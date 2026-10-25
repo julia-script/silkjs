@@ -1,0 +1,216 @@
+//! Non-executing inspection and stack text from quickjs.c:7613-7739,7771-7782.
+//! Every frame/function/debug atom must stay alive and address-stable throughout
+//! formatting. This layer does not define Error properties or invoke JavaScript.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.slice { Slice }
+import silk.u8
+import silk.u32
+import silk.usize
+import dtoa { Dtoa }
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types { RuntimeState, ObjectData, ObjectPayload, ShapeData, PropertySlot,
+  StackFrame, FunctionBytecode, FunctionDebugInfo, ByteStorage, JS_PROP_TMASK, JS_PROP_NORMAL, JS_MODE_BACKTRACE_BARRIER }
+import js_strings { Strings, StringBuilder }
+import js_string_types { StringOwner, StringLengthError }
+import js_atoms { AtomTable }
+import js_shapes as shapes
+import js_atom_data as atoms
+import js_class_data as classes
+import js_debug_positions { SourceLocation, decodePc2Line, decodePc2LineRaw, FUNCTION_DEFINITION_PC }
+
+pub const SKIP_FIRST_LEVEL: u32 = 1
+fn present<T>(pointer: ?*mut T) -> *mut T {
+  return unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(pointer)
+}
+
+/// Borrowed flat string, checking an own data slot and at most one prototype.
+/// An own accessor, varref, auto-init, rope or non-string blocks prototype lookup.
+pub unsafe fn propertyString(object: Value, atom: u32) -> Option<Value> {
+  let mut pointer = match object {
+    Value.Object { reference } => reference
+    _ => { return Option<Value>.none() }
+  }
+  let anchor = ()
+  let mut level: usize = 0
+  while level < 2 {
+    let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, pointer)
+    let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+    match unsafe shapes.lookup(data.shape, atom) {
+      Option<usize>.Some { value: index } => {
+        if (u8.toU32(shape.properties.get(index).flags) & JS_PROP_TMASK) != JS_PROP_NORMAL {
+          return Option<Value>.none()
+        }
+        return match data.properties.get(index) {
+          PropertySlot.Value { value: Value.String { reference } } => Option<Value>.some(Value.String { reference: reference })
+          _ => Option<Value>.none()
+        }
+      }
+      Option<usize>.None => ()
+    }
+    if Pointer.isNull<HeapHeader>(shape.prototype) { return Option<Value>.none() }
+    pointer = present(shape.prototype)
+    level = level + 1
+  }
+  return Option<Value>.none()
+}
+
+/// Even a non-enumerable/accessor own stack suppresses backtrace attachment.
+pub unsafe fn isNeeded(value: Value) -> bool {
+  let pointer = match value { Value.Object { reference } => reference _ => { return false } }
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, pointer)
+  if data.classId != classes.JS_CLASS_ERROR { return false }
+  return match unsafe shapes.lookup(data.shape, atoms.JS_ATOM_stack) {
+    Option<usize>.Some { .. } => false
+    Option<usize>.None => true
+  }
+}
+unsafe fn bytecode(function: Value) -> Option<*mut HeapHeader> {
+  let pointer = match function { Value.Object { reference } => reference _ => { return Option<*mut HeapHeader>.none() } }
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, pointer)
+  return match &data.payload {
+    ObjectPayload.BytecodeFunction { function: closure } => Option<*mut HeapHeader>.some(closure.bytecode)
+    _ => Option<*mut HeapHeader>.none()
+  }
+}
+
+/// Bytecode errors defer attachment until the VM has recorded the throwing PC.
+pub unsafe fn shouldAttachImmediately(runtime: *mut HeapHeader) -> bool {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  if state.inOutOfMemory { return false }
+  if Pointer.isNull<StackFrame>(state.currentStackFrame) { return true }
+  let frame = unsafe Pointer.borrow<(), StackFrame>(&anchor, present(state.currentStackFrame))
+  return match unsafe bytecode(frame.currentFunction) {
+    Option<*mut HeapHeader>.Some { .. } => false
+    Option<*mut HeapHeader>.None => true
+  }
+}
+
+effect fn appendCString(builder: &mut StringBuilder, value: Value) -> ()
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let mut length: usize = 0
+  let total = Strings.length(value)
+  while length < total && Strings.codeUnit(value, length) != 0 { length = length + 1 }
+  run builder.appendRange(value, 0, length)
+}
+effect fn appendInteger(builder: &mut StringBuilder, value: i32) -> ()
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let mut buffer: [u8; 12] = [0; 12]
+  let length = Dtoa.i32toa(&mut buffer, value)
+  run builder.appendLatin1(Slice.view<u8>(&buffer, 0, length))
+}
+unsafe fn location(storage: &ByteStorage, pc: u32) -> SourceLocation {
+  return match &storage.* {
+    ByteStorage.Owned { bytes } => decodePc2Line(bytes.asSlice(), pc)
+    ByteStorage.Borrowed { data, length } => unsafe decodePc2LineRaw(unsafe Pointer.assumeMany<u8>(data), length, pc)
+  }
+}
+unsafe effect fn appendAtom(builder: &mut StringBuilder, runtime: *mut HeapHeader, atom: u32) -> ()
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  if AtomTable.isInteger(atom) {
+    let mut buffer: [u8; 11] = [0; 11]
+    let length = Dtoa.u32toa(&mut buffer, AtomTable.integer(atom))
+    run builder.appendLatin1(Slice.view<u8>(&buffer, 0, length))
+  } else {
+    let anchor = ()
+    let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+    let text = StringOwner.adopt(run state.atoms.toValue(atom, true))
+    run appendCString(&mut builder, text.get())
+  }
+}
+
+/// Append the optional source prefix separately so Error attachment can define
+/// fileName/lineNumber/columnNumber before inspecting frames, as build_backtrace.
+pub effect fn appendOrigin(builder: &mut StringBuilder, filename: Option<Value>,
+  line: i32, column: i32) -> ()
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  match move filename {
+    Option<Value>.Some { value } => {
+      run builder.appendLatin1(b"    at ")
+      run appendCString(&mut builder, value)
+      if line != -1 {
+        run builder.appendUnit(58) run appendInteger(&mut builder, line)
+        run builder.appendUnit(58) run appendInteger(&mut builder, column)
+      }
+      run builder.appendUnit(10)
+    }
+    Option<Value>.None => ()
+  }
+}
+
+/// Append borrowed live frames without allocating the final JavaScript string.
+/// Buffer failures are distinct from StringBuilder.finish failures for Error.stack.
+pub unsafe effect fn appendFrames(runtime: *mut HeapHeader, builder: &mut StringBuilder,
+  flags: u32) -> () ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let mut pointer = state.currentStackFrame
+  drop state
+  let mut skip = (flags & SKIP_FIRST_LEVEL) != 0
+  while !Pointer.isNull<StackFrame>(pointer) {
+    let frame = unsafe Pointer.borrow<(), StackFrame>(&anchor, present(pointer))
+    if (frame.mode & JS_MODE_BACKTRACE_BARRIER) != 0 { break }
+    pointer = frame.previous
+    if skip { skip = false continue }
+    run builder.appendLatin1(b"    at ")
+    let mut named = false
+    match unsafe propertyString(frame.currentFunction, atoms.JS_ATOM_name) {
+      Option<Value>.Some { value } => {
+        if Strings.length(value) != 0 && Strings.codeUnit(value, 0) != 0 {
+          run appendCString(&mut builder, value)
+          named = true
+        }
+      }
+      Option<Value>.None => ()
+    }
+    if !named { run builder.appendLatin1(b"<anonymous>") }
+    match unsafe bytecode(frame.currentFunction) {
+      Option<*mut HeapHeader>.Some { value: function } => {
+        let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, function)
+        match &code.debug {
+          Option<FunctionDebugInfo>.Some { value: debug } => {
+            let mut pc = FUNCTION_DEFINITION_PC
+            match &frame.currentPc {
+              Option<usize>.Some { value } => { pc = u32.wrappingSubtract(usize.toU32(value), 1) }
+              Option<usize>.None => ()
+            }
+            let position = unsafe location(&debug.pcToLine, pc)
+            run builder.appendLatin1(b" (")
+            run unsafe appendAtom(&mut builder, runtime, debug.filename)
+            if position.line != 0 {
+              run builder.appendUnit(58) run appendInteger(&mut builder, position.line)
+              run builder.appendUnit(58) run appendInteger(&mut builder, position.column)
+            }
+            run builder.appendUnit(41)
+          }
+          Option<FunctionDebugInfo>.None => ()
+        }
+      }
+      Option<*mut HeapHeader>.None => { run builder.appendLatin1(b" (native)") }
+    }
+    run builder.appendUnit(10)
+  }
+}
+
+/// Returns an owned string. Optional filename is a borrowed decoded string;
+/// both it and function/atom names use C-string truncation at the first NUL.
+/// UTF16 preserves the source's WTF8 roundtrip, including lone surrogates.
+pub unsafe effect fn format(runtime: *mut HeapHeader, filename: Option<Value>,
+  line: i32, column: i32, flags: u32) -> Value
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let mut builder = StringBuilder.make()
+  run appendOrigin(&mut builder, move filename, line, column)
+  run unsafe appendFrames(runtime, &mut builder, flags)
+  if builder.length() == 0 {
+    run builder.reserve(0, false)
+    let anchor = ()
+    let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+    return state.atoms.emptyString()
+  }
+  return run builder.finish()
+}

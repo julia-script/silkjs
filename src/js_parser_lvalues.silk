@@ -1,0 +1,230 @@
+// Reference rewriting and inferred names, quickjs.c:25370-25417,26364-26667.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.ownership { Drop }
+import silk.pointer { Pointer }
+import silk.i32
+import silk.u16
+import silk.u32
+import js_heap { HeapCell, HeapHeader }
+import js_core_types { RuntimeState }
+import js_compiler_types { FunctionDef }
+import js_compiler_emit as emit
+import js_parser_core { Parser }
+import js_parser_diagnostics { SyntaxError }
+import js_string_types { StringLengthError }
+import js_atoms { AtomTable }
+import js_atom_data as atoms
+import js_opcode_data as op
+import js_tokens as tok
+import byte_buffer { readU16, readU32 }
+
+pub enum PutLValue { NoKeep, NoKeepDepth, KeepTop, KeepSecond, NoKeepBottom }
+// Owns the atom removed from the old instruction. Runtime must outlive this
+// temporary, including error unwinding. putLValue consumes it; Drop releases an
+// abandoned reference without requiring every grammar error path to do so.
+pub struct LValue {
+  pub opcode: u8,
+  pub scope: i32,
+  pub label: i32,
+  pub depth: i32,
+  runtime: *mut HeapHeader,
+  atom: u32
+}
+impl LValue {
+  pub fn name(self: &Self) -> u32 { return self.atom }
+  fn takeName(self: &mut Self) -> u32 { let atom = self.atom self.atom = 0 return atom }
+  // For binding declarations that do not first emit a get instruction.
+  pub fn variable(runtime: *mut HeapHeader, ownedName: u32, scope: i32) -> Self {
+    return Self { opcode: op.OP_scope_get_var, scope: scope, label: -1, depth: 0, runtime: runtime, atom: ownedName }
+  }
+}
+impl Drop for LValue {
+  fn drop(self: &mut Self) -> () {
+    if self.atom != 0 {
+      let mut anchor = ()
+      let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, self.runtime)
+      rt.atoms.release(self.atom)
+    }
+  }
+}
+
+pub unsafe fn hasWithScope(cell: *mut HeapHeader, scope: i32) -> bool {
+  let anchor = () let mut cursor: ?*mut HeapHeader = cell let mut level = scope
+  while !Pointer.isNull<HeapHeader>(cursor) {
+    let node = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(cursor)
+    let fd = unsafe HeapCell.payload<FunctionDef, ()>(&anchor, node)
+    if (fd.jsMode & 1) == 0 {
+      let mut index = fd.scopes.get(i32.toUsize(level)).first
+      while index >= 0 {
+        let variable = fd.vars.get(i32.toUsize(index))
+        if variable.name == atoms.JS_ATOM__with_ { return true }
+        index = variable.scopeNext
+      }
+    }
+    level = fd.parentScopeLevel cursor = fd.parent
+  }
+  return false
+}
+
+effect fn invalid<'src>(parser: &mut Parser<'src>, token: i32) -> LValue
+  ! SyntaxError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+  if token == tok.TOK_FOR { return run parser.syntax<LValue>(b"invalid for in/of left hand-side") }
+  if token == tok.TOK_INC || token == tok.TOK_DEC { return run parser.syntax<LValue>(b"invalid increment/decrement operand") }
+  if token == 91 || token == 123 { return run parser.syntax<LValue>(b"invalid destructuring target") }
+  return run parser.syntax<LValue>(b"invalid assignment left-hand side")
+}
+
+pub unsafe effect fn getLValue<'src>(parser: &mut Parser<'src>, keep: bool, token: i32) -> LValue
+  ! SyntaxError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let mut anchor = () let mut runtimeAnchor = ()
+  let original = unsafe HeapCell.payload<FunctionDef, ()>(&anchor, parser.currentFunction)
+  let mut opcode = emit.previousOpcode(original)
+  let mut name: u32 = 0 let mut scope: i32 = 0 let mut depth: i32 = 0
+  if opcode == op.OP_scope_get_var {
+    let position = i32.toUsize(original.lastOpcodePosition)
+    name = readU32(original.bytecode.asSlice(), position + 1)
+    scope = u16.toI32(readU16(original.bytecode.asSlice(), position + 5))
+    if (name == atoms.JS_ATOM_arguments || name == atoms.JS_ATOM_eval) && (original.jsMode & 1) != 0 {
+      drop original return run parser.syntax<LValue>(b"invalid lvalue in strict mode")
+    }
+    if name == atoms.JS_ATOM_this || name == atoms.JS_ATOM_new_target {
+      drop original return run invalid(&mut parser, token)
+    }
+    if unsafe hasWithScope(parser.currentFunction, scope) { depth = 2 }
+  } else if opcode == op.OP_get_field || opcode == op.OP_scope_get_private_field {
+    let position = i32.toUsize(original.lastOpcodePosition)
+    name = readU32(original.bytecode.asSlice(), position + 1) depth = 1
+    if opcode == op.OP_scope_get_private_field { scope = u16.toI32(readU16(original.bytecode.asSlice(), position + 5)) }
+  } else if opcode == op.OP_get_array_el { depth = 2 }
+  else if opcode == op.OP_get_super_value { depth = 3 }
+  else if opcode == op.OP_call || opcode == op.OP_call_method {
+    if (original.jsMode & 1) != 0 || token == tok.TOK_LAND_ASSIGN || token == tok.TOK_LOR_ASSIGN
+      || token == tok.TOK_DOUBLE_QUESTION_MARK_ASSIGN || token == 91 || token == 123 {
+      drop original return run invalid(&mut parser, token)
+    }
+    opcode = op.OP_call
+  } else { drop original return run invalid(&mut parser, token) }
+  drop original
+  let fd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, parser.currentFunction)
+  if opcode == op.OP_call {
+    run emit.emitOp(&mut fd, op.OP_throw_error) run emit.emitU32(&mut fd, 0) run emit.emitU8(&mut fd, 5)
+  } else {
+    let position = i32.toUsize(fd.lastOpcodePosition)
+    fd.bytecode.truncate(position) fd.lastOpcodePosition = -1
+  }
+  let mut result = LValue { opcode: opcode, scope: scope, label: -1, depth: depth, runtime: parser.runtime, atom: name }
+  let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, parser.runtime)
+  if opcode == op.OP_scope_get_var && depth != 0 {
+    let label = run emit.newLabel(&mut fd)
+    if label < 0 { drop rt drop fd fail OutOfMemoryError {} }
+    result.label = label result.opcode = op.OP_get_ref_value
+    run emit.emitOp(&mut fd, op.OP_scope_make_ref)
+    run emit.emitAtom(&mut fd, &mut rt.atoms, name)
+    run emit.emitU32(&mut fd, i32.toU32(label)) run emit.emitU16(&mut fd, i32.toU16(scope))
+    let references = emit.updateLabel(&mut fd, label, 1)
+    if keep { run emit.emitOp(&mut fd, op.OP_get_ref_value) }
+  } else if keep {
+    if opcode == op.OP_scope_get_var {
+      run emit.emitOp(&mut fd, op.OP_scope_get_var) run emit.emitAtom(&mut fd, &mut rt.atoms, name)
+      run emit.emitU16(&mut fd, i32.toU16(scope))
+    } else if opcode == op.OP_get_field {
+      run emit.emitOp(&mut fd, op.OP_get_field2) run emit.emitAtom(&mut fd, &mut rt.atoms, name)
+    } else if opcode == op.OP_scope_get_private_field {
+      run emit.emitOp(&mut fd, op.OP_scope_get_private_field2) run emit.emitAtom(&mut fd, &mut rt.atoms, name)
+      run emit.emitU16(&mut fd, i32.toU16(scope))
+    } else if opcode == op.OP_get_array_el { run emit.emitOp(&mut fd, op.OP_get_array_el3) }
+    else if opcode == op.OP_get_super_value {
+      run emit.emitOp(&mut fd, op.OP_to_propkey) run emit.emitOp(&mut fd, op.OP_dup3) run emit.emitOp(&mut fd, op.OP_get_super_value)
+    }
+  }
+  return move result
+}
+
+// Transfer ownership only if the fixed-width operand commits; partial bytecode
+// teardown already releases committed atom operands even when later operands fail.
+effect fn ownedAtom(fd: &mut FunctionDef, table: &mut AtomTable, name: u32) -> () ? &mut Allocator {
+  let before = fd.bytecode.length()
+  run emit.emitU32(&mut fd, name)
+  if fd.bytecode.length() != before + 4 { table.release(name) }
+}
+pub unsafe effect fn putLValue<'src>(parser: &mut Parser<'src>, input: LValue, special: PutLValue, lexical: bool) -> () ? &mut Allocator {
+  let mut target = move input
+  let mut anchor = () let mut runtimeAnchor = ()
+  let fd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, parser.currentFunction)
+  let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, parser.runtime)
+  let opcode = target.opcode
+  if opcode == op.OP_scope_get_var {
+    if special == PutLValue.KeepTop { run emit.emitOp(&mut fd, op.OP_dup) }
+  } else if opcode == op.OP_get_field || opcode == op.OP_scope_get_private_field {
+    if special == PutLValue.KeepTop { run emit.emitOp(&mut fd, op.OP_insert2) }
+    else if special == PutLValue.KeepSecond { run emit.emitOp(&mut fd, op.OP_perm3) }
+    else if special == PutLValue.NoKeepBottom { run emit.emitOp(&mut fd, op.OP_swap) }
+  } else if opcode == op.OP_get_array_el || opcode == op.OP_get_ref_value {
+    if opcode == op.OP_get_ref_value {
+      rt.atoms.release(target.takeName())
+      let emitted = run emit.emitLabel(&mut fd, target.label)
+    }
+    if special == PutLValue.NoKeep { run emit.emitOp(&mut fd, op.OP_nop) }
+    else if special == PutLValue.KeepTop { run emit.emitOp(&mut fd, op.OP_insert3) }
+    else if special == PutLValue.KeepSecond { run emit.emitOp(&mut fd, op.OP_perm4) }
+    else if special == PutLValue.NoKeepBottom { run emit.emitOp(&mut fd, op.OP_rot3l) }
+  } else if opcode == op.OP_get_super_value {
+    if special == PutLValue.KeepTop { run emit.emitOp(&mut fd, op.OP_insert4) }
+    else if special == PutLValue.KeepSecond { run emit.emitOp(&mut fd, op.OP_perm5) }
+    else if special == PutLValue.NoKeepBottom { run emit.emitOp(&mut fd, op.OP_rot4l) }
+  }
+  if opcode == op.OP_scope_get_var {
+    let mut put = op.OP_scope_put_var if lexical { put = op.OP_scope_put_var_init }
+    run emit.emitOp(&mut fd, put) run ownedAtom(&mut fd, &mut rt.atoms, target.takeName())
+    run emit.emitU16(&mut fd, i32.toU16(target.scope))
+  } else if opcode == op.OP_get_field {
+    run emit.emitOp(&mut fd, op.OP_put_field) run ownedAtom(&mut fd, &mut rt.atoms, target.takeName())
+  } else if opcode == op.OP_scope_get_private_field {
+    run emit.emitOp(&mut fd, op.OP_scope_put_private_field) run ownedAtom(&mut fd, &mut rt.atoms, target.takeName())
+    run emit.emitU16(&mut fd, i32.toU16(target.scope))
+  } else if opcode == op.OP_get_array_el { run emit.emitOp(&mut fd, op.OP_put_array_el) }
+  else if opcode == op.OP_get_ref_value { run emit.emitOp(&mut fd, op.OP_put_ref_value) }
+  else if opcode == op.OP_get_super_value { run emit.emitOp(&mut fd, op.OP_put_super_value) }
+  else if opcode != op.OP_call { Intrinsic.trap("QuickJS invariant violated") }
+}
+
+pub unsafe effect fn setObjectName<'src>(parser: &mut Parser<'src>, name: u32) -> () ? &mut Allocator {
+  let mut anchor = () let mut runtimeAnchor = ()
+  let fd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, parser.currentFunction)
+  let code = emit.previousOpcode(&fd.*)
+  if code != op.OP_set_name && code != op.OP_set_class_name { return () }
+  let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, parser.runtime)
+  let position = i32.toUsize(fd.lastOpcodePosition)
+  if code == op.OP_set_name {
+    let previous = readU32(fd.bytecode.asSlice(), position + 1)
+    let owned = rt.atoms.duplicate(name)
+    rt.atoms.release(previous)
+    fd.bytecode.truncate(position) fd.lastOpcodePosition = -1
+    run emit.emitOp(&mut fd, op.OP_set_name) run ownedAtom(&mut fd, &mut rt.atoms, owned)
+  } else {
+    let definePosition = position + 1 - u32.toUsize(readU32(fd.bytecode.asSlice(), position + 1))
+    if fd.bytecode.get(definePosition) != op.OP_define_class { Intrinsic.trap("QuickJS invariant violated") }
+    let previous = readU32(fd.bytecode.asSlice(), definePosition + 1)
+    let owned = rt.atoms.duplicate(name)
+    rt.atoms.release(previous) fd.bytecode.patchU32(definePosition + 1, owned)
+    fd.lastOpcodePosition = -1
+  }
+}
+pub unsafe effect fn setObjectNameComputed<'src>(parser: &mut Parser<'src>) -> () ? &mut Allocator {
+  let mut anchor = ()
+  let fd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, parser.currentFunction)
+  let code = emit.previousOpcode(&fd.*)
+  if code != op.OP_set_name && code != op.OP_set_class_name { return () }
+  let position = i32.toUsize(fd.lastOpcodePosition)
+  if code == op.OP_set_name {
+    let previous = readU32(fd.bytecode.asSlice(), position + 1)
+    let mut runtimeAnchor = () let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, parser.runtime)
+    rt.atoms.release(previous) drop rt
+    fd.bytecode.truncate(position) fd.lastOpcodePosition = -1
+    run emit.emitOp(&mut fd, op.OP_set_name_computed)
+  } else {
+    let definePosition = position + 1 - u32.toUsize(readU32(fd.bytecode.asSlice(), position + 1))
+    if fd.bytecode.get(definePosition) != op.OP_define_class { Intrinsic.trap("QuickJS invariant violated") }
+    fd.bytecode.set(definePosition, op.OP_define_class_computed) fd.lastOpcodePosition = -1
+  }
+}

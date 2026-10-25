@@ -1,0 +1,164 @@
+//! Source setup and compilation, quickjs.c:38019-38132. Compiler trees and
+//! newly loaded module roots are torn down only after installing the exception.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.slice { Slice }
+import js_heap { HeapCell, HeapHeader }
+import js_core_types { RuntimeState, FunctionBytecode, FunctionKind, ObjectData, ObjectPayload,
+  StackFrame, ModuleDef, JS_MODE_STRICT }
+import js_value { Value }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_coercion_host { CoercionHooks }
+import js_error_host { ErrorHooks }
+import js_module_host { ModuleHostHooks }
+import js_parser_host { ModuleAttributeHooks }
+import js_exceptions { JsException }
+import js_compiler_types { FunctionDef, CompilerError, CompilerErrorKind }
+import js_compiler_state as state
+import js_compiler_variables as variables
+import js_compiler_emit as emit
+import js_compiler_finish as finish
+import js_parser_core { Parser, ParserStackOverflow }
+import js_parser_program { parseProgram }
+import js_parser_diagnostics { SyntaxError }
+import js_tokens { LexError }
+import js_bytecode { BytecodeError }
+import js_debug_positions { SourcePositionCache }
+import js_string_types { StringLengthError }
+import js_bigint { BigIntError }
+import js_module_metadata as modules
+import js_module_loader as loader
+import js_eval_errors as errors
+import js_atom_data as atoms
+import runtime_memory { AllocationObserver }
+
+pub const TYPE_GLOBAL: i32 = 0
+pub const TYPE_MODULE: i32 = 1
+pub const TYPE_DIRECT: i32 = 2
+pub const TYPE_INDIRECT: i32 = 3
+pub const TYPE_MASK: i32 = 3
+pub const FLAG_STRICT: i32 = 8
+pub const FLAG_COMPILE_ONLY: i32 = 32
+pub const FLAG_BACKTRACE_BARRIER: i32 = 64
+pub const FLAG_ASYNC: i32 = 128
+fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+pub fn present(value: ?*mut HeapHeader) -> *mut HeapHeader {
+  return match Pointer.nonNullMut<HeapHeader>(value) { Option<*mut HeapHeader>.Some { value: found } => found _ => invariant() }
+}
+pub unsafe fn directFrame(context: *mut HeapHeader) -> *mut StackFrame {
+  let anchor = () let rt = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, unsafe runtime.contextRuntime(context))
+  return match Pointer.nonNullMut<StackFrame>(rt.currentStackFrame) { Option<*mut StackFrame>.Some { value } => value _ => invariant() }
+}
+pub unsafe fn frameBytecode(frame: *mut StackFrame) -> *mut HeapHeader {
+  let anchor = () let sf = unsafe Pointer.borrow<(), StackFrame>(&anchor, frame)
+  let function = match sf.currentFunction { Value.Object { reference } => reference _ => invariant() } drop sf
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, function)
+  return match &object.payload { ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode _ => invariant() }
+}
+unsafe effect fn parse<H: HeapHooks + ModuleAttributeHooks>(hooks: &mut H, memory: &AllocationObserver,
+  cell: *mut HeapHeader, source: &[u8], module: bool) -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow | CompilerError | JsException ? &mut Allocator {
+  let mut parser = run unsafe Parser.make(source, cell, module, !module)
+  let parsed = run Effect.result(unsafe parseProgram(&mut parser, &mut hooks, memory))
+  match move parsed {
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException>.Success { .. } => ()
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException>.Failure { error } => {
+      match move error {
+        LexError lexical => { fail run parser.lexicalError(move lexical) }
+        OutOfMemoryError allocation => { fail move allocation }
+        StringLengthError length => { fail move length }
+        BigIntError bigint => { fail move bigint }
+        SyntaxError syntax => { fail move syntax }
+        ParserStackOverflow overflow => { fail move overflow }
+        CompilerError compiler => {
+          if compiler.kind == CompilerErrorKind.LexicalRedefinition || compiler.kind == CompilerErrorKind.ParameterRedefinition
+            || compiler.kind == CompilerErrorKind.VariableRedefinition || compiler.kind == CompilerErrorKind.GlobalRedefinition {
+            return run parser.syntax<()>(errors.redefinitionMessage(compiler.kind))
+          }
+          fail move compiler
+        }
+        JsException signal => { fail move signal }
+      }
+    }
+  }
+}
+unsafe effect fn body<H: HeapHooks + CoercionHooks + ModuleHostHooks + ModuleAttributeHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, source: &[u8], filename: &[u8], flags: i32,
+  scope: i32, frame: ?*mut StackFrame, root: &mut ?*mut HeapHeader, module: &mut ?*mut HeapHeader,
+  cache: *mut SourcePositionCache) -> Value
+  ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow | CompilerError | BytecodeError | JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context) let evalType = flags & TYPE_MASK
+  let mut anchor = () let mut ra = ()
+  let table = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ra, rt)
+  let mut filenameLength: usize = 0
+  while filenameLength < filename.length && filename[filenameLength] != 0 { filenameLength = filenameLength + 1 }
+  let name = run table.atoms.internUtf8(Slice.view(filename, 0, filenameLength)) drop table
+  if evalType == TYPE_MODULE {
+    let created = run Effect.result(unsafe modules.newModule(context, name))
+    match move created {
+      Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => { module.* = value }
+      Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => { fail move error }
+    }
+  }
+  let created = run Effect.result(unsafe state.newFunction(context, Pointer.null<HeapHeader>(), true, false, name, 0, cache))
+  // Module construction consumed name; otherwise the evaluator owns it.
+  if evalType != TYPE_MODULE { let table = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ra, rt) table.atoms.release(name) }
+  let cell = match move created {
+    Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value
+    Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => { fail move error }
+  }
+  root.* = cell
+  let fd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
+  let evalState = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ra, rt)
+  fd.evalType = evalType fd.hasThisBinding = evalType != TYPE_DIRECT
+  fd.argumentsAllowed = true fd.functionName = evalState.atoms.duplicate(atoms.JS_ATOM__eval_)
+  fd.module = module.*
+  if (flags & FLAG_STRICT) != 0 || evalType == TYPE_MODULE { fd.jsMode = JS_MODE_STRICT }
+  if evalType == TYPE_DIRECT {
+    let sf = match Pointer.nonNullMut<StackFrame>(frame) { Option<*mut StackFrame>.Some { value } => value _ => invariant() }
+    let ba = () let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&ba, unsafe frameBytecode(sf))
+    fd.jsMode = bytecode.mode fd.newTargetAllowed = bytecode.newTargetAllowed
+    fd.superCallAllowed = bytecode.superCallAllowed fd.superAllowed = bytecode.superAllowed
+    fd.argumentsAllowed = bytecode.argumentsAllowed
+    run variables.addClosureVariables(&mut fd, &mut evalState.atoms, &bytecode.*, scope)
+  }
+  if evalType == TYPE_MODULE || (flags & FLAG_ASYNC) != 0 { fd.inFunctionBody = true fd.functionKind = FunctionKind.Async }
+  let level = run emit.pushScope(&mut fd) fd.bodyScope = level drop evalState drop fd
+  run unsafe parse(&mut hooks, memory, cell, source, evalType == TYPE_MODULE)
+  if evalType == TYPE_MODULE {
+    let fd = unsafe HeapCell.payload<FunctionDef, ()>(&anchor, cell) let await = fd.hasAwait drop fd
+    let data = unsafe HeapCell.payloadMut<ModuleDef, ()>(&mut anchor, present(module.*)) data.hasTopLevelAwait = await
+  }
+  root.* = Pointer.null<HeapHeader>()
+  let compiled = run unsafe finish.createFunction(&mut hooks, cell, source)
+  if evalType != TYPE_MODULE { return compiled }
+  let moduleHeader = present(module.*)
+  let data = unsafe HeapCell.payloadMut<ModuleDef, ()>(&mut anchor, moduleHeader) data.functionObject = compiled drop data
+  run unsafe loader.resolveModule(&mut hooks, context, moduleHeader)
+  unsafe HeapCell.retain(moduleHeader)
+  return Value.Module { reference: moduleHeader }
+}
+// frame is the actual published activation, never a copied/reconstructed frame.
+// The direct caller must keep its function, argv, locals and VarRef table live.
+pub unsafe effect fn compile<H: HeapHooks + CoercionHooks + ErrorHooks + ModuleHostHooks + ModuleAttributeHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, source: &[u8], filename: &[u8], flags: i32,
+  scope: i32, frame: ?*mut StackFrame) -> Value ! JsException ? &mut Allocator {
+  let mut root = Pointer.null<HeapHeader>() let mut module = Pointer.null<HeapHeader>()
+  let mut cache = SourcePositionCache.make()
+  let compiled = run Effect.result(unsafe body(&mut hooks, memory, context, source, filename, flags, scope,
+    frame, &mut root, &mut module, Pointer.fromMutRef<SourcePositionCache>(&mut cache)))
+  match move compiled {
+    Result<Value, OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow | CompilerError | BytecodeError | JsException>.Success { value } => { return value }
+    Result<Value, OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow | CompilerError | BytecodeError | JsException>.Failure { error } => {
+      let pending = run Effect.catch<JsException>(unsafe errors.compilation<Value, H>(&mut hooks, memory, context, move error), errors.exceptionValue)
+      if !Pointer.isNull<HeapHeader>(root) { unsafe state.destroyFunction(&mut hooks, present(root)) }
+      if !Pointer.isNull<HeapHeader>(module) { unsafe gc.releaseHeader(&mut hooks, unsafe runtime.contextRuntime(context), present(module)) }
+      fail JsException {}
+    }
+  }
+}

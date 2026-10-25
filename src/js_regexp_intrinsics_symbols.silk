@@ -1,0 +1,798 @@
+//! Native RegExp symbol methods, quickjs.c:50722-51621. All API inputs are
+//! borrowed. Scope slots own their Values; take transfers ownership before a
+//! consuming call, and abrupt completion materializes its error before cleanup.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.list { List }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.result { Result }
+import silk.slice { Slice }
+import silk.i32
+import silk.i64
+import silk.u16
+import silk.u32
+import silk.usize
+import runtime_memory { AllocationObserver }
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types { ContextState, RuntimeState, ObjectData, ObjectPayload, ShapeData,
+  PropertySlot, NativeFunctionId, BuiltinFamily, FrameSlots }
+import js_gc { HeapHooks }
+import js_coercion_host { CoercionHooks }
+import js_property_host { OwnPropertyHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_call_host { CallHooks }
+import js_interrupt_host { InterruptHooks }
+import js_exceptions { JsException }
+import js_string_types { FlatString, StringLengthError, stringReference }
+import js_strings { StringBuilder, Strings }
+import js_atom_data as atoms
+import js_class_data as classes
+import js_runtime as runtime
+import js_shapes as shapes
+import js_proxy_core as core
+import js_constructor_ops as constructors
+import js_boxing as boxing
+import js_function_invoke as invoke
+import js_regexp_intrinsics_support as support
+import js_regexp_intrinsics_exec as execution
+import js_regexp_string_iterator as iterator
+import regexp_types { FLAG_GLOBAL, FLAG_STICKY, FLAG_UNICODE, FLAG_UNICODE_SETS, FLAG_NAMED_GROUPS }
+
+// The first four results stay on the native stack, like source ValueBuffer.
+struct Scope {
+  values: [Value; 9],
+  inlineResults: [Value; 4],
+  results: List<Value>,
+  count: usize
+}
+impl Scope {
+  fn make() -> Self { return Scope { values: [Value.Undefined; 9], inlineResults: [Value.Undefined; 4], results: List<Value>.make(), count: 0 } }
+  fn take(self: &mut Self, index: usize) -> Value { return Intrinsic.replace(self.values[index], Value.Undefined) }
+  fn result(self: &Self, index: usize) -> Value {
+    if index < 4 { return self.inlineResults[index] }
+    return self.results.get(index - 4)
+  }
+  // Ownership stays in values[6] until append succeeds, including spill OOM.
+  effect fn collect(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.count < 4 {
+      let value = self.take(6)
+      self.inlineResults[self.count] = value
+    } else {
+      let value = self.values[6]
+      run self.results.append(value)
+      self.values[6] = Value.Undefined
+    }
+    self.count = self.count + 1
+  }
+}
+unsafe fn clear<H: HeapHooks>(hooks: &mut H, context: *mut HeapHeader, scope: &mut Scope, index: usize) -> () {
+  unsafe support.release(&mut hooks, context, scope.take(index))
+}
+unsafe fn dispose<H: HeapHooks>(hooks: &mut H, context: *mut HeapHeader, scope: &mut Scope) -> () {
+  let mut i: usize = 0
+  while i < scope.count { unsafe support.release(&mut hooks, context, scope.result(i)) i = i + 1 }
+  i = 0
+  while i < 9 { unsafe clear(&mut hooks, context, &mut scope, i) i = i + 1 }
+}
+fn number(value: i64) -> Value { return Value.number(i64.toF64(value)) }
+fn contains(value: Value, unit: u16) -> bool {
+  let mut i: usize = 0
+  while i < Strings.length(value) { if Strings.codeUnit(value, i) == unit { return true } i = i + 1 }
+  return false
+}
+fn unicode(flags: Value) -> bool { return contains(flags, 117) || contains(flags, 118) }
+unsafe fn defaultConstructor(context: *mut HeapHeader) -> Value {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  return state.regexpConstructor
+}
+// ToStringFree, including release on a conversion exception.
+unsafe effect fn stringFree<H: HeapHooks + CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  owned: Value) -> Value ! JsException ? &mut Allocator {
+  let converted = run Effect.result(unsafe support.string(&mut hooks, context, owned))
+  unsafe support.release(&mut hooks, context, owned)
+  return match move converted {
+    Result<Value, JsException>.Success { value } => value
+    Result<Value, JsException>.Failure { error } => { fail move error }
+  }
+}
+unsafe effect fn propertyString<H: HeapHooks + CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  object: Value, atom: u32) -> Value ! JsException ? &mut Allocator {
+  let value = run unsafe support.get(&mut hooks, context, object, atom)
+  return run unsafe stringFree(&mut hooks, context, value)
+}
+unsafe effect fn propertyLength<H: HeapHooks + CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  object: Value, atom: u32, narrow: bool) -> i64 ! JsException ? &mut Allocator {
+  let value = run unsafe support.get(&mut hooks, context, object, atom)
+  if narrow {
+    let converted = run Effect.result(unsafe support.uint32(&mut hooks, context, value))
+    unsafe support.release(&mut hooks, context, value)
+    return match move converted {
+      Result<u32, JsException>.Success { value: length } => u32.toI64(length)
+      Result<u32, JsException>.Failure { error } => { fail move error }
+    }
+  }
+  let converted = run Effect.result(unsafe support.length(&mut hooks, context, value))
+  unsafe support.release(&mut hooks, context, value)
+  return match move converted {
+    Result<i64, JsException>.Success { value: length } => length
+    Result<i64, JsException>.Failure { error } => { fail move error }
+  }
+}
+unsafe effect fn getIndex<H: HeapHooks + CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  object: Value, index: i64) -> Value ! JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+  let interned = run Effect.result(state.atoms.internInt64(index))
+  drop state
+  let atom = match move interned {
+    Result<u32, OutOfMemoryError | StringLengthError>.Success { value } => value
+    Result<u32, OutOfMemoryError | StringLengthError>.Failure { error } => run unsafe support.materialize(&mut hooks, context, move error)
+  }
+  let fetched = run Effect.result(unsafe support.get(&mut hooks, context, object, atom))
+  let released = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+  released.atoms.release(atom)
+  drop released
+  return match move fetched {
+    Result<Value, JsException>.Success { value } => value
+    Result<Value, JsException>.Failure { error } => { fail move error }
+  }
+}
+unsafe effect fn getName<H: HeapHooks + CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  object: Value, name: Value) -> Value ! JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+  let interned = run Effect.result(state.atoms.intern(name))
+  drop state
+  let atom = match move interned {
+    Result<u32, OutOfMemoryError | StringLengthError>.Success { value } => value
+    Result<u32, OutOfMemoryError | StringLengthError>.Failure { error } => run unsafe support.materialize(&mut hooks, context, move error)
+  }
+  let fetched = run Effect.result(unsafe support.get(&mut hooks, context, object, atom))
+  let released = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+  released.atoms.release(atom)
+  drop released
+  return match move fetched {
+    Result<Value, JsException>.Success { value } => value
+    Result<Value, JsException>.Failure { error } => { fail move error }
+  }
+}
+unsafe effect fn substring<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader, string: Value,
+  start: i64, end: i64) -> Value ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  if start == 0 && end == usize.toI64(Strings.length(string)) { return Strings.duplicate(string) }
+  if end <= start { return run unsafe core.atomValue(&mut hooks, context, atoms.JS_ATOM_empty_string) }
+  let mut builder = StringBuilder.make()
+  run appendRange(&mut builder, string, start, end)
+  return run builder.finish()
+}
+// Source string_buffer_concat appends nothing for reversed ranges (custom exec
+// can report a match extending beyond the end of the searched string).
+effect fn appendRange(builder: &mut StringBuilder, string: Value, start: i64, end: i64) -> ()
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  if end <= start { return () }
+  // Inputs have already passed ToString/flatten. Slice the flat storage rather
+  // than walking a rope iterator from zero for every match (quadratic on /./g).
+  let anchor = ()
+  let flat = unsafe HeapCell.payload<FlatString, ()>(&anchor, stringReference(string))
+  let from = i64.toUsize(start)
+  let count = i64.toUsize(end - start)
+  if flat.wide { run builder.appendUtf16(Slice.view(flat.utf16.asSlice(), from, count)) }
+  else { run builder.appendLatin1(Slice.view(flat.latin1.asSlice(), from, count)) }
+}
+unsafe effect fn construct<H: CoercionHooks + CallHooks>(hooks: &mut H, context: *mut HeapHeader,
+  constructor: Value, receiver: Value, flags: Value) -> Value ! JsException ? &mut Allocator {
+  let mut arguments: [Value; 2] = [receiver, flags]
+  let argv = FrameSlots.Borrowed { data: Pointer.fromMutRef<Value>(&mut arguments[0]), length: 2 }
+  let called = run Effect.result(unsafe hooks.construct(context, constructor, constructor, &argv))
+  return match move called {
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => value
+    Result<Value, OutOfMemoryError | JsException>.Failure { error } => run unsafe support.materialize(&mut hooks, context, move error)
+  }
+}
+unsafe effect fn advanceEmpty<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks>(hooks: &mut H,
+  context: *mut HeapHeader, receiver: Value, string: Value, fullUnicode: bool) -> () ! JsException ? &mut Allocator {
+  let index = run unsafe propertyLength(&mut hooks, context, receiver, atoms.JS_ATOM_lastIndex, false)
+  run unsafe support.set(&mut hooks, context, receiver, atoms.JS_ATOM_lastIndex, number(support.advance(string, index, fullUnicode)))
+}
+
+// Source StringBuffer has sticky allocation errors. Literal writes often ignore
+// their return value, so later getters/callbacks/lastIndex updates still run.
+// This is deliberately not an eager-throw builder.
+// String arguments to append/appendRange and GetSubstitution are borrowed flat
+// strings, produced by ToString. No method retains its string arguments.
+pub struct ReplacementBuffer { builder: StringBuilder, failed: bool }
+impl ReplacementBuffer {
+  pub fn make() -> Self { return ReplacementBuffer { builder: StringBuilder.make(), failed: false } }
+  pub fn isFailed(self: &Self) -> bool { return self.failed }
+  pub unsafe effect fn reserve<H: CoercionHooks>(self: &mut Self, hooks: &mut H, context: *mut HeapHeader,
+    additional: usize, wide: bool) -> bool ! JsException ? &mut Allocator {
+    if self.failed { return false }
+    let attempted = run Effect.result(self.builder.reserve(additional, wide))
+    match move attempted {
+      Result<(), OutOfMemoryError | StringLengthError>.Success { .. } => { return true }
+      Result<(), OutOfMemoryError | StringLengthError>.Failure { error } => {
+        run unsafe self.record(&mut hooks, context, move error)
+        return false
+      }
+    }
+  }
+  pub unsafe effect fn appendUnit<H: CoercionHooks>(self: &mut Self, hooks: &mut H, context: *mut HeapHeader,
+    unit: u16) -> bool ! JsException ? &mut Allocator {
+    if self.failed { return false }
+    let attempted = run Effect.result(self.builder.appendUnit(unit))
+    match move attempted {
+      Result<(), OutOfMemoryError | StringLengthError>.Success { .. } => { return true }
+      Result<(), OutOfMemoryError | StringLengthError>.Failure { error } => {
+        run unsafe self.record(&mut hooks, context, move error)
+        return false
+      }
+    }
+  }
+  pub unsafe effect fn appendLatin1<H: CoercionHooks>(self: &mut Self, hooks: &mut H, context: *mut HeapHeader,
+    bytes: &[u8]) -> bool ! JsException ? &mut Allocator {
+    if self.failed { return false }
+    let attempted = run Effect.result(self.builder.appendLatin1(bytes))
+    match move attempted {
+      Result<(), OutOfMemoryError | StringLengthError>.Success { .. } => { return true }
+      Result<(), OutOfMemoryError | StringLengthError>.Failure { error } => {
+        run unsafe self.record(&mut hooks, context, move error)
+        return false
+      }
+    }
+  }
+  unsafe effect fn record<H: CoercionHooks>(self: &mut Self, hooks: &mut H, context: *mut HeapHeader,
+    error: OutOfMemoryError | StringLengthError) -> () ! JsException ? &mut Allocator {
+    let pending = run Effect.catch<JsException>(unsafe support.materialize(&mut hooks, context, move error), core.exceptionValue)
+    self.failed = true
+    self.builder = StringBuilder.make()
+  }
+  pub unsafe effect fn appendRange<H: CoercionHooks>(self: &mut Self, hooks: &mut H, context: *mut HeapHeader,
+    string: Value, start: i64, end: i64) -> bool ! JsException ? &mut Allocator {
+    if end <= start { return true }
+    if self.failed { return false }
+    let attempted = run Effect.result(appendRange(&mut self.builder, string, start, end))
+    match move attempted {
+      Result<(), OutOfMemoryError | StringLengthError>.Success { .. } => { return true }
+      Result<(), OutOfMemoryError | StringLengthError>.Failure { error } => {
+        run unsafe self.record(&mut hooks, context, move error)
+        return false
+      }
+    }
+  }
+  pub unsafe effect fn append<H: CoercionHooks>(self: &mut Self, hooks: &mut H, context: *mut HeapHeader,
+    string: Value) -> bool ! JsException ? &mut Allocator {
+    if self.failed { return false }
+    return run unsafe self.appendRange(&mut hooks, context, string, 0, usize.toI64(Strings.length(string)))
+  }
+  unsafe effect fn dollar<H: CoercionHooks>(self: &mut Self, hooks: &mut H, context: *mut HeapHeader) -> ()
+    ! JsException ? &mut Allocator {
+    if self.failed { return () }
+    let attempted = run Effect.result(self.builder.appendUnit(36))
+    match move attempted {
+      Result<(), OutOfMemoryError | StringLengthError>.Success { .. } => ()
+      Result<(), OutOfMemoryError | StringLengthError>.Failure { error } => { run unsafe self.record(&mut hooks, context, move error) }
+    }
+  }
+  pub unsafe effect fn finish<H: CoercionHooks>(self: Self, hooks: &mut H, context: *mut HeapHeader) -> Value
+    ! JsException ? &mut Allocator {
+    if self.failed { fail JsException {} }
+    if self.builder.length() == 0 { return run unsafe core.atomValue(&mut hooks, context, atoms.JS_ATOM_empty_string) }
+    let attempted = run Effect.result(self.builder.finish())
+    return match move attempted {
+      Result<Value, OutOfMemoryError>.Success { value } => value
+      Result<Value, OutOfMemoryError>.Failure { error } => run unsafe support.materialize(&mut hooks, context, move error)
+    }
+  }
+}
+
+// GetSubstitution, quickjs.c:48132-48252. An empty offsets slice selects the
+// ordinary captures-array form (array includes group zero). Otherwise offsets
+// contains start/end pairs, including zero, and -1 denotes an unmatched group.
+// namedCaptures is already ToObject'd, or Undefined. All inputs are borrowed;
+// builder is caller-owned. Always finish it: ignored literal-write errors are
+// sticky and do not necessarily cause GetSubstitution itself to throw.
+pub unsafe effect fn getSubstitution<H: HeapHooks + CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  builder: &mut ReplacementBuffer, matched: Value, string: Value, position: i64,
+  captures: Value, namedCaptures: Value, replacement: Value, offsets: &[i32]) -> () ! JsException ? &mut Allocator {
+  let mut scope = Scope.make()
+  let attempted = run Effect.result(unsafe substitutionBody(&mut hooks, context, &mut builder, matched, string,
+    position, captures, namedCaptures, replacement, offsets, &mut scope))
+  let mut failed = false
+  match move attempted {
+    Result<(), OutOfMemoryError | StringLengthError | JsException>.Success { .. } => ()
+    Result<(), OutOfMemoryError | StringLengthError | JsException>.Failure { error } => {
+      let pending = run Effect.catch<JsException>(unsafe support.materialize(&mut hooks, context, move error), core.exceptionValue)
+      failed = true
+    }
+  }
+  unsafe dispose(&mut hooks, context, &mut scope)
+  if failed { fail JsException {} }
+}
+unsafe effect fn substitutionBody<H: HeapHooks + CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  builder: &mut ReplacementBuffer, matched: Value, string: Value, position: i64,
+  captures: Value, namedCaptures: Value, replacement: Value, offsets: &[i32], scope: &mut Scope) -> ()
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  if replacement.tag() != -7 { return run unsafe core.error(&mut hooks, context, b"not a string") }
+  let direct = offsets.length != 0
+  let mut matchedLength: i64 = 0
+  let mut captureCount: i64 = 0
+  if direct {
+    matchedLength = i32.toI64(offsets[1]) - i32.toI64(offsets[0])
+    captureCount = usize.toI64(offsets.length / 2)
+  } else {
+    if captures.tag() != 3 { captureCount = run unsafe propertyLength(&mut hooks, context, captures, atoms.JS_ATOM_length, true) }
+    matchedLength = run unsafe propertyLength(&mut hooks, context, matched, atoms.JS_ATOM_length, true)
+  }
+  let length = Strings.length(replacement)
+  let stringLength = usize.toI64(Strings.length(string))
+  let mut i: usize = 0
+  while i < length {
+    let mut j = i
+    while j < length && Strings.codeUnit(replacement, j) != 36 { j = j + 1 }
+    if j + 1 >= length { break }
+    let prefix = run unsafe builder.appendRange(&mut hooks, context, replacement, usize.toI64(i), usize.toI64(j))
+    let literal = j
+    let c = Strings.codeUnit(replacement, j + 1)
+    j = j + 2
+    let mut substituted = true
+    if c == 36 { run unsafe builder.dollar(&mut hooks, context) }
+    else if c == 38 {
+      if direct {
+        let whole = run unsafe builder.appendRange(&mut hooks, context, string, position, position + matchedLength)
+      } else if !run unsafe builder.append(&mut hooks, context, matched) { fail JsException {} }
+    } else if c == 96 {
+      let before = run unsafe builder.appendRange(&mut hooks, context, string, 0, position)
+    } else if c == 39 {
+      let after = run unsafe builder.appendRange(&mut hooks, context, string, position + matchedLength, stringLength)
+    }
+    else if c >= 48 && c <= 57 {
+      let mut k = u16.toI64(c - 48)
+      if j < length {
+        let c1 = Strings.codeUnit(replacement, j)
+        if c1 >= 48 && c1 <= 57 {
+          let k1 = k * 10 + u16.toI64(c1 - 48)
+          if k1 >= 1 && k1 < captureCount { k = k1 j = j + 1 }
+        }
+      }
+      if k >= 1 && k < captureCount {
+        if direct {
+          let start = offsets[i64.toUsize(k) * 2]
+          let end = offsets[i64.toUsize(k) * 2 + 1]
+          if start >= 0 && end >= 0 {
+            let captured = run unsafe builder.appendRange(&mut hooks, context, string, i32.toI64(start), i32.toI64(end))
+          }
+        } else {
+          scope.values[0] = run unsafe getIndex(&mut hooks, context, captures, k)
+          if scope.values[0].tag() != 3 {
+            if builder.failed { fail JsException {} }
+            let owned = scope.take(0)
+            scope.values[0] = run unsafe stringFree(&mut hooks, context, owned)
+            if !run unsafe builder.append(&mut hooks, context, scope.values[0]) { fail JsException {} }
+          }
+          unsafe clear(&mut hooks, context, &mut scope, 0)
+        }
+      } else { substituted = false }
+    } else if c == 60 && namedCaptures.tag() != 3 {
+      let mut end = j
+      while end < length && Strings.codeUnit(replacement, end) != 62 { end = end + 1 }
+      if end == length { substituted = false }
+      else {
+        scope.values[0] = run unsafe substring(&mut hooks, context, replacement, usize.toI64(j), usize.toI64(end))
+        scope.values[1] = run unsafe getName(&mut hooks, context, namedCaptures, scope.values[0])
+        if scope.values[1].tag() != 3 {
+          if builder.failed { fail JsException {} }
+          let owned = scope.take(1)
+          scope.values[1] = run unsafe stringFree(&mut hooks, context, owned)
+          if !run unsafe builder.append(&mut hooks, context, scope.values[1]) { fail JsException {} }
+        }
+        unsafe clear(&mut hooks, context, &mut scope, 1)
+        unsafe clear(&mut hooks, context, &mut scope, 0)
+        j = end + 1
+      }
+    } else { substituted = false }
+    if !substituted {
+      let unchanged = run unsafe builder.appendRange(&mut hooks, context, replacement, usize.toI64(literal), usize.toI64(j))
+    }
+    i = j
+  }
+  let tail = run unsafe builder.appendRange(&mut hooks, context, replacement, usize.toI64(i), usize.toI64(length))
+}
+
+// Non-observable shape traversal: custom accessors/exotic prototypes must take
+// the generic path. Match the pinned source's checks, not a broader heuristic.
+unsafe fn findSlot(receiver: Value, atom: u32, own: bool) -> Option<PropertySlot> {
+  let mut cursor = core.reference(receiver)
+  let anchor = ()
+  while true {
+    let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, cursor)
+    match unsafe shapes.lookup(object.shape, atom) {
+      Option<usize>.Some { value: index } => { return Option<PropertySlot>.some(object.properties.get(index)) }
+      Option<usize>.None => ()
+    }
+    if own { return Option<PropertySlot>.none() }
+    let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, object.shape)
+    let prototype = shape.prototype
+    drop shape
+    drop object
+    cursor = match Pointer.nonNullMut<HeapHeader>(prototype) {
+      Option<*mut HeapHeader>.Some { value } => value
+      Option<*mut HeapHeader>.None => { return Option<PropertySlot>.none() }
+    }
+    let parent = unsafe HeapCell.payload<ObjectData, ()>(&anchor, cursor)
+    if parent.isExotic { return Option<PropertySlot>.none() }
+  }
+}
+unsafe fn native(value: Value, method: u32, magic: i32) -> bool {
+  if !value.isObject() { return false }
+  let anchor = ()
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(value))
+  if object.classId != classes.JS_CLASS_C_FUNCTION { return false }
+  return match &object.payload {
+    ObjectPayload.NativeFunction { function } => {
+      if function.isDataFunction || function.magic != magic { return false }
+      return match function.function {
+        NativeFunctionId.Builtin { family: BuiltinFamily.RegExp, method: actual } => actual == method
+        _ => false
+      }
+    }
+    _ => false
+  }
+}
+unsafe fn standardGetter(receiver: Value, atom: u32, method: u32, magic: i32) -> bool {
+  match unsafe findSlot(receiver, atom, false) {
+    Option<PropertySlot>.Some { value: PropertySlot.GetterSetter { getter, .. } } => {
+      match Pointer.nonNullMut<HeapHeader>(getter) {
+        Option<*mut HeapHeader>.Some { value } => { return unsafe native(Value.Object { reference: value }, method, magic) }
+        Option<*mut HeapHeader>.None => ()
+      }
+    }
+    _ => ()
+  }
+  return false
+}
+unsafe fn standard(receiver: Value) -> bool {
+  if !unsafe support.regexp(receiver) { return false }
+  match unsafe findSlot(receiver, atoms.JS_ATOM_lastIndex, true) {
+    Option<PropertySlot>.Some { value: PropertySlot.Value { value } } => {
+      if value.tag() != 0 && value.tag() != 8 { return false }
+    }
+    _ => { return false }
+  }
+  match unsafe findSlot(receiver, atoms.JS_ATOM_exec, false) {
+    Option<PropertySlot>.Some { value: PropertySlot.Value { value } } => { if !unsafe native(value, 7, 0) { return false } }
+    _ => { return false }
+  }
+  return unsafe standardGetter(receiver, atoms.JS_ATOM_flags, 3, 0) &&
+    unsafe standardGetter(receiver, atoms.JS_ATOM_global, 4, u32.toI32(FLAG_GLOBAL)) &&
+    unsafe standardGetter(receiver, atoms.JS_ATOM_unicode, 4, u32.toI32(FLAG_UNICODE))
+}
+unsafe effect fn optimizedReplace<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, receiver: Value, string: Value, replacement: Value) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let fields = unsafe support.fields(receiver)
+  let flags = unsafe support.flags(receiver)
+  if (flags & FLAG_NAMED_GROUPS) != 0 { return Value.Undefined }
+  let global = (flags & FLAG_GLOBAL) != 0
+  let sticky = (flags & FLAG_STICKY) != 0
+  let fullUnicode = (flags & (FLAG_UNICODE | FLAG_UNICODE_SETS)) != 0
+  if global { run unsafe execution.setLastIndex(&mut hooks, context, receiver, 0) }
+  let mut lastIndex: i64 = 0
+  if global || sticky { lastIndex = run unsafe execution.getLastIndex(&mut hooks, context, receiver) }
+  let length = usize.toI64(Strings.length(string))
+  let mut nextSource: i64 = 0
+  let mut builder = ReplacementBuffer.make()
+  while true {
+    if lastIndex > length {
+      if global || sticky { run unsafe execution.setLastIndex(&mut hooks, context, receiver, 0) }
+      break
+    }
+    let matched = run unsafe execution.execute(&mut hooks, memory, context, fields.bytecode, string, i64.toUsize(lastIndex))
+    if !matched.matched {
+      if global || sticky { run unsafe execution.setLastIndex(&mut hooks, context, receiver, 0) }
+      break
+    }
+    let start = i32.toI64(matched.captures.get(0))
+    let end = i32.toI64(matched.captures.get(1))
+    if !run unsafe builder.appendRange(&mut hooks, context, string, nextSource, start) { fail JsException {} }
+    if Strings.length(replacement) != 0 {
+      run unsafe getSubstitution(&mut hooks, context, &mut builder, Value.Undefined, string, start,
+        Value.Undefined, Value.Undefined, replacement, matched.captures.asSlice())
+    }
+    nextSource = end
+    if !global {
+      if sticky { run unsafe execution.setLastIndex(&mut hooks, context, receiver, i64.toI32(end)) }
+      break
+    }
+    lastIndex = end
+    if start == end { lastIndex = support.advance(string, end, fullUnicode) }
+  }
+  if !run unsafe builder.appendRange(&mut hooks, context, string, nextSource, length) { fail JsException {} }
+  return run unsafe builder.finish(&mut hooks, context)
+}
+
+unsafe effect fn matchBody<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + CallHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, receiver: Value, input: Value, scope: &mut Scope) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  scope.values[0] = run unsafe support.string(&mut hooks, context, input)
+  scope.values[1] = run unsafe propertyString(&mut hooks, context, receiver, atoms.JS_ATOM_flags)
+  if !contains(scope.values[1], 103) { return run unsafe execution.regExpExec(&mut hooks, memory, context, receiver, scope.values[0]) }
+  let fullUnicode = unicode(scope.values[1])
+  run unsafe support.set(&mut hooks, context, receiver, atoms.JS_ATOM_lastIndex, Value.Int { value: 0 })
+  scope.values[2] = run unsafe support.array(&mut hooks, memory, context)
+  let mut n: i64 = 0
+  while true {
+    unsafe clear(&mut hooks, context, &mut scope, 3)
+    scope.values[3] = run unsafe execution.regExpExec(&mut hooks, memory, context, receiver, scope.values[0])
+    if scope.values[3].tag() == 2 { break }
+    let matched = run unsafe getIndex(&mut hooks, context, scope.values[3], 0)
+    scope.values[4] = run unsafe stringFree(&mut hooks, context, matched)
+    let empty = Strings.length(scope.values[4]) == 0
+    let owned = scope.take(4)
+    run unsafe support.defineIndex(&mut hooks, context, scope.values[2], n, owned)
+    n = n + 1
+    if empty { run unsafe advanceEmpty(&mut hooks, context, receiver, scope.values[0], fullUnicode) }
+  }
+  if n == 0 { return Value.Null }
+  return scope.take(2)
+}
+unsafe effect fn matchAllBody<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + CallHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, receiver: Value, input: Value, scope: &mut Scope) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  scope.values[0] = run unsafe support.string(&mut hooks, context, input)
+  let defaultCtor = unsafe defaultConstructor(context)
+  scope.values[1] = run unsafe constructors.speciesConstructor(&mut hooks, context, receiver, defaultCtor)
+  scope.values[2] = run unsafe propertyString(&mut hooks, context, receiver, atoms.JS_ATOM_flags)
+  scope.values[3] = run unsafe construct(&mut hooks, context, scope.values[1], receiver, scope.values[2])
+  let lastIndex = run unsafe propertyLength(&mut hooks, context, receiver, atoms.JS_ATOM_lastIndex, false)
+  run unsafe support.set(&mut hooks, context, scope.values[3], atoms.JS_ATOM_lastIndex, number(lastIndex))
+  return run unsafe iterator.create(&mut hooks, memory, context, scope.values[3], scope.values[0], contains(scope.values[2], 103), unicode(scope.values[2]))
+}
+unsafe effect fn searchBody<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + CallHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, receiver: Value, input: Value, scope: &mut Scope) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  scope.values[0] = run unsafe support.string(&mut hooks, context, input)
+  scope.values[1] = run unsafe support.get(&mut hooks, context, receiver, atoms.JS_ATOM_lastIndex)
+  if !unsafe core.sameValue(scope.values[1], Value.Int { value: 0 }) {
+    run unsafe support.set(&mut hooks, context, receiver, atoms.JS_ATOM_lastIndex, Value.Int { value: 0 })
+  }
+  // Deliberately no finally restoration if exec or the second getter throws.
+  scope.values[2] = run unsafe execution.regExpExec(&mut hooks, memory, context, receiver, scope.values[0])
+  scope.values[3] = run unsafe support.get(&mut hooks, context, receiver, atoms.JS_ATOM_lastIndex)
+  if !unsafe core.sameValue(scope.values[3], scope.values[1]) {
+    let previous = scope.take(1)
+    run unsafe support.set(&mut hooks, context, receiver, atoms.JS_ATOM_lastIndex, previous)
+  }
+  if scope.values[2].tag() == 2 { return Value.Int { value: -1 } }
+  return run unsafe support.get(&mut hooks, context, scope.values[2], atoms.JS_ATOM_index)
+}
+unsafe effect fn splitBody<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + CallHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, receiver: Value, input: Value, limit: Value, scope: &mut Scope) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  scope.values[0] = run unsafe support.string(&mut hooks, context, input)
+  let defaultCtor = unsafe defaultConstructor(context)
+  scope.values[1] = run unsafe constructors.speciesConstructor(&mut hooks, context, receiver, defaultCtor)
+  scope.values[2] = run unsafe propertyString(&mut hooks, context, receiver, atoms.JS_ATOM_flags)
+  let fullUnicode = unicode(scope.values[2])
+  if !contains(scope.values[2], 121) {
+    let mut flagBuilder = StringBuilder.make()
+    run flagBuilder.append(scope.values[2])
+    run flagBuilder.appendUnit(121)
+    unsafe clear(&mut hooks, context, &mut scope, 2)
+    scope.values[2] = run flagBuilder.finish()
+  }
+  scope.values[3] = run unsafe construct(&mut hooks, context, scope.values[1], receiver, scope.values[2])
+  scope.values[4] = run unsafe support.array(&mut hooks, memory, context)
+  let mut maximum: i64 = 4294967295
+  if limit.tag() != 3 { maximum = u32.toI64(run unsafe support.uint32(&mut hooks, context, limit)) }
+  if maximum == 0 { return scope.take(4) }
+  let size = usize.toI64(Strings.length(scope.values[0]))
+  let mut p: i64 = 0
+  let mut q: i64 = 0
+  let mut count: i64 = 0
+  if size == 0 {
+    scope.values[5] = run unsafe execution.regExpExec(&mut hooks, memory, context, scope.values[3], scope.values[0])
+    if scope.values[5].tag() != 2 { return scope.take(4) }
+  }
+  while q < size {
+    run unsafe support.set(&mut hooks, context, scope.values[3], atoms.JS_ATOM_lastIndex, number(q))
+    unsafe clear(&mut hooks, context, &mut scope, 5)
+    scope.values[5] = run unsafe execution.regExpExec(&mut hooks, memory, context, scope.values[3], scope.values[0])
+    if scope.values[5].tag() == 2 { q = support.advance(scope.values[0], q, fullUnicode) }
+    else {
+      let mut end = run unsafe propertyLength(&mut hooks, context, scope.values[3], atoms.JS_ATOM_lastIndex, false)
+      if end > size { end = size }
+      if end == p { q = support.advance(scope.values[0], q, fullUnicode) }
+      else {
+        let sub = run unsafe substring(&mut hooks, context, scope.values[0], p, q)
+        run unsafe support.defineIndex(&mut hooks, context, scope.values[4], count, sub)
+        count = count + 1
+        if count == maximum { return scope.take(4) }
+        p = end
+        let captureCount = run unsafe propertyLength(&mut hooks, context, scope.values[5], atoms.JS_ATOM_length, false)
+        let mut capture: i64 = 1
+        while capture < captureCount {
+          let captured = run unsafe getIndex(&mut hooks, context, scope.values[5], capture)
+          run unsafe support.defineIndex(&mut hooks, context, scope.values[4], count, captured)
+          count = count + 1
+          if count == maximum { return scope.take(4) }
+          capture = capture + 1
+        }
+        q = p
+      }
+    }
+  }
+  if p > size { p = size }
+  let tail = run unsafe substring(&mut hooks, context, scope.values[0], p, size)
+  run unsafe support.defineIndex(&mut hooks, context, scope.values[4], count, tail)
+  return scope.take(4)
+}
+unsafe effect fn replaceBody<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + CallHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, receiver: Value, input: Value, replacement: Value, scope: &mut Scope) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  scope.values[0] = run unsafe support.string(&mut hooks, context, input)
+  let functional = unsafe hooks.isCallable(context, replacement)
+  if !functional { scope.values[1] = run unsafe support.string(&mut hooks, context, replacement) }
+  if !functional && unsafe standard(receiver) {
+    let optimized = run unsafe optimizedReplace(&mut hooks, memory, context, receiver, scope.values[0], scope.values[1])
+    if optimized.tag() != 3 { return optimized }
+  }
+  scope.values[2] = run unsafe propertyString(&mut hooks, context, receiver, atoms.JS_ATOM_flags)
+  let global = contains(scope.values[2], 103)
+  let fullUnicode = unicode(scope.values[2])
+  if global { run unsafe support.set(&mut hooks, context, receiver, atoms.JS_ATOM_lastIndex, Value.Int { value: 0 }) }
+  while true {
+    scope.values[6] = run unsafe execution.regExpExec(&mut hooks, memory, context, receiver, scope.values[0])
+    if scope.values[6].tag() == 2 { break }
+    let result = scope.values[6]
+    run scope.collect()
+    if !global { break }
+    unsafe clear(&mut hooks, context, &mut scope, 3)
+    let matched = run unsafe getIndex(&mut hooks, context, result, 0)
+    scope.values[3] = run unsafe stringFree(&mut hooks, context, matched)
+    if Strings.length(scope.values[3]) == 0 { run unsafe advanceEmpty(&mut hooks, context, receiver, scope.values[0], fullUnicode) }
+  }
+  let length = usize.toI64(Strings.length(scope.values[0]))
+  let mut nextSource: i64 = 0
+  let mut builder = ReplacementBuffer.make()
+  let mut j: usize = 0
+  while j < scope.count {
+    let result = scope.result(j)
+    let captureCount = run unsafe propertyLength(&mut hooks, context, result, atoms.JS_ATOM_length, true)
+    unsafe clear(&mut hooks, context, &mut scope, 3)
+    let matched = run unsafe getIndex(&mut hooks, context, result, 0)
+    scope.values[3] = run unsafe stringFree(&mut hooks, context, matched)
+    let mut position = run unsafe propertyLength(&mut hooks, context, result, atoms.JS_ATOM_index, false)
+    if position > length { position = length }
+    unsafe clear(&mut hooks, context, &mut scope, 4)
+    scope.values[4] = run unsafe support.array(&mut hooks, memory, context)
+    run unsafe support.defineIndex(&mut hooks, context, scope.values[4], 0, unsafe scope.values[3].retained())
+    let mut n: i64 = 1
+    while n < captureCount {
+      let capture = run unsafe getIndex(&mut hooks, context, result, n)
+      let mut converted = capture
+      if capture.tag() != 3 { converted = run unsafe stringFree(&mut hooks, context, capture) }
+      run unsafe support.defineIndex(&mut hooks, context, scope.values[4], n, converted)
+      n = n + 1
+    }
+    unsafe clear(&mut hooks, context, &mut scope, 5)
+    scope.values[5] = run unsafe support.get(&mut hooks, context, result, atoms.JS_ATOM_groups)
+    if functional {
+      run unsafe support.defineIndex(&mut hooks, context, scope.values[4], n, number(position))
+      n = n + 1
+      run unsafe support.defineIndex(&mut hooks, context, scope.values[4], n, unsafe scope.values[0].retained())
+      n = n + 1
+      if scope.values[5].tag() != 3 {
+        run unsafe support.defineIndex(&mut hooks, context, scope.values[4], n, unsafe scope.values[5].retained())
+      }
+      let mut arguments: [Value; 2] = [Value.Undefined, scope.values[4]]
+      let argv = FrameSlots.Borrowed { data: Pointer.fromMutRef<Value>(&mut arguments[0]), length: 2 }
+      unsafe clear(&mut hooks, context, &mut scope, 7)
+      let called = run unsafe invoke.apply(&mut hooks, context, replacement, &argv, 0)
+      scope.values[7] = run unsafe stringFree(&mut hooks, context, called)
+    } else {
+      if scope.values[5].tag() != 3 { scope.values[8] = run unsafe boxing.toObject(&mut hooks, memory, context, scope.values[5]) }
+      unsafe clear(&mut hooks, context, &mut scope, 7)
+      let mut substitution = ReplacementBuffer.make()
+      run unsafe getSubstitution(&mut hooks, context, &mut substitution, scope.values[3], scope.values[0], position,
+        scope.values[4], scope.values[8], scope.values[1], &[])
+      scope.values[7] = run unsafe substitution.finish(&mut hooks, context)
+      unsafe clear(&mut hooks, context, &mut scope, 8)
+    }
+    // Callbacks and captures are still evaluated for backwards custom matches.
+    if position >= nextSource {
+      let before = run unsafe builder.appendRange(&mut hooks, context, scope.values[0], nextSource, position)
+      let replacementText = run unsafe builder.append(&mut hooks, context, scope.values[7])
+      nextSource = position + usize.toI64(Strings.length(scope.values[3]))
+    }
+    j = j + 1
+  }
+  let tail = run unsafe builder.appendRange(&mut hooks, context, scope.values[0], nextSource, length)
+  return run unsafe builder.finish(&mut hooks, context)
+}
+unsafe effect fn nextBody<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + CallHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, receiver: Value, done: &mut i32, scope: &mut Scope) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  if !unsafe iterator.valid(receiver) { return run unsafe core.error(&mut hooks, context, b"not a RegExp String Iterator") }
+  let object = core.reference(receiver)
+  let state = unsafe iterator.fields(object)
+  if state.done { done.* = 1 return Value.Undefined }
+  scope.values[0] = run unsafe execution.regExpExec(&mut hooks, memory, context, state.regexp, state.string)
+  if scope.values[0].tag() == 2 {
+    unsafe iterator.setDone(object)
+    done.* = 1
+    return Value.Undefined
+  }
+  // Re-read global/unicode after exec, as the source accesses the record after
+  // the callback (reentrant next may already have set done, which is not reset).
+  let current = unsafe iterator.fields(object)
+  if current.global {
+    let matched = run unsafe getIndex(&mut hooks, context, scope.values[0], 0)
+    scope.values[1] = run unsafe stringFree(&mut hooks, context, matched)
+    if Strings.length(scope.values[1]) == 0 {
+      run unsafe advanceEmpty(&mut hooks, context, state.regexp, state.string, current.unicode)
+    }
+  } else { unsafe iterator.setDone(object) }
+  done.* = 0
+  return scope.take(0)
+}
+
+// Shared boundary preserves a real pending exception during all Value cleanup.
+unsafe effect fn dispatch<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + CallHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, method: u32, receiver: Value, input: Value,
+  extra: Value, done: &mut i32) -> Value ! JsException ? &mut Allocator {
+  done.* = 0
+  if method != 14 && !receiver.isObject() { return run unsafe core.error(&mut hooks, context, b"not an object") }
+  let mut scope = Scope.make()
+  let attempted = run Effect.result(unsafe body(&mut hooks, memory, context, method, receiver, input, extra, &mut done, &mut scope))
+  let output = match move attempted {
+    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Success { value } => value
+    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Failure { error } =>
+      run Effect.catch<JsException>(unsafe support.materialize(&mut hooks, context, move error), core.exceptionValue)
+  }
+  unsafe dispose(&mut hooks, context, &mut scope)
+  if output.isException() { done.* = 0 fail JsException {} }
+  return output
+}
+unsafe effect fn body<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + CallHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, method: u32, receiver: Value, input: Value,
+  extra: Value, done: &mut i32, scope: &mut Scope) -> Value ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  if method == 9 { return run unsafe matchBody(&mut hooks, memory, context, receiver, input, &mut scope) }
+  if method == 10 { return run unsafe matchAllBody(&mut hooks, memory, context, receiver, input, &mut scope) }
+  if method == 11 { return run unsafe replaceBody(&mut hooks, memory, context, receiver, input, extra, &mut scope) }
+  if method == 12 { return run unsafe searchBody(&mut hooks, memory, context, receiver, input, &mut scope) }
+  if method == 13 { return run unsafe splitBody(&mut hooks, memory, context, receiver, input, extra, &mut scope) }
+  return run unsafe nextBody(&mut hooks, memory, context, receiver, &mut done, &mut scope)
+}
+pub unsafe effect fn matchString<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + CallHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, receiver: Value, input: Value) -> Value ! JsException ? &mut Allocator {
+  let mut done: i32 = 0
+  return run unsafe dispatch(&mut hooks, memory, context, 9, receiver, input, Value.Undefined, &mut done)
+}
+pub unsafe effect fn matchAll<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + CallHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, receiver: Value, input: Value) -> Value ! JsException ? &mut Allocator {
+  let mut done: i32 = 0
+  return run unsafe dispatch(&mut hooks, memory, context, 10, receiver, input, Value.Undefined, &mut done)
+}
+pub unsafe effect fn replace<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + CallHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, receiver: Value, input: Value, replacement: Value) -> Value ! JsException ? &mut Allocator {
+  let mut done: i32 = 0
+  return run unsafe dispatch(&mut hooks, memory, context, 11, receiver, input, replacement, &mut done)
+}
+pub unsafe effect fn search<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + CallHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, receiver: Value, input: Value) -> Value ! JsException ? &mut Allocator {
+  let mut done: i32 = 0
+  return run unsafe dispatch(&mut hooks, memory, context, 12, receiver, input, Value.Undefined, &mut done)
+}
+pub unsafe effect fn split<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + CallHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, receiver: Value, input: Value, limit: Value) -> Value ! JsException ? &mut Allocator {
+  let mut done: i32 = 0
+  return run unsafe dispatch(&mut hooks, memory, context, 13, receiver, input, limit, &mut done)
+}
+pub unsafe effect fn iteratorNext<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + CallHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, receiver: Value, done: &mut i32) -> Value ! JsException ? &mut Allocator {
+  return run unsafe dispatch(&mut hooks, memory, context, 14, receiver, Value.Undefined, Value.Undefined, &mut done)
+}

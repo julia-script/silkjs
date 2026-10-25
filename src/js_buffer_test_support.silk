@@ -1,0 +1,339 @@
+//! Callback-capable buffer consumers using real objects, native ABI and backing
+//! owners. Host callbacks have their own ledger; no synthetic typed-array caches.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.list { List }
+import silk.pointer { Pointer }
+import silk.raw_buffer { RawBuffer }
+import silk.layout { Layout }
+import silk.slot { Slot }
+import silk.u32
+import runtime_memory { AllocationObserver }
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_value { Value }
+import js_core_types { FrameSlots, NativeFunctionId, NativeCallProtocol, NativeErrorKind, BuiltinFamily, WeakRefHeader }
+import js_gc { HeapHooks, Tracer }
+import js_gc as gc
+import js_runtime as runtime
+import js_runtime_registry as registry
+import js_runtime_classes as definitions
+import js_class_data as classes
+import js_atom_data as atoms
+import js_coercion_host { CoercionHooks }
+import js_property_host { OwnPropertyHooks, OwnPropertyResult, GetPropertyHooks, HasPropertyHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_call_host { CallHooks }
+import js_native_function_host { NativeFunctionHooks, NativeIteratorResult }
+import js_object_intrinsics_test_support { Hooks as BaseHooks }
+import js_proxy_test_support as proxyFixture
+import js_property_get as get
+import js_property_mutations as properties
+import js_object_allocate as objects
+import js_native_functions as native
+import js_proxy_core as core
+import js_boxing as boxing
+import js_array_storage_test_support { trap }
+import js_typed_array_read as indexed
+import js_buffer_storage as storage
+import js_buffer_storage { BufferHooks }
+import js_typed_array_buffer as typed
+import js_typed_array_methods as typedMethods
+import js_typed_array_methods_iterator as arrayIterator
+import js_dataview as dataview
+import js_array_buffer_intrinsics as buffers
+import js_exceptions { JsException }
+import js_exceptions as exceptions
+import js_string_types { StringLengthError }
+import js_bigint { BigIntError }
+
+struct HostBytes { bytes: Intrinsic.RawBuffer<u8>, references: u32 }
+struct HostOwner { data: ?*mut u8, owner: ?*mut HeapHeader }
+pub struct Hooks<'a> {
+  pub base: BaseHooks<'a>, pub memory: &'a AllocationObserver,
+  pub target: Value, pub callbackValue: Value, pub events: u32,
+  pub action: u32, pub resizeLength: u32, pub nextCalls: u32, pub closed: u32, pub callbackCalls: u32,
+  pub failNext: bool, pub viewFinalizers: u32, pub bufferFinalizers: u32,
+  pub hostAllocations: u32, pub hostDuplicates: u32, pub hostFrees: u32, pub hostLive: u32, pub hostNullFrees: u32,
+  hostOwners: List<HostOwner>
+}
+impl<'a> Hooks<'a> {
+  pub fn make(memory: &'a AllocationObserver) -> Self {
+    return Self { base: BaseHooks.make(memory), memory: memory,
+      target: Value.Undefined, callbackValue: Value.Int { value: 0 }, events: 0,
+      action: 0, resizeLength: 0, nextCalls: 0, closed: 0, callbackCalls: 0, failNext: false,
+      viewFinalizers: 0, bufferFinalizers: 0, hostAllocations: 0, hostDuplicates: 0,
+      hostFrees: 0, hostLive: 0, hostNullFrees: 0, hostOwners: List<HostOwner>.make() }
+  }
+  /// Call after releasing all buffers, before inspecting the runtime allocator.
+  pub fn clearHostLedger(self: &mut Self) -> () {
+    if self.hostLive != 0 { trap() }
+    self.hostOwners = List<HostOwner>.make()
+  }
+}
+fn runtimeCallback(id: NativeFunctionId, expected: u32) -> bool {
+  return match id { NativeFunctionId.Builtin { family, method } => family == BuiltinFamily.Runtime && method == expected _ => false }
+}
+impl<'a> HeapHooks for Hooks<'a> {
+  unsafe fn traceClass(self: &mut Self, rt: *mut HeapHeader, object: *mut HeapHeader, id: NativeFunctionId, tracer: &mut Tracer) -> () {
+    if runtimeCallback(id, 20) { unsafe storage.markView(object, &mut tracer) return () }
+    if runtimeCallback(id, definitions.NATIVE_JS_ARRAY_ITERATOR_MARK) { unsafe arrayIterator.mark(object, &mut tracer) return () }
+    unsafe self.base.traceClass(rt, object, id, &mut tracer)
+  }
+  unsafe fn finalizeClass(self: &mut Self, rt: *mut HeapHeader, object: *mut HeapHeader, id: NativeFunctionId) -> () {
+    if runtimeCallback(id, 18) { self.bufferFinalizers = self.bufferFinalizers + 1 unsafe storage.finalizeBuffer(&mut self, rt, object) return () }
+    if runtimeCallback(id, 19) { self.viewFinalizers = self.viewFinalizers + 1 unsafe storage.finalizeView(&mut self, rt, object) return () }
+    if runtimeCallback(id, definitions.NATIVE_JS_ARRAY_ITERATOR_FINALIZER) { unsafe arrayIterator.finalize(&mut self, rt, object) return () }
+    unsafe self.base.finalizeClass(rt, object, id)
+  }
+  unsafe effect fn sweepWeak(self: &mut Self, rt: *mut HeapHeader, node: *mut WeakRefHeader) -> () ? &mut Allocator { run unsafe self.base.sweepWeak(rt, node) }
+  unsafe fn destroyAuxiliary(self: &mut Self, rt: *mut HeapHeader, node: *mut HeapHeader) -> () { unsafe self.base.destroyAuxiliary(rt, node) }
+}
+impl<'a> BufferHooks for Hooks<'a> {
+  unsafe effect fn allocateShared(self: &mut Self, rt: *mut HeapHeader, id: NativeFunctionId, opaque: ?*mut u8, length: usize) -> ?*mut u8 ! OutOfMemoryError ? &mut Allocator {
+    let mut size = length if size == 0 { size = 1 }
+    let allocation = run Allocator.allocate(Layout { bytes: size, alignment: 8 })
+    let mut bytes = unsafe RawBuffer.from<u8>(move allocation, size)
+    RawBuffer.fill(&mut bytes, 0, size, 0)
+    let data = Slot.address(RawBuffer.slot<u8>(&mut bytes, 0))
+    let owner = run HeapCell.allocate(HeapKind.Auxiliary, HostBytes { bytes: move bytes, references: 1 })
+    let appended = run Effect.result(self.hostOwners.append(HostOwner { data: data, owner: owner }))
+    match move appended {
+      Result<(), OutOfMemoryError>.Success { .. } => ()
+      Result<(), OutOfMemoryError>.Failure { error } => { unsafe HeapCell.destroy<HostBytes>(owner) fail move error }
+    }
+    self.hostAllocations = self.hostAllocations + 1 self.hostLive = self.hostLive + 1
+    return data
+  }
+  unsafe fn duplicateShared(self: &mut Self, rt: *mut HeapHeader, id: NativeFunctionId, opaque: ?*mut u8, data: ?*mut u8) -> () {
+    let owner = unsafe hostOwner(&self, data)
+    let mut anchor = () let bytes = unsafe HeapCell.payloadMut<HostBytes, ()>(&mut anchor, owner)
+    bytes.references = bytes.references + 1 self.hostDuplicates = self.hostDuplicates + 1
+  }
+  unsafe fn freeShared(self: &mut Self, rt: *mut HeapHeader, id: Option<NativeFunctionId>, opaque: ?*mut u8, data: ?*mut u8) -> () { unsafe releaseHost(&mut self, data) }
+  unsafe fn freeExternal(self: &mut Self, rt: *mut HeapHeader, id: NativeFunctionId, opaque: ?*mut u8, data: ?*mut u8) -> () { unsafe releaseHost(&mut self, data) }
+}
+unsafe fn address(data: ?*mut u8) -> usize {
+  return Pointer.address<u8>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(data))
+}
+unsafe fn hostOwner<'a>(hooks: &Hooks<'a>, data: ?*mut u8) -> *mut HeapHeader {
+  let mut i: usize = 0
+  while i < hooks.hostOwners.length() {
+    let entry = &hooks.hostOwners.asSlice()[i]
+    if unsafe address(entry.data) == unsafe address(data) && !Pointer.isNull<HeapHeader>(entry.owner) {
+      return unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(entry.owner)
+    }
+    i = i + 1
+  }
+  return trap()
+}
+unsafe fn releaseHost<'a>(hooks: &mut Hooks<'a>, data: ?*mut u8) -> () {
+  if Pointer.isNull<u8>(data) {
+    hooks.hostFrees = hooks.hostFrees + 1 hooks.hostNullFrees = hooks.hostNullFrees + 1
+    return ()
+  }
+  let owner = unsafe hostOwner(&hooks, data)
+  let mut anchor = () let bytes = unsafe HeapCell.payloadMut<HostBytes, ()>(&mut anchor, owner)
+  bytes.references = bytes.references - 1 let last = bytes.references == 0 drop bytes
+  hooks.hostFrees = hooks.hostFrees + 1
+  if !last { return () }
+  let mut i: usize = 0
+  while i < hooks.hostOwners.length() {
+    if unsafe address(hooks.hostOwners.asSlice()[i].data) == unsafe address(data) {
+      hooks.hostOwners.set(i, HostOwner { data: Pointer.null<u8>(), owner: Pointer.null<HeapHeader>() })
+      break
+    }
+    i = i + 1
+  }
+  hooks.hostLive = hooks.hostLive - 1 unsafe HeapCell.destroy<HostBytes>(owner)
+}
+impl<'a> CoercionHooks for Hooks<'a> {
+  unsafe effect fn throwError(self: &mut Self, ctx: *mut HeapHeader, kind: NativeErrorKind, message: &[u8]) -> never ! JsException ? &mut Allocator { return run unsafe self.base.throwError(ctx, kind, message) }
+  unsafe effect fn throwOutOfMemory(self: &mut Self, ctx: *mut HeapHeader) -> never ! JsException ? &mut Allocator { return run unsafe self.base.throwOutOfMemory(ctx) }
+  unsafe fn isCallable(self: &mut Self, ctx: *mut HeapHeader, value: Value) -> bool { return unsafe self.base.isCallable(ctx, value) }
+  unsafe effect fn getProperty(self: &mut Self, ctx: *mut HeapHeader, object: Value, atom: u32) -> Value ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe get.getProperty(&mut self, ctx, object, atom) }
+  unsafe effect fn call(self: &mut Self, ctx: *mut HeapHeader, function: Value, receiver: Value, arguments: &[Value]) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+    let mut missing = Value.Undefined let mut data = Pointer.fromMutRef<Value>(&mut missing)
+    if arguments.length != 0 { data = unsafe Intrinsic.pointerRequalify<*const Value, *mut Value>(Pointer.fromRef<Value>(&arguments[0])) }
+    let argv = FrameSlots.Borrowed { data: data, length: arguments.length }
+    return run unsafe self.callArguments(ctx, function, receiver, &argv)
+  }
+}
+impl<'a> CallHooks for Hooks<'a> {
+  unsafe effect fn callArguments(self: &mut Self, ctx: *mut HeapHeader, function: Value, receiver: Value, arguments: &FrameSlots) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+    if !unsafe self.isCallable(ctx, function) { return run unsafe self.throwError(ctx, NativeErrorKind.Type, b"not a function") }
+    let memory = self.memory return run unsafe native.call(&mut self, memory, ctx, function, receiver, arguments, 0)
+  }
+  unsafe effect fn construct(self: &mut Self, ctx: *mut HeapHeader, function: Value, newTarget: Value, arguments: &FrameSlots) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+    if !function.isObject() { return run unsafe self.throwError(ctx, NativeErrorKind.Type, b"not a function") }
+    if !unsafe boxing.isConstructor(function) { return run unsafe core.throwNotConstructor(&mut self, ctx, function) }
+    let memory = self.memory return run unsafe native.call(&mut self, memory, ctx, function, newTarget, arguments, 1)
+  }
+}
+impl<'a> OwnPropertyHooks for Hooks<'a> {
+  unsafe effect fn throwNotObject(self: &mut Self, ctx: *mut HeapHeader) -> never ! JsException ? &mut Allocator { return run unsafe self.base.throwNotObject(ctx) }
+  unsafe effect fn throwUninitialized(self: &mut Self, ctx: *mut HeapHeader, atom: u32) -> never ! JsException ? &mut Allocator { return run unsafe self.base.throwUninitialized(ctx, atom) }
+  unsafe effect fn instantiateAutoInit(self: &mut Self, ctx: *mut HeapHeader, object: Value, atom: u32) -> () ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe self.base.instantiateAutoInit(ctx, object, atom) }
+  unsafe effect fn readTypedIndex(self: &mut Self, ctx: *mut HeapHeader, object: Value, index: u32) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+    return match run unsafe indexed.readIndex(core.reference(object), index) { Option<Value>.Some { value } => value Option<Value>.None => Value.Undefined }
+  }
+  unsafe effect fn getExoticOwnProperty(self: &mut Self, ctx: *mut HeapHeader, table: NativeFunctionId, object: Value, atom: u32, requested: bool) -> OwnPropertyResult ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe self.base.getExoticOwnProperty(ctx, table, object, atom, requested) }
+}
+impl<'a> GetPropertyHooks for Hooks<'a> {
+  unsafe effect fn getExoticProperty(self: &mut Self, ctx: *mut HeapHeader, table: NativeFunctionId, object: Value, atom: u32, receiver: Value) -> Value ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe self.base.getExoticProperty(ctx, table, object, atom, receiver) }
+}
+impl<'a> HasPropertyHooks for Hooks<'a> {
+  unsafe effect fn hasExoticProperty(self: &mut Self, ctx: *mut HeapHeader, table: NativeFunctionId, object: Value, atom: u32) -> bool
+    ! OutOfMemoryError | JsException ? &mut Allocator {
+    return run unsafe self.base.hasExoticProperty(ctx, table, object, atom)
+  }
+}
+impl<'a> PropertyWriteHooks for Hooks<'a> {
+  unsafe effect fn setExoticProperty(self: &mut Self, ctx: *mut HeapHeader, table: NativeFunctionId, object: Value, atom: u32, value: Value, receiver: Value, flags: u32) -> bool ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe self.base.setExoticProperty(ctx, table, object, atom, value, receiver, flags) }
+  unsafe effect fn defineExoticProperty(self: &mut Self, ctx: *mut HeapHeader, table: NativeFunctionId, object: Value, atom: u32, value: Value, getter: Value, setter: Value, flags: u32) -> bool ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe self.base.defineExoticProperty(ctx, table, object, atom, value, getter, setter, flags) }
+  unsafe effect fn deleteExoticProperty(self: &mut Self, ctx: *mut HeapHeader, table: NativeFunctionId, object: Value, atom: u32) -> bool ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe self.base.deleteExoticProperty(ctx, table, object, atom) }
+  unsafe effect fn isExoticExtensible(self: &mut Self, ctx: *mut HeapHeader, table: NativeFunctionId, object: Value) -> bool ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe self.base.isExoticExtensible(ctx, table, object) }
+}
+// Host IDs 101+ never overlap the base fixture's bytecode bodies (notably body6).
+unsafe effect fn observed<'a>(hooks: &mut Hooks<'a>, ctx: *mut HeapHeader, id: u32, receiver: Value) -> Value ! JsException ? &mut Allocator {
+  hooks.events = u32.wrappingAdd(u32.wrappingMultiply(hooks.events, 10), id - 100)
+  if id == 101 { return unsafe receiver.retained() }
+  if id == 102 {
+    hooks.nextCalls = hooks.nextCalls + 1
+    if hooks.failNext && hooks.nextCalls == 2 { return run unsafe exceptions.throwValue<Value, Hooks<'a>>(&mut hooks, unsafe runtime.contextRuntime(ctx), Value.Int { value: 707 }) }
+    let memory = hooks.memory let mut done: i32 = 0 if hooks.nextCalls > 3 { done = 1 }
+    let value = Value.number(u32.toF64(hooks.nextCalls * 100))
+    return run unsafe native.createIteratorResult(&mut hooks, memory, ctx, value, done)
+  }
+  if id == 103 { hooks.closed = hooks.closed + 1 return Value.Undefined }
+  if id >= 104 && id <= 109 {
+    hooks.callbackCalls = hooks.callbackCalls + 1
+    let target = hooks.target
+    if hooks.action == 1 { unsafe storage.detach(&mut hooks, unsafe runtime.contextRuntime(ctx), target) }
+    if hooks.action == 2 {
+      let resized = run Effect.result(unsafe storage.resize(core.reference(target), hooks.resizeLength))
+      match move resized {
+        Result<(), OutOfMemoryError>.Success { .. } => ()
+        Result<(), OutOfMemoryError>.Failure { error } => { return run unsafe core.materialize(&mut hooks, ctx, move error) }
+      }
+    }
+    if id == 105 { return Value.Null }
+    return unsafe hooks.callbackValue.retained()
+  }
+  return trap()
+}
+unsafe effect fn family<'a>(hooks: &mut Hooks<'a>, ctx: *mut HeapHeader, id: NativeFunctionId,
+  receiver: Value, argv: &FrameSlots, magic: i32) -> Value ! JsException ? &mut Allocator {
+  let memory = hooks.memory
+  match id {
+    NativeFunctionId.Builtin { family, method } => {
+      if family == BuiltinFamily.TypedArray {
+        if method >= 8 { return run unsafe typedMethods.call(&mut hooks, memory, ctx, method - 8, receiver, argv) }
+        return run unsafe typed.dispatch(&mut hooks, memory, ctx, method, receiver, receiver, argv, magic)
+      }
+      if family == BuiltinFamily.DataView { return run unsafe dataview.dispatch(&mut hooks, memory, ctx, method, receiver, argv, receiver, magic) }
+      if family == BuiltinFamily.ArrayBuffer || family == BuiltinFamily.SharedArrayBuffer {
+        return run unsafe buffers.dispatch(&mut hooks, memory, ctx, receiver, receiver, argv, method, family == BuiltinFamily.SharedArrayBuffer)
+      }
+    }
+    NativeFunctionId.Host { id: callback } => { return run unsafe observed(&mut hooks, ctx, callback, receiver) }
+  }
+  return trap()
+}
+impl<'a> NativeFunctionHooks for Hooks<'a> {
+  unsafe effect fn nativeGeneric(self: &mut Self, id: NativeFunctionId, ctx: *mut HeapHeader, receiver: Value, argc: i32, argv: &FrameSlots) -> Value ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe family(&mut self, ctx, id, receiver, argv, 0) }
+  unsafe effect fn nativeMagic(self: &mut Self, id: NativeFunctionId, ctx: *mut HeapHeader, receiver: Value, argc: i32, argv: &FrameSlots, magic: i32) -> Value ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe family(&mut self, ctx, id, receiver, argv, magic) }
+  unsafe effect fn nativeGetter(self: &mut Self, id: NativeFunctionId, ctx: *mut HeapHeader, receiver: Value) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+    let mut missing = Value.Undefined let argv = FrameSlots.Borrowed { data: Pointer.fromMutRef<Value>(&mut missing), length: 0 }
+    return run unsafe family(&mut self, ctx, id, receiver, &argv, 0)
+  }
+  unsafe effect fn nativeGetterMagic(self: &mut Self, id: NativeFunctionId, ctx: *mut HeapHeader, receiver: Value, magic: i32) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+    let mut missing = Value.Undefined let argv = FrameSlots.Borrowed { data: Pointer.fromMutRef<Value>(&mut missing), length: 0 }
+    return run unsafe family(&mut self, ctx, id, receiver, &argv, magic)
+  }
+  unsafe effect fn nativeFlags(self: &mut Self, id: NativeFunctionId, ctx: *mut HeapHeader, function: Value, receiver: Value, argc: i32, argv: &FrameSlots, flags: i32) -> Value ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe self.base.nativeFlags(id, ctx, function, receiver, argc, argv, flags) }
+  fn nativeFloatUnary(self: &mut Self, id: NativeFunctionId, value: f64) -> f64 { return self.base.nativeFloatUnary(id, value) }
+  fn nativeFloatBinary(self: &mut Self, id: NativeFunctionId, left: f64, right: f64) -> f64 { return self.base.nativeFloatBinary(id, left, right) }
+  unsafe effect fn nativeSetter(self: &mut Self, id: NativeFunctionId, ctx: *mut HeapHeader, receiver: Value, value: Value) -> Value ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe self.base.nativeSetter(id, ctx, receiver, value) }
+  unsafe effect fn nativeSetterMagic(self: &mut Self, id: NativeFunctionId, ctx: *mut HeapHeader, receiver: Value, value: Value, magic: i32) -> Value ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe self.base.nativeSetterMagic(id, ctx, receiver, value, magic) }
+  unsafe effect fn nativeIteratorNext(self: &mut Self, id: NativeFunctionId, ctx: *mut HeapHeader, receiver: Value, argc: i32, argv: &FrameSlots, magic: i32) -> NativeIteratorResult
+    ! OutOfMemoryError | JsException ? &mut Allocator {
+    match id {
+      NativeFunctionId.Builtin { family, method } => {
+        if family == BuiltinFamily.Iterator && method == 0 {
+          let memory = self.memory
+          return run unsafe arrayIterator.next(&mut self, memory, ctx, receiver)
+        }
+      }
+      _ => ()
+    }
+    return run unsafe self.base.nativeIteratorNext(id, ctx, receiver, argc, argv, magic)
+  }
+  unsafe effect fn nativeData(self: &mut Self, id: NativeFunctionId, ctx: *mut HeapHeader, receiver: Value, argc: i32, argv: &FrameSlots, magic: i32, captured: &FrameSlots) -> Value ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe self.base.nativeData(id, ctx, receiver, argc, argv, magic, captured) }
+}
+pub unsafe effect fn prepare<'a>(hooks: &mut Hooks<'a>, ctx: *mut HeapHeader) -> () ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  run unsafe proxyFixture.prepare(&mut hooks.base.base, ctx)
+  let rt = unsafe runtime.contextRuntime(ctx) let memory = hooks.memory
+  let mut id = classes.JS_CLASS_ARRAY_BUFFER
+  while id <= classes.JS_CLASS_DATAVIEW {
+    let definition = definitions.standardDefinition(id)
+    let registered = run unsafe registry.registerClassAtom(rt, id, definition.classNameAtom, move definition)
+    let prototype = run unsafe objects.withPrototype(&mut hooks, memory, ctx, Value.Null)
+    unsafe runtime.setClassPrototype(&mut hooks, ctx, id, prototype)
+    id = id + 1
+  }
+  let iteratorDefinition = definitions.standardDefinition(classes.JS_CLASS_ARRAY_ITERATOR)
+  let registeredIterator = run unsafe registry.registerClassAtom(rt, classes.JS_CLASS_ARRAY_ITERATOR,
+    iteratorDefinition.classNameAtom, move iteratorDefinition)
+  let iteratorPrototype = run unsafe objects.withPrototype(&mut hooks, memory, ctx, Value.Null)
+  unsafe runtime.setClassPrototype(&mut hooks, ctx, classes.JS_CLASS_ARRAY_ITERATOR, iteratorPrototype)
+}
+pub unsafe effect fn function<'a>(hooks: &mut Hooks<'a>, ctx: *mut HeapHeader, id: u32) -> Value ! JsException ? &mut Allocator {
+  let memory = hooks.memory
+  return run unsafe native.newFunction(&mut hooks, memory, ctx, NativeFunctionId.Host { id: id }, b"buffer callback", 0, NativeCallProtocol.Generic, 0)
+}
+pub unsafe effect fn put<'a>(hooks: &mut Hooks<'a>, ctx: *mut HeapHeader, object: Value, atom: u32, value: Value) -> () ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  let accepted = run unsafe properties.definePropertyValue(&mut hooks, ctx, object, atom, unsafe value.retained(), 7)
+  if !accepted { trap() }
+}
+pub unsafe effect fn accessor<'a>(hooks: &mut Hooks<'a>, ctx: *mut HeapHeader, object: Value, atom: u32, callback: u32) -> () ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  let getter = run unsafe function(&mut hooks, ctx, callback)
+  let defined = run Effect.result(unsafe properties.defineProperty(&mut hooks, ctx, object, atom, Value.Undefined, getter, Value.Undefined, 2048 | 256 | 1))
+  unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(ctx), getter)
+  match move defined {
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { value } => { if !value { trap() } }
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => { fail move error }
+  }
+}
+/// Creates a real valueOf callback. target borrows the caller's buffer owner.
+pub unsafe effect fn coercionValue<'a>(hooks: &mut Hooks<'a>, ctx: *mut HeapHeader,
+  buffer: Value, mode: u32) -> Value ! JsException ? &mut Allocator {
+  hooks.target = buffer hooks.action = mode hooks.resizeLength = 6
+  hooks.callbackValue = Value.Int { value: 7 } hooks.callbackCalls = 0
+  let memory = hooks.memory
+  let allocated = run Effect.result(unsafe objects.object(&mut hooks, memory, ctx))
+  let object = match move allocated {
+    Result<Value, OutOfMemoryError>.Success { value } => value
+    Result<Value, OutOfMemoryError>.Failure { error } => { return run unsafe core.materialize(&mut hooks, ctx, move error) }
+  }
+  let made = run Effect.result(unsafe function(&mut hooks, ctx, 104))
+  let callback = match move made {
+    Result<Value, JsException>.Success { value } => value
+    Result<Value, JsException>.Failure { error } => {
+      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(ctx), object) fail move error
+    }
+  }
+  let defined = run Effect.result(unsafe put(&mut hooks, ctx, object, atoms.JS_ATOM_valueOf, callback))
+  let mut failed = false
+  match move defined {
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { .. } => ()
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => {
+      let pending = run Effect.catch<JsException>(unsafe core.materialize(&mut hooks, ctx, move error), core.exceptionValue)
+      failed = true
+    }
+  }
+  unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(ctx), callback)
+  if failed { unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(ctx), object) fail JsException {} }
+  return object
+}

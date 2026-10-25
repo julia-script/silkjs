@@ -1,0 +1,317 @@
+//! Complete CONFIG_ATOMICS intrinsic family, pinned QuickJS 7d1c13c5d8f8c6b32893786ed35cdcebd88194d2,
+//! quickjs.c 63982-64503. Inputs borrow rooted native-call frame values; outputs
+//! own. Reentrant coercions never retain a borrowed heap payload or stale
+//! ordinary-buffer pointer. The embedding shares one native Domain across all
+//! runtimes whose SAB backing addresses may alias (see js_atomics_native).
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.atomic { MemoryOrder }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.f64
+import silk.i64
+import silk.u32
+import silk.u64
+import runtime_memory { AllocationObserver }
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types { FrameSlots, ObjectData, ObjectPayload, RuntimeState, NativeErrorKind,
+  NativeFunctionId, NativeCallProtocol, BuiltinFamily, JS_PROP_WRITABLE, JS_PROP_CONFIGURABLE }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_coercion_host { CoercionHooks }
+import js_exceptions { JsException }
+import js_errors as errors
+import js_string_types { StringLengthError }
+import js_integer_coercions as integer
+import js_bigint_coercions as bigint
+import js_proxy_core as core
+import js_buffer_storage as storage
+import js_atomics_native as native
+import js_atomics_native { Domain, WaitResult }
+import js_shared_memory as shared
+import js_shared_memory { Span }
+import js_class_data as classes
+import js_atom_data as atoms
+
+pub const ADD: u32 = 0
+pub const AND: u32 = 1
+pub const OR: u32 = 2
+pub const SUB: u32 = 3
+pub const XOR: u32 = 4
+pub const EXCHANGE: u32 = 5
+pub const COMPARE_EXCHANGE: u32 = 6
+pub const LOAD: u32 = 7
+pub const STORE: u32 = 8
+pub const IS_LOCK_FREE: u32 = 9
+pub const PAUSE: u32 = 10
+pub const WAIT: u32 = 11
+pub const NOTIFY: u32 = 12
+pub const ENTRY_COUNT: u32 = 13
+pub fn id(method: u32) -> NativeFunctionId {
+  if method >= ENTRY_COUNT { invariant() }
+  return NativeFunctionId.Builtin { family: BuiltinFamily.Atomics, method: method }
+}
+pub fn entryMethod(entry: u32) -> u32 { if entry >= ENTRY_COUNT { invariant() } return entry }
+pub fn entryMagic(entry: u32) -> i32 { if entry < 8 { return u32.toI32(entry) } return 0 }
+pub fn entryProtocol(entry: u32) -> NativeCallProtocol {
+  if entry < 8 { return NativeCallProtocol.GenericMagic }
+  if entry < ENTRY_COUNT { return NativeCallProtocol.Generic }
+  return invariant()
+}
+pub fn entryLength(entry: u32) -> i32 {
+  if entry == COMPARE_EXCHANGE || entry == WAIT { return 4 }
+  if entry == LOAD { return 2 }
+  if entry == IS_LOCK_FREE { return 1 }
+  if entry == PAUSE { return 0 }
+  if entry < ENTRY_COUNT { return 3 }
+  return invariant()
+}
+pub fn entryName(entry: u32) -> &'static [u8] {
+  return match entry {
+    0 => b"add" 1 => b"and" 2 => b"or" 3 => b"sub" 4 => b"xor"
+    5 => b"exchange" 6 => b"compareExchange" 7 => b"load" 8 => b"store"
+    9 => b"isLockFree" 10 => b"pause" 11 => b"wait" 12 => b"notify"
+    _ => invariant()
+  }
+}
+// JS_AddIntrinsicAtomics installs a lazy ordinary global object, not a class
+// constructor. All function entries are writable/configurable, nonenumerable.
+pub fn globalName() -> &'static [u8] { return b"Atomics" }
+pub fn globalFlags() -> u32 { return JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE }
+pub fn methodFlags() -> u32 { return JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE }
+pub fn toStringTag() -> &'static [u8] { return b"Atomics" }
+pub fn toStringTagFlags() -> u32 { return JS_PROP_CONFIGURABLE }
+fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+unsafe fn argument(argv: &FrameSlots, index: usize) -> Value {
+  if index >= argv.length() { return Value.Undefined }
+  return unsafe argv.get(index)
+}
+struct Access { object: *mut HeapHeader, index: u64, classId: u32 }
+unsafe effect fn range<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader) -> never
+  ! JsException ? &mut Allocator {
+  return run unsafe hooks.throwError(context, NativeErrorKind.Range, b"out-of-bound access")
+}
+// mode 0: integer operations; 1: notify; 2: wait. In particular notify does
+// NOT revalidate after index coercion and always coerces count, even when that
+// coercion detached/resized an ordinary buffer or the result will be zero.
+unsafe effect fn getBuffer<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, receiver: Value, indexValue: Value, mode: u32) -> Access
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let classId = unsafe storage.classId(receiver)
+  let mut valid = classId >= classes.JS_CLASS_INT8_ARRAY && classId <= classes.JS_CLASS_BIG_UINT64_ARRAY
+  if mode != 0 { valid = classId == classes.JS_CLASS_INT32_ARRAY || classId == classes.JS_CLASS_BIG_INT64_ARRAY }
+  if !valid { return run unsafe core.error(&mut hooks, context, b"integer TypedArray expected") }
+  let object = core.reference(receiver)
+  let view = unsafe storage.view(object)
+  let buffer = unsafe storage.snapshot(view.buffer)
+  if !buffer.shared {
+    if mode == 2 { return run unsafe core.error(&mut hooks, context, b"not a SharedArrayBuffer TypedArray") }
+    if buffer.detached { return run unsafe core.error(&mut hooks, context, b"ArrayBuffer is detached") }
+  }
+  let oldLength = unsafe storage.count(object)
+  let mut index: u64 = 0
+  run unsafe integer.toIndex(&mut hooks, context, &mut index, indexValue)
+  if index >= u32.toU64(oldLength) { return run unsafe range(&mut hooks, context) }
+  if mode != 1 {
+    if unsafe storage.isOutOfBounds(object) {
+      return run unsafe core.error(&mut hooks, context, b"ArrayBuffer is detached or resized")
+    }
+    if index >= u32.toU64(unsafe storage.count(object)) { return run unsafe range(&mut hooks, context) }
+  }
+  return Access { object: object, index: index, classId: classId }
+}
+unsafe effect fn revalidate<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  access: &Access) -> () ! JsException ? &mut Allocator {
+  // Unlike getBuffer's error, the source uses Detached here for either OOB case.
+  if unsafe storage.isOutOfBounds(access.object) {
+    return run unsafe core.error(&mut hooks, context, b"ArrayBuffer is detached")
+  }
+  if access.index >= u32.toU64(unsafe storage.count(access.object)) { return run unsafe range(&mut hooks, context) }
+}
+unsafe fn address(access: &Access) -> *mut u8 {
+  let anchor = ()
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, access.object)
+  let data = match &object.payload {
+    ObjectPayload.TypedArray { array } => array.cachedData
+    _ => invariant()
+  }
+  drop object
+  return unsafe storage.dataAt(data, u64.toU32(u64.shiftLeft(access.index, u32.toU64(storage.sizeLog2(access.classId)))))
+}
+struct Location { span: Span, offset: u32 }
+unsafe fn location(access: &Access) -> Location {
+  let view = unsafe storage.view(access.object)
+  let buffer = unsafe storage.snapshot(view.buffer)
+  let mut span = Span { data: buffer.data, capacity: buffer.byteLength }
+  if buffer.physicalCapacity != 0 { span = storage.memorySpan(buffer) }
+  let indexOffset = u64.toU32(u64.shiftLeft(access.index, u32.toU64(storage.sizeLog2(access.classId))))
+  return Location { span: span, offset: view.offset + indexOffset }
+}
+fn unsigned(number: i64) -> u64 {
+  if number < 0 { return i64.toU64(-(number + 1)) ^ 0xffffffffffffffff }
+  return i64.toU64(number)
+}
+unsafe effect fn operand<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, value: Value, shift: u32) -> u64
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  if shift == 3 {
+    let mut wide: i64 = 0
+    run unsafe bigint.toBigInt64(&mut hooks, context, &mut wide, value)
+    return unsigned(wide)
+  }
+  let mut narrow: u32 = 0
+  run unsafe integer.toUint32(&mut hooks, context, &mut narrow, value)
+  return u32.toU64(narrow)
+}
+effect fn resultValue(bits: u64, classId: u32) -> Value ! OutOfMemoryError ? &mut Allocator {
+  if classId == classes.JS_CLASS_INT8_ARRAY { return Value.Int { value: u64.toI32(bits ^ 128) - 128 } }
+  if classId == classes.JS_CLASS_INT16_ARRAY { return Value.Int { value: u64.toI32(bits ^ 32768) - 32768 } }
+  if classId == classes.JS_CLASS_INT32_ARRAY {
+    if bits > 2147483647 { return Value.Int { value: -1 - u64.toI32(bits ^ 0xffffffff) } }
+    return Value.Int { value: u64.toI32(bits) }
+  }
+  if classId <= classes.JS_CLASS_UINT32_ARRAY { return Value.number(u64.toF64(bits)) }
+  if classId == classes.JS_CLASS_BIG_INT64_ARRAY {
+    let mut signed: i64 = 0
+    if bits > 9223372036854775807 { signed = -1 - u64.toI64(bits ^ 0xffffffffffffffff) }
+    else { signed = u64.toI64(bits) }
+    return run bigint.newBigInt64(signed)
+  }
+  if classId == classes.JS_CLASS_BIG_UINT64_ARRAY { return run bigint.newBigUint64(bits) }
+  return invariant()
+}
+unsafe effect fn operationBody<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, method: u32, argv: &FrameSlots) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let access = run unsafe getBuffer(&mut hooks, context, unsafe argument(argv, 0), unsafe argument(argv, 1), 0)
+  let shift = storage.sizeLog2(access.classId)
+  let mut value: u64 = 0
+  let mut replacement: u64 = 0
+  if method != LOAD {
+    value = run unsafe operand(&mut hooks, context, unsafe argument(argv, 2), shift)
+    if method == COMPARE_EXCHANGE {
+      replacement = run unsafe operand(&mut hooks, context, unsafe argument(argv, 3), shift)
+    }
+    // Both compareExchange coercions precede this one revalidation.
+    run unsafe revalidate(&mut hooks, context, &access)
+  }
+  let memory = unsafe location(&access)
+  let bits = unsafe shared.operate(memory.span, memory.offset, shift, method, value, replacement)
+  return run resultValue(bits, access.classId)
+}
+struct Owners { converted: Value }
+unsafe effect fn storeBody<H: HeapHooks + CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  argv: &FrameSlots, owners: &mut Owners) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let access = run unsafe getBuffer(&mut hooks, context, unsafe argument(argv, 0), unsafe argument(argv, 1), 0)
+  let shift = storage.sizeLog2(access.classId)
+  let input = unsafe argument(argv, 2)
+  if shift == 3 { owners.converted = run unsafe bigint.toBigIntFree(&mut hooks, context, unsafe input.retained()) }
+  else { owners.converted = run unsafe integer.toIntegerFree(&mut hooks, context, unsafe input.retained()) }
+  if owners.converted.isException() { fail JsException {} }
+  let bits = run unsafe operand(&mut hooks, context, owners.converted, shift)
+  run unsafe revalidate(&mut hooks, context, &access)
+  let memory = unsafe location(&access)
+  unsafe shared.store(memory.span, memory.offset, shift, bits, MemoryOrder.SequentiallyConsistent)
+  let returned = owners.converted
+  owners.converted = Value.Undefined
+  // Returns the untruncated ToInteger/ToBigInt result, not the stored element.
+  return returned
+}
+unsafe effect fn waitBody<H: HeapHooks + CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  memoryObserver: &AllocationObserver, domain: Domain, argv: &FrameSlots) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let access = run unsafe getBuffer(&mut hooks, context, unsafe argument(argv, 0), unsafe argument(argv, 1), 2)
+  let shift = storage.sizeLog2(access.classId)
+  // Shared backing cannot detach, shrink, or relocate. Source captures this
+  // address before expected/timeout coercions, unlike ordinary operations.
+  let memory = unsafe location(&access)
+  let expected = run unsafe operand(&mut hooks, context, unsafe argument(argv, 2), shift)
+  let mut milliseconds: f64 = 0.0
+  run unsafe integer.toFloat64(&mut hooks, context, &mut milliseconds, unsafe argument(argv, 3))
+  let mut timeout: i64 = 9223372036854775807
+  if !f64.isNaN(milliseconds) && milliseconds < 9223372036854775808.0 {
+    if milliseconds < 0.0 { timeout = 0 } else { timeout = f64.toI64(milliseconds) }
+  }
+  let anchor = ()
+  let rt = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, unsafe runtime.contextRuntime(context))
+  let canBlock = rt.canBlock
+  drop rt
+  if !canBlock { return run unsafe core.error(&mut hooks, context, b"cannot block in this thread") }
+  let outcome = unsafe native.wait(domain, memory.span, memory.offset, shift, expected, timeout)
+  let atom = match outcome {
+    WaitResult.NotEqual => atoms.JS_ATOM_not_equal
+    WaitResult.TimedOut => atoms.JS_ATOM_timed_out
+    WaitResult.Ok => atoms.JS_ATOM_ok
+    WaitResult.Cancelled => { return run unsafe errors.throwInterrupted(&mut hooks, memoryObserver, context) }
+  }
+  return run unsafe core.atomValue(&mut hooks, context, atom)
+}
+unsafe effect fn notifyBody<H: HeapHooks + CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  domain: Domain, argv: &FrameSlots) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let access = run unsafe getBuffer(&mut hooks, context, unsafe argument(argv, 0), unsafe argument(argv, 1), 1)
+  let countValue = unsafe argument(argv, 2)
+  let mut count: i32 = 2147483647
+  if !core.undefined(countValue) {
+    run unsafe integer.toInt32Clamp(&mut hooks, context, &mut count, countValue, 0, 2147483647, 0)
+  }
+  let view = unsafe storage.view(access.object)
+  let buffer = unsafe storage.snapshot(view.buffer)
+  if !buffer.shared || count <= 0 { return Value.Int { value: 0 } }
+  return Value.Int { value: unsafe native.notify(domain, unsafe address(&access), count) }
+}
+unsafe effect fn pause<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  value: Value) -> Value ! JsException ? &mut Allocator {
+  // No conversion: objects, strings, bool, null, symbols and BigInt all reject.
+  let valid = match value {
+    Value.Undefined => true
+    Value.Int { .. } => true
+    Value.Float64 { value: number } => f64.isFinite(number) && f64.trunc(number) == number
+    _ => false
+  }
+  if !valid { return run unsafe core.error(&mut hooks, context, b"not an integral number") }
+  native.pause(Intrinsic.targetOperatingSystem())
+  return Value.Undefined
+}
+unsafe effect fn isLockFreeBody<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, value: Value) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let mut size: i32 = 0
+  run unsafe integer.toInt32Sat(&mut hooks, context, &mut size, value)
+  return Value.Bool { value: size == 1 || size == 2 || size == 4 || size == 8 }
+}
+unsafe effect fn body<H: HeapHooks + CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  memory: &AllocationObserver, domain: Domain, method: u32, argv: &FrameSlots, owners: &mut Owners) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  if method <= LOAD { return run unsafe operationBody(&mut hooks, context, method, argv) }
+  if method == STORE { return run unsafe storeBody(&mut hooks, context, argv, &mut owners) }
+  if method == IS_LOCK_FREE { return run unsafe isLockFreeBody(&mut hooks, context, unsafe argument(argv, 0)) }
+  if method == PAUSE { return run unsafe pause(&mut hooks, context, unsafe argument(argv, 0)) }
+  if method == WAIT { return run unsafe waitBody(&mut hooks, context, memory, domain, argv) }
+  if method == NOTIFY { return run unsafe notifyBody(&mut hooks, context, domain, argv) }
+  return invariant()
+}
+unsafe effect fn finish<H: HeapHooks + CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  called: Result<Value, OutOfMemoryError | StringLengthError | JsException>, converted: Value) -> Value
+  ! JsException ? &mut Allocator {
+  let mut output = Value.Undefined
+  let mut failed = false
+  match move called {
+    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Success { value } => { output = value }
+    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => {
+      let pending = run Effect.catch<JsException>(unsafe core.materialize(&mut hooks, context, move error), core.exceptionValue)
+      failed = true
+    }
+  }
+  unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), converted)
+  if failed { fail JsException {} }
+  return output
+}
+pub unsafe effect fn call<H: HeapHooks + CoercionHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, domain: Domain, method: u32, argv: &FrameSlots) -> Value ! JsException ? &mut Allocator {
+  let mut owners = Owners { converted: Value.Undefined }
+  let called = run Effect.result(unsafe body(&mut hooks, context, memory, domain, method, argv, &mut owners))
+  return run unsafe finish(&mut hooks, context, move called, owners.converted)
+}

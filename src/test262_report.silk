@@ -1,0 +1,252 @@
+//! Pinned run-test262.c error classification and native memory aggregation.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.list { List }
+import silk.slice { Slice }
+import silk.pointer { Pointer }
+import silk.ownership { Copy, Drop }
+import silk.i32
+import silk.i64
+import silk.usize
+import js_heap { HeapHeader }
+import runtime_memory { AllocationObserver }
+import js_libc_platform { PlatformError }
+import js_libc_platform as platform
+import cli_io
+import qjs_stats { MemorySnapshot }
+import qjs_stats
+import test262_text as text
+
+pub struct Observation {
+  pub failed: bool, pub threw: bool, pub negative: bool, pub strict: bool,
+  pub line: i32, pub hasLine: bool, pub message: List<u8>
+}
+struct Known { found: bool, start: usize, length: usize, line: i32 }
+struct Position { offset: usize, line: i32 }
+impl Copy for Known {}
+impl Copy for Position {}
+fn whitespace(c: u8) -> bool { return c == 32 || (c >= 9 && c <= 13) }
+fn skipComments(source: &[u8]) -> Position {
+  let mut at: usize = 0 let mut line: i32 = 1
+  while at < source.length && source[at] != 0 {
+    let c = source[at] at = at + 1
+    if whitespace(c) { if c == 10 { line = line + 1 } continue }
+    if c == 47 && at < source.length && source[at] == 47 {
+      at = at + 1
+      while at < source.length && source[at] != 0 && source[at] != 10 { at = at + 1 }
+      continue
+    }
+    if c == 47 && at < source.length && source[at] == 42 {
+      at = at + 1
+      while at < source.length && source[at] != 0 {
+        if source[at] == 10 { line = line + 1 }
+        if source[at] == 42 && at + 1 < source.length && source[at + 1] == 47 { at = at + 2 break }
+        at = at + 1
+      }
+      continue
+    }
+    break
+  }
+  return Position { offset: at, line: line }
+}
+fn longestMatch(source: &[u8], needle: &[u8], position: Position, fallback: i32) -> i32 {
+  let mut best: usize = 0 let mut result = fallback
+  let mut at = position.offset let mut line = position.line
+  if needle.length == 0 { return result }
+  while at < source.length && source[at] != 0 {
+    if source[at] == needle[0] {
+      let mut length: usize = 1
+      while at + length < source.length && length < needle.length && source[at + length] != 0 && source[at + length] == needle[length] { length = length + 1 }
+      if length > best { best = length result = line if length == needle.length { break } }
+    }
+    if source[at] == 10 { line = line + 1 }
+    at = at + 1
+  }
+  return result
+}
+fn findKnown(known: &[u8], filename: &[u8], strict: bool) -> Known {
+  let absent = Known { found: false, start: 0, length: 0, line: 0 }
+  if filename.length == 0 { return absent }
+  let mut at: usize = 0
+  while at < known.length {
+    let start = text.find(known, filename, at)
+    if start == known.length { break }
+    at = start + filename.length
+    if at >= known.length || known[at] != 58 { continue }
+    if start != 0 && known[start - 1] != 10 && known[start - 1] != 40 { continue }
+    let mut cursor = at + 1
+    while cursor < known.length && whitespace(known[cursor]) { cursor = cursor + 1 }
+    let numberStart = cursor
+    if cursor < known.length && (known[cursor] == 43 || known[cursor] == 45) { cursor = cursor + 1 }
+    let digitStart = cursor
+    while cursor < known.length && known[cursor] >= 48 && known[cursor] <= 57 { cursor = cursor + 1 }
+    let mut line: i32 = 0
+    if cursor != digitStart { line = text.number(Slice.view(known, numberStart, cursor - numberStart)) }
+    else { cursor = at + 1 }
+    if cursor < known.length && known[cursor] == 58 { cursor = cursor + 1 }
+    while cursor < known.length && known[cursor] == 32 { cursor = cursor + 1 }
+    let isStrict = text.starts(Slice.view(known, cursor, known.length - cursor), b"strict mode: ")
+    if isStrict != strict { continue }
+    if isStrict { cursor = cursor + 13 }
+    if text.starts(Slice.view(known, cursor, known.length - cursor), b"unexpected error: ") { cursor = cursor + 18 }
+    let mut end = cursor
+    while end < known.length && known[end] != 10 && known[end] != 0 { end = end + 1 }
+    // Upstream recognizes the next record by its first eight filename bytes.
+    let mut prefix = filename.length if prefix > 8 { prefix = 8 }
+    while end + 1 < known.length && known[end] == 10 && known[end + 1] != 0 {
+      let next = Slice.view(known, end + 1, known.length - end - 1)
+      if text.starts(next, Slice.view(filename, 0, prefix)) && (filename.length >= 8 || next.length == prefix || next[prefix] == 0) { break }
+      end = end + 1
+      while end < known.length && known[end] != 10 && known[end] != 0 { end = end + 1 }
+    }
+    return Known { found: true, start: cursor, length: end - cursor, line: line }
+  }
+  return absent
+}
+fn printNumber(value: i32) -> () {
+  let mut buffer: [u8; 16] = [0; 16] let mut at: usize = 16
+  let mut magnitude = i32.toI64(value)
+  if magnitude < 0 { magnitude = -magnitude }
+  while true { at = at - 1 buffer[at] = i64.toU8(magnitude % 10) + 48 magnitude = magnitude / 10 if magnitude == 0 { break } }
+  if value < 0 { at = at - 1 buffer[at] = 45 }
+  cli_io.stdout(Slice.view(&buffer, at, 16 - at))
+}
+fn printRecord(filename: &[u8], line: i32, strict: bool, prefix: &[u8], message: &[u8]) -> () {
+  cli_io.stdout(filename) cli_io.stdout(b":") printNumber(line) cli_io.stdout(b": ")
+  if strict { cli_io.stdout(b"strict mode: ") }
+  cli_io.stdout(prefix) cli_io.stdout(message) cli_io.stdout(b"\n")
+}
+fn swap(records: &mut List<List<u8>>, left: usize, right: usize) -> () {
+  if left == right { return }
+  let slots = records.asMutSlice()
+  let first = Intrinsic.replace(slots[left], List<u8>.make())
+  let second = Intrinsic.replace(slots[right], move first)
+  slots[left] = move second
+}
+fn sift(records: &mut List<List<u8>>, start: usize, count: usize) -> () {
+  let mut root = start
+  while root < count / 2 {
+    let mut child = root * 2 + 1
+    if child + 1 < count && text.compare(records.asSlice()[child].asSlice(), records.asSlice()[child + 1].asSlice()) < 0 { child = child + 1 }
+    if text.compare(records.asSlice()[root].asSlice(), records.asSlice()[child].asSlice()) >= 0 { break }
+    swap(&mut records, root, child) root = child
+  }
+}
+unsafe extern "C" fn createFile(path: *const u8, mode: u32) -> i32 as "creat" with Intrinsic.foreign(noCapture: ("path",))
+unsafe extern "C" fn closeFile(fd: i32) -> i32 as "close"
+struct OutputFile { descriptor: i32 }
+impl Drop for OutputFile { fn drop(self: &mut Self) -> () { if self.descriptor >= 0 { let ignored = unsafe closeFile(self.descriptor) } } }
+
+pub struct Reporter {
+  known: List<u8>, verbose: bool, update: bool,
+  pub hasKnown: bool, pub newErrors: i32, pub changedErrors: i32, pub fixedErrors: i32,
+  pub records: List<List<u8>>
+}
+impl Reporter {
+  pub fn make(known: List<u8>, verbose: bool, update: bool) -> Self {
+    let present = known.length() != 0 && !update
+    return Self { known: move known, verbose: verbose, update: update, hasKnown: present,
+      newErrors: 0, changedErrors: 0, fixedErrors: 0, records: List<List<u8>>.make() }
+  }
+  effect fn error(self: &mut Self, filename: &[u8], line: i32, strict: bool, prefix: &[u8], message: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    if !self.update { printRecord(filename, line, strict, prefix, message) return }
+    let mut record = List<u8>.make()
+    run text.append(&mut record, filename) run text.append(&mut record, b":")
+    run text.decimal(&mut record, i32.toI64(line)) run text.append(&mut record, b": ")
+    if strict { run text.append(&mut record, b"strict mode: ") }
+    run text.append(&mut record, prefix) run text.append(&mut record, message) run text.append(&mut record, b"\n")
+    run self.records.append(move record)
+  }
+  pub effect fn record(self: &mut Self, filename: &[u8], source: &[u8], observation: &Observation) -> () ! OutOfMemoryError ? &mut Allocator {
+    if !self.verbose { return }
+    let mut known = Known { found: false, start: 0, length: 0, line: 0 }
+    if self.hasKnown && !self.update { known = findKnown(self.known.asSlice(), filename, observation.strict) }
+    let position = skipComments(source)
+    let mut line = position.line if observation.hasLine { line = observation.line }
+    let message = observation.message.asSlice()
+    if observation.negative {
+      if !observation.failed {
+        if observation.threw && known.found {
+          let previous = Slice.view(self.known.asSlice(), known.start, known.length)
+          if text.equal(previous, b"expected error") || text.starts(previous, b"unexpected error type:") || text.equal(previous, message) {
+            if !observation.hasLine { line = longestMatch(source, message, position, line) }
+            printRecord(filename, line, observation.strict, b"OK, now has error ", message)
+            self.fixedErrors = self.fixedErrors + 1
+          }
+        }
+      } else if !known.found {
+        if observation.threw { run self.error(filename, line, observation.strict, b"unexpected error type: ", message) }
+        else { run self.error(filename, line, observation.strict, b"expected error", b"") }
+        self.newErrors = self.newErrors + 1
+      }
+      return
+    }
+    if observation.threw {
+      let same = known.found && text.equal(Slice.view(self.known.asSlice(), known.start, known.length), message)
+      if !same {
+        if !observation.hasLine {
+          let mut needle = message
+          if text.starts(needle, b"Test262 Error: ") { needle = Slice.view(needle, 15, needle.length - 15) }
+          if text.find(needle, b"Test case returned non-true value!", 0) != needle.length { needle = b"runTestCase" }
+          line = longestMatch(source, needle, position, line)
+        }
+        let mut prefix: &[u8] = b"" if self.hasKnown && !self.update { prefix = b"unexpected error: " }
+        run self.error(filename, line, observation.strict, prefix, message)
+        if known.found {
+          printRecord(filename, known.line, observation.strict, b"previous error: ", Slice.view(self.known.asSlice(), known.start, known.length))
+          self.changedErrors = self.changedErrors + 1
+        } else { self.newErrors = self.newErrors + 1 }
+      }
+    } else if known.found {
+      printRecord(filename, known.line, observation.strict, b"OK, fixed error: ", Slice.view(self.known.asSlice(), known.start, known.length))
+      self.fixedErrors = self.fixedErrors + 1
+    }
+  }
+  pub effect fn finish(self: &mut Self, path: &[u8]) -> () ! OutOfMemoryError | PlatformError ? &mut Allocator {
+    if !self.update { return }
+    let count = self.records.length() let mut at = count / 2
+    while at != 0 { at = at - 1 sift(&mut self.records, at, count) }
+    at = count
+    while at > 1 { at = at - 1 swap(&mut self.records, 0, at) sift(&mut self.records, 0, at) }
+    let name = run platform.cString(path)
+    let fd = unsafe createFile(Pointer.fromRef<u8>(&name.asSlice()[0]), 438)
+    if fd < 0 { fail PlatformError { code: unsafe platform.errno() } }
+    let mut file = OutputFile { descriptor: fd }
+    at = 0
+    while at < count {
+      if !platform.writeAll(fd, self.records.asSlice()[at].asSlice()) { fail PlatformError { code: unsafe platform.errno() } }
+      at = at + 1
+    }
+    let result = unsafe closeFile(fd) file.descriptor = -1
+    if result < 0 { fail PlatformError { code: unsafe platform.errno() } }
+  }
+}
+
+pub struct Statistics {
+  pub count: usize, total: MemorySnapshot, minimum: MemorySnapshot, maximum: MemorySnapshot,
+  minimumFilename: List<u8>, maximumFilename: List<u8>
+}
+impl Statistics {
+  pub fn make() -> Self {
+    return Self { count: 0, total: MemorySnapshot.make(), minimum: MemorySnapshot.make(), maximum: MemorySnapshot.make(),
+      minimumFilename: List<u8>.make(), maximumFilename: List<u8>.make() }
+  }
+  pub unsafe effect fn sample(self: &mut Self, rt: *mut HeapHeader, memory: &AllocationObserver, filename: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    let usage = unsafe qjs_stats.snapshot(rt, memory)
+    if self.count == 0 || usage.allocatedBytes() < self.minimum.allocatedBytes() {
+      let name = run text.copy(filename) self.minimumFilename = move name self.minimum = usage.copy()
+    }
+    if self.count == 0 || usage.allocatedBytes() > self.maximum.allocatedBytes() {
+      let name = run text.copy(filename) self.maximumFilename = move name self.maximum = usage.copy()
+    }
+    self.total.add(&usage) self.count = self.count + 1
+  }
+  pub fn display(self: &Self, detail: i32) -> () {
+    if detail == 0 { return }
+    if detail > 1 && self.count > 1 {
+      cli_io.stdout(b"\nMininum memory statistics for ") cli_io.stdout(self.minimumFilename.asSlice()) cli_io.stdout(b":\n\n") self.minimum.display()
+      cli_io.stdout(b"\nMaximum memory statistics for ") cli_io.stdout(self.maximumFilename.asSlice()) cli_io.stdout(b":\n\n") self.maximum.display()
+    }
+    cli_io.stdout(b"\nAverage memory statistics for ") printNumber(usize.toI32(self.count)) cli_io.stdout(b" tests:\n\n")
+    let average = self.total.average(self.count) average.display() cli_io.stdout(b"\n")
+  }
+}

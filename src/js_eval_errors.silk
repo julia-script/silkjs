@@ -1,0 +1,123 @@
+//! Parse/compiler diagnostics become real pending ECMAScript exceptions before
+//! the evaluator releases its compiler tree or source/module roots.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.list { List }
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types { NativeErrorKind, RuntimeState }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_coercion_host { CoercionHooks }
+import js_error_host { ErrorHooks }
+import js_exceptions { JsException }
+import js_runtime as runtime
+import js_errors as errors
+import js_strings { Strings }
+import js_string_types { StringLengthError, StringOwner }
+import js_bigint { BigIntError }
+import js_parser_core { ParserStackOverflow }
+import js_parser_diagnostics { SyntaxError, DiagnosticMessage }
+import js_compiler_types { CompilerError, CompilerErrorKind }
+import js_bytecode { BytecodeError, BytecodeErrorKind }
+import runtime_memory { AllocationObserver }
+
+pub effect fn exceptionValue(error: JsException) -> Value { drop error return Value.Exception }
+pub unsafe effect fn materialize<T, H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  error: OutOfMemoryError | StringLengthError | BigIntError | JsException) -> T ! JsException ? &mut Allocator {
+  match move error {
+    OutOfMemoryError allocation => { return run unsafe hooks.throwOutOfMemory(context) }
+    StringLengthError length => { return run unsafe hooks.throwError(context, NativeErrorKind.Internal, b"string too long") }
+    BigIntError bigint => { return run unsafe hooks.throwError(context, NativeErrorKind.Range, b"BigInt is too large") }
+    JsException signal => { fail move signal }
+  }
+}
+unsafe effect fn installSyntax<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, message: &[u8]) -> Value ! JsException ? &mut Allocator {
+  return run unsafe errors.throwError2(&mut hooks, memory, context, NativeErrorKind.Syntax, message, false)
+}
+pub unsafe effect fn syntax<H: HeapHooks + CoercionHooks + ErrorHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, diagnostic: SyntaxError) -> never ! JsException ? &mut Allocator {
+  let converted = run Effect.result(Strings.toUtf8(diagnostic.message.get(), false))
+  let bytes = match move converted {
+    Result<List<u8>, OutOfMemoryError>.Success { value } => move value
+    Result<List<u8>, OutOfMemoryError>.Failure { error } => { return run unsafe materialize<never, H>(&mut hooks, context, move error) }
+  }
+  let marker = run Effect.catch<JsException>(unsafe installSyntax(&mut hooks, memory, context, bytes.asSlice()), exceptionValue)
+  let rt = unsafe runtime.contextRuntime(context)
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let exception = unsafe state.currentException.retained() drop state
+  if diagnostic.location.line != 0 {
+    run unsafe errors.buildBacktrace(&mut hooks, memory, context, exception,
+      Option<Value>.some(diagnostic.filename.get()), diagnostic.location.line, diagnostic.location.column, 0)
+  }
+  // Backtrace attachment may replace the pending exception. Source keeps that
+  // replacement, rather than restoring the original SyntaxError over it.
+  unsafe gc.release(&mut hooks, rt, exception)
+  fail JsException {}
+}
+pub fn redefinitionMessage(kind: CompilerErrorKind) -> &'static [u8] {
+  if kind == CompilerErrorKind.ParameterRedefinition { return b"invalid redefinition of parameter name" }
+  if kind == CompilerErrorKind.VariableRedefinition { return b"invalid redefinition of a variable" }
+  if kind == CompilerErrorKind.GlobalRedefinition { return b"invalid redefinition of global identifier" }
+  return b"invalid redefinition of lexical identifier"
+}
+pub unsafe effect fn compiler<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, diagnostic: CompilerError) -> never ! JsException ? &mut Allocator {
+  let mut text = DiagnosticMessage.make()
+  let mut kind = NativeErrorKind.Syntax
+  match diagnostic.kind {
+    CompilerErrorKind.TooManyLocals => { kind = NativeErrorKind.Internal text.append(b"too many local variables") }
+    CompilerErrorKind.TooManyArguments => { kind = NativeErrorKind.Internal text.append(b"too many arguments") }
+    CompilerErrorKind.TooManyClosures => { kind = NativeErrorKind.Internal text.append(b"too many closure variables") }
+    CompilerErrorKind.LexicalRedefinition => { text.append(redefinitionMessage(diagnostic.kind)) }
+    CompilerErrorKind.ParameterRedefinition => { text.append(redefinitionMessage(diagnostic.kind)) }
+    CompilerErrorKind.VariableRedefinition => { text.append(redefinitionMessage(diagnostic.kind)) }
+    CompilerErrorKind.GlobalRedefinition => { text.append(redefinitionMessage(diagnostic.kind)) }
+    _ => {
+      if diagnostic.kind == CompilerErrorKind.UndefinedPrivateField { text.append(b"undefined private field '") }
+      else { text.append(b"exported variable '") }
+      match &diagnostic.name {
+        Option<StringOwner>.Some { value } => {
+          let converted = run Effect.result(Strings.toUtf8(value.get(), false))
+          match move converted {
+            Result<List<u8>, OutOfMemoryError>.Success { value: bytes } => { text.append(bytes.asSlice()) }
+            Result<List<u8>, OutOfMemoryError>.Failure { error } => { return run unsafe materialize<never, H>(&mut hooks, context, move error) }
+          }
+        }
+        Option<StringOwner>.None => ()
+      }
+      text.append(b"'")
+      if diagnostic.kind == CompilerErrorKind.MissingExport { text.append(b" does not exist") }
+    }
+  }
+  return run unsafe errors.throwError(&mut hooks, memory, context, kind, text.bytes())
+}
+pub unsafe effect fn compilation<T, H: HeapHooks + CoercionHooks + ErrorHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader,
+  error: OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow | CompilerError | BytecodeError | JsException) -> T
+  ! JsException ? &mut Allocator {
+  match move error {
+    SyntaxError diagnostic => { return run unsafe syntax(&mut hooks, memory, context, move diagnostic) }
+    CompilerError diagnostic => { return run unsafe compiler(&mut hooks, memory, context, move diagnostic) }
+    ParserStackOverflow overflow => { return run unsafe errors.throwStackOverflow(&mut hooks, memory, context) }
+    BytecodeError diagnostic => {
+      let message = match diagnostic.kind {
+        BytecodeErrorKind.StackOverflow => b"stack overflow"
+        BytecodeErrorKind.StackUnderflow => b"stack underflow"
+        BytecodeErrorKind.InvalidOpcode => b"invalid opcode"
+        BytecodeErrorKind.BufferOverflow => b"bytecode buffer overflow"
+        BytecodeErrorKind.InconsistentStack => b"inconsistent stack size"
+        BytecodeErrorKind.InconsistentCatch => b"inconsistent catch stack"
+        BytecodeErrorKind.MissingCatch => b"missing catch"
+      }
+      return run unsafe hooks.throwError(context, NativeErrorKind.Internal, message)
+    }
+    OutOfMemoryError allocation => { return run unsafe materialize<T, H>(&mut hooks, context, move allocation) }
+    StringLengthError length => { return run unsafe materialize<T, H>(&mut hooks, context, move length) }
+    BigIntError bigint => { return run unsafe materialize<T, H>(&mut hooks, context, move bigint) }
+    JsException signal => { fail move signal }
+  }
+}

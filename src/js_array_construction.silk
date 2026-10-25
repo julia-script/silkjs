@@ -1,0 +1,161 @@
+//! Native js_create_array/js_create_array_free, quickjs.c:9710-9759.
+//! Context and backing slots stay rooted and address-stable throughout each call.
+//! Requires count <= INT32_MAX and start..start+count within initialized slots.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.usize
+import silk.i64
+import runtime_memory { AllocationObserver }
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types { ObjectData, ObjectPayload, PropertySlot, FrameSlots, NativeErrorKind }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_coercion_host { CoercionHooks }
+import js_exceptions { JsException }
+import js_proxy_core as core
+import js_object_allocate as objects
+import js_array_storage as arrays
+
+fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+effect fn reservedCapacity(error: OutOfMemoryError) -> () { drop error invariant() }
+
+unsafe effect fn prepare<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, count: usize) -> Value
+  ! JsException ? &mut Allocator {
+  let allocated = run Effect.result(unsafe objects.array(&mut hooks, memory, context))
+  let array = match move allocated {
+    Result<Value, OutOfMemoryError>.Success { value } => value
+    Result<Value, OutOfMemoryError>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error)
+  }
+  if count != 0 {
+    let expanded = run Effect.result(unsafe arrays.expandFastValues(&mut hooks, context, core.reference(array), usize.toU32(count)))
+    match move expanded {
+      Result<(), OutOfMemoryError>.Success { .. } => ()
+      Result<(), OutOfMemoryError>.Failure { error } => {
+        let pending = run Effect.catch<JsException>(unsafe core.materialize(&mut hooks, context, move error), core.exceptionValue)
+        unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), array)
+        fail JsException {}
+      }
+    }
+  }
+  return array
+}
+
+/// Pinned js_allocate_fast_array: the dense-copy methods have an INT32_MAX
+/// bound, unlike Array's constructor, and reserve initialized undefined owners.
+pub unsafe effect fn allocateFast<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, length: i64) -> Value
+  ! JsException ? &mut Allocator {
+  if length > 2147483647 {
+    return run unsafe hooks.throwError(context, NativeErrorKind.Range, b"invalid array length")
+  }
+  let mut count: usize = 0
+  if length > 0 { count = i64.toUsize(length) }
+  let result = run unsafe prepare(&mut hooks, memory, context, count)
+  if count != 0 {
+    let mut anchor = ()
+    let object = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, core.reference(result))
+    match &mut object.payload {
+      ObjectPayload.FastArray { array } => {
+        let mut index: usize = 0
+        while index < count {
+          run Effect.catch<OutOfMemoryError>(array.values.append(Value.Undefined), reservedCapacity)
+          index = index + 1
+        }
+      }
+      _ => invariant()
+    }
+    object.properties.set(0, PropertySlot.Value { value: Value.Int { value: usize.toI32(count) } })
+  }
+  return result
+}
+
+/// Copies an already-validated dense source range without initializing it twice.
+/// Source backing storage is acquired only after allocation/collector callbacks.
+pub unsafe effect fn copyFastRange<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, source: Value,
+  start: usize, count: usize) -> Value ! JsException ? &mut Allocator {
+  let result = run unsafe prepare(&mut hooks, memory, context, count)
+  if count != 0 {
+    let inputAnchor = () let mut outputAnchor = ()
+    let input = unsafe HeapCell.payload<ObjectData, ()>(&inputAnchor, core.reference(source))
+    let output = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut outputAnchor, core.reference(result))
+    match &input.payload {
+      ObjectPayload.FastArray { array: from } => {
+        match &mut output.payload {
+          ObjectPayload.FastArray { array: to } => {
+            let mut index: usize = 0
+            while index < count {
+              let value = unsafe from.values.get(start + index).retained()
+              run Effect.catch<OutOfMemoryError>(to.values.append(value), reservedCapacity)
+              index = index + 1
+            }
+          }
+          _ => invariant()
+        }
+      }
+      _ => invariant()
+    }
+    output.properties.set(0, PropertySlot.Value { value: Value.Int { value: usize.toI32(count) } })
+  }
+  return result
+}
+
+/// Borrows input owners. Every installed array element retains its own reference.
+pub unsafe effect fn create<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, values: &FrameSlots,
+  start: usize, count: usize) -> Value ! JsException ? &mut Allocator {
+  let result = run unsafe prepare(&mut hooks, memory, context, count)
+  if count != 0 {
+    let mut anchor = () let object = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, core.reference(result))
+    match &mut object.payload {
+      ObjectPayload.FastArray { array } => {
+        let mut index: usize = 0
+        while index < count {
+          let borrowed = unsafe values.get(start + index)
+          let owned = unsafe borrowed.retained()
+          // The complete capacity is reserved before taking any element owner.
+          run Effect.catch<OutOfMemoryError>(array.values.append(owned), reservedCapacity)
+          index = index + 1
+        }
+      }
+      _ => invariant()
+    }
+    object.properties.set(0, PropertySlot.Value { value: Value.Int { value: usize.toI32(count) } })
+  }
+  return result
+}
+
+/// Consumes every selected slot owner on success AND failure, without clearing
+/// stale slot bits. The caller removes that range from its live stack/owner set.
+pub unsafe effect fn createFree<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, values: &FrameSlots,
+  start: usize, count: usize) -> Value ! JsException ? &mut Allocator {
+  let allocated = run Effect.result(unsafe prepare(&mut hooks, memory, context, count))
+  let result = match move allocated {
+    Result<Value, JsException>.Success { value } => value
+    Result<Value, JsException>.Failure { error } => {
+      let rt = unsafe runtime.contextRuntime(context) let mut index: usize = 0
+      while index < count { unsafe gc.release(&mut hooks, rt, unsafe values.get(start + index)) index = index + 1 }
+      fail move error
+    }
+  }
+  if count != 0 {
+    let mut anchor = () let object = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, core.reference(result))
+    match &mut object.payload {
+      ObjectPayload.FastArray { array } => {
+        let mut index: usize = 0
+        while index < count {
+          run Effect.catch<OutOfMemoryError>(array.values.append(unsafe values.get(start + index)), reservedCapacity)
+          index = index + 1
+        }
+      }
+      _ => invariant()
+    }
+    object.properties.set(0, PropertySlot.Value { value: Value.Int { value: usize.toI32(count) } })
+  }
+  return result
+}

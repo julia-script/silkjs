@@ -1,0 +1,227 @@
+//! Final branch, exception-marker and iterator instructions, quickjs.c:18634-18671,
+//! 19132-19352,19472-19518. Inactive operand capacity is never read as a Value.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.pointer { Pointer }
+import silk.slice { Slice }
+import silk.u8
+import silk.u32
+import silk.i32
+import silk.usize
+import runtime_memory { AllocationObserver }
+import js_heap { HeapCell }
+import js_core_types { FrameSlots, StackFrame, FunctionBytecode, RuntimeState, NativeErrorKind }
+import js_value { Value }
+import js_vm_state { Machine }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_coercion_host { CoercionHooks }
+import js_property_host { OwnPropertyHooks, GetPropertyHooks, OwnKeysHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_prototype_host { PrototypeHooks }
+import js_interrupt_host { InterruptHooks }
+import js_native_function_host { NativeFunctionHooks }
+import js_call_host { CallHooks }
+import js_exceptions { JsException }
+import js_exceptions as exceptions
+import js_interrupts as interrupts
+import js_primitives as primitives
+import js_proxy_core as core
+import js_for_in as enumeration
+import js_iterators as iterators
+import js_property_get as properties
+import js_parser_diagnostics { DiagnosticMessage }
+import js_opcode_data as op
+import js_atom_data as atoms
+
+unsafe fn slots(machine: &Machine) -> FrameSlots {
+  let anchor = () let frame = unsafe Pointer.borrow<(), StackFrame>(&anchor, machine.frame)
+  return FrameSlots.Borrowed { data: machine.stack, length: frame.stack.length() }
+}
+unsafe effect fn call<H: CoercionHooks + CallHooks>(hooks: &mut H, machine: &Machine,
+  function: Value, receiver: Value, start: usize, count: usize) -> Value ! JsException ? &mut Allocator {
+  let arguments = FrameSlots.Borrowed { data: unsafe machine.slot(start), length: count }
+  let called = run Effect.result(unsafe hooks.callArguments(machine.context, function, receiver, &arguments))
+  return match move called {
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => value
+    Result<Value, OutOfMemoryError | JsException>.Failure { error } => { return run unsafe core.materialize(&mut hooks, machine.context, move error) }
+  }
+}
+unsafe effect fn throwEncoded<H: CoercionHooks + OwnPropertyHooks>(hooks: &mut H,
+  machine: &Machine, atom: u32, kind: u8) -> never ! JsException ? &mut Allocator {
+  if kind == 2 { return run unsafe hooks.throwUninitialized(machine.context, atom) }
+  if kind == 3 { return run unsafe hooks.throwError(machine.context, NativeErrorKind.Reference, b"unsupported reference to 'super'") }
+  if kind == 4 { return run unsafe hooks.throwError(machine.context, NativeErrorKind.Type, b"iterator does not have a throw method") }
+  if kind == 5 { return run unsafe hooks.throwError(machine.context, NativeErrorKind.Reference, b"invalid assignment left-hand side") }
+  let mut message = DiagnosticMessage.make()
+  let mut errorKind = NativeErrorKind.Internal
+  if kind <= 1 {
+    errorKind = NativeErrorKind.Type
+    if kind == 1 { errorKind = NativeErrorKind.Syntax message.append(b"redeclaration of '") }
+    else { message.append(b"'") }
+    let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)
+    message.appendAtom(&state.atoms, atom) drop state
+    if kind == 0 { message.append(b"' is read-only") } else { message.append(b"'") }
+  } else {
+    message.append(b"invalid throw var type ")
+    let mut digits: [u8; 3] = [0; 3] let mut index: usize = 3 let mut number = kind
+    while true {
+      index = index - 1 digits[index] = 48 + number % 10 number = number / 10
+      if number == 0 { break }
+    }
+    message.append(Slice.view(&digits, index, 3 - index))
+  }
+  return run unsafe hooks.throwError(machine.context, errorKind, message.bytes())
+}
+
+pub unsafe effect fn step<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + OwnKeysHooks
+  + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks>(hooks: &mut H,
+  memory: &AllocationObserver, machine: &mut Machine, opcode: u8) -> bool
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  if opcode == op.OP_goto || opcode == op.OP_goto16 || opcode == op.OP_goto8 {
+    let mut width: usize = 4 let mut displacement: i32 = 0
+    if opcode == op.OP_goto { displacement = unsafe machine.readI32() }
+    else if opcode == op.OP_goto16 { width = 2 displacement = unsafe machine.readI16() }
+    else { width = 1 displacement = unsafe machine.readI8() }
+    machine.jump(displacement, width)
+    run unsafe interrupts.poll(&mut hooks, memory, machine.context) return true
+  }
+  if opcode == op.OP_if_true || opcode == op.OP_if_false || opcode == op.OP_if_true8 || opcode == op.OP_if_false8 {
+    let mut width: usize = 4 let mut displacement: i32 = 0
+    if opcode == op.OP_if_true8 || opcode == op.OP_if_false8 { width = 1 displacement = unsafe machine.readI8() }
+    else { displacement = unsafe machine.readI32() }
+    let value = unsafe machine.top(1)
+    let truth = unsafe primitives.toBoolean(value) != 0
+    unsafe gc.release(&mut hooks, machine.runtime, value)
+    machine.sp = machine.sp - 1
+    let positive = opcode == op.OP_if_true || opcode == op.OP_if_true8
+    if truth == positive { machine.jump(displacement, width) }
+    // Source polls even when the conditional edge is not taken.
+    run unsafe interrupts.poll(&mut hooks, memory, machine.context) return true
+  }
+  if opcode == op.OP_catch || opcode == op.OP_gosub {
+    let displacement = unsafe machine.readI32()
+    if opcode == op.OP_catch {
+      let target = machine.target(displacement, 4)
+      unsafe machine.push(Value.CatchOffset { offset: usize.toI32(target) })
+    } else {
+      let returnPc = usize.toI32(machine.pc)
+      unsafe machine.push(Value.Int { value: returnPc })
+      machine.jump(displacement, 4)
+    }
+    return true
+  }
+  if opcode == op.OP_ret {
+    let value = unsafe machine.top(1)
+    let anchor = () let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, machine.bytecode)
+    let length = bytecode.code.length() drop bytecode
+    match value {
+      Value.Int { value: target } => {
+        if target >= 0 && i32.toUsize(target) < length {
+          machine.sp = machine.sp - 1 machine.pc = i32.toUsize(target) return true
+        }
+      }
+      _ => ()
+    }
+    return run unsafe hooks.throwError(machine.context, NativeErrorKind.Internal, b"invalid ret value")
+  }
+  if opcode == op.OP_throw {
+    let value = unsafe machine.pop()
+    return run unsafe exceptions.throwValue<bool, H>(&mut hooks, machine.runtime, value)
+  }
+  if opcode == op.OP_throw_error {
+    let atom = unsafe machine.readU32() let kind = unsafe machine.readU8()
+    return run unsafe throwEncoded(&mut hooks, &machine.*, atom, kind)
+  }
+  if opcode == op.OP_nip_catch {
+    let result = unsafe machine.pop()
+    while machine.sp != 0 {
+      let value = unsafe machine.top(1)
+      if match value { Value.CatchOffset { .. } => true _ => false } { break }
+      let removed = unsafe machine.pop() unsafe gc.release(&mut hooks, machine.runtime, removed)
+    }
+    if machine.sp == 0 {
+      let pending = run Effect.catch<JsException>(unsafe hooks.throwError(machine.context, NativeErrorKind.Internal, b"nip_catch"), core.exceptionValue)
+      unsafe gc.release(&mut hooks, machine.runtime, result) fail JsException {}
+    }
+    unsafe machine.set(1, result) return true
+  }
+  if opcode == op.OP_for_in_start {
+    unsafe machine.publishPc()
+    let built = run Effect.result(unsafe enumeration.build(&mut hooks, memory, machine.context, unsafe machine.top(1)))
+    match move built {
+      Result<Value, JsException>.Success { value } => { unsafe machine.set(1, value) }
+      Result<Value, JsException>.Failure { error } => { unsafe machine.set(1, Value.Exception) fail move error }
+    }
+    return true
+  }
+  if opcode == op.OP_for_in_next {
+    unsafe machine.publishPc()
+    let next = run unsafe enumeration.next(&mut hooks, memory, machine.context, unsafe machine.top(1))
+    unsafe machine.push(next.value) unsafe machine.push(Value.Bool { value: next.done }) return true
+  }
+  if opcode == op.OP_for_of_start || opcode == op.OP_for_await_of_start {
+    unsafe machine.publishPc() let mut output = unsafe slots(&machine.*)
+    run unsafe iterators.forOfStart(&mut hooks, memory, machine.context, &mut output, machine.sp - 1, opcode == op.OP_for_await_of_start)
+    machine.sp = machine.sp + 1 unsafe machine.push(Value.CatchOffset { offset: 0 }) return true
+  }
+  if opcode == op.OP_for_of_next {
+    let offset = u8.toUsize(unsafe machine.readU8())
+    unsafe machine.publishPc() let mut output = unsafe slots(&machine.*)
+    run unsafe iterators.forOfNext(&mut hooks, machine.context, &mut output, machine.sp - 3 - offset, machine.sp)
+    machine.sp = machine.sp + 2 return true
+  }
+  if opcode == op.OP_for_await_of_next {
+    unsafe machine.publishPc() let mut output = unsafe slots(&machine.*)
+    run unsafe iterators.forAwaitNext(&mut hooks, machine.context, &mut output, machine.sp - 3)
+    machine.sp = machine.sp + 1 return true
+  }
+  if opcode == op.OP_iterator_check_object || opcode == op.OP_iterator_get_value_done {
+    if opcode == op.OP_iterator_get_value_done { unsafe machine.publishPc() }
+    let object = unsafe machine.top(1)
+    if !object.isObject() { return run unsafe hooks.throwError(machine.context, NativeErrorKind.Type, b"iterator must return an object") }
+    if opcode == op.OP_iterator_get_value_done {
+      let mut done = false
+      let value = run unsafe iterators.completeValue(&mut hooks, machine.context, object, &mut done)
+      unsafe gc.release(&mut hooks, machine.runtime, object)
+      unsafe machine.set(2, Value.CatchOffset { offset: 0 }) unsafe machine.set(1, value)
+      unsafe machine.push(Value.Bool { value: done })
+    }
+    return true
+  }
+  if opcode == op.OP_iterator_close {
+    machine.sp = machine.sp - 1
+    unsafe gc.release(&mut hooks, machine.runtime, unsafe machine.top(1)) machine.sp = machine.sp - 1
+    let iterator = unsafe machine.top(1)
+    if !core.undefined(iterator) {
+      unsafe machine.publishPc()
+      run unsafe iterators.close(&mut hooks, machine.context, iterator, false)
+      unsafe gc.release(&mut hooks, machine.runtime, iterator)
+    }
+    machine.sp = machine.sp - 1 return true
+  }
+  if opcode == op.OP_iterator_next {
+    unsafe machine.publishPc()
+    let result = run unsafe call(&mut hooks, &machine.*, unsafe machine.top(3), unsafe machine.top(4), machine.sp - 1, 1)
+    unsafe gc.release(&mut hooks, machine.runtime, unsafe machine.top(1)) unsafe machine.set(1, result) return true
+  }
+  if opcode == op.OP_iterator_call {
+    let flags = unsafe machine.readU8() unsafe machine.publishPc()
+    let mut atom = atoms.JS_ATOM_return if (flags & 1) != 0 { atom = atoms.JS_ATOM_throw }
+    let method = run unsafe properties.getProperty(&mut hooks, machine.context, unsafe machine.top(4), atom)
+    let missing = core.undefined(method) || method.tag() == 2
+    if !missing {
+      let mut count: usize = 1 if (flags & 2) != 0 { count = 0 }
+      let called = run Effect.result(unsafe call(&mut hooks, &machine.*, method, unsafe machine.top(4), machine.sp - 1, count))
+      unsafe gc.release(&mut hooks, machine.runtime, method)
+      let result = match move called {
+        Result<Value, JsException>.Success { value } => value
+        Result<Value, JsException>.Failure { error } => { fail move error }
+      }
+      unsafe gc.release(&mut hooks, machine.runtime, unsafe machine.top(1)) unsafe machine.set(1, result)
+    }
+    unsafe machine.push(Value.Bool { value: missing }) return true
+  }
+  return false
+}

@@ -1,0 +1,260 @@
+//! Actual Engine launcher for the independent JavaScript execution verifiers.
+//! case/fault use the 40-word observation contract; foreign-case/foreign-fault
+//! additionally pass a real second realm. string-case/string-fault use UTF16.
+//! SOURCE is an absolute host path.
+import silk.allocator { Allocator, OutOfMemoryError, SystemAllocator }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.bytes { Bytes }
+import silk.list { List }
+import silk.host_input { HostInput, HostInputError }
+import silk.filesystem { FileSystem, FileError, Path }
+import silk.os_filesystem { OsFileSystem }
+import silk.writer { Writer, WriterError }
+import silk.os_writer { StdoutWriter, StderrWriter }
+import silk.u8
+import silk.u32
+import silk.usize
+import byte_buffer { ByteBuffer }
+import js_engine { Engine }
+import js_engine_no_host { NoHostServices }
+import js_atomics_native { Domain, WaiterDomain, SynchronizationError }
+import js_heap { HeapHeader }
+import js_value { Value }
+import js_exceptions { JsException }
+import js_exceptions as exceptions
+import js_string_types { StringLengthError }
+import js_bigint { BigIntError }
+import js_strings { Strings }
+import js_coercions as coercion
+import js_runtime as runtime
+import js_gc as gc
+import js_intrinsic_install as intrinsics
+import js_async_execution_consumers as asynchronous
+import js_string_intrinsics_consumers as strings
+import js_weakref_intrinsics_consumers as weak
+import js_errors_test_support { FaultAllocator }
+import native_stack as stack
+import runtime_memory { RuntimeAllocator, AllocationObserver }
+
+fn equal(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at: usize = 0
+  while at < left.length { if left[at] != right[at] { return false } at = at + 1 }
+  return true
+}
+fn unsigned(bytes: &[u8]) -> Option<usize> {
+  if bytes.length == 0 { return Option<usize>.none() }
+  let mut value: usize = 0 let mut at: usize = 0
+  while at < bytes.length {
+    let digit = u8.toUsize(bytes[at])
+    if digit < 48 || digit > 57 { return Option<usize>.none() }
+    if value > (usize.MAX - (digit - 48)) / 10 { return Option<usize>.none() }
+    value = value * 10 + digit - 48 at = at + 1
+  }
+  return Option<usize>.some(value)
+}
+effect fn argument(index: usize) -> Bytes ! HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
+  let found = run HostInput.argument(index)
+  return match move found {
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => { fail HostInput.inputFailure() }
+  }
+}
+effect fn append(output: &mut ByteBuffer, words: &[u32]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at: usize = 0
+  while at < words.length { run output.writeU32(words[at]) at = at + 1 }
+}
+unsafe effect fn report<'m>(engine: &mut Engine<'m, NoHostServices>, context: *mut HeapHeader) -> () ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  if !unsafe exceptions.has(rt) { return }
+  let thrown = unsafe exceptions.take(rt)
+  let converted = run Effect.result(unsafe coercion.toString(&mut engine, context, thrown))
+  unsafe gc.release(&mut engine, rt, thrown)
+  match move converted {
+    Result<Value, OutOfMemoryError | JsException | StringLengthError | BigIntError>.Success { value } => {
+      let encoded = run Effect.result(Strings.toUtf8(value, false))
+      unsafe gc.release(&mut engine, rt, value)
+      match move encoded {
+        Result<List<u8>, OutOfMemoryError>.Success { value: bytes } => {
+          let mut writer = StderrWriter.make()
+          let written = run Effect.result(Writer.writeAll(bytes.asSlice())) |> Effect.provideMut<Writer>(&mut writer)
+          let newline = run Effect.result(Writer.writeAll(b"\n")) |> Effect.provideMut<Writer>(&mut writer)
+        }
+        Result<List<u8>, OutOfMemoryError>.Failure { .. } => { StderrWriter.print("exception UTF8 conversion failed\n", &.{}) }
+      }
+    }
+    Result<Value, OutOfMemoryError | JsException | StringLengthError | BigIntError>.Failure { .. } => {
+      StderrWriter.print("exception string conversion failed\n", &.{})
+    }
+  }
+  if unsafe exceptions.has(rt) { let nested = unsafe exceptions.take(rt) unsafe gc.release(&mut engine, rt, nested) }
+}
+unsafe effect fn foreignRealm<'m>(engine: &mut Engine<'m, NoHostServices>, memory: &AllocationObserver,
+  rt: *mut HeapHeader) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  let context = run unsafe intrinsics.create(&mut engine, memory, rt)
+  let prepared = run Effect.result(unsafe asynchronous.prepare(&mut engine, context,
+    b"globalThis.foreignConstructor=function ForeignDateTarget(){};foreignConstructor.prototype=null;globalThis.foreignDatePrototype=Date.prototype;globalThis"))
+  unsafe gc.releaseHeader(&mut engine, rt, context)
+  return match move prepared { Result<Value, JsException>.Success { value } => value Result<Value, JsException>.Failure { error } => { fail move error } }
+}
+unsafe effect fn observe<'m>(engine: &mut Engine<'m, NoHostServices>, allocator: &mut RuntimeAllocator<SystemAllocator>,
+  memory: &AllocationObserver, context: *mut HeapHeader, function: Value, extra: Value, operation: u32, stringMode: bool,
+  output: &mut ByteBuffer) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  if stringMode {
+    let row = run unsafe strings.runCase(&mut engine, context, function, operation) |> Effect.provideMut<Allocator>(&mut allocator.*)
+    run append(&mut output, &row)
+  } else {
+    let row = run unsafe asynchronous.runCase(&mut engine, memory, context, function, extra, operation) |> Effect.provideMut<Allocator>(&mut allocator.*)
+    run append(&mut output, &row)
+  }
+}
+unsafe effect fn executeWeak<'m>(engine: &mut Engine<'m, NoHostServices>,
+  allocator: RuntimeAllocator<SystemAllocator>, context: *mut HeapHeader,
+  cases: Value, operation: u32, output: &mut ByteBuffer) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  let mut fault = FaultAllocator { parent: move allocator, armed: false,
+    remaining: usize.MAX, persistent: false, failures: 0 }
+  let mut first: u32 = 0 let mut second: u32 = 0 let mut shutdown: u32 = 0
+  let mut status: i32 = 0
+  if operation < weak.CASE_COUNT {
+    let result = run Effect.result(unsafe weak.runCase(&mut engine, context, cases, operation))
+      |> Effect.provideMut<Allocator>(&mut fault)
+    match move result {
+      Result<[u32; 2], OutOfMemoryError | JsException>.Success { value } => {
+        first = value[0] second = value[1]
+      }
+      Result<[u32; 2], OutOfMemoryError | JsException>.Failure { .. } => { status = 4 }
+    }
+  } else if operation < 18 {
+    let result = run Effect.result(unsafe weak.enqueueOom(&mut engine, context, cases,
+      &mut fault, u32.toUsize(operation - 16)))
+    match move result {
+      Result<(), OutOfMemoryError | JsException>.Success { .. } => ()
+      Result<(), OutOfMemoryError | JsException>.Failure { .. } => { status = 4 }
+    }
+  } else {
+    let correct = run unsafe weak.shutdown(&mut engine, context, cases)
+      |> Effect.provideMut<Allocator>(&mut fault)
+    if correct { shutdown = 1 } else { status = 4 }
+  }
+  if operation != 18 {
+    run unsafe report(&mut engine, context) |> Effect.provideMut<Allocator>(&mut fault)
+    unsafe gc.release(&mut engine, rt, cases)
+    unsafe gc.releaseHeader(&mut engine, rt, context)
+    run unsafe gc.destroyRuntime(&mut engine, rt) |> Effect.provideMut<Allocator>(&mut fault)
+  }
+  let stats = engine.memory.stats()
+  run append(&mut output, &[first, second, usize.toU32(fault.failures), shutdown,
+    usize.toU32(stats.allocationCount), usize.toU32(stats.usedBytes)])
+  return status
+}
+unsafe effect fn execute(domain: Domain, source: &[u8], operation: u32, fault: bool, cutoff: usize,
+  stringMode: bool, foreignMode: bool, weakMode: bool, output: &mut ByteBuffer) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let memory = run allocator.observe()
+  let mut engine = Engine { memory: &memory, domain: domain, services: NoHostServices {} }
+  let rt = run runtime.allocateRuntimeStorage(stack.currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let created = run Effect.result(unsafe intrinsics.create(&mut engine, &memory, rt)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let context = match move created {
+    Result<*mut HeapHeader, OutOfMemoryError | JsException>.Success { value } => value
+    Result<*mut HeapHeader, OutOfMemoryError | JsException>.Failure { .. } => {
+      run unsafe gc.destroyRuntime(&mut engine, rt) |> Effect.provideMut<Allocator>(&mut allocator)
+      StderrWriter.print("realm installation failed\n", &.{}) return 2
+    }
+  }
+  let prepared = run Effect.result(unsafe asynchronous.prepare(&mut engine, context, source)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let function = match move prepared {
+    Result<Value, JsException>.Success { value } => value
+    Result<Value, JsException>.Failure { .. } => {
+      run unsafe report(&mut engine, context) |> Effect.provideMut<Allocator>(&mut allocator)
+      unsafe gc.releaseHeader(&mut engine, rt, context)
+      run unsafe gc.destroyRuntime(&mut engine, rt) |> Effect.provideMut<Allocator>(&mut allocator)
+      StderrWriter.print("scenario compilation failed\n", &.{}) return 3
+    }
+  }
+  if weakMode {
+    return run unsafe executeWeak(&mut engine, move allocator, context, function, operation, &mut output)
+  }
+  let mut extra = Value.Undefined
+  if foreignMode {
+    let made = run Effect.result(unsafe foreignRealm(&mut engine, &memory, rt)) |> Effect.provideMut<Allocator>(&mut allocator)
+    extra = match move made {
+      Result<Value, OutOfMemoryError | JsException>.Success { value } => value
+      Result<Value, OutOfMemoryError | JsException>.Failure { .. } => {
+        run unsafe report(&mut engine, context) |> Effect.provideMut<Allocator>(&mut allocator)
+        unsafe gc.release(&mut engine, rt, function) unsafe gc.releaseHeader(&mut engine, rt, context)
+        run unsafe gc.destroyRuntime(&mut engine, rt) |> Effect.provideMut<Allocator>(&mut allocator)
+        StderrWriter.print("foreign realm installation failed\n", &.{}) return 3
+      }
+    }
+  }
+  if fault {
+    if stringMode {
+      let row = run unsafe strings.runFault(&mut engine, move allocator, &memory, context, function, operation, cutoff)
+      run append(&mut output, &row)
+    } else {
+      let row = run unsafe asynchronous.runFault(&mut engine, move allocator, &memory, context, function, extra, operation, cutoff)
+      run append(&mut output, &row)
+    }
+    return 0
+  }
+  let observed = run Effect.result(unsafe observe(&mut engine, &mut allocator, &memory, context, function, extra, operation, stringMode, &mut output))
+  run unsafe report(&mut engine, context) |> Effect.provideMut<Allocator>(&mut allocator)
+  unsafe gc.release(&mut engine, rt, function)
+  unsafe gc.release(&mut engine, rt, extra)
+  unsafe gc.releaseHeader(&mut engine, rt, context)
+  run unsafe gc.destroyRuntime(&mut engine, rt) |> Effect.provideMut<Allocator>(&mut allocator)
+  match move observed {
+    Result<(), OutOfMemoryError | JsException>.Success { .. } => {
+      run output.writeU32(usize.toU32(memory.stats().usedBytes))
+      run output.writeU32(usize.toU32(memory.stats().allocationCount))
+      return 0
+    }
+    Result<(), OutOfMemoryError | JsException>.Failure { .. } => {
+      StderrWriter.print("scenario execution failed\n", &.{}) return 4
+    }
+  }
+}
+pub effect fn main() -> i32 ! HostInputError | OutOfMemoryError | FileError | SynchronizationError | WriterError ? &mut HostInput {
+  let mut system = Allocator.systemAllocatorProvider()
+  let count = run HostInput.argumentCount()
+  if count != 4 && count != 5 { return 64 }
+  let mode = run argument(1) |> Effect.provideMut<Allocator>(&mut system)
+  let modeBytes = Bytes.asSlice(&mode)
+  let fault = equal(modeBytes, b"fault") || equal(modeBytes, b"string-fault") || equal(modeBytes, b"foreign-fault")
+  let stringMode = equal(modeBytes, b"string-case") || equal(modeBytes, b"string-fault")
+  let foreignMode = equal(modeBytes, b"foreign-case") || equal(modeBytes, b"foreign-fault")
+  let weakMode = equal(modeBytes, b"weak-case")
+  if !fault && !stringMode && !foreignMode && !weakMode && !equal(modeBytes, b"case") { return 64 }
+  if (fault && count != 5) || (!fault && count != 4) { return 64 }
+  let input = run argument(2) |> Effect.provideMut<Allocator>(&mut system)
+  let path = run Path.fromBytes(Bytes.asSlice(&input)) |> Effect.provideMut<Allocator>(&mut system)
+  let operationBytes = run argument(3) |> Effect.provideMut<Allocator>(&mut system)
+  let operation = match move unsigned(Bytes.asSlice(&operationBytes)) {
+    Option<usize>.Some { value } => value
+    Option<usize>.None => { return 64 }
+  }
+  if operation > 2147483647 { return 64 }
+  if weakMode && operation > 18 { return 64 }
+  let mut cutoff: usize = 0
+  if fault {
+    let cutoffBytes = run argument(4) |> Effect.provideMut<Allocator>(&mut system)
+    cutoff = match move unsigned(Bytes.asSlice(&cutoffBytes)) { Option<usize>.Some { value } => value Option<usize>.None => { return 64 } }
+  }
+  let mut files = run OsFileSystem.make("/") |> Effect.provideMut<Allocator>(&mut system)
+  let source = run FileSystem.readFile(&path) |> Effect.provideMut<FileSystem>(&mut files) |> Effect.provideMut<Allocator>(&mut system)
+  // The waiter domain is embedding-wide, outside the per-runtime fault allocator.
+  // Track its owners independently, including destruction after the runtime ends.
+  let mut synchronization = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let domain = run WaiterDomain.make() |> Effect.provideMut<Allocator>(&mut synchronization)
+  let mut output = ByteBuffer.make()
+  let status = run unsafe execute(domain.handle(), Bytes.asSlice(&source), usize.toU32(operation), fault, cutoff, stringMode, foreignMode, weakMode, &mut output) |> Effect.provideMut<Allocator>(&mut system)
+  drop domain
+  if synchronization.stats().usedBytes != 0 || synchronization.stats().allocationCount != 0 { return 99 }
+  if status != 0 { return status }
+  let mut writer = StdoutWriter.make()
+  run Writer.writeAll(output.asSlice()) |> Effect.provideMut<Writer>(&mut writer)
+  return 0
+}

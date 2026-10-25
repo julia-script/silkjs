@@ -1,0 +1,552 @@
+// Native port of Fabrice Bellard's dtoa.c (2024), MIT; see repository provenance.
+// Float output returns its byte count and writes a trailing NUL. maxLength()
+// includes the NUL capacity. Integer output returns its byte count WITHOUT a
+// trailing NUL; 65 bytes suffice for any signed radix integer.
+// Radices are 2..36 (parse also accepts 0 for inference). Nondecimal formatting
+// follows upstream's free-format contract. Fixed/frac precision is at most 101.
+import silk.f64
+import silk.i32
+import silk.i64
+import silk.u8
+import silk.u32
+import silk.u64
+import silk.usize
+import dtoa_big { Big, Rounded, ROUND_EVEN, ROUND_AWAY, ROUND_ZERO, DIGITS_PER_LIMB, RADIX_BASE, clz32, clz64, trailingZeros, low32, minimum, maximum, radixLog, power }
+
+pub const JS_DTOA_MAX_DIGITS: u32 = 101
+pub const JS_DTOA_FORMAT_FREE: u32 = 0
+pub const JS_DTOA_FORMAT_FIXED: u32 = 1
+pub const JS_DTOA_FORMAT_FRAC: u32 = 2
+pub const JS_DTOA_FORMAT_MASK: u32 = 3
+pub const JS_DTOA_EXP_AUTO: u32 = 0
+pub const JS_DTOA_EXP_ENABLED: u32 = 4
+pub const JS_DTOA_EXP_DISABLED: u32 = 8
+pub const JS_DTOA_EXP_MASK: u32 = 12
+pub const JS_DTOA_MINUS_ZERO: u32 = 16
+pub const JS_ATOD_INT_ONLY: u32 = 1
+pub const JS_ATOD_ACCEPT_BIN_OCT: u32 = 2
+pub const JS_ATOD_ACCEPT_LEGACY_OCTAL: u32 = 4
+pub const JS_ATOD_ACCEPT_UNDERSCORES: u32 = 8
+const FORMAT_DIGITS: [i32; 35] = [54,35,28,24,22,20,19,18,17,17,16,16,15,15,15,14,14,14,14,14,13,13,13,13,13,13,13,12,12,12,12,12,12,12,12]
+const PARSE_DIGITS: [i32; 35] = [64,80,32,55,49,45,21,40,38,37,35,34,33,32,16,31,30,30,29,29,28,28,27,27,27,26,26,26,26,25,12,25,25,24,24]
+const MAX_EXPONENT: [i32; 35] = [1024,647,512,442,397,365,342,324,309,297,286,277,269,263,256,251,246,242,237,234,230,227,224,221,218,216,214,211,209,207,205,203,202,200,199]
+const MIN_EXPONENT: [i32; 35] = [-1075,-679,-538,-463,-416,-383,-359,-340,-324,-311,-300,-291,-283,-276,-269,-263,-258,-254,-249,-245,-242,-238,-235,-232,-229,-227,-224,-222,-220,-217,-215,-214,-212,-210,-208]
+const FRACTION_MASK: u64 = 0xfffffffffffff
+const INFINITY_BITS: u64 = 0x7ff0000000000000
+const SIGN_BIT: u64 = 0x8000000000000000
+
+pub struct ParsedNumber { pub value: f64, pub consumed: usize }
+pub struct Dtoa {}
+
+fn digitByte(value: u32) -> u8 {
+  if value < 10 { return u32.toU8(value + 48) }
+  return u32.toU8(value + 87)
+}
+fn fixedDigits(output: &mut [u8], offset: usize, mut value: u64, radix: u32, length: usize) -> () {
+  let mut index = length
+  while index > 0 {
+    index = index - 1
+    output[offset + index] = digitByte(u64.toU32(value % u32.toU64(radix)))
+    value = value / u32.toU64(radix)
+  }
+}
+fn binaryDigits(output: &mut [u8], offset: usize, mut value: u64, bits: i32, length: usize) -> () {
+  let mask = u64.shiftLeft(1, i32.toU64(bits)) - 1
+  let mut index = length
+  while index > 0 {
+    index = index - 1
+    output[offset + index] = digitByte(u64.toU32(value & mask))
+    value = u64.shiftRight(value, i32.toU64(bits))
+  }
+}
+fn unsigned32(output: &mut [u8], offset: usize, mut value: u32) -> usize {
+  let mut temporary: [u8; 10] = [0; 10]
+  let mut start: usize = 10
+  while true {
+    start = start - 1
+    temporary[start] = u32.toU8(value % 10 + 48)
+    value = value / 10
+    if value == 0 { break }
+  }
+  let length = 10 - start
+  let mut index: usize = 0
+  while index < length {
+    output[offset + index] = temporary[start + index]
+    index = index + 1
+  }
+  return length
+}
+fn unsigned64(output: &mut [u8], offset: usize, mut value: u64) -> usize {
+  if value < 0x100000000 { return unsigned32(&mut output, offset, u64.toU32(value)) }
+  let mut high = value / 1000000000
+  value = value % 1000000000
+  let mut length: usize = 0
+  if high >= 0x100000000 {
+    let mut highest = u64.toU32(high / 1000000000)
+    high = high % 1000000000
+    if highest >= 10 {
+      output[offset + length] = u32.toU8(highest / 10 + 48)
+      length = length + 1
+      highest = highest % 10
+    }
+    output[offset + length] = u32.toU8(highest + 48)
+    length = length + 1
+    fixedDigits(&mut output, offset + length, high, 10, 9)
+    length = length + 9
+  } else { length = unsigned32(&mut output, offset, u64.toU32(high)) }
+  fixedDigits(&mut output, offset + length, value, 10, 9)
+  return length + 9
+}
+fn unsignedRadix(output: &mut [u8], offset: usize, mut value: u64, radix: u32) -> usize {
+  if radix == 10 { return unsigned64(&mut output, offset, value) }
+  if (radix & (radix - 1)) == 0 {
+    let bits = 31 - clz32(radix)
+    let mut length: usize = 1
+    if value != 0 { length = i32.toUsize((64 - clz64(value) + bits - 1) / bits) }
+    binaryDigits(&mut output, offset, value, bits, length)
+    return length
+  }
+  let mut temporary: [u8; 41] = [0; 41]
+  let mut start: usize = 41
+  while true {
+    start = start - 1
+    temporary[start] = digitByte(u64.toU32(value % u32.toU64(radix)))
+    value = value / u32.toU64(radix)
+    if value == 0 { break }
+  }
+  let length = 41 - start
+  let mut index: usize = 0
+  while index < length {
+    output[offset + index] = temporary[start + index]
+    index = index + 1
+  }
+  return length
+}
+fn signedMagnitude(value: i64) -> u64 {
+  if value >= 0 { return i64.toU64(value) }
+  // Avoid negating MIN, and avoid checked signed-to-unsigned conversion.
+  return i64.toU64(-(value + 1)) + 1
+}
+fn outputDigits(output: &mut [u8], offset: usize, number: &mut Big, radix: u32, length: i32, dot: i32) -> usize {
+  let mut remaining = length
+  let digits = DIGITS_PER_LIMB[u32.toUsize(radix - 2)]
+  let mut bits: i32 = 0
+  if (radix & (radix - 1)) == 0 { bits = 31 - clz32(radix) }
+  while remaining != 0 {
+    let count = minimum(remaining, digits)
+    remaining = remaining - count
+    if bits != 0 {
+      binaryDigits(&mut output, offset + i32.toUsize(remaining), u32.toU64(number.limbs[0]), bits, i32.toUsize(count))
+      if remaining != 0 { number.shiftRound(digits * bits, ROUND_ZERO) }
+    } else {
+      let remainder = number.divide(RADIX_BASE[u32.toUsize(radix - 2)])
+      fixedDigits(&mut output, offset + i32.toUsize(remaining), u32.toU64(remainder), radix, i32.toUsize(count))
+    }
+  }
+  if dot != length {
+    let mut index = i32.toUsize(length)
+    while index > i32.toUsize(dot) {
+      output[offset + index] = output[offset + index - 1]
+      index = index - 1
+    }
+    output[offset + i32.toUsize(dot)] = 46
+    return i32.toUsize(length + 1)
+  }
+  return i32.toUsize(length)
+}
+fn copyText(output: &mut [u8], offset: usize, text: &[u8]) -> usize {
+  let mut index: usize = 0
+  while index < text.length {
+    output[offset + index] = text[index]
+    index = index + 1
+  }
+  return offset + text.length
+}
+
+impl Dtoa {
+  pub fn u32toa(output: &mut [u8], value: u32) -> usize { return unsigned32(&mut output, 0, value) }
+  pub fn i32toa(output: &mut [u8], value: i32) -> usize {
+    if value >= 0 { return unsigned32(&mut output, 0, i32.toU32(value)) }
+    output[0] = 45
+    return 1 + unsigned32(&mut output, 1, u64.toU32(signedMagnitude(i32.toI64(value))))
+  }
+  pub fn u64toa(output: &mut [u8], value: u64) -> usize { return unsigned64(&mut output, 0, value) }
+  pub fn i64toa(output: &mut [u8], value: i64) -> usize {
+    if value >= 0 { return unsigned64(&mut output, 0, i64.toU64(value)) }
+    output[0] = 45
+    return 1 + unsigned64(&mut output, 1, signedMagnitude(value))
+  }
+  pub fn u64toaRadix(output: &mut [u8], value: u64, radix: u32) -> usize { return unsignedRadix(&mut output, 0, value, radix) }
+  pub fn i64toaRadix(output: &mut [u8], value: i64, radix: u32) -> usize {
+    if value >= 0 { return unsignedRadix(&mut output, 0, i64.toU64(value), radix) }
+    output[0] = 45
+    return 1 + unsignedRadix(&mut output, 1, signedMagnitude(value), radix)
+  }
+  pub fn maxLength(value: f64, radix: u32, digits: u32, flags: u32) -> usize {
+    let format = flags & JS_DTOA_FORMAT_MASK
+    let exponent = u64.toI32(u64.shiftRight(f64.toBits(value), 52) & 0x7ff)
+    let mut length: i32 = 0
+    if format != JS_DTOA_FORMAT_FRAC {
+      if format == JS_DTOA_FORMAT_FREE { length = FORMAT_DIGITS[u32.toUsize(radix - 2)] }
+      else { length = u32.toI32(digits) }
+      if (flags & JS_DTOA_EXP_MASK) == JS_DTOA_EXP_DISABLED {
+        if exponent == 0x7ff { length = 0 }
+        else {
+          let mut binaryExponent = exponent - 1023
+          let fraction = f64.toBits(value) & FRACTION_MASK
+          // Normalize subnormals for a true bound. The upstream helper uses
+          // the encoded exponent here and can under-allocate fixed precision.
+          if exponent == 0 && fraction != 0 {
+            binaryExponent = 63 - clz64(fraction) - 1074
+          }
+          let mut extra = radixLog(binaryExponent - 1, radix)
+          if extra < 0 { extra = -extra }
+          length = length + 10 + extra
+        }
+      } else { length = length + 8 }
+    } else if exponent != 0x7ff {
+      let binaryExponent = exponent - 1023
+      if binaryExponent < 0 { length = 1 }
+      else { length = 2 + radixLog(binaryExponent - 1, radix) }
+      length = length + 3 + u32.toI32(digits)
+    }
+    return i32.toUsize(maximum(length, 9)) + 1
+  }
+  pub fn format(output: &mut [u8], value: f64, radix: u32, digits: u32, flags: u32) -> usize {
+    let length = Dtoa.formatInner(&mut output, value, radix, digits, flags)
+    output[length] = 0
+    return length
+  }
+  fn formatInner(output: &mut [u8], value: f64, radix: u32, digits: u32, flags: u32) -> usize {
+    let format = flags & JS_DTOA_FORMAT_MASK
+    let exponentMode = flags & JS_DTOA_EXP_MASK
+    let radixShift = trailingZeros(radix)
+    let oddRadix = u32.shiftRight(radix, i32.toU32(radixShift))
+    let bits = f64.toBits(value)
+    let negative = (bits & SIGN_BIT) != 0
+    let mut exponent = u64.toI32(u64.shiftRight(bits, 52) & 0x7ff)
+    let mut mantissa = bits & FRACTION_MASK
+    let mut cursor: usize = 0
+    if exponent == 0x7ff {
+      if mantissa != 0 { return copyText(&mut output, 0, b"NaN") }
+      if negative { output[0] = 45
+        cursor = 1 }
+      return copyText(&mut output, cursor, b"Infinity")
+    }
+    let mut number = Big.make()
+    let mut decimalExponent: i32 = 1
+    let mut precision: i32 = 1
+    if exponent == 0 && mantissa == 0 {
+      if format == JS_DTOA_FORMAT_FRAC { precision = u32.toI32(digits) + 1 }
+      else if format != JS_DTOA_FORMAT_FREE { precision = u32.toI32(digits) }
+      if negative && (flags & JS_DTOA_MINUS_ZERO) != 0 {
+        output[cursor] = 45
+        cursor = cursor + 1
+      }
+    } else {
+      if exponent == 0 {
+        let shift = clz64(mantissa) - 11
+        exponent = exponent - (shift - 1)
+        mantissa = u64.shiftLeft(mantissa, i32.toU64(shift))
+      } else { mantissa = mantissa | 0x10000000000000 }
+      if negative {
+        output[cursor] = 45
+        cursor = cursor + 1
+      }
+      exponent = exponent - 1022
+      if format == JS_DTOA_FORMAT_FREE && exponent >= 1 && exponent <= 53 &&
+          (mantissa & (u64.shiftLeft(1, i32.toU64(53 - exponent)) - 1)) == 0 && exponentMode != JS_DTOA_EXP_ENABLED {
+        return cursor + unsignedRadix(&mut output, cursor, u64.shiftRight(mantissa, i32.toU64(53 - exponent)), radix)
+      }
+      decimalExponent = 1 + radixLog(exponent - 1, radix)
+      if format == JS_DTOA_FORMAT_FREE {
+        precision = FORMAT_DIGITS[u32.toUsize(radix - 2)]
+        let initialExponent = decimalExponent
+        let mut foundPrecision: i32 = 0
+        let mut foundExponent: i32 = 0
+        let mut foundMantissa: u64 = 0
+        while true {
+          let limit = power(radix, precision)
+          decimalExponent = initialExponent
+          let mut candidate: u64 = 0
+          while true {
+            number.scaleRound(mantissa, exponent - 53, oddRadix, radixShift, precision - decimalExponent, ROUND_EVEN)
+            candidate = number.get()
+            if candidate < limit { break }
+            decimalExponent = decimalExponent + 1
+          }
+          while candidate % u32.toU64(radix) == 0 {
+            candidate = candidate / u32.toU64(radix)
+            precision = precision - 1
+          }
+          let mut matches = foundPrecision == 0
+          if !matches {
+            number.set(candidate)
+            let back = number.scaleFloat(oddRadix, radixShift, decimalExponent - precision, ROUND_EVEN)
+            matches = back.mantissa == mantissa && back.exponent == exponent
+          }
+          if !matches { break }
+          foundPrecision = precision
+          foundExponent = decimalExponent
+          foundMantissa = candidate
+          if precision == 1 { break }
+          precision = precision - 1
+        }
+        precision = foundPrecision
+        decimalExponent = foundExponent
+        number.set(foundMantissa)
+      } else if format == JS_DTOA_FORMAT_FRAC {
+        number.scaleRound(mantissa, exponent - 53, oddRadix, radixShift, u32.toI32(digits), ROUND_AWAY)
+        let integerDigits = maximum(decimalExponent + 1, 1)
+        let mut length = outputDigits(&mut output, cursor, &mut number, radix, integerDigits + u32.toI32(digits), integerDigits)
+        if output[cursor] == 48 && length >= 2 && output[cursor + 1] != 46 {
+          length = length - 1
+          let mut index: usize = 0
+          while index < length {
+            output[cursor + index] = output[cursor + index + 1]
+            index = index + 1
+          }
+        }
+        return cursor + length
+      } else {
+        precision = u32.toI32(digits)
+        let mut limit = Big.make()
+        limit.set(1)
+        let shift = limit.multiplyPower(oddRadix, radixShift, precision, false, 0)
+        limit.shiftRound(shift, ROUND_ZERO)
+        while true {
+          number.scaleRound(mantissa, exponent - 53, oddRadix, radixShift, precision - decimalExponent, ROUND_AWAY)
+          if number.compare(&limit) < 0 { break }
+          decimalExponent = decimalExponent + 1
+        }
+      }
+    }
+    let mut maximumExponent = FORMAT_DIGITS[u32.toUsize(radix - 2)] + 4
+    if format == JS_DTOA_FORMAT_FIXED { maximumExponent = u32.toI32(digits) }
+    if exponentMode == JS_DTOA_EXP_ENABLED || (exponentMode == JS_DTOA_EXP_AUTO && (decimalExponent <= -6 || decimalExponent > maximumExponent)) {
+      cursor = cursor + outputDigits(&mut output, cursor, &mut number, radix, precision, 1)
+      decimalExponent = decimalExponent - 1
+      if radix == 10 { output[cursor] = 101 }
+      else if oddRadix == 1 && radixShift <= 4 {
+        decimalExponent = decimalExponent * radixShift
+        output[cursor] = 112
+      } else { output[cursor] = 64 }
+      cursor = cursor + 1
+      if decimalExponent < 0 {
+        output[cursor] = 45
+        decimalExponent = -decimalExponent
+      } else { output[cursor] = 43 }
+      cursor = cursor + 1
+      cursor = cursor + unsigned32(&mut output, cursor, i32.toU32(decimalExponent))
+    } else if decimalExponent <= 0 {
+      output[cursor] = 48
+      output[cursor + 1] = 46
+      cursor = cursor + 2
+      let mut index: i32 = 0
+      while index < -decimalExponent {
+        output[cursor] = 48
+        cursor = cursor + 1
+        index = index + 1
+      }
+      cursor = cursor + outputDigits(&mut output, cursor, &mut number, radix, precision, precision)
+    } else {
+      cursor = cursor + outputDigits(&mut output, cursor, &mut number, radix, precision, minimum(precision, decimalExponent))
+      let mut index: i32 = 0
+      while index < decimalExponent - precision {
+        output[cursor] = 48
+        cursor = cursor + 1
+        index = index + 1
+      }
+    }
+    return cursor
+  }
+
+  // Parsing is byte-oriented, does not skip whitespace, and consumes precisely
+  // the same prefix as js_atod. Malformed exponents return NaN at the failure
+  // position, not at the exponent marker. Non-power-of-two input retains the
+  // upstream ~128 significant-bit cap; power-of-two input retains sticky bits.
+  pub fn parse(input: &[u8], mut radix: u32, flags: u32) -> ParsedNumber {
+    let mut cursor: usize = 0
+    let mut negative = false
+    if byteAt(input, cursor) == 43 { cursor = cursor + 1 }
+    else if byteAt(input, cursor) == 45 {
+      negative = true
+      cursor = cursor + 1
+    }
+    let start = cursor
+    let mut separator: u32 = 256
+    if (flags & JS_ATOD_ACCEPT_UNDERSCORES) != 0 { separator = 95 }
+    let integer = (flags & JS_ATOD_INT_ONLY) != 0
+    if byteAt(input, cursor) == 48 {
+      let next = byteAt(input, cursor + 1)
+      let mut prefixed = false
+      if (next == 120 || next == 88) && (radix == 0 || radix == 16) {
+        cursor = cursor + 2
+        radix = 16
+        prefixed = true
+      } else if (next == 111 || next == 79) && radix == 0 && (flags & JS_ATOD_ACCEPT_BIN_OCT) != 0 {
+        cursor = cursor + 2
+        radix = 8
+        prefixed = true
+      } else if (next == 98 || next == 66) && radix == 0 && (flags & JS_ATOD_ACCEPT_BIN_OCT) != 0 {
+        cursor = cursor + 2
+        radix = 2
+        prefixed = true
+      } else if next >= 48 && next <= 57 && radix == 0 && (flags & JS_ATOD_ACCEPT_LEGACY_OCTAL) != 0 {
+        separator = 256
+        let mut index = cursor + 1
+        while byteAt(input, index) >= 48 && byteAt(input, index) <= 55 { index = index + 1 }
+        if byteAt(input, index) != 56 && byteAt(input, index) != 57 {
+          cursor = cursor + 1
+          radix = 8
+          prefixed = true
+        }
+      }
+      if prefixed && digitValue(byteAt(input, cursor)) >= radix { return parseFailure(cursor) }
+    } else if !integer && startsInfinity(input, cursor) {
+      return parsedBits(INFINITY_BITS, negative, cursor + 8)
+    }
+    if radix == 0 { radix = 10 }
+    let tableIndex = u32.toUsize(radix - 2)
+    let maxDigits = PARSE_DIGITS[tableIndex]
+    let digitsPerLimb = DIGITS_PER_LIMB[tableIndex]
+    let base = RADIX_BASE[tableIndex]
+    let radixShift = trailingZeros(radix)
+    let oddRadix = u32.shiftRight(radix, i32.toU32(radixShift))
+    let mut radixBits: i32 = 0
+    if oddRadix == 1 { radixBits = radixShift }
+    let mut number = Big.make()
+    let mut position: i64 = 0
+    let mut dot: i64 = -1
+    while true {
+      if byteAt(input, cursor) == 46 && (cursor > start || digitValue(byteAt(input, cursor + 1)) < radix) && !integer {
+        if dot >= 0 { break }
+        dot = position
+        cursor = cursor + 1
+      }
+      if byteAt(input, cursor) == separator && cursor > start && byteAt(input, cursor + 1) == 48 { cursor = cursor + 1 }
+      if byteAt(input, cursor) != 48 { break }
+      cursor = cursor + 1
+      position = position + 1
+    }
+    let significantStart = position
+    let mut digitCount: i32 = 0
+    let mut limbDigits: i32 = 0
+    let mut current: u32 = 0
+    let mut extra: u32 = 0
+    while true {
+      if byteAt(input, cursor) == 46 && (cursor > start || digitValue(byteAt(input, cursor + 1)) < radix) && !integer {
+        if dot >= 0 { break }
+        dot = position
+        cursor = cursor + 1
+      }
+      if byteAt(input, cursor) == separator && cursor > start && digitValue(byteAt(input, cursor + 1)) < radix { cursor = cursor + 1 }
+      let digit = digitValue(byteAt(input, cursor))
+      if digit >= radix { break }
+      cursor = cursor + 1
+      position = position + 1
+      if digitCount < maxDigits {
+        current = u32.wrappingAdd(u32.wrappingMultiply(current, radix), digit)
+        limbDigits = limbDigits + 1
+        if limbDigits == digitsPerLimb {
+          number.multiplyBase(base, current)
+          current = 0
+          limbDigits = 0
+        }
+        digitCount = digitCount + 1
+      } else { extra = extra | digit }
+    }
+    if limbDigits != 0 { number.multiplyBase(u64.toU32(power(radix, limbDigits)), current) }
+    let zero = digitCount == 0
+    let mut exponentOffset: i64 = 0
+    if !zero {
+      if dot < 0 { dot = position }
+      exponentOffset = significantStart + i32.toI64(digitCount) - dot
+    }
+    if radixBits != 0 && extra != 0 { number.limbs[0] = number.limbs[0] | 1 }
+    let mut exponent: i64 = 0
+    let mut exponentOverflow = false
+    let mut binaryExponent = false
+    let marker = byteAt(input, cursor)
+    if !integer && cursor > start && ((radix == 10 && (marker == 101 || marker == 69)) ||
+        (radix != 10 && (marker == 64 || (radixBits >= 1 && radixBits <= 4 && (marker == 112 || marker == 80))))) {
+      binaryExponent = marker == 112 || marker == 80
+      cursor = cursor + 1
+      let mut exponentNegative = false
+      if byteAt(input, cursor) == 43 { cursor = cursor + 1 }
+      else if byteAt(input, cursor) == 45 {
+        exponentNegative = true
+        cursor = cursor + 1
+      }
+      let first = digitValue(byteAt(input, cursor))
+      if first >= 10 { return parseFailure(cursor) }
+      exponent = u32.toI64(first)
+      cursor = cursor + 1
+      while true {
+        if byteAt(input, cursor) == separator && digitValue(byteAt(input, cursor + 1)) < 10 { cursor = cursor + 1 }
+        let digit = digitValue(byteAt(input, cursor))
+        if digit >= 10 { break }
+        if !exponentOverflow {
+          if exponent > 214748363 { exponentOverflow = true }
+          else { exponent = exponent * 10 + u32.toI64(digit) }
+        }
+        cursor = cursor + 1
+      }
+      if exponentNegative { exponent = -exponent }
+      if !zero && exponentOverflow {
+        if exponentNegative { return parsedBits(0, negative, cursor) }
+        return parsedBits(INFINITY_BITS, negative, cursor)
+      }
+    }
+    if cursor == start { return parseFailure(cursor) }
+    if zero { return parsedBits(0, negative, cursor) }
+    let mut rounded = Rounded { mantissa: 0, exponent: 0 }
+    if radixBits != 0 {
+      if !binaryExponent { exponent = exponent * i32.toI64(radixBits) }
+      exponent = exponent - exponentOffset * i32.toI64(radixBits)
+      let bound = exponent + i32.toI64(digitCount * radixBits)
+      if bound >= i32.toI64(1024 + radixBits) { return parsedBits(INFINITY_BITS, negative, cursor) }
+      if bound <= -1075 { return parsedBits(0, negative, cursor) }
+      rounded = number.roundFloat(i64.toI32(-exponent), ROUND_EVEN)
+    } else {
+      exponent = exponent - exponentOffset
+      let bound = exponent + i32.toI64(digitCount)
+      if bound >= i32.toI64(MAX_EXPONENT[tableIndex] + 1) { return parsedBits(INFINITY_BITS, negative, cursor) }
+      if bound <= i32.toI64(MIN_EXPONENT[tableIndex]) { return parsedBits(0, negative, cursor) }
+      rounded = number.scaleFloat(oddRadix, radixShift, i64.toI32(exponent), ROUND_EVEN)
+    }
+    let mantissa = rounded.mantissa
+    let binary = rounded.exponent
+    if mantissa == 0 || binary < -1073 { return parsedBits(0, negative, cursor) }
+    if binary > 1024 { return parsedBits(INFINITY_BITS, negative, cursor) }
+    if binary < -1021 { return parsedBits(u64.shiftRight(mantissa, i32.toU64(-binary - 1021)), negative, cursor) }
+    return parsedBits(u64.shiftLeft(i32.toU64(binary + 1022), 52) | (mantissa & FRACTION_MASK), negative, cursor)
+  }
+}
+
+fn byteAt(input: &[u8], index: usize) -> u32 {
+  if index >= input.length { return 0 }
+  return u8.toU32(input[index])
+}
+fn digitValue(byte: u32) -> u32 {
+  if byte >= 48 && byte <= 57 { return byte - 48 }
+  if byte >= 65 && byte <= 90 { return byte - 55 }
+  if byte >= 97 && byte <= 122 { return byte - 87 }
+  return 36
+}
+fn startsInfinity(input: &[u8], offset: usize) -> bool {
+  let text = b"Infinity"
+  let mut index: usize = 0
+  while index < 8 {
+    if byteAt(input, offset + index) != u8.toU32(text[index]) { return false }
+    index = index + 1
+  }
+  return true
+}
+fn parsedBits(mut bits: u64, negative: bool, consumed: usize) -> ParsedNumber {
+  if negative { bits = bits | SIGN_BIT }
+  return ParsedNumber { value: f64.fromBits(bits), consumed: consumed }
+}
+fn parseFailure(consumed: usize) -> ParsedNumber {
+  return ParsedNumber { value: f64.fromBits(0x7ff8000000000000), consumed: consumed }
+}

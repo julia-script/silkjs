@@ -1,0 +1,273 @@
+//! Final-pass mechanics from quickjs.c:35332-35579,35797-35920,36385-36460.
+//! Allocations are reserved by resolveLabels before atom ownership is changed.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.i32
+import silk.u8
+import silk.u16
+import silk.u32
+import silk.usize
+import byte_buffer { ByteBuffer, readU32 }
+import js_atoms { AtomTable }
+import js_compiler_types { FunctionDef, RelocEntry, JumpSlot }
+import js_compiler_emit { updateLabel }
+import js_compiler_code { CodeContext, matchCode, opcode, signedWord, unsignedWord, skipDeadCode }
+import js_debug_positions { PcSourcePosition }
+import js_compiler_state { captureVar }
+import js_core_types { JS_MODE_STRICT }
+import js_opcode_data as op
+
+pub effect fn addPosition(fd: &mut FunctionDef, out: &ByteBuffer, line: i32) -> () ! OutOfMemoryError ? &mut Allocator {
+  let pc = usize.toU32(out.length())
+  let source = unsignedWord(line)
+  if !fd.stripDebug && fd.lineNumbers.length() < fd.lineNumberCapacity
+    && pc >= fd.lineNumberLastPc && source != fd.lineNumberLast {
+    run fd.lineNumbers.append(PcSourcePosition { pc: pc, sourcePosition: source })
+    fd.lineNumberLastPc = pc fd.lineNumberLast = source
+  }
+}
+pub effect fn pushShortInt(out: &mut ByteBuffer, value: i32) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value >= -1 && value <= 7 { run out.append(i32.toU8(opcode(op.OP_push_0) + value)) }
+  else if value >= -128 && value <= 127 {
+    run out.append(op.OP_push_i8) run out.append(u32.toU8(unsignedWord(value) & 255))
+  } else if value >= -32768 && value <= 32767 {
+    run out.append(op.OP_push_i16) run out.writeU16(u32.toU16(unsignedWord(value) & 65535))
+  } else { run out.append(op.OP_push_i32) run out.writeU32(unsignedWord(value)) }
+}
+pub effect fn putShortCode(out: &mut ByteBuffer, code: u8, index: i32) -> () ! OutOfMemoryError ? &mut Allocator {
+  if index < 4 {
+    let mut base: i32 = -1
+    if code == op.OP_get_loc { base = opcode(op.OP_get_loc0) }
+    else if code == op.OP_put_loc { base = opcode(op.OP_put_loc0) }
+    else if code == op.OP_set_loc { base = opcode(op.OP_set_loc0) }
+    else if code == op.OP_get_arg { base = opcode(op.OP_get_arg0) }
+    else if code == op.OP_put_arg { base = opcode(op.OP_put_arg0) }
+    else if code == op.OP_set_arg { base = opcode(op.OP_set_arg0) }
+    else if code == op.OP_get_var_ref { base = opcode(op.OP_get_var_ref0) }
+    else if code == op.OP_put_var_ref { base = opcode(op.OP_put_var_ref0) }
+    else if code == op.OP_set_var_ref { base = opcode(op.OP_set_var_ref0) }
+    else if code == op.OP_call { base = opcode(op.OP_call0) }
+    if base >= 0 { run out.append(i32.toU8(base + index)) return () }
+  }
+  if index < 256 {
+    let mut base: i32 = -1
+    if code == op.OP_get_loc { base = opcode(op.OP_get_loc8) }
+    else if code == op.OP_put_loc { base = opcode(op.OP_put_loc8) }
+    else if code == op.OP_set_loc { base = opcode(op.OP_set_loc8) }
+    if base >= 0 { run out.append(i32.toU8(base)) run out.append(i32.toU8(index)) return () }
+  }
+  run out.append(code) run out.writeU16(i32.toU16(index))
+}
+effect fn special(out: &mut ByteBuffer, kind: u8, index: i32) -> () ! OutOfMemoryError ? &mut Allocator {
+  if index >= 0 { run out.append(op.OP_special_object) run out.append(kind) run putShortCode(&mut out, op.OP_put_loc, index) }
+}
+pub effect fn initializeLocals(fd: &mut FunctionDef, out: &mut ByteBuffer) -> () ! OutOfMemoryError ? &mut Allocator {
+  run special(&mut out, 4, fd.homeObjectVarIndex)
+  run special(&mut out, 2, fd.thisActiveFunctionVarIndex)
+  run special(&mut out, 3, fd.newTargetVarIndex)
+  if fd.thisVarIndex >= 0 {
+    if fd.isDerivedClassConstructor { run out.append(op.OP_set_loc_uninitialized) run out.writeU16(i32.toU16(fd.thisVarIndex)) }
+    else { run out.append(op.OP_push_this) run putShortCode(&mut out, op.OP_put_loc, fd.thisVarIndex) }
+  }
+  if fd.argumentsVarIndex >= 0 {
+    run out.append(op.OP_special_object)
+    if (fd.jsMode & JS_MODE_STRICT) != 0 || !fd.hasSimpleParameterList { run out.append(0) }
+    else {
+      run out.append(1)
+      let mut i: usize = 0
+      while i < fd.args.length() { captureVar(&mut fd, usize.toI32(i), true) i = i + 1 }
+    }
+    if fd.argumentsArgIndex >= 0 { run putShortCode(&mut out, op.OP_set_loc, fd.argumentsArgIndex) }
+    run putShortCode(&mut out, op.OP_put_loc, fd.argumentsVarIndex)
+  }
+  run special(&mut out, 2, fd.functionVarIndex)
+  run special(&mut out, 5, fd.varObjectIndex)
+  run special(&mut out, 5, fd.argVarObjectIndex)
+}
+pub fn codeHasLabel(bytes: &[u8], position: i32, label: i32) -> bool {
+  let mut pos = position
+  while i32.toUsize(pos) < bytes.length {
+    let code = bytes[i32.toUsize(pos)]
+    if code == op.OP_line_num { pos = pos + 5 continue }
+    if code == op.OP_label || code == op.OP_goto {
+      if signedWord(readU32(bytes, i32.toUsize(pos + 1))) == label { return true }
+      if code == op.OP_label { pos = pos + 5 continue }
+    }
+    break
+  }
+  return false
+}
+pub fn findJumpTarget(fd: &mut FunctionDef, bytes: &[u8], original: i32, first: &mut u8) -> i32 {
+  let mut label = original
+  let removed = updateLabel(&mut fd, label, -1)
+  let mut iterations: i32 = 0
+  let mut done = false
+  while iterations < 10 {
+    let mut pos = fd.labels.get(i32.toUsize(label)).position2
+    while true {
+      let code = bytes[i32.toUsize(pos)] first.* = code
+      if code == op.OP_line_num || code == op.OP_label { pos = pos + 5 continue }
+      if code == op.OP_goto { label = signedWord(readU32(bytes, i32.toUsize(pos + 1))) break }
+      if code == op.OP_drop {
+        pos = pos + 1
+        while bytes[i32.toUsize(pos)] == op.OP_drop { pos = pos + 1 }
+        if bytes[i32.toUsize(pos)] == op.OP_return_undef { first.* = op.OP_return_undef }
+      }
+      done = true break
+    }
+    if done { break }
+    iterations = iterations + 1
+  }
+  if !done { label = original }
+  let added = updateLabel(&mut fd, label, 1)
+  return label
+}
+pub fn patchDisplacement(out: &mut ByteBuffer, position: i32, size: i32, diff: i32) -> () {
+  let at = i32.toUsize(position)
+  if size == 1 {
+    if diff < -128 || diff > 127 { Intrinsic.trap("QuickJS invariant violated") }
+    out.set(at, u32.toU8(unsignedWord(diff) & 255))
+  } else if size == 2 {
+    if diff < -32768 || diff > 32767 { Intrinsic.trap("QuickJS invariant violated") }
+    out.patchU16(at, u32.toU16(unsignedWord(diff) & 65535))
+  } else { out.patchU32(at, unsignedWord(diff)) }
+}
+pub fn resolveLabel(fd: &mut FunctionDef, out: &mut ByteBuffer, label: i32) -> () {
+  let mut slot = fd.labels.get(i32.toUsize(label))
+  if slot.address != -1 { Intrinsic.trap("QuickJS invariant violated") }
+  slot.address = usize.toI32(out.length())
+  let mut relocation = slot.firstRelocation
+  while relocation != -1 {
+    let entry = fd.relocations.get(i32.toUsize(relocation))
+    patchDisplacement(&mut out, u32.toI32(entry.address), entry.size, slot.address - u32.toI32(entry.address))
+    relocation = entry.next
+  }
+  slot.firstRelocation = -1 fd.labels.set(i32.toUsize(label), slot)
+}
+effect fn addRelocation(fd: &mut FunctionDef, label: i32, position: i32, size: i32) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut slot = fd.labels.get(i32.toUsize(label))
+  let index = usize.toI32(fd.relocations.length())
+  run fd.relocations.append(RelocEntry { next: slot.firstRelocation, address: i32.toU32(position), size: size })
+  slot.firstRelocation = index fd.labels.set(i32.toUsize(label), slot)
+}
+// optimize=false enters source's has_label directly: synthesized tests intentionally
+// do not repeat jump threading or conditional inversion.
+pub effect fn emitBranch(fd: &mut FunctionDef, table: &mut AtomTable, bytes: &[u8], out: &mut ByteBuffer,
+    position: i32, next: i32, line: &mut i32, initialCode: u8, initialLabel: i32, optimize: bool) -> i32
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut code = initialCode let mut label = initialLabel let mut after = next
+  if optimize && (code == op.OP_goto || code == op.OP_if_true || code == op.OP_if_false) {
+    let mut first: u8 = 0
+    label = findJumpTarget(&mut fd, bytes, label, &mut first)
+    if codeHasLabel(bytes, after, label) {
+      let removed = updateLabel(&mut fd, label, -1)
+      if code != op.OP_goto { run out.append(op.OP_drop) }
+      return after
+    }
+    if code == op.OP_goto {
+      if first == op.OP_return || first == op.OP_return_undef || first == op.OP_throw {
+        let removed = updateLabel(&mut fd, label, -1)
+        run addPosition(&mut fd, &out.*, line.*) run out.append(first)
+        return skipDeadCode(&mut fd, &mut table, bytes, after, &mut line)
+      }
+    } else {
+      let mut cc = CodeContext.make()
+      if matchCode(&mut cc, bytes, after, &[opcode(op.OP_goto), -1]) && codeHasLabel(bytes, cc.position, label) {
+        if cc.lineNumber != -1 { line.* = cc.lineNumber }
+        after = cc.position let removed = updateLabel(&mut fd, label, -1)
+        label = cc.label code = code ^ op.OP_if_true ^ op.OP_if_false
+      }
+    }
+  }
+  run addPosition(&mut fd, &out.*, line.*)
+  if code == op.OP_goto { after = skipDeadCode(&mut fd, &mut table, bytes, after, &mut line) }
+  let slot = fd.labels.get(i32.toUsize(label))
+  let at = usize.toI32(out.length()) + 1
+  let mut size: i32 = 4
+  let mut emitted = code
+  let mut diff = slot.address - at
+  let forward = slot.address == -1
+  if forward { diff = slot.position2 - position - 1 }
+  let mut byteFits = diff >= -128 && diff <= 127
+  let mut wordFits = diff >= -32768 && diff <= 32767
+  if forward { byteFits = diff < 128 wordFits = diff < 32768 }
+  if byteFits && (code == op.OP_if_false || code == op.OP_if_true || code == op.OP_goto) {
+    size = 1 emitted = i32.toU8(opcode(op.OP_if_false8) + opcode(code) - opcode(op.OP_if_false))
+  } else if wordFits && code == op.OP_goto { size = 2 emitted = op.OP_goto16 }
+  run fd.jumps.append(JumpSlot { opcode: opcode(emitted), size: size, position: at, label: label })
+  run out.append(emitted)
+  if size == 1 { if forward { diff = 0 } run out.append(u32.toU8(unsignedWord(diff) & 255)) }
+  else if size == 2 { if forward { diff = 0 } run out.writeU16(u32.toU16(unsignedWord(diff) & 65535)) }
+  else { run out.writeU32(unsignedWord(slot.address - at)) }
+  if forward { run addRelocation(&mut fd, label, at, size) }
+  return after
+}
+pub effect fn emitWith(fd: &mut FunctionDef, bytes: &[u8], out: &mut ByteBuffer, position: i32, line: i32) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let pos = i32.toUsize(position) let code = bytes[pos]
+  let atom = readU32(bytes, pos + 1)
+  let mut first: u8 = 0
+  let label = findJumpTarget(&mut fd, bytes, signedWord(readU32(bytes, pos + 5)), &mut first)
+  let slot = fd.labels.get(i32.toUsize(label))
+  run addPosition(&mut fd, &out.*, line)
+  let at = usize.toI32(out.length()) + 5
+  run fd.jumps.append(JumpSlot { opcode: opcode(code), size: 4, position: at, label: label })
+  run out.append(code) run out.writeU32(atom) run out.writeU32(unsignedWord(slot.address - at))
+  if slot.address == -1 { run addRelocation(&mut fd, label, at, 4) }
+  run out.append(bytes[pos + 9])
+}
+pub fn shrinkJumps(fd: &mut FunctionDef, out: &mut ByteBuffer) -> () {
+  let mut changed = false let mut i: usize = 0
+  while i < fd.jumps.length() {
+    let mut jump = fd.jumps.get(i) let code = i32.toU8(jump.opcode)
+    if code == op.OP_goto16 || code == op.OP_if_false || code == op.OP_if_true || code == op.OP_goto {
+      let mut delta: i32 = 3
+      if code == op.OP_goto16 { delta = 1 }
+      let diff = fd.labels.get(i32.toUsize(jump.label)).address - jump.position
+      let mut shrink = false
+      if diff >= -128 && diff <= 127 + delta {
+        jump.size = 1
+        if code == op.OP_goto16 { jump.opcode = opcode(op.OP_goto8) }
+        else { jump.opcode = opcode(op.OP_if_false8) + opcode(code) - opcode(op.OP_if_false) }
+        shrink = true
+      } else if diff >= -32768 && diff <= 32767 && code == op.OP_goto {
+        jump.size = 2 delta = 2 jump.opcode = opcode(op.OP_goto16) shrink = true
+      }
+      if shrink {
+        out.set(i32.toUsize(jump.position - 1), i32.toU8(jump.opcode))
+        let mut at = i32.toUsize(jump.position + jump.size)
+        let removed = i32.toUsize(delta)
+        while at + removed < out.length() { let byte = out.get(at + removed) out.set(at, byte) at = at + 1 }
+        let shorterLength = out.length() - removed
+        out.truncate(shorterLength)
+        fd.jumps.set(i, jump) changed = true
+        let mut j: usize = 0
+        while j < fd.labels.length() {
+          let mut slot = fd.labels.get(j)
+          if slot.address > jump.position { slot.address = slot.address - delta fd.labels.set(j, slot) }
+          j = j + 1
+        }
+        j = i + 1
+        while j < fd.jumps.length() {
+          let mut later = fd.jumps.get(j)
+          if later.position > jump.position { later.position = later.position - delta fd.jumps.set(j, later) }
+          j = j + 1
+        }
+        j = 0
+        while j < fd.lineNumbers.length() {
+          let mut entry = fd.lineNumbers.get(j)
+          if entry.pc > i32.toU32(jump.position) { entry.pc = entry.pc - i32.toU32(delta) fd.lineNumbers.set(j, entry) }
+          j = j + 1
+        }
+      }
+    }
+    i = i + 1
+  }
+  if changed {
+    i = 0
+    while i < fd.jumps.length() {
+      let jump = fd.jumps.get(i)
+      patchDisplacement(&mut out, jump.position, jump.size, fd.labels.get(i32.toUsize(jump.label)).address - jump.position)
+      i = i + 1
+    }
+  }
+}

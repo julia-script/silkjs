@@ -1,0 +1,270 @@
+//! Real stored-property native embedding shared by tests and the C differential.
+//! The registered host class owns an auxiliary payload, atoms and descriptor
+//! Values. Its own-keys and own-descriptor operations read that stored payload.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.list { List }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.result { Result }
+import silk.ownership { Copy }
+import silk.u8
+import silk.u32
+import silk.usize
+import runtime_memory { AllocationObserver }
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_core_types { RuntimeState, ObjectData, ObjectPayload, ShapeData, PropertySlot,
+  PropertyDescriptor, PropertyEnum, NativeFunctionId, ExoticCallbacks, WeakRefHeader,
+  EXOTIC_GET_OWN_PROPERTY, EXOTIC_GET_OWN_PROPERTY_NAMES }
+import js_gc { HeapHooks, Tracer }
+import js_gc as gc
+import js_runtime as runtime
+import js_runtime_registry as registry
+import js_runtime_classes { emptyDefinition }
+import js_shapes as shapes
+import js_object_allocate as objects
+import js_var_refs as varRefs
+import js_value { Value }
+import js_strings { Strings }
+import js_string_types { StringOwner, StringLengthError }
+import js_property_host { OwnKeysHooks }
+import js_property_ownership { releaseDescriptor }
+import js_exceptions { JsException }
+import js_exceptions as exceptions
+import js_array_storage_test_support { reference, trap }
+
+pub const CLASS_ID: u32 = 67
+pub const TABLE_ID: u32 = 9047
+pub struct Entry {
+  pub atom: u32, pub flags: u32, pub present: bool, pub seedEnumerable: bool,
+  pub value: Value, pub getter: Value, pub setter: Value
+}
+impl Copy for Entry {}
+pub struct StoredProperties { pub entries: List<Entry> }
+pub struct Hooks {
+  pub events: [u32; 128], pub eventCount: usize, pub failKeys: bool,
+  pub failDescriptor: u32, pub finalized: usize, pub collectInKeys: bool
+}
+impl Hooks {
+  pub fn make() -> Self {
+    return Self { events: [0; 128], eventCount: 0, failKeys: false,
+      failDescriptor: 0, finalized: 0, collectInKeys: false }
+  }
+  fn event(self: &mut Self, code: u32) -> () {
+    self.events[self.eventCount] = code
+    self.eventCount = self.eventCount + 1
+  }
+}
+fn host(callback: NativeFunctionId) -> bool {
+  return match callback { NativeFunctionId.Host { id } => id == TABLE_ID _ => false }
+}
+pub unsafe fn storage(object: Value) -> *mut HeapHeader {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(object))
+  let pointer = match &data.payload { ObjectPayload.HostOpaque { data: opaque } => opaque _ => trap() }
+  if Pointer.isNull<u8>(pointer) { trap() }
+  let present = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(pointer)
+  return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut HeapHeader>(present)
+}
+impl HeapHooks for Hooks {
+  unsafe fn traceClass(self: &mut Self, rt: *mut HeapHeader, object: *mut HeapHeader,
+    callback: NativeFunctionId, tracer: &mut Tracer) -> () {
+    if host(callback) {
+      let anchor = ()
+      let data = unsafe HeapCell.payload<StoredProperties, ()>(&anchor, unsafe storage(Value.Object { reference: object }))
+      let mut i: usize = 0
+      while i < data.entries.length() {
+        let entry = data.entries.get(i)
+        unsafe tracer.value(entry.value)
+        unsafe tracer.value(entry.getter)
+        unsafe tracer.value(entry.setter)
+        i = i + 1
+      }
+    } else if !unsafe gc.traceCorePayload(object, &mut tracer) { trap() }
+  }
+  unsafe fn finalizeClass(self: &mut Self, rt: *mut HeapHeader, object: *mut HeapHeader,
+    callback: NativeFunctionId) -> () {
+    self.finalized = self.finalized + 1
+    if host(callback) {
+      let owned = unsafe storage(Value.Object { reference: object })
+      let mut anchor = ()
+      let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, object)
+      p.payload = ObjectPayload.Empty
+      drop p
+      let data = unsafe HeapCell.payloadMut<StoredProperties, ()>(&mut anchor, owned)
+      let entries = Intrinsic.replace(data.entries, List<Entry>.make())
+      drop data
+      let mut i: usize = 0
+      while i < entries.length() {
+        let entry = entries.get(i)
+        unsafe releaseAtom(rt, entry.atom)
+        unsafe releaseDescriptor(&mut self, rt, PropertyDescriptor {
+          flags: entry.flags, value: entry.value, getter: entry.getter, setter: entry.setter
+        })
+        i = i + 1
+      }
+      unsafe HeapCell.destroy<StoredProperties>(owned)
+    } else if !unsafe gc.finalizeCorePayload(&mut self, rt, object) { trap() }
+  }
+  unsafe effect fn sweepWeak(self: &mut Self, rt: *mut HeapHeader, node: *mut WeakRefHeader) -> () ? &mut Allocator { trap() }
+  unsafe fn destroyAuxiliary(self: &mut Self, rt: *mut HeapHeader, node: *mut HeapHeader) -> () { trap() }
+}
+impl OwnKeysHooks for Hooks {
+  unsafe effect fn getOwnKeys(self: &mut Self, context: *mut HeapHeader,
+    table: NativeFunctionId, object: Value) -> List<PropertyEnum>
+    ! OutOfMemoryError | JsException ? &mut Allocator {
+    if !host(table) { trap() }
+    self.event(0)
+    let rt = unsafe runtime.contextRuntime(context)
+    if self.collectInKeys { run unsafe gc.collect(&mut self, rt, true) }
+    if self.failKeys { return run unsafe exceptions.throwValue<List<PropertyEnum>, Self>(&mut self, rt, Value.Int { value: 101 }) }
+    let anchor = ()
+    let data = unsafe HeapCell.payload<StoredProperties, ()>(&anchor, unsafe storage(object))
+    let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+    let mut result = List<PropertyEnum>.make()
+    run result.reserveExact(data.entries.length())
+    let mut i: usize = 0
+    while i < data.entries.length() {
+      let entry = data.entries.get(i)
+      run result.append(PropertyEnum { atom: state.atoms.duplicate(entry.atom), isEnumerable: entry.seedEnumerable })
+      i = i + 1
+    }
+    return move result
+  }
+  unsafe effect fn getOwnProperty(self: &mut Self, context: *mut HeapHeader,
+    object: Value, atom: u32) -> Option<PropertyDescriptor>
+    ! OutOfMemoryError | JsException ? &mut Allocator {
+    let rt = unsafe runtime.contextRuntime(context)
+    let mut event: u32 = 127
+    let anchor = ()
+    let data = unsafe HeapCell.payload<StoredProperties, ()>(&anchor, unsafe storage(object))
+    let mut i: usize = 0
+    while i < data.entries.length() {
+      if data.entries.get(i).atom == atom { event = usize.toU32(i + 1) break }
+      i = i + 1
+    }
+    drop data
+    let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(object))
+    match unsafe shapes.lookup(p.shape, atom) {
+      Option<usize>.Some { value: index } => {
+        let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, p.shape)
+        let flags = u8.toU32(shape.properties.get(index).flags)
+        let slot = p.properties.get(index)
+        drop shape drop p
+        let mut value = Value.Undefined
+        let mut getter = Value.Undefined
+        let mut setter = Value.Undefined
+        match slot {
+          PropertySlot.Value { value: stored } => { value = unsafe stored.retained() }
+          PropertySlot.GetterSetter { getter: get, setter: set } => {
+            match Pointer.nonNullMut<HeapHeader>(get) {
+              Option<*mut HeapHeader>.Some { value: node } => { unsafe HeapCell.retain(node) getter = Value.Object { reference: node } }
+              _ => ()
+            }
+            match Pointer.nonNullMut<HeapHeader>(set) {
+              Option<*mut HeapHeader>.Some { value: node } => { unsafe HeapCell.retain(node) setter = Value.Object { reference: node } }
+              _ => ()
+            }
+          }
+          PropertySlot.VarRef { reference: cell } => {
+            value = unsafe varRefs.read(cell)
+            if match value { Value.Uninitialized => true _ => false } {
+              return run unsafe exceptions.throwValue<Option<PropertyDescriptor>, Self>(&mut self, rt, Value.Int { value: 303 })
+            }
+            value = unsafe value.retained()
+          }
+          PropertySlot.AutoInit { .. } => trap()
+        }
+        return Option<PropertyDescriptor>.some(PropertyDescriptor { flags: flags, value: value, getter: getter, setter: setter })
+      }
+      Option<usize>.None => ()
+    }
+    drop p
+    self.event(event)
+    if event == self.failDescriptor {
+      return run unsafe exceptions.throwValue<Option<PropertyDescriptor>, Self>(&mut self, rt, Value.Int { value: 202 })
+    }
+    let stored = unsafe HeapCell.payload<StoredProperties, ()>(&anchor, unsafe storage(object))
+    if i < stored.entries.length() {
+      let entry = stored.entries.get(i)
+      if entry.present {
+        return Option<PropertyDescriptor>.some(PropertyDescriptor { flags: entry.flags,
+          value: unsafe entry.value.retained(), getter: unsafe entry.getter.retained(), setter: unsafe entry.setter.retained() })
+      }
+    }
+    return Option<PropertyDescriptor>.none()
+  }
+}
+pub unsafe effect fn register(rt: *mut HeapHeader) -> () ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let mut definition = emptyDefinition()
+  definition.finalizer = Option<NativeFunctionId>.some(NativeFunctionId.Host { id: TABLE_ID })
+  definition.mark = Option<NativeFunctionId>.some(NativeFunctionId.Host { id: TABLE_ID })
+  definition.exotic = Option<ExoticCallbacks>.some(ExoticCallbacks { descriptor: NativeFunctionId.Host { id: TABLE_ID },
+    methodMask: EXOTIC_GET_OWN_PROPERTY | EXOTIC_GET_OWN_PROPERTY_NAMES })
+  if !run unsafe registry.registerClass(rt, CLASS_ID, b"StoredKeys", move definition) { trap() }
+}
+pub unsafe effect fn exotic(hooks: &mut Hooks, memory: &AllocationObserver, context: *mut HeapHeader) -> Value
+  ! OutOfMemoryError ? &mut Allocator {
+  let data = run HeapCell.allocate(HeapKind.Auxiliary, StoredProperties { entries: List<Entry>.make() })
+  let allocated = run Effect.result(unsafe objects.withPrototypeClass(&mut hooks, memory, context, Value.Null, CLASS_ID))
+  match move allocated {
+    Result<Value, OutOfMemoryError>.Failure { error } => { unsafe HeapCell.destroy<StoredProperties>(data) fail move error }
+    Result<Value, OutOfMemoryError>.Success { value } => {
+      let mut anchor = ()
+      let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, reference(value))
+      p.payload = ObjectPayload.HostOpaque { data: unsafe Intrinsic.pointerReinterpret<*mut HeapHeader, *mut u8>(data) }
+      return value
+    }
+  }
+}
+pub unsafe effect fn atom(rt: *mut HeapHeader, text: &[u8], kind: u32) -> u32
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+  if kind == 0 { return run state.atoms.internUtf8(text) }
+  let description = StringOwner.adopt(run Strings.fromUtf8(text))
+  let mut symbol = Value.Undefined
+  if kind == 1 { symbol = run state.atoms.uniqueSymbol(Option<Value>.some(description.get())) }
+  else if kind == 2 { symbol = run state.atoms.privateSymbol(description.get()) }
+  else { symbol = run state.atoms.globalSymbol(Option<Value>.some(description.get())) }
+  let result = state.atoms.symbolAtom(symbol)
+  Strings.release(symbol)
+  return result
+}
+pub unsafe fn releaseAtom(rt: *mut HeapHeader, atom: u32) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+  state.atoms.release(atom)
+}
+// All inputs borrowed; the stored descriptor retains all fields independently.
+pub unsafe effect fn store(rt: *mut HeapHeader, object: Value, entry: Entry) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = ()
+  let data = unsafe HeapCell.payloadMut<StoredProperties, ()>(&mut anchor, unsafe storage(object))
+  run data.entries.reserve(1)
+  let runtimeAnchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&runtimeAnchor, rt)
+  run data.entries.append(Entry { atom: state.atoms.duplicate(entry.atom), flags: entry.flags,
+    present: entry.present, seedEnumerable: entry.seedEnumerable, value: unsafe entry.value.retained(),
+    getter: unsafe entry.getter.retained(), setter: unsafe entry.setter.retained() })
+}
+pub unsafe effect fn add<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, object: Value,
+  atom: u32, flags: u8, slot: PropertySlot) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = ()
+  let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, reference(object))
+  let added = run unsafe shapes.addProperty(rt, &mut p, atom, flags)
+  p.properties.set(added.index, slot)
+  drop p
+  unsafe gc.releaseOptional(&mut hooks, rt, added.retiredShape)
+}
+pub unsafe effect fn remove(hooks: &mut Hooks, rt: *mut HeapHeader, object: Value, atom: u32) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = ()
+  let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, reference(object))
+  let retired = run unsafe shapes.deleteProperty(rt, &mut p, atom)
+  drop p
+  match move retired {
+    Option<shapes.RetiredProperty>.Some { value } => { unsafe gc.releaseProperty(&mut hooks, rt, value.slot) }
+    Option<shapes.RetiredProperty>.None => trap()
+  }
+}

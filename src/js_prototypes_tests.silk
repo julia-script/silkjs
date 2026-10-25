@@ -1,0 +1,316 @@
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.result { Result }
+import silk.testing { AssertionError, Testing }
+import silk.usize
+import runtime_memory { RuntimeAllocator, AllocationObserver }
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_core_types { ObjectData, RuntimeState, ShapeData, EXOTIC_GET_PROTOTYPE, EXOTIC_SET_PROTOTYPE, EXOTIC_IS_EXTENSIBLE }
+import js_value { Value }
+import js_strings { Strings, StringBuilder }
+import js_string_types { StringLengthError }
+import js_bigint { BigInt, BigIntError }
+import js_gc as gc
+import js_runtime as runtime
+import js_object_allocate as objects
+import js_class_data as classes
+import js_prototypes as prototypes
+import js_prototypes { PrototypeError }
+import js_prototypes_test_support as fixture
+import js_prototypes_test_support { Hooks, StoredPrototype }
+import js_array_storage_test_support { FaultAllocator, reference, rc, shape, trap }
+import js_exceptions { JsException }
+import js_exceptions as exceptions
+
+fn same(left: Value, right: Value) -> bool {
+  if left.isObject() && right.isObject() { return Pointer.address<HeapHeader>(reference(left)) == Pointer.address<HeapHeader>(reference(right)) }
+  return left.tag() == 2 && right.tag() == 2
+}
+unsafe fn flags(object: Value, immutable: bool, extensible: bool, standard: bool) -> () {
+  let mut anchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, reference(object))
+  data.hasImmutablePrototype = immutable
+  data.extensible = extensible
+  data.isStandardArrayPrototype = standard
+}
+unsafe fn standard(object: Value) -> bool {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(object))
+  return data.isStandardArrayPrototype
+}
+unsafe effect fn validation(memory: &AllocationObserver) -> ()
+  ! OutOfMemoryError | JsException | AssertionError<'static> ? &mut Allocator {
+  let rt = run runtime.allocateRuntimeStorage(0)
+  let ctx = run unsafe runtime.allocateContextStorage(rt)
+  let mut hooks = Hooks.make()
+  let object = run unsafe objects.withPrototype(&mut hooks, memory, ctx, Value.Null)
+  let values = [Value.Null, Value.Undefined, Value.Int { value: 7 }, Value.Bool { value: true },
+    Value.Float64 { value: -0.0 }, Value.ShortBigInt { value: 8 }, object]
+  let protos = [Value.Null, object, Value.Int { value: 0 }, Value.Undefined]
+  let mut i: usize = 0
+  while i < values.length {
+    let mut j: usize = 0
+    while j < protos.length {
+      let mut mode: usize = 0
+      while mode < 2 {
+        let result = run unsafe fixture.setResult(&mut hooks, ctx, values[i], protos[j], mode == 1)
+        let mut expected: u32 = 1
+        if j >= 2 || i < 2 || (mode == 0 && i != 6) { expected = 2 }
+        else if i == 6 && j == 1 { expected = 0 if mode == 1 { expected = 6 } }
+        run Testing.expect(result == expected, "Object validates proto before accepting primitives; Reflect requires object first")
+        mode = mode + 1
+      }
+      j = j + 1
+    }
+    unsafe prototypes.setImmutablePrototype(values[i])
+    let extensible = run unsafe prototypes.isExtensible(&mut hooks, ctx, values[i])
+    run Testing.expect(extensible == (i == 6), "isExtensible returns false for every primitive")
+    i = i + 1
+  }
+  unsafe gc.release(&mut hooks, rt, object)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx)
+  run unsafe gc.destroyRuntime(&mut hooks, rt)
+}
+test effect fn prototypeValidationPrecedenceAndPrimitiveModes() -> () ! OutOfMemoryError | JsException | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  run unsafe validation(&observer) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observer.stats().allocationCount == 0, "validation retains no owners")
+}
+unsafe effect fn ordinary(memory: &AllocationObserver) -> ()
+  ! OutOfMemoryError | StringLengthError | JsException | PrototypeError | AssertionError<'static> ? &mut Allocator {
+  let rt = run runtime.allocateRuntimeStorage(0)
+  let ctx = run unsafe runtime.allocateContextStorage(rt)
+  let mut hooks = Hooks.make()
+  run unsafe fixture.register(rt, EXOTIC_GET_PROTOTYPE | EXOTIC_SET_PROTOTYPE | EXOTIC_IS_EXTENSIBLE)
+  let old = run unsafe fixture.exotic(&mut hooks, memory, ctx, Value.Null, true, true, 0)
+  let object = run unsafe objects.withPrototype(&mut hooks, memory, ctx, old)
+  let next = run unsafe objects.withPrototype(&mut hooks, memory, ctx, Value.Null)
+  unsafe flags(object, true, false, true)
+  let identical = run unsafe prototypes.setPrototype(&mut hooks, ctx, object, old)
+  run Testing.expect(identical && unsafe standard(object), "identical prototype succeeds before immutable and extensible checks without clearing flag")
+  let immutable = run unsafe fixture.setResult(&mut hooks, ctx, object, next, true)
+  let immutableReflect = run unsafe fixture.setResult(&mut hooks, ctx, object, next, false)
+  run Testing.expect(immutable == 4 && immutableReflect == 0 && unsafe standard(object), "immutable precedes nonextensible and mutation")
+  unsafe flags(object, false, false, true)
+  let nonextensible = run unsafe fixture.setResult(&mut hooks, ctx, object, next, true)
+  run Testing.expect(nonextensible == 5, "nonextensible object rejects replacement")
+  unsafe flags(object, false, true, true)
+  let child = run unsafe objects.withPrototype(&mut hooks, memory, ctx, object)
+  let circular = run unsafe fixture.setResult(&mut hooks, ctx, object, child, true)
+  run Testing.expect(circular == 6 && unsafe standard(object), "cycle scan rejects indirect cycle without modifying the target")
+  unsafe gc.release(&mut hooks, rt, child)
+  hooks.observedObject = object
+  hooks.observedOld = reference(old)
+  unsafe gc.release(&mut hooks, rt, old)
+  let changed = run unsafe prototypes.setPrototype(&mut hooks, ctx, object, next)
+  run Testing.expect(changed && hooks.finalized == 1 && hooks.sawOldEdge && hooks.sawArrayFlag && !unsafe standard(object),
+    "old prototype finalizer observes the old shape edge and array flag before publication")
+  hooks.observedObject = Value.Null
+  let owned = run unsafe prototypes.getPrototype(&mut hooks, ctx, object)
+  run Testing.expect(same(owned, next) && unsafe rc(reference(next)) == 3, "public get retains the shape prototype")
+  unsafe gc.release(&mut hooks, rt, next)
+  unsafe gc.release(&mut hooks, rt, object)
+  run Testing.expect(unsafe rc(reference(owned)) == 1, "returned owner survives object and original prototype destruction")
+  unsafe gc.release(&mut hooks, rt, owned)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx)
+  run unsafe gc.destroyRuntime(&mut hooks, rt)
+}
+test effect fn prototypeRestrictionsCyclesAndFinalizerPublicationOrder() -> ()
+  ! OutOfMemoryError | StringLengthError | JsException | PrototypeError | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  run unsafe ordinary(&observer) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observer.stats().allocationCount == 0, "ordinary prototype graph fully reclaimed")
+}
+unsafe effect fn primitive(memory: &AllocationObserver) -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException | AssertionError<'static> ? &mut Allocator {
+  let rt = run runtime.allocateRuntimeStorage(0)
+  let ctx = run unsafe runtime.allocateContextStorage(rt)
+  let mut hooks = Hooks.make()
+  let classIds = [classes.JS_CLASS_NUMBER, classes.JS_CLASS_BOOLEAN, classes.JS_CLASS_STRING, classes.JS_CLASS_SYMBOL, classes.JS_CLASS_BIG_INT]
+  let mut expected = [Value.Null; 5]
+  let mut i: usize = 0
+  while i < classIds.length {
+    let proto = run unsafe objects.withPrototype(&mut hooks, memory, ctx, Value.Null)
+    expected[i] = proto
+    unsafe runtime.setClassPrototype(&mut hooks, ctx, classIds[i], proto)
+    i = i + 1
+  }
+  let text = run Strings.fromLatin1(b"prototype")
+  let mut builder = StringBuilder.make()
+  run builder.fill(97, 513)
+  let longText = run builder.finish()
+  let rope = run Strings.concat(text, longText)
+  let integer = run BigInt.fromI64(9007199254740993)
+  let bigintNode = run HeapCell.allocate<BigInt>(HeapKind.BigInt, move integer)
+  let bigint = Value.BigInt { reference: bigintNode }
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+  let symbol = run state.atoms.uniqueSymbol(Option<Value>.none())
+  drop state
+  let values = [Value.Int { value: 1 }, Value.Float64 { value: -0.0 }, Value.Bool { value: false }, text, rope, symbol,
+    Value.ShortBigInt { value: 2 }, bigint, Value.Null, Value.Undefined, expected[0], Value.Exception,
+    Value.Uninitialized, Value.CatchOffset { offset: 2 }]
+  let indices: [usize; 14] = [0, 0, 1, 2, 2, 3, 4, 4, 5, 5, 5, 5, 5, 5]
+  i = 0
+  while i < values.length {
+    let mut wanted = Value.Null
+    if indices[i] < 5 { wanted = expected[indices[i]] }
+    let borrowed = unsafe prototypes.getPrototypePrimitive(ctx, values[i])
+    run Testing.expect(same(borrowed, wanted), "primitive tag selects the installed class prototype; objects and internal tags return null")
+    if wanted.isObject() { run Testing.expect(unsafe rc(reference(wanted)) == 1, "primitive selector borrows without retaining") }
+    let owned = run unsafe prototypes.getPrototypeFree(&mut hooks, ctx, unsafe values[i].retained())
+    run Testing.expect(same(owned, wanted), "public consuming get has the same value and transfers an owned reference")
+    unsafe gc.release(&mut hooks, rt, owned)
+    i = i + 1
+  }
+  unsafe gc.release(&mut hooks, rt, symbol)
+  unsafe gc.release(&mut hooks, rt, bigint)
+  unsafe gc.release(&mut hooks, rt, rope)
+  unsafe gc.release(&mut hooks, rt, text)
+  unsafe gc.release(&mut hooks, rt, longText)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx)
+  run unsafe gc.destroyRuntime(&mut hooks, rt)
+}
+test effect fn primitivePrototypesBorrowAndOwnedGetCoversEveryTagFamily() -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  run unsafe primitive(&observer) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observer.stats().allocationCount == 0, "primitive values and context-owned prototypes are released")
+}
+unsafe effect fn exotic(memory: &AllocationObserver) -> ()
+  ! OutOfMemoryError | StringLengthError | JsException | PrototypeError | AssertionError<'static> ? &mut Allocator {
+  let rt = run runtime.allocateRuntimeStorage(0)
+  let ctx = run unsafe runtime.allocateContextStorage(rt)
+  let mut hooks = Hooks.make()
+  run unsafe fixture.register(rt, EXOTIC_GET_PROTOTYPE | EXOTIC_SET_PROTOTYPE | EXOTIC_IS_EXTENSIBLE)
+  let leaf = run unsafe objects.withPrototype(&mut hooks, memory, ctx, Value.Null)
+  let host = run unsafe fixture.exotic(&mut hooks, memory, ctx, leaf, true, false, 0)
+  unsafe flags(host, true, false, true)
+  let mut flagAnchor = ()
+  let unmarked = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut flagAnchor, reference(host))
+  unmarked.isExotic = false
+  drop unmarked
+  let ordinaryGet = run unsafe prototypes.getPrototype(&mut hooks, ctx, host)
+  let ordinaryExtensible = run unsafe prototypes.isExtensible(&mut hooks, ctx, host)
+  let ordinarySet = run unsafe prototypes.setPrototype(&mut hooks, ctx, host, Value.Null)
+  run Testing.expect(ordinaryGet.tag() == 2 && !ordinaryExtensible && ordinarySet && hooks.eventCount == 0,
+    "registered methods do not dispatch when the object's exotic flag is clear")
+  unsafe gc.release(&mut hooks, rt, ordinaryGet)
+  let marked = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut flagAnchor, reference(host))
+  marked.isExotic = true
+  drop marked
+  hooks.collectInCallback = true
+  hooks.reenterGet = true
+  let got = run unsafe prototypes.getPrototype(&mut hooks, ctx, host)
+  run Testing.expect(same(got, leaf) && hooks.events[0] == 1 && hooks.events[1] == 3,
+    "registered get callback supports collection and reentrant native query without borrowed payloads")
+  unsafe gc.release(&mut hooks, rt, got)
+  let accepted = run unsafe prototypes.setPrototype(&mut hooks, ctx, host, Value.Null)
+  run Testing.expect(accepted && unsafe standard(host), "exotic set precedes ordinary restrictions and does not clear ordinary array flag")
+  let target = run unsafe objects.withPrototype(&mut hooks, memory, ctx, Value.Null)
+  let mut anchor = ()
+  let stored = unsafe HeapCell.payloadMut<StoredPrototype, ()>(&mut anchor, unsafe fixture.storage(host))
+  stored.prototype = unsafe target.retained()
+  stored.failure = 1
+  drop stored
+  hooks.eventCount = 0
+  let noTrapCycle = run unsafe prototypes.setPrototype(&mut hooks, ctx, target, host)
+  run Testing.expect(noTrapCycle && hooks.eventCount == 0, "cycle check follows stored links, not an exotic get trap reporting a cycle")
+  let failed = run Effect.result(unsafe prototypes.getPrototypeFree(&mut hooks, ctx, unsafe host.retained()))
+  let mut threw = false
+  match move failed {
+    Result<Value, OutOfMemoryError | JsException>.Failure { error } => {
+      match move error {
+        JsException marker => { drop marker threw = true }
+        OutOfMemoryError allocation => { fail move allocation }
+      }
+    }
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => { unsafe gc.release(&mut hooks, rt, value) }
+  }
+  run Testing.expect(threw && unsafe rc(reference(host)) == 2 && unsafe exceptions.has(rt), "getFree consumes its input on callback exception")
+  let thrown = unsafe exceptions.take(rt)
+  run Testing.expect(match thrown { Value.Int { value } => value == 101 _ => false }, "callback failure preserves the real pending exception")
+  unsafe gc.release(&mut hooks, rt, thrown)
+  let allocationFailure = unsafe HeapCell.payloadMut<StoredPrototype, ()>(&mut anchor, unsafe fixture.storage(host))
+  allocationFailure.failure = 4
+  drop allocationFailure
+  let failedAllocation = run Effect.result(unsafe prototypes.getPrototypeFree(&mut hooks, ctx, unsafe host.retained()))
+  let mut exhausted = false
+  match move failedAllocation {
+    Result<Value, OutOfMemoryError | JsException>.Failure { error } => {
+      match move error {
+        OutOfMemoryError allocation => { drop allocation exhausted = true }
+        JsException marker => { fail move marker }
+      }
+    }
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => { unsafe gc.release(&mut hooks, rt, value) }
+  }
+  run Testing.expect(exhausted && unsafe rc(reference(host)) == 2 && !unsafe exceptions.has(rt),
+    "getFree consumes exactly one reference when a registered host reports allocation failure")
+  hooks.reenterGet = false
+  unsafe gc.release(&mut hooks, rt, host)
+  unsafe gc.release(&mut hooks, rt, target)
+  run unsafe gc.collect(&mut hooks, rt, true)
+  run Testing.expect(hooks.finalized == 1, "registered tracing collects the actual stored-prototype cycle")
+  unsafe gc.release(&mut hooks, rt, leaf)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx)
+  run unsafe gc.destroyRuntime(&mut hooks, rt)
+}
+test effect fn registeredPrototypeCallbacksReenterCollectAndConsumeThrownGetInput() -> ()
+  ! OutOfMemoryError | StringLengthError | JsException | PrototypeError | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  run unsafe exotic(&observer) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observer.stats().allocationCount == 0, "exotic cycle and auxiliary payload leave zero allocations")
+}
+effect fn oomCode(error: OutOfMemoryError) -> u32 { drop error return 8 }
+test effect fn prototypeShapeOOMRestoresSpeculativeRetainAndSharedShape() -> ()
+  ! OutOfMemoryError | JsException | AssertionError<'static> {
+  let mut attempt: usize = 0
+  let mut succeeded = false
+  while attempt < 16 && !succeeded {
+    let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+    let observer = run memory.observe()
+    let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+    let ctx = run unsafe runtime.allocateContextStorage(rt) |> Effect.provideMut<Allocator>(&mut memory)
+    unsafe runtime.setGCThreshold(rt, usize.MAX)
+    let mut hooks = Hooks.make()
+    let old = run unsafe objects.withPrototype(&mut hooks, &observer, ctx, Value.Null) |> Effect.provideMut<Allocator>(&mut memory)
+    let next = run unsafe objects.withPrototype(&mut hooks, &observer, ctx, Value.Null) |> Effect.provideMut<Allocator>(&mut memory)
+    let target = run unsafe objects.withPrototype(&mut hooks, &observer, ctx, old) |> Effect.provideMut<Allocator>(&mut memory)
+    let sibling = run unsafe objects.withPrototype(&mut hooks, &observer, ctx, old) |> Effect.provideMut<Allocator>(&mut memory)
+    unsafe flags(target, false, true, true)
+    let originalShape = unsafe shape(target)
+    let bytes = observer.stats().usedBytes
+    let mut fault = FaultAllocator { parent: move memory, remaining: attempt }
+    let result = run Effect.catch<OutOfMemoryError>(unsafe fixture.setResult(&mut hooks, ctx, target, next, true), oomCode)
+      |> Effect.provideMut<Allocator>(&mut fault)
+    succeeded = result == 1
+    if !succeeded {
+      run Testing.expect(result == 8 && unsafe rc(reference(next)) == 1 && unsafe rc(reference(old)) == 2
+        && Pointer.address<HeapHeader>(unsafe shape(target)) == Pointer.address<HeapHeader>(originalShape)
+        && unsafe rc(originalShape) == 2 && unsafe standard(target) && observer.stats().usedBytes == bytes,
+        "every failed shape clone reclaims scratch and speculative prototype retain without publishing")
+    } else {
+      run Testing.expect(unsafe rc(reference(next)) == 2 && !unsafe standard(target), "successful replacement owns one new edge")
+      let siblingProto = run unsafe prototypes.getPrototype(&mut hooks, ctx, sibling) |> Effect.provideMut<Allocator>(&mut fault)
+      run Testing.expect(same(siblingProto, old), "COW replacement leaves shared sibling prototype unchanged")
+      unsafe gc.release(&mut hooks, rt, siblingProto)
+    }
+    unsafe gc.release(&mut hooks, rt, target)
+    unsafe gc.release(&mut hooks, rt, sibling)
+    unsafe gc.release(&mut hooks, rt, old)
+    unsafe gc.release(&mut hooks, rt, next)
+    unsafe gc.releaseHeader(&mut hooks, rt, ctx)
+    run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut fault)
+    run Testing.expect(observer.stats().allocationCount == 0, "success and every allocation failure tear down without leaks")
+    attempt = attempt + 1
+  }
+  run Testing.expect(succeeded && attempt > 1, "fault sweep crosses failures into successful shape cloning")
+}
+

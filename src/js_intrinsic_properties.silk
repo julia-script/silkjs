@@ -1,0 +1,271 @@
+//! Native FunctionList instantiation and constructor factory, quickjs.c:40363-40704.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.slice { Slice }
+import silk.i32
+import silk.i64
+import silk.u32
+import runtime_memory { AllocationObserver }
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types { RuntimeState, ContextState, NativeFunctionId, NativeCallProtocol, AutoInitKind, AutoInitOpaque, JS_PROP_HAS_GET, JS_PROP_HAS_SET, JS_PROP_HAS_CONFIGURABLE, JS_PROP_HAS_ENUMERABLE }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_native_functions as functions
+import js_object_allocate as objects
+import js_property_mutations as mutations
+import js_property_host { OwnPropertyHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_coercion_host { CoercionHooks }
+import js_proxy_core as core
+import js_string_types { StringLengthError }
+import js_bigint { BigIntError }
+import js_exceptions { JsException }
+import js_atom_data as atoms
+import js_class_data as classes
+
+pub struct FunctionDefinition {
+  pub callback: NativeFunctionId, pub name: &'static [u8], pub length: i32,
+  pub protocol: NativeCallProtocol, pub magic: i32
+}
+pub union Definition {
+  Function { pub function: FunctionDefinition },
+  GetterSetter { pub getter: Option<NativeFunctionId>, pub setter: Option<NativeFunctionId>, pub magic: i32, pub isMagic: bool },
+  String { pub value: &'static [u8] },
+  Object { pub table: NativeFunctionId },
+  Int32 { pub value: i32 },
+  Int64 { pub value: i64 },
+  Double { pub value: f64 },
+  Bool { pub value: bool },
+  Undefined,
+  Atom { pub atom: u32 },
+  Alias { pub name: &'static [u8], pub base: i32 }
+}
+pub struct Entry { pub name: &'static [u8], pub flags: u32, pub definition: Definition }
+pub interface IntrinsicDefinitions {
+  fn entry(self: &Self, descriptor: NativeFunctionId) -> Entry
+  fn tableLength(self: &Self, table: NativeFunctionId) -> u32
+  fn tableEntry(self: &Self, table: NativeFunctionId, index: u32) -> NativeFunctionId
+}
+pub const JS_NEW_CTOR_NO_GLOBAL: u32 = 1
+pub const JS_NEW_CTOR_PROTO_CLASS: u32 = 2
+pub const JS_NEW_CTOR_PROTO_EXIST: u32 = 4
+pub const JS_NEW_CTOR_READONLY: u32 = 8
+fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+unsafe fn prototype(context: *mut HeapHeader, classId: u32) -> Value {
+  let anchor = () let state = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  return state.classPrototypes.get(u32.toUsize(classId))
+}
+unsafe fn global(context: *mut HeapHeader) -> Value {
+  let anchor = () let state = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  return state.globalObject
+}
+// Built-in symbol atoms are immortal; ordinary names return an owned atom.
+pub unsafe effect fn findAtom<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader, name: &[u8]) -> u32 ! JsException ? &mut Allocator {
+  if name.length > 0 && name[0] == 91 {
+    let mut length: usize = 0
+    while length < name.length && name[length] != 0 { length = length + 1 }
+    if length < 2 { invariant() }
+    let mut atom = atoms.JS_ATOM_Symbol_toPrimitive
+    while atom < atoms.JS_ATOM_END {
+      let candidate = atoms.atomName(atom)
+      if candidate.length == length - 2 {
+        let mut index: usize = 0
+        while index < candidate.length && candidate[index] == name[index + 1] { index = index + 1 }
+        if index == candidate.length { return atom }
+      }
+      atom = atom + 1
+    }
+    invariant()
+  }
+  return run unsafe intern(&mut hooks, context, name)
+}
+unsafe effect fn intern<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader, name: &[u8]) -> u32 ! JsException ? &mut Allocator {
+  let mut length: usize = 0
+  while length < name.length && name[length] != 0 { length = length + 1 }
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, unsafe runtime.contextRuntime(context))
+  let interned = run Effect.result(state.atoms.internUtf8(Slice.view(name, 0, length))) drop state
+  return match move interned {
+    Result<u32, OutOfMemoryError | StringLengthError>.Success { value } => value
+    Result<u32, OutOfMemoryError | StringLengthError>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error)
+  }
+}
+unsafe effect fn atomValue<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader, atom: u32) -> Value ! JsException ? &mut Allocator {
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, unsafe runtime.contextRuntime(context))
+  let converted = run Effect.result(state.atoms.toValue(atom, false)) drop state
+  return match move converted {
+    Result<Value, OutOfMemoryError | StringLengthError>.Success { value } => value
+    Result<Value, OutOfMemoryError | StringLengthError>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error)
+  }
+}
+unsafe effect fn get<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader, owner: Value, atom: u32) -> Value ! JsException ? &mut Allocator {
+  let result = run Effect.result(unsafe hooks.getProperty(context, owner, atom))
+  return match move result {
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => value
+    Result<Value, OutOfMemoryError | JsException>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error)
+  }
+}
+unsafe effect fn define<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H, context: *mut HeapHeader, owner: Value, atom: u32, value: Value, flags: u32) -> () ! JsException ? &mut Allocator {
+  let result = run Effect.result(unsafe mutations.definePropertyValue(&mut hooks, context, owner, atom, value, flags))
+  match move result {
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { .. } => ()
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => { return run unsafe core.materialize(&mut hooks, context, move error) }
+  }
+}
+unsafe effect fn accessor<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, callback: Option<NativeFunctionId>, name: &[u8], setter: bool, isMagic: bool, magic: i32) -> Value ! JsException ? &mut Allocator {
+  let id = match move callback { Option<NativeFunctionId>.Some { value } => value Option<NativeFunctionId>.None => { return Value.Undefined } }
+  // snprintf(buf, 64, "%s %s", ...): at most 63 bytes, including prefix.
+  let mut buffer: [u8; 64] = [0; 64]
+  buffer[0] = 103 if setter { buffer[0] = 115 }
+  buffer[1] = 101 buffer[2] = 116 buffer[3] = 32
+  let mut count: usize = 0
+  while count < name.length && count < 59 && name[count] != 0 { buffer[count + 4] = name[count] count = count + 1 }
+  let mut protocol = NativeCallProtocol.Getter let mut length: i32 = 0
+  if isMagic { protocol = NativeCallProtocol.GetterMagic }
+  if setter { length = 1 protocol = NativeCallProtocol.Setter if isMagic { protocol = NativeCallProtocol.SetterMagic } }
+  return run unsafe functions.newFunction(&mut hooks, memory, context, id, Slice.view(&buffer, 0, count + 4), length, protocol, magic)
+}
+unsafe effect fn instantiate<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, owner: Value, atom: u32, descriptor: NativeFunctionId, entry: Entry) -> () ! JsException ? &mut Allocator {
+  let mut flags = entry.flags
+  let mut value = Value.Undefined let mut lazy = false
+  match move entry.definition {
+    Definition.Function { .. } => {
+      if atom == atoms.JS_ATOM_Symbol_toPrimitive { flags = 1 }
+      else if atom == atoms.JS_ATOM_Symbol_hasInstance { flags = 0 }
+      lazy = true
+    }
+    Definition.String { .. } => { lazy = true }
+    Definition.Object { .. } => { lazy = true }
+    Definition.Alias { name, base } => {
+      let targetAtom = run unsafe findAtom(&mut hooks, context, name)
+      let target = match base { -1 => owner 0 => unsafe global(context) 1 => unsafe prototype(context, classes.JS_CLASS_ARRAY) _ => invariant() }
+      let fetched = run Effect.result(unsafe get(&mut hooks, context, target, targetAtom))
+      unsafe mutations.releaseAtom(unsafe runtime.contextRuntime(context), targetAtom)
+      value = match move fetched { Result<Value, JsException>.Success { value: found } => found Result<Value, JsException>.Failure { error } => { fail move error } }
+      if atom == atoms.JS_ATOM_Symbol_toPrimitive { flags = 1 }
+      else if atom == atoms.JS_ATOM_Symbol_hasInstance { flags = 0 }
+    }
+    Definition.GetterSetter { getter, setter, magic, isMagic } => {
+      let getFunction = run unsafe accessor(&mut hooks, memory, context, move getter, entry.name, false, isMagic, magic)
+      let created = run Effect.result(unsafe accessor(&mut hooks, memory, context, move setter, entry.name, true, isMagic, magic))
+      let setFunction = match move created {
+        Result<Value, JsException>.Success { value: found } => found
+        Result<Value, JsException>.Failure { error } => { unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), getFunction) fail move error }
+      }
+      let defined = run Effect.result(unsafe mutations.defineProperty(&mut hooks, context, owner, atom, Value.Undefined, getFunction, setFunction, flags | JS_PROP_HAS_GET | JS_PROP_HAS_SET | JS_PROP_HAS_CONFIGURABLE | JS_PROP_HAS_ENUMERABLE))
+      let mut failed = false
+      match move defined {
+        Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { .. } => ()
+        Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => {
+          let pending = run Effect.catch<JsException>(unsafe core.materialize(&mut hooks, context, move error), core.exceptionValue) failed = true
+        }
+      }
+      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), getFunction)
+      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), setFunction)
+      if failed { fail JsException {} } return ()
+    }
+    Definition.Int32 { value: number } => { value = Value.Int { value: number } }
+    Definition.Int64 { value: number } => { value = Value.number(i64.toF64(number)) }
+    Definition.Double { value: number } => { value = Value.number(number) }
+    Definition.Bool { value: boolean } => { value = Value.Bool { value: boolean } }
+    Definition.Undefined => ()
+    Definition.Atom { atom: name } => { value = run unsafe atomValue(&mut hooks, context, name) }
+  }
+  if lazy {
+    let installed = run Effect.result(unsafe mutations.defineAutoInitProperty(&mut hooks, context, owner, atom, AutoInitKind.Property, AutoInitOpaque.Native { descriptor: descriptor }, flags))
+    match move installed {
+      Result<bool, OutOfMemoryError>.Success { .. } => ()
+      Result<bool, OutOfMemoryError>.Failure { error } => { return run unsafe core.materialize(&mut hooks, context, move error) }
+    }
+  } else { run unsafe define(&mut hooks, context, owner, atom, value, flags) }
+}
+pub unsafe effect fn install<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + IntrinsicDefinitions>(hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, owner: Value, table: NativeFunctionId) -> () ! JsException ? &mut Allocator {
+  let count = hooks.tableLength(table) let mut index: u32 = 0
+  while index < count {
+    let descriptor = hooks.tableEntry(table, index) let entry = hooks.entry(descriptor)
+    let atom = run unsafe findAtom(&mut hooks, context, entry.name)
+    let installed = run Effect.result(unsafe instantiate(&mut hooks, memory, context, owner, atom, descriptor, move entry))
+    unsafe mutations.releaseAtom(unsafe runtime.contextRuntime(context), atom)
+    match move installed { Result<(), JsException>.Success { .. } => () Result<(), JsException>.Failure { error } => { fail move error } }
+    index = index + 1
+  }
+}
+pub unsafe effect fn initialize<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + IntrinsicDefinitions>(hooks: &mut H, memory: &AllocationObserver, realm: *mut HeapHeader, owner: Value, atom: u32, descriptor: NativeFunctionId) -> Value ! JsException ? &mut Allocator {
+  let entry = hooks.entry(descriptor)
+  match move entry.definition {
+    Definition.Function { function } => { return run unsafe functions.newFunction(&mut hooks, memory, realm, function.callback, function.name, function.length, function.protocol, function.magic) }
+    Definition.String { value } => {
+      let name = run unsafe intern(&mut hooks, realm, value)
+      let converted = run Effect.result(unsafe atomValue(&mut hooks, realm, name))
+      unsafe mutations.releaseAtom(unsafe runtime.contextRuntime(realm), name)
+      return match move converted { Result<Value, JsException>.Success { value: found } => found Result<Value, JsException>.Failure { error } => { fail move error } }
+    }
+    Definition.Object { table } => {
+      let mut parent = unsafe prototype(realm, classes.JS_CLASS_OBJECT)
+      if atom == atoms.JS_ATOM_Symbol_unscopables { parent = Value.Null }
+      return run unsafe objectPrototypeList(&mut hooks, memory, realm, parent, table)
+    }
+    _ => invariant()
+  }
+}
+pub unsafe effect fn objectPrototypeList<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + IntrinsicDefinitions>(hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, prototype: Value, table: NativeFunctionId) -> Value ! JsException ? &mut Allocator {
+  let count = hooks.tableLength(table)
+  let allocated = run Effect.result(unsafe objects.withPrototypeClassCapacity(&mut hooks, memory, context, prototype, classes.JS_CLASS_OBJECT, u32.toI32(count)))
+  let object = match move allocated { Result<Value, OutOfMemoryError>.Success { value } => value Result<Value, OutOfMemoryError>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error) }
+  let installed = run Effect.result(unsafe install(&mut hooks, memory, context, object, table))
+  return match move installed { Result<(), JsException>.Success { .. } => object Result<(), JsException>.Failure { error } => { unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), object) fail move error } }
+}
+fn count<H: IntrinsicDefinitions>(hooks: &H, table: &Option<NativeFunctionId>) -> i32 {
+  return match &table.* { Option<NativeFunctionId>.Some { value } => u32.toI32(hooks.tableLength(value)) Option<NativeFunctionId>.None => 0 }
+}
+unsafe effect fn installOptional<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + IntrinsicDefinitions>(hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, owner: Value, table: Option<NativeFunctionId>) -> () ! JsException ? &mut Allocator {
+  match move table { Option<NativeFunctionId>.Some { value } => { run unsafe install(&mut hooks, memory, context, owner, value) } Option<NativeFunctionId>.None => () }
+}
+unsafe effect fn link<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H, context: *mut HeapHeader, constructor: Value, prototype: Value, flags: u32) -> Value ! JsException ? &mut Allocator {
+  run unsafe define(&mut hooks, context, constructor, atoms.JS_ATOM_prototype, unsafe prototype.retained(), 0)
+  run unsafe define(&mut hooks, context, prototype, atoms.JS_ATOM_constructor, unsafe constructor.retained(), flags)
+  return Value.Undefined
+}
+unsafe effect fn constructorBody<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + IntrinsicDefinitions>(hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, classId: i32, name: &[u8], callback: NativeFunctionId, length: i32, protocol: NativeCallProtocol, magic: i32, constructorPrototype: Value, constructorTable: Option<NativeFunctionId>, prototypeTable: Option<NativeFunctionId>, flags: u32, roots: &mut [Value; 3]) -> () ! JsException ? &mut Allocator {
+  let mut parent = constructorPrototype
+  if core.undefined(parent) {
+    let objectPrototype = unsafe prototype(context, classes.JS_CLASS_OBJECT)
+    roots[0] = unsafe objectPrototype.retained()
+    let anchor = () let state = unsafe HeapCell.payload<ContextState, ()>(&anchor, context) parent = state.functionPrototype
+  } else { roots[0] = run unsafe get(&mut hooks, context, parent, atoms.JS_ATOM_prototype) }
+  if (flags & JS_NEW_CTOR_PROTO_EXIST) != 0 {
+    if classId < 0 { invariant() }
+    let existing = unsafe prototype(context, i32.toU32(classId))
+    roots[1] = unsafe existing.retained()
+  } else {
+    let mut prototypeClass = classes.JS_CLASS_OBJECT
+    if (flags & JS_NEW_CTOR_PROTO_CLASS) != 0 { if classId < 0 { invariant() } prototypeClass = i32.toU32(classId) }
+    let fields = count(&hooks.*, &prototypeTable) + 1
+    let allocated = run Effect.result(unsafe objects.withPrototypeClassCapacity(&mut hooks, memory, context, roots[0], prototypeClass, fields))
+    roots[1] = match move allocated { Result<Value, OutOfMemoryError>.Success { value } => value Result<Value, OutOfMemoryError>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error) }
+    if classId >= 0 {
+      unsafe runtime.setClassPrototype(&mut hooks, context, i32.toU32(classId), unsafe roots[1].retained())
+    }
+  }
+  run unsafe installOptional(&mut hooks, memory, context, roots[1], move prototypeTable)
+  let fields = count(&hooks.*, &constructorTable) + 3
+  roots[2] = run unsafe functions.newFunctionWithPrototype(&mut hooks, memory, context, callback, name, length, protocol, magic, parent, fields)
+  run unsafe installOptional(&mut hooks, memory, context, roots[2], move constructorTable)
+  if (flags & JS_NEW_CTOR_NO_GLOBAL) == 0 {
+    let defined = run Effect.result(unsafe mutations.definePropertyValueStr(&mut hooks, context, unsafe global(context), name, unsafe roots[2].retained(), 3))
+    match move defined { Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { .. } => () Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => { return run unsafe core.materialize(&mut hooks, context, move error) } }
+  }
+  let mut constructorFlags: u32 = 3 if (flags & JS_NEW_CTOR_READONLY) != 0 { constructorFlags = 1 }
+  // The pinned factory deliberately ignores JS_SetConstructor2's result.
+  let ignored = run Effect.catch<JsException>(unsafe link(&mut hooks, context, roots[2], roots[1], constructorFlags), core.exceptionValue)
+}
+pub unsafe effect fn constructor<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + IntrinsicDefinitions>(hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, classId: i32, name: &[u8], callback: NativeFunctionId, length: i32, protocol: NativeCallProtocol, magic: i32, constructorPrototype: Value, constructorTable: Option<NativeFunctionId>, prototypeTable: Option<NativeFunctionId>, flags: u32) -> Value ! JsException ? &mut Allocator {
+  let mut roots: [Value; 3] = [Value.Undefined; 3]
+  let result = run Effect.result(unsafe constructorBody(&mut hooks, memory, context, classId, name, callback, length, protocol, magic, constructorPrototype, move constructorTable, move prototypeTable, flags, &mut roots))
+  let rt = unsafe runtime.contextRuntime(context)
+  unsafe gc.release(&mut hooks, rt, roots[1]) unsafe gc.release(&mut hooks, rt, roots[0])
+  return match move result { Result<(), JsException>.Success { .. } => roots[2] Result<(), JsException>.Failure { error } => { unsafe gc.release(&mut hooks, rt, roots[2]) fail move error } }
+}

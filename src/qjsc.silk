@@ -1,0 +1,201 @@
+//! Native qjsc frontend: compile with the full realm, serialize actual engine
+//! Values, then emit Silk data or invoke the installed native Silk toolchain.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.list { List }
+import silk.slice { Slice }
+import silk.i32
+import cli_options as options { Arguments, QjscOptions, ArgRef }
+import cli_io as io
+import js_libc { Session }
+import js_libc as libc
+import js_libc_modules as modules
+import js_libc_plugins as plugins
+import js_libc_platform as platform { PlatformError }
+import js_exceptions as exceptions { JsException }
+import js_value { Value }
+import js_lexer { Lexer }
+import js_eval as evaluation
+import js_eval_compile as flags
+import js_binary_object_writer as binary
+import js_runtime as runtime
+import js_runtime_registry { ClassIdAllocator }
+import js_libc_process { Process }
+import js_gc as gc
+import js_atomics_native { Domain, WaiterDomain, SynchronizationError }
+import runtime_memory { RuntimeAllocator }
+import qjsc_emit as emit { Object }
+import qjsc_toolchain as toolchain
+
+effect fn explicitName(bytes: &[u8]) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut length = bytes.length
+  if length > 1023 { length = 1023 }
+  return run emit.copy(Slice.view<u8>(bytes, 0, length))
+}
+fn moduleFile(path: &[u8], source: &[u8], mode: i32) -> bool {
+  if mode >= 0 { return mode != 0 }
+  if path.length >= 4 && emit.equal(Slice.view<u8>(path, path.length - 4, 4), b".mjs") { return true }
+  return Lexer.detectModule(source)
+}
+effect fn collect(captured: List<modules.CapturedModule>, objects: &mut List<Object>, namePrefix: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut entries = move captured
+  let mut at: usize = 0
+  while at < entries.length() {
+    // Move each owner exactly once without shifting the remaining graph. The
+    // immediately installed empty entry keeps List's drop invariant on failure.
+    let item = Intrinsic.replace(entries.asMutSlice()[at],
+      modules.CapturedModule { name: List<u8>.make(), bytes: List<u8>.make(), json: false })
+    at = at + 1
+    let mut found = false
+    let mut index: usize = 0
+    while index < objects.length() {
+      if emit.equal(objects.asSlice()[index].filename.asSlice(), item.name.asSlice()) { found = true break }
+      index = index + 1
+    }
+    if !found {
+      let name = run emit.unique(objects.asSlice(), item.name.asSlice(), namePrefix)
+      run objects.append(Object { name: move name, filename: move item.name, bytes: move item.bytes, json: item.json, module: true, main: false })
+    }
+  }
+}
+unsafe effect fn serialize<'m>(session: &mut Session<'m>, compiled: Value, filename: &[u8], module: bool,
+  byteSwap: bool, objects: &mut List<Object>, namePrefix: &[u8]) -> List<u8> ! OutOfMemoryError | JsException ? &mut Allocator {
+  if module {
+    run unsafe modules.capture(&mut session.engine, session.context, compiled)
+    let mut captured = modules.takeCapture(&mut session.engine)
+    let mut index = captured.length()
+    while index != 0 {
+      index = index - 1
+      if emit.equal(captured.asSlice()[index].name.asSlice(), filename) {
+        let root = captured.remove(index)
+        run collect(move captured, &mut objects, namePrefix)
+        return move root.bytes
+      }
+    }
+    Intrinsic.trap("module capture did not contain its root")
+  }
+  let mut writeFlags = binary.JS_WRITE_OBJ_BYTECODE
+  if byteSwap { writeFlags = writeFlags | binary.JS_WRITE_OBJ_BSWAP }
+  return run unsafe binary.writeObject(&mut session.engine, session.context, compiled, writeFlags)
+}
+unsafe effect fn compile<'m>(session: &mut Session<'m>, args: &Arguments, configuration: &QjscOptions) -> List<Object>
+! OutOfMemoryError | JsException | PlatformError ? &mut Allocator {
+  unsafe runtime.setStripInfo(session.runtime, i32.toU8(configuration.stripFlags))
+  let mut n: usize = 0
+  while n < configuration.nativeModules.length() {
+    let native = &configuration.nativeModules.asSlice()[n]
+    run plugins.declareNative(&mut session.engine, native.name.asSlice())
+    n = n + 1
+  }
+  let mut objects = List<Object>.make()
+  let namePrefix = options.prefix(args, configuration)
+  let mut index = configuration.firstInput
+  while index < args.count() {
+    let filename = args.bytes(index)
+    let loaded = run Effect.result(platform.readFile(filename))
+    let source = match move loaded {
+      Result<List<u8>, OutOfMemoryError | PlatformError>.Success { value } => move value
+      Result<List<u8>, OutOfMemoryError | PlatformError>.Failure { error } => {
+        io.stderr(b"Could not load '") io.stderr(filename) io.stderr(b"'\n")
+        fail move error
+      }
+    }
+    let mut evalFlags = flags.FLAG_COMPILE_ONLY
+    let module = moduleFile(filename, source.asSlice(), configuration.module)
+    if module { evalFlags = evalFlags | flags.TYPE_MODULE }
+    modules.beginCapture(&mut session.engine, configuration.byteSwap)
+    let memory = session.engine.memory
+    let compiled = run unsafe evaluation.evaluate(&mut session.engine, memory, session.context, source.asSlice(), filename, evalFlags)
+    let written = run Effect.result(unsafe serialize(&mut session, compiled, filename, module, configuration.byteSwap, &mut objects, namePrefix))
+    unsafe gc.release(&mut session.engine, session.runtime, compiled)
+    let bytes = match move written {
+      Result<List<u8>, OutOfMemoryError | JsException>.Success { value } => move value
+      Result<List<u8>, OutOfMemoryError | JsException>.Failure { error } => { fail move error }
+    }
+    let name = ifName(configuration, index)
+    let symbol = match move name {
+      Option<ArgRef>.Some { value } => run explicitName(args.resolve(value))
+      Option<ArgRef>.None => run emit.unique(objects.asSlice(), filename, namePrefix)
+    }
+    run objects.append(Object { name: move symbol, filename: run emit.copy(filename), bytes: move bytes, json: false, module: module, main: true })
+    index = index + 1
+  }
+  index = 0
+  while index < configuration.dynamicModules.length() {
+    let path = args.resolve(configuration.dynamicModules.get(index))
+    modules.beginCapture(&mut session.engine, configuration.byteSwap)
+    run unsafe modules.loadDynamic(&mut session.engine, session.context, path)
+    run collect(modules.takeCapture(&mut session.engine), &mut objects, namePrefix)
+    index = index + 1
+  }
+  return move objects
+}
+fn ifName(configuration: &QjscOptions, index: usize) -> Option<ArgRef> {
+  if index == configuration.firstInput {
+    return match &configuration.name {
+      Option<ArgRef>.Some { value } => Option<ArgRef>.some(value)
+      Option<ArgRef>.None => Option<ArgRef>.none()
+    }
+  }
+  return Option<ArgRef>.none()
+}
+effect fn generate<'m>(session: &Session<'m>, configuration: &QjscOptions, objects: &[Object]) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut nativeUsed = List<bool>.make()
+  run nativeUsed.reserveExact(configuration.nativeModules.length())
+  let mut index: usize = 0
+  while index < configuration.nativeModules.length() {
+    run nativeUsed.append(plugins.wasLoaded(&session.engine, configuration.nativeModules.asSlice()[index].name.asSlice()))
+    index = index + 1
+  }
+  return run emit.emit(configuration, objects, nativeUsed.asSlice())
+}
+unsafe effect fn execute(args: &Arguments, configuration: &QjscOptions, domain: Domain) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let memory = run allocator.observe()
+  let namespace = run ClassIdAllocator.make()
+  let process = run Process.make(&namespace)
+  let opened = run Effect.result(unsafe Session.open(&memory, domain, &process, configuration.experimental)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut session = match move opened {
+    Result<Session, OutOfMemoryError | JsException>.Success { value } => move value
+    Result<Session, OutOfMemoryError | JsException>.Failure { .. } => { io.stderr(b"qjsc: could not create compiler runtime\n") return 1 }
+  }
+  let compiled = run Effect.result(unsafe compile(&mut session, args, configuration)) |> Effect.provideMut<Allocator>(&mut allocator)
+  match move compiled {
+    Result<List<Object>, OutOfMemoryError | JsException | PlatformError>.Success { value: objects } => {
+      let emitted = run Effect.result(generate(&session, configuration, objects.asSlice()))
+      run unsafe session.close() |> Effect.provideMut<Allocator>(&mut allocator)
+      let generated = match move emitted {
+        Result<List<u8>, OutOfMemoryError>.Success { value } => move value
+        Result<List<u8>, OutOfMemoryError>.Failure { error } => { fail move error }
+      }
+      let produced = run Effect.result(toolchain.output(args, configuration, generated.asSlice()))
+      return match move produced {
+        Result<i32, OutOfMemoryError | io.IoError>.Success { value } => value
+        Result<i32, OutOfMemoryError | io.IoError>.Failure { error } => {
+          match move error {
+            OutOfMemoryError exhausted => { fail move exhausted }
+            io.IoError failure => { io.stderr(b"qjsc: output or native compiler invocation failed\n") return 1 }
+          }
+        }
+      }
+    }
+    Result<List<Object>, OutOfMemoryError | JsException | PlatformError>.Failure { error } => {
+      if unsafe exceptions.has(session.runtime) {
+        run unsafe libc.dumpError(&mut session.engine, session.context) |> Effect.provideMut<Allocator>(&mut allocator)
+      }
+      run unsafe session.close() |> Effect.provideMut<Allocator>(&mut allocator)
+      match move error {
+        PlatformError failure => ()
+        OutOfMemoryError exhausted => { io.stderr(b"qjsc: out of memory\n") }
+        JsException failure => ()
+      }
+      return 1
+    }
+  }
+}
+pub effect fn compileFiles(args: &Arguments, configuration: &QjscOptions) -> i32 ! OutOfMemoryError | SynchronizationError ? &mut Allocator {
+  let domain = run WaiterDomain.make()
+  return run unsafe execute(args, configuration, domain.handle())
+}

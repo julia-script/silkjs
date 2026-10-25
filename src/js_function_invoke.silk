@@ -1,0 +1,187 @@
+//! Native quickjs.c:41989-42100. Inputs are borrowed roots through every getter,
+//! coercion and call. Extracted arguments own references until synchronous dispatch
+//! returns; native scratch always allocates at least one slot, even for length 0.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.pointer { Pointer }
+import silk.i64
+import silk.usize
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types { ObjectData, ObjectPayload, ValueSlots, FrameSlots, NativeErrorKind, JS_MAX_LOCAL_VARS }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_call_host { CallHooks }
+import js_coercion_host { CoercionHooks }
+import js_integer_coercions as integers
+import js_var_refs as varRefs
+import js_class_data as classes
+import js_atom_data as atoms
+import js_exceptions { JsException }
+import js_string_types { StringLengthError }
+
+pub struct ArgumentList {
+  storage: ValueSlots,
+  count: usize
+}
+impl ArgumentList {
+  pub fn length(self: &Self) -> usize { return self.count }
+  // The returned view borrows this owner; never retain it beyond freeArgList.
+  pub fn view(self: &mut Self) -> FrameSlots {
+    return FrameSlots.Borrowed { data: self.storage.address(0), length: self.count }
+  }
+}
+unsafe effect fn materialize<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  error: OutOfMemoryError | StringLengthError | JsException) -> Value ! JsException ? &mut Allocator {
+  match move error {
+    OutOfMemoryError allocation => { return run unsafe hooks.throwOutOfMemory(context) }
+    StringLengthError length => { return run unsafe hooks.throwError(context, NativeErrorKind.Internal, b"string too long") }
+    JsException signal => { fail move signal }
+  }
+}
+effect fn exceptionValue(error: JsException) -> Value { drop error return Value.Exception }
+pub unsafe fn freeArgList<H: HeapHooks>(hooks: &mut H, context: *mut HeapHeader, arguments: ArgumentList) -> () {
+  let rt = unsafe runtime.contextRuntime(context)
+  let mut i: usize = 0
+  while i < arguments.count { unsafe gc.release(&mut hooks, rt, arguments.storage.get(i)) i = i + 1 }
+}
+pub unsafe effect fn getLength64<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, output: &mut i64, object: Value) -> ()
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let fetched = run Effect.result(unsafe hooks.getProperty(context, object, atoms.JS_ATOM_length))
+  let value = match move fetched {
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => value
+    Result<Value, OutOfMemoryError | JsException>.Failure { error } => { output.* = 0 fail move error }
+  }
+  run unsafe integers.toLengthFree(&mut hooks, context, &mut output, value)
+}
+pub unsafe effect fn buildArgList<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, array: Value) -> ArgumentList ! JsException ? &mut Allocator {
+  // Preserve the logical length separately from capacity (the zero-length case
+  // still allocates). Read length exactly once, before touching dense storage.
+  let allocated = run Effect.result(unsafe prepare(&mut hooks, context, array))
+  let mut arguments = match move allocated {
+    Result<ArgumentList, OutOfMemoryError | StringLengthError | JsException>.Success { value } => move value
+    Result<ArgumentList, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => {
+      let pending = run unsafe materialize(&mut hooks, context, move error)
+      fail JsException {}
+    }
+  }
+  let length = arguments.count arguments.count = 0
+  let filled = run Effect.result(unsafe fill(&mut hooks, context, array, &mut arguments, length))
+  match move filled {
+    Result<(), OutOfMemoryError | JsException>.Success { .. } => { return move arguments }
+    Result<(), OutOfMemoryError | JsException>.Failure { error } => {
+      let pending = run Effect.catch<JsException>(unsafe materialize(&mut hooks, context, move error), exceptionValue)
+      unsafe freeArgList(&mut hooks, context, move arguments)
+      fail JsException {}
+    }
+  }
+}
+unsafe effect fn prepare<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, array: Value) -> ArgumentList
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  if !array.isObject() { return run unsafe hooks.throwError(context, NativeErrorKind.Type, b"not a object") }
+  let mut length: i64 = 0
+  run unsafe getLength64(&mut hooks, context, &mut length, array)
+  if length > usize.toI64(JS_MAX_LOCAL_VARS) {
+    return run unsafe hooks.throwError(context, NativeErrorKind.Range, b"too many arguments in function call (only 65534 allowed)")
+  }
+  let count = i64.toUsize(length)
+  let mut capacity = count if capacity == 0 { capacity = 1 }
+  return ArgumentList { storage: run ValueSlots.make(capacity), count: count }
+}
+unsafe effect fn fill<H: HeapHooks + CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  array: Value, arguments: &mut ArgumentList, length: usize) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  let reference = match array { Value.Object { reference } => reference _ => Intrinsic.trap("QuickJS invariant violated") }
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+  if object.fastArray && (object.classId == classes.JS_CLASS_ARRAY || object.classId == classes.JS_CLASS_ARGUMENTS || object.classId == classes.JS_CLASS_MAPPED_ARGUMENTS) {
+    match &object.payload {
+      ObjectPayload.FastArray { array: dense } => {
+        if length == dense.values.length() {
+          while arguments.count < length {
+            let previous = arguments.storage.replace(arguments.count, unsafe dense.values.get(arguments.count).retained())
+            arguments.count = arguments.count + 1
+          }
+          return ()
+        }
+      }
+      ObjectPayload.MappedArguments { arguments: mapped } => {
+        if length == mapped.varRefs.length() {
+          while arguments.count < length {
+            let value = unsafe varRefs.read(mapped.varRefs.get(arguments.count))
+            let previous = arguments.storage.replace(arguments.count, unsafe value.retained())
+            arguments.count = arguments.count + 1
+          }
+          return ()
+        }
+      }
+      _ => ()
+    }
+  }
+  drop object
+  while arguments.count < length {
+    // All indices are below JS_MAX_LOCAL_VARS, hence immediate uint32 atoms:
+    // this is exactly GetPropertyUint32 without temporary key allocation.
+    let value = run unsafe hooks.getProperty(context, array, 0x80000000 | usize.toU32(arguments.count))
+    let previous = arguments.storage.replace(arguments.count, value)
+    arguments.count = arguments.count + 1
+  }
+}
+pub unsafe effect fn apply<H: HeapHooks + CoercionHooks + CallHooks>(hooks: &mut H,
+  context: *mut HeapHeader, function: Value, arguments: &FrameSlots, magic: i32) -> Value ! JsException ? &mut Allocator {
+  if !unsafe hooks.isCallable(context, function) { return run unsafe hooks.throwError(context, NativeErrorKind.Type, b"not a function") }
+  let mut receiver = Value.Undefined let mut array = Value.Undefined
+  if arguments.length() > 0 { receiver = unsafe arguments.get(0) }
+  if arguments.length() > 1 { array = unsafe arguments.get(1) }
+  if (array.tag() == 2 || array.tag() == 3) && magic != 2 {
+    let empty = FrameSlots.Borrowed { data: unsafe Intrinsic.pointerRequalify<[*]mut Value, *mut Value>(unsafe Intrinsic.stackAllocate<Value>(0)), length: 0 }
+    let called = run Effect.result(unsafe hooks.callArguments(context, function, receiver, &empty))
+    return match move called {
+      Result<Value, OutOfMemoryError | JsException>.Success { value } => value
+      Result<Value, OutOfMemoryError | JsException>.Failure { error } => run unsafe materialize(&mut hooks, context, move error)
+    }
+  }
+  let mut list = run unsafe buildArgList(&mut hooks, context, array)
+  let slots = list.view()
+  let called = run Effect.result(unsafe dispatch(&mut hooks, context, function, receiver, &slots, (magic & 1) != 0))
+  drop slots
+  // Materialize a native allocation error before releasing arguments, just as a
+  // failing JS_Call has already installed its pending exception in QuickJS.
+  match move called {
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => {
+      unsafe freeArgList(&mut hooks, context, move list) return value
+    }
+    Result<Value, OutOfMemoryError | JsException>.Failure { error } => {
+      let pending = run Effect.catch<JsException>(unsafe materialize(&mut hooks, context, move error), exceptionValue)
+      unsafe freeArgList(&mut hooks, context, move list) fail JsException {}
+    }
+  }
+}
+unsafe effect fn dispatch<H: CallHooks>(hooks: &mut H, context: *mut HeapHeader,
+  function: Value, receiver: Value, arguments: &FrameSlots, constructor: bool) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  if constructor { return run unsafe hooks.construct(context, function, receiver, arguments) }
+  return run unsafe hooks.callArguments(context, function, receiver, arguments)
+}
+pub unsafe effect fn call<H: CoercionHooks + CallHooks>(hooks: &mut H, context: *mut HeapHeader,
+  function: Value, arguments: &FrameSlots) -> Value ! JsException ? &mut Allocator {
+  let mut receiver = Value.Undefined
+  let mut data = unsafe Intrinsic.pointerRequalify<[*]mut Value, *mut Value>(unsafe Intrinsic.stackAllocate<Value>(0)) let mut count: usize = 0
+  if arguments.length() != 0 {
+    receiver = unsafe arguments.get(0) count = arguments.length() - 1
+    if count != 0 {
+      match &arguments.* {
+        FrameSlots.Owned { slots } => { data = unsafe Intrinsic.pointerRequalify<*const Value, *mut Value>(Pointer.fromRef<Value>(&slots.view()[1])) }
+        FrameSlots.Borrowed { data: source, .. } => { data = unsafe Pointer.atMut<Value>(unsafe Pointer.assumeManyMut<Value>(source), 1) }
+      }
+    }
+  }
+  let rest = FrameSlots.Borrowed { data: data, length: count }
+  let called = run Effect.result(unsafe hooks.callArguments(context, function, receiver, &rest))
+  return match move called {
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => value
+    Result<Value, OutOfMemoryError | JsException>.Failure { error } => run unsafe materialize(&mut hooks, context, move error)
+  }
+}

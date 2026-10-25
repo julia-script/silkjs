@@ -1,0 +1,272 @@
+//! Native owners used by error tests and the standalone C differential. The host
+//! implements only ordinary configurable data definitions, plus an explicit
+//! throwing callback used to exercise the mandatory attachment boundary. It does
+//! not pretend to implement JavaScript Proxy or arbitrary descriptor semantics.
+import silk.allocator { Allocator, OutOfMemoryError, SystemAllocator }
+import silk.effect { Effect }
+import silk.layout { Layout }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.result { Result }
+import silk.u32
+import silk.u8
+import silk.usize
+import runtime_memory { RuntimeAllocator, AllocationObserver }
+import js_heap { HeapCell, HeapHeader }
+import js_core_types { RuntimeState, ContextState, ObjectData, ShapeData, PropertySlot,
+  NativeErrorKind, NativeFunctionId, WeakRefHeader }
+import js_gc { HeapHooks, Tracer }
+import js_gc as gc
+import js_runtime as runtime
+import js_runtime_registry as registry
+import js_runtime_classes { emptyDefinition }
+import js_object_allocate as objects
+import js_shapes as shapes
+import js_class_data as classes
+import js_atom_data as atoms
+import js_value { Value }
+import js_strings { Strings }
+import js_string_types { StringLengthError }
+import js_errors as errors
+import js_error_host { ErrorHooks }
+import js_exceptions { JsException }
+import js_exceptions as exceptions
+import js_backtrace_test_support as frames
+import js_array_storage_test_support { reference, trap }
+
+const WATCH_CLASS: u32 = 68
+const WATCH_CALLBACK: u32 = 9068
+pub struct Hooks<'a> {
+  pub memory: &'a AllocationObserver,
+  pub definitions: usize, pub throwOn: usize, pub collect: bool,
+  pub finalized: usize, pub sawOldPending: bool, pub sawUncatchable: bool
+}
+impl<'a> Hooks<'a> {
+  pub fn make(memory: &'a AllocationObserver) -> Self {
+    return Self { memory: memory, definitions: 0, throwOn: 0, collect: false,
+      finalized: 0, sawOldPending: false, sawUncatchable: false }
+  }
+}
+impl<'a> HeapHooks for Hooks<'a> {
+  unsafe fn traceClass(self: &mut Self, rt: *mut HeapHeader, object: *mut HeapHeader,
+    callback: NativeFunctionId, tracer: &mut Tracer) -> () {
+    if !unsafe gc.traceCorePayload(object, &mut tracer) { trap() }
+  }
+  unsafe fn finalizeClass(self: &mut Self, rt: *mut HeapHeader, object: *mut HeapHeader,
+    callback: NativeFunctionId) -> () {
+    match callback {
+      NativeFunctionId.Host { id } => {
+        if id == WATCH_CALLBACK {
+          self.finalized = self.finalized + 1
+          let anchor = ()
+          let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+          self.sawOldPending = match state.currentException {
+            Value.Object { reference: pending } => Pointer.address(pending) == Pointer.address(object)
+            _ => false
+          }
+          self.sawUncatchable = state.currentExceptionIsUncatchable
+        }
+      }
+      _ => ()
+    }
+    if !unsafe gc.finalizeCorePayload(&mut self, rt, object) { trap() }
+  }
+  unsafe effect fn sweepWeak(self: &mut Self, rt: *mut HeapHeader, node: *mut WeakRefHeader) -> () ? &mut Allocator { trap() }
+  unsafe fn destroyAuxiliary(self: &mut Self, rt: *mut HeapHeader, node: *mut HeapHeader) -> () { trap() }
+}
+effect fn ignore(error: JsException) -> () { drop error }
+unsafe effect fn reportOom<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
+  ctx: *mut HeapHeader) -> () ! JsException ? &mut Allocator {
+  return run unsafe errors.throwOutOfMemory(&mut hooks, memory, ctx)
+}
+impl<'a> ErrorHooks for Hooks<'a> {
+  unsafe effect fn defineErrorProperty(self: &mut Self, ctx: *mut HeapHeader,
+    object: Value, atom: u32, value: Value, flags: u32) -> bool ! JsException ? &mut Allocator {
+    let rt = unsafe runtime.contextRuntime(ctx)
+    self.definitions = self.definitions + 1
+    if self.collect { run unsafe gc.collect(&mut self, rt, true) }
+    if self.throwOn == self.definitions {
+      run Effect.catchAll(unsafe exceptions.throwValue<(), Self>(&mut self, rt, Value.Int { value: 37 }), ignore)
+      unsafe gc.release(&mut self, rt, value)
+      fail JsException {}
+    }
+    let changed = run Effect.result(unsafe define(&mut self, rt, object, atom, value, u32.toU8(flags)))
+    return match move changed {
+      Result<bool, OutOfMemoryError>.Success { value: accepted } => {
+        unsafe gc.release(&mut self, rt, value)
+        return accepted
+      }
+      Result<bool, OutOfMemoryError>.Failure { .. } => {
+        let memory = self.memory
+        run Effect.catchAll(unsafe reportOom(&mut self, memory, ctx), ignore)
+        // DefinePropertyValue consumes its input after the pending OOM is set.
+        unsafe gc.release(&mut self, rt, value)
+        fail JsException {}
+      }
+    }
+  }
+}
+// Borrowed value, as in JS_DefineProperty; retain only when publishing a slot.
+unsafe effect fn define<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader,
+  object: Value, atom: u32, value: Value, flags: u8) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, reference(object))
+  if data.isExotic { trap() }
+  match unsafe shapes.lookup(data.shape, atom) {
+    Option<usize>.Some { value: at } => {
+      let shapeAnchor = ()
+      let shape = unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, data.shape)
+      let oldFlags = shape.properties.get(at).flags
+      drop shape
+      if (oldFlags & 1) == 0 {
+        drop data
+        return false
+      }
+      run unsafe shapes.updateFlags(rt, &mut data, at, flags)
+      let old = data.properties.get(at)
+      data.properties.set(at, PropertySlot.Value { value: unsafe value.retained() })
+      drop data
+      unsafe gc.releaseProperty(&mut hooks, rt, old)
+      return true
+    }
+    Option<usize>.None => ()
+  }
+  if !data.extensible {
+    drop data
+    return false
+  }
+  let added = run unsafe shapes.addProperty(rt, &mut data, atom, flags)
+  data.properties.set(added.index, PropertySlot.Value { value: unsafe value.retained() })
+  drop data
+  unsafe gc.releaseOptional(&mut hooks, rt, added.retiredShape)
+  return true
+}
+
+pub fn kind(number: usize) -> NativeErrorKind {
+  return match number {
+    0 => NativeErrorKind.Eval 1 => NativeErrorKind.Range 2 => NativeErrorKind.Reference
+    3 => NativeErrorKind.Syntax 4 => NativeErrorKind.Type 5 => NativeErrorKind.Uri
+    6 => NativeErrorKind.Internal 7 => NativeErrorKind.Aggregate _ => NativeErrorKind.Suppressed
+  }
+}
+fn name(number: usize) -> &'static [u8] {
+  return match number {
+    0 => b"EvalError" 1 => b"RangeError" 2 => b"ReferenceError" 3 => b"SyntaxError"
+    4 => b"TypeError" 5 => b"URIError" 6 => b"InternalError" 7 => b"AggregateError" _ => b"SuppressedError"
+  }
+}
+/// Installs real ordinary prototype owners; context teardown owns all of them.
+pub unsafe effect fn prepare<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
+  ctx: *mut HeapHeader) -> () ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(ctx)
+  let base = run unsafe objects.withPrototype(&mut hooks, memory, ctx, Value.Null)
+  unsafe runtime.setClassPrototype(&mut hooks, ctx, classes.JS_CLASS_ERROR, base)
+  let baseName = run Strings.fromLatin1(b"Error")
+  run unsafe frames.add(&mut hooks, rt, base, atoms.JS_ATOM_name, 3, PropertySlot.Value { value: baseName })
+  let mut i: usize = 0
+  while i < 9 {
+    let prototype = run unsafe objects.withPrototype(&mut hooks, memory, ctx, base)
+    let mut anchor = ()
+    let context = unsafe HeapCell.payloadMut<ContextState, ()>(&mut anchor, ctx)
+    context.nativeErrorPrototypes[i] = prototype
+    drop context
+    let text = run Strings.fromLatin1(name(i))
+    run unsafe frames.add(&mut hooks, rt, prototype, atoms.JS_ATOM_name, 3, PropertySlot.Value { value: text })
+    i = i + 1
+  }
+  let mut definition = emptyDefinition()
+  definition.finalizer = Option<NativeFunctionId>.some(NativeFunctionId.Host { id: WATCH_CALLBACK })
+  if !run unsafe registry.registerClass(rt, WATCH_CLASS, b"PendingOwner", move definition) { trap() }
+}
+pub unsafe effect fn watched<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
+  ctx: *mut HeapHeader) -> Value ! OutOfMemoryError ? &mut Allocator {
+  return run unsafe objects.withPrototypeClass(&mut hooks, memory, ctx, Value.Null, WATCH_CLASS)
+}
+pub unsafe effect fn putPending<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader,
+  value: Value) -> () ? &mut Allocator {
+  run Effect.catchAll(unsafe exceptions.throwValue<(), H>(&mut hooks, rt, value), ignore)
+}
+pub unsafe effect fn raise<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
+  ctx: *mut HeapHeader, which: NativeErrorKind, message: &[u8], policy: u32) -> ()
+  ! JsException ? &mut Allocator {
+  if policy == 0 { return run unsafe errors.throwError(&mut hooks, memory, ctx, which, message) }
+  return run unsafe errors.throwError2(&mut hooks, memory, ctx, which, message, policy == 2)
+}
+pub unsafe effect fn capture<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
+  ctx: *mut HeapHeader, which: NativeErrorKind, message: &[u8], policy: u32) -> Value ? &mut Allocator {
+  run Effect.catchAll(unsafe raise(&mut hooks, memory, ctx, which, message, policy), ignore)
+  return unsafe exceptions.take(unsafe runtime.contextRuntime(ctx))
+}
+pub unsafe effect fn captureOom<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
+  ctx: *mut HeapHeader) -> Value ? &mut Allocator {
+  run Effect.catchAll(unsafe reportOom(&mut hooks, memory, ctx), ignore)
+  return unsafe exceptions.take(unsafe runtime.contextRuntime(ctx))
+}
+pub struct Property { pub present: bool, pub flags: u32, pub value: Value }
+pub unsafe fn property(object: Value, atom: u32) -> Property {
+  if !object.isObject() { return Property { present: false, flags: 0, value: Value.Undefined } }
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(object))
+  let at = match unsafe shapes.lookup(data.shape, atom) {
+    Option<usize>.Some { value } => value
+    Option<usize>.None => { return Property { present: false, flags: 0, value: Value.Undefined } }
+  }
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+  let flags = u8.toU32(shape.properties.get(at).flags)
+  let value = match data.properties.get(at) { PropertySlot.Value { value } => value _ => trap() }
+  return Property { present: true, flags: flags, value: value }
+}
+pub unsafe fn prototypeIndex(ctx: *mut HeapHeader, object: Value) -> u32 {
+  if !object.isObject() { return 99 }
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(object))
+  if data.classId != classes.JS_CLASS_ERROR { return 98 }
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+  let prototype = Pointer.address(shape.prototype)
+  let context = unsafe HeapCell.payload<ContextState, ()>(&anchor, ctx)
+  let mut i: usize = 0
+  while i < 9 {
+    if prototype == Pointer.address(reference(context.nativeErrorPrototypes[i])) { return usize.toU32(i) }
+    i = i + 1
+  }
+  if prototype == Pointer.address(reference(context.classPrototypes.get(u32.toUsize(classes.JS_CLASS_ERROR)))) { return 9 }
+  return 97
+}
+pub unsafe fn setOom(rt: *mut HeapHeader, value: bool) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+  state.inOutOfMemory = value
+}
+pub unsafe fn inOom(rt: *mut HeapHeader) -> bool {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  return state.inOutOfMemory
+}
+pub unsafe fn uncatchable(rt: *mut HeapHeader) -> bool {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  return state.currentExceptionIsUncatchable
+}
+pub unsafe fn preventExtensions(object: Value) -> () {
+  let mut anchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, reference(object))
+  data.extensible = false
+}
+
+pub struct FaultAllocator {
+  pub parent: RuntimeAllocator<SystemAllocator>, pub armed: bool,
+  pub remaining: usize, pub persistent: bool, pub failures: usize
+}
+impl Allocator for FaultAllocator {
+  effect fn allocate(self: &mut Self, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
+    if self.armed {
+      if self.remaining == 0 {
+        self.failures = self.failures + 1
+        self.armed = self.persistent
+        return run Allocator.outOfMemory()
+      }
+      self.remaining = self.remaining - 1
+    }
+    return run Allocator.allocate(move layout) |> Effect.provideMut<Allocator>(&mut self.parent)
+  }
+}

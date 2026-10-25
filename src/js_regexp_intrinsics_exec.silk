@@ -1,0 +1,331 @@
+//! RegExp builtin execution and dynamic RegExpExec, quickjs.c:50395-50414,
+//! 50470-50720,50839-50871. Inputs are borrowed; returned Values are owned.
+//! Capture offsets remain UTF-16 code-unit offsets, including Unicode modes.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.list { List }
+import silk.slice { Slice }
+import silk.i32
+import silk.i64
+import silk.u8
+import silk.u16
+import silk.u32
+import silk.usize
+import runtime_memory { AllocationObserver }
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types { ContextState, RuntimeState, ObjectData, ObjectPayload, PropertySlot,
+  ShapeData, NativeFunctionId, NativeErrorKind, JS_PROP_WRITABLE, JS_PROP_C_W_E, JS_PROP_THROW }
+import js_gc { HeapHooks }
+import js_coercion_host { CoercionHooks }
+import js_call_host { CallHooks }
+import js_property_host { OwnPropertyHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_interrupt_host { InterruptHooks }
+import js_exceptions { JsException }
+import js_string_types { FlatString, StringOwner, StringLengthError, stringReference }
+import js_strings { Strings }
+import js_runtime as runtime
+import js_errors as errors
+import js_object_allocate as allocate
+import js_shapes as shapes
+import js_property_mutations as properties
+import js_proxy_core as core
+import js_atom_data as atoms
+import js_class_data as classes
+import js_regexp_intrinsics_support as support
+import regexp_exec { RegExpExecutor }
+import regexp_types { RegExpMatch, RegExpTimeout, FLAG_GLOBAL, FLAG_STICKY, FLAG_INDICES, FLAG_NAMED_GROUPS }
+import byte_buffer { readU16, readU32 }
+
+// Unlike VM polling, the regexp engine already maintains its own 10,000-event
+// counter. Calling js_interrupts.poll here would incorrectly square that interval.
+unsafe effect fn interrupted<H: InterruptHooks>(hooks: &mut H, context: *mut HeapHeader) -> bool ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let opaque = state.interrupt.opaque
+  let callback = match &state.interrupt.callback {
+    Option<NativeFunctionId>.Some { value } => Option<NativeFunctionId>.some(value)
+    Option<NativeFunctionId>.None => Option<NativeFunctionId>.none()
+  }
+  drop state
+  return match move callback {
+    Option<NativeFunctionId>.Some { value } => run unsafe hooks.interrupt(rt, value, opaque)
+    Option<NativeFunctionId>.None => false
+  }
+}
+
+// Shared with the source optimized replacement path. Both inputs must be flat
+// strings and start <= input length; the owner keeps them live during callbacks.
+pub unsafe effect fn execute<H: HeapHooks + CoercionHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, bytecode: Value, string: Value,
+  start: usize) -> RegExpMatch ! JsException ? &mut Allocator {
+  let anchor = ()
+  let code = unsafe HeapCell.payload<FlatString, ()>(&anchor, stringReference(bytecode))
+  let input = unsafe HeapCell.payload<FlatString, ()>(&anchor, stringReference(string))
+  let attempted = run Effect.result(unsafe executeFlat(&mut hooks, context, &code, &input, start))
+  drop input drop code
+  return match move attempted {
+    Result<RegExpMatch, OutOfMemoryError | RegExpTimeout>.Success { value } => move value
+    Result<RegExpMatch, OutOfMemoryError | RegExpTimeout>.Failure { error } => {
+      match move error {
+        RegExpTimeout timeout => { return run unsafe errors.throwInterrupted(&mut hooks, memory, context) }
+        OutOfMemoryError allocation => {
+          return run unsafe hooks.throwError(context, NativeErrorKind.Internal, b"out of memory in regexp execution")
+        }
+      }
+    }
+  }
+}
+unsafe effect fn executeFlat<H: InterruptHooks>(hooks: &mut H, context: *mut HeapHeader,
+  code: &FlatString, input: &FlatString, start: usize) -> RegExpMatch
+  ! OutOfMemoryError | RegExpTimeout ? &mut Allocator {
+  if input.wide {
+    return run RegExpExecutor.execute16(code.latin1.asSlice(), Slice.view(input.utf16.asSlice(), 0, input.length), start,
+      effect fn() -> bool ? &mut Allocator { return run unsafe interrupted(&mut hooks, context) })
+  }
+  return run RegExpExecutor.execute8(code.latin1.asSlice(), Slice.view(input.latin1.asSlice(), 0, input.length), start,
+    effect fn() -> bool ? &mut Allocator { return run unsafe interrupted(&mut hooks, context) })
+}
+
+// The non-configurable lastIndex slot is always first, even after other properties
+// are added. The ToLength helper retains nonintegers before coercion can reenter.
+pub unsafe effect fn getLastIndex<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, receiver: Value) -> i64 ! JsException ? &mut Allocator {
+  let anchor = ()
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(receiver))
+  let stored = match object.properties.get(0) {
+    PropertySlot.Value { value } => value
+    _ => Intrinsic.trap("QuickJS invariant violated")
+  }
+  drop object
+  match stored {
+    Value.Int { value } => { if value < 0 { return 0 } return i32.toI64(value) }
+    _ => ()
+  }
+  return run unsafe support.length(&mut hooks, context, stored)
+}
+pub unsafe effect fn setLastIndex<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks>(
+  hooks: &mut H, context: *mut HeapHeader, receiver: Value, index: i32) -> ()
+  ! JsException ? &mut Allocator {
+  let mut anchor = ()
+  let object = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, core.reference(receiver))
+  let shapeAnchor = ()
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, object.shape)
+  let writable = (u8.toU32(shape.properties.get(0).flags) & JS_PROP_WRITABLE) != 0
+  drop shape
+  let integer = match object.properties.get(0) {
+    PropertySlot.Value { value: Value.Int { .. } } => true
+    _ => false
+  }
+  if integer && writable {
+    object.properties.set(0, PropertySlot.Value { value: Value.Int { value: index } })
+    return ()
+  }
+  drop object
+  run unsafe support.set(&mut hooks, context, receiver, atoms.JS_ATOM_lastIndex, Value.Int { value: index })
+}
+
+unsafe fn hasOwn(object: Value, atom: u32) -> bool {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(object))
+  return match unsafe shapes.lookup(data.shape, atom) {
+    Option<usize>.Some { .. } => true Option<usize>.None => false
+  }
+}
+
+// All JS references under construction stay in this cleanup ledger until their
+// ownership has actually transferred. Native lists are affine and drop on failure.
+struct ResultState {
+  object: Value,
+  groups: Value,
+  indices: Value,
+  indicesGroups: Value,
+  temporary: Value,
+  groupName: u32
+}
+unsafe effect fn resultArray<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, string: Value, groups: Value, count: usize, index: i32) -> Value
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut slots = List<PropertySlot>.make()
+  run slots.reserveExact(4)
+  run slots.append(PropertySlot.Value { value: Value.Int { value: usize.toI32(count) } })
+  run slots.append(PropertySlot.Value { value: Value.Int { value: index } })
+  // Append inert placeholders before acquiring the two reference-counted slots.
+  run slots.append(PropertySlot.Value { value: Value.Undefined })
+  run slots.append(PropertySlot.Value { value: Value.Undefined })
+  slots.set(2, PropertySlot.Value { value: unsafe string.retained() })
+  slots.set(3, PropertySlot.Value { value: unsafe groups.retained() })
+  let anchor = ()
+  let ctx = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  let shape = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(ctx.regexpResultShape)
+  drop ctx
+  unsafe HeapCell.retain(shape)
+  return run unsafe allocate.fromShape(&mut hooks, memory, context, shape, classes.JS_CLASS_ARRAY,
+    Option<List<PropertySlot>>.some(move slots))
+}
+unsafe effect fn buildResult<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks>(
+  hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, string: Value,
+  bytecode: Value, matched: &RegExpMatch, state: &mut ResultState) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let anchor = ()
+  let code = unsafe HeapCell.payload<FlatString, ()>(&anchor, stringReference(bytecode))
+  let bytes = code.latin1.asSlice()
+  let flags = u16.toU32(readU16(bytes, 0))
+  let named = (flags & FLAG_NAMED_GROUPS) != 0
+  let count = u8.toUsize(bytes[2])
+  let mut nameOffset = u32.toUsize(readU32(bytes, 4)) + 8
+  if named { state.groups = run unsafe support.object(&mut hooks, memory, context, Value.Null) }
+  if (flags & FLAG_INDICES) != 0 {
+    state.indices = run unsafe support.array(&mut hooks, memory, context)
+    if named { state.indicesGroups = run unsafe support.object(&mut hooks, memory, context, Value.Null) }
+  }
+  state.object = run unsafe resultArray(&mut hooks, memory, context, string, state.groups,
+    count, matched.captures.get(0))
+  let mut arrayAnchor = ()
+  let arrayObject = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut arrayAnchor, core.reference(state.object))
+  match &mut arrayObject.payload {
+    ObjectPayload.FastArray { array } => { run array.values.reserveExact(count) }
+    _ => { Intrinsic.trap("QuickJS invariant violated") }
+  }
+  drop arrayObject
+  let mut i: usize = 0
+  while i < count {
+    if named && i > 0 {
+      let mut nameEnd = nameOffset
+      while bytes[nameEnd] != 0 { nameEnd = nameEnd + 1 }
+      if nameEnd != nameOffset {
+        let mut atomAnchor = ()
+        let rt = unsafe runtime.contextRuntime(context)
+        let runtimeState = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut atomAnchor, rt)
+        state.groupName = run runtimeState.atoms.internUtf8(Slice.view(bytes, nameOffset, nameEnd - nameOffset))
+      }
+      // Each compiler name record ends in NUL followed by its duplicate-name scope.
+      nameOffset = nameEnd + 2
+    }
+    let start = matched.captures.get(i * 2)
+    let end = matched.captures.get(i * 2 + 1)
+    let present = start >= 0 && end >= 0
+    if (flags & FLAG_INDICES) != 0 {
+      if present {
+        state.temporary = run unsafe support.array(&mut hooks, memory, context)
+        run unsafe support.defineIndex(&mut hooks, context, state.temporary, 0, Value.Int { value: start })
+        run unsafe support.defineIndex(&mut hooks, context, state.temporary, 1, Value.Int { value: end })
+      }
+      if state.groupName != 0 && (present || !unsafe hasOwn(state.indicesGroups, state.groupName)) {
+        let pair = unsafe state.temporary.retained()
+        run unsafe support.define(&mut hooks, context, state.indicesGroups, state.groupName,
+          pair, JS_PROP_C_W_E | JS_PROP_THROW)
+      }
+      let pair = state.temporary
+      state.temporary = Value.Undefined
+      run unsafe support.defineIndex(&mut hooks, context, state.indices, usize.toI64(i), pair)
+    }
+    if present { state.temporary = run Strings.substring(string, i32.toUsize(start), i32.toUsize(end)) }
+    if state.groupName != 0 {
+      if present || !unsafe hasOwn(state.groups, state.groupName) {
+        let capture = unsafe state.temporary.retained()
+        run unsafe support.define(&mut hooks, context, state.groups, state.groupName,
+          capture, JS_PROP_C_W_E | JS_PROP_THROW)
+      }
+      unsafe properties.releaseAtom(unsafe runtime.contextRuntime(context), state.groupName)
+      state.groupName = 0
+    }
+    let mut appendAnchor = ()
+    let output = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut appendAnchor, core.reference(state.object))
+    match &mut output.payload {
+      ObjectPayload.FastArray { array } => { run array.values.append(state.temporary) }
+      _ => { Intrinsic.trap("QuickJS invariant violated") }
+    }
+    state.temporary = Value.Undefined
+    i = i + 1
+  }
+  if (flags & FLAG_INDICES) != 0 {
+    let groups = state.indicesGroups
+    state.indicesGroups = Value.Undefined
+    run unsafe support.define(&mut hooks, context, state.indices, atoms.JS_ATOM_groups,
+      groups, JS_PROP_C_W_E | JS_PROP_THROW)
+    let indices = state.indices
+    state.indices = Value.Undefined
+    run unsafe support.define(&mut hooks, context, state.object, atoms.JS_ATOM_indices,
+      indices, JS_PROP_C_W_E | JS_PROP_THROW)
+  }
+  let result = state.object
+  state.object = Value.Undefined
+  return result
+}
+
+unsafe effect fn builtinExec<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + InterruptHooks>(
+  hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, receiver: Value,
+  input: Value) -> Value ! JsException ? &mut Allocator {
+  if !unsafe support.regexp(receiver) {
+    return run unsafe core.error(&mut hooks, context, b"RegExp object expected")
+  }
+  let string = StringOwner.adopt(run unsafe support.string(&mut hooks, context, input))
+  let mut lastIndex = run unsafe getLastIndex(&mut hooks, context, receiver)
+  // Read the current bytecode AFTER both coercions: they may invoke compile().
+  let fields = unsafe support.fields(receiver)
+  let code = StringOwner.borrowed(fields.bytecode)
+  let anchor = ()
+  let flat = unsafe HeapCell.payload<FlatString, ()>(&anchor, stringReference(code.get()))
+  let flags = u16.toU32(readU16(flat.latin1.asSlice(), 0))
+  drop flat
+  let updatesIndex = (flags & (FLAG_GLOBAL | FLAG_STICKY)) != 0
+  if !updatesIndex { lastIndex = 0 }
+  if lastIndex > usize.toI64(Strings.length(string.get())) {
+    run unsafe setLastIndex(&mut hooks, context, receiver, 0)
+    return Value.Null
+  }
+  let matched = run unsafe execute(&mut hooks, memory, context, code.get(), string.get(), i64.toUsize(lastIndex))
+  if !matched.matched {
+    if updatesIndex { run unsafe setLastIndex(&mut hooks, context, receiver, 0) }
+    return Value.Null
+  }
+  if updatesIndex { run unsafe setLastIndex(&mut hooks, context, receiver, matched.captures.get(1)) }
+  let mut state = ResultState { object: Value.Undefined, groups: Value.Undefined,
+    indices: Value.Undefined, indicesGroups: Value.Undefined, temporary: Value.Undefined, groupName: 0 }
+  let built = run Effect.result(unsafe buildResult(&mut hooks, memory, context, string.get(), code.get(), &matched, &mut state))
+  unsafe properties.releaseAtom(unsafe runtime.contextRuntime(context), state.groupName)
+  unsafe support.release(&mut hooks, context, state.temporary)
+  unsafe support.release(&mut hooks, context, state.indicesGroups)
+  unsafe support.release(&mut hooks, context, state.indices)
+  unsafe support.release(&mut hooks, context, state.groups)
+  unsafe support.release(&mut hooks, context, state.object)
+  return match move built {
+    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Success { value } => value
+    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => {
+      return run unsafe support.materialize(&mut hooks, context, move error)
+    }
+  }
+}
+
+pub unsafe effect fn regExpExec<H: HeapHooks + CoercionHooks + CallHooks + OwnPropertyHooks + PropertyWriteHooks + InterruptHooks>(
+  hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, receiver: Value,
+  string: Value) -> Value ! JsException ? &mut Allocator {
+  let method = run unsafe support.get(&mut hooks, context, receiver, atoms.JS_ATOM_exec)
+  if unsafe hooks.isCallable(context, method) {
+    let result = run unsafe core.callFree(&mut hooks, context, method, receiver, &[string])
+    if !result.isObject() && result.tag() != Value.Null.tag() {
+      unsafe support.release(&mut hooks, context, result)
+      return run unsafe core.error(&mut hooks, context, b"RegExp exec method must return an object or null")
+    }
+    return result
+  }
+  unsafe support.release(&mut hooks, context, method)
+  return run unsafe builtinExec(&mut hooks, memory, context, receiver, string)
+}
+
+pub unsafe effect fn exec<H: HeapHooks + CoercionHooks + CallHooks + OwnPropertyHooks + PropertyWriteHooks + InterruptHooks>(
+  hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, receiver: Value,
+  input: Value, test: bool) -> Value ! JsException ? &mut Allocator {
+  if !test { return run unsafe builtinExec(&mut hooks, memory, context, receiver, input) }
+  // Pinned test delegates directly, so an override observes the ORIGINAL argument
+  // (not ToString(input)), and arbitrary receivers are permitted by that override.
+  let result = run unsafe regExpExec(&mut hooks, memory, context, receiver, input)
+  let matched = result.tag() != Value.Null.tag()
+  unsafe support.release(&mut hooks, context, result)
+  return Value.Bool { value: matched }
+}

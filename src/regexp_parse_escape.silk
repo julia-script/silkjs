@@ -1,0 +1,216 @@
+// Ported from QuickJS libregexp.c at 7d1c13c5d8f8c6b32893786ed35cdcebd88194d2.
+// Copyright (c) 2017-2021 Fabrice Bellard and Charlie Gordon. See LICENSE.quickjs.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.list { List }
+import silk.option { Option }
+import silk.slice { Slice }
+import silk.u8
+import silk.u32
+import silk.i32
+import regexp_types { RegExpSyntaxError }
+import unicode_case { UnicodeCase }
+import utf8 { Utf8, Decoded }
+
+pub struct EscapeResult { pub codePoint: i32, pub next: usize }
+pub struct DecimalResult { pub value: i32, pub next: usize }
+pub struct GroupName { pub bytes: List<u8>, pub next: usize }
+
+fn byteAt(input: &[u8], offset: usize) -> u32 {
+  if offset >= input.length { return 0 }
+  return u8.toU32(input[offset])
+}
+
+fn hexValue(c: u32) -> i32 {
+  if c >= 48 && c <= 57 { return u32.toI32(c - 48) }
+  if c >= 65 && c <= 70 { return u32.toI32(c - 65 + 10) }
+  if c >= 97 && c <= 102 { return u32.toI32(c - 97 + 10) }
+  return -1
+}
+
+/// Offset points after the backslash. Failure leaves next equal to offset.
+/// Modes 0/1 allow legacy octal; modes 1/2 allow braced Unicode; mode 2 joins pairs.
+pub fn parseEscape(input: &[u8], offset: usize, allowUtf16: u32) -> EscapeResult {
+  let malformed = EscapeResult { codePoint: -1, next: offset }
+  if offset >= input.length { return EscapeResult { codePoint: -2, next: offset } }
+  let mut p = offset + 1
+  let mut c = byteAt(input, offset)
+  match c {
+    98 => { c = 8 }
+    102 => { c = 12 }
+    110 => { c = 10 }
+    114 => { c = 13 }
+    116 => { c = 9 }
+    118 => { c = 11 }
+    120 => {
+      let h0 = hexValue(byteAt(input, p))
+      if h0 < 0 { return move malformed }
+      let h1 = hexValue(byteAt(input, p + 1))
+      if h1 < 0 { return move malformed }
+      c = i32.toU32(h0 * 16 + h1)
+      p = p + 2
+    }
+    117 => {
+      c = 0
+      if byteAt(input, p) == 123 && allowUtf16 != 0 {
+        p = p + 1
+        while true {
+          let h = hexValue(byteAt(input, p))
+          if h < 0 { return move malformed }
+          c = c * 16 + i32.toU32(h)
+          p = p + 1
+          if c > 0x10ffff { return move malformed }
+          if byteAt(input, p) == 125 { break }
+        }
+        p = p + 1
+      } else {
+        let mut i: usize = 0
+        while i < 4 {
+          let h = hexValue(byteAt(input, p))
+          if h < 0 { return move malformed }
+          c = c * 16 + i32.toU32(h)
+          p = p + 1
+          i = i + 1
+        }
+        if c >= 0xd800 && c <= 0xdbff && allowUtf16 == 2 && byteAt(input, p) == 92 && byteAt(input, p + 1) == 117 {
+          let mut second: u32 = 0
+          i = 0
+          while i < 4 {
+            let h = hexValue(byteAt(input, p + 2 + i))
+            if h < 0 { break }
+            second = second * 16 + i32.toU32(h)
+            i = i + 1
+          }
+          if i == 4 && second >= 0xdc00 && second <= 0xdfff {
+            c = 0x10000 + (c - 0xd800) * 1024 + second - 0xdc00
+            p = p + 6
+          }
+        }
+      }
+    }
+    _ => {
+      if c < 48 || c > 55 { return EscapeResult { codePoint: -2, next: offset } }
+      c = c - 48
+      if allowUtf16 == 2 {
+        let following = byteAt(input, p)
+        if c != 0 || (following >= 48 && following <= 57) { return move malformed }
+      } else {
+        let following = byteAt(input, p)
+        if following >= 48 && following <= 55 {
+          c = c * 8 + following - 48
+          p = p + 1
+          if c < 32 {
+            let third = byteAt(input, p)
+            if third >= 48 && third <= 55 {
+              c = c * 8 + third - 48
+              p = p + 1
+            }
+          }
+        }
+      }
+    }
+  }
+  return EscapeResult { codePoint: u32.toI32(c), next: p }
+}
+
+/// Matches upstream's >= INT32_MAX boundary; disallowed overflow leaves next unchanged.
+pub fn parseDigits(input: &[u8], offset: usize, allowOverflow: bool) -> DecimalResult {
+  let mut p = offset
+  let mut value: i32 = 0
+  while p < input.length {
+    let c = byteAt(input, p)
+    if c < 48 || c > 57 { break }
+    let digit = u32.toI32(c - 48)
+    if value > 214748364 || (value == 214748364 && digit >= 7) {
+      if !allowOverflow { return DecimalResult { value: -1, next: offset } }
+      value = 2147483647
+    } else {
+      value = value * 10 + digit
+    }
+    p = p + 1
+  }
+  return DecimalResult { value: value, next: p }
+}
+
+fn decodeAt(input: &[u8], offset: usize) -> Option<Decoded> {
+  if offset >= input.length { return Option<Decoded>.none() }
+  return Utf8.decode(Slice.view<u8>(input, offset, input.length - offset))
+}
+
+/// Offset follows '<'; next follows '>'. Invalid names return None without allocation.
+/// The 128-byte upstream scratch bound reserves six encoding bytes plus a terminator
+/// before each character. Returned bytes contain neither terminator nor scope trailer.
+pub effect fn tryGroupName(input: &[u8], offset: usize) -> Option<GroupName> ! OutOfMemoryError ? &mut Allocator {
+  let mut buffer: [u8; 128] = [0; 128]
+  let mut length: usize = 0
+  let mut p = offset
+  while true {
+    if p >= input.length { return Option<GroupName>.none() }
+    let mut c = byteAt(input, p)
+    if c == 62 { break }
+    if c == 92 {
+      p = p + 1
+      if byteAt(input, p) != 117 { return Option<GroupName>.none() }
+      let escaped = parseEscape(input, p, 2)
+      if escaped.codePoint < 0 { return Option<GroupName>.none() }
+      c = i32.toU32(escaped.codePoint)
+      p = escaped.next
+    } else if c >= 128 {
+      let decoded = match move decodeAt(input, p) {
+        Option<Decoded>.Some { value } => move value
+        Option<Decoded>.None => { return Option<GroupName>.none() }
+      }
+      c = decoded.codePoint
+      p = p + decoded.length
+      if c >= 0xd800 && c <= 0xdbff {
+        match move decodeAt(input, p) {
+          Option<Decoded>.Some { value } => {
+            if value.codePoint >= 0xdc00 && value.codePoint <= 0xdfff {
+              c = 0x10000 + (c - 0xd800) * 1024 + value.codePoint - 0xdc00
+              p = p + value.length
+            }
+          }
+          Option<Decoded>.None => {}
+        }
+      }
+    } else {
+      p = p + 1
+    }
+    if c > 0x10ffff { return Option<GroupName>.none() }
+    if length == 0 {
+      if !UnicodeCase.isIdentifierStart(c) { return Option<GroupName>.none() }
+    } else {
+      if !UnicodeCase.isIdentifierContinue(c) { return Option<GroupName>.none() }
+    }
+    if length + 7 > 128 { return Option<GroupName>.none() }
+    if c < 128 {
+      buffer[length] = u32.toU8(c)
+      length = length + 1
+    } else {
+      let mut encoded: [u8; 6] = [0; 6]
+      let count = Utf8.encode(c, &mut encoded)
+      let mut i: usize = 0
+      while i < count {
+        buffer[length] = encoded[i]
+        length = length + 1
+        i = i + 1
+      }
+    }
+  }
+  if length == 0 { return Option<GroupName>.none() }
+  let mut bytes = List<u8>.make()
+  run bytes.reserveExact(length)
+  let mut i: usize = 0
+  while i < length {
+    run bytes.append(buffer[i])
+    i = i + 1
+  }
+  return Option<GroupName>.some(GroupName { bytes: move bytes, next: p + 1 })
+}
+
+pub effect fn parseGroupName(input: &[u8], offset: usize) -> GroupName ! OutOfMemoryError | RegExpSyntaxError ? &mut Allocator {
+  let result = run tryGroupName(input, offset)
+  return match move result {
+    Option<GroupName>.Some { value } => move value
+    Option<GroupName>.None => { fail RegExpSyntaxError { message: "invalid group name", offset: offset } }
+  }
+}

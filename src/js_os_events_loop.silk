@@ -1,0 +1,211 @@
+//! Source-ordered libc job pump and blocking POSIX poll integration.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.result { Result }
+import silk.i32
+import silk.i64
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_engine { Engine }
+import js_libc_services { LibcServices }
+import js_libc as libc
+import js_gc as gc
+import js_runtime as runtime
+import js_runtime_jobs as jobs
+import js_promise as promise
+import js_exceptions { JsException }
+import js_exceptions as exceptions
+import js_os_events as events
+import js_os_events { ReadWriteHandler, SignalHandler, Timer, Rejection }
+import js_os_events_platform { PollFd }
+import js_os_events_platform as platform
+import js_os_workers as workers
+import js_os_workers_transport { Pipe }
+
+pub struct UnhandledRejection { pub code: i32 }
+unsafe effect fn reportError<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader) -> () ? &mut Allocator {
+  run unsafe libc.dumpError(&mut engine, context)
+}
+unsafe effect fn callHandler<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader, function: Value) -> () ? &mut Allocator {
+  // A callback may clear itself, another descriptor or the entire timer list.
+  let retained = unsafe function.retained()
+  let called = run Effect.result(unsafe promise.call(&mut engine, context, retained, Value.Undefined, &[]))
+  let rt = unsafe runtime.contextRuntime(context)
+  unsafe gc.release(&mut engine, rt, retained)
+  match move called {
+    Result<Value, JsException>.Success { value } => {
+      if value.isException() { run unsafe reportError(&mut engine, context) }
+      unsafe gc.release(&mut engine, rt, value)
+    }
+    Result<Value, JsException>.Failure { .. } => { run unsafe reportError(&mut engine, context) }
+  }
+}
+// True means one poll turn completed, false means there are no live event sources.
+pub unsafe effect fn poll<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context) let ts = unsafe events.state(rt)
+  let mut anchor = () let data = unsafe Pointer.borrowMut(&mut anchor, ts)
+  if !data.pollingEnabled { return false }
+  let main = Pointer.isNull<Pipe>(data.recvPipe)
+  if main { platform.collect(&mut data.signals) }
+  let mut cursor = data.signalHandlers.first drop data
+  if main {
+    while let Option<*mut HeapHeader>.Some { value: node } = Pointer.nonNullMut(cursor) {
+      let handler = unsafe HeapCell.payload<SignalHandler, ()>(&anchor, node)
+      let number = handler.number let function = handler.function drop handler
+      let data = unsafe Pointer.borrowMut(&mut anchor, ts) let ready = platform.take(&mut data.signals, number) drop data
+      if ready { run unsafe callHandler(&mut engine, context, function) return true }
+      cursor = unsafe events.next(node)
+    }
+  }
+  let liveState = unsafe Pointer.borrow(&anchor, ts)
+  if liveState.readWriteHandlers.isEmpty() && liveState.timers.isEmpty() && Pointer.isNull<HeapHeader>(liveState.workerPortsFirst) { return false }
+  let hasTimers = !liveState.timers.isEmpty() cursor = liveState.timers.first drop liveState
+  let mut minDelay: i32 = -1
+  if hasTimers {
+    minDelay = 10000 let now = platform.nowMilliseconds()
+    while let Option<*mut HeapHeader>.Some { value: node } = Pointer.nonNullMut(cursor) {
+      let timer = unsafe HeapCell.payloadMut<Timer, ()>(&mut anchor, node)
+      let delay = i64.wrappingSubtract(timer.timeout, now)
+      if delay <= 0 {
+        let function = Intrinsic.replace(timer.function, Value.Undefined) drop timer
+        unsafe events.freeTimer(&mut engine, rt, node)
+        run unsafe callHandler(&mut engine, context, function)
+        unsafe gc.release(&mut engine, rt, function)
+        return true
+      }
+      if delay < i32.toI64(minDelay) { minDelay = i64.toI32(delay) }
+      drop timer cursor = unsafe events.next(node)
+    }
+  }
+  let pollSetup = unsafe Pointer.borrowMut(&mut anchor, ts) pollSetup.pollFds.clear()
+  cursor = pollSetup.readWriteHandlers.first drop pollSetup
+  while let Option<*mut HeapHeader>.Some { value: node } = Pointer.nonNullMut(cursor) {
+    let handler = unsafe HeapCell.payloadMut<ReadWriteHandler, ()>(&mut anchor, node)
+    let mut flags: i16 = 0
+    if !events.null(handler.read) { flags = flags | platform.READABLE }
+    if !events.null(handler.write) { flags = flags | platform.WRITABLE }
+    let fd = handler.fd drop handler
+    if flags != 0 {
+      let data = unsafe Pointer.borrowMut(&mut anchor, ts) let index = data.pollFds.length()
+      run data.pollFds.append(PollFd { fd: fd, events: flags, revents: 0 }) drop data
+      let handler = unsafe HeapCell.payloadMut<ReadWriteHandler, ()>(&mut anchor, node) handler.pollIndex = index
+    }
+    cursor = unsafe events.next(node)
+  }
+  let portsBeforePoll = unsafe Pointer.borrow(&anchor, ts) cursor = portsBeforePoll.workerPortsFirst drop portsBeforePoll
+  while let Option<*mut HeapHeader>.Some { value: node } = Pointer.nonNullMut(cursor) {
+    let fd = unsafe workers.portFd(node)
+    if fd >= 0 {
+      let data = unsafe Pointer.borrowMut(&mut anchor, ts) let index = data.pollFds.length()
+      run data.pollFds.append(PollFd { fd: fd, events: platform.READABLE, revents: 0 }) drop data
+      unsafe workers.portSetPollIndex(node, index)
+    }
+    cursor = unsafe workers.portNext(node)
+  }
+  let pollState = unsafe Pointer.borrowMut(&mut anchor, ts)
+  // Signal watchers alone do not keep the source loop alive. When another source
+  // is live their kernel queue closes the check-then-sleep race in source signal().
+  if main && pollState.signals.fd >= 0 { run pollState.pollFds.append(PollFd { fd: pollState.signals.fd, events: platform.READABLE, revents: 0 }) }
+  let ready = platform.poll(&mut pollState.pollFds, minDelay)
+  cursor = pollState.readWriteHandlers.first drop pollState
+  if ready <= 0 { return true }
+  // Keep source ordering: descriptors before ports, even if the signal queue woke
+  // this poll. The following turn checks pending signals before timers/descriptors.
+  while let Option<*mut HeapHeader>.Some { value: node } = Pointer.nonNullMut(cursor) {
+    let handler = unsafe HeapCell.payload<ReadWriteHandler, ()>(&anchor, node)
+    let index = handler.pollIndex let read = handler.read let write = handler.write drop handler
+    let data = unsafe Pointer.borrow(&anchor, ts) let flags = data.pollFds.asSlice()[index].revents drop data
+    if !events.null(read) && (flags & (platform.FAILED | platform.READABLE)) != 0 {
+      run unsafe callHandler(&mut engine, context, read) return true
+    }
+    if !events.null(write) && (flags & (platform.FAILED | platform.WRITABLE)) != 0 {
+      run unsafe callHandler(&mut engine, context, write) return true
+    }
+    cursor = unsafe events.next(node)
+  }
+  let portsAfterPoll = unsafe Pointer.borrow(&anchor, ts) cursor = portsAfterPoll.workerPortsFirst drop portsAfterPoll
+  while let Option<*mut HeapHeader>.Some { value: node } = Pointer.nonNullMut(cursor) {
+    if unsafe workers.portFd(node) >= 0 {
+      let index = unsafe workers.portPollIndex(node)
+      let data = unsafe Pointer.borrow(&anchor, ts) let flags = data.pollFds.asSlice()[index].revents drop data
+      if flags != 0 {
+        let memory = engine.memory
+        let handled = run Effect.result(unsafe workers.handlePostedMessage(&mut engine, memory, context, node))
+        match move handled {
+          Result<bool, JsException>.Success { value } => { if value { return true } }
+          Result<bool, JsException>.Failure { .. } => { run unsafe reportError(&mut engine, context) return true }
+        }
+      }
+    }
+    cursor = unsafe workers.portNext(node)
+  }
+  return true
+}
+// Remove before printing: JS Error stack getters or the value printer can reenter
+// user code. Captured reasons remain owned across such callbacks.
+unsafe fn takeRejection<'m>(engine: &mut Engine<'m, LibcServices>, rt: *mut HeapHeader) -> Option<Value> {
+  let mut anchor = () let data = unsafe Pointer.borrowMut(&mut anchor, unsafe events.state(rt))
+  let first = unsafe data.rejections.popFront() drop data
+  let node = match move first { Option<*mut HeapHeader>.Some { value } => value _ => { return Option<Value>.none() } }
+  let entry = unsafe HeapCell.payload<Rejection, ()>(&anchor, node)
+  let rejected = entry.promise let reason = entry.reason drop entry
+  unsafe HeapCell.destroy<Rejection>(node)
+  unsafe gc.release(&mut engine, rt, rejected)
+  return Option<Value>.some(reason)
+}
+pub unsafe effect fn checkRejections<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader) -> () ! UnhandledRejection ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context) let mut rejected = false
+  while let Option<Value>.Some { value: reason } = unsafe takeRejection(&mut engine, rt) {
+    rejected = true platform.rejectionPrefix()
+    run unsafe libc.dumpValue(&mut engine, context, reason)
+    unsafe gc.release(&mut engine, rt, reason)
+  }
+  if rejected { fail UnhandledRejection { code: 1 } }
+}
+pub unsafe effect fn eventLoop<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader) -> () ! OutOfMemoryError | UnhandledRejection ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  while true {
+    while true {
+      let job = run unsafe jobs.executePendingJob(&mut engine, rt)
+      if job.status <= 0 {
+        if job.status < 0 { run unsafe reportError(&mut engine, context) }
+        break
+      }
+    }
+    run unsafe checkRejections(&mut engine, context)
+    if !run unsafe poll(&mut engine, context) { return () }
+  }
+}
+unsafe effect fn awaitBody<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader, value: Value) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  while true {
+    let status = unsafe promise.state(value)
+    if status == promise.FULFILLED { return unsafe promise.result(value) }
+    if status == promise.REJECTED {
+      return run unsafe exceptions.throwValue<Value, Engine<'m, LibcServices>>(&mut engine, rt, unsafe promise.result(value))
+    }
+    if status != promise.PENDING { return unsafe value.retained() }
+    let job = run unsafe jobs.executePendingJob(&mut engine, rt)
+    if job.status < 0 { run unsafe reportError(&mut engine, context) }
+    if job.status == 0 {
+      if let Option<Value>.Some { value: reason } = unsafe takeRejection(&mut engine, rt) {
+        // Await's caller owns error reporting. Do not print then throw a second copy.
+        return run unsafe exceptions.throwValue<Value, Engine<'m, LibcServices>>(&mut engine, rt, reason)
+      }
+      let polled = run unsafe poll(&mut engine, context)
+      // As in js_std_await, a pending promise without an event source remains
+      // pending. Do not synthesize a fulfilled value or an unrelated rejection.
+    }
+  }
+}
+// Consumes value on every success/failure path, unlike the borrowed await body.
+pub unsafe effect fn awaitValue<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader, value: Value) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  let awaited = run Effect.result(unsafe awaitBody(&mut engine, context, value))
+  unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), value)
+  return match move awaited {
+    Result<Value, OutOfMemoryError | JsException>.Success { value: result } => result
+    Result<Value, OutOfMemoryError | JsException>.Failure { error } => { fail move error }
+  }
+}

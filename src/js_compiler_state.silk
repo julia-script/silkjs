@@ -1,0 +1,416 @@
+//! State helpers from quickjs.c:24444-24899,32848-33007,33480-33546.
+//! Raw entry points require the live exclusively owned compiler tree and runtime;
+//! no payload borrow may survive a call that dispatches HeapHooks. Context/module/
+//! sourceCache are borrowed for the parse lifetime. Explicit destroyFunction is
+//! required on success and failure; dropping native Lists alone cannot release JS.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.i32
+import silk.u16
+import silk.usize
+import silk.pointer { Pointer }
+import silk.list { List }
+import byte_buffer { ByteBuffer }
+import js_value { Value }
+import js_atoms { AtomTable }
+import js_atom_data as atoms
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_core_types { RuntimeState, ContextState, ClosureVar, ClosureKind, VariableKind, JS_MODE_STRICT }
+import js_gc { HeapHooks }
+import js_gc
+import js_compiler_emit { freeBytecodeAtoms }
+import js_compiler_types {
+  FunctionDef, CompilerVar, GlobalVar, BlockEnv, VarScope, VariableDefinition,
+  CompilerError, CompilerErrorKind, MAX_LOCAL_VAR_COUNT, ARGUMENT_VAR_OFFSET,
+  GLOBAL_VAR_OFFSET, ARG_SCOPE_INDEX, reserveArray, JumpSlot, LabelSlot
+}
+import js_debug_positions { SourcePositionCache, PcSourcePosition, encodePc2Line }
+import js_string_types { StringLengthError }
+
+fn present(value: ?*mut HeapHeader) -> *mut HeapHeader {
+  return unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(value)
+}
+// Filename is a borrowed atom from this runtime. Source offsets are relative to
+// the immutable full parse input, not to the function's extracted source bytes.
+pub unsafe effect fn newFunction(context: *mut HeapHeader, parent: ?*mut HeapHeader,
+    isEval: bool, isFuncExpr: bool, filename: u32, sourcePosition: u32,
+    cache: ?*mut SourcePositionCache) -> *mut HeapHeader ! OutOfMemoryError ? &mut Allocator {
+  let anchor = ()
+  let ctx = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  let runtime = ctx.runtime
+  drop ctx
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let strip = state.stripFlags
+  drop state
+  let mut fd = FunctionDef.make(context, runtime, sourcePosition)
+  fd.parent = parent fd.isEval = isEval fd.isFuncExpr = isFuncExpr
+  fd.stripDebug = (strip & 2) != 0 fd.stripSource = (strip & 3) != 0 fd.sourceCache = cache
+  if !Pointer.isNull<HeapHeader>(parent) {
+    let outer = unsafe HeapCell.payload<FunctionDef, ()>(&anchor, present(parent))
+    fd.jsMode = outer.jsMode fd.parentScopeLevel = outer.scopeLevel
+    fd.previousSibling = outer.lastChild
+  }
+  // Allocate before retaining any JS edge so allocator failure has no leaked atom.
+  let cell = run HeapCell.allocate(HeapKind.Auxiliary, move fd)
+  let mut writeAnchor = ()
+  let runtimeState = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut writeAnchor, runtime)
+  let ownedFilename = runtimeState.atoms.duplicate(filename)
+  drop runtimeState
+  let payload = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut writeAnchor, cell)
+  payload.filename = ownedFilename
+  let previous = payload.previousSibling
+  drop payload
+  if !Pointer.isNull<HeapHeader>(previous) {
+    let sibling = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut writeAnchor, present(previous))
+    sibling.nextSibling = cell
+  }
+  if !Pointer.isNull<HeapHeader>(parent) {
+    let outer = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut writeAnchor, present(parent))
+    if Pointer.isNull<HeapHeader>(outer.firstChild) { outer.firstChild = cell }
+    outer.lastChild = cell
+  }
+  return cell
+}
+pub unsafe fn destroyFunction<H: HeapHooks>(hooks: &mut H, cell: *mut HeapHeader) -> () {
+  let mut anchor = ()
+  while true {
+    let fd = unsafe HeapCell.payload<FunctionDef, ()>(&anchor, cell)
+    let child = fd.firstChild
+    drop fd
+    if Pointer.isNull<HeapHeader>(child) { break }
+    unsafe destroyFunction(&mut hooks, present(child))
+  }
+  // Source teardown order: child definitions, bytecode atoms/native patch data,
+  // then constants in increasing pool order (finalizers can observe this order).
+  unsafe {
+    let buffers = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
+    let mut runtimeAnchor = ()
+    let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, buffers.runtime)
+    freeBytecodeAtoms(&mut rt.atoms, buffers.bytecode.asSlice(), buffers.useShortOpcodes)
+    buffers.bytecode = ByteBuffer.make()
+    buffers.jumps = List<JumpSlot>.make()
+    buffers.labels = List<LabelSlot>.make()
+    buffers.lineNumbers = List<PcSourcePosition>.make()
+  }
+  // Detach each value BEFORE release: reentrant finalization sees no owned edge.
+  let mut constantIndex: usize = 0
+  while true {
+    let fd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
+    let count = fd.constants.length()
+    let runtime = fd.runtime
+    if constantIndex == count { break }
+    let value = fd.constants.get(constantIndex)
+    fd.constants.set(constantIndex, Value.Undefined)
+    constantIndex = constantIndex + 1
+    drop fd
+    unsafe js_gc.release(&mut hooks, runtime, value)
+  }
+  let fd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
+  let mut runtimeAnchor = ()
+  let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, fd.runtime)
+  fd.constants = List<Value>.make()
+  rt.atoms.release(fd.functionName)
+  let mut i: usize = 0
+  while i < fd.vars.length() { rt.atoms.release(fd.vars.get(i).name) i = i + 1 }
+  i = 0 while i < fd.args.length() { rt.atoms.release(fd.args.get(i).name) i = i + 1 }
+  i = 0 while i < fd.globalVars.length() { rt.atoms.release(fd.globalVars.get(i).name) i = i + 1 }
+  i = 0 while i < fd.closureVars.length() { rt.atoms.release(fd.closureVars.get(i).name) i = i + 1 }
+  i = 0 while i < fd.blocks.length() { rt.atoms.release(fd.blocks.get(i).labelName) i = i + 1 }
+  rt.atoms.release(fd.filename)
+  drop rt
+  let previous = fd.previousSibling let next = fd.nextSibling let parent = fd.parent
+  drop fd
+  if !Pointer.isNull<HeapHeader>(previous) {
+    let previousFd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, present(previous))
+    previousFd.nextSibling = next
+  }
+  if !Pointer.isNull<HeapHeader>(next) {
+    let nextFd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, present(next))
+    nextFd.previousSibling = previous
+  }
+  if !Pointer.isNull<HeapHeader>(parent) {
+    let outer = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, present(parent))
+    if Pointer.address<HeapHeader>(outer.firstChild) == Pointer.address<HeapHeader>(cell) { outer.firstChild = next }
+    if Pointer.address<HeapHeader>(outer.lastChild) == Pointer.address<HeapHeader>(cell) { outer.lastChild = previous }
+  }
+  unsafe HeapCell.destroy<FunctionDef>(cell)
+}
+pub fn findArg(fd: &FunctionDef, name: u32) -> i32 {
+  let mut i = fd.args.length()
+  while i > 0 { i = i - 1 if fd.args.get(i).name == name { return usize.toI32(i) | ARGUMENT_VAR_OFFSET } }
+  return -1
+}
+pub fn findVar(fd: &FunctionDef, name: u32) -> i32 {
+  let mut i = fd.vars.length()
+  while i > 0 { i = i - 1 let v = fd.vars.get(i) if v.name == name && v.scopeLevel == 0 { return usize.toI32(i) } }
+  return findArg(fd, name)
+}
+pub fn findVarInScope(fd: &FunctionDef, name: u32, scope: i32) -> i32 {
+  let mut index = fd.scopes.get(i32.toUsize(scope)).first
+  while index >= 0 {
+    let v = fd.vars.get(i32.toUsize(index))
+    if v.scopeLevel != scope { break }
+    if v.name == name { return index }
+    index = v.scopeNext
+  }
+  return -1
+}
+pub fn isChildScope(fd: &FunctionDef, scope: i32, parent: i32) -> bool {
+  let mut current = scope
+  while current >= 0 { if current == parent { return true } current = fd.scopes.get(i32.toUsize(current)).parent }
+  return false
+}
+pub fn findVarInChildScope(fd: &FunctionDef, name: u32, scope: i32) -> i32 {
+  let mut i: usize = 0
+  while i < fd.vars.length() {
+    let v = fd.vars.get(i)
+    if v.name == name && v.scopeLevel == 0 && isChildScope(fd, v.scopeNext, scope) { return usize.toI32(i) }
+    i = i + 1
+  }
+  return -1
+}
+pub fn findGlobalVar(fd: &FunctionDef, name: u32) -> i32 {
+  let mut i: usize = 0
+  while i < fd.globalVars.length() { if fd.globalVars.get(i).name == name { return usize.toI32(i) } i = i + 1 }
+  return -1
+}
+pub fn findLexicalGlobalVar(fd: &FunctionDef, name: u32) -> i32 {
+  let index = findGlobalVar(fd, name)
+  if index >= 0 && fd.globalVars.get(i32.toUsize(index)).isLexical { return index }
+  return -1
+}
+pub fn findLexicalDeclaration(fd: &FunctionDef, name: u32, first: i32, checkCatch: bool) -> i32 {
+  let mut index = first
+  while index >= 0 {
+    let v = fd.vars.get(i32.toUsize(index))
+    if v.name == name && (v.isLexical || (v.kind == VariableKind.Catch && checkCatch)) { return index }
+    index = v.scopeNext
+  }
+  if fd.isEval && fd.evalType == 0 && findLexicalGlobalVar(fd, name) >= 0 { return GLOBAL_VAR_OFFSET }
+  return -1
+}
+pub effect fn addVar(fd: &mut FunctionDef, table: &mut AtomTable, name: u32) -> i32
+  ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  if fd.vars.length() >= MAX_LOCAL_VAR_COUNT {
+    let error = run CompilerError.make(&table.*, CompilerErrorKind.TooManyLocals, name) fail move error
+  }
+  run reserveArray(&mut fd.vars)
+  let index = usize.toI32(fd.vars.length())
+  run fd.vars.append(CompilerVar.make(table.duplicate(name)))
+  return index
+}
+pub effect fn addArg(fd: &mut FunctionDef, table: &mut AtomTable, name: u32) -> i32
+  ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  if fd.args.length() >= MAX_LOCAL_VAR_COUNT {
+    let error = run CompilerError.make(&table.*, CompilerErrorKind.TooManyArguments, name) fail move error
+  }
+  run reserveArray(&mut fd.args)
+  let index = usize.toI32(fd.args.length())
+  run fd.args.append(CompilerVar.make(table.duplicate(name)))
+  return index
+}
+pub effect fn addScopeVar(fd: &mut FunctionDef, table: &mut AtomTable, name: u32, kind: VariableKind) -> i32
+  ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  let index = run addVar(&mut fd, &mut table, name)
+  let mut v = fd.vars.get(i32.toUsize(index))
+  v.kind = kind v.scopeLevel = fd.scopeLevel v.scopeNext = fd.scopeFirst
+  fd.vars.set(i32.toUsize(index), v)
+  let mut scope = fd.scopes.get(i32.toUsize(fd.scopeLevel))
+  scope.first = index fd.scopes.set(i32.toUsize(fd.scopeLevel), scope) fd.scopeFirst = index
+  return index
+}
+pub effect fn addFunctionVar(fd: &mut FunctionDef, table: &mut AtomTable, name: u32) -> i32
+  ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  if fd.functionVarIndex >= 0 { return fd.functionVarIndex }
+  let index = run addVar(&mut fd, &mut table, name)
+  fd.functionVarIndex = index
+  let mut v = fd.vars.get(i32.toUsize(index)) v.kind = VariableKind.FunctionName
+  if (fd.jsMode & JS_MODE_STRICT) != 0 { v.isConst = true }
+  fd.vars.set(i32.toUsize(index), v) return index
+}
+pub effect fn addArgumentsVar(fd: &mut FunctionDef, table: &mut AtomTable) -> i32
+  ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  if fd.argumentsVarIndex < 0 { fd.argumentsVarIndex = run addVar(&mut fd, &mut table, atoms.JS_ATOM_arguments) }
+  return fd.argumentsVarIndex
+}
+pub effect fn addArgumentsArg(fd: &mut FunctionDef, table: &mut AtomTable) -> ()
+  ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  if fd.argumentsArgIndex < 0 && findVarInScope(&fd.*, atoms.JS_ATOM_arguments, ARG_SCOPE_INDEX) < 0 {
+    let index = run addVar(&mut fd, &mut table, atoms.JS_ATOM_arguments)
+    let mut v = fd.vars.get(i32.toUsize(index))
+    let mut scope = fd.scopes.get(1)
+    v.scopeNext = scope.first scope.first = index v.scopeLevel = ARG_SCOPE_INDEX v.isLexical = true
+    fd.vars.set(i32.toUsize(index), v) fd.scopes.set(1, scope) fd.argumentsArgIndex = index
+  }
+}
+pub effect fn addGlobalVar(fd: &mut FunctionDef, table: &mut AtomTable, name: u32) -> i32
+  ! OutOfMemoryError ? &mut Allocator {
+  run reserveArray(&mut fd.globalVars)
+  let index = usize.toI32(fd.globalVars.length())
+  run fd.globalVars.append(GlobalVar { constantPoolIndex: -1, forceInit: false,
+    isLexical: false, isConst: false, scopeLevel: fd.scopeLevel, name: table.duplicate(name) })
+  return index
+}
+pub effect fn defineVar(fd: &mut FunctionDef, table: &mut AtomTable, name: u32, definition: VariableDefinition) -> i32
+  ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  if definition == VariableDefinition.With { return run addScopeVar(&mut fd, &mut table, name, VariableKind.Normal) }
+  if definition == VariableDefinition.Catch { return run addScopeVar(&mut fd, &mut table, name, VariableKind.Catch) }
+  if definition == VariableDefinition.Var {
+    if findLexicalDeclaration(&fd.*, name, fd.scopeFirst, false) >= 0 {
+      let error = run CompilerError.make(&table.*, CompilerErrorKind.LexicalRedefinition, name) fail move error
+    }
+    if fd.isGlobalVar {
+      let previous = findGlobalVar(&fd.*, name)
+      if previous >= 0 {
+        let global = fd.globalVars.get(i32.toUsize(previous))
+        if global.isLexical && global.scopeLevel == fd.scopeLevel && fd.evalType == 1 {
+          let error = run CompilerError.make(&table.*, CompilerErrorKind.LexicalRedefinition, name) fail move error
+        }
+      }
+      let added = run addGlobalVar(&mut fd, &mut table, name)
+      return GLOBAL_VAR_OFFSET
+    }
+    let found = findVar(&fd.*, name)
+    if found >= 0 { return found }
+    let index = run addVar(&mut fd, &mut table, name)
+    if name == atoms.JS_ATOM_arguments && fd.hasArgumentsBinding { fd.argumentsVarIndex = index }
+    let mut v = fd.vars.get(i32.toUsize(index)) v.scopeNext = fd.scopeLevel
+    fd.vars.set(i32.toUsize(index), v) return index
+  }
+  let previous = findLexicalDeclaration(&fd.*, name, fd.scopeFirst, true)
+  if previous >= 0 {
+    let mut conflict = false
+    if previous < GLOBAL_VAR_OFFSET {
+      let v = fd.vars.get(i32.toUsize(previous))
+      if v.scopeLevel == fd.scopeLevel {
+        conflict = !((fd.jsMode & JS_MODE_STRICT) == 0 && definition == VariableDefinition.FunctionDeclaration
+          && v.kind == VariableKind.FunctionDeclaration)
+      } else if v.kind == VariableKind.Catch && v.scopeLevel + 2 == fd.scopeLevel { conflict = true }
+    } else { conflict = fd.scopeLevel == fd.bodyScope }
+    if conflict {
+      let error = run CompilerError.make(&table.*, CompilerErrorKind.LexicalRedefinition, name) fail move error
+    }
+  }
+  let functionDecl = definition == VariableDefinition.FunctionDeclaration || definition == VariableDefinition.NewFunctionDeclaration
+  if !functionDecl && fd.scopeLevel == fd.bodyScope && findArg(&fd.*, name) >= 0 {
+    let error = run CompilerError.make(&table.*, CompilerErrorKind.ParameterRedefinition, name) fail move error
+  }
+  if findVarInChildScope(&fd.*, name, fd.scopeLevel) >= 0 {
+    let error = run CompilerError.make(&table.*, CompilerErrorKind.VariableRedefinition, name) fail move error
+  }
+  if fd.isGlobalVar {
+    let globalIndex = findGlobalVar(&fd.*, name)
+    if globalIndex >= 0 && isChildScope(&fd.*, fd.globalVars.get(i32.toUsize(globalIndex)).scopeLevel, fd.scopeLevel) {
+      let error = run CompilerError.make(&table.*, CompilerErrorKind.GlobalRedefinition, name) fail move error
+    }
+  }
+  if fd.isEval && (fd.evalType == 0 || fd.evalType == 1) && fd.scopeLevel == fd.bodyScope && definition != VariableDefinition.Using {
+    let index = run addGlobalVar(&mut fd, &mut table, name)
+    let mut global = fd.globalVars.get(i32.toUsize(index))
+    global.isLexical = true global.isConst = definition == VariableDefinition.Const
+    fd.globalVars.set(i32.toUsize(index), global) return GLOBAL_VAR_OFFSET
+  }
+  let mut kind = VariableKind.Normal
+  if definition == VariableDefinition.FunctionDeclaration { kind = VariableKind.FunctionDeclaration }
+  else if definition == VariableDefinition.NewFunctionDeclaration { kind = VariableKind.NewFunctionDeclaration }
+  else if definition == VariableDefinition.Using { kind = VariableKind.Using }
+  let index = run addScopeVar(&mut fd, &mut table, name, kind)
+  let mut v = fd.vars.get(i32.toUsize(index)) v.isLexical = true
+  v.isConst = definition == VariableDefinition.Const || definition == VariableDefinition.Using
+  fd.vars.set(i32.toUsize(index), v) return index
+}
+pub effect fn addPrivateClassField(fd: &mut FunctionDef, table: &mut AtomTable, name: u32,
+    kind: VariableKind, isStatic: bool) -> i32 ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  let index = run addScopeVar(&mut fd, &mut table, name, kind)
+  let mut v = fd.vars.get(i32.toUsize(index)) v.isLexical = true v.isConst = true v.isStaticPrivate = isStatic
+  fd.vars.set(i32.toUsize(index), v) return index
+}
+pub effect fn addVarThis(fd: &mut FunctionDef, table: &mut AtomTable) -> i32
+  ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  let index = run addVar(&mut fd, &mut table, atoms.JS_ATOM_this)
+  if fd.isDerivedClassConstructor {
+    let mut v = fd.vars.get(i32.toUsize(index)) v.isLexical = true fd.vars.set(i32.toUsize(index), v)
+  }
+  return index
+}
+pub effect fn addClosureVar(fd: &mut FunctionDef, table: &mut AtomTable, kind: ClosureKind,
+    index: i32, name: u32, isConst: bool, isLexical: bool, variableKind: VariableKind) -> i32
+  ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  if fd.closureVars.length() >= MAX_LOCAL_VAR_COUNT {
+    let error = run CompilerError.make(&table.*, CompilerErrorKind.TooManyClosures, name) fail move error
+  }
+  run reserveArray(&mut fd.closureVars)
+  let result = usize.toI32(fd.closureVars.length())
+  run fd.closureVars.append(ClosureVar { kind: kind, isLexical: isLexical, isConst: isConst,
+    variableKind: variableKind, variableIndex: i32.toU16(index), name: table.duplicate(name) })
+  return result
+}
+pub fn findClosureVar(fd: &FunctionDef, name: u32) -> i32 {
+  let mut i: usize = 0
+  while i < fd.closureVars.length() { if fd.closureVars.get(i).name == name { return usize.toI32(i) } i = i + 1 }
+  return -1
+}
+// ancestor MUST be a strict ancestor of cell; all references are borrowed.
+pub unsafe effect fn getClosureVar(cell: *mut HeapHeader, ancestor: *mut HeapHeader,
+    kind: ClosureKind, index: i32, name: u32, isConst: bool, isLexical: bool, variableKind: VariableKind) -> i32
+  ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  let mut anchor = ()
+  let view = unsafe HeapCell.payload<FunctionDef, ()>(&anchor, cell)
+  let parent = present(view.parent) let runtime = view.runtime drop view
+  let mut captureKind = kind let mut captureIndex = index
+  if Pointer.address<HeapHeader>(parent) != Pointer.address<HeapHeader>(ancestor) {
+    captureIndex = run unsafe getClosureVar(parent, ancestor, kind, index, name, isConst, isLexical, variableKind)
+    if kind != ClosureKind.GlobalReference { captureKind = ClosureKind.Reference }
+  }
+  let fd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
+  let mut i: usize = 0
+  while i < fd.closureVars.length() {
+    let v = fd.closureVars.get(i)
+    if u16.toI32(v.variableIndex) == captureIndex && v.kind == captureKind { return usize.toI32(i) }
+    i = i + 1
+  }
+  let mut runtimeAnchor = ()
+  let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, runtime)
+  return run addClosureVar(&mut fd, &mut rt.atoms, captureKind, captureIndex, name, isConst, isLexical, variableKind)
+}
+// Unlike the source's stack addresses these indices remain valid across growth.
+// labelName is borrowed on entry and owned by the block until pop/destroy.
+pub effect fn pushBlock(fd: &mut FunctionDef, table: &mut AtomTable, block: BlockEnv) -> i32
+  ! OutOfMemoryError ? &mut Allocator {
+  run reserveArray(&mut fd.blocks)
+  let mut stored = block stored.previous = fd.topBreak stored.labelName = table.duplicate(block.labelName)
+  let index = usize.toI32(fd.blocks.length())
+  run fd.blocks.append(stored) fd.topBreak = index return index
+}
+pub fn popBlock(fd: &mut FunctionDef, table: &mut AtomTable) -> () {
+  let index = i32.toUsize(fd.topBreak)
+  if index + 1 != fd.blocks.length() { Intrinsic.trap("QuickJS invariant violated") }
+  let block = fd.blocks.remove(index) fd.topBreak = block.previous table.release(block.labelName)
+}
+// Bounded pc2line collector used by resolution. Allocation is done up front;
+// addLineNumber mirrors source suppression rather than growing beyond capacity.
+pub effect fn initializeLineNumbers(fd: &mut FunctionDef, capacity: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  run fd.lineNumbers.reserveExact(capacity)
+  fd.lineNumbers.clear() fd.lineNumberCapacity = capacity fd.lineNumberLast = fd.sourcePosition fd.lineNumberLastPc = 0
+}
+pub effect fn addLineNumber(fd: &mut FunctionDef, pc: u32, sourcePosition: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+  if fd.lineNumbers.length() >= fd.lineNumberCapacity || pc < fd.lineNumberLastPc || sourcePosition == fd.lineNumberLast { return () }
+  run fd.lineNumbers.append(PcSourcePosition { pc: pc, sourcePosition: sourcePosition })
+  fd.lineNumberLast = sourcePosition fd.lineNumberLastPc = pc
+}
+pub effect fn computePc2Line(fd: &mut FunctionDef, fullSource: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  if fd.stripDebug { fd.pc2line.clear() return () }
+  fd.pc2line = run encodePc2Line(fullSource, fd.sourcePosition, fd.lineNumbers.asSlice())
+}
+
+// The argument/local slot is selected by index, never by an interior List pointer.
+pub fn captureVar(fd: &mut FunctionDef, index: i32, argument: bool) -> () {
+  let mut v = CompilerVar.make(0)
+  if argument { v = fd.args.get(i32.toUsize(index)) }
+  else { v = fd.vars.get(i32.toUsize(index)) }
+  if !v.isCaptured {
+    v.isCaptured = true v.varRefIndex = i32.toU16(fd.varRefCount)
+    fd.varRefCount = fd.varRefCount + 1
+    if argument { fd.args.set(i32.toUsize(index), v) }
+    else { fd.vars.set(i32.toUsize(index), v) }
+  }
+}

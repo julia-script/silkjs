@@ -1,0 +1,320 @@
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.result { Result }
+import silk.testing { Testing, AssertionError }
+import silk.usize
+import silk.u32
+import js_heap { HeapCell, HeapHeader }
+import js_core_types { RuntimeState, FunctionBytecode, ModuleDef, ObjectData, ShapeData,
+  PropertySlot, JS_PROP_ENUMERABLE }
+import js_compiler_types { FunctionDef, CompilerError }
+import js_compiler_state as state
+import js_compiler_finish { createFunction }
+import js_debug_positions { SourcePositionCache }
+import js_parser_core { Parser, ParserStackOverflow }
+import js_parser_program { parseProgram }
+import js_exceptions { JsException }
+import js_parser_diagnostics { SyntaxError }
+import js_parser_program_test_support as fixture
+import js_parser_program_test_support { Hooks, trap, reference }
+import js_array_storage_test_support { FaultAllocator }
+import js_runtime as runtime
+import js_gc as gc
+import js_tokens { LexError }
+import js_tokens as tok
+import js_bigint { BigIntError }
+import js_bytecode { BytecodeError }
+import js_string_types { StringOwner, StringLengthError }
+import js_strings { Strings, StringBuilder }
+import js_value { Value }
+import js_atom_data as atoms
+import runtime_memory { RuntimeAllocator }
+import native_stack { currentFrameAddress }
+
+fn present(value: ?*mut HeapHeader) -> *mut HeapHeader {
+  return unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(value)
+}
+effect fn snapshot(value: Value) -> StringOwner
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let mut builder = StringBuilder.make()
+  run builder.append(value)
+  return StringOwner.adopt(run builder.finish())
+}
+effect fn grammarCase(source: &[u8], accepted: bool) -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make(false)
+  let ctx = run unsafe fixture.context(&mut hooks, &observer, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut cache = SourcePositionCache.make()
+  let root = run unsafe fixture.root(ctx, false, false, false, Pointer.fromMutRef<SourcePositionCache>(&mut cache)) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut parser = run unsafe Parser.make(source, root, false, true) |> Effect.provideMut<Allocator>(&mut memory)
+  let result = run Effect.result(unsafe parseProgram(&mut parser, &mut hooks, &observer)) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut success = false
+  match move result {
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException>.Success { .. } => { success = true }
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException>.Failure { error } => {
+      match move error {
+        SyntaxError e => {
+          drop e
+        }
+        OutOfMemoryError e => { fail move e } StringLengthError e => { fail move e }
+        BigIntError e => { fail move e } LexError e => { fail move e }
+        ParserStackOverflow e => { fail move e } CompilerError e => { fail move e } JsException e => { fail move e }
+      }
+    }
+  }
+  run Testing.expect(success == accepted, "the grammar's static restriction must reject for syntax, not lexer/allocator/host failure")
+  run Testing.expect(Pointer.address<HeapHeader>(parser.currentFunction) == Pointer.address<HeapHeader>(root), "nested function/class parsing restores the owning program on success and failure")
+  if success { run Testing.expect(parser.token.kind == tok.TOK_EOF, "successful program parsing consumes all source elements") }
+  drop parser
+  unsafe state.destroyFunction(&mut hooks, root)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx) run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observer.stats().usedBytes == 0 && observer.stats().allocationCount == 0,
+    "static rejection destroys all token, child-function, atom and literal owners")
+}
+
+test effect fn programStaticRestrictionsDistinguishClassAndFunctionContexts() -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException | AssertionError<'static> {
+  run grammarCase(b"class C{static{let x=1;this.x=x} #x=1; get #p(){return this.#x} set #p(v){this.#x=v}}", true)
+  run grammarCase(b"class C{static{return 1}}", false)
+  run grammarCase(b"class C{static{await x}}", false)
+  run grammarCase(b"class C{static{arguments}}", false)
+  run grammarCase(b"class C{#x;#x;}", false)
+  run grammarCase(b"class C{get x(a){}}", false)
+  run grammarCase(b"class C{set x(){}}", false)
+  run grammarCase(b"class C{constructor(){super()}}", false)
+  run grammarCase(b"class B{};class C extends B{constructor(){super()}}", true)
+  run grammarCase(b"function f(a=1){return a} function g(a){'use strict';return a}", true)
+  run grammarCase(b"function f(a=1){'use strict';return a}", false)
+  run grammarCase(b"async function f(a=await x){}", false)
+  run grammarCase(b"function* f(a=yield 1){}", false)
+  run grammarCase(b"let x; x??=o?.m?.(); x&&=1;", true)
+  run grammarCase(b"o?.x=1;", false)
+  run grammarCase(b"a??b||c;", false)
+}
+
+test effect fn programNestedFailureRestoresRootModeAndRetainsDiagnosticPastTeardown() -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make(false)
+  let ctx = run unsafe fixture.context(&mut hooks, &observer, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut cache = SourcePositionCache.make()
+  let root = run unsafe fixture.root(ctx, false, false, false, Pointer.fromMutRef<SourcePositionCache>(&mut cache)) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut parser = run unsafe Parser.make(b"function outer(a='owned'){return class C{#field='held';static{return 1}}}", root, false, true) |> Effect.provideMut<Allocator>(&mut memory)
+  let result = run Effect.result(unsafe parseProgram(&mut parser, &mut hooks, &observer)) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut retained = Option<SyntaxError>.none()
+  match move result {
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException>.Success { .. } => trap()
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException>.Failure { error } => {
+      match move error {
+        SyntaxError e => { retained = Option<SyntaxError>.some(move e) }
+        OutOfMemoryError e => { fail move e } StringLengthError e => { fail move e }
+        BigIntError e => { fail move e } LexError e => { fail move e }
+        ParserStackOverflow e => { fail move e } CompilerError e => { fail move e } JsException e => { fail move e }
+      }
+    }
+  }
+  let diagnostic = match move retained { Option<SyntaxError>.Some { value } => move value _ => trap() }
+  let messageSnapshot = run snapshot(diagnostic.message.get()) |> Effect.provideMut<Allocator>(&mut memory)
+  let filenameSnapshot = run snapshot(diagnostic.filename.get()) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(Pointer.address<HeapHeader>(parser.currentFunction) == Pointer.address<HeapHeader>(root), "failure inside class static initialization restores every nested function cursor")
+  let anchor = () let fd = unsafe HeapCell.payload<FunctionDef, ()>(&anchor, root)
+  run Testing.expect(fd.jsMode == 0, "class strict mode must not escape through a failed nested body")
+  drop fd drop parser
+  unsafe state.destroyFunction(&mut hooks, root)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx) run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(Strings.equal(diagnostic.message.get(), messageSnapshot.get()) && diagnostic.location.line == 1 && diagnostic.location.column > 1,
+    "syntax diagnostics retain their complete original message and coordinates after failed tree destruction")
+  run Testing.expect(Strings.equal(diagnostic.filename.get(), filenameSnapshot.get()), "the retained diagnostic preserves its complete filename after atom-table teardown")
+  drop diagnostic drop messageSnapshot drop filenameSnapshot
+  run Testing.expect(observer.stats().usedBytes == 0 && observer.stats().allocationCount == 0,
+    "dropping the independent diagnostic releases the last failure-path allocations")
+}
+
+effect fn attributeCase(source: &[u8], reject: bool, expectedCalls: usize) -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make(reject)
+  let ctx = run unsafe fixture.context(&mut hooks, &observer, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut marker: u8 = 90
+  unsafe fixture.registerValidator(rt, Pointer.fromMutRef<u8>(&mut marker))
+  let mut cache = SourcePositionCache.make()
+  let root = run unsafe fixture.root(ctx, true, false, false, Pointer.fromMutRef<SourcePositionCache>(&mut cache)) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut parser = run unsafe Parser.make(source, root, true, false) |> Effect.provideMut<Allocator>(&mut memory)
+  let result = run Effect.result(unsafe parseProgram(&mut parser, &mut hooks, &observer)) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hostRejected = false
+  match move result {
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException>.Success { .. } => ()
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException>.Failure { error } => {
+      match move error {
+        JsException e => { hostRejected = true }
+        OutOfMemoryError e => { fail move e } StringLengthError e => { fail move e }
+        BigIntError e => { fail move e } LexError e => { fail move e } SyntaxError e => { fail move e }
+        ParserStackOverflow e => { fail move e } CompilerError e => { fail move e }
+      }
+    }
+  }
+  run Testing.expect(hooks.calls == expectedCalls && hooks.dispatched && hooks.nullPrototype && hooks.validStrings,
+    "registered validator observes real null-prototype own string attributes and its opaque registration")
+  run Testing.expect(hostRejected == (reject && expectedCalls != 0), "only a dispatched rejecting host raises the pending JavaScript exception")
+  if hostRejected {
+    run Testing.expect(parser.token.kind == 125 && source[parser.token.start] == 125 && parser.lexer.offset == parser.token.start + 1,
+      "attribute validation runs before consuming the closing brace or the next declaration")
+    let anchor = () let data = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+    run Testing.expect(match data.currentException { Value.Int { value } => value == 90210 _ => false },
+      "parser propagates the host's installed exception without replacing it with syntax failure")
+  } else { run Testing.expect(parser.token.kind == tok.TOK_EOF, "accepted or empty attributes leave the parser able to finish the module") }
+  let anchor = () let fd = unsafe HeapCell.payload<FunctionDef, ()>(&anchor, root)
+  let module = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, present(fd.module))
+  run Testing.expect(module.requestedModules.length() == 1, "the parsed module owns its dependency even when host validation rejects")
+  let attributes = module.requestedModules.asSlice()[0].attributes
+  if expectedCalls == 0 {
+    run Testing.expect(attributes.tag() == Value.Undefined.tag(), "empty with clauses never allocate an attributes object")
+  } else {
+    let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(attributes))
+    let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, object.shape)
+    run Testing.expect(shape.properties.length() == 1, "one committed attribute remains owned even under host rejection")
+    let data = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+    let key = StringOwner.adopt(run data.atoms.toValue(shape.properties.get(0).atom, true) |> Effect.provideMut<Allocator>(&mut memory))
+    run Testing.expect(Strings.length(key.get()) == 4 && Strings.codeUnit(key.get(), 0) == 116 &&
+      Strings.codeUnit(key.get(), 1) == 121 && Strings.codeUnit(key.get(), 2) == 112 && Strings.codeUnit(key.get(), 3) == 101,
+      "the committed key is the parsed type name, not a context-specific atom number")
+  }
+  drop module drop fd drop parser
+  unsafe state.destroyFunction(&mut hooks, root)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx) run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observer.stats().usedBytes == 0 && observer.stats().allocationCount == 0,
+    "module list, attributes, parser tokens and pending host exception unwind together")
+}
+
+test effect fn programAttributeValidationPreservesClosingCursorAndSuppressesEmptyWith() -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException | AssertionError<'static> {
+  run attributeCase(b"import data from 'm' with {type:'json'}; export {data};", false, 1)
+  run attributeCase(b"import data from 'm' with {type:'json'}; let unreachable=1;", true, 1)
+  run attributeCase(b"import 'm' with {};", true, 0)
+}
+
+test effect fn programTaggedTemplateConstantsAreSealedOwnedArraysNotLiteralStandins() -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make(false)
+  let ctx = run unsafe fixture.context(&mut hooks, &observer, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut cache = SourcePositionCache.make()
+  let root = run unsafe fixture.root(ctx, false, false, false, Pointer.fromMutRef<SourcePositionCache>(&mut cache)) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut parser = run unsafe Parser.make(b"tag`cooked\\n${value}\\unicode`;", root, false, true) |> Effect.provideMut<Allocator>(&mut memory)
+  run unsafe parseProgram(&mut parser, &mut hooks, &observer) |> Effect.provideMut<Allocator>(&mut memory)
+  let anchor = () let fd = unsafe HeapCell.payload<FunctionDef, ()>(&anchor, root)
+  let cooked = fd.constants.get(0)
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(cooked))
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, object.shape)
+  run Testing.expect(!object.extensible && !object.fastArray && !Pointer.isNull<HeapHeader>(shape.prototype),
+    "tagged cooked storage is a real sealed slow array with Array.prototype")
+  let mut raw = Value.Undefined let mut sawCooked = false let mut sawInvalidEscape = false
+  let mut index: usize = 0
+  while index < shape.properties.length() {
+    let property = shape.properties.get(index)
+    let item = match object.properties.get(index) { PropertySlot.Value { value } => value _ => trap() }
+    if property.atom == atoms.JS_ATOM_raw { raw = item run Testing.expect(property.flags == 0, "raw is a non-writable non-enumerable non-configurable own property") }
+    if property.atom == 0x80000000 {
+      sawCooked = Strings.length(item) == 7 && Strings.codeUnit(item, 6) == 10
+      run Testing.expect(property.flags == u32.toU8(JS_PROP_ENUMERABLE), "template element is enumerable but cannot be changed or deleted")
+    }
+    if property.atom == 0x80000001 { sawInvalidEscape = item.tag() == Value.Undefined.tag() }
+    index = index + 1
+  }
+  run Testing.expect(sawCooked && sawInvalidEscape, "cooked escapes and tagged invalid-escape undefined are semantically distinct")
+  let rawObject = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(raw))
+  run Testing.expect(!rawObject.extensible && !rawObject.fastArray, "raw array has its own sealed storage owner")
+  let retained = unsafe cooked.retained()
+  drop rawObject drop shape drop object drop fd drop parser
+  unsafe state.destroyFunction(&mut hooks, root)
+  let survivor = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(retained))
+  run Testing.expect(!survivor.extensible && survivor.properties.length() >= 4, "retained template value remains intact after compiler constants release")
+  drop survivor
+  unsafe gc.release(&mut hooks, rt, retained)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx) run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observer.stats().usedBytes == 0 && observer.stats().allocationCount == 0,
+    "cooked/raw ownership graph and prototype edges release without leaks")
+}
+
+test effect fn programDefaultParameterScopeAndCapturedBindingsSurviveRealAssembly() -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException | BytecodeError | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make(false)
+  let ctx = run unsafe fixture.context(&mut hooks, &observer, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut cache = SourcePositionCache.make()
+  let root = run unsafe fixture.root(ctx, false, false, false, Pointer.fromMutRef<SourcePositionCache>(&mut cache)) |> Effect.provideMut<Allocator>(&mut memory)
+  let source = b"function outer(a=1){let x=2;return ()=>a+x}"
+  let mut parser = run unsafe Parser.make(source, root, false, true) |> Effect.provideMut<Allocator>(&mut memory)
+  run unsafe parseProgram(&mut parser, &mut hooks, &observer) |> Effect.provideMut<Allocator>(&mut memory)
+  let anchor = () let fd = unsafe HeapCell.payload<FunctionDef, ()>(&anchor, root)
+  let child = unsafe HeapCell.payload<FunctionDef, ()>(&anchor, present(fd.firstChild))
+  run Testing.expect(child.hasParameterExpressions && !child.hasSimpleParameterList && child.bodyScope > 1,
+    "default parameters create a separate argument environment before the body scope")
+  drop child drop fd drop parser
+  let compiled = run unsafe createFunction(&mut hooks, root, source) |> Effect.provideMut<Allocator>(&mut memory)
+  let bytecode = match compiled { Value.FunctionBytecode { reference } => reference _ => trap() }
+  let top = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  let outerCell = match top.constants.get(0) { Value.FunctionBytecode { reference } => reference _ => trap() }
+  let outer = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, outerCell)
+  let mut captured: usize = 0 let mut index: usize = 0
+  while index < outer.varDefs.length() { if outer.varDefs.get(index).isCaptured { captured = captured + 1 } index = index + 1 }
+  run Testing.expect(captured == 2, "assembler resolves both parameter and lexical body capture, not global fallback")
+  let arrowCell = match outer.constants.get(0) { Value.FunctionBytecode { reference } => reference _ => trap() }
+  let arrow = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, arrowCell)
+  run Testing.expect(arrow.closureVars.length() == 2 && arrow.stackSize >= 2 && arrow.code.length() > 0,
+    "the nested function owns resolved captures and executable assembled code")
+  drop arrow drop outer drop top
+  unsafe gc.release(&mut hooks, rt, compiled)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx) run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observer.stats().usedBytes == 0 && observer.stats().allocationCount == 0,
+    "assembly transfers recursive function/realm ownership and releases the transient parse tree")
+}
+
+test effect fn programAllocationFailureUnwindsEveryNestedGrammarOwner() -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException | AssertionError<'static> {
+  let mut allowance: usize = 0 let mut reachedSuccess = false
+  while allowance < 4096 && !reachedSuccess {
+    let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+    let observer = run memory.observe()
+    let rt = run runtime.allocateRuntimeStorage(currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut memory)
+    let mut hooks = Hooks.make(false)
+    let ctx = run unsafe fixture.context(&mut hooks, &observer, rt) |> Effect.provideMut<Allocator>(&mut memory)
+    let mut cache = SourcePositionCache.make()
+    let root = run unsafe fixture.root(ctx, true, false, false, Pointer.fromMutRef<SourcePositionCache>(&mut cache)) |> Effect.provideMut<Allocator>(&mut memory)
+    let source = b"import data from 'm' with {type:'json'}; export default class C{#x='owned';m({a=1}={}){return tag`head${()=>this.#x+a}tail`}}"
+    let mut parser = run unsafe Parser.make(source, root, true, false) |> Effect.provideMut<Allocator>(&mut memory)
+    let mut fault = FaultAllocator { parent: move memory, remaining: allowance }
+    let result = run Effect.result(unsafe parseProgram(&mut parser, &mut hooks, &observer)) |> Effect.provideMut<Allocator>(&mut fault)
+    match move result {
+      Result<(), OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException>.Success { .. } => { reachedSuccess = true }
+      Result<(), OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException>.Failure { error } => {
+        match move error {
+          OutOfMemoryError e => () StringLengthError e => { fail move e }
+          BigIntError e => { fail move e } LexError e => { fail move e } SyntaxError e => { fail move e }
+          ParserStackOverflow e => { fail move e } CompilerError e => { fail move e } JsException e => { fail move e }
+        }
+      }
+    }
+    run Testing.expect(Pointer.address<HeapHeader>(parser.currentFunction) == Pointer.address<HeapHeader>(root), "allocation failure restores the parser cursor before compiler-owner teardown")
+    drop parser
+    unsafe state.destroyFunction(&mut hooks, root)
+    unsafe gc.releaseHeader(&mut hooks, rt, ctx) run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut fault)
+    run Testing.expect(observer.stats().usedBytes == 0 && observer.stats().allocationCount == 0,
+      "every allocation prefix reclaims module attributes, private names, child functions and cooked/raw arrays")
+    allowance = allowance + 1
+  }
+  run Testing.expect(reachedSuccess && allowance > 1, "fault injection reaches a real successful parse after traversing allocation failures")
+}

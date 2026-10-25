@@ -1,0 +1,226 @@
+//! Proxy own descriptors, quickjs.c:53350-53571. All inputs are borrowed;
+//! callers keep the context, proxy and arguments rooted across callbacks.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.option { Option }
+import silk.result { Result }
+import runtime_memory { AllocationObserver }
+import js_heap { HeapHeader }
+import js_value { Value }
+import js_core_types { PropertyDescriptor, JS_PROP_C_W_E, JS_PROP_CONFIGURABLE,
+  JS_PROP_WRITABLE, JS_PROP_GETSET, JS_PROP_TMASK, JS_PROP_HAS_CONFIGURABLE,
+  JS_PROP_HAS_ENUMERABLE, JS_PROP_HAS_WRITABLE, JS_PROP_HAS_VALUE,
+  JS_PROP_HAS_GET, JS_PROP_HAS_SET, JS_PROP_THROW }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_atom_data as atoms
+import js_coercion_host { CoercionHooks }
+import js_call_host { CallHooks }
+import js_property_host { OwnPropertyHooks, HasPropertyHooks, OwnPropertyResult }
+import js_property_write_host { PropertyWriteHooks }
+import js_prototype_host { PrototypeHooks }
+import js_property_descriptors as descriptors
+import js_property_descriptor_values as descriptorValues
+import js_property_mutations as mutations
+import js_property_ownership { releaseDescriptor }
+import js_proxy_core as core
+import js_string_types { StringLengthError }
+import js_bigint { BigIntError }
+import js_exceptions { JsException }
+
+unsafe fn releaseOptional<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader,
+  descriptor: Option<PropertyDescriptor>) -> () {
+  match move descriptor {
+    Option<PropertyDescriptor>.Some { value } => { unsafe releaseDescriptor(&mut hooks, rt, move value) }
+    Option<PropertyDescriptor>.None => ()
+  }
+}
+// check_define_prop_desc supplements the shared flag-only compatibility kernel.
+unsafe fn compatible(descriptor: &PropertyDescriptor, value: Value, getter: Value,
+  setter: Value, flags: u32) -> bool {
+  if !mutations.checkDefinePropertyFlags(descriptor.flags, flags) { return false }
+  if (descriptor.flags & JS_PROP_CONFIGURABLE) == 0 {
+    if (descriptor.flags & JS_PROP_TMASK) == JS_PROP_GETSET {
+      if (flags & JS_PROP_HAS_GET) != 0 && !unsafe core.sameValue(getter, descriptor.getter) { return false }
+      if (flags & JS_PROP_HAS_SET) != 0 && !unsafe core.sameValue(setter, descriptor.setter) { return false }
+    } else if (descriptor.flags & JS_PROP_WRITABLE) == 0 {
+      if (flags & JS_PROP_HAS_VALUE) != 0 && !unsafe core.sameValue(value, descriptor.value) { return false }
+    }
+  }
+  return true
+}
+unsafe fn consistentResult(target: &Option<PropertyDescriptor>, result: &PropertyDescriptor,
+  extensible: bool) -> bool {
+  let mut flags = result.flags | JS_PROP_HAS_CONFIGURABLE | JS_PROP_HAS_ENUMERABLE
+  if (result.flags & JS_PROP_GETSET) != 0 { flags = flags | JS_PROP_HAS_GET | JS_PROP_HAS_SET }
+  else { flags = flags | JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE }
+  match &target.* {
+    Option<PropertyDescriptor>.Some { value: current } => {
+      if !unsafe compatible(&current, result.value, result.getter, result.setter, flags) { return false }
+      if (result.flags & JS_PROP_CONFIGURABLE) == 0 {
+        if (current.flags & JS_PROP_CONFIGURABLE) != 0 { return false }
+        if (result.flags & (JS_PROP_GETSET | JS_PROP_WRITABLE)) == 0 &&
+          (current.flags & JS_PROP_WRITABLE) != 0 { return false }
+      }
+      return true
+    }
+    Option<PropertyDescriptor>.None => {
+      return extensible && (result.flags & JS_PROP_CONFIGURABLE) != 0
+    }
+  }
+}
+pub unsafe effect fn getOwnProperty<H: HeapHooks + OwnPropertyHooks + HasPropertyHooks +
+  CoercionHooks + CallHooks + PrototypeHooks>(hooks: &mut H, context: *mut HeapHeader,
+  proxy: Value, atom: u32, requested: bool) -> OwnPropertyResult ! JsException ? &mut Allocator {
+  let method = run unsafe core.getMethod(&mut hooks, context, proxy, atoms.JS_ATOM_getOwnPropertyDescriptor)
+  let target = unsafe core.target(proxy)
+  let rt = unsafe runtime.contextRuntime(context)
+  if core.undefined(method) {
+    if !requested {
+      let checked = run Effect.result(unsafe descriptors.hasOwnProperty(&mut hooks, context, target, atom))
+      let found = match move checked {
+        Result<bool, OutOfMemoryError | JsException>.Success { value } => value
+        Result<bool, OutOfMemoryError | JsException>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error)
+      }
+      if found { return OwnPropertyResult.Exists }
+      return OwnPropertyResult.Absent
+    }
+    let own = run unsafe core.ownProperty(&mut hooks, context, target, atom)
+    return match move own {
+      Option<PropertyDescriptor>.Some { value } => OwnPropertyResult.Descriptor { descriptor: move value }
+      Option<PropertyDescriptor>.None => OwnPropertyResult.Absent
+    }
+  }
+  let named = run Effect.result(unsafe core.atomValue(&mut hooks, context, atom))
+  let key = match move named {
+    Result<Value, JsException>.Success { value } => value
+    Result<Value, JsException>.Failure { error } => {
+      unsafe gc.release(&mut hooks, rt, method) fail move error
+    }
+  }
+  let arguments = [target, key]
+  let called = run Effect.result(unsafe core.callFree(&mut hooks, context, method,
+    unsafe core.handler(proxy), &arguments))
+  unsafe gc.release(&mut hooks, rt, key)
+  let trapResult = match move called {
+    Result<Value, JsException>.Success { value } => value
+    Result<Value, JsException>.Failure { error } => { fail move error }
+  }
+  if !trapResult.isObject() && !core.undefined(trapResult) {
+    unsafe gc.release(&mut hooks, rt, trapResult)
+    return run unsafe core.error(&mut hooks, context, b"proxy: inconsistent getOwnPropertyDescriptor")
+  }
+  let inspected = run Effect.result(unsafe core.ownProperty(&mut hooks, context, target, atom))
+  let targetDescriptor = match move inspected {
+    Result<Option<PropertyDescriptor>, JsException>.Success { value } => move value
+    Result<Option<PropertyDescriptor>, JsException>.Failure { error } => {
+      unsafe gc.release(&mut hooks, rt, trapResult) fail move error
+    }
+  }
+  if core.undefined(trapResult) {
+    // This branch uses the stored extensible bit, not an exotic IsExtensible call.
+    let inconsistent = match &targetDescriptor {
+      Option<PropertyDescriptor>.Some { value } => (value.flags & JS_PROP_CONFIGURABLE) == 0 || !unsafe core.storedExtensible(target)
+      Option<PropertyDescriptor>.None => false
+    }
+    unsafe releaseOptional(&mut hooks, rt, move targetDescriptor)
+    if inconsistent { return run unsafe core.error(&mut hooks, context, b"proxy: inconsistent getOwnPropertyDescriptor") }
+    return OwnPropertyResult.Absent
+  }
+  let extensibility = run Effect.result(unsafe core.extensible(&mut hooks, context, target))
+  let extensible = match move extensibility {
+    Result<bool, JsException>.Success { value } => value
+    Result<bool, JsException>.Failure { error } => {
+      unsafe gc.release(&mut hooks, rt, trapResult)
+      unsafe releaseOptional(&mut hooks, rt, move targetDescriptor)
+      fail move error
+    }
+  }
+  let converted = run Effect.result(unsafe descriptorValues.toPropertyDescriptor(&mut hooks, context, trapResult))
+  unsafe gc.release(&mut hooks, rt, trapResult)
+  let mut resultDescriptor = match move converted {
+    Result<PropertyDescriptor, JsException>.Success { value } => move value
+    Result<PropertyDescriptor, JsException>.Failure { error } => {
+      unsafe releaseOptional(&mut hooks, rt, move targetDescriptor) fail move error
+    }
+  }
+  // CompletePropertyDescriptor: absent booleans remain false and absent value,
+  // getter and setter remain Undefined. Strip HAS bits only after determining kind.
+  if (resultDescriptor.flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) != 0 {
+    resultDescriptor.flags = resultDescriptor.flags | JS_PROP_GETSET
+  }
+  resultDescriptor.flags = resultDescriptor.flags & (JS_PROP_C_W_E | JS_PROP_TMASK)
+  if !unsafe consistentResult(&targetDescriptor, &resultDescriptor, extensible) {
+    unsafe releaseDescriptor(&mut hooks, rt, move resultDescriptor)
+    unsafe releaseOptional(&mut hooks, rt, move targetDescriptor)
+    return run unsafe core.error(&mut hooks, context, b"proxy: inconsistent getOwnPropertyDescriptor")
+  }
+  unsafe releaseOptional(&mut hooks, rt, move targetDescriptor)
+  if !requested {
+    unsafe releaseDescriptor(&mut hooks, rt, move resultDescriptor)
+    return OwnPropertyResult.Exists
+  }
+  return OwnPropertyResult.Descriptor { descriptor: move resultDescriptor }
+}
+pub unsafe effect fn defineOwnProperty<H: HeapHooks + OwnPropertyHooks + CoercionHooks +
+  CallHooks + PropertyWriteHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, proxy: Value, atom: u32, value: Value, getter: Value,
+  setter: Value, flags: u32) -> bool ! JsException ? &mut Allocator {
+  let method = run unsafe core.getMethod(&mut hooks, context, proxy, atoms.JS_ATOM_defineProperty)
+  let target = unsafe core.target(proxy)
+  let rt = unsafe runtime.contextRuntime(context)
+  if core.undefined(method) {
+    let defined = run Effect.result(unsafe mutations.defineProperty(&mut hooks, context,
+      target, atom, value, getter, setter, flags))
+    return match move defined {
+      Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { value: accepted } => accepted
+      Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error)
+    }
+  }
+  let named = run Effect.result(unsafe core.atomValue(&mut hooks, context, atom))
+  let key = match move named {
+    Result<Value, JsException>.Success { value: name } => name
+    Result<Value, JsException>.Failure { error } => {
+      unsafe gc.release(&mut hooks, rt, method) fail move error
+    }
+  }
+  let created = run Effect.result(unsafe descriptorValues.fromPropertyDescriptor(&mut hooks,
+    memory, context, value, getter, setter, flags))
+  let description = match move created {
+    Result<Value, JsException>.Success { value: object } => object
+    Result<Value, JsException>.Failure { error } => {
+      unsafe gc.release(&mut hooks, rt, key)
+      unsafe gc.release(&mut hooks, rt, method)
+      fail move error
+    }
+  }
+  let arguments = [target, key, description]
+  let called = run Effect.result(unsafe core.callFree(&mut hooks, context, method,
+    unsafe core.handler(proxy), &arguments))
+  unsafe gc.release(&mut hooks, rt, key)
+  unsafe gc.release(&mut hooks, rt, description)
+  let trapResult = match move called {
+    Result<Value, JsException>.Success { value: result } => result
+    Result<Value, JsException>.Failure { error } => { fail move error }
+  }
+  if !unsafe core.toBoolFree(&mut hooks, context, trapResult) {
+    // JS_PROP_THROW_STRICT is intentionally not tested by this trap.
+    if (flags & JS_PROP_THROW) != 0 { return run unsafe core.error(&mut hooks, context, b"proxy: defineProperty exception") }
+    return false
+  }
+  let targetDescriptor = run unsafe core.ownProperty(&mut hooks, context, target, atom)
+  let settingNotConfigurable = (flags & (JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE)) == JS_PROP_HAS_CONFIGURABLE
+  let inconsistent = match &targetDescriptor {
+    Option<PropertyDescriptor>.None => !unsafe core.storedExtensible(target) || settingNotConfigurable
+    Option<PropertyDescriptor>.Some { value: current } =>
+      !unsafe compatible(&current, value, getter, setter, flags) ||
+      ((current.flags & JS_PROP_CONFIGURABLE) != 0 && settingNotConfigurable) ||
+      ((current.flags & JS_PROP_TMASK) != JS_PROP_GETSET &&
+        (current.flags & (JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)) == JS_PROP_WRITABLE &&
+        (flags & (JS_PROP_HAS_WRITABLE | JS_PROP_WRITABLE)) == JS_PROP_HAS_WRITABLE)
+  }
+  unsafe releaseOptional(&mut hooks, rt, move targetDescriptor)
+  if inconsistent { return run unsafe core.error(&mut hooks, context, b"proxy: inconsistent defineProperty") }
+  return true
+}

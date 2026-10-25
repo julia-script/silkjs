@@ -1,0 +1,300 @@
+//! Native quickjs-libc.c:2280-2350,3465-3667 worker transport. Only native
+//! bytes/backing owners cross threads; JS heaps and allocator observers never do.
+//! Detached children retain their native owners until their own thread exits.
+import silk.allocator { OutOfMemoryError }
+import silk.atomic { Atomic, MemoryOrder }
+import silk.layout { Layout }
+import silk.list { List }
+import silk.option { Option }
+import silk.ownership { Drop }
+import silk.pointer { Pointer }
+import silk.usize
+import js_atomics_native { Domain, WaiterDomain }
+import js_binary_object_writer { WriteResult }
+import js_libc_plugins { Registry }
+import js_libc_modules { CapturedModule }
+import js_libc_process { Process }
+import js_libc as libc
+import js_os_workers_resources { Resources }
+import js_os_workers_resources as resources
+
+extern "C" struct NativeMutex { words: [u64; 8] }
+// Keep pthread contracts identical to SDK native_thread/native synchronization.
+// pthread_create retains both the callback and argument until the child runs.
+unsafe extern "C" fn pthread_mutex_init(mutex: *mut NativeMutex, attributes: ?*const u8) -> i32
+unsafe extern "C" fn pthread_mutex_destroy(mutex: *mut NativeMutex) -> i32
+unsafe extern "C" fn pthread_mutex_lock(mutex: *mut NativeMutex) -> i32
+unsafe extern "C" fn pthread_mutex_unlock(mutex: *mut NativeMutex) -> i32
+unsafe extern "C" fn pthread_attr_init(attributes: *mut u8) -> i32
+unsafe extern "C" fn pthread_attr_setstacksize(attributes: *mut u8, size: usize) -> i32
+unsafe extern "C" fn pthread_attr_setdetachstate(attributes: *mut u8, state: i32) -> i32
+unsafe extern "C" fn pthread_attr_destroy(attributes: *mut u8) -> i32
+unsafe extern "C" fn pthread_create(thread: *mut usize, attributes: ?*const u8,
+  start: extern "C" fn(?*mut u8) -> ?*mut u8, argument: ?*mut u8) -> i32
+  with Intrinsic.foreign(threadCallbacks: ("start",))
+unsafe extern "C" fn pipe(fds: *mut i32) -> i32 with Intrinsic.foreign(noCapture: ("fds",))
+unsafe extern "C" fn close(fd: i32) -> i32
+unsafe extern "C" fn write(fd: i32, bytes: *const u8, length: usize) -> isize with Intrinsic.foreign(noCapture: ("bytes",))
+unsafe extern "C" fn read(fd: i32, bytes: *mut u8, length: usize) -> isize with Intrinsic.foreign(noCapture: ("bytes",))
+unsafe extern "C" fn darwinErrno() -> *mut i32 as "__error"
+unsafe extern "C" fn linuxErrno() -> *mut i32 as "__errno_location"
+
+pub struct TransportError { pub code: i32 }
+struct SharedHeader { references: usize }
+pub struct Message { pub next: ?*mut Message, pub data: *mut u8, pub length: usize,
+  shared: ?*mut *mut u8, sharedCount: usize }
+pub struct Pipe { references: usize, mutex: NativeMutex, first: ?*mut Message,
+  last: ?*mut Message, pub readFd: i32, writeFd: i32 }
+pub struct Group { references: usize, waiters: WaiterDomain }
+pub struct WorkerStart { pub process: Process, pub experimental: bool,
+  pub domain: Domain, pub group: *mut Group, pub recvPipe: *mut Pipe,
+  pub sendPipe: *mut Pipe, pub filename: List<u8>, pub basename: List<u8>, pub stripFlags: u8,
+  pub plugins: Option<Registry>, pub bundle: List<CapturedModule>, pub featureBitmap: u64 }
+impl Drop for WorkerStart {
+  fn drop(self: &mut Self) -> () {
+    unsafe releasePipe(self.recvPipe) unsafe releasePipe(self.sendPipe)
+    unsafe releaseGroup(self.group)
+  }
+}
+fn invariant() -> never { return Intrinsic.trap("worker native ownership invariant") }
+fn require(code: i32) -> () { if code != 0 { invariant() } }
+fn errno() -> i32 {
+  static if Intrinsic.targetOperatingSystem() == "darwin" { return unsafe Pointer.read<i32>(unsafe darwinErrno()) }
+  else { return unsafe Pointer.read<i32>(unsafe linuxErrno()) }
+}
+unsafe fn nonnull<T>(pointer: ?*mut T) -> *mut T {
+  return unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(pointer)
+}
+effect fn allocate<T>(owner: &Resources, kind: u32) -> *mut T ! OutOfMemoryError {
+  let memory = resources.allocate(owner, Layout.of<T>().bytes, kind)
+  if Pointer.isNull<u8>(memory) { fail OutOfMemoryError {} }
+  return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut T>(unsafe nonnull(memory))
+}
+unsafe fn deallocate<T>(pointer: *mut T) -> () {
+  unsafe resources.release(unsafe Intrinsic.pointerReinterpret<*mut T, *mut u8>(pointer))
+}
+fn sharedOffset() -> usize { return (Layout.of<SharedHeader>().bytes + 7) / 8 * 8 }
+/// Stable 8-aligned base, physically capacity bytes, atomic intrusive reference
+/// count. BufferStorage initializes canonical atomic cells before publication.
+pub effect fn allocateShared(owner: &Resources, length: usize) -> ?*mut u8 ! OutOfMemoryError {
+  let offset = sharedOffset()
+  if length > usize.MAX - offset { fail OutOfMemoryError {} }
+  let mut capacity = length if capacity == 0 { capacity = 1 }
+  let raw = resources.allocate(owner, offset + capacity, 1)
+  if Pointer.isNull<u8>(raw) { fail OutOfMemoryError {} }
+  let base = unsafe nonnull(raw)
+  let header = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut SharedHeader>(base)
+  unsafe Pointer.put<SharedHeader>(header, SharedHeader { references: 1 })
+  return unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(base), offset)
+}
+unsafe fn sharedHeader(data: *mut u8) -> *mut SharedHeader {
+  let address = Pointer.address<u8>(data) - sharedOffset()
+  return unsafe Pointer.read<*mut SharedHeader>(unsafe Intrinsic.pointerReinterpret<*const usize, *const *mut SharedHeader>(Pointer.fromRef<usize>(&address)))
+}
+pub unsafe fn duplicateShared(data: ?*mut u8) -> () {
+  if Pointer.isNull<u8>(data) { return () }
+  let header = unsafe sharedHeader(unsafe nonnull(data)) let mut anchor = ()
+  let storage = unsafe Pointer.borrowMut<(), SharedHeader>(&mut anchor, header)
+  let references = Pointer.fromMutRef<usize>(&mut storage.references) drop storage
+  let previous = unsafe Atomic.fetchAdd<usize>(references, 1, MemoryOrder.Relaxed)
+  if previous == 0 || previous == usize.MAX { invariant() }
+}
+pub unsafe fn freeShared(data: ?*mut u8) -> () {
+  if Pointer.isNull<u8>(data) { return () }
+  let header = unsafe sharedHeader(unsafe nonnull(data)) let mut anchor = ()
+  let storage = unsafe Pointer.borrowMut<(), SharedHeader>(&mut anchor, header)
+  let references = Pointer.fromMutRef<usize>(&mut storage.references) drop storage
+  let previous = unsafe Atomic.fetchSubtract<usize>(references, 1, MemoryOrder.Release)
+  if previous == 0 { invariant() }
+  if previous == 1 { Atomic.fence(MemoryOrder.Acquire) unsafe deallocate(header) }
+}
+pub effect fn newPipe(owner: &Resources) -> *mut Pipe ! OutOfMemoryError | TransportError {
+  let pointer = run allocate<Pipe>(owner, 2)
+  let mut fds: [i32; 2] = [-1; 2]
+  if !owner.permit() { unsafe deallocate(pointer) fail OutOfMemoryError {} }
+  if unsafe pipe(Pointer.fromMutRef<i32>(&mut fds[0])) != 0 {
+    let code = errno() unsafe deallocate(pointer) fail TransportError { code: code }
+  }
+  owner.descriptorsOpened()
+  unsafe Pointer.put<Pipe>(pointer, Pipe { references: 1, mutex: NativeMutex { words: [0; 8] },
+    first: Pointer.null<Message>(), last: Pointer.null<Message>(), readFd: fds[0], writeFd: fds[1] })
+  let mut anchor = () let state = unsafe Pointer.borrowMut<(), Pipe>(&mut anchor, pointer)
+  let status = unsafe pthread_mutex_init(Pointer.fromMutRef<NativeMutex>(&mut state.mutex), Pointer.null<u8>()) drop state
+  if status != 0 {
+    let a = unsafe close(fds[0]) let b = unsafe close(fds[1]) owner.descriptorsClosed() unsafe deallocate(pointer)
+    fail TransportError { code: status }
+  }
+  return pointer
+}
+pub unsafe fn retainPipe(pointer: *mut Pipe) -> *mut Pipe {
+  let mut anchor = () let state = unsafe Pointer.borrowMut<(), Pipe>(&mut anchor, pointer)
+  let references = Pointer.fromMutRef<usize>(&mut state.references) drop state
+  let old = unsafe Atomic.fetchAdd<usize>(references, 1, MemoryOrder.Relaxed)
+  if old == 0 || old == usize.MAX { invariant() } return pointer
+}
+pub unsafe fn freeMessage(pointer: *mut Message) -> () {
+  let message = unsafe Pointer.take<Message>(pointer) let mut index: usize = 0
+  if !Pointer.isNull<*mut u8>(message.shared) {
+    let array = unsafe Pointer.assumeManyMut<*mut u8>(unsafe nonnull(message.shared))
+    while index < message.sharedCount {
+      unsafe freeShared(unsafe Pointer.read<*mut u8>(unsafe Pointer.atMut<*mut u8>(array, index))) index = index + 1
+    }
+    unsafe deallocate(unsafe nonnull(message.shared))
+  }
+  unsafe resources.release(message.data) unsafe deallocate(pointer)
+}
+pub unsafe fn releasePipe(optional: ?*mut Pipe) -> () {
+  if Pointer.isNull<Pipe>(optional) { return () }
+  let pointer = unsafe nonnull(optional) let mut anchor = ()
+  let state = unsafe Pointer.borrowMut<(), Pipe>(&mut anchor, pointer)
+  let references = Pointer.fromMutRef<usize>(&mut state.references) drop state
+  let old = unsafe Atomic.fetchSubtract<usize>(references, 1, MemoryOrder.Release)
+  if old == 0 { invariant() } if old != 1 { return () }
+  Atomic.fence(MemoryOrder.Acquire)
+  let state2 = unsafe Pointer.borrowMut<(), Pipe>(&mut anchor, pointer)
+  let mut current = state2.first
+  require(unsafe pthread_mutex_destroy(Pointer.fromMutRef<NativeMutex>(&mut state2.mutex)))
+  let a = unsafe close(state2.readFd) let b = unsafe close(state2.writeFd) drop state2
+  let owner = unsafe resources.owner(unsafe Intrinsic.pointerReinterpret<*mut Pipe, *mut u8>(pointer))
+  owner.descriptorsClosed()
+  while !Pointer.isNull<Message>(current) {
+    let message = unsafe nonnull(current) let entry = unsafe Pointer.borrow<(), Message>(&anchor, message)
+    current = entry.next drop entry unsafe freeMessage(message)
+  }
+  unsafe deallocate(pointer)
+}
+unsafe fn lock(pointer: *mut Pipe) -> *mut NativeMutex {
+  let mut anchor = () let state = unsafe Pointer.borrowMut<(), Pipe>(&mut anchor, pointer)
+  let mutex = Pointer.fromMutRef<NativeMutex>(&mut state.mutex) drop state
+  require(unsafe pthread_mutex_lock(mutex)) return mutex
+}
+unsafe fn signal(fd: i32) -> () {
+  let byte: u8 = 0
+  // Pinned source's (errno != EAGAIN || errno != EINTR) breaks on EVERY error.
+  // Preserve its defined one-attempt behavior rather than invent retries.
+  let ignored = unsafe write(fd, Pointer.fromRef<u8>(&byte), 1)
+}
+unsafe fn clear(fd: i32) -> () {
+  let mut bytes: [u8; 16] = [0; 16]
+  while true {
+    if unsafe read(fd, Pointer.fromMutRef<u8>(&mut bytes[0]), 16) >= 0 { return () }
+    let code = errno() let mut again: i32 = 11
+    static if Intrinsic.targetOperatingSystem() == "darwin" { again = 35 }
+    if code != 4 && code != again { return () }
+  }
+}
+pub unsafe fn enqueue(pointer: *mut Pipe, message: *mut Message) -> () {
+  let mutex = unsafe lock(pointer) let mut anchor = ()
+  let state = unsafe Pointer.borrowMut<(), Pipe>(&mut anchor, pointer)
+  let previous = state.last
+  if Pointer.isNull<Message>(state.first) { unsafe signal(state.writeFd) state.first = message }
+  state.last = message drop state
+  if !Pointer.isNull<Message>(previous) {
+    let last = unsafe Pointer.borrowMut<(), Message>(&mut anchor, unsafe nonnull(previous)) last.next = message
+  }
+  require(unsafe pthread_mutex_unlock(mutex))
+}
+pub unsafe fn dequeue(pointer: *mut Pipe) -> ?*mut Message {
+  let mutex = unsafe lock(pointer) let mut anchor = ()
+  let state = unsafe Pointer.borrowMut<(), Pipe>(&mut anchor, pointer) let first = state.first
+  if !Pointer.isNull<Message>(first) {
+    let messageAnchor = ()
+    let item = unsafe Pointer.borrow<(), Message>(&messageAnchor, unsafe nonnull(first)) let next = item.next drop item
+    state.first = next
+    if Pointer.isNull<Message>(next) { state.last = Pointer.null<Message>() unsafe clear(state.readFd) }
+  }
+  drop state require(unsafe pthread_mutex_unlock(mutex)) return first
+}
+/// Copy into libc ownership before the originating runtime allocator can die.
+/// The writer table borrows SAB owners; duplicate them before returning to JS.
+pub unsafe effect fn copyMessage(owner: &Resources, output: &WriteResult) -> *mut Message ! OutOfMemoryError {
+  let pointer = run allocate<Message>(owner, 3)
+  let length = output.bytes.length() let count = output.shared.length()
+  let mut size = length if size == 0 { size = 1 }
+  let raw = resources.allocate(owner, size, 0)
+  if Pointer.isNull<u8>(raw) { unsafe deallocate(pointer) fail OutOfMemoryError {} }
+  let data = unsafe nonnull(raw) let mut table = Pointer.null<*mut u8>()
+  if count != 0 {
+    if count > usize.MAX / Layout.of<*mut u8>().bytes { unsafe resources.release(data) unsafe deallocate(pointer) fail OutOfMemoryError {} }
+    let allocated = resources.allocate(owner, count * Layout.of<*mut u8>().bytes, 0)
+    if Pointer.isNull<u8>(allocated) { unsafe resources.release(data) unsafe deallocate(pointer) fail OutOfMemoryError {} }
+    table = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut *mut u8>(unsafe nonnull(allocated))
+  }
+  let mut index: usize = 0
+  while index < length {
+    unsafe Pointer.write<u8>(unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(data), index), output.bytes.get(index)) index = index + 1
+  }
+  index = 0
+  while index < count {
+    let entry = output.shared.get(index) unsafe duplicateShared(entry.address)
+    unsafe Pointer.write<*mut u8>(unsafe Pointer.atMut<*mut u8>(unsafe Pointer.assumeManyMut<*mut u8>(unsafe nonnull(table)), index), entry.address)
+    index = index + 1
+  }
+  unsafe Pointer.put<Message>(pointer, Message { next: Pointer.null<Message>(), data: data, length: length, shared: table, sharedCount: count })
+  return pointer
+}
+pub effect fn newGroup(owner: &Resources, domain: Domain) -> *mut Group ! OutOfMemoryError {
+  let pointer = run allocate<Group>(owner, 4)
+  unsafe Pointer.put<Group>(pointer, Group { references: 1, waiters: unsafe WaiterDomain.retain(domain) })
+  return pointer
+}
+pub unsafe fn groupResources(pointer: *mut Group) -> Resources {
+  return unsafe resources.owner(unsafe Intrinsic.pointerReinterpret<*mut Group, *mut u8>(pointer))
+}
+pub unsafe fn pipeResources(pointer: *mut Pipe) -> Resources {
+  return unsafe resources.owner(unsafe Intrinsic.pointerReinterpret<*mut Pipe, *mut u8>(pointer))
+}
+pub unsafe fn groupDomain(pointer: *mut Group) -> Domain {
+  let anchor = () let state = unsafe Pointer.borrow<(), Group>(&anchor, pointer) return state.waiters.handle()
+}
+pub unsafe fn retainGroup(pointer: *mut Group) -> *mut Group {
+  let mut anchor = () let state = unsafe Pointer.borrowMut<(), Group>(&mut anchor, pointer)
+  let references = Pointer.fromMutRef<usize>(&mut state.references) drop state
+  let old = unsafe Atomic.fetchAdd<usize>(references, 1, MemoryOrder.Relaxed)
+  if old == 0 || old == usize.MAX { invariant() } return pointer
+}
+pub unsafe fn releaseGroup(optional: ?*mut Group) -> () {
+  if Pointer.isNull<Group>(optional) { return () }
+  let pointer = unsafe nonnull(optional) let mut anchor = ()
+  let state = unsafe Pointer.borrowMut<(), Group>(&mut anchor, pointer)
+  let references = Pointer.fromMutRef<usize>(&mut state.references) drop state
+  let old = unsafe Atomic.fetchSubtract<usize>(references, 1, MemoryOrder.Release)
+  if old == 0 { invariant() } if old != 1 { return () }
+  Atomic.fence(MemoryOrder.Acquire)
+  let owned = unsafe Pointer.take<Group>(pointer) drop owned unsafe deallocate(pointer)
+}
+export "C" fn silkJsWorkerThreadEntry(raw: ?*mut u8) -> ?*mut u8 {
+  let pointer = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut WorkerStart>(unsafe nonnull(raw))
+  let owner = unsafe resources.owner(unsafe nonnull(raw))
+  let args = unsafe Pointer.take<WorkerStart>(pointer) unsafe deallocate(pointer)
+  libc.runWorker(move args)
+  owner.threadFinished()
+  return Pointer.null<u8>()
+}
+/// Consumes args on success and failure. Detached children own their packet and
+/// retained Group independently of the originating Session's lifetime.
+pub unsafe effect fn start(args: WorkerStart) -> () ! OutOfMemoryError | TransportError {
+  let owner = unsafe groupResources(args.group)
+  let packet = run allocate<WorkerStart>(&owner, 6)
+  unsafe Pointer.put<WorkerStart>(packet, move args)
+  let mut attributes: [u64; 16] = [0; 16]
+  let attr = unsafe Intrinsic.pointerReinterpret<*mut u64, *mut u8>(Pointer.fromMutRef<u64>(&mut attributes[0]))
+  let initialized = unsafe pthread_attr_init(attr) let mut status = initialized let mut thread: usize = 0
+  if status == 0 { status = unsafe pthread_attr_setstacksize(attr, 8 * 1024 * 1024) }
+  let mut detached: i32 = 1 static if Intrinsic.targetOperatingSystem() == "darwin" { detached = 2 }
+  if status == 0 { status = unsafe pthread_attr_setdetachstate(attr, detached) }
+  if status == 0 && !owner.permit() { status = 11 }
+  if status == 0 {
+    // Reserve before creation: a detached child can exit before create returns.
+    // Failed creation rolls back; successful entry owns the matching decrement.
+    owner.threadStarted()
+    status = unsafe pthread_create(Pointer.fromMutRef<usize>(&mut thread), attr, silkJsWorkerThreadEntry,
+      unsafe Intrinsic.pointerReinterpret<*mut WorkerStart, *mut u8>(packet))
+    if status != 0 { owner.threadFinished() }
+  }
+  if initialized == 0 { let ignored = unsafe pthread_attr_destroy(attr) }
+  if status != 0 {
+    let failed = unsafe Pointer.take<WorkerStart>(packet) drop failed
+    unsafe deallocate(packet) fail TransportError { code: status }
+  }
+}

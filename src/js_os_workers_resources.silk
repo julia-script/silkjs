@@ -1,0 +1,125 @@
+//! Cross-thread native resource accounting and bounded allocation for Workers.
+//! Each successful raw allocation owns the ledger independently of its runtime.
+//! Detached-thread counters are owned by the entrypoint through actual teardown.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.layout { Layout }
+import silk.ownership { Copy }
+import silk.pointer { Pointer }
+import silk.sync { Arc, Mutex }
+import silk.thread { Transferable, Concurrent }
+import silk.usize
+unsafe extern "C" fn malloc(length: usize) -> ?*mut u8
+unsafe extern "C" fn free(pointer: ?*mut u8) -> ()
+pub struct Snapshot { pub blocks: usize, pub bytes: usize, pub sharedBlocks: usize,
+  pub pipes: usize, pub messages: usize, pub groups: usize, pub childNodes: usize,
+  pub startPackets: usize, pub descriptors: usize, pub threads: usize,
+  pub attempts: usize, pub failures: usize }
+impl Copy for Snapshot {}
+struct Counters { snapshot: Snapshot, remaining: usize }
+impl Transferable for Counters {}
+pub struct Resources { shared: Arc<Mutex<Counters>> }
+impl Transferable for Resources {}
+impl Concurrent for Resources {}
+struct Header { owner: Resources, bytes: usize, kind: u32 }
+fn offset() -> usize { return (Layout.of<Header>().bytes + 7) / 8 * 8 }
+impl Resources {
+  pub effect fn make() -> Self ! OutOfMemoryError {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let state = run Mutex<Counters>.make(Counters { remaining: usize.MAX,
+      snapshot: Snapshot { blocks: 0, bytes: 0, sharedBlocks: 0, pipes: 0,
+        messages: 0, groups: 0, childNodes: 0, startPackets: 0, descriptors: 0,
+        threads: 0, attempts: 0, failures: 0 } }) |> Effect.provideMut<Allocator>(&mut allocator)
+    return Self { shared: run Arc<Mutex<Counters>>.make(move state) |> Effect.provideMut<Allocator>(&mut allocator) }
+  }
+  pub fn clone(self: &Self) -> Self { return Self { shared: self.shared.clone() } }
+  pub fn snapshot(self: &Self) -> Snapshot {
+    let guard = self.shared.get().lock() return guard.get().snapshot
+  }
+  /// One-shot refusal after n native allocation/acquisition attempts; usize.MAX
+  /// disables the bound. Existing owners remain valid and always reclaimable.
+  pub fn failAfter(self: &Self, n: usize) -> () {
+    let mut guard = self.shared.get().lock() let state = guard.getMut() state.remaining = n
+  }
+  pub fn permit(self: &Self) -> bool {
+    let mut guard = self.shared.get().lock() let state = guard.getMut()
+    state.snapshot.attempts = state.snapshot.attempts + 1
+    if state.remaining == 0 {
+      state.remaining = usize.MAX state.snapshot.failures = state.snapshot.failures + 1 return false
+    }
+    if state.remaining != usize.MAX { state.remaining = state.remaining - 1 } return true
+  }
+  pub fn descriptorsOpened(self: &Self) -> () {
+    let mut guard = self.shared.get().lock() let state = guard.getMut()
+    state.snapshot.descriptors = state.snapshot.descriptors + 2
+  }
+  pub fn descriptorsClosed(self: &Self) -> () {
+    let mut guard = self.shared.get().lock() let state = guard.getMut()
+    state.snapshot.descriptors = state.snapshot.descriptors - 2
+  }
+  pub fn threadStarted(self: &Self) -> () {
+    let mut guard = self.shared.get().lock() let state = guard.getMut()
+    state.snapshot.threads = state.snapshot.threads + 1
+  }
+  pub fn threadFinished(self: &Self) -> () {
+    let mut guard = self.shared.get().lock() let state = guard.getMut()
+    state.snapshot.threads = state.snapshot.threads - 1
+  }
+  fn acquired(self: &Self, bytes: usize, kind: u32) -> () {
+    let mut guard = self.shared.get().lock() let state = guard.getMut()
+    state.snapshot.blocks = state.snapshot.blocks + 1 state.snapshot.bytes = state.snapshot.bytes + bytes
+    if kind == 1 { state.snapshot.sharedBlocks = state.snapshot.sharedBlocks + 1 }
+    else if kind == 2 { state.snapshot.pipes = state.snapshot.pipes + 1 }
+    else if kind == 3 { state.snapshot.messages = state.snapshot.messages + 1 }
+    else if kind == 4 { state.snapshot.groups = state.snapshot.groups + 1 }
+    else if kind == 5 { state.snapshot.childNodes = state.snapshot.childNodes + 1 }
+    else if kind == 6 { state.snapshot.startPackets = state.snapshot.startPackets + 1 }
+  }
+  fn released(self: &Self, bytes: usize, kind: u32) -> () {
+    let mut guard = self.shared.get().lock() let state = guard.getMut()
+    state.snapshot.blocks = state.snapshot.blocks - 1 state.snapshot.bytes = state.snapshot.bytes - bytes
+    if kind == 1 { state.snapshot.sharedBlocks = state.snapshot.sharedBlocks - 1 }
+    else if kind == 2 { state.snapshot.pipes = state.snapshot.pipes - 1 }
+    else if kind == 3 { state.snapshot.messages = state.snapshot.messages - 1 }
+    else if kind == 4 { state.snapshot.groups = state.snapshot.groups - 1 }
+    else if kind == 5 { state.snapshot.childNodes = state.snapshot.childNodes - 1 }
+    else if kind == 6 { state.snapshot.startPackets = state.snapshot.startPackets - 1 }
+  }
+}
+impl Allocator for Resources {
+  effect fn allocate(self: &mut Self, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
+    // Native transport allocations have at most eight-byte alignment.
+    if layout.alignment > 8 { return run Allocator.outOfMemory() }
+    let raw = allocate(&self.*, layout.bytes, 0)
+    if Pointer.isNull<u8>(raw) { return run Allocator.outOfMemory() }
+    let pointer = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(raw)
+    let reclaim: extern "C" fn(?*mut u8) -> () = silkJsWorkerAllocationReclaim
+    return unsafe Intrinsic.allocationAdopt(pointer, move layout, reclaim, pointer)
+  }
+}
+export "C" fn silkJsWorkerAllocationReclaim(pointer: ?*mut u8) -> () { unsafe release(pointer) }
+pub fn allocate(owner: &Resources, bytes: usize, kind: u32) -> ?*mut u8 {
+  let prefix = offset() let mut capacity = bytes if capacity == 0 { capacity = 1 }
+  if capacity > usize.MAX - prefix || !owner.permit() { return Pointer.null<u8>() }
+  let raw = unsafe malloc(prefix + capacity)
+  if Pointer.isNull<u8>(raw) { return raw }
+  let base = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(raw)
+  let header = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Header>(base)
+  unsafe Pointer.put<Header>(header, Header { owner: owner.clone(), bytes: prefix + capacity, kind: kind })
+  owner.acquired(prefix + capacity, kind)
+  return unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(base), prefix)
+}
+unsafe fn header(pointer: *mut u8) -> *mut Header {
+  let address = Pointer.address<u8>(pointer) - offset()
+  return unsafe Pointer.read<*mut Header>(unsafe Intrinsic.pointerReinterpret<*const usize, *const *mut Header>(Pointer.fromRef<usize>(&address)))
+}
+pub unsafe fn owner(pointer: *mut u8) -> Resources {
+  let anchor = () let state = unsafe Pointer.borrow<(), Header>(&anchor, unsafe header(pointer)) return state.owner.clone()
+}
+pub unsafe fn release(optional: ?*mut u8) -> () {
+  if Pointer.isNull<u8>(optional) { return () }
+  let pointer = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(optional)
+  let base = unsafe header(pointer) let state = unsafe Pointer.take<Header>(base)
+  unsafe free(unsafe Intrinsic.pointerReinterpret<*mut Header, *mut u8>(base))
+  state.owner.released(state.bytes, state.kind)
+}

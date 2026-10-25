@@ -1,0 +1,224 @@
+//! Proxy auxiliary state and shared operations, quickjs.c:52975-53024.
+//! Callers keep context/proxy/arguments alive through callbacks. Revocation keeps
+//! target and handler owned until finalization: callbacks borrow their values.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types { RuntimeState, ObjectData, ObjectPayload, ObjectPayloadFamily, PropertyDescriptor,
+  NativeErrorKind, FrameSlots, JS_PROP_HAS_VALUE, JS_PROP_HAS_CONFIGURABLE,
+  JS_PROP_HAS_WRITABLE, JS_PROP_HAS_ENUMERABLE }
+import js_gc { HeapHooks, Tracer }
+import js_gc as gc
+import js_runtime as runtime
+import js_primitives { EqualityMode }
+import js_primitives as primitives
+import js_coercion_host { CoercionHooks }
+import js_call_host { CallHooks }
+import js_property_host { OwnPropertyHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_prototype_host { PrototypeHooks }
+import js_property_descriptors as descriptors
+import js_property_mutations as properties
+import js_prototypes as prototypes
+import js_string_types { StringLengthError }
+import js_bigint { BigIntError }
+import js_exceptions { JsException }
+import js_backtrace as backtrace
+import js_atom_data as atoms
+import js_strings { Strings }
+import js_parser_diagnostics { DiagnosticMessage }
+import silk.list { List }
+import native_stack { currentFrameAddress }
+
+pub struct ProxyData {
+  pub target: Value,
+  pub handler: Value,
+  pub isFunction: bool,
+  pub revoked: bool
+}
+fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+pub fn reference(value: Value) -> *mut HeapHeader {
+  return match value { Value.Object { reference } => reference _ => invariant() }
+}
+pub fn undefined(value: Value) -> bool { return match value { Value.Undefined => true _ => false } }
+pub unsafe fn storage(object: *mut HeapHeader) -> ?*mut HeapHeader {
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  return match &data.payload {
+    ObjectPayload.Opaque { family: ObjectPayloadFamily.Proxy, reference } => reference
+    ObjectPayload.Empty => Pointer.null<HeapHeader>()
+    _ => invariant()
+  }
+}
+unsafe fn state(object: Value) -> *mut HeapHeader {
+  return match Pointer.nonNullMut<HeapHeader>(unsafe storage(reference(object))) {
+    Option<*mut HeapHeader>.Some { value } => value _ => invariant()
+  }
+}
+pub unsafe fn target(object: Value) -> Value {
+  let anchor = () let data = unsafe HeapCell.payload<ProxyData, ()>(&anchor, unsafe state(object))
+  return data.target
+}
+pub unsafe fn handler(object: Value) -> Value {
+  let anchor = () let data = unsafe HeapCell.payload<ProxyData, ()>(&anchor, unsafe state(object))
+  return data.handler
+}
+pub unsafe fn isCallable(object: Value) -> bool {
+  let anchor = () let data = unsafe HeapCell.payload<ProxyData, ()>(&anchor, unsafe state(object))
+  return data.isFunction
+}
+pub unsafe fn isRevoked(object: Value) -> bool {
+  let anchor = () let data = unsafe HeapCell.payload<ProxyData, ()>(&anchor, unsafe state(object))
+  return data.revoked
+}
+pub unsafe fn revoke(object: Value) -> () {
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<ProxyData, ()>(&mut anchor, unsafe state(object))
+  data.revoked = true
+}
+pub unsafe fn constructorBit(object: Value) -> bool {
+  if !object.isObject() { return false }
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(object))
+  return data.isConstructor
+}
+pub unsafe fn storedExtensible(object: Value) -> bool {
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(object))
+  return data.extensible
+}
+pub unsafe fn sameValue(a: Value, b: Value) -> bool { return unsafe primitives.equal(a, b, EqualityMode.SameValue) }
+pub unsafe fn mark(object: *mut HeapHeader, tracer: &mut Tracer) -> () {
+  let node = match Pointer.nonNullMut<HeapHeader>(unsafe storage(object)) {
+    Option<*mut HeapHeader>.Some { value } => value _ => { return () }
+  }
+  let anchor = () let data = unsafe HeapCell.payload<ProxyData, ()>(&anchor, node)
+  unsafe tracer.value(data.target) unsafe tracer.value(data.handler)
+}
+pub unsafe fn finalize<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, object: *mut HeapHeader) -> () {
+  let node = match Pointer.nonNullMut<HeapHeader>(unsafe storage(object)) {
+    Option<*mut HeapHeader>.Some { value } => value _ => { return () }
+  }
+  let mut anchor = () let objectData = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, object)
+  objectData.payload = ObjectPayload.Empty drop objectData
+  let data = unsafe HeapCell.payload<ProxyData, ()>(&anchor, node)
+  let ownedTarget = data.target let ownedHandler = data.handler drop data
+  unsafe gc.release(&mut hooks, rt, ownedTarget) unsafe gc.release(&mut hooks, rt, ownedHandler)
+  unsafe HeapCell.destroy<ProxyData>(node)
+}
+pub unsafe effect fn error<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  message: &[u8]) -> never ! JsException ? &mut Allocator {
+  return run unsafe hooks.throwError(context, NativeErrorKind.Type, message)
+}
+pub unsafe effect fn materialize<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  error: OutOfMemoryError | StringLengthError | BigIntError | JsException) -> never ! JsException ? &mut Allocator {
+  match move error {
+    OutOfMemoryError allocation => { return run unsafe hooks.throwOutOfMemory(context) }
+    StringLengthError length => { return run unsafe hooks.throwError(context, NativeErrorKind.Internal, b"string too long") }
+    BigIntError impossible => invariant()
+    JsException signal => { fail move signal }
+  }
+}
+pub effect fn exceptionValue(error: JsException) -> Value { drop error return Value.Exception }
+pub unsafe effect fn getMethod<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  object: Value, name: u32) -> Value ! JsException ? &mut Allocator {
+  if unsafe runtime.checkStackOverflow(unsafe runtime.contextRuntime(context), currentFrameAddress(), 0, true) {
+    return run unsafe hooks.throwError(context, NativeErrorKind.Internal, b"stack overflow")
+  }
+  if unsafe isRevoked(object) { return run unsafe error(&mut hooks, context, b"revoked proxy") }
+  let result = run Effect.result(unsafe hooks.getProperty(context, unsafe handler(object), name))
+  let method = match move result {
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => value
+    Result<Value, OutOfMemoryError | JsException>.Failure { error: failure } => run unsafe materialize(&mut hooks, context, move failure)
+  }
+  if match method { Value.Null => true _ => false } { return Value.Undefined }
+  return method
+}
+pub unsafe effect fn callFree<H: HeapHooks + CoercionHooks + CallHooks>(hooks: &mut H,
+  context: *mut HeapHeader, method: Value, receiver: Value, arguments: &[Value]) -> Value ! JsException ? &mut Allocator {
+  let mut data = unsafe Intrinsic.pointerRequalify<[*]mut Value, *mut Value>(unsafe Intrinsic.stackAllocate<Value>(0))
+  if arguments.length != 0 {
+    data = unsafe Intrinsic.pointerRequalify<*const Value, *mut Value>(Pointer.fromRef<Value>(&arguments[0]))
+  }
+  let slots = FrameSlots.Borrowed { data: data, length: arguments.length }
+  let called = run Effect.result(unsafe hooks.callArguments(context, method, receiver, &slots))
+  let result = match move called {
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => value
+    Result<Value, OutOfMemoryError | JsException>.Failure { error: failure } => {
+      let pending = run Effect.catch<JsException>(unsafe materialize(&mut hooks, context, move failure), exceptionValue)
+      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), method)
+      fail JsException {}
+    }
+  }
+  unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), method)
+  return result
+}
+pub unsafe effect fn atomValue<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  atom: u32) -> Value ! JsException ? &mut Allocator {
+  let anchor = () let data = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, unsafe runtime.contextRuntime(context))
+  let result = run Effect.result(data.atoms.toValue(atom, false)) drop data
+  return match move result {
+    Result<Value, OutOfMemoryError | StringLengthError>.Success { value } => value
+    Result<Value, OutOfMemoryError | StringLengthError>.Failure { error: failure } => run unsafe materialize(&mut hooks, context, move failure)
+  }
+}
+pub unsafe fn toBoolFree<H: HeapHooks>(hooks: &mut H, context: *mut HeapHeader, value: Value) -> bool {
+  let result = unsafe primitives.toBoolean(value) != 0
+  unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), value)
+  return result
+}
+pub unsafe effect fn defineValue<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value, atom: u32, value: Value, flags: u32) -> bool ! JsException ? &mut Allocator {
+  let result = run Effect.result(unsafe properties.defineProperty(&mut hooks, context, object, atom, value,
+    Value.Undefined, Value.Undefined, flags | JS_PROP_HAS_VALUE | JS_PROP_HAS_CONFIGURABLE |
+    JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE))
+  let accepted = match move result {
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { value: success } => success
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error: failure } => {
+      let pending = run Effect.catch<JsException>(unsafe materialize(&mut hooks, context, move failure), exceptionValue)
+      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), value)
+      fail JsException {}
+    }
+  }
+  unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), value)
+  return accepted
+}
+pub unsafe effect fn ownProperty<H: HeapHooks + OwnPropertyHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value, atom: u32) -> Option<PropertyDescriptor> ! JsException ? &mut Allocator {
+  let result = run Effect.result(unsafe descriptors.getOwnProperty(&mut hooks, context, object, atom))
+  return match move result {
+    Result<Option<PropertyDescriptor>, OutOfMemoryError | JsException>.Success { value } => move value
+    Result<Option<PropertyDescriptor>, OutOfMemoryError | JsException>.Failure { error: failure } => run unsafe materialize(&mut hooks, context, move failure)
+  }
+}
+pub unsafe effect fn extensible<H: PrototypeHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value) -> bool ! JsException ? &mut Allocator {
+  let result = run Effect.result(unsafe prototypes.isExtensible(&mut hooks, context, object))
+  return match move result {
+    Result<bool, OutOfMemoryError | JsException>.Success { value } => value
+    Result<bool, OutOfMemoryError | JsException>.Failure { error: failure } => run unsafe materialize(&mut hooks, context, move failure)
+  }
+}
+
+pub unsafe effect fn throwNotConstructor<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  function: Value) -> never ! JsException ? &mut Allocator {
+  if unsafe hooks.isCallable(context, function) {
+    match unsafe backtrace.propertyString(function, atoms.JS_ATOM_name) {
+      Option<Value>.Some { value: name } => {
+        let encoded = run Effect.result(Strings.toUtf8(name, false))
+        match move encoded {
+          Result<List<u8>, OutOfMemoryError>.Success { value: bytes } => {
+            let mut message = DiagnosticMessage.make()
+            message.append(bytes.asSlice()) message.append(b" is not a constructor")
+            return run unsafe error(&mut hooks, context, message.bytes())
+          }
+          Result<List<u8>, OutOfMemoryError>.Failure { error: failure } => {
+            let pending = run Effect.catch<JsException>(unsafe materialize(&mut hooks, context, move failure), exceptionValue)
+          }
+        }
+      }
+      Option<Value>.None => ()
+    }
+  }
+  return run unsafe error(&mut hooks, context, b"not a constructor")
+}

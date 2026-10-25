@@ -1,0 +1,457 @@
+//! Native Promise storage, capabilities, resolving functions and jobs.
+//! quickjs.c:56405-56947,57571-57653. Inputs borrow; successful Values own.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import runtime_memory { AllocationObserver }
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_core_types { RuntimeState, ContextState, ObjectData, ObjectPayload, ObjectPayloadFamily,
+  NativeFunctionId, HeapList, FrameSlots, NativeErrorKind, JobEntry }
+import js_value { Value }
+import js_gc { HeapHooks, Tracer }
+import js_gc as gc
+import js_runtime as runtime
+import js_runtime_jobs as jobs
+import js_class_data as classes
+import js_atom_data as atoms
+import js_coercion_host { CoercionHooks }
+import js_property_host { OwnPropertyHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_call_host { CallHooks }
+import js_native_functions as functions
+import js_constructor_ops as constructors
+import js_object_allocate as objects
+import js_proxy_core as core
+import js_primitives as primitives
+import js_exceptions { JsException }
+import js_exceptions as exceptions
+import js_promise_callbacks as callbacks
+
+pub interface PromiseHooks {
+  /// Both Values and opaque are borrowed. The callback may reenter the engine.
+  unsafe effect fn promiseRejection(self: &mut Self, context: *mut HeapHeader,
+    callback: NativeFunctionId, promise: Value, reason: Value, handled: bool, opaque: ?*mut u8) -> () ? &mut Allocator
+}
+pub const PENDING: i32 = 0
+pub const FULFILLED: i32 = 1
+// NativeFunctionHooks supplies captured data as a borrowed writable native range.
+// Mutate the backing slot, never the shared FrameSlots descriptor itself.
+pub unsafe fn setCapture(captured: &FrameSlots, index: usize, value: Value) -> () {
+  match &captured.* {
+    FrameSlots.Borrowed { data, .. } => {
+      unsafe Pointer.write<Value>(unsafe Pointer.atMut<Value>(unsafe Pointer.assumeManyMut<Value>(data), index), value)
+    }
+    _ => invariant()
+  }
+}
+pub const REJECTED: i32 = 2
+struct Data { state: i32, handled: bool, result: Value, reactions: HeapList }
+struct Resolved { already: bool }
+struct Resolving { promise: Value, resolved: *mut HeapHeader }
+pub struct Capability { pub promise: Value, pub resolve: Value, pub reject: Value }
+impl Capability {
+  pub fn make() -> Self { return Self { promise: Value.Undefined, resolve: Value.Undefined, reject: Value.Undefined } }
+}
+fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+pub unsafe fn argument(argv: &FrameSlots, index: usize) -> Value {
+  if index >= argv.length() { return Value.Undefined } return unsafe argv.get(index)
+}
+unsafe fn storage(object: *mut HeapHeader) -> ?*mut HeapHeader {
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  return match &data.payload {
+    ObjectPayload.Opaque { reference, .. } => reference
+    ObjectPayload.Empty => Pointer.null<HeapHeader>()
+    _ => invariant()
+  }
+}
+unsafe fn node(promise: Value) -> ?*mut HeapHeader {
+  if !promise.isObject() { return Pointer.null<HeapHeader>() }
+  let object = core.reference(promise)
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  if data.classId != classes.JS_CLASS_PROMISE { return Pointer.null<HeapHeader>() }
+  drop data return unsafe storage(object)
+}
+unsafe fn required(promise: Value) -> *mut HeapHeader {
+  return match Pointer.nonNullMut<HeapHeader>(unsafe node(promise)) {
+    Option<*mut HeapHeader>.Some { value } => value _ => invariant()
+  }
+}
+pub unsafe fn state(promise: Value) -> i32 {
+  let reference = match Pointer.nonNullMut<HeapHeader>(unsafe node(promise)) {
+    Option<*mut HeapHeader>.Some { value } => value _ => { return -1 }
+  }
+  let anchor = () let data = unsafe HeapCell.payload<Data, ()>(&anchor, reference)
+  return data.state
+}
+pub unsafe fn result(promise: Value) -> Value {
+  let reference = match Pointer.nonNullMut<HeapHeader>(unsafe node(promise)) {
+    Option<*mut HeapHeader>.Some { value } => value _ => { return Value.Undefined }
+  }
+  let anchor = () let data = unsafe HeapCell.payload<Data, ()>(&anchor, reference)
+  return unsafe data.result.retained()
+}
+pub unsafe effect fn get<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader, object: Value, atom: u32) -> Value ! JsException ? &mut Allocator {
+  let outcome = run Effect.result(unsafe hooks.getProperty(context, object, atom))
+  return match move outcome {
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => value
+    Result<Value, OutOfMemoryError | JsException>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error)
+  }
+}
+pub unsafe effect fn call<H: CoercionHooks + CallHooks>(hooks: &mut H, context: *mut HeapHeader,
+  function: Value, receiver: Value, arguments: &[Value]) -> Value ! JsException ? &mut Allocator {
+  let mut missing = Value.Undefined let mut pointer = Pointer.fromMutRef<Value>(&mut missing)
+  if arguments.length != 0 { pointer = unsafe Intrinsic.pointerRequalify<*const Value, *mut Value>(Pointer.fromRef<Value>(&arguments[0])) }
+  let slots = FrameSlots.Borrowed { data: pointer, length: arguments.length }
+  return run unsafe callSlots(&mut hooks, context, function, receiver, &slots)
+}
+pub unsafe effect fn callSlots<H: CoercionHooks + CallHooks>(hooks: &mut H, context: *mut HeapHeader,
+  function: Value, receiver: Value, arguments: &FrameSlots) -> Value ! JsException ? &mut Allocator {
+  let outcome = run Effect.result(unsafe hooks.callArguments(context, function, receiver, arguments))
+  return match move outcome {
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => value
+    Result<Value, OutOfMemoryError | JsException>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error)
+  }
+}
+pub unsafe effect fn invoke<H: HeapHooks + CoercionHooks + CallHooks>(hooks: &mut H, context: *mut HeapHeader,
+  receiver: Value, atom: u32, arguments: &[Value]) -> Value ! JsException ? &mut Allocator {
+  let method = run unsafe get(&mut hooks, context, receiver, atom)
+  let outcome = run Effect.result(unsafe call(&mut hooks, context, method, receiver, arguments))
+  unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), method)
+  return match move outcome { Result<Value, JsException>.Success { value } => value Result<Value, JsException>.Failure { error } => { fail move error } }
+}
+pub unsafe effect fn checkFunction<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader, value: Value) -> () ! JsException ? &mut Allocator {
+  if !unsafe hooks.isCallable(context, value) { return run unsafe core.error(&mut hooks, context, b"not a function") }
+}
+pub unsafe fn freeCapability<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, capability: Capability) -> () {
+  unsafe gc.release(&mut hooks, rt, capability.resolve) unsafe gc.release(&mut hooks, rt, capability.reject)
+  unsafe gc.release(&mut hooks, rt, capability.promise)
+}
+unsafe fn freeList<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, list: HeapList) -> () {
+  let mut owned = move list
+  while true {
+    let reference = match unsafe owned.popFront() { Option<*mut HeapHeader>.Some { value } => value _ => { break } }
+    unsafe gc.releaseJob(&mut hooks, rt, reference)
+  }
+}
+unsafe fn markList(list: &HeapList, tracer: &mut Tracer) -> () {
+  let mut cursor = list.first
+  while true {
+    let reference = match Pointer.nonNullMut<HeapHeader>(cursor) { Option<*mut HeapHeader>.Some { value } => value _ => { break } }
+    let anchor = () let data = unsafe HeapCell.payload<JobEntry, ()>(&anchor, reference)
+    let mut index: usize = 0
+    while index < data.arguments.length() { unsafe tracer.value(data.arguments.get(index)) index = index + 1 }
+    drop data
+    let header = unsafe Pointer.borrow<(), HeapHeader>(&anchor, reference)
+    cursor = header.next
+  }
+}
+pub unsafe fn mark(object: *mut HeapHeader, tracer: &mut Tracer) -> () {
+  let reference = match Pointer.nonNullMut<HeapHeader>(unsafe storage(object)) { Option<*mut HeapHeader>.Some { value } => value _ => { return } }
+  let anchor = () let data = unsafe HeapCell.payload<Data, ()>(&anchor, reference)
+  unsafe tracer.value(data.result) unsafe markList(&data.reactions, &mut tracer)
+}
+pub unsafe fn finalize<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, object: *mut HeapHeader) -> () {
+  let reference = match Pointer.nonNullMut<HeapHeader>(unsafe storage(object)) { Option<*mut HeapHeader>.Some { value } => value _ => { return } }
+  let mut anchor = () let objectData = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, object)
+  objectData.payload = ObjectPayload.Empty drop objectData
+  let data = unsafe HeapCell.payloadMut<Data, ()>(&mut anchor, reference)
+  let resultValue = Intrinsic.replace(data.result, Value.Undefined)
+  let reactions = Intrinsic.replace(data.reactions, HeapList.make()) drop data
+  unsafe freeList(&mut hooks, rt, move reactions)
+  unsafe gc.release(&mut hooks, rt, resultValue) unsafe HeapCell.destroy<Data>(reference)
+}
+pub unsafe fn markResolving(object: *mut HeapHeader, tracer: &mut Tracer) -> () {
+  let reference = match Pointer.nonNullMut<HeapHeader>(unsafe storage(object)) { Option<*mut HeapHeader>.Some { value } => value _ => { return } }
+  let anchor = () let data = unsafe HeapCell.payload<Resolving, ()>(&anchor, reference)
+  unsafe tracer.value(data.promise)
+}
+unsafe fn freeResolved(reference: *mut HeapHeader) -> () { if unsafe HeapCell.decrement(reference) { unsafe HeapCell.destroy<Resolved>(reference) } }
+pub unsafe fn finalizeResolving<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, object: *mut HeapHeader) -> () {
+  let reference = match Pointer.nonNullMut<HeapHeader>(unsafe storage(object)) { Option<*mut HeapHeader>.Some { value } => value _ => { return } }
+  let mut anchor = () let objectData = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, object)
+  objectData.payload = ObjectPayload.Empty drop objectData
+  let data = unsafe HeapCell.payload<Resolving, ()>(&anchor, reference)
+  let promise = data.promise let resolved = data.resolved drop data
+  unsafe freeResolved(resolved) unsafe gc.release(&mut hooks, rt, promise) unsafe HeapCell.destroy<Resolving>(reference)
+}
+unsafe effect fn track<H: PromiseHooks>(hooks: &mut H, context: *mut HeapHeader, promise: Value, reason: Value, handled: bool) -> () ? &mut Allocator {
+  let anchor = () let runtimeData = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, unsafe runtime.contextRuntime(context))
+  let callback = match &runtimeData.promiseRejectionTracker.callback { Option<NativeFunctionId>.Some { value } => value _ => { return } }
+  let opaque = runtimeData.promiseRejectionTracker.opaque drop runtimeData
+  run unsafe hooks.promiseRejection(context, callback, promise, reason, handled, opaque)
+}
+unsafe effect fn enqueue<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader, method: u32, arguments: &[Value]) -> bool ? &mut Allocator {
+  let outcome = run Effect.result(unsafe jobs.enqueueJob(context, callbacks.id(method), arguments))
+  return match move outcome {
+    Result<(), OutOfMemoryError>.Success { .. } => true
+    Result<(), OutOfMemoryError>.Failure { error } => {
+      let pending = run Effect.catch<JsException>(unsafe core.materialize(&mut hooks, context, move error), core.exceptionValue)
+      return false
+    }
+  }
+}
+unsafe fn queueReaction<H: HeapHooks>(hooks: &mut H, context: *mut HeapHeader,
+  reference: *mut HeapHeader, reject: bool, value: Value) -> () {
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<JobEntry, ()>(&mut anchor, reference)
+  let arguments = data.arguments.asMutSlice()
+  let mut unused = arguments[3]
+  if reject { unused = arguments[2] arguments[2] = arguments[3] }
+  arguments[3] = Value.Bool { value: reject }
+  arguments[4] = unsafe value.retained()
+  drop arguments drop data
+  unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), unused)
+  unsafe jobs.enqueuePreparedJob(context, reference)
+}
+pub unsafe effect fn settle<H: HeapHooks + CoercionHooks + PromiseHooks>(hooks: &mut H,
+  context: *mut HeapHeader, promise: Value, value: Value, reject: bool) -> () ? &mut Allocator {
+  if unsafe state(promise) != PENDING { return }
+  let reference = unsafe required(promise) let rt = unsafe runtime.contextRuntime(context)
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<Data, ()>(&mut anchor, reference)
+  let old = Intrinsic.replace(data.result, unsafe value.retained())
+  data.state = FULFILLED if reject { data.state = REJECTED }
+  let unhandled = !data.handled drop data
+  unsafe gc.release(&mut hooks, rt, old)
+  if reject && unhandled { run unsafe track(&mut hooks, context, promise, value, false) }
+  while true {
+    let current = unsafe HeapCell.payloadMut<Data, ()>(&mut anchor, reference)
+    let pending = unsafe current.reactions.popFront()
+    drop current
+    let reaction = match move pending { Option<*mut HeapHeader>.Some { value: selected } => selected _ => { break } }
+    unsafe queueReaction(&mut hooks, context, reaction, reject, value)
+  }
+}
+unsafe effect fn createResolvingOne<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, promise: Value, resolved: *mut HeapHeader, reject: bool) -> Value ! JsException ? &mut Allocator {
+  let anchor = () let ctx = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  let prototype = ctx.functionPrototype drop ctx
+  let mut classId = classes.JS_CLASS_PROMISE_RESOLVE_FUNCTION let mut family = ObjectPayloadFamily.PromiseResolve
+  if reject { classId = classes.JS_CLASS_PROMISE_REJECT_FUNCTION family = ObjectPayloadFamily.PromiseReject }
+  let allocated = run Effect.result(unsafe objects.withPrototypeClass(&mut hooks, memory, context, prototype, classId))
+  let object = match move allocated { Result<Value, OutOfMemoryError>.Success { value } => value Result<Value, OutOfMemoryError>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error) }
+  let allocatedData = run Effect.result(HeapCell.allocate(HeapKind.Auxiliary, Resolving { promise: Value.Undefined, resolved: resolved }))
+  let reference = match move allocatedData {
+    Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value
+    Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => {
+      let pending = run Effect.catch<JsException>(unsafe core.materialize(&mut hooks, context, move error), core.exceptionValue)
+      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), object) fail JsException {}
+    }
+  }
+  unsafe HeapCell.retain(resolved)
+  let mut mutation = () let data = unsafe HeapCell.payloadMut<Resolving, ()>(&mut mutation, reference)
+  data.promise = unsafe promise.retained() drop data
+  let objectData = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut mutation, core.reference(object))
+  objectData.payload = ObjectPayload.Opaque { family: family, reference: reference } drop objectData
+  let configured = run Effect.result(unsafe functions.setFunctionProperties(&mut hooks, context, object, atoms.JS_ATOM_empty_string, 1))
+  return match move configured {
+    Result<(), JsException>.Success { .. } => object
+    Result<(), JsException>.Failure { error } => { unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), object) fail move error }
+  }
+}
+pub unsafe effect fn createResolvingFunctions<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, promise: Value) -> Capability ! JsException ? &mut Allocator {
+  let allocated = run Effect.result(HeapCell.allocate(HeapKind.Auxiliary, Resolved { already: false }))
+  let shared = match move allocated { Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error) }
+  let first = run Effect.result(unsafe createResolvingOne(&mut hooks, memory, context, promise, shared, false))
+  let resolve = match move first {
+    Result<Value, JsException>.Success { value } => value
+    Result<Value, JsException>.Failure { error } => { unsafe freeResolved(shared) fail move error }
+  }
+  let second = run Effect.result(unsafe createResolvingOne(&mut hooks, memory, context, promise, shared, true))
+  unsafe freeResolved(shared)
+  return match move second {
+    Result<Value, JsException>.Success { value } => Capability { promise: Value.Undefined, resolve: resolve, reject: value }
+    Result<Value, JsException>.Failure { error } => { unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), resolve) fail move error }
+  }
+}
+pub unsafe effect fn resolvingCall<H: HeapHooks + CoercionHooks + PromiseHooks>(hooks: &mut H,
+  context: *mut HeapHeader, function: Value, arguments: &FrameSlots) -> Value ! JsException ? &mut Allocator {
+  let object = core.reference(function)
+  let reference = match Pointer.nonNullMut<HeapHeader>(unsafe storage(object)) { Option<*mut HeapHeader>.Some { value } => value _ => { return Value.Undefined } }
+  let mut anchor = () let data = unsafe HeapCell.payload<Resolving, ()>(&anchor, reference)
+  let promise = data.promise let shared = data.resolved drop data
+  let resolved = unsafe HeapCell.payloadMut<Resolved, ()>(&mut anchor, shared)
+  if resolved.already { return Value.Undefined } resolved.already = true drop resolved
+  let objectData = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  let reject = objectData.classId == classes.JS_CLASS_PROMISE_REJECT_FUNCTION drop objectData
+  let resolution = unsafe argument(arguments, 0) let rt = unsafe runtime.contextRuntime(context)
+  if reject || !resolution.isObject() { run unsafe settle(&mut hooks, context, promise, resolution, reject) return Value.Undefined }
+  let mut then = Value.Exception
+  if unsafe core.sameValue(resolution, promise) {
+    let pending = run Effect.catch<JsException>(unsafe selfResolution(&mut hooks, context), core.exceptionValue)
+  } else { then = run Effect.catch<JsException>(unsafe get(&mut hooks, context, resolution, atoms.JS_ATOM_then), core.exceptionValue) }
+  if then.isException() {
+    let error = unsafe exceptions.take(rt) run unsafe settle(&mut hooks, context, promise, error, true) unsafe gc.release(&mut hooks, rt, error)
+  } else if !unsafe hooks.isCallable(context, then) {
+    unsafe gc.release(&mut hooks, rt, then) run unsafe settle(&mut hooks, context, promise, resolution, false)
+  } else {
+    let queued = run unsafe enqueue(&mut hooks, context, callbacks.THENABLE_JOB, &[promise, resolution, then]) unsafe gc.release(&mut hooks, rt, then)
+    if !queued {
+      let error = unsafe exceptions.take(rt)
+      run unsafe settle(&mut hooks, context, promise, error, true)
+      unsafe gc.release(&mut hooks, rt, error)
+    }
+  }
+  return Value.Undefined
+}
+unsafe effect fn selfResolution<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader) -> Value ! JsException ? &mut Allocator {
+  return run unsafe core.error(&mut hooks, context, b"promise self resolution")
+}
+pub unsafe effect fn constructor<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + CallHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, newTarget: Value, executor: Value) -> Value ! JsException ? &mut Allocator {
+  run unsafe checkFunction(&mut hooks, context, executor)
+  let object = run unsafe constructors.createFromConstructor(&mut hooks, memory, context, newTarget, classes.JS_CLASS_PROMISE)
+  let outcome = run Effect.result(unsafe constructBody(&mut hooks, memory, context, object, executor))
+  return match move outcome {
+    Result<(), JsException>.Success { .. } => object
+    Result<(), JsException>.Failure { error } => { unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), object) fail move error }
+  }
+}
+unsafe effect fn constructBody<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + CallHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, object: Value, executor: Value) -> () ! JsException ? &mut Allocator {
+  let allocated = run Effect.result(HeapCell.allocate(HeapKind.Auxiliary, Data { state: PENDING, handled: false,
+    result: Value.Undefined, reactions: HeapList.make() }))
+  let reference = match move allocated { Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error) }
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, core.reference(object))
+  data.payload = ObjectPayload.Opaque { family: ObjectPayloadFamily.Promise, reference: reference } drop data
+  let capability = run unsafe createResolvingFunctions(&mut hooks, memory, context, object)
+  let rt = unsafe runtime.contextRuntime(context)
+  let returned = run Effect.catch<JsException>(unsafe call(&mut hooks, context, executor, Value.Undefined, &[capability.resolve, capability.reject]), core.exceptionValue)
+  let mut failed = false
+  if returned.isException() {
+    let error = unsafe exceptions.take(rt)
+    let rejected = run Effect.catch<JsException>(unsafe call(&mut hooks, context, capability.reject, Value.Undefined, &[error]), core.exceptionValue)
+    unsafe gc.release(&mut hooks, rt, error) failed = rejected.isException() unsafe gc.release(&mut hooks, rt, rejected)
+  }
+  unsafe gc.release(&mut hooks, rt, returned) unsafe freeCapability(&mut hooks, rt, move capability)
+  if failed { fail JsException {} }
+}
+pub unsafe effect fn executor<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader, arguments: &FrameSlots, captured: &FrameSlots) -> Value ! JsException ? &mut Allocator {
+  let mut i: usize = 0
+  while i < 2 {
+    if !core.undefined(unsafe captured.get(i)) { return run unsafe core.error(&mut hooks, context, b"resolving function already set") }
+    let value = unsafe argument(arguments, i)
+    unsafe setCapture(captured, i, unsafe value.retained()) i = i + 1
+  }
+  return Value.Undefined
+}
+pub unsafe effect fn newCapability<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + CallHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, ctor: Value) -> Capability ! JsException ? &mut Allocator {
+  let executorValue = run unsafe functions.newDataFunction(&mut hooks, memory, context, callbacks.id(callbacks.EXECUTOR), 2, 0, &[Value.Undefined, Value.Undefined])
+  let outcome = run Effect.result(unsafe capabilityBody(&mut hooks, memory, context, ctor, executorValue))
+  unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), executorValue)
+  return match move outcome { Result<Capability, JsException>.Success { value } => move value Result<Capability, JsException>.Failure { error } => { fail move error } }
+}
+unsafe effect fn capabilityBody<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + CallHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, ctor: Value, executorValue: Value) -> Capability ! JsException ? &mut Allocator {
+  let mut promise = Value.Undefined
+  if core.undefined(ctor) { promise = run unsafe constructor(&mut hooks, memory, context, ctor, executorValue) }
+  else {
+    let mut argumentValue = executorValue let args = FrameSlots.Borrowed { data: Pointer.fromMutRef<Value>(&mut argumentValue), length: 1 }
+    let constructed = run Effect.result(unsafe hooks.construct(context, ctor, ctor, &args))
+    promise = match move constructed { Result<Value, OutOfMemoryError | JsException>.Success { value } => value Result<Value, OutOfMemoryError | JsException>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error) }
+  }
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(executorValue))
+  let pair = match &object.payload { ObjectPayload.NativeFunction { function } => [function.capturedValues.get(0), function.capturedValues.get(1)] _ => invariant() } drop object
+  let mut i: usize = 0
+  while i < 2 {
+    let checked = run Effect.result(unsafe checkFunction(&mut hooks, context, pair[i]))
+    match move checked { Result<(), JsException>.Success { .. } => () Result<(), JsException>.Failure { error } => { unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), promise) fail move error } }
+    i = i + 1
+  }
+  return Capability { promise: promise, resolve: unsafe pair[0].retained(), reject: unsafe pair[1].retained() }
+}
+unsafe effect fn allocateReaction<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  onFulfilled: Value, onRejected: Value, resolve: Value, reject: Value) -> *mut HeapHeader ! JsException ? &mut Allocator {
+  let mut fulfillHandler = onFulfilled let mut rejectHandler = onRejected
+  if !unsafe hooks.isCallable(context, fulfillHandler) { fulfillHandler = Value.Undefined }
+  if !unsafe hooks.isCallable(context, rejectHandler) { rejectHandler = Value.Undefined }
+  // Reserve the eventual job before publishing the subscription. Settlement only
+  // selects its handler, fills its result, and transfers the existing queue node.
+  let allocated = run Effect.result(unsafe jobs.prepareJob(callbacks.id(callbacks.REACTION_JOB),
+    &[resolve, reject, fulfillHandler, rejectHandler, Value.Undefined]))
+  return match move allocated {
+    Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value
+    Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error)
+  }
+}
+pub unsafe effect fn performThen<H: HeapHooks + CoercionHooks + PromiseHooks>(hooks: &mut H, context: *mut HeapHeader,
+  promise: Value, onFulfilled: Value, onRejected: Value, resolve: Value, reject: Value) -> () ! JsException ? &mut Allocator {
+  let reference = unsafe required(promise)
+  let reaction = run unsafe allocateReaction(&mut hooks, context, onFulfilled, onRejected, resolve, reject)
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<Data, ()>(&mut anchor, reference)
+  let settled = data.state let handled = data.handled let value = data.result
+  if settled == PENDING { unsafe data.reactions.pushBack(reaction) drop data }
+  else {
+    drop data
+    if settled == REJECTED && !handled { run unsafe track(&mut hooks, context, promise, value, true) }
+    unsafe queueReaction(&mut hooks, context, reaction, settled == REJECTED, value)
+  }
+  let after = unsafe HeapCell.payloadMut<Data, ()>(&mut anchor, reference) after.handled = true drop after
+}
+pub unsafe effect fn then<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + CallHooks + PromiseHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, promise: Value, onFulfilled: Value, onRejected: Value) -> Value ! JsException ? &mut Allocator {
+  if unsafe state(promise) < 0 { return run unsafe core.error(&mut hooks, context, b"not a Promise") }
+  let rt = unsafe runtime.contextRuntime(context)
+  let ctor = run unsafe constructors.speciesConstructor(&mut hooks, context, promise, Value.Undefined)
+  let allocated = run Effect.result(unsafe newCapability(&mut hooks, memory, context, ctor)) unsafe gc.release(&mut hooks, rt, ctor)
+  let mut capability = match move allocated { Result<Capability, JsException>.Success { value } => move value Result<Capability, JsException>.Failure { error } => { fail move error } }
+  let installed = run Effect.result(unsafe performThen(&mut hooks, context, promise, onFulfilled, onRejected, capability.resolve, capability.reject))
+  let mut output = Value.Exception
+  match move installed { Result<(), JsException>.Success { .. } => { output = Intrinsic.replace(capability.promise, Value.Undefined) } _ => () }
+  unsafe freeCapability(&mut hooks, rt, move capability)
+  if output.isException() { fail JsException {} } return output
+}
+pub unsafe effect fn resolve<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + CallHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, ctor: Value, value: Value, reject: bool) -> Value ! JsException ? &mut Allocator {
+  if !ctor.isObject() { return run unsafe core.error(&mut hooks, context, b"not an object") }
+  let rt = unsafe runtime.contextRuntime(context)
+  if !reject && unsafe state(value) >= 0 {
+    let actual = run unsafe get(&mut hooks, context, value, atoms.JS_ATOM_constructor)
+    let same = unsafe core.sameValue(actual, ctor) unsafe gc.release(&mut hooks, rt, actual)
+    if same { return unsafe value.retained() }
+  }
+  let mut capability = run unsafe newCapability(&mut hooks, memory, context, ctor)
+  let mut method = capability.resolve if reject { method = capability.reject }
+  let returned = run Effect.catch<JsException>(unsafe call(&mut hooks, context, method, Value.Undefined, &[value]), core.exceptionValue)
+  let mut output = Value.Exception
+  if !returned.isException() { output = Intrinsic.replace(capability.promise, Value.Undefined) }
+  unsafe gc.release(&mut hooks, rt, returned) unsafe freeCapability(&mut hooks, rt, move capability)
+  if output.isException() { fail JsException {} } return output
+}
+pub unsafe effect fn dispatchJob<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + CallHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, method: u32, arguments: &[Value]) -> Value ! JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  if method == callbacks.REACTION_JOB {
+    let handler = arguments[2] let mut rejected = unsafe primitives.toBoolean(arguments[3]) != 0
+    let mut returned = Value.Undefined
+    if core.undefined(handler) {
+      if rejected {
+        let pending = run Effect.catch<JsException>(unsafe exceptions.throwValue<Value, H>(&mut hooks, rt, unsafe arguments[4].retained()), core.exceptionValue)
+        returned = unsafe exceptions.take(rt)
+      } else { returned = unsafe arguments[4].retained() }
+    }
+    else {
+      returned = run Effect.catch<JsException>(unsafe call(&mut hooks, context, handler, Value.Undefined, &[arguments[4]]), core.exceptionValue)
+      rejected = returned.isException() if rejected { returned = unsafe exceptions.take(rt) }
+    }
+    let mut function = arguments[0] if rejected { function = arguments[1] }
+    let mut output = Value.Undefined
+    if !core.undefined(function) { output = run Effect.catch<JsException>(unsafe call(&mut hooks, context, function, Value.Undefined, &[returned]), core.exceptionValue) }
+    unsafe gc.release(&mut hooks, rt, returned)
+    if output.isException() { fail JsException {} } return output
+  }
+  if method == callbacks.THENABLE_JOB {
+    let capability = run unsafe createResolvingFunctions(&mut hooks, memory, context, arguments[0])
+    let mut output = run Effect.catch<JsException>(unsafe call(&mut hooks, context, arguments[2], arguments[1], &[capability.resolve, capability.reject]), core.exceptionValue)
+    if output.isException() {
+      let error = unsafe exceptions.take(rt)
+      output = run Effect.catch<JsException>(unsafe call(&mut hooks, context, capability.reject, Value.Undefined, &[error]), core.exceptionValue)
+      unsafe gc.release(&mut hooks, rt, error)
+    }
+    unsafe freeCapability(&mut hooks, rt, move capability)
+    if output.isException() { fail JsException {} } return output
+  }
+  return invariant()
+}

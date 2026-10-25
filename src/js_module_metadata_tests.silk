@@ -1,0 +1,181 @@
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.result { Result }
+import silk.testing { AssertionError, Testing }
+import silk.usize
+import runtime_memory { RuntimeAllocator }
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_value { Value }
+import js_strings { Strings }
+import js_string_types { StringOwner, StringLengthError }
+import js_core_types { RuntimeState, ContextState, ModuleDef, ModuleStatus, ExportBinding,
+  ImportEntry, NativeFunctionId, WeakRefHeader }
+import js_gc { HeapHooks, Tracer }
+import js_gc
+import js_runtime { allocateRuntimeStorage, allocateContextStorage }
+import js_module_metadata { ExportKind, ModuleMetadataError, ModuleMetadataErrorKind }
+import js_module_metadata as metadata
+
+// Fixtures contain real modules/strings and no class-owned or Auxiliary JS edges.
+// Unexpected dispatch fails rather than substituting a pretend finalizer.
+struct NoClassEdges {}
+impl HeapHooks for NoClassEdges {
+  unsafe fn traceClass(self: &mut Self, runtime: *mut HeapHeader, object: *mut HeapHeader, callback: NativeFunctionId, tracer: &mut Tracer) -> () { Intrinsic.trap("QuickJS invariant violated") }
+  unsafe fn finalizeClass(self: &mut Self, runtime: *mut HeapHeader, object: *mut HeapHeader, callback: NativeFunctionId) -> () { Intrinsic.trap("QuickJS invariant violated") }
+  unsafe effect fn sweepWeak(self: &mut Self, runtime: *mut HeapHeader, node: *mut WeakRefHeader) -> () ? &mut Allocator { Intrinsic.trap("QuickJS invariant violated") }
+  unsafe fn destroyAuxiliary(self: &mut Self, runtime: *mut HeapHeader, node: *mut HeapHeader) -> () { Intrinsic.trap("QuickJS invariant violated") }
+}
+unsafe fn rc(node: *mut HeapHeader) -> i32 {
+  let anchor = ()
+  let header = unsafe Pointer.borrow<(), HeapHeader>(&anchor, node)
+  return header.referenceCount
+}
+unsafe fn valueRc(value: Value) -> i32 {
+  return match value { Value.String { reference } => unsafe rc(reference) _ => -1 }
+}
+fn same(left: ?*mut HeapHeader, right: ?*mut HeapHeader) -> bool {
+  return Pointer.address<HeapHeader>(left) == Pointer.address<HeapHeader>(right)
+}
+effect fn allocationFailed(error: OutOfMemoryError) -> i32 { drop error return -1 }
+
+
+test effect fn moduleListUnlinkRetainedLifetimeAndCycleCollection() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let runtime = run allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let context = run unsafe allocateContextStorage(runtime) |> Effect.provideMut<Allocator>(&mut allocator)
+  let first = run unsafe metadata.newModule(context, 0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let middle = run unsafe metadata.newModule(context, 0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let last = run unsafe metadata.newModule(context, 0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut anchor = () let mut hooks = NoClassEdges {}
+  unsafe js_gc.releaseHeader(&mut hooks, runtime, middle)
+  let a = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, first)
+  let b = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, last)
+  run Testing.expect(same(a.nextModule, last) && same(b.previousModule, first), "failed compilation unlinks interior module")
+  drop a drop b
+  unsafe js_gc.releaseHeader(&mut hooks, runtime, first)
+  let ctx = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  run Testing.expect(same(ctx.loadedModules.first, last) && same(ctx.loadedModules.last, last), "head removal updates both context endpoints")
+  drop ctx
+  unsafe HeapCell.retain(last)
+  let m = unsafe HeapCell.payloadMut<ModuleDef, ()>(&mut anchor, last)
+  m.privateValue = unsafe Value.Module { reference: last }.retained()
+  drop m
+  unsafe js_gc.releaseHeader(&mut hooks, runtime, context)
+  let surviving = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, last)
+  run Testing.expect(Pointer.isNull<HeapHeader>(surviving.previousModule) && Pointer.isNull<HeapHeader>(surviving.nextModule) && unsafe rc(last) == 2, "context detaches retained module and consumes only its list reference")
+  drop surviving
+  run unsafe js_gc.collect(&mut hooks, runtime, false) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(unsafe rc(last) == 2, "external module root protects private-value cycle")
+  unsafe js_gc.releaseHeader(&mut hooks, runtime, last)
+  run unsafe js_gc.collect(&mut hooks, runtime, false) |> Effect.provideMut<Allocator>(&mut allocator)
+  let rt = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  run Testing.expect(Pointer.isNull<HeapHeader>(rt.gcObjects.first) && Pointer.isNull<HeapHeader>(rt.zeroReferenceObjects.first), "unrooted module private-value cycle is traced and destroyed")
+  drop rt
+  run unsafe js_gc.destroyRuntime(&mut hooks, runtime) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(allocator.stats().usedBytes == 0, "unlink and cycle paths reclaim all native storage")
+}
+
+test effect fn moduleConstructorAndEveryMetadataGrowthRollBackOnOutOfMemory() -> ()
+  ! OutOfMemoryError | StringLengthError | ModuleMetadataError | AssertionError<'static> {
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let runtime = run allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let context = run unsafe allocateContextStorage(runtime) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut ra = () let mut anchor = ()
+  let initial = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ra, runtime)
+  let baseline = initial.atoms.count()
+  let doomed = run initial.atoms.internUtf8(b"consumed-on-module-oom") |> Effect.provideMut<Allocator>(&mut allocator)
+  drop initial
+  let constructorLimit = allocator.stats().usedBytes
+  allocator.setLimit(constructorLimit)
+  let result = run Effect.result(unsafe metadata.newModule(context, doomed)) |> Effect.provideMut<Allocator>(&mut allocator)
+  match move result {
+    Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => { drop error }
+    Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => { run Testing.expect(false, "constructor must fail at allocator limit") }
+  }
+  let recovered = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ra, runtime)
+  let ctx = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  run Testing.expect(recovered.atoms.count() == baseline && Pointer.isNull<HeapHeader>(ctx.loadedModules.first) && same(recovered.gcObjects.first, context) && same(recovered.gcObjects.last, context), "failed constructor consumes name without GC or context publication")
+  drop ctx
+  allocator.setLimit(usize.MAX)
+  let name = run recovered.atoms.internUtf8(b"metadata-oom-name") |> Effect.provideMut<Allocator>(&mut allocator)
+  let text = run recovered.atoms.toValue(name, true) |> Effect.provideMut<Allocator>(&mut allocator)
+  drop recovered
+  let node = run unsafe metadata.newModule(context, 0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let m = unsafe HeapCell.payloadMut<ModuleDef, ()>(&mut anchor, node)
+  let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ra, runtime)
+  let mut stage: usize = 0
+  while stage < 2 {
+    let used = allocator.stats().usedBytes
+    allocator.setLimit(used)
+    let requested = run metadata.addRequested(&mut m, &mut rt.atoms, name) |> Effect.catch<OutOfMemoryError>(allocationFailed) |> Effect.provideMut<Allocator>(&mut allocator)
+    let exported = run metadata.addExport(&mut m, &mut rt.atoms, name, 0x80000001, ExportKind.Local) |> Effect.catch<OutOfMemoryError>(allocationFailed) |> Effect.provideMut<Allocator>(&mut allocator)
+    let star = run metadata.addStarExport(&mut m, 9) |> Effect.catch<OutOfMemoryError>(allocationFailed) |> Effect.provideMut<Allocator>(&mut allocator)
+    let imported = run metadata.addImport(&mut m, &mut rt.atoms, ImportEntry { variableIndex: 8, isStar: true, importName: name, requestedModuleIndex: 9 }) |> Effect.catch<OutOfMemoryError>(allocationFailed) |> Effect.provideMut<Allocator>(&mut allocator)
+    run Testing.expect(requested == -1 && exported == -1 && star == -1 && imported == -1, "each initial/growing table allocation fails independently")
+    run Testing.expect(m.requestedModules.length() == stage && m.exports.length() == stage && m.starExports.length() == stage && m.imports.length() == stage, "OOM never publishes an entry")
+    run Testing.expect(m.requestedModules.capacity() == stage && m.exports.capacity() == stage && m.starExports.capacity() == stage && m.imports.capacity() == stage, "OOM keeps old capacities")
+    run Testing.expect(unsafe valueRc(text) == 2 + usize.toI32(stage) * 3 && allocator.stats().usedBytes == used, "OOM retains no borrowed atom or replacement array")
+    if stage == 1 {
+      let diagnostic = run metadata.addExport(&mut m, &mut rt.atoms, name, 0x80000000, ExportKind.Local) |> Effect.catch<OutOfMemoryError>(allocationFailed) |> Effect.provideMut<Allocator>(&mut allocator)
+      run Testing.expect(diagnostic == -1 && m.exports.length() == 1 && m.exports.capacity() == 1 && unsafe valueRc(text) == 5 && allocator.stats().usedBytes == used, "integer duplicate-name formatting OOM preserves the existing export and borrowed atoms")
+    }
+    allocator.setLimit(usize.MAX)
+    if stage == 0 {
+      let r = run metadata.addRequested(&mut m, &mut rt.atoms, name) |> Effect.provideMut<Allocator>(&mut allocator)
+      let e = run metadata.addExport(&mut m, &mut rt.atoms, name, 0x80000000, ExportKind.Indirect) |> Effect.provideMut<Allocator>(&mut allocator)
+      let s = run metadata.addStarExport(&mut m, 0) |> Effect.provideMut<Allocator>(&mut allocator)
+      let i = run metadata.addImport(&mut m, &mut rt.atoms, ImportEntry { variableIndex: 7, isStar: false, importName: name, requestedModuleIndex: 0 }) |> Effect.provideMut<Allocator>(&mut allocator)
+    }
+    stage = stage + 1
+  }
+  run Testing.expect(m.imports.get(0).variableIndex == 7 && m.starExports.get(0).requestedModuleIndex == 0 && m.requestedModules.asSlice()[0].name == name && m.exports.get(0).exportName == 0x80000000, "existing entries survive failed growth intact")
+  rt.atoms.release(name)
+  drop rt drop m
+  Strings.release(text)
+  let mut hooks = NoClassEdges {}
+  unsafe js_gc.releaseHeader(&mut hooks, runtime, context)
+  run unsafe js_gc.destroyRuntime(&mut hooks, runtime) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(allocator.stats().usedBytes == 0, "all failed and successful metadata storage reclaimed")
+}
+
+test effect fn moduleDuplicateExportOwnsDiagnosticPastRuntimeTeardown() -> ()
+  ! OutOfMemoryError | StringLengthError | ModuleMetadataError | AssertionError<'static> {
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let runtime = run allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let context = run unsafe allocateContextStorage(runtime) |> Effect.provideMut<Allocator>(&mut allocator)
+  let node = run unsafe metadata.newModule(context, 0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut anchor = () let mut ra = ()
+  let m = unsafe HeapCell.payloadMut<ModuleDef, ()>(&mut anchor, node)
+  let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ra, runtime)
+  let name = run rt.atoms.internUtf8(b"duplicate-export") |> Effect.provideMut<Allocator>(&mut allocator)
+  let index = run metadata.addExport(&mut m, &mut rt.atoms, name, name, ExportKind.Local) |> Effect.provideMut<Allocator>(&mut allocator)
+  let diagnosticLimit = allocator.stats().usedBytes
+  allocator.setLimit(diagnosticLimit)
+  let duplicate = run Effect.result(metadata.addExport(&mut m, &mut rt.atoms, 0, name, ExportKind.Indirect)) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(index == 0 && m.exports.length() == 1 && m.exports.capacity() == 1 && m.exports.get(0).localName == name, "duplicate is found before growth despite exhausted allocator and leaves original binding intact")
+  rt.atoms.release(name)
+  drop rt drop m
+  let mut hooks = NoClassEdges {}
+  unsafe js_gc.releaseHeader(&mut hooks, runtime, context)
+  run unsafe js_gc.destroyRuntime(&mut hooks, runtime) |> Effect.provideMut<Allocator>(&mut allocator)
+  match move duplicate {
+    Result<i32, OutOfMemoryError | StringLengthError | ModuleMetadataError>.Success { value } => { run Testing.expect(false, "duplicate must fail") }
+    Result<i32, OutOfMemoryError | StringLengthError | ModuleMetadataError>.Failure { error } => {
+      match move error {
+        OutOfMemoryError e => { fail move e }
+        StringLengthError e => { fail move e }
+        ModuleMetadataError diagnostic => {
+          run Testing.expect(diagnostic.kind == ModuleMetadataErrorKind.DuplicateExport && diagnostic.atom == name, "typed diagnostic identity survives unwind")
+          match &diagnostic.name {
+            Option<StringOwner>.Some { value } => { run Testing.expect(Strings.length(value.get()) == 16 && Strings.codeUnit(value.get(), 0) == 100 && Strings.codeUnit(value.get(), 15) == 116, "error owns name independently after all JS roots disappear") }
+            Option<StringOwner>.None => { run Testing.expect(false, "duplicate diagnostic must own its name") }
+          }
+        }
+      }
+    }
+  }
+  run Testing.expect(allocator.stats().usedBytes == 0, "dropping diagnostic releases final atom registry ownership")
+}

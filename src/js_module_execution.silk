@@ -1,0 +1,324 @@
+//! InnerModuleEvaluation and async ancestor propagation, quickjs.c:31959-32378.
+//! Module links borrow context loaded-list roots. Values in module records and
+//! data-function captures own references; no payload borrow crosses JS execution.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.list { List }
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types { RuntimeState, ModuleDef, ModuleStatus, NativeFunctionId, NativeErrorKind, FrameSlots }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_exceptions { JsException }
+import js_exceptions as exceptions
+import js_coercion_host { CoercionHooks }
+import js_property_host { OwnPropertyHooks, GetPropertyHooks, HasPropertyHooks, OwnKeysHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_prototype_host { PrototypeHooks }
+import js_interrupt_host { InterruptHooks }
+import js_native_function_host { NativeFunctionHooks }
+import js_call_host { CallHooks }
+import js_error_host { ErrorHooks }
+import js_eval_host { EvalHooks }
+import js_module_host { ModuleHostHooks }
+import js_promise { PromiseHooks }
+import js_promise as promises
+import js_async_functions as asynchronous
+import js_native_functions as functions
+import js_module_execution_callbacks as callbacks
+import js_eval_errors as errors
+import js_eval_compile { present }
+import runtime_memory { AllocationObserver }
+import native_stack { currentFrameAddress }
+
+fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+unsafe effect fn stack<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader) -> () ! JsException ? &mut Allocator {
+  if unsafe runtime.checkStackOverflow(unsafe runtime.contextRuntime(context), currentFrameAddress(), 0, true) {
+    return run unsafe hooks.throwError(context, NativeErrorKind.Internal, b"stack overflow")
+  }
+}
+unsafe fn code(module: *mut HeapHeader) -> Value {
+  let anchor = () let data = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, module) return data.functionObject
+}
+unsafe effect fn settle<H: HeapHooks + CoercionHooks + CallHooks>(hooks: &mut H,
+  context: *mut HeapHeader, module: *mut HeapHeader, rejected: bool, value: Value) -> () ? &mut Allocator {
+  let anchor = () let data = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, module)
+  if data.promise.tag() == Value.Undefined.tag() { return () }
+  let mut index: usize = 0 if rejected { index = 1 }
+  let function = data.resolvingFunctions[index] drop data
+  // Source discards the call result, including Exception, without taking or
+  // replacing its pending exception (31966,32072,32357,32371).
+  let returned = run Effect.catch<JsException>(unsafe promises.call(&mut hooks, context, function, Value.Undefined, &[value]), errors.exceptionValue)
+  unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), returned)
+}
+unsafe effect fn setEvaluated<H: HeapHooks + CoercionHooks + CallHooks>(hooks: &mut H,
+  context: *mut HeapHeader, module: *mut HeapHeader) -> () ? &mut Allocator {
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<ModuleDef, ()>(&mut anchor, module)
+  data.status = ModuleStatus.Evaluated data.asyncEvaluation = false drop data
+  run unsafe settle(&mut hooks, context, module, false, Value.Undefined)
+}
+pub unsafe effect fn rejected<H: HeapHooks + CoercionHooks + CallHooks>(hooks: &mut H,
+  context: *mut HeapHeader, module: *mut HeapHeader, error: Value) -> Value ! JsException ? &mut Allocator {
+  run unsafe stack(&mut hooks, context)
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<ModuleDef, ()>(&mut anchor, module)
+  if data.status == ModuleStatus.Evaluated { return Value.Undefined }
+  data.evaluationHasException = true data.evaluationException = unsafe error.retained()
+  data.status = ModuleStatus.Evaluated data.asyncEvaluation = false
+  let count = data.asyncParentModules.length() drop data
+  run unsafe settle(&mut hooks, context, module, true, error)
+  let mut index: usize = 0
+  while index < count {
+    let source = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, module)
+    let parent = source.asyncParentModules.get(index) drop source
+    let ignored = run Effect.catch<JsException>(unsafe rejected(&mut hooks, context, parent, error), errors.exceptionValue) index = index + 1
+  }
+  return Value.Undefined
+}
+unsafe effect fn sync<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks + PromiseHooks + ModuleHostHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, module: *mut HeapHeader) -> () ! JsException ? &mut Allocator {
+  let anchor = () let data = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, module)
+  let native = match &data.initialize { Option<NativeFunctionId>.Some { value } => Option<NativeFunctionId>.some(value) _ => Option<NativeFunctionId>.none() } drop data
+  match move native {
+    Option<NativeFunctionId>.Some { value } => {
+      let initialized = run Effect.result(unsafe hooks.initializeModule(context, value, module))
+      match move initialized {
+        Result<(), OutOfMemoryError | JsException>.Success { .. } => { return () }
+        Result<(), OutOfMemoryError | JsException>.Failure { error } => { return run unsafe errors.materialize<(), H>(&mut hooks, context, move error) }
+      }
+    }
+    Option<NativeFunctionId>.None => ()
+  }
+  let mut empty = Value.Undefined let argv = FrameSlots.Borrowed { data: Pointer.fromMutRef<Value>(&mut empty), length: 0 }
+  let promise = run unsafe asynchronous.call(&mut hooks, memory, context, unsafe code(module), Value.Undefined, &argv)
+  let state = unsafe promises.state(promise) let rt = unsafe runtime.contextRuntime(context)
+  let mut error = Value.Undefined if state == promises.REJECTED { error = unsafe promises.result(promise) }
+  unsafe gc.release(&mut hooks, rt, promise)
+  if state == promises.REJECTED { return run unsafe exceptions.throwValue<(), H>(&mut hooks, rt, error) }
+  if state != promises.FULFILLED { return run unsafe hooks.throwError(context, NativeErrorKind.Type, b"promise is pending") }
+}
+unsafe effect fn attach<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + CallHooks + PromiseHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, promise: Value, module: *mut HeapHeader) -> () ! JsException ? &mut Allocator {
+  let captured = [Value.Module { reference: module }]
+  let fulfilled = run unsafe functions.newDataFunction(&mut hooks, memory, context, callbacks.id(callbacks.ASYNC_FULFILLED), 0, 0, &captured)
+  let rt = unsafe runtime.contextRuntime(context)
+  let created = run Effect.result(unsafe functions.newDataFunction(&mut hooks, memory, context, callbacks.id(callbacks.ASYNC_REJECTED), 0, 0, &captured))
+  let reject = match move created {
+    Result<Value, JsException>.Success { value } => value
+    Result<Value, JsException>.Failure { error } => { unsafe gc.release(&mut hooks, rt, fulfilled) fail move error }
+  }
+  let attached = run Effect.result(unsafe promises.then(&mut hooks, memory, context, promise, fulfilled, reject))
+  unsafe gc.release(&mut hooks, rt, fulfilled) unsafe gc.release(&mut hooks, rt, reject)
+  match move attached {
+    Result<Value, JsException>.Success { value } => { unsafe gc.release(&mut hooks, rt, value) }
+    Result<Value, JsException>.Failure { error } => { fail move error }
+  }
+}
+unsafe effect fn async<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks + PromiseHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, module: *mut HeapHeader) -> () ! JsException ? &mut Allocator {
+  let mut empty = Value.Undefined let argv = FrameSlots.Borrowed { data: Pointer.fromMutRef<Value>(&mut empty), length: 0 }
+  let promise = run unsafe asynchronous.call(&mut hooks, memory, context, unsafe code(module), Value.Undefined, &argv)
+  let attached = run Effect.result(unsafe attach(&mut hooks, memory, context, promise, module))
+  unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), promise)
+  match move attached { Result<(), JsException>.Success { .. } => () Result<(), JsException>.Failure { error } => { fail move error } }
+}
+fn contains(list: &List<*mut HeapHeader>, module: *mut HeapHeader) -> bool {
+  let mut i: usize = 0
+  while i < list.length() { if Pointer.address<HeapHeader>(list.get(i)) == Pointer.address<HeapHeader>(module) { return true } i = i + 1 }
+  return false
+}
+unsafe effect fn gather<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  module: *mut HeapHeader, list: &mut List<*mut HeapHeader>) -> () ! JsException ? &mut Allocator {
+  run unsafe stack(&mut hooks, context)
+  let mut anchor = () let data = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, module)
+  let count = data.asyncParentModules.length() drop data let mut index: usize = 0
+  while index < count {
+    let source = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, module)
+    let parent = source.asyncParentModules.get(index) drop source
+    let p = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, parent) let cycle = present(p.cycleRoot) drop p
+    let root = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, cycle) let failed = root.evaluationHasException drop root
+    if !contains(&list.*, parent) && !failed {
+      let changed = unsafe HeapCell.payloadMut<ModuleDef, ()>(&mut anchor, parent)
+      changed.pendingAsyncDependencies = changed.pendingAsyncDependencies - 1
+      let ready = changed.pendingAsyncDependencies == 0 let await = changed.hasTopLevelAwait drop changed
+      if ready {
+        let added = run Effect.result(list.append(parent))
+        match move added {
+          Result<(), OutOfMemoryError>.Success { .. } => ()
+          Result<(), OutOfMemoryError>.Failure { error } => { return run unsafe errors.materialize<(), H>(&mut hooks, context, move error) }
+        }
+        if !await { run unsafe gather(&mut hooks, context, parent, &mut list) }
+      }
+    }
+    index = index + 1
+  }
+}
+unsafe fn timestamp(module: *mut HeapHeader) -> i64 {
+  let anchor = () let data = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, module) return data.asyncEvaluationTimestamp
+}
+// Allocation-free O(n log n) ordering of the ready set. Timestamp order, not
+// request order, is observable when independent await branches become ready.
+unsafe fn sift(list: &mut List<*mut HeapHeader>, root: usize, count: usize) -> () {
+  let value = list.get(root) let time = unsafe timestamp(value) let mut cursor = root
+  while cursor < count / 2 {
+    let mut child = cursor * 2 + 1
+    if child + 1 < count && unsafe timestamp(list.get(child)) < unsafe timestamp(list.get(child + 1)) { child = child + 1 }
+    if time >= unsafe timestamp(list.get(child)) { break }
+    let childValue = list.get(child)
+    list.set(cursor, childValue) cursor = child
+  }
+  list.set(cursor, value)
+}
+unsafe fn sort(list: &mut List<*mut HeapHeader>) -> () {
+  let count = list.length() let mut cursor = count / 2
+  while cursor > 0 { cursor = cursor - 1 unsafe sift(&mut list, cursor, count) }
+  let mut end = count
+  while end > 1 {
+    end = end - 1
+    let first = list.get(0) let last = list.get(end)
+    list.set(0, last) list.set(end, first)
+    unsafe sift(&mut list, 0, end)
+  }
+}
+pub unsafe effect fn fulfilled<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks + PromiseHooks + ModuleHostHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, module: *mut HeapHeader) -> Value ! JsException ? &mut Allocator {
+  let anchor = () let data = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, module)
+  if data.status == ModuleStatus.Evaluated { return Value.Undefined } drop data
+  run unsafe setEvaluated(&mut hooks, context, module)
+  let mut ready = List<*mut HeapHeader>.make()
+  run unsafe gather(&mut hooks, context, module, &mut ready) unsafe sort(&mut ready)
+  let rt = unsafe runtime.contextRuntime(context) let mut index: usize = 0
+  while index < ready.length() {
+    let current = ready.get(index)
+    let data = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, current)
+    let evaluated = data.status == ModuleStatus.Evaluated let await = data.hasTopLevelAwait drop data
+    if !evaluated {
+      let result = run Effect.result(unsafe executeReady(&mut hooks, memory, context, current, await))
+      match move result {
+        Result<(), JsException>.Success { .. } => ()
+        Result<(), JsException>.Failure { .. } => {
+          let error = unsafe exceptions.take(rt)
+          let ignored = run Effect.catch<JsException>(unsafe rejected(&mut hooks, context, current, error), errors.exceptionValue)
+          unsafe gc.release(&mut hooks, rt, error)
+        }
+      }
+    }
+    index = index + 1
+  }
+  return Value.Undefined
+}
+unsafe effect fn executeReady<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks + PromiseHooks + ModuleHostHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, module: *mut HeapHeader, await: bool) -> () ! JsException ? &mut Allocator {
+  if await { run unsafe async(&mut hooks, memory, context, module) }
+  else { run unsafe sync(&mut hooks, memory, context, module) run unsafe setEvaluated(&mut hooks, context, module) }
+}
+unsafe effect fn inner<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks + PromiseHooks + ModuleHostHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, module: *mut HeapHeader, index: i32,
+  top: &mut ?*mut HeapHeader) -> i32 ! JsException ? &mut Allocator {
+  run unsafe stack(&mut hooks, context)
+  let rt = unsafe runtime.contextRuntime(context) let mut anchor = ()
+  let data = unsafe HeapCell.payloadMut<ModuleDef, ()>(&mut anchor, module)
+  if data.status == ModuleStatus.EvaluatingAsync || data.status == ModuleStatus.Evaluated {
+    let failed = data.evaluationHasException let error = data.evaluationException drop data
+    if failed { return run unsafe exceptions.throwValue<i32, H>(&mut hooks, rt, unsafe error.retained()) }
+    return index
+  }
+  if data.status == ModuleStatus.Evaluating { return index }
+  data.status = ModuleStatus.Evaluating data.dfsIndex = index data.dfsAncestorIndex = index
+  data.pendingAsyncDependencies = 0 data.stackPrevious = top.* top.* = module
+  let count = data.requestedModules.length() drop data
+  let mut next = index + 1 let mut cursor: usize = 0
+  while cursor < count {
+    let data = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, module)
+    let mut target = present(data.requestedModules.asSlice()[cursor].module) drop data
+    next = run unsafe inner(&mut hooks, memory, context, target, next, &mut top)
+    let dependency = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, target)
+    let evaluating = dependency.status == ModuleStatus.Evaluating
+    let ancestor = dependency.dfsAncestorIndex let cycle = dependency.cycleRoot drop dependency
+    if evaluating {
+      let changed = unsafe HeapCell.payloadMut<ModuleDef, ()>(&mut anchor, module)
+      if ancestor < changed.dfsAncestorIndex { changed.dfsAncestorIndex = ancestor }
+    } else {
+      target = present(cycle)
+      let dependency = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, target)
+      let failed = dependency.evaluationHasException let error = dependency.evaluationException drop dependency
+      if failed { return run unsafe exceptions.throwValue<i32, H>(&mut hooks, rt, unsafe error.retained()) }
+    }
+    let asyncDependency = unsafe HeapCell.payloadMut<ModuleDef, ()>(&mut anchor, target)
+    if asyncDependency.asyncEvaluation {
+      let appended = run Effect.result(asyncDependency.asyncParentModules.append(module)) drop asyncDependency
+      match move appended {
+        Result<(), OutOfMemoryError>.Success { .. } => ()
+        Result<(), OutOfMemoryError>.Failure { error } => { return run unsafe errors.materialize<i32, H>(&mut hooks, context, move error) }
+      }
+      let changed = unsafe HeapCell.payloadMut<ModuleDef, ()>(&mut anchor, module)
+      changed.pendingAsyncDependencies = changed.pendingAsyncDependencies + 1
+    }
+    cursor = cursor + 1
+  }
+  let pendingState = unsafe HeapCell.payloadMut<ModuleDef, ()>(&mut anchor, module)
+  let pending = pendingState.pendingAsyncDependencies > 0 let await = pendingState.hasTopLevelAwait
+  if pending || await {
+    pendingState.asyncEvaluation = true drop pendingState
+    let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+    let timestamp = state.moduleAsyncEvaluationNextTimestamp
+    state.moduleAsyncEvaluationNextTimestamp = timestamp + 1 drop state
+    let updated = unsafe HeapCell.payloadMut<ModuleDef, ()>(&mut anchor, module) updated.asyncEvaluationTimestamp = timestamp drop updated
+    if !pending { run unsafe async(&mut hooks, memory, context, module) }
+  } else { drop pendingState run unsafe sync(&mut hooks, memory, context, module) }
+  let cycleState = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, module)
+  let root = cycleState.dfsIndex == cycleState.dfsAncestorIndex drop cycleState
+  if root {
+    while true {
+      let current = present(top.*) let data = unsafe HeapCell.payloadMut<ModuleDef, ()>(&mut anchor, current)
+      top.* = data.stackPrevious data.stackPrevious = Pointer.null<HeapHeader>()
+      if data.asyncEvaluation { data.status = ModuleStatus.EvaluatingAsync } else { data.status = ModuleStatus.Evaluated }
+      data.cycleRoot = module drop data
+      if Pointer.address<HeapHeader>(current) == Pointer.address<HeapHeader>(module) { break }
+    }
+  }
+  return next
+}
+pub unsafe effect fn evaluate<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks + PromiseHooks + ModuleHostHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, input: *mut HeapHeader) -> Value ! JsException ? &mut Allocator {
+  let mut module = input let mut anchor = ()
+  let initial = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, module)
+  if initial.status == ModuleStatus.EvaluatingAsync || initial.status == ModuleStatus.Evaluated { module = present(initial.cycleRoot) } drop initial
+  let data = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, module)
+  if data.promise.tag() != Value.Undefined.tag() { return unsafe data.promise.retained() } drop data
+  let capability = run unsafe promises.newCapability(&mut hooks, memory, context, Value.Undefined)
+  let capabilityState = unsafe HeapCell.payloadMut<ModuleDef, ()>(&mut anchor, module)
+  capabilityState.promise = capability.promise capabilityState.resolvingFunctions = [capability.resolve, capability.reject] drop capabilityState
+  let mut top = Pointer.null<HeapHeader>()
+  let result = run Effect.result(unsafe inner(&mut hooks, memory, context, module, 0, &mut top))
+  let rt = unsafe runtime.contextRuntime(context)
+  match move result {
+    Result<i32, JsException>.Failure { .. } => {
+      let error = unsafe exceptions.take(rt)
+      while !Pointer.isNull<HeapHeader>(top) {
+        let data = unsafe HeapCell.payloadMut<ModuleDef, ()>(&mut anchor, present(top))
+        top = data.stackPrevious data.stackPrevious = Pointer.null<HeapHeader>()
+        data.status = ModuleStatus.Evaluated data.asyncEvaluation = false data.evaluationHasException = true
+        data.evaluationException = unsafe error.retained() data.cycleRoot = module
+      }
+      run unsafe settle(&mut hooks, context, module, true, error)
+      unsafe gc.release(&mut hooks, rt, error)
+    }
+    Result<i32, JsException>.Success { .. } => {
+      let data = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, module) let pending = data.asyncEvaluation drop data
+      if !pending { run unsafe settle(&mut hooks, context, module, false, Value.Undefined) }
+    }
+  }
+  let resultState = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, module) return unsafe resultState.promise.retained()
+}
+pub unsafe effect fn dispatchData<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks + PromiseHooks + ModuleHostHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, method: u32, arguments: &FrameSlots,
+  captured: &FrameSlots) -> Value ! JsException ? &mut Allocator {
+  let module = match unsafe captured.get(0) { Value.Module { reference } => reference _ => invariant() }
+  if method == callbacks.ASYNC_REJECTED { return run unsafe rejected(&mut hooks, context, module, unsafe promises.argument(arguments, 0)) }
+  if method == callbacks.ASYNC_FULFILLED { return run unsafe fulfilled(&mut hooks, memory, context, module) }
+  return invariant()
+}

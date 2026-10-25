@@ -1,0 +1,583 @@
+//! Behavioral consumers: actual native Object ABI, callbacks, collection and OOM.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.list { List }
+import silk.pointer { Pointer }
+import silk.i32
+import silk.u32
+import silk.u16
+import silk.u64
+import silk.usize
+import silk.f64
+import runtime_memory { AllocationObserver, RuntimeAllocator }
+import native_stack { currentFrameAddress }
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types { ContextState, RuntimeState, ObjectData, ObjectPayload, NativeFunctionId, NativeCallProtocol,
+  NativeErrorKind, BuiltinFamily, WeakRefHeader, FrameSlots, PropertyDescriptor, PropertyEnum,
+  JS_PROP_HAS_GET, JS_PROP_HAS_CONFIGURABLE, JS_PROP_HAS_ENUMERABLE, JS_PROP_CONFIGURABLE, JS_PROP_ENUMERABLE }
+import js_gc { HeapHooks, Tracer }
+import js_gc as gc
+import js_runtime as runtime
+import js_runtime_registry as registry
+import js_runtime_classes as definitions
+import js_proxy_test_support as base
+import js_proxy_test_support { Hooks as BaseHooks }
+import js_array_storage_test_support as storage
+import js_array_storage_test_support { reference, trap }
+import js_property_host { OwnPropertyHooks, OwnPropertyResult, GetPropertyHooks, HasPropertyHooks, OwnKeysHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_prototype_host { PrototypeHooks }
+import js_coercion_host { CoercionHooks }
+import js_call_host { CallHooks }
+import js_native_function_host { NativeFunctionHooks, NativeIteratorResult }
+import js_interrupt_host { InterruptHooks }
+import js_native_functions as native
+import js_property_get as get
+import js_property_descriptors as descriptors
+import js_property_mutations as properties
+import js_property_names as names
+import js_property_names { OwnKeysError }
+import js_property_ownership { releaseDescriptor }
+import js_object_allocate as objects
+import js_object_intrinsics as intrinsic
+import js_constructor_ops as constructors
+import js_prototypes as prototypes
+import js_prototypes { PrototypeError }
+import js_property_descriptors_test_support as errorFixture
+import js_bound_functions as bound
+import js_proxy as proxy
+import js_proxy_core as core
+import js_proxy_descriptors as proxyDescriptors
+import js_strings { Strings }
+import js_string_types { StringLengthError }
+import js_bigint { BigIntError }
+import js_exceptions { JsException }
+import js_exceptions as exceptions
+import js_errors_test_support { FaultAllocator }
+import js_atom_data as atoms
+import js_class_data as classes
+
+pub struct Hooks<'a> {
+  pub base: BaseHooks<'a>, pub memory: &'a AllocationObserver,
+  roots: [Value; 16], args: [Value; 3], receiver: Value,
+  method: u32, mode: u32, calls: u32, closed: u32, nextCount: u32,
+  events: u32, receiverMatches: u32, interrupted: u32,
+  foreign: ?*mut HeapHeader, realmBits: u32
+}
+impl<'a> Hooks<'a> {
+  pub fn make(memory: &'a AllocationObserver) -> Self {
+    return Self { base: BaseHooks.make(memory), memory: memory, roots: [Value.Undefined; 16],
+      args: [Value.Undefined; 3], receiver: Value.Undefined, method: 0, mode: 0,
+      calls: 0, closed: 0, nextCount: 0, events: 0, receiverMatches: 0, interrupted: 0,
+      foreign: Pointer.null<HeapHeader>(), realmBits: 0 }
+  }
+}
+fn callback(id: NativeFunctionId, expected: u32) -> bool {
+  return match id { NativeFunctionId.Builtin { family, method } => family == BuiltinFamily.Runtime && method == expected _ => false }
+}
+impl<'a> HeapHooks for Hooks<'a> {
+  unsafe fn traceClass(self: &mut Self, rt: *mut HeapHeader, object: *mut HeapHeader, id: NativeFunctionId, tracer: &mut Tracer) -> () {
+    if callback(id, 12) { unsafe bound.mark(object, &mut tracer) return () }
+    if callback(id, 57) { unsafe core.mark(object, &mut tracer) return () }
+    unsafe self.base.traceClass(rt, object, id, &mut tracer)
+  }
+  unsafe fn finalizeClass(self: &mut Self, rt: *mut HeapHeader, object: *mut HeapHeader, id: NativeFunctionId) -> () {
+    if callback(id, 11) { unsafe bound.finalize(&mut self, rt, object) return () }
+    if callback(id, 56) { unsafe core.finalize(&mut self, rt, object) return () }
+    unsafe self.base.finalizeClass(rt, object, id)
+  }
+  unsafe effect fn sweepWeak(self: &mut Self, rt: *mut HeapHeader, object: *mut WeakRefHeader) -> () ? &mut Allocator { run unsafe self.base.sweepWeak(rt, object) }
+  unsafe fn destroyAuxiliary(self: &mut Self, rt: *mut HeapHeader, object: *mut HeapHeader) -> () { unsafe self.base.destroyAuxiliary(rt, object) }
+}
+impl<'a> CoercionHooks for Hooks<'a> {
+  unsafe effect fn throwError(self: &mut Self, ctx: *mut HeapHeader, kind: NativeErrorKind, message: &[u8]) -> never ! JsException ? &mut Allocator { return run unsafe self.base.throwError(ctx, kind, message) }
+  unsafe effect fn throwOutOfMemory(self: &mut Self, ctx: *mut HeapHeader) -> never ! JsException ? &mut Allocator { return run unsafe self.base.throwOutOfMemory(ctx) }
+  unsafe fn isCallable(self: &mut Self, ctx: *mut HeapHeader, value: Value) -> bool {
+    if !value.isObject() { return false }
+    let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(value))
+    let classId = object.classId drop object
+    if classId == classes.JS_CLASS_PROXY { return unsafe core.isCallable(value) }
+    if classId == classes.JS_CLASS_C_FUNCTION || classId == classes.JS_CLASS_C_FUNCTION_DATA { return true }
+    return unsafe self.base.isCallable(ctx, value)
+  }
+  unsafe effect fn getProperty(self: &mut Self, ctx: *mut HeapHeader, object: Value, atom: u32) -> Value ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe get.getProperty(&mut self, ctx, object, atom) }
+  unsafe effect fn call(self: &mut Self, ctx: *mut HeapHeader, function: Value, receiver: Value, arguments: &[Value]) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+    let mut data = unsafe Intrinsic.pointerRequalify<[*]mut Value, *mut Value>(unsafe Intrinsic.stackAllocate<Value>(0))
+    if arguments.length != 0 { data = unsafe Intrinsic.pointerRequalify<*const Value, *mut Value>(Pointer.fromRef<Value>(&arguments[0])) }
+    let slots = FrameSlots.Borrowed { data: data, length: arguments.length }
+    return run unsafe self.callArguments(ctx, function, receiver, &slots)
+  }
+}
+impl<'a> CallHooks for Hooks<'a> {
+  unsafe effect fn callArguments(self: &mut Self, ctx: *mut HeapHeader, function: Value, receiver: Value, arguments: &FrameSlots) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+    if !unsafe self.isCallable(ctx, function) { return run unsafe self.throwError(ctx, NativeErrorKind.Type, b"not a function") }
+    let memory = self.memory
+    let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(function))
+    let classId = object.classId drop object
+    if classId == classes.JS_CLASS_PROXY { return run unsafe proxy.call(&mut self, memory, ctx, function, receiver, arguments, 0) }
+    return run unsafe native.call(&mut self, memory, ctx, function, receiver, arguments, 0)
+  }
+  unsafe effect fn construct(self: &mut Self, ctx: *mut HeapHeader, function: Value, newTarget: Value, arguments: &FrameSlots) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+    let memory = self.memory
+    return run unsafe native.call(&mut self, memory, ctx, function, newTarget, arguments, 1)
+  }
+}
+impl<'a> OwnPropertyHooks for Hooks<'a> {
+  unsafe effect fn throwNotObject(self: &mut Self, ctx: *mut HeapHeader) -> never ! JsException ? &mut Allocator { return run unsafe self.base.throwNotObject(ctx) }
+  unsafe effect fn throwUninitialized(self: &mut Self, ctx: *mut HeapHeader, atom: u32) -> never ! JsException ? &mut Allocator { return run unsafe self.base.throwUninitialized(ctx, atom) }
+  unsafe effect fn instantiateAutoInit(self: &mut Self, ctx: *mut HeapHeader, object: Value, atom: u32) -> () ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe self.base.instantiateAutoInit(ctx, object, atom) }
+  unsafe effect fn readTypedIndex(self: &mut Self, ctx: *mut HeapHeader, object: Value, index: u32) -> Value ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe self.base.readTypedIndex(ctx, object, index) }
+  unsafe effect fn getExoticOwnProperty(self: &mut Self, ctx: *mut HeapHeader, table: NativeFunctionId, object: Value, atom: u32, requested: bool) -> OwnPropertyResult ! OutOfMemoryError | JsException ? &mut Allocator {
+    if callback(table, 59) { return run unsafe proxyDescriptors.getOwnProperty(&mut self, ctx, object, atom, requested) }
+    return run unsafe self.base.getExoticOwnProperty(ctx, table, object, atom, requested)
+  }
+}
+impl<'a> GetPropertyHooks for Hooks<'a> {
+  unsafe effect fn getExoticProperty(self: &mut Self, ctx: *mut HeapHeader, table: NativeFunctionId, object: Value, atom: u32, receiver: Value) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+    if callback(table, 59) { return run unsafe proxy.get(&mut self, ctx, object, atom, receiver) }
+    return run unsafe self.base.getExoticProperty(ctx, table, object, atom, receiver)
+  }
+}
+impl<'a> HasPropertyHooks for Hooks<'a> {
+  unsafe effect fn hasExoticProperty(self: &mut Self, ctx: *mut HeapHeader, table: NativeFunctionId, object: Value, atom: u32) -> bool ! OutOfMemoryError | JsException ? &mut Allocator {
+    if callback(table, 59) { return run unsafe proxy.has(&mut self, ctx, object, atom) }
+    return run unsafe self.base.hasExoticProperty(ctx, table, object, atom)
+  }
+}
+impl<'a> OwnKeysHooks for Hooks<'a> {
+  unsafe effect fn getOwnKeys(self: &mut Self, ctx: *mut HeapHeader, table: NativeFunctionId, object: Value) -> List<PropertyEnum> ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe proxy.ownKeys(&mut self, ctx, object) }
+  unsafe effect fn getOwnProperty(self: &mut Self, ctx: *mut HeapHeader, object: Value, atom: u32) -> Option<PropertyDescriptor> ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe descriptors.getOwnProperty(&mut self, ctx, object, atom) }
+}
+impl<'a> PropertyWriteHooks for Hooks<'a> {
+  unsafe effect fn setExoticProperty(self: &mut Self, ctx: *mut HeapHeader, table: NativeFunctionId, object: Value, atom: u32, value: Value, receiver: Value, flags: u32) -> bool ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe proxy.set(&mut self, ctx, object, atom, value, receiver, flags) }
+  unsafe effect fn defineExoticProperty(self: &mut Self, ctx: *mut HeapHeader, table: NativeFunctionId, object: Value, atom: u32, value: Value, getter: Value, setter: Value, flags: u32) -> bool ! OutOfMemoryError | JsException ? &mut Allocator {
+    let memory = self.memory return run unsafe proxyDescriptors.defineOwnProperty(&mut self, memory, ctx, object, atom, value, getter, setter, flags)
+  }
+  unsafe effect fn deleteExoticProperty(self: &mut Self, ctx: *mut HeapHeader, table: NativeFunctionId, object: Value, atom: u32) -> bool ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe proxy.deleteProperty(&mut self, ctx, object, atom) }
+  unsafe effect fn isExoticExtensible(self: &mut Self, ctx: *mut HeapHeader, table: NativeFunctionId, object: Value) -> bool ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe proxy.isExtensible(&mut self, ctx, object) }
+}
+impl<'a> PrototypeHooks for Hooks<'a> {
+  unsafe effect fn getPrototype(self: &mut Self, ctx: *mut HeapHeader, table: NativeFunctionId, object: Value) -> Value ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe proxy.getPrototype(&mut self, ctx, object) }
+  unsafe effect fn setPrototype(self: &mut Self, ctx: *mut HeapHeader, table: NativeFunctionId, object: Value, prototype: Value) -> bool ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe proxy.setPrototype(&mut self, ctx, object, prototype) }
+  unsafe effect fn isExtensible(self: &mut Self, ctx: *mut HeapHeader, table: NativeFunctionId, object: Value) -> bool ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe proxy.isExtensible(&mut self, ctx, object) }
+  unsafe effect fn preventExtensions(self: &mut Self, ctx: *mut HeapHeader, table: NativeFunctionId, object: Value) -> bool ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe proxy.preventExtensions(&mut self, ctx, object) }
+}
+
+impl<'a> InterruptHooks for Hooks<'a> {
+  unsafe effect fn interrupt(self: &mut Self, rt: *mut HeapHeader, id: NativeFunctionId, opaque: ?*mut u8) -> bool ? &mut Allocator {
+    self.interrupted = self.interrupted + 1 return true
+  }
+}
+unsafe fn slots(values: &[Value]) -> FrameSlots {
+  let mut data = unsafe Intrinsic.pointerRequalify<[*]mut Value, *mut Value>(unsafe Intrinsic.stackAllocate<Value>(0))
+  if values.length != 0 { data = unsafe Intrinsic.pointerRequalify<*const Value, *mut Value>(Pointer.fromRef<Value>(&values[0])) }
+  return FrameSlots.Borrowed { data: data, length: values.length }
+}
+unsafe effect fn route<'a>(hooks: &mut Hooks<'a>, id: NativeFunctionId, context: *mut HeapHeader,
+  receiver: Value, argv: &FrameSlots) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  match id {
+    NativeFunctionId.Builtin { family: BuiltinFamily.Object, method } => {
+      let memory = hooks.memory
+      return run unsafe intrinsic.dispatch(&mut hooks, memory, context, method, receiver, argv)
+    }
+    NativeFunctionId.Host { id: number } => { return run unsafe observed(&mut hooks, context, number, receiver, argv) }
+    _ => trap()
+  }
+}
+impl<'a> NativeFunctionHooks for Hooks<'a> {
+  unsafe effect fn nativeGeneric(self: &mut Self, id: NativeFunctionId, context: *mut HeapHeader, receiver: Value, argc: i32, argv: &FrameSlots) -> Value ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe route(&mut self, id, context, receiver, argv) }
+  unsafe effect fn nativeMagic(self: &mut Self, id: NativeFunctionId, context: *mut HeapHeader, receiver: Value, argc: i32, argv: &FrameSlots, magic: i32) -> Value ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe route(&mut self, id, context, receiver, argv) }
+  unsafe effect fn nativeFlags(self: &mut Self, id: NativeFunctionId, context: *mut HeapHeader, function: Value, receiver: Value, argc: i32, argv: &FrameSlots, flags: i32) -> Value ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe route(&mut self, id, context, receiver, argv) }
+  fn nativeFloatUnary(self: &mut Self, id: NativeFunctionId, value: f64) -> f64 { trap() }
+  fn nativeFloatBinary(self: &mut Self, id: NativeFunctionId, left: f64, right: f64) -> f64 { trap() }
+  unsafe effect fn nativeGetter(self: &mut Self, id: NativeFunctionId, context: *mut HeapHeader, receiver: Value) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+    let empty: [Value; 0] = [] let arguments = unsafe slots(&empty)
+    return run unsafe route(&mut self, id, context, receiver, &arguments)
+  }
+  unsafe effect fn nativeSetter(self: &mut Self, id: NativeFunctionId, context: *mut HeapHeader, receiver: Value, value: Value) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+    let args = [value] let arguments = unsafe slots(&args)
+    return run unsafe route(&mut self, id, context, receiver, &arguments)
+  }
+  unsafe effect fn nativeGetterMagic(self: &mut Self, id: NativeFunctionId, context: *mut HeapHeader, receiver: Value, magic: i32) -> Value ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe self.nativeGetter(id, context, receiver) }
+  unsafe effect fn nativeSetterMagic(self: &mut Self, id: NativeFunctionId, context: *mut HeapHeader, receiver: Value, value: Value, magic: i32) -> Value ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe self.nativeSetter(id, context, receiver, value) }
+  unsafe effect fn nativeIteratorNext(self: &mut Self, id: NativeFunctionId, context: *mut HeapHeader, receiver: Value, argc: i32, argv: &FrameSlots, magic: i32) -> NativeIteratorResult ! OutOfMemoryError | JsException ? &mut Allocator { trap() }
+  unsafe effect fn nativeData(self: &mut Self, id: NativeFunctionId, context: *mut HeapHeader, receiver: Value, argc: i32, argv: &FrameSlots, magic: i32, captured: &FrameSlots) -> Value ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe route(&mut self, id, context, receiver, argv) }
+}
+unsafe effect fn put<'a>(hooks: &mut Hooks<'a>, ctx: *mut HeapHeader, object: Value, atom: u32, value: Value, flags: u32) -> () ! JsException ? &mut Allocator {
+  let accepted = run unsafe core.defineValue(&mut hooks, ctx, object, atom, unsafe value.retained(), flags)
+}
+unsafe effect fn function<'a>(hooks: &mut Hooks<'a>, ctx: *mut HeapHeader, id: u32) -> Value ! JsException ? &mut Allocator {
+  let memory = hooks.memory
+  return run unsafe native.newFunction(&mut hooks, memory, ctx, NativeFunctionId.Host { id: id }, b"callback", 0, NativeCallProtocol.Generic, 0)
+}
+unsafe effect fn accessor<'a>(hooks: &mut Hooks<'a>, ctx: *mut HeapHeader, object: Value, atom: u32, id: u32) -> () ! JsException ? &mut Allocator {
+  let getter = run unsafe function(&mut hooks, ctx, id)
+  let attempted = run Effect.result(unsafe properties.defineProperty(&mut hooks, ctx, object, atom, Value.Undefined, getter, Value.Undefined,
+    JS_PROP_HAS_GET | JS_PROP_HAS_CONFIGURABLE | JS_PROP_HAS_ENUMERABLE | JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE))
+  unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(ctx), getter)
+  match move attempted {
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { .. } => ()
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => { return run unsafe core.materialize(&mut hooks, ctx, move error) }
+  }
+}
+unsafe effect fn observed<'a>(hooks: &mut Hooks<'a>, ctx: *mut HeapHeader, id: u32,
+  receiver: Value, argv: &FrameSlots) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  hooks.calls = hooks.calls + 1 hooks.events = (hooks.events * 17 + id) & 65535
+  let rt = unsafe runtime.contextRuntime(ctx) run unsafe gc.collect(&mut hooks, rt, true)
+  if id == 1 { return unsafe hooks.roots[2].retained() }
+  if id == 2 {
+    if hooks.mode == 2 { return run unsafe exceptions.throwValue<Value, Hooks<'a>>(&mut hooks, rt, Value.Int { value: 707 }) }
+    let target = hooks.roots[0]
+    let changed = run Effect.result(unsafe properties.defineProperty(&mut hooks, ctx, target, atoms.JS_ATOM_name, Value.Undefined, Value.Undefined, Value.Undefined, JS_PROP_HAS_ENUMERABLE))
+    match move changed { Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { .. } => ()
+      Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => { return run unsafe core.materialize(&mut hooks, ctx, move error) } }
+    return Value.Int { value: 11 }
+  }
+  if id == 3 { return Value.Int { value: 41 } }
+  if id == 4 { return unsafe hooks.roots[6].retained() }
+  if id == 5 {
+    hooks.nextCount = hooks.nextCount + 1
+    if hooks.mode == 1 { return run unsafe exceptions.throwValue<Value, Hooks<'a>>(&mut hooks, rt, Value.Int { value: 707 }) }
+    let memory = hooks.memory let object = run unsafe objects.object(&mut hooks, memory, ctx)
+    let done = hooks.nextCount > 3
+    let mut item = Value.Undefined
+    if !done { item = hooks.roots[6 + u32.toUsize(hooks.nextCount)] }
+    let result = run Effect.result(unsafe iteratorFields(&mut hooks, ctx, object, item, done))
+    match move result { Result<(), JsException>.Success { .. } => { return object }
+      Result<(), JsException>.Failure { error } => { unsafe gc.release(&mut hooks, rt, object) fail move error } }
+  }
+  if id == 6 {
+    hooks.closed = hooks.closed + 1
+    return run unsafe exceptions.throwValue<Value, Hooks<'a>>(&mut hooks, rt, Value.Int { value: 909 })
+  }
+  if id == 7 {
+    let anchor = () let state = unsafe HeapCell.payload<ContextState, ()>(&anchor, ctx)
+    if unsafe core.sameValue(receiver, state.globalObject) { hooks.receiverMatches = hooks.receiverMatches + 1 }
+    if hooks.mode == 2 { return run unsafe exceptions.throwValue<Value, Hooks<'a>>(&mut hooks, rt, Value.Int { value: 707 }) }
+    if hooks.mode == 3 { return unsafe hooks.roots[10].retained() }
+    let value = unsafe argv.get(0)
+    return Value.Int { value: f64.toI32(value.numericValue()) & 1 }
+  }
+  if id == 8 { return unsafe hooks.roots[2].retained() }
+  if id == 9 { return unsafe hooks.roots[3].retained() }
+  if id == 10 {
+    let mut anchor = () let state = unsafe HeapCell.payloadMut<ContextState, ()>(&mut anchor, ctx)
+    state.interruptCounter = 1
+    return unsafe hooks.roots[0].retained()
+  }
+  if id == 11 { return Value.Int { value: 31 } }
+  if id == 12 { return Value.Undefined }
+  if id == 13 { return run unsafe exceptions.throwValue<Value, Hooks<'a>>(&mut hooks, rt, Value.Int { value: 707 }) }
+  if id == 14 {
+    let descriptor = hooks.roots[3]
+    run unsafe put(&mut hooks, ctx, descriptor, atoms.JS_ATOM_value, Value.Int { value: 93 }, 7)
+    return unsafe hooks.roots[3].retained()
+  }
+  trap()
+}
+unsafe effect fn iteratorFields<'a>(hooks: &mut Hooks<'a>, ctx: *mut HeapHeader, object: Value, item: Value, done: bool) -> () ! JsException ? &mut Allocator {
+  run unsafe put(&mut hooks, ctx, object, atoms.JS_ATOM_value, item, 7)
+  run unsafe put(&mut hooks, ctx, object, atoms.JS_ATOM_done, Value.Bool { value: done }, 7)
+}
+
+unsafe effect fn setup<'a>(hooks: &mut Hooks<'a>, ctx: *mut HeapHeader, method: u32, mode: u32) -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | PrototypeError | JsException ? &mut Allocator {
+  hooks.method = method hooks.mode = mode
+  let memory = hooks.memory
+  hooks.roots[0] = run unsafe objects.withPrototype(&mut hooks, memory, ctx, Value.Null)
+  hooks.roots[1] = run unsafe objects.withPrototype(&mut hooks, memory, ctx, Value.Null)
+  hooks.roots[2] = run Strings.fromLatin1(b"value")
+  hooks.roots[3] = run unsafe objects.object(&mut hooks, memory, ctx)
+  hooks.roots[4] = run unsafe objects.object(&mut hooks, memory, ctx)
+  hooks.roots[5] = run unsafe function(&mut hooks, ctx, 11)
+  let target = hooks.roots[0] let proto = hooks.roots[1] let desc = hooks.roots[3]
+  let descriptorMap = hooks.roots[4] let keyText = hooks.roots[2]
+  run unsafe put(&mut hooks, ctx, target, 0x80000002, Value.Int { value: 20 }, 7)
+  run unsafe put(&mut hooks, ctx, target, atoms.JS_ATOM_value, Value.Int { value: 11 }, 7)
+  run unsafe put(&mut hooks, ctx, target, atoms.JS_ATOM_name, Value.Int { value: 12 }, 3)
+  run unsafe put(&mut hooks, ctx, target, atoms.JS_ATOM_Symbol_iterator, Value.Int { value: 13 }, 7)
+  run unsafe put(&mut hooks, ctx, desc, atoms.JS_ATOM_value, Value.Int { value: 41 }, 7)
+  run unsafe put(&mut hooks, ctx, desc, atoms.JS_ATOM_writable, Value.Bool { value: true }, 7)
+  run unsafe put(&mut hooks, ctx, desc, atoms.JS_ATOM_enumerable, Value.Bool { value: true }, 7)
+  run unsafe put(&mut hooks, ctx, desc, atoms.JS_ATOM_configurable, Value.Bool { value: true }, 7)
+  run unsafe put(&mut hooks, ctx, descriptorMap, atoms.JS_ATOM_value, desc, 7)
+  hooks.args = [target, hooks.roots[2], desc] hooks.receiver = target
+  if mode == 2 && (method == 12 || method == 13 || method >= 18 && method <= 21 ||
+    method == 36 || method == 38 || method == 39 || method == 40) { hooks.args[0] = Value.Int { value: 7 } }
+  if method == 0 { hooks.receiver = Value.Undefined if mode == 1 { hooks.args[0] = Value.Null } }
+  if method == 1 { hooks.args[0] = Value.Null hooks.args[1] = hooks.roots[4] }
+  if method == 3 { hooks.args[1] = proto }
+  if method == 5 { hooks.args[1] = hooks.roots[4] }
+  if method == 16 {
+    hooks.args[0] = Value.Float64 { value: -0.0 } hooks.args[1] = Value.Int { value: 0 }
+    if mode == 1 { hooks.args[0] = Value.Float64 { value: f64.fromBits(0x7ff8000000000000) } hooks.args[1] = hooks.args[0] }
+  }
+  if method == 17 { hooks.args[1] = desc hooks.args[2] = Value.Null }
+  if method == 25 {
+    let methodFunction = run unsafe function(&mut hooks, ctx, 8)
+    run unsafe put(&mut hooks, ctx, target, atoms.JS_ATOM_toString, methodFunction, 7)
+    unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(ctx), methodFunction)
+  }
+  if method == 27 || method == 29 || method >= 32 && method <= 35 { hooks.args[0] = hooks.roots[2] }
+  if method == 28 {
+    let changed = run unsafe prototypes.setPrototype(&mut hooks, ctx, target, proto)
+    hooks.receiver = proto
+  }
+  if method == 31 { hooks.args[0] = proto }
+  if method == 32 || method == 33 { hooks.args[1] = hooks.roots[5] }
+  if method == 34 || method == 35 { run unsafe accessor(&mut hooks, ctx, target, atoms.JS_ATOM_value, 11) }
+  if mode != 0 && (method == 9 || method == 10 || method == 11 || method == 17) {
+    run unsafe put(&mut hooks, ctx, target, atoms.JS_ATOM_name, Value.Int { value: 12 }, 7)
+    run unsafe accessor(&mut hooks, ctx, target, atoms.JS_ATOM_value, 2)
+    if method == 17 { hooks.args[0] = proto hooks.args[1] = target }
+  }
+  if mode == 1 && (method == 1 || method == 5) {
+    run unsafe accessor(&mut hooks, ctx, descriptorMap, atoms.JS_ATOM_value, 9)
+    run unsafe accessor(&mut hooks, ctx, descriptorMap, atoms.JS_ATOM_name, 14)
+  }
+  if mode == 1 && (method == 4 || method == 37 || method == 14 || method == 40) {
+    hooks.roots[10] = run unsafe objects.object(&mut hooks, memory, ctx)
+    let converter = run unsafe function(&mut hooks, ctx, 1)
+    let keyObject = hooks.roots[10]
+    run unsafe put(&mut hooks, ctx, keyObject, atoms.JS_ATOM_toString, converter, 7)
+    unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(ctx), converter)
+    hooks.args[1] = hooks.roots[10]
+  }
+  if mode == 1 && (method == 23 || method == 27 || method == 29) {
+    hooks.roots[10] = run unsafe objects.object(&mut hooks, memory, ctx)
+    let converter = run unsafe function(&mut hooks, ctx, 13)
+    let keyObject = hooks.roots[10]
+    run unsafe put(&mut hooks, ctx, keyObject, atoms.JS_ATOM_toString, converter, 7)
+    unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(ctx), converter)
+    if method == 23 { hooks.args[0] = Value.Null hooks.args[1] = hooks.roots[10] }
+    else { hooks.receiver = Value.Null hooks.args[0] = hooks.roots[10] }
+  }
+  if method == 24 && mode == 1 { run unsafe put(&mut hooks, ctx, target, atoms.JS_ATOM_Symbol_toStringTag, keyText, 7) }
+  if method == 24 && mode == 2 { hooks.receiver = Value.Null }
+  if method == 24 && mode >= 3 {
+    if mode == 3 { hooks.roots[11] = run unsafe objects.array(&mut hooks, memory, ctx) }
+    else { hooks.roots[11] = run unsafe function(&mut hooks, ctx, 12) }
+    let proxyTarget = hooks.roots[11]
+    hooks.roots[12] = run unsafe proxy.constructor(&mut hooks, memory, ctx, proxyTarget, proto)
+    hooks.receiver = hooks.roots[12]
+    if mode == 5 { unsafe core.revoke(hooks.roots[12]) }
+  }
+  if method == 28 && mode == 1 || (method == 34 || method == 35) && mode == 1 {
+    // A proxy can manufacture a cyclic prototype graph. The installed interrupt
+    // must terminate traversal, not a fabricated depth limit in the operation.
+    let getter = run unsafe function(&mut hooks, ctx, 10)
+    run unsafe put(&mut hooks, ctx, proto, atoms.JS_ATOM_getPrototypeOf, getter, 7)
+    unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(ctx), getter)
+    hooks.roots[12] = run unsafe proxy.constructor(&mut hooks, memory, ctx, target, proto)
+    unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(ctx), target)
+    hooks.roots[0] = unsafe hooks.roots[12].retained()
+    if method == 28 { hooks.args[0] = hooks.roots[12] }
+    else { hooks.receiver = hooks.roots[12] hooks.args[0] = Value.Int { value: 88 } }
+    let mut anchor = () let state = unsafe HeapCell.payloadMut<ContextState, ()>(&mut anchor, ctx)
+    state.interruptCounter = 10000 drop state
+    let rt = unsafe runtime.contextRuntime(ctx) let runtimeState = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+    runtimeState.interrupt.callback = Option<NativeFunctionId>.some(NativeFunctionId.Host { id: 99 })
+  }
+  if method == 8 || method == 22 {
+    hooks.roots[6] = run unsafe objects.object(&mut hooks, memory, ctx)
+    let iterator = hooks.roots[6]
+    let acquire = run unsafe function(&mut hooks, ctx, 4)
+    run unsafe put(&mut hooks, ctx, iterator, atoms.JS_ATOM_Symbol_iterator, acquire, 7)
+    unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(ctx), acquire)
+    let next = run unsafe function(&mut hooks, ctx, 5)
+    run unsafe put(&mut hooks, ctx, iterator, atoms.JS_ATOM_next, next, 7)
+    unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(ctx), next)
+    let close = run unsafe function(&mut hooks, ctx, 6)
+    run unsafe put(&mut hooks, ctx, iterator, atoms.JS_ATOM_return, close, 7)
+    unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(ctx), close)
+    let mut i: usize = 7
+    while i < 10 {
+      if method == 8 { hooks.roots[i] = Value.Int { value: usize.toI32(i - 6) } }
+      else {
+        hooks.roots[i] = run unsafe objects.object(&mut hooks, memory, ctx)
+        let entry = hooks.roots[i]
+        run unsafe put(&mut hooks, ctx, entry, 0x80000000, keyText, 7)
+        run unsafe put(&mut hooks, ctx, entry, 0x80000001, Value.Int { value: usize.toI32(i) }, 7)
+      }
+      i = i + 1
+    }
+    if method == 22 && mode == 2 {
+      let entry = hooks.roots[7]
+      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(ctx), entry) hooks.roots[7] = Value.Int { value: 7 }
+    }
+    hooks.args[0] = hooks.roots[6]
+    if method == 8 {
+      hooks.roots[11] = run unsafe function(&mut hooks, ctx, 7) hooks.args[1] = hooks.roots[11]
+      if mode == 4 { hooks.args[1] = Value.Int { value: 1 } hooks.args[0] = Value.Null }
+      if mode == 3 {
+        hooks.roots[10] = run unsafe objects.object(&mut hooks, memory, ctx)
+        let converter = run unsafe function(&mut hooks, ctx, 13)
+        let keyObject = hooks.roots[10]
+        run unsafe put(&mut hooks, ctx, keyObject, atoms.JS_ATOM_toString, converter, 7)
+        unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(ctx), converter)
+      }
+    }
+  }
+  if method == 41 {
+    let rt = unsafe runtime.contextRuntime(ctx)
+    let foreign = run unsafe storage.context(rt) hooks.foreign = foreign
+    hooks.roots[13] = run unsafe objects.withPrototype(&mut hooks, memory, foreign, Value.Null)
+    let foreignPrototype = hooks.roots[13]
+    run unsafe put(&mut hooks, foreign, foreignPrototype, atoms.JS_ATOM_value, Value.Int { value: 81 }, 7)
+    let retainedPrototype = unsafe foreignPrototype.retained()
+    unsafe runtime.setClassPrototype(&mut hooks, foreign, classes.JS_CLASS_OBJECT, retainedPrototype)
+    hooks.roots[14] = run unsafe function(&mut hooks, foreign, 12)
+    let foreignFunction = hooks.roots[14]
+    if mode == 1 {
+      let empty = unsafe slots(&[])
+      hooks.roots[12] = run unsafe bound.bind(&mut hooks, memory, ctx, foreignFunction, &empty)
+    } else if mode == 2 || mode == 3 {
+      hooks.roots[12] = run unsafe proxy.constructor(&mut hooks, memory, ctx, foreignFunction, proto)
+      if mode == 3 { unsafe core.revoke(hooks.roots[12]) }
+    } else { hooks.roots[12] = unsafe hooks.roots[14].retained() }
+    return ()
+  }
+  let mut protocol = NativeCallProtocol.Generic
+  if method == 2 || method == 4 || method == 8 || method >= 9 && method <= 14 ||
+    method >= 18 && method <= 21 || method >= 32 { protocol = NativeCallProtocol.GenericMagic }
+  if method == 0 { protocol = NativeCallProtocol.ConstructorOrFunction }
+  if method == 30 { protocol = NativeCallProtocol.Getter }
+  if method == 31 { protocol = NativeCallProtocol.Setter }
+  hooks.roots[15] = run unsafe native.newFunction(&mut hooks, memory, ctx,
+    NativeFunctionId.Builtin { family: BuiltinFamily.Object, method: method }, b"Object intrinsic", 3, protocol, 0)
+}
+fn mix(hash: u32, word: u32) -> u32 { return (hash * 31 + (word & 65535)) & 65535 }
+unsafe effect fn digest<'a>(hooks: &mut Hooks<'a>, ctx: *mut HeapHeader, value: Value, depth: u32) -> u32
+  ! OutOfMemoryError | StringLengthError | OwnKeysError | JsException ? &mut Allocator {
+  if value.isNumber() {
+    let number = value.numericValue()
+    if number != number { return 900 }
+    if number == 0.0 { if f64.toBits(number) == 0x8000000000000000 { return 901 } return 902 }
+    return mix(3, f64.toU32(number))
+  }
+  if value.isString() {
+    let mut result: u32 = 5 let mut i: usize = 0
+    while i < Strings.length(value) { result = mix(result, u16.toU32(Strings.codeUnit(value, i))) i = i + 1 }
+    return result
+  }
+  if !value.isObject() {
+    return match value { Value.Null => 101 Value.Undefined => 102
+      Value.Bool { value: flag } => { if flag { return 104 } return 103 }
+      Value.Symbol { .. } => 105 _ => 106 }
+  }
+  if unsafe hooks.isCallable(ctx, value) { return 77 }
+  if depth == 0 { return 88 }
+  let keys = run unsafe names.getOwnPropertyNames(&mut hooks, ctx, value, 3)
+  let mut hash: u32 = 7 let mut i: usize = 0
+  while i < keys.length() {
+    let key = keys.get(i).atom
+    let keyValue = run unsafe core.atomValue(&mut hooks, ctx, key)
+    hash = mix(hash, run unsafe digest(&mut hooks, ctx, keyValue, 0))
+    unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(ctx), keyValue)
+    let found = run unsafe descriptors.getOwnProperty(&mut hooks, ctx, value, key)
+    match move found {
+      Option<PropertyDescriptor>.None => { hash = mix(hash, 0) }
+      Option<PropertyDescriptor>.Some { value: desc } => {
+        hash = mix(hash, desc.flags & 7)
+        if (desc.flags & 16) != 0 { hash = mix(hash, 99) }
+        else { hash = mix(hash, run unsafe digest(&mut hooks, ctx, desc.value, depth - 1)) }
+        unsafe releaseDescriptor(&mut hooks, unsafe runtime.contextRuntime(ctx), move desc)
+      }
+    }
+    i = i + 1
+  }
+  unsafe names.releaseNames(unsafe runtime.contextRuntime(ctx), move keys)
+  return hash
+}
+unsafe effect fn perform<'a>(hooks: &mut Hooks<'a>, ctx: *mut HeapHeader) -> Value ! JsException ? &mut Allocator {
+  let memory = hooks.memory
+  if hooks.method == 41 {
+    let foreign = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(hooks.foreign)
+    let before = unsafe storage.rc(foreign)
+    let newTarget = hooks.roots[12]
+    let realm = run unsafe constructors.getFunctionRealm(&mut hooks, ctx, newTarget)
+    hooks.realmBits = base.flag(Pointer.address(realm) == Pointer.address(foreign))
+    if before == unsafe storage.rc(foreign) { hooks.realmBits = hooks.realmBits | 4 }
+    let object = run unsafe constructors.createFromConstructor(&mut hooks, memory, ctx, newTarget, classes.JS_CLASS_OBJECT)
+    let prototypeResult = run Effect.result(unsafe prototypes.getPrototype(&mut hooks, ctx, object))
+    let prototype = match move prototypeResult {
+      Result<Value, OutOfMemoryError | JsException>.Success { value } => value
+      Result<Value, OutOfMemoryError | JsException>.Failure { error } => {
+        unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(ctx), object)
+        return run unsafe core.materialize(&mut hooks, ctx, move error)
+      }
+    }
+    if unsafe core.sameValue(prototype, hooks.roots[13]) { hooks.realmBits = hooks.realmBits | 2 }
+    unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(ctx), prototype)
+    return object
+  }
+  let args = hooks.args let argv = unsafe slots(&args)
+  let receiver = hooks.receiver let function = hooks.roots[15]
+  return run unsafe native.call(&mut hooks, memory, ctx, function, receiver, &argv, 0)
+}
+pub effect fn isolated(method: u32, mode: u32, armed: bool, cutoff: usize) -> [u32; 16]
+  ! OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | PrototypeError | JsException {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider()) let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe storage.context(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make(&observer)
+  run unsafe base.prepare(&mut hooks.base, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+  run unsafe setup(&mut hooks, ctx, method, mode) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut fault = FaultAllocator { parent: move memory, armed: armed, remaining: cutoff, persistent: false, failures: 0 }
+  let result = run Effect.result(unsafe perform(&mut hooks, ctx)) |> Effect.provideMut<Allocator>(&mut fault)
+  fault.armed = false
+  let mut record: [u32; 16] = [0; 16]
+  record[12] = usize.toU32(fault.failures) record[13] = base.flag(unsafe exceptions.has(rt))
+  match move result {
+    Result<Value, JsException>.Success { value } => {
+      record[0] = 1 record[1] = run unsafe digest(&mut hooks, ctx, value, 4) |> Effect.provideMut<Allocator>(&mut fault)
+      record[3] = base.flag(unsafe core.sameValue(value, hooks.roots[0]))
+      if method == 1 || method == 5 || method == 22 || method >= 9 && method <= 11 {
+        let mut atom = atoms.JS_ATOM_value
+        if method >= 9 && method <= 11 { atom = atoms.JS_ATOM_length }
+        let observed = run unsafe hooks.getProperty(ctx, value, atom) |> Effect.provideMut<Allocator>(&mut fault)
+        record[11] = base.code(observed) unsafe gc.release(&mut hooks, rt, observed)
+      }
+      if (method == 18 || method == 19) && value.isObject() {
+        let observed = run unsafe descriptors.getOwnProperty(&mut hooks, ctx, value, atoms.JS_ATOM_value) |> Effect.provideMut<Allocator>(&mut fault)
+        match move observed {
+          Option<PropertyDescriptor>.Some { value: desc } => {
+            record[11] = desc.flags & 7 unsafe releaseDescriptor(&mut hooks, rt, move desc)
+          }
+          Option<PropertyDescriptor>.None => ()
+        }
+      }
+      if method == 8 {
+        let prototype = run unsafe prototypes.getPrototype(&mut hooks, ctx, value) |> Effect.provideMut<Allocator>(&mut fault)
+        record[11] = match prototype { Value.Null => 1 _ => 0 }
+        unsafe gc.release(&mut hooks, rt, prototype)
+      }
+      unsafe gc.release(&mut hooks, rt, value)
+    }
+    Result<Value, JsException>.Failure { .. } => {
+      let error = unsafe exceptions.take(rt)
+      record[2] = 100 + unsafe errorFixture.errorKind(ctx, error)
+      if error.isNumber() { record[2] = base.code(error) }
+      unsafe gc.release(&mut hooks, rt, error)
+    }
+  }
+  let observedTarget = hooks.roots[0]
+  record[4] = run unsafe digest(&mut hooks, ctx, observedTarget, 3) |> Effect.provideMut<Allocator>(&mut fault)
+  record[5] = hooks.calls record[6] = hooks.events record[7] = hooks.closed record[8] = hooks.nextCount
+  record[9] = hooks.receiverMatches record[10] = hooks.interrupted
+  if method == 41 { record[11] = hooks.realmBits }
+  let mut i: usize = 0
+  while i < 16 { let value = hooks.roots[i] hooks.roots[i] = Value.Undefined unsafe gc.release(&mut hooks, rt, value) i = i + 1 }
+  if !Pointer.isNull(hooks.foreign) {
+    let foreign = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(hooks.foreign)
+    hooks.foreign = Pointer.null<HeapHeader>() unsafe gc.releaseHeader(&mut hooks, rt, foreign)
+  }
+  run unsafe gc.collect(&mut hooks, rt, true) |> Effect.provideMut<Allocator>(&mut fault)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx)
+  run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut fault)
+  record[14] = usize.toU32(observer.stats().allocationCount) record[15] = usize.toU32(observer.stats().usedBytes)
+  return record
+}

@@ -1,0 +1,210 @@
+//! Primitive emission (quickjs.c:24254-24442). No parsing or final resolution.
+//! All fd/table borrows are exclusive, same-runtime, non-reentrant. Emission OOM
+//! is sticky in bytecodeError, matching DynBuf; callers inspect it before resolution.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.i32
+import silk.u8
+import silk.u32
+import silk.usize
+import byte_buffer { ByteBuffer, readU32 }
+import js_atoms { AtomTable }
+import js_value { Value }
+import js_heap { HeapCell }
+import js_core_types { RuntimeState }
+import js_gc { HeapHooks }
+import js_gc
+import js_compiler_types { FunctionDef, LabelSlot, VarScope, reserveArray }
+import js_opcode_data as op
+
+pub const MAX_BYTECODE_CAPACITY: usize = 1073741823
+
+effect fn reserveBytes(bytes: &mut ByteBuffer, capacity: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let additional = capacity - bytes.length()
+  run bytes.reserveExact(additional)
+  return true
+}
+// DynBuf's error is sticky for growth, NOT for writes fitting old capacity.
+// This is also used for operands: a failed claim never partially writes one.
+pub effect fn claimBytecode(fd: &mut FunctionDef, additional: usize) -> bool ? &mut Allocator {
+  if additional <= fd.bytecode.capacity() - fd.bytecode.length() { return true }
+  if fd.bytecodeError { return false }
+  if additional > MAX_BYTECODE_CAPACITY - fd.bytecode.length() {
+    fd.bytecodeError = true return false
+  }
+  let mut capacity = fd.bytecode.capacity() + fd.bytecode.capacity() / 2
+  let needed = fd.bytecode.length() + additional
+  if capacity < needed { capacity = needed }
+  if capacity > MAX_BYTECODE_CAPACITY { fd.bytecodeError = true return false }
+  let success = run Effect.catchAll(reserveBytes(&mut fd.bytecode, capacity), failed)
+  if !success { fd.bytecodeError = true }
+  return success
+}
+// Recovery returns success/failure without borrowing the emitter in a handler.
+effect fn failed(error: OutOfMemoryError) -> bool { drop error return false }
+effect fn put8(bytes: &mut ByteBuffer, value: u8) -> bool ! OutOfMemoryError ? &mut Allocator { run bytes.append(value) return true }
+effect fn put16(bytes: &mut ByteBuffer, value: u16) -> bool ! OutOfMemoryError ? &mut Allocator { run bytes.writeU16(value) return true }
+effect fn put32(bytes: &mut ByteBuffer, value: u32) -> bool ! OutOfMemoryError ? &mut Allocator { run bytes.writeU32(value) return true }
+pub effect fn emitU8(fd: &mut FunctionDef, value: u8) -> () ? &mut Allocator {
+  if run claimBytecode(&mut fd, 1) {
+    if !run Effect.catchAll(put8(&mut fd.bytecode, value), failed) { fd.bytecodeError = true }
+  }
+}
+pub effect fn emitU16(fd: &mut FunctionDef, value: u16) -> () ? &mut Allocator {
+  if run claimBytecode(&mut fd, 2) {
+    if !run Effect.catchAll(put16(&mut fd.bytecode, value), failed) { fd.bytecodeError = true }
+  }
+}
+pub effect fn emitU32(fd: &mut FunctionDef, value: u32) -> () ? &mut Allocator {
+  if run claimBytecode(&mut fd, 4) {
+    if !run Effect.catchAll(put32(&mut fd.bytecode, value), failed) { fd.bytecodeError = true }
+  }
+}
+pub effect fn emitOp(fd: &mut FunctionDef, opcode: u8) -> () ? &mut Allocator {
+  fd.lastOpcodePosition = usize.toI32(fd.bytecode.length())
+  run emitU8(&mut fd, opcode)
+}
+pub fn previousOpcode(fd: &FunctionDef) -> u8 {
+  if fd.lastOpcodePosition < 0 || fd.bytecodeError { return op.OP_invalid }
+  return fd.bytecode.get(i32.toUsize(fd.lastOpcodePosition))
+}
+pub fn isLiveCode(fd: &FunctionDef) -> bool {
+  let code = previousOpcode(fd)
+  return !(code == op.OP_tail_call || code == op.OP_tail_call_method || code == op.OP_return
+    || code == op.OP_return_undef || code == op.OP_return_async || code == op.OP_throw
+    || code == op.OP_throw_error || code == op.OP_goto || code == op.OP_goto8
+    || code == op.OP_goto16 || code == op.OP_ret)
+}
+pub effect fn emitSourcePosition(fd: &mut FunctionDef, offset: u32) -> () ? &mut Allocator {
+  if offset != fd.lastOpcodeSourcePosition {
+    run emitU8(&mut fd, op.OP_line_num)
+    run emitU32(&mut fd, offset)
+    fd.lastOpcodeSourcePosition = offset
+  }
+}
+pub effect fn emitAtom(fd: &mut FunctionDef, atoms: &mut AtomTable, name: u32) -> () ? &mut Allocator {
+  // Fixed-width put reserves before changing bytes; retain only a committed operand.
+  let before = fd.bytecode.length()
+  run emitU32(&mut fd, name)
+  if fd.bytecode.length() == before + 4 { let retained = atoms.duplicate(name) }
+}
+pub fn updateLabel(fd: &mut FunctionDef, label: i32, delta: i32) -> i32 {
+  let mut slot = fd.labels.get(i32.toUsize(label))
+  slot.referenceCount = slot.referenceCount + delta
+  if slot.referenceCount < 0 { Intrinsic.trap("QuickJS invariant violated") }
+  fd.labels.set(i32.toUsize(label), slot)
+  return slot.referenceCount
+}
+pub effect fn newLabelFd(fd: &mut FunctionDef) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  run reserveArray(&mut fd.labels)
+  let index = usize.toI32(fd.labels.length())
+  run fd.labels.append(LabelSlot { referenceCount: 0, position: -1, position2: -1, address: -1, firstRelocation: -1 })
+  return index
+}
+effect fn missingLabel(error: OutOfMemoryError) -> i32 { drop error return -1 }
+pub effect fn newLabel(fd: &mut FunctionDef) -> i32 ? &mut Allocator {
+  let label = run Effect.catchAll(newLabelFd(&mut fd), missingLabel)
+  if label < 0 { fd.bytecodeError = true }
+  return label
+}
+pub effect fn emitLabelRaw(fd: &mut FunctionDef, label: i32) -> () ? &mut Allocator {
+  run emitU8(&mut fd, op.OP_label)
+  run emitU32(&mut fd, i32.toU32(label))
+  let mut slot = fd.labels.get(i32.toUsize(label))
+  slot.position = usize.toI32(fd.bytecode.length())
+  fd.labels.set(i32.toUsize(label), slot)
+}
+pub effect fn emitLabel(fd: &mut FunctionDef, label: i32) -> i32 ? &mut Allocator {
+  if label < 0 { return -1 }
+  fd.lastOpcodePosition = usize.toI32(fd.bytecode.length())
+  run emitLabelRaw(&mut fd, label)
+  return usize.toI32(fd.bytecode.length()) - 4
+}
+pub effect fn emitGoto(fd: &mut FunctionDef, opcode: u8, label: i32) -> i32 ? &mut Allocator {
+  if !isLiveCode(&fd.*) { return -1 }
+  let mut target = label
+  if target < 0 { target = run newLabel(&mut fd) if target < 0 { return -1 } }
+  run emitOp(&mut fd, opcode)
+  run emitU32(&mut fd, i32.toU32(target))
+  let references = updateLabel(&mut fd, target, 1)
+  return target
+}
+pub effect fn pushScope(fd: &mut FunctionDef) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  let index = usize.toI32(fd.scopes.length())
+  run fd.scopes.append(VarScope { parent: fd.scopeLevel, first: fd.scopeFirst })
+  run emitOp(&mut fd, op.OP_enter_scope)
+  run emitU16(&mut fd, i32.toU16(index))
+  fd.scopeLevel = index
+  return index
+}
+pub fn firstLexicalVar(fd: &FunctionDef, scope: i32) -> i32 {
+  let mut current = scope
+  while current >= 0 {
+    let entry = fd.scopes.get(i32.toUsize(current))
+    if entry.first >= 0 { return entry.first }
+    current = entry.parent
+  }
+  return -1
+}
+pub effect fn popScope(fd: &mut FunctionDef) -> () ? &mut Allocator {
+  run emitOp(&mut fd, op.OP_leave_scope)
+  let scope = i32.toU16(fd.scopeLevel)
+  run emitU16(&mut fd, scope)
+  fd.scopeLevel = fd.scopes.get(i32.toUsize(fd.scopeLevel)).parent
+  fd.scopeFirst = firstLexicalVar(&fd.*, fd.scopeLevel)
+}
+pub effect fn closeScopes(fd: &mut FunctionDef, scope: i32, stop: i32) -> () ? &mut Allocator {
+  let mut current = scope
+  while current > stop {
+    run emitOp(&mut fd, op.OP_leave_scope)
+    run emitU16(&mut fd, i32.toU16(current))
+    current = fd.scopes.get(i32.toUsize(current)).parent
+  }
+}
+effect fn reserveConstant(fd: &mut FunctionDef) -> bool ! OutOfMemoryError ? &mut Allocator {
+  run reserveArray(&mut fd.constants) return true
+}
+// Consumes value on BOTH success and failure. Runtime must stay live during hooks.
+pub unsafe effect fn addConstant<H: HeapHooks>(hooks: &mut H, fd: &mut FunctionDef, value: Value) -> i32
+  ! OutOfMemoryError ? &mut Allocator {
+  let reserved = run Effect.catchAll(reserveConstant(&mut fd), failed)
+  if !reserved { unsafe js_gc.release(&mut hooks, fd.runtime, value) fail OutOfMemoryError {} }
+  let index = usize.toI32(fd.constants.length())
+  run fd.constants.append(value)
+  return index
+}
+effect fn atomFailed(error: OutOfMemoryError) -> u32 { drop error return 0 }
+// val is borrowed and must be a flat JS String when asAtom is true (source invariant).
+pub unsafe effect fn emitPushConstant<H: HeapHooks>(hooks: &mut H, fd: &mut FunctionDef,
+    value: Value, asAtom: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value.tag() == -7 && asAtom {
+    let mut anchor = ()
+    let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, fd.runtime)
+    let retained = unsafe value.retained()
+    let atom = run Effect.catchAll(rt.atoms.internOwned(retained), atomFailed)
+    if atom != 0 && !AtomTable.isInteger(atom) {
+      run emitOp(&mut fd, op.OP_push_atom_value)
+      let before = fd.bytecode.length()
+      run emitU32(&mut fd, atom)
+      if fd.bytecode.length() != before + 4 { rt.atoms.release(atom) }
+      return ()
+    }
+  }
+  let retained = unsafe value.retained()
+  let index = run unsafe addConstant(&mut hooks, &mut fd, retained)
+  run emitOp(&mut fd, op.OP_push_const)
+  run emitU32(&mut fd, i32.toU32(index))
+}
+// Truncated atom operands can result from OOM. Their references were never retained.
+pub fn freeBytecodeAtoms(atoms: &mut AtomTable, bytes: &[u8], short: bool) -> () {
+  let mut position: usize = 0
+  while position < bytes.length {
+    let info = op.opcodeInfo(bytes[position], short)
+    let format = info.format
+    if format == op.OP_FMT_atom || format == op.OP_FMT_atom_u8 || format == op.OP_FMT_atom_u16
+      || format == op.OP_FMT_atom_label_u8 || format == op.OP_FMT_atom_label_u16 {
+      if position + 5 <= bytes.length { atoms.release(readU32(bytes, position + 1)) }
+    }
+    position = position + u8.toUsize(info.size)
+  }
+}

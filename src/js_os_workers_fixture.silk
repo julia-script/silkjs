@@ -1,0 +1,416 @@
+//! Actual detached Session/Worker ownership and independent allocation sweeps.
+//! Root teardown never stops or joins children. Host-fed input proves that a
+//! child outlives its original Process/WaiterDomain; ledgers settle at real exit.
+import silk.allocator { Allocator, OutOfMemoryError, SystemAllocator }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.layout { Layout }
+import silk.list { List }
+import silk.ownership { Drop }
+import silk.pointer { Pointer }
+import silk.usize
+import silk.writer { Writer, WriterError }
+import silk.os_writer { StdoutWriter }
+import byte_buffer { ByteBuffer }
+import runtime_memory { RuntimeAllocator, AllocationObserver }
+import js_atomics_native { WaiterDomain, SynchronizationError }
+import js_runtime_registry { ClassIdAllocator }
+import js_heap { HeapHeader }
+import js_value { Value }
+import js_core_types { FrameSlots }
+import js_exceptions { JsException }
+import js_exceptions as exceptions
+import js_gc as gc
+import js_libc as libc
+import js_libc { Session }
+import js_libc_process { Process }
+import js_call_host { CallHooks }
+import js_eval as evaluation
+import js_os_events { ThreadState }
+import js_os_events as events
+import js_os_workers_resources { Snapshot, Resources }
+import js_os_workers as workers
+import js_os_events_platform { PollFd, Signals }
+import js_os_events_platform as platform
+import js_std_native as native
+struct FaultAllocator { parent: RuntimeAllocator<SystemAllocator>, remaining: usize, failed: bool }
+impl Allocator for FaultAllocator {
+  effect fn allocate(self: &mut Self, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
+    if self.remaining == 0 { self.remaining = usize.MAX self.failed = true return run Allocator.outOfMemory() }
+    if self.remaining != usize.MAX { self.remaining = self.remaining - 1 }
+    return run Allocator.allocate(move layout) |> Effect.provideMut<Allocator>(&mut self.parent)
+  }
+}
+unsafe extern "C" fn fcntl(fd: i32, command: i32, ...) -> i32
+unsafe extern "C" fn close(fd: i32) -> i32
+unsafe extern "C" fn pipe(fds: *mut i32) -> i32 with Intrinsic.foreign(noCapture: ("fds",))
+unsafe extern "C" fn dup(fd: i32) -> i32
+unsafe extern "C" fn dup2(fd: i32, target: i32) -> i32
+unsafe extern "C" fn write(fd: i32, data: *const u8, length: usize) -> i64 with Intrinsic.foreign(noCapture: ("data",))
+unsafe extern "C" fn dprintf(fd: i32, format: *const u8, ...) -> i32 with Intrinsic.foreign(noCapture: ("format",))
+unsafe extern "C" fn ftrylockfile(file: *mut native.File) -> i32 with Intrinsic.foreign(noCapture: ("file",))
+unsafe extern "C" fn funlockfile(file: *mut native.File) -> () with Intrinsic.foreign(noCapture: ("file",))
+extern "C" struct Timespec { seconds: i64, nanoseconds: i64 }
+unsafe extern "C" fn nanosleep(request: *const Timespec, remaining: ?*mut Timespec) -> i32 with Intrinsic.foreign(noCapture: ("request", "remaining"))
+unsafe extern "C" fn getpid() -> i32
+unsafe extern "C" fn kill(pid: i32, number: i32) -> i32
+unsafe extern "C" fn sigaction(number: i32, action: ?*const u8, previous: ?*mut u8) -> i32
+unsafe extern "C" fn nativeSignal(number: i32, handler: ?*const u8) -> ?*const u8 as "signal"
+export "C" fn silkJsWorkersFixtureForeignSignal(number: i32) -> () {}
+struct ForeignSignals { urgent: i32, first: [u64; 32], second: [u64; 32] }
+impl Drop for ForeignSignals {
+  fn drop(self: &mut Self) -> () {
+    let first = unsafe Intrinsic.pointerReinterpret<*const [u64; 32], *const u8>(Pointer.fromRef(&self.first))
+    let second = unsafe Intrinsic.pointerReinterpret<*const [u64; 32], *const u8>(Pointer.fromRef(&self.second))
+    if unsafe sigaction(self.urgent, first, Pointer.null<u8>()) != 0 ||
+      unsafe sigaction(28, second, Pointer.null<u8>()) != 0 { Intrinsic.trap("fixture signal restoration") }
+  }
+}
+fn foreignSignals(urgent: i32) -> ForeignSignals {
+  let mut result = ForeignSignals { urgent: urgent, first: [0; 32], second: [0; 32] }
+  let first = unsafe Intrinsic.pointerReinterpret<*mut [u64; 32], *mut u8>(Pointer.fromMutRef(&mut result.first))
+  let second = unsafe Intrinsic.pointerReinterpret<*mut [u64; 32], *mut u8>(Pointer.fromMutRef(&mut result.second))
+  if unsafe sigaction(urgent, Pointer.null<u8>(), first) != 0 ||
+    unsafe sigaction(28, Pointer.null<u8>(), second) != 0 { Intrinsic.trap("fixture signal snapshot") }
+  let callback: extern "C" fn(i32) -> () = silkJsWorkersFixtureForeignSignal
+  let address = unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<
+    *const extern "C" fn(i32) -> (), *const ?*const u8>(Pointer.fromRef(&callback)))
+  let oldFirst = unsafe nativeSignal(urgent, address) let oldSecond = unsafe nativeSignal(28, address)
+  if Pointer.address(oldFirst) == usize.MAX || Pointer.address(oldSecond) == usize.MAX { Intrinsic.trap("fixture foreign signal install") }
+  return move result
+}
+fn descriptors() -> u32 {
+  let mut count: u32 = 0 let mut fd: i32 = 0
+  while fd < 4096 { if unsafe fcntl(fd, 1) >= 0 { count = count + 1 } fd = fd + 1 }
+  return count
+}
+fn empty(value: Snapshot) -> bool {
+  return value.blocks == 0 && value.bytes == 0 && value.sharedBlocks == 0 && value.pipes == 0 &&
+    value.messages == 0 && value.groups == 0 && value.startPackets == 0 &&
+    value.descriptors == 0 && value.threads == 0
+}
+fn awaitEmpty(resources: &Resources) -> bool {
+  let pause = Timespec { seconds: 0, nanoseconds: 1000000 } let mut turns: usize = 0
+  while !empty(resources.snapshot()) && turns < 10000 {
+    let ignored = unsafe nanosleep(Pointer.fromRef(&pause), Pointer.null<Timespec>()) turns = turns + 1
+  }
+  return empty(resources.snapshot())
+}
+fn faultFailure(code: i32, mode: usize, operation: usize, ordinal: usize, native: Snapshot,
+    bytes: usize, allocations: usize, expectedBytes: usize, expectedAllocations: usize,
+    fds: u32, expectedFds: u32) -> i32 {
+  let context = b"Worker fault failure: status=%d mode=%zu operation=%zu ordinal=%zu\n\0"
+  let ledger = b"Worker native ledger: blocks=%zu bytes=%zu shared=%zu pipes=%zu messages=%zu groups=%zu packets=%zu descriptors=%zu threads=%zu failures=%zu\n\0"
+  let runtime = b"Worker runtime ledger: bytes=%zu/%zu allocations=%zu/%zu FDs=%u/%u\n\0"
+  let a = unsafe dprintf(2, Pointer.fromRef(&context[0]), code, mode, operation, ordinal)
+  let b = unsafe dprintf(2, Pointer.fromRef(&ledger[0]), native.blocks, native.bytes, native.sharedBlocks,
+    native.pipes, native.messages, native.groups, native.startPackets, native.descriptors, native.threads, native.failures)
+  let c = unsafe dprintf(2, Pointer.fromRef(&runtime[0]), bytes, expectedBytes, allocations, expectedAllocations, fds, expectedFds)
+  return code
+}
+fn source(operation: usize) -> &'static [u8] {
+  return match operation {
+    0 => b"(()=>{let w=new os.Worker('./libc_worker_fault_idle.mjs');if(w.onmessage!==null)throw Error('initial handler');return true})"
+    1 => b"(()=>{let w=new os.Worker('./libc_worker_fault_idle.mjs');let f=()=>w;w.onmessage=f;if(w.onmessage!==f)throw Error('identity');w.onmessage=null;w.onmessage=f;w=null;std.gc();return true})"
+    2 => b"(()=>{let w=new os.Worker('./libc_worker_fault_idle.mjs');let b=new SharedArrayBuffer(13);new Uint8Array(b).set([1,2,3]);let x={b,a:new Uint8Array(b),large:'abc'.repeat(500)};x.x=x;w.postMessage({command:'echo',value:x});return true})"
+    3 => b"(()=>{let w=new os.Worker('./libc_worker_fault_idle.mjs');for(let i=0;i<16;i++)w.postMessage({command:'sequence',index:i});w=null;std.gc();return true})"
+    4 => b"(()=>{let w=new os.Worker('./libc_worker_fault_idle.mjs');let b=new SharedArrayBuffer(8);let x={b};x.bad=()=>1;let threw=false;try{w.postMessage(x)}catch(e){threw=true}if(!threw)throw Error('clone rejection');return true})"
+    5 => b"(()=>{function N(){}N.prototype=17;let rejected=false;try{Reflect.construct(os.Worker,['./libc_worker_fault_idle.mjs'],N)}catch(e){rejected=e instanceof TypeError&&e.message==='could not determine calling script or module name'}if(!rejected)throw Error('indirect caller rejection');return true})"
+    6 => b"(()=>{globalThis.received=false;globalThis.w=new os.Worker('./libc_worker_fault_child.mjs');w.onmessage=e=>{let x=e.data;if(x.self!==x||x.bytes.buffer!==x.buffer||x.bytes[0]!==42)throw Error('decoded graph');received=true;w.onmessage=null};let b=new SharedArrayBuffer(8);new Uint8Array(b)[0]=42;let x={buffer:b,bytes:new Uint8Array(b),text:'abc'.repeat(100)};x.self=x;w.postMessage({command:'echo',value:x});return true})"
+    7 => b"(()=>{globalThis.received=false;globalThis.w=new os.Worker('./libc_worker_fault_child.mjs');w.onmessage=e=>{if(e.data!=='read:ok')throw Error('read result');received=true;w.onmessage=null};w.postMessage({command:'read'});return true})"
+    8 => b"(()=>{globalThis.received=false;globalThis.w=new os.Worker('./libc_worker_fault_child.mjs');w.onmessage=e=>{if(e.data!=='write:ok')throw Error('write result');received=true;w.onmessage=null};w.postMessage({command:'write'});return true})"
+    9 => b"(()=>{globalThis.received=false;globalThis.keeper=-1;globalThis.w=new os.Worker('./libc_worker_fault_child.mjs');let fds=os.pipe();os.close(fds[0]);os.close(fds[1]);keeper=os.open('/dev/null',os.O_RDONLY);if(keeper!==fds[0])throw Error('fd not reused');w.onmessage=e=>{if(e.data!==keeper)throw Error('fd echo');received=true;w.onmessage=null};w.postMessage({command:'sequence',index:keeper});return true})"
+    _ => Intrinsic.trap("worker fault operation") }
+}
+fn foreignOwnerSource() -> &'static [u8] {
+  return b"import * as os from 'os';new os.Worker('./libc_worker_fault_idle.mjs');"
+}
+struct Redirect { saved: i32, writer: i32 }
+impl Drop for Redirect {
+  fn drop(self: &mut Self) -> () {
+    let restored = unsafe dup2(self.saved, 0)
+    let savedClosed = unsafe close(self.saved) let writerClosed = unsafe close(self.writer)
+    if restored != 0 || savedClosed != 0 || writerClosed != 0 { Intrinsic.trap("fixture stdin restoration") }
+  }
+}
+fn inputLocked() -> bool {
+  let file = unsafe native.input()
+  if unsafe ftrylockfile(file) != 0 { return true }
+  unsafe funlockfile(file) return false
+}
+fn survivorSource(priorError: bool) -> &'static [u8] {
+  if priorError {
+    return b"import * as std from 'std';if(!std.in.error()||std.in.eof())throw Error('detached Worker changed prior stdin error');std.in.clearerr();if(std.in.getline()!=='SURVIVOR'||std.in.error()||std.in.eof())throw Error('independent Process could not recover shared stdin');"
+  }
+  return b"import * as std from 'std';if(std.in.error()||std.in.eof())throw Error('detached Worker poisoned shared stdin');if(std.in.getline()!=='SURVIVOR'||std.in.error()||std.in.eof())throw Error('independent Process could not read shared stdin');"
+}
+effect fn detachedInput(namespace: &ClassIdAllocator, process: &Process,
+    domain: &WaiterDomain, memory: &AllocationObserver, allocator: &mut FaultAllocator, priorError: bool) -> i32 ! OutOfMemoryError | SynchronizationError {
+  let before = allocator.parent.stats() let fdBefore = descriptors()
+  let file = unsafe native.input()
+  if unsafe native.ferror(file) != 0 || unsafe native.feof(file) != 0 { return 110 }
+  let saved = unsafe dup(0) if saved < 0 { return 111 }
+  let mut pipes: [i32; 2] = [-1; 2]
+  if unsafe pipe(Pointer.fromMutRef(&mut pipes[0])) != 0 { let ignored = unsafe close(saved) return 112 }
+  if unsafe dup2(pipes[0], 0) != 0 {
+    let a = unsafe close(saved) let b = unsafe close(pipes[0]) let c = unsafe close(pipes[1]) return 113
+  }
+  let readerClosed = unsafe close(pipes[0])
+  let redirect = Redirect { saved: saved, writer: pipes[1] }
+  if readerClosed != 0 { return 114 }
+  if priorError {
+    if unsafe native.fputc(88, file) >= 0 || unsafe native.ferror(file) == 0 || unsafe native.feof(file) != 0 { return 120 }
+  }
+  let first = run Process.make(namespace)
+  let originalDomain = run WaiterDomain.make() |> Effect.provideMut<Allocator>(&mut allocator)
+  let opened = run Effect.result(unsafe Session.open(memory, originalDomain.handle(), &first, false)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut active = match move opened { Result.Success { value } => move value Result.Failure { .. } => { return 115 } }
+  let anchor = () let state = unsafe Pointer.borrow<(), ThreadState>(&anchor, unsafe events.state(active.runtime))
+  let resources = state.resources.clone() drop state
+  let started = run Effect.result(unsafe libc.evalBuffer(&mut active.engine, active.context,
+    b"import * as os from 'os';globalThis.worker=new os.Worker('./libc_worker_detached_child.mjs');worker.onmessage=()=>{};",
+    b"tests/fixtures/libc_worker_main.mjs", 1)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut passed = false
+  match move started {
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => {
+      passed = true unsafe gc.release(&mut active.engine, active.runtime, value) }
+    Result<Value, OutOfMemoryError | JsException>.Failure { .. } => ()
+  }
+  let mut fds = List<PollFd>.make()
+  if passed {
+    let state = unsafe Pointer.borrow<(), ThreadState>(&anchor, unsafe events.state(active.runtime))
+    let receiver = state.workerPortsFirst drop state
+    passed = !Pointer.isNull<HeapHeader>(receiver)
+    if passed {
+      let node = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(receiver)
+      let appended = run Effect.result(fds.append(PollFd { fd: unsafe workers.portFd(node), events: 1, revents: 0 })) |> Effect.provideMut<Allocator>(&mut allocator)
+      match move appended { Result.Success { .. } => { passed = platform.poll(&mut fds, 10000) > 0 }
+        Result.Failure { .. } => { passed = false } }
+    }
+  }
+  // Real FILE-lock ownership plus an empty, still-open pipe witnesses a blocked
+  // child operation. No test scheduler, fake I/O, or production test hook.
+  let pause = Timespec { seconds: 0, nanoseconds: 1000000 } let mut attempts: usize = 0
+  while passed && !inputLocked() && attempts < 5000 {
+    let ignored = unsafe nanosleep(Pointer.fromRef(&pause), Pointer.null<Timespec>()) attempts = attempts + 1
+  }
+  passed = passed && attempts < 5000
+  if passed {
+    let settle = Timespec { seconds: 0, nanoseconds: 10000000 }
+    let ignored = unsafe nanosleep(Pointer.fromRef(&settle), Pointer.null<Timespec>())
+    passed = inputLocked()
+  }
+  if unsafe exceptions.has(active.runtime) { unsafe gc.release(&mut active.engine, active.runtime, unsafe exceptions.take(active.runtime)) }
+  run unsafe active.close() |> Effect.provideMut<Allocator>(&mut allocator)
+  drop active drop fds drop first drop originalDomain
+  // The host observed the child holding FILE's lock before root close. It must
+  // still be alive and blocked after both original native owners are dropped.
+  passed = passed && resources.snapshot().threads == 1 && inputLocked()
+  let firstLine = b"OK\n"
+  let fed = unsafe write(redirect.writer, Pointer.fromRef(&firstLine[0]), firstLine.length)
+  let completed = awaitEmpty(&resources)
+  if !passed || fed != usize.toI64(firstLine.length) || !completed { return 116 }
+  drop resources
+  let reopened = run Effect.result(unsafe Session.open(memory, domain.handle(), process, false)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut second = match move reopened { Result.Success { value } => move value Result.Failure { .. } => { return 117 } }
+  let line = b"SURVIVOR\n"
+  passed = unsafe write(redirect.writer, Pointer.fromRef(&line[0]), line.length) == usize.toI64(line.length)
+  if passed {
+    let checked = run Effect.result(unsafe libc.evalBuffer(&mut second.engine, second.context,
+      survivorSource(priorError),
+      b"worker-fixture:shared-stdin-check", 1)) |> Effect.provideMut<Allocator>(&mut allocator)
+    passed = false
+    match move checked {
+      Result<Value, OutOfMemoryError | JsException>.Success { value } => {
+        passed = true unsafe gc.release(&mut second.engine, second.runtime, value) }
+      Result<Value, OutOfMemoryError | JsException>.Failure { .. } => ()
+    }
+  }
+  if unsafe exceptions.has(second.runtime) { unsafe gc.release(&mut second.engine, second.runtime, unsafe exceptions.take(second.runtime)) }
+  run unsafe second.close() |> Effect.provideMut<Allocator>(&mut allocator)
+  drop second drop redirect
+  if !passed { return 118 }
+  let after = allocator.parent.stats()
+  if after.usedBytes != before.usedBytes || after.allocationCount != before.allocationCount || descriptors() != fdBefore { return 119 }
+  return 0
+}
+pub effect fn main() -> i32 ! OutOfMemoryError | SynchronizationError | WriterError {
+  let mut allocator = FaultAllocator { parent: run RuntimeAllocator.make(Allocator.systemAllocatorProvider()), remaining: usize.MAX, failed: false }
+  let memory = run allocator.parent.observe()
+  let namespace = run ClassIdAllocator.make() |> Effect.provideMut<Allocator>(&mut allocator)
+  let process = run Process.make(&namespace)
+  let domain = run WaiterDomain.make() |> Effect.provideMut<Allocator>(&mut allocator)
+  let initialDescriptors = descriptors()
+  let mut signalEvents = Signals.make()
+  let mut urgent: i32 = 23 static if Intrinsic.targetOperatingSystem() == "darwin" { urgent = 16 }
+  let occupied = foreignSignals(urgent)
+  let before = allocator.parent.stats()
+  let opened = run Effect.result(unsafe Session.open(&memory, domain.handle(), &process, false)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut active = match move opened { Result.Success { value } => move value Result.Failure { .. } => { return 10 } }
+  let anchor = () let state = unsafe Pointer.borrow<(), ThreadState>(&anchor, unsafe events.state(active.runtime))
+  let resources = state.resources.clone() drop state
+  let rejected = run Effect.result(unsafe libc.evalBuffer(&mut active.engine, active.context,
+    foreignOwnerSource(), b"tests/fixtures/libc_worker_main.mjs", 1)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut passed = false
+  match move rejected {
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => {
+      passed = true
+      unsafe gc.release(&mut active.engine, active.runtime, value)
+    }
+    Result<Value, OutOfMemoryError | JsException>.Failure { .. } => ()
+  }
+  if unsafe exceptions.has(active.runtime) { unsafe gc.release(&mut active.engine, active.runtime, unsafe exceptions.take(active.runtime)) }
+  run unsafe active.close() |> Effect.provideMut<Allocator>(&mut allocator)
+  drop active
+  let completed = awaitEmpty(&resources)
+  let after = allocator.parent.stats()
+  if !passed || !completed || after.usedBytes != before.usedBytes ||
+    after.allocationCount != before.allocationCount || descriptors() != initialDescriptors { return 11 }
+  drop resources drop occupied
+  let inputResult = run detachedInput(&namespace, &process, &domain, &memory, &mut allocator, false)
+  if inputResult != 0 { return inputResult }
+  let priorErrorResult = run detachedInput(&namespace, &process, &domain, &memory, &mut allocator, true)
+  if priorErrorResult != 0 { return priorErrorResult }
+  if !platform.install(&mut signalEvents, urgent) ||
+    !platform.install(&mut signalEvents, 28) { return 7 }
+  // Positive process-signal control: the independent queue must see real input.
+  if unsafe kill(unsafe getpid(), urgent) != 0 || unsafe kill(unsafe getpid(), 28) != 0 { return 8 }
+  platform.collect(&mut signalEvents)
+  if !platform.take(&mut signalEvents, urgent) || !platform.take(&mut signalEvents, 28) { return 9 }
+  let baseline = allocator.parent.stats() let fdBaseline = descriptors()
+  let mut attempts: u32 = 0 let mut injected: u32 = 0 let mut cases: u32 = 0 let mut mode: usize = 0
+  while mode < 2 {
+    let mut operation: usize = 0
+    while operation < 10 {
+      let mut ordinal: usize = 0
+      while true {
+        allocator.failed = false
+        let opened = run Effect.result(unsafe Session.open(&memory, domain.handle(), &process, false)) |> Effect.provideMut<Allocator>(&mut allocator)
+        let mut active = match move opened { Result.Success { value } => move value Result.Failure { .. } => { return 2 } }
+        let anchor = () let state = unsafe Pointer.borrow<(), ThreadState>(&anchor, unsafe events.state(active.runtime))
+        let resources = state.resources.clone() drop state
+        let imported = run Effect.result(unsafe libc.evalBuffer(&mut active.engine, active.context,
+          b"import * as o from 'os';import * as s from 'std';globalThis.os=o;globalThis.std=s;",
+          b"worker-fixture:imports", 1)) |> Effect.provideMut<Allocator>(&mut allocator)
+        match move imported {
+          Result<Value, OutOfMemoryError | JsException>.Success { value } => {
+            unsafe gc.release(&mut active.engine, active.runtime, value) }
+          Result<Value, OutOfMemoryError | JsException>.Failure { .. } => {
+            run unsafe active.close() |> Effect.provideMut<Allocator>(&mut allocator) return 3 }
+        }
+        let prepared = run Effect.result(unsafe evaluation.evaluate(&mut active.engine, &memory, active.context,
+          source(operation), b"tests/fixtures/worker-fault.js", 0)) |> Effect.provideMut<Allocator>(&mut allocator)
+        let function = match move prepared { Result<Value, JsException>.Success { value } => value
+          Result<Value, JsException>.Failure { .. } => { run unsafe active.close() |> Effect.provideMut<Allocator>(&mut allocator) return 4 } }
+        let mut slot = Value.Undefined let arguments = FrameSlots.Borrowed { data: Pointer.fromMutRef<Value>(&mut slot), length: 0 }
+        let mut delivery = Pointer.null<HeapHeader>()
+        if operation >= 6 {
+          let sent = run Effect.result(unsafe active.engine.callArguments(active.context, function, Value.Undefined, &arguments)) |> Effect.provideMut<Allocator>(&mut allocator)
+          match move sent {
+            Result<Value, OutOfMemoryError | JsException>.Success { value } => { unsafe gc.release(&mut active.engine, active.runtime, value) }
+            Result<Value, OutOfMemoryError | JsException>.Failure { .. } => {
+              unsafe gc.release(&mut active.engine, active.runtime, function)
+              run unsafe active.close() |> Effect.provideMut<Allocator>(&mut allocator) return 5
+            }
+          }
+          let threadState = unsafe Pointer.borrow<(), ThreadState>(&anchor, unsafe events.state(active.runtime))
+          delivery = threadState.workerPortsFirst drop threadState
+          if Pointer.isNull<HeapHeader>(delivery) { return Intrinsic.trap("missing worker receiver") }
+          let node = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(delivery)
+          let mut fds = List<PollFd>.make()
+          run fds.append(PollFd { fd: unsafe workers.portFd(node), events: 1, revents: 0 }) |> Effect.provideMut<Allocator>(&mut allocator)
+          if platform.poll(&mut fds, 10000) <= 0 {
+            unsafe gc.release(&mut active.engine, active.runtime, function)
+            run unsafe active.close() |> Effect.provideMut<Allocator>(&mut allocator) return 6
+          }
+        }
+        if mode == 0 { allocator.remaining = ordinal } else { resources.failAfter(ordinal) }
+        let mut called = Result<Value, OutOfMemoryError | JsException>.Success { value: Value.Undefined }
+        if operation >= 6 {
+          let node = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(delivery)
+          let handled = run Effect.result(unsafe workers.handlePostedMessage(&mut active.engine, &memory, active.context, node)) |> Effect.provideMut<Allocator>(&mut allocator)
+          called = match move handled {
+            Result<bool, JsException>.Success { value } => Result<Value, OutOfMemoryError | JsException>.Success { value: Value.Bool { value: value } }
+            Result<bool, JsException>.Failure { error } => Result<Value, OutOfMemoryError | JsException>.Failure { error: move error }
+          }
+        } else {
+          called = run Effect.result(unsafe active.engine.callArguments(active.context, function, Value.Undefined, &arguments)) |> Effect.provideMut<Allocator>(&mut allocator)
+        }
+        allocator.remaining = usize.MAX
+        let mut clean = false
+        match move called { Result<Value, OutOfMemoryError | JsException>.Success { value } => {
+          clean = match value { Value.Bool { value: result } => result _ => false }
+          unsafe gc.release(&mut active.engine, active.runtime, value) }
+          Result<Value, OutOfMemoryError | JsException>.Failure { .. } => () }
+        if operation >= 6 && clean {
+          let observed = run Effect.result(unsafe evaluation.evaluate(&mut active.engine, &memory, active.context,
+            b"received===true", b"worker-delivery-result.js", 0)) |> Effect.provideMut<Allocator>(&mut allocator)
+          match move observed {
+            Result<Value, JsException>.Success { value } => {
+              clean = match value { Value.Bool { value: result } => result _ => false }
+              unsafe gc.release(&mut active.engine, active.runtime, value)
+            }
+            Result<Value, JsException>.Failure { .. } => { clean = false }
+          }
+        }
+        unsafe gc.release(&mut active.engine, active.runtime, function)
+        if unsafe exceptions.has(active.runtime) {
+          if !allocator.failed && resources.snapshot().failures == 0 {
+            run unsafe libc.dumpError(&mut active.engine, active.context) |> Effect.provideMut<Allocator>(&mut allocator)
+          } else { unsafe gc.release(&mut active.engine, active.runtime, unsafe exceptions.take(active.runtime)) }
+        }
+        let mut keeper: i32 = -1
+        if operation == 9 {
+          let kept = run Effect.result(unsafe evaluation.evaluate(&mut active.engine, &memory, active.context,
+            b"keeper", b"worker-descriptor-result.js", 0)) |> Effect.provideMut<Allocator>(&mut allocator)
+          match move kept {
+            Result<Value, JsException>.Success { value } => {
+              match value { Value.Int { value: fd } => { keeper = fd } _ => { clean = false } }
+              unsafe gc.release(&mut active.engine, active.runtime, value)
+            }
+            Result<Value, JsException>.Failure { .. } => { clean = false }
+          }
+        }
+        run unsafe active.close() |> Effect.provideMut<Allocator>(&mut allocator)
+        drop active
+        let completed = awaitEmpty(&resources)
+        if keeper >= 0 {
+          if unsafe fcntl(keeper, 1) < 0 { return 94 }
+          if unsafe close(keeper) != 0 { return 95 }
+        }
+        let native = resources.snapshot() resources.failAfter(usize.MAX)
+        let failed = allocator.failed || native.failures != 0
+        attempts = attempts + 1 if failed { injected = injected + 1 }
+        let after = allocator.parent.stats()
+        let actualDescriptors = descriptors()
+        let mut failure: i32 = 0
+        if !completed || !empty(native) { failure = 90 }
+        else if after.usedBytes != baseline.usedBytes || after.allocationCount != baseline.allocationCount { failure = 91 }
+        else if actualDescriptors != fdBaseline { failure = 92 }
+        // Worker startup and natural exit must never masquerade as signal input.
+        platform.collect(&mut signalEvents)
+        if failure == 0 && (platform.take(&mut signalEvents, urgent) || platform.take(&mut signalEvents, 28)) { failure = 96 }
+        if failure == 0 && !failed && !clean { failure = 93 }
+        if failure != 0 {
+          return faultFailure(failure, mode, operation, ordinal, native, after.usedBytes, after.allocationCount,
+            baseline.usedBytes, baseline.allocationCount, actualDescriptors, fdBaseline)
+        }
+        if !failed { break }
+        ordinal = ordinal + 1
+      }
+      cases = cases + 1 operation = operation + 1
+    }
+    mode = mode + 1
+  }
+  platform.dispose(&mut signalEvents)
+  if descriptors() != initialDescriptors { return 98 }
+  drop process drop domain drop namespace
+  if allocator.parent.stats().allocationCount != 0 || allocator.parent.stats().usedBytes != 0 { return 99 }
+  let mut system = Allocator.systemAllocatorProvider() let mut output = ByteBuffer.make()
+  run output.writeU32(cases) |> Effect.provideMut<Allocator>(&mut system)
+  run output.writeU32(attempts) |> Effect.provideMut<Allocator>(&mut system)
+  run output.writeU32(injected) |> Effect.provideMut<Allocator>(&mut system)
+  let mut writer = StdoutWriter.make()
+  run Writer.writeAll(output.asSlice()) |> Effect.provideMut<Writer>(&mut writer)
+  return 0
+}

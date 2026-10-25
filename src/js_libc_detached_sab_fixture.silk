@@ -1,0 +1,149 @@
+//! Actual Engine/Worker SAB lifetime after the parent runtime, allocator,
+//! Process and original Atomics owner disappear. No JavaScript value crosses
+//! heaps; the child must retain the queue before the host acquires a new lease.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.atomic { MemoryOrder }
+import silk.effect { Effect }
+import silk.ownership { Drop }
+import silk.pointer { Pointer }
+import silk.result { Result }
+import runtime_memory { RuntimeAllocator }
+import js_atomics_native { WaiterDomain, SynchronizationError }
+import js_atomics_native as atomics
+import js_buffer_storage as storage
+import js_shared_memory { Span }
+import js_shared_memory as shared
+import js_runtime_registry { ClassIdAllocator }
+import js_value { Value }
+import js_exceptions { JsException }
+import js_proxy_core as core
+import js_gc as gc
+import js_eval as evaluation
+import js_libc { Session }
+import js_libc as libc
+import js_libc_process { Process }
+import js_os_events { ThreadState }
+import js_os_events as events
+import js_os_events_platform as platform
+import js_os_workers_transport as transport
+import js_os_workers_resources { Snapshot }
+unsafe extern "C" fn fcntl(fd: i32, command: i32, ...) -> i32
+unsafe extern "C" fn dprintf(fd: i32, format: *const u8, ...) -> i32 with Intrinsic.foreign(noCapture: ("format",))
+extern "C" struct Timespec { seconds: i64, nanoseconds: i64 }
+unsafe extern "C" fn nanosleep(request: *const Timespec, remaining: ?*mut Timespec) -> i32 with Intrinsic.foreign(noCapture: ("request", "remaining"))
+struct SharedOwner { span: Span }
+impl Drop for SharedOwner {
+  fn drop(self: &mut Self) -> () { unsafe transport.freeShared(self.span.data) }
+}
+fn pause() -> () {
+  let delay = Timespec { seconds: 0, nanoseconds: 1000000 }
+  let ignored = unsafe nanosleep(Pointer.fromRef(&delay), Pointer.null<Timespec>())
+}
+fn descriptors() -> u32 {
+  let mut count: u32 = 0 let mut fd: i32 = 0
+  while fd < 4096 { if unsafe fcntl(fd, 1) >= 0 { count = count + 1 } fd = fd + 1 }
+  return count
+}
+fn failure(code: i32) -> i32 {
+  let text = b"detached SAB lifetime failure: %d\n\0"
+  let ignored = unsafe dprintf(2, Pointer.fromRef(&text[0]), code)
+  return code
+}
+fn onlyHostBacking(state: Snapshot) -> bool {
+  return state.blocks == 1 && state.sharedBlocks == 1 && state.pipes == 0 &&
+    state.messages == 0 && state.groups == 0 && state.childNodes == 0 &&
+    state.startPackets == 0 && state.descriptors == 0 && state.threads == 0
+}
+pub effect fn main() -> i32 ! OutOfMemoryError | SynchronizationError {
+  let initialDescriptors = descriptors()
+  let mut metadata = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let metadataMemory = run metadata.observe()
+  let namespace = run ClassIdAllocator.make() |> Effect.provideMut<Allocator>(&mut metadata)
+  let process = run Process.make(&namespace)
+  let mut queueAllocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let queueMemory = run queueAllocator.observe()
+  let originalDomain = run WaiterDomain.make() |> Effect.provideMut<Allocator>(&mut queueAllocator)
+  let handle = originalDomain.handle()
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let memory = run allocator.observe()
+  let opened = run Effect.result(unsafe Session.open(&memory, handle, &process, false)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut active = match move opened {
+    Result<Session, OutOfMemoryError | JsException>.Success { value } => move value
+    Result<Session, OutOfMemoryError | JsException>.Failure { .. } => { return failure(1) }
+  }
+  let anchor = () let state = unsafe Pointer.borrow<(), ThreadState>(&anchor, unsafe events.state(active.runtime))
+  let resources = state.resources.clone() drop state
+  let started = run Effect.result(unsafe libc.evalFile(&mut active.engine, active.context,
+    b"tests/fixtures/libc_worker_detached_sab_main.mjs", 1)) |> Effect.provideMut<Allocator>(&mut allocator)
+  match move started {
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => { unsafe gc.release(&mut active.engine, active.runtime, value) }
+    Result<Value, OutOfMemoryError | JsException>.Failure { .. } => {
+      run unsafe libc.dumpError(&mut active.engine, active.context) |> Effect.provideMut<Allocator>(&mut allocator)
+      run unsafe active.close() |> Effect.provideMut<Allocator>(&mut allocator)
+      return failure(2)
+    }
+  }
+  let found = run Effect.result(unsafe evaluation.evaluate(&mut active.engine, &memory, active.context,
+    b"globalThis.detachedShared", b"detached-host:buffer", 0)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let buffer = match move found {
+    Result<Value, JsException>.Success { value } => value
+    Result<Value, JsException>.Failure { .. } => {
+      run unsafe libc.dumpError(&mut active.engine, active.context) |> Effect.provideMut<Allocator>(&mut allocator)
+      run unsafe active.close() |> Effect.provideMut<Allocator>(&mut allocator)
+      return failure(3)
+    }
+  }
+  if !unsafe storage.isBuffer(buffer) {
+    unsafe gc.release(&mut active.engine, active.runtime, buffer)
+    run unsafe active.close() |> Effect.provideMut<Allocator>(&mut allocator)
+    return failure(4)
+  }
+  let captured = unsafe storage.snapshot(core.reference(buffer))
+  if !captured.shared || captured.byteLength != 16 { return failure(5) }
+  let span = storage.memorySpan(captured)
+  unsafe transport.duplicateShared(span.data)
+  let backing = SharedOwner { span: span }
+  unsafe gc.release(&mut active.engine, active.runtime, buffer)
+  let readyDeadline = platform.nowMilliseconds() + 10000
+  while unsafe shared.load(span, 4, 2, MemoryOrder.SequentiallyConsistent) == 0 && platform.nowMilliseconds() < readyDeadline { pause() }
+  if unsafe shared.load(span, 4, 2, MemoryOrder.SequentiallyConsistent) != 1 { return failure(6) }
+  if resources.snapshot().threads != 1 { return failure(7) }
+  run unsafe active.close() |> Effect.provideMut<Allocator>(&mut allocator)
+  drop active drop originalDomain drop process drop namespace drop allocator drop metadata drop queueAllocator
+  if memory.stats().allocationCount != 0 || memory.stats().usedBytes != 0 { return failure(8) }
+  if resources.snapshot().threads != 1 || metadataMemory.stats().allocationCount == 0 { return failure(9) }
+  if queueMemory.stats().allocationCount != 1 { return failure(17) }
+  if unsafe shared.load(span, 8, 2, MemoryOrder.SequentiallyConsistent) != 0 { return failure(10) }
+  // Only the child owns the queue at the assertion above: its allocator tracks
+  // no namespace or runtime allocations. Acquire a host lease only AFTER that
+  // proof. The child's second wait keeps it alive even if its first cond_wait
+  // spuriously returns; a late host notification therefore cannot use freed
+  // queue storage. This lease does not conceal a missing Worker Group retain.
+  let hostQueue = unsafe WaiterDomain.retain(handle)
+  let wakeDeadline = platform.nowMilliseconds() + 10000
+  let address = unsafe shared.address(span, 0)
+  let mut awakened: i32 = 0
+  while awakened == 0 && platform.nowMilliseconds() < wakeDeadline {
+    awakened = unsafe atomics.notify(handle, address, 1)
+    if awakened == 0 { pause() }
+  }
+  if awakened != 1 { return failure(11) }
+  let exitDeadline = platform.nowMilliseconds() + 10000
+  while unsafe shared.load(span, 8, 2, MemoryOrder.SequentiallyConsistent) == 0 && platform.nowMilliseconds() < exitDeadline { pause() }
+  if unsafe shared.load(span, 8, 2, MemoryOrder.SequentiallyConsistent) != 73 { return failure(13) }
+  unsafe shared.store(span, 12, 2, 1, MemoryOrder.SequentiallyConsistent)
+  let ignoredWake = unsafe atomics.notify(hostQueue.handle(), unsafe shared.address(span, 12), 1)
+  while !onlyHostBacking(resources.snapshot()) && platform.nowMilliseconds() < exitDeadline { pause() }
+  if !onlyHostBacking(resources.snapshot()) { return failure(12) }
+  if unsafe shared.load(span, 8, 2, MemoryOrder.SequentiallyConsistent) != 73 { return failure(13) }
+  if metadataMemory.stats().allocationCount != 0 || metadataMemory.stats().usedBytes != 0 { return failure(14) }
+  drop hostQueue
+  if queueMemory.stats().allocationCount != 0 || queueMemory.stats().usedBytes != 0 { return failure(18) }
+  drop backing
+  let final = resources.snapshot()
+  if final.blocks != 0 || final.bytes != 0 || final.sharedBlocks != 0 || final.descriptors != 0 || final.threads != 0 { return failure(15) }
+  if descriptors() != initialDescriptors { return failure(16) }
+  let text = b"detached SAB lifetime OK: root freed, original owners dropped, real notify, eventual zero ledgers\n\0"
+  let ignored = unsafe dprintf(1, Pointer.fromRef(&text[0]))
+  return 0
+}

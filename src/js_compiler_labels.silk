@@ -1,0 +1,304 @@
+//! Native final compiler pass, quickjs.c:35332-36483 (SHORT_OPCODES/OPTIMIZE).
+//! Input is complete post-variable-pass bytecode with positions2/reference counts.
+//! The cell, runtime, source and compiler tree must be live and exclusively owned;
+//! allocator callbacks must not reenter them. Source is the FULL immutable parse
+//! input, not FunctionDef.source (the extracted function text).
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.list { List }
+import silk.slice { Slice }
+import silk.i32
+import silk.u8
+import silk.u16
+import silk.u32
+import silk.usize
+import byte_buffer { ByteBuffer, readU16, readU32 }
+import js_heap { HeapHeader, HeapCell }
+import js_atoms { AtomTable }
+import js_atom_data as atoms
+import js_core_types { RuntimeState }
+import js_compiler_types { FunctionDef, LabelSlot, JumpSlot, RelocEntry }
+import js_debug_positions { PcSourcePosition }
+import js_compiler_state { computePc2Line }
+import js_compiler_emit { updateLabel, MAX_BYTECODE_CAPACITY }
+import js_compiler_code { CodeContext, matchCode, opcode, M2, M3, M4, signedWord, unsignedWord, skipDeadCode }
+import js_compiler_label_support { addPosition, pushShortInt, putShortCode, initializeLocals, resolveLabel, emitBranch, emitWith, shrinkJumps }
+import js_opcode_data as op
+
+fn matchedLine(cc: &CodeContext, line: &mut i32) -> () {
+  if cc.lineNumber >= 0 { line.* = cc.lineNumber }
+}
+effect fn unchanged(fd: &mut FunctionDef, bytes: &[u8], out: &mut ByteBuffer, position: i32, length: i32, line: i32) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  run addPosition(&mut fd, &out.*, line)
+  run out.appendSlice(Slice.view<u8>(bytes, i32.toUsize(position), i32.toUsize(length)))
+}
+effect fn constantTest(fd: &mut FunctionDef, table: &mut AtomTable, bytes: &[u8], out: &mut ByteBuffer,
+    position: i32, cc: &CodeContext, line: &mut i32, value: bool) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  matchedLine(cc, &mut line)
+  if value == (cc.opcode == opcode(op.OP_if_true)) {
+    return run emitBranch(&mut fd, &mut table, bytes, &mut out, position, cc.position, &mut line, op.OP_goto, cc.label, true)
+  }
+  let removed = updateLabel(&mut fd, cc.label, -1)
+  return cc.position
+}
+
+// One source switch arm per branch below. Returning next is the source's break;
+// unchanged is no_change, and emitBranch implements has_goto/has_label.
+effect fn resolveInstruction(fd: &mut FunctionDef, table: &mut AtomTable, bytes: &[u8], out: &mut ByteBuffer,
+    position: i32, line: &mut i32) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  let pos = i32.toUsize(position)
+  let code = bytes[pos]
+  let length = u8.toI32(op.opcodeInfo(code, false).size)
+  let mut next = position + length
+  let mut cc = CodeContext.make()
+  if code == op.OP_line_num { line.* = signedWord(readU32(bytes, pos + 1)) return next }
+  if code == op.OP_label { resolveLabel(&mut fd, &mut out, signedWord(readU32(bytes, pos + 1))) return next }
+  if code == op.OP_call || code == op.OP_call_method {
+    let count = u16.toI32(readU16(bytes, pos + 1))
+    if matchCode(&mut cc, bytes, next, &[opcode(op.OP_return), -1]) {
+      matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
+      run putShortCode(&mut out, code + 1, count)
+      return skipDeadCode(&mut fd, &mut table, bytes, cc.position, &mut line)
+    }
+    run addPosition(&mut fd, &out.*, line.*) run putShortCode(&mut out, code, count) return next
+  }
+  if code == op.OP_return || code == op.OP_return_undef || code == op.OP_return_async
+    || code == op.OP_throw || code == op.OP_throw_error {
+    next = skipDeadCode(&mut fd, &mut table, bytes, next, &mut line)
+    run unchanged(&mut fd, bytes, &mut out, position, length, line.*) return next
+  }
+  if code == op.OP_goto || code == op.OP_gosub || code == op.OP_catch || code == op.OP_if_true || code == op.OP_if_false {
+    return run emitBranch(&mut fd, &mut table, bytes, &mut out, position, next, &mut line,
+      code, signedWord(readU32(bytes, pos + 1)), true)
+  }
+  if code == op.OP_with_get_var || code == op.OP_with_put_var || code == op.OP_with_delete_var
+    || code == op.OP_with_make_ref || code == op.OP_with_get_ref {
+    run emitWith(&mut fd, bytes, &mut out, position, line.*) return next
+  }
+  if code == op.OP_drop {
+    if matchCode(&mut cc, bytes, next, &[opcode(op.OP_return_undef), -1]) { matchedLine(&cc, &mut line) return next }
+  } else if code == op.OP_null || code == op.OP_undefined {
+    if code == op.OP_undefined {
+      if matchCode(&mut cc, bytes, next, &[opcode(op.OP_drop), -1]) { matchedLine(&cc, &mut line) return cc.position }
+      if matchCode(&mut cc, bytes, next, &[opcode(op.OP_return), -1]) {
+        matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
+        run out.append(op.OP_return_undef) return cc.position
+      }
+      if matchCode(&mut cc, bytes, next, &[M2(op.OP_if_false, op.OP_if_true), -1]) {
+        return run constantTest(&mut fd, &mut table, bytes, &mut out, position, &cc, &mut line, false)
+      }
+    }
+    let mut test = op.OP_is_null
+    if code == op.OP_undefined { test = op.OP_is_undefined }
+    if matchCode(&mut cc, bytes, next, &[opcode(op.OP_strict_eq), -1]) {
+      matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*) run out.append(test) return cc.position
+    }
+    if matchCode(&mut cc, bytes, next, &[opcode(op.OP_strict_neq), M2(op.OP_if_false, op.OP_if_true), -1]) {
+      matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*) run out.append(test)
+      return run emitBranch(&mut fd, &mut table, bytes, &mut out, position, cc.position, &mut line,
+        i32.toU8(cc.opcode) ^ op.OP_if_false ^ op.OP_if_true, cc.label, false)
+    }
+    if code == op.OP_null && matchCode(&mut cc, bytes, next, &[M2(op.OP_if_false, op.OP_if_true), -1]) {
+      return run constantTest(&mut fd, &mut table, bytes, &mut out, position, &cc, &mut line, false)
+    }
+  } else if code == op.OP_push_false || code == op.OP_push_true {
+    if matchCode(&mut cc, bytes, next, &[M2(op.OP_if_false, op.OP_if_true), -1]) {
+      return run constantTest(&mut fd, &mut table, bytes, &mut out, position, &cc, &mut line, code == op.OP_push_true)
+    }
+  } else if code == op.OP_push_i32 || code == op.OP_push_bigint_i32 {
+    let value = signedWord(readU32(bytes, pos + 1))
+    if value != -2147483648 && (value != 0 || code == op.OP_push_bigint_i32)
+      && matchCode(&mut cc, bytes, next, &[opcode(op.OP_neg), -1]) {
+      matchedLine(&cc, &mut line)
+      let afterNeg = cc.position
+      if matchCode(&mut cc, bytes, afterNeg, &[opcode(op.OP_drop), -1]) { matchedLine(&cc, &mut line) }
+      else {
+        run addPosition(&mut fd, &out.*, line.*)
+        if code == op.OP_push_i32 { run pushShortInt(&mut out, -value) }
+        else { run out.append(code) run out.writeU32(unsignedWord(-value)) }
+      }
+      return cc.position
+    }
+    if code == op.OP_push_i32 {
+      if matchCode(&mut cc, bytes, next, &[opcode(op.OP_drop), -1]) { matchedLine(&cc, &mut line) return cc.position }
+      if matchCode(&mut cc, bytes, next, &[M2(op.OP_if_false, op.OP_if_true), -1]) {
+        return run constantTest(&mut fd, &mut table, bytes, &mut out, position, &cc, &mut line, value != 0)
+      }
+      run addPosition(&mut fd, &out.*, line.*) run pushShortInt(&mut out, value) return next
+    }
+  } else if code == op.OP_push_const || code == op.OP_fclosure {
+    let index = signedWord(readU32(bytes, pos + 1))
+    if index < 256 {
+      run addPosition(&mut fd, &out.*, line.*)
+      run out.append(i32.toU8(opcode(op.OP_push_const8) + opcode(code) - opcode(op.OP_push_const)))
+      run out.append(i32.toU8(index)) return next
+    }
+  } else if code == op.OP_get_field {
+    let atom = readU32(bytes, pos + 1)
+    if atom == atoms.JS_ATOM_length {
+      table.release(atom) run addPosition(&mut fd, &out.*, line.*) run out.append(op.OP_get_length) return next
+    }
+  } else if code == op.OP_push_atom_value {
+    let atom = readU32(bytes, pos + 1)
+    if matchCode(&mut cc, bytes, next, &[opcode(op.OP_drop), -1]) {
+      table.release(atom) matchedLine(&cc, &mut line) return cc.position
+    }
+    if atom == atoms.JS_ATOM_empty_string {
+      table.release(atom) run addPosition(&mut fd, &out.*, line.*) run out.append(op.OP_push_empty_string) return next
+    }
+  } else if code == op.OP_to_propkey {
+    if matchCode(&mut cc, bytes, next, &[M3(op.OP_get_loc, op.OP_get_arg, op.OP_get_var_ref), -1, opcode(op.OP_put_array_el), -1])
+      || matchCode(&mut cc, bytes, next, &[M3(op.OP_push_i32, op.OP_push_const, op.OP_push_atom_value), opcode(op.OP_put_array_el), -1])
+      || matchCode(&mut cc, bytes, next, &[M4(op.OP_undefined, op.OP_null, op.OP_push_true, op.OP_push_false), opcode(op.OP_put_array_el), -1]) { return next }
+  } else if code == op.OP_insert2 {
+    if matchCode(&mut cc, bytes, next, &[opcode(op.OP_put_field), opcode(op.OP_drop), -1]) {
+      matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
+      run out.append(op.OP_put_field) run out.writeU32(cc.atom) return cc.position
+    }
+  } else if code == op.OP_dup {
+    if matchCode(&mut cc, bytes, next, &[M4(op.OP_put_loc, op.OP_put_loc_check, op.OP_put_arg, op.OP_put_var_ref), -1, -1]) {
+      matchedLine(&cc, &mut line)
+      let mut replacement = i32.toU8(cc.opcode + 1)
+      next = cc.position
+      let afterPut = cc.position
+      let mut delayedLine: i32 = -1
+      if matchCode(&mut cc, bytes, afterPut, &[opcode(op.OP_drop), -1]) {
+        matchedLine(&cc, &mut line) replacement = replacement - 1 next = cc.position
+        let afterDrop = cc.position let index = cc.index
+        if matchCode(&mut cc, bytes, afterDrop, &[opcode(replacement) - 1, index, -1]) {
+          delayedLine = cc.lineNumber replacement = replacement + 1 next = cc.position
+        }
+      }
+      run addPosition(&mut fd, &out.*, line.*) run putShortCode(&mut out, replacement, cc.index)
+      if delayedLine >= 0 { line.* = delayedLine } return next
+    }
+  } else if code == op.OP_get_loc {
+    let index = u16.toI32(readU16(bytes, pos + 1))
+    // The source intentionally leaves get_loc >=256 unchanged, rather than
+    // examining its peepholes (the three-byte encoding is already minimal).
+    if index < 256 {
+      if matchCode(&mut cc, bytes, next, &[M2(op.OP_post_dec, op.OP_post_inc), opcode(op.OP_put_loc), index, opcode(op.OP_drop), -1])
+        || matchCode(&mut cc, bytes, next, &[M2(op.OP_dec, op.OP_inc), opcode(op.OP_dup), opcode(op.OP_put_loc), index, opcode(op.OP_drop), -1]) {
+        matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
+        let mut replacement = op.OP_dec_loc
+        if cc.opcode == opcode(op.OP_inc) || cc.opcode == opcode(op.OP_post_inc) { replacement = op.OP_inc_loc }
+        run out.append(replacement) run out.append(i32.toU8(index)) return cc.position
+      }
+      if matchCode(&mut cc, bytes, next, &[opcode(op.OP_push_atom_value), opcode(op.OP_add), opcode(op.OP_dup), opcode(op.OP_put_loc), index, opcode(op.OP_drop), -1]) {
+        matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
+        if cc.atom == atoms.JS_ATOM_empty_string { table.release(cc.atom) run out.append(op.OP_push_empty_string) }
+        else { run out.append(op.OP_push_atom_value) run out.writeU32(cc.atom) }
+        run out.append(op.OP_add_loc) run out.append(i32.toU8(index)) return cc.position
+      }
+      if matchCode(&mut cc, bytes, next, &[opcode(op.OP_push_i32), opcode(op.OP_add), opcode(op.OP_dup), opcode(op.OP_put_loc), index, opcode(op.OP_drop), -1]) {
+        matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*) run pushShortInt(&mut out, cc.label)
+        run out.append(op.OP_add_loc) run out.append(i32.toU8(index)) return cc.position
+      }
+      if matchCode(&mut cc, bytes, next, &[M3(op.OP_get_loc, op.OP_get_arg, op.OP_get_var_ref), -1, opcode(op.OP_add), opcode(op.OP_dup), opcode(op.OP_put_loc), index, opcode(op.OP_drop), -1]) {
+        matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*) run putShortCode(&mut out, i32.toU8(cc.opcode), cc.index)
+        run out.append(op.OP_add_loc) run out.append(i32.toU8(index)) return cc.position
+      }
+      run addPosition(&mut fd, &out.*, line.*) run putShortCode(&mut out, code, index) return next
+    }
+  } else if code == op.OP_get_arg || code == op.OP_get_var_ref {
+    run addPosition(&mut fd, &out.*, line.*) run putShortCode(&mut out, code, u16.toI32(readU16(bytes, pos + 1))) return next
+  } else if code == op.OP_put_loc || code == op.OP_put_loc_check || code == op.OP_put_arg || code == op.OP_put_var_ref {
+    let index = u16.toI32(readU16(bytes, pos + 1))
+    if matchCode(&mut cc, bytes, next, &[opcode(code) - 1, index, -1]) {
+      matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*) run putShortCode(&mut out, code + 1, index) return cc.position
+    }
+    run addPosition(&mut fd, &out.*, line.*) run putShortCode(&mut out, code, index) return next
+  } else if code == op.OP_post_inc || code == op.OP_post_dec {
+    let replacement = i32.toU8(opcode(op.OP_dec) + opcode(code) - opcode(op.OP_post_dec))
+    if matchCode(&mut cc, bytes, next, &[M3(op.OP_put_loc, op.OP_put_arg, op.OP_put_var_ref), -1, opcode(op.OP_drop), -1]) {
+      matchedLine(&cc, &mut line)
+      let mut store = i32.toU8(cc.opcode) let index = cc.index next = cc.position
+      let afterDrop = cc.position
+      if matchCode(&mut cc, bytes, afterDrop, &[opcode(store) - 1, index, -1]) {
+        matchedLine(&cc, &mut line) store = store + 1 next = cc.position
+      }
+      run addPosition(&mut fd, &out.*, line.*) run out.append(replacement) run putShortCode(&mut out, store, index) return next
+    }
+    if matchCode(&mut cc, bytes, next, &[opcode(op.OP_perm3), opcode(op.OP_put_field), opcode(op.OP_drop), -1]) {
+      matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
+      run out.append(replacement) run out.append(op.OP_put_field) run out.writeU32(cc.atom) return cc.position
+    }
+    if matchCode(&mut cc, bytes, next, &[opcode(op.OP_perm4), opcode(op.OP_put_array_el), opcode(op.OP_drop), -1]) {
+      matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
+      run out.append(replacement) run out.append(op.OP_put_array_el) return cc.position
+    }
+  } else if code == op.OP_typeof {
+    if matchCode(&mut cc, bytes, next, &[opcode(op.OP_push_atom_value), M4(op.OP_strict_eq, op.OP_strict_neq, op.OP_eq, op.OP_neq), -1]) {
+      matchedLine(&cc, &mut line)
+      let equal = cc.opcode == opcode(op.OP_strict_eq) || cc.opcode == opcode(op.OP_eq)
+      let mut replacement: i32 = -1
+      if cc.atom == atoms.JS_ATOM_undefined { replacement = opcode(op.OP_typeof_is_undefined) }
+      else if cc.atom == atoms.JS_ATOM_function { replacement = opcode(op.OP_typeof_is_function) }
+      if replacement >= 0 {
+        if equal {
+          run addPosition(&mut fd, &out.*, line.*) run out.append(i32.toU8(replacement)) table.release(cc.atom) return cc.position
+        }
+        let afterComparison = cc.position
+        if matchCode(&mut cc, bytes, afterComparison, &[opcode(op.OP_if_false), -1]) {
+          matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
+          run out.append(i32.toU8(replacement)) table.release(cc.atom)
+          return run emitBranch(&mut fd, &mut table, bytes, &mut out, position, cc.position, &mut line, op.OP_if_true, cc.label, false)
+        }
+      }
+    }
+  }
+  run unchanged(&mut fd, bytes, &mut out, position, length, line.*)
+  return next
+}
+
+effect fn resolve(fd: &mut FunctionDef, table: &mut AtomTable, source: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  if fd.bytecodeError { fail OutOfMemoryError {} }
+  // Every rewrite is nonexpanding. The entire initialization prelude is at most
+  // 43 bytes. Reserving before consuming any atom makes all subsequent emission
+  // and metadata appends allocation-free; an OOM leaves the old owning bytecode.
+  if fd.bytecode.length() > MAX_BYTECODE_CAPACITY - 43 { fail OutOfMemoryError {} }
+  let capacity = fd.bytecode.length() + 43
+  let mut out = ByteBuffer.make()
+  run out.reserveExact(capacity)
+  let jumpCapacity = fd.jumpCapacity
+  run fd.jumps.reserveExact(jumpCapacity)
+  run fd.relocations.reserveExact(jumpCapacity)
+  if fd.lineNumberCapacity != 0 && !fd.stripDebug {
+    let lineCapacity = fd.lineNumberCapacity
+    run fd.lineNumbers.reserveExact(lineCapacity)
+    fd.lineNumberLast = fd.sourcePosition fd.lineNumberLastPc = 0
+  }
+  let input = Intrinsic.replace(fd.bytecode, ByteBuffer.make())
+  run initializeLocals(&mut fd, &mut out)
+  let mut position: i32 = 0 let mut line = signedWord(fd.sourcePosition)
+  while i32.toUsize(position) < input.length() {
+    position = run resolveInstruction(&mut fd, &mut table, input.asSlice(), &mut out, position, &mut line)
+  }
+  let mut i: usize = 0
+  while i < fd.labels.length() {
+    if fd.labels.get(i).firstRelocation != -1 { Intrinsic.trap("QuickJS invariant violated") }
+    i = i + 1
+  }
+  shrinkJumps(&mut fd, &mut out)
+  // Surviving atom operands transfer without retain/release; removed ones were
+  // released at their source rewrite. Publish before debug encoding can fail.
+  fd.bytecode = move out fd.useShortOpcodes = true
+  fd.labels = List<LabelSlot>.make() fd.jumps = List<JumpSlot>.make() fd.relocations = List<RelocEntry>.make()
+  run computePc2Line(&mut fd, source)
+  fd.lineNumbers = List<PcSourcePosition>.make()
+}
+effect fn failed(error: OutOfMemoryError) -> bool { drop error return false }
+effect fn resolveSuccess(fd: &mut FunctionDef, table: &mut AtomTable, source: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  run resolve(&mut fd, &mut table, source) return true
+}
+// Failure is sticky and the function remains destroyable. No GC callbacks run:
+// releasing bytecode atoms affects only the runtime atom/string registry.
+pub unsafe effect fn resolveLabels(cell: *mut HeapHeader, source: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = ()
+  let fd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
+  let mut runtimeAnchor = ()
+  let runtime = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, fd.runtime)
+  let ok = run Effect.catchAll(resolveSuccess(&mut fd.*, &mut runtime.atoms, source), failed)
+  if !ok { fd.bytecodeError = true fail OutOfMemoryError {} }
+}

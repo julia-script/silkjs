@@ -1,0 +1,425 @@
+//! Native Set algebra/predicates (quickjs.c:55059-55610) and Map/Set.groupBy
+//! (54760-54875). Inputs borrow roots; successful returned Values own references.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.f64
+import silk.i32
+import silk.i64
+import silk.u32
+import silk.u8
+import silk.usize
+import runtime_memory { AllocationObserver }
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types { ContextState, FrameSlots, NativeErrorKind, ObjectData, ObjectPayload,
+  PropertySlot, ShapeData, JS_PROP_WRITABLE }
+import js_gc { HeapHooks }
+import js_runtime as runtime
+import js_coercion_host { CoercionHooks }
+import js_property_host { OwnPropertyHooks, GetPropertyHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_call_host { CallHooks }
+import js_native_function_host { NativeFunctionHooks }
+import js_atom_data as atoms
+import js_proxy_core as core
+import js_primitives as primitives
+import js_property_mutations as properties
+import js_array_construction as arrays
+import js_array_storage { StorageOutcome }
+import js_array_storage as arrayStorage
+import js_map_storage as storage
+import js_map_iterators as iterators
+import js_collection_support { Scope }
+import js_collection_support as support
+import js_string_types { StringLengthError }
+import js_bigint { BigIntError }
+import js_exceptions { JsException }
+
+pub const IS_DISJOINT_FROM: u32 = 16
+pub const IS_SUBSET_OF: u32 = 17
+pub const IS_SUPERSET_OF: u32 = 18
+pub const INTERSECTION: u32 = 19
+pub const DIFFERENCE: u32 = 20
+pub const SYMMETRIC_DIFFERENCE: u32 = 21
+pub const UNION: u32 = 22
+
+fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+unsafe fn argument(args: &FrameSlots, index: usize) -> Value {
+  if index >= args.length() { return Value.Undefined }
+  return unsafe args.get(index)
+}
+unsafe fn clear<H: HeapHooks>(hooks: &mut H, context: *mut HeapHeader, scope: &mut Scope, index: usize) -> () {
+  unsafe support.release(&mut hooks, context, scope.take(index))
+}
+unsafe fn ownedState(value: Value, magic: u32) -> *mut HeapHeader {
+  return match Pointer.nonNullMut<HeapHeader>(unsafe storage.state(value, magic)) {
+    Option<*mut HeapHeader>.Some { value: state } => state
+    _ => invariant()
+  }
+}
+
+// Algebra owners: result, has, keys, iterator, next, item, coercion temporary.
+// An actual native Set bypasses its .size property, but NEVER its has/keys getters.
+unsafe effect fn setRecord<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, other: Value, scope: &mut Scope) -> i64 ! JsException ? &mut Allocator {
+  let mut size: i64 = 0
+  match Pointer.nonNullMut<HeapHeader>(unsafe storage.state(other, 1)) {
+    Option<*mut HeapHeader>.Some { value: state } => { size = u32.toI64(unsafe storage.count(state)) }
+    _ => {
+      scope.values[6] = run unsafe support.get(&mut hooks, context, other, atoms.JS_ATOM_size)
+      let number = run unsafe support.number(&mut hooks, context, scope.values[6])
+      unsafe clear(&mut hooks, context, &mut scope, 6)
+      if f64.isNaN(number) { return run unsafe core.error(&mut hooks, context, b".size is not a number") }
+      size = primitives.numberToInt64Saturated(number).value
+      if size < 0 { return run unsafe hooks.throwError(context, NativeErrorKind.Range, b".size must be positive") }
+    }
+  }
+  scope.values[1] = run unsafe support.get(&mut hooks, context, other, atoms.JS_ATOM_has)
+  if core.undefined(scope.values[1]) { return run unsafe core.error(&mut hooks, context, b".has is undefined") }
+  if !unsafe hooks.isCallable(context, scope.values[1]) { return run unsafe core.error(&mut hooks, context, b".has is not a function") }
+  scope.values[2] = run unsafe support.get(&mut hooks, context, other, atoms.JS_ATOM_keys)
+  if core.undefined(scope.values[2]) { return run unsafe core.error(&mut hooks, context, b".keys is undefined") }
+  if !unsafe hooks.isCallable(context, scope.values[2]) { return run unsafe core.error(&mut hooks, context, b".keys is not a function") }
+  return size
+}
+unsafe effect fn otherIterator<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, other: Value, scope: &mut Scope) -> () ! JsException ? &mut Allocator {
+  let mut missing = Value.Undefined
+  let args = FrameSlots.Borrowed { data: Pointer.fromMutRef<Value>(&mut missing), length: 0 }
+  scope.values[3] = run unsafe support.call(&mut hooks, context, scope.values[2], other, &args)
+  scope.values[4] = run unsafe support.get(&mut hooks, context, scope.values[3], atoms.JS_ATOM_next)
+}
+unsafe effect fn hasItem<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, other: Value, scope: &mut Scope, releaseItem: bool) -> bool ! JsException ? &mut Allocator {
+  let mut item = scope.values[5]
+  let args = FrameSlots.Borrowed { data: Pointer.fromMutRef<Value>(&mut item), length: 1 }
+  let result = run unsafe support.call(&mut hooks, context, scope.values[1], other, &args)
+  // Predicates release the visited key before ToBoolFree; the producing methods
+  // retain it until insertion/deletion has completed.
+  if releaseItem { unsafe clear(&mut hooks, context, &mut scope, 5) }
+  return unsafe core.toBoolFree(&mut hooks, context, result)
+}
+unsafe effect fn copySet<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, source: *mut HeapHeader, scope: &mut Scope) -> () ! JsException ? &mut Allocator {
+  scope.values[0] = run unsafe storage.create(&mut hooks, memory, context, Value.Undefined, 1)
+  let target = unsafe ownedState(scope.values[0], 1)
+  // This source copy does not invoke .add, @@iterator, or any JavaScript callback.
+  // It walks ordered records directly, not a separately allocated key snapshot.
+  let mut cursor = unsafe storage.first(source)
+  while true {
+    let record = match Pointer.nonNullMut<HeapHeader>(cursor) {
+      Option<*mut HeapHeader>.Some { value } => value
+      _ => { break }
+    }
+    if !unsafe storage.empty(record) {
+      run unsafe storage.put(&mut hooks, context, target, unsafe storage.key(record), Value.Undefined)
+    }
+    cursor = unsafe storage.following(record)
+  }
+}
+unsafe effect fn predicates<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, method: u32, receiver: Value,
+  other: Value, source: *mut HeapHeader, size: i64, scope: &mut Scope) -> Value ! JsException ? &mut Allocator {
+  let count = u32.toI64(unsafe storage.count(source))
+  if (method == IS_SUBSET_OF && count > size) || (method == IS_SUPERSET_OF && count < size) {
+    return Value.Bool { value: false }
+  }
+  if method == IS_SUBSET_OF || (method == IS_DISJOINT_FROM && count <= size) {
+    scope.values[3] = run unsafe iterators.create(&mut hooks, memory, context, receiver, 1, 0)
+    while true {
+      let mut done = false
+      scope.values[5] = run unsafe iterators.next(&mut hooks, memory, context, scope.values[3], 1, &mut done)
+      if done { break }
+      let present = run unsafe hasItem(&mut hooks, context, other, &mut scope, true)
+      if (method == IS_DISJOINT_FROM && present) || (method == IS_SUBSET_OF && !present) {
+        return Value.Bool { value: false }
+      }
+    }
+  } else {
+    run unsafe otherIterator(&mut hooks, context, other, &mut scope)
+    while true {
+      let mut done = false
+      scope.values[5] = run unsafe support.next(&mut hooks, context, scope.values[3], scope.values[4], &mut done)
+      if done { break }
+      let present = unsafe storage.has(source, scope.values[5])
+      unsafe clear(&mut hooks, context, &mut scope, 5)
+      if (method == IS_DISJOINT_FROM && present) || (method == IS_SUPERSET_OF && !present) {
+        // The pinned source deliberately ignores IteratorClose's return code:
+        // a throwing return leaves its pending exception, but this result is false.
+        let closed = run Effect.result(unsafe support.close(&mut hooks, context, scope.values[3], false))
+        drop closed
+        return Value.Bool { value: false }
+      }
+    }
+  }
+  return Value.Bool { value: true }
+}
+unsafe effect fn intersection<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, receiver: Value, other: Value,
+  source: *mut HeapHeader, size: i64, scope: &mut Scope) -> Value ! JsException ? &mut Allocator {
+  let native = u32.toI64(unsafe storage.count(source)) <= size
+  if native {
+    scope.values[3] = run unsafe iterators.create(&mut hooks, memory, context, receiver, 1, 0)
+  } else {
+    run unsafe otherIterator(&mut hooks, context, other, &mut scope)
+  }
+  // The keys call and next getter precede allocation of the result Set.
+  scope.values[0] = run unsafe storage.create(&mut hooks, memory, context, Value.Undefined, 1)
+  let target = unsafe ownedState(scope.values[0], 1)
+  while true {
+    let mut done = false
+    if native {
+      scope.values[5] = run unsafe iterators.next(&mut hooks, memory, context, scope.values[3], 1, &mut done)
+    } else {
+      scope.values[5] = run unsafe support.next(&mut hooks, context, scope.values[3], scope.values[4], &mut done)
+    }
+    if done { break }
+    let mut present = false
+    if native { present = run unsafe hasItem(&mut hooks, context, other, &mut scope, false) }
+    else { present = unsafe storage.has(source, scope.values[5]) }
+    if present && !unsafe storage.has(target, scope.values[5]) {
+      run unsafe storage.put(&mut hooks, context, target, scope.values[5], Value.Undefined)
+    }
+    unsafe clear(&mut hooks, context, &mut scope, 5)
+  }
+  return scope.take(0)
+}
+unsafe effect fn difference<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, other: Value, source: *mut HeapHeader,
+  size: i64, scope: &mut Scope) -> Value ! JsException ? &mut Allocator {
+  run unsafe copySet(&mut hooks, memory, context, source, &mut scope)
+  let target = unsafe ownedState(scope.values[0], 1)
+  let native = u32.toI64(unsafe storage.count(source)) <= size
+  if native {
+    // Difference visits the COPY, unlike intersection/subset/disjointness.
+    scope.values[3] = run unsafe iterators.create(&mut hooks, memory, context, scope.values[0], 1, 0)
+  } else {
+    run unsafe otherIterator(&mut hooks, context, other, &mut scope)
+  }
+  while true {
+    let mut done = false
+    if native {
+      scope.values[5] = run unsafe iterators.next(&mut hooks, memory, context, scope.values[3], 1, &mut done)
+    } else {
+      scope.values[5] = run unsafe support.next(&mut hooks, context, scope.values[3], scope.values[4], &mut done)
+    }
+    if done { break }
+    let mut remove = true
+    if native { remove = run unsafe hasItem(&mut hooks, context, other, &mut scope, false) }
+    if remove {
+      let erased = unsafe storage.erase(&mut hooks, unsafe runtime.contextRuntime(context), target, scope.values[5])
+    }
+    unsafe clear(&mut hooks, context, &mut scope, 5)
+  }
+  return scope.take(0)
+}
+unsafe effect fn combine<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, method: u32, other: Value,
+  source: *mut HeapHeader, scope: &mut Scope) -> Value ! JsException ? &mut Allocator {
+  unsafe clear(&mut hooks, context, &mut scope, 1)
+  run unsafe otherIterator(&mut hooks, context, other, &mut scope)
+  // Both iterator acquisition side effects run BEFORE this copy.
+  run unsafe copySet(&mut hooks, memory, context, source, &mut scope)
+  let target = unsafe ownedState(scope.values[0], 1)
+  while true {
+    let mut done = false
+    scope.values[5] = run unsafe support.next(&mut hooks, context, scope.values[3], scope.values[4], &mut done)
+    if done { break }
+    if method == UNION {
+      run unsafe storage.put(&mut hooks, context, target, scope.values[5], Value.Undefined)
+    } else if unsafe storage.has(source, scope.values[5]) {
+      // Membership is tested against the LIVE receiver on every iteration.
+      let erased = unsafe storage.erase(&mut hooks, unsafe runtime.contextRuntime(context), target, scope.values[5])
+    } else if !unsafe storage.has(target, scope.values[5]) {
+      // A duplicate, or a key erased from the receiver by the iterator, must not
+      // be removed/reinserted in the result: its original position survives.
+      run unsafe storage.put(&mut hooks, context, target, scope.values[5], Value.Undefined)
+    }
+    unsafe clear(&mut hooks, context, &mut scope, 5)
+  }
+  return scope.take(0)
+}
+unsafe effect fn body<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, method: u32, receiver: Value,
+  args: &FrameSlots, scope: &mut Scope) -> Value ! JsException ? &mut Allocator {
+  let source = run unsafe storage.requireState(&mut hooks, context, receiver, 1)
+  let other = unsafe argument(args, 0)
+  let size = run unsafe setRecord(&mut hooks, context, other, &mut scope)
+  if method >= IS_DISJOINT_FROM && method <= IS_SUPERSET_OF {
+    return run unsafe predicates(&mut hooks, memory, context, method, receiver, other, source, size, &mut scope)
+  }
+  if method == INTERSECTION { return run unsafe intersection(&mut hooks, memory, context, receiver, other, source, size, &mut scope) }
+  if method == DIFFERENCE { return run unsafe difference(&mut hooks, memory, context, other, source, size, &mut scope) }
+  if method == SYMMETRIC_DIFFERENCE || method == UNION {
+    return run unsafe combine(&mut hooks, memory, context, method, other, source, &mut scope)
+  }
+  return run unsafe core.error(&mut hooks, context, b"invalid Set algebra method")
+}
+pub unsafe effect fn call<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, method: u32, thisValue: Value,
+  args: &FrameSlots) -> Value ! JsException ? &mut Allocator {
+  let mut scope = Scope.make()
+  let result = run Effect.result(unsafe body(&mut hooks, memory, context, method, thisValue, args, &mut scope))
+  // Callback/storage adapters have already installed the pending exception.
+  // The current item is released before a failed result Set, as in the source.
+  unsafe clear(&mut hooks, context, &mut scope, 6)
+  unsafe clear(&mut hooks, context, &mut scope, 5)
+  unsafe clear(&mut hooks, context, &mut scope, 0)
+  if method == SYMMETRIC_DIFFERENCE || method == UNION {
+    unsafe clear(&mut hooks, context, &mut scope, 1)
+    unsafe clear(&mut hooks, context, &mut scope, 4)
+    unsafe clear(&mut hooks, context, &mut scope, 3)
+    unsafe clear(&mut hooks, context, &mut scope, 2)
+  } else {
+    unsafe clear(&mut hooks, context, &mut scope, 1)
+    unsafe clear(&mut hooks, context, &mut scope, 2)
+    unsafe clear(&mut hooks, context, &mut scope, 3)
+    unsafe clear(&mut hooks, context, &mut scope, 4)
+  }
+  unsafe support.cleanup(&mut hooks, context, move scope)
+  return match move result {
+    Result<Value, JsException>.Success { value } => value
+    Result<Value, JsException>.Failure { error } => { fail move error }
+  }
+}
+
+unsafe effect fn fastPush<H: HeapHooks + CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  array: Value, item: Value) -> bool ! JsException ? &mut Allocator {
+  let node = core.reference(array)
+  let anchor = ()
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  if !object.fastArray { return false }
+  let mut count: usize = 0
+  let mut capacity: usize = 0
+  match &object.payload {
+    ObjectPayload.FastArray { array: values } => {
+      count = values.values.length()
+      capacity = values.values.capacity()
+    }
+    _ => invariant()
+  }
+  let denseLength = match object.properties.get(0) {
+    PropertySlot.Value { value: Value.Int { value } } => value >= 0 && i32.toUsize(value) == count
+    _ => false
+  }
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, object.shape)
+  let writable = (u8.toU32(shape.properties.get(0).flags) & JS_PROP_WRITABLE) != 0
+  drop shape
+  drop object
+  if !denseLength || !writable || count >= 2147483647 || !unsafe properties.canExtendFast(node) { return false }
+  // js_array_push expands BEFORE changing length. Generic indexed Set instead
+  // extends length before its allocation; a leaked group array can expose that
+  // difference on OOM, so reserve through the existing array storage API first.
+  if count == capacity {
+    let expanded = run Effect.result(unsafe arrayStorage.expandFastValues(&mut hooks, context, node, usize.toU32(count + 1)))
+    match move expanded {
+      Result<(), OutOfMemoryError>.Success { .. } => ()
+      Result<(), OutOfMemoryError>.Failure { error } => { return run unsafe core.materialize(&mut hooks, context, move error) }
+    }
+  }
+  let appended = run Effect.result(unsafe arrayStorage.appendFastElement(&mut hooks, context, node, unsafe item.retained()))
+  match move appended {
+    Result<StorageOutcome, OutOfMemoryError>.Success { value } => {
+      if value != StorageOutcome.Accepted { invariant() }
+    }
+    Result<StorageOutcome, OutOfMemoryError>.Failure { error } => { return run unsafe core.materialize(&mut hooks, context, move error) }
+  }
+  return true
+}
+unsafe effect fn pushGroup<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, scope: &mut Scope) -> () ! JsException ? &mut Allocator {
+  let array = scope.values[5]
+  let item = scope.values[3]
+  if run unsafe fastPush(&mut hooks, context, array, item) { return () }
+  // Group arrays always have an own numeric length in the uint32 range. The
+  // general push path observes inherited indexed setters before setting length.
+  scope.values[6] = run unsafe support.get(&mut hooks, context, array, atoms.JS_ATOM_length)
+  let length = scope.values[6].numericValue()
+  unsafe clear(&mut hooks, context, &mut scope, 6)
+  let inserted = run Effect.result(unsafe properties.setPropertyInt64(&mut hooks, context, array,
+    f64.toI64(length), unsafe item.retained()))
+  match move inserted {
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { .. } => ()
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => {
+      return run unsafe core.materialize(&mut hooks, context, move error)
+    }
+  }
+  let resized = run Effect.result(unsafe properties.setProperty(&mut hooks, context, array,
+    atoms.JS_ATOM_length, Value.number(length + 1.0)))
+  match move resized {
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { .. } => ()
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => {
+      return run unsafe core.materialize(&mut hooks, context, move error)
+    }
+  }
+}
+// Grouping owners: Map, iterator, next, item, key, group array, length temporary.
+unsafe effect fn groupByBody<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, args: &FrameSlots,
+  scope: &mut Scope, close: &mut bool) -> Value ! JsException ? &mut Allocator {
+  let callback = unsafe argument(args, 1)
+  if !unsafe hooks.isCallable(context, callback) { return run unsafe core.error(&mut hooks, context, b"not a function") }
+  scope.values[1] = run unsafe support.iterator(&mut hooks, memory, context, unsafe argument(args, 0))
+  scope.values[2] = run unsafe support.get(&mut hooks, context, scope.values[1], atoms.JS_ATOM_next)
+  // Source installs this very same Map-producing function on Set as well.
+  scope.values[0] = run unsafe storage.create(&mut hooks, memory, context, Value.Undefined, 0)
+  let groups = unsafe ownedState(scope.values[0], 0)
+  let mut index: i64 = 0
+  while true {
+    close.* = true
+    if index >= primitives.MAX_SAFE_INTEGER { return run unsafe core.error(&mut hooks, context, b"too many elements") }
+    close.* = false
+    let mut done = false
+    scope.values[3] = run unsafe support.next(&mut hooks, context, scope.values[1], scope.values[2], &mut done)
+    if done { break }
+    let anchor = ()
+    let state = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+    let receiver = state.globalObject
+    drop state
+    let mut values: [Value; 2] = [scope.values[3], Value.number(i64.toF64(index))]
+    let callArgs = FrameSlots.Borrowed { data: Pointer.fromMutRef<Value>(&mut values[0]), length: 2 }
+    close.* = true
+    scope.values[4] = run unsafe support.call(&mut hooks, context, callback, receiver, &callArgs)
+    close.* = false
+    scope.values[5] = unsafe storage.get(groups, scope.values[4])
+    if core.undefined(scope.values[5]) {
+      let mut missing = Value.Undefined
+      let empty = FrameSlots.Borrowed { data: Pointer.fromMutRef<Value>(&mut missing), length: 0 }
+      scope.values[5] = run unsafe arrays.create(&mut hooks, memory, context, &empty, 0, 0)
+      run unsafe storage.put(&mut hooks, context, groups, scope.values[4], scope.values[5])
+    }
+    run unsafe pushGroup(&mut hooks, context, &mut scope)
+    unsafe clear(&mut hooks, context, &mut scope, 5)
+    unsafe clear(&mut hooks, context, &mut scope, 4)
+    unsafe clear(&mut hooks, context, &mut scope, 3)
+    index = index + 1
+  }
+  return scope.take(0)
+}
+pub unsafe effect fn groupBy<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, args: &FrameSlots) -> Value ! JsException ? &mut Allocator {
+  let mut scope = Scope.make()
+  let mut close = false
+  let result = run Effect.result(unsafe groupByBody(&mut hooks, memory, context, args, &mut scope, &mut close))
+  if close {
+    // Only callback and safe-index failures close the iterator. next/get/allocation
+    // and push failures intentionally do not; pending=true preserves the original.
+    let closed = run Effect.result(unsafe support.close(&mut hooks, context, scope.values[1], true))
+    drop closed
+  }
+  unsafe clear(&mut hooks, context, &mut scope, 6)
+  unsafe clear(&mut hooks, context, &mut scope, 5)
+  unsafe clear(&mut hooks, context, &mut scope, 4)
+  unsafe clear(&mut hooks, context, &mut scope, 3)
+  unsafe clear(&mut hooks, context, &mut scope, 0)
+  unsafe clear(&mut hooks, context, &mut scope, 1)
+  unsafe clear(&mut hooks, context, &mut scope, 2)
+  unsafe support.cleanup(&mut hooks, context, move scope)
+  return match move result {
+    Result<Value, JsException>.Success { value } => value
+    Result<Value, JsException>.Failure { error } => { fail move error }
+  }
+}

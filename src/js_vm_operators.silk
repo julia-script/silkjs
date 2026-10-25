@@ -1,0 +1,316 @@
+//! Final arithmetic, comparison and conversion dispatch. Slow helpers consume
+//! their slot owners; optimized-local operations instead retain the old binding.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.f64
+import silk.i32
+import silk.i64
+import silk.u8
+import silk.u32
+import js_heap { HeapCell }
+import js_core_types { ObjectData }
+import js_value { Value }
+import js_vm_state { Machine }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_coercion_host { CoercionHooks }
+import js_property_host { OwnPropertyHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_exceptions { JsException }
+import js_string_types { StringLengthError }
+import js_bigint { BigIntError }
+import js_strings { Strings }
+import js_primitives as primitive
+import js_primitives { EqualityMode }
+import js_unary_operators as unary
+import js_unary_operators { Arithmetic as UnaryArithmetic, Postfix }
+import js_binary_operators as binary
+import js_binary_operators { Arithmetic as BinaryArithmetic, Logic }
+import js_comparison_operators as comparison
+import js_comparison_operators { Operation as ComparisonOperation }
+import js_coercions as coercion
+import js_boxing as boxing
+import js_vm_values as values
+import js_opcode_data as op
+import js_atom_data as atoms
+import runtime_memory { AllocationObserver }
+
+fn bits(value: i32) -> u32 {
+  if value < 0 { return i32.toU32(-(value + 1)) ^ 0xffffffff } return i32.toU32(value)
+}
+fn signed(value: u32) -> i32 {
+  if value > 2147483647 { return -1 - u32.toI32(value ^ 0xffffffff) } return u32.toI32(value)
+}
+fn unaryOperation(opcode: u8) -> UnaryArithmetic {
+  if opcode == op.OP_plus { return UnaryArithmetic.Plus }
+  if opcode == op.OP_neg { return UnaryArithmetic.Negate }
+  if opcode == op.OP_inc || opcode == op.OP_inc_loc { return UnaryArithmetic.Increment }
+  return UnaryArithmetic.Decrement
+}
+unsafe fn typeofAtom<H: CoercionHooks>(hooks: &mut H, machine: &Machine, value: Value) -> u32 {
+  if value.isNumber() { return atoms.JS_ATOM_number }
+  if value.isBigInt() { return atoms.JS_ATOM_bigint }
+  if value.isString() { return atoms.JS_ATOM_string }
+  match value {
+    Value.Undefined => { return atoms.JS_ATOM_undefined }
+    Value.Bool { .. } => { return atoms.JS_ATOM_boolean }
+    Value.Null => { return atoms.JS_ATOM_object }
+    Value.Symbol { .. } => { return atoms.JS_ATOM_symbol }
+    Value.Object { reference } => {
+      let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+      let htmlDda = object.isHtmlDda drop object
+      if htmlDda { return atoms.JS_ATOM_undefined }
+      if unsafe hooks.isCallable(machine.context, value) { return atoms.JS_ATOM_function }
+      return atoms.JS_ATOM_object
+    }
+    _ => { return atoms.JS_ATOM_unknown }
+  }
+}
+
+unsafe effect fn binarySlow<H: HeapHooks + CoercionHooks>(hooks: &mut H, machine: &Machine,
+  left: &mut Value, right: &mut Value, opcode: u8) -> ()
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  if opcode == op.OP_add { run unsafe binary.add(&mut hooks, machine.context, &mut left, &mut right) return }
+  if opcode >= op.OP_mul && opcode <= op.OP_pow {
+    let mut operation = BinaryArithmetic.Subtract
+    if opcode == op.OP_mul { operation = BinaryArithmetic.Multiply }
+    else if opcode == op.OP_div { operation = BinaryArithmetic.Divide }
+    else if opcode == op.OP_mod { operation = BinaryArithmetic.Remainder }
+    else if opcode == op.OP_pow { operation = BinaryArithmetic.Power }
+    run unsafe binary.arithmetic(&mut hooks, machine.context, &mut left, &mut right, operation) return
+  }
+  if opcode == op.OP_shr { run unsafe binary.unsignedShiftRight(&mut hooks, machine.context, &mut left, &mut right) return }
+  if opcode == op.OP_shl || opcode == op.OP_sar || (opcode >= op.OP_and && opcode <= op.OP_or) {
+    let mut operation = Logic.And
+    if opcode == op.OP_shl { operation = Logic.ShiftLeft }
+    else if opcode == op.OP_sar { operation = Logic.ShiftRight }
+    else if opcode == op.OP_xor { operation = Logic.Xor }
+    else if opcode == op.OP_or { operation = Logic.Or }
+    run unsafe binary.logic(&mut hooks, machine.context, &mut left, &mut right, operation) return
+  }
+  let mut operation = ComparisonOperation.Equal
+  if opcode == op.OP_lt { operation = ComparisonOperation.Less }
+  else if opcode == op.OP_lte { operation = ComparisonOperation.LessEqual }
+  else if opcode == op.OP_gt { operation = ComparisonOperation.Greater }
+  else if opcode == op.OP_gte { operation = ComparisonOperation.GreaterEqual }
+  else if opcode == op.OP_neq { operation = ComparisonOperation.NotEqual }
+  run unsafe comparison.apply(&mut hooks, machine.context, &mut left, &mut right, operation)
+}
+
+// Returns Undefined only when no numeric fast path applies. No numeric result
+// can have that tag, so this needs neither allocation nor an extra wrapper.
+fn numericFast(left: Value, right: Value, opcode: u8) -> Value {
+  if !left.isNumber() || !right.isNumber() { return Value.Undefined }
+  let a = left.numericValue() let b = right.numericValue()
+  if opcode == op.OP_lt { return Value.Bool { value: a < b } }
+  if opcode == op.OP_lte { return Value.Bool { value: a <= b } }
+  if opcode == op.OP_gt { return Value.Bool { value: a > b } }
+  if opcode == op.OP_gte { return Value.Bool { value: a >= b } }
+  if opcode == op.OP_eq { return Value.Bool { value: a == b } }
+  if opcode == op.OP_neq { return Value.Bool { value: a != b } }
+  match left {
+    Value.Int { value: x } => match right {
+      Value.Int { value: y } => {
+        let wideX = i32.toI64(x) let wideY = i32.toI64(y)
+        if opcode == op.OP_add { return Value.number(i64.toF64(wideX + wideY)) }
+        if opcode == op.OP_sub { return Value.number(i64.toF64(wideX - wideY)) }
+        if opcode == op.OP_mul {
+          if (x == 0 || y == 0) && (x < 0 || y < 0) { return Value.Float64 { value: f64.fromBits(0x8000000000000000) } }
+          return Value.number(i64.toF64(wideX * wideY))
+        }
+        if opcode == op.OP_div { return Value.number(a / b) }
+        if opcode == op.OP_mod && x >= 0 && y > 0 { return Value.Int { value: x % y } }
+        if opcode == op.OP_and { return Value.Int { value: x & y } }
+        if opcode == op.OP_or { return Value.Int { value: x | y } }
+        if opcode == op.OP_xor { return Value.Int { value: x ^ y } }
+        let shift = bits(y) & 31
+        if opcode == op.OP_shl { return Value.Int { value: signed(u32.shiftLeft(bits(x), shift)) } }
+        if opcode == op.OP_sar { return Value.Int { value: i32.shiftRight(x, u32.toI32(shift)) } }
+        if opcode == op.OP_shr { return Value.number(u32.toF64(u32.shiftRight(bits(x), shift))) }
+      }
+      _ => ()
+    }
+    _ => ()
+  }
+  if opcode == op.OP_add { return Value.Float64 { value: a + b } }
+  if opcode == op.OP_sub { return Value.Float64 { value: a - b } }
+  if opcode == op.OP_mul { return Value.Float64 { value: a * b } }
+  return Value.Undefined
+}
+
+pub unsafe effect fn step<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks>(
+  hooks: &mut H, memory: &AllocationObserver, machine: &mut Machine, opcode: u8) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  if opcode == op.OP_nop { return true }
+  if opcode == op.OP_inc_loc || opcode == op.OP_dec_loc {
+    let index = u8.toUsize(unsafe machine.readU8())
+    let input = unsafe machine.local(index)
+    match input {
+      Value.Int { value } => {
+        if (opcode == op.OP_inc_loc && value < 2147483647) || (opcode == op.OP_dec_loc && value > -2147483648) {
+          let mut n = value
+          if opcode == op.OP_inc_loc { n = value + 1 } else { n = value - 1 }
+          let previous = unsafe machine.setLocal(index, Value.Int { value: n }) return true
+        }
+      }
+      _ => ()
+    }
+    unsafe machine.publishPc()
+    let mut output = unsafe input.retained()
+    run unsafe unary.arithmetic(&mut hooks, machine.context, &mut output, unaryOperation(opcode))
+    let previous = unsafe machine.setLocal(index, output)
+    unsafe gc.release(&mut hooks, machine.runtime, previous) return true
+  }
+  if opcode == op.OP_add_loc {
+    let index = u8.toUsize(unsafe machine.readU8())
+    let local = unsafe machine.local(index) let input = unsafe machine.top(1)
+    // Only both-float (not mixed number) is a source add_loc fast path.
+    let bothInts = match local { Value.Int { .. } => match input { Value.Int { .. } => true _ => false } _ => false }
+    let bothFloats = match local { Value.Float64 { .. } => match input { Value.Float64 { .. } => true _ => false } _ => false }
+    if bothInts || bothFloats {
+      let output = numericFast(local, input, op.OP_add)
+      let previous = unsafe machine.setLocal(index, output) machine.sp = machine.sp - 1 return true
+    }
+    machine.sp = machine.sp - 1 unsafe machine.publishPc()
+    if local.tag() == -7 && input.tag() == -7 && run Strings.concatInPlace(local, input) {
+      unsafe gc.release(&mut hooks, machine.runtime, input) return true
+    }
+    let mut left = unsafe local.retained() let mut right = input
+    run unsafe binary.add(&mut hooks, machine.context, &mut left, &mut right)
+    let previous = unsafe machine.setLocal(index, left)
+    unsafe gc.release(&mut hooks, machine.runtime, previous) return true
+  }
+  if opcode >= op.OP_neg && opcode <= op.OP_post_inc {
+    let input = unsafe machine.top(1)
+    let postfix = opcode == op.OP_post_dec || opcode == op.OP_post_inc
+    if opcode == op.OP_plus || opcode == op.OP_neg {
+      match input {
+        Value.Float64 { value } => {
+          if opcode == op.OP_neg { unsafe machine.set(1, Value.Float64 { value: -value }) }
+          return true
+        }
+        Value.Bool { value } => {
+          let mut integer: i32 = 0 if value { integer = 1 }
+          if opcode == op.OP_plus { unsafe machine.set(1, Value.Int { value: integer }) }
+          else {
+            let mut output = Value.Int { value: -integer }
+            if integer == 0 { output = Value.Float64 { value: f64.fromBits(0x8000000000000000) } }
+            unsafe machine.set(1, output)
+          }
+          return true
+        }
+        Value.Null => {
+          if opcode == op.OP_plus { unsafe machine.set(1, Value.Int { value: 0 }) }
+          else { unsafe machine.set(1, Value.Float64 { value: f64.fromBits(0x8000000000000000) }) }
+          return true
+        }
+        _ => ()
+      }
+    }
+    match input {
+      Value.Int { value } => {
+        if opcode == op.OP_plus { return true }
+        if opcode == op.OP_neg {
+          let mut output = Value.number(-i32.toF64(value))
+          if value == 0 { output = Value.Float64 { value: f64.fromBits(0x8000000000000000) } }
+          unsafe machine.set(1, output) return true
+        }
+        let increment = opcode == op.OP_inc || opcode == op.OP_post_inc
+        if (increment && value < 2147483647) || (!increment && value > -2147483648) {
+          let mut n = value
+          if increment { n = value + 1 } else { n = value - 1 }
+          if postfix { unsafe machine.push(Value.Int { value: n }) } else { unsafe machine.set(1, Value.Int { value: n }) }
+          return true
+        }
+      }
+      _ => ()
+    }
+    unsafe machine.publishPc()
+    let mut old = input let mut output = Value.Undefined
+    let mut operation = Postfix.Decrement
+    if opcode == op.OP_post_inc { operation = Postfix.Increment }
+    let mut result = Result<(), OutOfMemoryError | StringLengthError | JsException>.Success { value: () }
+    if postfix { result = run Effect.result(unsafe unary.postfix(&mut hooks, machine.context, &mut old, &mut output, operation)) }
+    else { result = run Effect.result(unsafe unary.arithmetic(&mut hooks, machine.context, &mut old, unaryOperation(opcode))) }
+    unsafe machine.set(1, old)
+    match move result {
+      Result<(), OutOfMemoryError | StringLengthError | JsException>.Failure { error } => { fail move error }
+      Result<(), OutOfMemoryError | StringLengthError | JsException>.Success { .. } => ()
+    }
+    if postfix { unsafe machine.push(output) } return true
+  }
+  if opcode == op.OP_not {
+    let mut value = unsafe machine.top(1)
+    match value { Value.Int { value: n } => { unsafe machine.set(1, Value.Int { value: -1 - n }) return true } _ => () }
+    unsafe machine.publishPc()
+    let result = run Effect.result(unsafe unary.bitwiseNot(&mut hooks, machine.context, &mut value))
+    unsafe machine.set(1, value)
+    match move result {
+      Result<(), OutOfMemoryError | StringLengthError | JsException>.Failure { error } => { fail move error }
+      Result<(), OutOfMemoryError | StringLengthError | JsException>.Success { .. } => { return true }
+    }
+  }
+  if opcode == op.OP_lnot || opcode == op.OP_is_undefined_or_null || opcode == op.OP_is_undefined || opcode == op.OP_is_null
+    || opcode == op.OP_typeof || opcode == op.OP_typeof_is_undefined || opcode == op.OP_typeof_is_function {
+    let input = unsafe machine.top(1)
+    let mut answer = false let mut atom: u32 = 0
+    if opcode == op.OP_lnot { answer = unsafe primitive.toBoolean(input) == 0 }
+    else if opcode == op.OP_typeof || opcode == op.OP_typeof_is_undefined || opcode == op.OP_typeof_is_function {
+      atom = unsafe typeofAtom(&mut hooks, &machine.*, input)
+      if opcode == op.OP_typeof_is_undefined { answer = atom == atoms.JS_ATOM_undefined }
+      else { answer = atom == atoms.JS_ATOM_function }
+    } else {
+      answer = match input {
+        Value.Undefined => opcode != op.OP_is_null
+        Value.Null => opcode != op.OP_is_undefined
+        _ => false
+      }
+    }
+    unsafe gc.release(&mut hooks, machine.runtime, input)
+    if opcode == op.OP_typeof {
+      let output = run unsafe values.atomValue(&mut hooks, &machine.*, atom, true) unsafe machine.set(1, output)
+    } else { unsafe machine.set(1, Value.Bool { value: answer }) }
+    return true
+  }
+  if opcode == op.OP_to_object || opcode == op.OP_to_propkey {
+    let input = unsafe machine.top(1)
+    if opcode == op.OP_to_object && input.isObject() { return true }
+    if opcode == op.OP_to_propkey {
+      match input { Value.Int { .. } => { return true } Value.Symbol { .. } => { return true } _ => () }
+      if input.isString() { return true }
+    }
+    unsafe machine.publishPc()
+    let mut output = Value.Undefined
+    if opcode == op.OP_to_object { output = run unsafe boxing.toObject(&mut hooks, memory, machine.context, input) }
+    else { output = run unsafe coercion.toPropertyKey(&mut hooks, machine.context, input) }
+    if output.isException() { fail JsException {} }
+    unsafe gc.release(&mut hooks, machine.runtime, input) unsafe machine.set(1, output) return true
+  }
+  let binaryOpcode = (opcode >= op.OP_mul && opcode <= op.OP_gte) || (opcode >= op.OP_eq && opcode <= op.OP_or)
+  if !binaryOpcode { return false }
+  let mut left = unsafe machine.top(2) let mut right = unsafe machine.top(1)
+  if opcode == op.OP_strict_eq || opcode == op.OP_strict_neq {
+    let mut answer = unsafe primitive.equal(left, right, EqualityMode.Strict)
+    if opcode == op.OP_strict_neq { answer = !answer }
+    unsafe gc.release(&mut hooks, machine.runtime, left) unsafe gc.release(&mut hooks, machine.runtime, right)
+    unsafe machine.set(2, Value.Bool { value: answer }) machine.sp = machine.sp - 1 return true
+  }
+  let fast = numericFast(left, right, opcode)
+  match fast { Value.Undefined => () _ => { unsafe machine.set(2, fast) machine.sp = machine.sp - 1 return true } }
+  if opcode == op.OP_add && left.isString() && right.isString() {
+    let result = run Effect.result(Strings.concatOwned(left, right))
+    unsafe machine.set(2, Value.Exception) machine.sp = machine.sp - 1
+    match move result {
+      Result<Value, OutOfMemoryError | StringLengthError>.Success { value } => { unsafe machine.set(1, value) return true }
+      Result<Value, OutOfMemoryError | StringLengthError>.Failure { error } => { fail move error }
+    }
+  }
+  unsafe machine.publishPc()
+  let result = run Effect.result(unsafe binarySlow(&mut hooks, &machine.*, &mut left, &mut right, opcode))
+  unsafe machine.set(2, left) unsafe machine.set(1, right)
+  match move result {
+    Result<(), OutOfMemoryError | StringLengthError | JsException>.Success { .. } => { machine.sp = machine.sp - 1 return true }
+    Result<(), OutOfMemoryError | StringLengthError | JsException>.Failure { error } => { fail move error }
+  }
+}

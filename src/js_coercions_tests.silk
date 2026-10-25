@@ -1,0 +1,377 @@
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.f64
+import silk.testing { Testing, AssertionError }
+import runtime_memory { RuntimeAllocator }
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_core_types { RuntimeState, ContextState, ObjectData, ShapeData }
+import js_gc as gc
+import js_runtime as runtime
+import js_value { Value }
+import js_strings { Strings }
+import js_string_types { StringLengthError, stringReference }
+import js_bigint { BigInt, BigIntError }
+import js_atom_data as atoms
+import js_exceptions { JsException }
+import js_exceptions as exceptions
+import js_coercions as coercion
+import js_coercions_test_support as fixture
+import js_coercions_test_support { Hooks }
+import js_coercions_cases as cases
+import js_array_storage_test_support { FaultAllocator, reference, rc }
+import js_class_data as classes
+
+unsafe fn isTypeError(context: *mut HeapHeader, value: Value) -> bool {
+  if !value.isObject() { return false }
+  let anchor = ()
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(value))
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, object.shape)
+  let state = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  return object.classId == classes.JS_CLASS_ERROR
+    && Pointer.address(shape.prototype) == Pointer.address(reference(state.nativeErrorPrototypes[4]))
+}
+
+// Different hints must change observable callback order and actual argument text,
+// not only produce a common canned output. Collection runs inside every callback.
+test effect fn objectPrimitiveHintsAndForcedOrdinaryKeepOwnersLive() -> ()
+  ! OutOfMemoryError | StringLengthError | JsException | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe runtime.allocateContextStorage(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run unsafe fixture.register(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make() hooks.collect = true
+  run unsafe fixture.prepareErrors(&mut hooks, &observer, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+  let object = run unsafe cases.make(&mut hooks, &observer, ctx, 0, Value.Int { value: 41 }) |> Effect.provideMut<Allocator>(&mut memory)
+  let hints: [u32; 6] = [0, 1, 2, 16, 17, 18]
+  let mut i: usize = 0
+  while i < hints.length {
+    hooks.clear()
+    let result = run unsafe coercion.toPrimitive(&mut hooks, ctx, object, hints[i]) |> Effect.provideMut<Allocator>(&mut memory)
+    run Testing.expect(result.numericValue() == 41.0, "callback's captured payload is returned")
+    run Testing.expect(unsafe rc(reference(object)) == 1, "borrowed object survives call and collector without reference drift")
+    run Testing.expect(hooks.lastReceiver == Pointer.address(reference(object)), "actual receiver remains the original object")
+    if i < 3 {
+      run Testing.expect(hooks.eventCount == 3 && hooks.events[0] == 10 && hooks.events[1] == 11,
+        "exotic getter runs before actual registered function")
+      let mut expected: u32 = 1000
+      if i == 0 { expected = 1002 } else if i == 1 { expected = 1001 }
+      run Testing.expect(hooks.events[2] == expected && hooks.callableChecks == 0,
+        "exotic receives source hint and bypasses ordinary callability precheck")
+    } else {
+      let mut expected: u32 = 20 if i == 3 { expected = 30 }
+      run Testing.expect(hooks.eventCount == 2 && hooks.events[0] == expected && hooks.events[1] == expected + 1,
+        "forced ordinary skips Symbol.toPrimitive getter entirely")
+      run Testing.expect(hooks.callableChecks == 1, "ordinary path checks callable before calling")
+    }
+    unsafe gc.release(&mut hooks, rt, result)
+    i = i + 1
+  }
+  hooks.clear()
+  let mut fault = FaultAllocator { parent: move memory, remaining: 0 }
+  let transferred = run unsafe coercion.toPrimitiveFree(&mut hooks, ctx, object, 1) |> Effect.provideMut<Allocator>(&mut fault)
+  run Testing.expect(transferred.numericValue() == 41.0 && hooks.finalizedCount == 7,
+    "consuming exotic call releases receiver and six stored callback objects without allocation")
+  unsafe gc.release(&mut hooks, rt, transferred)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx) run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut fault)
+  run Testing.expect(observer.stats().usedBytes == 0 && observer.stats().allocationCount == 0, "hints and collector teardown ledger is empty")
+}
+
+test effect fn coercionFallbackFailuresPreservePendingValuesAndBorrowedEdges() -> ()
+  ! OutOfMemoryError | StringLengthError | JsException | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider()) let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe runtime.allocateContextStorage(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run unsafe fixture.register(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make()
+  run unsafe fixture.prepareErrors(&mut hooks, &observer, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+  let leaf = run Strings.fromLatin1(b"stored-exception-or-result") |> Effect.provideMut<Allocator>(&mut memory)
+  let families: [u32; 18] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 17, 18, 19, 20]
+  let mut i: usize = 0
+  while i < families.length {
+    let family = families[i]
+    let object = run unsafe cases.make(&mut hooks, &observer, ctx, family, leaf) |> Effect.provideMut<Allocator>(&mut memory)
+    let before = unsafe rc(stringReference(leaf)) hooks.clear()
+    let outcome = run Effect.result(unsafe coercion.toPrimitive(&mut hooks, ctx, object, 1)) |> Effect.provideMut<Allocator>(&mut memory)
+    let mut status: u32 = 0
+    match move outcome {
+      Result<Value, OutOfMemoryError | StringLengthError | JsException>.Success { value } => {
+        run Testing.expect(Strings.equal(value, leaf), "ordinary or exotic method returns captured value")
+        unsafe gc.release(&mut hooks, rt, value)
+      }
+      Result<Value, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => {
+        match move error {
+          JsException thrown => {
+            status = 2 let pending = unsafe exceptions.take(rt)
+            if family == 4 || family == 5 || family == 10 || family == 17 || family == 18 {
+              run Testing.expect(unsafe isTypeError(ctx, pending), "invalid conversion results install a real TypeError with the context's prototype")
+              if family == 4 {
+                run Testing.expect(hooks.callableChecks == 0, "exotic nonfunction is not skipped or prechecked")
+              }
+            } else { run Testing.expect(Strings.equal(pending, leaf), "getter and call exceptions preserve arbitrary thrown value") }
+            unsafe gc.release(&mut hooks, rt, pending)
+          }
+          OutOfMemoryError allocation => { fail move allocation }
+          StringLengthError length => { fail move length }
+        }
+      }
+    }
+    let mut expected: u32 = 0
+    if family == 4 || family == 5 || family == 6 || family == 7 || family == 10
+      || family == 13 || family == 17 || family == 18 { expected = 2 }
+    run Testing.expect(status == expected, "source failure precedence, method skips and short circuit")
+    if family == 8 {
+      run Testing.expect(hooks.eventCount == 4 && hooks.events[0] == 20 && hooks.events[1] == 21
+        && hooks.events[2] == 30 && hooks.events[3] == 31, "ordinary object result is released before reading second method")
+    }
+    if family == 6 || family == 13 {
+      run Testing.expect(hooks.eventCount == 1, "throwing getter prevents later method lookup")
+    }
+    run Testing.expect(unsafe rc(reference(object)) == 1 && unsafe rc(stringReference(leaf)) == before,
+      "every successful, failed and skipped method leaves borrowed owners unchanged")
+    unsafe gc.release(&mut hooks, rt, object)
+    run Testing.expect(unsafe rc(stringReference(leaf)) == 1, "stored captures are reclaimed after each fixture")
+    i = i + 1
+  }
+  unsafe gc.release(&mut hooks, rt, leaf)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx) run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observer.stats().usedBytes == 0 && observer.stats().allocationCount == 0, "all failure paths have zero teardown ledger")
+}
+
+test effect fn objectAwareWrappersPreserveBigintsSymbolsAndSignedZero() -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider()) let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe runtime.allocateContextStorage(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run unsafe fixture.register(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make()
+  run unsafe fixture.prepareErrors(&mut hooks, &observer, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+  let symbol = run state.atoms.uniqueSymbol(Option<Value>.none()) |> Effect.provideMut<Allocator>(&mut memory)
+  drop state
+  let symbolObject = run unsafe cases.make(&mut hooks, &observer, ctx, 0, symbol) |> Effect.provideMut<Allocator>(&mut memory)
+  let symbolBefore = unsafe rc(stringReference(symbol))
+  let key = run unsafe coercion.toPropertyKey(&mut hooks, ctx, symbolObject) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(key.tag() == -8 && unsafe rc(stringReference(symbol)) == symbolBefore + 1,
+    "object property-key keeps returned symbol identity and transfers exactly one owner")
+  unsafe gc.release(&mut hooks, rt, key)
+  let text = run Effect.result(unsafe coercion.toStringFree(&mut hooks, ctx, unsafe symbolObject.retained())) |> Effect.provideMut<Allocator>(&mut memory)
+  let symbolError = match move text {
+    Result<Value, OutOfMemoryError | JsException | StringLengthError | BigIntError>.Failure { error } => match move error {
+      JsException thrown => true _ => false
+    }
+    _ => false
+  }
+  let symbolPending = unsafe exceptions.take(rt)
+  run Testing.expect(symbolError && unsafe isTypeError(ctx, symbolPending)
+    && unsafe rc(reference(symbolObject)) == 1 && unsafe rc(stringReference(symbol)) == symbolBefore,
+    "String differs from property key and frees only the passed object reference on failure")
+  unsafe gc.release(&mut hooks, rt, symbolPending)
+  let integer = run BigInt.fromI64(9007199254740993) |> Effect.provideMut<Allocator>(&mut memory)
+  let node = run HeapCell.allocate(HeapKind.BigInt, move integer) |> Effect.provideMut<Allocator>(&mut memory)
+  let bigint = Value.BigInt { reference: node }
+  let bigintObject = run unsafe cases.make(&mut hooks, &observer, ctx, 0, bigint) |> Effect.provideMut<Allocator>(&mut memory)
+  let before = unsafe rc(node)
+  let numeric = run unsafe coercion.toNumeric(&mut hooks, ctx, bigintObject) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(numeric.tag() == -9 && unsafe rc(node) == before + 1, "Numeric transfers returned heap bigint unchanged")
+  unsafe gc.release(&mut hooks, rt, numeric)
+  let number = run Effect.result(unsafe coercion.toNumberFree(&mut hooks, ctx, unsafe bigintObject.retained())) |> Effect.provideMut<Allocator>(&mut memory)
+  let bigintError = match move number {
+    Result<Value, OutOfMemoryError | JsException | StringLengthError>.Failure { error } => match move error {
+      JsException thrown => true _ => false
+    }
+    _ => false
+  }
+  let bigintPending = unsafe exceptions.take(rt)
+  run Testing.expect(bigintError && unsafe isTypeError(ctx, bigintPending)
+    && unsafe rc(node) == before && unsafe rc(reference(bigintObject)) == 1,
+    "Number rejects bigint without rounding and consumes intermediate primitive")
+  unsafe gc.release(&mut hooks, rt, bigintPending)
+  let negative = run Strings.fromLatin1(b" -0 ") |> Effect.provideMut<Allocator>(&mut memory)
+  let numericObject = run unsafe cases.make(&mut hooks, &observer, ctx, 0, negative) |> Effect.provideMut<Allocator>(&mut memory)
+  let zero = run unsafe coercion.toNumber(&mut hooks, ctx, numericObject) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(f64.toBits(zero.numericValue()) == 0x8000000000000000, "object path reuses signed-zero primitive parser")
+  unsafe gc.release(&mut hooks, rt, numericObject) unsafe gc.release(&mut hooks, rt, negative)
+  unsafe gc.release(&mut hooks, rt, bigintObject) unsafe gc.release(&mut hooks, rt, bigint)
+  unsafe gc.release(&mut hooks, rt, symbolObject) unsafe gc.release(&mut hooks, rt, symbol)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx) run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observer.stats().usedBytes == 0 && observer.stats().allocationCount == 0, "object wrapper teardown ledger is empty")
+}
+
+test effect fn callbackMutationAndCycleCollectionCannotInvalidateProtocolLoans() -> ()
+  ! OutOfMemoryError | StringLengthError | JsException | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider()) let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe runtime.allocateContextStorage(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run unsafe fixture.register(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make() hooks.collect = true
+  run unsafe fixture.prepareErrors(&mut hooks, &observer, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+  let object = run unsafe fixture.object(&mut hooks, &observer, ctx, 1) |> Effect.provideMut<Allocator>(&mut memory)
+  let replacement = run unsafe fixture.closure(&mut hooks, &observer, ctx, true, 41, 0, Value.Int { value: 72 }, 0, Value.Undefined)
+    |> Effect.provideMut<Allocator>(&mut memory)
+  run unsafe fixture.property(&mut hooks, rt, object, atoms.JS_ATOM_toString, Value.Undefined, false) |> Effect.provideMut<Allocator>(&mut memory)
+  // The closure captures its receiver, forming a real collectible reference cycle.
+  let mutator = run unsafe fixture.closure(&mut hooks, &observer, ctx, true, 21, 3, object, atoms.JS_ATOM_toString, replacement)
+    |> Effect.provideMut<Allocator>(&mut memory)
+  run unsafe fixture.property(&mut hooks, rt, object, atoms.JS_ATOM_valueOf, mutator, false) |> Effect.provideMut<Allocator>(&mut memory)
+  unsafe gc.release(&mut hooks, rt, replacement) unsafe gc.release(&mut hooks, rt, mutator)
+  let output = run unsafe coercion.toPrimitiveFree(&mut hooks, ctx, object, 1) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(output.numericValue() == 72.0 && hooks.eventCount == 2 && hooks.events[0] == 21 && hooks.events[1] == 41,
+    "second lookup sees callback mutation, not a stale payload or prefetched method")
+  unsafe gc.release(&mut hooks, rt, output)
+  run unsafe gc.collect(&mut hooks, rt, true) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(hooks.finalizedCount == 3, "receiver/function cycle and replacement are collected exactly once")
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx) run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observer.stats().usedBytes == 0 && observer.stats().allocationCount == 0, "reentrant collector fixture leaves no storage")
+}
+
+test effect fn dispatchAndStringAllocationFailuresConsumeEveryTemporaryOwner() -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException | AssertionError<'static> {
+  let mut attempt: usize = 0 let mut sawFailure = false let mut sawSuccess = false
+  while attempt < 8 && !sawSuccess {
+    let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider()) let observer = run memory.observe()
+    let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+    let ctx = run unsafe runtime.allocateContextStorage(rt) |> Effect.provideMut<Allocator>(&mut memory)
+    run unsafe fixture.register(rt) |> Effect.provideMut<Allocator>(&mut memory)
+    let mut hooks = Hooks.make()
+    run unsafe fixture.prepareErrors(&mut hooks, &observer, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+    let object = run unsafe cases.make(&mut hooks, &observer, ctx, 23, Value.Int { value: 12345 }) |> Effect.provideMut<Allocator>(&mut memory)
+    let mut fault = FaultAllocator { parent: move memory, remaining: attempt }
+    // Number-hint exercises a real native allocation in valueOf; String-hint
+    // allocates the primitive result after ToPrimitive has released its duplicate.
+    let outcome = run Effect.result(unsafe coercion.toNumberFree(&mut hooks, ctx, unsafe object.retained())) |> Effect.provideMut<Allocator>(&mut fault)
+    match move outcome {
+      Result<Value, OutOfMemoryError | JsException | StringLengthError>.Success { value } => {
+        sawSuccess = true run Testing.expect(value.numericValue() == 12345.0, "callback allocation eventually succeeds")
+        unsafe gc.release(&mut hooks, rt, value)
+      }
+      Result<Value, OutOfMemoryError | JsException | StringLengthError>.Failure { error } => {
+        match move error {
+          OutOfMemoryError allocation => { sawFailure = true }
+          JsException thrown => { fail move thrown }
+          StringLengthError length => { fail move length }
+        }
+      }
+    }
+    run Testing.expect(unsafe rc(reference(object)) == 1, "call failure releases method and consuming receiver exactly once")
+    fault.remaining = 0
+    let stringResult = run Effect.result(unsafe coercion.toStringFree(&mut hooks, ctx, unsafe object.retained())) |> Effect.provideMut<Allocator>(&mut fault)
+    let failed = match move stringResult {
+      Result<Value, OutOfMemoryError | JsException | StringLengthError | BigIntError>.Failure { error } => match move error {
+        OutOfMemoryError allocation => true _ => false
+      }
+      _ => false
+    }
+    run Testing.expect(failed && unsafe rc(reference(object)) == 1, "post-dispatch primitive formatting OOM frees duplicate object and primitive")
+    unsafe gc.release(&mut hooks, rt, object)
+    unsafe gc.releaseHeader(&mut hooks, rt, ctx) run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut fault)
+    run Testing.expect(observer.stats().usedBytes == 0 && observer.stats().allocationCount == 0, "fault path teardown ledger is empty")
+    attempt = attempt + 1
+  }
+  run Testing.expect(sawFailure && sawSuccess, "fault sweep reaches failure and complete successful operation")
+}
+
+test effect fn exoticObjectResultAndThrownObjectKeepSourceFinalizerOrder() -> ()
+  ! OutOfMemoryError | StringLengthError | JsException | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider()) let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe runtime.allocateContextStorage(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run unsafe fixture.register(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make()
+  run unsafe fixture.prepareErrors(&mut hooks, &observer, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+  let leaf = run unsafe fixture.object(&mut hooks, &observer, ctx, 99) |> Effect.provideMut<Allocator>(&mut memory)
+  let object = run unsafe cases.make(&mut hooks, &observer, ctx, 0, leaf) |> Effect.provideMut<Allocator>(&mut memory)
+  unsafe gc.release(&mut hooks, rt, leaf) hooks.clear()
+  let rejected = run Effect.result(unsafe coercion.toPrimitiveFree(&mut hooks, ctx, object, 2)) |> Effect.provideMut<Allocator>(&mut memory)
+  let objectError = match move rejected {
+    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => match move error {
+      JsException thrown => true _ => false
+    }
+    _ => false
+  }
+  let rejectedPending = unsafe exceptions.take(rt)
+  run Testing.expect(objectError && unsafe isTypeError(ctx, rejectedPending) && !hooks.finalizedWithPending
+    && hooks.finalizedCount == 8 && hooks.finalized[0] == 1 && hooks.finalized[7] == 99,
+    "exotic nonprimitive failure frees receiver then returned object's last owner before installing the error")
+  unsafe gc.release(&mut hooks, rt, rejectedPending)
+  let thrown = run unsafe fixture.object(&mut hooks, &observer, ctx, 98) |> Effect.provideMut<Allocator>(&mut memory)
+  let throwing = run unsafe cases.make(&mut hooks, &observer, ctx, 6, thrown) |> Effect.provideMut<Allocator>(&mut memory)
+  unsafe gc.release(&mut hooks, rt, thrown) hooks.clear()
+  let failed = run Effect.result(unsafe coercion.toPrimitiveFree(&mut hooks, ctx, throwing, 1)) |> Effect.provideMut<Allocator>(&mut memory)
+  let pendingFailure = match move failed {
+    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => match move error {
+      JsException marker => true _ => false
+    }
+    _ => false
+  }
+  let pending = unsafe exceptions.take(rt)
+  run Testing.expect(pendingFailure && pending.isObject() && unsafe rc(reference(pending)) == 1,
+    "getter's arbitrary object exception survives destruction of every captured and receiver owner")
+  let before = hooks.finalizedCount
+  unsafe gc.release(&mut hooks, rt, pending)
+  run Testing.expect(hooks.finalizedCount == before + 1 && hooks.finalized[before] == 98,
+    "pending exception alone owns the thrown object until explicitly taken and released")
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx) run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observer.stats().usedBytes == 0 && observer.stats().allocationCount == 0, "object failure finalizers leave zero ledger")
+}
+
+test effect fn getterAllocationFailureAndPrimitivePassthroughRetainExactOwnership() -> ()
+  ! OutOfMemoryError | StringLengthError | JsException | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider()) let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe runtime.allocateContextStorage(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run unsafe fixture.register(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make()
+  run unsafe fixture.prepareErrors(&mut hooks, &observer, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+  let object = run unsafe fixture.object(&mut hooks, &observer, ctx, 1) |> Effect.provideMut<Allocator>(&mut memory)
+  run unsafe cases.getter(&mut hooks, &observer, ctx, object, atoms.JS_ATOM_Symbol_toPrimitive, 10, 4, Value.Null)
+    |> Effect.provideMut<Allocator>(&mut memory)
+  let text = run Strings.fromLatin1(b"borrowed-primitive") |> Effect.provideMut<Allocator>(&mut memory)
+  let mut fault = FaultAllocator { parent: move memory, remaining: 0 }
+  let failed = run Effect.result(unsafe coercion.toPrimitiveFree(&mut hooks, ctx, unsafe object.retained(), 1))
+    |> Effect.provideMut<Allocator>(&mut fault)
+  let allocationFailure = match move failed {
+    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => match move error {
+      OutOfMemoryError allocation => true _ => false
+    }
+    _ => false
+  }
+  run Testing.expect(allocationFailure && unsafe rc(reference(object)) == 1 && hooks.eventCount == 1,
+    "failing getter releases function owner and consumes only the passed receiver owner")
+  hooks.clear()
+  let alias = run unsafe coercion.toPrimitive(&mut hooks, ctx, text, 0) |> Effect.provideMut<Allocator>(&mut fault)
+  run Testing.expect(unsafe rc(stringReference(text)) == 2 && hooks.eventCount == 0, "borrowed primitive path retains without any dispatch or allocation")
+  let transferred = run unsafe coercion.toPrimitiveFree(&mut hooks, ctx, alias, 18) |> Effect.provideMut<Allocator>(&mut fault)
+  run Testing.expect(unsafe rc(stringReference(text)) == 2 && Strings.equal(transferred, text), "consuming primitive path transfers without a redundant retain")
+  let sentinel = run unsafe coercion.toPrimitiveFree(&mut hooks, ctx, Value.Exception, 2) |> Effect.provideMut<Allocator>(&mut fault)
+  run Testing.expect(sentinel.tag() == 6 && !unsafe exceptions.has(rt), "internal Exception remains a legal nonobject passthrough, not a fabricated callback exception")
+  unsafe gc.release(&mut hooks, rt, transferred) unsafe gc.release(&mut hooks, rt, text)
+  unsafe gc.release(&mut hooks, rt, object)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx) run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut fault)
+  run Testing.expect(observer.stats().usedBytes == 0 && observer.stats().allocationCount == 0, "getter OOM and primitive passthrough leave zero ledger")
+}
+
+test effect fn ordinaryConversionFailureInstallsExceptionBeforeReceiverFinalization() -> ()
+  ! OutOfMemoryError | StringLengthError | JsException | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider()) let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe runtime.allocateContextStorage(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run unsafe fixture.register(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make()
+  run unsafe fixture.prepareErrors(&mut hooks, &observer, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+  let object = run unsafe fixture.object(&mut hooks, &observer, ctx, 17) |> Effect.provideMut<Allocator>(&mut memory)
+  let failed = run Effect.result(unsafe coercion.toPrimitiveFree(&mut hooks, ctx, object, 1))
+    |> Effect.provideMut<Allocator>(&mut memory)
+  drop failed
+  let pending = unsafe exceptions.take(rt)
+  let observed = hooks.finalizedCount == 1 && hooks.finalized[0] == 17
+    && hooks.finalizedWithPending && unsafe isTypeError(ctx, pending)
+  unsafe gc.release(&mut hooks, rt, pending)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx) run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observed, "ordinary ToPrimitive failure installs the pending exception before consuming the receiver")
+  run Testing.expect(observer.stats().usedBytes == 0 && observer.stats().allocationCount == 0, "throwing coercion finalization releases every owner")
+}

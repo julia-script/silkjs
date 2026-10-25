@@ -1,0 +1,196 @@
+//! Borrowed membership and typeof kernels, quickjs.c:8167-8264,16171-16195,
+//! 16252-16317. apply consumes both distinct slots on every outcome, materializing
+//! errors before releasing their owners. No payload loan crosses host dispatch.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.pointer { Pointer }
+import runtime_memory { AllocationObserver }
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types { ObjectData, ShapeData, RuntimeState, FrameSlots, NativeErrorKind }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_coercion_host { CoercionHooks }
+import js_call_host { CallHooks }
+import js_prototype_host { PrototypeHooks }
+import js_interrupt_host { InterruptHooks }
+import js_property_host { OwnPropertyHooks, HasPropertyHooks }
+import js_coercions as coercions
+import js_property_queries as queries
+import js_prototypes as prototypes
+import js_interrupts as interrupts
+import js_bound_functions as bound
+import js_primitives as primitives
+import js_class_data as classes
+import js_atom_data as atoms
+import js_exceptions { JsException }
+import js_string_types { StringLengthError }
+import js_bigint { BigIntError }
+
+pub enum Operation { In, InstanceOf }
+fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+fn reference(value: Value) -> *mut HeapHeader {
+  return match value { Value.Object { reference } => reference _ => invariant() }
+}
+unsafe effect fn chain<H: HeapHooks + PrototypeHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, value: Value, prototype: Value) -> bool
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  let wanted = reference(prototype)
+  let mut current = reference(value)
+  while true {
+    let anchor = ()
+    let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, current)
+    let exotic = object.isExotic && !object.fastArray
+    let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, object.shape)
+    let next = shape.prototype
+    drop shape drop object
+    if Pointer.isNull<HeapHeader>(next) {
+      if !exotic { return false }
+      let borrowed = Value.Object { reference: current }
+      let mut cursor = unsafe borrowed.retained()
+      while true {
+        // getPrototypeFree consumes even when the exotic callback throws.
+        cursor = run unsafe prototypes.getPrototypeFree(&mut hooks, context, cursor)
+        if match cursor { Value.Null => true _ => false } { return false }
+        if Pointer.address(reference(cursor)) == Pointer.address(wanted) {
+          unsafe gc.release(&mut hooks, rt, cursor) return true
+        }
+        // Source polls only after a nonnull, nonmatching slow-path successor.
+        let polled = run Effect.result(unsafe interrupts.poll(&mut hooks, memory, context))
+        match move polled {
+          Result<(), JsException>.Success { .. } => ()
+          Result<(), JsException>.Failure { error } => {
+            unsafe gc.release(&mut hooks, rt, cursor) fail move error
+          }
+        }
+      }
+    }
+    current = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(next)
+    if Pointer.address(current) == Pointer.address(wanted) { return true }
+  }
+}
+pub unsafe effect fn ordinaryIsInstanceOf<H: HeapHooks + CoercionHooks + CallHooks + PrototypeHooks + InterruptHooks>(
+  hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, value: Value, constructor: Value) -> bool
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  if !unsafe hooks.isCallable(context, constructor) { return false }
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(constructor))
+  let boundFunction = object.classId == classes.JS_CLASS_BOUND_FUNCTION drop object
+  if boundFunction { return run unsafe isInstanceOf(&mut hooks, memory, context, value, unsafe bound.target(constructor)) }
+  if !value.isObject() { return false }
+  let prototype = run unsafe hooks.getProperty(context, constructor, atoms.JS_ATOM_prototype)
+  let rt = unsafe runtime.contextRuntime(context)
+  let result = run Effect.result(unsafe checkPrototype(&mut hooks, memory, context, value, prototype))
+  unsafe gc.release(&mut hooks, rt, prototype)
+  return match move result {
+    Result<bool, OutOfMemoryError | JsException>.Success { value: found } => found
+    Result<bool, OutOfMemoryError | JsException>.Failure { error } => { fail move error }
+  }
+}
+unsafe effect fn checkPrototype<H: HeapHooks + CoercionHooks + PrototypeHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, value: Value, prototype: Value) -> bool
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  if !prototype.isObject() {
+    return run unsafe hooks.throwError(context, NativeErrorKind.Type, b"operand 'prototype' property is not an object")
+  }
+  return run unsafe chain(&mut hooks, memory, context, value, prototype)
+}
+pub unsafe effect fn isInstanceOf<H: HeapHooks + CoercionHooks + CallHooks + PrototypeHooks + InterruptHooks>(
+  hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, value: Value, constructor: Value) -> bool
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  if !constructor.isObject() {
+    return run unsafe hooks.throwError(context, NativeErrorKind.Type, b"invalid 'instanceof' right operand")
+  }
+  let method = run unsafe hooks.getProperty(context, constructor, atoms.JS_ATOM_Symbol_hasInstance)
+  let rt = unsafe runtime.contextRuntime(context)
+  let absent = match method { Value.Undefined => true Value.Null => true _ => false }
+  if !absent {
+    let mut argument = value
+    let arguments = FrameSlots.Borrowed { data: Pointer.fromMutRef<Value>(&mut argument), length: 1 }
+    let called = run Effect.result(unsafe hooks.callArguments(context, method, constructor, &arguments))
+    unsafe gc.release(&mut hooks, rt, method)
+    let output = match move called {
+      Result<Value, OutOfMemoryError | JsException>.Success { value: result } => result
+      Result<Value, OutOfMemoryError | JsException>.Failure { error } => { fail move error }
+    }
+    let truth = unsafe primitives.toBoolean(output)
+    unsafe gc.release(&mut hooks, rt, output)
+    if truth < 0 { fail JsException {} }
+    return truth != 0
+  }
+  unsafe gc.release(&mut hooks, rt, method)
+  if !unsafe hooks.isCallable(context, constructor) {
+    return run unsafe hooks.throwError(context, NativeErrorKind.Type, b"invalid 'instanceof' right operand")
+  }
+  return run unsafe ordinaryIsInstanceOf(&mut hooks, memory, context, value, constructor)
+}
+pub unsafe effect fn has<H: HeapHooks + CoercionHooks + OwnPropertyHooks + HasPropertyHooks>(hooks: &mut H,
+  context: *mut HeapHeader, key: Value, object: Value) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  if !object.isObject() { return run unsafe hooks.throwError(context, NativeErrorKind.Type, b"invalid 'in' operand") }
+  let atom = run unsafe coercions.valueToAtom(&mut hooks, context, key)
+  let result = run Effect.result(unsafe queries.hasProperty(&mut hooks, context, object, atom))
+  let rt = unsafe runtime.contextRuntime(context)
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+  state.atoms.release(atom) drop state
+  return match move result {
+    Result<bool, OutOfMemoryError | JsException>.Success { value } => value
+    Result<bool, OutOfMemoryError | JsException>.Failure { error } => { fail move error }
+  }
+}
+/// Returns a borrowed predefined atom; never retains, releases or coerces input.
+pub unsafe fn typeOf<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader, value: Value) -> u32 {
+  match value {
+    Value.ShortBigInt { .. } => { return atoms.JS_ATOM_bigint }
+    Value.BigInt { .. } => { return atoms.JS_ATOM_bigint }
+    Value.Int { .. } => { return atoms.JS_ATOM_number }
+    Value.Float64 { .. } => { return atoms.JS_ATOM_number }
+    Value.Undefined => { return atoms.JS_ATOM_undefined }
+    Value.Bool { .. } => { return atoms.JS_ATOM_boolean }
+    Value.String { .. } => { return atoms.JS_ATOM_string }
+    Value.Rope { .. } => { return atoms.JS_ATOM_string }
+    Value.Object { reference: node } => {
+      let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+      let htmlDda = object.isHtmlDda drop object
+      if htmlDda { return atoms.JS_ATOM_undefined }
+      if unsafe hooks.isCallable(context, value) { return atoms.JS_ATOM_function }
+      return atoms.JS_ATOM_object
+    }
+    Value.Null => { return atoms.JS_ATOM_object }
+    Value.Symbol { .. } => { return atoms.JS_ATOM_symbol }
+    _ => { return atoms.JS_ATOM_unknown }
+  }
+}
+unsafe effect fn materialize<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  error: OutOfMemoryError | StringLengthError | BigIntError | JsException) -> bool ! JsException ? &mut Allocator {
+  match move error {
+    OutOfMemoryError allocation => { return run unsafe hooks.throwOutOfMemory(context) }
+    StringLengthError length => { return run unsafe hooks.throwError(context, NativeErrorKind.Internal, b"string too long") }
+    BigIntError impossible => invariant()
+    JsException signal => { fail move signal }
+  }
+}
+pub unsafe effect fn apply<H: HeapHooks + CoercionHooks + CallHooks + PrototypeHooks + InterruptHooks + OwnPropertyHooks + HasPropertyHooks>(
+  hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, left: &mut Value, right: &mut Value, operation: Operation) -> ()
+  ! JsException ? &mut Allocator {
+  let a = left.* let b = right.* left.* = Value.Undefined right.* = Value.Undefined
+  let attempted = run Effect.result(unsafe evaluate(&mut hooks, memory, context, a, b, operation))
+  let result = match move attempted {
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { value } => Result<bool, JsException>.Success { value: value }
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => run Effect.result(unsafe materialize(&mut hooks, context, move error))
+  }
+  let rt = unsafe runtime.contextRuntime(context)
+  unsafe gc.release(&mut hooks, rt, a) unsafe gc.release(&mut hooks, rt, b)
+  match move result {
+    Result<bool, JsException>.Success { value } => { left.* = Value.Bool { value: value } }
+    Result<bool, JsException>.Failure { error } => { fail move error }
+  }
+}
+unsafe effect fn evaluate<H: HeapHooks + CoercionHooks + CallHooks + PrototypeHooks + InterruptHooks + OwnPropertyHooks + HasPropertyHooks>(
+  hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, left: Value, right: Value, operation: Operation) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  if operation == Operation.In { return run unsafe has(&mut hooks, context, left, right) }
+  return run unsafe isInstanceOf(&mut hooks, memory, context, left, right)
+}

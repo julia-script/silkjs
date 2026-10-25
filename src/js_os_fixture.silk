@@ -1,0 +1,173 @@
+//! Real Session OS failure sweep: native descriptors/children and engine allocations
+//! must return to baseline after every independently injected allocation ordinal.
+//! In-memory modules use URI names; filesystem names require realpath metadata.
+import silk.allocator { Allocator, OutOfMemoryError, SystemAllocator }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.layout { Layout }
+import silk.pointer { Pointer }
+import silk.usize
+import silk.writer { Writer, WriterError }
+import silk.os_writer { StdoutWriter }
+import byte_buffer { ByteBuffer }
+import runtime_memory { RuntimeAllocator }
+import js_atomics_native { WaiterDomain, SynchronizationError }
+import js_runtime_registry { ClassIdAllocator }
+import js_libc_process { Process }
+import js_value { Value }
+import js_core_types { FrameSlots }
+import js_exceptions { JsException }
+import js_exceptions as exceptions
+import js_gc as gc
+import js_libc as libc
+import js_libc { Session }
+import js_call_host { CallHooks }
+import js_eval as evaluation
+import js_os_platform as platform
+import js_std_native as native
+import silk.i32
+struct FaultAllocator { parent:RuntimeAllocator<SystemAllocator>, remaining:usize, failed:bool }
+impl Allocator for FaultAllocator {
+  effect fn allocate(self:&mut Self,layout:Layout)->Intrinsic.Allocation ! OutOfMemoryError {
+    if self.remaining==0 { self.remaining=usize.MAX self.failed=true return run Allocator.outOfMemory() }
+    if self.remaining!=usize.MAX { self.remaining=self.remaining-1 }
+    return run Allocator.allocate(move layout) |> Effect.provideMut<Allocator>(&mut self.parent)
+  }
+}
+unsafe extern "C" fn fcntl(fd:i32,command:i32,...)->i32
+fn descriptors()->u32 { let mut count:u32=0 let mut fd:i32=0 while fd<1024 { if unsafe fcntl(fd,1)>=0 { count=count+1 } fd=fd+1 } return count }
+fn diagnostic(operation:usize,ordinal:usize)->() {
+  let mut bytes:[u8;128]=[0;128]
+  let count=unsafe native.snprintf(Pointer.fromMutRef(&mut bytes[0]),128,Pointer.fromRef(&b"os fixture operation=%zu ordinal=%zu\n\0"[0]),operation,ordinal)
+  if count>0 && count<128 { let ignored=unsafe platform.write(2,Pointer.fromRef(&bytes[0]),i32.toUsize(count)) }
+}
+fn source(index:usize)->&'static [u8] {
+  return match index {
+    0=>b"(()=>{osFaultFd=os.open('/dev/null',os.O_RDWR);let fd=osFaultFd;if(fd<0)throw Error('open');try{let b=new ArrayBuffer(8);if(os.write(fd,b,0,8)!==8||os.read(fd,b,0,8)!==0)throw Error('io')}finally{os.close(fd);osFaultFd=-1}return true})"
+    1=>b"(()=>{osFaultPipe=os.pipe();let p=osFaultPipe;if(!p)throw Error('pipe');try{let b=new Uint8Array([5,6,7]);if(os.write(p[1],b.buffer,0,3)!==3)throw Error('write');let r=new Uint8Array(3);if(os.read(p[0],r.buffer,0,3)!==3||r[2]!==7)throw Error('read')}finally{os.close(p[0]);os.close(p[1]);osFaultPipe=null}return true})"
+    2=>b"(()=>{let s=os.stat('.');if(s[1]!==0||(s[0].mode&os.S_IFMT)!==os.S_IFDIR)throw Error('stat');return true})"
+    3=>b"(()=>{let r=os.readdir('.');if(r[1]!==0||!r[0].includes('.'))throw Error('readdir');return true})"
+    4=>b"(()=>{let r=os.getcwd();if(r[1]!==0||r[0][0]!=='/')throw Error('getcwd');let p=os.realpath('.');if(p[1]!==0||p[0]!==r[0])throw Error('realpath');return true})"
+    5=>b"(()=>{if(os.exec(['/bin/sh','-c','test \"$X\" = value || exit 98; exit 19'],{env:{X:'value'},cwd:'.',usePath:false})!==19)throw Error('exec');return true})"
+    6=>b"(()=>{osFaultFd=os.open('/dev/zero',os.O_RDONLY);let fd=osFaultFd;if(fd<0)throw Error('open');try{let b=new SharedArrayBuffer(16);new Uint8Array(b).fill(255);if(os.read(fd,b,0,16)!==16||new Uint8Array(b)[15]!==0)throw Error('shared read')}finally{os.close(fd);osFaultFd=-1}return true})"
+    7=>b"(()=>{osFaultFd=os.open('/dev/null',os.O_WRONLY);let fd=osFaultFd;if(fd<0)throw Error('open');try{let b=new SharedArrayBuffer(8);if(os.write(fd,b,0,8)!==8)throw Error('shared write')}finally{os.close(fd);osFaultFd=-1}return true})"
+    8=>b"(()=>{if(os.symlink('.', 'os-fault-link')!==0)throw Error('symlink');try{let r=os.readlink('os-fault-link');if(r[0]!=='.'||r[1]!==0)throw Error('readlink');if((os.lstat('os-fault-link')[0].mode&os.S_IFMT)!==os.S_IFLNK)throw Error('lstat')}finally{os.remove('os-fault-link')}return true})"
+    9=>b"(()=>{let p=os.waitpid(-123456,0);if(p[0]>=0||p[1]!==0)throw Error('waitpid');return true})"
+    _=>Intrinsic.trap("os fault operation")
+  }
+}
+pub effect fn main()->i32 ! OutOfMemoryError|SynchronizationError|WriterError {
+  let mut allocator=FaultAllocator { parent:run RuntimeAllocator.make(Allocator.systemAllocatorProvider()),remaining:usize.MAX,failed:false }
+  let memory=run allocator.parent.observe()
+  let namespace=run ClassIdAllocator.make() |> Effect.provideMut<Allocator>(&mut allocator)
+  let process=run Process.make(&namespace)
+  let domain=run WaiterDomain.make() |> Effect.provideMut<Allocator>(&mut allocator)
+  let baseline=allocator.parent.stats() let nativeBaseline=descriptors()
+  // A PTY invocation exercises shared terminal state across complete Session
+  // teardown. The second call snapshots raw mode; source restores that latest
+  // snapshot at process exit rather than the original cooked mode.
+  if unsafe platform.isatty(0)!=0 {
+    let mut sessionIndex:usize=0
+    while sessionIndex<2 {
+      let opened=run Effect.result(unsafe Session.open(&memory,domain.handle(),&process,false)) |> Effect.provideMut<Allocator>(&mut allocator)
+      let mut active=match move opened { Result.Success { value }=>move value Result.Failure { .. }=>{ return 20 } }
+      let evaluated=run Effect.result(unsafe libc.evalBuffer(&mut active.engine,active.context,b"import * as os from 'os'; os.ttySetRaw(0);",b"os-fixture:terminal",1)) |> Effect.provideMut<Allocator>(&mut allocator)
+      let mut success=false
+      match move evaluated { Result<Value,OutOfMemoryError|JsException>.Success { value }=>{ success=true unsafe gc.release(&mut active.engine,active.runtime,value) } Result<Value,OutOfMemoryError|JsException>.Failure { .. }=>() }
+      if !success { run unsafe libc.dumpError(&mut active.engine,active.context) |> Effect.provideMut<Allocator>(&mut allocator) }
+      run unsafe active.close() |> Effect.provideMut<Allocator>(&mut allocator)
+      if !success { return 21 }
+      if allocator.parent.stats().usedBytes!=baseline.usedBytes || descriptors()!=nativeBaseline { return 22 }
+      sessionIndex=sessionIndex+1
+    }
+    drop process drop domain drop namespace
+    if allocator.parent.stats().usedBytes!=0 || allocator.parent.stats().allocationCount!=0 { return 23 }
+    let marker=b"TERMINAL DOMAIN OK\n"
+    let count=unsafe platform.write(1,Pointer.fromRef(&marker[0]),marker.length)
+    if count!=19 { return 24 }
+    return 0
+  }
+  let mut attempts:u32=0 let mut injected:u32=0 let mut operation:usize=0
+  while operation<12 {
+    let mut ordinal:usize=0
+    while true {
+      allocator.failed=false
+      if operation==11 { allocator.remaining=ordinal }
+      let opened=run Effect.result(unsafe Session.open(&memory,domain.handle(),&process,false)) |> Effect.provideMut<Allocator>(&mut allocator)
+      if operation==11 { allocator.remaining=usize.MAX }
+      let mut clean=false
+      match move opened {
+        Result.Success { value:session }=>{
+          let mut active=move session
+          if operation==11 { clean=true } else {
+            if operation==10 { allocator.remaining=ordinal }
+            let imported=run Effect.result(unsafe libc.evalBuffer(&mut active.engine,active.context,b"import * as module from 'os'; globalThis.os=module;",b"os-fixture:import",1)) |> Effect.provideMut<Allocator>(&mut allocator)
+            if operation==10 { allocator.remaining=usize.MAX }
+            let mut importedOk=false
+            match move imported { Result<Value,OutOfMemoryError|JsException>.Success { value }=>{ importedOk=true unsafe gc.release(&mut active.engine,active.runtime,value) } Result<Value,OutOfMemoryError|JsException>.Failure { .. }=>() }
+            if operation==10 { clean=importedOk } else {
+              if !importedOk {
+                diagnostic(operation,ordinal)
+                run unsafe libc.dumpError(&mut active.engine,active.context) |> Effect.provideMut<Allocator>(&mut allocator)
+                run unsafe active.close() |> Effect.provideMut<Allocator>(&mut allocator) return 2
+              }
+              let ownsDescriptors=operation==0 || operation==1 || operation==6 || operation==7
+              if ownsDescriptors {
+                // OP_put_var updates an initialized mutable lexical cell through
+                // js_var_refs.replace; replacing Int/Null needs no allocation.
+                // Preexisting lexical slots retain only descriptors published by
+                // the JS API. Unpublished native failures remain ledger failures.
+                let initialized=run Effect.result(unsafe evaluation.evaluate(&mut active.engine,&memory,active.context,b"let osFaultFd=-1;let osFaultPipe=null;",b"os-fault-owners.js",0)) |> Effect.provideMut<Allocator>(&mut allocator)
+                match move initialized { Result<Value,JsException>.Success { value }=>{ unsafe gc.release(&mut active.engine,active.runtime,value) } Result<Value,JsException>.Failure { .. }=>{ run unsafe active.close() |> Effect.provideMut<Allocator>(&mut allocator) return 5 } }
+              }
+              let prepared=run Effect.result(unsafe evaluation.evaluate(&mut active.engine,&memory,active.context,source(operation),b"os-fault.js",0)) |> Effect.provideMut<Allocator>(&mut allocator)
+              let function=match move prepared { Result<Value,JsException>.Success { value }=>value Result<Value,JsException>.Failure { .. }=>{ run unsafe active.close() |> Effect.provideMut<Allocator>(&mut allocator) return 3 } }
+              let mut slot=Value.Undefined let args=FrameSlots.Borrowed { data:Pointer.fromMutRef(&mut slot),length:0 }
+              allocator.remaining=ordinal
+              let called=run Effect.result(unsafe active.engine.callArguments(active.context,function,Value.Undefined,&args)) |> Effect.provideMut<Allocator>(&mut allocator)
+              allocator.remaining=usize.MAX
+              match move called { Result<Value,OutOfMemoryError|JsException>.Success { value }=>{ clean=match value { Value.Bool { value:boolean }=>boolean _=>false } unsafe gc.release(&mut active.engine,active.runtime,value) } Result<Value,OutOfMemoryError|JsException>.Failure { .. }=>() }
+              unsafe gc.release(&mut active.engine,active.runtime,function)
+              if ownsDescriptors {
+                // Published raw FDs are user-owned, not ThreadState-owned. Even
+                // a JS finally call may hit the injected OOM before os.close.
+                // Cleanup runs outside injection and touches only our retained
+                // handles; it cannot conceal an unpublished production FD leak.
+                if unsafe exceptions.has(active.runtime) { unsafe gc.release(&mut active.engine,active.runtime,unsafe exceptions.take(active.runtime)) }
+                let cleaned=run Effect.result(unsafe evaluation.evaluate(&mut active.engine,&memory,active.context,b"if(osFaultFd>=0){os.close(osFaultFd);osFaultFd=-1}if(osFaultPipe){os.close(osFaultPipe[0]);os.close(osFaultPipe[1]);osFaultPipe=null}",b"os-fault-cleanup.js",0)) |> Effect.provideMut<Allocator>(&mut allocator)
+                match move cleaned { Result<Value,JsException>.Success { value }=>{ unsafe gc.release(&mut active.engine,active.runtime,value) } Result<Value,JsException>.Failure { .. }=>{ diagnostic(operation,ordinal) run unsafe libc.dumpError(&mut active.engine,active.context) |> Effect.provideMut<Allocator>(&mut allocator) run unsafe active.close() |> Effect.provideMut<Allocator>(&mut allocator) return 95 } }
+              }
+            }
+          }
+          if unsafe exceptions.has(active.runtime) { unsafe gc.release(&mut active.engine,active.runtime,unsafe exceptions.take(active.runtime)) }
+          run unsafe active.close() |> Effect.provideMut<Allocator>(&mut allocator)
+        }
+        Result.Failure { .. }=>{ if operation!=11 { return 4 } }
+      }
+      // Filesystem mutations are not transactions: OOM may prevent the JS
+      // finally block from running after symlink succeeds. The fixture owns
+      // this path and restores it between ordinals, not the production port.
+      if operation==8 {
+        let path=b"os-fault-link\0"
+        if unsafe platform.remove(Pointer.fromRef(&path[0]))!=0 && platform.errno()!=2 { return 94 }
+      }
+      attempts=attempts+1 if allocator.failed { injected=injected+1 }
+      let after=allocator.parent.stats()
+      if after.usedBytes!=baseline.usedBytes || after.allocationCount!=baseline.allocationCount { return 90 }
+      if descriptors()!=nativeBaseline { return 91 }
+      let mut status:i32=0
+      if unsafe platform.waitpid(-1,Pointer.fromMutRef(&mut status),1)>=0 || platform.errno()!=10 { return 93 }
+      if !allocator.failed { if !clean { return 92 } break }
+      ordinal=ordinal+1
+    }
+    operation=operation+1
+  }
+  drop process drop domain drop namespace
+  if allocator.parent.stats().usedBytes!=0 || allocator.parent.stats().allocationCount!=0 { return 99 }
+  let mut system=Allocator.systemAllocatorProvider() let mut out=ByteBuffer.make()
+  run out.writeU32(12) |> Effect.provideMut<Allocator>(&mut system)
+  run out.writeU32(attempts) |> Effect.provideMut<Allocator>(&mut system)
+  run out.writeU32(injected) |> Effect.provideMut<Allocator>(&mut system)
+  let mut writer=StdoutWriter.make() run Writer.writeAll(out.asSlice()) |> Effect.provideMut<Writer>(&mut writer)
+  return 0
+}

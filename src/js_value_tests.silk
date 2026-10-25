@@ -1,0 +1,288 @@
+import silk.allocator { Allocator, OutOfMemoryError, SystemAllocator }
+import silk.effect { Effect }
+import silk.f64
+import silk.layout { Layout }
+import silk.list { List }
+import silk.option { Option }
+import silk.ownership { Drop }
+import silk.pointer { Pointer }
+import silk.testing { AssertionError, Testing }
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_value { Value }
+import runtime_memory { RuntimeAllocator }
+
+effect fn expectNumber(input: f64, expectedTag: i32, expectedBits: u64) -> ()
+  ! AssertionError<'static> {
+  let value = Value.number(input)
+  run Testing.expect(Value.tag(&value) == expectedTag, "number representation tag")
+  run Testing.expect(Value.isNumber(&value), "numeric tag classification")
+  run Testing.expect(!Value.isBigInt(&value), "number is not a BigInt")
+  run Testing.expect(f64.toBits(Value.numericValue(&value)) == expectedBits, "exact numeric payload bits")
+  let hasReference = match Value.heapReference(&value) {
+    Option<*mut HeapHeader>.Some { value: _ } => true
+    Option<*mut HeapHeader>.None => false
+  }
+  run Testing.expect(!hasReference, "numbers have no heap reference")
+}
+
+test effect fn valueNumberIntegerBoundariesAndSignedZero() -> () ! AssertionError<'static> {
+  run expectNumber(0.0, 0, 0x0000000000000000)
+  run expectNumber(f64.fromBits(0x8000000000000000), 8, 0x8000000000000000)
+  run expectNumber(1.0, 0, 0x3ff0000000000000)
+  run expectNumber(-1.0, 0, 0xbff0000000000000)
+  run expectNumber(2147483647.0, 0, 0x41dfffffffc00000)
+  run expectNumber(-2147483648.0, 0, 0xc1e0000000000000)
+  run expectNumber(2147483648.0, 8, 0x41e0000000000000)
+  run expectNumber(-2147483649.0, 8, 0xc1e0000000200000)
+  run expectNumber(0.5, 8, 0x3fe0000000000000)
+  run expectNumber(-0.5, 8, 0xbfe0000000000000)
+  run expectNumber(f64.fromBits(0x41dfffffffbfffff), 8, 0x41dfffffffbfffff)
+  run expectNumber(f64.fromBits(0xc1dfffffffffffff), 8, 0xc1dfffffffffffff)
+  run expectNumber(9007199254740992.0, 8, 0x4340000000000000)
+}
+
+test effect fn valueNumberPreservesNonFiniteAndSubnormalBits() -> () ! AssertionError<'static> {
+  run expectNumber(f64.fromBits(0x0000000000000001), 8, 0x0000000000000001)
+  run expectNumber(f64.fromBits(0x8000000000000001), 8, 0x8000000000000001)
+  run expectNumber(f64.fromBits(0x7fefffffffffffff), 8, 0x7fefffffffffffff)
+  run expectNumber(f64.fromBits(0x7ff0000000000000), 8, 0x7ff0000000000000)
+  run expectNumber(f64.fromBits(0xfff0000000000000), 8, 0xfff0000000000000)
+  run expectNumber(f64.fromBits(0x7ff8000000000000), 8, 0x7ff8000000000000)
+  run expectNumber(f64.fromBits(0x7ff8000000000042), 8, 0x7ff8000000000042)
+  run expectNumber(f64.fromBits(0xfff8000000000001), 8, 0xfff8000000000001)
+}
+
+test effect fn valueImmediateTagsAndNonCoercingPredicates() -> () ! AssertionError<'static> {
+  // The expected codes are the independent quickjs.h tag contract, not native union indices.
+  let values = [
+    Value.Int { value: -2147483648 }, Value.Bool { value: true }, Value.Null,
+    Value.Undefined, Value.Uninitialized, Value.CatchOffset { offset: -123 },
+    Value.Exception, Value.ShortBigInt { value: -2147483648 }, Value.Float64 { value: 1.25 }
+  ]
+  let tags: [i32; 9] = [0, 1, 2, 3, 4, 5, 6, 7, 8]
+  let mut index: usize = 0
+  while index < values.length {
+    let value = values[index]
+    run Testing.expect(Value.tag(&value) == tags[index], "immediate QuickJS tag")
+    run Testing.expect(Value.isNumber(&value) == (index == 0 || index == 8), "only Int and Float64 are numbers")
+    run Testing.expect(Value.isBigInt(&value) == (index == 7), "short BigInt is a BigInt, not a number")
+    run Testing.expect(Value.isException(&value) == (index == 6), "exception sentinel only")
+    run Testing.expect(!Value.isString(&value) && !Value.isObject(&value), "immediate is neither string nor object")
+    let hasReference = match Value.heapReference(&value) {
+      Option<*mut HeapHeader>.Some { value: _ } => true
+      Option<*mut HeapHeader>.None => false
+    }
+    run Testing.expect(!hasReference, "immediate has no heap ownership")
+    let copied = unsafe Value.retained(value)
+    run Testing.expect(Value.tag(&copied) == tags[index], "retaining an immediate preserves its tag")
+    let requestsDestruction = unsafe Value.decrementReference(&copied)
+    run Testing.expect(!requestsDestruction, "immediate decrement never requests destruction")
+    index = index + 1
+  }
+  let minimum = Value.ShortBigInt { value: -2147483648 }
+  let maximum = Value.ShortBigInt { value: 2147483647 }
+  let minimumPayload = match minimum {
+    Value.ShortBigInt { value } => value
+    _ => 0
+  }
+  let maximumPayload = match maximum {
+    Value.ShortBigInt { value } => value
+    _ => 0
+  }
+  run Testing.expect(minimumPayload == -2147483648 && maximumPayload == 2147483647, "32-bit short BigInt endpoints")
+  let catchOffset = match values[5] {
+    Value.CatchOffset { offset } => offset
+    _ => 0
+  }
+  run Testing.expect(catchOffset == -123, "signed catch offset preserved")
+}
+
+unsafe fn referenceCount(header: *const HeapHeader) -> i32 {
+  let anchor = ()
+  let view = unsafe Pointer.borrow<(), HeapHeader>(&anchor, header)
+  return view.referenceCount
+}
+
+test effect fn valueHeapTagsAndReferenceExtraction() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let header = run HeapCell.allocate<u8>(HeapKind.Auxiliary, 17)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  // Borrowed tag views test metadata only; no tag view invents another owned reference.
+  let values = [
+    Value.BigInt { reference: header }, Value.Symbol { reference: header },
+    Value.String { reference: header }, Value.Rope { reference: header },
+    Value.Module { reference: header }, Value.FunctionBytecode { reference: header },
+    Value.Object { reference: header }
+  ]
+  let mut tags: [i32; 7] = [0; 7]
+  let mut classifications: [bool; 7] = [false; 7]
+  let mut references: [bool; 7] = [false; 7]
+  let mut index: usize = 0
+  while index < values.length {
+    let value = values[index]
+    tags[index] = Value.tag(&value)
+    classifications[index] = Value.isBigInt(&value) == (index == 0)
+      && Value.isString(&value) == (index == 2 || index == 3)
+      && Value.isObject(&value) == (index == 6)
+      && !Value.isNumber(&value) && !Value.isException(&value)
+    references[index] = match Value.heapReference(&value) {
+      Option<*mut HeapHeader>.Some { value: found } => Pointer.address<HeapHeader>(found) == Pointer.address<HeapHeader>(header)
+      Option<*mut HeapHeader>.None => false
+    }
+    index = index + 1
+  }
+  let count = unsafe referenceCount(header)
+  let reachedZero = unsafe HeapCell.decrement(header)
+  unsafe HeapCell.destroy<u8>(header)
+  let expected: [i32; 7] = [-9, -8, -7, -6, -3, -2, -1]
+  index = 0
+  while index < tags.length {
+    run Testing.expect(tags[index] == expected[index], "heap QuickJS tag")
+    run Testing.expect(classifications[index], "heap tag predicates do not conflate internal values")
+    run Testing.expect(references[index], "every negative tag extracts its exact reference")
+    index = index + 1
+  }
+  run Testing.expect(count == 1 && reachedZero, "metadata queries and Copy do not retain")
+}
+
+test effect fn valueStringSymbolAliasesRetainAndDecrementExplicitly() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let header = run HeapCell.allocate<u32>(HeapKind.String, 0x1f642)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let string = Value.String { reference: header }
+  let borrowed = string
+  let afterCopy = unsafe referenceCount(header)
+  let shared = unsafe Value.retained(borrowed)
+  let afterShared = unsafe referenceCount(header)
+  let symbol = unsafe Value.retained(Value.Symbol { reference: header })
+  let afterSymbol = unsafe referenceCount(header)
+  let firstZero = unsafe Value.decrementReference(&string)
+  let afterFirst = unsafe referenceCount(header)
+  let secondZero = unsafe Value.decrementReference(&shared)
+  let afterSecond = unsafe referenceCount(header)
+  let finalZero = unsafe Value.decrementReference(&symbol)
+  let afterFinal = unsafe referenceCount(header)
+  let anchor = ()
+  let stillAllocated = unsafe HeapCell.payload<u32, ()>(&anchor, header)
+  let payloadAfterZero = stillAllocated.*
+  drop stillAllocated
+  unsafe HeapCell.destroy<u32>(header)
+  run Testing.expect(afterCopy == 1 && afterShared == 2 && afterSymbol == 3, "only explicit retained aliases increase count")
+  run Testing.expect(!firstZero && !secondZero && finalZero, "only final owned reference requests destruction")
+  run Testing.expect(afterFirst == 2 && afterSecond == 1 && afterFinal == 0, "exact shared-reference decrements")
+  run Testing.expect(payloadAfterZero == 0x1f642, "zero count does not prematurely free storage")
+  run Testing.expect(Value.tag(&borrowed) == -7 && Value.tag(&symbol) == -8, "shared string/symbol storage keeps distinct tags")
+  run Testing.expect(Value.isString(&borrowed) && !Value.isString(&symbol), "symbol is not a string")
+}
+
+struct IdentityPayload {
+  prefix: [u8; 3],
+  words: [u64; 8]
+}
+
+// Keeps the single owned reference alive across all fallible container operations.
+// Entries in the container below are borrowed Copy aliases, not independent owners.
+struct IdentityOwner { header: *mut HeapHeader }
+impl Drop for IdentityOwner {
+  fn drop(self: &mut IdentityOwner) -> () {
+    if unsafe HeapCell.decrement(self.header) {
+      unsafe HeapCell.destroy<IdentityPayload>(self.header)
+    }
+  }
+}
+
+test effect fn heapCellsStayStableAcrossContainerGrowthAndTypedMutation() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let header = run HeapCell.allocate<IdentityPayload>(HeapKind.Object, IdentityPayload {
+    prefix: [7, 11, 13], words: [0x0123456789abcdef; 8]
+  }) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut owner = IdentityOwner { header: header }
+  let view = unsafe Pointer.borrow<IdentityOwner, HeapHeader>(&owner, header)
+  let base = Pointer.address<u8>(view.allocation)
+  let bytes = view.allocationBytes
+  let headerAddress = Pointer.address<HeapHeader>(header)
+  let initialHeader = view.referenceCount == 1 && view.mark == 0 && view.kind == HeapKind.Object
+    && Pointer.isNull<HeapHeader>(view.previous) && Pointer.isNull<HeapHeader>(view.next)
+  drop view
+  let initial = unsafe HeapCell.payload<IdentityPayload, IdentityOwner>(&owner, header)
+  let payloadAddress = Pointer.address<IdentityPayload>(Pointer.fromRef<IdentityPayload>(initial))
+  drop initial
+  let mut values = List<Value>.make()
+  run List<Value>.append(&mut values, Value.Object { reference: header })
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let firstCapacity = List<Value>.capacity(&values)
+  let mut index: usize = 0
+  while index < 1024 {
+    run List<Value>.append(&mut values, Value.Object { reference: header })
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    index = index + 1
+  }
+  run Testing.expect(List<Value>.capacity(&values) > firstCapacity, "container actually grows")
+  run Testing.expect(initialHeader, "new cell header has one reference and no GC membership")
+  run Testing.expect(headerAddress >= base && headerAddress + Layout.of<HeapHeader>().bytes <= base + bytes, "header lies within its recorded complete allocation")
+  run Testing.expect(payloadAddress >= base && payloadAddress + Layout.of<IdentityPayload>().bytes <= base + bytes, "typed payload lies within its recorded complete allocation")
+  let changed = unsafe HeapCell.payloadMut<IdentityPayload, IdentityOwner>(&mut owner, header)
+  changed.words[7] = 0xfedcba9876543210
+  drop changed
+  let aliases = List<Value>.asSlice(&values)
+  index = 0
+  while index < aliases.length {
+    let aliasHeader = match Value.heapReference(&aliases[index]) {
+      Option<*mut HeapHeader>.Some { value } => value
+      Option<*mut HeapHeader>.None => {
+        run Testing.expect(false, "object alias must retain its heap-reference representation")
+        return
+      }
+    }
+    run Testing.expect(Pointer.address<HeapHeader>(aliasHeader) == headerAddress, "header identity survives container growth")
+    let payload = unsafe HeapCell.payload<IdentityPayload, IdentityOwner>(&owner, aliasHeader)
+    run Testing.expect(Pointer.address<IdentityPayload>(Pointer.fromRef<IdentityPayload>(payload)) == payloadAddress, "payload identity survives container growth")
+    run Testing.expect(payload.prefix[0] == 7 && payload.prefix[2] == 13 && payload.words[0] == 0x0123456789abcdef
+      && payload.words[7] == 0xfedcba9876543210, "all aliases see typed mutation without damaging other fields")
+    drop payload
+    index = index + 1
+  }
+  drop aliases
+  drop values
+  run Testing.expect(unsafe referenceCount(header) == 1, "container copies and drops do not change JavaScript reference count")
+}
+
+struct DropProbe {
+  counter: *mut i32,
+  nativeBytes: List<u8>
+}
+impl Drop for DropProbe {
+  fn drop(self: &mut DropProbe) -> () {
+    let count = unsafe Pointer.read<i32>(self.counter)
+    unsafe Pointer.write<i32>(self.counter, count + 1)
+  }
+}
+
+test effect fn heapDestroyDropsNativePayloadOnceAndReleasesAllStorage() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = run RuntimeAllocator<SystemAllocator>.make(Allocator.systemAllocatorProvider())
+  let mut count: i32 = 0
+  let mut nativeBytes = List<u8>.make()
+  run List<u8>.append(&mut nativeBytes, 37) |> Effect.provideMut<Allocator>(&mut allocator)
+  let header = run HeapCell.allocate<DropProbe>(HeapKind.Auxiliary, DropProbe {
+    counter: Pointer.fromMutRef<i32>(&mut count), nativeBytes: move nativeBytes
+  }) |> Effect.provideMut<Allocator>(&mut allocator)
+  let before = RuntimeAllocator<SystemAllocator>.stats(&allocator)
+  let value = Value.Object { reference: header }
+  let alias = unsafe Value.retained(value)
+  let firstZero = unsafe Value.decrementReference(&alias)
+  let countAfterAlias = count
+  let finalZero = unsafe Value.decrementReference(&value)
+  let countBeforeDestroy = count
+  let zeroCountStorage = RuntimeAllocator<SystemAllocator>.stats(&allocator)
+  unsafe HeapCell.destroy<DropProbe>(header)
+  let after = RuntimeAllocator<SystemAllocator>.stats(&allocator)
+  run Testing.expect(before.allocationCount == 2, "cell and native payload each own real storage")
+  run Testing.expect(!firstZero && finalZero && countAfterAlias == 0 && countBeforeDestroy == 0, "decrement does not masquerade as destruction")
+  run Testing.expect(zeroCountStorage.allocationCount == 2, "zero-reference cell awaits explicit destruction dispatch")
+  run Testing.expect(count == 1, "native payload destructor executes exactly once")
+  run Testing.expect(after.allocationCount == 0 && after.usedBytes == 0, "destruction releases native payload owners and self-owned backing")
+}

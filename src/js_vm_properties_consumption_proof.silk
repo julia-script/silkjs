@@ -1,0 +1,114 @@
+//! Finalizer-visible exception ordering at consuming property API boundaries.
+//! Each row owns its observed object exclusively through the consumed operand.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.usize
+import runtime_memory { RuntimeAllocator }
+import js_heap { HeapHeader }
+import js_core_types { PropertySlot }
+import js_value { Value }
+import js_runtime as runtime
+import js_gc as gc
+import js_exceptions { JsException }
+import js_exceptions as exceptions
+import js_string_types { StringLengthError }
+import js_bigint { BigIntError }
+import js_property_mutations as mutations
+import js_property_get as getters
+import js_property_mutations_test_support { Hooks }
+import js_property_get_test_support as base
+import js_property_names_test_support as stored
+import js_coercions_test_support as conversion
+import js_array_storage_test_support as storage
+import js_object_allocate as objects
+import js_errors_test_support { FaultAllocator }
+import js_atom_data as atoms
+
+unsafe effect fn operation(hooks: &mut Hooks, context: *mut HeapHeader,
+  target: Value, receiver: Value, atom: u32, input: Value, mode: u32) -> Value
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  if mode == 0 {
+    let accepted = run unsafe mutations.definePropertyValue(&mut hooks, context, target, atom, input, 7)
+    return Value.Bool { value: accepted }
+  }
+  if mode == 1 {
+    let accepted = run unsafe mutations.setPropertyInternal(&mut hooks, context, target, atom, input, receiver, 0)
+    return Value.Bool { value: accepted }
+  }
+  if mode == 2 {
+    let accepted = run unsafe mutations.setPropertyValue(&mut hooks, context, target, Value.Int { value: -1 }, input, 0)
+    return Value.Bool { value: accepted }
+  }
+  if mode == 3 {
+    let accepted = run unsafe mutations.definePropertyValueValue(&mut hooks, context, target, Value.Int { value: -1 }, input, 7)
+    return Value.Bool { value: accepted }
+  }
+  if mode == 4 { return run unsafe getters.getPropertyValue(&mut hooks, context, target, input) }
+  if mode == 6 {
+    let accepted = run unsafe mutations.setPropertyInternal(&mut hooks, context, target, atom, input, target, 0)
+    return Value.Bool { value: accepted }
+  }
+  if mode == 7 {
+    let accepted = run unsafe mutations.setPropertyValue(&mut hooks, context, target, input, Value.Undefined, 0)
+    return Value.Bool { value: accepted }
+  }
+  if mode == 8 {
+    let accepted = run unsafe mutations.definePropertyValueValue(&mut hooks, context, target, input, Value.Undefined, 7)
+    return Value.Bool { value: accepted }
+  }
+  return run unsafe getters.getPropertyValue(&mut hooks, context, Value.Null, input)
+}
+// fields: actual injected failures, last-owner finalizations, pending observed
+// by that finalizer, pending on return, operation failed, zero teardown ledger.
+pub effect fn record(mode: u32) -> [u32; 6]
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let context = run unsafe storage.context(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make(&observer)
+  run unsafe base.prepare(&mut hooks.base, context) |> Effect.provideMut<Allocator>(&mut memory)
+  let target = run unsafe objects.withPrototype(&mut hooks, &observer, context, Value.Null) |> Effect.provideMut<Allocator>(&mut memory)
+  // The second object shares the empty shape, forcing allocation on definition.
+  let receiver = run unsafe objects.withPrototype(&mut hooks, &observer, context, Value.Null) |> Effect.provideMut<Allocator>(&mut memory)
+  let atom = run unsafe stored.atom(rt, b"consumption-order-property", 0) |> Effect.provideMut<Allocator>(&mut memory)
+  let input = run unsafe conversion.closure(&mut hooks.base.conversion, &observer, context,
+    false, 901, 0, Value.Undefined, 0, Value.Undefined) |> Effect.provideMut<Allocator>(&mut memory)
+  if mode == 4 || mode >= 7 {
+    // The real ToPropertyKey path calls @@toPrimitive, then allocates the string
+    // for -1. No host callback synthesizes an allocation error or pending state.
+    let method = run unsafe conversion.closure(&mut hooks.base.conversion, &observer, context,
+      true, 902, 0, Value.Int { value: -1 }, 0, Value.Undefined) |> Effect.provideMut<Allocator>(&mut memory)
+    run unsafe stored.add(&mut hooks, rt, input, atoms.JS_ATOM_Symbol_toPrimitive, 7,
+      PropertySlot.Value { value: method }) |> Effect.provideMut<Allocator>(&mut memory)
+  }
+  hooks.base.finalizedCount = 0 hooks.base.finalizedPending = false
+  let mut fault = FaultAllocator { parent: move memory, armed: mode != 5,
+    remaining: 0, persistent: false, failures: 0, }
+  let attempted = run Effect.result(unsafe operation(&mut hooks, context, target, receiver, atom, input, mode))
+    |> Effect.provideMut<Allocator>(&mut fault)
+  fault.armed = false
+  let mut row: [u32; 6] = [0; 6]
+  row[0] = usize.toU32(fault.failures)
+  let mut index: usize = 0
+  while index < hooks.base.finalizedCount {
+    if hooks.base.finalized[index] == 901 { row[1] = row[1] + 1 }
+    index = index + 1
+  }
+  if hooks.base.finalizedPending { row[2] = 1 }
+  if unsafe exceptions.has(rt) { row[3] = 1 }
+  match move attempted {
+    Result<Value, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { value } => {
+      unsafe gc.release(&mut hooks, rt, value)
+    }
+    Result<Value, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { .. } => { row[4] = 1 }
+  }
+  if unsafe exceptions.has(rt) { unsafe gc.release(&mut hooks, rt, unsafe exceptions.take(rt)) }
+  unsafe gc.release(&mut hooks, rt, target) unsafe gc.release(&mut hooks, rt, receiver)
+  unsafe stored.releaseAtom(rt, atom)
+  unsafe gc.releaseHeader(&mut hooks, rt, context)
+  run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut fault)
+  if observer.stats().usedBytes == 0 && observer.stats().allocationCount == 0 { row[5] = 1 }
+  return row
+}

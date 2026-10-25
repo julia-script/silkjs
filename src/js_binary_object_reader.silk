@@ -1,0 +1,588 @@
+//! Native QuickJS 7d1c13c5d8f8c6b32893786ed35cdcebd88194d2 reader,
+//! quickjs.c:39191-40337. Wire version 5 is always little endian.
+//! Reader roots are explicit owners, including partial graphs and module roots.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.list { List }
+import silk.ownership { Copy }
+import silk.pointer { Pointer }
+import silk.u8
+import silk.u16
+import silk.u32
+import silk.u64
+import silk.usize
+import silk.i32
+import silk.i64
+import silk.f64
+import js_engine { Engine }
+import js_engine_host { EngineServices }
+import js_heap { HeapHeader, HeapCell, HeapKind }
+import js_value { Value }
+import js_exceptions { JsException }
+import js_coercion_host { CoercionHooks }
+import js_core_types { RuntimeState, ContextState, ObjectData, ObjectPayload, NativeErrorKind, NativeFunctionId,
+  FunctionBytecode, FunctionKind, FunctionDebugInfo, ByteStorage, VarDef, ClosureVar,
+  VariableKind, ClosureKind, ModuleDef, RequestedModule, ExportEntry, ExportBinding,
+  StarExportEntry, ImportEntry, JS_PROP_C_W_E, JS_PROP_ENUMERABLE }
+import js_string_types { FlatString, StringOwner, StringLengthError, STRING_LENGTH_MAX }
+import js_bigint { BigInt, BigIntError }
+import js_bigint_coercions as bigint
+import js_runtime as runtime
+import js_gc as gc
+import js_object_allocate as objects
+import js_property_mutations as properties
+import js_boxing as boxing
+import js_buffer_storage as storage
+import js_module_metadata as modules
+import js_opcode_data as op
+import js_atom_data as atoms
+import js_class_data as classes
+import native_stack { currentFrameAddress }
+
+pub const BYTECODE: u32 = 1
+pub const ROM_DATA: u32 = 2
+pub const SAB: u32 = 4
+pub const REFERENCE: u32 = 8
+/// Borrowed relocation entry. The decoder clones the buffer's backing owner;
+/// address is the serialized identifier, not necessarily this buffer's address.
+pub struct SharedBacking { pub address: u64, pub buffer: Value }
+impl Copy for SharedBacking {}
+struct Reader<'a> {
+  data: *const u8, length: usize, position: usize, flags: u32, rom: bool,
+  trusted: bool, shared: &'a [SharedBacking], firstAtom: u32,
+  atoms: List<u32>, references: List<Value>, roots: List<Value>, modules: List<*mut HeapHeader>
+}
+fn reference(value: Value) -> *mut HeapHeader {
+  return match value { Value.Object { reference } => reference
+    Value.FunctionBytecode { reference } => reference Value.Module { reference } => reference
+    _ => Intrinsic.trap("reader heap owner invariant") }
+}
+effect fn error<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,
+  message:&[u8]) -> never !JsException ?&mut Allocator {
+  return run unsafe engine.throwError(context,NativeErrorKind.Syntax,message)
+}
+effect fn typeError<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,
+  message:&[u8]) -> never !JsException ?&mut Allocator {
+  return run unsafe engine.throwError(context,NativeErrorKind.Type,message)
+}
+effect fn need<'a,'m,S:EngineServices>(r:&Reader<'a>,engine:&mut Engine<'m,S>,context:*mut HeapHeader,
+  count:usize) -> () !JsException ?&mut Allocator {
+  if count > r.length-r.position { return run error(&mut engine,context,b"read after the end of the buffer") }
+}
+fn at<'a>(r:&Reader<'a>,index:usize) -> *const u8 {
+  return unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(r.data),index)
+}
+effect fn byte<'a,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,context:*mut HeapHeader)
+  -> u8 !JsException ?&mut Allocator {
+  run need(&r.*,&mut engine,context,1)
+  let value=unsafe Pointer.read<u8>(at(&r.*,r.position)) r.position=r.position+1 return value
+}
+effect fn fixed<'a,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,context:*mut HeapHeader,count:usize)
+  -> u64 !JsException ?&mut Allocator {
+  run need(&r.*,&mut engine,context,count) let mut value:u64=0 let mut i:usize=0
+  while i<count { value=value|u64.shiftLeft(u8.toU64(unsafe Pointer.read<u8>(at(&r.*,r.position+i))),usize.toU64(i*8)) i=i+1 }
+  r.position=r.position+count return value
+}
+effect fn leb<'a,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,context:*mut HeapHeader)
+  -> u32 !JsException ?&mut Allocator {
+  let mut value:u32=0 let mut shift:u32=0
+  while shift<35 {
+    let b=run byte(&mut r,&mut engine,context)
+    value=value|u32.shiftLeft(u8.toU32(b&127),shift)
+    if (b&128)==0 { return value } shift=shift+7
+  }
+  return run error(&mut engine,context,b"read after the end of the buffer")
+}
+fn signed(value:u32)->i32 { if value>=0x80000000 { return -1-u32.toI32(value^0xffffffff) } return u32.toI32(value) }
+effect fn count<'a,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,context:*mut HeapHeader)
+  -> usize !JsException ?&mut Allocator {
+  let n=run leb(&mut r,&mut engine,context)
+  if n>0x7fffffff { return run error(&mut engine,context,b"invalid binary object length") }
+  return u32.toUsize(n)
+}
+effect fn own<'a,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,context:*mut HeapHeader,value:Value)
+  -> Value !OutOfMemoryError ?&mut Allocator {
+  if value.tag()>=0 { return value }
+  let result=run Effect.result(r.roots.append(value))
+  match move result { Result<(),OutOfMemoryError>.Success {..}=>() Result<(),OutOfMemoryError>.Failure {error}=>{
+    unsafe gc.release(&mut engine,unsafe runtime.contextRuntime(context),value) fail move error
+  }} return value
+}
+effect fn addReference<'a>(r:&mut Reader<'a>,value:Value)->() !OutOfMemoryError ?&mut Allocator {
+  if (r.flags&REFERENCE)!=0 { run r.references.append(value) }
+}
+fn duplicateAtom<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,atom:u32)->u32 {
+  let anchor=() let rt=unsafe HeapCell.payload<RuntimeState,()>(&anchor,unsafe runtime.contextRuntime(context))
+  return rt.atoms.duplicate(atom)
+}
+effect fn mapAtom<'a,'m,S:EngineServices>(r:&Reader<'a>,engine:&mut Engine<'m,S>,context:*mut HeapHeader,index:u32)
+  ->u32 !JsException ?&mut Allocator {
+  if (index&0x80000000)!=0 || index<r.firstAtom { return index }
+  let offset=u32.toUsize(index-r.firstAtom)
+  if offset>=r.atoms.length() { return run error(&mut engine,context,b"invalid atom index") }
+  return r.atoms.get(offset)
+}
+effect fn atom<'a,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,context:*mut HeapHeader)
+  ->u32 !JsException ?&mut Allocator {
+  let encoded=run leb(&mut r,&mut engine,context)
+  if (encoded&1)!=0 { return u32.shiftRight(encoded,1)|0x80000000 }
+  return run mapAtom(&r.*,&mut engine,context,u32.shiftRight(encoded,1))
+}
+effect fn string<'a,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,context:*mut HeapHeader)
+  ->Value !OutOfMemoryError|JsException ?&mut Allocator {
+  let encoded=run leb(&mut r,&mut engine,context) let length=u32.toUsize(u32.shiftRight(encoded,1))
+  if length>STRING_LENGTH_MAX { return run unsafe engine.throwError(context,NativeErrorKind.Internal,b"string too long") }
+  let wide=(encoded&1)!=0 let mut width:usize=1 if wide { width=2 }
+  run need(&r.*,&mut engine,context,length*width)
+  let mut flat=FlatString.make() flat.wide=wide flat.length=length
+  let mut i:usize=0
+  if wide { run flat.utf16.reserveExact(length)
+    while i<length { run flat.utf16.append(u64.toU16(run fixed(&mut r,&mut engine,context,2))) i=i+1 }
+  } else { run flat.latin1.reserveExact(length+1)
+    while i<length { run flat.latin1.append(run byte(&mut r,&mut engine,context)) i=i+1 }
+    run flat.latin1.append(0)
+  }
+  return Value.String { reference:run HeapCell.allocate(HeapKind.String,move flat) }
+}
+effect fn copiedBytes<'a,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,context:*mut HeapHeader,length:usize)
+  ->List<u8> !OutOfMemoryError|JsException ?&mut Allocator {
+  run need(&r.*,&mut engine,context,length) let mut bytes=List<u8>.make() run bytes.reserveExact(length)
+  let mut i:usize=0 while i<length { run bytes.append(run byte(&mut r,&mut engine,context)) i=i+1 } return move bytes
+}
+effect fn header<'a,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,context:*mut HeapHeader)
+  ->() !OutOfMemoryError|JsException ?&mut Allocator {
+  let version=run byte(&mut r,&mut engine,context)
+  if version!=5 { return run error(&mut engine,context,b"invalid binary object version (expected 5)") }
+  let n=run count(&mut r,&mut engine,context) run need(&r.*,&mut engine,context,n)
+  run r.atoms.reserveExact(n) let mut i:usize=0
+  while i<n {
+    let text=run string(&mut r,&mut engine,context)
+    let mut anchor=() let rt=unsafe HeapCell.payloadMut<RuntimeState,()>(&mut anchor,unsafe runtime.contextRuntime(context))
+    let a=run rt.atoms.internOwned(text) drop rt
+    run r.atoms.append(a)
+    if a!=r.firstAtom+usize.toU32(i) { r.rom=false } i=i+1
+  }
+}
+effect fn readBigInt<'a,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,context:*mut HeapHeader)
+  ->Value !OutOfMemoryError|JsException|BigIntError ?&mut Allocator {
+  let n=u32.toUsize(run leb(&mut r,&mut engine,context))
+  if n==0 { return Value.ShortBigInt { value:0 } }
+  run need(&r.*,&mut engine,context,n) let mut words=List<u32>.make() run words.reserveExact((n+3)/4)
+  let mut i:usize=0 while i<n {
+    let mut width=n-i if width>4 { width=4 }
+    let mut word=u64.toU32(run fixed(&mut r,&mut engine,context,width))
+    if width<4 && (word&u32.shiftLeft(128,usize.toU32((width-1)*8)))!=0 { word=word|u32.shiftLeft(0xffffffff,usize.toU32(width*8)) }
+    run words.append(word) i=i+width
+  }
+  return run bigint.compact(run BigInt.fromOwnedLimbs(move words))
+}
+effect fn readBuffer<'a,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,context:*mut HeapHeader,shared:bool)
+  ->Value !OutOfMemoryError|JsException ?&mut Allocator {
+  let length=run leb(&mut r,&mut engine,context) let maximum=run leb(&mut r,&mut engine,context)
+  if maximum<length { return run typeError(&mut engine,context,b"invalid array buffer") }
+  let mut max=Option<u64>.none() if maximum!=0xffffffff { max=Option<u64>.some(u32.toU64(maximum)) }
+  let memory=engine.memory let mut value=Value.Undefined
+  if shared {
+    if (r.flags&SAB)==0 { return run error(&mut engine,context,b"invalid shared array buffer tag") }
+    let address=run fixed(&mut r,&mut engine,context,8) let mut i:usize=0
+    while i<r.shared.length {
+      let entry=r.shared[i]
+      if entry.address==address {
+        let source=run unsafe storage.requireBuffer(&mut engine,context,entry.buffer,1)
+        let state=unsafe storage.snapshot(source) let mut expected:i64=-1
+        // Preserve the pinned constructor's external growable-buffer rejection;
+        // relocation changes pointer identity, not the source codec's policy.
+        if maximum!=0xffffffff && !Pointer.isNull<u8>(state.data) {
+          return run unsafe engine.throwError(context,NativeErrorKind.Internal,
+            b"resizable ArrayBuffers not supported for externally managed buffers")
+        }
+        if maximum!=0xffffffff { expected=u32.toI64(maximum) }
+        let mut capacity=state.byteLength if state.maxByteLength>=0 { capacity=i64.toU32(state.maxByteLength) }
+        if state.detached || state.maxByteLength!=expected || length>capacity {
+          return run typeError(&mut engine,context,b"invalid shared array buffer relocation")
+        }
+        let clone=run unsafe storage.duplicateShared(&mut engine,memory,context,entry.buffer)
+        value=run own(&mut r,&mut engine,context,clone)
+        run unsafe storage.resize(reference(value),length) run addReference(&mut r,value) return value
+      } i=i+1
+    }
+    if !r.trusted { return run typeError(&mut engine,context,b"missing shared array buffer relocation") }
+    let anchor=() let rt=unsafe HeapCell.payload<RuntimeState,()>(&anchor,unsafe runtime.contextRuntime(context))
+    let canDuplicate=match &rt.sharedArrayBuffers.duplicate { Option<NativeFunctionId>.Some {..}=>true _=>false } drop rt
+    if !canDuplicate { return run error(&mut engine,context,b"shared array buffer duplication is unavailable") }
+    // This reinterpretation is confined to the explicitly unsafe trusted API.
+    let pointer=unsafe Pointer.read<?*mut u8>(unsafe Intrinsic.pointerReinterpret<*const u64,*const ?*mut u8>(Pointer.fromRef<u64>(&address)))
+    value=run unsafe storage.createExternal(&mut engine,memory,context,Value.Undefined,u32.toU64(length),move max,true,pointer,Option<NativeFunctionId>.none(),Pointer.null<u8>(),false)
+  } else {
+    run need(&r.*,&mut engine,context,u32.toUsize(length))
+    let mut pointer=Pointer.null<u8>()
+    if length!=0 { pointer=unsafe Intrinsic.pointerRequalify<*const u8,*mut u8>(at(&r.*,r.position)) }
+    value=run unsafe storage.createExternal(&mut engine,memory,context,Value.Undefined,u32.toU64(length),move max,false,pointer,Option<NativeFunctionId>.none(),Pointer.null<u8>(),true)
+    r.position=r.position+u32.toUsize(length)
+  }
+  let result=run own(&mut r,&mut engine,context,value) run addReference(&mut r,result) return result
+}
+effect fn readTypedArray<'a,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,context:*mut HeapHeader)
+  ->Value !OutOfMemoryError|JsException|StringLengthError|BigIntError ?&mut Allocator {
+  let tag=u8.toU32(run byte(&mut r,&mut engine,context))
+  if tag>classes.JS_CLASS_FLOAT64_ARRAY-classes.JS_CLASS_UINT8C_ARRAY { return run typeError(&mut engine,context,b"invalid typed array") }
+  let length=run leb(&mut r,&mut engine,context) let offset=run leb(&mut r,&mut engine,context)
+  let index=r.references.length() run addReference(&mut r,Value.Undefined)
+  let buffer=run readValue(&mut r,&mut engine,context)
+  let backing=run unsafe storage.requireBuffer(&mut engine,context,buffer,-1)
+  let state=unsafe storage.snapshot(backing) let class=classes.JS_CLASS_UINT8C_ARRAY+tag let shift=storage.sizeLog2(class)
+  let bytes=u64.shiftLeft(u32.toU64(length),u32.toU64(shift))
+  if (offset&(u32.shiftLeft(1,shift)-1))!=0 { return run unsafe engine.throwError(context,NativeErrorKind.Range,b"invalid offset") }
+  if state.detached || u32.toU64(offset)+bytes>u32.toU64(state.byteLength) { return run unsafe engine.throwError(context,NativeErrorKind.Range,b"invalid length") }
+  let memory=engine.memory let created=run unsafe objects.withClass(&mut engine,memory,context,class)
+  let value=run own(&mut r,&mut engine,context,created)
+  run unsafe storage.initializeView(&mut engine,context,reference(value),unsafe buffer.retained(),offset,u64.toU32(bytes),false)
+  if (r.flags&REFERENCE)!=0 { r.references.set(index,value) } return value
+}
+effect fn readValue<'a,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,context:*mut HeapHeader)
+  ->Value !OutOfMemoryError|JsException|StringLengthError|BigIntError ?&mut Allocator {
+  if unsafe runtime.checkStackOverflow(unsafe runtime.contextRuntime(context),currentFrameAddress(),0,true) {
+    return run unsafe engine.throwError(context,NativeErrorKind.Internal,b"stack overflow")
+  }
+  let tag=run byte(&mut r,&mut engine,context)
+  if tag==1 { return Value.Null } if tag==2 { return Value.Undefined }
+  if tag==3 || tag==4 { return Value.Bool { value:tag==4 } }
+  if tag==5 { let encoded=run leb(&mut r,&mut engine,context) let magnitude=u32.shiftRight(encoded,1)
+    let mut bits=magnitude if (encoded&1)!=0 { bits=magnitude^0xffffffff } return Value.Int { value:signed(bits) } }
+  if tag==6 { return Value.Float64 { value:f64.fromBits(run fixed(&mut r,&mut engine,context,8)) } }
+  if tag==7 { let value=run string(&mut r,&mut engine,context) return run own(&mut r,&mut engine,context,value) }
+  if tag==10 { let value=run readBigInt(&mut r,&mut engine,context) return run own(&mut r,&mut engine,context,value) }
+  if tag==12 || tag==13 {
+    if (r.flags&BYTECODE)==0 { return run error(&mut engine,context,b"invalid bytecode tag") }
+    if tag==12 { return run readFunction(&mut r,&mut engine,context) }
+    return run readModule(&mut r,&mut engine,context)
+  }
+  if tag==14 { return run readTypedArray(&mut r,&mut engine,context) }
+  if tag==15 || tag==16 { return run readBuffer(&mut r,&mut engine,context,tag==16) }
+  if tag==19 {
+    if (r.flags&REFERENCE)==0 { return run error(&mut engine,context,b"object references are not allowed") }
+    let index=u32.toUsize(run leb(&mut r,&mut engine,context))
+    if index>=r.references.length() { return run error(&mut engine,context,b"invalid object reference") }
+    let value=r.references.get(index)
+    if !value.isObject() { return run error(&mut engine,context,b"invalid pending typed array reference") } return value
+  }
+  let memory=engine.memory
+  if tag==17 || tag==18 {
+    let primitive=run readValue(&mut r,&mut engine,context) let mut value=Value.Undefined
+    if tag==17 {
+      if !primitive.isNumber() { return run typeError(&mut engine,context,b"Number tag expected for date") }
+      value=run unsafe objects.withClass(&mut engine,memory,context,classes.JS_CLASS_DATE)
+      let mut anchor=() let object=unsafe HeapCell.payloadMut<ObjectData,()>(&mut anchor,reference(value))
+      object.payload=ObjectPayload.Boxed { value:primitive }
+    } else { value=run unsafe boxing.toObject(&mut engine,memory,context,primitive) }
+    let result=run own(&mut r,&mut engine,context,value) run addReference(&mut r,result) return result
+  }
+  if tag!=8 && tag!=9 && tag!=11 { return run error(&mut engine,context,b"invalid binary object tag") }
+  let mut value=Value.Undefined
+  if tag==8 { value=run unsafe objects.object(&mut engine,memory,context) }
+  else { value=run unsafe objects.array(&mut engine,memory,context) }
+  let result=run own(&mut r,&mut engine,context,value) run addReference(&mut r,result)
+  let n=run leb(&mut r,&mut engine,context) let mut i:u32=0
+  while i<n {
+    let mut key:u32=0 if tag==8 { key=run atom(&mut r,&mut engine,context) }
+    if tag==8 && key==0 { return run error(&mut engine,context,b"invalid property atom") }
+    let child=run readValue(&mut r,&mut engine,context)
+    let mut flags=JS_PROP_C_W_E if tag==11 { flags=JS_PROP_ENUMERABLE }
+    if tag==8 { let defined=run unsafe properties.definePropertyValue(&mut engine,context,result,key,unsafe child.retained(),flags) }
+    else { let defined=run unsafe properties.definePropertyValueUint32(&mut engine,context,result,i,unsafe child.retained(),flags) }
+    i=i+1
+  }
+  if tag==11 {
+    let raw=run readValue(&mut r,&mut engine,context)
+    if raw.tag()!=3 { let defined=run unsafe properties.definePropertyValue(&mut engine,context,result,atoms.JS_ATOM_raw,unsafe raw.retained(),0) }
+    let mut anchor=() let object=unsafe HeapCell.payloadMut<ObjectData,()>(&mut anchor,reference(result)) object.extensible=false
+  }
+  return result
+}
+
+effect fn variableKind<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,kind:u8)
+  ->VariableKind !JsException ?&mut Allocator {
+  return match kind {
+    0=>VariableKind.Normal 1=>VariableKind.FunctionDeclaration 2=>VariableKind.NewFunctionDeclaration
+    3=>VariableKind.Catch 4=>VariableKind.FunctionName 5=>VariableKind.PrivateField
+    6=>VariableKind.PrivateMethod 7=>VariableKind.PrivateGetter 8=>VariableKind.PrivateSetter
+    9=>VariableKind.PrivateGetterSetter 10=>VariableKind.GlobalFunctionDeclaration
+    11=>VariableKind.Using 12=>VariableKind.UsingMethod
+    _=>run error(&mut engine,context,b"invalid variable kind")
+  }
+}
+fn closureKind(kind:u16)->ClosureKind {
+  return match kind&7 { 0=>ClosureKind.Local 1=>ClosureKind.Argument 2=>ClosureKind.Reference
+    3=>ClosureKind.GlobalReference 4=>ClosureKind.GlobalDeclaration 5=>ClosureKind.Global
+    6=>ClosureKind.ModuleDeclaration _=>ClosureKind.ModuleImport }
+}
+fn atomFormat(format:u8)->bool {
+  return format==op.OP_FMT_atom || format==op.OP_FMT_atom_u8 || format==op.OP_FMT_atom_u16
+    || format==op.OP_FMT_atom_label_u8 || format==op.OP_FMT_atom_label_u16
+}
+fn wordAt<'a>(r:&Reader<'a>,position:usize)->u32 {
+  let mut value:u32=0 let mut i:usize=0
+  while i<4 { value=value|u32.shiftLeft(u8.toU32(unsafe Pointer.read<u8>(at(r,position+i))),usize.toU32(i*8)) i=i+1 }
+  return value
+}
+effect fn readCode<'a,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,context:*mut HeapHeader,
+  function:*mut HeapHeader,length:usize)->() !OutOfMemoryError|JsException ?&mut Allocator {
+  run need(&r.*,&mut engine,context,length)
+  let start=r.position let mut offset:usize=0
+  // Validate before installing any atom ownership or exposing code to VM/GC.
+  while offset<length {
+    let opcode=unsafe Pointer.read<u8>(at(&r.*,start+offset))
+    if opcode==0 || u8.toUsize(opcode)>=op.OP_COUNT { return run error(&mut engine,context,b"invalid bytecode opcode") }
+    let info=op.opcodeInfo(opcode,true) let size=u8.toUsize(info.size)
+    if size==0 || size>length-offset { return run error(&mut engine,context,b"truncated bytecode instruction") }
+    if atomFormat(info.format) {
+      let mapped=run mapAtom(&r.*,&mut engine,context,wordAt(&r.*,start+offset+1))
+    }
+    offset=offset+size
+  }
+  let mut code=ByteStorage.Owned { bytes:List<u8>.make() }
+  if r.rom && length!=0 {
+    code=ByteStorage.Borrowed { data:at(&r.*,start),length:length } r.position=r.position+length
+  } else { code=ByteStorage.Owned { bytes:run copiedBytes(&mut r,&mut engine,context,length) } }
+  offset=0
+  while offset<length {
+    let opcode=unsafe code.byte(offset) let info=op.opcodeInfo(opcode,true)
+    if atomFormat(info.format) {
+      let index=wordAt(&r.*,start+offset+1)
+      // The validation pass proved every map lookup; no failure after retain.
+      let mut mapped=index
+      if (index&0x80000000)==0 && index>=r.firstAtom { mapped=r.atoms.get(u32.toUsize(index-r.firstAtom)) }
+      let retained=duplicateAtom(&mut engine,context,mapped)
+      match &mut code {
+        ByteStorage.Owned { bytes }=>{
+          let mut j:usize=0 while j<4 { bytes.set(offset+1+j,u32.toU8(u32.shiftRight(retained,usize.toU32(j*8))&255)) j=j+1 }
+        }
+        _=>()
+      }
+    }
+    offset=offset+u8.toUsize(info.size)
+  }
+  let mut anchor=() let b=unsafe HeapCell.payloadMut<FunctionBytecode,()>(&mut anchor,function)
+  b.code=move code
+}
+effect fn readFunction<'a,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,context:*mut HeapHeader)
+  ->Value !OutOfMemoryError|JsException|StringLengthError|BigIntError ?&mut Allocator {
+  let flags=u64.toU16(run fixed(&mut r,&mut engine,context,2))
+  let mode=run byte(&mut r,&mut engine,context) let name=run atom(&mut r,&mut engine,context)
+  let argc=u32.toU16((run leb(&mut r,&mut engine,context))&65535)
+  let varc=u32.toU16((run leb(&mut r,&mut engine,context))&65535)
+  let defined=u32.toU16((run leb(&mut r,&mut engine,context))&65535)
+  let stack=u32.toU16((run leb(&mut r,&mut engine,context))&65535)
+  let refs=u32.toU16((run leb(&mut r,&mut engine,context))&65535)
+  let closures=run count(&mut r,&mut engine,context) let constants=run count(&mut r,&mut engine,context)
+  let codeLength=run count(&mut r,&mut engine,context) let locals=run count(&mut r,&mut engine,context)
+  run need(&r.*,&mut engine,context,closures+constants+codeLength+locals)
+  let kind=match u16.shiftRight(flags,4)&3 { 0=>FunctionKind.Normal 1=>FunctionKind.Generator 2=>FunctionKind.Async _=>FunctionKind.AsyncGenerator }
+  let function=run HeapCell.allocate<FunctionBytecode>(HeapKind.FunctionBytecode,FunctionBytecode {
+    mode:mode,hasPrototype:(flags&1)!=0,hasSimpleParameterList:(flags&2)!=0,
+    isDerivedClassConstructor:(flags&4)!=0,needsHomeObject:(flags&8)!=0,kind:kind,
+    newTargetAllowed:(flags&64)!=0,superCallAllowed:(flags&128)!=0,superAllowed:(flags&256)!=0,
+    argumentsAllowed:(flags&512)!=0,readOnlyBytecode:r.rom,isDirectOrIndirectEval:(flags&2048)!=0,
+    code:ByteStorage.Owned { bytes:List<u8>.make() },name:0,varDefs:List<VarDef>.make(),
+    closureVars:List<ClosureVar>.make(),argumentCount:argc,variableCount:varc,
+    definedArgumentCount:defined,stackSize:stack,varRefCount:refs,realm:context,
+    constants:List<Value>.make(),debug:Option<FunctionDebugInfo>.none()
+  })
+  unsafe HeapCell.retain(context) unsafe gc.publish(unsafe runtime.contextRuntime(context),function)
+  let value=run own(&mut r,&mut engine,context,Value.FunctionBytecode { reference:function })
+  let mut anchor=()
+  let b=unsafe HeapCell.payloadMut<FunctionBytecode,()>(&mut anchor,function)
+  b.name=duplicateAtom(&mut engine,context,name)
+  run b.varDefs.reserveExact(locals) run b.closureVars.reserveExact(closures) run b.constants.reserveExact(constants) drop b
+  let mut i:usize=0
+  while i<locals {
+    let varName=run atom(&mut r,&mut engine,context) let next=run leb(&mut r,&mut engine,context)
+    let refIndex=u32.toU16((run leb(&mut r,&mut engine,context))&65535)
+    let bits=run byte(&mut r,&mut engine,context) let varKind=run variableKind(&mut engine,context,bits&15)
+    let b=unsafe HeapCell.payloadMut<FunctionBytecode,()>(&mut anchor,function)
+    run b.varDefs.append(VarDef { name:duplicateAtom(&mut engine,context,varName),scopeNext:signed(u32.wrappingSubtract(next,1)),
+      varRefIndex:refIndex,kind:varKind,isConst:(bits&16)!=0,isLexical:(bits&32)!=0,isCaptured:(bits&64)!=0,hasScope:(bits&128)!=0 })
+    i=i+1
+  }
+  i=0
+  while i<closures {
+    let varName=run atom(&mut r,&mut engine,context) let index=u32.toU16((run leb(&mut r,&mut engine,context))&65535)
+    let bits=u64.toU16(run fixed(&mut r,&mut engine,context,2))
+    let varKind=run variableKind(&mut engine,context,u16.toU8(u16.shiftRight(bits,5)&15))
+    let b=unsafe HeapCell.payloadMut<FunctionBytecode,()>(&mut anchor,function)
+    run b.closureVars.append(ClosureVar { name:duplicateAtom(&mut engine,context,varName),variableIndex:index,
+      kind:closureKind(bits),isConst:(bits&8)!=0,isLexical:(bits&16)!=0,variableKind:varKind })
+    i=i+1
+  }
+  run readCode(&mut r,&mut engine,context,function,codeLength)
+  if (flags&1024)!=0 {
+    let filename=run atom(&mut r,&mut engine,context)
+    let b=unsafe HeapCell.payloadMut<FunctionBytecode,()>(&mut anchor,function)
+    b.debug=Option<FunctionDebugInfo>.some(FunctionDebugInfo { filename:duplicateAtom(&mut engine,context,filename),
+      source:Option<ByteStorage>.none(),pcToLine:ByteStorage.Owned { bytes:List<u8>.make() } }) drop b
+    let lines=run count(&mut r,&mut engine,context)
+    let lineBytes=run copiedBytes(&mut r,&mut engine,context,lines)
+    let linesDebug=unsafe HeapCell.payloadMut<FunctionBytecode,()>(&mut anchor,function)
+    match &mut linesDebug.debug { Option<FunctionDebugInfo>.Some { value:debug }=>{ debug.pcToLine=ByteStorage.Owned { bytes:move lineBytes } } _=>() } drop linesDebug
+    let source=run count(&mut r,&mut engine,context)
+    if source!=0 {
+      let sourceBytes=run copiedBytes(&mut r,&mut engine,context,source)
+      let b=unsafe HeapCell.payloadMut<FunctionBytecode,()>(&mut anchor,function)
+      match &mut b.debug { Option<FunctionDebugInfo>.Some { value:debug }=>{ debug.source=Option<ByteStorage>.some(ByteStorage.Owned { bytes:move sourceBytes }) } _=>() }
+    }
+  }
+  i=0
+  while i<constants {
+    let child=run readValue(&mut r,&mut engine,context)
+    let b=unsafe HeapCell.payloadMut<FunctionBytecode,()>(&mut anchor,function)
+    run b.constants.append(unsafe child.retained()) i=i+1
+  }
+  return value
+}
+effect fn readModule<'a,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,context:*mut HeapHeader)
+  ->Value !OutOfMemoryError|JsException|StringLengthError|BigIntError ?&mut Allocator {
+  let name=run atom(&mut r,&mut engine,context)
+  // Reserve before creation: once linked, both context and transaction own roots.
+  run r.modules.reserveExact(1) run r.roots.reserveExact(1)
+  let module=run unsafe modules.newModule(context,duplicateAtom(&mut engine,context,name))
+  run r.modules.append(module) unsafe HeapCell.retain(module)
+  let value=run own(&mut r,&mut engine,context,Value.Module { reference:module })
+  let mut anchor=()
+  let requested=run count(&mut r,&mut engine,context) run need(&r.*,&mut engine,context,requested)
+  let m=unsafe HeapCell.payloadMut<ModuleDef,()>(&mut anchor,module) run m.requestedModules.reserveExact(requested) drop m
+  let mut i:usize=0
+  while i<requested {
+    let moduleName=run atom(&mut r,&mut engine,context) let attributes=run readValue(&mut r,&mut engine,context)
+    let m=unsafe HeapCell.payloadMut<ModuleDef,()>(&mut anchor,module)
+    run m.requestedModules.append(RequestedModule { name:duplicateAtom(&mut engine,context,moduleName),module:Pointer.null<HeapHeader>(),
+      attributes:unsafe attributes.retained() }) i=i+1
+  }
+  let exports=run count(&mut r,&mut engine,context) run need(&r.*,&mut engine,context,exports)
+  let exportStorage=unsafe HeapCell.payloadMut<ModuleDef,()>(&mut anchor,module) run exportStorage.exports.reserveExact(exports) drop exportStorage
+  i=0
+  while i<exports {
+    let kind=run byte(&mut r,&mut engine,context) let index=signed(run leb(&mut r,&mut engine,context))
+    let mut local:u32=0 let mut binding=ExportBinding.Local { variableIndex:index,varRef:Pointer.null<HeapHeader>() }
+    if kind!=0 { local=run atom(&mut r,&mut engine,context) binding=ExportBinding.Indirect { requestedModuleIndex:index } }
+    let exported=run atom(&mut r,&mut engine,context)
+    let m=unsafe HeapCell.payloadMut<ModuleDef,()>(&mut anchor,module)
+    run m.exports.append(ExportEntry { binding:binding,localName:duplicateAtom(&mut engine,context,local),
+      exportName:duplicateAtom(&mut engine,context,exported) }) i=i+1
+  }
+  let stars=run count(&mut r,&mut engine,context) run need(&r.*,&mut engine,context,stars)
+  let starStorage=unsafe HeapCell.payloadMut<ModuleDef,()>(&mut anchor,module) run starStorage.starExports.reserveExact(stars) drop starStorage
+  i=0
+  while i<stars {
+    let index=signed(run leb(&mut r,&mut engine,context))
+    let m=unsafe HeapCell.payloadMut<ModuleDef,()>(&mut anchor,module)
+    run m.starExports.append(StarExportEntry { requestedModuleIndex:index }) i=i+1
+  }
+  let imports=run count(&mut r,&mut engine,context) run need(&r.*,&mut engine,context,imports)
+  let importStorage=unsafe HeapCell.payloadMut<ModuleDef,()>(&mut anchor,module) run importStorage.imports.reserveExact(imports) drop importStorage
+  i=0
+  while i<imports {
+    let index=signed(run leb(&mut r,&mut engine,context)) let starByte=run byte(&mut r,&mut engine,context)
+    let star=starByte!=0
+    let imported=run atom(&mut r,&mut engine,context) let requestedIndex=signed(run leb(&mut r,&mut engine,context))
+    let m=unsafe HeapCell.payloadMut<ModuleDef,()>(&mut anchor,module)
+    run m.imports.append(ImportEntry { variableIndex:index,isStar:star,importName:duplicateAtom(&mut engine,context,imported),
+      requestedModuleIndex:requestedIndex }) i=i+1
+  }
+  let tlaByte=run byte(&mut r,&mut engine,context)
+  let function=run readValue(&mut r,&mut engine,context)
+  let completed=unsafe HeapCell.payloadMut<ModuleDef,()>(&mut anchor,module)
+  completed.hasTopLevelAwait=tlaByte!=0 completed.functionObject=unsafe function.retained()
+  return value
+}
+unsafe fn unlinkFailedModule(context:*mut HeapHeader,module:*mut HeapHeader)->() {
+  let mut anchor=()
+  let m=unsafe HeapCell.payloadMut<ModuleDef,()>(&mut anchor,module)
+  let previous=m.previousModule let next=m.nextModule
+  m.previousModule=Pointer.null<HeapHeader>() m.nextModule=Pointer.null<HeapHeader>() drop m
+  match Pointer.nonNullMut<HeapHeader>(previous) {
+    Option<*mut HeapHeader>.Some { value }=>{
+      let p=unsafe HeapCell.payloadMut<ModuleDef,()>(&mut anchor,value) p.nextModule=next
+    }
+    _=>{
+      let ctx=unsafe HeapCell.payloadMut<ContextState,()>(&mut anchor,context) ctx.loadedModules.first=next
+    }
+  }
+  match Pointer.nonNullMut<HeapHeader>(next) {
+    Option<*mut HeapHeader>.Some { value }=>{
+      let n=unsafe HeapCell.payloadMut<ModuleDef,()>(&mut anchor,value) n.previousModule=previous
+    }
+    _=>{
+      let ctx=unsafe HeapCell.payloadMut<ContextState,()>(&mut anchor,context) ctx.loadedModules.last=previous
+    }
+  }
+}
+effect fn body<'a,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,context:*mut HeapHeader)
+  ->Value !OutOfMemoryError|JsException|StringLengthError|BigIntError ?&mut Allocator {
+  run header(&mut r,&mut engine,context)
+  return unsafe (run readValue(&mut r,&mut engine,context)).retained()
+}
+effect fn decode<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,data:*const u8,
+  length:usize,flags:u32,trusted:bool,shared:&[SharedBacking])->Value !JsException ?&mut Allocator {
+  let mut first:u32=1 if (flags&BYTECODE)!=0 { first=atoms.JS_ATOM_END }
+  let mut r=Reader { data:data,length:length,position:0,flags:flags,rom:(flags&ROM_DATA)!=0,
+    trusted:trusted,shared:shared,firstAtom:first,atoms:List<u32>.make(),references:List<Value>.make(),
+    roots:List<Value>.make(),modules:List<*mut HeapHeader>.make() }
+  let decoded=run Effect.result(body(&mut r,&mut engine,context))
+  let failed=match &decoded { Result<Value,OutOfMemoryError|JsException|StringLengthError|BigIntError>.Failure {..}=>true _=>false }
+  let rt=unsafe runtime.contextRuntime(context)
+  let mut i:usize=0
+  if failed {
+    while i<r.modules.length() {
+      let module=r.modules.get(i) unsafe unlinkFailedModule(context,module)
+      unsafe gc.releaseHeader(&mut engine,rt,module) i=i+1
+    }
+  }
+  i=0 while i<r.roots.length() { unsafe gc.release(&mut engine,rt,r.roots.get(i)) i=i+1 }
+  let mut anchor=() let state=unsafe HeapCell.payloadMut<RuntimeState,()>(&mut anchor,rt)
+  i=0 while i<r.atoms.length() { state.atoms.release(r.atoms.get(i)) i=i+1 } drop state
+  // RC alone cannot reclaim partial cyclic graphs. No live caller roots are lost.
+  if failed { run unsafe gc.collect(&mut engine,rt,false) }
+  return match move decoded {
+    Result<Value,OutOfMemoryError|JsException|StringLengthError|BigIntError>.Success { value }=>value
+    Result<Value,OutOfMemoryError|JsException|StringLengthError|BigIntError>.Failure { error:failure }=>match move failure {
+      OutOfMemoryError allocation=>run unsafe engine.throwOutOfMemory(context)
+      JsException signal=>{ fail move signal }
+      StringLengthError lengthError=>run unsafe engine.throwError(context,NativeErrorKind.Internal,b"string too long")
+      BigIntError bigintError=>run unsafe engine.throwError(context,NativeErrorKind.Range,b"BigInt is too large to allocate")
+    }
+  }
+}
+/// Copies bytecode; never retains pointers into bytes. ROM_DATA is rejected.
+/// SAB addresses require explicit readObjectShared relocation entries.
+/// Requires a live context belonging to engine's exclusively accessed runtime.
+pub unsafe effect fn readObject<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,bytes:&[u8],flags:u32)
+  ->Value !JsException ?&mut Allocator {
+  return run unsafe readObjectShared(&mut engine,context,bytes,flags,&[])
+}
+/// Copies bytecode and clones matched shared backing owners. Entries borrow their
+/// buffers only for this call; decoded wrappers remain valid independently.
+/// Requires a live context and live borrowed buffer Values in the same runtime.
+pub unsafe effect fn readObjectShared<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,
+  bytes:&[u8],flags:u32,shared:&[SharedBacking])->Value !JsException ?&mut Allocator {
+  if (flags&ROM_DATA)!=0 { return run error(&mut engine,context,b"ROM data requires readObjectRom") }
+  if bytes.length==0 { return run error(&mut engine,context,b"read after the end of the buffer") }
+  return run decode(&mut engine,context,Pointer.fromRef<u8>(&bytes[0]),bytes.length,flags,false,shared)
+}
+/// data must remain readable and immutable until all decoded bytecode and its
+/// closures are destroyed, including after this call returns. Relocation falls
+/// back to copied bytecode when runtime atom IDs do not match the ROM atom table.
+/// Raw SAB pointers are not accepted by this API.
+pub unsafe effect fn readObjectRom<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,
+  data:*const u8,length:usize,flags:u32)->Value !JsException ?&mut Allocator {
+  return run decode(&mut engine,context,data,length,flags,false,&[])
+}
+/// Trusted embedding-only pointer wire API. In addition to the ROM lifetime
+/// contract when ROM_DATA is set, every SAB address must name a live, pinned
+/// backing accepted by the runtime's shared duplicate/free callbacks, with the
+/// declared physical capacity. Never pass untrusted serialized bytes here.
+pub unsafe effect fn readObjectTrusted<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,
+  data:*const u8,length:usize,flags:u32)->Value !JsException ?&mut Allocator {
+  return run decode(&mut engine,context,data,length,flags,true,&[])
+}

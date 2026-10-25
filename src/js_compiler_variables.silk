@@ -1,0 +1,750 @@
+//! Variable/scope pass: quickjs.c:33548-34649,34791-34896,34973-35330;
+//! global/module preparation and scope relinking:36740-36879.
+//! Call recomputeScopeLinks, then addEvalVariables (hasEvalCall), then
+//! addGlobalVariables (isEval), before resolving children and this function.
+//! Compiler trees and their runtime are exclusively borrowed; no GC hooks run.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.pointer { Pointer }
+import silk.list { List }
+import silk.i32
+import silk.u8
+import silk.u16
+import silk.u32
+import silk.usize
+import byte_buffer { ByteBuffer, readU16, readU32 }
+import js_heap { HeapHeader, HeapCell }
+import js_atoms { AtomTable }
+import js_atom_data as atoms
+import js_opcode_data as op
+import js_core_types { RuntimeState, ModuleDef, ExportBinding, FunctionBytecode, ClosureVar, ClosureKind, VariableKind, JS_MODE_STRICT }
+import js_compiler_types { FunctionDef, CompilerVar, GlobalVar, CompilerError, CompilerErrorKind, ARGUMENT_VAR_OFFSET, ARG_SCOPE_END }
+import js_compiler_state as state
+import js_compiler_emit as emit
+import js_compiler_code { CodeContext, matchCode, M2, opcode, skipDeadCode, getLabelPosition, signedWord, unsignedWord }
+import js_string_types { StringLengthError }
+
+fn present(value: ?*mut HeapHeader) -> *mut HeapHeader { return unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(value) }
+fn same(a: *mut HeapHeader, b: *mut HeapHeader) -> bool { return Pointer.address<HeapHeader>(a) == Pointer.address<HeapHeader>(b) }
+fn globalKind(kind: ClosureKind) -> bool { return kind == ClosureKind.Global || kind == ClosureKind.GlobalDeclaration || kind == ClosureKind.GlobalReference }
+fn pseudo(name: u32) -> bool { return name == atoms.JS_ATOM_home_object || name == atoms.JS_ATOM_this_active_func || name == atoms.JS_ATOM_new_target || name == atoms.JS_ATOM_this }
+fn argumentVisible(name: u32, kind: VariableKind) -> bool { return pseudo(name) || name == atoms.JS_ATOM__arg_var_ || kind == VariableKind.FunctionName }
+
+pub fn recomputeScopeLinks(fd: &mut FunctionDef) -> () {
+  let mut scope: usize = 0
+  while scope < fd.scopes.length() { let mut s = fd.scopes.get(scope) s.first = -1 fd.scopes.set(scope, s) scope = scope + 1 }
+  if fd.hasParameterExpressions { let mut s = fd.scopes.get(1) s.first = ARG_SCOPE_END fd.scopes.set(1, s) }
+  let mut index: usize = 0
+  while index < fd.vars.length() {
+    let mut v = fd.vars.get(index) let mut s = fd.scopes.get(i32.toUsize(v.scopeLevel))
+    v.scopeNext = s.first s.first = usize.toI32(index)
+    fd.vars.set(index, v) fd.scopes.set(i32.toUsize(v.scopeLevel), s) index = index + 1
+  }
+  scope = 2
+  while scope < fd.scopes.length() {
+    let mut s = fd.scopes.get(scope)
+    if s.first < 0 { s.first = fd.scopes.get(i32.toUsize(s.parent)).first fd.scopes.set(scope, s) }
+    scope = scope + 1
+  }
+  index = 0
+  while index < fd.vars.length() {
+    let mut v = fd.vars.get(index)
+    if v.scopeNext < 0 && v.scopeLevel > 1 {
+      let parent = fd.scopes.get(i32.toUsize(v.scopeLevel)).parent
+      v.scopeNext = fd.scopes.get(i32.toUsize(parent)).first fd.vars.set(index, v)
+    }
+    index = index + 1
+  }
+}
+effect fn addThis(fd: &mut FunctionDef, table: &mut AtomTable) -> i32
+  ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  let index = run state.addVar(&mut fd, &mut table, atoms.JS_ATOM_this)
+  if fd.isDerivedClassConstructor { let mut v = fd.vars.get(i32.toUsize(index)) v.isLexical = true fd.vars.set(i32.toUsize(index), v) }
+  return index
+}
+effect fn resolvePseudo(fd: &mut FunctionDef, table: &mut AtomTable, name: u32) -> i32
+  ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  if !fd.hasThisBinding { return -1 }
+  if name == atoms.JS_ATOM_this {
+    if fd.thisVarIndex < 0 { fd.thisVarIndex = run addThis(&mut fd, &mut table) } return fd.thisVarIndex
+  }
+  if name == atoms.JS_ATOM_home_object {
+    if fd.homeObjectVarIndex < 0 { fd.homeObjectVarIndex = run state.addVar(&mut fd, &mut table, name) } return fd.homeObjectVarIndex
+  }
+  if name == atoms.JS_ATOM_new_target {
+    if fd.newTargetVarIndex < 0 { fd.newTargetVarIndex = run state.addVar(&mut fd, &mut table, name) } return fd.newTargetVarIndex
+  }
+  if name == atoms.JS_ATOM_this_active_func {
+    if fd.thisActiveFunctionVarIndex < 0 { fd.thisActiveFunctionVarIndex = run state.addVar(&mut fd, &mut table, name) } return fd.thisActiveFunctionVarIndex
+  }
+  return -1
+}
+effect fn addThisBindings(fd: &mut FunctionDef, table: &mut AtomTable) -> ()
+  ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  let a = run resolvePseudo(&mut fd, &mut table, atoms.JS_ATOM_this)
+  let b = run resolvePseudo(&mut fd, &mut table, atoms.JS_ATOM_new_target)
+  if fd.isDerivedClassConstructor { let c = run resolvePseudo(&mut fd, &mut table, atoms.JS_ATOM_this_active_func) }
+  if fd.hasHomeObject { let d = run resolvePseudo(&mut fd, &mut table, atoms.JS_ATOM_home_object) }
+}
+pub unsafe effect fn addEvalVariables(cell: *mut HeapHeader) -> ()
+  ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  let mut anchor = () let mut ra = ()
+  let fd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
+  let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ra, fd.runtime)
+  if !fd.isEval && (fd.jsMode & JS_MODE_STRICT) == 0 {
+    fd.varObjectIndex = run state.addVar(&mut fd, &mut rt.atoms, atoms.JS_ATOM__var_)
+    if fd.hasParameterExpressions { fd.argVarObjectIndex = run state.addVar(&mut fd, &mut rt.atoms, atoms.JS_ATOM__arg_var_) }
+  }
+  let mut hasThis = fd.hasThisBinding let mut hasArguments = fd.hasArgumentsBinding
+  if hasThis { run addThisBindings(&mut fd, &mut rt.atoms) }
+  if hasArguments {
+    let added = run state.addArgumentsVar(&mut fd, &mut rt.atoms)
+    if fd.hasParameterExpressions && (fd.jsMode & JS_MODE_STRICT) == 0 { run state.addArgumentsArg(&mut fd, &mut rt.atoms) }
+  }
+  if fd.isFuncExpr && fd.functionName != 0 { let name = fd.functionName let added = run state.addFunctionVar(&mut fd, &mut rt.atoms, name) }
+  let mut i: usize = 0
+  while i < fd.args.length() { state.captureVar(&mut fd, usize.toI32(i), true) i = i + 1 }
+  i = 0
+  while i < fd.vars.length() {
+    let v = fd.vars.get(i)
+    if v.scopeLevel == 0 && v.name != atoms.JS_ATOM__ret_ && v.name != 0 { state.captureVar(&mut fd, usize.toI32(i), false) }
+    i = i + 1
+  }
+  drop rt drop fd
+  let mut current = cell
+  while true {
+    let child = unsafe HeapCell.payload<FunctionDef, ()>(&anchor, current)
+    let scope = child.parentScopeLevel let parent = child.parent drop child
+    if Pointer.isNull<HeapHeader>(parent) { break }
+    current = present(parent)
+    let outer = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, current)
+    let runtime = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ra, outer.runtime)
+    if !hasThis && outer.hasThisBinding { run addThisBindings(&mut outer, &mut runtime.atoms) hasThis = true }
+    if !hasArguments && outer.hasArgumentsBinding { let added = run state.addArgumentsVar(&mut outer, &mut runtime.atoms) hasArguments = true }
+    if outer.isFuncExpr && outer.functionName != 0 { let name = outer.functionName let added = run state.addFunctionVar(&mut outer, &mut runtime.atoms, name) }
+    let mut index = outer.scopes.get(i32.toUsize(scope)).first drop runtime drop outer
+    while index >= 0 {
+      let owner = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, current)
+      let v = owner.vars.get(i32.toUsize(index)) state.captureVar(&mut owner, index, false) drop owner
+      let added = run unsafe state.getClosureVar(cell, current, ClosureKind.Local, index, v.name, v.isConst, v.isLexical, v.kind)
+      index = v.scopeNext
+    }
+    let argScope = index == ARG_SCOPE_END
+    let counts = unsafe HeapCell.payload<FunctionDef, ()>(&anchor, current)
+    let argCount = counts.args.length() let varCount = counts.vars.length() let closureCount = counts.closureVars.length() let isEval = counts.isEval drop counts
+    i = 0
+    if !argScope {
+      while i < argCount {
+        let owner = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, current)
+        let v = owner.args.get(i)
+        if v.name != 0 { state.captureVar(&mut owner, usize.toI32(i), true) }
+        drop owner
+        if v.name != 0 { let added = run unsafe state.getClosureVar(cell, current, ClosureKind.Argument, usize.toI32(i), v.name, false, v.isLexical, VariableKind.Normal) }
+        i = i + 1
+      }
+    }
+    i = 0
+    while i < varCount {
+      let owner = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, current)
+      let v = owner.vars.get(i)
+      let visible = (!argScope && v.name != atoms.JS_ATOM__ret_ && v.name != 0) || (argScope && argumentVisible(v.name, v.kind))
+      if v.scopeLevel == 0 && visible { state.captureVar(&mut owner, usize.toI32(i), false) }
+      drop owner
+      if v.scopeLevel == 0 && visible { let added = run unsafe state.getClosureVar(cell, current, ClosureKind.Local, usize.toI32(i), v.name, false, v.isLexical, VariableKind.Normal) }
+      i = i + 1
+    }
+    if isEval {
+      i = 0
+      while i < closureCount {
+        let owner = unsafe HeapCell.payload<FunctionDef, ()>(&anchor, current) let v = owner.closureVars.get(i) drop owner
+        if !globalKind(v.kind) { let added = run unsafe state.getClosureVar(cell, current, ClosureKind.Reference, usize.toI32(i), v.name, v.isConst, v.isLexical, v.variableKind) }
+        i = i + 1
+      }
+    }
+  }
+}
+// Direct-eval snapshots preallocate the combined argument/local/closure bound,
+// unlike incremental addClosureVar, and must not impose its 65534-entry limit.
+effect fn snapshotClosure(fd: &mut FunctionDef, table: &mut AtomTable, kind: ClosureKind,
+    index: i32, name: u32, constant: bool, lexical: bool, variableKind: VariableKind) -> () ! OutOfMemoryError ? &mut Allocator {
+  run fd.closureVars.append(ClosureVar { kind: kind, variableIndex: i32.toU16(index & 65535),
+    name: table.duplicate(name), isConst: constant, isLexical: lexical, variableKind: variableKind })
+}
+pub effect fn addClosureVariables(fd: &mut FunctionDef, table: &mut AtomTable, bytecode: &FunctionBytecode, scopeIndex: i32) -> ()
+  ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  let mut index = scopeIndex let args = u16.toUsize(bytecode.argumentCount) let vars = u16.toUsize(bytecode.variableCount)
+  let mut old: usize = 0 while old < fd.closureVars.length() { table.release(fd.closureVars.get(old).name) old = old + 1 }
+  fd.closureVars = List<ClosureVar>.make()
+  run fd.closureVars.reserveExact(args + vars + bytecode.closureVars.length())
+  while index >= 0 {
+    let v = bytecode.varDefs.get(args + i32.toUsize(index))
+    if v.hasScope { run snapshotClosure(&mut fd, &mut table, ClosureKind.Local, index, v.name, v.isConst, v.isLexical, v.kind) }
+    index = v.scopeNext
+  }
+  let argScope = index == ARG_SCOPE_END let mut i: usize = 0
+  if !argScope { while i < args { let v = bytecode.varDefs.get(i) run snapshotClosure(&mut fd, &mut table, ClosureKind.Argument, usize.toI32(i), v.name, false, false, VariableKind.Normal) i = i + 1 } }
+  i = 0
+  while i < vars {
+    let v = bytecode.varDefs.get(args + i)
+    if !v.hasScope && ((!argScope && v.name != atoms.JS_ATOM__ret_) || (argScope && argumentVisible(v.name, v.kind))) {
+      run snapshotClosure(&mut fd, &mut table, ClosureKind.Local, usize.toI32(i), v.name, v.isConst, v.isLexical, v.kind)
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < bytecode.closureVars.length() {
+    let v = bytecode.closureVars.get(i)
+    if !globalKind(v.kind) { run snapshotClosure(&mut fd, &mut table, ClosureKind.Reference, usize.toI32(i), v.name, v.isConst, v.isLexical, v.variableKind) }
+    i = i + 1
+  }
+}
+pub unsafe effect fn addGlobalVariables(cell: *mut HeapHeader) -> ()
+  ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  let mut anchor = () let mut ra = () let mut ma = ()
+  let fd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
+  let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ra, fd.runtime)
+  let mut needed = true let mut i: usize = 0
+  if fd.evalType == 2 && (fd.jsMode & JS_MODE_STRICT) == 0 {
+    while i < fd.closureVars.length() { let name = fd.closureVars.get(i).name if name == atoms.JS_ATOM__var_ || name == atoms.JS_ATOM__arg_var_ { needed = false break } i = i + 1 }
+  }
+  if needed {
+    let mut kind = ClosureKind.GlobalDeclaration if !Pointer.isNull<HeapHeader>(fd.module) { kind = ClosureKind.ModuleDeclaration }
+    i = 0
+    while i < fd.globalVars.length() {
+      let v = fd.globalVars.get(i) let mut vk = VariableKind.Normal
+      if v.constantPoolIndex >= 0 && !v.isLexical { vk = VariableKind.GlobalFunctionDeclaration }
+      let added = run state.addClosureVar(&mut fd, &mut rt.atoms, kind, usize.toI32(i), v.name, v.isConst, v.isLexical, vk) i = i + 1
+    }
+  }
+  if Pointer.isNull<HeapHeader>(fd.module) { return () }
+  let module = unsafe HeapCell.payloadMut<ModuleDef, ()>(&mut ma, present(fd.module))
+  i = 0
+  while i < module.exports.length() {
+    let mut e = module.exports.get(i)
+    let local = match e.binding { ExportBinding.Local { .. } => true _ => false }
+    if local {
+      let mut j: usize = 0
+      while j < module.imports.length() {
+        let im = module.imports.get(j)
+        if fd.closureVars.get(i32.toUsize(im.variableIndex)).name == e.localName {
+          e.binding = ExportBinding.Indirect { requestedModuleIndex: im.requestedModuleIndex }
+          rt.atoms.release(e.localName)
+          if im.isStar { e.localName = rt.atoms.duplicate(atoms.JS_ATOM__star_) } else { e.localName = rt.atoms.duplicate(im.importName) }
+          module.exports.set(i, e) break
+        }
+        j = j + 1
+      }
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < module.exports.length() {
+    let mut e = module.exports.get(i)
+    match e.binding {
+      ExportBinding.Local { varRef, .. } => {
+        let index = state.findClosureVar(&fd.*, e.localName)
+        if index < 0 { let error = run CompilerError.make(&rt.atoms, CompilerErrorKind.MissingExport, e.localName) fail move error }
+        e.binding = ExportBinding.Local { variableIndex: index, varRef: varRef } module.exports.set(i, e)
+      }
+      _ => ()
+    }
+    i = i + 1
+  }
+}
+
+struct Binding { index: i32, storage: i32, constant: bool, lexical: bool, kind: VariableKind }
+fn localBinding(v: CompilerVar, index: i32) -> Binding { return Binding { index: index, storage: 0, constant: v.isConst, lexical: v.isLexical, kind: v.kind } }
+effect fn pair(fd: &mut FunctionDef, code: u8, index: i32) -> () ? &mut Allocator {
+  run emit.emitU8(&mut fd, code) run emit.emitU16(&mut fd, i32.toU16(index))
+}
+effect fn atomOp(fd: &mut FunctionDef, table: &mut AtomTable, code: u8, name: u32) -> () ? &mut Allocator {
+  run emit.emitU8(&mut fd, code) run emit.emitAtom(&mut fd, &mut table, name)
+}
+effect fn throwReadOnly(fd: &mut FunctionDef, table: &mut AtomTable, name: u32) -> () ? &mut Allocator {
+  run atomOp(&mut fd, &mut table, op.OP_throw_error, name) run emit.emitU8(&mut fd, 0)
+}
+effect fn labelOut(fd: &mut FunctionDef, label: i32) -> () ? &mut Allocator {
+  run emit.emitU8(&mut fd, op.OP_label) run emit.emitU32(&mut fd, i32.toU32(label))
+  let mut slot = fd.labels.get(i32.toUsize(label)) slot.position2 = usize.toI32(fd.bytecode.length()) fd.labels.set(i32.toUsize(label), slot)
+}
+unsafe effect fn objectTest(cell: *mut HeapHeader, owner: *mut HeapHeader, index: i32, closure: bool,
+    name: u32, code: u8, label: &mut i32, isWith: bool) -> ()
+  ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  let mut anchor = () let mut ra = () let mut selected = index
+  if !same(cell, owner) {
+    let outer = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, owner)
+    let mut variableName: u32 = 0
+    if closure { variableName = outer.closureVars.get(i32.toUsize(index)).name }
+    else { variableName = outer.vars.get(i32.toUsize(index)).name state.captureVar(&mut outer, index, false) }
+    drop outer
+    let mut kind = ClosureKind.Local if closure { kind = ClosureKind.Reference }
+    selected = run unsafe state.getClosureVar(cell, owner, kind, index, variableName, false, false, VariableKind.Normal)
+  }
+  let fd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
+  let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ra, fd.runtime)
+  let mut get = op.OP_get_loc if closure || !same(cell, owner) { get = op.OP_get_var_ref }
+  if label.* < 0 { label.* = run emit.newLabelFd(&mut fd) }
+  // Reserve before starting the atom-owning instruction so OOM cleanup can
+  // append the untouched suffix without splicing it into a partial operand.
+  run pair(&mut fd, get, selected)
+  let mut withCode = op.OP_with_get_var
+  if code != op.OP_scope_get_var_undef { withCode = i32.toU8(u8.toI32(op.OP_with_get_var) + u8.toI32(code) - u8.toI32(op.OP_scope_get_var)) }
+  run atomOp(&mut fd, &mut rt.atoms, withCode, name)
+  run emit.emitU32(&mut fd, i32.toU32(label.*))
+  let mut flag: u8 = 0 if isWith { flag = 1 } run emit.emitU8(&mut fd, flag)
+  let count = emit.updateLabel(&mut fd, label.*, 1) fd.jumpCapacity = fd.jumpCapacity + 1
+}
+unsafe effect fn lookup(cell: *mut HeapHeader, name: u32, scope: i32, code: u8, label: &mut i32) -> Binding
+  ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  let mut current = cell let mut level = scope let mut anchor = () let mut ra = ()
+  while true {
+    let view = unsafe HeapCell.payload<FunctionDef, ()>(&anchor, current)
+    let mut index = view.scopes.get(i32.toUsize(level)).first drop view
+    let mut found: i32 = -1
+    while index >= 0 {
+      let owner = unsafe HeapCell.payload<FunctionDef, ()>(&anchor, current)
+      let v = owner.vars.get(i32.toUsize(index)) drop owner
+      if v.name == name {
+        if v.isConst && (code == op.OP_scope_put_var || code == op.OP_scope_make_ref) { return localBinding(v, index) }
+        found = index break
+      }
+      if v.name == atoms.JS_ATOM__with_ && !pseudo(name) { run unsafe objectTest(cell, current, index, false, name, code, &mut label, true) }
+      index = v.scopeNext
+    }
+    let argScope = index == ARG_SCOPE_END
+    let owner = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, current)
+    let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ra, owner.runtime)
+    if found < 0 && !argScope { found = state.findVar(&owner.*, name) }
+    if found < 0 && pseudo(name) { found = run resolvePseudo(&mut owner, &mut rt.atoms, name) }
+    if found < 0 && name == atoms.JS_ATOM_arguments && owner.hasArgumentsBinding { found = run state.addArgumentsVar(&mut owner, &mut rt.atoms) }
+    if found < 0 && owner.isFuncExpr && name == owner.functionName { found = run state.addFunctionVar(&mut owner, &mut rt.atoms, name) }
+    drop rt
+    if found >= 0 {
+      let argument = (found & ARGUMENT_VAR_OFFSET) != 0
+      let mut binding = Binding { index: found, storage: 1, constant: false, lexical: false, kind: VariableKind.Normal }
+      if argument { binding.index = found - ARGUMENT_VAR_OFFSET }
+      else { binding = localBinding(owner.vars.get(i32.toUsize(found)), found) }
+      if same(current, cell) { return move binding }
+      state.captureVar(&mut owner, binding.index, argument) drop owner
+      let mut kind = ClosureKind.Local if argument { kind = ClosureKind.Argument }
+      binding.index = run unsafe state.getClosureVar(cell, current, kind, binding.index, name, binding.constant, binding.lexical, binding.kind)
+      binding.storage = 2 return move binding
+    }
+    let varObject = owner.varObjectIndex let argObject = owner.argVarObjectIndex
+    let parent = owner.parent let parentScope = owner.parentScopeLevel let isEval = owner.isEval
+    drop owner
+    if !pseudo(name) {
+      if !argScope && varObject >= 0 { run unsafe objectTest(cell, current, varObject, false, name, code, &mut label, false) }
+      if argObject >= 0 { run unsafe objectTest(cell, current, argObject, false, name, code, &mut label, false) }
+    }
+    if isEval || Pointer.isNull<HeapHeader>(parent) { break }
+    current = present(parent) level = parentScope
+  }
+  let terminal = unsafe HeapCell.payload<FunctionDef, ()>(&anchor, current)
+  let count = terminal.closureVars.length() let isEval = terminal.isEval drop terminal
+  if !isEval { Intrinsic.trap("QuickJS invariant violated") }
+  let mut i: usize = 0
+  while i < count {
+    let owner = unsafe HeapCell.payload<FunctionDef, ()>(&anchor, current) let v = owner.closureVars.get(i) drop owner
+    if v.name == name {
+      let mut index = usize.toI32(i) let mut storage: i32 = 2 let mut kind = ClosureKind.Reference
+      if globalKind(v.kind) { storage = 3 kind = ClosureKind.GlobalReference }
+      if !same(cell, current) { index = run unsafe state.getClosureVar(cell, current, kind, index, name, v.isConst, v.isLexical, v.variableKind) }
+      return Binding { index: index, storage: storage, constant: v.isConst, lexical: v.isLexical, kind: v.variableKind }
+    }
+    if !pseudo(name) && (v.name == atoms.JS_ATOM__var_ || v.name == atoms.JS_ATOM__arg_var_ || v.name == atoms.JS_ATOM__with_) {
+      run unsafe objectTest(cell, current, usize.toI32(i), true, name, code, &mut label, v.name == atoms.JS_ATOM__with_)
+    }
+    i = i + 1
+  }
+  let owner = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, current)
+  let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ra, owner.runtime)
+  let mut added = run state.addClosureVar(&mut owner, &mut rt.atoms, ClosureKind.Global, 0, name, false, false, VariableKind.Normal)
+  drop rt drop owner
+  if !same(cell, current) { added = run unsafe state.getClosureVar(cell, current, ClosureKind.GlobalReference, added, name, false, false, VariableKind.Normal) }
+  return Binding { index: added, storage: 3, constant: false, lexical: false, kind: VariableKind.Normal }
+}
+fn canOptimize(input: &ByteBuffer, position: i32) -> bool {
+  let p = i32.toUsize(position)
+  let code = input.get(p)
+  return input.get(p + 1) == op.OP_put_ref_value && (code == op.OP_insert3 || code == op.OP_perm4 || code == op.OP_nop || code == op.OP_rot3l)
+}
+effect fn optimizeReference(fd: &mut FunctionDef, input: &mut ByteBuffer, label: i32, next: i32, get: u8, index: i32) -> i32 ? &mut Allocator {
+  let mut result = next
+  if input.get(i32.toUsize(next)) == op.OP_get_ref_value { run pair(&mut fd, get, index) result = result + 1 }
+  let labelPosition = i32.toUsize(fd.labels.get(i32.toUsize(label)).position)
+  let mut p = labelPosition - 5
+  if input.get(labelPosition) == op.OP_insert3 { input.set(p, op.OP_dup) p = p + 1 }
+  input.set(p, get + 1) input.patchU16(p + 1, i32.toU16(index)) p = p + 3
+  while p < labelPosition + 2 { input.set(p, op.OP_nop) p = p + 1 }
+  return result
+}
+unsafe effect fn resolveScope(cell: *mut HeapHeader, input: &mut ByteBuffer, name: u32, scope: i32, code: u8, label: i32, next: i32) -> i32
+  ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  let mut done: i32 = -1
+  let binding = run unsafe lookup(cell, name, scope, code, &mut done)
+  let mut anchor = () let mut ra = ()
+  let fd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
+  let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ra, fd.runtime)
+  let mut result = next
+  let put = code == op.OP_scope_put_var || code == op.OP_scope_put_var_init
+  let mut get = op.OP_get_loc
+  if binding.storage == 1 { get = op.OP_get_arg }
+  else if binding.storage == 2 { get = op.OP_get_var_ref }
+  else if binding.storage == 3 { get = op.OP_get_var }
+  if binding.lexical && binding.storage == 0 { get = op.OP_get_loc_check }
+  if binding.lexical && binding.storage == 2 { get = op.OP_get_var_ref_check }
+  if binding.storage != 3 && binding.constant && (code == op.OP_scope_put_var || code == op.OP_scope_make_ref) {
+    run throwReadOnly(&mut fd, &mut rt.atoms, name)
+  } else if code == op.OP_scope_make_ref {
+    if binding.storage != 3 && binding.kind == VariableKind.FunctionName {
+      run emit.emitU8(&mut fd, op.OP_object)
+      let mut rawGet = op.OP_get_loc if binding.storage == 2 { rawGet = op.OP_get_var_ref }
+      run pair(&mut fd, rawGet, binding.index)
+      run atomOp(&mut fd, &mut rt.atoms, op.OP_define_field, name)
+      run atomOp(&mut fd, &mut rt.atoms, op.OP_push_atom_value, name)
+    } else if done < 0 && canOptimize(&input.*, fd.labels.get(i32.toUsize(label)).position) {
+      result = run optimizeReference(&mut fd, &mut input, label, next, get, binding.index)
+    } else {
+      let mut make = op.OP_make_loc_ref
+      if binding.storage == 1 { make = op.OP_make_arg_ref }
+      else if binding.storage == 2 { make = op.OP_make_var_ref_ref }
+      else if binding.storage == 3 { make = op.OP_make_var_ref }
+      if binding.storage < 2 { state.captureVar(&mut fd, binding.index, binding.storage == 1) }
+      run atomOp(&mut fd, &mut rt.atoms, make, name)
+      if binding.storage != 3 { run emit.emitU16(&mut fd, i32.toU16(binding.index)) }
+    }
+  } else if code == op.OP_scope_delete_var {
+    if binding.storage == 3 { run atomOp(&mut fd, &mut rt.atoms, op.OP_delete_var, name) }
+    else { run emit.emitU8(&mut fd, op.OP_push_false) }
+  } else if binding.storage != 3 && code == op.OP_scope_put_var && binding.kind == VariableKind.FunctionName {
+    run emit.emitU8(&mut fd, op.OP_drop)
+  } else {
+    if code == op.OP_scope_get_ref { run emit.emitU8(&mut fd, op.OP_undefined) }
+    let mut selected = get
+    if binding.storage == 3 {
+      if code == op.OP_scope_put_var_init { selected = op.OP_put_var_init }
+      else if code == op.OP_scope_get_var_undef { selected = op.OP_get_var_undef }
+      else if put { selected = op.OP_put_var }
+    } else if put {
+      selected = get + 1
+      if binding.lexical && code == op.OP_scope_put_var_init {
+        if binding.storage == 0 { selected = op.OP_put_loc if name == atoms.JS_ATOM_this { selected = op.OP_put_loc_check_init } }
+        else { selected = op.OP_put_var_ref if name == atoms.JS_ATOM_this { selected = op.OP_put_var_ref_check_init } }
+      }
+    } else if code == op.OP_scope_get_var_checkthis && binding.storage == 0 && binding.lexical { selected = op.OP_get_loc_checkthis }
+    run pair(&mut fd, selected, binding.index)
+  }
+  if done >= 0 { run labelOut(&mut fd, done) }
+  return result
+}
+
+unsafe effect fn privateLookup(cell: *mut HeapHeader, name: u32, scope: i32) -> Binding
+  ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  let mut current = cell let mut level = scope let mut anchor = () let mut ra = ()
+  while true {
+    let owner = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, current)
+    let mut index = owner.scopes.get(i32.toUsize(level)).first
+    while index >= 0 {
+      let v = owner.vars.get(i32.toUsize(index))
+      if v.name == name {
+        let mut binding = localBinding(v, index)
+        if same(cell, current) { return move binding }
+        state.captureVar(&mut owner, index, false) drop owner
+        binding.index = run unsafe state.getClosureVar(cell, current, ClosureKind.Local, index, name, true, true, VariableKind.Normal)
+        binding.storage = 2 return move binding
+      }
+      index = v.scopeNext
+    }
+    let parent = owner.parent level = owner.parentScopeLevel
+    if Pointer.isNull<HeapHeader>(parent) {
+      if owner.isEval {
+        let mut i: usize = 0
+        while i < owner.closureVars.length() {
+          let v = owner.closureVars.get(i)
+          if v.name == name {
+            let mut selected = usize.toI32(i) drop owner
+            if !same(cell, current) { selected = run unsafe state.getClosureVar(cell, current, ClosureKind.Reference, selected, name, v.isConst, v.isLexical, v.variableKind) }
+            return Binding { index: selected, storage: 2, constant: v.isConst, lexical: v.isLexical, kind: v.variableKind }
+          }
+          i = i + 1
+        }
+      }
+      let rt = unsafe HeapCell.payload<RuntimeState, ()>(&ra, owner.runtime)
+      let error = run CompilerError.make(&rt.atoms, CompilerErrorKind.UndefinedPrivateField, name) fail move error
+    }
+    drop owner current = present(parent)
+  }
+}
+effect fn privateGet(fd: &mut FunctionDef, binding: &Binding) -> () ? &mut Allocator {
+  let mut get = op.OP_get_loc if binding.storage == 2 { get = op.OP_get_var_ref }
+  run pair(&mut fd, get, binding.index)
+}
+unsafe effect fn resolvePrivate(cell: *mut HeapHeader, name: u32, scope: i32, code: u8) -> ()
+  ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  let binding = run unsafe privateLookup(cell, name, scope)
+  let mut anchor = () let mut ra = ()
+  if code == op.OP_scope_put_private_field && (binding.kind == VariableKind.PrivateSetter || binding.kind == VariableKind.PrivateGetterSetter) {
+    let owner = unsafe HeapCell.payload<FunctionDef, ()>(&anchor, cell)
+    let runtime = owner.runtime drop owner
+    let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ra, runtime)
+    let setterName = run rt.atoms.concatUtf8(name, b"<set>") drop rt
+    let outcome = run Effect.result(unsafe privateLookup(cell, setterName, scope))
+    let runtimeState = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ra, runtime)
+    runtimeState.atoms.release(setterName) drop runtimeState
+    let setter = match move outcome {
+      Result<Binding, OutOfMemoryError | StringLengthError | CompilerError>.Success { value } => move value
+      Result<Binding, OutOfMemoryError | StringLengthError | CompilerError>.Failure { error } => { fail move error }
+    }
+    let fd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
+    run privateGet(&mut fd, &setter)
+    run emit.emitU8(&mut fd, op.OP_swap) run emit.emitU8(&mut fd, op.OP_rot3r)
+    run emit.emitU8(&mut fd, op.OP_check_brand) run emit.emitU8(&mut fd, op.OP_rot3l)
+    run pair(&mut fd, op.OP_call_method, 1) run emit.emitU8(&mut fd, op.OP_drop)
+    return ()
+  }
+  let fd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
+  let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ra, fd.runtime)
+  if code == op.OP_scope_in_private_field {
+    run privateGet(&mut fd, &binding) run emit.emitU8(&mut fd, op.OP_private_in)
+  } else if code == op.OP_scope_put_private_field {
+    if binding.kind == VariableKind.PrivateField { run privateGet(&mut fd, &binding) run emit.emitU8(&mut fd, op.OP_put_private_field) }
+    else { run throwReadOnly(&mut fd, &mut rt.atoms, name) }
+  } else if binding.kind == VariableKind.PrivateField {
+    if code == op.OP_scope_get_private_field2 { run emit.emitU8(&mut fd, op.OP_dup) }
+    run privateGet(&mut fd, &binding) run emit.emitU8(&mut fd, op.OP_get_private_field)
+  } else if binding.kind == VariableKind.PrivateMethod {
+    run privateGet(&mut fd, &binding) run emit.emitU8(&mut fd, op.OP_check_brand)
+    if code != op.OP_scope_get_private_field2 { run emit.emitU8(&mut fd, op.OP_nip) }
+  } else if binding.kind == VariableKind.PrivateGetter || binding.kind == VariableKind.PrivateGetterSetter {
+    if code == op.OP_scope_get_private_field2 { run emit.emitU8(&mut fd, op.OP_dup) }
+    run privateGet(&mut fd, &binding) run emit.emitU8(&mut fd, op.OP_check_brand) run pair(&mut fd, op.OP_call_method, 0)
+  } else { run throwReadOnly(&mut fd, &mut rt.atoms, name) }
+}
+effect fn hoisted(fd: &mut FunctionDef, table: &mut AtomTable) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut i: usize = 0
+  while i < fd.args.length() {
+    let v = fd.args.get(i)
+    if v.functionPoolIndex >= 0 {
+      run emit.emitU8(&mut fd, op.OP_fclosure) run emit.emitU32(&mut fd, i32.toU32(v.functionPoolIndex))
+      run pair(&mut fd, op.OP_put_arg, usize.toI32(i))
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < fd.vars.length() {
+    let v = fd.vars.get(i)
+    if v.scopeLevel == 0 && v.functionPoolIndex >= 0 {
+      run emit.emitU8(&mut fd, op.OP_fclosure) run emit.emitU32(&mut fd, i32.toU32(v.functionPoolIndex))
+      run pair(&mut fd, op.OP_put_loc, usize.toI32(i))
+    }
+    i = i + 1
+  }
+  let mut next: i32 = -1
+  if !Pointer.isNull<HeapHeader>(fd.module) {
+    next = run emit.newLabelFd(&mut fd)
+    run emit.emitU8(&mut fd, op.OP_push_this) run emit.emitU8(&mut fd, op.OP_if_false) run emit.emitU32(&mut fd, i32.toU32(next))
+    let count = emit.updateLabel(&mut fd, next, 1) fd.jumpCapacity = fd.jumpCapacity + 1
+  }
+  i = 0
+  while i < fd.globalVars.length() {
+    let v = fd.globalVars.get(i) let mut object = false let mut force = v.forceInit let mut index: usize = 0
+    while index < fd.closureVars.length() {
+      let cv = fd.closureVars.get(index)
+      if cv.name == v.name { force = false break }
+      if cv.name == atoms.JS_ATOM__var_ || cv.name == atoms.JS_ATOM__arg_var_ {
+        run pair(&mut fd, op.OP_get_var_ref, usize.toI32(index)) object = true force = true break
+      }
+      index = index + 1
+    }
+    if index == fd.closureVars.length() { Intrinsic.trap("QuickJS invariant violated") }
+    if v.constantPoolIndex >= 0 || force {
+      if v.constantPoolIndex >= 0 {
+        run emit.emitU8(&mut fd, op.OP_fclosure) run emit.emitU32(&mut fd, i32.toU32(v.constantPoolIndex))
+        if v.name == atoms.JS_ATOM__default_ { run atomOp(&mut fd, &mut table, op.OP_set_name, atoms.JS_ATOM_default) }
+      } else { run emit.emitU8(&mut fd, op.OP_undefined) }
+      if object { run atomOp(&mut fd, &mut table, op.OP_define_field, v.name) run emit.emitU8(&mut fd, op.OP_drop) }
+      else { run pair(&mut fd, op.OP_put_var_ref, usize.toI32(index)) }
+    }
+    table.release(v.name)
+    let mut cleared = v cleared.name = 0 fd.globalVars.set(i, cleared)
+    i = i + 1
+  }
+  fd.globalVars = List<GlobalVar>.make()
+  if next >= 0 { run emit.emitU8(&mut fd, op.OP_return_undef) run labelOut(&mut fd, next) }
+}
+fn captureScope(fd: &mut FunctionDef, scope: i32) -> () {
+  let mut index = fd.scopes.get(i32.toUsize(scope)).first
+  while index >= 0 { let next = fd.vars.get(i32.toUsize(index)).scopeNext state.captureVar(&mut fd, index, false) index = next }
+}
+fn atomOperand(code: u8) -> bool {
+  let format = op.opcodeInfo(code, false).format
+  return format == op.OP_FMT_atom || format == op.OP_FMT_atom_u8 || format == op.OP_FMT_atom_u16 || format == op.OP_FMT_atom_label_u8 || format == op.OP_FMT_atom_label_u16
+}
+// Retain copied operands only once their full word is committed. The input keeps
+// its original references until pass cleanup, including exceptional exits.
+effect fn copyInstruction(fd: &mut FunctionDef, table: &mut AtomTable, input: &ByteBuffer, position: usize) -> () ? &mut Allocator {
+  let code = input.get(position) let size = u8.toUsize(op.opcodeInfo(code, false).size)
+  run emit.emitU8(&mut fd, code)
+  let mut offset: usize = 1
+  if atomOperand(code) {
+    run emit.emitAtom(&mut fd, &mut table, readU32(input.asSlice(), position + 1)) offset = 5
+  }
+  while offset < size { run emit.emitU8(&mut fd, input.get(position + offset)) offset = offset + 1 }
+}
+effect fn lineOut(fd: &mut FunctionDef, line: i32) -> () ? &mut Allocator {
+  fd.lineNumberCapacity = fd.lineNumberCapacity + 1
+  run emit.emitU8(&mut fd, op.OP_line_num) run emit.emitU32(&mut fd, unsignedWord(line))
+}
+unsafe effect fn resolvePass(cell: *mut HeapHeader, input: &mut ByteBuffer, position: &mut usize) -> ()
+  ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  let mut anchor = () let mut ra = ()
+  let initial = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
+  let runtime = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ra, initial.runtime)
+  let mut i: usize = 0
+  while i < initial.globalVars.length() {
+    let global = initial.globalVars.get(i) let mut j: usize = 0
+    while j < initial.closureVars.length() {
+      let cv = initial.closureVars.get(j)
+      if globalKind(cv.kind) || cv.kind == ClosureKind.ModuleDeclaration || cv.kind == ClosureKind.ModuleImport { break }
+      if cv.name == global.name {
+        if initial.evalType == 2 && cv.isLexical { run atomOp(&mut initial, &mut runtime.atoms, op.OP_throw_error, global.name) run emit.emitU8(&mut initial, 1) }
+        break
+      }
+      if cv.name == atoms.JS_ATOM__var_ || cv.name == atoms.JS_ATOM__arg_var_ { break }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  drop runtime drop initial
+  let mut line: i32 = 0 let mut cc = CodeContext.make()
+  while position.* < input.length() {
+    let p = position.* let code = input.get(p)
+    let size = u8.toUsize(op.opcodeInfo(code, false).size) let mut next = p + size
+    if code == op.OP_scope_get_var_checkthis || code == op.OP_scope_get_var_undef || code == op.OP_scope_get_var
+      || code == op.OP_scope_put_var || code == op.OP_scope_delete_var || code == op.OP_scope_get_ref || code == op.OP_scope_put_var_init || code == op.OP_scope_make_ref {
+      let name = readU32(input.asSlice(), p + 1) let mut label: i32 = -1 let mut scopeOffset: usize = 5
+      if code == op.OP_scope_make_ref {
+        label = u32.toI32(readU32(input.asSlice(), p + 5)) scopeOffset = 9
+        let owner = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
+        let count = emit.updateLabel(&mut owner, label, -1)
+      }
+      let scope = u16.toI32(readU16(input.asSlice(), p + scopeOffset))
+      next = i32.toUsize(run unsafe resolveScope(cell, &mut input, name, scope, code, label, usize.toI32(next)))
+    } else if code == op.OP_scope_get_private_field || code == op.OP_scope_get_private_field2 || code == op.OP_scope_put_private_field || code == op.OP_scope_in_private_field {
+      let name = readU32(input.asSlice(), p + 1) let scope = u16.toI32(readU16(input.asSlice(), p + 5))
+      run unsafe resolvePrivate(cell, name, scope, code)
+    } else {
+      let fd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
+      let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ra, fd.runtime)
+      let mut copy = true
+      if code == op.OP_line_num { line = signedWord(readU32(input.asSlice(), p + 1)) fd.lineNumberCapacity = fd.lineNumberCapacity + 1 }
+      else if code == op.OP_eval || code == op.OP_apply_eval {
+        let mut offset: usize = 1 if code == op.OP_eval { offset = 3 }
+        let scope = u16.toI32(readU16(input.asSlice(), p + offset))
+        captureScope(&mut fd, scope)
+        run emit.emitU8(&mut fd, code)
+        if code == op.OP_eval { run emit.emitU16(&mut fd, readU16(input.asSlice(), p + 1)) }
+        let adjusted = fd.scopes.get(i32.toUsize(scope)).first - ARG_SCOPE_END
+        run emit.emitU16(&mut fd, i32.toU16(adjusted)) copy = false
+      } else if code == op.OP_gosub {
+        fd.jumpCapacity = fd.jumpCapacity + 1
+        let label = u32.toI32(readU32(input.asSlice(), p + 1))
+        let target = fd.labels.get(i32.toUsize(label)).position
+        if matchCode(&mut cc, input.asSlice(), target, &[opcode(op.OP_ret), -1]) { let count = emit.updateLabel(&mut fd, label, -1) copy = false }
+      } else if code == op.OP_insert3 {
+        if matchCode(&mut cc, input.asSlice(), usize.toI32(next), &[M2(op.OP_put_array_el, op.OP_put_ref_value), opcode(op.OP_drop), -1]) {
+          run emit.emitU8(&mut fd, i32.toU8(cc.opcode)) next = i32.toUsize(cc.position)
+          if cc.lineNumber != -1 && cc.lineNumber != line { line = cc.lineNumber run lineOut(&mut fd, line) } copy = false
+        }
+      } else if code == op.OP_goto || code == op.OP_tail_call || code == op.OP_tail_call_method || code == op.OP_return
+        || code == op.OP_return_undef || code == op.OP_throw || code == op.OP_throw_error || code == op.OP_ret {
+        if code == op.OP_goto { fd.jumpCapacity = fd.jumpCapacity + 1 }
+        run copyInstruction(&mut fd, &mut rt.atoms, &input.*, p)
+        let mut deadLine: i32 = -1
+        let end = i32.toUsize(skipDeadCode(&mut fd, &mut rt.atoms, input.asSlice(), usize.toI32(next), &mut deadLine))
+        // skipDeadCode released these original operands; zero them before cleanup.
+        let mut dead = next
+        while dead < end {
+          let deadCode = input.get(dead) let deadSize = u8.toUsize(op.opcodeInfo(deadCode, false).size)
+          if atomOperand(deadCode) { input.patchU32(dead + 1, 0) }
+          dead = dead + deadSize
+        }
+        next = end
+        if end < input.length() && deadLine >= 0 && deadLine != line { line = deadLine run lineOut(&mut fd, line) }
+        copy = false
+      } else if code == op.OP_label {
+        let index = i32.toUsize(u32.toI32(readU32(input.asSlice(), p + 1)))
+        let mut slot = fd.labels.get(index) slot.position2 = usize.toI32(fd.bytecode.length() + size) fd.labels.set(index, slot)
+      } else if code == op.OP_enter_scope || code == op.OP_leave_scope {
+        let scope = u16.toI32(readU16(input.asSlice(), p + 1))
+        if code == op.OP_enter_scope && scope == fd.bodyScope { run hoisted(&mut fd, &mut rt.atoms) }
+        let mut index = fd.scopes.get(i32.toUsize(scope)).first
+        while index >= 0 {
+          let v = fd.vars.get(i32.toUsize(index)) if v.scopeLevel != scope { break }
+          if code == op.OP_leave_scope {
+            if v.isCaptured { run pair(&mut fd, op.OP_close_loc, index) }
+          } else if index != fd.argumentsArgIndex {
+            if v.kind == VariableKind.FunctionDeclaration || v.kind == VariableKind.NewFunctionDeclaration {
+              run emit.emitU8(&mut fd, op.OP_fclosure) run emit.emitU32(&mut fd, i32.toU32(v.functionPoolIndex)) run pair(&mut fd, op.OP_put_loc, index)
+            } else { run pair(&mut fd, op.OP_set_loc_uninitialized, index) }
+          }
+          index = v.scopeNext
+        }
+        copy = false
+      } else if code == op.OP_set_name {
+        if readU32(input.asSlice(), p + 1) == 0 { copy = false }
+      } else if code == op.OP_if_false || code == op.OP_if_true || code == op.OP_catch { fd.jumpCapacity = fd.jumpCapacity + 1 }
+      else if code == op.OP_dup {
+        if matchCode(&mut cc, input.asSlice(), usize.toI32(next), &[M2(op.OP_if_false, op.OP_if_true), opcode(op.OP_drop), -1]) {
+          let first = cc.label let mut target = first let branch = cc.opcode let after = cc.position let branchLine = cc.lineNumber
+          let mut targetPosition = getLabelPosition(&fd.*, input.asSlice(), target)
+          while matchCode(&mut cc, input.asSlice(), targetPosition, &[opcode(op.OP_dup), branch, opcode(op.OP_drop), -1]) {
+            target = cc.label targetPosition = getLabelPosition(&fd.*, input.asSlice(), target)
+          }
+          if matchCode(&mut cc, input.asSlice(), targetPosition, &[branch, -1]) {
+            fd.jumpCapacity = fd.jumpCapacity + 1
+            let removed = emit.updateLabel(&mut fd, first, -1) let added = emit.updateLabel(&mut fd, cc.label, 1)
+            run emit.emitU8(&mut fd, i32.toU8(branch)) run emit.emitU32(&mut fd, i32.toU32(cc.label)) next = i32.toUsize(after)
+            if branchLine != -1 && branchLine != line { line = branchLine run lineOut(&mut fd, line) }
+            copy = false
+          }
+        }
+      } else if code == op.OP_nop || code == op.OP_set_class_name { copy = false }
+      else if code == op.OP_get_field_opt_chain {
+        run atomOp(&mut fd, &mut rt.atoms, op.OP_get_field, readU32(input.asSlice(), p + 1)) copy = false
+      } else if code == op.OP_get_array_el_opt_chain { run emit.emitU8(&mut fd, op.OP_get_array_el) copy = false }
+      if copy { run copyInstruction(&mut fd, &mut rt.atoms, &input.*, p) }
+    }
+    position.* = next
+  }
+}
+pub unsafe effect fn resolveVariables(cell: *mut HeapHeader) -> ()
+  ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  let mut anchor = () let mut ra = ()
+  let initial = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
+  if initial.bytecodeError { fail OutOfMemoryError {} }
+  let mut input = Intrinsic.replace(initial.bytecode, ByteBuffer.make()) drop initial
+  let mut position: usize = 0
+  let outcome = run Effect.result(unsafe resolvePass(cell, &mut input, &mut position))
+  let fd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
+  let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ra, fd.runtime)
+  match move outcome {
+    Result<(), OutOfMemoryError | StringLengthError | CompilerError>.Success { .. } => {
+      emit.freeBytecodeAtoms(&mut rt.atoms, input.asSlice(), false)
+      if fd.bytecodeError { fail OutOfMemoryError {} }
+      return ()
+    }
+    Result<(), OutOfMemoryError | StringLengthError | CompilerError>.Failure { error } => {
+      // Preserve the unprocessed suffix just as source fail: does. This retains
+      // diagnostics independently and leaves a destructible, atom-owning buffer.
+      while position < input.length() {
+        let size = u8.toUsize(op.opcodeInfo(input.get(position), false).size)
+        run copyInstruction(&mut fd, &mut rt.atoms, &input, position) position = position + size
+      }
+      emit.freeBytecodeAtoms(&mut rt.atoms, input.asSlice(), false)
+      fail move error
+    }
+  }
+}

@@ -1,0 +1,876 @@
+//! Native state and storage for the pinned QuickJS engine; no evaluator or runtime policy.
+//!
+//! Every JS reference below is explicit: copying Value or a raw header pointer does not
+//! retain it. HeapHeader is the only JS reference count. Native container destruction
+//! releases storage, NOT the JS children it contains; engine destruction must visit and
+//! release those children first. List length/capacity replace the source's count/size pairs.
+//!
+//! Heap pointers name HeapCell payloads of the documented type. Only HeapCell.payload /
+//! payloadMut may recover them: neither header offsets nor native struct layout are ABI.
+//! Raw links are borrowed and require live, stable allocations and exclusive mutation.
+//! RuntimeAllocator and reentrant host dispatch providers belong to the public Runtime
+//! handle, not RuntimeState; source malloc bookkeeping is provided by runtime_memory.
+
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.box { Box }
+import silk.layout { Layout }
+import silk.list { List }
+import silk.option { Option }
+import silk.ownership { Copy }
+import silk.pointer { Pointer }
+import silk.raw_buffer { RawBuffer }
+import silk.slot { Slot }
+import silk.usize
+import js_atoms { AtomTable }
+import js_heap { HeapHeader }
+import js_value { Value }
+
+pub const JS_MODE_STRICT: u8 = 1
+pub const JS_MODE_ASYNC: u8 = 4
+pub const JS_MODE_BACKTRACE_BARRIER: u8 = 8
+pub const JS_MAX_LOCAL_VARS: usize = 65534
+pub const JS_INTERRUPT_COUNTER_INIT: i32 = 10000
+pub const ARG_SCOPE_INDEX: i32 = 1
+pub const ARG_SCOPE_END: i32 = -2
+
+pub const JS_PROP_CONFIGURABLE: u32 = 1
+pub const JS_PROP_WRITABLE: u32 = 2
+pub const JS_PROP_ENUMERABLE: u32 = 4
+pub const JS_PROP_C_W_E: u32 = 7
+pub const JS_PROP_LENGTH: u32 = 8
+pub const JS_PROP_TMASK: u32 = 48
+pub const JS_PROP_NORMAL: u32 = 0
+pub const JS_PROP_GETSET: u32 = 16
+pub const JS_PROP_VARREF: u32 = 32
+pub const JS_PROP_AUTOINIT: u32 = 48
+pub const JS_PROP_HAS_SHIFT: u32 = 8
+pub const JS_PROP_HAS_CONFIGURABLE: u32 = 256
+pub const JS_PROP_HAS_WRITABLE: u32 = 512
+pub const JS_PROP_HAS_ENUMERABLE: u32 = 1024
+pub const JS_PROP_HAS_GET: u32 = 2048
+pub const JS_PROP_HAS_SET: u32 = 4096
+pub const JS_PROP_HAS_VALUE: u32 = 8192
+pub const JS_PROP_THROW: u32 = 16384
+pub const JS_PROP_THROW_STRICT: u32 = 32768
+pub const JS_PROP_NO_EXOTIC: u32 = 65536
+pub const JS_CALL_FLAG_CONSTRUCTOR: u32 = 1
+pub const JS_PROP_INITIAL_SIZE: usize = 2
+pub const JS_PROP_INITIAL_HASH_SIZE: usize = 4
+pub const JS_NATIVE_ERROR_COUNT: usize = 9
+pub const JS_CONTEXT_VALUE_COUNT: usize = 7
+pub const JS_INTL_CTOR_NUMBERFORMAT: usize = 0
+pub const JS_INTL_CTOR_DATETIMEFORMAT: usize = 1
+pub const JS_INTL_CTOR_COLLATOR: usize = 2
+pub const JS_INTL_CTOR_LISTFORMAT: usize = 3
+pub const JS_INTL_CTOR_LOCALE: usize = 4
+pub const JS_INTL_CTOR_DURATIONFORMAT: usize = 5
+pub const JS_INTL_FALLBACK_SYMBOL: usize = 6
+
+pub enum NativeErrorKind {
+  Eval, Range, Reference, Syntax, Type, Uri, Internal, Aggregate, Suppressed
+}
+
+/// Closed builtin dispatch families; method is a family-local native operation ID.
+/// Host IDs instead name entries in the owning Runtime's reentrant host service.
+pub enum BuiltinFamily {
+  Runtime, Object, Function, BoundFunction, Array, Arguments, Error, Number, BigInt,
+  Boolean, String, Symbol, Date, Math, Json, RegExp, ArrayBuffer, SharedArrayBuffer,
+  TypedArray, DataView, Atomics, Map, Set, WeakMap, WeakSet, Iterator, AsyncIterator,
+  Generator, Async, AsyncGenerator, Promise, Proxy, Reflect, WeakRef,
+  FinalizationRegistry, DisposableStack, AsyncDisposableStack, Module, Job,
+  Global, Intl, Temporal, Std, Os
+}
+pub union NativeFunctionId {
+  Builtin { pub family: BuiltinFamily, pub method: u32 },
+  Host { pub id: u32 }
+}
+impl Copy for NativeFunctionId {}
+
+/// These names and sourceOrdinal preserve every JSCFunctionEnum calling convention.
+/// Captured-data functions have a separate signature, selected by isDataFunction below.
+pub enum NativeCallProtocol {
+  Generic, GenericMagic, Constructor, ConstructorMagic, ConstructorOrFunction,
+  ConstructorOrFunctionMagic, ConstructorOrFunctionFlags, FloatUnary, FloatBinary,
+  Getter, Setter, GetterMagic, SetterMagic, IteratorNext
+}
+impl NativeCallProtocol {
+  pub fn sourceOrdinal(self: &Self) -> u8 {
+    return match self.* {
+      NativeCallProtocol.Generic => 0
+      NativeCallProtocol.GenericMagic => 1
+      NativeCallProtocol.Constructor => 2
+      NativeCallProtocol.ConstructorMagic => 3
+      NativeCallProtocol.ConstructorOrFunction => 4
+      NativeCallProtocol.ConstructorOrFunctionMagic => 5
+      NativeCallProtocol.ConstructorOrFunctionFlags => 6
+      NativeCallProtocol.FloatUnary => 7
+      NativeCallProtocol.FloatBinary => 8
+      NativeCallProtocol.Getter => 9
+      NativeCallProtocol.Setter => 10
+      NativeCallProtocol.GetterMagic => 11
+      NativeCallProtocol.SetterMagic => 12
+      NativeCallProtocol.IteratorNext => 13
+    }
+  }
+}
+
+pub struct HostHook {
+  pub callback: Option<NativeFunctionId>,
+  pub opaque: ?*mut u8
+}
+pub struct ModuleLoaderHooks {
+  pub normalize: Option<NativeFunctionId>,
+  pub load: Option<NativeFunctionId>,
+  pub checkSupportedImportAttributes: Option<NativeFunctionId>,
+  pub loaderHasAttributes: bool,
+  pub opaque: ?*mut u8
+}
+pub struct SharedArrayBufferHooks {
+  pub allocate: Option<NativeFunctionId>,
+  pub free: Option<NativeFunctionId>,
+  pub duplicate: Option<NativeFunctionId>,
+  pub opaque: ?*mut u8
+}
+pub struct LocaleCallbacks {
+  pub numberToLocaleString: Option<NativeFunctionId>,
+  pub dateToLocaleString: Option<NativeFunctionId>,
+  pub stringLocaleCompare: Option<NativeFunctionId>,
+  pub bigintToLocaleString: Option<NativeFunctionId>,
+  pub getStringLocaleLanguage: Option<NativeFunctionId>
+}
+
+pub const EXOTIC_GET_OWN_PROPERTY: u16 = 1
+pub const EXOTIC_GET_OWN_PROPERTY_NAMES: u16 = 2
+pub const EXOTIC_DELETE_PROPERTY: u16 = 4
+pub const EXOTIC_DEFINE_OWN_PROPERTY: u16 = 8
+pub const EXOTIC_HAS_PROPERTY: u16 = 16
+pub const EXOTIC_GET_PROPERTY: u16 = 32
+pub const EXOTIC_SET_PROPERTY: u16 = 64
+pub const EXOTIC_GET_PROTOTYPE: u16 = 128
+pub const EXOTIC_SET_PROTOTYPE: u16 = 256
+pub const EXOTIC_IS_EXTENSIBLE: u16 = 512
+pub const EXOTIC_PREVENT_EXTENSIONS: u16 = 1024
+
+/// descriptor names a native exotic-method table, not an ordinary JS callable.
+/// Dispatch supplies the method bit as well as this ID; a Host table may contain
+/// independently registered methods. methodMask distinguishes absent callbacks.
+pub struct ExoticCallbacks {
+  pub descriptor: NativeFunctionId,
+  pub methodMask: u16
+}
+impl Copy for ExoticCallbacks {}
+pub struct ClassDef {
+  pub classId: u32,
+  pub classNameAtom: u32,
+  pub finalizer: Option<NativeFunctionId>,
+  pub mark: Option<NativeFunctionId>,
+  pub call: Option<NativeFunctionId>,
+  pub exotic: Option<ExoticCallbacks>
+}
+
+/// Bytecode/debug/ROM storage. Borrowed never frees or copies data. Public raw fields
+/// deliberately do not confer a safe borrow: byte and pointerAt are unsafe for both
+/// variants. The caller keeps borrowed ROM alive and immutable for every access and
+/// keeps owned bytes from moving/growing while an escaped pointer is in use.
+pub union ByteStorage {
+  Owned { pub bytes: List<u8> },
+  Borrowed { pub data: *const u8, pub length: usize }
+}
+impl ByteStorage {
+  pub fn length(self: &Self) -> usize {
+    return match &self.* {
+      ByteStorage.Owned { bytes } => bytes.length()
+      ByteStorage.Borrowed { length, .. } => length
+    }
+  }
+  /// Requires index < length and live immutable borrowed storage. No JS ownership.
+  pub unsafe fn byte(self: &Self, index: usize) -> u8 {
+    return match &self.* {
+      ByteStorage.Owned { bytes } => bytes.get(index)
+      ByteStorage.Borrowed { data, .. } => unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(data), index))
+    }
+  }
+  /// Requires index < length; the returned pointer is valid only while the backing
+  /// allocation stays alive and unmoved and no mutation conflicts with its uses.
+  pub unsafe fn pointerAt(self: &Self, index: usize) -> *const u8 {
+    return match &self.* {
+      ByteStorage.Owned { bytes } => Pointer.fromRef<u8>(&bytes.asSlice()[index])
+      ByteStorage.Borrowed { data, .. } => unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(data), index)
+    }
+  }
+}
+
+/// Fixed-size initialized VM slots. Moving this owner does not move its slots.
+/// All slots start Undefined. No growth or ownership-cloning operation exists.
+/// Dropping this owner frees native storage only; the engine must first release
+/// every owned JS child. get/replace/view return borrowed Value copies, not retains.
+pub struct ValueSlots {
+  storage: Option<Intrinsic.RawBuffer<Value>>,
+  count: usize,
+  emptyAnchor: [Value; 0]
+}
+impl ValueSlots {
+  pub effect fn make(count: usize) -> Self ! OutOfMemoryError ? &mut Allocator {
+    if count == 0 {
+      return Self { storage: Option<Intrinsic.RawBuffer<Value>>.none(), count: 0, emptyAnchor: [] }
+    }
+    let element = Layout.of<Value>()
+    if count > usize.MAX / element.bytes { return run Allocator.outOfMemory() }
+    let allocation = run Allocator.allocate(Layout { bytes: count * element.bytes, alignment: element.alignment })
+    let mut storage = unsafe RawBuffer.from<Value>(move allocation, count)
+    let mut index: usize = 0
+    while index < count {
+      Slot.write(RawBuffer.slot<Value>(&mut storage, index), Value.Undefined)
+      index = index + 1
+    }
+    return Self { storage: Option<Intrinsic.RawBuffer<Value>>.some(move storage), count: count, emptyAnchor: [] }
+  }
+  pub fn length(self: &Self) -> usize { return self.count }
+  pub fn view(self: &Self) -> &[Value] {
+    return match &self.storage {
+      Option<Intrinsic.RawBuffer<Value>>.Some { value } => unsafe RawBuffer.view<Value>(&value, 0, self.count)
+      Option<Intrinsic.RawBuffer<Value>>.None => emptySlotView(&self.emptyAnchor)
+    }
+  }
+  pub fn viewMut(self: &mut Self) -> &mut [Value] {
+    return match &mut self.storage {
+      Option<Intrinsic.RawBuffer<Value>>.Some { value } => unsafe RawBuffer.viewMut<Value>(&mut value, 0, self.count)
+      Option<Intrinsic.RawBuffer<Value>>.None => emptySlotViewMut(&mut self.emptyAnchor)
+    }
+  }
+  pub fn get(self: &Self, index: usize) -> Value { return self.view()[index] }
+  /// Replaces a slot without retaining incoming or releasing outgoing references.
+  /// The caller transfers the slot's JS ownership and handles the returned old value.
+  pub fn replace(self: &mut Self, index: usize, value: Value) -> Value {
+    let slots = self.viewMut()
+    let old = slots[index]
+    slots[index] = value
+    return old
+  }
+  /// Bounds checked. An escaped pointer borrows no lifetime and never owns a Value.
+  /// Uses require this allocation alive, the slot initialized, and no conflicting
+  /// borrowed views/raw accesses. Moving ValueSlots is allowed; dropping it is not.
+  pub fn address(self: &mut Self, index: usize) -> *mut Value {
+    return Pointer.fromMutRef<Value>(&mut self.viewMut()[index])
+  }
+}
+fn emptySlotView(anchor: &[Value]) -> &[Value] { return anchor }
+fn emptySlotViewMut(anchor: &mut [Value]) -> &mut [Value] { return move anchor }
+
+
+/// Frame storage borrowed from a caller or owned by the activation. Borrowed ranges
+/// are fixed storage whose external owner outlives every frame/varref use. Each
+/// accessed slot must be initialized; inactive operand capacity need not be.
+/// Neither variant permits pointers into growable List<Value> storage.
+pub union FrameSlots {
+  Owned { pub slots: ValueSlots },
+  Borrowed { pub data: *mut Value, pub length: usize }
+}
+impl FrameSlots {
+  pub fn length(self: &Self) -> usize {
+    return match &self.* {
+      FrameSlots.Owned { slots } => slots.length()
+      FrameSlots.Borrowed { length, .. } => length
+    }
+  }
+  /// Requires index < length, live initialized storage, and no conflicting mutation.
+  pub unsafe fn get(self: &Self, index: usize) -> Value {
+    return match &self.* {
+      FrameSlots.Owned { slots } => slots.get(index)
+      FrameSlots.Borrowed { data, .. } => unsafe Pointer.read<Value>(unsafe Pointer.atMut<Value>(unsafe Pointer.assumeManyMut<Value>(data), index))
+    }
+  }
+  /// Requires index < length and exclusive access to the initialized backing slot.
+  /// Transfers references without an implicit retain or release, like ValueSlots.replace.
+  pub unsafe fn replace(self: &mut Self, index: usize, value: Value) -> Value {
+    match &mut self.* {
+      FrameSlots.Owned { slots } => { return slots.replace(index, value) }
+      FrameSlots.Borrowed { data, .. } => {
+        let address = unsafe Pointer.atMut<Value>(unsafe Pointer.assumeManyMut<Value>(data), index)
+        let previous = unsafe Pointer.read<Value>(address)
+        unsafe Pointer.write<Value>(address, value)
+        return previous
+      }
+    }
+  }
+  /// Transfers into an exclusively writable slot without reading stale or
+  /// uninitialized storage. The caller must release any previous owner first.
+  pub unsafe fn write(self: &mut Self, index: usize, value: Value) -> () {
+    match &mut self.* {
+      FrameSlots.Owned { slots } => { let output = slots.viewMut() output[index] = value }
+      FrameSlots.Borrowed { data, .. } => {
+        unsafe Pointer.write<Value>(unsafe Pointer.atMut<Value>(unsafe Pointer.assumeManyMut<Value>(data), index), value)
+      }
+    }
+  }
+}
+
+/// Non-owning VarRef cache cells, fixed before publishing the frame. Synchronous
+/// calls borrow native stack storage; suspended activations own their table.
+/// Borrowed cells must remain initialized and address-stable until detachment.
+pub union FrameReferences {
+  Owned { pub slots: List<?*mut HeapHeader> },
+  Borrowed { pub data: *mut ?*mut HeapHeader, pub length: usize }
+}
+impl FrameReferences {
+  pub fn length(self: &Self) -> usize {
+    return match &self.* {
+      FrameReferences.Owned { slots } => slots.length()
+      FrameReferences.Borrowed { length, .. } => length
+    }
+  }
+  /// Requires index < length and live initialized storage without conflicting access.
+  pub unsafe fn get(self: &Self, index: usize) -> ?*mut HeapHeader {
+    return match &self.* {
+      FrameReferences.Owned { slots } => slots.get(index)
+      FrameReferences.Borrowed { data, .. } => unsafe Pointer.read<?*mut HeapHeader>(
+        unsafe Pointer.atMut<?*mut HeapHeader>(unsafe Pointer.assumeManyMut<?*mut HeapHeader>(data), index))
+    }
+  }
+  /// Requires exclusive access to the initialized cell. Never retains or releases
+  /// the header: ownership belongs to closures, not this lookup table.
+  pub unsafe fn set(self: &mut Self, index: usize, value: ?*mut HeapHeader) -> () {
+    match &mut self.* {
+      FrameReferences.Owned { slots } => { slots.set(index, value) }
+      FrameReferences.Borrowed { data, .. } => {
+        unsafe Pointer.write<?*mut HeapHeader>(unsafe Pointer.atMut<?*mut HeapHeader>(
+          unsafe Pointer.assumeManyMut<?*mut HeapHeader>(data), index), value)
+      }
+    }
+  }
+}
+
+/// A non-owning intrusive list using HeapHeader.previous/next. A header can belong
+/// to only one such list at a time. Context/module secondary membership has separate
+/// links below. Dropping a list neither frees nor detaches its nodes.
+pub struct HeapList {
+  pub first: ?*mut HeapHeader,
+  pub last: ?*mut HeapHeader
+}
+impl HeapList {
+  pub fn make() -> Self {
+    return Self { first: Pointer.null<HeapHeader>(), last: Pointer.null<HeapHeader>() }
+  }
+  pub fn isEmpty(self: &Self) -> bool { return Pointer.isNull<HeapHeader>(self.first) }
+  /// node is live, detached from every HeapList, and has null links. Caller has
+  /// exclusive access to this list and all touched headers; no links retain nodes.
+  pub unsafe fn pushBack(self: &mut Self, node: *mut HeapHeader) -> () {
+    let previous = self.last
+    let mut anchor = ()
+    let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, node)
+    header.previous = previous
+    header.next = Pointer.null<HeapHeader>()
+    drop header
+    match Pointer.nonNullMut<HeapHeader>(previous) {
+      Option<*mut HeapHeader>.Some { value } => {
+        let prior = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, value)
+        prior.next = node
+      }
+      Option<*mut HeapHeader>.None => { self.first = node }
+    }
+    self.last = node
+  }
+  /// Same lifetime, detached-node and exclusivity requirements as pushBack.
+  pub unsafe fn pushFront(self: &mut Self, node: *mut HeapHeader) -> () {
+    let next = self.first
+    let mut anchor = ()
+    let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, node)
+    header.previous = Pointer.null<HeapHeader>()
+    header.next = next
+    drop header
+    match Pointer.nonNullMut<HeapHeader>(next) {
+      Option<*mut HeapHeader>.Some { value } => {
+        let following = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, value)
+        following.previous = node
+      }
+      Option<*mut HeapHeader>.None => { self.last = node }
+    }
+    self.first = node
+  }
+  /// node must be a member of this list, and every link must still be live. Caller
+  /// exclusively accesses this list and touched headers. Returns node to detached
+  /// state, without changing its reference count or reclaiming its allocation.
+  pub unsafe fn remove(self: &mut Self, node: *mut HeapHeader) -> () {
+    let mut anchor = ()
+    let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, node)
+    let previous = header.previous
+    let next = header.next
+    header.previous = Pointer.null<HeapHeader>()
+    header.next = Pointer.null<HeapHeader>()
+    drop header
+    match Pointer.nonNullMut<HeapHeader>(previous) {
+      Option<*mut HeapHeader>.Some { value } => {
+        let prior = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, value)
+        prior.next = next
+      }
+      Option<*mut HeapHeader>.None => { self.first = next }
+    }
+    match Pointer.nonNullMut<HeapHeader>(next) {
+      Option<*mut HeapHeader>.Some { value } => {
+        let following = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, value)
+        following.previous = previous
+      }
+      Option<*mut HeapHeader>.None => { self.last = previous }
+    }
+  }
+  /// Same live-list and exclusivity requirements as remove; an empty list is valid.
+  pub unsafe fn popFront(self: &mut Self) -> Option<*mut HeapHeader> {
+    let first = Pointer.nonNullMut<HeapHeader>(self.first)
+    match &first {
+      Option<*mut HeapHeader>.Some { value } => { unsafe self.remove(value) }
+      Option<*mut HeapHeader>.None => ()
+    }
+    return move first
+  }
+}
+
+pub enum GcPhase { None, Decrement, RemoveCycles }
+pub enum WeakRefKind { Map, WeakRef, FinalizationRegistry }
+/// Embedded weak-list nodes expose their owning payload explicitly, never via an
+/// offsetof/container-of cast. owner and list links do not retain JS references.
+pub struct WeakRefHeader {
+  pub previous: ?*mut WeakRefHeader,
+  pub next: ?*mut WeakRefHeader,
+  pub kind: WeakRefKind,
+  pub owner: *mut HeapHeader
+}
+pub struct WeakRefList {
+  pub first: ?*mut WeakRefHeader,
+  pub last: ?*mut WeakRefHeader
+}
+pub struct ContextList {
+  pub first: ?*mut HeapHeader,
+  pub last: ?*mut HeapHeader
+}
+pub struct ModuleList {
+  pub first: ?*mut HeapHeader,
+  pub last: ?*mut HeapHeader
+}
+pub struct LeakTrackingState {
+  /// Borrowed String headers for the source's optional DUMP_LEAKS diagnostics.
+  pub strings: List<*mut HeapHeader>
+}
+
+/// Runtime root payload (HeapKind.Auxiliary). Its AtomTable is a native owner.
+/// GC lists, context links, shape buckets and weak-list links are non-owning.
+/// currentException and queued JobEntry arguments are owned JS roots.
+pub struct RuntimeState {
+  pub runtimeInfo: Option<ByteStorage>,
+  pub atoms: AtomTable,
+  pub classes: List<ClassDef>,
+  /// Full Intl constructor IDs in source installation order, shared across realms.
+  pub intlClassIds: [u32; 10],
+  /// Runtime-local counterparts of Intl's source process-global subordinate IDs.
+  pub intlSegmentsClassId: u32,
+  pub intlSegmentIteratorClassId: u32,
+  /// Runtime-local IDs shared by every realm's eight Temporal classes.
+  pub temporalClassIds: [u32; 8],
+  pub contexts: ContextList,
+  pub gcObjects: HeapList,
+  pub zeroReferenceObjects: HeapList,
+  pub temporaryGcObjects: HeapList,
+  pub gcPhase: GcPhase,
+  pub mallocGcThreshold: usize,
+  pub weakReferences: WeakRefList,
+  pub leakTracking: Option<LeakTrackingState>,
+  pub stackSize: usize,
+  pub stackTop: usize,
+  pub stackLimit: usize,
+  pub currentException: Value,
+  pub currentExceptionIsUncatchable: bool,
+  pub inOutOfMemory: bool,
+  pub currentStackFrame: ?*mut StackFrame,
+  pub interrupt: HostHook,
+  pub promiseRejectionTracker: HostHook,
+  /// FIFO Auxiliary HeapCell<JobEntry> nodes; queue ownership is explicit JS roots.
+  pub jobs: HeapList,
+  pub moduleLoader: ModuleLoaderHooks,
+  pub moduleAsyncEvaluationNextTimestamp: i64,
+  pub canBlock: bool,
+  pub sharedArrayBuffers: SharedArrayBufferHooks,
+  pub stripFlags: u8,
+  pub shapeHashBits: i32,
+  pub shapeHashCount: usize,
+  pub shapeHash: List<?*mut HeapHeader>,
+  pub userOpaque: ?*mut u8
+}
+
+/// Context payload (HeapKind.Context). runtime and context-list links are borrowed.
+/// Cached shapes/prototypes/constructors/values are owned JS edges. Modules use
+/// separate previousModule/nextModule links, independent of the common GC list.
+pub struct ContextState {
+  pub runtime: *mut HeapHeader,
+  pub previousContext: ?*mut HeapHeader,
+  pub nextContext: ?*mut HeapHeader,
+  pub binaryObjectCount: u16,
+  pub binaryObjectSize: i32,
+  pub arrayShape: ?*mut HeapHeader,
+  pub argumentsShape: ?*mut HeapHeader,
+  pub mappedArgumentsShape: ?*mut HeapHeader,
+  pub regexpShape: ?*mut HeapHeader,
+  pub regexpResultShape: ?*mut HeapHeader,
+  pub classPrototypes: List<Value>,
+  pub functionPrototype: Value,
+  pub functionConstructor: Value,
+  pub arrayConstructor: Value,
+  pub regexpConstructor: Value,
+  pub promiseConstructor: Value,
+  pub nativeErrorPrototypes: [Value; 9],
+  pub iteratorConstructor: Value,
+  pub asyncIteratorPrototype: Value,
+  pub arrayPrototypeValues: Value,
+  pub throwTypeError: Value,
+  pub evalObject: Value,
+  pub userValues: [Value; 7],
+  pub globalObject: Value,
+  pub globalVarObject: Value,
+  pub randomState: u64,
+  pub interruptCounter: i32,
+  pub loadedModules: ModuleList,
+  pub regexpCompilerEnabled: bool,
+  pub evalEnabled: bool,
+  pub localeCallbacks: Option<LocaleCallbacks>,
+  pub userOpaque: ?*mut u8
+}
+
+pub enum AutoInitKind { Prototype, ModuleNamespace, Property }
+/// Auto-init retains its Context realm. The opaque descriptor is either the source
+/// host pointer, a typed heap payload (module, for example), or a native table ID.
+pub union AutoInitOpaque {
+  Pointer { pub value: ?*mut u8 },
+  Heap { pub reference: *mut HeapHeader },
+  Native { pub descriptor: NativeFunctionId }
+}
+impl Copy for AutoInitOpaque {}
+pub union PropertySlot {
+  Value { pub value: Value },
+  GetterSetter { pub getter: ?*mut HeapHeader, pub setter: ?*mut HeapHeader },
+  VarRef { pub reference: *mut HeapHeader },
+  AutoInit { pub realm: *mut HeapHeader, pub kind: AutoInitKind, pub opaque: AutoInitOpaque }
+}
+impl Copy for PropertySlot {}
+pub struct PropertyDescriptor {
+  pub flags: u32,
+  pub value: Value,
+  pub getter: Value,
+  pub setter: Value
+}
+pub struct PropertyEnum {
+  pub isEnumerable: bool,
+  pub atom: u32
+}
+impl Copy for PropertyEnum {}
+pub struct ShapeProperty {
+  pub hashNext: u32,
+  pub flags: u8,
+  pub atom: u32
+}
+impl Copy for ShapeProperty {}
+/// Shape payload (HeapKind.Shape). Prototype is an owned Object edge; hash links
+/// and bucket indices are borrowed. properties includes deleted entries; atom 0 is
+/// free. Native list capacity supplies prop_size, length supplies prop_count.
+pub struct ShapeData {
+  pub isHashed: bool,
+  pub hash: u32,
+  pub propertyHashMask: u32,
+  pub deletedPropertyCount: usize,
+  pub hashNext: ?*mut HeapHeader,
+  pub prototype: ?*mut HeapHeader,
+  pub hashIndices: List<u32>,
+  pub properties: List<ShapeProperty>
+}
+
+pub struct BytecodeClosure {
+  pub bytecode: *mut HeapHeader,
+  /// Module imports remain null until the module linker installs their cells.
+  pub varRefs: List<?*mut HeapHeader>,
+  pub homeObject: ?*mut HeapHeader
+}
+/// Ordinary functions retain realm; captured-data functions may have no realm.
+/// magic is i32 to preserve both the ordinary signed i16 and captured unsigned u16
+/// source domains without a lossy cast. Captured data is owned, not a borrowed argv.
+pub struct NativeFunctionData {
+  pub realm: ?*mut HeapHeader,
+  pub function: NativeFunctionId,
+  pub length: u8,
+  pub protocol: NativeCallProtocol,
+  pub magic: i32,
+  pub isDataFunction: bool,
+  pub capturedValues: List<Value>
+}
+pub struct FastArrayData {
+  /// Native capacity is the source size; length is the initialized element count.
+  pub values: List<Value>
+}
+pub struct MappedArgumentsData {
+  pub varRefs: List<*mut HeapHeader>
+}
+/// The view is an owned typed-family payload. cachedData is borrowed from its
+/// buffer, invalidated on detach/resize; count is element count, not byte length.
+/// No JS Values or per-element allocations are used for typed array storage.
+pub struct TypedArrayCache {
+  pub view: *mut HeapHeader,
+  /// Physical backing policy, refreshed when a native host publishes private bytes.
+  pub shared: bool,
+  pub cachedData: ?*mut u8,
+  pub count: u32,
+  /// Immutable view policy: auto-length tracking OR a non-shared resizable
+  /// backing buffer. Source track_rab/max_byte_length/shared never change after
+  /// construction, so detach/resize only invalidate cachedData/count, not this bit.
+  pub requiresExtensible: bool
+}
+pub struct RegExpData {
+  /// Both are owned shared flat-string Values; bytecode also contains regexp flags.
+  pub pattern: Value,
+  pub bytecode: Value
+}
+pub struct GlobalObjectData {
+  pub uninitializedVariables: Value
+}
+/// Family implementations own these payload bodies. The family tag determines the
+/// HeapCell<T> payload and native destruction/tracing dispatch; null is allowed
+/// during allocation before that family's initialization has succeeded.
+pub enum ObjectPayloadFamily {
+  BoundFunction, ForInIterator, ArrayBuffer, SharedArrayBuffer, DataView,
+  Map, Set, WeakMap, WeakSet, MapIterator, SetIterator, ArrayIterator, StringIterator,
+  RegExpStringIterator, Generator, IteratorConcat, IteratorHelper, IteratorWrap,
+  IteratorZip, ArrayFromAsync, Proxy, Promise, PromiseResolve, PromiseReject,
+  AsyncFunctionResolve, AsyncFunctionReject, AsyncFromSyncIterator, AsyncGenerator,
+  DisposableStack, AsyncDisposableStack, WeakRef, FinalizationRegistry, Intl, Temporal, Std
+}
+pub union ObjectPayload {
+  Empty,
+  /// Host memory is interpreted/reclaimed only by the registered class callbacks.
+  HostOpaque { pub data: ?*mut u8 },
+  BytecodeFunction { pub function: BytecodeClosure },
+  NativeFunction { pub function: NativeFunctionData },
+  FastArray { pub array: FastArrayData },
+  MappedArguments { pub arguments: MappedArgumentsData },
+  TypedArray { pub array: TypedArrayCache },
+  Boxed { pub value: Value },
+  RegExp { pub regexp: RegExpData },
+  GlobalObject { pub global: GlobalObjectData },
+  Opaque { pub family: ObjectPayloadFamily, pub reference: ?*mut HeapHeader }
+}
+pub struct ObjectData {
+  pub isStandardArrayPrototype: bool,
+  pub extensible: bool,
+  pub freeMark: bool,
+  pub isExotic: bool,
+  pub fastArray: bool,
+  pub isConstructor: bool,
+  pub hasImmutablePrototype: bool,
+  pub temporaryMark: bool,
+  pub isHtmlDda: bool,
+  pub classId: u32,
+  /// Weak liveness count, NOT a second strong JS reference count.
+  pub weakRefCount: u32,
+  pub shape: *mut HeapHeader,
+  pub properties: List<PropertySlot>,
+  pub payload: ObjectPayload
+}
+
+pub enum ClosureKind {
+  Local, Argument, Reference, GlobalReference, GlobalDeclaration, Global,
+  ModuleDeclaration, ModuleImport
+}
+pub enum VariableKind {
+  Normal, FunctionDeclaration, NewFunctionDeclaration, Catch, FunctionName,
+  PrivateField, PrivateMethod, PrivateGetter, PrivateSetter, PrivateGetterSetter,
+  GlobalFunctionDeclaration, Using, UsingMethod
+}
+pub struct ClosureVar {
+  pub kind: ClosureKind,
+  pub isLexical: bool,
+  pub isConst: bool,
+  pub variableKind: VariableKind,
+  pub variableIndex: u16,
+  pub name: u32
+}
+impl Copy for ClosureVar {}
+/// The source JSBytecodeVarDef, not the parser's transient scope record.
+pub struct VarDef {
+  pub name: u32,
+  pub scopeNext: i32,
+  pub isConst: bool,
+  pub isLexical: bool,
+  pub isCaptured: bool,
+  pub hasScope: bool,
+  pub kind: VariableKind,
+  pub varRefIndex: u16
+}
+impl Copy for VarDef {}
+pub enum FunctionKind { Normal, Generator, Async, AsyncGenerator }
+pub struct FunctionDebugInfo {
+  pub filename: u32,
+  /// None is stripped/unavailable source, distinct from an available empty script.
+  pub source: Option<ByteStorage>,
+  pub pcToLine: ByteStorage
+}
+/// FunctionBytecode payload (HeapKind.FunctionBytecode). Lists supply all source
+/// lengths/counts; code may be borrowed ROM. realm, constants, atoms and closure
+/// names are explicit owned JS edges. Debug presence replaces source has_debug.
+pub struct FunctionBytecode {
+  pub mode: u8,
+  pub hasPrototype: bool,
+  pub hasSimpleParameterList: bool,
+  pub isDerivedClassConstructor: bool,
+  pub needsHomeObject: bool,
+  pub kind: FunctionKind,
+  pub newTargetAllowed: bool,
+  pub superCallAllowed: bool,
+  pub superAllowed: bool,
+  pub argumentsAllowed: bool,
+  pub readOnlyBytecode: bool,
+  pub isDirectOrIndirectEval: bool,
+  pub code: ByteStorage,
+  pub name: u32,
+  pub varDefs: List<VarDef>,
+  pub closureVars: List<ClosureVar>,
+  pub argumentCount: u16,
+  pub variableCount: u16,
+  pub definedArgumentCount: u16,
+  pub stackSize: u16,
+  pub varRefCount: u16,
+  pub realm: *mut HeapHeader,
+  pub constants: List<Value>,
+  pub debug: Option<FunctionDebugInfo>
+}
+
+pub union FrameSlot {
+  Argument { pub index: usize },
+  Local { pub index: usize }
+}
+impl Copy for FrameSlot {}
+/// Attached references identify stable frame slots by kind/index, never by a
+/// pointer into a growable list. An attached async reference retains the AsyncFrame
+/// found through frame.asyncOwner; the frame's own backpointer is borrowed. Detach
+/// duplicates the slot Value into Detached and releases that async-owner edge.
+/// The detached state owns its Value independently of the still-initialized slot.
+pub union VarRefState {
+  Attached { pub frame: *mut StackFrame, pub slot: FrameSlot, pub varRefIndex: u16 },
+  Detached { pub value: Value }
+}
+impl Copy for VarRefState {}
+pub struct VarRef {
+  pub isLexical: bool,
+  pub isConst: bool,
+  pub state: VarRefState
+}
+/// A published frame MUST stay at its original address, as must argument/local/
+/// operand slot allocations. Stack-local frames can be borrowed for a synchronous
+/// call; resumable activations use StableFrame. currentPc is the bytecode offset
+/// after a call (None for native/no PC), not a pointer into growable bytecode.
+pub struct StackFrame {
+  pub previous: ?*mut StackFrame,
+  /// Explicit reverse link replaces source container_of(frame, AsyncFunctionState).
+  /// Borrowed here; every attached async VarRef holds a separate explicit JS edge.
+  pub asyncOwner: ?*mut HeapHeader,
+  pub currentFunction: Value,
+  pub arguments: FrameSlots,
+  pub locals: FrameSlots,
+  pub stack: FrameSlots,
+  /// Header pointers are stable; VarRef holds an index, not a List element pointer.
+  /// Initialize the complete reference table before publishing this frame.
+  pub varRefs: FrameReferences,
+  pub currentPc: Option<usize>,
+  pub argumentCount: i32,
+  pub mode: u8,
+  /// None while running; Some is a suspended generator's next free stack index.
+  pub stackPointer: Option<usize>
+}
+/// Native owner for a non-moving frame. Moving this handle never moves the frame.
+/// Before drop, unlink all runtime frame links, detach VarRefs, and release the
+/// frame's JS children. Native destruction then reclaims the frame and owned slots.
+pub struct StableFrame { frame: Box<StackFrame> }
+impl StableFrame {
+  pub effect fn make(frame: StackFrame) -> Self ! OutOfMemoryError ? &mut Allocator {
+    return Self { frame: run Box<StackFrame>.make(move frame) }
+  }
+  pub fn get(self: &Self) -> &StackFrame { return &self.frame.get()[0] }
+  /// Requires no conflicting raw frame/slot accesses; do not replace/move published
+  /// slots or the frame while attached references can observe them.
+  pub unsafe fn getMut(self: &mut Self) -> &mut StackFrame { return &mut self.frame.getMut()[0] }
+  /// Later dereferences require this owner alive and exclusive/shared access as
+  /// appropriate. The returned address does not itself borrow or retain the frame.
+  pub fn address(self: &mut Self) -> *mut StackFrame {
+    return Pointer.fromMutRef<StackFrame>(&mut self.frame.getMut()[0])
+  }
+}
+/// AsyncFunction payload (HeapKind.AsyncFunction), also used by generators. Its
+/// StableFrame owns the argument/local/operand memory; completed frames must have
+/// detached their references. Frame PC/SP preserve the resumable source state.
+pub struct AsyncFrame {
+  pub thisValue: Value,
+  pub argumentCount: i32,
+  pub throwFlag: bool,
+  pub isCompleted: bool,
+  pub resolvingFunctions: [Value; 2],
+  pub frame: StableFrame
+}
+
+pub struct RequestedModule {
+  pub name: u32,
+  pub module: ?*mut HeapHeader,
+  pub attributes: Value
+}
+pub union ExportBinding {
+  Local { pub variableIndex: i32, pub varRef: ?*mut HeapHeader },
+  Indirect { pub requestedModuleIndex: i32 }
+}
+impl Copy for ExportBinding {}
+pub struct ExportEntry {
+  pub binding: ExportBinding,
+  pub localName: u32,
+  pub exportName: u32
+}
+impl Copy for ExportEntry {}
+pub struct StarExportEntry { pub requestedModuleIndex: i32 }
+impl Copy for StarExportEntry {}
+pub struct ImportEntry {
+  pub variableIndex: i32,
+  pub isStar: bool,
+  pub importName: u32,
+  pub requestedModuleIndex: i32
+}
+impl Copy for ImportEntry {}
+pub enum ModuleStatus { Unlinked, Linking, Linked, Evaluating, EvaluatingAsync, Evaluated }
+/// Module payload (HeapKind.Module). Secondary list and DFS/parent/cycle links are
+/// borrowed traversal edges; namespace/function/live bindings/capability/exception/
+/// metadata/private Values follow the source's explicit JS ownership rules.
+pub struct ModuleDef {
+  pub name: u32,
+  pub previousModule: ?*mut HeapHeader,
+  pub nextModule: ?*mut HeapHeader,
+  pub requestedModules: List<RequestedModule>,
+  pub exports: List<ExportEntry>,
+  pub starExports: List<StarExportEntry>,
+  pub imports: List<ImportEntry>,
+  pub namespace: Value,
+  pub functionObject: Value,
+  pub initialize: Option<NativeFunctionId>,
+  pub hasTopLevelAwait: bool,
+  pub resolved: bool,
+  pub functionCreated: bool,
+  pub status: ModuleStatus,
+  pub dfsIndex: i32,
+  pub dfsAncestorIndex: i32,
+  pub stackPrevious: ?*mut HeapHeader,
+  pub asyncParentModules: List<*mut HeapHeader>,
+  pub pendingAsyncDependencies: i32,
+  pub asyncEvaluation: bool,
+  pub asyncEvaluationTimestamp: i64,
+  pub cycleRoot: ?*mut HeapHeader,
+  pub promise: Value,
+  pub resolvingFunctions: [Value; 2],
+  pub evaluationHasException: bool,
+  pub evaluationException: Value,
+  pub metaObject: Value,
+  pub privateValue: Value
+}
+/// Prepared nodes own their arguments; enqueue adds an owned Context realm.
+pub struct JobEntry {
+  pub realm: ?*mut HeapHeader,
+  pub function: NativeFunctionId,
+  pub arguments: List<Value>
+}

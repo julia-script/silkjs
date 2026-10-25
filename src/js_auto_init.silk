@@ -1,0 +1,104 @@
+//! JS_AutoInitProperty, quickjs.c:8266-8317. The initializer may allocate but must
+//! not mutate the owner's property storage. Dispatch is mandatory and typed: the
+//! module-namespace branch returns a borrowed cell, never a fake tagged string.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.option { Option }
+import silk.result { Result }
+import silk.u8
+import silk.u32
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types { ObjectData, ShapeData, PropertySlot, AutoInitKind, AutoInitOpaque,
+  VarRef, JS_PROP_TMASK, JS_PROP_VARREF, JS_PROP_WRITABLE }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_shapes as shapes
+import js_var_refs as cells
+import js_coercion_host { CoercionHooks }
+import js_exceptions { JsException }
+import js_class_data as classes
+
+pub union InitializedProperty {
+  Value { pub value: Value },
+  Binding { pub reference: *mut HeapHeader }
+}
+pub interface AutoInitHooks {
+  // Value transfers ownership; Binding is borrowed until installation retains it.
+  // Allocation errors must already be materialized before returning JsException.
+  unsafe effect fn initializeProperty(self: &mut Self, realm: *mut HeapHeader,
+    owner: Value, atom: u32, kind: AutoInitKind, opaque: AutoInitOpaque) -> InitializedProperty
+    ! JsException ? &mut Allocator
+}
+fn trap() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+fn node(value: Value) -> *mut HeapHeader { return match value { Value.Object { reference } => reference _ => trap() } }
+unsafe effect fn prepare(rt: *mut HeapHeader, object: *mut HeapHeader) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = () let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, object)
+  run unsafe shapes.prepareUpdate(rt, &mut p)
+}
+pub unsafe effect fn instantiate<H: HeapHooks + CoercionHooks + AutoInitHooks>(hooks: &mut H,
+  context: *mut HeapHeader, owner: Value, atom: u32) -> () ! JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context) let object = node(owner)
+  let prepared = run Effect.result(unsafe prepare(rt, object))
+  match move prepared {
+    Result<(), OutOfMemoryError>.Success { .. } => ()
+    Result<(), OutOfMemoryError>.Failure { .. } => { return run unsafe hooks.throwOutOfMemory(context) }
+  }
+  let anchor = () let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  let index = match unsafe shapes.lookup(p.shape, atom) { Option<usize>.Some { value } => value _ => trap() }
+  let saved = p.properties.get(index) let classId = p.classId
+  let shape = p.shape drop p
+  let metadata = unsafe HeapCell.payload<ShapeData, ()>(&anchor, shape)
+  let bits = u8.toU32(metadata.properties.get(index).flags) & ~JS_PROP_TMASK drop metadata
+  let result = match saved {
+    PropertySlot.AutoInit { realm, kind, opaque } => run Effect.result(unsafe hooks.initializeProperty(realm, owner, atom, kind, opaque))
+    _ => trap()
+  }
+  unsafe gc.releaseProperty(&mut hooks, rt, saved)
+  let mut changedAnchor = () let changed = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut changedAnchor, object)
+  changed.properties.set(index, PropertySlot.Value { value: Value.Undefined }) drop changed
+  let changedShape = unsafe HeapCell.payloadMut<ShapeData, ()>(&mut changedAnchor, shape)
+  let mut property = changedShape.properties.get(index) property.flags = u32.toU8(bits)
+  changedShape.properties.set(index, property) drop changedShape
+  let initialized = match move result {
+    Result<InitializedProperty, JsException>.Success { value } => move value
+    Result<InitializedProperty, JsException>.Failure { error } => { fail move error }
+  }
+  let mut stored = PropertySlot.Value { value: Value.Undefined }
+  let mut storedBits = bits
+  match move initialized {
+    InitializedProperty.Binding { reference } => {
+      match saved { PropertySlot.AutoInit { kind: AutoInitKind.ModuleNamespace, .. } => () _ => trap() }
+      unsafe HeapCell.retain(reference)
+      stored = PropertySlot.VarRef { reference: reference } storedBits = bits | JS_PROP_VARREF
+    }
+    InitializedProperty.Value { value } => {
+      if classId == classes.JS_CLASS_GLOBAL_OBJECT {
+        let allocated = run Effect.result(unsafe cells.createDetached(rt, false))
+        let reference = match move allocated {
+          Result<*mut HeapHeader, OutOfMemoryError>.Success { value: reference } => reference
+          Result<*mut HeapHeader, OutOfMemoryError>.Failure { .. } => {
+            // The consumed initializer result cannot escape after the slot has
+            // become Undefined. Preserve pending OOM before releasing it.
+            let pending = run Effect.catch<JsException>(unsafe oom(&mut hooks, context), exceptionValue)
+            unsafe gc.release(&mut hooks, rt, value) fail JsException {}
+          }
+        }
+        let empty = unsafe cells.replace(reference, value)
+        let cell = unsafe HeapCell.payloadMut<VarRef, ()>(&mut changedAnchor, reference)
+        cell.isConst = (bits & JS_PROP_WRITABLE) == 0 drop cell
+        stored = PropertySlot.VarRef { reference: reference } storedBits = bits | JS_PROP_VARREF
+      } else { stored = PropertySlot.Value { value: value } }
+    }
+  }
+  let target = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut changedAnchor, object)
+  target.properties.set(index, stored) drop target
+  let finalShape = unsafe HeapCell.payloadMut<ShapeData, ()>(&mut changedAnchor, shape)
+  let mut finalProperty = finalShape.properties.get(index) finalProperty.flags = u32.toU8(storedBits)
+  finalShape.properties.set(index, finalProperty)
+}
+effect fn exceptionValue(error: JsException) -> Value { drop error return Value.Exception }
+unsafe effect fn oom<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader) -> Value ! JsException ? &mut Allocator {
+  return run unsafe hooks.throwOutOfMemory(context)
+}

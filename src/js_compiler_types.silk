@@ -1,0 +1,179 @@
+//! Transient QuickJS compiler state, quickjs.c:22321-22542. Not executable bytecode.
+//! Function cells are stable, uniquely compiler-owned Auxiliary allocations, not GC
+//! nodes. Parent/child pointers borrow that tree; destruction unlinks before freeing.
+//! List references may not escape mutation; scope/block/relocation links are indices.
+//! Every mutable operation requires exclusive access to the tree and its runtime;
+//! allocators must not reenter it. Value copies are borrowed, never implicit retains.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.list { List }
+import silk.ownership { Copy }
+import silk.pointer { Pointer }
+import silk.usize
+import byte_buffer { ByteBuffer }
+import js_heap { HeapHeader }
+import js_value { Value }
+import js_core_types { ClosureVar, VariableKind, FunctionKind }
+import js_debug_positions { SourcePositionCache, PcSourcePosition }
+import silk.option { Option }
+import js_atoms { AtomTable }
+import js_string_types { StringOwner, StringLengthError }
+
+pub const MAX_LOCAL_VAR_COUNT: usize = 65534
+pub const ARGUMENT_VAR_OFFSET: i32 = 0x20000000
+pub const GLOBAL_VAR_OFFSET: i32 = 0x40000000
+pub const ARG_SCOPE_INDEX: i32 = 1
+pub const ARG_SCOPE_END: i32 = -2
+pub enum ParseFunctionKind { Statement, Var, Expression, Arrow, Getter, Setter, Method, ClassStaticInit, ClassConstructor, DerivedClassConstructor }
+pub enum ParseExportKind { None, Named, Default }
+pub enum VariableDefinition { With, Let, Const, FunctionDeclaration, NewFunctionDeclaration, Catch, Var, Using }
+pub enum CompilerErrorKind { TooManyLocals, TooManyArguments, TooManyClosures, LexicalRedefinition, ParameterRedefinition, VariableRedefinition, GlobalRedefinition, UndefinedPrivateField, MissingExport }
+// name owns its string/registry reference independently of the parse tree and
+// runtime AtomTable handle. Diagnostics remain readable after parser unwinding.
+pub struct CompilerError { pub kind: CompilerErrorKind, pub atom: u32, pub name: Option<StringOwner> }
+impl CompilerError {
+  pub effect fn make(table: &AtomTable, kind: CompilerErrorKind, atom: u32) -> Self
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let mut name = Option<StringOwner>.none()
+    if atom != 0 { name = Option<StringOwner>.some(StringOwner.adopt(run table.toValue(atom, true))) }
+    return Self { kind: kind, atom: atom, name: move name }
+  }
+}
+
+// Unlike final core VarDef this contains the parser scope and function-pool fields.
+pub struct CompilerVar {
+  pub name: u32, pub scopeLevel: i32, pub scopeNext: i32,
+  pub isConst: bool, pub isLexical: bool, pub isCaptured: bool,
+  pub isStaticPrivate: bool, pub kind: VariableKind, pub varRefIndex: u16,
+  pub functionPoolIndex: i32
+}
+impl Copy for CompilerVar {}
+impl CompilerVar {
+  pub fn make(name: u32) -> Self { return Self { name: name, scopeLevel: 0, scopeNext: 0,
+    isConst: false, isLexical: false, isCaptured: false, isStaticPrivate: false,
+    kind: VariableKind.Normal, varRefIndex: 0, functionPoolIndex: -1 } }
+}
+pub struct GlobalVar { pub constantPoolIndex: i32, pub forceInit: bool, pub isLexical: bool,
+  pub isConst: bool, pub scopeLevel: i32, pub name: u32 }
+impl Copy for GlobalVar {}
+pub struct VarScope { pub parent: i32, pub first: i32 }
+impl Copy for VarScope {}
+pub struct ScopeTable { inline: [VarScope; 4], overflow: List<VarScope>, count: usize }
+impl ScopeTable {
+  pub fn make() -> Self { return Self { inline: [VarScope { parent: -1, first: -1 }; 4],
+    overflow: List<VarScope>.make(), count: 1 } }
+  pub fn length(self: &Self) -> usize { return self.count }
+  pub fn capacity(self: &Self) -> usize { if self.overflow.length() == 0 { return 4 } return self.overflow.capacity() }
+  pub fn get(self: &Self, index: usize) -> VarScope {
+    if index >= self.count { Intrinsic.trap("QuickJS invariant violated") }
+    if self.overflow.length() == 0 { return self.inline[index] }
+    return self.overflow.get(index)
+  }
+  pub fn set(self: &mut Self, index: usize, value: VarScope) -> () {
+    if index >= self.count { Intrinsic.trap("QuickJS invariant violated") }
+    if self.overflow.length() == 0 { self.inline[index] = value }
+    else { self.overflow.set(index, value) }
+  }
+  pub effect fn append(self: &mut Self, value: VarScope) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.count < 4 { self.inline[self.count] = value }
+    else {
+      if self.overflow.length() == 0 {
+        run self.overflow.reserveExact(6)
+        let mut i: usize = 0
+        while i < 4 { run self.overflow.append(self.inline[i]) i = i + 1 }
+      }
+      run reserveArray(&mut self.overflow)
+      run self.overflow.append(value)
+    }
+    self.count = self.count + 1
+  }
+}
+// js_resize_array uses max(required, old * 3 / 2). No allocator slack is promised
+// by Silk, so exact native capacity is the source capacity without optional slack.
+pub effect fn reserveArray<T>(values: &mut List<T>) -> () ! OutOfMemoryError ? &mut Allocator {
+  if values.length() < values.capacity() { return () }
+  let mut capacity = values.capacity() * 3 / 2
+  if capacity < values.length() + 1 { capacity = values.length() + 1 }
+  let additional = capacity - values.length()
+  run values.reserveExact(additional)
+}
+pub struct BlockEnv {
+  pub previous: i32, pub labelName: u32, pub labelBreak: i32, pub labelContinue: i32,
+  pub dropCount: i32, pub labelFinally: i32, pub scopeLevel: i32,
+  pub usingLabelCatch: i32, pub usingLabelEnd: i32, pub hasIterator: bool,
+  pub isRegularStatement: bool, pub hasUsing: bool, pub isAwaitUsing: bool
+}
+impl Copy for BlockEnv {}
+impl BlockEnv {
+  pub fn make() -> Self { return Self { previous: -1, labelName: 0, labelBreak: -1,
+    labelContinue: -1, dropCount: 0, labelFinally: -1, scopeLevel: 0,
+    usingLabelCatch: -1, usingLabelEnd: -1, hasIterator: false,
+    isRegularStatement: false, hasUsing: false, isAwaitUsing: false } }
+}
+pub struct RelocEntry { pub next: i32, pub address: u32, pub size: i32 }
+impl Copy for RelocEntry {}
+pub struct JumpSlot { pub opcode: i32, pub size: i32, pub position: i32, pub label: i32 }
+impl Copy for JumpSlot {}
+pub struct LabelSlot { pub referenceCount: i32, pub position: i32, pub position2: i32,
+  pub address: i32, pub firstRelocation: i32 }
+impl Copy for LabelSlot {}
+
+pub struct FunctionDef {
+  pub context: *mut HeapHeader, pub runtime: *mut HeapHeader,
+  pub parent: ?*mut HeapHeader, pub parentConstantPoolIndex: i32, pub parentScopeLevel: i32,
+  pub firstChild: ?*mut HeapHeader, pub lastChild: ?*mut HeapHeader,
+  pub previousSibling: ?*mut HeapHeader, pub nextSibling: ?*mut HeapHeader,
+  pub isEval: bool, pub evalType: i32, pub isGlobalVar: bool, pub isFuncExpr: bool,
+  pub hasHomeObject: bool, pub hasPrototype: bool, pub hasSimpleParameterList: bool,
+  pub hasParameterExpressions: bool, pub hasUseStrict: bool, pub hasEvalCall: bool,
+  pub hasArgumentsBinding: bool, pub hasThisBinding: bool, pub newTargetAllowed: bool,
+  pub superCallAllowed: bool, pub superAllowed: bool, pub argumentsAllowed: bool,
+  pub isDerivedClassConstructor: bool, pub inFunctionBody: bool,
+  pub functionKind: FunctionKind, pub functionType: ParseFunctionKind, pub jsMode: u8,
+  pub functionName: u32, pub vars: List<CompilerVar>, pub args: List<CompilerVar>,
+  pub definedArgCount: i32, pub varRefCount: i32,
+  pub varObjectIndex: i32, pub argVarObjectIndex: i32, pub argumentsVarIndex: i32,
+  pub argumentsArgIndex: i32, pub functionVarIndex: i32, pub evalReturnIndex: i32,
+  pub thisVarIndex: i32, pub newTargetVarIndex: i32, pub thisActiveFunctionVarIndex: i32,
+  pub homeObjectVarIndex: i32, pub needHomeObject: bool,
+  pub scopeLevel: i32, pub scopeFirst: i32, pub scopes: ScopeTable, pub bodyScope: i32,
+  pub globalVars: List<GlobalVar>, pub bytecode: ByteBuffer, pub bytecodeError: bool,
+  pub lastOpcodePosition: i32, pub lastOpcodeSourcePosition: u32, pub useShortOpcodes: bool,
+  pub labels: List<LabelSlot>, pub blocks: List<BlockEnv>, pub topBreak: i32,
+  pub constants: List<Value>, pub closureVars: List<ClosureVar>,
+  pub relocations: List<RelocEntry>, pub jumps: List<JumpSlot>, pub jumpCapacity: usize,
+  pub lineNumbers: List<PcSourcePosition>, pub lineNumberCapacity: usize,
+  pub lineNumberLast: u32, pub lineNumberLastPc: u32,
+  pub stripDebug: bool, pub stripSource: bool, pub filename: u32, pub sourcePosition: u32,
+  // Borrowed cache shared by the parse; must outlive the entire function tree.
+  pub sourceCache: ?*mut SourcePositionCache, pub pc2line: ByteBuffer,
+  pub source: ByteBuffer, pub module: ?*mut HeapHeader, pub hasAwait: bool
+}
+impl FunctionDef {
+  // Detached native owner. filename/name/array JS edges must be released explicitly
+  // before dropping; production construction/destruction use compiler_state APIs.
+  pub fn make(context: *mut HeapHeader, runtime: *mut HeapHeader, sourcePosition: u32) -> Self {
+    return Self { context: context, runtime: runtime, parent: Pointer.null<HeapHeader>(),
+      parentConstantPoolIndex: -1, parentScopeLevel: 0, firstChild: Pointer.null<HeapHeader>(),
+      lastChild: Pointer.null<HeapHeader>(), previousSibling: Pointer.null<HeapHeader>(), nextSibling: Pointer.null<HeapHeader>(),
+      isEval: false, evalType: 0, isGlobalVar: false, isFuncExpr: false, hasHomeObject: false,
+      hasPrototype: false, hasSimpleParameterList: false, hasParameterExpressions: false,
+      hasUseStrict: false, hasEvalCall: false, hasArgumentsBinding: false, hasThisBinding: false,
+      newTargetAllowed: false, superCallAllowed: false, superAllowed: false, argumentsAllowed: false,
+      isDerivedClassConstructor: false, inFunctionBody: false, functionKind: FunctionKind.Normal,
+      functionType: ParseFunctionKind.Statement, jsMode: 0, functionName: 0,
+      vars: List<CompilerVar>.make(), args: List<CompilerVar>.make(), definedArgCount: 0, varRefCount: 0,
+      varObjectIndex: -1, argVarObjectIndex: -1, argumentsVarIndex: -1, argumentsArgIndex: -1,
+      functionVarIndex: -1, evalReturnIndex: -1, thisVarIndex: -1, newTargetVarIndex: -1,
+      thisActiveFunctionVarIndex: -1, homeObjectVarIndex: -1, needHomeObject: false,
+      scopeLevel: 0, scopeFirst: -1, scopes: ScopeTable.make(), bodyScope: -1,
+      globalVars: List<GlobalVar>.make(), bytecode: ByteBuffer.make(), bytecodeError: false,
+      lastOpcodePosition: -1, lastOpcodeSourcePosition: sourcePosition, useShortOpcodes: false,
+      labels: List<LabelSlot>.make(), blocks: List<BlockEnv>.make(), topBreak: -1,
+      constants: List<Value>.make(), closureVars: List<ClosureVar>.make(),
+      relocations: List<RelocEntry>.make(), jumps: List<JumpSlot>.make(), jumpCapacity: 0,
+      lineNumbers: List<PcSourcePosition>.make(), lineNumberCapacity: 0, lineNumberLast: 0,
+      lineNumberLastPc: 0, stripDebug: false, stripSource: false, filename: 0,
+      sourcePosition: sourcePosition, sourceCache: Pointer.null<SourcePositionCache>(),
+      pc2line: ByteBuffer.make(), source: ByteBuffer.make(), module: Pointer.null<HeapHeader>(), hasAwait: false }
+  }
+}

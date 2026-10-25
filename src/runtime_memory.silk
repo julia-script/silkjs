@@ -1,0 +1,250 @@
+//! Lifetime-independent allocations with a per-provider memory budget.
+//!
+//! Charged bytes are the complete child request: the native owner header, alignment
+//! padding, and payload (one addressable byte for an empty payload). The separately
+//! allocated control ledger is excluded. Its owner survives the provider until the
+//! last allocation is reclaimed. Child allocator metadata is outside this budget.
+//! Reclamation is entirely native Silk; the C ABI is only the adoption callback ABI.
+
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.atomic { Atomic, CompareExchange, MemoryOrder }
+import silk.effect { Effect }
+import silk.layout { Layout }
+import silk.ownership { Copy, Drop }
+import silk.pointer { Pointer }
+import silk.raw_buffer { RawBuffer }
+import silk.slot { Slot }
+import silk.thread { Transferable, Concurrent }
+import silk.usize
+
+/// A coherent, allocation-free snapshot. Peak usage counts successful allocations only.
+pub struct RuntimeMemoryStats {
+  pub usedBytes: usize,
+  pub peakBytes: usize,
+  pub allocationCount: usize,
+  pub limit: usize
+}
+
+impl Copy for RuntimeMemoryStats {}
+
+// One provider reference, one per outstanding allocation, and one per observer.
+// The gate protects the whole stats record so a snapshot cannot tear across a reclaim.
+struct Ledger {
+  storage: Intrinsic.RawBuffer<Ledger>,
+  references: usize,
+  gate: usize,
+  stats: RuntimeMemoryStats
+}
+
+// Field addresses are obtained from a fresh typed borrow, never from assumed offsets.
+// These addresses do not themselves own a reference; their enclosing owner does.
+struct LedgerPointers {
+  allocation: *mut Ledger,
+  references: *mut usize,
+  gate: *mut usize,
+  stats: *mut RuntimeMemoryStats
+}
+
+impl Copy for LedgerPointers {}
+
+struct AllocationHeader {
+  storage: Intrinsic.RawBuffer<u8>,
+  ledger: LedgerPointers,
+  chargedBytes: usize
+}
+
+/// An Allocator provider whose allocations do not borrow the provider or its child.
+/// A child must honor the Allocator contract: returned owners reclaim independently.
+pub struct RuntimeAllocator<A> {
+  child: A,
+  ledger: LedgerPointers
+}
+
+impl<A: Transferable> Transferable for RuntimeAllocator<A> {}
+
+/// Allocation-free owning observation handle. Safepoints can inspect accounting
+/// while the provider is exclusively installed as an Allocator effect service.
+/// It cannot allocate, alter limits, or retain JS values, and outlives the provider.
+pub struct AllocationObserver { ledger: LedgerPointers }
+impl Transferable for AllocationObserver {}
+impl Concurrent for AllocationObserver {}
+impl AllocationObserver {
+  pub fn stats(self: &Self) -> RuntimeMemoryStats { return ledgerStats(self.ledger) }
+}
+impl Drop for AllocationObserver {
+  fn drop(self: &mut Self) -> () { unsafe releaseLedger(self.ledger) }
+}
+
+fn ledgerStats(ledger: LedgerPointers) -> RuntimeMemoryStats {
+  unsafe {
+    lockLedger(ledger)
+    let state = Pointer.read<RuntimeMemoryStats>(ledger.stats)
+    unlockLedger(ledger)
+    return state
+  }
+}
+
+impl<A> RuntimeAllocator<A> {
+  /// Allocates the control ledger through the child, with an initially unlimited budget.
+  pub effect fn make(child: A) -> RuntimeAllocator<A> ! OutOfMemoryError
+  where &mut A provides &Allocator from &mut Allocator {
+    let mut ownedChild = move child
+    let allocation = run Allocator.allocate(Layout.of<Ledger>())
+      |> Effect.provideMut<Allocator>(&mut ownedChild)
+    let mut storage = unsafe RawBuffer.from<Ledger>(move allocation, 1)
+    let address = Slot.address(RawBuffer.slot<Ledger>(&mut storage, 0))
+    unsafe Pointer.put<Ledger>(address, Ledger {
+      storage: move storage,
+      references: 1,
+      gate: 0,
+      stats: RuntimeMemoryStats { usedBytes: 0, peakBytes: 0, allocationCount: 0, limit: usize.MAX }
+    })
+    let mut anchor = ()
+    let fresh = unsafe Pointer.borrowMut(&mut anchor, address)
+    let ledger = LedgerPointers {
+      allocation: address,
+      references: Pointer.fromMutRef(&mut fresh.references),
+      gate: Pointer.fromMutRef(&mut fresh.gate),
+      stats: Pointer.fromMutRef(&mut fresh.stats)
+    }
+    return RuntimeAllocator<A> { child: move ownedChild, ledger: ledger }
+  }
+
+  /// Changes the budget without invalidating storage. A limit below current usage
+  /// refuses new requests until enough existing allocations have been reclaimed.
+  pub fn setLimit(self: &mut Self, limit: usize) -> () {
+    let ledger = self.ledger
+    unsafe {
+      lockLedger(ledger)
+      let mut state = Pointer.read<RuntimeMemoryStats>(ledger.stats)
+      state.limit = limit
+      Pointer.write<RuntimeMemoryStats>(ledger.stats, state)
+      unlockLedger(ledger)
+    }
+    return ()
+  }
+
+  /// Reads one consistent snapshot, including concurrent cross-thread reclamation.
+  pub fn stats(self: &Self) -> RuntimeMemoryStats { return ledgerStats(self.ledger) }
+
+  pub effect fn observe(self: &Self) -> AllocationObserver ! OutOfMemoryError {
+    let ledger = self.ledger
+    let mut count = unsafe Atomic.load<usize>(ledger.references, MemoryOrder.Relaxed)
+    while true {
+      if count == usize.MAX { fail OutOfMemoryError {} }
+      match unsafe Atomic.compareExchange<usize>(ledger.references, count, count + 1, MemoryOrder.Relaxed, MemoryOrder.Relaxed) {
+        CompareExchange<usize>.Exchanged => { return AllocationObserver { ledger: ledger } }
+        CompareExchange<usize>.Observed { value } => { count = value }
+      }
+    }
+  }
+}
+
+impl<A> Allocator for RuntimeAllocator<A>
+where &mut A provides &Allocator from &mut Allocator {
+  effect fn allocate(self: &mut Self, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
+    // Layout literals can bypass Layout.make; reject invalid alignment before arithmetic.
+    if layout.alignment == 0 { return run Allocator.outOfMemory() }
+    let mask = layout.alignment - 1
+    if usize.bitAnd(layout.alignment, mask) != 0 { return run Allocator.outOfMemory() }
+    let header = Layout.of<AllocationHeader>()
+    if header.bytes > usize.MAX - mask { return run Allocator.outOfMemory() }
+    let offset = (header.bytes + mask) / layout.alignment * layout.alignment
+    let mut payloadBytes = layout.bytes
+    // Keep even a zero-sized adopted pointer inside its live backing allocation.
+    if payloadBytes == 0 { payloadBytes = 1 }
+    if payloadBytes > usize.MAX - offset { return run Allocator.outOfMemory() }
+    let chargedBytes = offset + payloadBytes
+    let mut alignment = header.alignment
+    if alignment < layout.alignment { alignment = layout.alignment }
+
+    let before = self.stats()
+    if before.usedBytes > before.limit { return run Allocator.outOfMemory() }
+    if chargedBytes > before.limit - before.usedBytes { return run Allocator.outOfMemory() }
+    let ledger = self.ledger
+    if unsafe Atomic.load<usize>(ledger.references, MemoryOrder.Relaxed) == usize.MAX {
+      return run Allocator.outOfMemory()
+    }
+
+    // The provider is exclusively borrowed. While the child runs, only reclaims can
+    // change usage, and those only decrease it. No reservation or peak change is
+    // needed: child failure leaves the ledger untouched, even across suspension.
+    let allocation = run Allocator.allocate(Layout { bytes: chargedBytes, alignment: alignment })
+      |> Effect.provideMut<Allocator>(&mut self.child)
+    let mut storage = unsafe RawBuffer.from<u8>(move allocation, chargedBytes)
+    let base = Slot.address(RawBuffer.slot<u8>(&mut storage, 0))
+    let bytes = unsafe Pointer.assumeManyMut<u8>(base)
+    let at = unsafe Pointer.atMut<u8>(bytes, offset)
+    let owner = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut AllocationHeader>(base)
+    unsafe {
+      // An Allocator loan excludes observe() on this provider; existing observers
+      // cannot clone. Reclaims can only decrease the count checked above.
+      let retained = Atomic.fetchAdd<usize>(ledger.references, 1, MemoryOrder.Relaxed)
+      Pointer.put<AllocationHeader>(owner, AllocationHeader {
+        storage: move storage, ledger: ledger, chargedBytes: chargedBytes
+      })
+      lockLedger(ledger)
+      let mut state = Pointer.read<RuntimeMemoryStats>(ledger.stats)
+      state.usedBytes = state.usedBytes + chargedBytes
+      state.allocationCount = state.allocationCount + 1
+      if state.peakBytes < state.usedBytes { state.peakBytes = state.usedBytes }
+      Pointer.write<RuntimeMemoryStats>(ledger.stats, state)
+      unlockLedger(ledger)
+      let reclaim: extern "C" fn(?*mut u8) -> () = silkRuntimeMemoryReclaim
+      return Intrinsic.allocationAdopt(at, move layout, reclaim, base)
+    }
+  }
+}
+
+impl<A> Drop for RuntimeAllocator<A> {
+  fn drop(self: &mut RuntimeAllocator<A>) -> () {
+    unsafe releaseLedger(self.ledger)
+    return ()
+  }
+}
+
+// Critical sections contain only bounded record accesses, never allocation,
+// effect suspension, backing-owner destruction, or a user callback.
+unsafe fn lockLedger(ledger: LedgerPointers) -> () {
+  while true {
+    match unsafe Atomic.compareExchange<usize>(ledger.gate, 0, 1, MemoryOrder.Acquire, MemoryOrder.Relaxed) {
+      CompareExchange<usize>.Exchanged => { return () }
+      CompareExchange<usize>.Observed {..} => ()
+    }
+  }
+}
+
+unsafe fn unlockLedger(ledger: LedgerPointers) -> () {
+  unsafe Atomic.store<usize>(ledger.gate, 0, MemoryOrder.Release)
+  return ()
+}
+
+unsafe fn releaseLedger(ledger: LedgerPointers) -> () {
+  if unsafe Atomic.fetchSubtract<usize>(ledger.references, 1, MemoryOrder.Release) != 1 { return () }
+  Atomic.fence(MemoryOrder.Acquire)
+  // No provider, observer or allocation can access this cell after the final reference.
+  let owner = unsafe Pointer.take<Ledger>(ledger.allocation)
+  drop owner
+  return ()
+}
+
+export "C" fn silkRuntimeMemoryReclaim(context: ?*mut u8) -> () {
+  let present = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(context)
+  let address = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut AllocationHeader>(present)
+  let owner = unsafe Pointer.take<AllocationHeader>(address)
+  let ledger = owner.ledger
+  let chargedBytes = owner.chargedBytes
+  // Move the complete header out before freeing the storage that contained it.
+  // Free backing outside the gate, since the child may itself be a RuntimeAllocator.
+  drop owner
+  unsafe {
+    lockLedger(ledger)
+    let mut state = Pointer.read<RuntimeMemoryStats>(ledger.stats)
+    state.usedBytes = state.usedBytes - chargedBytes
+    state.allocationCount = state.allocationCount - 1
+    Pointer.write<RuntimeMemoryStats>(ledger.stats, state)
+    unlockLedger(ledger)
+    releaseLedger(ledger)
+  }
+  return ()
+}

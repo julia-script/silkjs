@@ -1,0 +1,138 @@
+//! run-test262.c's filesystem-only loader, deliberately distinct from qjs libc.
+//! Only type=json selects JSON; unsupported attributes are not rejected upstream.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.list { List }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.result { Result }
+import js_engine { Engine }
+import js_libc_services { LibcServices }
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types { RuntimeState, NativeFunctionId, NativeErrorKind }
+import js_coercion_host { CoercionHooks }
+import js_string_types { StringOwner, StringLengthError }
+import js_strings { Strings }
+import js_bigint { BigIntError }
+import js_parser_diagnostics { SyntaxError }
+import js_parser_core { ParserStackOverflow }
+import js_module_metadata { ModuleMetadataError }
+import js_exceptions { JsException }
+import js_gc as gc
+import js_runtime as runtime
+import js_module_loader as loader
+import js_module_native as native
+import js_property_mutations as properties
+import js_libc_platform as platform
+import js_json_parse as json
+import js_eval as evaluation
+import js_eval_compile as flags
+import js_eval_errors as errors
+import test262_text as text
+
+pub const LOAD: u32 = 0x2620f000
+pub const JSON_INITIALIZE: u32 = 0x2620f001
+pub unsafe fn install(rt: *mut HeapHeader, filename: ?*mut u8) -> () {
+  unsafe loader.setLoaderWithAttributes(rt, Option<NativeFunctionId>.none(),
+    Option<NativeFunctionId>.some(NativeFunctionId.Host { id: LOAD }), Option<NativeFunctionId>.none(), filename)
+}
+unsafe effect fn filename(opaque: ?*mut u8) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<u8>.make()
+  if Pointer.isNull<u8>(opaque) { return move out }
+  let pointer = unsafe Pointer.assumeManyMut<u8>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(opaque))
+  let mut at: usize = 0
+  while true { let c = unsafe Pointer.read<u8>(unsafe Pointer.atMut<u8>(pointer, at)) if c == 0 { break } run out.append(c) at = at + 1 }
+  return move out
+}
+unsafe effect fn isJson<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader, attributes: Value) -> bool
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  if attributes.tag() == Value.Undefined.tag() { return false }
+  let mut anchor = () let rt = unsafe runtime.contextRuntime(context)
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+  let atom = run state.atoms.internUtf8(b"type") drop state
+  let fetched = run Effect.result(unsafe engine.getProperty(context, attributes, atom))
+  unsafe properties.releaseAtom(rt, atom)
+  let value = match move fetched {
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => value
+    Result<Value, OutOfMemoryError | JsException>.Failure { error } => { fail move error }
+  }
+  if !value.isString() { unsafe gc.release(&mut engine, rt, value) return false }
+  let string = StringOwner.adopt(value) let bytes = run Strings.toUtf8(string.get(), false)
+  return text.equal(bytes.asSlice(), b"json")
+}
+unsafe effect fn jsonModule<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader, name: &[u8], value: Value)
+  -> *mut HeapHeader ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  let created = run Effect.result(unsafe native.newNativeModule(context, name, NativeFunctionId.Host { id: JSON_INITIALIZE }))
+  let module = match move created {
+    Result<*mut HeapHeader, OutOfMemoryError | StringLengthError>.Success { value: createdModule } => createdModule
+    Result<*mut HeapHeader, OutOfMemoryError | StringLengthError>.Failure { error } => { unsafe gc.release(&mut engine, rt, value) fail move error }
+  }
+  unsafe native.setPrivateValue(&mut engine, context, module, value)
+  let exported = run Effect.result(unsafe native.addModuleExport(context, module, b"default"))
+  match move exported {
+    Result<(), OutOfMemoryError | StringLengthError | ModuleMetadataError>.Success { .. } => { return module }
+    Result<(), OutOfMemoryError | StringLengthError | ModuleMetadataError>.Failure { error } => {
+      unsafe gc.releaseHeader(&mut engine, rt, module)
+      match move error {
+        OutOfMemoryError allocation => { fail move allocation }
+        StringLengthError length => { fail move length }
+        ModuleMetadataError duplicate => { return Intrinsic.trap("fresh test262 JSON export duplicated") }
+      }
+    }
+  }
+}
+pub unsafe effect fn initialize<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader, module: *mut HeapHeader)
+  -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  let value = unsafe native.getPrivateValue(module)
+  let exported = run Effect.result(unsafe native.setModuleExport(&mut engine, context, module, b"default", value))
+  match move exported {
+    Result<bool, OutOfMemoryError | StringLengthError>.Success { .. } => ()
+    Result<bool, OutOfMemoryError | StringLengthError>.Failure { error } => { return run unsafe errors.materialize<(), Engine<'m, LibcServices>>(&mut engine, context, move error) }
+  }
+}
+unsafe effect fn loadBody<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader, name: &[u8], attributes: Value, opaque: ?*mut u8)
+  -> *mut HeapHeader ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let root = run unsafe filename(opaque)
+  let mut path = List<u8>.make()
+  if text.find(name, b"/", 0) == name.length { path = run text.path(text.basename(root.asSlice()), name) }
+  else { path = run text.copy(name) }
+  let loaded = run Effect.result(platform.readFile(path.asSlice()))
+  let source = match move loaded {
+    Result<List<u8>, OutOfMemoryError | platform.PlatformError>.Success { value } => move value
+    Result<List<u8>, OutOfMemoryError | platform.PlatformError>.Failure { error } => match move error {
+      OutOfMemoryError allocation => { fail move allocation }
+      platform.PlatformError system => {
+        let mut message = run text.copy(b"could not load module filename '")
+        run text.append(&mut message, path.asSlice()) run text.append(&mut message, b"'")
+        return run unsafe engine.throwError(context, NativeErrorKind.Reference, message.asSlice())
+      }
+    }
+  }
+  let memory = engine.memory
+  if run unsafe isJson(&mut engine, context, attributes) {
+    let label = StringOwner.adopt(run Strings.fromUtf8(path.asSlice()))
+    let parsed = run Effect.result(unsafe json.parseJSON2(&mut engine, memory, context, source.asSlice(), label.get(), 0))
+    let value = match move parsed {
+      Result<Value, OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow>.Success { value } => value
+      Result<Value, OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow>.Failure { error } => {
+        return run unsafe errors.compilation<*mut HeapHeader, Engine<'m, LibcServices>>(&mut engine, memory, context, move error)
+      }
+    }
+    return run unsafe jsonModule(&mut engine, context, path.asSlice(), value)
+  }
+  let compiled = run unsafe evaluation.evaluate(&mut engine, memory, context, source.asSlice(), path.asSlice(), flags.TYPE_MODULE | flags.FLAG_COMPILE_ONLY)
+  let module = match compiled { Value.Module { reference } => reference _ => { return Intrinsic.trap("test262 module compiler returned non-module") } }
+  unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), compiled)
+  return module
+}
+pub unsafe effect fn load<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader, name: &[u8], attributes: Value, opaque: ?*mut u8)
+  -> *mut HeapHeader ! OutOfMemoryError | JsException ? &mut Allocator {
+  let loaded = run Effect.result(unsafe loadBody(&mut engine, context, name, attributes, opaque))
+  return match move loaded {
+    Result<*mut HeapHeader, OutOfMemoryError | StringLengthError | JsException>.Success { value } => value
+    Result<*mut HeapHeader, OutOfMemoryError | StringLengthError | JsException>.Failure { error } =>
+      run unsafe errors.materialize<*mut HeapHeader, Engine<'m, LibcServices>>(&mut engine, context, move error)
+  }
+}

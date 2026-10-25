@@ -1,0 +1,227 @@
+//! Native OS-thread proof on real SharedArrayBuffer backing. No JS heap object
+//! crosses threads: the main thread roots the backing until every join returns.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.atomic { MemoryOrder }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.ownership { Copy }
+import silk.thread { Transferable, Concurrent }
+import silk.u32
+import silk.u64
+import silk.native_thread { NativeThread, SpawnError }
+import runtime_memory { RuntimeAllocator }
+import native_stack { currentFrameAddress }
+import js_exceptions { JsException }
+import js_string_types { StringLengthError }
+import js_errors_test_support { FaultAllocator }
+import js_array_storage_test_support as contexts
+import js_buffer_test_support as fixture
+import js_buffer_test_support { Hooks }
+import js_buffer_storage as storage
+import js_atomics_native as native
+import js_atomics_native { WaiterDomain, SynchronizationError, Domain, WaitResult }
+import js_shared_memory as shared
+import js_shared_memory { Span }
+import js_runtime as runtime
+import js_gc as gc
+import js_value { Value }
+import js_proxy_core as core
+
+extern "C" struct Timespec { seconds: i64, nanoseconds: i64 }
+unsafe extern "C" fn nanosleep(request: *const Timespec, remaining: ?*mut Timespec) -> i32
+  with Intrinsic.foreign(noCapture: ("request", "remaining"))
+struct Address { pointer: *mut u8, span: Span, offset: u32 }
+impl Copy for Address {}
+impl Transferable for Address {}
+impl Concurrent for Address {}
+fn addMany(address: Address, shift: u32) -> i32 {
+  let mut index: u32 = 0
+  while index < 10000 { let previous = unsafe shared.operate(address.span, address.offset, shift, 0, 1, 0) index = index + 1 }
+  return 0
+}
+fn addHighWord(span: Span) -> i32 {
+  let mut index: u32 = 0
+  while index < 10000 {
+    let previous = unsafe shared.operate(span, 0, 3, 0, 4294967296, 0)
+    index = index + 1
+  }
+  return 0
+}
+fn ordinaryByteWrites(span: Span) -> i32 {
+  // Mirrors the fixed shared backing created below, whose real owner remains
+  // rooted on the main thread. Exercise the production scalar-storage route.
+  let state = storage.BufferState { data: span.data, byteLength: span.capacity,
+    maxByteLength: -1, detached: false, shared: true, external: false, physicalCapacity: span.capacity }
+  let mut index: u32 = 0
+  while index < 10000 {
+    unsafe storage.storeScalar(state, 7, 0, 165)
+    index = index + 1
+  }
+  return 0
+}
+fn waitOne(domain: Domain, address: Address, shift: u32, timeout: i64) -> i32 {
+  return match unsafe native.wait(domain, address.span, address.offset, shift, 0, timeout) {
+    WaitResult.Ok => 0
+    WaitResult.TimedOut => 1
+    WaitResult.NotEqual => 2
+    WaitResult.Cancelled => 3
+  }
+}
+fn notifyOne(domain: Domain, address: Address) -> () {
+  // This is only the consumer coordinating thread startup. Each retry sleeps
+  // in the OS; implementation waits always use a blocking POSIX condition.
+  let delay = Timespec { seconds: 0, nanoseconds: 1000000 }
+  let mut attempts: u32 = 0
+  while unsafe native.notify(domain, address.pointer, 1) == 0 {
+    attempts = attempts + 1
+    if attempts >= 10000 { contexts.trap() }
+    let ignored = unsafe nanosleep(Pointer.fromRef(&delay), Pointer.null<Timespec>())
+  }
+  if unsafe native.notify(domain, address.pointer, 1) != 0 { contexts.trap() }
+}
+pub effect fn runThreads() -> ()
+  ! OutOfMemoryError | StringLengthError | JsException | SynchronizationError | SpawnError {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let domain = run WaiterDomain.make() |> Effect.provideMut<Allocator>(&mut memory)
+  let capability = domain.handle()
+  let rt = run runtime.allocateRuntimeStorage(currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe contexts.context(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make(&observer)
+  run unsafe fixture.prepare(&mut hooks, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+  let buffer = run unsafe storage.create(&mut hooks, &observer, ctx, Value.Undefined, 16,
+    Option<u64>.none(), true) |> Effect.provideMut<Allocator>(&mut memory)
+  let bytes = unsafe storage.snapshot(core.reference(buffer))
+  let span = Span { data: bytes.data, capacity: bytes.byteLength }
+  let address = Address { pointer: unsafe shared.address(span, 0), span: span, offset: 0 }
+  let other = Address { pointer: unsafe shared.address(span, 8), span: span, offset: 8 }
+  let mut shift: u32 = 0
+  while shift < 4 {
+    unsafe shared.store(span, 0, shift, 0, MemoryOrder.SequentiallyConsistent)
+    let firstAddress = address let firstShift = shift
+    let secondAddress = address let secondShift = shift
+    let thirdAddress = address let thirdShift = shift
+    let fourthAddress = address let fourthShift = shift
+    let first = run NativeThread.spawn(fn() -> i32 { return addMany(firstAddress, firstShift) }) |> Effect.provideMut<Allocator>(&mut memory)
+    let second = run NativeThread.spawn(fn() -> i32 { return addMany(secondAddress, secondShift) }) |> Effect.provideMut<Allocator>(&mut memory)
+    let third = run NativeThread.spawn(fn() -> i32 { return addMany(thirdAddress, thirdShift) }) |> Effect.provideMut<Allocator>(&mut memory)
+    let fourth = run NativeThread.spawn(fn() -> i32 { return addMany(fourthAddress, fourthShift) }) |> Effect.provideMut<Allocator>(&mut memory)
+    let local = addMany(address, shift)
+    if first.join() != 0 || second.join() != 0 || third.join() != 0 || fourth.join() != 0 { contexts.trap() }
+    let mut expected: u64 = 50000 if shift == 0 { expected = 80 }
+    if unsafe shared.operate(span, 0, shift, 7, 0, 0) != expected { contexts.trap() }
+    shift = shift + 1
+  }
+  // Different JS widths overlap the same canonical cell concurrently. A
+  // subword CAS or ordinary byte store that loses adjacent updates fails this.
+  unsafe shared.store(span, 0, 3, 0, MemoryOrder.SequentiallyConsistent)
+  let lowAddress = address let highSpan = span let byteSpan = span
+  let lowWorker = run NativeThread.spawn(fn() -> i32 { return addMany(lowAddress, 2) }) |> Effect.provideMut<Allocator>(&mut memory)
+  let highWorker = run NativeThread.spawn(fn() -> i32 { return addHighWord(highSpan) }) |> Effect.provideMut<Allocator>(&mut memory)
+  let byteWorker = run NativeThread.spawn(fn() -> i32 { return ordinaryByteWrites(byteSpan) }) |> Effect.provideMut<Allocator>(&mut memory)
+  if lowWorker.join() != 0 || highWorker.join() != 0 || byteWorker.join() != 0 { contexts.trap() }
+  if unsafe shared.load(span, 0, 3, MemoryOrder.SequentiallyConsistent) != 0xa500271000002710 { contexts.trap() }
+  // Actual bounded allocations, not rounded-up buffers, cover every tail
+  // decomposition and unaligned scalar access while preserving neighbor bytes.
+  let mut capacity: u32 = 1
+  while capacity <= 15 {
+    let tailBuffer = run unsafe storage.create(&mut hooks, &observer, ctx, Value.Undefined, u32.toU64(capacity),
+      Option<u64>.none(), true) |> Effect.provideMut<Allocator>(&mut memory)
+    let tailState = unsafe storage.snapshot(core.reference(tailBuffer))
+    let tailSpan = Span { data: tailState.data, capacity: capacity }
+    if capacity == 1 || capacity == 2 || capacity == 4 {
+      let mut tailShift: u32 = 0 let mut full: u64 = 255
+      if capacity == 2 { tailShift = 1 full = 65535 }
+      if capacity == 4 { tailShift = 2 full = 4294967295 }
+      unsafe shared.store(tailSpan, 0, tailShift, full, MemoryOrder.SequentiallyConsistent)
+      if unsafe shared.operate(tailSpan, 0, tailShift, 0, 1, 0) != full { contexts.trap() }
+      if unsafe shared.load(tailSpan, 0, tailShift, MemoryOrder.SequentiallyConsistent) != 0 { contexts.trap() }
+    }
+    let mut expectedBytes: [u8; 15] = [0; 15]
+    let mut position: u32 = 0
+    while position < capacity {
+      expectedBytes[u32.toUsize(position)] = u32.toU8(position + 16)
+      unsafe shared.storeByte(tailSpan, position, u32.toU8(position + 16))
+      position = position + 1
+    }
+    let mut scalarShift: u32 = 0
+    while scalarShift < 4 {
+      let scalarWidth = u32.shiftLeft(1, scalarShift)
+      position = 0
+      while position + scalarWidth <= capacity {
+        unsafe shared.store(tailSpan, position, scalarShift, 0xfedcba9876543210, MemoryOrder.Relaxed)
+        let expectedScalar: u64 = match scalarShift {
+          0 => 0x10 1 => 0x3210 2 => 0x76543210 _ => 0xfedcba9876543210
+        }
+        if unsafe shared.load(tailSpan, position, scalarShift, MemoryOrder.Relaxed) != expectedScalar { contexts.trap() }
+        let mut byte: u32 = 0
+        while byte < scalarWidth {
+          expectedBytes[u32.toUsize(position + byte)] = u64.toU8(u64.shiftRight(0xfedcba9876543210, u32.toU64(byte * 8)) & 255)
+          byte = byte + 1
+        }
+        let mut checked: u32 = 0
+        while checked < capacity {
+          if unsafe shared.loadByte(tailSpan, checked) != expectedBytes[u32.toUsize(checked)] { contexts.trap() }
+          checked = checked + 1
+        }
+        position = position + 1
+      }
+      scalarShift = scalarShift + 1
+    }
+    unsafe gc.release(&mut hooks, rt, tailBuffer)
+    capacity = capacity + 1
+  }
+  shift = 2
+  while shift <= 3 {
+    unsafe shared.store(span, 0, shift, 0, MemoryOrder.SequentiallyConsistent)
+    let waitingAddress = address let waitingDomain = capability let waitingShift = shift
+    let waiter = run NativeThread.spawn(fn() -> i32 { return waitOne(waitingDomain, waitingAddress, waitingShift, 10000) }) |> Effect.provideMut<Allocator>(&mut memory)
+    if unsafe native.notify(capability, other.pointer, 2147483647) != 0 { contexts.trap() }
+    if unsafe native.notify(capability, address.pointer, 0) != 0 { contexts.trap() }
+    notifyOne(capability, address)
+    if waiter.join() != 0 { contexts.trap() }
+    match unsafe native.wait(capability, span, 0, shift, 1, 0) { WaitResult.NotEqual => () _ => contexts.trap() }
+    match unsafe native.wait(capability, span, 0, shift, 0, 0) { WaitResult.TimedOut => () _ => contexts.trap() }
+    shift = shift + 1
+  }
+  unsafe shared.store(span, 0, 3, 0, MemoryOrder.SequentiallyConsistent)
+  let firstWaitAddress = address let firstWaitDomain = capability
+  let secondWaitAddress = address let secondWaitDomain = capability
+  let firstWait = run NativeThread.spawn(fn() -> i32 { return waitOne(firstWaitDomain, firstWaitAddress, 3, 9223372036854775807) }) |> Effect.provideMut<Allocator>(&mut memory)
+  let secondWait = run NativeThread.spawn(fn() -> i32 { return waitOne(secondWaitDomain, secondWaitAddress, 3, 9223372036854775807) }) |> Effect.provideMut<Allocator>(&mut memory)
+  let delay = Timespec { seconds: 0, nanoseconds: 1000000 }
+  let mut woken: i32 = 0
+  let mut attempts: u32 = 0
+  while woken < 2 {
+    let count = unsafe native.notify(capability, address.pointer, 1)
+    if count < 0 || count > 1 { contexts.trap() }
+    woken = woken + count
+    if count == 0 {
+      attempts = attempts + 1
+      if attempts >= 10000 { contexts.trap() }
+      let ignored = unsafe nanosleep(Pointer.fromRef(&delay), Pointer.null<Timespec>())
+    }
+  }
+  if firstWait.join() != 0 || secondWait.join() != 0 { contexts.trap() }
+  if unsafe native.notify(capability, address.pointer, 2147483647) != 0 { contexts.trap() }
+  unsafe gc.release(&mut hooks, rt, buffer)
+  run unsafe gc.collect(&mut hooks, rt, true) |> Effect.provideMut<Allocator>(&mut memory)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx)
+  run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  hooks.clearHostLedger()
+  drop domain
+  if observer.stats().allocationCount != 0 || observer.stats().usedBytes != 0 { contexts.trap() }
+}
+pub effect fn domainFault() -> () ! OutOfMemoryError {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let mut fault = FaultAllocator { parent: move memory, armed: true, remaining: 0, persistent: false, failures: 0 }
+  let outcome = run Effect.result(WaiterDomain.make()) |> Effect.provideMut<Allocator>(&mut fault)
+  match move outcome {
+    Result<WaiterDomain, OutOfMemoryError | SynchronizationError>.Success { value } => { drop value contexts.trap() }
+    Result<WaiterDomain, OutOfMemoryError | SynchronizationError>.Failure { .. } => ()
+  }
+  if fault.failures != 1 || observer.stats().allocationCount != 0 || observer.stats().usedBytes != 0 { contexts.trap() }
+}

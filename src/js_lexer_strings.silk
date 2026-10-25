@@ -1,0 +1,257 @@
+// Native lexical strings from QuickJS 7d1c13c5d8f8c6b32893786ed35cdcebd88194d2.
+// Builders and finished StringOwner guards are affine: every failure unwinds
+// both unfinished buffers and any already-finished token payloads.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.option { Option }
+import silk.i32
+import silk.u32
+import js_strings { StringBuilder }
+import js_string_types { StringOwner, StringLengthError }
+import js_tokens { Token, TokenPayload, LexError, TOK_STRING, TOK_TEMPLATE, TOK_REGEXP }
+import js_lexer_chars { byte, decode, escape, digit, isDigit, isIdentNext }
+
+// Nonnegative points are output; -1 is malformed, -2 a line continuation,
+// -3 a strict-mode octal escape, and -4 malformed source UTF-8.
+struct CookedEscape { point: i32, end: usize }
+fn cookedEscape(source: &[u8], at: usize, strict: bool, template: bool) -> CookedEscape {
+  if at >= source.length { return CookedEscape { point: -1, end: at } }
+  let c = byte(source, at)
+  if c == 13 {
+    let mut end = at + 1
+    if byte(source, end) == 10 { end = end + 1 }
+    return CookedEscape { point: -2, end: end }
+  }
+  if c == 10 { return CookedEscape { point: -2, end: at + 1 } }
+  if c >= 128 {
+    let decoded = decode(source, at)
+    if !decoded.valid { return CookedEscape { point: -4, end: at } }
+    if decoded.point == 0x2028 || decoded.point == 0x2029 {
+      return CookedEscape { point: -2, end: decoded.end }
+    }
+    return CookedEscape { point: u32.toI32(decoded.point), end: decoded.end }
+  }
+  if isDigit(c) && (strict || template) {
+    if c == 48 && !isDigit(byte(source, at + 1)) {
+      return CookedEscape { point: 0, end: at + 1 }
+    }
+    if c >= 56 || template { return CookedEscape { point: -1, end: at } }
+    return CookedEscape { point: -3, end: at }
+  }
+  let parsed = escape(source, at)
+  if parsed.point == -2 {
+    // Identity escapes, including a literal embedded NUL, discard the slash.
+    return CookedEscape { point: u32.toI32(c), end: at + 1 }
+  }
+  return CookedEscape { point: parsed.point, end: parsed.end }
+}
+
+pub effect fn scanString(source: &[u8], start: usize, strict: bool) -> Token
+  ! LexError | StringLengthError | OutOfMemoryError ? &mut Allocator {
+  if start >= source.length { fail LexError.at(start, "unexpected end of string") }
+  let separator = byte(source, start)
+  let mut p = start + 1
+  let mut builder = StringBuilder.make()
+  while true {
+    if p >= source.length { fail LexError.at(start, "unexpected end of string") }
+    let mut c = byte(source, p)
+    p = p + 1
+    if c == separator { break }
+    if c == 10 || c == 13 { fail LexError.at(start, "unexpected end of string") }
+    if c == 92 {
+      let slash = p - 1
+      if p >= source.length { fail LexError.at(start, "unexpected end of string") }
+      let parsed = cookedEscape(source, p, strict, false)
+      if parsed.point == -4 { fail LexError.at(start, "invalid UTF-8 sequence") }
+      if parsed.point == -3 {
+        fail LexError.at(slash, "octal escape sequences are not allowed in strict mode")
+      }
+      if parsed.point == -1 { fail LexError.at(slash, "malformed escape sequence in string literal") }
+      p = parsed.end
+      if parsed.point == -2 { continue }
+      c = i32.toU32(parsed.point)
+    } else if c >= 128 {
+      let decoded = decode(source, p - 1)
+      if !decoded.valid { fail LexError.at(start, "invalid UTF-8 sequence") }
+      c = decoded.point
+      p = decoded.end
+    }
+    run builder.appendCodePoint(c)
+  }
+  let value = StringOwner.adopt(run builder.finish())
+  return Token { kind: TOK_STRING, start: start, end: p, gotLineFeed: false,
+    payload: TokenPayload.String { value: move value, separator: separator } }
+}
+
+// contentStart is after the opening backtick or the preceding substitution's
+// closing brace. Raw scanning always continues after an invalid cooked escape.
+// cookedEnd lets one source walk preserve escape spelling without decoding the
+// escaped hex/octal digits a second time as cooked text.
+pub effect fn scanTemplate(source: &[u8], start: usize, contentStart: usize, strict: bool) -> Token
+  ! LexError | StringLengthError | OutOfMemoryError ? &mut Allocator {
+  let mut raw = StringBuilder.make()
+  let mut cooked = StringBuilder.make()
+  let mut cookedValid = true
+  let mut cookedEnd = contentStart
+  let mut p = contentStart
+  let mut separator: u32 = 96
+  while true {
+    if p >= source.length { fail LexError.at(start, "unexpected end of string") }
+    let at = p
+    let mut c = byte(source, p)
+    p = p + 1
+    if c == 96 { break }
+    if c == 36 && byte(source, p) == 123 {
+      p = p + 1
+      separator = 36
+      break
+    }
+    let escaped = c == 92
+    if escaped {
+      run raw.appendCodePoint(92)
+      if p >= source.length { fail LexError.at(start, "unexpected end of string") }
+      if cookedValid && at >= cookedEnd {
+        let parsed = cookedEscape(source, p, strict, true)
+        if parsed.point == -1 || parsed.point == -3 || parsed.point == -4 {
+          cookedValid = false
+          cooked = StringBuilder.make()
+        } else {
+          cookedEnd = parsed.end
+          if parsed.point >= 0 { run cooked.appendCodePoint(i32.toU32(parsed.point)) }
+        }
+      }
+      c = byte(source, p)
+      p = p + 1
+    }
+    // Normalize CR and CRLF even immediately after a raw backslash.
+    if c == 13 {
+      if byte(source, p) == 10 { p = p + 1 }
+      c = 10
+    }
+    if c >= 128 {
+      let decoded = decode(source, p - 1)
+      if !decoded.valid { fail LexError.at(p - 1, "invalid UTF-8 sequence") }
+      c = decoded.point
+      p = decoded.end
+    }
+    run raw.appendCodePoint(c)
+    if !escaped && cookedValid && at >= cookedEnd { run cooked.appendCodePoint(c) }
+  }
+  let rawValue = StringOwner.adopt(run raw.finish())
+  let mut cookedValue = Option<StringOwner>.none()
+  if cookedValid {
+    let value = StringOwner.adopt(run cooked.finish())
+    cookedValue = Option<StringOwner>.some(move value)
+  }
+  return Token { kind: TOK_TEMPLATE, start: start, end: p, gotLineFeed: false,
+    payload: TokenPayload.Template { raw: move rawValue, cooked: move cookedValue, separator: separator } }
+}
+
+// JSON extensions intentionally follow json_parse_string, not JS escapes:
+// only escaped LF and \\v are added; \\x, \\0, CR continuations and brace Unicode
+// escapes remain invalid. The caller selects whether single quotes are tokens.
+pub effect fn scanJsonString(source: &[u8], start: usize, extended: bool) -> Token
+  ! LexError | StringLengthError | OutOfMemoryError ? &mut Allocator {
+  if start >= source.length { fail LexError.at(start, "Unexpected end of JSON input") }
+  let separator = byte(source, start)
+  let mut p = start + 1
+  let mut builder = StringBuilder.make()
+  while true {
+    if p >= source.length { fail LexError.at(start, "Unexpected end of JSON input") }
+    let mut c = byte(source, p)
+    p = p + 1
+    if c == separator { break }
+    if c < 32 { fail LexError.at(p - 1, "Bad control character in string literal") }
+    if c == 92 {
+      if p >= source.length { fail LexError.at(start, "Unexpected end of JSON input") }
+      c = byte(source, p)
+      p = p + 1
+      if c == 98 { c = 8 }
+      else if c == 102 { c = 12 }
+      else if c == 110 { c = 10 }
+      else if c == 114 { c = 13 }
+      else if c == 116 { c = 9 }
+      else if c == 117 {
+        c = 0
+        let mut i: usize = 0
+        while i < 4 {
+          let h = digit(byte(source, p))
+          if p >= source.length || h >= 16 { fail LexError.at(p, "Bad Unicode escape") }
+          c = c * 16 + h
+          p = p + 1
+          i = i + 1
+        }
+      } else if c == 10 && extended { continue }
+      else if c == 118 && extended { c = 11 }
+      else if c != 92 && c != 47 && c != separator { fail LexError.at(p - 1, "Bad escaped character") }
+    } else if c >= 128 {
+      let decoded = decode(source, p - 1)
+      if !decoded.valid { fail LexError.at(p - 1, "Bad UTF-8 sequence") }
+      c = decoded.point
+      p = decoded.end
+    }
+    run builder.appendCodePoint(c)
+  }
+  let value = StringOwner.adopt(run builder.finish())
+  return Token { kind: TOK_STRING, start: start, end: p, gotLineFeed: false,
+    payload: TokenPayload.String { value: move value, separator: separator } }
+}
+
+// This is lexical rescanning only. Duplicate/unknown flags and regexp grammar
+// are the regexp compiler's responsibility, exactly as in js_parse_regexp.
+pub effect fn scanRegExp(source: &[u8], start: usize) -> Token
+  ! LexError | StringLengthError | OutOfMemoryError ? &mut Allocator {
+  if start >= source.length { fail LexError.at(start, "unexpected end of regexp") }
+  let mut p = start + 1
+  let mut inClass = false
+  let mut body = StringBuilder.make()
+  let mut flags = StringBuilder.make()
+  while true {
+    if p >= source.length { fail LexError.at(start, "unexpected end of regexp") }
+    let mut at = p
+    let mut c = byte(source, p)
+    p = p + 1
+    if c == 10 || c == 13 { fail LexError.at(at, "unexpected line terminator in regexp") }
+    if c == 47 && !inClass { break }
+    if c == 91 { inClass = true }
+    else if c == 93 { inClass = false }
+    let escaped = c == 92
+    if escaped {
+      run body.appendCodePoint(92)
+      if p >= source.length { fail LexError.at(start, "unexpected end of regexp") }
+      at = p
+      c = byte(source, p)
+      p = p + 1
+      if c == 10 || c == 13 { fail LexError.at(at, "unexpected line terminator in regexp") }
+      if c == 0 && p >= source.length { fail LexError.at(start, "unexpected end of regexp") }
+    }
+    if c >= 128 {
+      let decoded = decode(source, at)
+      if !decoded.valid { fail LexError.at(at, "invalid UTF-8 sequence") }
+      c = decoded.point
+      p = decoded.end
+      if c == 0x2028 || c == 0x2029 {
+        // Upstream's escaped branch advances p before reporting this error.
+        if escaped { fail LexError.at(p - 1, "unexpected line terminator in regexp") }
+        fail LexError.at(at, "unexpected line terminator in regexp")
+      }
+    }
+    run body.appendCodePoint(c)
+  }
+  while p < source.length {
+    let mut c = byte(source, p)
+    let mut end = p + 1
+    if c >= 128 {
+      let decoded = decode(source, p)
+      if !decoded.valid { fail LexError.at(p, "invalid UTF-8 sequence") }
+      c = decoded.point
+      end = decoded.end
+    }
+    if !isIdentNext(c) { break }
+    run flags.appendCodePoint(c)
+    p = end
+  }
+  let bodyValue = StringOwner.adopt(run body.finish())
+  let flagsValue = StringOwner.adopt(run flags.finish())
+  return Token { kind: TOK_REGEXP, start: start, end: p, gotLineFeed: false,
+    payload: TokenPayload.RegExp { body: move bodyValue, flags: move flagsValue } }
+}

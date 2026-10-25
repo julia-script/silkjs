@@ -1,0 +1,186 @@
+//! DisposableStack and AsyncDisposableStack owned records, quickjs.c:55752-55769,
+//! 55855-55884,55950-56015,56339-56380. Auxiliary storage is never a GC-list node.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.layout { Layout }
+import silk.raw_buffer { RawBuffer }
+import silk.slot { Slot }
+import silk.usize
+import runtime_memory { AllocationObserver }
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_value { Value }
+import js_core_types { ObjectData, ObjectPayload, ObjectPayloadFamily, NativeErrorKind }
+import js_gc { HeapHooks, Tracer }
+import js_gc as gc
+import js_runtime as runtime
+import js_coercion_host { CoercionHooks }
+import js_constructor_ops as constructors
+import js_proxy_core as core
+import js_class_data as classes
+import js_exceptions { JsException }
+
+pub const USE: i32 = 0
+pub const ADOPT: i32 = 1
+pub const DEFER: i32 = 2
+pub struct Resource { pub value: Value, pub method: Value, pub hint: i32 }
+struct State { disposed: bool, count: usize, capacity: usize, resources: Option<Intrinsic.RawBuffer<Resource>> }
+fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+fn family(classId: u32) -> ObjectPayloadFamily {
+  if classId == classes.JS_CLASS_DISPOSABLE_STACK { return ObjectPayloadFamily.DisposableStack }
+  require(classId == classes.JS_CLASS_ASYNC_DISPOSABLE_STACK)
+  return ObjectPayloadFamily.AsyncDisposableStack
+}
+unsafe fn objectState(object: *mut HeapHeader) -> ?*mut HeapHeader {
+  let a = () let data = unsafe HeapCell.payload<ObjectData, ()>(&a, object)
+  return match &data.payload {
+    ObjectPayload.Opaque { family: tag, reference } => {
+      require(tag == ObjectPayloadFamily.DisposableStack || tag == ObjectPayloadFamily.AsyncDisposableStack)
+      return reference
+    }
+    ObjectPayload.Empty => Pointer.null<HeapHeader>()
+    _ => invariant()
+  }
+}
+pub unsafe effect fn requireState<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  receiver: Value, classId: u32, live: bool) -> *mut HeapHeader ! JsException ? &mut Allocator {
+  let mut optional = Pointer.null<HeapHeader>()
+  if receiver.isObject() {
+    let a = () let object = unsafe HeapCell.payload<ObjectData, ()>(&a, core.reference(receiver))
+    let matches = object.classId == classId drop object
+    if matches { optional = unsafe objectState(core.reference(receiver)) }
+  }
+  let node = match Pointer.nonNullMut<HeapHeader>(optional) {
+    Option<*mut HeapHeader>.Some { value } => value
+    _ => {
+      if classId == classes.JS_CLASS_ASYNC_DISPOSABLE_STACK { return run unsafe core.error(&mut hooks, context, b"AsyncDisposableStack object expected") }
+      return run unsafe core.error(&mut hooks, context, b"DisposableStack object expected")
+    }
+  }
+  if live && unsafe disposed(node) { return run unsafe hooks.throwError(context, NativeErrorKind.Reference, b"DisposableStack has been disposed") }
+  return node
+}
+pub unsafe fn disposed(node: *mut HeapHeader) -> bool {
+  let a = () let state = unsafe HeapCell.payload<State, ()>(&a, node) return state.disposed
+}
+pub unsafe fn count(node: *mut HeapHeader) -> usize {
+  let a = () let state = unsafe HeapCell.payload<State, ()>(&a, node) return state.count
+}
+pub unsafe fn begin(node: *mut HeapHeader) -> () {
+  let mut a = () let state = unsafe HeapCell.payloadMut<State, ()>(&mut a, node) state.disposed = true
+}
+pub unsafe fn finish(node: *mut HeapHeader) -> () {
+  let mut a = () let state = unsafe HeapCell.payloadMut<State, ()>(&mut a, node) state.count = 0
+}
+/// Borrows a record; callers keep the stack alive and drop payload loans before JS.
+pub unsafe fn resource(node: *mut HeapHeader, index: usize) -> Resource {
+  let a = () let state = unsafe HeapCell.payload<State, ()>(&a, node)
+  require(index < state.count)
+  return match &state.resources {
+    Option<Intrinsic.RawBuffer<Resource>>.Some { value } => {
+      let records = unsafe RawBuffer.view<Resource>(&value, 0, state.count)
+      return Resource { value: records[index].value, method: records[index].method, hint: records[index].hint }
+    }
+    _ => invariant()
+  }
+}
+pub unsafe fn clearResource<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, node: *mut HeapHeader, index: usize) -> () {
+  let record = unsafe resource(node, index)
+  unsafe gc.release(&mut hooks, rt, record.value)
+  unsafe gc.release(&mut hooks, rt, record.method)
+  let mut a = () let state = unsafe HeapCell.payloadMut<State, ()>(&mut a, node)
+  let length = state.count
+  match &mut state.resources {
+    Option<Intrinsic.RawBuffer<Resource>>.Some { value } => {
+      let records = unsafe RawBuffer.viewMut<Resource>(&mut value, 0, length)
+      records[index].value = Value.Undefined records[index].method = Value.Undefined
+    }
+    _ => invariant()
+  }
+}
+unsafe effect fn grow(node: *mut HeapHeader) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut a = () let state = unsafe HeapCell.payload<State, ()>(&a, node)
+  let count = state.count let capacity = state.capacity drop state
+  if count < capacity { return }
+  let layout = Layout.of<Resource>()
+  if capacity > usize.MAX / 2 { return run Allocator.outOfMemory() }
+  let mut next = capacity * 2 if next < 4 { next = 4 }
+  if next > usize.MAX / layout.bytes { return run Allocator.outOfMemory() }
+  let allocation = run Allocator.allocate(Layout { bytes: next * layout.bytes, alignment: layout.alignment })
+  let mut buffer = unsafe RawBuffer.from<Resource>(move allocation, next)
+  let mut index: usize = 0
+  while index < count { Slot.write(RawBuffer.slot<Resource>(&mut buffer, index), unsafe resource(node, index)) index = index + 1 }
+  let grown = unsafe HeapCell.payloadMut<State, ()>(&mut a, node)
+  grown.resources = Option<Intrinsic.RawBuffer<Resource>>.some(move buffer) grown.capacity = next
+}
+/// Allocation occurs before retaining either borrowed input; failure leaves the stack unchanged.
+pub unsafe effect fn add<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  node: *mut HeapHeader, value: Value, method: Value, hint: i32) -> () ! JsException ? &mut Allocator {
+  let grown = run Effect.result(unsafe grow(node))
+  match move grown {
+    Result<(), OutOfMemoryError>.Success { .. } => ()
+    Result<(), OutOfMemoryError>.Failure { error } => { return run unsafe core.materialize(&mut hooks, context, move error) }
+  }
+  let mut a = () let state = unsafe HeapCell.payloadMut<State, ()>(&mut a, node) let index = state.count
+  match &mut state.resources {
+    Option<Intrinsic.RawBuffer<Resource>>.Some { value: buffer } => {
+      Slot.write(RawBuffer.slot<Resource>(&mut buffer, index), Resource { value: unsafe value.retained(), method: unsafe method.retained(), hint: hint })
+    }
+    _ => invariant()
+  }
+  state.count = index + 1
+}
+/// Undefined target selects the current realm's intrinsic prototype for move().
+pub unsafe effect fn create<H: HeapHooks + CoercionHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, newTarget: Value, classId: u32) -> Value ! JsException ? &mut Allocator {
+  let object = run unsafe constructors.createFromConstructor(&mut hooks, memory, context, newTarget, classId)
+  let allocated = run Effect.result(HeapCell.allocate(HeapKind.Auxiliary, State { disposed: false,
+    count: 0, capacity: 0, resources: Option<Intrinsic.RawBuffer<Resource>>.none() }))
+  let node = match move allocated {
+    Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value
+    Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => {
+      let pending = run Effect.catch<JsException>(unsafe core.materialize(&mut hooks, context, move error), core.exceptionValue)
+      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), object) fail JsException {}
+    }
+  }
+  let mut a = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut a, core.reference(object))
+  data.payload = ObjectPayload.Opaque { family: family(classId), reference: node }
+  return object
+}
+pub unsafe effect fn moveStack<H: HeapHooks + CoercionHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, node: *mut HeapHeader, classId: u32) -> Value ! JsException ? &mut Allocator {
+  let object = run unsafe create(&mut hooks, memory, context, Value.Undefined, classId)
+  let destination = match Pointer.nonNullMut<HeapHeader>(unsafe objectState(core.reference(object))) {
+    Option<*mut HeapHeader>.Some { value } => value _ => invariant()
+  }
+  let mut a = () let state = unsafe HeapCell.payloadMut<State, ()>(&mut a, node)
+  let resources = Intrinsic.replace(state.resources, Option<Intrinsic.RawBuffer<Resource>>.none())
+  let count = state.count let capacity = state.capacity
+  state.count = 0 state.capacity = 0 state.disposed = true drop state
+  let target = unsafe HeapCell.payloadMut<State, ()>(&mut a, destination)
+  target.resources = move resources target.count = count target.capacity = capacity
+  return object
+}
+pub unsafe fn mark(object: *mut HeapHeader, tracer: &mut Tracer) -> () {
+  let node = match Pointer.nonNullMut<HeapHeader>(unsafe objectState(object)) {
+    Option<*mut HeapHeader>.Some { value } => value _ => { return }
+  }
+  let length = unsafe count(node) let mut index: usize = 0
+  while index < length {
+    let record = unsafe resource(node, index)
+    unsafe tracer.value(record.value) unsafe tracer.value(record.method) index = index + 1
+  }
+}
+pub unsafe fn finalize<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, object: *mut HeapHeader) -> () {
+  let node = match Pointer.nonNullMut<HeapHeader>(unsafe objectState(object)) {
+    Option<*mut HeapHeader>.Some { value } => value _ => { return }
+  }
+  let mut a = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut a, object)
+  data.payload = ObjectPayload.Empty drop data
+  let length = unsafe count(node) let mut index: usize = 0
+  while index < length { unsafe clearResource(&mut hooks, rt, node, index) index = index + 1 }
+  unsafe HeapCell.destroy<State>(node)
+}
+fn require(condition: bool) -> () { if !condition { Intrinsic.trap("QuickJS invariant violated") } }

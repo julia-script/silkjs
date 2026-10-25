@@ -1,0 +1,681 @@
+//! Native Proxy traps, callable dispatch and intrinsic, quickjs.c:53026-53979.
+//! Inputs are borrowed roots throughout synchronous callbacks. Outputs own values
+//! or atoms. Every getMethod guard precedes revocation checks and trap lookup.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.list { List }
+import silk.i32
+import silk.u32
+import silk.usize
+import runtime_memory { AllocationObserver }
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_value { Value }
+import js_core_types { RuntimeState, ContextState, ObjectData, ObjectPayload, ObjectPayloadFamily,
+  PropertyDescriptor, PropertyEnum, PropertySlot, FrameSlots, NativeErrorKind, NativeCallProtocol,
+  JS_PROP_GETSET, JS_PROP_CONFIGURABLE, JS_PROP_WRITABLE, JS_PROP_C_W_E, JS_CALL_FLAG_CONSTRUCTOR }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_runtime_registry as registry
+import js_runtime_classes as definitions
+import js_class_data as classes
+import js_atom_data as atoms
+import js_proxy_core as core
+import js_proxy_core { ProxyData }
+import js_property_host { OwnPropertyHooks, GetPropertyHooks, HasPropertyHooks, OwnKeysHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_prototype_host { PrototypeHooks }
+import js_coercion_host { CoercionHooks }
+import js_call_host { CallHooks }
+import js_property_mutations as properties
+import js_property_get as getters
+import js_property_queries as queries
+import js_property_names as names
+import js_property_names { OwnKeysError }
+import js_property_ownership { releaseDescriptor }
+import js_prototypes as prototypes
+import js_prototypes { PrototypeError }
+import js_coercions as coercions
+import js_integer_coercions as integers
+import js_object_allocate as objects
+import js_array_storage as arrays
+import js_native_functions as native
+import js_string_types { StringLengthError }
+import js_bigint { BigIntError }
+import js_exceptions { JsException }
+
+fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+unsafe effect fn prototype<H: CoercionHooks + PrototypeHooks>(hooks: &mut H, context: *mut HeapHeader,
+  target: Value) -> Value ! JsException ? &mut Allocator {
+  let result = run Effect.result(unsafe prototypes.getPrototype(&mut hooks, context, target))
+  return match move result {
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => value
+    Result<Value, OutOfMemoryError | JsException>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error)
+  }
+}
+pub unsafe effect fn getPrototype<H: HeapHooks + CoercionHooks + CallHooks + PrototypeHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value) -> Value ! JsException ? &mut Allocator {
+  let method = run unsafe core.getMethod(&mut hooks, context, object, atoms.JS_ATOM_getPrototypeOf)
+  let target = unsafe core.target(object)
+  if core.undefined(method) { return run unsafe prototype(&mut hooks, context, target) }
+  let arguments = [target]
+  let result = run unsafe core.callFree(&mut hooks, context, method, unsafe core.handler(object), &arguments)
+  let checked = run Effect.result(unsafe checkPrototype(&mut hooks, context, target, result, true))
+  match move checked {
+    Result<bool, JsException>.Success { value: consistent } => {
+      if consistent { return result }
+      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), result)
+      return run unsafe core.error(&mut hooks, context, b"proxy: inconsistent prototype")
+    }
+    Result<bool, JsException>.Failure { error } => { unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), result) fail move error }
+  }
+}
+unsafe effect fn checkPrototype<H: HeapHooks + CoercionHooks + PrototypeHooks>(hooks: &mut H,
+  context: *mut HeapHeader, target: Value, result: Value, checkType: bool) -> bool ! JsException ? &mut Allocator {
+  if checkType && !result.isObject() && !match result { Value.Null => true _ => false } { return false }
+  if !run unsafe core.extensible(&mut hooks, context, target) {
+    let actual = run unsafe prototype(&mut hooks, context, target)
+    let equal = unsafe core.sameValue(actual, result)
+    unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), actual)
+    if !equal { return false }
+  }
+  return true
+}
+pub unsafe effect fn setPrototype<H: HeapHooks + CoercionHooks + CallHooks + PrototypeHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value, desired: Value) -> bool ! JsException ? &mut Allocator {
+  let method = run unsafe core.getMethod(&mut hooks, context, object, atoms.JS_ATOM_setPrototypeOf)
+  let target = unsafe core.target(object)
+  if core.undefined(method) {
+    let set = run Effect.result(unsafe prototypes.setPrototypeInternal(&mut hooks, context, target, desired, false))
+    return match move set {
+      Result<bool, OutOfMemoryError | JsException | PrototypeError>.Success { value } => value
+      Result<bool, OutOfMemoryError | JsException | PrototypeError>.Failure { error } => match move error {
+        PrototypeError reason => run unsafe core.error(&mut hooks, context, reason.message())
+        OutOfMemoryError allocation => run unsafe core.materialize(&mut hooks, context, move allocation)
+        JsException signal => { fail move signal }
+      }
+    }
+  }
+  let arguments = [target, desired]
+  let result = run unsafe core.callFree(&mut hooks, context, method, unsafe core.handler(object), &arguments)
+  if !unsafe core.toBoolFree(&mut hooks, context, result) { return false }
+  if !run unsafe checkPrototype(&mut hooks, context, target, desired, false) {
+    return run unsafe core.error(&mut hooks, context, b"proxy: inconsistent prototype")
+  }
+  return true
+}
+pub unsafe effect fn isExtensible<H: HeapHooks + CoercionHooks + CallHooks + PrototypeHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value) -> bool ! JsException ? &mut Allocator {
+  let method = run unsafe core.getMethod(&mut hooks, context, object, atoms.JS_ATOM_isExtensible)
+  let target = unsafe core.target(object)
+  if core.undefined(method) { return run unsafe core.extensible(&mut hooks, context, target) }
+  let arguments = [target]
+  let result = run unsafe core.callFree(&mut hooks, context, method, unsafe core.handler(object), &arguments)
+  let accepted = unsafe core.toBoolFree(&mut hooks, context, result)
+  if accepted != run unsafe core.extensible(&mut hooks, context, target) {
+    return run unsafe core.error(&mut hooks, context, b"proxy: inconsistent isExtensible")
+  }
+  return accepted
+}
+pub unsafe effect fn preventExtensions<H: HeapHooks + CoercionHooks + CallHooks + PrototypeHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value) -> bool ! JsException ? &mut Allocator {
+  let method = run unsafe core.getMethod(&mut hooks, context, object, atoms.JS_ATOM_preventExtensions)
+  let target = unsafe core.target(object)
+  if core.undefined(method) {
+    let result = run Effect.result(unsafe prototypes.preventExtensions(&mut hooks, context, target))
+    return match move result {
+      Result<bool, OutOfMemoryError | JsException>.Success { value } => value
+      Result<bool, OutOfMemoryError | JsException>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error)
+    }
+  }
+  let arguments = [target]
+  let result = run unsafe core.callFree(&mut hooks, context, method, unsafe core.handler(object), &arguments)
+  let accepted = unsafe core.toBoolFree(&mut hooks, context, result)
+  if accepted && run unsafe core.extensible(&mut hooks, context, target) {
+    return run unsafe core.error(&mut hooks, context, b"proxy: inconsistent preventExtensions")
+  }
+  return accepted
+}
+unsafe effect fn keyForMethod<H: HeapHooks + CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  method: Value, atom: u32) -> Value ! JsException ? &mut Allocator {
+  let result = run Effect.result(unsafe core.atomValue(&mut hooks, context, atom))
+  return match move result {
+    Result<Value, JsException>.Success { value } => value
+    Result<Value, JsException>.Failure { error } => { unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), method) fail move error }
+  }
+}
+unsafe effect fn keyedCall<H: HeapHooks + CoercionHooks + CallHooks>(hooks: &mut H, context: *mut HeapHeader,
+  object: Value, method: Value, atom: u32) -> Value ! JsException ? &mut Allocator {
+  let key = run unsafe keyForMethod(&mut hooks, context, method, atom)
+  let arguments = [unsafe core.target(object), key]
+  let result = run Effect.result(unsafe core.callFree(&mut hooks, context, method, unsafe core.handler(object), &arguments))
+  unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), key)
+  return match move result { Result<Value, JsException>.Success { value } => value Result<Value, JsException>.Failure { error } => { fail move error } }
+}
+pub unsafe effect fn has<H: HeapHooks + OwnPropertyHooks + HasPropertyHooks + CoercionHooks + CallHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value, atom: u32) -> bool ! JsException ? &mut Allocator {
+  let method = run unsafe core.getMethod(&mut hooks, context, object, atoms.JS_ATOM_has)
+  let target = unsafe core.target(object)
+  if core.undefined(method) {
+    let result = run Effect.result(unsafe queries.hasProperty(&mut hooks, context, target, atom))
+    return match move result {
+      Result<bool, OutOfMemoryError | JsException>.Success { value } => value
+      Result<bool, OutOfMemoryError | JsException>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error)
+    }
+  }
+  let result = run unsafe keyedCall(&mut hooks, context, object, method, atom)
+  let accepted = unsafe core.toBoolFree(&mut hooks, context, result)
+  if !accepted {
+    let ownDescriptorResult = run unsafe core.ownProperty(&mut hooks, context, target, atom)
+    match move ownDescriptorResult {
+      Option<PropertyDescriptor>.Some { value } => {
+        let fixed = (value.flags & JS_PROP_CONFIGURABLE) == 0
+        unsafe releaseDescriptor(&mut hooks, unsafe runtime.contextRuntime(context), move value)
+        if fixed || !unsafe core.storedExtensible(target) { return run unsafe core.error(&mut hooks, context, b"proxy: inconsistent has") }
+      }
+      Option<PropertyDescriptor>.None => ()
+    }
+  }
+  return accepted
+}
+unsafe effect fn checkGet<H: HeapHooks + OwnPropertyHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, target: Value, atom: u32, result: Value) -> bool ! JsException ? &mut Allocator {
+  let ownDescriptorResult = run unsafe core.ownProperty(&mut hooks, context, target, atom)
+  match move ownDescriptorResult {
+    Option<PropertyDescriptor>.Some { value } => {
+      let mut bad = false
+      if (value.flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)) == 0 {
+        bad = !unsafe core.sameValue(value.value, result)
+      } else if (value.flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE)) == JS_PROP_GETSET {
+        bad = core.undefined(value.getter) && !core.undefined(result)
+      }
+      unsafe releaseDescriptor(&mut hooks, unsafe runtime.contextRuntime(context), move value)
+      return !bad
+    }
+    Option<PropertyDescriptor>.None => ()
+  }
+  return true
+}
+pub unsafe effect fn get<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + CoercionHooks + CallHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value, atom: u32, receiver: Value) -> Value ! JsException ? &mut Allocator {
+  let method = run unsafe core.getMethod(&mut hooks, context, object, atoms.JS_ATOM_get)
+  let target = unsafe core.target(object)
+  if core.undefined(method) {
+    let result = run Effect.result(unsafe getters.getPropertyReceiver(&mut hooks, context, target, atom, receiver, false))
+    return match move result {
+      Result<Value, OutOfMemoryError | JsException>.Success { value } => value
+      Result<Value, OutOfMemoryError | JsException>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error)
+    }
+  }
+  let key = run unsafe keyForMethod(&mut hooks, context, method, atom)
+  let arguments = [target, key, receiver]
+  let called = run Effect.result(unsafe core.callFree(&mut hooks, context, method, unsafe core.handler(object), &arguments))
+  unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), key)
+  let result = match move called { Result<Value, JsException>.Success { value } => value Result<Value, JsException>.Failure { error } => { fail move error } }
+  let checked = run Effect.result(unsafe checkGet(&mut hooks, context, target, atom, result))
+  match move checked {
+    Result<bool, JsException>.Success { value: consistent } => {
+      if consistent { return result }
+      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), result)
+      return run unsafe core.error(&mut hooks, context, b"proxy: inconsistent get")
+    }
+    Result<bool, JsException>.Failure { error } => { unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), result) fail move error }
+  }
+}
+pub unsafe effect fn set<H: HeapHooks + OwnPropertyHooks + PropertyWriteHooks + CoercionHooks + CallHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value, atom: u32, value: Value, receiver: Value, flags: u32) -> bool ! JsException ? &mut Allocator {
+  let method = run unsafe core.getMethod(&mut hooks, context, object, atoms.JS_ATOM_set)
+  let target = unsafe core.target(object)
+  if core.undefined(method) {
+    let result = run Effect.result(unsafe properties.setPropertyInternal(&mut hooks, context, target, atom, unsafe value.retained(), receiver, flags))
+    return match move result {
+      Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { value: accepted } => accepted
+      Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error)
+    }
+  }
+  let key = run unsafe keyForMethod(&mut hooks, context, method, atom)
+  let arguments = [target, key, value, receiver]
+  let called = run Effect.result(unsafe core.callFree(&mut hooks, context, method, unsafe core.handler(object), &arguments))
+  unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), key)
+  let result = match move called { Result<Value, JsException>.Success { value: returned } => returned Result<Value, JsException>.Failure { error } => { fail move error } }
+  let accepted = unsafe core.toBoolFree(&mut hooks, context, result)
+  if accepted {
+    let ownDescriptorResult = run unsafe core.ownProperty(&mut hooks, context, target, atom)
+    match move ownDescriptorResult {
+      Option<PropertyDescriptor>.Some { value: descriptor } => {
+        let mut bad = false
+        if (descriptor.flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)) == 0 {
+          bad = !unsafe core.sameValue(descriptor.value, value)
+        } else if (descriptor.flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE)) == JS_PROP_GETSET {
+          bad = core.undefined(descriptor.setter)
+        }
+        unsafe releaseDescriptor(&mut hooks, unsafe runtime.contextRuntime(context), move descriptor)
+        if bad { return run unsafe core.error(&mut hooks, context, b"proxy: inconsistent set") }
+      }
+      Option<PropertyDescriptor>.None => ()
+    }
+  } else if unsafe properties.shouldThrow(context, flags) {
+    return run unsafe core.error(&mut hooks, context, b"proxy: cannot set property")
+  }
+  return accepted
+}
+pub unsafe effect fn deleteProperty<H: HeapHooks + OwnPropertyHooks + PropertyWriteHooks + CoercionHooks + CallHooks + PrototypeHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value, atom: u32) -> bool ! JsException ? &mut Allocator {
+  let method = run unsafe core.getMethod(&mut hooks, context, object, atoms.JS_ATOM_deleteProperty)
+  let target = unsafe core.target(object)
+  if core.undefined(method) {
+    let result = run Effect.result(unsafe properties.deleteOwnProperty(&mut hooks, context, target, atom))
+    return match move result {
+      Result<bool, OutOfMemoryError | JsException>.Success { value } => value
+      Result<bool, OutOfMemoryError | JsException>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error)
+    }
+  }
+  let result = run unsafe keyedCall(&mut hooks, context, object, method, atom)
+  let accepted = unsafe core.toBoolFree(&mut hooks, context, result)
+  if accepted {
+    let ownDescriptorResult = run unsafe core.ownProperty(&mut hooks, context, target, atom)
+    match move ownDescriptorResult {
+      Option<PropertyDescriptor>.Some { value } => {
+        let checked = run Effect.result(unsafe checkDelete(&mut hooks, context, target, value.flags))
+        unsafe releaseDescriptor(&mut hooks, unsafe runtime.contextRuntime(context), move value)
+        match move checked { Result<(), JsException>.Success { .. } => () Result<(), JsException>.Failure { error } => { fail move error } }
+      }
+      Option<PropertyDescriptor>.None => ()
+    }
+  }
+  return accepted
+}
+unsafe effect fn checkDelete<H: CoercionHooks + PrototypeHooks>(hooks: &mut H, context: *mut HeapHeader,
+  target: Value, flags: u32) -> () ! JsException ? &mut Allocator {
+  if (flags & JS_PROP_CONFIGURABLE) == 0 || !run unsafe core.extensible(&mut hooks, context, target) {
+    return run unsafe core.error(&mut hooks, context, b"proxy: inconsistent deleteProperty")
+  }
+}
+
+unsafe effect fn targetKeys<H: HeapHooks + OwnKeysHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, target: Value) -> List<PropertyEnum> ! JsException ? &mut Allocator {
+  let result = run Effect.result(unsafe names.getOwnPropertyNames(&mut hooks, context, target,
+    names.JS_GPN_STRING_MASK | names.JS_GPN_SYMBOL_MASK))
+  return match move result {
+    Result<List<PropertyEnum>, OutOfMemoryError | OwnKeysError | JsException | StringLengthError>.Success { value } => move value
+    Result<List<PropertyEnum>, OutOfMemoryError | OwnKeysError | JsException | StringLengthError>.Failure { error } => match move error {
+      // target is an object, and no ENUM_ONLY/SET_ENUM bit can perform TDZ reads.
+      OwnKeysError impossible => invariant()
+      OutOfMemoryError allocation => run unsafe core.materialize(&mut hooks, context, move allocation)
+      StringLengthError length => run unsafe core.materialize(&mut hooks, context, move length)
+      JsException signal => { fail move signal }
+    }
+  }
+}
+fn findKey(table: &List<PropertyEnum>, count: usize, atom: u32) -> Option<usize> {
+  let mut i: usize = 0
+  while i < count { if table.get(i).atom == atom { return Option<usize>.some(i) } i = i + 1 }
+  return Option<usize>.none()
+}
+unsafe effect fn appendKeys<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, array: Value, output: &mut List<PropertyEnum>) -> () ! JsException ? &mut Allocator {
+  let fetched = run Effect.result(unsafe hooks.getProperty(context, array, atoms.JS_ATOM_length))
+  let lengthValue = match move fetched {
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => value
+    Result<Value, OutOfMemoryError | JsException>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error)
+  }
+  let mut length: u32 = 0
+  let converted = run Effect.result(unsafe integers.toUint32Free(&mut hooks, context, &mut length, lengthValue))
+  match move converted {
+    Result<(), OutOfMemoryError | StringLengthError | JsException>.Success { .. } => ()
+    Result<(), OutOfMemoryError | StringLengthError | JsException>.Failure { error } => { return run unsafe core.materialize(&mut hooks, context, move error) }
+  }
+  let reserved = run Effect.result(output.reserveExact(u32.toUsize(length)))
+  match move reserved {
+    Result<(), OutOfMemoryError>.Success { .. } => ()
+    Result<(), OutOfMemoryError>.Failure { error } => { return run unsafe core.materialize(&mut hooks, context, move error) }
+  }
+  let mut i: u32 = 0
+  while i < length {
+    let read = run Effect.result(unsafe getters.getPropertyUint32(&mut hooks, context, array, i))
+    let value = match move read {
+      Result<Value, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { value } => value
+      Result<Value, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error)
+    }
+    if !value.isString() && !match value { Value.Symbol { .. } => true _ => false } {
+      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), value)
+      return run unsafe core.error(&mut hooks, context, b"proxy: properties must be strings or symbols")
+    }
+    let interned = run Effect.result(unsafe coercions.valueToAtom(&mut hooks, context, value))
+    let atom = match move interned {
+      Result<u32, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { value: key } => key
+      Result<u32, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => {
+        let pending = run Effect.catch<JsException>(unsafe core.materialize(&mut hooks, context, move error), core.exceptionValue)
+        unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), value)
+        fail JsException {}
+      }
+    }
+    unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), value)
+    // Capacity was reserved before the first observable element read.
+    let appended = run Effect.result(output.append(PropertyEnum { atom: atom, isEnumerable: false }))
+    match move appended {
+      Result<(), OutOfMemoryError>.Success { .. } => ()
+      Result<(), OutOfMemoryError>.Failure { error } => {
+        let pending = run Effect.catch<JsException>(unsafe core.materialize(&mut hooks, context, move error), core.exceptionValue)
+        unsafe properties.releaseAtom(unsafe runtime.contextRuntime(context), atom)
+        fail JsException {}
+      }
+    }
+    i = i + 1
+  }
+}
+unsafe effect fn checkKeys<H: HeapHooks + OwnPropertyHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value, target: Value, extensible: bool,
+  output: &mut List<PropertyEnum>, actual: &List<PropertyEnum>) -> () ! JsException ? &mut Allocator {
+  let mut i: usize = 0
+  while i < actual.length() {
+    if unsafe core.isRevoked(object) { return run unsafe core.error(&mut hooks, context, b"revoked proxy") }
+    let ownDescriptorResult = run unsafe core.ownProperty(&mut hooks, context, target, actual.get(i).atom)
+    match move ownDescriptorResult {
+      Option<PropertyDescriptor>.Some { value } => {
+        let required = (value.flags & JS_PROP_CONFIGURABLE) == 0 || !extensible
+        unsafe releaseDescriptor(&mut hooks, unsafe runtime.contextRuntime(context), move value)
+        if required {
+          match findKey(&output, output.length(), actual.get(i).atom) {
+            Option<usize>.Some { value: at } => {
+              if !extensible { let item = output.get(at) output.set(at, PropertyEnum { atom: item.atom, isEnumerable: true }) }
+            }
+            Option<usize>.None => { return run unsafe core.error(&mut hooks, context, b"proxy: target property must be present in proxy ownKeys") }
+          }
+        }
+      }
+      Option<PropertyDescriptor>.None => ()
+    }
+    i = i + 1
+  }
+  if !extensible {
+    i = 0
+    while i < output.length() {
+      if !output.get(i).isEnumerable {
+        return run unsafe core.error(&mut hooks, context, b"proxy: property not present in target were returned by non extensible proxy")
+      }
+      i = i + 1
+    }
+  }
+}
+unsafe effect fn ownKeysResult<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + OwnKeysHooks + CoercionHooks + PrototypeHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value, array: Value, output: &mut List<PropertyEnum>) -> () ! JsException ? &mut Allocator {
+  run unsafe appendKeys(&mut hooks, context, array, &mut output)
+  let mut i: usize = 1
+  while i < output.length() {
+    if match findKey(&output, i, output.get(i).atom) { Option<usize>.Some { .. } => true _ => false } {
+      return run unsafe core.error(&mut hooks, context, b"proxy: duplicate property")
+    }
+    i = i + 1
+  }
+  let target = unsafe core.target(object)
+  let extensible = run unsafe core.extensible(&mut hooks, context, target)
+  if unsafe core.isRevoked(object) { return run unsafe core.error(&mut hooks, context, b"revoked proxy") }
+  let actual = run unsafe targetKeys(&mut hooks, context, target)
+  let result = run Effect.result(unsafe checkKeys(&mut hooks, context, object, target, extensible, &mut output, &actual))
+  unsafe names.releaseNames(unsafe runtime.contextRuntime(context), move actual)
+  match move result { Result<(), JsException>.Success { .. } => () Result<(), JsException>.Failure { error } => { fail move error } }
+}
+pub unsafe effect fn ownKeys<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + OwnKeysHooks + CoercionHooks + CallHooks + PrototypeHooks>(
+  hooks: &mut H, context: *mut HeapHeader, object: Value) -> List<PropertyEnum> ! JsException ? &mut Allocator {
+  let method = run unsafe core.getMethod(&mut hooks, context, object, atoms.JS_ATOM_ownKeys)
+  let target = unsafe core.target(object)
+  if core.undefined(method) { return run unsafe targetKeys(&mut hooks, context, target) }
+  let arguments = [target]
+  let array = run unsafe core.callFree(&mut hooks, context, method, unsafe core.handler(object), &arguments)
+  let mut output = List<PropertyEnum>.make()
+  let result = run Effect.result(unsafe ownKeysResult(&mut hooks, context, object, array, &mut output))
+  match move result {
+    Result<(), JsException>.Success { .. } => {
+      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), array)
+      return move output
+    }
+    Result<(), JsException>.Failure { error } => {
+      unsafe names.releaseNames(unsafe runtime.contextRuntime(context), move output)
+      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), array)
+      fail move error
+    }
+  }
+}
+
+unsafe effect fn fillArguments(object: Value, arguments: &FrameSlots) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, core.reference(object))
+  match &mut data.payload {
+    ObjectPayload.FastArray { array } => {
+      let mut i: usize = 0
+      while i < arguments.length() {
+        // expandFastValues reserved the entire vector before any retain.
+        let argument = unsafe arguments.get(i)
+        run array.values.append(unsafe argument.retained())
+        i = i + 1
+      }
+    }
+    _ => invariant()
+  }
+  data.properties.set(0, PropertySlot.Value { value: Value.Int { value: usize.toI32(arguments.length()) } })
+}
+unsafe effect fn argumentArray<H: HeapHooks + CoercionHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, arguments: &FrameSlots) -> Value ! JsException ? &mut Allocator {
+  let allocated = run Effect.result(unsafe objects.array(&mut hooks, memory, context))
+  let object = match move allocated {
+    Result<Value, OutOfMemoryError>.Success { value } => value
+    Result<Value, OutOfMemoryError>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error)
+  }
+  if arguments.length() != 0 {
+    let expanded = run Effect.result(unsafe arrays.expandFastValues(&mut hooks, context, core.reference(object), usize.toU32(arguments.length())))
+    match move expanded {
+      Result<(), OutOfMemoryError>.Success { .. } => ()
+      Result<(), OutOfMemoryError>.Failure { error } => {
+        let pending = run Effect.catch<JsException>(unsafe core.materialize(&mut hooks, context, move error), core.exceptionValue)
+        unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), object)
+        fail JsException {}
+      }
+    }
+    let filled = run Effect.result(unsafe fillArguments(object, arguments))
+    match move filled {
+      Result<(), OutOfMemoryError>.Success { .. } => ()
+      Result<(), OutOfMemoryError>.Failure { error } => {
+        let pending = run Effect.catch<JsException>(unsafe core.materialize(&mut hooks, context, move error), core.exceptionValue)
+        unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), object)
+        fail JsException {}
+      }
+    }
+  }
+  return object
+}
+unsafe effect fn invokeTarget<H: CoercionHooks + CallHooks>(hooks: &mut H, context: *mut HeapHeader,
+  target: Value, receiver: Value, arguments: &FrameSlots, construct: bool) -> Value ! JsException ? &mut Allocator {
+  if construct {
+    let called = run Effect.result(unsafe hooks.construct(context, target, receiver, arguments))
+    return match move called {
+      Result<Value, OutOfMemoryError | JsException>.Success { value } => value
+      Result<Value, OutOfMemoryError | JsException>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error)
+    }
+  }
+  let called = run Effect.result(unsafe hooks.callArguments(context, target, receiver, arguments))
+  return match move called {
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => value
+    Result<Value, OutOfMemoryError | JsException>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error)
+  }
+}
+pub unsafe effect fn call<H: HeapHooks + CoercionHooks + CallHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, object: Value, receiver: Value, arguments: &FrameSlots, flags: i32) -> Value ! JsException ? &mut Allocator {
+  let construct = (flags & 1) != 0
+  let mut name = atoms.JS_ATOM_apply
+  if construct { name = atoms.JS_ATOM_construct }
+  let method = run unsafe core.getMethod(&mut hooks, context, object, name)
+  let target = unsafe core.target(object)
+  if construct {
+    if !unsafe core.constructorBit(target) {
+      // Pinned C forgets this method owner on its non-constructor error path.
+      let pending = run Effect.catch<JsException>(unsafe core.throwNotConstructor(&mut hooks, context, target), core.exceptionValue)
+      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), method)
+      fail JsException {}
+    }
+  } else if !unsafe core.isCallable(object) {
+    unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), method)
+    return run unsafe core.error(&mut hooks, context, b"not a function")
+  }
+  if core.undefined(method) { return run unsafe invokeTarget(&mut hooks, context, target, receiver, arguments, construct) }
+  let allocated = run Effect.result(unsafe argumentArray(&mut hooks, memory, context, arguments))
+  let array = match move allocated {
+    Result<Value, JsException>.Success { value } => value
+    Result<Value, JsException>.Failure { error } => { unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), method) fail move error }
+  }
+  let mut values = [target, receiver, array]
+  if construct { values[1] = array values[2] = receiver }
+  // Source validates a construct result before releasing method/argument array.
+  let data = unsafe Intrinsic.pointerRequalify<*const Value, *mut Value>(Pointer.fromRef<Value>(&values[0]))
+  let slots = FrameSlots.Borrowed { data: data, length: 3 }
+  let called = run Effect.result(unsafe invokeTarget(&mut hooks, context, method, unsafe core.handler(object), &slots, false))
+  match move called {
+    Result<Value, JsException>.Success { value } => {
+      if construct && !value.isObject() {
+        unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), value)
+        let pending = run Effect.catch<JsException>(unsafe core.error(&mut hooks, context, b"not an object"), core.exceptionValue)
+        unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), method)
+        unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), array)
+        fail JsException {}
+      }
+      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), method)
+      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), array)
+      return value
+    }
+    Result<Value, JsException>.Failure { error } => {
+      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), method)
+      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), array)
+      fail move error
+    }
+  }
+}
+pub unsafe effect fn resolve<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  value: &mut Value, throwException: bool) -> bool ! JsException ? &mut Allocator {
+  let mut depth: usize = 0
+  while value.isObject() {
+    let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(value.*))
+    let proxy = data.classId == classes.JS_CLASS_PROXY drop data
+    if !proxy { break }
+    if depth > 1000 {
+      if throwException { return run unsafe hooks.throwError(context, NativeErrorKind.Internal, b"stack overflow") }
+      return false
+    }
+    depth = depth + 1
+    if unsafe core.isRevoked(value.*) {
+      if throwException { return run unsafe core.error(&mut hooks, context, b"revoked proxy") }
+      return false
+    }
+    value.* = unsafe core.target(value.*)
+  }
+  return true
+}
+pub unsafe effect fn constructor<H: HeapHooks + CoercionHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, target: Value, handler: Value) -> Value ! JsException ? &mut Allocator {
+  if !target.isObject() || !handler.isObject() { return run unsafe core.error(&mut hooks, context, b"not an object") }
+  let allocated = run Effect.result(unsafe objects.withPrototypeClass(&mut hooks, memory, context, Value.Null, classes.JS_CLASS_PROXY))
+  let object = match move allocated {
+    Result<Value, OutOfMemoryError>.Success { value } => value
+    Result<Value, OutOfMemoryError>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error)
+  }
+  let callable = unsafe hooks.isCallable(context, target)
+  let state = run Effect.result(HeapCell.allocate(HeapKind.Auxiliary,
+    ProxyData { target: target, handler: handler, isFunction: callable, revoked: false }))
+  let payload = match move state {
+    Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value
+    Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => {
+      let pending = run Effect.catch<JsException>(unsafe core.materialize(&mut hooks, context, move error), core.exceptionValue)
+      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), object)
+      fail JsException {}
+    }
+  }
+  let retainedTarget = unsafe target.retained() let retainedHandler = unsafe handler.retained()
+  let constructorFlag = unsafe core.constructorBit(target)
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, core.reference(object))
+  data.payload = ObjectPayload.Opaque { family: ObjectPayloadFamily.Proxy, reference: payload }
+  data.isConstructor = constructorFlag
+  return object
+}
+pub unsafe fn revokeCaptured<H: HeapHooks>(hooks: &mut H, context: *mut HeapHeader, captured: &FrameSlots) -> Value {
+  let object = unsafe captured.get(0)
+  if object.isObject() {
+    unsafe core.revoke(object)
+    unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), object)
+    let address = match &captured.* {
+      FrameSlots.Borrowed { data, .. } => data
+      FrameSlots.Owned { slots } => unsafe Intrinsic.pointerRequalify<*const Value, *mut Value>(Pointer.fromRef<Value>(&slots.view()[0]))
+    }
+    unsafe Pointer.write<Value>(address, Value.Null)
+  }
+  return Value.Undefined
+}
+effect fn ignoredDefinition(error: JsException) -> bool { drop error return false }
+pub unsafe effect fn revocable<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, target: Value, handler: Value) -> Value ! JsException ? &mut Allocator {
+  let object = run unsafe constructor(&mut hooks, memory, context, target, handler)
+  let captured = [object]
+  let created = run Effect.result(unsafe native.newDataFunction(&mut hooks, memory, context,
+    definitions.descriptor(definitions.NATIVE_JS_PROXY_REVOKE), 0, 0, &captured))
+  let revokeFunction = match move created {
+    Result<Value, JsException>.Success { value } => value
+    Result<Value, JsException>.Failure { error } => { unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), object) fail move error }
+  }
+  let allocated = run Effect.result(unsafe objects.object(&mut hooks, memory, context))
+  let record = match move allocated {
+    Result<Value, OutOfMemoryError>.Success { value } => value
+    Result<Value, OutOfMemoryError>.Failure { error } => {
+      let pending = run Effect.catch<JsException>(unsafe core.materialize(&mut hooks, context, move error), core.exceptionValue)
+      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), object)
+      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), revokeFunction)
+      fail JsException {}
+    }
+  }
+  // Source intentionally ignores both DefinePropertyValue results.
+  let proxyDefined = run Effect.catch<JsException>(unsafe core.defineValue(&mut hooks, context, record, atoms.JS_ATOM_proxy, object, JS_PROP_C_W_E), ignoredDefinition)
+  let revokeDefined = run Effect.catch<JsException>(unsafe core.defineValue(&mut hooks, context, record, atoms.JS_ATOM_revoke, revokeFunction, JS_PROP_C_W_E), ignoredDefinition)
+  return record
+}
+unsafe effect fn installRevocable<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, constructor: Value) -> () ! JsException ? &mut Allocator {
+  let function = run unsafe native.newFunction(&mut hooks, memory, context,
+    definitions.descriptor(definitions.NATIVE_JS_PROXY_REVOCABLE), b"revocable", 2, NativeCallProtocol.Generic, 0)
+  let rt = unsafe runtime.contextRuntime(context)
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+  let interned = run Effect.result(state.atoms.internUtf8(b"revocable")) drop state
+  let atom = match move interned {
+    Result<u32, OutOfMemoryError | StringLengthError>.Success { value } => value
+    Result<u32, OutOfMemoryError | StringLengthError>.Failure { error } => {
+      let pending = run Effect.catch<JsException>(unsafe core.materialize(&mut hooks, context, move error), core.exceptionValue)
+      unsafe gc.release(&mut hooks, rt, function) fail JsException {}
+    }
+  }
+  let defined = run Effect.result(unsafe core.defineValue(&mut hooks, context, constructor, atom, function, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE))
+  unsafe properties.releaseAtom(rt, atom)
+  match move defined { Result<bool, JsException>.Success { .. } => () Result<bool, JsException>.Failure { error } => { fail move error } }
+}
+pub unsafe effect fn install<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader) -> () ! JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  if !unsafe registry.isRegisteredClass(rt, classes.JS_CLASS_PROXY) {
+    let registered = run Effect.result(unsafe registry.registerClassAtom(rt, classes.JS_CLASS_PROXY, atoms.JS_ATOM_Object, definitions.proxyDefinition()))
+    match move registered {
+      Result<bool, OutOfMemoryError>.Success { .. } => ()
+      Result<bool, OutOfMemoryError>.Failure { error } => { return run unsafe core.materialize(&mut hooks, context, move error) }
+    }
+  }
+  let anchor = () let state = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  let functionPrototype = state.functionPrototype let global = state.globalObject drop state
+  let function = run unsafe native.newFunctionWithPrototype(&mut hooks, memory, context,
+    definitions.descriptor(definitions.NATIVE_JS_PROXY_CONSTRUCTOR), b"Proxy", 2,
+    NativeCallProtocol.Constructor, 0, functionPrototype, 3)
+  let decorated = run Effect.result(unsafe installRevocable(&mut hooks, memory, context, function))
+  match move decorated {
+    Result<(), JsException>.Success { .. } => ()
+    Result<(), JsException>.Failure { error } => { unsafe gc.release(&mut hooks, rt, function) fail move error }
+  }
+  // Consuming definition already frees function on failure; do not duplicate the
+  // pinned source's additional failure-label free of the consumed constructor.
+  let defined = run unsafe core.defineValue(&mut hooks, context, global, atoms.JS_ATOM_Proxy,
+    function, JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+}

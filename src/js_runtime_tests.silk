@@ -1,0 +1,320 @@
+import silk.allocator { Allocator, OutOfMemoryError, SystemAllocator }
+import silk.effect { Effect }
+import silk.layout { Layout }
+import silk.pointer { Pointer }
+import silk.option { Option }
+import silk.testing { Testing, AssertionError }
+import silk.usize
+import silk.native_thread { NativeThread, SpawnError }
+import silk.u32
+import js_heap { HeapCell, HeapHeader }
+import js_core_types { RuntimeState, ContextState, NativeFunctionId, WeakRefHeader }
+import js_gc { HeapHooks, Tracer }
+import js_gc as gc
+import js_value { Value }
+import js_strings { Strings }
+import js_string_types { StringLengthError }
+import js_runtime as runtime
+import js_runtime_registry as registry
+import js_runtime_registry { ClassIdAllocator }
+import js_runtime_classes { emptyDefinition }
+import js_runtime_jobs as jobs
+import js_runtime_jobs { JobDispatcher }
+import runtime_memory { RuntimeAllocator }
+
+fn invariantFailure() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+// These tests construct no objects/weak/auxiliary family payloads. Unexpected
+// lifecycle dispatch traps rather than masking absent builtin implementations.
+struct Hooks { sequence: u32, calls: u32 }
+impl HeapHooks for Hooks {
+  unsafe fn traceClass(self: &mut Self, rt: *mut HeapHeader, object: *mut HeapHeader, callback: NativeFunctionId, tracer: &mut Tracer) -> () { invariantFailure() }
+  unsafe fn finalizeClass(self: &mut Self, rt: *mut HeapHeader, object: *mut HeapHeader, callback: NativeFunctionId) -> () { invariantFailure() }
+  unsafe effect fn sweepWeak(self: &mut Self, rt: *mut HeapHeader, node: *mut WeakRefHeader) -> () ? &mut Allocator { invariantFailure() }
+  unsafe fn destroyAuxiliary(self: &mut Self, rt: *mut HeapHeader, node: *mut HeapHeader) -> () { invariantFailure() }
+}
+impl JobDispatcher for Hooks {
+  unsafe effect fn dispatchJob(self: &mut Self, context: *mut HeapHeader, function: NativeFunctionId, arguments: &[Value]) -> Value
+    ! OutOfMemoryError ? &mut Allocator {
+    let id = match function { NativeFunctionId.Host { id } => id _ => invariantFailure() }
+    self.sequence = self.sequence * 10 + id
+    self.calls = self.calls + 1
+    if id == 1 {
+      run unsafe jobs.enqueueJob(context, NativeFunctionId.Host { id: 3 }, &[])
+      return unsafe arguments[0].retained()
+    }
+    if id == 2 { return Value.Exception }
+    if id == 4 { return run Allocator.outOfMemory() }
+    return Value.Undefined
+  }
+}
+unsafe fn rc(node: *mut HeapHeader) -> i32 {
+  let anchor = ()
+  unsafe { return Pointer.borrow<(), HeapHeader>(&anchor, node).referenceCount }
+}
+unsafe fn prototypeCount(node: *mut HeapHeader) -> usize {
+  let anchor = ()
+  unsafe { return HeapCell.payload<ContextState, ()>(&anchor, node).classPrototypes.length() }
+}
+effect fn refused(error: OutOfMemoryError) -> bool { drop error return false }
+struct FaultAllocator { parent: RuntimeAllocator<SystemAllocator>, remaining: usize }
+impl Allocator for FaultAllocator {
+  effect fn allocate(self: &mut Self, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
+    if self.remaining == 0 { return run Allocator.outOfMemory() }
+    self.remaining = self.remaining - 1
+    return run Allocator.allocate(move layout) |> Effect.provideMut<Allocator>(&mut self.parent)
+  }
+}
+effect fn runtimeAttempt() -> bool ! OutOfMemoryError ? &mut Allocator {
+  let rt = run runtime.allocateRuntimeStorage(2097152)
+  let mut hooks = Hooks { sequence: 0, calls: 0 }
+  run unsafe gc.destroyRuntime(&mut hooks, rt)
+  return true
+}
+
+test effect fn runtimeCreationFailureReleasesEveryPartiallyInitializedOwner() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let memory = run RuntimeAllocator<SystemAllocator>.make(Allocator.systemAllocatorProvider())
+  let mut fault = FaultAllocator { parent: move memory, remaining: 0 }
+  let mut allowed: usize = 0
+  let mut succeeded = false
+  while !succeeded {
+    fault.remaining = allowed
+    succeeded = run Effect.catchAll(runtimeAttempt(), refused) |> Effect.provideMut<Allocator>(&mut fault)
+    run Testing.expect(fault.parent.stats().usedBytes == 0 && fault.parent.stats().allocationCount == 0,
+      "creation failure reclaims atoms, registry, buckets and runtime allocation")
+    allowed = allowed + 1
+  }
+  run Testing.expect(allowed > 10, "fault sweep reaches atom-table initialization and final publication")
+}
+
+test effect fn registrationFailurePreservesSourceOrderedContextGrowthAndAtomOwnership() -> ()
+  ! OutOfMemoryError | StringLengthError | AssertionError<'static> {
+  let mut failAfter: usize = 0
+  while failAfter < 3 {
+    let mut memory = run RuntimeAllocator<SystemAllocator>.make(Allocator.systemAllocatorProvider())
+    let rt = run runtime.allocateRuntimeStorage(2097152) |> Effect.provideMut<Allocator>(&mut memory)
+    let first = run unsafe runtime.allocateContextStorage(rt) |> Effect.provideMut<Allocator>(&mut memory)
+    let second = run unsafe runtime.allocateContextStorage(rt) |> Effect.provideMut<Allocator>(&mut memory)
+    let mut anchor = ()
+    let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+    let atom = run state.atoms.internUtf8(b"dynamic-registration") |> Effect.provideMut<Allocator>(&mut memory)
+    let atomCount = state.atoms.count()
+    drop state
+    let mut fault = FaultAllocator { parent: move memory, remaining: failAfter }
+    let accepted = run Effect.catchAll(unsafe registry.registerClassAtom(rt, 67, atom, emptyDefinition()), refused)
+      |> Effect.provideMut<Allocator>(&mut fault)
+    run Testing.expect(!accepted && !unsafe registry.isRegisteredClass(rt, 67), "failed growth does not publish class")
+    let old = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+    run Testing.expect(old.classes.length() == 67 && old.atoms.count() == atomCount, "failure preserves class count and borrowed name")
+    drop old
+    let mut firstExpected: usize = 67
+    let mut secondExpected: usize = 67
+    if failAfter > 0 { firstExpected = 100 }
+    if failAfter > 1 { secondExpected = 100 }
+    run Testing.expect(unsafe prototypeCount(first) == firstExpected && unsafe prototypeCount(second) == secondExpected,
+      "earlier contexts commit growth before later allocation failure")
+    fault.remaining = usize.MAX
+    let retried = run unsafe registry.registerClassAtom(rt, 67, atom, emptyDefinition()) |> Effect.provideMut<Allocator>(&mut fault)
+    run Testing.expect(retried && unsafe registry.isRegisteredClass(rt, 67), "retry finishes partially grown registry")
+    let committed = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+    committed.atoms.release(atom)
+    run Testing.expect(committed.atoms.count() == atomCount, "successful class owns dynamic name after caller release")
+    drop committed
+    let duplicate = run unsafe registry.registerClassAtom(rt, 67, 0, emptyDefinition()) |> Effect.provideMut<Allocator>(&mut fault)
+    let invalid = run unsafe registry.registerClassAtom(rt, 65536, 0, emptyDefinition()) |> Effect.provideMut<Allocator>(&mut fault)
+    run Testing.expect(!duplicate && !invalid, "duplicate and 16-bit overflow IDs are rejected")
+    let mut hooks = Hooks { sequence: 0, calls: 0 }
+    unsafe gc.releaseHeader(&mut hooks, rt, first)
+    unsafe gc.releaseHeader(&mut hooks, rt, second)
+    run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut fault)
+    run Testing.expect(fault.parent.stats().usedBytes == 0, "context/class shutdown releases all names and native arrays")
+    failAfter = failAfter + 1
+  }
+}
+
+test effect fn jobsKeepRealmAndArgumentsAliveAcrossReentrantDispatchAndFailures() -> ()
+  ! OutOfMemoryError | StringLengthError | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator<SystemAllocator>.make(Allocator.systemAllocatorProvider())
+  let rt = run runtime.allocateRuntimeStorage(2097152) |> Effect.provideMut<Allocator>(&mut memory)
+  let context = run unsafe runtime.allocateContextStorage(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let text = run Strings.fromLatin1(b"rooted-job-argument") |> Effect.provideMut<Allocator>(&mut memory)
+  let reference = match text { Value.String { reference } => reference _ => invariantFailure() }
+  let mut hooks = Hooks { sequence: 0, calls: 0 }
+  run unsafe jobs.enqueueJob(context, NativeFunctionId.Host { id: 1 }, &[text]) |> Effect.provideMut<Allocator>(&mut memory)
+  run unsafe jobs.enqueueJob(context, NativeFunctionId.Host { id: 2 }, &[text]) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(unsafe rc(context) == 3 && unsafe rc(reference) == 3, "each queued job owns realm and copied argument")
+  unsafe gc.release(&mut hooks, rt, text)
+  unsafe gc.releaseHeader(&mut hooks, rt, context)
+  let first = run unsafe jobs.executePendingJob(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(first.status == 1 && !Pointer.isNull<HeapHeader>(first.context), "dispatch can append while current job stays rooted")
+  let second = run unsafe jobs.executePendingJob(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(second.status == -1 && !Pointer.isNull<HeapHeader>(second.context), "exception status still releases owned arguments")
+  let third = run unsafe jobs.executePendingJob(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(third.status == 1 && Pointer.isNull<HeapHeader>(third.context) && hooks.sequence == 123,
+    "reentrant enqueue preserves FIFO and last job releases last realm root")
+  let empty = run unsafe jobs.executePendingJob(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(empty.status == 0 && !unsafe jobs.isJobPending(rt), "empty queue has no dispatch")
+  let other = run unsafe runtime.allocateContextStorage(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run unsafe jobs.enqueueJob(other, NativeFunctionId.Host { id: 4 }, &[]) |> Effect.provideMut<Allocator>(&mut memory)
+  unsafe gc.releaseHeader(&mut hooks, rt, other)
+  let failed = run Effect.catchAll(jobAttempt(&mut hooks, rt), refused) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(!failed && !unsafe jobs.isJobPending(rt), "typed dispatch failure detaches and releases its realm")
+  run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(memory.stats().usedBytes == 0, "job return values and failure paths leak no native storage")
+}
+effect fn jobAttempt(hooks: &mut Hooks, rt: *mut HeapHeader) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let result = run unsafe jobs.executePendingJob(&mut hooks, rt)
+  return result.status == 1
+}
+
+test effect fn contextRootsStackBoundaryAndGCThresholdUseRuntimePolicies() -> ()
+  ! OutOfMemoryError | StringLengthError | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator<SystemAllocator>.make(Allocator.systemAllocatorProvider())
+  let rt = run runtime.allocateRuntimeStorage(2097152) |> Effect.provideMut<Allocator>(&mut memory)
+  let context = run unsafe runtime.allocateContextStorage(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let text = run Strings.fromLatin1(b"user-root") |> Effect.provideMut<Allocator>(&mut memory)
+  let reference = match text { Value.String { reference } => reference _ => invariantFailure() }
+  let mut hooks = Hooks { sequence: 0, calls: 0 }
+  unsafe runtime.setContextValue(&mut hooks, context, 0, text)
+  let copy = unsafe runtime.getContextValue(context, 0)
+  run Testing.expect(unsafe rc(reference) == 2, "root getters retain")
+  unsafe runtime.setClassPrototype(&mut hooks, context, 1, copy)
+  unsafe runtime.setContextValue(&mut hooks, context, 0, Value.Null)
+  run Testing.expect(unsafe rc(reference) == 1, "root setters consume and release old")
+  let finalCopy = unsafe runtime.getClassPrototype(context, 1)
+  unsafe runtime.setContextValue(&mut hooks, context, -1, finalCopy)
+  let invalidRoot = unsafe runtime.getContextValue(context, 7)
+  run Testing.expect(unsafe rc(reference) == 1 && invalidRoot.tag() == 3,
+    "invalid user index consumes incoming and reads Undefined")
+  unsafe runtime.setMaxStackSize(rt, 1024)
+  unsafe runtime.updateStackTop(rt, 8192)
+  run Testing.expect(!unsafe runtime.checkStackOverflow(rt, 7168, 0, true)
+    && unsafe runtime.checkStackOverflow(rt, 7168, 1, true)
+    && !unsafe runtime.checkStackOverflow(rt, 7168, 1, false), "stack limit is exclusive and respects disabled checks")
+  unsafe runtime.setMaxStackSize(rt, 0)
+  run Testing.expect(!unsafe runtime.checkStackOverflow(rt, 1, 0, true), "zero stack size disables limit")
+  let used = memory.stats().usedBytes
+  unsafe runtime.setGCThreshold(rt, used)
+  let observer = run memory.observe()
+  let atThreshold = run unsafe runtime.triggerGC(&observer, &mut hooks, rt, 0, false) |> Effect.provideMut<Allocator>(&mut memory)
+  let aboveThreshold = run unsafe runtime.triggerGC(&observer, &mut hooks, rt, 1, false) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(!atThreshold && aboveThreshold, "GC threshold uses strict greater-than")
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  run Testing.expect(state.mallocGcThreshold == used + used / 2, "threshold resets from post-GC usage")
+  drop state
+  unsafe gc.releaseHeader(&mut hooks, rt, context)
+  run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(memory.stats().usedBytes == 0, "root cleanup frees retained strings")
+}
+
+test effect fn classIdNamespaceSharesSequenceAcrossThreadsAndCachesRequests() -> ()
+  ! OutOfMemoryError | SpawnError | AssertionError<'static> {
+  let mut system = Allocator.systemAllocatorProvider()
+  let ids = run ClassIdAllocator.make() |> Effect.provideMut<Allocator>(&mut system)
+  let leftIds = ids.clone()
+  let rightIds = ids.clone()
+  let left = run NativeThread.spawn(fn() -> u32 {
+    let owned = move leftIds
+    let mut cache: u32 = 0
+    let id = owned.allocate(&mut cache)
+    if owned.allocate(&mut cache) != id { invariantFailure() }
+    return id
+  }) |> Effect.provideMut<Allocator>(&mut system)
+  let right = run NativeThread.spawn(fn() -> u32 {
+    let owned = move rightIds
+    let mut cache: u32 = 0
+    return owned.allocate(&mut cache)
+  }) |> Effect.provideMut<Allocator>(&mut system)
+  let a = left.join()
+  let b = right.join()
+  let mut cache: u32 = 0
+  let next = ids.allocate(&mut cache)
+  run Testing.expect(a != b && a + b == 135 && next == 69, "clones share sequence and cached requests consume no ID")
+}
+
+test effect fn builtinClassIdentitySurvivesConcurrentRuntimeRequests() -> ()
+  ! OutOfMemoryError | SpawnError | AssertionError<'static> {
+  let mut system = Allocator.systemAllocatorProvider()
+  let ids = run ClassIdAllocator.make() |> Effect.provideMut<Allocator>(&mut system)
+  let leftIds = ids.clone()
+  let rightIds = ids.clone()
+  let left = run NativeThread.spawn(fn() -> u32 {
+    let owned = move leftIds
+    return owned.builtin(12)
+  }) |> Effect.provideMut<Allocator>(&mut system)
+  let right = run NativeThread.spawn(fn() -> u32 {
+    let owned = move rightIds
+    return owned.builtin(12)
+  }) |> Effect.provideMut<Allocator>(&mut system)
+  let a = left.join()
+  let b = right.join()
+  let mut cache: u32 = 0
+  let dynamic = ids.allocate(&mut cache)
+  let other = ids.builtin(19)
+  run Testing.expect(a == b && ids.builtin(12) == a && dynamic == a + 1,
+    "concurrent runtime requests consume one shared builtin identity")
+  run Testing.expect(other == dynamic + 1 && ids.allocate(&mut cache) == dynamic,
+    "builtin and externally cached classes share one nonaliasing namespace")
+}
+
+effect fn enqueueAttempt(context: *mut HeapHeader, text: Value) -> bool
+  ! OutOfMemoryError ? &mut Allocator {
+  run unsafe jobs.enqueueJob(context, NativeFunctionId.Host { id: 3 }, &[text])
+  return true
+}
+test effect fn enqueueFailureAndUndispatchedRuntimeShutdownReleaseEveryRoot() -> ()
+  ! OutOfMemoryError | StringLengthError | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator<SystemAllocator>.make(Allocator.systemAllocatorProvider())
+  let rt = run runtime.allocateRuntimeStorage(2097152) |> Effect.provideMut<Allocator>(&mut memory)
+  let context = run unsafe runtime.allocateContextStorage(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let text = run Strings.fromLatin1(b"pending-at-shutdown") |> Effect.provideMut<Allocator>(&mut memory)
+  let reference = match text { Value.String { reference } => reference _ => invariantFailure() }
+  let mut fault = FaultAllocator { parent: move memory, remaining: 0 }
+  let before = fault.parent.stats().usedBytes
+  let mut failAfter: usize = 0
+  while failAfter < 2 {
+    fault.remaining = failAfter
+    let accepted = run Effect.catchAll(enqueueAttempt(context, text), refused)
+      |> Effect.provideMut<Allocator>(&mut fault)
+    run Testing.expect(!accepted && !unsafe jobs.isJobPending(rt)
+      && unsafe rc(context) == 1 && unsafe rc(reference) == 1
+      && fault.parent.stats().usedBytes == before, "failed argv/node allocation publishes and retains nothing")
+    failAfter = failAfter + 1
+  }
+  fault.remaining = usize.MAX
+  run unsafe jobs.enqueueJob(context, NativeFunctionId.Host { id: 3 }, &[text])
+    |> Effect.provideMut<Allocator>(&mut fault)
+  let mut hooks = Hooks { sequence: 0, calls: 0 }
+  unsafe gc.release(&mut hooks, rt, text)
+  unsafe gc.releaseHeader(&mut hooks, rt, context)
+  run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut fault)
+  run Testing.expect(hooks.calls == 0 && fault.parent.stats().usedBytes == 0,
+    "runtime destruction releases pending argument/realm roots without executing jobs")
+}
+
+test effect fn classNamesUseLiteralEightBitAtomsRatherThanPropertyIndexNormalization() -> ()
+  ! OutOfMemoryError | StringLengthError | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator<SystemAllocator>.make(Allocator.systemAllocatorProvider())
+  let rt = run runtime.allocateRuntimeStorage(2097152) |> Effect.provideMut<Allocator>(&mut memory)
+  let numeric = run unsafe registry.registerClass(rt, 67, b"123\x00ignored", emptyDefinition())
+    |> Effect.provideMut<Allocator>(&mut memory)
+  let latin = run unsafe registry.registerClass(rt, 68, b"\xff", emptyDefinition())
+    |> Effect.provideMut<Allocator>(&mut memory)
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let numericAtom = state.classes.asSlice()[67].classNameAtom
+  let latinAtom = state.classes.asSlice()[68].classNameAtom
+  let numericName = run state.atoms.toValue(numericAtom, true) |> Effect.provideMut<Allocator>(&mut memory)
+  let latinName = run state.atoms.toValue(latinAtom, true) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(numeric && latin && (numericAtom & 0x80000000) == 0
+    && Strings.length(numericName) == 3 && Strings.codeUnit(numericName, 2) == 51
+    && Strings.length(latinName) == 1 && Strings.codeUnit(latinName, 0) == 255,
+    "class names bypass integer atoms, stop at NUL and preserve Latin-1 bytes")
+  drop state
+  Strings.release(numericName)
+  Strings.release(latinName)
+  let mut hooks = Hooks { sequence: 0, calls: 0 }
+  run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(memory.stats().usedBytes == 0, "class names release their interned string storage")
+}
