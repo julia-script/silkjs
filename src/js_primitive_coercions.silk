@@ -1,0 +1,238 @@
+//! Unsafe primitive-only QuickJS coercion kernels. Every input MUST be a live
+//! non-object Value; object ToPrimitive belongs to the caller, never a fallback.
+//! Free entry points consume on every success/failure; borrowed entry points
+//! return a new ownership. HeapHooks performs actual internal-tag destruction.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.slice { Slice }
+import silk.f64
+import silk.u8
+import dtoa { Dtoa, JS_ATOD_INT_ONLY, JS_DTOA_FORMAT_FREE }
+import js_value { Value }
+import js_heap { HeapCell, HeapHeader }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_atoms { AtomTable }
+import js_atom_data as atoms
+import js_core_types { RuntimeState }
+import js_strings { Strings }
+import js_string_types { StringOwner, StringLengthError, FlatString, stringReference }
+import js_bigint { BigInt, BigIntError }
+import js_bigint_text { BigIntText }
+import utf8 { Utf8, Decoded }
+import unicode_case { UnicodeCase }
+
+pub enum NumberHint { Number, Numeric }
+pub enum CoercionError { BigIntToNumber, SymbolToNumber, SymbolToString }
+impl CoercionError {
+  pub fn message(self: &Self) -> &'static [u8] {
+    return match self.* {
+      CoercionError.BigIntToNumber => b"cannot convert bigint to number"
+      CoercionError.SymbolToNumber => b"cannot convert symbol to number"
+      CoercionError.SymbolToString => b"cannot convert symbol to string"
+    }
+  }
+}
+fn primitiveRequired(value: Value) -> () { if value.isObject() { invalidPrimitive() } }
+fn invalidPrimitive() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+fn nan() -> Value { return Value.Float64 { value: f64.fromBits(0x7ff8000000000000) } }
+fn byte(input: &[u8], at: usize) -> u32 {
+  if at >= input.length { return 0 }
+  return u8.toU32(input[at])
+}
+fn digit(value: u32) -> u32 {
+  if value >= 48 && value <= 57 { return value - 48 }
+  if value >= 65 && value <= 90 { return value - 55 }
+  if value >= 97 && value <= 122 { return value - 87 }
+  return 36
+}
+fn spaces(input: &[u8], start: usize) -> usize {
+  let mut at = start
+  while at < input.length {
+    match Utf8.decode(Slice.view(input, at, input.length - at)) {
+      Option<Decoded>.None => { return at }
+      Option<Decoded>.Some { value } => {
+        if !UnicodeCase.isSpace(value.codePoint) { return at }
+        at = at + value.length
+      }
+    }
+  }
+  return at
+}
+// js_atof's grammar, NOT js_atod's extended radix floats or lexer token grammar.
+// Scanning first lets the allocation-free dtoa kernel consume exactly the source
+// token, with prefixes removed and no separators. Embedded NUL is trailing junk.
+fn parseNumber(input: &[u8]) -> Value {
+  let start = spaces(input, 0)
+  if start == input.length { return Value.Int { value: 0 } }
+  let mut at = start
+  let signed = byte(input, at) == 43 || byte(input, at) == 45
+  if signed { at = at + 1 }
+  let mut radix: u32 = 10
+  let mut token = start
+  if !signed && byte(input, at) == 48 {
+    let next = byte(input, at + 1)
+    if next == 120 || next == 88 { radix = 16 }
+    else if next == 111 || next == 79 { radix = 8 }
+    else if next == 98 || next == 66 { radix = 2 }
+    if radix != 10 {
+      at = at + 2
+      token = at
+      if digit(byte(input, at)) >= radix { return nan() }
+    }
+  }
+  if radix == 10 {
+    let infinity = b"Infinity"
+    let mut i: usize = 0
+    while i < 8 && byte(input, at + i) == u8.toU32(infinity[i]) { i = i + 1 }
+    if i == 8 {
+      if spaces(input, at + 8) != input.length { return nan() }
+      let mut bits: u64 = 0x7ff0000000000000
+      if byte(input, start) == 45 { bits = 0xfff0000000000000 }
+      return Value.Float64 { value: f64.fromBits(bits) }
+    }
+  }
+  let first = at
+  while digit(byte(input, at)) < radix { at = at + 1 }
+  let mut floating = false
+  if radix == 10 {
+    if byte(input, at) == 46 && (at > first || digit(byte(input, at + 1)) < 10) {
+      floating = true
+      at = at + 1
+      while digit(byte(input, at)) < 10 { at = at + 1 }
+    }
+    if at > first && (byte(input, at) == 101 || byte(input, at) == 69) {
+      floating = true
+      let mut exponent = at + 1
+      if byte(input, exponent) == 43 || byte(input, exponent) == 45 { exponent = exponent + 1 }
+      if digit(byte(input, exponent)) < 10 {
+        at = exponent + 1
+        while digit(byte(input, at)) < 10 { at = at + 1 }
+      }
+    }
+  }
+  if at == first || spaces(input, at) != input.length { return nan() }
+  let mut flags = JS_ATOD_INT_ONLY
+  if floating { flags = 0 }
+  return Value.number(Dtoa.parse(Slice.view(input, token, at - token), radix, flags).value)
+}
+effect fn stringNumberFree(table: &AtomTable, value: Value) -> Value
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let owned = StringOwner.adopt(value)
+  let flat = StringOwner.adopt(run table.flatten(owned.get()))
+  let storage = unsafe HeapCell.payload<FlatString, StringOwner>(&flat, stringReference(flat.get()))
+  if !storage.wide {
+    let input = Slice.view<u8>(storage.latin1.asSlice(), 0, storage.length)
+    let mut index: usize = 0
+    while index < input.length && input[index] < 128 { index = index + 1 }
+    // Source JS_ToCString borrows ASCII storage: Number("42") must not require
+    // a temporary UTF8 allocation or fail because that allocation was refused.
+    if index == input.length { return parseNumber(input) }
+  }
+  drop storage
+  let bytes = run Strings.toUtf8(flat.get(), false)
+  drop flat
+  drop owned
+  return parseNumber(bytes.asSlice())
+}
+
+/// Consumes value, including diagnostic and allocation failures. Numeric transfers
+/// either BigInt representation unchanged; Number rejects and releases it.
+pub unsafe effect fn toNumberFree<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader,
+  value: Value, hint: NumberHint) -> Value
+  ! OutOfMemoryError | StringLengthError | CoercionError ? &mut Allocator {
+  primitiveRequired(value)
+  if value.isBigInt() {
+    if hint == NumberHint.Numeric { return value }
+    unsafe gc.release(&mut hooks, runtime, value)
+    fail CoercionError.BigIntToNumber
+  }
+  match value {
+    Value.Int { .. } => { return value }
+    Value.Float64 { .. } => { return value }
+    Value.Exception => { return value }
+    Value.Bool { value: boolean } => {
+      if boolean { return Value.Int { value: 1 } }
+      return Value.Int { value: 0 }
+    }
+    Value.Null => { return Value.Int { value: 0 } }
+    Value.String { .. } => {
+      let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+      return run stringNumberFree(&state.atoms, value)
+    }
+    Value.Rope { .. } => {
+      let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+      return run stringNumberFree(&state.atoms, value)
+    }
+    Value.Symbol { .. } => {
+      unsafe gc.release(&mut hooks, runtime, value)
+      fail CoercionError.SymbolToNumber
+    }
+    _ => { unsafe gc.release(&mut hooks, runtime, value) return nan() }
+  }
+}
+
+/// Borrowed JS_ToStringInternal. In property-key mode symbols are retained,
+/// never described or interned. String results are flat, including rope aliases.
+pub unsafe effect fn toStringInternal(table: &AtomTable, value: Value, propertyKey: bool) -> Value
+  ! OutOfMemoryError | StringLengthError | BigIntError | CoercionError ? &mut Allocator {
+  primitiveRequired(value)
+  match value {
+    Value.String { .. } => { return unsafe value.retained() }
+    Value.Rope { .. } => { return run table.flatten(value) }
+    Value.Int { value: number } => {
+      let mut bytes: [u8; 32] = [0; 32]
+      let length = Dtoa.i32toa(&mut bytes, number)
+      return run Strings.fromLatin1(Slice.view<u8>(&bytes, 0, length))
+    }
+    Value.ShortBigInt { value: number } => {
+      let mut bytes: [u8; 32] = [0; 32]
+      let length = Dtoa.i32toa(&mut bytes, number)
+      return run Strings.fromLatin1(Slice.view<u8>(&bytes, 0, length))
+    }
+    Value.Float64 { value: number } => {
+      let mut bytes: [u8; 32] = [0; 32]
+      let length = Dtoa.format(&mut bytes, number, 10, 0, JS_DTOA_FORMAT_FREE)
+      return run Strings.fromLatin1(Slice.view<u8>(&bytes, 0, length))
+    }
+    Value.Bool { value: boolean } => {
+      if boolean { return run table.toValue(atoms.JS_ATOM_true, true) }
+      return run table.toValue(atoms.JS_ATOM_false, true)
+    }
+    Value.Null => { return run table.toValue(atoms.JS_ATOM_null, true) }
+    Value.Undefined => { return run table.toValue(atoms.JS_ATOM_undefined, true) }
+    Value.Exception => { return Value.Exception }
+    Value.FunctionBytecode { .. } => { return run Strings.fromLatin1(b"[function bytecode]") }
+    Value.Symbol { .. } => {
+      if propertyKey { return unsafe value.retained() }
+      fail CoercionError.SymbolToString
+    }
+    Value.BigInt { reference } => {
+      let anchor = ()
+      let integer = unsafe HeapCell.payload<BigInt, ()>(&anchor, reference)
+      let bytes = run BigIntText.format(integer, 10)
+      return run Strings.fromLatin1(bytes.asSlice())
+    }
+    _ => { return run Strings.fromLatin1(b"[unsupported type]") }
+  }
+}
+pub unsafe effect fn toString(table: &AtomTable, value: Value) -> Value
+  ! OutOfMemoryError | StringLengthError | BigIntError | CoercionError ? &mut Allocator {
+  return run unsafe toStringInternal(table, value, false)
+}
+pub unsafe effect fn toPropertyKey(table: &AtomTable, value: Value) -> Value
+  ! OutOfMemoryError | StringLengthError | BigIntError | CoercionError ? &mut Allocator {
+  return run unsafe toStringInternal(table, value, true)
+}
+pub unsafe effect fn toStringFree<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader,
+  table: &AtomTable, value: Value) -> Value
+  ! OutOfMemoryError | StringLengthError | BigIntError | CoercionError ? &mut Allocator {
+  let result = run Effect.result(unsafe toString(table, value))
+  unsafe gc.release(&mut hooks, runtime, value)
+  return match move result {
+    Result<Value, OutOfMemoryError | StringLengthError | BigIntError | CoercionError>.Success { value: output } => output
+    Result<Value, OutOfMemoryError | StringLengthError | BigIntError | CoercionError>.Failure { error } => { fail move error }
+  }
+}

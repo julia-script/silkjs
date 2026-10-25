@@ -1,0 +1,374 @@
+//! quickjs.c:61539-61906,62111-62435, pinned 7d1c13c5. Arguments borrow;
+//! results own. Raw data never crosses a JavaScript call except the owned sort snapshot.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.pointer { Pointer }
+import silk.raw_buffer { RawBuffer }
+import silk.slot { Slot }
+import silk.layout { Layout }
+import silk.i32
+import silk.i64
+import silk.u16
+import silk.u32
+import silk.u64
+import silk.f32
+import silk.f64
+import runtime_memory { AllocationObserver }
+import js_heap { HeapHeader, HeapCell }
+import js_value { Value }
+import js_core_types { FrameSlots }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_coercion_host { CoercionHooks }
+import js_property_host { OwnPropertyHooks, GetPropertyHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_call_host { CallHooks }
+import js_native_function_host { NativeFunctionHooks }
+import js_buffer_storage { BufferHooks, BufferState }
+import js_buffer_storage as storage
+import js_typed_array_buffer as typed
+import js_typed_array_read as indexedRead
+import js_class_data as classes
+import js_atom_data as atoms
+import js_proxy_core as core
+import js_integer_coercions as integer
+import js_coercions as coercion
+import js_property_get as get
+import js_strings { StringBuilder, Strings }
+import js_string_types { StringLengthError }
+import js_bigint { BigInt, BigIntError }
+import js_math as math
+import js_exceptions { JsException }
+import js_typed_array_methods_order_sort { Compare, Data }
+import js_typed_array_methods_order_sort as rqsort
+import js_typed_array_methods_order_scan as rawScan
+import js_typed_array_methods_support as support
+
+pub const SORT: u32 = 0
+pub const TO_SORTED: u32 = 1
+pub const JOIN: u32 = 2
+pub const TO_LOCALE_STRING: u32 = 3
+pub const INDEX_OF: u32 = 4
+pub const LAST_INDEX_OF: u32 = 5
+pub const INCLUDES: u32 = 6
+fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+unsafe fn argument(argv: &FrameSlots, index: usize) -> Value {
+  if index >= argv.length() { return Value.Undefined } return unsafe argv.get(index)
+}
+// End the live backing snapshot before entering any comparator callback.
+unsafe fn copySnapshot(object: *mut HeapHeader, destination: BufferState, count: u32) -> () {
+  let view = unsafe storage.view(object)
+  let source = unsafe storage.snapshot(view.buffer)
+  unsafe storage.copyBytes(destination, 0, source, view.offset, count)
+}
+fn number(classId: u32, bits: u64) -> f64 {
+  if classId == classes.JS_CLASS_INT8_ARRAY {
+    let mut value = u64.toI32(bits) if value >= 128 { value = value - 256 }
+    return i32.toF64(value)
+  }
+  if classId == classes.JS_CLASS_UINT8_ARRAY || classId == classes.JS_CLASS_UINT8C_ARRAY { return u64.toF64(bits) }
+  if classId == classes.JS_CLASS_INT16_ARRAY {
+    let mut value = u64.toI32(bits) if value >= 32768 { value = value - 65536 }
+    return i32.toF64(value)
+  }
+  if classId == classes.JS_CLASS_UINT16_ARRAY { return u64.toF64(bits) }
+  if classId == classes.JS_CLASS_INT32_ARRAY {
+    let mut value = u64.toI64(bits) if value >= 2147483648 { value = value - 4294967296 }
+    return i64.toF64(value)
+  }
+  if classId == classes.JS_CLASS_UINT32_ARRAY { return u64.toF64(bits) }
+  if classId == classes.JS_CLASS_FLOAT16_ARRAY { return math.fromFp16(bits) }
+  if classId == classes.JS_CLASS_FLOAT32_ARRAY { return f32.toF64(f32.fromBits(u64.toU32(bits))) }
+  return f64.fromBits(bits)
+}
+fn order64(a: u64, b: u64) -> i32 { if a < b { return -1 } if a > b { return 1 } return 0 }
+fn signedBits(value: i64) -> u64 { if value < 0 { return i64.toU64(-(value + 1)) ^ 0xffffffffffffffff } return i64.toU64(value) }
+fn floatOrder(a: f64, b: f64) -> i32 {
+  if f64.isNaN(a) { if f64.isNaN(b) { return 0 } return 1 }
+  if f64.isNaN(b) { return -1 }
+  if a < b { return -1 } if a > b { return 1 }
+  if a != 0.0 { return 0 }
+  return order64(f64.toBits(b), f64.toBits(a))
+}
+struct RawCompare { classId: u32 }
+impl Compare for RawCompare {
+  unsafe effect fn compare(self: &mut Self, a: u64, b: u64) -> i32 ! JsException ? &mut Allocator {
+    if self.classId == classes.JS_CLASS_BIG_UINT64_ARRAY { return order64(a, b) }
+    if self.classId == classes.JS_CLASS_BIG_INT64_ARRAY {
+      return order64(a ^ 0x8000000000000000, b ^ 0x8000000000000000)
+    }
+    return floatOrder(number(self.classId, a), number(self.classId, b))
+  }
+}
+struct CallbackCompare<'a, H> {
+  hooks: &'a mut H, context: *mut HeapHeader, classId: u32,
+  snapshot: *mut u8, callback: Value, failed: bool
+}
+unsafe effect fn sortElement<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  classId: u32, snapshot: *mut u8, index: u32) -> Value ? &mut Allocator {
+  let outcome = run Effect.result(unsafe indexedRead.readRaw(classId, snapshot, index))
+  return match move outcome {
+    Result<Value, OutOfMemoryError>.Success { value } => value
+    Result<Value, OutOfMemoryError>.Failure { error } => {
+      // getfun is deliberately unchecked in js_TA_cmp_generic: both operands
+      // are obtained and the comparator runs even if BigInt boxing failed.
+      return run Effect.catch<JsException>(unsafe core.materialize(&mut hooks, context, move error), core.exceptionValue)
+    }
+  }
+}
+unsafe effect fn compareBody<H: HeapHooks + CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  classId: u32, snapshot: *mut u8, callback: Value, a: u32, b: u32, roots: &mut [Value]) -> i32
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  roots[0] = run unsafe sortElement(&mut hooks, context, classId, snapshot, a)
+  roots[1] = run unsafe sortElement(&mut hooks, context, classId, snapshot, b)
+  let result = run unsafe hooks.call(context, callback, Value.Undefined, &[roots[0], roots[1]])
+  let mut value: f64 = 0.0
+  match result {
+    Value.Int { value: small } => { value = i32.toF64(small) }
+    _ => { run unsafe integer.toFloat64Free(&mut hooks, context, &mut value, result) }
+  }
+  if value > 0.0 { return 1 } if value < 0.0 { return -1 }
+  return order64(u32.toU64(a), u32.toU64(b))
+}
+impl<'a, H: HeapHooks + CoercionHooks> Compare for CallbackCompare<'a, H> {
+  unsafe effect fn compare(self: &mut Self, a: u64, b: u64) -> i32 ! JsException ? &mut Allocator {
+    if self.failed { return 0 }
+    let mut roots = [Value.Undefined; 2]
+    let outcome = run Effect.result(unsafe compareBody(&mut self.hooks.*, self.context, self.classId,
+      self.snapshot, self.callback, u64.toU32(a), u64.toU32(b), &mut roots))
+    let mut order: i32 = 0
+    match move outcome {
+      Result<i32, OutOfMemoryError | StringLengthError | JsException>.Success { value } => { order = value }
+      Result<i32, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => {
+        let pending = run Effect.catch<JsException>(unsafe core.materialize(&mut self.hooks.*, self.context, move error), core.exceptionValue)
+        self.failed = true
+      }
+    }
+    let rt = unsafe runtime.contextRuntime(self.context)
+    unsafe gc.release(&mut self.hooks.*, rt, roots[0]) unsafe gc.release(&mut self.hooks.*, rt, roots[1])
+    return order
+  }
+}
+unsafe effect fn sortBody<H: HeapHooks + CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  receiver: Value, argv: &FrameSlots) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  let callback = unsafe argument(argv, 0)
+  // check_function precedes receiver validation, including length-zero arrays.
+  if !core.undefined(callback) && !unsafe hooks.isCallable(context, callback) {
+    return run unsafe core.error(&mut hooks, context, b"not a function")
+  }
+  let length = run unsafe typed.getLengthUnsafe(&mut hooks, context, receiver)
+  if length > 1 {
+    let object = core.reference(receiver) let classId = unsafe storage.classId(receiver)
+    let shift = storage.sizeLog2(classId)
+    let width = u32.shiftLeft(1, shift)
+    if core.undefined(callback) {
+      let mut comparison = RawCompare { classId: classId }
+      let view = unsafe storage.view(object)
+      let state = unsafe storage.snapshot(view.buffer)
+      run unsafe rqsort.sort(&mut comparison, Data.Buffer { state: state, offset: view.offset }, length, shift)
+    } else {
+      let allocation = run Allocator.allocate(Layout { bytes: u32.toUsize(length) * u32.toUsize(width), alignment: 8 })
+      let mut snapshot = unsafe RawBuffer.from<u8>(move allocation, u32.toUsize(length) * u32.toUsize(width))
+      let bytes = Slot.address(RawBuffer.slot<u8>(&mut snapshot, 0))
+      let snapshotState = support.privateState(bytes, length * width)
+      unsafe copySnapshot(object, snapshotState, length * width)
+      let indexAllocation = run Allocator.allocate(Layout { bytes: u32.toUsize(length) * 4, alignment: 4 })
+      let mut indexes = unsafe RawBuffer.from<u32>(move indexAllocation, u32.toUsize(length))
+      let indexBase = Slot.address(RawBuffer.slot<u32>(&mut indexes, 0))
+      let mut i: u32 = 0
+      while i < length { unsafe Pointer.write<u32>(unsafe Pointer.atMut<u32>(unsafe Pointer.assumeManyMut<u32>(indexBase), u32.toUsize(i)), i) i = i + 1 }
+      let mut comparison = CallbackCompare { hooks: &mut hooks, context: context, classId: classId, snapshot: bytes, callback: callback, failed: false }
+      let indexData = Data.Private { data: unsafe Intrinsic.pointerReinterpret<*mut u32, *mut u8>(indexBase) }
+      run unsafe rqsort.sort(&mut comparison, indexData, length, 2)
+      let failed = comparison.failed drop comparison
+      if failed { fail JsException {} }
+      let mut current = unsafe storage.count(object) if current > length { current = length }
+      // Reacquire backing only after the last comparator (which can resize/detach).
+      if current > 0 {
+        let view = unsafe storage.view(object)
+        let destination = unsafe storage.snapshot(view.buffer) i = 0
+        while i < current {
+          let source = unsafe Pointer.read<u32>(unsafe Pointer.at<u32>(unsafe Pointer.assumeMany<u32>(indexBase), u32.toUsize(i)))
+          let bits = unsafe storage.loadScalar(snapshotState, source * width, shift)
+          unsafe storage.storeScalar(destination, view.offset + i * width, shift, bits) i = i + 1
+        }
+      }
+    }
+  }
+  return unsafe receiver.retained()
+}
+unsafe effect fn search<H: HeapHooks + CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  method: u32, receiver: Value, argv: &FrameSlots) -> Value ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let initial = run unsafe typed.getLengthUnsafe(&mut hooks, context, receiver)
+  let mut found: i32 = -1
+  if initial == 0 { return searchResult(method, found) }
+  let mut k: i64 = 0 let mut stop = u32.toI64(initial) let mut increment: i64 = 1
+  if method == LAST_INDEX_OF {
+    k = u32.toI64(initial) - 1 stop = -1 increment = -1
+    if argv.length() > 1 { run unsafe integer.toInt64Clamp(&mut hooks, context, &mut k, unsafe argument(argv, 1), -1, u32.toI64(initial) - 1, u32.toI64(initial)) }
+    if k < 0 { return searchResult(method, found) }
+  } else if argv.length() > 1 {
+    let mut index: i32 = 0
+    run unsafe integer.toInt32Clamp(&mut hooks, context, &mut index, unsafe argument(argv, 1), 0, u32.toI32(initial), u32.toI32(initial))
+    k = i32.toI64(index)
+  }
+  let needle = unsafe argument(argv, 0)
+  let object = core.reference(receiver) let mut length = unsafe storage.count(object)
+  if initial > length && method == INCLUDES && core.undefined(needle) && k < u32.toI64(initial) { return Value.Bool { value: true } }
+  if length > initial { length = initial }
+  if length == 0 { return searchResult(method, found) }
+  let end = u32.toI64(length)
+  if method == LAST_INDEX_OF { if k > end - 1 { k = end - 1 } }
+  else if k > end { k = end }
+  if stop > end { stop = end }
+  let classId = unsafe storage.classId(receiver)
+  let big = classId == classes.JS_CLASS_BIG_INT64_ARRAY || classId == classes.JS_CLASS_BIG_UINT64_ARRAY
+  let mut bits: u64 = 0 let mut value: f64 = 0.0
+  if needle.isBigInt() {
+    if !big { return searchResult(method, found) }
+    match needle {
+      Value.ShortBigInt { value: small } => {
+        if classId == classes.JS_CLASS_BIG_UINT64_ARRAY && small < 0 { return searchResult(method, found) }
+        bits = signedBits(i32.toI64(small))
+      }
+      Value.BigInt { reference } => {
+        let anchor = () let integer = unsafe HeapCell.payload<BigInt, ()>(&anchor, reference)
+        if classId == classes.JS_CLASS_BIG_INT64_ARRAY {
+          if integer.length() > 2 { return searchResult(method, found) }
+        } else {
+          if integer.negative() || integer.length() > 3 || (integer.length() == 3 && integer.limb(2) != 0) { return searchResult(method, found) }
+        }
+        bits = integer.lowU64()
+      }
+      _ => invariant()
+    }
+  } else {
+    if !needle.isNumber() || big { return searchResult(method, found) }
+    value = needle.numericValue()
+    // Reject non-representable searches before scanning raw memory.
+    if classId <= classes.JS_CLASS_UINT32_ARRAY {
+      let mut minimum: f64 = 0.0 let mut maximum: f64 = 255.0
+      if classId == classes.JS_CLASS_INT8_ARRAY { minimum = -128.0 maximum = 127.0 }
+      if classId == classes.JS_CLASS_INT16_ARRAY { minimum = -32768.0 maximum = 32767.0 }
+      if classId == classes.JS_CLASS_UINT16_ARRAY { maximum = 65535.0 }
+      if classId == classes.JS_CLASS_INT32_ARRAY { minimum = -2147483648.0 maximum = 2147483647.0 }
+      if classId == classes.JS_CLASS_UINT32_ARRAY { maximum = 4294967295.0 }
+      if f64.isNaN(value) || value < minimum || value > maximum || f64.trunc(value) != value { return searchResult(method, found) }
+      // Source scan8 uses a uint16_t needle in its reverse loop (unlike
+      // memchr's byte conversion); negative Int8 needles do not match there.
+      if classId == classes.JS_CLASS_INT8_ARRAY && method == LAST_INDEX_OF && value < 0.0 { return searchResult(method, found) }
+    } else if f64.isNaN(value) {
+      if method != INCLUDES { return searchResult(method, found) }
+    } else {
+      if classId == classes.JS_CLASS_FLOAT16_ARRAY && math.fromFp16(math.toFp16(value)) != value { return searchResult(method, found) }
+      if classId == classes.JS_CLASS_FLOAT32_ARRAY && f32.toF64(f64.toF32(value)) != value { return searchResult(method, found) }
+    }
+  }
+  let view = unsafe storage.view(object) let state = unsafe storage.snapshot(view.buffer)
+  let shift = storage.sizeLog2(classId) let width = u32.shiftLeft(1, shift)
+  let mut mask: u64 = 0xffffffffffffffff let mut nanExponent: u64 = 0
+  if !big {
+    if classId <= classes.JS_CLASS_UINT32_ARRAY {
+      bits = signedBits(f64.toI64(value))
+      mask = u64.shiftRight(mask, 64 - u32.toU64(width * 8))
+      bits = bits & mask
+    } else {
+      let mut signMask: u64 = 0x7fffffffffffffff let mut exponent: u64 = 0x7ff0000000000000
+      bits = f64.toBits(value)
+      if width == 2 { bits = math.toFp16(value) signMask = 0x7fff exponent = 0x7c00 }
+      if width == 4 { bits = u32.toU64(f32.toBits(f64.toF32(value))) signMask = 0x7fffffff exponent = 0x7f800000 }
+      if value == 0.0 { mask = signMask bits = 0 }
+      if f64.isNaN(value) { mask = signMask nanExponent = exponent }
+    }
+  }
+  found = unsafe rawScan.scan(state, view.offset, shift, k, stop, increment, bits, mask, nanExponent)
+  return searchResult(method, found)
+}
+fn searchResult(method: u32, found: i32) -> Value {
+  if method == INCLUDES { return Value.Bool { value: found >= 0 } } return Value.Int { value: found }
+}
+struct JoinOwners { separator: Value, element: Value, method: Value, text: Value }
+unsafe effect fn appendSeparator(builder: &mut StringBuilder, separator: Value, unit: i32) -> () ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  if unit >= 0 { run builder.appendUnit(i32.toU16(unit)) } else { run builder.append(separator) }
+}
+unsafe effect fn joinBody<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks>(hooks: &mut H,
+  context: *mut HeapHeader, receiver: Value, argv: &FrameSlots, locale: bool, owners: &mut JoinOwners) -> Value
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  let oldLength = run unsafe typed.getLengthUnsafe(&mut hooks, context, receiver)
+  let mut length = oldLength let mut newLength = oldLength let mut unit: i32 = 44
+  let separator = unsafe argument(argv, 0)
+  if !locale && !core.undefined(separator) {
+    owners.separator = run unsafe coercion.toString(&mut hooks, context, separator)
+    unit = -1
+    if Strings.length(owners.separator) == 1 && !Strings.isWide(owners.separator) { unit = u16.toI32(Strings.codeUnit(owners.separator, 0)) }
+    newLength = unsafe storage.count(core.reference(receiver)) if length > newLength { length = newLength }
+  }
+  let rt = unsafe runtime.contextRuntime(context) let mut builder = StringBuilder.make()
+  let mut i: u32 = 0
+  while i < length {
+    if i > 0 { run unsafe appendSeparator(&mut builder, owners.separator, unit) }
+    owners.element = run unsafe get.getPropertyUint32(&mut hooks, context, receiver, i)
+    if !core.undefined(owners.element) && owners.element.tag() != 2 {
+      if locale {
+        owners.method = run unsafe hooks.getProperty(context, owners.element, atoms.JS_ATOM_toLocaleString)
+        let called = run unsafe hooks.call(context, owners.method, owners.element, &[unsafe argument(argv, 0), unsafe argument(argv, 1)])
+        unsafe gc.release(&mut hooks, rt, owners.method) owners.method = Value.Undefined
+        unsafe gc.release(&mut hooks, rt, owners.element) owners.element = called
+      }
+      let element = owners.element owners.element = Value.Undefined
+      owners.text = run unsafe coercion.toStringFree(&mut hooks, context, element)
+      run builder.append(owners.text)
+      unsafe gc.release(&mut hooks, rt, owners.text) owners.text = Value.Undefined
+    }
+    i = i + 1
+  }
+  i = newLength if i < 1 { i = 1 }
+  while i < oldLength { run unsafe appendSeparator(&mut builder, owners.separator, unit) i = i + 1 }
+  // Source frees the separator before final string allocation.
+  unsafe gc.release(&mut hooks, rt, owners.separator) owners.separator = Value.Undefined
+  return run builder.finish()
+}
+unsafe effect fn join<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks>(hooks: &mut H,
+  context: *mut HeapHeader, receiver: Value, argv: &FrameSlots, locale: bool) -> Value ! JsException ? &mut Allocator {
+  let mut owners = JoinOwners { separator: Value.Undefined, element: Value.Undefined, method: Value.Undefined, text: Value.Undefined }
+  let outcome = run Effect.result(unsafe joinBody(&mut hooks, context, receiver, argv, locale, &mut owners))
+  let mut result = Value.Undefined let mut failed = false
+  match move outcome {
+    Result<Value, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { value } => { result = value }
+    Result<Value, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => {
+      let pending = run Effect.catch<JsException>(unsafe core.materialize(&mut hooks, context, move error), core.exceptionValue) failed = true
+    }
+  }
+  let rt = unsafe runtime.contextRuntime(context)
+  unsafe gc.release(&mut hooks, rt, owners.text) unsafe gc.release(&mut hooks, rt, owners.method)
+  unsafe gc.release(&mut hooks, rt, owners.element) unsafe gc.release(&mut hooks, rt, owners.separator)
+  if failed { fail JsException {} } return result
+}
+pub unsafe effect fn call<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks + BufferHooks>(
+  hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, method: u32, receiver: Value, argv: &FrameSlots) -> Value ! JsException ? &mut Allocator {
+  if method == JOIN || method == TO_LOCALE_STRING { return run unsafe join(&mut hooks, context, receiver, argv, method == TO_LOCALE_STRING) }
+  if method >= INDEX_OF && method <= INCLUDES {
+    let outcome = run Effect.result(unsafe search(&mut hooks, context, method, receiver, argv))
+    return match move outcome {
+      Result<Value, OutOfMemoryError | StringLengthError | JsException>.Success { value } => value
+      Result<Value, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => { return run unsafe core.materialize(&mut hooks, context, move error) }
+    }
+  }
+  let mut target = receiver
+  if method == TO_SORTED {
+    let source = run unsafe typed.requireTypedArray(&mut hooks, context, receiver)
+    target = run unsafe typed.constructorTa(&mut hooks, memory, context, Value.Undefined, receiver, unsafe storage.classId(receiver), unsafe storage.count(source))
+  } else if method != SORT { return invariant() }
+  let outcome = run Effect.result(unsafe sortBody(&mut hooks, context, target, argv))
+  let mut result = Value.Undefined let mut failed = false
+  match move outcome {
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => { result = value }
+    Result<Value, OutOfMemoryError | JsException>.Failure { error } => {
+      let pending = run Effect.catch<JsException>(unsafe core.materialize(&mut hooks, context, move error), core.exceptionValue) failed = true
+    }
+  }
+  if method == TO_SORTED { unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), target) }
+  if failed { fail JsException {} } return result
+}

@@ -1,0 +1,817 @@
+//! Native ArrayBuffer storage and shared TypedArray/DataView ownership, quickjs.c
+//! 60207-60583,60842-60867,63303-63331,63570-63593. Raw pointers expire on JS calls.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.atomic { Atomic, MemoryOrder }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.ownership { Copy, Drop }
+import silk.pointer { Pointer }
+import silk.layout { Layout }
+import silk.raw_buffer { RawBuffer }
+import silk.slot { Slot }
+import silk.thread { Transferable, Concurrent }
+import silk.u8
+import silk.u16
+import silk.u32
+import silk.u64
+import silk.i64
+import silk.usize
+import runtime_memory { AllocationObserver }
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_value { Value }
+import js_core_types { ObjectData, ObjectPayload, ObjectPayloadFamily, TypedArrayCache, NativeFunctionId, RuntimeState, NativeErrorKind }
+import js_gc { HeapHooks, Tracer }
+import js_gc as gc
+import js_runtime as runtime
+import js_coercion_host { CoercionHooks }
+import js_exceptions { JsException }
+import js_constructor_ops as constructors
+import js_proxy_core as core
+import js_class_data as classes
+import js_shared_memory as sharedMemory
+
+/// Native callbacks cannot execute JavaScript. allocate returns null on refusal;
+/// duplicate/free implement the embedding's thread-safe shared backing ownership.
+/// freeShared(None) performs the embedding allocator's native default free when
+/// sab_alloc is installed without sab_free; it must not silently retain memory.
+/// Shared host aliases must retain one 8-aligned base and physical capacity;
+/// published bytes use memorySpan/canonical accesses, never plain host loads.
+pub interface BufferHooks {
+  unsafe effect fn allocateShared(self: &mut Self, runtime: *mut HeapHeader, callback: NativeFunctionId,
+    opaque: ?*mut u8, length: usize) -> ?*mut u8 ! OutOfMemoryError ? &mut Allocator
+  unsafe fn duplicateShared(self: &mut Self, runtime: *mut HeapHeader, callback: NativeFunctionId,
+    opaque: ?*mut u8, data: ?*mut u8) -> ()
+  unsafe fn freeShared(self: &mut Self, runtime: *mut HeapHeader, callback: Option<NativeFunctionId>,
+    opaque: ?*mut u8, data: ?*mut u8) -> ()
+  unsafe fn freeExternal(self: &mut Self, runtime: *mut HeapHeader, callback: NativeFunctionId,
+    opaque: ?*mut u8, data: ?*mut u8) -> ()
+}
+union Backing {
+  Empty,
+  Owned { bytes: Intrinsic.RawBuffer<u8> },
+  Shared { owner: *mut SharedBacking },
+  Borrowed,
+  External { callback: Option<NativeFunctionId>, opaque: ?*mut u8 },
+  HostShared { fallback: Option<NativeFunctionId>, opaque: ?*mut u8, defaultFree: bool }
+}
+struct SharedBacking {
+  references: usize,
+  bytes: Intrinsic.RawBuffer<u8>,
+  metadata: Option<Intrinsic.RawBuffer<u8>>
+}
+/// A native backing owner, independent of any JavaScript heap or wrapper.
+/// The byte length is a snapshot; canonical atomic cells use physical capacity.
+pub struct BufferLease {
+  owner: *mut SharedBacking,
+  bytes: ?*mut u8,
+  byteLength: u32,
+  capacity: u32
+}
+impl Transferable for BufferLease {}
+impl Concurrent for BufferLease {}
+impl BufferLease {
+  pub fn clone(self: &Self) -> Self {
+    unsafe retainSharedOwner(self.owner)
+    return Self { owner: self.owner, bytes: self.bytes, byteLength: self.byteLength, capacity: self.capacity }
+  }
+  pub fn data(self: &Self) -> ?*mut u8 { return self.bytes }
+  pub fn length(self: &Self) -> u32 { return self.byteLength }
+}
+impl Drop for BufferLease {
+  fn drop(self: &mut Self) -> () { unsafe releaseSharedOwner(self.owner) }
+}
+struct SharedAllocation { owner: *mut SharedBacking, data: *mut u8 }
+struct BufferData {
+  state: BufferState,
+  backing: Backing,
+  externalPins: usize,
+  first: ?*mut HeapHeader,
+  last: ?*mut HeapHeader
+}
+struct ViewData {
+  state: ViewState,
+  object: *mut HeapHeader,
+  previous: ?*mut HeapHeader,
+  next: ?*mut HeapHeader,
+  linked: bool
+}
+pub struct BufferState {
+  pub data: ?*mut u8,
+  pub byteLength: u32,
+  pub maxByteLength: i64,
+  pub detached: bool,
+  pub shared: bool,
+  pub external: bool,
+  /// Zero for private bytes; otherwise the canonical shared allocation extent.
+  /// This is independent of JavaScript ArrayBuffer/SharedArrayBuffer identity.
+  pub physicalCapacity: u32
+}
+impl Copy for BufferState {}
+pub struct ViewState {
+  pub buffer: *mut HeapHeader,
+  pub offset: u32,
+  pub byteLength: u32,
+  pub tracking: bool
+}
+impl Copy for ViewState {}
+fn copyCallback(callback: &Option<NativeFunctionId>) -> Option<NativeFunctionId> {
+  return match &callback.* {
+    Option<NativeFunctionId>.Some { value } => Option<NativeFunctionId>.some(value)
+    Option<NativeFunctionId>.None => Option<NativeFunctionId>.none()
+  }
+}
+fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+unsafe fn nonnull(value: ?*mut HeapHeader) -> *mut HeapHeader {
+  return unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(value)
+}
+pub unsafe fn classId(value: Value) -> u32 {
+  if !value.isObject() { return 0 }
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(value))
+  return object.classId
+}
+pub unsafe fn isBuffer(value: Value) -> bool {
+  let id = unsafe classId(value)
+  return id == classes.JS_CLASS_ARRAY_BUFFER || id == classes.JS_CLASS_SHARED_ARRAY_BUFFER
+}
+unsafe fn payload(object: *mut HeapHeader) -> *mut HeapHeader {
+  let anchor = () let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  return match &p.payload {
+    ObjectPayload.Opaque { reference, .. } => unsafe nonnull(reference)
+    ObjectPayload.TypedArray { array } => array.view
+    _ => invariant()
+  }
+}
+pub unsafe fn snapshot(object: *mut HeapHeader) -> BufferState {
+  let anchor = () let p = unsafe HeapCell.payload<BufferData, ()>(&anchor, unsafe payload(object))
+  return p.state
+}
+pub unsafe fn view(object: *mut HeapHeader) -> ViewState {
+  let anchor = () let p = unsafe HeapCell.payload<ViewData, ()>(&anchor, unsafe payload(object))
+  return p.state
+}
+pub fn sizeLog2(class: u32) -> u32 {
+  return u8.toU32(classes.typedArraySizeLog2(class))
+}
+pub unsafe fn dataAt(data: ?*mut u8, offset: u32) -> *mut u8 {
+  let p = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(data)
+  return unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(p), u32.toUsize(offset))
+}
+// The shared backing base never moves. A growable wrapper's current length is
+// not its physical extent: clones with different visible lengths use the same
+// canonical cells, including the final 4/2/1-byte tail.
+pub fn memorySpan(state: BufferState) -> sharedMemory.Span {
+  if state.physicalCapacity == 0 { invariant() }
+  return sharedMemory.Span { data: state.data, capacity: state.physicalCapacity }
+}
+// Callers prove bounds and keep these pointer-only snapshots across no JS call.
+// Shared cells use relaxed atomics; private aligned scalars stay native loads.
+pub unsafe fn loadScalar(state: BufferState, offset: u32, sizeLog2: u32) -> u64 {
+  if state.physicalCapacity != 0 { return unsafe sharedMemory.load(memorySpan(state), offset, sizeLog2, MemoryOrder.Relaxed) }
+  let pointer = unsafe dataAt(state.data, offset)
+  let width = u32.shiftLeft(1, sizeLog2)
+  if Pointer.address<u8>(pointer) % u32.toUsize(width) == 0 {
+    if sizeLog2 == 0 { return u8.toU64(unsafe Pointer.read<u8>(pointer)) }
+    if sizeLog2 == 1 { return u16.toU64(unsafe Pointer.read<u16>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut u16>(pointer))) }
+    if sizeLog2 == 2 { return u32.toU64(unsafe Pointer.read<u32>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut u32>(pointer))) }
+    return unsafe Pointer.read<u64>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut u64>(pointer))
+  }
+  let mut bits: u64 = 0
+  let mut i: u32 = 0
+  while i < width {
+    let byte = unsafe Pointer.read<u8>(unsafe dataAt(state.data, offset + i))
+    bits = bits | u64.shiftLeft(u8.toU64(byte), u32.toU64(i * 8))
+    i = i + 1
+  }
+  return bits
+}
+pub unsafe fn storeScalar(state: BufferState, offset: u32, sizeLog2: u32, bits: u64) -> () {
+  if state.physicalCapacity != 0 { unsafe sharedMemory.store(memorySpan(state), offset, sizeLog2, bits, MemoryOrder.Relaxed) return () }
+  let pointer = unsafe dataAt(state.data, offset)
+  let width = u32.shiftLeft(1, sizeLog2)
+  if Pointer.address<u8>(pointer) % u32.toUsize(width) == 0 {
+    if sizeLog2 == 0 { unsafe Pointer.write<u8>(pointer, u64.toU8(bits & 255)) }
+    else if sizeLog2 == 1 { unsafe Pointer.write<u16>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut u16>(pointer), u64.toU16(bits & 65535)) }
+    else if sizeLog2 == 2 { unsafe Pointer.write<u32>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut u32>(pointer), u64.toU32(bits & 0xffffffff)) }
+    else { unsafe Pointer.write<u64>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut u64>(pointer), bits) }
+    return ()
+  }
+  let mut i: u32 = 0
+  while i < width {
+    unsafe Pointer.write<u8>(unsafe dataAt(state.data, offset + i), u64.toU8(u64.shiftRight(bits, u32.toU64(i * 8)) & 255))
+    i = i + 1
+  }
+}
+fn chunkSize(count: u32) -> u32 {
+  if count >= 8 { return 3 }
+  if count >= 4 { return 2 }
+  if count >= 2 { return 1 }
+  return 0
+}
+// Nonoverlapping byte ranges. Chunks preserve bits without boxing float/BigInt.
+pub unsafe fn copyBytes(destination: BufferState, destOffset: u32,
+  source: BufferState, sourceOffset: u32, count: u32) -> () {
+  if count == 0 { return () }
+  if destination.physicalCapacity == 0 && source.physicalCapacity == 0 {
+    unsafe copy(unsafe dataAt(destination.data, destOffset), unsafe dataAt(source.data, sourceOffset), count)
+    return ()
+  }
+  let mut i: u32 = 0
+  while i < count {
+    let shift = chunkSize(count - i)
+    let bits = unsafe loadScalar(source, sourceOffset + i, shift)
+    unsafe storeScalar(destination, destOffset + i, shift, bits)
+    i = i + u32.shiftLeft(1, shift)
+  }
+}
+pub unsafe fn moveBytes(state: BufferState, destOffset: u32, sourceOffset: u32, count: u32) -> () {
+  if count == 0 || destOffset == sourceOffset { return () }
+  if destOffset < sourceOffset || destOffset - sourceOffset >= count {
+    unsafe copyBytes(state, destOffset, state, sourceOffset, count)
+    return ()
+  }
+  let mut remaining = count
+  while remaining > 0 {
+    let shift = chunkSize(remaining)
+    remaining = remaining - u32.shiftLeft(1, shift)
+    let bits = unsafe loadScalar(state, sourceOffset + remaining, shift)
+    unsafe storeScalar(state, destOffset + remaining, shift, bits)
+  }
+}
+pub unsafe fn fillBytes(state: BufferState, offset: u32, count: u32, value: u8) -> () {
+  if state.physicalCapacity == 0 {
+    let mut i: u32 = 0
+    while i < count {
+      unsafe Pointer.write<u8>(unsafe dataAt(state.data, offset + i), value)
+      i = i + 1
+    }
+    return ()
+  }
+  let bits = u8.toU64(value) * 0x0101010101010101
+  let mut i: u32 = 0
+  while i < count {
+    let shift = chunkSize(count - i)
+    unsafe storeScalar(state, offset + i, shift, bits)
+    i = i + u32.shiftLeft(1, shift)
+  }
+}
+// Private bytes or unpublished initialization only. Published shared storage
+// must use copyBytes so overlapping JavaScript view widths share atomic cells.
+pub unsafe fn copy(destination: ?*mut u8, source: ?*mut u8, count: u32) -> () {
+  let mut i: u32 = 0
+  while i < count {
+    unsafe Pointer.write<u8>(unsafe dataAt(destination, i), unsafe Pointer.read<u8>(unsafe dataAt(source, i)))
+    i = i + 1
+  }
+}
+unsafe fn zero(data: ?*mut u8, start: u32, end: u32) -> () {
+  let mut i = start
+  while i < end { unsafe Pointer.write<u8>(unsafe dataAt(data, i), 0) i = i + 1 }
+}
+pub unsafe effect fn requireBuffer<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  value: Value, shared: i32) -> *mut HeapHeader ! JsException ? &mut Allocator {
+  let id = unsafe classId(value)
+  if (shared != 1 && id == classes.JS_CLASS_ARRAY_BUFFER) ||
+    (shared != 0 && id == classes.JS_CLASS_SHARED_ARRAY_BUFFER) { return core.reference(value) }
+  if shared == 1 { return run unsafe core.error(&mut hooks, context, b"SharedArrayBuffer object expected") }
+  return run unsafe core.error(&mut hooks, context, b"ArrayBuffer object expected")
+}
+effect fn allocateBytes(length: u32) -> Intrinsic.RawBuffer<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut size = u32.toUsize(length) if size == 0 { size = 1 }
+  let allocation = run Allocator.allocate(Layout { bytes: size, alignment: 8 })
+  let mut bytes = unsafe RawBuffer.from<u8>(move allocation, size)
+  RawBuffer.fill(&mut bytes, 0, size, 0)
+  return move bytes
+}
+unsafe fn pointer(bytes: &mut Intrinsic.RawBuffer<u8>) -> *mut u8 {
+  return Slot.address(RawBuffer.slot<u8>(&mut bytes, 0))
+}
+effect fn allocateSharedBytes(length: u32) -> SharedAllocation ! OutOfMemoryError ? &mut Allocator {
+  let layout = Layout.of<SharedBacking>()
+  let offset = (layout.bytes + 7) / 8 * 8
+  let mut size = u32.toUsize(length) if size == 0 { size = 1 }
+  let mut alignment = layout.alignment if alignment < 8 { alignment = 8 }
+  let allocation = run Allocator.allocate(Layout { bytes: offset + size, alignment: alignment })
+  let mut bytes = unsafe RawBuffer.from<u8>(move allocation, offset + size)
+  RawBuffer.fill(&mut bytes, offset, size, 0)
+  let base = unsafe pointer(&mut bytes)
+  let data = unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(base), offset)
+  let owner = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut SharedBacking>(base)
+  unsafe Pointer.put<SharedBacking>(owner, SharedBacking { references: 1, bytes: move bytes,
+    metadata: Option<Intrinsic.RawBuffer<u8>>.none() })
+  return SharedAllocation { owner: owner, data: data }
+}
+unsafe fn retainSharedOwner(owner: *mut SharedBacking) -> () {
+  let mut anchor = () let shared = unsafe Pointer.borrowMut<(), SharedBacking>(&mut anchor, owner)
+  let refs = Pointer.fromMutRef<usize>(&mut shared.references) drop shared
+  let previous = unsafe Atomic.fetchAdd<usize>(refs, 1, MemoryOrder.Relaxed)
+}
+unsafe fn releaseSharedOwner(owner: *mut SharedBacking) -> () {
+  let mut anchor = () let shared = unsafe Pointer.borrowMut<(), SharedBacking>(&mut anchor, owner)
+  let refs = Pointer.fromMutRef<usize>(&mut shared.references) drop shared
+  if unsafe Atomic.fetchSubtract<usize>(refs, 1, MemoryOrder.Release) == 1 {
+    Atomic.fence(MemoryOrder.Acquire)
+    let allocation = unsafe Pointer.take<SharedBacking>(owner) drop allocation
+  }
+}
+pub unsafe fn hasNativeSharedBacking(object: *mut HeapHeader) -> bool {
+  let anchor = () let buffer = unsafe HeapCell.payload<BufferData, ()>(&anchor, unsafe payload(object))
+  return match &buffer.backing { Backing.Shared { .. } => true _ => false }
+}
+pub unsafe fn hasExternalBacking(object: *mut HeapHeader) -> bool {
+  let anchor = () let buffer = unsafe HeapCell.payload<BufferData, ()>(&anchor, unsafe payload(object))
+  return match &buffer.backing { Backing.External { .. } => true _ => false }
+}
+pub unsafe fn hasBorrowedSharedBacking(object: *mut HeapHeader) -> bool {
+  let anchor = () let buffer = unsafe HeapCell.payload<BufferData, ()>(&anchor, unsafe payload(object))
+  return match &buffer.backing { Backing.Borrowed => true _ => false }
+}
+pub unsafe fn hasPinnedExternalBacking(object: *mut HeapHeader) -> bool {
+  let anchor = () let buffer = unsafe HeapCell.payload<BufferData, ()>(&anchor, unsafe payload(object))
+  return buffer.externalPins != 0
+}
+/// The caller roots this ordinary external buffer until every borrowed alias is
+/// gone, then unpins it. Nonempty storage must be eight-byte aligned.
+pub unsafe fn pinExternalBacking(object: *mut HeapHeader) -> u32 {
+  let mut anchor = () let buffer = unsafe HeapCell.payloadMut<BufferData, ()>(&mut anchor, unsafe payload(object))
+  match &buffer.backing { Backing.External { .. } => () _ => invariant() }
+  if buffer.state.detached || buffer.state.shared { invariant() }
+  let mut capacity = buffer.state.byteLength if capacity == 0 { capacity = 1 }
+  buffer.externalPins = buffer.externalPins + 1 buffer.state.physicalCapacity = capacity drop buffer
+  unsafe refresh(object)
+  return capacity
+}
+pub unsafe fn unpinExternalBacking(object: *mut HeapHeader) -> () {
+  let mut anchor = () let buffer = unsafe HeapCell.payloadMut<BufferData, ()>(&mut anchor, unsafe payload(object))
+  if buffer.externalPins == 0 { invariant() }
+  buffer.externalPins = buffer.externalPins - 1
+  let private = buffer.externalPins == 0
+  if private { buffer.state.physicalCapacity = 0 }
+  drop buffer
+  if private { unsafe refresh(object) }
+}
+/// The host proves that every alias uses this same live allocation extent.
+pub unsafe fn setSharedPhysicalCapacity(object: *mut HeapHeader, capacity: u32) -> () {
+  let mut anchor = () let buffer = unsafe HeapCell.payloadMut<BufferData, ()>(&mut anchor, unsafe payload(object))
+  if !buffer.state.shared || capacity == 0 || capacity < buffer.state.byteLength { invariant() }
+  buffer.state.physicalCapacity = capacity drop buffer
+  unsafe refresh(object)
+}
+/// Retains native-owned ordinary or shared storage without copying. External
+/// storage requires an independently rooted pin and borrowed wrappers instead.
+pub unsafe effect fn leaseBacking(object: *mut HeapHeader) -> BufferLease ! OutOfMemoryError ? &mut Allocator {
+  let state = unsafe snapshot(object)
+  if state.detached { invariant() }
+  let anchor = () let buffer = unsafe HeapCell.payload<BufferData, ()>(&anchor, unsafe payload(object))
+  let existing: ?*mut SharedBacking = match &buffer.backing {
+    Backing.Shared { owner } => owner
+    _ => Pointer.null<SharedBacking>()
+  }
+  let owned = match &buffer.backing { Backing.Owned { .. } => true _ => false }
+  drop buffer
+  if !Pointer.isNull<SharedBacking>(existing) {
+    let owner = unsafe Intrinsic.pointerRequalify<?*mut SharedBacking, *mut SharedBacking>(existing)
+    unsafe retainSharedOwner(owner)
+    return BufferLease { owner: owner, bytes: state.data, byteLength: state.byteLength,
+      capacity: state.physicalCapacity }
+  }
+  if state.shared || !owned { invariant() }
+  let layout = Layout.of<SharedBacking>()
+  let size = layout.bytes
+  let allocation = run Allocator.allocate(move layout)
+  let mut metadata = unsafe RawBuffer.from<u8>(move allocation, size)
+  let owner = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut SharedBacking>(unsafe pointer(&mut metadata))
+  let mut mutable = ()
+  let selected = unsafe HeapCell.payloadMut<BufferData, ()>(&mut mutable, unsafe payload(object))
+  let backing = Intrinsic.replace(selected.backing, Backing.Empty) drop selected
+  let mut bytes = match move backing {
+    Backing.Owned { bytes } => move bytes
+    _ => invariant()
+  }
+  let data = unsafe pointer(&mut bytes)
+  let capacity = usize.toU32(RawBuffer.count<u8>(&bytes))
+  unsafe Pointer.put<SharedBacking>(owner, SharedBacking { references: 2, bytes: move bytes,
+    metadata: Option<Intrinsic.RawBuffer<u8>>.some(move metadata) })
+  let published = unsafe HeapCell.payloadMut<BufferData, ()>(&mut mutable, unsafe payload(object))
+  published.backing = Backing.Shared { owner: owner }
+  published.state.data = data published.state.physicalCapacity = capacity drop published
+  unsafe refresh(object)
+  return BufferLease { owner: owner, bytes: data, byteLength: state.byteLength, capacity: capacity }
+}
+unsafe fn putPayload(object: *mut HeapHeader, reference: *mut HeapHeader, shared: bool) -> () {
+  let mut anchor = () let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, object)
+  let mut family = ObjectPayloadFamily.ArrayBuffer if shared { family = ObjectPayloadFamily.SharedArrayBuffer }
+  p.payload = ObjectPayload.Opaque { family: family, reference: reference }
+}
+/// Creates native storage after CreateFromConstructor, preserving source observable ordering.
+pub unsafe effect fn create<H: HeapHooks + CoercionHooks + BufferHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, newTarget: Value,
+  length: u64, maximum: Option<u64>, shared: bool) -> Value ! JsException ? &mut Allocator {
+  return run unsafe createExternal(&mut hooks, memory, context, newTarget, length, move maximum,
+    shared, Pointer.null<u8>(), Option<NativeFunctionId>.none(), Pointer.null<u8>(), true)
+}
+unsafe effect fn createBufferObject<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, newTarget: Value,
+  length: u64, maximum: Option<u64>, shared: bool, external: bool) -> Value ! JsException ? &mut Allocator {
+  let mut class = classes.JS_CLASS_ARRAY_BUFFER if shared { class = classes.JS_CLASS_SHARED_ARRAY_BUFFER }
+  let object = run unsafe constructors.createFromConstructor(&mut hooks, memory, context, newTarget, class)
+  let rt = unsafe runtime.contextRuntime(context)
+  let mut max: i64 = -1
+  match move maximum { Option<u64>.Some { value } => { if value <= 2147483647 { max = u64.toI64(value) } else { max = 2147483648 } } _ => () }
+  if length > 2147483647 || max > 2147483647 {
+    let mut message: &[u8] = b"invalid array buffer length" if length <= 2147483647 { message = b"invalid max array buffer length" }
+    let pending = run Effect.catch<JsException>(unsafe hooks.throwError(context, NativeErrorKind.Range, message), core.exceptionValue)
+    unsafe gc.release(&mut hooks, rt, object) fail JsException {}
+  }
+  let mut capacity: u32 = 0
+  if shared {
+    capacity = u64.toU32(length)
+    if max >= 0 { capacity = i64.toU32(max) }
+    if capacity == 0 { capacity = 1 }
+  }
+  let made = run Effect.result(HeapCell.allocate<BufferData>(HeapKind.Auxiliary, BufferData {
+    state: BufferState { data: Pointer.null<u8>(), byteLength: u64.toU32(length), maxByteLength: max,
+      detached: false, shared: shared, external: external, physicalCapacity: capacity },
+    backing: Backing.Empty, externalPins: 0, first: Pointer.null<HeapHeader>(), last: Pointer.null<HeapHeader>() }))
+  let cell = match move made {
+    Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value
+    Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => {
+      let pending = run Effect.catch<JsException>(unsafe core.materialize(&mut hooks, context, move error), core.exceptionValue)
+      unsafe gc.release(&mut hooks, rt, object) fail JsException {}
+    }
+  }
+  unsafe putPayload(core.reference(object), cell, shared)
+  return object
+}
+/// If allocate is false, ownership transfers only on success. External resizable
+/// memory is rejected, as in the embedding API. allocate=true copies optional data.
+pub unsafe effect fn createExternal<H: HeapHooks + CoercionHooks + BufferHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, newTarget: Value,
+  length: u64, maximum: Option<u64>, shared: bool, data: ?*mut u8,
+  free: Option<NativeFunctionId>, opaque: ?*mut u8, allocate: bool) -> Value ! JsException ? &mut Allocator {
+  let hasMaximum = match &maximum { Option<u64>.Some { .. } => true _ => false }
+  if !allocate && !Pointer.isNull<u8>(data) && hasMaximum {
+    return run unsafe hooks.throwError(context, NativeErrorKind.Internal, b"resizable ArrayBuffers not supported for externally managed buffers")
+  }
+  let object = run unsafe createBufferObject(&mut hooks, memory, context, newTarget,
+    length, move maximum, shared, !allocate)
+  let rt = unsafe runtime.contextRuntime(context)
+  let cell = unsafe payload(core.reference(object))
+  let initialized = run Effect.result(unsafe initializeBacking(&mut hooks, rt, cell, data, move free, opaque, allocate))
+  match move initialized {
+    Result<(), OutOfMemoryError>.Success { .. } => { return object }
+    Result<(), OutOfMemoryError>.Failure { error } => {
+      let pending = run Effect.catch<JsException>(unsafe core.materialize(&mut hooks, context, move error), core.exceptionValue)
+      unsafe gc.release(&mut hooks, rt, object) fail JsException {}
+    }
+  }
+}
+unsafe effect fn initializeBacking<H: BufferHooks>(hooks: &mut H, rt: *mut HeapHeader,
+  cell: *mut HeapHeader, input: ?*mut u8, free: Option<NativeFunctionId>, opaque: ?*mut u8,
+  allocate: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  let anchor = () let initial = unsafe HeapCell.payload<BufferData, ()>(&anchor, cell)
+  let state = initial.state drop initial
+  let runtimeState = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let allocCallback = copyCallback(&runtimeState.sharedArrayBuffers.allocate)
+  let dupCallback = copyCallback(&runtimeState.sharedArrayBuffers.duplicate)
+  let hostOpaque = runtimeState.sharedArrayBuffers.opaque drop runtimeState
+  let mut backing = Backing.Empty let mut data = input
+  if allocate {
+    let mut capacity = state.byteLength
+    if state.shared && state.maxByteLength >= 0 { capacity = i64.toU32(state.maxByteLength) }
+    let hasAllocator = match &allocCallback { Option<NativeFunctionId>.Some { .. } => true _ => false }
+    if state.shared && hasAllocator {
+      let callback = match move allocCallback { Option<NativeFunctionId>.Some { value } => value _ => invariant() }
+      let mut size = u32.toUsize(capacity) if size == 0 { size = 1 }
+      data = run unsafe hooks.allocateShared(rt, callback, hostOpaque, size)
+      if Pointer.isNull<u8>(data) { fail OutOfMemoryError {} }
+      unsafe zero(data, 0, capacity)
+      backing = Backing.HostShared { fallback: Option<NativeFunctionId>.none(), opaque: opaque, defaultFree: true }
+    } else if state.shared {
+      let allocation = run allocateSharedBytes(capacity)
+      data = allocation.data
+      backing = Backing.Shared { owner: allocation.owner }
+    } else {
+      let mut bytes = run allocateBytes(capacity)
+      data = unsafe pointer(&mut bytes)
+      backing = Backing.Owned { bytes: move bytes }
+    }
+    if !Pointer.isNull<u8>(input) { unsafe copy(data, input, state.byteLength) }
+  } else if state.shared {
+    match move dupCallback { Option<NativeFunctionId>.Some { value } => { unsafe hooks.duplicateShared(rt, value, hostOpaque, input) } _ => () }
+    backing = Backing.HostShared { fallback: move free, opaque: opaque, defaultFree: false }
+  } else { backing = Backing.External { callback: move free, opaque: opaque } }
+  let mut mutable = () let p = unsafe HeapCell.payloadMut<BufferData, ()>(&mut mutable, cell)
+  p.state.data = data p.backing = move backing
+}
+unsafe fn releaseBacking<H: BufferHooks>(hooks: &mut H, rt: *mut HeapHeader, backing: Backing, data: ?*mut u8) -> () {
+  match move backing {
+    Backing.External { callback, opaque } => match move callback { Option<NativeFunctionId>.Some { value } => { unsafe hooks.freeExternal(rt, value, opaque, data) } _ => () }
+    Backing.HostShared { fallback, opaque, defaultFree } => {
+      let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+      let callback = copyCallback(&state.sharedArrayBuffers.free) let hostOpaque = state.sharedArrayBuffers.opaque drop state
+      let hasFree = match &callback { Option<NativeFunctionId>.Some { .. } => true _ => false }
+      if hasFree || defaultFree { unsafe hooks.freeShared(rt, move callback, hostOpaque, data) }
+      else { match move fallback { Option<NativeFunctionId>.Some { value } => { unsafe hooks.freeExternal(rt, value, opaque, data) } _ => () } }
+    }
+    Backing.Shared { owner } => { unsafe releaseSharedOwner(owner) }
+    _ => ()
+  }
+}
+pub unsafe fn count(object: *mut HeapHeader) -> u32 {
+  let anchor = () let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  return match &p.payload { ObjectPayload.TypedArray { array } => array.count _ => 0 }
+}
+pub unsafe fn isOutOfBounds(object: *mut HeapHeader) -> bool {
+  let v = unsafe view(object) let b = unsafe snapshot(v.buffer)
+  if b.detached || v.offset > b.byteLength { return true }
+  if v.tracking { return false }
+  if u32.toU64(v.offset) + u32.toU64(v.byteLength) > u32.toU64(b.byteLength) { return true }
+  let id = unsafe classId(Value.Object { reference: object })
+  if id == classes.JS_CLASS_DATAVIEW { return false }
+  return u32.toU64(v.offset) + u64.shiftLeft(u32.toU64(unsafe count(object)), u32.toU64(sizeLog2(id))) > u32.toU64(b.byteLength)
+}
+pub unsafe effect fn initializeView<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: *mut HeapHeader, buffer: Value, offset: u32,
+  byteLength: u32, tracking: bool) -> () ! JsException ? &mut Allocator {
+  let bufferObject = core.reference(buffer)
+  let made = run Effect.result(HeapCell.allocate<ViewData>(HeapKind.Auxiliary, ViewData {
+    state: ViewState { buffer: bufferObject, offset: offset, byteLength: byteLength, tracking: tracking },
+    object: object, previous: Pointer.null<HeapHeader>(), next: Pointer.null<HeapHeader>(), linked: true }))
+  let cell = match move made {
+    Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value
+    Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => {
+      let pending = run Effect.catch<JsException>(unsafe core.materialize(&mut hooks, context, move error), core.exceptionValue)
+      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), buffer) fail JsException {}
+    }
+  }
+  let mut anchor = () let b = unsafe HeapCell.payloadMut<BufferData, ()>(&mut anchor, unsafe payload(bufferObject))
+  let previous = b.last let state = b.state
+  if Pointer.isNull<HeapHeader>(previous) { b.first = cell }
+  b.last = cell drop b
+  if !Pointer.isNull<HeapHeader>(previous) {
+    let p = unsafe HeapCell.payloadMut<ViewData, ()>(&mut anchor, unsafe nonnull(previous)) p.next = cell
+  }
+  let v = unsafe HeapCell.payloadMut<ViewData, ()>(&mut anchor, cell) v.previous = previous drop v
+  let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, object)
+  if p.classId == classes.JS_CLASS_DATAVIEW { p.payload = ObjectPayload.Opaque { family: ObjectPayloadFamily.DataView, reference: cell } }
+  else {
+    let shift = sizeLog2(p.classId)
+    p.payload = ObjectPayload.TypedArray { array: TypedArrayCache { view: cell, cachedData: unsafe dataAt(state.data, offset),
+      count: u32.shiftRight(byteLength, shift), requiresExtensible: tracking || (state.maxByteLength >= 0 && !state.shared), shared: state.physicalCapacity != 0 } }
+  }
+}
+pub unsafe fn refresh(object: *mut HeapHeader) -> () {
+  let cell = unsafe payload(object) let anchor = ()
+  let b = unsafe HeapCell.payload<BufferData, ()>(&anchor, cell)
+  let state = b.state let mut cursor = b.first drop b
+  while !Pointer.isNull<HeapHeader>(cursor) {
+    let node = unsafe nonnull(cursor) let mut a = ()
+    let v = unsafe HeapCell.payloadMut<ViewData, ()>(&mut a, node)
+    cursor = v.next let target = v.object let s = v.state
+    let id = unsafe classId(Value.Object { reference: target })
+    if id == classes.JS_CLASS_DATAVIEW && s.tracking {
+      v.state.byteLength = 0 if state.byteLength > s.offset { v.state.byteLength = state.byteLength - s.offset }
+    }
+    drop v
+    if id != classes.JS_CLASS_DATAVIEW {
+      let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut a, target)
+      match &mut p.payload {
+        ObjectPayload.TypedArray { array } => {
+          array.count = 0 array.cachedData = Pointer.null<u8>()
+          array.shared = state.physicalCapacity != 0
+          if !state.detached {
+            let shift = sizeLog2(id)
+            if s.tracking {
+              if u32.toU64(state.byteLength) >= u32.toU64(s.offset) + u64.shiftLeft(1, u32.toU64(shift)) {
+                array.count = u32.shiftRight(state.byteLength - s.offset, shift) array.cachedData = unsafe dataAt(state.data, s.offset)
+              }
+            } else if u32.toU64(state.byteLength) >= u32.toU64(s.offset) + u32.toU64(s.byteLength) {
+              array.count = u32.shiftRight(s.byteLength, shift) array.cachedData = unsafe dataAt(state.data, s.offset)
+            }
+          }
+        }
+        _ => invariant()
+      }
+    }
+  }
+}
+pub unsafe fn markView(object: *mut HeapHeader, tracer: &mut Tracer) -> () {
+  let anchor = () let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  let optional: ?*mut HeapHeader = match &p.payload { ObjectPayload.TypedArray { array } => array.view
+    ObjectPayload.Opaque { reference, .. } => reference _ => { return () } }
+  if Pointer.isNull<HeapHeader>(optional) { return () }
+  let cell = unsafe nonnull(optional)
+  drop p let v = unsafe HeapCell.payload<ViewData, ()>(&anchor, cell) let buffer = v.state.buffer drop v
+  unsafe tracer.header(buffer)
+}
+pub unsafe fn finalizeView<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, object: *mut HeapHeader) -> () {
+  let mut anchor = () let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, object)
+  let optional: ?*mut HeapHeader = match &p.payload { ObjectPayload.TypedArray { array } => array.view
+    ObjectPayload.Opaque { reference, .. } => reference _ => { return () } }
+  if Pointer.isNull<HeapHeader>(optional) { return () }
+  let cell = unsafe nonnull(optional)
+  p.payload = ObjectPayload.Empty drop p
+  let v = unsafe HeapCell.payload<ViewData, ()>(&anchor, cell)
+  let state = v.state let previous = v.previous let next = v.next let linked = v.linked drop v
+  if linked {
+    if !Pointer.isNull<HeapHeader>(previous) { let prev = unsafe HeapCell.payloadMut<ViewData, ()>(&mut anchor, unsafe nonnull(previous)) prev.next = next }
+    if !Pointer.isNull<HeapHeader>(next) { let after = unsafe HeapCell.payloadMut<ViewData, ()>(&mut anchor, unsafe nonnull(next)) after.previous = previous }
+    let b = unsafe HeapCell.payloadMut<BufferData, ()>(&mut anchor, unsafe payload(state.buffer))
+    if Pointer.isNull<HeapHeader>(previous) { b.first = next }
+    if Pointer.isNull<HeapHeader>(next) { b.last = previous }
+  }
+  unsafe gc.release(&mut hooks, rt, Value.Object { reference: state.buffer })
+  unsafe HeapCell.destroy<ViewData>(cell)
+}
+pub unsafe fn finalizeBuffer<H: BufferHooks>(hooks: &mut H, rt: *mut HeapHeader, object: *mut HeapHeader) -> () {
+  let mut anchor = () let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, object)
+  let optional = match &p.payload { ObjectPayload.Opaque { reference, .. } => reference _ => { return () } }
+  if Pointer.isNull<HeapHeader>(optional) { return () }
+  let cell = unsafe nonnull(optional)
+  p.payload = ObjectPayload.Empty drop p
+  let b = unsafe HeapCell.payloadMut<BufferData, ()>(&mut anchor, cell)
+  let mut cursor = b.first let data = b.state.data let backing = Intrinsic.replace(b.backing, Backing.Empty) drop b
+  while !Pointer.isNull<HeapHeader>(cursor) {
+    let v = unsafe HeapCell.payloadMut<ViewData, ()>(&mut anchor, unsafe nonnull(cursor))
+    cursor = v.next let target = v.object v.next = Pointer.null<HeapHeader>() v.previous = Pointer.null<HeapHeader>() v.linked = false drop v
+    let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, target)
+    match &mut p.payload { ObjectPayload.TypedArray { array } => { array.count = 0 array.cachedData = Pointer.null<u8>() } _ => () }
+  }
+  unsafe releaseBacking(&mut hooks, rt, move backing, data)
+  unsafe HeapCell.destroy<BufferData>(cell)
+}
+/// The caller must not detach an external buffer with active borrowed aliases.
+pub unsafe fn detach<H: BufferHooks>(hooks: &mut H, rt: *mut HeapHeader, value: Value) -> () {
+  if unsafe classId(value) != classes.JS_CLASS_ARRAY_BUFFER { return () }
+  let object = core.reference(value) let mut anchor = ()
+  let p = unsafe HeapCell.payloadMut<BufferData, ()>(&mut anchor, unsafe payload(object))
+  if p.state.detached { return () }
+  if p.externalPins != 0 { invariant() }
+  let data = p.state.data
+  let replacement = match &p.backing { Backing.External { callback, opaque } => Backing.External { callback: copyCallback(&callback), opaque: opaque } _ => Backing.Empty }
+  let backing = Intrinsic.replace(p.backing, move replacement) drop p
+  unsafe releaseBacking(&mut hooks, rt, move backing, data)
+  let detached = unsafe HeapCell.payloadMut<BufferData, ()>(&mut anchor, unsafe payload(object))
+  detached.state.data = Pointer.null<u8>() detached.state.byteLength = 0 detached.state.detached = true
+  detached.state.physicalCapacity = 0 drop detached
+  unsafe refresh(object)
+}
+/// Ordinary growth uses the allocator service's allocate/copy replacement (the
+/// service has no realloc); shrink keeps capacity but clears discarded bytes.
+pub unsafe effect fn resize(object: *mut HeapHeader, length: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+  let cell = unsafe payload(object) let state = unsafe snapshot(object)
+  if state.shared { let mut a = () let p = unsafe HeapCell.payloadMut<BufferData, ()>(&mut a, cell) p.state.byteLength = length drop p unsafe refresh(object) return () }
+  let leaseAnchor = () let leased = unsafe HeapCell.payload<BufferData, ()>(&leaseAnchor, cell)
+  let sharedOwner: ?*mut SharedBacking = match &leased.backing {
+    Backing.Shared { owner } => owner
+    _ => Pointer.null<SharedBacking>()
+  }
+  drop leased
+  if !Pointer.isNull<SharedBacking>(sharedOwner) {
+    let owner = unsafe Intrinsic.pointerRequalify<?*mut SharedBacking, *mut SharedBacking>(sharedOwner)
+    let mut a = () let shared = unsafe Pointer.borrowMut<(), SharedBacking>(&mut a, owner)
+    let refs = Pointer.fromMutRef<usize>(&mut shared.references) drop shared
+    if unsafe Atomic.load<usize>(refs, MemoryOrder.Acquire) == 1 {
+      let SharedBacking { references, bytes, metadata } = unsafe Pointer.take<SharedBacking>(owner)
+      let p = unsafe HeapCell.payloadMut<BufferData, ()>(&mut a, cell)
+      p.backing = Backing.Owned { bytes: move bytes } p.state.physicalCapacity = 0 drop p
+      drop metadata
+      unsafe refresh(object)
+    } else {
+      let mut bytes = run allocateBytes(length) let data = unsafe pointer(&mut bytes)
+      let destination = BufferState { data: data, byteLength: length, maxByteLength: state.maxByteLength,
+        detached: false, shared: false, external: state.external, physicalCapacity: 0 }
+      let mut count = length if state.byteLength < count { count = state.byteLength }
+      unsafe copyBytes(destination, 0, state, 0, count)
+      let p = unsafe HeapCell.payloadMut<BufferData, ()>(&mut a, cell)
+      p.backing = Backing.Owned { bytes: move bytes } p.state.data = data
+      p.state.byteLength = length p.state.physicalCapacity = 0 drop p
+      unsafe releaseSharedOwner(owner) unsafe refresh(object)
+      return ()
+    }
+  }
+  let anchor = () let p = unsafe HeapCell.payload<BufferData, ()>(&anchor, cell)
+  let capacity = match &p.backing { Backing.Owned { bytes } => RawBuffer.count<u8>(&bytes) _ => invariant() } drop p
+  if u32.toUsize(length) <= capacity {
+    if length < state.byteLength { unsafe zero(state.data, length, state.byteLength) }
+    else { unsafe zero(state.data, state.byteLength, length) }
+    let mut a = () let p = unsafe HeapCell.payloadMut<BufferData, ()>(&mut a, cell) p.state.byteLength = length
+  } else {
+    let mut bytes = run allocateBytes(length) let data = unsafe pointer(&mut bytes)
+    unsafe copy(data, state.data, state.byteLength)
+    let mut a = () let p = unsafe HeapCell.payloadMut<BufferData, ()>(&mut a, cell)
+    p.backing = Backing.Owned { bytes: move bytes } p.state.data = data p.state.byteLength = length
+  }
+  unsafe refresh(object)
+}
+/// Moves the backing owner, not its bytes. destination must own an empty native
+/// ArrayBuffer; both objects remain rooted. No callbacks or allocations occur.
+pub unsafe fn moveBacking(source: *mut HeapHeader, destination: *mut HeapHeader) -> () {
+  let mut anchor = () let p = unsafe HeapCell.payloadMut<BufferData, ()>(&mut anchor, unsafe payload(source))
+  if p.externalPins != 0 { invariant() }
+  let replacement = match &p.backing { Backing.External { callback, opaque } => Backing.External { callback: copyCallback(&callback), opaque: opaque } _ => Backing.Empty }
+  let backing = Intrinsic.replace(p.backing, move replacement) let state = p.state
+  p.state.data = Pointer.null<u8>() p.state.byteLength = 0 p.state.detached = true
+  p.state.physicalCapacity = 0 drop p
+  let d = unsafe HeapCell.payloadMut<BufferData, ()>(&mut anchor, unsafe payload(destination))
+  d.backing = move backing d.state.data = state.data d.state.byteLength = state.byteLength
+  d.state.external = state.external d.state.physicalCapacity = state.physicalCapacity drop d
+  unsafe refresh(source)
+}
+
+/// Borrowed native byte span. Any subsequent JS call may detach/reallocate it.
+/// For shared storage the pointer identifies the backing, not permission for
+/// plain byte access: use loadScalar/storeScalar or the shared-aware bulk APIs.
+pub unsafe effect fn getArrayBuffer<H: CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, value: Value) -> BufferState ! JsException ? &mut Allocator {
+  let object = run unsafe requireBuffer(&mut hooks, context, value, -1)
+  let result = unsafe snapshot(object)
+  if result.detached { return run unsafe core.error(&mut hooks, context, b"ArrayBuffer is detached") }
+  return result
+}
+/// Native SAB serialization/embedding clone. The new wrapper has its own source
+/// byteLength while sharing stable memory and a thread-safe backing owner.
+pub unsafe effect fn duplicateShared<H: HeapHooks + CoercionHooks + BufferHooks>(
+  hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader,
+  value: Value) -> Value ! JsException ? &mut Allocator {
+  let source = run unsafe requireBuffer(&mut hooks, context, value, 1)
+  let object = run unsafe constructors.createFromConstructor(&mut hooks, memory, context,
+    Value.Undefined, classes.JS_CLASS_SHARED_ARRAY_BUFFER)
+  let state = unsafe snapshot(source)
+  let allocated = run Effect.result(HeapCell.allocate<BufferData>(HeapKind.Auxiliary,
+    BufferData { state: state, backing: Backing.Empty, externalPins: 0,
+      first: Pointer.null<HeapHeader>(), last: Pointer.null<HeapHeader>() }))
+  let rt = unsafe runtime.contextRuntime(context)
+  let cell = match move allocated {
+    Result<*mut HeapHeader, OutOfMemoryError>.Success { value: pointer } => pointer
+    Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => {
+      let pending = run Effect.catch<JsException>(unsafe core.materialize(&mut hooks, context, move error), core.exceptionValue)
+      unsafe gc.release(&mut hooks, rt, object) fail JsException {}
+    }
+  }
+  let anchor = () let sourceData = unsafe HeapCell.payload<BufferData, ()>(&anchor, unsafe payload(source))
+  let mut backing = match &sourceData.backing {
+    Backing.Shared { owner } => Backing.Shared { owner: owner }
+    Backing.Borrowed => Backing.Borrowed
+    Backing.HostShared { fallback, opaque, defaultFree } => Backing.HostShared { fallback: copyCallback(&fallback), opaque: opaque, defaultFree: defaultFree }
+    Backing.External { callback, opaque } => Backing.External { callback: copyCallback(&callback), opaque: opaque }
+    _ => invariant()
+  }
+  drop sourceData
+  match &backing {
+    Backing.Shared { owner } => { unsafe retainSharedOwner(owner) }
+    Backing.Borrowed => ()
+    _ => {
+      let runtimeState = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+      let callback = copyCallback(&runtimeState.sharedArrayBuffers.duplicate)
+      let opaque = runtimeState.sharedArrayBuffers.opaque drop runtimeState
+      match move callback { Option<NativeFunctionId>.Some { value: duplicateId } => {
+        unsafe hooks.duplicateShared(rt, duplicateId, opaque, state.data)
+      } _ => () }
+    }
+  }
+  let mut a = () let destination = unsafe HeapCell.payloadMut<BufferData, ()>(&mut a, cell)
+  destination.backing = move backing drop destination
+  unsafe putPayload(core.reference(object), cell, true)
+  return object
+}
+/// Creates an independent SAB wrapper without assuming a host transport header.
+pub unsafe effect fn newSharedFromLease<H: HeapHooks + CoercionHooks + BufferHooks>(
+  hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader,
+  lease: &BufferLease) -> Value ! JsException ? &mut Allocator {
+  let object = run unsafe createBufferObject(&mut hooks, memory, context, Value.Undefined,
+    u32.toU64(lease.byteLength), Option<u64>.none(), true, true)
+  unsafe retainSharedOwner(lease.owner)
+  let mut anchor = () let buffer = unsafe HeapCell.payloadMut<BufferData, ()>(&mut anchor, unsafe payload(core.reference(object)))
+  buffer.state.data = lease.bytes buffer.state.physicalCapacity = lease.capacity
+  buffer.backing = Backing.Shared { owner: lease.owner }
+  return object
+}
+/// The caller keeps this eight-byte-aligned allocation alive until every
+/// wrapper and its duplicates have died; all aliases use the same capacity.
+/// A null pointer is permitted only when length is zero.
+pub unsafe effect fn newSharedBorrowed<H: HeapHooks + CoercionHooks>(
+  hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader,
+  data: ?*mut u8, length: u32, capacity: u32) -> Value ! JsException ? &mut Allocator {
+  if capacity == 0 || capacity < length { invariant() }
+  if length != 0 && (Pointer.isNull<u8>(data) || Pointer.address(data) % 8 != 0) { invariant() }
+  let object = run unsafe createBufferObject(&mut hooks, memory, context, Value.Undefined,
+    u32.toU64(length), Option<u64>.none(), true, true)
+  let mut anchor = () let buffer = unsafe HeapCell.payloadMut<BufferData, ()>(&mut anchor, unsafe payload(core.reference(object)))
+  buffer.state.data = data buffer.state.physicalCapacity = capacity buffer.backing = Backing.Borrowed
+  return object
+}
+
+pub unsafe effect fn newArrayBuffer<H: HeapHooks + CoercionHooks + BufferHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, data: ?*mut u8, length: u64,
+  free: Option<NativeFunctionId>, opaque: ?*mut u8, shared: bool) -> Value ! JsException ? &mut Allocator {
+  return run unsafe createExternal(&mut hooks, memory, context, Value.Undefined, length,
+    Option<u64>.none(), shared, data, move free, opaque, false)
+}
+pub unsafe effect fn newArrayBufferCopy<H: HeapHooks + CoercionHooks + BufferHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, data: ?*mut u8,
+  length: u64) -> Value ! JsException ? &mut Allocator {
+  return run unsafe createExternal(&mut hooks, memory, context, Value.Undefined, length,
+    Option<u64>.none(), false, data, Option<NativeFunctionId>.none(), Pointer.null<u8>(), true)
+}

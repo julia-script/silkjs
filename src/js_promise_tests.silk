@@ -1,0 +1,177 @@
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.testing { Testing, AssertionError }
+import silk.result { Result }
+import runtime_memory { RuntimeAllocator }
+import native_stack { currentFrameAddress }
+import js_runtime as runtime
+import js_gc as gc
+import js_array_storage_test_support as storage
+import js_promise_test_support as fixture
+import js_promise_test_support { Hooks }
+import js_string_types { StringLengthError }
+import js_exceptions { JsException }
+import js_exceptions as exceptions
+import js_promise as promises
+import js_runtime_jobs as jobs
+import js_value { Value }
+import js_errors_test_support { FaultAllocator }
+
+effect fn scenario(operation: u32, mode: u32) -> [u32; 16]
+  ! OutOfMemoryError | StringLengthError | JsException | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider()) let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut memory)
+  let context = run unsafe storage.context(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make(&observer)
+  run unsafe fixture.prepare(&mut hooks, context) |> Effect.provideMut<Allocator>(&mut memory)
+  let record = run unsafe fixture.runCase(&mut hooks, context, operation, mode) |> Effect.provideMut<Allocator>(&mut memory)
+  unsafe gc.releaseHeader(&mut hooks, rt, context) run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observer.stats().usedBytes == 0 && observer.stats().allocationCount == 0,
+    "Promise reactions, resolving records, queued realms, captures and cycles leave no allocation owners")
+  return record
+}
+
+test effect fn promiseFirstSettlementWinsAcrossExecutorThrowAndThenableJobs() -> ()
+  ! OutOfMemoryError | StringLengthError | JsException | AssertionError<'static> {
+  let direct = run scenario(0, 0)
+  run Testing.expect(direct[2] == 2 && direct[3] == 41 && direct[8] == 0,
+    "executor resolve wins over its subsequent reject and thrown completion")
+  let thenable = run scenario(2, 0) let rejected = run scenario(2, 1)
+  run Testing.expect(thenable[1] == 1 && thenable[2] == 2 && thenable[3] == 41 && thenable[11] == 1,
+    "thenable callback runs only as a native queued job and shares the already-resolved flag")
+  run Testing.expect(rejected[2] == 3 && rejected[3] == 41,
+    "reversing the first callback reverses settlement; a later resolve cannot overwrite rejection")
+  let selfResolved = run scenario(3, 0)
+  run Testing.expect(selfResolved[2] == 3 && selfResolved[3] == 104, "self-resolution rejects with a TypeError, not an unresolved cycle")
+}
+
+test effect fn promiseReactionQueueReentrancyAndRejectionTracking() -> ()
+  ! OutOfMemoryError | StringLengthError | JsException | AssertionError<'static> {
+  let rejected = run scenario(1, 0)
+  run Testing.expect(rejected[1] == 1 && rejected[2] == 2 && rejected[3] == 42 && rejected[8] == 1 && rejected[9] == 1,
+    "attaching after rejection reports handled exactly once and schedules the handler asynchronously")
+  let ordered = run scenario(4, 0) let nested = run scenario(27, 0)
+  run Testing.expect(ordered[11] == 2 && ordered[6] == 2 && ordered[3] == 42 && nested[11] == 2 && nested[3] == 42,
+    "two pending reactions execute once even when the first callback executes the next job reentrantly")
+  let thrown = run scenario(20, 0) let absent = run scenario(25, 0)
+  run Testing.expect(thrown[2] == 3 && thrown[3] == 707 && absent[2] == 2 && absent[3] == 41,
+    "reaction exceptions reject downstream while non-callable fulfillment handlers act as identity")
+}
+
+test effect fn promiseCombinatorsPreserveOrderStatusAndKeyedAlreadyCalledRecord() -> ()
+  ! OutOfMemoryError | StringLengthError | JsException | AssertionError<'static> {
+  let all = run scenario(5, 0) let settled = run scenario(6, 1)
+  run Testing.expect(all[2] == 2 && all[4] == 11 && all[5] == 22,
+    "all results retain input order rather than reaction settlement order")
+  run Testing.expect(settled[2] == 2 && settled[4] == 1011 && settled[5] == 2022,
+    "allSettled distinguishes fulfillment value and rejection reason records")
+  let keyed = run scenario(10, 0)
+  run Testing.expect(keyed[2] == 2 && keyed[4] == 1031 && keyed[5] == 1031 && keyed[15] == 1,
+    "allSettledKeyed shares the already-called box across both callbacks and creates a null-prototype result")
+  let empty = run scenario(28, 0)
+  run Testing.expect(empty[2] == 3 && empty[3] == 107, "any of an empty iterator rejects with an AggregateError")
+  let rejected = run scenario(7, 2)
+  run Testing.expect(rejected[2] == 3 && rejected[3] == 107 && rejected[4] == 11 && rejected[5] == 22,
+    "any stores every rejection reason in original input order on AggregateError.errors")
+  let symbols = run scenario(29, 0)
+  run Testing.expect(symbols[2] == 2 && symbols[4] == 11 && symbols[5] == 33 && symbols[13] == 0 && symbols[15] == 1,
+    "keyed collection retains symbol keys and rechecks a snapshotted key deleted by an earlier getter")
+}
+
+test effect fn promiseIteratorClosePreservesOriginalFailure() -> ()
+  ! OutOfMemoryError | StringLengthError | JsException | AssertionError<'static> {
+  let callFails = run scenario(22, 0) let closeThrows = run scenario(22, 1) let nextThrows = run scenario(23, 0)
+  run Testing.expect(callFails[2] == 3 && callFails[3] == 707 && callFails[10] == 1,
+    "resolve callback failure after acquisition closes the iterator before rejecting")
+  run Testing.expect(closeThrows[3] == 707 && closeThrows[10] == 1,
+    "a throwing return method does not replace the original pending error")
+  run Testing.expect(nextThrows[3] == 707 && nextThrows[10] == 0,
+    "source IteratorNext failure rejects without invoking return")
+}
+
+test effect fn promiseFinallyWaitsAndRestoresOrOverridesCompletion() -> ()
+  ! OutOfMemoryError | StringLengthError | JsException | AssertionError<'static> {
+  let fulfilled = run scenario(11, 0) let rejected = run scenario(12, 0) let replaced = run scenario(12, 1)
+  run Testing.expect(fulfilled[1] == 1 && fulfilled[2] == 2 && fulfilled[3] == 41,
+    "finally waits for its PromiseResolve chain and restores the original value")
+  run Testing.expect(rejected[2] == 3 && rejected[3] == 41 && replaced[2] == 3 && replaced[3] == 707,
+    "finally thrower restores a rejection unless the finally callback throws its own error")
+  let attempt = run scenario(13, 0) let pair = run scenario(14, 0)
+  run Testing.expect(attempt[2] == 3 && attempt[3] == 707 && pair[13] == 2 && pair[3] == 61,
+    "try captures a synchronous throw and withResolvers exposes functioning resolving closures")
+}
+
+test effect fn asyncFromSyncAssimilatesValuesAndClosesOnRejectedNext() -> ()
+  ! OutOfMemoryError | StringLengthError | JsException | AssertionError<'static> {
+  let next = run scenario(15, 0) let returned = run scenario(16, 0)
+  run Testing.expect(next[1] == 1 && next[2] == 2 && next[4] == 11 && next[5] == 0,
+    "async next resolves to a fresh iterator result only after the value reaction job")
+  run Testing.expect(returned[2] == 2 && returned[4] == 51 && returned[5] == 1,
+    "missing sync return resolves immediately with the caller value and done true")
+  let missingThrow = run scenario(17, 0) let rejected = run scenario(18, 1)
+  run Testing.expect(missingThrow[2] == 3 && missingThrow[3] == 104 && missingThrow[10] == 1,
+    "missing throw first closes the sync iterator then rejects with TypeError")
+  run Testing.expect(rejected[2] == 3 && rejected[3] == 11 && rejected[10] == 1,
+    "rejected yielded promise closes the sync iterator; close errors preserve the rejection")
+}
+
+test effect fn promiseCustomCapabilityAndSpeciesExceptionsAreSynchronous() -> ()
+  ! OutOfMemoryError | StringLengthError | JsException | AssertionError<'static> {
+  let custom = run scenario(19, 0) let duplicate = run scenario(19, 1) let getter = run scenario(24, 0)
+  run Testing.expect(custom[2] == 2 && custom[3] == 41,
+    "custom constructors receive the real capability executor and return their own promise")
+  run Testing.expect(duplicate[0] == 0 && duplicate[12] == 104 && getter[0] == 0 && getter[12] == 707,
+    "executor reuse and species getter failure throw before returning a downstream promise")
+  let cycle = run scenario(26, 0)
+  run Testing.expect(cycle[2] == 1 && cycle[11] == 0,
+    "a pending promise/resolver cycle stays pending until released and is collected by the scenario ledger")
+}
+
+test effect fn registeredPromiseContinuationsSurviveASealedAllocator() -> ()
+  ! OutOfMemoryError | StringLengthError | JsException | AssertionError<'static> {
+  let mut phase: usize = 0
+  while phase < 2 {
+    let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+    let observer = run memory.observe()
+    let rt = run runtime.allocateRuntimeStorage(currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut memory)
+    let context = run unsafe storage.context(rt) |> Effect.provideMut<Allocator>(&mut memory)
+    let mut hooks = Hooks.make(&observer)
+    run unsafe fixture.prepare(&mut hooks, context) |> Effect.provideMut<Allocator>(&mut memory)
+    let capability = run unsafe promises.newCapability(&mut hooks, &observer, context, Value.Undefined)
+      |> Effect.provideMut<Allocator>(&mut memory)
+    let downstream = run unsafe promises.then(&mut hooks, &observer, context, capability.promise, Value.Undefined, Value.Undefined)
+      |> Effect.provideMut<Allocator>(&mut memory)
+    run unsafe gc.collect(&mut hooks, rt, true) |> Effect.provideMut<Allocator>(&mut memory)
+    let mut resolver = capability.resolve
+    if phase == 1 { resolver = capability.reject }
+    let mut fault = FaultAllocator { parent: move memory, armed: true, remaining: 0, persistent: true, failures: 0 }
+    let settled = run Effect.result(unsafe promises.call(&mut hooks, context, resolver, Value.Undefined, &[Value.Int { value: 41 }]))
+      |> Effect.provideMut<Allocator>(&mut fault)
+    fault.armed = false
+    let mut succeeded = false
+    match move settled {
+      Result<Value, JsException>.Success { value } => { unsafe gc.release(&mut hooks, rt, value) succeeded = true }
+      Result<Value, JsException>.Failure { .. } => ()
+    }
+    let hidden = unsafe exceptions.has(rt)
+    if hidden { let error = unsafe exceptions.take(rt) unsafe gc.release(&mut hooks, rt, error) }
+    let deferred = unsafe promises.state(downstream) == promises.PENDING && unsafe jobs.isJobPending(rt)
+    let dispatched = run unsafe jobs.executePendingJob(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut fault)
+    let value = unsafe promises.result(downstream)
+    let mut expected = promises.FULFILLED
+    if phase == 1 { expected = promises.REJECTED }
+    let delivered = unsafe promises.state(downstream) == expected && value.isNumber() && value.numericValue() == 41.0
+    let finished = !unsafe jobs.isJobPending(rt) && !unsafe exceptions.has(rt)
+    unsafe gc.release(&mut hooks, rt, value) unsafe gc.release(&mut hooks, rt, downstream)
+    unsafe promises.freeCapability(&mut hooks, rt, move capability)
+    unsafe gc.releaseHeader(&mut hooks, rt, context)
+    run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut fault)
+    run Testing.expect(succeeded && !hidden && fault.failures == 0,
+      "settling an existing subscription never allocates or loses its continuation to OOM")
+    run Testing.expect(deferred && dispatched.status == 1 && delivered && finished,
+      "both fulfillment and rejection remain asynchronous and deliver exactly once after GC")
+    run Testing.expect(observer.stats().allocationCount == 0 && observer.stats().usedBytes == 0,
+      "prepared and executed reactions release every captured value and realm")
+    phase = phase + 1
+  }
+}

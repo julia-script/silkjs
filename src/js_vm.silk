@@ -1,0 +1,370 @@
+//! Native JS_CallInternal/constructor dispatch and final-bytecode execution,
+//! quickjs.c:18052-21158,21236-21304. Synchronous frames live on the native stack;
+//! resumable frames borrow their explicit AsyncFrame owner. No C engine is used.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.slice { Slice }
+import silk.u8
+import silk.u16
+import silk.u32
+import silk.i32
+import silk.usize
+import runtime_memory { AllocationObserver }
+import native_stack { currentFrameAddress }
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types { RuntimeState, ContextState, ObjectData, ObjectPayload, FunctionBytecode, StackFrame,
+  AsyncFrame, FrameSlots, NativeFunctionId, NativeErrorKind, JS_CALL_FLAG_CONSTRUCTOR }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_coercion_host { CoercionHooks }
+import js_property_host { OwnPropertyHooks, GetPropertyHooks, HasPropertyHooks, OwnKeysHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_prototype_host { PrototypeHooks }
+import js_interrupt_host { InterruptHooks }
+import js_native_function_host { NativeFunctionHooks }
+import js_call_host { CallHooks }
+import js_error_host { ErrorHooks }
+import js_eval_host { EvalHooks }
+import js_exceptions { JsException }
+import js_exceptions as exceptions
+import js_string_types { StringLengthError }
+import js_bigint { BigIntError }
+import js_vm_state { Machine }
+import js_vm_activation as activation
+import js_vm_primitives as primitiveInstructions
+import js_vm_properties as propertyInstructions
+import js_vm_control as controlInstructions
+import js_vm_factories as factories
+import js_vm_disposal as disposal
+import js_vm_append as spread
+import js_proxy_core as core
+import js_interrupts as interrupts
+import js_backtrace as backtrace
+import js_errors as errors
+import js_iterators as iterators
+import js_boxing as boxing
+import js_constructor_ops as constructors
+import js_prototypes as prototypes
+import js_function_invoke as invoke
+import js_parser_diagnostics { DiagnosticMessage }
+import js_opcode_data as op
+import js_class_data as classes
+
+pub const AWAIT: i32 = 0
+pub const YIELD: i32 = 1
+pub const YIELD_STAR: i32 = 2
+pub const INITIAL_YIELD: i32 = 3
+union Step { Continue, Done { value: Value } }
+fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+effect fn ignoreClose(error: JsException) -> () { drop error }
+unsafe fn previous(runtime: *mut HeapHeader) -> ?*mut StackFrame {
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  return state.currentStackFrame
+}
+unsafe fn classId(value: Value) -> u32 {
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(value))
+  return object.classId
+}
+unsafe fn classCallback(runtime: *mut HeapHeader, id: u32) -> Option<NativeFunctionId> {
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  return match &state.classes.asSlice()[u32.toUsize(id)].call {
+    Option<NativeFunctionId>.Some { value } => Option<NativeFunctionId>.some(value)
+    Option<NativeFunctionId>.None => Option<NativeFunctionId>.none()
+  }
+}
+unsafe effect fn callClass<H: CoercionHooks + NativeFunctionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, function: Value, receiver: Value, argv: &FrameSlots, flags: u32) -> Value
+  ! JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  let id = match move unsafe classCallback(rt, unsafe classId(function)) {
+    Option<NativeFunctionId>.Some { value } => value
+    Option<NativeFunctionId>.None => { return run unsafe core.error(&mut hooks, context, b"not a function") }
+  }
+  let invoked = run Effect.result(unsafe hooks.nativeFlags(id, context, function, receiver, usize.toI32(argv.length()), argv, u32.toI32(flags)))
+  return match move invoked {
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => {
+      if value.isException() { fail JsException {} }
+      return value
+    }
+    Result<Value, OutOfMemoryError | JsException>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error)
+  }
+}
+/// Inputs are borrowed roots. COPY_ARGUMENTS is mandatory for a public call;
+/// callInternal(flags=0) additionally requires exclusive access to argv cells.
+pub unsafe effect fn call<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks
+  + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, function: Value, receiver: Value, argv: &FrameSlots) -> Value
+  ! JsException ? &mut Allocator {
+  return run unsafe callInternal(&mut hooks, memory, context, function, receiver, Value.Undefined, argv, activation.COPY_ARGUMENTS)
+}
+pub unsafe effect fn callInternal<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks
+  + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, function: Value, receiver: Value, newTarget: Value,
+  argv: &FrameSlots, flags: u32) -> Value ! JsException ? &mut Allocator {
+  run unsafe interrupts.poll(&mut hooks, memory, context)
+  if !function.isObject() { return run unsafe core.error(&mut hooks, context, b"not a function") }
+  if unsafe classId(function) != classes.JS_CLASS_BYTECODE_FUNCTION {
+    return run unsafe callClass(&mut hooks, context, function, receiver, argv, flags)
+  }
+  let rt = unsafe runtime.contextRuntime(context)
+  let empty = unsafe Intrinsic.pointerRequalify<[*]mut Value, *mut Value>(unsafe Intrinsic.stackAllocate<Value>(0))
+  let emptyRefs = unsafe Intrinsic.pointerRequalify<[*]mut ?*mut HeapHeader, *mut ?*mut HeapHeader>(unsafe Intrinsic.stackAllocate<?*mut HeapHeader>(0))
+  let description = unsafe activation.describe(function, empty, emptyRefs)
+  let sizes = activation.layout(&description, argv.length(), flags)
+  if unsafe runtime.checkStackOverflow(rt, currentFrameAddress(), sizes.bytes, true) {
+    return run unsafe errors.throwStackOverflow(&mut hooks, memory, context)
+  }
+  let storage = unsafe Intrinsic.pointerRequalify<[*]mut Value, *mut Value>(unsafe Intrinsic.stackAllocate<Value>(sizes.allocationSlots))
+  let prior = unsafe previous(rt)
+  let mut frame = unsafe activation.initialize(&description, &sizes, storage, function, argv, prior)
+  let framePointer = Pointer.fromMutRef<StackFrame>(&mut frame)
+  let mut machine = unsafe activation.machine(&description, rt, context, framePointer, argv, receiver, newTarget, empty, 0, 0)
+  unsafe activation.publish(rt, framePointer)
+  let result = run Effect.result(unsafe dispatch(&mut hooks, memory, &mut machine, false))
+  unsafe activation.release(&mut hooks, &description, &sizes, &machine)
+  unsafe activation.publish(rt, prior)
+  return match move result {
+    Result<Value, JsException>.Success { value } => value
+    Result<Value, JsException>.Failure { error } => { fail move error }
+  }
+}
+pub unsafe effect fn construct<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks
+  + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, function: Value, newTarget: Value, argv: &FrameSlots) -> Value
+  ! JsException ? &mut Allocator {
+  return run unsafe constructInternal(&mut hooks, memory, context, function, newTarget, argv, activation.COPY_ARGUMENTS)
+}
+pub unsafe effect fn constructInternal<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks
+  + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, function: Value, newTarget: Value, argv: &FrameSlots, flags: u32) -> Value
+  ! JsException ? &mut Allocator {
+  run unsafe interrupts.poll(&mut hooks, memory, context)
+  if !function.isObject() { return run unsafe core.error(&mut hooks, context, b"not a function") }
+  if !unsafe boxing.isConstructor(function) { return run unsafe core.throwNotConstructor(&mut hooks, context, function) }
+  let constructorFlags = flags | JS_CALL_FLAG_CONSTRUCTOR
+  if unsafe classId(function) != classes.JS_CLASS_BYTECODE_FUNCTION {
+    return run unsafe callClass(&mut hooks, context, function, newTarget, argv, constructorFlags)
+  }
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(function))
+  let bytecode = match &object.payload { ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode _ => invariant() }
+  drop object
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  let derived = code.isDerivedClassConstructor drop code
+  if derived { return run unsafe callInternal(&mut hooks, memory, context, function, Value.Undefined, newTarget, argv, constructorFlags) }
+  let receiver = run unsafe constructors.createFromConstructor(&mut hooks, memory, context, newTarget, classes.JS_CLASS_OBJECT)
+  let called = run Effect.result(unsafe callInternal(&mut hooks, memory, context, function, receiver, newTarget, argv, constructorFlags))
+  let rt = unsafe runtime.contextRuntime(context)
+  return match move called {
+    Result<Value, JsException>.Success { value } => {
+      if value.isObject() { unsafe gc.release(&mut hooks, rt, receiver) return value }
+      unsafe gc.release(&mut hooks, rt, value) return receiver
+    }
+    Result<Value, JsException>.Failure { error } => { unsafe gc.release(&mut hooks, rt, receiver) fail move error }
+  }
+}
+/// state is a rooted, suspended HeapKind.AsyncFunction. The family caller owns
+/// completion and VarRef detachment; this function only executes and saves PC/SP.
+pub unsafe effect fn resume<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks
+  + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, state: *mut HeapHeader) -> Value ! JsException ? &mut Allocator {
+  run unsafe interrupts.poll(&mut hooks, memory, context)
+  let rt = unsafe runtime.contextRuntime(context)
+  let prior = unsafe previous(rt)
+  let mut anchor = () let suspended = unsafe HeapCell.payloadMut<AsyncFrame, ()>(&mut anchor, state)
+  let receiver = suspended.thisValue let count = i32.toUsize(suspended.argumentCount)
+  let throwing = suspended.throwFlag let framePointer = suspended.frame.address() drop suspended
+  let frame = unsafe Pointer.borrowMut<(), StackFrame>(&mut anchor, framePointer)
+  let pc = match &frame.currentPc { Option<usize>.Some { value } => value _ => invariant() }
+  let sp = match &frame.stackPointer { Option<usize>.Some { value } => value _ => invariant() }
+  let function = frame.currentFunction
+  let empty = unsafe Intrinsic.pointerRequalify<[*]mut Value, *mut Value>(unsafe Intrinsic.stackAllocate<Value>(0))
+  let emptyRefs = unsafe Intrinsic.pointerRequalify<[*]mut ?*mut HeapHeader, *mut ?*mut HeapHeader>(unsafe Intrinsic.stackAllocate<?*mut HeapHeader>(0))
+  let argv = FrameSlots.Borrowed { data: unsafe activation.data(&frame.arguments, empty), length: count }
+  frame.stackPointer = Option<usize>.none() frame.previous = prior drop frame
+  let description = unsafe activation.describe(function, empty, emptyRefs)
+  let mut machine = unsafe activation.machine(&description, rt, context, framePointer, &argv, receiver, Value.Undefined, empty, pc, sp)
+  unsafe activation.publish(rt, framePointer)
+  let result = run Effect.result(unsafe dispatch(&mut hooks, memory, &mut machine, throwing))
+  let saved = unsafe Pointer.borrowMut<(), StackFrame>(&mut anchor, framePointer)
+  saved.currentPc = Option<usize>.some(machine.pc) saved.stackPointer = Option<usize>.some(machine.sp) drop saved
+  unsafe activation.publish(rt, prior)
+  return match move result {
+    Result<Value, JsException>.Success { value } => value
+    Result<Value, JsException>.Failure { error } => { fail move error }
+  }
+}
+unsafe effect fn unwind<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + CallHooks + ErrorHooks>(hooks: &mut H,
+  memory: &AllocationObserver, machine: &mut Machine) -> bool ? &mut Allocator {
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)
+  let error = state.currentException drop state
+  if unsafe backtrace.isNeeded(error) {
+    unsafe machine.publishPc()
+    run unsafe errors.buildBacktrace(&mut hooks, memory, machine.context, error, Option<Value>.none(), 0, 0, 0)
+  }
+  let current = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)
+  let uncatchable = current.currentExceptionIsUncatchable drop current
+  if uncatchable { return false }
+  while machine.sp != 0 {
+    let value = unsafe machine.pop()
+    unsafe gc.release(&mut hooks, machine.runtime, value)
+    match value {
+      Value.CatchOffset { offset } => {
+        if offset == 0 {
+          unsafe gc.release(&mut hooks, machine.runtime, unsafe machine.pop())
+          let closed = run Effect.catch<JsException>(unsafe iterators.close(&mut hooks, machine.context, unsafe machine.top(1), true), ignoreClose)
+        } else {
+          let pending = unsafe exceptions.take(machine.runtime)
+          unsafe machine.push(pending) machine.pc = i32.toUsize(offset) return true
+        }
+      }
+      _ => ()
+    }
+  }
+  return false
+}
+unsafe effect fn dispatch<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks
+  + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
+  memory: &AllocationObserver, machine: &mut Machine, throwing: bool) -> Value ! JsException ? &mut Allocator {
+  if throwing && !run unsafe unwind(&mut hooks, memory, &mut machine) { fail JsException {} }
+  while true {
+    let opcode = unsafe machine.readU8()
+    let executed = run Effect.result(unsafe instruction(&mut hooks, memory, &mut machine, opcode))
+    match move executed {
+      Result<Step, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { value } => {
+        match move value { Step.Continue => () Step.Done { value: result } => { return result } }
+      }
+      Result<Step, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => {
+        let pending = run Effect.catch<JsException>(unsafe core.materialize(&mut hooks, machine.context, move error), core.exceptionValue)
+        if !run unsafe unwind(&mut hooks, memory, &mut machine) { fail JsException {} }
+      }
+    }
+  }
+}
+unsafe fn releaseOperands<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, first: usize) -> () {
+  let mut index = first
+  while index < machine.sp { unsafe gc.release(&mut hooks, machine.runtime, unsafe Pointer.read<Value>(unsafe machine.slot(index))) index = index + 1 }
+  machine.sp = first
+}
+unsafe fn isEval(machine: &Machine, function: Value) -> bool {
+  let anchor = () let context = unsafe HeapCell.payload<ContextState, ()>(&anchor, machine.context)
+  return unsafe core.sameValue(function, context.evalObject)
+}
+unsafe effect fn evaluate<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks
+  + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
+  memory: &AllocationObserver, machine: &Machine, function: Value, argv: &FrameSlots, scope: i32, flags: u32) -> Value
+  ! JsException ? &mut Allocator {
+  if unsafe isEval(machine, function) {
+    let mut input = Value.Undefined if argv.length() != 0 { input = unsafe argv.get(0) }
+    return run unsafe hooks.evaluateObject(machine.context, Value.Undefined, input, 2, scope)
+  }
+  return run unsafe callInternal(&mut hooks, memory, machine.context, function, Value.Undefined, Value.Undefined, argv, flags)
+}
+unsafe effect fn instruction<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks
+  + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
+  memory: &AllocationObserver, machine: &mut Machine, opcode: u8) -> Step
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  if run unsafe primitiveInstructions.step(&mut hooks, memory, &mut machine, opcode) { return Step.Continue }
+  if run unsafe propertyInstructions.step(&mut hooks, memory, &mut machine, opcode) { return Step.Continue }
+  if run unsafe controlInstructions.step(&mut hooks, memory, &mut machine, opcode) { return Step.Continue }
+  if run unsafe factories.step(&mut hooks, memory, &mut machine, opcode) { return Step.Continue }
+  if run unsafe disposal.step(&mut hooks, memory, &mut machine, opcode) { return Step.Continue }
+  if opcode == op.OP_return { return Step.Done { value: unsafe machine.pop() } }
+  if opcode == op.OP_return_undef || opcode == op.OP_return_async { return Step.Done { value: Value.Undefined } }
+  if opcode == op.OP_await { return Step.Done { value: Value.Int { value: AWAIT } } }
+  if opcode == op.OP_yield { return Step.Done { value: Value.Int { value: YIELD } } }
+  if opcode == op.OP_yield_star || opcode == op.OP_async_yield_star { return Step.Done { value: Value.Int { value: YIELD_STAR } } }
+  if opcode == op.OP_initial_yield { return Step.Done { value: Value.Int { value: INITIAL_YIELD } } }
+  if opcode == op.OP_call || opcode == op.OP_tail_call || opcode == op.OP_call_method || opcode == op.OP_tail_call_method
+    || opcode == op.OP_call_constructor || (opcode >= op.OP_call0 && opcode <= op.OP_call3) {
+    let mut count: usize = 0
+    if opcode >= op.OP_call0 && opcode <= op.OP_call3 { count = u8.toUsize(opcode - op.OP_call0) }
+    else { count = u16.toUsize(unsafe machine.readU16()) }
+    let start = machine.sp - count
+    let argv = FrameSlots.Borrowed { data: unsafe machine.slot(start), length: count }
+    let mut receiver = Value.Undefined let mut first = start - 1
+    let mut function = unsafe machine.top(count + 1)
+    if opcode == op.OP_call_method || opcode == op.OP_tail_call_method { receiver = unsafe machine.top(count + 2) first = start - 2 }
+    unsafe machine.publishPc()
+    let mut result = Value.Undefined
+    if opcode == op.OP_call_constructor {
+      let newTarget = function function = unsafe machine.top(count + 2) first = start - 2
+      result = run unsafe constructInternal(&mut hooks, memory, machine.context, function, newTarget, &argv, 0)
+    } else { result = run unsafe callInternal(&mut hooks, memory, machine.context, function, receiver, Value.Undefined, &argv, 0) }
+    if opcode == op.OP_tail_call || opcode == op.OP_tail_call_method { return Step.Done { value: result } }
+    unsafe releaseOperands(&mut hooks, &mut machine, first) unsafe machine.push(result) return Step.Continue
+  }
+  if opcode == op.OP_apply {
+    let magic = u16.toI32(unsafe machine.readU16()) unsafe machine.publishPc()
+    let argv = FrameSlots.Borrowed { data: unsafe machine.slot(machine.sp - 2), length: 2 }
+    let result = run unsafe invoke.apply(&mut hooks, machine.context, unsafe machine.top(3), &argv, magic)
+    let first = machine.sp - 3 unsafe releaseOperands(&mut hooks, &mut machine, first)
+    unsafe machine.push(result) return Step.Continue
+  }
+  if opcode == op.OP_check_ctor_return {
+    let value = unsafe machine.top(1)
+    if !value.isObject() && !core.undefined(value) {
+      return run unsafe hooks.throwError(machine.callerContext, NativeErrorKind.Type, b"derived class constructor must return an object or undefined")
+    }
+    unsafe machine.push(Value.Bool { value: !value.isObject() }) return Step.Continue
+  }
+  if opcode == op.OP_check_ctor || opcode == op.OP_init_ctor {
+    if opcode == op.OP_init_ctor { unsafe machine.publishPc() }
+    if core.undefined(machine.newTarget) { return run unsafe core.error(&mut hooks, machine.context, b"class constructors must be invoked with 'new'") }
+    if opcode == op.OP_init_ctor {
+      let fetched = run Effect.result(unsafe prototypes.getPrototype(&mut hooks, machine.context, machine.function))
+      let prototype = match move fetched {
+        Result<Value, OutOfMemoryError | JsException>.Success { value } => value
+        Result<Value, OutOfMemoryError | JsException>.Failure { error } => run unsafe core.materialize(&mut hooks, machine.context, move error)
+      }
+      let anchor = () let argv = unsafe Pointer.borrow<(), FrameSlots>(&anchor, machine.originalArguments)
+      let called = run Effect.result(unsafe construct(&mut hooks, memory, machine.context, prototype, machine.newTarget, argv))
+      unsafe gc.release(&mut hooks, machine.runtime, prototype)
+      match move called {
+        Result<Value, JsException>.Success { value } => { unsafe machine.push(value) }
+        Result<Value, JsException>.Failure { error } => { fail move error }
+      }
+    }
+    return Step.Continue
+  }
+  if opcode == op.OP_eval {
+    let count = u16.toUsize(unsafe machine.readU16()) let scope = u16.toI32(unsafe machine.readU16()) - 2
+    let start = machine.sp - count
+    let argv = FrameSlots.Borrowed { data: unsafe machine.slot(start), length: count }
+    unsafe machine.publishPc()
+    let result = run unsafe evaluate(&mut hooks, memory, &machine, unsafe machine.top(count + 1), &argv, scope, 0)
+    unsafe releaseOperands(&mut hooks, &mut machine, start - 1) unsafe machine.push(result) return Step.Continue
+  }
+  if opcode == op.OP_apply_eval {
+    let scope = u16.toI32(unsafe machine.readU16()) - 2 unsafe machine.publishPc()
+    let mut arguments = run unsafe invoke.buildArgList(&mut hooks, machine.context, unsafe machine.top(1))
+    let argv = arguments.view()
+    let called = run Effect.result(unsafe evaluate(&mut hooks, memory, &machine, unsafe machine.top(2), &argv, scope, activation.COPY_ARGUMENTS))
+    drop argv unsafe invoke.freeArgList(&mut hooks, machine.context, move arguments)
+    let result = match move called {
+      Result<Value, JsException>.Success { value } => value
+      Result<Value, JsException>.Failure { error } => { fail move error }
+    }
+    let first = machine.sp - 2 unsafe releaseOperands(&mut hooks, &mut machine, first) unsafe machine.push(result) return Step.Continue
+  }
+  if opcode == op.OP_import {
+    unsafe machine.publishPc()
+    let result = run unsafe hooks.dynamicImport(machine.context, unsafe machine.top(2), unsafe machine.top(1))
+    let first = machine.sp - 2 unsafe releaseOperands(&mut hooks, &mut machine, first) unsafe machine.push(result) return Step.Continue
+  }
+  if opcode == op.OP_append { run unsafe spread.execute(&mut hooks, memory, &mut machine) return Step.Continue }
+  let mut message = DiagnosticMessage.make() message.append(b"invalid opcode: pc=")
+  let mut digits: [u8; 10] = [0; 10] let mut at: usize = 10 let mut position = usize.toU32(machine.pc - 1)
+  while true {
+    at = at - 1 digits[at] = 48 + u32.toU8(position % 10) position = position / 10
+    if position == 0 { break }
+  }
+  message.append(Slice.view(&digits, at, 10 - at)) message.append(b" opcode=0x")
+  let hex = b"0123456789abcdef" let encoded = [hex[u8.toUsize(opcode / 16)], hex[u8.toUsize(opcode % 16)]]
+  message.append(&encoded)
+  return run unsafe hooks.throwError(machine.context, NativeErrorKind.Internal, message.bytes())
+}

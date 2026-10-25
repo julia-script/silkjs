@@ -1,0 +1,190 @@
+//! Module namespace shape and lazy live bindings, pinned quickjs.c:31047-31308.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.list { List }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.result { Result }
+import silk.u32
+import silk.i32
+import silk.usize
+import silk.ownership { Copy }
+import runtime_memory { AllocationObserver }
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types { ModuleDef, ExportBinding, RuntimeState, ObjectData, PropertySlot, AutoInitKind, AutoInitOpaque,
+  NativeErrorKind, JS_PROP_ENUMERABLE, JS_PROP_WRITABLE, JS_PROP_VARREF }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_module_resolver as resolver
+import js_module_resolver { Resolution, ResolveFailure }
+import js_object_allocate as objects
+import js_shapes as shapes
+import js_property_mutations as properties
+import js_auto_init { InitializedProperty }
+import js_coercion_host { CoercionHooks }
+import js_exceptions { JsException }
+import js_string_types { StringLengthError, StringOwner }
+import js_atoms { AtomTable }
+import js_atom_data as atoms
+import js_class_data as classes
+
+struct ExportedName { atom: u32, localIndex: i32 }
+impl Copy for ExportedName {}
+fn trap() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+fn node(value: Value) -> *mut HeapHeader { return match value { Value.Object { reference } => reference _ => trap() } }
+unsafe effect fn names(module: *mut HeapHeader, fromStar: bool, visited: &mut List<*mut HeapHeader>,
+  result: &mut List<ExportedName>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut index: usize = 0
+  while index < visited.length() { if Pointer.address<HeapHeader>(visited.get(index)) == Pointer.address<HeapHeader>(module) { return () } index = index + 1 }
+  run visited.append(module)
+  let anchor = () let data = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, module)
+  let exports = data.exports.length() let stars = data.starExports.length() drop data
+  index = 0
+  while index < exports {
+    let exported = unsafe resolver.entry(module, index) let name = exported.exportName
+    if !fromStar || name != atoms.JS_ATOM_default {
+      let mut cursor: usize = 0
+      while cursor < result.length() && result.get(cursor).atom != name { cursor = cursor + 1 }
+      if cursor == result.length() {
+        let mut localIndex: i32 = -1
+        if !fromStar {
+          match exported.binding { ExportBinding.Local { .. } => { localIndex = usize.toI32(index) } _ => () }
+        }
+        run result.append(ExportedName { atom: name, localIndex: localIndex })
+      } else {
+        let mut duplicate = result.get(cursor) duplicate.localIndex = -1 result.set(cursor, duplicate)
+      }
+    }
+    index = index + 1
+  }
+  index = 0
+  while index < stars {
+    let current = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, module)
+    let request = current.starExports.get(index).requestedModuleIndex drop current
+    run unsafe names(unsafe resolver.dependency(module, request), true, &mut visited, &mut result) index = index + 1
+  }
+}
+fn sift(table: &AtomTable, names: &mut List<ExportedName>, start: usize, end: usize) -> () {
+  let mut root = start
+  while root < end / 2 {
+    let mut child = root * 2 + 1
+    if child + 1 < end && table.compareStrings(names.get(child).atom, names.get(child + 1).atom) < 0 { child = child + 1 }
+    if table.compareStrings(names.get(root).atom, names.get(child).atom) >= 0 { return () }
+    let old = names.get(root) let replacement = names.get(child)
+    names.set(root, replacement) names.set(child, old) root = child
+  }
+}
+unsafe fn sortNames(rtHeader: *mut HeapHeader, names: &mut List<ExportedName>) -> () {
+  let anchor = () let rt = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rtHeader)
+  let count = names.length() let mut start = count / 2
+  while start > 0 { start = start - 1 sift(&rt.atoms, &mut names, start, count) }
+  let mut end = count
+  while end > 1 {
+    end = end - 1 let old = names.get(0) let replacement = names.get(end)
+    names.set(0, replacement) names.set(end, old)
+    sift(&rt.atoms, &mut names, 0, end)
+  }
+}
+unsafe effect fn install<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, object: Value,
+  atom: u32, flags: u32, slot: PropertySlot) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node(object))
+  let added = run unsafe shapes.addProperty(rt, &mut data, atom, u32.toU8(flags))
+  data.properties.set(added.index, slot) drop data
+  unsafe gc.releaseOptional(&mut hooks, rt, added.retiredShape)
+}
+unsafe effect fn fill<H: HeapHooks + CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  module: *mut HeapHeader, object: Value) -> () ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  let mut visited = List<*mut HeapHeader>.make() let mut exported = List<ExportedName>.make()
+  run unsafe names(module, false, &mut visited, &mut exported)
+  drop visited
+  unsafe sortNames(rt, &mut exported)
+  let mut index: usize = 0
+  while index < exported.length() {
+    let current = exported.get(index) let name = current.atom
+    let mut resolved = Resolution.Found { module: module, index: 0 }
+    if current.localIndex >= 0 { resolved = Resolution.Found { module: module, index: i32.toUsize(current.localIndex) } }
+    else { resolved = run unsafe resolver.resolveExport(module, name) }
+    match resolved {
+      Resolution.Missing { reason: ResolveFailure.Ambiguous } => ()
+      Resolution.Missing { reason } => { return run unsafe resolver.throwResolution(&mut hooks, context, module, name, reason) }
+      Resolution.Found { module: target, index: slot } => {
+        let entry = unsafe resolver.entry(target, slot)
+        let mut cell = Pointer.null<HeapHeader>()
+        if entry.localName != atoms.JS_ATOM__star_ { cell = unsafe resolver.binding(target, entry) }
+        if Pointer.isNull<HeapHeader>(cell) {
+          let installed = run unsafe properties.defineAutoInitProperty(&mut hooks, context, object, name,
+            AutoInitKind.ModuleNamespace, AutoInitOpaque.Heap { reference: module }, JS_PROP_ENUMERABLE | JS_PROP_WRITABLE)
+        } else {
+          let reference = resolver.present(cell)
+          run unsafe install(&mut hooks, rt, object, name, JS_PROP_ENUMERABLE | JS_PROP_WRITABLE | JS_PROP_VARREF,
+            PropertySlot.VarRef { reference: reference })
+          unsafe HeapCell.retain(reference)
+        }
+      }
+    }
+    index = index + 1
+  }
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let mut tag = StringOwner.adopt(run state.atoms.toValue(atoms.JS_ATOM_Module, true)) drop state
+  run unsafe install(&mut hooks, rt, object, atoms.JS_ATOM_Symbol_toStringTag, 0, PropertySlot.Value { value: tag.get() })
+  let transferred = tag.take()
+  let mut changedAnchor = () let changed = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut changedAnchor, node(object))
+  changed.extensible = false
+}
+pub unsafe effect fn getNamespace<H: HeapHooks + CoercionHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, module: *mut HeapHeader) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let mut anchor = () let source = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, module)
+  let cached = source.namespace drop source
+  if cached.tag() != 3 { return unsafe cached.retained() }
+  let object = run unsafe objects.withPrototypeClass(&mut hooks, memory, context, Value.Null, classes.JS_CLASS_MODULE_NS)
+  let filled = run Effect.result(unsafe fill(&mut hooks, context, module, object))
+  match move filled {
+    Result<(), OutOfMemoryError | StringLengthError | JsException>.Success { .. } => ()
+    Result<(), OutOfMemoryError | StringLengthError | JsException>.Failure { error } => {
+      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), object) fail move error
+    }
+  }
+  let changed = unsafe HeapCell.payloadMut<ModuleDef, ()>(&mut anchor, module) changed.namespace = object
+  return unsafe object.retained()
+}
+/// HasProperty is the sole namespace exotic callback: no TDZ read or lazy init.
+pub unsafe fn hasProperty(object: Value, atom: u32) -> bool {
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node(object))
+  return match unsafe shapes.lookup(data.shape, atom) { Option<usize>.Some { .. } => true _ => false }
+}
+unsafe effect fn initialize<H: HeapHooks + CoercionHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, module: *mut HeapHeader, atom: u32) -> InitializedProperty
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let resolved = run unsafe resolver.resolveExport(module, atom)
+  return match resolved {
+    Resolution.Missing { reason } => { return run unsafe resolver.throwResolution(&mut hooks, context, module, atom, reason) }
+    Resolution.Found { module: target, index } => {
+      let entry = unsafe resolver.entry(target, index)
+      if entry.localName == atoms.JS_ATOM__star_ {
+        let request = match entry.binding { ExportBinding.Indirect { requestedModuleIndex } => requestedModuleIndex _ => trap() }
+        let value = run unsafe getNamespace(&mut hooks, memory, context, unsafe resolver.dependency(target, request))
+        return InitializedProperty.Value { value: value }
+      }
+      return InitializedProperty.Binding { reference: resolver.present(unsafe resolver.binding(target, entry)) }
+    }
+  }
+}
+/// AutoInitHooks dispatch uses this directly; the realm/object root is held by its caller.
+pub unsafe effect fn initializeProperty<H: HeapHooks + CoercionHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, module: *mut HeapHeader, atom: u32) -> InitializedProperty ! JsException ? &mut Allocator {
+  let result = run Effect.result(unsafe initialize(&mut hooks, memory, context, module, atom))
+  return match move result {
+    Result<InitializedProperty, OutOfMemoryError | StringLengthError | JsException>.Success { value } => move value
+    Result<InitializedProperty, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => {
+      match move error {
+        JsException signal => { fail move signal }
+        OutOfMemoryError allocation => { return run unsafe hooks.throwOutOfMemory(context) }
+        StringLengthError length => { return run unsafe hooks.throwError(context, NativeErrorKind.Internal, b"string too long") }
+      }
+    }
+  }
+}

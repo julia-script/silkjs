@@ -1,0 +1,195 @@
+//! JS_SetObjectData and JS_ToObject/JS_ToObjectFree, quickjs.c:5913-5937,
+//! 40733-40787. Boxed strings contain flat text, never a rope.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.usize
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types { ObjectData, ObjectPayload, NativeErrorKind }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_class_data as classes
+import js_atom_data as atoms
+import js_object_allocate as objects
+import js_coercions as coercions
+import js_coercion_host { CoercionHooks }
+import js_property_host { OwnPropertyHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_property_mutations as properties
+import js_string_types { StringLengthError }
+import js_strings { Strings }
+import js_bigint { BigIntError }
+import js_exceptions { JsException }
+import runtime_memory { AllocationObserver }
+
+fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+fn boxedClass(classId: u32) -> bool {
+  return classId == classes.JS_CLASS_NUMBER || classId == classes.JS_CLASS_STRING
+    || classId == classes.JS_CLASS_BOOLEAN || classId == classes.JS_CLASS_SYMBOL
+    || classId == classes.JS_CLASS_DATE || classId == classes.JS_CLASS_BIG_INT
+}
+
+// Consumes data on every exit. The caller keeps object/context live; String-class
+// data must be a flat string. A pre-existing Exception preserves its pending error.
+pub unsafe effect fn setObjectData<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value, data: Value) -> () ! JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  match object {
+    Value.Object { reference } => {
+      let anchor = ()
+      let before = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+      if boxedClass(before.classId) {
+        let previous = match &before.payload {
+          ObjectPayload.Boxed { value } => value
+          _ => invariant()
+        }
+        drop before
+        unsafe gc.release(&mut hooks, rt, previous)
+        let mut freshAnchor = ()
+        let fresh = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut freshAnchor, reference)
+        fresh.payload = ObjectPayload.Boxed { value: data }
+        return ()
+      }
+    }
+    _ => ()
+  }
+  unsafe gc.release(&mut hooks, rt, data)
+  if object.isException() { fail JsException {} }
+  return run unsafe hooks.throwError(context, NativeErrorKind.Type, b"invalid object type")
+}
+
+// Source boxing materializes errors before dropping its temporary flat string or
+// consuming input. BigInt conversion is unreachable for the fresh String length.
+unsafe effect fn materialize<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  error: OutOfMemoryError | StringLengthError | BigIntError | JsException) -> Value
+  ! JsException ? &mut Allocator {
+  match move error {
+    OutOfMemoryError allocation => { return run unsafe hooks.throwOutOfMemory(context) }
+    StringLengthError length => { return run unsafe hooks.throwError(context, NativeErrorKind.Internal, b"string too long") }
+    BigIntError impossible => invariant()
+    JsException signal => { fail move signal }
+  }
+}
+effect fn exceptionValue(error: JsException) -> Value { drop error return Value.Exception }
+unsafe effect fn allocate<H: HeapHooks + CoercionHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, classId: u32) -> Value ! JsException ? &mut Allocator {
+  let result = run Effect.result(unsafe objects.withClass(&mut hooks, memory, context, classId))
+  return match move result {
+    Result<Value, OutOfMemoryError>.Success { value } => value
+    Result<Value, OutOfMemoryError>.Failure { error } => run unsafe hooks.throwOutOfMemory(context)
+  }
+}
+unsafe effect fn install<H: HeapHooks + CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  object: Value, data: Value) -> Value ! JsException ? &mut Allocator {
+  let installed = run Effect.result(unsafe setObjectData(&mut hooks, context, object, data))
+  match move installed {
+    Result<(), JsException>.Success { .. } => { return object }
+    Result<(), JsException>.Failure { error } => {
+      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), object)
+      fail move error
+    }
+  }
+}
+unsafe effect fn flatObject<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(
+  hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, flat: Value) -> Value
+  ! JsException ? &mut Allocator {
+  let object = run unsafe allocate(&mut hooks, memory, context, classes.JS_CLASS_STRING)
+  let length = Value.Int { value: usize.toI32(Strings.length(flat)) }
+  let defined = run Effect.result(unsafe properties.definePropertyValue(&mut hooks, context,
+    object, atoms.JS_ATOM_length, length, 0))
+  match move defined {
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { .. } => ()
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => {
+      // Upstream ignores this result: the box survives, with the error pending.
+      let ignored = run Effect.catch<JsException>(unsafe materialize(&mut hooks, context, move error), exceptionValue)
+    }
+  }
+  return run unsafe install(&mut hooks, context, object, unsafe flat.retained())
+}
+unsafe effect fn stringObject<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(
+  hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, input: Value) -> Value
+  ! JsException ? &mut Allocator {
+  // JS_ToString duplicates a rope before linearizing it. Keep that owner alive
+  // through pending-error construction, then release it before ToObjectFree's input.
+  let mut linearizationOwner = Value.Undefined
+  if input.tag() == -6 { linearizationOwner = unsafe input.retained() }
+  let converted = run Effect.result(unsafe coercions.toString(&mut hooks, context, input))
+  let normalized = match move converted {
+    Result<Value, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { value } =>
+      Result<Value, JsException>.Success { value: value }
+    Result<Value, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } =>
+      run Effect.result(unsafe materialize(&mut hooks, context, move error))
+  }
+  unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), linearizationOwner)
+  let flat = match move normalized {
+    Result<Value, JsException>.Success { value } => value
+    Result<Value, JsException>.Failure { error } => { fail move error }
+  }
+  let result = run Effect.result(unsafe flatObject(&mut hooks, memory, context, flat))
+  unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), flat)
+  return match move result {
+    Result<Value, JsException>.Success { value } => value
+    Result<Value, JsException>.Failure { error } => { fail move error }
+  }
+}
+
+// Borrows input. Object identity and the Exception sentinel pass through; null,
+// undefined and internal non-JavaScript tags throw rather than manufacture boxes.
+pub unsafe effect fn toObject<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(
+  hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, value: Value) -> Value
+  ! JsException ? &mut Allocator {
+  if value.isObject() || value.isException() { return unsafe value.retained() }
+  if value.isString() { return run unsafe stringObject(&mut hooks, memory, context, value) }
+  let classId = match value {
+    Value.BigInt { .. } => classes.JS_CLASS_BIG_INT
+    Value.ShortBigInt { .. } => classes.JS_CLASS_BIG_INT
+    Value.Int { .. } => classes.JS_CLASS_NUMBER
+    Value.Float64 { .. } => classes.JS_CLASS_NUMBER
+    Value.Bool { .. } => classes.JS_CLASS_BOOLEAN
+    Value.Symbol { .. } => classes.JS_CLASS_SYMBOL
+    _ => { return run unsafe hooks.throwError(context, NativeErrorKind.Type, b"cannot convert to object") }
+  }
+  let object = run unsafe allocate(&mut hooks, memory, context, classId)
+  return run unsafe install(&mut hooks, context, object, unsafe value.retained())
+}
+pub unsafe effect fn toObjectFree<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(
+  hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, value: Value) -> Value
+  ! JsException ? &mut Allocator {
+  let result = run Effect.result(unsafe toObject(&mut hooks, memory, context, value))
+  unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), value)
+  return match move result {
+    Result<Value, JsException>.Success { value: output } => output
+    Result<Value, JsException>.Failure { error } => { fail move error }
+  }
+}
+
+pub unsafe fn isConstructor(value: Value) -> bool {
+  match value {
+    Value.Object { reference } => {
+      let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+      return object.isConstructor
+    }
+    _ => { return false }
+  }
+}
+pub unsafe fn setConstructorBit(value: Value, flag: bool) -> bool {
+  match value {
+    Value.Object { reference } => {
+      let mut anchor = () let object = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, reference)
+      object.isConstructor = flag
+      return true
+    }
+    _ => { return false }
+  }
+}
+pub unsafe fn isError(value: Value) -> bool {
+  match value {
+    Value.Object { reference } => {
+      let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+      return object.classId == classes.JS_CLASS_ERROR
+    }
+    _ => { return false }
+  }
+}

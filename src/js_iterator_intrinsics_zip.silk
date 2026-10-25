@@ -1,0 +1,540 @@
+//! Iterator.zip/zipKeyed storage and algorithms, pinned quickjs.c:45425-46015.
+//! Inputs borrow; iterator records and padding own their values. Close order is reversed.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.list { List }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.result { Result }
+import silk.usize
+import runtime_memory { AllocationObserver }
+import silk.u8
+import utf8 { Utf8 }
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_value { Value }
+import js_core_types { ObjectData, ObjectPayload, ObjectPayloadFamily, RuntimeState, FrameSlots, PropertyEnum, PropertyDescriptor, NativeErrorKind, JS_PROP_ENUMERABLE, JS_PROP_C_W_E }
+import js_gc { HeapHooks, Tracer }
+import js_gc as gc
+import js_runtime as runtime
+import js_class_data as classes
+import js_atom_data as atoms
+import js_atoms { ATOM_INTEGER_TAG }
+import js_coercion_host { CoercionHooks }
+import js_property_host { OwnKeysHooks, OwnPropertyHooks, GetPropertyHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_call_host { CallHooks }
+import js_native_function_host { NativeFunctionHooks, NativeIteratorResult }
+import js_exceptions { JsException }
+import js_string_types { StringLengthError }
+import js_strings { Strings }
+import js_property_names { OwnKeysError, JS_GPN_STRING_MASK, JS_GPN_SYMBOL_MASK }
+import js_property_names as names
+import js_property_ownership { releaseDescriptor }
+import js_property_get as properties
+import js_object_allocate as objects
+import js_collection_support as owners
+import js_collection_support { Scope }
+import js_proxy_core as core
+import js_iterator_intrinsics_support as support
+
+const OPEN: u8 = 0
+const CLOSED: u8 = 1
+const EXHAUSTED: u8 = 2
+const SHORTEST: i32 = 0
+const LONGEST: i32 = 1
+const STRICT: i32 = 2
+struct Data {
+  iters: List<Value>, nexts: List<Value>, padding: List<Value>, keys: List<u32>, state: List<u8>,
+  count: usize, capacity: usize, mode: i32, keyed: bool, running: bool, done: bool, started: bool
+}
+impl Data {
+  fn make(keyed: bool) -> Self {
+    return Self { iters: List<Value>.make(), nexts: List<Value>.make(), padding: List<Value>.make(),
+      keys: List<u32>.make(), state: List<u8>.make(), count: 0, capacity: 0, mode: SHORTEST,
+      keyed: keyed, running: false, done: false, started: false }
+  }
+}
+unsafe fn storage(object: *mut HeapHeader) -> ?*mut HeapHeader {
+  let anchor = () let objectData = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  return match &objectData.payload {
+    ObjectPayload.Opaque { family: ObjectPayloadFamily.IteratorZip, reference } => reference
+    ObjectPayload.Empty => Pointer.null<HeapHeader>()
+    _ => Intrinsic.trap("invalid zip payload")
+  }
+}
+pub unsafe fn mark(object: *mut HeapHeader, tracer: &mut Tracer) -> () {
+  let node = match Pointer.nonNullMut<HeapHeader>(unsafe storage(object)) {
+    Option<*mut HeapHeader>.Some { value } => value _ => { return }
+  }
+  let anchor = () let data = unsafe HeapCell.payload<Data, ()>(&anchor, node)
+  let mut i: usize = 0
+  while i < data.count {
+    unsafe tracer.value(data.iters.get(i)) unsafe tracer.value(data.nexts.get(i)) unsafe tracer.value(data.padding.get(i))
+    i = i + 1
+  }
+}
+unsafe fn releaseData<H: HeapHooks>(h: &mut H, rt: *mut HeapHeader, data: &Data) -> () {
+  let mut i: usize = 0
+  while i < data.count {
+    unsafe gc.release(&mut h, rt, data.iters.get(i)) unsafe gc.release(&mut h, rt, data.nexts.get(i))
+    if data.keyed {
+      let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+      state.atoms.release(data.keys.get(i))
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < data.padding.length() { unsafe gc.release(&mut h, rt, data.padding.get(i)) i = i + 1 }
+}
+pub unsafe fn finalize<H: HeapHooks>(h: &mut H, rt: *mut HeapHeader, object: *mut HeapHeader) -> () {
+  let node = match Pointer.nonNullMut<HeapHeader>(unsafe storage(object)) {
+    Option<*mut HeapHeader>.Some { value } => value _ => { return }
+  }
+  let mut anchor = () let target = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, object)
+  target.payload = ObjectPayload.Empty drop target
+  let data = unsafe HeapCell.payload<Data, ()>(&anchor, node)
+  let mut i: usize = 0
+  while i < data.count {
+    unsafe gc.release(&mut h, rt, data.iters.get(i))
+    unsafe gc.release(&mut h, rt, data.nexts.get(i))
+    unsafe gc.release(&mut h, rt, data.padding.get(i))
+    if data.keyed {
+      let mut runtimeAnchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, rt)
+      state.atoms.release(data.keys.get(i))
+    }
+    i = i + 1
+  }
+  drop data
+  unsafe HeapCell.destroy<Data>(node)
+}
+unsafe effect fn materialize<H: CoercionHooks + OwnPropertyHooks>(h: &mut H, c: *mut HeapHeader,
+  error: OutOfMemoryError | StringLengthError | OwnKeysError | JsException) -> never ! JsException ? &mut Allocator {
+  // Enumeration's semantic errors become pending JS exceptions before cleanup.
+  match move error {
+    OwnKeysError keys => {
+      match move keys {
+        OwnKeysError.NotObject => { return run unsafe core.error(&mut h, c, b"not an object") }
+        OwnKeysError.Uninitialized { name } => {
+          let rt = unsafe runtime.contextRuntime(c)
+          let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+          let result = run Effect.result(state.atoms.internOwned(unsafe name.get().retained())) drop state
+          let atom = match move result {
+            Result<u32, OutOfMemoryError>.Success { value } => value
+            Result<u32, OutOfMemoryError>.Failure { .. } => { return run unsafe h.throwOutOfMemory(c) }
+          }
+          let thrown = run Effect.result(unsafe uninitialized(&mut h, c, atom))
+          let released = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+          released.atoms.release(atom) drop released
+          match move thrown { Result<Value, JsException>.Failure { error: signal } => { fail move signal } _ => Intrinsic.trap("throw returned") }
+        }
+      }
+    }
+    OutOfMemoryError allocation => { return run unsafe h.throwOutOfMemory(c) }
+    StringLengthError length => { return run unsafe h.throwError(c, NativeErrorKind.Internal, b"string too long") }
+    JsException signal => { fail move signal }
+  }
+}
+fn cStringEqual(bytes: &[u8], expected: &[u8]) -> bool {
+  let mut length: usize = 0
+  while length < bytes.length && bytes[length] != 0 { length = length + 1 }
+  if length != expected.length { return false }
+  let mut i: usize = 0
+  while i < length { if bytes[i] != expected[i] { return false } i = i + 1 }
+  return true
+}
+fn modeStringEqual(value: Value, expected: &[u8]) -> bool {
+  let length = Strings.length(value)
+  if length < expected.length { return false }
+  let mut i: usize = 0
+  while i < expected.length {
+    if Strings.codeUnit(value, i) != u8.toU16(expected[i]) { return false }
+    i = i + 1
+  }
+  return length == i || Strings.codeUnit(value, i) == 0
+}
+effect fn decodeMode(value: Value) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  // JS_ToCString borrows narrow ASCII without allocating. Non-ASCII conversion
+  // reserves once, including characters after NUL that strcmp never examines.
+  let length = Strings.length(value) let wide = Strings.isWide(value)
+  let mut high: usize = 0 let mut i: usize = 0
+  while i < length { if Strings.codeUnit(value, i) >= 128 { high = high + 1 } i = i + 1 }
+  if !wide && high == 0 {
+    if modeStringEqual(value, b"shortest") { return SHORTEST }
+    if modeStringEqual(value, b"longest") { return LONGEST }
+    if modeStringEqual(value, b"strict") { return STRICT }
+    return -1
+  }
+  let mut capacity = length + high
+  if wide { capacity = length * 3 }
+  let mut bytes = List<u8>.make()
+  run bytes.reserveExact(capacity + 1)
+  i = 0
+  while i < length {
+    let point = Strings.codePoint(value, &mut i)
+    let mut encoded: [u8; 6] = [0; 6]
+    let count = Utf8.encode(point, &mut encoded)
+    let mut k: usize = 0
+    while k < count { run bytes.append(encoded[k]) k = k + 1 }
+  }
+  run bytes.append(0)
+  if cStringEqual(bytes.asSlice(), b"shortest") { return SHORTEST }
+  if cStringEqual(bytes.asSlice(), b"longest") { return LONGEST }
+  if cStringEqual(bytes.asSlice(), b"strict") { return STRICT }
+  return -1
+}
+// Reserve each source vector independently, including partially successful growth.
+effect fn reserve(data: &mut Data) -> () ! OutOfMemoryError ? &mut Allocator {
+  if data.count != data.capacity { return }
+  let mut capacity: usize = 4
+  if data.capacity != 0 {
+    if data.keyed { capacity = data.capacity * 2 } else { capacity = data.capacity + data.capacity / 2 }
+  }
+  let extraIterators = capacity - data.iters.length()
+  run data.iters.reserveExact(extraIterators)
+  let extraNexts = capacity - data.nexts.length()
+  run data.nexts.reserveExact(extraNexts)
+  if data.keyed {
+    let extraKeys = capacity - data.keys.length()
+    run data.keys.reserveExact(extraKeys)
+  }
+  let extraStates = capacity - data.state.length()
+  run data.state.reserveExact(extraStates)
+  data.capacity = capacity
+}
+struct Construction {
+  values: Scope, names: List<PropertyEnum>, closeInput: bool, closeCollected: bool
+}
+impl Construction {
+  fn make() -> Self { return Self { values: Scope.make(), names: List<PropertyEnum>.make(), closeInput: false, closeCollected: false } }
+}
+// Scope slots: mode, padding option, input iterator/next, padding iterator/next,
+// current iterator/next, item, keyed value, new object.
+unsafe effect fn construct<H: HeapHooks + CoercionHooks + OwnKeysHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(
+  h: &mut H, m: &AllocationObserver, c: *mut HeapHeader, argv: &FrameSlots, data: &mut Data, s: &mut Construction
+) -> *mut HeapHeader ! OutOfMemoryError | StringLengthError | OwnKeysError | JsException ? &mut Allocator {
+  let input = unsafe support.argument(argv, 0) let options = unsafe support.argument(argv, 1)
+  if !input.isObject() { return run unsafe core.error(&mut h, c, b"not an object") }
+  if !core.undefined(options) && !options.isObject() { return run unsafe core.error(&mut h, c, b"options must be an object") }
+  if !core.undefined(options) { s.values.values[0] = run unsafe properties.getPropertyStr(&mut h, c, options, b"mode") }
+  let mode = s.values.values[0]
+  if !core.undefined(mode) {
+    let isString = match mode { Value.String { .. } => true Value.Rope { .. } => true _ => false }
+    if !isString {
+      unsafe owners.release(&mut h, c, s.values.take(0))
+      return run unsafe core.error(&mut h, c, b"invalid mode")
+    }
+    let decoded = run Effect.result(decodeMode(mode))
+    unsafe owners.release(&mut h, c, s.values.take(0))
+    data.mode = match move decoded {
+      Result<i32, OutOfMemoryError>.Success { value } => value
+      Result<i32, OutOfMemoryError>.Failure { error } => { fail move error }
+    }
+    if data.mode < 0 { return run unsafe core.error(&mut h, c, b"invalid mode") }
+  }
+  if data.mode == LONGEST && !core.undefined(options) {
+    s.values.values[1] = run unsafe properties.getPropertyStr(&mut h, c, options, b"padding")
+    if !core.undefined(s.values.values[1]) && !s.values.values[1].isObject() {
+      unsafe owners.release(&mut h, c, s.values.take(1))
+      return run unsafe core.error(&mut h, c, b"padding must be an object")
+    }
+  }
+  if !data.keyed {
+    s.values.values[2] = run unsafe owners.iterator(&mut h, m, c, input)
+    s.closeCollected = true
+    s.closeInput = true
+    s.values.values[3] = run unsafe owners.get(&mut h, c, s.values.values[2], atoms.JS_ATOM_next)
+    s.closeInput = false
+    while true {
+      let mut done = false
+      s.values.values[8] = run unsafe owners.next(&mut h, c, s.values.values[2], s.values.values[3], &mut done)
+      if done { unsafe owners.release(&mut h, c, s.values.take(8)) break }
+      s.closeInput = true
+      let acquired = run Effect.result(unsafe support.flattenable(&mut h, c, s.values.values[8], &mut s.values.values[7], false))
+      unsafe owners.release(&mut h, c, s.values.take(8))
+      s.values.values[6] = match move acquired {
+        Result<Value, JsException>.Success { value } => value
+        Result<Value, JsException>.Failure { error } => { fail move error }
+      }
+      s.closeInput = false
+      run reserve(&mut data)
+      run data.iters.append(s.values.take(6)) run data.nexts.append(s.values.take(7)) run data.state.append(OPEN)
+      data.count = data.count + 1
+    }
+  } else {
+    s.names = run unsafe names.getOwnPropertyNames(&mut h, c, input, JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK)
+    s.closeCollected = true
+    let mut i: usize = 0
+    while i < s.names.length() {
+      let key = s.names.get(i).atom i = i + 1
+      let found = run unsafe core.ownProperty(&mut h, c, input, key)
+      let mut skip = false
+      match move found {
+        Option<PropertyDescriptor>.Some { value } => {
+          skip = (value.flags & JS_PROP_ENUMERABLE) == 0
+          unsafe releaseDescriptor(&mut h, unsafe runtime.contextRuntime(c), move value)
+        }
+        _ => ()
+      }
+      // An absent descriptor deliberately still performs Get (including inheritance).
+      if skip { continue }
+      s.values.values[9] = run unsafe owners.get(&mut h, c, input, key)
+      if core.undefined(s.values.values[9]) { continue }
+      let acquired = run Effect.result(unsafe support.flattenable(&mut h, c, s.values.values[9], &mut s.values.values[7], false))
+      unsafe owners.release(&mut h, c, s.values.take(9))
+      s.values.values[6] = match move acquired {
+        Result<Value, JsException>.Success { value } => value
+        Result<Value, JsException>.Failure { error } => { fail move error }
+      }
+      run reserve(&mut data)
+      let mut anchor = () let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, unsafe runtime.contextRuntime(c))
+      let ownedKey = rt.atoms.duplicate(key) drop rt
+      run data.keys.append(ownedKey)
+      run data.iters.append(s.values.take(6)) run data.nexts.append(s.values.take(7)) run data.state.append(OPEN)
+      data.count = data.count + 1
+    }
+    unsafe names.releaseNames(unsafe runtime.contextRuntime(c), Intrinsic.replace(s.names, List<PropertyEnum>.make()))
+  }
+  run data.padding.reserveExact(data.count + 1)
+  let mut i: usize = 0
+  while i <= data.count { run data.padding.append(Value.Undefined) i = i + 1 }
+  if data.mode == LONGEST && !core.undefined(s.values.values[1]) {
+    if !data.keyed {
+      s.values.values[4] = run unsafe owners.iterator(&mut h, m, c, s.values.values[1])
+      s.values.values[5] = run unsafe owners.get(&mut h, c, s.values.values[4], atoms.JS_ATOM_next)
+      let mut usingIterator = true i = 0
+      while i < data.count {
+        let mut done = false
+        s.values.values[8] = run unsafe owners.next(&mut h, c, s.values.values[4], s.values.values[5], &mut done)
+        if done { unsafe owners.release(&mut h, c, s.values.take(8)) usingIterator = false break }
+        data.padding.set(i, s.values.take(8)) i = i + 1
+      }
+      if usingIterator { run unsafe owners.close(&mut h, c, s.values.values[4], false) }
+    } else {
+      i = 0
+      while i < data.count {
+        let value = run unsafe owners.get(&mut h, c, s.values.values[1], data.keys.get(i))
+        data.padding.set(i, value) i = i + 1
+      }
+    }
+  }
+  s.values.values[10] = run unsafe objects.withClass(&mut h, m, c, classes.JS_CLASS_ITERATOR_ZIP)
+  // Allocate the auxiliary node only after the JS object; ownership moves after success.
+  return run HeapCell.allocate(HeapKind.Auxiliary, Data.make(data.keyed))
+}
+pub unsafe effect fn create<H: HeapHooks + CoercionHooks + OwnKeysHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(
+  h: &mut H, m: &AllocationObserver, c: *mut HeapHeader, argv: &FrameSlots, keyed: bool
+) -> Value ! JsException ? &mut Allocator {
+  let mut data = Data.make(keyed) let mut s = Construction.make()
+  let built = run Effect.result(unsafe construct(&mut h, m, c, argv, &mut data, &mut s))
+  let node = match move built {
+    Result<*mut HeapHeader, OutOfMemoryError | StringLengthError | OwnKeysError | JsException>.Success { value } => value
+    Result<*mut HeapHeader, OutOfMemoryError | StringLengthError | OwnKeysError | JsException>.Failure { error } => {
+      let pending = run Effect.catch<JsException>(unsafe materialize(&mut h, c, move error), core.exceptionValue)
+      // Failed auxiliary allocation releases the unattached JS object before closing.
+      unsafe owners.release(&mut h, c, s.values.take(10))
+      if s.closeCollected {
+        let mut i = data.count
+        while i != 0 { i = i - 1 let closed = run Effect.result(unsafe owners.close(&mut h, c, data.iters.get(i), true)) }
+        if s.closeInput { let closed = run Effect.result(unsafe owners.close(&mut h, c, s.values.values[2], true)) }
+      }
+      unsafe owners.release(&mut h, c, s.values.take(6))
+      unsafe owners.release(&mut h, c, s.values.take(7))
+      unsafe owners.release(&mut h, c, s.values.take(9))
+      unsafe owners.release(&mut h, c, s.values.take(8))
+      unsafe releaseData(&mut h, unsafe runtime.contextRuntime(c), &data)
+      unsafe names.releaseNames(unsafe runtime.contextRuntime(c), move s.names)
+      unsafe cleanupInputs(&mut h, c, move s.values)
+      fail JsException {}
+    }
+  }
+  let object = s.values.take(10)
+  let mut anchor = () let target = unsafe HeapCell.payloadMut<Data, ()>(&mut anchor, node)
+  target.* = move data drop target
+  let objectState = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, core.reference(object))
+  objectState.payload = ObjectPayload.Opaque { family: ObjectPayloadFamily.IteratorZip, reference: node } drop objectState
+  unsafe names.releaseNames(unsafe runtime.contextRuntime(c), move s.names)
+  unsafe cleanupInputs(&mut h, c, move s.values)
+  return object
+}
+
+struct Flags { count: usize, mode: i32, keyed: bool, running: bool, done: bool, started: bool }
+unsafe fn flags(node: *mut HeapHeader) -> Flags {
+  let anchor = () let data = unsafe HeapCell.payload<Data, ()>(&anchor, node)
+  return Flags { count: data.count, mode: data.mode, keyed: data.keyed, running: data.running, done: data.done, started: data.started }
+}
+struct Record { iterator: Value, next: Value, padding: Value, key: u32, state: u8 }
+unsafe fn record(node: *mut HeapHeader, i: usize) -> Record {
+  let anchor = () let data = unsafe HeapCell.payload<Data, ()>(&anchor, node)
+  let mut key: u32 = 0
+  if data.keyed { key = data.keys.get(i) }
+  return Record { iterator: data.iters.get(i), next: data.nexts.get(i), padding: data.padding.get(i), key: key, state: data.state.get(i) }
+}
+unsafe fn setState(node: *mut HeapHeader, i: usize, state: u8) -> () {
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<Data, ()>(&mut anchor, node)
+  data.state.set(i, state)
+}
+unsafe fn setRunning(node: *mut HeapHeader, running: bool) -> () {
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<Data, ()>(&mut anchor, node)
+  data.running = running
+}
+unsafe fn setDone(node: *mut HeapHeader) -> () {
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<Data, ()>(&mut anchor, node)
+  data.done = true
+}
+unsafe fn setStarted(node: *mut HeapHeader) -> () {
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<Data, ()>(&mut anchor, node)
+  data.started = true
+}
+unsafe effect fn closeAll<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + CallHooks>(
+  h: &mut H, c: *mut HeapHeader, node: *mut HeapHeader, pending: bool
+) -> () ! JsException ? &mut Allocator {
+  let state = unsafe flags(node)
+  let mut failed = pending let mut i = state.count
+  while i != 0 {
+    i = i - 1 let item = unsafe record(node, i)
+    if item.state != OPEN { continue }
+    unsafe setState(node, i, CLOSED)
+    let closed = run Effect.result(unsafe owners.close(&mut h, c, item.iterator, failed))
+    match move closed { Result<(), JsException>.Failure { .. } => { failed = true } _ => () }
+  }
+  if failed { fail JsException {} }
+}
+unsafe fn freeResults<H: HeapHooks>(h: &mut H, c: *mut HeapHeader, results: &mut List<Value>) -> () {
+  let mut i: usize = 0
+  while i < results.length() { unsafe owners.release(&mut h, c, results.get(i)) i = i + 1 }
+  results.* = List<Value>.make()
+}
+unsafe effect fn advance<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(
+  h: &mut H, m: &AllocationObserver, c: *mut HeapHeader, node: *mut HeapHeader,
+  results: &mut List<Value>, freeBeforeClose: &mut bool
+) -> NativeIteratorResult ! OutOfMemoryError | JsException ? &mut Allocator {
+  let state = unsafe flags(node)
+  run results.reserveExact(state.count)
+  let mut i: usize = 0
+  while i < state.count { run results.append(Value.Undefined) i = i + 1 }
+  i = 0
+  while i < state.count {
+    let item = unsafe record(node, i)
+    if item.state == EXHAUSTED { results.set(i, unsafe item.padding.retained()) i = i + 1 continue }
+    let mut done = false
+    let stepped = run Effect.result(unsafe owners.next(&mut h, c, item.iterator, item.next, &mut done))
+    let value = match move stepped {
+      Result<Value, JsException>.Success { value } => value
+      Result<Value, JsException>.Failure { error } => { unsafe setState(node, i, CLOSED) fail move error }
+    }
+    if !done { results.set(i, value) i = i + 1 continue }
+    unsafe owners.release(&mut h, c, value)
+    unsafe setState(node, i, CLOSED)
+    if state.mode == SHORTEST {
+      unsafe setDone(node)
+      freeBeforeClose.* = true
+      run unsafe closeAll(&mut h, c, node, false)
+      return NativeIteratorResult { value: Value.Undefined, done: 1 }
+    }
+    if state.mode == STRICT {
+      if i != 0 { return run unsafe core.error(&mut h, c, b"iterators have different lengths") }
+      let mut k: usize = 1
+      while k < state.count {
+        let other = unsafe record(node, k)
+        let stepped = run Effect.result(unsafe owners.next(&mut h, c, other.iterator, other.next, &mut done))
+        let value = match move stepped {
+          Result<Value, JsException>.Success { value: nextValue } => nextValue
+          Result<Value, JsException>.Failure { error } => { unsafe setState(node, k, CLOSED) fail move error }
+        }
+        unsafe owners.release(&mut h, c, value)
+        if done { unsafe setState(node, k, CLOSED) }
+        else { return run unsafe core.error(&mut h, c, b"iterators have different lengths") }
+        k = k + 1
+      }
+      unsafe setDone(node)
+      return NativeIteratorResult { value: Value.Undefined, done: 1 }
+    }
+    let mut open = false let mut k: usize = 0
+    while k < state.count {
+      let remaining = unsafe record(node, k)
+      if remaining.state == OPEN { open = true break }
+      k = k + 1
+    }
+    if !open { unsafe setDone(node) return NativeIteratorResult { value: Value.Undefined, done: 1 } }
+    unsafe setState(node, i, EXHAUSTED)
+    results.set(i, unsafe item.padding.retained())
+    i = i + 1
+  }
+  // FinishResults failures free the output and scratch values before closing.
+  freeBeforeClose.* = true
+  let mut output = Value.Undefined
+  if state.keyed { output = run unsafe objects.withPrototype(&mut h, m, c, Value.Null) }
+  else { output = run unsafe objects.array(&mut h, m, c) }
+  i = 0
+  while i < state.count {
+    let mut key = usize.toU32(i) | ATOM_INTEGER_TAG
+    if state.keyed { let keyed = unsafe record(node, i) key = keyed.key }
+    let value = results.get(i) results.set(i, Value.Undefined)
+    let defined = run Effect.result(unsafe core.defineValue(&mut h, c, output, key, value, JS_PROP_C_W_E))
+    match move defined {
+      Result<bool, JsException>.Success { .. } => ()
+      Result<bool, JsException>.Failure { error } => { unsafe owners.release(&mut h, c, output) fail move error }
+    }
+    i = i + 1
+  }
+  unsafe setStarted(node)
+  return NativeIteratorResult { value: output, done: 0 }
+}
+pub unsafe effect fn next<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(
+  h: &mut H, m: &AllocationObserver, c: *mut HeapHeader, receiver: Value, magic: i32
+) -> NativeIteratorResult ! JsException ? &mut Allocator {
+  let mut storageNode: ?*mut HeapHeader = Pointer.null<HeapHeader>()
+  if receiver.isObject() {
+    let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(receiver))
+    let valid = object.classId == classes.JS_CLASS_ITERATOR_ZIP drop object
+    if valid { storageNode = unsafe storage(core.reference(receiver)) }
+  }
+  let node = match Pointer.nonNullMut<HeapHeader>(storageNode) {
+    Option<*mut HeapHeader>.Some { value } => value
+    _ => { return run unsafe core.error(&mut h, c, b"Iterator Zip object expected") }
+  }
+  let state = unsafe flags(node)
+  // The running check intentionally precedes done, including the empty-zip quirk.
+  if state.running { return run unsafe core.error(&mut h, c, b"cannot invoke a running iterator") }
+  if state.done { return NativeIteratorResult { value: Value.Undefined, done: 1 } }
+  if magic == 1 {
+    unsafe setDone(node) unsafe setRunning(node, state.started)
+    let closed = run Effect.result(unsafe closeAll(&mut h, c, node, false))
+    unsafe setRunning(node, false)
+    match move closed { Result<(), JsException>.Failure { error } => { fail move error } _ => () }
+    return NativeIteratorResult { value: Value.Undefined, done: 1 }
+  }
+  unsafe setRunning(node, true)
+  if state.count == 0 {
+    // Pinned source returns without clearing running on this path.
+    unsafe setDone(node) return NativeIteratorResult { value: Value.Undefined, done: 1 }
+  }
+  let mut results = List<Value>.make() let mut freeBeforeClose = false
+  let advanced = run Effect.result(unsafe advance(&mut h, m, c, node, &mut results, &mut freeBeforeClose))
+  match move advanced {
+    Result<NativeIteratorResult, OutOfMemoryError | JsException>.Success { value } => {
+      unsafe freeResults(&mut h, c, &mut results) unsafe setRunning(node, false)
+      return move value
+    }
+    Result<NativeIteratorResult, OutOfMemoryError | JsException>.Failure { error } => {
+      let pending = run Effect.catch<JsException>(unsafe core.materialize(&mut h, c, move error), core.exceptionValue)
+      if freeBeforeClose { unsafe freeResults(&mut h, c, &mut results) }
+      let closed = run Effect.result(unsafe closeAll(&mut h, c, node, true))
+      unsafe freeResults(&mut h, c, &mut results) unsafe setRunning(node, false)
+      // Failure does not set done: subsequent next calls even revisit CLOSED records.
+      fail JsException {}
+    }
+  }
+}
+
+unsafe effect fn uninitialized<H: OwnPropertyHooks>(h: &mut H, c: *mut HeapHeader, atom: u32) -> Value ! JsException ? &mut Allocator {
+  return run unsafe h.throwUninitialized(c, atom)
+}
+
+unsafe fn cleanupInputs<H: HeapHooks>(h: &mut H, c: *mut HeapHeader, scope: owners.Scope) -> () {
+  let mut owned = move scope
+  let mut i: usize = 2
+  while i < 6 { unsafe owners.release(&mut h, c, owned.take(i)) i = i + 1 }
+  unsafe owners.release(&mut h, c, owned.take(1))
+  unsafe owners.cleanup(&mut h, c, move owned)
+}

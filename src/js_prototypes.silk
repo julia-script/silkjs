@@ -1,0 +1,226 @@
+//! Prototype operations, quickjs.c:7995-8165,9015-9059. Arguments are borrowed
+//! except getPrototypeFree's consumed input; every successful Value result owns.
+//! Runtime/context must outlive calls. No payload borrow crosses host dispatch.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.result { Result }
+import silk.u32
+import js_core_types { ContextState, RuntimeState, ObjectData, ObjectPayload, ShapeData,
+  NativeFunctionId, ExoticCallbacks, EXOTIC_GET_PROTOTYPE, EXOTIC_SET_PROTOTYPE,
+  EXOTIC_IS_EXTENSIBLE, EXOTIC_PREVENT_EXTENSIONS }
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_shapes as shapes
+import js_class_data as classes
+import js_exceptions { JsException }
+import js_prototype_host { PrototypeHooks }
+
+pub enum PrototypeError { NotObject, BadPrototype, Immutable, NotExtensible, Circular }
+impl PrototypeError {
+  pub fn message(self: &Self) -> &'static [u8] {
+    return match self.* {
+      PrototypeError.NotObject => b"not an object"
+      PrototypeError.BadPrototype => b"proxy: bad prototype"
+      PrototypeError.Immutable => b"prototype is immutable"
+      PrototypeError.NotExtensible => b"object is not extensible"
+      PrototypeError.Circular => b"circular prototype chain"
+    }
+  }
+}
+fn trap() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+fn reference(value: Value) -> *mut HeapHeader {
+  return match value { Value.Object { reference } => reference _ => trap() }
+}
+fn present(value: ?*mut HeapHeader) -> *mut HeapHeader {
+  return unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(value)
+}
+unsafe fn storedPrototype(node: *mut HeapHeader) -> ?*mut HeapHeader {
+  let anchor = ()
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, object.shape)
+  return shape.prototype
+}
+unsafe fn method(rt: *mut HeapHeader, node: *mut HeapHeader, mask: u16) -> Option<NativeFunctionId> {
+  let anchor = ()
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  if !object.isExotic { return Option<NativeFunctionId>.none() }
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  match &state.classes.asSlice()[u32.toUsize(object.classId)].exotic {
+    Option<ExoticCallbacks>.Some { value } => {
+      if (value.methodMask & mask) != 0 { return Option<NativeFunctionId>.some(value.descriptor) }
+    }
+    Option<ExoticCallbacks>.None => ()
+  }
+  return Option<NativeFunctionId>.none()
+}
+pub unsafe fn setImmutablePrototype(object: Value) -> () {
+  if !object.isObject() { return () }
+  let mut anchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, reference(object))
+  data.hasImmutablePrototype = true
+}
+/// Borrowed context class-prototype alias, not an owning public result.
+pub unsafe fn getPrototypePrimitive(context: *mut HeapHeader, value: Value) -> Value {
+  let classId = match value {
+    Value.ShortBigInt { .. } => classes.JS_CLASS_BIG_INT
+    Value.BigInt { .. } => classes.JS_CLASS_BIG_INT
+    Value.Int { .. } => classes.JS_CLASS_NUMBER
+    Value.Float64 { .. } => classes.JS_CLASS_NUMBER
+    Value.Bool { .. } => classes.JS_CLASS_BOOLEAN
+    Value.String { .. } => classes.JS_CLASS_STRING
+    Value.Rope { .. } => classes.JS_CLASS_STRING
+    Value.Symbol { .. } => classes.JS_CLASS_SYMBOL
+    _ => { return Value.Null }
+  }
+  let anchor = ()
+  let state = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  return state.classPrototypes.get(u32.toUsize(classId))
+}
+pub unsafe effect fn getPrototype<H: PrototypeHooks>(hooks: &mut H, context: *mut HeapHeader,
+  object: Value) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  if !object.isObject() {
+    let primitive = unsafe getPrototypePrimitive(context, object)
+    return unsafe primitive.retained()
+  }
+  let rt = unsafe runtime.contextRuntime(context)
+  let node = reference(object)
+  match unsafe method(rt, node, EXOTIC_GET_PROTOTYPE) {
+    Option<NativeFunctionId>.Some { value: table } => { return run unsafe hooks.getPrototype(context, table, object) }
+    Option<NativeFunctionId>.None => ()
+  }
+  let proto = unsafe storedPrototype(node)
+  if Pointer.isNull<HeapHeader>(proto) { return Value.Null }
+  let value = Value.Object { reference: present(proto) }
+  return unsafe value.retained()
+}
+pub unsafe effect fn getPrototypeFree<H: PrototypeHooks + HeapHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  let result = run Effect.result(unsafe getPrototype(&mut hooks, context, object))
+  unsafe gc.release(&mut hooks, rt, object)
+  return match move result {
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => value
+    Result<Value, OutOfMemoryError | JsException>.Failure { error } => { fail move error }
+  }
+}
+effect fn reject(throwFlag: bool, error: PrototypeError) -> bool ! PrototypeError {
+  if throwFlag { fail error }
+  return false
+}
+/// throwFlag=true is Object/JS_SetPrototype semantics; false is Reflect semantics.
+pub unsafe effect fn setPrototypeInternal<H: PrototypeHooks + HeapHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value, prototype: Value, throwFlag: bool) -> bool
+  ! OutOfMemoryError | JsException | PrototypeError ? &mut Allocator {
+  if throwFlag {
+    if match object { Value.Null => true Value.Undefined => true _ => false } { fail PrototypeError.NotObject }
+  } else if !object.isObject() { fail PrototypeError.NotObject }
+  let proto: ?*mut HeapHeader = match prototype {
+    Value.Object { reference: node } => node
+    Value.Null => Pointer.null<HeapHeader>()
+    _ => { fail PrototypeError.NotObject }
+  }
+  if !object.isObject() { return true }
+  let rt = unsafe runtime.contextRuntime(context)
+  let node = reference(object)
+  match unsafe method(rt, node, EXOTIC_SET_PROTOTYPE) {
+    Option<NativeFunctionId>.Some { value: table } => {
+      let accepted = run unsafe hooks.setPrototype(context, table, object, prototype)
+      if !accepted { return run reject(throwFlag, PrototypeError.BadPrototype) }
+      return true
+    }
+    Option<NativeFunctionId>.None => ()
+  }
+  if Pointer.address<HeapHeader>(unsafe storedPrototype(node)) == Pointer.address<HeapHeader>(proto) { return true }
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  let immutable = data.hasImmutablePrototype
+  let extensible = data.extensible
+  drop data
+  if immutable { return run reject(throwFlag, PrototypeError.Immutable) }
+  if !extensible { return run reject(throwFlag, PrototypeError.NotExtensible) }
+  let mut cursor = proto
+  while !Pointer.isNull<HeapHeader>(cursor) {
+    if Pointer.address<HeapHeader>(cursor) == Pointer.address<HeapHeader>(node) {
+      return run reject(throwFlag, PrototypeError.Circular)
+    }
+    // Deliberately reads stored shape edges, never invokes exotic getPrototype.
+    cursor = unsafe storedPrototype(present(cursor))
+  }
+  let ownedPrototype = unsafe prototype.retained()
+  let mut updateAnchor = ()
+  let target = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut updateAnchor, node)
+  let prepared = run Effect.result(unsafe shapes.prepareUpdate(rt, &mut target))
+  let shapeNode = target.shape
+  drop target
+  match move prepared {
+    Result<(), OutOfMemoryError>.Failure { error } => {
+      // Upstream 8084-8088 leaks this speculative retain on shape OOM. Native
+      // ownership is transactional: retain before prepare, release on failure.
+      unsafe gc.release(&mut hooks, rt, ownedPrototype)
+      fail move error
+    }
+    Result<(), OutOfMemoryError>.Success { .. } => ()
+  }
+  let old = unsafe storedPrototype(node)
+  // Source ordering is observable to native finalizers: old edge and std-array
+  // flag remain visible until after release. replacePrototype publishes too soon.
+  if !Pointer.isNull<HeapHeader>(old) { unsafe gc.release(&mut hooks, rt, Value.Object { reference: present(old) }) }
+  let shape = unsafe HeapCell.payloadMut<ShapeData, ()>(&mut updateAnchor, shapeNode)
+  shape.prototype = proto
+  drop shape
+  let changed = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut updateAnchor, node)
+  changed.isStandardArrayPrototype = false
+  return true
+}
+pub unsafe effect fn setPrototype<H: PrototypeHooks + HeapHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value, prototype: Value) -> bool
+  ! OutOfMemoryError | JsException | PrototypeError ? &mut Allocator {
+  return run unsafe setPrototypeInternal(&mut hooks, context, object, prototype, true)
+}
+pub unsafe effect fn isExtensible<H: PrototypeHooks>(hooks: &mut H, context: *mut HeapHeader,
+  object: Value) -> bool ! OutOfMemoryError | JsException ? &mut Allocator {
+  if !object.isObject() { return false }
+  let rt = unsafe runtime.contextRuntime(context)
+  let node = reference(object)
+  match unsafe method(rt, node, EXOTIC_IS_EXTENSIBLE) {
+    Option<NativeFunctionId>.Some { value: table } => { return run unsafe hooks.isExtensible(context, table, object) }
+    Option<NativeFunctionId>.None => ()
+  }
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  return data.extensible
+}
+pub unsafe effect fn preventExtensions<H: PrototypeHooks>(hooks: &mut H, context: *mut HeapHeader,
+  object: Value) -> bool ! OutOfMemoryError | JsException ? &mut Allocator {
+  if !object.isObject() { return false }
+  let rt = unsafe runtime.contextRuntime(context)
+  let node = reference(object)
+  let mut anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  let exotic = data.isExotic
+  let typed = data.classId >= classes.JS_CLASS_UINT8C_ARRAY && data.classId <= classes.JS_CLASS_FLOAT64_ARRAY
+  let mut requiresExtensible = false
+  if exotic && typed {
+    requiresExtensible = match &data.payload {
+      ObjectPayload.TypedArray { array } => array.requiresExtensible
+      _ => trap()
+    }
+  }
+  drop data
+  if exotic && typed {
+    if requiresExtensible { return false }
+  } else {
+    match unsafe method(rt, node, EXOTIC_PREVENT_EXTENSIONS) {
+      Option<NativeFunctionId>.Some { value: table } => { return run unsafe hooks.preventExtensions(context, table, object) }
+      Option<NativeFunctionId>.None => ()
+    }
+  }
+  let changed = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+  changed.extensible = false
+  return true
+}

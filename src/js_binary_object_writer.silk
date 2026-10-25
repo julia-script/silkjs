@@ -1,0 +1,626 @@
+//! Native QuickJS binary writer, pinned quickjs.c:38216-39189 (version 5).
+//! Inputs are borrowed JS roots and must remain live throughout the call. The
+//! shared side table borrows source buffers: keep those buffers/backings alive
+//! until the consumer has duplicated their backing ownership. No JS edge is
+//! acquired by the table. All native tables unwind on errors; temporary object
+//! marks are scoped guards, including allocation and unsupported-tag failures.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.list { List }
+import silk.ownership { Copy, Drop }
+import silk.pointer { Pointer }
+import silk.u8
+import silk.u16
+import silk.u32
+import silk.u64
+import silk.i32
+import silk.i64
+import silk.usize
+import silk.f64
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_engine { Engine }
+import js_engine_host { EngineServices }
+import js_core_types { RuntimeState, ObjectData, ObjectPayload, PropertySlot, ShapeData,
+  ByteStorage, FunctionBytecode, FunctionKind, VariableKind, ClosureKind, ModuleDef,
+  ExportBinding, NativeErrorKind, FunctionDebugInfo }
+import js_coercion_host { CoercionHooks }
+import js_exceptions { JsException }
+import js_atoms { AtomTable }
+import js_string_types { StringOwner, StringLengthError, AtomKind }
+import js_strings { Strings }
+import js_bigint { BigInt }
+import js_runtime as runtime
+import js_errors as errors
+import js_proxy_core as core
+import js_shapes as shapes
+import js_buffer_storage as buffers
+import js_class_data as classes
+import js_atom_data as atoms
+import js_opcode_data as op
+import native_stack { currentFrameAddress }
+
+pub const JS_WRITE_OBJ_BYTECODE: u32 = 1
+/// Present in quickjs.h but ignored by the pinned implementation: wire is LE.
+pub const JS_WRITE_OBJ_BSWAP: u32 = 2
+pub const JS_WRITE_OBJ_SAB: u32 = 4
+pub const JS_WRITE_OBJ_REFERENCE: u32 = 8
+pub struct SharedEntry { pub address: *mut u8, pub buffer: Value }
+impl Copy for SharedEntry {}
+pub struct WriteResult { pub bytes: List<u8>, pub shared: List<SharedEntry> }
+/// Releases only native side-table storage, never its borrowed source buffers.
+pub fn releaseShared(entries: List<SharedEntry>) -> () { drop entries }
+
+struct ObjectEntry { object: *mut HeapHeader, next: u32 }
+impl Copy for ObjectEntry {}
+struct Writer {
+  bytes: List<u8>, shared: List<SharedEntry>, atomMap: List<u32>, atomList: List<u32>,
+  objects: List<ObjectEntry>, buckets: List<u32>, firstAtom: u32, flags: u32
+}
+struct Mark { object: *mut HeapHeader, active: bool }
+impl Drop for Mark {
+  fn drop(self: &mut Self) -> () {
+    if self.active {
+      let mut anchor = ()
+      let object = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, self.object)
+      object.temporaryMark = false
+    }
+  }
+}
+fn boolean(value: bool) -> u32 { if value { return 1 } return 0 }
+fn hash(object: *mut HeapHeader, size: usize) -> usize {
+  return usize.wrappingMultiply(Pointer.address<HeapHeader>(object), 3163) & (size - 1)
+}
+impl Writer {
+  fn make(flags: u32) -> Self {
+    let mut first: u32 = 1
+    if (flags & JS_WRITE_OBJ_BYTECODE) != 0 { first = atoms.JS_ATOM_END }
+    return Self { bytes: List<u8>.make(), shared: List<SharedEntry>.make(),
+      atomMap: List<u32>.make(), atomList: List<u32>.make(), objects: List<ObjectEntry>.make(),
+      buckets: List<u32>.make(), firstAtom: first, flags: flags }
+  }
+  effect fn byte(self: &mut Self, value: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.bytes.append(value)
+  }
+  effect fn leb(self: &mut Self, mut value: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    while value >= 128 {
+      run self.byte(u32.toU8(value & 127) | 128)
+      value = u32.shiftRight(value, 7)
+    }
+    run self.byte(u32.toU8(value))
+  }
+  effect fn word(self: &mut Self, value: u32, count: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut i: u32 = 0
+    while i < count { run self.byte(u32.toU8(u32.shiftRight(value, i * 8) & 255)) i = i + 1 }
+  }
+  effect fn quad(self: &mut Self, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut i: u64 = 0
+    while i < 8 { run self.byte(u64.toU8(u64.shiftRight(value, i * 8) & 255)) i = i + 1 }
+  }
+  effect fn storage(self: &mut Self, bytes: &ByteStorage) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.bytes.reserve(bytes.length())
+    let mut i: usize = 0
+    while i < bytes.length() { run self.byte(unsafe bytes.byte(i)) i = i + 1 }
+  }
+  effect fn atomIndex(self: &mut Self, atom: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    if atom < self.firstAtom || AtomTable.isInteger(atom) { return atom }
+    let index = u32.toUsize(atom - self.firstAtom)
+    if index < self.atomMap.length() && self.atomMap.get(index) != 0 { return self.atomMap.get(index) }
+    if index >= self.atomMap.length() {
+      let additional = index + 1 - self.atomMap.length()
+      run self.atomMap.reserve(additional)
+      while self.atomMap.length() <= index { run self.atomMap.append(0) }
+    }
+    if self.atomList.length() >= u32.toUsize(u32.MAX - self.firstAtom) { return run Allocator.outOfMemory() }
+    let mapped = usize.toU32(self.atomList.length()) + self.firstAtom
+    run self.atomList.append(atom)
+    self.atomMap.set(index, mapped)
+    return mapped
+  }
+  effect fn atom(self: &mut Self, atom: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    if AtomTable.isInteger(atom) { run self.leb(u32.shiftLeft(AtomTable.integer(atom), 1) | 1) }
+    else {
+      let mapped = run self.atomIndex(atom)
+      run self.leb(u32.shiftLeft(mapped, 1))
+    }
+  }
+  fn findObject(self: &Self, object: *mut HeapHeader) -> u32 {
+    if self.objects.length() == 0 { return u32.MAX }
+    let mut cursor = self.buckets.get(hash(object, self.buckets.length()))
+    while cursor != u32.MAX {
+      let entry = self.objects.get(u32.toUsize(cursor))
+      if Pointer.address<HeapHeader>(entry.object) == Pointer.address<HeapHeader>(object) { return cursor }
+      cursor = entry.next
+    }
+    return u32.MAX
+  }
+  effect fn addObject(self: &mut Self, object: *mut HeapHeader) -> () ! OutOfMemoryError ? &mut Allocator {
+    let count = self.objects.length()
+    if count >= u32.toUsize(u32.MAX) { return run Allocator.outOfMemory() }
+    if count + 1 >= self.buckets.length() {
+      let mut size = self.buckets.length()
+      if size < 4 { size = 4 }
+      while size <= count { size = size * 2 }
+      let mut replacement = List<u32>.make()
+      run replacement.reserve(size)
+      while replacement.length() < size { run replacement.append(u32.MAX) }
+      let mut i: usize = 0
+      while i < count {
+        let mut entry = self.objects.get(i)
+        let bucket = hash(entry.object, size)
+        entry.next = replacement.get(bucket)
+        replacement.set(bucket, usize.toU32(i))
+        self.objects.set(i, entry)
+        i = i + 1
+      }
+      self.buckets = move replacement
+    }
+    let bucket = hash(object, self.buckets.length())
+    run self.objects.append(ObjectEntry { object: object, next: self.buckets.get(bucket) })
+    self.buckets.set(bucket, usize.toU32(count))
+  }
+  effect fn string(self: &mut Self, value: Value) -> () ! OutOfMemoryError ? &mut Allocator {
+    let length = Strings.length(value)
+    let wide = Strings.isWide(value)
+    run self.leb(u32.shiftLeft(usize.toU32(length), 1) | boolean(wide))
+    let mut i: usize = 0
+    while i < length {
+      let unit = u16.toU32(Strings.codeUnit(value, i))
+      let mut width: u32 = 1 if wide { width = 2 }
+      run self.word(unit, width)
+      i = i + 1
+    }
+  }
+  effect fn bigint(self: &mut Self, limbs: &[u32]) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.byte(10)
+    let mut length = limbs.length * 4
+    if limbs.length == 1 && limbs[0] == 0 { length = 0 }
+    else {
+      let high = limbs[limbs.length - 1]
+      let mut shift: u32 = 24
+      while shift > 0 {
+        let byte = u32.shiftRight(high, shift) & 255
+        if (byte != 0 && byte != 255) || (byte & 1) != (u32.shiftRight(high, shift - 1) & 1) { break }
+        shift = shift - 8 length = length - 1
+      }
+    }
+    run self.leb(usize.toU32(length))
+    let mut i: usize = 0
+    while i < length {
+      run self.byte(u32.toU8(u32.shiftRight(limbs[i / 4], usize.toU32(i % 4) * 8) & 255))
+      i = i + 1
+    }
+  }
+}
+
+unsafe effect fn reject<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  message: &[u8]) -> never ! JsException ? &mut Allocator {
+  return run unsafe engine.throwError(context, NativeErrorKind.Type, message)
+}
+unsafe effect fn unsupported<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader) -> never ! JsException ? &mut Allocator {
+  return run unsafe engine.throwError(context, NativeErrorKind.Internal, b"unsupported tag")
+}
+unsafe effect fn propertyValue<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  object: &ObjectData, index: usize) -> Value ! JsException ? &mut Allocator {
+  let anchor = () let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, object.shape)
+  if (shape.properties.get(index).flags & 48) != 0 {
+    return run unsafe reject(&mut engine, context, b"only value properties are supported")
+  }
+  return match object.properties.get(index) {
+    PropertySlot.Value { value } => value
+    _ => run unsafe reject(&mut engine, context, b"only value properties are supported")
+  }
+}
+unsafe effect fn ownValue<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  object: &ObjectData, atom: u32, enumerable: bool) -> Value ! JsException ? &mut Allocator {
+  match unsafe shapes.lookup(object.shape, atom) {
+    Option<usize>.None => { return Value.Undefined }
+    Option<usize>.Some { value: index } => {
+      let anchor = () let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, object.shape)
+      if enumerable && (shape.properties.get(index).flags & 4) == 0 { return Value.Undefined }
+      return run unsafe propertyValue(&mut engine, context, object, index)
+    }
+  }
+}
+
+unsafe effect fn writeArray<'m, S: EngineServices>(state: &mut Writer, engine: &mut Engine<'m, S>,
+  context: *mut HeapHeader, object: &ObjectData) -> () ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let template = (state.flags & JS_WRITE_OBJ_BYTECODE) != 0 && !object.extensible
+  if template { run state.byte(11) } else { run state.byte(9) }
+  let lengthValue = run unsafe ownValue(&mut engine, context, object, atoms.JS_ATOM_length, false)
+  if !lengthValue.isNumber() || lengthValue.numericValue() < 0.0 || lengthValue.numericValue() > 4294967295.0 {
+    return run unsafe reject(&mut engine, context, b"invalid array length")
+  }
+  let length = f64.toU32(lengthValue.numericValue())
+  run state.leb(length)
+  let mut i: u32 = 0
+  if object.fastArray {
+    if let ObjectPayload.FastArray { array } = &object.payload {
+      while u32.toUsize(i) < array.values.length() && i < length {
+        run unsafe writeValue(&mut state, &mut engine, context, array.values.get(u32.toUsize(i)))
+        i = i + 1
+      }
+    }
+    while i < length { run state.byte(2) i = i + 1 }
+  } else {
+    while i < length {
+      let rt = unsafe runtime.contextRuntime(context)
+      let mut anchor = () let runtimeData = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+      let atom = run runtimeData.atoms.internUInt32(i)
+      drop runtimeData
+      let result = run Effect.result(unsafe ownValue(&mut engine, context, object, atom, true))
+      let releaseRuntime = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+      releaseRuntime.atoms.release(atom)
+      drop releaseRuntime
+      let item = match move result {
+        Result<Value, JsException>.Success { value } => value
+        Result<Value, JsException>.Failure { error } => { fail move error }
+      }
+      run unsafe writeValue(&mut state, &mut engine, context, item)
+      i = i + 1
+    }
+  }
+  if template {
+    let raw = run unsafe ownValue(&mut engine, context, object, atoms.JS_ATOM_raw, false)
+    run unsafe writeValue(&mut state, &mut engine, context, raw)
+  }
+}
+unsafe effect fn writePlain<'m, S: EngineServices>(state: &mut Writer, engine: &mut Engine<'m, S>,
+  context: *mut HeapHeader, object: &ObjectData) -> () ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  run state.byte(8)
+  let anchor = () let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, object.shape)
+  let rt = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, unsafe runtime.contextRuntime(context))
+  let mut count: u32 = 0 let mut pass: u32 = 0
+  while pass < 2 {
+    if pass == 1 { run state.leb(count) }
+    let mut i: usize = 0
+    while i < shape.properties.length() {
+      let property = shape.properties.get(i)
+      if property.atom != 0 && rt.atoms.kind(property.atom) == AtomKind.String && (property.flags & 4) != 0 {
+        let value = run unsafe propertyValue(&mut engine, context, object, i)
+        if pass == 0 { count = count + 1 }
+        else {
+          run state.atom(property.atom)
+          run unsafe writeValue(&mut state, &mut engine, context, value)
+        }
+      }
+      i = i + 1
+    }
+    pass = pass + 1
+  }
+}
+unsafe effect fn writeObjectTag<'m, S: EngineServices>(state: &mut Writer, engine: &mut Engine<'m, S>,
+  context: *mut HeapHeader, reference: *mut HeapHeader) -> () ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+  let id = object.classId
+  if id == classes.JS_CLASS_ARRAY { return run unsafe writeArray(&mut state, &mut engine, context, &object.*) }
+  if id == classes.JS_CLASS_OBJECT { return run unsafe writePlain(&mut state, &mut engine, context, &object.*) }
+  if id == classes.JS_CLASS_ARRAY_BUFFER || id == classes.JS_CLASS_SHARED_ARRAY_BUFFER {
+    let shared = id == classes.JS_CLASS_SHARED_ARRAY_BUFFER
+    if shared && (state.flags & JS_WRITE_OBJ_SAB) == 0 { return run unsafe unsupported(&mut engine, context) }
+    let buffer = unsafe buffers.snapshot(reference)
+    if buffer.detached { return run unsafe reject(&mut engine, context, b"ArrayBuffer is detached") }
+    if shared { run state.byte(16) } else { run state.byte(15) }
+    run state.leb(buffer.byteLength)
+    run state.leb(i64.toU32(buffer.maxByteLength & 4294967295))
+    if shared {
+      let address = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(buffer.data)
+      run state.quad(usize.toU64(Pointer.address<u8>(address)))
+      run state.shared.append(SharedEntry { address: address, buffer: Value.Object { reference: reference } })
+    } else {
+      run state.bytes.reserve(u32.toUsize(buffer.byteLength))
+      let mut i: u32 = 0
+      while i < buffer.byteLength {
+        run state.byte(unsafe Pointer.read<u8>(unsafe buffers.dataAt(buffer.data, i)))
+        i = i + 1
+      }
+    }
+    return ()
+  }
+  if id == classes.JS_CLASS_DATE || id == classes.JS_CLASS_NUMBER || id == classes.JS_CLASS_STRING ||
+    id == classes.JS_CLASS_BOOLEAN || id == classes.JS_CLASS_BIG_INT {
+    if id == classes.JS_CLASS_DATE { run state.byte(17) } else { run state.byte(18) }
+    if let ObjectPayload.Boxed { value } = &object.payload { return run unsafe writeValue(&mut state, &mut engine, context, value) }
+    return run unsafe reject(&mut engine, context, b"invalid boxed object")
+  }
+  if id >= classes.JS_CLASS_UINT8C_ARRAY && id <= classes.JS_CLASS_FLOAT64_ARRAY {
+    let view = unsafe buffers.view(reference)
+    run state.byte(14) run state.byte(u32.toU8(id - classes.JS_CLASS_UINT8C_ARRAY))
+    if let ObjectPayload.TypedArray { array } = &object.payload {
+      run state.leb(array.count) run state.leb(view.offset)
+      return run unsafe writeValue(&mut state, &mut engine, context, Value.Object { reference: view.buffer })
+    }
+    return run unsafe reject(&mut engine, context, b"invalid typed array")
+  }
+  return run unsafe reject(&mut engine, context, b"unsupported object class")
+}
+
+fn variableKind(kind: VariableKind) -> u32 {
+  return match kind {
+    VariableKind.Normal => 0
+    VariableKind.FunctionDeclaration => 1
+    VariableKind.NewFunctionDeclaration => 2
+    VariableKind.Catch => 3
+    VariableKind.FunctionName => 4
+    VariableKind.PrivateField => 5
+    VariableKind.PrivateMethod => 6
+    VariableKind.PrivateGetter => 7
+    VariableKind.PrivateSetter => 8
+    VariableKind.PrivateGetterSetter => 9
+    VariableKind.GlobalFunctionDeclaration => 10
+    VariableKind.Using => 11
+    VariableKind.UsingMethod => 12
+  }
+}
+fn closureKind(kind: ClosureKind) -> u32 {
+  return match kind {
+    ClosureKind.Local => 0
+    ClosureKind.Argument => 1
+    ClosureKind.Reference => 2
+    ClosureKind.GlobalReference => 3
+    ClosureKind.GlobalDeclaration => 4
+    ClosureKind.Global => 5
+    ClosureKind.ModuleDeclaration => 6
+    ClosureKind.ModuleImport => 7
+  }
+}
+unsafe effect fn writeCode<'m, S: EngineServices>(state: &mut Writer, engine: &mut Engine<'m, S>,
+  context: *mut HeapHeader, code: &ByteStorage) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  // Native final bytecode is already LE. Stream it once, replacing atom operands
+  // without making the pinned implementation's avoidable temporary code copy.
+  let mut position: usize = 0
+  run state.bytes.reserve(code.length())
+  while position < code.length() {
+    let opcode = unsafe code.byte(position)
+    if opcode == 0 || u8.toUsize(opcode) >= op.OP_COUNT {
+      return run unsafe reject(&mut engine, context, b"invalid bytecode opcode")
+    }
+    let info = op.opcodeInfo(opcode, true)
+    let size = u8.toUsize(info.size)
+    if size == 0 || size > code.length() - position {
+      return run unsafe reject(&mut engine, context, b"truncated bytecode")
+    }
+    run state.byte(opcode)
+    let mut offset: usize = 1
+    if info.format == op.OP_FMT_atom || info.format == op.OP_FMT_atom_u8 ||
+      info.format == op.OP_FMT_atom_u16 || info.format == op.OP_FMT_atom_label_u8 ||
+      info.format == op.OP_FMT_atom_label_u16 {
+      if size < 5 { return run unsafe reject(&mut engine, context, b"truncated bytecode atom") }
+      let mut atom: u32 = 0 let mut j: u32 = 0
+      while j < 4 {
+        atom = atom | u32.shiftLeft(u8.toU32(unsafe code.byte(position + 1 + u32.toUsize(j))), j * 8)
+        j = j + 1
+      }
+      let mapped = run state.atomIndex(atom)
+      run state.word(mapped, 4)
+      offset = 5
+    }
+    while offset < size { run state.byte(unsafe code.byte(position + offset)) offset = offset + 1 }
+    position = position + size
+  }
+}
+unsafe effect fn writeFunction<'m, S: EngineServices>(state: &mut Writer, engine: &mut Engine<'m, S>,
+  context: *mut HeapHeader, reference: *mut HeapHeader) -> () ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let anchor = () let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference)
+  run state.byte(12)
+  let kind: u32 = match function.kind {
+    FunctionKind.Normal => 0
+    FunctionKind.Generator => 1
+    FunctionKind.Async => 2
+    FunctionKind.AsyncGenerator => 3
+  }
+  let debug = match &function.debug { Option<FunctionDebugInfo>.Some { .. } => true _ => false }
+  let flags = boolean(function.hasPrototype) | u32.shiftLeft(boolean(function.hasSimpleParameterList), 1) |
+    u32.shiftLeft(boolean(function.isDerivedClassConstructor), 2) | u32.shiftLeft(boolean(function.needsHomeObject), 3) |
+    u32.shiftLeft(kind, 4) | u32.shiftLeft(boolean(function.newTargetAllowed), 6) |
+    u32.shiftLeft(boolean(function.superCallAllowed), 7) | u32.shiftLeft(boolean(function.superAllowed), 8) |
+    u32.shiftLeft(boolean(function.argumentsAllowed), 9) | u32.shiftLeft(boolean(debug), 10) |
+    u32.shiftLeft(boolean(function.isDirectOrIndirectEval), 11)
+  run state.word(flags, 2) run state.byte(function.mode) run state.atom(function.name)
+  run state.leb(u16.toU32(function.argumentCount))
+  run state.leb(u16.toU32(function.variableCount))
+  run state.leb(u16.toU32(function.definedArgumentCount))
+  run state.leb(u16.toU32(function.stackSize))
+  run state.leb(u16.toU32(function.varRefCount))
+  run state.leb(usize.toU32(function.closureVars.length()))
+  run state.leb(usize.toU32(function.constants.length()))
+  run state.leb(usize.toU32(function.code.length()))
+  run state.leb(usize.toU32(function.varDefs.length()))
+  let mut i: usize = 0
+  while i < function.varDefs.length() {
+    let variable = function.varDefs.get(i)
+    run state.atom(variable.name)
+    run state.leb(i64.toU32((i32.toI64(variable.scopeNext) + 1) & 4294967295))
+    run state.leb(u16.toU32(variable.varRefIndex))
+    run state.byte(u32.toU8(variableKind(variable.kind) | u32.shiftLeft(boolean(variable.isConst), 4) |
+      u32.shiftLeft(boolean(variable.isLexical), 5) | u32.shiftLeft(boolean(variable.isCaptured), 6) |
+      u32.shiftLeft(boolean(variable.hasScope), 7)))
+    i = i + 1
+  }
+  i = 0
+  while i < function.closureVars.length() {
+    let closure = function.closureVars.get(i)
+    run state.atom(closure.name) run state.leb(u16.toU32(closure.variableIndex))
+    run state.word(closureKind(closure.kind) | u32.shiftLeft(boolean(closure.isConst), 3) |
+      u32.shiftLeft(boolean(closure.isLexical), 4) | u32.shiftLeft(variableKind(closure.variableKind), 5), 2)
+    i = i + 1
+  }
+  run unsafe writeCode(&mut state, &mut engine, context, &function.code)
+  if let Option<FunctionDebugInfo>.Some { value: info } = &function.debug {
+    run state.atom(info.filename)
+    run state.leb(usize.toU32(info.pcToLine.length()))
+    run state.storage(&info.pcToLine)
+    match &info.source {
+      Option<ByteStorage>.Some { value: source } => {
+        run state.leb(usize.toU32(source.length())) run state.storage(&source)
+      }
+      Option<ByteStorage>.None => { run state.leb(0) }
+    }
+  }
+  i = 0
+  while i < function.constants.length() {
+    run unsafe writeValue(&mut state, &mut engine, context, function.constants.get(i))
+    i = i + 1
+  }
+}
+unsafe effect fn writeModule<'m, S: EngineServices>(state: &mut Writer, engine: &mut Engine<'m, S>,
+  context: *mut HeapHeader, reference: *mut HeapHeader) -> () ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let anchor = () let module = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, reference)
+  run state.byte(13) run state.atom(module.name)
+  run state.leb(usize.toU32(module.requestedModules.length()))
+  let mut i: usize = 0
+  while i < module.requestedModules.length() {
+    let requested = &module.requestedModules.asSlice()[i]
+    run state.atom(requested.name)
+    run unsafe writeValue(&mut state, &mut engine, context, requested.attributes)
+    i = i + 1
+  }
+  run state.leb(usize.toU32(module.exports.length()))
+  i = 0
+  while i < module.exports.length() {
+    let entry = module.exports.get(i)
+    match entry.binding {
+      ExportBinding.Local { variableIndex, .. } => {
+        run state.byte(0) run state.leb(i64.toU32(i32.toI64(variableIndex) & 4294967295))
+      }
+      ExportBinding.Indirect { requestedModuleIndex } => {
+        run state.byte(1) run state.leb(i64.toU32(i32.toI64(requestedModuleIndex) & 4294967295))
+        run state.atom(entry.localName)
+      }
+    }
+    run state.atom(entry.exportName)
+    i = i + 1
+  }
+  run state.leb(usize.toU32(module.starExports.length()))
+  i = 0
+  while i < module.starExports.length() {
+    run state.leb(i64.toU32(i32.toI64(module.starExports.get(i).requestedModuleIndex) & 4294967295))
+    i = i + 1
+  }
+  run state.leb(usize.toU32(module.imports.length()))
+  i = 0
+  while i < module.imports.length() {
+    let entry = module.imports.get(i)
+    run state.leb(i64.toU32(i32.toI64(entry.variableIndex) & 4294967295))
+    run state.byte(u32.toU8(boolean(entry.isStar))) run state.atom(entry.importName)
+    run state.leb(i64.toU32(i32.toI64(entry.requestedModuleIndex) & 4294967295))
+    i = i + 1
+  }
+  run state.byte(u32.toU8(boolean(module.hasTopLevelAwait)))
+  run unsafe writeValue(&mut state, &mut engine, context, module.functionObject)
+}
+unsafe effect fn writeValue<'m, S: EngineServices>(state: &mut Writer, engine: &mut Engine<'m, S>,
+  context: *mut HeapHeader, value: Value) -> () ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  if unsafe runtime.checkStackOverflow(rt, currentFrameAddress(), 0, true) {
+    let memory = engine.memory
+    return run unsafe errors.throwStackOverflow(&mut engine, memory, context)
+  }
+  match value {
+    Value.Null => { run state.byte(1) }
+    Value.Undefined => { run state.byte(2) }
+    Value.Bool { value: flag } => { run state.byte(3 + u32.toU8(boolean(flag))) }
+    Value.Int { value: number } => {
+      run state.byte(5)
+      let bits = i64.toU32(i32.toI64(number) & 4294967295)
+      let mut sign: u32 = 0 if number < 0 { sign = u32.MAX }
+      run state.leb(u32.shiftLeft(bits, 1) ^ sign)
+    }
+    Value.Float64 { value: number } => { run state.byte(6) run state.quad(f64.toBits(number)) }
+    Value.String { .. } => { run state.byte(7) run state.string(value) }
+    Value.Rope { .. } => {
+      let anchor = () let runtimeData = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+      let flat = StringOwner.adopt(run runtimeData.atoms.flatten(value))
+      drop runtimeData
+      run unsafe writeValue(&mut state, &mut engine, context, flat.get())
+    }
+    Value.ShortBigInt { value: number } => {
+      let words = [i64.toU32(i32.toI64(number) & 4294967295)]
+      run state.bigint(&words)
+    }
+    Value.BigInt { reference } => {
+      let anchor = () let number = unsafe HeapCell.payload<BigInt, ()>(&anchor, reference)
+      run state.bigint(number.limbs())
+    }
+    Value.FunctionBytecode { reference } => {
+      if (state.flags & JS_WRITE_OBJ_BYTECODE) == 0 { return run unsafe unsupported(&mut engine, context) }
+      run unsafe writeFunction(&mut state, &mut engine, context, reference)
+    }
+    Value.Module { reference } => {
+      if (state.flags & JS_WRITE_OBJ_BYTECODE) == 0 { return run unsafe unsupported(&mut engine, context) }
+      run unsafe writeModule(&mut state, &mut engine, context, reference)
+    }
+    Value.Object { reference } => {
+      let references = (state.flags & JS_WRITE_OBJ_REFERENCE) != 0
+      if references {
+        let index = state.findObject(reference)
+        if index != u32.MAX { run state.byte(19) run state.leb(index) return () }
+        run state.addObject(reference)
+      } else {
+        let mut anchor = () let object = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, reference)
+        if object.temporaryMark { return run unsafe reject(&mut engine, context, b"circular reference") }
+        object.temporaryMark = true
+      }
+      let mark = Mark { object: reference, active: !references }
+      run unsafe writeObjectTag(&mut state, &mut engine, context, reference)
+      drop mark
+    }
+    _ => { return run unsafe unsupported(&mut engine, context) }
+  }
+}
+unsafe effect fn finish(state: &mut Writer, context: *mut HeapHeader) -> () ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let mut prefix = Writer.make(0)
+  run prefix.byte(5) run prefix.leb(usize.toU32(state.atomList.length()))
+  let anchor = () let rt = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, unsafe runtime.contextRuntime(context))
+  let mut i: usize = 0
+  while i < state.atomList.length() {
+    let string = StringOwner.adopt(run rt.atoms.toValue(state.atomList.get(i), true))
+    run prefix.string(string.get())
+    i = i + 1
+  }
+  let offset = prefix.bytes.length()
+  let oldLength = state.bytes.length()
+  run state.bytes.reserve(offset)
+  i = 0
+  while i < offset { run state.byte(0) i = i + 1 }
+  i = oldLength
+  while i > 0 {
+    i = i - 1
+    let byte = state.bytes.get(i)
+    state.bytes.set(i + offset, byte)
+  }
+  i = 0
+  while i < offset { state.bytes.set(i, prefix.bytes.get(i)) i = i + 1 }
+}
+effect fn perform<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  value: Value, flags: u32) -> WriteResult ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let mut state = Writer.make(flags)
+  run unsafe writeValue(&mut state, &mut engine, context, value)
+  run unsafe finish(&mut state, context)
+  return match move state { Writer { bytes, shared, .. } => WriteResult { bytes: move bytes, shared: move shared } }
+}
+/// Serializes borrowed live engine Values. BSWAP and unknown bits are ignored.
+/// SharedEntry borrows both source object and backing; dropping the result frees
+/// only native output storage, so the caller explicitly owns the source lifetime.
+/// Requires a live context owned by this engine and a live, valid borrowed Value
+/// graph from its runtime, with exclusive runtime execution throughout the call.
+pub unsafe effect fn writeObject2<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  value: Value, flags: u32) -> WriteResult ! JsException ? &mut Allocator {
+  let result = run Effect.result(perform(&mut engine, context, value, flags))
+  return match move result {
+    Result<WriteResult, OutOfMemoryError | StringLengthError | JsException>.Success { value: output } => move output
+    Result<WriteResult, OutOfMemoryError | StringLengthError | JsException>.Failure { error } =>
+      run unsafe core.materialize(&mut engine, context, move error)
+  }
+}
+/// Same wire output, discarding (and freeing) the native non-owning SAB table.
+/// Requires the same live context, borrowed graph, and exclusivity as writeObject2.
+pub unsafe effect fn writeObject<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  value: Value, flags: u32) -> List<u8> ! JsException ? &mut Allocator {
+  let result = run unsafe writeObject2(&mut engine, context, value, flags)
+  return match move result {
+    WriteResult { bytes, shared } => { releaseShared(move shared) return move bytes }
+  }
+}

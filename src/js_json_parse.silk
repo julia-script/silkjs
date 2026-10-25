@@ -1,0 +1,461 @@
+// Native JSON parsing and source records, quickjs.c:51712-52101.
+// Source is borrowed, never copied. Runtime/context/intrinsics must remain live;
+// install the normal Object prototype and cached Array shape before calling.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.f64
+import silk.list { List }
+import silk.option { Option }
+import silk.ownership { Copy }
+import silk.result { Result }
+import silk.slice { Slice }
+import silk.u32
+import silk.usize
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types { RuntimeState, ObjectData, PropertySlot, JS_PROP_C_W_E }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime { contextRuntime, checkStackOverflow }
+import native_stack { currentFrameAddress }
+import runtime_memory { AllocationObserver }
+import js_object_allocate as objects
+import js_array_storage as arrays
+import js_array_storage { StorageOutcome }
+import js_shapes as shapes
+import js_lexer { Lexer, LexicalContext }
+import js_tokens { Token, TokenPayload, LexError }
+import js_tokens as tok
+import js_atom_data as atoms
+import js_bigint { BigIntError }
+import js_string_types { StringOwner, StringLengthError }
+import js_parser_diagnostics { DiagnosticMessage, SyntaxError }
+import js_parser_core { ParserStackOverflow }
+import js_parser_support { OwnedAtom }
+
+const NO_RECORD: usize = usize.MAX
+pub const JS_PARSE_JSON_EXT: i32 = 1
+pub enum JsonRecordKind { Empty, Primitive, Object, Array }
+pub struct JsonSourceSpan { pub start: usize, pub length: usize }
+impl Copy for JsonSourceSpan {}
+struct RecordEntry { atom: u32, record: usize, hashNext: usize }
+impl Copy for RecordEntry {}
+struct ParseRecord {
+  value: Value,
+  kind: JsonRecordKind,
+  span: JsonSourceSpan,
+  entries: List<RecordEntry>,
+  hash: List<usize>
+}
+impl ParseRecord {
+  fn empty() -> Self {
+    return Self { value: Value.Undefined, kind: JsonRecordKind.Empty,
+      span: JsonSourceSpan { start: 0, length: 0 }, entries: List<RecordEntry>.make(), hash: List<usize>.make() }
+  }
+}
+
+// Affine native owner. Call destroy before dropping, or transfer the whole owner
+// with move. Values returned by accessors are BORROWED, including original graph
+// edges displaced by duplicate keys or a later reviver. Record indices are stable.
+// The source lifetime is carried even after detaching from ParsedJson.
+pub struct JsonParseRecords<'src> {
+  runtime: *mut HeapHeader,
+  source: &'src [u8],
+  nodes: List<ParseRecord>
+}
+impl<'src> JsonParseRecords<'src> {
+  fn make(runtime: *mut HeapHeader, source: &'src [u8]) -> Self {
+    return Self { runtime: runtime, source: source, nodes: List<ParseRecord>.make() }
+  }
+  pub fn root(self: &Self) -> Option<usize> {
+    if self.nodes.length() == 0 { return Option<usize>.none() }
+    return Option<usize>.some(0)
+  }
+  pub fn originalValue(self: &Self, record: usize) -> Value { return self.nodes.asSlice()[record].value }
+  pub fn kind(self: &Self, record: usize) -> JsonRecordKind { return self.nodes.asSlice()[record].kind }
+  pub fn sourceSpan(self: &Self, record: usize) -> Option<JsonSourceSpan> {
+    let node = &self.nodes.asSlice()[record]
+    if node.kind != JsonRecordKind.Primitive { return Option<JsonSourceSpan>.none() }
+    return Option<JsonSourceSpan>.some(node.span)
+  }
+  pub fn sourceBytes(self: &Self) -> &'src [u8] { return self.source }
+  pub fn primitiveSource(self: &Self, record: usize) -> Option<&'src [u8]> {
+    let node = &self.nodes.asSlice()[record]
+    if node.kind != JsonRecordKind.Primitive { return Option<&'src [u8]>.none() }
+    return Option<&'src [u8]>.some(Slice.view(self.source, node.span.start, node.span.length))
+  }
+  pub fn childCount(self: &Self, record: usize) -> usize { return self.nodes.asSlice()[record].entries.length() }
+  pub fn arrayElement(self: &Self, record: usize, index: usize) -> Option<usize> {
+    let node = &self.nodes.asSlice()[record]
+    if node.kind != JsonRecordKind.Array || index >= node.entries.length() { return Option<usize>.none() }
+    return Option<usize>.some(node.entries.get(index).record)
+  }
+  // Deliberately matches upstream's duplicate-key asymmetry: linear lookup
+  // returns the FIRST duplicate below nine entries, hashed lookup the LAST.
+  pub fn find(self: &Self, record: usize, key: u32) -> Option<usize> {
+    let node = &self.nodes.asSlice()[record]
+    if node.kind != JsonRecordKind.Object { return Option<usize>.none() }
+    if node.hash.length() == 0 {
+      let mut i: usize = 0
+      while i < node.entries.length() {
+        let entry = node.entries.get(i)
+        if entry.atom == key { return Option<usize>.some(entry.record) }
+        i = i + 1
+      }
+    } else {
+      let mut i = node.hash.get(u32.toUsize(key) & (node.hash.length() - 1))
+      while i != NO_RECORD {
+        let entry = node.entries.get(i)
+        if entry.atom == key { return Option<usize>.some(entry.record) }
+        i = entry.hashNext
+      }
+    }
+    return Option<usize>.none()
+  }
+  // Iterative teardown does not consume native stack proportional to JSON depth.
+  // Idempotent. No heap payload borrow survives a release/finalizer callback.
+  pub unsafe fn destroy<H: HeapHooks>(self: &mut Self, hooks: &mut H) -> () {
+    let mut i: usize = 0
+    while i < self.nodes.length() {
+      let node = &mut self.nodes.asMutSlice()[i]
+      let value = node.value
+      node.value = Value.Undefined
+      drop node
+      unsafe gc.release(&mut hooks, self.runtime, value)
+      let mut j: usize = 0
+      while j < self.nodes.asSlice()[i].entries.length() {
+        let entry = self.nodes.asSlice()[i].entries.get(j)
+        let mut anchor = ()
+        let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, self.runtime)
+        rt.atoms.release(entry.atom)
+        j = j + 1
+      }
+      i = i + 1
+    }
+    self.nodes = List<ParseRecord>.make()
+  }
+  unsafe fn initialize(self: &mut Self, record: usize, value: Value, kind: JsonRecordKind,
+    start: usize, length: usize) -> () {
+    if record == NO_RECORD { return () }
+    let node = &mut self.nodes.asMutSlice()[record]
+    node.value = unsafe value.retained()
+    node.kind = kind
+    node.span = JsonSourceSpan { start: start, length: length }
+  }
+  unsafe effect fn add(self: &mut Self, parent: usize, atom: u32) -> usize
+    ! OutOfMemoryError ? &mut Allocator {
+    if parent == NO_RECORD { return NO_RECORD }
+    run self.nodes.reserve(1)
+    let index = self.nodes.length()
+    let node = &mut self.nodes.asMutSlice()[parent]
+    run node.entries.reserve(1)
+    let count = node.entries.length()
+    if node.kind == JsonRecordKind.Object && count >= 8 && count + 1 > node.hash.length() {
+      let mut size: usize = 1
+      while size <= count { size = size * 2 }
+      let mut hash = List<usize>.make()
+      run hash.reserveExact(size)
+      let mut i: usize = 0
+      while i < size { run hash.append(NO_RECORD) i = i + 1 }
+      i = 0
+      while i < count {
+        let mut entry = node.entries.get(i)
+        let bucket = u32.toUsize(entry.atom) & (size - 1)
+        entry.hashNext = hash.get(bucket)
+        node.entries.set(i, entry)
+        hash.set(bucket, i)
+        i = i + 1
+      }
+      node.hash = move hash
+    }
+    let mut next = NO_RECORD
+    if node.hash.length() != 0 {
+      let bucket = u32.toUsize(atom) & (node.hash.length() - 1)
+      next = node.hash.get(bucket)
+      node.hash.set(bucket, count)
+    }
+    // All fallible reservations precede the new owned atom edge.
+    run node.entries.append(RecordEntry { atom: atom, record: index, hashNext: next })
+    drop node
+    let mut anchor = ()
+    let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, self.runtime)
+    let retained = rt.atoms.duplicate(atom)
+    drop rt
+    run self.nodes.append(ParseRecord.empty())
+    return index
+  }
+}
+
+// Owns one parsed value edge and, when requested, an independently retained
+// record graph. takeValue/takeRecords transfer each ownership independently.
+// destroy releases whatever has not been transferred, and is idempotent.
+pub struct ParsedJson<'src> {
+  runtime: *mut HeapHeader,
+  rootValue: Value,
+  sourceRecords: Option<JsonParseRecords<'src>>
+}
+impl<'src> ParsedJson<'src> {
+  pub fn value(self: &Self) -> Value { return self.rootValue }
+  pub fn records(self: &Self) -> &Option<JsonParseRecords<'src>> { return &self.sourceRecords }
+  pub fn takeValue(self: &mut Self) -> Value { return Intrinsic.replace(self.rootValue, Value.Undefined) }
+  pub fn takeRecords(self: &mut Self) -> Option<JsonParseRecords<'src>> {
+    return Intrinsic.replace(self.sourceRecords, Option<JsonParseRecords<'src>>.none())
+  }
+  pub unsafe fn destroy<H: HeapHooks>(self: &mut Self, hooks: &mut H) -> () {
+    let value = self.takeValue()
+    unsafe gc.release(&mut hooks, self.runtime, value)
+    match &mut self.sourceRecords {
+      Option<JsonParseRecords<'src>>.Some { value: records } => { unsafe records.destroy(&mut hooks) }
+      Option<JsonParseRecords<'src>>.None => ()
+    }
+    self.sourceRecords = Option<JsonParseRecords<'src>>.none()
+  }
+}
+
+struct JsonParser<'src> {
+  lexer: Lexer<'src>, token: Token, runtime: *mut HeapHeader,
+  context: *mut HeapHeader, filename: StringOwner, records: JsonParseRecords<'src>
+}
+impl<'src> JsonParser<'src> {
+  effect fn diagnostic<T>(self: &mut Self, message: DiagnosticMessage, offset: usize) -> T
+    ! SyntaxError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let location = self.lexer.location(offset)
+    fail run message.error(self.filename.get(), offset, location)
+  }
+  effect fn syntax<T>(self: &mut Self, text: &[u8]) -> T
+    ! SyntaxError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let mut message = DiagnosticMessage.make() message.append(text)
+    let offset = self.token.start
+    return run self.diagnostic<T>(move message, offset)
+  }
+  unsafe effect fn advance(self: &mut Self) -> ()
+    ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow ? &mut Allocator {
+    if unsafe checkStackOverflow(self.runtime, currentFrameAddress(), 0, true) { fail ParserStackOverflow {} }
+    let mut anchor = ()
+    let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, self.runtime)
+    let result = run Effect.result(self.lexer.next(&mut rt.atoms))
+    drop rt
+    match move result {
+      Result<Token, LexError | BigIntError | OutOfMemoryError | StringLengthError>.Success { value } => { self.token = move value }
+      Result<Token, LexError | BigIntError | OutOfMemoryError | StringLengthError>.Failure { error } => {
+        match move error {
+          LexError e => {
+            let mut message = DiagnosticMessage.make()
+            if e.message == "Unexpected token '%c'" {
+              message.append(b"Unexpected token '") message.appendCharacter(u32.toI32(e.detail)) message.append(b"'")
+            } else { message.append(Intrinsic.stringUtf8Bytes(e.message)) }
+            return run self.diagnostic<()>(move message, e.offset)
+          }
+          BigIntError e => { fail move e }
+          OutOfMemoryError e => { fail move e }
+          StringLengthError e => { fail move e }
+        }
+      }
+    }
+  }
+  unsafe effect fn expect(self: &mut Self, kind: i32) -> ()
+    ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow ? &mut Allocator {
+    if self.token.kind != kind {
+      let mut message = DiagnosticMessage.make()
+      message.append(b"expecting '") message.appendCharacter(kind) message.append(b"'")
+      let offset = self.token.start
+      return run self.diagnostic<()>(move message, offset)
+    }
+    run unsafe self.advance()
+  }
+  unsafe effect fn propertyName(self: &mut Self) -> OwnedAtom
+    ! OutOfMemoryError | StringLengthError | SyntaxError ? &mut Allocator {
+    match &self.token.payload {
+      TokenPayload.String { value, .. } => {
+        let mut anchor = ()
+        let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, self.runtime)
+        let atom = run rt.atoms.intern(value.get())
+        return unsafe OwnedAtom.adopt(self.runtime, atom)
+      }
+      _ => ()
+    }
+    if self.lexer.context.extendedJson && self.token.kind == tok.TOK_IDENT {
+      return unsafe OwnedAtom.duplicate(self.runtime, self.token.atom())
+    }
+    return run self.syntax<OwnedAtom>(b"expecting property name")
+  }
+}
+
+fn objectReference(value: Value) -> *mut HeapHeader {
+  return match value { Value.Object { reference } => reference _ => invalidObject() }
+}
+fn invalidObject() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+// Only fresh ordinary objects: no accessor/proxy/prototype-setter dispatch.
+// Consumes incoming on every path. Duplicate definitions preserve slot order.
+unsafe effect fn defineProperty<H: HeapHooks>(s: &JsonParser, hooks: &mut H,
+  object: Value, key: u32, incoming: Value) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, objectReference(object))
+  match unsafe shapes.lookup(data.shape, key) {
+    Option<usize>.Some { value: index } => {
+      let old = data.properties.get(index)
+      data.properties.set(index, PropertySlot.Value { value: incoming })
+      drop data
+      unsafe gc.releaseProperty(&mut hooks, s.runtime, old)
+    }
+    Option<usize>.None => {
+      let result = run Effect.result(unsafe shapes.addProperty(s.runtime, &mut data, key, u32.toU8(JS_PROP_C_W_E)))
+      match move result {
+        Result<shapes.AddResult, OutOfMemoryError>.Success { value } => {
+          data.properties.set(value.index, PropertySlot.Value { value: incoming })
+          drop data
+          unsafe gc.releaseOptional(&mut hooks, s.runtime, value.retiredShape)
+        }
+        Result<shapes.AddResult, OutOfMemoryError>.Failure { error } => {
+          drop data unsafe gc.release(&mut hooks, s.runtime, incoming) fail move error
+        }
+      }
+    }
+  }
+}
+
+unsafe effect fn parseValue<H: HeapHooks>(s: &mut JsonParser, hooks: &mut H,
+  memory: &AllocationObserver, record: usize) -> Value
+  ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow ? &mut Allocator {
+  let mut value = Value.Undefined
+  let result = run Effect.result(unsafe parseValueInto(&mut s, &mut hooks, memory, record, &mut value))
+  match move result {
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow>.Success { .. } => { return value }
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow>.Failure { error } => {
+      unsafe gc.release(&mut hooks, s.runtime, value)
+      fail move error
+    }
+  }
+}
+unsafe effect fn parseValueInto<H: HeapHooks>(s: &mut JsonParser, hooks: &mut H,
+  memory: &AllocationObserver, record: usize, value: &mut Value) -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow ? &mut Allocator {
+  if unsafe checkStackOverflow(s.runtime, currentFrameAddress(), 0, true) { fail ParserStackOverflow {} }
+  if s.token.kind == 123 {
+    run unsafe s.advance()
+    value.* = run unsafe objects.object(&mut hooks, memory, s.context)
+    unsafe s.records.initialize(record, value.*, JsonRecordKind.Object, 0, 0)
+    if s.token.kind != 125 {
+      while true {
+        let name = run unsafe s.propertyName()
+        run unsafe s.advance()
+        run unsafe s.expect(58)
+        let child = run unsafe s.records.add(record, name.get())
+        let property = run unsafe parseValue(&mut s, &mut hooks, memory, child)
+        run unsafe defineProperty(&s.*, &mut hooks, value.*, name.get(), property)
+        if s.token.kind != 44 { break }
+        run unsafe s.advance()
+        if s.lexer.context.extendedJson && s.token.kind == 125 { break }
+      }
+    }
+    run unsafe s.expect(125)
+    return ()
+  }
+  if s.token.kind == 91 {
+    run unsafe s.advance()
+    value.* = run unsafe objects.array(&mut hooks, memory, s.context)
+    unsafe s.records.initialize(record, value.*, JsonRecordKind.Array, 0, 0)
+    if s.token.kind != 93 {
+      while true {
+        let child = run unsafe s.records.add(record, 0)
+        let element = run unsafe parseValue(&mut s, &mut hooks, memory, child)
+        let accepted = run unsafe arrays.appendFastElement(&mut hooks, s.context, objectReference(value.*), element)
+        // The new private array has an unmodified writable length descriptor.
+        if accepted != StorageOutcome.Accepted { return invalidObject() }
+        if s.token.kind != 44 { break }
+        run unsafe s.advance()
+        if s.lexer.context.extendedJson && s.token.kind == 93 { break }
+      }
+    }
+    run unsafe s.expect(93)
+    return ()
+  }
+  let mut primitive = false
+  let mut accepted = true
+  match &s.token.payload {
+    TokenPayload.String { value: string, .. } => { value.* = unsafe string.get().retained() primitive = true }
+    TokenPayload.Number { value: number } => { value.* = Value.number(number) primitive = true }
+    _ => {
+      if s.token.kind == tok.TOK_IDENT {
+        let name = s.token.atom()
+        if name == atoms.JS_ATOM_false || name == atoms.JS_ATOM_true {
+          value.* = Value.Bool { value: name == atoms.JS_ATOM_true } primitive = true
+        } else if name == atoms.JS_ATOM_null { value.* = Value.Null primitive = true }
+        else if name == atoms.JS_ATOM_NaN && s.lexer.context.extendedJson {
+          value.* = Value.Float64 { value: f64.fromBits(0x7ff8000000000000) }
+        } else if name == atoms.JS_ATOM_Infinity && s.lexer.context.extendedJson {
+          value.* = Value.Float64 { value: f64.fromBits(0x7ff0000000000000) }
+        } else { accepted = false }
+      } else { accepted = false }
+    }
+  }
+  if !accepted {
+    if s.token.kind == tok.TOK_EOF { return run s.syntax<()>(b"Unexpected end of JSON input") }
+    let mut message = DiagnosticMessage.make()
+    let offset = s.token.start
+    message.append(b"unexpected token: '")
+    message.append(Slice.view(s.lexer.sourceBytes(), offset, s.lexer.offset - offset))
+    message.append(b"'")
+    return run s.diagnostic<()>(move message, offset)
+  }
+  // As in the pinned source, bare extended NaN/Infinity identifiers leave the
+  // record Empty/Undefined. Signed numeric forms have ordinary primitive spans.
+  if primitive {
+    unsafe s.records.initialize(record, value.*, JsonRecordKind.Primitive, s.token.start, s.lexer.offset - s.token.start)
+  }
+  run unsafe s.advance()
+}
+
+unsafe effect fn parseDocument<H: HeapHooks>(s: &mut JsonParser, hooks: &mut H,
+  memory: &AllocationObserver, captureRecords: bool, value: &mut Value) -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow ? &mut Allocator {
+  run unsafe s.advance()
+  let mut record = NO_RECORD
+  if captureRecords { run s.records.nodes.append(ParseRecord.empty()) record = 0 }
+  value.* = run unsafe parseValue(&mut s, &mut hooks, memory, record)
+  if s.token.kind != tok.TOK_EOF { return run s.syntax<()>(b"unexpected data at the end") }
+}
+
+// JS_ParseJSON3: filename is a borrowed string Value, source is borrowed UTF-8.
+// Success transfers owned value/records; all failures clean every acquired edge.
+// Lexical failures become SyntaxError with filename and one-based coordinates.
+// No FunctionDef, bytecode compiler state, reviver, or intrinsic fallback is used.
+pub unsafe effect fn parse<'src, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, source: &'src [u8], filename: Value,
+  extended: bool, captureRecords: bool) -> ParsedJson<'src>
+  ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow ? &mut Allocator {
+  let runtime = unsafe contextRuntime(context)
+  let mut s = JsonParser { lexer: Lexer.make(source, LexicalContext.jsonSource(extended)),
+    token: Token.empty(32, 0, 0), runtime: runtime, context: context,
+    filename: StringOwner.borrowed(filename), records: JsonParseRecords.make(runtime, source) }
+  unsafe HeapCell.retain(context)
+  let mut value = Value.Undefined
+  let result = run Effect.result(unsafe parseDocument(&mut s, &mut hooks, memory, captureRecords, &mut value))
+  match move result {
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow>.Success { .. } => {
+      let records = Intrinsic.replace(s.records, JsonParseRecords.make(runtime, source))
+      let mut captured = Option<JsonParseRecords<'src>>.none()
+      if captureRecords { captured = Option<JsonParseRecords<'src>>.some(move records) }
+      unsafe gc.releaseHeader(&mut hooks, runtime, context)
+      return ParsedJson { runtime: runtime, rootValue: value, sourceRecords: move captured }
+    }
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow>.Failure { error } => {
+      unsafe s.records.destroy(&mut hooks)
+      unsafe gc.release(&mut hooks, runtime, value)
+      unsafe gc.releaseHeader(&mut hooks, runtime, context)
+      fail move error
+    }
+  }
+}
+// JS_ParseJSON2 / JS_ParseJSON wrappers return the single owned parsed edge.
+pub unsafe effect fn parseJSON2<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, source: &[u8], filename: Value, flags: i32) -> Value
+  ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow ? &mut Allocator {
+  let mut parsed = run unsafe parse(&mut hooks, memory, context, source, filename, (flags & JS_PARSE_JSON_EXT) != 0, false)
+  return parsed.takeValue()
+}
+pub unsafe effect fn parseJSON<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, source: &[u8], filename: Value) -> Value
+  ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow ? &mut Allocator {
+  return run unsafe parseJSON2(&mut hooks, memory, context, source, filename, 0)
+}

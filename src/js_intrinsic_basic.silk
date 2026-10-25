@@ -1,0 +1,256 @@
+//! JS_NewContextRaw and JS_AddIntrinsicBasicObjects, quickjs.c:2642-2675,
+//! 59826-59965. This is the raw realm bootstrap, not JS_AddIntrinsicBaseObjects.
+//! The runtime, observer and allocator must belong to the same live engine.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.option { Option }
+import silk.result { Result }
+import silk.u32
+import runtime_memory { AllocationObserver }
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types {
+  ContextState, ObjectData, ObjectPayload, BuiltinFamily, NativeFunctionId, NativeCallProtocol,
+  JS_NATIVE_ERROR_COUNT, JS_PROP_INITIAL_HASH_SIZE, JS_PROP_WRITABLE, JS_PROP_CONFIGURABLE,
+  JS_PROP_LENGTH, JS_PROP_GETSET,
+}
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_shapes as shapes
+import js_object_allocate as objects
+import js_native_functions as functions
+import js_prototypes as prototypes
+import js_intrinsic_properties { IntrinsicDefinitions, JS_NEW_CTOR_PROTO_CLASS }
+import js_intrinsic_properties as properties
+import js_coercion_host { CoercionHooks }
+import js_property_host { OwnPropertyHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_exceptions { JsException }
+import js_atom_data as atoms
+import js_class_data as classes
+
+fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+fn reference(value: Value) -> *mut HeapHeader {
+  return match value {
+    Value.Object { reference } => reference
+    _ => invariant()
+  }
+}
+fn builtin(family: BuiltinFamily, method: u32) -> NativeFunctionId {
+  return NativeFunctionId.Builtin { family: family, method: method }
+}
+effect fn exceptionValue(error: JsException) -> Value { drop error return Value.Exception }
+
+unsafe effect fn allocateObject<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, prototype: Value, classId: u32,
+  capacity: i32) -> Value ! JsException ? &mut Allocator {
+  let allocated = run Effect.result(unsafe objects.withPrototypeClassCapacity(&mut hooks,
+    memory, context, prototype, classId, capacity))
+  return match move allocated {
+    Result<Value, OutOfMemoryError>.Success { value } => value
+    Result<Value, OutOfMemoryError>.Failure { .. } => run unsafe hooks.throwOutOfMemory(context)
+  }
+}
+
+unsafe effect fn constructorPrototype<H: CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, constructor: Value) -> Value ! JsException ? &mut Allocator {
+  let result = run Effect.result(unsafe hooks.getProperty(context, constructor, atoms.JS_ATOM_prototype))
+  return match move result {
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => value
+    Result<Value, OutOfMemoryError | JsException>.Failure { error } => {
+      match move error {
+        OutOfMemoryError allocation => run unsafe hooks.throwOutOfMemory(context)
+        JsException signal => { fail move signal }
+      }
+    }
+  }
+}
+
+fn nativeErrorName(kind: u32) -> &'static [u8] {
+  return match kind {
+    0 => b"EvalError"
+    1 => b"RangeError"
+    2 => b"ReferenceError"
+    3 => b"SyntaxError"
+    4 => b"TypeError"
+    5 => b"URIError"
+    6 => b"InternalError"
+    7 => b"AggregateError"
+    8 => b"SuppressedError"
+    _ => invariant()
+  }
+}
+unsafe effect fn addNativeErrors<H: HeapHooks + OwnPropertyHooks + CoercionHooks
+  + PropertyWriteHooks + IntrinsicDefinitions>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, errorConstructor: Value) -> () ! JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  let mut kind: u32 = 0
+  while u32.toUsize(kind) < JS_NATIVE_ERROR_COUNT {
+    let length = match kind { 7 => 2 8 => 3 _ => 1 }
+    let constructor = run unsafe properties.constructor(&mut hooks, memory, context, -1,
+      nativeErrorName(kind), builtin(BuiltinFamily.Error, 0), length,
+      NativeCallProtocol.ConstructorOrFunctionMagic, u32.toI32(kind), errorConstructor,
+      Option<NativeFunctionId>.none(), Option<NativeFunctionId>.some(builtin(BuiltinFamily.Error, kind + 2)), 0)
+    // JS_GetProperty's pending exception is installed before releasing func_obj.
+    let prototype = run Effect.catch<JsException>(unsafe constructorPrototype(&mut hooks,
+      context, constructor), exceptionValue)
+    let mut anchor = ()
+    let state = unsafe HeapCell.payloadMut<ContextState, ()>(&mut anchor, context)
+    state.nativeErrorPrototypes[u32.toUsize(kind)] = prototype
+    drop state
+    unsafe gc.release(&mut hooks, rt, constructor)
+    if prototype.isException() { fail JsException {} }
+    kind = kind + 1
+  }
+}
+
+unsafe effect fn allocateShape<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  prototype: Value, capacity: usize) -> *mut HeapHeader ! JsException ? &mut Allocator {
+  let allocated = run Effect.result(unsafe shapes.create(unsafe runtime.contextRuntime(context),
+    reference(prototype), JS_PROP_INITIAL_HASH_SIZE, capacity))
+  return match move allocated {
+    Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value
+    Result<*mut HeapHeader, OutOfMemoryError>.Failure { .. } => run unsafe hooks.throwOutOfMemory(context)
+  }
+}
+unsafe effect fn addShapeProperty<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  shape: *mut HeapHeader, atom: u32, flags: u32) -> () ! JsException ? &mut Allocator {
+  let added = run Effect.result(unsafe shapes.addShapeProperty(unsafe runtime.contextRuntime(context),
+    shape, atom, u32.toU8(flags)))
+  match move added {
+    Result<usize, OutOfMemoryError>.Success { .. } => ()
+    Result<usize, OutOfMemoryError>.Failure { .. } => run unsafe hooks.throwOutOfMemory(context)
+  }
+}
+
+/// Requires fresh allocateContextStorage storage. Every successful allocation is
+/// immediately transferred to its source root; failure leaves that partial graph
+/// owned by context. The caller must release its context ownership on failure.
+/// Object/Function prototype tables are only reserved here: BaseObjects installs
+/// them later, after the minimum realm needed for exceptions and compilation.
+pub unsafe effect fn addBasic<H: HeapHooks + OwnPropertyHooks + CoercionHooks
+  + PropertyWriteHooks + IntrinsicDefinitions>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader) -> () ! JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  let objectFields = u32.toI32(hooks.tableLength(builtin(BuiltinFamily.Object, 1))) + 1
+  let objectPrototype = run Effect.catch<JsException>(unsafe allocateObject(&mut hooks,
+    memory, context, Value.Null, classes.JS_CLASS_OBJECT, objectFields), exceptionValue)
+  unsafe runtime.setClassPrototype(&mut hooks, context, classes.JS_CLASS_OBJECT, objectPrototype)
+  if objectPrototype.isException() { fail JsException {} }
+  unsafe prototypes.setImmutablePrototype(objectPrototype)
+
+  // name, length and constructor, plus the later caller/arguments accessors.
+  let functionFields = u32.toI32(hooks.tableLength(builtin(BuiltinFamily.Function, 1))) + 3 + 2
+  let functionPrototype = run Effect.catch<JsException>(unsafe functions.newFunctionWithPrototype(
+    &mut hooks, memory, context, builtin(BuiltinFamily.Function, 0), b"", 0,
+    NativeCallProtocol.Generic, 0, objectPrototype, functionFields), exceptionValue)
+  let mut functionAnchor = ()
+  let functionContext = unsafe HeapCell.payloadMut<ContextState, ()>(&mut functionAnchor, context)
+  functionContext.functionPrototype = functionPrototype
+  drop functionContext
+  if functionPrototype.isException() { fail JsException {} }
+  unsafe runtime.setClassPrototype(&mut hooks, context, classes.JS_CLASS_BYTECODE_FUNCTION,
+    unsafe functionPrototype.retained())
+
+  let global = run Effect.catch<JsException>(unsafe allocateObject(&mut hooks, memory, context,
+    objectPrototype, classes.JS_CLASS_GLOBAL_OBJECT, 64), exceptionValue)
+  let mut globalAnchor = ()
+  let globalContext = unsafe HeapCell.payloadMut<ContextState, ()>(&mut globalAnchor, context)
+  globalContext.globalObject = global
+  drop globalContext
+  if global.isException() { fail JsException {} }
+  // Global property creation requires this table. A recovered allocator must not
+  // let bootstrap continue with an exception sentinel in place of the object.
+  let uninitialized = run Effect.catch<JsException>(unsafe allocateObject(&mut hooks, memory,
+    context, Value.Null, classes.JS_CLASS_OBJECT, 4), exceptionValue)
+  let mut uninitializedAnchor = ()
+  let globalData = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut uninitializedAnchor, reference(global))
+  match &mut globalData.payload {
+    ObjectPayload.GlobalObject { global: storage } => { storage.uninitializedVariables = uninitialized }
+    _ => invariant()
+  }
+  drop globalData
+  if uninitialized.isException() { fail JsException {} }
+  let globalVariables = run Effect.catch<JsException>(unsafe allocateObject(&mut hooks, memory,
+    context, Value.Null, classes.JS_CLASS_OBJECT, 16), exceptionValue)
+  let mut variablesAnchor = ()
+  let variablesContext = unsafe HeapCell.payloadMut<ContextState, ()>(&mut variablesAnchor, context)
+  variablesContext.globalVarObject = globalVariables
+  drop variablesContext
+  if globalVariables.isException() { fail JsException {} }
+
+  let errorConstructor = run unsafe properties.constructor(&mut hooks, memory, context,
+    u32.toI32(classes.JS_CLASS_ERROR), b"Error", builtin(BuiltinFamily.Error, 0), 1,
+    NativeCallProtocol.ConstructorOrFunctionMagic, -1, Value.Undefined,
+    Option<NativeFunctionId>.some(builtin(BuiltinFamily.Error, 0)),
+    Option<NativeFunctionId>.some(builtin(BuiltinFamily.Error, 1)), 0)
+  let nativeErrors = run Effect.result(unsafe addNativeErrors(&mut hooks, memory, context, errorConstructor))
+  unsafe gc.release(&mut hooks, rt, errorConstructor)
+  match move nativeErrors {
+    Result<(), JsException>.Success { .. } => ()
+    Result<(), JsException>.Failure { error } => { fail move error }
+  }
+
+  let arrayConstructor = run unsafe properties.constructor(&mut hooks, memory, context,
+    u32.toI32(classes.JS_CLASS_ARRAY), b"Array", builtin(BuiltinFamily.Array, 0), 1,
+    NativeCallProtocol.ConstructorOrFunction, 0, Value.Undefined,
+    Option<NativeFunctionId>.some(builtin(BuiltinFamily.Array, 0)),
+    Option<NativeFunctionId>.some(builtin(BuiltinFamily.Array, 1)), JS_NEW_CTOR_PROTO_CLASS)
+  let mut arrayAnchor = ()
+  let arrayContext = unsafe HeapCell.payloadMut<ContextState, ()>(&mut arrayAnchor, context)
+  arrayContext.arrayConstructor = arrayConstructor
+  let arrayPrototype = arrayContext.classPrototypes.get(u32.toUsize(classes.JS_CLASS_ARRAY))
+  drop arrayContext
+  let arrayData = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut arrayAnchor, reference(arrayPrototype))
+  arrayData.isStandardArrayPrototype = true
+  drop arrayData
+
+  let arrayShape = run unsafe allocateShape(&mut hooks, context, arrayPrototype, 1)
+  let mut arrayShapeAnchor = ()
+  let arrayShapeContext = unsafe HeapCell.payloadMut<ContextState, ()>(&mut arrayShapeAnchor, context)
+  arrayShapeContext.arrayShape = arrayShape
+  drop arrayShapeContext
+  run unsafe addShapeProperty(&mut hooks, context, arrayShape, atoms.JS_ATOM_length,
+    JS_PROP_WRITABLE | JS_PROP_LENGTH)
+
+  let argumentsShape = run unsafe allocateShape(&mut hooks, context, objectPrototype, 3)
+  let mut argumentsAnchor = ()
+  let argumentsContext = unsafe HeapCell.payloadMut<ContextState, ()>(&mut argumentsAnchor, context)
+  argumentsContext.argumentsShape = argumentsShape
+  drop argumentsContext
+  run unsafe addShapeProperty(&mut hooks, context, argumentsShape, atoms.JS_ATOM_length,
+    JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+  run unsafe addShapeProperty(&mut hooks, context, argumentsShape, atoms.JS_ATOM_Symbol_iterator,
+    JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+  run unsafe addShapeProperty(&mut hooks, context, argumentsShape, atoms.JS_ATOM_callee, JS_PROP_GETSET)
+
+  let mappedShape = run unsafe allocateShape(&mut hooks, context, objectPrototype, 3)
+  let mut mappedAnchor = ()
+  let mappedContext = unsafe HeapCell.payloadMut<ContextState, ()>(&mut mappedAnchor, context)
+  mappedContext.mappedArgumentsShape = mappedShape
+  drop mappedContext
+  run unsafe addShapeProperty(&mut hooks, context, mappedShape, atoms.JS_ATOM_length,
+    JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+  run unsafe addShapeProperty(&mut hooks, context, mappedShape, atoms.JS_ATOM_Symbol_iterator,
+    JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+  run unsafe addShapeProperty(&mut hooks, context, mappedShape, atoms.JS_ATOM_callee,
+    JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+}
+
+/// Returns the embedding's one owned context reference only after BasicObjects is
+/// complete. Failed construction drops that reference through the normal GC path;
+/// native-function/auto-init realm cycles remain collector-owned, as JS_FreeContext.
+pub unsafe effect fn createRaw<H: HeapHooks + OwnPropertyHooks + CoercionHooks
+  + PropertyWriteHooks + IntrinsicDefinitions>(hooks: &mut H, memory: &AllocationObserver,
+  runtimePointer: *mut HeapHeader) -> *mut HeapHeader ! OutOfMemoryError | JsException ? &mut Allocator {
+  let context = run unsafe runtime.allocateContextStorage(runtimePointer)
+  let initialized = run Effect.result(unsafe addBasic(&mut hooks, memory, context))
+  match move initialized {
+    Result<(), JsException>.Success { .. } => { return context }
+    Result<(), JsException>.Failure { error } => {
+      unsafe gc.releaseHeader(&mut hooks, runtimePointer, context)
+      fail move error
+    }
+  }
+}

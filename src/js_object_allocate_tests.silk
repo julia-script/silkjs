@@ -1,0 +1,161 @@
+import silk.allocator { Allocator, OutOfMemoryError, SystemAllocator }
+import silk.effect { Effect }
+import silk.layout { Layout }
+import silk.list { List }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.testing { AssertionError, Testing }
+import silk.usize
+import runtime_memory { RuntimeAllocator }
+import js_heap { HeapCell, HeapHeader }
+import js_core_types { ContextState, ObjectData, ShapeData, PropertySlot, NativeFunctionId, WeakRefHeader }
+import js_gc { HeapHooks, Tracer }
+import js_gc as gc
+import js_runtime as runtime
+import js_object_allocate as objects
+import js_shapes as shapes
+import js_class_data as classes
+import js_value { Value }
+import js_strings { Strings }
+import js_string_types { StringLengthError, stringReference }
+
+fn trap() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+struct Hooks { finalized: usize }
+impl HeapHooks for Hooks {
+  unsafe fn traceClass(self: &mut Self, runtime: *mut HeapHeader, object: *mut HeapHeader,
+    callback: NativeFunctionId, tracer: &mut Tracer) -> () {
+    if !unsafe gc.traceCorePayload(object, &mut tracer) { trap() }
+  }
+  unsafe fn finalizeClass(self: &mut Self, runtime: *mut HeapHeader, object: *mut HeapHeader,
+    callback: NativeFunctionId) -> () {
+    self.finalized = self.finalized + 1
+    if !unsafe gc.finalizeCorePayload(&mut self, runtime, object) { trap() }
+  }
+  unsafe effect fn sweepWeak(self: &mut Self, runtime: *mut HeapHeader, node: *mut WeakRefHeader) -> () ? &mut Allocator { trap() }
+  unsafe fn destroyAuxiliary(self: &mut Self, runtime: *mut HeapHeader, node: *mut HeapHeader) -> () { trap() }
+}
+fn reference(value: Value) -> *mut HeapHeader {
+  return match value { Value.Object { reference } => reference _ => trap() }
+}
+unsafe fn rc(node: *mut HeapHeader) -> i32 {
+  let anchor = () unsafe { return Pointer.borrow<(), HeapHeader>(&anchor, node).referenceCount }
+}
+unsafe fn shape(value: Value) -> *mut HeapHeader {
+  let anchor = () unsafe { return HeapCell.payload<ObjectData, ()>(&anchor, reference(value)).shape }
+}
+effect fn refused(error: OutOfMemoryError) -> Value { drop error return Value.Exception }
+struct FaultAllocator { parent: RuntimeAllocator<SystemAllocator>, remaining: usize }
+impl Allocator for FaultAllocator {
+  effect fn allocate(self: &mut Self, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
+    if self.remaining == 0 { return run Allocator.outOfMemory() }
+    self.remaining = self.remaining - 1
+    return run Allocator.allocate(move layout) |> Effect.provideMut<Allocator>(&mut self.parent)
+  }
+}
+
+test effect fn cachedArrayShapeAndPrototypeEdgesSurviveOriginalOwners() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe runtime.allocateContextStorage(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks { finalized: 0 }
+  let first = run unsafe objects.withPrototypeClass(&mut hooks, &observer, ctx, Value.Null, classes.JS_CLASS_ARRAY)
+    |> Effect.provideMut<Allocator>(&mut memory)
+  let cached = unsafe shape(first)
+  unsafe HeapCell.retain(cached)
+  let mut anchor = ()
+  let context = unsafe HeapCell.payloadMut<ContextState, ()>(&mut anchor, ctx)
+  context.arrayShape = cached
+  drop context
+  unsafe gc.release(&mut hooks, rt, first)
+  let array = run unsafe objects.array(&mut hooks, &observer, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(array))
+  let length = match data.properties.get(0) { PropertySlot.Value { value: Value.Int { value } } => value _ => -1 }
+  run Testing.expect(data.fastArray && data.isExotic && length == 0
+    && Pointer.address<HeapHeader>(data.shape) == Pointer.address<HeapHeader>(cached),
+    "cached construction resets length and reuses the retained shape")
+  drop data
+  let child = run unsafe objects.withPrototype(&mut hooks, &observer, ctx, array) |> Effect.provideMut<Allocator>(&mut memory)
+  let sibling = run unsafe objects.withPrototype(&mut hooks, &observer, ctx, array) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(Pointer.address<HeapHeader>(unsafe shape(child)) == Pointer.address<HeapHeader>(unsafe shape(sibling)),
+    "objects with the same prototype share their empty shape")
+  unsafe gc.release(&mut hooks, rt, array)
+  unsafe gc.release(&mut hooks, rt, child)
+  run Testing.expect(hooks.finalized == 1, "the surviving sibling's shared shape retains its prototype")
+  unsafe gc.release(&mut hooks, rt, sibling)
+  run Testing.expect(hooks.finalized == 2, "last shape owner releases prototype exactly once")
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx)
+  run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(memory.stats().usedBytes == 0 && observer.stats().allocationCount == 0,
+    "cached shape and native property buffers are fully reclaimed")
+}
+
+test effect fn unpublishedArrayFailureReclaimsEveryCloneAndNeverDispatchesFinalizer() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut failAfter: usize = 0
+  while failAfter < 7 {
+    let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+    let observer = run memory.observe()
+    let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+    let ctx = run unsafe runtime.allocateContextStorage(rt) |> Effect.provideMut<Allocator>(&mut memory)
+    unsafe runtime.setGCThreshold(rt, usize.MAX)
+    let base = run unsafe shapes.empty(rt, Pointer.null<HeapHeader>()) |> Effect.provideMut<Allocator>(&mut memory)
+    let before = memory.stats().usedBytes
+    unsafe HeapCell.retain(base)
+    let mut fault = FaultAllocator { parent: move memory, remaining: failAfter }
+    let mut hooks = Hooks { finalized: 0 }
+    let result = run Effect.catchAll(unsafe objects.fromShape(&mut hooks, &observer, ctx, base,
+      classes.JS_CLASS_ARRAY, Option<List<PropertySlot>>.none()), refused) |> Effect.provideMut<Allocator>(&mut fault)
+    let accepted = !result.isException()
+    unsafe gc.release(&mut hooks, rt, result)
+    run Testing.expect(unsafe rc(base) == 1 && fault.parent.stats().usedBytes == before,
+      "every object/slot/shape-clone allocation failure restores input ownership")
+    if accepted { run Testing.expect(hooks.finalized == 1, "published array is finalized once") }
+    else { run Testing.expect(hooks.finalized == 0, "unpublished partial array never invokes class callbacks") }
+    run Testing.expect(accepted == (failAfter >= 5), "fault sweep reaches all five mandatory allocations and then succeeds")
+    unsafe gc.releaseHeader(&mut hooks, rt, base)
+    unsafe gc.releaseHeader(&mut hooks, rt, ctx)
+    run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut fault)
+    run Testing.expect(observer.stats().usedBytes == 0, "failed construction leaves no orphaned shape hash entry")
+    failAfter = failAfter + 1
+  }
+}
+
+test effect fn suppliedPropertyOwnershipTransfersOnSuccessAndIsConsumedOnFailure() -> ()
+  ! OutOfMemoryError | StringLengthError | AssertionError<'static> {
+  let mut attempt: usize = 0
+  while attempt < 2 {
+    let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+    let observer = run memory.observe()
+    let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+    let ctx = run unsafe runtime.allocateContextStorage(rt) |> Effect.provideMut<Allocator>(&mut memory)
+    let mut hooks = Hooks { finalized: 0 }
+    let first = run unsafe objects.withPrototypeClass(&mut hooks, &observer, ctx, Value.Null, classes.JS_CLASS_ARRAY)
+      |> Effect.provideMut<Allocator>(&mut memory)
+    let cached = unsafe shape(first)
+    unsafe HeapCell.retain(cached)
+    let text = run Strings.fromLatin1(b"owned-property") |> Effect.provideMut<Allocator>(&mut memory)
+    let retained = unsafe text.retained()
+    let mut slots = List<PropertySlot>.make()
+    run slots.reserveExact(2) |> Effect.provideMut<Allocator>(&mut memory)
+    run slots.append(PropertySlot.Value { value: retained }) |> Effect.provideMut<Allocator>(&mut memory)
+    let mut fault = FaultAllocator { parent: move memory, remaining: attempt }
+    let result = run Effect.catchAll(unsafe objects.fromShape(&mut hooks, &observer, ctx, cached,
+      classes.JS_CLASS_OBJECT, Option<List<PropertySlot>>.some(move slots)), refused) |> Effect.provideMut<Allocator>(&mut fault)
+    run Testing.expect(result.isException() == (attempt == 0), "supplied slots need only the object allocation")
+    if !result.isException() {
+      let anchor = ()
+      let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(result))
+      let same = match data.properties.get(0) { PropertySlot.Value { value } => Strings.compare(value, text) == 0 _ => false }
+      run Testing.expect(same && unsafe rc(stringReference(text)) == 2, "supplied string value remains owned by the published object")
+    }
+    unsafe gc.release(&mut hooks, rt, result)
+    run Testing.expect(unsafe rc(stringReference(text)) == 1 && unsafe rc(cached) == 1,
+      "success destruction and failed construction consume exactly one incoming reference")
+    unsafe gc.release(&mut hooks, rt, text)
+    unsafe gc.release(&mut hooks, rt, first)
+    unsafe gc.releaseHeader(&mut hooks, rt, ctx)
+    run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut fault)
+    run Testing.expect(observer.stats().allocationCount == 0, "supplied backing is reclaimed in both outcomes")
+    attempt = attempt + 1
+  }
+}

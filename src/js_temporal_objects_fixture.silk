@@ -1,0 +1,193 @@
+//! Actual Engine Temporal semantics and independently numbered allocation failures.
+import silk.allocator { Allocator, OutOfMemoryError, SystemAllocator }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.list { List }
+import silk.layout { Layout }
+import silk.pointer { Pointer }
+import silk.usize
+import silk.writer { Writer, WriterError }
+import silk.os_writer { StdoutWriter, StderrWriter }
+import byte_buffer { ByteBuffer }
+import js_engine { Engine }
+import js_engine_no_host { NoHostServices }
+import js_atomics_native { WaiterDomain, SynchronizationError }
+import js_heap { HeapHeader }
+import js_value { Value }
+import js_exceptions { JsException }
+import js_coercion_host { CoercionHooks }
+import js_exceptions as exceptions
+import js_runtime as runtime
+import js_runtime_registry { ClassIdAllocator }
+import js_gc as gc
+import js_intrinsic_install as intrinsics
+import js_intrinsic_install_support as install
+import js_eval as evaluation
+import js_strings { Strings }
+import js_intl as intl
+import js_intl_common as common
+import js_temporal as temporal
+import js_temporal_objects_cases_generated as cases
+import native_stack as stack
+import runtime_memory { RuntimeAllocator, AllocationObserver }
+
+unsafe extern "C" fn getenv(name: *const u8) -> ?[*]const u8
+  with Intrinsic.foreign(noCapture: ("name",))
+effect fn clockOnly() -> bool {
+  let name = b"SILK_TEMPORAL_CLOCK_ONLY\0"
+  return !Pointer.isNullMany<u8>(unsafe getenv(Pointer.fromRef<u8>(&name[0])))
+}
+
+struct FaultAllocator { parent: RuntimeAllocator<SystemAllocator>, remaining: usize, failed: bool }
+impl Allocator for FaultAllocator {
+  effect fn allocate(self: &mut Self, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
+    if self.remaining == 0 { self.remaining = usize.MAX self.failed = true return run Allocator.outOfMemory() }
+    if self.remaining != usize.MAX { self.remaining = self.remaining - 1 }
+    return run Allocator.allocate(move layout) |> Effect.provideMut<Allocator>(&mut self.parent)
+  }
+}
+unsafe effect fn installFamilies<'m>(engine: &mut Engine<'m, NoHostServices>, memory: &AllocationObserver, context: *mut HeapHeader, namespace: &ClassIdAllocator) -> () ! JsException ? &mut Allocator {
+  run unsafe intl.addIntrinsic(&mut engine, memory, context, namespace)
+  run unsafe temporal.addIntrinsic(&mut engine, memory, context, namespace)
+}
+unsafe effect fn setup<'m>(engine: &mut Engine<'m, NoHostServices>, memory: &AllocationObserver, rt: *mut HeapHeader, namespace: &ClassIdAllocator) -> *mut HeapHeader ! OutOfMemoryError | JsException ? &mut Allocator {
+  let context = run unsafe intrinsics.create(&mut engine, memory, rt)
+  let installed = run Effect.result(unsafe installFamilies(&mut engine, memory, context, namespace))
+  match move installed { Result<(), JsException>.Success { .. } => { return context } Result<(), JsException>.Failure { error } => { unsafe gc.releaseHeader(&mut engine, rt, context) fail move error } }
+}
+unsafe effect fn exposeOther<'m>(engine: &mut Engine<'m, NoHostServices>, memory: &AllocationObserver, context: *mut HeapHeader, namespace: &ClassIdAllocator) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  let other = run unsafe setup(&mut engine, memory, rt, namespace)
+  let got = run Effect.result(unsafe common.get(&mut engine, other, unsafe install.global(other), b"Temporal"))
+  let exported = match move got { Result<Value, JsException>.Success { value } => value Result<Value, JsException>.Failure { error } => { unsafe gc.releaseHeader(&mut engine, rt, other) fail move error } }
+  let defined = run Effect.result(unsafe common.define(&mut engine, context, unsafe install.global(context), b"__otherTemporal", exported, 3))
+  unsafe gc.releaseHeader(&mut engine, rt, other)
+  match move defined { Result<(), JsException>.Success { .. } => () Result<(), JsException>.Failure { error } => { fail move error } }
+}
+unsafe effect fn semanticBody<'m>(engine: &mut Engine<'m, NoHostServices>, memory: &AllocationObserver, context: *mut HeapHeader, namespace: &ClassIdAllocator) -> () ! OutOfMemoryError | JsException | WriterError ? &mut Allocator {
+  let previous = run unsafe common.get(&mut engine, context, unsafe install.global(context), b"Temporal")
+  run unsafe common.define(&mut engine, context, unsafe install.global(context), b"__previousTemporal", previous, 3)
+  run unsafe temporal.addIntrinsic(&mut engine, memory, context, namespace)
+  run unsafe exposeOther(&mut engine, memory, context, namespace)
+  let rt = unsafe runtime.contextRuntime(context)
+  let mut writer = StdoutWriter.make()
+  let onlyClock = run clockOnly()
+  let mut index: usize = 0
+  while index < cases.COUNT {
+    if !onlyClock || cases.clockCase(index) {
+    let result = run unsafe evaluation.evaluate(&mut engine, memory, context, cases.source(index), b"temporal-objects-case.js", 0)
+    let converted = run Effect.result(Strings.toUtf8(result, false))
+    unsafe gc.release(&mut engine, rt, result)
+    let bytes = match move converted { Result<List<u8>, OutOfMemoryError>.Success { value } => move value Result<List<u8>, OutOfMemoryError>.Failure { error } => { fail move error } }
+    let mut out = ByteBuffer.make() run out.writeU32(usize.toU32(bytes.length())) run out.appendSlice(bytes.asSlice())
+    run Writer.writeAll(out.asSlice()) |> Effect.provideMut<Writer>(&mut writer)
+    }
+    index = index + 1
+  }
+}
+unsafe effect fn semantic<'m>(engine: &mut Engine<'m, NoHostServices>, memory: &AllocationObserver, rt: *mut HeapHeader, namespace: &ClassIdAllocator) -> () ! OutOfMemoryError | JsException | WriterError ? &mut Allocator {
+  let context = run unsafe setup(&mut engine, memory, rt, namespace)
+  let result = run Effect.result(unsafe semanticBody(&mut engine, memory, context, namespace))
+  unsafe gc.releaseHeader(&mut engine, rt, context)
+  match move result { Result<(), OutOfMemoryError | JsException | WriterError>.Success { .. } => () Result<(), OutOfMemoryError | JsException | WriterError>.Failure { error } => { fail move error } }
+}
+unsafe effect fn faultCall<'m>(engine: &mut Engine<'m, NoHostServices>, memory: &AllocationObserver, context: *mut HeapHeader, namespace: &ClassIdAllocator, index: usize, function: Value) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  if index == cases.FAULT_COUNT {
+    run unsafe installFamilies(&mut engine, memory, context, namespace)
+    return Value.Undefined
+  }
+  if index == cases.FAULT_COUNT + 1 {
+    let other = run unsafe setup(&mut engine, memory, unsafe runtime.contextRuntime(context), namespace)
+    unsafe gc.releaseHeader(&mut engine, unsafe runtime.contextRuntime(context), other)
+    return Value.Undefined
+  }
+  return run unsafe engine.call(context, function, Value.Undefined, &[])
+}
+unsafe effect fn retryRealm<'m>(engine: &mut Engine<'m, NoHostServices>, memory: &AllocationObserver, rt: *mut HeapHeader, namespace: &ClassIdAllocator) -> bool ! OutOfMemoryError | JsException ? &mut Allocator {
+  let other = run unsafe setup(&mut engine, memory, rt, namespace)
+  let checked = run Effect.result(unsafe evaluation.evaluate(&mut engine, memory, other, b"(function(){const read=()=>__oomPending;Object.defineProperty(globalThis,'__oomPending',{value:17,writable:true,configurable:true});const first=read();delete globalThis.__oomPending;let missing=false;try{read()}catch(e){missing=e instanceof ReferenceError}Object.defineProperty(globalThis,'__oomPending',{value:23,writable:true,configurable:true});const last=read();delete globalThis.__oomPending;return first===17&&missing&&last===23&&typeof Object==='function'&&typeof Array==='function'&&new Temporal.Instant(0n).toString()==='1970-01-01T00:00:00Z'})()", b"temporal-second-realm-recovery.js", 0))
+  let mut valid = false
+  match move checked {
+    Result<Value, JsException>.Success { value } => { valid = match value { Value.Bool { value: flag } => flag _ => false } unsafe gc.release(&mut engine, rt, value) }
+    Result<Value, JsException>.Failure { error } => { unsafe gc.releaseHeader(&mut engine, rt, other) fail move error }
+  }
+  unsafe gc.releaseHeader(&mut engine, rt, other)
+  return valid
+}
+pub effect fn main() -> i32 ! OutOfMemoryError | SynchronizationError | WriterError {
+  let mut allocator = FaultAllocator { parent: run RuntimeAllocator.make(Allocator.systemAllocatorProvider()), remaining: usize.MAX, failed: false }
+  let memory = run allocator.parent.observe()
+  let namespace = run ClassIdAllocator.make() |> Effect.provideMut<Allocator>(&mut allocator)
+  let domain = run WaiterDomain.make() |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut engine = Engine { memory: &memory, domain: domain.handle(), services: NoHostServices {} }
+  let rt = run runtime.allocateRuntimeStorage(stack.currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let completed = run Effect.result(unsafe semantic(&mut engine, &memory, rt, &namespace)) |> Effect.provideMut<Allocator>(&mut allocator)
+  run unsafe gc.destroyRuntime(&mut engine, rt) |> Effect.provideMut<Allocator>(&mut allocator)
+  match move completed { Result<(), OutOfMemoryError | JsException | WriterError>.Success { .. } => () Result<(), OutOfMemoryError | JsException | WriterError>.Failure { .. } => { return 2 } }
+  let mut faultCases: u32 = 0 let mut attempts: u32 = 0 let mut injected: u32 = 0
+  let onlyClock = run clockOnly()
+  if cases.FAULTS && !onlyClock {
+    let baseline = allocator.parent.stats()
+    let mut index: usize = 0
+    while index < cases.FAULT_COUNT + 2 {
+      let mut ordinal: usize = 0
+      while true {
+        let faultRuntime = run runtime.allocateRuntimeStorage(stack.currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut allocator)
+        let initialized = run Effect.result(unsafe intrinsics.create(&mut engine, &memory, faultRuntime)) |> Effect.provideMut<Allocator>(&mut allocator)
+        let context = match move initialized { Result<*mut HeapHeader, OutOfMemoryError | JsException>.Success { value } => value Result<*mut HeapHeader, OutOfMemoryError | JsException>.Failure { .. } => { return 3 } }
+        if index != cases.FAULT_COUNT {
+          let installed = run Effect.result(unsafe installFamilies(&mut engine, &memory, context, &namespace)) |> Effect.provideMut<Allocator>(&mut allocator)
+          match move installed { Result<(), JsException>.Success { .. } => () Result<(), JsException>.Failure { .. } => { return 4 } }
+        }
+        let mut function = Value.Undefined
+        if index < cases.FAULT_COUNT {
+          let prepared = run Effect.result(unsafe evaluation.evaluate(&mut engine, &memory, context, cases.faultSource(index), b"temporal-objects-fault.js", 0)) |> Effect.provideMut<Allocator>(&mut allocator)
+          function = match move prepared { Result<Value, JsException>.Success { value } => value Result<Value, JsException>.Failure { .. } => { return 5 } }
+        }
+        allocator.remaining = ordinal allocator.failed = false
+        let called = run Effect.result(unsafe faultCall(&mut engine, &memory, context, &namespace, index, function)) |> Effect.provideMut<Allocator>(&mut allocator)
+        allocator.remaining = usize.MAX
+        let injectedHere = allocator.failed
+        let mut returnedNormally = false
+        attempts = attempts + 1 if injectedHere { injected = injected + 1 }
+        match move called { Result<Value, OutOfMemoryError | JsException>.Success { value } => { returnedNormally = !value.isException() unsafe gc.release(&mut engine, faultRuntime, value) } Result<Value, OutOfMemoryError | JsException>.Failure { .. } => () }
+        unsafe gc.release(&mut engine, faultRuntime, function)
+        if unsafe exceptions.has(faultRuntime) { unsafe gc.release(&mut engine, faultRuntime, unsafe exceptions.take(faultRuntime)) }
+        if injectedHere && index >= cases.FAULT_COUNT {
+          let retried = run Effect.result(unsafe installFamilies(&mut engine, &memory, context, &namespace)) |> Effect.provideMut<Allocator>(&mut allocator)
+          match move retried { Result<(), JsException>.Success { .. } => () Result<(), JsException>.Failure { .. } => { return 7 } }
+          let checked = run Effect.result(unsafe evaluation.evaluate(&mut engine, &memory, context, b"new Temporal.Instant(0n).toString()", b"temporal-install-retry.js", 0)) |> Effect.provideMut<Allocator>(&mut allocator)
+          match move checked { Result<Value, JsException>.Success { value } => { unsafe gc.release(&mut engine, faultRuntime, value) } Result<Value, JsException>.Failure { .. } => { return 8 } }
+          if index == cases.FAULT_COUNT + 1 {
+            let recovered = run Effect.result(unsafe retryRealm(&mut engine, &memory, faultRuntime, &namespace)) |> Effect.provideMut<Allocator>(&mut allocator)
+            match move recovered { Result<bool, OutOfMemoryError | JsException>.Success { value } => { if !value { return 9 } } Result<bool, OutOfMemoryError | JsException>.Failure { .. } => { return 9 } }
+          }
+        }
+        unsafe gc.releaseHeader(&mut engine, faultRuntime, context)
+        run unsafe gc.destroyRuntime(&mut engine, faultRuntime) |> Effect.provideMut<Allocator>(&mut allocator)
+        let stats = allocator.parent.stats()
+        if stats.allocationCount != baseline.allocationCount || stats.usedBytes != baseline.usedBytes {
+          StderrWriter.print("Temporal operation {operation} cutoff {cutoff}: teardown ledger {blocks}/{bytes}, baseline {baseBlocks}/{baseBytes}\n", &.{ operation: index, cutoff: ordinal, blocks: stats.allocationCount, bytes: stats.usedBytes, baseBlocks: baseline.allocationCount, baseBytes: baseline.usedBytes })
+          return 90
+        }
+        if !injectedHere {
+          if !returnedNormally {
+            StderrWriter.print("Temporal operation {operation} cutoff {cutoff}: non-injected failure\n", &.{ operation: index, cutoff: ordinal })
+            return 6
+          }
+          break
+        }
+        ordinal = ordinal + 1
+      }
+      faultCases = faultCases + 1 index = index + 1
+    }
+  }
+  drop engine drop domain drop namespace
+  if allocator.parent.stats().allocationCount != 0 || allocator.parent.stats().usedBytes != 0 { return 99 }
+  let mut system = Allocator.systemAllocatorProvider() let mut out = ByteBuffer.make()
+  run out.writeU32(faultCases) |> Effect.provideMut<Allocator>(&mut system)
+  run out.writeU32(attempts) |> Effect.provideMut<Allocator>(&mut system)
+  run out.writeU32(injected) |> Effect.provideMut<Allocator>(&mut system)
+  let mut writer = StdoutWriter.make() run Writer.writeAll(out.asSlice()) |> Effect.provideMut<Writer>(&mut writer)
+  return 0
+}

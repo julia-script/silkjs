@@ -1,0 +1,159 @@
+//! Async disposal's synchronous first call and lazy Promise.then progression,
+//! quickjs.c:56087-56332. Promise jobs own captures after stack records are cleared.
+import silk.allocator { Allocator }
+import silk.effect { Effect }
+import silk.result { Result }
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types { ContextState, FrameSlots, NativeFunctionId, BuiltinFamily }
+import runtime_memory { AllocationObserver }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_coercion_host { CoercionHooks }
+import js_property_host { OwnPropertyHooks, GetPropertyHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_native_function_host { NativeFunctionHooks }
+import js_call_host { CallHooks }
+import js_error_host { ErrorHooks }
+import js_promise { PromiseHooks }
+import js_promise as promise
+import js_native_functions as native
+import js_disposal as disposal
+import js_disposable_stack_storage as storage
+import js_proxy_core as core
+import js_exceptions { JsException }
+import js_exceptions as exceptions
+import js_atom_data as atoms
+
+// 32 belongs to js_disposal.SYNC_DISPOSE_WRAPPER and is never reassigned.
+pub const STEP: u32 = 33
+pub const RETHROW: u32 = 34
+pub const TO_UNDEFINED: u32 = 35
+fn id(method: u32) -> NativeFunctionId { return NativeFunctionId.Builtin { family: BuiltinFamily.AsyncDisposableStack, method: method } }
+pub unsafe effect fn resolve<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + CallHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, value: Value, rejected: bool) -> Value ! JsException ? &mut Allocator {
+  let a = () let state = unsafe HeapCell.payload<ContextState, ()>(&a, context)
+  let constructor = state.promiseConstructor drop state
+  return run unsafe promise.resolve(&mut hooks, memory, context, constructor, value, rejected)
+}
+pub unsafe effect fn callResource<H: CoercionHooks + CallHooks>(hooks: &mut H, context: *mut HeapHeader,
+  value: Value, method: Value, hint: i32) -> Value ! JsException ? &mut Allocator {
+  if hint == storage.ADOPT { return run unsafe promise.call(&mut hooks, context, method, Value.Undefined, &[value]) }
+  if hint == storage.DEFER { return run unsafe promise.call(&mut hooks, context, method, Value.Undefined, &[]) }
+  return run unsafe promise.call(&mut hooks, context, method, value, &[])
+}
+unsafe effect fn rethrow<H: HeapHooks + CoercionHooks + ErrorHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, input: Value, magic: i32, captured: &FrameSlots) -> Value ! JsException ? &mut Allocator {
+  let stored = unsafe captured.get(0) let previous = unsafe stored.retained()
+  let rt = unsafe runtime.contextRuntime(context)
+  if magic == 0 { return run unsafe exceptions.throwValue<Value, H>(&mut hooks, rt, previous) }
+  let combined = run Effect.result(unsafe disposal.suppressed(&mut hooks, memory, context, input, previous))
+  unsafe gc.release(&mut hooks, rt, previous)
+  let error = match move combined {
+    Result<Value, JsException>.Success { value } => value
+    Result<Value, JsException>.Failure { error } => { fail move error }
+  }
+  return run unsafe exceptions.throwValue<Value, H>(&mut hooks, rt, error)
+}
+unsafe effect fn step<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + CallHooks + ErrorHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, input: Value, magic: i32, captured: &FrameSlots) -> Value ! JsException ? &mut Allocator {
+  let value = unsafe captured.get(0) let method = unsafe captured.get(1)
+  let hint = match unsafe captured.get(2) { Value.Int { value: integer } => integer _ => Intrinsic.trap("QuickJS invariant violated") }
+  let hasPrevious = magic == 1 let rt = unsafe runtime.contextRuntime(context)
+  if core.undefined(method) {
+    if hasPrevious { return run unsafe exceptions.throwValue<Value, H>(&mut hooks, rt, unsafe input.retained()) }
+    return Value.Undefined
+  }
+  let result = run Effect.catch<JsException>(unsafe callResource(&mut hooks, context, value, method, hint), core.exceptionValue)
+  if result.isException() {
+    let error = unsafe exceptions.take(rt)
+    if !hasPrevious { return run unsafe exceptions.throwValue<Value, H>(&mut hooks, rt, error) }
+    let combined = run Effect.result(unsafe disposal.suppressed(&mut hooks, memory, context, error, input))
+    unsafe gc.release(&mut hooks, rt, error)
+    let suppressed = match move combined {
+      Result<Value, JsException>.Success { value: combinedError } => combinedError
+      Result<Value, JsException>.Failure { error: failure } => { fail move failure }
+    }
+    return run unsafe exceptions.throwValue<Value, H>(&mut hooks, rt, suppressed)
+  }
+  if !hasPrevious { return result }
+  let wrapped = run Effect.result(unsafe resolve(&mut hooks, memory, context, result, false))
+  unsafe gc.release(&mut hooks, rt, result)
+  let promiseValue = match move wrapped {
+    Result<Value, JsException>.Success { value: object } => object
+    Result<Value, JsException>.Failure { error } => { fail move error }
+  }
+  // Source attempts both allocations and invokes then even if either produced
+  // an exception sentinel. Do not turn this into an early-return error check.
+  let fulfilled = run Effect.catch<JsException>(unsafe native.newDataFunction(&mut hooks, memory, context, id(RETHROW), 0, 0, &[input]), core.exceptionValue)
+  let rejected = run Effect.catch<JsException>(unsafe native.newDataFunction(&mut hooks, memory, context, id(RETHROW), 1, 1, &[input]), core.exceptionValue)
+  let chained = run Effect.result(unsafe promise.invoke(&mut hooks, context, promiseValue, atoms.JS_ATOM_then, &[fulfilled, rejected]))
+  unsafe gc.release(&mut hooks, rt, fulfilled) unsafe gc.release(&mut hooks, rt, rejected) unsafe gc.release(&mut hooks, rt, promiseValue)
+  return match move chained {
+    Result<Value, JsException>.Success { value: output } => output
+    Result<Value, JsException>.Failure { error } => { fail move error }
+  }
+}
+pub unsafe effect fn data<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + NativeFunctionHooks + CallHooks + PromiseHooks + ErrorHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, method: u32, receiver: Value,
+  argv: &FrameSlots, magic: i32, captured: &FrameSlots) -> Value ! JsException ? &mut Allocator {
+  if method == TO_UNDEFINED { return Value.Undefined }
+  let input = unsafe promise.argument(argv, 0)
+  if method == RETHROW { return run unsafe rethrow(&mut hooks, memory, context, input, magic, captured) }
+  require(method == STEP)
+  return run unsafe step(&mut hooks, memory, context, input, magic, captured)
+}
+unsafe fn discardRemaining<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, node: *mut HeapHeader, remaining: usize) -> () {
+  let mut index = remaining
+  while index != 0 { index = index - 1 unsafe storage.clearResource(&mut hooks, rt, node, index) }
+  unsafe storage.finish(node)
+}
+pub unsafe effect fn dispose<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + CallHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, node: *mut HeapHeader) -> Value ! JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context) let count = unsafe storage.count(node)
+  unsafe storage.begin(node)
+  let mut remaining = count let mut chain = Value.Exception
+  if remaining == 0 {
+    chain = run Effect.catch<JsException>(unsafe resolve(&mut hooks, memory, context, Value.Undefined, false), core.exceptionValue)
+  } else {
+    let index = remaining - 1 let record = unsafe storage.resource(node, index)
+    if core.undefined(record.method) {
+      chain = run Effect.catch<JsException>(unsafe resolve(&mut hooks, memory, context, Value.Undefined, false), core.exceptionValue)
+    } else {
+      let result = run Effect.catch<JsException>(unsafe callResource(&mut hooks, context, record.value, record.method, record.hint), core.exceptionValue)
+      let rejected = result.isException() let mut value = result
+      if rejected { value = unsafe exceptions.take(rt) }
+      chain = run Effect.catch<JsException>(unsafe resolve(&mut hooks, memory, context, value, rejected), core.exceptionValue)
+      unsafe gc.release(&mut hooks, rt, value)
+    }
+    unsafe storage.clearResource(&mut hooks, rt, node, index) remaining = index
+  }
+  if chain.isException() { unsafe discardRemaining(&mut hooks, rt, node, remaining) fail JsException {} }
+  while remaining != 0 {
+    let index = remaining - 1 let record = unsafe storage.resource(node, index)
+    let captures = [record.value, record.method, Value.Int { value: record.hint }]
+    let fulfilled = run Effect.catch<JsException>(unsafe native.newDataFunction(&mut hooks, memory, context, id(STEP), 0, 0, &captures), core.exceptionValue)
+    let rejected = run Effect.catch<JsException>(unsafe native.newDataFunction(&mut hooks, memory, context, id(STEP), 1, 1, &captures), core.exceptionValue)
+    unsafe storage.clearResource(&mut hooks, rt, node, index)
+    if fulfilled.isException() || rejected.isException() {
+      unsafe gc.release(&mut hooks, rt, fulfilled) unsafe gc.release(&mut hooks, rt, rejected) unsafe gc.release(&mut hooks, rt, chain)
+      unsafe discardRemaining(&mut hooks, rt, node, remaining) fail JsException {}
+    }
+    let next = run Effect.catch<JsException>(unsafe promise.invoke(&mut hooks, context, chain, atoms.JS_ATOM_then, &[fulfilled, rejected]), core.exceptionValue)
+    unsafe gc.release(&mut hooks, rt, fulfilled) unsafe gc.release(&mut hooks, rt, rejected) unsafe gc.release(&mut hooks, rt, chain)
+    if next.isException() { unsafe discardRemaining(&mut hooks, rt, node, remaining) fail JsException {} }
+    chain = next remaining = index
+  }
+  unsafe storage.finish(node)
+  if count == 0 { return chain }
+  let normalize = run Effect.catch<JsException>(unsafe native.newDataFunction(&mut hooks, memory, context, id(TO_UNDEFINED), 0, 0, &[]), core.exceptionValue)
+  if normalize.isException() { unsafe gc.release(&mut hooks, rt, chain) fail JsException {} }
+  let result = run Effect.result(unsafe promise.invoke(&mut hooks, context, chain, atoms.JS_ATOM_then, &[normalize]))
+  unsafe gc.release(&mut hooks, rt, normalize) unsafe gc.release(&mut hooks, rt, chain)
+  return match move result {
+    Result<Value, JsException>.Success { value } => value
+    Result<Value, JsException>.Failure { error } => { fail move error }
+  }
+}
+fn require(condition: bool) -> () { if !condition { Intrinsic.trap("QuickJS invariant violated") } }

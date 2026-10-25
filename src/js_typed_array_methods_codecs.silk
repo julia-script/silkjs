@@ -1,0 +1,277 @@
+//! Uint8Array base64/hex methods, pinned quickjs.c:62446-63227.
+//! Arguments borrow, successful Values own. Input UTF-8 ownership spans option
+//! getters, but backing pointers are acquired only after the final getter.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.raw_buffer { RawBuffer }
+import silk.layout { Layout }
+import silk.slot { Slot }
+import silk.pointer { Pointer }
+import silk.u8
+import silk.u16
+import silk.u32
+import silk.u64
+import silk.usize
+import runtime_memory { AllocationObserver }
+import js_heap { HeapHeader }
+import js_value { Value }
+import js_core_types { FrameSlots, NativeErrorKind, NativeFunctionId }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_class_data as classes
+import js_atom_data as atoms
+import js_coercion_host { CoercionHooks }
+import js_property_host { OwnPropertyHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_buffer_storage { BufferHooks, BufferState }
+import js_buffer_storage as storage
+import js_constructor_ops as constructors
+import js_object_allocate as objects
+import js_property_mutations as properties
+import js_proxy_core as core
+import js_strings { StringBuilder }
+import js_string_types { StringOwner, StringLengthError, STRING_LENGTH_MAX }
+import js_bigint { BigIntError }
+import js_exceptions { JsException }
+import js_typed_array_methods_codecs_support { Input, Decoded, Output }
+import js_typed_array_methods_codecs_support as bytes
+
+pub const TO_BASE64: u32 = 0
+pub const TO_HEX: u32 = 1
+pub const SET_FROM_BASE64: u32 = 2
+pub const SET_FROM_HEX: u32 = 3
+pub const FROM_BASE64: u32 = 4
+pub const FROM_HEX: u32 = 5
+fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+unsafe fn argument(argv: &FrameSlots, index: usize) -> Value {
+  if index >= argv.length() { return Value.Undefined }
+  return unsafe argv.get(index)
+}
+unsafe effect fn checkReceiver<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  receiver: Value) -> () ! JsException ? &mut Allocator {
+  if unsafe storage.classId(receiver) != classes.JS_CLASS_UINT8_ARRAY {
+    return run unsafe core.error(&mut hooks, context, b"not a Uint8Array")
+  }
+}
+struct ViewBytes { state: BufferState, offset: u32, length: usize }
+unsafe effect fn viewBytes<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  receiver: Value) -> ViewBytes ! JsException ? &mut Allocator {
+  let object = core.reference(receiver)
+  if unsafe storage.isOutOfBounds(object) {
+    return run unsafe core.error(&mut hooks, context, b"ArrayBuffer is detached or resized")
+  }
+  let view = unsafe storage.view(object)
+  let backing = unsafe storage.snapshot(view.buffer)
+  return ViewBytes { state: backing, offset: view.offset,
+    length: u32.toUsize(unsafe storage.count(object)) }
+}
+unsafe effect fn checkOptions<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  options: Value) -> () ! JsException ? &mut Allocator {
+  if options.tag() != 3 && !options.isObject() {
+    return run unsafe core.error(&mut hooks, context, b"options must be an object")
+  }
+}
+unsafe effect fn getOption<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  options: Value, atom: u32) -> Value ! JsException ? &mut Allocator {
+  let fetched = run Effect.result(unsafe hooks.getProperty(context, options, atom))
+  return match move fetched {
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => value
+    Result<Value, OutOfMemoryError | JsException>.Failure { error } => {
+      return run unsafe core.materialize(&mut hooks, context, move error)
+    }
+  }
+}
+unsafe effect fn inputString<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  value: Value) -> Input ! JsException ? &mut Allocator {
+  let converted = run Effect.result(Input.make(value))
+  return match move converted {
+    Result<Input, OutOfMemoryError | StringLengthError>.Success { value: input } => move input
+    Result<Input, OutOfMemoryError | StringLengthError>.Failure { error } => {
+      return run unsafe core.materialize(&mut hooks, context, move error)
+    }
+  }
+}
+unsafe effect fn parseOption<H: HeapHooks + CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  options: Value, last: bool) -> u32 ! JsException ? &mut Allocator {
+  if options.tag() == 3 { return 0 }
+  let mut atom = atoms.JS_ATOM_alphabet if last { atom = atoms.JS_ATOM_lastChunkHandling }
+  let value = run unsafe getOption(&mut hooks, context, options, atom)
+  if value.tag() == 3 { return 0 }
+  if !value.isString() {
+    unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), value)
+    if last { return run unsafe core.error(&mut hooks, context, b"expected string for lastChunkHandling") }
+    return run unsafe core.error(&mut hooks, context, b"expected string for alphabet")
+  }
+  let owner = StringOwner.adopt(value)
+  let input = run unsafe inputString(&mut hooks, context, owner.get())
+  drop owner
+  if last {
+    if input.equalsCString(b"loose") { return 0 }
+    if input.equalsCString(b"strict") { return 1 }
+    if input.equalsCString(b"stop-before-partial") { return 2 }
+    return run unsafe core.error(&mut hooks, context, b"invalid lastChunkHandling option")
+  }
+  if input.equalsCString(b"base64") { return 0 }
+  if input.equalsCString(b"base64url") { return 1 }
+  return run unsafe core.error(&mut hooks, context, b"invalid alphabet")
+}
+unsafe fn load(view: &ViewBytes, index: usize) -> u32 {
+  return u64.toU32(unsafe storage.loadScalar(view.state, view.offset + usize.toU32(index), 0))
+}
+unsafe effect fn encode<H: HeapHooks + CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  receiver: Value, options: Value, hex: bool) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  run unsafe checkReceiver(&mut hooks, context, receiver)
+  let mut alphabet: u32 = 0 let mut omit = false
+  if !hex {
+    run unsafe checkOptions(&mut hooks, context, options)
+    alphabet = run unsafe parseOption(&mut hooks, context, options, false)
+    if options.tag() != 3 {
+      let value = run unsafe getOption(&mut hooks, context, options, atoms.JS_ATOM_omitPadding)
+      omit = unsafe core.toBoolFree(&mut hooks, context, value)
+    }
+  }
+  let view = run unsafe viewBytes(&mut hooks, context, receiver)
+  let mut length = 4 * ((view.length + 2) / 3)
+  if hex { length = view.length * 2 }
+  if length > STRING_LENGTH_MAX { return run unsafe hooks.throwError(context, NativeErrorKind.Range, b"output too large") }
+  let mut builder = StringBuilder.make()
+  run builder.reserve(length, false)
+  let mut index: usize = 0
+  if hex {
+    let digits = bytes.hexAlphabet()
+    while index < view.length {
+      let value = unsafe load(&view, index)
+      run builder.appendUnit(u8.toU16(digits[u32.toUsize(value / 16)]))
+      run builder.appendUnit(u8.toU16(digits[u32.toUsize(value & 15)]))
+      index = index + 1
+    }
+  } else {
+    let digits = bytes.alphabet(alphabet == 1)
+    while index + 3 <= view.length {
+      let value = 65536 * unsafe load(&view, index) + 256 * unsafe load(&view, index + 1) + unsafe load(&view, index + 2)
+      run builder.appendUnit(u8.toU16(digits[u32.toUsize(u32.shiftRight(value, 18) & 63)]))
+      run builder.appendUnit(u8.toU16(digits[u32.toUsize(u32.shiftRight(value, 12) & 63)]))
+      run builder.appendUnit(u8.toU16(digits[u32.toUsize(u32.shiftRight(value, 6) & 63)]))
+      run builder.appendUnit(u8.toU16(digits[u32.toUsize(value & 63)]))
+      index = index + 3
+    }
+    let remaining = view.length - index
+    if remaining != 0 {
+      let mut value = 65536 * unsafe load(&view, index)
+      if remaining == 2 { value = value + 256 * unsafe load(&view, index + 1) }
+      run builder.appendUnit(u8.toU16(digits[u32.toUsize(u32.shiftRight(value, 18) & 63)]))
+      run builder.appendUnit(u8.toU16(digits[u32.toUsize(u32.shiftRight(value, 12) & 63)]))
+      if remaining == 2 { run builder.appendUnit(u8.toU16(digits[u32.toUsize(u32.shiftRight(value, 6) & 63)])) }
+      else if !omit { run builder.appendUnit(61) }
+      if !omit { run builder.appendUnit(61) }
+    }
+  }
+  return run builder.finish()
+}
+unsafe effect fn copyArray<H: HeapHooks + CoercionHooks + BufferHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, data: ?*mut u8, length: usize) -> Value ! JsException ? &mut Allocator {
+  let buffer = run unsafe storage.createExternal(&mut hooks, memory, context, Value.Undefined,
+    usize.toU64(length), Option<u64>.none(), false, data, Option<NativeFunctionId>.none(), Pointer.null<u8>(), true)
+  let made = run Effect.result(unsafe constructors.createFromConstructor(&mut hooks, memory, context, Value.Undefined, classes.JS_CLASS_UINT8_ARRAY))
+  let object = match move made {
+    Result<Value, JsException>.Success { value } => value
+    Result<Value, JsException>.Failure { error } => {
+      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), buffer) fail move error
+    }
+  }
+  let initialized = run Effect.result(unsafe storage.initializeView(&mut hooks, context, core.reference(object), buffer, 0, usize.toU32(length), false))
+  match move initialized {
+    Result<(), JsException>.Success { .. } => { return object }
+    Result<(), JsException>.Failure { error } => {
+      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), object) fail move error
+    }
+  }
+}
+unsafe effect fn resultFields<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value, read: usize, written: usize) -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  let first = run unsafe properties.definePropertyValueStr(&mut hooks, context, object, b"read", Value.number(u32.toF64(usize.toU32(read))), 7)
+  let second = run unsafe properties.definePropertyValueStr(&mut hooks, context, object, b"written", Value.number(u32.toF64(usize.toU32(written))), 7)
+}
+unsafe effect fn readWritten<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, result: Decoded) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  let object = run unsafe objects.object(&mut hooks, memory, context)
+  let defined = run Effect.result(unsafe resultFields(&mut hooks, context, object, result.read, result.written))
+  match move defined {
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { .. } => { return object }
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => {
+      let pending = run Effect.catch<JsException>(unsafe core.materialize(&mut hooks, context, move error), core.exceptionValue)
+      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), object) fail JsException {}
+    }
+  }
+}
+unsafe effect fn decode<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + BufferHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, receiver: Value, argv: &FrameSlots, hex: bool, set: bool) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  if set { run unsafe checkReceiver(&mut hooks, context, receiver) }
+  let value = unsafe argument(argv, 0)
+  if !value.isString() { return run unsafe core.error(&mut hooks, context, b"expected string") }
+  let input = run unsafe inputString(&mut hooks, context, value)
+  let mut alphabet: u32 = 0 let mut last: u32 = 0
+  if !hex {
+    let options = unsafe argument(argv, 1)
+    run unsafe checkOptions(&mut hooks, context, options)
+    alphabet = run unsafe parseOption(&mut hooks, context, options, false)
+    last = run unsafe parseOption(&mut hooks, context, options, true)
+  }
+  let mut temporary = Option<Intrinsic.RawBuffer<u8>>.none()
+  let mut data = Pointer.null<u8>() let mut capacity: usize = 0
+  let mut destination = Output.Private { data: Pointer.null<u8>() }
+  if set {
+    let view = run unsafe viewBytes(&mut hooks, context, receiver)
+    destination = Output.Buffer { state: view.state, offset: view.offset }
+    capacity = view.length
+  } else {
+    capacity = (input.length / 4) * 3 + 3
+    if hex { capacity = input.length / 2 + 1 }
+    let allocationResult = run Effect.result(Allocator.allocate(Layout { bytes: capacity, alignment: 1 }))
+    let allocation = match move allocationResult {
+      Result<Intrinsic.Allocation, OutOfMemoryError>.Success { value: block } => move block
+      Result<Intrinsic.Allocation, OutOfMemoryError>.Failure { error } => {
+        return run unsafe core.materialize(&mut hooks, context, move error)
+      }
+    }
+    let mut allocated = unsafe RawBuffer.from<u8>(move allocation, capacity)
+    data = Slot.address(RawBuffer.slot<u8>(&mut allocated, 0))
+    destination = Output.Private { data: data }
+    temporary = Option<Intrinsic.RawBuffer<u8>>.some(move allocated)
+  }
+  let mut decoded = Decoded { read: 0, written: 0, error: false }
+  if hex { decoded = unsafe bytes.hex(&input, destination, capacity) }
+  else { decoded = unsafe bytes.base64(&input, destination, capacity, alphabet == 1, last) }
+  drop destination
+  drop input
+  if decoded.error {
+    drop temporary
+    if hex { return run unsafe hooks.throwError(context, NativeErrorKind.Syntax, b"invalid hex string") }
+    return run unsafe hooks.throwError(context, NativeErrorKind.Syntax, b"invalid base64 string")
+  }
+  if set { return run unsafe readWritten(&mut hooks, memory, context, move decoded) }
+  return run unsafe copyArray(&mut hooks, memory, context, data, decoded.written)
+}
+pub unsafe effect fn call<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + BufferHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, method: u32, receiver: Value, argv: &FrameSlots) -> Value ! JsException ? &mut Allocator {
+  let outcome = run Effect.result(unsafe body(&mut hooks, memory, context, method, receiver, argv))
+  return match move outcome {
+    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Success { value } => value
+    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => {
+      return run unsafe core.materialize(&mut hooks, context, move error)
+    }
+  }
+}
+unsafe effect fn body<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + BufferHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, method: u32, receiver: Value, argv: &FrameSlots) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  if method <= TO_HEX { return run unsafe encode(&mut hooks, context, receiver, unsafe argument(argv, 0), method == TO_HEX) }
+  if method > FROM_HEX { return invariant() }
+  return run unsafe decode(&mut hooks, memory, context, receiver, argv, (method & 1) != 0, method < FROM_BASE64)
+}

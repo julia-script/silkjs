@@ -1,0 +1,432 @@
+import silk.allocator { Allocator, OutOfMemoryError, SystemAllocator }
+import silk.box { Box }
+import silk.effect { Effect }
+import silk.layout { Layout }
+import silk.list { List }
+import silk.native_thread { NativeThread, SpawnError }
+import silk.ownership { Copy }
+import silk.pointer { Pointer }
+import silk.raw_buffer { RawBuffer }
+import silk.slot { Slot }
+import silk.sync { Arc, Mutex }
+import silk.testing { AssertionError, Testing }
+import silk.usize
+import runtime_memory { RuntimeAllocator, RuntimeMemoryStats }
+
+// The child observes actual requests and actual owner reclamations, including the
+// allocator's private ledger. Its own owners retain the observer independently,
+// so neither the provider nor a stack variable must outlive an allocation.
+struct ChildCounts {
+  attempts: usize,
+  issued: usize,
+  returned: usize,
+  liveBytes: usize,
+  lastBytes: usize,
+  refused: bool
+}
+
+impl Copy for ChildCounts {}
+
+struct TrackingAllocator {
+  system: SystemAllocator,
+  observer: Arc<Mutex<ChildCounts>>
+}
+
+struct TrackingHeader {
+  storage: Intrinsic.RawBuffer<u8>,
+  observer: Arc<Mutex<ChildCounts>>,
+  requestedBytes: usize
+}
+
+impl Allocator for TrackingAllocator {
+  effect fn allocate(self: &mut Self, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
+    let refused = recordAttempt(&self.observer)
+    if refused { return run Allocator.outOfMemory() }
+    let header = Layout.of<TrackingHeader>()
+    let mask = layout.alignment - 1
+    if header.bytes > usize.MAX - mask { return run Allocator.outOfMemory() }
+    let offset = (header.bytes + mask) / layout.alignment * layout.alignment
+    let mut requested = layout.bytes
+    if requested == 0 { requested = 1 }
+    if requested > usize.MAX - offset { return run Allocator.outOfMemory() }
+    let bytes = offset + requested
+    let mut alignment = header.alignment
+    if alignment < layout.alignment { alignment = layout.alignment }
+    let allocation = run Allocator.allocate(Layout { bytes: bytes, alignment: alignment })
+      |> Effect.provideMut<Allocator>(&mut self.system)
+    let mut storage = unsafe RawBuffer.from<u8>(move allocation, bytes)
+    let base = Slot.address(RawBuffer.slot<u8>(&mut storage, 0))
+    let address = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut TrackingHeader>(base)
+    let at = unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(base), offset)
+    let observer = self.observer.clone()
+    recordIssued(&observer, layout.bytes)
+    unsafe Pointer.put<TrackingHeader>(address, TrackingHeader {
+      storage: move storage, observer: move observer, requestedBytes: layout.bytes
+    })
+    let reclaim: extern "C" fn(?*mut u8) -> () = silkRuntimeMemoryTestReclaim
+    return unsafe Intrinsic.allocationAdopt(at, move layout, reclaim, base)
+  }
+}
+
+fn recordAttempt(observer: &Arc<Mutex<ChildCounts>>) -> bool {
+  let mut guard = observer.get().lock()
+  let counts = guard.getMut()
+  counts.attempts = counts.attempts + 1
+  return counts.refused
+}
+
+fn recordIssued(observer: &Arc<Mutex<ChildCounts>>, bytes: usize) -> () {
+  let mut guard = observer.get().lock()
+  let counts = guard.getMut()
+  counts.issued = counts.issued + 1
+  counts.liveBytes = counts.liveBytes + bytes
+  counts.lastBytes = bytes
+  return ()
+}
+
+fn childStats(observer: &Arc<Mutex<ChildCounts>>) -> ChildCounts {
+  let guard = observer.get().lock()
+  return guard.get().*
+}
+
+fn refuseChild(observer: &Arc<Mutex<ChildCounts>>, refused: bool) -> () {
+  let mut guard = observer.get().lock()
+  let counts = guard.getMut()
+  counts.refused = refused
+  return ()
+}
+
+export "C" fn silkRuntimeMemoryTestReclaim(context: ?*mut u8) -> () {
+  let present = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(context)
+  let address = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut TrackingHeader>(present)
+  let owner = unsafe Pointer.take<TrackingHeader>(address)
+  let mut guard = owner.observer.get().lock()
+  let counts = guard.getMut()
+  counts.returned = counts.returned + 1
+  counts.liveBytes = counts.liveBytes - owner.requestedBytes
+  drop guard
+  drop owner
+  return ()
+}
+
+effect fn makeObserver() -> Arc<Mutex<ChildCounts>> ! OutOfMemoryError ? &mut Allocator {
+  let mutex = run Mutex<ChildCounts>.make(ChildCounts {
+    attempts: 0, issued: 0, returned: 0, liveBytes: 0, lastBytes: 0, refused: false
+  })
+  return run Arc<Mutex<ChildCounts>>.make(move mutex)
+}
+
+fn trackingChild(observer: &Arc<Mutex<ChildCounts>>) -> TrackingAllocator {
+  return TrackingAllocator { system: Allocator.systemAllocatorProvider(), observer: observer.clone() }
+}
+
+effect fn allocationSucceeded(layout: Layout) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let allocation = run Allocator.allocate(move layout)
+  drop allocation
+  return true
+}
+
+effect fn growthSucceeded(values: &mut List<u8>, additional: usize) -> bool
+  ! OutOfMemoryError ? &mut Allocator {
+  run values.reserveExact(additional)
+  return true
+}
+
+effect fn constructionSucceeded(child: TrackingAllocator) -> bool ! OutOfMemoryError {
+  let allocator = run RuntimeAllocator.make(move child)
+  drop allocator
+  return true
+}
+
+effect fn refused(error: OutOfMemoryError) -> bool {
+  drop error
+  return false
+}
+
+effect fn expectSameStats(actual: RuntimeMemoryStats, expected: RuntimeMemoryStats) -> ()
+  ! AssertionError<'static> {
+  run Testing.expect(actual.usedBytes == expected.usedBytes, "unchanged current bytes")
+  run Testing.expect(actual.peakBytes == expected.peakBytes, "unchanged peak bytes")
+  run Testing.expect(actual.allocationCount == expected.allocationCount, "unchanged allocation count")
+  run Testing.expect(actual.limit == expected.limit, "unchanged byte limit")
+}
+
+test effect fn everyOwnerIsChargedAndIndividualDropReturnsBacking() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut system = Allocator.systemAllocatorProvider()
+  let observer = run makeObserver() |> Effect.provideMut<Allocator>(&mut system)
+  let mut allocator = run RuntimeAllocator.make(trackingChild(&observer))
+  let control = childStats(&observer)
+  run Testing.expect(control.issued == 1 && control.liveBytes > 0, "independent ledger allocation")
+  let initial = allocator.stats()
+  run Testing.expect(initial.usedBytes == 0 && initial.peakBytes == 0, "control ledger is excluded")
+  run Testing.expect(initial.allocationCount == 0 && initial.limit == usize.MAX, "empty unlimited provider")
+
+  let first = run Box<i32>.make(71) |> Effect.provideMut<Allocator>(&mut allocator)
+  let firstStats = allocator.stats()
+  run Testing.expect(firstStats.usedBytes > Layout.of<i32>().bytes, "owner header is charged")
+  run Testing.expect(firstStats.usedBytes == childStats(&observer).lastBytes, "whole child request is charged")
+  run Testing.expect(firstStats.allocationCount == 1, "first owner is counted")
+  let second = run Box<i64>.make(93) |> Effect.provideMut<Allocator>(&mut allocator)
+  let both = allocator.stats()
+  run Testing.expect(both.allocationCount == 2, "second owner is counted")
+  run Testing.expect(both.usedBytes == childStats(&observer).liveBytes - control.liveBytes, "all backing bytes are charged")
+  run Testing.expect(both.peakBytes == both.usedBytes, "successful peak")
+
+  drop first
+  let remaining = allocator.stats()
+  run Testing.expect(remaining.usedBytes == both.usedBytes - firstStats.usedBytes, "individual owner releases its bytes")
+  run Testing.expect(remaining.allocationCount == 1 && remaining.peakBytes == both.peakBytes, "drop preserves peak")
+  run Testing.expect(childStats(&observer).returned == 1 && second.get()[0] == 93, "other owner stays valid")
+  drop second
+  let empty = allocator.stats()
+  run Testing.expect(empty.usedBytes == 0 && empty.allocationCount == 0, "last payload leaves no charge")
+  run Testing.expect(empty.peakBytes == both.peakBytes, "peak survives last payload")
+  drop allocator
+  let finished = childStats(&observer)
+  run Testing.expect(finished.returned == finished.issued && finished.liveBytes == 0, "ledger and backing reclaimed once")
+}
+
+test effect fn limitFailureNeverRequestsChildOrDamagesExistingStorage() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut system = Allocator.systemAllocatorProvider()
+  let observer = run makeObserver() |> Effect.provideMut<Allocator>(&mut system)
+  let mut allocator = run RuntimeAllocator.make(trackingChild(&observer))
+  let value = run Box<i32>.make(12345) |> Effect.provideMut<Allocator>(&mut allocator)
+  let charge = allocator.stats().usedBytes
+  allocator.setLimit(charge)
+  let before = allocator.stats()
+  let attempts = childStats(&observer).attempts
+  let accepted = run Effect.catchAll(allocationSucceeded(Layout.of<i32>()), refused)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(!accepted, "limit rejects additional owner")
+  run expectSameStats(allocator.stats(), before)
+  run Testing.expect(childStats(&observer).attempts == attempts, "limit checked before child")
+  run Testing.expect(value.get()[0] == 12345, "failure preserves existing storage")
+
+  allocator.setLimit(0)
+  let below = allocator.stats()
+  let acceptedBelow = run Effect.catchAll(allocationSucceeded(Layout.of<u8>()), refused)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(!acceptedBelow && value.get()[0] == 12345, "lowering limit never frees live owners")
+  run expectSameStats(allocator.stats(), below)
+  drop value
+  let empty = allocator.stats()
+  run Testing.expect(empty.usedBytes == 0 && empty.limit == 0, "drop respects new limit")
+  let emptyAccepted = run Effect.catchAll(allocationSucceeded(Layout { bytes: 0, alignment: 1 }), refused)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(!emptyAccepted, "zero payload still needs charged owner storage")
+  run Testing.expect(childStats(&observer).attempts == attempts, "all budget failures avoid child")
+
+  allocator.setLimit(charge)
+  let exact = run Box<i32>.make(19) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(allocator.stats().usedBytes == charge && exact.get()[0] == 19, "exact full backing budget succeeds")
+}
+
+test effect fn listGrowthReclaimsOldOwnerAndFailureKeepsOriginalCapacity() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let mut values = List<u8>.make()
+  run values.appendBytes(b"preserved") |> Effect.provideMut<Allocator>(&mut allocator)
+  let first = allocator.stats()
+  run values.reserveExact(4096) |> Effect.provideMut<Allocator>(&mut allocator)
+  let grown = allocator.stats()
+  run Testing.expect(grown.allocationCount == 1, "reallocation releases old owner")
+  run Testing.expect(grown.usedBytes > first.usedBytes, "larger storage charged")
+  run Testing.expect(grown.peakBytes == first.usedBytes + grown.usedBytes, "peak includes overlapping old and new buffers")
+  allocator.setLimit(grown.usedBytes)
+  let before = allocator.stats()
+  let capacity = values.capacity()
+  let address = Pointer.addressMany<u8>(Pointer.fromSlice<u8>(values.asSlice()))
+  let accepted = run Effect.catchAll(growthSucceeded(&mut values, 16384), refused)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(!accepted, "growth fails at budget")
+  run expectSameStats(allocator.stats(), before)
+  run Testing.expect(values.capacity() == capacity && values.length() == 9, "failed growth preserves shape")
+  run Testing.expect(Pointer.addressMany<u8>(Pointer.fromSlice<u8>(values.asSlice())) == address, "failed growth preserves allocation")
+  let expected = b"preserved"
+  let mut index: usize = 0
+  while index < expected.length {
+    run Testing.expect(values.get(index) == expected[index], "failed growth preserves bytes")
+    index = index + 1
+  }
+  drop values
+  run Testing.expect(allocator.stats().allocationCount == 0 && allocator.stats().usedBytes == 0, "container drop releases final owner")
+}
+
+test effect fn childOutOfMemoryDoesNotChangeAccountingOrPeak() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut system = Allocator.systemAllocatorProvider()
+  let observer = run makeObserver() |> Effect.provideMut<Allocator>(&mut system)
+  refuseChild(&observer, true)
+  let made = run Effect.catchAll(constructionSucceeded(trackingChild(&observer)), refused)
+  run Testing.expect(!made && childStats(&observer).issued == 0, "ledger construction propagates child failure")
+  refuseChild(&observer, false)
+  let mut allocator = run RuntimeAllocator.make(trackingChild(&observer))
+  let held = run Box<i32>.make(81) |> Effect.provideMut<Allocator>(&mut allocator)
+  let before = allocator.stats()
+  let childBefore = childStats(&observer)
+  refuseChild(&observer, true)
+  let accepted = run Effect.catchAll(allocationSucceeded(Layout { bytes: 8192, alignment: 64 }), refused)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(!accepted, "in-budget child refusal is propagated")
+  run expectSameStats(allocator.stats(), before)
+  let childAfter = childStats(&observer)
+  run Testing.expect(childAfter.attempts == childBefore.attempts + 1, "failure reached the child")
+  run Testing.expect(childAfter.issued == childBefore.issued && childAfter.liveBytes == childBefore.liveBytes, "child failure acquired no owner")
+  run Testing.expect(held.get()[0] == 81, "child failure preserves existing owner")
+  refuseChild(&observer, false)
+  let recovered = run Box<i32>.make(42) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(allocator.stats().allocationCount == 2 && recovered.get()[0] == 42, "same custom provider recovers")
+}
+
+test effect fn arithmeticOverflowAndInvalidAlignmentFailBeforeChild() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut system = Allocator.systemAllocatorProvider()
+  let observer = run makeObserver() |> Effect.provideMut<Allocator>(&mut system)
+  let mut allocator = run RuntimeAllocator.make(trackingChild(&observer))
+  let before = allocator.stats()
+  let attempts = childStats(&observer).attempts
+  let huge = run Effect.catchAll(allocationSucceeded(Layout { bytes: usize.MAX, alignment: 1 }), refused)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(!huge, "header plus payload overflow rejected")
+  let alignedHuge = run Effect.catchAll(allocationSucceeded(Layout { bytes: usize.MAX / 2 + 1, alignment: usize.MAX / 2 + 1 }), refused)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(!alignedHuge, "alignment padding plus payload overflow rejected")
+  let zeroAlignment = run Effect.catchAll(allocationSucceeded(Layout { bytes: 1, alignment: 0 }), refused)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let oddAlignment = run Effect.catchAll(allocationSucceeded(Layout { bytes: 1, alignment: 3 }), refused)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(!zeroAlignment && !oddAlignment, "invalid layout literal rejected")
+  run expectSameStats(allocator.stats(), before)
+  run Testing.expect(childStats(&observer).attempts == attempts, "invalid requests never reach child")
+}
+
+test effect fn requestedAlignmentAndZeroSizeHaveRealOwnedStorage() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let alignments: [usize; 6] = [1, 2, 8, 64, 256, 4096]
+  let mut index: usize = 0
+  while index < alignments.length {
+    let alignment = alignments[index]
+    let allocation = run Allocator.allocate(Layout { bytes: 3, alignment: alignment })
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    let mut storage = unsafe RawBuffer.from<u8>(move allocation, 3)
+    let at = Slot.address(RawBuffer.slot<u8>(&mut storage, 0))
+    run Testing.expect(Pointer.address<u8>(at) % alignment == 0, "requested payload alignment")
+    RawBuffer.fill(&mut storage, 0, 3, 91)
+    run Testing.expect(unsafe RawBuffer.read<u8>(&storage, 2) == 91, "aligned payload is writable")
+    let state = allocator.stats()
+    run Testing.expect(state.allocationCount == 1 && state.usedBytes > 3, "aligned owner and padding are charged")
+    drop storage
+    run Testing.expect(allocator.stats().usedBytes == 0 && allocator.stats().allocationCount == 0, "aligned owner reclaimed")
+    index = index + 1
+  }
+  let empty = run Allocator.allocate(Layout { bytes: 0, alignment: 4096 })
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(allocator.stats().allocationCount == 1 && allocator.stats().usedBytes > 0, "empty request is a live owned allocation")
+  drop empty
+  run Testing.expect(allocator.stats().allocationCount == 0 && allocator.stats().usedBytes == 0, "empty owner reclaimed")
+}
+
+test effect fn providerDiesBeforeAllocationsAndLedgerDiesWithLastOwner() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut system = Allocator.systemAllocatorProvider()
+  let observer = run makeObserver() |> Effect.provideMut<Allocator>(&mut system)
+  let mut allocator = run RuntimeAllocator.make(trackingChild(&observer))
+  let first = run Box<i32>.make(40) |> Effect.provideMut<Allocator>(&mut allocator)
+  let second = run Box<i32>.make(2) |> Effect.provideMut<Allocator>(&mut allocator)
+  drop allocator
+  let orphaned = childStats(&observer)
+  run Testing.expect(orphaned.issued == 3 && orphaned.returned == 0, "provider drop keeps ledger and live allocations")
+  run Testing.expect(first.get()[0] + second.get()[0] == 42, "allocations do not borrow provider lifetime")
+  drop first
+  run Testing.expect(childStats(&observer).returned == 1, "individual delayed reclaim keeps ledger")
+  run Testing.expect(second.get()[0] == 2, "remaining allocation survives delayed reclaim")
+  drop second
+  let finished = childStats(&observer)
+  run Testing.expect(finished.returned == 3 && finished.liveBytes == 0, "last owner frees its storage and control ledger")
+}
+
+fn finishValues(values: List<Box<i32>>) -> i32 {
+  let mut result: i32 = 0
+  let slice = values.asSlice()
+  let mut index: usize = 0
+  while index < slice.length {
+    result = result + slice[index].get()[0]
+    index = index + 1
+  }
+  return result
+}
+
+test effect fn crossThreadReclaimAfterProviderDropFreesEveryOwnerExactlyOnce() -> ()
+  ! OutOfMemoryError | SpawnError | AssertionError<'static> {
+  let mut system = Allocator.systemAllocatorProvider()
+  let observer = run makeObserver() |> Effect.provideMut<Allocator>(&mut system)
+  let mut allocator = run RuntimeAllocator.make(trackingChild(&observer))
+  let mut left = List<Box<i32>>.make()
+  let mut right = List<Box<i32>>.make()
+  let mut index: usize = 0
+  while index < 64 {
+    let first = run Box<i32>.make(40) |> Effect.provideMut<Allocator>(&mut allocator)
+    let second = run Box<i32>.make(2) |> Effect.provideMut<Allocator>(&mut allocator)
+    run left.append(move first) |> Effect.provideMut<Allocator>(&mut system)
+    run right.append(move second) |> Effect.provideMut<Allocator>(&mut system)
+    index = index + 1
+  }
+  run Testing.expect(allocator.stats().allocationCount == 128, "all threaded owners counted")
+  drop allocator
+  let firstWorker = run NativeThread.spawn(fn() -> i32 { return finishValues(move left) })
+    |> Effect.provideMut<Allocator>(&mut system)
+  let secondWorker = run NativeThread.spawn(fn() -> i32 { return finishValues(move right) })
+    |> Effect.provideMut<Allocator>(&mut system)
+  let first = firstWorker.join()
+  let second = secondWorker.join()
+  run Testing.expect(first + second == 2688, "payloads survive transfer and provider destruction")
+  let finished = childStats(&observer)
+  run Testing.expect(finished.issued == 129 && finished.returned == 129, "all backing owners and ledger reclaimed exactly once")
+  run Testing.expect(finished.liveBytes == 0, "cross-thread final release leaves no backing")
+}
+
+test effect fn nestedRuntimeProvidersKeepBothLedgersUntilFinalReclaim() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut system = Allocator.systemAllocatorProvider()
+  let observer = run makeObserver() |> Effect.provideMut<Allocator>(&mut system)
+  let outer = run RuntimeAllocator.make(trackingChild(&observer))
+  let mut inner = run RuntimeAllocator.make(move outer)
+  let first = run Box<i32>.make(11) |> Effect.provideMut<Allocator>(&mut inner)
+  let second = run Box<i32>.make(31) |> Effect.provideMut<Allocator>(&mut inner)
+  run Testing.expect(inner.stats().allocationCount == 2, "inner excludes its own ledger")
+  drop inner
+  let orphaned = childStats(&observer)
+  run Testing.expect(orphaned.issued == 4 && orphaned.returned == 0, "both provider ledgers remain owned")
+  drop first
+  run Testing.expect(childStats(&observer).returned == 1 && second.get()[0] == 31, "nested individual reclaim")
+  drop second
+  let finished = childStats(&observer)
+  run Testing.expect(finished.returned == 4 && finished.liveBytes == 0, "nested backing and both ledgers released")
+}
+
+test effect fn allocationObserverSurvivesProviderAndLastAllocationWithoutKeepingBackingAlive() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut system = Allocator.systemAllocatorProvider()
+  let observer = run makeObserver() |> Effect.provideMut<Allocator>(&mut system)
+  let mut allocator = run RuntimeAllocator.make(trackingChild(&observer))
+  let stats = run allocator.observe()
+  let owner = run Box<i32>.make(42) |> Effect.provideMut<Allocator>(&mut allocator)
+  allocator.setLimit(4096)
+  let before = stats.stats()
+  drop allocator
+  run Testing.expect(owner.get()[0] == 42 && before.allocationCount == 1 && before.limit == 4096,
+    "observation does not borrow the provider or its allocated value")
+  drop owner
+  run Testing.expect(stats.stats().usedBytes == 0 && stats.stats().allocationCount == 0,
+    "last allocation reclamation remains observable after provider destruction")
+  let retainedControl = childStats(&observer)
+  run Testing.expect(retainedControl.issued == 2 && retainedControl.returned == 1,
+    "only the accounting ledger remains, not payload backing")
+  drop stats
+  let reclaimed = childStats(&observer)
+  run Testing.expect(reclaimed.returned == 2 && reclaimed.liveBytes == 0,
+    "last observation releases the independent control ledger exactly once")
+}

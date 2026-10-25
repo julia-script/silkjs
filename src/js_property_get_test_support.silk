@@ -1,0 +1,389 @@
+//! Executable embedding for native Get: real owned closures, registered exotic
+//! descriptors, mutation/collection and cached typed bytes; no canned Get results.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.list { List }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.result { Result }
+import silk.u32
+import runtime_memory { AllocationObserver }
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_core_types { RuntimeState, ObjectData, ObjectPayload, ShapeData, PropertySlot, PropertyDescriptor,
+  NativeFunctionId, BuiltinFamily, NativeErrorKind, WeakRefHeader, TypedArrayCache, AutoInitKind, AutoInitOpaque }
+import js_value { Value }
+import js_gc { HeapHooks, Tracer }
+import js_gc as gc
+import js_runtime as runtime
+import js_shapes as shapes
+import js_object_allocate as objects
+import js_class_data as classes
+import js_strings { Strings }
+import js_string_types { StringLengthError }
+import js_string_exotic as stringExotic
+import js_arguments as argumentObjects
+import js_bound_functions as bound
+import js_for_in as forIn
+import js_async_from_sync as asyncFromSync
+import js_closures as closures
+import js_auto_init as autoInit
+import js_module_namespace as namespaces
+import js_proxy_core as proxyCore
+import js_auto_init { AutoInitHooks, InitializedProperty }
+import js_runtime_classes { NATIVE_JS_BOUND_FUNCTION_MARK, NATIVE_JS_BOUND_FUNCTION_FINALIZER,
+  NATIVE_JS_FOR_IN_ITERATOR_MARK, NATIVE_JS_FOR_IN_ITERATOR_FINALIZER,
+  NATIVE_JS_ASYNC_FROM_SYNC_ITERATOR_MARK, NATIVE_JS_ASYNC_FROM_SYNC_ITERATOR_FINALIZER,
+  NATIVE_JS_MODULE_NS_EXOTIC_METHODS, NATIVE_JS_PROXY_MARK, NATIVE_JS_PROXY_FINALIZER }
+import js_parser_diagnostics { DiagnosticMessage }
+import js_coercions_test_support as conversion
+import js_coercions_test_support { Hooks as ConversionHooks, Closure }
+import js_property_names_test_support as stored
+import js_property_names_test_support { StoredProperties, Entry }
+import js_property_descriptors_test_support { ByteView, LAZY_TABLE }
+import js_property_queries_test_support { prototype, mask }
+import js_array_storage_test_support { reference, trap }
+import js_property_host { OwnPropertyHooks, OwnPropertyResult, GetPropertyHooks, HasPropertyHooks }
+import js_coercion_host { CoercionHooks }
+import js_property_get as get
+import js_typed_array_read as typedRead
+import js_exceptions { JsException }
+import js_exceptions as exceptions
+import js_errors as errors
+
+pub struct Hooks<'a> {
+  pub memory: &'a AllocationObserver, pub conversion: ConversionHooks,
+  pub calls: usize, pub ownCalls: usize, pub getCalls: usize, pub autoCalls: usize,
+  pub finalized: [u32; 128], pub finalizedCount: usize, pub finalizedPending: bool,
+  pub receiverTag: i32, pub receiverAddress: usize,
+  pub mutateTarget: Value, pub replacement: Value, pub mutateOwn: bool,
+  pub failOwn: bool, pub failGet: bool, pub failHas: bool, pub failAuto: bool, pub relocate: bool
+}
+impl<'a> Hooks<'a> {
+  pub fn make(memory: &'a AllocationObserver) -> Self {
+    return Self { memory: memory, conversion: ConversionHooks.make(), calls: 0, ownCalls: 0,
+      getCalls: 0, autoCalls: 0, finalized: [0; 128], finalizedCount: 0, finalizedPending: false,
+      receiverTag: 0, receiverAddress: 0, mutateTarget: Value.Undefined, replacement: Value.Null,
+      mutateOwn: false, failOwn: false, failGet: false, failHas: false, failAuto: false, relocate: false }
+  }
+}
+fn tableIs(table: NativeFunctionId, id: u32) -> bool {
+  return match table { NativeFunctionId.Host { id: actual } => actual == id _ => false }
+}
+fn runtimeCallback(callback: NativeFunctionId, expected: u32) -> bool {
+  return match callback {
+    NativeFunctionId.Builtin { family, method } => family == BuiltinFamily.Runtime && method == expected
+    _ => false
+  }
+}
+impl<'a> HeapHooks for Hooks<'a> {
+  unsafe fn traceClass(self: &mut Self, rt: *mut HeapHeader, node: *mut HeapHeader,
+    callback: NativeFunctionId, tracer: &mut Tracer) -> () {
+    if runtimeCallback(callback, NATIVE_JS_BOUND_FUNCTION_MARK) { unsafe bound.mark(node, &mut tracer) return () }
+    if runtimeCallback(callback, NATIVE_JS_FOR_IN_ITERATOR_MARK) { unsafe forIn.mark(node, &mut tracer) return () }
+    if runtimeCallback(callback, NATIVE_JS_ASYNC_FROM_SYNC_ITERATOR_MARK) { unsafe asyncFromSync.mark(node, &mut tracer) return () }
+    if runtimeCallback(callback, NATIVE_JS_PROXY_MARK) { unsafe proxyCore.mark(node, &mut tracer) return () }
+    let anchor = () let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+    if match &p.payload { ObjectPayload.TypedArray { .. } => true _ => false } { return () }
+    drop p
+    if tableIs(callback, conversion.TABLE) {
+      unsafe HeapHooks.traceClass(&mut self.conversion, rt, node, callback, &mut tracer)
+    } else if tableIs(callback, stored.TABLE_ID) {
+      let data = unsafe HeapCell.payload<StoredProperties, ()>(&anchor, unsafe stored.storage(Value.Object { reference: node }))
+      let mut i: usize = 0
+      while i < data.entries.length() {
+        let entry = data.entries.get(i)
+        unsafe tracer.value(entry.value) unsafe tracer.value(entry.getter) unsafe tracer.value(entry.setter)
+        i = i + 1
+      }
+    } else if !unsafe gc.traceCorePayload(node, &mut tracer) { trap() }
+  }
+  unsafe fn finalizeClass(self: &mut Self, rt: *mut HeapHeader, node: *mut HeapHeader,
+    callback: NativeFunctionId) -> () {
+    self.finalizedPending = self.finalizedPending || unsafe exceptions.has(rt)
+    if runtimeCallback(callback, NATIVE_JS_BOUND_FUNCTION_FINALIZER) { unsafe bound.finalize(&mut self, rt, node) return () }
+    if runtimeCallback(callback, NATIVE_JS_FOR_IN_ITERATOR_FINALIZER) { unsafe forIn.finalize(&mut self, rt, node) return () }
+    if runtimeCallback(callback, NATIVE_JS_ASYNC_FROM_SYNC_ITERATOR_FINALIZER) { unsafe asyncFromSync.finalize(&mut self, rt, node) return () }
+    if runtimeCallback(callback, NATIVE_JS_PROXY_FINALIZER) { unsafe proxyCore.finalize(&mut self, rt, node) return () }
+    let mut anchor = () let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+    let mut view = Pointer.null<HeapHeader>()
+    match &p.payload { ObjectPayload.TypedArray { array } => { view = array.view } _ => () }
+    if !Pointer.isNull<HeapHeader>(view) { p.payload = ObjectPayload.Empty }
+    drop p
+    match Pointer.nonNullMut<HeapHeader>(view) {
+      Option<*mut HeapHeader>.Some { value } => { unsafe HeapCell.destroy<ByteView>(value) return () }
+      Option<*mut HeapHeader>.None => ()
+    }
+    let object = Value.Object { reference: node }
+    if tableIs(callback, conversion.TABLE) {
+      let owned = unsafe conversion.storage(object)
+      let data = unsafe HeapCell.payload<Closure, ()>(&anchor, owned)
+      let result = data.result let mutation = data.mutation let event = data.event
+      drop data
+      let current = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+      current.payload = ObjectPayload.Empty drop current
+      self.finalized[self.finalizedCount] = event self.finalizedCount = self.finalizedCount + 1
+      unsafe gc.release(&mut self, rt, result) unsafe gc.release(&mut self, rt, mutation)
+      unsafe HeapCell.destroy<Closure>(owned)
+    } else if tableIs(callback, stored.TABLE_ID) {
+      let owned = unsafe stored.storage(object)
+      let current = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+      current.payload = ObjectPayload.Empty drop current
+      let data = unsafe HeapCell.payloadMut<StoredProperties, ()>(&mut anchor, owned)
+      let entries = Intrinsic.replace(data.entries, List<Entry>.make()) drop data
+      let mut i: usize = 0
+      while i < entries.length() {
+        let entry = entries.get(i)
+        unsafe stored.releaseAtom(rt, entry.atom)
+        unsafe gc.release(&mut self, rt, entry.value)
+        unsafe gc.release(&mut self, rt, entry.getter) unsafe gc.release(&mut self, rt, entry.setter)
+        i = i + 1
+      }
+      unsafe HeapCell.destroy<StoredProperties>(owned)
+    } else if !unsafe gc.finalizeCorePayload(&mut self, rt, node) { trap() }
+  }
+  unsafe effect fn sweepWeak(self: &mut Self, rt: *mut HeapHeader, node: *mut WeakRefHeader) -> () ? &mut Allocator { trap() }
+  unsafe fn destroyAuxiliary(self: &mut Self, rt: *mut HeapHeader, node: *mut HeapHeader) -> () { trap() }
+}
+unsafe effect fn hideEnumerable(rt: *mut HeapHeader, object: Value, atom: u32) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = () let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, reference(object))
+  if p.classId == stored.CLASS_ID {
+    drop p
+    let data = unsafe HeapCell.payloadMut<StoredProperties, ()>(&mut anchor, unsafe stored.storage(object))
+    let entries = data.entries.asMutSlice()
+    let mut index: usize = 0
+    while index < entries.length {
+      if entries[index].atom == atom { entries[index].flags = entries[index].flags & ~4 return () }
+      index = index + 1
+    }
+    trap()
+  }
+  let index = match unsafe shapes.lookup(p.shape, atom) { Option<usize>.Some { value } => value _ => trap() }
+  let metadata = () let shape = unsafe HeapCell.payload<ShapeData, ()>(&metadata, p.shape)
+  let flags = shape.properties.get(index).flags drop shape
+  run unsafe shapes.updateFlags(rt, &mut p, index, flags & 251)
+}
+impl<'a> CoercionHooks for Hooks<'a> {
+  unsafe effect fn throwOutOfMemory(self: &mut Self, context: *mut HeapHeader) -> never
+    ! JsException ? &mut Allocator {
+    let memory = self.memory
+    return run unsafe errors.throwOutOfMemory(&mut self, memory, context)
+  }
+  unsafe effect fn throwError(self: &mut Self, context: *mut HeapHeader, kind: NativeErrorKind,
+    message: &[u8]) -> never ! JsException ? &mut Allocator {
+    let memory = self.memory
+    return run unsafe errors.throwError(&mut self, memory, context, kind, message)
+  }
+  unsafe effect fn getProperty(self: &mut Self, context: *mut HeapHeader, object: Value, atom: u32) -> Value
+    ! OutOfMemoryError | JsException ? &mut Allocator {
+    return run unsafe get.getProperty(&mut self, context, object, atom)
+  }
+  unsafe fn isCallable(self: &mut Self, context: *mut HeapHeader, value: Value) -> bool {
+    return unsafe CoercionHooks.isCallable(&mut self.conversion, context, value)
+  }
+  unsafe effect fn call(self: &mut Self, context: *mut HeapHeader, function: Value,
+    receiver: Value, arguments: &[Value]) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+    if unsafe argumentObjects.isThrower(function) {
+      return run unsafe argumentObjects.throwTypeError(&mut self, context, receiver, arguments.length)
+    }
+    if !unsafe self.isCallable(context, function) {
+      return run unsafe self.throwError(context, NativeErrorKind.Type, b"not a function")
+    }
+    let rt = unsafe runtime.contextRuntime(context)
+    let anchor = () let data = unsafe HeapCell.payload<Closure, ()>(&anchor, unsafe conversion.storage(function))
+    let result = unsafe data.result.retained() let mutation = unsafe data.mutation.retained()
+    let body = data.body let atom = data.mutationAtom drop data
+    self.calls = self.calls + 1 self.receiverTag = receiver.tag()
+    self.receiverAddress = 0
+    if receiver.isObject() { self.receiverAddress = Pointer.address(reference(receiver)) }
+    if body == 3 {
+      let mut mutationAnchor = ()
+      let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut mutationAnchor, reference(receiver))
+      let index = match unsafe shapes.lookup(p.shape, atom) { Option<usize>.Some { value } => value _ => trap() }
+      let old = p.properties.get(index)
+      p.properties.set(index, PropertySlot.Value { value: unsafe mutation.retained() })
+      drop p
+      unsafe gc.releaseProperty(&mut self, rt, old)
+    }
+    if body == 6 {
+      let hidden = run Effect.result(unsafe hideEnumerable(rt, receiver, atom))
+      match move hidden {
+        Result<(), OutOfMemoryError>.Success { .. } => ()
+        Result<(), OutOfMemoryError>.Failure { error } => {
+          unsafe gc.release(&mut self, rt, result)
+          unsafe gc.release(&mut self, rt, mutation)
+          fail move error
+        }
+      }
+    }
+    unsafe gc.release(&mut self, rt, mutation)
+    run unsafe gc.collect(&mut self, rt, true)
+    if body == 1 { return run unsafe exceptions.throwValue<Value, Self>(&mut self, rt, result) }
+    if body == 2 { unsafe gc.release(&mut self, rt, result) return unsafe receiver.retained() }
+    return result
+  }
+}
+impl<'a> AutoInitHooks for Hooks<'a> {
+  unsafe effect fn initializeProperty(self: &mut Self, realm: *mut HeapHeader, owner: Value,
+    atom: u32, kind: AutoInitKind, opaque: AutoInitOpaque) -> InitializedProperty ! JsException ? &mut Allocator {
+    self.autoCalls = self.autoCalls + 1
+    match kind {
+      AutoInitKind.Prototype => {
+        let memory = self.memory
+        let prototype = run unsafe closures.instantiatePrototype(&mut self, memory, realm, owner)
+        return InitializedProperty.Value { value: prototype }
+      }
+      AutoInitKind.Property => {
+        match opaque {
+          AutoInitOpaque.Native { descriptor } => { if !tableIs(descriptor, LAZY_TABLE) { trap() } }
+          _ => trap()
+        }
+        if self.failAuto { return run unsafe self.throwError(realm, NativeErrorKind.Type, b"initializer failed") }
+        let initialized = run Effect.result(Strings.fromLatin1(b"lazy"))
+        return match move initialized {
+          Result<Value, OutOfMemoryError | StringLengthError>.Success { value } => InitializedProperty.Value { value: value }
+          Result<Value, OutOfMemoryError | StringLengthError>.Failure { .. } => run unsafe self.throwOutOfMemory(realm)
+        }
+      }
+      AutoInitKind.ModuleNamespace => {
+        let module = match opaque { AutoInitOpaque.Heap { reference } => reference _ => trap() }
+        let memory = self.memory
+        return run unsafe namespaces.initializeProperty(&mut self, memory, realm, module, atom)
+      }
+    }
+  }
+}
+impl<'a> OwnPropertyHooks for Hooks<'a> {
+  unsafe effect fn throwNotObject(self: &mut Self, context: *mut HeapHeader) -> never ! JsException ? &mut Allocator {
+    return run unsafe self.throwError(context, NativeErrorKind.Type, b"not an object")
+  }
+  unsafe effect fn throwUninitialized(self: &mut Self, context: *mut HeapHeader, atom: u32) -> never
+    ! JsException ? &mut Allocator {
+    let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, unsafe runtime.contextRuntime(context))
+    let mut message = DiagnosticMessage.make() message.appendAtom(&state.atoms, atom) drop state
+    message.append(b" is not initialized")
+    return run unsafe self.throwError(context, NativeErrorKind.Reference, message.bytes())
+  }
+  unsafe effect fn readTypedIndex(self: &mut Self, context: *mut HeapHeader, object: Value, index: u32) -> Value
+    ! OutOfMemoryError | JsException ? &mut Allocator {
+    let indexed = run unsafe typedRead.readIndex(reference(object), index)
+    return match move indexed {
+      Option<Value>.Some { value } => value Option<Value>.None => Value.Undefined
+    }
+  }
+  unsafe effect fn instantiateAutoInit(self: &mut Self, context: *mut HeapHeader, object: Value, atom: u32) -> ()
+    ! OutOfMemoryError | JsException ? &mut Allocator {
+    run unsafe autoInit.instantiate(&mut self, context, object, atom)
+    let rt = unsafe runtime.contextRuntime(context)
+    let mut i: u32 = 0
+    while i < 24 && self.relocate {
+      run unsafe stored.add(&mut self, rt, object, 0x80000000 | i, 7, PropertySlot.Value { value: Value.Undefined })
+      i = i + 1
+    }
+    run unsafe gc.collect(&mut self, rt, true)
+  }
+  unsafe effect fn getExoticOwnProperty(self: &mut Self, context: *mut HeapHeader, table: NativeFunctionId,
+    object: Value, atom: u32, requested: bool) -> OwnPropertyResult ! OutOfMemoryError | JsException ? &mut Allocator {
+    if stringExotic.isTable(table) {
+      return run unsafe stringExotic.getOwnProperty(&mut self, context, object, atom, requested)
+    }
+    if !tableIs(table, stored.TABLE_ID) { trap() }
+    self.ownCalls = self.ownCalls + 1
+    let rt = unsafe runtime.contextRuntime(context)
+    if self.mutateOwn {
+      let target = self.mutateTarget let replacement = self.replacement
+      run unsafe prototype(&mut self, rt, target, replacement)
+    }
+    run unsafe gc.collect(&mut self, rt, true)
+    if self.failOwn { return run unsafe self.throwError(context, NativeErrorKind.Type, b"exotic failed") }
+    let anchor = () let data = unsafe HeapCell.payload<StoredProperties, ()>(&anchor, unsafe stored.storage(object))
+    let mut i: usize = 0
+    while i < data.entries.length() {
+      let entry = data.entries.get(i)
+      if entry.atom == atom && entry.present {
+        if !requested { return OwnPropertyResult.Exists }
+        return OwnPropertyResult.Descriptor { descriptor: PropertyDescriptor { flags: entry.flags,
+          value: unsafe entry.value.retained(), getter: unsafe entry.getter.retained(), setter: unsafe entry.setter.retained() } }
+      }
+      i = i + 1
+    }
+    return OwnPropertyResult.Absent
+  }
+}
+impl<'a> HasPropertyHooks for Hooks<'a> {
+  unsafe effect fn hasExoticProperty(self: &mut Self, context: *mut HeapHeader, table: NativeFunctionId,
+    object: Value, atom: u32) -> bool ! OutOfMemoryError | JsException ? &mut Allocator {
+    if runtimeCallback(table, NATIVE_JS_MODULE_NS_EXOTIC_METHODS) { return unsafe namespaces.hasProperty(object, atom) }
+    if self.failHas { return run unsafe self.throwError(context, NativeErrorKind.Type, b"has failed") }
+    let own = run unsafe OwnPropertyHooks.getExoticOwnProperty(&mut self, context, table, object, atom, false)
+    return match move own { OwnPropertyResult.Exists => true OwnPropertyResult.Absent => false _ => trap() }
+  }
+}
+impl<'a> GetPropertyHooks for Hooks<'a> {
+  unsafe effect fn getExoticProperty(self: &mut Self, context: *mut HeapHeader, table: NativeFunctionId,
+    object: Value, atom: u32, receiver: Value) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+    if !tableIs(table, stored.TABLE_ID) { trap() }
+    self.getCalls = self.getCalls + 1
+    self.receiverTag = receiver.tag()
+    self.receiverAddress = 0
+    if receiver.isObject() { self.receiverAddress = Pointer.address(reference(receiver)) }
+    let rt = unsafe runtime.contextRuntime(context)
+    run unsafe gc.collect(&mut self, rt, true)
+    if self.failGet { return run unsafe self.throwError(context, NativeErrorKind.Type, b"get failed") }
+    let anchor = () let data = unsafe HeapCell.payload<StoredProperties, ()>(&anchor, unsafe stored.storage(object))
+    let mut i: usize = 0
+    while i < data.entries.length() {
+      let entry = data.entries.get(i)
+      if entry.atom == atom && entry.present { return unsafe entry.value.retained() }
+      i = i + 1
+    }
+    return Value.Undefined
+  }
+}
+pub unsafe effect fn prepare<'a>(hooks: &mut Hooks<'a>, context: *mut HeapHeader) -> ()
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  run unsafe stored.register(rt)
+  run unsafe conversion.register(rt)
+  let memory = hooks.memory
+  run unsafe conversion.prepareErrors(&mut hooks.conversion, memory, context)
+}
+pub unsafe effect fn closure<'a>(hooks: &mut Hooks<'a>, context: *mut HeapHeader, event: u32,
+  body: u32, result: Value, atom: u32, mutation: Value) -> Value ! OutOfMemoryError ? &mut Allocator {
+  let memory = hooks.memory
+  return run unsafe conversion.closure(&mut hooks.conversion, memory, context, true, event, body, result, atom, mutation)
+}
+pub unsafe effect fn typed<'a>(hooks: &mut Hooks<'a>, context: *mut HeapHeader, classId: u32,
+  raw: &[u8], count: u32) -> Value ! OutOfMemoryError ? &mut Allocator {
+  let mut bytes = List<u8>.make() let mut i: usize = 0
+  while i < raw.length { run bytes.append(raw[i]) i = i + 1 }
+  // A detached view still owns real byte storage but publishes count zero.
+  if bytes.length() == 0 { run bytes.append(0) }
+  let view = run HeapCell.allocate(HeapKind.Auxiliary, ByteView { bytes: move bytes })
+  let memory = hooks.memory
+  let allocated = run Effect.result(unsafe objects.withPrototypeClass(&mut hooks, memory, context, Value.Null, classId))
+  let object = match move allocated {
+    Result<Value, OutOfMemoryError>.Success { value } => value
+    Result<Value, OutOfMemoryError>.Failure { error } => { unsafe HeapCell.destroy<ByteView>(view) fail move error }
+  }
+  let mut anchor = () let backing = unsafe HeapCell.payloadMut<ByteView, ()>(&mut anchor, view)
+  let slice = backing.bytes.asMutSlice()
+  let pointer = Pointer.fromMutRef<u8>(&mut slice[0]) drop slice drop backing
+  let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, reference(object))
+  p.payload = ObjectPayload.TypedArray { array: TypedArrayCache { view: view, shared: false, cachedData: pointer, count: count, requiresExtensible: false } }
+  return object
+}
+pub unsafe effect fn exotic<'a>(hooks: &mut Hooks<'a>, context: *mut HeapHeader) -> Value
+  ! OutOfMemoryError ? &mut Allocator {
+  let data = run HeapCell.allocate(HeapKind.Auxiliary, StoredProperties { entries: List<Entry>.make() })
+  let memory = hooks.memory
+  let allocated = run Effect.result(unsafe objects.withPrototypeClass(&mut hooks, memory, context, Value.Null, stored.CLASS_ID))
+  return match move allocated {
+    Result<Value, OutOfMemoryError>.Failure { error } => { unsafe HeapCell.destroy<StoredProperties>(data) fail move error }
+    Result<Value, OutOfMemoryError>.Success { value } => {
+      let mut anchor = () let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, reference(value))
+      p.payload = ObjectPayload.HostOpaque { data: unsafe Intrinsic.pointerReinterpret<*mut HeapHeader, *mut u8>(data) }
+      return value
+    }
+  }
+}

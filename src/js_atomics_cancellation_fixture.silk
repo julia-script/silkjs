@@ -1,0 +1,153 @@
+//! Standalone cancellation smoke: real native threads and real Atomics.wait
+//! dispatch, independently asserted interruption and allocation ownership.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.atomic { MemoryOrder }
+import silk.box { Box }
+import silk.effect { Effect }
+import silk.native_thread { NativeThread, SpawnError }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.result { Result }
+import runtime_memory { RuntimeAllocator }
+import native_stack { currentFrameAddress }
+import js_atomics_native as native
+import js_atomics_native { Domain, WaiterDomain, CancellableDomain, WaitResult, SynchronizationError }
+import js_shared_memory as shared
+import js_shared_memory { Span }
+import js_exceptions { JsException }
+import js_exceptions as exceptions
+import js_string_types { StringLengthError }
+import js_errors_test_support { FaultAllocator }
+import js_array_storage_test_support as contexts
+import js_buffer_test_support as fixture
+import js_buffer_test_support { Hooks }
+import js_buffer_storage as storage
+import js_typed_array_buffer as typed
+import js_atomics as atomics
+import js_class_data as classes
+import js_core_types { RuntimeState, FrameSlots }
+import js_heap { HeapCell }
+import js_value { Value }
+import js_runtime as runtime
+import js_gc as gc
+import js_property_descriptors_test_support { errorKind }
+
+extern "C" struct Timespec { seconds: i64, nanoseconds: i64 }
+unsafe extern "C" fn nanosleep(request: *const Timespec, remaining: ?*mut Timespec) -> i32
+  with Intrinsic.foreign(noCapture: ("request", "remaining"))
+fn waitScoped(domain: Domain, span: Span, shift: u32) -> i32 {
+  unsafe shared.store(span, 8, 3, 1, MemoryOrder.SequentiallyConsistent)
+  return match unsafe native.wait(domain, span, 0, shift, 0, 9223372036854775807) {
+    WaitResult.Cancelled => 1
+    WaitResult.Ok => 2
+    WaitResult.NotEqual => 3
+    WaitResult.TimedOut => 4
+  }
+}
+fn awaitStart(span: Span) -> () {
+  let delay = Timespec { seconds: 0, nanoseconds: 1000 }
+  let mut attempts: u32 = 0
+  while unsafe shared.load(span, 8, 3, MemoryOrder.SequentiallyConsistent) == 0 {
+    attempts = attempts + 1
+    if attempts >= 100000 { contexts.trap() }
+    let ignored = unsafe nanosleep(Pointer.fromRef(&delay), Pointer.null<Timespec>())
+  }
+}
+pub effect fn runCancellation() -> u32 ! OutOfMemoryError | SynchronizationError | SpawnError {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let owner = run WaiterDomain.make() |> Effect.provideMut<Allocator>(&mut memory)
+  let mut backing = run Box<[u64; 2]>.make([0; 2]) |> Effect.provideMut<Allocator>(&mut memory)
+  let first = Pointer.fromMutRef(&mut backing.getMut()[0][0])
+  let span = Span { data: unsafe Intrinsic.pointerReinterpret<*mut u64, *mut u8>(first), capacity: 16 }
+  let baseline = observer.stats()
+  let mut completed: u32 = 0
+  while completed < 66 {
+    let scope = run CancellableDomain.make(owner.handle()) |> Effect.provideMut<Allocator>(&mut memory)
+    let handle = scope.handle() let threadSpan = span
+    let mut shift: u32 = 2 if completed % 2 != 0 { shift = 3 }
+    let threadShift = shift
+    unsafe shared.store(span, 8, 3, 0, MemoryOrder.SequentiallyConsistent)
+    // The first two waits start AFTER cancellation, including both widths.
+    // Subsequent waits race cancellation against the enqueue mutex boundary.
+    if completed < 2 { scope.cancel() }
+    let thread = run NativeThread.spawn(fn() -> i32 { return waitScoped(handle, threadSpan, threadShift) }) |> Effect.provideMut<Allocator>(&mut memory)
+    if completed >= 2 { awaitStart(span) scope.cancel() }
+    scope.cancel()
+    if thread.join() != 1 { contexts.trap() }
+    if unsafe native.notify(owner.handle(), unsafe shared.address(span, 0), 2147483647) != 0 { contexts.trap() }
+    drop scope
+    if observer.stats().allocationCount != baseline.allocationCount || observer.stats().usedBytes != baseline.usedBytes { contexts.trap() }
+    completed = completed + 1
+  }
+  // Cancellation must neither poison the root nor change its ordinary results.
+  match unsafe native.wait(owner.handle(), span, 0, 2, 1, 0) { WaitResult.NotEqual => () _ => contexts.trap() }
+  match unsafe native.wait(owner.handle(), span, 0, 3, 0, 0) { WaitResult.TimedOut => () _ => contexts.trap() }
+  drop backing
+  drop owner
+  if observer.stats().allocationCount != 0 || observer.stats().usedBytes != 0 { contexts.trap() }
+  return completed
+}
+pub effect fn scopeAllocationFailure() -> () ! OutOfMemoryError | SynchronizationError {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let owner = run WaiterDomain.make() |> Effect.provideMut<Allocator>(&mut memory)
+  let baseline = observer.stats()
+  let mut fault = FaultAllocator { parent: move memory, armed: true, remaining: 0, persistent: false, failures: 0 }
+  let failed = run Effect.result(CancellableDomain.make(owner.handle())) |> Effect.provideMut<Allocator>(&mut fault)
+  match move failed {
+    Result<CancellableDomain, OutOfMemoryError>.Success { value } => { drop value contexts.trap() }
+    Result<CancellableDomain, OutOfMemoryError>.Failure { .. } => ()
+  }
+  if fault.failures != 1 || observer.stats().allocationCount != baseline.allocationCount || observer.stats().usedBytes != baseline.usedBytes { contexts.trap() }
+  drop owner
+  if observer.stats().allocationCount != 0 || observer.stats().usedBytes != 0 { contexts.trap() }
+}
+pub effect fn runInterrupted(armed: bool) -> ()
+  ! OutOfMemoryError | SynchronizationError | StringLengthError | JsException {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let owner = run WaiterDomain.make() |> Effect.provideMut<Allocator>(&mut memory)
+  let scope = run CancellableDomain.make(owner.handle()) |> Effect.provideMut<Allocator>(&mut memory)
+  let rt = run runtime.allocateRuntimeStorage(currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe contexts.context(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make(&observer)
+  run unsafe fixture.prepare(&mut hooks, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+  let buffer = run unsafe storage.create(&mut hooks, &observer, ctx, Value.Undefined, 8,
+    Option<u64>.none(), true) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut constructorValues = [buffer, Value.Int { value: 0 }, Value.Int { value: 2 }]
+  let constructorArgs = FrameSlots.Borrowed { data: Pointer.fromMutRef(&mut constructorValues[0]), length: 3 }
+  let object = run unsafe typed.constructor(&mut hooks, &observer, ctx, Value.Undefined,
+    &constructorArgs, classes.JS_CLASS_INT32_ARRAY) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+  state.canBlock = true
+  drop state
+  let mut values = [object, Value.Int { value: 0 }, Value.Int { value: 0 }, Value.Undefined]
+  let args = FrameSlots.Borrowed { data: Pointer.fromMutRef(&mut values[0]), length: 4 }
+  scope.cancel()
+  let mut fault = FaultAllocator { parent: move memory, armed: armed, remaining: 0, persistent: false, failures: 0 }
+  let outcome = run Effect.result(unsafe atomics.call(&mut hooks, &observer, ctx, scope.handle(), atomics.WAIT, &args)) |> Effect.provideMut<Allocator>(&mut fault)
+  fault.armed = false
+  match move outcome {
+    Result<Value, JsException>.Success { value } => { unsafe gc.release(&mut hooks, rt, value) contexts.trap() }
+    Result<Value, JsException>.Failure { .. } => ()
+  }
+  let finalState = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let uncatchable = finalState.currentExceptionIsUncatchable
+  drop finalState
+  if !uncatchable || !unsafe exceptions.has(rt) { contexts.trap() }
+  if armed && fault.failures == 0 { contexts.trap() }
+  let error = unsafe exceptions.take(rt)
+  if !armed && unsafe errorKind(ctx, error) != 6 { contexts.trap() }
+  unsafe gc.release(&mut hooks, rt, error)
+  unsafe gc.release(&mut hooks, rt, object)
+  unsafe gc.release(&mut hooks, rt, buffer)
+  run unsafe gc.collect(&mut hooks, rt, true) |> Effect.provideMut<Allocator>(&mut fault)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx)
+  run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut fault)
+  hooks.clearHostLedger()
+  drop scope
+  drop owner
+  if observer.stats().allocationCount != 0 || observer.stats().usedBytes != 0 { contexts.trap() }
+}

@@ -1,0 +1,93 @@
+//! JS_HasProperty, quickjs.c:9062-9102. Inputs are borrowed; callbacks may
+//! mutate prototypes and collect. Each current node stays owned until its
+//! successor is retained, including the source's destructive-callback edge case.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.result { Result }
+import silk.u32
+import js_heap { HeapCell, HeapHeader }
+import js_core_types { RuntimeState, ObjectData, ShapeData, NativeFunctionId, ExoticCallbacks, EXOTIC_HAS_PROPERTY }
+import js_value { Value }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_class_data as classes
+import js_property_host { OwnPropertyHooks, HasPropertyHooks }
+import js_property_descriptors as descriptors
+import js_exceptions { JsException }
+
+union Step { Done { found: bool }, Next { reference: *mut HeapHeader } }
+unsafe effect fn step<H: HeapHooks + OwnPropertyHooks + HasPropertyHooks>(hooks: &mut H,
+  context: *mut HeapHeader, rt: *mut HeapHeader, node: *mut HeapHeader, atom: u32) -> Step
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let anchor = ()
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  let exotic = object.isExotic
+  let classId = object.classId
+  drop object
+  let mut callback = Option<NativeFunctionId>.none()
+  if exotic {
+    let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+    match &state.classes.asSlice()[u32.toUsize(classId)].exotic {
+      Option<ExoticCallbacks>.Some { value } => {
+        if (value.methodMask & EXOTIC_HAS_PROPERTY) != 0 {
+          callback = Option<NativeFunctionId>.some(value.descriptor)
+        }
+      }
+      Option<ExoticCallbacks>.None => ()
+    }
+  }
+  let value = Value.Object { reference: node }
+  match move callback {
+    Option<NativeFunctionId>.Some { value: table } => {
+      return Step.Done { found: run unsafe HasPropertyHooks.hasExoticProperty(&mut hooks, context, table, value, atom) }
+    }
+    Option<NativeFunctionId>.None => ()
+  }
+  if run unsafe descriptors.hasOwnProperty(&mut hooks, context, value, atom) {
+    return Step.Done { found: true }
+  }
+  // Re-read after dispatch: neither the object payload nor its old shape is
+  // borrowed across the own-property callback.
+  let current = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  if current.classId >= classes.JS_CLASS_UINT8C_ARRAY && current.classId <= classes.JS_CLASS_FLOAT64_ARRAY {
+    let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+    if !match state.atoms.numericIndex(atom) { Value.Undefined => true _ => false } {
+      return Step.Done { found: false }
+    }
+  }
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, current.shape)
+  return match Pointer.nonNullMut<HeapHeader>(shape.prototype) {
+    Option<*mut HeapHeader>.Some { value: next } => {
+      unsafe HeapCell.retain(next)
+      return Step.Next { reference: next }
+    }
+    Option<*mut HeapHeader>.None => Step.Done { found: false }
+  }
+}
+/// Nonobjects return false. TDZ throws; auto-init is not instantiated. Exotic
+/// has_property wins over own slots, fast storage and prototype traversal.
+pub unsafe effect fn hasProperty<H: HeapHooks + OwnPropertyHooks + HasPropertyHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value, atom: u32) -> bool
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut current = match object { Value.Object { reference } => reference _ => { return false } }
+  let rt = unsafe runtime.contextRuntime(context)
+  unsafe HeapCell.retain(context)
+  unsafe HeapCell.retain(current)
+  while true {
+    let result = run Effect.result(unsafe step(&mut hooks, context, rt, current, atom))
+    unsafe gc.releaseHeader(&mut hooks, rt, current)
+    match move result {
+      Result<Step, OutOfMemoryError | JsException>.Success { value } => match move value {
+        Step.Next { reference } => { current = reference }
+        Step.Done { found } => { unsafe gc.releaseHeader(&mut hooks, rt, context) return found }
+      }
+      Result<Step, OutOfMemoryError | JsException>.Failure { error } => {
+        unsafe gc.releaseHeader(&mut hooks, rt, context)
+        fail move error
+      }
+    }
+  }
+}

@@ -1,0 +1,259 @@
+//! Native quickjs.c:14721-14965,59585-59632 BigInt value boundaries.
+//! Free functions consume on every outcome; borrowed functions preserve identity.
+//! Strict conversion rejects Numbers (including Exception sentinels); constructor
+//! conversion accepts integral Numbers. Checked overflow leaves saturated halves.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.slice { Slice }
+import silk.f64
+import silk.i32
+import silk.i64
+import silk.u64
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_value { Value }
+import js_bigint { BigInt, BigIntError }
+import js_bigint_text { BigIntText }
+import js_atoms { AtomTable }
+import js_strings { Strings }
+import js_string_types { StringOwner, FlatString, StringLengthError, stringReference }
+import unicode_case { UnicodeCase }
+import silk.u16
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_core_types { NativeErrorKind, RuntimeState }
+import js_exceptions { JsException }
+import js_coercion_host { CoercionHooks }
+import js_coercions as coercion
+import js_integer_coercions as integer
+
+// Only impossible kernel invariants reach here, never a JS semantic fallback.
+fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+fn signed64(bits: u64) -> i64 {
+  if (bits & 0x8000000000000000) != 0 { return -1 - u64.toI64(bits ^ 0xffffffffffffffff) }
+  return u64.toI64(bits)
+}
+fn unsigned64(value: i64) -> u64 {
+  if value < 0 { return i64.toU64(-(value + 1)) ^ 0xffffffffffffffff }
+  return i64.toU64(value)
+}
+// The normalized limb owner is moved, never copied. The one-limb owner drops on
+// compaction; HeapCell.allocate drops its payload if allocation is refused.
+pub effect fn compact(value: BigInt) -> Value ! OutOfMemoryError ? &mut Allocator {
+  if value.length() == 1 { return Value.ShortBigInt { value: i64.toI32(value.lowI64()) } }
+  return Value.BigInt { reference: run HeapCell.allocate(HeapKind.BigInt, move value) }
+}
+effect fn constructed(result: Result<BigInt, OutOfMemoryError | BigIntError>) -> Value
+  ! OutOfMemoryError ? &mut Allocator {
+  return match move result {
+    Result<BigInt, OutOfMemoryError | BigIntError>.Success { value } => run compact(move value)
+    Result<BigInt, OutOfMemoryError | BigIntError>.Failure { error } => match move error {
+      OutOfMemoryError allocation => { fail move allocation }
+      BigIntError impossible => invariant()
+    }
+  }
+}
+pub effect fn newBigInt64(value: i64) -> Value ! OutOfMemoryError ? &mut Allocator {
+  if value >= -2147483647 - 1 && value <= 2147483647 { return Value.ShortBigInt { value: i64.toI32(value) } }
+  return run constructed(run Effect.result(BigInt.fromI64(value)))
+}
+pub effect fn newBigUint64(value: u64) -> Value ! OutOfMemoryError ? &mut Allocator {
+  if value <= 2147483647 { return Value.ShortBigInt { value: u64.toI32(value) } }
+  return run constructed(run Effect.result(BigInt.fromU64(value)))
+}
+pub effect fn newBigInt128(low: u64, high: u64) -> Value ! OutOfMemoryError ? &mut Allocator {
+  let mut extension: u64 = 0
+  if (low & 0x8000000000000000) != 0 { extension = 0xffffffffffffffff }
+  if high == extension { return run newBigInt64(signed64(low)) }
+  return run constructed(run Effect.result(BigInt.fromI128(low, high)))
+}
+
+// No JS callback while string/UTF8 temporary owners are live. Syntax becomes NaN
+// here; the public Err wrapper materializes SyntaxError only after these drop.
+effect fn parseStringFree(table: &AtomTable, value: Value) -> Value
+  ! OutOfMemoryError | StringLengthError | BigIntError ? &mut Allocator {
+  let owned = StringOwner.adopt(value)
+  let flat = StringOwner.adopt(run table.flatten(owned.get()))
+  let mut at: usize = 0
+  while at < Strings.length(flat.get()) && UnicodeCase.isSpace(u16.toU32(Strings.codeUnit(flat.get(), at))) { at = at + 1 }
+  if at == Strings.length(flat.get()) { return Value.ShortBigInt { value: 0 } }
+  let storage = unsafe HeapCell.payload<FlatString, StringOwner>(&flat, stringReference(flat.get()))
+  if !storage.wide {
+    let bytes = Slice.view<u8>(storage.latin1.asSlice(), 0, storage.length)
+    let mut index: usize = 0
+    while index < bytes.length && bytes[index] < 128 { index = index + 1 }
+    if index == bytes.length { return run compact(run BigIntText.parseInteger(bytes)) }
+  }
+  drop storage
+  let bytes = run Strings.toUtf8(flat.get(), false)
+  drop flat drop owned
+  return run compact(run BigIntText.parseInteger(bytes.asSlice()))
+}
+pub unsafe effect fn stringToBigInt<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, value: Value) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  if !value.isString() { invariant() }
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, unsafe runtime.contextRuntime(context))
+  let result = run Effect.result(parseStringFree(&state.atoms, value))
+  drop state
+  return match move result {
+    Result<Value, OutOfMemoryError | StringLengthError | BigIntError>.Success { value: output } => output
+    Result<Value, OutOfMemoryError | StringLengthError | BigIntError>.Failure { error } => match move error {
+      OutOfMemoryError allocation => { fail move allocation }
+      StringLengthError length => { fail move length }
+      BigIntError diagnostic => match diagnostic {
+        BigIntError.InvalidSyntax { .. } => Value.Float64 { value: f64.fromBits(0x7ff8000000000000) }
+        BigIntError.TooLarge => run unsafe hooks.throwError(context, NativeErrorKind.Range, b"BigInt is too large to allocate")
+        _ => invariant()
+      }
+    }
+  }
+}
+pub unsafe effect fn stringToBigIntErr<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, value: Value) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let output = run unsafe stringToBigInt(&mut hooks, context, value)
+  if !output.isBigInt() { return run unsafe hooks.throwError(context, NativeErrorKind.Syntax, b"invalid bigint literal") }
+  return output
+}
+unsafe effect fn floatConstructor<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, value: f64) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  let result = run Effect.result(BigInt.fromFloat64(value))
+  return match move result {
+    Result<BigInt, OutOfMemoryError | BigIntError>.Success { value: big } => run compact(move big)
+    Result<BigInt, OutOfMemoryError | BigIntError>.Failure { error } => match move error {
+      OutOfMemoryError allocation => { fail move allocation }
+      BigIntError diagnostic => match diagnostic {
+        BigIntError.Fractional => run unsafe hooks.throwError(context, NativeErrorKind.Range, b"cannot convert to BigInt: not an integer")
+        BigIntError.NonFinite => run unsafe hooks.throwError(context, NativeErrorKind.Range, b"cannot convert NaN or Infinity to BigInt")
+        _ => invariant()
+      }
+    }
+  }
+}
+unsafe effect fn convertFree<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, input: Value, constructor: bool) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let mut value = input
+  while true {
+    match value {
+      Value.ShortBigInt { .. } => { return value }
+      Value.BigInt { .. } => { return value }
+      Value.Bool { value: boolean } => {
+        if boolean { return Value.ShortBigInt { value: 1 } }
+        return Value.ShortBigInt { value: 0 }
+      }
+      Value.String { .. } => { return run unsafe stringToBigIntErr(&mut hooks, context, value) }
+      Value.Rope { .. } => { return run unsafe stringToBigIntErr(&mut hooks, context, value) }
+      Value.Object { .. } => {
+        value = run unsafe coercion.toPrimitiveFree(&mut hooks, context, value, coercion.JS_HINT_NUMBER)
+        // A callback's Exception sentinel propagates, unlike an input sentinel.
+        if value.isException() { return value }
+      }
+      Value.Int { value: number } => {
+        if constructor { return Value.ShortBigInt { value: number } }
+        break
+      }
+      Value.Float64 { value: number } => {
+        if constructor { return run unsafe floatConstructor(&mut hooks, context, number) }
+        break
+      }
+      _ => { break }
+    }
+  }
+  unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), value)
+  if constructor { return run unsafe hooks.throwError(context, NativeErrorKind.Type, b"cannot convert to BigInt") }
+  return run unsafe hooks.throwError(context, NativeErrorKind.Type, b"cannot convert to bigint")
+}
+pub unsafe effect fn toBigIntFree<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, value: Value) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  return run unsafe convertFree(&mut hooks, context, value, false)
+}
+pub unsafe effect fn toBigInt<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, value: Value) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  return run unsafe toBigIntFree(&mut hooks, context, unsafe value.retained())
+}
+pub unsafe effect fn toBigIntCtorFree<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, value: Value) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  return run unsafe convertFree(&mut hooks, context, value, true)
+}
+pub unsafe effect fn toBigInt64Free<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, output: &mut i64, value: Value) -> ()
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let outcome = run Effect.result(unsafe toBigIntFree(&mut hooks, context, value))
+  let converted = match move outcome {
+    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Success { value: big } => big
+    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => {
+      output.* = 0 fail move error
+    }
+  }
+  if converted.isException() { output.* = 0 fail JsException {} }
+  match converted {
+    Value.ShortBigInt { value: small } => { output.* = i32.toI64(small) }
+    Value.BigInt { reference } => {
+      let anchor = () let big = unsafe HeapCell.payload<BigInt, ()>(&anchor, reference)
+      let bits = big.lowI64() drop big
+      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), converted)
+      output.* = bits
+    }
+    _ => invariant()
+  }
+}
+pub unsafe effect fn toBigInt64<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, output: &mut i64, value: Value) -> ()
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  run unsafe toBigInt64Free(&mut hooks, context, &mut output, unsafe value.retained())
+}
+pub unsafe effect fn toBigInt128SatFree<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, low: &mut u64, high: &mut u64, value: Value) -> i32
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let outcome = run Effect.result(unsafe toBigIntFree(&mut hooks, context, value))
+  let converted = match move outcome {
+    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Success { value: big } => big
+    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => {
+      low.* = 0 high.* = 0 fail move error
+    }
+  }
+  if converted.isException() { low.* = 0 high.* = 0 fail JsException {} }
+  match converted {
+    Value.ShortBigInt { value: small } => {
+      low.* = unsigned64(i32.toI64(small))
+      high.* = 0
+      if small < 0 { high.* = 0xffffffffffffffff }
+      return 0
+    }
+    Value.BigInt { reference } => {
+      let anchor = () let big = unsafe HeapCell.payload<BigInt, ()>(&anchor, reference)
+      let saturated = big.saturatingI128() drop big
+      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), converted)
+      low.* = saturated.value.low high.* = saturated.value.high
+      if saturated.clamped { return 1 }
+      return 0
+    }
+    _ => invariant()
+  }
+}
+pub unsafe effect fn toBigInt128Sat<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, low: &mut u64, high: &mut u64, value: Value) -> i32
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  return run unsafe toBigInt128SatFree(&mut hooks, context, &mut low, &mut high, unsafe value.retained())
+}
+pub unsafe effect fn toBigInt128<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, low: &mut u64, high: &mut u64, value: Value) -> ()
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let clamped = run unsafe toBigInt128Sat(&mut hooks, context, &mut low, &mut high, value)
+  if clamped != 0 { return run unsafe hooks.throwError(context, NativeErrorKind.Range, b"BigInt does not fit in 128 bits") }
+}
+// Lives on the BigInt side of the dependency edge, so integer consumers do not
+// import BigInt coercions. Objects still take the Number route, as in QuickJS.
+pub unsafe effect fn toInt64Ext<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, output: &mut i64, value: Value) -> ()
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  if value.isBigInt() { run unsafe toBigInt64(&mut hooks, context, &mut output, value) }
+  else { run unsafe integer.toInt64(&mut hooks, context, &mut output, value) }
+}

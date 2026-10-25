@@ -1,0 +1,284 @@
+//! Ordered hash records and weak ownership, quickjs.c:54108-54924.
+//! Deleted records remain linked only while an iterator holds a record lock.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.list { List }
+import silk.f64
+import silk.i32
+import silk.u16
+import silk.u32
+import silk.u64
+import silk.usize
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_value { Value }
+import js_core_types { ObjectData, ObjectPayload, ObjectPayloadFamily, WeakRefHeader, WeakRefKind }
+import js_gc { HeapHooks, Tracer }
+import js_gc as gc
+import js_runtime as runtime
+import js_class_data as classes
+import js_primitives { EqualityMode }
+import js_primitives as primitives
+import js_bigint { BigInt }
+import js_string_rope { RopeIterator }
+import js_coercion_host { CoercionHooks }
+import js_constructor_ops as constructors
+import js_proxy_core as core
+import js_exceptions { JsException }
+import runtime_memory { AllocationObserver }
+
+struct Record {
+  previous: ?*mut HeapHeader,
+  next: ?*mut HeapHeader,
+  hashNext: ?*mut HeapHeader,
+  references: u32,
+  empty: bool,
+  key: Value,
+  value: Value
+}
+struct State {
+  first: ?*mut HeapHeader,
+  last: ?*mut HeapHeader,
+  buckets: List<?*mut HeapHeader>,
+  bits: u32,
+  count: u32,
+  weak: bool,
+  weakHeader: WeakRefHeader
+}
+fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+pub unsafe fn nonnull(pointer: ?*mut HeapHeader) -> *mut HeapHeader {
+  return match Pointer.nonNullMut<HeapHeader>(pointer) { Option<*mut HeapHeader>.Some { value } => value _ => invariant() }
+}
+fn family(magic: u32) -> ObjectPayloadFamily {
+  if magic == 0 { return ObjectPayloadFamily.Map }
+  if magic == 1 { return ObjectPayloadFamily.Set }
+  if magic == 2 { return ObjectPayloadFamily.WeakMap }
+  if magic == 3 { return ObjectPayloadFamily.WeakSet }
+  return invariant()
+}
+pub fn normalize(key: Value) -> Value {
+  if key.isNumber() && key.numericValue() == 0.0 { return Value.Int { value: 0 } }
+  return key
+}
+pub unsafe fn state(value: Value, magic: u32) -> ?*mut HeapHeader {
+  if !value.isObject() { return Pointer.null<HeapHeader>() }
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(value))
+  if object.classId != classes.JS_CLASS_MAP + magic { return Pointer.null<HeapHeader>() }
+  return match &object.payload { ObjectPayload.Opaque { family: tag, reference } => { if tag == family(magic) { return reference } return Pointer.null<HeapHeader>() } _ => Pointer.null<HeapHeader>() }
+}
+pub unsafe effect fn requireState<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader, value: Value,
+  magic: u32) -> *mut HeapHeader ! JsException ? &mut Allocator {
+  return match Pointer.nonNullMut<HeapHeader>(unsafe state(value, magic)) {
+    Option<*mut HeapHeader>.Some { value: node } => node
+    _ => run unsafe core.error(&mut hooks, context, b"incompatible collection receiver")
+  }
+}
+pub unsafe fn count(node: *mut HeapHeader) -> u32 { let a = () let s = unsafe HeapCell.payload<State, ()>(&a, node) return s.count }
+pub unsafe fn first(node: *mut HeapHeader) -> ?*mut HeapHeader { let a = () let s = unsafe HeapCell.payload<State, ()>(&a, node) return s.first }
+pub unsafe fn following(node: *mut HeapHeader) -> ?*mut HeapHeader { let a = () let r = unsafe HeapCell.payload<Record, ()>(&a, node) return r.next }
+pub unsafe fn key(node: *mut HeapHeader) -> Value { let a = () let r = unsafe HeapCell.payload<Record, ()>(&a, node) return r.key }
+pub unsafe fn value(node: *mut HeapHeader) -> Value { let a = () let r = unsafe HeapCell.payload<Record, ()>(&a, node) return r.value }
+pub unsafe fn empty(node: *mut HeapHeader) -> bool { let a = () let r = unsafe HeapCell.payload<Record, ()>(&a, node) return r.empty }
+pub unsafe fn lock(node: *mut HeapHeader) -> () { let mut a = () let r = unsafe HeapCell.payloadMut<Record, ()>(&mut a, node) r.references = r.references + 1 }
+pub unsafe fn unlock(state: *mut HeapHeader, node: *mut HeapHeader) -> () {
+  let mut a = () let r = unsafe HeapCell.payloadMut<Record, ()>(&mut a, node)
+  r.references = r.references - 1
+  if r.references != 0 { return }
+  let previous = r.previous let next = r.next drop r
+  let s = unsafe HeapCell.payloadMut<State, ()>(&mut a, state)
+  if Pointer.isNull<HeapHeader>(previous) { s.first = next }
+  if Pointer.isNull<HeapHeader>(next) { s.last = previous }
+  drop s
+  if !Pointer.isNull<HeapHeader>(previous) { let p = unsafe HeapCell.payloadMut<Record, ()>(&mut a, unsafe nonnull(previous)) p.next = next }
+  if !Pointer.isNull<HeapHeader>(next) { let p = unsafe HeapCell.payloadMut<Record, ()>(&mut a, unsafe nonnull(next)) p.previous = previous }
+  unsafe HeapCell.destroy<Record>(node)
+}
+fn hash32(value: u32, bits: u32) -> u32 { return u32.shiftRight(u32.wrappingMultiply(value, 0x61c88647), 32 - bits) }
+fn hash64(value: u64, bits: u32) -> u32 { return u64.toU32(u64.shiftRight(u64.wrappingMultiply(value, 0x61c8864680b583eb), u32.toU64(64 - bits))) }
+unsafe fn hash(key: Value, bits: u32) -> u32 {
+  if key.isNumber() {
+    let mut number = key.numericValue()
+    if f64.isNaN(number) { number = f64.fromBits(0x7ff8000000000000) }
+    return hash64(f64.toBits(number) ^ 8, bits)
+  }
+  if key.isString() {
+    let mut iterator = RopeIterator.make(&key) let mut h: u32 = 0
+    while true { match iterator.next() { Option<u16>.Some { value: unit } => { h = u32.wrappingAdd(u32.wrappingMultiply(h, 263), u16.toU32(unit)) } _ => { break } } }
+    return hash32(h ^ 0xfffffff9, bits)
+  }
+  match key {
+    Value.Bool { value: boolean } => { if boolean { return hash32(0, bits) } return hash32(1, bits) }
+    Value.Object { reference } => { return hash64(usize.toU64(Pointer.address<HeapHeader>(reference)) ^ 0xffffffffffffffff, bits) }
+    Value.Symbol { reference } => { return hash64(usize.toU64(Pointer.address<HeapHeader>(reference)) ^ 0xfffffffffffffff8, bits) }
+    Value.ShortBigInt { value: integer } => { return hash32(u32.wrappingAdd(263, i32.toU32(integer)) ^ 0xfffffff7, bits) }
+    Value.BigInt { reference } => {
+      let a = () let integer = unsafe HeapCell.payload<BigInt, ()>(&a, reference)
+      let mut i = integer.length() let mut h: u32 = 1
+      while i != 0 { i = i - 1 h = u32.wrappingAdd(u32.wrappingMultiply(h, 263), integer.limbs()[i]) }
+      return hash32(h ^ 0xfffffff7, bits)
+    }
+    _ => { return 0 }
+  }
+}
+unsafe fn find(node: *mut HeapHeader, input: Value) -> ?*mut HeapHeader {
+  let key = normalize(input) let a = () let s = unsafe HeapCell.payload<State, ()>(&a, node)
+  let weak = s.weak let mut cursor = s.buckets.get(u32.toUsize(unsafe hash(key, s.bits))) drop s
+  while !Pointer.isNull<HeapHeader>(cursor) {
+    let r = unsafe HeapCell.payload<Record, ()>(&a, unsafe nonnull(cursor))
+    if !r.empty && (!weak || unsafe gc.isWeakLive(r.key)) && unsafe primitives.equal(r.key, key, EqualityMode.SameValueZero) { return cursor }
+    cursor = r.hashNext
+  }
+  return Pointer.null<HeapHeader>()
+}
+pub unsafe fn has(node: *mut HeapHeader, key: Value) -> bool { return !Pointer.isNull<HeapHeader>(unsafe find(node, key)) }
+pub unsafe fn get(node: *mut HeapHeader, key: Value) -> Value {
+  let found = unsafe find(node, key)
+  if Pointer.isNull<HeapHeader>(found) { return Value.Undefined }
+  let stored = unsafe value(unsafe nonnull(found))
+  return unsafe stored.retained()
+}
+effect fn buckets(bits: u32) -> List<?*mut HeapHeader> ! OutOfMemoryError ? &mut Allocator {
+  let mut result = List<?*mut HeapHeader>.make() let length = u32.toUsize(u32.shiftLeft(1, bits))
+  run result.reserveExact(length)
+  while result.length() < length { run result.append(Pointer.null<HeapHeader>()) }
+  return move result
+}
+unsafe effect fn resize(node: *mut HeapHeader) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut a = () let initial = unsafe HeapCell.payload<State, ()>(&a, node)
+  let oldBits = initial.bits let weak = initial.weak let mut cursor = initial.first drop initial
+  if oldBits == 31 { return }
+  let bits = oldBits + 1 let mut table = run buckets(bits)
+  while !Pointer.isNull<HeapHeader>(cursor) {
+    let r = unsafe HeapCell.payloadMut<Record, ()>(&mut a, unsafe nonnull(cursor))
+    if !r.empty && (!weak || unsafe gc.isWeakLive(r.key)) {
+      let index = u32.toUsize(unsafe hash(r.key, bits)) r.hashNext = table.get(index) table.set(index, cursor)
+    }
+    cursor = r.next
+  }
+  let s = unsafe HeapCell.payloadMut<State, ()>(&mut a, node) s.buckets = move table s.bits = bits
+}
+pub unsafe effect fn put<H: HeapHooks + CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  node: *mut HeapHeader, input: Value, value: Value) -> () ! JsException ? &mut Allocator {
+  let key = normalize(input) let mut a = () let initial = unsafe HeapCell.payload<State, ()>(&a, node) let weak = initial.weak drop initial
+  if weak && !unsafe gc.isWeakTarget(key) { return run unsafe core.error(&mut hooks, context, b"invalid value used as weak collection key") }
+  let found = unsafe find(node, key)
+  if !Pointer.isNull<HeapHeader>(found) {
+    let owned = unsafe value.retained() let r = unsafe HeapCell.payloadMut<Record, ()>(&mut a, unsafe nonnull(found))
+    let old = r.value r.value = owned drop r
+    unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), old) return
+  }
+  let allocated = run Effect.result(HeapCell.allocate(HeapKind.Auxiliary, Record { previous: Pointer.null<HeapHeader>(), next: Pointer.null<HeapHeader>(), hashNext: Pointer.null<HeapHeader>(), references: 1, empty: false, key: Value.Undefined, value: Value.Undefined }))
+  let record = match move allocated { Result<*mut HeapHeader, OutOfMemoryError>.Success { value: pointer } => pointer Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error) }
+  let mut ownedKey = key if weak { ownedKey = unsafe gc.retainWeak(key) } else { ownedKey = unsafe key.retained() }
+  let ownedValue = unsafe value.retained()
+  let s = unsafe HeapCell.payloadMut<State, ()>(&mut a, node) let index = u32.toUsize(unsafe hash(key, s.bits))
+  let previous = s.last let hashNext = s.buckets.get(index)
+  s.buckets.set(index, record) s.last = record
+  if Pointer.isNull<HeapHeader>(previous) { s.first = record }
+  s.count = s.count + 1 let grow = u32.toUsize(s.count) >= s.buckets.length() * 2 drop s
+  let r = unsafe HeapCell.payloadMut<Record, ()>(&mut a, record) r.previous = previous r.hashNext = hashNext r.key = ownedKey r.value = ownedValue drop r
+  if !Pointer.isNull<HeapHeader>(previous) { let r = unsafe HeapCell.payloadMut<Record, ()>(&mut a, unsafe nonnull(previous)) r.next = record }
+  if grow {
+    let resized = run Effect.result(unsafe resize(node))
+    match move resized {
+      Result<(), OutOfMemoryError>.Success { .. } => ()
+      Result<(), OutOfMemoryError>.Failure { error } => {
+        // map_hash_resize ignores js_realloc's failure but not the OOM it
+        // installed. The inserted record and normal return both survive.
+        let pending = run Effect.catch<JsException>(unsafe core.materialize(&mut hooks, context, move error), core.exceptionValue)
+      }
+    }
+  }
+}
+unsafe fn removeRecord<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, node: *mut HeapHeader, record: *mut HeapHeader) -> () {
+  let mut a = () let r = unsafe HeapCell.payloadMut<Record, ()>(&mut a, record)
+  if r.empty { return }
+  let key = r.key let value = r.value r.key = Value.Undefined r.value = Value.Undefined r.empty = true drop r
+  let s = unsafe HeapCell.payloadMut<State, ()>(&mut a, node) let weak = s.weak s.count = s.count - 1 drop s
+  unsafe unlock(node, record)
+  if weak { unsafe gc.releaseWeak(key) } else { unsafe gc.release(&mut hooks, rt, key) }
+  unsafe gc.release(&mut hooks, rt, value)
+}
+unsafe fn unhash(node: *mut HeapHeader, record: *mut HeapHeader) -> () {
+  let mut a = () let s = unsafe HeapCell.payloadMut<State, ()>(&mut a, node)
+  let index = u32.toUsize(unsafe hash(unsafe key(record), s.bits))
+  let mut cursor = s.buckets.get(index) let mut previous = Pointer.null<HeapHeader>() drop s
+  while !Pointer.isNull<HeapHeader>(cursor) {
+    let r = unsafe HeapCell.payload<Record, ()>(&a, unsafe nonnull(cursor)) let next = r.hashNext drop r
+    if Pointer.address<HeapHeader>(cursor) == Pointer.address<HeapHeader>(record) {
+      if Pointer.isNull<HeapHeader>(previous) { let s = unsafe HeapCell.payloadMut<State, ()>(&mut a, node) s.buckets.set(index, next) }
+      else { let p = unsafe HeapCell.payloadMut<Record, ()>(&mut a, unsafe nonnull(previous)) p.hashNext = next }
+      return
+    }
+    previous = cursor cursor = next
+  }
+}
+pub unsafe fn erase<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, node: *mut HeapHeader, key: Value) -> bool {
+  let found = unsafe find(node, key) if Pointer.isNull<HeapHeader>(found) { return false }
+  let record = unsafe nonnull(found) unsafe unhash(node, record) unsafe removeRecord(&mut hooks, rt, node, record) return true
+}
+pub unsafe fn clear<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, node: *mut HeapHeader) -> () {
+  let mut a = () let s = unsafe HeapCell.payloadMut<State, ()>(&mut a, node)
+  let mut i: usize = 0 while i < s.buckets.length() { s.buckets.set(i, Pointer.null<HeapHeader>()) i = i + 1 }
+  let mut cursor = s.first drop s
+  while !Pointer.isNull<HeapHeader>(cursor) { let record = unsafe nonnull(cursor) cursor = unsafe following(record) unsafe removeRecord(&mut hooks, rt, node, record) }
+}
+pub unsafe effect fn create<H: HeapHooks + CoercionHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, newTarget: Value, magic: u32) -> Value ! JsException ? &mut Allocator {
+  let object = run unsafe constructors.createFromConstructor(&mut hooks, memory, context, newTarget, classes.JS_CLASS_MAP + magic)
+  let initialized = run Effect.result(unsafe initialize(object, magic))
+  match move initialized {
+    Result<*mut HeapHeader, OutOfMemoryError>.Success { value: node } => {
+      let mut a = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut a, core.reference(object))
+      data.payload = ObjectPayload.Opaque { family: family(magic), reference: node } drop data
+      if magic >= 2 { let s = unsafe HeapCell.payloadMut<State, ()>(&mut a, node) let weak = Pointer.fromMutRef<WeakRefHeader>(&mut s.weakHeader) drop s unsafe gc.publishWeak(unsafe runtime.contextRuntime(context), weak) }
+      return object
+    }
+    Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => {
+      let pending = run Effect.catch<JsException>(unsafe core.materialize(&mut hooks, context, move error), core.exceptionValue)
+      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), object) fail JsException {}
+    }
+  }
+}
+unsafe effect fn initialize(object: Value, magic: u32) -> *mut HeapHeader ! OutOfMemoryError ? &mut Allocator {
+  let table = run buckets(1)
+  return run HeapCell.allocate(HeapKind.Auxiliary, State { first: Pointer.null<HeapHeader>(), last: Pointer.null<HeapHeader>(), buckets: move table, bits: 1, count: 0, weak: magic >= 2,
+    weakHeader: WeakRefHeader { previous: Pointer.null<WeakRefHeader>(), next: Pointer.null<WeakRefHeader>(), kind: WeakRefKind.Map, owner: core.reference(object) } })
+}
+unsafe fn objectState(object: *mut HeapHeader) -> ?*mut HeapHeader {
+  let a = () let data = unsafe HeapCell.payload<ObjectData, ()>(&a, object)
+  return match &data.payload { ObjectPayload.Opaque { reference, .. } => reference _ => Pointer.null<HeapHeader>() }
+}
+pub unsafe fn mark(object: *mut HeapHeader, tracer: &mut Tracer) -> () {
+  let optional = unsafe objectState(object) if Pointer.isNull<HeapHeader>(optional) { return }
+  let a = () let s = unsafe HeapCell.payload<State, ()>(&a, unsafe nonnull(optional)) let weak = s.weak let mut cursor = s.first drop s
+  while !Pointer.isNull<HeapHeader>(cursor) {
+    let r = unsafe HeapCell.payload<Record, ()>(&a, unsafe nonnull(cursor))
+    if !weak { unsafe tracer.value(r.key) } unsafe tracer.value(r.value) cursor = r.next
+  }
+}
+pub unsafe fn finalize<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, object: *mut HeapHeader) -> () {
+  let optional = unsafe objectState(object) if Pointer.isNull<HeapHeader>(optional) { return }
+  let node = unsafe nonnull(optional) let mut a = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut a, object) data.payload = ObjectPayload.Empty drop data
+  let s = unsafe HeapCell.payloadMut<State, ()>(&mut a, node) let weak = s.weak let mut cursor = s.first let weakNode = Pointer.fromMutRef<WeakRefHeader>(&mut s.weakHeader) drop s
+  if weak { unsafe gc.unlinkWeak(rt, weakNode) }
+  while !Pointer.isNull<HeapHeader>(cursor) {
+    let record = unsafe nonnull(cursor) cursor = unsafe following(record)
+    let key = unsafe key(record) let value = unsafe value(record)
+    unsafe HeapCell.destroy<Record>(record)
+    if weak { unsafe gc.releaseWeak(key) } else { unsafe gc.release(&mut hooks, rt, key) }
+    unsafe gc.release(&mut hooks, rt, value)
+  }
+  unsafe HeapCell.destroy<State>(node)
+}
+pub unsafe fn sweepWeak<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, weakNode: *mut WeakRefHeader) -> () {
+  let a = () let weak = unsafe Pointer.borrow<(), WeakRefHeader>(&a, weakNode) let object = weak.owner drop weak
+  let optional = unsafe objectState(object) if Pointer.isNull<HeapHeader>(optional) { return }
+  let node = unsafe nonnull(optional) let mut cursor = unsafe first(node)
+  while !Pointer.isNull<HeapHeader>(cursor) {
+    let record = unsafe nonnull(cursor) cursor = unsafe following(record)
+    if !unsafe gc.isWeakLive(unsafe key(record)) { unsafe unhash(node, record) unsafe removeRecord(&mut hooks, rt, node, record) }
+  }
+}

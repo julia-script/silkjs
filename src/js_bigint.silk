@@ -1,0 +1,542 @@
+// Native QuickJS BigInt data operations; 32-bit two's-complement limbs.
+// Copyright of the upstream algorithms: Fabrice Bellard and Charlie Gordon;
+// see LICENSE.quickjs. No JS coercion or shared-reference ownership lives here.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.list { List }
+import silk.ownership { Copy }
+import silk.f64
+import silk.i32
+import silk.i64
+import silk.u32
+import silk.u64
+import silk.usize
+import dtoa_big { low32, clz32, clz64 }
+import js_bigint_mp as mp
+
+// Compatibility profile: JS_LIMB_BITS=JS_SHORT_BIG_INT_BITS=32. Initial
+// allocations are capped at 32768 limbs. Upstream js_bigint_extend can append
+// one more sign limb without that check; stored results therefore allow 32769.
+pub const BIGINT_MAX_LIMBS: usize = 32768
+pub const BIGINT_MAX_STORED_LIMBS: usize = 32769
+pub union BigIntError {
+  TooLarge,
+  // Direct exponent overflow differs from an arithmetic allocation-size failure.
+  PowerTooLarge,
+  DivisionByZero,
+  NegativeExponent,
+  Fractional,
+  NonFinite,
+  InvalidRadix,
+  InvalidSyntax { pub consumed: usize },
+  InvalidLimbs,
+  DoesNotFit128
+}
+impl Copy for BigIntError {}
+
+pub union Bitwise { And, Or, Xor }
+impl Copy for Bitwise {}
+pub struct Int128 { pub low: u64, pub high: u64 }
+impl Copy for Int128 {}
+pub struct Saturated128 { pub value: Int128, pub clamped: bool }
+struct Head { mantissa: u64, exponent: i32 }
+
+/// Owned normalized signed limbs, least significant first. Zero is one zero limb.
+/// The immutable view is suitable for serialization and short-BigInt compaction.
+pub struct BigInt { words: List<u32> }
+
+/// Borrowed normalized signed limbs. The owner must outlive the view; no input
+/// storage is allocated or retained. Use a stack one-limb slice for short values.
+pub struct BigIntView<'a> { words: &'a [u32] }
+
+pub effect fn checkSize(length: usize) -> () ! BigIntError {
+  if length > BIGINT_MAX_LIMBS { fail BigIntError.TooLarge }
+}
+effect fn checkStoredSize(length: usize) -> () ! BigIntError {
+  if length > BIGINT_MAX_STORED_LIMBS { fail BigIntError.TooLarge }
+}
+
+
+impl BigInt {
+  pub fn view<'a>(self: &'a Self) -> BigIntView<'a> { return BigIntView { words: self.words.asSlice() } }
+  pub fn limbs(self: &Self) -> &[u32] { return self.words.asSlice() }
+  pub fn length(self: &Self) -> usize { return self.words.length() }
+  pub fn negative(self: &Self) -> bool { return (self.words.get(self.words.length() - 1) & 0x80000000) != 0 }
+  pub fn isZero(self: &Self) -> bool { return self.words.length() == 1 && self.words.get(0) == 0 }
+  fn extension(self: &Self) -> u32 { if self.negative() { return 0xffffffff } return 0 }
+  pub fn limb(self: &Self, index: usize) -> u32 {
+    if index < self.words.length() { return self.words.get(index) }
+    return self.extension()
+  }
+  fn normalize(self: &mut Self) -> () {
+    let mut n = self.words.length()
+    while n > 1 {
+      let v = self.words.get(n - 1)
+      if (v != 0 && v != 0xffffffff) || (v & 1) != u32.shiftRight(self.words.get(n - 2), 31) { break }
+      n = n - 1
+    }
+    self.words.truncate(n)
+  }
+  effect fn extend(self: &mut Self, high: u32) -> () ! BigIntError | OutOfMemoryError ? &mut Allocator {
+    let n = self.words.length()
+    if (high != 0 && high != 0xffffffff) || (high & 1) != u32.shiftRight(self.words.get(n - 1), 31) {
+      run checkStoredSize(n + 1)
+      run self.words.append(high)
+    } else { self.normalize() }
+  }
+  /// Takes ownership and normalizes. Accepts the source's one-limb extension
+  /// exception for serialization; arithmetic still checks its initial allocations.
+  pub effect fn fromOwnedLimbs(words: List<u32>) -> BigInt ! BigIntError {
+    if words.length() == 0 { fail BigIntError.InvalidLimbs }
+    run checkStoredSize(words.length())
+    let mut result = BigInt { words: move words }
+    result.normalize()
+    return move result
+  }
+  pub effect fn fromLimbs(words: &[u32]) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
+    if words.length == 0 { fail BigIntError.InvalidLimbs }
+    run checkStoredSize(words.length)
+    let mut result = run mp.zeroes(words.length)
+    let mut i: usize = 0
+    while i < words.length { result.set(i, words[i]) i = i + 1 }
+    return run BigInt.fromOwnedLimbs(move result)
+  }
+  pub effect fn copy(self: &Self) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
+    return run BigInt.fromLimbs(self.limbs())
+  }
+  pub effect fn fromI32(value: i32) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
+    let mut bits: u32 = 0
+    if value < 0 { bits = i32.toU32(-(value + 1)) ^ 0xffffffff } else { bits = i32.toU32(value) }
+    return run BigInt.fromLimbs(&[bits])
+  }
+  pub effect fn fromU32(value: u32) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
+    return run BigInt.fromLimbs(&[value, 0])
+  }
+  pub effect fn fromI64(value: i64) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
+    let mut bits: u64 = 0
+    if value < 0 { bits = i64.toU64(-(value + 1)) ^ 0xffffffffffffffff } else { bits = i64.toU64(value) }
+    return run BigInt.fromLimbs(&[low32(bits), u64.toU32(u64.shiftRight(bits, 32))])
+  }
+  pub effect fn fromU64(value: u64) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
+    return run BigInt.fromLimbs(&[low32(value), u64.toU32(u64.shiftRight(value, 32)), 0])
+  }
+  pub effect fn fromI128(low: u64, high: u64) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
+    return run BigInt.fromLimbs(&[low32(low), u64.toU32(u64.shiftRight(low, 32)), low32(high), u64.toU32(u64.shiftRight(high, 32))])
+  }
+  pub effect fn fromU128(low: u64, high: u64) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
+    return run BigInt.fromLimbs(&[low32(low), u64.toU32(u64.shiftRight(low, 32)), low32(high), u64.toU32(u64.shiftRight(high, 32)), 0])
+  }
+  pub fn lowU64(self: &Self) -> u64 { return u32.toU64(self.limb(0)) | u64.shiftLeft(u32.toU64(self.limb(1)), 32) }
+  pub fn lowI64(self: &Self) -> i64 {
+    let bits = self.lowU64()
+    if (bits & 0x8000000000000000) != 0 { return -1 - u64.toI64(bits ^ 0xffffffffffffffff) }
+    return u64.toI64(bits)
+  }
+  pub fn low128(self: &Self) -> Int128 {
+    return Int128 { low: self.lowU64(), high: u32.toU64(self.limb(2)) | u64.shiftLeft(u32.toU64(self.limb(3)), 32) }
+  }
+  pub fn saturatingI128(self: &Self) -> Saturated128 {
+    if self.length() <= 4 { return Saturated128 { value: self.low128(), clamped: false } }
+    if self.negative() { return Saturated128 { value: Int128 { low: 0, high: 0x8000000000000000 }, clamped: true } }
+    return Saturated128 { value: Int128 { low: 0xffffffffffffffff, high: 0x7fffffffffffffff }, clamped: true }
+  }
+  pub effect fn toI128(self: &Self) -> Int128 ! BigIntError {
+    if self.length() > 4 { fail BigIntError.DoesNotFit128 }
+    return self.low128()
+  }
+  pub fn compare(self: &Self, other: &BigInt) -> i32 {
+    return self.view().compare(&other.view())
+  }
+  pub effect fn negate(self: &Self) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
+    run checkSize(self.length())
+    let mut result = run self.copy()
+    mp.negate(result.words.asMutSlice())
+    let mut high: u32 = 0
+    if !self.negative() && !self.isZero() { high = 0xffffffff }
+    run result.extend(high)
+    return move result
+  }
+  pub effect fn increment(self: &Self) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
+    return run self.addUnit(false)
+  }
+  pub effect fn decrement(self: &Self) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
+    return run self.addUnit(true)
+  }
+  effect fn addUnit(self: &Self, subtract: bool) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
+    run checkSize(self.length())
+    let mut result = run self.copy()
+    let mut carry: u64 = 1
+    let mut i: usize = 0
+    while i < result.length() && carry != 0 {
+      let v = result.words.get(i)
+      if subtract {
+        result.words.set(i, u32.wrappingSubtract(v, 1))
+        carry = 0
+        if v == 0 { carry = 1 }
+      } else {
+        let sum = u32.toU64(v) + carry
+        result.words.set(i, low32(sum))
+        carry = u64.shiftRight(sum, 32)
+      }
+      i = i + 1
+    }
+    let mut high = self.extension()
+    if subtract { high = u32.wrappingSubtract(high, u64.toU32(carry)) } else { high = u32.wrappingAdd(high, u64.toU32(carry)) }
+    run result.extend(high)
+    return move result
+  }
+  /// Scratch magnitude, not signed limbs. Ownership remains with the caller.
+  pub effect fn magnitude(self: &Self) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
+    return run self.view().magnitude()
+  }
+  pub effect fn fromMagnitude(words: List<u32>, negative: bool) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
+    if words.length() == 0 { fail BigIntError.InvalidLimbs }
+    let mut result = BigInt { words: move words }
+    mp.trim(&mut result.words)
+    run checkStoredSize(result.length())
+    let n = result.length()
+    if (result.words.get(n - 1) & 0x80000000) != 0 { run result.words.append(0) }
+    if negative { mp.negate(result.words.asMutSlice()) }
+    result.normalize()
+    run checkStoredSize(result.length())
+    return move result
+  }
+  pub effect fn bitNot(self: &Self) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
+    run checkSize(self.length())
+    let mut result = run self.copy()
+    let mut i: usize = 0
+    while i < result.length() { result.words.set(i, self.limb(i) ^ 0xffffffff) i = i + 1 }
+    return move result
+  }
+  pub effect fn truncateBits(self: &Self, bits: u64, signed: bool) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
+    if bits == 0 { return run BigInt.fromI32(0) }
+    if bits >= usize.toU64(self.length()) * 32 && (signed || !self.negative()) { return run self.copy() }
+    if bits > usize.toU64(BIGINT_MAX_LIMBS) * 32 { fail BigIntError.TooLarge }
+    let n = u64.toUsize((bits + 31) / 32)
+    run checkSize(n)
+    let mut result = BigInt { words: run mp.zeroes(n) }
+    let mut i: usize = 0
+    while i < n { result.words.set(i, self.limb(i)) i = i + 1 }
+    let width = u64.toU32((bits - 1) % 32 + 1)
+    let mut mask: u32 = 0xffffffff
+    if width < 32 { mask = u32.shiftLeft(1, width) - 1 }
+    let mut high = result.words.get(n - 1) & mask
+    if signed && (high & u32.shiftLeft(1, width - 1)) != 0 { high = high | (mask ^ 0xffffffff) }
+    result.words.set(n - 1, high)
+    if !signed { run result.extend(0) } else { result.normalize() }
+    return move result
+  }
+  pub fn toFloat64(self: &Self) -> f64 { return self.view().toFloat64() }
+  pub effect fn fromFloat64(value: f64) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
+    let bits = f64.toBits(value)
+    let biased = u64.toI32(u64.shiftRight(bits, 52) & 2047)
+    let mut mantissa = bits & 0xfffffffffffff
+    if biased == 2047 { fail BigIntError.NonFinite }
+    if biased == 0 && mantissa == 0 { return run BigInt.fromI32(0) }
+    let mut e = biased - 1023
+    if e < 0 { fail BigIntError.Fractional }
+    mantissa = mantissa | 0x10000000000000
+    if e < 52 {
+      let shift = i32.toU64(52 - e)
+      if (mantissa & (u64.shiftLeft(1, shift) - 1)) != 0 { fail BigIntError.Fractional }
+      mantissa = u64.shiftRight(mantissa, shift)
+      e = 0
+    } else { e = e - 52 }
+    let mut signed = u64.toI64(mantissa)
+    if (bits & 0x8000000000000000) != 0 { signed = -signed }
+    let base = run BigInt.fromI64(signed)
+    return run base.view().shiftLeft(i32.toU64(e))
+  }
+  pub fn compareFloat64(self: &Self, value: f64) -> i32 {
+    return self.view().compareFloat64(value)
+  }
+}
+
+impl<'a> BigIntView<'a> {
+  /// Borrows canonical signed storage, rejecting invalid representation without
+  /// copying or normalizing it. A one-word slice is always normalized.
+  pub effect fn fromLimbs(words: &'a [u32]) -> Self ! BigIntError {
+    if words.length == 0 { fail BigIntError.InvalidLimbs }
+    run checkStoredSize(words.length)
+    if words.length > 1 {
+      let high = words[words.length - 1]
+      if (high == 0 || high == 0xffffffff) &&
+          (high & 1) == u32.shiftRight(words[words.length - 2], 31) {
+        fail BigIntError.InvalidLimbs
+      }
+    }
+    return Self { words: words }
+  }
+  pub fn limbs(self: &Self) -> &[u32] { return self.words }
+  pub fn length(self: &Self) -> usize { return self.words.length }
+  pub fn negative(self: &Self) -> bool { return (self.words[self.words.length - 1] & 0x80000000) != 0 }
+  pub fn isZero(self: &Self) -> bool { return self.words.length == 1 && self.words[0] == 0 }
+  fn extension(self: &Self) -> u32 { if self.negative() { return 0xffffffff } return 0 }
+  pub fn limb(self: &Self, index: usize) -> u32 {
+    if index < self.words.length { return self.words[index] }
+    return self.extension()
+  }
+  /// Allocates an owned result only when the operation requires an unchanged value.
+  pub effect fn copy(self: &Self) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
+    return run BigInt.fromLimbs(self.words)
+  }
+  pub fn compare<'b>(self: &Self, other: &BigIntView<'b>) -> i32 {
+    if self.negative() != other.negative() { if self.negative() { return -1 } return 1 }
+    if self.length() != other.length() {
+      if (self.length() < other.length()) != self.negative() { return -1 }
+      return 1
+    }
+    let mut i = self.length()
+    while i > 0 {
+      i = i - 1
+      if self.limb(i) < other.limb(i) { return -1 }
+      if self.limb(i) > other.limb(i) { return 1 }
+    }
+    return 0
+  }
+  effect fn addSigned<'b>(self: &Self, other: &BigIntView<'b>, subtract: bool) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
+    let mut n = self.length()
+    if other.length() > n { n = other.length() }
+    run checkSize(n)
+    let mut result = BigInt { words: run mp.zeroes(n) }
+    let mut carry: u64 = 0
+    let mut mask: u32 = 0
+    if subtract { carry = 1 mask = 0xffffffff }
+    let mut i: usize = 0
+    while i < n {
+      let v = u32.toU64(self.limb(i)) + u32.toU64(other.limb(i) ^ mask) + carry
+      result.words.set(i, low32(v))
+      carry = u64.shiftRight(v, 32)
+      i = i + 1
+    }
+    let high = low32(u32.toU64(self.extension()) + u32.toU64(other.extension() ^ mask) + carry)
+    run result.extend(high)
+    return move result
+  }
+  pub effect fn add<'b>(self: &Self, other: &BigIntView<'b>) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator { return run self.addSigned(other, false) }
+  pub effect fn subtract<'b>(self: &Self, other: &BigIntView<'b>) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator { return run self.addSigned(other, true) }
+  pub effect fn multiply<'b>(self: &Self, other: &BigIntView<'b>) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
+    let n = self.length() + other.length()
+    run checkSize(n)
+    let mut result = BigInt { words: run mp.zeroes(n) }
+    mp.multiply(result.words.asMutSlice(), self.limbs(), other.limbs())
+    if self.negative() { mp.subtractAt(result.words.asMutSlice(), self.length(), other.limbs()) }
+    if other.negative() { mp.subtractAt(result.words.asMutSlice(), other.length(), self.limbs()) }
+    result.normalize()
+    return move result
+  }
+  /// Scratch magnitude, not signed limbs. Ownership remains with the caller.
+  pub effect fn magnitude(self: &Self) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
+    let mut result = run mp.zeroes(self.length())
+    let mut i: usize = 0
+    while i < self.length() { result.set(i, self.words[i]) i = i + 1 }
+    if self.negative() { mp.negate(result.asMutSlice()) }
+    mp.trim(&mut result)
+    return move result
+  }
+  pub effect fn divide<'b>(self: &Self, divisor: &BigIntView<'b>) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator { return run self.divrem(divisor, false) }
+  pub effect fn remainder<'b>(self: &Self, divisor: &BigIntView<'b>) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator { return run self.divrem(divisor, true) }
+  effect fn divrem<'b>(self: &Self, divisor: &BigIntView<'b>, remainder: bool) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
+    if divisor.isZero() { fail BigIntError.DivisionByZero }
+    // Upstream reserves two extra numerator limbs before the small-value shortcut.
+    run checkSize(self.length() + 2)
+    let mut a = run self.magnitude()
+    run a.reserve(2)
+    let mut b = run divisor.magnitude()
+    if a.length() < b.length() {
+      if remainder { return run self.copy() }
+      return run BigInt.fromI32(0)
+    }
+    let shift = i32.toU32(clz32(b.get(b.length() - 1)))
+    if shift != 0 {
+      let ignored = mp.shiftLeft(b.asMutSlice(), shift)
+      let high = mp.shiftLeft(a.asMutSlice(), shift)
+      if high != 0 { run a.append(high) }
+    }
+    let qn = a.length() - b.length() + 1
+    run checkSize(qn + 1)
+    let mut q = run mp.zeroes(qn)
+    mp.divideNormalized(q.asMutSlice(), a.asMutSlice(), b.asSlice())
+    if remainder {
+      a.truncate(b.length())
+      if shift != 0 { mp.shiftRight(a.asMutSlice(), shift, 0) }
+      return run BigInt.fromMagnitude(move a, self.negative())
+    }
+    return run BigInt.fromMagnitude(move q, self.negative() != divisor.negative())
+  }
+  pub effect fn bitwise<'b>(self: &Self, other: &BigIntView<'b>, operation: Bitwise) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
+    let mut n = self.length()
+    if other.length() > n { n = other.length() }
+    run checkSize(n)
+    let mut result = BigInt { words: run mp.zeroes(n) }
+    let mut i: usize = 0
+    while i < n {
+      let a = self.limb(i)
+      let b = other.limb(i)
+      let v = match operation { Bitwise.And => a & b Bitwise.Or => a | b Bitwise.Xor => a ^ b }
+      result.words.set(i, v)
+      i = i + 1
+    }
+    result.normalize()
+    return move result
+  }
+  pub effect fn shiftLeft(self: &Self, count: u64) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
+    if self.isZero() { return run BigInt.fromI32(0) }
+    if count / 32 > usize.toU64(BIGINT_MAX_LIMBS) { fail BigIntError.TooLarge }
+    let offset = u64.toUsize(count / 32)
+    let shift = u64.toU32(count % 32)
+    run checkSize(self.length() + offset)
+    let mut result = BigInt { words: run mp.zeroes(self.length() + offset) }
+    let mut carry: u32 = 0
+    let mut i: usize = 0
+    while i < self.length() {
+      let v = self.limb(i)
+      if shift == 0 { result.words.set(offset + i, v) } else {
+        result.words.set(offset + i, u32.shiftLeft(v, shift) | carry)
+        carry = u32.shiftRight(v, 32 - shift)
+      }
+      i = i + 1
+    }
+    if shift != 0 { run result.extend(carry | u32.shiftLeft(self.extension(), shift)) }
+    return move result
+  }
+  pub effect fn shiftRight(self: &Self, count: u64) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
+    if count / 32 >= usize.toU64(self.length()) {
+      if self.negative() { return run BigInt.fromI32(-1) }
+      return run BigInt.fromI32(0)
+    }
+    let offset = u64.toUsize(count / 32)
+    let shift = u64.toU32(count % 32)
+    let n = self.length() - offset
+    run checkSize(n)
+    let mut result = BigInt { words: run mp.zeroes(n) }
+    let mut i: usize = 0
+    while i < n {
+      let mut v = self.limb(i + offset)
+      if shift != 0 { v = u32.shiftRight(v, shift) | u32.shiftLeft(self.limb(i + offset + 1), 32 - shift) }
+      result.words.set(i, v)
+      i = i + 1
+    }
+    result.normalize()
+    return move result
+  }
+  /// Arbitrary signed BigInt count; negative counts reverse direction. Huge right
+  /// shifts saturate, huge left shifts fail except for zero, as in QuickJS.
+  pub effect fn shift<'b>(self: &Self, count: &BigIntView<'b>, left: bool) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
+    let mut amount: u64 = 2147483647
+    if count.length() == 1 {
+      let bits = count.limb(0)
+      if count.negative() { amount = u32.toU64(u32.wrappingSubtract(0, bits)) } else { amount = u32.toU64(bits) }
+      if amount > 2147483647 { amount = 2147483647 }
+    }
+    if left != count.negative() { return run self.shiftLeft(amount) }
+    return run self.shiftRight(amount)
+  }
+  pub effect fn power<'b>(self: &Self, exponent: &BigIntView<'b>) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
+    if exponent.negative() { fail BigIntError.NegativeExponent }
+    if exponent.isZero() { return run BigInt.fromI32(1) }
+    if self.length() == 1 {
+      let mut v = self.limb(0)
+      if v <= 1 { return run self.copy() }
+      if v == 0xffffffff {
+        if (exponent.limb(0) & 1) != 0 { return run BigInt.fromI32(-1) }
+        return run BigInt.fromI32(1)
+      }
+      if self.negative() { v = u32.wrappingSubtract(0, v) }
+      if (v & (v - 1)) == 0 {
+        if exponent.length() > 1 { fail BigIntError.PowerTooLarge }
+        let bit = u32.toU64(exponent.limb(0)) * i32.toU64(31 - clz32(v))
+        if bit > usize.toU64(BIGINT_MAX_LIMBS) * 32 { fail BigIntError.PowerTooLarge }
+        let mut neg = false
+        if self.negative() && (exponent.limb(0) & 1) != 0 { neg = true }
+        let mut signBit: u64 = 1
+        if neg { signBit = 0 }
+        let n = u64.toUsize((bit + 32 + signBit) / 32)
+        run checkSize(n)
+        let mut result = BigInt { words: run mp.zeroes(n) }
+        let mut word: u32 = 1
+        if neg { word = 0xffffffff }
+        result.words.set(u64.toUsize(bit / 32), u32.shiftLeft(word, u64.toU32(bit % 32)))
+        return move result
+      }
+    }
+    if exponent.length() > 1 { fail BigIntError.PowerTooLarge }
+    let e = exponent.limb(0)
+    run checkSize(self.length())
+    let mut result = run self.copy()
+    let mut bit = 30 - clz32(e)
+    while bit >= 0 {
+      result = run result.view().multiply(&result.view())
+      if (u32.shiftRight(e, i32.toU32(bit)) & 1) != 0 { result = run result.view().multiply(self) }
+      bit = bit - 1
+    }
+    return move result
+  }
+  // The top 64 magnitude bits plus a sticky low bit, without copying limbs.
+  fn head(self: &Self) -> Head {
+    let mut high: u64 = 0
+    let mut low: u32 = 0
+    let mut sticky: u32 = 0
+    let mut carry: u64 = 0
+    let mask = self.extension()
+    if self.negative() { carry = 1 }
+    let mut i: usize = 0
+    while i < self.length() {
+      let v = u32.toU64(self.limb(i) ^ mask) + carry
+      carry = u64.shiftRight(v, 32)
+      sticky = sticky | low
+      low = low32(high)
+      high = u64.shiftRight(high, 32) | u64.shiftLeft(u32.toU64(low32(v)), 32)
+      i = i + 1
+    }
+    let mut lower = u64.shiftLeft(u32.toU64(low), 32)
+    if sticky != 0 { lower = lower | 1 }
+    let shift = i32.toU64(clz64(high))
+    if shift != 0 { high = u64.shiftLeft(high, shift) | u64.shiftRight(lower, 64 - shift) lower = u64.shiftLeft(lower, shift) }
+    if lower != 0 { high = high | 1 }
+    return Head { mantissa: high, exponent: usize.toI32(self.length()) * 32 - u64.toI32(shift) - 1 }
+  }
+  pub fn toFloat64(self: &Self) -> f64 {
+    if self.isZero() { return 0.0 }
+    let head = self.head()
+    let mut e = head.exponent
+    let mut mantissa: u64 = 0
+    if e > 1023 { e = 1024 } else {
+      let value = u64.shiftRight(head.mantissa, 1) | (head.mantissa & 1)
+      mantissa = u64.shiftRight(value + (u64.shiftRight(value, 10) & 1) + 511, 10)
+      if mantissa >= 0x20000000000000 { mantissa = u64.shiftRight(mantissa, 1) e = e + 1 }
+      mantissa = mantissa & 0xfffffffffffff
+    }
+    let mut bits = u64.shiftLeft(i32.toU64(e + 1023), 52) | mantissa
+    if self.negative() { bits = bits | 0x8000000000000000 }
+    return f64.fromBits(bits)
+  }
+  /// Pinned raw-Float64 comparison: -1/0/1, or 2 for NaN. JS Int-tagged
+  /// operands use integer comparison instead, including the ShortBigInt fast
+  /// path. The upstream Float64 unequal-exponent branch does not reverse
+  /// negative magnitudes; preserve that observable source behavior.
+  pub fn compareFloat64(self: &Self, value: f64) -> i32 {
+    let bits = f64.toBits(value)
+    let negative = (bits & 0x8000000000000000) != 0
+    let biased = u64.toI32(u64.shiftRight(bits, 52) & 2047)
+    let fraction = bits & 0xfffffffffffff
+    if biased == 2047 {
+      if fraction != 0 { return 2 }
+      if negative { return 1 } return -1
+    }
+    if biased == 0 && fraction == 0 {
+      if self.isZero() { return 0 }
+      if self.negative() { return -1 } return 1
+    }
+    if self.isZero() { if negative { return 1 } return -1 }
+    if self.negative() != negative { if self.negative() { return -1 } return 1 }
+    let head = self.head()
+    let exponent = biased - 1023
+    let mantissa = u64.shiftLeft(fraction | 0x10000000000000, 11)
+    let mut result: i32 = 0
+    if head.exponent < exponent { return -1 }
+    if head.exponent > exponent { return 1 }
+    if head.mantissa < mantissa { result = -1 } else if head.mantissa > mantissa { result = 1 }
+    if negative { return -result }
+    return result
+  }
+}

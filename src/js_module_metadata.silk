@@ -1,0 +1,139 @@
+//! Module creation and parser metadata from quickjs.c:30442-30627,32673-32682.
+//! No loader, linker, evaluation, binding validation or parser diagnostics live here.
+//! Context/module/table must belong to the same live runtime. Metadata mutations
+//! require exclusive payload access and a non-reentrant allocator, like compiler state.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.list { List }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.result { Result }
+import silk.usize
+import js_atoms { AtomTable }
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_value { Value }
+import js_core_types { RuntimeState, ContextState, ModuleDef, ModuleStatus, RequestedModule,
+  ExportEntry, ExportBinding, StarExportEntry, ImportEntry, NativeFunctionId }
+import js_compiler_types { reserveArray }
+import js_string_types { StringOwner, StringLengthError }
+import js_gc
+
+pub enum ExportKind { Local, Indirect }
+pub enum ModuleMetadataErrorKind { DuplicateExport }
+/// name independently owns its text, so a diagnostic survives module/context/runtime
+/// destruction. atom is the original identifier, not an additional atom ownership.
+pub struct ModuleMetadataError {
+  pub kind: ModuleMetadataErrorKind,
+  pub atom: u32,
+  pub name: Option<StringOwner>
+}
+impl ModuleMetadataError {
+  pub effect fn duplicateExport(table: &AtomTable, atom: u32) -> Self
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let mut name = Option<StringOwner>.none()
+    if atom != 0 { name = Option<StringOwner>.some(StringOwner.adopt(run table.toValue(atom, true))) }
+    return Self { kind: ModuleMetadataErrorKind.DuplicateExport, atom: atom, name: move name }
+  }
+}
+
+/// Consumes ownedName even on allocation failure. The returned address BORROWS the
+/// context's new loaded-list reference (RC=1); it is NOT an additional caller root.
+/// To keep it past context teardown, explicitly HeapCell.retain it. Compiler failure
+/// may release the list's reference once via js_gc.releaseHeader, which unlinks it;
+/// otherwise context teardown releases it. Never release that ownership twice.
+/// Like source js_mallocz this does not introduce an object-allocation GC safepoint.
+pub unsafe effect fn newModule(context: *mut HeapHeader, ownedName: u32) -> *mut HeapHeader
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = ()
+  let ctx = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  let runtime = ctx.runtime
+  let previous = ctx.loadedModules.last
+  drop ctx
+  let allocated = run Effect.result(HeapCell.allocate<ModuleDef>(HeapKind.Module, ModuleDef {
+    name: ownedName, previousModule: previous, nextModule: Pointer.null<HeapHeader>(),
+    requestedModules: List<RequestedModule>.make(), exports: List<ExportEntry>.make(),
+    starExports: List<StarExportEntry>.make(), imports: List<ImportEntry>.make(),
+    namespace: Value.Undefined, functionObject: Value.Undefined, initialize: Option<NativeFunctionId>.none(),
+    hasTopLevelAwait: false, resolved: false, functionCreated: false, status: ModuleStatus.Unlinked,
+    dfsIndex: 0, dfsAncestorIndex: 0, stackPrevious: Pointer.null<HeapHeader>(),
+    asyncParentModules: List<*mut HeapHeader>.make(), pendingAsyncDependencies: 0,
+    asyncEvaluation: false, asyncEvaluationTimestamp: 0, cycleRoot: Pointer.null<HeapHeader>(),
+    promise: Value.Undefined, resolvingFunctions: [Value.Undefined, Value.Undefined],
+    evaluationHasException: false, evaluationException: Value.Undefined,
+    metaObject: Value.Undefined, privateValue: Value.Undefined
+  }))
+  let module = match move allocated {
+    Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value
+    Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => {
+      let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+      rt.atoms.release(ownedName)
+      fail move error
+    }
+  }
+  unsafe js_gc.publish(runtime, module)
+  match Pointer.nonNullMut<HeapHeader>(previous) {
+    Option<*mut HeapHeader>.Some { value } => {
+      let prior = unsafe HeapCell.payloadMut<ModuleDef, ()>(&mut anchor, value)
+      prior.nextModule = module
+    }
+    Option<*mut HeapHeader>.None => ()
+  }
+  let updated = unsafe HeapCell.payloadMut<ContextState, ()>(&mut anchor, context)
+  if Pointer.isNull<HeapHeader>(previous) { updated.loadedModules.first = module }
+  updated.loadedModules.last = module
+  return module
+}
+
+/// borrowedName is retained only after successful growth. Repeated requests remain
+/// distinct records, exactly as add_req_module_entry; resolution is a separate phase.
+pub effect fn addRequested(module: &mut ModuleDef, table: &mut AtomTable, borrowedName: u32) -> i32
+  ! OutOfMemoryError ? &mut Allocator {
+  run reserveArray(&mut module.requestedModules)
+  let index = usize.toI32(module.requestedModules.length())
+  run module.requestedModules.append(RequestedModule { name: table.duplicate(borrowedName),
+    module: Pointer.null<HeapHeader>(), attributes: Value.Undefined })
+  return index
+}
+pub fn findExport(module: &ModuleDef, exportName: u32) -> i32 {
+  let mut index: usize = 0
+  while index < module.exports.length() {
+    if module.exports.get(index).exportName == exportName { return usize.toI32(index) }
+    index = index + 1
+  }
+  return -1
+}
+/// Both names are borrowed. Duplicate detection precedes allocation/mutation; a
+/// duplicate error owns its display name independently of these borrowed atoms.
+pub effect fn addExport(module: &mut ModuleDef, table: &mut AtomTable,
+  localName: u32, exportName: u32, kind: ExportKind) -> i32
+  ! OutOfMemoryError | StringLengthError | ModuleMetadataError ? &mut Allocator {
+  if findExport(&module.*, exportName) >= 0 { fail run ModuleMetadataError.duplicateExport(&table.*, exportName) }
+  run reserveArray(&mut module.exports)
+  let index = usize.toI32(module.exports.length())
+  let binding = match kind {
+    ExportKind.Local => ExportBinding.Local { variableIndex: 0, varRef: Pointer.null<HeapHeader>() }
+    ExportKind.Indirect => ExportBinding.Indirect { requestedModuleIndex: 0 }
+  }
+  run module.exports.append(ExportEntry { binding: binding,
+    localName: table.duplicate(localName), exportName: table.duplicate(exportName) })
+  return index
+}
+/// requestedIndex is supplied by the parser; this helper neither resolves nor
+/// validates it. Returns source success code 0, not the appended slot's index.
+pub effect fn addStarExport(module: &mut ModuleDef, requestedIndex: i32) -> i32
+  ! OutOfMemoryError ? &mut Allocator {
+  run reserveArray(&mut module.starExports)
+  run module.starExports.append(StarExportEntry { requestedModuleIndex: requestedIndex })
+  return 0
+}
+/// Low-level metadata append after parser binding/closure validation. entry.importName
+/// is borrowed and retained only after growth. Other fields are copied verbatim;
+/// repeated imports are allowed here. Returns the original add_import success code.
+pub effect fn addImport(module: &mut ModuleDef, table: &mut AtomTable, entry: ImportEntry) -> i32
+  ! OutOfMemoryError ? &mut Allocator {
+  run reserveArray(&mut module.imports)
+  let mut stored = entry
+  stored.importName = table.duplicate(entry.importName)
+  run module.imports.append(stored)
+  return 0
+}

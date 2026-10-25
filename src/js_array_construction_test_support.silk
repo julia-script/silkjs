@@ -1,0 +1,123 @@
+//! Real fast-array ownership consumers shared by tests and the independent oracle.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.pointer { Pointer }
+import silk.usize
+import silk.u32
+import silk.i32
+import silk.u16
+import silk.f64
+import runtime_memory { RuntimeAllocator, AllocationObserver }
+import native_stack { currentFrameAddress }
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types { FrameSlots, ObjectData, ObjectPayload, NativeFunctionId, NativeErrorKind, WeakRefHeader }
+import js_gc { HeapHooks, Tracer }
+import js_gc as gc
+import js_runtime as runtime
+import js_coercion_host { CoercionHooks }
+import js_exceptions { JsException }
+import js_exceptions as exceptions
+import js_strings { Strings }
+import js_string_types { StringLengthError }
+import js_property_get_test_support as base
+import js_property_get_test_support { Hooks as BaseHooks }
+import js_coercions_test_support as closures
+import js_coercions_test_support { Closure }
+import js_array_storage_test_support as storage
+import js_array_storage_test_support { reference, trap }
+import js_errors_test_support { FaultAllocator }
+import js_array_construction as construction
+
+struct Hooks<'a> { base: BaseHooks<'a>, finalized: u32, withPending: u32 }
+impl<'a> HeapHooks for Hooks<'a> {
+  unsafe fn traceClass(self: &mut Self, rt: *mut HeapHeader, object: *mut HeapHeader, callback: NativeFunctionId, tracer: &mut Tracer) -> () { unsafe self.base.traceClass(rt, object, callback, &mut tracer) }
+  unsafe fn finalizeClass(self: &mut Self, rt: *mut HeapHeader, object: *mut HeapHeader, callback: NativeFunctionId) -> () {
+    if match callback { NativeFunctionId.Host { id } => id == closures.TABLE _ => false } {
+      self.finalized = self.finalized + 1
+      if unsafe exceptions.has(rt) { self.withPending = self.withPending + 1 }
+    }
+    unsafe self.base.finalizeClass(rt, object, callback)
+  }
+  unsafe effect fn sweepWeak(self: &mut Self, rt: *mut HeapHeader, node: *mut WeakRefHeader) -> () ? &mut Allocator { run unsafe self.base.sweepWeak(rt, node) }
+  unsafe fn destroyAuxiliary(self: &mut Self, rt: *mut HeapHeader, node: *mut HeapHeader) -> () { unsafe self.base.destroyAuxiliary(rt, node) }
+}
+impl<'a> CoercionHooks for Hooks<'a> {
+  unsafe effect fn throwError(self: &mut Self, ctx: *mut HeapHeader, kind: NativeErrorKind, message: &[u8]) -> never ! JsException ? &mut Allocator { return run unsafe self.base.throwError(ctx, kind, message) }
+  unsafe effect fn throwOutOfMemory(self: &mut Self, ctx: *mut HeapHeader) -> never ! JsException ? &mut Allocator { return run unsafe self.base.throwOutOfMemory(ctx) }
+  unsafe fn isCallable(self: &mut Self, ctx: *mut HeapHeader, value: Value) -> bool { return unsafe self.base.isCallable(ctx, value) }
+  unsafe effect fn getProperty(self: &mut Self, ctx: *mut HeapHeader, object: Value, atom: u32) -> Value ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe self.base.getProperty(ctx, object, atom) }
+  unsafe effect fn call(self: &mut Self, ctx: *mut HeapHeader, function: Value, receiver: Value, arguments: &[Value]) -> Value ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe self.base.call(ctx, function, receiver, arguments) }
+}
+fn flag(value: bool) -> u32 { if value { return 1 } return 0 }
+fn stringNode(value: Value) -> *mut HeapHeader { return match value { Value.String { reference } => reference _ => trap() } }
+
+pub effect fn isolated(count: usize, consume: bool, armed: bool, cutoff: usize) -> [u32; 13]
+  ! OutOfMemoryError | StringLengthError {
+  if count > 33 { trap() }
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider()) let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe storage.context(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks { base: BaseHooks.make(&observer), finalized: 0, withPending: 0 }
+  run unsafe base.prepare(&mut hooks.base, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut values: [Value; 35] = [Value.Undefined; 35]
+  values[0] = run Strings.fromLatin1(b"prefix") |> Effect.provideMut<Allocator>(&mut memory)
+  values[count + 1] = run Strings.fromLatin1(b"suffix") |> Effect.provideMut<Allocator>(&mut memory)
+  let mut index: usize = 0
+  while index < count {
+    if index % 3 == 0 {
+      if index == 0 { values[index + 1] = run unsafe base.closure(&mut hooks.base, ctx, 0, 0, Value.Undefined, 0, Value.Undefined) |> Effect.provideMut<Allocator>(&mut memory) }
+      else { values[index + 1] = unsafe values[1].retained() }
+    }
+    else if index % 3 == 1 { values[index + 1] = run Strings.fromLatin1(b"heap") |> Effect.provideMut<Allocator>(&mut memory) }
+    else { values[index + 1] = Value.Int { value: usize.toI32(index) } }
+    index = index + 1
+  }
+  run unsafe gc.collect(&mut hooks, rt, true) |> Effect.provideMut<Allocator>(&mut memory)
+  let slots = FrameSlots.Borrowed { data: Pointer.fromMutRef<Value>(&mut values[0]), length: count + 2 }
+  let mut fault = FaultAllocator { parent: move memory, remaining: cutoff, armed: armed, persistent: false, failures: 0 }
+  let mut outcome = Result<Value, JsException>.Success { value: Value.Undefined }
+  if consume { outcome = run Effect.result(unsafe construction.createFree(&mut hooks, &observer, ctx, &slots, 1, count)) |> Effect.provideMut<Allocator>(&mut fault) }
+  else { outcome = run Effect.result(unsafe construction.create(&mut hooks, &observer, ctx, &slots, 1, count)) |> Effect.provideMut<Allocator>(&mut fault) }
+  fault.armed = false
+  let mut record: [u32; 13] = [0; 13]
+  record[5] = hooks.finalized record[6] = flag(unsafe exceptions.has(rt)) record[9] = hooks.withPending
+  record[7] = i32.toU32(unsafe storage.rc(stringNode(values[0])))
+  record[8] = i32.toU32(unsafe storage.rc(stringNode(values[count + 1])))
+  record[10] = usize.toU32(fault.failures)
+  match move outcome {
+    Result<Value, JsException>.Success { value } => {
+      record[0] = 1 record[1] = usize.toU32(unsafe storage.count(value)) record[2] = unsafe storage.length(value)
+      let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(value))
+      match &object.payload {
+        ObjectPayload.FastArray { array } => {
+          index = 0
+          while index < count {
+            let item = array.values.get(index) let mut word: u32 = 0
+            if item.isObject() {
+              let data = unsafe HeapCell.payload<Closure, ()>(&anchor, unsafe closures.storage(item))
+              word = 3000 + data.event
+              if index == 0 { record[4] = i32.toU32(unsafe storage.rc(reference(item))) }
+            } else if item.isString() {
+              word = 2000 let mut unit: usize = 0
+              while unit < Strings.length(item) { word = (word * 31 + u16.toU32(Strings.codeUnit(item, unit))) & 65535 unit = unit + 1 }
+            } else { word = f64.toU32(item.numericValue()) }
+            record[3] = (record[3] * 31 + word) & 65535 index = index + 1
+          }
+        }
+        _ => trap()
+      }
+      drop object
+      unsafe gc.release(&mut hooks, rt, value)
+    }
+    Result<Value, JsException>.Failure { .. } => { let error = unsafe exceptions.take(rt) unsafe gc.release(&mut hooks, rt, error) }
+  }
+  if !consume { index = 0 while index < count { unsafe gc.release(&mut hooks, rt, values[index + 1]) index = index + 1 } }
+  unsafe gc.release(&mut hooks, rt, values[0]) unsafe gc.release(&mut hooks, rt, values[count + 1])
+  run unsafe gc.collect(&mut hooks, rt, true) |> Effect.provideMut<Allocator>(&mut fault)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx)
+  run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut fault)
+  record[11] = usize.toU32(observer.stats().allocationCount) record[12] = usize.toU32(observer.stats().usedBytes)
+  return record
+}

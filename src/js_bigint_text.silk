@@ -1,0 +1,256 @@
+// Native BigInt text conversion and QuickJS js_atof integer-token scanning.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.option { Option }
+import silk.slice { Slice }
+import silk.u8
+import silk.u32
+import silk.u64
+import silk.i32
+import silk.usize
+import byte_buffer { ByteBuffer }
+import dtoa_big { clz32, DIGITS_PER_LIMB, RADIX_BASE }
+import js_bigint { BigInt, BigIntError, BIGINT_MAX_LIMBS, checkSize }
+import js_bigint_mp as mp
+import unicode_case { UnicodeCase }
+import utf8 { Utf8, Decoded }
+
+// Bit values deliberately match js_atof. The result type is always BigInt.
+pub const INT_ONLY: u32 = 1
+pub const ACCEPT_BIN_OCT: u32 = 4
+pub const ACCEPT_LEGACY_OCTAL: u32 = 16
+pub const ACCEPT_UNDERSCORES: u32 = 32
+pub const ACCEPT_SUFFIX: u32 = 64
+pub const ACCEPT_PREFIX_AFTER_SIGN: u32 = 1024
+pub struct ParsedBigInt { pub value: BigInt, pub consumed: usize }
+pub struct BigIntText {}
+
+fn byte(input: &[u8], index: usize) -> u32 {
+  if index >= input.length { return 0 }
+  return u8.toU32(input[index])
+}
+fn digit(value: u32) -> u32 {
+  if value >= 48 && value <= 57 { return value - 48 }
+  if value >= 65 && value <= 90 { return value - 65 + 10 }
+  if value >= 97 && value <= 122 { return value - 97 + 10 }
+  return 36
+}
+fn digitByte(value: u32) -> u8 {
+  if value < 10 { return u32.toU8(value + 48) }
+  return u32.toU8(value + 87)
+}
+fn skipSpaces(input: &[u8], start: usize) -> usize {
+  let mut at = start
+  while at < input.length {
+    let next = Utf8.decode(Slice.view(input, at, input.length - at))
+    match move next {
+      Option<Decoded>.None => { return at }
+      Option<Decoded>.Some { value } => {
+        if !UnicodeCase.isSpace(value.codePoint) { return at }
+        at = at + value.length
+      }
+    }
+  }
+  return at
+}
+
+impl BigIntText {
+  /// Scans from byte zero, without whitespace skipping. radix=0 recognizes source
+  /// prefixes; otherwise 2..36. Success may stop before trailing input. Syntax
+  /// failures carry the exact consumed byte offset, including a consumed suffix.
+  pub effect fn parse(input: &[u8], radix: u32, flags: u32) -> ParsedBigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
+    if radix != 0 && (radix < 2 || radix > 36) { fail BigIntError.InvalidRadix }
+    let mut base = radix
+    let mut at: usize = 0
+    let mut negative = false
+    let mut signed = false
+    if byte(input, at) == 43 || byte(input, at) == 45 {
+      negative = byte(input, at) == 45
+      signed = true
+      at = at + 1
+    }
+    let mut separators = (flags & ACCEPT_UNDERSCORES) != 0
+    let mut legacy = false
+    let mut prefix = false
+    if (!signed || (flags & ACCEPT_PREFIX_AFTER_SIGN) != 0) && byte(input, at) == 48 {
+      let next = byte(input, at + 1)
+      if (next == 120 || next == 88) && (base == 0 || base == 16) {
+        base = 16 at = at + 2 prefix = true
+      } else if (next == 111 || next == 79) && base == 0 && (flags & ACCEPT_BIN_OCT) != 0 {
+        base = 8 at = at + 2 prefix = true
+      } else if (next == 98 || next == 66) && base == 0 && (flags & ACCEPT_BIN_OCT) != 0 {
+        base = 2 at = at + 2 prefix = true
+      } else if next >= 48 && next <= 57 && base == 0 && (flags & ACCEPT_LEGACY_OCTAL) != 0 {
+        legacy = true
+        separators = false
+        let mut p = at + 1
+        while byte(input, p) >= 48 && byte(input, p) <= 55 { p = p + 1 }
+        if byte(input, p) != 56 && byte(input, p) != 57 { at = at + 1 base = 8 prefix = true }
+      }
+      if prefix && digit(byte(input, at)) >= base { fail BigIntError.InvalidSyntax { consumed: at } }
+    }
+    if base == 0 { base = 10 }
+    let start = at
+    while digit(byte(input, at)) < base || (separators && byte(input, at) == 95
+      && (base != 10 || at != start + 1 || byte(input, at - 1) != 48)
+      && digit(byte(input, at + 1)) < base) { at = at + 1 }
+    let end = at
+    let mut fractional = false
+    if (flags & INT_ONLY) == 0 && base == 10 {
+      if byte(input, at) == 46 && (at > start || digit(byte(input, at + 1)) < 10) {
+        fractional = true
+        at = at + 1
+        if separators && byte(input, at) == 95 { fail BigIntError.InvalidSyntax { consumed: at } }
+        while digit(byte(input, at)) < 10 || (separators && byte(input, at) == 95 && digit(byte(input, at + 1)) < 10) { at = at + 1 }
+      }
+      if at > start && (byte(input, at) == 101 || byte(input, at) == 69) {
+        fractional = true
+        let mut p = at + 1
+        if byte(input, p) == 43 || byte(input, p) == 45 { p = p + 1 }
+        if digit(byte(input, p)) < 10 {
+          at = p + 1
+          while digit(byte(input, at)) < 10 || (separators && byte(input, at) == 95 && digit(byte(input, at + 1)) < 10) { at = at + 1 }
+        }
+      }
+    }
+    if at == start { fail BigIntError.InvalidSyntax { consumed: at } }
+    if (flags & ACCEPT_SUFFIX) != 0 && byte(input, at) == 110 { at = at + 1 }
+    if fractional || legacy { fail BigIntError.InvalidSyntax { consumed: at } }
+    let value = run parseDigits(input, start, end, base, negative)
+    return ParsedBigInt { value: move value, consumed: at }
+  }
+
+  /// ECMAScript StringToBigInt grammar: Unicode surrounding space, empty=0,
+  /// decimal signs, unsigned 0x/0o/0b, no separators, suffixes or trailing junk.
+  pub effect fn parseInteger(input: &[u8]) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
+    let start = skipSpaces(input, 0)
+    if start == input.length { return run BigInt.fromI32(0) }
+    let parsed = run BigIntText.parse(Slice.view(input, start, input.length - start), 0, INT_ONLY | ACCEPT_BIN_OCT)
+    let end = skipSpaces(input, start + parsed.consumed)
+    if end != input.length { fail BigIntError.InvalidSyntax { consumed: end } }
+    return match move parsed { ParsedBigInt { value, consumed: _ } => move value }
+  }
+
+  /// Lower-case ASCII without a terminator. Power-of-two formatting borrows
+  /// positive limbs directly; other bases divide a single owned scratch copy.
+  pub effect fn format(value: &BigInt, radix: u32) -> ByteBuffer ! BigIntError | OutOfMemoryError ? &mut Allocator {
+    if radix < 2 || radix > 36 { fail BigIntError.InvalidRadix }
+    if (radix & (radix - 1)) == 0 && !value.negative() { return run formatBinary(value.limbs(), false, radix) }
+    run checkSize(value.length())
+    let mut words = run value.magnitude()
+    if (radix & (radix - 1)) == 0 { return run formatBinary(words.asSlice(), value.negative(), radix) }
+    let mut output = ByteBuffer.make()
+    let top = words.get(words.length() - 1)
+    let bits = words.length() * 32 - i32.toUsize(clz32(top))
+    let bound = bits / i32.toUsize(31 - clz32(radix)) + 2
+    run output.reserve(bound)
+    let block = RADIX_BASE[u32.toUsize(radix - 2)]
+    let width = i32.toUsize(DIGITS_PER_LIMB[u32.toUsize(radix - 2)])
+    while true {
+      mp.trim(&mut words)
+      if words.length() == 1 && words.get(0) < block {
+        let mut v = words.get(0)
+        if v == 0 && output.length() == 0 { run output.append(48) }
+        while v != 0 { run output.append(digitByte(v % radix)) v = v / radix }
+        break
+      }
+      let mut v = mp.divideSmall(words.asMutSlice(), block)
+      let mut i: usize = 0
+      while i < width { run output.append(digitByte(v % radix)) v = v / radix i = i + 1 }
+    }
+    if value.negative() { run output.append(45) }
+    let mut i: usize = 0
+    let n = output.length()
+    while i < n / 2 {
+      let a = output.get(i)
+      let b = output.get(n - 1 - i)
+      output.set(i, b)
+      output.set(n - 1 - i, a)
+      i = i + 1
+    }
+    return move output
+  }
+}
+
+// Input is already lexically scanned. Leading zeroes/separators do not count
+// against source allocation bounds. The decimal estimate is exactly QuickJS's.
+effect fn parseDigits(input: &[u8], start: usize, end: usize, radix: u32, negative: bool) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
+  let mut first = start
+  while first < end && (input[first] == 48 || input[first] == 95) { first = first + 1 }
+  let mut digits: usize = 0
+  let mut p = first
+  while p < end { if input[p] != 95 { digits = digits + 1 } p = p + 1 }
+  if digits > BIGINT_MAX_LIMBS * 32 { fail BigIntError.TooLarge }
+  let binary = (radix & (radix - 1)) == 0
+  let width = i32.toUsize(32 - clz32(radix - 1))
+  let mut bound: usize = 1
+  if binary { bound = digits * width / 32 + 1 }
+  else if radix == 10 { bound = ((digits * 27 + 7) / 8) / 32 + 1 }
+  run checkSize(bound)
+  if binary {
+    let mut words = run mp.zeroes(bound)
+    p = end
+    let mut bit: usize = 0
+    while p > first {
+      p = p - 1
+      if input[p] != 95 {
+        let v = digit(u8.toU32(input[p]))
+        let pos = bit / 32
+        let shift = usize.toU32(bit % 32)
+        let old = words.get(pos)
+        words.set(pos, old | u32.shiftLeft(v, shift))
+        if usize.toU32(width) + shift > 32 {
+          let next = words.get(pos + 1)
+          words.set(pos + 1, next | u32.shiftRight(v, 32 - shift))
+        }
+        bit = bit + width
+      }
+    }
+    return run BigInt.fromMagnitude(move words, negative)
+  }
+  let mut words = run mp.zeroes(1)
+  run words.reserveExact(bound - 1)
+  let chunk = i32.toUsize(DIGITS_PER_LIMB[u32.toUsize(radix - 2)])
+  p = first
+  while p < end {
+    let mut v: u32 = 0
+    let mut multiplier: u32 = 1
+    let mut count: usize = 0
+    while p < end && count < chunk {
+      if input[p] != 95 {
+        v = v * radix + digit(u8.toU32(input[p]))
+        multiplier = multiplier * radix
+        count = count + 1
+      }
+      p = p + 1
+    }
+    let high = mp.multiplySmall(words.asMutSlice(), multiplier, v)
+    if high != 0 {
+      run checkSize(words.length() + 1)
+      run words.append(high)
+    }
+  }
+  return run BigInt.fromMagnitude(move words, negative)
+}
+
+effect fn formatBinary(words: &[u32], negative: bool, radix: u32) -> ByteBuffer ! OutOfMemoryError ? &mut Allocator {
+  let mut n = words.length
+  while n > 1 && words[n - 1] == 0 { n = n - 1 }
+  let width = i32.toUsize(31 - clz32(radix))
+  let bits = n * 32 - i32.toUsize(clz32(words[n - 1]))
+  let mut digits = (bits + width - 1) / width
+  if digits == 0 { digits = 1 }
+  let mut output = ByteBuffer.make()
+  run output.reserve(digits + 1)
+  if negative { run output.append(45) }
+  let mut i = digits
+  while i > 0 {
+    i = i - 1
+    let bit = i * width
+    let pos = bit / 32
+    let shift = usize.toU32(bit % 32)
+    let mut v = u32.shiftRight(words[pos], shift)
+    if usize.toU32(width) + shift > 32 && pos + 1 < n { v = v | u32.shiftLeft(words[pos + 1], 32 - shift) }
+    run output.append(digitByte(v & (radix - 1)))
+  }
+  return move output
+}

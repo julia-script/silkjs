@@ -1,0 +1,220 @@
+//! Object construction from quickjs.c:5721-5889,5939-5959. No JS coercion or
+//! intrinsic installation. Raw entry points require a live context, registered
+//! class, matching runtime allocator/observer, and borrowed Object-or-Null prototype.
+//! Construction consumes shape/property ownership on both success and failure.
+//! Class constructors must install their nonempty family payload before exposing it.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.layout { Layout }
+import silk.list { List }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.result { Result }
+import silk.i32
+import silk.u32
+import silk.usize
+import runtime_memory { AllocationObserver }
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_value { Value }
+import js_core_types { RuntimeState, ContextState, ObjectData, ObjectPayload, PropertySlot,
+  ShapeData, FastArrayData, MappedArgumentsData, RegExpData, GlobalObjectData,
+  JS_PROP_WRITABLE, JS_PROP_LENGTH, JS_PROP_INITIAL_SIZE, JS_PROP_INITIAL_HASH_SIZE, ExoticCallbacks }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_shapes as shapes
+import js_runtime as runtimeApi
+import js_class_data as classes
+import js_atom_data as atoms
+
+fn present(value: ?*mut HeapHeader) -> *mut HeapHeader {
+  return unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(value)
+}
+fn prototypeObject(value: Value) -> ?*mut HeapHeader {
+  return match value { Value.Object { reference } => reference _ => Pointer.null<HeapHeader>() }
+}
+fn boxedClass(classId: u32) -> bool {
+  return classId == classes.JS_CLASS_NUMBER || classId == classes.JS_CLASS_STRING
+    || classId == classes.JS_CLASS_BOOLEAN || classId == classes.JS_CLASS_SYMBOL
+    || classId == classes.JS_CLASS_DATE || classId == classes.JS_CLASS_BIG_INT
+}
+fn initialPayload(classId: u32) -> ObjectPayload {
+  if classId == classes.JS_CLASS_ARRAY || classId == classes.JS_CLASS_ARGUMENTS {
+    return ObjectPayload.FastArray { array: FastArrayData { values: List<Value>.make() } }
+  }
+  if classId == classes.JS_CLASS_MAPPED_ARGUMENTS {
+    return ObjectPayload.MappedArguments { arguments: MappedArgumentsData { varRefs: List<*mut HeapHeader>.make() } }
+  }
+  if boxedClass(classId) { return ObjectPayload.Boxed { value: Value.Undefined } }
+  if classId == classes.JS_CLASS_REGEXP {
+    return ObjectPayload.RegExp { regexp: RegExpData { pattern: Value.Null, bytecode: Value.Null } }
+  }
+  if classId == classes.JS_CLASS_GLOBAL_OBJECT {
+    return ObjectPayload.GlobalObject { global: GlobalObjectData { uninitializedVariables: Value.Undefined } }
+  }
+  // Source opaque/native-function/bytecode/typed-view pointers are all null here.
+  // Empty has no owned edges; the relevant constructor replaces it with its typed payload.
+  return ObjectPayload.Empty
+}
+unsafe fn releaseSlots<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader,
+  slots: List<PropertySlot>) -> () {
+  let mut i: usize = 0
+  while i < slots.length() { unsafe gc.releaseProperty(&mut hooks, runtime, slots.get(i)) i = i + 1 }
+}
+unsafe fn releaseSupplied<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader,
+  supplied: Option<List<PropertySlot>>) -> () {
+  match move supplied {
+    Option<List<PropertySlot>>.Some { value } => { unsafe releaseSlots(&mut hooks, runtime, move value) }
+    Option<List<PropertySlot>>.None => ()
+  }
+}
+unsafe effect fn initialize(context: *mut HeapHeader, node: *mut HeapHeader,
+  supplied: &mut Option<List<PropertySlot>>) -> ?*mut HeapHeader ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = ()
+  let object = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+  let shape = object.shape
+  let mut sourceAnchor = ()
+  let shapeData = unsafe HeapCell.payload<ShapeData, ()>(&sourceAnchor, shape)
+  let capacity = shapeData.properties.capacity()
+  let count = shapeData.properties.length()
+  drop shapeData
+  let mut hasProperties = false
+  match &mut supplied.* {
+    Option<List<PropertySlot>>.Some { value } => {
+      // A supplied list owns exactly one initialized slot for each shape property.
+      if value.length() != count { Intrinsic.trap("QuickJS invariant violated") }
+      if value.capacity() < capacity { let extra = capacity - value.length() run value.reserveExact(extra) }
+      hasProperties = true
+    }
+    Option<List<PropertySlot>>.None => ()
+  }
+  if hasProperties {
+    let owned = Intrinsic.replace(supplied.*, Option<List<PropertySlot>>.none())
+    match move owned {
+      Option<List<PropertySlot>>.Some { value } => { object.properties = move value }
+      Option<List<PropertySlot>>.None => { Intrinsic.trap("QuickJS invariant violated") }
+    }
+    return Pointer.null<HeapHeader>()
+  }
+  object.properties = run unsafe shapes.allocateSlots(shape)
+  if object.classId == classes.JS_CLASS_ARRAY {
+    let ctx = unsafe HeapCell.payload<ContextState, ()>(&sourceAnchor, context)
+    let cached = ctx.arrayShape
+    let runtime = ctx.runtime
+    drop ctx
+    if Pointer.address<HeapHeader>(cached) == Pointer.address<HeapHeader>(shape) {
+      object.properties.set(0, PropertySlot.Value { value: Value.Int { value: 0 } })
+    } else {
+      let added = run unsafe shapes.addProperty(runtime, &mut object, atoms.JS_ATOM_length, u32.toU8(JS_PROP_WRITABLE | JS_PROP_LENGTH))
+      object.properties.set(added.index, PropertySlot.Value { value: Value.Int { value: 0 } })
+      return added.retiredShape
+    }
+  }
+  // C_FUNCTION's first slot is already Undefined, including an empty prototype shape.
+  return Pointer.null<HeapHeader>()
+}
+
+/// Consumes ownedShape and supplied slots, including OOM. Native slot storage is
+/// transferred when supplied, avoiding a redundant copy; capacity still covers shape.
+/// No class finalizer runs for an allocation that was never published.
+pub unsafe effect fn fromShape<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, ownedShape: *mut HeapHeader, classId: u32,
+  properties: Option<List<PropertySlot>>) -> Value ! OutOfMemoryError ? &mut Allocator {
+  let runtime = unsafe runtimeApi.contextRuntime(context)
+  let collected = run unsafe runtimeApi.triggerGC(memory, &mut hooks, runtime, Layout.of<ObjectData>().bytes, false)
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let mut exotic = match &state.classes.asSlice()[u32.toUsize(classId)].exotic {
+    Option<ExoticCallbacks>.Some { .. } => true Option<ExoticCallbacks>.None => false
+  }
+  drop state
+  let fast = classId == classes.JS_CLASS_ARRAY || classId == classes.JS_CLASS_ARGUMENTS
+    || classId == classes.JS_CLASS_MAPPED_ARGUMENTS
+    || (classId >= classes.JS_CLASS_UINT8C_ARRAY && classId <= classes.JS_CLASS_FLOAT64_ARRAY)
+  if fast { exotic = true }
+  // These source switch arms deliberately bypass the generic exotic descriptor.
+  if classId == classes.JS_CLASS_OBJECT || classId == classes.JS_CLASS_C_FUNCTION
+    || classId == classes.JS_CLASS_DATAVIEW || classId == classes.JS_CLASS_REGEXP
+    || classId == classes.JS_CLASS_GLOBAL_OBJECT { exotic = false }
+  let allocated = run Effect.result(HeapCell.allocate<ObjectData>(HeapKind.Object, ObjectData {
+    isStandardArrayPrototype: false, extensible: true, freeMark: false, isExotic: exotic,
+    fastArray: fast, isConstructor: false, hasImmutablePrototype: false, temporaryMark: false,
+    isHtmlDda: false, classId: classId, weakRefCount: 0, shape: ownedShape,
+    properties: List<PropertySlot>.make(), payload: initialPayload(classId)
+  }))
+  let node = match move allocated {
+    Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value
+    Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => {
+      unsafe releaseSupplied(&mut hooks, runtime, move properties)
+      unsafe gc.releaseHeader(&mut hooks, runtime, ownedShape)
+      fail move error
+    }
+  }
+  let mut supplied = move properties
+  let initialized = run Effect.result(unsafe initialize(context, node, &mut supplied))
+  match move initialized {
+    Result<?*mut HeapHeader, OutOfMemoryError>.Success { value: retired } => {
+      unsafe gc.publish(runtime, node)
+      unsafe gc.releaseOptional(&mut hooks, runtime, retired)
+      return Value.Object { reference: node }
+    }
+    Result<?*mut HeapHeader, OutOfMemoryError>.Failure { error } => {
+      let mut failureAnchor = ()
+      let failed = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut failureAnchor, node)
+      let shape = failed.shape
+      let slots = Intrinsic.replace(failed.properties, List<PropertySlot>.make())
+      drop failed
+      unsafe HeapCell.destroy<ObjectData>(node)
+      unsafe releaseSupplied(&mut hooks, runtime, move supplied)
+      unsafe releaseSlots(&mut hooks, runtime, move slots)
+      unsafe gc.releaseHeader(&mut hooks, runtime, shape)
+      fail move error
+    }
+  }
+}
+pub unsafe effect fn withPrototypeClass<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, prototype: Value, classId: u32) -> Value ! OutOfMemoryError ? &mut Allocator {
+  let runtime = unsafe runtimeApi.contextRuntime(context)
+  let shape = run unsafe shapes.empty(runtime, prototypeObject(prototype))
+  return run unsafe fromShape(&mut hooks, memory, context, shape, classId, Option<List<PropertySlot>>.none())
+}
+/// Unshared shape for prototypes/constructors whose property layout is not interned.
+pub unsafe effect fn withPrototypeClassCapacity<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, prototype: Value, classId: u32, propertyCapacity: i32) -> Value
+  ! OutOfMemoryError ? &mut Allocator {
+  let runtime = unsafe runtimeApi.contextRuntime(context)
+  let mut capacity = JS_PROP_INITIAL_SIZE
+  let mut hashSize = JS_PROP_INITIAL_HASH_SIZE
+  if propertyCapacity > 2 {
+    capacity = i32.toUsize(propertyCapacity)
+    hashSize = 1
+    while hashSize < capacity { hashSize = hashSize * 2 }
+  }
+  let shape = run unsafe shapes.createUnhashed(runtime, prototypeObject(prototype), hashSize, capacity)
+  return run unsafe fromShape(&mut hooks, memory, context, shape, classId, Option<List<PropertySlot>>.none())
+}
+pub unsafe effect fn withClass<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, classId: u32) -> Value ! OutOfMemoryError ? &mut Allocator {
+  let anchor = ()
+  let ctx = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  let prototype = ctx.classPrototypes.get(u32.toUsize(classId))
+  drop ctx
+  return run unsafe withPrototypeClass(&mut hooks, memory, context, prototype, classId)
+}
+pub unsafe effect fn withPrototype<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, prototype: Value) -> Value ! OutOfMemoryError ? &mut Allocator {
+  return run unsafe withPrototypeClass(&mut hooks, memory, context, prototype, classes.JS_CLASS_OBJECT)
+}
+pub unsafe effect fn object<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader) -> Value ! OutOfMemoryError ? &mut Allocator {
+  return run unsafe withClass(&mut hooks, memory, context, classes.JS_CLASS_OBJECT)
+}
+/// Requires the context's Array intrinsic cached shape to have been installed.
+pub unsafe effect fn array<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader) -> Value ! OutOfMemoryError ? &mut Allocator {
+  let anchor = ()
+  let ctx = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  let shape = present(ctx.arrayShape)
+  drop ctx
+  unsafe HeapCell.retain(shape)
+  return run unsafe fromShape(&mut hooks, memory, context, shape, classes.JS_CLASS_ARRAY, Option<List<PropertySlot>>.none())
+}

@@ -1,0 +1,342 @@
+//! qjs memory report. Counts walk the live native heap; byte sizes describe Silk
+//! storage, not the unrelated C layouts. The allocator ledger supplies exact total
+//! charged bytes/blocks, including host services and native allocation headers.
+import silk.layout { Layout }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.slice { Slice }
+import silk.usize
+import silk.u32
+import silk.u16
+import silk.i32
+import silk.f64
+import js_heap { HeapHeader, HeapCell, HeapKind }
+import js_core_types { RuntimeState, ContextState, ObjectData, ObjectPayload, ObjectPayloadFamily, PropertySlot,
+  ShapeData, ShapeProperty, FunctionBytecode, FunctionDebugInfo, ClosureVar, VarDef,
+  ByteStorage, VarRef, VarRefState, ClassDef, ModuleDef, RequestedModule, ExportEntry,
+  StarExportEntry, ImportEntry, JobEntry }
+import js_string_types { FlatString, RopeString }
+import js_value { Value }
+import js_class_data as classes
+import js_bound_functions { BoundFunctionData }
+import js_buffer_storage as buffers
+import runtime_memory { AllocationObserver }
+import cli_io
+
+struct Usage {
+  usedCount: usize, usedBytes: usize,
+  objects: usize, objectBytes: usize, properties: usize, propertyBytes: usize,
+  shapes: usize, shapeBytes: usize, functions: usize, functionBytes: usize,
+  bytecodeBytes: usize, pc2lineCount: usize, pc2lineBytes: usize, nativeFunctions: usize,
+  arrays: usize, fastArrays: usize, elements: usize, elementBytes: usize,
+  binaryCount: usize, binaryBytes: usize, strings: f64, stringBytes: f64, stringAllocations: f64,
+  atomBytes: usize,
+  classCounts: [usize; 128]
+}
+fn allocation(usage: &mut Usage, bytes: usize) -> () {
+  if bytes != 0 { usage.usedCount = usage.usedCount + 1 usage.usedBytes = usage.usedBytes + bytes }
+}
+fn nativeBytes(bytes: &ByteStorage) -> usize {
+  return match &bytes.* { ByteStorage.Owned { bytes: owned } => owned.capacity() ByteStorage.Borrowed { .. } => 0 }
+}
+unsafe fn headerBytes(cell: *mut HeapHeader) -> usize {
+  let anchor = () return (unsafe Pointer.borrow<(), HeapHeader>(&anchor, cell)).allocationBytes
+}
+unsafe fn stringValue(usage: &mut Usage, value: Value, scale: f64) -> () {
+  match value {
+    Value.String { reference } => {
+      let anchor = () let header = unsafe Pointer.borrow<(), HeapHeader>(&anchor, reference)
+      let divisor = i32.toF64(header.referenceCount)
+      if divisor <= 0.0 { return }
+      let cellBytes = header.allocationBytes let kind = header.kind drop header
+      if kind == HeapKind.Rope {
+        let rope = unsafe HeapCell.payload<RopeString, ()>(&anchor, reference)
+        usage.strings = usage.strings + scale / divisor
+        usage.stringAllocations = usage.stringAllocations + scale / divisor
+        usage.stringBytes = usage.stringBytes + usize.toF64(cellBytes) * scale / divisor
+        unsafe stringValue(&mut usage, rope.left, scale / divisor)
+        unsafe stringValue(&mut usage, rope.right, scale / divisor)
+      } else {
+        let text = unsafe HeapCell.payload<FlatString, ()>(&anchor, reference)
+        if text.atom != 0 { return }
+        usage.strings = usage.strings + scale / divisor
+        let mut allocations: f64 = 1.0
+        if text.latin1.capacity() != 0 { allocations = allocations + 1.0 }
+        if text.utf16.capacity() != 0 { allocations = allocations + 1.0 }
+        usage.stringAllocations = usage.stringAllocations + allocations * scale / divisor
+        usage.stringBytes = usage.stringBytes + usize.toF64(cellBytes + text.latin1.capacity() + text.utf16.capacity() * 2) * scale / divisor
+      }
+    }
+    _ => ()
+  }
+}
+unsafe fn object(usage: &mut Usage, cell: *mut HeapHeader) -> () {
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, cell)
+  usage.objects = usage.objects + 1 usage.objectBytes = usage.objectBytes + unsafe headerBytes(cell)
+  let mut classIndex = u32.toUsize(data.classId)
+  if classIndex >= u32.toUsize(classes.JS_CLASS_INIT_COUNT) { classIndex = 127 }
+  usage.classCounts[classIndex] = usage.classCounts[classIndex] + 1
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+  usage.properties = usage.properties + shape.properties.length()
+  usage.propertyBytes = usage.propertyBytes + data.properties.capacity() * Layout.of<PropertySlot>().bytes
+  allocation(&mut usage, data.properties.capacity() * Layout.of<PropertySlot>().bytes)
+  let mut at: usize = 0
+  while at < data.properties.length() {
+    if at < shape.properties.length() && shape.properties.get(at).atom != 0 {
+      match data.properties.get(at) { PropertySlot.Value { value } => { unsafe stringValue(&mut usage, value, 1.0) } _ => () }
+    }
+    at = at + 1
+  }
+  if data.classId == classes.JS_CLASS_ARRAY || data.classId == classes.JS_CLASS_ARGUMENTS { usage.arrays = usage.arrays + 1 }
+  match &data.payload {
+    ObjectPayload.FastArray { array } => {
+      usage.fastArrays = usage.fastArrays + 1 usage.elements = usage.elements + array.values.length()
+      usage.elementBytes = usage.elementBytes + array.values.capacity() * Layout.of<Value>().bytes
+      allocation(&mut usage, array.values.capacity() * Layout.of<Value>().bytes)
+      at = 0 while at < array.values.length() { unsafe stringValue(&mut usage, array.values.get(at), 1.0) at = at + 1 }
+    }
+    ObjectPayload.MappedArguments { arguments } => {
+      usage.fastArrays = usage.fastArrays + 1 usage.elements = usage.elements + arguments.varRefs.length()
+      usage.elementBytes = usage.elementBytes + arguments.varRefs.capacity() * Layout.of<*mut HeapHeader>().bytes
+      allocation(&mut usage, arguments.varRefs.capacity() * Layout.of<*mut HeapHeader>().bytes)
+    }
+    ObjectPayload.NativeFunction { function } => {
+      usage.nativeFunctions = usage.nativeFunctions + 1
+      allocation(&mut usage, function.capturedValues.capacity() * Layout.of<Value>().bytes)
+      at = 0 while at < function.capturedValues.length() { unsafe stringValue(&mut usage, function.capturedValues.get(at), 1.0) at = at + 1 }
+    }
+    ObjectPayload.BytecodeFunction { function } => {
+      usage.functionBytes = usage.functionBytes + function.varRefs.capacity() * Layout.of<?*mut HeapHeader>().bytes
+      allocation(&mut usage, function.varRefs.capacity() * Layout.of<?*mut HeapHeader>().bytes)
+    }
+    ObjectPayload.Boxed { value } => { unsafe stringValue(&mut usage, value, 1.0) }
+    ObjectPayload.RegExp { regexp } => { unsafe stringValue(&mut usage, regexp.pattern, 1.0) unsafe stringValue(&mut usage, regexp.bytecode, 1.0) }
+    ObjectPayload.TypedArray { array } => { allocation(&mut usage, unsafe headerBytes(array.view)) }
+    ObjectPayload.Opaque { family, reference } => {
+      if !Pointer.isNull<HeapHeader>(reference) {
+        let opaque = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(reference)
+        allocation(&mut usage, unsafe headerBytes(opaque))
+        if family == ObjectPayloadFamily.BoundFunction {
+          let bound = unsafe HeapCell.payload<BoundFunctionData, ()>(&anchor, opaque)
+          allocation(&mut usage, bound.arguments.capacity() * Layout.of<Value>().bytes)
+          at = 0 while at < bound.arguments.length() { unsafe stringValue(&mut usage, bound.arguments.get(at), 1.0) at = at + 1 }
+        }
+        if data.classId == classes.JS_CLASS_ARRAY_BUFFER || data.classId == classes.JS_CLASS_SHARED_ARRAY_BUFFER {
+          let buffer = unsafe buffers.snapshot(cell)
+          if !Pointer.isNull<u8>(buffer.data) { allocation(&mut usage, u32.toUsize(buffer.byteLength)) }
+        }
+      }
+    }
+    _ => ()
+  }
+}
+unsafe fn compute(rt: *mut HeapHeader) -> Usage {
+  let mut usage = Usage { usedCount: 0, usedBytes: 0, objects: 0, objectBytes: 0, properties: 0, propertyBytes: 0,
+    shapes: 0, shapeBytes: 0, functions: 0, functionBytes: 0, bytecodeBytes: 0,
+    pc2lineCount: 0, pc2lineBytes: 0, nativeFunctions: 0, arrays: 0, fastArrays: 0,
+    elements: 0, elementBytes: 0, binaryCount: 0, binaryBytes: 0, strings: 0.0, stringBytes: 0.0, stringAllocations: 0.0,
+    atomBytes: 0, classCounts: [0; 128] }
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  allocation(&mut usage, unsafe headerBytes(rt))
+  allocation(&mut usage, state.classes.capacity() * Layout.of<ClassDef>().bytes)
+  allocation(&mut usage, state.shapeHash.capacity() * Layout.of<?*mut HeapHeader>().bytes)
+  let atoms = state.atoms.storageUsage()
+  usage.atomBytes = atoms.bytes
+  usage.usedCount = usage.usedCount + atoms.allocationCount
+  usage.usedBytes = usage.usedBytes + atoms.bytes
+  match &state.runtimeInfo { Option<ByteStorage>.Some { value } => { allocation(&mut usage, nativeBytes(&value)) } _ => () }
+  let mut cursor = state.gcObjects.first
+  while !Pointer.isNull<HeapHeader>(cursor) {
+    let cell = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(cursor)
+    let header = unsafe Pointer.borrow<(), HeapHeader>(&anchor, cell)
+    let kind = header.kind cursor = header.next drop header
+    allocation(&mut usage, unsafe headerBytes(cell))
+    match kind {
+      HeapKind.Object => { unsafe object(&mut usage, cell) }
+      HeapKind.Shape => {
+        let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, cell)
+        usage.shapes = usage.shapes + 1
+        usage.shapeBytes = usage.shapeBytes + unsafe headerBytes(cell) + shape.properties.capacity() * Layout.of<ShapeProperty>().bytes + shape.hashIndices.capacity() * 4
+        allocation(&mut usage, shape.properties.capacity() * Layout.of<ShapeProperty>().bytes)
+        allocation(&mut usage, shape.hashIndices.capacity() * 4)
+      }
+      HeapKind.FunctionBytecode => {
+        let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, cell)
+        usage.functions = usage.functions + 1
+        usage.functionBytes = usage.functionBytes + unsafe headerBytes(cell) + code.varDefs.capacity() * Layout.of<VarDef>().bytes + code.closureVars.capacity() * Layout.of<ClosureVar>().bytes + code.constants.capacity() * Layout.of<Value>().bytes
+        usage.bytecodeBytes = usage.bytecodeBytes + nativeBytes(&code.code)
+        allocation(&mut usage, code.varDefs.capacity() * Layout.of<VarDef>().bytes)
+        allocation(&mut usage, code.closureVars.capacity() * Layout.of<ClosureVar>().bytes)
+        allocation(&mut usage, code.constants.capacity() * Layout.of<Value>().bytes)
+        allocation(&mut usage, nativeBytes(&code.code))
+        let mut at: usize = 0 while at < code.constants.length() { unsafe stringValue(&mut usage, code.constants.get(at), 1.0) at = at + 1 }
+        match &code.debug {
+          Option<FunctionDebugInfo>.Some { value } => {
+            match &value.source { Option<ByteStorage>.Some { value: source } => {
+              let bytes = nativeBytes(&source) usage.functionBytes = usage.functionBytes + bytes allocation(&mut usage, bytes)
+            } _ => () }
+            let bytes = nativeBytes(&value.pcToLine)
+            allocation(&mut usage, bytes)
+            if bytes != 0 { usage.pc2lineCount = usage.pc2lineCount + 1 usage.pc2lineBytes = usage.pc2lineBytes + bytes }
+          }
+          _ => ()
+        }
+      }
+      HeapKind.Context => {
+        let context = unsafe HeapCell.payload<ContextState, ()>(&anchor, cell)
+        allocation(&mut usage, context.classPrototypes.capacity() * Layout.of<Value>().bytes)
+        usage.binaryCount = usage.binaryCount + u16.toUsize(context.binaryObjectCount)
+        if context.binaryObjectSize > 0 { usage.binaryBytes = usage.binaryBytes + i32.toUsize(context.binaryObjectSize) }
+      }
+      HeapKind.VarRef => {
+        let reference = unsafe HeapCell.payload<VarRef, ()>(&anchor, cell)
+        usage.functionBytes = usage.functionBytes + unsafe headerBytes(cell)
+        match &reference.state { VarRefState.Detached { value } => { unsafe stringValue(&mut usage, value, 1.0) } _ => () }
+      }
+      HeapKind.Module => {
+        let module = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, cell)
+        allocation(&mut usage, module.requestedModules.capacity() * Layout.of<RequestedModule>().bytes)
+        allocation(&mut usage, module.exports.capacity() * Layout.of<ExportEntry>().bytes)
+        allocation(&mut usage, module.starExports.capacity() * Layout.of<StarExportEntry>().bytes)
+        allocation(&mut usage, module.imports.capacity() * Layout.of<ImportEntry>().bytes)
+        allocation(&mut usage, module.asyncParentModules.capacity() * Layout.of<*mut HeapHeader>().bytes)
+        unsafe stringValue(&mut usage, module.namespace, 1.0)
+        unsafe stringValue(&mut usage, module.functionObject, 1.0)
+      }
+      _ => ()
+    }
+  }
+  let mut jobCursor = state.jobs.first
+  while !Pointer.isNull<HeapHeader>(jobCursor) {
+    let cell = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(jobCursor)
+    let header = unsafe Pointer.borrow<(), HeapHeader>(&anchor, cell)
+    jobCursor = header.next
+    allocation(&mut usage, header.allocationBytes)
+    let job = unsafe HeapCell.payload<JobEntry, ()>(&anchor, cell)
+    allocation(&mut usage, job.arguments.capacity() * Layout.of<Value>().bytes)
+    let mut at: usize = 0 while at < job.arguments.length() { unsafe stringValue(&mut usage, job.arguments.get(at), 1.0) at = at + 1 }
+  }
+  usage.usedCount = usage.usedCount + f64.toUsize(usage.stringAllocations + 0.5)
+  usage.usedBytes = usage.usedBytes + f64.toUsize(usage.stringBytes + 0.5)
+  return move usage
+}
+fn number(value: usize, width: usize) -> () {
+  let mut digits: [u8; 32] = [0; 32] let mut length: usize = 0 let mut rest = value
+  while true { digits[31 - length] = usize.toU8(rest % 10) + 48 length = length + 1 rest = rest / 10 if rest == 0 { break } }
+  while length < width { digits[31 - length] = 32 length = length + 1 }
+  cli_io.stdout(Slice.view(&digits, 32 - length, length))
+}
+fn row(name: &[u8], count: usize, bytes: usize) -> () {
+  cli_io.stdout(name) let mut at = name.length while at < 20 { cli_io.stdout(b" ") at = at + 1 }
+  cli_io.stdout(b" ") number(count, 8) cli_io.stdout(b" ") number(bytes, 8) cli_io.stdout(b"\n")
+}
+pub unsafe fn dump(rt: *mut HeapHeader, memory: &AllocationObserver) -> () {
+  let usage = unsafe compute(rt) let ledger = memory.stats()
+  cli_io.stdout(b"QuickJS memory usage -- 2026-06-04 native Silk version, ")
+  number(Layout.of<*mut HeapHeader>().bytes * 8, 1) cli_io.stdout(b"-bit, malloc limit: ")
+  if ledger.limit == usize.MAX { cli_io.stdout(b"-1") } else { number(ledger.limit, 1) }
+  cli_io.stdout(b"\n\nNative payload layouts (allocator headers and capacity included in totals)\n")
+  row(b"JSRuntime", 1, Layout.of<RuntimeState>().bytes) row(b"JSContext", 1, Layout.of<ContextState>().bytes)
+  row(b"JSObject", 1, Layout.of<ObjectData>().bytes) row(b"JSString", 1, Layout.of<FlatString>().bytes)
+  row(b"JSFunctionBytecode", 1, Layout.of<FunctionBytecode>().bytes)
+  cli_io.stdout(b"\nJSObject classes\n")
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let mut at: usize = 0
+  while at < 128 {
+    if usage.classCounts[at] != 0 {
+      cli_io.stdout(b"  ") number(usage.classCounts[at], 5) cli_io.stdout(b"  ") number(at, 2) cli_io.stdout(b" ")
+      if at == 127 { cli_io.stdout(b"other") }
+      else if at < state.classes.length() {
+        let mut text: [u8; 128] = [0; 128]
+        let length = state.atoms.diagnosticText(state.classes.asSlice()[at].classNameAtom, &mut text, 0)
+        cli_io.stdout(Slice.view(&text, 0, length))
+      } else { cli_io.stdout(b"none") }
+      cli_io.stdout(b"\n")
+    }
+    at = at + 1
+  }
+  cli_io.stdout(b"\nNAME                    COUNT     SIZE\n")
+  row(b"memory allocated", ledger.allocationCount, ledger.usedBytes)
+  row(b"memory used", usage.usedCount, usage.usedBytes)
+  row(b"atoms", state.atoms.count(), usage.atomBytes)
+  if usage.strings >= 0.5 { row(b"strings", f64.toUsize(usage.strings + 0.5), f64.toUsize(usage.stringBytes + 0.5)) }
+  if usage.objects != 0 {
+    row(b"objects", usage.objects, usage.objectBytes) row(b"  properties", usage.properties, usage.propertyBytes) row(b"  shapes", usage.shapes, usage.shapeBytes)
+  }
+  if usage.functions != 0 {
+    row(b"bytecode functions", usage.functions, usage.functionBytes) row(b"  bytecode", usage.functions, usage.bytecodeBytes)
+    if usage.pc2lineCount != 0 { row(b"  pc2line", usage.pc2lineCount, usage.pc2lineBytes) }
+  }
+  if usage.nativeFunctions != 0 { row(b"native functions", usage.nativeFunctions, 0) }
+  if usage.arrays != 0 { row(b"arrays", usage.arrays, 0) }
+  if usage.fastArrays != 0 { row(b"  fast arrays", usage.fastArrays, 0) row(b"  elements", usage.elements, usage.elementBytes) }
+  if usage.binaryCount != 0 { row(b"binary objects", usage.binaryCount, usage.binaryBytes) }
+}
+
+// Finalized native counters in the order used by run-test262.c's update_stats:
+// malloc count/size, used count/size, atom count/size, string count/size,
+// object count/size, property count/size, shape count/size, function count/size,
+// bytecode size, pc2line count/size, native functions, arrays, fast arrays,
+// elements. Native element capacity bytes and binary count/bytes follow.
+// Keep weighted string traversal private: aggregation operates on the same
+// rounded integer counts displayed for an individual runtime.
+pub struct MemorySnapshot { values: [usize; 26] }
+impl MemorySnapshot {
+  pub fn make() -> Self { return Self { values: [0; 26] } }
+  pub fn copy(self: &Self) -> Self {
+    let mut result = MemorySnapshot.make() let mut at: usize = 0
+    while at < 26 { result.values[at] = self.values[at] at = at + 1 }
+    return move result
+  }
+  pub fn allocatedBytes(self: &Self) -> usize { return self.values[1] }
+  pub fn add(self: &mut Self, other: &Self) -> () {
+    let mut at: usize = 0
+    while at < 26 { self.values[at] = self.values[at] + other.values[at] at = at + 1 }
+  }
+  pub fn average(self: &Self, count: usize) -> Self {
+    let mut result = MemorySnapshot.make()
+    if count != 0 {
+      let mut at: usize = 0
+      while at < 26 { result.values[at] = self.values[at] / count at = at + 1 }
+    }
+    return move result
+  }
+  pub fn display(self: &Self) -> () {
+    cli_io.stdout(b"NAME                    COUNT     SIZE\n")
+    row(b"memory allocated", self.values[0], self.values[1])
+    row(b"memory used", self.values[2], self.values[3])
+    row(b"atoms", self.values[4], self.values[5])
+    if self.values[6] != 0 { row(b"strings", self.values[6], self.values[7]) }
+    if self.values[8] != 0 {
+      row(b"objects", self.values[8], self.values[9])
+      row(b"  properties", self.values[10], self.values[11])
+      row(b"  shapes", self.values[12], self.values[13])
+    }
+    if self.values[14] != 0 {
+      row(b"bytecode functions", self.values[14], self.values[15])
+      row(b"  bytecode", self.values[14], self.values[16])
+      if self.values[17] != 0 { row(b"  pc2line", self.values[17], self.values[18]) }
+    }
+    if self.values[19] != 0 { row(b"native functions", self.values[19], 0) }
+    if self.values[20] != 0 { row(b"arrays", self.values[20], 0) }
+    if self.values[21] != 0 {
+      row(b"  fast arrays", self.values[21], 0)
+      row(b"  elements", self.values[22], self.values[23])
+    }
+    if self.values[24] != 0 { row(b"binary objects", self.values[24], self.values[25]) }
+  }
+}
+pub unsafe fn snapshot(rt: *mut HeapHeader, memory: &AllocationObserver) -> MemorySnapshot {
+  let usage = unsafe compute(rt) let ledger = memory.stats()
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  return MemorySnapshot { values: [
+    ledger.allocationCount, ledger.usedBytes, usage.usedCount, usage.usedBytes,
+    state.atoms.count(), usage.atomBytes,
+    f64.toUsize(usage.strings + 0.5), f64.toUsize(usage.stringBytes + 0.5),
+    usage.objects, usage.objectBytes, usage.properties, usage.propertyBytes,
+    usage.shapes, usage.shapeBytes, usage.functions, usage.functionBytes,
+    usage.bytecodeBytes, usage.pc2lineCount, usage.pc2lineBytes,
+    usage.nativeFunctions, usage.arrays, usage.fastArrays, usage.elements,
+    usage.elementBytes, usage.binaryCount, usage.binaryBytes
+  ] }
+}

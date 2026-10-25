@@ -1,0 +1,344 @@
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.list { List }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.testing { Testing, AssertionError }
+import silk.u32
+import silk.usize
+import runtime_memory { RuntimeAllocator }
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_core_types { RuntimeState, ObjectData, ObjectPayload, PropertySlot, PropertyEnum, TypedArrayCache,
+  VarRef, VarRefState, StackFrame, FrameSlot, FrameSlots, FrameReferences }
+import js_gc as gc
+import js_runtime as runtime
+import js_object_allocate as objects
+import js_array_storage as arrays
+import js_array_storage { ArrayLengthError }
+import js_array_storage_test_support as storage
+import js_array_storage_test_support { FaultAllocator, reference, rc }
+import js_class_data as classes
+import js_value { Value }
+import js_strings { Strings }
+import js_string_types { StringOwner, StringLengthError, stringReference }
+import js_var_refs as varRefs
+import js_property_names as names
+import js_property_names { OwnKeysError }
+import js_property_names_test_support as fixture
+import js_property_names_test_support { Hooks, Entry }
+import js_exceptions { JsException }
+import js_exceptions as exceptions
+
+unsafe effect fn collectNames(hooks: &mut Hooks, ctx: *mut HeapHeader, object: Value, flags: u32) -> bool
+  ! OutOfMemoryError | OwnKeysError | JsException | StringLengthError ? &mut Allocator {
+  let result = run unsafe names.getOwnPropertyNames(&mut hooks, ctx, object, flags)
+  unsafe names.releaseNames(unsafe runtime.contextRuntime(ctx), move result)
+  return true
+}
+effect fn oom(error: OutOfMemoryError) -> bool { drop error return false }
+effect fn thrown(error: JsException) -> bool { drop error return false }
+effect fn notObject(error: OwnKeysError) -> bool {
+  return match move error { OwnKeysError.NotObject => false OwnKeysError.Uninitialized { .. } => true }
+}
+unsafe effect fn captureName(hooks: &mut Hooks, ctx: *mut HeapHeader, object: Value, flags: u32) -> Option<StringOwner>
+  ! OutOfMemoryError | OwnKeysError | JsException | StringLengthError ? &mut Allocator {
+  let result = run unsafe names.getOwnPropertyNames(&mut hooks, ctx, object, flags)
+  unsafe names.releaseNames(unsafe runtime.contextRuntime(ctx), move result)
+  return Option<StringOwner>.none()
+}
+effect fn uninitialized(error: OwnKeysError) -> Option<StringOwner> {
+  return match move error {
+    OwnKeysError.Uninitialized { name } => Option<StringOwner>.some(move name)
+    OwnKeysError.NotObject => Option<StringOwner>.none()
+  }
+}
+
+test effect fn ownNamesSortOnlyNumericPrefixAndRetainEverySelectedAtom() -> ()
+  ! OutOfMemoryError | StringLengthError | OwnKeysError | JsException | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe storage.context(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make()
+  let object = run unsafe objects.withPrototype(&mut hooks, &observer, ctx, Value.Null) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut keys: [u32; 9] = [0; 9]
+  keys[0] = run unsafe fixture.atom(rt, b"4294967294", 0) |> Effect.provideMut<Allocator>(&mut memory)
+  keys[1] = run unsafe fixture.atom(rt, b"first", 0) |> Effect.provideMut<Allocator>(&mut memory)
+  keys[2] = run unsafe fixture.atom(rt, b"symbol", 1) |> Effect.provideMut<Allocator>(&mut memory)
+  keys[3] = run unsafe fixture.atom(rt, b"10", 0) |> Effect.provideMut<Allocator>(&mut memory)
+  keys[4] = run unsafe fixture.atom(rt, b"hidden", 0) |> Effect.provideMut<Allocator>(&mut memory)
+  keys[5] = run unsafe fixture.atom(rt, b"secret", 2) |> Effect.provideMut<Allocator>(&mut memory)
+  keys[6] = run unsafe fixture.atom(rt, b"2", 0) |> Effect.provideMut<Allocator>(&mut memory)
+  keys[7] = run unsafe fixture.atom(rt, b"4294967295", 0) |> Effect.provideMut<Allocator>(&mut memory)
+  keys[8] = run unsafe fixture.atom(rt, b"deleted", 0) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut i: usize = 0
+  while i < 9 {
+    let mut flags: u8 = 7
+    if i == 4 { flags = 3 }
+    run unsafe fixture.add(&mut hooks, rt, object, keys[i], flags, PropertySlot.Value { value: Value.Undefined })
+      |> Effect.provideMut<Allocator>(&mut memory)
+    i = i + 1
+  }
+  run unsafe fixture.remove(&mut hooks, rt, object, keys[8]) |> Effect.provideMut<Allocator>(&mut memory)
+  let all = run unsafe names.getOwnPropertyNames(&mut hooks, ctx, object, 7) |> Effect.provideMut<Allocator>(&mut memory)
+  let order: [usize; 8] = [6, 3, 0, 1, 4, 7, 2, 5]
+  run Testing.expect(all.length() == 8 && hooks.eventCount == 0, "ordinary keys omit tombstones and never dispatch")
+  i = 0
+  while i < 8 {
+    run Testing.expect(all.get(i).atom == keys[order[i]] && all.get(i).isEnumerable == (order[i] != 4),
+      "numeric array indices sort ascending, then insertion-ordered strings and symbol/private keys")
+    i = i + 1
+  }
+  let enumerable = run unsafe names.getOwnPropertyNames(&mut hooks, ctx, object, 17) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(enumerable.length() == 5 && enumerable.get(3).atom == keys[1]
+    && enumerable.get(4).atom == keys[7], "ENUM_ONLY filters hidden keys and kind mask excludes both symbol kinds")
+  unsafe names.releaseNames(rt, move enumerable)
+  unsafe gc.release(&mut hooks, rt, object)
+  i = 0
+  while i < 9 { unsafe fixture.releaseAtom(rt, keys[i]) i = i + 1 }
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let name = StringOwner.adopt(run state.atoms.toValue(all.get(3).atom, true) |> Effect.provideMut<Allocator>(&mut memory))
+  run Testing.expect(Strings.length(name.get()) == 5 && Strings.codeUnit(name.get(), 0) == 102,
+    "returned atom ownership survives destruction of object and caller's atom handles")
+  drop name drop state
+  unsafe names.releaseNames(rt, move all)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx)
+  run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observer.stats().usedBytes == 0, "ordered result owns and releases precisely its selected atoms")
+}
+
+test effect fn ownNamesTDZFilteringOwnsPrintableNameBeyondRuntimeTeardown() -> ()
+  ! OutOfMemoryError | StringLengthError | OwnKeysError | JsException | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe storage.context(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make()
+  let object = run unsafe objects.withPrototype(&mut hooks, &observer, ctx, Value.Null) |> Effect.provideMut<Allocator>(&mut memory)
+  let atom = run unsafe fixture.atom(rt, b"uninitializedExport", 0) |> Effect.provideMut<Allocator>(&mut memory)
+  let cell = run unsafe varRefs.createDetached(rt, true) |> Effect.provideMut<Allocator>(&mut memory)
+  run unsafe fixture.add(&mut hooks, rt, object, atom, 36, PropertySlot.VarRef { reference: cell }) |> Effect.provideMut<Allocator>(&mut memory)
+  unsafe fixture.releaseAtom(rt, atom)
+  let raw = run unsafe collectNames(&mut hooks, ctx, object, 1) |> Effect.provideMut<Allocator>(&mut memory)
+  let filtered = run unsafe collectNames(&mut hooks, ctx, object, 34) |> Effect.provideMut<Allocator>(&mut memory)
+  let invalid = run Effect.catch<OwnKeysError>(unsafe collectNames(&mut hooks, ctx, Value.Null, 7), notObject)
+    |> Effect.provideMut<Allocator>(&mut memory)
+  let errorName = run Effect.catch<OwnKeysError>(unsafe captureName(&mut hooks, ctx, object, 33), uninitialized)
+    |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(raw && filtered && !invalid, "TDZ check requires a selected property and SET_ENUM or ENUM_ONLY; primitives reject")
+  unsafe gc.release(&mut hooks, rt, object)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx)
+  run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  match move errorName {
+    Option<StringOwner>.Some { value } => {
+      run Testing.expect(Strings.length(value.get()) == 19 && Strings.codeUnit(value.get(), 0) == 117
+        && Strings.codeUnit(value.get(), 18) == 116, "typed TDZ error owns the printable name after its runtime is gone")
+    }
+    Option<StringOwner>.None => { run Testing.expect(false, "selected module binding must produce Uninitialized") }
+  }
+  run Testing.expect(observer.stats().usedBytes == 0, "owned error drops its independent string/atom registry lifetime")
+}
+
+test effect fn exoticFilteringFailureAndOOMReleaseAllKeysAndDescriptorEdges() -> ()
+  ! OutOfMemoryError | StringLengthError | OwnKeysError | JsException | AssertionError<'static> {
+  let mut attempt: usize = 0
+  let mut sawSuccess = false
+  while attempt < 4 {
+    let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+    let observer = run memory.observe()
+    let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+    let ctx = run unsafe storage.context(rt) |> Effect.provideMut<Allocator>(&mut memory)
+    run unsafe fixture.register(rt) |> Effect.provideMut<Allocator>(&mut memory)
+    let mut hooks = Hooks.make()
+    hooks.collectInKeys = true
+    let object = run unsafe fixture.exotic(&mut hooks, &observer, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+    let leaf = run unsafe objects.withPrototype(&mut hooks, &observer, ctx, Value.Null) |> Effect.provideMut<Allocator>(&mut memory)
+    let text = run Strings.fromLatin1(b"descriptor-value") |> Effect.provideMut<Allocator>(&mut memory)
+    let atom = run unsafe fixture.atom(rt, b"stored-key", 0) |> Effect.provideMut<Allocator>(&mut memory)
+    run unsafe fixture.store(rt, object, Entry { atom: atom, flags: 7, present: true, seedEnumerable: false,
+      value: text, getter: leaf, setter: leaf }) |> Effect.provideMut<Allocator>(&mut memory)
+    let mut fault = FaultAllocator { parent: move memory, remaining: attempt }
+    let success = run Effect.catch<OutOfMemoryError>(unsafe collectNames(&mut hooks, ctx, object, 33), oom)
+      |> Effect.provideMut<Allocator>(&mut fault)
+    if success { sawSuccess = true }
+    run Testing.expect(unsafe rc(stringReference(text)) == 2 && unsafe rc(reference(leaf)) == 3
+      && unsafe rc(reference(object)) == 1, "both list allocation failures and success consume every returned descriptor edge and temporary root")
+    hooks.eventCount = 0 hooks.failDescriptor = 1 fault.remaining = 100
+    let rejected = run Effect.catch<JsException>(unsafe collectNames(&mut hooks, ctx, object, 33), thrown)
+      |> Effect.provideMut<Allocator>(&mut fault)
+    let exception = unsafe exceptions.take(rt)
+    run Testing.expect(!rejected && hooks.eventCount == 2 && hooks.events[0] == 0 && hooks.events[1] == 1
+      && match exception { Value.Int { value } => value == 202 _ => false },
+      "descriptor failure preserves its thrown value and stops after ownKeys then first descriptor")
+    hooks.eventCount = 0 hooks.failDescriptor = 0 hooks.failKeys = true
+    let failedKeys = run Effect.catch<JsException>(unsafe collectNames(&mut hooks, ctx, object, 33), thrown)
+      |> Effect.provideMut<Allocator>(&mut fault)
+    let keyException = unsafe exceptions.take(rt)
+    run Testing.expect(!failedKeys && hooks.eventCount == 1
+      && match keyException { Value.Int { value } => value == 101 _ => false }, "ownKeys failure never invokes a descriptor")
+    unsafe gc.release(&mut hooks, rt, object)
+    run Testing.expect(unsafe rc(stringReference(text)) == 1 && unsafe rc(reference(leaf)) == 1,
+      "stored host payload releases all three independently retained values without changing unrelated object")
+    unsafe gc.release(&mut hooks, rt, text)
+    unsafe gc.release(&mut hooks, rt, leaf)
+    unsafe fixture.releaseAtom(rt, atom)
+    unsafe gc.releaseHeader(&mut hooks, rt, ctx)
+    run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut fault)
+    run Testing.expect(observer.stats().usedBytes == 0, "exotic callback and allocation failures never orphan atoms, descriptors or payload buffers")
+    attempt = attempt + 1
+  }
+  run Testing.expect(sawSuccess, "failure sweep reaches successful publication")
+}
+
+// This borrowed cache fixture has real stable backing and a real view allocation.
+// No typed-family finalizer is faked: detach it and destroy the borrowed view
+// explicitly before releasing the uninitialized typed object's Empty payload.
+struct BorrowedView { bytes: List<u8> }
+test effect fn arrayMappedStringAndTypedCachesEnumerateTheirSourceLengths() -> ()
+  ! OutOfMemoryError | StringLengthError | OwnKeysError | JsException | ArrayLengthError | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe storage.context(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make()
+  let array = run unsafe arrays.allocateFastArray(&mut hooks, &observer, ctx, 3) |> Effect.provideMut<Allocator>(&mut memory)
+  let mapped = run unsafe objects.withPrototypeClass(&mut hooks, &observer, ctx, Value.Null, classes.JS_CLASS_MAPPED_ARGUMENTS)
+    |> Effect.provideMut<Allocator>(&mut memory)
+  let mut i: usize = 0
+  while i < 2 {
+    let cell = run unsafe varRefs.createDetached(rt, true) |> Effect.provideMut<Allocator>(&mut memory)
+    run unsafe storage.appendMapped(mapped, cell) |> Effect.provideMut<Allocator>(&mut memory)
+    i = i + 1
+  }
+  let boxed = run unsafe objects.withPrototypeClass(&mut hooks, &observer, ctx, Value.Null, classes.JS_CLASS_STRING)
+    |> Effect.provideMut<Allocator>(&mut memory)
+  let text = run Strings.fromUtf16(&[65, 0xd83d, 0xde00]) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut anchor = ()
+  let boxData = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, reference(boxed))
+  boxData.payload = ObjectPayload.Boxed { value: text }
+  drop boxData
+  let typed = run unsafe objects.withPrototypeClass(&mut hooks, &observer, ctx, Value.Null, classes.JS_CLASS_UINT8_ARRAY)
+    |> Effect.provideMut<Allocator>(&mut memory)
+  let mut bytes = List<u8>.make()
+  run bytes.append(10) |> Effect.provideMut<Allocator>(&mut memory)
+  run bytes.append(20) |> Effect.provideMut<Allocator>(&mut memory)
+  let view = run HeapCell.allocate(HeapKind.Auxiliary, BorrowedView { bytes: move bytes }) |> Effect.provideMut<Allocator>(&mut memory)
+  let backing = unsafe HeapCell.payloadMut<BorrowedView, ()>(&mut anchor, view)
+  let dataPointer = Pointer.fromMutRef<u8>(&mut backing.bytes.asMutSlice()[0])
+  drop backing
+  let cache = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, reference(typed))
+  cache.payload = ObjectPayload.TypedArray { array: TypedArrayCache { view: view, shared: false, cachedData: dataPointer, count: 2, requiresExtensible: false } }
+  drop cache
+  let inputs: [Value; 4] = [array, mapped, boxed, typed]
+  let lengths: [usize; 4] = [3, 2, 3, 2]
+  i = 0
+  while i < 4 {
+    let result = run unsafe names.getOwnPropertyNames(&mut hooks, ctx, inputs[i], 17) |> Effect.provideMut<Allocator>(&mut memory)
+    run Testing.expect(result.length() == lengths[i], "cached counts and boxed UTF-16 code-unit length supply implicit keys")
+    let mut j: usize = 0
+    while j < result.length() {
+      run Testing.expect(result.get(j).atom == (usize.toU32(j) | 0x80000000) && result.get(j).isEnumerable,
+        "implicit keys are ascending enumerable immediate atoms; uninitialized fast mapped cells are not read")
+      j = j + 1
+    }
+    unsafe names.releaseNames(rt, move result)
+    i = i + 1
+  }
+  let detach = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, reference(typed))
+  detach.payload = ObjectPayload.Empty
+  drop detach
+  unsafe HeapCell.destroy<BorrowedView>(view)
+  run unsafe arrays.convertFastToSlow(&mut hooks, ctx, reference(mapped)) |> Effect.provideMut<Allocator>(&mut memory)
+  let slow = run unsafe collectNames(&mut hooks, ctx, mapped, 1) |> Effect.provideMut<Allocator>(&mut memory)
+  let slowError = run Effect.catch<OwnKeysError>(unsafe captureName(&mut hooks, ctx, mapped, 33), uninitialized)
+    |> Effect.provideMut<Allocator>(&mut memory)
+  match move slowError {
+    Option<StringOwner>.Some { value } => {
+      run Testing.expect(Strings.length(value.get()) == 1 && Strings.codeUnit(value.get(), 0) == 48,
+        "slow mapped arguments now inspect their varrefs and own a printable immediate-index name")
+    }
+    Option<StringOwner>.None => { run Testing.expect(false, "slow mapped binding is still uninitialized") }
+  }
+  run Testing.expect(slow && hooks.eventCount == 0, "registered exotic table without ownKeys never dispatches a fallback")
+  i = 0
+  while i < 4 { unsafe gc.release(&mut hooks, rt, inputs[i]) i = i + 1 }
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx)
+  run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observer.stats().usedBytes == 0, "implicit keys require no per-element ownership and borrowed cache teardown is real")
+}
+
+test effect fn attachedOwnBindingReadsCurrentFrameSlotRatherThanDetachedStorage() -> ()
+  ! OutOfMemoryError | StringLengthError | OwnKeysError | JsException | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe storage.context(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make()
+  let object = run unsafe objects.withPrototype(&mut hooks, &observer, ctx, Value.Null) |> Effect.provideMut<Allocator>(&mut memory)
+  let atom = run unsafe fixture.atom(rt, b"attached", 0) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut local = Value.Uninitialized
+  let mut cached = Pointer.null<HeapHeader>()
+  let slot = Pointer.fromMutRef<Value>(&mut local)
+  let mut frame = StackFrame { previous: Pointer.null<StackFrame>(), asyncOwner: Pointer.null<HeapHeader>(),
+    currentFunction: Value.Undefined, arguments: FrameSlots.Borrowed { data: slot, length: 0 },
+    locals: FrameSlots.Borrowed { data: slot, length: 1 }, stack: FrameSlots.Borrowed { data: slot, length: 0 },
+    varRefs: FrameReferences.Borrowed { data: Pointer.fromMutRef<?*mut HeapHeader>(&mut cached), length: 1 },
+    currentPc: Option<usize>.none(), argumentCount: 0, mode: 0, stackPointer: Option<usize>.none() }
+  let cell = run HeapCell.allocate(HeapKind.VarRef, VarRef { isLexical: false, isConst: false,
+    state: VarRefState.Attached { frame: Pointer.fromMutRef<StackFrame>(&mut frame), slot: FrameSlot.Local { index: 0 }, varRefIndex: 0 } })
+    |> Effect.provideMut<Allocator>(&mut memory)
+  cached = cell
+  unsafe gc.publish(rt, cell)
+  run unsafe fixture.add(&mut hooks, rt, object, atom, 36, PropertySlot.VarRef { reference: cell }) |> Effect.provideMut<Allocator>(&mut memory)
+  unsafe fixture.releaseAtom(rt, atom)
+  let first = run Effect.catch<OwnKeysError>(unsafe captureName(&mut hooks, ctx, object, 17), uninitialized)
+    |> Effect.provideMut<Allocator>(&mut memory)
+  match move first {
+    Option<StringOwner>.Some { value } => { run Testing.expect(Strings.length(value.get()) == 8, "attached TDZ reports its binding name") }
+    Option<StringOwner>.None => { run Testing.expect(false, "attached frame sentinel must throw") }
+  }
+  let old = unsafe varRefs.replace(cell, Value.Int { value: 42 })
+  let initialized = run unsafe collectNames(&mut hooks, ctx, object, 17) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(initialized && match old { Value.Uninitialized => true _ => false },
+    "enumeration rereads the live frame after initialization")
+  unsafe gc.release(&mut hooks, rt, object)
+  run Testing.expect(Pointer.isNull<HeapHeader>(cached), "property owns and releases the attached cell and clears its frame cache")
+  drop frame
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx)
+  run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observer.stats().usedBytes == 0, "attached name lookup does not leak frame or atom ownership")
+}
+
+test effect fn numericOrderingNeedsOnlyTheResultAllocationAndEmptyKeysNeedNone() -> ()
+  ! OutOfMemoryError | StringLengthError | OwnKeysError | JsException | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe storage.context(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make()
+  let object = run unsafe objects.withPrototype(&mut hooks, &observer, ctx, Value.Null) |> Effect.provideMut<Allocator>(&mut memory)
+  let empty = run unsafe objects.withPrototype(&mut hooks, &observer, ctx, Value.Null) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut i: u32 = 32
+  while i > 0 {
+    i = i - 1
+    run unsafe fixture.add(&mut hooks, rt, object, i | 0x80000000, 7, PropertySlot.Value { value: Value.Undefined })
+      |> Effect.provideMut<Allocator>(&mut memory)
+  }
+  let mut fault = FaultAllocator { parent: move memory, remaining: 1 }
+  let ordered = run unsafe names.getOwnPropertyNames(&mut hooks, ctx, object, 1) |> Effect.provideMut<Allocator>(&mut fault)
+  run Testing.expect(ordered.length() == 32 && fault.remaining == 0, "descending numeric keys allocate only their final result storage")
+  i = 0
+  while i < 32 {
+    run Testing.expect(ordered.get(u32.toUsize(i)).atom == (i | 0x80000000), "in-place sort produces ascending keys without scratch storage")
+    i = i + 1
+  }
+  unsafe names.releaseNames(rt, move ordered)
+  let zero = run unsafe names.getOwnPropertyNames(&mut hooks, ctx, empty, 7) |> Effect.provideMut<Allocator>(&mut fault)
+  run Testing.expect(zero.length() == 0, "empty native enumeration has no incidental allocation")
+  unsafe names.releaseNames(rt, move zero)
+  unsafe gc.release(&mut hooks, rt, object)
+  unsafe gc.release(&mut hooks, rt, empty)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx)
+  run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut fault)
+  run Testing.expect(observer.stats().usedBytes == 0, "sorting and empty-result ownership fully release")
+}

@@ -1,0 +1,184 @@
+//! Native-only lifetime proof: scoped cancellation, failed recipient broadcasts,
+//! abandoned callbacks, native allocation failures, and independent zero ledgers.
+//! The matching C tool hangs in these teardown cases; do not label them parity.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.usize
+import js_atomics_native { Domain, WaiterDomain, SynchronizationError }
+import js_runtime_registry { ClassIdAllocator }
+import js_libc_process { Process }
+import js_libc { Session }
+import js_libc as libc
+import js_value { Value }
+import js_heap { HeapHeader }
+import js_core_types { NativeFunctionId }
+import js_buffer_storage as buffers
+import js_shared_memory as sharedMemory
+import js_intl_common as common
+import js_intrinsic_install_support as globals
+import js_proxy_core as core
+import js_exceptions { JsException }
+import js_eval as evaluation
+import js_gc as gc
+import js_std_native as output
+import js_os_events_platform as clock
+import js_os_workers_resources { Snapshot }
+import runtime_memory { RuntimeAllocator }
+import test262_host as host
+import test262_agent_native as agentNative
+
+fn empty(value: Snapshot) -> bool {
+  return value.blocks == 0 && value.bytes == 0 && value.sharedBlocks == 0 && value.pipes == 0 &&
+    value.messages == 0 && value.groups == 0 && value.childNodes == 0 && value.startPackets == 0 &&
+    value.descriptors == 0 && value.threads == 0
+}
+unsafe effect fn evaluate<'m>(session: &mut Session<'m>, source: &[u8]) -> bool ? &mut Allocator {
+  let memory = session.engine.memory
+  let result = run Effect.result(unsafe evaluation.evaluate(&mut session.engine, memory, session.context, source, b"<host-lifetime>", 0))
+  match move result { Result<Value, JsException>.Success { value } => {
+    unsafe gc.release(&mut session.engine, session.runtime, value) return true
+  } Result<Value, JsException>.Failure { .. } => {
+    run unsafe libc.dumpError(&mut session.engine, session.context) return false
+  } }
+}
+fn waitHelper() -> &'static [u8] { return b"function next(){var end=$262.agent.monotonicNow()+10000;for(;;){var r=$262.agent.getReport();if(r!==null)return r;if($262.agent.monotonicNow()>end)throw Error('report timeout');$262.agent.sleep(1)}}" }
+unsafe effect fn externalObject<'m>(session: &mut Session<'m>, name: &[u8], data: ?*mut u8, length: u64) -> *mut HeapHeader ! JsException ? &mut Allocator {
+  let memory = session.engine.memory
+  let value = run unsafe buffers.newArrayBuffer(&mut session.engine, memory, session.context, data, length,
+    Option<NativeFunctionId>.none(), Pointer.null<u8>(), false)
+  let object = core.reference(value)
+  run unsafe common.define(&mut session.engine, session.context, unsafe globals.global(session.context), name, value, 7)
+  return object
+}
+// External bytes remain host-owned and retain their exact address. The host uses
+// canonical atomic accesses once published; JS pins keep only wrapper roots,
+// never a second copy of external bytes or a cross-thread JavaScript pointer.
+effect fn externalCases(domain: Domain, process: &Process) -> bool ! OutOfMemoryError | JsException {
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider()) let memory = run allocator.observe()
+  let mut session = run unsafe Session.openCore(&memory, domain, process, 2047) |> Effect.provideMut<Allocator>(&mut allocator)
+  run unsafe host.install(&mut session, Pointer.null<output.File>()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let resources = host.resources(&session.engine)
+  let mut bytes: [u64; 2] = [0; 2] let mut other: [u64; 2] = [0; 2]
+  let data = unsafe Intrinsic.pointerReinterpret<*mut u64, *mut u8>(Pointer.fromMutRef(&mut bytes[0]))
+  let otherData = unsafe Intrinsic.pointerReinterpret<*mut u64, *mut u8>(Pointer.fromMutRef(&mut other[0]))
+  unsafe Pointer.write<u8>(data, 7) unsafe Pointer.write<u8>(otherData, 61)
+  let object = run unsafe externalObject(&mut session, b"external", data, 16) |> Effect.provideMut<Allocator>(&mut allocator)
+  let rollback = run unsafe externalObject(&mut session, b"rollback", otherData, 16) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut ok = run unsafe evaluate(&mut session, waitHelper()) |> Effect.provideMut<Allocator>(&mut allocator)
+  ok = (run unsafe evaluate(&mut session, b"var marker={};try{$262.agent.broadcast(rollback,{valueOf(){throw marker}});throw Error('coercion did not throw')}catch(e){if(e!==marker)throw e}$262.detachArrayBuffer(rollback);if(rollback.byteLength!==0)throw Error('failed broadcast pin leaked');") |> Effect.provideMut<Allocator>(&mut allocator)) && ok
+  let emptyRecipient = run unsafe externalObject(&mut session, b"emptyRecipient", otherData, 16) |> Effect.provideMut<Allocator>(&mut allocator)
+  ok = (run unsafe evaluate(&mut session, b"$262.agent.broadcast(emptyRecipient,0);$262.detachArrayBuffer(emptyRecipient);if(emptyRecipient.byteLength!==0)throw Error('zero-recipient pin leaked');") |> Effect.provideMut<Allocator>(&mut allocator)) && ok
+  let unaligned = unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(otherData), 1)
+  let invalid = run unsafe externalObject(&mut session, b"unaligned", unaligned, 7) |> Effect.provideMut<Allocator>(&mut allocator)
+  ok = (run unsafe evaluate(&mut session, b"var rejected=false;try{$262.agent.broadcast(unaligned,{valueOf(){throw Error('unexpected coercion')}})}catch(e){rejected=e instanceof TypeError}if(!rejected)throw Error('external alignment');$262.detachArrayBuffer(unaligned);") |> Effect.provideMut<Allocator>(&mut allocator)) && ok
+  ok = (run unsafe evaluate(&mut session, b"var weak=new WeakRef(external);var control=new SharedArrayBuffer(4);$262.agent.start(\"var held;$262.agent.receiveBroadcast(function(b){held=new Uint8Array(b);if(held[0]!==7)throw Error('external initial alias');held[1]=19;Promise.resolve().then(function(){$262.agent.receiveBroadcast(function(){if(held[2]!==33)throw Error('host write lost');held[3]=44;$262.agent.report('alias')});$262.agent.report('held')})})\");$262.agent.broadcast(external,1);if(next()!=='held')throw Error('external readiness');") |> Effect.provideMut<Allocator>(&mut allocator)) && ok
+  let snapshot = unsafe buffers.snapshot(object)
+  if Pointer.address<u8>(snapshot.data) != Pointer.address<u8>(data) || !snapshot.external || snapshot.shared { ok = false }
+  if snapshot.physicalCapacity == 0 { ok = false }
+  else {
+    let span = buffers.memorySpan(snapshot)
+    if unsafe sharedMemory.loadByte(span, 1) != 19 { ok = false }
+    unsafe sharedMemory.storeByte(span, 2, 33)
+  }
+  ok = (run unsafe evaluate(&mut session, b"external=null;") |> Effect.provideMut<Allocator>(&mut allocator)) && ok
+  run unsafe gc.collect(&mut session.engine, session.runtime, true) |> Effect.provideMut<Allocator>(&mut allocator)
+  ok = (run unsafe evaluate(&mut session, b"var live=weak.deref();if(!live||live.byteLength!==16)throw Error('external pin did not survive GC');for(var operation of [()=> $262.detachArrayBuffer(live),()=>live.transfer(0),()=>live.transfer()]){var caught=false;try{operation()}catch(e){caught=e instanceof TypeError}if(!caught)throw Error('external detach/transfer bypass')}live=null;$262.agent.broadcast(control,2);if(next()!=='alias')throw Error('external alias report');") |> Effect.provideMut<Allocator>(&mut allocator)) && ok
+  if snapshot.physicalCapacity != 0 && unsafe sharedMemory.loadByte(buffers.memorySpan(snapshot), 3) != 44 { ok = false }
+  // Recursive publication commits the same pin while the outer coercion fails.
+  let recursive = run unsafe externalObject(&mut session, b"recursive", otherData, 16) |> Effect.provideMut<Allocator>(&mut allocator)
+  ok = (run unsafe evaluate(&mut session, b"$262.agent.start(\"$262.agent.receiveBroadcast(function(b,n){if(new Uint8Array(b)[0]!==61||n!==5)throw Error('recursive alias');$262.agent.report('recursive')})\");try{$262.agent.broadcast(recursive,{valueOf(){$262.agent.broadcast(recursive,5);throw marker}})}catch(e){if(e!==marker)throw e}if(next()!=='recursive')throw Error('recursive publication');var caught=false;try{$262.detachArrayBuffer(recursive)}catch(e){caught=e instanceof TypeError}if(!caught)throw Error('outer rollback dropped inner pin');") |> Effect.provideMut<Allocator>(&mut allocator)) && ok
+  let zero = run unsafe externalObject(&mut session, b"zeroExternal", Pointer.null<u8>(), 0) |> Effect.provideMut<Allocator>(&mut allocator)
+  ok = (run unsafe evaluate(&mut session, b"$262.agent.start(\"$262.agent.receiveBroadcast(function(b){if(b.byteLength!==0)throw Error('empty external alias');$262.agent.report('empty')})\");$262.agent.broadcast(zeroExternal,0);if(next()!=='empty')throw Error('empty external report');") |> Effect.provideMut<Allocator>(&mut allocator)) && ok
+  // Mailboxes are preallocated at start: fanout itself has no failing allocation.
+  // The one-shot refusal must instead strike a child's report AFTER both
+  // recipients have received the exact borrowed bytes and committed the pin.
+  let mut fanoutBytes: [u64; 2] = [0; 2]
+  let fanoutData = unsafe Intrinsic.pointerReinterpret<*mut u64, *mut u8>(Pointer.fromMutRef(&mut fanoutBytes[0]))
+  unsafe Pointer.write<u8>(fanoutData, 73)
+  let fanout = run unsafe externalObject(&mut session, b"fanoutExternal", fanoutData, 16) |> Effect.provideMut<Allocator>(&mut allocator)
+  ok = (run unsafe evaluate(&mut session, b"var source=\"$262.agent.receiveBroadcast(function(b){var a=new Uint8Array(b);if(Atomics.load(a,0)!==73)throw Error('fanout alias');Atomics.add(a,1,1);$262.agent.report('fanout-report')});$262.agent.report('fanout-ready')\";$262.agent.start(source);$262.agent.start(source);if(next()!=='fanout-ready'||next()!=='fanout-ready')throw Error('fanout readiness');var fanoutWeak=new WeakRef(fanoutExternal);") |> Effect.provideMut<Allocator>(&mut allocator)) && ok
+  let failedBefore = host.workerFailures(&session.engine)
+  let allocationFailures = resources.snapshot().failures
+  resources.failAfter(0)
+  ok = (run unsafe evaluate(&mut session, b"$262.agent.broadcast(fanoutExternal,0);var deadline=$262.agent.monotonicNow()+10000;while(Atomics.load(new Uint8Array(fanoutExternal),1)!==2){if($262.agent.monotonicNow()>deadline)throw Error('partial fanout');$262.agent.sleep(1)}if(next()!=='fanout-report')throw Error('surviving recipient');fanoutExternal=null;") |> Effect.provideMut<Allocator>(&mut allocator)) && ok
+  resources.failAfter(usize.MAX)
+  let failureDeadline = clock.nowNanoseconds() + 10000000000
+  while host.workerFailures(&session.engine) == failedBefore && clock.nowNanoseconds() < failureDeadline {
+    unsafe agentNative.sleep(host.state(&session.engine).group, 1)
+  }
+  if host.workerFailures(&session.engine) != failedBefore + 1 || resources.snapshot().failures != allocationFailures + 1 { ok = false }
+  if !unsafe host.externalPinned(&session.engine, Value.Object { reference: fanout }) { ok = false }
+  if Pointer.address<u8>((unsafe buffers.snapshot(fanout)).data) != Pointer.address<u8>(fanoutData) { ok = false }
+  run unsafe gc.collect(&mut session.engine, session.runtime, true) |> Effect.provideMut<Allocator>(&mut allocator)
+  ok = (run unsafe evaluate(&mut session, b"if(!fanoutWeak.deref())throw Error('post-publication failure released pin');") |> Effect.provideMut<Allocator>(&mut allocator)) && ok
+  unsafe host.shutdown(&mut session)
+  run unsafe session.close() |> Effect.provideMut<Allocator>(&mut allocator) drop session
+  if !empty(resources.snapshot()) || memory.stats().allocationCount != 0 || memory.stats().usedBytes != 0 { ok = false }
+  return ok
+}
+pub effect fn main() -> i32 ! OutOfMemoryError | SynchronizationError | JsException {
+  let mut system = Allocator.systemAllocatorProvider()
+  let domain = run WaiterDomain.make() |> Effect.provideMut<Allocator>(&mut system)
+  let namespace = run ClassIdAllocator.make() |> Effect.provideMut<Allocator>(&mut system)
+  let process = run Process.make(&namespace)
+  let externalOk = run externalCases(domain.handle(), &process)
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider()) let memory = run allocator.observe()
+  let mut first = run unsafe Session.openCore(&memory, domain.handle(), &process, 2047) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut second = run unsafe Session.openCore(&memory, domain.handle(), &process, 2047) |> Effect.provideMut<Allocator>(&mut allocator)
+  run unsafe host.install(&mut first, Pointer.null<output.File>()) |> Effect.provideMut<Allocator>(&mut allocator)
+  run unsafe host.install(&mut second, Pointer.null<output.File>()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let firstResources = host.resources(&first.engine) let secondResources = host.resources(&second.engine)
+  let mut ok = run unsafe evaluate(&mut first, waitHelper()) |> Effect.provideMut<Allocator>(&mut allocator)
+  ok = ok && externalOk
+  ok = (run unsafe evaluate(&mut second, waitHelper()) |> Effect.provideMut<Allocator>(&mut allocator)) && ok
+  ok = (run unsafe evaluate(&mut first, b"print({toString(){throw Error('must not coerce ignored object')}},'Test262:AsyncTestComplete\\0trailing')") |> Effect.provideMut<Allocator>(&mut allocator)) && ok
+  if host.asyncDone(&first.engine) != 1 || host.asyncDone(&second.engine) != 0 { ok = false }
+  ok = (run unsafe evaluate(&mut first, b"print('Test262:AsyncTestFailure: deliberate');print('Test262:AsyncTestComplete')") |> Effect.provideMut<Allocator>(&mut allocator)) && ok
+  if host.asyncDone(&first.engine) != 3 { ok = false }
+  host.resetDone(&mut first.engine)
+  ok = (run unsafe evaluate(&mut second, b"var cells=new Int32Array(new SharedArrayBuffer(8));$262.agent.start(\"$262.agent.receiveBroadcast(function(b){var a=new Int32Array(b);$262.agent.report('waiting');var status=Atomics.wait(a,0,0);$262.agent.report(status)})\");$262.agent.broadcast(cells.buffer,0);if(next()!=='waiting')throw Error('second readiness');") |> Effect.provideMut<Allocator>(&mut allocator)) && ok
+  ok = (run unsafe evaluate(&mut first, b"$262.agent.start(\"$262.agent.receiveBroadcast(function(b){$262.agent.report('wait');Atomics.wait(new Int32Array(b),0,0)})\");$262.agent.broadcast(new SharedArrayBuffer(4),0);if(next()!=='wait')throw Error('first readiness');$262.agent.start(\"$262.agent.report('spin');while(true){}\");if(next()!=='spin')throw Error('spin readiness');$262.agent.start(\"$262.agent.report('sleep');$262.agent.sleep(1000000)\");if(next()!=='sleep')throw Error('sleep readiness');$262.agent.start(\"$262.agent.receiveBroadcast(()=>{});$262.agent.report('callback')\");if(next()!=='callback')throw Error('callback readiness');") |> Effect.provideMut<Allocator>(&mut allocator)) && ok
+  let before = clock.nowNanoseconds()
+  unsafe host.shutdown(&mut first)
+  run unsafe first.close() |> Effect.provideMut<Allocator>(&mut allocator) drop first
+  if clock.nowNanoseconds() - before > 10000000000 || !empty(firstResources.snapshot()) { ok = false }
+  // A poisoned shared waiter domain would make the unrelated waiter return
+  // without notification, and no notify could observe its live waiter afterward.
+  ok = (run unsafe evaluate(&mut second, b"if($262.agent.getReport()!==null)throw Error('unrelated scope cancelled');var end=$262.agent.monotonicNow()+10000;while(Atomics.notify(cells,0,1)!==1){if($262.agent.monotonicNow()>end)throw Error('unrelated waiter retired');$262.agent.sleep(1)}if(next()!=='ok')throw Error('unrelated wait result');") |> Effect.provideMut<Allocator>(&mut allocator)) && ok
+  unsafe host.shutdown(&mut second)
+  run unsafe second.close() |> Effect.provideMut<Allocator>(&mut allocator) drop second
+  if !empty(secondResources.snapshot()) || memory.stats().allocationCount != 0 || memory.stats().usedBytes != 0 { ok = false }
+  // A source exception may race either side of publication/acknowledgement.
+  let mut iteration: usize = 0
+  while iteration < 16 {
+    let mut session = run unsafe Session.openCore(&memory, domain.handle(), &process, 2047) |> Effect.provideMut<Allocator>(&mut allocator)
+    run unsafe host.install(&mut session, Pointer.null<output.File>()) |> Effect.provideMut<Allocator>(&mut allocator)
+    let resources = host.resources(&session.engine)
+    ok = (run unsafe evaluate(&mut session, b"$262.agent.start('throw Error(\"intentional worker failure\")');$262.agent.broadcast(new SharedArrayBuffer(4),0);") |> Effect.provideMut<Allocator>(&mut allocator)) && ok
+    unsafe host.shutdown(&mut session)
+    run unsafe session.close() |> Effect.provideMut<Allocator>(&mut allocator) drop session
+    if !empty(resources.snapshot()) || memory.stats().allocationCount != 0 || memory.stats().usedBytes != 0 { ok = false }
+    iteration = iteration + 1
+  }
+  // Inject at every actual native acquisition edge, not a simulated JS error.
+  let mut ordinal: usize = 0 let mut completed = false
+  while ordinal < 32 {
+    let mut session = run unsafe Session.openCore(&memory, domain.handle(), &process, 2047) |> Effect.provideMut<Allocator>(&mut allocator)
+    run unsafe host.install(&mut session, Pointer.null<output.File>()) |> Effect.provideMut<Allocator>(&mut allocator)
+    let resources = host.resources(&session.engine) resources.failAfter(ordinal)
+    ok = (run unsafe evaluate(&mut session, b"try{$262.agent.start('$262.agent.report(\"owned report\")')}catch(e){if(!(e instanceof Error))throw e}") |> Effect.provideMut<Allocator>(&mut allocator)) && ok
+    resources.failAfter(usize.MAX)
+    unsafe host.shutdown(&mut session)
+    run unsafe session.close() |> Effect.provideMut<Allocator>(&mut allocator) drop session
+    let snapshot = resources.snapshot()
+    if !empty(snapshot) || memory.stats().allocationCount != 0 || memory.stats().usedBytes != 0 { ok = false }
+    if snapshot.failures == 0 { completed = true break }
+    ordinal = ordinal + 1
+  }
+  if !completed || !ok { return 1 }
+  let written = unsafe output.write(unsafe output.output(), b"test262-host: external-pins scoped-cancellation failure-race native-faults zero-ledgers PASS\n")
+  return 0
+}

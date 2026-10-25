@@ -1,0 +1,138 @@
+//! BigInt callbacks, quickjs.c:59635-59821. Prototype is ordinary, not boxed.
+//! Source locale fallback deliberately accepts the toString radix argument.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.slice { Slice }
+import silk.list { List }
+import silk.i32
+import silk.u32
+import silk.u64
+import silk.usize
+import runtime_memory { AllocationObserver }
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types { FrameSlots, NativeFunctionId, BuiltinFamily, NativeCallProtocol }
+import js_gc { HeapHooks }
+import js_coercion_host { CoercionHooks }
+import js_native_function_host { NativeFunctionHooks }
+import js_exceptions { JsException }
+import js_string_types { StringLengthError }
+import js_strings { Strings }
+import js_bigint { BigInt, BigIntError, BIGINT_MAX_LIMBS }
+import js_bigint_text { BigIntText }
+import js_bigint_coercions as bigint
+import js_integer_coercions as integer
+import js_function_intrinsics_support as shared
+import js_function_intrinsics_support { Roots }
+import js_number_intrinsics_support as support
+import js_proxy_core as proxy
+import js_class_data as classes
+import dtoa { Dtoa }
+
+pub const CONSTRUCTOR: u32 = 0
+pub const AS_UINT_N: u32 = 1
+pub const AS_INT_N: u32 = 2
+pub const TO_STRING: u32 = 3
+pub const TO_LOCALE_STRING: u32 = 4
+pub const VALUE_OF: u32 = 5
+pub const METHOD_COUNT: u32 = 6
+pub fn nativeId(method: u32) -> NativeFunctionId { require(method < METHOD_COUNT) return NativeFunctionId.Builtin { family: BuiltinFamily.BigInt, method: method } }
+pub fn name(method: u32) -> &'static [u8] { return match method { 0 => b"BigInt" 1 => b"asUintN" 2 => b"asIntN" 3 => b"toString" 4 => b"toLocaleString" 5 => b"valueOf" _ => shared.invariant() } }
+pub fn length(method: u32) -> i32 { require(method < METHOD_COUNT) if method == CONSTRUCTOR { return 1 } if method == AS_UINT_N || method == AS_INT_N { return 2 } return 0 }
+pub fn protocol(method: u32) -> NativeCallProtocol { require(method < METHOD_COUNT) if method == CONSTRUCTOR { return NativeCallProtocol.ConstructorOrFunction } if method == AS_UINT_N || method == AS_INT_N { return NativeCallProtocol.GenericMagic } return NativeCallProtocol.Generic }
+pub fn magic(method: u32) -> i32 { require(method < METHOD_COUNT) if method == AS_INT_N { return 1 } return 0 }
+fn word(value: i32) -> u32 { if value < 0 { return i32.toU32(-(value + 1)) ^ 0xffffffff } return i32.toU32(value) }
+fn signedWord(value: u32) -> i32 { if value >= 0x80000000 { return -1 - u32.toI32(value ^ 0xffffffff) } return u32.toI32(value) }
+effect fn shortTruncate(value: i32, bits: u64, signed: bool) -> Value ! OutOfMemoryError | BigIntError ? &mut Allocator {
+  if bits >= 32 && (signed || value >= 0) { return Value.ShortBigInt { value: value } }
+  if bits < 32 {
+    let width = u64.toU32(bits)
+    let mask = u32.shiftLeft(1, width) - 1
+    let mut result = word(value) & mask
+    if signed && (result & u32.shiftLeft(1, width - 1)) != 0 { result = result | (mask ^ 0xffffffff) }
+    return Value.ShortBigInt { value: signedWord(result) }
+  }
+  // Only unsigned negative short values need allocation. Populate the final
+  // result directly rather than allocating a temporary BigInt for one limb.
+  if bits > usize.toU64(BIGINT_MAX_LIMBS) * 32 { fail BigIntError.TooLarge }
+  let n = u64.toUsize((bits + 31) / 32)
+  let mut limbs = List<u32>.make()
+  run limbs.reserveExact(n + 1)
+  run limbs.append(word(value))
+  let mut index: usize = 1
+  while index < n { run limbs.append(0xffffffff) index = index + 1 }
+  let width = u64.toU32((bits - 1) % 32 + 1)
+  if width < 32 {
+    let last = limbs.get(n - 1) & (u32.shiftLeft(1, width) - 1)
+    limbs.set(n - 1, last)
+  }
+  if (limbs.get(n - 1) & 0x80000000) != 0 { run limbs.append(0) }
+  return run bigint.compact(run BigInt.fromOwnedLimbs(move limbs))
+}
+unsafe effect fn truncate(value: Value, bits: u64, signed: bool) -> Value ! OutOfMemoryError | BigIntError ? &mut Allocator {
+  if bits == 0 { return Value.ShortBigInt { value: 0 } }
+  match value {
+    Value.ShortBigInt { value: small } => { return run shortTruncate(small, bits, signed) }
+    Value.BigInt { reference } => {
+      let anchor = () let big = unsafe HeapCell.payload<BigInt, ()>(&anchor, reference)
+      if bits >= usize.toU64(big.length()) * 32 && (signed || !big.negative()) { return unsafe value.retained() }
+      return run bigint.compact(run big.truncateBits(bits, signed))
+    }
+    _ => shared.invariant()
+  }
+}
+unsafe effect fn text(value: Value, base: u32) -> Value ! OutOfMemoryError | StringLengthError | BigIntError ? &mut Allocator {
+  match value {
+    Value.ShortBigInt { value: small } => {
+      let mut bytes: [u8; 70] = [0; 70]
+      let count = Dtoa.i64toaRadix(&mut bytes, i32.toI64(small), base)
+      return run Strings.fromLatin1(Slice.view<u8>(&bytes, 0, count))
+    }
+    Value.BigInt { reference } => {
+      let anchor = () let big = unsafe HeapCell.payload<BigInt, ()>(&anchor, reference)
+      let bytes = run BigIntText.format(big, base)
+      return run Strings.fromLatin1(bytes.asSlice())
+    }
+    _ => shared.invariant()
+  }
+}
+unsafe effect fn body<H: HeapHooks + CoercionHooks + NativeFunctionHooks>(hooks: &mut H, context: *mut HeapHeader, method: u32, receiver: Value, argv: &FrameSlots, roots: &mut Roots) -> Value ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  let arg = unsafe shared.argument(argv, 0)
+  if method == CONSTRUCTOR {
+    if !shared.undefined(receiver) { return run unsafe proxy.throwNotConstructor(&mut hooks, context, receiver) }
+    return run unsafe bigint.toBigIntCtorFree(&mut hooks, context, unsafe arg.retained())
+  }
+  if method == AS_UINT_N || method == AS_INT_N {
+    let mut bits: u64 = 0
+    run unsafe integer.toIndex(&mut hooks, context, &mut bits, arg)
+    roots.values[0] = run unsafe bigint.toBigInt(&mut hooks, context, unsafe shared.argument(argv, 1))
+    if roots.values[0].isException() { fail JsException {} }
+    return run unsafe truncate(roots.values[0], bits, method == AS_INT_N)
+  }
+  roots.values[0] = run unsafe support.thisValue(&mut hooks, context, receiver, classes.JS_CLASS_BIG_INT)
+  if method == VALUE_OF { return roots.take(0) }
+  if method == TO_LOCALE_STRING {
+    match unsafe support.locale(context, true) {
+      Option<NativeFunctionId>.Some { value } => { return run unsafe hooks.nativeGeneric(value, context, roots.values[0], usize.toI32(argv.length()), argv) }
+      _ => ()
+    }
+  }
+  let mut base: i32 = 10
+  if !shared.undefined(arg) { base = run unsafe support.radix(&mut hooks, context, arg) }
+  return run unsafe text(roots.values[0], i32.toU32(base))
+}
+pub unsafe effect fn dispatch<H: HeapHooks + CoercionHooks + NativeFunctionHooks>(hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, method: u32, receiver: Value, argv: &FrameSlots, magic: i32) -> Value ! JsException ? &mut Allocator {
+  require(method < METHOD_COUNT)
+  let mut roots = Roots.make()
+  let result = run Effect.result(unsafe body(&mut hooks, context, method, receiver, argv, &mut roots))
+  let value = match move result {
+    Result<Value, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { value } => value
+    Result<Value, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => run Effect.catch<JsException>(unsafe support.materialize(&mut hooks, context, move error), shared.exceptionValue)
+  }
+  unsafe roots.clear(&mut hooks, context)
+  if value.isException() { fail JsException {} }
+  return value
+}
+fn require(condition: bool) -> () { if !condition { Intrinsic.trap("QuickJS invariant violated") } }

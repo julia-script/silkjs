@@ -1,0 +1,177 @@
+//! Global binding property entry points, quickjs.c:10922-11028. These preserve
+//! lexical TDZ/const checks and use the real HasProperty/exotic deletion kernels.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.option { Option }
+import silk.result { Result }
+import silk.u8
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types { ContextState, RuntimeState, ObjectData, ShapeData, PropertySlot,
+  NativeErrorKind, JS_PROP_CONFIGURABLE, JS_PROP_WRITABLE, JS_PROP_ENUMERABLE,
+  JS_PROP_TMASK, JS_PROP_GETSET }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_shapes as shapes
+import js_var_refs as varRefs
+import js_property_host { OwnPropertyHooks, HasPropertyHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_coercion_host { CoercionHooks }
+import js_property_queries as queries
+import js_property_mutations as mutations
+import js_parser_diagnostics { DiagnosticMessage }
+import js_string_types { StringLengthError }
+import js_exceptions { JsException }
+
+pub const DEFINE_GLOBAL_LEX_VAR: u32 = 128
+pub const DEFINE_GLOBAL_FUNC_VAR: u32 = 64
+fn trap() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+fn node(object: Value) -> *mut HeapHeader { return match object { Value.Object { reference } => reference _ => trap() } }
+unsafe fn global(context: *mut HeapHeader, lexical: bool) -> Value {
+  let anchor = () let ctx = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  if lexical { return ctx.globalVarObject } return ctx.globalObject
+}
+unsafe fn own(object: Value, atom: u32) -> Option<usize> {
+  let anchor = () let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node(object))
+  return unsafe shapes.lookup(p.shape, atom)
+}
+unsafe fn flags(object: Value, index: usize) -> u32 {
+  let anchor = () let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node(object))
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, p.shape)
+  return u8.toU32(shape.properties.get(index).flags)
+}
+unsafe effect fn error<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  atom: u32, redeclared: bool) -> never ! JsException ? &mut Allocator {
+  let mut message = DiagnosticMessage.make()
+  let mut kind = NativeErrorKind.Type
+  if redeclared { kind = NativeErrorKind.Syntax message.append(b"redeclaration of '") }
+  else { message.append(b"cannot define variable '") }
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, unsafe runtime.contextRuntime(context))
+  message.appendAtom(&state.atoms, atom) drop state message.append(b"'")
+  return run unsafe hooks.throwError(context, kind, message.bytes())
+}
+unsafe effect fn check<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  atom: u32, options: u32) -> () ! JsException ? &mut Allocator {
+  let object = unsafe global(context, false)
+  let found = unsafe own(object, atom)
+  if (options & DEFINE_GLOBAL_LEX_VAR) != 0 {
+    match move found {
+      Option<usize>.Some { value } => { if (unsafe flags(object, value) & JS_PROP_CONFIGURABLE) == 0 { return run unsafe error(&mut hooks, context, atom, true) } }
+      Option<usize>.None => ()
+    }
+  } else {
+    match move found {
+      Option<usize>.None => {
+        let anchor = () let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node(object))
+        let extensible = p.extensible drop p
+        if !extensible { return run unsafe error(&mut hooks, context, atom, false) }
+      }
+      Option<usize>.Some { value } => {
+        if (options & DEFINE_GLOBAL_FUNC_VAR) != 0 {
+          let current = unsafe flags(object, value)
+          if (current & JS_PROP_CONFIGURABLE) == 0 && ((current & JS_PROP_TMASK) == JS_PROP_GETSET || (current & (JS_PROP_WRITABLE | JS_PROP_ENUMERABLE)) != (JS_PROP_WRITABLE | JS_PROP_ENUMERABLE)) {
+            return run unsafe error(&mut hooks, context, atom, false)
+          }
+        }
+      }
+    }
+  }
+  match unsafe own(unsafe global(context, true), atom) {
+    Option<usize>.Some { .. } => { return run unsafe error(&mut hooks, context, atom, true) }
+    Option<usize>.None => ()
+  }
+}
+pub unsafe effect fn checkDefineGlobalVar<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, atom: u32, options: u32) -> () ! JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context) unsafe HeapCell.retain(context)
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let key = state.atoms.duplicate(atom) drop state
+  let result = run Effect.result(unsafe check(&mut hooks, context, atom, options))
+  unsafe mutations.releaseAtom(rt, key) unsafe gc.releaseHeader(&mut hooks, rt, context)
+  match move result { Result<(), JsException>.Success { .. } => () Result<(), JsException>.Failure { error } => { fail move error } }
+}
+effect fn exceptionKey(error: JsException) -> Value { drop error return Value.Exception }
+unsafe effect fn keyFailure<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  error: OutOfMemoryError | StringLengthError) -> Value ! JsException ? &mut Allocator {
+  match move error {
+    OutOfMemoryError allocation => { return run unsafe hooks.throwOutOfMemory(context) }
+    StringLengthError length => { return run unsafe hooks.throwError(context, NativeErrorKind.Internal, b"string too long") }
+  }
+}
+unsafe effect fn getReference<H: HeapHooks + OwnPropertyHooks + HasPropertyHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, rt: *mut HeapHeader, atom: u32) -> [Value; 2]
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let lexical = unsafe global(context, true)
+  let mut owner = Value.Undefined
+  match unsafe own(lexical, atom) {
+    Option<usize>.Some { value: index } => {
+      let anchor = () let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node(lexical))
+      let cell = match p.properties.get(index) { PropertySlot.VarRef { reference } => reference _ => trap() } drop p
+      if match unsafe varRefs.read(cell) { Value.Uninitialized => true _ => false } {
+        return run unsafe OwnPropertyHooks.throwUninitialized(&mut hooks, context, atom)
+      }
+      if (unsafe flags(lexical, index) & JS_PROP_WRITABLE) == 0 {
+        let mut message = DiagnosticMessage.make() message.append(b"'")
+        let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+        message.appendAtom(&state.atoms, atom) drop state message.append(b"' is read-only")
+        return run unsafe hooks.throwError(context, NativeErrorKind.Type, message.bytes())
+      }
+      owner = unsafe lexical.retained()
+    }
+    Option<usize>.None => {
+      if run unsafe queries.hasProperty(&mut hooks, context, unsafe global(context, false), atom) {
+        let currentGlobal = unsafe global(context, false)
+        owner = unsafe currentGlobal.retained()
+      }
+    }
+  }
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let converted = run Effect.result(state.atoms.toValue(atom, false)) drop state
+  return match move converted {
+    Result<Value, OutOfMemoryError | StringLengthError>.Success { value } => [owner, value]
+    Result<Value, OutOfMemoryError | StringLengthError>.Failure { error } => {
+      // JS_GetGlobalVarRef does not inspect AtomToValue's result. Its owned base
+      // survives a key-allocation failure, with Exception in the second slot.
+      let key = run Effect.catch<JsException>(unsafe keyFailure(&mut hooks, context, move error), exceptionKey)
+      return [owner, key]
+    }
+  }
+}
+/// Both returned entries transfer independent ownership, including Undefined.
+/// Atom-to-key allocation failure still succeeds with an Exception key and a
+/// pending error, matching the source's unchecked JS_AtomToValue result.
+pub unsafe effect fn getGlobalVarRef<H: HeapHooks + OwnPropertyHooks + HasPropertyHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, atom: u32) -> [Value; 2]
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context) unsafe HeapCell.retain(context)
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let key = state.atoms.duplicate(atom) drop state
+  let result = run Effect.result(unsafe getReference(&mut hooks, context, rt, atom))
+  unsafe mutations.releaseAtom(rt, key) unsafe gc.releaseHeader(&mut hooks, rt, context)
+  return match move result {
+    Result<[Value; 2], OutOfMemoryError | StringLengthError | JsException>.Success { value } => value
+    Result<[Value; 2], OutOfMemoryError | StringLengthError | JsException>.Failure { error } => { fail move error }
+  }
+}
+unsafe effect fn remove<H: HeapHooks + OwnPropertyHooks + HasPropertyHooks + PropertyWriteHooks>(hooks: &mut H,
+  context: *mut HeapHeader, atom: u32) -> bool ! OutOfMemoryError | JsException ? &mut Allocator {
+  match unsafe own(unsafe global(context, true), atom) {
+    Option<usize>.Some { .. } => { return false }
+    Option<usize>.None => ()
+  }
+  if !run unsafe queries.hasProperty(&mut hooks, context, unsafe global(context, false), atom) { return true }
+  return run unsafe mutations.deleteOwnProperty(&mut hooks, context, unsafe global(context, false), atom)
+}
+pub unsafe effect fn deleteGlobalVar<H: HeapHooks + OwnPropertyHooks + HasPropertyHooks + PropertyWriteHooks>(hooks: &mut H,
+  context: *mut HeapHeader, atom: u32) -> bool ! OutOfMemoryError | JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context) unsafe HeapCell.retain(context)
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let key = state.atoms.duplicate(atom) drop state
+  let result = run Effect.result(unsafe remove(&mut hooks, context, atom))
+  unsafe mutations.releaseAtom(rt, key) unsafe gc.releaseHeader(&mut hooks, rt, context)
+  return match move result {
+    Result<bool, OutOfMemoryError | JsException>.Success { value } => value
+    Result<bool, OutOfMemoryError | JsException>.Failure { error } => { fail move error }
+  }
+}

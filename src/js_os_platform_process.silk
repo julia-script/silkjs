@@ -1,0 +1,98 @@
+//! Source execvpe search and fork/exec/wait, without JavaScript or allocation in the child.
+//! Detached Worker lifetime does not cancel native waits or terminate children.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.list { List }
+import silk.pointer { Pointer }
+import silk.i32
+import silk.usize
+import js_os_platform as os
+pub const FORK_ERROR: i32 = -2147483648
+unsafe extern "C" fn fork() -> i32
+unsafe extern "C" fn execve(path: *const u8, argv: *const ?*const u8, env: *const ?*const u8) -> i32 with Intrinsic.foreign(noCapture: ("path", "argv", "env"))
+unsafe extern "C" fn execv(path: *const u8, argv: *const ?*const u8) -> i32 with Intrinsic.foreign(noCapture: ("path", "argv"))
+unsafe extern "C" fn getenv(name: *const u8) -> ?*mut u8 with Intrinsic.foreign(noCapture: ("name",))
+unsafe extern "C" fn setuid(uid: u32) -> i32
+unsafe extern "C" fn setgid(gid: u32) -> i32
+unsafe extern "C" fn sysconf(name: i32) -> i64
+unsafe extern "C" fn cExit(status: i32) -> () as "_exit"
+unsafe fn exitChild(status: i32) -> never {
+  unsafe cExit(status)
+  return Intrinsic.trap("_exit returned")
+}
+pub struct Options {
+  pub arguments: List<List<u8>>, pub environment: List<List<u8>>, pub customEnvironment: bool,
+  pub file: List<u8>, pub cwd: List<u8>, pub fds: [i32; 3], pub uid: u32, pub gid: u32,
+  pub block: bool, pub usePath: bool,
+}
+impl Options {
+  pub fn make() -> Self { return Self { arguments: List<List<u8>>.make(), environment: List<List<u8>>.make(), customEnvironment: false, file: List<u8>.make(), cwd: List<u8>.make(), fds: [0,1,2], uid: 0xffffffff, gid: 0xffffffff, block: true, usePath: true } }
+}
+unsafe fn execute(file: *const u8, args: *const ?*const u8, env: *const ?*const u8, custom: bool) -> i32 {
+  if custom { return unsafe execve(file, args, env) }
+  return unsafe execv(file, args)
+}
+unsafe fn search(file: *const u8, args: *const ?*const u8, env: *const ?*const u8, custom: bool) -> i32 {
+  let size = unsafe os.length(file)
+  if size == 0 { os.setErrno(2) return -1 }
+  let bytes = unsafe Pointer.assumeMany<u8>(file) let mut i: usize = 0
+  while i < size { if unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(bytes,i)) == 47 { return unsafe execute(file,args,env,custom) } i = i + 1 }
+  let variable = b"PATH\0" let defaultPath = b"/bin:/usr/bin\0"
+  let found = unsafe getenv(Pointer.fromRef(&variable[0]))
+  let mut path = Pointer.fromRef(&defaultPath[0])
+  if !Pointer.isNull<u8>(found) { path = unsafe Intrinsic.pointerRequalify<?*mut u8,*const u8>(found) }
+  let pathBytes = unsafe Pointer.assumeMany<u8>(path)
+  let mut start: usize = 0 let mut denied = false
+  while true {
+    let mut end = start
+    while unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(pathBytes,end)) != 0 && unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(pathBytes,end)) != 58 { end = end + 1 }
+    let segment = end - start
+    if segment + 1 + size + 1 <= os.pathMax() {
+      let mut buffer: [u8;4096] = [0;4096] let mut index: usize = 0
+      while index < segment { buffer[index] = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(pathBytes,start + index)) index = index + 1 }
+      buffer[segment] = 47 index = 0
+      while index < size { buffer[segment + 1 + index] = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(bytes,index)) index = index + 1 }
+      let result = unsafe execute(Pointer.fromRef(&buffer[0]),args,env,custom)
+      let error = os.errno()
+      if error == 13 { denied = true } else { if error != 2 && error != 20 { return -1 } }
+    }
+    if unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(pathBytes,end)) == 0 { break }
+    start = end + 1
+  }
+  if denied { os.setErrno(13) } return -1
+}
+pub unsafe effect fn spawn(options: &Options) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  let mut args = List<?*const u8>.make() let mut env = List<?*const u8>.make() let mut i: usize = 0
+  run args.reserveExact(options.arguments.length() + 1)
+  while i < options.arguments.length() { run args.append(Pointer.fromRef(&options.arguments.asSlice()[i].asSlice()[0])) i = i + 1 }
+  run args.append(Pointer.null<u8>())
+  run env.reserveExact(options.environment.length() + 1) i = 0
+  while i < options.environment.length() { run env.append(Pointer.fromRef(&options.environment.asSlice()[i].asSlice()[0])) i = i + 1 }
+  run env.append(Pointer.null<u8>())
+  let mut file = Pointer.fromRef(&options.arguments.asSlice()[0].asSlice()[0])
+  if options.file.length() != 0 { file = Pointer.fromRef(&options.file.asSlice()[0]) }
+  let argp = Pointer.fromRef(&args.asSlice()[0]) let envp = Pointer.fromRef(&env.asSlice()[0])
+  let mut openMax: i32 = 5 static if Intrinsic.targetOperatingSystem() == "darwin" { openMax = 5 } else { openMax = 4 }
+  let mut maxFd = unsafe sysconf(openMax) if maxFd > 1024 { maxFd = 1024 }
+  let pid = unsafe fork()
+  if pid < 0 { return FORK_ERROR }
+  if pid == 0 {
+    let mut index: usize = 0
+    while index < 3 { if options.fds[index] != usize.toI32(index) { if unsafe os.dup2(options.fds[index],usize.toI32(index)) < 0 { unsafe exitChild(127) } } index = index + 1 }
+    let mut fd: i32 = 3
+    while i32.toI64(fd) < maxFd { let ignored = unsafe os.close(fd) fd = fd + 1 }
+    if options.cwd.length() != 0 { if unsafe os.chdir(Pointer.fromRef(&options.cwd.asSlice()[0])) < 0 { unsafe exitChild(127) } }
+    if options.gid != 0xffffffff { if unsafe setgid(options.gid) < 0 { unsafe exitChild(127) } }
+    if options.uid != 0xffffffff { if unsafe setuid(options.uid) < 0 { unsafe exitChild(127) } }
+    if options.usePath { let ignored = unsafe search(file,argp,envp,options.customEnvironment) }
+    else { let ignored = unsafe execute(file,argp,envp,options.customEnvironment) }
+    unsafe exitChild(127)
+  }
+  if !options.block { return pid }
+  while true {
+    let mut status: i32 = 0 let result = unsafe os.waitpid(pid,Pointer.fromMutRef(&mut status),0)
+    if result == pid {
+      if (status & 127) == 0 { return i32.shiftRight(status,8) & 255 }
+      if (status & 127) != 127 { return -(status & 127) }
+    }
+  }
+}

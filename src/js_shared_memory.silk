@@ -1,0 +1,223 @@
+//! Data-race-free SharedArrayBuffer bytes using the SDK's native atomic cells.
+//! All aliases of one backing must agree on its aligned base and immutable
+//! physical capacity. Wrapper byteLength and view bounds never choose cells.
+//! Complete 8-byte blocks use u64; a partial last block decomposes into aligned
+//! 4/2/1-byte cells. No access reaches padding or bytes outside the allocation.
+//! Every published shared access (including native host accesses) must use this
+//! protocol. JavaScript views may overlap at any widths. Ordinary scalar accesses
+//! may split across cells; naturally aligned integer Atomics fit one cell and
+//! use native seq_cst RMW/CAS, preserving adjacent bytes without a lock.
+import silk.atomic { Atomic, CompareExchange, MemoryOrder }
+import silk.ownership { Copy }
+import silk.pointer { Pointer }
+import silk.u8
+import silk.thread { Transferable, Concurrent }
+import silk.u16
+import silk.u32
+import silk.u64
+
+pub struct Span { pub data: ?*mut u8, pub capacity: u32 }
+impl Copy for Span {}
+struct Cell { offset: u32, sizeLog2: u32 }
+impl Copy for Cell {}
+impl Transferable for Span {}
+impl Concurrent for Span {}
+struct Exchange { exchanged: bool, observed: u64 }
+fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+fn cell(span: Span, offset: u32) -> Cell {
+  if offset >= span.capacity { return invariant() }
+  let mut start = offset / 8 * 8
+  let mut remaining = span.capacity - start
+  if remaining >= 8 { return Cell { offset: start, sizeLog2: 3 } }
+  if remaining >= 4 {
+    if offset < start + 4 { return Cell { offset: start, sizeLog2: 2 } }
+    start = start + 4 remaining = remaining - 4
+  }
+  if remaining >= 2 {
+    if offset < start + 2 { return Cell { offset: start, sizeLog2: 1 } }
+    start = start + 2
+  }
+  return Cell { offset: start, sizeLog2: 0 }
+}
+fn mask(bytes: u32) -> u64 {
+  if bytes == 8 { return 0xffffffffffffffff }
+  return u64.shiftLeft(1, u32.toU64(bytes * 8)) - 1
+}
+pub unsafe fn address(span: Span, offset: u32) -> *mut u8 {
+  let first = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(span.data)
+  return unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(first), u32.toUsize(offset))
+}
+unsafe fn loadCell(span: Span, selected: Cell, static order: MemoryOrder) -> u64 {
+  let pointer = unsafe address(span, selected.offset)
+  if selected.sizeLog2 == 0 { return u8.toU64(unsafe Atomic.load<u8>(pointer, order)) }
+  if selected.sizeLog2 == 1 {
+    return u16.toU64(unsafe Atomic.load<u16>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut u16>(pointer), order))
+  }
+  if selected.sizeLog2 == 2 {
+    return u32.toU64(unsafe Atomic.load<u32>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut u32>(pointer), order))
+  }
+  return unsafe Atomic.load<u64>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut u64>(pointer), order)
+}
+unsafe fn compare<T: Copy>(pointer: *mut T, expected: T, desired: T,
+  static order: MemoryOrder) -> CompareExchange<T> {
+  return unsafe Atomic.compareExchange<T>(pointer, expected, desired, order, order)
+}
+unsafe fn compareCell(span: Span, selected: Cell, expected: u64, desired: u64,
+  static order: MemoryOrder) -> Exchange {
+  let pointer = unsafe address(span, selected.offset)
+  if selected.sizeLog2 == 0 {
+    return match unsafe compare<u8>(pointer, u64.toU8(expected), u64.toU8(desired), order) {
+      CompareExchange<u8>.Exchanged => Exchange { exchanged: true, observed: expected }
+      CompareExchange<u8>.Observed { value } => Exchange { exchanged: false, observed: u8.toU64(value) }
+    }
+  }
+  if selected.sizeLog2 == 1 {
+    return match unsafe compare<u16>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut u16>(pointer), u64.toU16(expected), u64.toU16(desired), order) {
+      CompareExchange<u16>.Exchanged => Exchange { exchanged: true, observed: expected }
+      CompareExchange<u16>.Observed { value } => Exchange { exchanged: false, observed: u16.toU64(value) }
+    }
+  }
+  if selected.sizeLog2 == 2 {
+    return match unsafe compare<u32>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut u32>(pointer), u64.toU32(expected), u64.toU32(desired), order) {
+      CompareExchange<u32>.Exchanged => Exchange { exchanged: true, observed: expected }
+      CompareExchange<u32>.Observed { value } => Exchange { exchanged: false, observed: u32.toU64(value) }
+    }
+  }
+  return match unsafe compare<u64>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut u64>(pointer), expected, desired, order) {
+    CompareExchange<u64>.Exchanged => Exchange { exchanged: true, observed: expected }
+    CompareExchange<u64>.Observed { value } => Exchange { exchanged: false, observed: value }
+  }
+}
+unsafe fn storeCell(span: Span, selected: Cell, bits: u64, static order: MemoryOrder) -> () {
+  let pointer = unsafe address(span, selected.offset)
+  if selected.sizeLog2 == 0 { unsafe Atomic.store<u8>(pointer, u64.toU8(bits), order) return () }
+  if selected.sizeLog2 == 1 {
+    unsafe Atomic.store<u16>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut u16>(pointer), u64.toU16(bits), order) return ()
+  }
+  if selected.sizeLog2 == 2 {
+    unsafe Atomic.store<u32>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut u32>(pointer), u64.toU32(bits), order) return ()
+  }
+  unsafe Atomic.store<u64>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut u64>(pointer), bits, order)
+}
+// Logical little-endian bits. The admitted native targets are little-endian;
+// DataView callers reverse bytes separately for big-endian scalar access.
+// Caller proves [offset,offset+2^sizeLog2) lies inside the live backing. order
+// is Relaxed for ordinary accesses or SequentiallyConsistent for Atomics.
+pub unsafe fn load(span: Span, offset: u32, sizeLog2: u32, static order: MemoryOrder) -> u64 {
+  let width = u32.shiftLeft(1, sizeLog2)
+  let end = offset + width
+  let mut cursor = offset
+  let mut result: u64 = 0
+  while cursor < end {
+    let selected = cell(span, cursor)
+    let cellEnd = selected.offset + u32.shiftLeft(1, selected.sizeLog2)
+    let mut count = cellEnd - cursor
+    if count > end - cursor { count = end - cursor }
+    let raw = unsafe loadCell(span, selected, order)
+    let chunk = u64.shiftRight(raw, u32.toU64((cursor - selected.offset) * 8)) & mask(count)
+    result = result | u64.shiftLeft(chunk, u32.toU64((cursor - offset) * 8))
+    cursor = cursor + count
+  }
+  return result
+}
+unsafe fn storeChunk(span: Span, selected: Cell, offset: u32, count: u32, bits: u64,
+  static order: MemoryOrder) -> () {
+  let fieldMask = mask(count)
+  let shift = u32.toU64((offset - selected.offset) * 8)
+  let inserted = u64.shiftLeft(bits & fieldMask, shift)
+  if offset == selected.offset && count == u32.shiftLeft(1, selected.sizeLog2) {
+    unsafe storeCell(span, selected, inserted, order)
+    return ()
+  }
+  let outside = u64.shiftLeft(fieldMask, shift) ^ 0xffffffffffffffff
+  let mut current = unsafe loadCell(span, selected, order)
+  while true {
+    let desired = (current & outside) | inserted
+    let exchange = unsafe compareCell(span, selected, current, desired, order)
+    if exchange.exchanged { return () }
+    current = exchange.observed
+  }
+}
+pub unsafe fn store(span: Span, offset: u32, sizeLog2: u32, bits: u64,
+  static order: MemoryOrder) -> () {
+  let end = offset + u32.shiftLeft(1, sizeLog2)
+  let mut cursor = offset
+  while cursor < end {
+    let selected = cell(span, cursor)
+    let cellEnd = selected.offset + u32.shiftLeft(1, selected.sizeLog2)
+    let mut count = cellEnd - cursor
+    if count > end - cursor { count = end - cursor }
+    let chunk = u64.shiftRight(bits, u32.toU64((cursor - offset) * 8))
+    unsafe storeChunk(span, selected, cursor, count, chunk, order)
+    cursor = cursor + count
+  }
+}
+pub unsafe fn loadByte(span: Span, offset: u32) -> u8 {
+  return u64.toU8(unsafe load(span, offset, 0, MemoryOrder.Relaxed))
+}
+pub unsafe fn storeByte(span: Span, offset: u32, value: u8) -> () {
+  unsafe store(span, offset, 0, u8.toU64(value), MemoryOrder.Relaxed)
+}
+unsafe fn fullOperation<T: Copy>(pointer: *mut T, op: u32, value: T) -> T {
+  if op == 0 { return unsafe Atomic.fetchAdd<T>(pointer, value, MemoryOrder.SequentiallyConsistent) }
+  if op == 1 { return unsafe Atomic.fetchBitAnd<T>(pointer, value, MemoryOrder.SequentiallyConsistent) }
+  if op == 2 { return unsafe Atomic.fetchBitOr<T>(pointer, value, MemoryOrder.SequentiallyConsistent) }
+  if op == 3 { return unsafe Atomic.fetchSubtract<T>(pointer, value, MemoryOrder.SequentiallyConsistent) }
+  if op == 4 { return unsafe Atomic.fetchBitXor<T>(pointer, value, MemoryOrder.SequentiallyConsistent) }
+  if op == 5 { return unsafe Atomic.swap<T>(pointer, value, MemoryOrder.SequentiallyConsistent) }
+  if op == 7 { return unsafe Atomic.load<T>(pointer, MemoryOrder.SequentiallyConsistent) }
+  return invariant()
+}
+unsafe fn full(span: Span, selected: Cell, op: u32, value: u64, replacement: u64) -> u64 {
+  if op == 6 {
+    let limit = mask(u32.shiftLeft(1, selected.sizeLog2))
+    let result = unsafe compareCell(span, selected, value & limit, replacement & limit, MemoryOrder.SequentiallyConsistent)
+    return result.observed
+  }
+  let pointer = unsafe address(span, selected.offset)
+  if selected.sizeLog2 == 0 {
+    return u8.toU64(unsafe fullOperation<u8>(pointer, op, u64.toU8(value & 255)))
+  }
+  if selected.sizeLog2 == 1 {
+    return u16.toU64(unsafe fullOperation<u16>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut u16>(pointer), op, u64.toU16(value & 65535)))
+  }
+  if selected.sizeLog2 == 2 {
+    return u32.toU64(unsafe fullOperation<u32>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut u32>(pointer), op, u64.toU32(value & 0xffffffff)))
+  }
+  return unsafe fullOperation<u64>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut u64>(pointer), op, value)
+}
+/// Native lock-free Atomics RMW. The source element must be naturally aligned
+/// relative to the 8-aligned backing base, and wholly inside capacity. The
+/// whole-cell fast path uses native fetch operations; a subword uses a masked
+/// native strong-CAS retry, never multiple observable stores or a software lock.
+pub unsafe fn operate(span: Span, offset: u32, sizeLog2: u32, op: u32,
+  value: u64, replacement: u64) -> u64 {
+  let selected = cell(span, offset)
+  if selected.offset == offset && selected.sizeLog2 == sizeLog2 {
+    return unsafe full(span, selected, op, value, replacement)
+  }
+  let width = u32.shiftLeft(1, sizeLog2)
+  if offset + width > selected.offset + u32.shiftLeft(1, selected.sizeLog2) { return invariant() }
+  let fieldMask = mask(width)
+  let shift = u32.toU64((offset - selected.offset) * 8)
+  let outside = u64.shiftLeft(fieldMask, shift) ^ 0xffffffffffffffff
+  let operand = value & fieldMask
+  let mut current = unsafe loadCell(span, selected, MemoryOrder.SequentiallyConsistent)
+  while true {
+    let old = u64.shiftRight(current, shift) & fieldMask
+    if op == 7 || (op == 6 && old != operand) { return old }
+    let mut updated: u64 = 0
+    if op == 0 { updated = u64.wrappingAdd(old, operand) }
+    else if op == 1 { updated = old & operand }
+    else if op == 2 { updated = old | operand }
+    else if op == 3 { updated = u64.wrappingSubtract(old, operand) }
+    else if op == 4 { updated = old ^ operand }
+    else if op == 5 { updated = operand }
+    else if op == 6 { updated = replacement }
+    else { invariant() }
+    let desired = (current & outside) | u64.shiftLeft(updated & fieldMask, shift)
+    let exchanged = unsafe compareCell(span, selected, current, desired, MemoryOrder.SequentiallyConsistent)
+    if exchanged.exchanged { return old }
+    current = exchanged.observed
+  }
+}

@@ -1,0 +1,217 @@
+//! Effect-safe command/reply adapter for native Silk plugins. The plugin executes
+//! only between host operations; JS exceptions never unwind through a C callback.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.list { List }
+import silk.option { Option }
+import silk.ownership { Drop }
+import silk.pointer { Pointer }
+import silk.result { Result }
+import silk.f64
+import silk.i32
+import silk.u32
+import silk.usize
+import js_heap { HeapHeader }
+import js_value { Value }
+import js_engine { Engine }
+import js_libc_services { LibcServices }
+import js_core_types { NativeErrorKind, JS_PROP_THROW, FrameSlots }
+import js_coercion_host { CoercionHooks }
+import js_exceptions { JsException }
+import js_exceptions as exceptions
+import js_string_types { StringLengthError }
+import js_string_rope { stringLength }
+import js_strings { Strings, StringBuilder }
+import js_bigint { BigIntError }
+import js_coercions as coercions
+import js_property_get as properties
+import js_property_mutations as mutations
+import js_eval as evaluation
+import js_gc as gc
+import js_runtime as runtime
+import js_proxy_core as errors
+import js_libc_plugins_abi as abi
+import js_libc_plugins_abi { Descriptor, Call }
+import js_libc_bjson as binary
+
+struct Invocation { descriptor: Descriptor, call: *mut Call }
+impl Drop for Invocation {
+  fn drop(self: &mut Self) -> () {
+    let call = unsafe Pointer.read<Call>(self.call)
+    unsafe self.descriptor.finish(self.descriptor.state, call.state)
+  }
+}
+unsafe effect fn invalid(engine: &mut Engine<LibcServices>, context: *mut HeapHeader) -> never ! JsException ? &mut Allocator {
+  return run unsafe engine.throwError(context, NativeErrorKind.Internal, b"invalid native plugin operation or handle")
+}
+unsafe effect fn get(engine: &mut Engine<LibcServices>, context: *mut HeapHeader, values: &List<Value>, handle: u32) -> Value
+  ! JsException ? &mut Allocator {
+  if u32.toUsize(handle) >= values.length() { return run unsafe invalid(&mut engine, context) }
+  return values.get(u32.toUsize(handle))
+}
+unsafe effect fn append(engine: &mut Engine<LibcServices>, context: *mut HeapHeader, values: &mut List<Value>, value: Value) -> u32
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  if values.length() >= 0xffffffff {
+    unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), value)
+    return run unsafe engine.throwError(context, NativeErrorKind.Internal, b"native plugin handle space exhausted")
+  }
+  let result = run Effect.result(values.append(value))
+  match move result {
+    Result<(), OutOfMemoryError>.Success { .. } => { return usize.toU32(values.length() - 1) }
+    Result<(), OutOfMemoryError>.Failure { error } => {
+      unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), value) fail move error
+    }
+  }
+}
+unsafe effect fn bytes(engine: &mut Engine<LibcServices>, context: *mut HeapHeader, data: ?[*]const u8, length: usize) -> List<u8>
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut result = List<u8>.make()
+  if length == 0 { return move result }
+  let pointer = match Pointer.nonNullMany<u8>(data) {
+    Option<[*]const u8>.Some { value } => value
+    _ => { return run unsafe invalid(&mut engine, context) }
+  }
+  run result.reserveExact(length) let mut i: usize = 0
+  while i < length { run result.append(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(pointer, i))) i = i + 1 }
+  return move result
+}
+unsafe effect fn string(engine: &mut Engine<LibcServices>, context: *mut HeapHeader, call: &Call) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  if call.length == 0 { return run Strings.fromUtf8(b"") }
+  let pointer = match Pointer.nonNullMany<u8>(call.bytes) {
+    Option<[*]const u8>.Some { value } => value
+    _ => { return run unsafe invalid(&mut engine, context) }
+  }
+  return run unsafe Strings.fromUtf8Pointer(unsafe Pointer.at<u8>(pointer, 0), call.length)
+}
+unsafe effect fn utf16(engine: &mut Engine<LibcServices>, context: *mut HeapHeader, call: &Call) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let mut builder = StringBuilder.make()
+  if call.length == 0 { return run builder.finish() }
+  let pointer = match Pointer.nonNullMany<u16>(call.units) {
+    Option<[*]const u16>.Some { value } => value
+    _ => { return run unsafe invalid(&mut engine, context) }
+  }
+  run builder.reserve(call.length, true) let mut i: usize = 0
+  while i < call.length { run builder.appendUnit(unsafe Pointer.read<u16>(unsafe Pointer.at<u16>(pointer, i))) i = i + 1 }
+  return run builder.finish()
+}
+fn typeNumber(value: Value) -> f64 {
+  if value.isNumber() { return 3.0 } if value.isString() { return 4.0 } if value.isBigInt() { return 7.0 }
+  return match value { Value.Undefined => 0.0 Value.Null => 1.0 Value.Bool { .. } => 2.0
+    Value.Object { .. } => 5.0 Value.Symbol { .. } => 6.0 _ => -1.0 }
+}
+unsafe effect fn binaryArgument(engine: &mut Engine<LibcServices>, context: *mut HeapHeader, values: &List<Value>, call: &Call, index: u32) -> Value ! JsException ? &mut Allocator {
+  if u32.toUsize(index) >= call.length { return Value.Undefined }
+  if call.a > u32.MAX - index { return run unsafe invalid(&mut engine, context) }
+  return run unsafe get(&mut engine, context, values, call.a + index)
+}
+unsafe effect fn loop(engine: &mut Engine<LibcServices>, context: *mut HeapHeader, descriptor: Descriptor,
+  exportIndex: u32, call: &mut Call, values: &mut List<Value>) -> Value
+  ! OutOfMemoryError | JsException | StringLengthError | BigIntError ? &mut Allocator {
+  let mut replyBytes = List<u8>.make() let mut replyUnits = List<u16>.make()
+  let invocation = Invocation { descriptor: descriptor, call: Pointer.fromMutRef(&mut call) }
+  while true {
+    let status = unsafe descriptor.invoke(descriptor.state, exportIndex, Pointer.fromMutRef(&mut call))
+    if status != 0 { return run unsafe engine.throwError(context, NativeErrorKind.Internal, b"native plugin callback failed") }
+    if call.op == abi.RETURN {
+      let value = run unsafe get(&mut engine, context, &values, call.a)
+      return unsafe value.retained()
+    }
+    if call.op == abi.THROW {
+      let value = run unsafe get(&mut engine, context, &values, call.a)
+      return run unsafe exceptions.throwValue<Value, Engine<LibcServices>>(&mut engine, unsafe runtime.contextRuntime(context), unsafe value.retained())
+    }
+    let mut output = Value.Undefined
+    if call.op == abi.UNDEFINED { output = Value.Undefined }
+    else if call.op == abi.NULL { output = Value.Null }
+    else if call.op == abi.BOOLEAN { output = Value.Bool { value: call.number != 0.0 } }
+    else if call.op == abi.NUMBER { output = Value.number(call.number) }
+    else if call.op == abi.STRING { output = run unsafe string(&mut engine, context, &call) }
+    else if call.op == abi.STRING_UTF16 { output = run unsafe utf16(&mut engine, context, &call) }
+    else if call.op == abi.TO_NUMBER {
+      let input = run unsafe get(&mut engine, context, &values, call.a)
+      output = run unsafe coercions.toNumber(&mut engine, context, input) call.number = output.numericValue()
+    } else if call.op == abi.TO_STRING || call.op == abi.TO_UTF16 {
+      let input = run unsafe get(&mut engine, context, &values, call.a)
+      output = run unsafe coercions.toString(&mut engine, context, input)
+      // Root before buffer allocation, including its failure path.
+      call.result = run unsafe append(&mut engine, context, &mut values, output)
+      if call.op == abi.TO_STRING {
+        replyBytes = run Strings.toUtf8(output, false)
+        call.bytes = Pointer.fromSlice(replyBytes.asSlice()) call.length = replyBytes.length()
+      } else {
+        replyUnits.clear() let length = stringLength(output) run replyUnits.reserveExact(length)
+        let mut i: usize = 0 while i < length { run replyUnits.append(Strings.codeUnit(output, i)) i = i + 1 }
+        call.units = Pointer.fromSlice(replyUnits.asSlice()) call.length = length
+      }
+      call.phase = 1 continue
+    } else if call.op == abi.TYPE {
+      let input = run unsafe get(&mut engine, context, &values, call.a)
+      call.number = typeNumber(input) output = Value.number(call.number)
+    } else if call.op == abi.GET {
+      let object = run unsafe get(&mut engine, context, &values, call.a)
+      let key = run unsafe get(&mut engine, context, &values, call.b)
+      output = run unsafe properties.getPropertyValue(&mut engine, context, object, unsafe key.retained())
+    } else if call.op == abi.SET {
+      let object = run unsafe get(&mut engine, context, &values, call.a)
+      let key = run unsafe get(&mut engine, context, &values, call.b)
+      let value = run unsafe get(&mut engine, context, &values, call.result)
+      let changed = run unsafe mutations.setPropertyValue(&mut engine, context, object, unsafe key.retained(), unsafe value.retained(), JS_PROP_THROW)
+      output = Value.Bool { value: changed }
+    } else if call.op == abi.CALL {
+      let function = run unsafe get(&mut engine, context, &values, call.a)
+      let receiver = run unsafe get(&mut engine, context, &values, call.b)
+      let mut arguments = List<Value>.make()
+      if call.length != 0 {
+        let handles = match Pointer.nonNullMany<u32>(call.handles) {
+          Option<[*]const u32>.Some { value } => value
+          _ => { return run unsafe invalid(&mut engine, context) }
+        }
+        run arguments.reserveExact(call.length) let mut i: usize = 0
+        while i < call.length {
+          let handle = unsafe Pointer.read<u32>(unsafe Pointer.at<u32>(handles, i))
+          run arguments.append(run unsafe get(&mut engine, context, &values, handle)) i = i + 1
+        }
+      }
+      output = run unsafe engine.call(context, function, receiver, arguments.asSlice())
+    } else if call.op == abi.EVAL {
+      let source = run unsafe bytes(&mut engine, context, call.bytes, call.length) let memory = engine.memory
+      output = run unsafe evaluation.evaluate(&mut engine, memory, context, source.asSlice(), b"<native-plugin>", 0)
+    } else if call.op == abi.READ_BINARY || call.op == abi.WRITE_BINARY {
+      let first = run unsafe binaryArgument(&mut engine, context, &values, &call, 0)
+      let second = run unsafe binaryArgument(&mut engine, context, &values, &call, 1)
+      if call.op == abi.WRITE_BINARY { output = run unsafe binary.write(&mut engine, context, first, second) }
+      else {
+        let third = run unsafe binaryArgument(&mut engine, context, &values, &call, 2)
+        let fourth = run unsafe binaryArgument(&mut engine, context, &values, &call, 3)
+        output = run unsafe binary.read(&mut engine, context, first, second, third, fourth)
+      }
+    } else { return run unsafe invalid(&mut engine, context) }
+    call.result = run unsafe append(&mut engine, context, &mut values, output) call.phase = 1
+  }
+}
+pub unsafe effect fn invoke(engine: &mut Engine<LibcServices>, context: *mut HeapHeader, descriptor: Descriptor,
+  exportIndex: u32, receiver: Value, argc: u32, arguments: &FrameSlots) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut values = List<Value>.make() run values.reserveExact(arguments.length() + 1)
+  run values.append(unsafe receiver.retained()) let mut i: usize = 0
+  while i < arguments.length() { let argument = unsafe arguments.get(i) run values.append(unsafe argument.retained()) i = i + 1 }
+  let mut call = Call { state: Pointer.null<u8>(), phase: 0, argc: argc, op: abi.RETURN,
+    a: 0, b: 0, result: 0, number: 0.0, bytes: unsafe Intrinsic.pointerRequalify<?*mut u8, ?[*]const u8>(Pointer.null<u8>()), length: 0,
+    handles: unsafe Intrinsic.pointerRequalify<?*mut u32, ?[*]const u32>(Pointer.null<u32>()),
+    units: unsafe Intrinsic.pointerRequalify<?*mut u16, ?[*]const u16>(Pointer.null<u16>()) }
+  let outcome = run Effect.result(unsafe loop(&mut engine, context, descriptor, exportIndex, &mut call, &mut values))
+  let rt = unsafe runtime.contextRuntime(context) i = 0
+  while i < values.length() { unsafe gc.release(&mut engine, rt, values.get(i)) i = i + 1 }
+  return match move outcome {
+    Result<Value, OutOfMemoryError | JsException | StringLengthError | BigIntError>.Success { value } => value
+    Result<Value, OutOfMemoryError | JsException | StringLengthError | BigIntError>.Failure { error } => {
+      match move error {
+        OutOfMemoryError allocation => { fail move allocation }
+        JsException exception => { fail move exception }
+        StringLengthError length => { return run unsafe errors.materialize(&mut engine, context, move length) }
+        BigIntError bigint => { return run unsafe errors.materialize(&mut engine, context, move bigint) }
+      }
+    }
+  }
+}

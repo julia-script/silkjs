@@ -1,0 +1,141 @@
+//! Shared Array/TypedArray iterator ownership and live stepping, quickjs.c:44962-45078.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.pointer { Pointer }
+import silk.u32
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_value { Value }
+import js_core_types { ObjectData, ObjectPayload, ObjectPayloadFamily, FrameSlots }
+import js_gc { HeapHooks, Tracer }
+import js_gc as gc
+import js_runtime as runtime
+import js_class_data as classes
+import js_atom_data as atoms
+import js_coercion_host { CoercionHooks }
+import js_property_host { OwnPropertyHooks, GetPropertyHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_native_function_host { NativeIteratorResult }
+import js_constructor_ops as constructors
+import js_boxing as boxing
+import js_integer_coercions as integers
+import js_typed_array_buffer as typedArrays
+import js_collection_support as owners
+import js_proxy_core as core
+import js_array_construction as arrays
+import js_string_types { StringLengthError }
+import js_exceptions { JsException }
+import runtime_memory { AllocationObserver }
+
+// BuiltinFamily.Iterator dispatch identities. Array factory magic is KEY,
+// VALUE, or ENTRY; TypedArray factories keep their separate TypedArray IDs.
+pub const NEXT_METHOD: u32 = 0
+pub const ARRAY_FACTORY_METHOD: u32 = 1
+pub const KEY: u32 = 0
+pub const VALUE: u32 = 1
+pub const ENTRY: u32 = 2
+struct Iterator { object: Value, kind: u32, index: u32 }
+unsafe fn payload(object: *mut HeapHeader) -> ?*mut HeapHeader {
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  return match &data.payload {
+    ObjectPayload.Opaque { family, reference } => {
+      if family == ObjectPayloadFamily.ArrayIterator { return reference }
+      return Pointer.null<HeapHeader>()
+    }
+    _ => Pointer.null<HeapHeader>()
+  }
+}
+unsafe fn nonnull(value: ?*mut HeapHeader) -> *mut HeapHeader {
+  return unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(value)
+}
+
+pub unsafe effect fn create<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks>(
+  hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader,
+  receiver: Value, kind: u32, typed: bool) -> Value ! JsException ? &mut Allocator {
+  if typed { run unsafe typedArrays.validate(&mut hooks, context, receiver) }
+  let source = run unsafe boxing.toObject(&mut hooks, memory, context, receiver)
+  let created = run Effect.result(unsafe constructors.createFromConstructor(&mut hooks, memory, context, Value.Undefined, classes.JS_CLASS_ARRAY_ITERATOR))
+  let object = match move created {
+    Result<Value, JsException>.Success { value } => value
+    Result<Value, JsException>.Failure { error } => { unsafe owners.release(&mut hooks, context, source) fail move error }
+  }
+  let allocated = run Effect.result(HeapCell.allocate(HeapKind.Auxiliary, Iterator { object: source, kind: kind, index: 0 }))
+  let node = match move allocated {
+    Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value
+    Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => {
+      let pending = run Effect.catch<JsException>(unsafe core.materialize(&mut hooks, context, move error), core.exceptionValue)
+      unsafe owners.release(&mut hooks, context, object)
+      unsafe owners.release(&mut hooks, context, source)
+      fail JsException {}
+    }
+  }
+  let mut anchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, core.reference(object))
+  data.payload = ObjectPayload.Opaque { family: ObjectPayloadFamily.ArrayIterator, reference: node }
+  return object
+}
+
+unsafe effect fn length<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks>(
+  hooks: &mut H, context: *mut HeapHeader, object: Value) -> u32 ! JsException ? &mut Allocator {
+  if unsafe typedArrays.isTypedArray(object) { return run unsafe typedArrays.getLengthUnsafe(&mut hooks, context, object) }
+  let value = run unsafe owners.get(&mut hooks, context, object, atoms.JS_ATOM_length)
+  let mut output: u32 = 0
+  let converted = run Effect.result(unsafe integers.toUint32Free(&mut hooks, context, &mut output, value))
+  match move converted {
+    Result<(), OutOfMemoryError | StringLengthError | JsException>.Success { .. } => ()
+    Result<(), OutOfMemoryError | StringLengthError | JsException>.Failure { error } => { return run unsafe core.materialize(&mut hooks, context, move error) }
+  }
+  return output
+}
+
+pub unsafe effect fn next<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks>(
+  hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader,
+  receiver: Value) -> NativeIteratorResult ! JsException ? &mut Allocator {
+  if !receiver.isObject() { return run unsafe core.error(&mut hooks, context, b"incompatible array iterator receiver") }
+  let mut anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(receiver))
+  let valid = data.classId == classes.JS_CLASS_ARRAY_ITERATOR drop data
+  let optional = unsafe payload(core.reference(receiver))
+  if !valid || Pointer.isNull<HeapHeader>(optional) { return run unsafe core.error(&mut hooks, context, b"incompatible array iterator receiver") }
+  let node = unsafe nonnull(optional)
+  let initial = unsafe HeapCell.payload<Iterator, ()>(&anchor, node)
+  let source = initial.object drop initial
+  if core.undefined(source) { return NativeIteratorResult { value: Value.Undefined, done: 1 } }
+  // Length is live. No payload loan survives its getter or numeric coercion.
+  let count = run unsafe length(&mut hooks, context, source)
+  let iterator = unsafe HeapCell.payloadMut<Iterator, ()>(&mut anchor, node)
+  let index = iterator.index let kind = iterator.kind let object = iterator.object
+  if index >= count {
+    iterator.object = Value.Undefined drop iterator
+    unsafe owners.release(&mut hooks, context, object)
+    return NativeIteratorResult { value: Value.Undefined, done: 1 }
+  }
+  iterator.index = index + 1 drop iterator
+  let number = Value.number(u32.toF64(index))
+  if kind == KEY { return NativeIteratorResult { value: number, done: 0 } }
+  // Advance before Get: a throwing accessor must not repeat on the next call.
+  let value = run unsafe owners.getIndex(&mut hooks, context, object, index)
+  if kind == VALUE { return NativeIteratorResult { value: value, done: 0 } }
+  let mut values = [number, value]
+  let arguments = FrameSlots.Borrowed { data: Pointer.fromMutRef<Value>(&mut values[0]), length: 2 }
+  let pair = run unsafe arrays.createFree(&mut hooks, memory, context, &arguments, 0, 2)
+  return NativeIteratorResult { value: pair, done: 0 }
+}
+
+pub unsafe fn mark(object: *mut HeapHeader, tracer: &mut Tracer) -> () {
+  let optional = unsafe payload(object)
+  if Pointer.isNull<HeapHeader>(optional) { return }
+  let anchor = () let iterator = unsafe HeapCell.payload<Iterator, ()>(&anchor, unsafe nonnull(optional))
+  unsafe tracer.value(iterator.object)
+}
+pub unsafe fn finalize<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, object: *mut HeapHeader) -> () {
+  let optional = unsafe payload(object)
+  if Pointer.isNull<HeapHeader>(optional) { return }
+  let node = unsafe nonnull(optional) let mut anchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, object)
+  data.payload = ObjectPayload.Empty drop data
+  let iterator = unsafe HeapCell.payload<Iterator, ()>(&anchor, node)
+  let source = iterator.object drop iterator
+  unsafe HeapCell.destroy<Iterator>(node)
+  unsafe gc.release(&mut hooks, rt, source)
+}

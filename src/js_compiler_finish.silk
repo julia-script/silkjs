@@ -1,0 +1,146 @@
+//! js_create_function, quickjs.c:36845-37102. This consumes the compiler subtree
+//! on either outcome. source borrows the full immutable parse input, not fd.source.
+//! Context/runtime/ancestors must remain live and exclusively accessed throughout.
+//! The result owns one published FunctionBytecode reference, not a callable object.
+//! Input is complete parser IR: child constant indices designate reserved Undefined
+//! slots. When compiling a child directly, its ancestors' scope links must already
+//! be prepared (normal recursive entry performs that preparation before descent).
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.list { List }
+import silk.pointer { Pointer }
+import silk.i32
+import silk.usize
+import byte_buffer { ByteBuffer }
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_value { Value }
+import js_gc { HeapHooks }
+import js_gc
+import js_core_types { FunctionBytecode, FunctionDebugInfo, ByteStorage, VarDef, ClosureVar, ClosureKind, RuntimeState }
+import js_compiler_types { FunctionDef, CompilerVar, CompilerError }
+import js_compiler_state as state
+import js_compiler_variables as variables
+import js_compiler_labels { resolveLabels }
+import js_bytecode { computeStackSize, BytecodeError }
+import js_string_types { StringLengthError }
+
+fn definition(v: CompilerVar, strip: bool) -> VarDef {
+  let mut name = v.name if strip { name = 0 }
+  return VarDef { name: name, scopeNext: v.scopeNext, isConst: v.isConst,
+    isLexical: v.isLexical, isCaptured: v.isCaptured, hasScope: v.scopeLevel != 0,
+    kind: v.kind, varRefIndex: v.varRefIndex }
+}
+fn keepClosureName(kind: ClosureKind) -> bool {
+  return kind == ClosureKind.GlobalReference || kind == ClosureKind.GlobalDeclaration
+    || kind == ClosureKind.Global || kind == ClosureKind.ModuleDeclaration || kind == ClosureKind.ModuleImport
+}
+
+unsafe effect fn assemble<H: HeapHooks>(hooks: &mut H, cell: *mut HeapHeader, source: &[u8]) -> Value
+  ! OutOfMemoryError | StringLengthError | CompilerError | BytecodeError ? &mut Allocator {
+  let mut anchor = ()
+  let initial = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
+  variables.recomputeScopeLinks(&mut initial)
+  let eval = initial.hasEvalCall let global = initial.isEval
+  drop initial
+  if eval { run unsafe variables.addEvalVariables(cell) }
+  if global { run unsafe variables.addGlobalVariables(cell) }
+  while true {
+    let parent = unsafe HeapCell.payload<FunctionDef, ()>(&anchor, cell)
+    let child = parent.firstChild drop parent
+    if Pointer.isNull<HeapHeader>(child) { break }
+    let childCell = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(child)
+    let childFd = unsafe HeapCell.payload<FunctionDef, ()>(&anchor, childCell)
+    let index = i32.toUsize(childFd.parentConstantPoolIndex) drop childFd
+    // createFunction unlinks this child on both outcomes; no dangling list cursor.
+    let value = run unsafe createFunction(&mut hooks, childCell, source)
+    let parentWrite = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
+    parentWrite.constants.set(index, value)
+  }
+  run unsafe variables.resolveVariables(cell)
+  run unsafe resolveLabels(cell, source)
+  let fd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
+  let stackSize = run computeStackSize(fd.bytecode.asSlice())
+  let strip = fd.stripDebug && !fd.hasEvalCall
+  // Only this representation differs from the transient IR. Until allocation
+  // commits, these names borrow fd's references; List drop releases no JS atoms.
+  let mut definitions = List<VarDef>.make()
+  run definitions.reserveExact(fd.args.length() + fd.vars.length())
+  let mut i: usize = 0
+  while i < fd.args.length() { run definitions.append(definition(fd.args.get(i), strip)) i = i + 1 }
+  i = 0
+  while i < fd.vars.length() { run definitions.append(definition(fd.vars.get(i), strip)) i = i + 1 }
+  let runtime = fd.runtime let context = fd.context
+  // Allocate BEFORE moving any JS edge. OOM leaves the complete fd destructible.
+  let result = run HeapCell.allocate(HeapKind.FunctionBytecode, FunctionBytecode {
+    mode: fd.jsMode, hasPrototype: fd.hasPrototype, hasSimpleParameterList: fd.hasSimpleParameterList,
+    isDerivedClassConstructor: fd.isDerivedClassConstructor,
+    needsHomeObject: fd.homeObjectVarIndex >= 0 || fd.needHomeObject, kind: fd.functionKind,
+    newTargetAllowed: fd.newTargetAllowed, superCallAllowed: fd.superCallAllowed,
+    superAllowed: fd.superAllowed, argumentsAllowed: fd.argumentsAllowed,
+    readOnlyBytecode: false, isDirectOrIndirectEval: fd.evalType == 2 || fd.evalType == 3,
+    code: ByteStorage.Owned { bytes: List<u8>.make() }, name: 0,
+    varDefs: move definitions, closureVars: List<ClosureVar>.make(),
+    argumentCount: usize.toU16(fd.args.length()), variableCount: usize.toU16(fd.vars.length()),
+    definedArgumentCount: i32.toU16(fd.definedArgCount), stackSize: stackSize,
+    varRefCount: i32.toU16(fd.varRefCount), realm: context,
+    constants: List<Value>.make(), debug: Option<FunctionDebugInfo>.none()
+  })
+  // No fallible operations after this point. All native buffers move, never copy.
+  let mut resultAnchor = () let mut runtimeAnchor = ()
+  let b = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut resultAnchor, result)
+  let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, runtime)
+  let code = Intrinsic.replace(fd.bytecode, ByteBuffer.make())
+  b.code = ByteStorage.Owned { bytes: code.intoList() }
+  b.name = fd.functionName fd.functionName = 0
+  b.constants = Intrinsic.replace(fd.constants, List<Value>.make())
+  i = 0
+  while i < fd.args.length() {
+    let mut v = fd.args.get(i) if strip { rt.atoms.release(v.name) }
+    v.name = 0 fd.args.set(i, v) i = i + 1
+  }
+  i = 0
+  while i < fd.vars.length() {
+    let mut v = fd.vars.get(i) if strip { rt.atoms.release(v.name) }
+    v.name = 0 fd.vars.set(i, v) i = i + 1
+  }
+  if strip {
+    i = 0
+    while i < fd.closureVars.length() {
+      let mut v = fd.closureVars.get(i)
+      if !keepClosureName(v.kind) { rt.atoms.release(v.name) v.name = 0 fd.closureVars.set(i, v) }
+      i = i + 1
+    }
+  }
+  b.closureVars = Intrinsic.replace(fd.closureVars, List<ClosureVar>.make())
+  if !fd.stripDebug {
+    let lines = Intrinsic.replace(fd.pc2line, ByteBuffer.make())
+    let mut text = Option<ByteStorage>.none()
+    if fd.source.length() != 0 {
+      let bytes = Intrinsic.replace(fd.source, ByteBuffer.make())
+      text = Option<ByteStorage>.some(ByteStorage.Owned { bytes: bytes.intoList() })
+    }
+    b.debug = Option<FunctionDebugInfo>.some(FunctionDebugInfo {
+      filename: fd.filename, source: move text, pcToLine: ByteStorage.Owned { bytes: lines.intoList() }
+    })
+    fd.filename = 0
+  }
+  drop rt drop b drop fd
+  unsafe HeapCell.retain(context)
+  unsafe js_gc.publish(runtime, result)
+  return Value.FunctionBytecode { reference: result }
+}
+
+pub unsafe effect fn createFunction<H: HeapHooks>(hooks: &mut H, cell: *mut HeapHeader, source: &[u8]) -> Value
+  ! OutOfMemoryError | StringLengthError | CompilerError | BytecodeError ? &mut Allocator {
+  let outcome = run Effect.result(unsafe assemble(&mut hooks, cell, source))
+  // Shared teardown releases stripped atoms/source, remaining parser-only owners,
+  // failed descendants, and any already assembled children in constant slots.
+  // Successful transfer zeroes all edges now owned by the published bytecode.
+  unsafe state.destroyFunction(&mut hooks, cell)
+  return match move outcome {
+    Result<Value, OutOfMemoryError | StringLengthError | CompilerError | BytecodeError>.Success { value } => value
+    Result<Value, OutOfMemoryError | StringLengthError | CompilerError | BytecodeError>.Failure { error } => { fail move error }
+  }
+}

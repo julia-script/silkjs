@@ -1,0 +1,114 @@
+//! Real Session acceptance entry. MODE CUTOFF emits six u32 words: clean,
+//! injected, runtime bytes/blocks, embedding-domain bytes/blocks. Every sample
+//! owns a fresh Session and the ordinary filesystem loader; no host substitutes.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.bytes { Bytes }
+import silk.host_input { HostInput, HostInputError }
+import silk.writer { Writer, WriterError }
+import silk.os_writer { StdoutWriter, StderrWriter }
+import silk.testing { Testing, AssertionError }
+import silk.u8
+import silk.usize
+import byte_buffer { ByteBuffer }
+import runtime_memory { RuntimeAllocator }
+import js_atomics_native { WaiterDomain, SynchronizationError }
+import js_runtime_registry { ClassIdAllocator }
+import js_libc_process { Process }
+import js_libc { Session }
+import js_libc as libc
+import js_exceptions { JsException }
+import js_exceptions as exceptions
+import js_string_types { StringLengthError }
+import js_errors_test_support { FaultAllocator }
+import js_eval_execution_consumer as scripts
+import js_module_execution_consumer as modules
+import js_eval_fault_consumer as evalFaults
+import js_module_execution_fault_consumer as moduleFaults
+
+fn unsigned(bytes: &[u8]) -> Option<usize> {
+  if bytes.length == 0 { return Option<usize>.none() }
+  let mut value: usize = 0 let mut at: usize = 0
+  while at < bytes.length {
+    let digit = u8.toUsize(bytes[at])
+    if digit < 48 || digit > 57 { return Option<usize>.none() }
+    if value > (usize.MAX - (digit - 48)) / 10 { return Option<usize>.none() }
+    value = value * 10 + digit - 48 at = at + 1
+  }
+  return Option<usize>.some(value)
+}
+effect fn argument(index: usize) -> usize ! HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
+  let found = run HostInput.argument(index)
+  let bytes = match move found { Option<Bytes>.Some { value } => move value Option<Bytes>.None => { fail HostInput.inputFailure() } }
+  return match move unsigned(Bytes.asSlice(&bytes)) { Option<usize>.Some { value } => value Option<usize>.None => { fail HostInput.inputFailure() } }
+}
+unsafe effect fn sample<'m>(session: &mut libc.Session<'m>, allocator: &mut FaultAllocator, mode: usize, cutoff: usize) -> bool
+  ! OutOfMemoryError | JsException | AssertionError<'static> | StringLengthError {
+  let memory = session.engine.memory let context = session.context
+  if mode == 0 {
+    run unsafe scripts.runScripts(&mut session.engine, memory, context) |> Effect.provideMut<Allocator>(&mut allocator)
+    return true
+  }
+  if mode == 1 {
+    run unsafe modules.runModules(&mut session.engine, memory, context) |> Effect.provideMut<Allocator>(&mut allocator)
+    return true
+  }
+  if mode == 2 {
+    let failed = run unsafe evalFaults.compileAtBudget(&mut session.engine, memory, context, &mut allocator, cutoff)
+    return !failed
+  }
+  if mode < 6 {
+    return run unsafe moduleFaults.recoverAtBudget(&mut session.engine, memory, context, &mut allocator, cutoff, mode - 3)
+  }
+  if mode == 6 {
+    run unsafe evalFaults.importEnqueueRecovery(&mut session.engine, memory, context, &mut allocator)
+    return true
+  }
+  return run unsafe moduleFaults.startupAtBudget(&mut session.engine, memory, context, &mut allocator, cutoff)
+}
+effect fn reportAssertion(error: AssertionError<'static>) -> bool ! AssertionError<'static> {
+  StderrWriter.print("eval/module assertion: {message}\n", &.{ message: Testing.assertionMessage(&error) })
+  fail move error
+}
+pub effect fn main() -> i32 ! HostInputError | OutOfMemoryError | SynchronizationError | WriterError ? &mut HostInput {
+  let mut system = Allocator.systemAllocatorProvider()
+  let count = run HostInput.argumentCount()
+  if count != 3 { return 64 }
+  let mode = run argument(1) |> Effect.provideMut<Allocator>(&mut system)
+  let cutoff = run argument(2) |> Effect.provideMut<Allocator>(&mut system)
+  if mode > 7 { return 64 }
+  let mut domains = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let namespace = run ClassIdAllocator.make() |> Effect.provideMut<Allocator>(&mut domains)
+  let process = run Process.make(&namespace)
+  let domain = run WaiterDomain.make() |> Effect.provideMut<Allocator>(&mut domains)
+  let mut allocator = FaultAllocator { parent: run RuntimeAllocator.make(Allocator.systemAllocatorProvider()), armed: false, remaining: usize.MAX, persistent: false, failures: 0 }
+  let memory = run allocator.parent.observe()
+  let opened = run Effect.result(unsafe Session.open(&memory, domain.handle(), &process, false)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut status: i32 = 0 let mut clean: u32 = 0
+  match move opened {
+    Result.Success { value } => {
+      let mut session = move value
+      let result = run Effect.result(Effect.catch<AssertionError<'static>>(unsafe sample(&mut session, &mut allocator, mode, cutoff), reportAssertion))
+      allocator.armed = false allocator.remaining = usize.MAX
+      match move result {
+        Result.Success { value: success } => { if success { clean = 1 } }
+        Result.Failure { .. } => { status = 4 StderrWriter.print("eval/module consumer assertion or execution failure\n", &.{}) }
+      }
+      if unsafe exceptions.has(session.runtime) { run unsafe libc.dumpError(&mut session.engine, session.context) |> Effect.provideMut<Allocator>(&mut allocator) }
+      run unsafe session.close() |> Effect.provideMut<Allocator>(&mut allocator)
+      drop session
+    }
+    Result.Failure { .. } => { status = 2 }
+  }
+  drop process drop domain drop namespace
+  let runtimeStats = memory.stats() let domainStats = domains.stats()
+  let mut out = ByteBuffer.make()
+  let row = [clean, usize.toU32(allocator.failures), usize.toU32(runtimeStats.usedBytes), usize.toU32(runtimeStats.allocationCount), usize.toU32(domainStats.usedBytes), usize.toU32(domainStats.allocationCount)]
+  let mut at: usize = 0
+  while at < 6 { run out.writeU32(row[at]) |> Effect.provideMut<Allocator>(&mut system) at = at + 1 }
+  let mut writer = StdoutWriter.make()
+  run Writer.writeAll(out.asSlice()) |> Effect.provideMut<Writer>(&mut writer)
+  return status
+}

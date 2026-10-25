@@ -1,0 +1,289 @@
+import silk.allocator { Allocator, OutOfMemoryError, SystemAllocator }
+import silk.effect { Effect }
+import silk.layout { Layout }
+import silk.list { List }
+import silk.option { Option }
+import silk.ownership { Drop }
+import silk.pointer { Pointer }
+import silk.testing { AssertionError, Testing }
+import silk.usize
+import js_core_types { ByteStorage, FrameSlots, FrameReferences, HeapList, StackFrame, StableFrame, ValueSlots }
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_value { Value }
+import runtime_memory { RuntimeAllocator }
+
+fn integerIs(value: Value, expected: i32) -> bool {
+  return match value {
+    Value.Int { value: found } => found == expected
+    _ => false
+  }
+}
+fn isUndefined(value: Value) -> bool {
+  return match value {
+    Value.Undefined => true
+    _ => false
+  }
+}
+
+// This guard only destroys its actual u32 payload. Values used by the slot test
+// are raw borrowed tag carriers, never interpreted by object/runtime semantics.
+struct CellOwner { header: *mut HeapHeader }
+impl Drop for CellOwner {
+  fn drop(self: &mut Self) -> () {
+    if unsafe HeapCell.decrement(self.header) { unsafe HeapCell.destroy<u32>(self.header) }
+  }
+}
+effect fn makeCell(value: u32) -> CellOwner ! OutOfMemoryError ? &mut Allocator {
+  return CellOwner { header: run HeapCell.allocate<u32>(HeapKind.Auxiliary, value) }
+}
+unsafe fn count(header: *const HeapHeader) -> i32 {
+  let anchor = ()
+  unsafe { return Pointer.borrow<(), HeapHeader>(&anchor, header).referenceCount }
+}
+unsafe fn detached(header: *const HeapHeader) -> bool {
+  let anchor = ()
+  let state = unsafe Pointer.borrow<(), HeapHeader>(&anchor, header)
+  return Pointer.isNull<HeapHeader>(state.previous) && Pointer.isNull<HeapHeader>(state.next)
+}
+unsafe fn links(header: *const HeapHeader, previous: ?*const HeapHeader, next: ?*const HeapHeader) -> bool {
+  let anchor = ()
+  let state = unsafe Pointer.borrow<(), HeapHeader>(&anchor, header)
+  return Pointer.address<HeapHeader>(state.previous) == Pointer.address<HeapHeader>(previous)
+    && Pointer.address<HeapHeader>(state.next) == Pointer.address<HeapHeader>(next)
+}
+fn poppedIs(popped: Option<*mut HeapHeader>, expected: *const HeapHeader) -> bool {
+  return match move popped {
+    Option<*mut HeapHeader>.Some { value } => Pointer.address<HeapHeader>(value) == Pointer.address<HeapHeader>(expected)
+    Option<*mut HeapHeader>.None => false
+  }
+}
+
+test effect fn valueSlotsInitializeAndSurviveOwnerContainerGrowth() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = run RuntimeAllocator<SystemAllocator>.make(Allocator.systemAllocatorProvider())
+  let mut slots = run ValueSlots.make(3) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(slots.length() == 3 && slots.view().length == 3, "fixed initialized slot extent")
+  run Testing.expect(isUndefined(slots.get(0)) && isUndefined(slots.get(1)) && isUndefined(slots.get(2)), "every slot starts Undefined")
+  let first = slots.replace(0, Value.Int { value: 11 })
+  let last = slots.replace(2, Value.Int { value: 37 })
+  run Testing.expect(isUndefined(first) && isUndefined(last), "replace transfers the previous slot value")
+  let address = slots.address(1)
+  let mut owners = List<ValueSlots>.make()
+  run owners.append(move slots) |> Effect.provideMut<Allocator>(&mut allocator)
+  let capacityBefore = owners.capacity()
+  let mut index: usize = 0
+  while index < 64 {
+    let empty = run ValueSlots.make(0) |> Effect.provideMut<Allocator>(&mut allocator)
+    run owners.append(move empty) |> Effect.provideMut<Allocator>(&mut allocator)
+    index = index + 1
+  }
+  let grew = owners.capacity() > capacityBefore
+  unsafe Pointer.write<Value>(address, Value.Int { value: 23 })
+  let newAddress = owners.asMutSlice()[0].address(1)
+  let stable = Pointer.address<Value>(address) == Pointer.address<Value>(newAddress)
+  let held = &owners.asSlice()[0]
+  let valuesCorrect = integerIs(held.get(0), 11) && integerIs(held.get(1), 23) && integerIs(held.get(2), 37)
+  drop held
+  let beforeDrop = allocator.stats()
+  drop owners
+  let afterDrop = allocator.stats()
+  run Testing.expect(grew && stable && valuesCorrect, "relocating the owner container never relocates or corrupts VM slots")
+  run Testing.expect(beforeDrop.allocationCount == 2, "only the nonempty slots and owner container allocate")
+  run Testing.expect(afterDrop.allocationCount == 0 && afterDrop.usedBytes == 0, "owner teardown releases both native allocations")
+}
+
+test effect fn valueSlotsDoNotRetainOrReleaseJavaScriptReferences() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = run RuntimeAllocator<SystemAllocator>.make(Allocator.systemAllocatorProvider())
+  let owner = run makeCell(73) |> Effect.provideMut<Allocator>(&mut allocator)
+  let childAddress = owner.header
+  let mut slots = run ValueSlots.make(2) |> Effect.provideMut<Allocator>(&mut allocator)
+  let incoming = Value.Object { reference: childAddress }
+  let old = slots.replace(0, incoming)
+  let another = slots.replace(1, incoming)
+  let beforeDrop = unsafe count(childAddress)
+  let returned = slots.replace(0, Value.Undefined)
+  let correctReturned = match returned {
+    Value.Object { reference } => Pointer.address<HeapHeader>(reference) == Pointer.address<HeapHeader>(childAddress)
+    _ => false
+  }
+  drop slots
+  let afterDrop = unsafe count(childAddress)
+  let childStillLive = allocator.stats().allocationCount == 1
+  drop owner
+  let released = allocator.stats()
+  run Testing.expect(isUndefined(old) && isUndefined(another) && correctReturned, "slot replacement transfers exact Value bits")
+  run Testing.expect(beforeDrop == 1 && afterDrop == 1 && childStillLive, "slot copies, replacements and native teardown never alter JS ownership")
+  run Testing.expect(released.allocationCount == 0 && released.usedBytes == 0, "explicit child owner performs the final destruction")
+}
+
+struct RefusingAllocator { attempts: usize }
+impl Allocator for RefusingAllocator {
+  effect fn allocate(self: &mut Self, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
+    self.attempts = self.attempts + 1
+    drop layout
+    return run Allocator.outOfMemory()
+  }
+}
+effect fn allocateSlots(count: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let slots = run ValueSlots.make(count)
+  drop slots
+  return true
+}
+effect fn refused(error: OutOfMemoryError) -> bool {
+  drop error
+  return false
+}
+
+test effect fn valueSlotsRejectOverflowBeforeAllocationAndHandleEmpty() -> ()
+  ! AssertionError<'static> {
+  let mut allocator = RefusingAllocator { attempts: 0 }
+  let empty = run Effect.catchAll(allocateSlots(0), refused)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let overflowCount = usize.MAX / Layout.of<Value>().bytes + 1
+  let overflow = run Effect.catchAll(allocateSlots(overflowCount), refused)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let noRequests = allocator.attempts == 0
+  let ordinary = run Effect.catchAll(allocateSlots(4), refused)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(empty && !overflow && noRequests, "zero slots need no allocation; overflowing byte multiplication never reaches allocator")
+  run Testing.expect(!ordinary && allocator.attempts == 1, "ordinary allocation refusal propagates without a second attempt")
+}
+
+test effect fn valueSlotAllocationFailurePreservesLiveStorage() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = run RuntimeAllocator<SystemAllocator>.make(Allocator.systemAllocatorProvider())
+  let mut held = run ValueSlots.make(1) |> Effect.provideMut<Allocator>(&mut allocator)
+  let previous = held.replace(0, Value.Int { value: 91 })
+  let before = allocator.stats()
+  allocator.setLimit(before.usedBytes)
+  let made = run Effect.catchAll(allocateSlots(4), refused)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let after = allocator.stats()
+  let unchanged = integerIs(held.get(0), 91)
+  drop held
+  let empty = allocator.stats()
+  run Testing.expect(!made && unchanged && isUndefined(previous), "failed slot allocation leaves earlier storage intact")
+  run Testing.expect(after.usedBytes == before.usedBytes && after.allocationCount == before.allocationCount, "failed allocation adds no native ownership")
+  run Testing.expect(empty.usedBytes == 0 && empty.allocationCount == 0, "earlier storage remains reclaimable after failure")
+}
+
+test effect fn stableFrameAndSlotsSurviveOwnerRelocation() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = run RuntimeAllocator<SystemAllocator>.make(Allocator.systemAllocatorProvider())
+  let arguments = run ValueSlots.make(2) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut locals = run ValueSlots.make(2) |> Effect.provideMut<Allocator>(&mut allocator)
+  let stack = run ValueSlots.make(4) |> Effect.provideMut<Allocator>(&mut allocator)
+  let localAddress = locals.address(1)
+  let mut frame = run StableFrame.make(StackFrame {
+    previous: Pointer.null<StackFrame>(), asyncOwner: Pointer.null<HeapHeader>(), currentFunction: Value.Undefined,
+    arguments: FrameSlots.Owned { slots: move arguments },
+    locals: FrameSlots.Owned { slots: move locals },
+    stack: FrameSlots.Owned { slots: move stack },
+    varRefs: FrameReferences.Owned { slots: List<?*mut HeapHeader>.make() }, currentPc: Option<usize>.none(),
+    argumentCount: 2, mode: 0, stackPointer: Option<usize>.none()
+  }) |> Effect.provideMut<Allocator>(&mut allocator)
+  let frameAddress = frame.address()
+  let mut frames = List<StableFrame>.make()
+  run frames.append(move frame) |> Effect.provideMut<Allocator>(&mut allocator)
+  let beforeCapacity = frames.capacity()
+  run frames.reserve(64) |> Effect.provideMut<Allocator>(&mut allocator)
+  let grew = frames.capacity() > beforeCapacity
+  let secondFrameAddress = frames.asMutSlice()[0].address()
+  let mut anchor = ()
+  let liveFrame = unsafe Pointer.borrowMut<(), StackFrame>(&mut anchor, frameAddress)
+  let old = unsafe liveFrame.locals.replace(1, Value.Int { value: 47 })
+  drop liveFrame
+  let throughOldSlotPointer = unsafe Pointer.read<Value>(localAddress)
+  let throughOwner = unsafe frames.asSlice()[0].get().locals.get(1)
+  let liveAllocations = allocator.stats().allocationCount
+  drop frames
+  let released = allocator.stats()
+  run Testing.expect(grew && Pointer.address<StackFrame>(frameAddress) == Pointer.address<StackFrame>(secondFrameAddress), "frame address survives forced owner-container reallocation")
+  run Testing.expect(isUndefined(old) && integerIs(throughOldSlotPointer, 47) && integerIs(throughOwner, 47), "old slot pointer and frame owner observe the same stable activation")
+  run Testing.expect(liveAllocations == 5 && released.allocationCount == 0 && released.usedBytes == 0, "frame, three slot arrays and owner container each reclaim their storage")
+}
+
+test effect fn borrowedFrameSlotsMutateCallerStorageWithoutOwningIt() -> ()
+  ! AssertionError<'static> {
+  let mut caller: [Value; 2] = [Value.Int { value: 5 }, Value.Int { value: 8 }]
+  let address = Pointer.fromMutRef<Value>(&mut caller[0])
+  let mut borrowed = FrameSlots.Borrowed { data: address, length: 2 }
+  let read = unsafe borrowed.get(0)
+  let old = unsafe borrowed.replace(1, Value.Int { value: 13 })
+  drop borrowed
+  run Testing.expect(integerIs(read, 5) && integerIs(old, 8) && integerIs(caller[1], 13), "borrowed activation slots access the original initialized caller array")
+}
+
+test effect fn heapListMaintainsBidirectionalOrderAndDetachesRemovedNodes() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = run RuntimeAllocator<SystemAllocator>.make(Allocator.systemAllocatorProvider())
+  let first = run makeCell(11) |> Effect.provideMut<Allocator>(&mut allocator)
+  let middle = run makeCell(23) |> Effect.provideMut<Allocator>(&mut allocator)
+  let last = run makeCell(37) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut list = HeapList.make()
+  let originallyEmpty = list.isEmpty()
+  unsafe list.pushBack(middle.header)
+  unsafe list.pushBack(last.header)
+  unsafe list.pushFront(first.header)
+  let forwardAndReverse = unsafe links(first.header, Pointer.null<HeapHeader>(), middle.header)
+    && unsafe links(middle.header, first.header, last.header)
+    && unsafe links(last.header, middle.header, Pointer.null<HeapHeader>())
+  let endpoints = Pointer.address<HeapHeader>(list.first) == Pointer.address<HeapHeader>(first.header)
+    && Pointer.address<HeapHeader>(list.last) == Pointer.address<HeapHeader>(last.header)
+  unsafe list.remove(middle.header)
+  let removedMiddle = unsafe detached(middle.header)
+    && unsafe links(first.header, Pointer.null<HeapHeader>(), last.header)
+    && unsafe links(last.header, first.header, Pointer.null<HeapHeader>())
+  unsafe list.remove(last.header)
+  let removedTail = unsafe detached(last.header)
+    && Pointer.address<HeapHeader>(list.last) == Pointer.address<HeapHeader>(first.header)
+  unsafe list.pushBack(last.header)
+  unsafe list.remove(first.header)
+  let removedHead = unsafe detached(first.header)
+    && Pointer.address<HeapHeader>(list.first) == Pointer.address<HeapHeader>(last.header)
+  unsafe list.pushFront(middle.header)
+  let poppedFirst = unsafe list.popFront()
+  let poppedLast = unsafe list.popFront()
+  let poppedEmpty = unsafe list.popFront()
+  let emptyResult = match move poppedEmpty {
+    Option<*mut HeapHeader>.None => true
+    Option<*mut HeapHeader>.Some { value: _ } => false
+  }
+  let fifo = poppedIs(move poppedFirst, middle.header) && poppedIs(move poppedLast, last.header)
+  let allDetached = unsafe detached(first.header) && unsafe detached(middle.header) && unsafe detached(last.header)
+  let emptyEndpoints = list.isEmpty() && Pointer.isNull<HeapHeader>(list.last)
+  let unchangedCounts = unsafe count(first.header) == 1 && unsafe count(middle.header) == 1 && unsafe count(last.header) == 1
+  drop first
+  drop middle
+  drop last
+  let reclaimed = allocator.stats()
+  run Testing.expect(originallyEmpty && forwardAndReverse && endpoints, "front/back insertion establishes both directions and endpoints")
+  run Testing.expect(removedMiddle && removedTail && removedHead, "middle, tail and head removal repair neighbors and clear removed links")
+  run Testing.expect(fifo && emptyResult && emptyEndpoints && allDetached, "FIFO removal through singleton and empty lists leaves no stale links")
+  run Testing.expect(unchangedCounts && reclaimed.allocationCount == 0 && reclaimed.usedBytes == 0, "list membership never retains or destroys nodes")
+}
+
+test effect fn byteStorageTransfersOwnedBytesAndBorrowsWithoutCopy() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = run RuntimeAllocator<SystemAllocator>.make(Allocator.systemAllocatorProvider())
+  let mut bytes = List<u8>.make()
+  run bytes.append(17) |> Effect.provideMut<Allocator>(&mut allocator)
+  run bytes.append(83) |> Effect.provideMut<Allocator>(&mut allocator)
+  let pointer = Pointer.fromRef<u8>(&bytes.asSlice()[0])
+  let borrowed = ByteStorage.Borrowed { data: pointer, length: 2 }
+  let second = unsafe borrowed.byte(1)
+  let borrowedPointer = unsafe borrowed.pointerAt(0)
+  drop borrowed
+  let afterBorrow = allocator.stats().allocationCount
+  let owned = ByteStorage.Owned { bytes: move bytes }
+  let ownedPointer = unsafe owned.pointerAt(0)
+  let first = unsafe owned.byte(0)
+  let length = owned.length()
+  drop owned
+  let released = allocator.stats()
+  run Testing.expect(second == 83 && first == 17 && length == 2, "owned and borrowed reads preserve byte storage")
+  run Testing.expect(Pointer.address<u8>(pointer) == Pointer.address<u8>(borrowedPointer)
+    && Pointer.address<u8>(pointer) == Pointer.address<u8>(ownedPointer), "borrowing and ownership transfer never copy the byte allocation")
+  run Testing.expect(afterBorrow == 1 && released.allocationCount == 0 && released.usedBytes == 0, "borrowed destruction preserves external storage; owned destruction reclaims it")
+}

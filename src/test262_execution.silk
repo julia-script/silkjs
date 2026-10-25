@@ -1,0 +1,260 @@
+//! Pinned eval_buf: evaluate real source, drain real jobs, inspect module promises.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.list { List }
+import silk.pointer { Pointer }
+import silk.result { Result }
+import silk.slice { Slice }
+import js_libc { Session }
+import js_engine { Engine }
+import js_libc_services { LibcServices }
+import js_heap { HeapCell, HeapHeader }
+import js_core_types { RuntimeState, NativeErrorKind }
+import js_value { Value }
+import js_exceptions { JsException }
+import js_string_types { StringOwner, StringLengthError }
+import js_bigint { BigIntError }
+import js_coercion_host { CoercionHooks }
+import js_strings { Strings }
+import js_eval as evaluation
+import js_eval_compile as flags
+import js_eval_errors as errors
+import js_runtime_jobs as jobs
+import js_promise as promise
+import js_exceptions as exceptions
+import js_gc as gc
+import js_boxing as boxing
+import js_coercions as coercions
+import js_property_mutations as properties
+import js_libc_platform as platform
+import js_std_native as stdio
+import js_value_print as printing
+import js_value_print { Options }
+import cli_io
+import test262_host as host
+import test262_text as text
+import test262_types { Metadata }
+import test262_report { Observation }
+pub struct IncludeFailure {}
+
+pub unsafe fn output(file: ?*mut stdio.File, bytes: &[u8]) -> () {
+  if !Pointer.isNull<stdio.File>(file) {
+    let written = unsafe stdio.write(unsafe Intrinsic.pointerRequalify<?*mut stdio.File, *mut stdio.File>(file), bytes)
+  }
+}
+unsafe effect fn stringify<'m>(session: &mut Session<'m>, value: Value) -> List<u8>
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let converted = run Effect.result(unsafe coercions.toString(&mut session.engine, session.context, value))
+  let string = match move converted {
+    Result<Value, OutOfMemoryError | JsException | StringLengthError | BigIntError>.Success { value: convertedValue } => StringOwner.adopt(convertedValue)
+    Result<Value, OutOfMemoryError | JsException | StringLengthError | BigIntError>.Failure { error } => {
+      return run unsafe errors.materialize<List<u8>, Engine<'m, LibcServices>>(&mut session.engine, session.context, move error)
+    }
+  }
+  return run Strings.toUtf8(string.get(), false)
+}
+unsafe effect fn property<'m>(session: &mut Session<'m>, object: Value, name: &[u8]) -> Value
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, session.runtime)
+  let interned = run Effect.result(state.atoms.internUtf8(name)) drop state
+  let atom = match move interned {
+    Result<u32, OutOfMemoryError | StringLengthError>.Success { value } => value
+    Result<u32, OutOfMemoryError | StringLengthError>.Failure { .. } => { return run unsafe session.engine.throwOutOfMemory(session.context) }
+  }
+  let result = run Effect.result(unsafe session.engine.getProperty(session.context, object, atom))
+  unsafe properties.releaseAtom(session.runtime, atom)
+  return match move result {
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => value
+    Result<Value, OutOfMemoryError | JsException>.Failure { error } => { fail move error }
+  }
+}
+unsafe effect fn evaluate<'m>(session: &mut Session<'m>, source: &[u8], filename: &[u8], evalFlags: i32, async: bool)
+  -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  host.resetDone(&mut session.engine)
+  let memory = session.engine.memory
+  let result = run unsafe evaluation.evaluate(&mut session.engine, memory, session.context, source, filename, evalFlags)
+  let module = (evalFlags & flags.TYPE_MASK) == flags.TYPE_MODULE
+  if !async && !module { return result }
+  let pumped = run Effect.result(unsafe drain(&mut session))
+  match move pumped {
+    Result<(), OutOfMemoryError | JsException>.Success { .. } => ()
+    Result<(), OutOfMemoryError | JsException>.Failure { error } => { unsafe gc.release(&mut session.engine, session.runtime, result) fail move error }
+  }
+  if async {
+    unsafe gc.release(&mut session.engine, session.runtime, result)
+    if host.asyncDone(&session.engine) != 1 { return run unsafe session.engine.throwError(session.context, NativeErrorKind.Type, b"$DONE() not called") }
+    return Value.Undefined
+  }
+  if module {
+    let state = unsafe promise.state(result)
+    let rejected = state == 2
+    let mut reason = Value.Undefined
+    if rejected { reason = unsafe promise.result(result) }
+    unsafe gc.release(&mut session.engine, session.runtime, result)
+    if rejected { return run unsafe exceptions.throwValue<Value, Engine<'m, LibcServices>>(&mut session.engine, session.runtime, reason) }
+    if state != 1 { return run unsafe session.engine.throwError(session.context, NativeErrorKind.Type, b"promise is pending") }
+    return Value.Undefined
+  }
+  return result
+}
+pub unsafe effect fn drain<'m>(session: &mut Session<'m>) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  while true {
+    let job = run unsafe jobs.executePendingJob(&mut session.engine, session.runtime)
+    if job.status < 0 { fail JsException {} }
+    if job.status == 0 { return }
+  }
+}
+pub unsafe effect fn includes<'m>(session: &mut Session<'m>, metadata: &Metadata, testFilename: &[u8]) -> ()
+  ! OutOfMemoryError | JsException | IncludeFailure ? &mut Allocator {
+  let mut index: usize = 0
+  while index < metadata.includes.length() {
+    let include = metadata.includes.asSlice()[index].asSlice()
+    let path = run text.path(metadata.harness.asSlice(), include)
+    let loaded = run Effect.result(platform.readFile(path.asSlice()))
+    let source = match move loaded {
+      Result<List<u8>, OutOfMemoryError | platform.PlatformError>.Success { value } => move value
+      Result<List<u8>, OutOfMemoryError | platform.PlatformError>.Failure { error } => match move error {
+        OutOfMemoryError allocation => { fail move allocation }
+        platform.PlatformError fileError => {
+          platform.flush() cli_io.stderr(b"run-test262: ") platform.printFileError(path.asSlice(), move fileError)
+          fail IncludeFailure {}
+        }
+      }
+    }
+    let memory = session.engine.memory
+    let evaluated = run Effect.result(unsafe evaluation.evaluate(&mut session.engine, memory, session.context, source.asSlice(), path.asSlice(), flags.TYPE_GLOBAL))
+    match move evaluated {
+      Result<Value, JsException>.Success { value } => { unsafe gc.release(&mut session.engine, session.runtime, value) }
+      Result<Value, JsException>.Failure { .. } => {
+        let exception = unsafe exceptions.take(session.runtime)
+        let mut observation = Observation { failed: true, threw: true, negative: false, strict: false,
+          line: 1, hasLine: false, message: List<u8>.make() }
+        let inspected = run Effect.result(unsafe exceptionInfo(&mut session, exception, path.asSlice(), &mut observation, unsafe stdio.error(), false))
+        unsafe gc.release(&mut session.engine, session.runtime, exception)
+        match move inspected {
+          Result<(), OutOfMemoryError | JsException>.Success { .. } => ()
+          Result<(), OutOfMemoryError | JsException>.Failure { error } => { fail move error }
+        }
+        platform.flush()
+        cli_io.stderr(b"run-test262: error evaluating ") cli_io.stderr(path.asSlice()) cli_io.stderr(b"\n")
+        cli_io.stderr(b"run-test262: error including ") cli_io.stderr(include) cli_io.stderr(b" for ")
+        cli_io.stderr(testFilename) cli_io.stderr(b"\n")
+        fail IncludeFailure {}
+      }
+    }
+    index = index + 1
+  }
+}
+unsafe effect fn exceptionInfo<'m>(session: &mut Session<'m>, exception: Value, filename: &[u8], observation: &mut Observation, file: ?*mut stdio.File, harness: bool)
+  -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  observation.message = run unsafe stringify(&mut session, exception)
+  let isError = unsafe boxing.isError(exception)
+  if isError {
+    if !Pointer.isNull<stdio.File>(file) {
+      let memory = session.engine.memory
+      let rendered = run unsafe printing.printValue(&mut session.engine, memory, session.context, exception, Options.defaults())
+      unsafe output(file, rendered.asSlice()) unsafe output(file, b"\n")
+    }
+  } else {
+    if !harness {
+      if observation.strict { unsafe output(file, b"strict mode: ") }
+      unsafe output(file, b"Throw: ")
+    }
+    unsafe output(file, observation.message.asSlice()) unsafe output(file, b"\n")
+  }
+  if isError {
+    let stack = run unsafe property(&mut session, exception, b"stack")
+    let converted = run Effect.result(unsafe stringify(&mut session, stack))
+    let defined = stack.tag() != Value.Undefined.tag()
+    unsafe gc.release(&mut session.engine, session.runtime, stack)
+    if defined {
+      let stackBytes = match move converted {
+        Result<List<u8>, OutOfMemoryError | JsException>.Success { value } => move value
+        Result<List<u8>, OutOfMemoryError | JsException>.Failure { error } => { fail move error }
+      }
+      if !harness { unsafe output(file, stackBytes.asSlice()) }
+      let at = text.find(stackBytes.asSlice(), filename, 0)
+      let after = at + filename.length
+      if after < stackBytes.length() && stackBytes.get(after) == 58 {
+        observation.line = text.number(Slice.view(stackBytes.asSlice(), after + 1, stackBytes.length() - after - 1))
+        observation.hasLine = true
+      }
+    }
+  }
+}
+unsafe effect fn harnessException<'m>(session: &mut Session<'m>, exception: Value, filename: &[u8], observation: &mut Observation, file: ?*mut stdio.File)
+  -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  observation.failed = true observation.threw = true
+  let inspected = run Effect.result(unsafe exceptionInfo(&mut session, exception, filename, &mut observation, file, true))
+  unsafe gc.release(&mut session.engine, session.runtime, exception)
+  match move inspected {
+    Result<(), OutOfMemoryError | JsException>.Success { .. } => ()
+    Result<(), OutOfMemoryError | JsException>.Failure { error } => { fail move error }
+  }
+}
+unsafe effect fn harnessObserve<'m>(session: &mut Session<'m>, source: &[u8], filename: &[u8], module: bool, file: ?*mut stdio.File)
+  -> Observation ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut observation = Observation { failed: false, threw: false, negative: false,
+    strict: false, line: 1, hasLine: false, message: List<u8>.make() }
+  let mut evalFlags = flags.TYPE_GLOBAL if module { evalFlags = flags.TYPE_MODULE }
+  let memory = session.engine.memory
+  let evaluated = run Effect.result(unsafe evaluation.evaluate(&mut session.engine, memory, session.context, source, filename, evalFlags))
+  let value = match move evaluated {
+    Result<Value, JsException>.Success { value } => value
+    Result<Value, JsException>.Failure { .. } => {
+      let exception = unsafe exceptions.take(session.runtime)
+      run unsafe harnessException(&mut session, exception, filename, &mut observation, file)
+      return move observation
+    }
+  }
+  let completed = run Effect.result(unsafe harnessJobs(&mut session, value, filename, &mut observation, file, module))
+  unsafe gc.release(&mut session.engine, session.runtime, value)
+  match move completed {
+    Result<(), OutOfMemoryError | JsException>.Success { .. } => ()
+    Result<(), OutOfMemoryError | JsException>.Failure { error } => { fail move error }
+  }
+  return move observation
+}
+unsafe effect fn harnessJobs<'m>(session: &mut Session<'m>, value: Value, filename: &[u8], observation: &mut Observation, file: ?*mut stdio.File, module: bool)
+  -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  // eshost mode continues after job errors; ordinary eval_buf stops at the first.
+  while true {
+    let job = run unsafe jobs.executePendingJob(&mut session.engine, session.runtime)
+    if job.status < 0 {
+      let exception = unsafe exceptions.take(session.runtime)
+      run unsafe harnessException(&mut session, exception, filename, &mut observation, file)
+    } else if job.status == 0 { break }
+  }
+  if module && unsafe promise.state(value) == 2 {
+    run unsafe harnessException(&mut session, unsafe promise.result(value), filename, &mut observation, file)
+  }
+}
+pub unsafe effect fn observe<'m>(session: &mut Session<'m>, source: &[u8], filename: &[u8], metadata: &Metadata,
+  strict: bool, harness: bool, file: ?*mut stdio.File) -> Observation ! OutOfMemoryError | JsException ? &mut Allocator {
+  if harness { return run unsafe harnessObserve(&mut session, source, filename, metadata.module, file) }
+  let mut evalFlags = flags.TYPE_GLOBAL
+  if metadata.module { evalFlags = flags.TYPE_MODULE }
+  if strict { evalFlags = evalFlags | flags.FLAG_STRICT }
+  let evaluated = run Effect.result(unsafe evaluate(&mut session, source, filename, evalFlags, metadata.async))
+  let mut observation = Observation { failed: metadata.negative, threw: false, negative: metadata.negative,
+    strict: strict, line: 1, hasLine: false, message: List<u8>.make() }
+  match move evaluated {
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => { unsafe gc.release(&mut session.engine, session.runtime, value) }
+    Result<Value, OutOfMemoryError | JsException>.Failure { error } => {
+      match move error { OutOfMemoryError allocation => { fail move allocation } JsException signal => () }
+      observation.threw = true observation.failed = !metadata.negative
+      let exception = unsafe exceptions.take(session.runtime)
+      let inspected = run Effect.result(unsafe exceptionInfo(&mut session, exception, filename, &mut observation, file, harness))
+      unsafe gc.release(&mut session.engine, session.runtime, exception)
+      match move inspected {
+        Result<(), OutOfMemoryError | JsException>.Success { .. } => ()
+        Result<(), OutOfMemoryError | JsException>.Failure { error: inspectedError } => { fail move inspectedError }
+      }
+      if metadata.negative && metadata.errorType.length() != 0 {
+        let colon = text.find(observation.message.asSlice(), b":", 0)
+        observation.failed = !text.equal(Slice.view(observation.message.asSlice(), 0, colon), metadata.errorType.asSlice())
+      }
+    }
+  }
+  return move observation
+}

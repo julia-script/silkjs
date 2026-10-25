@@ -1,0 +1,119 @@
+//! Real Session std allocation sweeps: ordinal failures, native descriptor balance,
+//! clean-success termination and complete runtime/namespace/domain teardown.
+//! In-memory modules use URI names; filesystem names require realpath metadata.
+import silk.allocator { Allocator, OutOfMemoryError, SystemAllocator }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.layout { Layout }
+import silk.pointer { Pointer }
+import silk.usize
+import silk.writer { Writer, WriterError }
+import silk.os_writer { StdoutWriter }
+import byte_buffer { ByteBuffer }
+import runtime_memory { RuntimeAllocator }
+import js_atomics_native { WaiterDomain, SynchronizationError }
+import js_runtime_registry { ClassIdAllocator }
+import js_value { Value }
+import js_core_types { FrameSlots }
+import js_exceptions { JsException }
+import js_exceptions as exceptions
+import js_gc as gc
+import js_libc as libc
+import js_libc { Session }
+import js_call_host { CallHooks }
+import js_eval as evaluation
+import js_std_native as native
+import js_os_platform as platform
+import silk.i32
+struct FaultAllocator { parent:RuntimeAllocator<SystemAllocator>,remaining:usize,failed:bool }
+impl Allocator for FaultAllocator {
+  effect fn allocate(self:&mut Self,layout:Layout)->Intrinsic.Allocation ! OutOfMemoryError {
+    if self.remaining==0 { self.remaining=usize.MAX self.failed=true return run Allocator.outOfMemory() }
+    if self.remaining!=usize.MAX { self.remaining=self.remaining-1 }
+    return run Allocator.allocate(move layout) |> Effect.provideMut<Allocator>(&mut self.parent)
+  }
+}
+unsafe extern "C" fn fcntl(fd:i32,command:i32,...)->i32
+fn descriptors()->u32 { let mut count:u32=0 let mut fd:i32=0 while fd<1024 { if unsafe fcntl(fd,1)>=0 { count=count+1 } fd=fd+1 } return count }
+fn diagnostic(operation:usize,ordinal:usize)->() {
+  let mut bytes:[u8;128]=[0;128]
+  let count=unsafe native.snprintf(Pointer.fromMutRef(&mut bytes[0]),128,Pointer.fromRef(&b"std fixture operation=%zu ordinal=%zu\n\0"[0]),operation,ordinal)
+  if count>0 && count<128 { let ignored=unsafe platform.write(2,Pointer.fromRef(&bytes[0]),i32.toUsize(count)) }
+}
+fn source(index:usize)->&'static [u8] {
+  return match index {
+    0=>b"(()=>{let f=std.tmpfile();if(!f)throw Error('tmpfile');try{f.puts('alpha\\nbeta');f.seek(0,0);if(f.getline()!=='alpha'||f.readAsString()!=='beta')throw Error('file')}finally{f.close()}return true})"
+    1=>b"(()=>{let f=std.popen(\"printf 'pipe'\",'r');if(!f)throw Error('popen');try{if(f.readAsString()!=='pipe')throw Error('pipe')}finally{f.close()}return true})"
+    2=>b"(()=>{let x=std.sprintf('%020ld|%.*f|%s|%c',123n,3,1.25,'hello',0x1f600);if(x!=='00000000000000000123|1.250|hello|\\ud83d\\ude00')throw Error(x);return true})"
+    3=>b"(()=>{let x=std.parseExtJSON('{a:1,b:[2,3,],}');if(x.a!==1||x.b[1]!==3)throw Error('JSON');return true})"
+    4=>b"(()=>{if(typeof std.getenviron()!=='object')throw Error('env');return true})"
+    5=>b"(()=>{if(std.evalScript('20+22')!==42)throw Error('eval');return true})"
+    6=>b"(()=>{let f=std.open('/dev/null','r');if(!f)throw Error('open');f.close();return true})"
+    7=>b"(()=>{let f=std.tmpfile();if(!f)throw Error('tmpfile');try{let b=new ArrayBuffer(4);new Uint8Array(b).set([0,1,2,255]);if(f.write(b,0,4)!==4)throw Error('write');f.seek(0,0);if(f.read(b,0,4)!==4)throw Error('read')}finally{f.close()}return true})"
+    8=>b"(()=>{let u=std.getenv('SILK_STD_URL');if(!u)throw Error('missing URL');let r=std.urlGet(u+'/ok',{binary:true,full:true});if(r.status!==200||new Uint8Array(r.response)[3]!==255)throw Error('url');return true})"
+    9=>b"(()=>{let f=std.tmpfile();if(!f)throw Error('tmpfile');f.puts('owned by finalizer');f=null;std.gc();globalThis.stdFinalizerFile=std.tmpfile();if(!stdFinalizerFile)throw Error('late tmpfile');stdFinalizerFile.puts('retained until runtime teardown');return true})"
+    _=>Intrinsic.trap("std fault operation")
+  }
+}
+pub effect fn main()->i32 ! OutOfMemoryError|SynchronizationError|WriterError {
+  let mut allocator=FaultAllocator { parent:run RuntimeAllocator.make(Allocator.systemAllocatorProvider()),remaining:usize.MAX,failed:false }
+  let memory=run allocator.parent.observe()
+  let namespace=run ClassIdAllocator.make() |> Effect.provideMut<Allocator>(&mut allocator)
+  let process=run Process.make(&namespace)
+  let domain=run WaiterDomain.make() |> Effect.provideMut<Allocator>(&mut allocator)
+  let baseline=allocator.parent.stats() let nativeBaseline=descriptors()
+  let mut attempts:u32=0 let mut injected:u32=0 let mut operation:usize=0
+  while operation<11 {
+    let mut ordinal:usize=0
+    while true {
+      allocator.failed=false
+      if operation==10 { allocator.remaining=ordinal }
+      let opened=run Effect.result(unsafe Session.open(&memory,domain.handle(),&process,false)) |> Effect.provideMut<Allocator>(&mut allocator)
+      if operation==10 { allocator.remaining=usize.MAX }
+      let mut clean=false
+      match move opened {
+        Result.Success { value:session }=>{
+          let mut active=move session
+          if operation==10 { clean=true } else {
+            let imported=run Effect.result(unsafe libc.evalBuffer(&mut active.engine,active.context,b"import * as s from 'std'; globalThis.std=s;",b"std-fixture:import",1)) |> Effect.provideMut<Allocator>(&mut allocator)
+            match move imported {
+              Result<Value,OutOfMemoryError|JsException>.Success { value }=>{ unsafe gc.release(&mut active.engine,active.runtime,value) }
+              Result<Value,OutOfMemoryError|JsException>.Failure { .. }=>{
+                diagnostic(operation,ordinal)
+                run unsafe libc.dumpError(&mut active.engine,active.context) |> Effect.provideMut<Allocator>(&mut allocator)
+                run unsafe active.close() |> Effect.provideMut<Allocator>(&mut allocator) return 2
+              }
+            }
+            let prepared=run Effect.result(unsafe evaluation.evaluate(&mut active.engine,&memory,active.context,source(operation),b"std-fault.js",0)) |> Effect.provideMut<Allocator>(&mut allocator)
+            let function=match move prepared { Result<Value,JsException>.Success { value }=>value Result<Value,JsException>.Failure { .. }=>{ run unsafe active.close() |> Effect.provideMut<Allocator>(&mut allocator) return 3 } }
+            let mut slot=Value.Undefined let args=FrameSlots.Borrowed { data:Pointer.fromMutRef(&mut slot),length:0 }
+            allocator.remaining=ordinal
+            let called=run Effect.result(unsafe active.engine.callArguments(active.context,function,Value.Undefined,&args)) |> Effect.provideMut<Allocator>(&mut allocator)
+            allocator.remaining=usize.MAX
+            match move called { Result<Value,OutOfMemoryError|JsException>.Success { value }=>{ clean=match value { Value.Bool { value:boolean }=>boolean _=>false } unsafe gc.release(&mut active.engine,active.runtime,value) } Result<Value,OutOfMemoryError|JsException>.Failure { .. }=>() }
+            unsafe gc.release(&mut active.engine,active.runtime,function)
+          }
+          if unsafe exceptions.has(active.runtime) { unsafe gc.release(&mut active.engine,active.runtime,unsafe exceptions.take(active.runtime)) }
+          run unsafe active.close() |> Effect.provideMut<Allocator>(&mut allocator)
+        }
+        Result.Failure { .. }=>{ if operation!=10 { return 4 } }
+      }
+      attempts=attempts+1 if allocator.failed { injected=injected+1 }
+      let after=allocator.parent.stats()
+      if after.usedBytes!=baseline.usedBytes || after.allocationCount!=baseline.allocationCount { return 90 }
+      if descriptors()!=nativeBaseline { return 91 }
+      if !allocator.failed { if !clean { diagnostic(operation,ordinal) return 92 } break }
+      ordinal=ordinal+1
+    }
+    operation=operation+1
+  }
+  drop domain drop process drop namespace
+  if allocator.parent.stats().usedBytes!=0 || allocator.parent.stats().allocationCount!=0 { return 99 }
+  let mut system=Allocator.systemAllocatorProvider() let mut out=ByteBuffer.make()
+  run out.writeU32(11) |> Effect.provideMut<Allocator>(&mut system)
+  run out.writeU32(attempts) |> Effect.provideMut<Allocator>(&mut system)
+  run out.writeU32(injected) |> Effect.provideMut<Allocator>(&mut system)
+  let mut writer=StdoutWriter.make() run Writer.writeAll(out.asSlice()) |> Effect.provideMut<Writer>(&mut writer)
+  return 0
+}
+import js_libc_process { Process }

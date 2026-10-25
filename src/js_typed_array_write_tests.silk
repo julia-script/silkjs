@@ -1,0 +1,382 @@
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.f64
+import silk.list { List }
+import silk.result { Result }
+import silk.testing { Testing, AssertionError }
+import silk.u64
+import silk.usize
+import runtime_memory { RuntimeAllocator }
+import js_heap { HeapCell, HeapHeader }
+import js_core_types { ObjectData, ObjectPayload }
+import js_value { Value }
+import js_gc as gc
+import js_runtime as runtime
+import js_object_allocate as objects
+import js_class_data as classes
+import js_strings { Strings }
+import js_string_types { StringLengthError, stringReference }
+import js_bigint { BigIntError }
+import js_bigint_coercions as bigint
+import js_exceptions { JsException }
+import js_exceptions as exceptions
+import js_typed_array_write as typed
+import js_typed_array_write_test_support as fixture
+import js_typed_array_write_test_support { Hooks }
+import js_property_get_test_support as base
+import js_property_descriptors_test_support { ByteView, errorKind }
+import js_array_storage_test_support as storage
+import js_array_storage_test_support { reference, rc, FaultAllocator }
+
+// Independent byte oracle: the explicit golden word is written at a byte offset;
+// every other byte must retain its guard. No typed reader or coercion computes it.
+unsafe fn written(object: Value, offset: usize, width: usize, golden: u64) -> bool {
+  let anchor = () let data = unsafe HeapCell.payload<ByteView, ()>(&anchor, unsafe fixture.view(object))
+  let bytes = data.bytes.asSlice()
+  let mut index: usize = 0
+  while index < bytes.length {
+    let mut expected: u8 = 0xa5
+    if index >= offset && index < offset + width {
+      expected = u64.toU8(u64.shiftRight(golden, usize.toU64((index - offset) * 8)) & 255)
+    }
+    if bytes[index] != expected { return false }
+    index = index + 1
+  }
+  return true
+}
+struct Case { classId: u32, value: Value, width: usize, bits: u64 }
+
+test effect fn typedWritesStoreEveryScalarFamilyWithoutAllocation() -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider()) let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe storage.context(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make(&observer)
+  let cases = [
+    Case { classId: classes.JS_CLASS_UINT8C_ARRAY, value: Value.Float64 { value: 253.5 }, width: 1, bits: 254 },
+    Case { classId: classes.JS_CLASS_INT8_ARRAY, value: Value.Float64 { value: -257.75 }, width: 1, bits: 255 },
+    Case { classId: classes.JS_CLASS_UINT8_ARRAY, value: Value.Float64 { value: 258.9 }, width: 1, bits: 2 },
+    Case { classId: classes.JS_CLASS_INT16_ARRAY, value: Value.Float64 { value: -65537.75 }, width: 2, bits: 65535 },
+    Case { classId: classes.JS_CLASS_UINT16_ARRAY, value: Value.Float64 { value: 65538.9 }, width: 2, bits: 2 },
+    Case { classId: classes.JS_CLASS_INT32_ARRAY, value: Value.Float64 { value: 4294967295.0 }, width: 4, bits: 0xffffffff },
+    Case { classId: classes.JS_CLASS_UINT32_ARRAY, value: Value.Float64 { value: -1.9 }, width: 4, bits: 0xffffffff },
+    Case { classId: classes.JS_CLASS_BIG_INT64_ARRAY, value: Value.ShortBigInt { value: -1 }, width: 8, bits: 0xffffffffffffffff },
+    Case { classId: classes.JS_CLASS_BIG_UINT64_ARRAY, value: Value.ShortBigInt { value: -2 }, width: 8, bits: 0xfffffffffffffffe },
+    Case { classId: classes.JS_CLASS_FLOAT16_ARRAY, value: Value.Float64 { value: f64.fromBits(0x3ff0020000000001) }, width: 2, bits: 0x3c01 },
+    Case { classId: classes.JS_CLASS_FLOAT32_ARRAY, value: Value.Float64 { value: 16777217.0 }, width: 4, bits: 0x4b800000 },
+    Case { classId: classes.JS_CLASS_FLOAT64_ARRAY, value: Value.Float64 { value: f64.fromBits(0x8000000000000000) }, width: 8, bits: 0x8000000000000000 }
+  ]
+  let mut views = [Value.Undefined; 12] let mut index: usize = 0
+  while index < cases.length {
+    views[index] = run unsafe base.typed(&mut hooks.base, ctx, cases[index].classId,
+      b"\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5", 2) |> Effect.provideMut<Allocator>(&mut memory)
+    index = index + 1
+  }
+  let mut fault = FaultAllocator { parent: move memory, remaining: 0 }
+  index = 0
+  while index < cases.length {
+    run unsafe typed.writeIndex(&mut hooks, ctx, reference(views[index]), 1, cases[index].value) |> Effect.provideMut<Allocator>(&mut fault)
+    run Testing.expect(unsafe written(views[index], cases[index].width, cases[index].width, cases[index].bits),
+      "typed write preserves guards and stores independently specified scalar bits at element offset")
+    run Testing.expect(unsafe rc(reference(views[index])) == 1, "borrowed typed target is not consumed or leaked")
+    unsafe gc.release(&mut hooks, rt, views[index])
+    index = index + 1
+  }
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx) run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut fault)
+  run Testing.expect(observer.stats().usedBytes == 0 && observer.stats().allocationCount == 0, "scalar writes balance all owners")
+}
+
+test effect fn typedWritesClampAndRoundFloatEdgesAndRetainStringsAndHeapBigints() -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider()) let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe storage.context(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make(&observer)
+  let clamp = run unsafe base.typed(&mut hooks.base, ctx, classes.JS_CLASS_UINT8C_ARRAY, b"\xa5\xa5", 1) |> Effect.provideMut<Allocator>(&mut memory)
+  let inputs: [Value; 7] = [Value.Float64 { value: -1.5 }, Value.Float64 { value: 254.5 }, Value.Float64 { value: 255.5 },
+    Value.Undefined, Value.Bool { value: true }, Value.Null, Value.Float64 { value: f64.fromBits(0x7ff0000000000000) }]
+  let outputs: [u64; 7] = [0, 254, 255, 0, 1, 0, 255]
+  let mut index: usize = 0
+  while index < inputs.length {
+    run unsafe typed.writeIndex(&mut hooks, ctx, reference(clamp), 0, inputs[index]) |> Effect.provideMut<Allocator>(&mut memory)
+    run Testing.expect(unsafe written(clamp, 0, 1, outputs[index]), "clamp saturates, rounds ties to even, and coerces primitive values")
+    index = index + 1
+  }
+  let half = run unsafe base.typed(&mut hooks.base, ctx, classes.JS_CLASS_FLOAT16_ARRAY, b"\xa5\xa5\xa5", 1) |> Effect.provideMut<Allocator>(&mut memory)
+  let halfInputs: [u64; 6] = [0x8000000000000000, 0x3e70000000000000, 0x3e60000000000000,
+    0x3ff0020000000000, 0x40effe0000000000, 0x7ff8000000000000]
+  let halfOutputs: [u64; 6] = [0x8000, 1, 0, 0x3c00, 0x7c00, 0x7c01]
+  index = 0
+  while index < halfInputs.length {
+    run unsafe typed.writeIndex(&mut hooks, ctx, reference(half), 0, Value.Float64 { value: f64.fromBits(halfInputs[index]) }) |> Effect.provideMut<Allocator>(&mut memory)
+    run Testing.expect(unsafe written(half, 0, 2, halfOutputs[index]), "binary16 preserves zero sign, subnormals, ties, overflow and source NaN encoding")
+    index = index + 1
+  }
+  let single = run unsafe base.typed(&mut hooks.base, ctx, classes.JS_CLASS_FLOAT32_ARRAY, b"\xa5\xa5\xa5\xa5\xa5", 1) |> Effect.provideMut<Allocator>(&mut memory)
+  run unsafe typed.writeIndex(&mut hooks, ctx, reference(single), 0, Value.Float64 { value: f64.fromBits(0x8000000000000000) }) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(unsafe written(single, 0, 4, 0x80000000), "binary32 stores negative zero rather than integer zero")
+  let double = run unsafe base.typed(&mut hooks.base, ctx, classes.JS_CLASS_FLOAT64_ARRAY, b"\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5", 1) |> Effect.provideMut<Allocator>(&mut memory)
+  let numberText = run Strings.fromLatin1(b"1.5") |> Effect.provideMut<Allocator>(&mut memory)
+  run unsafe typed.writeIndex(&mut hooks, ctx, reference(double), 0, numberText) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(unsafe written(double, 0, 8, 0x3ff8000000000000) && unsafe rc(stringReference(numberText)) == 1,
+    "floating conversion parses an owned string without consuming its caller reference")
+  let signed = run unsafe base.typed(&mut hooks.base, ctx, classes.JS_CLASS_BIG_INT64_ARRAY, b"\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5", 1) |> Effect.provideMut<Allocator>(&mut memory)
+  let unsigned = run unsafe base.typed(&mut hooks.base, ctx, classes.JS_CLASS_BIG_UINT64_ARRAY, b"\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5", 1) |> Effect.provideMut<Allocator>(&mut memory)
+  let negativeText = run Strings.fromLatin1(b"-18446744073709551617") |> Effect.provideMut<Allocator>(&mut memory)
+  run unsafe typed.writeIndex(&mut hooks, ctx, reference(signed), 0, negativeText) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(unsafe written(signed, 0, 8, 0xffffffffffffffff) && unsafe rc(stringReference(negativeText)) == 1,
+    "BigInt64 parses strings then reduces modulo 2^64, preserving borrowed text")
+  let large = run bigint.newBigInt128(1, 1) |> Effect.provideMut<Allocator>(&mut memory)
+  run unsafe typed.writeIndex(&mut hooks, ctx, reference(unsigned), 0, large) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(unsafe written(unsigned, 0, 8, 1) && match large { Value.BigInt { reference: node } => unsafe rc(node) == 1 _ => false },
+    "BigUint64 uses low bits of a heap BigInt and leaves caller ownership intact")
+  run unsafe typed.writeIndex(&mut hooks, ctx, reference(unsigned), 0, Value.Bool { value: true }) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(unsafe written(unsigned, 0, 8, 1), "strict BigInt element conversion accepts Boolean true")
+  unsafe gc.release(&mut hooks, rt, numberText) unsafe gc.release(&mut hooks, rt, negativeText) unsafe gc.release(&mut hooks, rt, large)
+  unsafe gc.release(&mut hooks, rt, clamp) unsafe gc.release(&mut hooks, rt, half) unsafe gc.release(&mut hooks, rt, single)
+  unsafe gc.release(&mut hooks, rt, double) unsafe gc.release(&mut hooks, rt, signed) unsafe gc.release(&mut hooks, rt, unsigned)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx) run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observer.stats().usedBytes == 0 && observer.stats().allocationCount == 0, "edge conversions release all transient parsed numbers")
+}
+
+test effect fn typedWritesConvertBeforeEveryDetachedCacheCheckAndRootCallbackInputs() -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider()) let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe storage.context(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make(&observer)
+  run unsafe base.prepare(&mut hooks.base, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut classId = classes.JS_CLASS_UINT8C_ARRAY
+  while classId <= classes.JS_CLASS_FLOAT64_ARRAY {
+    let target = run unsafe base.typed(&mut hooks.base, ctx, classId,
+      b"\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5", 1) |> Effect.provideMut<Allocator>(&mut memory)
+    let mut result = Value.Int { value: 93 }
+    if classId == classes.JS_CLASS_BIG_INT64_ARRAY || classId == classes.JS_CLASS_BIG_UINT64_ARRAY { result = Value.ShortBigInt { value: 93 } }
+    let input = run unsafe fixture.input(&mut hooks, ctx, target, result, 5) |> Effect.provideMut<Allocator>(&mut memory)
+    let contextBefore = unsafe rc(ctx) let targetBefore = unsafe rc(reference(target)) let valueBefore = unsafe rc(reference(input))
+    let callsBefore = hooks.calls
+    run unsafe typed.writeIndex(&mut hooks, ctx, reference(target), 0, input) |> Effect.provideMut<Allocator>(&mut memory)
+    run Testing.expect(hooks.calls == callsBefore + 1 && unsafe fixture.detached(target) && unsafe fixture.rawEquals(target, b""),
+      "real coercion callback detaches the previously in-bounds view before the write")
+    run Testing.expect(hooks.contextRoots > contextBefore && hooks.targetRoots > targetBefore && hooks.valueRoots > valueBefore,
+      "context, target and borrowed value have independent roots throughout actual callback and collection")
+    run Testing.expect(unsafe rc(ctx) == contextBefore && unsafe rc(reference(target)) == targetBefore && unsafe rc(reference(input)) == valueBefore,
+      "successful detached write balances every temporary root")
+    let retired = Intrinsic.replace(hooks.retired, List<u8>.make())
+    run Testing.expect(retired.length() == 16, "detachment transferred actual backing storage out of the view")
+    let mut byte: usize = 0
+    while byte < retired.length() {
+      run Testing.expect(retired.asSlice()[byte] == 0xa5, "no conversion family writes to a stale detached cache")
+      byte = byte + 1
+    }
+    drop retired
+    unsafe gc.release(&mut hooks, rt, input) unsafe gc.release(&mut hooks, rt, target)
+    classId = classId + 1
+  }
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx) run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observer.stats().usedBytes == 0 && observer.stats().allocationCount == 0, "detaching callbacks leave no roots or byte owners")
+}
+
+test effect fn typedWritesRefreshCountAndDataAfterCallbackResizesView() -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider()) let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe storage.context(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make(&observer)
+  run unsafe base.prepare(&mut hooks.base, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut initialCount: u32 = 0
+  while initialCount < 2 {
+    let target = run unsafe base.typed(&mut hooks.base, ctx, classes.JS_CLASS_UINT8_ARRAY,
+      b"\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5", initialCount) |> Effect.provideMut<Allocator>(&mut memory)
+    let input = run unsafe fixture.input(&mut hooks, ctx, target, Value.Int { value: 93 }, 7) |> Effect.provideMut<Allocator>(&mut memory)
+    run unsafe typed.writeIndex(&mut hooks, ctx, reference(target), 0, input) |> Effect.provideMut<Allocator>(&mut memory)
+    run Testing.expect(unsafe written(target, 8, 1, 93), "post-callback count and pointer determine the store, never the pre-coercion cache")
+    unsafe gc.release(&mut hooks, rt, input) unsafe gc.release(&mut hooks, rt, target)
+    initialCount = initialCount + 1
+  }
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx) run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observer.stats().usedBytes == 0 && observer.stats().allocationCount == 0, "cache replacement ownership balances")
+}
+
+effect fn expectTypeFailure<'a>(hooks: &mut Hooks<'a>, context: *mut HeapHeader,
+  result: Result<(), OutOfMemoryError | StringLengthError | BigIntError | JsException>) -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | AssertionError<'static> {
+  match move result {
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { .. } => {
+      run Testing.expect(false, "out-of-bounds conversion must still reject the wrong numeric family")
+    }
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => match move error {
+      JsException thrown => {
+        let rt = unsafe runtime.contextRuntime(context)
+        let pending = unsafe exceptions.take(rt)
+        let kind = unsafe errorKind(context, pending)
+        unsafe gc.release(&mut hooks, rt, pending)
+        run Testing.expect(kind == 4, "conversion materializes a real TypeError")
+      }
+      OutOfMemoryError allocation => { fail move allocation }
+      StringLengthError length => { fail move length }
+      BigIntError bigintError => { fail move bigintError }
+    }
+  }
+}
+
+test effect fn typedOutOfBoundsStillCoercesByClassAndPropagatesErrorsWithoutStores() -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider()) let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe storage.context(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make(&observer)
+  run unsafe base.prepare(&mut hooks.base, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut classId = classes.JS_CLASS_UINT8C_ARRAY
+  while classId <= classes.JS_CLASS_FLOAT64_ARRAY {
+    let target = run unsafe base.typed(&mut hooks.base, ctx, classId,
+      b"\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5", 1) |> Effect.provideMut<Allocator>(&mut memory)
+    let mut result = Value.Int { value: 93 } let mut invalid = Value.ShortBigInt { value: 93 }
+    if classId == classes.JS_CLASS_BIG_INT64_ARRAY || classId == classes.JS_CLASS_BIG_UINT64_ARRAY {
+      result = Value.ShortBigInt { value: 93 } invalid = Value.Int { value: 93 }
+    }
+    let input = run unsafe fixture.input(&mut hooks, ctx, target, result, 0) |> Effect.provideMut<Allocator>(&mut memory)
+    let contextBefore = unsafe rc(ctx) let targetBefore = unsafe rc(reference(target)) let inputBefore = unsafe rc(reference(input))
+    let callsBefore = hooks.calls
+    run unsafe typed.writeIndex(&mut hooks, ctx, reference(target), 0xffffffff, input) |> Effect.provideMut<Allocator>(&mut memory)
+    run unsafe typed.convertOutOfBounds(&mut hooks, ctx, reference(target), input) |> Effect.provideMut<Allocator>(&mut memory)
+    run Testing.expect(hooks.calls == callsBefore + 2 && unsafe written(target, 0, 0, 0),
+      "integer OOB and canonical numeric miss each perform one coercion and neither stores")
+    run Testing.expect(hooks.contextRoots > contextBefore && hooks.targetRoots > targetBefore && hooks.valueRoots > inputBefore,
+      "canonical numeric miss roots all callback inputs too")
+    let badIndex = run Effect.result(unsafe typed.writeIndex(&mut hooks, ctx, reference(target), 99, invalid)) |> Effect.provideMut<Allocator>(&mut memory)
+    run expectTypeFailure(&mut hooks, ctx, move badIndex)
+    let badCanonical = run Effect.result(unsafe typed.convertOutOfBounds(&mut hooks, ctx, reference(target), invalid)) |> Effect.provideMut<Allocator>(&mut memory)
+    run expectTypeFailure(&mut hooks, ctx, move badCanonical)
+    run Testing.expect(unsafe rc(ctx) == contextBefore && unsafe rc(reference(target)) == targetBefore && unsafe rc(reference(input)) == inputBefore,
+      "both no-store paths preserve borrowed owners on success and type failure")
+    unsafe gc.release(&mut hooks, rt, input) unsafe gc.release(&mut hooks, rt, target)
+    classId = classId + 1
+  }
+  let target = run unsafe base.typed(&mut hooks.base, ctx, classes.JS_CLASS_INT16_ARRAY, b"\xa5\xa5", 1) |> Effect.provideMut<Allocator>(&mut memory)
+  let throwing = run unsafe fixture.input(&mut hooks, ctx, target, Value.Int { value: 501 }, 1) |> Effect.provideMut<Allocator>(&mut memory)
+  let targetBefore = unsafe rc(reference(target)) let contextBefore = unsafe rc(ctx)
+  let failed = run Effect.result(unsafe typed.writeIndex(&mut hooks, ctx, reference(target), 0, throwing)) |> Effect.provideMut<Allocator>(&mut memory)
+  match move failed {
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { .. } => { run Testing.expect(false, "throwing conversion cannot store") }
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => match move error {
+      JsException thrown => {
+        let pending = unsafe exceptions.take(rt)
+        run Testing.expect(match pending { Value.Int { value } => value == 501 _ => false }, "actual callback exception is preserved unchanged")
+        unsafe gc.release(&mut hooks, rt, pending)
+      }
+      OutOfMemoryError allocation => { fail move allocation }
+      StringLengthError length => { fail move length }
+      BigIntError bigintError => { fail move bigintError }
+    }
+  }
+  run Testing.expect(unsafe written(target, 0, 0, 0) && unsafe rc(reference(throwing)) == 1
+    && unsafe rc(reference(target)) == targetBefore && unsafe rc(ctx) == contextBefore,
+    "failed callback neither stores nor consumes input and releases context/target roots")
+  unsafe gc.release(&mut hooks, rt, throwing) unsafe gc.release(&mut hooks, rt, target)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx) run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observer.stats().usedBytes == 0 && observer.stats().allocationCount == 0, "out-of-bounds and throwing conversions release every owner")
+}
+
+test effect fn freshTypedClassInstancesConvertBeforeIgnoringEmptyStorageWrites() -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider()) let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe storage.context(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make(&observer)
+  run unsafe base.prepare(&mut hooks.base, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut classId = classes.JS_CLASS_UINT8C_ARRAY
+  while classId <= classes.JS_CLASS_FLOAT64_ARRAY {
+    // Use the production allocator directly, not the fixture's installed view.
+    let target = run unsafe objects.withPrototypeClass(&mut hooks, &observer, ctx, Value.Null, classId) |> Effect.provideMut<Allocator>(&mut memory)
+    let mut result = Value.Int { value: 93 } let mut invalid = Value.ShortBigInt { value: 93 }
+    if classId == classes.JS_CLASS_BIG_INT64_ARRAY || classId == classes.JS_CLASS_BIG_UINT64_ARRAY {
+      result = Value.ShortBigInt { value: 93 } invalid = Value.Int { value: 93 }
+    }
+    let input = run unsafe fixture.input(&mut hooks, ctx, target, result, 0) |> Effect.provideMut<Allocator>(&mut memory)
+    let callsBefore = hooks.calls let contextBefore = unsafe rc(ctx)
+    run unsafe typed.writeIndex(&mut hooks, ctx, reference(target), 0, input) |> Effect.provideMut<Allocator>(&mut memory)
+    run Testing.expect(hooks.calls == callsBefore + 1, "fresh empty typed instance still performs actual value coercion")
+    let failed = run Effect.result(unsafe typed.writeIndex(&mut hooks, ctx, reference(target), 0, invalid)) |> Effect.provideMut<Allocator>(&mut memory)
+    run expectTypeFailure(&mut hooks, ctx, move failed)
+    let anchor = () let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(target))
+    let empty = match &p.payload { ObjectPayload.Empty => true _ => false }
+    drop p
+    run Testing.expect(empty && unsafe rc(reference(target)) == 2 && unsafe rc(reference(input)) == 1 && unsafe rc(ctx) == contextBefore,
+      "empty typed write leaves zero-element storage untouched and balances borrowed roots on both outcomes")
+    unsafe gc.release(&mut hooks, rt, input) unsafe gc.release(&mut hooks, rt, target)
+    classId = classId + 1
+  }
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx) run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observer.stats().usedBytes == 0 && observer.stats().allocationCount == 0, "fresh typed instances and conversion callbacks release every owner")
+}
+
+test effect fn consumingTypedWritesReleaseInputsAtSourceConversionBoundary() -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider()) let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe storage.context(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make(&observer)
+  run unsafe base.prepare(&mut hooks.base, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut mode: u32 = 0
+  while mode < 3 {
+    let target = run unsafe base.typed(&mut hooks.base, ctx, classes.JS_CLASS_UINT8_ARRAY, b"\xa5\xa5", 1) |> Effect.provideMut<Allocator>(&mut memory)
+    let input = run unsafe fixture.input(&mut hooks, ctx, target, Value.Int { value: 93 }, 0) |> Effect.provideMut<Allocator>(&mut memory)
+    let finalizedBefore = hooks.base.finalizedCount let contextBefore = unsafe rc(ctx)
+    match mode {
+      0 => { run unsafe typed.writeIndexFree(&mut hooks, ctx, reference(target), 0, input) |> Effect.provideMut<Allocator>(&mut memory) }
+      1 => { run unsafe typed.writeIndexFree(&mut hooks, ctx, reference(target), 99, input) |> Effect.provideMut<Allocator>(&mut memory) }
+      _ => { run unsafe typed.convertOutOfBoundsFree(&mut hooks, ctx, reference(target), input) |> Effect.provideMut<Allocator>(&mut memory) }
+    }
+    run Testing.expect(hooks.base.finalizedCount == finalizedBefore + 1 && unsafe rc(reference(target)) == 1 && unsafe rc(ctx) == contextBefore,
+      "Free success consumes receiver and callable owners for writes and both no-store paths")
+    if mode == 0 {
+      run Testing.expect(unsafe written(target, 0, 1, 93), "consuming in-bounds write stores its converted value")
+    } else {
+      run Testing.expect(unsafe written(target, 0, 0, 0), "consuming out-of-bounds operations never store")
+    }
+    let badInput = run unsafe fixture.input(&mut hooks, ctx, target, Value.ShortBigInt { value: 93 }, 0) |> Effect.provideMut<Allocator>(&mut memory)
+    hooks.base.finalizedPending = false
+    let finalizedBeforeError = hooks.base.finalizedCount
+    let failed = match mode {
+      0 => run Effect.result(unsafe typed.writeIndexFree(&mut hooks, ctx, reference(target), 0, badInput)) |> Effect.provideMut<Allocator>(&mut memory)
+      1 => run Effect.result(unsafe typed.writeIndexFree(&mut hooks, ctx, reference(target), 99, badInput)) |> Effect.provideMut<Allocator>(&mut memory)
+      _ => run Effect.result(unsafe typed.convertOutOfBoundsFree(&mut hooks, ctx, reference(target), badInput)) |> Effect.provideMut<Allocator>(&mut memory)
+    }
+    run Testing.expect(hooks.base.finalizedCount == finalizedBeforeError + 1 && !hooks.base.finalizedPending
+      && unsafe rc(reference(target)) == 1 && unsafe rc(ctx) == contextBefore,
+      "Free conversion releases its input before throwing the later numeric-family TypeError, without an extra owner delaying finalization")
+    run expectTypeFailure(&mut hooks, ctx, move failed)
+    if mode == 0 {
+      run Testing.expect(unsafe written(target, 0, 1, 93), "failed consuming write preserves the previous element")
+    } else {
+      run Testing.expect(unsafe written(target, 0, 0, 0), "failed consuming no-store paths preserve guard bytes")
+    }
+    unsafe gc.release(&mut hooks, rt, target)
+    mode = mode + 1
+  }
+  let target = run unsafe base.typed(&mut hooks.base, ctx, classes.JS_CLASS_UINT8_ARRAY, b"\xa5\xa5", 1) |> Effect.provideMut<Allocator>(&mut memory)
+  let throwing = run unsafe fixture.input(&mut hooks, ctx, target, Value.Int { value: 501 }, 1) |> Effect.provideMut<Allocator>(&mut memory)
+  hooks.base.finalizedPending = false
+  let finalizedBeforeThrow = hooks.base.finalizedCount let contextBeforeThrow = unsafe rc(ctx)
+  let thrown = run Effect.result(unsafe typed.writeIndexFree(&mut hooks, ctx, reference(target), 0, throwing)) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(hooks.base.finalizedCount == finalizedBeforeThrow + 1 && hooks.base.finalizedPending
+    && unsafe rc(reference(target)) == 1 && unsafe rc(ctx) == contextBeforeThrow && unsafe written(target, 0, 0, 0),
+    "callback failure consumes input with the callback exception already pending and leaves the element unchanged")
+  match move thrown {
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { .. } => { run Testing.expect(false, "throwing conversion must fail") }
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => match move error {
+      JsException exception => {
+        let pending = unsafe exceptions.take(rt)
+        run Testing.expect(match pending { Value.Int { value } => value == 501 _ => false }, "consuming boundary preserves the callback exception")
+        unsafe gc.release(&mut hooks, rt, pending)
+      }
+      OutOfMemoryError allocation => { fail move allocation }
+      StringLengthError length => { fail move length }
+      BigIntError bigintError => { fail move bigintError }
+    }
+  }
+  unsafe gc.release(&mut hooks, rt, target)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx) run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observer.stats().usedBytes == 0 && observer.stats().allocationCount == 0, "consuming success and failure paths release all owners")
+}

@@ -1,0 +1,180 @@
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.testing { Testing, AssertionError }
+import silk.u8
+import silk.usize
+import silk.slice { Slice }
+import js_value { Value }
+import js_strings { Strings, StringBuilder }
+import js_string_types { StringOwner, StringLengthError, FlatString }
+import js_heap { HeapCell, HeapHeader }
+import js_regexp_compile { compileString, compileStringForRuntime }
+import regexp_exec { RegExpExecutor }
+import regexp_types { RegExpSyntaxError, RegExpStackOverflow, RegExpTimeout, FLAG_UNICODE_SETS }
+import runtime_memory { RuntimeAllocator }
+import js_runtime as runtime
+import js_gc as gc
+import js_array_storage_test_support { Hooks }
+import native_stack { currentFrameAddress }
+import regexp_parse_sets { parseClass }
+
+effect fn expectMatch(pattern: Value, flags: Value, input: &[u16], expectedEnd: i32) -> ()
+  ! OutOfMemoryError | StringLengthError | RegExpSyntaxError | RegExpStackOverflow | RegExpTimeout | AssertionError<'static> ? &mut Allocator {
+  let bytecode = StringOwner.adopt(run compileString(pattern, flags, 256))
+  let reference = match bytecode.get() {
+    Value.String { reference } => reference
+    _ => Intrinsic.trap("QuickJS invariant violated")
+  }
+  let anchor = ()
+  let flat = unsafe HeapCell.payload<FlatString, ()>(&anchor, reference)
+  let result = run RegExpExecutor.execute16(Slice.view(flat.latin1.asSlice(), 0, flat.length), input, 0,
+    effect fn() -> bool ? &mut Allocator { return false })
+  run Testing.expect(result.matched == (expectedEnd >= 0), "quantifier repeats a code point only in Unicode modes")
+  if expectedEnd >= 0 {
+    run Testing.expect(result.captures.get(0) == 0 && result.captures.get(1) == expectedEnd,
+      "embedded NUL and isolated surrogates remain part of the anchored match")
+  }
+}
+test effect fn regexpBridgePreservesNulsAndSurrogatesWithModeDependentPairEncoding() -> ()
+  ! OutOfMemoryError | StringLengthError | RegExpSyntaxError | RegExpStackOverflow | RegExpTimeout | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let pattern = StringOwner.adopt(run Strings.fromUtf16(&[94,0xd83d,0xde00,43,0,0xd800,65,0xdc00,36]) |> Effect.provideMut<Allocator>(&mut allocator))
+  let u = StringOwner.adopt(run Strings.fromLatin1(b"u") |> Effect.provideMut<Allocator>(&mut allocator))
+  let v = StringOwner.adopt(run Strings.fromLatin1(b"v") |> Effect.provideMut<Allocator>(&mut allocator))
+  let paired: [u16; 8] = [0xd83d,0xde00,0xd83d,0xde00,0,0xd800,65,0xdc00]
+  let repeatedLow: [u16; 7] = [0xd83d,0xde00,0xde00,0,0xd800,65,0xdc00]
+  run expectMatch(pattern.get(), Value.Undefined, &paired, -1) |> Effect.provideMut<Allocator>(&mut allocator)
+  run expectMatch(pattern.get(), Value.Undefined, &repeatedLow, 7) |> Effect.provideMut<Allocator>(&mut allocator)
+  run expectMatch(pattern.get(), u.get(), &paired, 8) |> Effect.provideMut<Allocator>(&mut allocator)
+  run expectMatch(pattern.get(), u.get(), &repeatedLow, -1) |> Effect.provideMut<Allocator>(&mut allocator)
+  run expectMatch(pattern.get(), v.get(), &paired, 8) |> Effect.provideMut<Allocator>(&mut allocator)
+  run expectMatch(pattern.get(), v.get(), &repeatedLow, -1) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(Strings.length(pattern.get()) == 9 && Strings.codeUnit(pattern.get(), 1) == 0xd83d, "borrowed pattern survives")
+}
+effect fn attempt(pattern: Value, flags: Value, depth: usize) -> bool
+  ! OutOfMemoryError | StringLengthError | RegExpSyntaxError | RegExpStackOverflow ? &mut Allocator {
+  let output = StringOwner.adopt(run compileString(pattern, flags, depth))
+  return true
+}
+effect fn syntax(error: RegExpSyntaxError) -> bool ! AssertionError<'static> {
+  run Testing.expect(error.message == "invalid regular expression flags" && error.offset == 0, "native flag diagnostic")
+  return false
+}
+effect fn stack(error: RegExpStackOverflow) -> bool { drop error return false }
+test effect fn regexpBridgeRejectsFlagsBeforeParsingAndPropagatesDepth() -> ()
+  ! OutOfMemoryError | StringLengthError | RegExpSyntaxError | RegExpStackOverflow | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let pattern = StringOwner.adopt(run Strings.fromLatin1(b"(") |> Effect.provideMut<Allocator>(&mut allocator))
+  let invalid: &[&[u8]] = &[b"dd",b"gg",b"ii",b"mm",b"ss",b"uu",b"vv",b"yy",b"uv",b"vu",b"x",b"\x00",b"\xc3\xa9"]
+  let mut i: usize = 0
+  while i < invalid.length {
+    let flags = StringOwner.adopt(run Strings.fromUtf8(invalid[i]) |> Effect.provideMut<Allocator>(&mut allocator))
+    let accepted = run attempt(pattern.get(), flags.get(), 256) |> Effect.catch<RegExpSyntaxError>(syntax) |> Effect.provideMut<Allocator>(&mut allocator)
+    run Testing.expect(!accepted, "invalid flags rejected before invalid pattern")
+    i = i + 1
+  }
+  let deep = StringOwner.adopt(run Strings.fromLatin1(b"((a))") |> Effect.provideMut<Allocator>(&mut allocator))
+  let accepted = run attempt(deep.get(), Value.Undefined, 0) |> Effect.catch<RegExpStackOverflow>(stack) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(!accepted, "depth error is not syntax or OOM")
+}
+test effect fn regexpBridgeOomSweepReclaimsScratchAndPreservesBorrowedRope() -> ()
+  ! OutOfMemoryError | StringLengthError | RegExpSyntaxError | RegExpStackOverflow | AssertionError<'static> {
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let mut builder = StringBuilder.make()
+  run builder.fill(97, 600) |> Effect.provideMut<Allocator>(&mut allocator)
+  let leaf = StringOwner.adopt(run builder.finish() |> Effect.provideMut<Allocator>(&mut allocator))
+  let pattern = StringOwner.adopt(run Strings.concat(leaf.get(), leaf.get()) |> Effect.provideMut<Allocator>(&mut allocator))
+  let flags = StringOwner.adopt(run Strings.fromLatin1(b"dgimsy") |> Effect.provideMut<Allocator>(&mut allocator))
+  run Testing.expect(pattern.get().tag() == -6, "exercise rope input")
+  let baseline = allocator.stats().usedBytes
+  let mut extra: usize = 0
+  let mut succeeded = false
+  let mut encodingOrStorageOom = false
+  let mut compilerOom = false
+  while extra < 131072 && !succeeded {
+    allocator.setLimit(baseline + extra)
+    let tried = run Effect.result(attempt(pattern.get(), flags.get(), 256)) |> Effect.provideMut<Allocator>(&mut allocator)
+    match move tried {
+      Result<bool, OutOfMemoryError | StringLengthError | RegExpSyntaxError | RegExpStackOverflow>.Success { value } => { succeeded = value }
+      Result<bool, OutOfMemoryError | StringLengthError | RegExpSyntaxError | RegExpStackOverflow>.Failure { error } => {
+        match move error {
+          OutOfMemoryError allocation => { encodingOrStorageOom = true }
+          RegExpSyntaxError diagnostic => {
+            run Testing.expect(diagnostic.message == "out of memory" && diagnostic.offset == 0, "compiler allocation failures retain the source SyntaxError diagnostic")
+            compilerOom = true
+          }
+          StringLengthError length => { fail move length }
+          RegExpStackOverflow depth => { fail move depth }
+        }
+      }
+    }
+    run Testing.expect(allocator.stats().usedBytes == baseline, "every allocation failure and success releases scratch")
+    run Testing.expect(Strings.length(pattern.get()) == 1200 && Strings.codeUnit(pattern.get(), 1199) == 97 && Strings.length(flags.get()) == 6, "borrowed arguments survive every exit")
+    extra = extra + 1
+  }
+  run Testing.expect(succeeded, "sweep reaches success after all allocation thresholds")
+  run Testing.expect(encodingOrStorageOom && compilerOom, "encoding/storage OOM and compiler SyntaxError remain distinct")
+  drop pattern
+  drop leaf
+  drop flags
+  run Testing.expect(allocator.stats().usedBytes == 0, "no retained input aliases")
+}
+
+unsafe effect fn runtimeAttempt(pattern: Value, flags: Value, rt: *mut HeapHeader) -> bool
+  ! OutOfMemoryError | StringLengthError | RegExpSyntaxError | RegExpStackOverflow ? &mut Allocator {
+  let program = StringOwner.adopt(run unsafe compileStringForRuntime(pattern, flags, rt))
+  return true
+}
+test effect fn regexpRuntimeStackLimitRejectsBeforeRecursionAndPreservesFlagPriority() -> ()
+  ! OutOfMemoryError | StringLengthError | RegExpSyntaxError | RegExpStackOverflow | RegExpTimeout | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let rt = run runtime.allocateRuntimeStorage(currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut memory)
+  let pattern = StringOwner.adopt(run Strings.fromLatin1(b"^a+$") |> Effect.provideMut<Allocator>(&mut memory))
+  let flags = StringOwner.adopt(run Strings.fromLatin1(b"gg") |> Effect.provideMut<Allocator>(&mut memory))
+  unsafe runtime.updateStackTop(rt, currentFrameAddress() + 65536)
+  unsafe runtime.setMaxStackSize(rt, 4096)
+  let accepted = run unsafe runtimeAttempt(pattern.get(), Value.Undefined, rt)
+    |> Effect.catch<RegExpStackOverflow>(stack) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(!accepted && Strings.length(pattern.get()) == 4,
+    "the exhausted runtime's physical stack bound rejects without consuming the pattern")
+  let invalidFlags = run unsafe runtimeAttempt(pattern.get(), flags.get(), rt)
+    |> Effect.catch<RegExpSyntaxError>(syntax) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(!invalidFlags, "invalid flags retain precedence over exhausted stack")
+  unsafe runtime.setMaxStackSize(rt, 0)
+  let bytecode = StringOwner.adopt(run unsafe compileStringForRuntime(pattern.get(), Value.Undefined, rt)
+    |> Effect.provideMut<Allocator>(&mut memory))
+  let reference = match bytecode.get() {
+    Value.String { reference } => reference
+    _ => Intrinsic.trap("QuickJS invariant violated")
+  }
+  let anchor = ()
+  let flat = unsafe HeapCell.payload<FlatString, ()>(&anchor, reference)
+  let input: [u16; 3] = [97, 97, 97]
+  let matched = run RegExpExecutor.execute16(Slice.view(flat.latin1.asSlice(), 0, flat.length), &input, 0,
+    effect fn() -> bool ? &mut Allocator { return false }) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(matched.matched && matched.captures.get(0) == 0 && matched.captures.get(1) == 3,
+    "disabling the bound permits real compilation and execution")
+  drop matched
+  drop flat
+  drop bytecode
+  drop flags
+  drop pattern
+  let mut hooks = Hooks { finalized: 0 }
+  run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(memory.stats().usedBytes == 0, "stack rejection and resumed compilation retain no allocations")
+}
+
+effect fn classAttempt(limit: usize) -> bool
+  ! OutOfMemoryError | RegExpSyntaxError | RegExpStackOverflow ? &mut Allocator {
+  let parsed = run parseClass(b"[[a]--[b]]", 0, FLAG_UNICODE_SETS, usize.MAX, limit)
+  return true
+}
+test effect fn regexpNestedSetEntryChecksPhysicalStackIndependentlyOfDisjunction() -> ()
+  ! OutOfMemoryError | RegExpSyntaxError | RegExpStackOverflow | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let accepted = run classAttempt(currentFrameAddress() + 65536)
+    |> Effect.catch<RegExpStackOverflow>(stack) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(!accepted && memory.stats().usedBytes == 0,
+    "recursive Unicode-set parsing checks the physical bound without passing through disjunction")
+}

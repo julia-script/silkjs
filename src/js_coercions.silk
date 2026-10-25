@@ -1,0 +1,242 @@
+//! Object-aware QuickJS coercions (quickjs.c:11176-11253,13059-13146,
+//! 13728-13809). Nonobject conversion is delegated to the validated kernels.
+//! Free entry points consume on every outcome; other arguments are borrowed.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.i32
+import js_atoms { ATOM_INTEGER_TAG }
+import js_heap { HeapCell, HeapHeader }
+import js_core_types { RuntimeState, NativeErrorKind }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_value { Value }
+import js_atom_data as atoms
+import js_string_types { StringLengthError, releaseString }
+import js_bigint { BigIntError }
+import js_exceptions { JsException }
+import js_coercion_host { CoercionHooks }
+import js_primitive_coercions { NumberHint, CoercionError }
+import js_primitive_coercions as primitive
+
+pub const JS_HINT_STRING: u32 = 0
+pub const JS_HINT_NUMBER: u32 = 1
+pub const JS_HINT_NONE: u32 = 2
+pub const JS_HINT_FORCE_ORDINARY: u32 = 16
+
+// Exactly JS_CallFree ownership: only function is consumed, not this/arguments.
+unsafe effect fn callFree<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, rt: *mut HeapHeader, function: Value,
+  receiver: Value, arguments: &[Value]) -> Value
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let result = run Effect.result(unsafe hooks.call(context, function, receiver, arguments))
+  unsafe gc.release(&mut hooks, rt, function)
+  return match move result {
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => value
+    Result<Value, OutOfMemoryError | JsException>.Failure { error } => { fail move error }
+  }
+}
+
+// Owns no receiver reference. An exotic object result deliberately escapes this
+// helper so the consuming boundary releases receiver BEFORE that result.
+unsafe effect fn objectPrimitive<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, rt: *mut HeapHeader, value: Value, hint: u32) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let ordinary = (hint & JS_HINT_FORCE_ORDINARY) != 0
+  let preferred = hint & ~JS_HINT_FORCE_ORDINARY
+  if !ordinary {
+    let method = run unsafe hooks.getProperty(context, value, atoms.JS_ATOM_Symbol_toPrimitive)
+    let absent = match method { Value.Undefined => true Value.Null => true _ => false }
+    if !absent {
+      let mut atom = atoms.JS_ATOM_default
+      if preferred == JS_HINT_STRING { atom = atoms.JS_ATOM_string }
+      else if preferred == JS_HINT_NUMBER { atom = atoms.JS_ATOM_number }
+      let anchor = ()
+      let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+      let argumentResult = run Effect.result(state.atoms.toValue(atom, true))
+      drop state
+      let argument = match move argumentResult {
+        Result<Value, OutOfMemoryError | StringLengthError>.Success { value: text } => text
+        Result<Value, OutOfMemoryError | StringLengthError>.Failure { error } => {
+          unsafe gc.release(&mut hooks, rt, method)
+          fail move error
+        }
+      }
+      let arguments = [argument]
+      let called = run Effect.result(unsafe callFree(&mut hooks, context, rt, method, value, &arguments))
+      unsafe gc.release(&mut hooks, rt, argument)
+      return match move called {
+        Result<Value, OutOfMemoryError | JsException>.Success { value: output } => output
+        Result<Value, OutOfMemoryError | JsException>.Failure { error } => { fail move error }
+      }
+    }
+    // Null/Undefined have no reference, but keep the owned hook-result contract.
+    unsafe gc.release(&mut hooks, rt, method)
+  }
+  let stringFirst = preferred == JS_HINT_STRING
+  let mut index: usize = 0
+  while index < 2 {
+    let mut methodName = atoms.JS_ATOM_valueOf
+    if (index == 0 && stringFirst) || (index == 1 && !stringFirst) {
+      methodName = atoms.JS_ATOM_toString
+    }
+    let method = run unsafe hooks.getProperty(context, value, methodName)
+    if unsafe hooks.isCallable(context, method) {
+      let result = run unsafe callFree(&mut hooks, context, rt, method, value, &[])
+      if !result.isObject() { return result }
+      unsafe gc.release(&mut hooks, rt, result)
+    } else {
+      unsafe gc.release(&mut hooks, rt, method)
+    }
+    index = index + 1
+  }
+  return run unsafe hooks.throwError(context, NativeErrorKind.Type, b"toPrimitive")
+}
+
+pub unsafe effect fn toPrimitiveFree<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, value: Value, hint: u32) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  if !value.isObject() { return value }
+  let rt = unsafe runtime.contextRuntime(context)
+  let result = run Effect.result(unsafe objectPrimitive(&mut hooks, context, rt, value, hint))
+  unsafe gc.release(&mut hooks, rt, value)
+  match move result {
+    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Success { value: output } => {
+      if !output.isObject() { return output }
+      unsafe gc.release(&mut hooks, rt, output)
+      return run unsafe hooks.throwError(context, NativeErrorKind.Type, b"toPrimitive")
+    }
+    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => { fail move error }
+  }
+}
+pub unsafe effect fn toPrimitive<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, value: Value, hint: u32) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  return run unsafe toPrimitiveFree(&mut hooks, context, unsafe value.retained(), hint)
+}
+
+pub unsafe effect fn toNumberHintFree<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, value: Value, hint: NumberHint) -> Value
+  ! OutOfMemoryError | JsException | StringLengthError ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  let converted = run unsafe toPrimitiveFree(&mut hooks, context, value, JS_HINT_NUMBER)
+  let result = run Effect.result(unsafe primitive.toNumberFree(&mut hooks, rt, converted, hint))
+  return match move result {
+    Result<Value, OutOfMemoryError | StringLengthError | CoercionError>.Success { value: number } => number
+    Result<Value, OutOfMemoryError | StringLengthError | CoercionError>.Failure { error } => match move error {
+      CoercionError diagnostic => { return run unsafe hooks.throwError(context, NativeErrorKind.Type, diagnostic.message()) }
+      OutOfMemoryError allocation => { fail move allocation }
+      StringLengthError length => { fail move length }
+    }
+  }
+}
+pub unsafe effect fn toNumberFree<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, value: Value) -> Value
+  ! OutOfMemoryError | JsException | StringLengthError ? &mut Allocator {
+  return run unsafe toNumberHintFree(&mut hooks, context, value, NumberHint.Number)
+}
+pub unsafe effect fn toNumericFree<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, value: Value) -> Value
+  ! OutOfMemoryError | JsException | StringLengthError ? &mut Allocator {
+  return run unsafe toNumberHintFree(&mut hooks, context, value, NumberHint.Numeric)
+}
+pub unsafe effect fn toNumber<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, value: Value) -> Value
+  ! OutOfMemoryError | JsException | StringLengthError ? &mut Allocator {
+  return run unsafe toNumberFree(&mut hooks, context, unsafe value.retained())
+}
+pub unsafe effect fn toNumeric<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, value: Value) -> Value
+  ! OutOfMemoryError | JsException | StringLengthError ? &mut Allocator {
+  return run unsafe toNumericFree(&mut hooks, context, unsafe value.retained())
+}
+// Materialize a semantic error before the caller releases the converted value,
+// but only after ending the runtime/atom-table borrow.
+unsafe effect fn primitiveString<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, rt: *mut HeapHeader, value: Value, propertyKey: bool) -> Value
+  ! OutOfMemoryError | JsException | StringLengthError | BigIntError ? &mut Allocator {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let result = run Effect.result(unsafe primitive.toStringInternal(&state.atoms, value, propertyKey))
+  drop state
+  return match move result {
+    Result<Value, OutOfMemoryError | StringLengthError | BigIntError | CoercionError>.Success { value: text } => text
+    Result<Value, OutOfMemoryError | StringLengthError | BigIntError | CoercionError>.Failure { error } => match move error {
+      CoercionError diagnostic => { return run unsafe hooks.throwError(context, NativeErrorKind.Type, diagnostic.message()) }
+      OutOfMemoryError allocation => { fail move allocation }
+      StringLengthError length => { fail move length }
+      BigIntError integer => { fail move integer }
+    }
+  }
+}
+
+pub unsafe effect fn toStringInternal<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, value: Value, propertyKey: bool) -> Value
+  ! OutOfMemoryError | JsException | StringLengthError | BigIntError ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  let mut converted = value
+  if value.isObject() {
+    converted = run unsafe toPrimitive(&mut hooks, context, value, JS_HINT_STRING)
+  }
+  let result = run Effect.result(unsafe primitiveString(&mut hooks, context, rt, converted, propertyKey))
+  if value.isObject() { unsafe gc.release(&mut hooks, rt, converted) }
+  return match move result {
+    Result<Value, OutOfMemoryError | JsException | StringLengthError | BigIntError>.Success { value: text } => text
+    Result<Value, OutOfMemoryError | JsException | StringLengthError | BigIntError>.Failure { error } => { fail move error }
+  }
+}
+pub unsafe effect fn toString<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, value: Value) -> Value
+  ! OutOfMemoryError | JsException | StringLengthError | BigIntError ? &mut Allocator {
+  return run unsafe toStringInternal(&mut hooks, context, value, false)
+}
+pub unsafe effect fn toPropertyKey<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, value: Value) -> Value
+  ! OutOfMemoryError | JsException | StringLengthError | BigIntError ? &mut Allocator {
+  return run unsafe toStringInternal(&mut hooks, context, value, true)
+}
+pub unsafe effect fn toStringFree<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, value: Value) -> Value
+  ! OutOfMemoryError | JsException | StringLengthError | BigIntError ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  let result = run Effect.result(unsafe toString(&mut hooks, context, value))
+  unsafe gc.release(&mut hooks, rt, value)
+  return match move result {
+    Result<Value, OutOfMemoryError | JsException | StringLengthError | BigIntError>.Success { value: text } => text
+    Result<Value, OutOfMemoryError | JsException | StringLengthError | BigIntError>.Failure { error } => { fail move error }
+  }
+}
+
+/// JS_ValueToAtom (quickjs.c:9112-9135). Borrows value; success transfers one
+/// atom owner. Release it with the runtime's AtomTable.release.
+pub unsafe effect fn valueToAtom<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, value: Value) -> u32
+  ! OutOfMemoryError | JsException | StringLengthError | BigIntError ? &mut Allocator {
+  match value {
+    Value.Int { value: integer } => {
+      if integer >= 0 { return i32.toU32(integer) | ATOM_INTEGER_TAG }
+    }
+    _ => ()
+  }
+  let rt = unsafe runtime.contextRuntime(context)
+  match value {
+    Value.Symbol { .. } => {
+      let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+      return state.atoms.symbolAtom(value)
+    }
+    _ => ()
+  }
+  // No runtime/atom-table borrow crosses ToPropertyKey's user callbacks.
+  let key = run unsafe toPropertyKey(&mut hooks, context, value)
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+  match key {
+    Value.Symbol { .. } => {
+      let atom = state.atoms.symbolAtom(key)
+      releaseString(key)
+      return atom
+    }
+    _ => { return run state.atoms.internOwned(key) }
+  }
+}

@@ -1,0 +1,392 @@
+//! Native GetProperty, quickjs.c:8319-8473,9138-9284. Atom/object/receiver
+//! inputs are borrowed; value-key Get consumes its key on every outcome.
+//! Each prototype is rooted through callbacks and its successor retained before
+//! release. No payload/shape/runtime loan survives user code or native finalizers.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.result { Result }
+import silk.slice { Slice }
+import silk.i32
+import silk.i64
+import silk.u16
+import silk.u32
+import silk.usize
+import js_atoms { AtomTable, ATOM_INTEGER_TAG }
+import js_atom_data as atoms
+import js_core_types { RuntimeState, ObjectData, ObjectPayload, ShapeData, PropertySlot,
+  NativeFunctionId, NativeErrorKind, ExoticCallbacks, JS_PROP_GETSET,
+  EXOTIC_GET_PROPERTY, EXOTIC_GET_OWN_PROPERTY }
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_shapes as shapes
+import js_var_refs as varRefs
+import js_class_data as classes
+import js_prototypes as prototypes
+import js_strings { Strings }
+import js_string_types { StringLengthError }
+import js_parser_diagnostics { DiagnosticMessage }
+import js_bigint { BigIntError }
+import js_exceptions { JsException }
+import js_property_host { OwnPropertyHooks, OwnPropertyResult, GetPropertyHooks, HasPropertyHooks }
+import js_coercion_host { CoercionHooks }
+import js_coercions as coercions
+import js_property_queries as queries
+import js_typed_array_read as typed
+
+fn trap() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+effect fn exceptionValue(error: JsException) -> Value { drop error return Value.Exception }
+unsafe effect fn materialize<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  error: OutOfMemoryError | StringLengthError | BigIntError | JsException) -> Value ! JsException ? &mut Allocator {
+  match move error {
+    OutOfMemoryError allocation => { return run unsafe hooks.throwOutOfMemory(context) }
+    StringLengthError length => { return run unsafe hooks.throwError(context, NativeErrorKind.Internal, b"string too long") }
+    BigIntError impossible => trap()
+    JsException signal => { fail move signal }
+  }
+}
+union Step { Done { value: Value }, Next { reference: *mut HeapHeader }, Absent }
+unsafe effect fn throwAtom<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  rt: *mut HeapHeader, atom: u32, kind: NativeErrorKind, prefix: &[u8], suffix: &[u8]) -> never
+  ! JsException ? &mut Allocator {
+  let mut message = DiagnosticMessage.make()
+  message.append(prefix)
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  message.appendAtom(&state.atoms, atom)
+  drop state
+  message.append(suffix)
+  return run unsafe hooks.throwError(context, kind, message.bytes())
+}
+unsafe effect fn callFree<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, rt: *mut HeapHeader, function: Value, receiver: Value) -> Value
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let called = run Effect.result(unsafe hooks.call(context, function, receiver, &[]))
+  unsafe gc.release(&mut hooks, rt, function)
+  return match move called {
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => value
+    Result<Value, OutOfMemoryError | JsException>.Failure { error } => { fail move error }
+  }
+}
+// A single UTF-16 code unit cannot hit STRING_LENGTH_MAX; preserve allocation
+// failure without widening the owning host's GetProperty exception contract.
+effect fn character(unit: u16) -> Value ! OutOfMemoryError ? &mut Allocator {
+  let result = run Effect.result(Strings.fromCodePoint(u16.toU32(unit)))
+  return match move result {
+    Result<Value, OutOfMemoryError | StringLengthError>.Success { value } => value
+    Result<Value, OutOfMemoryError | StringLengthError>.Failure { error } => match move error {
+      OutOfMemoryError allocation => { fail move allocation }
+      StringLengthError length => trap()
+    }
+  }
+}
+unsafe effect fn fastIndex(node: *mut HeapHeader, index: u32) -> Option<Value>
+  ! OutOfMemoryError ? &mut Allocator {
+  let anchor = ()
+  let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  let at = u32.toUsize(index)
+  match &p.payload {
+    ObjectPayload.FastArray { array } => {
+      if at < array.values.length() { return Option<Value>.some(unsafe array.values.get(at).retained()) }
+    }
+    ObjectPayload.MappedArguments { arguments } => {
+      if at < arguments.varRefs.length() {
+        let value = unsafe varRefs.read(arguments.varRefs.get(at))
+        return Option<Value>.some(unsafe value.retained())
+      }
+    }
+    _ => ()
+  }
+  drop p
+  return run unsafe typed.readIndex(node, index)
+}
+unsafe effect fn step<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, rt: *mut HeapHeader, node: *mut HeapHeader,
+  atom: u32, receiver: Value) -> Step ! OutOfMemoryError | JsException ? &mut Allocator {
+  let object = Value.Object { reference: node }
+  while true {
+    let anchor = ()
+    let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+    match unsafe shapes.lookup(p.shape, atom) {
+      Option<usize>.Some { value: index } => {
+        let slot = p.properties.get(index)
+        drop p
+        match slot {
+          PropertySlot.Value { value } => { return Step.Done { value: unsafe value.retained() } }
+          PropertySlot.VarRef { reference } => {
+            let value = unsafe varRefs.read(reference)
+            if match value { Value.Uninitialized => true _ => false } {
+              return run unsafe OwnPropertyHooks.throwUninitialized(&mut hooks, context, atom)
+            }
+            return Step.Done { value: unsafe value.retained() }
+          }
+          PropertySlot.GetterSetter { getter, .. } => {
+            return match Pointer.nonNullMut<HeapHeader>(getter) {
+              Option<*mut HeapHeader>.None => Step.Done { value: Value.Undefined }
+              Option<*mut HeapHeader>.Some { value: function } => {
+                unsafe HeapCell.retain(function)
+                return Step.Done { value: run unsafe callFree(&mut hooks, context, rt, Value.Object { reference: function }, receiver) }
+              }
+            }
+          }
+          PropertySlot.AutoInit { .. } => {
+            run unsafe OwnPropertyHooks.instantiateAutoInit(&mut hooks, context, object, atom)
+            continue
+          }
+        }
+      }
+      Option<usize>.None => ()
+    }
+    let exotic = p.isExotic let fast = p.fastArray let classId = p.classId
+    drop p
+    if exotic {
+      if fast {
+        if AtomTable.isInteger(atom) {
+          let indexed = run unsafe fastIndex(node, atom & ~ATOM_INTEGER_TAG)
+          match move indexed {
+            Option<Value>.Some { value } => { return Step.Done { value: value } }
+            Option<Value>.None => ()
+          }
+          if classId >= classes.JS_CLASS_UINT8C_ARRAY && classId <= classes.JS_CLASS_FLOAT64_ARRAY {
+            return Step.Done { value: Value.Undefined }
+          }
+        } else if classId >= classes.JS_CLASS_UINT8C_ARRAY && classId <= classes.JS_CLASS_FLOAT64_ARRAY {
+          let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+          if !match state.atoms.numericIndex(atom) { Value.Undefined => true _ => false } {
+            return Step.Done { value: Value.Undefined }
+          }
+        }
+      } else {
+        let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+        let mut callback = Option<NativeFunctionId>.none()
+        let mut get = false
+        match &state.classes.asSlice()[u32.toUsize(classId)].exotic {
+          Option<ExoticCallbacks>.Some { value } => {
+            get = (value.methodMask & EXOTIC_GET_PROPERTY) != 0
+            if get || (value.methodMask & EXOTIC_GET_OWN_PROPERTY) != 0 {
+              callback = Option<NativeFunctionId>.some(value.descriptor)
+            }
+          }
+          Option<ExoticCallbacks>.None => ()
+        }
+        drop state
+        match move callback {
+          Option<NativeFunctionId>.Some { value: table } => {
+            if get {
+              return Step.Done { value: run unsafe GetPropertyHooks.getExoticProperty(&mut hooks, context, table, object, atom, receiver) }
+            }
+            let own = run unsafe OwnPropertyHooks.getExoticOwnProperty(&mut hooks, context, table, object, atom, true)
+            match move own {
+              OwnPropertyResult.Absent => ()
+              OwnPropertyResult.Exists => trap()
+              OwnPropertyResult.Descriptor { descriptor } => {
+                if (descriptor.flags & JS_PROP_GETSET) != 0 {
+                  // Setter must be destroyed before invoking the getter. Unlike
+                  // an ordinary empty accessor, an exotic Undefined getter is called.
+                  unsafe gc.release(&mut hooks, rt, descriptor.setter)
+                  unsafe gc.release(&mut hooks, rt, descriptor.value)
+                  return Step.Done { value: run unsafe callFree(&mut hooks, context, rt, descriptor.getter, receiver) }
+                }
+                unsafe gc.release(&mut hooks, rt, descriptor.getter)
+                unsafe gc.release(&mut hooks, rt, descriptor.setter)
+                return Step.Done { value: descriptor.value }
+              }
+            }
+          }
+          Option<NativeFunctionId>.None => ()
+        }
+      }
+    }
+    // Fresh shape after arbitrary callback mutation, with current node rooted.
+    let current = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+    let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, current.shape)
+    return match Pointer.nonNullMut<HeapHeader>(shape.prototype) {
+      Option<*mut HeapHeader>.None => Step.Absent
+      Option<*mut HeapHeader>.Some { value: next } => {
+        unsafe HeapCell.retain(next)
+        return Step.Next { reference: next }
+      }
+    }
+  }
+}
+// Borrowed atom and original receiver. throwReference applies only to an
+// exhausted prototype chain, not typed canonical misses or exotic results.
+pub unsafe effect fn getPropertyReceiver<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value, atom: u32, receiver: Value, throwReference: bool) -> Value
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  match object {
+    Value.Null => { return run unsafe throwAtom(&mut hooks, context, rt, atom, NativeErrorKind.Type, b"cannot read property '", b"' of null") }
+    Value.Undefined => { return run unsafe throwAtom(&mut hooks, context, rt, atom, NativeErrorKind.Type, b"cannot read property '", b"' of undefined") }
+    Value.Exception => { fail JsException {} }
+    _ => ()
+  }
+  if object.isString() {
+    if AtomTable.isInteger(atom) {
+      let index = u32.toUsize(atom & ~ATOM_INTEGER_TAG)
+      if index < Strings.length(object) { return run character(Strings.codeUnit(object, index)) }
+    } else if atom == atoms.JS_ATOM_length {
+      return Value.Int { value: usize.toI32(Strings.length(object)) }
+    }
+  }
+  let mut start = object
+  if !object.isObject() { start = unsafe prototypes.getPrototypePrimitive(context, object) }
+  let mut current = match start {
+    Value.Object { reference } => reference
+    _ => { return Value.Undefined }
+  }
+  unsafe HeapCell.retain(context)
+  unsafe HeapCell.retain(current)
+  while true {
+    let result = run Effect.result(unsafe step(&mut hooks, context, rt, current, atom, receiver))
+    unsafe gc.releaseHeader(&mut hooks, rt, current)
+    match move result {
+      Result<Step, OutOfMemoryError | JsException>.Success { value } => match move value {
+        Step.Next { reference } => { current = reference }
+        Step.Done { value: output } => {
+          unsafe gc.releaseHeader(&mut hooks, rt, context)
+          // A String exotic descriptor can report found with an Exception value.
+          // Get's effect boundary must propagate that pending error to its caller.
+          if output.isException() { fail JsException {} }
+          return output
+        }
+        Step.Absent => {
+          // Throw before dropping the context root, also on materialization failure.
+          let missing = run Effect.result(unsafe missingProperty(&mut hooks, context, rt, atom, throwReference))
+          unsafe gc.releaseHeader(&mut hooks, rt, context)
+          return match move missing {
+            Result<Value, JsException>.Success { value: output } => output
+            Result<Value, JsException>.Failure { error } => { fail move error }
+          }
+        }
+      }
+      Result<Step, OutOfMemoryError | JsException>.Failure { error } => {
+        unsafe gc.releaseHeader(&mut hooks, rt, context)
+        fail move error
+      }
+    }
+  }
+}
+unsafe effect fn missingProperty<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  rt: *mut HeapHeader, atom: u32, throwReference: bool) -> Value ! JsException ? &mut Allocator {
+  if throwReference { return run unsafe throwAtom(&mut hooks, context, rt, atom, NativeErrorKind.Reference, b"'", b"' is not defined") }
+  return Value.Undefined
+}
+pub unsafe effect fn getProperty<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value, atom: u32) -> Value
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  return run unsafe getPropertyReceiver(&mut hooks, context, object, atom, object, false)
+}
+unsafe fn releaseAtom(rt: *mut HeapHeader, atom: u32) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+  state.atoms.release(atom)
+}
+unsafe effect fn getOwnedAtom<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, rt: *mut HeapHeader, object: Value, atom: u32) -> Value
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let result = run Effect.result(unsafe getProperty(&mut hooks, context, object, atom))
+  unsafe releaseAtom(rt, atom)
+  return match move result {
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => value
+    Result<Value, OutOfMemoryError | JsException>.Failure { error } => { fail move error }
+  }
+}
+// Consumes key even when ToObject fails, BEFORE ToPropertyKey may run user code.
+pub unsafe effect fn getPropertyValue<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value, key: Value) -> Value
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  if match object { Value.Null => true Value.Undefined => true _ => false } {
+    unsafe gc.release(&mut hooks, rt, key)
+    if match object { Value.Null => true _ => false } {
+      return run unsafe hooks.throwError(context, NativeErrorKind.Type, b"cannot read property of null")
+    }
+    return run unsafe hooks.throwError(context, NativeErrorKind.Type, b"cannot read property of undefined")
+  }
+  match object {
+    Value.Object { reference } => match key {
+      Value.Int { value } => {
+        if value >= 0 {
+          let indexed = run unsafe fastIndex(reference, i32.toU32(value))
+          match move indexed {
+            Option<Value>.Some { value: output } => { return output }
+            Option<Value>.None => ()
+          }
+        }
+      }
+      _ => ()
+    }
+    _ => ()
+  }
+  let converted = run Effect.result(unsafe coercions.valueToAtom(&mut hooks, context, key))
+  let atom = match move converted {
+    Result<u32, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { value } => value
+    Result<u32, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => {
+      let pending = run Effect.catch<JsException>(unsafe materialize(&mut hooks, context, move error), exceptionValue)
+      unsafe gc.release(&mut hooks, rt, key) fail JsException {}
+    }
+  }
+  unsafe gc.release(&mut hooks, rt, key)
+  return run unsafe getOwnedAtom(&mut hooks, context, rt, object, atom)
+}
+pub unsafe effect fn getPropertyUint32<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value, index: u32) -> Value
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  return run unsafe getPropertyValue(&mut hooks, context, object, Value.number(u32.toF64(index)))
+}
+pub unsafe effect fn getPropertyInt64<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value, index: i64) -> Value
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  if index >= 0 && index <= 2147483647 {
+    return run unsafe getPropertyValue(&mut hooks, context, object, Value.Int { value: i64.toI32(index) })
+  }
+  let rt = unsafe runtime.contextRuntime(context)
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+  let atom = run state.atoms.internInt64(index)
+  drop state
+  return run unsafe getOwnedAtom(&mut hooks, context, rt, object, atom)
+}
+// UTF-8 C-string wrapper: ignore bytes after its first NUL, as JS_NewAtom does.
+pub unsafe effect fn getPropertyStr<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value, name: &[u8]) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+  let mut length: usize = 0
+  while length < name.length && name[length] != 0 { length = length + 1 }
+  let atom = run state.atoms.internUtf8(Slice.view(name, 0, length))
+  drop state
+  return run unsafe getOwnedAtom(&mut hooks, context, rt, object, atom)
+}
+unsafe effect fn tryOwnedAtom<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value, atom: u32, index: i64, output: &mut Value) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  if !run unsafe queries.hasProperty(&mut hooks, context, object, atom) { return false }
+  output.* = Value.Exception
+  if index >= 0 && index <= 2147483647 {
+    output.* = run unsafe getPropertyValue(&mut hooks, context, object, Value.Int { value: i64.toI32(index) })
+  } else { output.* = run unsafe getProperty(&mut hooks, context, object, atom) }
+  return true
+}
+// Output starts Undefined; Has/atom-creation failure leaves it Undefined, while
+// a failed Get after positive Has writes Exception. Success transfers its owner.
+pub unsafe effect fn tryGetPropertyInt64<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value, index: i64, output: &mut Value) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  output.* = Value.Undefined
+  let rt = unsafe runtime.contextRuntime(context)
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+  let atom = run state.atoms.internInt64(index)
+  drop state
+  let result = run Effect.result(unsafe tryOwnedAtom(&mut hooks, context, object, atom, index, &mut output))
+  unsafe releaseAtom(rt, atom)
+  return match move result {
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { value } => value
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => { fail move error }
+  }
+}

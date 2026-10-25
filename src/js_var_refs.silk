@@ -1,0 +1,162 @@
+//! Closure cells from quickjs.c:17281-17357,17848-17860. Frame tables are
+//! non-owning caches; each returned header transfers one reference to its caller.
+//! Attached frames, their bytecode function and initialized slots must remain live
+//! at stable addresses. Async frames have a separate retained activation edge.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.pointer { Pointer }
+import silk.u16
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_value { Value }
+import js_core_types { ObjectData, ObjectPayload, FunctionBytecode, StackFrame,
+  FrameSlot, VarRef, VarRefState, JS_MODE_ASYNC }
+import js_gc { HeapHooks }
+import js_gc as gc
+
+fn trap() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+fn require(condition: bool) -> () { if !condition { trap() } }
+fn present(value: ?*mut HeapHeader) -> *mut HeapHeader {
+  require(!Pointer.isNull<HeapHeader>(value))
+  return unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(value)
+}
+fn sameSlot(left: FrameSlot, right: FrameSlot) -> bool {
+  match left {
+    FrameSlot.Argument { index } => {
+      return match right { FrameSlot.Argument { index: other } => index == other _ => false }
+    }
+    FrameSlot.Local { index } => {
+      return match right { FrameSlot.Local { index: other } => index == other _ => false }
+    }
+  }
+}
+unsafe fn frameBytecode(frame: *mut StackFrame) -> *mut HeapHeader {
+  let anchor = ()
+  let sf = unsafe Pointer.borrow<(), StackFrame>(&anchor, frame)
+  let function = match sf.currentFunction { Value.Object { reference } => reference _ => trap() }
+  drop sf
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, function)
+  return match &object.payload { ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode _ => trap() }
+}
+unsafe fn captureIndex(bytecode: *mut HeapHeader, index: usize, isArgument: bool) -> u16 {
+  let anchor = ()
+  let b = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  let mut definition = index
+  if isArgument {
+    require(index < u16.toUsize(b.argumentCount))
+  } else {
+    require(index < u16.toUsize(b.variableCount))
+    definition = definition + u16.toUsize(b.argumentCount)
+  }
+  let variable = &b.varDefs.asSlice()[definition]
+  require(variable.isCaptured && variable.varRefIndex < b.varRefCount)
+  return variable.varRefIndex
+}
+
+/// Lexical controls the initial value, not the cell's isLexical flag, exactly as
+/// js_create_var_ref. Global/module binding installation sets those flags later.
+pub unsafe effect fn createDetached(runtime: *mut HeapHeader, lexical: bool) -> *mut HeapHeader
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut value = Value.Undefined
+  if lexical { value = Value.Uninitialized }
+  let reference = run HeapCell.allocate<VarRef>(HeapKind.VarRef, VarRef {
+    isLexical: false, isConst: false, state: VarRefState.Detached { value: value }
+  })
+  unsafe gc.publish(runtime, reference)
+  return reference
+}
+
+/// Returns an owned reference to a captured argument/local. A cache hit never
+/// allocates; allocation failure leaves the cache and async-owner count unchanged.
+pub unsafe effect fn get(runtime: *mut HeapHeader, frame: *mut StackFrame,
+  index: usize, isArgument: bool) -> *mut HeapHeader ! OutOfMemoryError ? &mut Allocator {
+  let varRefIndex = unsafe captureIndex(unsafe frameBytecode(frame), index, isArgument)
+  let tableIndex = u16.toUsize(varRefIndex)
+  let mut slot = FrameSlot.Local { index: index }
+  if isArgument { slot = FrameSlot.Argument { index: index } }
+  let mut anchor = ()
+  let sf = unsafe Pointer.borrow<(), StackFrame>(&anchor, frame)
+  require(tableIndex < sf.varRefs.length())
+  if isArgument { require(index < sf.arguments.length()) } else { require(index < sf.locals.length()) }
+  let cached = unsafe sf.varRefs.get(tableIndex)
+  let asynchronous = (sf.mode & JS_MODE_ASYNC) != 0
+  let owner = sf.asyncOwner
+  drop sf
+  if !Pointer.isNull<HeapHeader>(cached) {
+    let header = present(cached)
+    let reference = unsafe HeapCell.payload<VarRef, ()>(&anchor, header)
+    let matches = match reference.state {
+      VarRefState.Attached { frame: foundFrame, slot: foundSlot, varRefIndex: foundIndex } =>
+        Pointer.address<StackFrame>(foundFrame) == Pointer.address<StackFrame>(frame)
+          && sameSlot(slot, foundSlot) && foundIndex == varRefIndex
+      VarRefState.Detached { .. } => false
+    }
+    require(matches)
+    drop reference
+    unsafe HeapCell.retain(header)
+    return header
+  }
+  let reference = run HeapCell.allocate<VarRef>(HeapKind.VarRef, VarRef {
+    isLexical: false, isConst: false,
+    state: VarRefState.Attached { frame: frame, slot: slot, varRefIndex: varRefIndex }
+  })
+  if asynchronous { unsafe HeapCell.retain(present(owner)) }
+  let active = unsafe Pointer.borrowMut<(), StackFrame>(&mut anchor, frame)
+  unsafe active.varRefs.set(tableIndex, reference)
+  drop active
+  unsafe gc.publish(runtime, reference)
+  return reference
+}
+
+/// Borrows the current value without retaining it. Retain before keeping the
+/// result across mutation, detachment, or release of the cell/frame owner.
+pub unsafe fn read(reference: *mut HeapHeader) -> Value {
+  let anchor = ()
+  let cell = unsafe HeapCell.payload<VarRef, ()>(&anchor, reference)
+  let state = cell.state
+  drop cell
+  match state {
+    VarRefState.Detached { value } => { return value }
+    VarRefState.Attached { frame, slot, .. } => {
+      let sf = unsafe Pointer.borrow<(), StackFrame>(&anchor, frame)
+      return match slot {
+        FrameSlot.Argument { index } => unsafe sf.arguments.get(index)
+        FrameSlot.Local { index } => unsafe sf.locals.get(index)
+      }
+    }
+  }
+}
+
+/// Transfers incoming ownership into the binding and returns its previous owned
+/// value. The caller applies lexical/const checks before replacement and releases
+/// the old value afterward, so finalizer reentry observes the new binding.
+pub unsafe fn replace(reference: *mut HeapHeader, value: Value) -> Value {
+  let mut anchor = ()
+  let cell = unsafe HeapCell.payloadMut<VarRef, ()>(&mut anchor, reference)
+  let state = cell.state
+  match state {
+    VarRefState.Detached { value: previous } => {
+      cell.state = VarRefState.Detached { value: value }
+      return previous
+    }
+    VarRefState.Attached { frame, slot, .. } => {
+      drop cell
+      let sf = unsafe Pointer.borrowMut<(), StackFrame>(&mut anchor, frame)
+      return match slot {
+        FrameSlot.Argument { index } => unsafe sf.arguments.replace(index, value)
+        FrameSlot.Local { index } => unsafe sf.locals.replace(index, value)
+      }
+    }
+  }
+}
+
+/// Closes only this lexical generation. Clearing the non-owning frame cache lets
+/// the next loop/block activation capture a distinct cell at the same local slot.
+/// The caller keeps the frame/async activation rooted until this returns.
+pub unsafe fn closeLexical<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader,
+  bytecode: *mut HeapHeader, frame: *mut StackFrame, index: usize) -> () {
+  let tableIndex = u16.toUsize(unsafe captureIndex(bytecode, index, false))
+  let anchor = ()
+  let sf = unsafe Pointer.borrow<(), StackFrame>(&anchor, frame)
+  let reference = unsafe sf.varRefs.get(tableIndex)
+  drop sf
+  if !Pointer.isNull<HeapHeader>(reference) { unsafe gc.detachVarRef(&mut hooks, runtime, present(reference)) }
+}

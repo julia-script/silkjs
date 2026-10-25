@@ -1,0 +1,228 @@
+//! Test262 agents execute actual parser/VM/jobs in independent RuntimeAllocators.
+//! run-test262.c:614-879 installs the same eight methods in every realm; only
+//! start/broadcast and leaving/receiveBroadcast enforce context-opaque checks.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.list { List }
+import silk.u32
+import silk.i32
+import silk.i64
+import runtime_memory { RuntimeAllocator }
+import js_engine { Engine }
+import js_libc_services { LibcServices }
+import js_libc { Session }
+import js_libc as libc
+import js_libc_platform as platform
+import js_heap { HeapHeader }
+import js_value { Value }
+import js_core_types { FrameSlots, NativeErrorKind, NativeFunctionId }
+import js_exceptions { JsException }
+import js_string_types { StringLengthError }
+import js_coercion_host { CoercionHooks }
+import js_runtime as runtime
+import js_runtime_jobs as jobs
+import js_gc as gc
+import js_vm as vm
+import js_eval as evaluation
+import js_std_support as support
+import js_integer_coercions as integers
+import js_proxy_core as core
+import js_buffer_storage as buffers
+import js_os_workers_transport as backing
+import js_os_events_platform as clock
+import test262_host as host
+import test262_agent_native as native
+import test262_agent_native { Broadcast, BroadcastBacking }
+
+unsafe effect fn int32<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader, value: Value) -> i32 ! JsException ? &mut Allocator {
+  let mut output: i32 = 0 let result = run Effect.result(unsafe integers.toInt32(&mut engine, context, &mut output, value))
+  match move result { Result<(), OutOfMemoryError | StringLengthError | JsException>.Success { .. } => ()
+    Result<(), OutOfMemoryError | StringLengthError | JsException>.Failure { error } => { return run unsafe core.materialize(&mut engine, context, move error) } }
+  return output
+}
+unsafe effect fn captureBroadcast<'m>(engine: &mut Engine<'m, LibcServices>,
+  context: *mut HeapHeader, object: *mut HeapHeader, state: buffers.BufferState,
+  pin: &mut Option<usize>) -> Broadcast ! OutOfMemoryError | JsException ? &mut Allocator {
+  if unsafe buffers.hasBorrowedSharedBacking(object) {
+    return Broadcast { backing: BroadcastBacking.Borrowed { data: state.data,
+      length: state.byteLength, capacity: state.physicalCapacity }, value: 0 }
+  }
+  if unsafe buffers.hasExternalBacking(object) {
+    if state.byteLength != 0 && (Pointer.isNull<u8>(state.data) || (Pointer.address<u8>(state.data) & 7) != 0) {
+      return run unsafe engine.throwError(context, NativeErrorKind.Type, b"external broadcast buffer must have eight-byte aligned storage")
+    }
+    let token = run unsafe host.acquireExternalPin(&mut engine, context, Value.Object { reference: object })
+    pin.* = Option<usize>.some(token)
+    let pinned = unsafe buffers.snapshot(object)
+    return Broadcast { backing: BroadcastBacking.Borrowed { data: state.data,
+      length: state.byteLength, capacity: pinned.physicalCapacity }, value: 0 }
+  }
+  if state.shared && !unsafe buffers.hasNativeSharedBacking(object) {
+    unsafe backing.duplicateShared(state.data)
+    return Broadcast { backing: BroadcastBacking.Shared { data: state.data,
+      length: state.byteLength, capacity: state.physicalCapacity }, value: 0 }
+  }
+  let lease = run unsafe buffers.leaseBacking(object)
+  return Broadcast { backing: BroadcastBacking.Leased { lease: move lease }, value: 0 }
+}
+unsafe effect fn broadcast<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader, value: Value, argument: Value) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  // JS_GetArrayBuffer accepts both kinds and rejects detached ordinary buffers.
+  let object = run unsafe buffers.requireBuffer(&mut engine, context, value, -1)
+  let state = unsafe buffers.snapshot(object)
+  if state.detached { return run unsafe engine.throwError(context, NativeErrorKind.Type, b"ArrayBuffer is detached") }
+  let group = host.state(&engine.*).group
+  // Own the exact pre-coercion snapshot for both native and host-backed SABs.
+  // A throwing coercion drops this owner without publishing any mailbox.
+  let mut pin = Option<usize>.none()
+  let mut message = run unsafe captureBroadcast(&mut engine, context, object, state, &mut pin)
+  let coerced = run Effect.result(unsafe int32(&mut engine, context, argument))
+  match move coerced {
+    Result<i32, JsException>.Success { value: number } => { message.value = number }
+    Result<i32, JsException>.Failure { error } => {
+      unsafe host.finishExternalPin(&mut engine, context, move pin, false)
+      fail move error
+    }
+  }
+  // C's raw pointer becomes dangling if coercion detaches its ordinary input.
+  // The native lease is still safe, but reject this source-UAF boundary.
+  if (unsafe buffers.snapshot(object)).detached {
+    unsafe host.finishExternalPin(&mut engine, context, move pin, false)
+    return run unsafe engine.throwError(context, NativeErrorKind.Type, b"ArrayBuffer is detached")
+  }
+  let recipients = unsafe native.broadcast(group, &message)
+  unsafe host.finishExternalPin(&mut engine, context, move pin, recipients != 0)
+  return Value.Undefined
+}
+pub unsafe effect fn dispatch<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader, id: u32, argc: i32, argv: &FrameSlots) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  let inside = unsafe host.insideAgent(&engine.*, context)
+  if (id == host.AGENT_START || id == host.AGENT_BROADCAST) && inside {
+    return run unsafe engine.throwError(context, NativeErrorKind.Type, b"cannot be called inside an agent")
+  }
+  if (id == host.AGENT_LEAVING || id == host.AGENT_RECEIVE) && !inside {
+    return run unsafe engine.throwError(context, NativeErrorKind.Type, b"must be called inside an agent")
+  }
+  let group = host.state(&engine.*).group let first = unsafe support.argument(argv, argc, 0)
+  if id == host.AGENT_START {
+    let source = run unsafe support.text(&mut engine, context, first)
+    let result = run Effect.result(unsafe native.start(group, &engine.services.process, engine.services.experimental, source.asSlice()))
+    match move result { Result<(), OutOfMemoryError | native.NativeError>.Success { .. } => ()
+      Result<(), OutOfMemoryError | native.NativeError>.Failure { error } => {
+        match move error { OutOfMemoryError allocation => { fail move allocation }
+          native.NativeError { .. } => { return run unsafe engine.throwError(context, NativeErrorKind.Internal, b"could not create agent") } }
+      } }
+    return Value.Undefined
+  }
+  if id == host.AGENT_REPORT_GET {
+    let report = unsafe native.getReport(group)
+    return match move report { Option<List<u8>>.Some { value } => run unsafe support.string(&mut engine, context, value.asSlice())
+      Option<List<u8>>.None => Value.Null }
+  }
+  if id == host.AGENT_BROADCAST { return run unsafe broadcast(&mut engine, context, first, unsafe support.argument(argv, argc, 1)) }
+  if id == host.AGENT_REPORT {
+    let text = run unsafe support.text(&mut engine, context, first) run unsafe native.report(group, text.asSlice()) return Value.Undefined
+  }
+  // Pinned leaving only checks context; it does not cancel callbacks or jobs.
+  if id == host.AGENT_LEAVING { return Value.Undefined }
+  if id == host.AGENT_RECEIVE {
+    if !unsafe engine.isCallable(context, first) { return run unsafe engine.throwError(context, NativeErrorKind.Type, b"expecting function") }
+    let state = host.stateMut(&mut engine) let previous = state.callback state.callback = unsafe first.retained() drop state
+    unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), previous) return Value.Undefined
+  }
+  if id == host.AGENT_SLEEP {
+    let signed = run unsafe int32(&mut engine, context, first)
+    let mut duration: u32 = 0
+    if signed < 0 { duration = i32.toU32(-(signed + 1)) ^ 0xffffffff } else { duration = i32.toU32(signed) }
+    unsafe native.sleep(group, duration) return Value.Undefined
+  }
+  if id == host.AGENT_NOW { return Value.number(i64.toF64(clock.nowNanoseconds() / 1000000)) }
+  return Intrinsic.trap("invalid test262 agent callback")
+}
+unsafe effect fn wrapBroadcast<'m>(session: &mut Session<'m>, message: &Broadcast) -> Value ! JsException ? &mut Allocator {
+  let memory = session.engine.memory
+  match &message.backing {
+    BroadcastBacking.Shared { data, length, capacity } => {
+      let value = run unsafe buffers.createExternal(&mut session.engine, memory, session.context, Value.Undefined,
+        u32.toU64(length), Option<u64>.none(), true, data, Option<NativeFunctionId>.none(), Pointer.null<u8>(), false)
+      unsafe buffers.setSharedPhysicalCapacity(core.reference(value), capacity)
+      return value
+    }
+    BroadcastBacking.Leased { lease } => {
+      return run unsafe buffers.newSharedFromLease(&mut session.engine, memory, session.context, &lease)
+    }
+    BroadcastBacking.Borrowed { data, length, capacity } => {
+      return run unsafe buffers.newSharedBorrowed(&mut session.engine, memory, session.context, data, length, capacity)
+    }
+  }
+}
+unsafe effect fn execute<'m>(session: &mut Session<'m>, source: List<u8>) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  let memory = session.engine.memory let group = host.state(&session.engine).group
+  let evaluated = run Effect.result(unsafe evaluation.evaluate(&mut session.engine, memory, session.context, source.asSlice(), b"<evalScript>", 0))
+  drop source
+  match move evaluated { Result<Value, JsException>.Success { value } => { unsafe gc.release(&mut session.engine, session.runtime, value) }
+    Result<Value, JsException>.Failure { .. } => {
+      if !unsafe native.stopping(group) { unsafe native.failed(group) run unsafe libc.dumpError(&mut session.engine, session.context) }
+    } }
+  while !unsafe native.stopping(group) {
+    let job = run unsafe jobs.executePendingJob(&mut session.engine, session.runtime)
+    if job.status < 0 {
+      unsafe native.failed(group) run unsafe libc.dumpError(&mut session.engine, session.context) break
+    }
+    if job.status > 0 { continue }
+    let state = host.state(&session.engine)
+    if state.callback.tag() == 3 { break }
+    let child = unsafe native.nonnull(state.child) drop state
+    let received = unsafe native.receive(group, child)
+    let message = match move received { Option<Broadcast>.Some { value } => move value Option<Broadcast>.None => { break } }
+    let made = run Effect.result(unsafe wrapBroadcast(&mut session, &message))
+    let number = message.value drop message
+    let buffer = match move made { Result<Value, JsException>.Success { value } => value Result<Value, JsException>.Failure { error } => { fail move error } }
+    let state2 = host.stateMut(&mut session.engine) let callback = Intrinsic.replace(state2.callback, Value.Undefined) drop state2
+    let mut values = [buffer, Value.Int { value: number }]
+    let arguments = FrameSlots.Borrowed { data: Pointer.fromMutRef(&mut values[0]), length: 2 }
+    let called = run Effect.result(unsafe vm.call(&mut session.engine, memory, session.context, callback, Value.Undefined, &arguments))
+    unsafe gc.release(&mut session.engine, session.runtime, buffer)
+    unsafe gc.release(&mut session.engine, session.runtime, callback)
+    // The C loop clears the current slot AFTER invoking, including a callback
+    // registered reentrantly by this callback. Do not silently retain it.
+    let state3 = host.stateMut(&mut session.engine) let replaced = Intrinsic.replace(state3.callback, Value.Undefined) drop state3
+    unsafe gc.release(&mut session.engine, session.runtime, replaced)
+    match move called { Result<Value, JsException>.Success { value } => { unsafe gc.release(&mut session.engine, session.runtime, value) }
+      Result<Value, JsException>.Failure { .. } => {
+        if !unsafe native.stopping(group) { unsafe native.failed(group) run unsafe libc.dumpError(&mut session.engine, session.context) }
+      } }
+  }
+}
+effect fn launch(packet: &mut native.Start) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider()) let memory = run allocator.observe()
+  let opened = run Effect.result(unsafe Session.openCore(&memory, unsafe native.domain(packet.group), &packet.process, 2047)) |> Effect.provideMut<Allocator>(&mut allocator)
+  match move opened { Result<Session, OutOfMemoryError | JsException>.Success { value } => {
+    let mut session = move value session.engine.services.experimental = packet.experimental
+    let installed = run Effect.result(unsafe host.installChild(&mut session, packet.group, packet.child)) |> Effect.provideMut<Allocator>(&mut allocator)
+    match move installed { Result<(), OutOfMemoryError | JsException>.Success { .. } => {
+      let source = Intrinsic.replace(packet.source, List<u8>.make())
+      let result = run Effect.result(unsafe execute(&mut session, move source)) |> Effect.provideMut<Allocator>(&mut allocator)
+      match move result { Result<(), OutOfMemoryError | JsException>.Success { .. } => ()
+        Result<(), OutOfMemoryError | JsException>.Failure { .. } => {
+          if !unsafe native.stopping(packet.group) { unsafe native.failed(packet.group) run unsafe libc.dumpError(&mut session.engine, session.context) |> Effect.provideMut<Allocator>(&mut allocator) }
+        } }
+    } Result<(), OutOfMemoryError | JsException>.Failure { .. } => {
+      unsafe native.failed(packet.group) run unsafe libc.dumpError(&mut session.engine, session.context) |> Effect.provideMut<Allocator>(&mut allocator)
+    } }
+    unsafe host.shutdown(&mut session)
+    run unsafe session.close() |> Effect.provideMut<Allocator>(&mut allocator) drop session
+  } Result<Session, OutOfMemoryError | JsException>.Failure { .. } => {
+    unsafe native.failed(packet.group) let written = platform.writeAll(2, b"JS_NewContext failure\n")
+  } }
+  let stats = memory.stats()
+  if stats.allocationCount != 0 || stats.usedBytes != 0 { Intrinsic.trap("test262 agent runtime teardown leaked allocations") }
+}
+pub fn runAgent(packet: native.Start) -> () {
+  let mut owned = move packet let mut allocator = Allocator.systemAllocatorProvider()
+  let result = run Effect.result(launch(&mut owned)) |> Effect.provideMut<Allocator>(&mut allocator)
+  match move result { Result<(), OutOfMemoryError>.Success { .. } => () Result<(), OutOfMemoryError>.Failure { .. } => {
+    unsafe native.failed(owned.group) let written = platform.writeAll(2, b"JS_NewRuntime failure\n")
+  } }
+}

@@ -1,0 +1,226 @@
+// Native QuickJS stack analysis and serialization operand rewriting.
+// Algorithms from quickjs.c; Fabrice Bellard and Charlie Gordon, LICENSE.quickjs.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.list { List }
+import silk.ownership { Copy }
+import silk.u8
+import silk.u16
+import silk.u32
+import silk.i32
+import silk.i64
+import silk.usize
+import byte_buffer { readU16, readU32 }
+import js_opcode_data as op
+
+pub const JS_STACK_SIZE_MAX: i32 = 65534
+pub union BytecodeErrorKind {
+  BufferOverflow, InvalidOpcode, StackUnderflow, StackOverflow,
+  InconsistentStack, InconsistentCatch, MissingCatch
+}
+impl Copy for BytecodeErrorKind {}
+pub struct BytecodeError {
+  pub kind: BytecodeErrorKind,
+  pub pc: i64,
+  pub opcode: u8,
+  pub expected: i64,
+  pub actual: i64
+}
+impl Copy for BytecodeError {}
+
+struct StackState {
+  levels: List<u16>,
+  catches: List<i64>,
+  pending: List<usize>,
+  maximum: i32
+}
+impl StackState {
+  effect fn checkMaximum(self: &mut Self, pc: i64, opcode: u8, level: i32) -> () ! BytecodeError {
+    if level > self.maximum {
+      self.maximum = level
+      if level > JS_STACK_SIZE_MAX {
+        fail BytecodeError { kind: BytecodeErrorKind.StackOverflow, pc: pc, opcode: opcode,
+          expected: 65534, actual: i32.toI64(level) }
+      }
+    }
+  }
+  effect fn enqueue(self: &mut Self, pc: i64, opcode: u8, level: i32, catchPc: i64) -> ()
+    ! BytecodeError | OutOfMemoryError ? &mut Allocator {
+    if pc < 0 || pc >= usize.toI64(self.levels.length()) {
+      fail BytecodeError { kind: BytecodeErrorKind.BufferOverflow, pc: pc, opcode: opcode,
+        expected: usize.toI64(self.levels.length()), actual: pc }
+    }
+    run self.checkMaximum(pc, opcode, level)
+    let index = i64.toUsize(pc)
+    let previous = self.levels.get(index)
+    if previous != 65535 {
+      if u16.toI32(previous) != level {
+        fail BytecodeError { kind: BytecodeErrorKind.InconsistentStack, pc: pc, opcode: opcode,
+          expected: u16.toI64(previous), actual: i32.toI64(level) }
+      }
+      let previousCatch = self.catches.get(index)
+      if previousCatch != catchPc {
+        fail BytecodeError { kind: BytecodeErrorKind.InconsistentCatch, pc: pc, opcode: opcode,
+          expected: previousCatch, actual: catchPc }
+      }
+      return ()
+    }
+    self.levels.set(index, i32.toU16(level))
+    self.catches.set(index, catchPc)
+    run self.pending.append(index)
+  }
+}
+
+fn signed32(value: u32) -> i64 {
+  if value >= 0x80000000 { return u32.toI64(value) - 4294967296 }
+  return u32.toI64(value)
+}
+fn displacement8(value: u8) -> i64 {
+  if value >= 128 { return u8.toI64(value) - 256 }
+  return u8.toI64(value)
+}
+fn displacement16(value: u16) -> i64 {
+  if value >= 32768 { return u16.toI64(value) - 65536 }
+  return u16.toI64(value)
+}
+
+// Analyzes final (short-opcode) little-endian bytecode, not parser temporaries.
+// As in QuickJS, only reachable instructions are inspected. Branch targets need
+// not be independently identified instruction boundaries. No runtime is required.
+pub effect fn computeStackSize(code: &[u8]) -> u16
+  ! BytecodeError | OutOfMemoryError ? &mut Allocator {
+  let mut state = StackState { levels: List<u16>.make(), catches: List<i64>.make(),
+    pending: List<usize>.make(), maximum: 0 }
+  run state.levels.reserve(code.length)
+  run state.catches.reserve(code.length)
+  let mut i: usize = 0
+  while i < code.length {
+    run state.levels.append(65535)
+    run state.catches.append(-1)
+    i = i + 1
+  }
+  run state.enqueue(0, op.OP_invalid, 0, -1)
+  while state.pending.length() != 0 {
+    let last = state.pending.length() - 1
+    let pos = state.pending.get(last)
+    state.pending.truncate(last)
+    let pc = usize.toI64(pos)
+    let opcode = code[pos]
+    let mut level = u16.toI32(state.levels.get(pos))
+    let mut catchPc = state.catches.get(pos)
+    if opcode == 0 || u8.toUsize(opcode) >= op.OP_COUNT {
+      fail BytecodeError { kind: BytecodeErrorKind.InvalidOpcode, pc: pc, opcode: opcode,
+        expected: 0, actual: u8.toI64(opcode) }
+    }
+    let info = op.opcodeInfo(opcode, true)
+    let mut next = pc + u8.toI64(info.size)
+    if next > usize.toI64(code.length) {
+      fail BytecodeError { kind: BytecodeErrorKind.BufferOverflow, pc: pc, opcode: opcode,
+        expected: usize.toI64(code.length), actual: next }
+    }
+    let mut pops = u8.toI32(info.pops)
+    if info.format == op.OP_FMT_npop || info.format == op.OP_FMT_npop_u16 {
+      pops = pops + u16.toI32(readU16(code, pos + 1))
+    } else if info.format == op.OP_FMT_npopx {
+      pops = pops + u8.toI32(opcode) - u8.toI32(op.OP_call0)
+    }
+    if level < pops {
+      fail BytecodeError { kind: BytecodeErrorKind.StackUnderflow, pc: pc, opcode: opcode,
+        expected: i32.toI64(pops), actual: i32.toI64(level) }
+    }
+    level = level + u8.toI32(info.pushes) - pops
+    run state.checkMaximum(pc, opcode, level)
+    if opcode == op.OP_tail_call || opcode == op.OP_tail_call_method
+      || opcode == op.OP_return || opcode == op.OP_return_undef
+      || opcode == op.OP_return_async || opcode == op.OP_throw
+      || opcode == op.OP_throw_error || opcode == op.OP_ret { continue }
+    if opcode == op.OP_goto {
+      next = pc + 1 + signed32(readU32(code, pos + 1))
+    } else if opcode == op.OP_goto16 {
+      next = pc + 1 + displacement16(readU16(code, pos + 1))
+    } else if opcode == op.OP_goto8 {
+      next = pc + 1 + displacement8(code[pos + 1])
+    } else if opcode == op.OP_if_true8 || opcode == op.OP_if_false8 {
+      run state.enqueue(pc + 1 + displacement8(code[pos + 1]), opcode, level, catchPc)
+    } else if opcode == op.OP_if_true || opcode == op.OP_if_false {
+      run state.enqueue(pc + 1 + signed32(readU32(code, pos + 1)), opcode, level, catchPc)
+    } else if opcode == op.OP_gosub {
+      run state.enqueue(pc + 1 + signed32(readU32(code, pos + 1)), opcode, level + 1, catchPc)
+    } else if opcode == op.OP_with_get_var || opcode == op.OP_with_delete_var {
+      run state.enqueue(pc + 5 + signed32(readU32(code, pos + 5)), opcode, level + 1, catchPc)
+    } else if opcode == op.OP_with_make_ref || opcode == op.OP_with_get_ref {
+      run state.enqueue(pc + 5 + signed32(readU32(code, pos + 5)), opcode, level + 2, catchPc)
+    } else if opcode == op.OP_with_put_var {
+      run state.enqueue(pc + 5 + signed32(readU32(code, pos + 5)), opcode, level - 1, catchPc)
+    } else if opcode == op.OP_catch {
+      run state.enqueue(pc + 1 + signed32(readU32(code, pos + 1)), opcode, level, catchPc)
+      catchPc = pc
+    } else if opcode == op.OP_for_of_start || opcode == op.OP_for_await_of_start {
+      catchPc = pc
+    } else if opcode == op.OP_drop || opcode == op.OP_nip || opcode == op.OP_nip1 || opcode == op.OP_iterator_close {
+      let mut catchLevel = level
+      if opcode == op.OP_nip || opcode == op.OP_nip1 { catchLevel = level - 1 }
+      if opcode == op.OP_iterator_close { catchLevel = level + 2 }
+      if catchPc >= 0 {
+        let index = i64.toUsize(catchPc)
+        let mut priorLevel = u16.toI32(state.levels.get(index))
+        if code[index] != op.OP_catch { priorLevel = priorLevel + 1 }
+        if catchLevel == priorLevel { catchPc = state.catches.get(index) }
+      }
+    } else if opcode == op.OP_nip_catch {
+      if catchPc < 0 {
+        fail BytecodeError { kind: BytecodeErrorKind.MissingCatch, pc: pc, opcode: opcode,
+          expected: 0, actual: catchPc }
+      }
+      let index = i64.toUsize(catchPc)
+      level = u16.toI32(state.levels.get(index))
+      if code[index] != op.OP_catch { level = level + 1 }
+      level = level + 1
+      catchPc = state.catches.get(index)
+    }
+    run state.enqueue(next, opcode, level, catchPc)
+  }
+  return i32.toU16(state.maximum)
+}
+
+fn reverse16(code: &mut [u8], start: usize) -> () {
+  let first = code[start]
+  code[start] = code[start + 1]
+  code[start + 1] = first
+}
+fn reverse32(code: &mut [u8], start: usize) -> () {
+  let first = code[start]
+  let second = code[start + 1]
+  code[start] = code[start + 3]
+  code[start + 1] = code[start + 2]
+  code[start + 2] = second
+  code[start + 3] = first
+}
+
+// In-place, allocation-free endian conversion in either direction. The caller
+// must provide complete, valid final bytecode: every opcode and its full operand
+// must be in bounds. Byte-sized operands and opcodes are never changed.
+pub fn swapBytecodeEndian(code: &mut [u8]) -> () {
+  let mut pos: usize = 0
+  while pos < code.length {
+    let info = op.opcodeInfo(code[pos], true)
+    let fmt = info.format
+    if fmt == op.OP_FMT_u16 || fmt == op.OP_FMT_i16 || fmt == op.OP_FMT_label16
+      || fmt == op.OP_FMT_npop || fmt == op.OP_FMT_loc || fmt == op.OP_FMT_arg || fmt == op.OP_FMT_var_ref {
+      reverse16(&mut code, pos + 1)
+    } else if fmt == op.OP_FMT_i32 || fmt == op.OP_FMT_u32 || fmt == op.OP_FMT_const
+      || fmt == op.OP_FMT_label || fmt == op.OP_FMT_atom || fmt == op.OP_FMT_atom_u8 {
+      reverse32(&mut code, pos + 1)
+    } else if fmt == op.OP_FMT_atom_u16 || fmt == op.OP_FMT_label_u16 {
+      reverse32(&mut code, pos + 1)
+      reverse16(&mut code, pos + 5)
+    } else if fmt == op.OP_FMT_atom_label_u8 || fmt == op.OP_FMT_atom_label_u16 {
+      reverse32(&mut code, pos + 1)
+      reverse32(&mut code, pos + 5)
+      if fmt == op.OP_FMT_atom_label_u16 { reverse16(&mut code, pos + 9) }
+    } else if fmt == op.OP_FMT_npop_u16 {
+      reverse16(&mut code, pos + 1)
+      reverse16(&mut code, pos + 3)
+    }
+    pos = pos + u8.toUsize(info.size)
+  }
+}

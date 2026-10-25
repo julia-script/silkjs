@@ -1,0 +1,178 @@
+//! Pinned intl/datetimeformat.c pattern rendering and byte-indexed parts; LICENSE.quickjs.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.ownership { Copy }
+import silk.list { List }
+import silk.slice { Slice }
+import silk.string { String }
+import silk.i32
+import silk.i64
+import silk.usize
+import silk.u8
+import byte_buffer { ByteBuffer }
+import utf8 { Utf8 }
+import intl_shared as shared
+import intl_locale_data as data
+import intl_locale_data { LocaleData }
+import intl_numbering_data as numbering
+import temporal_calendar as cal
+import temporal_timezone as tz
+import js_intl_datetimeformat_record { Fields }
+import js_intl_datetimeformat_render_support as support
+import js_intl_datetimeformat_render_support { DateFields }
+
+pub struct Part { pub kind:string<'static>, pub offset:usize, pub length:usize }
+impl Copy for Part {}
+pub struct Output { pub bytes:ByteBuffer, pub parts:List<Part>, pub wantParts:bool }
+impl Output {
+  pub fn make(wantParts:bool) -> Output { return Output {bytes:ByteBuffer.make(),parts:List<Part>.make(),wantParts:wantParts} }
+  pub effect fn record(self:&mut Self, kind:string<'static>, offset:usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.wantParts { run self.parts.append(Part {kind:kind,offset:offset,length:self.bytes.length() - offset}) }
+  }
+  pub effect fn emit(self:&mut Self, kind:string<'static>, text:string) -> () ! OutOfMemoryError ? &mut Allocator {
+    let off = self.bytes.length() run self.bytes.appendSlice(String.utf8Bytes(text)) run self.record(kind,off)
+  }
+  pub effect fn literal(self:&mut Self, text:string) -> () ! OutOfMemoryError ? &mut Allocator { run self.emit("literal",text) }
+  pub effect fn number(self:&mut Self, kind:string<'static>, value:i32, width:i32, ns:i32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let off = self.bytes.length()
+    // Widen before negation: the source's fixed decimal scratch buffer must never
+    // expose a signed-overflow or an out-of-bounds read at a numeric boundary.
+    let mut magnitude = i32.toI64(value) if magnitude < 0 { magnitude = -magnitude }
+    let mut digits:[u8;20] = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+    let mut at:usize = 20
+    while true { at = at - 1 digits[at] = i64.toU8(magnitude % 10) magnitude = magnitude / 10 if magnitude == 0 { break } }
+    if value < 0 { run self.bytes.append(45) }
+    let mut padding = width - usize.toI32(20 - at) - support.choose(value < 0,1,0)
+    while padding > 0 { run self.digit(ns,0) padding = padding - 1 }
+    while at < 20 { run self.digit(ns, u8.toI32(digits[at])) at = at + 1 }
+    run self.record(kind,off)
+  }
+  effect fn digit(self:&mut Self, ns:i32, digit:i32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut cp = shared.nf_get_digit(ns,digit)
+    if cp == 0 { cp = i32.toU32(48 + digit) }
+    let mut buffer:[u8;6] = [0,0,0,0,0,0] let n = Utf8.encode(cp,&mut buffer)
+    run self.bytes.appendSlice(Slice.view<u8>(&buffer,0,n))
+  }
+  pub effect fn leapSuffix(self:&mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.bytes.append(76)
+    let n = self.parts.length() if self.wantParts && n > 0 { let mut part = self.parts.get(n - 1) part.length = part.length + 1 self.parts.set(n - 1,part) }
+  }
+  fn suppressSpace(self:&mut Self) -> () {
+    let n = self.bytes.length() let mut remove:usize = 0
+    if n > 0 && self.bytes.get(n - 1) == 32 { remove = 1 }
+    else if n >= 3 && self.bytes.get(n - 3) == 226 && self.bytes.get(n - 2) == 128 && self.bytes.get(n - 1) == 175 { remove = 3 }
+    if remove == 0 { return () }
+    self.bytes.truncate(n - remove)
+    let count = self.parts.length()
+    if count > 0 { let last = self.parts.get(count - 1) if last.offset + last.length == n { self.parts.truncate(count - 1) } }
+  }
+  effect fn merge(self:&mut Self, other:&Output) -> () ! OutOfMemoryError ? &mut Allocator {
+    let base = self.bytes.length() run self.bytes.appendSlice(other.bytes.asSlice())
+    if self.wantParts { let mut i:usize = 0 while i < other.parts.length() { let mut part = other.parts.get(i) part.offset = part.offset + base run self.parts.append(part) i = i + 1 } }
+  }
+}
+fn alpha(c:u8) -> bool { return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) }
+fn next(bytes:&[u8], start:usize) -> usize {
+  let c = bytes[start] let mut end = start + 1 let mut extra:usize = 0
+  if c >= 192 { extra = 1 if c >= 224 { extra = 2 } if c >= 240 { extra = 3 } }
+  while extra > 0 && end < bytes.length && (bytes[end] & 192) == 128 { end = end + 1 extra = extra - 1 } return end
+}
+effect fn quoted(out:&mut Output, bytes:&[u8], start:usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let mut at = start + 1
+  if at < bytes.length && bytes[at] == 39 { run out.literal("'") return at + 1 }
+  let begin = at while at < bytes.length && bytes[at] != 39 { at = at + 1 }
+  run out.literal(support.text(Slice.view<u8>(bytes,begin,at - begin)))
+  if at < bytes.length { at = at + 1 } return at
+}
+pub effect fn zone(out:&mut Output, timeZone:&[u8], fields:&DateFields, longName:bool, pattern:bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  let name = support.text(timeZone)
+  if name == "UTC" || name == "GMT" || name == "Etc/UTC" || name == "Etc/GMT" {
+    if longName { run out.emit("timeZoneName","Coordinated Universal Time") } else { run out.emit("timeZoneName","UTC") } return ()
+  }
+  if pattern && timeZone.length > 0 && (timeZone[0] == 43 || timeZone[0] == 45) { run out.emit("timeZoneName",name) return () }
+  let id = tz.ti_tz_find_id(timeZone)
+  let mut minutes:i32 = 0 let mut negative = false
+  if id >= 0 {
+    // Pinned source intentionally looks up the already offset local second here.
+    let offset = tz.ti_tz_offset_at_sec(id,fields.epochSec)
+    if longName && name == "Europe/Vienna" {
+      if offset == 3600 { run out.emit("timeZoneName","Central European Standard Time") return () }
+      if offset == 7200 { run out.emit("timeZoneName","Central European Summer Time") return () }
+    }
+    negative = offset < 0 minutes = offset / 60 if minutes < 0 { minutes = -minutes }
+  } else {
+    if timeZone.length != 6 || (timeZone[0] != 43 && timeZone[0] != 45) || timeZone[3] != 58 || timeZone[1] < 48 || timeZone[1] > 57 || timeZone[2] < 48 || timeZone[2] > 57 || timeZone[4] < 48 || timeZone[4] > 57 || timeZone[5] < 48 || timeZone[5] > 57 { run out.emit("timeZoneName",name) return () }
+    negative = timeZone[0] == 45 minutes = support.offsetMinutes(timeZone) if minutes < 0 { minutes = -minutes }
+  }
+  let off = out.bytes.length() run out.bytes.appendSlice(b"GMT")
+  if minutes != 0 {
+    if negative { run out.bytes.append(45) } else { run out.bytes.append(43) }
+    // Suppress nested number parts; zone names always use ASCII digits.
+    let tracking = out.wantParts out.wantParts = false
+    run out.number("",minutes / 60,support.choose(longName,2,0),numbering.NS_LATN)
+    if longName || minutes % 60 != 0 { run out.bytes.append(58) run out.number("",minutes % 60,2,numbering.NS_LATN) }
+    out.wantParts = tracking
+  }
+  run out.record("timeZoneName",off)
+}
+pub effect fn pattern(out:&mut Output, bytes:&[u8], s:&Fields, localeName:string, zoneName:&[u8], locale:&LocaleData, fields:&DateFields) -> () ! OutOfMemoryError ? &mut Allocator {
+  let date = cal.ti_iso_to_calendar_date(s.calendar,fields.year,fields.month + 1,fields.day)
+  let era = cal.ti_calendar_era_and_era_year(s.calendar,fields.year,fields.month + 1,fields.day,date.year)
+  let isLunar = support.lunar(s.calendar) let mut year = era.year let mut month = date.month let mut leap = false
+  if isLunar { year = cal.ti_chinese_related_year(s.calendar,fields.year,fields.month + 1,fields.day) let code = cal.ti_calendar_month_to_month_code(s.calendar,date.year,date.month) month = code.month_code leap = code.has_l != 0 }
+  let mut at:usize = 0
+  while at < bytes.length {
+    if bytes[at] == 39 { at = run quoted(&mut out,bytes,at) }
+    else if alpha(bytes[at]) {
+      let start = at let c = bytes[at] while at < bytes.length && bytes[at] == c { at = at + 1 }
+      let width = usize.toI32(at - start) let numericWidth = support.choose(width == 2,2,0)
+      let mut field = c
+      if c == 75 || c == 72 || c == 107 { field = 104 }
+      if c == 98 || c == 66 { field = 97 }
+      if c == 90 || c == 118 || c == 86 { field = 122 }
+      match field {
+        121 => {
+          let mut yr = year if width == 2 { yr = yr % 100 } run out.number("year",yr,numericWidth,s.numberingSystem)
+          if s.era != 3 && !isLunar { let name = support.eraName(s.calendar,era.era,2 - s.era,locale) if name != "" { run out.literal(" ") run out.emit("era",name) } }
+        }
+        77 => {
+          let special = support.monthName(s.calendar,localeName,date.year,date.month,width)
+          if special != "" { run out.emit("month",special) }
+          else if width <= 2 { run out.number("month",month,numericWidth,s.numberingSystem) if isLunar && leap { run out.leapSuffix() } }
+          else if width == 3 { run out.emit("month",support.text(data.LD_MONTH_SHORT(locale,fields.month))) }
+          else { run out.emit("month",support.text(data.LD_MONTH_LONG(locale,fields.month))) }
+        }
+        100 => { run out.number("day",date.day,numericWidth,s.numberingSystem) }
+        69 => {
+          let mut name = data.LD_WEEKDAY_NARROW(locale,fields.weekday)
+          if width <= 3 { name = data.LD_WEEKDAY_SHORT(locale,fields.weekday) } else if width == 4 { name = data.LD_WEEKDAY_LONG(locale,fields.weekday) }
+          run out.emit("weekday",support.text(name))
+        }
+        71 => {
+          let mut style:i32 = 2 if width <= 3 { style = 1 } else if width == 4 { style = 0 }
+          let name = support.eraName(s.calendar,era.era,style,locale) if name != "" { run out.emit("era",name) }
+        }
+        104 => { run out.number("hour",support.displayHour(fields.hour,s.hourCycle),numericWidth,s.numberingSystem) }
+        109 => { run out.number("minute",fields.minute,numericWidth,s.numberingSystem) }
+        115 => { run out.number("second",fields.second,numericWidth,s.numberingSystem) }
+        97 => {
+          if s.hourCycle == 0 || s.hourCycle == 1 {
+            let mut name = data.LD_AMPM(locale,support.choose(fields.hour < 12,0,1))
+            if c == 66 { name = data.LD_DAYPERIOD(locale,support.dayPeriodIndex(fields.hour)) }
+            run out.emit("dayPeriod",support.text(name))
+          } else { out.suppressSpace() }
+        }
+        122 => { run zone(&mut out,zoneName,fields,width >= 4,true) }
+        _ => { run out.literal(support.text(Slice.view<u8>(bytes,start,at - start))) }
+      }
+    } else { let end = next(bytes,at) run out.literal(support.text(Slice.view<u8>(bytes,at,end - at))) at = end }
+  }
+}
+pub effect fn combined(out:&mut Output, bytes:&[u8], date:&Output, time:&Output) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at:usize = 0
+  while at < bytes.length {
+    if bytes[at] == 39 { at = run quoted(&mut out,bytes,at) }
+    else if bytes.length - at >= 3 && bytes[at] == 123 && (bytes[at + 1] == 48 || bytes[at + 1] == 49) && bytes[at + 2] == 125 {
+      if bytes[at + 1] == 48 { run out.merge(time) } else { run out.merge(date) } at = at + 3
+    } else { let end = next(bytes,at) run out.literal(support.text(Slice.view<u8>(bytes,at,end - at))) at = end }
+  }
+}

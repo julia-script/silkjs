@@ -1,0 +1,281 @@
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.pointer { Pointer }
+import silk.option { Option }
+import silk.result { Result }
+import silk.testing { AssertionError, Testing }
+import silk.usize
+import runtime_memory { RuntimeAllocator }
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_string_types { StringLengthError }
+import js_string_types { StringOwner }
+import js_strings { Strings }
+import js_core_types { RuntimeState, NativeFunctionId, WeakRefHeader, VariableKind, ClosureKind }
+import js_gc { HeapHooks, Tracer }
+import js_gc
+import js_runtime { allocateRuntimeStorage, allocateContextStorage }
+import js_compiler_types { FunctionDef, CompilerError, CompilerErrorKind, VariableDefinition, BlockEnv, MAX_LOCAL_VAR_COUNT }
+import js_compiler_state as state
+import js_compiler_emit as emit
+import js_opcode_data as op
+import js_atom_data as atoms
+import js_debug_positions { SourcePositionCache }
+
+// These fixtures contain no class-owned objects, weak nodes or Auxiliary JS
+// values. Any dispatch is a test failure, not a replacement runtime dispatcher.
+struct NoClassEdges {}
+impl HeapHooks for NoClassEdges {
+  unsafe fn traceClass(self: &mut Self, runtime: *mut HeapHeader, object: *mut HeapHeader, callback: NativeFunctionId, tracer: &mut Tracer) -> () { Intrinsic.trap("QuickJS invariant violated") }
+  unsafe fn finalizeClass(self: &mut Self, runtime: *mut HeapHeader, object: *mut HeapHeader, callback: NativeFunctionId) -> () { Intrinsic.trap("QuickJS invariant violated") }
+  unsafe effect fn sweepWeak(self: &mut Self, runtime: *mut HeapHeader, node: *mut WeakRefHeader) -> () ? &mut Allocator { Intrinsic.trap("QuickJS invariant violated") }
+  unsafe fn destroyAuxiliary(self: &mut Self, runtime: *mut HeapHeader, node: *mut HeapHeader) -> () { Intrinsic.trap("QuickJS invariant violated") }
+}
+effect fn rejected(error: CompilerError) -> i32 {
+  if error.kind == CompilerErrorKind.ParameterRedefinition { return 1 }
+  if error.kind == CompilerErrorKind.LexicalRedefinition { return 2 }
+  if error.kind == CompilerErrorKind.TooManyLocals { return 3 }
+  return 99
+}
+effect fn scenarios() -> () ! OutOfMemoryError | StringLengthError | CompilerError | AssertionError<'static> ? &mut Allocator {
+  let runtime = run allocateRuntimeStorage(0)
+  let context = run unsafe allocateContextStorage(runtime)
+  let root = run unsafe state.newFunction(context, Pointer.null<HeapHeader>(), false, false, 0, 7, Pointer.null<SourcePositionCache>())
+  let mut anchor = ()
+  let fd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, root)
+  let mut runtimeAnchor = ()
+  let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, runtime)
+  let argument = run state.addArg(&mut fd, &mut rt.atoms, atoms.JS_ATOM_name)
+  let scope = run emit.pushScope(&mut fd) fd.bodyScope = scope
+  let parameterConflict = run state.defineVar(&mut fd, &mut rt.atoms, atoms.JS_ATOM_name, VariableDefinition.Let) |> Effect.catch<CompilerError>(rejected)
+  run Testing.expect(parameterConflict == 1 && fd.vars.length() == 0, "lexical parameter collision leaves no declaration")
+  let first = run state.defineVar(&mut fd, &mut rt.atoms, atoms.JS_ATOM_length, VariableDefinition.FunctionDeclaration)
+  let second = run state.defineVar(&mut fd, &mut rt.atoms, atoms.JS_ATOM_length, VariableDefinition.FunctionDeclaration)
+  run Testing.expect(first == 0 && second == 1, "sloppy Annex B function declarations allocate separate scoped records")
+  fd.jsMode = 1
+  let strictConflict = run state.defineVar(&mut fd, &mut rt.atoms, atoms.JS_ATOM_length, VariableDefinition.FunctionDeclaration) |> Effect.catch<CompilerError>(rejected)
+  run Testing.expect(strictConflict == 2 && fd.vars.length() == 2, "strict function redefinition rejected before mutation")
+  state.captureVar(&mut fd, 0, false) state.captureVar(&mut fd, 0, false) state.captureVar(&mut fd, argument, true)
+  run Testing.expect(fd.varRefCount == 2 && fd.args.get(0).varRefIndex == 1, "capture indices allocated exactly once across args and locals")
+  let mut n: usize = 0
+  while n < 20 { let nested = run emit.pushScope(&mut fd) n = n + 1 }
+  run Testing.expect(state.findLexicalDeclaration(&fd.*, atoms.JS_ATOM_length, fd.scopeFirst, true) == second, "scope chains survive inline-to-heap growth")
+  n = 0 while n < 20 { run emit.popScope(&mut fd) n = n + 1 }
+  run Testing.expect(fd.scopeLevel == scope, "popping returns to original body scope")
+  let mut block = BlockEnv.make() block.labelName = atoms.JS_ATOM_name
+  let blockIndex = run state.pushBlock(&mut fd, &mut rt.atoms, block)
+  n = 0 while n < 30 { let nested = run state.pushBlock(&mut fd, &mut rt.atoms, BlockEnv.make()) n = n + 1 }
+  n = 0 while n < 30 { state.popBlock(&mut fd, &mut rt.atoms) n = n + 1 }
+  run Testing.expect(fd.topBreak == blockIndex && fd.blocks.get(0).labelName == atoms.JS_ATOM_name, "block indices survive growing backing storage")
+  state.popBlock(&mut fd, &mut rt.atoms)
+  drop rt drop fd
+  let child = run unsafe state.newFunction(context, root, false, false, 0, 9, Pointer.null<SourcePositionCache>())
+  let grandchild = run unsafe state.newFunction(context, child, false, false, 0, 11, Pointer.null<SourcePositionCache>())
+  let closure = run unsafe state.getClosureVar(grandchild, root, ClosureKind.Local, first, atoms.JS_ATOM_length, false, true, VariableKind.FunctionDeclaration)
+  let duplicate = run unsafe state.getClosureVar(grandchild, root, ClosureKind.Local, first, atoms.JS_ATOM_length, false, true, VariableKind.FunctionDeclaration)
+  run Testing.expect(closure == 0 && duplicate == 0, "transitive closure reuse")
+  let grand = unsafe HeapCell.payload<FunctionDef, ()>(&anchor, grandchild)
+  run Testing.expect(grand.closureVars.get(0).kind == ClosureKind.Reference, "grandchild captures parent reference rather than grandparent local")
+  drop grand
+  let string = run Strings.fromLatin1(b"compiler-owned-value")
+  let mut hooks = NoClassEdges {}
+  let childFd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, child)
+  let owned = unsafe string.retained()
+  let constant = run unsafe emit.addConstant(&mut hooks, &mut childFd, owned)
+  run Testing.expect(constant == 0, "constant index")
+  drop childFd
+  unsafe state.destroyFunction(&mut hooks, child)
+  let rootView = unsafe HeapCell.payload<FunctionDef, ()>(&anchor, root)
+  run Testing.expect(Pointer.isNull<HeapHeader>(rootView.firstChild) && Pointer.isNull<HeapHeader>(rootView.lastChild), "child teardown removes nested subtree and both parent endpoints")
+  drop rootView
+  match string {
+    Value.String { reference } => {
+      let h = unsafe Pointer.borrow<(), HeapHeader>(&anchor, reference)
+      run Testing.expect(h.referenceCount == 1, "subtree destruction releases owned constant through GC exactly once")
+    }
+    _ => { run Testing.expect(false, "flat fixture") }
+  }
+  Strings.release(string)
+  unsafe state.destroyFunction(&mut hooks, root)
+  unsafe js_gc.releaseHeader(&mut hooks, runtime, context)
+  run unsafe js_gc.destroyRuntime(&mut hooks, runtime)
+}
+test effect fn compilerScopeConflictsStableTreesAndValueOwnership() -> () ! OutOfMemoryError | StringLengthError | CompilerError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run scenarios() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+effect fn emission() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let runtime = run allocateRuntimeStorage(0)
+  let context = run unsafe allocateContextStorage(runtime)
+  let root = run unsafe state.newFunction(context, Pointer.null<HeapHeader>(), false, false, 0, 7, Pointer.null<SourcePositionCache>())
+  let mut anchor = ()
+  let fd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, root)
+  run emit.emitSourcePosition(&mut fd, 7)
+  run emit.emitOp(&mut fd, op.OP_return_undef)
+  let dead = run emit.emitGoto(&mut fd, op.OP_goto, -1)
+  run Testing.expect(dead == -1 && fd.labels.length() == 0 && fd.bytecode.length() == 1, "dead goto neither allocates label nor emits")
+  let label = run emit.newLabel(&mut fd)
+  run emit.emitLabelRaw(&mut fd, label)
+  run Testing.expect(!emit.isLiveCode(&fd.*), "raw label does not revive dead code")
+  let at = run emit.emitLabel(&mut fd, label)
+  run Testing.expect(emit.isLiveCode(&fd.*) && at == 7 && fd.labels.get(0).position == 11, "ordinary label revives code and stores post-instruction offset")
+  let target = run emit.emitGoto(&mut fd, op.OP_if_false, label)
+  let remaining = emit.updateLabel(&mut fd, label, -1)
+  run Testing.expect(target == label && remaining == 0, "branch reference count update")
+  run emit.emitSourcePosition(&mut fd, 9)
+  run emit.emitSourcePosition(&mut fd, 9)
+  run Testing.expect(fd.bytecode.length() == 21 && emit.previousOpcode(&fd.*) == op.OP_if_false, "source-position changes emit once without changing last real opcode")
+  let expected = [op.OP_return_undef, op.OP_label, 0, 0, 0, 0, op.OP_label, 0, 0, 0, 0, op.OP_if_false, 0, 0, 0, 0, op.OP_line_num, 9, 0, 0, 0]
+  let mut i: usize = 0 while i < expected.length { run Testing.expect(fd.bytecode.get(i) == expected[i], "independently laid out opcode operands") i = i + 1 }
+  drop fd
+  let mut hooks = NoClassEdges {}
+  unsafe state.destroyFunction(&mut hooks, root)
+  unsafe js_gc.releaseHeader(&mut hooks, runtime, context)
+  run unsafe js_gc.destroyRuntime(&mut hooks, runtime)
+}
+test effect fn compilerLabelsDeadCodeAndSourceOffsets() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run emission() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn allocationFailed(error: OutOfMemoryError) -> i32 { drop error return -1 }
+test effect fn compilerAllocationFailuresConsumeValuesAndPreserveBoundaries() -> ()
+  ! OutOfMemoryError | StringLengthError | CompilerError | AssertionError<'static> {
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let runtime = run allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let context = run unsafe allocateContextStorage(runtime) |> Effect.provideMut<Allocator>(&mut allocator)
+  let root = run unsafe state.newFunction(context, Pointer.null<HeapHeader>(), false, false, 0, 0, Pointer.null<SourcePositionCache>()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let string = run Strings.fromLatin1(b"retained-on-failure") |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut hooks = NoClassEdges {}
+  let mut anchor = ()
+  let fd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, root)
+  let usedBytes = allocator.stats().usedBytes
+  allocator.setLimit(usedBytes)
+  let owned = unsafe string.retained()
+  let failed = run unsafe emit.addConstant(&mut hooks, &mut fd, owned)
+    |> Effect.catch<OutOfMemoryError>(allocationFailed) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(failed == -1 && fd.constants.length() == 0, "failed constant growth consumes value without publishing slot")
+  match string {
+    Value.String { reference } => {
+      let countAnchor = ()
+      let h = unsafe Pointer.borrow<(), HeapHeader>(&countAnchor, reference)
+      run Testing.expect(h.referenceCount == 1, "failed constant insertion releases its incoming ownership")
+    }
+    _ => { run Testing.expect(false, "flat string fixture") }
+  }
+  run emit.emitOp(&mut fd, op.OP_return_undef) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(fd.bytecodeError && fd.bytecode.length() == 0 && emit.previousOpcode(&fd.*) == op.OP_invalid, "emission failure latches error without invalid opcode read")
+  let label = run emit.newLabel(&mut fd) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(label == -1 && fd.labels.length() == 0, "label growth failure publishes no label")
+  let first = run emit.pushScope(&mut fd) |> Effect.provideMut<Allocator>(&mut allocator)
+  let second = run emit.pushScope(&mut fd) |> Effect.provideMut<Allocator>(&mut allocator)
+  let third = run emit.pushScope(&mut fd) |> Effect.provideMut<Allocator>(&mut allocator)
+  let noScope = run emit.pushScope(&mut fd) |> Effect.catch<OutOfMemoryError>(allocationFailed) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(first == 1 && second == 2 && third == 3 && noScope == -1 && fd.scopes.length() == 4 && fd.scopeLevel == 3, "inline scopes allocate nothing and failed migration preserves active scope")
+  allocator.setLimit(usize.MAX)
+  // A sticky emitter cannot grow even after allocation becomes available.
+  run emit.emitOp(&mut fd, op.OP_nop) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(fd.bytecode.length() == 0, "latched failure prevents later partial bytecode")
+  run fd.bytecode.reserveExact(4) |> Effect.provideMut<Allocator>(&mut allocator)
+  run emit.emitU16(&mut fd, 0x0101) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(fd.bytecode.length() == 2 && fd.bytecodeError, "writes fitting old capacity remain permitted after error")
+  fd.bytecode.clear()
+  let mut runtimeAnchor = ()
+  let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, runtime)
+  run fd.vars.reserveExact(MAX_LOCAL_VAR_COUNT) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut i: usize = 0
+  while i < MAX_LOCAL_VAR_COUNT {
+    let index = run state.addVar(&mut fd, &mut rt.atoms, 0) |> Effect.provideMut<Allocator>(&mut allocator)
+    i = i + 1
+  }
+  let tooMany = run state.addVar(&mut fd, &mut rt.atoms, 0)
+    |> Effect.catch<CompilerError>(rejected) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(tooMany == 3 && fd.vars.length() == MAX_LOCAL_VAR_COUNT, "65534 local boundary rejects before increment")
+  drop rt drop fd
+  Strings.release(string)
+  unsafe state.destroyFunction(&mut hooks, root)
+  unsafe js_gc.releaseHeader(&mut hooks, runtime, context)
+  run unsafe js_gc.destroyRuntime(&mut hooks, runtime) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(allocator.stats().usedBytes == 0, "failed emission and full variable table teardown reclaim native allocations")
+}
+
+test effect fn compilerDiagnosticOwnsNameAfterTreeAndRuntimeTeardown() -> ()
+  ! OutOfMemoryError | StringLengthError | CompilerError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let runtime = run allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let context = run unsafe allocateContextStorage(runtime) |> Effect.provideMut<Allocator>(&mut allocator)
+  let root = run unsafe state.newFunction(context, Pointer.null<HeapHeader>(), false, false, 0, 0, Pointer.null<SourcePositionCache>()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut anchor = ()
+  let fd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, root)
+  let mut runtimeAnchor = ()
+  let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, runtime)
+  let name = run rt.atoms.internUtf8(b"unwound-name") |> Effect.provideMut<Allocator>(&mut allocator)
+  // Force a source error without manufacturing an invalid variable table.
+  let scope = run emit.pushScope(&mut fd) |> Effect.provideMut<Allocator>(&mut allocator)
+  fd.bodyScope = scope
+  let argument = run state.addArg(&mut fd, &mut rt.atoms, name) |> Effect.provideMut<Allocator>(&mut allocator)
+  let result = run Effect.result(state.defineVar(&mut fd, &mut rt.atoms, name, VariableDefinition.Let)) |> Effect.provideMut<Allocator>(&mut allocator)
+  rt.atoms.release(name)
+  drop rt drop fd
+  let mut hooks = NoClassEdges {}
+  unsafe state.destroyFunction(&mut hooks, root)
+  unsafe js_gc.releaseHeader(&mut hooks, runtime, context)
+  run unsafe js_gc.destroyRuntime(&mut hooks, runtime) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(argument == 0, "diagnostic fixture argument accepted")
+  match move result {
+    Result<i32, OutOfMemoryError | StringLengthError | CompilerError>.Success { value } => {
+      run Testing.expect(false, "lexical declaration must reject argument name")
+    }
+    Result<i32, OutOfMemoryError | StringLengthError | CompilerError>.Failure { error } => {
+      match move error {
+        OutOfMemoryError e => { fail move e }
+        StringLengthError e => { fail move e }
+        CompilerError diagnostic => {
+          run Testing.expect(diagnostic.kind == CompilerErrorKind.ParameterRedefinition, "original diagnostic category survives unwind")
+          match &diagnostic.name {
+            Option<StringOwner>.Some { value } => {
+              let text = value.get()
+              run Testing.expect(Strings.length(text) == 12 && Strings.codeUnit(text, 0) == 117 && Strings.codeUnit(text, 11) == 101, "retained diagnostic name survives atom table and tree destruction")
+            }
+            Option<StringOwner>.None => { run Testing.expect(false, "named diagnostic retains independent owner") }
+          }
+        }
+      }
+    }
+  }
+}
+
+test effect fn compilerAtomOperandsUseTemporaryAndFinalMetadataAndClaimOwnership() -> ()
+  ! OutOfMemoryError | StringLengthError | AssertionError<'static> {
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let runtime = run allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let context = run unsafe allocateContextStorage(runtime) |> Effect.provideMut<Allocator>(&mut allocator)
+  let root = run unsafe state.newFunction(context, Pointer.null<HeapHeader>(), false, false, 0, 0, Pointer.null<SourcePositionCache>()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let child = run unsafe state.newFunction(context, root, false, false, 0, 0, Pointer.null<SourcePositionCache>()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut anchor = ()
+  let mut runtimeAnchor = ()
+  let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, runtime)
+  let baseline = rt.atoms.count()
+  let atom = run rt.atoms.internUtf8(b"bytecode-owned-atom") |> Effect.provideMut<Allocator>(&mut allocator)
+  let fd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, root)
+  run emit.emitOp(&mut fd, op.OP_scope_get_var) |> Effect.provideMut<Allocator>(&mut allocator)
+  run emit.emitAtom(&mut fd, &mut rt.atoms, atom) |> Effect.provideMut<Allocator>(&mut allocator)
+  run emit.emitU16(&mut fd, 0) |> Effect.provideMut<Allocator>(&mut allocator)
+  drop fd
+  let childFd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, child)
+  childFd.useShortOpcodes = true
+  run emit.emitOp(&mut childFd, op.OP_push_atom_value) |> Effect.provideMut<Allocator>(&mut allocator)
+  run emit.emitAtom(&mut childFd, &mut rt.atoms, atom) |> Effect.provideMut<Allocator>(&mut allocator)
+  drop childFd
+  rt.atoms.release(atom)
+  run Testing.expect(rt.atoms.count() == baseline + 1, "bytecode operands retain name after caller releases it")
+  drop rt
+  let mut hooks = NoClassEdges {}
+  unsafe state.destroyFunction(&mut hooks, root)
+  let after = unsafe HeapCell.payload<RuntimeState, ()>(&runtimeAnchor, runtime)
+  run Testing.expect(after.atoms.count() == baseline, "temporary and final metadata each release exactly their atom operands")
+  drop after
+  unsafe js_gc.releaseHeader(&mut hooks, runtime, context)
+  run unsafe js_gc.destroyRuntime(&mut hooks, runtime) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(allocator.stats().usedBytes == 0, "atom operand owners leave no registry allocation")
+}

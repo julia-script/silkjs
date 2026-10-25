@@ -1,0 +1,171 @@
+//! Persistent startup failures must terminate the module Promise or throw an
+//! owned exception. Every sample uses a fresh module and drains its real jobs.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.usize
+import silk.testing { Testing, AssertionError }
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types { ModuleDef, ModuleStatus }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_coercion_host { CoercionHooks }
+import js_property_host { OwnPropertyHooks, GetPropertyHooks, HasPropertyHooks, OwnKeysHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_prototype_host { PrototypeHooks }
+import js_interrupt_host { InterruptHooks }
+import js_native_function_host { NativeFunctionHooks }
+import js_call_host { CallHooks }
+import js_error_host { ErrorHooks }
+import js_eval_host { EvalHooks }
+import js_module_host { ModuleHostHooks }
+import js_parser_host { ModuleAttributeHooks }
+import js_promise { PromiseHooks }
+import js_promise as promises
+import js_runtime_jobs as jobs
+import js_runtime_jobs { JobDispatcher, JobResult }
+import js_core_types { RuntimeState }
+import silk.pointer { Pointer }
+import js_eval_execution_consumer { integer }
+import js_exceptions { JsException }
+import js_exceptions as exceptions
+import js_string_types { StringLengthError }
+import js_eval as evaluation
+import js_eval_compile as flags
+import js_eval_errors as errors
+import js_module_linker as linker
+import js_module_execution as modules
+import js_errors_test_support { FaultAllocator }
+import runtime_memory { AllocationObserver }
+
+fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+pub unsafe effect fn startupAtBudget<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks + PromiseHooks + ModuleHostHooks + ModuleAttributeHooks + JobDispatcher>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, allocator: &mut FaultAllocator, budget: usize) -> bool
+  ! OutOfMemoryError | StringLengthError | JsException | AssertionError<'static> {
+  allocator.remaining = usize.MAX
+  let rt = unsafe runtime.contextRuntime(context)
+  run Testing.expect(!unsafe jobs.isJobPending(rt), "module startup fault sample requires a fresh empty queue")
+  let compiled = run unsafe evaluation.evaluate(&mut hooks, memory, context, b"await 0;", b"eval-start-fault.mjs",
+    flags.TYPE_MODULE | flags.FLAG_COMPILE_ONLY) |> Effect.provideMut<Allocator>(&mut allocator)
+  let module = match compiled { Value.Module { reference } => reference _ => invariant() }
+  let created = run Effect.result(unsafe linker.createFunctions(&mut hooks, memory, context, module))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  match move created {
+    Result<(), OutOfMemoryError | JsException>.Success { .. } => ()
+    Result<(), OutOfMemoryError | JsException>.Failure { error } => { unsafe gc.release(&mut hooks, rt, compiled) fail move error }
+  }
+  let linked = run Effect.result(unsafe linker.link(&mut hooks, memory, context, module))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  match move linked {
+    Result<(), OutOfMemoryError | StringLengthError | JsException>.Success { .. } => ()
+    Result<(), OutOfMemoryError | StringLengthError | JsException>.Failure { error } => { unsafe gc.release(&mut hooks, rt, compiled) fail move error }
+  }
+  allocator.remaining = budget
+  allocator.armed = true
+  allocator.persistent = true
+  let evaluated = run Effect.result(unsafe modules.evaluate(&mut hooks, memory, context, module))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  allocator.remaining = usize.MAX
+  allocator.armed = false
+  allocator.persistent = false
+  let pending = unsafe exceptions.has(rt)
+  if pending { let error = unsafe exceptions.take(rt) unsafe gc.release(&mut hooks, rt, error) }
+  let mut jobsOk = true let mut count: usize = 0
+  while unsafe jobs.isJobPending(rt) && count < 1000 {
+    let dispatched = run Effect.result(unsafe jobs.executePendingJob(&mut hooks, rt))
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    match move dispatched {
+      Result<JobResult, OutOfMemoryError>.Success { value } => { if value.status != 1 { jobsOk = false } }
+      Result<JobResult, OutOfMemoryError>.Failure { .. } => { jobsOk = false }
+    }
+    if unsafe exceptions.has(rt) { let error = unsafe exceptions.take(rt) unsafe gc.release(&mut hooks, rt, error) jobsOk = false }
+    count = count + 1
+  }
+  let mut correct = jobsOk && !unsafe jobs.isJobPending(rt)
+  match move evaluated {
+    Result<Value, JsException>.Success { value } => {
+      let anchor = () let data = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, module)
+      correct = correct && !pending && data.status == ModuleStatus.Evaluated && !data.asyncEvaluation
+      drop data
+      correct = correct && unsafe promises.state(value) != promises.PENDING
+      unsafe gc.release(&mut hooks, rt, value)
+    }
+    Result<Value, JsException>.Failure { .. } => { correct = correct && pending }
+  }
+  unsafe gc.release(&mut hooks, rt, compiled)
+  return correct
+}
+// Single-shot native safety contracts cover execution-time direct eval,
+// filesystem module/TLA, and import jobs.
+pub unsafe effect fn recoverAtBudget<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks + PromiseHooks + ModuleHostHooks + ModuleAttributeHooks + JobDispatcher>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, allocator: &mut FaultAllocator, budget: usize, mode: usize) -> bool
+  ! OutOfMemoryError | JsException | AssertionError<'static> {
+  let rt = unsafe runtime.contextRuntime(context) let anchor = ()
+  let beforeState = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let before = beforeState.currentStackFrame drop beforeState
+  let mut source = b"(function(a){let x=2;return eval('()=>a+x')})(40)()"
+  let mut name = b"eval/fault.js"
+  let mut compileFlags: i32 = flags.FLAG_COMPILE_ONLY
+  if mode == 1 {
+    source = b"import {answer} from './namespace.mjs';await 0;if(answer!==42)throw 17;"
+    name = b"eval/fault.mjs" compileFlags = compileFlags | flags.TYPE_MODULE
+  } else if mode == 2 {
+    source = b"import('./namespace.mjs').then(ns=>ns.answer)"
+  }
+  let mut compiled = Value.Undefined
+  if mode != 1 {
+    compiled = run unsafe evaluation.evaluate(&mut hooks, memory, context, source, name, compileFlags)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+  }
+  allocator.remaining = budget allocator.armed = true
+  let evaluated = run Effect.result(unsafe executeFault(&mut hooks, memory, context, compiled, source, name, mode))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut value = Value.Undefined let mut threw = false
+  match move evaluated {
+    Result<Value, JsException>.Success { value: result } => { value = result }
+    Result<Value, JsException>.Failure { .. } => { threw = true }
+  }
+  let pending = unsafe exceptions.has(rt)
+  if pending { let error = unsafe exceptions.take(rt) unsafe gc.release(&mut hooks, rt, error) }
+  let mut jobsOk = true let mut count: usize = 0
+  while unsafe jobs.isJobPending(rt) && count < 1000 {
+    let dispatched = run Effect.result(unsafe jobs.executePendingJob(&mut hooks, rt))
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    match move dispatched {
+      Result<JobResult, OutOfMemoryError>.Success { value: job } => { if job.status != 1 { jobsOk = false } }
+      Result<JobResult, OutOfMemoryError>.Failure { .. } => { jobsOk = false }
+    }
+    if unsafe exceptions.has(rt) { let error = unsafe exceptions.take(rt) unsafe gc.release(&mut hooks, rt, error) }
+    count = count + 1
+  }
+  allocator.armed = false allocator.remaining = usize.MAX
+  let state = unsafe promises.state(value)
+  let mut clean = !threw && !pending && jobsOk
+  let stranded = !threw && mode != 0 && state == promises.PENDING
+  if !threw && mode == 0 { clean = clean && value.isNumber() && value.numericValue() == 42.0 }
+  if !threw && mode != 0 {
+    clean = clean && state == promises.FULFILLED
+    let result = unsafe promises.result(value)
+    if mode == 2 { clean = clean && result.isNumber() && result.numericValue() == 42.0 }
+    unsafe gc.release(&mut hooks, rt, result)
+  }
+  unsafe gc.release(&mut hooks, rt, value)
+  run Testing.expect(!stranded, "allocation failure must not strand a pending import/module Promise with no queued work")
+  run Testing.expect(!unsafe jobs.isJobPending(rt), "fault job queue must terminate")
+  run Testing.expect(!threw || pending, "execution failure must publish its JS exception")
+  run Testing.expect(threw || !pending, "successful execution must not retain a pending OOM")
+  let afterState = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let after = afterState.currentStackFrame drop afterState
+  run Testing.expect(Pointer.address(before) == Pointer.address(after), "fault execution must restore currentStackFrame")
+  run unsafe integer(&mut hooks, memory, context, b"(function(x){return eval('x+1')})(41)", 42)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  return clean
+}
+unsafe effect fn executeFault<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks + PromiseHooks + ModuleHostHooks + ModuleAttributeHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, compiled: Value, source: &[u8], name: &[u8], mode: usize) -> Value
+  ! JsException ? &mut Allocator {
+  if mode == 1 { return run unsafe evaluation.evaluate(&mut hooks, memory, context, source, name, flags.TYPE_MODULE) }
+  return run unsafe evaluation.evaluateFunction(&mut hooks, memory, context, compiled)
+}

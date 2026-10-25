@@ -1,0 +1,283 @@
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.result { Result }
+import silk.testing { Testing, AssertionError }
+import silk.usize
+import runtime_memory { RuntimeAllocator }
+import js_value { Value }
+import js_core_types { NativeErrorKind, StackFrame }
+import js_string_types { StringLengthError, StringOwner }
+import js_strings { Strings }
+import js_gc as gc
+import js_runtime as runtime
+import js_atom_data as atoms
+import js_errors as errors
+import js_exceptions { JsException }
+import js_exceptions as exceptions
+import js_backtrace as trace
+import js_backtrace_test_support as frames
+import js_errors_test_support as fixture
+import js_errors_test_support { Hooks, FaultAllocator }
+
+test effect fn nativeErrorPrototypeMessageDescriptorsAndByteTruncation() -> ()
+  ! OutOfMemoryError | StringLengthError | JsException | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe runtime.allocateContextStorage(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make(&observer)
+  run unsafe fixture.prepare(&mut hooks, &observer, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+  let empty = run unsafe errors.newError(&mut hooks, &observer, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+  let emptyMessage = unsafe fixture.property(empty, atoms.JS_ATOM_message)
+  let emptyStack = unsafe fixture.property(empty, atoms.JS_ATOM_stack)
+  run Testing.expect(unsafe fixture.prototypeIndex(ctx, empty) == 9
+    && !emptyMessage.present && !emptyStack.present,
+    "JS_NewError only allocates its class and base prototype")
+  unsafe gc.release(&mut hooks, rt, empty)
+  let mut i: usize = 0
+  while i < 9 {
+    let error = run unsafe fixture.capture(&mut hooks, &observer, ctx, fixture.kind(i), b"abc\0ignored", 1) |> Effect.provideMut<Allocator>(&mut memory)
+    let message = unsafe fixture.property(error, atoms.JS_ATOM_message)
+    let name = unsafe fixture.property(error, atoms.JS_ATOM_name)
+    let stack = unsafe fixture.property(error, atoms.JS_ATOM_stack)
+    run Testing.expect(unsafe fixture.prototypeIndex(ctx, error) == usize.toU32(i)
+      && message.present && message.flags == 3 && Strings.length(message.value) == 3
+      && !name.present && !stack.present,
+      "each native kind selects its own prototype with a writable configurable nonenumerable message")
+    unsafe gc.release(&mut hooks, rt, error)
+    i = i + 1
+  }
+  let mut messageBytes: [u8; 260] = [97; 260]
+  let ascii = run unsafe fixture.capture(&mut hooks, &observer, ctx, NativeErrorKind.Type, &messageBytes, 1) |> Effect.provideMut<Allocator>(&mut memory)
+  let asciiMessage = unsafe fixture.property(ascii, atoms.JS_ATOM_message)
+  run Testing.expect(Strings.length(asciiMessage.value) == 255,
+    "the formatted message limit counts bytes, excluding the terminator")
+  unsafe gc.release(&mut hooks, rt, ascii)
+  messageBytes[253] = 0xe2 messageBytes[254] = 0x82 messageBytes[255] = 0xac
+  let split = run unsafe fixture.capture(&mut hooks, &observer, ctx, NativeErrorKind.Type, &messageBytes, 1) |> Effect.provideMut<Allocator>(&mut memory)
+  let splitMessage = unsafe fixture.property(split, atoms.JS_ATOM_message)
+  let decoded = splitMessage.value
+  run Testing.expect(Strings.length(decoded) == 254 && Strings.codeUnit(decoded, 253) == 0xfffd,
+    "truncation happens before decoding and an incomplete UTF8 suffix becomes replacement character")
+  unsafe gc.release(&mut hooks, rt, split)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx) run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observer.stats().allocationCount == 0 && observer.stats().usedBytes == 0,
+    "context prototypes, messages and every thrown error are reclaimed")
+}
+
+test effect fn nativeErrorReplacementFinalizesOldPendingBeforeResettingCatchability() -> ()
+  ! OutOfMemoryError | StringLengthError | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe runtime.allocateContextStorage(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make(&observer)
+  run unsafe fixture.prepare(&mut hooks, &observer, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+  let old = run unsafe fixture.watched(&mut hooks, &observer, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+  run unsafe fixture.putPending(&mut hooks, rt, old) |> Effect.provideMut<Allocator>(&mut memory)
+  unsafe exceptions.setUncatchable(rt, true)
+  let replacement = run unsafe fixture.capture(&mut hooks, &observer, ctx, NativeErrorKind.Range, b"replacement", 0) |> Effect.provideMut<Allocator>(&mut memory)
+  let stack = unsafe fixture.property(replacement, atoms.JS_ATOM_stack)
+  run Testing.expect(hooks.finalized == 1 && hooks.sawOldPending && hooks.sawUncatchable,
+    "the old owner finalizes while it is still the pending exception, before catchability resets")
+  run Testing.expect(!unsafe fixture.uncatchable(rt) && !unsafe exceptions.has(rt)
+    && stack.present && stack.flags == 3 && stack.value.isString() && Strings.length(stack.value) == 0,
+    "capture transfers the new owner and immediate no-frame attachment creates an empty stack string")
+  unsafe gc.release(&mut hooks, rt, replacement)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx) run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observer.stats().allocationCount == 0 && observer.stats().usedBytes == 0,
+    "pending replacement never leaves an extra object owner")
+}
+
+test effect fn nativeErrorOomRecursionPreservesPendingAndSuppressesBacktrace() -> ()
+  ! OutOfMemoryError | StringLengthError | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe runtime.allocateContextStorage(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make(&observer)
+  run unsafe fixture.prepare(&mut hooks, &observer, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+  run unsafe fixture.putPending(&mut hooks, rt, Value.Int { value: 71 }) |> Effect.provideMut<Allocator>(&mut memory)
+  unsafe exceptions.setUncatchable(rt, true) unsafe fixture.setOom(rt, true)
+  let nested = run unsafe fixture.captureOom(&mut hooks, &observer, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(match nested { Value.Int { value } => value == 71 _ => false },
+    "recursive OOM reports only the exception marker and leaves the pending value unchanged")
+  run Testing.expect(unsafe fixture.inOom(rt) && unsafe fixture.uncatchable(rt),
+    "the nested call does not reset its caller's recursion or catchability state")
+  unsafe fixture.setOom(rt, false)
+  let ordinary = run unsafe fixture.captureOom(&mut hooks, &observer, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+  let ordinaryStack = unsafe fixture.property(ordinary, atoms.JS_ATOM_stack)
+  run Testing.expect(unsafe fixture.prototypeIndex(ctx, ordinary) == 6
+    && !ordinaryStack.present && !unsafe fixture.inOom(rt),
+    "first OOM installs an InternalError without backtrace and restores the guard")
+  unsafe gc.release(&mut hooks, rt, ordinary)
+  let mut fault = FaultAllocator { parent: move memory, armed: true, remaining: 0, persistent: true, failures: 0 }
+  let exhausted = run unsafe fixture.capture(&mut hooks, &observer, ctx, NativeErrorKind.Type, b"failed allocation", 0) |> Effect.provideMut<Allocator>(&mut fault)
+  run Testing.expect(match exhausted { Value.Null => true _ => false },
+    "failed error-object allocation resolves to a real pending null rather than infinite recursion")
+  run Testing.expect(!unsafe fixture.inOom(rt) && !unsafe exceptions.has(rt) && fault.failures > 0,
+    "the outer OOM owner clears the guard even when every subsequent allocation fails")
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx) run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut fault)
+  run Testing.expect(observer.stats().allocationCount == 0 && observer.stats().usedBytes == 0,
+    "permanent exhaustion unwinds every partial native error owner")
+}
+
+test effect fn nativeBacktraceAttachmentOrdersCoordinatesAndConsumesCallbackFailures() -> ()
+  ! OutOfMemoryError | StringLengthError | JsException | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe runtime.allocateContextStorage(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks.make(&observer)
+  run unsafe fixture.prepare(&mut hooks, &observer, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+  let function = run unsafe frames.native(&mut hooks, &observer, ctx, Value.Null) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut frame = run frames.frame(function) |> Effect.provideMut<Allocator>(&mut memory)
+  unsafe frames.publish(rt, Pointer.fromMutRef<StackFrame>(&mut frame))
+  let filename = StringOwner.adopt(run Strings.fromLatin1(b"parse.js\0ignored") |> Effect.provideMut<Allocator>(&mut memory))
+  let mut failure: usize = 1
+  while failure <= 4 {
+    let object = run unsafe errors.newError(&mut hooks, &observer, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+    hooks.definitions = 0 hooks.throwOn = failure hooks.collect = true
+    run unsafe errors.buildBacktrace(&mut hooks, &observer, ctx, object, Option<Value>.some(filename.get()), 13, 7, 0) |> Effect.provideMut<Allocator>(&mut memory)
+    let pending = unsafe exceptions.take(rt)
+    run Testing.expect(match pending { Value.Int { value } => value == 37 _ => false },
+      "a thrown definition callback leaves its actual exception pending")
+    let fileName = unsafe fixture.property(object, atoms.JS_ATOM_fileName)
+    let lineNumber = unsafe fixture.property(object, atoms.JS_ATOM_lineNumber)
+    let columnNumber = unsafe fixture.property(object, atoms.JS_ATOM_columnNumber)
+    let stack = unsafe fixture.property(object, atoms.JS_ATOM_stack)
+    run Testing.expect(hooks.definitions == failure
+      && fileName.present == (failure > 1) && lineNumber.present == (failure > 2)
+      && columnNumber.present == (failure > 3) && !stack.present,
+      "definitions are ordered and only completed coordinates remain after a callback failure")
+    unsafe gc.release(&mut hooks, rt, object)
+    failure = failure + 1
+  }
+  hooks.throwOn = 0 hooks.definitions = 0
+  let sealed = run unsafe errors.newError(&mut hooks, &observer, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+  unsafe fixture.preventExtensions(sealed)
+  run unsafe errors.buildBacktrace(&mut hooks, &observer, ctx, sealed, Option<Value>.some(filename.get()), -1, 7, 1) |> Effect.provideMut<Allocator>(&mut memory)
+  let sealedFileName = unsafe fixture.property(sealed, atoms.JS_ATOM_fileName)
+  run Testing.expect(hooks.definitions == 4 && !unsafe exceptions.has(rt)
+    && !sealedFileName.present,
+    "nonthrowing descriptor rejection does not short-circuit subsequent definitions")
+  unsafe gc.release(&mut hooks, rt, sealed)
+  drop filename
+  unsafe frames.publish(rt, Pointer.null<StackFrame>())
+  unsafe gc.release(&mut hooks, rt, function)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx) run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observer.stats().allocationCount == 0 && observer.stats().usedBytes == 0,
+    "all callback-rejected filename and stack owners are consumed, even across collection")
+}
+
+test effect fn nativeErrorEveryAllocationFailureCleansTemporaryOwners() -> ()
+  ! OutOfMemoryError | StringLengthError | AssertionError<'static> {
+  let mut mode: usize = 0
+  while mode < 2 {
+    let mut cut: usize = 0
+    while cut < 48 {
+      let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+      let observer = run memory.observe()
+      let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+      let ctx = run unsafe runtime.allocateContextStorage(rt) |> Effect.provideMut<Allocator>(&mut memory)
+      let mut hooks = Hooks.make(&observer)
+      run unsafe fixture.prepare(&mut hooks, &observer, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+      let old = run unsafe fixture.watched(&mut hooks, &observer, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+      run unsafe fixture.putPending(&mut hooks, rt, old) |> Effect.provideMut<Allocator>(&mut memory)
+      let function = run unsafe frames.native(&mut hooks, &observer, ctx, Value.Null) |> Effect.provideMut<Allocator>(&mut memory)
+      let mut frame = run frames.frame(function) |> Effect.provideMut<Allocator>(&mut memory)
+      unsafe frames.publish(rt, Pointer.fromMutRef<StackFrame>(&mut frame))
+      let mut fault = FaultAllocator { parent: move memory, armed: true, remaining: cut, persistent: mode == 1, failures: 0 }
+      let value = run unsafe fixture.capture(&mut hooks, &observer, ctx, NativeErrorKind.Type, b"message", 2) |> Effect.provideMut<Allocator>(&mut fault)
+      run Testing.expect(hooks.finalized == 1 && !unsafe fixture.inOom(rt) && !unsafe exceptions.has(rt),
+        "every injected failure replaces the old pending owner exactly once and unwinds the recursion guard")
+      unsafe gc.release(&mut hooks, rt, value)
+      unsafe frames.publish(rt, Pointer.null<StackFrame>())
+      unsafe gc.release(&mut hooks, rt, function)
+      unsafe gc.releaseHeader(&mut hooks, rt, ctx) run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut fault)
+      run Testing.expect(observer.stats().allocationCount == 0 && observer.stats().usedBytes == 0,
+        "every one-shot and persistent allocation cut has a zero post-teardown ledger")
+      cut = cut + 1
+    }
+    mode = mode + 1
+  }
+}
+
+test effect fn nativeBacktraceEveryAllocationFailureCleansPrefixAndCallbackOwners() -> ()
+  ! OutOfMemoryError | StringLengthError | JsException | AssertionError<'static> {
+  let mut sawFailure = false let mut sawComplete = false
+  let mut mode: usize = 0
+  while mode < 2 {
+    let mut cut: usize = 0
+    while cut < 48 {
+      let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+      let observer = run memory.observe()
+      let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+      let ctx = run unsafe runtime.allocateContextStorage(rt) |> Effect.provideMut<Allocator>(&mut memory)
+      let mut hooks = Hooks.make(&observer)
+      run unsafe fixture.prepare(&mut hooks, &observer, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+      let object = run unsafe errors.newError(&mut hooks, &observer, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+      let function = run unsafe frames.native(&mut hooks, &observer, ctx, Value.Null) |> Effect.provideMut<Allocator>(&mut memory)
+      let mut frame = run frames.frame(function) |> Effect.provideMut<Allocator>(&mut memory)
+      unsafe frames.publish(rt, Pointer.fromMutRef<StackFrame>(&mut frame))
+      let filename = StringOwner.adopt(run Strings.fromLatin1(b"parse.js") |> Effect.provideMut<Allocator>(&mut memory))
+      hooks.collect = true
+      let mut fault = FaultAllocator { parent: move memory, armed: true, remaining: cut, persistent: mode == 1, failures: 0 }
+      run unsafe errors.buildBacktrace(&mut hooks, &observer, ctx, object,
+        Option<Value>.some(filename.get()), 13, 7, 0) |> Effect.provideMut<Allocator>(&mut fault)
+      sawFailure = sawFailure || fault.failures != 0
+      let file = unsafe fixture.property(object, atoms.JS_ATOM_fileName)
+      let line = unsafe fixture.property(object, atoms.JS_ATOM_lineNumber)
+      let column = unsafe fixture.property(object, atoms.JS_ATOM_columnNumber)
+      let stack = unsafe fixture.property(object, atoms.JS_ATOM_stack)
+      sawComplete = sawComplete || (stack.present && stack.value.isString())
+      run Testing.expect((!line.present || file.present) && (!column.present || line.present)
+        && (!stack.present || column.present) && !unsafe fixture.inOom(rt),
+        "allocation failure commits only a coordinate prefix and always restores the OOM guard")
+      let pending = unsafe exceptions.take(rt)
+      unsafe gc.release(&mut hooks, rt, pending)
+      drop filename
+      unsafe frames.publish(rt, Pointer.null<StackFrame>())
+      unsafe gc.release(&mut hooks, rt, object) unsafe gc.release(&mut hooks, rt, function)
+      unsafe gc.releaseHeader(&mut hooks, rt, ctx) run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut fault)
+      run Testing.expect(observer.stats().allocationCount == 0 && observer.stats().usedBytes == 0,
+        "prefix buffers, coordinate copies, callback inputs and nested OOM errors unwind at every allocation cut")
+      cut = cut + 1
+    }
+    mode = mode + 1
+  }
+  run Testing.expect(sawFailure && sawComplete,
+    "the attachment sweep exercises both failing allocations and a complete source-located stack")
+}
+
+test effect fn newErrorReportsNativeOomInsteadOfReturningAnExceptionValue() -> ()
+  ! OutOfMemoryError | StringLengthError | AssertionError<'static> {
+  let mut mode: usize = 0
+  while mode < 2 {
+    let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+    let observer = run memory.observe()
+    let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+    let ctx = run unsafe runtime.allocateContextStorage(rt) |> Effect.provideMut<Allocator>(&mut memory)
+    let mut hooks = Hooks.make(&observer)
+    run unsafe fixture.prepare(&mut hooks, &observer, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+    let mut fault = FaultAllocator { parent: move memory, armed: true, remaining: 0, persistent: mode == 1, failures: 0 }
+    let result = run Effect.result(unsafe errors.newError(&mut hooks, &observer, ctx)) |> Effect.provideMut<Allocator>(&mut fault)
+    let mut failed = false
+    match move result {
+      Result<Value, JsException>.Success { value } => { unsafe gc.release(&mut hooks, rt, value) }
+      Result<Value, JsException>.Failure { .. } => { failed = true }
+    }
+    let pending = unsafe exceptions.take(rt)
+    let mut correctPending = pending.tag() == 2
+    if mode == 0 { correctPending = unsafe fixture.prototypeIndex(ctx, pending) == 6 }
+    run Testing.expect(failed && correctPending && !unsafe fixture.inOom(rt),
+      "JS_NewError reports a failure marker with an owned native OOM, or null under permanent exhaustion")
+    unsafe gc.release(&mut hooks, rt, pending)
+    unsafe gc.releaseHeader(&mut hooks, rt, ctx) run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut fault)
+    run Testing.expect(observer.stats().allocationCount == 0 && observer.stats().usedBytes == 0,
+      "the failed bare Error allocation and recursive replacement own no leaked storage")
+    mode = mode + 1
+  }
+}

@@ -1,0 +1,104 @@
+//! FIFO jobs own their realm and arguments; dispatch is mandatory native behavior.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.list { List }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.result { Result }
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_core_types { RuntimeState, JobEntry, NativeFunctionId }
+import js_value { Value }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime { contextRuntime }
+
+pub interface JobDispatcher {
+  /// arguments are borrowed rooted Values; returns an owned Value or Exception.
+  /// The implementation installs the runtime exception before returning Exception.
+  /// Typed allocation failures are also cleaned up and propagated by the queue.
+  unsafe effect fn dispatchJob(self: &mut Self, context: *mut HeapHeader,
+    function: NativeFunctionId, arguments: &[Value]) -> Value
+    ! OutOfMemoryError ? &mut Allocator
+}
+pub struct JobResult {
+  /// Source result: 0 empty, 1 success, -1 JavaScript exception.
+  pub status: i32,
+  /// Borrowed obsolete pctx result, null if queue held the last context reference.
+  pub context: ?*mut HeapHeader
+}
+/// Allocates an unqueued owner without retaining a realm. Release with gc.releaseJob.
+/// OOM leaves every borrowed argument reference unchanged.
+pub unsafe effect fn prepareJob(function: NativeFunctionId, arguments: &[Value]) -> *mut HeapHeader
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut owned = List<Value>.make()
+  run owned.reserveExact(arguments.length)
+  let mut index: usize = 0
+  while index < arguments.length { run owned.append(arguments[index]) index = index + 1 }
+  // Allocation can fail while copies are still borrowed; only retain after success.
+  let node = run HeapCell.allocate<JobEntry>(HeapKind.Auxiliary,
+    JobEntry { realm: Pointer.null<HeapHeader>(), function: function, arguments: move owned })
+  index = 0
+  while index < arguments.length { let retained = unsafe arguments[index].retained() index = index + 1 }
+  return node
+}
+/// Consumes a prepared node into its runtime's FIFO without allocating.
+pub unsafe fn enqueuePreparedJob(context: *mut HeapHeader, node: *mut HeapHeader) -> () {
+  let runtime = unsafe contextRuntime(context)
+  unsafe HeapCell.retain(context)
+  let mut anchor = ()
+  let entry = unsafe HeapCell.payloadMut<JobEntry, ()>(&mut anchor, node)
+  entry.realm = context drop entry
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  unsafe state.jobs.pushBack(node)
+}
+/// Borrowed roots; OOM leaves both the queue and reference counts unchanged.
+pub unsafe effect fn enqueueJob(context: *mut HeapHeader, function: NativeFunctionId, arguments: &[Value]) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let node = run unsafe prepareJob(function, arguments)
+  unsafe enqueuePreparedJob(context, node)
+}
+pub unsafe fn isJobPending(runtime: *mut HeapHeader) -> bool {
+  let anchor = ()
+  unsafe { return !HeapCell.payload<RuntimeState, ()>(&anchor, runtime).jobs.isEmpty() }
+}
+/// Removes before dispatch, allowing jobs to append or execute other jobs reentrantly.
+/// Caller keeps runtime alive. Dispatch must not destroy it or release borrowed roots.
+pub unsafe effect fn executePendingJob<H: HeapHooks + JobDispatcher>(hooks: &mut H, runtime: *mut HeapHeader) -> JobResult
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  let pending = unsafe state.jobs.popFront()
+  drop state
+  let node = match move pending {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => { return JobResult { status: 0, context: Pointer.null<HeapHeader>() } }
+  }
+  let entry = unsafe HeapCell.payloadMut<JobEntry, ()>(&mut anchor, node)
+  let context = match Pointer.nonNullMut<HeapHeader>(entry.realm) {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => Intrinsic.trap("queued job has no realm")
+  }
+  let function = entry.function
+  let arguments = Intrinsic.replace(entry.arguments, List<Value>.make())
+  drop entry
+  let outcome = run Effect.result(unsafe hooks.dispatchJob(context, function, arguments.asSlice()))
+  let mut index: usize = 0
+  while index < arguments.length() { unsafe gc.release(&mut hooks, runtime, arguments.get(index)) index = index + 1 }
+  match move outcome {
+    Result<Value, OutOfMemoryError>.Failure { error } => {
+      unsafe gc.releaseJob(&mut hooks, runtime, node)
+      fail move error
+    }
+    Result<Value, OutOfMemoryError>.Success { value } => {
+      let mut status: i32 = 1
+      if value.isException() { status = -1 }
+      unsafe gc.release(&mut hooks, runtime, value)
+      let header = unsafe Pointer.borrow<(), HeapHeader>(&anchor, context)
+      let mut surviving = Pointer.null<HeapHeader>()
+      if header.referenceCount > 1 { surviving = context }
+      drop header
+      unsafe gc.releaseJob(&mut hooks, runtime, node)
+      return JobResult { status: status, context: surviving }
+    }
+  }
+}

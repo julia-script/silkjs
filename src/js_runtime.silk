@@ -1,0 +1,266 @@
+//! Native low-level runtime ownership and configuration. Allocate through the owning
+//! RuntimeAllocator provider; JS roots use js_gc, never native container destruction.
+//! allocateContextStorage is INTERNAL storage, not JS_NewContextRaw: callers must
+//! construct BasicObjects before exposing a JavaScript context to an embedding.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.list { List }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.u32
+import silk.i32
+import silk.usize
+import js_atoms { AtomTable }
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_value { Value }
+import js_core_types {
+  RuntimeState, ContextState, ContextList, ModuleList, HeapList, GcPhase,
+  HostHook, ModuleLoaderHooks, SharedArrayBufferHooks, WeakRefList, WeakRefHeader,
+  ClassDef, NativeFunctionId, StackFrame, ByteStorage, LeakTrackingState, LocaleCallbacks
+}
+import js_class_data as classes
+import js_runtime_classes as definitions
+import js_gc { HeapHooks }
+import js_gc as gc
+import runtime_memory { RuntimeAllocator, AllocationObserver }
+
+fn noHook() -> HostHook {
+  return HostHook { callback: Option<NativeFunctionId>.none(), opaque: Pointer.null<u8>() }
+}
+/// stackTop is supplied by the native embedding's stack probe. Keeping the probe
+/// outside this API avoids pretending an ordinary local address is a frame pointer.
+pub effect fn allocateRuntimeStorage(stackTop: usize) -> *mut HeapHeader
+  ! OutOfMemoryError ? &mut Allocator {
+  let atoms = run AtomTable.make()
+  let mut registry = List<ClassDef>.make()
+  run registry.reserveExact(u32.toUsize(classes.JS_CLASS_INIT_COUNT))
+  let mut id: u32 = 0
+  while id < classes.JS_CLASS_INIT_COUNT {
+    run registry.append(definitions.standardDefinition(id))
+    id = id + 1
+  }
+  let mut buckets = List<?*mut HeapHeader>.make()
+  run buckets.reserveExact(16)
+  while buckets.length() < 16 { run buckets.append(Pointer.null<HeapHeader>()) }
+  // Until publication every owner is lexical, so any failed allocation drops all
+  // atom/native storage. Standard names are permanent atoms, not dynamic retains.
+  return run HeapCell.allocate<RuntimeState>(HeapKind.Auxiliary, RuntimeState {
+    runtimeInfo: Option<ByteStorage>.none(), atoms: move atoms, classes: move registry,
+    intlClassIds: [0; 10],
+    intlSegmentsClassId: 0, intlSegmentIteratorClassId: 0,
+    temporalClassIds: [0; 8],
+    contexts: ContextList { first: Pointer.null<HeapHeader>(), last: Pointer.null<HeapHeader>() },
+    gcObjects: HeapList.make(), zeroReferenceObjects: HeapList.make(), temporaryGcObjects: HeapList.make(),
+    gcPhase: GcPhase.None, mallocGcThreshold: 262144,
+    weakReferences: WeakRefList { first: Pointer.null<WeakRefHeader>(), last: Pointer.null<WeakRefHeader>() },
+    leakTracking: Option<LeakTrackingState>.none(), stackSize: 1048576, stackTop: stackTop,
+    stackLimit: usize.wrappingSubtract(stackTop, 1048576),
+    currentException: Value.Uninitialized, currentExceptionIsUncatchable: false, inOutOfMemory: false,
+    currentStackFrame: Pointer.null<StackFrame>(), interrupt: noHook(), promiseRejectionTracker: noHook(), jobs: HeapList.make(),
+    moduleLoader: ModuleLoaderHooks { normalize: Option<NativeFunctionId>.none(), load: Option<NativeFunctionId>.none(),
+      checkSupportedImportAttributes: Option<NativeFunctionId>.none(), loaderHasAttributes: false, opaque: Pointer.null<u8>() },
+    moduleAsyncEvaluationNextTimestamp: 0, canBlock: false,
+    sharedArrayBuffers: SharedArrayBufferHooks { allocate: Option<NativeFunctionId>.none(), free: Option<NativeFunctionId>.none(),
+      duplicate: Option<NativeFunctionId>.none(), opaque: Pointer.null<u8>() },
+    stripFlags: 0, shapeHashBits: 4, shapeHashCount: 0, shapeHash: move buckets, userOpaque: Pointer.null<u8>()
+  })
+}
+/// Internal allocation for the intrinsic constructor. Every owned slot is valid;
+/// no JS intrinsics or objects have been constructed. Returned context owns one RC.
+/// runtime must outlive the context. No allocation occurs after publication.
+pub unsafe effect fn allocateContextStorage(runtime: *mut HeapHeader) -> *mut HeapHeader
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let count = state.classes.length()
+  let previous = state.contexts.last
+  drop state
+  let mut prototypes = List<Value>.make()
+  run prototypes.reserveExact(count)
+  while prototypes.length() < count { run prototypes.append(Value.Null) }
+  let context = run HeapCell.allocate<ContextState>(HeapKind.Context, ContextState {
+    runtime: runtime, previousContext: previous, nextContext: Pointer.null<HeapHeader>(),
+    binaryObjectCount: 0, binaryObjectSize: 0,
+    arrayShape: Pointer.null<HeapHeader>(), argumentsShape: Pointer.null<HeapHeader>(), mappedArgumentsShape: Pointer.null<HeapHeader>(),
+    regexpShape: Pointer.null<HeapHeader>(), regexpResultShape: Pointer.null<HeapHeader>(),
+    classPrototypes: move prototypes, functionPrototype: Value.Null, functionConstructor: Value.Null,
+    arrayConstructor: Value.Null, regexpConstructor: Value.Null, promiseConstructor: Value.Null,
+    nativeErrorPrototypes: [Value.Null; 9], iteratorConstructor: Value.Null, asyncIteratorPrototype: Value.Null,
+    arrayPrototypeValues: Value.Null, throwTypeError: Value.Null, evalObject: Value.Null,
+    userValues: [Value.Null; 7], globalObject: Value.Null, globalVarObject: Value.Null,
+    randomState: 0, interruptCounter: 0,
+    loadedModules: ModuleList { first: Pointer.null<HeapHeader>(), last: Pointer.null<HeapHeader>() },
+    regexpCompilerEnabled: false, evalEnabled: false,
+    localeCallbacks: Option<LocaleCallbacks>.none(), userOpaque: Pointer.null<u8>()
+  })
+  match Pointer.nonNullMut<HeapHeader>(previous) {
+    Option<*mut HeapHeader>.Some { value } => {
+      let prior = unsafe HeapCell.payloadMut<ContextState, ()>(&mut anchor, value)
+      prior.nextContext = context
+    }
+    Option<*mut HeapHeader>.None => ()
+  }
+  let updated = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  if Pointer.isNull<HeapHeader>(previous) { updated.contexts.first = context }
+  updated.contexts.last = context
+  drop updated
+  unsafe gc.publish(runtime, context)
+  return context
+}
+pub unsafe fn contextRuntime(context: *mut HeapHeader) -> *mut HeapHeader {
+  let anchor = ()
+  unsafe { return HeapCell.payload<ContextState, ()>(&anchor, context).runtime }
+}
+pub unsafe fn duplicateContext(context: *mut HeapHeader) -> *mut HeapHeader {
+  unsafe HeapCell.retain(context)
+  return context
+}
+pub unsafe fn getRuntimeOpaque(runtime: *mut HeapHeader) -> ?*mut u8 {
+  let anchor = ()
+  unsafe { return HeapCell.payload<RuntimeState, ()>(&anchor, runtime).userOpaque }
+}
+pub unsafe fn setRuntimeOpaque(runtime: *mut HeapHeader, opaque: ?*mut u8) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.userOpaque = opaque
+}
+pub unsafe fn getContextOpaque(context: *mut HeapHeader) -> ?*mut u8 {
+  let anchor = ()
+  unsafe { return HeapCell.payload<ContextState, ()>(&anchor, context).userOpaque }
+}
+pub unsafe fn setContextOpaque(context: *mut HeapHeader, opaque: ?*mut u8) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<ContextState, ()>(&mut anchor, context)
+  state.userOpaque = opaque
+}
+/// Consumes incoming; unlike context user roots, this publishes BEFORE release,
+/// matching set_value, so finalizers may inspect the replacement safely.
+pub unsafe fn setClassPrototype<H: HeapHooks>(hooks: &mut H, context: *mut HeapHeader, classId: u32, incoming: Value) -> () {
+  let mut anchor = ()
+  let data = unsafe HeapCell.payloadMut<ContextState, ()>(&mut anchor, context)
+  let runtime = data.runtime
+  let registryAnchor = ()
+  let registry = unsafe HeapCell.payload<RuntimeState, ()>(&registryAnchor, runtime)
+  if u32.toUsize(classId) >= registry.classes.length() { Intrinsic.trap("QuickJS invariant violated") }
+  drop registry
+  let old = data.classPrototypes.get(u32.toUsize(classId))
+  data.classPrototypes.set(u32.toUsize(classId), incoming)
+  drop data
+  unsafe gc.release(&mut hooks, runtime, old)
+}
+pub unsafe fn getClassPrototype(context: *mut HeapHeader, classId: u32) -> Value {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  let registryAnchor = ()
+  let registry = unsafe HeapCell.payload<RuntimeState, ()>(&registryAnchor, data.runtime)
+  if u32.toUsize(classId) >= registry.classes.length() { Intrinsic.trap("QuickJS invariant violated") }
+  return unsafe data.classPrototypes.get(u32.toUsize(classId)).retained()
+}
+/// Source JS_SetContextValue releases the old edge BEFORE storing the replacement.
+/// Incoming ownership is consumed even for an invalid index. Caller roots context.
+pub unsafe fn setContextValue<H: HeapHooks>(hooks: &mut H, context: *mut HeapHeader, index: i32, incoming: Value) -> () {
+  let runtime = unsafe contextRuntime(context)
+  if index < 0 || index >= 7 { unsafe gc.release(&mut hooks, runtime, incoming) return () }
+  let mut anchor = ()
+  let data = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  let old = data.userValues[i32.toUsize(index)]
+  drop data
+  unsafe gc.release(&mut hooks, runtime, old)
+  let updated = unsafe HeapCell.payloadMut<ContextState, ()>(&mut anchor, context)
+  updated.userValues[i32.toUsize(index)] = incoming
+}
+pub unsafe fn getContextValue(context: *mut HeapHeader, index: i32) -> Value {
+  if index < 0 || index >= 7 { return Value.Undefined }
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  return unsafe data.userValues[i32.toUsize(index)].retained()
+}
+pub fn setMemoryLimit<A>(allocator: &mut RuntimeAllocator<A>, limit: usize) -> () { allocator.setLimit(limit) }
+pub unsafe fn setGCThreshold(runtime: *mut HeapHeader, threshold: usize) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.mallocGcThreshold = threshold
+}
+/// Explicit safepoint, called before allocation. Size arithmetic wraps like size_t.
+/// Usage is sampled again AFTER collection because hooks can allocate/free storage.
+/// Weak callbacks use the caller's allocator capability; the observer only samples usage.
+pub unsafe effect fn triggerGC<H: HeapHooks>(allocator: &AllocationObserver, hooks: &mut H,
+  runtime: *mut HeapHeader, size: usize, force: bool) -> bool ? &mut Allocator {
+  let mut anchor = ()
+  let before = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let threshold = before.mallocGcThreshold
+  drop before
+  if !force && usize.wrappingAdd(allocator.stats().usedBytes, size) <= threshold { return false }
+  run unsafe gc.collect(&mut hooks, runtime, true)
+  let used = allocator.stats().usedBytes
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.mallocGcThreshold = usize.wrappingAdd(used, used / 2)
+  return true
+}
+fn updateStackLimit(state: &mut RuntimeState) -> () {
+  state.stackLimit = 0
+  if state.stackSize != 0 { state.stackLimit = usize.wrappingSubtract(state.stackTop, state.stackSize) }
+}
+pub unsafe fn setMaxStackSize(runtime: *mut HeapHeader, size: usize) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.stackSize = size
+  updateStackLimit(&mut state)
+}
+pub unsafe fn updateStackTop(runtime: *mut HeapHeader, stackTop: usize) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.stackTop = stackTop
+  updateStackLimit(&mut state)
+}
+/// checked=false is the CONFIG_STACK_CHECK-disabled policy. Downward stack and
+/// wrapping pointer arithmetic match the pinned implementation; zero size disables.
+pub unsafe fn checkStackOverflow(runtime: *mut HeapHeader, stackPointer: usize, allocationSize: usize, checked: bool) -> bool {
+  if !checked { return false }
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  return usize.wrappingSubtract(stackPointer, allocationSize) < state.stackLimit
+}
+pub unsafe fn setRuntimeInfo(runtime: *mut HeapHeader, info: Option<ByteStorage>) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.runtimeInfo = move info
+}
+pub unsafe fn setInterruptHandler(runtime: *mut HeapHeader, hook: HostHook) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.interrupt = move hook
+}
+pub unsafe fn setPromiseRejectionTracker(runtime: *mut HeapHeader, hook: HostHook) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.promiseRejectionTracker = move hook
+}
+pub unsafe fn setModuleLoader(runtime: *mut HeapHeader, hooks: ModuleLoaderHooks) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.moduleLoader = move hooks
+}
+pub unsafe fn setSharedArrayBufferFunctions(runtime: *mut HeapHeader, hooks: SharedArrayBufferHooks) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.sharedArrayBuffers = move hooks
+}
+pub unsafe fn setLocaleCallbacks(context: *mut HeapHeader, callbacks: Option<LocaleCallbacks>) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<ContextState, ()>(&mut anchor, context)
+  state.localeCallbacks = move callbacks
+}
+pub unsafe fn setCanBlock(runtime: *mut HeapHeader, canBlock: bool) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.canBlock = canBlock
+}
+pub unsafe fn setStripInfo(runtime: *mut HeapHeader, flags: u8) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.stripFlags = flags
+}
+pub unsafe fn getStripInfo(runtime: *mut HeapHeader) -> u8 {
+  let anchor = ()
+  unsafe { return HeapCell.payload<RuntimeState, ()>(&anchor, runtime).stripFlags }
+}

@@ -1,0 +1,235 @@
+//! POSIX event boundary for quickjs-libc.c. Kernel signal queues avoid asynchronous
+//! access to Silk heap storage; callbacks still run only at source poll safepoints.
+//! Shared C symbols keep the SDK's parameter-indexed foreign contracts; poll
+//! counts and clock IDs retain their distinct Darwin and GNU/Linux widths.
+import silk.list { List }
+import silk.ownership { Copy }
+import silk.pointer { Pointer }
+import silk.i32
+import silk.i64
+import silk.u32
+import silk.u64
+import silk.usize
+import js_os_platform as system
+
+pub extern "C" struct PollFd { pub fd: i32, pub events: i16, pub revents: i16 }
+impl Copy for PollFd {}
+extern "C" struct Timespec { seconds: i64, nanoseconds: i64 }
+// Opaque sigset_t storage: Darwin writes one u32; GNU/Linux uses all 128 bytes.
+extern "C" struct SignalSet { words: [u64; 16] }
+extern "C" struct KernelEvent { ident: usize, filter: i16, flags: u16, fflags: u32, data: i64, user: ?*mut u8 }
+unsafe extern "C" fn darwinPoll(fds: *mut PollFd, count: u32, timeout: i32) -> i32 as "poll" with Intrinsic.foreign(noCapture: ("fds",))
+unsafe extern "C" fn linuxPoll(fds: *mut PollFd, count: usize, timeout: i32) -> i32 as "poll" with Intrinsic.foreign(noCapture: ("fds",))
+unsafe extern "C" fn ppoll(fds: *mut PollFd, count: usize, timeout: *const Timespec, mask: ?*const SignalSet) -> i32
+  with Intrinsic.foreign(noCapture: ("fds", "timeout", "mask"))
+unsafe extern "C" fn darwinClock(clock: u32, result: *mut Timespec) -> i32 as "clock_gettime" with Intrinsic.foreign(noCapture: ("result",))
+unsafe extern "C" fn linuxClock(clock: i32, result: *mut Timespec) -> i32 as "clock_gettime" with Intrinsic.foreign(noCapture: ("result",))
+unsafe extern "C" fn close(fd: i32) -> i32
+unsafe extern "C" fn read(fd: i32, data: *mut u8, length: usize) -> isize with Intrinsic.foreign(noCapture: ("data",))
+unsafe extern "C" fn write(fd: i32, data: *const u8, length: usize) -> isize with Intrinsic.foreign(noCapture: ("data",))
+unsafe extern "C" fn fcntl(fd: i32, command: i32, ...) -> i32
+unsafe extern "C" fn kqueue() -> i32
+// Registration retains changes.user; only the output array and timeout promise
+// no capture. Do not extend that promise to the changes array.
+unsafe extern "C" fn kevent(fd: i32, changes: ?*const KernelEvent, count: i32,
+  events: ?*mut KernelEvent, capacity: i32, timeout: ?*const Timespec) -> i32
+  with Intrinsic.foreign(noCapture: ("events", "timeout"))
+unsafe extern "C" fn signalfd(fd: i32, mask: *const SignalSet, flags: i32) -> i32 with Intrinsic.foreign(noCapture: ("mask",))
+unsafe extern "C" fn sigemptyset(set: *mut SignalSet) -> i32 with Intrinsic.foreign(noCapture: ("set",))
+unsafe extern "C" fn sigfillset(set: *mut SignalSet) -> i32 with Intrinsic.foreign(noCapture: ("set",))
+unsafe extern "C" fn sigaddset(set: *mut SignalSet, signal: i32) -> i32 with Intrinsic.foreign(noCapture: ("set",))
+unsafe extern "C" fn sigismember(set: *const SignalSet, signal: i32) -> i32 with Intrinsic.foreign(noCapture: ("set",))
+unsafe extern "C" fn pthread_sigmask(how: i32, set: ?*const SignalSet, previous: ?*mut SignalSet) -> i32
+  with Intrinsic.foreign(noCapture: ("set", "previous"))
+// Public signal dispositions are owned only by explicit os.signal registrations.
+unsafe extern "C" fn nativeSignal(signal: i32, handler: ?*const u8) -> ?*const u8 as "signal"
+export "C" fn silkJsLibcSignalWake(signal: i32) -> () {}
+fn callbackDisposition(number: i32) -> usize {
+  let callback: extern "C" fn(i32) -> () = silkJsLibcSignalWake
+  let address = unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<
+    *const extern "C" fn(i32) -> (), *const ?*const u8>(Pointer.fromRef(&callback)))
+  return Pointer.address(unsafe nativeSignal(number, address))
+}
+unsafe fn disposition(number: i32, handler: usize) -> usize {
+  let address = unsafe Pointer.read<?*const u8>(unsafe Intrinsic.pointerReinterpret<
+    *const usize, *const ?*const u8>(Pointer.fromRef(&handler)))
+  return Pointer.address(unsafe nativeSignal(number, address))
+}
+
+pub fn blockWorkerSignals() -> () {
+  let mut all = SignalSet { words: [0; 16] }
+  if unsafe sigfillset(Pointer.fromMutRef(&mut all)) != 0 { Intrinsic.trap("could not construct worker signal mask") }
+  let blocked = unsafe pthread_sigmask(blockOperation(), Pointer.fromRef(&all), Pointer.null<SignalSet>())
+  if blocked != 0 { Intrinsic.trap("could not block worker signals") }
+}
+
+pub const READABLE: i16 = 1
+pub const WRITABLE: i16 = 4
+pub const FAILED: i16 = 56
+pub struct Signals {
+  pub fd: i32,
+  pub pending: u64,
+  active: u64,
+  originallyBlocked: u64,
+  originalHandlers: [usize; 64],
+}
+impl Signals {
+  pub fn make() -> Self {
+    return Self { fd: -1, pending: 0, active: 0, originallyBlocked: 0, originalHandlers: [0; 64] }
+  }
+}
+fn bit(signal: i32) -> u64 { return u64.shiftLeft(1, i32.toU64(signal)) }
+fn blockOperation() -> i32 { static if Intrinsic.targetOperatingSystem() == "darwin" { return 1 } else { return 0 } }
+fn unblockOperation() -> i32 { static if Intrinsic.targetOperatingSystem() == "darwin" { return 2 } else { return 1 } }
+fn mask(bits: u64) -> SignalSet {
+  let mut result = SignalSet { words: [0; 16] }
+  let ignored = unsafe sigemptyset(Pointer.fromMutRef(&mut result))
+  let mut number: i32 = 1
+  while number < 64 {
+    if (bits & bit(number)) != 0 { let added = unsafe sigaddset(Pointer.fromMutRef(&mut result), number) }
+    number = number + 1
+  }
+  return move result
+}
+pub fn nowNanoseconds() -> i64 {
+  let mut time = Timespec { seconds: 0, nanoseconds: 0 }
+  let mut status: i32 = 0
+  static if Intrinsic.targetOperatingSystem() == "darwin" { status = unsafe darwinClock(6, Pointer.fromMutRef(&mut time)) }
+  else { status = unsafe linuxClock(1, Pointer.fromMutRef(&mut time)) }
+  if status != 0 { return Intrinsic.trap("CLOCK_MONOTONIC failed") }
+  return i64.wrappingAdd(i64.wrappingMultiply(time.seconds, 1000000000), time.nanoseconds)
+}
+pub fn nowMilliseconds() -> i64 { return nowNanoseconds() / 1000000 }
+pub fn poll(fds: &mut List<PollFd>, timeout: i32) -> i32 {
+  let mut unused = PollFd { fd: -1, events: 0, revents: 0 }
+  let mut pointer = Pointer.fromMutRef(&mut unused)
+  let count = fds.length()
+  if count != 0 { pointer = Pointer.fromMutRef(&mut fds.asMutSlice()[0]) }
+  static if Intrinsic.targetOperatingSystem() == "darwin" { return unsafe darwinPoll(pointer, usize.toU32(count), timeout) }
+  else { return unsafe linuxPoll(pointer, count, timeout) }
+}
+// Returns false only if native queue allocation fails. Invalid/uncatchable signal
+// numbers below 64 remain accepted, matching source's ignored signal() failures.
+pub fn install(signals: &mut Signals, number: i32) -> bool {
+  let selected = bit(number)
+  if (signals.active & selected) != 0 { return true }
+  let one = mask(selected)
+  let mut old = SignalSet { words: [0; 16] }
+  let queried = unsafe pthread_sigmask(blockOperation(), Pointer.null<SignalSet>(), Pointer.fromMutRef(&mut old))
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    if signals.fd < 0 {
+      signals.fd = unsafe kqueue()
+      if signals.fd < 0 { return false }
+      let cloexec = unsafe fcntl(signals.fd, 2, 1)
+    }
+    let event = KernelEvent { ident: i32.toUsize(number), filter: -6, flags: 1 | 4 | 32,
+      fflags: 0, data: 0, user: Pointer.null<u8>() }
+    let registered = unsafe kevent(signals.fd, Pointer.fromRef(&event), 1, Pointer.null<KernelEvent>(), 0, Pointer.null<Timespec>())
+    if registered < 0 { return true }
+  }
+  static if Intrinsic.targetOperatingSystem() == "linux" {
+    let blocked = unsafe pthread_sigmask(blockOperation(), Pointer.fromRef(&one), Pointer.null<SignalSet>())
+    if blocked != 0 { return true }
+  }
+  let previous = callbackDisposition(number)
+  if previous == usize.MAX {
+    static if Intrinsic.targetOperatingSystem() == "linux" {
+      if unsafe sigismember(Pointer.fromRef(&old), number) != 1 {
+        let unblocked = unsafe pthread_sigmask(unblockOperation(), Pointer.fromRef(&one), Pointer.null<SignalSet>())
+      }
+    }
+    return true
+  }
+  signals.originalHandlers[i32.toUsize(number)] = previous
+  if unsafe sigismember(Pointer.fromRef(&old), number) == 1 { signals.originallyBlocked = signals.originallyBlocked | selected }
+  signals.active = signals.active | selected
+  static if Intrinsic.targetOperatingSystem() == "linux" {
+    let all = mask(signals.active)
+    let fd = unsafe signalfd(signals.fd, Pointer.fromRef(&all), 0x80800)
+    if fd < 0 { remove(&mut signals, number, previous) return false }
+    signals.fd = fd
+  }
+  return true
+}
+pub fn remove(signals: &mut Signals, number: i32, handler: usize) -> () {
+  let selected = bit(number)
+  if (signals.active & selected) != 0 {
+    // Drain before EV_DELETE: a delivered signal remains pending even when JS
+    // unregisters and re-registers its callback before the next event-loop turn.
+    collect(&mut signals)
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      let event = KernelEvent { ident: i32.toUsize(number), filter: -6, flags: 2, fflags: 0, data: 0, user: Pointer.null<u8>() }
+      let removed = unsafe kevent(signals.fd, Pointer.fromRef(&event), 1, Pointer.null<KernelEvent>(), 0, Pointer.null<Timespec>())
+    }
+    signals.active = signals.active & ~selected
+    let ignored = unsafe disposition(number, handler)
+    static if Intrinsic.targetOperatingSystem() == "linux" {
+      if (signals.originallyBlocked & selected) == 0 {
+        let one = mask(selected)
+        let unblocked = unsafe pthread_sigmask(unblockOperation(), Pointer.fromRef(&one), Pointer.null<SignalSet>())
+      }
+    }
+    signals.originallyBlocked = signals.originallyBlocked & ~selected
+    static if Intrinsic.targetOperatingSystem() == "linux" {
+      if signals.fd >= 0 { let all = mask(signals.active) let updated = unsafe signalfd(signals.fd, Pointer.fromRef(&all), 0x80800) }
+    }
+  } else { let ignored = unsafe disposition(number, handler) }
+}
+pub fn collect(signals: &mut Signals) -> () {
+  if signals.fd < 0 { return () }
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    let timeout = Timespec { seconds: 0, nanoseconds: 0 }
+    let mut event = KernelEvent { ident: 0, filter: 0, flags: 0, fflags: 0, data: 0, user: Pointer.null<u8>() }
+    while unsafe kevent(signals.fd, Pointer.null<KernelEvent>(), 0, Pointer.fromMutRef(&mut event), 1, Pointer.fromRef(&timeout)) > 0 {
+      if event.ident < 64 { signals.pending = signals.pending | u64.shiftLeft(1, usize.toU64(event.ident)) }
+    }
+  } else {
+    // Linux signalfd_siginfo has a stable 128-byte UAPI layout; signo is its first word.
+    let mut record: [u32; 32] = [0; 32]
+    let pointer = unsafe Intrinsic.pointerReinterpret<*mut [u32; 32], *mut u8>(Pointer.fromMutRef(&mut record))
+    while unsafe read(signals.fd, pointer, 128) == 128 {
+      if record[0] < 64 { signals.pending = signals.pending | u64.shiftLeft(1, u32.toU64(record[0])) }
+    }
+  }
+}
+pub fn clear(signals: &mut Signals, number: i32) -> () { collect(&mut signals) signals.pending = signals.pending & ~bit(number) }
+pub fn take(signals: &mut Signals, number: i32) -> bool {
+  let selected = bit(number)
+  if (signals.pending & selected) == 0 { return false }
+  signals.pending = signals.pending & ~selected
+  return true
+}
+pub fn interrupt(signals: &mut Signals) -> bool { collect(&mut signals) return (signals.pending & bit(2)) != 0 }
+pub fn dispose(signals: &mut Signals) -> () {
+  let mut number: i32 = 1
+  while number < 64 {
+    if (signals.active & bit(number)) != 0 {
+      let original = signals.originalHandlers[i32.toUsize(number)]
+      remove(&mut signals, number, original)
+    }
+    number = number + 1
+  }
+  if signals.fd >= 0 { let closed = unsafe close(signals.fd) signals.fd = -1 }
+}
+// Registered Linux signals are blocked for signalfd. Waiting on that descriptor
+// preserves nanosleep's observable -EINTR without invoking JS during os.sleep.
+pub fn sleep(signals: &mut Signals, delay: i64) -> i32 {
+  let mut milliseconds = delay if milliseconds < 0 { milliseconds = 0 }
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    return system.sleep(milliseconds)
+  } else {
+    if signals.fd < 0 { return system.sleep(milliseconds) }
+    collect(&mut signals)
+    let mut fd = PollFd { fd: signals.fd, events: READABLE, revents: 0 }
+    let timeout = Timespec { seconds: milliseconds / 1000, nanoseconds: (milliseconds % 1000) * 1000000 }
+    let ready = unsafe ppoll(Pointer.fromMutRef(&mut fd), 1, Pointer.fromRef(&timeout), Pointer.null<SignalSet>())
+    if ready < 0 { return -system.errno() }
+    if ready == 0 { return 0 }
+    collect(&mut signals)
+    return -4
+  }
+}
+pub fn rejectionPrefix() -> () {
+  let bytes = b"Possibly unhandled promise rejection: "
+  let ignored = unsafe write(2, Pointer.fromRef(&bytes[0]), bytes.length)
+}

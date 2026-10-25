@@ -1,0 +1,341 @@
+//! Owning native libc sessions and the qjs/qjsc embedding helpers.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.list { List }
+import silk.pointer { Pointer }
+import silk.string { String }
+import silk.i32
+import silk.usize
+import runtime_memory { AllocationObserver }
+import js_engine { Engine }
+import js_libc_services { LibcServices }
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types { ContextState, FrameSlots, NativeFunctionId, NativeCallProtocol, BuiltinFamily, NativeErrorKind, HostHook, ModuleLoaderHooks }
+import js_libc_process { Process }
+import js_value_print { Options }
+import js_atomics_native { Domain }
+import js_exceptions { JsException }
+import js_module_metadata { ModuleMetadataError }
+import js_string_types { StringLengthError }
+import js_coercion_host { CoercionHooks }
+import js_strings { Strings }
+import js_collection_support { Scope }
+import js_collection_support as owners
+import js_proxy_core as core
+import js_runtime as runtime
+import js_gc as gc
+import js_exceptions as exceptions
+import js_intrinsic_install as intrinsics
+import js_intl as intl
+import js_temporal as temporal
+import js_native_functions as functions
+import js_object_allocate as objects
+import js_eval as evaluation
+import js_eval_compile as flags
+import js_module_loader as loader
+import js_binary_object_reader as reader
+import js_libc_modules as modules
+import js_libc_platform as platform
+import js_os_events_loop as eventLoopModule
+import js_os_workers as workers
+import js_os_workers_transport { WorkerStart }
+import js_os_workers_transport as transport
+import js_libc_worker as workerRuntime
+import js_libc_plugins as plugins
+import js_std_native as stdio
+import js_property_mutations as mutations
+import js_bigint { BigIntError }
+import js_value_print as printing
+import js_os_events as events
+import js_std as standard
+import js_os as operating
+import native_stack as stack
+
+pub const PRINT: u32 = 0x4c000010
+pub const CONSOLE_LOG: u32 = 0x4c000011
+pub struct Session<'m> {
+  pub engine: Engine<'m, LibcServices>,
+  pub runtime: *mut HeapHeader,
+  pub context: *mut HeapHeader,
+  closed: bool
+}
+impl<'m> Session<'m> {
+  pub unsafe effect fn open(memory: &'m AllocationObserver, domain: Domain, process: &Process, experimental: bool) -> Self ! OutOfMemoryError | JsException ? &mut Allocator {
+    return run unsafe Session.openFeatures(memory, domain, process, experimental, 18446744073709551615)
+  }
+  pub unsafe effect fn openFeatures(memory: &'m AllocationObserver, domain: Domain, process: &Process, experimental: bool, featureBitmap: u64) -> Self ! OutOfMemoryError | JsException ? &mut Allocator {
+    let rt = run runtime.allocateRuntimeStorage(stack.currentFrameAddress())
+    return run unsafe Session.fromRuntimeFeatures(memory, domain, process, experimental, rt, featureBitmap)
+  }
+  // Core-only embedders install their own host globals/modules. The ordinary
+  // libc factory still owns exactly the same handlers and teardown path.
+  pub unsafe effect fn openCore(memory: &'m AllocationObserver, domain: Domain, process: &Process, featureBitmap: u64) -> Self ! OutOfMemoryError | JsException ? &mut Allocator {
+    let rt = run runtime.allocateRuntimeStorage(stack.currentFrameAddress())
+    let mut services = LibcServices.make(process, false)
+    services.featureBitmap = featureBitmap
+    return run unsafe Session.fromServices(memory, domain, move services, rt, Option<&WorkerStart>.none(), false)
+  }
+  pub unsafe effect fn fromRuntime(memory: &'m AllocationObserver, domain: Domain, process: &Process, experimental: bool, rt: *mut HeapHeader) -> Self ! OutOfMemoryError | JsException ? &mut Allocator {
+    return run unsafe Session.fromRuntimeFeatures(memory, domain, process, experimental, rt, 18446744073709551615)
+  }
+  pub unsafe effect fn fromRuntimeFeatures(memory: &'m AllocationObserver, domain: Domain, process: &Process, experimental: bool, rt: *mut HeapHeader, featureBitmap: u64) -> Self ! OutOfMemoryError | JsException ? &mut Allocator {
+    let mut services = LibcServices.make(process, experimental)
+    services.featureBitmap = featureBitmap
+    return run unsafe Session.fromServices(memory, domain, move services, rt, Option<&WorkerStart>.none(), true)
+  }
+  pub unsafe effect fn fromWorker(memory: &'m AllocationObserver, args: &mut WorkerStart) -> Self ! OutOfMemoryError | JsException ? &mut Allocator {
+    let rt = run runtime.allocateRuntimeStorage(stack.currentFrameAddress())
+    unsafe runtime.setStripInfo(rt, args.stripFlags)
+    unsafe runtime.setCanBlock(rt, true)
+    let mut services = LibcServices.make(&args.process, args.experimental)
+    services.featureBitmap = args.featureBitmap
+    services.moduleBundle = Intrinsic.replace(args.bundle, List<modules.CapturedModule>.make())
+    let registry = Intrinsic.replace(args.plugins, Option<plugins.Registry>.none())
+    match move registry { Option<plugins.Registry>.Some { value } => { services.plugins = move value } _ => () }
+    return run unsafe Session.fromServices(memory, args.domain, move services, rt, Option<&WorkerStart>.some(&args.*), true)
+  }
+  unsafe effect fn fromServices(memory: &'m AllocationObserver, domain: Domain, services: LibcServices, rt: *mut HeapHeader, worker: Option<&WorkerStart>, hostModules: bool) -> Self ! OutOfMemoryError | JsException ? &mut Allocator {
+    let mut engine = Engine { memory: memory, domain: domain, services: move services }
+    let initialized = run Effect.result(unsafe initHandlers(&mut engine, rt))
+    match move initialized {
+      Result<(), OutOfMemoryError>.Success { .. } => ()
+      Result<(), OutOfMemoryError>.Failure { error } => { run unsafe gc.destroyRuntime(&mut engine, rt) fail move error }
+    }
+    if !hostModules {
+      unsafe runtime.setModuleLoader(rt, ModuleLoaderHooks { normalize: Option<NativeFunctionId>.none(),
+        load: Option<NativeFunctionId>.none(), checkSupportedImportAttributes: Option<NativeFunctionId>.none(),
+        loaderHasAttributes: false, opaque: Pointer.null<u8>() })
+    }
+    match move worker {
+      Option<&WorkerStart>.Some { value: args } => {
+        let mut anchor = () let state = unsafe Pointer.borrowMut<(), events.ThreadState>(&mut anchor, unsafe events.state(rt))
+        state.recvPipe = unsafe transport.retainPipe(args.recvPipe)
+        state.sendPipe = unsafe transport.retainPipe(args.sendPipe)
+        state.workerGroup = unsafe transport.retainGroup(args.group)
+        state.resources = unsafe transport.groupResources(args.group)
+        drop state
+      }
+      Option<&WorkerStart>.None => ()
+    }
+    if engine.services.moduleBundle.length() != 0 { unsafe modules.install(rt) }
+    let created = run Effect.result(unsafe createSessionContext(&mut engine, rt, hostModules))
+    let context = match move created {
+      Result<*mut HeapHeader, OutOfMemoryError | JsException>.Success { value } => value
+      Result<*mut HeapHeader, OutOfMemoryError | JsException>.Failure { error } => {
+        unsafe freeHandlers(&mut engine, rt)
+        run unsafe gc.destroyRuntime(&mut engine, rt)
+        fail move error
+      }
+    }
+    return Self { engine: move engine, runtime: rt, context: context, closed: false }
+  }
+  pub unsafe effect fn close(self: &mut Self) -> () ? &mut Allocator {
+    if self.closed { return }
+    unsafe freeHandlers(&mut self.engine, self.runtime)
+    unsafe gc.releaseHeader(&mut self.engine, self.runtime, self.context)
+    run unsafe gc.destroyRuntime(&mut self.engine, self.runtime)
+    self.closed = true
+  }
+}
+unsafe effect fn createSessionContext<'m>(engine: &mut Engine<'m, LibcServices>, rt: *mut HeapHeader, hostModules: bool) -> *mut HeapHeader ! OutOfMemoryError | JsException ? &mut Allocator {
+  if hostModules { return run unsafe createContext(&mut engine, rt) }
+  let memory = engine.memory let features = engine.services.featureBitmap
+  return run unsafe intrinsics.createFeatures(&mut engine, memory, rt, features)
+}
+pub unsafe effect fn createContext<'m>(engine: &mut Engine<'m, LibcServices>, rt: *mut HeapHeader) -> *mut HeapHeader ! OutOfMemoryError | JsException ? &mut Allocator {
+  let memory = engine.memory let features = engine.services.featureBitmap
+  let context = run unsafe intrinsics.createFeatures(&mut engine, memory, rt, features)
+  let installed = run Effect.result(unsafe installContext(&mut engine, context))
+  match move installed {
+    Result<(), OutOfMemoryError | JsException>.Success { .. } => { return context }
+    Result<(), OutOfMemoryError | JsException>.Failure { error } => { unsafe gc.releaseHeader(&mut engine, rt, context) fail move error }
+  }
+}
+unsafe effect fn installContext<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  let memory = engine.memory let namespace = engine.services.process.namespace.clone()
+  if engine.services.experimental {
+    run unsafe temporal.addIntrinsic(&mut engine, memory, context, &namespace)
+    run unsafe intl.addIntrinsic(&mut engine, memory, context, &namespace)
+  }
+  let stdModule = run unsafe standard.addModule(&mut engine, memory, context, &namespace, b"std")
+  let osModule = run Effect.result(unsafe operating.addModule(context, b"os"))
+  match move osModule {
+    Result<*mut HeapHeader, OutOfMemoryError | StringLengthError | ModuleMetadataError>.Success { .. } => ()
+    Result<*mut HeapHeader, OutOfMemoryError | StringLengthError | ModuleMetadataError>.Failure { .. } => { return run unsafe engine.throwOutOfMemory(context) }
+  }
+}
+pub unsafe effect fn initHandlers<'m>(engine: &mut Engine<'m, LibcServices>, rt: *mut HeapHeader) -> () ! OutOfMemoryError ? &mut Allocator {
+  run unsafe events.initHandlers(rt, &engine.services.process, engine.services.experimental, engine.domain)
+  let mut anchor = ()
+  let state = unsafe Pointer.borrowMut<(), events.ThreadState>(&mut anchor, unsafe events.state(rt))
+  state.featureBitmap = engine.services.featureBitmap drop state
+  unsafe workers.installShared(rt)
+  if (engine.services.featureBitmap & 512) != 0 { unsafe modules.install(rt) }
+}
+pub unsafe fn freeHandlers<'m>(engine: &mut Engine<'m, LibcServices>, rt: *mut HeapHeader) -> () {
+  unsafe events.freeHandlers(&mut engine, rt)
+}
+pub unsafe fn setRejectionTracker<'m>(engine: &mut Engine<'m, LibcServices>, rt: *mut HeapHeader, enabled: bool) -> () {
+  let mut callback = Option<NativeFunctionId>.none()
+  if enabled { callback = Option<NativeFunctionId>.some(NativeFunctionId.Host { id: 0x4c000290 }) }
+  unsafe runtime.setPromiseRejectionTracker(rt, HostHook { callback: move callback, opaque: Pointer.null<u8>() })
+}
+pub unsafe effect fn loop<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  let outcome = run Effect.result(unsafe eventLoopModule.eventLoop(&mut engine, context))
+  return match move outcome {
+    Result<(), OutOfMemoryError | eventLoopModule.UnhandledRejection>.Success { .. } => 0
+    Result<(), OutOfMemoryError | eventLoopModule.UnhandledRejection>.Failure { error } => {
+      return match move error { eventLoopModule.UnhandledRejection { code } => code OutOfMemoryError allocation => { fail move allocation } }
+    }
+  }
+}
+pub unsafe effect fn awaitValue<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader, value: Value) -> Value ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe eventLoopModule.awaitValue(&mut engine, context, value) }
+pub unsafe effect fn evalBuffer<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader, source: &[u8], filename: &[u8], evalFlags: i32) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  let memory = engine.memory
+  if (evalFlags & flags.TYPE_MASK) != flags.TYPE_MODULE { return run unsafe evaluation.evaluate(&mut engine, memory, context, source, filename, evalFlags) }
+  let compiled = run unsafe evaluation.evaluate(&mut engine, memory, context, source, filename, evalFlags | flags.FLAG_COMPILE_ONLY)
+  let meta = run Effect.result(unsafe modules.setImportMeta(&mut engine, context, compiled, true, true))
+  match move meta {
+    Result<(), OutOfMemoryError | JsException>.Success { .. } => ()
+    Result<(), OutOfMemoryError | JsException>.Failure { error } => {
+      unsafe owners.release(&mut engine, context, compiled) fail move error
+    }
+  }
+  if (evalFlags & flags.FLAG_COMPILE_ONLY) != 0 { return compiled }
+  let result = run unsafe evaluation.evaluateFunction(&mut engine, memory, context, compiled)
+  return run unsafe awaitValue(&mut engine, context, result)
+}
+pub unsafe effect fn evalFile<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader, path: &[u8], evalFlags: i32) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  let loaded = run Effect.result(platform.readFile(path))
+  let source = match move loaded {
+    Result<List<u8>, OutOfMemoryError | platform.PlatformError>.Success { value } => move value
+    Result<List<u8>, OutOfMemoryError | platform.PlatformError>.Failure { error } => {
+      match move error {
+        OutOfMemoryError { .. } => { return run unsafe engine.throwOutOfMemory(context) }
+        platform.PlatformError { .. } => { return run unsafe engine.throwError(context, NativeErrorKind.Reference, b"could not load file") }
+      }
+    }
+  }
+  return run unsafe evalBuffer(&mut engine, context, source.asSlice(), path, evalFlags)
+}
+pub unsafe effect fn evalBinary<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader, bytes: &[u8], loadOnly: bool) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  let compiled = run unsafe reader.readObject(&mut engine, context, bytes, reader.BYTECODE)
+  let isModule = match compiled { Value.Module { .. } => true _ => false }
+  if isModule {
+    let prepared = run Effect.result(unsafe prepareBinary(&mut engine, context, compiled, loadOnly))
+    match move prepared {
+      Result<(), OutOfMemoryError | JsException>.Success { .. } => ()
+      Result<(), OutOfMemoryError | JsException>.Failure { error } => { unsafe owners.release(&mut engine, context, compiled) fail move error }
+    }
+  }
+  if loadOnly { return compiled }
+  let memory = engine.memory
+  let result = run unsafe evaluation.evaluateFunction(&mut engine, memory, context, compiled)
+  if isModule { return run unsafe awaitValue(&mut engine, context, result) }
+  return result
+}
+unsafe effect fn prepareBinary<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader, compiled: Value, loadOnly: bool) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  if !loadOnly {
+    let module = match compiled { Value.Module { reference } => reference _ => { return } }
+    let resolved = run Effect.result(unsafe loader.resolveModule(&mut engine, context, module))
+    match move resolved {
+      Result<(), OutOfMemoryError | StringLengthError | JsException>.Success { .. } => ()
+      Result<(), OutOfMemoryError | StringLengthError | JsException>.Failure { error } => { return run unsafe core.materialize(&mut engine, context, move error) }
+    }
+  }
+  run unsafe modules.setImportMeta(&mut engine, context, compiled, false, !loadOnly)
+}
+pub unsafe effect fn printArguments<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader, argc: i32, argv: &FrameSlots, flush: bool) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  let memory = engine.memory let mut index: i32 = 0
+  while index < argc {
+    if index != 0 { let written = unsafe stdio.write(unsafe stdio.output(), b" ") }
+    let bytes = run unsafe printing.printArgument(&mut engine, memory, context, unsafe argv.get(i32.toUsize(index)))
+    let written = unsafe stdio.write(unsafe stdio.output(), bytes.asSlice()) index = index + 1
+  }
+  let written = unsafe stdio.write(unsafe stdio.output(), b"\n")
+  if flush { let flushed = unsafe stdio.fflush(unsafe stdio.output()) }
+  return Value.Undefined
+}
+pub unsafe effect fn dumpValue<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader, value: Value) -> () ? &mut Allocator {
+  let memory = engine.memory
+  let printed = run Effect.result(unsafe printing.printValue(&mut engine, memory, context, value, Options.defaults()))
+  match move printed {
+    Result<List<u8>, OutOfMemoryError | JsException>.Success { value: bytes } => { let written = unsafe stdio.write(unsafe stdio.error(), bytes.asSlice()) }
+    Result<List<u8>, OutOfMemoryError | JsException>.Failure { .. } => ()
+  }
+  let written = unsafe stdio.write(unsafe stdio.error(), b"\n")
+}
+pub unsafe effect fn dumpError<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader) -> () ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  let exception = unsafe exceptions.take(rt)
+  run unsafe dumpValue(&mut engine, context, exception)
+  unsafe gc.release(&mut engine, rt, exception)
+}
+unsafe effect fn setHelper<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader, object: Value, name: &[u8], value: Value) -> () ! JsException ? &mut Allocator {
+  let assigned = run Effect.result(unsafe mutations.setPropertyStr(&mut engine, context, object, name, value))
+  match move assigned {
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { .. } => ()
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => { return run unsafe core.materialize(&mut engine, context, move error) }
+  }
+}
+unsafe effect fn defineHelper<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader, object: Value, name: &[u8], id: NativeFunctionId, length: i32) -> () ! JsException ? &mut Allocator {
+  let memory = engine.memory
+  let function = run unsafe functions.newFunction(&mut engine, memory, context, id, name, length, NativeCallProtocol.Generic, 0)
+  run unsafe setHelper(&mut engine, context, object, name, function)
+}
+unsafe effect fn helperBody<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader, args: &[&[u8]], includeArgs: bool, scope: &mut Scope) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  let memory = engine.memory let anchor = ()
+  let data = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  let global = data.globalObject drop data
+  scope.values[0] = run unsafe objects.object(&mut engine, memory, context)
+  run unsafe defineHelper(&mut engine, context, scope.values[0], b"log", NativeFunctionId.Host { id: CONSOLE_LOG }, 1)
+  run unsafe setHelper(&mut engine, context, global, b"console", scope.take(0))
+  scope.values[0] = run unsafe objects.object(&mut engine, memory, context)
+  run unsafe defineHelper(&mut engine, context, scope.values[0], b"now", NativeFunctionId.Builtin { family: BuiltinFamily.Os, method: 30 }, 0)
+  run unsafe setHelper(&mut engine, context, global, b"performance", scope.take(0))
+  if includeArgs {
+    scope.values[0] = run unsafe objects.array(&mut engine, memory, context)
+    let mut at: usize = 0
+    while at < args.length {
+      let created = run Effect.result(Strings.fromUtf8(args[at]))
+      let value = match move created {
+        Result<Value, OutOfMemoryError | StringLengthError>.Success { value } => value
+        Result<Value, OutOfMemoryError | StringLengthError>.Failure { error } => run unsafe core.materialize(&mut engine, context, move error)
+      }
+      let assigned = run Effect.result(unsafe mutations.setPropertyUint32(&mut engine, context, scope.values[0], usize.toU32(at), value))
+      match move assigned {
+        Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { .. } => ()
+        Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => { return run unsafe core.materialize(&mut engine, context, move error) }
+      }
+      at = at + 1
+    }
+    run unsafe setHelper(&mut engine, context, global, b"scriptArgs", scope.take(0))
+  }
+  run unsafe defineHelper(&mut engine, context, global, b"print", NativeFunctionId.Host { id: PRINT }, 1)
+  run unsafe defineHelper(&mut engine, context, global, b"__loadScript", NativeFunctionId.Builtin { family: BuiltinFamily.Std, method: 3 }, 1)
+}
+pub unsafe effect fn installHelpersBytes<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader, args: &[&[u8]]) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut scope = Scope.make()
+  let result = run Effect.result(unsafe helperBody(&mut engine, context, args, true, &mut scope))
+  unsafe owners.cleanup(&mut engine, context, move scope)
+  match move result { Result<(), OutOfMemoryError | JsException>.Success { .. } => () Result<(), OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
+}
+pub unsafe effect fn installHelpers<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader, args: &[string]) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut bytes = List<&[u8]>.make() let mut at: usize = 0
+  while at < args.length { run bytes.append(String.utf8Bytes(args[at])) at = at + 1 }
+  run unsafe installHelpersBytes(&mut engine, context, bytes.asSlice())
+}
+pub unsafe effect fn installWorkerHelpers<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut scope = Scope.make()
+  let empty: [&[u8]; 0] = []
+  let result = run Effect.result(unsafe helperBody(&mut engine, context, &empty, false, &mut scope))
+  unsafe owners.cleanup(&mut engine, context, move scope)
+  match move result { Result<(), OutOfMemoryError | JsException>.Success { .. } => () Result<(), OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
+}
+pub unsafe effect fn prepareWorker<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader, args: &mut WorkerStart) -> () ! JsException ? &mut Allocator {
+  run unsafe workerRuntime.prepareInContext(&mut engine, context, &mut args)
+}
+pub fn runWorker(args: WorkerStart) -> () { workerRuntime.runWorker(move args) }

@@ -1,0 +1,342 @@
+//! Native static registration and dlopen ownership for the versioned Silk plugin ABI.
+//! Registry is runtime-owned and MUST be dropped after its runtime, not at context
+//! teardown: a callback may outlive its originating module/realm. No descriptor,
+//! function pointer or plugin allocation is shared with worker runtimes.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.layout { Layout }
+import silk.list { List }
+import silk.option { Option }
+import silk.ownership { Drop }
+import silk.pointer { Pointer }
+import silk.result { Result }
+import silk.i32
+import silk.u32
+import silk.usize
+import js_heap { HeapHeader }
+import js_value { Value }
+import js_core_types { NativeFunctionId, NativeCallProtocol, NativeErrorKind, FrameSlots }
+import js_engine { Engine }
+import js_libc_services { LibcServices }
+import js_exceptions { JsException }
+import js_string_types { StringLengthError }
+import js_module_metadata { ModuleMetadataError }
+import js_coercion_host { CoercionHooks }
+import js_module_native as native
+import js_native_functions as functions
+import js_gc as gc
+import js_runtime as runtime
+import js_libc_plugins_abi as abi
+import js_libc_plugins_abi { Descriptor, Export }
+import js_libc_plugins_calls as calls
+
+pub const INITIALIZE_BASE: u32 = 0x4c400000
+pub const CALLBACK_BASE: u32 = 0x4c500000
+pub const CALLBACK_END: u32 = 0x4c600000
+pub struct NativeRegistration<'a> {
+  pub name: &'a [u8],
+  pub initialize: extern "C" fn(*mut Descriptor) -> i32
+}
+pub struct PluginError { pub code: i32, pub message: List<u8> }
+
+unsafe extern "C" fn dlopen(path: ?[*]const u8, flags: i32) -> ?*mut u8 with Intrinsic.foreign(noCapture: ("path",))
+unsafe extern "C" fn dlsym(handle: *mut u8, name: ?[*]const u8) -> ?*mut u8 with Intrinsic.foreign(noCapture: ("name",))
+unsafe extern "C" fn dlclose(handle: *mut u8) -> i32
+unsafe extern "C" fn dlerror() -> ?[*]const u8
+struct Library { handle: *mut u8 }
+impl Drop for Library {
+  fn drop(self: &mut Self) -> () { let ignored = unsafe dlclose(self.handle) }
+}
+struct Loaded {
+  descriptor: Descriptor,
+  library: Option<Library>,
+  exports: List<ExportName>
+}
+impl Drop for Loaded {
+  fn drop(self: &mut Self) -> () { unsafe self.descriptor.shutdown(self.descriptor.state) }
+}
+struct ExportName { name: List<u8>, kind: u32, arity: i32 }
+struct Registration {
+  name: List<u8>,
+  factory: Option<extern "C" fn(*mut Descriptor) -> i32>,
+  declaration: bool,
+  used: bool,
+  loaded: Option<Loaded>,
+  callbackBase: u32
+}
+pub struct Registry { entries: List<Registration>, nextCallback: u32 }
+impl Registry {
+  pub fn make() -> Self { return Registry { entries: List<Registration>.make(), nextCallback: CALLBACK_BASE } }
+}
+fn same(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length { return false }
+  let mut i: usize = 0 while i < a.length { if a[i] != b[i] { return false } i = i + 1 } return true
+}
+effect fn copy(bytes: &[u8]) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut result = List<u8>.make() run result.reserveExact(bytes.length)
+  let mut i: usize = 0 while i < bytes.length { run result.append(bytes[i]) i = i + 1 } return move result
+}
+effect fn problem(code: i32, message: &[u8]) -> never ! OutOfMemoryError | PluginError ? &mut Allocator {
+  fail PluginError { code: code, message: run copy(message) }
+}
+fn index(registry: &Registry, name: &[u8]) -> usize {
+  let mut i: usize = 0 while i < registry.entries.length() {
+    if same(registry.entries.asSlice()[i].name.asSlice(), name) { return i } i = i + 1
+  } return registry.entries.length()
+}
+pub fn isDeclared(engine: &Engine<LibcServices>, name: &[u8]) -> bool {
+  return index(&engine.services.plugins, name) < engine.services.plugins.entries.length()
+}
+pub fn wasLoaded(engine: &Engine<LibcServices>, name: &[u8]) -> bool {
+  let at = index(&engine.services.plugins, name)
+  return at < engine.services.plugins.entries.length() && engine.services.plugins.entries.asSlice()[at].used
+}
+pub effect fn declareNative(engine: &mut Engine<LibcServices>, name: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  if isDeclared(&engine, name) { return () }
+  run engine.services.plugins.entries.append(Registration { name: run copy(name),
+    factory: Option<extern "C" fn(*mut Descriptor) -> i32>.none(), declaration: true,
+    used: false, loaded: Option<Loaded>.none(), callbackBase: 0 })
+}
+pub effect fn register(engine: &mut Engine<LibcServices>, name: &[u8],
+  initialize: extern "C" fn(*mut Descriptor) -> i32) -> () ! OutOfMemoryError | PluginError ? &mut Allocator {
+  let at = index(&engine.services.plugins, name)
+  if at < engine.services.plugins.entries.length() {
+    let item = &mut engine.services.plugins.entries.asMutSlice()[at]
+    if !item.declaration { run problem(1, b"native module already registered") }
+    item.factory = Option<extern "C" fn(*mut Descriptor) -> i32>.some(initialize)
+    item.declaration = false return ()
+  }
+  run engine.services.plugins.entries.append(Registration { name: run copy(name),
+    factory: Option<extern "C" fn(*mut Descriptor) -> i32>.some(initialize), declaration: false,
+    used: false, loaded: Option<Loaded>.none(), callbackBase: 0 })
+}
+/// Clone configuration only. Factories and dlopen run lazily in the worker thread.
+pub effect fn cloneRegistry(source: &Registry) -> Registry ! OutOfMemoryError | PluginError ? &mut Allocator {
+  let mut result = Registry.make() let mut i: usize = 0
+  while i < source.entries.length() {
+    let item = &source.entries.asSlice()[i]
+    let factory = match &item.factory {
+      Option<extern "C" fn(*mut Descriptor) -> i32>.Some { value } => Option<extern "C" fn(*mut Descriptor) -> i32>.some(value)
+      _ => Option<extern "C" fn(*mut Descriptor) -> i32>.none()
+    }
+    run result.entries.append(Registration { name: run copy(item.name.asSlice()), factory: move factory,
+      declaration: item.declaration, used: false, loaded: Option<Loaded>.none(), callbackBase: 0 })
+    i = i + 1
+  } return move result
+}
+unsafe effect fn dynamicError() -> never ! OutOfMemoryError | PluginError ? &mut Allocator {
+  let text = unsafe dlerror() let mut message = List<u8>.make()
+  match Pointer.nonNullMany<u8>(text) {
+    Option<[*]const u8>.Some { value } => {
+      let mut i: usize = 0
+      while true { let byte = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(value, i))
+        if byte == 0 { break } run message.append(byte) i = i + 1 }
+    }
+    _ => { message = run copy(b"native plugin dynamic loader failure") }
+  }
+  fail PluginError { code: 2, message: move message }
+}
+unsafe effect fn openLibrary(name: &[u8]) -> Library ! OutOfMemoryError | PluginError ? &mut Allocator {
+  let mut path = List<u8>.make() let mut hasSlash = false let mut i: usize = 0
+  while i < name.length {
+    if name[i] == 0 { run problem(3, b"native module path contains NUL") }
+    if name[i] == 47 { hasSlash = true } i = i + 1
+  }
+  // Match quickjs-libc: bare shared-object names refer to the current directory.
+  if !hasSlash { run path.append(46) run path.append(47) }
+  i = 0 while i < name.length { run path.append(name[i]) i = i + 1 } run path.append(0)
+  let mut flags: i32 = 2 // RTLD_NOW | RTLD_LOCAL (LOCAL is zero on ELF).
+  static if Intrinsic.targetOperatingSystem() == "darwin" { flags = flags | 4 }
+  let opened = unsafe dlopen(Pointer.fromSlice(path.asSlice()), flags)
+  match Pointer.nonNullMut<u8>(opened) {
+    Option<*mut u8>.Some { value } => { return Library { handle: value } }
+    _ => { return run unsafe dynamicError() }
+  }
+}
+unsafe fn descriptorFactory(address: *mut u8) -> extern "C" fn(*mut Descriptor) -> i32 {
+  // POSIX specifies dlsym's conversion to a function pointer. Read its pointer
+  // representation; pointerReinterpret itself admits only data-pointer types.
+  let bits = address
+  let slot = unsafe Intrinsic.pointerReinterpret<*const *mut u8, *const extern "C" fn(*mut Descriptor) -> i32>(Pointer.fromRef(&bits))
+  return unsafe Pointer.read<extern "C" fn(*mut Descriptor) -> i32>(slot)
+}
+unsafe effect fn createLoaded(item: &Registration) -> Loaded ! OutOfMemoryError | PluginError ? &mut Allocator {
+  let mut library = Option<Library>.none()
+  let mut selected = Option<extern "C" fn(*mut Descriptor) -> i32>.none()
+  match &item.factory {
+    Option<extern "C" fn(*mut Descriptor) -> i32>.Some { value } => {
+      selected = Option<extern "C" fn(*mut Descriptor) -> i32>.some(value)
+    }
+    _ => {
+      let opened = run unsafe openLibrary(item.name.asSlice())
+      let cleared = unsafe dlerror()
+      let symbol = unsafe dlsym(opened.handle, Pointer.fromSlice(b"silkjs_plugin_v1\0"))
+      let address = match Pointer.nonNullMut<u8>(symbol) {
+        Option<*mut u8>.Some { value } => value
+        _ => { return run unsafe dynamicError() }
+      }
+      let initialize = unsafe descriptorFactory(address)
+      library = Option<Library>.some(move opened)
+      selected = Option<extern "C" fn(*mut Descriptor) -> i32>.some(initialize)
+    }
+  }
+  let factory = match move selected {
+    Option<extern "C" fn(*mut Descriptor) -> i32>.Some { value } => value
+    _ => Intrinsic.trap("native plugin factory was not selected")
+  }
+  let storage = unsafe Intrinsic.stackAllocate<Descriptor>(1)
+  let pointer = unsafe Pointer.atMut<Descriptor>(storage, 0)
+  let status = unsafe factory(pointer)
+  if status != 0 { run problem(status, b"native plugin initialization failed") }
+  let descriptor = unsafe Pointer.read<Descriptor>(pointer)
+  // A successful factory owns state even if its version is rejected.
+  let mut loaded = Loaded { descriptor: descriptor, library: move library, exports: List<ExportName>.make() }
+  if descriptor.version != abi.VERSION || descriptor.byteSize != Layout.of<Descriptor>().bytes {
+    run problem(4, b"incompatible SilkJS native plugin ABI")
+  }
+  if descriptor.exportCount > 0x100000 { run problem(5, b"too many native plugin exports") }
+  let mut i: u32 = 0
+  while i < descriptor.exportCount {
+    let output = unsafe Intrinsic.stackAllocate<Export>(1)
+    let p = unsafe Pointer.atMut<Export>(output, 0)
+    if unsafe descriptor.describe(descriptor.state, i, p) != 0 { run problem(6, b"native plugin export declaration failed") }
+    let record = unsafe Pointer.read<Export>(p)
+    if record.kind != abi.FUNCTION && record.kind != abi.VALUE { run problem(7, b"invalid native plugin export kind") }
+    if record.arity < 0 || record.arity > 255 { run problem(8, b"invalid native plugin function arity") }
+    let mut name = List<u8>.make()
+    if record.nameLength != 0 {
+      let data = match Pointer.nonNullMany<u8>(record.name) {
+        Option<[*]const u8>.Some { value } => value
+        _ => { run problem(9, b"null native plugin export name") }
+      }
+      run name.reserveExact(record.nameLength) let mut j: usize = 0
+      while j < record.nameLength {
+        let byte = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(data, j))
+        if byte == 0 { run problem(10, b"native plugin export name contains NUL") }
+        run name.append(byte) j = j + 1
+      }
+    }
+    let mut j: usize = 0 while j < loaded.exports.length() {
+      if same(name.asSlice(), loaded.exports.asSlice()[j].name.asSlice()) { run problem(11, b"duplicate native plugin export") } j = j + 1
+    }
+    run loaded.exports.append(ExportName { name: move name, kind: record.kind, arity: record.arity }) i = i + 1
+  } return move loaded
+}
+unsafe effect fn ensureLoaded(registry: &mut Registry, at: usize) -> () ! OutOfMemoryError | PluginError ? &mut Allocator {
+  match &registry.entries.asSlice()[at].loaded { Option<Loaded>.Some { .. } => { return () } _ => () }
+  let loaded = run unsafe createLoaded(&registry.entries.asSlice()[at])
+  let count = loaded.descriptor.exportCount
+  if count > CALLBACK_END - registry.nextCallback { run problem(12, b"native plugin callback namespace exhausted") }
+  let base = registry.nextCallback registry.nextCallback = base + count
+  let item = &mut registry.entries.asMutSlice()[at] item.callbackBase = base item.loaded = Option<Loaded>.some(move loaded)
+}
+unsafe effect fn loadInternal(engine: &mut Engine<LibcServices>, context: *mut HeapHeader, name: &[u8]) -> *mut HeapHeader
+  ! OutOfMemoryError | PluginError | StringLengthError | ModuleMetadataError ? &mut Allocator {
+  let mut at = index(&engine.services.plugins, name)
+  if at == engine.services.plugins.entries.length() {
+    run engine.services.plugins.entries.append(Registration { name: run copy(name),
+      factory: Option<extern "C" fn(*mut Descriptor) -> i32>.none(), declaration: false,
+      used: false, loaded: Option<Loaded>.none(), callbackBase: 0 })
+  }
+  if at >= 0x100000 { run problem(12, b"native plugin module namespace exhausted") }
+  let declared = engine.services.plugins.entries.asSlice()[at].declaration || engine.services.captureModules
+  if !declared { run unsafe ensureLoaded(&mut engine.services.plugins, at) }
+  let module = run unsafe native.newNativeModule(context, name, NativeFunctionId.Host { id: INITIALIZE_BASE + usize.toU32(at) })
+  let loadedEntry = &mut engine.services.plugins.entries.asMutSlice()[at]
+  loadedEntry.used = true
+  drop loadedEntry
+  if declared { return module }
+  let adding = run Effect.result(unsafe addExports(&mut engine, context, module, at))
+  match move adding {
+    Result<(), OutOfMemoryError | StringLengthError | ModuleMetadataError>.Success { .. } => { return module }
+    Result<(), OutOfMemoryError | StringLengthError | ModuleMetadataError>.Failure { error } => {
+      unsafe gc.releaseHeader(&mut engine, unsafe runtime.contextRuntime(context), module) fail move error
+    }
+  }
+}
+unsafe effect fn addExports(engine: &mut Engine<LibcServices>, context: *mut HeapHeader, module: *mut HeapHeader, at: usize) -> ()
+  ! OutOfMemoryError | StringLengthError | ModuleMetadataError ? &mut Allocator {
+  match &engine.services.plugins.entries.asSlice()[at].loaded {
+    Option<Loaded>.Some { value } => {
+      let mut i: usize = 0 while i < value.exports.length() {
+        run unsafe native.addModuleExport(context, module, value.exports.asSlice()[i].name.asSlice()) i = i + 1
+      }
+    }
+    _ => ()
+  }
+}
+pub unsafe effect fn load(engine: &mut Engine<LibcServices>, context: *mut HeapHeader, name: &[u8]) -> *mut HeapHeader
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let result = run Effect.result(unsafe loadInternal(&mut engine, context, name))
+  return match move result {
+    Result<*mut HeapHeader, OutOfMemoryError | PluginError | StringLengthError | ModuleMetadataError>.Success { value } => value
+    Result<*mut HeapHeader, OutOfMemoryError | PluginError | StringLengthError | ModuleMetadataError>.Failure { error } => {
+      match move error {
+        OutOfMemoryError allocation => { fail move allocation }
+        PluginError { code, message } => { return run unsafe engine.throwError(context, NativeErrorKind.Reference, message.asSlice()) }
+        _ => { return run unsafe engine.throwError(context, NativeErrorKind.Internal, b"native module export declaration failed") }
+      }
+    }
+  }
+}
+pub unsafe effect fn initialize(engine: &mut Engine<LibcServices>, context: *mut HeapHeader, id: u32, module: *mut HeapHeader) -> ()
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  if id < INITIALIZE_BASE || id >= CALLBACK_BASE { return Intrinsic.trap("unregistered native plugin initializer") }
+  let at = u32.toUsize(id - INITIALIZE_BASE)
+  if at >= engine.services.plugins.entries.length() { return Intrinsic.trap("unregistered native plugin initializer") }
+  if engine.services.plugins.entries.asSlice()[at].declaration {
+    return run unsafe engine.throwError(context, NativeErrorKind.Reference, b"compile-only native module declaration cannot be executed")
+  }
+  let descriptor = match &engine.services.plugins.entries.asSlice()[at].loaded {
+    Option<Loaded>.Some { value } => value.descriptor
+    _ => { return Intrinsic.trap("unregistered native plugin initializer") }
+  }
+  let base = engine.services.plugins.entries.asSlice()[at].callbackBase let memory = engine.memory
+  let mut i: u32 = 0 while i < descriptor.exportCount {
+    // Export records live in a finalized, non-growing list allocation. Reentrant
+    // loads may move registry entries, but cannot move or replace this backing.
+    let address = match &engine.services.plugins.entries.asSlice()[at].loaded {
+      Option<Loaded>.Some { value } => Pointer.fromRef(&value.exports.asSlice()[u32.toUsize(i)])
+      _ => { return Intrinsic.trap("unregistered native plugin initializer") }
+    }
+    let anchor = () let entry = unsafe Pointer.borrow<(), ExportName>(&anchor, address)
+    let mut value = Value.Undefined
+    if entry.kind == abi.FUNCTION {
+      value = run unsafe functions.newFunction(&mut engine, memory, context, NativeFunctionId.Host { id: base + i }, entry.name.asSlice(), entry.arity, NativeCallProtocol.Generic, 0)
+    } else {
+      let empty = FrameSlots.Borrowed { data: unsafe Intrinsic.pointerRequalify<[*]mut Value, *mut Value>(unsafe Intrinsic.stackAllocate<Value>(0)), length: 0 }
+      value = run unsafe calls.invoke(&mut engine, context, descriptor, i, Value.Undefined, 0, &empty)
+    }
+    let assigned = run Effect.result(unsafe native.setModuleExport(&mut engine, context, module, entry.name.asSlice(), value))
+    match move assigned {
+      Result<bool, OutOfMemoryError | StringLengthError>.Success { value: accepted } => {
+        if !accepted { return run unsafe engine.throwError(context, NativeErrorKind.Internal, b"missing native plugin export") }
+      }
+      Result<bool, OutOfMemoryError | StringLengthError>.Failure { error } => {
+        match move error { OutOfMemoryError allocation => { fail move allocation } _ => { return run unsafe engine.throwError(context, NativeErrorKind.Internal, b"native export name too long") } }
+      }
+    } i = i + 1
+  }
+}
+pub unsafe effect fn dispatch(engine: &mut Engine<LibcServices>, context: *mut HeapHeader, id: u32,
+  receiver: Value, argc: i32, argv: &FrameSlots) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut descriptor = Option<Descriptor>.none() let mut exportIndex: u32 = 0 let mut at: usize = 0
+  while at < engine.services.plugins.entries.length() {
+    let item = &engine.services.plugins.entries.asSlice()[at]
+    match &item.loaded {
+      Option<Loaded>.Some { value } => {
+        if id >= item.callbackBase && id - item.callbackBase < value.descriptor.exportCount {
+          exportIndex = id - item.callbackBase
+          if value.exports.asSlice()[u32.toUsize(exportIndex)].kind != abi.FUNCTION { return Intrinsic.trap("unregistered native plugin callback") }
+          descriptor = Option<Descriptor>.some(value.descriptor) break
+        }
+      }
+      _ => ()
+    } at = at + 1
+  }
+  let plugin = match move descriptor {
+    Option<Descriptor>.Some { value } => value
+    _ => { return Intrinsic.trap("unregistered native plugin callback") }
+  }
+  return run unsafe calls.invoke(&mut engine, context, plugin, exportIndex, receiver, i32.toU32(argc), argv)
+}

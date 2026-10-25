@@ -1,0 +1,623 @@
+//! Object constructor, static and prototype entrypoints, quickjs.c:40869-41895,
+//! groupBy:54760-54875. Inputs borrow, successful Values own. Installation stays
+//! lazy in the intrinsic function-list owner. Method numbers are stable dispatch
+//! IDs, not a second Runtime callback range. Reflect variants retain source magic.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.list { List }
+import silk.pointer { Pointer }
+import silk.u32
+import silk.usize
+import silk.i64
+import silk.f64
+import runtime_memory { AllocationObserver }
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types { ContextState, RuntimeState, ObjectData, StackFrame, FrameSlots, PropertyEnum, PropertyDescriptor,
+  NativeErrorKind, JS_PROP_C_W_E, JS_PROP_THROW, JS_PROP_GETSET, JS_PROP_ENUMERABLE,
+  JS_PROP_CONFIGURABLE, JS_PROP_WRITABLE, JS_PROP_HAS_CONFIGURABLE,
+  JS_PROP_HAS_WRITABLE, JS_PROP_HAS_ENUMERABLE, JS_PROP_HAS_GET, JS_PROP_HAS_SET }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_class_data as classes
+import js_atom_data as atoms
+import js_coercion_host { CoercionHooks }
+import js_property_host { OwnPropertyHooks, HasPropertyHooks, GetPropertyHooks, OwnKeysHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_prototype_host { PrototypeHooks }
+import js_call_host { CallHooks }
+import js_native_function_host { NativeFunctionHooks }
+import js_interrupt_host { InterruptHooks }
+import js_interrupts as interrupts
+import js_property_names { OwnKeysError }
+import js_property_names as names
+import js_property_descriptors as descriptors
+import js_property_descriptor_values as descriptorValues
+import js_property_mutations as properties
+import js_property_ownership { releaseDescriptor }
+import js_prototypes { PrototypeError }
+import js_prototypes as prototypes
+import js_constructor_ops as constructors
+import js_boxing as boxing
+import js_object_allocate as objects
+import js_coercions as coercions
+import js_proxy_core as core
+import js_proxy as proxy
+import js_copy_data_properties as copying
+import js_iterators as iterators
+import js_strings { StringBuilder, Strings }
+import js_string_types { StringLengthError }
+import js_bigint { BigIntError }
+import js_exceptions { JsException }
+
+pub const CONSTRUCTOR: u32 = 0
+pub const CREATE: u32 = 1
+pub const GET_PROTOTYPE_OF: u32 = 2
+pub const SET_PROTOTYPE_OF: u32 = 3
+pub const DEFINE_PROPERTY: u32 = 4
+pub const DEFINE_PROPERTIES: u32 = 5
+pub const GET_OWN_PROPERTY_NAMES: u32 = 6
+pub const GET_OWN_PROPERTY_SYMBOLS: u32 = 7
+pub const GROUP_BY: u32 = 8
+pub const KEYS: u32 = 9
+pub const VALUES: u32 = 10
+pub const ENTRIES: u32 = 11
+pub const IS_EXTENSIBLE: u32 = 12
+pub const PREVENT_EXTENSIONS: u32 = 13
+pub const GET_OWN_PROPERTY_DESCRIPTOR: u32 = 14
+pub const GET_OWN_PROPERTY_DESCRIPTORS: u32 = 15
+pub const IS: u32 = 16
+pub const ASSIGN: u32 = 17
+pub const SEAL: u32 = 18
+pub const FREEZE: u32 = 19
+pub const IS_SEALED: u32 = 20
+pub const IS_FROZEN: u32 = 21
+pub const FROM_ENTRIES: u32 = 22
+pub const HAS_OWN: u32 = 23
+pub const TO_STRING: u32 = 24
+pub const TO_LOCALE_STRING: u32 = 25
+pub const VALUE_OF: u32 = 26
+pub const HAS_OWN_PROPERTY: u32 = 27
+pub const IS_PROTOTYPE_OF: u32 = 28
+pub const PROPERTY_IS_ENUMERABLE: u32 = 29
+pub const GET_PROTO: u32 = 30
+pub const SET_PROTO: u32 = 31
+pub const DEFINE_GETTER: u32 = 32
+pub const DEFINE_SETTER: u32 = 33
+pub const LOOKUP_GETTER: u32 = 34
+pub const LOOKUP_SETTER: u32 = 35
+pub const REFLECT_GET_PROTOTYPE_OF: u32 = 36
+pub const REFLECT_DEFINE_PROPERTY: u32 = 37
+pub const REFLECT_IS_EXTENSIBLE: u32 = 38
+pub const REFLECT_PREVENT_EXTENSIONS: u32 = 39
+pub const REFLECT_GET_OWN_PROPERTY_DESCRIPTOR: u32 = 40
+
+fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+fn nullish(value: Value) -> bool { return match value { Value.Null => true Value.Undefined => true _ => false } }
+fn null(value: Value) -> bool { return match value { Value.Null => true _ => false } }
+fn boolean(value: bool) -> Value { return Value.Bool { value: value } }
+unsafe fn argument(argv: &FrameSlots, index: usize) -> Value {
+  if index >= argv.length() { return Value.Undefined }
+  return unsafe argv.get(index)
+}
+unsafe fn classId(value: Value) -> u32 {
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(value))
+  return object.classId
+}
+unsafe effect fn uninitialized<H: OwnPropertyHooks>(hooks: &mut H, context: *mut HeapHeader,
+  atom: u32) -> Value ! JsException ? &mut Allocator {
+  return run unsafe hooks.throwUninitialized(context, atom)
+}
+unsafe effect fn materialize<H: CoercionHooks + OwnPropertyHooks>(hooks: &mut H, context: *mut HeapHeader,
+  error: OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | PrototypeError | JsException) -> never ! JsException ? &mut Allocator {
+  match move error {
+    OwnKeysError keys => {
+      match move keys {
+        OwnKeysError.NotObject => { return run unsafe core.error(&mut hooks, context, b"not an object") }
+        OwnKeysError.Uninitialized { name } => {
+          let rt = unsafe runtime.contextRuntime(context)
+          let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+          let interned = run Effect.result(state.atoms.internOwned(unsafe name.get().retained())) drop state
+          let atom = match move interned {
+            Result<u32, OutOfMemoryError>.Success { value } => value
+            Result<u32, OutOfMemoryError>.Failure { .. } => { return run unsafe hooks.throwOutOfMemory(context) }
+          }
+          let thrown = run Effect.catch<JsException>(unsafe uninitialized(&mut hooks, context, atom), core.exceptionValue)
+          unsafe properties.releaseAtom(rt, atom)
+          fail JsException {}
+        }
+      }
+    }
+    PrototypeError prototype => { return run unsafe core.error(&mut hooks, context, prototype.message()) }
+    OutOfMemoryError allocation => { return run unsafe hooks.throwOutOfMemory(context) }
+    StringLengthError length => { return run unsafe hooks.throwError(context, NativeErrorKind.Internal, b"string too long") }
+    BigIntError impossible => invariant()
+    JsException signal => { fail move signal }
+  }
+}
+// Fixed roots require no allocation. Keys/collected descriptors allocate only for
+// the source algorithms that snapshot them. Every failure leaves these owners
+// here until the pending exception has been installed.
+struct Scope {
+  values: [Value; 8], atom: u32, keys: List<PropertyEnum>, collected: List<Value>, close: bool
+}
+impl Scope {
+  fn make() -> Self { return Self { values: [Value.Undefined; 8], atom: 0,
+    keys: List<PropertyEnum>.make(), collected: List<Value>.make(), close: false } }
+  fn take(self: &mut Self, index: usize) -> Value {
+    let value = self.values[index] self.values[index] = Value.Undefined return value
+  }
+}
+unsafe fn clear<H: HeapHooks>(hooks: &mut H, context: *mut HeapHeader, scope: &mut Scope, index: usize) -> () {
+  unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), scope.take(index))
+}
+unsafe effect fn defineDescriptor<H: HeapHooks + OwnPropertyHooks + HasPropertyHooks + GetPropertyHooks + OwnKeysHooks + CoercionHooks + PropertyWriteHooks + PrototypeHooks + CallHooks + NativeFunctionHooks + InterruptHooks>(hooks: &mut H, context: *mut HeapHeader,
+  object: Value, atom: u32, input: Value, flags: u32) -> bool ! JsException ? &mut Allocator {
+  let desc = run unsafe descriptorValues.toPropertyDescriptor(&mut hooks, context, input)
+  let attempted = run Effect.result(unsafe properties.defineProperty(&mut hooks, context, object,
+    atom, desc.value, desc.getter, desc.setter, desc.flags | flags))
+  let result = match move attempted {
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { value } => value
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => {
+      let pending = run Effect.catch<JsException>(unsafe core.materialize(&mut hooks, context, move error), core.exceptionValue)
+      unsafe releaseDescriptor(&mut hooks, unsafe runtime.contextRuntime(context), move desc)
+      fail JsException {}
+    }
+  }
+  unsafe releaseDescriptor(&mut hooks, unsafe runtime.contextRuntime(context), move desc)
+  return result
+}
+unsafe effect fn descriptorObject<H: HeapHooks + OwnPropertyHooks + HasPropertyHooks + GetPropertyHooks + OwnKeysHooks + CoercionHooks + PropertyWriteHooks + PrototypeHooks + CallHooks + NativeFunctionHooks + InterruptHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, object: Value, atom: u32, scope: &mut Scope) -> Value ! OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | PrototypeError | JsException ? &mut Allocator {
+  let found = run unsafe descriptors.getOwnProperty(&mut hooks, context, object, atom)
+  match move found {
+    Option<PropertyDescriptor>.None => { return Value.Undefined }
+    Option<PropertyDescriptor>.Some { value: desc } => {
+      // This source path checks every definition, unlike js_create_desc's ignored
+      // errors. Keep the actual descriptor alive across allocation and callbacks.
+      let result = run Effect.result(unsafe descriptorFields(&mut hooks, memory, context, &desc, &mut scope))
+      let value = match move result {
+        Result<Value, OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | PrototypeError | JsException>.Success { value } => value
+        Result<Value, OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | PrototypeError | JsException>.Failure { error } => {
+          let pending = run Effect.catch<JsException>(unsafe materialize(&mut hooks, context, move error), core.exceptionValue)
+          unsafe releaseDescriptor(&mut hooks, unsafe runtime.contextRuntime(context), move desc)
+          fail JsException {}
+        }
+      }
+      unsafe releaseDescriptor(&mut hooks, unsafe runtime.contextRuntime(context), move desc)
+      return value
+    }
+  }
+}
+unsafe effect fn descriptorFields<H: HeapHooks + OwnPropertyHooks + HasPropertyHooks + GetPropertyHooks + OwnKeysHooks + CoercionHooks + PropertyWriteHooks + PrototypeHooks + CallHooks + NativeFunctionHooks + InterruptHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, desc: &PropertyDescriptor, scope: &mut Scope) -> Value ! OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | PrototypeError | JsException ? &mut Allocator {
+  scope.values[7] = run unsafe objects.object(&mut hooks, memory, context)
+  let object = scope.values[7] let flags = JS_PROP_C_W_E | JS_PROP_THROW
+  if (desc.flags & JS_PROP_GETSET) != 0 {
+    let a = run unsafe core.defineValue(&mut hooks, context, object, atoms.JS_ATOM_get, unsafe desc.getter.retained(), flags)
+    let b = run unsafe core.defineValue(&mut hooks, context, object, atoms.JS_ATOM_set, unsafe desc.setter.retained(), flags)
+  } else {
+    let a = run unsafe core.defineValue(&mut hooks, context, object, atoms.JS_ATOM_value, unsafe desc.value.retained(), flags)
+    let b = run unsafe core.defineValue(&mut hooks, context, object, atoms.JS_ATOM_writable, boolean((desc.flags & JS_PROP_WRITABLE) != 0), flags)
+  }
+  let c = run unsafe core.defineValue(&mut hooks, context, object, atoms.JS_ATOM_enumerable, boolean((desc.flags & JS_PROP_ENUMERABLE) != 0), flags)
+  let d = run unsafe core.defineValue(&mut hooks, context, object, atoms.JS_ATOM_configurable, boolean((desc.flags & JS_PROP_CONFIGURABLE) != 0), flags)
+  return scope.take(7)
+}
+unsafe effect fn definePropertiesBody<H: HeapHooks + OwnPropertyHooks + HasPropertyHooks + GetPropertyHooks + OwnKeysHooks + CoercionHooks + PropertyWriteHooks + PrototypeHooks + CallHooks + NativeFunctionHooks + InterruptHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, object: Value, input: Value, scope: &mut Scope) -> () ! OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | PrototypeError | JsException ? &mut Allocator {
+  if !object.isObject() { return run unsafe core.error(&mut hooks, context, b"not an object") }
+  scope.values[1] = run unsafe boxing.toObject(&mut hooks, memory, context, input)
+  scope.keys = run unsafe names.getOwnPropertyNames(&mut hooks, context, scope.values[1], 3)
+  run scope.collected.reserveExact(scope.keys.length())
+  let mut i: usize = 0
+  while i < scope.keys.length() { run scope.collected.append(Value.Undefined) i = i + 1 }
+  i = 0
+  while i < scope.keys.length() {
+    let mut key = scope.keys.get(i)
+    key.isEnumerable = false
+    let found = run unsafe descriptors.getOwnProperty(&mut hooks, context, scope.values[1], key.atom)
+    match move found {
+      Option<PropertyDescriptor>.None => ()
+      Option<PropertyDescriptor>.Some { value: desc } => {
+        key.isEnumerable = (desc.flags & JS_PROP_ENUMERABLE) != 0
+        unsafe releaseDescriptor(&mut hooks, unsafe runtime.contextRuntime(context), move desc)
+      }
+    }
+    scope.keys.set(i, key)
+    if key.isEnumerable {
+      let value = run unsafe hooks.getProperty(context, scope.values[1], key.atom)
+      scope.collected.set(i, value)
+    }
+    i = i + 1
+  }
+  // Source collects descriptor OBJECTS before conversion, not converted records.
+  i = 0
+  while i < scope.keys.length() {
+    let key = scope.keys.get(i)
+    if key.isEnumerable { let accepted = run unsafe defineDescriptor(&mut hooks, context, object, key.atom, scope.collected.get(i), JS_PROP_THROW) }
+    i = i + 1
+  }
+}
+unsafe effect fn enumerate<H: HeapHooks + OwnPropertyHooks + HasPropertyHooks + GetPropertyHooks + OwnKeysHooks + CoercionHooks + PropertyWriteHooks + PrototypeHooks + CallHooks + NativeFunctionHooks + InterruptHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, input: Value, method: u32, scope: &mut Scope) -> Value ! OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | PrototypeError | JsException ? &mut Allocator {
+  scope.values[0] = run unsafe boxing.toObject(&mut hooks, memory, context, input)
+  let mut flags: u32 = 1
+  if method == GET_OWN_PROPERTY_SYMBOLS { flags = 2 }
+  if method == GET_OWN_PROPERTY_DESCRIPTORS { flags = 3 }
+  scope.keys = run unsafe names.getOwnPropertyNames(&mut hooks, context, scope.values[0], flags)
+  if method == GET_OWN_PROPERTY_DESCRIPTORS { scope.values[1] = run unsafe objects.object(&mut hooks, memory, context) }
+  else { scope.values[1] = run unsafe objects.array(&mut hooks, memory, context) }
+  let mut i: usize = 0 let mut j: u32 = 0
+  while i < scope.keys.length() {
+    let atom = scope.keys.get(i).atom i = i + 1
+    if method == GET_OWN_PROPERTY_DESCRIPTORS {
+      // Retain source AtomToValue/ValueToAtom conversions, including their OOM.
+      scope.values[2] = run unsafe core.atomValue(&mut hooks, context, atom)
+      scope.atom = run unsafe coercions.valueToAtom(&mut hooks, context, scope.values[2])
+      scope.values[3] = run unsafe descriptorObject(&mut hooks, memory, context, scope.values[0], scope.atom, &mut scope)
+      unsafe properties.releaseAtom(unsafe runtime.contextRuntime(context), scope.atom) scope.atom = 0
+      unsafe clear(&mut hooks, context, &mut scope, 2)
+      if !core.undefined(scope.values[3]) {
+        let accepted = run unsafe properties.definePropertyValue(&mut hooks, context, scope.values[1], atom, scope.take(3), JS_PROP_C_W_E | JS_PROP_THROW)
+      }
+      continue
+    }
+    if method == KEYS || method == VALUES || method == ENTRIES {
+      let found = run unsafe descriptors.getOwnProperty(&mut hooks, context, scope.values[0], atom)
+      let mut enumerable = false
+      match move found {
+        Option<PropertyDescriptor>.None => ()
+        Option<PropertyDescriptor>.Some { value: desc } => {
+          enumerable = (desc.flags & JS_PROP_ENUMERABLE) != 0
+          unsafe releaseDescriptor(&mut hooks, unsafe runtime.contextRuntime(context), move desc)
+        }
+      }
+      if !enumerable { continue }
+    }
+    if method == VALUES { scope.values[2] = run unsafe hooks.getProperty(context, scope.values[0], atom) }
+    else if method == ENTRIES {
+      scope.values[2] = run unsafe objects.array(&mut hooks, memory, context)
+      let key = run unsafe core.atomValue(&mut hooks, context, atom)
+      let a = run unsafe properties.definePropertyValueUint32(&mut hooks, context, scope.values[2], 0, key, JS_PROP_C_W_E | JS_PROP_THROW)
+      let value = run unsafe hooks.getProperty(context, scope.values[0], atom)
+      let b = run unsafe properties.definePropertyValueUint32(&mut hooks, context, scope.values[2], 1, value, JS_PROP_C_W_E | JS_PROP_THROW)
+    } else { scope.values[2] = run unsafe core.atomValue(&mut hooks, context, atom) }
+    let accepted = run unsafe properties.definePropertyValueUint32(&mut hooks, context, scope.values[1], j, scope.take(2), JS_PROP_C_W_E)
+    j = j + 1
+  }
+  return scope.take(1)
+}
+
+unsafe effect fn integrity<H: HeapHooks + OwnPropertyHooks + HasPropertyHooks + GetPropertyHooks + OwnKeysHooks + CoercionHooks + PropertyWriteHooks + PrototypeHooks + CallHooks + NativeFunctionHooks + InterruptHooks>(hooks: &mut H, context: *mut HeapHeader,
+  object: Value, method: u32, scope: &mut Scope) -> Value ! OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | PrototypeError | JsException ? &mut Allocator {
+  let check = method == IS_SEALED || method == IS_FROZEN
+  let frozen = method == FREEZE || method == IS_FROZEN
+  if !object.isObject() { if check { return boolean(true) } return unsafe object.retained() }
+  if !check {
+    let accepted = run unsafe prototypes.preventExtensions(&mut hooks, context, object)
+    if !accepted { return run unsafe core.error(&mut hooks, context, b"proxy preventExtensions handler returned false") }
+  }
+  scope.keys = run unsafe names.getOwnPropertyNames(&mut hooks, context, object, 3)
+  let mut i: usize = 0
+  while i < scope.keys.length() {
+    let atom = scope.keys.get(i).atom i = i + 1
+    let mut flags = JS_PROP_THROW | JS_PROP_HAS_CONFIGURABLE
+    if check || frozen {
+      let found = run unsafe descriptors.getOwnProperty(&mut hooks, context, object, atom)
+      match move found {
+        Option<PropertyDescriptor>.None => ()
+        Option<PropertyDescriptor>.Some { value: desc } => {
+          let attributes = desc.flags
+          unsafe releaseDescriptor(&mut hooks, unsafe runtime.contextRuntime(context), move desc)
+          if check {
+            if (attributes & JS_PROP_CONFIGURABLE) != 0 || (frozen && (attributes & JS_PROP_WRITABLE) != 0) { return boolean(false) }
+          } else if (attributes & JS_PROP_WRITABLE) != 0 { flags = flags | JS_PROP_HAS_WRITABLE }
+        }
+      }
+    }
+    if !check { let accepted = run unsafe properties.defineProperty(&mut hooks, context, object, atom,
+      Value.Undefined, Value.Undefined, Value.Undefined, flags) }
+  }
+  if check { return boolean(!(run unsafe prototypes.isExtensible(&mut hooks, context, object))) }
+  return unsafe object.retained()
+}
+unsafe effect fn stringTag<H: HeapHooks + OwnPropertyHooks + HasPropertyHooks + GetPropertyHooks + OwnKeysHooks + CoercionHooks + PropertyWriteHooks + PrototypeHooks + CallHooks + NativeFunctionHooks + InterruptHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, receiver: Value, scope: &mut Scope) -> Value ! OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | PrototypeError | JsException ? &mut Allocator {
+  let mut builtin = atoms.JS_ATOM_Object
+  if null(receiver) { scope.values[1] = run Strings.fromLatin1(b"Null") }
+  else if core.undefined(receiver) { scope.values[1] = run Strings.fromLatin1(b"Undefined") }
+  else {
+    scope.values[0] = run unsafe boxing.toObject(&mut hooks, memory, context, receiver)
+    let mut target = scope.values[0]
+    let resolved = run unsafe proxy.resolve(&mut hooks, context, &mut target, true)
+    if target.isObject() && unsafe classId(target) == classes.JS_CLASS_ARRAY { builtin = atoms.JS_ATOM_Array }
+    else if unsafe hooks.isCallable(context, scope.values[0]) { builtin = atoms.JS_ATOM_Function }
+    else {
+      let id = unsafe classId(scope.values[0])
+      if id == classes.JS_CLASS_STRING || id == classes.JS_CLASS_ARGUMENTS || id == classes.JS_CLASS_MAPPED_ARGUMENTS ||
+        id == classes.JS_CLASS_ERROR || id == classes.JS_CLASS_BOOLEAN || id == classes.JS_CLASS_NUMBER ||
+        id == classes.JS_CLASS_DATE || id == classes.JS_CLASS_REGEXP {
+        let anchor = () let rt = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, unsafe runtime.contextRuntime(context))
+        builtin = rt.classes.asSlice()[u32.toUsize(id)].classNameAtom
+      }
+    }
+    scope.values[1] = run unsafe hooks.getProperty(context, scope.values[0], atoms.JS_ATOM_Symbol_toStringTag)
+    unsafe clear(&mut hooks, context, &mut scope, 0)
+    if !scope.values[1].isString() {
+      unsafe clear(&mut hooks, context, &mut scope, 1)
+      scope.values[1] = run unsafe core.atomValue(&mut hooks, context, builtin)
+    }
+  }
+  let mut builder = StringBuilder.make()
+  run builder.reserve(Strings.length(scope.values[1]) + 9, Strings.isWide(scope.values[1]))
+  run builder.appendLatin1(b"[object ") run builder.append(scope.values[1]) run builder.appendLatin1(b"]")
+  return run builder.finish()
+}
+unsafe effect fn fromEntriesBody<H: HeapHooks + OwnPropertyHooks + HasPropertyHooks + GetPropertyHooks + OwnKeysHooks + CoercionHooks + PropertyWriteHooks + PrototypeHooks + CallHooks + NativeFunctionHooks + InterruptHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, input: Value, scope: &mut Scope) -> Value ! OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | PrototypeError | JsException ? &mut Allocator {
+  scope.values[0] = run unsafe objects.object(&mut hooks, memory, context)
+  scope.values[1] = run unsafe iterators.getIterator(&mut hooks, memory, context, input, false)
+  scope.close = true
+  scope.values[2] = run unsafe hooks.getProperty(context, scope.values[1], atoms.JS_ATOM_next)
+  while true {
+    let mut done = false
+    scope.values[3] = run unsafe iterators.next(&mut hooks, context, scope.values[1], scope.values[2], &mut done)
+    if done { break }
+    if !scope.values[3].isObject() { return run unsafe core.error(&mut hooks, context, b"not an object") }
+    scope.values[4] = run unsafe hooks.getProperty(context, scope.values[3], 0x80000000)
+    scope.values[5] = run unsafe hooks.getProperty(context, scope.values[3], 0x80000001)
+    let key = scope.take(4) let value = scope.take(5)
+    let accepted = run unsafe properties.definePropertyValueValue(&mut hooks, context, scope.values[0], key, value, JS_PROP_C_W_E | JS_PROP_THROW)
+    unsafe clear(&mut hooks, context, &mut scope, 3)
+  }
+  scope.close = false return scope.take(0)
+}
+unsafe effect fn groupByBody<H: HeapHooks + OwnPropertyHooks + HasPropertyHooks + GetPropertyHooks + OwnKeysHooks + CoercionHooks + PropertyWriteHooks + PrototypeHooks + CallHooks + NativeFunctionHooks + InterruptHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, input: Value, callback: Value, scope: &mut Scope) -> Value ! OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | PrototypeError | JsException ? &mut Allocator {
+  if !unsafe hooks.isCallable(context, callback) { return run unsafe core.error(&mut hooks, context, b"not a function") }
+  scope.values[1] = run unsafe iterators.getIterator(&mut hooks, memory, context, input, false)
+  scope.values[2] = run unsafe hooks.getProperty(context, scope.values[1], atoms.JS_ATOM_next)
+  scope.values[0] = run unsafe objects.withPrototype(&mut hooks, memory, context, Value.Null)
+  let mut index: i64 = 0
+  while true {
+    scope.close = true
+    if index >= 9007199254740991 { return run unsafe core.error(&mut hooks, context, b"too many elements") }
+    scope.close = false
+    let mut done = false
+    scope.values[3] = run unsafe iterators.next(&mut hooks, context, scope.values[1], scope.values[2], &mut done)
+    if done { break }
+    let anchor = () let state = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+    let receiver = state.globalObject drop state
+    let args = [scope.values[3], Value.number(i64.toF64(index))]
+    scope.close = true
+    scope.values[4] = run unsafe hooks.call(context, callback, receiver, &args)
+    scope.atom = run unsafe coercions.valueToAtom(&mut hooks, context, scope.values[4])
+    unsafe clear(&mut hooks, context, &mut scope, 4)
+    scope.close = false
+    scope.values[5] = run unsafe hooks.getProperty(context, scope.values[0], scope.atom)
+    if core.undefined(scope.values[5]) {
+      scope.values[5] = run unsafe objects.array(&mut hooks, memory, context)
+      let accepted = run unsafe properties.definePropertyValue(&mut hooks, context, scope.values[0], scope.atom, unsafe scope.values[5].retained(), JS_PROP_C_W_E)
+    }
+    // Groups are fresh ordinary arrays, never exposed to callbacks until return.
+    // Execute push's indexed Set followed by length Set, not a host approximation.
+    scope.values[6] = run unsafe hooks.getProperty(context, scope.values[5], atoms.JS_ATOM_length)
+    let length = scope.values[6].numericValue()
+    unsafe clear(&mut hooks, context, &mut scope, 6)
+    let accepted = run unsafe properties.setPropertyInt64(&mut hooks, context, scope.values[5], f64.toI64(length), unsafe scope.values[3].retained())
+    let resized = run unsafe properties.setProperty(&mut hooks, context, scope.values[5], atoms.JS_ATOM_length, Value.number(length + 1.0))
+    unsafe clear(&mut hooks, context, &mut scope, 5)
+    unsafe clear(&mut hooks, context, &mut scope, 3)
+    unsafe properties.releaseAtom(unsafe runtime.contextRuntime(context), scope.atom) scope.atom = 0
+    index = index + 1
+  }
+  return scope.take(0)
+}
+unsafe fn activeFunction(context: *mut HeapHeader) -> Value {
+  let anchor = () let rt = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, unsafe runtime.contextRuntime(context))
+  let frame = rt.currentStackFrame drop rt
+  if Pointer.isNull(frame) { return Value.Undefined }
+  let pointer = unsafe Intrinsic.pointerRequalify<?*mut StackFrame, *mut StackFrame>(frame)
+  let current = unsafe Pointer.borrow<(), StackFrame>(&anchor, pointer)
+  return current.currentFunction
+}
+unsafe effect fn body<H: HeapHooks + OwnPropertyHooks + HasPropertyHooks + GetPropertyHooks + OwnKeysHooks + CoercionHooks + PropertyWriteHooks + PrototypeHooks + CallHooks + NativeFunctionHooks + InterruptHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, method: u32, receiver: Value, argv: &FrameSlots, scope: &mut Scope) -> Value ! OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | PrototypeError | JsException ? &mut Allocator {
+  let a = unsafe argument(argv, 0) let b = unsafe argument(argv, 1) let c = unsafe argument(argv, 2)
+  if method == CONSTRUCTOR {
+    if !core.undefined(receiver) && !unsafe core.sameValue(receiver, unsafe activeFunction(context)) {
+      return run unsafe constructors.createFromConstructor(&mut hooks, memory, context, receiver, classes.JS_CLASS_OBJECT)
+    }
+    if nullish(a) { return run unsafe objects.object(&mut hooks, memory, context) }
+    return run unsafe boxing.toObject(&mut hooks, memory, context, a)
+  }
+  if method == CREATE {
+    if !a.isObject() && !null(a) { return run unsafe core.error(&mut hooks, context, b"not a prototype") }
+    scope.values[0] = run unsafe objects.withPrototype(&mut hooks, memory, context, a)
+    if !core.undefined(b) {
+      let target = scope.values[0]
+      run unsafe definePropertiesBody(&mut hooks, memory, context, target, b, &mut scope)
+    }
+    return scope.take(0)
+  }
+  if method == DEFINE_PROPERTIES {
+    run unsafe definePropertiesBody(&mut hooks, memory, context, a, b, &mut scope)
+    return unsafe a.retained()
+  }
+  if method == GET_PROTOTYPE_OF || method == REFLECT_GET_PROTOTYPE_OF {
+    if !a.isObject() && (method == REFLECT_GET_PROTOTYPE_OF || nullish(a)) { return run unsafe core.error(&mut hooks, context, b"not an object") }
+    return run unsafe prototypes.getPrototype(&mut hooks, context, a)
+  }
+  if method == SET_PROTOTYPE_OF {
+    let accepted = run unsafe prototypes.setPrototypeInternal(&mut hooks, context, a, b, true)
+    return unsafe a.retained()
+  }
+  if method == DEFINE_PROPERTY || method == REFLECT_DEFINE_PROPERTY {
+    if !a.isObject() { return run unsafe core.error(&mut hooks, context, b"not an object") }
+    scope.atom = run unsafe coercions.valueToAtom(&mut hooks, context, b)
+    let mut flags: u32 = 0 if method == DEFINE_PROPERTY { flags = JS_PROP_THROW }
+    let accepted = run unsafe defineDescriptor(&mut hooks, context, a, scope.atom, c, flags)
+    if method == REFLECT_DEFINE_PROPERTY { return boolean(accepted) } return unsafe a.retained()
+  }
+  if method == GET_OWN_PROPERTY_NAMES || method == GET_OWN_PROPERTY_SYMBOLS || method == KEYS || method == VALUES ||
+    method == ENTRIES || method == GET_OWN_PROPERTY_DESCRIPTORS {
+    return run unsafe enumerate(&mut hooks, memory, context, a, method, &mut scope)
+  }
+  if method == IS_EXTENSIBLE || method == REFLECT_IS_EXTENSIBLE {
+    if !a.isObject() {
+      if method == REFLECT_IS_EXTENSIBLE { return run unsafe core.error(&mut hooks, context, b"not an object") }
+      return boolean(false)
+    }
+    return boolean(run unsafe prototypes.isExtensible(&mut hooks, context, a))
+  }
+  if method == PREVENT_EXTENSIONS || method == REFLECT_PREVENT_EXTENSIONS {
+    if !a.isObject() {
+      if method == REFLECT_PREVENT_EXTENSIONS { return run unsafe core.error(&mut hooks, context, b"not an object") }
+      return unsafe a.retained()
+    }
+    let accepted = run unsafe prototypes.preventExtensions(&mut hooks, context, a)
+    if method == REFLECT_PREVENT_EXTENSIONS { return boolean(accepted) }
+    if !accepted { return run unsafe core.error(&mut hooks, context, b"proxy preventExtensions handler returned false") }
+    return unsafe a.retained()
+  }
+  if method == GET_OWN_PROPERTY_DESCRIPTOR || method == REFLECT_GET_OWN_PROPERTY_DESCRIPTOR {
+    if method == REFLECT_GET_OWN_PROPERTY_DESCRIPTOR {
+      if !a.isObject() { return run unsafe core.error(&mut hooks, context, b"not an object") }
+      scope.values[0] = unsafe a.retained()
+    } else { scope.values[0] = run unsafe boxing.toObject(&mut hooks, memory, context, a) }
+    scope.atom = run unsafe coercions.valueToAtom(&mut hooks, context, b)
+    let target = scope.values[0] let key = scope.atom
+    return run unsafe descriptorObject(&mut hooks, memory, context, target, key, &mut scope)
+  }
+  if method == IS { return boolean(unsafe core.sameValue(a, b)) }
+  if method == ASSIGN {
+    scope.values[0] = run unsafe boxing.toObject(&mut hooks, memory, context, a)
+    let mut i: usize = 1
+    while i < argv.length() {
+      let source = unsafe argv.get(i) i = i + 1
+      if nullish(source) { continue }
+      scope.values[1] = run unsafe boxing.toObject(&mut hooks, memory, context, source)
+      run unsafe copying.copyDataProperties(&mut hooks, context, scope.values[0], scope.values[1], Value.Undefined, true)
+      unsafe clear(&mut hooks, context, &mut scope, 1)
+    }
+    return scope.take(0)
+  }
+  if method == SEAL || method == FREEZE || method == IS_SEALED || method == IS_FROZEN {
+    return run unsafe integrity(&mut hooks, context, a, method, &mut scope)
+  }
+  if method == FROM_ENTRIES { return run unsafe fromEntriesBody(&mut hooks, memory, context, a, &mut scope) }
+  if method == GROUP_BY { return run unsafe groupByBody(&mut hooks, memory, context, a, b, &mut scope) }
+  if method == TO_STRING { return run unsafe stringTag(&mut hooks, memory, context, receiver, &mut scope) }
+  if method == TO_LOCALE_STRING {
+    scope.values[0] = run unsafe hooks.getProperty(context, receiver, atoms.JS_ATOM_toString)
+    let args: [Value; 0] = []
+    return run unsafe hooks.call(context, scope.values[0], receiver, &args)
+  }
+  if method == VALUE_OF { return run unsafe boxing.toObject(&mut hooks, memory, context, receiver) }
+  if method == GET_PROTO {
+    scope.values[0] = run unsafe boxing.toObject(&mut hooks, memory, context, receiver)
+    return run unsafe prototypes.getPrototype(&mut hooks, context, scope.values[0])
+  }
+  if method == SET_PROTO {
+    if nullish(receiver) { return run unsafe core.error(&mut hooks, context, b"not an object") }
+    if !a.isObject() && !null(a) { return Value.Undefined }
+    let accepted = run unsafe prototypes.setPrototypeInternal(&mut hooks, context, receiver, a, true)
+    return Value.Undefined
+  }
+  if method == HAS_OWN || method == HAS_OWN_PROPERTY || method == PROPERTY_IS_ENUMERABLE {
+    if method == HAS_OWN {
+      scope.values[0] = run unsafe boxing.toObject(&mut hooks, memory, context, a)
+      scope.atom = run unsafe coercions.valueToAtom(&mut hooks, context, b)
+    } else {
+      scope.atom = run unsafe coercions.valueToAtom(&mut hooks, context, a)
+      scope.values[0] = run unsafe boxing.toObject(&mut hooks, memory, context, receiver)
+    }
+    if method != PROPERTY_IS_ENUMERABLE { return boolean(run unsafe descriptors.hasOwnProperty(&mut hooks, context, scope.values[0], scope.atom)) }
+    let found = run unsafe descriptors.getOwnProperty(&mut hooks, context, scope.values[0], scope.atom)
+    match move found {
+      Option<PropertyDescriptor>.None => { return boolean(false) }
+      Option<PropertyDescriptor>.Some { value: desc } => {
+        let enumerable = (desc.flags & JS_PROP_ENUMERABLE) != 0
+        unsafe releaseDescriptor(&mut hooks, unsafe runtime.contextRuntime(context), move desc)
+        return boolean(enumerable)
+      }
+    }
+  }
+  if method == DEFINE_GETTER || method == DEFINE_SETTER {
+    scope.values[0] = run unsafe boxing.toObject(&mut hooks, memory, context, receiver)
+    if !unsafe hooks.isCallable(context, b) { return run unsafe core.error(&mut hooks, context, b"not a function") }
+    scope.atom = run unsafe coercions.valueToAtom(&mut hooks, context, a)
+    let mut getter = Value.Undefined let mut setter = Value.Undefined
+    let mut flags = JS_PROP_THROW | JS_PROP_HAS_ENUMERABLE | JS_PROP_ENUMERABLE | JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE
+    if method == DEFINE_SETTER { setter = b flags = flags | JS_PROP_HAS_SET }
+    else { getter = b flags = flags | JS_PROP_HAS_GET }
+    let accepted = run unsafe properties.defineProperty(&mut hooks, context, scope.values[0], scope.atom, Value.Undefined, getter, setter, flags)
+    return Value.Undefined
+  }
+  if method == IS_PROTOTYPE_OF {
+    if !a.isObject() { return boolean(false) }
+    scope.values[0] = run unsafe boxing.toObject(&mut hooks, memory, context, receiver)
+    scope.values[1] = unsafe a.retained()
+    while true {
+      let owned = scope.take(1)
+      scope.values[1] = run unsafe prototypes.getPrototypeFree(&mut hooks, context, owned)
+      if null(scope.values[1]) { return boolean(false) }
+      if unsafe core.sameValue(scope.values[0], scope.values[1]) { return boolean(true) }
+      run unsafe interrupts.poll(&mut hooks, memory, context)
+    }
+  }
+  if method == LOOKUP_GETTER || method == LOOKUP_SETTER {
+    scope.values[0] = run unsafe boxing.toObject(&mut hooks, memory, context, receiver)
+    scope.atom = run unsafe coercions.valueToAtom(&mut hooks, context, a)
+    while true {
+      let found = run unsafe descriptors.getOwnProperty(&mut hooks, context, scope.values[0], scope.atom)
+      match move found {
+        Option<PropertyDescriptor>.None => ()
+        Option<PropertyDescriptor>.Some { value: desc } => {
+          let mut result = Value.Undefined
+          if (desc.flags & JS_PROP_GETSET) != 0 {
+            if method == LOOKUP_SETTER { result = unsafe desc.setter.retained() }
+            else { result = unsafe desc.getter.retained() }
+          }
+          unsafe releaseDescriptor(&mut hooks, unsafe runtime.contextRuntime(context), move desc)
+          return result
+        }
+      }
+      let owned = scope.take(0)
+      scope.values[0] = run unsafe prototypes.getPrototypeFree(&mut hooks, context, owned)
+      if null(scope.values[0]) { return Value.Undefined }
+      run unsafe interrupts.poll(&mut hooks, memory, context)
+    }
+  }
+  return invariant()
+}
+/// NativeFunctionHooks adapters pass the Builtin.Object method ID, receiver and
+/// the actual argument view here. ConstructorOrFunction passes newTarget as the
+/// receiver; Getter/Setter use GET_PROTO/SET_PROTO. No installation occurs here.
+pub unsafe effect fn dispatch<H: HeapHooks + OwnPropertyHooks + HasPropertyHooks + GetPropertyHooks + OwnKeysHooks + CoercionHooks + PropertyWriteHooks + PrototypeHooks + CallHooks + NativeFunctionHooks + InterruptHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, method: u32, receiver: Value, argv: &FrameSlots) -> Value ! JsException ? &mut Allocator {
+  let mut scope = Scope.make()
+  let called = run Effect.result(unsafe body(&mut hooks, memory, context, method, receiver, argv, &mut scope))
+  let result = match move called {
+    Result<Value, OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | PrototypeError | JsException>.Success { value } => value
+    Result<Value, OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | PrototypeError | JsException>.Failure { error } => run Effect.catch<JsException>(unsafe materialize(&mut hooks, context, move error), core.exceptionValue)
+  }
+  if result.isException() && scope.close && scope.values[1].isObject() {
+    let closed = run Effect.result(unsafe iterators.close(&mut hooks, context, scope.values[1], true))
+    drop closed
+  }
+  let rt = unsafe runtime.contextRuntime(context)
+  unsafe properties.releaseAtom(rt, scope.atom)
+  let keys = Intrinsic.replace(scope.keys, List<PropertyEnum>.make())
+  unsafe names.releaseNames(rt, move keys)
+  let mut i: usize = 0
+  while i < scope.collected.length() { unsafe gc.release(&mut hooks, rt, scope.collected.get(i)) i = i + 1 }
+  i = 0
+  while i < 8 { unsafe clear(&mut hooks, context, &mut scope, i) i = i + 1 }
+  if result.isException() { fail JsException {} }
+  return result
+}

@@ -1,0 +1,133 @@
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.pointer { Pointer }
+import silk.testing { AssertionError, Testing }
+import silk.u8
+import silk.u32
+import silk.usize
+import byte_buffer { ByteBuffer }
+import js_heap { HeapCell, HeapHeader }
+import js_core_types { RuntimeState, NativeFunctionId, WeakRefHeader }
+import js_gc { HeapHooks, Tracer }
+import js_gc
+import js_runtime { allocateRuntimeStorage, allocateContextStorage }
+import js_compiler_types { FunctionDef }
+import js_compiler_state { newFunction, destroyFunction }
+import js_compiler_labels { resolveLabels }
+import js_compiler_code { CodeContext, matchCode, opcode, M4 }
+import js_compiler_emit as emit
+import js_debug_positions { SourcePositionCache, decodePc2Line }
+import js_opcode_data as op
+import runtime_memory { RuntimeAllocator }
+import js_string_types { StringLengthError, StringOwner, stringReference }
+
+struct NoClassEdges {}
+impl HeapHooks for NoClassEdges {
+  unsafe fn traceClass(self: &mut Self, runtime: *mut HeapHeader, object: *mut HeapHeader, callback: NativeFunctionId, tracer: &mut Tracer) -> () { Intrinsic.trap("QuickJS invariant violated") }
+  unsafe fn finalizeClass(self: &mut Self, runtime: *mut HeapHeader, object: *mut HeapHeader, callback: NativeFunctionId) -> () { Intrinsic.trap("QuickJS invariant violated") }
+  unsafe effect fn sweepWeak(self: &mut Self, runtime: *mut HeapHeader, node: *mut WeakRefHeader) -> () ? &mut Allocator { Intrinsic.trap("QuickJS invariant violated") }
+  unsafe fn destroyAuxiliary(self: &mut Self, runtime: *mut HeapHeader, node: *mut HeapHeader) -> () { Intrinsic.trap("QuickJS invariant violated") }
+}
+
+test effect fn compilerMatcherCapturesSignedWordsAndPreservesFailedCursor() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut bytes = ByteBuffer.make()
+  run bytes.append(op.OP_line_num) |> Effect.provideMut<Allocator>(&mut allocator)
+  run bytes.writeU32(0xffffffff) |> Effect.provideMut<Allocator>(&mut allocator)
+  run bytes.append(op.OP_push_i32) |> Effect.provideMut<Allocator>(&mut allocator)
+  run bytes.writeU32(0x80000000) |> Effect.provideMut<Allocator>(&mut allocator)
+  run bytes.append(op.OP_put_loc) |> Effect.provideMut<Allocator>(&mut allocator)
+  run bytes.writeU16(257) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut cc = CodeContext.make()
+  let pattern = [M4(op.OP_push_i32, op.OP_null, op.OP_push_true, op.OP_push_false), opcode(op.OP_put_loc), -1, -1]
+  let matched = matchCode(&mut cc, bytes.asSlice(), 0, &pattern)
+  run Testing.expect(matched && cc.position == 13 && cc.lineNumber == -1 && cc.label == -2147483648 && cc.index == 257,
+    "32-bit signed captures and -1 line sentinel survive packed-opcode matching")
+  let rejected = matchCode(&mut cc, bytes.asSlice(), 5, &[opcode(op.OP_push_i32), opcode(op.OP_put_loc), 256, -1])
+  run Testing.expect(!rejected && cc.position == 13 && cc.lineNumber == -1,
+    "a mismatched exact operand never commits the speculative cursor")
+}
+
+effect fn branchBoundary() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let runtime = run allocateRuntimeStorage(0)
+  let context = run unsafe allocateContextStorage(runtime)
+  let cell = run unsafe newFunction(context, Pointer.null<HeapHeader>(), false, false, 0, 0, Pointer.null<SourcePositionCache>())
+  let mut anchor = ()
+  let fd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
+  let label = run emit.newLabelFd(&mut fd)
+  run emit.emitLabelRaw(&mut fd, label)
+  let mut slot = fd.labels.get(0) slot.position2 = slot.position fd.labels.set(0, slot)
+  let mut i: usize = 0
+  while i < 127 { run emit.emitU8(&mut fd, op.OP_nop) i = i + 1 }
+  run emit.emitU8(&mut fd, op.OP_line_num) run emit.emitU32(&mut fd, 2)
+  run emit.emitU8(&mut fd, op.OP_if_true) run emit.emitU32(&mut fd, 0)
+  let references = emit.updateLabel(&mut fd, label, 1)
+  run emit.emitU8(&mut fd, op.OP_return_undef)
+  fd.jumpCapacity = 1 fd.lineNumberCapacity = 1
+  drop fd
+  run unsafe resolveLabels(cell, b"a\nb")
+  let finalAnchor = ()
+  let result = unsafe HeapCell.payload<FunctionDef, ()>(&finalAnchor, cell)
+  run Testing.expect(result.useShortOpcodes && result.bytecode.length() == 130
+    && result.bytecode.get(127) == op.OP_if_true8 && result.bytecode.get(128) == 128,
+    "backward -128 is encoded as signed i8 rather than trapped or widened")
+  let location = decodePc2Line(result.pc2line.asSlice(), 127)
+  run Testing.expect(location.line == 2 && location.column == 1,
+    "source position remains attached to the shortened branch opcode")
+  drop result
+  let mut hooks = NoClassEdges {}
+  unsafe destroyFunction(&mut hooks, cell)
+  unsafe js_gc.releaseHeader(&mut hooks, runtime, context)
+  run unsafe js_gc.destroyRuntime(&mut hooks, runtime)
+}
+test effect fn compilerLabelsEncodeNegativeByteBoundaryAndDebugPc() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run branchBoundary() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn resolveAttempt(cell: *mut HeapHeader) -> bool ! OutOfMemoryError ? &mut Allocator {
+  run unsafe resolveLabels(cell, b"") return true
+}
+effect fn allocationRejected(error: OutOfMemoryError) -> bool { drop error return false }
+test effect fn compilerLabelsOomPreservesOriginalAtomOwner() -> () ! OutOfMemoryError | StringLengthError | AssertionError<'static> {
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let runtime = run allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let context = run unsafe allocateContextStorage(runtime) |> Effect.provideMut<Allocator>(&mut allocator)
+  let cell = run unsafe newFunction(context, Pointer.null<HeapHeader>(), false, false, 0, 0, Pointer.null<SourcePositionCache>())
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut anchor = ()
+  let fd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
+  let mut runtimeAnchor = ()
+  let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, runtime)
+  let atom = run rt.atoms.internUtf8(b"label-pass-owner") |> Effect.provideMut<Allocator>(&mut allocator)
+  run emit.emitU8(&mut fd, op.OP_push_atom_value) |> Effect.provideMut<Allocator>(&mut allocator)
+  run emit.emitAtom(&mut fd, &mut rt.atoms, atom) |> Effect.provideMut<Allocator>(&mut allocator)
+  run emit.emitU8(&mut fd, op.OP_drop) |> Effect.provideMut<Allocator>(&mut allocator)
+  run emit.emitU8(&mut fd, op.OP_return_undef) |> Effect.provideMut<Allocator>(&mut allocator)
+  let owner = StringOwner.adopt(run rt.atoms.toValue(atom, true) |> Effect.provideMut<Allocator>(&mut allocator))
+  rt.atoms.release(atom)
+  drop rt drop fd
+  let limit = allocator.stats().usedBytes
+  allocator.setLimit(limit)
+  let accepted = run Effect.catchAll(resolveAttempt(cell), allocationRejected) |> Effect.provideMut<Allocator>(&mut allocator)
+  let readAnchor = ()
+  let rejected = unsafe HeapCell.payload<FunctionDef, ()>(&readAnchor, cell)
+  run Testing.expect(!accepted && rejected.bytecodeError && !rejected.useShortOpcodes
+    && rejected.bytecode.length() == 7 && rejected.bytecode.get(0) == op.OP_push_atom_value,
+    "failed output reservation preserves the old bytecode and its ownership mode")
+  drop rejected
+  let reference = stringReference(owner.get())
+  let beforeAnchor = ()
+  let before = unsafe Pointer.borrow<(), HeapHeader>(&beforeAnchor, reference)
+  run Testing.expect(before.referenceCount == 2, "failed optimization has not released the removable atom")
+  drop before
+  let mut hooks = NoClassEdges {}
+  unsafe destroyFunction(&mut hooks, cell)
+  let afterAnchor = ()
+  let after = unsafe Pointer.borrow<(), HeapHeader>(&afterAnchor, reference)
+  run Testing.expect(after.referenceCount == 1, "destruction after failure releases the original atom exactly once")
+  drop after drop owner
+  unsafe js_gc.releaseHeader(&mut hooks, runtime, context)
+  run unsafe js_gc.destroyRuntime(&mut hooks, runtime) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(allocator.stats().usedBytes == 0, "failed label resolution leaves no native allocation")
+}

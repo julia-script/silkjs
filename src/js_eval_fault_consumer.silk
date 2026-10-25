@@ -1,0 +1,107 @@
+//! Allocation consumers use the existing runtime-counted allocator. They execute
+//! the real compiler/import path; no algorithm outcome is supplied by a fixture.
+//! Integration tears down the supplied realm/runtime after each sweep and asserts
+//! AllocationObserver.stats().usedBytes/allocationCount both return to zero.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.pointer { Pointer }
+import silk.usize
+import silk.testing { Testing, AssertionError }
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types { RuntimeState }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_coercion_host { CoercionHooks }
+import js_property_host { OwnPropertyHooks, GetPropertyHooks, HasPropertyHooks, OwnKeysHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_prototype_host { PrototypeHooks }
+import js_interrupt_host { InterruptHooks }
+import js_native_function_host { NativeFunctionHooks }
+import js_call_host { CallHooks }
+import js_error_host { ErrorHooks }
+import js_eval_host { EvalHooks }
+import js_module_host { ModuleHostHooks }
+import js_parser_host { ModuleAttributeHooks }
+import js_promise { PromiseHooks }
+import js_promise as promises
+import js_runtime_jobs as jobs
+import js_exceptions { JsException }
+import js_exceptions as exceptions
+import js_eval as evaluation
+import js_eval_compile as flags
+import js_eval_execution_consumer { integer }
+import js_module_dynamic_import as imports
+import js_errors_test_support { FaultAllocator }
+import js_strings { Strings }
+import js_string_types { StringOwner, StringLengthError }
+import runtime_memory { AllocationObserver }
+
+pub unsafe effect fn compileAtBudget<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks + PromiseHooks + ModuleHostHooks + ModuleAttributeHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, allocator: &mut FaultAllocator, budget: usize) -> bool
+  ! JsException | AssertionError<'static> {
+  let rt = unsafe runtime.contextRuntime(context) let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt) let before = state.currentStackFrame drop state
+  allocator.remaining = budget
+  allocator.armed = true
+  let compiled = run Effect.result(unsafe evaluation.evaluate(&mut hooks, memory, context,
+    b"(function(a){let x=2;return eval('()=>a+x')})(40)()", b"eval-fault.js", flags.FLAG_COMPILE_ONLY))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  allocator.remaining = usize.MAX
+  allocator.armed = false
+  let mut failed = false
+  match move compiled {
+    Result<Value, JsException>.Success { value } => { unsafe gc.release(&mut hooks, rt, value) }
+    Result<Value, JsException>.Failure { .. } => {
+      failed = true
+      let pending = unsafe exceptions.has(rt)
+      let error = unsafe exceptions.take(rt) unsafe gc.release(&mut hooks, rt, error)
+      run Testing.expect(pending, "allocation failure materializes a real pending JS exception")
+    }
+  }
+  let unexpected = unsafe exceptions.has(rt)
+  if unexpected { let error = unsafe exceptions.take(rt) unsafe gc.release(&mut hooks, rt, error) }
+  run Testing.expect(!unexpected, "successful compilation must not retain a pending allocation exception")
+  let afterState = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt) let after = afterState.currentStackFrame drop afterState
+  run Testing.expect(Pointer.address(before) == Pointer.address(after), "allocation failure must preserve the active frame root")
+  run unsafe integer(&mut hooks, memory, context, b"(function(x){return eval('x+1')})(41)", 42)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  return failed
+}
+// Persistent failure must either reject the import or throw an owned exception;
+// it must never return an orphaned pending Promise after enqueue fails.
+pub unsafe effect fn importEnqueueRecovery<H: HeapHooks + CoercionHooks + OwnPropertyHooks + OwnKeysHooks + PropertyWriteHooks + CallHooks + ModuleAttributeHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, allocator: &mut FaultAllocator) -> ()
+  ! OutOfMemoryError | StringLengthError | AssertionError<'static> {
+  allocator.remaining = usize.MAX
+  let name = StringOwner.adopt(run Strings.fromUtf8(b"./namespace.mjs") |> Effect.provideMut<Allocator>(&mut allocator))
+  let rt = unsafe runtime.contextRuntime(context)
+  run Testing.expect(!unsafe jobs.isJobPending(rt), "fault consumer requires an initially empty queue")
+  let mut completed = false let mut budget: usize = 0
+  while budget < 512 && !completed {
+    allocator.remaining = budget
+    allocator.armed = true
+    allocator.persistent = true
+    let imported = run Effect.result(unsafe imports.dynamicImport(&mut hooks, memory, context, name.get(), Value.Undefined))
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    allocator.remaining = usize.MAX
+    allocator.armed = false
+    allocator.persistent = false
+    let pending = unsafe exceptions.has(rt) let queued = unsafe jobs.isJobPending(rt)
+    match move imported {
+      Result<Value, JsException>.Success { value } => {
+        let state = unsafe promises.state(value)
+        completed = queued
+        let valid = !pending && ((queued && state == promises.PENDING) || (!queued && state == promises.REJECTED))
+        unsafe gc.release(&mut hooks, rt, value)
+        run Testing.expect(valid, "import enqueue failure rejects without a hidden exception or stranded Promise")
+      }
+      Result<Value, JsException>.Failure { .. } => { run Testing.expect(pending && !queued, "failed import setup owns its exception and publishes no job") }
+    }
+    if pending { let error = unsafe exceptions.take(rt) unsafe gc.release(&mut hooks, rt, error) }
+    budget = budget + 1
+  }
+  run Testing.expect(completed, "persistent import fault sweep reaches a non-failing queued import")
+}

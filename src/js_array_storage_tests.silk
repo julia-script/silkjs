@@ -1,0 +1,341 @@
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.result { Result }
+import silk.testing { AssertionError, Testing }
+import silk.u32
+import silk.usize
+import runtime_memory { RuntimeAllocator }
+import js_heap { HeapCell, HeapHeader }
+import js_core_types { ObjectData, PropertySlot, VarRef, VarRefState }
+import js_gc as gc
+import js_runtime as runtime
+import js_object_allocate as objects
+import js_array_storage as arrays
+import js_array_storage { StorageOutcome, ArrayLengthError }
+import js_array_storage_test_support as fixture
+import js_array_storage_test_support { Hooks, FaultAllocator }
+import js_class_data as classes
+import js_atom_data as atoms
+import js_value { Value }
+import js_strings { Strings }
+import js_string_types { StringLengthError, stringReference }
+
+fn present(slot: Option<PropertySlot>) -> bool {
+  return match move slot { Option<PropertySlot>.Some { .. } => true _ => false }
+}
+effect fn failedConversion(error: OutOfMemoryError) -> bool { drop error return true }
+unsafe effect fn convertSucceeded(hooks: &mut Hooks, ctx: *mut HeapHeader, node: *mut HeapHeader) -> bool
+  ! OutOfMemoryError ? &mut Allocator {
+  run unsafe arrays.convertFastToSlow(&mut hooks, ctx, node)
+  return false
+}
+
+test effect fn fastTruncationReleasesEdgesAndReadonlyLengthStillAllowsExistingHoles() -> ()
+  ! OutOfMemoryError | StringLengthError | ArrayLengthError | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe fixture.context(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks { finalized: 0 }
+  let array = run unsafe arrays.allocateFastArray(&mut hooks, &observer, ctx, 3) |> Effect.provideMut<Allocator>(&mut memory)
+  let node = fixture.reference(array)
+  let text = run Strings.fromLatin1(b"retained") |> Effect.provideMut<Allocator>(&mut memory)
+  let child = run unsafe arrays.allocateFastArray(&mut hooks, &observer, ctx, 0) |> Effect.provideMut<Allocator>(&mut memory)
+  unsafe fixture.setFastSlot(array, 0, unsafe text.retained())
+  unsafe fixture.setFastSlot(array, 1, unsafe text.retained())
+  unsafe fixture.setFastSlot(array, 2, child)
+  let truncated = run unsafe arrays.setArrayLength(&mut hooks, ctx, node, 1) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(truncated == StorageOutcome.Accepted && unsafe fixture.length(array) == 1
+    && unsafe fixture.count(array) == 1 && hooks.finalized == 1
+    && unsafe fixture.rc(stringReference(text)) == 2, "fast truncation frees only removed owned edges")
+  let grown = run unsafe arrays.setArrayLength(&mut hooks, ctx, node, 5) |> Effect.provideMut<Allocator>(&mut memory)
+  run unsafe fixture.flags(rt, array, atoms.JS_ATOM_length, 8) |> Effect.provideMut<Allocator>(&mut memory)
+  let same = run unsafe arrays.setArrayLength(&mut hooks, ctx, node, 5) |> Effect.provideMut<Allocator>(&mut memory)
+  let filled = run unsafe arrays.appendFastElement(&mut hooks, ctx, node, unsafe text.retained()) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(grown == StorageOutcome.Accepted && same == StorageOutcome.ReadOnlyLength
+    && filled == StorageOutcome.Accepted && unsafe fixture.length(array) == 5 && unsafe fixture.count(array) == 2,
+    "equal readonly length rejects while append below its declared length is permitted")
+  unsafe gc.release(&mut hooks, rt, array)
+  run Testing.expect(unsafe fixture.rc(stringReference(text)) == 1, "surviving fast edges release exactly once")
+  unsafe gc.release(&mut hooks, rt, text)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx)
+  run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observer.stats().usedBytes == 0, "truncation and grow leave no graph or native storage leak")
+}
+
+test effect fn slowLengthHonorsDescendingAndSparseNonconfigurableBarriers() -> ()
+  ! OutOfMemoryError | StringLengthError | ArrayLengthError | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe fixture.context(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks { finalized: 0 }
+  let array = run unsafe arrays.allocateFastArray(&mut hooks, &observer, ctx, 6) |> Effect.provideMut<Allocator>(&mut memory)
+  let sibling = run unsafe arrays.allocateFastArray(&mut hooks, &observer, ctx, 0) |> Effect.provideMut<Allocator>(&mut memory)
+  let oldShape = unsafe fixture.shape(sibling)
+  let node = fixture.reference(array)
+  let text = run Strings.fromLatin1(b"barrier") |> Effect.provideMut<Allocator>(&mut memory)
+  unsafe fixture.setFastSlot(array, 4, unsafe text.retained())
+  run unsafe arrays.convertFastToSlow(&mut hooks, ctx, node) |> Effect.provideMut<Allocator>(&mut memory)
+  run unsafe fixture.flags(rt, array, 0x80000003, 6) |> Effect.provideMut<Allocator>(&mut memory)
+  let blocked = run unsafe arrays.setArrayLength(&mut hooks, ctx, node, 1) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(blocked == StorageOutcome.NonConfigurable && unsafe fixture.length(array) == 4
+    && present(unsafe fixture.indexSlot(rt, array, 3)) && present(unsafe fixture.indexSlot(rt, array, 2))
+    && !present(unsafe fixture.indexSlot(rt, array, 4)) && !present(unsafe fixture.indexSlot(rt, array, 5))
+    && unsafe fixture.rc(stringReference(text)) == 1, "descending deletion commits higher indices before stopping at the barrier")
+  run Testing.expect(Pointer.address<HeapHeader>(unsafe fixture.shape(array)) != Pointer.address<HeapHeader>(oldShape)
+    && unsafe fixture.length(sibling) == 0 && unsafe fixture.fast(sibling), "conversion isolates the cached shared shape")
+  let grown = run unsafe arrays.setArrayLength(&mut hooks, ctx, node, 0xffffffff) |> Effect.provideMut<Allocator>(&mut memory)
+  run unsafe fixture.addIndex(&mut hooks, rt, array, 2147483648, 6, Value.Int { value: 23 }) |> Effect.provideMut<Allocator>(&mut memory)
+  run unsafe fixture.addIndex(&mut hooks, rt, array, 4294967294, 7, unsafe text.retained()) |> Effect.provideMut<Allocator>(&mut memory)
+  let sparse = run unsafe arrays.setArrayLength(&mut hooks, ctx, node, 0) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(sparse == StorageOutcome.NonConfigurable && unsafe fixture.length(array) == 2147483649
+    && present(unsafe fixture.indexSlot(rt, array, 2147483648))
+    && !present(unsafe fixture.indexSlot(rt, array, 4294967294)) && unsafe fixture.rc(stringReference(text)) == 1,
+    "sparse two-pass deletion finds the highest uint32 barrier and frees the higher index")
+  let anchor = () let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  run Testing.expect(match p.properties.get(0) { PropertySlot.Value { value: Value.Float64 { value } } => value == 2147483649.0 _ => false },
+    "length above INT32_MAX is canonical binary64, not a wrapped signed integer")
+  drop p
+  unsafe gc.release(&mut hooks, rt, text)
+  unsafe gc.release(&mut hooks, rt, sibling)
+  unsafe gc.release(&mut hooks, rt, array)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx)
+  run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observer.stats().usedBytes == 0, "dynamic index atoms and COW shapes release")
+}
+
+test effect fn mappedDeletionTransfersBindingOwnershipWithoutSnapshottingItsValue() -> ()
+  ! OutOfMemoryError | StringLengthError | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe fixture.context(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks { finalized: 0 }
+  let mapped = run unsafe objects.withPrototypeClass(&mut hooks, &observer, ctx, Value.Null, classes.JS_CLASS_MAPPED_ARGUMENTS)
+    |> Effect.provideMut<Allocator>(&mut memory)
+  let text = run Strings.fromLatin1(b"binding") |> Effect.provideMut<Allocator>(&mut memory)
+  let a = run unsafe fixture.detached(rt, unsafe text.retained()) |> Effect.provideMut<Allocator>(&mut memory)
+  let b = run unsafe fixture.detached(rt, unsafe text.retained()) |> Effect.provideMut<Allocator>(&mut memory)
+  let c = run unsafe fixture.detached(rt, unsafe text.retained()) |> Effect.provideMut<Allocator>(&mut memory)
+  unsafe HeapCell.retain(b)
+  run unsafe fixture.appendMapped(mapped, a) |> Effect.provideMut<Allocator>(&mut memory)
+  run unsafe fixture.appendMapped(mapped, b) |> Effect.provideMut<Allocator>(&mut memory)
+  run unsafe fixture.appendMapped(mapped, c) |> Effect.provideMut<Allocator>(&mut memory)
+  let last = run unsafe arrays.deleteOwnIndex(&mut hooks, ctx, fixture.reference(mapped), 2) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(last == StorageOutcome.Accepted && unsafe fixture.fast(mapped) && unsafe fixture.count(mapped) == 2
+    && unsafe fixture.rc(stringReference(text)) == 3, "last mapped element releases its varref without forcing conversion")
+  let interior = run unsafe arrays.deleteOwnIndex(&mut hooks, ctx, fixture.reference(mapped), 0) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(interior == StorageOutcome.Accepted && !unsafe fixture.fast(mapped)
+    && unsafe fixture.rc(b) == 2 && unsafe fixture.rc(stringReference(text)) == 2,
+    "interior deletion transfers varrefs unchanged and releases only the removed binding")
+  let mut anchor = () let binding = unsafe HeapCell.payloadMut<VarRef, ()>(&mut anchor, b)
+  binding.state = VarRefState.Detached { value: Value.Int { value: 91 } }
+  drop binding
+  unsafe gc.release(&mut hooks, rt, text)
+  let mut shared = false
+  match unsafe fixture.indexSlot(rt, mapped, 1) {
+    Option<PropertySlot>.Some { value: PropertySlot.VarRef { reference } } => {
+      let data = unsafe HeapCell.payload<VarRef, ()>(&anchor, reference)
+      shared = match data.state { VarRefState.Detached { value: Value.Int { value } } => value == 91 _ => false }
+    }
+    _ => ()
+  }
+  run Testing.expect(shared, "slow mapped property still observes subsequent binding writes")
+  unsafe gc.release(&mut hooks, rt, mapped)
+  run Testing.expect(unsafe fixture.rc(b) == 1 && unsafe fixture.rc(stringReference(text)) == 1,
+    "slow destruction releases one varref ownership, not the external owner")
+  unsafe gc.releaseHeader(&mut hooks, rt, b)
+  unsafe gc.release(&mut hooks, rt, text)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx)
+  run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observer.stats().usedBytes == 0, "mapped buffers, bindings, and values are reclaimed")
+}
+
+test effect fn appendConsumesRejectedValuesAndGrowthOOMLeavesLengthExtended() -> ()
+  ! OutOfMemoryError | StringLengthError | ArrayLengthError | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe fixture.context(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks { finalized: 0 }
+  let array = run unsafe arrays.allocateFastArray(&mut hooks, &observer, ctx, 0) |> Effect.provideMut<Allocator>(&mut memory)
+  let text = run Strings.fromLatin1(b"consumed") |> Effect.provideMut<Allocator>(&mut memory)
+  let mut fault = FaultAllocator { parent: move memory, remaining: 0 }
+  let result = run Effect.result(unsafe arrays.appendFastElement(&mut hooks, ctx, fixture.reference(array), unsafe text.retained()))
+    |> Effect.provideMut<Allocator>(&mut fault)
+  let failed = match move result { Result<StorageOutcome, OutOfMemoryError>.Failure { .. } => true _ => false }
+  run Testing.expect(failed && unsafe fixture.length(array) == 1
+    && unsafe fixture.count(array) == 0 && unsafe fixture.rc(stringReference(text)) == 1,
+    "append growth OOM consumes the value after updating length, but publishes no element")
+  fault.remaining = 100
+  let reset = run unsafe arrays.setArrayLength(&mut hooks, ctx, fixture.reference(array), 0) |> Effect.provideMut<Allocator>(&mut fault)
+  run unsafe fixture.flags(rt, array, atoms.JS_ATOM_length, 8) |> Effect.provideMut<Allocator>(&mut fault)
+  let child = run unsafe arrays.allocateFastArray(&mut hooks, &observer, ctx, 0) |> Effect.provideMut<Allocator>(&mut fault)
+  fault.remaining = 0
+  let readonly = run unsafe arrays.appendFastElement(&mut hooks, ctx, fixture.reference(array), child) |> Effect.provideMut<Allocator>(&mut fault)
+  run Testing.expect(readonly == StorageOutcome.ReadOnlyLength && hooks.finalized == 1
+    && unsafe fixture.count(array) == 0 && unsafe fixture.length(array) == 0,
+    "readonly append consumes the object without attempting allocation or length mutation")
+  unsafe gc.release(&mut hooks, rt, text)
+  unsafe gc.release(&mut hooks, rt, array)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx)
+  run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut fault)
+  run Testing.expect(observer.stats().usedBytes == 0, "consuming append leaves no leaked failed input")
+}
+
+test effect fn conversionOOMNeverPublishesPartialIndicesOrTransfersEdges() -> ()
+  ! OutOfMemoryError | StringLengthError | ArrayLengthError | AssertionError<'static> {
+  let mut attempt: usize = 0
+  let mut sawSuccess = false
+  while attempt < 8 {
+    let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+    let observer = run memory.observe()
+    let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+    let ctx = run unsafe fixture.context(rt) |> Effect.provideMut<Allocator>(&mut memory)
+    let mut hooks = Hooks { finalized: 0 }
+    let array = run unsafe arrays.allocateFastArray(&mut hooks, &observer, ctx, 3) |> Effect.provideMut<Allocator>(&mut memory)
+    let text = run Strings.fromLatin1(b"atomic") |> Effect.provideMut<Allocator>(&mut memory)
+    unsafe fixture.setFastSlot(array, 1, unsafe text.retained())
+    let mut anchor = () let initial = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, fixture.reference(array))
+    initial.isStandardArrayPrototype = true
+    drop initial
+    let mut fault = FaultAllocator { parent: move memory, remaining: attempt }
+    let failed = run Effect.catchAll(unsafe convertSucceeded(&mut hooks, ctx, fixture.reference(array)), failedConversion)
+      |> Effect.provideMut<Allocator>(&mut fault)
+    let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, fixture.reference(array))
+    if failed {
+      run Testing.expect(p.fastArray && p.isStandardArrayPrototype && p.properties.length() == 1
+        && unsafe fixture.count(array) == 3 && unsafe fixture.rc(stringReference(text)) == 2,
+        "every conversion allocation failure keeps all values in their original fast owner")
+    } else {
+      sawSuccess = true
+      run Testing.expect(!p.fastArray && !p.isStandardArrayPrototype && p.properties.length() == 4
+        && unsafe fixture.count(array) == 0 && unsafe fixture.rc(stringReference(text)) == 2,
+        "committed transition moves edges once and resets flags and source storage")
+    }
+    drop p
+    unsafe gc.release(&mut hooks, rt, array)
+    run Testing.expect(unsafe fixture.rc(stringReference(text)) == 1, "failed and committed conversions each release exactly their owned string")
+    unsafe gc.release(&mut hooks, rt, text)
+    unsafe gc.releaseHeader(&mut hooks, rt, ctx)
+    run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut fault)
+    run Testing.expect(observer.stats().usedBytes == 0, "conversion failure never orphans cloned shapes or reserved storage")
+    attempt = attempt + 1
+  }
+  run Testing.expect(sawSuccess, "allocation-failure sweep reaches the committed transition")
+}
+
+test effect fn slowDeletionOOMPreservesLengthAndSharedSiblingWhilePropagatingError() -> ()
+  ! OutOfMemoryError | StringLengthError | ArrayLengthError | AssertionError<'static> {
+  let mut branch: usize = 0
+  while branch < 2 {
+    let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+    let observer = run memory.observe()
+    let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+    let ctx = run unsafe fixture.context(rt) |> Effect.provideMut<Allocator>(&mut memory)
+    let mut hooks = Hooks { finalized: 0 }
+    let array = run unsafe arrays.allocateFastArray(&mut hooks, &observer, ctx, 0) |> Effect.provideMut<Allocator>(&mut memory)
+    let mut declared: u32 = 2
+    if branch == 1 { declared = 1000 }
+    let grown = run unsafe arrays.setArrayLength(&mut hooks, ctx, fixture.reference(array), declared) |> Effect.provideMut<Allocator>(&mut memory)
+    unsafe fixture.markSlow(array)
+    let text = run Strings.fromLatin1(b"cow-delete") |> Effect.provideMut<Allocator>(&mut memory)
+    run unsafe fixture.addIndex(&mut hooks, rt, array, declared - 1, 7, unsafe text.retained()) |> Effect.provideMut<Allocator>(&mut memory)
+    let sibling = run unsafe fixture.shareSlow(&mut hooks, &observer, ctx, array) |> Effect.provideMut<Allocator>(&mut memory)
+    let mut fault = FaultAllocator { parent: move memory, remaining: 0 }
+    let result = run Effect.result(unsafe arrays.setArrayLength(&mut hooks, ctx, fixture.reference(array), 0)) |> Effect.provideMut<Allocator>(&mut fault)
+    let failed = match move result { Result<StorageOutcome, OutOfMemoryError>.Failure { .. } => true _ => false }
+    run Testing.expect(failed && unsafe fixture.length(array) == declared && unsafe fixture.length(sibling) == declared
+      && present(unsafe fixture.indexSlot(rt, array, declared - 1))
+      && present(unsafe fixture.indexSlot(rt, sibling, declared - 1)) && unsafe fixture.rc(stringReference(text)) == 3,
+      "both deletion strategies propagate failed COW before length publication, retaining all owners")
+    unsafe gc.release(&mut hooks, rt, sibling)
+    unsafe gc.release(&mut hooks, rt, array)
+    unsafe gc.release(&mut hooks, rt, text)
+    unsafe gc.releaseHeader(&mut hooks, rt, ctx)
+    run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut fault)
+    run Testing.expect(observer.stats().usedBytes == 0, "failed slow deletion restores temporary roots")
+    branch = branch + 1
+  }
+}
+
+test effect fn initializedAllocationFailureReclaimsPublishedObjectAndHonorsTypedRange() -> ()
+  ! OutOfMemoryError | ArrayLengthError | AssertionError<'static> {
+  let mut attempt: usize = 0
+  let mut succeeded = false
+  while attempt < 4 {
+    let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+    let observer = run memory.observe()
+    let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+    let ctx = run unsafe fixture.context(rt) |> Effect.provideMut<Allocator>(&mut memory)
+    unsafe runtime.setGCThreshold(rt, usize.MAX)
+    let before = observer.stats().usedBytes
+    let mut hooks = Hooks { finalized: 0 }
+    let mut fault = FaultAllocator { parent: move memory, remaining: attempt }
+    let result = run Effect.result(unsafe arrays.allocateFastArray(&mut hooks, &observer, ctx, 5)) |> Effect.provideMut<Allocator>(&mut fault)
+    match move result {
+      Result<Value, OutOfMemoryError | ArrayLengthError>.Success { value } => {
+        succeeded = true
+        let removed = run unsafe arrays.setArrayLength(&mut hooks, ctx, fixture.reference(value), 0) |> Effect.provideMut<Allocator>(&mut fault)
+        unsafe gc.release(&mut hooks, rt, value)
+      }
+      Result<Value, OutOfMemoryError | ArrayLengthError>.Failure { error } => {
+        match move error {
+          OutOfMemoryError allocation => { drop allocation }
+          ArrayLengthError range => { fail move range }
+        }
+      }
+    }
+    run Testing.expect(observer.stats().usedBytes == before && unsafe fixture.rc(ctx) == 1,
+      "every initialized allocation boundary reclaims its object, native values, and temporary context root")
+    fault.remaining = 0
+    let range = run Effect.result(unsafe arrays.allocateFastArray(&mut hooks, &observer, ctx, 2147483648)) |> Effect.provideMut<Allocator>(&mut fault)
+    let typed = match move range {
+      Result<Value, OutOfMemoryError | ArrayLengthError>.Failure { error: ArrayLengthError {} } => true
+      _ => false
+    }
+    run Testing.expect(typed, "invalid initialized length fails with typed range error before allocation")
+    unsafe gc.releaseHeader(&mut hooks, rt, ctx)
+    run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut fault)
+    run Testing.expect(observer.stats().usedBytes == 0, "initialized allocation failure leaves no leaked graph")
+    attempt = attempt + 1
+  }
+  run Testing.expect(succeeded, "initialized allocation failure sweep reaches successful owned allocation")
+}
+
+test effect fn sparseTruncationPreservesSourceCompactionScanOrder() -> ()
+  ! OutOfMemoryError | StringLengthError | ArrayLengthError | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe fixture.context(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = Hooks { finalized: 0 }
+  let array = run unsafe arrays.allocateFastArray(&mut hooks, &observer, ctx, 0) |> Effect.provideMut<Allocator>(&mut memory)
+  let grown = run unsafe arrays.setArrayLength(&mut hooks, ctx, fixture.reference(array), 1000000) |> Effect.provideMut<Allocator>(&mut memory)
+  unsafe fixture.markSlow(array)
+  let text = run Strings.fromLatin1(b"compaction-order") |> Effect.provideMut<Allocator>(&mut memory)
+  let mut i: u32 = 0
+  while i < 32 {
+    run unsafe fixture.addIndex(&mut hooks, rt, array, i * 101, 7, unsafe text.retained()) |> Effect.provideMut<Allocator>(&mut memory)
+    i = i + 1
+  }
+  let truncated = run unsafe arrays.setArrayLength(&mut hooks, ctx, fixture.reference(array), 0) |> Effect.provideMut<Allocator>(&mut memory)
+  // Upstream increments i after compaction instead of restarting at the shifted
+  // live slot. This storage port intentionally preserves that observable order,
+  // including the surviving high properties, rather than silently fixing C.
+  run Testing.expect(truncated == StorageOutcome.Accepted && unsafe fixture.length(array) == 0
+    && !present(unsafe fixture.indexSlot(rt, array, 1515))
+    && present(unsafe fixture.indexSlot(rt, array, 1616))
+    && present(unsafe fixture.indexSlot(rt, array, 3131))
+    && unsafe fixture.rc(stringReference(text)) == 17,
+    "sparse deletion retains original scan progression when ordered compaction shifts remaining indices")
+  unsafe gc.release(&mut hooks, rt, array)
+  run Testing.expect(unsafe fixture.rc(stringReference(text)) == 1, "compaction transfers all surviving slot ownership exactly once")
+  unsafe gc.release(&mut hooks, rt, text)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx)
+  run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observer.stats().usedBytes == 0, "sparse compaction releases metadata, atoms, and all value edges")
+}

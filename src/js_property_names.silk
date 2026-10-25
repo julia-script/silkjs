@@ -1,0 +1,291 @@
+//! JS_GetOwnPropertyNames / JS_FreePropertyEnum, quickjs.c:8676-8921.
+//! Context, object and hooks are borrowed; results own their atoms. Caller keeps
+//! the runtime alive. No object/shape/runtime payload borrow crosses host dispatch.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.list { List }
+import silk.option { Option }
+import silk.result { Result }
+import silk.u8
+import silk.u32
+import silk.usize
+import js_atoms { AtomTable, ATOM_INTEGER_TAG }
+import js_core_types { RuntimeState, ObjectData, ObjectPayload, ShapeData, PropertySlot,
+  PropertyEnum, PropertyDescriptor, NativeFunctionId, ExoticCallbacks,
+  EXOTIC_GET_OWN_PROPERTY_NAMES, JS_PROP_ENUMERABLE, JS_PROP_TMASK, JS_PROP_VARREF }
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_string_types { AtomKind, StringOwner, StringLengthError }
+import js_strings { Strings }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_var_refs as varRefs
+import js_class_data as classes
+import js_property_host { OwnKeysHooks }
+import js_property_ownership { releaseDescriptor }
+import js_exceptions { JsException }
+
+pub const JS_GPN_STRING_MASK: u32 = 1
+pub const JS_GPN_SYMBOL_MASK: u32 = 2
+pub const JS_GPN_PRIVATE_MASK: u32 = 4
+pub const JS_GPN_ENUM_ONLY: u32 = 16
+pub const JS_GPN_SET_ENUM: u32 = 32
+pub union OwnKeysError {
+  NotObject,
+  Uninitialized { pub name: StringOwner }
+}
+
+fn trap() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+fn selected(kind: AtomKind, flags: u32) -> bool {
+  let mask = match kind {
+    AtomKind.String => JS_GPN_STRING_MASK
+    AtomKind.Symbol => JS_GPN_SYMBOL_MASK
+    AtomKind.GlobalSymbol => JS_GPN_SYMBOL_MASK
+    AtomKind.Private => JS_GPN_PRIVATE_MASK
+  }
+  return (flags & mask) != 0
+}
+fn included(kind: AtomKind, enumerable: bool, flags: u32) -> bool {
+  return selected(kind, flags) && ((flags & JS_GPN_ENUM_ONLY) == 0 || enumerable)
+}
+// Fast Arguments and mapped Arguments use the same source count as fast Arrays;
+// typed views use their cached element count, never byte length or backing size.
+fn indexedLength(object: &ObjectData) -> usize {
+  if !object.isExotic { return 0 }
+  if object.fastArray {
+    return match &object.payload {
+      ObjectPayload.FastArray { array } => array.values.length()
+      ObjectPayload.MappedArguments { arguments } => arguments.varRefs.length()
+      ObjectPayload.TypedArray { array } => u32.toUsize(array.count)
+      ObjectPayload.Empty => 0
+      _ => trap()
+    }
+  }
+  if object.classId == classes.JS_CLASS_STRING {
+    return match &object.payload {
+      ObjectPayload.Boxed { value: Value.String { reference } } => Strings.length(Value.String { reference: reference })
+      _ => 0
+    }
+  }
+  return 0
+}
+struct Counts { numbers: usize, strings: usize, symbols: usize }
+unsafe effect fn countShape(rt: *mut HeapHeader, node: *mut HeapHeader, flags: u32) -> Counts
+  ! OutOfMemoryError | OwnKeysError | StringLengthError ? &mut Allocator {
+  let anchor = ()
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, object.shape)
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let mut counts = Counts { numbers: 0, strings: 0, symbols: 0 }
+  let mut i: usize = 0
+  while i < shape.properties.length() {
+    let property = shape.properties.get(i)
+    if property.atom != 0 {
+      let enumerable = (u8.toU32(property.flags) & JS_PROP_ENUMERABLE) != 0
+      let kind = state.atoms.propertyKind(property.atom)
+      if included(kind, enumerable, flags) {
+        if (u8.toU32(property.flags) & JS_PROP_TMASK) == JS_PROP_VARREF
+          && (flags & (JS_GPN_SET_ENUM | JS_GPN_ENUM_ONLY)) != 0 {
+          let reference = match object.properties.get(i) { PropertySlot.VarRef { reference } => reference _ => trap() }
+          if match unsafe varRefs.read(reference) { Value.Uninitialized => true _ => false } {
+            let name = StringOwner.adopt(run state.atoms.toValue(property.atom, true))
+            fail OwnKeysError.Uninitialized { name: move name }
+          }
+        }
+        match state.atoms.arrayIndex(property.atom) {
+          Option<u32>.Some { .. } => { counts.numbers = counts.numbers + 1 }
+          Option<u32>.None => {
+            if kind == AtomKind.String { counts.strings = counts.strings + 1 }
+            else { counts.symbols = counts.symbols + 1 }
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  if (flags & JS_GPN_STRING_MASK) != 0 { counts.numbers = counts.numbers + indexedLength(object) }
+  return move counts
+}
+unsafe fn ownKeysTable(rt: *mut HeapHeader, node: *mut HeapHeader) -> Option<NativeFunctionId> {
+  let anchor = ()
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  if !object.isExotic || object.fastArray || object.classId == classes.JS_CLASS_STRING {
+    return Option<NativeFunctionId>.none()
+  }
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  match &state.classes.asSlice()[u32.toUsize(object.classId)].exotic {
+    Option<ExoticCallbacks>.Some { value } => {
+      if (value.methodMask & EXOTIC_GET_OWN_PROPERTY_NAMES) != 0 {
+        return Option<NativeFunctionId>.some(value.descriptor)
+      }
+    }
+    Option<ExoticCallbacks>.None => ()
+  }
+  return Option<NativeFunctionId>.none()
+}
+unsafe fn atomKind(rt: *mut HeapHeader, atom: u32) -> AtomKind {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  return state.atoms.propertyKind(atom)
+}
+fn numericKey(atoms: &AtomTable, entry: PropertyEnum) -> u32 {
+  return match atoms.arrayIndex(entry.atom) { Option<u32>.Some { value } => value _ => trap() }
+}
+// In-place heapsort: bounded stack, no scratch allocation, O(n log n). Only the
+// ordinary numeric prefix is touched; exotic callback order remains intact.
+fn sift(atoms: &AtomTable, names: &mut List<PropertyEnum>, start: usize, end: usize) -> () {
+  let mut root = start
+  while root < end / 2 {
+    let mut child = root * 2 + 1
+    if child + 1 < end && numericKey(atoms, names.get(child)) < numericKey(atoms, names.get(child + 1)) {
+      child = child + 1
+    }
+    if numericKey(atoms, names.get(root)) >= numericKey(atoms, names.get(child)) { return () }
+    let item = names.get(root)
+    let childItem = names.get(child)
+    names.set(root, childItem)
+    names.set(child, item)
+    root = child
+  }
+}
+fn sortNumeric(atoms: &AtomTable, names: &mut List<PropertyEnum>, count: usize) -> () {
+  let mut start = count / 2
+  while start > 0 { start = start - 1 sift(atoms, &mut names, start, count) }
+  let mut end = count
+  while end > 1 {
+    end = end - 1
+    let item = names.get(0)
+    let last = names.get(end)
+    names.set(0, last)
+    names.set(end, item)
+    sift(atoms, &mut names, 0, end)
+  }
+}
+unsafe effect fn enumerate<H: HeapHooks + OwnKeysHooks>(hooks: &mut H,
+  context: *mut HeapHeader, rt: *mut HeapHeader, node: *mut HeapHeader, flags: u32,
+  names: &mut List<PropertyEnum>, exotic: &mut List<PropertyEnum>) -> ()
+  ! OutOfMemoryError | OwnKeysError | JsException | StringLengthError ? &mut Allocator {
+  let counts = run unsafe countShape(rt, node, flags)
+  let objectValue = Value.Object { reference: node }
+  match unsafe ownKeysTable(rt, node) {
+    Option<NativeFunctionId>.Some { value: table } => {
+      exotic.* = run unsafe OwnKeysHooks.getOwnKeys(&mut hooks, context, table, objectValue)
+    }
+    Option<NativeFunctionId>.None => ()
+  }
+  let mut exoticCount: usize = 0
+  let mut i: usize = 0
+  while i < exotic.length() {
+    let item = exotic.get(i)
+    if selected(unsafe atomKind(rt, item.atom), flags) {
+      let mut enumerable = false
+      if (flags & (JS_GPN_SET_ENUM | JS_GPN_ENUM_ONLY)) != 0 {
+        let descriptor = run unsafe OwnKeysHooks.getOwnProperty(&mut hooks, context, objectValue, item.atom)
+        match move descriptor {
+          Option<PropertyDescriptor>.Some { value } => {
+            enumerable = (value.flags & JS_PROP_ENUMERABLE) != 0
+            unsafe releaseDescriptor(&mut hooks, rt, move value)
+          }
+          Option<PropertyDescriptor>.None => ()
+        }
+        exotic.set(i, PropertyEnum { atom: item.atom, isEnumerable: enumerable })
+      }
+      if (flags & JS_GPN_ENUM_ONLY) == 0 || enumerable { exoticCount = exoticCount + 1 }
+    }
+    i = i + 1
+  }
+  // Counts are native usize but source limits are uint32 accumulation followed
+  // by INT32_MAX. Each contribution is checked before adding, never wrapping.
+  let mut total: usize = 0
+  let parts: [usize; 4] = [counts.numbers, counts.strings, counts.symbols, exoticCount]
+  i = 0
+  while i < 4 {
+    if parts[i] > 2147483647 - total { return run Allocator.outOfMemory() }
+    total = total + parts[i]
+    i = i + 1
+  }
+  run names.reserveExact(total)
+  // Initialized null atoms make cleanup safe at every partially filled position.
+  while names.length() < total { run names.append(PropertyEnum { atom: 0, isEnumerable: false }) }
+  let anchor = ()
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, object.shape)
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let mut numberIndex: usize = 0
+  let mut stringIndex = counts.numbers
+  let mut symbolIndex = counts.numbers + counts.strings
+  let mut needsSort = false
+  i = 0
+  while i < shape.properties.length() {
+    let property = shape.properties.get(i)
+    if property.atom != 0 {
+      let enumerable = (u8.toU32(property.flags) & JS_PROP_ENUMERABLE) != 0
+      let kind = state.atoms.propertyKind(property.atom)
+      if included(kind, enumerable, flags) {
+        let mut index: usize = 0
+        match state.atoms.arrayIndex(property.atom) {
+          Option<u32>.Some { .. } => { index = numberIndex numberIndex = numberIndex + 1 needsSort = true }
+          Option<u32>.None => {
+            if kind == AtomKind.String { index = stringIndex stringIndex = stringIndex + 1 }
+            else { index = symbolIndex symbolIndex = symbolIndex + 1 }
+          }
+        }
+        names.set(index, PropertyEnum { atom: state.atoms.duplicate(property.atom), isEnumerable: enumerable })
+      }
+    }
+    i = i + 1
+  }
+  if (flags & JS_GPN_STRING_MASK) != 0 {
+    let length = indexedLength(object)
+    i = 0
+    while i < length {
+      // The total <= INT32_MAX guarantee makes every synthetic index an
+      // allocation-free immediate atom, including typed-array cached lengths.
+      names.set(numberIndex, PropertyEnum { atom: usize.toU32(i) | ATOM_INTEGER_TAG, isEnumerable: true })
+      numberIndex = numberIndex + 1
+      i = i + 1
+    }
+  }
+  i = 0
+  while i < exotic.length() {
+    let item = exotic.get(i)
+    if included(state.atoms.propertyKind(item.atom), item.isEnumerable, flags) {
+      names.set(symbolIndex, item)
+      exotic.set(i, PropertyEnum { atom: 0, isEnumerable: false })
+      symbolIndex = symbolIndex + 1
+    }
+    i = i + 1
+  }
+  if numberIndex != counts.numbers || stringIndex != counts.numbers + counts.strings || symbolIndex != total { trap() }
+  if needsSort && counts.numbers > 1 { sortNumeric(&state.atoms, &mut names, counts.numbers) }
+}
+
+// Consumes the native list and every owned atom; runtime must still be live.
+pub unsafe fn releaseNames(runtime: *mut HeapHeader, names: List<PropertyEnum>) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  let mut i: usize = 0
+  while i < names.length() { state.atoms.release(names.get(i).atom) i = i + 1 }
+}
+pub unsafe effect fn getOwnPropertyNames<H: HeapHooks + OwnKeysHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value, flags: u32) -> List<PropertyEnum>
+  ! OutOfMemoryError | OwnKeysError | JsException | StringLengthError ? &mut Allocator {
+  let node = match object { Value.Object { reference } => reference _ => { fail OwnKeysError.NotObject } }
+  let rt = unsafe runtime.contextRuntime(context)
+  unsafe HeapCell.retain(context)
+  unsafe HeapCell.retain(node)
+  let mut names = List<PropertyEnum>.make()
+  let mut exotic = List<PropertyEnum>.make()
+  let result = run Effect.result(unsafe enumerate(&mut hooks, context, rt, node, flags, &mut names, &mut exotic))
+  unsafe releaseNames(rt, move exotic)
+  unsafe gc.releaseHeader(&mut hooks, rt, node)
+  unsafe gc.releaseHeader(&mut hooks, rt, context)
+  match move result {
+    Result<(), OutOfMemoryError | OwnKeysError | JsException | StringLengthError>.Success { .. } => { return move names }
+    Result<(), OutOfMemoryError | OwnKeysError | JsException | StringLengthError>.Failure { error } => {
+      unsafe releaseNames(rt, move names)
+      fail move error
+    }
+  }
+}

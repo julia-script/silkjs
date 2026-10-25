@@ -1,0 +1,302 @@
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.i32
+import silk.list { List }
+import silk.option { Option }
+import silk.slice { Slice }
+import silk.string { String }
+import silk.u8
+import unicode_case { UnicodeCase }
+import unicode_properties { UnicodeProperties, UnknownProperty }
+import unicode_ranges { CharRange, RangeOperation }
+import utf8 { Utf8, Decoded }
+import regexp_strings { RegExpStrings }
+import regexp_parse_escape { parseEscape }
+import regexp_types { RegExpSyntaxError, RegExpStackOverflow, FLAG_IGNORECASE, FLAG_UNICODE, FLAG_UNICODE_SETS }
+import native_stack { currentFrameAddress }
+
+pub struct ClassResult { pub set: RegExpStrings, pub next: usize }
+pub struct AtomResult { pub set: RegExpStrings, pub codePoint: u32, pub isSet: bool, pub next: usize }
+
+fn byteAt(input: &[u8], offset: usize) -> u8 {
+  if offset >= input.length { return 0 }
+  return input[offset]
+}
+fn unicodeMode(flags: u32) -> bool { return flags & (FLAG_UNICODE | FLAG_UNICODE_SETS) != 0 }
+fn literal(code: u32, next: usize) -> AtomResult {
+  return AtomResult { set: RegExpStrings.make(), codePoint: code, isSet: false, next: next }
+}
+fn setAtom(set: RegExpStrings, next: usize) -> AtomResult {
+  return AtomResult { set: move set, codePoint: 0x40000000, isSet: true, next: next }
+}
+fn propertyByte(c: u8) -> bool {
+  return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+}
+fn propertyName(input: &[u8], start: usize, length: usize) -> string {
+  // The caller has admitted only ASCII letters, digits, and underscore.
+  unsafe { return String.fromUtf8Unchecked(Slice.view<u8>(input, start, length)) }
+}
+
+effect fn propertyFailure(error: UnknownProperty, offset: usize, message: string<'static>) -> CharRange ! RegExpSyntaxError {
+  fail RegExpSyntaxError { message: message, offset: offset }
+}
+effect fn sequenceFailure(error: UnknownProperty, offset: usize) -> () ! RegExpSyntaxError {
+  fail RegExpSyntaxError { message: "unknown unicode property name", offset: offset }
+}
+effect fn addSequence(values: &[u32], set: &mut RegExpStrings) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run set.add(values)
+}
+effect fn sequenceProperty(error: UnknownProperty, name: string, inverted: bool, flags: u32, offset: usize) -> RegExpStrings ! OutOfMemoryError | RegExpSyntaxError ? &mut Allocator {
+  if inverted || flags & FLAG_UNICODE_SETS == 0 {
+    fail RegExpSyntaxError { message: "unknown unicode property name", offset: offset }
+  }
+  let mut set = RegExpStrings.make()
+  run UnicodeProperties.sequences(name, addSequence(&mut set)) |> Effect.catch<UnknownProperty>(sequenceFailure(offset))
+  return move set
+}
+effect fn binaryProperty(error: UnknownProperty, name: string, inverted: bool, flags: u32, offset: usize) -> RegExpStrings ! OutOfMemoryError | RegExpSyntaxError ? &mut Allocator {
+  return run binaryPropertySet(name) |> Effect.catch<UnknownProperty>(sequenceProperty(name, inverted, flags, offset))
+}
+effect fn binaryPropertySet(name: string) -> RegExpStrings ! OutOfMemoryError | UnknownProperty ? &mut Allocator {
+  let mut set = RegExpStrings.make()
+  set.ranges = run UnicodeProperties.property(name)
+  return move set
+}
+effect fn categoryPropertySet(name: string) -> RegExpStrings ! OutOfMemoryError | UnknownProperty ? &mut Allocator {
+  let mut set = RegExpStrings.make()
+  set.ranges = run UnicodeProperties.generalCategory(name)
+  return move set
+}
+
+effect fn parseUnicodeProperty(input: &[u8], offset: usize, flags: u32, inverted: bool) -> ClassResult ! OutOfMemoryError | RegExpSyntaxError ? &mut Allocator {
+  if byteAt(input, offset) != 123 {
+    fail RegExpSyntaxError { message: "expecting '{' after \\p", offset: offset }
+  }
+  let start = offset + 1
+  let mut p = start
+  while propertyByte(byteAt(input, p)) {
+    if p - start >= 63 { fail RegExpSyntaxError { message: "unknown unicode property name", offset: p } }
+    p = p + 1
+  }
+  let name = propertyName(input, start, p - start)
+  let mut valueStart = p
+  let mut valueLength: usize = 0
+  if byteAt(input, p) == 61 {
+    p = p + 1
+    valueStart = p
+    while propertyByte(byteAt(input, p)) {
+      if p - valueStart >= 63 { fail RegExpSyntaxError { message: "unknown unicode property value", offset: p } }
+      p = p + 1
+    }
+    valueLength = p - valueStart
+  }
+  if byteAt(input, p) != 125 { fail RegExpSyntaxError { message: "expecting '}'", offset: p } }
+  let value = propertyName(input, valueStart, valueLength)
+  let mut set = RegExpStrings.make()
+  if name == "Script" || name == "sc" || name == "Script_Extensions" || name == "scx" {
+    let extensions = name == "Script_Extensions" || name == "scx"
+    set.ranges = run UnicodeProperties.script(value, extensions) |> Effect.catch<UnknownProperty>(propertyFailure(offset, "unknown unicode script"))
+  } else if name == "General_Category" || name == "gc" {
+    set.ranges = run UnicodeProperties.generalCategory(value) |> Effect.catch<UnknownProperty>(propertyFailure(offset, "unknown unicode general category"))
+  } else if valueLength == 0 {
+    set = run categoryPropertySet(name) |> Effect.catch<UnknownProperty>(binaryProperty(name, inverted, flags, offset))
+  } else {
+    fail RegExpSyntaxError { message: "unknown unicode property name", offset: offset }
+  }
+  // v folds before complement; u folds after complement, exactly as upstream.
+  if flags & FLAG_IGNORECASE != 0 && flags & FLAG_UNICODE_SETS != 0 { run set.canonicalize(unicodeMode(flags)) }
+  if inverted { run set.ranges.invert() }
+  if flags & FLAG_IGNORECASE != 0 && flags & FLAG_UNICODE_SETS == 0 { run set.canonicalize(unicodeMode(flags)) }
+  return ClassResult { set: move set, next: p + 1 }
+}
+
+effect fn builtinClass(c: u8) -> RegExpStrings ! OutOfMemoryError ? &mut Allocator {
+  let mut set = RegExpStrings.make()
+  if c == 100 || c == 68 {
+    run set.ranges.addInterval(48, 58)
+  } else if c == 119 || c == 87 {
+    run set.ranges.addInterval(48, 58)
+    run set.ranges.addInterval(65, 91)
+    run set.ranges.addInterval(95, 96)
+    run set.ranges.addInterval(97, 123)
+  } else {
+    let points: [u32; 20] = [9, 14, 32, 33, 160, 161, 5760, 5761, 8192, 8203, 8232, 8234, 8239, 8240, 8287, 8288, 12288, 12289, 65279, 65280]
+    let mut i: usize = 0
+    while i < 20 {
+      run set.ranges.addInterval(points[i], points[i + 1])
+      i = i + 2
+    }
+  }
+  if c == 68 || c == 83 || c == 87 { run set.ranges.invert() }
+  return move set
+}
+
+effect fn parseClassStringDisjunction(input: &[u8], offset: usize, flags: u32) -> ClassResult ! OutOfMemoryError | RegExpSyntaxError ? &mut Allocator {
+  if byteAt(input, offset) != 123 { fail RegExpSyntaxError { message: "expecting '{' after \\q", offset: offset } }
+  let mut p = offset + 1
+  let mut values = List<u32>.make()
+  let mut set = RegExpStrings.make()
+  while true {
+    values.clear()
+    while byteAt(input, p) != 125 && byteAt(input, p) != 124 {
+      let atom = run parseClassAtom(input, p, flags, false, false)
+      run values.append(atom.codePoint)
+      p = atom.next
+    }
+    run set.add(values.asSlice())
+    if byteAt(input, p) == 125 { break }
+    p = p + 1
+  }
+  if flags & FLAG_IGNORECASE != 0 { run set.canonicalize(true) }
+  return ClassResult { set: move set, next: p + 1 }
+}
+
+// offset includes the backslash for an escape; next is the first unconsumed byte.
+pub effect fn parseClassAtom(input: &[u8], offset: usize, flags: u32, inClass: bool, allowSets: bool) -> AtomResult ! OutOfMemoryError | RegExpSyntaxError ? &mut Allocator {
+  if offset >= input.length { fail RegExpSyntaxError { message: "unexpected end", offset: offset } }
+  let unicode = unicodeMode(flags)
+  let sets = flags & FLAG_UNICODE_SETS != 0
+  let mut p = offset
+  let mut c = byteAt(input, p)
+  if c == 92 {
+    p = p + 1
+    if p >= input.length { fail RegExpSyntaxError { message: "unexpected end", offset: p } }
+    c = input[p]
+    p = p + 1
+    if allowSets && (c == 100 || c == 68 || c == 115 || c == 83 || c == 119 || c == 87) {
+      return setAtom(run builtinClass(c), p)
+    }
+    if c == 99 {
+      let control = byteAt(input, p)
+      if (control >= 65 && control <= 90) || (control >= 97 && control <= 122) || (inClass && !unicode && ((control >= 48 && control <= 57) || control == 95)) {
+        return literal(u8.toU32(control) & 31, p + 1)
+      }
+      if unicode { fail RegExpSyntaxError { message: "invalid escape sequence in regular expression", offset: offset } }
+      return literal(92, p - 1)
+    }
+    if c == 45 {
+      if !inClass && unicode { fail RegExpSyntaxError { message: "invalid escape sequence in regular expression", offset: offset } }
+      return literal(45, p)
+    }
+    if c == 94 || c == 36 || c == 92 || c == 46 || c == 42 || c == 43 || c == 63 || c == 40 || c == 41 || c == 91 || c == 93 || c == 123 || c == 125 || c == 124 || c == 47 {
+      return literal(u8.toU32(c), p)
+    }
+    if (c == 112 || c == 80) && unicode && allowSets {
+      let result = run parseUnicodeProperty(input, p, flags, c == 80)
+      return setAtom(move result.set, result.next)
+    }
+    if c == 113 && sets && allowSets && inClass {
+      let result = run parseClassStringDisjunction(input, p, flags)
+      return setAtom(move result.set, result.next)
+    }
+    p = p - 1
+    let mut allowUtf16: u32 = 0
+    if unicode { allowUtf16 = 2 }
+    let escaped = parseEscape(input, p, allowUtf16)
+    if escaped.codePoint >= 0 { return literal(i32.toU32(escaped.codePoint), escaped.next) }
+    if unicode { fail RegExpSyntaxError { message: "invalid escape sequence in regular expression", offset: offset } }
+  } else if inClass && sets {
+    if c == 40 || c == 41 || c == 91 || c == 93 || c == 123 || c == 125 || c == 47 || c == 45 || c == 124 {
+      fail RegExpSyntaxError { message: "invalid character in class in regular expression", offset: p }
+    }
+    if (c == 38 || c == 33 || c == 35 || c == 36 || c == 37 || c == 42 || c == 43 || c == 44 || c == 46 || c == 58 || c == 59 || c == 60 || c == 61 || c == 62 || c == 63 || c == 64 || c == 94 || c == 96 || c == 126) && byteAt(input, p + 1) == c {
+      fail RegExpSyntaxError { message: "invalid class set operation in regular expression", offset: p }
+    }
+  }
+  if c < 128 { return literal(u8.toU32(c), p + 1) }
+  let decoded = Utf8.decode(Slice.view<u8>(input, p, input.length - p))
+  if let Option<Decoded>.Some { value } = move decoded {
+    if value.codePoint > 0xffff && !unicode { fail RegExpSyntaxError { message: "malformed unicode char", offset: p } }
+    return literal(value.codePoint, p + value.length)
+  }
+  fail RegExpSyntaxError { message: "malformed unicode char", offset: p }
+}
+
+effect fn parseSetOperand(input: &[u8], offset: usize, flags: u32, maxDepth: usize, stackLimit: usize) -> ClassResult ! OutOfMemoryError | RegExpSyntaxError | RegExpStackOverflow ? &mut Allocator {
+  if byteAt(input, offset) == 91 { return run parseClass(input, offset, flags, maxDepth, stackLimit) }
+  let mut atom = run parseClassAtom(input, offset, flags, true, true)
+  if !atom.isSet {
+    let mut code = atom.codePoint
+    if flags & FLAG_IGNORECASE != 0 { code = UnicodeCase.canonicalize(code, unicodeMode(flags)) }
+    run atom.set.ranges.unionInterval(code, code)
+  }
+  return ClassResult { set: move atom.set, next: atom.next }
+}
+
+// stackLimit is the same downward native-frame bound as RegExpCompiler.compile.
+pub effect fn parseClass(input: &[u8], offset: usize, flags: u32, maxDepth: usize, stackLimit: usize) -> ClassResult ! OutOfMemoryError | RegExpSyntaxError | RegExpStackOverflow ? &mut Allocator {
+  if maxDepth == 0 || (stackLimit != 0 && currentFrameAddress() < stackLimit) { fail RegExpStackOverflow {} }
+  if byteAt(input, offset) != 91 { fail RegExpSyntaxError { message: "expecting '['", offset: offset } }
+  let mut p = offset + 1
+  let invert = byteAt(input, p) == 94
+  if invert { p = p + 1 }
+  let mut set = RegExpStrings.make()
+  let mut first = true
+  let sets = flags & FLAG_UNICODE_SETS != 0
+  let unicode = unicodeMode(flags)
+  let ignoreCase = flags & FLAG_IGNORECASE != 0
+  while byteAt(input, p) != 93 {
+    if byteAt(input, p) == 91 && sets {
+      let nested = run parseClass(input, p, flags, maxDepth - 1, stackLimit)
+      run set.apply(&nested.set, RangeOperation.Union)
+      p = nested.next
+    } else {
+      let atom = run parseClassAtom(input, p, flags, true, true)
+      p = atom.next
+      let mut hasRange = false
+      if byteAt(input, p) == 45 && byteAt(input, p + 1) != 93 && !(sets && first && byteAt(input, p + 1) == 45) {
+        if atom.isSet {
+          if unicode { fail RegExpSyntaxError { message: "invalid class range", offset: p } }
+        } else {
+          let end = run parseClassAtom(input, p + 1, flags, true, true)
+          if end.isSet {
+            if unicode { fail RegExpSyntaxError { message: "invalid class range", offset: p } }
+          } else {
+            if end.codePoint < atom.codePoint { fail RegExpSyntaxError { message: "invalid class range", offset: p } }
+            p = end.next
+            if ignoreCase {
+              let mut range = CharRange.make()
+              run range.unionInterval(atom.codePoint, end.codePoint)
+              run range.canonicalize(unicode)
+              run set.ranges.apply(&range, RangeOperation.Union)
+            } else {
+              run set.ranges.unionInterval(atom.codePoint, end.codePoint)
+            }
+            first = false
+            hasRange = true
+          }
+        }
+      }
+      if !hasRange {
+        if atom.isSet { run set.apply(&atom.set, RangeOperation.Union) }
+        else {
+          let mut code = atom.codePoint
+          if ignoreCase { code = UnicodeCase.canonicalize(code, unicode) }
+          run set.ranges.unionInterval(code, code)
+        }
+      }
+    }
+    if sets && first {
+      let intersection = byteAt(input, p) == 38 && byteAt(input, p + 1) == 38 && byteAt(input, p + 2) != 38
+      let subtraction = byteAt(input, p) == 45 && byteAt(input, p + 1) == 45
+      if intersection || subtraction {
+        let mut operation = RangeOperation.Subtract
+        if intersection { operation = RangeOperation.Intersection }
+        while byteAt(input, p) != 93 {
+          let validIntersection = intersection && byteAt(input, p) == 38 && byteAt(input, p + 1) == 38 && byteAt(input, p + 2) != 38
+          let validSubtraction = subtraction && byteAt(input, p) == 45 && byteAt(input, p + 1) == 45
+          if !validIntersection && !validSubtraction { fail RegExpSyntaxError { message: "invalid operation in regular expression", offset: p } }
+          let operand = run parseSetOperand(input, p + 2, flags, maxDepth - 1, stackLimit)
+          run set.apply(&operand.set, operation)
+          p = operand.next
+        }
+      }
+    }
+    first = false
+  }
+  if invert {
+    if set.strings.length() != 0 { fail RegExpSyntaxError { message: "negated character class with strings in regular expression debugger eval code", offset: p } }
+    run set.ranges.invert()
+  }
+  return ClassResult { set: move set, next: p + 1 }
+}

@@ -1,0 +1,610 @@
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.ownership { Drop }
+import silk.pointer { Pointer }
+import silk.list { List }
+import silk.option { Option }
+import silk.slice { Slice }
+import silk.u8
+import silk.u16
+import silk.u32
+import silk.usize
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_value { Value }
+import js_string_types { FlatString, RopeString, StringOwner, StringLengthError, EmbeddedNullError, STRING_LENGTH_MAX, releaseString, stringReference }
+import js_string_rope { RopeIterator, stringLength, stringDepth, stringWide, ROPE_MAX_DEPTH, ROPE_SHORT_LENGTH, ROPE_SHORT2_LENGTH }
+import utf8 { Utf8, Decoded }
+
+// A successful reservation owns the final heap cell as well as character capacity.
+// finish transfers that owner without allocation; abandoning the builder drops it.
+pub struct StringBuilder { owner: StringOwner }
+impl StringBuilder {
+  pub fn make() -> Self { return StringBuilder { owner: StringOwner.adopt(Value.Undefined) } }
+  pub fn length(self: &Self) -> usize {
+    let value = self.owner.get()
+    if value.tag() != -7 { return 0 }
+    let data = unsafe HeapCell.payload<FlatString, Self>(self, stringReference(value))
+    return data.length
+  }
+  effect fn prepare(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.owner.get().tag() == -7 { return () }
+    let reference = run HeapCell.allocate(HeapKind.String, FlatString.make())
+    self.owner = StringOwner.adopt(Value.String { reference: reference })
+  }
+  // Growth and widening commit only after all allocation succeeds. On failure
+  // the builder remains valid, with its previous content and length unchanged.
+  pub effect fn reserve(self: &mut Self, additional: usize, wide: bool) -> ()
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let length = self.length()
+    if additional > STRING_LENGTH_MAX - length { fail StringLengthError {} }
+    let needed = length + additional
+    run self.prepare()
+    let reference = stringReference(self.owner.get())
+    let data = unsafe HeapCell.payloadMut<FlatString, Self>(&mut self.*, reference)
+    if wide && !data.wide {
+      let mut units = List<u16>.make()
+      run units.reserve(needed)
+      let mut i: usize = 0
+      while i < length {
+        run units.append(u8.toU16(data.latin1.get(i)))
+        i = i + 1
+      }
+      data.utf16 = move units
+      data.latin1 = List<u8>.make()
+      data.wide = true
+    } else if data.wide { run data.utf16.reserve(additional) }
+    else { run data.latin1.reserve(additional + 1) }
+  }
+  pub effect fn appendUnit(self: &mut Self, unit: u16) -> ()
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    run self.reserve(1, unit > 255)
+    let reference = stringReference(self.owner.get())
+    let data = unsafe HeapCell.payloadMut<FlatString, Self>(&mut self.*, reference)
+    if data.wide { run data.utf16.append(unit) }
+    else { run data.latin1.append(u16.toU8(unit)) }
+    data.length = data.length + 1
+  }
+  pub effect fn appendCodePoint(self: &mut Self, point: u32) -> ()
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    if point >= 65536 {
+      run self.reserve(2, true)
+      run self.appendUnit(u32.toU16(0xd800 + u32.shiftRight(point - 65536, 10)))
+      run self.appendUnit(u32.toU16(0xdc00 + ((point - 65536) & 1023)))
+    } else { run self.appendUnit(u32.toU16(point)) }
+  }
+  pub effect fn appendLatin1(self: &mut Self, bytes: &[u8]) -> ()
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    run self.reserve(bytes.length, false)
+    let mut i: usize = 0
+    while i < bytes.length {
+      run self.appendUnit(u8.toU16(bytes[i]))
+      i = i + 1
+    }
+  }
+  pub effect fn appendUtf16(self: &mut Self, units: &[u16]) -> ()
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let mut wide = false
+    let mut i: usize = 0
+    while i < units.length {
+      wide = wide || units[i] > 255
+      i = i + 1
+    }
+    run self.reserve(units.length, wide)
+    i = 0
+    while i < units.length {
+      run self.appendUnit(units[i])
+      i = i + 1
+    }
+  }
+  pub effect fn appendRange(self: &mut Self, value: Value, start: usize, end: usize) -> ()
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let mut iterator = RopeIterator.make(&value)
+    let mut index: usize = 0
+    let mut wide = false
+    while index < end {
+      match iterator.next() {
+        Option<u16>.Some { value: unit } => { if index >= start { wide = wide || unit > 255 } }
+        Option<u16>.None => { Intrinsic.trap("QuickJS invariant violated") }
+      }
+      index = index + 1
+    }
+    run self.reserve(end - start, wide)
+    iterator = RopeIterator.make(&value)
+    index = 0
+    while index < end {
+      match iterator.next() {
+        Option<u16>.Some { value: unit } => { if index >= start { run self.appendUnit(unit) } }
+        Option<u16>.None => { Intrinsic.trap("QuickJS invariant violated") }
+      }
+      index = index + 1
+    }
+  }
+  pub effect fn append(self: &mut Self, value: Value) -> ()
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    run self.appendRange(value, 0, stringLength(value))
+  }
+  pub effect fn fill(self: &mut Self, unit: u16, count: usize) -> ()
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    run self.reserve(count, unit > 255)
+    let mut i: usize = 0
+    while i < count {
+      run self.appendUnit(unit)
+      i = i + 1
+    }
+  }
+  pub effect fn finish(self: Self) -> Value ! OutOfMemoryError ? &mut Allocator {
+    let mut builder = move self
+    run builder.prepare()
+    let reference = stringReference(builder.owner.get())
+    let data = unsafe HeapCell.payloadMut<FlatString, Self>(&mut builder, reference)
+    if !data.wide { run data.latin1.append(0) }
+    drop data
+    return builder.owner.take()
+  }
+}
+
+pub struct Strings {}
+impl Strings {
+  pub fn length(value: Value) -> usize { return stringLength(value) }
+  pub fn isWide(value: Value) -> bool { return stringWide(value) }
+  pub fn depth(value: Value) -> usize { return stringDepth(value) }
+  pub fn duplicate(value: Value) -> Value { return unsafe value.retained() }
+  pub fn release(value: Value) -> () { releaseString(value) }
+  pub fn codeUnit(mut value: Value, mut index: usize) -> u16 {
+    while value.tag() == -6 {
+      let rope = unsafe HeapCell.payload<RopeString, Value>(&value, stringReference(value))
+      let left = rope.left
+      let right = rope.right
+      drop rope
+      let length = stringLength(left)
+      if index < length { value = left }
+      else {
+        value = right
+        index = index - length
+      }
+    }
+    unsafe { return HeapCell.payload<FlatString, Value>(&value, stringReference(value)).unit(index) }
+  }
+  pub fn codePoint(value: Value, index: &mut usize) -> u32 {
+    let mut point = u16.toU32(Strings.codeUnit(value, index.*))
+    index.* = index.* + 1
+    if point >= 0xd800 && point <= 0xdbff && index.* < stringLength(value) {
+      let low = u16.toU32(Strings.codeUnit(value, index.*))
+      if low >= 0xdc00 && low <= 0xdfff {
+        point = 65536 + (point - 0xd800) * 1024 + low - 0xdc00
+        index.* = index.* + 1
+      }
+    }
+    return point
+  }
+  pub effect fn fromLatin1(bytes: &[u8]) -> Value
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let mut builder = StringBuilder.make()
+    run builder.appendLatin1(bytes)
+    return run builder.finish()
+  }
+  // Like js_new_string16_len, this preserves wide storage even for ASCII input.
+  pub effect fn fromUtf16(units: &[u16]) -> Value
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let mut builder = StringBuilder.make()
+    run builder.reserve(units.length, true)
+    run builder.appendUtf16(units)
+    return run builder.finish()
+  }
+  pub effect fn fromCodePoint(point: u32) -> Value
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let mut builder = StringBuilder.make()
+    run builder.appendCodePoint(point)
+    return run builder.finish()
+  }
+  pub effect fn fromUtf8(bytes: &[u8]) -> Value
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    if bytes.length == 0 {
+      let mut builder = StringBuilder.make()
+      return run builder.finish()
+    }
+    return run unsafe Strings.fromUtf8Pointer(Pointer.fromRef<u8>(&bytes[0]), bytes.length)
+  }
+  // The caller keeps all length bytes alive and immutable until construction ends.
+  pub unsafe effect fn fromUtf8Pointer(data: *const u8, length: usize) -> Value
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let bytes = unsafe Pointer.assumeMany<u8>(data)
+    let mut builder = StringBuilder.make()
+    let mut index: usize = 0
+    while index < length {
+      let mut point: u32 = 0xffffffff
+      let mut consumed: usize = 0
+      match unsafe Utf8.decodePointer(unsafe Pointer.at<u8>(bytes, index), length - index) {
+        Option<Decoded>.Some { value } => {
+          point = value.codePoint
+          consumed = value.length
+        }
+        Option<Decoded>.None => {}
+      }
+      if point <= 0x10ffff { index = index + consumed }
+      else {
+        point = 0xfffd
+        // Deliberately preserve QuickJS's nonstandard invalid-run skip: an
+        // initial continuation run also consumes the following starter.
+        while index < length && unsafe Strings.continuation(bytes, index) { index = index + 1 }
+        if index < length {
+          index = index + 1
+          while index < length && unsafe Strings.continuation(bytes, index) { index = index + 1 }
+        }
+      }
+      run builder.appendCodePoint(point)
+    }
+    return run builder.finish()
+  }
+  unsafe fn continuation(bytes: [*]const u8, index: usize) -> bool {
+    let byte = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(bytes, index))
+    return byte >= 0x80 && byte < 0xc0
+  }
+  pub fn compare(left: Value, right: Value) -> i32 {
+    let mut a = RopeIterator.make(&left)
+    let mut b = RopeIterator.make(&right)
+    let mut remaining = stringLength(left)
+    if stringLength(right) < remaining { remaining = stringLength(right) }
+    while remaining != 0 {
+      let av = a.next().unwrapOr(0)
+      let bv = b.next().unwrapOr(0)
+      if av != bv { return u16.toI32(av) - u16.toI32(bv) }
+      remaining = remaining - 1
+    }
+    if stringLength(left) < stringLength(right) { return -1 }
+    if stringLength(left) > stringLength(right) { return 1 }
+    return 0
+  }
+  pub fn equal(left: Value, right: Value) -> bool {
+    return stringLength(left) == stringLength(right) && Strings.compare(left, right) == 0
+  }
+  pub fn compareRange(left: Value, leftOffset: usize, right: Value, rightOffset: usize, length: usize) -> i32 {
+    let mut i: usize = 0
+    while i < length {
+      let difference = u16.toI32(Strings.codeUnit(left, leftOffset + i)) - u16.toI32(Strings.codeUnit(right, rightOffset + i))
+      if difference != 0 { return difference }
+      i = i + 1
+    }
+    return 0
+  }
+  pub effect fn substring(value: Value, start: usize, end: usize) -> Value
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    if start == 0 && end == stringLength(value) { return Strings.duplicate(value) }
+    let mut builder = StringBuilder.make()
+    run builder.appendRange(value, start, end)
+    return run builder.finish()
+  }
+  // Borrowing factory: neither input is consumed, including on allocation failure.
+  pub effect fn concat(left: Value, right: Value) -> Value
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    if stringLength(left) > STRING_LENGTH_MAX - stringLength(right) { fail StringLengthError {} }
+    if right.tag() == -7 && stringLength(right) == 0 { return Strings.duplicate(left) }
+    if right.tag() == -7 && stringLength(right) <= ROPE_SHORT_LENGTH {
+      if left.tag() == -7 && stringLength(left) <= ROPE_SHORT2_LENGTH {
+        return run Strings.concatFlat(left, right)
+      }
+      if left.tag() == -6 {
+        let rope = unsafe HeapCell.payload<RopeString, Value>(&left, stringReference(left))
+        let first = rope.left
+        let last = rope.right
+        drop rope
+        if last.tag() == -7 && stringLength(last) <= ROPE_SHORT_LENGTH {
+          let joined = StringOwner.adopt(run Strings.concatFlat(last, right))
+          return run Strings.newRope(first, joined.get())
+        }
+      }
+    } else if left.tag() == -7 && right.tag() == -6 {
+      if stringLength(left) == 0 { return Strings.duplicate(right) }
+      let rope = unsafe HeapCell.payload<RopeString, Value>(&right, stringReference(right))
+      let first = rope.left
+      let last = rope.right
+      drop rope
+      if first.tag() == -7 && stringLength(first) <= ROPE_SHORT_LENGTH {
+        let joined = StringOwner.adopt(run Strings.concatFlat(left, first))
+        return run Strings.newRope(joined.get(), last)
+      }
+    }
+    return run Strings.newRope(left, right)
+  }
+  // Borrowed JS_ConcatString storage path. Owners remain rooted so callers can
+  // materialize an allocation error before releasing either input.
+  pub effect fn concatBorrowedReusingLeft(left: Value, right: Value) -> Value
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    if stringLength(left) > STRING_LENGTH_MAX - stringLength(right) { fail StringLengthError {} }
+    if left.tag() == -7 {
+      if right.tag() == -7 && stringLength(right) <= ROPE_SHORT_LENGTH && stringLength(left) <= ROPE_SHORT2_LENGTH {
+        if run Strings.concatInPlace(left, right) { return Strings.duplicate(left) }
+      } else if right.tag() == -6 && stringLength(left) != 0 {
+        let rope = unsafe HeapCell.payload<RopeString, Value>(&right, stringReference(right))
+        let first = rope.left
+        let last = rope.right
+        drop rope
+        if first.tag() == -7 && stringLength(first) <= ROPE_SHORT_LENGTH &&
+          stringDepth(last) < ROPE_MAX_DEPTH && Strings.canConcatInPlace(left, first) {
+          // Allocate the final node before mutation. Its borrowed children are
+          // unpublished until the allocation-free append and both retains commit.
+          let node = run HeapCell.allocate(HeapKind.Rope, RopeString {
+            left: left, right: last, length: stringLength(left) + stringLength(right),
+            depth: stringDepth(last) + 1, wide: stringWide(left) || stringWide(last)
+          })
+          let appended = run Effect.result(Strings.concatInPlace(left, first))
+          match move appended {
+            Result<bool, OutOfMemoryError>.Success { value } => {
+              if value {
+                let retainedLeft = Strings.duplicate(left)
+                let retainedRight = Strings.duplicate(last)
+                return Value.Rope { reference: node }
+              }
+              unsafe HeapCell.destroy<RopeString>(node)
+            }
+            Result<bool, OutOfMemoryError>.Failure { error } => {
+              unsafe HeapCell.destroy<RopeString>(node)
+              fail move error
+            }
+          }
+        }
+      }
+    }
+    return run Strings.concat(left, right)
+  }
+  // Consumes both input references on every exit. Reuses uniquely owned,
+  // uninterned flat storage only when the existing allocation has enough room.
+  pub effect fn concatOwned(left: Value, right: Value) -> Value
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let mut a = StringOwner.adopt(left)
+    let mut b = StringOwner.adopt(right)
+    if stringLength(left) > STRING_LENGTH_MAX - stringLength(right) { fail StringLengthError {} }
+    if right.tag() == -7 && stringLength(right) == 0 { return a.take() }
+    if left.tag() == -7 {
+      if right.tag() == -7 && stringLength(right) <= ROPE_SHORT_LENGTH && stringLength(left) <= ROPE_SHORT2_LENGTH {
+        return run Strings.concatFlatOwned(a.take(), b.take())
+      }
+      if right.tag() == -6 {
+        if stringLength(left) == 0 { return b.take() }
+        let rope = unsafe HeapCell.payload<RopeString, Value>(&right, stringReference(right))
+        let first = rope.left
+        let last = rope.right
+        drop rope
+        if first.tag() == -7 && stringLength(first) <= ROPE_SHORT_LENGTH {
+          // This branch deliberately has no bound on the left flat length.
+          // Source JS_ConcatString2 may reuse its unique spare storage.
+          let joined = StringOwner.adopt(run Strings.concatFlatOwned(a.take(), Strings.duplicate(first)))
+          return run Strings.newRope(joined.get(), last)
+        }
+      }
+    }
+    return run Strings.concat(left, right)
+  }
+  /// Borrows both strings and reuses the unique left allocation when possible.
+  /// Every append is capacity-guarded; the Allocator effect is required only by
+  /// List.append's interface, and this operation never requests an allocation.
+  pub effect fn concatInPlace(left: Value, right: Value) -> bool
+    ! OutOfMemoryError ? &mut Allocator {
+    if !Strings.canConcatInPlace(left, right) { return false }
+    let additional = stringLength(right)
+    if additional == 0 { return true }
+    let source = unsafe HeapCell.payload<FlatString, Value>(&right, stringReference(right))
+    let mut token = ()
+    let target = unsafe HeapCell.payloadMut<FlatString, ()>(&mut token, stringReference(left))
+    let length = target.length + additional
+    if !target.wide {
+      let last = target.latin1.length() - 1
+      let terminator = target.latin1.remove(last)
+    }
+    let mut i: usize = 0
+    while i < additional {
+      if target.wide { run target.utf16.append(source.unit(i)) }
+      else { run target.latin1.append(source.latin1.get(i)) }
+      i = i + 1
+    }
+    if !target.wide { run target.latin1.append(0) }
+    target.length = length
+    return true
+  }
+  fn canConcatInPlace(left: Value, right: Value) -> bool {
+    if left.tag() != -7 || right.tag() != -7 { return false }
+    let additional = stringLength(right)
+    if additional == 0 { return true }
+    if additional > STRING_LENGTH_MAX - stringLength(left) { return false }
+    let reference = stringReference(left)
+    let anchor = ()
+    let header = unsafe Pointer.borrow<(), HeapHeader>(&anchor, reference)
+    let unique = header.referenceCount == 1
+    drop header
+    if !unique { return false }
+    let source = unsafe HeapCell.payload<FlatString, Value>(&right, stringReference(right))
+    let target = unsafe HeapCell.payload<FlatString, Value>(&left, reference)
+    let length = target.length + additional
+    let mut fits = false
+    if target.wide { fits = target.utf16.capacity() >= length }
+    else { fits = !source.wide && target.latin1.capacity() > length }
+    return Pointer.isNull(target.registry) && fits
+  }
+  effect fn concatFlatOwned(left: Value, right: Value) -> Value
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let mut a = StringOwner.adopt(left)
+    let b = StringOwner.adopt(right)
+    let additional = stringLength(right)
+    if additional > STRING_LENGTH_MAX - stringLength(left) { fail StringLengthError {} }
+    if right.tag() == -7 && additional == 0 { return a.take() }
+    if run Strings.concatInPlace(left, right) { return a.take() }
+    return run Strings.concatFlat(left, right)
+  }
+  effect fn concatFlat(left: Value, right: Value) -> Value
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let mut builder = StringBuilder.make()
+    run builder.reserve(stringLength(left) + stringLength(right), stringWide(left) || stringWide(right))
+    run builder.append(left)
+    run builder.append(right)
+    return run builder.finish()
+  }
+  effect fn newRope(left: Value, right: Value) -> Value
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    if stringLength(left) > STRING_LENGTH_MAX - stringLength(right) { fail StringLengthError {} }
+    let mut depth = stringDepth(left)
+    if stringDepth(right) > depth { depth = stringDepth(right) }
+    // Allocate before retaining children: failed allocation owns no JS references.
+    let reference = run HeapCell.allocate(HeapKind.Rope, RopeString {
+      left: left, right: right, length: stringLength(left) + stringLength(right),
+      depth: depth + 1, wide: stringWide(left) || stringWide(right)
+    })
+    let retainedLeft = Strings.duplicate(left)
+    let retainedRight = Strings.duplicate(right)
+    let mut result = StringOwner.adopt(Value.Rope { reference: reference })
+    if depth + 1 > ROPE_MAX_DEPTH { return run Strings.rebalance(result.get()) }
+    return result.take()
+  }
+  pub effect fn rebalance(value: Value) -> Value
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let mut buckets = RopeBuckets.make()
+    let mut iterator = RopeIterator.make(&value)
+    while true {
+      match iterator.nextLeaf() {
+        Option<Value>.None => { break }
+        Option<Value>.Some { value: leaf } => {
+          let length = stringLength(leaf)
+          if length != 0 {
+            let mut index: usize = 0
+            let mut accumulated = StringOwner.adopt(Value.Undefined)
+            while length >= FIBONACCI[index + 1] {
+              let old = StringOwner.adopt(buckets.take(index))
+              if old.get().tag() != 3 {
+                if accumulated.get().tag() == 3 { accumulated = StringOwner.borrowed(old.get()) }
+                else { accumulated = StringOwner.adopt(run Strings.newRope(old.get(), accumulated.get())) }
+              }
+              index = index + 1
+            }
+            if accumulated.get().tag() == 3 { accumulated = StringOwner.borrowed(leaf) }
+            else { accumulated = StringOwner.adopt(run Strings.newRope(accumulated.get(), leaf)) }
+            while buckets.values[index].tag() != 3 {
+              let old = StringOwner.adopt(buckets.take(index))
+              accumulated = StringOwner.adopt(run Strings.newRope(old.get(), accumulated.get()))
+              index = index + 1
+            }
+            buckets.values[index] = accumulated.take()
+          }
+        }
+      }
+    }
+    let mut result = StringOwner.adopt(Value.Undefined)
+    let mut index: usize = 0
+    while index < 44 {
+      let old = StringOwner.adopt(buckets.take(index))
+      if old.get().tag() != 3 {
+        if result.get().tag() == 3 { result = StringOwner.borrowed(old.get()) }
+        else { result = StringOwner.adopt(run Strings.newRope(old.get(), result.get())) }
+      }
+      index = index + 1
+    }
+    if result.get().tag() == 3 { return run Strings.fromLatin1(b"") }
+    return result.take()
+  }
+  // A successful flatten memoizes the flat leaf in the rope, so aliases never
+  // rebuild it. Mutation only replaces equivalent content; no borrowed payload
+  // may span this call. The root JS reference remains owned by the caller.
+  pub effect fn flatten(value: Value) -> Value
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    return run Strings.flattenCache(value, Option<Value>.none())
+  }
+  /// Borrowed initialized-runtime cache. Empty must be a live zero-length flat
+  /// string; it is retained only when a new rope memoization is committed.
+  pub effect fn flattenWithEmpty(value: Value, empty: Value) -> Value
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    return run Strings.flattenCache(value, Option<Value>.some(empty))
+  }
+  effect fn flattenCache(value: Value, cachedEmpty: Option<Value>) -> Value
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    if value.tag() == -7 { return Strings.duplicate(value) }
+    let reference = stringReference(value)
+    let rope = unsafe HeapCell.payload<RopeString, Value>(&value, reference)
+    let left = rope.left
+    let right = rope.right
+    drop rope
+    if right.tag() == -7 && stringLength(right) == 0 { return Strings.duplicate(left) }
+    let mut builder = StringBuilder.make()
+    run builder.reserve(stringLength(value), stringWide(value))
+    run builder.append(value)
+    let mut flat = StringOwner.adopt(run builder.finish())
+    let mut empty = StringOwner.adopt(match move cachedEmpty {
+      Option<Value>.Some { value: cached } => Strings.duplicate(cached)
+      Option<Value>.None => run Strings.fromLatin1(b"")
+    })
+    let mut token = ()
+    let target = unsafe HeapCell.payloadMut<RopeString, ()>(&mut token, reference)
+    target.left = Strings.duplicate(flat.get())
+    target.right = empty.take()
+    target.depth = 1
+    drop target
+    releaseString(left)
+    releaseString(right)
+    return flat.take()
+  }
+  // Bytes exclude a terminator. Lone surrogates are preserved, not replaced.
+  pub effect fn toUtf8(value: Value, cesu8: bool) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+    let mut result = List<u8>.make()
+    let mut iterator = RopeIterator.make(&value)
+    let mut pending = iterator.next()
+    while true {
+      match move pending {
+        Option<u16>.None => { break }
+        Option<u16>.Some { value: unit } => {
+          let mut point = u16.toU32(unit)
+          pending = iterator.next()
+          if !cesu8 && point >= 0xd800 && point <= 0xdbff {
+            match &pending {
+              Option<u16>.Some { value: low } => {
+                if low >= 0xdc00 && low <= 0xdfff {
+                  point = 65536 + (point - 0xd800) * 1024 + u16.toU32(low) - 0xdc00
+                  pending = iterator.next()
+                }
+              }
+              Option<u16>.None => {}
+            }
+          }
+          let mut encoded: [u8; 6] = [0; 6]
+          let length = Utf8.encode(point, &mut encoded)
+          let mut i: usize = 0
+          while i < length {
+            run result.append(encoded[i])
+            i = i + 1
+          }
+        }
+      }
+    }
+    return move result
+  }
+  pub effect fn toCString(value: Value, cesu8: bool, rejectNull: bool) -> List<u8>
+    ! OutOfMemoryError | EmbeddedNullError ? &mut Allocator {
+    let mut result = run Strings.toUtf8(value, cesu8)
+    if rejectNull {
+      let mut i: usize = 0
+      while i < result.length() {
+        if result.get(i) == 0 { fail EmbeddedNullError {} }
+        i = i + 1
+      }
+    }
+    run result.append(0)
+    return move result
+  }
+}
+
+struct RopeBuckets { values: [Value; 44] }
+impl RopeBuckets {
+  fn make() -> Self { return RopeBuckets { values: [Value.Undefined; 44] } }
+  fn take(self: &mut Self, index: usize) -> Value {
+    let result = self.values[index]
+    self.values[index] = Value.Undefined
+    return result
+  }
+}
+impl Drop for RopeBuckets {
+  fn drop(self: &mut Self) -> () {
+    let mut index: usize = 0
+    while index < 44 {
+      releaseString(self.values[index])
+      index = index + 1
+    }
+  }
+}
+const FIBONACCI: [usize; 44] = [1,2,3,5,8,13,21,34,55,89,144,233,377,610,987,1597,2584,4181,6765,10946,17711,28657,46368,75025,121393,196418,317811,514229,832040,1346269,2178309,3524578,5702887,9227465,14930352,24157817,39088169,63245986,102334155,165580141,267914296,433494437,701408733,1134903170]

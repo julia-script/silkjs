@@ -1,0 +1,382 @@
+//! For-in snapshots and delayed prototype enumeration, quickjs.c:749-756,
+//! 6425-6447,16515-16743. build consumes input; next borrows its iterator and
+//! returns an owned value. No table copies and no payload loans across callbacks.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.list { List }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.result { Result }
+import silk.u8
+import silk.u32
+import silk.usize
+import runtime_memory { AllocationObserver }
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_core_types { ObjectData, ObjectPayload, ObjectPayloadFamily, ShapeData,
+  PropertyEnum, RuntimeState, NativeErrorKind, JS_PROP_ENUMERABLE }
+import js_value { Value }
+import js_atoms { ATOM_INTEGER_TAG }
+import js_gc { HeapHooks, Tracer }
+import js_gc as gc
+import js_runtime as runtime
+import js_class_data as classes
+import js_object_allocate as objects
+import js_boxing as boxing
+import js_property_names as names
+import js_property_names { OwnKeysError, JS_GPN_STRING_MASK, JS_GPN_SET_ENUM, JS_GPN_ENUM_ONLY }
+import js_property_descriptors as descriptors
+import js_property_mutations as mutations
+import js_prototypes as prototypes
+import js_property_host { OwnKeysHooks, OwnPropertyHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_prototype_host { PrototypeHooks }
+import js_coercion_host { CoercionHooks }
+import js_interrupt_host { InterruptHooks }
+import js_interrupts as interrupts
+import js_string_types { StringLengthError }
+import js_bigint { BigIntError }
+import js_exceptions { JsException }
+
+struct State {
+  object: Value, index: usize, count: usize, inPrototypeChain: bool,
+  isArray: bool, atoms: List<PropertyEnum>
+}
+pub struct Next { pub value: Value, pub done: bool }
+fn trap() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+fn reference(input: Value) -> *mut HeapHeader {
+  return match input { Value.Object { reference } => reference _ => trap() }
+}
+unsafe fn storage(object: *mut HeapHeader) -> ?*mut HeapHeader {
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  return match &data.payload {
+    ObjectPayload.Opaque { family, reference } => {
+      if family != ObjectPayloadFamily.ForInIterator { trap() }
+      return reference
+    }
+    ObjectPayload.Empty => Pointer.null<HeapHeader>()
+    _ => trap()
+  }
+}
+unsafe fn stateNode(object: *mut HeapHeader) -> *mut HeapHeader {
+  return match Pointer.nonNullMut<HeapHeader>(unsafe storage(object)) {
+    Option<*mut HeapHeader>.Some { value } => value
+    _ => trap()
+  }
+}
+// Auxiliary state is not a GC vertex: trace its actual owned JS edge directly.
+pub unsafe fn mark(object: *mut HeapHeader, tracer: &mut Tracer) -> () {
+  match Pointer.nonNullMut<HeapHeader>(unsafe storage(object)) {
+    Option<*mut HeapHeader>.Some { value } => {
+      let anchor = () let state = unsafe HeapCell.payload<State, ()>(&anchor, value)
+      unsafe tracer.value(state.object)
+    }
+    Option<*mut HeapHeader>.None => ()
+  }
+}
+pub unsafe fn finalize<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, object: *mut HeapHeader) -> () {
+  match Pointer.nonNullMut<HeapHeader>(unsafe storage(object)) {
+    Option<*mut HeapHeader>.Some { value: node } => {
+      let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, object)
+      data.payload = ObjectPayload.Opaque { family: ObjectPayloadFamily.ForInIterator, reference: Pointer.null<HeapHeader>() }
+      drop data
+      let state = unsafe HeapCell.payloadMut<State, ()>(&mut anchor, node)
+      let owned = Intrinsic.replace(state.object, Value.Undefined)
+      let table = Intrinsic.replace(state.atoms, List<PropertyEnum>.make())
+      drop state
+      unsafe gc.release(&mut hooks, rt, owned)
+      unsafe names.releaseNames(rt, move table)
+      unsafe HeapCell.destroy<State>(node)
+    }
+    Option<*mut HeapHeader>.None => ()
+  }
+}
+unsafe effect fn outOfMemory<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader) -> () ! JsException ? &mut Allocator {
+  return run unsafe hooks.throwOutOfMemory(context)
+}
+unsafe effect fn uninitialized<H: OwnPropertyHooks>(hooks: &mut H, context: *mut HeapHeader, atom: u32) -> () ! JsException ? &mut Allocator {
+  return run unsafe OwnPropertyHooks.throwUninitialized(&mut hooks, context, atom)
+}
+unsafe effect fn materializeValue<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  error: OutOfMemoryError | StringLengthError | BigIntError | JsException) -> Value ! JsException ? &mut Allocator {
+  return run unsafe materialize(&mut hooks, context, move error)
+}
+unsafe effect fn materialize<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  error: OutOfMemoryError | StringLengthError | BigIntError | JsException) -> never
+  ! JsException ? &mut Allocator {
+  match move error {
+    OutOfMemoryError allocation => { return run unsafe hooks.throwOutOfMemory(context) }
+    StringLengthError length => { return run unsafe hooks.throwError(context, NativeErrorKind.Internal, b"string too long") }
+    BigIntError impossible => trap()
+    JsException signal => { fail move signal }
+  }
+}
+unsafe effect fn ownNames<H: HeapHooks + OwnKeysHooks + OwnPropertyHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value, flags: u32) -> List<PropertyEnum> ! JsException ? &mut Allocator {
+  let result = run Effect.result(unsafe names.getOwnPropertyNames(&mut hooks, context, object, flags))
+  match move result {
+    Result<List<PropertyEnum>, OutOfMemoryError | OwnKeysError | JsException | StringLengthError>.Success { value } => { return move value }
+    Result<List<PropertyEnum>, OutOfMemoryError | OwnKeysError | JsException | StringLengthError>.Failure { error } => {
+      match move error {
+        OwnKeysError own => {
+          match move own {
+            OwnKeysError.NotObject => { return run unsafe OwnPropertyHooks.throwNotObject(&mut hooks, context) }
+            OwnKeysError.Uninitialized { name } => {
+              let rt = unsafe runtime.contextRuntime(context)
+              let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+              let interned = run Effect.result(state.atoms.internOwned(unsafe name.get().retained()))
+              drop state
+              let atom = match move interned {
+                Result<u32, OutOfMemoryError>.Success { value } => value
+                Result<u32, OutOfMemoryError>.Failure { .. } => { return run unsafe hooks.throwOutOfMemory(context) }
+              }
+              let thrown = run Effect.result(unsafe uninitialized(&mut hooks, context, atom))
+              unsafe mutations.releaseAtom(rt, atom)
+              match move thrown {
+                Result<(), JsException>.Failure { error: thrownError } => { fail move thrownError }
+                Result<(), JsException>.Success { .. } => trap()
+              }
+            }
+          }
+        }
+        OutOfMemoryError allocation => { return run unsafe hooks.throwOutOfMemory(context) }
+        StringLengthError length => { return run unsafe hooks.throwError(context, NativeErrorKind.Internal, b"string too long") }
+        JsException signal => { fail move signal }
+      }
+    }
+  }
+}
+unsafe effect fn exists<H: HeapHooks + OwnPropertyHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value, atom: u32) -> bool ! JsException ? &mut Allocator {
+  let result = run Effect.result(unsafe descriptors.hasOwnProperty(&mut hooks, context, object, atom))
+  return match move result {
+    Result<bool, OutOfMemoryError | JsException>.Success { value } => value
+    Result<bool, OutOfMemoryError | JsException>.Failure { error } => run unsafe materialize(&mut hooks, context, move error)
+  }
+}
+unsafe effect fn visit<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,
+  context: *mut HeapHeader, iterator: Value, atom: u32) -> () ! JsException ? &mut Allocator {
+  let result = run Effect.result(unsafe mutations.definePropertyValue(&mut hooks, context, iterator, atom, Value.Null, JS_PROP_ENUMERABLE))
+  match move result {
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { .. } => ()
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => { return run unsafe materialize(&mut hooks, context, move error) }
+  }
+}
+unsafe effect fn prototype<H: HeapHooks + PrototypeHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, object: Value) -> Value ! JsException ? &mut Allocator {
+  // The owner survives pending-error construction, just as GetPrototypeFree's
+  // source callee installs its exception before releasing the consuming input.
+  let result = run Effect.result(unsafe prototypes.getPrototype(&mut hooks, context, object))
+  let normalized = match move result {
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => Result<Value, JsException>.Success { value: value }
+    Result<Value, OutOfMemoryError | JsException>.Failure { error } => run Effect.result(unsafe materializeValue(&mut hooks, context, move error))
+  }
+  unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), object)
+  return match move normalized {
+    Result<Value, JsException>.Success { value } => value
+    Result<Value, JsException>.Failure { error } => { fail move error }
+  }
+}
+unsafe fn fastCount(object: Value) -> Option<usize> {
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(object))
+  if !data.fastArray { return Option<usize>.none() }
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+  let mut index: usize = 0
+  while index < shape.properties.length() {
+    if (u8.toU32(shape.properties.get(index).flags) & JS_PROP_ENUMERABLE) != 0 { return Option<usize>.none() }
+    index = index + 1
+  }
+  let count = match &data.payload {
+    ObjectPayload.FastArray { array } => array.values.length()
+    ObjectPayload.MappedArguments { arguments } => arguments.varRefs.length()
+    ObjectPayload.TypedArray { array } => u32.toUsize(array.count)
+    ObjectPayload.Empty => 0
+    _ => trap()
+  }
+  return Option<usize>.some(count)
+}
+unsafe fn installTable(rt: *mut HeapHeader, node: *mut HeapHeader, table: List<PropertyEnum>, reset: bool) -> () {
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<State, ()>(&mut anchor, node)
+  let old = Intrinsic.replace(state.atoms, move table)
+  state.count = state.atoms.length()
+  state.isArray = false
+  if reset { state.index = 0 }
+  drop state
+  unsafe names.releaseNames(rt, move old)
+}
+unsafe effect fn initialize<H: HeapHooks + OwnKeysHooks + OwnPropertyHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, iterator: Value, object: Value) -> () ! JsException ? &mut Allocator {
+  if object.tag() == 2 || object.tag() == 3 { return () }
+  let node = unsafe stateNode(reference(iterator))
+  match unsafe fastCount(object) {
+    Option<usize>.Some { value } => {
+      let mut anchor = () let state = unsafe HeapCell.payloadMut<State, ()>(&mut anchor, node)
+      state.isArray = true state.count = value
+    }
+    Option<usize>.None => {
+      let table = run unsafe ownNames(&mut hooks, context, object, JS_GPN_STRING_MASK | JS_GPN_SET_ENUM)
+      unsafe installTable(unsafe runtime.contextRuntime(context), node, move table, false)
+    }
+  }
+}
+unsafe effect fn buildOwned<H: HeapHooks + OwnKeysHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, input: Value) -> Value ! JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  let mut object = input
+  if !object.isObject() && object.tag() != 2 && object.tag() != 3 {
+    object = run unsafe boxing.toObjectFree(&mut hooks, memory, context, object)
+    if object.isException() { fail JsException {} }
+  }
+  let allocated = run Effect.result(HeapCell.allocate(HeapKind.Auxiliary, State { object: Value.Undefined,
+    index: 0, count: 0, inPrototypeChain: false, isArray: false, atoms: List<PropertyEnum>.make() }))
+  let node = match move allocated {
+    Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value
+    Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => {
+      let pending = run Effect.result(unsafe outOfMemory(&mut hooks, context))
+      unsafe gc.release(&mut hooks, rt, object)
+      match move pending { Result<(), JsException>.Failure { error: pendingError } => { fail move pendingError } Result<(), JsException>.Success { .. } => trap() }
+    }
+  }
+  let allocatedObject = run Effect.result(unsafe objects.withPrototypeClass(&mut hooks, memory, context, Value.Null, classes.JS_CLASS_FOR_IN_ITERATOR))
+  let iterator = match move allocatedObject {
+    Result<Value, OutOfMemoryError>.Success { value } => value
+    Result<Value, OutOfMemoryError>.Failure { error } => {
+      let pending = run Effect.result(unsafe outOfMemory(&mut hooks, context))
+      unsafe HeapCell.destroy<State>(node)
+      unsafe gc.release(&mut hooks, rt, object)
+      match move pending { Result<(), JsException>.Failure { error: pendingError } => { fail move pendingError } Result<(), JsException>.Success { .. } => trap() }
+    }
+  }
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<State, ()>(&mut anchor, node)
+  state.object = object drop state
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, reference(iterator))
+  data.payload = ObjectPayload.Opaque { family: ObjectPayloadFamily.ForInIterator, reference: node } drop data
+  let initialized = run Effect.result(unsafe initialize(&mut hooks, context, iterator, object))
+  return match move initialized {
+    Result<(), JsException>.Success { .. } => iterator
+    Result<(), JsException>.Failure { error } => { unsafe gc.release(&mut hooks, rt, iterator) fail move error }
+  }
+}
+pub unsafe effect fn build<H: HeapHooks + OwnKeysHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, input: Value) -> Value ! JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  unsafe HeapCell.retain(context)
+  let result = run Effect.result(unsafe buildOwned(&mut hooks, memory, context, input))
+  unsafe gc.releaseHeader(&mut hooks, rt, context)
+  return match move result { Result<Value, JsException>.Success { value } => value Result<Value, JsException>.Failure { error } => { fail move error } }
+}
+unsafe effect fn prepare<H: HeapHooks + OwnKeysHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, iterator: Value, node: *mut HeapHeader) -> bool ! JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  let anchor = () let initial = unsafe HeapCell.payload<State, ()>(&anchor, node)
+  let mut cursor = unsafe initial.object.retained() drop initial
+  while true {
+    cursor = run unsafe prototype(&mut hooks, context, cursor)
+    if cursor.tag() == 2 { return true }
+    let enumerated = run Effect.result(unsafe ownNames(&mut hooks, context, cursor, JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY))
+    let table = match move enumerated {
+      Result<List<PropertyEnum>, JsException>.Success { value } => move value
+      Result<List<PropertyEnum>, JsException>.Failure { error } => { unsafe gc.release(&mut hooks, rt, cursor) fail move error }
+    }
+    let count = table.length() unsafe names.releaseNames(rt, move table)
+    if count != 0 { unsafe gc.release(&mut hooks, rt, cursor) break }
+    let polled = run Effect.result(unsafe interrupts.poll(&mut hooks, memory, context))
+    match move polled { Result<(), JsException>.Success { .. } => () Result<(), JsException>.Failure { error } => { unsafe gc.release(&mut hooks, rt, cursor) fail move error } }
+  }
+  let state = unsafe HeapCell.payload<State, ()>(&anchor, node)
+  let array = state.isArray let object = state.object drop state
+  if array {
+    let table = run unsafe ownNames(&mut hooks, context, object, JS_GPN_STRING_MASK | JS_GPN_SET_ENUM)
+    unsafe installTable(rt, node, move table, false)
+  }
+  let mut index: usize = 0
+  while true {
+    let current = unsafe HeapCell.payload<State, ()>(&anchor, node)
+    if index >= current.count { break }
+    let atom = current.atoms.get(index).atom drop current
+    run unsafe visit(&mut hooks, context, iterator, atom)
+    index = index + 1
+  }
+  return false
+}
+unsafe effect fn candidate<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,
+  context: *mut HeapHeader, iterator: Value, node: *mut HeapHeader, atom: u32, enumerable: bool, inherited: bool) -> Next ! JsException ? &mut Allocator {
+  if inherited {
+    if run unsafe exists(&mut hooks, context, iterator, atom) { return Next { value: Value.Undefined, done: true } }
+    run unsafe visit(&mut hooks, context, iterator, atom)
+  }
+  if !enumerable { return Next { value: Value.Undefined, done: true } }
+  let anchor = () let state = unsafe HeapCell.payload<State, ()>(&anchor, node)
+  let object = state.object drop state
+  if !run unsafe exists(&mut hooks, context, object, atom) { return Next { value: Value.Undefined, done: true } }
+  let runtimeState = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, unsafe runtime.contextRuntime(context))
+  let converted = run Effect.result(runtimeState.atoms.toValue(atom, true)) drop runtimeState
+  // Source JS_AtomToValue failure is a value result, with done=false and the
+  // allocation exception pending; it is not the -1 return of js_for_in_next.
+  let output = match move converted {
+    Result<Value, OutOfMemoryError | StringLengthError>.Success { value } => value
+    Result<Value, OutOfMemoryError | StringLengthError>.Failure { error } => run Effect.catch<JsException>(unsafe materializeValue(&mut hooks, context, move error), exceptionValue)
+  }
+  return Next { value: output, done: false }
+}
+effect fn exceptionValue(error: JsException) -> Value { drop error return Value.Exception }
+unsafe effect fn advance<H: HeapHooks + OwnKeysHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, iterator: Value, node: *mut HeapHeader) -> Next ! JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  while true {
+    let mut anchor = () let state = unsafe HeapCell.payloadMut<State, ()>(&mut anchor, node)
+    if state.index >= state.count {
+      let object = state.object let inherited = state.inPrototypeChain drop state
+      if object.tag() == 2 || object.tag() == 3 { return Next { value: Value.Undefined, done: true } }
+      if !inherited {
+        if run unsafe prepare(&mut hooks, memory, context, iterator, node) { return Next { value: Value.Undefined, done: true } }
+        let prepared = unsafe HeapCell.payloadMut<State, ()>(&mut anchor, node)
+        prepared.inPrototypeChain = true
+        drop prepared
+      }
+      let before = unsafe HeapCell.payload<State, ()>(&anchor, node)
+      let owned = unsafe before.object.retained() drop before
+      let changed = run Effect.result(unsafe prototype(&mut hooks, context, owned))
+      let nextObject = match &changed { Result<Value, JsException>.Success { value } => value _ => Value.Exception }
+      let previous = unsafe HeapCell.payload<State, ()>(&anchor, node)
+      let old = previous.object drop previous
+      unsafe gc.release(&mut hooks, rt, old)
+      let updated = unsafe HeapCell.payloadMut<State, ()>(&mut anchor, node)
+      updated.object = nextObject drop updated
+      match move changed { Result<Value, JsException>.Success { .. } => () Result<Value, JsException>.Failure { error } => { fail move error } }
+      if nextObject.tag() == 2 { return Next { value: Value.Undefined, done: true } }
+      run unsafe interrupts.poll(&mut hooks, memory, context)
+      let current = unsafe HeapCell.payload<State, ()>(&anchor, node)
+      let currentObject = current.object drop current
+      let table = run unsafe ownNames(&mut hooks, context, currentObject, JS_GPN_STRING_MASK | JS_GPN_SET_ENUM)
+      unsafe installTable(rt, node, move table, true)
+    } else {
+      let mut entry = PropertyEnum { atom: 0, isEnumerable: false }
+      if state.isArray { entry = PropertyEnum { atom: usize.toU32(state.index) | ATOM_INTEGER_TAG, isEnumerable: true } }
+      else { entry = state.atoms.get(state.index) }
+      let inherited = state.inPrototypeChain && !state.isArray
+      state.index = state.index + 1 drop state
+      let runtimeState = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+      let atom = runtimeState.atoms.duplicate(entry.atom) drop runtimeState
+      let result = run Effect.result(unsafe candidate(&mut hooks, context, iterator, node, atom, entry.isEnumerable, inherited))
+      unsafe mutations.releaseAtom(rt, atom)
+      match move result {
+        Result<Next, JsException>.Success { value } => { if !value.done { return move value } }
+        Result<Next, JsException>.Failure { error } => { fail move error }
+      }
+    }
+  }
+}
+pub unsafe effect fn next<H: HeapHooks + OwnKeysHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, iterator: Value) -> Next ! JsException ? &mut Allocator {
+  if !iterator.isObject() { return Next { value: Value.Undefined, done: true } }
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(iterator))
+  if data.classId != classes.JS_CLASS_FOR_IN_ITERATOR { return Next { value: Value.Undefined, done: true } }
+  drop data
+  let rt = unsafe runtime.contextRuntime(context)
+  unsafe HeapCell.retain(context)
+  let owner = unsafe iterator.retained()
+  let result = run Effect.result(unsafe advance(&mut hooks, memory, context, iterator, unsafe stateNode(reference(iterator))))
+  unsafe gc.release(&mut hooks, rt, owner)
+  unsafe gc.releaseHeader(&mut hooks, rt, context)
+  return match move result { Result<Next, JsException>.Success { value } => move value Result<Next, JsException>.Failure { error } => { fail move error } }
+}

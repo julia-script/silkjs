@@ -1,0 +1,151 @@
+//! Runtime-independent shared class-ID namespace and source-ordered registration.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.option { Option }
+import silk.pointer { Pointer }
+import silk.result { Result }
+import silk.sync { Arc, Mutex }
+import silk.thread { Transferable, Concurrent }
+import silk.u32
+import silk.usize
+import silk.slice { Slice }
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types { RuntimeState, ContextState, ObjectData, ClassDef }
+import js_class_data { JS_CLASS_INIT_COUNT }
+import js_runtime_classes { emptyDefinition }
+import js_strings { Strings }
+import js_string_types { StringLengthError }
+
+struct ClassNamespace { next: u32, builtins: [u32; 22] }
+impl Transferable for ClassNamespace {}
+
+/// Create ONE namespace for an embedding, and clone it across runtimes/threads.
+/// It intentionally belongs to the embedding, not RuntimeState: creating a runtime
+/// must never reset the process-wide allocation sequence. Cached slots can be shared
+/// with allocateShared when all their accesses use this namespace's lock.
+pub struct ClassIdAllocator { shared: Arc<Mutex<ClassNamespace>> }
+impl Transferable for ClassIdAllocator {}
+impl Concurrent for ClassIdAllocator {}
+impl ClassIdAllocator {
+  pub effect fn make() -> Self ! OutOfMemoryError ? &mut Allocator {
+    let lock = run Mutex<ClassNamespace>.make(ClassNamespace { next: JS_CLASS_INIT_COUNT, builtins: [0; 22] })
+    return Self { shared: run Arc<Mutex<ClassNamespace>>.make(move lock) }
+  }
+  pub fn clone(self: &Self) -> Self { return Self { shared: self.shared.clone() } }
+  pub fn allocate(self: &Self, cached: &mut u32) -> u32 {
+    if cached.* != 0 { return cached.* }
+    return unsafe self.allocateShared(Pointer.fromMutRef<u32>(&mut cached.*))
+  }
+  /// Canonical source-static IDs across every runtime in this embedding.
+  /// Intl classes0..9, Segments10, SegmentIterator11, Temporal12..19, FILE20, Worker21.
+  pub fn builtin(self: &Self, slot: usize) -> u32 {
+    if slot >= 22 { return Intrinsic.trap("invalid builtin class slot") }
+    let mut guard = self.shared.get().lock()
+    let state = guard.getMut()
+    let cached = state.builtins[slot]
+    if cached != 0 { return cached }
+    let id = state.next
+    state.next = u32.wrappingAdd(id, 1)
+    state.builtins[slot] = id
+    return id
+  }
+  /// cached is live aligned storage; concurrent access is exclusively through
+  /// allocateShared on clones of THIS namespace. Zero allocates; nonzero is cached.
+  pub unsafe fn allocateShared(self: &Self, cached: *mut u32) -> u32 {
+    let mut guard = self.shared.get().lock()
+    let old = unsafe Pointer.read<u32>(cached)
+    if old != 0 { return old }
+    let state = guard.getMut()
+    let id = state.next
+    state.next = u32.wrappingAdd(id, 1)
+    unsafe Pointer.write<u32>(cached, id)
+    return id
+  }
+}
+pub unsafe fn getClassId(value: Value) -> u32 {
+  match value {
+    Value.Object { reference } => {
+      let anchor = ()
+      unsafe { return HeapCell.payload<ObjectData, ()>(&anchor, reference).classId }
+    }
+    _ => { return 0 }
+  }
+}
+pub unsafe fn isRegisteredClass(runtime: *mut HeapHeader, id: u32) -> bool {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  return u32.toUsize(id) < state.classes.length() && state.classes.asSlice()[u32.toUsize(id)].classId != 0
+}
+/// nameAtom is borrowed and retained ONLY after all allocations succeed. Incoming
+/// descriptor fields own no JS references. ID zero is source-compatible: registration
+/// succeeds but leaves the slot unregistered (class_id == 0).
+/// On OOM, earlier contexts may already have grown; class count remains unchanged.
+pub unsafe effect fn registerClassAtom(runtime: *mut HeapHeader, id: u32, nameAtom: u32, definition: ClassDef) -> bool
+  ! OutOfMemoryError ? &mut Allocator {
+  if id >= 65536 || unsafe isRegisteredClass(runtime, id) { return false }
+  let mut anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let oldCount = state.classes.length()
+  let mut cursor = state.contexts.first
+  drop state
+  if u32.toUsize(id) >= oldCount {
+    let mut newCount = oldCount * 3 / 2
+    if newCount < u32.toUsize(JS_CLASS_INIT_COUNT) { newCount = u32.toUsize(JS_CLASS_INIT_COUNT) }
+    if newCount < u32.toUsize(id) + 1 { newCount = u32.toUsize(id) + 1 }
+    while !Pointer.isNull<HeapHeader>(cursor) {
+      let pointer = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(cursor)
+      let context = unsafe HeapCell.payloadMut<ContextState, ()>(&mut anchor, pointer)
+      cursor = context.nextContext
+      // An earlier failed registration can leave a longer list. Source realloc
+      // reinitializes every slot from oldCount on each retry, even after shrink.
+      context.classPrototypes.truncate(newCount)
+      let additional = newCount - context.classPrototypes.length()
+      run context.classPrototypes.reserveExact(additional)
+      while context.classPrototypes.length() < newCount { run context.classPrototypes.append(Value.Null) }
+      let mut index = oldCount
+      while index < context.classPrototypes.length() {
+        context.classPrototypes.set(index, Value.Null)
+        index = index + 1
+      }
+    }
+    let growing = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+    let additionalClasses = newCount - growing.classes.length()
+    run growing.classes.reserveExact(additionalClasses)
+    while growing.classes.length() < newCount { run growing.classes.append(emptyDefinition()) }
+  }
+  let committing = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  let mut installed = move definition
+  installed.classId = id
+  installed.classNameAtom = committing.atoms.duplicate(nameAtom)
+  // Repeated ID-zero registration overwrites the source slot; reclaim the old
+  // name ownership instead of leaking an unreachable dynamic atom.
+  let oldName = committing.classes.asSlice()[u32.toUsize(id)].classNameAtom
+  committing.classes.set(u32.toUsize(id), move installed)
+  committing.atoms.release(oldName)
+  return true
+}
+/// JS_NewClass treats class_name as 8-bit bytes (not UTF-8). Embedded NUL ends it.
+/// This wrapper always releases its temporary atom, including allocation failure.
+pub unsafe effect fn registerClass(runtime: *mut HeapHeader, id: u32, name: &[u8], definition: ClassDef) -> bool
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let mut length: usize = 0
+  while length < name.length && name[length] != 0 { length = length + 1 }
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  let bytes = Slice.view<u8>(name, 0, length)
+  let mut atom = state.atoms.findAscii(bytes)
+  if atom == 0 {
+    let value = run Strings.fromLatin1(bytes)
+    atom = run state.atoms.internStringOwned(value)
+  }
+  drop state
+  let outcome = run Effect.result(unsafe registerClassAtom(runtime, id, atom, move definition))
+  let after = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  after.atoms.release(atom)
+  drop after
+  match move outcome {
+    Result<bool, OutOfMemoryError>.Success { value } => { return value }
+    Result<bool, OutOfMemoryError>.Failure { error } => { fail move error }
+  }
+}

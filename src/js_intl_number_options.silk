@@ -1,0 +1,287 @@
+//! Native pinned intl/numberformat.c:1282-1773 and 3665-3734, before/after
+//! constructor allocation and receiver unwrapping owned by js_intl_numberformat.
+//! Keeps Get/coercion/validation order, compact digit flags, C-string truncation,
+//! and source-ignored ToCString exceptions, including their pending OOM errors.
+//! Native allocations have RAII ownership. Default/stripped/rebuilt locale OOM
+//! propagates instead of creating unchecked null C state, and resolvedOptions
+//! propagates property/string allocation failures instead of returning a partial
+//! object with a pending exception as the unchecked C definitions can do.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.result { Result }
+import silk.option { Option }
+import silk.string { String }
+import silk.i32
+import runtime_memory { AllocationObserver }
+import js_heap { HeapHeader }
+import js_value { Value }
+import js_core_types { FrameSlots, NativeErrorKind, JS_PROP_C_W_E }
+import js_gc { HeapHooks }
+import js_coercion_host { CoercionHooks }
+import js_property_host { OwnPropertyHooks, GetPropertyHooks, HasPropertyHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_exceptions { JsException }
+import js_collection_support { Scope }
+import js_collection_support as owners
+import js_proxy_core as core
+import js_primitives as primitives
+import js_object_allocate as objects
+import js_intl_common as common
+import js_intl_number_record { NumberFormatRecord }
+import js_intl_number_options_tables as tables
+import intl_shared as shared
+import intl_numbering_data as numbering
+
+fn present(value: &Option<String>) -> bool {
+  return match &value.* { Option<String>.Some { .. } => true Option<String>.None => false }
+}
+unsafe effect fn invalid<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader, message: &[u8]) -> never ! JsException ? &mut Allocator {
+  return run unsafe hooks.throwError(context, NativeErrorKind.Range, message)
+}
+// C1349-1385,1406-1426,1467-1473 intentionally continue when ToCString fails.
+// Catching the effect does NOT clear the pending JS exception. Property Get
+// failures still propagate before this catch, and later errors can replace it.
+unsafe effect fn sourceOptionalText<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + CoercionHooks>(hooks: &mut H, context: *mut HeapHeader, options: Value, name: &[u8]) -> Option<String> ! JsException ? &mut Allocator {
+  let value = run unsafe common.get(&mut hooks, context, options, name)
+  if core.undefined(value) { return Option<String>.none() }
+  let converted = run Effect.result(unsafe common.text(&mut hooks, context, value, false))
+  unsafe owners.release(&mut hooks, context, value)
+  return match move converted {
+    Result<String, JsException>.Success { value: text } => Option<String>.some(move text)
+    Result<String, JsException>.Failure { .. } => Option<String>.none()
+  }
+}
+unsafe effect fn digitOptions<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + CoercionHooks>(hooks: &mut H, context: *mut HeapHeader, options: Value, record: &mut NumberFormatRecord, defaultMinimum: i32, defaultMaximum: i32) -> () ! JsException ? &mut Allocator {
+  let minimumInteger = run unsafe common.getNumberOption(&mut hooks, context, options, b"minimumIntegerDigits", 1, 21)
+  match move minimumInteger { Option<i32>.Some { value } => { record.minimumIntegerDigits = value } Option<i32>.None => () }
+  let mut hasMinimumFraction = false
+  let mut hasMaximumFraction = false
+  let minimumFraction = run unsafe common.getNumberOption(&mut hooks, context, options, b"minimumFractionDigits", 0, 100)
+  match move minimumFraction { Option<i32>.Some { value } => { record.minimumFractionDigits = value hasMinimumFraction = true } Option<i32>.None => () }
+  let maximumFraction = run unsafe common.getNumberOption(&mut hooks, context, options, b"maximumFractionDigits", 0, 100)
+  match move maximumFraction { Option<i32>.Some { value } => { record.maximumFractionDigits = value hasMaximumFraction = true } Option<i32>.None => () }
+  if hasMaximumFraction && !hasMinimumFraction {
+    record.minimumFractionDigits = defaultMinimum
+    if record.maximumFractionDigits < defaultMinimum { record.minimumFractionDigits = record.maximumFractionDigits }
+  } else if hasMinimumFraction && !hasMaximumFraction {
+    record.maximumFractionDigits = defaultMaximum
+    if record.minimumFractionDigits > defaultMaximum { record.maximumFractionDigits = record.minimumFractionDigits }
+  }
+  let minimumSignificant = run unsafe common.getNumberOption(&mut hooks, context, options, b"minimumSignificantDigits", 1, 21)
+  match move minimumSignificant { Option<i32>.Some { value } => { record.minimumSignificantDigits = value record.hasMinimumSignificantDigits = true } Option<i32>.None => () }
+  let maximumSignificant = run unsafe common.getNumberOption(&mut hooks, context, options, b"maximumSignificantDigits", 1, 21)
+  match move maximumSignificant { Option<i32>.Some { value } => { record.maximumSignificantDigits = value record.hasMaximumSignificantDigits = true } Option<i32>.None => () }
+  if record.hasMinimumSignificantDigits || record.hasMaximumSignificantDigits {
+    if !record.hasMinimumSignificantDigits { record.minimumSignificantDigits = 1 }
+    if !record.hasMaximumSignificantDigits { record.maximumSignificantDigits = 21 }
+    if record.maximumSignificantDigits < record.minimumSignificantDigits {
+      return run unsafe invalid(&mut hooks, context, b"maximumSignificantDigits must be >= minimumSignificantDigits")
+    }
+  }
+  let increment = run unsafe common.getNumberOption(&mut hooks, context, options, b"roundingIncrement", 1, 5000)
+  match move increment {
+    Option<i32>.Some { value } => {
+      if !tables.validIncrement(value) { return run unsafe invalid(&mut hooks, context, b"roundingIncrement out of range") }
+      record.roundingIncrement = value
+    }
+    Option<i32>.None => ()
+  }
+  record.roundingMode = run unsafe common.getStringOption(&mut hooks, context, options, b"roundingMode", &tables.ROUNDING_MODE_NAMES, 6)
+  record.roundingPriority = run unsafe common.getStringOption(&mut hooks, context, options, b"roundingPriority", &tables.ROUNDING_PRIORITY_NAMES, 0)
+  if record.roundingIncrement > 1 {
+    if record.roundingPriority != 0 { return run unsafe core.error(&mut hooks, context, b"roundingIncrement cannot be used with morePrecision or lessPrecision") }
+    if record.hasMinimumSignificantDigits || record.hasMaximumSignificantDigits { return run unsafe core.error(&mut hooks, context, b"roundingIncrement cannot be used with significant digits") }
+    if record.maximumFractionDigits != record.minimumFractionDigits { return run unsafe invalid(&mut hooks, context, b"maximumFractionDigits must equal minimumFractionDigits when roundingIncrement is used") }
+  }
+  record.trailingZeroDisplay = run unsafe common.getStringOption(&mut hooks, context, options, b"trailingZeroDisplay", &tables.TRAILING_ZERO_NAMES, 0)
+  if record.notation == 3 && record.roundingPriority == 0 && !record.hasMinimumSignificantDigits && !record.hasMaximumSignificantDigits && !hasMinimumFraction && !hasMaximumFraction {
+    record.minimumFractionDigits = 0
+    record.maximumFractionDigits = 0
+    record.minimumSignificantDigits = 1
+    record.maximumSignificantDigits = 2
+    record.roundingPriority = 1
+  }
+  // In particular, the pinned constructor does not reject mnfd > mxfd here.
+}
+unsafe effect fn groupingOption<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + CoercionHooks>(hooks: &mut H, context: *mut HeapHeader, options: Value, notation: i32) -> i32 ! JsException ? &mut Allocator {
+  let mut fallback: i32 = 0
+  if notation == 3 { fallback = 1 }
+  let value = run unsafe common.get(&mut hooks, context, options, b"useGrouping")
+  if core.undefined(value) { return fallback }
+  if match value { Value.Bool { value: flag } => flag _ => false } { return 2 }
+  if unsafe primitives.toBoolean(value) == 0 { unsafe owners.release(&mut hooks, context, value) return 3 }
+  let converted = run Effect.result(unsafe common.text(&mut hooks, context, value, false))
+  unsafe owners.release(&mut hooks, context, value)
+  let text = match move converted { Result<String, JsException>.Success { value: output } => move output Result<String, JsException>.Failure { error } => { fail move error } }
+  let name = tables.cStringView(text.view())
+  if name == "true" || name == "false" { return fallback }
+  if name == "min2" { return 1 }
+  if name == "auto" { return 0 }
+  if name == "always" { return 2 }
+  return run unsafe invalid(&mut hooks, context, b"invalid useGrouping option")
+}
+unsafe effect fn parseOptions<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + CoercionHooks>(hooks: &mut H, context: *mut HeapHeader, options: Value, record: &mut NumberFormatRecord) -> () ! JsException ? &mut Allocator {
+  let localeMatcher = run unsafe common.getStringOption(&mut hooks, context, options, b"localeMatcher", &["lookup", "best fit"], 1)
+  drop localeMatcher
+  let numberingOption = run unsafe sourceOptionalText(&mut hooks, context, options, b"numberingSystem")
+  match move numberingOption {
+    Option<String>.Some { value } => {
+      let text = tables.cStringView(value.view())
+      if !tables.validNumberingSystem(text) { return run unsafe invalid(&mut hooks, context, b"invalid numberingSystem option") }
+      let numberSystem = shared.js_intl_string_to_numbering_system(text)
+      if numberSystem != numbering.NS_UNKNOWN { record.hasNumberingSystemOption = true record.numberingSystem = numberSystem }
+    }
+    Option<String>.None => ()
+  }
+  record.style = run unsafe common.getStringOption(&mut hooks, context, options, b"style", &tables.STYLE_NAMES, 0)
+  let currency = run unsafe sourceOptionalText(&mut hooks, context, options, b"currency")
+  match move currency {
+    Option<String>.Some { value } => {
+      if !tables.validCurrency(value.view()) { return run unsafe invalid(&mut hooks, context, b"invalid currency code") }
+      record.currency = Option<String>.some(tables.upperCurrency(move value))
+    }
+    Option<String>.None => ()
+  }
+  record.currencyDisplay = run unsafe common.getStringOption(&mut hooks, context, options, b"currencyDisplay", &tables.CURRENCY_DISPLAY_NAMES, 1)
+  record.currencySign = run unsafe common.getStringOption(&mut hooks, context, options, b"currencySign", &tables.CURRENCY_SIGN_NAMES, 0)
+  if record.style == 2 && !present(&record.currency) { return run unsafe core.error(&mut hooks, context, b"currency option is required when style is currency") }
+  if record.style != 2 { record.currency = Option<String>.none() }
+  let unit = run unsafe sourceOptionalText(&mut hooks, context, options, b"unit")
+  match move unit { Option<String>.Some { value } => { record.unit = Option<String>.some(tables.cStringOwned(move value)) } Option<String>.None => () }
+  if record.style == 3 && !present(&record.unit) { return run unsafe core.error(&mut hooks, context, b"unit option is required when style is unit") }
+  match &record.unit { Option<String>.Some { value } => { if !tables.wellFormedUnit(value.view()) { return run unsafe invalid(&mut hooks, context, b"invalid unit identifier") } } Option<String>.None => () }
+  record.unitDisplay = run unsafe common.getStringOption(&mut hooks, context, options, b"unitDisplay", &tables.UNIT_DISPLAY_NAMES, 0)
+  record.notation = run unsafe common.getStringOption(&mut hooks, context, options, b"notation", &tables.NOTATION_NAMES, 0)
+  let mut defaultMinimum = record.minimumFractionDigits
+  let mut defaultMaximum = record.maximumFractionDigits
+  if record.style == 2 {
+    match &record.currency {
+      Option<String>.Some { value } => {
+        if record.notation == 0 { defaultMinimum = shared.js_intl_get_currency_digits(value.view()) defaultMaximum = defaultMinimum }
+        else { defaultMinimum = 0 defaultMaximum = 3 if record.notation == 3 { defaultMaximum = 0 } }
+      }
+      Option<String>.None => ()
+    }
+  } else if record.style == 1 { defaultMinimum = 0 defaultMaximum = 0 }
+  record.minimumFractionDigits = defaultMinimum
+  record.maximumFractionDigits = defaultMaximum
+  run unsafe digitOptions(&mut hooks, context, options, &mut record.*, defaultMinimum, defaultMaximum)
+  record.compactDisplay = run unsafe common.getStringOption(&mut hooks, context, options, b"compactDisplay", &tables.COMPACT_NAMES, 2)
+  record.useGrouping = run unsafe groupingOption(&mut hooks, context, options, record.notation)
+  record.signDisplay = run unsafe common.getStringOption(&mut hooks, context, options, b"signDisplay", &tables.SIGN_DISPLAY_NAMES, 0)
+}
+effect fn finishLocale(record: &mut NumberFormatRecord) -> () ! OutOfMemoryError ? &mut Allocator {
+  match &record.localeCanonical {
+    Option<String>.Some { value: canonical } => {
+      if shared.js_intl_locale_has_key(canonical.view(), "nu") {
+        match shared.locale_unicode_key_view(canonical.view(), "nu") {
+          Option<string>.Some { value } => {
+            let extensionSystem = shared.js_intl_string_to_numbering_system(value)
+            if !record.hasNumberingSystemOption || extensionSystem == record.numberingSystem {
+              run record.locale.append("-u-nu-")
+              run record.locale.append(value)
+            }
+          }
+          Option<string>.None => ()
+        }
+      }
+    }
+    Option<String>.None => ()
+  }
+}
+unsafe effect fn buildBody<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, argv: &FrameSlots, record: &mut NumberFormatRecord, scope: &mut Scope) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  record.* = NumberFormatRecord.make()
+  record.locale = run String.copy("en-US")
+  record.numberingSystem = numbering.NS_LATN
+  record.localeCanonical = run unsafe common.firstLocale(&mut hooks, memory, context, unsafe common.argument(argv, 0))
+  match &record.localeCanonical {
+    Option<String>.Some { value: canonical } => {
+      match shared.locale_unicode_key_view(canonical.view(), "nu") {
+        Option<string>.Some { value } => {
+          let numberSystem = shared.js_intl_string_to_numbering_system(value)
+          if numberSystem != numbering.NS_UNKNOWN { record.numberingSystem = numberSystem }
+        }
+        Option<string>.None => ()
+      }
+      record.locale = run shared.js_intl_strip_unicode_extensions(canonical.view())
+    }
+    Option<String>.None => ()
+  }
+  let options = unsafe common.argument(argv, 1)
+  if !core.undefined(options) {
+    scope.values[0] = run unsafe common.toObjectOptions(&mut hooks, memory, context, options)
+    run unsafe parseOptions(&mut hooks, context, scope.values[0], &mut record.*)
+    unsafe owners.release(&mut hooks, context, scope.take(0))
+  }
+  if record.notation == 3 && record.compactDisplay == 2 { record.compactDisplay = 0 }
+  if record.style == 2 && !present(&record.currency) { return run unsafe core.error(&mut hooks, context, b"currency code is required with currency style") }
+  run finishLocale(&mut record.*)
+}
+pub unsafe effect fn build<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, argv: &FrameSlots, record: &mut NumberFormatRecord) -> () ! JsException ? &mut Allocator {
+  let mut scope = Scope.make()
+  let result = run Effect.result(unsafe buildBody(&mut hooks, memory, context, argv, &mut record.*, &mut scope))
+  match move result {
+    Result<(), OutOfMemoryError | JsException>.Success { .. } => { unsafe owners.cleanup(&mut hooks, context, move scope) }
+    Result<(), OutOfMemoryError | JsException>.Failure { error } => {
+      let pending = run Effect.catch<JsException>(unsafe core.materialize(&mut hooks, context, move error), core.exceptionValue)
+      unsafe owners.cleanup(&mut hooks, context, move scope)
+      fail JsException {}
+    }
+  }
+}
+unsafe effect fn defineText<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H, context: *mut HeapHeader, result: Value, key: &[u8], text: string) -> () ! JsException ? &mut Allocator {
+  let value = run unsafe common.stringValue(&mut hooks, context, text)
+  run unsafe common.define(&mut hooks, context, result, key, value, JS_PROP_C_W_E)
+}
+unsafe effect fn defineInteger<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H, context: *mut HeapHeader, result: Value, key: &[u8], value: i32) -> () ! JsException ? &mut Allocator {
+  run unsafe common.define(&mut hooks, context, result, key, Value.Int { value: value }, JS_PROP_C_W_E)
+}
+unsafe effect fn resolvedBody<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H, context: *mut HeapHeader, record: &NumberFormatRecord, result: Value) -> () ! JsException ? &mut Allocator {
+  run unsafe defineText(&mut hooks, context, result, b"locale", record.locale.view())
+  run unsafe defineText(&mut hooks, context, result, b"numberingSystem", numbering.intl_all_numbering_systems(record.numberingSystem))
+  run unsafe defineText(&mut hooks, context, result, b"style", tables.STYLE_NAMES[i32.toUsize(record.style)])
+  if record.style == 2 {
+    match &record.currency {
+      Option<String>.Some { value } => {
+        run unsafe defineText(&mut hooks, context, result, b"currency", value.view())
+        run unsafe defineText(&mut hooks, context, result, b"currencyDisplay", tables.CURRENCY_DISPLAY_NAMES[i32.toUsize(record.currencyDisplay)])
+        run unsafe defineText(&mut hooks, context, result, b"currencySign", tables.CURRENCY_SIGN_NAMES[i32.toUsize(record.currencySign)])
+      }
+      Option<String>.None => ()
+    }
+  }
+  if record.style == 3 {
+    match &record.unit {
+      Option<String>.Some { value } => {
+        run unsafe defineText(&mut hooks, context, result, b"unit", value.view())
+        run unsafe defineText(&mut hooks, context, result, b"unitDisplay", tables.UNIT_DISPLAY_NAMES[i32.toUsize(record.unitDisplay)])
+      }
+      Option<String>.None => ()
+    }
+  }
+  run unsafe defineInteger(&mut hooks, context, result, b"minimumIntegerDigits", record.minimumIntegerDigits)
+  run unsafe defineInteger(&mut hooks, context, result, b"minimumFractionDigits", record.minimumFractionDigits)
+  run unsafe defineInteger(&mut hooks, context, result, b"maximumFractionDigits", record.maximumFractionDigits)
+  if record.hasMinimumSignificantDigits || record.hasMaximumSignificantDigits {
+    run unsafe defineInteger(&mut hooks, context, result, b"minimumSignificantDigits", record.minimumSignificantDigits)
+    run unsafe defineInteger(&mut hooks, context, result, b"maximumSignificantDigits", record.maximumSignificantDigits)
+  }
+  if record.useGrouping == 3 { run unsafe common.define(&mut hooks, context, result, b"useGrouping", Value.Bool { value: false }, JS_PROP_C_W_E) }
+  else { run unsafe defineText(&mut hooks, context, result, b"useGrouping", tables.GROUPING_NAMES[i32.toUsize(record.useGrouping)]) }
+  run unsafe defineText(&mut hooks, context, result, b"notation", tables.NOTATION_NAMES[i32.toUsize(record.notation)])
+  if record.notation == 3 { run unsafe defineText(&mut hooks, context, result, b"compactDisplay", tables.COMPACT_NAMES[i32.toUsize(record.compactDisplay)]) }
+  run unsafe defineText(&mut hooks, context, result, b"signDisplay", tables.SIGN_DISPLAY_NAMES[i32.toUsize(record.signDisplay)])
+  run unsafe defineInteger(&mut hooks, context, result, b"roundingIncrement", record.roundingIncrement)
+  run unsafe defineText(&mut hooks, context, result, b"roundingMode", tables.ROUNDING_MODE_NAMES[i32.toUsize(record.roundingMode)])
+  run unsafe defineText(&mut hooks, context, result, b"roundingPriority", tables.ROUNDING_PRIORITY_NAMES[i32.toUsize(record.roundingPriority)])
+  run unsafe defineText(&mut hooks, context, result, b"trailingZeroDisplay", tables.TRAILING_ZERO_NAMES[i32.toUsize(record.trailingZeroDisplay)])
+}
+pub unsafe effect fn resolvedOptions<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, record: &NumberFormatRecord) -> Value ! JsException ? &mut Allocator {
+  let allocated = run Effect.result(unsafe objects.object(&mut hooks, memory, context))
+  let result = match move allocated { Result<Value, OutOfMemoryError>.Success { value } => value Result<Value, OutOfMemoryError>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error) }
+  let populated = run Effect.result(unsafe resolvedBody(&mut hooks, context, record, result))
+  match move populated {
+    Result<(), JsException>.Success { .. } => { return result }
+    Result<(), JsException>.Failure { error } => { unsafe owners.release(&mut hooks, context, result) fail move error }
+  }
+}
