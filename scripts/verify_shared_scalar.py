@@ -13,6 +13,7 @@ import tempfile
 import tomllib
 
 from verify_bytecode import executable_path, process
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = r'''
@@ -51,8 +52,8 @@ pub effect fn main() -> i32 ! OutOfMemoryError | StringLengthError | WriterError
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--silk', default='silk')
-    parser.add_argument('--stdlib', type=Path)
+    parser.add_argument('--silk', default=str(toolchain.compiler_path()))
+    parser.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
     parser.add_argument('--cutoffs', type=int, default=128)
     args = parser.parse_args()
     if args.cutoffs < 1:

@@ -15,6 +15,8 @@ import subprocess
 import tempfile
 import tomllib
 from pathlib import Path
+import toolchain
+from verify_bytecode import executable_path
 
 ROOT = Path(__file__).resolve().parents[1]
 BLOCK = 1024
@@ -366,6 +368,8 @@ def names(header, table):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('upstream', type=Path)
+    parser.add_argument('--silk', default=str(toolchain.compiler_path()))
+    parser.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
     args = parser.parse_args()
     upstream = args.upstream.resolve()
     pin = tomllib.loads((ROOT / 'upstream.toml').read_text())
@@ -404,7 +408,7 @@ def main():
         version = manifest['package']['silk-version']
         (temp / 'silk.toml').write_text(f'[package]\nname = "unicode-differential"\nversion = "0.0.0"\nsilk-version = "{version}"\n')
         print('Building and running independent native Silk probe...', flush=True)
-        actual = subprocess.run(['silk', 'run', '--quiet', '--release'], cwd=temp, stdout=subprocess.PIPE, check=True).stdout
+        actual = subprocess.run([executable_path(args.silk), 'run', '--quiet', '--release', '--stdlib', str(args.stdlib.resolve())], cwd=temp, stdout=subprocess.PIPE, check=True).stdout
         size = len(labels) * 8
         if len(actual) != size or len(expected) != size:
             raise SystemExit(f'Wrong record count: expected {size} bytes, C {len(expected)}, Silk {len(actual)}')

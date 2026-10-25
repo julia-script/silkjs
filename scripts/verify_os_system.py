@@ -24,10 +24,10 @@ import sys
 import tempfile
 import termios
 import time
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 PINNED = Path('/private/tmp/silkjs-quickjs-reference-20261023')
-SDK = '/Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk'
 
 
 def run(argv, *, cwd, expected=0, timeout=90, env=None):
@@ -171,17 +171,15 @@ def main():
     parser.add_argument('--oracle', type=Path, default=PINNED / 'qjs')
     parser.add_argument('--fault', type=Path, default=ROOT / 'build/os-system/os-fault')
     parser.add_argument('--build-fault', action='store_true')
-    parser.add_argument('--compiler', type=Path, default=ROOT / 'build/toolchain-main-dd2e99ab/silk-fixed5')
-    parser.add_argument('--stdlib', type=Path, default=ROOT / 'build/toolchain-main-dd2e99ab/stdlib')
-    parser.add_argument('--cc', default='/opt/homebrew/opt/llvm/bin/clang' if sys.platform == 'darwin' else 'cc')
+    parser.add_argument('--compiler', type=Path, default=toolchain.compiler_path())
+    parser.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
+    parser.add_argument('--cc', default=toolchain.clang_path())
     args = parser.parse_args()
     native = args.native.resolve(strict=True)
     oracle = args.oracle.resolve(strict=True)
     assert native != oracle, 'native and reference executable must be separate'
-    environment = dict(os.environ)
-    if sys.platform == 'darwin':
-        environment['SDKROOT'] = SDK
-        environment['SILK_CLANG'] = args.cc
+    environment = toolchain.host_environment()
+    environment['SILK_CLANG'] = args.cc
     environment['SILK_VERIFY_MIR'] = '1'
     fault = args.fault.resolve()
     if args.build_fault:
@@ -195,7 +193,7 @@ def main():
         abi = root / 'abi'
         command = [args.cc, '-std=c11', '-D_DEFAULT_SOURCE', ROOT / 'tests/fixtures/os_abi.c', '-o', abi]
         if sys.platform == 'darwin':
-            command += ['-isysroot', SDK]
+            command += ['-isysroot', environment['SDKROOT']]
         run(command, cwd=root)
         assert run([abi], cwd=root).stdout == b'os host ABI OK\n'
         outputs = []

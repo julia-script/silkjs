@@ -34,6 +34,7 @@ import struct
 import subprocess
 import tempfile
 import tomllib
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 SUPPORT = ('cutils.c', 'dtoa.c', 'libregexp.c', 'libunicode.c')
@@ -1043,8 +1044,8 @@ def process(command, timeout, *, owner, cwd=None, data=None, cases=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('upstream', type=Path)
-    parser.add_argument('--silk', default='silk', help='native compiler executable')
-    parser.add_argument('--stdlib', type=Path, help='source standard library for this compiler')
+    parser.add_argument('--silk', default=str(toolchain.compiler_path()), help='native compiler executable')
+    parser.add_argument('--stdlib', type=Path, help='source standard library for this compiler', default=toolchain.stdlib_path())
     parser.add_argument('--cc', default='cc', help='independent C compiler executable')
     parser.add_argument('--seed', type=lambda value: int(value, 0), default=0x571A6501)
     parser.add_argument('--random-cases', type=int, default=256, help='additional seeded cases; exhaustive domains are always enabled')

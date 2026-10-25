@@ -22,6 +22,8 @@ import struct
 import subprocess
 import tempfile
 import tomllib
+import toolchain
+from verify_bytecode import executable_path
 
 ROOT = Path(__file__).resolve().parents[1]
 FLAGS = dict(g=1, i=2, m=4, s=8, u=16, y=32, d=64, v=256)
@@ -718,6 +720,8 @@ def validate_pins(upstream):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('upstream', type=Path)
+    parser.add_argument('--silk', default=str(toolchain.compiler_path()))
+    parser.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
     parser.add_argument('--timeout', type=int, default=600, help='wall-clock seconds allowed per compiler/probe process (default: 600)')
     parser.add_argument('--max-mismatches', type=int, default=30)
     args = parser.parse_args()
@@ -761,7 +765,7 @@ def main():
               f'{vm_cases:,} VM cases ({latin1:,} Latin1, {vm_cases-latin1:,} UTF16), '
               f'{timeouts:,} timeouts including {controls} mandatory controls.', flush=True)
         print('Building and running standalone native Silk compiler plus both bytecode streams...', flush=True)
-        native = subprocess.run(['silk', 'run', '--quiet', '--release'], cwd=temp, stdout=subprocess.PIPE, timeout=args.timeout)
+        native = subprocess.run([executable_path(args.silk), 'run', '--quiet', '--release', '--stdlib', str(args.stdlib.resolve())], cwd=temp, stdout=subprocess.PIPE, timeout=args.timeout)
         if native.returncode:
             print(f'Silk probe exited with status {native.returncode}; decoding completed records for location.', flush=True)
         compare_native(native.stdout, cases, references, args.max_mismatches)

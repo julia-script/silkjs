@@ -33,6 +33,7 @@ import tomllib
 
 # Shared process/pin/protocol utilities, not implementation or expected data.
 from verify_strings import ROOT, SUPPORT, executable_path, validate_pins, records
+import toolchain
 
 ZONES = ('UTC0', 'EST5', 'NPT-5:45', 'NST3:30', 'EST5EDT,M3.2.0/2,M11.1.0/2')
 FIELD_NAMES = ('year', 'month', 'date', 'hour', 'minute', 'second', 'ms', 'weekday', 'east')
@@ -370,8 +371,8 @@ def process(command, timeout, *, cwd=None, data=None, env=None):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('upstream', type=Path)
-    ap.add_argument('--silk', default='silk')
-    ap.add_argument('--stdlib', type=Path)
+    ap.add_argument('--silk', default=str(toolchain.compiler_path()))
+    ap.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
     ap.add_argument('--cc', default='cc')
     ap.add_argument('--timeout', type=int, default=900)
     ap.add_argument('--random-cases', type=int, default=96)

@@ -13,6 +13,8 @@ import struct
 import subprocess
 import tempfile
 import tomllib
+import toolchain
+from verify_bytecode import executable_path
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -227,6 +229,8 @@ def literal(data, prefix='b'):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('upstream',type=Path)
+    parser.add_argument('--silk', default=str(toolchain.compiler_path()))
+    parser.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
     args=parser.parse_args()
     upstream=args.upstream.resolve()
     pin=tomllib.loads((ROOT/'upstream.toml').read_text())
@@ -284,7 +288,7 @@ def main():
         version=tomllib.loads((ROOT/'silk.toml').read_text())['package']['silk-version']
         (temp/'silk.toml').write_text(f'[package]\nname="dtoa-differential"\nversion="0.0.0"\nsilk-version="{version}"\n')
         print('Building and running native Silk numeric probe...',flush=True)
-        actual=subprocess.run(['silk','run','--quiet','--release'],cwd=temp,stdout=subprocess.PIPE,check=True).stdout
+        actual=subprocess.run([executable_path(args.silk),'run','--quiet','--release','--stdlib',str(args.stdlib.resolve())],cwd=temp,stdout=subprocess.PIPE,check=True).stdout
         if len(actual)!=len(labels)*8 or len(expected)!=len(labels)*8:
             raise SystemExit(f'Wrong record count: expected {len(labels)*8} bytes; C={len(expected)}, Silk={len(actual)}')
         mismatches=[]

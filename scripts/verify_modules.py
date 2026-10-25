@@ -15,6 +15,7 @@ import tomllib
 from verify_bytecode import SUPPORT, executable_path, validate_pins
 from verify_compiler_state import execute
 from verify_closures import C_SOURCE as CLOSURE_HARNESS
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 C_SOURCE = CLOSURE_HARNESS.split('static JSClosureVar cv(')[0] + r'''
@@ -198,8 +199,8 @@ def inspect(data: bytes, engine: str) -> tuple[int, ...]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('upstream', type=Path)
-    parser.add_argument('--silk', default='silk')
-    parser.add_argument('--stdlib', type=Path)
+    parser.add_argument('--silk', default=str(toolchain.compiler_path()))
+    parser.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
     parser.add_argument('--cc', default='/usr/bin/cc')
     args = parser.parse_args()
     upstream = args.upstream.expanduser().resolve()

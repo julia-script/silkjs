@@ -17,6 +17,7 @@ import struct
 import subprocess
 import tempfile
 from verify_bytecode import executable_path, process, validate_pins
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCALES = ['en-US', 'de', 'de-DE', 'deu', 'DE', 'tr', 'tr-TR', 'az', 'az-Latn', 'th', 'th-TH', 'fr', 'ja', 'zz-ZZ']
@@ -230,9 +231,9 @@ def native_source(values, units, pairs):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--upstream',type=Path,required=True)
-    parser.add_argument('--silk',required=True)
-    parser.add_argument('--stdlib',type=Path,required=True)
-    parser.add_argument('--cc',default='/opt/homebrew/opt/llvm/bin/clang')
+    parser.add_argument('--silk',default=str(toolchain.compiler_path()))
+    parser.add_argument('--stdlib',type=Path,default=toolchain.stdlib_path())
+    parser.add_argument('--cc', default=toolchain.clang_path())
     parser.add_argument('--timeout',type=int,default=900)
     parser.add_argument('--sanitize-c',action='store_true')
     args=parser.parse_args()

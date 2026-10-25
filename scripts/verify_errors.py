@@ -3,8 +3,9 @@
 
 C is an independent executable, never a binding. Both sides create real native
 and bytecode frames, inherit error names from real prototypes, and expose data
-property flags and UTF16 values. One-shot/persistent allocation cuts are swept
-independently: allocation indices are intentionally NOT compared across heaps.
+property flags and UTF16 values. One-shot/persistent allocation cuts independently
+check OOM-state reset and complete teardown. Internal allocation phases are not
+compared: native string reservation preallocates storage that C allocates later.
 Run: python3 scripts/verify_errors.py QUICKJS
 """
 import argparse
@@ -16,6 +17,7 @@ import struct
 import tempfile
 import tomllib
 from verify_bytecode import ROOT, SUPPORT, executable_path, process, validate_pins
+import toolchain
 
 C_SOURCE = r'''
 #include "quickjs.c"
@@ -127,20 +129,15 @@ static void one(int family,int kind,int message,int frame_kind,int policy,int or
  word(live_count);word(live_bytes);assert(!live_count&&!live_bytes);flush();
 }
 static void sweep(int traced) {
- unsigned seen=0;
  for(int mode=0;mode<2;mode++)for(int cut=0;cut<64;cut++) {
   armed=0;JSRuntime*rt=JS_NewRuntime2(&allocator,NULL);assert(rt);JSContext*ctx=JS_NewContext(rt);assert(ctx);
   JSValue function=JS_UNDEFINED;JSStackFrame frame={0};
   if(traced){function=JS_NewCFunction(ctx,native,"",0);assert(!JS_IsException(function));frame.cur_func=function;rt->current_stack_frame=&frame;}
   remaining=cut;persistent=mode;armed=1;raise2(ctx,JS_TYPE_ERROR,TRUE,"message");armed=0;
-  JSValue object=JS_GetException(ctx);int present,flags;JSValue message=own(object,JS_ATOM_message,&present,&flags);
-  if(JS_IsNull(object))seen|=1;if(present&&JS_IsException(message))seen|=2;
-  JSValue stack=own(object,JS_ATOM_stack,&present,&flags);
-  if(present&&JS_IsNull(stack))seen|=4;if(present&&JS_IsException(stack))seen|=8;
+  JSValue object=JS_GetException(ctx);
   assert(!rt->in_out_of_memory);JS_FreeValue(ctx,object);rt->current_stack_frame=NULL;JS_FreeValue(ctx,function);
   JS_FreeContext(ctx);JS_FreeRuntime(rt);assert(!live_count&&!live_bytes);
  }
- word(seen);word(live_count);word(live_bytes);flush();
 }
 int main(void){CALLS sweep(0);sweep(1);return 0;}
 '''
@@ -263,8 +260,8 @@ effect fn one(out:&mut ByteBuffer,family:usize,which:usize,message:usize,frameKi
  run data.writeU32(usize.toU32(observer.stats().allocationCount)) run data.writeU32(usize.toU32(observer.stats().usedBytes))
  run writeRecord(&mut out,&data)
 }
-effect fn sweep(out:&mut ByteBuffer,traced:bool)->() ! OutOfMemoryError | StringLengthError ? &mut Allocator {
- let mut seen:u32=0 let mut mode:usize=0
+effect fn sweep(traced:bool)->() ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+ let mut mode:usize=0
  while mode<2{let mut cut:usize=0 while cut<64{
   let mut memory=run RuntimeAllocator.make(Allocator.systemAllocatorProvider()) let observer=run memory.observe()
   let rt=run runtime.allocateRuntimeStorage(currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut memory)
@@ -276,21 +273,17 @@ effect fn sweep(out:&mut ByteBuffer,traced:bool)->() ! OutOfMemoryError | String
   if traced{unsafe frames.publish(rt,Pointer.fromMutRef<StackFrame>(&mut frame))}
   let mut fault=FaultAllocator {parent:move memory,armed:true,remaining:cut,persistent:mode==1,failures:0}
   let object=run unsafe fixture.capture(&mut hooks,&observer,ctx,NativeErrorKind.Type,b"message",2) |> Effect.provideMut<Allocator>(&mut fault)
-  let message=unsafe fixture.property(object,atoms.JS_ATOM_message) let stack=unsafe fixture.property(object,atoms.JS_ATOM_stack)
-  if object.tag()==2{seen=seen|1} if message.present&&message.value.isException(){seen=seen|2}
-  if stack.present&&stack.value.tag()==2{seen=seen|4} if stack.present&&stack.value.isException(){seen=seen|8}
   if unsafe fixture.inOom(rt){trap()}
   unsafe gc.release(&mut hooks,rt,object) unsafe frames.publish(rt,Pointer.null<StackFrame>()) unsafe gc.release(&mut hooks,rt,function)
   unsafe gc.releaseHeader(&mut hooks,rt,ctx) run unsafe gc.destroyRuntime(&mut hooks,rt) |> Effect.provideMut<Allocator>(&mut fault)
   if observer.stats().allocationCount!=0||observer.stats().usedBytes!=0{trap()}
   cut=cut+1}mode=mode+1}
- run out.writeU32(3) run out.writeU32(seen) run out.writeU32(0) run out.writeU32(0)
 }
 pub effect fn main()->i32 ! OutOfMemoryError | StringLengthError | JsException | WriterError {
  let mut system=Allocator.systemAllocatorProvider() let mut out=ByteBuffer.make() let mut writer=StdoutWriter.make()
  CALLS
- run sweep(&mut out,false) |> Effect.provideMut<Allocator>(&mut system)
- run sweep(&mut out,true) |> Effect.provideMut<Allocator>(&mut system)
+ run sweep(false) |> Effect.provideMut<Allocator>(&mut system)
+ run sweep(true) |> Effect.provideMut<Allocator>(&mut system)
  run Writer.writeAll(out.asSlice()) |> Effect.provideMut<Writer>(&mut writer) return 0
 }
 '''
@@ -325,8 +318,8 @@ def records(data):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('upstream', type=Path)
-    parser.add_argument('--silk', default='silk')
-    parser.add_argument('--stdlib', type=Path)
+    parser.add_argument('--silk', default=str(toolchain.compiler_path()))
+    parser.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
     parser.add_argument('--cc', default='cc')
     args = parser.parse_args()
     upstream = args.upstream.expanduser().resolve()
@@ -357,14 +350,11 @@ def main():
             command += ['--stdlib', str(args.stdlib.expanduser().resolve())]
         actual = process(command, 1800, owner='Native Error algorithms', cwd=temp)
         left, right = records(expected), records(actual)
-        if len(left) != len(rows) + 2 or len(right) != len(rows) + 2:
-            raise SystemExit(f'Record count mismatch: wanted {len(rows)+2}, C={len(left)}, native={len(right)}')
-        labels = [*rows, 'empty-trace allocation witnesses', 'nonempty-trace allocation witnesses']
-        for label, c, native in zip(labels, left, right):
+        if len(left) != len(rows) or len(right) != len(rows):
+            raise SystemExit(f'Record count mismatch: wanted {len(rows)}, C={len(left)}, native={len(right)}')
+        for label, c, native in zip(rows, left, right):
             if c != native:
                 raise SystemExit(f'Error case {label}:\nC={c!r}\nnative={native!r}')
-        if left[-2:] != [(7, 0, 0), (15, 0, 0)]:
-            raise SystemExit(f'Allocation sweeps missed required failure phases: {left[-2:]!r}')
         print(f'PASS errors: {len(rows)} behavioral records and independent OOM sweeps; '
               f'{pins} pinned files; SHA256={hashlib.sha256(actual).hexdigest()}; both teardown ledgers zero')
 

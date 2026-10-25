@@ -9,6 +9,7 @@ import tempfile
 import tomllib
 from verify_bytecode import SUPPORT, executable_path, process, validate_pins
 from verify_bound_functions import ALLOCATOR_SOURCE
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = [(count, consume) for count in (0, 1, 2, 3, 9, 33) for consume in (0, 1)]
@@ -114,8 +115,8 @@ def records(data, cases, owner):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--reference', type=Path, required=True)
-    parser.add_argument('--silk', default='silk')
-    parser.add_argument('--stdlib', type=Path)
+    parser.add_argument('--silk', default=str(toolchain.compiler_path()))
+    parser.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
     parser.add_argument('--cc', default='/usr/bin/cc')
     args = parser.parse_args()
     reference = args.reference.resolve()

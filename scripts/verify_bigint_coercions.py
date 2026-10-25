@@ -47,6 +47,7 @@ COUNT = KINDS * OPERATIONS * FAMILIES
 # Reuse its embedding, not its conversions or expected results. The explicit
 # boundaries keep this harness independent of its case count and numeric model.
 from verify_integer_coercions import C_SOURCE as INTEGER_C
+import toolchain
 C_EMBEDDING = INTEGER_C.partition('static const uint64_t bits[]')[0]
 
 C_SOURCE = C_EMBEDDING + r'''
@@ -381,8 +382,8 @@ def records(data):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('upstream', type=Path)
-    parser.add_argument('--silk', default='silk')
-    parser.add_argument('--stdlib', type=Path)
+    parser.add_argument('--silk', default=str(toolchain.compiler_path()))
+    parser.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
     parser.add_argument('--cc', default='cc')
     args = parser.parse_args()
     upstream = args.upstream.resolve()

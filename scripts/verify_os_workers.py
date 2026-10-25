@@ -22,10 +22,10 @@ import tempfile
 import time
 
 from verify_bytecode import validate_pins
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 REFERENCE = Path('/private/tmp/silkjs-quickjs-reference-20261023')
-SDKROOT = '/Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk'
 
 
 def invoke(argv, *, cwd=ROOT, timeout=90, env=None, stdin=None):
@@ -163,19 +163,23 @@ def suite(native, oracle, env):
 
 
 def main():
+    global REFERENCE
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--native', type=Path, default=ROOT / 'build/native-frontends/qjs')
-    parser.add_argument('--oracle', type=Path, default=REFERENCE / 'qjs')
+    parser.add_argument('--reference', type=Path, default=REFERENCE)
+    parser.add_argument('--oracle', type=Path)
     parser.add_argument('--fixture', type=Path, default=ROOT / 'build/os-workers/faults')
     parser.add_argument('--oracle-fixture', type=Path, default=ROOT / 'build/os-workers/oracle-detached')
     parser.add_argument('--sab-fixture', type=Path, default=ROOT / 'build/accept-detached-sab')
     parser.add_argument('--build', action='store_true')
-    parser.add_argument('--compiler', type=Path, default=ROOT / 'build/toolchain-main-dd2e99ab/silk-fixed5')
-    parser.add_argument('--stdlib', type=Path, default=ROOT / 'build/toolchain-main-dd2e99ab/stdlib')
+    parser.add_argument('--compiler', type=Path, default=toolchain.compiler_path())
+    parser.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
     args = parser.parse_args()
+    REFERENCE = args.reference.resolve()
+    if args.oracle is None:
+        args.oracle = REFERENCE / 'qjs'
     validate_pins(REFERENCE.resolve())
-    clang = os.environ.get('SILK_CLANG', '/opt/homebrew/opt/llvm/bin/clang' if os.uname().sysname == 'Darwin' else 'clang')
-    env = dict(os.environ, SDKROOT=SDKROOT, SILK_CLANG=clang, SILK_VERIFY_MIR='1')
+    env = dict(toolchain.host_environment(), SILK_VERIFY_MIR='1')
     native, oracle, fixture = args.native.resolve(), args.oracle.resolve(), args.fixture.resolve()
     oracle_fixture = args.oracle_fixture.resolve()
     sab_fixture = args.sab_fixture.resolve()
@@ -187,7 +191,7 @@ def main():
         sab_fixture.parent.mkdir(parents=True, exist_ok=True)
         build(args, ROOT / 'src/js_libc_detached_sab_fixture.silk', sab_fixture, env)
         oracle_fixture.parent.mkdir(parents=True, exist_ok=True)
-        cflags = ['-isysroot', SDKROOT] if os.uname().sysname == 'Darwin' else []
+        cflags = ['-isysroot', env['SDKROOT']] if sys.platform == 'darwin' else []
         invoke([env['SILK_CLANG'], '-std=c11', '-O2', *cflags, '-I', REFERENCE,
                 ROOT / 'tests/fixtures/libc_worker_detached_oracle.c',
                 REFERENCE / 'libquickjs.a', '-lm', '-ldl', '-lpthread',

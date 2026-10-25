@@ -8,6 +8,7 @@ import tempfile
 import tomllib
 from verify_bytecode import SUPPORT, executable_path, process, validate_pins
 from verify_bound_functions import ALLOCATOR_SOURCE
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = [('class', parent, name) for parent in range(10) for name in range(11)]
@@ -197,8 +198,8 @@ pub effect fn main() -> i32 ! OutOfMemoryError | StringLengthError | BigIntError
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--reference', required=True, type=Path)
-    parser.add_argument('--silk', default='silk')
-    parser.add_argument('--stdlib', type=Path)
+    parser.add_argument('--silk', default=str(toolchain.compiler_path()))
+    parser.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
     parser.add_argument('--cc', default='cc')
     args = parser.parse_args()
     reference = args.reference.resolve()

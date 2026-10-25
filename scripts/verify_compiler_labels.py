@@ -19,6 +19,7 @@ import struct
 import tempfile
 import tomllib
 from verify_bytecode import process, executable_path, validate_pins, SUPPORT
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 SENTINEL = 0x7ffffffe
@@ -341,8 +342,8 @@ def records(data, cases, owner):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('upstream', type=Path)
-    parser.add_argument('--silk', default='silk')
-    parser.add_argument('--stdlib', type=Path)
+    parser.add_argument('--silk', default=str(toolchain.compiler_path()))
+    parser.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
     parser.add_argument('--cc', default='cc')
     parser.add_argument('--timeout', type=int, default=900)
     args = parser.parse_args()

@@ -12,6 +12,7 @@ import shutil
 import tempfile
 import tomllib
 from verify_bytecode import SUPPORT, executable_path, process, validate_pins
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 KEYS = ['key', 'absent', '0', '1', '2', '3', 'length', '-0', '01', '4294967295', '-1', '1.5', 'NaN', 'Infinity']
@@ -367,8 +368,8 @@ pub effect fn main() -> i32 ! OutOfMemoryError | StringLengthError | BigIntError
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('upstream', type=Path)
-    parser.add_argument('--silk', default='silk')
-    parser.add_argument('--stdlib', type=Path)
+    parser.add_argument('--silk', default=str(toolchain.compiler_path()))
+    parser.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
     parser.add_argument('--cc', default='cc')
     args = parser.parse_args()
     upstream = args.upstream.resolve()

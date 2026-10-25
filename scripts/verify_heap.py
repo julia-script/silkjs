@@ -21,6 +21,7 @@ import tempfile
 import tomllib
 
 from verify_bytecode import SUPPORT, executable_path, process, validate_pins, word
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 OPERATIONS = ('graph', 'typed', 'weak-object', 'weak-symbol', 'shape')
@@ -299,6 +300,7 @@ effect fn runtimeFixture() -> *mut HeapHeader ! OutOfMemoryError ? &mut Allocato
   }
   return run HeapCell.allocate<RuntimeState>(HeapKind.Auxiliary,RuntimeState {
     runtimeInfo:Option<ByteStorage>.none(),atoms:move atoms,classes:move classes,
+    intlClassIds:[0;10],intlSegmentsClassId:0,intlSegmentIteratorClassId:0,temporalClassIds:[0;8],
     contexts:ContextList { first:Pointer.null<HeapHeader>(),last:Pointer.null<HeapHeader>() },
     gcObjects:HeapList.make(),zeroReferenceObjects:HeapList.make(),temporaryGcObjects:HeapList.make(),
     gcPhase:GcPhase.None,mallocGcThreshold:0,
@@ -880,8 +882,8 @@ def records(data, cases, owner):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('upstream', type=Path)
-    parser.add_argument('--silk', default='silk')
-    parser.add_argument('--stdlib', type=Path)
+    parser.add_argument('--silk', default=str(toolchain.compiler_path()))
+    parser.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
     parser.add_argument('--cc', default='cc')
     parser.add_argument('--seed', type=lambda value: int(value, 0), default=0x6C5A9E)
     parser.add_argument('--random-cases', type=int, default=128)

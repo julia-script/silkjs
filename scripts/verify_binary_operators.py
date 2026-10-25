@@ -25,6 +25,7 @@ from verify_bytecode import SUPPORT, executable_path, process, validate_pins
 from verify_bigint_coercions import TEXTS, HEAPS, BITS, KINDS as BASE_KINDS, leaves
 from verify_unary_operators import C_SOURCE as UNARY_C, SILK_SOURCE as UNARY_SILK
 from verify_number_power import prepare_fdlibm, bounded_contrast, REVISION, SOURCE_SHA256
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 OPERATIONS = 12
@@ -477,8 +478,8 @@ def compare_references(original, platform, actual, traces):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('upstream', type=Path)
-    parser.add_argument('--silk', default='silk')
-    parser.add_argument('--stdlib', type=Path)
+    parser.add_argument('--silk', default=str(toolchain.compiler_path()))
+    parser.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
     parser.add_argument('--cc', default='cc')
     parser.add_argument('--fdlibm-source', type=Path,
                         help='Optional offline pinned e_pow.c (SHA256 verified); otherwise fetched')

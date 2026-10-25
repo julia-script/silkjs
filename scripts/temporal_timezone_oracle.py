@@ -2,7 +2,7 @@
 """Generate or run the complete pinned C/native timezone contrast.
 
 Generate: python3 scripts/temporal_timezone_oracle.py QUICKJS_ROOT OUTPUT.silk
-Verify:   python3 scripts/temporal_timezone_oracle.py QUICKJS_ROOT --silk COMPILER --stdlib SDK
+Verify:   python3 scripts/temporal_timezone_oracle.py QUICKJS_ROOT [--silk COMPILER] [--stdlib SDK]
 
 All name/alias assertions and every transition's gap/overlap/subsecond assertions
 come from executing unmodified C. Numeric expectations are packed in readonly
@@ -24,6 +24,7 @@ import tempfile
 import tomllib
 from generate_temporal_timezone import generate
 from verify_bytecode import executable_path, process, validate_pins
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -87,12 +88,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('reference', type=Path)
     parser.add_argument('output', type=Path, nargs='?')
-    parser.add_argument('--silk')
-    parser.add_argument('--stdlib', type=Path)
+    parser.add_argument('--silk', nargs='?', const=str(toolchain.compiler_path()))
+    parser.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
     parser.add_argument('--cc', default=os.environ.get('CC', 'cc'))
     args = parser.parse_args()
     if not args.output and not args.silk:
-        parser.error('provide OUTPUT.silk or --silk for complete verification')
+        args.silk = str(toolchain.compiler_path())
     root = args.reference.resolve()
     pins = validate_pins(root)
     fixture = ROOT / 'tests/fixtures/temporal_timezone_oracle.c'

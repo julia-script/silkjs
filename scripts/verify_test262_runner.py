@@ -25,6 +25,7 @@ import shutil
 import shlex
 import subprocess
 import tempfile
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 PINNED_SOURCE = Path('/private/tmp/silkjs-quickjs-reference-20261023/run-test262.c')
@@ -447,9 +448,10 @@ def build_reference(source, destination, output):
     with tempfile.TemporaryDirectory(prefix='silkjs-test262-reference-build-') as temporary:
         tree = Path(temporary) / 'source'
         shutil.copytree(source.parent, tree, ignore=shutil.ignore_patterns('.git', '.obj', '*.o', '*.a', '*.dSYM', 'run-test262', 'run-test262-debug', 'qjs', 'qjsc'))
-        compiler = os.environ.get('CC', os.environ.get('SILK_CLANG', 'clang'))
-        if os.environ.get('SDKROOT'):
-            compiler += ' -isysroot ' + shlex.quote(os.environ['SDKROOT'])
+        compiler = os.environ.get('CC') or toolchain.clang_path()
+        sdk = toolchain.sdkroot()
+        if sdk:
+            compiler += ' -isysroot ' + shlex.quote(sdk)
         command = ['make', '-j2', 'run-test262', 'CC=' + compiler]
         (output / 'reference-build-command.json').write_text(json.dumps(command) + '\n')
         result = subprocess.run(command, cwd=tree,

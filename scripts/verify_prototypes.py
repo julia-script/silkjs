@@ -14,6 +14,7 @@ import struct
 import tempfile
 import tomllib
 from verify_bytecode import SUPPORT, executable_path, process, validate_pins
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = [(0, flags, proto, mode, 0, 0) for flags in range(4) for proto in range(5) for mode in range(2)]
@@ -306,8 +307,8 @@ pub effect fn main()->i32 ! OutOfMemoryError | StringLengthError | WriterError {
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('upstream', type=Path)
-    parser.add_argument('--silk', default='silk')
-    parser.add_argument('--stdlib', type=Path)
+    parser.add_argument('--silk', default=str(toolchain.compiler_path()))
+    parser.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
     parser.add_argument('--cc', default='cc')
     args = parser.parse_args()
     upstream = args.upstream.resolve()

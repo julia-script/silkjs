@@ -36,6 +36,7 @@ import struct
 import subprocess
 import tempfile
 import tomllib
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 REVISION = '7d1c13c5d8f8c6b32893786ed35cdcebd88194d2'
@@ -875,8 +876,8 @@ def executable_path(value):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('upstream', type=Path)
-    parser.add_argument('--silk', default='silk', help='native compiler executable')
-    parser.add_argument('--stdlib', type=Path, help='source standard library for the selected compiler')
+    parser.add_argument('--silk', default=str(toolchain.compiler_path()), help='native compiler executable')
+    parser.add_argument('--stdlib', type=Path, help='source standard library for the selected compiler', default=toolchain.stdlib_path())
     parser.add_argument('--cc', default='cc', help='independent C compiler executable')
     parser.add_argument('--seed', type=lambda value: int(value, 0), default=0xBC2A1E)
     parser.add_argument('--random-cases', type=int, default=128, help='additional cases per family; mandatory domains are never disabled')

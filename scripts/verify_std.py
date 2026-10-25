@@ -18,6 +18,7 @@ import subprocess
 import tempfile
 import threading
 import termios
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 PIN = '8c6c42619ab4edf1548b051c73bb2bee670003415b1de30d2910d71917859bce'
@@ -160,8 +161,8 @@ def main():
     parser.add_argument('--oracle', type=Path, required=True)
     parser.add_argument('--upstream', type=Path, default=Path('/private/tmp/silkjs-quickjs-reference-20261023'))
     parser.add_argument('--fault-native', type=Path)
-    parser.add_argument('--silk', type=Path, default=ROOT/'build/toolchain-main-dd2e99ab/silk-fixed5')
-    parser.add_argument('--stdlib', type=Path, default=ROOT/'build/toolchain-main-dd2e99ab/stdlib')
+    parser.add_argument('--silk', type=Path, default=toolchain.compiler_path())
+    parser.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
     parser.add_argument('--output', type=Path)
     parser.add_argument('--timeout', type=float, default=300)
     args = parser.parse_args()
@@ -170,9 +171,7 @@ def main():
     output = args.output or Path(tempfile.mkdtemp(prefix='silkjs-std-'))
     output = output.resolve()
     output.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ, LC_ALL='C', TZ='UTC')
-    env.setdefault('SDKROOT', '/Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk')
-    env.setdefault('SILK_CLANG', '/opt/homebrew/opt/llvm/bin/clang')
+    env = dict(toolchain.host_environment(), LC_ALL='C', TZ='UTC')
     env['SILK_VERIFY_MIR'] = '1'
     server = ThreadingHTTPServer(('127.0.0.1', 0), Response)
     thread = threading.Thread(target=server.serve_forever, daemon=True)

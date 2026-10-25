@@ -28,6 +28,7 @@ import struct
 import subprocess
 import tempfile
 import tomllib
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 SUPPORT = ('cutils.c', 'dtoa.c', 'libregexp.c', 'libunicode.c')
@@ -613,8 +614,8 @@ def executable_path(value):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('upstream', type=Path)
-    parser.add_argument('--silk', default='silk', help='native compiler executable (default: silk)')
-    parser.add_argument('--stdlib', type=Path, help='source standard library for the selected compiler')
+    parser.add_argument('--silk', default=str(toolchain.compiler_path()), help='native compiler executable (default: pinned installed release)')
+    parser.add_argument('--stdlib', type=Path, help='source standard library for the selected compiler', default=toolchain.stdlib_path())
     parser.add_argument('--cc', default='cc', help='C compiler executable (default: cc)')
     parser.add_argument('--seed', type=lambda value: int(value, 0), default=0x51A7B16)
     parser.add_argument('--random-cases', type=int, default=160)
