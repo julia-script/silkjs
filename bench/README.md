@@ -22,6 +22,17 @@ python3 scripts/bench.py --reference path/to/c/qjs        # also measure C Quick
 Results are only comparable on the same host with the machine otherwise idle. Compare `min_s`
 for macro workloads; medians on shared cloud hosts vary by 10-30%.
 
-`results/baseline.json` was recorded on 2026-10-26 on a 4-CPU Linux x86_64 cloud container,
-Silk 0.1.0-dev.17, with C QuickJS 7d1c13c5 as the reference: SilkJS was 21x slower than C
-QuickJS on the macro geometric mean and 28x on the micro geometric mean.
+On a noisy host, compare two builds directly instead of against a recorded baseline:
+
+```sh
+python3 scripts/ab.py old/silkjs new/silkjs                  # interleaved wall-clock runs
+python3 scripts/ab.py old/silkjs new/silkjs --instructions   # callgrind instruction counts
+```
+
+`--instructions` is deterministic, so it settles whether a wall-clock "regression" is real.
+
+`results/baseline-edb6cee.json` was recorded on 2026-10-26 on a 4-CPU Linux x86_64 cloud
+container, Silk 0.1.0-dev.17, with C QuickJS 7d1c13c5 as the reference: SilkJS was 21x slower
+than C QuickJS on the macro geometric mean and 28x on the micro geometric mean.
+`results/baseline.json` was re-recorded from main 8f70631, after the first performance pass
+(about 3x faster than edb6cee on the macro geometric mean).
