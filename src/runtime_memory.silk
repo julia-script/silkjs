@@ -37,13 +37,15 @@ impl Copy for RuntimeMemoryStats {}
 // the header keeps its size, and a pooled block links to the next through the
 // first word of its payload.
 const POOLABLE: usize = 9223372036854775808
-const POOL_CLASSES: usize = 16
+const POOL_CLASSES: usize = 32
 const POOL_GRANULE: usize = 16
 const POOL_DEPTH: usize = 1024
+// Idle bytes one class may hold, so large classes keep fewer blocks.
+const POOL_CLASS_BYTES: usize = 262144
 struct Pool {
   enabled: bool,
-  heads: [?*mut AllocationHeader; 16],
-  counts: [usize; 16]
+  heads: [?*mut AllocationHeader; 32],
+  counts: [usize; 32]
 }
 
 // One provider reference, one per outstanding allocation, and one per observer.
@@ -84,6 +86,11 @@ struct AllocationHeader {
 // Pool classes all use offset Layout.of<AllocationHeader>().bytes.
 fn poolClass(chargedBytes: usize) -> usize {
   return (chargedBytes - Layout.of<AllocationHeader>().bytes - 1) / POOL_GRANULE
+}
+fn poolDepth(class: usize) -> usize {
+  let depth = POOL_CLASS_BYTES / ((class + 1) * POOL_GRANULE)
+  if depth < POOL_DEPTH { return depth }
+  return POOL_DEPTH
 }
 unsafe fn poolLink(block: *mut AllocationHeader) -> *mut ?*mut AllocationHeader {
   let base = unsafe Intrinsic.pointerReinterpret<*mut AllocationHeader, *mut u8>(block)
@@ -137,7 +144,7 @@ impl<A> RuntimeAllocator<A> {
       references: 1,
       gate: 0,
       stats: RuntimeMemoryStats { usedBytes: 0, peakBytes: 0, allocationCount: 0, limit: usize.MAX },
-      pool: Pool { enabled: false, heads: [Pointer.null<AllocationHeader>(); 16], counts: [0; 16] }
+      pool: Pool { enabled: false, heads: [Pointer.null<AllocationHeader>(); 32], counts: [0; 32] }
     })
     let mut anchor = ()
     let fresh = unsafe Pointer.borrowMut(&mut anchor, address)
@@ -220,14 +227,12 @@ where &mut A provides &Allocator from &mut Allocator {
       backingBytes = offset + (class + 1) * POOL_GRANULE
     }
 
-    let before = self.stats()
-    if before.usedBytes > before.limit { return run Allocator.outOfMemory() }
-    if chargedBytes > before.limit - before.usedBytes { return run Allocator.outOfMemory() }
     let ledger = self.ledger
     if unsafe Atomic.load<usize>(ledger.references, MemoryOrder.Relaxed) == usize.MAX {
       return run Allocator.outOfMemory()
     }
 
+    // A pooled block is taken and charged under one lock, which also checks the limit.
     let reclaim: extern "C" fn(?*mut u8) -> () = silkRuntimeMemoryReclaim
     if class < POOL_CLASSES {
       match Pointer.nonNullMut<AllocationHeader>(unsafe takePooled(ledger, class, chargedBytes | POOLABLE)) {
@@ -240,6 +245,9 @@ where &mut A provides &Allocator from &mut Allocator {
         Option<*mut AllocationHeader>.None => ()
       }
     }
+    let before = self.stats()
+    if before.usedBytes > before.limit { return run Allocator.outOfMemory() }
+    if chargedBytes > before.limit - before.usedBytes { return run Allocator.outOfMemory() }
 
     // The provider is exclusively borrowed. While the child runs, only reclaims can
     // change usage, and those only decrease it. No reservation or peak change is
@@ -303,7 +311,9 @@ unsafe fn takePooled(ledger: LedgerPointers, class: usize, recorded: usize) -> ?
   let mut anchor = ()
   let pool = unsafe Pointer.borrowMut<(), Pool>(&mut anchor, unsafe poolOf(ledger))
   let head = pool.heads[class]
-  if !pool.enabled || Pointer.isNull<AllocationHeader>(head) {
+  let mut state = unsafe Pointer.read<RuntimeMemoryStats>(ledger.stats)
+  let fits = state.usedBytes <= state.limit && chargedBytes <= state.limit - state.usedBytes
+  if !fits || !pool.enabled || Pointer.isNull<AllocationHeader>(head) {
     drop pool
     unsafe unlockLedger(ledger)
     return Pointer.null<AllocationHeader>()
@@ -315,7 +325,6 @@ unsafe fn takePooled(ledger: LedgerPointers, class: usize, recorded: usize) -> ?
   pool.counts[class] = pool.counts[class] - 1
   block.chargedBytes = recorded
   drop block drop pool
-  let mut state = unsafe Pointer.read<RuntimeMemoryStats>(ledger.stats)
   state.usedBytes = state.usedBytes + chargedBytes
   state.allocationCount = state.allocationCount + 1
   if state.peakBytes < state.usedBytes { state.peakBytes = state.usedBytes }
@@ -365,7 +374,7 @@ export "C" fn silkRuntimeMemoryReclaim(context: ?*mut u8) -> () {
     Pointer.write<RuntimeMemoryStats>(ledger.stats, state)
     let mut poolAnchor = ()
     let pool = Pointer.borrowMut<(), Pool>(&mut poolAnchor, unsafe poolOf(ledger))
-    if class < POOL_CLASSES && pool.enabled && pool.counts[class] < POOL_DEPTH {
+    if class < POOL_CLASSES && pool.enabled && pool.counts[class] < poolDepth(class) {
       Pointer.write<?*mut AllocationHeader>(poolLink(address), pool.heads[class])
       pool.heads[class] = Intrinsic.pointerRequalify<*mut AllocationHeader, ?*mut AllocationHeader>(address)
       pool.counts[class] = pool.counts[class] + 1
