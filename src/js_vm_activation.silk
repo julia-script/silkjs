@@ -25,8 +25,8 @@ pub struct Description {
   pub stack: usize,
   pub references: usize,
   pub mode: u8,
-}
-pub struct StorageLayout {
+  /// Storage layout for an entry with actualArguments and flags: copied
+  /// arguments, locals and stack, then the reference cache rounded to slots.
   pub copiedArguments: usize,
   pub values: usize,
   pub allocationSlots: usize,
@@ -36,7 +36,7 @@ pub struct StorageLayout {
 /// function is a rooted, fully linked BytecodeFunction with nonempty verified code.
 /// Empty-table pointers are aligned non-null sentinels and are never dereferenced.
 pub unsafe fn describe(function: ValueBits, emptyValue: *mut ValueBits,
-  emptyReferences: *mut ?*mut HeapHeader) -> Description {
+  emptyReferences: *mut ?*mut HeapHeader, actualArguments: usize, flags: u32) -> Description {
   let object = match function { ValueBits.Object { reference } => reference _ => trap() }
   let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
   let mut references = unsafe Intrinsic.pointerRequalify<*mut ?*mut HeapHeader, *const ?*mut HeapHeader>(emptyReferences)
@@ -52,22 +52,22 @@ pub unsafe fn describe(function: ValueBits, emptyValue: *mut ValueBits,
   let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
   let mut constants = unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(emptyValue)
   if code.constants.length() != 0 { constants = Pointer.fromRef<ValueBits>(&code.constants.asSlice()[0]) }
+  let arguments = u16.toUsize(code.argumentCount)
+  let locals = u16.toUsize(code.variableCount)
+  let stack = u16.toUsize(code.stackSize)
+  let referenceCount = u16.toUsize(code.varRefCount)
+  let mut copied: usize = 0
+  if actualArguments < arguments || (flags & COPY_ARGUMENTS) != 0 { copied = arguments }
+  let values = copied + locals + stack
+  let slotBytes = Layout.of<ValueBits>().bytes
+  let referenceBytes = referenceCount * Layout.of<?*mut HeapHeader>().bytes
+  let slots = values + (referenceBytes + slotBytes - 1) / slotBytes
   return Description { bytecode: bytecode, realm: code.realm,
     code: unsafe code.code.pointerAt(0), constants: constants, closureReferences: references,
-    arguments: u16.toUsize(code.argumentCount), locals: u16.toUsize(code.variableCount),
-    stack: u16.toUsize(code.stackSize), references: u16.toUsize(code.varRefCount), mode: code.mode }
+    arguments: arguments, locals: locals, stack: stack, references: referenceCount, mode: code.mode,
+    copiedArguments: copied, values: values, allocationSlots: slots, bytes: slots * slotBytes }
 }
 fn trap() -> never { return Intrinsic.trap("QuickJS invariant violated") }
-
-pub fn layout(description: &Description, actualArguments: usize, flags: u32) -> StorageLayout {
-  let mut copied: usize = 0
-  if actualArguments < description.arguments || (flags & COPY_ARGUMENTS) != 0 { copied = description.arguments }
-  let values = copied + description.locals + description.stack
-  let slotBytes = Layout.of<ValueBits>().bytes
-  let referenceBytes = description.references * Layout.of<?*mut HeapHeader>().bytes
-  let slots = values + (referenceBytes + slotBytes - 1) / slotBytes
-  return StorageLayout { copiedArguments: copied, values: values, allocationSlots: slots, bytes: slots * slotBytes }
-}
 
 /// Returns a borrowed pointer, never an ownership transfer. A mutable use through
 /// an Owned descriptor additionally requires exclusive access to its slot storage.
@@ -81,42 +81,63 @@ pub unsafe fn data(slots: &FrameSlots, empty: *mut ValueBits) -> *mut ValueBits 
 
 /// storage has allocationSlots aligned ValueBits cells; stack capacity remains raw.
 /// The reference cache occupies the rounded tail, aligned by ValueBits's pointer arm.
-pub unsafe fn initialize(description: &Description, sizes: &StorageLayout, storage: *mut ValueBits,
-  function: ValueBits, originalArguments: &FrameSlots, previous: ?*mut StackFrame) -> StackFrame {
+/// The entry owner keeps Entry address-stable for the whole dispatch and points
+/// machine.frame at entry.frame before publishing it.
+pub struct Entry {
+  pub frame: StackFrame,
+  pub machine: Machine,
+}
+pub unsafe fn enter(description: &Description, storage: *mut ValueBits,
+  function: ValueBits, originalArguments: &FrameSlots, previous: ?*mut StackFrame, runtime: *mut HeapHeader,
+  callerContext: *mut HeapHeader, receiver: ValueBits, newTarget: ValueBits, empty: *mut ValueBits) -> Entry {
   let many = unsafe Pointer.assumeManyMut<ValueBits>(storage)
+  let copied = description.copiedArguments
+  let originalCount = originalArguments.length()
   let mut index: usize = 0
-  while index < sizes.copiedArguments {
+  while index < copied {
     let mut value = ValueBits.Undefined
-    if index < originalArguments.length() {
+    if index < originalCount {
       let original = unsafe originalArguments.get(index)
       value = unsafe original.retained()
     }
     unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(many, index), value)
     index = index + 1
   }
-  let locals = unsafe Pointer.atMut<ValueBits>(many, sizes.copiedArguments)
+  let localCount = description.locals
+  let locals = unsafe Pointer.atMut<ValueBits>(many, copied)
+  let localMany = unsafe Pointer.assumeManyMut<ValueBits>(locals)
   index = 0
-  while index < description.locals {
-    unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(locals), index), ValueBits.Undefined)
+  while index < localCount {
+    unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(localMany, index), ValueBits.Undefined)
     index = index + 1
   }
-  let stack = unsafe Pointer.atMut<ValueBits>(many, sizes.copiedArguments + description.locals)
-  let references = unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut ?*mut HeapHeader>(unsafe Pointer.atMut<ValueBits>(many, sizes.values))
+  let stack = unsafe Pointer.atMut<ValueBits>(many, copied + localCount)
+  let references = unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut ?*mut HeapHeader>(unsafe Pointer.atMut<ValueBits>(many, description.values))
+  let referenceMany = unsafe Pointer.assumeManyMut<?*mut HeapHeader>(references)
   index = 0
   while index < description.references {
-    unsafe Pointer.write<?*mut HeapHeader>(unsafe Pointer.atMut<?*mut HeapHeader>(unsafe Pointer.assumeManyMut<?*mut HeapHeader>(references), index), Pointer.null<HeapHeader>())
+    unsafe Pointer.write<?*mut HeapHeader>(unsafe Pointer.atMut<?*mut HeapHeader>(referenceMany, index), Pointer.null<HeapHeader>())
     index = index + 1
   }
-  let mut arguments = unsafe data(originalArguments, storage)
-  let mut count = originalArguments.length()
-  if sizes.copiedArguments != 0 { arguments = storage count = sizes.copiedArguments }
-  return StackFrame { previous: previous, asyncOwner: Pointer.null<HeapHeader>(), currentFunction: function,
+  let mut arguments = empty
+  let mut count = originalCount
+  if copied != 0 { arguments = storage count = copied } else if originalCount != 0 { arguments = unsafe data(originalArguments, empty) }
+  let mut localView = empty if localCount != 0 { localView = locals }
+  let mut stackView = empty if description.stack != 0 { stackView = stack }
+  let frame = StackFrame { previous: previous, asyncOwner: Pointer.null<HeapHeader>(), currentFunction: function,
     arguments: FrameSlots.Borrowed { data: arguments, length: count },
-    locals: FrameSlots.Borrowed { data: locals, length: description.locals },
+    locals: FrameSlots.Borrowed { data: locals, length: localCount },
     stack: FrameSlots.Borrowed { data: stack, length: description.stack },
     varRefs: FrameReferences.Borrowed { data: references, length: description.references },
     currentPc: Option<usize>.some(0), argumentCount: usize.toI32(count), mode: description.mode,
     stackPointer: Option<usize>.none() }
+  let machine = Machine { context: description.realm, callerContext: callerContext, runtime: runtime,
+    function: function, bytecode: description.bytecode, frame: unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut StackFrame>(storage),
+    code: description.code, constants: description.constants, closureReferences: description.closureReferences,
+    originalArguments: Pointer.fromRef<FrameSlots>(originalArguments),
+    arguments: arguments, locals: localView, stack: stackView, thisValue: receiver, newTarget: newTarget,
+    argumentCount: originalCount, pc: 0, sp: 0 }
+  return Entry { frame: move frame, machine: move machine }
 }
 
 /// The frame and original argument descriptor must remain address-stable for the
@@ -141,11 +162,10 @@ pub unsafe fn publish(runtime: *mut HeapHeader, frame: ?*mut StackFrame) -> () {
 
 /// Detached references retain their values before any activation-owned slot is
 /// released. Runtime frame publication is restored by the entry owner afterward.
-pub unsafe fn release<H: HeapHooks>(hooks: &mut H, description: &Description, sizes: &StorageLayout,
-  activation: &Machine) -> () {
+pub unsafe fn release<H: HeapHooks>(hooks: &mut H, description: &Description, activation: &Machine) -> () {
   if description.references != 0 { unsafe gc.detachFrameReferences(&mut hooks, activation.runtime, activation.frame) }
   let mut index: usize = 0
-  while index < sizes.copiedArguments {
+  while index < description.copiedArguments {
     unsafe gc.release(&mut hooks, activation.runtime, unsafe activation.argument(index))
     index = index + 1
   }
