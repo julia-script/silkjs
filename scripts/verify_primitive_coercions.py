@@ -126,7 +126,7 @@ import silk.result { Result }
 import runtime_memory { RuntimeAllocator }
 import js_primitive_coercions as coercion
 import js_primitive_coercions { NumberHint, CoercionError }
-unsafe fn rc(v:Value)->i32 {
+unsafe fn rc(v:ValueBits)->i32 {
   match v.heapReference() {
     Option<*mut HeapHeader>.None => { return 0 }
     Option<*mut HeapHeader>.Some { value:node } => {
@@ -135,11 +135,11 @@ unsafe fn rc(v:Value)->i32 {
     }
   }
 }
-effect fn text(out:&mut ByteBuffer,v:Value)->() ! OutOfMemoryError ? &mut Allocator {
+effect fn text(out:&mut ByteBuffer,v:ValueBits)->() ! OutOfMemoryError ? &mut Allocator {
   run out.writeU64(usize.toU64(Strings.length(v))) let mut i:usize=0
   while i<Strings.length(v) { run out.writeU64(u32.toU64(u16.toU32(Strings.codeUnit(v,i)))) i=i+1 }
 }
-fn sameReference(a:Value,b:Value)->bool {
+fn sameReference(a:ValueBits,b:ValueBits)->bool {
   match a.heapReference() {
     Option<*mut HeapHeader>.Some { value:left } => {
       match b.heapReference() {
@@ -150,25 +150,25 @@ fn sameReference(a:Value,b:Value)->bool {
     _ => { return false }
   }
 }
-effect fn describe(out:&mut ByteBuffer,v:Value,original:Value)->() ! OutOfMemoryError ? &mut Allocator {
+effect fn describe(out:&mut ByteBuffer,v:ValueBits,original:ValueBits)->() ! OutOfMemoryError ? &mut Allocator {
   run out.writeU64(bits(i32.toI64(v.tag())))
   match v {
-    Value.Int { value:n } => { run out.writeU64(bits(i32.toI64(n))) }
-    Value.Float64 { value:n } => { run scalar(&mut out,n) }
-    Value.ShortBigInt { value:n } => { run out.writeU64(bits(i32.toI64(n))) }
-    Value.String { .. } => { run text(&mut out,v) run out.writeU64(flag(original.tag()==-7 && sameReference(v,original))) }
-    Value.Symbol { .. } => { run out.writeU64(flag(sameReference(v,original))) }
-    Value.BigInt { reference } => {
+    ValueBits.Int { value:n } => { run out.writeU64(bits(i32.toI64(n))) }
+    ValueBits.Float64 { value:n } => { run scalar(&mut out,n) }
+    ValueBits.ShortBigInt { value:n } => { run out.writeU64(bits(i32.toI64(n))) }
+    ValueBits.String { .. } => { run text(&mut out,v) run out.writeU64(flag(original.tag()==-7 && sameReference(v,original))) }
+    ValueBits.Symbol { .. } => { run out.writeU64(flag(sameReference(v,original))) }
+    ValueBits.BigInt { reference } => {
       let anchor=() let b=unsafe HeapCell.payload<BigInt,()>(&anchor,reference)
       run out.writeU64(usize.toU64(b.length())) let mut i:usize=0
       while i<b.length() { run out.writeU64(u32.toU64(b.limbs()[i])) i=i+1 }
       run out.writeU64(flag(sameReference(v,original)))
     }
-    Value.Exception => ()
+    ValueBits.Exception => ()
     _ => { trap() }
   }
 }
-unsafe effect fn convert(hooks:&mut Hooks,rt:*mut HeapHeader,table:&AtomTable,v:Value,op:u8)->Value
+unsafe effect fn convert(hooks:&mut Hooks,rt:*mut HeapHeader,table:&AtomTable,v:ValueBits,op:u8)->ValueBits
   ! OutOfMemoryError | StringLengthError | BigIntError | CoercionError ? &mut Allocator {
   if op==0 { return run unsafe coercion.toNumberFree(&mut hooks,rt,unsafe v.retained(),NumberHint.Number) }
   if op==1 { return run unsafe coercion.toNumberFree(&mut hooks,rt,unsafe v.retained(),NumberHint.Numeric) }
@@ -177,15 +177,15 @@ unsafe effect fn convert(hooks:&mut Hooks,rt:*mut HeapHeader,table:&AtomTable,v:
   if op==4 { return run unsafe coercion.toPropertyKey(table,v) }
   return trap()
 }
-unsafe effect fn operate(out:&mut ByteBuffer,hooks:&mut Hooks,rt:*mut HeapHeader,table:&AtomTable,original:Value,op:u8)->()
+unsafe effect fn operate(out:&mut ByteBuffer,hooks:&mut Hooks,rt:*mut HeapHeader,table:&AtomTable,original:ValueBits,op:u8)->()
   ! OutOfMemoryError | StringLengthError | BigIntError ? &mut Allocator {
   let before=unsafe rc(original)
   let result=run Effect.result(unsafe convert(&mut hooks,rt,table,original,op))
   match move result {
-    Result<Value,OutOfMemoryError | StringLengthError | BigIntError | CoercionError>.Success { value:v } => {
+    Result<ValueBits,OutOfMemoryError | StringLengthError | BigIntError | CoercionError>.Success { value:v } => {
       run out.writeU64(0) run describe(&mut out,v,original) unsafe gc.release(&mut hooks,rt,v)
     }
-    Result<Value,OutOfMemoryError | StringLengthError | BigIntError | CoercionError>.Failure { error } => {
+    Result<ValueBits,OutOfMemoryError | StringLengthError | BigIntError | CoercionError>.Failure { error } => {
       match move error {
         CoercionError diagnostic => {
           run out.writeU64(1) let message=diagnostic.message() run out.writeU64(usize.toU64(message.length))
@@ -203,7 +203,7 @@ unsafe effect fn operate(out:&mut ByteBuffer,hooks:&mut Hooks,rt:*mut HeapHeader
 effect fn probe()->() ! OutOfMemoryError | StringLengthError | BigIntError | WriterError ? &mut Allocator | &mut Writer {
   let mut input=Input { data:FIXTURE_DATA,at:0 } let mut table=run AtomTable.make()
   let rt=run runtime.allocateRuntimeStorage(2097152) let realm=run unsafe runtime.allocateContextStorage(rt)
-  let mut hooks=Hooks {} let mut pool=List<Value>.make() let size=input.word() let mut i:u32=0
+  let mut hooks=Hooks {} let mut pool=List<ValueBits>.make() let size=input.word() let mut i:u32=0
   while i<size {
     let next=run value(&mut input,&pool,&mut table,realm)
     if next.isObject() { trap() }

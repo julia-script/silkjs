@@ -100,7 +100,7 @@ static void emit_value(JSContext *ctx, JSValue v, unsigned consumed) {
     JS_FreeValue(ctx,v);
 }
 static JSValue value(JSContext *ctx, JSBigInt *a) {
-    /* Ownership transfers; preserve the source's compact Value representation. */
+    /* Ownership transfers; preserve the source's compact ValueBits representation. */
     return JS_CompactBigInt(ctx,a);
 }
 static JSBigInt *radix_integer(JSContext *ctx,const char *text,unsigned base) {

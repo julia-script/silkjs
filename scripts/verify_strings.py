@@ -309,7 +309,7 @@ static void churn(JSContext *ctx,unsigned n) {
 static void outlive(JSContext *outer,JSValue text,unsigned kind) {
     JSRuntime *rt=JS_NewRuntime(); if(!rt) die("lifetime runtime OOM");
     JSContext *ctx=JS_NewContext(rt); if(!ctx) die("lifetime context OOM");
-    /* Copy across runtimes; no atom/Value crosses registry ownership. */
+    /* Copy across runtimes; no atom/ValueBits crosses registry ownership. */
     unsigned n=string_rope_get_len(text); uint16_t *units=allocate((size_t)n*2);
     for(unsigned i=0;i<n;i++) units[i]=string_rope_get(text,i);
     JSValue description=checked(ctx,js_new_string16_len(ctx,units,n)); free(units);
@@ -391,7 +391,7 @@ import silk.u32
 import silk.u64
 import silk.usize
 import byte_buffer { ByteBuffer, readU16, readU32 }
-import js_value { Value }
+import js_value { ValueBits }
 import js_strings { Strings, StringBuilder }
 import js_string_types { StringOwner, StringLengthError, EmbeddedNullError, AtomKind }
 import js_string_rope { RopeIterator }
@@ -410,7 +410,7 @@ fn bytesHash(bytes:&[u8])->u64 {
   while i<bytes.length { h=mix(h,u8.toU64(bytes[i])) i=i+1 }
   return h
 }
-fn unitsHash(value:Value)->u64 {
+fn unitsHash(value:ValueBits)->u64 {
   let mut h=INITIAL let mut i:usize=0
   while i<Strings.length(value) { h=mix(h,u16.toU64(Strings.codeUnit(value,i))) i=i+1 }
   return h
@@ -418,10 +418,10 @@ fn unitsHash(value:Value)->u64 {
 fn flag(value:bool)->u64 { if value { return 1 } return 0 }
 fn sign(value:i32)->u64 { if value<0 { return 0 } if value>0 { return 2 } return 1 }
 fn signed(bits:u64)->i64 { if bits>=0x8000000000000000 { return -1-u64.toI64(bits^0xffffffffffffffff) } return u64.toI64(bits) }
-effect fn basic(out:&mut ByteBuffer,value:Value)->() ! OutOfMemoryError ? &mut Allocator {
+effect fn basic(out:&mut ByteBuffer,value:ValueBits)->() ! OutOfMemoryError ? &mut Allocator {
   run out.writeU64(usize.toU64(Strings.length(value))) run out.writeU64(unitsHash(value))
 }
-effect fn nonnull(out:&mut ByteBuffer,value:Value)->() ! OutOfMemoryError ? &mut Allocator {
+effect fn nonnull(out:&mut ByteBuffer,value:ValueBits)->() ! OutOfMemoryError ? &mut Allocator {
   let result=run Effect.result(Strings.toCString(value,false,true))
   match move result {
     Result<List<u8>,OutOfMemoryError | EmbeddedNullError>.Success { value:bytes } => {
@@ -451,7 +451,7 @@ effect fn nonnull(out:&mut ByteBuffer,value:Value)->() ! OutOfMemoryError ? &mut
     }
   }
 }
-effect fn snapshot(out:&mut ByteBuffer,value:Value)->() ! OutOfMemoryError | EmbeddedNullError ? &mut Allocator {
+effect fn snapshot(out:&mut ByteBuffer,value:ValueBits)->() ! OutOfMemoryError | EmbeddedNullError ? &mut Allocator {
   run basic(&mut out,value)
   let mut iterator=RopeIterator.make(&value) let mut h=INITIAL
   while true {
@@ -464,8 +464,8 @@ effect fn snapshot(out:&mut ByteBuffer,value:Value)->() ! OutOfMemoryError | Emb
   let mut leaves=RopeIterator.make(&value) h=INITIAL
   while true {
     match leaves.nextLeaf() {
-      Option<Value>.None => { break }
-      Option<Value>.Some { value:leaf } => {
+      Option<ValueBits>.None => { break }
+      Option<ValueBits>.Some { value:leaf } => {
         let mut i:usize=0
         while i<Strings.length(leaf) { h=mix(h,u16.toU64(Strings.codeUnit(leaf,i))) i=i+1 }
       }
@@ -487,42 +487,42 @@ effect fn snapshot(out:&mut ByteBuffer,value:Value)->() ! OutOfMemoryError | Emb
   }
   run nonnull(&mut out,value)
 }
-effect fn piece(input:&mut Input,builder:&mut StringBuilder,direct:bool)->Value
+effect fn piece(input:&mut Input,builder:&mut StringBuilder,direct:bool)->ValueBits
   ! OutOfMemoryError | StringLengthError ? &mut Allocator {
   let kind=input.byte() let n=u32.toUsize(input.word())
   if kind<=2 {
     let bytes=input.bytes(n)
     if kind==0 {
-      if direct { run builder.appendLatin1(bytes) return Value.Undefined }
+      if direct { run builder.appendLatin1(bytes) return ValueBits.Undefined }
       return run Strings.fromLatin1(bytes)
     }
     if kind==1 {
       let mut units=List<u16>.make() run units.reserve(n/2) let mut i:usize=0
       while i<n { run units.append(readU16(bytes,i)) i=i+2 }
-      if direct { run builder.appendUtf16(units.asSlice()) return Value.Undefined }
+      if direct { run builder.appendUtf16(units.asSlice()) return ValueBits.Undefined }
       return run Strings.fromUtf16(units.asSlice())
     }
     let mut owner=StringOwner.adopt(run Strings.fromUtf8(bytes))
-    if direct { run builder.append(owner.get()) return Value.Undefined }
+    if direct { run builder.append(owner.get()) return ValueBits.Undefined }
     return owner.take()
   }
   let unit=input.word()
   if kind==4 {
-    if direct { run builder.appendCodePoint(unit) return Value.Undefined }
+    if direct { run builder.appendCodePoint(unit) return ValueBits.Undefined }
     return run Strings.fromCodePoint(unit)
   }
-  if direct { run builder.fill(u32.toU16(unit),n) return Value.Undefined }
+  if direct { run builder.fill(u32.toU16(unit),n) return ValueBits.Undefined }
   let mut filled=StringBuilder.make() run filled.fill(u32.toU16(unit),n)
   return run filled.finish()
 }
-effect fn recipe(input:&mut Input)->Value ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+effect fn recipe(input:&mut Input)->ValueBits ! OutOfMemoryError | StringLengthError ? &mut Allocator {
   let style=input.byte() let n=u32.toUsize(input.word()) let mut builder=StringBuilder.make()
   if style==5 {
     run builder.reserve(13,false) let mut i:usize=0
     while i<n { let unused=run piece(&mut input,&mut builder,true) i=i+1 }
     return run builder.finish()
   }
-  let mut parts=List<Value>.make() run parts.reserve(n) let mut i:usize=0
+  let mut parts=List<ValueBits>.make() run parts.reserve(n) let mut i:usize=0
   while i<n { run parts.append(run piece(&mut input,&mut builder,false)) i=i+1 }
   if n==0 { return run Strings.fromLatin1(b"") }
   if style==0 { return parts.get(0) }
@@ -572,7 +572,7 @@ effect fn atomMetadata(out:&mut ByteBuffer,table:&AtomTable,atom:u32)->() ! OutO
   let value=StringOwner.adopt(run table.toValue(atom,false)) run out.writeU64(flag(value.get().tag()== -8))
   let text=StringOwner.adopt(run table.toValue(atom,true)) run basic(&mut out,text.get())
 }
-effect fn intern(table:&mut AtomTable,value:Value,method:u32)->u32 ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+effect fn intern(table:&mut AtomTable,value:ValueBits,method:u32)->u32 ! OutOfMemoryError | StringLengthError ? &mut Allocator {
   if method==0 { let bytes=run Strings.toUtf8(value,false) return run table.internUtf8(bytes.asSlice()) }
   if method==1 {
     let mut units=List<u16>.make() let mut i:usize=0 run units.reserve(Strings.length(value))
@@ -582,7 +582,7 @@ effect fn intern(table:&mut AtomTable,value:Value,method:u32)->u32 ! OutOfMemory
   if method==2 { return run table.intern(value) }
   return run table.internOwned(run Strings.flatten(value))
 }
-effect fn atomLifetime(out:&mut ByteBuffer,table:&mut AtomTable,text:Value)->() ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+effect fn atomLifetime(out:&mut ByteBuffer,table:&mut AtomTable,text:ValueBits)->() ! OutOfMemoryError | StringLengthError ? &mut Allocator {
   let atom=run intern(&mut table,text,0) run atomMetadata(&mut out,&table.*,atom)
   let mut method:u32=1
   while method<4 {
@@ -594,19 +594,19 @@ effect fn atomLifetime(out:&mut ByteBuffer,table:&mut AtomTable,text:Value)->() 
   let other=run intern(&mut table,text,2) run out.writeU64(flag(other==atom)) table.release(other) drop held
   let reinserted=run intern(&mut table,text,3) run atomMetadata(&mut out,&table.*,reinserted) table.release(reinserted)
 }
-effect fn symbol(table:&mut AtomTable,text:Value,kind:u8,absent:bool)->Value ! OutOfMemoryError | StringLengthError ? &mut Allocator {
-  let mut description=Option<Value>.none() if !absent { description=Option<Value>.some(text) }
+effect fn symbol(table:&mut AtomTable,text:ValueBits,kind:u8,absent:bool)->ValueBits ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let mut description=Option<ValueBits>.none() if !absent { description=Option<ValueBits>.some(text) }
   if kind==2 { return run table.globalSymbol(move description) }
   if kind==3 { return run table.privateSymbol(text) }
   return run table.uniqueSymbol(move description)
 }
-effect fn maybeDescription(out:&mut ByteBuffer,description:Option<Value>)->() ! OutOfMemoryError ? &mut Allocator {
+effect fn maybeDescription(out:&mut ByteBuffer,description:Option<ValueBits>)->() ! OutOfMemoryError ? &mut Allocator {
   match move description {
-    Option<Value>.None => { run out.writeU64(0) run out.writeU64(0) run out.writeU64(0) }
-    Option<Value>.Some { value } => { let owned=StringOwner.adopt(value) run out.writeU64(1) run basic(&mut out,owned.get()) }
+    Option<ValueBits>.None => { run out.writeU64(0) run out.writeU64(0) run out.writeU64(0) }
+    Option<ValueBits>.Some { value } => { let owned=StringOwner.adopt(value) run out.writeU64(1) run basic(&mut out,owned.get()) }
   }
 }
-effect fn symbols(out:&mut ByteBuffer,table:&mut AtomTable,text:Value,kind:u8,absent:bool)->()
+effect fn symbols(out:&mut ByteBuffer,table:&mut AtomTable,text:ValueBits,kind:u8,absent:bool)->()
   ! OutOfMemoryError | StringLengthError ? &mut Allocator {
   let mut builder=StringBuilder.make() run builder.append(text)
   let description=StringOwner.adopt(run builder.finish())
@@ -621,8 +621,8 @@ effect fn symbols(out:&mut ByteBuffer,table:&mut AtomTable,text:Value,kind:u8,ab
   table.release(aa) drop a run atomMetadata(&mut out,&table.*,ba)
   run maybeDescription(&mut out,table.globalKey(b.get()))
   match table.globalKey(b.get()) {
-    Option<Value>.None => { run out.writeU64(0) }
-    Option<Value>.Some { value:key } => {
+    Option<ValueBits>.None => { run out.writeU64(0) }
+    Option<ValueBits>.Some { value:key } => {
       let keyOwner=StringOwner.adopt(key)
       let again=StringOwner.adopt(run symbol(&mut table,keyOwner.get(),2,false))
       let ka=table.symbolAtom(again.get()) run out.writeU64(flag(ka==ba)) table.release(ka)
@@ -634,7 +634,7 @@ effect fn symbols(out:&mut ByteBuffer,table:&mut AtomTable,text:Value,kind:u8,ab
   table.release(otherAtom) table.release(ba)
 }
 effect fn churn(out:&mut ByteBuffer,table:&mut AtomTable,n:usize)->() ! OutOfMemoryError | StringLengthError ? &mut Allocator {
-  let prefix=run table.internUtf8(b"churn-") let mut ids=List<u32>.make() let mut values=List<Value>.make()
+  let prefix=run table.internUtf8(b"churn-") let mut ids=List<u32>.make() let mut values=List<ValueBits>.make()
   run ids.reserve(n) run values.reserve(n)
   let mut distinct=INITIAL let mut stable=INITIAL let mut held=INITIAL let mut reinserted=INITIAL let mut i:usize=0
   while i<n {
@@ -653,8 +653,8 @@ effect fn churn(out:&mut ByteBuffer,table:&mut AtomTable,n:usize)->() ! OutOfMem
   }
   run out.writeU64(distinct) run out.writeU64(stable) run out.writeU64(held) run out.writeU64(reinserted) table.release(prefix)
 }
-effect fn outlive(out:&mut ByteBuffer,text:Value,kind:u8)->() ! OutOfMemoryError | StringLengthError | EmbeddedNullError ? &mut Allocator {
-  let mut table=run AtomTable.make() let mut sym=StringOwner.adopt(Value.Undefined) let mut atom:u32=0
+effect fn outlive(out:&mut ByteBuffer,text:ValueBits,kind:u8)->() ! OutOfMemoryError | StringLengthError | EmbeddedNullError ? &mut Allocator {
+  let mut table=run AtomTable.make() let mut sym=StringOwner.adopt(ValueBits.Undefined) let mut atom:u32=0
   // Never transfer an already-interned value between registries.
   let mut units=List<u16>.make() let mut i:usize=0
   while i<Strings.length(text) { run units.append(Strings.codeUnit(text,i)) i=i+1 }

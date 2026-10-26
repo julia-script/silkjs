@@ -11,7 +11,7 @@ subnormals, signaling/quiet NaN payloads, ties, conversion thresholds and seeded
 random bits are mandatory/default fixtures. Every numeric input exercises every
 already-coerced Number kernel and both source-specific clamp operations.
 
-Value fixtures use real native string/rope/symbol/BigInt/heap payloads. The full
+ValueBits fixtures use real native string/rope/symbol/BigInt/heap payloads. The full
 ordered cross-product tests all three equality modes and both truthiness results,
 including internal tags, exception sentinels, identity versus content, HTMLDDA,
 and signed normalized 32-bit BigInt limb boundaries. Empty internal bytecode and
@@ -189,7 +189,7 @@ import silk.usize
 import byte_buffer { ByteBuffer, readU32 }
 import js_primitives as primitive
 import js_primitives { EqualityMode }
-import js_value { Value }
+import js_value { ValueBits }
 import js_heap { HeapCell, HeapHeader, HeapKind }
 import js_strings { Strings }
 import js_string_types { StringLengthError, RopeString, StringOwner }
@@ -234,7 +234,7 @@ impl HeapHooks for Hooks {
 }
 // Unpublished typed fixtures own all their edges. Destruction below is explicit;
 // no interpreter, intrinsic dispatcher or native expected-value implementation.
-effect fn object(html:bool)->Value ! OutOfMemoryError ? &mut Allocator {
+effect fn object(html:bool)->ValueBits ! OutOfMemoryError ? &mut Allocator {
   let mut hashes=List<u32>.make() run hashes.append(0)
   let shape=run HeapCell.allocate<ShapeData>(HeapKind.Shape,ShapeData {
     isHashed:false,hash:0,propertyHashMask:0,deletedPropertyCount:0,
@@ -246,22 +246,22 @@ effect fn object(html:bool)->Value ! OutOfMemoryError ? &mut Allocator {
     isConstructor:false,hasImmutablePrototype:false,temporaryMark:false,isHtmlDda:html,
     classId:1,weakRefCount:0,shape:shape,properties:List<PropertySlot>.make(),payload:ObjectPayload.Empty
   })
-  return Value.Object { reference:reference }
+  return ValueBits.Object { reference:reference }
 }
-effect fn internal(kind:u8,realm:*mut HeapHeader)->Value ! OutOfMemoryError ? &mut Allocator {
+effect fn internal(kind:u8,realm:*mut HeapHeader)->ValueBits ! OutOfMemoryError ? &mut Allocator {
   if kind==16 {
     let reference=run HeapCell.allocate<ModuleDef>(HeapKind.Module,ModuleDef {
       name:0,previousModule:Pointer.null<HeapHeader>(),nextModule:Pointer.null<HeapHeader>(),
       requestedModules:List<RequestedModule>.make(),exports:List<ExportEntry>.make(),
-      starExports:List<StarExportEntry>.make(),imports:List<ImportEntry>.make(),namespace:Value.Undefined,
-      functionObject:Value.Undefined,initialize:Option<NativeFunctionId>.none(),hasTopLevelAwait:false,
+      starExports:List<StarExportEntry>.make(),imports:List<ImportEntry>.make(),namespace:ValueBits.Undefined,
+      functionObject:ValueBits.Undefined,initialize:Option<NativeFunctionId>.none(),hasTopLevelAwait:false,
       resolved:false,functionCreated:false,status:ModuleStatus.Unlinked,dfsIndex:-1,dfsAncestorIndex:-1,
       stackPrevious:Pointer.null<HeapHeader>(),asyncParentModules:List<*mut HeapHeader>.make(),
       pendingAsyncDependencies:0,asyncEvaluation:false,asyncEvaluationTimestamp:0,
-      cycleRoot:Pointer.null<HeapHeader>(),promise:Value.Undefined,resolvingFunctions:[Value.Undefined;2],
-      evaluationHasException:false,evaluationException:Value.Undefined,metaObject:Value.Undefined,privateValue:Value.Undefined
+      cycleRoot:Pointer.null<HeapHeader>(),promise:ValueBits.Undefined,resolvingFunctions:[ValueBits.Undefined;2],
+      evaluationHasException:false,evaluationException:ValueBits.Undefined,metaObject:ValueBits.Undefined,privateValue:ValueBits.Undefined
     })
-    return Value.Module { reference:reference }
+    return ValueBits.Module { reference:reference }
   }
   let reference=run HeapCell.allocate<FunctionBytecode>(HeapKind.FunctionBytecode,FunctionBytecode {
     mode:0,hasPrototype:false,hasSimpleParameterList:true,isDerivedClassConstructor:false,
@@ -269,23 +269,23 @@ effect fn internal(kind:u8,realm:*mut HeapHeader)->Value ! OutOfMemoryError ? &m
     superAllowed:false,argumentsAllowed:false,readOnlyBytecode:false,isDirectOrIndirectEval:false,
     code:ByteStorage.Owned { bytes:List<u8>.make() },name:0,varDefs:List<VarDef>.make(),
     closureVars:List<ClosureVar>.make(),argumentCount:0,variableCount:0,definedArgumentCount:0,
-    stackSize:0,varRefCount:0,realm:realm,constants:List<Value>.make(),debug:Option<FunctionDebugInfo>.none()
+    stackSize:0,varRefCount:0,realm:realm,constants:List<ValueBits>.make(),debug:Option<FunctionDebugInfo>.none()
   })
   unsafe HeapCell.retain(realm)
-  return Value.FunctionBytecode { reference:reference }
+  return ValueBits.FunctionBytecode { reference:reference }
 }
-effect fn value(input:&mut Input,pool:&List<Value>,table:&mut AtomTable,realm:*mut HeapHeader)->Value
+effect fn value(input:&mut Input,pool:&List<ValueBits>,table:&mut AtomTable,realm:*mut HeapHeader)->ValueBits
   ! OutOfMemoryError | StringLengthError | BigIntError ? &mut Allocator {
   let kind=input.byte()
-  if kind==0 { return Value.Int { value:signed32(input.word()) } }
-  if kind==1 { return Value.Float64 { value:input.number() } }
-  if kind==2 { return Value.Bool { value:input.byte()!=0 } }
-  if kind==3 { return Value.Null }
-  if kind==4 { return Value.Undefined }
-  if kind==5 { return Value.Uninitialized }
-  if kind==6 { return Value.CatchOffset { offset:signed32(input.word()) } }
-  if kind==7 { return Value.Exception }
-  if kind==8 { return Value.ShortBigInt { value:signed32(input.word()) } }
+  if kind==0 { return ValueBits.Int { value:signed32(input.word()) } }
+  if kind==1 { return ValueBits.Float64 { value:input.number() } }
+  if kind==2 { return ValueBits.Bool { value:input.byte()!=0 } }
+  if kind==3 { return ValueBits.Null }
+  if kind==4 { return ValueBits.Undefined }
+  if kind==5 { return ValueBits.Uninitialized }
+  if kind==6 { return ValueBits.CatchOffset { offset:signed32(input.word()) } }
+  if kind==7 { return ValueBits.Exception }
+  if kind==8 { return ValueBits.ShortBigInt { value:signed32(input.word()) } }
   if kind==9 {
     let n=u32.toUsize(input.word()) let mut bytes=List<u8>.make() let mut i:usize=0
     while i<n { run bytes.append(input.byte()) i=i+1 }
@@ -307,35 +307,35 @@ effect fn value(input:&mut Input,pool:&List<Value>,table:&mut AtomTable,realm:*m
     })
     // Transfer the guarded leaf references only after the allocation succeeds.
     let ownedA=leftOwner.take() let ownedB=rightOwner.take()
-    return Value.Rope { reference:reference }
+    return ValueBits.Rope { reference:reference }
   }
   if kind==12 { return run object(input.byte()!=0) }
   if kind==13 {
     let description=StringOwner.adopt(run Strings.fromLatin1(b"same-description"))
-    return run table.uniqueSymbol(Option<Value>.some(description.get()))
+    return run table.uniqueSymbol(Option<ValueBits>.some(description.get()))
   }
   if kind==14 {
     let n=u32.toUsize(input.word()) let mut limbs=List<u32>.make() let mut i:usize=0
     while i<n { run limbs.append(input.word()) i=i+1 }
     let integer=run BigInt.fromOwnedLimbs(move limbs)
-    return Value.BigInt { reference:run HeapCell.allocate<BigInt>(HeapKind.BigInt,move integer) }
+    return ValueBits.BigInt { reference:run HeapCell.allocate<BigInt>(HeapKind.BigInt,move integer) }
   }
   if kind==15 { let alias=pool.get(u32.toUsize(input.word())) return unsafe alias.retained() }
   if kind==16 || kind==17 { return run internal(kind,realm) }
   return trap()
 }
-unsafe fn release(value:Value,hooks:&mut Hooks,rt:*mut HeapHeader)->() {
+unsafe fn release(value:ValueBits,hooks:&mut Hooks,rt:*mut HeapHeader)->() {
   if value.isString() || value.tag()==-8 { Strings.release(value) return () }
   if !unsafe value.decrementReference() { return () }
   match value {
-    Value.BigInt { reference } => { unsafe HeapCell.destroy<BigInt>(reference) }
-    Value.Module { reference } => { unsafe HeapCell.destroy<ModuleDef>(reference) }
-    Value.FunctionBytecode { reference } => {
+    ValueBits.BigInt { reference } => { unsafe HeapCell.destroy<BigInt>(reference) }
+    ValueBits.Module { reference } => { unsafe HeapCell.destroy<ModuleDef>(reference) }
+    ValueBits.FunctionBytecode { reference } => {
       let anchor=() let data=unsafe HeapCell.payload<FunctionBytecode,()>(&anchor,reference)
       let realm=data.realm drop data unsafe HeapCell.destroy<FunctionBytecode>(reference)
       unsafe gc.releaseHeader(&mut hooks,rt,realm)
     }
-    Value.Object { reference } => {
+    ValueBits.Object { reference } => {
       let anchor=() let data=unsafe HeapCell.payload<ObjectData,()>(&anchor,reference)
       let shape=data.shape drop data unsafe HeapCell.destroy<ObjectData>(reference)
       if unsafe HeapCell.decrement(shape) { unsafe HeapCell.destroy<ShapeData>(shape) }
@@ -347,14 +347,14 @@ effect fn scalar(out:&mut ByteBuffer,value:f64)->() ! OutOfMemoryError ? &mut Al
   if f64.isNaN(value) { run out.writeU64(0x7ff8000000000000) }
   else { run out.writeU64(f64.toBits(value)) }
 }
-effect fn equality(out:&mut ByteBuffer,a:Value,b:Value)->() ! OutOfMemoryError ? &mut Allocator {
+effect fn equality(out:&mut ByteBuffer,a:ValueBits,b:ValueBits)->() ! OutOfMemoryError ? &mut Allocator {
   run out.writeU64(flag(unsafe primitive.equal(a,b,EqualityMode.Strict)))
   run out.writeU64(flag(unsafe primitive.equal(a,b,EqualityMode.SameValue)))
   run out.writeU64(flag(unsafe primitive.equal(a,b,EqualityMode.SameValueZero)))
   run out.writeU64(bits(i32.toI64(unsafe primitive.toBoolean(a))))
   run out.writeU64(bits(i32.toI64(unsafe primitive.toBoolean(b))))
 }
-effect fn operate(input:&mut Input,out:&mut ByteBuffer,pool:&List<Value>)->()
+effect fn operate(input:&mut Input,out:&mut ByteBuffer,pool:&List<ValueBits>)->()
   ! OutOfMemoryError ? &mut Allocator {
   let op=input.byte()
   if op==0 {
@@ -384,14 +384,14 @@ effect fn operate(input:&mut Input,out:&mut ByteBuffer,pool:&List<Value>)->()
     let a=pool.get(u32.toUsize(input.word())) let b=pool.get(u32.toUsize(input.word()))
     run equality(&mut out,a,b)
   } else if op==3 {
-    let a=Value.Float64 { value:input.number() } let b=Value.Float64 { value:input.number() }
+    let a=ValueBits.Float64 { value:input.number() } let b=ValueBits.Float64 { value:input.number() }
     run equality(&mut out,a,b)
   } else { trap() }
 }
 effect fn probe()->() ! OutOfMemoryError | StringLengthError | BigIntError | WriterError ? &mut Allocator | &mut Writer {
   let mut input=Input { data:FIXTURE_DATA,at:0 } let mut table=run AtomTable.make()
   let rt=run runtime.allocateRuntimeStorage(2097152) let realm=run unsafe runtime.allocateContextStorage(rt)
-  let mut hooks=Hooks {} let mut pool=List<Value>.make() let size=input.word() let mut i:u32=0
+  let mut hooks=Hooks {} let mut pool=List<ValueBits>.make() let size=input.word() let mut i:u32=0
   while i<size { let next=run value(&mut input,&pool,&mut table,realm) run pool.append(next) i=i+1 }
   let count=input.word() let mut header=ByteBuffer.make() run header.writeU32(count) run Writer.writeAll(header.asSlice())
   let mut out=ByteBuffer.make() let mut length=ByteBuffer.make() i=0

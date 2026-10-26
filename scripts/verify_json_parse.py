@@ -131,7 +131,7 @@ import byte_buffer { ByteBuffer }
 import runtime_memory { RuntimeAllocator, AllocationObserver }
 import native_stack { currentFrameAddress }
 import js_heap { HeapCell, HeapHeader }
-import js_value { Value }
+import js_value { ValueBits }
 import js_core_types { ContextState, RuntimeState, ObjectData, ObjectPayload, ShapeData, PropertySlot }
 import js_gc as gc
 import js_runtime as runtime
@@ -147,7 +147,7 @@ import js_json_parse_test_support as jsonFixture
 import js_array_storage_test_support { Hooks, trap, reference }
 fn word(n:i32)->u32 {let mut x=i32.toI64(n) if x<0{x=x+4294967296} return i64.toU32(x)}
 fn boolean(value:bool)->u32 {if value{return 1} return 0}
-unsafe effect fn text(out:&mut ByteBuffer,v:Value)->() ! OutOfMemoryError ? &mut Allocator {
+unsafe effect fn text(out:&mut ByteBuffer,v:ValueBits)->() ! OutOfMemoryError ? &mut Allocator {
   if !v.isString(){trap()} run out.writeU32(usize.toU32(Strings.length(v))) let mut i:usize=0
   while i<Strings.length(v){run out.writeU32(u16.toU32(Strings.codeUnit(v,i))) i=i+1}
 }
@@ -155,14 +155,14 @@ unsafe effect fn key(out:&mut ByteBuffer,rt:*mut HeapHeader,atom:u32)->() ! OutO
   let anchor=() let state=unsafe HeapCell.payload<RuntimeState,()>(&anchor,rt)
   let value=StringOwner.adopt(run state.atoms.toValue(atom,true)) run unsafe text(&mut out,value.get())
 }
-unsafe effect fn graph(out:&mut ByteBuffer,ctx:*mut HeapHeader,v:Value)->() ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+unsafe effect fn graph(out:&mut ByteBuffer,ctx:*mut HeapHeader,v:ValueBits)->() ! OutOfMemoryError | StringLengthError ? &mut Allocator {
   match v {
-    Value.Undefined=>{run out.writeU32(0)} Value.Null=>{run out.writeU32(1)}
-    Value.Bool {value}=>{run out.writeU32(2) run out.writeU32(boolean(value))}
-    Value.Int {value}=>{run out.writeU32(3) run out.writeU32(word(value))}
-    Value.Float64 {value}=>{run out.writeU32(4) let bits=f64.toBits(value)
+    ValueBits.Undefined=>{run out.writeU32(0)} ValueBits.Null=>{run out.writeU32(1)}
+    ValueBits.Bool {value}=>{run out.writeU32(2) run out.writeU32(boolean(value))}
+    ValueBits.Int {value}=>{run out.writeU32(3) run out.writeU32(word(value))}
+    ValueBits.Float64 {value}=>{run out.writeU32(4) let bits=f64.toBits(value)
       run out.writeU32(u64.toU32(bits&0xffffffff)) run out.writeU32(u64.toU32(u64.shiftRight(bits,32)))}
-    Value.Object {reference:node}=>{
+    ValueBits.Object {reference:node}=>{
       let anchor=() let p=unsafe HeapCell.payload<ObjectData,()>(&anchor,node)
       let shape=unsafe HeapCell.payload<ShapeData,()>(&anchor,p.shape)
       let context=unsafe HeapCell.payload<ContextState,()>(&anchor,ctx)
@@ -208,7 +208,7 @@ unsafe effect fn record(out:&mut ByteBuffer,ctx:*mut HeapHeader,r:&JsonParseReco
   }
 }
 unsafe effect fn probe(out:&mut ByteBuffer,ctx:*mut HeapHeader,hooks:&mut Hooks,memory:&AllocationObserver,
-  filename:Value,id:u32,source:&[u8],extended:bool,capture:bool)->()
+  filename:ValueBits,id:u32,source:&[u8],extended:bool,capture:bool)->()
   ! OutOfMemoryError | StringLengthError | BigIntError | ParserStackOverflow ? &mut Allocator {
   run out.writeU32(id)
   let result=run Effect.result(unsafe json.parse(&mut hooks,memory,ctx,source,filename,extended,capture))

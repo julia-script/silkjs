@@ -177,7 +177,7 @@ import js_core_types { RuntimeState, ObjectData, ObjectPayload, PropertySlot, EX
 import js_gc as gc
 import js_runtime as runtime
 import js_object_allocate as objects
-import js_value { Value }
+import js_value { ValueBits }
 import js_atoms { AtomTable }
 import js_atom_data as atoms
 import js_strings { Strings }
@@ -207,19 +207,19 @@ fn signed(value: i32) -> u32 {
   if value < 0 { return i32.toU32(-(value + 1)) ^ 0xffffffff }
   return i32.toU32(value)
 }
-unsafe fn refs(value: Value) -> i32 {
+unsafe fn refs(value: ValueBits) -> i32 {
   return match value {
-    Value.Object { reference: node } => unsafe rc(node)
-    Value.String { reference: node } => unsafe rc(node)
-    Value.Symbol { reference: node } => unsafe rc(node)
-    Value.BigInt { reference: node } => unsafe rc(node)
+    ValueBits.Object { reference: node } => unsafe rc(node)
+    ValueBits.String { reference: node } => unsafe rc(node)
+    ValueBits.Symbol { reference: node } => unsafe rc(node)
+    ValueBits.BigInt { reference: node } => unsafe rc(node)
     _ => 0
   }
 }
 effect fn flag(out: &mut ByteBuffer, value: bool) -> () ! OutOfMemoryError ? &mut Allocator {
   if value { run out.writeU32(1) } else { run out.writeU32(0) }
 }
-effect fn text(out: &mut ByteBuffer, value: Value) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn text(out: &mut ByteBuffer, value: ValueBits) -> () ! OutOfMemoryError ? &mut Allocator {
   run out.writeU32(usize.toU32(Strings.length(value))) let mut i: usize = 0
   while i < Strings.length(value) { run out.writeU32(u16.toU32(Strings.codeUnit(value, i))) i = i + 1 }
 }
@@ -231,7 +231,7 @@ unsafe effect fn pending<'a>(out: &mut ByteBuffer, hooks: &mut Hooks<'a>, ctx: *
     let message = descriptor(run unsafe descriptors.getOwnProperty(&mut hooks, ctx, error, atoms.JS_ATOM_message))
     run text(&mut out, message.value) unsafe releaseDescriptor(&mut hooks, rt, move message)
   } else {
-    run out.writeU32(2) match error { Value.Int { value } => { run out.writeU32(signed(value)) } _ => trap() }
+    run out.writeU32(2) match error { ValueBits.Int { value } => { run out.writeU32(signed(value)) } _ => trap() }
   }
   unsafe gc.release(&mut hooks, rt, error)
 }
@@ -253,14 +253,14 @@ unsafe effect fn queryCase<'a>(out: &mut ByteBuffer, hooks: &mut Hooks<'a>, memo
     let mut kind: u32 = 0 if i == 18 { kind = 1 }
     keys[i] = run unsafe stored.atom(rt, name, kind) i = i + 1
   }
-  let parent = run unsafe objects.withPrototype(&mut hooks, memory, ctx, Value.Null)
-  i = 0 while i < 19 { run unsafe stored.add(&mut hooks, rt, parent, keys[i], 7, PropertySlot.Value { value: Value.Undefined }) i = i + 1 }
-  let mut object = Value.Undefined
+  let parent = run unsafe objects.withPrototype(&mut hooks, memory, ctx, ValueBits.Null)
+  i = 0 while i < 19 { run unsafe stored.add(&mut hooks, rt, parent, keys[i], 7, PropertySlot.Value { value: ValueBits.Undefined }) i = i + 1 }
+  let mut object = ValueBits.Undefined
   if (family >= 1 && family <= 5) || family == 10 || family == 11 {
     object = run unsafe stored.exotic(&mut hooks.descriptors.stored, memory, ctx)
     run unsafe stored.store(rt, object, Entry { atom: keys[0], flags: 7, present: family == 2 || family == 5 || family == 10,
-      seedEnumerable: true, value: Value.Undefined, getter: Value.Undefined, setter: Value.Undefined })
-    if family == 1 || family == 11 { run unsafe stored.add(&mut hooks, rt, object, keys[0], 7, PropertySlot.Value { value: Value.Undefined }) }
+      seedEnumerable: true, value: ValueBits.Undefined, getter: ValueBits.Undefined, setter: ValueBits.Undefined })
+    if family == 1 || family == 11 { run unsafe stored.add(&mut hooks, rt, object, keys[0], 7, PropertySlot.Value { value: ValueBits.Undefined }) }
     if family == 11 { let mut anchor = () let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, reference(object)) p.isExotic = false }
   } else if family == 6 || family == 7 {
     object = run unsafe descriptorFixture.typed(&mut hooks, memory, ctx)
@@ -268,14 +268,14 @@ unsafe effect fn queryCase<'a>(out: &mut ByteBuffer, hooks: &mut Hooks<'a>, memo
       let mut anchor = () let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, reference(object))
       match &mut p.payload { ObjectPayload.TypedArray { array } => { array.count = 0 array.cachedData = Pointer.null<u8>() } _ => trap() }
     }
-  } else { object = run unsafe objects.withPrototype(&mut hooks, memory, ctx, Value.Null) }
+  } else { object = run unsafe objects.withPrototype(&mut hooks, memory, ctx, ValueBits.Null) }
   if family != 4 { run unsafe fixture.prototype(&mut hooks, rt, object, parent) }
   if family == 3 { hooks.failHas = true }
   if family == 4 { hooks.mutateOwn = true hooks.mutationTarget = object hooks.replacement = parent }
   if family == 5 {
     let root = run unsafe objects.withPrototype(&mut hooks, memory, ctx, object)
     unsafe gc.release(&mut hooks, rt, object) object = root
-    hooks.mutateHas = true hooks.mutationTarget = root hooks.replacement = Value.Null
+    hooks.mutateHas = true hooks.mutationTarget = root hooks.replacement = ValueBits.Null
   }
   if family == 8 {
     let cell = run unsafe varRefs.createDetached(rt, true)
@@ -300,7 +300,7 @@ unsafe effect fn queryCase<'a>(out: &mut ByteBuffer, hooks: &mut Hooks<'a>, memo
     run out.writeU32(i32.toU32(unsafe refs(object))) run out.writeU32(i32.toU32(unsafe refs(parent)))
     run out.writeU32(usize.toU32(hooks.descriptors.stored.finalized)) i = i + 1
   }
-  run flag(&mut out, run unsafe queries.hasProperty(&mut hooks, ctx, Value.Null, keys[0]))
+  run flag(&mut out, run unsafe queries.hasProperty(&mut hooks, ctx, ValueBits.Null, keys[0]))
   let mut dormant = false
   if family == 9 {
     let anchor = () let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(object))
@@ -312,32 +312,32 @@ unsafe effect fn queryCase<'a>(out: &mut ByteBuffer, hooks: &mut Hooks<'a>, memo
   i = 0 while i < 19 { unsafe stored.releaseAtom(rt, keys[i]) i = i + 1 }
   run out.writeU32(usize.toU32(hooks.descriptors.stored.finalized))
 }
-unsafe effect fn input(rt: *mut HeapHeader, kind: u32) -> Value
+unsafe effect fn input(rt: *mut HeapHeader, kind: u32) -> ValueBits
   ! OutOfMemoryError | StringLengthError ? &mut Allocator {
   match kind {
-    0 => { return Value.Int { value: 0 } } 1 => { return Value.Int { value: 2147483647 } } 2 => { return Value.Int { value: -1 } }
-    3 => { return Value.Float64 { value: 2147483648.0 } } 4 => { return Value.Float64 { value: f64.fromBits(0x8000000000000000) } }
-    5 => { return Value.Float64 { value: f64.fromBits(0x7ff0000000000000) } } 6 => { return Value.Float64 { value: f64.fromBits(0x7ff8000000000000) } }
-    7 => { return Value.Null } 8 => { return Value.Undefined } 9 => { return Value.Bool { value: true } }
+    0 => { return ValueBits.Int { value: 0 } } 1 => { return ValueBits.Int { value: 2147483647 } } 2 => { return ValueBits.Int { value: -1 } }
+    3 => { return ValueBits.Float64 { value: 2147483648.0 } } 4 => { return ValueBits.Float64 { value: f64.fromBits(0x8000000000000000) } }
+    5 => { return ValueBits.Float64 { value: f64.fromBits(0x7ff0000000000000) } } 6 => { return ValueBits.Float64 { value: f64.fromBits(0x7ff8000000000000) } }
+    7 => { return ValueBits.Null } 8 => { return ValueBits.Undefined } 9 => { return ValueBits.Bool { value: true } }
     10 => { return run Strings.fromLatin1(b"01") } 11 => { return run Strings.fromLatin1(b"-0") } 12 => { return run Strings.fromLatin1(b"key-text") }
     13 => {
       let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
-      let description = run Strings.fromLatin1(b"same") let value = run state.atoms.uniqueSymbol(Option<Value>.some(description)) Strings.release(description) return value
+      let description = run Strings.fromLatin1(b"same") let value = run state.atoms.uniqueSymbol(Option<ValueBits>.some(description)) Strings.release(description) return value
     }
     14 => {
       let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
-      let description = run Strings.fromLatin1(b"same") let value = run state.atoms.globalSymbol(Option<Value>.some(description)) Strings.release(description) return value
+      let description = run Strings.fromLatin1(b"same") let value = run state.atoms.globalSymbol(Option<ValueBits>.some(description)) Strings.release(description) return value
     }
     _ => { return run integers.newBigInt64(4294967296) }
   }
 }
 unsafe effect fn method(hooks: &mut ConversionHooks, memory: &AllocationObserver, ctx: *mut HeapHeader,
-  object: Value, atom: u32, event: u32, body: u32, result: Value) -> () ! OutOfMemoryError ? &mut Allocator {
+  object: ValueBits, atom: u32, event: u32, body: u32, result: ValueBits) -> () ! OutOfMemoryError ? &mut Allocator {
   let rt = unsafe runtime.contextRuntime(ctx)
-  let function = run unsafe conversion.closure(&mut hooks, memory, ctx, true, event, body, result, 0, Value.Undefined)
+  let function = run unsafe conversion.closure(&mut hooks, memory, ctx, true, event, body, result, 0, ValueBits.Undefined)
   run unsafe conversion.property(&mut hooks, rt, object, atom, function, false) unsafe gc.release(&mut hooks, rt, function)
 }
-unsafe effect fn atomRecord(out: &mut ByteBuffer, rt: *mut HeapHeader, atom: u32, original: Value) -> ()
+unsafe effect fn atomRecord(out: &mut ByteBuffer, rt: *mut HeapHeader, atom: u32, original: ValueBits) -> ()
   ! OutOfMemoryError | StringLengthError ? &mut Allocator {
   if AtomTable.isInteger(atom) { run out.writeU32(0) run out.writeU32(AtomTable.integer(atom)) return }
   let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
@@ -345,7 +345,7 @@ unsafe effect fn atomRecord(out: &mut ByteBuffer, rt: *mut HeapHeader, atom: u32
     run out.writeU32(1) let value = run state.atoms.toValue(atom, true) run text(&mut out, value) Strings.release(value)
   } else {
     run out.writeU32(2) let mut equal = false
-    if match original { Value.Symbol { .. } => true _ => false } {
+    if match original { ValueBits.Symbol { .. } => true _ => false } {
       let own = state.atoms.symbolAtom(original) equal = atom == own drop state unsafe stored.releaseAtom(rt, own)
     }
     run flag(&mut out, equal)
@@ -355,14 +355,14 @@ unsafe effect fn valueCase<'a>(out: &mut ByteBuffer, hooks: &mut ConversionHooks
   memory: &AllocationObserver, ctx: *mut HeapHeader, kind: u32, mode: u32) -> ()
   ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
   run out.writeU32(kind) run out.writeU32(mode) hooks.clear() hooks.collect = true
-  let rt = unsafe runtime.contextRuntime(ctx) let value = run unsafe input(rt, kind) let mut object = Value.Undefined
+  let rt = unsafe runtime.contextRuntime(ctx) let value = run unsafe input(rt, kind) let mut object = ValueBits.Undefined
   if mode != 0 {
     object = run unsafe conversion.object(&mut hooks, memory, ctx, 99)
     if mode == 1 || mode == 3 {
       let mut body: u32 = 0 if mode == 3 { body = 1 }
       run unsafe method(&mut hooks, memory, ctx, object, atoms.JS_ATOM_Symbol_toPrimitive, 7, body, value)
     } else {
-      run unsafe method(&mut hooks, memory, ctx, object, atoms.JS_ATOM_toString, 1, 2, Value.Undefined)
+      run unsafe method(&mut hooks, memory, ctx, object, atoms.JS_ATOM_toString, 1, 2, ValueBits.Undefined)
       run unsafe method(&mut hooks, memory, ctx, object, atoms.JS_ATOM_valueOf, 2, 0, value)
     }
   }

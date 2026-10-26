@@ -139,7 +139,7 @@ import silk.os_writer { StdoutWriter }
 import byte_buffer { ByteBuffer }
 import runtime_memory { RuntimeAllocator, AllocationObserver }
 import js_heap { HeapCell, HeapHeader }
-import js_value { Value }
+import js_value { ValueBits }
 import js_core_types { RuntimeState, ObjectData, ObjectPayload, ShapeData, PropertySlot, VarRef, VarRefState }
 import js_gc as gc
 import js_runtime as runtime
@@ -156,15 +156,15 @@ import js_array_storage_test_support { Hooks, trap, reference }
 fn word(value:i32)->u32 { let mut wide=i32.toI64(value) if wide<0 { wide=wide+4294967296 } return i64.toU32(wide) }
 fn flag(value:bool)->u32 { if value { return 1 } return 0 }
 fn outcome(value:StorageOutcome)->u32 { return match value { StorageOutcome.Accepted=>1 StorageOutcome.ReadOnlyLength=>2 StorageOutcome.NonConfigurable=>3 } }
-unsafe fn item(text:Value,leaf:Value,kind:u32,n:i32)->Value {
-  if kind==1 { return unsafe text.retained() } if kind==2 { return unsafe leaf.retained() } return Value.Int {value:n}
+unsafe fn item(text:ValueBits,leaf:ValueBits,kind:u32,n:i32)->ValueBits {
+  if kind==1 { return unsafe text.retained() } if kind==2 { return unsafe leaf.retained() } return ValueBits.Int {value:n}
 }
-unsafe effect fn emitValue(out:&mut ByteBuffer,v:Value)->() ! OutOfMemoryError ? &mut Allocator {
+unsafe effect fn emitValue(out:&mut ByteBuffer,v:ValueBits)->() ! OutOfMemoryError ? &mut Allocator {
   run out.writeU32(word(v.tag()))
   match v {
-    Value.Int {value:n}=>{run out.writeU32(word(n))}
-    Value.Float64 {value:n}=>{let bits=f64.toBits(n) run out.writeU32(u64.toU32(bits&0xffffffff)) run out.writeU32(u64.toU32(u64.shiftRight(bits,32)))}
-    Value.Object {reference:node}=>{let anchor=() let p=unsafe HeapCell.payload<ObjectData,()>(&anchor,node)
+    ValueBits.Int {value:n}=>{run out.writeU32(word(n))}
+    ValueBits.Float64 {value:n}=>{let bits=f64.toBits(n) run out.writeU32(u64.toU32(bits&0xffffffff)) run out.writeU32(u64.toU32(u64.shiftRight(bits,32)))}
+    ValueBits.Object {reference:node}=>{let anchor=() let p=unsafe HeapCell.payload<ObjectData,()>(&anchor,node)
       run out.writeU32(p.classId) run out.writeU32(i32.toU32(unsafe fixture.rc(node)))}
     _=>{if v.isString() {run out.writeU32(usize.toU32(Strings.length(v))) let mut i:usize=0
       while i<Strings.length(v) {run out.writeU32(u16.toU32(Strings.codeUnit(v,i))) i=i+1}}}
@@ -175,7 +175,7 @@ unsafe effect fn binding(out:&mut ByteBuffer,node:*mut HeapHeader)->() ! OutOfMe
   let r=unsafe HeapCell.payload<VarRef,()>(&anchor,node)
   match r.state {VarRefState.Detached {value}=>{run unsafe emitValue(&mut out,value)} _=>trap()}
 }
-unsafe effect fn snapshot(out:&mut ByteBuffer,rt:*mut HeapHeader,arr:Value)->() ! OutOfMemoryError ? &mut Allocator {
+unsafe effect fn snapshot(out:&mut ByteBuffer,rt:*mut HeapHeader,arr:ValueBits)->() ! OutOfMemoryError ? &mut Allocator {
   let anchor=() let p=unsafe HeapCell.payload<ObjectData,()>(&anchor,reference(arr))
   let sh=unsafe HeapCell.payload<ShapeData,()>(&anchor,p.shape)
   let state=unsafe HeapCell.payload<RuntimeState,()>(&anchor,rt)
@@ -206,7 +206,7 @@ unsafe effect fn snapshot(out:&mut ByteBuffer,rt:*mut HeapHeader,arr:Value)->() 
     _=>trap()
   }
 }
-unsafe effect fn state(out:&mut ByteBuffer,rt:*mut HeapHeader,arr:Value,sibling:Value,text:Value,leaf:Value,refs:&List<*mut HeapHeader>)->()
+unsafe effect fn state(out:&mut ByteBuffer,rt:*mut HeapHeader,arr:ValueBits,sibling:ValueBits,text:ValueBits,leaf:ValueBits,refs:&List<*mut HeapHeader>)->()
   ! OutOfMemoryError ? &mut Allocator {
   run unsafe snapshot(&mut out,rt,arr) run out.writeU32(flag(sibling.isObject()))
   if sibling.isObject() {run unsafe snapshot(&mut out,rt,sibling)}
@@ -247,10 +247,10 @@ def emit_case(number, family, size, operations):
          'JSObject *p=JS_VALUE_GET_OBJ(arr);']
     s = [f'unsafe effect fn case{number}(out:&mut ByteBuffer,rt:*mut HeapHeader,ctx:*mut HeapHeader,hooks:&mut Hooks,memory:&AllocationObserver)->()'
          ' ! OutOfMemoryError | StringLengthError | ArrayLengthError ? &mut Allocator {',
-         'let text=run Strings.fromLatin1(b"held-array-string") let leaf=run unsafe objects.withPrototype(&mut hooks,memory,ctx,Value.Null)',
-         'let mut sibling=Value.Undefined let mut refs=List<*mut HeapHeader>.make()',
+         'let text=run Strings.fromLatin1(b"held-array-string") let leaf=run unsafe objects.withPrototype(&mut hooks,memory,ctx,ValueBits.Null)',
+         'let mut sibling=ValueBits.Undefined let mut refs=List<*mut HeapHeader>.make()',
          f'let arr=run unsafe arrays.allocateFastArray(&mut hooks,memory,ctx,{size})' if family == 0 else
-         f'let arr=run unsafe objects.withPrototypeClass(&mut hooks,memory,ctx,Value.Null,classes.JS_CLASS_{class_name})',
+         f'let arr=run unsafe objects.withPrototypeClass(&mut hooks,memory,ctx,ValueBits.Null,classes.JS_CLASS_{class_name})',
          'let node=reference(arr)']
     if family == 1 and size:
         c += [f'if(expand_fast_array(ctx,p,{size}))abort();p->u.array.count={size};']

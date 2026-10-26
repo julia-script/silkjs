@@ -86,7 +86,7 @@ import silk.os_writer { StdoutWriter }
 import byte_buffer { ByteBuffer }
 import runtime_memory { RuntimeAllocator, AllocationObserver }
 import js_core_types { StackFrame, PropertySlot }
-import js_value { Value }
+import js_value { ValueBits }
 import js_strings { Strings }
 import js_string_types { StringLengthError }
 import js_exceptions { JsException }
@@ -102,7 +102,7 @@ import js_array_storage_test_support { trap }
 fn signed(value: i32) -> u32 {
  if value < 0 { return i32.toU32(-(value + 1)) ^ 0xffffffff } return i32.toU32(value)
 }
-effect fn text(out: &mut ByteBuffer, value: Value) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn text(out: &mut ByteBuffer, value: ValueBits) -> () ! OutOfMemoryError ? &mut Allocator {
  run out.writeU32(usize.toU32(Strings.length(value))) let mut index: usize = 0
  while index < Strings.length(value) { run out.writeU32(u16.toU32(Strings.codeUnit(value,index))) index = index + 1 }
 }
@@ -112,7 +112,7 @@ effect fn probe(memory: &AllocationObserver) -> ()
  let mut hooks = @MAKE_HOOKS@ run unsafe fixture.prepare(&mut hooks,memory,ctx)
  let mut out = ByteBuffer.make() let mut variant: u32 = 0
  while variant < 4 {
- let function = run unsafe frames.native(&mut hooks,memory,ctx,Value.Null)
+ let function = run unsafe frames.native(&mut hooks,memory,ctx,ValueBits.Null)
  if variant != 0 {
   let mut units: [u16; 16] = [0xd800; 16] let mut length: usize = 16 let mut at: usize = 0
   if variant == 2 { length = 14 }
@@ -262,7 +262,7 @@ def main():
     else:
         c_create = 'JSValue error=checked(JS_NewError(ctx));build_backtrace(ctx,error,NULL,0,0,0);'
         native_create = ('let error = run unsafe errors.newError(&mut hooks,memory,ctx) '
-                         'run unsafe errors.buildBacktrace(&mut hooks,memory,ctx,error,Option<Value>.none(),0,0,0)')
+                         'run unsafe errors.buildBacktrace(&mut hooks,memory,ctx,error,Option<ValueBits>.none(),0,0,0)')
         hooks_import, make_hooks = 'import js_errors_test_support { Hooks }', 'Hooks.make(memory)'
     with tempfile.TemporaryDirectory(prefix='silkjs-error-string-limits-') as directory:
         temp = Path(directory).resolve()

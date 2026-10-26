@@ -123,11 +123,11 @@ fn operation(index:u32)->Operation{
 effect fn flag(out:&mut ByteBuffer,value:bool)->() ! OutOfMemoryError ? &mut Allocator {
  if value{run out.writeU32(1)}else{run out.writeU32(0)}
 }
-effect fn outputValue(out:&mut ByteBuffer,value:Value)->() ! OutOfMemoryError ? &mut Allocator {
+effect fn outputValue(out:&mut ByteBuffer,value:ValueBits)->() ! OutOfMemoryError ? &mut Allocator {
  run out.writeU32(signed(value.tag()))
- match value {Value.Bool {value:bit}=>{run flag(&mut out,bit)} _=>()}
+ match value {ValueBits.Bool {value:bit}=>{run flag(&mut out,bit)} _=>()}
 }
-unsafe effect fn pending(out:&mut ByteBuffer,hooks:&mut Hooks,ctx:*mut HeapHeader,first:Value,second:Value)->()
+unsafe effect fn pending(out:&mut ByteBuffer,hooks:&mut Hooks,ctx:*mut HeapHeader,first:ValueBits,second:ValueBits)->()
  ! OutOfMemoryError | JsException ? &mut Allocator {
  let rt=unsafe runtime.contextRuntime(ctx) let present=unsafe exceptions.has(rt)
  run flag(&mut out,present) if !present{return ()}
@@ -138,9 +138,9 @@ unsafe effect fn pending(out:&mut ByteBuffer,hooks:&mut Hooks,ctx:*mut HeapHeade
   else{run flag(&mut out,unsafe primitive.equal(error,first,EqualityMode.SameValue)) run flag(&mut out,unsafe primitive.equal(error,second,EqualityMode.SameValue))}
  }else if error.isString(){run text(&mut out,error)}else{
   match error {
-   Value.Int {value:n}=>{run out.writeU32(signed(n))}
-   Value.Bool {value:b}=>{run flag(&mut out,b)}
-   Value.Float64 {value:n}=>{run wide(&mut out,f64.toBits(n))}
+   ValueBits.Int {value:n}=>{run out.writeU32(signed(n))}
+   ValueBits.Bool {value:b}=>{run flag(&mut out,b)}
+   ValueBits.Float64 {value:n}=>{run wide(&mut out,f64.toBits(n))}
    _=>{run flag(&mut out,unsafe primitive.equal(error,first,EqualityMode.SameValue)) run flag(&mut out,unsafe primitive.equal(error,second,EqualityMode.SameValue))}
   }
  }
@@ -150,7 +150,7 @@ unsafe effect fn runCase(out:&mut ByteBuffer,hooks:&mut Hooks,memory:&Allocation
  a:u32,b:u32,familyA:u32,familyB:u32,op:u32)->()
  ! OutOfMemoryError | StringLengthError | JsException | BigIntError ? &mut Allocator {
  hooks.clear() let rt=unsafe runtime.contextRuntime(ctx)
- let first=run unsafe leaf(rt,a) let mut second=Value.Undefined
+ let first=run unsafe leaf(rt,a) let mut second=ValueBits.Undefined
  if a==b{second=unsafe first.retained()}else{second=run unsafe leaf(rt,b)}
  let firstRoot=unsafe rc(first) let secondRoot=unsafe rc(second)
  let left=run unsafe transitions.make(&mut hooks,memory,ctx,familyA,first,second)
@@ -196,8 +196,8 @@ unsafe effect fn faultCase(out:&mut ByteBuffer,mode:u32,reverse:bool,op:u32)->()
  run Effect.catch<JsException>(unsafe exceptions.throwValue<(),Hooks>(&mut inner,rt,previous),ignore)
  let mut hooks=ErrorOrderHooks {inner:move inner,watched:support.heapReference(string),countAtThrow:0}
  unsafe errorFixture.setOom(rt,mode==1)
- let mut old=Value.ShortBigInt {value:0} let mut next=unsafe string.retained()
- if reverse{old=next next=Value.ShortBigInt {value:0}}
+ let mut old=ValueBits.ShortBigInt {value:0} let mut next=unsafe string.retained()
+ if reverse{old=next next=ValueBits.ShortBigInt {value:0}}
  let mut fault=FaultAllocator {parent:move memory,armed:mode!=3,remaining:0,persistent:mode==2,failures:0}
  let outcome=run Effect.result(unsafe comparisons.apply(&mut hooks,ctx,&mut old,&mut next,operation(op))) |> Effect.provideMut<Allocator>(&mut fault)
  fault.armed=false
@@ -211,7 +211,7 @@ unsafe effect fn faultCase(out:&mut ByteBuffer,mode:u32,reverse:bool,op:u32)->()
  run flag(&mut out,failed) run outputValue(&mut out,old) run outputValue(&mut out,next)
  if mode!=1{run out.writeU32(signed(hooks.countAtThrow))}
  run flag(&mut out,unsafe errorFixture.inOom(rt)) run out.writeU32(signed(unsafe rc(string)))
- run unsafe pending(&mut out,&mut hooks.inner,ctx,string,Value.Undefined) |> Effect.provideMut<Allocator>(&mut fault)
+ run unsafe pending(&mut out,&mut hooks.inner,ctx,string,ValueBits.Undefined) |> Effect.provideMut<Allocator>(&mut fault)
  unsafe gc.release(&mut hooks,rt,old) unsafe gc.release(&mut hooks,rt,next) unsafe gc.release(&mut hooks,rt,string)
  unsafe errorFixture.setOom(rt,false) unsafe gc.releaseHeader(&mut hooks,rt,ctx) run unsafe gc.destroyRuntime(&mut hooks,rt) |> Effect.provideMut<Allocator>(&mut fault)
  if observer.stats().usedBytes!=0||observer.stats().allocationCount!=0{trap()}
