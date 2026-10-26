@@ -5,7 +5,8 @@ Runs, in order:
   1. the native regression suite: silk test src/tests.silk
   2. QuickJS's own tests/*.js (vendored in tests/upstream/ from the pinned upstream
      revision) under the release qjs binary
-  3. the benchmark workloads once each, checking output against C QuickJS
+  3. SilkJS's own regression scripts, tests/silkjs/*.js (behavior QuickJS gets wrong)
+  4. the benchmark workloads once each, checking output against C QuickJS
      (scripts/bench.py --skip-micro --runs 1)
 
   python3 scripts/check.py                 # everything
@@ -55,6 +56,8 @@ def main():
         raise SystemExit(f'missing {binary}; build with `silk build --release`')
     for script, flags in UPSTREAM:
         ok &= step(f'upstream {script}', [str(binary), *flags, script], cwd=ROOT / 'tests/upstream')
+    for script in sorted((ROOT / 'tests/silkjs').glob('*.js')):
+        ok &= step(f'silkjs {script.name}', [str(binary), script.name], cwd=ROOT / 'tests/silkjs')
     if not args.skip_bench:
         ok &= step('benchmark outputs', [sys.executable, 'scripts/bench.py', '--binary', str(binary),
                                          '--skip-micro', '--runs', '1'])
