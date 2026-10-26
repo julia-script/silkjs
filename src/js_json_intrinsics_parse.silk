@@ -2,7 +2,6 @@
 //! Parse records keep displaced graph edges alive until all reviver calls finish.
 import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
-import silk.result { Result }
 import silk.list { List }
 import silk.option { Option }
 import silk.pointer { Pointer }
@@ -11,6 +10,7 @@ import silk.u32
 import silk.usize
 import js_heap { HeapHeader }
 import js_value { ValueBits }
+import js_owned_value { Value }
 import js_core_types { FrameSlots, PropertyEnum, JS_PROP_C_W_E }
 import js_gc { HeapHooks }
 import js_coercion_host { CoercionHooks }
@@ -20,13 +20,12 @@ import js_call_host { CallHooks }
 import js_error_host { ErrorHooks }
 import js_json_parse { JsonParseRecords, ParsedJson, JsonRecordKind }
 import js_json_parse as parser
-import js_json_intrinsics_support { Scope }
 import js_json_intrinsics_support as support
 import js_function_intrinsics_support as shared
 import js_collection_support as calls
 import js_array_intrinsics_support as arrays
 import js_object_allocate as objects
-import js_property_names { OwnKeysError }
+import js_property_names { OwnKeysError, OwnedNames, OwnedAtom }
 import js_property_names as names
 import js_property_mutations as properties
 import js_property_delete as deletion
@@ -43,6 +42,12 @@ import js_parser_core { ParserStackOverflow }
 import js_exceptions { JsException }
 import runtime_memory { AllocationObserver }
 
+/// Failures caught without wrapping the success in a Result (see js_caught).
+struct FailedWalk { error: OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | JsException }
+effect fn failedWalk(error: OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | JsException) -> FailedWalk { return FailedWalk { error: move error } }
+struct FailedRevive { error: OutOfMemoryError | StringLengthError | BigIntError | JsException }
+effect fn failedRevive(error: OutOfMemoryError | StringLengthError | BigIntError | JsException) -> FailedRevive { return FailedRevive { error: move error } }
+
 fn child(records: &JsonParseRecords, parent: &Option<usize>, atom: u32) -> Option<usize> {
   match &parent.* {
     Option<usize>.None => { return Option<usize>.none() }
@@ -56,52 +61,65 @@ fn child(records: &JsonParseRecords, parent: &Option<usize>, atom: u32) -> Optio
     }
   }
 }
+unsafe effect fn keyNames<H: HeapHooks + OwnKeysHooks>(hooks: &mut H, context: *mut HeapHeader, value: ValueBits, wanted: bool) -> OwnedNames
+  ! OutOfMemoryError | StringLengthError | OwnKeysError | JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  if !wanted { return unsafe OwnedNames.adopt(rt, List<PropertyEnum>.make()) }
+  let listed = run unsafe names.getOwnPropertyNames(&mut hooks, context, value, names.JS_GPN_ENUM_ONLY | names.JS_GPN_STRING_MASK)
+  return unsafe OwnedNames.adopt(rt, move listed)
+}
+// Atom 0 stands for "no atom held": array walks own an index atom, object walks borrow the snapshot's.
+unsafe effect fn indexKey(context: *mut HeapHeader, array: bool, index: usize) -> OwnedAtom ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  if !array { return unsafe OwnedAtom.adopt(rt, 0) }
+  return unsafe OwnedAtom.adopt(rt, run unsafe support.indexAtom(context, usize.toI64(index)))
+}
 unsafe effect fn walkBody<H: HeapHooks + CoercionHooks + OwnPropertyHooks + OwnKeysHooks + PropertyWriteHooks + CallHooks + ErrorHooks>(hooks: &mut H,
   memory: &AllocationObserver, context: *mut HeapHeader, holder: ValueBits, atom: u32, reviver: ValueBits,
-  records: &JsonParseRecords, mut record: Option<usize>, scope: &mut Scope) -> ValueBits
+  records: &JsonParseRecords, mut record: Option<usize>) -> ValueBits
   ! OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | JsException ? &mut Allocator {
   run unsafe support.stack(&mut hooks, memory, context)
-  scope.roots.values[0] = run unsafe shared.get(&mut hooks, context, holder, atom)
-  let value = scope.roots.values[0]
+  let value = unsafe Value.adoptBits(run unsafe shared.get(&mut hooks, context, holder, atom))
   let original = match &record {
-    Option<usize>.Some { value: index } => unsafe core.sameValue(records.originalValue(index), value)
+    Option<usize>.Some { value: index } => unsafe core.sameValue(records.originalValue(index), value.view())
     Option<usize>.None => false
   }
   if !original { record = Option<usize>.none() }
-  scope.roots.values[1] = run unsafe objects.object(&mut hooks, memory, context)
-  if value.isObject() {
-    let array = run unsafe arrays.isArray(&mut hooks, context, value)
+  let sourceContext = unsafe Value.adoptBits(run unsafe objects.object(&mut hooks, memory, context))
+  if value.view().isObject() {
+    let array = run unsafe arrays.isArray(&mut hooks, context, value.view())
     let mut count: usize = 0
     if array {
-      scope.roots.values[2] = run unsafe shared.get(&mut hooks, context, value, atoms.JS_ATOM_length)
       let mut length: u32 = 0
-      run unsafe integers.toUint32Free(&mut hooks, context, &mut length, scope.roots.take(2))
+      let lengthValue = run unsafe shared.get(&mut hooks, context, value.view(), atoms.JS_ATOM_length)
+      run unsafe integers.toUint32Free(&mut hooks, context, &mut length, lengthValue)
       count = u32.toUsize(length)
-    } else {
-      scope.keys = run unsafe names.getOwnPropertyNames(&mut hooks, context, value, names.JS_GPN_ENUM_ONLY | names.JS_GPN_STRING_MASK)
-      count = scope.keys.length()
     }
+    let keys = run unsafe keyNames(&mut hooks, context, value.view(), !array)
+    if !array { count = keys.length() }
     let mut i: usize = 0
     while i < count {
-      let mut key: u32 = 0
-      if array { scope.atom = run unsafe support.indexAtom(context, usize.toI64(i)) key = scope.atom }
-      else { key = scope.keys.get(i).atom }
-      scope.roots.values[2] = run unsafe walk(&mut hooks, memory, context, value, key, reviver, records, child(records, &record, key))
-      if shared.undefined(scope.roots.values[2]) {
-        let removed = run unsafe deletion.deleteProperty(&mut hooks, memory, context, value, key, 0)
+      let held = run unsafe indexKey(context, array, i)
+      let mut key = held.get()
+      if !array { key = keys.get(i).atom }
+      // A revived value is either undefined or handed straight to the define.
+      let revived = run unsafe walk(&mut hooks, memory, context, value.view(), key, reviver, records, child(records, &record, key))
+      if shared.undefined(revived) {
+        let removed = run unsafe deletion.deleteProperty(&mut hooks, memory, context, value.view(), key, 0)
       } else {
-        let defined = run unsafe properties.definePropertyValue(&mut hooks, context, value, key, scope.roots.take(2), JS_PROP_C_W_E)
+        let defined = run unsafe properties.definePropertyValue(&mut hooks, context, value.view(), key, revived, JS_PROP_C_W_E)
       }
-      unsafe properties.releaseAtom(unsafe runtime.contextRuntime(context), scope.atom) scope.atom = 0
       i = i + 1
     }
+    // Snapshot atoms are retired before invoking this property's callback.
+    drop keys
   } else {
     match &record {
       Option<usize>.Some { value: index } => {
         match records.primitiveSource(index) {
           Option<&[u8]>.Some { value: bytes } => {
-            scope.roots.values[2] = run Strings.fromUtf8(bytes)
-            let defined = run unsafe properties.definePropertyValue(&mut hooks, context, scope.roots.values[1], atoms.JS_ATOM_source, scope.roots.take(2), JS_PROP_C_W_E)
+            let source = run Strings.fromUtf8(bytes)
+            let defined = run unsafe properties.definePropertyValue(&mut hooks, context, sourceContext.view(), atoms.JS_ATOM_source, source, JS_PROP_C_W_E)
           }
           Option<&[u8]>.None => ()
         }
@@ -109,30 +127,26 @@ unsafe effect fn walkBody<H: HeapHooks + CoercionHooks + OwnPropertyHooks + OwnK
       Option<usize>.None => ()
     }
   }
-  // Snapshot atoms are retired before invoking this property's callback.
-  unsafe names.releaseNames(unsafe runtime.contextRuntime(context), Intrinsic.replace(scope.keys, List<PropertyEnum>.make()))
-  scope.roots.values[3] = run unsafe shared.atomString(context, atom)
-  let mut values = [scope.roots.values[3], value, scope.roots.values[1]]
+  let name = unsafe Value.adoptBits(run unsafe shared.atomString(context, atom))
+  let mut values = [name.view(), value.view(), sourceContext.view()]
   let args = FrameSlots.Borrowed { data: Pointer.fromMutRef<ValueBits>(&mut values[0]), length: 3 }
   return run unsafe calls.call(&mut hooks, context, reviver, holder, &args)
 }
 unsafe effect fn walk<H: HeapHooks + CoercionHooks + OwnPropertyHooks + OwnKeysHooks + PropertyWriteHooks + CallHooks + ErrorHooks>(hooks: &mut H,
   memory: &AllocationObserver, context: *mut HeapHeader, holder: ValueBits, atom: u32, reviver: ValueBits,
   records: &JsonParseRecords, record: Option<usize>) -> ValueBits ! JsException ? &mut Allocator {
-  let mut scope = Scope.make()
-  let result = run Effect.result(unsafe walkBody(&mut hooks, memory, context, holder, atom, reviver, records, move record, &mut scope))
-  let output = match move result {
-    Result<ValueBits, OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | JsException>.Success { value } => value
-    Result<ValueBits, OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | JsException>.Failure { error } =>
-      run Effect.catch<JsException>(unsafe support.materialize<ValueBits, H>(&mut hooks, memory, context, move error), shared.exceptionValue)
+  let result = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | JsException>(unsafe walkBody(&mut hooks, memory, context, holder, atom, reviver, records, move record), failedWalk)
+  return match move result {
+    ValueBits value => value
+    FailedWalk { error } =>
+      run unsafe support.materialize<ValueBits, H>(&mut hooks, memory, context, move error)
   }
-  unsafe scope.clear(&mut hooks, context)
-  if output.isException() { fail JsException {} }
-  return output
 }
 unsafe effect fn revive<H: HeapHooks + CoercionHooks + OwnPropertyHooks + OwnKeysHooks + PropertyWriteHooks + CallHooks + ErrorHooks>(hooks: &mut H,
-  memory: &AllocationObserver, context: *mut HeapHeader, holder: ValueBits, reviver: ValueBits, parsed: &mut ParsedJson) -> ValueBits
+  memory: &AllocationObserver, context: *mut HeapHeader, reviver: ValueBits, parsed: &mut ParsedJson) -> ValueBits
   ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  let root = unsafe Value.adoptBits(run unsafe objects.object(&mut hooks, memory, context))
+  let holder = root.view()
   let defined = run unsafe properties.definePropertyValue(&mut hooks, context, holder, atoms.JS_ATOM_empty_string, parsed.takeValue(), JS_PROP_C_W_E)
   match &parsed.records().* {
     Option<JsonParseRecords>.Some { value: records } => { return run unsafe walk(&mut hooks, memory, context, holder, atoms.JS_ATOM_empty_string, reviver, &records, records.root()) }
@@ -140,19 +154,18 @@ unsafe effect fn revive<H: HeapHooks + CoercionHooks + OwnPropertyHooks + OwnKey
   }
 }
 pub unsafe effect fn parse<H: HeapHooks + CoercionHooks + OwnPropertyHooks + OwnKeysHooks + PropertyWriteHooks + CallHooks + ErrorHooks>(hooks: &mut H,
-  memory: &AllocationObserver, context: *mut HeapHeader, input: ValueBits, reviver: ValueBits, scope: &mut Scope) -> ValueBits
+  memory: &AllocationObserver, context: *mut HeapHeader, input: ValueBits, reviver: ValueBits) -> ValueBits
   ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow | JsException ? &mut Allocator {
-  scope.roots.values[0] = run unsafe shared.string(&mut hooks, context, input)
-  let bytes = run Strings.toUtf8(scope.roots.values[0], false)
+  let text = unsafe Value.adoptBits(run unsafe shared.string(&mut hooks, context, input))
+  let bytes = run Strings.toUtf8(text.view(), false)
   let callable = unsafe hooks.isCallable(context, reviver)
-  if callable { scope.roots.values[1] = run unsafe objects.object(&mut hooks, memory, context) }
-  scope.roots.values[2] = run Strings.fromLatin1(b"<input>")
-  let mut parsed = run unsafe parser.parse(&mut hooks, memory, context, bytes.asSlice(), scope.roots.values[2], false, callable)
+  let filename = unsafe Value.adoptBits(run Strings.fromLatin1(b"<input>"))
+  let mut parsed = run unsafe parser.parse(&mut hooks, memory, context, bytes.asSlice(), filename.view(), false, callable)
   if !callable { return parsed.takeValue() }
-  let result = run Effect.result(unsafe revive(&mut hooks, memory, context, scope.roots.values[1], reviver, &mut parsed))
+  let result = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError | BigIntError | JsException>(unsafe revive(&mut hooks, memory, context, reviver, &mut parsed), failedRevive)
   let output = match move result {
-    Result<ValueBits, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { value } => value
-    Result<ValueBits, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } =>
+    ValueBits value => value
+    FailedRevive { error } =>
       run Effect.catch<JsException>(unsafe support.materialize<ValueBits, H>(&mut hooks, memory, context, move error), shared.exceptionValue)
   }
   unsafe parsed.destroy(&mut hooks)
