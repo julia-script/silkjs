@@ -19,12 +19,13 @@ import silk.effect { Effect }
 import silk.list { List }
 import silk.option { Option }
 import silk.pointer { Pointer }
+import silk.result { Result }
 import silk.u8
 import silk.u32
 import silk.u64
 import silk.i32
 import silk.usize
-import js_core_types { ObjectData, PropertySlot, RuntimeState, ShapeData, ShapeProperty, JS_PROP_INITIAL_SIZE, JS_PROP_INITIAL_HASH_SIZE }
+import js_core_types { HeapList, ObjectData, PropertySlot, RuntimeState, ShapeData, ShapeProperty, JS_PROP_INITIAL_SIZE, JS_PROP_INITIAL_HASH_SIZE }
 import js_heap { HeapCell, HeapHeader, HeapKind }
 import js_value { ValueBits }
 
@@ -36,6 +37,12 @@ pub struct RetiredProperty {
   pub flags: u8,
   pub slot: PropertySlot
 }
+
+/// Interned shapes with fewer properties than this are never extended in place, so the
+/// shapes along a transition chain stay available for the next object built the same way.
+const SMALL_SHAPE: usize = 16
+/// How many zero-reference interned shapes the runtime keeps for reuse.
+const PARKED_SHAPES: usize = 256
 
 fn same(left: ?*const HeapHeader, right: ?*const HeapHeader) -> bool {
   return Pointer.address<HeapHeader>(left) == Pointer.address<HeapHeader>(right)
@@ -60,6 +67,55 @@ unsafe fn referenceCount(shape: *mut HeapHeader) -> i32 {
   unsafe { return Pointer.borrow<(), HeapHeader>(&anchor, shape).referenceCount }
 }
 effect fn ignoreOptionalAllocation(error: OutOfMemoryError) -> () { drop error }
+
+/// Takes an owned reference to a shape found in shapeHash. A parked shape is
+/// revived: it leaves the parked cache and rejoins the GC object list.
+unsafe fn acquire(runtime: *mut HeapHeader, shape: *mut HeapHeader) -> () {
+  if unsafe referenceCount(shape) == 0 {
+    let mut anchor = ()
+    let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+    unsafe state.parkedShapes.remove(shape)
+    state.parkedShapeCount = state.parkedShapeCount - 1
+    unsafe state.gcObjects.pushBack(shape)
+  }
+  unsafe HeapCell.retain(shape)
+}
+
+/// Called by the collector when the last reference to shape is dropped, after it has
+/// been detached from the GC lists. Small interned shapes stay linked in shapeHash
+/// (still owning their prototype and atoms) so a later object can reuse them.
+/// Returns the shape the caller must destroy now: shape itself when it is not kept,
+/// the oldest parked shape when the cache is full, or null.
+pub unsafe fn park(runtime: *mut HeapHeader, shape: *mut HeapHeader) -> ?*mut HeapHeader {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ShapeData, ()>(&anchor, shape)
+  let keep = data.isHashed && data.deletedPropertyCount == 0 && data.properties.length() < SMALL_SHAPE
+  drop data
+  if !keep { return shape }
+  let mut stateAnchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
+  unsafe state.parkedShapes.pushBack(shape)
+  if state.parkedShapeCount < PARKED_SHAPES {
+    state.parkedShapeCount = state.parkedShapeCount + 1
+    return Pointer.null<HeapHeader>()
+  }
+  return match unsafe state.parkedShapes.popFront() {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => Pointer.null<HeapHeader>()
+  }
+}
+
+/// Detaches the oldest parked shape, which the caller must destroy, or returns null.
+pub unsafe fn unpark(runtime: *mut HeapHeader) -> ?*mut HeapHeader {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  if state.parkedShapeCount == 0 { return Pointer.null<HeapHeader>() }
+  state.parkedShapeCount = state.parkedShapeCount - 1
+  return match unsafe state.parkedShapes.popFront() {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => Pointer.null<HeapHeader>()
+  }
+}
 
 effect fn zeroIndices(count: usize) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
   let mut indices = List<u32>.make()
@@ -209,7 +265,7 @@ pub unsafe effect fn empty(runtime: *mut HeapHeader, prototype: ?*mut HeapHeader
   ! OutOfMemoryError ? &mut Allocator {
   let existing = unsafe findPrototype(runtime, prototype)
   if !Pointer.isNull<HeapHeader>(existing) {
-    unsafe HeapCell.retain(present(existing))
+    unsafe acquire(runtime, present(existing))
     return present(existing)
   }
   return run unsafe create(runtime, prototype, JS_PROP_INITIAL_HASH_SIZE, JS_PROP_INITIAL_SIZE)
@@ -404,15 +460,19 @@ pub unsafe effect fn addProperty(runtime: *mut HeapHeader, object: &mut ObjectDa
       run object.properties.reserveExact(extra)
     }
     run object.properties.append(PropertySlot.Value { value: ValueBits.Undefined })
-    unsafe HeapCell.retain(present(transition))
+    unsafe acquire(runtime, present(transition))
     object.shape = present(transition)
     return AddResult { index: index, retiredShape: old }
   }
   let anchor = ()
   let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, old)
   let hashed = shape.isHashed
+  let small = shape.properties.length() < SMALL_SHAPE
   drop shape
-  if hashed && unsafe referenceCount(old) != 1 {
+  // A small shape is copied even when this object is its only owner, so it stays
+  // interned as the transition source; its reference is retired to the caller.
+  let mut retired = Pointer.null<HeapHeader>()
+  if hashed && (small || unsafe referenceCount(old) != 1) {
     let cloned = run unsafe clone(runtime, old)
     let mut cloneAnchor = ()
     let copy = unsafe HeapCell.payloadMut<ShapeData, ()>(&mut cloneAnchor, cloned)
@@ -420,7 +480,8 @@ pub unsafe effect fn addProperty(runtime: *mut HeapHeader, object: &mut ObjectDa
     drop copy
     unsafe link(runtime, cloned)
     object.shape = cloned
-    let cannotBeZero = unsafe HeapCell.decrement(old)
+    if unsafe referenceCount(old) == 1 { retired = old }
+    else { let cannotBeZero = unsafe HeapCell.decrement(old) }
   }
   let shapeAnchor = ()
   let updatedShape = unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, object.shape)
@@ -428,11 +489,32 @@ pub unsafe effect fn addProperty(runtime: *mut HeapHeader, object: &mut ObjectDa
   drop updatedShape
   // Unlike the moving source block, stable headers can remain linked during growth.
   // Failure therefore leaves the old hash and its chain completely untouched.
-  run unsafe reserveProperties(&mut object, index + 1)
+  let reserved = run Effect.result(unsafe reserveProperties(&mut object, index + 1))
+  match move reserved {
+    Result<(), OutOfMemoryError>.Success { .. } => ()
+    Result<(), OutOfMemoryError>.Failure { error } => {
+      if !Pointer.isNull<HeapHeader>(retired) { unsafe restore(runtime, &mut object, present(retired)) }
+      fail move error
+    }
+  }
   // These appends cannot allocate after reserveProperties; retain only after success.
   run object.properties.append(PropertySlot.Value { value: ValueBits.Undefined })
   let appended = run unsafe appendMetadata(runtime, object.shape, atom, flags)
-  return AddResult { index: index, retiredShape: Pointer.null<HeapHeader>() }
+  return AddResult { index: index, retiredShape: retired }
+}
+
+/// Undoes a small-shape copy: object gets back its original shape and the unused
+/// copy is destroyed. The copy's prototype edge is also held by the original.
+unsafe fn restore(runtime: *mut HeapHeader, object: &mut ObjectData, original: *mut HeapHeader) -> () {
+  let copy = object.shape
+  object.shape = original
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  unsafe state.gcObjects.remove(copy)
+  drop state
+  let zero = unsafe HeapCell.decrement(copy)
+  let prototype = unsafe destroyDetached(runtime, copy)
+  if !Pointer.isNull<HeapHeader>(prototype) { let cannotBeZero = unsafe HeapCell.decrement(present(prototype)) }
 }
 
 /// Batch append after prepareUpdate and reserveProperties. Requires a uniquely
