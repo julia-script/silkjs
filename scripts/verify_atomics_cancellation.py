@@ -13,6 +13,7 @@ import tempfile
 import tomllib
 
 from verify_bytecode import executable_path, process
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 TEST = "scopedCancellationUnlinksBlockedWaitersWithoutPoisoningSharedQueue"
@@ -42,8 +43,8 @@ pub effect fn main() -> i32 ! OutOfMemoryError | SynchronizationError | SpawnErr
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--silk", default="silk")
-    parser.add_argument("--stdlib", type=Path)
+    parser.add_argument("--silk", default=str(toolchain.compiler_path()))
+    parser.add_argument("--stdlib", type=Path, default=toolchain.stdlib_path())
     args = parser.parse_args()
     silk = executable_path(args.silk)
     options = ["--stdlib", str(args.stdlib.resolve())] if args.stdlib else []

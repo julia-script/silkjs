@@ -18,6 +18,7 @@ import tomllib
 
 from verify_bytecode import SUPPORT, executable_path, process, validate_pins
 from verify_bound_functions import ALLOCATOR_SOURCE
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = [(method, 0) for method in range(42)]
@@ -242,8 +243,8 @@ def native(temp, silk, stdlib, cases, faults=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--reference', required=True, type=Path)
-    parser.add_argument('--silk', default='silk')
-    parser.add_argument('--stdlib', type=Path)
+    parser.add_argument('--silk', default=str(toolchain.compiler_path()))
+    parser.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
     parser.add_argument('--cc', default='/usr/bin/cc')
     args = parser.parse_args()
     reference = args.reference.resolve()

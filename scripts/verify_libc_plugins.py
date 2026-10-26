@@ -6,7 +6,7 @@ The compiler currently rejects package.kind=shared-library. We use its supported
 object-form LLVM emission, then invoke the platform linker with PIC and an exact
 export list. The resulting Darwin dylib intentionally keeps the .so suffix used
 by the module loader. Only the optional oracle target includes QuickJS headers.
-The default fixed5 compiler includes the required callback and varargs fixes.
+The default compiler and standard library come from the pinned installed release.
 The entry wrapper invokes the exported factory through a typed C function pointer:
 direct Silk calls to C exports are unsupported, while actual C ABI calls are supported.
 
@@ -26,11 +26,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "scripts/fixtures/libc_plugins"
 DEFAULT_REFERENCE = Path("/private/tmp/silkjs-quickjs-reference-20261023")
-SDKROOT = "/Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk"
 
 
 def invoke(argv, *, cwd, env, expected=0, stdout=None, stderr=None, timeout=180):
@@ -47,7 +47,7 @@ def invoke(argv, *, cwd, env, expected=0, stdout=None, stderr=None, timeout=180)
 def shared_flags(clang, output, *, oracle=False):
     flags = [str(clang)]
     if sys.platform == "darwin":
-        flags += ["-isysroot", os.environ.get("SDKROOT", SDKROOT), "-dynamiclib"]
+        flags += ["-isysroot", toolchain.sdkroot(), "-dynamiclib"]
         if oracle:
             flags += ["-Wl,-undefined,dynamic_lookup"]
         else:
@@ -97,7 +97,7 @@ def build_plugin(output, compiler, stdlib, clang, env, *, variant="valid",
     obj = package / "plugin.o"
     compile_args = [clang, "-fPIC", "-O2", "-c", ir, "-o", obj]
     if sys.platform == "darwin":
-        compile_args += ["-isysroot", env.get("SDKROOT", SDKROOT)]
+        compile_args += ["-isysroot", env.get("SDKROOT") or toolchain.sdkroot()]
     invoke(compile_args, cwd=package, env=env)
     result = output / (filename if variant == "valid" else variant + ".so")
     link = shared_flags(clang, result)
@@ -260,9 +260,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--qjs", type=Path)
     parser.add_argument("--qjsc", type=Path)
-    parser.add_argument("--compiler", type=Path, default=ROOT / "build/toolchain-main-dd2e99ab/silk-fixed5")
-    parser.add_argument("--stdlib", type=Path, default=ROOT / "build/toolchain-main-dd2e99ab/stdlib")
-    parser.add_argument("--clang", type=Path, default=Path("/opt/homebrew/opt/llvm/bin/clang") if sys.platform == "darwin" else Path(shutil.which("clang") or "clang"))
+    parser.add_argument("--compiler", type=Path, default=toolchain.compiler_path())
+    parser.add_argument("--stdlib", type=Path, default=toolchain.stdlib_path())
+    parser.add_argument("--clang", type=Path, default=Path(toolchain.clang_path()))
     parser.add_argument("--reference", type=Path, default=DEFAULT_REFERENCE)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--build-only", action="store_true")
@@ -275,11 +275,9 @@ def main():
     output = args.output or Path(tempfile.mkdtemp(prefix="native-libc-plugins-", dir=ROOT / "build"))
     output.mkdir(parents=True, exist_ok=True)
     output = output.resolve()
-    env = dict(os.environ, SILK_CLANG=str(args.clang), SILK_VERIFY_MIR="1",
+    env = dict(toolchain.host_environment(), SILK_CLANG=str(args.clang), SILK_VERIFY_MIR="1",
                SILKJS_SOURCE_DIR=str(ROOT / "src"), SILKJS_COMPILER=str(args.compiler),
                SILKJS_STDLIB=str(args.stdlib))
-    if sys.platform == "darwin":
-        env.setdefault("SDKROOT", SDKROOT)
     fixture = build_plugin(output, args.compiler, args.stdlib, args.clang, env)
     if args.build_only:
         print(fixture)

@@ -19,6 +19,7 @@ import struct
 import tempfile
 import tomllib
 from verify_bytecode import SUPPORT, executable_path, process, validate_pins
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 GRAMMAR_ERRORS = 'OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException'
@@ -741,8 +742,8 @@ def compare(expected, actual, path='programs'):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('upstream', type=Path)
-    parser.add_argument('--silk', default='silk')
-    parser.add_argument('--stdlib', type=Path)
+    parser.add_argument('--silk', default=str(toolchain.compiler_path()))
+    parser.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
     parser.add_argument('--cc', default='cc')
     parser.add_argument('--case', action='append', default=[], help='select named-case substrings; repeatable')
     parser.add_argument('--upstream-tests', action='store_true', help='also compile every upstream tests/*.js source with module autodetection')

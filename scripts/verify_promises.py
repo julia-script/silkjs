@@ -17,6 +17,7 @@ import struct
 import tempfile
 import tomllib
 from verify_bytecode import SUPPORT, executable_path, process, validate_pins
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = [(op, 0) for op in range(30)] + [(op, 1) for op in (2, 5, 6, 7, 8, 11, 12, 17, 18, 19, 22)] + [(7, 2)]
@@ -246,8 +247,8 @@ def compare(expected, actual):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--reference', required=True, type=Path)
-    parser.add_argument('--silk', default='silk')
-    parser.add_argument('--stdlib', type=Path)
+    parser.add_argument('--silk', default=str(toolchain.compiler_path()))
+    parser.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
     parser.add_argument('--cc', default='/usr/bin/cc')
     args = parser.parse_args()
     reference = args.reference.resolve()

@@ -24,6 +24,7 @@ import tomllib
 from verify_strings import ROOT, SUPPORT, executable_path, validate_pins, process
 from verify_primitives import C_SOURCE as PRIMITIVE_C, SILK_SOURCE as PRIMITIVE_SILK
 from verify_primitives import u32, wide, float_bits, signed_limbs, number_corpus
+import toolchain
 
 # Reuse the established binary fixture decoders only, never primitive operations
 # or expected outputs. Explicit boundaries fail loudly if that fixture ABI moves.
@@ -344,8 +345,8 @@ def records(data, cases, owner):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('upstream', type=Path)
-    ap.add_argument('--silk', default='silk')
-    ap.add_argument('--stdlib', type=Path)
+    ap.add_argument('--silk', default=str(toolchain.compiler_path()))
+    ap.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
     ap.add_argument('--cc', default='cc')
     ap.add_argument('--timeout', type=int, default=900)
     ap.add_argument('--random-cases', type=int, default=512)

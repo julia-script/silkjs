@@ -15,6 +15,7 @@ import subprocess
 from intl_numberformat_cases import cases, native_boundaries, FAULTS, INDEPENDENT
 from verify_intl_locale import literal, records, INTL, TEMPORAL
 from verify_bytecode import executable_path, process, validate_pins
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFECTS = [
@@ -64,9 +65,9 @@ int main(int argc,char **argv){
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--upstream',type=Path,required=True)
-    parser.add_argument('--silk',default=str(ROOT/'build/toolchain-main-dd2e99ab/silk-fixed4'))
-    parser.add_argument('--stdlib',type=Path,default=ROOT/'build/toolchain-main-dd2e99ab/stdlib')
-    parser.add_argument('--cc',default='/opt/homebrew/opt/llvm/bin/clang')
+    parser.add_argument('--silk', default=str(toolchain.compiler_path()))
+    parser.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
+    parser.add_argument('--cc', default=toolchain.clang_path())
     parser.add_argument('--cflag',action='append',default=[])
     parser.add_argument('--timeout',type=int,default=1800)
     parser.add_argument('--build-dir',type=Path,default=ROOT/'build/intl-numberformat-differential')

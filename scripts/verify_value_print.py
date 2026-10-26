@@ -3,7 +3,7 @@
 
 No production C linkage. Checks exact output bytes, getter/proxy nonexecution,
 source option limits and native allocation cleanup at every injected ordinal.
-Raw pointer-bearing output is checked structurally, not compared across processes.
+Raw pointers are checked structurally, including nullness, not platform spelling.
 Converted sparse arrays are checked against explicit bytes: only fast arrays
 print a dense prefix and trailing-hole summary, matching the pinned source.
 Negative depth remains a native safety assertion, NOT a passing differential:
@@ -19,6 +19,7 @@ import shutil
 import struct
 import subprocess
 from verify_bytecode import executable_path, process, validate_pins
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT = (False, False, 2, 1000, 100)
@@ -100,7 +101,7 @@ def cases():
     add('raw-bigint-positive','123456789012345678901234567890n',options=(False,True,2,1000,100))
     add('raw-bigint-negative','-123456789012345678901234567890n',options=(False,True,2,1000,100))
     add('raw-function','(function named(){})',b'[Function]',(False,True,2,1000,100))
-    add('raw-pointer-getter', '({get x(){throw 1}})', options=(False,True,2,1000,100))
+    add('raw-pointer-getter', '({get x(){throw 1}})', b'{ x: [Getter <address> Setter <null>] }', options=(False,True,2,1000,100))
     add('raw-pointer-depth', '({child:{x:1}})', options=(False,True,1,1000,100))
     add('raw-closure', '(()=>{let x=42;return function captured(){return x}})()', options=(False,True,2,1000,100))
     return rows
@@ -175,9 +176,9 @@ def records(data,count):
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--upstream',type=Path,default=Path('/private/tmp/silkjs-quickjs-reference-20261023'))
-    p.add_argument('--silk',default=str(ROOT/'build/toolchain-main-dd2e99ab/silk-fixed5'))
-    p.add_argument('--stdlib',type=Path,default=ROOT/'build/toolchain-main-dd2e99ab/stdlib')
-    p.add_argument('--cc',default='/opt/homebrew/opt/llvm/bin/clang')
+    p.add_argument('--silk',default=str(toolchain.compiler_path()))
+    p.add_argument('--stdlib',type=Path,default=toolchain.stdlib_path())
+    p.add_argument('--cc',default=toolchain.clang_path())
     p.add_argument('--cflag',action='append',default=[])
     p.add_argument('--build-dir',type=Path,default=ROOT/'build/value-print-differential')
     p.add_argument('--timeout',type=int,default=1800)
@@ -216,6 +217,11 @@ def main():
                 differences.append(f'{row[0]} missing native pointer: C={c!r}, native={n!r}')
             c=re.sub(rb'0x[1-9a-f][0-9a-f]*',b'<address>',c)
             n=re.sub(rb'0x[1-9a-f][0-9a-f]*',b'<address>',n)
+            # libc's %p null spelling is implementation-defined. Preserve the
+            # getter/setter field and nullness, without rewriting value text.
+            null_pointer = rb'((?:Getter|Setter) )(?:\(nil\)|0x0)(?=[ \]])'
+            c=re.sub(null_pointer,rb'\1<null>',c)
+            n=re.sub(null_pointer,rb'\1<null>',n)
         if c!=n:differences.append(f'{row[0]}: C={c!r}, native={n!r}')
         if row[2] is not None and (c!=row[2] or n!=row[2]):differences.append(f'{row[0]} violates independent expected bytes {row[2]!r}: C={c!r}, native={n!r}')
     if differences:raise SystemExit('\n'.join(differences))

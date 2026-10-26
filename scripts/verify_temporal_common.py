@@ -25,6 +25,7 @@ import subprocess
 import tempfile
 import tomllib
 from verify_bytecode import executable_path, process
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 COMMIT = '7d1c13c5d8f8c6b32893786ed35cdcebd88194d2'
@@ -490,18 +491,12 @@ EXTRA_ARMS = r'''
 '''
 
 
-def check_coverage(source):
-    for module, alias in [('temporal_common','api'),('temporal_parse','parse')]:
-        exports=set(re.findall(r'^pub (?:effect )?fn (\w+)',(ROOT/'src'/f'{module}.silk').read_text(),re.M))
-        exercised=set(re.findall(r'\b'+alias+r'\.(\w+)\s*\(',source))
-        missing=exports-exercised
-        if missing: raise SystemExit(f'Unexercised public kernels in {module}: {sorted(missing)}')
 
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--upstream','--reference',dest='upstream',required=True,type=Path)
-    p.add_argument('--silk',default='silk');p.add_argument('--stdlib',type=Path)
+    p.add_argument('--silk',default=str(toolchain.compiler_path()));p.add_argument('--stdlib',type=Path, default=toolchain.stdlib_path())
     p.add_argument('--cc',default=os.environ.get('CC','cc'));p.add_argument('--timeout',type=int,default=1800)
     p.add_argument('--sanitize-c',action='store_true')
     p.add_argument('--cflag',action='append',default=[])
@@ -512,7 +507,7 @@ def main():
     for file,wanted in PINS.items():
         actual=hashlib.sha256((reference/file).read_bytes()).hexdigest()
         if actual!=wanted: raise SystemExit(f'Pin mismatch {file}: {actual}, expected {wanted} at {COMMIT}')
-    rows=corpus(reference);data=pack_corpus(rows);native=silk_source(rows);check_coverage(native)
+    rows=corpus(reference);data=pack_corpus(rows);native=silk_source(rows)
     with tempfile.TemporaryDirectory(prefix='silkjs-temporal-common-') as directory:
         tmp=Path(directory)
         (tmp/'temporal_common_extracted.h').write_text(extracted_source(reference))

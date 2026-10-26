@@ -37,6 +37,7 @@ import tempfile
 import tomllib
 from urllib.request import urlopen
 from verify_bytecode import executable_path, process
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 REVISION = '57dd0f905df7b8b49d638b0007a64a08a5d6535e'
@@ -228,8 +229,8 @@ pub effect fn main() -> i32 ! OutOfMemoryError | WriterError {
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--silk', default='silk')
-    parser.add_argument('--stdlib', type=Path)
+    parser.add_argument('--silk', default=str(toolchain.compiler_path()))
+    parser.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
     parser.add_argument('--cc', default='cc')
     parser.add_argument('--fdlibm-source', type=Path)
     args = parser.parse_args()
@@ -256,6 +257,7 @@ def main():
         if len(reference) != len(cases) * 16 or len(actual) != len(cases) * 8:
             raise SystemExit('Invalid power oracle output size')
         contrasts = []
+        unexplained = []
         for index, (x, y) in enumerate(cases):
             original, platform = struct.unpack_from('<QQ', reference, index * 16)
             native, = struct.unpack_from('<Q', actual, index * 8)
@@ -266,9 +268,16 @@ def main():
                 try:
                     contrasts.append(bounded_contrast(x, y, original, platform))
                 except (ValueError, ArithmeticError) as error:
-                    raise SystemExit(f'Unexplained power platform mismatch {index}: {error}') from error
+                    unexplained.append(
+                        f'Unexplained power platform mismatch {index}: x={x:#018x} y={y:#018x} '
+                        f'fdlibm={original:#018x} platform={platform:#018x}: {error}')
         for contrast in contrasts:
             print(contrast)
+        if unexplained:
+            print(f'Native power fidelity: {len(cases)} exact native/fdlibm matches; '
+                  f'source-SHA256={SOURCE_SHA256}; native-SHA256={hashlib.sha256(actual).hexdigest()}; '
+                  f'{len(unexplained)} platform contrasts remain non-passing')
+            raise SystemExit('\n'.join(unexplained))
         nan_count = sum('pow-platform/nan-representation' in entry for entry in contrasts)
         print(f'PASS power: {len(cases)} exact native/fdlibm matches; '
               f'{len(cases) - len(contrasts)} exact platform matches; '

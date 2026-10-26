@@ -16,6 +16,7 @@ import struct
 import subprocess
 from verify_bytecode import SUPPORT, executable_path, process, validate_pins
 from verify_native_functions import C_SOURCE as ALLOCATION_ORACLE
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = [(kind, mode) for kind in range(11) for mode in range(17)]
@@ -215,8 +216,8 @@ pub effect fn main() -> i32 ! OutOfMemoryError | StringLengthError | BigIntError
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--reference', required=True, type=Path)
-    parser.add_argument('--silk', default='silk')
-    parser.add_argument('--stdlib', type=Path)
+    parser.add_argument('--silk', default=str(toolchain.compiler_path()))
+    parser.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
     parser.add_argument('--cc', default='cc')
     args = parser.parse_args()
     reference = args.reference.resolve()

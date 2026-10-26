@@ -10,6 +10,7 @@ import subprocess
 from intl_auxiliary_cases import cases, FAULTS
 from verify_intl_locale import INTL, TEMPORAL, literal, records
 from verify_bytecode import executable_path, process, validate_pins
+import toolchain
 
 ROOT=Path(__file__).resolve().parents[1]
 
@@ -57,9 +58,9 @@ int main(int argc,char **argv){
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--upstream',type=Path,required=True)
-    p.add_argument('--silk',default=str(ROOT/'build/toolchain-main-dd2e99ab/silk-fixed4'))
-    p.add_argument('--stdlib',type=Path,default=ROOT/'build/toolchain-main-dd2e99ab/stdlib')
-    p.add_argument('--cc',default='/opt/homebrew/opt/llvm/bin/clang')
+    p.add_argument('--silk',default=str(toolchain.compiler_path()))
+    p.add_argument('--stdlib',type=Path,default=toolchain.stdlib_path())
+    p.add_argument('--cc',default=toolchain.clang_path())
     p.add_argument('--cflag',action='append',default=[])
     p.add_argument('--timeout',type=int,default=1800)
     p.add_argument('--build-dir',type=Path,default=ROOT/'build/intl-auxiliary-differential')

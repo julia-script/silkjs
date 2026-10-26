@@ -33,6 +33,7 @@ import tempfile
 import tomllib
 
 from verify_strings import ROOT, SUPPORT, executable_path, validate_pins, records, process
+import toolchain
 
 SIGN = 0x8000000000000000
 INF = 0x7ff0000000000000
@@ -383,8 +384,8 @@ def fixtures(seed, random_cases):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('upstream', type=Path)
-    parser.add_argument('--silk', default='silk')
-    parser.add_argument('--stdlib', type=Path)
+    parser.add_argument('--silk', default=str(toolchain.compiler_path()))
+    parser.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
     parser.add_argument('--cc', default='cc')
     parser.add_argument('--timeout', type=int, default=900)
     parser.add_argument('--random-cases', type=int, default=96)

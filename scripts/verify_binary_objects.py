@@ -20,6 +20,7 @@ import subprocess
 import tempfile
 
 from verify_bytecode import SUPPORT, validate_pins
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPILE = 32
@@ -343,9 +344,9 @@ def compare(job, actual):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--reference', required=True, type=Path)
-    parser.add_argument('--silk', type=Path, default=ROOT / 'build/toolchain-main-dd2e99ab/silk-fixed4')
-    parser.add_argument('--stdlib', type=Path, default=ROOT / 'build/toolchain-main-dd2e99ab/stdlib')
-    parser.add_argument('--cc', default='/opt/homebrew/opt/llvm/bin/clang')
+    parser.add_argument('--silk', type=Path, default=toolchain.compiler_path())
+    parser.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
+    parser.add_argument('--cc', default=toolchain.clang_path())
     parser.add_argument('--cflag', action='append', default=[])
     parser.add_argument('--cutoffs', type=int, default=512)
     parser.add_argument('--case', action='append', help='Diagnostic subset; default runs every case')

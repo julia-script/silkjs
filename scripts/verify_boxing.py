@@ -10,6 +10,7 @@ import tomllib
 from verify_bytecode import SUPPORT, executable_path, process, validate_pins
 from verify_bigint_coercions import leaves, KINDS, TEXTS
 from verify_property_get import C_SOURCE as GET_C, SILK_SOURCE as GET_SILK
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 TOTAL_KINDS = KINDS + 6
@@ -341,8 +342,8 @@ def records(data):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('upstream', type=Path)
-    parser.add_argument('--silk', default='silk')
-    parser.add_argument('--stdlib', type=Path)
+    parser.add_argument('--silk', default=str(toolchain.compiler_path()))
+    parser.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
     parser.add_argument('--cc', default='cc')
     args = parser.parse_args()
     upstream = args.upstream.resolve()

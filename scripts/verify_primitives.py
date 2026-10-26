@@ -37,6 +37,7 @@ import tempfile
 import tomllib
 
 from verify_strings import ROOT, SUPPORT, executable_path, validate_pins, records, process
+import toolchain
 
 NUMERIC_FIELDS = ('int32', 'int64', 'integer.bits', 'int32.saturated',
                   'int64.saturated', 'int64.saturation-flags', 'uint8.clamped',
@@ -594,8 +595,8 @@ def fixtures(pool, seed, random_cases):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('upstream', type=Path)
-    ap.add_argument('--silk', default='silk')
-    ap.add_argument('--stdlib', type=Path)
+    ap.add_argument('--silk', default=str(toolchain.compiler_path()))
+    ap.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
     ap.add_argument('--cc', default='cc')
     ap.add_argument('--timeout', type=int, default=900)
     ap.add_argument('--random-cases', type=int, default=4096)

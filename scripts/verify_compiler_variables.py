@@ -15,6 +15,7 @@ import tempfile
 import tomllib
 from verify_bytecode import validate_pins, executable_path, SUPPORT
 from verify_compiler_state import execute, SILK_SOURCE as STATE_SOURCE
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
 OPS = ['scope_get_var_undef', 'scope_get_var', 'scope_put_var', 'scope_delete_var',
@@ -471,8 +472,8 @@ def sources(cases):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('upstream', type=Path)
-    parser.add_argument('--silk', default='silk')
-    parser.add_argument('--stdlib', type=Path)
+    parser.add_argument('--silk', default=str(toolchain.compiler_path()))
+    parser.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
     parser.add_argument('--cc', default='cc')
     args = parser.parse_args()
     upstream = args.upstream.expanduser().resolve()

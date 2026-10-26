@@ -36,6 +36,7 @@ import tomllib
 # Reuse the established recursive source-pin validator and process launcher,
 # not any semantic fixture, native output, or oracle implementation.
 from verify_strings import ROOT, SUPPORT, executable_path, process, validate_pins
+import toolchain
 
 REVISION = '7d1c13c5d8f8c6b32893786ed35cdcebd88194d2'
 SCAN, NEXT, REGEXP, TEMPLATE, SNAPSHOT, REPARSE, PEEK, PARENS, LOCATION, MODULE, ASI = range(11)
@@ -601,8 +602,8 @@ def records(data, cases, owner):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('upstream', type=Path)
-    parser.add_argument('--silk', default='silk')
-    parser.add_argument('--stdlib', type=Path)
+    parser.add_argument('--silk', default=str(toolchain.compiler_path()))
+    parser.add_argument('--stdlib', type=Path, default=toolchain.stdlib_path())
     parser.add_argument('--cc', default='cc')
     parser.add_argument('--seed', type=lambda x: int(x, 0), default=0x1E7E2026)
     parser.add_argument('--random-cases', type=int, default=256)

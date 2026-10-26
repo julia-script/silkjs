@@ -22,11 +22,9 @@ import tempfile
 import termios
 import time
 from verify_libc_plugins import build_bjson_plugin
+import toolchain
 
 ROOT = Path(__file__).resolve().parents[1]
-SDKROOT = "/Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk"
-DEFAULT_COMPILER = ROOT / "build/toolchain-main-dd2e99ab/silk-fixed5"
-DEFAULT_STDLIB = ROOT / "build/toolchain-main-dd2e99ab/stdlib"
 
 
 def invoke(argv, *, cwd=ROOT, expected=0, stdout=None, stderr=None, timeout=90, env=None):
@@ -390,15 +388,15 @@ def main():
     parser.add_argument("--build", action="store_true")
     parser.add_argument("--output", type=Path, default=ROOT / "build/native-frontends")
     parser.add_argument("--reference", type=Path, default=Path("/private/tmp/silkjs-quickjs-reference-20261023"))
-    parser.add_argument("--compiler", type=Path, default=DEFAULT_COMPILER)
-    parser.add_argument("--stdlib", type=Path, default=DEFAULT_STDLIB)
+    parser.add_argument("--compiler", type=Path, default=toolchain.compiler_path())
+    parser.add_argument("--stdlib", type=Path, default=toolchain.stdlib_path())
     parser.add_argument("--bjson-plugin", type=Path, help="Reuse an already compiled native bjson plugin")
     parser.add_argument("--compiler-start", choices=COMPILER_STAGES,
                         help="Run compiler scenarios from this stage only; do not repeat interpreter/upstream/PTY checks")
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ, SDKROOT=SDKROOT, SILK_CLANG="/opt/homebrew/opt/llvm/bin/clang", SILK_VERIFY_MIR="1",
+    env = dict(toolchain.host_environment(), SILK_VERIFY_MIR="1",
                SILKJS_SOURCE_DIR=str(ROOT / "src"), SILKJS_COMPILER=str(args.compiler.resolve()), SILKJS_STDLIB=str(args.stdlib.resolve()))
     qjs, qjsc = output / "qjs", output / "qjsc"
     if args.build:
