@@ -160,7 +160,7 @@ unsafe effect fn runCase(out: &mut ByteBuffer, hooks: &mut Hooks, memory: &Alloc
   let first = run unsafe leaf(rt, lk) let second = run unsafe leaf(rt, rk)
   let firstRoot = unsafe rc(first) let secondRoot = unsafe rc(second)
   let a = run unsafe transitions.make(&mut hooks, memory, ctx, lf, first, second)
-  let mut b = Value.Undefined
+  let mut b = ValueBits.Undefined
   if alias { b = unsafe a.retained() }
   else { b = run unsafe transitions.make(&mut hooks, memory, ctx, rf, second, first) }
   let aBefore = unsafe rc(a) let bBefore = unsafe rc(b)
@@ -362,7 +362,7 @@ def corpus():
     for index, (number, big) in enumerate(EXTRAS, BASE_KINDS):
         c += f'\nif(kind=={index})return ' + (f'__JS_NewShortBigInt(ctx,{number});' if big else f'JS_NewInt32(ctx,{number});')
         literal = '-2147483647 - 1' if number == -2147483648 else str(number)
-        silk += f'\nif kind == {index} {{ return Value.' + ('ShortBigInt' if big else 'Int') + f' {{ value: {literal} }} }}'
+        silk += f'\nif kind == {index} {{ return ValueBits.' + ('ShortBigInt' if big else 'Int') + f' {{ value: {literal} }} }}'
     for index, length in enumerate(FLAT_LENGTHS, BASE_KINDS + len(EXTRAS)):
         c += f'\nif(kind=={index}){{char bytes[{length}];memset(bytes,120,sizeof(bytes));return checked(JS_NewStringLen(ctx,bytes,sizeof(bytes)));}}'
         silk += f'\nif kind == {index} {{ let bytes: [u8; {length}] = [120; {length}] return run Strings.fromLatin1(&bytes) }}'

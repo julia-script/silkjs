@@ -131,7 +131,7 @@ import byte_buffer { ByteBuffer }
 import runtime_memory { RuntimeAllocator }
 import js_runtime as runtime
 import js_gc as gc
-import js_value { Value }
+import js_value { ValueBits }
 import js_private_fields_cases as cases
 import js_private_fields_test_support as fixture
 import js_private_fields as fields
@@ -166,8 +166,8 @@ pub effect fn main() -> i32 ! OutOfMemoryError | StringLengthError | BigIntError
  while phase < 2 {
   let mut position: usize = 0
   while position < 32 {
-   let object = run unsafe objects.withPrototype(&mut hooks, &observer, ctx, Value.Null) |> Effect.provideMut<Allocator>(&mut fault)
-   let home = run unsafe objects.withPrototype(&mut hooks, &observer, ctx, Value.Null) |> Effect.provideMut<Allocator>(&mut fault)
+   let object = run unsafe objects.withPrototype(&mut hooks, &observer, ctx, ValueBits.Null) |> Effect.provideMut<Allocator>(&mut fault)
+   let home = run unsafe objects.withPrototype(&mut hooks, &observer, ctx, ValueBits.Null) |> Effect.provideMut<Allocator>(&mut fault)
    let name = run unsafe fixture.symbol(rt) |> Effect.provideMut<Allocator>(&mut fault)
    let incoming = run Strings.fromLatin1(b"owned") |> Effect.provideMut<Allocator>(&mut fault)
    fault.armed = true fault.remaining = position

@@ -124,7 +124,7 @@ import silk.os_writer { StdoutWriter }
 import runtime_memory { RuntimeAllocator }
 import byte_buffer { ByteBuffer }
 import js_heap { HeapCell, HeapHeader }
-import js_value { Value }
+import js_value { ValueBits }
 import js_strings { Strings }
 import js_string_types { StringLengthError }
 import js_core_types { RuntimeState, ContextState, ModuleDef, ModuleStatus, ExportBinding, ImportEntry, NativeFunctionId, WeakRefHeader }
@@ -147,7 +147,7 @@ effect fn word(out:&mut ByteBuffer,value:i32)->() ! OutOfMemoryError ? &mut Allo
 fn flag(value:bool)->i32 { if value { return 1 } return 0 }
 fn same(a:?*mut HeapHeader,b:?*mut HeapHeader)->bool { return Pointer.address<HeapHeader>(a)==Pointer.address<HeapHeader>(b) }
 unsafe fn rc(node:*mut HeapHeader)->i32 { let anchor=() let header=unsafe Pointer.borrow<(),HeapHeader>(&anchor,node) return header.referenceCount }
-unsafe fn textRc(value:Value)->i32 { return match value { Value.String { reference }=>unsafe rc(reference) _=>-1 } }
+unsafe fn textRc(value:ValueBits)->i32 { return match value { ValueBits.String { reference }=>unsafe rc(reference) _=>-1 } }
 effect fn duplicate(error:ModuleMetadataError)->i32 { return flag(error.kind==ModuleMetadataErrorKind.DuplicateExport) }
 effect fn probe()->() ! OutOfMemoryError | StringLengthError | ModuleMetadataError | WriterError ? &mut Allocator | &mut Writer {
   let runtime=run allocateRuntimeStorage(0) let context=run unsafe allocateContextStorage(runtime)

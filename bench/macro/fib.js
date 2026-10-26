@@ -1,0 +1,3 @@
+// Recursive calls and integer arithmetic: function-call overhead in the interpreter loop.
+function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }
+console.log(fib(25));

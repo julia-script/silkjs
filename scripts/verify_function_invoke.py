@@ -139,7 +139,7 @@ import silk.writer { Writer, WriterError }
 import silk.os_writer { StdoutWriter }
 import byte_buffer { ByteBuffer }
 import runtime_memory { RuntimeAllocator }
-import js_value { Value }
+import js_value { ValueBits }
 import js_core_types { FrameSlots }
 import js_runtime as runtime
 import js_gc as gc
@@ -173,17 +173,17 @@ pub effect fn main() -> i32 ! OutOfMemoryError | StringLengthError | BigIntError
    let function = run unsafe fixture.target(&mut hooks, &observer, ctx) |> Effect.provideMut<Allocator>(&mut fault)
    hooks.target = function hooks.expectedNewTarget = function
    let array = run unsafe fixture.arrayLike(&mut hooks, &observer, ctx, scenario) |> Effect.provideMut<Allocator>(&mut fault)
-   let mut values = [function, array] let slots = FrameSlots.Borrowed { data: Pointer.fromMutRef<Value>(&mut values[0]), length: 2 }
+   let mut values = [function, array] let slots = FrameSlots.Borrowed { data: Pointer.fromMutRef<ValueBits>(&mut values[0]), length: 2 }
    let mut magic: i32 = 0 if kind == 2 { magic = 1 }
    let before = fault.failures fault.armed = true fault.remaining = position
    let result = run Effect.result(unsafe invoke.apply(&mut hooks, ctx, function, &slots, magic)) |> Effect.provideMut<Allocator>(&mut fault)
    fault.armed = false
    match move result {
-    Result<Value, JsException>.Success { value } => {
+    Result<ValueBits, JsException>.Success { value } => {
      if kind == 0 && position == 0 { trap() }
      unsafe gc.release(&mut hooks, rt, value)
     }
-    Result<Value, JsException>.Failure { .. } => { if !unsafe exceptions.has(rt) { trap() } }
+    Result<ValueBits, JsException>.Failure { .. } => { if !unsafe exceptions.has(rt) { trap() } }
    }
    if kind == 0 && position == 0 && (fault.failures - before != 1 || hooks.calls != 0) { trap() }
    let pending = unsafe exceptions.take(rt) unsafe gc.release(&mut hooks, rt, pending)

@@ -93,7 +93,7 @@ import silk.os_writer { StdoutWriter }
 import byte_buffer { ByteBuffer }
 import runtime_memory { RuntimeAllocator, AllocationObserver }
 import js_heap { HeapCell, HeapHeader }
-import js_value { Value }
+import js_value { ValueBits }
 import js_core_types { ContextState, ObjectData, ShapeData, PropertySlot, NativeFunctionId, WeakRefHeader, ExoticCallbacks }
 import js_gc { HeapHooks, Tracer }
 import js_gc as gc
@@ -107,7 +107,7 @@ import js_string_types { StringLengthError, stringReference }
 fn trap()->never { return Intrinsic.trap("QuickJS invariant violated") }
 fn word(value:i32)->u32 { let mut wide=i32.toI64(value) if wide<0 { wide=wide+4294967296 } return i64.toU32(wide) }
 fn flag(value:bool)->u32 { if value { return 1 } return 0 }
-fn reference(value:Value)->*mut HeapHeader { return match value { Value.Object {reference}=>reference _=>trap() } }
+fn reference(value:ValueBits)->*mut HeapHeader { return match value { ValueBits.Object {reference}=>reference _=>trap() } }
 unsafe fn rc(node:*mut HeapHeader)->u32 { let anchor=() unsafe { return i32.toU32(Pointer.borrow<(),HeapHeader>(&anchor,node).referenceCount) } }
 struct Hooks {}
 impl HeapHooks for Hooks {
@@ -120,7 +120,7 @@ impl HeapHooks for Hooks {
   unsafe effect fn sweepWeak(self:&mut Self,rt:*mut HeapHeader,node:*mut WeakRefHeader)->() ? &mut Allocator { trap() }
   unsafe fn destroyAuxiliary(self:&mut Self,rt:*mut HeapHeader,node:*mut HeapHeader)->() { trap() }
 }
-unsafe effect fn snapshot(out:&mut ByteBuffer,value:Value)->() ! OutOfMemoryError ? &mut Allocator {
+unsafe effect fn snapshot(out:&mut ByteBuffer,value:ValueBits)->() ! OutOfMemoryError ? &mut Allocator {
   let anchor=() let p=unsafe HeapCell.payload<ObjectData,()>(&anchor,reference(value))
   let s=unsafe HeapCell.payload<ShapeData,()>(&anchor,p.shape)
   run out.writeU32(p.classId) run out.writeU32(flag(p.extensible)) run out.writeU32(flag(p.isExotic))
@@ -133,14 +133,14 @@ unsafe effect fn snapshot(out:&mut ByteBuffer,value:Value)->() ! OutOfMemoryErro
     let v=match p.properties.get(i) { PropertySlot.Value {value:held}=>held _=>trap() }
     run out.writeU32(sp.atom) run out.writeU32(u8.toU32(sp.flags)) run out.writeU32(word(v.tag()))
     match v {
-      Value.Int {value:number}=>{run out.writeU32(word(number))}
+      ValueBits.Int {value:number}=>{run out.writeU32(word(number))}
       _=>{if v.isString() { let n=Strings.length(v) run out.writeU32(usize.toU32(n)) let mut j:usize=0
         while j<n { run out.writeU32(u16.toU32(Strings.codeUnit(v,j))) j=j+1 } }}
     }
     i=i+1
   }
 }
-unsafe fn shape(value:Value)->*mut HeapHeader { let anchor=() unsafe { return HeapCell.payload<ObjectData,()>(&anchor,reference(value)).shape } }
+unsafe fn shape(value:ValueBits)->*mut HeapHeader { let anchor=() unsafe { return HeapCell.payload<ObjectData,()>(&anchor,reference(value)).shape } }
 effect fn probe(out:&mut ByteBuffer)->() ! OutOfMemoryError | StringLengthError ? &mut Allocator {
   let mut memory=run RuntimeAllocator.make(Allocator.systemAllocatorProvider()) let observer=run memory.observe()
   let rt=run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
@@ -148,7 +148,7 @@ effect fn probe(out:&mut ByteBuffer)->() ! OutOfMemoryError | StringLengthError 
   let mut hooks=Hooks {}
   let ids=[CLASS_IDS] let mut i:usize=0
   while i<ids.length {
-    let value=run unsafe objects.withPrototypeClass(&mut hooks,&observer,ctx,Value.Null,ids[i]) |> Effect.provideMut<Allocator>(&mut memory)
+    let value=run unsafe objects.withPrototypeClass(&mut hooks,&observer,ctx,ValueBits.Null,ids[i]) |> Effect.provideMut<Allocator>(&mut memory)
     run unsafe snapshot(&mut out,value) unsafe gc.release(&mut hooks,rt,value) i=i+1
   }
   let mut definition=emptyDefinition()
@@ -159,10 +159,10 @@ effect fn probe(out:&mut ByteBuffer)->() ! OutOfMemoryError | StringLengthError 
   run unsafe snapshot(&mut out,custom) unsafe gc.release(&mut hooks,rt,custom)
   let capacities:[i32;CAPACITY_COUNT]=[CAPACITIES] i=0
   while i<capacities.length {
-    let value=run unsafe objects.withPrototypeClassCapacity(&mut hooks,&observer,ctx,Value.Null,classes.JS_CLASS_OBJECT,capacities[i]) |> Effect.provideMut<Allocator>(&mut memory)
+    let value=run unsafe objects.withPrototypeClassCapacity(&mut hooks,&observer,ctx,ValueBits.Null,classes.JS_CLASS_OBJECT,capacities[i]) |> Effect.provideMut<Allocator>(&mut memory)
     run unsafe snapshot(&mut out,value) unsafe gc.release(&mut hooks,rt,value) i=i+1
   }
-  let parent=run unsafe objects.withPrototype(&mut hooks,&observer,ctx,Value.Null) |> Effect.provideMut<Allocator>(&mut memory)
+  let parent=run unsafe objects.withPrototype(&mut hooks,&observer,ctx,ValueBits.Null) |> Effect.provideMut<Allocator>(&mut memory)
   unsafe runtime.setClassPrototype(&mut hooks,ctx,classes.JS_CLASS_OBJECT,unsafe parent.retained())
   let a=run unsafe objects.object(&mut hooks,&observer,ctx) |> Effect.provideMut<Allocator>(&mut memory)
   let b=run unsafe objects.withClass(&mut hooks,&observer,ctx,classes.JS_CLASS_OBJECT) |> Effect.provideMut<Allocator>(&mut memory)
@@ -171,7 +171,7 @@ effect fn probe(out:&mut ByteBuffer)->() ! OutOfMemoryError | StringLengthError 
   run out.writeU32(unsafe rc(reference(parent))) unsafe gc.release(&mut hooks,rt,a)
   run out.writeU32(unsafe rc(reference(parent))) unsafe gc.release(&mut hooks,rt,b)
   run out.writeU32(unsafe rc(reference(parent))) unsafe gc.release(&mut hooks,rt,parent)
-  let first=run unsafe objects.withPrototypeClass(&mut hooks,&observer,ctx,Value.Null,classes.JS_CLASS_ARRAY) |> Effect.provideMut<Allocator>(&mut memory)
+  let first=run unsafe objects.withPrototypeClass(&mut hooks,&observer,ctx,ValueBits.Null,classes.JS_CLASS_ARRAY) |> Effect.provideMut<Allocator>(&mut memory)
   let cached=unsafe shape(first) unsafe HeapCell.retain(cached)
   let mut anchor=() let context=unsafe HeapCell.payloadMut<ContextState,()>(&mut anchor,ctx)
   context.arrayShape=cached drop context unsafe gc.release(&mut hooks,rt,first)

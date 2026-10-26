@@ -206,7 +206,7 @@ import byte_buffer { ByteBuffer }
 import runtime_memory { RuntimeAllocator, AllocationObserver }
 import js_heap { HeapCell, HeapHeader, HeapKind }
 import js_core_types { RuntimeState }
-import js_value { Value }
+import js_value { ValueBits }
 import js_gc as gc
 import js_runtime as runtime
 import js_strings { Strings }
@@ -223,7 +223,7 @@ import js_exceptions { JsException }
 import js_exceptions as exceptions
 import js_atom_data as atoms
 import js_array_storage_test_support { trap }
-unsafe fn rc(value: Value) -> i32 {
+unsafe fn rc(value: ValueBits) -> i32 {
   match value.heapReference() {
     Option<*mut HeapHeader>.None => { return 0 }
     Option<*mut HeapHeader>.Some { value: node } => {
@@ -236,49 +236,49 @@ fn signed(value: i32) -> u32 {
   if value < 0 { return i32.toU32(-(value + 1)) ^ 0xffffffff }
   return i32.toU32(value)
 }
-effect fn text(out: &mut ByteBuffer, value: Value) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn text(out: &mut ByteBuffer, value: ValueBits) -> () ! OutOfMemoryError ? &mut Allocator {
   run out.writeU32(usize.toU32(Strings.length(value))) let mut i: usize = 0
   while i < Strings.length(value) { run out.writeU32(u16.toU32(Strings.codeUnit(value, i))) i = i + 1 }
 }
-unsafe effect fn leaf(rt: *mut HeapHeader, kind: u32) -> Value
+unsafe effect fn leaf(rt: *mut HeapHeader, kind: u32) -> ValueBits
   ! OutOfMemoryError | StringLengthError | BigIntError ? &mut Allocator {
-  if kind == 0 { return Value.Undefined } if kind == 1 { return Value.Null }
-  if kind == 2 { return Value.Bool { value: false } } if kind == 3 { return Value.Int { value: 41 } }
+  if kind == 0 { return ValueBits.Undefined } if kind == 1 { return ValueBits.Null }
+  if kind == 2 { return ValueBits.Bool { value: false } } if kind == 3 { return ValueBits.Int { value: 41 } }
   if kind == 4 { return run Strings.fromLatin1(b" -0 ") }
   if kind == 5 {
     let description = StringOwner.adopt(run Strings.fromLatin1(b"coercion-symbol"))
     let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
-    return run state.atoms.uniqueSymbol(Option<Value>.some(description.get()))
+    return run state.atoms.uniqueSymbol(Option<ValueBits>.some(description.get()))
   }
   if kind == 6 {
     let integer = run BigInt.fromI64(9007199254740993)
-    return Value.BigInt { reference: run HeapCell.allocate(HeapKind.BigInt, move integer) }
+    return ValueBits.BigInt { reference: run HeapCell.allocate(HeapKind.BigInt, move integer) }
   }
-  if kind == 7 { return Value.Float64 { value: f64.fromBits(0x8000000000000000) } }
+  if kind == 7 { return ValueBits.Float64 { value: f64.fromBits(0x8000000000000000) } }
   return trap()
 }
-unsafe effect fn describe(out: &mut ByteBuffer, rt: *mut HeapHeader, value: Value, original: Value) -> ()
+unsafe effect fn describe(out: &mut ByteBuffer, rt: *mut HeapHeader, value: ValueBits, original: ValueBits) -> ()
   ! OutOfMemoryError | StringLengthError | BigIntError | CoercionError ? &mut Allocator {
   match value {
-    Value.Undefined => { run out.writeU32(0) }
-    Value.Null => { run out.writeU32(1) }
-    Value.Bool { value: boolean } => { run out.writeU32(2) let mut flag: u32 = 0 if boolean { flag = 1 } run out.writeU32(flag) }
-    Value.Int { .. } => { run out.writeU32(3) run out.writeU64(f64.toBits(value.numericValue())) }
-    Value.Float64 { value: number } => {
+    ValueBits.Undefined => { run out.writeU32(0) }
+    ValueBits.Null => { run out.writeU32(1) }
+    ValueBits.Bool { value: boolean } => { run out.writeU32(2) let mut flag: u32 = 0 if boolean { flag = 1 } run out.writeU32(flag) }
+    ValueBits.Int { .. } => { run out.writeU32(3) run out.writeU64(f64.toBits(value.numericValue())) }
+    ValueBits.Float64 { value: number } => {
       run out.writeU32(3) let mut bits = f64.toBits(number) if f64.isNaN(number) { bits = 0x7ff8000000000000 } run out.writeU64(bits)
     }
-    Value.String { .. } => { run out.writeU32(4) run text(&mut out, value) }
-    Value.Symbol { reference: node } => {
+    ValueBits.String { .. } => { run out.writeU32(4) run text(&mut out, value) }
+    ValueBits.Symbol { reference: node } => {
       run out.writeU32(5) let mut same: u32 = 0
-      match original { Value.Symbol { reference: other } => { if Pointer.address(node) == Pointer.address(other) { same = 1 } } _ => () }
+      match original { ValueBits.Symbol { reference: other } => { if Pointer.address(node) == Pointer.address(other) { same = 1 } } _ => () }
       run out.writeU32(same)
     }
-    Value.BigInt { .. } => {
+    ValueBits.BigInt { .. } => {
       run out.writeU32(6) let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
       let textValue = StringOwner.adopt(run unsafe primitive.toString(&state.atoms, value))
       run text(&mut out, textValue.get())
     }
-    Value.ShortBigInt { .. } => {
+    ValueBits.ShortBigInt { .. } => {
       run out.writeU32(6) let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
       let textValue = StringOwner.adopt(run unsafe primitive.toString(&state.atoms, value))
       run text(&mut out, textValue.get())
@@ -286,7 +286,7 @@ unsafe effect fn describe(out: &mut ByteBuffer, rt: *mut HeapHeader, value: Valu
     _ => trap()
   }
 }
-unsafe effect fn convert(hooks: &mut Hooks, context: *mut HeapHeader, object: Value, op: u32) -> Value
+unsafe effect fn convert(hooks: &mut Hooks, context: *mut HeapHeader, object: ValueBits, op: u32) -> ValueBits
   ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
   if op < 3 { return run unsafe coercion.toPrimitive(&mut hooks, context, object, op) }
   if op < 6 { return run unsafe coercion.toPrimitiveFree(&mut hooks, context, unsafe object.retained(), op - 3) }
@@ -309,10 +309,10 @@ unsafe effect fn runCase(out: &mut ByteBuffer, hooks: &mut Hooks, memory: &Alloc
   let before = unsafe rc(value) let objectBefore = unsafe rc(object)
   let outcome = run Effect.result(unsafe convert(&mut hooks, context, object, op))
   match move outcome {
-    Result<Value, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { value: result } => {
+    Result<ValueBits, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { value: result } => {
       run out.writeU32(0) run unsafe describe(&mut out, rt, result, value) unsafe gc.release(&mut hooks, rt, result)
     }
-    Result<Value, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => {
+    Result<ValueBits, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => {
       match move error {
         JsException thrown => {
           let pending = unsafe exceptions.take(rt)
@@ -342,13 +342,13 @@ unsafe effect fn runCase(out: &mut ByteBuffer, hooks: &mut Hooks, memory: &Alloc
 unsafe effect fn finalizerWitness(out: &mut ByteBuffer, hooks: &mut Hooks, memory: &AllocationObserver,
   context: *mut HeapHeader, family: u32) -> () ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
   let rt = unsafe runtime.contextRuntime(context) hooks.clear() hooks.collect = false
-  let object = run unsafe cases.make(&mut hooks, memory, context, family, Value.Null)
+  let object = run unsafe cases.make(&mut hooks, memory, context, family, ValueBits.Null)
   let outcome = run Effect.result(unsafe coercion.toPrimitiveFree(&mut hooks, context, object, 1))
   match move outcome {
-    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Success { value } => {
+    Result<ValueBits, OutOfMemoryError | StringLengthError | JsException>.Success { value } => {
       unsafe gc.release(&mut hooks, rt, value) trap()
     }
-    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => match move error {
+    Result<ValueBits, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => match move error {
       JsException marker => ()
       OutOfMemoryError allocation => { fail move allocation }
       StringLengthError length => { fail move length }

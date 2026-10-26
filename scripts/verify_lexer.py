@@ -223,7 +223,7 @@ import js_tokens { Token, TokenPayload, LexError }
 import js_tokens as tok
 import js_bigint { BigIntError }
 import js_atoms { AtomTable }
-import js_value { Value }
+import js_value { ValueBits }
 import js_strings { Strings }
 import js_string_types { StringOwner, StringLengthError }
 struct Input { data:&'static [u8], at:usize }
@@ -232,7 +232,7 @@ impl Input {
   fn bytes(self:&mut Self,n:usize)->&'static [u8] { let data=Slice.view<u8>(self.data,self.at,n) self.at=self.at+n return data }
 }
 fn flag(value:bool)->u32 { if value { return 1 } return 0 }
-effect fn text(out:&mut ByteBuffer,value:Value)->() ! OutOfMemoryError ? &mut Allocator {
+effect fn text(out:&mut ByteBuffer,value:ValueBits)->() ! OutOfMemoryError ? &mut Allocator {
   run out.writeU32(usize.toU32(Strings.length(value))) let mut i:usize=0
   while i<Strings.length(value) { run out.writeU32(u16.toU32(Strings.codeUnit(value,i))) i=i+1 }
 }

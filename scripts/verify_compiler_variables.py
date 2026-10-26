@@ -370,7 +370,7 @@ import silk.list { List }
 import silk.option { Option }
 import silk.u32
 import js_heap { HeapKind }
-import js_value { Value }
+import js_value { ValueBits }
 import js_core_types { ModuleDef, ModuleStatus, RequestedModule, ExportEntry, ExportBinding, ImportEntry, StarExportEntry, FunctionBytecode, FunctionKind, ByteStorage, ClosureVar, VarDef, FunctionDebugInfo }
 effect fn prepareGlobal(cell:*mut HeapHeader)->i32 ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator { run unsafe variables.addGlobalVariables(cell) return 0 }
 effect fn missingExport(error:CompilerError)->i32 { if error.kind!=CompilerErrorKind.MissingExport { Intrinsic.trap("QuickJS invariant violated") } return -1 }
@@ -378,20 +378,20 @@ effect fn makeModule()->*mut HeapHeader ! OutOfMemoryError ? &mut Allocator {
  return run HeapCell.allocate<ModuleDef>(HeapKind.Module,ModuleDef {
   name:0,previousModule:Pointer.null<HeapHeader>(),nextModule:Pointer.null<HeapHeader>(),
   requestedModules:List<RequestedModule>.make(),exports:List<ExportEntry>.make(),starExports:List<StarExportEntry>.make(),imports:List<ImportEntry>.make(),
-  namespace:Value.Undefined,functionObject:Value.Undefined,initialize:Option<NativeFunctionId>.none(),
+  namespace:ValueBits.Undefined,functionObject:ValueBits.Undefined,initialize:Option<NativeFunctionId>.none(),
   hasTopLevelAwait:false,resolved:false,functionCreated:false,status:ModuleStatus.Unlinked,
   dfsIndex:-1,dfsAncestorIndex:-1,stackPrevious:Pointer.null<HeapHeader>(),
   asyncParentModules:List<*mut HeapHeader>.make(),pendingAsyncDependencies:0,asyncEvaluation:false,
-  asyncEvaluationTimestamp:0,cycleRoot:Pointer.null<HeapHeader>(),promise:Value.Undefined,
-  resolvingFunctions:[Value.Undefined;2],evaluationHasException:false,evaluationException:Value.Undefined,
-  metaObject:Value.Undefined,privateValue:Value.Undefined
+  asyncEvaluationTimestamp:0,cycleRoot:Pointer.null<HeapHeader>(),promise:ValueBits.Undefined,
+  resolvingFunctions:[ValueBits.Undefined;2],evaluationHasException:false,evaluationException:ValueBits.Undefined,
+  metaObject:ValueBits.Undefined,privateValue:ValueBits.Undefined
  })
 }
 fn makeSnapshot(context:*mut HeapHeader)->FunctionBytecode {
  return FunctionBytecode { mode:0,hasPrototype:false,hasSimpleParameterList:false,isDerivedClassConstructor:false,needsHomeObject:false,kind:FunctionKind.Normal,
   newTargetAllowed:false,superCallAllowed:false,superAllowed:false,argumentsAllowed:false,readOnlyBytecode:false,isDirectOrIndirectEval:false,
   code:ByteStorage.Owned { bytes:List<u8>.make() },name:0,varDefs:List<VarDef>.make(),closureVars:List<ClosureVar>.make(),
-  argumentCount:1,variableCount:4,definedArgumentCount:0,stackSize:0,varRefCount:0,realm:context,constants:List<Value>.make(),debug:Option<FunctionDebugInfo>.none()
+  argumentCount:1,variableCount:4,definedArgumentCount:0,stackSize:0,varRefCount:0,realm:context,constants:List<ValueBits>.make(),debug:Option<FunctionDebugInfo>.none()
  }
 }
 fn snapshotVar(name:u32,scoped:bool,next:i32)->VarDef {

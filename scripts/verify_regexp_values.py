@@ -60,7 +60,7 @@ import silk.u16
 import silk.u32
 import silk.usize
 import byte_buffer { ByteBuffer, readU32 }
-import js_value { Value }
+import js_value { ValueBits }
 import js_strings { Strings }
 import js_string_types { StringOwner, StringLengthError }
 import js_regexp_compile { compileString }
@@ -68,16 +68,16 @@ import regexp_types { RegExpSyntaxError, RegExpStackOverflow }
 struct Input { data: &[u8], at: usize }
 impl Input {
  fn word(self:&mut Self)->u32 { let n=readU32(self.data,self.at) self.at=self.at+4 return n }
- effect fn text(self:&mut Self)->Value ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+ effect fn text(self:&mut Self)->ValueBits ! OutOfMemoryError | StringLengthError ? &mut Allocator {
   let n=u32.toUsize(self.word()) let mut units=List<u16>.make() let mut i:usize=0
   while i<n { run units.append(u32.toU16(self.word())) i=i+1 }
   return run Strings.fromUtf16(units.asSlice())
  }
 }
-effect fn diagnostic(error:RegExpSyntaxError)->Value ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+effect fn diagnostic(error:RegExpSyntaxError)->ValueBits ! OutOfMemoryError | StringLengthError ? &mut Allocator {
  return run Strings.fromLatin1(Intrinsic.stringUtf8Bytes(error.message))
 }
-effect fn compile(pattern:Value,flags:Value,status:&mut u32)->Value
+effect fn compile(pattern:ValueBits,flags:ValueBits,status:&mut u32)->ValueBits
  ! OutOfMemoryError | StringLengthError | RegExpSyntaxError | RegExpStackOverflow ? &mut Allocator {
  let result=run compileString(pattern,flags,4096) status.*=1 return result
 }
@@ -92,7 +92,7 @@ effect fn probe()->() ! OutOfMemoryError | StringLengthError | RegExpStackOverfl
    let right=StringOwner.adopt(run Strings.substring(pattern.get(),half,Strings.length(pattern.get())))
    pattern=StringOwner.adopt(run Strings.concat(left.get(),right.get()))
   }
-  let mut flagValue=flags.get() if undefined!=0 { flagValue=Value.Undefined }
+  let mut flagValue=flags.get() if undefined!=0 { flagValue=ValueBits.Undefined }
   let mut status:u32=0
   let result=StringOwner.adopt(run compile(pattern.get(),flagValue,&mut status) |> Effect.catch<RegExpSyntaxError>(diagnostic))
   let mut out=ByteBuffer.make() run out.writeU32(status) run out.writeU32(usize.toU32(Strings.length(result.get())))

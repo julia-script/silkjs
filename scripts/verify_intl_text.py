@@ -107,7 +107,7 @@ import byte_buffer { ByteBuffer }
 import runtime_memory { RuntimeAllocator }
 import js_string_types { StringOwner, StringLengthError }
 import js_strings { Strings }
-import js_value { Value }
+import js_value { ValueBits }
 import intl_collation as col
 import intl_collation { CollationOptions }
 import intl_segmentation as seg

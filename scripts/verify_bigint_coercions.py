@@ -122,7 +122,7 @@ import byte_buffer { ByteBuffer }
 import runtime_memory { RuntimeAllocator, AllocationObserver }
 import js_heap { HeapCell, HeapHeader }
 import js_core_types { RuntimeState }
-import js_value { Value }
+import js_value { ValueBits }
 import js_runtime as runtime
 import js_gc as gc
 import js_strings { Strings }
@@ -140,7 +140,7 @@ import js_coercions_test_support { Hooks }
 import js_integer_coercions_test_support as transitions
 import js_atom_data as atoms
 import js_array_storage_test_support { trap }
-unsafe fn rc(value: Value) -> i32 {
+unsafe fn rc(value: ValueBits) -> i32 {
   match value.heapReference() {
     Option<*mut HeapHeader>.None => { return 0 }
     Option<*mut HeapHeader>.Some { value: node } => {
@@ -164,25 +164,25 @@ fn fromBits(value: u64) -> i64 {
 effect fn wide(out: &mut ByteBuffer, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
   run out.writeU32(u64.toU32(value & 0xffffffff)) run out.writeU32(u64.toU32(u64.shiftRight(value, 32)))
 }
-effect fn text(out: &mut ByteBuffer, value: Value) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn text(out: &mut ByteBuffer, value: ValueBits) -> () ! OutOfMemoryError ? &mut Allocator {
   run out.writeU32(usize.toU32(Strings.length(value))) let mut i: usize = 0
   while i < Strings.length(value) { run out.writeU32(u16.toU32(Strings.codeUnit(value, i))) i = i + 1 }
 }
-unsafe effect fn leaf(rt: *mut HeapHeader, kind: u32) -> Value
+unsafe effect fn leaf(rt: *mut HeapHeader, kind: u32) -> ValueBits
   ! OutOfMemoryError | StringLengthError | BigIntError ? &mut Allocator {
  @SILK_LEAVES@
  return trap()
 }
-unsafe effect fn value(out: &mut ByteBuffer, input: Value) -> () ! OutOfMemoryError ? &mut Allocator {
+unsafe effect fn value(out: &mut ByteBuffer, input: ValueBits) -> () ! OutOfMemoryError ? &mut Allocator {
   run out.writeU32(signed(input.tag()))
   match input {
-    Value.ShortBigInt { value: small } => { run out.writeU32(1) run out.writeU32(signed(small)) }
-    Value.BigInt { reference: node } => {
+    ValueBits.ShortBigInt { value: small } => { run out.writeU32(1) run out.writeU32(signed(small)) }
+    ValueBits.BigInt { reference: node } => {
       let anchor = () let big = unsafe HeapCell.payload<BigInt, ()>(&anchor, node)
       run out.writeU32(usize.toU32(big.length())) let mut i: usize = 0
       while i < big.length() { run out.writeU32(big.limb(i)) i = i + 1 }
     }
-    Value.Float64 { value: number } => {
+    ValueBits.Float64 { value: number } => {
       let mut bits = f64.toBits(number)
       if f64.isNaN(number) { bits = 0x7ff8000000000000 }
       run wide(&mut out, bits)
@@ -190,8 +190,8 @@ unsafe effect fn value(out: &mut ByteBuffer, input: Value) -> () ! OutOfMemoryEr
     _ => ()
   }
 }
-struct Outputs { low: u64, high: u64, signedValue: i64, flag: i32, result: Value }
-unsafe effect fn convert(hooks: &mut Hooks, ctx: *mut HeapHeader, input: Value,
+struct Outputs { low: u64, high: u64, signedValue: i64, flag: i32, result: ValueBits }
+unsafe effect fn convert(hooks: &mut Hooks, ctx: *mut HeapHeader, input: ValueBits,
   op: u32, kind: u32, out: &mut Outputs) -> ()
   ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
   let seeds: [u64; 11] = [0,1,0xffffffffffffffff,2147483647,0xffffffff80000000,2147483648,0xffffffff7fffffff,0x7fffffffffffffff,0x8000000000000000,0x100000000,0x123456789abcdef0]
@@ -219,12 +219,12 @@ unsafe effect fn runCase(out: &mut ByteBuffer, hooks: &mut Hooks, memory: &Alloc
   ctx: *mut HeapHeader, family: u32, kind: u32, op: u32) -> ()
   ! OutOfMemoryError | StringLengthError | JsException | BigIntError ? &mut Allocator {
   let rt = unsafe runtime.contextRuntime(ctx) hooks.clear()
-  let first = run unsafe leaf(rt, kind) let mut second = Value.Int { value: 7 }
+  let first = run unsafe leaf(rt, kind) let mut second = ValueBits.Int { value: 7 }
   if (kind & 1) == 0 { second = unsafe first.retained() }
   let firstRoot = unsafe rc(first) let secondRoot = unsafe rc(second)
   let input = run unsafe transitions.make(&mut hooks, memory, ctx, family, first, second)
   let inputBefore = unsafe rc(input) let firstBefore = unsafe rc(first) let secondBefore = unsafe rc(second)
-  let mut outputs = Outputs { low: 91, high: 92, signedValue: 93, flag: 0, result: Value.Exception }
+  let mut outputs = Outputs { low: 91, high: 92, signedValue: 93, flag: 0, result: ValueBits.Exception }
   let outcome = run Effect.result(unsafe convert(&mut hooks, ctx, input, op, kind, &mut outputs))
   let mut failed: u32 = 0
   match &outcome {
@@ -333,19 +333,19 @@ def leaves():
             f'return run support.heapInteger(b"{text}")')
     for bits in BITS:
         add(f'JSFloat64Union u={{.u64=UINT64_C(0x{bits:016x})}};return __JS_NewFloat64(ctx,u.d);',
-            f'return Value.Float64 {{ value: f64.fromBits(0x{bits:016x}) }}')
-    for c_value, silk_value in [('JS_UNDEFINED', 'Value.Undefined'), ('JS_NULL', 'Value.Null'),
-                               ('JS_FALSE', 'Value.Bool { value: false }'), ('JS_TRUE', 'Value.Bool { value: true }'),
-                               ('JS_NewInt32(ctx,0)', 'Value.Int { value: 0 }'),
-                               ('JS_NewInt32(ctx,INT32_MIN)', 'Value.Int { value: -2147483647 - 1 }'),
-                               ('JS_NewInt32(ctx,INT32_MAX)', 'Value.Int { value: 2147483647 }'),
-                               ('JS_NewBigInt64(ctx,-1)', 'Value.ShortBigInt { value: -1 }'),
-                               ('JS_NewBigInt64(ctx,INT32_MAX)', 'Value.ShortBigInt { value: 2147483647 }')]:
+            f'return ValueBits.Float64 {{ value: f64.fromBits(0x{bits:016x}) }}')
+    for c_value, silk_value in [('JS_UNDEFINED', 'ValueBits.Undefined'), ('JS_NULL', 'ValueBits.Null'),
+                               ('JS_FALSE', 'ValueBits.Bool { value: false }'), ('JS_TRUE', 'ValueBits.Bool { value: true }'),
+                               ('JS_NewInt32(ctx,0)', 'ValueBits.Int { value: 0 }'),
+                               ('JS_NewInt32(ctx,INT32_MIN)', 'ValueBits.Int { value: -2147483647 - 1 }'),
+                               ('JS_NewInt32(ctx,INT32_MAX)', 'ValueBits.Int { value: 2147483647 }'),
+                               ('JS_NewBigInt64(ctx,-1)', 'ValueBits.ShortBigInt { value: -1 }'),
+                               ('JS_NewBigInt64(ctx,INT32_MAX)', 'ValueBits.ShortBigInt { value: 2147483647 }')]:
         add(f'return {c_value};', f'return {silk_value}')
     add('return checked(JS_NewSymbol(ctx,"bigint-symbol",FALSE));',
         'let description = StringOwner.adopt(run Strings.fromLatin1(b"bigint-symbol")) '
         'let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt) '
-        'return run state.atoms.uniqueSymbol(Option<Value>.some(description.get()))')
+        'return run state.atoms.uniqueSymbol(Option<ValueBits>.some(description.get()))')
     for prefix in ('42', '42n'):
         add('char pad[513];memset(pad,32,sizeof(pad));'
             f'return checked(JS_ConcatString(ctx,JS_NewString(ctx,"{prefix}"),JS_NewStringLen(ctx,pad,sizeof(pad))));',

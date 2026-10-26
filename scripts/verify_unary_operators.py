@@ -100,17 +100,17 @@ import silk.list { List }
 import js_heap { HeapKind }
 import js_unary_operators_test_support as unarySupport
 import js_array_storage_test_support { FaultAllocator }
-unsafe effect fn dump(out: &mut ByteBuffer, input: Value) -> () ! OutOfMemoryError ? &mut Allocator {
+unsafe effect fn dump(out: &mut ByteBuffer, input: ValueBits) -> () ! OutOfMemoryError ? &mut Allocator {
   run out.writeU32(signed(input.tag()))
   match input {
-    Value.Int { value: integer } => { run out.writeU32(signed(integer)) }
-    Value.ShortBigInt { value: small } => { run out.writeU32(1) run out.writeU32(signed(small)) }
-    Value.BigInt { reference: node } => {
+    ValueBits.Int { value: integer } => { run out.writeU32(signed(integer)) }
+    ValueBits.ShortBigInt { value: small } => { run out.writeU32(1) run out.writeU32(signed(small)) }
+    ValueBits.BigInt { reference: node } => {
       let anchor = () let big = unsafe HeapCell.payload<BigInt, ()>(&anchor, node)
       run out.writeU32(usize.toU32(big.length())) let mut i: usize = 0
       while i < big.length() { run out.writeU32(big.limb(i)) i = i + 1 }
     }
-    Value.Float64 { value: number } => { run wide(&mut out, f64.toBits(number)) }
+    ValueBits.Float64 { value: number } => { run wide(&mut out, f64.toBits(number)) }
     _ => ()
   }
 }
@@ -118,12 +118,12 @@ unsafe effect fn runCase(out: &mut ByteBuffer, hooks: &mut Hooks, memory: &Alloc
   ctx: *mut HeapHeader, family: u32, kind: u32, op: u32) -> ()
   ! OutOfMemoryError | StringLengthError | JsException | BigIntError ? &mut Allocator {
   let rt = unsafe runtime.contextRuntime(ctx) hooks.clear()
-  let first = run unsafe leaf(rt, kind) let mut second = Value.Int { value: 7 }
+  let first = run unsafe leaf(rt, kind) let mut second = ValueBits.Int { value: 7 }
   if (kind & 1) == 0 { second = unsafe first.retained() }
   let firstRoot = unsafe rc(first) let secondRoot = unsafe rc(second)
   let input = run unsafe transitions.make(&mut hooks, memory, ctx, family, first, second)
   let inputBefore = unsafe rc(input) let firstBefore = unsafe rc(first) let secondBefore = unsafe rc(second)
-  let mut old = unsafe input.retained() let mut next = Value.Undefined
+  let mut old = unsafe input.retained() let mut next = ValueBits.Undefined
   let outcome = run Effect.result(unsafe unarySupport.apply(&mut hooks, ctx, &mut old, &mut next, op))
   let mut failed: u32 = 0
   match &outcome {
@@ -172,7 +172,7 @@ effect fn faultCase(out: &mut ByteBuffer, op: u32) -> ()
   let mut hooks = Hooks.make()
   run unsafe fixture.prepareErrors(&mut hooks, &observer, ctx) |> Effect.provideMut<Allocator>(&mut memory)
   let root = run bigint.newBigUint64(0xffffffffffffffff) |> Effect.provideMut<Allocator>(&mut memory)
-  let mut old = unsafe root.retained() let mut next = Value.Undefined
+  let mut old = unsafe root.retained() let mut next = ValueBits.Undefined
   let mut fault = FaultAllocator { parent: move memory, remaining: 0 }
   let outcome = run Effect.result(unsafe unarySupport.apply(&mut hooks, ctx, &mut old, &mut next, op)) |> Effect.provideMut<Allocator>(&mut fault)
   match move outcome {
@@ -236,9 +236,9 @@ pub effect fn main() -> i32
 def corpus():
     c, silk = leaves()
     c += f'\nif(kind=={BASE_KINDS})return __JS_NewShortBigInt(ctx,INT32_MIN);'
-    silk += f'\nif kind == {BASE_KINDS} {{ return Value.ShortBigInt {{ value: -2147483647 - 1 }} }}'
+    silk += f'\nif kind == {BASE_KINDS} {{ return ValueBits.ShortBigInt {{ value: -2147483647 - 1 }} }}'
     c += f'\nif(kind=={BASE_KINDS + 1}){{JSBigInt*p=js_bigint_new(ctx,32768);if(!p)abort();memset(p->tab,0,32768*sizeof(js_limb_t));p=js_bigint_extend(ctx,p,1);if(!p)abort();return JS_MKPTR(JS_TAG_BIG_INT,p);}}'
-    silk += f'\nif kind == {BASE_KINDS + 1} {{ let mut words = List<u32>.make() let mut i: usize = 0 while i < 32768 {{ run words.append(0) i = i + 1 }} run words.append(1) let big = run BigInt.fromOwnedLimbs(move words) return Value.BigInt {{ reference: run HeapCell.allocate(HeapKind.BigInt, move big) }} }}'
+    silk += f'\nif kind == {BASE_KINDS + 1} {{ let mut words = List<u32>.make() let mut i: usize = 0 while i < 32768 {{ run words.append(0) i = i + 1 }} run words.append(1) let big = run BigInt.fromOwnedLimbs(move words) return ValueBits.BigInt {{ reference: run HeapCell.allocate(HeapKind.BigInt, move big) }} }}'
     return c, silk
 
 

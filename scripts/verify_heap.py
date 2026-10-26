@@ -255,7 +255,7 @@ import silk.u32
 import silk.usize
 import js_atoms { AtomTable }
 import js_heap { HeapCell, HeapHeader, HeapKind }
-import js_value { Value }
+import js_value { ValueBits }
 import js_string_types { StringLengthError }
 import js_gc { HeapHooks, Tracer }
 import js_gc as gc
@@ -306,7 +306,7 @@ effect fn runtimeFixture() -> *mut HeapHeader ! OutOfMemoryError ? &mut Allocato
     gcPhase:GcPhase.None,mallocGcThreshold:0,
     weakReferences:WeakRefList { first:Pointer.null<WeakRefHeader>(),last:Pointer.null<WeakRefHeader>() },
     leakTracking:Option<LeakTrackingState>.none(),stackSize:0,stackTop:0,stackLimit:0,
-    currentException:Value.Null,currentExceptionIsUncatchable:false,inOutOfMemory:false,
+    currentException:ValueBits.Null,currentExceptionIsUncatchable:false,inOutOfMemory:false,
     currentStackFrame:Pointer.null<StackFrame>(),interrupt:noHook(),promiseRejectionTracker:noHook(),jobs:HeapList.make(),
     moduleLoader:ModuleLoaderHooks { normalize:Option<NativeFunctionId>.none(),load:Option<NativeFunctionId>.none(),
       checkSupportedImportAttributes:Option<NativeFunctionId>.none(),loaderHasAttributes:false,opaque:Pointer.null<u8>() },
@@ -320,7 +320,7 @@ effect fn runtimeFixture() -> *mut HeapHeader ! OutOfMemoryError ? &mut Allocato
 // actual weak key and strong entry; an empty swept entry stays linked until its
 // owner finalizes, exactly as required by the collector callback contract.
 struct Fixture {
-  id:u32, kind:u32, edge:Value, typed:?*mut HeapHeader, target:Value,
+  id:u32, kind:u32, edge:ValueBits, typed:?*mut HeapHeader, target:ValueBits,
   weak:WeakRefHeader
 }
 struct Hooks { finalized:u32, count:u32, auxiliary:u32 }
@@ -348,7 +348,7 @@ impl HeapHooks for Hooks {
     callback:NativeFunctionId) -> () {
     descriptor(callback) let anchor=() let data=unsafe HeapCell.payload<ObjectData,()>(&anchor,object)
     check(data.freeMark && data.properties.length()==0) drop data
-    check(!unsafe gc.isLiveObject(Value.Object { reference:object }))
+    check(!unsafe gc.isLiveObject(ValueBits.Object { reference:object }))
     let reference=unsafe fixture(object) let owned=unsafe HeapCell.payload<Fixture,()>(&anchor,reference)
     let id=owned.id drop owned
     if id!=31 { check(id<31 && (self.finalized & u32.shiftLeft(1,id))==0)
@@ -361,7 +361,7 @@ impl HeapHooks for Hooks {
     let reference=unsafe fixture(owner) let data=unsafe HeapCell.payloadMut<Fixture,()>(&mut anchor,reference)
     check(data.kind==4)
     if unsafe gc.isWeakLive(data.target) { return () }
-    let target=data.target let held=data.edge data.target=Value.Undefined data.edge=Value.Undefined drop data
+    let target=data.target let held=data.edge data.target=ValueBits.Undefined data.edge=ValueBits.Undefined drop data
     let before=self.count unsafe gc.releaseWeak(target) unsafe gc.release(&mut self,runtime,held)
     check(self.count==before)
   }
@@ -383,7 +383,7 @@ effect fn object(rt:*mut HeapHeader,id:u32,prototype:?*mut HeapHeader) -> *mut H
   ! OutOfMemoryError ? &mut Allocator {
   let shape=run unsafe Shapes.empty(rt,prototype)
   let reference=run HeapCell.allocate<Fixture>(HeapKind.Auxiliary,Fixture {
-    id:id,kind:0,edge:Value.Undefined,typed:Pointer.null<HeapHeader>(),target:Value.Undefined,
+    id:id,kind:0,edge:ValueBits.Undefined,typed:Pointer.null<HeapHeader>(),target:ValueBits.Undefined,
     weak:WeakRefHeader { previous:Pointer.null<WeakRefHeader>(),next:Pointer.null<WeakRefHeader>(),kind:WeakRefKind.Map,owner:rt }
   })
   let result=run HeapCell.allocate<ObjectData>(HeapKind.Object,ObjectData {
@@ -396,9 +396,9 @@ effect fn object(rt:*mut HeapHeader,id:u32,prototype:?*mut HeapHeader) -> *mut H
 effect fn snapshot(out:&mut ByteBuffer,hooks:&Hooks) -> () ! OutOfMemoryError ? &mut Allocator {
   run out.writeU32(hooks.finalized) run out.writeU32(hooks.count) run out.writeU32(hooks.auxiliary)
 }
-effect fn assign(hooks:&mut Hooks,rt:*mut HeapHeader,parent:*mut HeapHeader,child:Value,slot:u32) -> ()
+effect fn assign(hooks:&mut Hooks,rt:*mut HeapHeader,parent:*mut HeapHeader,child:ValueBits,slot:u32) -> ()
   ! OutOfMemoryError ? &mut Allocator {
-  let mut anchor=() let mut old=Value.Undefined
+  let mut anchor=() let mut old=ValueBits.Undefined
   if slot==0 {
     let data=unsafe HeapCell.payloadMut<ObjectData,()>(&mut anchor,parent)
     let mut index:usize=0 let mut retired=Pointer.null<HeapHeader>()
@@ -423,17 +423,17 @@ effect fn graph(input:&mut Input,out:&mut ByteBuffer,hooks:&mut Hooks,rt:*mut He
   while i<n { run nodes.append(run object(rt,i,Pointer.null<HeapHeader>())) i=i+1 }
   i=0
   while i<n { let mut j:u32=0 while j<2 {
-    let target=input.word() check(target<=n) let mut value=Value.Undefined
-    if target<n { value=Value.Object { reference:nodes.get(u32.toUsize(target)) } }
+    let target=input.word() check(target<=n) let mut value=ValueBits.Undefined
+    if target<n { value=ValueBits.Object { reference:nodes.get(u32.toUsize(target)) } }
     run assign(&mut hooks,rt,nodes.get(u32.toUsize(i)),value,j) j=j+1
   } i=i+1 }
   run unsafe gc.collect(&mut hooks,rt,false) run snapshot(&mut out,&hooks)
   i=0 while i<n { if (roots & u32.shiftLeft(1,i))==0 { unsafe gc.releaseHeader(&mut hooks,rt,nodes.get(u32.toUsize(i))) } i=i+1 }
   run unsafe gc.collect(&mut hooks,rt,false) run snapshot(&mut out,&hooks)
   i=0 while i<n { if (roots & u32.shiftLeft(1,i))!=0 { let mut j:u32=0 while j<2 {
-    let target=input.word() let mut value=Value.Undefined
+    let target=input.word() let mut value=ValueBits.Undefined
     check(target==n || (target<n && (roots & u32.shiftLeft(1,target))!=0))
-    if target<n { value=Value.Object { reference:nodes.get(u32.toUsize(target)) } }
+    if target<n { value=ValueBits.Object { reference:nodes.get(u32.toUsize(target)) } }
     run assign(&mut hooks,rt,nodes.get(u32.toUsize(i)),value,j) j=j+1
   } } i=i+1 }
   run unsafe gc.collect(&mut hooks,rt,false) run snapshot(&mut out,&hooks)
@@ -447,12 +447,12 @@ effect fn contextFixture(rt:*mut HeapHeader) -> *mut HeapHeader ! OutOfMemoryErr
     binaryObjectCount:0,binaryObjectSize:0,arrayShape:Pointer.null<HeapHeader>(),
     argumentsShape:Pointer.null<HeapHeader>(),mappedArgumentsShape:Pointer.null<HeapHeader>(),
     regexpShape:Pointer.null<HeapHeader>(),regexpResultShape:Pointer.null<HeapHeader>(),
-    classPrototypes:List<Value>.make(),functionPrototype:Value.Undefined,functionConstructor:Value.Undefined,
-    arrayConstructor:Value.Undefined,regexpConstructor:Value.Undefined,promiseConstructor:Value.Undefined,
-    nativeErrorPrototypes:[Value.Undefined;9],iteratorConstructor:Value.Undefined,
-    asyncIteratorPrototype:Value.Undefined,arrayPrototypeValues:Value.Undefined,throwTypeError:Value.Undefined,
-    evalObject:Value.Undefined,userValues:[Value.Undefined;7],globalObject:Value.Undefined,
-    globalVarObject:Value.Undefined,randomState:0,interruptCounter:10000,
+    classPrototypes:List<ValueBits>.make(),functionPrototype:ValueBits.Undefined,functionConstructor:ValueBits.Undefined,
+    arrayConstructor:ValueBits.Undefined,regexpConstructor:ValueBits.Undefined,promiseConstructor:ValueBits.Undefined,
+    nativeErrorPrototypes:[ValueBits.Undefined;9],iteratorConstructor:ValueBits.Undefined,
+    asyncIteratorPrototype:ValueBits.Undefined,arrayPrototypeValues:ValueBits.Undefined,throwTypeError:ValueBits.Undefined,
+    evalObject:ValueBits.Undefined,userValues:[ValueBits.Undefined;7],globalObject:ValueBits.Undefined,
+    globalVarObject:ValueBits.Undefined,randomState:0,interruptCounter:10000,
     loadedModules:ModuleList { first:Pointer.null<HeapHeader>(),last:Pointer.null<HeapHeader>() },
     regexpCompilerEnabled:false,evalEnabled:false,
     localeCallbacks:Option<LocaleCallbacks>.none(),userOpaque:Pointer.null<u8>()
@@ -474,13 +474,13 @@ effect fn moduleFixture(rt:*mut HeapHeader,realm:*mut HeapHeader) -> *mut HeapHe
     name:0,previousModule:Pointer.null<HeapHeader>(),nextModule:Pointer.null<HeapHeader>(),
     requestedModules:List<RequestedModule>.make(),exports:List<ExportEntry>.make(),
     starExports:List<StarExportEntry>.make(),imports:List<ImportEntry>.make(),
-    namespace:Value.Undefined,functionObject:Value.Undefined,initialize:Option<NativeFunctionId>.none(),
+    namespace:ValueBits.Undefined,functionObject:ValueBits.Undefined,initialize:Option<NativeFunctionId>.none(),
     hasTopLevelAwait:false,resolved:true,functionCreated:false,status:ModuleStatus.Unlinked,
     dfsIndex:-1,dfsAncestorIndex:-1,stackPrevious:Pointer.null<HeapHeader>(),
     asyncParentModules:List<*mut HeapHeader>.make(),pendingAsyncDependencies:0,asyncEvaluation:false,
-    asyncEvaluationTimestamp:0,cycleRoot:Pointer.null<HeapHeader>(),promise:Value.Undefined,
-    resolvingFunctions:[Value.Undefined;2],evaluationHasException:false,evaluationException:Value.Undefined,
-    metaObject:Value.Undefined,privateValue:Value.Undefined
+    asyncEvaluationTimestamp:0,cycleRoot:Pointer.null<HeapHeader>(),promise:ValueBits.Undefined,
+    resolvingFunctions:[ValueBits.Undefined;2],evaluationHasException:false,evaluationException:ValueBits.Undefined,
+    metaObject:ValueBits.Undefined,privateValue:ValueBits.Undefined
   })
   let mut anchor=() let context=unsafe HeapCell.payloadMut<ContextState,()>(&mut anchor,realm)
   let previous=context.loadedModules.last context.loadedModules.last=module
@@ -493,19 +493,19 @@ effect fn moduleFixture(rt:*mut HeapHeader,realm:*mut HeapHeader) -> *mut HeapHe
   let data=unsafe HeapCell.payloadMut<ModuleDef,()>(&mut anchor,module)
   data.previousModule=previous drop data unsafe gc.publish(rt,module) return module
 }
-effect fn asyncFixture(rt:*mut HeapHeader,local:Value) -> *mut HeapHeader
+effect fn asyncFixture(rt:*mut HeapHeader,local:ValueBits) -> *mut HeapHeader
   ! OutOfMemoryError ? &mut Allocator {
   let arguments=run ValueSlots.make(0) let mut locals=run ValueSlots.make(1)
   drop locals.replace(0,local) let stack=run ValueSlots.make(2)
   let frame=run StableFrame.make(StackFrame {
-    previous:Pointer.null<StackFrame>(),asyncOwner:Pointer.null<HeapHeader>(),currentFunction:Value.Undefined,
+    previous:Pointer.null<StackFrame>(),asyncOwner:Pointer.null<HeapHeader>(),currentFunction:ValueBits.Undefined,
     arguments:FrameSlots.Owned { slots:move arguments },locals:FrameSlots.Owned { slots:move locals },
     stack:FrameSlots.Owned { slots:move stack },varRefs:FrameReferences.Owned { slots:List<?*mut HeapHeader>.make() },
     currentPc:Option<usize>.some(0),argumentCount:0,mode:JS_MODE_ASYNC,stackPointer:Option<usize>.some(0)
   })
   let activation=run HeapCell.allocate<AsyncFrame>(HeapKind.AsyncFunction,AsyncFrame {
-    thisValue:Value.Undefined,argumentCount:0,throwFlag:false,isCompleted:false,
-    resolvingFunctions:[Value.Undefined;2],frame:move frame
+    thisValue:ValueBits.Undefined,argumentCount:0,throwFlag:false,isCompleted:false,
+    resolvingFunctions:[ValueBits.Undefined;2],frame:move frame
   })
   let mut anchor=() let data=unsafe HeapCell.payloadMut<AsyncFrame,()>(&mut anchor,activation)
   let stableFrame=unsafe data.frame.getMut() stableFrame.asyncOwner=activation drop stableFrame drop data
@@ -516,30 +516,30 @@ effect fn typed(input:&mut Input,out:&mut ByteBuffer,hooks:&mut Hooks,rt:*mut He
   ! OutOfMemoryError ? &mut Allocator {
   let kind=input.word() check(kind>=1 && kind<=3)
   let owner=run object(rt,0,Pointer.null<HeapHeader>()) let leaf=run object(rt,1,Pointer.null<HeapHeader>())
-  run assign(&mut hooks,rt,leaf,Value.Object { reference:owner },0)
+  run assign(&mut hooks,rt,leaf,ValueBits.Object { reference:owner },0)
   let mut owned=Pointer.null<HeapHeader>() let mut anchor=()
   if kind==1 {
     let reference=run HeapCell.allocate<VarRef>(HeapKind.VarRef,VarRef {
-      isLexical:false,isConst:false,state:VarRefState.Detached { value:Value.Object { reference:leaf } }
+      isLexical:false,isConst:false,state:VarRefState.Detached { value:ValueBits.Object { reference:leaf } }
     }) unsafe gc.publish(rt,reference) owned=reference
   } else if kind==2 {
-    let activation=run asyncFixture(rt,Value.Object { reference:leaf })
+    let activation=run asyncFixture(rt,ValueBits.Object { reference:leaf })
     let data=unsafe HeapCell.payloadMut<AsyncFrame,()>(&mut anchor,activation)
-    data.thisValue=unsafe Value.Object { reference:leaf }.retained()
-    data.resolvingFunctions[0]=unsafe Value.Object { reference:leaf }.retained() drop data
+    data.thisValue=unsafe ValueBits.Object { reference:leaf }.retained()
+    data.resolvingFunctions[0]=unsafe ValueBits.Object { reference:leaf }.retained() drop data
     owned=activation
   } else {
     let realm=run contextFixture(rt) let module=run moduleFixture(rt,realm)
     let context=unsafe HeapCell.payloadMut<ContextState,()>(&mut anchor,realm)
-    context.globalObject=Value.Object { reference:leaf } drop context
+    context.globalObject=ValueBits.Object { reference:leaf } drop context
     let data=unsafe HeapCell.payloadMut<ModuleDef,()>(&mut anchor,module)
-    data.namespace=unsafe Value.Object { reference:leaf }.retained()
-    data.promise=unsafe Value.Object { reference:leaf }.retained()
-    data.resolvingFunctions[0]=unsafe Value.Object { reference:leaf }.retained()
-    data.resolvingFunctions[1]=unsafe Value.Object { reference:leaf }.retained()
-    data.evaluationException=unsafe Value.Object { reference:leaf }.retained()
-    data.metaObject=unsafe Value.Object { reference:leaf }.retained()
-    data.privateValue=unsafe Value.Object { reference:leaf }.retained() drop data
+    data.namespace=unsafe ValueBits.Object { reference:leaf }.retained()
+    data.promise=unsafe ValueBits.Object { reference:leaf }.retained()
+    data.resolvingFunctions[0]=unsafe ValueBits.Object { reference:leaf }.retained()
+    data.resolvingFunctions[1]=unsafe ValueBits.Object { reference:leaf }.retained()
+    data.evaluationException=unsafe ValueBits.Object { reference:leaf }.retained()
+    data.metaObject=unsafe ValueBits.Object { reference:leaf }.retained()
+    data.privateValue=unsafe ValueBits.Object { reference:leaf }.retained() drop data
     owned=realm
   }
   let reference=unsafe fixture(owner) let data=unsafe HeapCell.payloadMut<Fixture,()>(&mut anchor,reference)
@@ -552,32 +552,32 @@ effect fn weakObject(input:&mut Input,out:&mut ByteBuffer,hooks:&mut Hooks,rt:*m
   ! OutOfMemoryError ? &mut Allocator {
   let cycle=input.word() check(cycle<=1)
   let target=run object(rt,0,Pointer.null<HeapHeader>()) let held=run object(rt,1,Pointer.null<HeapHeader>())
-  if cycle==1 { run assign(&mut hooks,rt,target,Value.Object { reference:target },0) }
+  if cycle==1 { run assign(&mut hooks,rt,target,ValueBits.Object { reference:target },0) }
   let map=run object(rt,31,Pointer.null<HeapHeader>()) let reference=unsafe fixture(map)
   let mut anchor=() let data=unsafe HeapCell.payloadMut<Fixture,()>(&mut anchor,reference)
-  data.kind=4 data.target=unsafe gc.retainWeak(Value.Object { reference:target })
-  data.edge=Value.Object { reference:held } data.weak.owner=map
+  data.kind=4 data.target=unsafe gc.retainWeak(ValueBits.Object { reference:target })
+  data.edge=ValueBits.Object { reference:held } data.weak.owner=map
   let node=Pointer.fromMutRef<WeakRefHeader>(&mut data.weak) drop data unsafe gc.publishWeak(rt,node)
-  let weak=unsafe gc.retainWeak(Value.Object { reference:target })
+  let weak=unsafe gc.retainWeak(ValueBits.Object { reference:target })
   unsafe gc.releaseHeader(&mut hooks,rt,target)
   run snapshot(&mut out,&hooks) run out.writeU32(flag(unsafe gc.isWeakLive(weak)))
   run unsafe gc.collect(&mut hooks,rt,true) run snapshot(&mut out,&hooks) run out.writeU32(flag(unsafe gc.isWeakLive(weak)))
   run unsafe gc.collect(&mut hooks,rt,true) run snapshot(&mut out,&hooks) run out.writeU32(flag(unsafe gc.isWeakLive(weak)))
   let swept=unsafe HeapCell.payload<Fixture,()>(&anchor,reference)
-  check(match swept.edge { Value.Undefined => true _ => false }) drop swept
+  check(match swept.edge { ValueBits.Undefined => true _ => false }) drop swept
   unsafe gc.releaseWeak(weak) unsafe gc.releaseHeader(&mut hooks,rt,map) run snapshot(&mut out,&hooks)
   check(hooks.finalized==3 && hooks.auxiliary==2)
 }
 effect fn weakSymbol(out:&mut ByteBuffer,hooks:&mut Hooks,rt:*mut HeapHeader) -> ()
   ! OutOfMemoryError | StringLengthError ? &mut Allocator {
   let mut anchor=() let state=unsafe HeapCell.payloadMut<RuntimeState,()>(&mut anchor,rt)
-  let symbol=run state.atoms.uniqueSymbol(Option<Value>.none())
+  let symbol=run state.atoms.uniqueSymbol(Option<ValueBits>.none())
   let atom=state.atoms.symbolAtom(symbol) state.atoms.release(atom) drop state
   let weak=unsafe gc.retainWeak(symbol) let second=unsafe gc.retainWeak(symbol)
   run out.writeU32(flag(unsafe gc.isWeakTarget(symbol))) run out.writeU32(flag(unsafe gc.isWeakLive(weak)))
   unsafe gc.release(&mut hooks,rt,symbol) run out.writeU32(flag(unsafe gc.isWeakLive(weak)))
   let replacementState=unsafe HeapCell.payloadMut<RuntimeState,()>(&mut anchor,rt)
-  let replacement=run replacementState.atoms.uniqueSymbol(Option<Value>.none())
+  let replacement=run replacementState.atoms.uniqueSymbol(Option<ValueBits>.none())
   let reused=replacementState.atoms.symbolAtom(replacement) replacementState.atoms.release(reused) drop replacementState
   run out.writeU32(flag(atom==reused)) run out.writeU32(flag(unsafe gc.isWeakLive(second)))
   unsafe gc.releaseWeak(weak) run out.writeU32(flag(unsafe gc.isWeakLive(second)))
@@ -590,7 +590,7 @@ effect fn addInteger(hooks:&mut Hooks,rt:*mut HeapHeader,node:*mut HeapHeader,ke
   ! OutOfMemoryError ? &mut Allocator {
   let mut anchor=() let data=unsafe HeapCell.payloadMut<ObjectData,()>(&mut anchor,node)
   let result=run unsafe Shapes.addProperty(rt,&mut data,key | 0x80000000,flags)
-  data.properties.set(result.index,PropertySlot.Value { value:Value.Int { value:u32.toI32(value) } }) drop data
+  data.properties.set(result.index,PropertySlot.Value { value:ValueBits.Int { value:u32.toI32(value) } }) drop data
   unsafe gc.releaseOptional(&mut hooks,rt,result.retiredShape)
 }
 effect fn shapeState(out:&mut ByteBuffer,node:*mut HeapHeader,n:u32,stride:u32) -> ()
@@ -604,7 +604,7 @@ effect fn shapeState(out:&mut ByteBuffer,node:*mut HeapHeader,n:u32,stride:u32) 
     if property.atom!=0 {
       run out.writeU32(property.atom) run out.writeU32(u8.toU32(property.flags))
       let storedSlot=match data.properties.get(i) { PropertySlot.Value { value:slotValue } => slotValue _ => failInvariant() }
-      let integer=match storedSlot { Value.Int { value:integerValue } => integerValue _ => failInvariant() }
+      let integer=match storedSlot { ValueBits.Int { value:integerValue } => integerValue _ => failInvariant() }
       check(integer>=0) run out.writeU32(i32.toU32(integer))
     } i=i+1
   }

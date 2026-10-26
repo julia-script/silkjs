@@ -147,7 +147,7 @@ import silk.effect { Effect }
 import silk.result { Result }
 import silk.pointer { Pointer }
 import js_core_types { FrameSlots }
-import js_value { Value }
+import js_value { ValueBits }
 import js_bound_functions as bound
 import js_exceptions as exceptions
 import js_strings { Strings }
@@ -185,16 +185,16 @@ pub effect fn main() -> i32 ! OutOfMemoryError | StringLengthError | BigIntError
   let text = run Strings.fromLatin1(b"owned bound argument") |> Effect.provideMut<Allocator>(&mut fault)
   fault.armed = true fault.remaining = position
   let mut bindValues = [function, text]
-  let bindArguments = FrameSlots.Borrowed { data: Pointer.fromMutRef<Value>(&mut bindValues[0]), length: 2 }
+  let bindArguments = FrameSlots.Borrowed { data: Pointer.fromMutRef<ValueBits>(&mut bindValues[0]), length: 2 }
   let result = run Effect.result(unsafe bound.bind(&mut hooks, &observer, ctx, function, &bindArguments)) |> Effect.provideMut<Allocator>(&mut fault)
   fault.armed = false
   match move result {
-   Result<Value, JsException>.Success { value } => {
+   Result<ValueBits, JsException>.Success { value } => {
     if unsafe exceptions.has(rt) { ignored = ignored + 1 }
     if !unsafe fixture.isBound(value) { trap() }
     unsafe gc.release(&mut hooks, rt, value)
    }
-   Result<Value, JsException>.Failure { .. } => { if !unsafe exceptions.has(rt) { trap() } }
+   Result<ValueBits, JsException>.Failure { .. } => { if !unsafe exceptions.has(rt) { trap() } }
   }
   let pending = unsafe exceptions.take(rt) unsafe gc.release(&mut hooks, rt, pending)
   if unsafe rc(reference(function)) != 1 || unsafe rc(stringReference(text)) != 1 { trap() }

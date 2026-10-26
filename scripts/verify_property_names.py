@@ -162,7 +162,7 @@ import byte_buffer { ByteBuffer }
 import runtime_memory { RuntimeAllocator, AllocationObserver }
 import js_heap { HeapCell, HeapHeader, HeapKind }
 import js_core_types { RuntimeState, ObjectData, ObjectPayload, PropertySlot, PropertyEnum, FastArrayData, TypedArrayCache }
-import js_value { Value }
+import js_value { ValueBits }
 import js_strings { Strings }
 import js_string_types { AtomKind, StringLengthError, stringReference }
 import js_gc as gc
@@ -182,19 +182,19 @@ import js_exceptions { JsException }
 import js_exceptions as exceptions
 struct BorrowedView { bytes: List<u8> }
 fn bit(value:bool)->u32 {if value {return 1} return 0}
-effect fn text(out:&mut ByteBuffer,value:Value)->() ! OutOfMemoryError ? &mut Allocator {
+effect fn text(out:&mut ByteBuffer,value:ValueBits)->() ! OutOfMemoryError ? &mut Allocator {
   run out.writeU32(usize.toU32(Strings.length(value))) let mut i:usize=0
   while i<Strings.length(value) {run out.writeU32(u16.toU32(Strings.codeUnit(value,i))) i=i+1}
 }
 // Convert failures to an owned result without catching allocation failures.
 union Outcome { Keys { keys:List<PropertyEnum> }, Own { error:OwnKeysError }, Thrown }
-unsafe effect fn enumerate(hooks:&mut Hooks,ctx:*mut HeapHeader,o:Value,flags:u32)->Outcome
+unsafe effect fn enumerate(hooks:&mut Hooks,ctx:*mut HeapHeader,o:ValueBits,flags:u32)->Outcome
   ! OutOfMemoryError | StringLengthError | OwnKeysError | JsException ? &mut Allocator {
   return Outcome.Keys {keys:run unsafe names.getOwnPropertyNames(&mut hooks,ctx,o,flags)}
 }
 effect fn ownFailure(error:OwnKeysError)->Outcome {return Outcome.Own {error:move error}}
 effect fn callbackFailure(error:JsException)->Outcome {drop error return Outcome.Thrown}
-unsafe effect fn result(out:&mut ByteBuffer,hooks:&mut Hooks,ctx:*mut HeapHeader,o:Value,flags:u32)->()
+unsafe effect fn result(out:&mut ByteBuffer,hooks:&mut Hooks,ctx:*mut HeapHeader,o:ValueBits,flags:u32)->()
   ! OutOfMemoryError | StringLengthError ? &mut Allocator {
   let rt=unsafe runtime.contextRuntime(ctx)
   let outcome=run Effect.catch<JsException>(Effect.catch<OwnKeysError>(unsafe enumerate(&mut hooks,ctx,o,flags),ownFailure),callbackFailure)
@@ -216,7 +216,7 @@ unsafe effect fn result(out:&mut ByteBuffer,hooks:&mut Hooks,ctx:*mut HeapHeader
     }}
     Outcome.Thrown=>{
       run out.writeU32(3) let value=unsafe exceptions.take(rt)
-      let number=match value {Value.Int {value:n}=>i32.toU32(n) _=>trap()} run out.writeU32(number)
+      let number=match value {ValueBits.Int {value:n}=>i32.toU32(n) _=>trap()} run out.writeU32(number)
       unsafe gc.release(&mut hooks,rt,value)
     }
   }
@@ -228,28 +228,28 @@ unsafe effect fn runCase(out:&mut ByteBuffer,hooks:&mut Hooks,memory:&Allocation
   let rt=unsafe runtime.contextRuntime(ctx) hooks.eventCount=0 hooks.failKeys=failure==1 hooks.failDescriptor=0
   if failure==2 {hooks.failDescriptor=4} else if failure==3 {hooks.failDescriptor=6}
   let value=run Strings.fromLatin1(b"descriptor-value")
-  let leaf=run unsafe objects.withPrototype(&mut hooks,memory,ctx,Value.Null)
-  let mut object=Value.Null let mut view=Pointer.null<HeapHeader>()
-  if family==0 || family==9 || family==10 {object=run unsafe objects.withPrototype(&mut hooks,memory,ctx,Value.Null)}
+  let leaf=run unsafe objects.withPrototype(&mut hooks,memory,ctx,ValueBits.Null)
+  let mut object=ValueBits.Null let mut view=Pointer.null<HeapHeader>()
+  if family==0 || family==9 || family==10 {object=run unsafe objects.withPrototype(&mut hooks,memory,ctx,ValueBits.Null)}
   else if family==1 {object=run unsafe fixture.exotic(&mut hooks,memory,ctx)}
   else if family==2 {object=run unsafe arrays.allocateFastArray(&mut hooks,memory,ctx,3)}
   else if family==3 || family==4 {
     let mut cls=classes.JS_CLASS_ARGUMENTS if family==4 {cls=classes.JS_CLASS_MAPPED_ARGUMENTS}
-    object=run unsafe objects.withPrototypeClass(&mut hooks,memory,ctx,Value.Null,cls)
+    object=run unsafe objects.withPrototypeClass(&mut hooks,memory,ctx,ValueBits.Null,cls)
     if family==4 {
       let mut i:usize=0 while i<3 {let cell=run unsafe varRefs.createDetached(rt,true) run unsafe storage.appendMapped(object,cell) i=i+1}
     } else {
       let mut anchor=() let p=unsafe HeapCell.payloadMut<ObjectData,()>(&mut anchor,reference(object))
-      match &mut p.payload {ObjectPayload.FastArray {array}=>{let mut i:usize=0 while i<3 {run array.values.append(Value.Undefined) i=i+1}} _=>trap()}
+      match &mut p.payload {ObjectPayload.FastArray {array}=>{let mut i:usize=0 while i<3 {run array.values.append(ValueBits.Undefined) i=i+1}} _=>trap()}
     }
   } else if family==5 || family==8 {
-    object=run unsafe objects.withPrototypeClass(&mut hooks,memory,ctx,Value.Null,classes.JS_CLASS_STRING)
+    object=run unsafe objects.withPrototypeClass(&mut hooks,memory,ctx,ValueBits.Null,classes.JS_CLASS_STRING)
     if family==5 {
       let string=run Strings.fromUtf16(&[65,0xd83d,0xde00]) let mut anchor=()
       let p=unsafe HeapCell.payloadMut<ObjectData,()>(&mut anchor,reference(object)) p.payload=ObjectPayload.Boxed {value:string}
     }
   } else if family==6 || family==7 {
-    object=run unsafe objects.withPrototypeClass(&mut hooks,memory,ctx,Value.Null,classes.JS_CLASS_UINT8_ARRAY)
+    object=run unsafe objects.withPrototypeClass(&mut hooks,memory,ctx,ValueBits.Null,classes.JS_CLASS_UINT8_ARRAY)
     let mut bytes=List<u8>.make() run bytes.append(1) run bytes.append(2) run bytes.append(3)
     let allocated=run HeapCell.allocate(HeapKind.Auxiliary,BorrowedView {bytes:move bytes}) view=allocated
     let mut anchor=() let backing=unsafe HeapCell.payloadMut<BorrowedView,()>(&mut anchor,allocated)
@@ -263,13 +263,13 @@ unsafe effect fn runCase(out:&mut ByteBuffer,hooks:&mut Hooks,memory:&Allocation
     let kinds:[u32;12]=[0,0,1,0,0,2,0,0,0,3,0,0] let mut i:usize=0
     while i<12 {
       let atom=run unsafe fixture.atom(rt,texts[i],kinds[i]) let mut attrs:u8=7 if i==4 {attrs=3}
-      run unsafe fixture.add(&mut hooks,rt,object,atom,attrs,PropertySlot.Value {value:Value.Undefined})
+      run unsafe fixture.add(&mut hooks,rt,object,atom,attrs,PropertySlot.Value {value:ValueBits.Undefined})
       if i==8 {run unsafe fixture.remove(&mut hooks,rt,object,atom)} unsafe fixture.releaseAtom(rt,atom) i=i+1
     }
   } else if family==1 {
     let ordinary=run unsafe fixture.atom(rt,b"ordinary",0)
-    run unsafe fixture.add(&mut hooks,rt,object,ordinary,3,PropertySlot.Value {value:Value.Undefined}) unsafe fixture.releaseAtom(rt,ordinary)
-    run unsafe fixture.add(&mut hooks,rt,object,0x8000000f,7,PropertySlot.Value {value:Value.Undefined})
+    run unsafe fixture.add(&mut hooks,rt,object,ordinary,3,PropertySlot.Value {value:ValueBits.Undefined}) unsafe fixture.releaseAtom(rt,ordinary)
+    run unsafe fixture.add(&mut hooks,rt,object,0x8000000f,7,PropertySlot.Value {value:ValueBits.Undefined})
     let texts:[&[u8];8]=[b"9",b"alpha",b"symbol",b"hidden",b"absent",b"secret",b"global",b"ordinary"]
     let kinds:[u32;8]=[0,0,1,0,0,2,3,0] let mut i:usize=0
     while i<8 {
