@@ -2,6 +2,8 @@
 """Correctness gate for SilkJS changes.
 
 Runs, in order:
+  0. a type check of every entry point and fixture outside the package exports (silk check
+     on a temporary manifest that also exports them), so signature changes cannot strand them
   1. the native regression suite: silk test src/tests.silk
   2. QuickJS's own tests/*.js (vendored in tests/upstream/ from the pinned upstream
      revision) under the release qjs binary
@@ -15,6 +17,7 @@ Runs, in order:
 test_bjson.js is not vendored: it needs upstream's bjson.so C plugin.
 """
 import argparse
+import re
 import subprocess
 import sys
 import time
@@ -41,13 +44,42 @@ def step(name, command, cwd=ROOT):
     return result.returncode == 0
 
 
+def entry_modules():
+    """Modules with a `main` that silk check does not otherwise reach. Fixtures importing a
+    generated module that is not present (it comes from a generator script) are left out."""
+    present = {path.stem for path in (ROOT / 'src').glob('*.silk')}
+    modules = []
+    for path in sorted((ROOT / 'src').glob('*.silk')):
+        text = path.read_text()
+        if not re.search(r'(?m)^(pub )?(effect )?fn main\(', text):
+            continue
+        imported = re.findall(r'(?m)^import (\w+)', text)
+        if all(name in present or name == 'silk' for name in imported):
+            modules.append(path.stem)
+    return modules
+
+
+def check_entries():
+    manifest = (ROOT / 'silk.toml').read_text()
+    anchor = '  "js_libc_bjson_plugin",'
+    if anchor not in manifest:
+        raise SystemExit('check.py: silk.toml exports changed; update check_entries')
+    extra = ''.join(f', "{name}"' for name in ['tests', 'test262_runner', *entry_modules()])
+    temporary = ROOT / '.entries-check.toml'
+    temporary.write_text(manifest.replace(anchor, anchor[:-1] + extra + ',', 1))
+    try:
+        return step('entry points type-check', ['silk', 'check', '--manifest-path', str(temporary)])
+    finally:
+        temporary.unlink()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--binary', type=Path, default=BINARY)
     parser.add_argument('--skip-native', action='store_true', help='skip silk test src/tests.silk')
     parser.add_argument('--skip-bench', action='store_true', help='skip the benchmark output check')
     args = parser.parse_args()
-    ok = True
+    ok = check_entries()
     if not args.skip_native:
         ok &= step('native regression suite', ['silk', 'test', 'src/tests.silk', '-o', 'build/core-tests',
                                                '--optimization', 'speed', '--debug', 'false'])
