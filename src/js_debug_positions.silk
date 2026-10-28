@@ -8,6 +8,7 @@ import silk.slice { Slice }
 import silk.u8
 import silk.u32
 import silk.u64
+import silk.usize
 import silk.i32
 import silk.i64
 import byte_buffer { ByteBuffer }
@@ -30,28 +31,47 @@ impl Copy for PcSourcePosition {}
 // Deliberately matches upstream byte counting, including cursors inside UTF8:
 // only LF starts a new line, CR/U+2028/U+2029 count as columns, continuation
 // bytes do not count, and each leading byte counts one (not two UTF16 units).
-pub struct SourcePositionCache { cursor: usize, line: i32, column: i32 }
+//
+// Besides the last located offset, the cache keeps the furthest offset it has reached (the mark).
+// A function's positions jump back to its start after its nested functions moved the cursor past
+// it, and then forward again; resuming from the mark makes the forward jump cost the distance past
+// the mark instead of a rescan. A jump back to near the start of the source scans from the start.
+pub struct SourcePositionCache {
+  cursor: usize, line: i32, column: i32,
+  markCursor: usize, markLine: i32, markColumn: i32
+}
 impl SourcePositionCache {
-  pub fn make() -> SourcePositionCache { return SourcePositionCache { cursor: 0, line: 0, column: 0 } }
+  pub fn make() -> SourcePositionCache {
+    return SourcePositionCache { cursor: 0, line: 0, column: 0, markCursor: 0, markLine: 0, markColumn: 0 }
+  }
   pub fn locate(self: &mut Self, source: &[u8], offset: usize) -> SourceLocation {
     if offset >= self.cursor {
       // Checking the end once lets the scan read without per-byte index checks.
       if offset > source.length { Intrinsic.trap("SourcePositionCache.locate: offset past source") }
-      let moved = unsafe scan(Pointer.fromSlice<u8>(source), self.cursor, offset, self.line, self.column)
+      if offset >= self.markCursor && self.markCursor > self.cursor {
+        self.cursor = self.markCursor
+        self.line = self.markLine
+        self.column = self.markColumn
+      }
+      let moved = unsafe scan(Pointer.fromSlice<u8>(source), source.length, self.cursor, offset, self.line, self.column)
       self.line = moved.line
       self.column = moved.column
     } else {
-      let between = unsafe scan(Pointer.fromSlice<u8>(source), offset, self.cursor, 0, 0)
-      if between.line == 0 { self.column = self.column - between.column }
-      else {
-        self.line = self.line - between.line
-        self.column = 0
-        let mut i = offset
-        while i > 0 {
-          i = i - 1
-          let c = source[i]
-          if c == 10 { break }
-          if c < 128 || c >= 192 { self.column = self.column + 1 }
+      if self.cursor > self.markCursor {
+        self.markCursor = self.cursor
+        self.markLine = self.line
+        self.markColumn = self.column
+      }
+      if offset <= self.cursor - offset {
+        let start = unsafe scan(Pointer.fromSlice<u8>(source), source.length, 0, offset, 0, 0)
+        self.line = start.line
+        self.column = start.column
+      } else {
+        let between = unsafe scan(Pointer.fromSlice<u8>(source), source.length, offset, self.cursor, 0, 0)
+        if between.line == 0 { self.column = self.column - between.column }
+        else {
+          self.line = self.line - between.line
+          self.column = unsafe columnBefore(Pointer.fromSlice<u8>(source), offset)
         }
       }
     }
@@ -62,44 +82,89 @@ impl SourcePositionCache {
 
 const ONES: u64 = 0x0101010101010101
 const HIGH: u64 = 0x8080808080808080
+const LOW: u64 = 0x7f7f7f7f7f7f7f7f
 const NEWLINES: u64 = 0x0a0a0a0a0a0a0a0a
 unsafe fn wordAt(bytes: ?[*]const u8, index: usize) -> u64 {
   let base = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(bytes)
   let at = unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u64>(unsafe Pointer.at<u8>(base, index))
   return unsafe Pointer.readUnaligned<u64>(at)
 }
-// Advances line/column over bytes [from, to), which must be within the source.
-// Byte order does not matter. Words without LF only add their non-continuation bytes to the column; a word
-// holding an LF falls back to the byte loop.
-unsafe fn scan(bytes: ?[*]const u8, from: usize, to: usize, startLine: i32, startColumn: i32) -> SourceLocation {
+// The high bit of each byte of `word` that is LF.
+fn newlinesIn(word: u64) -> u64 with Intrinsic.inlineAlways() {
+  let other = u64.bitXor(word, NEWLINES)
+  return u64.bitAnd(u64.bitNot(u64.bitOr(u64.wrappingAdd(u64.bitAnd(other, LOW), LOW), other)), HIGH)
+}
+// The high bit of each byte of `word` that counts as a column: every byte except UTF8
+// continuation bytes, which have bit 7 set and bit 6 clear.
+fn leadsIn(word: u64) -> u64 with Intrinsic.inlineAlways() {
+  return u64.bitAnd(u64.bitNot(u64.bitAnd(word, u64.bitNot(u64.shiftLeft(word, 1)))), HIGH)
+}
+// The number of bytes marked in `marks`, which holds only high bits.
+fn marked(marks: u64) -> i32 with Intrinsic.inlineAlways() {
+  return u64.toI32(u64.shiftRight(u64.wrappingMultiply(u64.shiftRight(marks, 7), ONES), 56))
+}
+// The high bits of every byte at or below the highest byte marked in `newlines`.
+fn throughLast(newlines: u64) -> u64 with Intrinsic.inlineAlways() {
+  let mut smeared = u64.bitOr(newlines, u64.shiftRight(newlines, 8))
+  smeared = u64.bitOr(smeared, u64.shiftRight(smeared, 16))
+  return u64.bitOr(smeared, u64.shiftRight(smeared, 32))
+}
+// Advances line/column over bytes [from, to), which must be within the source of `length` bytes.
+// Each step reads one word: an LF adds its count to the line, and the column restarts with the
+// bytes after the last LF. A word that reaches past `to` masks those bytes off; only the last
+// few bytes of the source, where a whole word would read past the end, go byte by byte.
+unsafe fn scan(bytes: ?[*]const u8, length: usize, from: usize, to: usize, startLine: i32, startColumn: i32) -> SourceLocation {
   let mut line = startLine
   let mut column = startColumn
   let mut i = from
   while i < to {
-    let mut stop = i + 1
-    if to - i >= 8 {
-      let word = unsafe wordAt(bytes, i)
-      let newline = u64.bitXor(word, NEWLINES)
-      if u64.bitAnd(u64.bitAnd(u64.wrappingSubtract(newline, ONES), u64.bitNot(newline)), HIGH) == 0 {
-        // A continuation byte has bit 7 set and bit 6 clear.
-        let continuation = u64.bitAnd(u64.bitAnd(word, u64.bitNot(u64.shiftLeft(word, 1))), HIGH)
-        let count = u64.shiftRight(u64.wrappingMultiply(u64.shiftRight(continuation, 7), ONES), 56)
-        column = i32.wrappingAdd(column, 8 - u64.toI32(count))
-        i = i + 8
-        continue
+    let remaining = to - i
+    if remaining < 8 && length - i < 8 {
+      while i < to {
+        let c = unsafe byteAt(bytes, i)
+        if c == 10 {
+          line = line + 1
+          column = 0
+        } else if c < 128 || c >= 192 { column = i32.wrappingAdd(column, 1) }
+        i = i + 1
       }
-      stop = i + 8
+      break
     }
-    while i < stop {
-      let c = unsafe byteAt(bytes, i)
-      if c == 10 {
-        line = line + 1
-        column = 0
-      } else if c < 128 || c >= 192 { column = i32.wrappingAdd(column, 1) }
-      i = i + 1
+    let word = unsafe wordAt(bytes, i)
+    let mut valid = HIGH
+    if remaining < 8 { valid = u64.bitAnd(HIGH, u64.wrappingSubtract(u64.shiftLeft(1, usize.toU64(remaining * 8)), 1)) }
+    let newlines = u64.bitAnd(newlinesIn(word), valid)
+    let leads = u64.bitAnd(leadsIn(word), valid)
+    if newlines == 0 {
+      column = i32.wrappingAdd(column, marked(leads))
+    } else {
+      line = line + marked(newlines)
+      column = marked(u64.bitAnd(leads, u64.bitNot(throughLast(newlines))))
     }
+    i = i + 8
   }
   return SourceLocation { line: line, column: column }
+}
+// The column of `offset`: the bytes that count as columns between the LF before it (or the start
+// of the source) and `offset`, read a word at a time from `offset` down.
+unsafe fn columnBefore(bytes: ?[*]const u8, offset: usize) -> i32 {
+  let mut column: i32 = 0
+  let mut i = offset
+  while i >= 8 {
+    let word = unsafe wordAt(bytes, i - 8)
+    let newlines = newlinesIn(word)
+    let leads = leadsIn(word)
+    if newlines != 0 { return column + marked(u64.bitAnd(leads, u64.bitNot(throughLast(newlines)))) }
+    column = column + marked(leads)
+    i = i - 8
+  }
+  while i > 0 {
+    i = i - 1
+    let c = unsafe byteAt(bytes, i)
+    if c == 10 { break }
+    if c < 128 || c >= 192 { column = column + 1 }
+  }
+  return column
 }
 
 // Mirrors add_pc2line_info's bounded collector. A zero capacity disables it;
@@ -209,10 +274,15 @@ fn putLeb128(buffer: &mut [u8; 16], at: usize, value: u32) -> usize with Intrins
 pub effect fn encodePc2Line(source: &[u8], functionSourcePosition: u32, positions: &[PcSourcePosition],
   cache: &mut SourcePositionCache) -> ByteBuffer ! OutOfMemoryError ? &mut Allocator {
   let mut out = ByteBuffer.make()
+  // Most entries take one or two bytes; a short reservation up front keeps the appends below on
+  // their inlined fast path.
+  run out.reserve(positions.length * 2 + 10)
   let mut last = cache.locate(source, u32.toUsize(functionSourcePosition))
   let mut lastPc: u32 = 0
-  run writeLeb128(&mut out, i32.toU32(last.line))
-  run writeLeb128(&mut out, i32.toU32(last.column))
+  let mut header: [u8; 16] = [0; 16]
+  let mut written = putLeb128(&mut header, 0, i32.toU32(last.line))
+  written = putLeb128(&mut header, written, i32.toU32(last.column))
+  run appendBytes(&mut out, Slice.view(&header, 0, written))
   let mut index: usize = 0
   while index < positions.length {
     let entry = positions[index]
@@ -236,11 +306,17 @@ pub effect fn encodePc2Line(source: &[u8], functionSourcePosition: u32, position
       used = putLeb128(&mut scratch, used, zigzag(diffLine))
     }
     used = putLeb128(&mut scratch, used, zigzag(diffColumn))
-    run out.appendSlice(Slice.view(&scratch, 0, used))
+    run appendBytes(&mut out, Slice.view(&scratch, 0, used))
     lastPc = entry.pc
     last = current
   }
   return move out
+}
+
+// Appends within the reserved storage when it fits, growing only when it does not.
+effect fn appendBytes(out: &mut ByteBuffer, bytes: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator
+with Intrinsic.inlineAlways() {
+  if !out.appendSliceWithin(bytes) { run out.appendSlice(bytes) }
 }
 
 fn signedBits(value: u32) -> i32 {
