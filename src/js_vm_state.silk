@@ -1,8 +1,8 @@
 //! Allocation-free interpreter activation over the stable frame's native slots.
 //! Only verified, little-endian compiler/reader bytecode may enter the
 //! interpreter. Code, constants, closure references and original arguments remain
-//! live and address-stable throughout dispatch. Slots below sp own their values;
-//! slots above sp may be uninitialized or contain stale, non-owning bits.
+//! live and address-stable throughout dispatch. Slots below top own their values;
+//! slots at and above top may be uninitialized or contain stale, non-owning bits.
 import silk.ownership { Copy }
 import silk.pointer { Pointer }
 import silk.option { Option }
@@ -12,6 +12,8 @@ import silk.u16
 import silk.u32
 import silk.i32
 import silk.usize
+import silk.i64
+import silk.layout { Layout }
 import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
 import js_core_types { FrameSlots, StackFrame, ObjectData, ObjectPayload }
@@ -33,18 +35,43 @@ pub struct Machine {
   pub thisValue: ValueBits,
   pub newTarget: ValueBits,
   pub argumentCount: usize,
-  pub pc: usize,
-  pub sp: usize,
+  /// The next bytecode byte and the first free stack slot, as raw pointers so
+  /// dispatch needs neither base in a register; pc() and sp() give indexes.
+  pub ip: *const u8,
+  pub stackTop: *mut ValueBits,
 }
 /// Raw pointers and bits only: execute keeps a register copy (see js_vm.sync).
 impl Copy for Machine {}
 
+/// Pointer arithmetic by a possibly negative element count: element offsets
+/// are plain wrapping multiplies, so a wrapped usize steps backwards.
+unsafe fn codeAt(pointer: *const u8, offset: usize) -> *const u8 {
+  return unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(pointer), offset)
+}
+unsafe fn cellAt(pointer: *mut ValueBits, offset: usize) -> *mut ValueBits {
+  return unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(pointer), offset)
+}
 impl Machine {
+  /// The byte offset of ip in the code.
+  pub fn pc(self: &Self) -> usize {
+    return usize.wrappingSubtract(Pointer.address<u8>(self.ip), Pointer.address<u8>(self.code))
+  }
+  pub unsafe fn setPc(self: &mut Self, pc: usize) -> () { self.ip = unsafe codeAt(self.code, pc) }
+  /// The slot index of top in the operand stack.
+  pub fn sp(self: &Self) -> usize {
+    return usize.wrappingSubtract(Pointer.address<ValueBits>(self.stackTop), Pointer.address<ValueBits>(self.stack)) / Layout.of<ValueBits>().bytes
+  }
+  pub unsafe fn setSp(self: &mut Self, sp: usize) -> () { self.stackTop = unsafe cellAt(self.stack, sp) }
+  /// Gives up the top count slots without reading them.
+  pub unsafe fn discard(self: &mut Self, count: usize) -> () { self.stackTop = unsafe cellAt(self.stackTop, usize.wrappingSubtract(0, count)) }
+  /// Claims count slots a callee already initialized above top.
+  pub unsafe fn advance(self: &mut Self, count: usize) -> () { self.stackTop = unsafe cellAt(self.stackTop, count) }
+  /// The cell depth slots below top; depth 1 is the top value.
+  pub unsafe fn topCell(self: &Self, depth: usize) -> *mut ValueBits { return unsafe cellAt(self.stackTop, usize.wrappingSubtract(0, depth)) }
   pub unsafe fn readU8(self: &mut Self) -> u8 {
-    let value = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(self.code), self.pc))
-    // pc and sp index verified bytecode and its declared stack, so they cannot
-    // wrap; the hot accessors skip the overflow checks.
-    self.pc = usize.wrappingAdd(self.pc, 1)
+    let value = unsafe Pointer.read<u8>(self.ip)
+    // ip and top stay inside verified bytecode and its declared stack.
+    self.ip = unsafe codeAt(self.ip, 1)
     return value
   }
   pub unsafe fn readU16(self: &mut Self) -> u16 {
@@ -54,20 +81,18 @@ impl Machine {
   }
   /// The bytecode byte offset bytes past pc, without consuming it.
   pub unsafe fn peekU8(self: &Self, offset: usize) -> u8 {
-    return unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(self.code), self.pc + offset))
+    return unsafe Pointer.read<u8>(unsafe codeAt(self.ip, offset))
   }
   /// Reads the u16 operand at pc without consuming it.
   pub unsafe fn peekU16(self: &Self) -> u16 {
-    let bytes = unsafe Pointer.assumeMany<u8>(self.code)
-    let a = u8.toU16(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(bytes, self.pc)))
-    let b = u8.toU16(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(bytes, usize.wrappingAdd(self.pc, 1))))
+    let a = u8.toU16(unsafe Pointer.read<u8>(self.ip))
+    let b = u8.toU16(unsafe Pointer.read<u8>(unsafe codeAt(self.ip, 1)))
     return a | u16.shiftLeft(b, 8)
   }
   /// Reads the u16 at pc + offset without consuming it.
   pub unsafe fn peekU16At(self: &Self, offset: usize) -> u16 {
-    let bytes = unsafe Pointer.assumeMany<u8>(self.code)
-    let a = u8.toU16(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(bytes, usize.wrappingAdd(self.pc, offset))))
-    let b = u8.toU16(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(bytes, usize.wrappingAdd(self.pc, offset + 1))))
+    let a = u8.toU16(unsafe Pointer.read<u8>(unsafe codeAt(self.ip, offset)))
+    let b = u8.toU16(unsafe Pointer.read<u8>(unsafe codeAt(self.ip, offset + 1)))
     return a | u16.shiftLeft(b, 8)
   }
   pub unsafe fn readU32(self: &mut Self) -> u32 {
@@ -92,37 +117,37 @@ impl Machine {
   }
   /// Relative operands are based at their first byte, not the next instruction.
   pub fn target(self: &Self, displacement: i32, width: usize) -> usize {
-    let origin = self.pc - width
+    let origin = self.pc() - width
     if displacement >= 0 { return origin + i32.toUsize(displacement) }
     return origin - (i32.toUsize(-(displacement + 1)) + 1)
   }
   /// Steps over operands already read with peekU16/peekU16At.
-  pub fn skip(self: &mut Self, count: usize) -> () {
-    self.pc = usize.wrappingAdd(self.pc, count)
+  pub unsafe fn skip(self: &mut Self, count: usize) -> () {
+    self.ip = unsafe codeAt(self.ip, count)
   }
-  pub fn jump(self: &mut Self, displacement: i32, width: usize) -> () {
-    self.pc = self.target(displacement, width)
+  pub unsafe fn jump(self: &mut Self, displacement: i32, width: usize) -> () {
+    self.ip = unsafe codeAt(self.ip, usize.wrappingSubtract(i64.wrappingToUsize(i32.toI64(displacement)), width))
   }
   /// Must precede calls that can expose this frame through a nested invocation.
   pub unsafe fn publishPc(self: &Self) -> () {
     let mut anchor = ()
     let frame = unsafe Pointer.borrowMut<(), StackFrame>(&mut anchor, self.frame)
-    frame.currentPc = Option<usize>.some(self.pc)
+    frame.currentPc = Option<usize>.some(self.pc())
   }
   pub unsafe fn slot(self: &Self, index: usize) -> *mut ValueBits {
     return unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(self.stack), index)
   }
   /// Transfers an owned value into previously inactive storage. No old read.
   pub unsafe fn push(self: &mut Self, value: ValueBits) -> () {
-    unsafe Pointer.write<ValueBits>(unsafe self.slot(self.sp), value)
-    self.sp = usize.wrappingAdd(self.sp, 1)
+    unsafe Pointer.write<ValueBits>(self.stackTop, value)
+    self.stackTop = unsafe cellAt(self.stackTop, 1)
   }
   /// Pushes a retained copy of an initialized cell (a local, argument or operand).
   pub unsafe fn pushCopy(self: &mut Self, from: *mut ValueBits) -> () {
     let value = unsafe Pointer.read<ValueBits>(from)
     drop unsafe value.retained()
-    unsafe copyCell(from, unsafe self.slot(self.sp))
-    self.sp = usize.wrappingAdd(self.sp, 1)
+    unsafe copyCell(from, self.stackTop)
+    self.stackTop = unsafe cellAt(self.stackTop, 1)
   }
   pub unsafe fn argumentCell(self: &Self, index: usize) -> *mut ValueBits {
     return unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(self.arguments), index)
@@ -132,16 +157,16 @@ impl Machine {
   }
   /// Transfers the top owner out; intentionally does not clear inactive storage.
   pub unsafe fn pop(self: &mut Self) -> ValueBits {
-    self.sp = usize.wrappingSubtract(self.sp, 1)
-    return unsafe Pointer.read<ValueBits>(unsafe self.slot(self.sp))
+    self.stackTop = unsafe cellAt(self.stackTop, usize.wrappingSubtract(0, 1))
+    return unsafe Pointer.read<ValueBits>(self.stackTop)
   }
   /// depth 1 is the top. The result borrows that slot's JavaScript ownership.
   pub unsafe fn top(self: &Self, depth: usize) -> ValueBits {
-    return unsafe Pointer.read<ValueBits>(unsafe self.slot(usize.wrappingSubtract(self.sp, depth)))
+    return unsafe Pointer.read<ValueBits>(unsafe cellAt(self.stackTop, usize.wrappingSubtract(0, depth)))
   }
   /// Transfers ownership; caller must handle any owner previously in this slot.
   pub unsafe fn set(self: &Self, depth: usize, value: ValueBits) -> () {
-    unsafe Pointer.write<ValueBits>(unsafe self.slot(usize.wrappingSubtract(self.sp, depth)), value)
+    unsafe Pointer.write<ValueBits>(unsafe cellAt(self.stackTop, usize.wrappingSubtract(0, depth)), value)
   }
   pub unsafe fn argument(self: &Self, index: usize) -> ValueBits {
     return unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(self.arguments), index))
