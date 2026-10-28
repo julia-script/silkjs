@@ -309,6 +309,114 @@ fn rangeContains(bytecode: &[u8], offset: usize, count: usize, code: u32, wide: 
   return false
 }
 
+struct Advance {
+  position: usize,
+  failed: bool
+}
+
+fn consume<'input>(input: &ExecInput<'input>, position: usize, fold: bool) -> Character with Intrinsic.inlineAlways() {
+  let character = ExecInput.forward(input, position, input.length)
+  if fold { return Character { code: UnicodeCase.canonicalize(character.code, input.unicode), position: character.position } }
+  return move character
+}
+
+fn literal<'input>(input: &ExecInput<'input>, position: usize, value: u32, fold: bool) -> Advance with Intrinsic.inlineAlways() {
+  if position >= input.length { return Advance { position: position, failed: true } }
+  let character = consume(input, position, fold)
+  return Advance { position: character.position, failed: value != character.code }
+}
+
+fn classRange<'input>(bytecode: &[u8], pc: usize, count: usize, input: &ExecInput<'input>, position: usize,
+  wide: bool, fold: bool) -> Advance with Intrinsic.inlineAlways() {
+  if position >= input.length { return Advance { position: position, failed: true } }
+  let character = consume(input, position, fold)
+  return Advance { position: character.position, failed: !rangeContains(bytecode, pc, count, character.code, wide) }
+}
+
+fn atWordBoundary<'input>(input: &ExecInput<'input>, position: usize, ignoreCase: bool) -> bool with Intrinsic.inlineAlways() {
+  let mut before = false
+  let mut after = false
+  if position != 0 { before = isWord(ExecInput.backward(input, position, 0).code, ignoreCase) }
+  if position < input.length { after = isWord(ExecInput.forward(input, position, input.length).code, ignoreCase) }
+  return before != after
+}
+
+fn backReference<'input>(bytecode: &[u8], candidates: usize, count: usize, registers: &Registers, captureCount: usize,
+  input: &ExecInput<'input>, start: usize, backward: bool, ignoreCase: bool) -> Advance {
+  let mut position = start
+  let mut candidate: usize = 0
+  while candidate < count {
+    let capture = u8.toUsize(bytecode[candidates + candidate])
+    if capture >= captureCount { return Advance { position: position, failed: true } }
+    let savedStart = Registers.get(registers, capture * 2)
+    let savedEnd = Registers.get(registers, capture * 2 + 1)
+    if savedStart >= 0 && savedEnd >= 0 {
+      let captureStart = i64.toUsize(savedStart)
+      let captureEnd = i64.toUsize(savedEnd)
+      let mut cursor = captureStart
+      if backward { cursor = captureEnd }
+      while (!backward && cursor < captureEnd) || (backward && cursor > captureStart) {
+        if (!backward && position >= input.length) || (backward && position == 0) {
+          return Advance { position: position, failed: true }
+        }
+        let mut first: u32 = 0
+        let mut second: u32 = 0
+        if backward {
+          let a = ExecInput.backward(input, cursor, captureStart)
+          let b = ExecInput.backward(input, position, 0)
+          cursor = a.position
+          position = b.position
+          first = a.code
+          second = b.code
+        } else {
+          let a = ExecInput.forward(input, cursor, captureEnd)
+          let b = ExecInput.forward(input, position, input.length)
+          cursor = a.position
+          position = b.position
+          first = a.code
+          second = b.code
+        }
+        if ignoreCase {
+          first = UnicodeCase.canonicalize(first, input.unicode)
+          second = UnicodeCase.canonicalize(second, input.unicode)
+        }
+        if first != second { return Advance { position: position, failed: true } }
+      }
+      return Advance { position: position, failed: false }
+    }
+    candidate = candidate + 1
+  }
+  return Advance { position: position, failed: false }
+}
+
+struct Jump {
+  pc: usize,
+  failed: bool,
+  poll: bool
+}
+
+/// The four loop_*split opcodes; `pc` points at their register operand.
+effect fn loopSplit(machine: &mut Machine, bytecode: &[u8], pc: usize, registerBase: usize, position: usize,
+  checkAdvance: bool, gotoFirst: bool) -> Jump ! OutOfMemoryError ? &mut Allocator with Intrinsic.inlineAlways() {
+  let index = registerBase + u8.toUsize(bytecode[pc])
+  let limit = readU32(bytecode, pc + 1)
+  let displacement = readU32(bytecode, pc + 5)
+  let next = pc + 9
+  let counter = u32.wrappingSubtract(i64.toU32(Registers.get(&machine.values, index)), 1)
+  run Machine.save(&mut machine, index, u32.toI64(counter), true)
+  if counter > limit { return Jump { pc: branch(next, displacement), failed: false, poll: true } }
+  if checkAdvance && Registers.get(&machine.values, index + 1) == usize.toI64(position) && counter != limit {
+    return Jump { pc: next, failed: true, poll: false }
+  }
+  if counter == 0 { return Jump { pc: next, failed: false, poll: false } }
+  if gotoFirst {
+    run Machine.pushFrame(&mut machine, next, position, STATE_SPLIT)
+    return Jump { pc: branch(next, displacement), failed: false, poll: false }
+  }
+  run Machine.pushFrame(&mut machine, branch(next, displacement), position, STATE_SPLIT)
+  return Jump { pc: next, failed: false, poll: false }
+}
+
 pub struct RegExpExecutor {}
 
 impl RegExpExecutor {
@@ -353,236 +461,212 @@ effect fn execute<'input, 'env>(bytecode: &[u8], input: &ExecInput<'input>, star
     pc = pc + 1
     let mut failed = false
     let mut poll = false
-    if opcode == regexp_opcodes.REOP_match {
-      let mut captures = List<i32>.make()
-      run List<i32>.reserveExact(&mut captures, registerBase)
-      let mut index: usize = 0
-      while index < registerBase {
-        run List<i32>.append(&mut captures, i64.toI32(Registers.get(&machine.values, index)))
-        index = index + 1
+    // Every opcode gets its own arm so LLVM lowers the dispatch to one jump table.
+    match opcode {
+      16 => { // REOP_match
+        let mut captures = List<i32>.make()
+        run List<i32>.reserveExact(&mut captures, registerBase)
+        let mut index: usize = 0
+        while index < registerBase {
+          run List<i32>.append(&mut captures, i64.toI32(Registers.get(&machine.values, index)))
+          index = index + 1
+        }
+        return RegExpMatch { matched: true, captures: move captures }
       }
-      return RegExpMatch { matched: true, captures: move captures }
-    } else if opcode == regexp_opcodes.REOP_lookahead_match {
-      let frame = Machine.finishPositive(&mut machine)
-      pc = frame.pc
-      position = frame.position
-    } else if opcode == regexp_opcodes.REOP_negative_lookahead_match {
-      Machine.finishNegative(&mut machine)
-      failed = true
-    } else if opcode == regexp_opcodes.REOP_char || opcode == regexp_opcodes.REOP_char_i
-      || opcode == regexp_opcodes.REOP_char32 || opcode == regexp_opcodes.REOP_char32_i {
-      let mut value: u32 = 0
-      if opcode == regexp_opcodes.REOP_char32 || opcode == regexp_opcodes.REOP_char32_i {
-        value = readU32(bytecode, pc)
+      17 => { // REOP_lookahead_match
+        let frame = Machine.finishPositive(&mut machine)
+        pc = frame.pc
+        position = frame.position
+      }
+      18 => { // REOP_negative_lookahead_match
+        Machine.finishNegative(&mut machine)
+        failed = true
+      }
+      1 => { // REOP_char
+        let step = literal(input, position, u16.toU32(readU16(bytecode, pc)), false)
+        pc = pc + 2 position = step.position failed = step.failed
+      }
+      2 => { // REOP_char_i
+        let step = literal(input, position, u16.toU32(readU16(bytecode, pc)), true)
+        pc = pc + 2 position = step.position failed = step.failed
+      }
+      3 => { // REOP_char32
+        let step = literal(input, position, readU32(bytecode, pc), false)
+        pc = pc + 4 position = step.position failed = step.failed
+      }
+      4 => { // REOP_char32_i
+        let step = literal(input, position, readU32(bytecode, pc), true)
+        pc = pc + 4 position = step.position failed = step.failed
+      }
+      14 => { // REOP_split_goto_first
+        let target = branch(pc + 4, readU32(bytecode, pc))
+        run Machine.pushFrame(&mut machine, pc + 4, position, STATE_SPLIT)
+        pc = target
+      }
+      15 => { // REOP_split_next_first
         pc = pc + 4
-      } else {
-        value = u16.toU32(readU16(bytecode, pc))
+        run Machine.pushFrame(&mut machine, branch(pc, readU32(bytecode, pc - 4)), position, STATE_SPLIT)
+      }
+      40 => { // REOP_lookahead
+        pc = pc + 4
+        run Machine.pushFrame(&mut machine, branch(pc, readU32(bytecode, pc - 4)), position, STATE_LOOKAHEAD)
+      }
+      41 => { // REOP_negative_lookahead
+        pc = pc + 4
+        run Machine.pushFrame(&mut machine, branch(pc, readU32(bytecode, pc - 4)), position, STATE_NEGATIVE_LOOKAHEAD)
+      }
+      13 => { // REOP_goto
+        pc = branch(pc + 4, readU32(bytecode, pc))
+        poll = true
+      }
+      9 => { failed = position != 0 } // REOP_line_start
+      10 => { // REOP_line_start_m
+        if position != 0 { failed = !isLineTerminator(ExecInput.backward(input, position, 0).code) }
+      }
+      11 => { failed = position != input.length } // REOP_line_end
+      12 => { // REOP_line_end_m
+        if position != input.length { failed = !isLineTerminator(ExecInput.forward(input, position, input.length).code) }
+      }
+      5 => { // REOP_dot
+        if position == input.length { failed = true }
+        else {
+          let character = ExecInput.forward(input, position, input.length)
+          position = character.position
+          failed = isLineTerminator(character.code)
+        }
+      }
+      6 => { // REOP_any
+        if position == input.length { failed = true }
+        else { position = ExecInput.forward(input, position, input.length).position }
+      }
+      7 => { // REOP_space
+        if position == input.length { failed = true }
+        else {
+          let character = ExecInput.forward(input, position, input.length)
+          position = character.position
+          failed = !UnicodeCase.isSpace(character.code)
+        }
+      }
+      8 => { // REOP_not_space
+        if position == input.length { failed = true }
+        else {
+          let character = ExecInput.forward(input, position, input.length)
+          position = character.position
+          failed = UnicodeCase.isSpace(character.code)
+        }
+      }
+      19 => { // REOP_save_start
+        let index = u8.toUsize(bytecode[pc]) * 2
+        pc = pc + 1
+        run Machine.save(&mut machine, index, usize.toI64(position), false)
+      }
+      20 => { // REOP_save_end
+        let index = u8.toUsize(bytecode[pc]) * 2 + 1
+        pc = pc + 1
+        run Machine.save(&mut machine, index, usize.toI64(position), false)
+      }
+      21 => { // REOP_save_reset
+        let mut index = u8.toUsize(bytecode[pc]) * 2
+        let end = (u8.toUsize(bytecode[pc + 1]) + 1) * 2
         pc = pc + 2
-      }
-      if position >= input.length { failed = true }
-      else {
-        let character = ExecInput.forward(input, position, input.length)
-        position = character.position
-        let mut code = character.code
-        if opcode == regexp_opcodes.REOP_char_i || opcode == regexp_opcodes.REOP_char32_i {
-          code = UnicodeCase.canonicalize(code, input.unicode)
-        }
-        failed = value != code
-      }
-    } else if opcode == regexp_opcodes.REOP_split_goto_first || opcode == regexp_opcodes.REOP_split_next_first {
-      let displacement = readU32(bytecode, pc)
-      pc = pc + 4
-      let mut alternative = branch(pc, displacement)
-      if opcode == regexp_opcodes.REOP_split_goto_first {
-        alternative = pc
-        pc = branch(pc, displacement)
-      }
-      run Machine.pushFrame(&mut machine, alternative, position, STATE_SPLIT)
-    } else if opcode == regexp_opcodes.REOP_lookahead || opcode == regexp_opcodes.REOP_negative_lookahead {
-      let displacement = readU32(bytecode, pc)
-      pc = pc + 4
-      let mut kind = STATE_LOOKAHEAD
-      if opcode == regexp_opcodes.REOP_negative_lookahead { kind = STATE_NEGATIVE_LOOKAHEAD }
-      run Machine.pushFrame(&mut machine, branch(pc, displacement), position, kind)
-    } else if opcode == regexp_opcodes.REOP_goto {
-      let displacement = readU32(bytecode, pc)
-      pc = branch(pc + 4, displacement)
-      poll = true
-    } else if opcode == regexp_opcodes.REOP_line_start || opcode == regexp_opcodes.REOP_line_start_m {
-      if position != 0 {
-        if opcode == regexp_opcodes.REOP_line_start { failed = true }
-        else { failed = !isLineTerminator(ExecInput.backward(input, position, 0).code) }
-      }
-    } else if opcode == regexp_opcodes.REOP_line_end || opcode == regexp_opcodes.REOP_line_end_m {
-      if position != input.length {
-        if opcode == regexp_opcodes.REOP_line_end { failed = true }
-        else { failed = !isLineTerminator(ExecInput.forward(input, position, input.length).code) }
-      }
-    } else if opcode == regexp_opcodes.REOP_dot || opcode == regexp_opcodes.REOP_any
-      || opcode == regexp_opcodes.REOP_space || opcode == regexp_opcodes.REOP_not_space {
-      if position == input.length { failed = true }
-      else {
-        let character = ExecInput.forward(input, position, input.length)
-        position = character.position
-        if opcode == regexp_opcodes.REOP_dot { failed = isLineTerminator(character.code) }
-        else if opcode == regexp_opcodes.REOP_space { failed = !UnicodeCase.isSpace(character.code) }
-        else if opcode == regexp_opcodes.REOP_not_space { failed = UnicodeCase.isSpace(character.code) }
-      }
-    } else if opcode == regexp_opcodes.REOP_save_start || opcode == regexp_opcodes.REOP_save_end {
-      let capture = u8.toUsize(bytecode[pc])
-      pc = pc + 1
-      let mut index = capture * 2
-      if opcode == regexp_opcodes.REOP_save_end { index = index + 1 }
-      run Machine.save(&mut machine, index, usize.toI64(position), false)
-    } else if opcode == regexp_opcodes.REOP_save_reset {
-      let mut index = u8.toUsize(bytecode[pc]) * 2
-      let end = (u8.toUsize(bytecode[pc + 1]) + 1) * 2
-      pc = pc + 2
-      while index < end {
-        run Machine.save(&mut machine, index, -1, false)
-        index = index + 1
-      }
-    } else if opcode == regexp_opcodes.REOP_set_i32 {
-      let index = registerBase + u8.toUsize(bytecode[pc])
-      let value = readU32(bytecode, pc + 1)
-      pc = pc + 5
-      run Machine.save(&mut machine, index, u32.toI64(value), true)
-    } else if opcode == regexp_opcodes.REOP_loop {
-      let index = registerBase + u8.toUsize(bytecode[pc])
-      let displacement = readU32(bytecode, pc + 1)
-      pc = pc + 5
-      let counter = u32.wrappingSubtract(i64.toU32(Registers.get(&machine.values, index)), 1)
-      run Machine.save(&mut machine, index, u32.toI64(counter), true)
-      if counter != 0 {
-        pc = branch(pc, displacement)
-        poll = true
-      }
-    } else if opcode == regexp_opcodes.REOP_loop_split_goto_first
-      || opcode == regexp_opcodes.REOP_loop_split_next_first
-      || opcode == regexp_opcodes.REOP_loop_check_adv_split_goto_first
-      || opcode == regexp_opcodes.REOP_loop_check_adv_split_next_first {
-      let index = registerBase + u8.toUsize(bytecode[pc])
-      let limit = readU32(bytecode, pc + 1)
-      let displacement = readU32(bytecode, pc + 5)
-      pc = pc + 9
-      let counter = u32.wrappingSubtract(i64.toU32(Registers.get(&machine.values, index)), 1)
-      run Machine.save(&mut machine, index, u32.toI64(counter), true)
-      if counter > limit {
-        pc = branch(pc, displacement)
-        poll = true
-      } else {
-        let checkAdvance = opcode == regexp_opcodes.REOP_loop_check_adv_split_goto_first
-          || opcode == regexp_opcodes.REOP_loop_check_adv_split_next_first
-        if checkAdvance && Registers.get(&machine.values, index + 1) == usize.toI64(position) && counter != limit {
-          failed = true
-        } else if counter != 0 {
-          let mut alternative = branch(pc, displacement)
-          if opcode == regexp_opcodes.REOP_loop_split_goto_first
-            || opcode == regexp_opcodes.REOP_loop_check_adv_split_goto_first {
-            alternative = pc
-            pc = branch(pc, displacement)
-          }
-          run Machine.pushFrame(&mut machine, alternative, position, STATE_SPLIT)
+        while index < end {
+          run Machine.save(&mut machine, index, -1, false)
+          index = index + 1
         }
       }
-    } else if opcode == regexp_opcodes.REOP_set_char_pos {
-      let index = registerBase + u8.toUsize(bytecode[pc])
-      pc = pc + 1
-      run Machine.save(&mut machine, index, usize.toI64(position), true)
-    } else if opcode == regexp_opcodes.REOP_check_advance {
-      let index = registerBase + u8.toUsize(bytecode[pc])
-      pc = pc + 1
-      failed = Registers.get(&machine.values, index) == usize.toI64(position)
-    } else if opcode == regexp_opcodes.REOP_word_boundary || opcode == regexp_opcodes.REOP_word_boundary_i
-      || opcode == regexp_opcodes.REOP_not_word_boundary || opcode == regexp_opcodes.REOP_not_word_boundary_i {
-      let ignoreCase = opcode == regexp_opcodes.REOP_word_boundary_i || opcode == regexp_opcodes.REOP_not_word_boundary_i
-      let boundary = opcode == regexp_opcodes.REOP_word_boundary || opcode == regexp_opcodes.REOP_word_boundary_i
-      let mut before = false
-      let mut after = false
-      if position != 0 { before = isWord(ExecInput.backward(input, position, 0).code, ignoreCase) }
-      if position < input.length { after = isWord(ExecInput.forward(input, position, input.length).code, ignoreCase) }
-      failed = (before != after) != boundary
-    } else if opcode == regexp_opcodes.REOP_back_reference || opcode == regexp_opcodes.REOP_back_reference_i
-      || opcode == regexp_opcodes.REOP_backward_back_reference || opcode == regexp_opcodes.REOP_backward_back_reference_i {
-      let count = u8.toUsize(bytecode[pc])
-      let candidates = pc + 1
-      pc = candidates + count
-      let backward = opcode == regexp_opcodes.REOP_backward_back_reference
-        || opcode == regexp_opcodes.REOP_backward_back_reference_i
-      let ignoreCase = opcode == regexp_opcodes.REOP_back_reference_i
-        || opcode == regexp_opcodes.REOP_backward_back_reference_i
-      let mut candidate: usize = 0
-      while candidate < count {
-        let capture = u8.toUsize(bytecode[candidates + candidate])
-        if capture >= captureCount {
-          failed = true
-          break
-        }
-        let savedStart = Registers.get(&machine.values, capture * 2)
-        let savedEnd = Registers.get(&machine.values, capture * 2 + 1)
-        if savedStart >= 0 && savedEnd >= 0 {
-          let captureStart = i64.toUsize(savedStart)
-          let captureEnd = i64.toUsize(savedEnd)
-          let mut cursor = captureStart
-          if backward { cursor = captureEnd }
-          while (!backward && cursor < captureEnd) || (backward && cursor > captureStart) {
-            if (!backward && position >= input.length) || (backward && position == 0) {
-              failed = true
-              break
-            }
-            let mut first: u32 = 0
-            let mut second: u32 = 0
-            if backward {
-              let a = ExecInput.backward(input, cursor, captureStart)
-              let b = ExecInput.backward(input, position, 0)
-              cursor = a.position
-              position = b.position
-              first = a.code
-              second = b.code
-            } else {
-              let a = ExecInput.forward(input, cursor, captureEnd)
-              let b = ExecInput.forward(input, position, input.length)
-              cursor = a.position
-              position = b.position
-              first = a.code
-              second = b.code
-            }
-            if ignoreCase {
-              first = UnicodeCase.canonicalize(first, input.unicode)
-              second = UnicodeCase.canonicalize(second, input.unicode)
-            }
-            if first != second {
-              failed = true
-              break
-            }
-          }
-          break
-        }
-        candidate = candidate + 1
+      27 => { // REOP_set_i32
+        let index = registerBase + u8.toUsize(bytecode[pc])
+        let value = readU32(bytecode, pc + 1)
+        pc = pc + 5
+        run Machine.save(&mut machine, index, u32.toI64(value), true)
       }
-    } else if opcode == regexp_opcodes.REOP_range || opcode == regexp_opcodes.REOP_range_i
-      || opcode == regexp_opcodes.REOP_range32 || opcode == regexp_opcodes.REOP_range32_i {
-      let count = u16.toUsize(readU16(bytecode, pc))
-      pc = pc + 2
-      let wide = opcode == regexp_opcodes.REOP_range32 || opcode == regexp_opcodes.REOP_range32_i
-      if position >= input.length { failed = true }
-      else {
-        let character = ExecInput.forward(input, position, input.length)
-        position = character.position
-        let mut code = character.code
-        if opcode == regexp_opcodes.REOP_range_i || opcode == regexp_opcodes.REOP_range32_i {
-          code = UnicodeCase.canonicalize(code, input.unicode)
+      22 => { // REOP_loop
+        let index = registerBase + u8.toUsize(bytecode[pc])
+        let displacement = readU32(bytecode, pc + 1)
+        pc = pc + 5
+        let counter = u32.wrappingSubtract(i64.toU32(Registers.get(&machine.values, index)), 1)
+        run Machine.save(&mut machine, index, u32.toI64(counter), true)
+        if counter != 0 {
+          pc = branch(pc, displacement)
+          poll = true
         }
-        failed = !rangeContains(bytecode, pc, count, code, wide)
       }
-      if wide { pc = pc + count * 8 }
-      else { pc = pc + count * 4 }
-    } else if opcode == regexp_opcodes.REOP_prev {
-      if position == 0 { failed = true }
-      else { position = ExecInput.backward(input, position, 0).position }
-    } else {
+      23 => { // REOP_loop_split_goto_first
+        let jump = run loopSplit(&mut machine, bytecode, pc, registerBase, position, false, true)
+        pc = jump.pc failed = jump.failed poll = jump.poll
+      }
+      24 => { // REOP_loop_split_next_first
+        let jump = run loopSplit(&mut machine, bytecode, pc, registerBase, position, false, false)
+        pc = jump.pc failed = jump.failed poll = jump.poll
+      }
+      25 => { // REOP_loop_check_adv_split_goto_first
+        let jump = run loopSplit(&mut machine, bytecode, pc, registerBase, position, true, true)
+        pc = jump.pc failed = jump.failed poll = jump.poll
+      }
+      26 => { // REOP_loop_check_adv_split_next_first
+        let jump = run loopSplit(&mut machine, bytecode, pc, registerBase, position, true, false)
+        pc = jump.pc failed = jump.failed poll = jump.poll
+      }
+      42 => { // REOP_set_char_pos
+        let index = registerBase + u8.toUsize(bytecode[pc])
+        pc = pc + 1
+        run Machine.save(&mut machine, index, usize.toI64(position), true)
+      }
+      43 => { // REOP_check_advance
+        let index = registerBase + u8.toUsize(bytecode[pc])
+        pc = pc + 1
+        failed = Registers.get(&machine.values, index) == usize.toI64(position)
+      }
+      28 => { failed = !atWordBoundary(input, position, false) } // REOP_word_boundary
+      29 => { failed = !atWordBoundary(input, position, true) } // REOP_word_boundary_i
+      30 => { failed = atWordBoundary(input, position, false) } // REOP_not_word_boundary
+      31 => { failed = atWordBoundary(input, position, true) } // REOP_not_word_boundary_i
+      32 => { // REOP_back_reference
+        let count = u8.toUsize(bytecode[pc])
+        let step = backReference(bytecode, pc + 1, count, &machine.values, captureCount, input, position, false, false)
+        pc = pc + 1 + count position = step.position failed = step.failed
+      }
+      33 => { // REOP_back_reference_i
+        let count = u8.toUsize(bytecode[pc])
+        let step = backReference(bytecode, pc + 1, count, &machine.values, captureCount, input, position, false, true)
+        pc = pc + 1 + count position = step.position failed = step.failed
+      }
+      34 => { // REOP_backward_back_reference
+        let count = u8.toUsize(bytecode[pc])
+        let step = backReference(bytecode, pc + 1, count, &machine.values, captureCount, input, position, true, false)
+        pc = pc + 1 + count position = step.position failed = step.failed
+      }
+      35 => { // REOP_backward_back_reference_i
+        let count = u8.toUsize(bytecode[pc])
+        let step = backReference(bytecode, pc + 1, count, &machine.values, captureCount, input, position, true, true)
+        pc = pc + 1 + count position = step.position failed = step.failed
+      }
+      36 => { // REOP_range
+        let count = u16.toUsize(readU16(bytecode, pc))
+        let step = classRange(bytecode, pc + 2, count, input, position, false, false)
+        pc = pc + 2 + count * 4 position = step.position failed = step.failed
+      }
+      37 => { // REOP_range_i
+        let count = u16.toUsize(readU16(bytecode, pc))
+        let step = classRange(bytecode, pc + 2, count, input, position, false, true)
+        pc = pc + 2 + count * 4 position = step.position failed = step.failed
+      }
+      38 => { // REOP_range32
+        let count = u16.toUsize(readU16(bytecode, pc))
+        let step = classRange(bytecode, pc + 2, count, input, position, true, false)
+        pc = pc + 2 + count * 8 position = step.position failed = step.failed
+      }
+      39 => { // REOP_range32_i
+        let count = u16.toUsize(readU16(bytecode, pc))
+        let step = classRange(bytecode, pc + 2, count, input, position, true, true)
+        pc = pc + 2 + count * 8 position = step.position failed = step.failed
+      }
+      44 => { // REOP_prev
+        if position == 0 { failed = true }
+        else { position = ExecInput.backward(input, position, 0).position }
+      }
       // REOP_invalid and unknown bytes violate the compiler-bytecode precondition.
-      Intrinsic.trap("QuickJS invariant violated")
+      _ => { Intrinsic.trap("QuickJS invariant violated") }
     }
     if failed {
       let resume = Machine.backtrack(&mut machine)
