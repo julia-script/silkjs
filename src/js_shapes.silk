@@ -25,7 +25,7 @@ import silk.u32
 import silk.u64
 import silk.i32
 import silk.usize
-import js_core_types { HeapList, ObjectData, PropertySlot, RuntimeState, ShapeData, ShapeProperty, TransitionEntry, JS_PROP_INITIAL_SIZE, JS_PROP_INITIAL_HASH_SIZE }
+import js_core_types { GcPhase, HeapList, ObjectData, PropertySlot, RuntimeState, ShapeData, ShapeProperty, TransitionEntry, JS_PROP_INITIAL_SIZE, JS_PROP_INITIAL_HASH_SIZE }
 import js_heap { HeapCell, HeapHeader, HeapKind }
 import js_value { ValueBits }
 
@@ -79,6 +79,60 @@ unsafe fn acquire(runtime: *mut HeapHeader, shape: *mut HeapHeader) -> () with I
     unsafe state.gcObjects.pushBack(shape)
   }
   unsafe HeapCell.retain(shape)
+}
+
+/// The common add on a fresh object: it is old's only owner and the target is parked,
+/// so releasing old would park it just as acquiring the target revives it. Swapping
+/// their list places does both without the release path; the parked count is unchanged.
+unsafe fn trade(runtime: *mut HeapHeader, old: *mut HeapHeader, target: *mut HeapHeader) -> bool with Intrinsic.inlineAlways() {
+  if unsafe referenceCount(target) != 0 || unsafe referenceCount(old) != 1 { return false }
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ShapeData, ()>(&anchor, old)
+  let keep = data.isHashed && data.deletedPropertyCount == 0 && data.properties.length() < SMALL_SHAPE
+  drop data
+  if !keep { return false }
+  let mut stateAnchor = ()
+  let phaseState = unsafe HeapCell.payload<RuntimeState, ()>(&stateAnchor, runtime)
+  let phase = phaseState.gcPhase
+  drop phaseState
+  if phase != GcPhase.None { return false }
+  // old is in gcObjects and target in parkedShapes, so the two are never neighbours.
+  let mut headerAnchor = ()
+  let oldHeader = unsafe Pointer.borrowMut<(), HeapHeader>(&mut headerAnchor, old)
+  let oldPrevious = oldHeader.previous
+  let oldNext = oldHeader.next
+  drop oldHeader
+  let targetHeader = unsafe Pointer.borrowMut<(), HeapHeader>(&mut headerAnchor, target)
+  let targetPrevious = targetHeader.previous
+  let targetNext = targetHeader.next
+  targetHeader.previous = oldPrevious
+  targetHeader.next = oldNext
+  drop targetHeader
+  let movedHeader = unsafe Pointer.borrowMut<(), HeapHeader>(&mut headerAnchor, old)
+  movedHeader.previous = targetPrevious
+  movedHeader.next = targetNext
+  drop movedHeader
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
+  match Pointer.nonNullMut<HeapHeader>(oldPrevious) {
+    Option<*mut HeapHeader>.Some { value } => { let h = unsafe Pointer.borrowMut<(), HeapHeader>(&mut headerAnchor, value) h.next = target }
+    Option<*mut HeapHeader>.None => { state.gcObjects.first = target }
+  }
+  match Pointer.nonNullMut<HeapHeader>(oldNext) {
+    Option<*mut HeapHeader>.Some { value } => { let h = unsafe Pointer.borrowMut<(), HeapHeader>(&mut headerAnchor, value) h.previous = target }
+    Option<*mut HeapHeader>.None => { state.gcObjects.last = target }
+  }
+  match Pointer.nonNullMut<HeapHeader>(targetPrevious) {
+    Option<*mut HeapHeader>.Some { value } => { let h = unsafe Pointer.borrowMut<(), HeapHeader>(&mut headerAnchor, value) h.next = old }
+    Option<*mut HeapHeader>.None => { state.parkedShapes.first = old }
+  }
+  match Pointer.nonNullMut<HeapHeader>(targetNext) {
+    Option<*mut HeapHeader>.Some { value } => { let h = unsafe Pointer.borrowMut<(), HeapHeader>(&mut headerAnchor, value) h.previous = old }
+    Option<*mut HeapHeader>.None => { state.parkedShapes.last = old }
+  }
+  drop state
+  let dead = unsafe HeapCell.decrement(old)
+  unsafe HeapCell.retain(target)
+  return true
 }
 
 /// Called by the collector when the last reference to shape is dropped, after it has
@@ -552,8 +606,11 @@ pub unsafe effect fn addProperty(runtime: *mut HeapHeader, object: &mut ObjectDa
       }
     }
     run object.properties.append(PropertySlot.Value { value: ValueBits.Undefined })
-    unsafe acquire(runtime, present(transition))
     object.shape = present(transition)
+    if unsafe trade(runtime, old, present(transition)) {
+      return AddResult { index: index, retiredShape: Pointer.null<HeapHeader>() }
+    }
+    unsafe acquire(runtime, present(transition))
     return AddResult { index: index, retiredShape: old }
   }
   let anchor = ()
