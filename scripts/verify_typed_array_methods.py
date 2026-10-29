@@ -101,10 +101,10 @@ static void isolated(unsigned mode,int armed,size_t cutoff){
 int main(int argc,char **argv){if(argc==4){isolated(atoi(argv[1]),atoi(argv[2]),strtoull(argv[3],NULL,10));return 0;}for(unsigned i=0;i<16;i++)isolated(i,0,0);return 0;}
 '''
 SILK_SOURCE = r'''
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.effect { Effect }
-import silk.writer { Writer, WriterError }
-import silk.os_writer { StdoutWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StdoutWriter }
 import byte_buffer { ByteBuffer }
 import js_typed_array_methods_oracle as oracle
 import js_exceptions { JsException }

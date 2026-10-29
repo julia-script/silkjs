@@ -96,7 +96,7 @@ int main(void){JSMallocFunctions mf={tracked_malloc,tracked_free,tracked_realloc
 # Our dump includes Int payloads and raw NaN bits (the coercion oracle intentionally
 # canonicalizes its floating diagnostics, which is insufficient for unary plus).
 SILK_SOURCE = BIGINT_SILK.partition('struct Outputs')[0] + r'''
-import silk.list { List }
+import silk.collections.list { List }
 import js_heap { HeapKind }
 import js_unary_operators_test_support as unarySupport
 import js_array_storage_test_support { FaultAllocator }

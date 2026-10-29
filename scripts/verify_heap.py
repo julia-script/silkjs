@@ -242,17 +242,17 @@ int main(void) {
 '''
 
 SILK_SOURCE = r'''
-import silk.allocator { Allocator, OutOfMemoryError, SystemAllocator }
-import silk.effect { Effect }
-import silk.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError, SystemAllocator }
+import silk.core.effect { Effect }
+import silk.collections.list { List }
 import silk.option { Option }
-import silk.pointer { Pointer }
-import silk.os_writer { StdoutWriter }
-import silk.writer { Writer, WriterError }
-import silk.i32
-import silk.u8
-import silk.u32
-import silk.usize
+import silk.mem.pointer { Pointer }
+import silk.io.writer_native { StdoutWriter }
+import silk.io.writer { Writer, WriterError }
+import silk.num.i32
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
 import js_atoms { AtomTable }
 import js_heap { HeapCell, HeapHeader, HeapKind }
 import js_value { ValueBits }

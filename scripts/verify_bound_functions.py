@@ -142,10 +142,10 @@ int main(int argc,char **argv){JSRuntime *rt=JS_NewRuntime2(&allocator,NULL);if(
  JS_FreeContext(ctx);JS_FreeRuntime(rt);word(live_count);word(live_bytes);return 0;}
 '''
 SILK_SOURCE = r'''
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.effect { Effect }
-import silk.result { Result }
-import silk.pointer { Pointer }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.mem.pointer { Pointer }
 import js_core_types { FrameSlots }
 import js_value { ValueBits }
 import js_bound_functions as bound
@@ -154,8 +154,8 @@ import js_strings { Strings }
 import js_string_types { stringReference }
 import js_errors_test_support { FaultAllocator }
 import js_array_storage_test_support { reference, rc }
-import silk.writer { Writer, WriterError }
-import silk.os_writer { StdoutWriter }
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StdoutWriter }
 import byte_buffer { ByteBuffer }
 import runtime_memory { RuntimeAllocator }
 import js_runtime as runtime

@@ -122,7 +122,7 @@ int main(void) {
 '''
 
 SILK_SOURCE = fixture_prefix(PRIMITIVE_SILK, 'effect fn equality(') + r'''
-import silk.result { Result }
+import silk.core.result { Result }
 import runtime_memory { RuntimeAllocator }
 import js_primitive_coercions as coercion
 import js_primitive_coercions { NumberHint, CoercionError }

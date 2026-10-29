@@ -72,16 +72,16 @@ int main(void){for(int n=0;n<10;n++)for(int t=0;t<6;t++)for(int pc=0;pc<3;pc++)f
 '''
 
 S_SOURCE = r'''
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.effect { Effect }
-import silk.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.collections.list { List }
 import silk.option { Option }
-import silk.pointer { Pointer }
-import silk.u32
-import silk.u16
-import silk.usize
-import silk.writer { Writer, WriterError }
-import silk.os_writer { StdoutWriter }
+import silk.mem.pointer { Pointer }
+import silk.num.u32
+import silk.num.u16
+import silk.num.usize
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StdoutWriter }
 import byte_buffer { ByteBuffer }
 import runtime_memory { RuntimeAllocator, AllocationObserver }
 import native_stack { currentFrameAddress }

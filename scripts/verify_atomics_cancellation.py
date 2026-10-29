@@ -19,11 +19,11 @@ ROOT = Path(__file__).resolve().parents[1]
 TEST = "scopedCancellationUnlinksBlockedWaitersWithoutPoisoningSharedQueue"
 EXPECTED = b"PASS scoped cancellation: 66 native thread joins; uncatchable JS interruption including OOM; zero ledgers\n"
 MAIN = r'''
-import silk.allocator { OutOfMemoryError }
-import silk.effect { Effect }
-import silk.native_thread { SpawnError }
-import silk.os_writer { StdoutWriter }
-import silk.writer { Writer, WriterError }
+import silk.mem.allocator { OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.concurrency.thread_native { SpawnError }
+import silk.io.writer_native { StdoutWriter }
+import silk.io.writer { Writer, WriterError }
 import js_atomics_native { SynchronizationError }
 import js_atomics_cancellation_fixture as fixture
 import js_exceptions { JsException }

@@ -92,17 +92,17 @@ int main(void) {
 '''
 
 SILK_SOURCE = r'''
-import silk.allocator { Allocator, OutOfMemoryError, SystemAllocator }
-import silk.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError, SystemAllocator }
+import silk.core.effect { Effect }
 import silk.option { Option }
-import silk.pointer { Pointer }
-import silk.u32
-import silk.i32
-import silk.usize
-import silk.u8
-import silk.u16
-import silk.writer { Writer, WriterError }
-import silk.os_writer { StdoutWriter }
+import silk.mem.pointer { Pointer }
+import silk.num.u32
+import silk.num.i32
+import silk.num.usize
+import silk.num.u8
+import silk.num.u16
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StdoutWriter }
 import byte_buffer { ByteBuffer }
 import js_heap { HeapCell, HeapHeader }
 import js_core_types { RuntimeState, NativeFunctionId, WeakRefHeader, ExoticCallbacks }

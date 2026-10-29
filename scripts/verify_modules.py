@@ -110,12 +110,12 @@ int main(void){semantic();
  for(int phase=0;phase<3;phase++)for(int cutoff=0;cutoff<48;cutoff++)fault(cutoff,phase);return 0;}
 '''
 SILK_SOURCE = r'''
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.effect { Effect }
-import silk.writer { Writer, WriterError }
-import silk.os_writer { StdoutWriter }
-import silk.usize
-import silk.u8
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StdoutWriter }
+import silk.num.usize
+import silk.num.u8
 import byte_buffer { ByteBuffer }
 import runtime_memory { RuntimeAllocator }
 import native_stack { currentFrameAddress }

@@ -116,7 +116,7 @@ import js_errors_test_support { FaultAllocator }
 import js_errors_test_support as errorFixture
 import js_property_descriptors_test_support as descriptorFixture
 import js_core_types { ObjectData }
-import silk.list { List }
+import silk.collections.list { List }
 fn operation(index:u32)->Operation{
  return match index {0=>Operation.Less 1=>Operation.LessEqual 2=>Operation.Greater 3=>Operation.GreaterEqual 4=>Operation.Equal _=>Operation.NotEqual}
 }
