@@ -26,10 +26,33 @@ const STATE_LOOKAHEAD: i64 = 1
 const STATE_NEGATIVE_LOOKAHEAD: i64 = 2
 const INTERRUPT_COUNTER_INIT: u32 = 10000
 
-struct ExecInput<'input> {
-  bytes: &'input [u8],
-  words: &'input [u16],
-  wide: bool,
+// Code units of the subject string. Each width gets its own copy of the engine,
+// so the per-character width test and the slice bounds checks fold away.
+interface Units {
+  fn holdsWords(self: &Self) -> bool
+  // `position` is below the input length; every caller checks it first.
+  fn codeUnitAt(self: &Self, position: usize) -> u32
+}
+
+struct Narrow { bytes: ?[*]const u8 }
+struct Wide { words: ?[*]const u16 }
+
+impl Units for Narrow {
+  fn holdsWords(self: &Self) -> bool with Intrinsic.inlineAlways() { return false }
+  fn codeUnitAt(self: &Self, position: usize) -> u32 with Intrinsic.inlineAlways() {
+    unsafe { return u8.toU32(Pointer.read<u8>(Pointer.at<u8>(Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(self.bytes), position))) }
+  }
+}
+
+impl Units for Wide {
+  fn holdsWords(self: &Self) -> bool with Intrinsic.inlineAlways() { return true }
+  fn codeUnitAt(self: &Self, position: usize) -> u32 with Intrinsic.inlineAlways() {
+    unsafe { return u16.toU32(Pointer.read<u16>(Pointer.at<u16>(Intrinsic.pointerRequalify<?[*]const u16, [*]const u16>(self.words), position))) }
+  }
+}
+
+struct ExecInput<U> {
+  units: U,
   unicode: bool,
   length: usize
 }
@@ -42,37 +65,32 @@ struct Character {
 fn isHighSurrogate(code: u32) -> bool { return code >= 0xd800 && code <= 0xdbff }
 fn isLowSurrogate(code: u32) -> bool { return code >= 0xdc00 && code <= 0xdfff }
 
-impl<'input> ExecInput<'input> {
-  fn unit(self: &Self, position: usize) -> u32 {
-    if self.wide { return u16.toU32(self.words[position]) }
-    return u8.toU32(self.bytes[position])
-  }
+fn unitAt<U: Units>(input: &ExecInput<U>, position: usize) -> u32 with Intrinsic.inlineAlways() { return input.units.codeUnitAt(position) }
 
-  fn forward(self: &Self, position: usize, end: usize) -> Character with Intrinsic.inlineAlways() {
-    let mut code = ExecInput.unit(self, position)
-    let mut next = position + 1
-    if self.wide && self.unicode && isHighSurrogate(code) && next < end {
-      let low = ExecInput.unit(self, next)
-      if isLowSurrogate(low) {
-        code = 0x10000 + (code - 0xd800) * 1024 + low - 0xdc00
-        next = next + 1
-      }
+fn stepForward<U: Units>(input: &ExecInput<U>, position: usize, end: usize) -> Character with Intrinsic.inlineAlways() {
+  let mut code = unitAt(input, position)
+  let mut next = position + 1
+  if input.units.holdsWords() && input.unicode && isHighSurrogate(code) && next < end {
+    let low = unitAt(input, next)
+    if isLowSurrogate(low) {
+      code = 0x10000 + (code - 0xd800) * 1024 + low - 0xdc00
+      next = next + 1
     }
-    return Character { code: code, position: next }
   }
+  return Character { code: code, position: next }
+}
 
-  fn backward(self: &Self, position: usize, start: usize) -> Character {
-    let mut next = position - 1
-    let mut code = ExecInput.unit(self, next)
-    if self.wide && self.unicode && isLowSurrogate(code) && next > start {
-      let high = ExecInput.unit(self, next - 1)
-      if isHighSurrogate(high) {
-        code = 0x10000 + (high - 0xd800) * 1024 + code - 0xdc00
-        next = next - 1
-      }
+fn stepBackward<U: Units>(input: &ExecInput<U>, position: usize, start: usize) -> Character {
+  let mut next = position - 1
+  let mut code = unitAt(input, next)
+  if input.units.holdsWords() && input.unicode && isLowSurrogate(code) && next > start {
+    let high = unitAt(input, next - 1)
+    if isHighSurrogate(high) {
+      code = 0x10000 + (high - 0xd800) * 1024 + code - 0xdc00
+      next = next - 1
     }
-    return Character { code: code, position: next }
   }
+  return Character { code: code, position: next }
 }
 
 // The first 32 words stay on the native stack, as in libregexp.c. `words` points
@@ -109,12 +127,13 @@ impl UndoStack {
     unsafe { Pointer.write<i64>(Pointer.atMut<i64>(slots(self.words), index), value) }
   }
 
-  effect fn push(self: &mut Self, value: i64) -> ()
+  // Makes room for `count` (at most 32) more words and returns the current
+  // length, where the caller writes them before advancing `length`.
+  effect fn reserve(self: &mut Self, count: usize) -> usize
     ! OutOfMemoryError ? &mut Allocator with Intrinsic.inlineAlways() {
-    let index = self.length
-    if index == self.capacity { run UndoStack.grow(&mut self) }
-    unsafe { Pointer.write<i64>(Pointer.atMut<i64>(slots(self.words), index), value) }
-    self.length = index + 1
+    let at = self.length
+    if self.capacity - at < count { run UndoStack.grow(&mut self) }
+    return at
   }
 
   // Doubles the buffer. The heap copy keeps its high-water mark, so a log that
@@ -219,19 +238,24 @@ impl Machine {
     }
     if !saved {
       let previous = Registers.get(&self.values, index)
-      run UndoStack.push(&mut self.stack, usize.toI64(index))
-      run UndoStack.push(&mut self.stack, previous)
+      let at = run UndoStack.reserve(&mut self.stack, 2)
+      UndoStack.set(&mut self.stack, at, usize.wrappingToI64(index))
+      UndoStack.set(&mut self.stack, at + 1, previous)
+      self.stack.length = at + 2
     }
     Registers.set(&mut self.values, index, value)
   }
 
   effect fn pushFrame(self: &mut Self, pc: usize, position: usize, kind: i64) -> ()
     ! OutOfMemoryError ? &mut Allocator with Intrinsic.inlineAlways() {
-    let link = usize.toI64(self.base) * 4 + kind
-    run UndoStack.push(&mut self.stack, usize.toI64(pc))
-    run UndoStack.push(&mut self.stack, usize.toI64(position))
-    run UndoStack.push(&mut self.stack, link)
-    self.base = self.stack.length
+    // The log holds fewer than 2^61 words, so the link cannot overflow.
+    let link = usize.wrappingToI64(usize.shiftLeft(self.base, 2)) + kind
+    let at = run UndoStack.reserve(&mut self.stack, 3)
+    UndoStack.set(&mut self.stack, at, usize.wrappingToI64(pc))
+    UndoStack.set(&mut self.stack, at + 1, usize.wrappingToI64(position))
+    UndoStack.set(&mut self.stack, at + 2, link)
+    self.stack.length = at + 3
+    self.base = at + 3
   }
 
   fn undo(self: &mut Self) -> () with Intrinsic.inlineAlways() {
@@ -367,35 +391,35 @@ struct Advance {
   failed: bool
 }
 
-fn consume<'input>(input: &ExecInput<'input>, position: usize, fold: bool) -> Character with Intrinsic.inlineAlways() {
-  let character = ExecInput.forward(input, position, input.length)
+fn consume<U: Units>(input: &ExecInput<U>, position: usize, fold: bool) -> Character with Intrinsic.inlineAlways() {
+  let character = stepForward(input, position, input.length)
   if fold { return Character { code: UnicodeCase.canonicalize(character.code, input.unicode), position: character.position } }
   return move character
 }
 
-fn literal<'input>(input: &ExecInput<'input>, position: usize, value: u32, fold: bool) -> Advance with Intrinsic.inlineAlways() {
+fn literal<U: Units>(input: &ExecInput<U>, position: usize, value: u32, fold: bool) -> Advance with Intrinsic.inlineAlways() {
   if position >= input.length { return Advance { position: position, failed: true } }
   let character = consume(input, position, fold)
   return Advance { position: character.position, failed: value != character.code }
 }
 
-fn classRange<'input>(bytecode: &[u8], pc: usize, count: usize, input: &ExecInput<'input>, position: usize,
+fn classRange<U: Units>(bytecode: &[u8], pc: usize, count: usize, input: &ExecInput<U>, position: usize,
   wide: bool, fold: bool) -> Advance with Intrinsic.inlineAlways() {
   if position >= input.length { return Advance { position: position, failed: true } }
   let character = consume(input, position, fold)
   return Advance { position: character.position, failed: !rangeContains(bytecode, pc, count, character.code, wide) }
 }
 
-fn atWordBoundary<'input>(input: &ExecInput<'input>, position: usize, ignoreCase: bool) -> bool with Intrinsic.inlineAlways() {
+fn atWordBoundary<U: Units>(input: &ExecInput<U>, position: usize, ignoreCase: bool) -> bool with Intrinsic.inlineAlways() {
   let mut before = false
   let mut after = false
-  if position != 0 { before = isWord(ExecInput.backward(input, position, 0).code, ignoreCase) }
-  if position < input.length { after = isWord(ExecInput.forward(input, position, input.length).code, ignoreCase) }
+  if position != 0 { before = isWord(stepBackward(input, position, 0).code, ignoreCase) }
+  if position < input.length { after = isWord(stepForward(input, position, input.length).code, ignoreCase) }
   return before != after
 }
 
-fn backReference<'input>(bytecode: &[u8], candidates: usize, count: usize, registers: &Registers, captureCount: usize,
-  input: &ExecInput<'input>, start: usize, backward: bool, ignoreCase: bool) -> Advance {
+fn backReference<U: Units>(bytecode: &[u8], candidates: usize, count: usize, registers: &Registers, captureCount: usize,
+  input: &ExecInput<U>, start: usize, backward: bool, ignoreCase: bool) -> Advance {
   let mut position = start
   let mut candidate: usize = 0
   while candidate < count {
@@ -415,15 +439,15 @@ fn backReference<'input>(bytecode: &[u8], candidates: usize, count: usize, regis
         let mut first: u32 = 0
         let mut second: u32 = 0
         if backward {
-          let a = ExecInput.backward(input, cursor, captureStart)
-          let b = ExecInput.backward(input, position, 0)
+          let a = stepBackward(input, cursor, captureStart)
+          let b = stepBackward(input, position, 0)
           cursor = a.position
           position = b.position
           first = a.code
           second = b.code
         } else {
-          let a = ExecInput.forward(input, cursor, captureEnd)
-          let b = ExecInput.forward(input, position, input.length)
+          let a = stepForward(input, cursor, captureEnd)
+          let b = stepForward(input, position, input.length)
           cursor = a.position
           position = b.position
           first = a.code
@@ -478,7 +502,7 @@ impl RegExpExecutor {
     mut interrupted: for<use 'call> mut fn<'env>() -> once Effect<'call & 'env; bool ? &mut Allocator>) -> RegExpMatch
     ! OutOfMemoryError | RegExpTimeout ? &mut Allocator {
     let flags = u16.toU32(readU16(bytecode, regexp_opcodes.RE_HEADER_FLAGS))
-    let view = ExecInput { bytes: input, words: &[], wide: false,
+    let view = ExecInput<Narrow> { units: Narrow { bytes: Pointer.fromSlice<u8>(input) },
       unicode: (flags & (FLAG_UNICODE | FLAG_UNICODE_SETS)) != 0, length: input.length }
     return run execute(bytecode, &view, start, move interrupted)
   }
@@ -488,13 +512,13 @@ impl RegExpExecutor {
     mut interrupted: for<use 'call> mut fn<'env>() -> once Effect<'call & 'env; bool ? &mut Allocator>) -> RegExpMatch
     ! OutOfMemoryError | RegExpTimeout ? &mut Allocator {
     let flags = u16.toU32(readU16(bytecode, regexp_opcodes.RE_HEADER_FLAGS))
-    let view = ExecInput { bytes: b"", words: input, wide: true,
+    let view = ExecInput<Wide> { units: Wide { words: Pointer.fromSlice<u16>(input) },
       unicode: (flags & (FLAG_UNICODE | FLAG_UNICODE_SETS)) != 0, length: input.length }
     return run execute(bytecode, &view, start, move interrupted)
   }
 }
 
-effect fn execute<'input, 'env>(bytecode: &[u8], input: &ExecInput<'input>, start: usize,
+effect fn execute<U: Units, 'env>(bytecode: &[u8], input: &ExecInput<U>, start: usize,
   mut interrupted: for<use 'call> mut fn<'env>() -> once Effect<'call & 'env; bool ? &mut Allocator>) -> RegExpMatch
   ! OutOfMemoryError | RegExpTimeout ? &mut Allocator {
   let captureCount = u8.toUsize(bytecode[regexp_opcodes.RE_HEADER_CAPTURE_COUNT])
@@ -505,8 +529,8 @@ effect fn execute<'input, 'env>(bytecode: &[u8], input: &ExecInput<'input>, star
   let mut pc = regexp_opcodes.RE_HEADER_LEN
   let mut position = start
   let mut interruptCounter = INTERRUPT_COUNTER_INIT
-  if input.wide && input.unicode && position > 0 && position < input.length {
-    if isLowSurrogate(ExecInput.unit(input, position)) && isHighSurrogate(ExecInput.unit(input, position - 1)) {
+  if input.units.holdsWords() && input.unicode && position > 0 && position < input.length {
+    if isLowSurrogate(unitAt(input, position)) && isHighSurrogate(unitAt(input, position - 1)) {
       position = position - 1
     }
   }
@@ -575,28 +599,28 @@ effect fn execute<'input, 'env>(bytecode: &[u8], input: &ExecInput<'input>, star
       }
       9 => { failed = position != 0 } // REOP_line_start
       10 => { // REOP_line_start_m
-        if position != 0 { failed = !isLineTerminator(ExecInput.backward(input, position, 0).code) }
+        if position != 0 { failed = !isLineTerminator(stepBackward(input, position, 0).code) }
       }
       11 => { failed = position != input.length } // REOP_line_end
       12 => { // REOP_line_end_m
-        if position != input.length { failed = !isLineTerminator(ExecInput.forward(input, position, input.length).code) }
+        if position != input.length { failed = !isLineTerminator(stepForward(input, position, input.length).code) }
       }
       5 => { // REOP_dot
         if position == input.length { failed = true }
         else {
-          let character = ExecInput.forward(input, position, input.length)
+          let character = stepForward(input, position, input.length)
           position = character.position
           failed = isLineTerminator(character.code)
         }
       }
       6 => { // REOP_any
         if position == input.length { failed = true }
-        else { position = ExecInput.forward(input, position, input.length).position }
+        else { position = stepForward(input, position, input.length).position }
       }
       7 => { // REOP_space
         if position == input.length { failed = true }
         else {
-          let character = ExecInput.forward(input, position, input.length)
+          let character = stepForward(input, position, input.length)
           position = character.position
           failed = !UnicodeCase.isSpace(character.code)
         }
@@ -604,7 +628,7 @@ effect fn execute<'input, 'env>(bytecode: &[u8], input: &ExecInput<'input>, star
       8 => { // REOP_not_space
         if position == input.length { failed = true }
         else {
-          let character = ExecInput.forward(input, position, input.length)
+          let character = stepForward(input, position, input.length)
           position = character.position
           failed = UnicodeCase.isSpace(character.code)
         }
@@ -717,7 +741,7 @@ effect fn execute<'input, 'env>(bytecode: &[u8], input: &ExecInput<'input>, star
       }
       44 => { // REOP_prev
         if position == 0 { failed = true }
-        else { position = ExecInput.backward(input, position, 0).position }
+        else { position = stepBackward(input, position, 0).position }
       }
       // REOP_invalid and unknown bytes violate the compiler-bytecode precondition.
       _ => { Intrinsic.trap("QuickJS invariant violated") }
