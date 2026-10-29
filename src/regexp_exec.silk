@@ -75,71 +75,99 @@ impl<'input> ExecInput<'input> {
   }
 }
 
-// The first 32 words stay on the native stack, as in libregexp.c. Spill storage
-// retains its high-water mark so backtracking never reallocates already-used slots.
+// The first 32 words stay on the native stack, as in libregexp.c. `words` points
+// at the inline array until the log outgrows it, then at the heap buffer, so a
+// read or write is one unchecked access. Machine.bind sets it once the machine is
+// in its final place: moving a bound machine would leave it pointing at the old copy.
 struct UndoStack {
+  words: ?*mut i64,
+  capacity: usize,
+  length: usize,
   inlineWords: [i64; 32],
-  spill: List<i64>,
-  length: usize
+  heap: List<i64>
+}
+
+fn slots(words: ?*mut i64) -> [*]mut i64 with Intrinsic.inlineAlways() {
+  unsafe { return Pointer.assumeManyMut<i64>(Intrinsic.pointerRequalify<?*mut i64, *mut i64>(words)) }
 }
 
 impl UndoStack {
   fn make() -> Self {
-    return UndoStack { inlineWords: [0; 32], spill: List<i64>.make(), length: 0 }
+    return UndoStack { words: Pointer.null<i64>(), capacity: 32, length: 0, inlineWords: [0; 32], heap: List<i64>.make() }
   }
 
+  fn bind(self: &mut Self) -> () {
+    self.words = Pointer.fromMutRef<i64>(&mut self.inlineWords[0])
+  }
+
+  // Callers keep `index` below `length`, which never exceeds `capacity`.
   fn get(self: &Self, index: usize) -> i64 with Intrinsic.inlineAlways() {
-    if index < 32 { return self.inlineWords[index] }
-    return List<i64>.get(&self.spill, index - 32)
+    unsafe { return Pointer.read<i64>(Pointer.atMut<i64>(slots(self.words), index)) }
   }
 
   fn set(self: &mut Self, index: usize, value: i64) -> () with Intrinsic.inlineAlways() {
-    if index < 32 { self.inlineWords[index] = value }
-    else { List<i64>.set(&mut self.spill, index - 32, value) }
+    unsafe { Pointer.write<i64>(Pointer.atMut<i64>(slots(self.words), index), value) }
   }
 
   effect fn push(self: &mut Self, value: i64) -> ()
     ! OutOfMemoryError ? &mut Allocator with Intrinsic.inlineAlways() {
     let index = self.length
-    if index < 32 { self.inlineWords[index] = value }
-    else if index - 32 < List<i64>.length(&self.spill) {
-      List<i64>.set(&mut self.spill, index - 32, value)
-    } else {
-      run List<i64>.append(&mut self.spill, value)
-    }
+    if index == self.capacity { run UndoStack.grow(&mut self) }
+    unsafe { Pointer.write<i64>(Pointer.atMut<i64>(slots(self.words), index), value) }
     self.length = index + 1
+  }
+
+  // Doubles the buffer. The heap copy keeps its high-water mark, so a log that
+  // shrinks and grows again reuses it without reallocating.
+  effect fn grow(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator with Intrinsic.inlineNever() {
+    let capacity = self.capacity
+    if List<i64>.length(&self.heap) == 0 {
+      run List<i64>.reserveExact(&mut self.heap, capacity * 2)
+      let mut index: usize = 0
+      while index < capacity {
+        let value = self.inlineWords[index]
+        run List<i64>.append(&mut self.heap, value)
+        index = index + 1
+      }
+    }
+    let filled = List<i64>.length(&self.heap)
+    run List<i64>.appendRepeated(&mut self.heap, 0, capacity * 2 - filled)
+    self.capacity = List<i64>.length(&self.heap)
+    self.words = Pointer.fromMutRef<i64>(&mut List<i64>.asMutSlice(&mut self.heap)[0])
   }
 }
 
 // Capture and loop registers. Only the header's live count is reset per exec,
 // the first 32 inline: a full 765-word array cost a 6 KB fill on every exec.
+// `values` points at whichever storage holds them; Machine.bind sets it.
 struct Registers {
+  values: ?*mut i64,
   inlineValues: [i64; 32],
   spill: List<i64>
 }
 
 impl Registers {
   effect fn make(count: usize) -> Self ! OutOfMemoryError ? &mut Allocator {
-    let mut registers = Registers { inlineValues: [-1; 32], spill: List<i64>.make() }
+    let mut registers = Registers { values: Pointer.null<i64>(), inlineValues: [-1; 32], spill: List<i64>.make() }
     if count > 32 {
-      run List<i64>.reserveExact(&mut registers.spill, count - 32)
-      let mut index: usize = 32
-      while index < count {
-        run List<i64>.append(&mut registers.spill, -1)
-        index = index + 1
-      }
+      run List<i64>.reserveExact(&mut registers.spill, count)
+      run List<i64>.appendRepeated(&mut registers.spill, -1, count)
     }
     return move registers
   }
 
+  fn bind(self: &mut Self) -> () {
+    if List<i64>.length(&self.spill) == 0 { self.values = Pointer.fromMutRef<i64>(&mut self.inlineValues[0]) }
+    else { self.values = Pointer.fromMutRef<i64>(&mut List<i64>.asMutSlice(&mut self.spill)[0]) }
+  }
+
+  // Register indices come from validated bytecode and stay below the live count.
   fn get(self: &Self, index: usize) -> i64 with Intrinsic.inlineAlways() {
-    if index < 32 { return self.inlineValues[index] }
-    return List<i64>.get(&self.spill, index - 32)
+    unsafe { return Pointer.read<i64>(Pointer.atMut<i64>(slots(self.values), index)) }
   }
 
   fn set(self: &mut Self, index: usize, value: i64) -> () with Intrinsic.inlineAlways() {
-    if index < 32 { self.inlineValues[index] = value }
-    else { List<i64>.set(&mut self.spill, index - 32, value) }
+    unsafe { Pointer.write<i64>(Pointer.atMut<i64>(slots(self.values), index), value) }
   }
 }
 
@@ -167,6 +195,13 @@ impl Machine {
   effect fn make(registerCount: usize) -> Self ! OutOfMemoryError ? &mut Allocator {
     let values = run Registers.make(registerCount)
     return Machine { values: move values, stack: UndoStack.make(), base: 0 }
+  }
+
+  // Points the register file and undo log at their storage. Run it after the
+  // machine reaches its final place and never move the machine afterwards.
+  fn bind(self: &mut Self) -> () {
+    Registers.bind(&mut self.values)
+    UndoStack.bind(&mut self.stack)
   }
 
   effect fn save(self: &mut Self, index: usize, value: i64, check: bool) -> ()
@@ -202,7 +237,7 @@ impl Machine {
   fn undo(self: &mut Self) -> () with Intrinsic.inlineAlways() {
     while self.stack.length > self.base {
       let top = self.stack.length
-      let index = i64.toUsize(UndoStack.get(&self.stack, top - 2))
+      let index = i64.wrappingToUsize(UndoStack.get(&self.stack, top - 2))
       Registers.set(&mut self.values, index, UndoStack.get(&self.stack, top - 1))
       self.stack.length = top - 2
     }
@@ -211,11 +246,13 @@ impl Machine {
   fn popFrame(self: &mut Self) -> Frame with Intrinsic.inlineAlways() {
     let top = self.base
     let link = UndoStack.get(&self.stack, top - 1)
-    let pc = i64.toUsize(UndoStack.get(&self.stack, top - 3))
-    let position = i64.toUsize(UndoStack.get(&self.stack, top - 2))
+    let pc = i64.wrappingToUsize(UndoStack.get(&self.stack, top - 3))
+    let position = i64.wrappingToUsize(UndoStack.get(&self.stack, top - 2))
     self.stack.length = top - 3
-    self.base = i64.toUsize(link / 4)
-    return Frame { pc: pc, position: position, kind: link % 4 }
+    // Links are base * 4 + kind with a nonnegative base.
+    let bits = i64.wrappingToUsize(link)
+    self.base = usize.shiftRight(bits, 2)
+    return Frame { pc: pc, position: position, kind: usize.wrappingToI64(usize.bitAnd(bits, 3)) }
   }
 
   fn backtrack(self: &mut Self) -> Resume {
@@ -249,7 +286,7 @@ impl Machine {
       let mut source = self.stack.length
       let mut target = source
       while source < top {
-        let next = i64.toUsize(UndoStack.get(&self.stack, source + 2))
+        let next = i64.wrappingToUsize(UndoStack.get(&self.stack, source + 2))
         source = source + 3
         while source < next {
           let value = UndoStack.get(&self.stack, source)
@@ -464,6 +501,7 @@ effect fn execute<'input, 'env>(bytecode: &[u8], input: &ExecInput<'input>, star
   let registerBase = captureCount * 2
   let liveRegisters = registerBase + u8.toUsize(bytecode[regexp_opcodes.RE_HEADER_REGISTER_COUNT])
   let mut machine = run Machine.make(liveRegisters)
+  Machine.bind(&mut machine)
   let mut pc = regexp_opcodes.RE_HEADER_LEN
   let mut position = start
   let mut interruptCounter = INTERRUPT_COUNTER_INIT
