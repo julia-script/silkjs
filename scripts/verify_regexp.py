@@ -185,19 +185,19 @@ int main(void) {
 '''
 
 SILK_SOURCE = r'''
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.effect { Effect }
-import silk.i32
-import silk.list { List }
-import silk.os_writer { StdoutWriter }
-import silk.result { Result }
-import silk.slice { Slice }
-import silk.u8
-import silk.u16
-import silk.u32
-import silk.u64
-import silk.usize
-import silk.writer { Writer, WriterError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.num.i32
+import silk.collections.list { List }
+import silk.io.writer_native { StdoutWriter }
+import silk.core.result { Result }
+import silk.collections.slice { Slice }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.io.writer { Writer, WriterError }
 import byte_buffer { readU16, readU32 }
 import regexp_compile { RegExpCompiler }
 import regexp_exec { RegExpExecutor }

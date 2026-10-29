@@ -81,17 +81,17 @@ unsigned count=word();put32(count);for(unsigned i=0;i<count;i++){DynBuf out;dbuf
 '''
 
 SILK_SOURCE = r'''
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.effect { Effect }
-import silk.pointer { Pointer }
-import silk.slice { Slice }
-import silk.os_writer { StdoutWriter }
-import silk.writer { Writer, WriterError }
-import silk.u32
-import silk.u8
-import silk.u16
-import silk.i32
-import silk.usize
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.mem.pointer { Pointer }
+import silk.collections.slice { Slice }
+import silk.io.writer_native { StdoutWriter }
+import silk.io.writer { Writer, WriterError }
+import silk.num.u32
+import silk.num.u8
+import silk.num.u16
+import silk.num.i32
+import silk.num.usize
 import byte_buffer { ByteBuffer, readU32 }
 import js_heap { HeapHeader, HeapCell }
 import js_core_types { RuntimeState, NativeFunctionId, WeakRefHeader }

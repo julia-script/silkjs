@@ -51,14 +51,14 @@ int main(void) {
 }
 '''
 SILK_SOURCE = r'''
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.effect { Effect }
-import silk.list { List }
-import silk.os_writer { StdoutWriter }
-import silk.writer { Writer, WriterError }
-import silk.u16
-import silk.u32
-import silk.usize
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.collections.list { List }
+import silk.io.writer_native { StdoutWriter }
+import silk.io.writer { Writer, WriterError }
+import silk.num.u16
+import silk.num.u32
+import silk.num.usize
 import byte_buffer { ByteBuffer, readU32 }
 import js_value { ValueBits }
 import js_strings { Strings }

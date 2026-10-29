@@ -94,15 +94,15 @@ def c_cases(units, pairs):
     return '\n'.join(lines)
 
 
-NATIVE = '''import silk.allocator { Allocator, OutOfMemoryError }
-import silk.effect { Effect }
+NATIVE = '''import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
 import silk.option { Option }
-import silk.list { List }
-import silk.usize
-import silk.i32
-import silk.u32
-import silk.writer { Writer, WriterError }
-import silk.os_writer { StdoutWriter }
+import silk.collections.list { List }
+import silk.num.usize
+import silk.num.i32
+import silk.num.u32
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StdoutWriter }
 import byte_buffer { ByteBuffer }
 import runtime_memory { RuntimeAllocator }
 import js_string_types { StringOwner, StringLengthError }

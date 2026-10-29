@@ -96,17 +96,17 @@ int main(void) {
 '''
 
 SILK_SOURCE = r'''
-import silk.effect { Effect }
-import silk.f64
-import silk.i32
-import silk.i64
-import silk.os_writer { StdoutWriter }
-import silk.slice { Slice }
-import silk.u8
-import silk.u32
-import silk.u64
-import silk.usize
-import silk.writer { Writer, WriterError }
+import silk.core.effect { Effect }
+import silk.num.f64
+import silk.num.i32
+import silk.num.i64
+import silk.io.writer_native { StdoutWriter }
+import silk.collections.slice { Slice }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.io.writer { Writer, WriterError }
 import byte_buffer { readU64 }
 import dtoa { Dtoa }
 

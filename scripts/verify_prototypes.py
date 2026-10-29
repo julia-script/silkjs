@@ -152,14 +152,14 @@ static void oom_witness(void) {
 int main(void) {CALLS oom_witness();return 0;}
 '''
 SILK_SOURCE = r'''
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.effect { Effect }
-import silk.i32
-import silk.pointer { Pointer }
-import silk.u32
-import silk.usize
-import silk.writer { Writer, WriterError }
-import silk.os_writer { StdoutWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.num.i32
+import silk.mem.pointer { Pointer }
+import silk.num.u32
+import silk.num.usize
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StdoutWriter }
 import byte_buffer { ByteBuffer }
 import runtime_memory { RuntimeAllocator, AllocationObserver }
 import js_heap { HeapCell, HeapHeader }

@@ -82,8 +82,8 @@ def build_plugin(output, compiler, stdlib, clang, env, *, variant="valid",
     (source / "entry.silk").write_text(
         'import js_libc_plugins_abi { Descriptor, Export }\n'
         f'import {module}\n'
-        'import silk.pointer { Pointer }\n'
-        'import silk.i32\n'
+        'import silk.mem.pointer { Pointer }\n'
+        'import silk.num.i32\n'
         + extra +
         f'export "C" fn entry(out: *mut Descriptor) -> i32 as "{symbol}" {{\n'
         f'  let initialize: extern "C" fn(*mut Descriptor) -> i32 = {module}.initialize\n'

@@ -365,10 +365,10 @@ static void dump(JSFunctionDef *fd) {
 SILK_HELPERS = r'''
 import js_compiler_variables as variables
 import js_compiler_types { CompilerErrorKind }
-import silk.result { Result }
-import silk.list { List }
+import silk.core.result { Result }
+import silk.collections.list { List }
 import silk.option { Option }
-import silk.u32
+import silk.num.u32
 import js_heap { HeapKind }
 import js_value { ValueBits }
 import js_core_types { ModuleDef, ModuleStatus, RequestedModule, ExportEntry, ExportBinding, ImportEntry, StarExportEntry, FunctionBytecode, FunctionKind, ByteStorage, ClosureVar, VarDef, FunctionDebugInfo }

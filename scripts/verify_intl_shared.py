@@ -310,15 +310,15 @@ int main(int argc,char **argv){
 
 
 def silk_source(calls, table_calls, helpers, allocations):
-    return '''import silk.allocator { Allocator, OutOfMemoryError }
-import silk.effect { Effect }
-import silk.bytes { Bytes }
-import silk.string { String }
+    return '''import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.collections.bytes { Bytes }
+import silk.text.string { String }
 import silk.option { Option }
-import silk.usize
-import silk.i32
-import silk.writer { Writer, WriterError }
-import silk.os_writer { StdoutWriter }
+import silk.num.usize
+import silk.num.i32
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StdoutWriter }
 import byte_buffer { ByteBuffer }
 import intl_shared as api
 import intl_locale_tag as tags

@@ -50,12 +50,12 @@ int main(void) {
 '''
 
 SILK_TABLES = r'''
-import silk.i32
-import silk.i64
-import silk.usize
-import silk.effect { Effect }
-import silk.os_writer { StdoutWriter }
-import silk.writer { Writer, WriterError }
+import silk.num.i32
+import silk.num.i64
+import silk.num.usize
+import silk.core.effect { Effect }
+import silk.io.writer_native { StdoutWriter }
+import silk.io.writer { Writer, WriterError }
 import temporal_timezone_data as data
 effect fn word(value: i64) -> () ! WriterError ? &mut Writer {
  let mut bytes:[u8;8]=[0;8] let mut i:usize=0

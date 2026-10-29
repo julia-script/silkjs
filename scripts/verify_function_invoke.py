@@ -131,12 +131,12 @@ int main(int argc,char **argv){
 }
 '''
 SILK_SOURCE = r'''
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.effect { Effect }
-import silk.result { Result }
-import silk.pointer { Pointer }
-import silk.writer { Writer, WriterError }
-import silk.os_writer { StdoutWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.mem.pointer { Pointer }
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StdoutWriter }
 import byte_buffer { ByteBuffer }
 import runtime_memory { RuntimeAllocator }
 import js_value { ValueBits }

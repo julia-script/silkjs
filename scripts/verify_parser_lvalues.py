@@ -21,8 +21,8 @@ static void dump(JSFunctionDef *fd) {
 }
 '''
 S_DUMP = r'''
-import silk.u8
-import silk.u32
+import silk.num.u8
+import silk.num.u32
 import js_core_types { VariableKind }
 import js_compiler_types { FunctionDef, CompilerError }
 import js_parser_lvalues { LValue, PutLValue }
