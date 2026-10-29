@@ -54,6 +54,7 @@ CASES = [
     Case('array-holes', '(()=>{let x=[,1,,];x.length=6;x.extra=9;return x})()', '__binary.length === 6 && (0 in __binary) && (5 in __binary) && __binary[0] === undefined && __binary.extra === undefined'),
     Case('array-sparse', '(()=>{let x=[];x[3]=42;Object.defineProperty(x,"1",{value:9,enumerable:false});return x})()', '__binary.length === 4 && __binary[1] === undefined && __binary[3] === 42'),
     Case('repeated-copy', '(()=>{let x={a:1};return [x,x]})()', '__binary[0] !== __binary[1] && __binary[0].a === 1'),
+    Case('nested-copy', '(()=>{let x={a:1};let y={p:x,q:[x,{r:x}]};return [y,y]})()', '__binary[0].q[1].r.a === 1 && __binary[1].p !== __binary[0].p && __binary[0].p !== __binary[0].q[0]'),
     Case('repeated-reference', '(()=>{let x={a:1};return [x,x]})()', '__binary[0] === __binary[1]', REFERENCE),
     Case('cycle', '(()=>{let x={n:42};x.self=x;x.array=[x,x];return x})()', '__binary.self === __binary && __binary.array[0] === __binary && __binary.array[1] === __binary', REFERENCE),
     Case('cycle-rejected', '(()=>{let x={};x.self=x;return x})()', reject=True),
