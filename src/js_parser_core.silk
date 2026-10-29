@@ -1,7 +1,7 @@
 // Shared parser cursor and diagnostics, quickjs.c:22567-22829,23177-23226.
 // Parser.make is the one unsafe entry: its caller grants the parser exclusive live access
-// to the function tree, context and runtime until it is dropped. The cells are private, so
-// grammar functions that take only a Parser and plain values are safe.
+// to the context and runtime until it is dropped. The parser borrows the function tree,
+// so grammar functions that take only a Parser and plain values are safe.
 // This owner never frees the transient function tree; the compile entry point does.
 import silk.allocator { Allocator, OutOfMemoryError }
 import silk.pointer { Pointer }
@@ -9,7 +9,7 @@ import silk.slice { Slice }
 import silk.u32
 import js_heap { HeapCell, HeapHeader }
 import js_core_types { RuntimeState, FunctionKind }
-import js_compiler_types { FunctionDef, ParseFunctionKind }
+import js_compiler_types { FunctionDef, FunctionId, FunctionTree, ParseFunctionKind }
 import js_lexer { Lexer, LexicalContext, LexerPosition, SkipParensResult }
 import js_tokens { Token, LexError }
 import js_bigint { BigIntError }
@@ -17,6 +17,9 @@ import js_string_types { StringOwner, StringLengthError }
 import js_parser_diagnostics { DiagnosticMessage, SyntaxError }
 import js_runtime { checkStackOverflow }
 import native_stack { currentFrameAddress }
+import silk.option { Option }
+import js_debug_positions { SourcePositionCache }
+import js_compiler_state as state
 
 pub const PF_IN_ACCEPTED: i32 = 1
 pub const PF_POSTFIX_CALL: i32 = 2
@@ -30,37 +33,42 @@ pub struct ParserCells<'a> { pub function: &'a mut FunctionDef, pub runtime: &'a
 pub struct Parser<'src> {
   pub lexer: Lexer<'src>,
   pub token: Token,
-  currentFunction: *mut HeapHeader,
+  tree: &'src mut FunctionTree,
+  currentFunction: FunctionId,
   context: *mut HeapHeader,
   runtime: *mut HeapHeader,
   pub filename: StringOwner
 }
 impl<'src> Parser<'src> {
-  pub unsafe effect fn make(source: &'src [u8], root: *mut HeapHeader, module: bool, allowHtmlComments: bool) -> Self
+  pub unsafe effect fn make(source: &'src [u8], tree: &'src mut FunctionTree, root: FunctionId, module: bool, allowHtmlComments: bool) -> Self
     ! OutOfMemoryError | StringLengthError ? &mut Allocator {
     let anchor = ()
-    let fd = unsafe HeapCell.payload<FunctionDef, ()>(&anchor, root)
+    let fd = tree.get(root)
     let rt = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, fd.runtime)
     let filename = StringOwner.adopt(run rt.atoms.toValue(fd.filename, true))
-    let mut context = LexicalContext.script()
-    context.module = module context.allowHtmlComments = allowHtmlComments
-    return Self { lexer: Lexer.make(source, context), token: Token.empty(32, 0, 0),
-      currentFunction: root, context: fd.context, runtime: fd.runtime, filename: move filename }
+    let context = fd.context let runtime = fd.runtime drop rt drop fd
+    let mut lexical = LexicalContext.script()
+    lexical.module = module lexical.allowHtmlComments = allowHtmlComments
+    return Self { lexer: Lexer.make(source, lexical), token: Token.empty(32, 0, 0), tree: &mut tree,
+      currentFunction: root, context: context, runtime: runtime, filename: move filename }
   }
-  pub fn functionCell(self: &Self) -> *mut HeapHeader { return self.currentFunction }
+  pub fn functionCell(self: &Self) -> FunctionId { return self.currentFunction }
   pub fn contextCell(self: &Self) -> *mut HeapHeader { return self.context }
   pub fn runtimeCell(self: &Self) -> *mut HeapHeader { return self.runtime }
-  /// Caller proves cell is a live FunctionDef of this parser's tree.
-  pub unsafe fn enterFunction(self: &mut Self, cell: *mut HeapHeader) -> () { self.currentFunction = cell }
-  /// make's caller grants the parser exclusive use of its function tree, context and
-  /// runtime; the cells are private so only enterFunction can retarget it. These borrows
-  /// are tied to the parser borrow, so no second alias can be taken while they live.
-  pub fn function(self: &mut Self) -> &mut FunctionDef {
-    let cell = self.currentFunction
-    return unsafe HeapCell.payloadMut<FunctionDef, Self>(&mut self, cell)
-  }
-  pub fn functionView(self: &Self) -> &FunctionDef {
-    return unsafe HeapCell.payload<FunctionDef, Self>(&self, self.currentFunction)
+  /// Makes `id`, a definition of this parser's tree, the function being parsed.
+  pub fn enterFunction(self: &mut Self, id: FunctionId) -> () { self.currentFunction = id }
+  /// The function being parsed. make's caller grants the parser exclusive use of the
+  /// context and runtime; these borrows are tied to the parser borrow, so no second
+  /// alias can be taken while they live.
+  pub fn function(self: &mut Self) -> &mut FunctionDef { return self.tree.getMut(self.currentFunction) }
+  pub fn functionView(self: &Self) -> &FunctionDef { return self.tree.get(self.currentFunction) }
+  /// Any definition of the parser's tree.
+  pub fn functionAt(self: &Self, id: FunctionId) -> &FunctionDef { return self.tree.get(id) }
+  pub fn functionAtMut(self: &mut Self, id: FunctionId) -> &mut FunctionDef { return self.tree.getMut(id) }
+  /// Adds a definition to the tree, linked as the last child of `parent`.
+  pub effect fn newFunction(self: &mut Self, parent: Option<FunctionId>, isEval: bool, isFuncExpr: bool, filename: u32,
+    sourcePosition: u32, cache: ?*mut SourcePositionCache) -> FunctionId ! OutOfMemoryError ? &mut Allocator {
+    return run unsafe state.newFunction(&mut self.tree, self.context, parent, isEval, isFuncExpr, filename, sourcePosition, cache)
   }
   pub fn runtimeState(self: &mut Self) -> &mut RuntimeState {
     let cell = self.runtime
@@ -68,29 +76,32 @@ impl<'src> Parser<'src> {
   }
   pub fn cells<'a>(self: &'a mut Self) -> ParserCells<'a> {
     let functionCell = self.currentFunction let runtimeCell = self.runtime
-    // Distinct cells: a FunctionDef and the RuntimeState never share storage. Two disjoint
-    // fields serve as anchors so both borrows last as long as the parser borrow.
-    return ParserCells { function: unsafe HeapCell.payloadMut<FunctionDef, Token>(&mut self.token, functionCell),
+    // The tree and the RuntimeState never share storage. The disjoint filename field
+    // anchors the runtime borrow so both last as long as the parser borrow.
+    return ParserCells { function: self.tree.getMut(functionCell),
+      runtime: unsafe HeapCell.payloadMut<RuntimeState, StringOwner>(&mut self.filename, runtimeCell) }
+  }
+  /// Disjoint borrows of the definition `id` and the runtime.
+  pub fn cellsAt<'a>(self: &'a mut Self, id: FunctionId) -> ParserCells<'a> {
+    let runtimeCell = self.runtime
+    return ParserCells { function: self.tree.getMut(id),
       runtime: unsafe HeapCell.payloadMut<RuntimeState, StringOwner>(&mut self.filename, runtimeCell) }
   }
   pub fn sourceBytes(self: &Self) -> &'src [u8] { return self.lexer.sourceBytes() }
   pub fn save(self: &Self) -> LexerPosition { return self.lexer.save(&self.token) }
   pub fn peek(self: &Self, noLineTerminator: bool) -> i32 { return self.lexer.peek(noLineTerminator) }
-  pub fn synchronize(self: &mut Self) -> () {
-    let anchor = ()
-    let current = unsafe HeapCell.payload<FunctionDef, ()>(&anchor, self.currentFunction)
-    self.lexer.context.strict = (current.jsMode & 1) != 0
-    drop current
-    let mut cell: ?*mut HeapHeader = self.currentFunction
+  pub fn synchronize(self: &mut Self) -> () with Intrinsic.inlineAlways() {
+    let mut id = self.currentFunction
+    let mut first = true
     let mut generator = false let mut asynchronous = false
-    while !Pointer.isNull<HeapHeader>(cell) {
-      let pointer = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(cell)
-      let fd = unsafe HeapCell.payload<FunctionDef, ()>(&anchor, pointer)
+    while true {
+      let fd = self.tree.get(id)
+      if first { self.lexer.context.strict = (fd.jsMode & 1) != 0 first = false }
       generator = generator || fd.functionKind == FunctionKind.Generator || fd.functionKind == FunctionKind.AsyncGenerator
       asynchronous = asynchronous || fd.functionKind == FunctionKind.Async || fd.functionKind == FunctionKind.AsyncGenerator
         || fd.functionType == ParseFunctionKind.ClassStaticInit
       if fd.functionType != ParseFunctionKind.Arrow || fd.inFunctionBody { break }
-      cell = fd.parent
+      id = match fd.parent { Option<FunctionId>.Some { value } => value _ => { break } }
     }
     self.lexer.context.generator = generator self.lexer.context.asyncFunction = asynchronous
   }
