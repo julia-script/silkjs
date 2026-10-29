@@ -31,31 +31,39 @@ impl Copy for RuntimeMemoryStats {}
 
 // Opt-in reuse of small blocks: with pooling enabled, a payload that fits a
 // 16-byte class comes from that class's list. Lists are refilled with one
-// ARENA_BYTES child allocation carved into blocks, and reclaimed blocks always
-// return to their list; the arena backing goes back to the child with the ledger.
-// Pooled blocks are not charged while idle and hold no ledger reference. Charges
-// stay exact; only the backing is rounded up. A pooled block's header sets
-// POOLABLE in chargedBytes (charges never reach 2^63) and links to the next idle
-// block through the first word of its payload.
+// ARENA_BYTES child allocation, aligned to its size and carved into blocks of one
+// class, and reclaimed blocks always return to their list; the arena backing goes
+// back to the child with the ledger. Pooled blocks are not charged while idle and
+// hold no ledger reference. A pooled allocation is charged its whole class.
 //
-// A pooled block is a BlockHeader followed by its payload; its arena owns the
-// backing. Any other block starts with an AllocationHeader that also owns the
-// backing. Each kind has its own reclaim callback.
-const POOLABLE: usize = 9223372036854775808
-const CHARGE_MASK: usize = 9223372036854775807
+// A pooled block is only its payload: no per-block header. Its arena's header,
+// found by masking the block address down to ARENA_BYTES, records the ledger and
+// the class. An idle block links to the next through its first word. Any other
+// block starts with an AllocationHeader that owns the backing. Each kind has its
+// own reclaim callback.
 const ARENA_BYTES: usize = 16384
+// One child allocation serves this many arenas. A group's unused tail is never
+// touched, so it costs address space but no resident memory.
+const GROUP_ARENAS: usize = 64
 const POOL_CLASSES: usize = 32
 const POOL_GRANULE: usize = 16
 struct Pool {
   enabled: bool,
-  heads: [?*mut BlockHeader; 32],
+  heads: [?*mut u8; 32],
   counts: [usize; 32],
-  arenas: ?*mut ArenaHeader
+  arenas: ?*mut ArenaHeader,
+  // The next uncarved arena of the newest group, and how many follow it.
+  spare: ?*mut u8,
+  spareCount: usize
 }
 
-// The first record of an arena allocation; storage owns the whole arena.
+// The first record of every arena. Every block in the arena belongs to ledger and
+// has class's size. Arenas come from the child GROUP_ARENAS at a time; only a
+// group's first arena owns the group's storage and sits on the pool's list.
 struct ArenaHeader {
-  storage: Intrinsic.RawBuffer<u8>,
+  ledger: *mut Ledger,
+  class: usize,
+  storage: Option<Intrinsic.RawBuffer<u8>>,
   next: ?*mut ArenaHeader
 }
 
@@ -100,22 +108,24 @@ unsafe fn pointersOf(allocation: *mut Ledger) -> LedgerPointers with Intrinsic.i
 }
 
 // The ledger is kept as one pointer; reclaim rebuilds its field addresses.
-// Allocations adopt the header's address as their reclaim context.
+// Unpooled allocations adopt their AllocationHeader's address as reclaim context.
 struct BlockHeader {
   ledger: *mut Ledger,
   chargedBytes: usize
 }
 
-// Pooled payloads all start right after their BlockHeader.
-fn poolClass(chargedBytes: usize) -> usize {
-  return (chargedBytes - Layout.of<BlockHeader>().bytes - 1) / POOL_GRANULE
+// The bytes of one block of class.
+fn classBytes(class: usize) -> usize with Intrinsic.inlineAlways() { return (class + 1) * POOL_GRANULE }
+unsafe fn poolLink(block: *mut u8) -> *mut ?*mut u8 with Intrinsic.inlineAlways() {
+  return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ?*mut u8>(block)
 }
-unsafe fn payloadOf(block: *mut BlockHeader) -> *mut u8 with Intrinsic.inlineAlways() {
-  let base = unsafe Intrinsic.pointerReinterpret<*mut BlockHeader, *mut u8>(block)
-  return unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(base), Layout.of<BlockHeader>().bytes)
-}
-unsafe fn poolLink(block: *mut BlockHeader) -> *mut ?*mut BlockHeader with Intrinsic.inlineAlways() {
-  return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ?*mut BlockHeader>(unsafe payloadOf(block))
+// The header of the arena that holds a pooled block. Arenas are aligned to their
+// size, so the header sits at the block's address rounded down to ARENA_BYTES. The
+// step back is a wrapped (negative) index that stays inside the arena allocation.
+unsafe fn arenaOf(block: *mut u8) -> *mut ArenaHeader with Intrinsic.inlineAlways() {
+  let offset = usize.bitAnd(Pointer.address<u8>(block), ARENA_BYTES - 1)
+  let start = unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(block), usize.wrappingSubtract(0, offset))
+  return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ArenaHeader>(start)
 }
 // An unpooled block starts with the RawBuffer owning its backing and keeps the
 // payload at the first suitably aligned offset after this header.
@@ -170,7 +180,7 @@ impl<A> RuntimeAllocator<A> {
       references: 1,
       gate: 0,
       stats: RuntimeMemoryStats { usedBytes: 0, peakBytes: 0, allocationCount: 0, limit: usize.MAX },
-      pool: Pool { enabled: false, heads: [Pointer.null<BlockHeader>(); 32], counts: [0; 32], arenas: Pointer.null<ArenaHeader>() }
+      pool: Pool { enabled: false, heads: [Pointer.null<u8>(); 32], counts: [0; 32], arenas: Pointer.null<ArenaHeader>(), spare: Pointer.null<u8>(), spareCount: 0 }
     })
     let mut anchor = ()
     let fresh = unsafe Pointer.borrowMut(&mut anchor, address)
@@ -231,20 +241,18 @@ impl<A> RuntimeAllocator<A> {
 impl<A> Allocator for RuntimeAllocator<A>
 where &mut A provides &Allocator from &mut Allocator {
   effect fn allocate(self: &mut Self, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
-    // Pooled fast path. With a power-of-two alignment at most the block header's,
-    // the payload offset is exactly the header size, so the class needs no rounding.
-    let block = Layout.of<BlockHeader>()
+    // Pooled fast path. Blocks start at a multiple of the granule within their
+    // aligned arena, so any power-of-two alignment up to the granule is met.
     let requested = layout.bytes
     let requestedAlignment = layout.alignment
     if self.pooling && requested != 0 && requested <= POOL_CLASSES * POOL_GRANULE && requestedAlignment != 0
-      && requestedAlignment <= block.alignment && usize.bitAnd(requestedAlignment, requestedAlignment - 1) == 0 {
+      && requestedAlignment <= POOL_GRANULE && usize.bitAnd(requestedAlignment, requestedAlignment - 1) == 0 {
       let ledger = self.ledger
       if unsafe Atomic.load<usize>(ledger.references, MemoryOrder.Relaxed) != usize.MAX {
         let class = (requested - 1) / POOL_GRANULE
-        let recorded = (block.bytes + requested) | POOLABLE
-        match Pointer.nonNullMut<BlockHeader>(unsafe takePooled(ledger, class, recorded)) {
-          Option<*mut BlockHeader>.Some { value: owner } => { return unsafe adoptPooled(ledger, owner, move layout) }
-          Option<*mut BlockHeader>.None => { return run refill<A>(&mut self, move layout, class, recorded) }
+        match Pointer.nonNullMut<u8>(unsafe takePooled(ledger, class)) {
+          Option<*mut u8>.Some { value: block } => { return unsafe adoptPooled(ledger, block, move layout) }
+          Option<*mut u8>.None => { return run refill<A>(&mut self, move layout, class) }
         }
       }
     }
@@ -252,63 +260,100 @@ where &mut A provides &Allocator from &mut Allocator {
   }
 }
 
-unsafe fn adoptPooled(ledger: LedgerPointers, owner: *mut BlockHeader, layout: Layout) -> Intrinsic.Allocation
+unsafe fn adoptPooled(ledger: LedgerPointers, block: *mut u8, layout: Layout) -> Intrinsic.Allocation
   with Intrinsic.inlineAlways() {
   let retained = unsafe Atomic.fetchAdd<usize>(ledger.references, 1, MemoryOrder.Relaxed)
   let reclaim: extern "C" fn(?*mut u8) -> () = silkRuntimeMemoryReclaimPooled
-  let context = unsafe Intrinsic.pointerReinterpret<*mut BlockHeader, *mut u8>(owner)
-  return unsafe Intrinsic.allocationAdopt(unsafe payloadOf(owner), move layout, reclaim, context)
+  return unsafe Intrinsic.allocationAdopt(block, move layout, reclaim, block)
+}
+
+// Returns an uncarved arena with its header written for class: the next spare
+// arena of the newest group, or the first arena of a new group.
+effect fn takeArena<A>(self: &mut RuntimeAllocator<A>, class: usize) -> *mut u8
+  ! OutOfMemoryError where &mut A provides &Allocator from &mut Allocator with Intrinsic.inlineNever() {
+  let ledger = self.ledger
+  let mut spare = Pointer.null<u8>()
+  unsafe {
+    lockLedger(ledger)
+    let mut poolAnchor = ()
+    let pool = Pointer.borrowMut<(), Pool>(&mut poolAnchor, poolOf(ledger))
+    if pool.spareCount > 0 {
+      spare = pool.spare
+      pool.spareCount = pool.spareCount - 1
+      let next = Pointer.atMut<u8>(Pointer.assumeManyMut<u8>(Intrinsic.pointerRequalify<?*mut u8, *mut u8>(spare)), ARENA_BYTES)
+      pool.spare = Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(next)
+    }
+    drop pool
+    unlockLedger(ledger)
+  }
+  match Pointer.nonNullMut<u8>(spare) {
+    Option<*mut u8>.Some { value: arena } => {
+      unsafe Pointer.put<ArenaHeader>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ArenaHeader>(arena), ArenaHeader { ledger: ledger.allocation, class: class, storage: Option<Intrinsic.RawBuffer<u8>>.none(), next: Pointer.null<ArenaHeader>() })
+      return arena
+    }
+    Option<*mut u8>.None => {}
+  }
+  let groupBytes = ARENA_BYTES * GROUP_ARENAS
+  // Aligned to the arena size, so arenaOf finds the header from any block address.
+  let groupAllocation = run Allocator.allocate(Layout { bytes: groupBytes, alignment: ARENA_BYTES })
+    |> Effect.provideMut<Allocator>(&mut self.child)
+  let mut groupStorage = unsafe RawBuffer.from<u8>(move groupAllocation, groupBytes)
+  let groupBase = Slot.address(RawBuffer.slot<u8>(&mut groupStorage, 0))
+  if usize.bitAnd(Pointer.address<u8>(groupBase), ARENA_BYTES - 1) != 0 { Intrinsic.trap("pool arena is not aligned to its size") }
+  let owner = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ArenaHeader>(groupBase)
+  let second = unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(groupBase), ARENA_BYTES)
+  unsafe {
+    lockLedger(ledger)
+    let mut poolAnchor = ()
+    let pool = Pointer.borrowMut<(), Pool>(&mut poolAnchor, poolOf(ledger))
+    Pointer.put<ArenaHeader>(owner, ArenaHeader { ledger: ledger.allocation, class: class, storage: Option<Intrinsic.RawBuffer<u8>>.some(move groupStorage), next: pool.arenas })
+    pool.arenas = Intrinsic.pointerRequalify<*mut ArenaHeader, ?*mut ArenaHeader>(owner)
+    // A racing refill's leftover spares stay owned by its group, unused.
+    pool.spare = Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(second)
+    pool.spareCount = GROUP_ARENAS - 1
+    drop pool
+    unlockLedger(ledger)
+  }
+  return groupBase
 }
 
 // Carves one arena into blocks of an empty class, then takes the first of them.
-effect fn refill<A>(self: &mut RuntimeAllocator<A>, layout: Layout, class: usize, recorded: usize) -> Intrinsic.Allocation
+effect fn refill<A>(self: &mut RuntimeAllocator<A>, layout: Layout, class: usize) -> Intrinsic.Allocation
   ! OutOfMemoryError where &mut A provides &Allocator from &mut Allocator with Intrinsic.inlineNever() {
   let ledger = self.ledger
   let before = self.stats()
-  let chargedBytes = recorded & CHARGE_MASK
-  if before.usedBytes > before.limit || chargedBytes > before.limit - before.usedBytes { return run Allocator.outOfMemory() }
-  let block = Layout.of<BlockHeader>()
-  let blockBytes = block.bytes + (class + 1) * POOL_GRANULE
+  let blockBytes = classBytes(class)
+  if before.usedBytes > before.limit || blockBytes > before.limit - before.usedBytes { return run Allocator.outOfMemory() }
   let arenaHeader = Layout.of<ArenaHeader>()
-  let first = (arenaHeader.bytes + block.alignment - 1) / block.alignment * block.alignment
+  let first = (arenaHeader.bytes + POOL_GRANULE - 1) / POOL_GRANULE * POOL_GRANULE
   let count = (ARENA_BYTES - first) / blockBytes
-  let arenaBytes = first + count * blockBytes
-  let mut arenaAlignment = block.alignment
-  if arenaAlignment < arenaHeader.alignment { arenaAlignment = arenaHeader.alignment }
-  let arenaAllocation = run Allocator.allocate(Layout { bytes: arenaBytes, alignment: arenaAlignment })
-    |> Effect.provideMut<Allocator>(&mut self.child)
-  let mut arenaStorage = unsafe RawBuffer.from<u8>(move arenaAllocation, arenaBytes)
-  let arenaBase = Slot.address(RawBuffer.slot<u8>(&mut arenaStorage, 0))
-  let arenaOwner = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ArenaHeader>(arenaBase)
+  let arenaBase = run takeArena<A>(&mut self, class)
   let blocks = unsafe Pointer.assumeManyMut<u8>(arenaBase)
   // Link the blocks among themselves first, outside the gate.
-  let mut head = Pointer.null<BlockHeader>()
+  let mut head = Pointer.null<u8>()
   let mut index = count
   while index > 0 {
     index = index - 1
-    let owner = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut BlockHeader>(unsafe Pointer.atMut<u8>(blocks, first + index * blockBytes))
-    unsafe Pointer.put<BlockHeader>(owner, BlockHeader { ledger: ledger.allocation, chargedBytes: POOLABLE | blockBytes })
-    unsafe Pointer.write<?*mut BlockHeader>(unsafe poolLink(owner), head)
-    head = unsafe Intrinsic.pointerRequalify<*mut BlockHeader, ?*mut BlockHeader>(owner)
+    let block = unsafe Pointer.atMut<u8>(blocks, first + index * blockBytes)
+    unsafe Pointer.write<?*mut u8>(unsafe poolLink(block), head)
+    head = unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(block)
   }
   unsafe {
     lockLedger(ledger)
     let mut poolAnchor = ()
     let pool = Pointer.borrowMut<(), Pool>(&mut poolAnchor, poolOf(ledger))
-    Pointer.put<ArenaHeader>(arenaOwner, ArenaHeader { storage: move arenaStorage, next: pool.arenas })
-    pool.arenas = Intrinsic.pointerRequalify<*mut ArenaHeader, ?*mut ArenaHeader>(arenaOwner)
     // The last carved block links to the class's previous head (empty here).
-    let last = Intrinsic.pointerReinterpret<*mut u8, *mut BlockHeader>(Pointer.atMut<u8>(blocks, first + (count - 1) * blockBytes))
-    Pointer.write<?*mut BlockHeader>(poolLink(last), pool.heads[class])
+    let last = Pointer.atMut<u8>(blocks, first + (count - 1) * blockBytes)
+    Pointer.write<?*mut u8>(poolLink(last), pool.heads[class])
     pool.heads[class] = head
     pool.counts[class] = pool.counts[class] + count
     drop pool
     unlockLedger(ledger)
   }
-  match Pointer.nonNullMut<BlockHeader>(unsafe takePooled(ledger, class, recorded)) {
-    Option<*mut BlockHeader>.Some { value: owner } => { return unsafe adoptPooled(ledger, owner, move layout) }
+  match Pointer.nonNullMut<u8>(unsafe takePooled(ledger, class)) {
+    Option<*mut u8>.Some { value: block } => { return unsafe adoptPooled(ledger, block, move layout) }
     // Only a reclaim on another thread can change usage meanwhile, and it only lowers it.
-    Option<*mut BlockHeader>.None => { return run Allocator.outOfMemory() }
+    Option<*mut u8>.None => { return run Allocator.outOfMemory() }
   }
 }
 
@@ -390,28 +435,24 @@ unsafe fn unlockLedger(ledger: LedgerPointers) -> () with Intrinsic.inlineAlways
   return ()
 }
 
-// Pops a pooled block of class and charges it, or returns null. recorded is the
-// header's chargedBytes, including POOLABLE.
-unsafe fn takePooled(ledger: LedgerPointers, class: usize, recorded: usize) -> ?*mut BlockHeader with Intrinsic.inlineAlways() {
-  let chargedBytes = recorded & CHARGE_MASK
+// Pops a pooled block of class and charges its whole class, or returns null.
+unsafe fn takePooled(ledger: LedgerPointers, class: usize) -> ?*mut u8 with Intrinsic.inlineAlways() {
+  let chargedBytes = classBytes(class)
   unsafe lockLedger(ledger)
   let mut anchor = ()
   let pool = unsafe Pointer.borrowMut<(), Pool>(&mut anchor, unsafe poolOf(ledger))
   let head = pool.heads[class]
   let mut state = unsafe Pointer.read<RuntimeMemoryStats>(ledger.stats)
   let fits = state.usedBytes <= state.limit && chargedBytes <= state.limit - state.usedBytes
-  if !fits || !pool.enabled || Pointer.isNull<BlockHeader>(head) {
+  if !fits || !pool.enabled || Pointer.isNull<u8>(head) {
     drop pool
     unsafe unlockLedger(ledger)
-    return Pointer.null<BlockHeader>()
+    return Pointer.null<u8>()
   }
-  let owner = unsafe Intrinsic.pointerRequalify<?*mut BlockHeader, *mut BlockHeader>(head)
-  let mut blockAnchor = ()
-  let block = unsafe Pointer.borrowMut<(), BlockHeader>(&mut blockAnchor, owner)
-  pool.heads[class] = unsafe Pointer.read<?*mut BlockHeader>(unsafe poolLink(owner))
+  let block = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(head)
+  pool.heads[class] = unsafe Pointer.read<?*mut u8>(unsafe poolLink(block))
   pool.counts[class] = pool.counts[class] - 1
-  block.chargedBytes = recorded
-  drop block drop pool
+  drop pool
   state.usedBytes = state.usedBytes + chargedBytes
   state.allocationCount = state.allocationCount + 1
   if state.peakBytes < state.usedBytes { state.peakBytes = state.usedBytes }
@@ -441,37 +482,43 @@ unsafe fn destroyLedger(ledger: LedgerPointers) -> () with Intrinsic.inlineNever
   return ()
 }
 
-// Uncharges one reclaimed block and, for a pooled block, returns it to its class.
-unsafe fn uncharge(ledger: LedgerPointers, block: *mut BlockHeader, chargedBytes: usize, pooled: bool) -> ()
-  with Intrinsic.inlineAlways() {
+// Uncharges one reclaimed block's chargedBytes and, for a pooled block, returns it
+// to class's list.
+unsafe fn uncharge(ledger: LedgerPointers, chargedBytes: usize) -> () with Intrinsic.inlineAlways() {
   unsafe {
     lockLedger(ledger)
     let mut state = Pointer.read<RuntimeMemoryStats>(ledger.stats)
     state.usedBytes = state.usedBytes - chargedBytes
     state.allocationCount = state.allocationCount - 1
     Pointer.write<RuntimeMemoryStats>(ledger.stats, state)
-    if pooled {
-      let class = poolClass(chargedBytes)
-      let mut poolAnchor = ()
-      let pool = Pointer.borrowMut<(), Pool>(&mut poolAnchor, unsafe poolOf(ledger))
-      Pointer.write<?*mut BlockHeader>(poolLink(block), pool.heads[class])
-      pool.heads[class] = Intrinsic.pointerRequalify<*mut BlockHeader, ?*mut BlockHeader>(block)
-      pool.counts[class] = pool.counts[class] + 1
-      drop pool
-    }
+    unlockLedger(ledger)
+  }
+}
+unsafe fn unchargePooled(ledger: LedgerPointers, block: *mut u8, class: usize) -> () with Intrinsic.inlineAlways() {
+  unsafe {
+    lockLedger(ledger)
+    let mut state = Pointer.read<RuntimeMemoryStats>(ledger.stats)
+    state.usedBytes = state.usedBytes - classBytes(class)
+    state.allocationCount = state.allocationCount - 1
+    Pointer.write<RuntimeMemoryStats>(ledger.stats, state)
+    let mut poolAnchor = ()
+    let pool = Pointer.borrowMut<(), Pool>(&mut poolAnchor, unsafe poolOf(ledger))
+    Pointer.write<?*mut u8>(poolLink(block), pool.heads[class])
+    pool.heads[class] = Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(block)
+    pool.counts[class] = pool.counts[class] + 1
+    drop pool
     unlockLedger(ledger)
   }
 }
 
 export "C" fn silkRuntimeMemoryReclaimPooled(context: ?*mut u8) -> () {
-  let present = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(context)
-  let address = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut BlockHeader>(present)
-  let mut anchor = ()
-  let header = unsafe Pointer.borrowMut<(), BlockHeader>(&mut anchor, address)
-  let ledger = unsafe pointersOf(header.ledger)
-  let chargedBytes = header.chargedBytes & CHARGE_MASK
-  drop header
-  unsafe uncharge(ledger, address, chargedBytes, true)
+  let block = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(context)
+  let anchor = ()
+  let arena = unsafe Pointer.borrow<(), ArenaHeader>(&anchor, unsafe arenaOf(block))
+  let ledger = unsafe pointersOf(arena.ledger)
+  let class = arena.class
+  drop arena
+  unsafe unchargePooled(ledger, block, class)
   unsafe releaseLedger(ledger)
   return ()
 }
@@ -483,9 +530,8 @@ export "C" fn silkRuntimeMemoryReclaim(context: ?*mut u8) -> () {
   let header = unsafe Pointer.borrowMut<(), AllocationHeader>(&mut anchor, address)
   let ledger = unsafe pointersOf(header.block.ledger)
   let chargedBytes = header.block.chargedBytes
-  let block = Pointer.fromMutRef<BlockHeader>(&mut header.block)
   drop header
-  unsafe uncharge(ledger, block, chargedBytes, false)
+  unsafe uncharge(ledger, chargedBytes)
   // Move the complete header out before freeing the storage that contained it.
   // Free backing outside the gate, since the child may itself be a RuntimeAllocator.
   let owner = unsafe Pointer.take<AllocationHeader>(address)
