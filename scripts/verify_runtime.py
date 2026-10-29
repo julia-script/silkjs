@@ -94,7 +94,7 @@ int main(void) {
 SILK_SOURCE = r'''
 import silk.mem.allocator { Allocator, OutOfMemoryError, SystemAllocator }
 import silk.core.effect { Effect }
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.mem.pointer { Pointer }
 import silk.num.u32
 import silk.num.i32

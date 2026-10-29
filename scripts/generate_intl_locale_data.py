@@ -179,7 +179,7 @@ class Generator:
             '// String accessors exclude only the implicit C terminator; _raw includes it.',
             '// All returned slices borrow readonly static storage. Invalid table indices trap.',
             '// LocaleData.compactPatterns is a compact_pattern row offset, not a pointer.',
-            'import silk.collections.slice { Slice }', 'import silk.option { Option }', 'import silk.num.u8', 'import silk.num.usize', '',
+            'import silk.collections.slice { Slice }', 'import silk.core.option { Option }', 'import silk.num.u8', 'import silk.num.usize', '',
         ]
 
     def string(self, value):
