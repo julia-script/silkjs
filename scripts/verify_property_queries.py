@@ -305,7 +305,7 @@ unsafe effect fn queryCase<'a>(out: &mut ByteBuffer, hooks: &mut Hooks<'a>, memo
   if family == 9 {
     let anchor = () let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(object))
     let at = match unsafe shapes.lookup(p.shape, keys[0]) { Option<usize>.Some { value } => value _ => trap() }
-    dormant = match p.properties.get(at) { PropertySlot.AutoInit { .. } => true _ => false }
+    dormant = p.properties.get(at).isLazy()
   }
   run flag(&mut out, dormant)
   unsafe gc.release(&mut hooks, rt, object) run out.writeU32(i32.toU32(unsafe refs(parent))) unsafe gc.release(&mut hooks, rt, parent)
