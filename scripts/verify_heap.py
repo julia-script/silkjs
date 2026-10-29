@@ -245,7 +245,7 @@ SILK_SOURCE = r'''
 import silk.mem.allocator { Allocator, OutOfMemoryError, SystemAllocator }
 import silk.core.effect { Effect }
 import silk.collections.list { List }
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.mem.pointer { Pointer }
 import silk.io.writer_native { StdoutWriter }
 import silk.io.writer { Writer, WriterError }

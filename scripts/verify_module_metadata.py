@@ -117,7 +117,7 @@ import silk.core.effect { Effect }
 import silk.num.i32
 import silk.num.i64
 import silk.num.usize
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.mem.pointer { Pointer }
 import silk.io.writer { Writer, WriterError }
 import silk.io.writer_native { StdoutWriter }

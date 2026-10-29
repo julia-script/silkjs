@@ -314,7 +314,7 @@ def silk_source(calls, table_calls, helpers, allocations):
 import silk.core.effect { Effect }
 import silk.collections.bytes { Bytes }
 import silk.text.string { String }
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.num.usize
 import silk.num.i32
 import silk.io.writer { Writer, WriterError }

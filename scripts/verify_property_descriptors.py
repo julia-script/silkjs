@@ -137,7 +137,7 @@ SILK_SOURCE = r'''
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.num.i32
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.mem.pointer { Pointer }
 import silk.core.result { Result }
 import silk.num.u16

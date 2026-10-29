@@ -122,7 +122,7 @@ import silk.core.effect { Effect }
 import silk.num.f64
 import silk.num.i32
 import silk.collections.list { List }
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.mem.pointer { Pointer }
 import silk.core.result { Result }
 import silk.num.u16

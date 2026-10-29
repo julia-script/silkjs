@@ -367,7 +367,7 @@ import js_compiler_variables as variables
 import js_compiler_types { CompilerErrorKind }
 import silk.core.result { Result }
 import silk.collections.list { List }
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.num.u32
 import js_heap { HeapKind }
 import js_value { ValueBits }
