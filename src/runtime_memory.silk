@@ -47,6 +47,8 @@ const ARENA_BYTES: usize = 16384
 const GROUP_ARENAS: usize = 64
 const POOL_CLASSES: usize = 32
 const POOL_GRANULE: usize = 16
+// refill carves this many bytes of an arena at a time: one page.
+const CARVE_BYTES: usize = 4096
 struct Pool {
   enabled: bool,
   heads: [?*mut u8; 32],
@@ -54,7 +56,12 @@ struct Pool {
   arenas: ?*mut ArenaHeader,
   // The next uncarved arena of the newest group, and how many follow it.
   spare: ?*mut u8,
-  spareCount: usize
+  spareCount: usize,
+  // Each class's current arena is carved one page at a time, so a page is first
+  // written when the class needs it: the next uncarved block, and the bytes of
+  // the arena left after it. Only the allocating thread reads or writes these.
+  fresh: [?*mut u8; 32],
+  freshBytes: [usize; 32]
 }
 
 // The first record of every arena. Every block in the arena belongs to ledger and
@@ -186,7 +193,8 @@ impl<A> RuntimeAllocator<A> {
       references: 1,
       gate: 0,
       stats: RuntimeMemoryStats { usedBytes: 0, peakBytes: 0, allocationCount: 0, limit: usize.MAX },
-      pool: Pool { enabled: false, heads: [Pointer.null<u8>(); 32], counts: [0; 32], arenas: Pointer.null<ArenaHeader>(), spare: Pointer.null<u8>(), spareCount: 0 }
+      pool: Pool { enabled: false, heads: [Pointer.null<u8>(); 32], counts: [0; 32], arenas: Pointer.null<ArenaHeader>(), spare: Pointer.null<u8>(), spareCount: 0,
+        fresh: [Pointer.null<u8>(); 32], freshBytes: [0; 32] }
     })
     let mut anchor = ()
     let fresh = unsafe Pointer.borrowMut(&mut anchor, address)
@@ -318,7 +326,18 @@ effect fn takeArena<A>(self: &mut RuntimeAllocator<A>, class: usize) -> *mut u8
   return groupBase
 }
 
-// Carves one arena into blocks of an empty class, then takes the first of them.
+// How many blocks of blockBytes, out of the left bytes from start, begin on the
+// page start is on: at least one, since left holds a block.
+@inlineAlways
+unsafe fn carveCount(start: ?*mut u8, left: usize, blockBytes: usize) -> usize {
+  let address = Pointer.address<u8>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(start))
+  let pageLeft = CARVE_BYTES - usize.bitAnd(address, CARVE_BYTES - 1)
+  let count = (pageLeft + blockBytes - 1) / blockBytes
+  if count * blockBytes > left { return left / blockBytes }
+  return count
+}
+// Carves the next page of an empty class's arena into blocks (taking a new arena
+// when the current one is used up), then takes the first of them.
 @inlineNever
 effect fn refill<A>(self: &mut RuntimeAllocator<A>, layout: Layout, class: usize) -> Intrinsic.Allocation
   ! OutOfMemoryError where &mut A provides &Allocator from &mut Allocator {
@@ -326,17 +345,47 @@ effect fn refill<A>(self: &mut RuntimeAllocator<A>, layout: Layout, class: usize
   let before = self.stats()
   let blockBytes = classBytes(class)
   if before.usedBytes > before.limit || blockBytes > before.limit - before.usedBytes { return run Allocator.outOfMemory() }
-  let arenaHeader = Layout.of<ArenaHeader>()
-  let first = (arenaHeader.bytes + POOL_GRANULE - 1) / POOL_GRANULE * POOL_GRANULE
-  let count = (ARENA_BYTES - first) / blockBytes
-  let arenaBase = run takeArena<A>(&mut self, class)
-  let blocks = unsafe Pointer.assumeManyMut<u8>(arenaBase)
+  // Claim the next page of the class's current arena, or a fresh arena when it is
+  // used up. A racing refill's leftover run is simply dropped, unused.
+  let mut start = Pointer.null<u8>()
+  let mut count: usize = 0
+  unsafe {
+    lockLedger(ledger)
+    let mut poolAnchor = ()
+    let pool = Pointer.borrowMut<(), Pool>(&mut poolAnchor, poolOf(ledger))
+    if pool.freshBytes[class] >= blockBytes {
+      start = pool.fresh[class]
+      count = carveCount(start, pool.freshBytes[class], blockBytes)
+      pool.fresh[class] = Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(Pointer.atMut<u8>(Pointer.assumeManyMut<u8>(Intrinsic.pointerRequalify<?*mut u8, *mut u8>(start)), count * blockBytes))
+      pool.freshBytes[class] = pool.freshBytes[class] - count * blockBytes
+    }
+    drop pool
+    unlockLedger(ledger)
+  }
+  if count == 0 {
+    let arenaHeader = Layout.of<ArenaHeader>()
+    let first = (arenaHeader.bytes + POOL_GRANULE - 1) / POOL_GRANULE * POOL_GRANULE
+    let arenaBase = run takeArena<A>(&mut self, class)
+    start = unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(arenaBase), first))
+    let left = ARENA_BYTES - first
+    count = unsafe carveCount(start, left, blockBytes)
+    unsafe {
+      lockLedger(ledger)
+      let mut poolAnchor = ()
+      let pool = Pointer.borrowMut<(), Pool>(&mut poolAnchor, poolOf(ledger))
+      pool.fresh[class] = Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(Pointer.atMut<u8>(Pointer.assumeManyMut<u8>(Intrinsic.pointerRequalify<?*mut u8, *mut u8>(start)), count * blockBytes))
+      pool.freshBytes[class] = left - count * blockBytes
+      drop pool
+      unlockLedger(ledger)
+    }
+  }
+  let blocks = unsafe Pointer.assumeManyMut<u8>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(start))
   // Link the blocks among themselves first, outside the gate.
   let mut head = Pointer.null<u8>()
   let mut index = count
   while index > 0 {
     index = index - 1
-    let block = unsafe Pointer.atMut<u8>(blocks, first + index * blockBytes)
+    let block = unsafe Pointer.atMut<u8>(blocks, index * blockBytes)
     unsafe Pointer.write<?*mut u8>(unsafe poolLink(block), head)
     head = unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(block)
   }
@@ -345,7 +394,7 @@ effect fn refill<A>(self: &mut RuntimeAllocator<A>, layout: Layout, class: usize
     let mut poolAnchor = ()
     let pool = Pointer.borrowMut<(), Pool>(&mut poolAnchor, poolOf(ledger))
     // The last carved block links to the class's previous head (empty here).
-    let last = Pointer.atMut<u8>(blocks, first + (count - 1) * blockBytes)
+    let last = Pointer.atMut<u8>(blocks, (count - 1) * blockBytes)
     Pointer.write<?*mut u8>(poolLink(last), pool.heads[class])
     pool.heads[class] = head
     pool.counts[class] = pool.counts[class] + count
