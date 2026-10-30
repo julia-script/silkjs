@@ -4,6 +4,8 @@ import silk.mem.pointer { Pointer }
 import silk.mem.raw_buffer { RawBuffer }
 import silk.mem.slot { Slot }
 import silk.core.ownership { Copy }
+import silk.num.usize
+import runtime_memory as memory
 
 /// Storage/destruction categories, independent of the tag of a ValueBits using the cell.
 /// Symbols share string storage; Auxiliary is for other engine-owned native payloads.
@@ -18,6 +20,10 @@ pub struct HeapHeader {
   pub referenceCount: i32,
   pub mark: u8,
   pub kind: HeapKind,
+  /// How the cell's allocation is owned: OWNER_POOLED and OWNER_UNPOOLED cells are
+  /// runtime_memory blocks released from their address alone; an OWNER_PREFIX cell
+  /// keeps its RawBuffer right before its header.
+  pub owner: u8,
   pub previous: ?*mut HeapHeader,
   pub next: ?*mut HeapHeader,
   /// The runtime whose GC lists hold this cell, set when the cell is published to the
@@ -25,18 +31,30 @@ pub struct HeapHeader {
   pub runtime: ?*mut HeapHeader
 }
 
-// RawBuffer releases storage, not its initialized elements. Keeping that owner in its
-// own allocation gives a stable cell without a separate native reference count.
 // The header comes first, so a header pointer is also its cell's address: payload
 // access needs no stored base pointer. Silk lays fields out in declaration order;
 // placed() checks that on every allocation, and the check folds away.
-// storage spans the whole allocation in bytes, so a cell can carry a byte tail
-// after its payload (allocateWithTail) and still free through one owner.
+//
+// A cell keeps no owner of its own allocation when a RuntimeAllocator made it: its
+// pooled and unpooled blocks both release from their address, so the header's owner
+// byte replaces a 32-byte RawBuffer. An allocation from any other allocator is made
+// PREFIX bytes larger and keeps its RawBuffer in that prefix, right before the header.
+// Either way a cell can carry a byte tail after its payload (allocateWithTail).
 struct Cell<T> {
   header: HeapHeader,
-  storage: Intrinsic.RawBuffer<u8>,
   payload: T
 }
+
+/// The bytes an OWNER_PREFIX cell's RawBuffer takes before its header.
+const PREFIX: usize = 32
+const OWNER_PREFIX: u8 = 0
+const OWNER_POOLED: u8 = 1
+const OWNER_UNPOOLED: u8 = 2
+
+/// A RawBuffer read as its words, to recognise runtime_memory blocks by their reclaim
+/// callback and context.
+struct StorageWords { base: usize, count: usize, reclaim: usize, context: usize }
+impl Copy for StorageWords {}
 
 /// The cell whose header is at header. Every cell starts with its header.
 @inlineAlways
@@ -52,6 +70,131 @@ fn placed<T>(cell: &mut Cell<T>, base: *mut u8) -> *mut HeapHeader {
   return header
 }
 
+@inlineAlways
+fn freshHeader(kind: HeapKind, owner: u8) -> HeapHeader {
+  return HeapHeader { referenceCount: 1, mark: 0, kind: kind, owner: owner, previous: Pointer.null<HeapHeader>(),
+    next: Pointer.null<HeapHeader>(), runtime: Pointer.null<HeapHeader>() }
+}
+
+/// Where a cell of some size was placed, and how its allocation is owned.
+struct Placement { cell: *mut u8, owner: u8, found: bool }
+impl Copy for Placement {}
+
+/// Places a cell of cellBytes at the start of storage when storage is a runtime_memory
+/// block, or after its PREFIX when storage has room for one, keeping storage there.
+/// Otherwise storage is released and the placement is not found.
+@inlineAlways
+unsafe fn place(storage: Intrinsic.RawBuffer<u8>, cellBytes: usize) -> Placement {
+  let mut storage = move storage
+  if Layout.of<Intrinsic.RawBuffer<u8>>().bytes != PREFIX || Layout.of<StorageWords>().bytes != PREFIX {
+    Intrinsic.trap("RawBuffer is not four words")
+  }
+  let words = unsafe Pointer.read<StorageWords>(unsafe Intrinsic.pointerReinterpret<*const Intrinsic.RawBuffer<u8>, *const StorageWords>(
+    Pointer.fromRef<Intrinsic.RawBuffer<u8>>(&storage)))
+  let base = Slot.address(RawBuffer.slot<u8>(&mut storage, 0))
+  let owner = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Intrinsic.RawBuffer<u8>>(base)
+  let address = Pointer.address<u8>(base)
+  let mut kind = OWNER_PREFIX
+  if words.base == address && words.count >= cellBytes {
+    if words.context == address && words.reclaim == memory.pooledReclaimAddress() { kind = OWNER_POOLED }
+    else if words.context == usize.wrappingSubtract(address, memory.unpooledOffset()) && words.reclaim == memory.unpooledReclaimAddress() {
+      kind = OWNER_UNPOOLED
+    }
+  }
+  if kind != OWNER_PREFIX {
+    // The block releases from its address; its RawBuffer is parked where the header
+    // will overwrite it, which forgets it without running its drop.
+    unsafe Pointer.put<Intrinsic.RawBuffer<u8>>(owner, move storage)
+    return Placement { cell: base, owner: kind, found: true }
+  }
+  if words.count >= cellBytes + PREFIX {
+    unsafe Pointer.put<Intrinsic.RawBuffer<u8>>(owner, move storage)
+    return Placement { cell: unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(base), PREFIX), owner: OWNER_PREFIX, found: true }
+  }
+  drop storage
+  return Placement { cell: base, owner: OWNER_PREFIX, found: false }
+}
+
+/// Allocates a cell of cellBytes with alignment and no tail: the hot path, inlined so
+/// a runtime_memory block costs one recognition check.
+@inlineAlways
+effect fn obtainPlain(cellBytes: usize, alignment: usize) -> Placement ! OutOfMemoryError ? &mut Allocator {
+  if alignment <= 16 {
+    let allocation = run Allocator.allocate(Layout { bytes: cellBytes, alignment: alignment })
+    let storage = unsafe RawBuffer.from<u8>(move allocation, cellBytes)
+    let placement = unsafe place(move storage, cellBytes)
+    if placement.found { return placement }
+    // Another allocator's block: go straight to a prefixed one.
+    return run obtain(cellBytes, alignment, &[], &[], 0, true)
+  }
+  return run obtain(cellBytes, alignment, &[], &[], 0, false)
+}
+
+/// obtainPlain with a tail of first, second, then padding zero bytes after the cell.
+@inlineAlways
+effect fn obtainTail(cellBytes: usize, alignment: usize, first: &[u8], second: &[u8], padding: usize) -> Placement
+  ! OutOfMemoryError ? &mut Allocator {
+  if alignment <= 16 {
+    let bytes = cellBytes + first.length + second.length + padding
+    let allocation = run Allocator.allocate(Layout { bytes: bytes, alignment: alignment })
+    let mut storage = unsafe RawBuffer.from<u8>(move allocation, bytes)
+    // The intrinsics directly: the RawBuffer wrappers stay out of line here.
+    if first.length != 0 { unsafe Intrinsic.rawBufferCopy<u8>(&mut storage, cellBytes, first, first.length) }
+    if second.length != 0 { unsafe Intrinsic.rawBufferCopy<u8>(&mut storage, cellBytes + first.length, second, second.length) }
+    if padding != 0 { unsafe Intrinsic.rawBufferFill(&mut storage, cellBytes + first.length + second.length, padding, 0) }
+    let placement = unsafe place(move storage, bytes)
+    if placement.found { return placement }
+    return run obtain(cellBytes, alignment, first, second, padding, true)
+  }
+  return run obtain(cellBytes, alignment, first, second, padding, false)
+}
+
+/// Allocates cellBytes plus tail bytes (first, second, then padding zeros) for a cell
+/// with alignment, and copies the tail after the cell's first cellBytes.
+@inlineNever
+effect fn obtain(cellBytes: usize, alignment: usize, first: &[u8], second: &[u8], padding: usize, prefixed: bool) -> Placement
+  ! OutOfMemoryError ? &mut Allocator {
+  let bytes = cellBytes + first.length + second.length + padding
+  // A runtime_memory block of alignment up to its granule needs no prefix.
+  let mut extra = usize.ZERO
+  if prefixed || alignment > 16 { extra = PREFIX }
+  while true {
+    let total = bytes + extra
+    let allocation = run Allocator.allocate(Layout { bytes: total, alignment: alignment })
+    let mut storage = unsafe RawBuffer.from<u8>(move allocation, total)
+    let at = extra + cellBytes
+    if first.length != 0 { unsafe Intrinsic.rawBufferCopy<u8>(&mut storage, at, first, first.length) }
+    if second.length != 0 { unsafe Intrinsic.rawBufferCopy<u8>(&mut storage, at + first.length, second, second.length) }
+    if padding != 0 { unsafe Intrinsic.rawBufferFill(&mut storage, at + first.length + second.length, padding, 0) }
+    let placement = unsafe place(move storage, bytes)
+    if placement.found { return placement }
+    // Another allocator's block, with no room for its owner: ask again with the prefix.
+    extra = PREFIX
+  }
+  return Intrinsic.trap("unreachable")
+}
+
+/// Releases the allocation behind header after its payload is gone.
+@inlineAlways
+unsafe fn release(header: *mut HeapHeader) -> () {
+  let base = unsafe Intrinsic.pointerReinterpret<*mut HeapHeader, *mut u8>(header)
+  let anchor = ()
+  let view = unsafe Pointer.borrow<(), HeapHeader>(&anchor, header)
+  let owner = view.owner
+  drop view
+  if owner == OWNER_POOLED { return unsafe memory.releasePooled(base) }
+  if owner == OWNER_UNPOOLED { return unsafe memory.releaseUnpooled(base) }
+  let storage = unsafe Pointer.take<Intrinsic.RawBuffer<u8>>(unsafe prefixOwner(base))
+  drop storage
+}
+
+/// The RawBuffer kept before an OWNER_PREFIX cell at base.
+@inlineAlways
+unsafe fn prefixOwner(base: *mut u8) -> *mut Intrinsic.RawBuffer<u8> {
+  let start = unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(base), usize.wrappingSubtract(0, PREFIX))
+  return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Intrinsic.RawBuffer<u8>>(start)
+}
+
 pub struct HeapCell {}
 
 impl HeapCell {
@@ -59,26 +202,13 @@ impl HeapCell {
   /// failure the incoming payload's native owners are dropped normally.
   pub effect fn allocate<T>(kind: HeapKind, payload: T) -> *mut HeapHeader
     ! OutOfMemoryError ? &mut Allocator {
-    let bytes = Layout.of<Cell<T>>().bytes
-    let allocation = run Allocator.allocate(Layout.of<Cell<T>>())
-    let mut storage = unsafe RawBuffer.from<u8>(move allocation, bytes)
-    let base = Slot.address(RawBuffer.slot<u8>(&mut storage, 0))
-    let address = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Cell<T>>(base)
-    unsafe Pointer.put<Cell<T>>(address, Cell<T> {
-      storage: move storage,
-      header: HeapHeader {
-        referenceCount: 1,
-        mark: 0,
-        kind: kind,
-        previous: Pointer.null<HeapHeader>(),
-        next: Pointer.null<HeapHeader>(),
-        runtime: Pointer.null<HeapHeader>()
-      },
-      payload: move payload
-    })
+    let layout = Layout.of<Cell<T>>()
+    let placement = run obtainPlain(layout.bytes, layout.alignment)
+    let address = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Cell<T>>(placement.cell)
+    unsafe Pointer.put<Cell<T>>(address, Cell<T> { header: freshHeader(kind, placement.owner), payload: move payload })
     let mut anchor = ()
     let cell = unsafe Pointer.borrowMut<(), Cell<T>>(&mut anchor, address)
-    return placed<T>(&mut cell.*, base)
+    return placed<T>(&mut cell.*, placement.cell)
   }
 
   /// allocate, inlined into hot constructors so the payload literal is written
@@ -86,26 +216,13 @@ impl HeapCell {
   @inlineAlways
   pub effect fn allocateInline<T>(kind: HeapKind, payload: T) -> *mut HeapHeader
     ! OutOfMemoryError ? &mut Allocator {
-    let bytes = Layout.of<Cell<T>>().bytes
-    let allocation = run Allocator.allocate(Layout.of<Cell<T>>())
-    let mut storage = unsafe RawBuffer.from<u8>(move allocation, bytes)
-    let base = Slot.address(RawBuffer.slot<u8>(&mut storage, 0))
-    let address = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Cell<T>>(base)
-    unsafe Pointer.put<Cell<T>>(address, Cell<T> {
-      storage: move storage,
-      header: HeapHeader {
-        referenceCount: 1,
-        mark: 0,
-        kind: kind,
-        previous: Pointer.null<HeapHeader>(),
-        next: Pointer.null<HeapHeader>(),
-        runtime: Pointer.null<HeapHeader>()
-      },
-      payload: move payload
-    })
+    let layout = Layout.of<Cell<T>>()
+    let placement = run obtainPlain(layout.bytes, layout.alignment)
+    let address = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Cell<T>>(placement.cell)
+    unsafe Pointer.put<Cell<T>>(address, Cell<T> { header: freshHeader(kind, placement.owner), payload: move payload })
     let mut anchor = ()
     let cell = unsafe Pointer.borrowMut<(), Cell<T>>(&mut anchor, address)
-    return placed<T>(&mut cell.*, base)
+    return placed<T>(&mut cell.*, placement.cell)
   }
 
   /// Allocates a cell whose payload is left uninitialized: the caller must write
@@ -115,25 +232,17 @@ impl HeapCell {
   @inlineAlways
   pub effect fn allocateUninit<T>(kind: HeapKind) -> *mut HeapHeader
     ! OutOfMemoryError ? &mut Allocator {
-    let bytes = Layout.of<Cell<T>>().bytes
-    let allocation = run Allocator.allocate(Layout.of<Cell<T>>())
-    let storage = unsafe RawBuffer.from<u8>(move allocation, bytes)
-    return unsafe HeapCell.allocateUninitIn<T>(kind, move storage)
+    let layout = Layout.of<Cell<T>>()
+    let placement = run obtainPlain(layout.bytes, layout.alignment)
+    return unsafe initHeader<T>(kind, placement)
   }
   /// allocateUninit over storage taken from a dead cell of the same payload type
   /// (HeapCell.takeStorage): no allocator round trip.
   @inlineAlways
   pub unsafe fn allocateUninitIn<T>(kind: HeapKind, storage: Intrinsic.RawBuffer<u8>) -> *mut HeapHeader {
-    let mut storage = move storage
-    let bytes = Layout.of<Cell<T>>().bytes
-    let base = Slot.address(RawBuffer.slot<u8>(&mut storage, 0))
-    let address = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Cell<T>>(base)
-    let mut anchor = ()
-    let cell = unsafe Pointer.borrowMut<(), Cell<T>>(&mut anchor, address)
-    unsafe Pointer.put<Intrinsic.RawBuffer<u8>>(Pointer.fromMutRef<Intrinsic.RawBuffer<u8>>(&mut cell.storage), move storage)
-    unsafe Pointer.put<HeapHeader>(Pointer.fromMutRef<HeapHeader>(&mut cell.header), HeapHeader {
-      referenceCount: 1, mark: 0, kind: kind, previous: Pointer.null<HeapHeader>(), next: Pointer.null<HeapHeader>(), runtime: Pointer.null<HeapHeader>() })
-    return placed<T>(&mut cell.*, base)
+    let placement = unsafe place(move storage, Layout.of<Cell<T>>().bytes)
+    if !placement.found { Intrinsic.trap("reused cell storage is too small") }
+    return unsafe initHeader<T>(kind, placement)
   }
 
   /// Like allocate, with a byte tail right after the payload in the same allocation:
@@ -141,31 +250,13 @@ impl HeapCell {
   /// HeapCell.tailAddress gives its stable start.
   pub effect fn allocateWithTail<T>(kind: HeapKind, payload: T, first: &[u8], second: &[u8], padding: usize) -> *mut HeapHeader
     ! OutOfMemoryError ? &mut Allocator {
-    let cellBytes = Layout.of<Cell<T>>().bytes
-    let bytes = cellBytes + first.length + second.length + padding
-    let allocation = run Allocator.allocate(Layout { bytes: bytes, alignment: Layout.of<Cell<T>>().alignment })
-    let mut storage = unsafe RawBuffer.from<u8>(move allocation, bytes)
-    // The intrinsics directly: the RawBuffer wrappers stay out of line here.
-    if first.length != 0 { unsafe Intrinsic.rawBufferCopy<u8>(&mut storage, cellBytes, first, first.length) }
-    if second.length != 0 { unsafe Intrinsic.rawBufferCopy<u8>(&mut storage, cellBytes + first.length, second, second.length) }
-    if padding != 0 { unsafe Intrinsic.rawBufferFill(&mut storage, cellBytes + first.length + second.length, padding, 0) }
-    let base = Slot.address(RawBuffer.slot<u8>(&mut storage, 0))
-    let address = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Cell<T>>(base)
-    unsafe Pointer.put<Cell<T>>(address, Cell<T> {
-      storage: move storage,
-      header: HeapHeader {
-        referenceCount: 1,
-        mark: 0,
-        kind: kind,
-        previous: Pointer.null<HeapHeader>(),
-        next: Pointer.null<HeapHeader>(),
-        runtime: Pointer.null<HeapHeader>()
-      },
-      payload: move payload
-    })
+    let layout = Layout.of<Cell<T>>()
+    let placement = run obtainTail(layout.bytes, layout.alignment, first, second, padding)
+    let address = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Cell<T>>(placement.cell)
+    unsafe Pointer.put<Cell<T>>(address, Cell<T> { header: freshHeader(kind, placement.owner), payload: move payload })
     let mut anchor = ()
     let cell = unsafe Pointer.borrowMut<(), Cell<T>>(&mut anchor, address)
-    return placed<T>(&mut cell.*, base)
+    return placed<T>(&mut cell.*, placement.cell)
   }
 
   /// allocateWithTail for a payload whose last omitted bytes are never stored: the
@@ -174,22 +265,9 @@ impl HeapCell {
   /// or drops the payload as a whole). compactTailAddress gives the tail.
   pub effect fn allocateCompactWithTail<T>(kind: HeapKind, omitted: usize, first: &[u8], second: &[u8], padding: usize) -> *mut HeapHeader
     ! OutOfMemoryError ? &mut Allocator {
-    let cellBytes = Layout.of<Cell<T>>().bytes - omitted
-    let bytes = cellBytes + first.length + second.length + padding
-    let allocation = run Allocator.allocate(Layout { bytes: bytes, alignment: Layout.of<Cell<T>>().alignment })
-    let mut storage = unsafe RawBuffer.from<u8>(move allocation, bytes)
-    if first.length != 0 { unsafe Intrinsic.rawBufferCopy<u8>(&mut storage, cellBytes, first, first.length) }
-    if second.length != 0 { unsafe Intrinsic.rawBufferCopy<u8>(&mut storage, cellBytes + first.length, second, second.length) }
-    if padding != 0 { unsafe Intrinsic.rawBufferFill(&mut storage, cellBytes + first.length + second.length, padding, 0) }
-    let base = Slot.address(RawBuffer.slot<u8>(&mut storage, 0))
-    let address = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Cell<T>>(base)
-    let mut anchor = ()
-    let cell = unsafe Pointer.borrowMut<(), Cell<T>>(&mut anchor, address)
-    unsafe Pointer.put<Intrinsic.RawBuffer<u8>>(Pointer.fromMutRef<Intrinsic.RawBuffer<u8>>(&mut cell.storage), move storage)
-    unsafe Pointer.put<HeapHeader>(Pointer.fromMutRef<HeapHeader>(&mut cell.header), HeapHeader {
-      referenceCount: 1, mark: 0, kind: kind, previous: Pointer.null<HeapHeader>(), next: Pointer.null<HeapHeader>(),
-      runtime: Pointer.null<HeapHeader>() })
-    return placed<T>(&mut cell.*, base)
+    let layout = Layout.of<Cell<T>>()
+    let placement = run obtainTail(layout.bytes - omitted, layout.alignment, first, second, padding)
+    return unsafe initHeader<T>(kind, placement)
   }
   /// The tail of a cell made by allocateCompactWithTail<T> with the same omitted.
   pub unsafe fn compactTailAddress<T>(header: *const HeapHeader, omitted: usize) -> *mut u8 {
@@ -206,9 +284,8 @@ impl HeapCell {
   /// The first length tail bytes of a cell made by allocateWithTail<T>. Caller proves
   /// the same conditions as payload, and that the cell's tail holds length bytes.
   pub unsafe fn tail<'a, T, A>(anchor: &'a A, header: *const HeapHeader, length: usize) -> &'a [u8] {
-    let address = unsafe cellOf<T>(header)
-    let cell = unsafe Pointer.borrow<A, Cell<T>>(anchor, address)
-    return unsafe Intrinsic.rawBufferView<u8>(&cell.storage, Layout.of<Cell<T>>().bytes, length)
+    let start = unsafe HeapCell.tailAddress<T>(header)
+    return unsafe Pointer.borrowMany<A, u8>(anchor, unsafe Pointer.assumeMany<u8>(start), length)
   }
 
   /// Borrows the payload for the lifetime of anchor, not for an invented static lifetime.
@@ -252,60 +329,67 @@ impl HeapCell {
   /// Caller proves the exact T, has released all JavaScript child references and GC
   /// links, and ensures no outstanding borrows or future accesses to this allocation.
   pub unsafe fn destroy<T>(header: *mut HeapHeader) -> () {
-    let anchor = ()
     let address = unsafe cellOf<T>(header)
-    // Explicit order is essential: native payload owners die before the backing owner.
-    // Each owner moves out on its own; moving the whole cell first copied it twice.
+    // Explicit order is essential: native payload owners die before the backing.
     // HeapHeader owns nothing.
     let mut cellAnchor = ()
     let cell = unsafe Pointer.borrowMut<(), Cell<T>>(&mut cellAnchor, address)
     let payloadAddress = Pointer.fromMutRef<T>(&mut cell.payload)
-    let storageAddress = Pointer.fromMutRef<Intrinsic.RawBuffer<u8>>(&mut cell.storage)
     drop cell
     let payload = unsafe Pointer.take<T>(payloadAddress)
     drop payload
-    let storage = unsafe Pointer.take<Intrinsic.RawBuffer<u8>>(storageAddress)
-    drop storage
+    unsafe release(header)
   }
 
-  /// The size of header's whole allocation, tail included. Every cell, whatever its
-  /// payload, keeps its storage right after its header, so the storage's count is
-  /// the size; the header needs no copy of it.
+  /// The size of header's whole allocation, tail included: a pooled cell's whole block,
+  /// an unpooled cell's request, or what a prefixed cell's RawBuffer spans after its prefix.
   @inlineAlways
   pub unsafe fn allocationBytes(header: *const HeapHeader) -> usize {
+    let base = unsafe Intrinsic.pointerReinterpret<*mut Cell<()>, *mut u8>(unsafe cellOf<()>(header))
     let anchor = ()
-    let cell = unsafe Pointer.borrow<(), Cell<()>>(&anchor, unsafe cellOf<()>(header))
-    return RawBuffer.count<u8>(&cell.storage)
+    let view = unsafe Pointer.borrow<(), HeapHeader>(&anchor, header)
+    if view.owner == OWNER_POOLED { return unsafe memory.pooledBlockBytes(base) }
+    if view.owner == OWNER_UNPOOLED { return unsafe memory.unpooledBlockBytes(base) }
+    let owner = unsafe Pointer.borrow<(), Intrinsic.RawBuffer<u8>>(&anchor, unsafe prefixOwner(base))
+    return RawBuffer.count<u8>(&owner.*) - PREFIX
   }
-  /// Whether header's cell is exactly a Cell<T> allocation, with no tail, so that
-  /// its storage can back a new T cell.
+  /// Whether header's cell is a Cell<T> allocation with no tail, so that its storage
+  /// can back a new T cell.
   pub unsafe fn plainCell<T>(header: *mut HeapHeader) -> bool {
-    return unsafe HeapCell.allocationBytes(header) == Layout.of<Cell<T>>().bytes
+    let bytes = Layout.of<Cell<T>>().bytes
+    let anchor = ()
+    let view = unsafe Pointer.borrow<(), HeapHeader>(&anchor, header)
+    if view.owner == OWNER_POOLED { return bytes <= memory.pooledLimit() && unsafe HeapCell.allocationBytes(header) == memory.pooledClassBytes(bytes) }
+    return unsafe HeapCell.allocationBytes(header) == bytes
   }
   /// destroyEmptied that keeps the backing storage for reuse instead of freeing it.
   pub unsafe fn takeStorage<T>(header: *mut HeapHeader) -> Intrinsic.RawBuffer<u8> {
+    let base = unsafe Intrinsic.pointerReinterpret<*mut HeapHeader, *mut u8>(header)
     let anchor = ()
-    let address = unsafe cellOf<T>(header)
-    let mut cellAnchor = ()
-    let cell = unsafe Pointer.borrowMut<(), Cell<T>>(&mut cellAnchor, address)
-    let storageAddress = Pointer.fromMutRef<Intrinsic.RawBuffer<u8>>(&mut cell.storage)
-    drop cell
-    return unsafe Pointer.take<Intrinsic.RawBuffer<u8>>(storageAddress)
+    let view = unsafe Pointer.borrow<(), HeapHeader>(&anchor, header)
+    let owner = view.owner
+    drop view
+    if owner == OWNER_POOLED { return unsafe memory.adoptPooledBlock(base) }
+    if owner == OWNER_UNPOOLED { return unsafe memory.adoptUnpooledBlock(base) }
+    return unsafe Pointer.take<Intrinsic.RawBuffer<u8>>(unsafe prefixOwner(base))
   }
 
   /// destroy for a payload that owns nothing any more: its owners were moved out or
   /// reset to empty values. Only the backing storage is released, so the payload is
   /// neither copied out nor run through its drop glue.
   pub unsafe fn destroyEmptied<T>(header: *mut HeapHeader) -> () {
-    let anchor = ()
-    let address = unsafe cellOf<T>(header)
-    let mut cellAnchor = ()
-    let cell = unsafe Pointer.borrowMut<(), Cell<T>>(&mut cellAnchor, address)
-    let storageAddress = Pointer.fromMutRef<Intrinsic.RawBuffer<u8>>(&mut cell.storage)
-    drop cell
-    let storage = unsafe Pointer.take<Intrinsic.RawBuffer<u8>>(storageAddress)
-    drop storage
+    unsafe release(header)
   }
+}
+
+/// Writes a fresh header at placement and leaves the payload uninitialized.
+@inlineAlways
+unsafe fn initHeader<T>(kind: HeapKind, placement: Placement) -> *mut HeapHeader {
+  let address = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Cell<T>>(placement.cell)
+  let mut anchor = ()
+  let cell = unsafe Pointer.borrowMut<(), Cell<T>>(&mut anchor, address)
+  unsafe Pointer.put<HeapHeader>(Pointer.fromMutRef<HeapHeader>(&mut cell.header), freshHeader(kind, placement.owner))
+  return placed<T>(&mut cell.*, placement.cell)
 }
 
 /// A typed handle to a live heap cell whose payload is a `T`.
