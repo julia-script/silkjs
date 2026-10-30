@@ -1,21 +1,21 @@
 //! Native quickjs-libc.c handler ownership, timers, signals and rejection tracking.
 //! ThreadState is the sole owner stored in RuntimeState.userOpaque. The runtime is
 //! exclusively driven by one thread; native Worker pipes carry no JS heap pointers.
-import silk.num.usize
-import js_owned_value { ValueRef, lendBits, immediateRef }
-import js_realm { Realm, Arguments, lendRealm, lendArguments }
+import js_owned_value { Value, ValueRef, immediateRef }
+import js_realm { Realm, Arguments }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.mem.pointer { Pointer }
 import silk.core.result { Result }
+import silk.core.ownership { Copy }
 import silk.num.i32
 import silk.num.i64
 import silk.num.u32
 import silk.num.u64
 import runtime_memory { AllocationObserver }
-import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_heap { HeapCell, HeapHeader, HeapKind, CellRef }
 import js_value { ValueBits }
 import js_intl_realm as ops
 import js_core_types { HeapList, HostHook, NativeFunctionId, NativeErrorKind }
@@ -50,10 +50,31 @@ pub const CLEAR_TIMEOUT: u32 = 204
 pub const SLEEP_ASYNC: u32 = 205
 pub const REJECTION_TRACKER: u32 = 0x4c000290
 pub const EVAL_INTERRUPT: u32 = 0x4c000291
-pub struct ReadWriteHandler { pub fd: i32, pub pollIndex: usize, pub read: ValueBits, pub write: ValueBits }
-pub struct SignalHandler { pub number: i32, pub function: ValueBits }
-pub struct Timer { pub id: i32, pub timeout: i64, pub function: ValueBits }
-pub struct Rejection { pub promise: ValueBits, pub reason: ValueBits }
+pub struct ReadWriteHandler { pub fd: i32, pub pollIndex: usize, pub read: Value, pub write: Value }
+pub struct SignalHandler { pub number: i32, pub function: Value }
+pub struct Timer { pub id: i32, pub timeout: i64, pub function: Value }
+pub struct Rejection { pub promise: Value, pub reason: Value }
+/// A record on one of ThreadState's lists. Each list holds cells of a single record
+/// type, so the record after an entry has its type too. An entry is live until one of
+/// the remove functions here unlinks it; callers stop using it before running JS.
+pub struct Entry<T> { cell: CellRef<T> }
+impl<T> Copy for Entry<T> {}
+impl<T> Entry<T> {
+  /// Borrows the record for as long as `owner` stays borrowed.
+  pub fn get<'b, A>(self: Self, owner: &'b A) -> &'b T { return self.cell.get(owner) }
+  /// Borrows the record exclusively for as long as `owner` stays exclusively borrowed.
+  pub fn getMut<'b, A>(self: Self, owner: &'b mut A) -> &'b mut T { return self.cell.getMut(&mut owner.*) }
+  pub fn next(self: Self) -> Option<Entry<T>> {
+    let anchor = () let header = unsafe Pointer.borrow(&anchor, self.cell.header()) return unsafe entry<T>(header.next)
+  }
+}
+// The caller proves node is null or a live T cell.
+unsafe fn entry<T>(node: ?*mut HeapHeader) -> Option<Entry<T>> {
+  return match Pointer.nonNullMut(node) {
+    Option<*mut HeapHeader>.Some { value } => Option<Entry<T>>.some(Entry<T> { cell: unsafe CellRef<T>.of(value) })
+    _ => Option<Entry<T>>.none()
+  }
+}
 pub struct ThreadState {
   pub allocation: ?*mut HeapHeader,
   pub namespace: ClassIdAllocator,
@@ -62,10 +83,10 @@ pub struct ThreadState {
   pub featureBitmap: u64,
   pub domain: Domain,
   pub resources: Resources,
-  pub readWriteHandlers: HeapList,
-  pub signalHandlers: HeapList,
-  pub timers: HeapList,
-  pub rejections: HeapList,
+  readWriteList: HeapList,
+  signalList: HeapList,
+  timerList: HeapList,
+  rejectionList: HeapList,
   pub evalScriptRecurse: i32,
   pub nextTimerId: i32,
   pub pollingEnabled: bool,
@@ -83,8 +104,8 @@ pub unsafe effect fn initHandlers(rt: *mut HeapHeader, process: &Process,
   let resources = run Resources.make()
   let owner = run HeapCell.allocate(HeapKind.Auxiliary, ThreadState {
     allocation: Pointer.null<HeapHeader>(), namespace: process.namespace.clone(), process: process.clone(), experimental: experimental,
-    featureBitmap: u64.MAX, domain: domain, resources: move resources, readWriteHandlers: HeapList.make(), signalHandlers: HeapList.make(),
-    timers: HeapList.make(), rejections: HeapList.make(), evalScriptRecurse: 0, nextTimerId: 1,
+    featureBitmap: u64.MAX, domain: domain, resources: move resources, readWriteList: HeapList.make(), signalList: HeapList.make(),
+    timerList: HeapList.make(), rejectionList: HeapList.make(), evalScriptRecurse: 0, nextTimerId: 1,
     pollingEnabled: false, signals: Signals.make(), pollFds: List<PollFd>.make(),
     recvPipe: Pointer.null<Pipe>(), sendPipe: Pointer.null<Pipe>(), workerGroup: Pointer.null<Group>(),
     workerPortsFirst: Pointer.null<HeapHeader>(), workerPortsLast: Pointer.null<HeapHeader>() })
@@ -101,19 +122,31 @@ pub unsafe fn state(rt: *mut HeapHeader) -> *mut ThreadState {
   }
   return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ThreadState>(pointer)
 }
-pub unsafe fn next(node: *mut HeapHeader) -> ?*mut HeapHeader {
-  let anchor = () let header = unsafe Pointer.borrow(&anchor, node) return header.next
+impl ThreadState {
+  pub fn readWriteHandlers(self: &Self) -> Option<Entry<ReadWriteHandler>> { return unsafe entry<ReadWriteHandler>(self.readWriteList.first) }
+  pub fn signalHandlers(self: &Self) -> Option<Entry<SignalHandler>> { return unsafe entry<SignalHandler>(self.signalList.first) }
+  pub fn timers(self: &Self) -> Option<Entry<Timer>> { return unsafe entry<Timer>(self.timerList.first) }
+  pub fn rejections(self: &Self) -> Option<Entry<Rejection>> { return unsafe entry<Rejection>(self.rejectionList.first) }
 }
-pub unsafe fn enablePolling(rt: *mut HeapHeader) -> () {
-  let mut anchor = () let data = unsafe Pointer.borrowMut(&mut anchor, unsafe state(rt)) data.pollingEnabled = true
+/// The runtime's libc state, borrowed for as long as `owner` stays borrowed.
+/// Traps when the libc handlers were never installed.
+pub fn thread<'b, 'a, A>(realm: Realm<'a>, owner: &'b A) -> &'b ThreadState {
+  return unsafe Pointer.borrow<A, ThreadState>(owner, unsafe state(realm.runtime()))
+}
+/// thread, exclusively.
+pub fn threadMut<'b, 'a, A>(realm: Realm<'a>, owner: &'b mut A) -> &'b mut ThreadState {
+  return unsafe Pointer.borrowMut<A, ThreadState>(&mut owner.*, unsafe state(realm.runtime()))
+}
+pub fn enablePolling<'a>(realm: Realm<'a>) -> () {
+  let mut anchor = () let data = threadMut(realm, &mut anchor) data.pollingEnabled = true
 }
 pub unsafe fn setRejectionTracker(rt: *mut HeapHeader, enabled: bool) -> () {
   let mut callback = Option<NativeFunctionId>.none()
   if enabled { callback = Option<NativeFunctionId>.some(NativeFunctionId.Host { id: REJECTION_TRACKER }) }
   unsafe runtime.setPromiseRejectionTracker(rt, HostHook { callback: move callback, opaque: Pointer.null<u8>() })
 }
-pub unsafe fn beginEvalScript(rt: *mut HeapHeader) -> () {
-  let mut anchor = () let data = unsafe Pointer.borrowMut(&mut anchor, unsafe state(rt))
+pub fn beginEvalScript<'a>(realm: Realm<'a>) -> () {
+  let rt = realm.runtime() let mut anchor = () let data = threadMut(realm, &mut anchor)
   if !Pointer.isNull<Pipe>(data.recvPipe) { return () }
   data.evalScriptRecurse = data.evalScriptRecurse + 1
   if data.evalScriptRecurse == 1 {
@@ -121,8 +154,8 @@ pub unsafe fn beginEvalScript(rt: *mut HeapHeader) -> () {
     unsafe runtime.setInterruptHandler(rt, HostHook { callback: Option<NativeFunctionId>.some(NativeFunctionId.Host { id: EVAL_INTERRUPT }), opaque: Pointer.null<u8>() })
   }
 }
-pub unsafe fn endEvalScript(rt: *mut HeapHeader, failed: bool) -> () {
-  let mut anchor = () let data = unsafe Pointer.borrowMut(&mut anchor, unsafe state(rt))
+pub fn endEvalScript<'a>(realm: Realm<'a>, failed: bool) -> () {
+  let rt = realm.runtime() let mut anchor = () let data = threadMut(realm, &mut anchor)
   if !Pointer.isNull<Pipe>(data.recvPipe) { return () }
   data.evalScriptRecurse = data.evalScriptRecurse - 1
   if data.evalScriptRecurse == 0 {
@@ -136,76 +169,74 @@ pub unsafe effect fn interrupt(rt: *mut HeapHeader) -> bool ? &mut Allocator {
   let mut anchor = () let data = unsafe Pointer.borrowMut(&mut anchor, unsafe state(rt))
   return platform.interrupt(&mut data.signals)
 }
-pub unsafe fn sleep(rt: *mut HeapHeader, delay: i64) -> i32 {
-  let mut anchor = () let data = unsafe Pointer.borrowMut(&mut anchor, unsafe state(rt))
+pub fn sleep<'a>(realm: Realm<'a>, delay: i64) -> i32 {
+  let mut anchor = () let data = threadMut(realm, &mut anchor)
   return platform.sleep(&mut data.signals, delay)
 }
-unsafe fn findReadWrite(ts: *mut ThreadState, fd: i32) -> ?*mut HeapHeader {
-  let anchor = () let data = unsafe Pointer.borrow(&anchor, ts) let mut cursor = data.readWriteHandlers.first drop data
-  while let Option<*mut HeapHeader>.Some { value: node } = Pointer.nonNullMut(cursor) {
-    let entry = unsafe HeapCell.payload<ReadWriteHandler, ()>(&anchor, node)
-    if entry.fd == fd { return node }
-    drop entry cursor = unsafe next(node)
+fn findReadWrite<'a>(realm: Realm<'a>, fd: i32) -> Option<Entry<ReadWriteHandler>> {
+  let anchor = () let mut cursor = thread(realm, &anchor).readWriteHandlers()
+  while let Option<Entry<ReadWriteHandler>>.Some { value: entry } = cursor {
+    if entry.get(&anchor).fd == fd { return cursor }
+    cursor = entry.next()
   }
-  return Pointer.null<HeapHeader>()
+  return cursor
 }
-unsafe fn findSignal(ts: *mut ThreadState, number: i32) -> ?*mut HeapHeader {
-  let anchor = () let data = unsafe Pointer.borrow(&anchor, ts) let mut cursor = data.signalHandlers.first drop data
-  while let Option<*mut HeapHeader>.Some { value: node } = Pointer.nonNullMut(cursor) {
-    let entry = unsafe HeapCell.payload<SignalHandler, ()>(&anchor, node)
-    if entry.number == number { return node }
-    drop entry cursor = unsafe next(node)
+fn findSignal<'a>(realm: Realm<'a>, number: i32) -> Option<Entry<SignalHandler>> {
+  let anchor = () let mut cursor = thread(realm, &anchor).signalHandlers()
+  while let Option<Entry<SignalHandler>>.Some { value: entry } = cursor {
+    if entry.get(&anchor).number == number { return cursor }
+    cursor = entry.next()
   }
-  return Pointer.null<HeapHeader>()
+  return cursor
 }
-pub unsafe fn freeReadWrite<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, node: *mut HeapHeader) -> () {
+// Each remove unlinks the entry, frees its cell and then releases what it held, now
+// rather than deferred, so teardown leaves no handler values behind.
+unsafe fn freeReadWrite<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, entry: Entry<ReadWriteHandler>) -> () {
   let mut anchor = () let data = unsafe Pointer.borrowMut(&mut anchor, unsafe state(rt))
-  unsafe data.readWriteHandlers.remove(node) drop data
-  let entry = unsafe HeapCell.payload<ReadWriteHandler, ()>(&anchor, node)
-  let read = entry.read let write = entry.write drop entry
-  unsafe HeapCell.destroy<ReadWriteHandler>(node)
-  unsafe gc.release(&mut hooks, rt, read) unsafe gc.release(&mut hooks, rt, write)
+  unsafe data.readWriteList.remove(entry.cell.header()) drop data
+  let record = entry.getMut(&mut anchor) let read = record.read.take() let write = record.write.take() drop record
+  unsafe HeapCell.destroy<ReadWriteHandler>(entry.cell.header())
+  unsafe gc.release(&mut hooks, rt, read.intoBits()) unsafe gc.release(&mut hooks, rt, write.intoBits())
 }
-pub unsafe fn freeSignal<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, node: *mut HeapHeader) -> () {
+unsafe fn freeSignal<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, entry: Entry<SignalHandler>) -> () {
   let mut anchor = () let data = unsafe Pointer.borrowMut(&mut anchor, unsafe state(rt))
-  unsafe data.signalHandlers.remove(node) drop data
-  let entry = unsafe HeapCell.payload<SignalHandler, ()>(&anchor, node) let function = entry.function drop entry
-  unsafe HeapCell.destroy<SignalHandler>(node) unsafe gc.release(&mut hooks, rt, function)
+  unsafe data.signalList.remove(entry.cell.header()) drop data
+  let function = entry.getMut(&mut anchor).function.take()
+  unsafe HeapCell.destroy<SignalHandler>(entry.cell.header()) unsafe gc.release(&mut hooks, rt, function.intoBits())
 }
-pub unsafe fn freeTimer<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, node: *mut HeapHeader) -> () {
+unsafe fn freeTimer<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, entry: Entry<Timer>) -> () {
   let mut anchor = () let data = unsafe Pointer.borrowMut(&mut anchor, unsafe state(rt))
-  unsafe data.timers.remove(node) drop data
-  let entry = unsafe HeapCell.payload<Timer, ()>(&anchor, node) let function = entry.function drop entry
-  unsafe HeapCell.destroy<Timer>(node) unsafe gc.release(&mut hooks, rt, function)
+  unsafe data.timerList.remove(entry.cell.header()) drop data
+  let function = entry.getMut(&mut anchor).function.take()
+  unsafe HeapCell.destroy<Timer>(entry.cell.header()) unsafe gc.release(&mut hooks, rt, function.intoBits())
 }
-unsafe fn freeRejection<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, node: *mut HeapHeader) -> () {
+unsafe fn freeRejection<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, entry: Entry<Rejection>) -> () {
   let mut anchor = () let data = unsafe Pointer.borrowMut(&mut anchor, unsafe state(rt))
-  unsafe data.rejections.remove(node) drop data
-  let entry = unsafe HeapCell.payload<Rejection, ()>(&anchor, node)
-  let rejected = entry.promise let reason = entry.reason drop entry
-  unsafe HeapCell.destroy<Rejection>(node)
-  unsafe gc.release(&mut hooks, rt, rejected) unsafe gc.release(&mut hooks, rt, reason)
+  unsafe data.rejectionList.remove(entry.cell.header()) drop data
+  let record = entry.getMut(&mut anchor) let rejected = record.promise.take() let reason = record.reason.take() drop record
+  unsafe HeapCell.destroy<Rejection>(entry.cell.header())
+  unsafe gc.release(&mut hooks, rt, rejected.intoBits()) unsafe gc.release(&mut hooks, rt, reason.intoBits())
+}
+/// Unlinks and frees a timer, releasing its callback.
+pub fn removeTimer<'a, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>, entry: Entry<Timer>) -> () {
+  unsafe freeTimer(&mut hooks, realm.runtime(), entry)
+}
+/// Unlinks and frees the oldest unhandled rejection, handing its reason to the caller.
+pub fn takeRejection<'a, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>) -> Option<Value> {
+  let mut anchor = ()
+  let first = match thread(realm, &anchor).rejections() { Option<Entry<Rejection>>.Some { value } => value _ => { return Option<Value>.none() } }
+  let reason = first.getMut(&mut anchor).reason.take()
+  unsafe freeRejection(&mut hooks, realm.runtime(), first)
+  return Option<Value>.some(move reason)
 }
 pub unsafe fn freeHandlers<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader) -> () {
   if Pointer.isNull<u8>(unsafe runtime.getRuntimeOpaque(rt)) { return () }
   let ts = unsafe state(rt)
   let mut anchor = ()
-  while true {
-    let data = unsafe Pointer.borrow(&anchor, ts) let first = data.readWriteHandlers.first drop data
-    match Pointer.nonNullMut(first) { Option<*mut HeapHeader>.Some { value } => { unsafe freeReadWrite(&mut hooks, rt, value) } _ => { break } }
-  }
-  while true {
-    let data = unsafe Pointer.borrow(&anchor, ts) let first = data.signalHandlers.first drop data
-    match Pointer.nonNullMut(first) { Option<*mut HeapHeader>.Some { value } => { unsafe freeSignal(&mut hooks, rt, value) } _ => { break } }
-  }
-  while true {
-    let data = unsafe Pointer.borrow(&anchor, ts) let first = data.timers.first drop data
-    match Pointer.nonNullMut(first) { Option<*mut HeapHeader>.Some { value } => { unsafe freeTimer(&mut hooks, rt, value) } _ => { break } }
-  }
-  while true {
-    let data = unsafe Pointer.borrow(&anchor, ts) let first = data.rejections.first drop data
-    match Pointer.nonNullMut(first) { Option<*mut HeapHeader>.Some { value } => { unsafe freeRejection(&mut hooks, rt, value) } _ => { break } }
-  }
+  while let Option<Entry<ReadWriteHandler>>.Some { value } = (unsafe Pointer.borrow(&anchor, ts)).readWriteHandlers() { unsafe freeReadWrite(&mut hooks, rt, value) }
+  while let Option<Entry<SignalHandler>>.Some { value } = (unsafe Pointer.borrow(&anchor, ts)).signalHandlers() { unsafe freeSignal(&mut hooks, rt, value) }
+  while let Option<Entry<Timer>>.Some { value } = (unsafe Pointer.borrow(&anchor, ts)).timers() { unsafe freeTimer(&mut hooks, rt, value) }
+  while let Option<Entry<Rejection>>.Some { value } = (unsafe Pointer.borrow(&anchor, ts)).rejections() { unsafe freeRejection(&mut hooks, rt, value) }
   unsafe workers.freeState(&mut hooks, rt, ts)
   let data = unsafe Pointer.borrowMut(&mut anchor, ts)
   platform.dispose(&mut data.signals)
@@ -220,21 +251,16 @@ pub unsafe fn freeHandlers<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader) -> 
 // notification. Only after successful allocation do these external roots retain.
 pub effect fn trackRejection<'a, 'b, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>,
   rejected: ValueRef<'b>, reason: ValueRef<'b>, handled: bool) -> () ? &mut Allocator {
-  let rt = realm.runtime() let ts = unsafe state(rt)
-  let mut anchor = () let data = unsafe Pointer.borrow(&anchor, ts)
-  let mut cursor = data.rejections.first drop data
-  while let Option<*mut HeapHeader>.Some { value: node } = Pointer.nonNullMut(cursor) {
-    let entry = unsafe HeapCell.payload<Rejection, ()>(&anchor, node)
-    let same = unsafe core.sameValue(entry.promise, rejected.view()) drop entry
-    if same { if handled { unsafe freeRejection(&mut hooks, rt, node) } return () }
-    cursor = unsafe next(node)
+  let mut anchor = () let mut cursor = thread(realm, &anchor).rejections()
+  while let Option<Entry<Rejection>>.Some { value: entry } = cursor {
+    let same = unsafe core.sameValue(entry.get(&anchor).promise.view(), rejected.view())
+    if same { if handled { unsafe freeRejection(&mut hooks, realm.runtime(), entry) } return () }
+    cursor = entry.next()
   }
   if handled { return () }
-  let allocated = run Effect.result(HeapCell.allocate(HeapKind.Auxiliary, Rejection { promise: ValueBits.Undefined, reason: ValueBits.Undefined }))
+  let allocated = run Effect.result(HeapCell.allocate(HeapKind.Auxiliary, Rejection { promise: rejected.dup(), reason: reason.dup() }))
   let node = match move allocated { Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value _ => { return () } }
-  let entry = unsafe HeapCell.payloadMut<Rejection, ()>(&mut anchor, node)
-  entry.promise = unsafe rejected.view().retained() entry.reason = unsafe reason.view().retained() drop entry
-  let updated = unsafe Pointer.borrowMut(&mut anchor, ts) unsafe updated.rejections.pushBack(node)
+  let data = threadMut(realm, &mut anchor) unsafe data.rejectionList.pushBack(node)
 }
 effect fn int32<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H, realm: Realm<'a>, value: ValueRef<'b>) -> i32 ! JsException ? &mut Allocator {
   let mut output: i32 = 0 let converted = run Effect.result(unsafe integers.toInt32(&mut hooks, realm, &mut output, value.view()))
@@ -247,93 +273,91 @@ effect fn int64<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H, realm: Real
   return output
 }
 effect fn readWrite<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H, realm: Realm<'a>, args: Arguments<'a>, write: bool) -> ValueBits ! JsException ? &mut Allocator {
-  let rt = realm.runtime() let ts = unsafe state(rt)
   let fd = run int32(&mut hooks, realm, args.get(0))
-  let function = args.get(1).view()
-  let mut found = unsafe findReadWrite(ts, fd)
-  if !null(function) {
-    run promise.checkFunction(&mut hooks, realm, args.get(1))
-    if Pointer.isNull<HeapHeader>(found) {
-      let allocated = run Effect.result(HeapCell.allocate(HeapKind.Auxiliary, ReadWriteHandler { fd: fd, pollIndex: 0, read: ValueBits.Null, write: ValueBits.Null }))
+  let function = args.get(1)
+  let mut found = findReadWrite(realm, fd)
+  if !null(function.view()) {
+    run promise.checkFunction(&mut hooks, realm, function)
+    if found.isNone() {
+      let allocated = run Effect.result(HeapCell.allocate(HeapKind.Auxiliary, ReadWriteHandler { fd: fd, pollIndex: 0,
+        read: Value.immediate(ValueBits.Null), write: Value.immediate(ValueBits.Null) }))
       let node = match move allocated { Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => run ops.materialize(&mut hooks,realm, move error) }
-      let mut anchor = () let data = unsafe Pointer.borrowMut(&mut anchor, ts) unsafe data.readWriteHandlers.pushBack(node) found = node
+      let mut anchor = () let data = threadMut(realm, &mut anchor) unsafe data.readWriteList.pushBack(node) drop data
+      found = unsafe entry<ReadWriteHandler>(node)
     }
   }
-  let node = match Pointer.nonNullMut(found) { Option<*mut HeapHeader>.Some { value } => value _ => { return ValueBits.Undefined } }
-  let mut anchor = () let entry = unsafe HeapCell.payloadMut<ReadWriteHandler, ()>(&mut anchor, node)
-  let owned = unsafe function.retained() let mut previous = ValueBits.Null
-  if write { previous = Intrinsic.replace(entry.write, owned) } else { previous = Intrinsic.replace(entry.read, owned) }
-  let empty = null(entry.read) && null(entry.write) drop entry
-  if empty { unsafe freeReadWrite(&mut hooks, rt, node) }
-  unsafe gc.release(&mut hooks, rt, previous)
+  let handler = match found { Option<Entry<ReadWriteHandler>>.Some { value } => value _ => { return ValueBits.Undefined } }
+  let mut anchor = () let record = handler.getMut(&mut anchor)
+  let mut previous = Value.immediate(ValueBits.Null)
+  if write { previous = Intrinsic.replace(record.write, function.dup()) } else { previous = Intrinsic.replace(record.read, function.dup()) }
+  let empty = null(record.read.view()) && null(record.write.view()) drop record
+  if empty { unsafe freeReadWrite(&mut hooks, realm.runtime(), handler) }
+  realm.release(&mut hooks, move previous)
   return ValueBits.Undefined
 }
 effect fn signal<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H, realm: Realm<'a>, args: Arguments<'a>) -> ValueBits ! JsException ? &mut Allocator {
-  let rt = realm.runtime() let ts = unsafe state(rt)
-  let mut anchor = () let data = unsafe Pointer.borrow(&anchor, ts) let main = Pointer.isNull<Pipe>(data.recvPipe) drop data
-  if !main { return run ops.error(&mut hooks,realm, b"signal handler can only be set in the main thread") }
+  let mut anchor = ()
+  if !Pointer.isNull<Pipe>(thread(realm, &anchor).recvPipe) { return run ops.error(&mut hooks,realm, b"signal handler can only be set in the main thread") }
   let number = run int32(&mut hooks, realm, args.get(0))
   if number < 0 || number >= 64 { return run ops.throwError(&mut hooks,realm, NativeErrorKind.Range, b"invalid signal number") }
-  let function = args.get(1).view() let found = unsafe findSignal(ts, number)
-  if null(function) || core.undefined(function) {
-    if let Option<*mut HeapHeader>.Some { value: node } = Pointer.nonNullMut(found) { unsafe freeSignal(&mut hooks, rt, node) }
-    let data = unsafe Pointer.borrowMut(&mut anchor, ts) let mut handler: usize = 0 if core.undefined(function) { handler = 1 }
+  let function = args.get(1) let found = findSignal(realm, number)
+  if null(function.view()) || core.undefined(function.view()) {
+    if let Option<Entry<SignalHandler>>.Some { value: handler } = found { unsafe freeSignal(&mut hooks, realm.runtime(), handler) }
+    let data = threadMut(realm, &mut anchor) let mut handler: usize = 0 if core.undefined(function.view()) { handler = 1 }
     platform.remove(&mut data.signals, number, handler)
     return ValueBits.Undefined
   }
-  run promise.checkFunction(&mut hooks, realm, args.get(1))
-  let mut fresh = false
-  let mut selected = found
-  if Pointer.isNull<HeapHeader>(selected) {
-    let allocated = run Effect.result(HeapCell.allocate(HeapKind.Auxiliary, SignalHandler { number: number, function: ValueBits.Undefined }))
-    selected = match move allocated { Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => run ops.materialize(&mut hooks,realm, move error) }
-    fresh = true
+  run promise.checkFunction(&mut hooks, realm, function)
+  let handler = match found {
+    Option<Entry<SignalHandler>>.Some { value } => value
+    _ => {
+      let allocated = run Effect.result(HeapCell.allocate(HeapKind.Auxiliary, SignalHandler { number: number, function: Value.immediate(ValueBits.Undefined) }))
+      let node = match move allocated { Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => run ops.materialize(&mut hooks,realm, move error) }
+      let data = threadMut(realm, &mut anchor)
+      if !platform.install(&mut data.signals, number) { drop data unsafe HeapCell.destroy<SignalHandler>(node) return run hooks.throwOutOfMemory(realm) }
+      unsafe data.signalList.pushBack(node) drop data
+      match unsafe entry<SignalHandler>(node) { Option<Entry<SignalHandler>>.Some { value } => value _ => Intrinsic.trap("missing signal handler allocation") }
+    }
   }
-  let node = match Pointer.nonNullMut(selected) { Option<*mut HeapHeader>.Some { value } => value _ => { return Intrinsic.trap("missing signal handler allocation") } }
-  let updated = unsafe Pointer.borrowMut(&mut anchor, ts)
-  let installed = platform.install(&mut updated.signals, number)
-  if installed && fresh { unsafe updated.signalHandlers.pushBack(node) }
-  drop updated
-  if !installed { if fresh { unsafe HeapCell.destroy<SignalHandler>(node) } return run hooks.throwOutOfMemory(realm) }
-  let entry = unsafe HeapCell.payloadMut<SignalHandler, ()>(&mut anchor, node)
-  let previous = Intrinsic.replace(entry.function, unsafe function.retained()) drop entry
-  unsafe gc.release(&mut hooks, rt, previous)
+  if found.isSome() {
+    let data = threadMut(realm, &mut anchor)
+    if !platform.install(&mut data.signals, number) { drop data return run hooks.throwOutOfMemory(realm) }
+  }
+  let previous = Intrinsic.replace(handler.getMut(&mut anchor).function, function.dup())
+  realm.release(&mut hooks, move previous)
   return ValueBits.Undefined
 }
 effect fn addTimer<'a, 'b, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>, function: ValueRef<'b>, delay: i64, sleep: bool) -> i32 ! JsException ? &mut Allocator {
   let allocated = run Effect.result(HeapCell.allocate(HeapKind.Auxiliary, Timer { id: -1,
-    timeout: i64.wrappingAdd(platform.nowMilliseconds(), delay), function: ValueBits.Undefined }))
+    timeout: i64.wrappingAdd(platform.nowMilliseconds(), delay), function: function.dup() }))
   let node = match move allocated { Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => run ops.materialize(&mut hooks,realm, move error) }
-  let mut anchor = () let data = unsafe Pointer.borrowMut(&mut anchor, unsafe state(realm.runtime()))
+  let mut anchor = () let data = threadMut(realm, &mut anchor)
   let mut id: i32 = -1
   if !sleep { id = data.nextTimerId if id == i32.MAX { data.nextTimerId = 1 } else { data.nextTimerId = id + 1 } }
-  unsafe data.timers.pushBack(node) drop data
-  let entry = unsafe HeapCell.payloadMut<Timer, ()>(&mut anchor, node) entry.id = id entry.function = unsafe function.view().retained()
+  unsafe data.timerList.pushBack(node) drop data
+  let timer = unsafe HeapCell.payloadMut<Timer, ()>(&mut anchor, node) timer.id = id
   return id
 }
 pub effect fn dispatch<'a, H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + CallHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, method: u32, receiverRef: ValueRef<'a>, argvArgs: Arguments<'a>, magic: i32) -> ValueBits ! JsException ? &mut Allocator {
-  let receiver = receiverRef.view() let argv = argvArgs.slots() let argc = usize.toI32(argvArgs.length())
-  if method == SET_READ_HANDLER || method == SET_WRITE_HANDLER { return run readWrite(&mut hooks, realm, unsafe lendArguments(argv), method == SET_WRITE_HANDLER) }
-  if method == SIGNAL { return run signal(&mut hooks, realm, unsafe lendArguments(argv)) }
+  if method == SET_READ_HANDLER || method == SET_WRITE_HANDLER { return run readWrite(&mut hooks, realm, argvArgs, method == SET_WRITE_HANDLER) }
+  if method == SIGNAL { return run signal(&mut hooks, realm, argvArgs) }
   if method == SET_TIMEOUT {
-    let function = argvArgs.get(0).view() run promise.checkFunction(&mut hooks, realm, argvArgs.get(0))
-    let delay = run int64(&mut hooks, realm, (unsafe lendArguments(argv)).get(1))
+    run promise.checkFunction(&mut hooks, realm, argvArgs.get(0))
+    let delay = run int64(&mut hooks, realm, argvArgs.get(1))
     return ValueBits.Int { value: run addTimer(&mut hooks, realm, argvArgs.get(0), delay, false) }
   }
-  let rt = realm.runtime()
   if method == CLEAR_TIMEOUT {
-    let id = run int32(&mut hooks, realm, (unsafe lendArguments(argv)).get(0))
+    let id = run int32(&mut hooks, realm, argvArgs.get(0))
     if id <= 0 { return ValueBits.Undefined }
-    let anchor = () let data = unsafe Pointer.borrow(&anchor, unsafe state(rt)) let mut cursor = data.timers.first drop data
-    while let Option<*mut HeapHeader>.Some { value: node } = Pointer.nonNullMut(cursor) {
-      let entry = unsafe HeapCell.payload<Timer, ()>(&anchor, node) let found = entry.id == id drop entry
-      if found { unsafe freeTimer(&mut hooks, rt, node) break }
-      cursor = unsafe next(node)
+    let anchor = () let mut cursor = thread(realm, &anchor).timers()
+    while let Option<Entry<Timer>>.Some { value: timer } = cursor {
+      if timer.get(&anchor).id == id { removeTimer(&mut hooks, realm, timer) break }
+      cursor = timer.next()
     }
     return ValueBits.Undefined
   }
   if method == SLEEP_ASYNC {
-    let delay = run int64(&mut hooks, realm, (unsafe lendArguments(argv)).get(0))
+    let delay = run int64(&mut hooks, realm, argvArgs.get(0))
     let capability = run promise.newCapability(&mut hooks, memory, realm, immediateRef(ValueBits.Undefined))
     let installed = run addTimer(&mut hooks, realm, capability.resolve.borrow(), delay, true)
     let output = move capability.promise
