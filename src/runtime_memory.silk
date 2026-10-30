@@ -69,7 +69,9 @@ struct ArenaHeader {
 
 // One provider reference, one per outstanding allocation, and one per observer.
 // The gate protects the whole stats record so a snapshot cannot tear across a reclaim.
-// It also protects the pool.
+// It also protects the pool and the reference count: an allocation or reclaim already
+// holds the gate, so counting there costs no separate atomic read-modify-write. The
+// count is still accessed through relaxed atomics so a pre-check can read it ungated.
 struct Ledger {
   storage: Intrinsic.RawBuffer<Ledger>,
   references: usize,
@@ -96,7 +98,8 @@ unsafe fn poolOf(ledger: LedgerPointers) -> *mut Pool {
 
 impl Copy for LedgerPointers {}
 
-unsafe fn pointersOf(allocation: *mut Ledger) -> LedgerPointers with Intrinsic.inlineAlways() {
+@inlineAlways
+unsafe fn pointersOf(allocation: *mut Ledger) -> LedgerPointers {
   let mut anchor = ()
   let owner = unsafe Pointer.borrowMut<(), Ledger>(&mut anchor, allocation)
   return LedgerPointers {
@@ -115,14 +118,17 @@ struct BlockHeader {
 }
 
 // The bytes of one block of class.
-fn classBytes(class: usize) -> usize with Intrinsic.inlineAlways() { return (class + 1) * POOL_GRANULE }
-unsafe fn poolLink(block: *mut u8) -> *mut ?*mut u8 with Intrinsic.inlineAlways() {
+@inlineAlways
+fn classBytes(class: usize) -> usize { return (class + 1) * POOL_GRANULE }
+@inlineAlways
+unsafe fn poolLink(block: *mut u8) -> *mut ?*mut u8 {
   return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ?*mut u8>(block)
 }
 // The header of the arena that holds a pooled block. Arenas are aligned to their
 // size, so the header sits at the block's address rounded down to ARENA_BYTES. The
 // step back is a wrapped (negative) index that stays inside the arena allocation.
-unsafe fn arenaOf(block: *mut u8) -> *mut ArenaHeader with Intrinsic.inlineAlways() {
+@inlineAlways
+unsafe fn arenaOf(block: *mut u8) -> *mut ArenaHeader {
   let offset = usize.bitAnd(Pointer.address<u8>(block), ARENA_BYTES - 1)
   let start = unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(block), usize.wrappingSubtract(0, offset))
   return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ArenaHeader>(start)
@@ -227,14 +233,11 @@ impl<A> RuntimeAllocator<A> {
 
   pub effect fn observe(self: &Self) -> AllocationObserver ! OutOfMemoryError {
     let ledger = self.ledger
-    let mut count = unsafe Atomic.load<usize>(ledger.references, MemoryOrder.Relaxed)
-    while true {
-      if count == usize.MAX { fail OutOfMemoryError {} }
-      match unsafe Atomic.compareExchange<usize>(ledger.references, count, count + 1, MemoryOrder.Relaxed, MemoryOrder.Relaxed) {
-        CompareExchange<usize>.Exchanged => { return AllocationObserver { ledger: ledger } }
-        CompareExchange<usize>.Observed { value } => { count = value }
-      }
-    }
+    unsafe lockLedger(ledger)
+    let retained = unsafe retainGated(ledger)
+    unsafe unlockLedger(ledger)
+    if !retained { fail OutOfMemoryError {} }
+    return AllocationObserver { ledger: ledger }
   }
 }
 
@@ -248,29 +251,27 @@ where &mut A provides &Allocator from &mut Allocator {
     if self.pooling && requested != 0 && requested <= POOL_CLASSES * POOL_GRANULE && requestedAlignment != 0
       && requestedAlignment <= POOL_GRANULE && usize.bitAnd(requestedAlignment, requestedAlignment - 1) == 0 {
       let ledger = self.ledger
-      if unsafe Atomic.load<usize>(ledger.references, MemoryOrder.Relaxed) != usize.MAX {
-        let class = (requested - 1) / POOL_GRANULE
-        match Pointer.nonNullMut<u8>(unsafe takePooled(ledger, class)) {
-          Option<*mut u8>.Some { value: block } => { return unsafe adoptPooled(ledger, block, move layout) }
-          Option<*mut u8>.None => { return run refill<A>(&mut self, move layout, class) }
-        }
+      let class = (requested - 1) / POOL_GRANULE
+      match Pointer.nonNullMut<u8>(unsafe takePooled(ledger, class)) {
+        Option<*mut u8>.Some { value: block } => { return unsafe adoptPooled(ledger, block, move layout) }
+        Option<*mut u8>.None => { return run refill<A>(&mut self, move layout, class) }
       }
     }
     return run allocateUnpooled<A>(&mut self, move layout)
   }
 }
 
-unsafe fn adoptPooled(ledger: LedgerPointers, block: *mut u8, layout: Layout) -> Intrinsic.Allocation
-  with Intrinsic.inlineAlways() {
-  let retained = unsafe Atomic.fetchAdd<usize>(ledger.references, 1, MemoryOrder.Relaxed)
+@inlineAlways
+unsafe fn adoptPooled(ledger: LedgerPointers, block: *mut u8, layout: Layout) -> Intrinsic.Allocation {
   let reclaim: extern "C" fn(?*mut u8) -> () = silkRuntimeMemoryReclaimPooled
   return unsafe Intrinsic.allocationAdopt(block, move layout, reclaim, block)
 }
 
 // Returns an uncarved arena with its header written for class: the next spare
 // arena of the newest group, or the first arena of a new group.
+@inlineNever
 effect fn takeArena<A>(self: &mut RuntimeAllocator<A>, class: usize) -> *mut u8
-  ! OutOfMemoryError where &mut A provides &Allocator from &mut Allocator with Intrinsic.inlineNever() {
+  ! OutOfMemoryError where &mut A provides &Allocator from &mut Allocator {
   let ledger = self.ledger
   let mut spare = Pointer.null<u8>()
   unsafe {
@@ -318,8 +319,9 @@ effect fn takeArena<A>(self: &mut RuntimeAllocator<A>, class: usize) -> *mut u8
 }
 
 // Carves one arena into blocks of an empty class, then takes the first of them.
+@inlineNever
 effect fn refill<A>(self: &mut RuntimeAllocator<A>, layout: Layout, class: usize) -> Intrinsic.Allocation
-  ! OutOfMemoryError where &mut A provides &Allocator from &mut Allocator with Intrinsic.inlineNever() {
+  ! OutOfMemoryError where &mut A provides &Allocator from &mut Allocator {
   let ledger = self.ledger
   let before = self.stats()
   let blockBytes = classBytes(class)
@@ -358,8 +360,9 @@ effect fn refill<A>(self: &mut RuntimeAllocator<A>, layout: Layout, class: usize
 }
 
 // Every request the pool does not serve: a child allocation with its own header.
+@inlineNever
 effect fn allocateUnpooled<A>(self: &mut RuntimeAllocator<A>, layout: Layout) -> Intrinsic.Allocation
-  ! OutOfMemoryError where &mut A provides &Allocator from &mut Allocator with Intrinsic.inlineNever() {
+  ! OutOfMemoryError where &mut A provides &Allocator from &mut Allocator {
   let header = Layout.of<AllocationHeader>()
   // Layout literals can bypass Layout.make; reject invalid alignment before arithmetic.
   if layout.alignment == 0 { return run Allocator.outOfMemory() }
@@ -397,11 +400,12 @@ effect fn allocateUnpooled<A>(self: &mut RuntimeAllocator<A>, layout: Layout) ->
   unsafe {
     // An Allocator loan excludes observe() on this provider; existing observers
     // cannot clone. Reclaims can only decrease the count checked above.
-    let retained = Atomic.fetchAdd<usize>(ledger.references, 1, MemoryOrder.Relaxed)
     Pointer.put<AllocationHeader>(owner, AllocationHeader {
       storage: move storage, block: BlockHeader { ledger: ledger.allocation, chargedBytes: chargedBytes }
     })
     lockLedger(ledger)
+    // Checked above; only reclaims ran meanwhile, and they lower the count.
+    if !retainGated(ledger) { Intrinsic.trap("allocation ledger reference count overflow") }
     let mut state = Pointer.read<RuntimeMemoryStats>(ledger.stats)
     state.usedBytes = state.usedBytes + chargedBytes
     state.allocationCount = state.allocationCount + 1
@@ -421,7 +425,8 @@ impl<A> Drop for RuntimeAllocator<A> {
 
 // Critical sections contain only bounded record accesses, never allocation,
 // effect suspension, backing-owner destruction, or a user callback.
-unsafe fn lockLedger(ledger: LedgerPointers) -> () with Intrinsic.inlineAlways() {
+@inlineAlways
+unsafe fn lockLedger(ledger: LedgerPointers) -> () {
   while true {
     match unsafe Atomic.compareExchange<usize>(ledger.gate, 0, 1, MemoryOrder.Acquire, MemoryOrder.Relaxed) {
       CompareExchange<usize>.Exchanged => { return () }
@@ -430,13 +435,15 @@ unsafe fn lockLedger(ledger: LedgerPointers) -> () with Intrinsic.inlineAlways()
   }
 }
 
-unsafe fn unlockLedger(ledger: LedgerPointers) -> () with Intrinsic.inlineAlways() {
+@inlineAlways
+unsafe fn unlockLedger(ledger: LedgerPointers) -> () {
   unsafe Atomic.store<usize>(ledger.gate, 0, MemoryOrder.Release)
   return ()
 }
 
 // Pops a pooled block of class and charges its whole class, or returns null.
-unsafe fn takePooled(ledger: LedgerPointers, class: usize) -> ?*mut u8 with Intrinsic.inlineAlways() {
+@inlineAlways
+unsafe fn takePooled(ledger: LedgerPointers, class: usize) -> ?*mut u8 {
   let chargedBytes = classBytes(class)
   unsafe lockLedger(ledger)
   let mut anchor = ()
@@ -444,7 +451,8 @@ unsafe fn takePooled(ledger: LedgerPointers, class: usize) -> ?*mut u8 with Intr
   let head = pool.heads[class]
   let mut state = unsafe Pointer.read<RuntimeMemoryStats>(ledger.stats)
   let fits = state.usedBytes <= state.limit && chargedBytes <= state.limit - state.usedBytes
-  if !fits || !pool.enabled || Pointer.isNull<u8>(head) {
+  let references = unsafe Atomic.load<usize>(ledger.references, MemoryOrder.Relaxed)
+  if !fits || !pool.enabled || Pointer.isNull<u8>(head) || references == usize.MAX {
     drop pool
     unsafe unlockLedger(ledger)
     return Pointer.null<u8>()
@@ -453,6 +461,7 @@ unsafe fn takePooled(ledger: LedgerPointers, class: usize) -> ?*mut u8 with Intr
   pool.heads[class] = unsafe Pointer.read<?*mut u8>(unsafe poolLink(block))
   pool.counts[class] = pool.counts[class] - 1
   drop pool
+  unsafe Atomic.store<usize>(ledger.references, references + 1, MemoryOrder.Relaxed)
   state.usedBytes = state.usedBytes + chargedBytes
   state.allocationCount = state.allocationCount + 1
   if state.peakBytes < state.usedBytes { state.peakBytes = state.usedBytes }
@@ -461,14 +470,35 @@ unsafe fn takePooled(ledger: LedgerPointers, class: usize) -> ?*mut u8 with Intr
   return head
 }
 
-unsafe fn releaseLedger(ledger: LedgerPointers) -> () with Intrinsic.inlineAlways() {
-  if unsafe Atomic.fetchSubtract<usize>(ledger.references, 1, MemoryOrder.Release) != 1 { return () }
-  unsafe destroyLedger(ledger)
+@inlineAlways
+unsafe fn releaseLedger(ledger: LedgerPointers) -> () {
+  unsafe lockLedger(ledger)
+  let last = unsafe releaseGated(ledger)
+  unsafe unlockLedger(ledger)
+  if last { unsafe destroyLedger(ledger) }
+}
+
+// Takes one reference with the gate held, unless the count is saturated.
+@inlineAlways
+unsafe fn retainGated(ledger: LedgerPointers) -> bool {
+  let count = unsafe Atomic.load<usize>(ledger.references, MemoryOrder.Relaxed)
+  if count == usize.MAX { return false }
+  unsafe Atomic.store<usize>(ledger.references, count + 1, MemoryOrder.Relaxed)
+  return true
+}
+
+// Drops one reference with the gate held; true when it was the final one. The gate's
+// acquire and release order every earlier access before the destruction that follows.
+@inlineAlways
+unsafe fn releaseGated(ledger: LedgerPointers) -> bool {
+  let count = unsafe Atomic.load<usize>(ledger.references, MemoryOrder.Relaxed) - 1
+  unsafe Atomic.store<usize>(ledger.references, count, MemoryOrder.Relaxed)
+  return count == 0
 }
 
 // Runs once the final reference is gone. Idle pooled blocks live in the arenas.
-unsafe fn destroyLedger(ledger: LedgerPointers) -> () with Intrinsic.inlineNever() {
-  Atomic.fence(MemoryOrder.Acquire)
+@inlineNever
+unsafe fn destroyLedger(ledger: LedgerPointers) -> () {
   // No provider, observer or allocation can access this cell after the final reference.
   let owner = unsafe Pointer.take<Ledger>(ledger.allocation)
   let mut arena = owner.pool.arenas
@@ -484,17 +514,22 @@ unsafe fn destroyLedger(ledger: LedgerPointers) -> () with Intrinsic.inlineNever
 
 // Uncharges one reclaimed block's chargedBytes and, for a pooled block, returns it
 // to class's list.
-unsafe fn uncharge(ledger: LedgerPointers, chargedBytes: usize) -> () with Intrinsic.inlineAlways() {
+// Both also drop the block's ledger reference and return true when it was the final one.
+@inlineAlways
+unsafe fn uncharge(ledger: LedgerPointers, chargedBytes: usize) -> bool {
   unsafe {
     lockLedger(ledger)
     let mut state = Pointer.read<RuntimeMemoryStats>(ledger.stats)
     state.usedBytes = state.usedBytes - chargedBytes
     state.allocationCount = state.allocationCount - 1
     Pointer.write<RuntimeMemoryStats>(ledger.stats, state)
+    let last = releaseGated(ledger)
     unlockLedger(ledger)
+    return last
   }
 }
-unsafe fn unchargePooled(ledger: LedgerPointers, block: *mut u8, class: usize) -> () with Intrinsic.inlineAlways() {
+@inlineAlways
+unsafe fn unchargePooled(ledger: LedgerPointers, block: *mut u8, class: usize) -> bool {
   unsafe {
     lockLedger(ledger)
     let mut state = Pointer.read<RuntimeMemoryStats>(ledger.stats)
@@ -507,7 +542,9 @@ unsafe fn unchargePooled(ledger: LedgerPointers, block: *mut u8, class: usize) -
     pool.heads[class] = Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(block)
     pool.counts[class] = pool.counts[class] + 1
     drop pool
+    let last = releaseGated(ledger)
     unlockLedger(ledger)
+    return last
   }
 }
 
@@ -518,8 +555,7 @@ export "C" fn silkRuntimeMemoryReclaimPooled(context: ?*mut u8) -> () {
   let ledger = unsafe pointersOf(arena.ledger)
   let class = arena.class
   drop arena
-  unsafe unchargePooled(ledger, block, class)
-  unsafe releaseLedger(ledger)
+  if unsafe unchargePooled(ledger, block, class) { unsafe destroyLedger(ledger) }
   return ()
 }
 
@@ -531,11 +567,11 @@ export "C" fn silkRuntimeMemoryReclaim(context: ?*mut u8) -> () {
   let ledger = unsafe pointersOf(header.block.ledger)
   let chargedBytes = header.block.chargedBytes
   drop header
-  unsafe uncharge(ledger, chargedBytes)
+  let last = unsafe uncharge(ledger, chargedBytes)
   // Move the complete header out before freeing the storage that contained it.
   // Free backing outside the gate, since the child may itself be a RuntimeAllocator.
   let owner = unsafe Pointer.take<AllocationHeader>(address)
   drop owner
-  unsafe releaseLedger(ledger)
+  if last { unsafe destroyLedger(ledger) }
   return ()
 }
