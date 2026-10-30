@@ -32,3 +32,18 @@ src = null;
 for (var i = 0; i < 50; i++) assert(kept[i].toString(), "function k" + i + "() { return " + i + "; }", "kept " + i);
 assert(eval("(function e() { return 'ü'; })").toString(), "function e() { return 'ü'; }", "eval");
 assert(new Function("a", "b", "return a + b").toString(), "function anonymous(a,b\n) {\nreturn a + b\n}", "Function constructor");
+// An ASCII source string is compiled in place and its functions share the string.
+var shortSource = "(function q() { return 7; })";
+var q = eval(shortSource);
+shortSource = null;
+assert(q.toString(), "function q() { return 7; }", "short ASCII eval");
+var longSource = "(function w() { return '" + "y".repeat(500) + "'; })";
+longSource = longSource + "";
+var w = eval(longSource);
+longSource = null;
+assert(w.toString(), "function w() { return '" + "y".repeat(500) + "'; }", "long ASCII eval");
+function directEval() { var local = 3; return eval("(function d() { return local; })"); }
+assert(directEval().toString(), "function d() { return local; }", "direct eval");
+assert(directEval()(), 3, "direct eval closure");
+assert(eval("(function z() { return '\\xff'; })").toString(), "function z() { return '\\xff'; }", "escaped non-ASCII");
+assert(eval("(function y() { return '\xff'; })").toString(), "function y() { return '\xff'; }", "Latin-1 eval");
