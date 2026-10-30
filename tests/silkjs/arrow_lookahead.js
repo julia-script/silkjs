@@ -26,3 +26,14 @@ for (var i = 0; i < 60; i++) fsrc += "function g" + i + "() { return " + i + "; 
 fsrc += "function g3() { return 33; }\nreturn g3() + g59();";
 check("many functions", new Function(fsrc)(), 33 + 59);
 console.log("ok");
+// Redeclaration checks in scopes with more than 32 declarations.
+function decls(prefix, n) { var s = ""; for (var i = 0; i < n; i++) s += prefix + " d" + i + " = " + i + ";\n"; return s; }
+function throwsSyntax(src) { try { new Function(src); return false; } catch (e) { return e instanceof SyntaxError; } }
+check("let dup", throwsSyntax(decls("let", 40) + "let d3 = 1;"), true);
+check("let var clash", throwsSyntax(decls("let", 40) + "var d7 = 1;"), true);
+check("var let clash", throwsSyntax(decls("var", 40) + "let d9 = 1;"), true);
+check("block shadow", new Function(decls("let", 40) + "{ let d5 = 50; var e = d5; } return e + d5;")(), 55);
+check("const read", new Function(decls("const", 40) + "return d39 + d0;")(), 39);
+check("tdz", (function () { try { new Function(decls("let", 40) + "return z; let z = 1;")(); return "no"; } catch (e) { return e.constructor.name; } })(), "ReferenceError");
+check("closure", new Function(decls("let", 40) + "return (function () { return d20 + d33; })();")(), 53);
+check("with", new Function(decls("var", 40) + "var o = { d2: 200 }; with (o) { return d2 + d3; }")(), 203);
