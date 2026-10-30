@@ -25,6 +25,7 @@ import js_atom_data as atoms
 import js_class_data as classes
 import js_exceptions { JsException }
 import js_map_storage as storage
+import js_map_storage { Collection, Cursor }
 import js_map_iterators as iterators
 import js_collection_support as support
 import js_owned_value { Value, ValueRef, lendBits, immediateRef }
@@ -150,42 +151,36 @@ effect fn constructBody<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks 
   }
   return object.intoBits()
 }
-unsafe effect fn forEach<'a, 'b, H: HeapHooks + CoercionHooks + CallHooks>(hooks: &mut H, realm: Realm<'a>,
-  collection: ValueRef<'b>, node: *mut HeapHeader, callback: ValueRef<'b>, thisArgument: ValueRef<'b>, set: bool) -> ValueBits ! JsException ? &mut Allocator {
+effect fn forEach<'a, 'b, H: HeapHooks + CoercionHooks + CallHooks>(hooks: &mut H, realm: Realm<'a>,
+  collection: ValueRef<'b>, entries: Collection<'b>, callback: ValueRef<'b>, thisArgument: ValueRef<'b>, set: bool) -> ValueBits ! JsException ? &mut Allocator {
   if !hooks.isCallable(realm, callback) { return run ops.error(&mut hooks,realm, b"not a function") }
-  let mut cursor = unsafe storage.first(node)
-  while !Pointer.isNull<HeapHeader>(cursor) {
-    let record = unsafe storage.nonnull(cursor)
-    if unsafe storage.empty(record) { cursor = unsafe storage.following(record) continue }
-    unsafe storage.lock(record)
-    let borrowedKey = unsafe storage.key(record)
-    let key = unsafe borrowedKey.retained() let mut value = key
-    if !set { let borrowedValue = unsafe storage.value(record) value = unsafe borrowedValue.retained() }
-    let mut values = [value, key, collection.view()]
-    let args = FrameSlots { data: Pointer.fromMutRef<ValueBits>(&mut values[0]), count: 3 }
-    let called = run Effect.result(unsafe support.call(&mut hooks, realm, callback, thisArgument, &args))
-    unsafe support.release(&mut hooks, realm, value) if !set { unsafe support.release(&mut hooks, realm, key) }
-    cursor = unsafe storage.following(record) unsafe storage.unlock(node, record)
-    match move called { Result<Value, JsException>.Success { value: result } => { drop result } Result<Value, JsException>.Failure { error } => { fail move error } }
+  let mut cursor = Cursor.start()
+  while entries.advance(&mut cursor) {
+    let key = entries.key(&cursor)
+    let mut value = key.dup() if !set { value = entries.value(&cursor) }
+    let called = run Effect.result(support.callWith(&mut hooks, realm, callback, thisArgument, &[value.view(), key.view(), collection.view()]))
+    realm.release(&mut hooks, move value) realm.release(&mut hooks, move key)
+    match move called { Result<Value, JsException>.Success { value: result } => { drop result } Result<Value, JsException>.Failure { error } => { entries.leave(&mut cursor) fail move error } }
   }
   return ValueBits.Undefined
 }
-unsafe effect fn getOrInsert<'a, 'b, H: HeapHooks + CoercionHooks + CallHooks>(hooks: &mut H, realm: Realm<'a>,
-  node: *mut HeapHeader, key: ValueRef<'b>, input: ValueRef<'b>, computed: bool, weak: bool) -> ValueBits ! JsException ? &mut Allocator {
+effect fn getOrInsert<'a, 'b, H: HeapHooks + CoercionHooks + CallHooks>(hooks: &mut H, realm: Realm<'a>,
+  entries: Collection<'b>, key: ValueRef<'b>, input: ValueRef<'b>, computed: bool, weak: bool) -> ValueBits ! JsException ? &mut Allocator {
   if computed && !hooks.isCallable(realm, input) { return run ops.error(&mut hooks,realm, b"not a function") }
   let normalized = storage.normalize(key.view())
   if weak && !unsafe gc.isWeakTarget(normalized) { return run ops.error(&mut hooks,realm, b"invalid value used as WeakMap key") }
-  if unsafe storage.has(node, normalized) { return unsafe storage.get(node, normalized) }
-  let mut value = ValueBits.Undefined
+  // normalize only maps -0 to +0, so the normalized key is lent by `key`.
+  let lookup = unsafe lendBits(&key, normalized)
+  if entries.has(lookup) { return entries.get(lookup).intoBits() }
+  let mut value = input.dup()
   if computed {
-    let mut keyArgument = normalized let args = FrameSlots { data: Pointer.fromMutRef<ValueBits>(&mut keyArgument), count: 1 }
-    value = (run unsafe support.call(&mut hooks, realm, input, immediateRef(ValueBits.Undefined), &args)).intoBits()
-    let erased = unsafe storage.erase(&mut hooks, realm.runtime(), node, normalized)
-  } else { value = unsafe input.view().retained() }
-  let inserted = run Effect.result(unsafe storage.put(&mut hooks, realm, node, normalized, value))
+    value = run support.callWith(&mut hooks, realm, input, immediateRef(ValueBits.Undefined), &[normalized])
+    let erased = entries.erase(&mut hooks, realm, lookup)
+  }
+  let inserted = run Effect.result(entries.put(&mut hooks, realm, lookup, value.borrow()))
   match move inserted {
-    Result<(), JsException>.Success { .. } => { return value }
-    Result<(), JsException>.Failure { error } => { unsafe support.release(&mut hooks, realm, value) fail move error }
+    Result<(), JsException>.Success { .. } => { return value.intoBits() }
+    Result<(), JsException>.Failure { error } => { realm.release(&mut hooks, move value) fail move error }
   }
 }
 /// get/set/add/has/delete called straight from the native call path, skipping the
@@ -210,18 +205,15 @@ pub effect fn quickMethod<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H, r
   family: BuiltinFamily, method: u32, receiver: ValueRef<'b>, args: Arguments<'a>) -> Option<ValueBits> ! JsException ? &mut Allocator {
   if method < SET || method > DELETE { return Option<ValueBits>.none() }
   let kind = magic(family)
-  let node = match Pointer.nonNullMut<HeapHeader>(unsafe storage.state(receiver.view(), kind)) {
-    Option<*mut HeapHeader>.Some { value } => value
-    _ => { return Option<ValueBits>.none() }
-  }
-  let key = args.get(0).view()
+  let entries = match Collection.find(receiver, kind) { Option<Collection<'b>>.Some { value } => value _ => { return Option<ValueBits>.none() } }
+  let key = args.get(0)
   if method == SET {
-    let mut stored = args.get(1).view() if (kind & 1) != 0 { stored = ValueBits.Undefined }
-    run unsafe storage.put(&mut hooks, realm, node, key, stored) return Option<ValueBits>.some(unsafe receiver.view().retained())
+    let mut stored = args.get(1) if (kind & 1) != 0 { stored = immediateRef(ValueBits.Undefined) }
+    run entries.put(&mut hooks, realm, key, stored) return Option<ValueBits>.some(receiver.dup().intoBits())
   }
-  if method == GET { return Option<ValueBits>.some(unsafe storage.get(node, key)) }
-  if method == HAS { return Option<ValueBits>.some(ValueBits.Bool { value: unsafe storage.has(node, key) }) }
-  return Option<ValueBits>.some(ValueBits.Bool { value: unsafe storage.erase(&mut hooks, realm.runtime(), node, key) })
+  if method == GET { return Option<ValueBits>.some(entries.get(key).intoBits()) }
+  if method == HAS { return Option<ValueBits>.some(ValueBits.Bool { value: entries.has(key) }) }
+  return Option<ValueBits>.some(ValueBits.Bool { value: entries.erase(&mut hooks, realm, key) })
 }
 /// Generic/constructor/getter dispatcher. IteratorNext integrations call the raw
 /// js_map_iterators.next entrypoint; this direct API wraps its result exactly once.
@@ -238,19 +230,19 @@ pub effect fn call<'a, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetProp
     let mut flag: i32 = 0 if done { flag = 1 }
     return run unsafe functions.createIteratorResult(&mut hooks, memory, realm, value, flag)
   }
-  let node = run storage.requireState(&mut hooks, realm, thisValueRef, kind)
-  let key = argumentsArgs.get(0).view() let value = argumentsArgs.get(1).view()
+  let entries = run Collection.require(&mut hooks, realm, thisValueRef, kind)
+  let key = argumentsArgs.get(0)
   if method == SET {
-    let mut stored = value if (kind & 1) != 0 { stored = ValueBits.Undefined }
-    run unsafe storage.put(&mut hooks, realm, node, key, stored) return unsafe thisValue.retained()
+    let mut stored = argumentsArgs.get(1) if (kind & 1) != 0 { stored = immediateRef(ValueBits.Undefined) }
+    run entries.put(&mut hooks, realm, key, stored) return thisValueRef.dup().intoBits()
   }
-  if method == GET { return unsafe storage.get(node, key) }
-  if method == HAS { return ValueBits.Bool { value: unsafe storage.has(node, key) } }
-  if method == DELETE { return ValueBits.Bool { value: unsafe storage.erase(&mut hooks, realm.runtime(), node, key) } }
-  if method == CLEAR { unsafe storage.clear(&mut hooks, realm.runtime(), node) return ValueBits.Undefined }
-  if method == SIZE { return ValueBits.number(u32.toF64(unsafe storage.count(node))) }
-  if method == FOR_EACH { return run unsafe forEach(&mut hooks, realm, thisValueRef, node, argumentsArgs.get(0), argumentsArgs.get(1), kind != 0) }
-  if method == GET_OR_INSERT || method == GET_OR_INSERT_COMPUTED { return run unsafe getOrInsert(&mut hooks, realm, node, argumentsArgs.get(0), argumentsArgs.get(1), method == GET_OR_INSERT_COMPUTED, kind >= 2) }
+  if method == GET { return entries.get(key).intoBits() }
+  if method == HAS { return ValueBits.Bool { value: entries.has(key) } }
+  if method == DELETE { return ValueBits.Bool { value: entries.erase(&mut hooks, realm, key) } }
+  if method == CLEAR { entries.clear(&mut hooks, realm) return ValueBits.Undefined }
+  if method == SIZE { return ValueBits.number(u32.toF64(entries.count())) }
+  if method == FOR_EACH { return run forEach(&mut hooks, realm, thisValueRef, entries, argumentsArgs.get(0), argumentsArgs.get(1), kind != 0) }
+  if method == GET_OR_INSERT || method == GET_OR_INSERT_COMPUTED { return run getOrInsert(&mut hooks, realm, entries, argumentsArgs.get(0), argumentsArgs.get(1), method == GET_OR_INSERT_COMPUTED, kind >= 2) }
   let mut iteratorKind: u32 = 0
   if method == ENTRIES { iteratorKind = 2 } else if method == VALUES && kind == 0 { iteratorKind = 1 }
   return run iterators.create(&mut hooks, memory, realm, thisValueRef, kind, iteratorKind)
