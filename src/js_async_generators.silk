@@ -11,6 +11,7 @@ import js_core_types { ContextState, ObjectData, ObjectPayload, ObjectPayloadFam
 import js_value { ValueBits }
 import js_intl_realm as ops
 import js_owned_value { Value, ValueRef, lendBits, immediateRef }
+import silk.core.ownership { Copy }
 import js_gc { HeapHooks, Tracer }
 import js_gc as gc
 import js_runtime as runtime
@@ -24,7 +25,6 @@ import js_call_host { CallHooks }
 import js_error_host { ErrorHooks }
 import js_eval_host { EvalHooks }
 import js_exceptions { JsException }
-import js_exceptions as exceptions
 import js_proxy_core as core
 import js_constructor_ops as constructors
 import js_native_functions as functions
@@ -95,24 +95,61 @@ pub unsafe fn finalize<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, object:
   let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, object) data.payload = ObjectPayload.Empty drop data
   unsafe free(&mut hooks, rt, reference)
 }
-unsafe effect fn settle<'a, 'b, H: HeapHooks + CoercionHooks + CallHooks>(hooks: &mut H, realm: Realm<'a>,
-  reference: *mut HeapHeader, value: ValueRef<'b>, reject: bool) -> () ? &mut Allocator {
-  let mut anchor = () let data = unsafe HeapCell.payloadMut<Data, ()>(&mut anchor, reference)
-  let request = match unsafe data.queue.popFront() { Option<*mut HeapHeader>.Some { value: selected } => selected _ => invariant() } drop data
-  let entry = unsafe HeapCell.payload<Request, ()>(&anchor, request)
-  let mut method = entry.capability.resolve.view() if reject { method = entry.capability.reject.view() } drop entry
-  // Unlink before invoking the resolver: then getters may enqueue/reenter the generator.
-  let returned = run Effect.catch<JsException>(promise.call(&mut hooks, realm, unsafe lendBits(&method, method), immediateRef(ValueBits.Undefined), &[value.view()]), promise.exceptionValue)
-  drop returned
-  unsafe freeRequest(request)
-}
-unsafe effect fn resolve<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + CallHooks>(hooks: &mut H,
-  memory: &AllocationObserver, realm: Realm<'a>, reference: *mut HeapHeader, value: ValueRef<'b>, done: bool) -> () ? &mut Allocator {
-  let mut completed: i32 = 0 if done { completed = 1 }
-  let result = unsafe Value.adoptBits(run Effect.catch<JsException>(unsafe functions.createIteratorResult(&mut hooks, memory, realm, unsafe value.view().retained(), completed), core.exceptionValue))
-  // The pinned source passes even the Exception sentinel to resolve and keeps
-  // its pending error. ValueBits.Exception is an immediate non-owning native value.
-  run unsafe settle(&mut hooks, realm, reference, result.borrow(), false)
+/// The oldest pending request: its completion kind and a new owner of its input.
+struct Pending { completion: i32, input: Value }
+/// The state a live AsyncGenerator object owns, lent for as long as the object is.
+/// Only the object's finalizer frees it.
+struct Generator<'a> { node: *mut HeapHeader }
+impl<'a> Copy for Generator<'a> {}
+impl<'a> Generator<'a> {
+  /// The state `object` owns, or none when it is not an AsyncGenerator object.
+  fn find(object: ValueRef<'a>) -> Option<Generator<'a>> {
+    return match Pointer.nonNullMut<HeapHeader>(unsafe storage(object.view())) {
+      Option<*mut HeapHeader>.Some { value } => Option<Generator<'a>>.Some { value: Generator<'a> { node: value } }
+      _ => Option<Generator<'a>>.None
+    }
+  }
+  /// The state `object` owns; it must be an AsyncGenerator object.
+  fn of(object: ValueRef<'a>) -> Generator<'a> { return Generator<'a> { node: unsafe required(object.view()) } }
+  fn state(self: Generator<'a>) -> i32 { return unsafe state(self.node) }
+  fn setState(self: Generator<'a>, state: i32) -> () { unsafe setState(self.node, state) }
+  fn activation(self: Generator<'a>) -> *mut HeapHeader { return unsafe activation(self.node) }
+  /// Marks the generator completed and releases its activation.
+  fn complete<'r, H: HeapHooks>(self: Generator<'a>, hooks: &mut H, realm: Realm<'r>) -> () { unsafe complete(&mut hooks, realm.runtime(), self.node) }
+  fn front(self: Generator<'a>) -> Option<Pending> {
+    let anchor = () let data = unsafe HeapCell.payload<Data, ()>(&anchor, self.node)
+    let request = match Pointer.nonNullMut<HeapHeader>(data.queue.first) { Option<*mut HeapHeader>.Some { value } => value _ => { return Option<Pending>.None } }
+    drop data
+    let entry = unsafe HeapCell.payload<Request, ()>(&anchor, request)
+    return Option<Pending>.Some { value: Pending { completion: entry.completion, input: entry.result.dup() } }
+  }
+  /// Appends `request` to the FIFO queue.
+  effect fn enqueue(self: Generator<'a>, request: Request) -> () ! OutOfMemoryError ? &mut Allocator {
+    let node = run HeapCell.allocate(HeapKind.Auxiliary, move request)
+    let mut anchor = () let data = unsafe HeapCell.payloadMut<Data, ()>(&mut anchor, self.node)
+    unsafe data.queue.pushBack(node)
+  }
+  /// Removes the oldest request and settles its promise with `value`.
+  effect fn settle<'r, 'b, H: HeapHooks + CoercionHooks + CallHooks>(self: Generator<'a>, hooks: &mut H, realm: Realm<'r>,
+    value: ValueRef<'b>, reject: bool) -> () ? &mut Allocator {
+    let mut anchor = () let data = unsafe HeapCell.payloadMut<Data, ()>(&mut anchor, self.node)
+    let request = match unsafe data.queue.popFront() { Option<*mut HeapHeader>.Some { value: selected } => selected _ => invariant() } drop data
+    let entry = unsafe HeapCell.payload<Request, ()>(&anchor, request)
+    let mut method = entry.capability.resolve.view() if reject { method = entry.capability.reject.view() } drop entry
+    // Unlink before invoking the resolver: then getters may enqueue/reenter the generator.
+    let returned = run Effect.catch<JsException>(promise.call(&mut hooks, realm, unsafe lendBits(&request, method), immediateRef(ValueBits.Undefined), &[value.view()]), promise.exceptionValue)
+    drop returned
+    unsafe freeRequest(request)
+  }
+  /// Resolves the oldest request with an iterator result for `value`.
+  effect fn resolve<'r, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + CallHooks>(self: Generator<'a>, hooks: &mut H,
+    memory: &AllocationObserver, realm: Realm<'r>, value: ValueRef<'b>, done: bool) -> () ? &mut Allocator {
+    let mut completed: i32 = 0 if done { completed = 1 }
+    let result = unsafe Value.adoptBits(run Effect.catch<JsException>(unsafe functions.createIteratorResult(&mut hooks, memory, realm, value.dup().intoBits(), completed), core.exceptionValue))
+    // The pinned source passes even the Exception sentinel to resolve and keeps
+    // its pending error. ValueBits.Exception is an immediate non-owning native value.
+    run self.settle(&mut hooks, realm, result.borrow(), false)
+  }
 }
 effect fn attach<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + PromiseHooks>(hooks: &mut H,
   memory: &AllocationObserver, realm: Realm<'a>, generator: ValueRef<'b>, wrapper: Value, returning: bool) -> () ! JsException ? &mut Allocator {
@@ -146,45 +183,43 @@ effect fn awaitValue<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + P
 }
 effect fn resumeNext<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks + PromiseHooks>(hooks: &mut H,
   memory: &AllocationObserver, realm: Realm<'a>, generator: ValueRef<'b>) -> () ? &mut Allocator {
-  let reference = unsafe required(generator.view()) let rt = realm.runtime()
+  let state = Generator.of(generator)
   while true {
-    let anchor = () let data = unsafe HeapCell.payload<Data, ()>(&anchor, reference)
-    let request = match Pointer.nonNullMut<HeapHeader>(data.queue.first) { Option<*mut HeapHeader>.Some { value } => value _ => { return } }
-    let current = data.state drop data
+    let pending = match state.front() { Option<Pending>.Some { value } => move value _ => { return } }
+    let current = state.state()
     if current == AWAITING_RETURN { return }
-    let entry = unsafe HeapCell.payload<Request, ()>(&anchor, request)
-    let magic = entry.completion let input = entry.result.view() drop entry
-    if current == START && magic != 0 { unsafe complete(&mut hooks, rt, reference) continue }
+    let Pending { completion: magic, input } = move pending
+    if current == START && magic != 0 { drop input state.complete(&mut hooks, realm) continue }
     if current == COMPLETED {
-      if magic == 0 { run unsafe resolve(&mut hooks, memory, realm, reference, immediateRef(ValueBits.Undefined), true) }
-      else if magic == 2 { run unsafe settle(&mut hooks, realm, reference, unsafe lendBits(&input, input), true) }
+      if magic == 0 { run state.resolve(&mut hooks, memory, realm, immediateRef(ValueBits.Undefined), true) }
+      else if magic == 2 { run state.settle(&mut hooks, realm, input.borrow(), true) }
       else {
-        unsafe setState(reference, AWAITING_RETURN)
-        let awaited = run Effect.result(awaitValue(&mut hooks, memory, realm, generator, unsafe lendBits(&input, input), true))
+        state.setState(AWAITING_RETURN)
+        let awaited = run Effect.result(awaitValue(&mut hooks, memory, realm, generator, input.borrow(), true))
       }
       // Source stops after one completed request, including failed return-await
       // installation. Consumers record remaining pending requests independently.
       return
     }
-    let node = unsafe activation(reference)
+    let node = state.activation()
     if current != EXECUTING {
-      if current == START { unsafe frames.throwing(node, false) }
+      if current == START { drop input unsafe frames.throwing(node, false) }
       else if magic == 2 && current == YIELD {
-        let pending = run Effect.catch<JsException>(unsafe exceptions.throwValue<ValueBits, H>(&mut hooks, rt, unsafe input.retained()), core.exceptionValue)
+        let thrown = run Effect.catch<JsException>(realm.throwValue<ValueBits, H>(&mut hooks, move input), core.exceptionValue)
         unsafe frames.throwing(node, true)
       } else {
-        unsafe frames.putResult(node, unsafe input.retained()) unsafe frames.pushCompletion(node, magic) unsafe frames.throwing(node, false)
+        unsafe frames.putResult(node, input.intoBits()) unsafe frames.pushCompletion(node, magic) unsafe frames.throwing(node, false)
       }
-      unsafe setState(reference, EXECUTING)
-    }
+      state.setState(EXECUTING)
+    } else { drop input }
     let returned = run Effect.catch<JsException>(unsafe frames.resume(&mut hooks, memory, realm, node), core.exceptionValue)
     if unsafe frames.completed(node) {
       if returned.isException() {
-        let error = realm.takeException() unsafe complete(&mut hooks, rt, reference)
-        run unsafe settle(&mut hooks, realm, reference, error.borrow(), true) drop error
+        let error = realm.takeException() state.complete(&mut hooks, realm)
+        run state.settle(&mut hooks, realm, error.borrow(), true) drop error
       } else {
-        let result = unsafe Value.adoptBits(returned) unsafe complete(&mut hooks, rt, reference)
-        run unsafe resolve(&mut hooks, memory, realm, reference, result.borrow(), true) drop result
+        let result = unsafe Value.adoptBits(returned) state.complete(&mut hooks, realm)
+        run state.resolve(&mut hooks, memory, realm, result.borrow(), true) drop result
       }
       continue
     }
@@ -192,8 +227,8 @@ effect fn resumeNext<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + G
     let value = unsafe Value.adoptBits(unsafe frames.takeResult(node))
     if code == frames.YIELD || code == frames.YIELD_STAR {
       let mut suspended = YIELD if code == frames.YIELD_STAR { suspended = YIELD_STAR }
-      unsafe setState(reference, suspended)
-      run unsafe resolve(&mut hooks, memory, realm, reference, value.borrow(), false) drop value
+      state.setState(suspended)
+      run state.resolve(&mut hooks, memory, realm, value.borrow(), false) drop value
     } else if code == frames.AWAIT {
       let awaited = run Effect.result(awaitValue(&mut hooks, memory, realm, generator, value.borrow(), false))
       drop value
@@ -205,29 +240,26 @@ effect fn resumeNext<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + G
   }
 }
 pub effect fn resolvingCall<'a, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks + PromiseHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, argvArgs: Arguments<'a>, magic: i32, capturedArgs: Arguments<'a>) -> ValueBits ! JsException ? &mut Allocator {
-  let captured = capturedArgs.slots()
-  let generator = unsafe captured.get(0) let reference = unsafe required(generator)
-  let input = argvArgs.get(0).view() let reject = (magic & 1) != 0
+  let generator = capturedArgs.get(0) let state = Generator.of(generator)
+  let reject = (magic & 1) != 0
   if magic >= 2 {
-    require(unsafe state(reference) == AWAITING_RETURN || unsafe state(reference) == COMPLETED)
-    unsafe setState(reference, COMPLETED)
-    if reject { run unsafe settle(&mut hooks, realm, reference, argvArgs.get(0), true) }
-    else { run unsafe resolve(&mut hooks, memory, realm, reference, argvArgs.get(0), true) }
-  } else if unsafe state(reference) == EXECUTING {
-    let node = unsafe activation(reference) unsafe frames.throwing(node, reject)
+    require(state.state() == AWAITING_RETURN || state.state() == COMPLETED)
+    state.setState(COMPLETED)
+    if reject { run state.settle(&mut hooks, realm, argvArgs.get(0), true) }
+    else { run state.resolve(&mut hooks, memory, realm, argvArgs.get(0), true) }
+  } else if state.state() == EXECUTING {
+    let node = state.activation() unsafe frames.throwing(node, reject)
     if reject {
       let pending = run Effect.catch<JsException>(realm.throwValue<ValueBits, H>(&mut hooks, argvArgs.get(0).dup()), core.exceptionValue)
-    } else { unsafe frames.putResult(node, unsafe input.retained()) }
-    run resumeNext(&mut hooks, memory, realm, unsafe lendBits(&generator, generator))
+    } else { unsafe frames.putResult(node, argvArgs.get(0).dup().intoBits()) }
+    run resumeNext(&mut hooks, memory, realm, generator)
   }
   return ValueBits.Undefined
 }
 pub effect fn next<'a, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks + PromiseHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, receiverRef: ValueRef<'a>, argvArgs: Arguments<'a>, magic: i32) -> ValueBits ! JsException ? &mut Allocator {
-  let receiver = receiverRef.view()
   let capability = run promise.newCapability(&mut hooks, memory, realm, immediateRef(ValueBits.Undefined))
-  let rt = realm.runtime()
-  let reference = match Pointer.nonNullMut<HeapHeader>(unsafe storage(receiver)) {
-    Option<*mut HeapHeader>.Some { value } => value
+  let state = match Generator.find(receiverRef) {
+    Option<Generator<'a>>.Some { value } => value
     _ => {
       let pending = run Effect.catch<JsException>(core.error(&mut hooks, realm, b"not an AsyncGenerator object"), core.exceptionValue)
       let error = realm.takeException()
@@ -236,19 +268,14 @@ pub effect fn next<'a, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetProp
       return output.intoBits()
     }
   }
-  let allocated = run Effect.result(HeapCell.allocate(HeapKind.Auxiliary, Request { completion: magic, result: Value.immediate(ValueBits.Undefined), capability: Capability.make() }))
-  let request = match move allocated {
-    Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value
-    Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => run core.materialize(&mut hooks, realm, move error)
+  let output = capability.promise.dup()
+  let queued = run Effect.result(state.enqueue(Request { completion: magic, result: argvArgs.get(0).dup(), capability: move capability }))
+  match move queued {
+    Result<(), OutOfMemoryError>.Success { .. } => ()
+    Result<(), OutOfMemoryError>.Failure { error } => run core.materialize(&mut hooks, realm, move error)
   }
-  let output = capability.promise.dup().intoBits()
-  let mut anchor = () let entry = unsafe HeapCell.payloadMut<Request, ()>(&mut anchor, request)
-  let input = argvArgs.get(0).view()
-  entry.result = unsafe Value.retain(input) entry.capability = move capability drop entry
-  let data = unsafe HeapCell.payloadMut<Data, ()>(&mut anchor, reference) unsafe data.queue.pushBack(request)
-  let current = data.state drop data
-  if current != EXECUTING { run resumeNext(&mut hooks, memory, realm, receiverRef) }
-  return output
+  if state.state() != EXECUTING { run resumeNext(&mut hooks, memory, realm, receiverRef) }
+  return output.intoBits()
 }
 pub effect fn call<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
   memory: &AllocationObserver, realm: Realm<'a>, function: ValueRef<'b>, receiver: ValueRef<'b>, args: Arguments<'a>) -> ValueBits ! JsException ? &mut Allocator {
