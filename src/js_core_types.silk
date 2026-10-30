@@ -15,13 +15,17 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.box { Box }
 import silk.mem.layout { Layout }
 import silk.collections.list { List }
-import thin_list { ThinList }
+import thin_list { ThinList, BoxList }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
 import silk.mem.pointer { Pointer }
 import silk.mem.raw_buffer { RawBuffer }
 import silk.mem.slot { Slot }
 import silk.num.usize
+import silk.num.u16
+import silk.num.u32
+import silk.num.u8
+import silk.num.u64
 import js_atoms { AtomTable }
 import js_heap { HeapCell, HeapHeader, CellRef }
 import js_value { ValueBits }
@@ -93,7 +97,9 @@ impl Copy for NativeFunctionId {}
 pub enum NativeCallProtocol {
   Generic, GenericMagic, Constructor, ConstructorMagic, ConstructorOrFunction,
   ConstructorOrFunctionMagic, ConstructorOrFunctionFlags, FloatUnary, FloatBinary,
-  Getter, Setter, GetterMagic, SetterMagic, IteratorNext
+  Getter, Setter, GetterMagic, SetterMagic, IteratorNext,
+  /// A captured-data function: its own signature, selected before any other protocol.
+  Data
 }
 impl NativeCallProtocol {
   pub fn sourceOrdinal(self: &Self) -> u8 {
@@ -112,6 +118,8 @@ impl NativeCallProtocol {
       NativeCallProtocol.GetterMagic => 11
       NativeCallProtocol.SetterMagic => 12
       NativeCallProtocol.IteratorNext => 13
+      // Data functions have no source protocol; this ordinal is never published.
+      NativeCallProtocol.Data => 255
     }
   }
 }
@@ -480,7 +488,7 @@ pub struct RuntimeState {
   /// Emptied property slot lists of capacity 1 to SPARE_SLOT_CAPACITY, kept for
   /// reuse by new objects so that a short-lived object skips one allocate/free
   /// pair. Bin c - 1 occupies SPARE_SLOTS_PER_BIN entries; js_gc owns this cache.
-  pub spareSlots: List<ThinList<PropertySlot>>,
+  pub spareSlots: List<ThinList<SlotBits>>,
   pub spareSlotCounts: [usize; 4],
   /// Storage of dead plain object cells, kept for new objects so that a
   /// short-lived object skips one allocate/free pair. The first spareCellCount
@@ -606,6 +614,16 @@ impl PropertySlot {
       }
     }
   }
+  /// The JS_PROP_TMASK flags that name this slot's kind.
+  @inlineAlways
+  pub fn kind(self: &Self) -> u32 {
+    return match self.* {
+      PropertySlot.Value { .. } => JS_PROP_NORMAL
+      PropertySlot.GetterSetter { .. } => JS_PROP_GETSET
+      PropertySlot.VarRef { .. } => JS_PROP_VARREF
+      _ => JS_PROP_AUTOINIT
+    }
+  }
   /// Whether this is a lazy (auto-init) property.
   pub fn isLazy(self: &Self) -> bool {
     return match self.* {
@@ -647,6 +665,100 @@ impl PropertySlot {
     }
   }
 }
+/// A stored property slot in two words. Its kind is the JS_PROP_TMASK part of the shape
+/// property's flags, as in the source, so the slot carries no tag of its own: read it
+/// with view and those flags, and write it from the PropertySlot it holds.
+///
+/// A data slot holds its ValueBits. An accessor holds its getter then its setter, and a
+/// VarRef its cell. A lazy slot holds its realm's address with the lazy kind in the low
+/// two bits (cells are at least 16-byte aligned), then the module, the builtin
+/// descriptor, the host id or zero.
+pub struct SlotBits { first: u64, second: u64 }
+impl Copy for SlotBits {}
+struct SlotPointers { first: ?*mut HeapHeader, second: ?*mut HeapHeader }
+impl Copy for SlotPointers {}
+/// NativeFunctionId.Builtin's fields, read as one word.
+struct BuiltinWord { family: BuiltinFamily, method: u32 }
+impl Copy for BuiltinWord {}
+const LAZY_PROTOTYPE: u64 = 0
+const LAZY_NAMESPACE: u64 = 1
+const LAZY_BUILTIN: u64 = 2
+const LAZY_HOST: u64 = 3
+const LAZY_MASK: u64 = 3
+@inlineAlways
+fn checkSlotLayout() -> () {
+  if Layout.of<ValueBits>().bytes != 16 || Layout.of<ValueBits>().alignment > 8 || Layout.of<SlotPointers>().bytes != 16 || Layout.of<BuiltinWord>().bytes != 8 {
+    Intrinsic.trap("property slot words do not match their views")
+  }
+}
+@inlineAlways
+fn slotWords(pointers: SlotPointers) -> SlotBits {
+  checkSlotLayout()
+  return unsafe Pointer.read<SlotBits>(unsafe Intrinsic.pointerReinterpret<*const SlotPointers, *const SlotBits>(Pointer.fromRef<SlotPointers>(&pointers)))
+}
+@inlineAlways
+fn addressWord(pointer: ?*mut HeapHeader) -> u64 { return usize.toU64(Pointer.address<HeapHeader>(pointer)) }
+impl SlotBits {
+  @inlineAlways
+  pub fn from(slot: PropertySlot) -> SlotBits {
+    return match slot {
+      PropertySlot.Value { value } => SlotBits.value(value)
+      PropertySlot.GetterSetter { getter, setter } => slotWords(SlotPointers { first: getter, second: setter })
+      PropertySlot.VarRef { reference } => slotWords(SlotPointers { first: unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(reference), second: Pointer.null<HeapHeader>() })
+      PropertySlot.LazyPrototype { realm } => SlotBits.lazy(realm, LAZY_PROTOTYPE, 0)
+      PropertySlot.LazyNamespace { realm, module } => SlotBits.lazy(realm, LAZY_NAMESPACE, addressWord(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(module)))
+      PropertySlot.LazyBuiltin { realm, family, method } => {
+        let word = BuiltinWord { family: family, method: method }
+        SlotBits.lazy(realm, LAZY_BUILTIN, unsafe Pointer.read<u64>(unsafe Intrinsic.pointerReinterpret<*const BuiltinWord, *const u64>(Pointer.fromRef<BuiltinWord>(&word))))
+      }
+      PropertySlot.LazyHost { realm, id } => SlotBits.lazy(realm, LAZY_HOST, u32.toU64(id))
+    }
+  }
+  @inlineAlways
+  pub fn value(value: ValueBits) -> SlotBits {
+    checkSlotLayout()
+    return unsafe Pointer.read<SlotBits>(unsafe Intrinsic.pointerReinterpret<*const ValueBits, *const SlotBits>(Pointer.fromRef<ValueBits>(&value)))
+  }
+  @inlineNever
+  fn lazy(realm: *mut HeapHeader, kind: u64, second: u64) -> SlotBits {
+    let address = addressWord(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(realm))
+    if u64.bitAnd(address, LAZY_MASK) != 0 { Intrinsic.trap("lazy property realm is not aligned") }
+    return SlotBits { first: u64.bitOr(address, kind), second: second }
+  }
+  @inlineAlways
+  fn pointers(self: &Self) -> SlotPointers {
+    checkSlotLayout()
+    return unsafe Pointer.read<SlotPointers>(unsafe Intrinsic.pointerReinterpret<*const SlotBits, *const SlotPointers>(Pointer.fromRef<SlotBits>(self)))
+  }
+  /// The slot, read as the kind flags name.
+  @inlineAlways
+  pub fn view(self: &Self, flags: u8) -> PropertySlot {
+    let kind = u32.bitAnd(u8.toU32(flags), JS_PROP_TMASK)
+    if kind == JS_PROP_NORMAL { return PropertySlot.Value { value: self.valueBits() } }
+    return self.viewOther(kind)
+  }
+  @inlineNever
+  fn viewOther(self: &Self, kind: u32) -> PropertySlot {
+    let words = self.pointers()
+    if kind == JS_PROP_GETSET { return PropertySlot.GetterSetter { getter: words.first, setter: words.second } }
+    if kind == JS_PROP_VARREF { return PropertySlot.VarRef { reference: unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(words.first) } }
+    let lazy = u64.bitAnd(self.first, LAZY_MASK)
+    let untagged = SlotBits { first: u64.bitAnd(self.first, u64.bitNot(LAZY_MASK)), second: self.second }
+    let parts = untagged.pointers()
+    let realm = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(parts.first)
+    if lazy == LAZY_PROTOTYPE { return PropertySlot.LazyPrototype { realm: realm } }
+    if lazy == LAZY_NAMESPACE { return PropertySlot.LazyNamespace { realm: realm, module: unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(parts.second) } }
+    if lazy == LAZY_HOST { return PropertySlot.LazyHost { realm: realm, id: u64.toU32(self.second) } }
+    let word = unsafe Pointer.read<BuiltinWord>(unsafe Intrinsic.pointerReinterpret<*const u64, *const BuiltinWord>(Pointer.fromRef<u64>(&self.second)))
+    return PropertySlot.LazyBuiltin { realm: realm, family: word.family, method: word.method }
+  }
+  /// The value of a slot whose flags name a plain data property.
+  @inlineAlways
+  pub fn valueBits(self: &Self) -> ValueBits {
+    checkSlotLayout()
+    return unsafe Pointer.read<ValueBits>(unsafe Intrinsic.pointerReinterpret<*const SlotBits, *const ValueBits>(Pointer.fromRef<SlotBits>(self)))
+  }
+}
 /// An own-property description. Each value field owns its count, so dropping a
 /// descriptor releases all three.
 pub struct PropertyDescriptor {
@@ -683,24 +795,23 @@ pub struct ShapeData {
 pub struct BytecodeClosure {
   pub bytecode: *mut HeapHeader,
   /// Module imports remain null until the module linker installs their cells.
-  pub varRefs: ThinList<?*mut HeapHeader>,
+  pub varRefs: BoxList<?*mut HeapHeader>,
   pub homeObject: ?*mut HeapHeader
 }
-/// Ordinary functions retain realm; captured-data functions may have no realm.
-/// magic is i32 to preserve both the ordinary signed i16 and captured unsigned u16
-/// source domains without a lossy cast. Captured data is owned, not a borrowed argv;
+/// A data function has protocol Data; any other protocol is an ordinary function. magic
+/// keeps 16 bits: ordinary functions read them as a signed i16 and data functions as an
+/// unsigned u16, the two source domains. Captured data is owned, not a borrowed argv;
 /// it lives in its own NativeCapturedValues cell so that the common capture-free
-/// function does not widen every object's payload.
+/// function does not widen every object's payload. The fields fill 24 bytes, the size
+/// of the other large payloads.
 pub struct NativeFunctionData {
-  pub realm: ?*mut HeapHeader,
+  /// An ordinary function's retained realm, or a data function's auxiliary
+  /// NativeCapturedValues cell, owned by it alone (null when nothing is captured).
+  pub context: ?*mut HeapHeader,
   pub function: NativeFunctionId,
+  pub magicBits: u16,
   pub length: u8,
-  pub protocol: NativeCallProtocol,
-  pub magic: i32,
-  pub isDataFunction: bool,
-  /// An auxiliary NativeCapturedValues cell owned by this function alone, or null
-  /// when nothing is captured.
-  pub captured: ?*mut HeapHeader
+  pub protocol: NativeCallProtocol
 }
 /// The values a data function captured; each holds one reference.
 pub struct NativeCapturedValues {
@@ -708,8 +819,30 @@ pub struct NativeCapturedValues {
 }
 impl NativeFunctionData {
   @inlineAlways
+  pub fn isDataFunction(self: &Self) -> bool { return self.protocol == NativeCallProtocol.Data }
+  /// An ordinary function's realm; null for a data function.
+  @inlineAlways
+  pub fn realm(self: &Self) -> ?*mut HeapHeader {
+    if self.isDataFunction() { return Pointer.null<HeapHeader>() }
+    return self.context
+  }
+  /// A data function's NativeCapturedValues cell; null when nothing is captured and
+  /// for an ordinary function.
+  @inlineAlways
+  pub fn captured(self: &Self) -> ?*mut HeapHeader {
+    if self.isDataFunction() { return self.context }
+    return Pointer.null<HeapHeader>()
+  }
+  /// The magic value: signed for ordinary functions, unsigned for data functions.
+  @inlineAlways
+  pub fn magic(self: &Self) -> i32 {
+    let bits = u16.toI32(self.magicBits)
+    if bits >= 32768 && !self.isDataFunction() { return bits - 65536 }
+    return bits
+  }
+  @inlineAlways
   pub unsafe fn capturedCount(self: &Self) -> usize {
-    let cell = match Pointer.nonNullMut<HeapHeader>(self.captured) {
+    let cell = match Pointer.nonNullMut<HeapHeader>(self.captured()) {
       Option<*mut HeapHeader>.Some { value } => value
       Option<*mut HeapHeader>.None => { return 0 }
     }
@@ -717,7 +850,7 @@ impl NativeFunctionData {
   }
   @inlineAlways
   pub unsafe fn capturedGet(self: &Self, index: usize) -> ValueBits {
-    let cell = match Pointer.nonNullMut<HeapHeader>(self.captured) {
+    let cell = match Pointer.nonNullMut<HeapHeader>(self.captured()) {
       Option<*mut HeapHeader>.Some { value } => value
       Option<*mut HeapHeader>.None => { return Intrinsic.trap("captured value index out of range") }
     }
@@ -726,7 +859,7 @@ impl NativeFunctionData {
   /// The first captured value, or null when nothing is captured.
   @inlineAlways
   pub unsafe fn capturedPointer(self: &Self) -> ?[*]const ValueBits {
-    let cell = match Pointer.nonNullMut<HeapHeader>(self.captured) {
+    let cell = match Pointer.nonNullMut<HeapHeader>(self.captured()) {
       Option<*mut HeapHeader>.Some { value } => value
       Option<*mut HeapHeader>.None => { return unsafe Intrinsic.pointerRequalify<?*mut ValueBits, ?[*]const ValueBits>(Pointer.null<ValueBits>()) }
     }
@@ -745,19 +878,46 @@ pub struct MappedArgumentsData {
 /// No JS Values or per-element allocations are used for typed array storage.
 pub struct TypedArrayCache {
   pub view: *mut HeapHeader,
-  /// Physical backing policy, refreshed when a native host publishes private bytes.
-  pub shared: bool,
   pub cachedData: ?*mut u8,
   pub count: u32,
+  /// Physical backing policy, refreshed when a native host publishes private bytes.
+  pub shared: bool,
   /// Immutable view policy: auto-length tracking OR a non-shared resizable
   /// backing buffer. Source track_rab/max_byte_length/shared never change after
   /// construction, so detach/resize only invalidate cachedData/count, not this bit.
   pub requiresExtensible: bool
 }
+/// Both strings are owned flat strings (null before initialization), kept as their
+/// cells so the payload stays two words; bytecode also contains regexp flags.
 pub struct RegExpData {
-  /// Both are owned shared flat-string Values; bytecode also contains regexp flags.
-  pub pattern: ValueBits,
-  pub bytecode: ValueBits
+  patternCell: ?*mut HeapHeader,
+  bytecodeCell: ?*mut HeapHeader
+}
+impl RegExpData {
+  /// Takes pattern and bytecode, each a String value or Null.
+  pub fn of(pattern: ValueBits, bytecode: ValueBits) -> RegExpData {
+    return RegExpData { patternCell: regExpCell(pattern), bytecodeCell: regExpCell(bytecode) }
+  }
+  /// The pattern as a String value, or Null before initialization.
+  @inlineAlways
+  pub fn pattern(self: &Self) -> ValueBits { return regExpValue(self.patternCell) }
+  /// The bytecode as a String value, or Null before initialization.
+  @inlineAlways
+  pub fn bytecode(self: &Self) -> ValueBits { return regExpValue(self.bytecodeCell) }
+}
+fn regExpCell(value: ValueBits) -> ?*mut HeapHeader {
+  return match value {
+    ValueBits.String { reference } => unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(reference)
+    ValueBits.Null => Pointer.null<HeapHeader>()
+    _ => Intrinsic.trap("regexp fields are flat strings")
+  }
+}
+@inlineAlways
+fn regExpValue(cell: ?*mut HeapHeader) -> ValueBits {
+  return match Pointer.nonNullMut<HeapHeader>(cell) {
+    Option<*mut HeapHeader>.Some { value } => ValueBits.String { reference: value }
+    Option<*mut HeapHeader>.None => ValueBits.Null
+  }
 }
 pub struct GlobalObjectData {
   pub uninitializedVariables: ValueBits
@@ -787,22 +947,83 @@ pub union ObjectPayload {
   GlobalObject { pub global: GlobalObjectData },
   Opaque { pub family: ObjectPayloadFamily, pub reference: ?*mut HeapHeader }
 }
+// ObjectData.flags bits, one per boolean property of an object.
+const OBJECT_STANDARD_ARRAY_PROTOTYPE: u8 = 1
+const OBJECT_EXTENSIBLE: u8 = 2
+const OBJECT_FREE_MARK: u8 = 4
+const OBJECT_EXOTIC: u8 = 8
+const OBJECT_FAST_ARRAY: u8 = 16
+const OBJECT_CONSTRUCTOR: u8 = 32
+const OBJECT_IMMUTABLE_PROTOTYPE: u8 = 64
+const OBJECT_HTML_DDA: u8 = 128
+@inlineAlways
+fn objectFlag(flags: u8, bit: u8, value: bool) -> u8 {
+  if value { return u8.bitOr(flags, bit) }
+  return u8.bitAnd(flags, u8.bitNot(bit))
+}
+/// One object's data. The small fields share a word, as in the source's JSObject:
+/// the boolean properties as flag bits, a 16-bit class id and the weak count.
 pub struct ObjectData {
-  pub isStandardArrayPrototype: bool,
-  pub extensible: bool,
-  pub freeMark: bool,
-  pub isExotic: bool,
-  pub fastArray: bool,
-  pub isConstructor: bool,
-  pub hasImmutablePrototype: bool,
-  pub isHtmlDda: bool,
-  pub classId: u32,
+  flags: u8,
+  classBits: u16,
   /// Weak liveness count, NOT a second strong JS reference count.
   pub weakRefCount: u32,
   pub shape: *mut HeapHeader,
   /// Two words instead of a List's five: the slots, their count and capacity.
-  pub properties: ThinList<PropertySlot>,
+  pub properties: ThinList<SlotBits>,
   pub payload: ObjectPayload
+}
+impl ObjectData {
+  /// A fresh extensible object of classId over shape; every other flag is clear.
+  pub fn make(classId: u32, shape: *mut HeapHeader, properties: ThinList<SlotBits>, payload: ObjectPayload,
+    exotic: bool, fastArray: bool) -> ObjectData {
+    let mut flags = OBJECT_EXTENSIBLE
+    if exotic { flags = u8.bitOr(flags, OBJECT_EXOTIC) }
+    if fastArray { flags = u8.bitOr(flags, OBJECT_FAST_ARRAY) }
+    return ObjectData { flags: flags, classBits: classBits(classId), weakRefCount: 0, shape: shape, properties: move properties, payload: move payload }
+  }
+  /// The class id. Like the source, objects keep 16 bits of it.
+  @inlineAlways
+  pub fn classId(self: &Self) -> u32 { return u16.toU32(self.classBits) }
+  @inlineAlways
+  pub fn setClassId(self: &mut Self, classId: u32) -> () { self.classBits = classBits(classId) }
+  @inlineAlways
+  pub fn isStandardArrayPrototype(self: &Self) -> bool { return u8.bitAnd(self.flags, OBJECT_STANDARD_ARRAY_PROTOTYPE) != 0 }
+  @inlineAlways
+  pub fn setIsStandardArrayPrototype(self: &mut Self, value: bool) -> () { self.flags = objectFlag(self.flags, OBJECT_STANDARD_ARRAY_PROTOTYPE, value) }
+  @inlineAlways
+  pub fn extensible(self: &Self) -> bool { return u8.bitAnd(self.flags, OBJECT_EXTENSIBLE) != 0 }
+  @inlineAlways
+  pub fn setExtensible(self: &mut Self, value: bool) -> () { self.flags = objectFlag(self.flags, OBJECT_EXTENSIBLE, value) }
+  @inlineAlways
+  pub fn freeMark(self: &Self) -> bool { return u8.bitAnd(self.flags, OBJECT_FREE_MARK) != 0 }
+  @inlineAlways
+  pub fn setFreeMark(self: &mut Self, value: bool) -> () { self.flags = objectFlag(self.flags, OBJECT_FREE_MARK, value) }
+  @inlineAlways
+  pub fn isExotic(self: &Self) -> bool { return u8.bitAnd(self.flags, OBJECT_EXOTIC) != 0 }
+  @inlineAlways
+  pub fn setIsExotic(self: &mut Self, value: bool) -> () { self.flags = objectFlag(self.flags, OBJECT_EXOTIC, value) }
+  @inlineAlways
+  pub fn fastArray(self: &Self) -> bool { return u8.bitAnd(self.flags, OBJECT_FAST_ARRAY) != 0 }
+  @inlineAlways
+  pub fn setFastArray(self: &mut Self, value: bool) -> () { self.flags = objectFlag(self.flags, OBJECT_FAST_ARRAY, value) }
+  @inlineAlways
+  pub fn isConstructor(self: &Self) -> bool { return u8.bitAnd(self.flags, OBJECT_CONSTRUCTOR) != 0 }
+  @inlineAlways
+  pub fn setIsConstructor(self: &mut Self, value: bool) -> () { self.flags = objectFlag(self.flags, OBJECT_CONSTRUCTOR, value) }
+  @inlineAlways
+  pub fn hasImmutablePrototype(self: &Self) -> bool { return u8.bitAnd(self.flags, OBJECT_IMMUTABLE_PROTOTYPE) != 0 }
+  @inlineAlways
+  pub fn setHasImmutablePrototype(self: &mut Self, value: bool) -> () { self.flags = objectFlag(self.flags, OBJECT_IMMUTABLE_PROTOTYPE, value) }
+  @inlineAlways
+  pub fn isHtmlDda(self: &Self) -> bool { return u8.bitAnd(self.flags, OBJECT_HTML_DDA) != 0 }
+  @inlineAlways
+  pub fn setIsHtmlDda(self: &mut Self, value: bool) -> () { self.flags = objectFlag(self.flags, OBJECT_HTML_DDA, value) }
+}
+@inlineAlways
+fn classBits(classId: u32) -> u16 {
+  if classId > 65535 { Intrinsic.trap("object class ids are 16 bits") }
+  return u32.toU16(classId)
 }
 
 pub enum ClosureKind {
