@@ -140,13 +140,55 @@ unsafe effect fn arrayLength<'a>(realm: Realm<'a>, node: *mut HeapHeader) -> ?*m
 struct FailedOom { error: OutOfMemoryError }
 effect fn failedOom(error: OutOfMemoryError) -> FailedOom { return FailedOom { error: move error } }
 struct AllocatedNode { node: *mut HeapHeader }
+/// An uninitialized node with its slot list; every shape property starts Undefined.
+struct PreparedNode { node: *mut HeapHeader, slots: ThinList<SlotBits> }
+/// A node with room for capacity slots in its cell. A full-size one (the spare
+/// cells' size) comes from a spare cell when there is one.
 @inlineAlways
-effect fn spareNode(storage: Intrinsic.RawBuffer<u8>) -> AllocatedNode ! OutOfMemoryError ? &mut Allocator {
-  return AllocatedNode { node: unsafe HeapCell.allocateUninitIn<ObjectData>(HeapKind.Object, move storage) }
+unsafe effect fn inlineNode(runtime: *mut HeapHeader, capacity: usize, count: usize) -> PreparedNode ! OutOfMemoryError ? &mut Allocator {
+  let tailBytes = capacity * Layout.of<SlotBits>().bytes
+  let mut spare = Option<Intrinsic.RawBuffer<u8>>.none()
+  if capacity == shapes.INLINE_SLOTS { spare = unsafe gc.takeSpareCell(runtime) }
+  let node = match move spare {
+    Option<Intrinsic.RawBuffer<u8>>.Some { value } => unsafe HeapCell.allocateUninitIn<ObjectData>(HeapKind.Object, move value, tailBytes)
+    Option<Intrinsic.RawBuffer<u8>>.None => run HeapCell.allocateUninitWithTail<ObjectData>(HeapKind.Object, tailBytes)
+  }
+  let tail = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut SlotBits>(unsafe HeapCell.tailAddress<ObjectData>(node))
+  let mut slots = unsafe ThinList<SlotBits>.borrowing(tail, capacity)
+  let mut i: usize = 0
+  while i < count { slots.push(SlotBits.value(ValueBits.Undefined)) i = i + 1 }
+  return PreparedNode { node: node, slots: move slots }
 }
+/// A node for an object of shape, keeping small slot lists in its cell.
 @inlineAlways
-effect fn allocateUninitNode() -> AllocatedNode ! OutOfMemoryError ? &mut Allocator {
-  return AllocatedNode { node: run HeapCell.allocateUninit<ObjectData>(HeapKind.Object) }
+unsafe effect fn prepareNode(runtime: *mut HeapHeader, shape: *mut HeapHeader) -> PreparedNode ! OutOfMemoryError ? &mut Allocator {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ShapeData, ()>(&anchor, shape)
+  let capacity = data.properties.capacity()
+  let count = data.properties.length()
+  drop data
+  if capacity <= shapes.INLINE_SLOTS { return run unsafe inlineNode(runtime, capacity, count) }
+  return run unsafe separateNode(runtime, shape)
+}
+/// Writes slots into the uninitialized node's properties.
+@inlineAlways
+unsafe fn placeSlots(node: *mut HeapHeader, slots: ThinList<SlotBits>) -> *mut HeapHeader {
+  let mut anchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+  unsafe Pointer.put<ThinList<SlotBits>>(Pointer.fromMutRef<ThinList<SlotBits>>(&mut data.properties), move slots)
+  return node
+}
+/// A plain node with slot storage of its own for shape.
+@inlineAlways
+unsafe effect fn separateNode(runtime: *mut HeapHeader, shape: *mut HeapHeader) -> PreparedNode ! OutOfMemoryError ? &mut Allocator {
+  let prepared = run unsafe shapeSlots(runtime, shape)
+  match move prepared {
+    PreparedSlots { slots } => {
+      // On failure the dropped slots are all Undefined.
+      let node = run HeapCell.allocateUninit<ObjectData>(HeapKind.Object)
+      return PreparedNode { node: node, slots: move slots }
+    }
+  }
 }
 @inlineAlways
 effect fn allocateNode(data: ObjectData) -> AllocatedNode ! OutOfMemoryError ? &mut Allocator {
@@ -185,8 +227,9 @@ unsafe fn discardUnpublished<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHead
   let shape = failed.shape
   let slots = Intrinsic.replace(failed.properties, ThinList<SlotBits>.make())
   drop failed
-  unsafe HeapCell.destroy<ObjectData>(node)
+  // Before the cell goes: the slots may live in its tail.
   unsafe releaseSlots(&mut hooks, runtime, shape, move slots)
+  unsafe HeapCell.destroy<ObjectData>(node)
   unsafe gc.releaseHeader(&mut hooks, runtime, shape)
 }
 @inlineAlways
@@ -222,22 +265,10 @@ pub unsafe effect fn fromShape<'a, H: HeapHooks>(hooks: &mut H, memory: &Allocat
   if !hasSupplied {
     // The usual case builds the node with its final slot storage, so no empty
     // list is created and dropped and no separate initialize pass runs.
-    let prepared = run Intrinsic.catchFailure<OutOfMemoryError>(unsafe shapeSlots(runtime, ownedShape), failedOom)
-    let slots = match move prepared {
-      PreparedSlots { slots } => move slots
-      FailedOom { error } => {
-        unsafe gc.releaseHeader(&mut hooks, runtime, ownedShape)
-        fail move error
-      }
-    }
-    let created = match unsafe gc.takeSpareCell(runtime) {
-      Option<Intrinsic.RawBuffer<u8>>.Some { value } => run Intrinsic.catchFailure<OutOfMemoryError>(spareNode(move value), failedOom)
-      Option<Intrinsic.RawBuffer<u8>>.None => run Intrinsic.catchFailure<OutOfMemoryError>(allocateUninitNode(), failedOom)
-    }
+    let created = run Intrinsic.catchFailure<OutOfMemoryError>(unsafe prepareNode(runtime, ownedShape), failedOom)
     let fresh = match move created {
-      AllocatedNode { node } => node
+      PreparedNode { node, slots } => unsafe placeSlots(node, move slots)
       FailedOom { error } => {
-        // The dropped slots are all Undefined, so only the shape needs releasing.
         unsafe gc.releaseHeader(&mut hooks, runtime, ownedShape)
         fail move error
       }
@@ -248,7 +279,6 @@ pub unsafe effect fn fromShape<'a, H: HeapHooks>(hooks: &mut H, memory: &Allocat
     data.setIsStandardArrayPrototype(false) data.setExtensible(true) data.setFreeMark(false) data.setIsExotic(exotic)
     data.setFastArray(fast) data.setIsConstructor(false) data.setHasImmutablePrototype(false)
     data.setIsHtmlDda(false) data.setClassId(classId) data.weakRefCount = 0 data.shape = ownedShape
-    unsafe Pointer.put<ThinList<SlotBits>>(Pointer.fromMutRef<ThinList<SlotBits>>(&mut data.properties), move slots)
     unsafe Pointer.put<ObjectPayload>(Pointer.fromMutRef<ObjectPayload>(&mut data.payload), initialPayload(classId))
     drop data
     if classId == classes.JS_CLASS_ARRAY {
