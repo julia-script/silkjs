@@ -47,3 +47,9 @@ assert(directEval().toString(), "function d() { return local; }", "direct eval")
 assert(directEval()(), 3, "direct eval closure");
 assert(eval("(function z() { return '\\xff'; })").toString(), "function z() { return '\\xff'; }", "escaped non-ASCII");
 assert(eval("(function y() { return '\xff'; })").toString(), "function y() { return '\xff'; }", "Latin-1 eval");
+// A non-ASCII source's UTF-8 form becomes the string the functions share.
+var wideSource = "(function v() { return '" + "λ😀".repeat(200) + "'; })";
+var v = eval(wideSource);
+wideSource = null;
+assert(v.toString(), "function v() { return '" + "λ😀".repeat(200) + "'; }", "long non-ASCII eval");
+assert(v(), "λ😀".repeat(200), "long non-ASCII value");
