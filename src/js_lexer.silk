@@ -8,6 +8,9 @@ import silk.core.ownership { Copy }
 import silk.collections.slice { Slice }
 import silk.num.u32
 import silk.num.u8
+import silk.num.u64
+import silk.num.usize
+import silk.collections.list { List }
 import js_atoms { AtomTable }
 import js_atom_data as atoms
 import js_bigint { BigIntError }
@@ -75,6 +78,83 @@ impl Copy for SkipParensResult {}
 pub const SKIP_HAS_SEMI: u32 = 1
 pub const SKIP_HAS_ELLIPSIS: u32 = 2
 pub const SKIP_HAS_ASSIGNMENT: u32 = 4
+const SKIP_CACHE_MIN_TOKENS: u32 = 16
+
+/// Results of skipParens by the source offset of the opening bracket. One scan
+/// over `{ a: { b: [...] } }` records every nested span it closes, so the
+/// parser's later lookaheads at the inner brackets do not rescan them; without
+/// it, deeply nested literals cost source size times nesting depth.
+/// A slot packs offset + 1 in the low half and the result in the high half:
+/// token kind (16 bits), span bits (4), line feed before the token (1) and the
+/// lexical context the scan ran in (4).
+pub struct SkipCache { slots: List<u64>, count: usize, levels: List<SkipLevel> }
+// One open bracket of a skipParens scan: its kind (96 for a template
+// substitution), offset, the semicolon/ellipsis bits seen directly inside it, and
+// the assignment and token counts when it opened. Kept in the cache so a scan
+// does not zero a fresh stack.
+struct SkipLevel { kind: i32, open: usize, direct: u32, assignedAt: u32, tokensAt: u32 }
+impl Copy for SkipLevel {}
+impl SkipCache {
+  pub fn make() -> SkipCache { return SkipCache { slots: List<u64>.make(), count: 0, levels: List<SkipLevel>.make() } }
+  fn slot(offset: usize, mask: usize) -> usize {
+    return u32.toUsize(u32.shiftRight(u32.wrappingMultiply(usize.wrappingToU32(offset), 0x9E3779B1), 7)) & mask
+  }
+  fn find(self: &Self, offset: usize) -> u64 {
+    let length = self.slots.length()
+    if length == 0 { return 0 }
+    let key = u32.toU64(usize.wrappingToU32(offset) + 1)
+    let mut index = SkipCache.slot(offset, length - 1)
+    while true {
+      let entry = self.slots.get(index)
+      if entry == 0 { return 0 }
+      if (entry & 0xffffffff) == key { return u64.shiftRight(entry, 32) }
+      index = (index + 1) & (length - 1)
+    }
+    return 0
+  }
+  effect fn insert(self: &mut Self, offset: usize, value: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    if offset >= 0xffffffff { return () }
+    if (self.count + 1) * 2 > self.slots.length() {
+      let mut size: usize = 64
+      while size < (self.count + 1) * 4 { size = size * 2 }
+      let old = Intrinsic.replace(self.slots, run List<u64>.makeWithCapacity(size))
+      run self.slots.appendRepeated(0, size)
+      self.count = 0
+      let mut i: usize = 0
+      while i < old.length() {
+        let entry = old.get(i)
+        if entry != 0 { self.place(entry) }
+        i = i + 1
+      }
+    }
+    self.place(u64.bitOr(u32.toU64(usize.wrappingToU32(offset) + 1), u64.shiftLeft(u32.toU64(value), 32)))
+  }
+  fn place(self: &mut Self, entry: u64) -> () {
+    let length = self.slots.length()
+    let offset = u64.toUsize(entry & 0xffffffff) - 1
+    let mut index = SkipCache.slot(offset, length - 1)
+    while true {
+      let current = self.slots.get(index)
+      if current == 0 { self.slots.set(index, entry) self.count = self.count + 1 return () }
+      if (current & 0xffffffff) == (entry & 0xffffffff) { self.slots.set(index, entry) return () }
+      index = (index + 1) & (length - 1)
+    }
+  }
+}
+fn contextBits(context: &LexicalContext) -> u32 {
+  let mut bits: u32 = 0
+  if context.strict { bits = bits | 1 }
+  if context.generator { bits = bits | 2 }
+  if context.asyncFunction { bits = bits | 4 }
+  if context.module { bits = bits | 8 }
+  return bits
+}
+fn cachedResult(packed: u32, noLineTerminator: bool) -> SkipParensResult {
+  let mut kind = u32.toI32(packed & 0xffff)
+  if kind >= 0x8000 { kind = kind - 0x10000 }
+  if noLineTerminator && (packed & 0x100000) != 0 { kind = 10 }
+  return SkipParensResult { kind: kind, bits: u32.shiftRight(packed, 16) & 15 }
+}
 
 /// A JSON key read straight from the source; atom is 0 when none was read.
 pub struct JsonKey { pub atom: u32, pub start: usize, pub end: usize }
@@ -433,12 +513,26 @@ impl<'src> Lexer<'src> {
   }
   // Non-mutating parser heuristic. A separate cursor owns temporary tokens;
   // original token and cursor retain exact ownership and source position.
-  pub effect fn skipParens(self: &Self, current: &Token, table: &mut AtomTable, noLineTerminator: bool) -> SkipParensResult
+  pub effect fn skipParens(self: &Self, current: &Token, table: &mut AtomTable, cache: &mut SkipCache, noLineTerminator: bool) -> SkipParensResult
     ! LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let context = contextBits(&self.context)
+    let cached = cache.find(current.start)
+    if cached != 0 && u32.shiftRight(u64.wrappingToU32(cached), 21) == context {
+      return cachedResult(u64.wrappingToU32(cached), noLineTerminator)
+    }
     let mut probe = Lexer.make(self.source, self.context)
     probe.probe = true
     let mut token = run probe.seek(self.save(current), &mut table)
-    let mut states: [i32; 256] = [0; 256]
+    if cache.levels.length() == 0 {
+      run cache.levels.appendRepeated(SkipLevel { kind: 0, open: 0, direct: 0, assignedAt: 0, tokensAt: 0 }, 256)
+    }
+    let mut stack = Intrinsic.replace(cache.levels, List<SkipLevel>.make())
+    let levels = stack.asMutSlice()
+    let mut assignments: u32 = 0
+    let mut tokens: u32 = 0
+    let mut closed = false
+    let mut closedOffset: usize = 0
+    let mut closedBits: u32 = 0
     let mut level: usize = 1
     let mut lastKind: i32 = 0
     let mut bits: u32 = 0
@@ -447,12 +541,12 @@ impl<'src> Lexer<'src> {
       let kind = token.kind
       if kind == 40 || kind == 91 || kind == 123 {
         if level >= 256 { break }
-        states[level] = kind
+        levels[level] = SkipLevel { kind: kind, open: token.start, direct: 0, assignedAt: assignments, tokensAt: tokens }
         level = level + 1
       } else if kind == 41 || kind == 93 || kind == 125 {
         if level == 0 { break }
         level = level - 1
-        let opening = states[level]
+        let opening = levels[level].kind
         if kind == 125 && opening == 96 {
           token = run probe.continueTemplate(&token) |> Effect.catch<LexError>(lookaheadError)
           if token.kind == tok.TOK_ERROR { break }
@@ -461,25 +555,42 @@ impl<'src> Lexer<'src> {
           if kind == 93 { expected = 91 }
           if kind == 125 { expected = 123 }
           if opening != expected { break }
+          // Short spans are cheaper to rescan than to remember.
+          let span = levels[level]
+          if tokens - span.tokensAt >= SKIP_CACHE_MIN_TOKENS {
+            closed = true closedOffset = span.open
+            closedBits = span.direct
+            if span.assignedAt != assignments { closedBits = closedBits | SKIP_HAS_ASSIGNMENT }
+          }
         }
       } else if kind == tok.TOK_EOF { break }
-      else if kind == 59 && level == 2 { bits = bits | SKIP_HAS_SEMI }
-      else if kind == tok.TOK_ELLIPSIS && level == 2 { bits = bits | SKIP_HAS_ELLIPSIS }
-      else if kind == 61 { bits = bits | SKIP_HAS_ASSIGNMENT }
+      else if kind == 59 { if level == 2 { bits = bits | SKIP_HAS_SEMI } levels[level - 1].direct = levels[level - 1].direct | SKIP_HAS_SEMI }
+      else if kind == tok.TOK_ELLIPSIS { if level == 2 { bits = bits | SKIP_HAS_ELLIPSIS } levels[level - 1].direct = levels[level - 1].direct | SKIP_HAS_ELLIPSIS }
+      else if kind == 61 { bits = bits | SKIP_HAS_ASSIGNMENT assignments = assignments + 1 }
       else if (kind == 47 || kind == tok.TOK_DIV_ASSIGN) && isRegExpAllowed(lastKind) {
         token = run probe.rescanRegExp(&token) |> Effect.catch<LexError>(lookaheadError)
         if token.kind == tok.TOK_ERROR { break }
       }
       if token.kind == tok.TOK_TEMPLATE && token.templateSeparator() != 96 {
         if level >= 256 { break }
-        states[level] = 96
+        levels[level] = SkipLevel { kind: 96, open: token.start, direct: 0, assignedAt: assignments, tokensAt: tokens }
         level = level + 1
       }
+      tokens = tokens + 1
       lastKind = token.kind
       if token.isPseudoKeyword(atoms.JS_ATOM_of) || token.isPseudoKeyword(atoms.JS_ATOM_yield) { lastKind = tok.TOK_OF }
       let previous = token.start
       token = run probe.next(&mut table) |> Effect.catch<LexError>(lookaheadError)
       if token.kind == tok.TOK_ERROR { break }
+      if closed {
+        // The token after a closed span is what a lookahead from its bracket returns.
+        closed = false
+        let mut after = token.kind
+        if token.isPseudoKeyword(atoms.JS_ATOM_of) { after = tok.TOK_OF }
+        let mut packed = (i32.wrappingToU32(after) & 0xffff) | u32.shiftLeft(closedBits, 16) | u32.shiftLeft(context, 21)
+        if hasLineFeed(self.source, previous, token.start) { packed = packed | 0x100000 }
+        run cache.insert(closedOffset, packed)
+      }
       if level <= 1 {
         result = token.kind
         if token.isPseudoKeyword(atoms.JS_ATOM_of) { result = tok.TOK_OF }
@@ -487,6 +598,8 @@ impl<'src> Lexer<'src> {
         break
       }
     }
+    drop levels
+    cache.levels = move stack
     return SkipParensResult { kind: result, bits: bits }
   }
 }
