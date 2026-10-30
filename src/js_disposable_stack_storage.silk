@@ -14,7 +14,8 @@ import silk.core.ownership { Copy }
 import runtime_memory { AllocationObserver }
 import js_heap { HeapCell, HeapHeader, HeapKind }
 import js_value { ValueBits }
-import js_owned_value { ValueRef }
+import js_owned_value { Value, ValueRef, lendFor }
+import silk.collections.list { List }
 import js_object_ref { ObjectRef }
 import js_core_types { ObjectData, ObjectPayload, ObjectPayloadFamily, NativeErrorKind }
 import js_gc { HeapHooks, Tracer }
@@ -29,8 +30,11 @@ import js_exceptions { JsException }
 pub const USE: i32 = 0
 pub const ADOPT: i32 = 1
 pub const DEFER: i32 = 2
-pub struct Resource { pub value: ValueBits, pub method: ValueBits, pub hint: i32 }
-struct State { disposed: bool, count: usize, capacity: usize, resources: Option<Intrinsic.RawBuffer<Resource>> }
+struct Resource { value: Value, method: Value, hint: i32 }
+/// A resource on a stack, lent until `Stack.clearResource` releases it.
+pub struct ResourceRef<'a> { pub value: ValueRef<'a>, pub method: ValueRef<'a>, pub hint: i32 }
+impl<'a> Copy for ResourceRef<'a> {}
+struct State { disposed: bool, resources: List<Resource> }
 fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
 fn family(classId: u32) -> ObjectPayloadFamily {
   if classId == classes.JS_CLASS_DISPOSABLE_STACK { return ObjectPayloadFamily.DisposableStack }
@@ -74,97 +78,48 @@ impl<'a> Stack<'a> {
   pub fn disposed(self: Stack<'a>) -> bool {
     let a = () let state = unsafe HeapCell.payload<State, ()>(&a, self.node) return state.disposed
   }
-  pub fn count(self: Stack<'a>) -> usize { return unsafe count(self.node) }
+  pub fn count(self: Stack<'a>) -> usize { let a = () return self.state(&a).resources.length() }
+  fn state<'b, A>(self: Stack<'a>, owner: &'b A) -> &'b State { return unsafe HeapCell.payload<State, A>(owner, self.node) }
+  fn stateMut<'b, A>(self: Stack<'a>, owner: &'b mut A) -> &'b mut State { return unsafe HeapCell.payloadMut<State, A>(&mut owner.*, self.node) }
   /// Marks the stack disposed; resources stay until they are cleared.
   pub fn begin(self: Stack<'a>) -> () {
     let mut a = () let state = unsafe HeapCell.payloadMut<State, ()>(&mut a, self.node) state.disposed = true
   }
   /// Forgets every resource, once each has been cleared.
   pub fn finish(self: Stack<'a>) -> () {
-    let mut a = () let state = unsafe HeapCell.payloadMut<State, ()>(&mut a, self.node) state.count = 0
+    let mut a = () self.stateMut(&mut a).resources.clear()
   }
-  /// A copy of record `index`'s bits; they stay alive until clearResource(index).
-  pub fn resource(self: Stack<'a>, index: usize) -> Resource { return unsafe resource(self.node, index) }
-  /// Releases record `index`'s value and method.
+  /// Resource `index`. A disposed stack does not change while it is disposed, so the
+  /// resource stays alive until clearResource(index).
+  pub fn resource(self: Stack<'a>, index: usize) -> ResourceRef<'a> {
+    let a = () let record = &self.state(&a).resources.asSlice()[index]
+    return ResourceRef<'a> { value: unsafe lendFor<'a>(record.value.view()), method: unsafe lendFor<'a>(record.method.view()), hint: record.hint }
+  }
+  /// Releases resource `index`'s value and method.
   pub fn clearResource<'r, H: HeapHooks>(self: Stack<'a>, hooks: &mut H, realm: Realm<'r>, index: usize) -> () {
-    unsafe clearResource(&mut hooks, realm.runtime(), self.node, index)
+    let mut a = () let record = &mut self.stateMut(&mut a).resources.asMutSlice()[index]
+    let value = record.value.take() let method = record.method.take() drop record
+    realm.release(&mut hooks, move value) realm.release(&mut hooks, move method)
   }
-  /// Allocation occurs before retaining either borrowed input; failure leaves the stack unchanged.
+  /// Retains both borrowed inputs only once the record has room; failure leaves the stack unchanged.
   pub effect fn add<'r, 'b, H: CoercionHooks>(self: Stack<'a>, hooks: &mut H, realm: Realm<'r>,
     value: ValueRef<'b>, method: ValueRef<'b>, hint: i32) -> () ! JsException ? &mut Allocator {
-    run unsafe add(&mut hooks, realm, self.node, value, method, hint)
+    let mut a = ()
+    let added = run Effect.result(self.stateMut(&mut a).resources.append(Resource { value: value.dup(), method: method.dup(), hint: hint }))
+    match move added {
+      Result<(), OutOfMemoryError>.Success { .. } => ()
+      Result<(), OutOfMemoryError>.Failure { error } => { return run core.materialize(&mut hooks, realm, move error) }
+    }
   }
   /// A new stack object that takes over these resources; this stack becomes disposed.
   pub effect fn moveTo<'r, H: HeapHooks + CoercionHooks>(self: Stack<'a>, hooks: &mut H, memory: &AllocationObserver, realm: Realm<'r>, classId: u32) -> ValueBits ! JsException ? &mut Allocator {
     return run unsafe moveStack(&mut hooks, memory, realm, self.node, classId)
   }
 }
-unsafe fn count(node: *mut HeapHeader) -> usize {
-  let a = () let state = unsafe HeapCell.payload<State, ()>(&a, node) return state.count
-}
-/// Borrows a record; callers keep the stack alive and drop payload loans before JS.
-unsafe fn resource(node: *mut HeapHeader, index: usize) -> Resource {
-  let a = () let state = unsafe HeapCell.payload<State, ()>(&a, node)
-  require(index < state.count)
-  return match &state.resources {
-    Option<Intrinsic.RawBuffer<Resource>>.Some { value } => {
-      let records = unsafe RawBuffer.view<Resource>(&value, 0, state.count)
-      return Resource { value: records[index].value, method: records[index].method, hint: records[index].hint }
-    }
-    _ => invariant()
-  }
-}
-unsafe fn clearResource<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, node: *mut HeapHeader, index: usize) -> () {
-  let record = unsafe resource(node, index)
-  unsafe gc.release(&mut hooks, rt, record.value)
-  unsafe gc.release(&mut hooks, rt, record.method)
-  let mut a = () let state = unsafe HeapCell.payloadMut<State, ()>(&mut a, node)
-  let length = state.count
-  match &mut state.resources {
-    Option<Intrinsic.RawBuffer<Resource>>.Some { value } => {
-      let records = unsafe RawBuffer.viewMut<Resource>(&mut value, 0, length)
-      records[index].value = ValueBits.Undefined records[index].method = ValueBits.Undefined
-    }
-    _ => invariant()
-  }
-}
-unsafe effect fn grow(node: *mut HeapHeader) -> () ! OutOfMemoryError ? &mut Allocator {
-  let mut a = () let state = unsafe HeapCell.payload<State, ()>(&a, node)
-  let count = state.count let capacity = state.capacity drop state
-  if count < capacity { return }
-  let layout = Layout.of<Resource>()
-  if capacity > usize.MAX / 2 { return run Allocator.outOfMemory() }
-  let mut next = capacity * 2 if next < 4 { next = 4 }
-  if next > usize.MAX / layout.bytes { return run Allocator.outOfMemory() }
-  let allocation = run Allocator.allocate(Layout { bytes: next * layout.bytes, alignment: layout.alignment })
-  let mut buffer = unsafe RawBuffer.from<Resource>(move allocation, next)
-  let mut index: usize = 0
-  while index < count { Slot.write(RawBuffer.slot<Resource>(&mut buffer, index), unsafe resource(node, index)) index = index + 1 }
-  let grown = unsafe HeapCell.payloadMut<State, ()>(&mut a, node)
-  grown.resources = Option<Intrinsic.RawBuffer<Resource>>.some(move buffer) grown.capacity = next
-}
-/// Allocation occurs before retaining either borrowed input; failure leaves the stack unchanged.
-unsafe effect fn add<'a, 'b, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
-  node: *mut HeapHeader, value: ValueRef<'b>, method: ValueRef<'b>, hint: i32) -> () ! JsException ? &mut Allocator {
-  let grown = run Effect.result(unsafe grow(node))
-  match move grown {
-    Result<(), OutOfMemoryError>.Success { .. } => ()
-    Result<(), OutOfMemoryError>.Failure { error } => { return run core.materialize(&mut hooks, realm, move error) }
-  }
-  let mut a = () let state = unsafe HeapCell.payloadMut<State, ()>(&mut a, node) let index = state.count
-  match &mut state.resources {
-    Option<Intrinsic.RawBuffer<Resource>>.Some { value: buffer } => {
-      Slot.write(RawBuffer.slot<Resource>(&mut buffer, index), Resource { value: unsafe value.view().retained(), method: unsafe method.view().retained(), hint: hint })
-    }
-    _ => invariant()
-  }
-  state.count = index + 1
-}
 /// Undefined target selects the current realm's intrinsic prototype for move().
 pub unsafe effect fn create<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H, memory: &AllocationObserver,realm: Realm<'a>, newTarget: ValueBits, classId: u32) -> ValueBits ! JsException ? &mut Allocator {
   let object = run unsafe constructors.createFromConstructor(&mut hooks, memory, realm, newTarget, classId)
-  let allocated = run Effect.result(HeapCell.allocate(HeapKind.Auxiliary, State { disposed: false,
-    count: 0, capacity: 0, resources: Option<Intrinsic.RawBuffer<Resource>>.none() }))
+  let allocated = run Effect.result(HeapCell.allocate(HeapKind.Auxiliary, State { disposed: false, resources: List<Resource>.make() }))
   let node = match move allocated {
     Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value
     Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => {
@@ -182,22 +137,19 @@ unsafe effect fn moveStack<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H, memo
     Option<*mut HeapHeader>.Some { value } => value _ => invariant()
   }
   let mut a = () let state = unsafe HeapCell.payloadMut<State, ()>(&mut a, node)
-  let resources = Intrinsic.replace(state.resources, Option<Intrinsic.RawBuffer<Resource>>.none())
-  let count = state.count let capacity = state.capacity
-  state.count = 0 state.capacity = 0 state.disposed = true drop state
+  let resources = Intrinsic.replace(state.resources, List<Resource>.make())
+  state.disposed = true drop state
   let target = unsafe HeapCell.payloadMut<State, ()>(&mut a, destination)
-  target.resources = move resources target.count = count target.capacity = capacity
+  target.resources = move resources
   return object
 }
 pub unsafe fn mark(object: *mut HeapHeader, tracer: &mut Tracer) -> () {
   let node = match Pointer.nonNullMut<HeapHeader>(unsafe objectState(object)) {
     Option<*mut HeapHeader>.Some { value } => value _ => { return }
   }
-  let length = unsafe count(node) let mut index: usize = 0
-  while index < length {
-    let record = unsafe resource(node, index)
-    unsafe tracer.value(record.value) unsafe tracer.value(record.method) index = index + 1
-  }
+  let a = () let state = unsafe HeapCell.payload<State, ()>(&a, node)
+  let records = state.resources.asSlice() let mut index: usize = 0
+  while index < records.length { unsafe tracer.value(records[index].value.view()) unsafe tracer.value(records[index].method.view()) index = index + 1 }
 }
 pub unsafe fn finalize<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, object: *mut HeapHeader) -> () {
   let node = match Pointer.nonNullMut<HeapHeader>(unsafe objectState(object)) {
@@ -205,8 +157,14 @@ pub unsafe fn finalize<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, object:
   }
   let mut a = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut a, object)
   data.payload = ObjectPayload.Empty drop data
-  let length = unsafe count(node) let mut index: usize = 0
-  while index < length { unsafe clearResource(&mut hooks, rt, node, index) index = index + 1 }
+  let state = unsafe HeapCell.payloadMut<State, ()>(&mut a, node)
+  let mut resources = Intrinsic.replace(state.resources, List<Resource>.make()) drop state
+  let records = resources.asMutSlice() let mut index: usize = 0
+  while index < records.length {
+    unsafe gc.release(&mut hooks, rt, records[index].value.take().intoBits())
+    unsafe gc.release(&mut hooks, rt, records[index].method.take().intoBits()) index = index + 1
+  }
+  drop records drop resources
   unsafe HeapCell.destroy<State>(node)
 }
 fn require(condition: bool) -> () { if !condition { Intrinsic.trap("QuickJS invariant violated") } }
