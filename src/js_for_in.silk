@@ -11,7 +11,8 @@ import silk.num.u8
 import silk.num.u32
 import silk.num.usize
 import runtime_memory { AllocationObserver }
-import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_heap { HeapCell, HeapHeader, HeapKind, CellRef }
+import silk.core.ownership { Copy }
 import js_core_types { ObjectData, ObjectPayload, ObjectPayloadFamily, ShapeData,
   PropertyEnum, RuntimeState, NativeErrorKind, JS_PROP_ENUMERABLE }
 import js_value { ValueBits }
@@ -41,7 +42,7 @@ import js_bigint { BigIntError }
 import js_exceptions { JsException }
 
 struct State {
-  object: ValueBits, index: usize, count: usize, inPrototypeChain: bool,
+  object: Value, index: usize, count: usize, inPrototypeChain: bool,
   isArray: bool, atoms: List<PropertyEnum>
 }
 pub struct Next { pub value: ValueBits, pub done: bool }
@@ -60,18 +61,27 @@ unsafe fn storage(object: *mut HeapHeader) -> ?*mut HeapHeader {
     _ => trap()
   }
 }
-unsafe fn stateNode(object: *mut HeapHeader) -> *mut HeapHeader {
-  return match Pointer.nonNullMut<HeapHeader>(unsafe storage(object)) {
-    Option<*mut HeapHeader>.Some { value } => value
-    _ => trap()
+/// A for-in iterator's snapshot, lent while the iterator object is: only its
+/// finalizer frees the State.
+struct Snapshot<'a> { cell: CellRef<State> }
+impl<'a> Copy for Snapshot<'a> {}
+impl<'a> Snapshot<'a> {
+  /// Traps unless iterator is an initialized for-in iterator object.
+  @inlineAlways fn of(iterator: ValueRef<'a>) -> Snapshot<'a> {
+    return match Pointer.nonNullMut<HeapHeader>(unsafe storage(reference(iterator.view()))) {
+      Option<*mut HeapHeader>.Some { value } => Snapshot<'a> { cell: unsafe CellRef<State>.of(value) }
+      _ => trap()
+    }
   }
+  @inlineAlways fn get<'b, A>(self: Self, owner: &'b A) -> &'b State { return self.cell.get(owner) }
+  @inlineAlways fn getMut<'b, A>(self: Self, owner: &'b mut A) -> &'b mut State { return self.cell.getMut(&mut owner.*) }
 }
 // Auxiliary state is not a GC vertex: trace its actual owned JS edge directly.
 pub unsafe fn mark(object: *mut HeapHeader, tracer: &mut Tracer) -> () {
   match Pointer.nonNullMut<HeapHeader>(unsafe storage(object)) {
     Option<*mut HeapHeader>.Some { value } => {
       let anchor = () let state = unsafe HeapCell.payload<State, ()>(&anchor, value)
-      unsafe tracer.value(state.object)
+      unsafe tracer.value(state.object.view())
     }
     Option<*mut HeapHeader>.None => ()
   }
@@ -83,10 +93,10 @@ pub unsafe fn finalize<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, object:
       data.payload = ObjectPayload.Opaque { family: ObjectPayloadFamily.ForInIterator, reference: Pointer.null<HeapHeader>() }
       drop data
       let state = unsafe HeapCell.payloadMut<State, ()>(&mut anchor, node)
-      let owned = Intrinsic.replace(state.object, ValueBits.Undefined)
+      let owned = state.object.take()
       let table = Intrinsic.replace(state.atoms, List<PropertyEnum>.make())
       drop state
-      unsafe gc.release(&mut hooks, rt, owned)
+      unsafe gc.release(&mut hooks, rt, owned.intoBits())
       unsafe names.releaseNames(rt, move table)
       unsafe HeapCell.destroy<State>(node)
     }
@@ -187,26 +197,26 @@ unsafe fn fastCount(object: ValueBits) -> Option<usize> {
   }
   return Option<usize>.some(count)
 }
-unsafe fn installTable(rt: *mut HeapHeader, node: *mut HeapHeader, table: List<PropertyEnum>, reset: bool) -> () {
-  let mut anchor = () let state = unsafe HeapCell.payloadMut<State, ()>(&mut anchor, node)
+fn installTable<'a, 's>(realm: Realm<'a>, snapshot: Snapshot<'s>, table: List<PropertyEnum>, reset: bool) -> () {
+  let mut anchor = () let state = snapshot.getMut(&mut anchor)
   let old = Intrinsic.replace(state.atoms, move table)
   state.count = state.atoms.length()
   state.isArray = false
   if reset { state.index = 0 }
   drop state
-  unsafe names.releaseNames(rt, move old)
+  unsafe names.releaseNames(realm.runtime(), move old)
 }
 effect fn initialize<'a, 'b, H: HeapHooks + OwnKeysHooks + OwnPropertyHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, iterator: ValueRef<'b>, object: ValueRef<'b>) -> () ! JsException ? &mut Allocator {
   if object.view().tag() == 2 || object.view().tag() == 3 { return () }
-  let node = unsafe stateNode(reference(iterator.view()))
+  let snapshot = Snapshot.of(iterator)
   match unsafe fastCount(object.view()) {
     Option<usize>.Some { value } => {
-      let mut anchor = () let state = unsafe HeapCell.payloadMut<State, ()>(&mut anchor, node)
+      let mut anchor = () let state = snapshot.getMut(&mut anchor)
       state.isArray = true state.count = value
     }
     Option<usize>.None => {
       let table = run ownNames(&mut hooks, realm, object, JS_GPN_STRING_MASK | JS_GPN_SET_ENUM)
-      unsafe installTable(realm.runtime(), node, move table, false)
+      installTable(realm, snapshot, move table, false)
     }
   }
 }
@@ -218,7 +228,7 @@ unsafe effect fn buildOwned<'a, H: HeapHooks + OwnKeysHooks + OwnPropertyHooks +
     object = run unsafe boxing.toObjectFree(&mut hooks, memory, realm, object)
     if object.isException() { fail JsException {} }
   }
-  let allocated = run Effect.result(HeapCell.allocate(HeapKind.Auxiliary, State { object: ValueBits.Undefined,
+  let allocated = run Effect.result(HeapCell.allocate(HeapKind.Auxiliary, State { object: Value.immediate(ValueBits.Undefined),
     index: 0, count: 0, inPrototypeChain: false, isArray: false, atoms: List<PropertyEnum>.make() }))
   let node = match move allocated {
     Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value
@@ -239,7 +249,7 @@ unsafe effect fn buildOwned<'a, H: HeapHooks + OwnKeysHooks + OwnPropertyHooks +
     }
   }
   let mut anchor = () let state = unsafe HeapCell.payloadMut<State, ()>(&mut anchor, node)
-  state.object = object drop state
+  state.object = unsafe Value.adoptBits(object) drop state
   let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, reference(iterator))
   data.payload = ObjectPayload.Opaque { family: ObjectPayloadFamily.ForInIterator, reference: node } drop data
   let initialized = run Effect.result(initialize(&mut hooks, realm, unsafe lendBits(&iterator, iterator), unsafe lendBits(&object, object)))
@@ -256,11 +266,10 @@ pub unsafe effect fn build<'a, 'b, H: HeapHooks + OwnKeysHooks + OwnPropertyHook
   unsafe gc.releaseHeader(&mut hooks, rt, context)
   return match move result { Result<ValueBits, JsException>.Success { value } => value Result<ValueBits, JsException>.Failure { error } => { fail move error } }
 }
-unsafe effect fn prepare<'a, 'b, H: HeapHooks + OwnKeysHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks>(hooks: &mut H,
-  memory: &AllocationObserver, realm: Realm<'a>, iterator: ValueRef<'b>, node: *mut HeapHeader) -> bool ! JsException ? &mut Allocator {
+effect fn prepare<'a, 'b, H: HeapHooks + OwnKeysHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, iterator: ValueRef<'b>, snapshot: Snapshot<'b>) -> bool ! JsException ? &mut Allocator {
   let rt = realm.runtime()
-  let anchor = () let initial = unsafe HeapCell.payload<State, ()>(&anchor, node)
-  let mut cursor = unsafe Value.adoptBits(unsafe initial.object.retained()) drop initial
+  let anchor = () let mut cursor = snapshot.get(&anchor).object.dup()
   while true {
     let object = move cursor
     cursor = run prototype(&mut hooks, realm, move object)
@@ -271,15 +280,15 @@ unsafe effect fn prepare<'a, 'b, H: HeapHooks + OwnKeysHooks + OwnPropertyHooks 
     run interrupts.poll(&mut hooks, memory, realm)
   }
   drop cursor
-  let state = unsafe HeapCell.payload<State, ()>(&anchor, node)
-  let array = state.isArray let object = state.object drop state
+  let state = snapshot.get(&anchor)
+  let array = state.isArray let object = state.object.view() drop state
   if array {
     let table = run ownNames(&mut hooks, realm, unsafe lendBits(&object, object), JS_GPN_STRING_MASK | JS_GPN_SET_ENUM)
-    unsafe installTable(rt, node, move table, false)
+    installTable(realm, snapshot, move table, false)
   }
   let mut index: usize = 0
   while true {
-    let current = unsafe HeapCell.payload<State, ()>(&anchor, node)
+    let current = snapshot.get(&anchor)
     if index >= current.count { break }
     let atom = current.atoms.get(index).atom drop current
     run visit(&mut hooks, realm, iterator, atom)
@@ -287,14 +296,13 @@ unsafe effect fn prepare<'a, 'b, H: HeapHooks + OwnKeysHooks + OwnPropertyHooks 
   }
   return false
 }
-unsafe effect fn candidate<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, iterator: ValueRef<'b>, node: *mut HeapHeader, atom: u32, enumerable: bool, inherited: bool) -> Next ! JsException ? &mut Allocator {
+effect fn candidate<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, iterator: ValueRef<'b>, snapshot: Snapshot<'b>, atom: u32, enumerable: bool, inherited: bool) -> Next ! JsException ? &mut Allocator {
   if inherited {
     if run exists(&mut hooks, realm, iterator, atom) { return Next { value: ValueBits.Undefined, done: true } }
     run visit(&mut hooks, realm, iterator, atom)
   }
   if !enumerable { return Next { value: ValueBits.Undefined, done: true } }
-  let anchor = () let state = unsafe HeapCell.payload<State, ()>(&anchor, node)
-  let object = state.object drop state
+  let anchor = () let object = snapshot.get(&anchor).object.view()
   if !run exists(&mut hooks, realm, unsafe lendBits(&object, object), atom) { return Next { value: ValueBits.Undefined, done: true } }
   let runtimeState = realm.runtimeState(&anchor)
   let converted = run Effect.result(runtimeState.atoms.toValue(atom, true)) drop runtimeState
@@ -307,37 +315,35 @@ unsafe effect fn candidate<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHoo
   return Next { value: output, done: false }
 }
 effect fn exceptionValue(error: JsException) -> ValueBits { drop error return ValueBits.Exception }
-unsafe effect fn advance<'a, 'b, H: HeapHooks + OwnKeysHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks>(hooks: &mut H,
-  memory: &AllocationObserver, realm: Realm<'a>, iterator: ValueRef<'b>, node: *mut HeapHeader) -> Next ! JsException ? &mut Allocator {
-  let rt = realm.runtime()
+effect fn advance<'a, 'b, H: HeapHooks + OwnKeysHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, iterator: ValueRef<'b>) -> Next ! JsException ? &mut Allocator {
+  let rt = realm.runtime() let snapshot = Snapshot.of(iterator)
   while true {
-    let mut anchor = () let state = unsafe HeapCell.payloadMut<State, ()>(&mut anchor, node)
+    let mut anchor = () let state = snapshot.getMut(&mut anchor)
     if state.index >= state.count {
-      let object = state.object let inherited = state.inPrototypeChain drop state
+      let object = state.object.view() let inherited = state.inPrototypeChain drop state
       if object.tag() == 2 || object.tag() == 3 { return Next { value: ValueBits.Undefined, done: true } }
       if !inherited {
-        if run unsafe prepare(&mut hooks, memory, realm, iterator, node) { return Next { value: ValueBits.Undefined, done: true } }
-        let prepared = unsafe HeapCell.payloadMut<State, ()>(&mut anchor, node)
+        if run prepare(&mut hooks, memory, realm, iterator, snapshot) { return Next { value: ValueBits.Undefined, done: true } }
+        let prepared = snapshot.getMut(&mut anchor)
         prepared.inPrototypeChain = true
         drop prepared
       }
-      let before = unsafe HeapCell.payload<State, ()>(&anchor, node)
-      let owned = unsafe Value.adoptBits(unsafe before.object.retained()) drop before
+      let owned = snapshot.get(&anchor).object.dup()
       let changed = run Effect.result(prototype(&mut hooks, realm, move owned))
-      let nextObject = match &changed { Result<Value, JsException>.Success { value } => value.view() _ => ValueBits.Exception }
-      let previous = unsafe HeapCell.payload<State, ()>(&anchor, node)
-      let old = previous.object drop previous
-      unsafe gc.release(&mut hooks, rt, old)
-      let updated = unsafe HeapCell.payloadMut<State, ()>(&mut anchor, node)
-      updated.object = nextObject drop updated
-      // The state slot now owns the successor's count.
-      match move changed { Result<Value, JsException>.Success { value } => { let stored = value.intoBits() } Result<Value, JsException>.Failure { error } => { fail move error } }
+      // The state slot owns the successor's count; a failed lookup leaves Exception.
+      let mut failure = Option<JsException>.none()
+      let successor = match move changed { Result<Value, JsException>.Success { value } => move value
+        Result<Value, JsException>.Failure { error } => { failure = Option<JsException>.some(move error) Value.immediate(ValueBits.Exception) } }
+      let nextObject = successor.view()
+      let old = Intrinsic.replace(snapshot.getMut(&mut anchor).object, move successor)
+      realm.release(&mut hooks, move old)
+      if let Option<JsException>.Some { value: error } = move failure { fail move error }
       if nextObject.tag() == 2 { return Next { value: ValueBits.Undefined, done: true } }
       run interrupts.poll(&mut hooks, memory, realm)
-      let current = unsafe HeapCell.payload<State, ()>(&anchor, node)
-      let currentObject = current.object drop current
+      let currentObject = snapshot.get(&anchor).object.view()
       let table = run ownNames(&mut hooks, realm, unsafe lendBits(&currentObject, currentObject), JS_GPN_STRING_MASK | JS_GPN_SET_ENUM)
-      unsafe installTable(rt, node, move table, true)
+      installTable(realm, snapshot, move table, true)
     } else {
       let mut entry = PropertyEnum { atom: 0, isEnumerable: false }
       if state.isArray { entry = PropertyEnum { atom: usize.toU32(state.index) | ATOM_INTEGER_TAG, isEnumerable: true } }
@@ -346,7 +352,7 @@ unsafe effect fn advance<'a, 'b, H: HeapHooks + OwnKeysHooks + OwnPropertyHooks 
       state.index = state.index + 1 drop state
       let runtimeState = realm.runtimeState(&anchor)
       let atom = runtimeState.atoms.duplicate(entry.atom) drop runtimeState
-      let result = run Effect.result(unsafe candidate(&mut hooks, realm, iterator, node, atom, entry.isEnumerable, inherited))
+      let result = run Effect.result(candidate(&mut hooks, realm, iterator, snapshot, atom, entry.isEnumerable, inherited))
       unsafe mutations.releaseAtom(rt, atom)
       match move result {
         Result<Next, JsException>.Success { value } => { if !value.done { return move value } }
@@ -364,7 +370,7 @@ pub effect fn next<'a, 'b, H: HeapHooks + OwnKeysHooks + OwnPropertyHooks + Coer
   let rt = realm.runtime()
   unsafe HeapCell.retain(context)
   let owner = unsafe iterator.view().retained()
-  let result = run Effect.result(unsafe advance(&mut hooks, memory, realm, iterator, unsafe stateNode(reference(iterator.view()))))
+  let result = run Effect.result(advance(&mut hooks, memory, realm, iterator))
   unsafe gc.release(&mut hooks, rt, owner)
   unsafe gc.releaseHeader(&mut hooks, rt, context)
   return match move result { Result<Next, JsException>.Success { value } => move value Result<Next, JsException>.Failure { error } => { fail move error } }
