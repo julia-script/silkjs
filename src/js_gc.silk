@@ -31,7 +31,7 @@ import js_core_types {
   FunctionDebugInfo, RequestedModule, ExportEntry, ImportEntry, StarExportEntry,
   linkedModule, NativeCapturedValues
 }
-import js_class_data { JS_CLASS_OBJECT }
+import js_class_data { JS_CLASS_OBJECT, JS_CLASS_ARRAY }
 import js_shapes
 import js_opcode_data as op
 
@@ -81,6 +81,34 @@ impl Tracer {
       }
     }
   }
+  /// header for an operation known where it is inlined, so the per-edge work is
+  /// a count update; the relinks stay out of line.
+  @inlineAlways
+  unsafe fn edgeAs(self: &mut Self, child: *mut HeapHeader, operation: MarkOperation) -> () {
+    let mut anchor = ()
+    let h = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, child)
+    if operation == MarkOperation.Decrement {
+      require(h.referenceCount > 0)
+      h.referenceCount = h.referenceCount - 1
+      if h.referenceCount == 0 && h.mark == 1 { drop h unsafe moveToTemporary(self.runtime, child) }
+    } else {
+      h.referenceCount = h.referenceCount + 1
+      if operation == MarkOperation.RestoreReachable && h.referenceCount == 1 {
+        h.mark = 0
+        drop h
+        unsafe moveToGc(self.runtime, child)
+      }
+    }
+  }
+  @inlineAlways
+  unsafe fn valueAs(self: &mut Self, child: ValueBits, operation: MarkOperation) -> () {
+    match child {
+      ValueBits.Object { reference } => { unsafe self.edgeAs(reference, operation) }
+      ValueBits.FunctionBytecode { reference } => { unsafe self.edgeAs(reference, operation) }
+      ValueBits.Module { reference } => { unsafe self.edgeAs(reference, operation) }
+      _ => ()
+    }
+  }
   pub unsafe fn optional(self: &mut Self, child: ?*mut HeapHeader) -> () {
     match Pointer.nonNullMut<HeapHeader>(child) {
       Option<*mut HeapHeader>.Some { value } => { unsafe self.header(value) }
@@ -97,6 +125,16 @@ impl Tracer {
   }
 }
 
+@inlineNever
+unsafe fn moveToTemporary(runtime: *mut HeapHeader, child: *mut HeapHeader) -> () {
+  unsafe unlinkGc(runtime, child)
+  unsafe appendTemporary(runtime, child)
+}
+@inlineNever
+unsafe fn moveToGc(runtime: *mut HeapHeader, child: *mut HeapHeader) -> () {
+  unsafe unlinkGc(runtime, child)
+  unsafe appendGc(runtime, child)
+}
 fn require(condition: bool) -> () { if !condition { invariantFailure() } }
 fn invariantFailure() -> never { return Intrinsic.trap("QuickJS invariant violated") }
 fn same(a: ?*const HeapHeader, b: ?*const HeapHeader) -> bool {
@@ -438,7 +476,7 @@ pub unsafe effect fn collect<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHead
     // Later nodes cannot move until visited (mark==0), so this saved successor is
     // stable even if a back edge moves an earlier node to the temporary list.
     cursor = unsafe next(node)
-    unsafe traceChildren(&mut hooks, node, &mut tracer)
+    unsafe traceDecrement(&mut hooks, node, &mut tracer)
     unsafe mark(node, 1)
     if unsafe count(node) == 0 {
       unsafe unlinkGc(runtime, node)
@@ -451,7 +489,7 @@ pub unsafe effect fn collect<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHead
     let node = unsafe nonnull(cursor)
     require(unsafe count(node) > 0)
     unsafe mark(node, 0)
-    unsafe traceChildren(&mut hooks, node, &mut tracer)
+    unsafe traceRestoreReachable(&mut hooks, node, &mut tracer)
     // Read AFTER tracing: newly reachable nodes append to this traversal.
     cursor = unsafe next(node)
   }
@@ -459,7 +497,7 @@ pub unsafe effect fn collect<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHead
   cursor = unsafe firstGc(runtime, 1)
   while !Pointer.isNull<HeapHeader>(cursor) {
     let node = unsafe nonnull(cursor)
-    unsafe traceChildren(&mut hooks, node, &mut tracer)
+    unsafe traceRestoreUnreachable(&mut hooks, node, &mut tracer)
     cursor = unsafe next(node)
   }
   unsafe setPhase(runtime, GcPhase.RemoveCycles)
@@ -528,6 +566,73 @@ pub unsafe fn releaseProperty<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHea
   }
 }
 
+/// traceChildren specialized per collect pass: plain objects and fast arrays,
+/// the bulk of most heaps, trace their edges with the pass's count update inline.
+@inlineNever
+unsafe fn traceDecrement<H: HeapHooks>(hooks: &mut H, node: *mut HeapHeader, tracer: &mut Tracer) -> () {
+  unsafe traceAs(&mut hooks, node, &mut tracer, MarkOperation.Decrement)
+}
+@inlineNever
+unsafe fn traceRestoreReachable<H: HeapHooks>(hooks: &mut H, node: *mut HeapHeader, tracer: &mut Tracer) -> () {
+  unsafe traceAs(&mut hooks, node, &mut tracer, MarkOperation.RestoreReachable)
+}
+@inlineNever
+unsafe fn traceRestoreUnreachable<H: HeapHooks>(hooks: &mut H, node: *mut HeapHeader, tracer: &mut Tracer) -> () {
+  unsafe traceAs(&mut hooks, node, &mut tracer, MarkOperation.RestoreUnreachable)
+}
+@inlineAlways
+unsafe fn traceAs<H: HeapHooks>(hooks: &mut H, node: *mut HeapHeader, tracer: &mut Tracer, operation: MarkOperation) -> () {
+  if unsafe kind(node) != HeapKind.Object { unsafe traceChildren(&mut hooks, node, &mut tracer) return () }
+  let anchor = ()
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  require(!object.freeMark())
+  let classId = object.classId()
+  unsafe tracer.edgeAs(object.shape, operation)
+  let metadata = unsafe HeapCell.payload<ShapeData, ()>(&anchor, object.shape)
+  let mut index: usize = 0
+  while index < metadata.properties.length() {
+    let entry = metadata.properties.get(index)
+    if entry.atom != 0 {
+      if (u8.toU32(entry.flags) & JS_PROP_TMASK) == 0 { unsafe tracer.valueAs(object.properties.get(index).valueBits(), operation) }
+      else { unsafe traceProperty(object.properties.get(index).view(entry.flags), &mut tracer) }
+    }
+    index = index + 1
+  }
+  drop metadata
+  if classId == JS_CLASS_OBJECT { return () }
+  // An Array's mark callback traces exactly its fast element list.
+  if classId == JS_CLASS_ARRAY {
+    match &object.payload {
+      ObjectPayload.FastArray { array } => {
+        let mut element: usize = 0
+        while element < array.values.length() {
+          unsafe tracer.valueAs(array.values.get(element), operation)
+          element = element + 1
+        }
+        return ()
+      }
+      _ => ()
+    }
+  }
+  drop object
+  unsafe traceClassOf(&mut hooks, node, classId, &mut tracer)
+}
+unsafe fn traceClassOf<H: HeapHooks>(hooks: &mut H, node: *mut HeapHeader, classId: u32, tracer: &mut Tracer) -> () {
+  let anchor = ()
+  let runtime = tracer.runtime
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let callback = match &state.classes.asSlice()[u32.toUsize(classId)].mark {
+    Option<NativeFunctionId>.Some { value } => Option<NativeFunctionId>.some(value)
+    Option<NativeFunctionId>.None => Option<NativeFunctionId>.none()
+  }
+  drop state
+  match move callback {
+    Option<NativeFunctionId>.Some { value } => {
+      unsafe HeapHooks.traceClass(&mut hooks, runtime, node, value, &mut tracer)
+    }
+    Option<NativeFunctionId>.None => ()
+  }
+}
 unsafe fn traceChildren<H: HeapHooks>(hooks: &mut H, node: *mut HeapHeader, tracer: &mut Tracer) -> () {
   let anchor = ()
   match unsafe kind(node) {
