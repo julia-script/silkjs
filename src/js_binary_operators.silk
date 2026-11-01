@@ -10,10 +10,11 @@ import silk.num.f64
 import silk.num.i32
 import silk.num.i64
 import silk.num.u32
+import silk.num.u64
 import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
 import js_owned_value { ValueRef }
-import js_bigint { BigInt, BigIntView, BigIntError, Bitwise }
+import js_bigint { BigInt, BigIntView, BigIntError, Bitwise, ShortLimbs, Int128 }
 import js_bigint_coercions as bigint
 import js_gc { HeapHooks }
 import js_gc as gc
@@ -46,16 +47,50 @@ fn bits(value: i32) -> u32 {
   if value < 0 { return i32.toU32(-(value + 1)) ^ 0xffffffff }
   return i32.toU32(value)
 }
+// The high limb pair of a 128-bit sign extension of value.
+fn extension(value: i64) -> u64 { if value < 0 { return 0xffffffffffffffff } return 0 }
+// A BigInt that fits 128 bits as two's complement words; false when it is wider.
+unsafe fn wide128(value: ValueBits, out: &mut Int128) -> bool {
+  match value {
+    ValueBits.ShortBigInt { value: x } => { out.* = Int128 { low: i64.wrappingToU64(x), high: extension(x) } return true }
+    ValueBits.BigInt { reference } => {
+      let anchor = () let big = unsafe HeapCell.shortPayload<BigInt, ()>(&anchor, reference)
+      if big.length() > 4 { return false }
+      out.* = big.low128() return true
+    }
+    _ => { return false }
+  }
+}
+// a + b (or a - b) in 128-bit two's complement; false when the result needs more bits.
+fn sum128(a: Int128, b: Int128, subtract: bool, out: &mut Int128) -> bool {
+  let mut low: u64 = 0 let mut high: u64 = 0
+  if subtract {
+    low = u64.wrappingSubtract(a.low, b.low)
+    let mut borrow: u64 = 0 if a.low < b.low { borrow = 1 }
+    high = u64.wrappingSubtract(u64.wrappingSubtract(a.high, b.high), borrow)
+  } else {
+    low = u64.wrappingAdd(a.low, b.low)
+    let mut carry: u64 = 0 if low < a.low { carry = 1 }
+    high = u64.wrappingAdd(u64.wrappingAdd(a.high, b.high), carry)
+  }
+  let sign: u64 = 0x8000000000000000
+  let signA = a.high & sign let signB = b.high & sign let signResult = high & sign
+  // Overflow: same-sign addends (opposite-sign for subtraction) whose result flips sign.
+  let operandsAgree = (signA == signB) != subtract
+  if operandsAgree && signResult != signA { return false }
+  out.* = Int128 { low: low, high: high }
+  return true
+}
 fn signed(value: u32) -> i32 {
   if value > 0x7fffffff { return -1 - u32.toI32(value ^ 0xffffffff) }
   return u32.toI32(value)
 }
-fn shortWord(value: ValueBits) -> u32 {
-  match value { ValueBits.ShortBigInt { value: number } => { return bits(number) } _ => { return 0 } }
+fn shortLimbs(value: ValueBits) -> ShortLimbs {
+  match value { ValueBits.ShortBigInt { value: number } => { return ShortLimbs.of(number) } _ => { return ShortLimbs.of(0) } }
 }
-unsafe effect fn view<'a>(anchor: &'a (), storage: &'a [u32], value: ValueBits) -> BigIntView<'a> ! BigIntError {
+unsafe effect fn view<'a>(anchor: &'a (), storage: &'a ShortLimbs, value: ValueBits) -> BigIntView<'a> ! BigIntError {
   match value {
-    ValueBits.ShortBigInt { .. } => { return run BigIntView.fromLimbs(storage) }
+    ValueBits.ShortBigInt { .. } => { return run BigIntView.fromLimbs(storage.limbs()) }
     ValueBits.BigInt { reference } => {
       let payload = unsafe HeapCell.shortPayload<BigInt, ()>(anchor, reference)
       return payload.view()
@@ -132,8 +167,8 @@ effect fn kernel<'a, 'b>(left: &BigIntView<'a>, right: &BigIntView<'b>, operatio
 unsafe effect fn borrowedKernel(left: ValueBits, right: ValueBits, operation: Operation) -> BigInt
   ! OutOfMemoryError | BigIntError ? &mut Allocator {
   let anchor = ()
-  let leftStorage = [shortWord(left)]
-  let rightStorage = [shortWord(right)]
+  let leftStorage = shortLimbs(left)
+  let rightStorage = shortLimbs(right)
   let a = run unsafe view(&anchor, &leftStorage, left)
   let b = run unsafe view(&anchor, &rightStorage, right)
   return run kernel(&a, &b, operation)
@@ -218,25 +253,41 @@ effect fn execute<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'
   }
   if operation != Operation.UnsignedShiftRight {
     match left.* {
-      ValueBits.ShortBigInt { value: a } => match right.* {
-        ValueBits.ShortBigInt { value: b } => {
-          let x = i32.toI64(a) let y = i32.toI64(b)
+      ValueBits.ShortBigInt { value: x } => match right.* {
+        ValueBits.ShortBigInt { value: y } => {
           match operation {
-            Operation.Add => { return run bigint.newBigInt64(x + y) }
-            Operation.Subtract => { return run bigint.newBigInt64(x - y) }
-            Operation.Multiply => { return run bigint.newBigInt64(x * y) }
-            Operation.Divide => { if b != 0 && !(a == -2147483648 && b == -1) { return ValueBits.ShortBigInt { value: a / b } } }
-            Operation.Remainder => { if b != 0 && !(a == -2147483648 && b == -1) { return ValueBits.ShortBigInt { value: a % b } } }
-            Operation.And => { return ValueBits.ShortBigInt { value: a & b } }
-            Operation.Or => { return ValueBits.ShortBigInt { value: a | b } }
-            Operation.Xor => { return ValueBits.ShortBigInt { value: a ^ b } }
+            Operation.Add => {
+              match i64.checkedAdd(x, y) {
+                Option<i64>.Some { value } => { return ValueBits.ShortBigInt { value: value } }
+                Option<i64>.None => { return run bigint.newBigInt128(i64.wrappingToU64(i64.wrappingAdd(x, y)), extension(x)) }
+              }
+            }
+            Operation.Subtract => {
+              match i64.checkedSubtract(x, y) {
+                Option<i64>.Some { value } => { return ValueBits.ShortBigInt { value: value } }
+                Option<i64>.None => { return run bigint.newBigInt128(i64.wrappingToU64(i64.wrappingSubtract(x, y)), extension(x)) }
+              }
+            }
+            Operation.Multiply => {
+              match i64.checkedMultiply(x, y) {
+                Option<i64>.Some { value } => { return ValueBits.ShortBigInt { value: value } }
+                Option<i64>.None => {
+                  return run bigint.newBigInt128(i64.wrappingToU64(i64.wrappingMultiply(x, y)), i64.wrappingToU64(i64.multiplyHigh(x, y)))
+                }
+              }
+            }
+            Operation.Divide => { if y != 0 && !(x == i64.MIN && y == -1) { return ValueBits.ShortBigInt { value: x / y } } }
+            Operation.Remainder => { if y != 0 && !(x == i64.MIN && y == -1) { return ValueBits.ShortBigInt { value: x % y } } }
+            Operation.And => { return ValueBits.ShortBigInt { value: x & y } }
+            Operation.Or => { return ValueBits.ShortBigInt { value: x | y } }
+            Operation.Xor => { return ValueBits.ShortBigInt { value: x ^ y } }
             Operation.ShiftLeft => {
-              if b >= 0 && b <= 31 { return run bigint.newBigInt64(i64.shiftLeft(x, y)) }
-              if b < 0 && b >= -31 { return ValueBits.ShortBigInt { value: i32.shiftRight(a, -b) } }
+              if y >= 0 && y <= 31 && x >= -2147483648 && x <= 2147483647 { return ValueBits.ShortBigInt { value: i64.shiftLeft(x, y) } }
+              if y < 0 && y >= -63 { return ValueBits.ShortBigInt { value: i64.shiftRight(x, -y) } }
             }
             Operation.ShiftRight => {
-              if b >= 0 && b <= 31 { return ValueBits.ShortBigInt { value: i32.shiftRight(a, b) } }
-              if b < 0 && b >= -31 { return run bigint.newBigInt64(i64.shiftLeft(x, -y)) }
+              if y >= 0 && y <= 63 { return ValueBits.ShortBigInt { value: i64.shiftRight(x, y) } }
+              if y < 0 && y >= -31 && x >= -2147483648 && x <= 2147483647 { return ValueBits.ShortBigInt { value: i64.shiftLeft(x, -y) } }
             }
             _ => ()
           }
@@ -245,6 +296,17 @@ effect fn execute<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'
         _ => ()
       }
       _ => ()
+    }
+    // Both operands are already BigInts: no conversion can run a callback.
+    if left.*.isBigInt() && right.*.isBigInt() {
+      if operation == Operation.Add || operation == Operation.Subtract {
+        let mut a = Int128 { low: 0, high: 0 } let mut b = Int128 { low: 0, high: 0 }
+        if unsafe wide128(left.*, &mut a) && unsafe wide128(right.*, &mut b) {
+          let mut sum = Int128 { low: 0, high: 0 }
+          if sum128(a, b, operation == Operation.Subtract, &mut sum) { return run bigint.newBigInt128(sum.low, sum.high) }
+        }
+      }
+      return run bigResult(&mut hooks, realm, &mut left, &mut right, operation)
     }
   }
   if operation == Operation.Add {
