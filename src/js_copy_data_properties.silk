@@ -11,8 +11,13 @@ import silk.num.u32
 import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
 import js_owned_value { lendBits, immediateRef, ValueRef }
-import js_core_types { RuntimeState, ObjectData, ExoticCallbacks, PropertyDescriptor,
-  PropertyEnum, EXOTIC_GET_OWN_PROPERTY_NAMES, JS_PROP_ENUMERABLE, JS_PROP_C_W_E }
+import js_core_types { RuntimeState, ObjectData, ExoticCallbacks, PropertyDescriptor, ShapeData, SlotBits,
+  PropertyEnum, EXOTIC_GET_OWN_PROPERTY_NAMES, JS_PROP_ENUMERABLE, JS_PROP_C_W_E, JS_PROP_TMASK }
+import js_shapes as shapes
+import js_shapes { AddResult }
+import js_class_data as classes
+import js_gc as gc
+import silk.num.u8
 import js_gc { HeapHooks }
 import js_runtime as runtime
 import js_coercion_host { CoercionHooks }
@@ -41,15 +46,71 @@ fn enumerationFlags<'a, 'b>(realm: Realm<'a>, source: ValueRef<'b>) -> u32 {
   }
   return flags
 }
+fn plainObject(value: ValueBits) -> Option<*mut HeapHeader> {
+  let node = match value { ValueBits.Object { reference } => reference _ => { return Option<*mut HeapHeader>.none() } }
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  if data.classId() != classes.JS_CLASS_OBJECT || data.isExotic() { return Option<*mut HeapHeader>.none() }
+  return Option<*mut HeapHeader>.some(node)
+}
+// The value of source's own plain data property atom, retained, or Uninitialized
+// when it has no such property or it is an accessor or other special slot.
+unsafe fn ownDataValue(source: *mut HeapHeader, atom: u32) -> ValueBits {
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, source)
+  return match unsafe shapes.lookup(data.shape, atom) {
+    Option<usize>.Some { value: index } => {
+      let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+      let flags = u8.toU32(shape.properties.get(index).flags) drop shape
+      if (flags & JS_PROP_TMASK) != 0 { return ValueBits.Uninitialized }
+      unsafe data.properties.get(index).valueBits().retained()
+    }
+    Option<usize>.None => ValueBits.Uninitialized
+  }
+}
+struct AddFailed { error: OutOfMemoryError }
+effect fn addFailed(error: OutOfMemoryError) -> AddFailed { return AddFailed { error: move error } }
+// CreateDataProperty of a key target does not have yet on an ordinary extensible
+// object: the same shape transition an object literal takes. Takes ownership of
+// value only when it returns true; anything else is left to the generic define.
+unsafe effect fn addDataProperty<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, target: *mut HeapHeader, atom: u32, value: ValueBits) -> bool
+  ? &mut Allocator {
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, target)
+  if !data.extensible() || data.isStandardArrayPrototype() { return false }
+  match unsafe shapes.lookup(data.shape, atom) { Option<usize>.Some { .. } => { return false } Option<usize>.None => () }
+  let added = match run Intrinsic.catchFailure<OutOfMemoryError>(unsafe shapes.addProperty(runtime, &mut data, atom, u32.toU8(JS_PROP_C_W_E)), addFailed) {
+    AddResult result => move result
+    AddFailed { .. } => { return false }
+  }
+  data.properties.set(added.index, SlotBits.value(value)) drop data
+  unsafe gc.releaseOptional(&mut hooks, runtime, added.retiredShape)
+  return true
+}
 effect fn copy<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(
   hooks: &mut H, realm: Realm<'a>, target: ValueRef<'b>, source: ValueRef<'b>, excluded: ValueRef<'b>,
   keys: &[PropertyEnum], recheck: bool, assignment: bool) -> ()
   ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
   let rt = realm.runtime()
+  // Object spread from an ordinary object into an ordinary one: reading a data
+  // property and defining a new one on the target run no code, so both go
+  // straight to the shapes. A key either side cannot take that way falls back.
+  let mut direct = Option<*mut HeapHeader>.none()
+  let mut destination = Option<*mut HeapHeader>.none()
+  if !assignment && !recheck && !excluded.view().isObject() {
+    direct = plainObject(source.view())
+    destination = plainObject(target.view())
+  }
   let mut index: usize = 0
   while index < keys.length {
     let atom = keys[index].atom
     index = index + 1
+    if let Option<*mut HeapHeader>.Some { value: from } = direct {
+      if let Option<*mut HeapHeader>.Some { value: into } = destination {
+        let value = unsafe ownDataValue(from, atom)
+        if value.tag() != 4 {
+          if run unsafe addDataProperty(&mut hooks, rt, into, atom, value) { continue }
+          unsafe gc.release(&mut hooks, rt, value)
+        }
+      }
+    }
     if excluded.view().isObject() && run descriptors.hasOwnProperty(&mut hooks, realm, excluded, atom) { continue }
     if recheck {
       let found = run descriptors.getOwnProperty(&mut hooks, realm, source, atom)
