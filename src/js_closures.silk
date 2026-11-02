@@ -180,29 +180,37 @@ effect fn lazy<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H, realm: Realm
     Result<bool, OutOfMemoryError>.Failure { .. } => { return run hooks.throwOutOfMemory(realm) }
   }
 }
-// A fresh function's length, name and lazy prototype in one step, when the whole
-// transition chain from its shape is already interned: no per-property lookups and
-// no intermediate shape reference churn. Returns false with nothing defined when
-// the chain isn't there yet, and the definitions then take the general path.
-unsafe effect fn configureMemoized<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
-  function: ValueRef<'b>, hasPrototype: bool, name: u32, length: u16) -> bool
+// A new function object created directly with its final shape (length, name and,
+// for constructors, a lazy prototype) when that whole transition chain from the
+// class prototype's empty shape is already interned: no per-property lookups or
+// transitions, and no empty shape revived only to be retired again. Returns
+// Undefined, having created nothing, when the chain isn't interned yet.
+unsafe effect fn shapedFunction<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H, memory: &AllocationObserver,
+  realm: Realm<'a>, classId: u32, hasPrototype: bool, name: u32, length: u16) -> ValueBits
   ! OutOfMemoryError | JsException ? &mut Allocator { let context = realm.context()
   let rt = realm.runtime()
   // Allocates (and may collect), so it runs before the shape walk.
   let text = run functions.atomString(&mut hooks, realm, name)
-  let mut anchor = ()
-  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node(function.view()))
-  let mut target = unsafe shapes.transitionTarget(rt, data.shape, atoms.JS_ATOM_length, 1)
+  let anchor = () let ctx = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  let mut prototype: ?*mut HeapHeader = Pointer.null<HeapHeader>()
+  match ctx.classPrototypes.get(u32.toUsize(classId)) { ValueBits.Object { reference } => { prototype = reference } _ => () }
+  drop ctx
+  let mut target = unsafe shapes.findPrototype(rt, prototype)
+  if !Pointer.isNull<HeapHeader>(target) { target = unsafe shapes.transitionTarget(rt, present(target), atoms.JS_ATOM_length, 1) }
   if !Pointer.isNull<HeapHeader>(target) { target = unsafe shapes.transitionTarget(rt, present(target), atoms.JS_ATOM_name, 1) }
   if hasPrototype && !Pointer.isNull<HeapHeader>(target) {
     target = unsafe shapes.transitionTarget(rt, present(target), atoms.JS_ATOM_prototype, u32.toU8(JS_PROP_WRITABLE | JS_PROP_AUTOINIT))
   }
-  if Pointer.isNull<HeapHeader>(target) { drop data unsafe gc.release(&mut hooks, rt, text) return false }
-  let adopted = run Effect.result(unsafe shapes.adopt(rt, &mut data, present(target)))
-  let retired = match move adopted {
-    Result<?*mut HeapHeader, OutOfMemoryError>.Success { value } => value
-    Result<?*mut HeapHeader, OutOfMemoryError>.Failure { error } => { drop data unsafe gc.release(&mut hooks, rt, text) fail move error }
+  if Pointer.isNull<HeapHeader>(target) { unsafe gc.release(&mut hooks, rt, text) return ValueBits.Undefined }
+  unsafe shapes.take(rt, present(target))
+  let allocated = run Effect.result(unsafe objects.fromShape(&mut hooks, memory, realm, present(target), classId,
+    Option<ThinList<SlotBits>>.none()))
+  let function = match move allocated {
+    Result<ValueBits, OutOfMemoryError>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError>.Failure { error } => { unsafe gc.release(&mut hooks, rt, text) fail move error }
   }
+  let mut dataAnchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut dataAnchor, node(function))
   let mut first = data.properties.length() - 2
   if hasPrototype { first = first - 1 }
   data.properties.set(first, SlotBits.value(ValueBits.Int { value: u16.toI32(length) }))
@@ -213,17 +221,12 @@ unsafe effect fn configureMemoized<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: 
     data.properties.set(first + 2, SlotBits.from(PropertySlot.lazy(context, AutoInitKind.Prototype,
       AutoInitOpaque.Pointer { value: Pointer.null<u8>() })))
   }
-  drop data
-  unsafe gc.releaseOptional(&mut hooks, rt, retired)
-  return true
+  return function
 }
 effect fn configure<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(
   hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, function: ValueRef<'b>,
   kind: FunctionKind, hasPrototype: bool, name: u32, length: u16) -> ()
   ! OutOfMemoryError | JsException ? &mut Allocator { let context = realm.context()
-  if kind != FunctionKind.Generator && kind != FunctionKind.AsyncGenerator {
-    if run unsafe configureMemoized(&mut hooks, realm, function, hasPrototype, name, length) { return () }
-  }
   run functions.setFunctionProperties(&mut hooks, realm, unsafe lendBits(&function, function.view()), name, u16.toI32(length))
   if kind == FunctionKind.Generator || kind == FunctionKind.AsyncGenerator {
     let mut prototypeClass = classes.JS_CLASS_GENERATOR
@@ -247,8 +250,21 @@ pub unsafe effect fn closure<'a, H: HeapHooks + OwnPropertyHooks + CoercionHooks
   let anchor = () let b = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
   let kind = b.kind let hasPrototype = b.hasPrototype let length = b.definedArgumentCount
   let mut name = b.name if name == 0 { name = atoms.JS_ATOM_empty_string } drop b
+  let mut fresh = ValueBits.Undefined
+  if kind != FunctionKind.Generator && kind != FunctionKind.AsyncGenerator {
+    let shaped = run Intrinsic.catchFailure<OutOfMemoryError | JsException>(
+      unsafe shapedFunction(&mut hooks, memory, realm, classFor(kind), hasPrototype, name, length), failedConfigure)
+    match move shaped {
+      ValueBits value => { fresh = value }
+      FailedConfigure { error } => {
+        let pending = run Effect.catch<JsException>(materialize(&mut hooks, realm, move error), exceptionValue)
+        unsafe gc.release(&mut hooks, realm.runtime(), bytecodeValue) fail JsException {}
+      }
+    }
+    if fresh.isObject() { return run unsafe closure2(&mut hooks, realm, fresh, bytecode, inherited, frame, isEval) }
+  }
   let allocated = run Intrinsic.catchFailure<OutOfMemoryError>(objects.withClass(&mut hooks, memory, realm, classFor(kind)), failedOom)
-  let fresh = match move allocated {
+  fresh = match move allocated {
     ValueBits value => value
     FailedOom { error } => {
       let pending = run Effect.catch<JsException>(materialize(&mut hooks, realm, move error), exceptionValue)
