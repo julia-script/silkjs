@@ -36,3 +36,19 @@ container, Silk 0.1.0-dev.17, with C QuickJS 7d1c13c5 as the reference: SilkJS w
 than C QuickJS on the macro geometric mean and 28x on the micro geometric mean.
 `results/baseline.json` was re-recorded from main 8f70631, after the first performance pass
 (about 3x faster than edb6cee on the macro geometric mean).
+
+## V8 benchmark suite
+
+`v8/` holds the eight V8 benchmarks that the QuickJS site reports (richards, deltablue,
+crypto, raytrace, earley-boyer, regexp, splay, navier-stokes), copied unchanged with
+`base.js` from github.com/chromium/octane at 570ad1c (BSD, see `v8/LICENSE`).
+
+```sh
+python3 scripts/v8bench.py path/to/silkjs path/to/c/qjs                  # suite scores, higher is better
+python3 scripts/v8bench.py --instructions old/silkjs new/silkjs          # fixed iterations under callgrind
+python3 scripts/v8bench.py --instructions a b --only richards deltablue
+```
+
+Scores are wall-clock based and noisy on shared hosts. A score gap that the instruction
+counts do not show usually comes from memory traffic, such as larger objects or more GC
+cycles.
