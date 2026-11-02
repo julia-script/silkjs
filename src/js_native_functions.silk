@@ -337,6 +337,81 @@ unsafe effect fn dispatch<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHook
     }
   }
 }
+/// call's common case: an ordinary native function with the Generic or
+/// GenericMagic protocol, called (not constructed) with at least its declared
+/// length of arguments. It builds the same native frame without call's padding,
+/// data-function and protocol branches, whose register pressure cost about
+/// 150 Ir a call. None declines (call then handles it, stack overflow included).
+@inlineNever
+pub effect fn callPlain<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + NativeFunctionHooks>(
+  hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, function: ValueRef<'b>,
+  receiver: ValueRef<'b>, args: Arguments<'a>) -> Option<ValueBits> ! JsException ? &mut Allocator {
+  let arguments = args.slots()
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(function.view()))
+  let mut id = NativeFunctionId.Host { id: 0 } let mut protocol = NativeCallProtocol.Data let mut magic: i32 = 0
+  let mut length: usize = 0 let mut nativeRealm = Pointer.null<HeapHeader>()
+  match &object.payload {
+    ObjectPayload.NativeFunction { function: native } => {
+      id = native.function protocol = native.protocol magic = native.magic()
+      length = u8.toUsize(native.length) nativeRealm = native.realm()
+    }
+    _ => ()
+  }
+  drop object
+  let magical = protocol == NativeCallProtocol.GenericMagic
+  if !magical && protocol != NativeCallProtocol.Generic { return Option<ValueBits>.none() }
+  let argc = arguments.length()
+  if argc < length { return Option<ValueBits>.none() }
+  let rt = realm.runtime()
+  if unsafe runtime.checkStackOverflow(rt, currentFrameAddress(), length * Layout.of<ValueBits>().bytes, true) { return Option<ValueBits>.none() }
+  let empty = unsafe Intrinsic.pointerRequalify<[*]mut ValueBits, *mut ValueBits>(unsafe Intrinsic.stackAllocate<ValueBits>(0))
+  let mut data = empty
+  if argc != 0 { data = arguments.data }
+  let argv = FrameSlots { data: data, count: argc }
+  let calleeContext = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(nativeRealm)
+  let calleeContextRealm = unsafe lendRealm(&calleeContext, calleeContext)
+  let mut beforeAnchor = () let before = realm.runtimeStateMut(&mut beforeAnchor)
+  let previous = before.currentStackFrame drop before
+  let emptyRefs = unsafe Intrinsic.pointerRequalify<[*]mut ?*mut HeapHeader, *mut ?*mut HeapHeader>(unsafe Intrinsic.stackAllocate<?*mut HeapHeader>(0))
+  let framePointer = unsafe Intrinsic.pointerRequalify<[*]mut StackFrame, *mut StackFrame>(unsafe Intrinsic.stackAllocate<StackFrame>(1))
+  unsafe Pointer.put<StackFrame>(framePointer, StackFrame {
+    previous: previous, asyncOwner: Pointer.null<HeapHeader>(), currentFunction: function.view(),
+    arguments: FrameSlots { data: data, count: argc },
+    locals: FrameSlots { data: empty, count: 0 }, stack: FrameSlots { data: empty, count: 0 },
+    varRefs: FrameReferences { data: emptyRefs, count: 0 }, currentPc: Option<usize>.none(),
+    argumentCount: usize.toI32(argc), mode: 0, stackPointer: Option<usize>.none()
+  })
+  let mut publishAnchor = () let published = realm.runtimeStateMut(&mut publishAnchor)
+  published.currentStackFrame = framePointer drop published
+  let result = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError | JsException>(unsafe dispatchPlain(&mut hooks, memory,
+    calleeContextRealm, id, magical, magic, receiver.view(), usize.toI32(argc), unsafe lendArguments(&argv)), textFailed)
+  let outward = match move result {
+    ValueBits value => Result<ValueBits, JsException>.Success { value: value }
+    TextFailed { error } =>
+      run Effect.result(materialize(&mut hooks, calleeContextRealm, move error))
+  }
+  let mut restoreAnchor = () let restored = realm.runtimeStateMut(&mut restoreAnchor)
+  restored.currentStackFrame = previous drop restored
+  return match move outward {
+    Result<ValueBits, JsException>.Success { value } => Option<ValueBits>.some(value)
+    Result<ValueBits, JsException>.Failure { error } => { fail move error }
+  }
+}
+/// dispatch for callPlain's two protocols.
+@inlineAlways
+unsafe effect fn dispatchPlain<'a, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + NativeFunctionHooks>(
+  hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, id: NativeFunctionId, magical: bool, magic: i32,
+  receiver: ValueBits, argc: i32, args: Arguments<'a>) -> ValueBits
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  if !magical { return run hooks.nativeGeneric(id, realm, unsafe lendBits(&receiver, receiver), argc, unsafe lendArguments(args.slots())) }
+  if let NativeFunctionId.Builtin { family, method } = id {
+    if family == BuiltinFamily.Map || family == BuiltinFamily.Set || family == BuiltinFamily.WeakMap || family == BuiltinFamily.WeakSet {
+      let quick = run collections.quickMethod(&mut hooks, realm, family, method, unsafe lendBits(&receiver, receiver), args)
+      if let Option<ValueBits>.Some { value } = move quick { return value }
+    }
+  }
+  return run hooks.nativeMagic(id, realm, unsafe lendBits(&receiver, receiver), argc, unsafe lendArguments(args.slots()), magic)
+}
 struct CallData {
   function: NativeFunctionId, protocol: NativeCallProtocol, magic: i32,
   length: u8, isDataFunction: bool, realm: ?*mut HeapHeader,
@@ -456,6 +531,27 @@ fn quickMath(method: u32, argv: FrameSlots) -> ValueBits {
     return ValueBits.number(mathIds.binary(method, value, right))
   }
   return ValueBits.Uninitialized
+}
+/// Whether quick or quickWrite may answer a call to function: only builtins of
+/// these families have frameless paths. A single switch, so every other native
+/// call skips both scans.
+@inlineAlways
+pub unsafe fn mayAnswerQuick(function: ValueBits) -> bool {
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(function))
+  let mut id = NativeFunctionId.Host { id: 0 }
+  match &object.payload { ObjectPayload.NativeFunction { function: native } => { id = native.function } _ => () }
+  drop object
+  if let NativeFunctionId.Builtin { family, method } = id { return quickFamily(family) }
+  return false
+}
+@inlineAlways
+fn quickFamily(family: BuiltinFamily) -> bool {
+  return match family {
+    BuiltinFamily.Array => true BuiltinFamily.Number => true BuiltinFamily.BigInt => true
+    BuiltinFamily.String => true BuiltinFamily.Date => true BuiltinFamily.Math => true
+    BuiltinFamily.Map => true BuiltinFamily.Set => true BuiltinFamily.WeakMap => true BuiltinFamily.WeakSet => true
+    _ => false
+  }
 }
 /// The frameless answer of a hot builtin that cannot throw, for callers that
 /// have not built the native frame yet; Uninitialized declines.
