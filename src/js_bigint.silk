@@ -4,6 +4,9 @@
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.collections.list { List }
 import silk.core.ownership { Copy }
+import silk.core.option { Option }
+import silk.collections.slice { Slice }
+import silk.mem.pointer { Pointer }
 import silk.num.f64
 import silk.num.i32
 import silk.num.i64
@@ -42,11 +45,98 @@ struct Head { mantissa: u64, exponent: i32 }
 
 /// Owned normalized signed limbs, least significant first. Zero is one zero limb.
 /// The immutable view is suitable for serialization and short-BigInt compaction.
-pub struct BigInt { words: List<u32> }
+pub struct BigInt { words: Limbs }
 
 /// Borrowed normalized signed limbs. The owner must outlive the view; no input
 /// storage is allocated or retained. Use a stack one-limb slice for short values.
+// Small values keep their limbs inline, so a heap BigInt up to INLINE_LIMBS limbs
+// (320 bits) is one cell with no separate limb buffer.
+const INLINE_LIMBS: usize = 10
+struct Limbs { count: usize, spilled: bool, inline: [u32; 10], heap: List<u32> }
+impl Limbs {
+  fn empty() -> Limbs { return Limbs { count: 0, spilled: false, inline: [0; 10], heap: List<u32>.make() } }
+  effect fn zeroes(length: usize) -> Limbs ! OutOfMemoryError ? &mut Allocator {
+    if length <= INLINE_LIMBS { return Limbs { count: length, spilled: false, inline: [0; 10], heap: List<u32>.make() } }
+    return Limbs { count: 0, spilled: true, inline: [0; 10], heap: run mp.zeroes(length) }
+  }
+  effect fn copyOf(words: &[u32]) -> Limbs ! OutOfMemoryError ? &mut Allocator {
+    let mut result = Limbs.empty()
+    if words.length <= INLINE_LIMBS {
+      Slice.copyInto(&mut result.inline, 0, words)
+      result.count = words.length
+      return move result
+    }
+    result.spilled = true
+    result.heap = run List<u32>.makeWithCapacity(words.length)
+    run result.heap.appendSlice(words)
+    return move result
+  }
+  fn adopt(words: List<u32>) -> Limbs {
+    let mut result = Limbs.empty()
+    if words.length() <= INLINE_LIMBS {
+      Slice.copyInto(&mut result.inline, 0, words.asSlice())
+      result.count = words.length()
+      return move result
+    }
+    result.spilled = true
+    result.heap = move words
+    return move result
+  }
+  fn length(self: &Self) -> usize { if self.spilled { return self.heap.length() } return self.count }
+  fn get(self: &Self, index: usize) -> u32 { if self.spilled { return self.heap.get(index) } return self.inline[index] }
+  fn set(self: &mut Self, index: usize, value: u32) -> () {
+    if self.spilled { self.heap.set(index, value) return () }
+    if index >= self.count { Intrinsic.trap("BigInt limb index out of range") }
+    self.inline[index] = value
+  }
+  fn asSlice(self: &Self) -> &[u32] { if self.spilled { return self.heap.asSlice() } return Slice.view<u32>(&self.inline, 0, self.count) }
+  fn asMutSlice(self: &mut Self) -> &mut [u32] {
+    if self.spilled { return self.heap.asMutSlice() }
+    return Slice.viewMut<u32>(&mut self.inline, 0, self.count)
+  }
+  fn truncate(self: &mut Self, length: usize) -> () {
+    if self.spilled { self.heap.truncate(length) return () }
+    if length < self.count { self.count = length }
+  }
+  effect fn append(self: &mut Self, value: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.spilled { run self.heap.append(value) return () }
+    if self.count < INLINE_LIMBS { self.inline[self.count] = value self.count = self.count + 1 return () }
+    let mut heap = run List<u32>.makeWithCapacity(self.count + 1)
+    run heap.appendSlice(Slice.view<u32>(&self.inline, 0, self.count))
+    run heap.append(value)
+    self.heap = move heap
+    self.spilled = true
+  }
+  // Drops high zero limbs, keeping at least one (mp.trim for magnitudes).
+  fn trim(self: &mut Self) -> () {
+    let mut n = self.length()
+    while n > 1 && self.get(n - 1) == 0 { n = n - 1 }
+    self.truncate(n)
+  }
+}
 pub struct BigIntView<'a> { words: &'a [u32] }
+
+/// The canonical signed limbs of a short BigInt value, least significant first:
+/// one limb when the value fits in i32 and two otherwise. Borrow `limbs()` for a view.
+pub struct ShortLimbs { words: [u32; 2], count: usize }
+impl Copy for ShortLimbs {}
+impl ShortLimbs {
+  pub fn of(value: i64) -> ShortLimbs {
+    let bits = i64.wrappingToU64(value)
+    let mut count: usize = 2
+    if value >= -2147483648 && value <= 2147483647 { count = 1 }
+    return ShortLimbs { words: [low32(bits), u64.toU32(u64.shiftRight(bits, 32))], count: count }
+  }
+  pub fn limbs<'a>(self: &'a Self) -> &'a [u32] { return Slice.view<u32>(&self.words, 0, self.count) }
+}
+/// Reads limbs as one i64 when the normalized value has at most two limbs.
+pub fn shortValue(words: &[u32]) -> Option<i64> {
+  if words.length == 1 { return Option<i64>.some(i32.toI64(u32.wrappingToI32(words[0]))) }
+  if words.length == 2 {
+    return Option<i64>.some(u64.wrappingToI64(u32.toU64(words[0]) | u64.shiftLeft(u32.toU64(words[1]), 32)))
+  }
+  return Option<i64>.none()
+}
 
 pub effect fn checkSize(length: usize) -> () ! BigIntError {
   if length > BIGINT_MAX_LIMBS { fail BigIntError.TooLarge }
@@ -56,7 +146,116 @@ effect fn checkStoredSize(length: usize) -> () ! BigIntError {
 }
 
 
+// Operands up to this many limbs run add, subtract and multiply in stack
+// scratch and allocate the normalized result once.
+pub const SMALL_LIMBS: usize = 16
+fn scratchLimb(words: &[u32], index: usize) -> u32 {
+  if index < words.length { return words[index] }
+  if (words[words.length - 1] & 0x80000000) != 0 { return 0xffffffff }
+  return 0
+}
+// Copies the shortest two's-complement prefix of words into an exact-size list.
+effect fn fromScratch(words: &[u32]) -> BigInt ! OutOfMemoryError ? &mut Allocator {
+  let mut n = words.length
+  while n > 1 {
+    let v = words[n - 1]
+    if (v != 0 && v != 0xffffffff) || (v & 1) != u32.shiftRight(words[n - 2], 31) { break }
+    n = n - 1
+  }
+  return BigInt { words: run Limbs.copyOf(Slice.view<u32>(words, 0, n)) }
+}
+/// The normalized length of the two's-complement limbs in words (fromScratch's prefix).
+pub fn scratchLength(words: &[u32]) -> usize {
+  let mut n = words.length
+  while n > 1 {
+    let v = words[n - 1]
+    if (v != 0 && v != 0xffffffff) || (v & 1) != u32.shiftRight(words[n - 2], 31) { break }
+    n = n - 1
+  }
+  return n
+}
+/// sumSmall's limbs, written to scratch: the unnormalized length (fromScratch input).
+pub fn sumScratch(scratch: &mut [u32; 33], a: &[u32], b: &[u32], subtract: bool) -> usize {
+  let mut mask: u32 = 0
+  let mut carry: u64 = 0
+  if subtract { carry = 1 mask = 0xffffffff }
+  let extensionA = scratchLimb(a, a.length) let extensionB = scratchLimb(b, b.length) ^ mask
+  let mut common = a.length let mut n = b.length
+  if b.length < common { common = b.length n = a.length }
+  let mut i: usize = 0
+  while i < common {
+    let v = u32.toU64(a[i]) + u32.toU64(b[i] ^ mask) + carry
+    scratch[i] = low32(v)
+    carry = u64.shiftRight(v, 32)
+    i = i + 1
+  }
+  while i < a.length {
+    let v = u32.toU64(a[i]) + u32.toU64(extensionB) + carry
+    scratch[i] = low32(v)
+    carry = u64.shiftRight(v, 32)
+    i = i + 1
+  }
+  while i < b.length {
+    let v = u32.toU64(extensionA) + u32.toU64(b[i] ^ mask) + carry
+    scratch[i] = low32(v)
+    carry = u64.shiftRight(v, 32)
+    i = i + 1
+  }
+  scratch[n] = low32(u32.toU64(extensionA) + u32.toU64(extensionB) + carry)
+  return n + 1
+}
+/// a + b (or a - b) for limb slices of at most SMALL_LIMBS limbs each.
+pub effect fn sumSmall(a: &[u32], b: &[u32], subtract: bool) -> BigInt ! OutOfMemoryError ? &mut Allocator {
+  let mut scratch: [u32; 33] = [0; 33]
+  let n = sumScratch(&mut scratch, a, b, subtract)
+  return run fromScratch(Slice.view<u32>(&scratch, 0, n))
+}
+/// productSmall's limbs, written to zeroed scratch: the unnormalized length.
+pub fn productScratch(scratch: &mut [u32; 33], a: &[u32], b: &[u32]) -> usize {
+  let n = a.length + b.length
+  multiplyInto(Slice.viewMut<u32>(&mut scratch.*, 0, n), a, b)
+  return n
+}
+/// Whether writeInline can store words: they fit the inline limbs.
+@inlineAlways
+pub fn fitsInline(words: &[u32]) -> bool { return words.length <= INLINE_LIMBS }
+/// ofNormalized for words that fitsInline, built straight into uninitialized
+/// storage at destination instead of on the stack and then copied there.
+@inlineAlways
+pub unsafe fn writeInline(destination: *mut BigInt, words: &[u32]) -> () {
+  unsafe Pointer.put<BigInt>(destination, BigInt { words: Limbs { count: words.length, spilled: false, inline: [0; 10], heap: List<u32>.make() } })
+  let mut anchor = ()
+  let target = unsafe Pointer.borrowMut<(), BigInt>(&mut anchor, destination)
+  Slice.copyInto(&mut target.words.inline, 0, words)
+}
+/// A heap BigInt of normalized limbs words (more than two: shorter ones are
+/// ShortBigInt values), without fromScratch's intermediate copy when they fit inline.
+pub effect fn ofNormalized(words: &[u32]) -> BigInt ! OutOfMemoryError ? &mut Allocator {
+  return BigInt { words: run Limbs.copyOf(words) }
+}
+fn multiplyInto(out: &mut [u32], a: &[u32], b: &[u32]) -> () {
+  mp.multiply(&mut out, a, b)
+  if (a[a.length - 1] & 0x80000000) != 0 { mp.subtractAt(&mut out, a.length, b) }
+  if (b[b.length - 1] & 0x80000000) != 0 { mp.subtractAt(&mut out, b.length, a) }
+}
+/// a * b for limb slices of at most SMALL_LIMBS limbs each.
+pub effect fn productSmall(a: &[u32], b: &[u32]) -> BigInt ! OutOfMemoryError ? &mut Allocator {
+  let mut scratch: [u32; 32] = [0; 32]
+  let n = a.length + b.length
+  multiplyInto(Slice.viewMut<u32>(&mut scratch, 0, n), a, b)
+  return run fromScratch(Slice.view<u32>(&scratch, 0, n))
+}
+
+
 impl BigInt {
+  /// Replaces the value with normalized words in place when both the old and
+  /// the new limbs are inline; false leaves it unchanged.
+  pub fn overwriteInline(self: &mut Self, words: &[u32]) -> bool {
+    if self.words.spilled || words.length > INLINE_LIMBS { return false }
+    Slice.copyInto(&mut self.words.inline, 0, words)
+    self.words.count = words.length
+    return true
+  }
   pub fn view<'a>(self: &'a Self) -> BigIntView<'a> { return BigIntView { words: self.words.asSlice() } }
   pub fn limbs(self: &Self) -> &[u32] { return self.words.asSlice() }
   pub fn length(self: &Self) -> usize { return self.words.length() }
@@ -88,17 +287,16 @@ impl BigInt {
   pub effect fn fromOwnedLimbs(words: List<u32>) -> BigInt ! BigIntError {
     if words.length() == 0 { fail BigIntError.InvalidLimbs }
     run checkStoredSize(words.length())
-    let mut result = BigInt { words: move words }
+    let mut result = BigInt { words: Limbs.adopt(move words) }
     result.normalize()
     return move result
   }
   pub effect fn fromLimbs(words: &[u32]) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
     if words.length == 0 { fail BigIntError.InvalidLimbs }
     run checkStoredSize(words.length)
-    let mut result = run mp.zeroes(words.length)
-    let mut i: usize = 0
-    while i < words.length { result.set(i, words[i]) i = i + 1 }
-    return run BigInt.fromOwnedLimbs(move result)
+    let mut result = BigInt { words: run Limbs.copyOf(words) }
+    result.normalize()
+    return move result
   }
   pub effect fn copy(self: &Self) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
     return run BigInt.fromLimbs(self.limbs())
@@ -190,8 +388,8 @@ impl BigInt {
   }
   pub effect fn fromMagnitude(words: List<u32>, negative: bool) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
     if words.length() == 0 { fail BigIntError.InvalidLimbs }
-    let mut result = BigInt { words: move words }
-    mp.trim(&mut result.words)
+    let mut result = BigInt { words: Limbs.adopt(move words) }
+    result.words.trim()
     run checkStoredSize(result.length())
     let n = result.length()
     if (result.words.get(n - 1) & 0x80000000) != 0 { run result.words.append(0) }
@@ -213,7 +411,7 @@ impl BigInt {
     if bits > usize.toU64(BIGINT_MAX_LIMBS) * 32 { fail BigIntError.TooLarge }
     let n = u64.toUsize((bits + 31) / 32)
     run checkSize(n)
-    let mut result = BigInt { words: run mp.zeroes(n) }
+    let mut result = BigInt { words: run Limbs.zeroes(n) }
     let mut i: usize = 0
     while i < n { result.words.set(i, self.limb(i)) i = i + 1 }
     let width = u64.toU32((bits - 1) % 32 + 1)
@@ -297,7 +495,7 @@ impl<'a> BigIntView<'a> {
     let mut n = self.length()
     if other.length() > n { n = other.length() }
     run checkSize(n)
-    let mut result = BigInt { words: run mp.zeroes(n) }
+    let mut result = BigInt { words: run Limbs.zeroes(n) }
     let mut carry: u64 = 0
     let mut mask: u32 = 0
     if subtract { carry = 1 mask = 0xffffffff }
@@ -317,7 +515,7 @@ impl<'a> BigIntView<'a> {
   pub effect fn multiply<'b>(self: &Self, other: &BigIntView<'b>) -> BigInt ! BigIntError | OutOfMemoryError ? &mut Allocator {
     let n = self.length() + other.length()
     run checkSize(n)
-    let mut result = BigInt { words: run mp.zeroes(n) }
+    let mut result = BigInt { words: run Limbs.zeroes(n) }
     mp.multiply(result.words.asMutSlice(), self.limbs(), other.limbs())
     if self.negative() { mp.subtractAt(result.words.asMutSlice(), self.length(), other.limbs()) }
     if other.negative() { mp.subtractAt(result.words.asMutSlice(), other.length(), self.limbs()) }
@@ -367,7 +565,7 @@ impl<'a> BigIntView<'a> {
     let mut n = self.length()
     if other.length() > n { n = other.length() }
     run checkSize(n)
-    let mut result = BigInt { words: run mp.zeroes(n) }
+    let mut result = BigInt { words: run Limbs.zeroes(n) }
     let mut i: usize = 0
     while i < n {
       let a = self.limb(i)
@@ -385,7 +583,7 @@ impl<'a> BigIntView<'a> {
     let offset = u64.toUsize(count / 32)
     let shift = u64.toU32(count % 32)
     run checkSize(self.length() + offset)
-    let mut result = BigInt { words: run mp.zeroes(self.length() + offset) }
+    let mut result = BigInt { words: run Limbs.zeroes(self.length() + offset) }
     let mut carry: u32 = 0
     let mut i: usize = 0
     while i < self.length() {
@@ -408,7 +606,7 @@ impl<'a> BigIntView<'a> {
     let shift = u64.toU32(count % 32)
     let n = self.length() - offset
     run checkSize(n)
-    let mut result = BigInt { words: run mp.zeroes(n) }
+    let mut result = BigInt { words: run Limbs.zeroes(n) }
     let mut i: usize = 0
     while i < n {
       let mut v = self.limb(i + offset)
@@ -452,7 +650,7 @@ impl<'a> BigIntView<'a> {
         if neg { signBit = 0 }
         let n = u64.toUsize((bit + 32 + signBit) / 32)
         run checkSize(n)
-        let mut result = BigInt { words: run mp.zeroes(n) }
+        let mut result = BigInt { words: run Limbs.zeroes(n) }
         let mut word: u32 = 1
         if neg { word = 0xffffffff }
         result.words.set(u64.toUsize(bit / 32), u32.shiftLeft(word, u64.toU32(bit % 32)))

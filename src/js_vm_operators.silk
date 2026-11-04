@@ -7,6 +7,7 @@ import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.num.f64
 import silk.num.i32
+import silk.num.usize
 import silk.num.i64
 import silk.num.u8
 import silk.num.u32
@@ -15,7 +16,7 @@ import js_heap { HeapCell, HeapHeader }
 import js_core_types { ObjectData }
 import js_value { ValueBits }
 import js_owned_value { lendBits, immediateRef }
-import js_vm_state { Machine }
+import js_vm_state { Machine, cellAt }
 import js_gc { HeapHooks }
 import js_gc as gc
 import js_coercion_host { CoercionHooks }
@@ -25,8 +26,10 @@ import js_exceptions { JsException }
 import js_string_types { StringLengthError, releaseString }
 import js_bigint { BigIntError }
 import js_strings { Strings }
+import js_unit_strings as unitStrings
 import js_primitives as primitive
 import js_primitives { EqualityMode }
+import js_primitive_coercions as primitiveCoercions
 import js_unary_operators as unary
 import js_unary_operators { Arithmetic as UnaryArithmetic, Postfix }
 import js_binary_operators as binary
@@ -142,8 +145,8 @@ fn numericFast(left: ValueBits, right: ValueBits, opcode: u8) -> ValueBits {
     ValueBits.Int { value: x } => match right {
       ValueBits.Int { value: y } => {
         let wideX = i32.toI64(x) let wideY = i32.toI64(y)
-        if opcode == op.OP_add { return ValueBits.number(i64.toF64(wideX + wideY)) }
-        if opcode == op.OP_sub { return ValueBits.number(i64.toF64(wideX - wideY)) }
+        if opcode == op.OP_add { return intSum(x, y) }
+        if opcode == op.OP_sub { return intDifference(x, y) }
         if opcode == op.OP_mul {
           if (x == 0 || y == 0) && (x < 0 || y < 0) { return ValueBits.Float64 { value: f64.fromBits(0x8000000000000000) } }
           return ValueBits.number(i64.toF64(wideX * wideY))
@@ -214,6 +217,22 @@ pub unsafe fn floatOperands(machine: &Machine, x: &mut f64, y: &mut f64) -> bool
 pub unsafe fn finishBinary(machine: &mut Machine, result: ValueBits) -> () {
   unsafe machine.set(2, result) unsafe machine.discard(1)
 }
+/// x + y and x - y on Ints: an overflow-checked i32 operation, and the exact
+/// double only when it overflows.
+@inlineAlways
+pub fn intSum(x: i32, y: i32) -> ValueBits {
+  // The sign test, not checkedAdd: its Option is built with a select and then
+  // tested, a few more instructions than one overflow branch.
+  let sum = i32.wrappingAdd(x, y)
+  if ((x ^ sum) & (y ^ sum)) >= 0 { return ValueBits.Int { value: sum } }
+  return ValueBits.Float64 { value: i64.toF64(i32.toI64(x) + i32.toI64(y)) }
+}
+@inlineAlways
+pub fn intDifference(x: i32, y: i32) -> ValueBits {
+  let difference = i32.wrappingSubtract(x, y)
+  if ((x ^ y) & (x ^ difference)) >= 0 { return ValueBits.Int { value: difference } }
+  return ValueBits.Float64 { value: i64.toF64(i32.toI64(x) - i32.toI64(y)) }
+}
 pub fn intNumber(value: i64) -> ValueBits {
   if value >= -2147483648 && value <= 2147483647 { return ValueBits.Int { value: i64.toI32(value) } }
   return ValueBits.Float64 { value: i64.toF64(value) }
@@ -247,6 +266,27 @@ pub unsafe fn stepTop(machine: &mut Machine, delta: i32, postfix: bool) -> bool 
       if postfix { unsafe machine.push(next) } else { unsafe machine.set(1, next) }
       return true
     }
+    _ => {
+      // Float64 goes out of line on cell pointers, so the Int test stays first
+      // and the machine stays in registers.
+      let cell = unsafe cellAt(machine.stackTop, usize.wrappingSubtract(0, 1))
+      let mut out = cell if postfix { out = machine.stackTop }
+      if !unsafe floatBump(cell, out, delta) { return false }
+      if postfix { machine.stackTop = unsafe cellAt(machine.stackTop, 1) }
+      return true
+    }
+  }
+}
+/// Float64 counters (the microbench driver's n is one): writes cell + delta to
+/// out and returns true, or returns false for any other tag. Float64 stays
+/// Float64, as floatResult in js_unary_operators does not compact.
+@inlineNever
+unsafe fn floatBump(cell: *mut ValueBits, out: *mut ValueBits, delta: i32) -> bool {
+  match unsafe Pointer.read<ValueBits>(cell) {
+    ValueBits.Float64 { value } => {
+      unsafe Pointer.write<ValueBits>(out, ValueBits.Float64 { value: value + i32.toF64(delta) })
+      return true
+    }
     _ => { return false }
   }
 }
@@ -261,7 +301,12 @@ pub unsafe fn stepLocal(machine: &mut Machine, delta: i32) -> bool {
       unsafe machine.skip(1)
       return true
     }
-    _ => { return false }
+    _ => {
+      let cell = unsafe cellAt(machine.locals, index)
+      if !unsafe floatBump(cell, cell, delta) { return false }
+      unsafe machine.skip(1)
+      return true
+    }
   }
 }
 
@@ -299,6 +344,28 @@ unsafe fn storedLocal(machine: &Machine) -> i64 {
   if next == op.OP_put_loc || next == op.OP_set_loc || next == op.OP_put_loc_check || next == op.OP_set_loc_check { return u8.toI64(unsafe machine.peekU8(1)) + 256 * u8.toI64(unsafe machine.peekU8(2)) }
   return -1
 }
+// Whether the local or argument that the instruction after the current one
+// overwrites holds value.
+@inlineAlways
+unsafe fn storedSlotHolds(machine: &Machine, value: ValueBits) -> bool {
+  let index = unsafe storedLocal(&machine)
+  if index >= 0 { return sameString(unsafe machine.local(i64.toUsize(index)), value) }
+  let next = unsafe machine.peekU8(0)
+  if next >= op.OP_put_arg0 && next <= op.OP_set_arg3 {
+    return sameString(unsafe machine.argument(u8.toUsize(u8.bitAnd(next - op.OP_put_arg0, 3))), value)
+  }
+  if next == op.OP_put_arg || next == op.OP_set_arg {
+    let slot = u8.toUsize(unsafe machine.peekU8(1)) + 256 * u8.toUsize(unsafe machine.peekU8(2))
+    return sameString(unsafe machine.argument(slot), value)
+  }
+  return false
+}
+/// OP_add's own entry to addText, when either operand is a string.
+@inlineNever
+pub unsafe effect fn addTextEntry(machine: &mut Machine) -> bool ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  if !(unsafe machine.top(2)).isString() && !(unsafe machine.top(1)).isString() { return false }
+  return run unsafe addText(&mut machine)
+}
 /// OP_add with a string operand and a string or Int partner, without the generic
 /// operator chain. False leaves the operands for step.
 pub unsafe effect fn addText(machine: &mut Machine) -> bool ! OutOfMemoryError | StringLengthError ? &mut Allocator {
@@ -306,11 +373,28 @@ pub unsafe effect fn addText(machine: &mut Machine) -> bool ! OutOfMemoryError |
   // `s = s + piece` / `s += piece` into the local s came from: the store replaces
   // the local's reference, so append in place when no one else holds s.
   if left.isString() && right.isString() {
-    let index = unsafe storedLocal(&machine)
-    if index >= 0 && sameString(unsafe machine.local(i64.toUsize(index)), left)
-      && run Strings.appendInPlaceShared(left, right) {
-      releaseString(right)
-      unsafe machine.discard(1)
+    if unsafe storedSlotHolds(&machine, left) {
+      if run Strings.appendInPlaceShared(left, right) {
+        releaseString(right)
+        unsafe machine.discard(1)
+        return true
+      }
+      // The local still holds left; the store that follows replaces it.
+      match run Strings.joinGrowable(left, right, 2) {
+        Option<ValueBits>.Some { value } => {
+          releaseString(left) releaseString(right)
+          unsafe machine.set(2, value) unsafe machine.discard(1)
+          return true
+        }
+        Option<ValueBits>.None => ()
+      }
+    }
+  }
+  // `s = piece + s` into the local s came from: grow the rope s already is.
+  if right.tag() == -6 && left.tag() == -7 && unsafe storedSlotHolds(&machine, right) {
+    if run Strings.prependInPlaceShared(right, left) {
+      releaseString(left)
+      unsafe machine.set(2, right) unsafe machine.discard(1)
       return true
     }
   }
@@ -322,6 +406,18 @@ pub unsafe effect fn addText(machine: &mut Machine) -> bool ! OutOfMemoryError |
   } else {
     if !right.isString() { return false }
     match left { ValueBits.Int { value } => { integer = value mixed = true integerFirst = true } _ => { return false } }
+  }
+  // `n + ''` for 0 <= n < 256: the runtime's cached decimal string, no new cell.
+  if mixed && integer >= 0 && integer < 256 {
+    let mut text = left if integerFirst { text = right }
+    if text.tag() == -7 && Strings.length(text) == 0 {
+      let cached = run Effect.result(unitStrings.decimal(unsafe lendRealm(&machine.context, machine.context), i32.toU32(integer)))
+      if let Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value: digit } = move cached {
+        releaseString(text)
+        unsafe machine.set(2, digit) unsafe machine.discard(1)
+        return true
+      }
+    }
   }
   let joined = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError>(joinText(left, right, integer, mixed, integerFirst), failedText)
   match move joined {
@@ -406,18 +502,6 @@ pub unsafe fn notFast(value: ValueBits) -> i32 {
     _ => -1
   }
 }
-/// OP_eq / OP_neq (negate) answered by looseIdentity, kept out of the dispatch
-/// loop so its code does not weigh on every other opcode. False leaves the
-/// operands for step.
-@inlineNever
-pub unsafe fn looseEquality<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, negate: bool) -> bool {
-  let left = unsafe machine.top(2) let right = unsafe machine.top(1)
-  let same = unsafe looseIdentity(left, right)
-  if same < 0 { return false }
-  unsafe machine.set(2, ValueBits.Bool { value: (same == 1) != negate }) unsafe machine.discard(1)
-  unsafe gc.release(&mut hooks, machine.runtime, left) unsafe gc.release(&mut hooks, machine.runtime, right)
-  return true
-}
 @inlineAlways
 pub unsafe fn binaryFast(machine: &mut Machine, opcode: u8) -> bool {
   let fast = numericFast(unsafe machine.top(2), unsafe machine.top(1), opcode)
@@ -426,31 +510,175 @@ pub unsafe fn binaryFast(machine: &mut Machine, opcode: u8) -> bool {
   return true
 }
 
+/// x + y, x - y or x * y for two ShortBigInts when the result fits a ShortBigInt:
+/// no conversion chain and no allocation. Undefined for anything else.
+@inlineNever
+// Two heap or mixed BigInts in stack scratch; Undefined declines, including on
+// allocation failure (the generic path then reports it).
+unsafe effect fn bigSum(left: ValueBits, right: ValueBits) -> ValueBits ? &mut Allocator {
+  let made = run Effect.result(unsafe binary.smallBigArithmetic(left, right, false, false))
+  return match move made {
+    Result<ValueBits, OutOfMemoryError>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError>.Failure { error } => { drop error ValueBits.Undefined }
+  }
+}
+/// binary.smallBigInPlace's add, out of addLocal's line: its scratch stays off
+/// the Int and short BigInt paths.
+@inlineNever
+unsafe effect fn bigAddInPlace(local: ValueBits, input: ValueBits) -> bool ? &mut Allocator {
+  return match unsafe binary.smallBigInPlace(local, input, false, false) { ValueBits.Undefined => false _ => true }
+}
+@inlineNever
+unsafe effect fn bigArithmetic<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, opcode: u8) -> bool ? &mut Allocator {
+  let left = unsafe machine.top(2) let right = unsafe machine.top(1)
+  if !left.isBigInt() || !right.isBigInt() { return false }
+  let made = run Effect.result(unsafe binary.smallBigArithmetic(left, right, opcode == op.OP_sub, opcode == op.OP_mul))
+  let value = match move made {
+    Result<ValueBits, OutOfMemoryError>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError>.Failure { error } => { drop error return false }
+  }
+  match value { ValueBits.Undefined => { return false } _ => () }
+  unsafe gc.release(&mut hooks, machine.runtime, left) unsafe gc.release(&mut hooks, machine.runtime, right)
+  unsafe machine.set(2, value) unsafe machine.discard(1)
+  return true
+}
+fn shortBigIntArithmetic(left: ValueBits, right: ValueBits, opcode: u8) -> ValueBits {
+  let x = match left { ValueBits.ShortBigInt { value } => value _ => { return ValueBits.Undefined } }
+  let y = match right { ValueBits.ShortBigInt { value } => value _ => { return ValueBits.Undefined } }
+  let mut result = Option<i64>.none()
+  if opcode == op.OP_mul { result = i64.checkedMultiply(x, y) }
+  else if opcode == op.OP_sub { result = i64.checkedSubtract(x, y) }
+  else { result = i64.checkedAdd(x, y) }
+  return match result {
+    Option<i64>.Some { value } => ValueBits.ShortBigInt { value: value }
+    Option<i64>.None => ValueBits.Undefined
+  }
+}
+/// OP_add_loc on two numbers, run on the dispatch registers: false declines
+/// without touching anything.
+@inlineAlways
+pub unsafe fn addLocalNumbers(machine: &mut Machine) -> bool {
+  let index = u8.toUsize(unsafe machine.peekU8(0))
+  let local = unsafe machine.local(index) let input = unsafe machine.top(1)
+  let mut sum = 0.0
+  match local {
+    ValueBits.Int { value: x } => match input {
+      ValueBits.Int { value: y } => {
+        let previous = unsafe machine.setLocal(index, intSum(x, y))
+        unsafe machine.skip(1) unsafe machine.discard(1) return true
+      }
+      ValueBits.Float64 { value: y } => { sum = i32.toF64(x) + y }
+      _ => { return false }
+    }
+    ValueBits.Float64 { value: x } => match input {
+      ValueBits.Float64 { value: y } => { sum = x + y }
+      ValueBits.Int { value: y } => { sum = x + i32.toF64(y) }
+      _ => { return false }
+    }
+    _ => { return false }
+  }
+  let previous = unsafe machine.setLocal(index, ValueBits.Float64 { value: sum })
+  unsafe machine.skip(1) unsafe machine.discard(1) return true
+}
 /// add_loc for two Ints, two Float64s or two strings, with no opcode dispatch.
 /// false leaves the operands and the operand byte to step.
 @inlineNever
 pub unsafe effect fn addLocal<H: HeapHooks>(hooks: &mut H, machine: &mut Machine) -> bool ! OutOfMemoryError | StringLengthError ? &mut Allocator {
   let index = u8.toUsize(unsafe machine.peekU8(0))
   let local = unsafe machine.local(index) let input = unsafe machine.top(1)
-  let bothInts = match local { ValueBits.Int { .. } => match input { ValueBits.Int { .. } => true _ => false } _ => false }
-  let bothFloats = match local { ValueBits.Float64 { .. } => match input { ValueBits.Float64 { .. } => true _ => false } _ => false }
-  if bothInts || bothFloats {
-    let output = numericFast(local, input, op.OP_add)
-    let previous = unsafe machine.setLocal(index, output)
+  if let ValueBits.Int { value: x } = local {
+    if let ValueBits.Int { value: y } = input {
+      let previous = unsafe machine.setLocal(index, intSum(x, y))
+      unsafe machine.skip(1) unsafe machine.discard(1) return true
+    }
+  }
+  // Any other pair of numbers adds as doubles (numericFast's OP_add result).
+  let mut sum = 0.0 let mut numeric = true
+  match local {
+    ValueBits.Float64 { value: x } => match input {
+      ValueBits.Float64 { value: y } => { sum = x + y }
+      ValueBits.Int { value: y } => { sum = x + i32.toF64(y) }
+      _ => { numeric = false }
+    }
+    ValueBits.Int { value: x } => match input {
+      ValueBits.Float64 { value: y } => { sum = i32.toF64(x) + y }
+      _ => { numeric = false }
+    }
+    _ => { numeric = false }
+  }
+  if numeric {
+    let previous = unsafe machine.setLocal(index, ValueBits.Float64 { value: sum })
     unsafe machine.skip(1) unsafe machine.discard(1) return true
   }
-  if !local.isString() || !input.isString() { return false }
+  if !local.isString() || !input.isString() {
+    // s += x on a BigInt only this local holds: summed into its own cell.
+    if let ValueBits.BigInt { .. } = local {
+      if run unsafe bigAddInPlace(local, input) {
+        unsafe machine.skip(1) unsafe machine.discard(1)
+        unsafe gc.release(&mut hooks, machine.runtime, input)
+        return true
+      }
+    }
+    let mut sum = shortBigIntArithmetic(local, input, op.OP_add)
+    match sum { ValueBits.Undefined => { sum = run unsafe bigSum(local, input) } _ => () }
+    match sum { ValueBits.Undefined => { return false } _ => () }
+    if local.isBigInt() || input.isBigInt() {
+      let previous = unsafe machine.setLocal(index, sum)
+      unsafe machine.skip(1) unsafe machine.discard(1)
+      unsafe gc.release(&mut hooks, machine.runtime, previous)
+      unsafe gc.release(&mut hooks, machine.runtime, input)
+      return true
+    }
+    let previous = unsafe machine.setLocal(index, sum)
+    unsafe machine.skip(1) unsafe machine.discard(1) return true
+  }
+  if run Strings.appendShortLatin1(local, input) {
+    unsafe machine.skip(1) unsafe machine.discard(1)
+    unsafe gc.release(&mut hooks, machine.runtime, input)
+    return true
+  }
   unsafe machine.publishPc()
-  if !run Strings.appendInPlace(local, input) { return false }
+  // Every in-place append needs s held only by this slot; skip them otherwise.
+  let mut appended = false
+  if Strings.heldOnce(local) { appended = run Strings.appendInPlace(local, input) }
+  if !appended {
+    // A string that cannot grow in place moves once into a buffer with room.
+    match run Strings.joinGrowable(local, input, 1) {
+      Option<ValueBits>.Some { value } => {
+        let previous = unsafe machine.setLocal(index, value)
+        releaseString(previous)
+      }
+      Option<ValueBits>.None => { return false }
+    }
+  }
   unsafe machine.skip(1) unsafe machine.discard(1)
   unsafe gc.release(&mut hooks, machine.runtime, input)
   return true
 }
+/// x + y, x - y or x * y on two BigInts, called from the arms ahead of step
+/// (whose prologue costs more than a short BigInt sum) once both operands are
+/// known to be BigInts. False declines to step.
+@inlineNever
+pub unsafe effect fn bigOperands<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, opcode: u8) -> bool ? &mut Allocator {
+  let product = shortBigIntArithmetic(unsafe machine.top(2), unsafe machine.top(1), opcode)
+  match product { ValueBits.Undefined => () _ => { unsafe machine.set(2, product) unsafe machine.discard(1) return true } }
+  return run unsafe bigArithmetic(&mut hooks, &mut machine, opcode)
+}
+/// Whether both binary operands are BigInts (bigOperands' precondition).
+@inlineAlways
+pub unsafe fn bigIntOperands(machine: &Machine) -> bool {
+  return (unsafe machine.top(2)).isBigInt() && (unsafe machine.top(1)).isBigInt()
+}
+// The family fallback: rare on hot paths, so its call sites are laid out cold.
+@cold
 pub unsafe effect fn step<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks>(
   hooks: &mut H, memory: &AllocationObserver, machine: &mut Machine, opcode: u8) -> bool
   ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
-  // Checked first: string building reaches step on every non-numeric add.
-  if opcode == op.OP_add { if run unsafe addText(&mut machine) { return true } }
+  if opcode == op.OP_add || opcode == op.OP_sub || opcode == op.OP_mul {
+    let product = shortBigIntArithmetic(unsafe machine.top(2), unsafe machine.top(1), opcode)
+    match product { ValueBits.Undefined => () _ => { unsafe machine.set(2, product) unsafe machine.discard(1) return true } }
+    if run unsafe bigArithmetic(&mut hooks, &mut machine, opcode) { return true }
+  }
   // Equality that needs no coercion (identity, same type, nullish), answered
   // before the generic binary path; the arm already took numbers.
   if opcode >= op.OP_eq && opcode <= op.OP_strict_neq {
@@ -634,6 +862,21 @@ pub unsafe effect fn step<H: HeapHooks + CoercionHooks + OwnPropertyHooks + Prop
       Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => { unsafe machine.set(1, value) return true }
       Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error } => { fail move error }
     }
+  }
+  // A number against a flat ASCII string in a numeric operator or a comparison:
+  // ToNumber of a string has no side effects, so convert it in place and retry.
+  if opcode != op.OP_add && (left.isNumber() != right.isNumber()) {
+    let mut number = ValueBits.Undefined
+    if left.isNumber() { number = primitiveCoercions.asciiStringNumber(right) } else { number = primitiveCoercions.asciiStringNumber(left) }
+    match number { ValueBits.Undefined => () _ => {
+      let mut a = left let mut b = right
+      if left.isNumber() { b = number } else { a = number }
+      let retried = numericFast(a, b, opcode)
+      match retried { ValueBits.Undefined => () _ => {
+        unsafe gc.release(&mut hooks, machine.runtime, left) unsafe gc.release(&mut hooks, machine.runtime, right)
+        unsafe machine.set(2, retried) unsafe machine.discard(1) return true
+      } }
+    } }
   }
   unsafe machine.publishPc()
   let result = run Effect.result(unsafe binarySlow(&mut hooks, &machine.*, &mut left, &mut right, opcode))

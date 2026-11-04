@@ -114,7 +114,7 @@ pub fn shouldThrow<'a>(realm: Realm<'a>, flags: u32) -> bool {
   return match Pointer.nonNullMut<StackFrame>(state.currentStackFrame) {
     Option<*mut StackFrame>.Some { value } => {
       let frame = unsafe Pointer.borrow<(), StackFrame>(&anchor, value)
-      return (frame.mode & JS_MODE_STRICT) != 0
+      return (frame.mode & u8.toU32(JS_MODE_STRICT)) != 0
     }
     Option<*mut StackFrame>.None => false
   }
@@ -310,6 +310,7 @@ unsafe effect fn create<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks 
   ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
   let anchor = () let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
   let id = p.classId() let exotic = p.isExotic() let fast = p.fastArray() let extensible = p.extensible() drop p
+  let mut fill = false
   if exotic {
     if id == classes.JS_CLASS_ARRAY {
       match unsafe arrayIndex(rt, atom) {
@@ -325,6 +326,9 @@ unsafe effect fn create<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks 
             run unsafe arrays.convertFastToSlow(&mut hooks, realm, node)
           }
           let oldLength = match unsafe slot(node, 0) { PropertySlot.Value { value: lengthValue } => f64.toU32(lengthValue.numericValue()) _ => trap() }
+          // Filling a hole may leave exactly the indices below length: densify
+          // checks after the add below.
+          fill = !fast && index < oldLength && (propertyFlags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) == 0
           if index + 1 > oldLength {
             if (unsafe storedFlags(node, 0) & JS_PROP_WRITABLE) == 0 { return run readOnly(&mut hooks, realm, atoms.JS_ATOM_length, propertyFlags) }
             let previous = unsafe put(node, 0, PropertySlot.Value { value: ValueBits.number(u32.toF64(index + 1)) }, unsafe storedFlags(node, 0))
@@ -371,6 +375,9 @@ unsafe effect fn create<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks 
   match move added {
     Result<(), OutOfMemoryError>.Failure { error } => { unsafe gc.releaseProperty(&mut hooks, rt, incoming) fail move error }
     Result<(), OutOfMemoryError>.Success { .. } => ()
+  }
+  if fill && stored == JS_PROP_C_W_E {
+    drop run Effect.result(unsafe arrays.densify(&mut hooks, realm, node))
   }
   if id == classes.JS_CLASS_GLOBAL_OBJECT && (stored & JS_PROP_TMASK) == JS_PROP_VARREF {
     let cell = match incoming { PropertySlot.VarRef { reference } => reference _ => trap() }
@@ -866,7 +873,9 @@ unsafe effect fn deleteOwn<'a, H: HeapHooks + PropertyWriteHooks>(hooks: &mut H,
           _ => ()
         }
       }
-      run unsafe deleteStored(&mut hooks, rt, node, atom) return true
+      let mut anchor = () let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+      let removed = run unsafe shapes.deleteAt(rt, &mut p, atom, index) drop p
+      unsafe gc.releaseProperty(&mut hooks, rt, removed.slot) return true
     }
     Option<usize>.None => ()
   }
@@ -894,6 +903,13 @@ unsafe effect fn deleteOwn<'a, H: HeapHooks + PropertyWriteHooks>(hooks: &mut H,
     }
   }
   return true
+}
+/// deleteOwnProperty for a caller that keeps the object, the atom and the realm
+/// alive across the call (the VM's operand stack and frame), so nothing is
+/// retained or caught here.
+pub unsafe effect fn deleteOwnRooted<'a, H: HeapHooks + PropertyWriteHooks>(hooks: &mut H, realm: Realm<'a>, node: *mut HeapHeader, atom: u32) -> bool
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  return run unsafe deleteOwn(&mut hooks, realm, realm.runtime(), node, atom)
 }
 /// Internal delete_property. Requires an object; no boxing or throw-flag mapping.
 pub effect fn deleteOwnProperty<'a, 'b, H: HeapHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, atom: u32) -> bool
@@ -950,6 +966,13 @@ unsafe effect fn defineAuto<'a, 'b, H: HeapHooks>(hooks: &mut H, realm: Realm<'a
     Result<(), OutOfMemoryError>.Success { .. } => true
     Result<(), OutOfMemoryError>.Failure { error } => { unsafe gc.releaseHeader(&mut hooks, rt, context) fail move error }
   }
+}
+/// defineAutoInitProperty for an object the caller owns and that has no property
+/// atom, with a predefined atom: nothing needs rooting across the definition.
+pub unsafe effect fn defineFreshAutoInit<'a, 'b, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>,
+  object: ValueRef<'b>, atom: u32, kind: AutoInitKind, opaque: AutoInitOpaque,
+  propertyFlags: u32) -> bool ! OutOfMemoryError ? &mut Allocator {
+  return run unsafe defineAuto(&mut hooks, realm, realm.runtime(), object, atom, kind, opaque, propertyFlags)
 }
 pub effect fn defineAutoInitProperty<'a, 'b, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>,
   object: ValueRef<'b>, atom: u32, kind: AutoInitKind, opaque: AutoInitOpaque,
@@ -1194,7 +1217,22 @@ pub effect fn defineObjectName<'a, 'b, H: HeapHooks + OwnPropertyHooks + Coercio
     FailedOomLength { error } =>
       run Effect.catch<JsException>(nameStringFailure(&mut hooks, realm, move error), nameExceptionValue)
   }
+  if propertyFlags == JS_PROP_CONFIGURABLE && unsafe replaceOwnName(&mut hooks, rt, object.view(), string) { return () }
   let accepted = run unsafe definePropertyValue(&mut hooks, realm, object, atoms.JS_ATOM_name, string, propertyFlags)
+}
+/// defineObjectName's common case: an anonymous function's own configurable,
+/// read-only "name" data property, where the definition only replaces the value.
+unsafe fn replaceOwnName<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, object: ValueBits, string: ValueBits) -> bool {
+  let node = reference(object)
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+  if data.isExotic() { return false }
+  let index = match unsafe shapes.lookup(data.shape, atoms.JS_ATOM_name) { Option<usize>.Some { value } => value Option<usize>.None => { return false } }
+  if u8.toU32(unsafe shapes.slotFlags(data.shape, index)) != JS_PROP_CONFIGURABLE { return false }
+  let old = data.properties.get(index).valueBits()
+  data.properties.set(index, SlotBits.value(string))
+  drop data
+  unsafe gc.release(&mut hooks, rt, old)
+  return true
 }
 unsafe effect fn computedName<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, rt: *mut HeapHeader, object: ValueRef<'b>, key: ValueRef<'b>, propertyFlags: u32) -> ()
   ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {

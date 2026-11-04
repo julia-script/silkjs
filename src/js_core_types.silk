@@ -63,7 +63,7 @@ pub const JS_PROP_THROW_STRICT: u32 = 32768
 pub const JS_PROP_NO_EXOTIC: u32 = 65536
 pub const JS_CALL_FLAG_CONSTRUCTOR: u32 = 1
 pub const JS_PROP_INITIAL_SIZE: usize = 4
-pub const JS_PROP_INITIAL_HASH_SIZE: usize = 4
+pub const JS_PROP_INITIAL_HASH_SIZE: usize = 8
 pub const JS_NATIVE_ERROR_COUNT: usize = 9
 pub const JS_CONTEXT_VALUE_COUNT: usize = 7
 pub const JS_INTL_CTOR_NUMBERFORMAT: usize = 0
@@ -462,6 +462,9 @@ pub struct RuntimeState {
   pub temporaryGcObjects: HeapList,
   pub gcPhase: GcPhase,
   pub mallocGcThreshold: usize,
+  /// Consecutive collections that freed little, 0 to 3; each widens the next
+  /// threshold so a growing acyclic heap is not rescanned at every 1.5x step.
+  pub quietCollections: u8,
   pub weakReferences: WeakRefList,
   pub leakTracking: Option<LeakTrackingState>,
   pub stackSize: usize,
@@ -492,19 +495,28 @@ pub struct RuntimeState {
   /// pair. Bin c - 1 occupies SPARE_SLOTS_PER_BIN entries; js_gc owns this cache.
   pub spareSlots: List<ThinList<SlotBits>>,
   pub spareSlotCounts: [usize; 4],
+  /// Emptied fast-array value lists of capacity 1 to SPARE_VALUE_CAPACITY, by capacity (js_shapes).
+  pub spareValues: List<ThinList<ValueBits>>,
+  pub spareValueCounts: [usize; 8],
   /// Storage of dead plain object cells, kept for new objects so that a
   /// short-lived object skips one allocate/free pair. The first spareCellCount
-  /// entries are Some; js_gc and js_object_allocate own this cache.
+  /// entries are Some; js_gc and js_object_allocate own this cache. Cells with a
+  /// PAIR_SLOTS tail sit after SPARE_CELLS, the first sparePairCellCount of them Some.
   pub spareCells: List<Option<Intrinsic.RawBuffer<u8>>>,
   pub spareCellCount: usize,
-  /// Direct-mapped memo of recent hashed-shape transitions; js_shapes owns it.
-  /// An entry is live only while its generation equals shapeGeneration, which
-  /// js_shapes bumps whenever a hashed shape is destroyed, unhashed or rehashed.
+  pub sparePairCellCount: usize,
+  /// Two-way memo of recent hashed-shape transitions; js_shapes owns it. An
+  /// entry hits only while its base keeps the version it was recorded at, and
+  /// unlinking a target clears the one slot that names it (ShapeData.memoSlot).
   pub transitions: [TransitionEntry; 64],
-  pub shapeGeneration: u32,
+  /// The next ShapeData.version; starts at 1 so no live shape has version 0.
+  pub nextShapeVersion: u64,
+  /// get_field site cache, indexed by a hash of the site's bytecode address;
+  /// js_vm_property_ops owns it.
+  pub fieldCache: [FieldCacheEntry; 1024],
   /// One-code-unit Latin-1 strings, filled on first use; the runtime owns one
   /// reference to each. Read through js_unit_strings.
-  pub unitStrings: [ValueBits; 256],
+  pub unitStrings: [ValueBits; 512],
   pub userOpaque: ?*mut u8,
   /// Storage for frames of JS-to-JS calls the dispatch loop makes without native
   /// recursion (js_vm.callInline). Allocated once and never moved; the slots
@@ -515,14 +527,35 @@ pub struct RuntimeState {
   pub callFramesEnd: ?*mut ValueBits
 }
 
-/// One js_shapes transition memo entry: base (an address, 0 when empty) plus
-/// atom and flags lead to the hashed target shape.
+/// One get_field site cache entry: site is the bytecode address of the
+/// instruction's operand (0 when empty), key is the object's shape version
+/// shifted left 16 bits plus the slot index of an own data property.
+pub struct FieldCacheEntry {
+  pub site: usize,
+  pub key: u64,
+  /// 0 for an own property. Otherwise the property is the prototype's (the
+  /// object's shape names it and has no record for the atom): its shape's
+  /// version shifted left 16 bits plus its slot index there. The index
+  /// FIELD_PASS_THROUGH marks a prototype without a record for the atom: the
+  /// property is then further up, named by midKey and farKey the same way.
+  pub protoKey: u64,
+  pub midKey: u64,
+  pub farKey: u64
+}
+/// The slot index of a FieldCacheEntry key whose prototype has no record for the atom.
+pub const FIELD_PASS_THROUGH: u64 = 0xffff
+impl Copy for FieldCacheEntry {}
+
+/// One js_shapes transition memo entry: base (an address, 0 when empty) at
+/// baseVersion plus atom and flags lead to the hashed target shape. The version
+/// names the base's records, so a base changed or freed and reallocated in place
+/// never hits a stale entry.
 pub struct TransitionEntry {
   pub base: usize,
   pub target: ?*mut HeapHeader,
   pub atom: u32,
   pub flags: u8,
-  pub generation: u32
+  pub baseVersion: u64
 }
 impl Copy for TransitionEntry {}
 
@@ -739,6 +772,12 @@ impl SlotBits {
     if kind == JS_PROP_NORMAL { return PropertySlot.Value { value: self.valueBits() } }
     return self.viewOther(kind)
   }
+  /// The realm reference of a lazy (auto-init) slot: the only edge such a slot owns.
+  @inlineAlways
+  pub fn lazyRealmUnchecked(self: &Self) -> ?*mut HeapHeader {
+    let untagged = SlotBits { first: u64.bitAnd(self.first, u64.bitNot(LAZY_MASK)), second: self.second }
+    return untagged.pointers().first
+  }
   @inlineNever
   fn viewOther(self: &Self, kind: u32) -> PropertySlot {
     let words = self.pointers()
@@ -793,8 +832,17 @@ pub struct ShapeData {
   pub slotPlan: u8,
   pub planCreated: u8,
   pub planOutgrown: u8,
+  /// The transition memo slot that names this shape as its target, or
+  /// js_shapes.NO_MEMO_SLOT: at most one slot does, so unlinking it clears that slot.
+  pub memoSlot: u8,
   pub hash: u32,
   pub propertyHashMask: u32,
+  /// Names this shape's current records for the get_field site cache
+  /// (js_vm_property_ops.FieldCacheEntry): js_shapes gives a shape a fresh one
+  /// from RuntimeState.nextShapeVersion when it is created and whenever its
+  /// records or prototype change, so a cached index stays right while the
+  /// version matches, even across a shape freed and reallocated.
+  pub version: u64,
   pub deletedPropertyCount: usize,
   pub hashNext: ?*mut HeapHeader,
   pub prototype: ?*mut HeapHeader,
@@ -1125,18 +1173,37 @@ pub struct FunctionBytecode {
   pub debug: Option<FunctionDebugInfo>
 }
 
-pub union FrameSlot {
-  Argument { pub index: usize },
-  Local { pub index: usize }
-}
+/// A captured frame slot: an argument or local index plus the frame's varRefs
+/// table entry. Packed in one word so an attached VarRef cell stays 64 bytes.
+pub struct FrameSlot { bits: u64 }
 impl Copy for FrameSlot {}
+impl FrameSlot {
+  // One integer word, not a struct of narrow fields: copies of VarRefState then
+  // stay single loads instead of byte-wise reassembly.
+  @inlineAlways
+  pub fn make(index: usize, varRefIndex: u16, isArgument: bool) -> FrameSlot {
+    let mut bits = u64.bitOr(u64.bitAnd(usize.toU64(index), 0xffffffff), u64.shiftLeft(u16.toU64(varRefIndex), 32))
+    if isArgument { bits = u64.bitOr(bits, u64.shiftLeft(1, 48)) }
+    return FrameSlot { bits: bits }
+  }
+  /// The argument or local index.
+  @inlineAlways
+  pub fn index(self: &Self) -> usize { return u64.toUsize(u64.bitAnd(self.bits, 0xffffffff)) }
+  /// The frame's varRefs table entry.
+  @inlineAlways
+  pub fn varRefIndex(self: &Self) -> u16 { return u64.toU16(u64.bitAnd(u64.shiftRight(self.bits, 32), 0xffff)) }
+  @inlineAlways
+  pub fn isArgument(self: &Self) -> bool { return u64.bitAnd(u64.shiftRight(self.bits, 48), 1) != 0 }
+  @inlineAlways
+  pub fn same(self: &Self, other: FrameSlot) -> bool { return self.bits == other.bits }
+}
 /// Attached references identify stable frame slots by kind/index, never by a
 /// pointer into a growable list. An attached async reference retains the AsyncFrame
 /// found through frame.asyncOwner; the frame's own backpointer is borrowed. Detach
 /// duplicates the slot ValueBits into Detached and releases that async-owner edge.
 /// The detached state owns its ValueBits independently of the still-initialized slot.
 pub union VarRefState {
-  Attached { pub frame: *mut StackFrame, pub slot: FrameSlot, pub varRefIndex: u16 },
+  Attached { pub frame: *mut StackFrame, pub slot: FrameSlot },
   Detached { pub value: ValueBits }
 }
 impl Copy for VarRefState {}
@@ -1145,10 +1212,14 @@ pub struct VarRef {
   pub isConst: bool,
   pub state: VarRefState
 }
+/// StackFrame.currentPc of a frame with no bytecode position.
+pub const NO_PC: usize = 18446744073709551615
+/// StackFrame.stackPointer of a running frame.
+pub const NO_SP: usize = 18446744073709551615
 /// A published frame MUST stay at its original address, as must argument/local/
 /// operand slot allocations. Stack-local frames can be borrowed for a synchronous
 /// call; resumable activations use StableFrame. currentPc is the bytecode offset
-/// after a call (None for native/no PC), not a pointer into growable bytecode.
+/// after a call (NO_PC for native/no PC), not a pointer into growable bytecode.
 pub struct StackFrame {
   pub previous: ?*mut StackFrame,
   /// Explicit reverse link replaces source container_of(frame, AsyncFunctionState).
@@ -1161,11 +1232,13 @@ pub struct StackFrame {
   /// Header pointers are stable; VarRef holds an index, not a List element pointer.
   /// Initialize the complete reference table before publishing this frame.
   pub varRefs: FrameReferences,
-  pub currentPc: Option<usize>,
+  /// NO_PC for native frames and frames without a PC.
+  pub currentPc: usize,
   pub argumentCount: i32,
-  pub mode: u8,
-  /// None while running; Some is a suspended generator's next free stack index.
-  pub stackPointer: Option<usize>
+  /// A JS_MODE_* byte, widened so the frame record has no padding to clear.
+  pub mode: u32,
+  /// NO_SP while running; otherwise a suspended generator's next free stack index.
+  pub stackPointer: usize
 }
 /// Native owner for a non-moving frame. Moving this handle never moves the frame.
 /// Before drop, unlink all runtime frame links, detach VarRefs, and release the

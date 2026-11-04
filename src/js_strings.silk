@@ -185,7 +185,7 @@ impl StringBuilder {
         match spans.next() {
           Option<LeafSpan>.Some { value: span } => {
             let flat = unsafe HeapCell.shortPayload<FlatString, ValueBits>(&value, stringReference(span.leaf))
-            wide = flat.wide && hasWideUnit(Slice.view(flat.utf16.asSlice(), span.start, span.end - span.start))
+            wide = flat.wide && hasWideUnit(Slice.view(flat.wideUnits(), span.start, span.end - span.start))
           }
           Option<LeafSpan>.None => { break }
         }
@@ -202,12 +202,12 @@ impl StringBuilder {
           if !flat.wide && !data.wide { run data.latin1.appendBytes(Slice.view(unsafe latin1Bytes(&value, stringReference(span.leaf)), span.start, count)) }
           else {
             let mut i = span.start
-            if data.wide && flat.wide { run data.utf16.appendSlice(Slice.view(flat.utf16.asSlice(), span.start, count)) }
+            if data.wide && flat.wide { run data.utf16.appendSlice(Slice.view(flat.wideUnits(), span.start, count)) }
             else if data.wide {
               let source = unsafe latin1Bytes(&value, stringReference(span.leaf))
               while i < span.end { run data.utf16.append(u8.toU16(source[i])) i = i + 1 }
             }
-            else { while i < span.end { run data.latin1.append(u16.toU8(flat.utf16.get(i))) i = i + 1 } }
+            else { while i < span.end { run data.latin1.append(u16.toU8(flat.wideUnits()[i])) i = i + 1 } }
           }
           data.addLength(count)
         }
@@ -221,7 +221,7 @@ impl StringBuilder {
     let count = end - start
     let source = unsafe HeapCell.shortPayload<FlatString, ValueBits>(&value, stringReference(value))
     let sourceWide = source.wide
-    let wide = sourceWide && hasWideUnit(Slice.view(source.utf16.asSlice(), start, count))
+    let wide = sourceWide && hasWideUnit(Slice.view(source.wideUnits(), start, count))
     drop source
     // Fast path: Latin-1 into an existing Latin-1 buffer. appendBytes grows the
     // list geometrically, so the separate reserve step is not needed.
@@ -240,12 +240,12 @@ impl StringBuilder {
     if !flat.wide && !data.wide { run data.latin1.appendBytes(Slice.view(unsafe latin1Bytes(&value, stringReference(value)), start, count)) }
     else {
       let mut i = start
-      if data.wide && flat.wide { run data.utf16.appendSlice(Slice.view(flat.utf16.asSlice(), start, count)) }
+      if data.wide && flat.wide { run data.utf16.appendSlice(Slice.view(flat.wideUnits(), start, count)) }
       else if data.wide {
         let source = unsafe latin1Bytes(&value, stringReference(value))
         while i < end { run data.utf16.append(u8.toU16(source[i])) i = i + 1 }
       }
-      else { while i < end { run data.latin1.append(u16.toU8(flat.utf16.get(i))) i = i + 1 } }
+      else { while i < end { run data.latin1.append(u16.toU8(flat.wideUnits()[i])) i = i + 1 } }
     }
     data.addLength(count)
   }
@@ -278,8 +278,13 @@ impl StringBuilder {
 }
 
 // Longer strings keep a List buffer so repeated appends can grow it in place.
-// 240 bytes keeps a FlatString cell with its tail inside the 512-byte pool classes.
-const INLINE_LATIN1_MAX: usize = 240
+// Up to this, a finished string is one cell with its text in the tail: within
+// the 1024-byte pool classes up to 752 bytes, one child allocation past that,
+// rather than a pooled cell plus a separate buffer.
+const INLINE_LATIN1_MAX: usize = 4000
+// The pooled part of that range. concatOwned joins two short strings directly
+// only up to here: past it, prepending to a long string should build a rope.
+const POOLED_LATIN1_MAX: usize = 752
 fn isAscii(bytes: &[u8]) -> bool {
   let mut i: usize = 0
   if bytes.length >= 8 {
@@ -318,7 +323,7 @@ fn foldSlice(anchor: &ValueBits, reference: *mut HeapHeader, start: usize, end: 
   let mut h = initial
   let mut i = start
   if flat.wide {
-    let units = flat.utf16.asSlice()
+    let units = flat.wideUnits()
     while i < end { h = u32.wrappingAdd(u32.wrappingMultiply(h, 263), u16.toU32(units[i])) i = i + 1 }
   } else {
     let units = unsafe latin1Bytes(anchor, reference)
@@ -337,6 +342,15 @@ fn hasWideLead(bytes: &[u8]) -> bool {
 }
 fn hasWideUnit(units: &[u16]) -> bool {
   let mut i: usize = 0
+  if units.length >= 4 {
+    // Four units a step: any high byte anywhere means a unit above 255.
+    let base = unsafe Intrinsic.pointerRequalify<?[*]const u16, [*]const u16>(Pointer.fromSlice<u16>(units))
+    while i + 4 <= units.length {
+      let at = unsafe Intrinsic.pointerReinterpret<*const u16, *const align(1) u64>(unsafe Pointer.at<u16>(base, i))
+      if u64.bitAnd(unsafe Pointer.readUnaligned<u64>(at), 0xff00ff00ff00ff00) != 0 { return true }
+      i = i + 4
+    }
+  }
   while i < units.length {
     if units[i] > 255 { return true }
     i = i + 1
@@ -536,7 +550,27 @@ impl Strings {
     if stringLength(left) > stringLength(right) { return 1 }
     return 0
   }
-  fn compareFlat(left: ValueBits, right: ValueBits) -> i32 {
+  /// The first eight units of a flat Latin-1 string as one big-endian number,
+  /// zero padded: unequal keys order two such strings as compareFlat does (equal
+  /// keys decide nothing). None for a wide string.
+  pub fn latin1Key(value: ValueBits) -> Option<u64> {
+    let text = unsafe HeapCell.shortPayload<FlatString, ValueBits>(&value, stringReference(value))
+    if text.wide { return Option<u64>.none() }
+    let mut length = text.length()
+    drop text
+    if length > 8 { length = 8 }
+    let bytes = unsafe latin1Bytes(&value, stringReference(value))
+    let mut key: u64 = 0
+    let mut i: usize = 0
+    while i < 8 {
+      let mut unit: u64 = 0
+      if i < length { unit = u8.toU64(bytes[i]) }
+      key = u64.shiftLeft(key, 8) | unit
+      i = i + 1
+    }
+    return Option<u64>.some(key)
+  }
+  pub fn compareFlat(left: ValueBits, right: ValueBits) -> i32 {
     let a = unsafe HeapCell.shortPayload<FlatString, ValueBits>(&left, stringReference(left))
     let b = unsafe HeapCell.shortPayload<FlatString, ValueBits>(&right, stringReference(right))
     let mut remaining = a.length()
@@ -544,8 +578,17 @@ impl Strings {
     let mut i: usize = 0
     if !a.wide && !b.wide {
       let x = unsafe latin1Bytes(&left, stringReference(left)) let y = unsafe latin1Bytes(&right, stringReference(right))
+      // remaining is at most both lengths, so the raw reads stay in bounds.
+      let px = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(x))
+      let py = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(y))
+      while i + 8 <= remaining
+        && unsafe Pointer.readUnaligned<u64>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u64>(unsafe Pointer.at<u8>(px, i)))
+          == unsafe Pointer.readUnaligned<u64>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u64>(unsafe Pointer.at<u8>(py, i))) {
+        i = i + 8
+      }
       while i < remaining {
-        if x[i] != y[i] { return u8.toI32(x[i]) - u8.toI32(y[i]) }
+        let p = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(px, i)) let q = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(py, i))
+        if p != q { return u8.toI32(p) - u8.toI32(q) }
         i = i + 1
       }
     } else {
@@ -589,6 +632,21 @@ impl Strings {
     if value.tag() == -7 && !stringWide(value) && start <= end && end <= stringLength(value) {
       let bytes = Slice.view(unsafe latin1Bytes(&value, stringReference(value)), start, end - start)
       return run Strings.joinLatin1(bytes, Slice.view(bytes, 0, 0))
+    }
+    // A wide flat source: one exact allocation, no builder or rope spans. The
+    // result is narrow exactly when every unit is below 256, as appendFlat does.
+    if value.tag() == -7 && start < end && end <= stringLength(value) {
+      let count = end - start
+      let flat = unsafe HeapCell.shortPayload<FlatString, ValueBits>(&value, stringReference(value))
+      let units = Slice.view(flat.wideUnits(), start, count)
+      if hasWideUnit(units) { return run Strings.joinWide(units) }
+      if count <= 64 {
+        let mut bytes: [u8; 64] = [0; 64]
+        let mut i: usize = 0
+        while i < count { bytes[i] = u16.toU8(units[i]) i = i + 1 }
+        drop flat
+        return run Strings.joinLatin1(Slice.view(&bytes, 0, count), Slice.view(&bytes, 0, 0))
+      }
     }
     let mut builder = StringBuilder.make()
     run builder.appendRange(value, start, end)
@@ -678,7 +736,7 @@ impl Strings {
     // Two short Latin-1 strings with a compact left: concatFlatOwned could neither
     // append in place nor grow left, so join them here without its checks.
     if right.tag() == -7 && Strings.compactLatin1(left) && !stringWide(right)
-      && stringLength(left) + stringLength(right) <= INLINE_LATIN1_MAX {
+      && stringLength(left) + stringLength(right) <= POOLED_LATIN1_MAX {
       return run Strings.joinLatin1(Slice.view(unsafe latin1Bytes(&left, stringReference(left)), 0, stringLength(left)),
         Slice.view(unsafe latin1Bytes(&right, stringReference(right)), 0, stringLength(right)))
     }
@@ -719,6 +777,42 @@ impl Strings {
     }
     if target.tag() == -6 && short { return run Strings.appendToUniqueRope(target, piece) }
     return false
+  }
+  /// Whether a string value has exactly one holder.
+  @inlineAlways
+  pub fn heldOnce(value: ValueBits) -> bool {
+    let anchor = ()
+    let header = unsafe Pointer.borrow<(), HeapHeader>(&anchor, stringReference(value))
+    return header.referenceCount == 1
+  }
+  /// The common `s += piece` of a short flat Latin-1 piece onto a uniquely held,
+  /// growable flat Latin-1 s with room: every check in one place, no growth.
+  /// False leaves both untouched for appendInPlace.
+  pub effect fn appendShortLatin1(target: ValueBits, piece: ValueBits) -> bool ! OutOfMemoryError ? &mut Allocator {
+    if target.tag() != -7 || piece.tag() != -7 { return false }
+    let reference = stringReference(target)
+    let anchor = ()
+    let header = unsafe Pointer.borrow<(), HeapHeader>(&anchor, reference)
+    let unique = header.referenceCount == 1
+    drop header
+    if !unique { return false }
+    let source = unsafe HeapCell.shortPayload<FlatString, ValueBits>(&piece, stringReference(piece))
+    let additional = source.length()
+    if source.wide || additional == 0 || additional > 16 { return false }
+    drop source
+    let bytes = unsafe latin1Bytes(&piece, stringReference(piece))
+    let mut token = ()
+    let data = unsafe HeapCell.shortPayloadMut<FlatString, ()>(&mut token, reference)
+    if data.compact || data.wide || !Pointer.isNull(data.registry) { return false }
+    let length = data.length()
+    if length + additional >= data.latin1.capacity() || length + additional > STRING_LENGTH_MAX { return false }
+    let mut i: usize = 0
+    while i < additional { run data.latin1.append(0) i = i + 1 }
+    let text = data.latin1.asMutSlice()
+    i = 0
+    while i < additional { text[length + i] = bytes[i] i = i + 1 }
+    data.setLength(length + additional)
+    return true
   }
   /// appendInPlace for a target that one more holder references, which the
   /// caller is about to overwrite with the result (`s = s + piece` on a local).
@@ -778,6 +872,34 @@ impl Strings {
     target.length = target.length + additional
     return true
   }
+  /// `s = piece + s` on a local s holding a rope that one more holder (the operand
+  /// stack) references: joins piece onto the rope's short left leaf and keeps the
+  /// rope node, instead of a new leaf and a new node per prepend. False leaves
+  /// both untouched.
+  pub effect fn prependInPlaceShared(target: ValueBits, piece: ValueBits) -> bool
+    ! OutOfMemoryError ? &mut Allocator {
+    if target.tag() != -6 || piece.tag() != -7 || stringWide(piece) { return false }
+    let additional = stringLength(piece)
+    if additional == 0 || additional > ROPE_SHORT_LENGTH || stringLength(target) > STRING_LENGTH_MAX - additional { return false }
+    let reference = stringReference(target)
+    let anchor = ()
+    let header = unsafe Pointer.borrow<(), HeapHeader>(&anchor, reference)
+    let unique = header.referenceCount == 2
+    drop header
+    if !unique { return false }
+    let node = unsafe HeapCell.shortPayload<RopeString, ValueBits>(&target, reference)
+    let first = node.left
+    drop node
+    if first.tag() != -7 || stringWide(first) || stringLength(first) > ROPE_SHORT_LENGTH { return false }
+    let joined = run Strings.joinLatin1(Slice.view(unsafe latin1Bytes(&piece, stringReference(piece)), 0, additional),
+      Slice.view(unsafe latin1Bytes(&first, stringReference(first)), 0, stringLength(first)))
+    let previous = StringOwner.adopt(first)
+    let mut token = ()
+    let rope = unsafe HeapCell.shortPayloadMut<RopeString, ()>(&mut token, reference)
+    rope.left = joined
+    rope.length = rope.length + additional
+    return true
+  }
   /// Borrows both strings and reuses the unique left allocation when possible.
   /// Every append is capacity-guarded; the Allocator effect is required only by
   /// List.append's interface, and this operation never requests an allocation.
@@ -790,10 +912,6 @@ impl Strings {
     let mut token = ()
     let target = unsafe HeapCell.shortPayloadMut<FlatString, ()>(&mut token, stringReference(left))
     let length = target.length() + additional
-    if !target.wide {
-      let last = target.latin1.length() - 1
-      let terminator = target.latin1.remove(last)
-    }
     if target.wide {
       let mut i: usize = 0
       while i < additional {
@@ -801,7 +919,11 @@ impl Strings {
         i = i + 1
       }
     } else {
-      run target.latin1.appendBytes(Slice.view(unsafe latin1Bytes(&right, stringReference(right)), 0, additional))
+      // The first byte takes the terminator's place; capacity was checked above.
+      let bytes = unsafe latin1Bytes(&right, stringReference(right))
+      let last = target.latin1.length() - 1
+      target.latin1.set(last, bytes[0])
+      if additional > 1 { run target.latin1.appendBytes(Slice.view(bytes, 1, additional - 1)) }
       run target.latin1.append(0)
     }
     target.setLength(length)
@@ -874,6 +996,39 @@ impl Strings {
     }
     return run Strings.concatFlat(left, right)
   }
+  /// `s + piece` for a string being built up in place (`s += piece` on a local
+  /// that cannot take the bytes in place): a new flat Latin-1 string whose buffer
+  /// has room to keep growing, so the following appends need no new cell. Borrows
+  /// both strings; none when either is not short flat Latin-1 text.
+  /// holders is how many references the caller accounts for: more mean someone
+  /// else keeps left (`t = s; s += piece`), so the result will not be appended to
+  /// in place either and gets an exact buffer.
+  pub effect fn joinGrowable(left: ValueBits, right: ValueBits, holders: i32) -> Option<ValueBits> ! OutOfMemoryError ? &mut Allocator {
+    if left.tag() != -7 || right.tag() != -7 || stringWide(left) || stringWide(right) { return Option<ValueBits>.none() }
+    let first = stringLength(left) let second = stringLength(right)
+    let length = first + second
+    if second == 0 || second > ROPE_SHORT_LENGTH || length > ROPE_SHORT2_LENGTH { return Option<ValueBits>.none() }
+    let anchor = ()
+    let header = unsafe Pointer.borrow<(), HeapHeader>(&anchor, stringReference(left))
+    let shared = header.referenceCount > holders
+    drop header
+    if shared {
+      return Option<ValueBits>.some(run Strings.joinLatin1(Slice.view(unsafe latin1Bytes(&left, stringReference(left)), 0, first),
+        Slice.view(unsafe latin1Bytes(&right, stringReference(right)), 0, second)))
+    }
+    let mut capacity = 2 * length
+    if capacity < 64 { capacity = 64 }
+    let mut bytes = List<u8>.make()
+    run bytes.reserveExact(capacity + 1)
+    run bytes.appendBytes(Slice.view(unsafe latin1Bytes(&left, stringReference(left)), 0, first))
+    run bytes.appendBytes(Slice.view(unsafe latin1Bytes(&right, stringReference(right)), 0, second))
+    run bytes.append(0)
+    let mut data = FlatString.make()
+    data.latin1 = move bytes
+    data.setLength(length)
+    let reference = run HeapCell.allocateShort(HeapKind.String, move data)
+    return Option<ValueBits>.some(ValueBits.String { reference: reference })
+  }
   // A new flat Latin-1 string holding first then second: one exact buffer, one cell.
   pub effect fn joinLatin1(first: &[u8], second: &[u8]) -> ValueBits ! OutOfMemoryError ? &mut Allocator {
     let length = first.length + second.length
@@ -909,6 +1064,39 @@ impl Strings {
     run bytes.append(0)
     let mut data = FlatString.make()
     data.latin1 = move bytes
+    data.setLength(length)
+    let reference = run HeapCell.allocateShort(HeapKind.String, move data)
+    return ValueBits.String { reference: reference }
+  }
+  // A new flat wide string holding units: short ones keep them in the cell
+  // itself, as joinLatin1 does, so one allocation and no List.
+  pub effect fn joinWide(units: &[u16]) -> ValueBits ! OutOfMemoryError ? &mut Allocator {
+    let length = units.length
+    if length * 2 <= INLINE_LATIN1_MAX {
+      let omitted = compactOmittedBytes()
+      let bytes = Slice.asBytes<u16>(units)
+      let cell = run HeapCell.allocateShortCompactWithTail<FlatString>(HeapKind.String, omitted, bytes, Slice.view(bytes, 0, 0), 0)
+      let mut token = ()
+      let created = unsafe HeapCell.shortPayloadMut<FlatString, ()>(&mut token, cell)
+      created.compact = true
+      created.setLength(length)
+      created.registry = Pointer.null<HeapHeader>()
+      created.atom = 0
+      created.hash = 0
+      created.next = 0
+      created.weakRefCount = 0
+      created.wide = true
+      created.kind = AtomKind.String
+      created.hasDescription = true
+      drop created
+      return ValueBits.String { reference: cell }
+    }
+    let mut copy = List<u16>.make()
+    run copy.reserveExact(length)
+    run copy.appendSlice(units)
+    let mut data = FlatString.make()
+    data.wide = true
+    data.utf16 = move copy
     data.setLength(length)
     let reference = run HeapCell.allocateShort(HeapKind.String, move data)
     return ValueBits.String { reference: reference }
@@ -1078,7 +1266,7 @@ impl Strings {
       }
       // Flat UTF-16: one pass over the units into a buffer grown up front.
       // Every unit has one byte reserved; a non-ASCII sequence grows it as needed.
-      let units = Slice.view(flat.utf16.asSlice(), 0, flat.length())
+      let units = Slice.view(flat.wideUnits(), 0, flat.length())
       run result.appendRepeated(0, units.length)
       let mut written: usize = 0
       let mut i: usize = 0

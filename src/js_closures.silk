@@ -20,7 +20,7 @@ import js_realm { Realm, lendRealm }
 import js_core_types { ObjectData, ObjectPayload, BytecodeClosure, FunctionBytecode,
   FunctionKind, ClosureVar, ClosureKind, VariableKind, StackFrame, ContextState,
   AutoInitKind, AutoInitOpaque, NativeErrorKind, PropertySlot, SlotBits, JS_PROP_WRITABLE, JS_PROP_CONFIGURABLE,
-  JS_PROP_HAS_VALUE, JS_PROP_HAS_CONFIGURABLE, JS_PROP_HAS_WRITABLE, JS_PROP_HAS_ENUMERABLE }
+  JS_PROP_HAS_VALUE, JS_PROP_HAS_CONFIGURABLE, JS_PROP_HAS_WRITABLE, JS_PROP_HAS_ENUMERABLE, JS_PROP_AUTOINIT }
 import js_gc { HeapHooks }
 import js_gc as gc
 import js_runtime as runtime
@@ -73,10 +73,13 @@ unsafe effect fn fill<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks>(h
   let count = b.closureVars.length() let evalDeclaration = b.isDirectOrIndirectEval drop b
   if count == 0 { return () }
   let mut changedAnchor = () let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut changedAnchor, node(function.view()))
-  match &mut p.payload {
+  // The list starts as count null cells, which every reader and the finalizer accept,
+  // and is filled in place below; its storage is reserved here once and never
+  // grows, so the loop stores through this element pointer.
+  let references = match &mut p.payload {
     ObjectPayload.BytecodeFunction { function: closure } => {
-      // Filled in order below: until then the list holds the captured prefix.
-      run closure.varRefs.reserveExact(count)
+      closure.varRefs = run BoxList<?*mut HeapHeader>.makeFilled(count, Pointer.null<HeapHeader>())
+      unsafe Pointer.assumeManyMut<?*mut HeapHeader>(unsafe closure.varRefs.elementsMut())
     }
     _ => trap()
   }
@@ -94,23 +97,37 @@ unsafe effect fn fill<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks>(h
       index = index + 1
     }
   }
+  // The capturing frame's bytecode, looked up on the first local or argument capture.
+  let mut frameCode: ?*mut HeapHeader = Pointer.null<HeapHeader>()
+  // The definitions are fixed with the bytecode, which the function keeps alive, so
+  // one view of them serves the whole loop without a reload and length check per capture.
+  let codeAnchor = () let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&codeAnchor, bytecode)
+  let definitions = code.closureVars.asSlice()
   let mut index: usize = 0
   while index < count {
-    let definition = unsafe capture(bytecode, index)
+    let definition = definitions[index]
     let mut reference: ?*mut HeapHeader = Pointer.null<HeapHeader>()
+    if definition.kind == ClosureKind.Local || definition.kind == ClosureKind.Argument {
+      let source = active(frame)
+      if Pointer.isNull<HeapHeader>(frameCode) { frameCode = unsafe cells.bytecodeOf(source) }
+      reference = run unsafe cells.getIn(rt, source, present(frameCode), u16.toUsize(definition.variableIndex),
+        definition.kind == ClosureKind.Argument)
+      unsafe Pointer.put<?*mut HeapHeader>(unsafe Pointer.atMut<?*mut HeapHeader>(references, index), reference)
+      index = index + 1
+      continue
+    }
     match definition.kind {
       ClosureKind.ModuleImport => ()
       ClosureKind.ModuleDeclaration => { reference = run unsafe cells.createDetached(rt, definition.isLexical) }
       ClosureKind.GlobalDeclaration => { let realmAnchor = () reference = run globals.defineGlobal(&mut hooks, unsafe lendRealm(&realmAnchor, context), definition, evalDeclaration) }
       ClosureKind.Global => { let realmAnchor = () reference = run globals.captureGlobal(&mut hooks, unsafe lendRealm(&realmAnchor, context), definition) }
-      ClosureKind.Local => { reference = run unsafe cells.get(rt, active(frame), u16.toUsize(definition.variableIndex), false) }
-      ClosureKind.Argument => { reference = run unsafe cells.get(rt, active(frame), u16.toUsize(definition.variableIndex), true) }
+      ClosureKind.Local => trap()
+      ClosureKind.Argument => trap()
       ClosureKind.Reference => { let cell = present(inherited[u16.toUsize(definition.variableIndex)]) unsafe HeapCell.retain(cell) reference = cell }
       ClosureKind.GlobalReference => { let cell = present(inherited[u16.toUsize(definition.variableIndex)]) unsafe HeapCell.retain(cell) reference = cell }
     }
-    let target = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut changedAnchor, node(function.view()))
-    match &mut target.payload { ObjectPayload.BytecodeFunction { function: closure } => { run closure.varRefs.append(reference) } _ => trap() }
-    drop target index = index + 1
+    unsafe Pointer.put<?*mut HeapHeader>(unsafe Pointer.atMut<?*mut HeapHeader>(references, index), reference)
+    index = index + 1
   }
 }
 pub unsafe effect fn closure2<'a, H: HeapHooks + OwnPropertyHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, function: ValueBits, bytecode: *mut HeapHeader,
@@ -155,12 +172,57 @@ unsafe effect fn define<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks 
 }
 effect fn lazy<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
   function: ValueRef<'b>) -> ValueBits ! JsException ? &mut Allocator {
-  let result = run Effect.result(properties.defineAutoInitProperty(&mut hooks, realm, unsafe lendBits(&function, function.view()),
+  // The new function is owned by the caller and JS_ATOM_prototype is predefined.
+  let result = run Effect.result(unsafe properties.defineFreshAutoInit(&mut hooks, realm, unsafe lendBits(&function, function.view()),
     atoms.JS_ATOM_prototype, AutoInitKind.Prototype, AutoInitOpaque.Pointer { value: Pointer.null<u8>() }, JS_PROP_WRITABLE))
   return match move result {
     Result<bool, OutOfMemoryError>.Success { .. } => ValueBits.Undefined
     Result<bool, OutOfMemoryError>.Failure { .. } => { return run hooks.throwOutOfMemory(realm) }
   }
+}
+// A new function object created directly with its final shape (length, name and,
+// for constructors, a lazy prototype) when that whole transition chain from the
+// class prototype's empty shape is already interned: no per-property lookups or
+// transitions, and no empty shape revived only to be retired again. Returns
+// Undefined, having created nothing, when the chain isn't interned yet.
+unsafe effect fn shapedFunction<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H, memory: &AllocationObserver,
+  realm: Realm<'a>, classId: u32, hasPrototype: bool, name: u32, length: u16) -> ValueBits
+  ! OutOfMemoryError | JsException ? &mut Allocator { let context = realm.context()
+  let rt = realm.runtime()
+  // Allocates (and may collect), so it runs before the shape walk.
+  let text = run functions.atomString(&mut hooks, realm, name)
+  let anchor = () let ctx = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  let mut prototype: ?*mut HeapHeader = Pointer.null<HeapHeader>()
+  match ctx.classPrototypes.get(u32.toUsize(classId)) { ValueBits.Object { reference } => { prototype = reference } _ => () }
+  drop ctx
+  let mut target = unsafe shapes.findPrototype(rt, prototype)
+  if !Pointer.isNull<HeapHeader>(target) {
+    let mut steps: usize = 2
+    if hasPrototype { steps = 3 }
+    target = unsafe shapes.transitionChain(rt, present(target), [atoms.JS_ATOM_length, atoms.JS_ATOM_name, atoms.JS_ATOM_prototype],
+      [1, 1, u32.toU8(JS_PROP_WRITABLE | JS_PROP_AUTOINIT)], steps)
+  }
+  if Pointer.isNull<HeapHeader>(target) { unsafe gc.release(&mut hooks, rt, text) return ValueBits.Undefined }
+  unsafe shapes.take(rt, present(target))
+  let allocated = run Effect.result(unsafe objects.fromShape(&mut hooks, memory, realm, present(target), classId,
+    Option<ThinList<SlotBits>>.none()))
+  let function = match move allocated {
+    Result<ValueBits, OutOfMemoryError>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError>.Failure { error } => { unsafe gc.release(&mut hooks, rt, text) fail move error }
+  }
+  let mut dataAnchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut dataAnchor, node(function))
+  let mut first = data.properties.length() - 2
+  if hasPrototype { first = first - 1 }
+  data.properties.set(first, SlotBits.value(ValueBits.Int { value: u16.toI32(length) }))
+  data.properties.set(first + 1, SlotBits.value(text))
+  if hasPrototype {
+    data.setIsConstructor(true)
+    unsafe HeapCell.retain(context)
+    data.properties.set(first + 2, SlotBits.from(PropertySlot.lazy(context, AutoInitKind.Prototype,
+      AutoInitOpaque.Pointer { value: Pointer.null<u8>() })))
+  }
+  return function
 }
 effect fn configure<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(
   hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, function: ValueRef<'b>,
@@ -189,8 +251,21 @@ pub unsafe effect fn closure<'a, H: HeapHooks + OwnPropertyHooks + CoercionHooks
   let anchor = () let b = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
   let kind = b.kind let hasPrototype = b.hasPrototype let length = b.definedArgumentCount
   let mut name = b.name if name == 0 { name = atoms.JS_ATOM_empty_string } drop b
+  let mut fresh = ValueBits.Undefined
+  if kind != FunctionKind.Generator && kind != FunctionKind.AsyncGenerator {
+    let shaped = run Intrinsic.catchFailure<OutOfMemoryError | JsException>(
+      unsafe shapedFunction(&mut hooks, memory, realm, classFor(kind), hasPrototype, name, length), failedConfigure)
+    match move shaped {
+      ValueBits value => { fresh = value }
+      FailedConfigure { error } => {
+        let pending = run Effect.catch<JsException>(materialize(&mut hooks, realm, move error), exceptionValue)
+        unsafe gc.release(&mut hooks, realm.runtime(), bytecodeValue) fail JsException {}
+      }
+    }
+    if fresh.isObject() { return run unsafe closure2(&mut hooks, realm, fresh, bytecode, inherited, frame, isEval) }
+  }
   let allocated = run Intrinsic.catchFailure<OutOfMemoryError>(objects.withClass(&mut hooks, memory, realm, classFor(kind)), failedOom)
-  let fresh = match move allocated {
+  fresh = match move allocated {
     ValueBits value => value
     FailedOom { error } => {
       let pending = run Effect.catch<JsException>(materialize(&mut hooks, realm, move error), exceptionValue)
