@@ -45,7 +45,7 @@ import js_regexp_intrinsics_support as support
 import js_regexp_intrinsics_exec as execution
 import js_regexp_string_iterator as iterator
 import js_regexp_string_iterator { Matches }
-import regexp_types { FLAG_GLOBAL, FLAG_STICKY, FLAG_UNICODE, FLAG_UNICODE_SETS, FLAG_NAMED_GROUPS }
+import regexp_types { FLAG_GLOBAL, FLAG_STICKY, FLAG_UNICODE, FLAG_UNICODE_SETS, FLAG_NAMED_GROUPS, FLAG_INDICES, FLAG_IGNORECASE, FLAG_MULTILINE, FLAG_DOTALL }
 
 // Exec results of a replace. The first four stay on the native stack, like
 // source ValueBuffer; the rest spill to an owning list.
@@ -143,9 +143,7 @@ effect fn substring<'a, 'b, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>, s
   start: i64, end: i64) -> Value ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
   if start == 0 && end == usize.toI64(Strings.length(string.view())) { return string.dup() }
   if end <= start { return unsafe Value.adoptBits(run core.atomValue(&mut hooks, realm, atoms.JS_ATOM_empty_string)) }
-  let mut builder = StringBuilder.make()
-  run unsafe appendRange(&mut builder, string.view(), start, end)
-  return unsafe Value.adoptBits(run builder.finish())
+  return unsafe Value.adoptBits(run Strings.substring(string.view(), i64.toUsize(start), i64.toUsize(end)))
 }
 // Source string_buffer_concat appends nothing for reversed ranges (custom exec
 // can report a match extending beyond the end of the searched string).
@@ -412,6 +410,8 @@ unsafe fn native(value: ValueBits, method: u32, magic: i32) -> bool {
     _ => false
   }
 }
+/// Whether value is the builtin RegExp.prototype symbol method method.
+pub unsafe fn builtinSymbol(value: ValueBits, method: u32) -> bool { return unsafe native(value, method, 0) }
 unsafe fn standardGetter(receiver: ValueBits, atom: u32, method: u32, magic: i32) -> bool {
   match unsafe findSlot(receiver, atom, false) {
     Option<PropertySlot>.Some { value: PropertySlot.GetterSetter { getter, .. } } => {
@@ -455,6 +455,9 @@ effect fn optimizedReplace<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHoo
   let length = usize.toI64(Strings.length(string.view()))
   let mut nextSource: i64 = 0
   let mut builder = ReplacementBuffer.make()
+  // A replacement without `$` is inserted as is.
+  let plain = !contains(replacement.view(), 36)
+  let mut sized = false
   while true {
     if lastIndex > length {
       if global || sticky { run execution.setLastIndex(&mut hooks, realm, receiver, 0) }
@@ -467,8 +470,16 @@ effect fn optimizedReplace<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHoo
     }
     let start = i32.toI64(matched.captures.get(0))
     let end = i32.toI64(matched.captures.get(1))
+    // The first match sizes the result for the common case of a replacement
+    // about as long as the match.
+    if !sized {
+      if !run builder.reserve(&mut hooks, realm, i64.toUsize(length) + Strings.length(replacement.view()), false) { fail JsException {} }
+      sized = true
+    }
     if !run builder.appendRange(&mut hooks, realm, string, nextSource, start) { fail JsException {} }
-    if Strings.length(replacement.view()) != 0 {
+    if plain {
+      if !run builder.append(&mut hooks, realm, replacement) { fail JsException {} }
+    } else if Strings.length(replacement.view()) != 0 {
       run getSubstitution(&mut hooks, realm, &mut builder, immediateRef(ValueBits.Undefined), string, start,
         immediateRef(ValueBits.Undefined), immediateRef(ValueBits.Undefined), replacement, matched.captures.asSlice())
     }
@@ -634,11 +645,91 @@ unsafe fn searchableSplitter(receiver: ValueBits, constructor: ValueBits, splitt
   if (flags & (FLAG_STICKY | FLAG_UNICODE | FLAG_UNICODE_SETS)) != 0 { return false }
   return unsafe support.flags(splitter) == (flags | FLAG_STICKY)
 }
+// The searchable split loop (see searchableSplitter) from p.*, appending parts
+// to array; p.* ends at the start of the unsplit tail. True when the limit was
+// reached and array is complete.
+effect fn searchSplit<'a, 'b, 'c, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, receiver: ValueRef<'b>, text: ValueRef<'c>, array: ValueRef<'c>, maximum: i64,
+  p: &mut i64, count: &mut i64) -> bool ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+    let fields = unsafe support.fields(receiver.view())
+    let bytecode = fields.bytecode()
+    let size = usize.toI64(Strings.length(text.view()))
+    let mut q = p.*
+    while q < size {
+      let matched = run execution.execute(&mut hooks, memory, realm, unsafe lendBits(&bytecode, bytecode), text, i64.toUsize(q))
+      if !matched.matched { break }
+      let start = i32.toI64(matched.captures.get(0))
+      if start >= size { break }
+      let mut end = i32.toI64(matched.captures.get(1))
+      if end > size { end = size }
+      if end == p.* { q = start + 1 }
+      else {
+        let sub = run substring(&mut hooks, realm, text, p.*, start)
+        run support.defineIndex(&mut hooks, realm, array, count.*, move sub)
+        count.* = count.* + 1
+        if count.* == maximum { return true }
+        p.* = end
+        let mut capture: usize = 1
+        while capture * 2 < matched.captures.length() {
+          let from = matched.captures.get(capture * 2)
+          let to = matched.captures.get(capture * 2 + 1)
+          let mut captured = Value.immediate(ValueBits.Undefined)
+          if from >= 0 && to >= 0 { captured = run substring(&mut hooks, realm, text, i32.toI64(from), i32.toI64(to)) }
+          run support.defineIndex(&mut hooks, realm, array, count.*, move captured)
+          count.* = count.* + 1
+          if count.* == maximum { return true }
+          capture = capture + 1
+        }
+        q = p.*
+      }
+    }
+    return false
+}
+// Whether split on receiver may skip constructing its splitter and search with
+// receiver's own bytecode: every property the generic path would read from
+// receiver or the constructor resolves to the builtin, so neither the reads nor
+// the private splitter are observable.
+unsafe fn quickSplit(receiver: ValueBits, defaultCtor: ValueBits) -> bool {
+  if !unsafe standard(receiver) { return false }
+  let flags = unsafe support.flags(receiver)
+  if (flags & (FLAG_STICKY | FLAG_UNICODE | FLAG_UNICODE_SETS)) != 0 { return false }
+  let names: [u32; 6] = [atoms.JS_ATOM_hasIndices, atoms.JS_ATOM_ignoreCase, atoms.JS_ATOM_multiline,
+    atoms.JS_ATOM_dotAll, atoms.JS_ATOM_unicodeSets, atoms.JS_ATOM_sticky]
+  let magics: [u32; 6] = [FLAG_INDICES, FLAG_IGNORECASE, FLAG_MULTILINE, FLAG_DOTALL, FLAG_UNICODE_SETS, FLAG_STICKY]
+  let mut index: usize = 0
+  while index < 6 {
+    if !unsafe standardGetter(receiver, names[index], 4, u32.toI32(magics[index])) { return false }
+    index = index + 1
+  }
+  match unsafe findSlot(receiver, atoms.JS_ATOM_constructor, false) {
+    Option<PropertySlot>.Some { value: PropertySlot.Value { value } } => { if !unsafe core.sameValue(value, defaultCtor) { return false } }
+    _ => { return false }
+  }
+  if !unsafe standardGetter(defaultCtor, atoms.JS_ATOM_Symbol_species, 15, 0) { return false }
+  // IsRegExp in the RegExp constructor reads @@match.
+  return match unsafe findSlot(receiver, atoms.JS_ATOM_Symbol_match, false) {
+    Option<PropertySlot>.Some { value: PropertySlot.Value { .. } } => true
+    Option<PropertySlot>.None => true
+    _ => false
+  }
+}
 effect fn splitBody<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + CallHooks + InterruptHooks>(hooks: &mut H,
   memory: &AllocationObserver, realm: Realm<'a>, receiver: ValueRef<'b>, input: ValueRef<'b>, limit: ValueRef<'b>) -> ValueBits
   ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
   let text = run support.string(&mut hooks, realm, input)
   let defaultCtor = defaultConstructor(realm)
+  if Strings.length(text.view()) > 0 && unsafe quickSplit(receiver.view(), defaultCtor) {
+    let array = run support.array(&mut hooks, memory, realm)
+    let mut maximum: i64 = 4294967295
+    if limit.view().tag() != 3 { maximum = u32.toI64(run support.uint32(&mut hooks, realm, limit)) }
+    if maximum == 0 { return array.intoBits() }
+    let mut p: i64 = 0
+    let mut count: i64 = 0
+    if run searchSplit(&mut hooks, memory, realm, receiver, text.borrow(), array.borrow(), maximum, &mut p, &mut count) { return array.intoBits() }
+    let tail = run substring(&mut hooks, realm, text.borrow(), p, usize.toI64(Strings.length(text.view())))
+    run support.defineIndex(&mut hooks, realm, array.borrow(), count, move tail)
+    return array.intoBits()
+  }
   let constructor = run constructors.speciesConstructor(&mut hooks, realm, receiver, unsafe lendBits(&defaultCtor, defaultCtor))
   let mut flags = run propertyString(&mut hooks, realm, receiver, atoms.JS_ATOM_flags)
   let fullUnicode = unicode(flags.view())
@@ -662,40 +753,7 @@ effect fn splitBody<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + Pr
     if result.view().tag() != 2 { return array.intoBits() }
   }
   if size > 0 && unsafe searchableSplitter(receiver.view(), constructor.view(), splitter.view(), defaultCtor) {
-    // The sticky loop below tries each q in turn; the first q that matches is
-    // the leftmost match a forward search from q finds with the receiver's
-    // non-sticky bytecode. The splitter is private, so its lastIndex writes
-    // and exec result arrays are unobservable and are skipped.
-    let fields = unsafe support.fields(receiver.view())
-    let bytecode = fields.bytecode()
-    while q < size {
-      let matched = run execution.execute(&mut hooks, memory, realm, unsafe lendBits(&bytecode, bytecode), text.borrow(), i64.toUsize(q))
-      if !matched.matched { break }
-      let start = i32.toI64(matched.captures.get(0))
-      if start >= size { break }
-      let mut end = i32.toI64(matched.captures.get(1))
-      if end > size { end = size }
-      if end == p { q = start + 1 }
-      else {
-        let sub = run substring(&mut hooks, realm, text.borrow(), p, start)
-        run support.defineIndex(&mut hooks, realm, array.borrow(), count, move sub)
-        count = count + 1
-        if count == maximum { return array.intoBits() }
-        p = end
-        let mut capture: usize = 1
-        while capture * 2 < matched.captures.length() {
-          let from = matched.captures.get(capture * 2)
-          let to = matched.captures.get(capture * 2 + 1)
-          let mut captured = Value.immediate(ValueBits.Undefined)
-          if from >= 0 && to >= 0 { captured = run substring(&mut hooks, realm, text.borrow(), i32.toI64(from), i32.toI64(to)) }
-          run support.defineIndex(&mut hooks, realm, array.borrow(), count, move captured)
-          count = count + 1
-          if count == maximum { return array.intoBits() }
-          capture = capture + 1
-        }
-        q = p
-      }
-    }
+    if run searchSplit(&mut hooks, memory, realm, receiver, text.borrow(), array.borrow(), maximum, &mut p, &mut count) { return array.intoBits() }
     q = size
   }
   while q < size {
