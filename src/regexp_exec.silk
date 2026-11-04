@@ -18,12 +18,16 @@ import silk.num.u32
 import silk.num.usize
 import byte_buffer { readU16 }
 import regexp_opcodes
-import regexp_types { RegExpMatch, Captures, RegExpTimeout, FLAG_UNICODE, FLAG_UNICODE_SETS, FLAG_HINT, HINT_LENGTH, HINT_LITERAL }
+import regexp_types { RegExpMatch, Captures, RegExpTimeout, FLAG_UNICODE, FLAG_UNICODE_SETS, FLAG_HINT, HINT_LENGTH, HINT_LITERAL, HINT_ANCHORED }
 import unicode_case { UnicodeCase }
 
 const STATE_SPLIT: i64 = 0
 const STATE_LOOKAHEAD: i64 = 1
 const STATE_NEGATIVE_LOOKAHEAD: i64 = 2
+// A greedy one-character loop's pending exits (greedyLoop): the frame's pc word
+// holds the exit pc in its low 32 bits and the lowest position in the high ones;
+// its position word is the next position to resume at, counting down.
+const STATE_STAR: i64 = 3
 const INTERRUPT_COUNTER_INIT: u32 = 10000
 // Undo-log words kept on the native stack before the log moves to the heap.
 const UNDO_INLINE: usize = 256
@@ -116,10 +120,14 @@ fn slots(words: ?*mut i64) -> [*]mut i64 {
 struct Storage {
   inlineWords: ?*mut i64,
   heap: List<i64>,
-  inlineValues: [i64; 32],
+  inlineValues: ?*mut i64,
   spill: List<i64>
 }
 
+@inlineAlways
+fn registerStore(values: ?*mut i64, index: usize, value: i64) -> () {
+  unsafe { Pointer.write<i64>(Pointer.atMut<i64>(slots(values), index), value) }
+}
 @inlineAlways
 fn registerAt(values: ?*mut i64, index: usize) -> i64 {
   unsafe { return Pointer.read<i64>(Pointer.atMut<i64>(slots(values), index)) }
@@ -180,8 +188,12 @@ struct Machine {
 impl Machine {
   // `storage` must outlive the machine and stay in place.
   effect fn make(storage: &mut Storage, registerCount: usize) -> Self ! OutOfMemoryError ? &mut Allocator {
-    let mut values = Pointer.fromMutRef<i64>(&mut storage.inlineValues[0])
-    if registerCount > 32 {
+    let mut values = storage.inlineValues
+    if registerCount <= 32 {
+      // Only the live registers start unset: filling all 32 cost every exec.
+      let mut index: usize = 0
+      while index < registerCount { registerStore(values, index, -1) index = index + 1 }
+    } else {
       run List<i64>.reserveExact(&mut storage.spill, registerCount)
       run List<i64>.appendRepeated(&mut storage.spill, -1, registerCount)
       values = Pointer.fromMutRef<i64>(&mut List<i64>.asMutSlice(&mut storage.spill)[0])
@@ -291,6 +303,17 @@ impl Machine {
   fn backtrack(self: &mut Self) -> Resume {
     while self.base != 0 {
       Machine.undo(&mut self)
+      let top = self.base
+      if usize.bitAnd(i64.wrappingToUsize(Machine.word(&self, usize.wrappingSubtract(top, 1))), 3) == 3 {
+        // STATE_STAR: resume at the exit one position lower, keeping the frame
+        // while lower positions remain.
+        let packed = i64.wrappingToUsize(Machine.word(&self, usize.wrappingSubtract(top, 3)))
+        let position = i64.wrappingToUsize(Machine.word(&self, usize.wrappingSubtract(top, 2)))
+        if position > usize.shiftRight(packed, 32) {
+          Machine.setWord(&mut self, usize.wrappingSubtract(top, 2), usize.wrappingToI64(position - 1))
+        } else { let finished = Machine.popFrame(&mut self) }
+        return Resume { exists: true, pc: usize.bitAnd(packed, 0xffffffff), position: position }
+      }
       let frame = Machine.popFrame(&mut self)
       if frame.kind != STATE_LOOKAHEAD {
         return Resume { exists: true, pc: frame.pc, position: frame.position }
@@ -586,6 +609,47 @@ fn skipAhead<U: Units>(bytecode: &[u8], first: usize, op: u8, input: &ExecInput<
   return at
 }
 
+/// The size of the step at at when it matches exactly one character and a greedy
+/// loop over it can run in place (oneUnit: every character is one unit), else 0.
+@inlineAlways
+fn oneStepSize(ops: [*]const u8, at: usize, oneUnit: bool) -> usize {
+  if !oneUnit { return 0 }
+  let opcode = unsafe op8(ops, at)
+  if opcode == regexp_opcodes.REOP_char || opcode == regexp_opcodes.REOP_char_i { return 3 }
+  if opcode >= regexp_opcodes.REOP_dot && opcode <= regexp_opcodes.REOP_not_space { return 1 }
+  if opcode == regexp_opcodes.REOP_range || opcode == regexp_opcodes.REOP_range_i { return 3 + u16.toUsize(unsafe rangeU16(ops, at + 1)) * 4 }
+  if opcode == regexp_opcodes.REOP_range32 || opcode == regexp_opcodes.REOP_range32_i { return 3 + u16.toUsize(unsafe rangeU16(ops, at + 1)) * 8 }
+  return 0
+}
+/// The position after matching the one-character step at at (see oneStepSize) as
+/// many times as it matches from position on.
+@inlineNever
+fn greedyRun<U: Units>(bytecode: &[u8], ops: [*]const u8, at: usize, input: &ExecInput<U>, position: usize) -> usize {
+  let opcode = unsafe op8(ops, at)
+  let mut end = position
+  if opcode == regexp_opcodes.REOP_char {
+    let unit = u16.toU32(unsafe rangeU16(ops, at + 1))
+    while end < input.length && unitAt(input, end) == unit { end = usize.wrappingAdd(end, 1) }
+  } else if opcode == regexp_opcodes.REOP_char_i {
+    let unit = u16.toU32(unsafe rangeU16(ops, at + 1))
+    while !literal(input, end, unit, true).failed { end = usize.wrappingAdd(end, 1) }
+  } else if opcode == regexp_opcodes.REOP_dot {
+    while end < input.length && !isLineTerminator(unitAt(input, end)) { end = usize.wrappingAdd(end, 1) }
+  } else if opcode == regexp_opcodes.REOP_any {
+    end = input.length
+  } else if opcode == regexp_opcodes.REOP_space {
+    while end < input.length && UnicodeCase.isSpace(unitAt(input, end)) { end = usize.wrappingAdd(end, 1) }
+  } else if opcode == regexp_opcodes.REOP_not_space {
+    while end < input.length && !UnicodeCase.isSpace(unitAt(input, end)) { end = usize.wrappingAdd(end, 1) }
+  } else {
+    let count = u16.toUsize(unsafe rangeU16(ops, at + 1))
+    let wide = opcode == regexp_opcodes.REOP_range32 || opcode == regexp_opcodes.REOP_range32_i
+    let fold = opcode == regexp_opcodes.REOP_range_i || opcode == regexp_opcodes.REOP_range32_i
+    while !classRange(bytecode, at + 3, count, input, end, wide, fold).failed { end = usize.wrappingAdd(end, 1) }
+  }
+  return end
+}
+
 /// The first position at or after start where the count REOP_char steps from
 /// first match, or -1; every character is one unit.
 fn literalSearch<U: Units>(ops: [*]const u8, first: usize, count: usize, input: &ExecInput<U>, start: usize) -> i64 {
@@ -615,23 +679,35 @@ effect fn execute<U: Units, 'env>(bytecode: &[u8], input: &ExecInput<U>, start: 
   ! OutOfMemoryError | RegExpTimeout ? &mut Allocator {
   if bytecode.length <= regexp_opcodes.RE_HEADER_LEN { Intrinsic.trap("QuickJS invariant violated") }
   let ops = opcodes(bytecode)
-  // The compiler's search hint (regexp_types.FLAG_HINT) names a run of
-  // REOP_char steps, each one unit when the input is not UTF-16 in u/v mode.
-  if (u16.toU32(unsafe rangeU16(ops, regexp_opcodes.RE_HEADER_FLAGS)) & FLAG_HINT) != 0 && !(input.units.holdsWords() && input.unicode) {
+  // The compiler's search hint (regexp_types.FLAG_HINT).
+  let mut startPc = regexp_opcodes.RE_HEADER_LEN
+  if (u16.toU32(unsafe rangeU16(ops, regexp_opcodes.RE_HEADER_FLAGS)) & FLAG_HINT) != 0 {
     let hint = regexp_opcodes.RE_HEADER_LEN + u32.toUsize(unsafe rangeU32(ops, regexp_opcodes.RE_HEADER_BYTECODE_LEN)) - HINT_LENGTH
     let kind = unsafe op8(ops, hint + 1)
-    let literalAt = u16.toUsize(unsafe rangeU16(ops, hint + 2))
-    let literalCount = u16.toUsize(unsafe rangeU16(ops, hint + 4))
-    let found = literalSearch(ops, literalAt, literalCount, input, start)
-    if found < 0 || kind == HINT_LITERAL { return run literalMatch(found, literalCount) }
+    if kind == HINT_ANCHORED {
+      // Only position 0 can match (a u/v-mode start inside a surrogate pair
+      // moves back to the pair, so that case takes the search). From 0 the
+      // search prefix would only retry later positions.
+      if start == 0 { startPc = regexp_opcodes.RE_HEADER_LEN + 11 }
+      else if !(input.units.holdsWords() && input.unicode) { return RegExpMatch { matched: false, captures: Captures.empty() } }
+    } else if !(input.units.holdsWords() && input.unicode) {
+      // A run of REOP_char steps, each one unit here.
+      let literalAt = u16.toUsize(unsafe rangeU16(ops, hint + 2))
+      let literalCount = u16.toUsize(unsafe rangeU16(ops, hint + 4))
+      let found = literalSearch(ops, literalAt, literalCount, input, start)
+      if found < 0 || kind == HINT_LITERAL { return run literalMatch(found, literalCount) }
+    }
   }
   let captureCount = u8.toUsize(unsafe op8(ops, regexp_opcodes.RE_HEADER_CAPTURE_COUNT))
   let registerBase = captureCount * 2
+  // Every character is one unit: greedy one-character loops run in place.
+  let oneUnit = !(input.units.holdsWords() && input.unicode)
   let liveRegisters = registerBase + u8.toUsize(unsafe op8(ops, regexp_opcodes.RE_HEADER_REGISTER_COUNT))
   let undo = unsafe Intrinsic.pointerRequalify<[*]mut i64, *mut i64>(unsafe Intrinsic.stackAllocate<i64>(UNDO_INLINE))
-  let mut storage = Storage { inlineWords: undo, heap: List<i64>.make(), inlineValues: [-1; 32], spill: List<i64>.make() }
+  let registers = unsafe Intrinsic.pointerRequalify<[*]mut i64, *mut i64>(unsafe Intrinsic.stackAllocate<i64>(32))
+  let mut storage = Storage { inlineWords: undo, heap: List<i64>.make(), inlineValues: registers, spill: List<i64>.make() }
   let mut machine = run Machine.make(&mut storage, liveRegisters)
-  let mut pc = regexp_opcodes.RE_HEADER_LEN
+  let mut pc = startPc
   let mut position = start
   let mut interruptCounter = INTERRUPT_COUNTER_INIT
   if input.units.holdsWords() && input.unicode && position > 0 && position < input.length {
@@ -722,12 +798,30 @@ effect fn execute<U: Units, 'env>(bytecode: &[u8], input: &ExecInput<U>, start: 
       }
       14 => { // REOP_split_goto_first
         let target = branch(pc + 4, unsafe rangeU32(ops, pc))
-        run Machine.pushFrame(&mut machine, pc + 4, position, STATE_SPLIT)
-        pc = target
+        // The greedy x+ loop's back edge right after its one-character step x.
+        let size = oneStepSize(ops, target, oneUnit)
+        if size != 0 && usize.wrappingAdd(target, size) == pc - 1 {
+          let end = greedyRun(bytecode, ops, target, input, position)
+          if end > position { run Machine.pushFrame(&mut machine, usize.shiftLeft(position, 32) + pc + 4, end - 1, STATE_STAR) }
+          pc = pc + 4 position = end
+        } else {
+          run Machine.pushFrame(&mut machine, pc + 4, position, STATE_SPLIT)
+          pc = target
+        }
       }
       15 => { // REOP_split_next_first
         pc = usize.wrappingAdd(pc, 4)
-        run Machine.pushFrame(&mut machine, branch(pc, unsafe rangeU32(ops, pc - 4)), position, STATE_SPLIT)
+        let exit = branch(pc, unsafe rangeU32(ops, pc - 4))
+        // A greedy x* loop over a one-character step x: split, x, goto back.
+        let size = oneStepSize(ops, pc, oneUnit)
+        if size != 0 && exit == pc + size + 5 && unsafe op8(ops, pc + size) == regexp_opcodes.REOP_goto &&
+          branch(exit, unsafe rangeU32(ops, pc + size + 1)) == pc - 5 {
+          let end = greedyRun(bytecode, ops, pc, input, position)
+          if end > position { run Machine.pushFrame(&mut machine, usize.shiftLeft(position, 32) + exit, end - 1, STATE_STAR) }
+          pc = exit position = end
+        } else {
+          run Machine.pushFrame(&mut machine, exit, position, STATE_SPLIT)
+        }
       }
       40 => { // REOP_lookahead
         pc = usize.wrappingAdd(pc, 4)
