@@ -44,6 +44,8 @@ pub struct RetiredProperty {
 /// Interned shapes with fewer properties than this are never extended in place, so the
 /// shapes along a transition chain stay available for the next object built the same way.
 const SMALL_SHAPE: usize = 32
+/// ShapeData.memoSlot for a shape no transition memo slot names.
+pub const NO_MEMO_SLOT: u8 = 255
 /// How many zero-reference interned shapes the runtime keeps for reuse.
 const PARKED_SHAPES: usize = 256
 
@@ -261,16 +263,14 @@ unsafe fn unlink(runtime: *mut HeapHeader, shape: *mut HeapHeader) -> () {
   }
   state.shapeHashCount = state.shapeHashCount - 1
   // Every destroy, unhash and rehash of a hashed shape comes through here, so
-  // this retires the transition memo entries that name it, as base or target.
-  // Only those: bumping the generation instead dropped the whole memo, and an
-  // object that deletes a property unhashes its shape every time (each later
-  // add then walked findTransition's O(n) compare, ~250 Ir).
-  let address = Pointer.address<HeapHeader>(shape)
-  let mut i: usize = 0
-  while i < 64 {
-    let entry = state.transitions[i]
-    if entry.base == address || Pointer.address<HeapHeader>(present(entry.target)) == address { state.transitions[i].base = 0 }
-    i = i + 1
+  // this retires the one memo entry that names it as target. Entries naming it
+  // as base need nothing: they hit only at the base version they recorded, and
+  // a shape changed in place or allocated at a freed address has a new one.
+  // (Scanning all 64 entries cost ~390 Ir, paid by every object that deletes.)
+  let slot = (unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, shape)).memoSlot
+  if slot != NO_MEMO_SLOT {
+    let index = u8.toUsize(slot)
+    if Pointer.address<HeapHeader>(present(state.transitions[index].target)) == Pointer.address<HeapHeader>(shape) { state.transitions[index].base = 0 }
   }
   let mut detachedAnchor = ()
   let detached = unsafe HeapCell.payloadMut<ShapeData, ()>(&mut detachedAnchor, shape)
@@ -296,7 +296,7 @@ unsafe effect fn allocateShape(hashSize: usize, capacity: usize, hash: u32, dele
   let mut anchor = ()
   let data = unsafe HeapCell.payloadMut<ShapeData, ()>(&mut anchor, shape)
   unsafe Pointer.put<ShapeData>(Pointer.fromMutRef<ShapeData>(&mut data), ShapeData {
-    isHashed: false, slotPlan: SLOTS_UNDECIDED, planCreated: 0, planOutgrown: 0, hash: hash, propertyHashMask: usize.toU32(hashSize - 1), version: 0,
+    isHashed: false, slotPlan: SLOTS_UNDECIDED, planCreated: 0, planOutgrown: 0, memoSlot: NO_MEMO_SLOT, hash: hash, propertyHashMask: usize.toU32(hashSize - 1), version: 0,
     deletedPropertyCount: deletedPropertyCount, hashNext: Pointer.null<HeapHeader>(), prototype: prototype,
     hashIndices: move indices, properties: move properties
   })
@@ -777,27 +777,50 @@ unsafe fn memoTransition(runtime: *mut HeapHeader, base: *mut HeapHeader,
   // Two-way sets: one hot constructor's few transitions used to collide in a
   // direct-mapped slot often enough to miss most lookups after a layout change.
   let set = u64.toUsize(u64.shiftRight(u64.wrappingMultiply(key, 0x9e3779b97f4a7c15), 59)) * 2
+  // base is live (an object's shape or a memoized target), so its version reads safely.
+  let baseAnchor = ()
+  let baseVersion = (unsafe HeapCell.payload<ShapeData, ()>(&baseAnchor, base)).version
   let mut anchor = ()
   let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
-  let generation = state.shapeGeneration
   let first = state.transitions[set]
-  if first.base == address && first.atom == atom && first.flags == flags && first.generation == generation {
+  if first.base == address && first.atom == atom && first.flags == flags && first.baseVersion == baseVersion {
     return first.target
   }
   let second = state.transitions[set + 1]
-  if second.base == address && second.atom == atom && second.flags == flags && second.generation == generation {
+  if second.base == address && second.atom == atom && second.flags == flags && second.baseVersion == baseVersion {
     return second.target
   }
   drop state
   let found = unsafe findTransition(runtime, base, atom, flags)
-  if !Pointer.isNull<HeapHeader>(found) {
-    let memo = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
-    let entry = TransitionEntry { base: address, target: found, atom: atom, flags: flags, generation: generation }
-    // The newest entry takes the first way; a live first entry moves to the second.
-    if first.base != 0 && first.generation == generation { memo.transitions[set + 1] = first }
-    memo.transitions[set] = entry
-  }
+  if !Pointer.isNull<HeapHeader>(found) { unsafe remember(runtime, set, TransitionEntry { base: address, target: found, atom: atom, flags: flags, baseVersion: baseVersion }) }
   return found
+}
+/// Records entry in set's first way, keeping each target named by one slot at
+/// most: the slot its memoSlot names is cleared first, and a live first entry
+/// moves to the second way, taking its target's memoSlot along.
+@inlineNever
+unsafe fn remember(runtime: *mut HeapHeader, set: usize, entry: TransitionEntry) -> () {
+  let target = present(entry.target)
+  let mut targetAnchor = ()
+  let previous = (unsafe HeapCell.payload<ShapeData, ()>(&targetAnchor, target)).memoSlot
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  if previous != NO_MEMO_SLOT {
+    let index = u8.toUsize(previous)
+    if Pointer.address<HeapHeader>(present(state.transitions[index].target)) == Pointer.address<HeapHeader>(target) { state.transitions[index].base = 0 }
+  }
+  let first = state.transitions[set]
+  state.transitions[set] = entry
+  // A live first entry's target is alive: unlinking it would have cleared the slot.
+  if first.base != 0 {
+    state.transitions[set + 1] = first
+    let mut movedAnchor = ()
+    let moved = unsafe HeapCell.payloadMut<ShapeData, ()>(&mut movedAnchor, present(first.target))
+    moved.memoSlot = usize.toU8(set + 1)
+  }
+  drop state
+  let data = unsafe HeapCell.payloadMut<ShapeData, ()>(&mut targetAnchor, target)
+  data.memoSlot = usize.toU8(set)
 }
 pub unsafe effect fn addProperty(runtime: *mut HeapHeader, object: &mut ObjectData,
   atom: u32, flags: u8) -> AddResult ! OutOfMemoryError ? &mut Allocator {
