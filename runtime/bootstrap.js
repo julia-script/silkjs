@@ -45,11 +45,11 @@ function internalRequire(request, parent = '') {
   if (stringEndsWith(request, '.js')) request = stringSlice(request, 0, -3);
   if (moduleHas(request)) return moduleGet(request).exports;
   let factory = factoryGet(request);
-  if (!factory) throw Object.assign(new Error('Unknown builtin: ' + request), { code: 'ERR_UNKNOWN_BUILTIN_MODULE' });
+  if (factory === undefined) throw Object.assign(new Error('Unknown builtin: ' + request), { code: 'ERR_UNKNOWN_BUILTIN_MODULE' });
   const module = { exports: {} }; moduleSet(request, module);
   try {
-    if (typeof factory === 'string') {
-      factory = native.compileFunction(factory, 'node:' + request);
+    if (typeof factory === 'number') {
+      factory = native.compileFunction(native.builtinSource(factory), 'node:' + request);
       factorySet(request, factory);
     }
     factory(module, module.exports, name => internalRequire(name, request));
@@ -57,7 +57,7 @@ function internalRequire(request, parent = '') {
   catch (error) { moduleDelete(request); throw error; }
   return module.exports;
 }
-/*__BUILTINS__*/
+for (let index = 0, count = native.builtinCount(); index < count; index++) define(native.builtinName(index), index);
 
 for (const name of ['dispose', 'asyncDispose']) {
   if (Symbol[name] === undefined) Object.defineProperty(Symbol, name, { value: Symbol.for('nodejs.' + name) });
@@ -119,8 +119,9 @@ host.initializeRealmBuiltins = (handle, global, wasmCodeGeneration) => {
     if (name === 'internal/host') return bridge;
     if (!realmSources.has(name)) return internalRequire(name);
     if (cache.has(name)) return cache.get(name).exports;
-    const source = realmSources.get(name);
-    if (typeof source !== 'string') throw new Error('Unknown realm builtin dependency: ' + name);
+    const index = realmSources.get(name);
+    if (typeof index !== 'number') throw new Error('Unknown realm builtin dependency: ' + name);
+    const source = native.builtinSource(index);
     const module = { exports: {} };
     cache.set(name, module);
     const script = native.vmCompile('(' + source + ')', 'node:' + name, handle);
