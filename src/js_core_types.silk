@@ -202,6 +202,14 @@ impl ByteStorage {
       ByteStorage.Borrowed { data, .. } => unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(data), index))
     }
   }
+  /// pointerAt(0) without the bounds check: requires nonempty storage, as for
+  /// pointerAt, and the same lifetime rules.
+  pub unsafe fn start(self: &Self) -> *const u8 {
+    return match &self.* {
+      ByteStorage.Owned { bytes } => unsafe Pointer.at<u8>(unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Intrinsic.pointerFromSlice<u8>(bytes.asSlice())), 0)
+      ByteStorage.Borrowed { data, .. } => data
+    }
+  }
   /// Requires index < length; the returned pointer is valid only while the backing
   /// allocation stays alive and unmoved and no mutation conflicts with its uses.
   pub unsafe fn pointerAt(self: &Self, index: usize) -> *const u8 {
@@ -513,6 +521,9 @@ pub struct RuntimeState {
   pub transitions: [TransitionEntry; 64],
   /// The next ShapeData.version; starts at 1 so no live shape has version 0.
   pub nextShapeVersion: u64,
+  /// The ShapeData.version of the last object spread source js_copy_data_properties
+  /// found to be all plain enumerable data properties; versions are never reused.
+  pub plainCloneVersion: u64,
   /// get_field site cache, indexed by a hash of the site's bytecode address;
   /// js_vm_property_ops owns it.
   pub fieldCache: [FieldCacheEntry; 4096],
@@ -535,9 +546,20 @@ pub struct RuntimeState {
   pub emptyShapes: [EmptyShapeEntry; 16],
   /// instanceof cache, indexed by the constructor's shape version (js_vm_object_ops).
   pub instanceCache: [InstanceCacheEntry; 64],
-  /// One-code-unit Latin-1 strings, filled on first use; the runtime owns one
-  /// reference to each. Read through js_unit_strings.
-  pub unitStrings: [ValueBits; 512],
+  /// Object literal site cache (js_gc.literalShape): the shape an `object`
+  /// instruction's literal ends with after its leading define_field runs, owned
+  /// here and released before each collection.
+  pub literalCache: [LiteralCacheEntry; 256],
+  /// The last `a + b + 'literal'` join (js_vm_operators.addThree): its three
+  /// pieces and result, each owned here and released before each collection.
+  /// Strings have no identity, so the same three pieces give that result again.
+  pub joinCache: [ValueBits; 4],
+  /// The last RegExp layout js_regexp_intrinsics_symbols.standard proved; it owns it.
+  pub regexpStandard: RegExpStandardCache,
+  /// One-code-unit Latin-1 strings, small decimals and recent short substrings,
+  /// filled on use; the runtime owns one reference to each. Read through
+  /// js_unit_strings.
+  pub unitStrings: [ValueBits; 769],
   /// Dead objects still in gcObjects that drainZero destroys next, newest last
   /// (see js_gc.enqueueZero).
   pub zeroStack: [?*mut HeapHeader; 256],
@@ -571,12 +593,32 @@ pub struct FieldCacheEntry {
   pub midKey: u64,
   pub farKey: u64
 }
+/// A RegExp layout whose builtin behavior js_regexp_intrinsics_symbols.standard
+/// proved: receiverVersion names a receiver's records (an own lastIndex at slot
+/// lastIndex, no own exec or flag getters) and its prototype, and protoVersion
+/// names that prototype's records, which hold exec and the flags, global and
+/// unicode accessors at the other slots. Versions are 0 when empty. Slot values
+/// can change without a new version, so every use checks them again.
+pub struct RegExpStandardCache {
+  pub receiverVersion: u64,
+  pub protoVersion: u64,
+  pub lastIndex: u32,
+  pub exec: u32,
+  pub flags: u32,
+  pub global: u32,
+  pub unicode: u32,
+  /// The prototype's Symbol.replace slot, or u32.MAX when the proven layout has
+  /// none (or the receiver has its own).
+  pub replace: u32
+}
+impl Copy for RegExpStandardCache {}
+pub const EMPTY_REGEXP_STANDARD: RegExpStandardCache = RegExpStandardCache { receiverVersion: 0, protoVersion: 0, lastIndex: 0, exec: 0, flags: 0, global: 0, unicode: 0, replace: 0xffffffff }
 /// The slot index of a FieldCacheEntry key whose prototype has no record for the atom.
 pub const FIELD_PASS_THROUGH: u64 = 0xffff
 impl Copy for FieldCacheEntry {}
 /// The RuntimeState.fieldCache entry for the get_field site whose operand starts at site.
 @inlineAlways
-pub fn fieldCacheIndex(site: usize) -> usize { return (site ^ usize.shiftRight(site, 12)) & 4095 }
+pub fn fieldCacheIndex(site: usize) -> usize { return site & 4095 }
 
 /// One js_shapes transition memo entry: base (an address, 0 when empty) at
 /// baseVersion plus atom and flags lead to the hashed target shape. The version
@@ -653,6 +695,17 @@ pub struct InstanceCacheEntry {
   pub index: usize
 }
 impl Copy for InstanceCacheEntry {}
+/// One RuntimeState.literalCache entry: site is the address just past an
+/// `object` instruction (0 when empty). shape, when not null, is the owned
+/// shape its object has after the define_field instructions that follow it with
+/// nothing else touching the object; null marks a site that has none.
+pub struct LiteralCacheEntry {
+  pub site: usize,
+  pub shape: ?*mut HeapHeader
+}
+impl Copy for LiteralCacheEntry {}
+@inlineAlways
+pub fn literalCacheIndex(site: usize) -> usize { return (site ^ usize.shiftRight(site, 8)) & 255 }
 pub const INSTANCE_CACHE_EMPTY: u64 = 0xffffffffffffffff
 pub struct TransitionEntry {
   pub base: usize,
@@ -957,6 +1010,10 @@ pub struct ShapeData {
   /// records or prototype change, so a cached index stays right while the
   /// version matches, even across a shape freed and reallocated.
   pub version: u64,
+  /// Equals version once js_shapes.plainRecords has seen that every record is a
+  /// plain data property (no accessor, var ref or lazy slot); renewing the
+  /// version retires it.
+  pub plainVersion: u64,
   pub deletedPropertyCount: usize,
   pub hashNext: ?*mut HeapHeader,
   pub prototype: ?*mut HeapHeader,
@@ -1284,6 +1341,9 @@ pub struct FunctionBytecode {
   /// The code never writes, aliases or captures a parameter slot, so a public
   /// call may lend the caller's argument cells instead of copying them.
   pub borrowsArguments: bool,
+  /// Nonzero when js_bytecode.leafCode holds for a plain function: calls may run
+  /// it without a frame (js_vm_leaf), and each declined run uses up one.
+  pub leaf: u8,
   /// js_bytecode.constructForm of the code: which constructor fast path, if
   /// any, constructInline tries.
   pub constructForm: u8,

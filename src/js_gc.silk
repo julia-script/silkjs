@@ -27,7 +27,7 @@ import js_value { ValueBits }
 import js_strings { Strings }
 import js_string_types { FlatString, AtomKind, destroyFlat }
 import js_bigint { BigInt }
-import js_core_types { NO_SP, FieldCacheEntry, fieldCacheIndex, ConstructPin, ReceiverCacheEntry, blankReceiverEntry, ForwardEntry, blankForwardEntry, EmptyShapeEntry,
+import js_core_types { NO_SP, LiteralCacheEntry, literalCacheIndex, FieldCacheEntry, fieldCacheIndex, ConstructPin, ReceiverCacheEntry, blankReceiverEntry, ForwardEntry, blankForwardEntry, EmptyShapeEntry,
   RuntimeState, ContextState, GcPhase, HeapList, ObjectData, ObjectPayload,
   PropertySlot, SlotBits, ShapeData, ShapeProperty, JS_PROP_TMASK, JS_PROP_AUTOINIT, FunctionBytecode, VarRef, VarRefState, FrameSlot,
   StackFrame, AsyncFrame, ModuleDef, ExportBinding, NativeFunctionId,
@@ -816,6 +816,70 @@ pub unsafe fn releasePins<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader)
     slot = slot + 1
   }
 }
+/// Empties the object literal site cache, releasing its shapes.
+unsafe fn releaseLiterals<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader) -> () {
+  let mut anchor = ()
+  let mut slot: usize = 0
+  while slot < 256 {
+    let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+    let entry = state.literalCache[slot]
+    state.literalCache[slot] = LiteralCacheEntry { site: 0, shape: Pointer.null<HeapHeader>() }
+    drop state
+    unsafe releaseOptional(&mut hooks, runtime, entry.shape)
+    slot = slot + 1
+  }
+  let mut index: usize = 0
+  while index < 4 {
+    let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+    let held = state.joinCache[index]
+    state.joinCache[index] = ValueBits.Undefined
+    drop state
+    unsafe release(&mut hooks, runtime, held)
+    index = index + 1
+  }
+}
+/// The literal site cache entry for site: its shape owned once more, null when
+/// the site has none; found tells whether the site was seen at all.
+pub struct LiteralShape { pub found: bool, pub shape: ?*mut HeapHeader }
+impl Copy for LiteralShape {}
+@inlineAlways
+pub unsafe fn literalShape(runtime: *mut HeapHeader, site: usize) -> LiteralShape {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let entry = state.literalCache[literalCacheIndex(site)]
+  drop state
+  if entry.site != site { return LiteralShape { found: false, shape: Pointer.null<HeapHeader>() } }
+  match Pointer.nonNullMut<HeapHeader>(entry.shape) {
+    Option<*mut HeapHeader>.Some { value } => { unsafe HeapCell.retain(value) }
+    Option<*mut HeapHeader>.None => ()
+  }
+  return LiteralShape { found: true, shape: entry.shape }
+}
+/// Records shape (owned by the caller, retained here; null for none) for site.
+pub unsafe fn noteLiteral<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, site: usize, shape: ?*mut HeapHeader) -> () {
+  match Pointer.nonNullMut<HeapHeader>(shape) {
+    Option<*mut HeapHeader>.Some { value } => { unsafe HeapCell.retain(value) }
+    Option<*mut HeapHeader>.None => ()
+  }
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  let slot = literalCacheIndex(site)
+  let old = state.literalCache[slot]
+  state.literalCache[slot] = LiteralCacheEntry { site: site, shape: shape }
+  drop state
+  unsafe releaseOptional(&mut hooks, runtime, old.shape)
+}
+/// Empties the literal cache entry filled for the site at address site, if any.
+unsafe fn forgetLiteralSite<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, site: usize) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  let slot = literalCacheIndex(site)
+  let old = state.literalCache[slot]
+  if old.site != site { return () }
+  state.literalCache[slot] = LiteralCacheEntry { site: 0, shape: Pointer.null<HeapHeader>() }
+  drop state
+  unsafe releaseOptional(&mut hooks, runtime, old.shape)
+}
 /// Destroys every parked shape so the collector sees only live references.
 pub unsafe fn flushParkedShapes<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader) -> () {
   let mut shape = unsafe js_shapes.unpark(runtime)
@@ -939,6 +1003,7 @@ pub unsafe effect fn collect<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHead
   require(unsafe phase(runtime) == GcPhase.None)
   unsafe releasePins(&mut hooks, runtime)
   unsafe releaseRetired(&mut hooks, runtime)
+  unsafe releaseLiterals(&mut hooks, runtime)
   unsafe drainPending(&mut hooks, runtime)
   unsafe flushParkedShapes(&mut hooks, runtime)
   require(Pointer.isNull<HeapHeader>(unsafe firstGc(runtime, 1)))
@@ -1365,6 +1430,8 @@ pub unsafe fn finalizeCorePayload<H: HeapHooks>(hooks: &mut H, runtime: *mut Hea
     }
     ObjectPayload.FastArray { array } => {
       let mut index: usize = 0
+      // A number-only array has nothing to release.
+      if !ValueBits.anyHeap(array.values.asSlice()) { index = array.values.length() }
       while index < array.values.length() {
         unsafe release(&mut hooks, runtime, array.values.get(index))
         index = index + 1
@@ -1594,6 +1661,8 @@ unsafe fn destroyObject<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, n
   let slotCount = properties.length()
   let mut index: usize = 0
   require(slotCount <= unsafe js_shapes.recordCount(shape))
+  // Plain data records holding only numbers and other immediates own nothing.
+  if slotCount != 0 && unsafe js_shapes.plainRecords(shape) && !ValueBits.anyHeapEarly(unsafe js_shapes.slotValues(&properties)) { index = slotCount }
   while index < slotCount {
     // Plain values take release's inline fast path without building a
     // PropertySlot; only other slots call out.
@@ -2023,6 +2092,9 @@ unsafe fn destroyBytecode<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader,
         unsafe forgetFieldSite(runtime, Pointer.address<u8>(unsafe code.pointerAt(position + 1)))
       }
     }
+    if unsafe code.byte(position) == op.OP_object {
+      unsafe forgetLiteralSite(&mut hooks, runtime, Pointer.address<u8>(unsafe code.pointerAt(position)) + 1)
+    }
     require(info.size != 0)
     position = position + u8.toUsize(info.size)
   }
@@ -2415,7 +2487,7 @@ pub unsafe effect fn destroyRuntime<H: HeapHooks>(hooks: &mut H, runtime: *mut H
   drop state
   unsafe release(&mut hooks, runtime, exception)
   let mut unit: usize = 0
-  while unit < 512 {
+  while unit < 769 {
     let cache = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
     let cached = cache.unitStrings[unit]
     cache.unitStrings[unit] = ValueBits.Undefined

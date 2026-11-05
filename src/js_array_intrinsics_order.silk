@@ -196,25 +196,145 @@ impl<'a, H: HeapHooks + CoercionHooks> Order for Comparison<'a, H> {
     self.slots.set(left, other) self.slots.set(right, saved)
   }
 }
-/// The default order over flat Latin-1 strings: each slot's latin1Key settles
-/// most comparisons without reading either string.
-struct FlatOrder<'a> { slots: &'a mut List<ValueSlot>, keys: &'a mut List<u64> }
-impl<'a> Order for FlatOrder<'a> {
-  unsafe effect fn compare(self: &mut Self, left: usize, right: usize) -> i32 ! JsException ? &mut Allocator {
-    let x = self.keys.get(left) let y = self.keys.get(right)
-    if x < y { return -1 }
-    if x > y { return 1 }
-    let first = self.slots.get(left) let second = self.slots.get(right)
-    let order = Strings.compareFlat(first.value, second.value)
-    if order != 0 { return order }
-    return positionOrder(first.position, second.position)
+/// One keyed sort entry: the slot's latin1Key and its index in the slot list.
+struct KeyedIndex { key: u64, index: usize }
+impl Copy for KeyedIndex {}
+/// The default flat-string order as a strict total order: key, then the full
+/// text, then the original index (slot order is position order), so any
+/// correct sort gives the stable result.
+@inlineAlways
+fn keyedLess(slots: &List<ValueBits>, a: KeyedIndex, b: KeyedIndex) -> bool {
+  if a.key != b.key { return a.key < b.key }
+  let order = Strings.compareFlat(slots.get(a.index), slots.get(b.index))
+  if order != 0 { return order < 0 }
+  return a.index < b.index
+}
+// Raw entry access for the sort's inner loops, whose indices the run bounds
+// already keep inside the lists (each holds count entries).
+@inlineAlways
+unsafe fn entries(items: &mut List<KeyedIndex>) -> [*]mut KeyedIndex {
+  return unsafe Intrinsic.pointerRequalify<?[*]mut KeyedIndex, [*]mut KeyedIndex>(Intrinsic.pointerFromMutSlice<KeyedIndex>(&mut items.asMutSlice()))
+}
+@inlineAlways
+unsafe fn entryAt(base: [*]mut KeyedIndex, index: usize) -> KeyedIndex { return unsafe Pointer.read<KeyedIndex>(unsafe Pointer.atMut<KeyedIndex>(base, index)) }
+@inlineAlways
+unsafe fn putEntry(base: [*]mut KeyedIndex, index: usize, entry: KeyedIndex) -> () { unsafe Pointer.write<KeyedIndex>(unsafe Pointer.atMut<KeyedIndex>(base, index), entry) }
+/// Inserts items[sorted..end) into the sorted items[start..sorted).
+fn insertKeyed(slots: &List<ValueBits>, items: &mut List<KeyedIndex>, start: usize, sorted: usize, end: usize) -> () {
+  if end > items.length() { Intrinsic.trap("insertKeyed: range past the end") }
+  let base = unsafe entries(&mut items)
+  let mut i = sorted
+  while i < end {
+    let item = unsafe entryAt(base, i)
+    let mut j = i
+    while j > start {
+      let previous = unsafe entryAt(base, usize.wrappingSubtract(j, 1))
+      if !keyedLess(slots, item, previous) { break }
+      unsafe putEntry(base, j, previous) j = usize.wrappingSubtract(j, 1)
+    }
+    unsafe putEntry(base, j, item)
+    i = usize.wrappingAdd(i, 1)
   }
-  fn swap(self: &mut Self, left: usize, right: usize) -> () {
-    let saved = self.slots.get(left) let other = self.slots.get(right)
-    self.slots.set(left, other) self.slots.set(right, saved)
-    let key = self.keys.get(left) let otherKey = self.keys.get(right)
-    self.keys.set(left, otherKey) self.keys.set(right, key)
+}
+/// Natural merge sort for the keyed default order: presorted, reversed and
+/// nearly sorted inputs (the usual shapes) take one linear pass instead of
+/// quicksort's n log n compares.
+/// Returns the stable order of the texts (flat strings) by key, then text.
+effect fn sortKeyed(slots: &List<ValueBits>, keys: &List<u64>) -> List<KeyedIndex> ! OutOfMemoryError ? &mut Allocator {
+  let count = slots.length()
+  let mut items = List<KeyedIndex>.make() run items.reserveExact(count)
+  let mut k: usize = 0
+  while k < count { run items.append(KeyedIndex { key: keys.get(k), index: k }) k = k + 1 }
+  // Runs: maximal ascending stretches, strictly descending ones reversed, each
+  // extended to at least 32 entries by insertion.
+  let mut runs = List<usize>.make()
+  let mut start: usize = 0
+  while start < count {
+    let mut end = start + 1
+    if end < count && keyedLess(slots, items.get(end), items.get(start)) {
+      while end < count && keyedLess(slots, items.get(end), items.get(end - 1)) { end = end + 1 }
+      let mut low = start let mut high = end - 1
+      while low < high { let t = items.get(low) let u = items.get(high) items.set(low, u) items.set(high, t) low = low + 1 high = high - 1 }
+    } else {
+      while end < count && !keyedLess(slots, items.get(end), items.get(end - 1)) { end = end + 1 }
+    }
+    if end - start < 32 && end < count {
+      let mut target = start + 32
+      if target > count { target = count }
+      insertKeyed(slots, &mut items, start, end, target)
+      end = target
+    }
+    run runs.append(end)
+    start = end
   }
+  let mut other = List<KeyedIndex>.make() run other.appendRepeated(KeyedIndex { key: 0, index: 0 }, count)
+  let mut ends = List<usize>.make()
+  while runs.length() > 1 {
+    ends.clear()
+    let mut r: usize = 0 let mut low: usize = 0
+    while r < runs.length() {
+      let middle = runs.get(r)
+      let mut high = middle
+      if r + 1 < runs.length() { high = runs.get(r + 1) }
+      let mut i = low let mut j = middle let mut o = low
+      if high > count { Intrinsic.trap("sortKeyed: run past the end") }
+      let from = unsafe entries(&mut items) let into = unsafe entries(&mut other)
+      if j < high && keyedLess(slots, unsafe entryAt(from, j), unsafe entryAt(from, j - 1)) {
+        while i < middle && j < high {
+          // Straight-line selection: random input makes the take-left/right
+          // branch a coin flip, so it is computed rather than predicted.
+          let left = unsafe entryAt(from, i) let right = unsafe entryAt(from, j)
+          let mut takeRight = right.key < left.key
+          if right.key == left.key { takeRight = keyedLess(slots, right, left) }
+          let mut chosen = left let mut step: usize = 0
+          if takeRight { chosen = right step = 1 }
+          unsafe putEntry(into, o, chosen)
+          j = usize.wrappingAdd(j, step) i = usize.wrappingAdd(i, usize.wrappingSubtract(1, step))
+          o = usize.wrappingAdd(o, 1)
+        }
+      }
+      while i < middle { unsafe putEntry(into, o, unsafe entryAt(from, i)) i = usize.wrappingAdd(i, 1) o = usize.wrappingAdd(o, 1) }
+      while j < high { unsafe putEntry(into, o, unsafe entryAt(from, j)) j = usize.wrappingAdd(j, 1) o = usize.wrappingAdd(o, 1) }
+      run ends.append(high)
+      low = high r = r + 2
+    }
+    let swapped = Intrinsic.replace(items, List<KeyedIndex>.make())
+    items = Intrinsic.replace(other, move swapped)
+    let finished = Intrinsic.replace(runs, List<usize>.make())
+    runs = Intrinsic.replace(ends, move finished)
+  }
+  return move items
+}
+/// The default order of a dense fast Array whose elements are all flat strings
+/// with Latin-1 keys: no code runs, so the sorted order is applied by permuting
+/// the elements in place, which changes no reference counts. False, before
+/// any change, when an element does not qualify.
+effect fn sortDenseText(array: ValueBits, count: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut texts = List<ValueBits>.make() run texts.reserveExact(count)
+  let mut keys = List<u64>.make() run keys.reserveExact(count)
+  let mut k: usize = 0
+  while k < count {
+    let value = unsafe support.fastBorrow(array, usize.toI64(k))
+    if value.tag() != -7 { return false }
+    match Strings.latin1Key(value) {
+      Option<u64>.Some { value: key } => { run keys.append(key) }
+      Option<u64>.None => { return false }
+    }
+    run texts.append(value)
+    k = k + 1
+  }
+  let order = run sortKeyed(&texts, &keys)
+  let mut anchor = ()
+  let object = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, core.reference(array))
+  match &mut object.payload {
+    ObjectPayload.FastArray { array: data } => {
+      if data.values.length() != count { invariant() }
+      k = 0
+      while k < count { data.values.set(k, texts.get(order.get(k).index)) k = k + 1 }
+    }
+    _ => invariant()
+  }
+  return true
 }
 unsafe fn installDense(array: ValueBits, index: i64, value: ValueBits) -> () {
   let mut anchor = ()
@@ -258,6 +378,13 @@ effect fn sortBody<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + Get
   let mut length: i64 = 0
   run invoke.getLength64(&mut hooks, realm, &mut length, object.borrow())
   let mut undefinedCount: i64 = 0 let mut i: i64 = 0
+  // A fast Array's elements are own data values: reading them runs no code, so
+  // they are read directly, into room reserved once.
+  let dense = length > 0 && unsafe support.fastCount(object.view()) == length
+  // Flat strings in the default order, the common sort of names, permute in place.
+  if dense && core.undefined(callback.view()) && run sortDenseText(object.view(), i64.toUsize(length)) { return object.intoBits() }
+  let held = slots.items.length()
+  if dense && slots.items.capacity() < i64.toUsize(length) { run slots.items.reserveExact(i64.toUsize(length) - held) }
   while i < length {
     // Growth precedes Has/Get even if this index is a hole or undefined.
     if slots.items.length() >= slots.items.capacity() {
@@ -267,7 +394,9 @@ effect fn sortBody<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + Get
       run slots.items.reserveExact(additional)
     }
     let mut element = ValueBits.Undefined
-    let present = run properties.tryGetPropertyInt64(&mut hooks, realm, object.borrow(), i, &mut element)
+    let mut present = true
+    if dense { element = unsafe support.fastGet(object.view(), i) }
+    else { present = run properties.tryGetPropertyInt64(&mut hooks, realm, object.borrow(), i, &mut element) }
     if present {
       if core.undefined(element) { undefinedCount = undefinedCount + 1 }
       else {
@@ -302,9 +431,16 @@ effect fn sortBody<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + Get
     }
   }
   if keyed {
-    let mut order = FlatOrder { slots: &mut slots.items, keys: &mut keys }
-    run unsafe rqsort.sort(&mut order, count)
-    drop order
+    let mut texts = List<ValueBits>.make() run texts.reserveExact(count)
+    k = 0
+    while k < count { run texts.append(slots.items.get(k).value) k = k + 1 }
+    let order = run sortKeyed(&texts, &keys)
+    let mut ordered = List<ValueSlot>.make() run ordered.reserveExact(count)
+    k = 0
+    while k < count { run ordered.append(slots.items.get(order.get(k).index)) k = k + 1 }
+    k = 0
+    while k < count { slots.items.set(k, ordered.get(k)) k = k + 1 }
+    drop ordered
   } else if flatText {
     k = 0
     while k < count {
