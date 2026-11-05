@@ -36,3 +36,8 @@ if (JSON.stringify(r3) !== "[\"161:\\\\/Qngr(\",165,\"null\",171,\"null\",171,\"
 var L = 'ab"c'.repeat(80) + 'Z', s4 = 'x'.repeat(50) + L + 'y' + L, reg4 = new RegExp(L, 'g');
 var r4 = [new RegExp(L).exec(s4).index, new RegExp(L).test('q' + L.slice(1)), s4.replace(reg4, '-').length, (s4.match(reg4) || []).length, new RegExp(L + 'q').test(s4)];
 if (JSON.stringify(r4) !== '[50,false,53,2,false]') throw new Error('long literal hint: ' + JSON.stringify(r4));
+// More capture offsets than the match keeps in place (over 20 registers).
+var re5 = /(a)?(b)(c)?(d)(e)?(f)(g)?(h)(i)?(j)(k)?(l)(m)?(n)/g, out5 = [], m5;
+while ((m5 = re5.exec('xbdfhjlnqabcdefghijklmn'))) out5.push(JSON.stringify(m5), m5.index);
+out5.push('abdfhjln'.replace(/(a)(b)(c)?(d)(e)?(f)(g)?(h)(i)?(j)?(k)?(l)?(m)?(n)?/, '$14|$4|$3|$1'));
+if (out5.join(';') !== '["bdfhjln",null,"b",null,"d",null,"f",null,"h",null,"j",null,"l",null,"n"];1;["abcdefghijklmn","a","b","c","d","e","f","g","h","i","j","k","l","m","n"];9;n|d||a') throw new Error('many captures: ' + out5.join(';'));
