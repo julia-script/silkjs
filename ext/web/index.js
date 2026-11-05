@@ -17,7 +17,6 @@ const groups = [
   ['internal/web/compression', ['CompressionStream', 'DecompressionStream']],
   ['internal/web/navigator', ['Navigator', 'navigator']],
   ['internal/web/urlpattern', ['URLPattern']],
-  ['internal/web/intl', ['Intl']],
   ['internal/web/url', ['URL', 'URLSearchParams']],
   ['internal/web/blob', ['Blob', 'File']],
   ['internal/web/websocket', ['WebSocket', 'MessageEvent', 'CloseEvent']],
