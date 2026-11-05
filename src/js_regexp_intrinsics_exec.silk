@@ -32,6 +32,7 @@ import js_interrupt_host { InterruptHooks }
 import js_exceptions { JsException }
 import js_string_types { FlatString, StringOwner, StringLengthError, stringReference, latin1Bytes }
 import js_strings { Strings }
+import js_unit_strings as unitStrings
 import js_runtime as runtime
 import js_errors as errors
 import js_object_allocate as allocate
@@ -42,7 +43,7 @@ import js_atom_data as atoms
 import js_class_data as classes
 import js_regexp_intrinsics_support as support
 import regexp_exec { RegExpExecutor }
-import regexp_types { RegExpMatch, RegExpTimeout, FLAG_GLOBAL, FLAG_STICKY, FLAG_INDICES, FLAG_NAMED_GROUPS }
+import regexp_types { RegExpMatch, Captures, RegExpTimeout, FLAG_GLOBAL, FLAG_STICKY, FLAG_INDICES, FLAG_NAMED_GROUPS }
 import byte_buffer { readU16, readU32 }
 
 // Unlike VM polling, the regexp engine already maintains its own 10,000-event
@@ -86,6 +87,40 @@ pub effect fn execute<'a, 'b, H: HeapHooks + CoercionHooks + InterruptHooks>(hoo
       }
     }
   }
+}
+/// execute's form that writes a match's offsets into out (unchanged without a
+/// match) instead of returning a match record.
+pub effect fn matchInto<'a, 'b, H: HeapHooks + CoercionHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, bytecode: ValueRef<'b>, string: ValueRef<'b>,
+  start: usize, out: &mut Captures) -> bool ! JsException ? &mut Allocator {
+  let anchor = ()
+  let code = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(bytecode.view()))
+  let input = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(string.view()))
+  let mut inputBytes = Slice.view(code.latin1.asSlice(), 0, 0)
+  if !input.wide { inputBytes = unsafe latin1Bytes(&anchor, stringReference(string.view())) }
+  let attempted = run Effect.result(executeInto(&mut hooks, realm, &code, &input, inputBytes, start, &mut out))
+  drop input drop code
+  return match move attempted {
+    Result<bool, OutOfMemoryError | RegExpTimeout>.Success { value } => value
+    Result<bool, OutOfMemoryError | RegExpTimeout>.Failure { error } => {
+      match move error {
+        RegExpTimeout timeout => { return run errors.throwInterrupted(&mut hooks, memory, realm) }
+        OutOfMemoryError allocation => {
+          return run hooks.throwError(realm, NativeErrorKind.Internal, b"out of memory in regexp execution")
+        }
+      }
+    }
+  }
+}
+effect fn executeInto<'a, H: InterruptHooks>(hooks: &mut H, realm: Realm<'a>,
+  code: &FlatString, input: &FlatString, inputBytes: &[u8], start: usize, out: &mut Captures) -> bool
+  ! OutOfMemoryError | RegExpTimeout ? &mut Allocator {
+  if input.wide {
+    return run RegExpExecutor.match16(code.latin1.asSlice(), Slice.view(input.wideUnits(), 0, input.length()), start,
+      effect fn() -> bool ? &mut Allocator { return run interrupted(&mut hooks, realm) }, &mut out)
+  }
+  return run RegExpExecutor.match8(code.latin1.asSlice(), Slice.view(inputBytes, 0, input.length()), start,
+    effect fn() -> bool ? &mut Allocator { return run interrupted(&mut hooks, realm) }, &mut out)
 }
 effect fn executeFlat<'a, H: InterruptHooks>(hooks: &mut H, realm: Realm<'a>,
   code: &FlatString, input: &FlatString, inputBytes: &[u8], start: usize) -> RegExpMatch
@@ -177,7 +212,7 @@ effect fn resultArray<'a, 'b, H: HeapHooks>(hooks: &mut H, memory: &AllocationOb
 /// indices (the d flag) through buildDecoratedResult.
 effect fn buildResult<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks>(
   hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, string: ValueRef<'b>,
-  bytecode: ValueRef<'b>, matched: &RegExpMatch, state: &mut ResultState) -> ValueBits
+  bytecode: ValueRef<'b>, captures: &Captures, state: &mut ResultState) -> ValueBits
   ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
   let anchor = ()
   let code = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(bytecode.view()))
@@ -186,10 +221,10 @@ effect fn buildResult<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
   let count = u8.toUsize(bytes[2])
   drop code
   if (flags & (FLAG_NAMED_GROUPS | FLAG_INDICES)) != 0 {
-    return run buildDecoratedResult(&mut hooks, memory, realm, string, bytecode, matched, &mut state)
+    return run buildDecoratedResult(&mut hooks, memory, realm, string, bytecode, captures, &mut state)
   }
   state.object = run resultArray(&mut hooks, memory, realm, string, immediateRef(ValueBits.Undefined),
-    count, matched.captures.get(0))
+    count, captures.get(0))
   let mut arrayAnchor = ()
   let arrayObject = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut arrayAnchor, core.reference(state.object))
   match &mut arrayObject.payload {
@@ -208,10 +243,16 @@ effect fn buildResult<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
   drop arrayObject
   let mut i: usize = 0
   while i < count {
-    let start = matched.captures.get(i * 2)
-    let end = matched.captures.get(i * 2 + 1)
+    let start = captures.get(i * 2)
+    let end = captures.get(i * 2 + 1)
     if start >= 0 && end >= 0 {
-      let piece = run Strings.substring(string.view(), i32.toUsize(start), i32.toUsize(end))
+      // One-unit captures (a separator, say) share the runtime's unit strings.
+      let mut piece = ValueBits.Undefined
+      if end - start == 1 {
+        piece = run unsafe unitStrings.unit(realm.runtime(), u16.toU32(Strings.codeUnit(string.view(), i32.toUsize(start))))
+      } else {
+        piece = run Strings.substring(string.view(), i32.toUsize(start), i32.toUsize(end))
+      }
       let mut setAnchor = ()
       let output = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut setAnchor, core.reference(state.object))
       match &mut output.payload {
@@ -228,7 +269,7 @@ effect fn buildResult<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
 @cold
 effect fn buildDecoratedResult<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks>(
   hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, string: ValueRef<'b>,
-  bytecode: ValueRef<'b>, matched: &RegExpMatch, state: &mut ResultState) -> ValueBits
+  bytecode: ValueRef<'b>, captures: &Captures, state: &mut ResultState) -> ValueBits
   ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
   let anchor = ()
   let code = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(bytecode.view()))
@@ -243,7 +284,7 @@ effect fn buildDecoratedResult<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropert
     if named { state.indicesGroups = (run support.object(&mut hooks, memory, realm, immediateRef(ValueBits.Null))).intoBits() }
   }
   state.object = run resultArray(&mut hooks, memory, realm, string, unsafe lendBits(&state, state.groups),
-    count, matched.captures.get(0))
+    count, captures.get(0))
   let mut arrayAnchor = ()
   let arrayObject = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut arrayAnchor, core.reference(state.object))
   match &mut arrayObject.payload {
@@ -272,8 +313,8 @@ effect fn buildDecoratedResult<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropert
       // Each compiler name record ends in NUL followed by its duplicate-name scope.
       nameOffset = nameEnd + 2
     }
-    let start = matched.captures.get(i * 2)
-    let end = matched.captures.get(i * 2 + 1)
+    let start = captures.get(i * 2)
+    let end = captures.get(i * 2 + 1)
     let present = start >= 0 && end >= 0
     if (flags & FLAG_INDICES) != 0 {
       if present {
@@ -353,7 +394,7 @@ effect fn builtinExec<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
   if updatesIndex { run setLastIndex(&mut hooks, realm, receiver, matched.captures.get(1)) }
   let mut state = ResultState { object: ValueBits.Undefined, groups: ValueBits.Undefined,
     indices: ValueBits.Undefined, indicesGroups: ValueBits.Undefined, temporary: ValueBits.Undefined, groupName: 0 }
-  let built = run Effect.result(buildResult(&mut hooks, memory, realm, unsafe lendFor(string.get()), unsafe lendFor(code.get()), &matched, &mut state))
+  let built = run Effect.result(buildResult(&mut hooks, memory, realm, unsafe lendFor(string.get()), unsafe lendFor(code.get()), &matched.captures, &mut state))
   if state.groupName != 0 { unsafe properties.releaseAtom(realm.runtime(), state.groupName) }
   unsafe support.release(&mut hooks, realm, state.temporary)
   unsafe support.release(&mut hooks, realm, state.indicesGroups)
@@ -438,24 +479,25 @@ pub effect fn quickExec<'a, H: HeapHooks + CoercionHooks + OwnPropertyHooks + Pr
   let text = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(input))
   let mut inputBytes = Slice.view(codeFlat.latin1.asSlice(), 0, 0)
   if !text.wide { inputBytes = unsafe latin1Bytes(&anchor, stringReference(input)) }
-  let attempted = run Effect.result(executeFlat(&mut hooks, realm, &codeFlat, &text, inputBytes, lastIndex))
+  let mut captures = Captures.empty()
+  let attempted = run Effect.result(executeInto(&mut hooks, realm, &codeFlat, &text, inputBytes, lastIndex, &mut captures))
   drop text drop codeFlat
   let matched = match move attempted {
-    Result<RegExpMatch, OutOfMemoryError | RegExpTimeout>.Success { value } => move value
-    Result<RegExpMatch, OutOfMemoryError | RegExpTimeout>.Failure { .. } => { return Option<ValueBits>.none() }
+    Result<bool, OutOfMemoryError | RegExpTimeout>.Success { value } => value
+    Result<bool, OutOfMemoryError | RegExpTimeout>.Failure { .. } => { return Option<ValueBits>.none() }
   }
-  if !matched.matched {
+  if !matched {
     if updatesIndex { unsafe quickLastIndex(receiver, 0) }
     return Option<ValueBits>.some(ValueBits.Null)
   }
   let mut state = ResultState { object: ValueBits.Undefined, groups: ValueBits.Undefined,
     indices: ValueBits.Undefined, indicesGroups: ValueBits.Undefined, temporary: ValueBits.Undefined, groupName: 0 }
-  let built = run Effect.result(buildResult(&mut hooks, memory, realm, unsafe lendFor(input), unsafe lendFor(code), &matched, &mut state))
+  let built = run Effect.result(buildResult(&mut hooks, memory, realm, unsafe lendFor(input), unsafe lendFor(code), &captures, &mut state))
   unsafe support.release(&mut hooks, realm, state.temporary)
   unsafe support.release(&mut hooks, realm, state.object)
   return match move built {
     Result<ValueBits, OutOfMemoryError | StringLengthError | JsException>.Success { value } => {
-      if updatesIndex { unsafe quickLastIndex(receiver, matched.captures.get(1)) }
+      if updatesIndex { unsafe quickLastIndex(receiver, captures.get(1)) }
       Option<ValueBits>.some(value)
     }
     Result<ValueBits, OutOfMemoryError | StringLengthError | JsException>.Failure { .. } => Option<ValueBits>.none()
