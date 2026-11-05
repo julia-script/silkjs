@@ -77,6 +77,7 @@ impl RegExpCompiler {
     run state.code.append(op.REOP_match)
     if state.cursor != pattern.length { fail RegExpSyntaxError { message: "extraneous characters at the end", offset: state.cursor } }
     let registers = run allocateRegisters(&mut state.code)
+    let programEnd = state.code.length()
     state.code.set(op.RE_HEADER_CAPTURE_COUNT, usize.toU8(state.captures))
     state.code.set(op.RE_HEADER_REGISTER_COUNT, usize.toU8(registers))
     if (flags & re.FLAG_STICKY) == 0 {
@@ -88,27 +89,49 @@ impl RegExpCompiler {
         if hint.kind == re.HINT_LITERAL { hint.kind = re.HINT_REQUIRED }
       }
       let mut kind = hint.kind
-      if kind != re.HINT_ANCHORED && kind != re.HINT_LITERAL {
-        let mut set = FirstSet { bits: [0; 4], visits: 0 }
-        if firstSet(state.code.asSlice(), op.RE_HEADER_LEN + 11, &mut set) && set.useful() {
-          let mut word: usize = 0
-          while word < 4 {
-            let mut b: usize = 0
-            while b < 8 { run state.code.append(u64.toU8(u64.bitAnd(u64.shiftRight(set.bits[word], usize.toU64(b * 8)), 255))) b = b + 1 }
-            word = word + 1
+      let mut set = FirstSet { bits: [0; 4], visits: 0 }
+      let withSet = kind != re.HINT_ANCHORED && kind != re.HINT_LITERAL &&
+        firstSet(state.code.asSlice(), op.RE_HEADER_LEN + 11, &mut set) && set.useful()
+      if kind == re.HINT_LITERAL || kind == re.HINT_REQUIRED {
+        let mut latin = true
+        let mut k: usize = 0
+        while k < hint.count {
+          if readU16(state.code.asSlice(), hint.at + k * 3 + 1) > 255 { latin = false }
+          k = k + 1
+        }
+        if latin {
+          k = 0
+          while k < hint.count {
+            let unit = u16.toU8(readU16(state.code.asSlice(), hint.at + k * 3 + 1))
+            run state.code.append(unit)
+            k = k + 1
           }
-          kind = u8.bitOr(kind, re.HINT_FIRST_SET)
+          kind = u8.bitOr(kind, re.HINT_RUN_BYTES)
         }
       }
-      if kind != 0 {
+      if withSet {
+        let mut word: usize = 0
+        while word < 4 {
+          let mut b: usize = 0
+          while b < 8 { run state.code.append(u64.toU8(u64.bitAnd(u64.shiftRight(set.bits[word], usize.toU64(b * 8)), 255))) b = b + 1 }
+          word = word + 1
+        }
+        kind = u8.bitOr(kind, re.HINT_FIRST_SET)
+      }
+      let plan = skipPlan(state.code.asSlice())
+      if kind != 0 || plan.first != 0 {
         let pivot = literalPivot(state.code.asSlice(), hint.at, hint.count)
         run state.code.append(re.HINT_OPCODE)
         run state.code.append(kind)
         run state.code.writeU16(usize.toU16(hint.at))
         run state.code.writeU16(usize.toU16(hint.count + pivot * 256))
+        run state.code.writeU16(usize.toU16(plan.first))
+        run state.code.append(plan.opcode)
         state.code.patchU16(op.RE_HEADER_FLAGS, u32.toU16(flags | re.FLAG_HINT))
       }
     }
+    // Last, since the walks above read the plain splits.
+    markStars(&mut state.code, programEnd)
     let bytecodeLength = usize.toU32(state.code.length() - op.RE_HEADER_LEN)
     state.code.patchU32(op.RE_HEADER_BYTECODE_LEN, bytecodeLength)
     if state.names.length() > (state.captures - 1) * 2 {
@@ -143,7 +166,10 @@ impl CompilerState {
   effect fn emitChar(self: &mut Self, value: u32) -> () ! OutOfMemoryError ? &mut Allocator {
     let mut opcode = op.REOP_char
     if value > 65535 { opcode = op.REOP_char32 }
-    if (self.flags & re.FLAG_IGNORECASE) != 0 { opcode = opcode + 1 }
+    // No other character folds to an ASCII non-letter, so ignoring case
+    // changes nothing for one: the plain step joins literal runs and searches.
+    let caseless = value < 128 && !((value >= 0x41 && value <= 0x5a) || (value >= 0x61 && value <= 0x7a))
+    if (self.flags & re.FLAG_IGNORECASE) != 0 && !caseless { opcode = opcode + 1 }
     run self.code.append(opcode)
     if value <= 65535 { run self.code.writeU16(u32.toU16(value)) }
     else { run self.code.writeU32(value) }
@@ -162,6 +188,10 @@ impl CompilerState {
     let mut opcode = op.REOP_range32
     if narrow { opcode = op.REOP_range }
     if (self.flags & re.FLAG_IGNORECASE) != 0 { opcode = opcode + 1 }
+    if narrow {
+      opcode = re.REOP_CLASS
+      if (self.flags & re.FLAG_IGNORECASE) != 0 { opcode = re.REOP_CLASS_I }
+    }
     run self.code.append(opcode)
     run self.code.writeU16(usize.toU16(count))
     let mut i: usize = 0
@@ -176,6 +206,25 @@ impl CompilerState {
         run self.code.writeU32(high)
       }
       i = i + 2
+    }
+    if narrow {
+      // The Latin-1 bitmap: unit c matches when its folded form (what the
+      // executor's classRange tests) is in the table.
+      let unicode = (self.flags & (re.FLAG_UNICODE | re.FLAG_UNICODE_SETS)) != 0
+      let fold = (self.flags & re.FLAG_IGNORECASE) != 0
+      let mut byte: u32 = 0
+      while byte < 32 {
+        let mut bits: u32 = 0
+        let mut b: u32 = 0
+        while b < 8 {
+          let mut c = byte * 8 + b
+          if fold { c = UnicodeCase.canonicalize(c, unicode) }
+          if pointsContain(points, c) { bits = bits | u32.shiftLeft(1, b) }
+          b = b + 1
+        }
+        run self.code.append(u32.toU8(bits))
+        byte = byte + 1
+      }
     }
   }
   effect fn emitStrings(self: &mut Self, set: &RegExpStrings) -> () ! OutOfMemoryError | RegExpSyntaxError ? &mut Allocator {
@@ -356,17 +405,28 @@ impl CompilerState {
   ! OutOfMemoryError | RegExpSyntaxError | RegExpStackOverflow ? &mut Allocator {
     if self.depth >= self.maxDepth || (self.stackLimit != 0 && currentFrameAddress() < self.stackLimit) { fail RegExpStackOverflow {} }
     self.depth = self.depth + 1
-    let start = self.code.length()
+    // a|b|c becomes split(b) a goto(end) split(c) b goto(end) c: each choice
+    // pushes one frame, and the first alternative runs after one split, not
+    // one per alternative. Until the end is known, each goto's operand holds
+    // the previous goto's operand offset plus one (0 for none).
+    let mut altStart = self.code.length()
+    let mut lastJump: usize = 0
     run self.alternative(input, backward)
     while byte(input, self.cursor) == 124 {
       self.cursor = self.cursor + 1
-      let length = self.code.length() - start
-      run self.code.insertZeroes(start, 5)
-      self.code.set(start, op.REOP_split_next_first)
-      self.code.patchU32(start + 1, usize.toU32(length + 5))
-      let jump = run self.emit32(op.REOP_goto, 0)
+      let length = self.code.length() - altStart
+      run self.code.insertZeroes(altStart, 5)
+      self.code.set(altStart, op.REOP_split_next_first)
+      self.code.patchU32(altStart + 1, usize.toU32(length + 5))
+      let jump = run self.emit32(op.REOP_goto, usize.toU32(lastJump))
+      lastJump = jump + 1
+      altStart = self.code.length()
       self.scope = u8.wrappingAdd(self.scope, 1)
       run self.alternative(input, backward)
+    }
+    while lastJump != 0 {
+      let jump = lastJump - 1
+      lastJump = u32.toUsize(readU32(self.code.asSlice(), jump))
       self.patchEnd(jump)
     }
     self.depth = self.depth - 1
@@ -612,8 +672,20 @@ fn reverseBytes(code: &mut ByteBuffer, start: usize, end: usize) -> () {
 
 struct AtomAnalysis { advanceCheck: bool, captureReset: bool }
 
+/// Whether c is in the [start, end) pairs of a CharRange's points.
+fn pointsContain(points: &[u32], c: u32) -> bool {
+  let mut i: usize = 0
+  while i + 1 < points.length {
+    if c < points[i] { return false }
+    if c < points[i + 1] { return true }
+    i = i + 2
+  }
+  return false
+}
+
 fn instructionLength(bytes: &[u8], at: usize) -> usize {
   let opcode = bytes[at]
+  if opcode == re.REOP_CLASS || opcode == re.REOP_CLASS_I { return 3 + u16.toUsize(readU16(bytes, at + 1)) * 4 + re.CLASS_BITS_LENGTH }
   let mut length = op.opcodeSize(opcode)
   if opcode == op.REOP_range || opcode == op.REOP_range_i { length = length + u16.toUsize(readU16(bytes, at + 1)) * 4 }
   else if opcode == op.REOP_range32 || opcode == op.REOP_range32_i { length = length + u16.toUsize(readU16(bytes, at + 1)) * 8 }
@@ -627,7 +699,8 @@ fn analyzeAtom(bytes: &[u8], start: usize) -> AtomAnalysis {
   let mut capture = false
   while at < bytes.length {
     let opcode = bytes[at]
-    if (opcode >= op.REOP_char && opcode <= op.REOP_not_space) || (opcode >= op.REOP_range && opcode <= op.REOP_range32_i) {
+    if (opcode >= op.REOP_char && opcode <= op.REOP_not_space) || (opcode >= op.REOP_range && opcode <= op.REOP_range32_i) ||
+      opcode == re.REOP_CLASS || opcode == re.REOP_CLASS_I {
       advance = false
     } else if opcode >= op.REOP_back_reference && opcode <= op.REOP_backward_back_reference_i {
       capture = true
@@ -667,6 +740,42 @@ impl FirstSet {
   }
 }
 /// The target of the jump at at (goto or a split).
+/// The size of the step at at when it matches exactly one character (one unit
+/// when the input's characters are), so a greedy loop over it can run in
+/// place, else 0.
+fn starStep(code: &[u8], at: usize) -> usize {
+  if at >= code.length { return 0 }
+  let opcode = code[at]
+  if opcode == op.REOP_char || opcode == op.REOP_char_i { return 3 }
+  if opcode >= op.REOP_dot && opcode <= op.REOP_not_space { return 1 }
+  if opcode == re.REOP_CLASS || opcode == re.REOP_CLASS_I || opcode == op.REOP_range || opcode == op.REOP_range_i ||
+    opcode == op.REOP_range32 || opcode == op.REOP_range32_i { return instructionLength(code, at) }
+  return 0
+}
+/// Marks the program's greedy loops over one one-character step (re.REOP_STAR,
+/// re.REOP_PLUS), so the executor need not recognize them on every dispatch.
+fn markStars(code: &mut ByteBuffer, end: usize) {
+  let mut at = op.RE_HEADER_LEN
+  while at < end {
+    let bytes = code.asSlice()
+    let opcode = bytes[at]
+    let length = instructionLength(bytes, at)
+    let mut mark: u8 = 0
+    if opcode == op.REOP_split_next_first {
+      let size = starStep(bytes, at + 5)
+      let jump = at + 5 + size
+      if size != 0 && jumpTarget(bytes, at) == jump + 5 && jump < end && bytes[jump] == op.REOP_goto && jumpTarget(bytes, jump) == at { mark = re.REOP_STAR }
+    } else if opcode == op.REOP_split_goto_first {
+      let target = jumpTarget(bytes, at)
+      if target < at {
+        let size = starStep(bytes, target)
+        if size != 0 && target + size == at { mark = re.REOP_PLUS }
+      }
+    }
+    if mark != 0 { code.set(at, mark) }
+    at = at + length
+  }
+}
 fn jumpTarget(code: &[u8], at: usize) -> usize {
   let displacement = readU32(code, at + 1)
   if displacement < 0x80000000 { return usize.wrappingAdd(at + 5, u32.toUsize(displacement)) }
@@ -697,6 +806,16 @@ fn firstSet(code: &[u8], start: usize, set: &mut FirstSet) -> bool {
       while unit < 256 {
         let space = (unit >= 9 && unit <= 13) || unit == 32 || unit == 0xa0
         if space == (opcode == op.REOP_space) { set.add(unit) }
+        unit = unit + 1
+      }
+      return true
+    }
+    if opcode == re.REOP_CLASS || opcode == re.REOP_CLASS_I {
+      // The bitmap is exactly the Latin-1 units the class matches.
+      let bitsAt = at + 3 + u16.toUsize(readU16(code, at + 1)) * 4
+      let mut unit: usize = 0
+      while unit < 256 {
+        if (u8.toU32(code[bitsAt + unit / 8]) & u32.shiftLeft(1, usize.toU32(unit & 7))) != 0 { set.add(unit) }
         unit = unit + 1
       }
       return true
@@ -769,6 +888,29 @@ fn forwardTarget(code: &[u8], at: usize) -> usize {
 /// jump skips (lookaround bodies sit behind one too). Kind 0 when there is no
 /// useful one: none, or a run that is already the first step (the search
 /// prefix skips to it). A pattern anchored at ^ gets HINT_ANCHORED instead.
+struct SkipPlan { first: usize, opcode: u8 }
+/// The search prefix's plan (regexp_types.FLAG_HINT): after the prefix
+/// (split_goto_first, any, goto, save_start 0), zero-width steps (a group's
+/// start, \b, \B) leave the position where the first consuming step must
+/// match. The program ends in save_end and match, so the walk stays inside it.
+fn skipPlan(code: &[u8]) -> SkipPlan {
+  let base = op.RE_HEADER_LEN
+  let mut first = base + 13
+  if !(code.length > first + 3 && code[base] == op.REOP_split_goto_first && code[base + 5] == op.REOP_any &&
+    code[base + 6] == op.REOP_goto && code[base + 11] == op.REOP_save_start) { return SkipPlan { first: 0, opcode: 0 } }
+  let mut opcode = code[first]
+  while opcode == op.REOP_save_start || (opcode >= op.REOP_word_boundary && opcode <= op.REOP_not_word_boundary_i) {
+    if opcode == op.REOP_save_start { first = first + 2 } else { first = first + 1 }
+    opcode = code[first]
+  }
+  if (opcode == op.REOP_char || opcode == op.REOP_char_i || opcode == op.REOP_line_start ||
+    opcode == op.REOP_space || opcode == op.REOP_not_space || opcode == re.REOP_CLASS || opcode == re.REOP_CLASS_I ||
+    (opcode >= op.REOP_range && opcode <= op.REOP_range32_i)) && code.length > first + 3 {
+    return SkipPlan { first: first, opcode: opcode }
+  }
+  return SkipPlan { first: first, opcode: 0 }
+}
+
 fn searchHint(code: &[u8]) -> SearchHint {
   let base = op.RE_HEADER_LEN
   let first = base + 13
@@ -878,7 +1020,12 @@ impl CompilerState {
     let analysis = analyzeAtom(self.code.asSlice(), atomStart)
     let mut advance = analysis.advanceCheck
     let mut start = atomStart
-    if analysis.captureReset && captureStart != self.captures {
+    // A quantifier that runs its atom at most once needs no capture reset: the
+    // captures inside it are still unset when it starts (only the atom sets
+    // them, and an enclosing repeat resets them per iteration), and undo
+    // restores them on backtracking.
+    let resets = captureStart != self.captures && maximum > 1
+    if analysis.captureReset && resets {
       run self.code.insertZeroes(start, 3)
       self.code.set(start, op.REOP_save_reset)
       self.code.set(start + 1, usize.toU8(captureStart))
@@ -886,7 +1033,7 @@ impl CompilerState {
     }
     let length = self.code.length() - start
     if minimum == 0 {
-      if !analysis.captureReset && captureStart != self.captures {
+      if !analysis.captureReset && resets {
         run self.code.insertZeroes(start, 3)
         self.code.set(start, op.REOP_save_reset)
         self.code.set(start + 1, usize.toU8(captureStart))
