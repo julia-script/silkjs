@@ -229,3 +229,20 @@ var got12 = out12.join('|');
 const expected12 = '18|true|true|true|true|true|0,1,3,4,5,b,d,f,g,h,i,j,k,l|3,4,5,j,k,l|{"3":"n3","4":"n4","5":"n5","j":10,"k":11,"l":12}|3,4,5,j,k,l,a,b|again|b2|10|n3|3,4,5,j,k,l,a,b|false|4|true|z,w|TypeError|got|true||q|1|true|0|true|proto|false|2|19|2|38||k2,k4,k6,k8|k1|back|true|3|false|true|false';
 console.log(got12 === expected12 ? 'PASS in-place deletes' : 'FAIL ' + got12);
 if (got12 !== expected12) throw new Error('delete regressions');
+var out13 = [];
+var st = new Set(); out13.push(st.add(1) === st, st.add(1).size, st.add(-0).has(0), st.add('x', 'extra').has('x'), st.size);
+var ws = new WeakSet(); var wk = {}; out13.push(ws.add(wk) === ws, ws.has(wk));
+try { ws.add(1); out13.push('no throw'); } catch (err) { out13.push(err instanceof TypeError); }
+var wm = new WeakMap(); try { wm.set('s', 1); out13.push('no throw'); } catch (err) { out13.push(err instanceof TypeError); }
+var mp = new Map(); out13.push(mp.set('k') === mp, mp.has('k'), mp.get('k'), mp.size, mp.set(NaN, 1).get(NaN), mp.set(-0, 'z').get(0));
+class DoublingMap extends Map { set(k, v) { return super.set(k, v * 2); } } var mm = new DoublingMap(); mm.set('a', 2); out13.push(mm.get('a'));
+var notSet = { add: Set.prototype.add }; try { notSet.add(1); out13.push('no throw'); } catch (err) { out13.push(err instanceof TypeError); }
+var setAsMap = new Set(); setAsMap.set = Map.prototype.set; try { setAsMap.set(1, 2); out13.push('no throw'); } catch (err) { out13.push(err instanceof TypeError); }
+var order = new Set([3, 1]); for (var i = 0; i < 5; i++) order.add(i); out13.push(Array.from(order).join());
+var it = order.values(); it.next(); order.delete(1); order.add(9); var rest = []; for (var v of it) rest.push(v); out13.push(rest.join());
+var big = new Set(); for (var i = 0; i < 300; i++) big.add('s' + (i % 150)); out13.push(big.size, big.has('s149'), big.delete('s3'), big.has('s3'), big.size);
+var objs = new Set(); var o1 = {}; objs.add(o1); objs.add(o1); objs.add({}); out13.push(objs.size);
+var got13 = out13.join('|');
+const expected13 = 'true|1|true|true|3|true|true|true|true|true|true||1|1|z|4|true|true|3,1,0,2,4|0,2,4,9|150|true|true|false|149|2';
+console.log(got13 === expected13 ? 'PASS collection call answers' : 'FAIL ' + got13);
+if (got13 !== expected13) throw new Error('collection call regressions');
