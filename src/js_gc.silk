@@ -11,13 +11,15 @@
 
 import thin_list { ThinList }
 import runtime_memory as memory
-import silk.mem.allocator { Allocator }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.mem.pointer { Pointer }
+import silk.core.ownership { Copy }
 import silk.num.u8
 import silk.num.u16
 import silk.num.u32
+import silk.num.u64
 import silk.num.i32
 import silk.num.usize
 import js_heap { HeapCell, HeapHeader, HeapKind, CellRef }
@@ -25,7 +27,7 @@ import js_value { ValueBits }
 import js_strings { Strings }
 import js_string_types { FlatString, AtomKind, destroyFlat }
 import js_bigint { BigInt }
-import js_core_types { NO_SP, FieldCacheEntry, fieldCacheIndex,
+import js_core_types { NO_SP, FieldCacheEntry, fieldCacheIndex, ConstructPin, ReceiverCacheEntry, blankReceiverEntry, EmptyShapeEntry,
   RuntimeState, ContextState, GcPhase, HeapList, ObjectData, ObjectPayload,
   PropertySlot, SlotBits, ShapeData, ShapeProperty, JS_PROP_TMASK, JS_PROP_AUTOINIT, FunctionBytecode, VarRef, VarRefState, FrameSlot,
   StackFrame, AsyncFrame, ModuleDef, ExportBinding, NativeFunctionId,
@@ -35,6 +37,7 @@ import js_core_types { NO_SP, FieldCacheEntry, fieldCacheIndex,
 }
 import js_class_data { JS_CLASS_OBJECT, JS_CLASS_ARRAY, JS_CLASS_BYTECODE_FUNCTION }
 import js_shapes
+import js_atom_data as atomIds
 import js_opcode_data as op
 
 /// Required real class/host dispatch. There are no default lifecycle callbacks.
@@ -491,6 +494,284 @@ unsafe fn destroyShape<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, sh
     Option<*mut HeapHeader>.None => ()
   }
 }
+/// Pins the shape chain of a just-constructed object (receiver, an Object) in
+/// RuntimeState.constructPins, so later objects of its constructor walk shapes
+/// that stay referenced: no add parks the shape it leaves or revives the one it
+/// takes. An entry already naming the receiver's shape returns at once.
+@inlineAlways
+pub unsafe fn pinConstructed<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, receiver: *mut HeapHeader) -> () {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, receiver)
+  let final = data.shape
+  drop data
+  let address = Pointer.address<HeapHeader>(final)
+  let slot = u64.toUsize(u64.shiftRight(u64.wrappingMultiply(usize.toU64(address / 16), 0x9e3779b97f4a7c15), 58))
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  if state.constructPins[slot].final == address { return () }
+  drop state
+  unsafe repin(&mut hooks, runtime, slot, final)
+}
+@inlineNever
+unsafe fn repin<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, slot: usize, final: *mut HeapHeader) -> () {
+  let mut chain: [?*mut HeapHeader; 8] = [Pointer.null<HeapHeader>(); 8]
+  let count = unsafe js_shapes.constructChain(runtime, final, &mut chain)
+  let mut i: usize = 0
+  while i < count { unsafe js_shapes.take(runtime, unsafe nonnull(chain[i])) i = i + 1 }
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  let old = state.constructPins[slot]
+  state.constructPins[slot] = ConstructPin { final: Pointer.address<HeapHeader>(final), count: count, shapes: chain }
+  drop state
+  i = 0
+  while i < old.count { unsafe releaseHeader(&mut hooks, runtime, unsafe nonnull(old.shapes[i])) i = i + 1 }
+}
+/// Consumes an add's retired shape (null, or old's reference): a small interned
+/// shape left without other references joins RuntimeState.retiredShapes,
+/// releasing the ring's oldest entry, instead of being parked.
+@inlineAlways
+pub unsafe fn retireShape<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, retired: ?*mut HeapHeader) -> () {
+  let shape = match Pointer.nonNullMut<HeapHeader>(retired) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return () } }
+  let mut anchor = ()
+  let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, shape)
+  if header.referenceCount > 1 { header.referenceCount = i32.wrappingSubtract(header.referenceCount, 1) return () }
+  drop header
+  unsafe retireLast(&mut hooks, runtime, shape)
+}
+@inlineNever
+unsafe fn retireLast<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, shape: *mut HeapHeader) -> () {
+  if !unsafe js_shapes.parkable(shape) || unsafe phase(runtime) != GcPhase.None { unsafe releaseLast(&mut hooks, runtime, shape) return () }
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  let next = state.retiredShapeNext
+  let oldest = state.retiredShapes[next]
+  state.retiredShapes[next] = shape
+  state.retiredShapeNext = (next + 1) & 63
+  drop state
+  unsafe releaseOptional(&mut hooks, runtime, oldest)
+}
+/// Releases every retiredShapes entry.
+unsafe fn releaseRetired<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader) -> () {
+  let mut anchor = ()
+  let mut slot: usize = 0
+  while slot < 64 {
+    let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+    let old = state.retiredShapes[slot]
+    state.retiredShapes[slot] = Pointer.null<HeapHeader>()
+    drop state
+    unsafe releaseOptional(&mut hooks, runtime, old)
+    slot = slot + 1
+  }
+}
+/// An owned reference to the interned empty shape for the `prototype` of
+/// function (an Object used as new.target), when the receiver cache knows it:
+/// `new F()` then allocates its receiver without reading the property or
+/// searching the shape table. Null sends the caller down the generic path.
+@inlineAlways
+pub unsafe fn receiverShape<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, function: *mut HeapHeader) -> ?*mut HeapHeader {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, function)
+  let version = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)).version
+  let address = Pointer.address<HeapHeader>(function)
+  let slot = u64.toUsize(u64.shiftRight(u64.wrappingMultiply(usize.toU64(address / 16), 0x9e3779b97f4a7c15), 58))
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let entry = state.receiverCache[slot]
+  drop state
+  if entry.function != address || entry.version != version || data.isExotic() {
+    drop data
+    return unsafe refillReceiver(&mut hooks, runtime, function, slot)
+  }
+  // The version fixes the record at entry.index as a data property.
+  let prototype = (unsafe js_shapes.unchecked<SlotBits>(&data.properties, entry.index)).valueBits()
+  drop data
+  let empty = unsafe nonnull(entry.empty)
+  let held = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, empty)).prototype
+  match prototype {
+    ValueBits.Object { reference } => {
+      if Pointer.address<HeapHeader>(reference) != Pointer.address<HeapHeader>(unsafe nonnull(held)) { return Pointer.null<HeapHeader>() }
+    }
+    _ => { return Pointer.null<HeapHeader>() }
+  }
+  unsafe HeapCell.retain(empty)
+  return empty
+}
+@inlineNever
+unsafe fn refillReceiver<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, function: *mut HeapHeader, slot: usize) -> ?*mut HeapHeader {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, function)
+  if data.isExotic() { return Pointer.null<HeapHeader>() }
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+  let version = shape.version
+  let index = match unsafe js_shapes.lookup(data.shape, atomIds.JS_ATOM_prototype) {
+    Option<usize>.Some { value } => value
+    Option<usize>.None => { return Pointer.null<HeapHeader>() }
+  }
+  if (u8.toU32(shape.properties.get(index).flags) & JS_PROP_TMASK) != 0 { return Pointer.null<HeapHeader>() }
+  let prototype = match data.properties.get(index).valueBits() {
+    ValueBits.Object { reference } => reference
+    _ => { return Pointer.null<HeapHeader>() }
+  }
+  drop shape drop data
+  let found = unsafe js_shapes.findPrototype(runtime, prototype)
+  if Pointer.isNull<HeapHeader>(found) { return Pointer.null<HeapHeader>() }
+  let empty = unsafe nonnull(found)
+  // One reference for the entry, one for the caller.
+  unsafe js_shapes.take(runtime, empty)
+  unsafe HeapCell.retain(empty)
+  let mut stateAnchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
+  let old = state.receiverCache[slot]
+  let mut entry = blankReceiverEntry()
+  entry.function = Pointer.address<HeapHeader>(function) entry.version = version entry.index = index entry.empty = found
+  state.receiverCache[slot] = entry
+  drop state
+  unsafe releaseOptional(&mut hooks, runtime, old.empty)
+  unsafe releaseOptional(&mut hooks, runtime, old.final)
+  return found
+}
+@inlineAlways
+fn receiverSlot(address: usize) -> usize {
+  return u64.toUsize(u64.shiftRight(u64.wrappingMultiply(usize.toU64(address / 16), 0x9e3779b97f4a7c15), 58))
+}
+/// The shape versions of the prototype chain from first, link by link, into
+/// chain; returns the depth, or 4 when it is longer than chain holds.
+unsafe fn chainVersions(first: ?*mut HeapHeader, chain: &mut [u64; 3]) -> usize {
+  let anchor = ()
+  let mut current = first
+  let mut depth: usize = 0
+  while !Pointer.isNull<HeapHeader>(current) {
+    if depth == 3 { return 4 }
+    let link = unsafe HeapCell.payload<ObjectData, ()>(&anchor, unsafe nonnull(current))
+    let linkShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, link.shape)
+    chain[depth] = linkShape.version
+    current = linkShape.prototype
+    depth = depth + 1
+  }
+  return depth
+}
+/// The plan's final shape (an owned reference) for `new function(...)` when the
+/// receiver cache holds a construct plan that still applies, else null.
+@inlineAlways
+pub unsafe fn plannedShape(runtime: *mut HeapHeader, function: *mut HeapHeader, bytecode: usize) -> PlannedShape {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, function)
+  let version = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)).version
+  let address = Pointer.address<HeapHeader>(function)
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let entry = &state.receiverCache[receiverSlot(address)]
+  let missed = PlannedShape { final: Pointer.null<HeapHeader>(), empty: Pointer.null<HeapHeader>(), stores: 0, sources: [0; 8] }
+  if entry.function != address || entry.version != version || entry.stores == 0 || entry.bytecode != bytecode || data.isExotic() { return missed }
+  let final = unsafe nonnull(entry.final)
+  let finalShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, final)
+  // The version fixes the record at entry.index as a data property.
+  match (unsafe js_shapes.unchecked<SlotBits>(&data.properties, entry.index)).valueBits() {
+    ValueBits.Object { reference } => {
+      if Pointer.address<HeapHeader>(reference) != Pointer.address<HeapHeader>(unsafe nonnull(finalShape.prototype)) { return missed }
+    }
+    _ => { return missed }
+  }
+  let mut current = finalShape.prototype
+  let depth = u8.toUsize(entry.depth)
+  let mut level: usize = 0
+  while level < depth {
+    let link = unsafe HeapCell.payload<ObjectData, ()>(&anchor, unsafe nonnull(current))
+    let linkShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, link.shape)
+    if linkShape.version != entry.chain[level] { return missed }
+    current = linkShape.prototype
+    level = level + 1
+  }
+  let mut headerAnchor = ()
+  let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut headerAnchor, final)
+  let count = header.referenceCount
+  if count <= 0 { return missed }
+  header.referenceCount = i32.wrappingAdd(count, 1)
+  return PlannedShape { final: entry.final, empty: entry.empty, stores: entry.stores, sources: entry.sources }
+}
+pub struct PlannedShape { pub final: ?*mut HeapHeader, pub empty: ?*mut HeapHeader, pub stores: u8, pub sources: [u8; 8] }
+impl Copy for PlannedShape {}
+/// Records a construct plan on function's receiver cache entry, whose empty shape
+/// the receiver just built had: its stores (arguments sources) took it to final.
+pub unsafe fn notePlan<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, function: *mut HeapHeader, empty: *mut HeapHeader,
+  final: *mut HeapHeader, bytecode: usize, stores: usize, sources: [u8; 8]) -> () {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, function)
+  let version = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)).version
+  drop data
+  let address = Pointer.address<HeapHeader>(function)
+  let slot = receiverSlot(address)
+  let mut chain: [u64; 3] = [0; 3]
+  let finalShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, final)
+  let depth = unsafe chainVersions(finalShape.prototype, &mut chain)
+  drop finalShape
+  if depth > 3 || stores == 0 || stores > 8 { return () }
+  let mut stateAnchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
+  let entry = state.receiverCache[slot]
+  if entry.function != address || entry.version != version || Pointer.address<HeapHeader>(unsafe nonnull(entry.empty)) != Pointer.address<HeapHeader>(empty) { return () }
+  if Pointer.address<HeapHeader>(unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(entry.final)) == Pointer.address<HeapHeader>(final) && entry.bytecode == bytecode { return () }
+  unsafe HeapCell.retain(final)
+  let mut updated = entry
+  updated.final = final updated.bytecode = bytecode updated.stores = usize.toU8(stores) updated.depth = usize.toU8(depth)
+  updated.sources = sources updated.chain = chain
+  state.receiverCache[slot] = updated
+  drop state
+  unsafe releaseOptional(&mut hooks, runtime, entry.final)
+}
+/// An owned reference to prototype's interned empty shape (js_shapes.empty),
+/// through RuntimeState.emptyShapes.
+@inlineAlways
+pub unsafe effect fn cachedEmpty<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, prototype: ?*mut HeapHeader) -> *mut HeapHeader
+  ! OutOfMemoryError ? &mut Allocator {
+  let address = match Pointer.nonNullMut<HeapHeader>(prototype) {
+    Option<*mut HeapHeader>.Some { value } => Pointer.address<HeapHeader>(value)
+    Option<*mut HeapHeader>.None => { return run unsafe js_shapes.empty(runtime, prototype) }
+  }
+  let slot = js_shapes.emptySlot(address)
+  let mut anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let entry = state.emptyShapes[slot]
+  drop state
+  if entry.prototype == address {
+    // A weak entry: a parked (count 0) shape goes back through js_shapes.empty.
+    let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, unsafe nonnull(entry.empty))
+    let count = header.referenceCount
+    if count > 0 {
+      header.referenceCount = i32.wrappingAdd(count, 1)
+      return unsafe nonnull(entry.empty)
+    }
+  }
+  return run unsafe refillEmpty(&mut hooks, runtime, prototype, slot)
+}
+@inlineNever
+unsafe effect fn refillEmpty<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, prototype: ?*mut HeapHeader, slot: usize) -> *mut HeapHeader
+  ! OutOfMemoryError ? &mut Allocator {
+  let empty = run unsafe js_shapes.empty(runtime, prototype)
+  // An unhashed shape (none was interned) is the caller's alone.
+  if !unsafe js_shapes.parkable(empty) { return empty }
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  // Weak: js_shapes.destroyDetached clears the entry with its shape.
+  state.emptyShapes[slot] = EmptyShapeEntry { prototype: Pointer.address<HeapHeader>(unsafe nonnull(prototype)), empty: empty }
+  return empty
+}
+/// Releases every constructPins chain and receiverCache shape, so the collector
+/// sees only live references.
+pub unsafe fn releasePins<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader) -> () {
+  let mut anchor = ()
+  let mut slot: usize = 0
+  while slot < 64 {
+    let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+    let old = state.constructPins[slot]
+    state.constructPins[slot] = ConstructPin { final: 0, count: 0, shapes: [Pointer.null<HeapHeader>(); 8] }
+    let receiver = state.receiverCache[slot]
+    state.receiverCache[slot] = blankReceiverEntry()
+    drop state
+    unsafe releaseOptional(&mut hooks, runtime, receiver.empty)
+    unsafe releaseOptional(&mut hooks, runtime, receiver.final)
+    let mut i: usize = 0
+    while i < old.count { unsafe releaseHeader(&mut hooks, runtime, unsafe nonnull(old.shapes[i])) i = i + 1 }
+    slot = slot + 1
+  }
+}
 /// Destroys every parked shape so the collector sees only live references.
 pub unsafe fn flushParkedShapes<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader) -> () {
   let mut shape = unsafe js_shapes.unpark(runtime)
@@ -526,6 +807,8 @@ pub unsafe fn drainZero<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader) -
 pub unsafe effect fn collect<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader,
   removeWeakObjects: bool) -> () ? &mut Allocator {
   require(unsafe phase(runtime) == GcPhase.None)
+  unsafe releasePins(&mut hooks, runtime)
+  unsafe releaseRetired(&mut hooks, runtime)
   unsafe drainPending(&mut hooks, runtime)
   unsafe flushParkedShapes(&mut hooks, runtime)
   require(Pointer.isNull<HeapHeader>(unsafe firstGc(runtime, 1)))
@@ -1090,6 +1373,11 @@ pub unsafe fn takeSpareCell(runtime: *mut HeapHeader, capacity: usize) -> Option
   state.sparePairCellCount = count - 1
   return Intrinsic.replace(state.spareCells.asMutSlice()[SPARE_CELLS + count - 1], Option<Intrinsic.RawBuffer<u8>>.none())
 }
+unsafe fn valuesInTail(node: *mut HeapHeader) -> bool {
+  let anchor = ()
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  return match &object.payload { ObjectPayload.FastArray { array } => array.values.borrowsStorage() _ => false }
+}
 unsafe fn destroyObject<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node: *mut HeapHeader) -> () {
   let mut anchor = ()
   let object = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
@@ -1119,6 +1407,8 @@ unsafe fn destroyObject<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, n
   // so they skip the call; that tail's size picks the cell's spare bin.
   let mut tail: usize = 0
   if properties.borrowsStorage() { tail = properties.capacity() }
+  // An array literal's values may follow the slots in the tail: no spare bin fits.
+  if classId == JS_CLASS_ARRAY && tail != 0 && unsafe valuesInTail(node) { tail = 0 }
   if properties.ownsStorage() { unsafe js_shapes.parkSlots(runtime, move properties) } else { drop properties }
   unsafe releaseObjectHeader(&mut hooks, runtime, shape)
   let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
