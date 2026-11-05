@@ -3,6 +3,7 @@ import js_pointers as pointers
 import js_realm { lendRealm }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.concurrency.atomic { Atomic, MemoryOrder }
+import silk.concurrency.sync { Mutex }
 import silk.mem.box { Box }
 import silk.collections.bytes { Bytes }
 import silk.core.effect { Effect }
@@ -34,9 +35,10 @@ import test262_host as host
 import test262_native as native
 import test262_text as text
 
+/// What workers update together, one at a time.
+struct Locked { reporter: Reporter, statistics: Statistics, featureCounts: List<i32> }
 struct Shared {
-  options: *const Options, mutex: native.Mutex, reporter: Reporter, statistics: Statistics,
-  featureCounts: List<i32>, output: ?*mut stdio.File,
+  options: *const Options, locked: Mutex<Locked>, output: ?*mut stdio.File,
   count: i32, failed: i32, skipped: i32, fatal: i32, runtimes: i32, threads: i32,
   start: i32, stop: i32
 }
@@ -52,10 +54,8 @@ unsafe fn counters(pointer: *mut Shared) -> Counters {
 }
 unsafe fn increment(value: *mut i32) -> () { let previous = unsafe Atomic.fetchAdd<i32>(value, 1, MemoryOrder.Relaxed) }
 unsafe fn load(value: *mut i32) -> i32 { return unsafe Atomic.load<i32>(value, MemoryOrder.Acquire) }
-unsafe fn mutex(pointer: *mut Shared) -> *mut native.Mutex {
-  let mut anchor = () let state = unsafe Pointer.borrowMut<(), Shared>(&mut anchor, pointer)
-  return Pointer.fromMutRef(&mut state.mutex)
-}
+// Workers share the state through this pointer; it lives until every worker has joined.
+unsafe fn shared<'a>(anchor: &'a (), pointer: *mut Shared) -> &'a Shared { return unsafe Pointer.borrow<(), Shared>(&anchor.*, pointer) }
 unsafe fn options(pointer: *mut Shared) -> *const Options {
   let anchor = () return (unsafe Pointer.borrow<(), Shared>(&anchor, pointer)).options
 }
@@ -64,19 +64,16 @@ unsafe fn reportFile(pointer: *mut Shared) -> ?*mut stdio.File {
 }
 unsafe effect fn record(pointer: *mut Shared, filename: &[u8], source: &[u8], observation: &Observation) -> ()
   ! OutOfMemoryError ? &mut Allocator {
-  let gate = unsafe mutex(pointer) unsafe native.lock(gate)
+  let anchor = () let mut guard = (unsafe shared(&anchor, pointer)).locked.lock()
   platform.flush()
-  let mut anchor = () let state = unsafe Pointer.borrowMut<(), Shared>(&mut anchor, pointer)
-  let recorded = run Effect.result(state.reporter.record(filename, source, observation)) drop state
-  unsafe native.unlock(gate)
+  let locked = guard.getMut()
+  let recorded = run Effect.result(locked.reporter.record(filename, source, observation)) drop guard
   match move recorded { Result<(), OutOfMemoryError>.Success { .. } => () Result<(), OutOfMemoryError>.Failure { error } => { fail move error } }
 }
 unsafe effect fn sample<'m>(pointer: *mut Shared, session: &Session<'m>, filename: &[u8]) -> ()
   ! OutOfMemoryError ? &mut Allocator {
-  let gate = unsafe mutex(pointer) unsafe native.lock(gate)
-  let mut anchor = () let state = unsafe Pointer.borrowMut<(), Shared>(&mut anchor, pointer)
-  let recorded = run Effect.result(unsafe state.statistics.sample(session.runtime, session.engine.memory, filename)) drop state
-  unsafe native.unlock(gate)
+  let anchor = () let mut guard = (unsafe shared(&anchor, pointer)).locked.lock() let locked = guard.getMut()
+  let recorded = run Effect.result(unsafe locked.statistics.sample(session.runtime, session.engine.memory, filename)) drop guard
   match move recorded { Result<(), OutOfMemoryError>.Success { .. } => () Result<(), OutOfMemoryError>.Failure { error } => { fail move error } }
 }
 unsafe effect fn body<'m>(session: &mut Session<'m>, filename: &mut List<u8>, source: &[u8], metadata: &Metadata,
@@ -171,22 +168,20 @@ unsafe effect fn describe(pointer: *mut Shared, filename: &[u8], index: i32, met
 unsafe fn countFeatures(pointer: *mut Shared, metadata: &Metadata) -> () {
   let anchor = () let config = unsafe Pointer.borrow<(), Options>(&anchor, unsafe options(pointer))
   if !config.countSkippedFeatures { return }
-  let gate = unsafe mutex(pointer) unsafe native.lock(gate)
-  let mut mutableAnchor = () let state = unsafe Pointer.borrowMut<(), Shared>(&mut mutableAnchor, pointer)
+  let lockAnchor = () let mut guard = (unsafe shared(&lockAnchor, pointer)).locked.lock() let locked = guard.getMut()
   let mut i: usize = 0
   while i < metadata.skippedFeatures.length() {
     let mut j: usize = 0
     while j < config.skipFeatures.length() {
       if text.equal(metadata.skippedFeatures.asSlice()[i].asSlice(), config.skipFeatures.asSlice()[j].asSlice()) {
-        let previous = state.featureCounts.get(j)
-        let counts = state.featureCounts.asMutSlice()
+        let previous = locked.featureCounts.get(j)
+        let counts = locked.featureCounts.asMutSlice()
         counts[j] = previous + 1 break
       }
       j = j + 1
     }
     i = i + 1
   }
-  drop state unsafe native.unlock(gate)
 }
 unsafe effect fn test(pointer: *mut Shared, process: &Process, domain: Domain, filename: &[u8], index: i32)
   -> () ! OutOfMemoryError | platform.PlatformError ? &mut Allocator {
@@ -335,12 +330,13 @@ unsafe effect fn schedule(pointer: *mut Shared) -> () ! OutOfMemoryError ? &mut 
 unsafe effect fn summaries(pointer: *mut Shared, excluded: i32, elapsed: i64, ledger: bool) -> i32
   ! OutOfMemoryError | platform.PlatformError ? &mut Allocator {
   let mut anchor = () let state = unsafe Pointer.borrowMut<(), Shared>(&mut anchor, pointer)
+  let lockAnchor = () let mut guard = (unsafe shared(&lockAnchor, pointer)).locked.lock() let locked = guard.getMut()
   let configAnchor = () let config = unsafe Pointer.borrow<(), Options>(&configAnchor, state.options)
-  if config.memory != 0 { state.statistics.display(config.memory) }
+  if config.memory != 0 { locked.statistics.display(config.memory) }
   if config.countSkippedFeatures {
     let mut header = false let mut i: usize = 0
-    while i < state.featureCounts.length() {
-      let count = state.featureCounts.get(i)
+    while i < locked.featureCounts.length() {
+      let count = locked.featureCounts.get(i)
       if count != 0 {
         if !header {
           let mut heading = run text.copy(b"SKIPPED FEATURE")
@@ -366,10 +362,10 @@ unsafe effect fn summaries(pointer: *mut Shared, excluded: i32, elapsed: i64, le
     if state.count != 1 { run message.append(115) }
     if excluded != 0 { run text.append(&mut message, b", ") run text.decimal(&mut message, i32.toI64(excluded)) run text.append(&mut message, b" excluded") }
     if state.skipped != 0 { run text.append(&mut message, b", ") run text.decimal(&mut message, i32.toI64(state.skipped)) run text.append(&mut message, b" skipped") }
-    if state.reporter.hasKnown {
-      if state.reporter.newErrors != 0 { run text.append(&mut message, b", ") run text.decimal(&mut message, i32.toI64(state.reporter.newErrors)) run text.append(&mut message, b" new") }
-      if state.reporter.changedErrors != 0 { run text.append(&mut message, b", ") run text.decimal(&mut message, i32.toI64(state.reporter.changedErrors)) run text.append(&mut message, b" changed") }
-      if state.reporter.fixedErrors != 0 { run text.append(&mut message, b", ") run text.decimal(&mut message, i32.toI64(state.reporter.fixedErrors)) run text.append(&mut message, b" fixed") }
+    if locked.reporter.hasKnown {
+      if locked.reporter.newErrors != 0 { run text.append(&mut message, b", ") run text.decimal(&mut message, i32.toI64(locked.reporter.newErrors)) run text.append(&mut message, b" new") }
+      if locked.reporter.changedErrors != 0 { run text.append(&mut message, b", ") run text.decimal(&mut message, i32.toI64(locked.reporter.changedErrors)) run text.append(&mut message, b" changed") }
+      if locked.reporter.fixedErrors != 0 { run text.append(&mut message, b", ") run text.decimal(&mut message, i32.toI64(locked.reporter.fixedErrors)) run text.append(&mut message, b" fixed") }
     }
     run message.append(10) cli_io.stderr(message.asSlice())
     if config.timings {
@@ -379,7 +375,7 @@ unsafe effect fn summaries(pointer: *mut Shared, excluded: i32, elapsed: i64, le
       run text.append(&mut timing, b")\n") cli_io.stderr(timing.asSlice())
     }
   }
-  run state.reporter.finish(config.errorFile.asSlice())
+  run locked.reporter.finish(config.errorFile.asSlice())
   if ledger {
     let mut message = run text.copy(b"Native runner ledger: threads=") run text.decimal(&mut message, i32.toI64(state.threads))
     run text.append(&mut message, b" runtimes=") run text.decimal(&mut message, i32.toI64(state.runtimes))
@@ -388,7 +384,7 @@ unsafe effect fn summaries(pointer: *mut Shared, excluded: i32, elapsed: i64, le
   if state.fatal != 0 { return 1 }
   if config.harness { if state.failed != 0 { return 1 } return 0 }
   if config.updateErrors { return 0 }
-  if state.reporter.newErrors != 0 || state.reporter.changedErrors != 0 || state.reporter.fixedErrors != 0 { return 1 }
+  if locked.reporter.newErrors != 0 || locked.reporter.changedErrors != 0 || locked.reporter.fixedErrors != 0 { return 1 }
   return 0
 }
 pub effect fn runTests(config: &mut Options) -> i32 ! OutOfMemoryError | platform.PlatformError ? &mut Allocator {
@@ -427,14 +423,10 @@ pub effect fn runTests(config: &mut Options) -> i32 ! OutOfMemoryError | platfor
       closeOutput = true
     }
   }
-  let mut state = Shared { options: Pointer.fromRef(&config.*), mutex: native.zeroMutex(), reporter: move reporter,
-    statistics: Statistics.make(), featureCounts: move featureCounts, output: output,
+  let locked = run Mutex<Locked>.make(Locked { reporter: move reporter, statistics: Statistics.make(),
+    featureCounts: move featureCounts })
+  let mut state = Shared { options: Pointer.fromRef(&config.*), locked: move locked, output: output,
     count: 0, failed: 0, skipped: 0, fatal: 0, runtimes: 0, threads: 0, start: 0, stop: 0 }
-  let init = unsafe native.init(Pointer.fromMutRef(&mut state.mutex))
-  if init != 0 {
-    if closeOutput { let ignored = unsafe stdio.fclose(pointers.present(output)) }
-    fail platform.PlatformError { code: init }
-  }
   let mut excluded = config.excluded at = 0
   while at < config.tests.length() {
     let selection = selected(&config, at)
@@ -453,7 +445,6 @@ pub effect fn runTests(config: &mut Options) -> i32 ! OutOfMemoryError | platfor
     }
   } else { scheduled = run Effect.result(unsafe schedule(pointer)) }
   let elapsed = native.cpuMilliseconds() - started
-  unsafe native.destroy(Pointer.fromMutRef(&mut state.mutex))
   if closeOutput { let ignored = unsafe stdio.fclose(pointers.present(output)) }
   match move scheduled { Result<(), OutOfMemoryError>.Success { .. } => () Result<(), OutOfMemoryError>.Failure { error } => { fail move error } }
   if state.fatal != 0 { return 1 }
