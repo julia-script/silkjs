@@ -1,10 +1,11 @@
-//! Native per-variant runtime ownership and source-striped pthread scheduling.
+//! Native per-variant runtime ownership and source-striped native-thread scheduling.
 import js_pointers as pointers
 import js_realm { lendRealm }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.concurrency.atomic { Atomic, MemoryOrder }
 import silk.concurrency.sync { Mutex }
-import silk.mem.box { Box }
+import silk.concurrency.thread { Transferable }
+import silk.concurrency.thread_native { JoinHandle, NativeThread, SpawnError }
 import silk.collections.bytes { Bytes }
 import silk.core.effect { Effect }
 import silk.collections.list { List }
@@ -42,7 +43,6 @@ struct Shared {
   count: i32, failed: i32, skipped: i32, fatal: i32, runtimes: i32, threads: i32,
   start: i32, stop: i32
 }
-struct Worker { shared: *mut Shared, index: i32, thread: usize }
 struct Counters { count: *mut i32, failed: *mut i32, skipped: *mut i32, fatal: *mut i32,
   runtimes: *mut i32, threads: *mut i32, start: *mut i32, stop: *mut i32 }
 unsafe fn counters(pointer: *mut Shared) -> Counters {
@@ -254,10 +254,8 @@ unsafe effect fn worker(pointer: *mut Shared, number: i32) -> ()
     if config.harness { break }
   }
 }
-export "C" fn silkTest262Worker(raw: ?*mut u8) -> ?*mut u8 {
-  let pointer = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Worker>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(raw))
-  let anchor = () let args = unsafe Pointer.borrow<(), Worker>(&anchor, pointer)
-  let shared = args.shared let index = args.index drop args
+fn workerEntry(handle: SharedHandle, index: i32) -> i32 {
+  let shared = handle.pointer
   let counts = unsafe counters(shared) unsafe increment(counts.threads)
   while unsafe load(counts.start) == 0 { native.sleep(1) }
   let mut system = Allocator.systemAllocatorProvider()
@@ -268,7 +266,7 @@ export "C" fn silkTest262Worker(raw: ?*mut u8) -> ?*mut u8 {
       cli_io.stderr(b"run-test262: test worker failed\n") unsafe increment(counts.fatal)
     }
   }
-  return Pointer.null<u8>()
+  return 0
 }
 unsafe effect fn progress(pointer: *mut Shared) -> () ! OutOfMemoryError ? &mut Allocator {
   let counts = unsafe counters(pointer) let anchor = () let config = unsafe Pointer.borrow<(), Options>(&anchor, unsafe options(pointer))
@@ -291,41 +289,49 @@ unsafe effect fn progress(pointer: *mut Shared) -> () ! OutOfMemoryError ? &mut 
     cli_io.stderr(message.asSlice()) if done { return }
   }
 }
-export "C" fn silkTest262Progress(raw: ?*mut u8) -> ?*mut u8 {
-  let pointer = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Shared>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(raw))
+fn progressEntry(handle: SharedHandle) -> i32 {
+  let pointer = handle.pointer
   let mut system = Allocator.systemAllocatorProvider()
   let result = run Effect.result(unsafe progress(pointer)) |> Effect.provideMut<Allocator>(&mut system)
   match move result { Result<(), OutOfMemoryError>.Success { .. } => () Result<(), OutOfMemoryError>.Failure { .. } => { unsafe increment((unsafe counters(pointer)).fatal) } }
-  return Pointer.null<u8>()
+  return 0
+}
+/// The shared runner state, lent to worker threads; `schedule` joins them before it ends.
+struct SharedHandle { pointer: *mut Shared }
+impl Transferable for SharedHandle {}
+// A failed start counts as fatal, never escapes: threads already started still borrow `Shared`.
+unsafe fn started(pointer: *mut Shared, spawned: Result<JoinHandle<i32>, OutOfMemoryError | SpawnError>) -> Option<JoinHandle<i32>> {
+  return match move spawned {
+    Result<JoinHandle<i32>, OutOfMemoryError | SpawnError>.Success { value } => Option<JoinHandle<i32>>.some(move value)
+    Result<JoinHandle<i32>, OutOfMemoryError | SpawnError>.Failure { error } => {
+      drop error unsafe increment((unsafe counters(pointer)).fatal) Option<JoinHandle<i32>>.none()
+    }
+  }
 }
 unsafe effect fn schedule(pointer: *mut Shared) -> () ! OutOfMemoryError ? &mut Allocator {
   let anchor = () let config = unsafe Pointer.borrow<(), Options>(&anchor, unsafe options(pointer))
-  let mut workers = List<Box<Worker>>.make() run workers.reserveExact(i32.toUsize(config.threads))
-  let mut index: i32 = 0
-  // Allocate every stable argument before any thread can observe partial setup.
-  while index < config.threads {
-    let entry = run Box<Worker>.make(Worker { shared: pointer, index: index, thread: 0 })
-    run workers.append(move entry) index = index + 1
-  }
-  let mut progressThread: usize = 0 let mut progressStarted = false
-  let raw = unsafe Intrinsic.pointerReinterpret<*mut Shared, *mut u8>(pointer)
+  let mut workers = List<JoinHandle<i32>>.make() run workers.reserveExact(i32.toUsize(config.threads))
+  let mut progressThread = Option<JoinHandle<i32>>.none()
   if config.progress != 0 {
-    let code = unsafe native.spawn(silkTest262Progress, raw, Pointer.fromMutRef(&mut progressThread))
-    if code == 0 { progressStarted = true } else { unsafe increment((unsafe counters(pointer)).fatal) }
+    let handle = SharedHandle { pointer: pointer }
+    progressThread = unsafe started(pointer, run Effect.result(NativeThread.spawn(fn() -> i32 { return progressEntry(move handle) })))
   }
-  index = 0 let mut started: i32 = 0
+  let mut index: i32 = 0
   while index < config.threads {
-    let entry = &mut workers.asMutSlice()[i32.toUsize(index)].getMut()[0]
-    let rawEntry = unsafe Intrinsic.pointerReinterpret<*mut Worker, *mut u8>(Pointer.fromMutRef(&mut entry.*))
-    let code = unsafe native.spawn(silkTest262Worker, rawEntry, Pointer.fromMutRef(&mut entry.thread))
-    if code != 0 { unsafe increment((unsafe counters(pointer)).fatal) break }
-    started = started + 1 index = index + 1
+    let handle = SharedHandle { pointer: pointer } let mine = index
+    let spawned = unsafe started(pointer, run Effect.result(NativeThread.spawn(fn() -> i32 { return workerEntry(move handle, mine) })))
+    match move spawned {
+      Option<JoinHandle<i32>>.Some { value } => { run workers.append(move value) }
+      Option<JoinHandle<i32>>.None => { break }
+    }
+    index = index + 1
   }
   unsafe Atomic.store<i32>((unsafe counters(pointer)).start, 1, MemoryOrder.Release)
-  index = 0
-  while index < started { unsafe native.join(workers.asSlice()[i32.toUsize(index)].get()[0].thread) index = index + 1 }
+  while true {
+    match workers.pop() { Option<JoinHandle<i32>>.Some { value } => { let _code = value.join() } Option<JoinHandle<i32>>.None => { break } }
+  }
   unsafe Atomic.store<i32>((unsafe counters(pointer)).stop, 1, MemoryOrder.Release)
-  if progressStarted { unsafe native.join(progressThread) }
+  match move progressThread { Option<JoinHandle<i32>>.Some { value } => { let _code = value.join() } Option<JoinHandle<i32>>.None => () }
 }
 unsafe effect fn summaries(pointer: *mut Shared, excluded: i32, elapsed: i64, ledger: bool) -> i32
   ! OutOfMemoryError | platform.PlatformError ? &mut Allocator {
