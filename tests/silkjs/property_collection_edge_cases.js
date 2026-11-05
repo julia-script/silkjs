@@ -175,3 +175,30 @@ var got10 = out10.join('|');
 const expected10 = "true|2,4,6,8|1,3|1|2,3,4,9|1,2|true|true|true|2|1|false|sp2|6|false|true|5,6|true|true|true|2";
 console.log(got10 === expected10 ? 'PASS array species shortcuts' : 'FAIL ' + got10);
 if (got10 !== expected10) throw new Error('array species regressions');
+var out11 = [];
+function P() {} P.prototype.z = 0;
+function make(x, y) { var o = new P(); o.x = x; o.y = y; o.z = x + y; return o; }
+for (var i = 0; i < 50; i++) make(i, 1);
+var a = make(1, 2); out11.push(a.x, a.y, a.z, Object.keys(a).join());
+Object.defineProperty(P.prototype, 'z', { set: function (v) { this.seen = v; }, get: function () { return 'g'; }, configurable: true });
+var b = make(3, 4); out11.push(b.z, b.seen, b.hasOwnProperty('z'), Object.keys(b).join());
+Object.defineProperty(P.prototype, 'z', { value: 9, writable: false, configurable: true });
+var c = make(5, 6); out11.push(c.z, c.hasOwnProperty('z'));
+delete P.prototype.z;
+var d = make(7, 8); out11.push(d.z, d.hasOwnProperty('z'));
+function addTo(o, v) { o.w = v; return o; }
+for (var i = 0; i < 20; i++) addTo({ k: i }, i);
+var frozen = Object.preventExtensions({ k: 1 }); addTo(frozen, 2); out11.push(frozen.w, Object.keys(frozen).join());
+var sealedProto = { k: 1 }; Object.defineProperty(Object.prototype, 'w', { set: function (v) { this.viaSetter = v; }, configurable: true });
+var e = addTo({ k: 3 }, 4); out11.push(e.viaSetter, e.hasOwnProperty('w')); delete Object.prototype.w;
+var f = addTo({ k: 5 }, 6); out11.push(f.w, Object.keys(f).join());
+var arr = addTo([1], 7); out11.push(arr.w, arr.length);
+var shapes = [{ k: 1 }, { m: 1 }, { k: 1, m: 2 }];
+for (var i = 0; i < 30; i++) { var s = addTo(Object.assign({}, shapes[i % 3]), i); if (i >= 27) out11.push(Object.keys(s).join() + '=' + s.w); }
+function strictAdd(o) { 'use strict'; o.q = 1; return o; }
+for (var i = 0; i < 10; i++) strictAdd({});
+try { strictAdd(Object.freeze({})); out11.push('no throw'); } catch (err) { out11.push(err instanceof TypeError); }
+var got11 = out11.join('|');
+const expected11 = "1|2|3|x,y,z|g|7|false|x,y,seen|9|false|15|true||k|4|false|6|k,w|7|1|k,w=27|m,w=28|k,m,w=29|true";
+console.log(got11 === expected11 ? 'PASS put_field add site cache' : 'FAIL ' + got11);
+if (got11 !== expected11) throw new Error('add site cache regressions');
