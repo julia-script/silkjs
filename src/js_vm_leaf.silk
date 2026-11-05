@@ -32,6 +32,8 @@ import js_opcode_data as op
 
 /// Scratch cells a run may use: the callee's locals and operand stack.
 const LEAF_CELLS: usize = 24
+/// Runs live at once: the outermost and one leaf it calls (Nesting).
+const LEAF_DEPTH: usize = 2
 
 fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
 
@@ -44,16 +46,23 @@ pub unsafe fn leafBytecode(function: ValueBits, count: usize) -> ?*mut HeapHeade
   let bytecode = match &data.payload { ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode _ => invariant() }
   drop data
   let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
-  if !code.leaf || u16.toUsize(code.argumentCount) > count { return Pointer.null<HeapHeader>() }
+  if code.leaf == 0 || u16.toUsize(code.argumentCount) > count { return Pointer.null<HeapHeader>() }
   return bytecode
 }
 
+/// Charges a declined run to code, a leaf's FunctionBytecode: a leaf that keeps
+/// needing slow paths stops being tried.
+@inlineNever
+pub unsafe fn miss(code: *mut HeapHeader) -> () {
+  let mut anchor = () let bytecode = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut anchor, code)
+  bytecode.leaf = bytecode.leaf - 1
+}
 /// Runs the leaf code (a bytecode function's FunctionBytecode, rooted by the
 /// call's operands) for the call at caller whose operands start at first, with
 /// arguments argv (at least code's declared count) and this receiver. Returns
 /// true with the operands from first replaced by the result (caller's ip still
 /// at the call's operand); false with nothing changed.
-@inlineNever
+@inlineAlways
 pub unsafe fn attempt<H: HeapHooks>(hooks: &mut H, caller: *mut Machine, function: ValueBits, code: *mut HeapHeader,
   argv: FrameSlots, first: *mut ValueBits, receiver: ValueBits) -> bool {
   let callerAnchor = () let running = unsafe Pointer.borrow<(), Machine>(&callerAnchor, caller)
@@ -64,7 +73,17 @@ pub unsafe fn attempt<H: HeapHooks>(hooks: &mut H, caller: *mut Machine, functio
   let top = unsafe Intrinsic.pointerRequalify<?*mut ValueBits, *mut ValueBits>(state.callFramesTop)
   let room = usize.wrappingSubtract(Pointer.address<ValueBits>(unsafe Intrinsic.pointerRequalify<?*mut ValueBits, *mut ValueBits>(state.callFramesEnd)), Pointer.address<ValueBits>(top))
   drop state
-  if LEAF_CELLS * 16 > room { return false }
+  if LEAF_DEPTH * LEAF_CELLS * 16 > room { return false }
+  let mut nesting = Outer<H> { hooks: Pointer.fromMutRef<H>(&mut hooks), caller: caller, first: first }
+  return unsafe evaluate<Outer<H>>(&mut nesting, runtime, frame, function, code, argv.data, argv.count, receiver, top)
+}
+/// Runs the leaf code for function with count arguments at arguments and this
+/// receiver, on scratch cells from top. True once nesting completed the call
+/// with its result, borrowed from wherever the run read it; false when an opcode
+/// needs its slow path.
+@inlineNever
+unsafe fn evaluate<N: Nesting>(nesting: &mut N, runtime: *mut HeapHeader, frame: *mut StackFrame, function: ValueBits,
+  code: *mut HeapHeader, arguments: *mut ValueBits, count: usize, receiver: ValueBits, top: *mut ValueBits) -> bool {
   let anchor = () let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, code)
   let localCount = u16.toUsize(bytecode.variableCount)
   if localCount + u16.toUsize(bytecode.stackSize) > LEAF_CELLS { return false }
@@ -77,8 +96,8 @@ pub unsafe fn attempt<H: HeapHooks>(hooks: &mut H, caller: *mut Machine, functio
   // frame stays the caller's: no fast path reads or publishes a frame.
   let mut s = Machine { context: realm, callerContext: realm, runtime: runtime,
     bytecode: code, frame: frame, code: ip, constants: constants, closureReferences: unsafe references(function, top),
-    originalArguments: unsafe Intrinsic.pointerRequalify<?*mut FrameSlots, *const FrameSlots>(Pointer.null<FrameSlots>()), arguments: argv.data, locals: top, stack: stack,
-    thisValue: receiver, newTarget: ValueBits.Undefined, argumentCount: argv.count, ip: ip, stackTop: stack,
+    originalArguments: unsafe Intrinsic.pointerRequalify<?*mut FrameSlots, *const FrameSlots>(Pointer.null<FrameSlots>()), arguments: arguments, locals: top, stack: stack,
+    thisValue: receiver, newTarget: ValueBits.Undefined, argumentCount: count, ip: ip, stackTop: stack,
     record: Pointer.null<u8>() }
   let mut index: usize = 0
   while index < localCount { unsafe Pointer.write<ValueBits>(unsafe cellAt(top, index), ValueBits.Undefined) index = index + 1 }
@@ -176,7 +195,27 @@ pub unsafe fn attempt<H: HeapHooks>(hooks: &mut H, caller: *mut Machine, functio
       }
       63 => { // OP_put_field: leafCode puts return_undef right after, so the store is the run's last step
         let atom = unsafe s.readU32()
-        return unsafe store(&mut hooks, caller, first, unsafe s.top(2), atom, unsafe s.top(1))
+        if !nesting.outermost() { return false }
+        if !unsafe store(unsafe s.top(2), atom, unsafe s.top(1)) { return false }
+        unsafe nesting.complete(ValueBits.Undefined) return true
+      }
+      62 => { // OP_get_field2: the method above its receiver, as get_field
+        if !unsafe properties.pushFieldOperand(&mut s) { return false }
+        let value = unsafe s.top(1) if !unsafe gc.releaseIfShared(value) { invariant() }
+      }
+      36 => { // OP_call_method: a leaf callee runs on the cells above this run's, as a leaf of its own
+        let argc = u16.toUsize(unsafe s.readU16())
+        let callee = unsafe s.top(argc + 1)
+        if !nesting.outermost() || !unsafe isBytecodeFunction(callee) { return false }
+        let inner = match Pointer.nonNullMut<HeapHeader>(unsafe leafBytecode(callee, argc)) {
+          Option<*mut HeapHeader>.Some { value } => value
+          Option<*mut HeapHeader>.None => { return false }
+        }
+        let target = unsafe s.top(argc + 2)
+        let operands = unsafe cellAt(s.stackTop, usize.wrappingSubtract(0, argc))
+        let mut value = ValueBits.Undefined
+        if !unsafe nesting.call(runtime, frame, callee, inner, operands, argc, target, s.stackTop, Pointer.fromMutRef<ValueBits>(&mut value)) { return false }
+        unsafe s.discard(argc + 2) unsafe s.push(value)
       }
       // Branches go forward only (leafCode), so a run needs no interrupt poll.
       104 => { let displacement = unsafe s.readI32() if !unsafe condition(&mut s) { unsafe s.jump(displacement, 4) } } // OP_if_false
@@ -264,8 +303,8 @@ pub unsafe fn attempt<H: HeapHooks>(hooks: &mut H, caller: *mut Machine, functio
       }
       246 => { let answer = match unsafe s.top(1) { ValueBits.Undefined => true _ => false } unsafe s.set(1, ValueBits.Bool { value: answer }) } // OP_is_undefined
       247 => { let answer = match unsafe s.top(1) { ValueBits.Null => true _ => false } unsafe s.set(1, ValueBits.Bool { value: answer }) } // OP_is_null
-      40 => { let value = unsafe s.top(1) unsafe finish(&mut hooks, caller, first, unsafe value.retained()) return true } // OP_return
-      41 => { unsafe finish(&mut hooks, caller, first, ValueBits.Undefined) return true } // OP_return_undef
+      40 => { let value = unsafe s.top(1) unsafe nesting.complete(value) return true } // OP_return
+      41 => { unsafe nesting.complete(ValueBits.Undefined) return true } // OP_return_undef
       // Up to 255, so the jump table covers every byte and needs no range check.
       248 => { return false } 249 => { return false } 250 => { return false } 251 => { return false }
       252 => { return false } 253 => { return false } 254 => { return false } 255 => { return false }
@@ -286,6 +325,12 @@ unsafe fn references(function: ValueBits, empty: *mut ValueBits) -> *const ?*mut
     }
     _ => invariant()
   }
+}
+@inlineAlways
+unsafe fn isBytecodeFunction(value: ValueBits) -> bool {
+  let object = match value { ValueBits.Object { reference } => reference _ => { return false } }
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  return data.classId() == classes.JS_CLASS_BYTECODE_FUNCTION
 }
 /// get_loc_check: an initialized local, else the call's TDZ error.
 @inlineAlways
@@ -342,15 +387,49 @@ unsafe fn equality(s: &mut Machine, numeric: u8, strict: bool, equal: bool) -> b
   unsafe operators.finishBinary(&mut s, ValueBits.Bool { value: (same == 1) == equal })
   return true
 }
-/// put_field of value on object, then the leaf's return_undef: true with the
-/// call completed when the store needs no slow path, else false with nothing changed.
+/// put_field of value on object, then the leaf's return_undef: true when the
+/// store needs no slow path, else false with nothing changed.
 @inlineNever
-unsafe fn store<H: HeapHooks>(hooks: &mut H, caller: *mut Machine, first: *mut ValueBits, object: ValueBits, atom: u32, value: ValueBits) -> bool {
+unsafe fn store(object: ValueBits, atom: u32, value: ValueBits) -> bool {
   let node = match object { ValueBits.Object { reference } => reference _ => { return false } }
   let mut stored = unsafe value.retained()
   if !unsafe properties.writeOwnField(node, atom, Pointer.fromMutRef<ValueBits>(&mut stored)) { if !unsafe gc.releaseIfShared(stored) { invariant() } return false }
-  unsafe finish(&mut hooks, caller, first, ValueBits.Undefined)
   return true
+}
+/// How a run treats the leaf calls it makes and its result: the outermost run
+/// (Outer) may call other leaves and store, and completes the call; a nested one
+/// (Inner) declines both, so a declined run never leaves a store behind and
+/// nesting stops at one level, and hands its result to the run that called it.
+interface Nesting {
+  fn outermost(self: &Self) -> bool
+  unsafe fn complete(self: &mut Self, value: ValueBits) -> ()
+  /// Runs a leaf the run calls, with its result written to result.
+  unsafe fn call(self: &mut Self, runtime: *mut HeapHeader, frame: *mut StackFrame, function: ValueBits, code: *mut HeapHeader,
+    arguments: *mut ValueBits, count: usize, receiver: ValueBits, top: *mut ValueBits, result: *mut ValueBits) -> bool
+}
+struct Outer<H: HeapHooks> { hooks: *mut H, caller: *mut Machine, first: *mut ValueBits }
+struct Inner { result: *mut ValueBits }
+impl<H: HeapHooks> Nesting for Outer<H> {
+  @inlineAlways
+  fn outermost(self: &Self) -> bool { return true }
+  @inlineAlways
+  unsafe fn complete(self: &mut Self, value: ValueBits) -> () {
+    let mut anchor = () let hooks = unsafe Pointer.borrowMut<(), H>(&mut anchor, self.hooks)
+    unsafe finish(&mut hooks, self.caller, self.first, unsafe value.retained())
+  }
+  unsafe fn call(self: &mut Self, runtime: *mut HeapHeader, frame: *mut StackFrame, function: ValueBits, code: *mut HeapHeader,
+    arguments: *mut ValueBits, count: usize, receiver: ValueBits, top: *mut ValueBits, result: *mut ValueBits) -> bool {
+    let mut nested = Inner { result: result }
+    return unsafe evaluate<Inner>(&mut nested, runtime, frame, function, code, arguments, count, receiver, top)
+  }
+}
+impl Nesting for Inner {
+  @inlineAlways
+  fn outermost(self: &Self) -> bool { return false }
+  @inlineAlways
+  unsafe fn complete(self: &mut Self, value: ValueBits) -> () { unsafe Pointer.write<ValueBits>(self.result, value) }
+  unsafe fn call(self: &mut Self, runtime: *mut HeapHeader, frame: *mut StackFrame, function: ValueBits, code: *mut HeapHeader,
+    arguments: *mut ValueBits, count: usize, receiver: ValueBits, top: *mut ValueBits, result: *mut ValueBits) -> bool { return false }
 }
 /// Completes the call with value, an owned result: the caller's operands from
 /// first are released and value pushed in their place.

@@ -3,7 +3,9 @@
 // read, primitive receivers, TDZ reads of outer bindings, missing arguments,
 // array holes and out-of-range indexes, int overflow, -0, NaN, strings, strict
 // and loose equality, a callee replaced mid-loop, and setters that store one
-// field on plain, frozen, accessor and array receivers. Expected values come from V8.
+// field on plain, frozen, accessor and array receivers, leaves calling leaves
+// (and setters, natives and non-functions), and leaves that keep declining.
+// Expected values come from V8.
 var r=[];
 function P(x,y){ this.x=x; this.y=y; this.items=[1,2,3]; }
 P.prototype.getX=function(){ return this.x; };
@@ -59,7 +61,23 @@ var viaSetter=new S(0); var seen=[]; Object.defineProperty(viaSetter,'n',{set:fu
 var lenObj=[1,2,3]; S.prototype.trunc=function(){ this.length = 1; }; S.prototype.trunc.call(lenObj); r.push(lenObj.length);
 try { S.prototype.set.call(undefined, 1); } catch(e) { r.push(e.constructor.name); }
 try { S.prototype.strictSet.call(7, 1); } catch(e) { r.push(e.constructor.name); } S.prototype.set.call(7, 1); r.push('prim');
+function Q(){ this.inner=new P(2,3); this.list=[]; this.count=0; }
+Q.prototype.innerX=function(){ return this.inner.getX(); };
+Q.prototype.innerDot=function(o){ return this.inner.dot(o); };
+Q.prototype.twoDeep=function(){ return this.inner.deep(); };
+Q.prototype.copy=function(){ this.count = this.inner.getX(); };
+Q.prototype.callSetter=function(){ this.inner.setX(); return this.inner.x; };
+Q.prototype.pushOne=function(v){ this.list.push(v); };
+Q.prototype.notFn=function(){ return this.inner.missing(); };
+Q.prototype.withArgs=function(a,b){ return this.inner.sum(a,b) + this.inner.diff(a,b); };
+P.prototype.setX=function(){ this.x = this.x + 1; };
+var qq=new Q(), qt=0; for (var m=0;m<300;m++){ qt += qq.innerX() + qq.innerDot(q) + qq.twoDeep() + qq.withArgs(m,1); qq.copy(); qq.pushOne(m); } r.push(qt, qq.count, qq.list.length, qq.list[299]);
+r.push(qq.callSetter(), qq.callSetter(), qq.inner.x);
+try { qq.notFn(); } catch(e) { r.push(e.constructor.name); }
+qq.inner=null; try { qq.innerX(); } catch(e) { r.push(e.constructor.name); }
+qq.inner={ getX: function(){ return 'other'; }, deep: function(){ return 'd'; } }; r.push(qq.innerX(), qq.twoDeep());
+var flip=new P(1,1), ft=0; for (var n=0;n<400;n++){ flip.items = (n%2) ? [n] : [,]; ft += flip.at(0) === undefined ? 1 : flip.at(0); } r.push(ft);
 const got = r.join();
-const expected = '10199,,,,,3,42,-42,3,1,proxied,true,true,false,true,false,true,true,false,true,true,false,true,2147483648,true,false,2147483648,a1,0.75,-2147483649,NaN,NaN,5,6,-13,true,true,false,object,object,true,true,,ReferenceError,7,11,21,505,TypeError,2,3,9,own0,5,5,,1,49,true,1,3,n,2,0,TypeError,5,g,1,TypeError,prim';
+const expected = '10199,,,,,3,42,-42,3,1,proxied,true,true,false,true,false,true,true,false,true,true,false,true,2147483648,true,false,2147483648,a1,0.75,-2147483649,NaN,NaN,5,6,-13,true,true,false,object,object,true,true,,ReferenceError,7,11,21,505,TypeError,2,3,9,own0,5,5,,1,49,true,1,3,n,2,0,TypeError,5,g,1,TypeError,prim,99900,2,300,299,3,4,4,TypeError,TypeError,other,d,40200';
 console.log(got === expected ? 'PASS leaf calls' : 'FAIL ' + got);
 if (got !== expected) throw new Error('leaf call regressions');
