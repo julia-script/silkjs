@@ -23,6 +23,7 @@ import js_core_types { ContextState, RuntimeState, ObjectData, ObjectPayload, Sh
   PropertySlot, NativeFunctionId, BuiltinFamily, FrameSlots }
 import js_gc { HeapHooks }
 import js_gc as gc
+import js_object_ref { ObjectRef }
 import js_owned_value { Value, ValueList, ValueRef, lendBits, immediateRef }
 import js_coercion_host { CoercionHooks }
 import js_property_host { OwnPropertyHooks }
@@ -52,9 +53,9 @@ import regexp_types { FLAG_GLOBAL, FLAG_STICKY, FLAG_UNICODE, FLAG_UNICODE_SETS,
 struct Results { inline: [ValueBits; 4], spill: ValueList, count: usize }
 impl Results {
   fn make() -> Self { return Results { inline: [ValueBits.Undefined; 4], spill: ValueList.make(), count: 0 } }
-  fn get(self: &Self, index: usize) -> ValueBits {
-    if index < 4 { return self.inline[index] }
-    return self.spill.get(index - 4)
+  fn borrow<'r>(self: &'r Self, index: usize) -> ValueRef<'r> {
+    if index < 4 { return unsafe lendBits(self, self.inline[index]) }
+    return self.spill.borrow(index - 4)
   }
   // A failed spill drops the value with the failure, as the source's cleanup does.
   effect fn append(self: &mut Self, value: Value) -> () ! OutOfMemoryError ? &mut Allocator {
@@ -374,8 +375,9 @@ effect fn substitutionBody<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H, 
 
 // Non-observable shape traversal: custom accessors/exotic prototypes must take
 // the generic path. Match the pinned source's checks, not a broader heuristic.
-unsafe fn findSlot(receiver: ValueBits, atom: u32, own: bool) -> Option<PropertySlot> {
-  let mut cursor = core.reference(receiver)
+// The receiver is lent, so it and every prototype reachable from it stay live.
+fn findSlot<'v>(receiver: ValueRef<'v>, atom: u32, own: bool) -> Option<PropertySlot> {
+  let mut cursor = core.reference(receiver.view())
   let anchor = ()
   while true {
     let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, cursor)
@@ -396,10 +398,10 @@ unsafe fn findSlot(receiver: ValueBits, atom: u32, own: bool) -> Option<Property
     if parent.isExotic() { return Option<PropertySlot>.none() }
   }
 }
-unsafe fn native(value: ValueBits, method: u32, magic: i32) -> bool {
-  if !value.isObject() { return false }
+fn native<'v>(value: ValueRef<'v>, method: u32, magic: i32) -> bool {
+  if !value.view().isObject() { return false }
   let anchor = ()
-  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(value))
+  let object = ObjectRef.of(value).data(&anchor)
   if object.classId() != classes.JS_CLASS_C_FUNCTION { return false }
   return match &object.payload {
     ObjectPayload.NativeFunction { function } => {
@@ -412,11 +414,12 @@ unsafe fn native(value: ValueBits, method: u32, magic: i32) -> bool {
     _ => false
   }
 }
-unsafe fn standardGetter(receiver: ValueBits, atom: u32, method: u32, magic: i32) -> bool {
-  match unsafe findSlot(receiver, atom, false) {
+fn standardGetter<'v>(receiver: ValueRef<'v>, atom: u32, method: u32, magic: i32) -> bool {
+  match findSlot(receiver, atom, false) {
     Option<PropertySlot>.Some { value: PropertySlot.GetterSetter { getter, .. } } => {
       match Pointer.nonNullMut<HeapHeader>(getter) {
-        Option<*mut HeapHeader>.Some { value } => { return unsafe native(ValueBits.Object { reference: value }, method, magic) }
+        // The slot that holds the getter keeps it alive while receiver is lent.
+        Option<*mut HeapHeader>.Some { value } => { return native(unsafe lendBits(&receiver, ValueBits.Object { reference: value }), method, magic) }
         Option<*mut HeapHeader>.None => ()
       }
     }
@@ -424,21 +427,21 @@ unsafe fn standardGetter(receiver: ValueBits, atom: u32, method: u32, magic: i32
   }
   return false
 }
-unsafe fn standard(receiver: ValueBits) -> bool {
-  if !unsafe support.regexp(receiver) { return false }
-  match unsafe findSlot(receiver, atoms.JS_ATOM_lastIndex, true) {
+fn standard<'v>(receiver: ValueRef<'v>) -> bool {
+  if !unsafe support.regexp(receiver.view()) { return false }
+  match findSlot(receiver, atoms.JS_ATOM_lastIndex, true) {
     Option<PropertySlot>.Some { value: PropertySlot.Value { value } } => {
       if value.tag() != 0 && value.tag() != 8 { return false }
     }
     _ => { return false }
   }
-  match unsafe findSlot(receiver, atoms.JS_ATOM_exec, false) {
-    Option<PropertySlot>.Some { value: PropertySlot.Value { value } } => { if !unsafe native(value, 7, 0) { return false } }
+  match findSlot(receiver, atoms.JS_ATOM_exec, false) {
+    Option<PropertySlot>.Some { value: PropertySlot.Value { value } } => { if !native(unsafe lendBits(&receiver, value), 7, 0) { return false } }
     _ => { return false }
   }
-  return unsafe standardGetter(receiver, atoms.JS_ATOM_flags, 3, 0) &&
-    unsafe standardGetter(receiver, atoms.JS_ATOM_global, 4, u32.toI32(FLAG_GLOBAL)) &&
-    unsafe standardGetter(receiver, atoms.JS_ATOM_unicode, 4, u32.toI32(FLAG_UNICODE))
+  return standardGetter(receiver, atoms.JS_ATOM_flags, 3, 0) &&
+    standardGetter(receiver, atoms.JS_ATOM_global, 4, u32.toI32(FLAG_GLOBAL)) &&
+    standardGetter(receiver, atoms.JS_ATOM_unicode, 4, u32.toI32(FLAG_UNICODE))
 }
 effect fn optimizedReplace<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + InterruptHooks>(hooks: &mut H,
   memory: &AllocationObserver, realm: Realm<'a>, receiver: ValueRef<'b>, string: ValueRef<'b>, replacement: ValueRef<'b>) -> ValueBits
@@ -539,13 +542,13 @@ effect fn optimizedCallbackReplace<'a, 'b, H: HeapHooks + CoercionHooks + OwnPro
     let mut i: usize = 0
     while i < CALLBACK_ARGUMENTS { unsafe support.release(&mut hooks, realm, argv[i]) i = i + 1 }
     let text = match move called {
-      Result<ValueBits, OutOfMemoryError | StringLengthError | JsException>.Success { value } => value
-      Result<ValueBits, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => { fail move error }
+      Result<Value, OutOfMemoryError | StringLengthError | JsException>.Success { value } => move value
+      Result<Value, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => { fail move error }
     }
     let start = i32.toI64(found.get(base))
     let appended = run Effect.result(builder.appendRange(&mut hooks, realm, string, nextSource, start))
-    let replaced = run Effect.result(builder.append(&mut hooks, realm, unsafe lendBits(&text, text)))
-    unsafe support.release(&mut hooks, realm, text)
+    let replaced = run Effect.result(builder.append(&mut hooks, realm, text.borrow()))
+    drop text
     match move appended { Result<bool, JsException>.Success { .. } => () Result<bool, JsException>.Failure { error } => { fail move error } }
     match move replaced { Result<bool, JsException>.Success { .. } => () Result<bool, JsException>.Failure { error } => { fail move error } }
     nextSource = i32.toI64(found.get(base + 1))
@@ -557,7 +560,7 @@ effect fn optimizedCallbackReplace<'a, 'b, H: HeapHooks + CoercionHooks + OwnPro
 // Fills argv with owned callback arguments for one match and returns the
 // callback's result as an owned string. The caller releases argv either way.
 effect fn callbackReplacement<'a, 'b, H: HeapHooks + CoercionHooks + CallHooks>(hooks: &mut H, realm: Realm<'a>,
-  replacement: ValueRef<'b>, string: ValueRef<'b>, captures: &[i32], argv: &mut [ValueBits; 16]) -> ValueBits
+  replacement: ValueRef<'b>, string: ValueRef<'b>, captures: &[i32], argv: &mut [ValueBits; 16]) -> Value
   ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
   let pairs = captures.length / 2
   let mut n: usize = 0
@@ -571,7 +574,7 @@ effect fn callbackReplacement<'a, 'b, H: HeapHooks + CoercionHooks + CallHooks>(
   argv[n + 1] = unsafe string.view().retained()
   let args = FrameSlots { data: Pointer.fromMutRef<ValueBits>(&mut argv[0]), count: n + 2 }
   let called = run unsafe calls.call(&mut hooks, realm, replacement, immediateRef(ValueBits.Undefined), &args)
-  return (run stringFree(&mut hooks, realm, move called)).intoBits()
+  return run stringFree(&mut hooks, realm, move called)
 }
 effect fn matchBody<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + CallHooks + InterruptHooks>(hooks: &mut H,
   memory: &AllocationObserver, realm: Realm<'a>, receiver: ValueRef<'b>, input: ValueRef<'b>) -> ValueBits
@@ -628,11 +631,11 @@ effect fn searchBody<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + P
 // Whether split may search with the receiver's own bytecode: the splitter is a
 // default-constructed RegExp with the builtin exec whose flags are the
 // receiver's plus sticky. Unicode modes keep the per-position loop.
-unsafe fn searchableSplitter(receiver: ValueBits, constructor: ValueBits, splitter: ValueBits, defaultCtor: ValueBits) -> bool {
-  if !unsafe core.sameValue(constructor, defaultCtor) || !unsafe support.regexp(receiver) || !unsafe standard(splitter) { return false }
-  let flags = unsafe support.flags(receiver)
+fn searchableSplitter<'v>(receiver: ValueRef<'v>, constructor: ValueRef<'v>, splitter: ValueRef<'v>, defaultCtor: ValueBits) -> bool {
+  if !unsafe core.sameValue(constructor.view(), defaultCtor) || !unsafe support.regexp(receiver.view()) || !standard(splitter) { return false }
+  let flags = unsafe support.flags(receiver.view())
   if (flags & (FLAG_STICKY | FLAG_UNICODE | FLAG_UNICODE_SETS)) != 0 { return false }
-  return unsafe support.flags(splitter) == (flags | FLAG_STICKY)
+  return unsafe support.flags(splitter.view()) == (flags | FLAG_STICKY)
 }
 effect fn splitBody<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + CallHooks + InterruptHooks>(hooks: &mut H,
   memory: &AllocationObserver, realm: Realm<'a>, receiver: ValueRef<'b>, input: ValueRef<'b>, limit: ValueRef<'b>) -> ValueBits
@@ -661,7 +664,7 @@ effect fn splitBody<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + Pr
     let result = run execution.regExpExec(&mut hooks, memory, realm, splitter.borrow(), text.borrow())
     if result.view().tag() != 2 { return array.intoBits() }
   }
-  if size > 0 && unsafe searchableSplitter(receiver.view(), constructor.view(), splitter.view(), defaultCtor) {
+  if size > 0 && searchableSplitter(receiver, constructor.borrow(), splitter.borrow(), defaultCtor) {
     // The sticky loop below tries each q in turn; the first q that matches is
     // the leftmost match a forward search from q finds with the receiver's
     // non-sticky bytecode. The splitter is private, so its lastIndex writes
@@ -737,11 +740,11 @@ effect fn replaceBody<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + 
   let functional = hooks.isCallable(realm, replacement)
   let mut replaceText = Value.immediate(ValueBits.Undefined)
   if !functional { replaceText = run support.string(&mut hooks, realm, replacement) }
-  if !functional && unsafe standard(receiver.view()) {
+  if !functional && standard(receiver) {
     let optimized = run optimizedReplace(&mut hooks, memory, realm, receiver, text.borrow(), replaceText.borrow())
     if optimized.tag() != 3 { return optimized }
   }
-  if functional && unsafe standard(receiver.view()) {
+  if functional && standard(receiver) {
     let optimized = run optimizedCallbackReplace(&mut hooks, memory, realm, receiver, text.borrow(), replacement)
     if optimized.tag() != 3 { return optimized }
   }
@@ -762,10 +765,9 @@ effect fn replaceGeneric<'a, 'b, 'c, H: HeapHooks + OwnPropertyHooks + CoercionH
   while true {
     let result = run execution.regExpExec(&mut hooks, memory, realm, receiver, text)
     if result.view().tag() == 2 { break }
-    let resultBits = result.view()
     run results.append(move result)
     if !global { break }
-    let matched = run getIndex(&mut hooks, realm, unsafe lendBits(&resultBits, resultBits), 0)
+    let matched = run getIndex(&mut hooks, realm, results.borrow(results.count - 1), 0)
     let matchedText = run stringFree(&mut hooks, realm, move matched)
     if Strings.length(matchedText.view()) == 0 { run advanceEmpty(&mut hooks, realm, receiver, text, fullUnicode) }
   }
@@ -774,22 +776,22 @@ effect fn replaceGeneric<'a, 'b, 'c, H: HeapHooks + OwnPropertyHooks + CoercionH
   let mut builder = ReplacementBuffer.make()
   let mut j: usize = 0
   while j < results.count {
-    let result = results.get(j)
-    let captureCount = run propertyLength(&mut hooks, realm, unsafe lendBits(&result, result), atoms.JS_ATOM_length, true)
-    let matchedValue = run getIndex(&mut hooks, realm, unsafe lendBits(&result, result), 0)
+    let result = results.borrow(j)
+    let captureCount = run propertyLength(&mut hooks, realm, result, atoms.JS_ATOM_length, true)
+    let matchedValue = run getIndex(&mut hooks, realm, result, 0)
     let matched = run stringFree(&mut hooks, realm, move matchedValue)
-    let mut position = run propertyLength(&mut hooks, realm, unsafe lendBits(&result, result), atoms.JS_ATOM_index, false)
+    let mut position = run propertyLength(&mut hooks, realm, result, atoms.JS_ATOM_index, false)
     if position > length { position = length }
     let captures = run support.array(&mut hooks, memory, realm)
     run support.defineIndex(&mut hooks, realm, captures.borrow(), 0, matched.dup())
     let mut n: i64 = 1
     while n < captureCount {
-      let mut capture = run getIndex(&mut hooks, realm, unsafe lendBits(&result, result), n)
+      let mut capture = run getIndex(&mut hooks, realm, result, n)
       if capture.view().tag() != 3 { let current = move capture capture = run stringFree(&mut hooks, realm, move current) }
       run support.defineIndex(&mut hooks, realm, captures.borrow(), n, move capture)
       n = n + 1
     }
-    let groups = run support.get(&mut hooks, realm, unsafe lendBits(&result, result), atoms.JS_ATOM_groups)
+    let groups = run support.get(&mut hooks, realm, result, atoms.JS_ATOM_groups)
     let mut replaced = Value.immediate(ValueBits.Undefined)
     if functional {
       run support.defineIndex(&mut hooks, realm, captures.borrow(), n, Value.immediate(number(position)))
