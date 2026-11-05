@@ -1599,6 +1599,26 @@ fn findCell(cells: &[?*mut HeapHeader; 16], count: usize, cell: ?*mut HeapHeader
   while i < count { if same(cells[i], cell) { return i } i = i + 1 }
   return count
 }
+/// Numbers each captured cell (VarRef.frameIndex = index + 1), or clears them.
+unsafe fn numberCells(cells: &[?*mut HeapHeader; 16], total: usize, numbered: bool) -> () {
+  let mut i: usize = 0
+  while i < total {
+    let mut anchor = ()
+    let reference = unsafe HeapCell.payloadMut<VarRef, ()>(&mut anchor, unsafe nonnull(cells[i]))
+    reference.frameIndex = 0
+    if numbered { reference.frameIndex = usize.toU8(i + 1) }
+    i = i + 1
+  }
+}
+/// The index of cell among numbered cells, or total when it is not one of them.
+@inlineAlways
+unsafe fn numberedCell(cells: &[?*mut HeapHeader; 16], total: usize, cell: ?*mut HeapHeader) -> usize {
+  if Pointer.isNull<HeapHeader>(cell) { return total }
+  let anchor = ()
+  let index = u8.toUsize((unsafe HeapCell.payload<VarRef, ()>(&anchor, unsafe nonnull(cell))).frameIndex)
+  if index == 0 || index > total || !same(cells[index - 1], cell) { return total }
+  return index - 1
+}
 /// Run after a returning frame released its slots: frees the cycles made only
 /// of the cells it captured and the closures they hold, the common shape of a
 /// recursive local function (closure -> captured cell -> closure). Trial
@@ -1626,82 +1646,97 @@ pub unsafe fn releaseFrameCycles<H: HeapHooks>(hooks: &mut H, runtime: *mut Heap
     i = i + 1
   }
   if closureCount != 0 {
-    // Edges inside the set: closure -> captured cell, cell -> closure.
-    let mut cellEdges: [i32; 16] = [0; 16]
+    // A closure is live when references from outside the set remain: its count
+    // exceeds the cells in the set that hold it. With every closure live no
+    // cell can die (a cell only dies by dropping a dead closure), the usual
+    // case for closures that escape.
     let mut closureEdges: [i32; 16] = [0; 16]
-    let anchor = ()
-    let mut j: usize = 0
-    while j < closureCount {
-      let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, unsafe nonnull(closures[j]))
-      match &data.payload {
-        ObjectPayload.BytecodeFunction { function } => {
-          let mut k: usize = 0
-          while k < function.varRefs.length() {
-            let at = findCell(&captures.cells, total, function.varRefs.get(k))
-            if at < total { cellEdges[at] = cellEdges[at] + 1 }
-            k = k + 1
-          }
-        }
-        _ => ()
-      }
-      j = j + 1
-    }
     i = 0
     while i < total { if owner[i] < 16 { closureEdges[owner[i]] = closureEdges[owner[i]] + 1 } i = i + 1 }
-    let mut cellLive: [bool; 16] = [false; 16]
     let mut closureLive: [bool; 16] = [false; 16]
-    i = 0
-    while i < total { cellLive[i] = owner[i] >= 16 || unsafe count(unsafe nonnull(captures.cells[i])) - 1 > cellEdges[i] i = i + 1 }
-    j = 0
-    while j < closureCount { closureLive[j] = unsafe count(unsafe nonnull(closures[j])) > closureEdges[j] j = j + 1 }
-    // Liveness flows along the set's edges until nothing changes.
-    let mut changed = true
-    while changed {
-      changed = false
-      i = 0
-      while i < total {
-        if cellLive[i] && owner[i] < 16 && !closureLive[owner[i]] { closureLive[owner[i]] = true changed = true }
-        i = i + 1
-      }
-      j = 0
-      while j < closureCount {
-        if closureLive[j] {
-          let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, unsafe nonnull(closures[j]))
-          match &data.payload {
-            ObjectPayload.BytecodeFunction { function } => {
-              let mut k: usize = 0
-              while k < function.varRefs.length() {
-                let at = findCell(&captures.cells, total, function.varRefs.get(k))
-                if at < total && !cellLive[at] { cellLive[at] = true changed = true }
-                k = k + 1
-              }
-            }
-            _ => ()
-          }
-        }
-        j = j + 1
-      }
+    let mut anyDead = false
+    let mut j: usize = 0
+    while j < closureCount {
+      closureLive[j] = unsafe count(unsafe nonnull(closures[j])) > closureEdges[j]
+      if !closureLive[j] { anyDead = true }
+      j = j + 1
     }
-    // Dead cells give up their closures; the cells themselves die when the
-    // closures and captures' retains are released.
-    let mut dropped: [ValueBits; 16] = [ValueBits.Undefined; 16]
-    let mut droppedCount: usize = 0
-    i = 0
-    while i < total {
-      if !cellLive[i] && owner[i] < 16 {
-        let mut cellAnchor = ()
-        let reference = unsafe HeapCell.payloadMut<VarRef, ()>(&mut cellAnchor, unsafe nonnull(captures.cells[i]))
-        match reference.state { VarRefState.Detached { value } => { dropped[droppedCount] = value droppedCount = droppedCount + 1 } _ => () }
-        reference.state = VarRefState.Detached { value: ValueBits.Undefined }
-      }
-      i = i + 1
-    }
-    i = 0
-    while i < droppedCount { unsafe release(&mut hooks, runtime, dropped[i]) i = i + 1 }
+    if anyDead { unsafe dropDeadCycles(&mut hooks, runtime, &captures.cells, total, &closures, closureCount, &owner, &mut closureLive) }
   }
   i = 0
   while i < total { unsafe releaseHeader(&mut hooks, runtime, unsafe nonnull(captures.cells[i])) i = i + 1 }
   captures.count = 0
+}
+/// The edges closure -> captured cell inside the set, read once. More than
+/// FRAME_CYCLE_EDGES and the set is left to the cycle collector.
+const FRAME_CYCLE_EDGES: usize = 48
+/// releaseFrameCycles once some closure has no reference from outside the set:
+/// finds what the live members reach and clears the cells left dead.
+@inlineNever
+unsafe fn dropDeadCycles<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, cells: &[?*mut HeapHeader; 16], total: usize,
+  closures: &[?*mut HeapHeader; 16], closureCount: usize, owner: &[usize; 16], closureLive: &mut [bool; 16]) -> () {
+  let mut edgeFrom: [u8; 48] = [0; 48]
+  let mut edgeTo: [u8; 48] = [0; 48]
+  let mut edges: usize = 0
+  let mut cellEdges: [i32; 16] = [0; 16]
+  let anchor = ()
+  unsafe numberCells(&cells, total, true)
+  let mut j: usize = 0
+  while j < closureCount {
+    let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, unsafe nonnull(closures[j]))
+    match &data.payload {
+      ObjectPayload.BytecodeFunction { function } => {
+        let mut k: usize = 0
+        while k < function.varRefs.length() {
+          let at = unsafe numberedCell(&cells, total, function.varRefs.get(k))
+          if at < total {
+            if edges == FRAME_CYCLE_EDGES { unsafe numberCells(&cells, total, false) return () }
+            cellEdges[at] = cellEdges[at] + 1
+            edgeFrom[edges] = usize.toU8(j) edgeTo[edges] = usize.toU8(at) edges = edges + 1
+          }
+          k = k + 1
+        }
+      }
+      _ => ()
+    }
+    j = j + 1
+  }
+  unsafe numberCells(&cells, total, false)
+  let mut cellLive: [bool; 16] = [false; 16]
+  let mut i: usize = 0
+  while i < total { cellLive[i] = owner[i] >= 16 || unsafe count(unsafe nonnull(cells[i])) - 1 > cellEdges[i] i = i + 1 }
+  // Liveness flows along the set's edges until nothing changes.
+  let mut changed = true
+  while changed {
+    changed = false
+    i = 0
+    while i < total {
+      if cellLive[i] && owner[i] < 16 && !closureLive[owner[i]] { closureLive[owner[i]] = true changed = true }
+      i = i + 1
+    }
+    let mut e: usize = 0
+    while e < edges {
+      let to = u8.toUsize(edgeTo[e])
+      if closureLive[u8.toUsize(edgeFrom[e])] && !cellLive[to] { cellLive[to] = true changed = true }
+      e = e + 1
+    }
+  }
+  // Dead cells give up their closures; the cells themselves die when the
+  // closures and captures' retains are released.
+  let mut dropped: [ValueBits; 16] = [ValueBits.Undefined; 16]
+  let mut droppedCount: usize = 0
+  i = 0
+  while i < total {
+    if !cellLive[i] && owner[i] < 16 {
+      let mut cellAnchor = ()
+      let reference = unsafe HeapCell.payloadMut<VarRef, ()>(&mut cellAnchor, unsafe nonnull(cells[i]))
+      match reference.state { VarRefState.Detached { value } => { dropped[droppedCount] = value droppedCount = droppedCount + 1 } _ => () }
+      reference.state = VarRefState.Detached { value: ValueBits.Undefined }
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < droppedCount { unsafe release(&mut hooks, runtime, dropped[i]) i = i + 1 }
 }
 
 unsafe fn releaseAtom(runtime: *mut HeapHeader, atom: u32) -> () {
