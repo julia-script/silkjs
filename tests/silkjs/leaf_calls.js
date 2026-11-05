@@ -89,7 +89,19 @@ var holdsK={ K: K }; try { holdsK.K(); r.push('no'); } catch(e) { r.push(e.const
 function newTargetless(){ return new.target === undefined; } r.push(newTargetless());
 function countArgs(){ return arguments.length; } r.push(countArgs(1,2,3));
 var boundGet=function(){ return this.v; }.bind({v: 9}); r.push(boundGet());
+function SC(d){ this.d=d; this.a=1; this.b=2; }
+SC.prototype.ex=function(){ if (this.d == 1) { this.b = this.a * 3 + 1; } else { this.a = this.b - 1; } };
+SC.prototype.tail=function(c){ if (c) { this.a = 7; } else { this.b = 8; } return 5; };
+var sc1=new SC(1), sc2=new SC(0), sct=0; for (var u=0;u<200;u++){ sc1.a=u; sc1.ex(); sc2.b=u; sc2.ex(); sct += sc1.b + sc2.a + sc1.tail(u%2); } r.push(sct, sc1.a, sc2.b);
+var scf=Object.freeze(new SC(1)); scf.ex(); r.push(scf.b);
+var scs=new SC(0); Object.defineProperty(scs, 'a', { set: function(v){ this.seen = v; }, get: function(){ return 'g'; } }); scs.ex(); r.push(scs.seen, scs.a);
+function mkGet(k){ var o={ get: function(){ return k; }, bump: function(){ k = k + 1; } }; return o; }
+var cg=mkGet(3), cgt=0; for (var u2=0;u2<100;u2++){ cgt += cg.get(); if (u2 % 10 == 0) cg.bump(); } r.push(cgt);
+function tdzRead(){ var f=function(){ return late; }; var out; try { out = f(); } catch(e) { out = e.constructor.name; } let late = 4; return out + f(); }
+r.push(tdzRead(), tdzRead());
+function dv(a,b){ return a / b; }
+var dvs=[]; for (var u3=0;u3<3;u3++){ dvs.push(dv(6,3), dv(1,2), dv(1,0), dv(-1,0), dv(0,-5), 1/dv(0,-5), dv(7.5,2.5), dv(3,1.5), dv('6',2), dv(0,0)); } r.push(dvs.join(':'));
 const got = r.join();
-const expected = '10199,,,,,3,42,-42,3,1,proxied,true,true,false,true,false,true,true,false,true,true,false,true,2147483648,true,false,2147483648,a1,0.75,-2147483649,NaN,NaN,5,6,-13,true,true,false,object,object,true,true,,ReferenceError,7,11,21,505,TypeError,2,3,9,own0,5,5,,1,49,true,1,3,n,2,0,TypeError,5,g,1,TypeError,prim,99900,2,300,299,3,4,4,TypeError,TypeError,other,d,40200,//3/undefined/1//u/number///3/undefined/1//u/number///3/undefined/1//u/number,TypeError,TypeError,true,3,9';
+const expected = '10199,,,,,3,42,-42,3,1,proxied,true,true,false,true,false,true,true,false,true,true,false,true,2147483648,true,false,2147483648,a1,0.75,-2147483649,NaN,NaN,5,6,-13,true,true,false,object,object,true,true,,ReferenceError,7,11,21,505,TypeError,2,3,9,own0,5,5,,1,49,true,1,3,n,2,0,TypeError,5,g,1,TypeError,prim,99900,2,300,299,3,4,4,TypeError,TypeError,other,d,40200,//3/undefined/1//u/number///3/undefined/1//u/number///3/undefined/1//u/number,TypeError,TypeError,true,3,9,80600,7,199,2,1,g,840,ReferenceError4,ReferenceError4,2:0.5:Infinity:-Infinity:0:-Infinity:3:2:3:NaN:2:0.5:Infinity:-Infinity:0:-Infinity:3:2:3:NaN:2:0.5:Infinity:-Infinity:0:-Infinity:3:2:3:NaN';
 console.log(got === expected ? 'PASS leaf calls' : 'FAIL ' + got);
 if (got !== expected) throw new Error('leaf call regressions');
