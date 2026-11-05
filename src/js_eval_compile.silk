@@ -1,14 +1,14 @@
 //! Source setup and compilation, quickjs.c:38019-38132. Compiler trees and
 //! newly loaded module roots are torn down only after installing the exception.
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.effect { Effect }
-import silk.result { Result }
-import silk.option { Option }
-import silk.pointer { Pointer }
-import silk.slice { Slice }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.mem.pointer { Pointer }
+import silk.collections.slice { Slice }
 import js_heap { HeapCell, HeapHeader }
 import js_core_types { RuntimeState, FunctionBytecode, FunctionKind, ObjectData, ObjectPayload,
-  StackFrame, ModuleDef, JS_MODE_STRICT }
+  StackFrame, ModuleDef, FunctionDebugInfo, JS_MODE_STRICT }
 import js_value { Value }
 import js_gc { HeapHooks }
 import js_gc as gc
@@ -35,7 +35,10 @@ import js_module_metadata as modules
 import js_module_loader as loader
 import js_eval_errors as errors
 import js_atom_data as atoms
+import js_backtrace as backtrace
+import js_module_native as hostModules
 import runtime_memory { AllocationObserver }
+import js_source_comments { SourceComments }
 
 pub const TYPE_GLOBAL: i32 = 0
 pub const TYPE_MODULE: i32 = 1
@@ -46,6 +49,36 @@ pub const FLAG_STRICT: i32 = 8
 pub const FLAG_COMPILE_ONLY: i32 = 32
 pub const FLAG_BACKTRACE_BARRIER: i32 = 64
 pub const FLAG_ASYNC: i32 = 128
+/// Validate isolated function-body token boundaries without generating a closure.
+/// Returns Undefined; the caller must still compile the complete parameter/body form.
+pub const FLAG_VALIDATE_FUNCTION_BODY: i32 = 256
+// Syntax validation assembles bindings/bytecode but never resolves dependencies.
+// These internal modes do not change FLAG_COMPILE_ONLY's linking contract.
+const FLAG_SYNTAX_ONLY: i32 = 512
+const FLAG_COMMONJS_BODY: i32 = 1024
+// Host VM diagnostics use ECMAScript line terminators/UTF-16 columns, while
+// ordinary QuickJS parser diagnostics keep their original coordinate policy.
+pub const FLAG_NODE_VM_DIAGNOSTICS: i32 = 2048
+// Embedders stage asynchronous dependency callbacks before native linking.
+pub const FLAG_UNLINKED_MODULE: i32 = 4096
+/// The embedding supplies original source after compilation (for wrappers).
+pub const FLAG_DEFER_HOST_SOURCE: i32 = 8192
+/// Preserve executable PCs and live lexical environments for owner-thread debugging.
+pub const FLAG_DEBUGGER: i32 = 16384
+unsafe fn vmCaller(context: *mut HeapHeader) -> bool {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, unsafe runtime.contextRuntime(context))
+  let mut pointer = state.currentStackFrame drop state
+  while let Option<*mut StackFrame>.Some { value: current } = Pointer.nonNullMut<StackFrame>(pointer) {
+    let frame = unsafe Pointer.borrow<(), StackFrame>(&anchor, current)
+    pointer = frame.previous
+    if let Option<*mut HeapHeader>.Some { value: reference } = unsafe backtrace.bytecode(frame.currentFunction) {
+      let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference)
+      return match &code.debug { Option<FunctionDebugInfo>.Some { value: debug } => debug.nodeVm _ => false }
+    }
+  }
+  return false
+}
 fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
 pub fn present(value: ?*mut HeapHeader) -> *mut HeapHeader {
   return match Pointer.nonNullMut<HeapHeader>(value) { Option<*mut HeapHeader>.Some { value: found } => found _ => invariant() }
@@ -61,12 +94,14 @@ pub unsafe fn frameBytecode(frame: *mut StackFrame) -> *mut HeapHeader {
   return match &object.payload { ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode _ => invariant() }
 }
 unsafe effect fn parse<H: HeapHooks + ModuleAttributeHooks>(hooks: &mut H, memory: &AllocationObserver,
-  cell: *mut HeapHeader, source: &[u8], module: bool) -> ()
+  cell: *mut HeapHeader, source: &[u8], module: bool, comments: &mut SourceComments) -> ()
   ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow | CompilerError | JsException ? &mut Allocator {
   let mut parser = run unsafe Parser.make(source, cell, module, !module)
   let parsed = run Effect.result(unsafe parseProgram(&mut parser, &mut hooks, memory))
   match move parsed {
-    Result<(), OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException>.Success { .. } => ()
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException>.Success { .. } => {
+      comments.* = parser.lexer.sourceComments
+    }
     Result<(), OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException>.Failure { error } => {
       match move error {
         LexError lexical => { fail run parser.lexicalError(move lexical) }
@@ -90,7 +125,7 @@ unsafe effect fn parse<H: HeapHooks + ModuleAttributeHooks>(hooks: &mut H, memor
 unsafe effect fn body<H: HeapHooks + CoercionHooks + ModuleHostHooks + ModuleAttributeHooks>(hooks: &mut H,
   memory: &AllocationObserver, context: *mut HeapHeader, source: &[u8], filename: &[u8], flags: i32,
   scope: i32, frame: ?*mut StackFrame, root: &mut ?*mut HeapHeader, module: &mut ?*mut HeapHeader,
-  cache: *mut SourcePositionCache) -> Value
+  cache: *mut SourcePositionCache, comments: &mut SourceComments) -> Value
   ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow | CompilerError | BytecodeError | JsException ? &mut Allocator {
   let rt = unsafe runtime.contextRuntime(context) let evalType = flags & TYPE_MASK
   let mut anchor = () let mut ra = ()
@@ -116,30 +151,68 @@ unsafe effect fn body<H: HeapHooks + CoercionHooks + ModuleHostHooks + ModuleAtt
   let fd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
   let evalState = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ra, rt)
   fd.evalType = evalType fd.hasThisBinding = evalType != TYPE_DIRECT
+  fd.nodeVmDiagnostics = (flags & FLAG_NODE_VM_DIAGNOSTICS) != 0
+  fd.debuggerMetadata.enabled = (flags & FLAG_DEBUGGER) != 0 || evalState.debugger.metadataEnabled || evalState.coverage.enabled
+  fd.deferModuleAttributes = (flags & FLAG_UNLINKED_MODULE) != 0
   fd.argumentsAllowed = true fd.functionName = evalState.atoms.duplicate(atoms.JS_ATOM__eval_)
   fd.module = module.*
   if (flags & FLAG_STRICT) != 0 || evalType == TYPE_MODULE { fd.jsMode = JS_MODE_STRICT }
   if evalType == TYPE_DIRECT {
     let sf = match Pointer.nonNullMut<StackFrame>(frame) { Option<*mut StackFrame>.Some { value } => value _ => invariant() }
     let ba = () let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&ba, unsafe frameBytecode(sf))
+    fd.debuggerMetadata.enabled = fd.debuggerMetadata.enabled || bytecode.debuggerMetadata.enabled
     fd.jsMode = bytecode.mode fd.newTargetAllowed = bytecode.newTargetAllowed
     fd.superCallAllowed = bytecode.superCallAllowed fd.superAllowed = bytecode.superAllowed
     fd.argumentsAllowed = bytecode.argumentsAllowed
     run variables.addClosureVariables(&mut fd, &mut evalState.atoms, &bytecode.*, scope)
   }
   if evalType == TYPE_MODULE || (flags & FLAG_ASYNC) != 0 { fd.inFunctionBody = true fd.functionKind = FunctionKind.Async }
+  if (flags & FLAG_VALIDATE_FUNCTION_BODY) != 0 {
+    fd.isEval = false fd.inFunctionBody = true fd.newTargetAllowed = true
+    fd.hasArgumentsBinding = true
+  }
+  if (flags & FLAG_COMMONJS_BODY) != 0 {
+    // Use the real function-body parser and parameter bindings, without copying
+    // source into a textual wrapper (which could permit closing-brace injection).
+    fd.hasSimpleParameterList = true
+    let names: [&[u8]; 5] = [b"exports", b"require", b"module", b"__filename", b"__dirname"]
+    let mut index: usize = 0
+    while index < names.length {
+      let name = run evalState.atoms.internUtf8(names[index])
+      let added = run Effect.result(state.addArg(&mut fd, &mut evalState.atoms, name))
+      evalState.atoms.release(name)
+      match move added {
+        Result<i32, OutOfMemoryError | StringLengthError | CompilerError>.Success { .. } => ()
+        Result<i32, OutOfMemoryError | StringLengthError | CompilerError>.Failure { error } => { fail move error }
+      }
+      index = index + 1
+    }
+  }
   let level = run emit.pushScope(&mut fd) fd.bodyScope = level drop evalState drop fd
-  run unsafe parse(&mut hooks, memory, cell, source, evalType == TYPE_MODULE)
+  run unsafe parse(&mut hooks, memory, cell, source, evalType == TYPE_MODULE, &mut comments)
+  if (flags & FLAG_VALIDATE_FUNCTION_BODY) != 0 {
+    root.* = Pointer.null<HeapHeader>()
+    unsafe state.destroyFunction(&mut hooks, cell)
+    return Value.Undefined
+  }
   if evalType == TYPE_MODULE {
     let fd = unsafe HeapCell.payload<FunctionDef, ()>(&anchor, cell) let await = fd.hasAwait drop fd
     let data = unsafe HeapCell.payloadMut<ModuleDef, ()>(&mut anchor, present(module.*)) data.hasTopLevelAwait = await
   }
   root.* = Pointer.null<HeapHeader>()
   let compiled = run unsafe finish.createFunction(&mut hooks, cell, source)
+  if (flags & FLAG_SYNTAX_ONLY) != 0 {
+    unsafe gc.release(&mut hooks, rt, compiled)
+    if !Pointer.isNull<HeapHeader>(module.*) {
+      unsafe gc.releaseHeader(&mut hooks, rt, present(module.*))
+      module.* = Pointer.null<HeapHeader>()
+    }
+    return Value.Undefined
+  }
   if evalType != TYPE_MODULE { return compiled }
   let moduleHeader = present(module.*)
   let data = unsafe HeapCell.payloadMut<ModuleDef, ()>(&mut anchor, moduleHeader) data.functionObject = compiled drop data
-  run unsafe loader.resolveModule(&mut hooks, context, moduleHeader)
+  if (flags & FLAG_UNLINKED_MODULE) == 0 { run unsafe loader.resolveModule(&mut hooks, context, moduleHeader) }
   unsafe HeapCell.retain(moduleHeader)
   return Value.Module { reference: moduleHeader }
 }
@@ -148,17 +221,134 @@ unsafe effect fn body<H: HeapHooks + CoercionHooks + ModuleHostHooks + ModuleAtt
 pub unsafe effect fn compile<H: HeapHooks + CoercionHooks + ErrorHooks + ModuleHostHooks + ModuleAttributeHooks>(hooks: &mut H,
   memory: &AllocationObserver, context: *mut HeapHeader, source: &[u8], filename: &[u8], flags: i32,
   scope: i32, frame: ?*mut StackFrame) -> Value ! JsException ? &mut Allocator {
+  let evalType = flags & TYPE_MASK
+  let effectiveFlags = if (evalType == TYPE_DIRECT || evalType == TYPE_INDIRECT) && unsafe vmCaller(context) {
+    flags | FLAG_NODE_VM_DIAGNOSTICS
+  } else { flags }
   let mut root = Pointer.null<HeapHeader>() let mut module = Pointer.null<HeapHeader>()
   let mut cache = SourcePositionCache.make()
-  let compiled = run Effect.result(unsafe body(&mut hooks, memory, context, source, filename, flags, scope,
-    frame, &mut root, &mut module, Pointer.fromMutRef<SourcePositionCache>(&mut cache)))
+  let mut comments = SourceComments.make()
+  let compiled = run Effect.result(unsafe body(&mut hooks, memory, context, source, filename, effectiveFlags, scope,
+    frame, &mut root, &mut module, Pointer.fromMutRef<SourcePositionCache>(&mut cache), &mut comments))
   match move compiled {
-    Result<Value, OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow | CompilerError | BytecodeError | JsException>.Success { value } => { return value }
+    Result<Value, OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow | CompilerError | BytecodeError | JsException>.Success { value } => {
+      let observed = run Effect.result(unsafe hooks.compiledSource(context, value, source, filename, effectiveFlags,
+        Slice.view(source, comments.sourceURLStart, comments.sourceURLEnd - comments.sourceURLStart),
+        Slice.view(source, comments.sourceMapStart, comments.sourceMapEnd - comments.sourceMapStart)))
+      if let Result<(), OutOfMemoryError | JsException>.Failure { error } = move observed {
+        unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), value)
+        if !Pointer.isNull<HeapHeader>(module) { unsafe gc.releaseHeader(&mut hooks, unsafe runtime.contextRuntime(context), present(module)) }
+        return run unsafe errors.materialize<Value, H>(&mut hooks, context, move error)
+      }
+      if evalType == TYPE_DIRECT || evalType == TYPE_INDIRECT {
+        if let Option<*mut HeapHeader>.Some { value: caller } = Pointer.nonNullMut<HeapHeader>(unsafe hostModules.currentBytecode(context)) {
+          let anchor = () let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, caller)
+          let callback = code.hostImport drop code
+          if callback.isObject() {
+            let configured = run Effect.result(unsafe hostModules.configureHostCallbacks(&mut hooks, context, value, callback, Value.Undefined))
+            if let Result<(), JsException>.Failure { error } = move configured {
+              unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), value) fail move error
+            }
+          }
+        }
+      }
+      return value
+    }
     Result<Value, OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow | CompilerError | BytecodeError | JsException>.Failure { error } => {
+      let pending = match move error {
+        SyntaxError diagnostic => {
+          let mut adjusted = move diagnostic
+          if (effectiveFlags & FLAG_NODE_VM_DIAGNOSTICS) != 0 && adjusted.location.line != 0 {
+            let mut coordinates = SourcePositionCache.make()
+            let position = coordinates.locateEcma(source, adjusted.offset)
+            adjusted.location.line = position.line + 1
+            adjusted.location.column = position.column + 1
+          }
+          run Effect.catch<JsException>(unsafe errors.compilation<Value, H>(&mut hooks, memory, context, move adjusted), errors.exceptionValue)
+        }
+        OutOfMemoryError allocation => run Effect.catch<JsException>(unsafe errors.compilation<Value, H>(&mut hooks, memory, context, move allocation), errors.exceptionValue)
+        StringLengthError string => run Effect.catch<JsException>(unsafe errors.compilation<Value, H>(&mut hooks, memory, context, move string), errors.exceptionValue)
+        BigIntError bigint => run Effect.catch<JsException>(unsafe errors.compilation<Value, H>(&mut hooks, memory, context, move bigint), errors.exceptionValue)
+        ParserStackOverflow overflow => run Effect.catch<JsException>(unsafe errors.compilation<Value, H>(&mut hooks, memory, context, move overflow), errors.exceptionValue)
+        CompilerError diagnostic => run Effect.catch<JsException>(unsafe errors.compilation<Value, H>(&mut hooks, memory, context, move diagnostic), errors.exceptionValue)
+        BytecodeError diagnostic => run Effect.catch<JsException>(unsafe errors.compilation<Value, H>(&mut hooks, memory, context, move diagnostic), errors.exceptionValue)
+        JsException exception => run Effect.catch<JsException>(unsafe errors.compilation<Value, H>(&mut hooks, memory, context, move exception), errors.exceptionValue)
+      }
+      if !Pointer.isNull<HeapHeader>(root) { unsafe state.destroyFunction(&mut hooks, present(root)) }
+      if !Pointer.isNull<HeapHeader>(module) { unsafe gc.releaseHeader(&mut hooks, unsafe runtime.contextRuntime(context), present(module)) }
+      fail JsException {}
+    }
+  }
+}
+
+/// Validate complete script/module bindings without resolving imports, evaluating
+/// source, or retaining a module in the context's loaded-module registry.
+pub unsafe effect fn checkSyntax<H: HeapHooks + CoercionHooks + ErrorHooks + ModuleHostHooks + ModuleAttributeHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, source: &[u8], filename: &[u8], module: bool) -> ()
+  ! JsException ? &mut Allocator {
+  let kind = if module { TYPE_MODULE } else { TYPE_GLOBAL }
+  let checked = run unsafe compile(&mut hooks, memory, context, source, filename,
+    kind | FLAG_SYNTAX_ONLY, -1, Pointer.null<StackFrame>())
+}
+
+enum SyntaxAcceptance { Accepted, ModuleOnly, Rejected }
+effect fn probeSyntax(error: SyntaxError) -> Value {
+  let module = error.moduleSyntax
+  drop error return Value.Bool { value: module }
+}
+effect fn probeCompiler(error: CompilerError) -> Value ! CompilerError {
+  // Resource limits are not evidence that the input needs module grammar.
+  if error.kind == CompilerErrorKind.TooManyLocals || error.kind == CompilerErrorKind.TooManyArguments
+    || error.kind == CompilerErrorKind.TooManyClosures { fail move error }
+  drop error return Value.Bool { value: false }
+}
+unsafe effect fn acceptsSyntax<H: HeapHooks + CoercionHooks + ErrorHooks + ModuleHostHooks + ModuleAttributeHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, source: &[u8], filename: &[u8], flags: i32) -> SyntaxAcceptance
+  ! JsException ? &mut Allocator {
+  let mut root = Pointer.null<HeapHeader>() let mut module = Pointer.null<HeapHeader>()
+  let mut cache = SourcePositionCache.make()
+  let mut comments = SourceComments.make()
+  // Catch typed parser/compiler syntax diagnostics before they become pending JS
+  // exceptions. OOM, interrupts, stack limits and host exceptions must propagate.
+  let checked = run Effect.result(Effect.catch<SyntaxError>(Effect.catch<CompilerError>(
+    unsafe body(&mut hooks, memory, context, source, filename, flags, -1,
+      Pointer.null<StackFrame>(), &mut root, &mut module, Pointer.fromMutRef<SourcePositionCache>(&mut cache), &mut comments),
+    probeCompiler), probeSyntax))
+  match move checked {
+    Result<Value, OutOfMemoryError | StringLengthError | BigIntError | ParserStackOverflow | CompilerError | BytecodeError | JsException>.Success { value } => {
+      if !Pointer.isNull<HeapHeader>(root) { unsafe state.destroyFunction(&mut hooks, present(root)) }
+      if !Pointer.isNull<HeapHeader>(module) { unsafe gc.releaseHeader(&mut hooks, unsafe runtime.contextRuntime(context), present(module)) }
+      return match value {
+        Value.Bool { value: moduleOnly } => if moduleOnly { SyntaxAcceptance.ModuleOnly } else { SyntaxAcceptance.Rejected }
+        _ => SyntaxAcceptance.Accepted
+      }
+    }
+    Result<Value, OutOfMemoryError | StringLengthError | BigIntError | ParserStackOverflow | CompilerError | BytecodeError | JsException>.Failure { error } => {
       let pending = run Effect.catch<JsException>(unsafe errors.compilation<Value, H>(&mut hooks, memory, context, move error), errors.exceptionValue)
       if !Pointer.isNull<HeapHeader>(root) { unsafe state.destroyFunction(&mut hooks, present(root)) }
       if !Pointer.isNull<HeapHeader>(module) { unsafe gc.releaseHeader(&mut hooks, unsafe runtime.contextRuntime(context), present(module)) }
       fail JsException {}
     }
+  }
+}
+
+/// Detect grammar that requires ESM, not the spelling of import/export/await.
+/// CommonJS files use function-body grammar with Node's five wrapper parameters;
+/// eval/stdin use global Script grammar. Neither probe loads or executes modules.
+pub unsafe effect fn detectModuleSyntax<H: HeapHooks + CoercionHooks + ErrorHooks + ModuleHostHooks + ModuleAttributeHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader, source: &[u8], filename: &[u8], commonJS: bool) -> bool
+  ! JsException ? &mut Allocator {
+  let scriptFlags = if commonJS { TYPE_GLOBAL | FLAG_VALIDATE_FUNCTION_BODY | FLAG_COMMONJS_BODY }
+    else { TYPE_GLOBAL | FLAG_SYNTAX_ONLY }
+  match run unsafe acceptsSyntax(&mut hooks, memory, context, source, filename, scriptFlags) {
+    SyntaxAcceptance.Accepted => { return false }
+    // As in Node, definite import/export/import.meta syntax selects ESM even if
+    // a later module diagnostic (e.g. missing local export) will reject it.
+    SyntaxAcceptance.ModuleOnly => { return true }
+    SyntaxAcceptance.Rejected => ()
+  }
+  return match run unsafe acceptsSyntax(&mut hooks, memory, context, source, filename, TYPE_MODULE | FLAG_SYNTAX_ONLY) {
+    SyntaxAcceptance.Accepted => true
+    _ => false
   }
 }

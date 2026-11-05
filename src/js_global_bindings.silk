@@ -1,18 +1,19 @@
 //! Global closure cells, quickjs.c:17372-17563. Returned cells own one reference;
 //! context/global objects are borrowed. The dictionary owns unresolved cells until
 //! a declaration consumes its entry, preserving capture identity across scripts.
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.effect { Effect }
-import silk.option { Option }
-import silk.pointer { Pointer }
-import silk.result { Result }
-import silk.u8
-import silk.u32
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.pointer { Pointer }
+import silk.core.result { Result }
+import silk.num.u8
+import silk.num.u32
 import js_heap { HeapCell, HeapHeader }
 import js_value { Value }
-import js_core_types { ContextState, ObjectData, ObjectPayload, PropertySlot, ShapeData,
-  ClosureVar, VariableKind, VarRef, JS_PROP_CONFIGURABLE, JS_PROP_WRITABLE,
-  JS_PROP_ENUMERABLE, JS_PROP_C_W_E, JS_PROP_TMASK, JS_PROP_VARREF }
+import js_core_types { ContextState, ObjectData, ObjectPayload, PropertySlot, AutoInitOpaque, ShapeData,
+  ClosureVar, VariableKind, VarRef, PropertyDescriptor, NativeErrorKind, JS_PROP_CONFIGURABLE, JS_PROP_WRITABLE,
+  JS_PROP_ENUMERABLE, JS_PROP_C_W_E, JS_PROP_TMASK, JS_PROP_VARREF, JS_PROP_GETSET,
+  JS_PROP_HAS_VALUE, JS_PROP_HAS_CONFIGURABLE, JS_PROP_HAS_WRITABLE, JS_PROP_HAS_ENUMERABLE, JS_PROP_THROW, JS_PROP_GLOBAL_DECLARATION }
 import js_gc { HeapHooks }
 import js_gc as gc
 import js_runtime as runtime
@@ -21,6 +22,13 @@ import js_var_refs as cells
 import js_property_host { OwnPropertyHooks }
 import js_coercion_host { CoercionHooks }
 import js_exceptions { JsException }
+import js_property_write_host { PropertyWriteHooks }
+import js_property_descriptors as descriptors
+import js_property_ownership as ownership
+import js_property_mutations as mutations
+import js_string_types { StringLengthError }
+import js_bigint { BigIntError }
+import js_debugger_restricted as restricted
 
 fn trap() -> never { return Intrinsic.trap("QuickJS invariant violated") }
 fn node(value: Value) -> *mut HeapHeader { return match value { Value.Object { reference } => reference _ => trap() } }
@@ -28,8 +36,11 @@ unsafe fn global(context: *mut HeapHeader, lexical: bool) -> *mut HeapHeader {
   let anchor = () let ctx = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
   if lexical { return node(ctx.globalVarObject) } return node(ctx.globalObject)
 }
-unsafe fn dictionary(object: *mut HeapHeader) -> *mut HeapHeader {
-  let anchor = () let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+unsafe fn dictionary(context: *mut HeapHeader, object: *mut HeapHeader) -> *mut HeapHeader {
+  let anchor = () let ctx = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  if ctx.globalProxyBindings.isObject() { return node(ctx.globalProxyBindings) }
+  drop ctx
+  let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
   return match &p.payload { ObjectPayload.GlobalObject { global } => node(global.uninitializedVariables) _ => trap() }
 }
 unsafe fn own(object: *mut HeapHeader, atom: u32) -> Option<usize> {
@@ -82,7 +93,7 @@ unsafe effect fn install<H: HeapHooks + CoercionHooks>(hooks: &mut H, context: *
 }
 pub unsafe effect fn getUninitialized<H: HeapHooks + CoercionHooks>(hooks: &mut H,
   context: *mut HeapHeader, object: *mut HeapHeader, atom: u32) -> *mut HeapHeader ! JsException ? &mut Allocator {
-  let table = unsafe dictionary(object)
+  let table = unsafe dictionary(context, object)
   match unsafe own(table, atom) {
     Option<usize>.Some { value: index } => {
       return match unsafe slot(table, index) { PropertySlot.VarRef { reference } => unsafe retained(reference) _ => trap() }
@@ -104,7 +115,7 @@ unsafe effect fn removeRaw<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader,
 pub unsafe effect fn findUninitialized<H: HeapHooks + CoercionHooks>(hooks: &mut H,
   context: *mut HeapHeader, object: *mut HeapHeader, atom: u32, lexical: bool) -> *mut HeapHeader
   ! JsException ? &mut Allocator {
-  let table = unsafe dictionary(object) let rt = unsafe runtime.contextRuntime(context)
+  let table = unsafe dictionary(context, object) let rt = unsafe runtime.contextRuntime(context)
   match unsafe own(table, atom) {
     Option<usize>.Some { value: index } => {
       let reference = match unsafe slot(table, index) { PropertySlot.VarRef { reference } => unsafe retained(reference) _ => trap() }
@@ -130,11 +141,62 @@ unsafe fn redefineRaw(object: *mut HeapHeader, index: usize, bits: u32, incoming
   let mut property = metadata.properties.get(index) property.flags = u32.toU8(bits)
   metadata.properties.set(index, property)
 }
-pub unsafe effect fn defineGlobal<H: HeapHooks + OwnPropertyHooks + CoercionHooks>(hooks: &mut H,
+unsafe effect fn mutationFailure<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
+  error: OutOfMemoryError | StringLengthError | BigIntError | JsException) -> never ! JsException ? &mut Allocator {
+  match move error {
+    OutOfMemoryError allocation => { return run unsafe hooks.throwOutOfMemory(context) }
+    StringLengthError length => { return run unsafe hooks.throwError(context, NativeErrorKind.Internal, b"string too long") }
+    BigIntError impossible => trap()
+    JsException signal => { fail move signal }
+  }
+}
+unsafe effect fn defineExternal<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(
+  hooks: &mut H, context: *mut HeapHeader, object: *mut HeapHeader, capture: ClosureVar,
+  evalDeclaration: bool) -> *mut HeapHeader ! JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context) let value = Value.Object { reference: object }
+  let queried = run Effect.result(unsafe descriptors.getOwnProperty(&mut hooks, context, value, capture.name))
+  let ownDescriptor = match move queried {
+    Result<Option<PropertyDescriptor>, OutOfMemoryError | JsException>.Success { value: descriptor } => move descriptor
+    Result<Option<PropertyDescriptor>, OutOfMemoryError | JsException>.Failure { error } => {
+      return run unsafe mutationFailure(&mut hooks, context, move error)
+    }
+  }
+  let mut found = false let mut previousFlags: u32 = 0
+  match move ownDescriptor {
+    Option<PropertyDescriptor>.Some { value: descriptor } => {
+      found = true previousFlags = descriptor.flags
+      unsafe ownership.releaseDescriptor(&mut hooks, rt, move descriptor)
+    }
+    Option<PropertyDescriptor>.None => ()
+  }
+  let mut bits = JS_PROP_ENUMERABLE | JS_PROP_WRITABLE
+  if evalDeclaration { bits = bits | JS_PROP_CONFIGURABLE }
+  if found && (previousFlags & JS_PROP_CONFIGURABLE) == 0 { bits = previousFlags & JS_PROP_C_W_E }
+  bits = bits | JS_PROP_HAS_CONFIGURABLE | JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE | JS_PROP_THROW | JS_PROP_GLOBAL_DECLARATION
+  if !found || (capture.variableKind == VariableKind.GlobalFunctionDeclaration && (previousFlags & JS_PROP_TMASK) == JS_PROP_GETSET) { bits = bits | JS_PROP_HAS_VALUE }
+  let defined = run Effect.result(unsafe mutations.defineProperty(&mut hooks, context, value, capture.name,
+    Value.Undefined, Value.Undefined, Value.Undefined, bits))
+  match move defined {
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { .. } => ()
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => {
+      return run unsafe mutationFailure(&mut hooks, context, move error)
+    }
+  }
+  // Keep this cell unresolved: every read/write must observe the external object,
+  // including mutations from a host callback during execution.
+  return run unsafe getUninitialized(&mut hooks, context, object, capture.name)
+}
+pub unsafe effect fn defineGlobal<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,
   context: *mut HeapHeader, capture: ClosureVar, evalDeclaration: bool) -> *mut HeapHeader ! JsException ? &mut Allocator {
+  run unsafe restricted.deny(context)
   let rt = unsafe runtime.contextRuntime(context)
   let object = unsafe global(context, capture.isLexical)
   let globalObject = unsafe global(context, false)
+  let anchor = () let ctx = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  let external = ctx.globalObjectStorage.isObject() drop ctx
+  if external && !capture.isLexical {
+    return run unsafe defineExternal(&mut hooks, context, globalObject, capture, evalDeclaration)
+  }
   let mut bits = JS_PROP_ENUMERABLE | JS_PROP_WRITABLE
   let mut split: ?*mut HeapHeader = Pointer.null<HeapHeader>()
   if capture.isLexical {
@@ -168,7 +230,14 @@ pub unsafe effect fn defineGlobal<H: HeapHooks + OwnPropertyHooks + CoercionHook
       match unsafe own(object, capture.name) {
         Option<usize>.Some { value: index } => {
           let current = unsafe slot(object, index)
-          if match current { PropertySlot.AutoInit { .. } => true _ => false } {
+          // JavaScript lazy data properties are not reads during declaration.
+          // Keep var bindings unresolved; a function declaration replaces the
+          // property without executing its initializer.
+          if match current {
+            PropertySlot.AutoInit { opaque: AutoInitOpaque.Initializer { .. }, .. } => false
+            PropertySlot.AutoInit { .. } => true
+            _ => false
+          } {
             let initialized = run Effect.result(unsafe OwnPropertyHooks.instantiateAutoInit(&mut hooks, context, Value.Object { reference: object }, capture.name))
             match move initialized {
               Result<(), OutOfMemoryError | JsException>.Success { .. } => ()
@@ -178,13 +247,20 @@ pub unsafe effect fn defineGlobal<H: HeapHooks + OwnPropertyHooks + CoercionHook
             }
             continue
           }
+          let oldBits = unsafe flags(object, index)
+          let replacing = capture.variableKind == VariableKind.GlobalFunctionDeclaration && (oldBits & JS_PROP_CONFIGURABLE) != 0 && match current {
+            PropertySlot.GetterSetter { .. } => true
+            PropertySlot.AutoInit { opaque: AutoInitOpaque.Initializer { .. }, .. } => true
+            _ => false
+          }
           let reference = match current {
             PropertySlot.VarRef { reference } => unsafe retained(reference)
-            _ => run unsafe getUninitialized(&mut hooks, context, object, capture.name)
+            _ => {
+              if replacing { run unsafe findUninitialized(&mut hooks, context, object, capture.name, false) }
+              else { run unsafe getUninitialized(&mut hooks, context, object, capture.name) }
+            }
           }
-          let oldBits = unsafe flags(object, index)
           if capture.variableKind == VariableKind.GlobalFunctionDeclaration && (oldBits & JS_PROP_CONFIGURABLE) != 0 {
-            let replacing = match current { PropertySlot.GetterSetter { .. } => true _ => false }
             if replacing {
               unsafe gc.releaseProperty(&mut hooks, rt, current)
               unsafe redefineRaw(object, index, bits | JS_PROP_VARREF, PropertySlot.VarRef { reference: reference })
@@ -193,7 +269,7 @@ pub unsafe effect fn defineGlobal<H: HeapHooks + OwnPropertyHooks + CoercionHook
               match current { PropertySlot.VarRef { .. } => () _ => trap() }
               unsafe redefineRaw(object, index, (oldBits & ~JS_PROP_C_W_E) | bits, current)
             }
-            let mut anchor = () let cell = unsafe HeapCell.payloadMut<VarRef, ()>(&mut anchor, reference) cell.isConst = false
+            let mut anchor = () let cell = unsafe HeapCell.payloadMut<VarRef, ()>(&mut anchor, reference) cell.isConst = false cell.isLexical = false
           }
           return reference
         }
@@ -229,7 +305,14 @@ pub unsafe effect fn captureGlobal<H: HeapHooks + OwnPropertyHooks + CoercionHoo
       Option<usize>.Some { value: index } => {
         match unsafe slot(object, index) {
           PropertySlot.VarRef { reference } => { return unsafe retained(reference) }
+          // Capturing a name is not a property read. Resolve JavaScript lazy
+          // data through the normal global lookup only when the closure runs;
+          // assignment can then replace the slot without initializing it.
+          PropertySlot.AutoInit { opaque: AutoInitOpaque.Initializer { .. }, .. } => {
+            return run unsafe getUninitialized(&mut hooks, context, object, capture.name)
+          }
           PropertySlot.AutoInit { .. } => {
+            run unsafe restricted.deny(context)
             let result = run Effect.result(unsafe OwnPropertyHooks.instantiateAutoInit(&mut hooks, context, Value.Object { reference: object }, capture.name))
             match move result {
               Result<(), OutOfMemoryError | JsException>.Success { .. } => ()

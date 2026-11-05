@@ -329,17 +329,17 @@ def pack_corpus(rows):
 
 
 SILK = r'''
-import silk.i32
-import silk.i64
-import silk.u8
-import silk.u32
-import silk.u64
-import silk.usize
-import silk.f64
-import silk.slice { Slice }
-import silk.effect { Effect }
-import silk.writer { Writer, WriterError }
-import silk.os_writer { StdoutWriter }
+import silk.num.i32
+import silk.num.i64
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.num.f64
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StdoutWriter }
 import js_bigint { Int128 }
 import temporal_common as api
 import temporal_parse as parse

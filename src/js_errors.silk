@@ -2,16 +2,16 @@
 //! Message bytes are already formatted: the source's 256-byte vsnprintf buffer
 //! retains at most 255 bytes, then JS_NewString decodes even a split UTF8 suffix.
 //! The caller supplies the owning context's allocator and allocation observer.
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.effect { Effect }
-import silk.option { Option }
-import silk.result { Result }
-import silk.slice { Slice }
-import silk.u32
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.collections.slice { Slice }
+import silk.num.u32
 import js_heap { HeapCell, HeapHeader }
 import js_value { Value }
-import js_core_types { ContextState, RuntimeState, ObjectData, PropertySlot, NativeErrorKind,
-  JS_PROP_WRITABLE, JS_PROP_CONFIGURABLE }
+import js_core_types { ContextState, RuntimeState, ObjectData, ObjectPayload, ShapeData, PropertySlot, NativeErrorKind,
+  JS_PROP_WRITABLE, JS_PROP_CONFIGURABLE, JS_PROP_GETSET }
 import js_gc { HeapHooks }
 import js_gc as gc
 import js_runtime as runtime
@@ -23,6 +23,7 @@ import js_atom_data as atoms
 import js_strings { Strings, StringBuilder }
 import js_string_types { StringLengthError }
 import js_backtrace as trace
+import js_node_stack as nodeStack
 import js_error_host { ErrorHooks }
 import js_exceptions { JsException }
 import js_exceptions as exceptions
@@ -186,14 +187,87 @@ unsafe effect fn finishStack<H: HeapHooks>(hooks: &mut H, memory: &AllocationObs
     }
   }
 }
+// Conversion happens only at the engine's own stack attachment boundary. Frames
+// remain private and immutable until the first successful native accessor read.
+unsafe effect fn makeNodeStackLazy<H: HeapHooks>(hooks: &mut H, context: *mut HeapHeader,
+  object: Value) -> () ! OutOfMemoryError ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  let anchor = ()
+  let ctx = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  let getter = ctx.nodeErrorStackGetter
+  let setter = ctx.nodeErrorStackSetter
+  drop ctx
+  if !getter.isObject() { return () }
+  let node = match object { Value.Object { reference } => reference _ => { return () } }
+  let mut objectAnchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut objectAnchor, node)
+  if data.classId != classes.JS_CLASS_ERROR { return () }
+  let index = match unsafe shapes.lookup(data.shape, atoms.JS_ATOM_stack) {
+    Option<usize>.Some { value } => value
+    Option<usize>.None => { return () }
+  }
+  let stack = match data.properties.get(index) {
+    PropertySlot.Value { value } => value
+    _ => { return () }
+  }
+  let metadata = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+  let flags = metadata.properties.get(index).flags
+  drop metadata
+  if (flags & u32.toU8(JS_PROP_CONFIGURABLE)) == 0 { return () }
+  run unsafe shapes.updateFlags(rt, &mut data, index, u32.toU8(JS_PROP_CONFIGURABLE | JS_PROP_GETSET))
+  let getterNode = match getter { Value.Object { reference } => reference _ => invalidFreshObject() }
+  let setterNode = match setter { Value.Object { reference } => reference _ => invalidFreshObject() }
+  unsafe HeapCell.retain(getterNode)
+  unsafe HeapCell.retain(setterNode)
+  data.properties.set(index, PropertySlot.GetterSetter { getter: getterNode, setter: setterNode })
+  let previous = Intrinsic.replace(data.payload, ObjectPayload.ErrorStack { value: stack, cached: false })
+  drop data
+  match move previous {
+    ObjectPayload.Empty => ()
+    ObjectPayload.ErrorStack { value, .. } => unsafe gc.release(&mut hooks, rt, value)
+    _ => invalidFreshObject()
+  }
+}
+unsafe effect fn nodeStackLazy<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, object: Value) -> () ? &mut Allocator {
+  let result = run Effect.result(unsafe makeNodeStackLazy(&mut hooks, context, object))
+  match move result {
+    Result<(), OutOfMemoryError>.Success { .. } => ()
+    Result<(), OutOfMemoryError>.Failure { .. } =>
+      run Effect.catchAll(unsafe outOfMemory(&mut hooks, memory, context), ignoreException)
+  }
+}
+unsafe fn nodeStacksEnabled(context: *mut HeapHeader) -> bool {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  return state.nodeErrorFormatter.isObject()
+}
+unsafe effect fn capturedNodeStack<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
+  context: *mut HeapHeader, flags: u32) -> Value ? &mut Allocator {
+  let count = match unsafe nodeStack.limit(context) {
+    Option<usize>.Some { value } => value
+    Option<usize>.None => { return Value.Undefined }
+  }
+  let captured = run Effect.result(unsafe nodeStack.capture(&mut hooks, memory, context,
+    count, Value.Undefined, (flags & trace.SKIP_FIRST_LEVEL) != 0))
+  return run unsafe stringResult(&mut hooks, memory, context, move captured)
+}
 unsafe effect fn freshBacktrace<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
   context: *mut HeapHeader, object: Value) -> () ? &mut Allocator {
   let rt = unsafe runtime.contextRuntime(context)
+  if unsafe nodeStacksEnabled(context) {
+    let captured = run unsafe capturedNodeStack(&mut hooks, memory, context, 0)
+    if captured.isException() { return () }
+    run Effect.catchAll(unsafe defineFresh(&mut hooks, memory, context, object, atoms.JS_ATOM_stack, captured), ignoreException)
+    run unsafe nodeStackLazy(&mut hooks, memory, context, object)
+    return ()
+  }
   let mut builder = StringBuilder.make()
   let appended = run Effect.result(unsafe trace.appendFrames(rt, &mut builder, 0))
   let buffered = bufferStatus(move appended)
   let stack = run unsafe finishStack(&mut hooks, memory, context, move builder, buffered)
   run Effect.catchAll(unsafe defineFresh(&mut hooks, memory, context, object, atoms.JS_ATOM_stack, stack), ignoreException)
+  run unsafe nodeStackLazy(&mut hooks, memory, context, object)
 }
 unsafe effect fn installError<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
   context: *mut HeapHeader, kind: NativeErrorKind, message: &[u8], addBacktrace: bool) -> ()
@@ -262,6 +336,13 @@ pub unsafe effect fn buildBacktrace<H: HeapHooks + ErrorHooks>(hooks: &mut H,
   memory: &AllocationObserver, context: *mut HeapHeader, object: Value,
   filename: Option<Value>, line: i32, column: i32, flags: u32) -> () ? &mut Allocator {
   if !object.isObject() { return () }
+  if unsafe nodeStacksEnabled(context) {
+    let captured = run unsafe capturedNodeStack(&mut hooks, memory, context, flags)
+    if captured.isException() { return () }
+    let attached = run unsafe defineAttached(&mut hooks, context, object, atoms.JS_ATOM_stack, captured)
+    if attached { run unsafe nodeStackLazy(&mut hooks, memory, context, object) }
+    return ()
+  }
   let rt = unsafe runtime.contextRuntime(context)
   let mut builder = StringBuilder.make()
   let mut source = Option<Value>.none()
@@ -288,6 +369,7 @@ pub unsafe effect fn buildBacktrace<H: HeapHooks + ErrorHooks>(hooks: &mut H,
   }
   let stack = run unsafe finishStack(&mut hooks, memory, context, move builder, buffered)
   let attached = run unsafe defineAttached(&mut hooks, context, object, atoms.JS_ATOM_stack, stack)
+  if attached { run unsafe nodeStackLazy(&mut hooks, memory, context, object) }
 }
 
 pub unsafe effect fn throwStackOverflow<H: HeapHooks>(hooks: &mut H,

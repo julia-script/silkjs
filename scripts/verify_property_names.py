@@ -147,17 +147,17 @@ int main(void) {
 }
 '''
 SILK_SOURCE = r'''
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.effect { Effect }
-import silk.i32
-import silk.list { List }
-import silk.option { Option }
-import silk.pointer { Pointer }
-import silk.u16
-import silk.u32
-import silk.usize
-import silk.writer { Writer, WriterError }
-import silk.os_writer { StdoutWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.num.i32
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.pointer { Pointer }
+import silk.num.u16
+import silk.num.u32
+import silk.num.usize
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StdoutWriter }
 import byte_buffer { ByteBuffer }
 import runtime_memory { RuntimeAllocator, AllocationObserver }
 import js_heap { HeapCell, HeapHeader, HeapKind }
@@ -254,7 +254,7 @@ unsafe effect fn runCase(out:&mut ByteBuffer,hooks:&mut Hooks,memory:&Allocation
     let allocated=run HeapCell.allocate(HeapKind.Auxiliary,BorrowedView {bytes:move bytes}) view=allocated
     let mut anchor=() let backing=unsafe HeapCell.payloadMut<BorrowedView,()>(&mut anchor,allocated)
     let mut pointer: ?*mut u8=Pointer.fromMutRef<u8>(&mut backing.bytes.asMutSlice()[0]) drop backing
-    let mut count:u32=3 if family==7 {count=0 pointer=Pointer.null<u8>()}
+    let mut count:u64=3 if family==7 {count=0 pointer=Pointer.null<u8>()}
     let p=unsafe HeapCell.payloadMut<ObjectData,()>(&mut anchor,reference(object))
     p.payload=ObjectPayload.TypedArray {array:TypedArrayCache {view:allocated,shared:false,cachedData:pointer,count:count,requiresExtensible:false}}
   }

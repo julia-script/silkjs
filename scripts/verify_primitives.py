@@ -171,25 +171,26 @@ int main(void) {
 '''
 
 SILK_SOURCE = r'''
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.effect { Effect }
-import silk.list { List }
-import silk.option { Option }
-import silk.pointer { Pointer }
-import silk.os_writer { StdoutWriter }
-import silk.writer { Writer, WriterError }
-import silk.f64
-import silk.i32
-import silk.i64
-import silk.u8
-import silk.u16
-import silk.u32
-import silk.u64
-import silk.usize
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.pointer { Pointer }
+import silk.io.writer_native { StdoutWriter }
+import silk.io.writer { Writer, WriterError }
+import silk.num.f64
+import silk.num.i32
+import silk.num.i64
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
 import byte_buffer { ByteBuffer, readU32 }
 import js_primitives as primitive
 import js_primitives { EqualityMode }
 import js_value { Value }
+import js_debugger_metadata { Metadata as DebuggerMetadata }
 import js_heap { HeapCell, HeapHeader, HeapKind }
 import js_strings { Strings }
 import js_string_types { StringLengthError, RopeString, StringOwner }
@@ -264,6 +265,8 @@ effect fn internal(kind:u8,realm:*mut HeapHeader)->Value ! OutOfMemoryError ? &m
     return Value.Module { reference:reference }
   }
   let reference=run HeapCell.allocate<FunctionBytecode>(HeapKind.FunctionBytecode,FunctionBytecode {
+    scriptId:0,scriptIsEval:false,
+    debuggerMetadata:DebuggerMetadata.make(),
     mode:0,hasPrototype:false,hasSimpleParameterList:true,isDerivedClassConstructor:false,
     needsHomeObject:false,kind:FunctionKind.Normal,newTargetAllowed:false,superCallAllowed:false,
     superAllowed:false,argumentsAllowed:false,readOnlyBytecode:false,isDirectOrIndirectEval:false,

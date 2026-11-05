@@ -121,13 +121,13 @@ int main(void){for(size_t i=0;i<sizeof(cases)/sizeof(cases[0]);i++)probe(cases[i
 '''
 
 SILK = r'''
-import silk.i32
-import silk.i64
-import silk.u8
-import silk.usize
-import silk.effect { Effect }
-import silk.os_writer { StdoutWriter }
-import silk.writer { Writer, WriterError }
+import silk.num.i32
+import silk.num.i64
+import silk.num.u8
+import silk.num.usize
+import silk.core.effect { Effect }
+import silk.io.writer_native { StdoutWriter }
+import silk.io.writer { Writer, WriterError }
 import temporal_calendar as cal
 import temporal_calendar_data as data
 fn probe(a: &[i32]) -> [i64; 8] {

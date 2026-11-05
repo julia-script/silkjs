@@ -5,26 +5,29 @@
 //! Input is complete parser IR: child constant indices designate reserved Undefined
 //! slots. When compiling a child directly, its ancestors' scope links must already
 //! be prepared (normal recursive entry performs that preparation before descent).
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.effect { Effect }
-import silk.result { Result }
-import silk.option { Option }
-import silk.list { List }
-import silk.pointer { Pointer }
-import silk.i32
-import silk.usize
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.collections.list { List }
+import silk.mem.pointer { Pointer }
+import silk.num.i32
+import silk.num.usize
 import byte_buffer { ByteBuffer }
 import js_heap { HeapCell, HeapHeader, HeapKind }
 import js_value { Value }
 import js_gc { HeapHooks }
 import js_gc
 import js_core_types { FunctionBytecode, FunctionDebugInfo, ByteStorage, VarDef, ClosureVar, ClosureKind, RuntimeState }
-import js_compiler_types { FunctionDef, CompilerVar, CompilerError }
+import js_compiler_types { FunctionDef, CompilerVar, CompilerError, CompilerErrorKind }
 import js_compiler_state as state
 import js_compiler_variables as variables
 import js_compiler_labels { resolveLabels }
 import js_bytecode { computeStackSize, BytecodeError }
 import js_string_types { StringLengthError }
+import js_debugger_metadata { Metadata as DebuggerMetadata, Scope }
+import js_debug_positions { SourcePositionCache }
+import silk.num.u32
 
 fn definition(v: CompilerVar, strip: bool) -> VarDef {
   let mut name = v.name if strip { name = 0 }
@@ -41,10 +44,14 @@ unsafe effect fn assemble<H: HeapHooks>(hooks: &mut H, cell: *mut HeapHeader, so
   ! OutOfMemoryError | StringLengthError | CompilerError | BytecodeError ? &mut Allocator {
   let mut anchor = ()
   let initial = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
+  if initial.debuggerMetadata.enabled {
+    initial.debuggerMetadata.sourceLength = usize.toU32(source.length)
+  }
   variables.recomputeScopeLinks(&mut initial)
-  let eval = initial.hasEvalCall let global = initial.isEval
+  let eval = initial.hasEvalCall let global = initial.isEval let debug = initial.debuggerMetadata.enabled
   drop initial
   if eval { run unsafe variables.addEvalVariables(cell) }
+  else if debug { run unsafe variables.addDebuggerVariables(cell) }
   if global { run unsafe variables.addGlobalVariables(cell) }
   while true {
     let parent = unsafe HeapCell.payload<FunctionDef, ()>(&anchor, cell)
@@ -58,11 +65,60 @@ unsafe effect fn assemble<H: HeapHooks>(hooks: &mut H, cell: *mut HeapHeader, so
     let parentWrite = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
     parentWrite.constants.set(index, value)
   }
+  let capture = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
+  if capture.debuggerMetadata.enabled {
+    if capture.args.length() + capture.vars.length() > 65535 {
+      let runtimeAnchor = () let rt = unsafe HeapCell.payload<RuntimeState, ()>(&runtimeAnchor, capture.runtime)
+      let error = run CompilerError.make(&rt.atoms, CompilerErrorKind.TooManyLocals, 0) fail move error
+    }
+    let mut index: usize = 0
+    while index < capture.args.length() { state.captureVar(&mut capture, usize.toI32(index), true) index = index + 1 }
+    index = 0
+    while index < capture.vars.length() { state.captureVar(&mut capture, usize.toI32(index), false) index = index + 1 }
+  }
+  drop capture
   run unsafe variables.resolveVariables(cell)
   run unsafe resolveLabels(cell, source)
   let fd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
   let stackSize = run computeStackSize(fd.bytecode.asSlice())
-  let strip = fd.stripDebug && !fd.hasEvalCall
+  if fd.debuggerMetadata.enabled {
+    if fd.args.length() + fd.vars.length() > 65535 {
+      let runtimeAnchor = () let rt = unsafe HeapCell.payload<RuntimeState, ()>(&runtimeAnchor, fd.runtime)
+      let error = run CompilerError.make(&rt.atoms, CompilerErrorKind.TooManyLocals, 0) fail move error
+    }
+    fd.debuggerMetadata.hasParameterExpressions = fd.hasParameterExpressions
+    let mut index: usize = 0
+    while index < fd.scopes.length() {
+      let scope = fd.scopes.get(index)
+      run fd.debuggerMetadata.scopes.append(Scope { parent: scope.parent, first: scope.first })
+      index = index + 1
+    }
+    index = 0
+    while index < fd.vars.length() {
+      state.captureVar(&mut fd, usize.toI32(index), false)
+      run fd.debuggerMetadata.localScopes.append(fd.vars.get(index).scopeLevel)
+      index = index + 1
+    }
+    // Reuse the parser-owned ECMAScript cache across the compilation tree.
+    // A fresh cache per function repeatedly scans overlapping source prefixes.
+    let mut fallbackCoordinates = SourcePositionCache.make()
+    let coordinatePointer = if Pointer.isNull<SourcePositionCache>(fd.sourceCache) {
+      Pointer.fromMutRef<SourcePositionCache>(&mut fallbackCoordinates)
+    } else {
+      unsafe Intrinsic.pointerRequalify<?*mut SourcePositionCache, *mut SourcePositionCache>(fd.sourceCache)
+    }
+    let mut coordinateAnchor = ()
+    let coordinates = unsafe Pointer.borrowMut<(), SourcePositionCache>(&mut coordinateAnchor, coordinatePointer)
+    index = 0
+    while index < fd.debuggerMetadata.locations.length() {
+      let mut location = fd.debuggerMetadata.locations.get(index)
+      let point = coordinates.locateEcma(source, u32.toUsize(location.sourcePosition))
+      location.line = point.line location.column = point.column
+      fd.debuggerMetadata.locations.set(index, location)
+      index = index + 1
+    }
+  }
+  let strip = fd.stripDebug && !fd.hasEvalCall && !fd.debuggerMetadata.enabled
   // Only this representation differs from the transient IR. Until allocation
   // commits, these names borrow fd's references; List drop releases no JS atoms.
   let mut definitions = List<VarDef>.make()
@@ -74,6 +130,12 @@ unsafe effect fn assemble<H: HeapHooks>(hooks: &mut H, cell: *mut HeapHeader, so
   let runtime = fd.runtime let context = fd.context
   // Allocate BEFORE moving any JS edge. OOM leaves the complete fd destructible.
   let result = run HeapCell.allocate(HeapKind.FunctionBytecode, FunctionBytecode {
+    scriptId: fd.scriptId,
+    scriptIsEval: fd.scriptIsEval || fd.evalType == 2 || fd.evalType == 3,
+    debuggerMetadata: DebuggerMetadata.make(),
+    hostImport: Value.Undefined,
+    hostModule: Value.Undefined,
+    hostScriptMetadata: Value.Undefined,
     mode: fd.jsMode, hasPrototype: fd.hasPrototype, hasSimpleParameterList: fd.hasSimpleParameterList,
     isDerivedClassConstructor: fd.isDerivedClassConstructor,
     needsHomeObject: fd.homeObjectVarIndex >= 0 || fd.needHomeObject, kind: fd.functionKind,
@@ -93,6 +155,7 @@ unsafe effect fn assemble<H: HeapHooks>(hooks: &mut H, cell: *mut HeapHeader, so
   let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, runtime)
   let code = Intrinsic.replace(fd.bytecode, ByteBuffer.make())
   b.code = ByteStorage.Owned { bytes: code.intoList() }
+  b.debuggerMetadata = Intrinsic.replace(fd.debuggerMetadata, DebuggerMetadata.make())
   b.name = fd.functionName fd.functionName = 0
   b.constants = Intrinsic.replace(fd.constants, List<Value>.make())
   i = 0
@@ -116,12 +179,15 @@ unsafe effect fn assemble<H: HeapHooks>(hooks: &mut H, cell: *mut HeapHeader, so
   b.closureVars = Intrinsic.replace(fd.closureVars, List<ClosureVar>.make())
   if !fd.stripDebug {
     let lines = Intrinsic.replace(fd.pc2line, ByteBuffer.make())
+    let callLines = Intrinsic.replace(fd.callSitePc2line, ByteBuffer.make())
     let mut text = Option<ByteStorage>.none()
     if fd.source.length() != 0 {
       let bytes = Intrinsic.replace(fd.source, ByteBuffer.make())
       text = Option<ByteStorage>.some(ByteStorage.Owned { bytes: bytes.intoList() })
     }
     b.debug = Option<FunctionDebugInfo>.some(FunctionDebugInfo {
+      callSitePcToLine: Option<ByteStorage>.some(ByteStorage.Owned { bytes: callLines.intoList() }),
+      nodeVm: fd.nodeVmDiagnostics, nodeSourceURL: false, lineOffset: 0, columnOffset: 0, sourceColumnOffset: 0,
       filename: fd.filename, source: move text, pcToLine: ByteStorage.Owned { bytes: lines.intoList() }
     })
     fd.filename = 0

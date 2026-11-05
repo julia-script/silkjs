@@ -140,11 +140,11 @@ static void isolated(unsigned s,unsigned k,unsigned m,int armed,size_t cutoff){
 int main(int argc,char **argv){if(argc==6){isolated(atoi(argv[1]),atoi(argv[2]),atoi(argv[3]),atoi(argv[4]),strtoull(argv[5],NULL,10));return 0;}SEMANTIC_CALLS return 0;}
 '''
 SILK_SOURCE = r'''
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.effect { Effect }
-import silk.writer { Writer, WriterError }
-import silk.os_writer { StdoutWriter }
-import silk.native_thread { SpawnError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StdoutWriter }
+import silk.concurrency.thread_native { SpawnError }
 import byte_buffer { ByteBuffer }
 import js_atomics_oracle as oracle
 import js_atomics_threads_oracle as threads
@@ -166,9 +166,10 @@ pub effect fn main() -> i32 ! OutOfMemoryError | StringLengthError | BigIntError
 
 
 def records(data, count, owner):
-    if len(data) != count * 56:
-        raise SystemExit(f'{owner}: expected {count * 56} bytes, got {len(data)}')
-    rows = list(struct.iter_unpack('<14I', data))
+    word_bytes = 8 if len(data) == count * 112 else 4
+    if len(data) != count * 14 * word_bytes:
+        raise SystemExit(f'{owner}: expected {count * 56} or {count * 112} bytes, got {len(data)}')
+    rows = list(struct.iter_unpack('<14Q' if word_bytes == 8 else '<14I', data))
     for index, row in enumerate(rows):
         if row[12:] != (0, 0):
             raise SystemExit(f'{owner} row {index}: leaked allocation/byte ledger {row[12:]}')
@@ -186,7 +187,7 @@ def native(temp, silk, stdlib, cases, cutoffs=1, armed=False):
   while cutoff < {cutoffs} {{
    let row = run oracle.isolated(cases[at].scenario, cases[at].kind, cases[at].method, {str(armed).lower()}, cutoff)
    let mut field: usize = 0
-   while field < 14 {{ run out.writeU32(row[field]) |> Effect.provideMut<Allocator>(&mut system) field = field + 1 }}
+   while field < 14 {{ run out.writeU64(row[field]) |> Effect.provideMut<Allocator>(&mut system) field = field + 1 }}
    cutoff = cutoff + 1
   }}
   at = at + 1

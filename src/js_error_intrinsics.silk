@@ -1,14 +1,15 @@
 //! Error, native errors, AggregateError and SuppressedError, quickjs.c:42257-42470.
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.effect { Effect }
-import silk.result { Result }
-import silk.option { Option }
-import silk.i32
-import silk.u32
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.num.i32
+import silk.num.u32
+import silk.mem.pointer { Pointer }
 import runtime_memory { AllocationObserver }
 import js_heap { HeapCell, HeapHeader }
 import js_value { Value }
-import js_core_types { ContextState, FrameSlots, NativeFunctionId, BuiltinFamily, NativeCallProtocol,
+import js_core_types { ContextState, RuntimeState, ObjectData, ObjectPayload, FrameSlots, NativeFunctionId, BuiltinFamily, NativeCallProtocol,
   JS_PROP_WRITABLE, JS_PROP_CONFIGURABLE, JS_PROP_C_W_E, JS_PROP_THROW }
 import js_gc { HeapHooks }
 import js_coercion_host { CoercionHooks }
@@ -34,25 +35,63 @@ import js_errors as errors
 import js_backtrace as backtrace
 import js_atom_data as atoms
 import js_class_data as classes
+import js_gc as gc
+import js_runtime as runtime
+import js_runtime_classes as runtimeClasses
+import js_native_functions as nativeFunctions
 
 pub const CONSTRUCTOR: u32 = 0
 pub const TO_STRING: u32 = 1
 pub const IS_ERROR: u32 = 2
-pub const METHOD_COUNT: u32 = 3
+pub const STACK_GET: u32 = 3
+pub const STACK_SET: u32 = 4
+pub const METHOD_COUNT: u32 = 5
 pub const AGGREGATE: i32 = 7
 pub const SUPPRESSED: i32 = 8
 const FLAGS: u32 = JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE
 pub fn nativeId(method: u32) -> NativeFunctionId { require(method < METHOD_COUNT) return NativeFunctionId.Builtin { family: BuiltinFamily.Error, method: method } }
 pub fn name(method: u32) -> &'static [u8] {
-  return match method { 0 => b"Error" 1 => b"toString" 2 => b"isError" _ => support.invariant() }
+  return match method { 0 => b"Error" 1 => b"toString" 2 => b"isError" 3 => b"" 4 => b"" _ => support.invariant() }
 }
-pub fn length(method: u32) -> i32 { require(method < METHOD_COUNT) if method == TO_STRING { return 0 } return 1 }
+pub fn length(method: u32) -> i32 { require(method < METHOD_COUNT) if method == TO_STRING || method == STACK_GET { return 0 } return 1 }
 pub fn protocol(method: u32) -> NativeCallProtocol {
   require(method < METHOD_COUNT)
   if method == CONSTRUCTOR { return NativeCallProtocol.ConstructorOrFunctionMagic }
   return NativeCallProtocol.Generic
 }
 pub fn magic(method: u32) -> i32 { require(method < METHOD_COUNT) if method == CONSTRUCTOR { return -1 } return 0 }
+// Opt-in is per realm and must run after its base intrinsics are installed.
+// No script globals are patched, and other embeddings retain QuickJS stacks.
+pub unsafe effect fn enableNodeStackFormatting<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks>(
+  hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader) -> () ! JsException ? &mut Allocator {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  let enabled = state.nodeErrorStackGetter.isObject()
+  drop state
+  if enabled { return () }
+  let getter = run unsafe nativeFunctions.newFunction(&mut hooks, memory, context,
+    nativeId(STACK_GET), b"", 0, NativeCallProtocol.Generic, 0)
+  let allocated = run Effect.result(unsafe nativeFunctions.newFunction(&mut hooks, memory, context,
+    nativeId(STACK_SET), b"", 1, NativeCallProtocol.Generic, 0))
+  let rt = unsafe runtime.contextRuntime(context)
+  let setter = match move allocated {
+    Result<Value, JsException>.Success { value } => value
+    Result<Value, JsException>.Failure { error } => {
+      unsafe gc.release(&mut hooks, rt, getter)
+      fail move error
+    }
+  }
+  let mut mutable = ()
+  let runtimeState = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut mutable, rt)
+  let definitions = runtimeState.classes.asMutSlice()
+  definitions[u32.toUsize(classes.JS_CLASS_ERROR)].finalizer = Option<NativeFunctionId>.some(runtimeClasses.descriptor(runtimeClasses.NATIVE_JS_OBJECT_DATA_FINALIZER))
+  definitions[u32.toUsize(classes.JS_CLASS_ERROR)].mark = Option<NativeFunctionId>.some(runtimeClasses.descriptor(runtimeClasses.NATIVE_JS_OBJECT_DATA_MARK))
+  drop definitions
+  drop runtimeState
+  let changed = unsafe HeapCell.payloadMut<ContextState, ()>(&mut mutable, context)
+  changed.nodeErrorStackGetter = getter
+  changed.nodeErrorStackSetter = setter
+}
 // Source intentionally ignores these define results, retaining the pending error
 // and continuing to later fields/backtrace. The host consumes value on both paths.
 unsafe effect fn defineIgnored<H: ErrorHooks>(hooks: &mut H, context: *mut HeapHeader,
@@ -166,6 +205,63 @@ unsafe effect fn toString<H: HeapHooks + CoercionHooks + OwnPropertyHooks>(hooks
   }
   return run Strings.concatBorrowedReusingLeft(roots.values[1], roots.values[2])
 }
+unsafe fn cacheStack<H: HeapHooks>(hooks: &mut H, context: *mut HeapHeader, object: *mut HeapHeader, value: Value) -> () {
+  let mut anchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, object)
+  let previous = Intrinsic.replace(data.payload, ObjectPayload.ErrorStack { value: unsafe value.retained(), cached: true })
+  drop data
+  match move previous {
+    ObjectPayload.ErrorStack { value: old, .. } => unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), old)
+    _ => support.invariant()
+  }
+}
+unsafe effect fn stackAccessor<H: HeapHooks + CoercionHooks + OwnPropertyHooks + CallHooks>(hooks: &mut H,
+  context: *mut HeapHeader, method: u32, receiver: Value, argv: &FrameSlots, roots: &mut Roots) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let object = match receiver { Value.Object { reference } => reference _ => { return Value.Undefined } }
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  let mut cached = false
+  let stored = match &data.payload {
+    ObjectPayload.ErrorStack { value, cached: ready } => { cached = ready value }
+    _ => { return Value.Undefined }
+  }
+  if method == STACK_SET {
+    drop data
+    unsafe cacheStack(&mut hooks, context, object, unsafe support.argument(argv, 0))
+    return Value.Undefined
+  }
+  if cached { return unsafe stored.retained() }
+  // Keep the captured frames alive across arbitrary name/message accessors.
+  roots.values[3] = unsafe stored.retained()
+  drop data
+  if support.undefined(roots.values[3]) {
+    unsafe cacheStack(&mut hooks, context, object, Value.Undefined)
+    return Value.Undefined
+  }
+  if roots.values[3].isObject() {
+    let state = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+    roots.values[5] = unsafe state.nodeErrorFormatter.retained()
+    drop state
+    let mut values = [receiver, roots.values[3]]
+    let arguments = FrameSlots.Borrowed { data: Pointer.fromMutRef<Value>(&mut values[0]), length: 2 }
+    let formatted = run unsafe hooks.callArguments(context, roots.values[5], Value.Undefined, &arguments)
+    unsafe cacheStack(&mut hooks, context, object, formatted)
+    return formatted
+  }
+  roots.values[4] = run unsafe toString(&mut hooks, context, receiver, &mut roots)
+  let mut builder = StringBuilder.make()
+  run builder.append(roots.values[4])
+  if Strings.length(roots.values[3]) != 0 {
+    run builder.appendLatin1(b"\n")
+    run builder.append(roots.values[3])
+  }
+  let formatted = run builder.finish()
+  // Only a successful read commits the cache; throwing accessors can be retried.
+  // A reentrant assignment during formatting is superseded, as in Node.
+  unsafe cacheStack(&mut hooks, context, object, formatted)
+  return formatted
+}
 // Internal Promise.any aggregate construction: no message, iterator conversion or
 // backtrace. The errors array is borrowed, and becomes an owned property edge.
 pub unsafe effect fn aggregateError<H: HeapHooks + CoercionHooks + ErrorHooks>(hooks: &mut H,
@@ -186,6 +282,7 @@ unsafe effect fn body<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPrope
   if method == CONSTRUCTOR { return run unsafe constructor(&mut hooks, memory, context, receiver, argv, magic, &mut roots) }
   if method == TO_STRING { return run unsafe toString(&mut hooks, context, receiver, &mut roots) }
   if method == IS_ERROR { return Value.Bool { value: unsafe boxing.isError(unsafe support.argument(argv, 0)) } }
+  if method == STACK_GET || method == STACK_SET { return run unsafe stackAccessor(&mut hooks, context, method, receiver, argv, &mut roots) }
   return support.invariant()
 }
 pub unsafe effect fn dispatch<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks + ErrorHooks>(hooks: &mut H,

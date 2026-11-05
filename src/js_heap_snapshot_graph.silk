@@ -1,0 +1,152 @@
+//! Native observational heap graph. All indices are zero-based; usize.MAX means
+//! no ephemeron condition. Default IDs are live addresses; identify() can upgrade
+//! them to monotonic runtime allocation IDs. Graph storage owns no JS references.
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.num.usize
+import silk.num.u64
+import js_heap { HeapHeader, HeapKind }
+import js_value { Value }
+
+pub enum Strength { Strong, Weak, Ephemeron, Borrowed }
+pub struct Node {
+  pub id: usize, pub reference: *mut HeapHeader, pub kind: HeapKind,
+  pub selfBytes: usize, pub nativeBytes: usize
+}
+impl Copy for Node {}
+pub struct Edge {
+  pub from: usize, pub to: usize, pub strength: Strength,
+  pub label: &'static [u8], pub index: usize, pub condition: usize
+}
+impl Copy for Edge {}
+pub struct Limitation { pub node: usize, pub message: &'static [u8] }
+impl Copy for Limitation {}
+pub struct Allocation { pub owner: usize, pub address: usize, pub bytes: usize }
+impl Copy for Allocation {}
+/// Mix the whole address before probing. Raw aligned address low bits cluster
+/// badly for fixed-size engine cells in power-of-two tables.
+pub fn addressSlot(address: usize, count: usize) -> usize {
+  let mut hash = usize.toU64(address)
+  hash = u64.wrappingMultiply(hash ^ u64.shiftRight(hash, 30), 0xbf58476d1ce4e5b9)
+  hash = u64.wrappingMultiply(hash ^ u64.shiftRight(hash, 27), 0x94d049bb133111eb)
+  return u64.toUsize((hash ^ u64.shiftRight(hash, 31)) % usize.toU64(count))
+}
+pub struct Graph {
+  pub nodes: List<Node>, pub edges: List<Edge>, pub limitations: List<Limitation>,
+  pub runtime: ?*mut HeapHeader, pub allocations: List<Allocation>,
+  pub allocationIdentity: bool,
+  slots: List<usize>, allocationSlots: List<usize>
+}
+impl Graph {
+  pub fn make() -> Self {
+    return Self { nodes: List<Node>.make(), edges: List<Edge>.make(),
+      limitations: List<Limitation>.make(), runtime: Pointer.null<HeapHeader>(),
+      allocations: List<Allocation>.make(), allocationIdentity: false,
+      slots: List<usize>.make(), allocationSlots: List<usize>.make() }
+  }
+  fn slot(self: &Self, id: usize) -> usize {
+    let mut slot = addressSlot(id, self.slots.length())
+    while self.slots.get(slot) != 0 {
+      if Pointer.address<HeapHeader>(self.nodes.get(self.slots.get(slot) - 1).reference) == id { break }
+      slot = (slot + 1) % self.slots.length()
+    }
+    return slot
+  }
+  effect fn grow(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut count: usize = 64
+    if self.slots.length() != 0 { count = self.slots.length() * 2 }
+    self.slots.clear()
+    run self.slots.reserve(count)
+    let mut i: usize = 0
+    while i < count { run self.slots.append(0) i = i + 1 }
+    i = 0
+    while i < self.nodes.length() {
+      let slot = self.slot(Pointer.address<HeapHeader>(self.nodes.get(i).reference))
+      self.slots.set(slot, i + 1) i = i + 1
+    }
+  }
+  /// Requires live, immutable engine storage throughout graph capture. Allocator
+  /// must not reenter JS or collect; use a host/SystemAllocator for graph output.
+  pub unsafe effect fn node(self: &mut Self, reference: *mut HeapHeader) -> usize
+    ! OutOfMemoryError ? &mut Allocator {
+    if self.slots.length() == 0 || (self.nodes.length() + 1) * 2 >= self.slots.length() { run self.grow() }
+    let id = Pointer.address<HeapHeader>(reference)
+    let slot = self.slot(id) let present = self.slots.get(slot)
+    if present != 0 { return present - 1 }
+    let anchor = () let header = unsafe Pointer.borrow<(), HeapHeader>(&anchor, reference)
+    let index = self.nodes.length()
+    run self.nodes.append(Node { id: id, reference: reference, kind: header.kind,
+      selfBytes: header.allocationBytes, nativeBytes: 0 })
+    self.slots.set(slot, index + 1)
+    return index
+  }
+  pub unsafe effect fn edge(self: &mut Self, from: usize, reference: *mut HeapHeader,
+    label: &'static [u8], index: usize, strength: Strength, condition: usize) -> ()
+    ! OutOfMemoryError ? &mut Allocator {
+    let to = run unsafe self.node(reference)
+    run self.edges.append(Edge { from: from, to: to, strength: strength, label: label, index: index, condition: condition })
+  }
+  pub unsafe effect fn optional(self: &mut Self, from: usize, reference: ?*mut HeapHeader,
+    label: &'static [u8], index: usize, strength: Strength, condition: usize) -> ()
+    ! OutOfMemoryError ? &mut Allocator {
+    match Pointer.nonNullMut<HeapHeader>(reference) {
+      Option<*mut HeapHeader>.Some { value } => { run unsafe self.edge(from, value, label, index, strength, condition) }
+      Option<*mut HeapHeader>.None => ()
+    }
+  }
+  pub unsafe effect fn value(self: &mut Self, from: usize, value: Value,
+    label: &'static [u8], index: usize, strength: Strength, condition: usize) -> ()
+    ! OutOfMemoryError ? &mut Allocator {
+    match value.heapReference() {
+      Option<*mut HeapHeader>.Some { value: reference } => { run unsafe self.edge(from, reference, label, index, strength, condition) }
+      Option<*mut HeapHeader>.None => ()
+    }
+  }
+  pub fn backing(self: &mut Self, index: usize, bytes: usize) -> () {
+    let mut node = self.nodes.get(index) node.nativeBytes = node.nativeBytes + bytes self.nodes.set(index, node)
+  }
+  fn allocationSlot(self: &Self, identity: usize) -> usize {
+    let mut slot = addressSlot(identity, self.allocationSlots.length())
+    while self.allocationSlots.get(slot) != 0 {
+      if self.allocations.get(self.allocationSlots.get(slot) - 1).address == identity { break }
+      slot = (slot + 1) % self.allocationSlots.length()
+    }
+    return slot
+  }
+  effect fn growAllocations(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut count: usize = 64
+    if self.allocationSlots.length() != 0 { count = self.allocationSlots.length() * 2 }
+    self.allocationSlots.clear()
+    run self.allocationSlots.reserve(count)
+    let mut i: usize = 0
+    while i < count { run self.allocationSlots.append(0) i = i + 1 }
+    i = 0
+    while i < self.allocations.length() {
+      let slot = self.allocationSlot(self.allocations.get(i).address)
+      if self.allocationSlots.get(slot) == 0 { self.allocationSlots.set(slot, i + 1) }
+      i = i + 1
+    }
+  }
+  /// Shared backing is charged once; every alias remains visible as an allocation
+  /// ownership record, with subsequent aliases carrying zero additional bytes.
+  pub effect fn allocation(self: &mut Self, owner: usize, identity: usize, bytes: usize) -> ()
+    ! OutOfMemoryError ? &mut Allocator {
+    if bytes == 0 || identity == 0 { return }
+    if self.allocationSlots.length() == 0 || (self.allocations.length() + 1) * 2 >= self.allocationSlots.length() {
+      run self.growAllocations()
+    }
+    let slot = self.allocationSlot(identity)
+    let mut charged = bytes
+    if self.allocationSlots.get(slot) != 0 { charged = 0 }
+    run self.allocations.append(Allocation { owner: owner, address: identity, bytes: charged })
+    if charged != 0 { self.allocationSlots.set(slot, self.allocations.length()) }
+    self.backing(owner, charged)
+  }
+  pub effect fn limit(self: &mut Self, node: usize, message: &'static [u8]) -> ()
+    ! OutOfMemoryError ? &mut Allocator {
+    run self.limitations.append(Limitation { node: node, message: message })
+  }
+}

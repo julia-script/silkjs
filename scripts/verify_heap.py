@@ -242,17 +242,18 @@ int main(void) {
 '''
 
 SILK_SOURCE = r'''
-import silk.allocator { Allocator, OutOfMemoryError, SystemAllocator }
-import silk.effect { Effect }
-import silk.list { List }
-import silk.option { Option }
-import silk.pointer { Pointer }
-import silk.os_writer { StdoutWriter }
-import silk.writer { Writer, WriterError }
-import silk.i32
-import silk.u8
-import silk.u32
-import silk.usize
+import silk.mem.allocator { Allocator, OutOfMemoryError, SystemAllocator }
+import js_debugger_types { State as DebuggerState }
+import silk.core.effect { Effect }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.pointer { Pointer }
+import silk.io.writer_native { StdoutWriter }
+import silk.io.writer { Writer, WriterError }
+import silk.num.i32
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
 import js_atoms { AtomTable }
 import js_heap { HeapCell, HeapHeader, HeapKind }
 import js_value { Value }
@@ -299,6 +300,8 @@ effect fn runtimeFixture() -> *mut HeapHeader ! OutOfMemoryError ? &mut Allocato
       call:Option<NativeFunctionId>.none(),exotic:Option<ExoticCallbacks>.none() }) i=i+1
   }
   return run HeapCell.allocate<RuntimeState>(HeapKind.Auxiliary,RuntimeState {
+    debugger:DebuggerState.make(),
+    nextScriptId:1,
     runtimeInfo:Option<ByteStorage>.none(),atoms:move atoms,classes:move classes,
     intlClassIds:[0;10],intlSegmentsClassId:0,intlSegmentIteratorClassId:0,temporalClassIds:[0;8],
     contexts:ContextList { first:Pointer.null<HeapHeader>(),last:Pointer.null<HeapHeader>() },
@@ -307,6 +310,8 @@ effect fn runtimeFixture() -> *mut HeapHeader ! OutOfMemoryError ? &mut Allocato
     weakReferences:WeakRefList { first:Pointer.null<WeakRefHeader>(),last:Pointer.null<WeakRefHeader>() },
     leakTracking:Option<LeakTrackingState>.none(),stackSize:0,stackTop:0,stackLimit:0,
     currentException:Value.Null,currentExceptionIsUncatchable:false,inOutOfMemory:false,
+    asyncContext:Value.Undefined,
+    asyncHooksEnabled:false,asyncHookActive:false,asyncTokenNext:1,asyncPromiseParent:Value.Undefined,
     currentStackFrame:Pointer.null<StackFrame>(),interrupt:noHook(),promiseRejectionTracker:noHook(),jobs:HeapList.make(),
     moduleLoader:ModuleLoaderHooks { normalize:Option<NativeFunctionId>.none(),load:Option<NativeFunctionId>.none(),
       checkSupportedImportAttributes:Option<NativeFunctionId>.none(),loaderHasAttributes:false,opaque:Pointer.null<u8>() },
@@ -498,6 +503,7 @@ effect fn asyncFixture(rt:*mut HeapHeader,local:Value) -> *mut HeapHeader
   let arguments=run ValueSlots.make(0) let mut locals=run ValueSlots.make(1)
   drop locals.replace(0,local) let stack=run ValueSlots.make(2)
   let frame=run StableFrame.make(StackFrame {
+    debuggerId:0,
     previous:Pointer.null<StackFrame>(),asyncOwner:Pointer.null<HeapHeader>(),currentFunction:Value.Undefined,
     arguments:FrameSlots.Owned { slots:move arguments },locals:FrameSlots.Owned { slots:move locals },
     stack:FrameSlots.Owned { slots:move stack },varRefs:FrameReferences.Owned { slots:List<?*mut HeapHeader>.make() },

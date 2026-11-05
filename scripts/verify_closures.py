@@ -196,11 +196,11 @@ int main(void){for(int kind=0;kind<4;kind++)semantic(kind);global_semantic();
  for(int n=0;n<16;n++)global_fault(n);return 0;}
 '''
 SILK_SOURCE = r'''
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
 import byte_buffer { ByteBuffer }
-import silk.writer { Writer, WriterError }
-import silk.os_writer { StdoutWriter }
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StdoutWriter }
 import runtime_memory { RuntimeAllocator }
 import js_core_types { FunctionKind }
 import js_runtime as runtime

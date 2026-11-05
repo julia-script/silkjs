@@ -29,7 +29,7 @@ def generate(source):
            '// QuickJS ' + REVISION + '; LICENSE.quickjs.',
            '// Source SHA-256: ' + hashlib.sha256(source.read_bytes()).hexdigest(),
            '// Exact pinned table cutoffs; no host timezone database or extrapolation.',
-           'import silk.slice { Slice }', 'import silk.u8', 'import silk.i32', 'import silk.i64', '']
+           'import silk.collections.slice { Slice }', 'import silk.num.u8', 'import silk.num.i32', 'import silk.num.i64', '']
     for name, count in [('zone', len(zones)), ('alias', len(aliases)), ('name', len(names)), ('region', len(regions))]:
         out.append(f'pub const ti_tz_{name}_count: i32 = {count}')
     out += ['', 'fn read16(data: &[u8], at: usize) -> usize {',

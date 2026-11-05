@@ -375,21 +375,21 @@ int main(void) {
 '''
 
 SILK_SOURCE = r'''
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.effect { Effect }
-import silk.result { Result }
-import silk.option { Option }
-import silk.list { List }
-import silk.slice { Slice }
-import silk.os_writer { StdoutWriter }
-import silk.writer { Writer, WriterError }
-import silk.f64
-import silk.i32
-import silk.u8
-import silk.u16
-import silk.u32
-import silk.u64
-import silk.usize
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.io.writer_native { StdoutWriter, StderrWriter }
+import silk.io.writer { Writer, WriterError }
+import silk.num.f64
+import silk.num.i32
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
 import byte_buffer { ByteBuffer, readU16, readU32 }
 import js_value { Value }
 import js_strings { Strings, StringBuilder }
@@ -716,10 +716,25 @@ effect fn probe()->() ! OutOfMemoryError | StringLengthError | EmbeddedNullError
     run Writer.writeAll(size.asSlice()) run Writer.writeAll(out.asSlice()) i=i+1
   }
 }
-pub effect fn main()->i32 ! OutOfMemoryError | StringLengthError | EmbeddedNullError | WriterError {
+effect fn execute()->i32 ! OutOfMemoryError | StringLengthError | EmbeddedNullError | WriterError {
   let mut allocator=Allocator.systemAllocatorProvider() let mut writer=StdoutWriter.make()
   run probe() |> Effect.provideMut<Allocator>(&mut allocator) |> Effect.provideMut<Writer>(&mut writer)
   return 0
+}
+effect fn stringLengthFailure(error: StringLengthError)->i32 ! WriterError {
+  drop error
+  let mut writer=StderrWriter.make()
+  run Writer.writeAll(b"Native string probe failed: StringLengthError\n") |> Effect.provideMut<Writer>(&mut writer)
+  return 1
+}
+effect fn embeddedNullFailure(error: EmbeddedNullError)->i32 ! WriterError {
+  drop error
+  let mut writer=StderrWriter.make()
+  run Writer.writeAll(b"Native string probe failed: EmbeddedNullError\n") |> Effect.provideMut<Writer>(&mut writer)
+  return 1
+}
+pub effect fn main()->i32 ! OutOfMemoryError | WriterError {
+  return run execute() |> Effect.catch<StringLengthError>(stringLengthFailure) |> Effect.catch<EmbeddedNullError>(embeddedNullFailure)
 }
 '''
 

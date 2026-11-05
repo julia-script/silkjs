@@ -198,12 +198,12 @@ for(unsigned i=0;i<sizeof(cases)/sizeof(*cases);i++){
 }return 0;}
 '''
 SILK_PROBE = r'''
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.effect { Effect }
-import silk.writer { Writer, WriterError }
-import silk.os_writer { StdoutWriter }
-import silk.f64
-import silk.u64
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StdoutWriter }
+import silk.num.f64
+import silk.num.u64
 import byte_buffer { ByteBuffer }
 import js_number_power as power
 struct Case { x: u64, y: u64 }

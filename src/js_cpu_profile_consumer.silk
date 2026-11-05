@@ -1,0 +1,128 @@
+//! Native consumer of real VM sampling. The host supplies its installed realm;
+//! source runs through the production compiler and dispatch hooks, not fake frames
+//! or synthetic timestamps. runCases also checks bounded storage and ownership.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.option { Option }
+import silk.testing.testing { Testing, AssertionError }
+import silk.num.u8
+import js_heap { HeapHeader }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_coercion_host { CoercionHooks }
+import js_property_host { OwnPropertyHooks, GetPropertyHooks, HasPropertyHooks, OwnKeysHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_prototype_host { PrototypeHooks }
+import js_interrupt_host { InterruptHooks }
+import js_native_function_host { NativeFunctionHooks }
+import js_call_host { CallHooks }
+import js_error_host { ErrorHooks }
+import js_eval_host { EvalHooks }
+import js_module_host { ModuleHostHooks }
+import js_parser_host { ModuleAttributeHooks }
+import js_promise { PromiseHooks }
+import js_exceptions { JsException }
+import js_eval as evaluation
+import js_cpu_profile { Profile }
+import js_cpu_profile as cpu
+import runtime_memory { AllocationObserver }
+import byte_buffer { ByteBuffer }
+import js_value { Value }
+import js_cpu_profile_json as json
+
+fn ascii(text: &[u16], expected: &[u8]) -> bool {
+  if text.length != expected.length { return false }
+  let mut i: usize = 0
+  while i < text.length { if text[i] != u8.toU16(expected[i]) { return false } i = i + 1 }
+  return true
+}
+effect fn elapsed(microseconds: i64) -> () {
+  let start = run cpu.nowMicroseconds()
+  while (run cpu.nowMicroseconds()) - start < microseconds {}
+}
+unsafe effect fn stopped(rt: *mut HeapHeader) -> Profile ! AssertionError<'static> {
+  let result = run unsafe cpu.stop(rt)
+  match move result {
+    Option<Profile>.Some { value } => { return move value }
+    Option<Profile>.None => { run Testing.expect(false, "an active recorder must transfer its owned profile") return Intrinsic.trap("unreachable failed assertion") }
+  }
+}
+pub unsafe effect fn runCases<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks + PromiseHooks + ModuleHostHooks + ModuleAttributeHooks>(hooks: &mut H,
+  memory: &AllocationObserver, context: *mut HeapHeader) -> ()
+  ! OutOfMemoryError | JsException | AssertionError<'static> ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  let before = run cpu.nowMicroseconds()
+  run Testing.expect(run unsafe cpu.start(rt, 1, 4096, 32768, 64), "valid start activates sampling")
+  run Testing.expect(!(run unsafe cpu.start(rt, 1, 1, 1, 1)), "duplicate start preserves the running recorder")
+  let value = run unsafe evaluation.evaluate(&mut hooks, memory, context,
+    b"(function cpuOuter(){function cpuLeaf(){let n=0;for(let i=0;i<100000;i++)n+=i;return n}return cpuLeaf()})()",
+    b"cpu-profile-consumer.js", 0)
+  unsafe gc.release(&mut hooks, rt, value)
+  let profile = run unsafe stopped(rt)
+  let after = run cpu.nowMicroseconds()
+  run Testing.expect(profile.startMicroseconds() >= before && profile.endMicroseconds() <= after &&
+    profile.endMicroseconds() >= profile.startMicroseconds(), "profile timestamps are real monotonic readings within the invocation")
+  let samples = profile.samples() let frames = profile.frames() let functions = profile.functions()
+  run Testing.expect(samples.length != 0, "actual VM dispatch produces samples while debugger is disabled")
+  let mut previous = profile.startMicroseconds() let mut i: usize = 0
+  let mut leaf = false let mut outer = false let mut nested = false let mut actualPc = false
+  while i < samples.length {
+    let sample = samples[i]
+    run Testing.expect(sample.timestampMicroseconds >= previous && sample.timestampMicroseconds <= profile.endMicroseconds(),
+      "every sample carries its actual ordered observation time")
+    run Testing.expect(sample.timestampMicroseconds - previous >= 1, "due samples do not duplicate invented missed ticks")
+    run Testing.expect(sample.kind == cpu.JAVASCRIPT, "VM safepoints do not invent native, idle, or GC samples")
+    run Testing.expect(sample.firstFrame <= frames.length && sample.frameCount <= frames.length - sample.firstFrame,
+      "sample frame ranges refer only to populated owned storage")
+    previous = sample.timestampMicroseconds
+    let mut j: usize = 0 let mut sawLeaf = false let mut sawOuter = false
+    while j < sample.frameCount {
+      let frame = frames[sample.firstFrame + j]
+      if frame.kind == cpu.JAVASCRIPT {
+        run Testing.expect(frame.functionAddress != 0 && frame.scriptId != 0 && frame.functionIndex < functions.length,
+          "JavaScript frames preserve actual code identity, script identity, and function metadata")
+        let function = &functions[frame.functionIndex]
+        run Testing.expect(function.address == frame.functionAddress && function.scriptId == frame.scriptId,
+          "frame attribution and copied function registry agree")
+        run Testing.expect(ascii(function.url(), b"cpu-profile-consumer.js"), "script URL comes from compiled source metadata")
+        if ascii(function.name(), b"cpuLeaf") { sawLeaf = true leaf = true }
+        if ascii(function.name(), b"cpuOuter") { sawOuter = true outer = true }
+        if let Option<usize>.Some { value: pc } = frame.pc { if pc != 0 { actualPc = true } }
+      }
+      j = j + 1
+    }
+    if sawLeaf && sawOuter { nested = true }
+    i = i + 1
+  }
+  run Testing.expect(leaf && outer && nested && actualPc, "real nested calls retain leaf/caller function names and executing PCs")
+  let encoded = run json.encode(&profile)
+  let mut check = ByteBuffer.make()
+  run check.appendSlice(b"(function(){const p=JSON.parse('")
+  i = 0
+  while i < encoded.length() {
+    let byte = encoded.get(i)
+    if byte == 39 || byte == 92 { run check.append(92) }
+    run check.append(byte) i = i + 1
+  }
+  run check.appendSlice(b"');return p.nodes[0].callFrame.functionName==='(root)'&&p.samples.length>0&&p.samples.length===p.timeDeltas.length&&p.samples.every(id=>p.nodes.some(n=>n.id===id))&&p.nodes.every(n=>n.children.every(id=>p.nodes.some(c=>c.id===id)))&&p.nodes.some(n=>n.callFrame.functionName==='cpuLeaf'&&n.callFrame.url==='cpu-profile-consumer.js')&&p.timeDeltas.every(d=>d>0)&&p.timeDeltas.reduce((a,b)=>a+b,0)<=p.endTime-p.startTime&&p.silk.safepointBias===true&&!p.nodes.some(n=>n.callFrame.functionName==='(idle)'||n.callFrame.functionName==='(garbage collector)')})()")
+  let checked = run unsafe evaluation.evaluate(&mut hooks, memory, context, check.asSlice(), b"cpu-profile-json-consumer.js", 0)
+  let validJson = match checked { Value.Bool { value: jsonAccepted } => jsonAccepted _ => false }
+  unsafe gc.release(&mut hooks, rt, checked)
+  run Testing.expect(validJson, "native CDP output parses as JSON and preserves its observed tree, samples, timestamps, and function metadata")
+  let again = run unsafe cpu.stop(rt)
+  run Testing.expect(match &again { Option<Profile>.None => true _ => false }, "repeated stop is inert")
+  let savedCount = profile.samples().length let savedEnd = profile.endMicroseconds()
+  run Testing.expect(run unsafe cpu.start(rt, 1, 1, 1, 1), "a stopped runtime can start a fresh bounded recorder")
+  run elapsed(1000)
+  run unsafe cpu.observe(rt, cpu.NATIVE)
+  run elapsed(1000)
+  unsafe cpu.observeNow(rt, cpu.NATIVE)
+  let bounded = run unsafe stopped(rt)
+  run Testing.expect(bounded.samples().length == 1 && bounded.droppedObservations() == 1,
+    "two real due observations produce one retained sample and one capacity drop, never catch-up samples")
+  run Testing.expect(bounded.samples()[0].kind == cpu.NATIVE, "native state appears only after explicit native observation")
+  run Testing.expect(profile.samples().length == savedCount && profile.endMicroseconds() == savedEnd,
+    "a later recording cannot mutate storage transferred by stop")
+  run Testing.expect(!(run unsafe cpu.start(rt, 0, 1, 1, 1)), "zero interval is rejected without enabling profiling")
+  run unsafe cpu.observe(rt, cpu.NATIVE)
+}

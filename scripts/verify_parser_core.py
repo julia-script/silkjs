@@ -28,16 +28,16 @@ static void record(JSContext *ctx) {
 }
 '''
 S_HEADER = r'''
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.effect { Effect }
-import silk.result { Result }
-import silk.pointer { Pointer }
-import silk.usize
-import silk.u16
-import silk.i32
-import silk.i64
-import silk.writer { Writer, WriterError }
-import silk.os_writer { StdoutWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.mem.pointer { Pointer }
+import silk.num.usize
+import silk.num.u16
+import silk.num.i32
+import silk.num.i64
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StdoutWriter }
 import byte_buffer { ByteBuffer }
 import runtime_memory { RuntimeAllocator }
 import js_heap { HeapCell, HeapHeader }

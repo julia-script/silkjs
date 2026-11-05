@@ -18,10 +18,10 @@ FIELDS = ('success', 'error_kind', 'result_length', 'result_digest', 'read',
           'written', 'backing_length', 'backing_digest', 'callbacks', 'events',
           'detached', 'pending', 'faults', 'source_reclaimed_bytes', 'allocations', 'bytes')
 NATIVE = r'''
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.effect { Effect }
-import silk.writer { Writer, WriterError }
-import silk.os_writer { StdoutWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.io.writer { Writer, WriterError }
+import silk.io.writer_native { StdoutWriter }
 import byte_buffer { ByteBuffer }
 import js_typed_array_methods_codecs_oracle as oracle
 import js_exceptions { JsException }
@@ -41,9 +41,10 @@ pub effect fn main() -> i32 ! OutOfMemoryError | StringLengthError | BigIntError
 
 
 def records(data, count, label):
-    if len(data) != count * 64:
-        raise SystemExit(f'{label}: expected {count * 64} bytes, got {len(data)}')
-    rows = list(struct.iter_unpack('<16I', data))
+    word_bytes = 8 if len(data) == count * 128 else 4
+    if len(data) != count * 16 * word_bytes:
+        raise SystemExit(f'{label}: expected {count * 64} or {count * 128} bytes, got {len(data)}')
+    rows = list(struct.iter_unpack('<16Q' if word_bytes == 8 else '<16I', data))
     for i, row in enumerate(rows):
         if row[14:] != (0, 0):
             raise SystemExit(f'{label} row {i}: owner leak {row}')
@@ -61,7 +62,7 @@ def native(temp, silk, stdlib, cases, cutoffs=1, armed=False):
     while cutoff < {cutoffs} {{
       let row = run oracle.isolated(cases[i].method, cases[i].kind, {str(armed).lower()}, cutoff)
       let mut field: usize = 0
-      while field < 16 {{ run out.writeU32(row[field]) |> Effect.provideMut<Allocator>(&mut system) field = field + 1 }}
+      while field < 16 {{ run out.writeU64(row[field]) |> Effect.provideMut<Allocator>(&mut system) field = field + 1 }}
       cutoff = cutoff + 1
     }}
     i = i + 1

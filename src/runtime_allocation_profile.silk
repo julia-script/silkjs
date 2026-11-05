@@ -1,0 +1,108 @@
+//! Bounded native allocation events. No JS ownership, allocation or user callback
+//! is permitted while recording. Sampling is deterministic byte-interval sampling,
+//! not V8's Poisson sampler; dropped events are reported rather than extrapolated.
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.ownership { Copy }
+import silk.mem.pointer { Pointer }
+import silk.num.usize
+import silk.num.i64
+import js_os_events_platform as clock
+
+pub struct Frame {
+  pub function: usize, pub scriptId: u64, pub pc: usize,
+  pub line: i32, pub column: i32,
+  pub nameLength: usize, pub nameTruncated: bool, pub name: [u16; 64]
+}
+impl Copy for Frame {}
+pub struct Trace { pub timestampNs: u64, pub depth: usize, pub truncated: bool, pub frames: [Frame; 16] }
+impl Copy for Trace {}
+pub fn emptyTrace() -> Trace {
+  let f = Frame { function: 0, scriptId: 0, pc: 0, line: -1, column: -1,
+    nameLength: 0, nameTruncated: false, name: [0; 64] }
+  return Trace { timestampNs: 0, depth: 0, truncated: false, frames: [f,f,f,f,f,f,f,f,f,f,f,f,f,f,f,f] }
+}
+pub struct AllocationRecord {
+  pub id: u64, pub address: usize, pub requestedBytes: usize, pub chargedBytes: usize
+}
+impl Copy for AllocationRecord {}
+pub struct Event { pub allocation: AllocationRecord, pub reclaimed: bool, pub trace: Trace }
+impl Copy for Event {}
+pub struct Config {
+  pub capacity: usize, pub intervalBytes: usize,
+  pub callback: extern "C" fn(?*mut u8, *mut Trace) -> (), pub context: ?*mut u8
+}
+impl Copy for Config {}
+pub struct Recording {
+  pub epoch: u64,
+  pub intervalBytes: usize,
+  pub events: List<Event>,
+  pub length: usize,
+  pub dropped: usize,
+  pub sampledAllocations: usize,
+  pub sampledBytes: usize,
+  remaining: usize,
+  callback: extern "C" fn(?*mut u8, *mut Trace) -> (),
+  context: ?*mut u8
+}
+impl Recording {
+  pub fn config(self: &Self) -> Config {
+    return Config { capacity: self.events.length(), intervalBytes: self.intervalBytes,
+      callback: self.callback, context: self.context }
+  }
+  /// Destination was preallocated outside the ledger gate with identical capacity.
+  pub fn copyInto(self: &Self, output: &mut Self) -> () {
+    output.epoch = self.epoch output.intervalBytes = self.intervalBytes
+    output.length = self.length output.dropped = self.dropped
+    output.sampledAllocations = self.sampledAllocations output.sampledBytes = self.sampledBytes
+    let values = output.events.asMutSlice()
+    let mut i: usize = 0
+    while i < self.length { values[i] = self.events.asSlice()[i] i = i + 1 }
+  }
+  /// Reserve with an allocator independent of the observed ledger. The callback
+  /// runs only on its owning allocation thread, never on a reclaiming thread.
+  /// It must not allocate, release, lock this ledger, execute JS, or suspend.
+  pub effect fn make(capacity: usize, intervalBytes: usize,
+    callback: extern "C" fn(?*mut u8, *mut Trace) -> (), context: ?*mut u8) -> Self
+    ! OutOfMemoryError ? &mut Allocator {
+    let mut events = List<Event>.make()
+    run events.reserveExact(capacity)
+    let empty = Event { allocation: AllocationRecord { id: 0, address: 0, requestedBytes: 0, chargedBytes: 0 }, reclaimed: false, trace: emptyTrace() }
+    let mut i: usize = 0
+    while i < capacity { run events.append(empty) i = i + 1 }
+    let interval = if intervalBytes == 0 { 1 } else { intervalBytes }
+    return Self { epoch: 0, intervalBytes: interval, events: move events, length: 0, dropped: 0,
+      sampledAllocations: 0, sampledBytes: 0, remaining: interval, callback: callback, context: context }
+  }
+  pub fn allocation(self: &mut Self, record: AllocationRecord) -> bool {
+    // Zero-byte requests still own native storage and participate in sampling.
+    let bytes = if record.requestedBytes == 0 { 1 } else { record.requestedBytes }
+    if bytes < self.remaining { self.remaining = self.remaining - bytes return false }
+    self.remaining = self.intervalBytes - ((bytes - self.remaining) % self.intervalBytes)
+    self.sampledAllocations = self.sampledAllocations + 1
+    self.sampledBytes = self.sampledBytes + record.requestedBytes
+    if !self.hasRoom() { return true }
+    let mut trace = emptyTrace()
+    unsafe self.callback(self.context, Pointer.fromMutRef(&mut trace))
+    self.append(Event { allocation: record, reclaimed: false, trace: trace })
+    return true
+  }
+  pub fn reclaim(self: &mut Self, record: AllocationRecord) -> () {
+    // No thread-local JS stack may be consulted on cross-thread reclamation.
+    if !self.hasRoom() { return () }
+    let mut trace = emptyTrace()
+    trace.timestampNs = i64.toU64(clock.nowNanoseconds())
+    self.append(Event { allocation: record, reclaimed: true, trace: trace })
+  }
+  fn hasRoom(self: &mut Self) -> bool {
+    if self.length != self.events.length() { return true }
+    if self.dropped != usize.MAX { self.dropped = self.dropped + 1 }
+    return false
+  }
+  fn append(self: &mut Self, event: Event) -> () {
+    let events = self.events.asMutSlice()
+    events[self.length] = event
+    self.length = self.length + 1
+  }
+  pub fn finish(self: &mut Self) -> () { self.events.truncate(self.length) }
+}

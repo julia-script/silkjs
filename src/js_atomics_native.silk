@@ -5,22 +5,27 @@
 //! views (including Int32/BigInt64) match by byte address, not wrapper or width.
 //! CancellableDomain owns a queue lease and an independent stop scope. Borrowed
 //! Domain handles remain valid only while their queue and scope owners are live.
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.atomic { Atomic, MemoryOrder }
-import silk.box { Box }
-import silk.layout { Layout }
-import silk.ownership { Copy, Drop }
-import silk.pointer { Pointer }
-import silk.raw_buffer { RawBuffer }
-import silk.slot { Slot }
-import silk.thread { Transferable, Concurrent }
-import silk.effect { Effect }
-import silk.native_thread { NativeThread, SpawnError }
-import silk.testing { Testing, AssertionError }
-import silk.usize
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.concurrency.atomic { Atomic, MemoryOrder }
+import silk.mem.box { Box }
+import silk.mem.layout { Layout }
+import silk.core.ownership { Copy, Drop }
+import silk.mem.pointer { Pointer }
+import silk.mem.raw_buffer { RawBuffer }
+import silk.mem.slot { Slot }
+import silk.concurrency.thread { Transferable, Concurrent }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.concurrency.thread_native { NativeThread, SpawnError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.num.usize
+import silk.num.i32
+import silk.num.u32
 import runtime_memory { RuntimeAllocator }
 import js_shared_memory as shared
 import js_shared_memory { Span }
+import silk.text.format { Debug, Format, Formatter }
+import silk.io.writer { Writer, WriterError }
 
 // Opaque POSIX storage: 64 bytes, alignment 8. Darwin arm64 mutex/cond are
 // 64/48 bytes; GNU libc x86_64/aarch64 mutex/cond fit the same envelopes.
@@ -64,20 +69,37 @@ struct Queue {
 struct Cancellation { cancelled: bool, active: usize }
 /// Copyable native capability, not an owning handle. Using it after its domain
 /// is destroyed is invalid. JS runtime/heap values never cross native threads.
+pub type WaitInterrupt = extern "C" fn(?*mut u8) -> u8
 pub struct Domain {
   queue: *mut Queue,
   mutex: *mut NativeMutex,
   cancellation: ?*mut Cancellation,
+  interrupt: Option<WaitInterrupt>,
+  interruptOpaque: ?*mut u8,
 }
 impl Copy for Domain {}
 impl Transferable for Domain {}
 impl Concurrent for Domain {}
+/// Borrows a thread-local, non-JS interrupt predicate for this capability only.
+/// Keep its opaque owner alive until all waits using the returned handle finish.
+/// Owning domain constructors deliberately do not inherit this borrowed hook.
+pub unsafe fn withInterrupt(domain: Domain, callback: WaitInterrupt, opaque: ?*mut u8) -> Domain {
+  let mut configured = domain
+  configured.interrupt = Option<WaitInterrupt>.some(callback)
+  configured.interruptOpaque = opaque
+  return configured
+}
 /// One-allocation shared waiter-list owner. Per-wait storage lives on the waiting
 /// thread's stack; every borrowed handle must retain an enclosing owner.
 pub struct WaiterDomain { domain: Domain }
 impl Transferable for WaiterDomain {}
 impl Concurrent for WaiterDomain {}
 pub struct SynchronizationError { pub code: i32 }
+impl Debug for SynchronizationError {
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return run Format.debugFields(self, "SynchronizationError", &mut formatter)
+  }
+}
 impl WaiterDomain {
   pub effect fn make() -> WaiterDomain ! OutOfMemoryError | SynchronizationError ? &mut Allocator {
     supportedTarget()
@@ -95,7 +117,7 @@ impl WaiterDomain {
       fail SynchronizationError { code: status }
     }
     return WaiterDomain {
-      domain: Domain { queue: queue, mutex: mutex, cancellation: Pointer.null<Cancellation>() } }
+      domain: Domain { queue: queue, mutex: mutex, cancellation: Pointer.null<Cancellation>(), interrupt: Option<WaitInterrupt>.none(), interruptOpaque: Pointer.null<u8>() } }
   }
   pub fn handle(self: &Self) -> Domain { return self.domain }
   /// Retains the live parent queue without allocation or inheriting its stop scope.
@@ -106,7 +128,7 @@ impl WaiterDomain {
     let previous = unsafe Atomic.fetchAdd<usize>(references, 1, MemoryOrder.Relaxed)
     if previous == 0 || previous > usize.MAX / 2 { invariant() }
     return WaiterDomain { domain: Domain {
-      queue: parent.queue, mutex: parent.mutex, cancellation: Pointer.null<Cancellation>() } }
+      queue: parent.queue, mutex: parent.mutex, cancellation: Pointer.null<Cancellation>(), interrupt: Option<WaitInterrupt>.none(), interruptOpaque: Pointer.null<u8>() } }
   }
 }
 impl Drop for WaiterDomain {
@@ -139,7 +161,7 @@ impl CancellableDomain {
     drop queue
     requireSuccess(unsafe pthread_mutex_unlock(parent.mutex))
     return CancellableDomain { storage: move storage, owner: move owner,
-      domain: Domain { queue: parent.queue, mutex: parent.mutex, cancellation: cancellation } }
+      domain: Domain { queue: parent.queue, mutex: parent.mutex, cancellation: cancellation, interrupt: Option<WaitInterrupt>.none(), interruptOpaque: Pointer.null<u8>() } }
   }
   pub fn handle(self: &Self) -> Domain { return self.domain }
   pub fn cancel(self: &Self) -> () {
@@ -257,8 +279,29 @@ pub enum WaitResult { NotEqual, TimedOut, Ok, Cancelled }
 /// timeout is whole milliseconds; i64.MAX denotes infinite. No retry loop:
 /// source pthread spurious wakeups return "ok". The comparison is a real
 /// atomic load, avoiding source C's plain-load data race with atomic writers.
-pub unsafe fn wait(domain: Domain, span: Span, offset: u32, sizeLog2: u32,
+pub unsafe fn wait(domain: Domain, span: Span, offset: u64, sizeLog2: u32,
   expected: u64, timeout: i64) -> WaitResult {
+  return unsafe waitDuration(domain, span, offset, sizeLog2, expected,
+    timeout == 9223372036854775807, timeout / 1000, (timeout % 1000) * 1000000)
+}
+/// WebAssembly timeout is signed nanoseconds; every negative value is infinite.
+/// This uses the same address-keyed queue and canonical comparison as Atomics.wait.
+pub unsafe fn waitNanoseconds(domain: Domain, span: Span, offset: u64, sizeLog2: u32,
+  expected: u64, timeout: i64) -> WaitResult {
+  return unsafe waitDuration(domain, span, offset, sizeLog2, expected,
+    timeout < 0, timeout / 1000000000, timeout % 1000000000)
+}
+fn realtime() -> Timespec {
+  let mut now = Timespec { seconds: 0, nanoseconds: 0 }
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    requireSuccess(unsafe darwinClockGetTime(0, Pointer.fromMutRef(&mut now)))
+  } else {
+    requireSuccess(unsafe gnuClockGetTime(0, Pointer.fromMutRef(&mut now)))
+  }
+  return move now
+}
+unsafe fn waitDuration(domain: Domain, span: Span, offset: u64, sizeLog2: u32,
+  expected: u64, infinite: bool, seconds: i64, nanoseconds: i64) -> WaitResult {
   let address = unsafe shared.address(span, offset)
   requireSuccess(unsafe pthread_mutex_lock(domain.mutex))
   // The flag and enqueue are protected by the same mutex. Cancellation cannot
@@ -290,7 +333,41 @@ pub unsafe fn wait(domain: Domain, span: Span, offset: u32, sizeLog2: u32,
     state.active = state.active + 1
   }
   let mut status: i32 = 0
-  if timeout == 9223372036854775807 {
+  let mut interrupted = false
+  let mut timedOut: i32 = 110
+  static if Intrinsic.targetOperatingSystem() == "darwin" { timedOut = 60 }
+  if let Option<WaitInterrupt>.Some { value: callback } = domain.interrupt {
+    let mut deadline = realtime()
+    deadline.seconds = deadline.seconds + seconds
+    deadline.nanoseconds = deadline.nanoseconds + nanoseconds
+    if deadline.nanoseconds >= 1000000000 {
+      deadline.nanoseconds = deadline.nanoseconds - 1000000000
+      deadline.seconds = deadline.seconds + 1
+    }
+    while true {
+      // The waiter stays linked during every slice and predicate call. A notify
+      // cannot be lost between polling intervals, and its FIFO position is fixed.
+      requireSuccess(unsafe pthread_mutex_unlock(domain.mutex))
+      interrupted = unsafe callback(domain.interruptOpaque) != 0
+      requireSuccess(unsafe pthread_mutex_lock(domain.mutex))
+      if interrupted || unsafe cancelled(domain) { break }
+      if !(unsafe Pointer.borrow(&anchor, node)).linked { status = 0 break }
+      let mut next = realtime()
+      if !infinite && (next.seconds > deadline.seconds || (next.seconds == deadline.seconds && next.nanoseconds >= deadline.nanoseconds)) {
+        status = timedOut break
+      }
+      next.nanoseconds = next.nanoseconds + 10000000
+      if next.nanoseconds >= 1000000000 {
+        next.nanoseconds = next.nanoseconds - 1000000000
+        next.seconds = next.seconds + 1
+      }
+      if !infinite && (next.seconds > deadline.seconds || (next.seconds == deadline.seconds && next.nanoseconds > deadline.nanoseconds)) {
+        next.seconds = deadline.seconds next.nanoseconds = deadline.nanoseconds
+      }
+      status = unsafe pthread_cond_timedwait(condition, domain.mutex, Pointer.fromRef(&next))
+      if status != 0 && status != timedOut { break }
+    }
+  } else if infinite {
     // Source ignores the return of the unbounded wait.
     let ignored = unsafe pthread_cond_wait(condition, domain.mutex)
   } else {
@@ -301,8 +378,8 @@ pub unsafe fn wait(domain: Domain, span: Span, offset: u32, sizeLog2: u32,
     } else {
       requireSuccess(unsafe gnuClockGetTime(0, Pointer.fromMutRef(&mut deadline)))
     }
-    deadline.seconds = deadline.seconds + timeout / 1000
-    deadline.nanoseconds = deadline.nanoseconds + (timeout % 1000) * 1000000
+    deadline.seconds = deadline.seconds + seconds
+    deadline.nanoseconds = deadline.nanoseconds + nanoseconds
     if deadline.nanoseconds >= 1000000000 {
       deadline.nanoseconds = deadline.nanoseconds - 1000000000
       deadline.seconds = deadline.seconds + 1
@@ -321,9 +398,7 @@ pub unsafe fn wait(domain: Domain, span: Span, offset: u32, sizeLog2: u32,
   }
   requireSuccess(unsafe pthread_mutex_unlock(domain.mutex))
   requireSuccess(unsafe pthread_cond_destroy(condition))
-  if wasCancelled { return WaitResult.Cancelled }
-  let mut timedOut: i32 = 110
-  static if Intrinsic.targetOperatingSystem() == "darwin" { timedOut = 60 }
+  if wasCancelled || interrupted { return WaitResult.Cancelled }
   if status == timedOut { return WaitResult.TimedOut }
   return WaitResult.Ok
 }
@@ -331,12 +406,17 @@ pub unsafe fn wait(domain: Domain, span: Span, offset: u32, sizeLog2: u32,
 /// so a waiter cannot destroy its stack condition while notify still uses it.
 pub unsafe fn notify(domain: Domain, address: *mut u8, count: i32) -> i32 {
   if count <= 0 { return 0 }
+  // notifyCount returns at most this positive i32 input.
+  return u32.toI32(unsafe notifyCount(domain, address, i32.toU32(count)))
+}
+pub unsafe fn notifyCount(domain: Domain, address: *mut u8, count: u32) -> u32 {
+  if count == 0 { return 0 }
   requireSuccess(unsafe pthread_mutex_lock(domain.mutex))
   let mut anchor = ()
   let queue = unsafe Pointer.borrow(&anchor, domain.queue)
   let mut cursor = queue.first
   drop queue
-  let mut notified: i32 = 0
+  let mut notified: u32 = 0
   while !Pointer.isNull<Waiter>(cursor) && notified < count {
     let pointer = unsafe nonnull(cursor)
     let node = unsafe Pointer.borrowMut(&mut anchor, pointer)
@@ -356,7 +436,7 @@ pub unsafe fn notify(domain: Domain, address: *mut u8, count: i32) -> i32 {
 
 // Module-local regression coordination observes the real queue under its mutex;
 // no production enqueue callback or public test-only waiter-count API is needed.
-fn regressionWait(domain: Domain, span: Span, offset: u32, shift: u32) -> i32 {
+fn regressionWait(domain: Domain, span: Span, offset: u64, shift: u32) -> i32 {
   return match unsafe wait(domain, span, offset, shift, 0, 10000) {
     WaitResult.Ok => 0
     WaitResult.Cancelled => 1

@@ -1,0 +1,99 @@
+//! Single-shot debugger evaluation: ownership of a successful result is transferred,
+//! not reconstructed by a second execution. Termination always dominates inspection.
+import silk.mem.allocator { Allocator }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.mem.pointer { Pointer }
+import js_engine { Engine }
+import js_engine_host { EngineServices }
+import js_heap { HeapCell, HeapHeader }
+import js_core_types { RuntimeState, StackFrame, ContextState, FunctionBytecode }
+import js_value { Value }
+import js_debugger { Frame }
+import js_debugger as debugger
+import js_debugger_restricted as policy
+import js_eval as eval
+import js_eval_compile as compile
+import js_exceptions { JsException }
+import js_gc as gc
+import js_runtime as runtime
+
+pub union Evaluation {
+  Success { pub value: Value },
+  Exception { pub value: Value },
+  SideEffect,
+  InvalidFrame,
+  Terminated
+}
+unsafe effect fn evaluate<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  target: ?*mut StackFrame, receiver: Value, source: &[u8], scope: i32, restricted: bool) -> Evaluation ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+  // An inspector request cannot clear a timeout/worker cancellation already pending.
+  if state.currentExceptionIsUncatchable { return Evaluation.Terminated }
+  if state.debugger.evaluating || state.debugger.restricted { return Evaluation.SideEffect }
+  let savedException = Intrinsic.replace(state.currentException, Value.Uninitialized)
+  let savedFrame = state.currentStackFrame
+  let savedCallback = state.debugger.callbackActive
+  // Ordinary Runtime evaluation executes guest code: breakpoints and stepping
+  // remain live. Paused/frame evaluation and restricted previews cannot replace
+  // the suspended activation or recursively enter the debugger.
+  let observable = !restricted && Pointer.isNull<StackFrame>(target) && !state.debugger.paused
+  state.debugger.evaluating = !observable
+  if observable { state.debugger.callbackActive = false }
+  if !Pointer.isNull<StackFrame>(target) { state.currentStackFrame = target }
+  drop state
+  let started = !restricted || unsafe policy.begin(rt)
+  if !started {
+    let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+    state.currentException = savedException state.currentStackFrame = savedFrame state.debugger.evaluating = false
+    state.debugger.callbackActive = savedCallback
+    return Evaluation.SideEffect
+  }
+  let memory = engine.memory
+  let flags = if Pointer.isNull<StackFrame>(target) { compile.TYPE_GLOBAL } else { compile.TYPE_DIRECT }
+  let result = run Effect.result(unsafe eval.evaluateSource(&mut engine, memory, context, receiver,
+    source, b"<debugger>", flags, scope))
+  let rejected = restricted && unsafe policy.finish(rt)
+  let restored = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+  restored.currentStackFrame = savedFrame restored.debugger.evaluating = false
+  restored.debugger.callbackActive = savedCallback
+  let terminated = restored.currentExceptionIsUncatchable
+  if terminated {
+    drop restored unsafe gc.release(&mut engine, rt, savedException)
+    if let Result<Value, JsException>.Success { value } = move result { unsafe gc.release(&mut engine, rt, value) }
+    return Evaluation.Terminated
+  }
+  let evaluationException = Intrinsic.replace(restored.currentException, savedException)
+  restored.currentExceptionIsUncatchable = false drop restored
+  if rejected {
+    unsafe gc.release(&mut engine, rt, evaluationException)
+    if let Result<Value, JsException>.Success { value } = move result { unsafe gc.release(&mut engine, rt, value) }
+    return Evaluation.SideEffect
+  }
+  return match move result {
+    Result<Value, JsException>.Success { value } => {
+      unsafe gc.release(&mut engine, rt, evaluationException) return Evaluation.Success { value: value }
+    }
+    Result<Value, JsException>.Failure { error } => { drop error return Evaluation.Exception { value: evaluationException } }
+  }
+}
+pub unsafe effect fn evaluateGlobal<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  source: &[u8], restricted: bool) -> Evaluation ? &mut Allocator {
+  let anchor = () let realm = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  let receiver = realm.globalObject drop realm
+  return run unsafe evaluate(&mut engine, context, Pointer.null<StackFrame>(), receiver, source, -1, restricted)
+}
+pub unsafe effect fn evaluateFrame<'m, S: EngineServices>(engine: &mut Engine<'m, S>, handle: Frame,
+  source: &[u8], restricted: bool) -> Evaluation ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(handle.context)
+  let pointer = match Pointer.nonNullMut<StackFrame>(unsafe debugger.resolve(rt, handle)) {
+    Option<*mut StackFrame>.Some { value } => value _ => { return Evaluation.InvalidFrame }
+  }
+  let anchor = () let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, handle.bytecode)
+  if !code.debuggerMetadata.enabled { return Evaluation.InvalidFrame }
+  drop code
+  let frame = unsafe Pointer.borrow<(), StackFrame>(&anchor, pointer) let receiver = frame.thisValue drop frame
+  return run unsafe evaluate(&mut engine, handle.context, pointer, receiver, source, handle.scope, restricted)
+}

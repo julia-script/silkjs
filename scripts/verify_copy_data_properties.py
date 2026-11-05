@@ -144,11 +144,11 @@ int main(void){
 }
 '''
 SILK_SOURCE = r'''
-import silk.allocator {Allocator,OutOfMemoryError}
-import silk.effect {Effect}
-import silk.writer {Writer,WriterError}
-import silk.os_writer {StdoutWriter}
-import silk.u32
+import silk.mem.allocator {Allocator,OutOfMemoryError}
+import silk.core.effect {Effect}
+import silk.io.writer {Writer,WriterError}
+import silk.io.writer_native {StdoutWriter}
+import silk.num.u32
 import byte_buffer {ByteBuffer}
 import js_string_types {StringLengthError}
 import js_copy_data_properties_test_support as fixture

@@ -11,19 +11,23 @@
 //! RuntimeAllocator and reentrant host dispatch providers belong to the public Runtime
 //! handle, not RuntimeState; source malloc bookkeeping is provided by runtime_memory.
 
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.box { Box }
-import silk.layout { Layout }
-import silk.list { List }
-import silk.option { Option }
-import silk.ownership { Copy }
-import silk.pointer { Pointer }
-import silk.raw_buffer { RawBuffer }
-import silk.slot { Slot }
-import silk.usize
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.box { Box }
+import silk.mem.layout { Layout }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.pointer { Pointer }
+import silk.mem.raw_buffer { RawBuffer }
+import silk.mem.slot { Slot }
+import silk.num.usize
 import js_atoms { AtomTable }
 import js_heap { HeapHeader }
 import js_value { Value }
+import js_debugger_types { State as DebuggerState }
+import js_debugger_metadata { Metadata as DebuggerMetadata }
+import js_coverage { State as CoverageState }
+import js_cpu_profile { State as CpuProfileState }
 
 pub const JS_MODE_STRICT: u8 = 1
 pub const JS_MODE_ASYNC: u8 = 4
@@ -53,6 +57,8 @@ pub const JS_PROP_HAS_VALUE: u32 = 8192
 pub const JS_PROP_THROW: u32 = 16384
 pub const JS_PROP_THROW_STRICT: u32 = 32768
 pub const JS_PROP_NO_EXOTIC: u32 = 65536
+/// Transient exotic-definition hint; not a stored property attribute.
+pub const JS_PROP_GLOBAL_DECLARATION: u32 = 131072
 pub const JS_CALL_FLAG_CONSTRUCTOR: u32 = 1
 pub const JS_PROP_INITIAL_SIZE: usize = 2
 pub const JS_PROP_INITIAL_HASH_SIZE: usize = 4
@@ -453,7 +459,7 @@ pub struct LeakTrackingState {
 
 /// Runtime root payload (HeapKind.Auxiliary). Its AtomTable is a native owner.
 /// GC lists, context links, shape buckets and weak-list links are non-owning.
-/// currentException and queued JobEntry arguments are owned JS roots.
+/// currentException, asyncContext and queued JobEntry values are owned JS roots.
 pub struct RuntimeState {
   pub runtimeInfo: Option<ByteStorage>,
   pub atoms: AtomTable,
@@ -477,9 +483,21 @@ pub struct RuntimeState {
   pub stackTop: usize,
   pub stackLimit: usize,
   pub currentException: Value,
+  pub asyncContext: Value,
+  pub asyncHooksEnabled: bool,
+  pub asyncHookActive: bool,
+  pub asyncTokenNext: usize,
+  /// Borrowed during synchronous Promise capability construction; the caller
+  /// roots this Value until swapAsyncPromiseParent restores its predecessor.
+  pub asyncPromiseParent: Value,
   pub currentExceptionIsUncatchable: bool,
   pub inOutOfMemory: bool,
   pub currentStackFrame: ?*mut StackFrame,
+  pub debugger: DebuggerState,
+  pub coverage: CoverageState,
+  pub cpuProfile: CpuProfileState,
+  /// Monotonic compilation identity shared by all realms; zero means no script.
+  pub nextScriptId: u64,
   pub interrupt: HostHook,
   pub promiseRejectionTracker: HostHook,
   /// FIFO Auxiliary HeapCell<JobEntry> nodes; queue ownership is explicit JS roots.
@@ -521,25 +539,39 @@ pub struct ContextState {
   pub arrayPrototypeValues: Value,
   pub throwTypeError: Value,
   pub evalObject: Value,
+  /// Null unless this embedding enables lazy Node-style Error stack headers.
+  pub nodeErrorStackGetter: Value,
+  pub nodeErrorStackSetter: Value,
+  pub nodeErrorConstructor: Value,
+  pub nodeErrorFormatter: Value,
   pub userValues: [Value; 7],
   pub globalObject: Value,
+  /// Original global binding record behind a host exotic global object.
+  pub globalObjectStorage: Value,
+  /// Unresolved external bindings must not be promoted by writes to that record.
+  pub globalProxyBindings: Value,
   pub globalVarObject: Value,
   pub randomState: u64,
   pub interruptCounter: i32,
   pub loadedModules: ModuleList,
   pub regexpCompilerEnabled: bool,
   pub evalEnabled: bool,
+  /// Host policy for eval/Function; does not restrict explicit host compilation.
+  pub codeGenerationAllowed: bool,
+  /// Host-managed realms drain these jobs only at their own evaluation boundary.
+  pub privateJobQueue: bool,
   pub localeCallbacks: Option<LocaleCallbacks>,
   pub userOpaque: ?*mut u8
 }
 
 pub enum AutoInitKind { Prototype, ModuleNamespace, Property }
-/// Auto-init retains its Context realm. The opaque descriptor is either the source
-/// host pointer, a typed heap payload (module, for example), or a native table ID.
+/// Auto-init retains its Context realm. Initializer owns its callable; other
+/// opaque heap pointers (including module namespace payloads) remain borrowed.
 pub union AutoInitOpaque {
   Pointer { pub value: ?*mut u8 },
   Heap { pub reference: *mut HeapHeader },
-  Native { pub descriptor: NativeFunctionId }
+  Native { pub descriptor: NativeFunctionId },
+  Initializer { pub reference: *mut HeapHeader }
 }
 impl Copy for AutoInitOpaque {}
 pub union PropertySlot {
@@ -613,7 +645,7 @@ pub struct TypedArrayCache {
   /// Physical backing policy, refreshed when a native host publishes private bytes.
   pub shared: bool,
   pub cachedData: ?*mut u8,
-  pub count: u32,
+  pub count: u64,
   /// Immutable view policy: auto-length tracking OR a non-shared resizable
   /// backing buffer. Source track_rab/max_byte_length/shared never change after
   /// construction, so detach/resize only invalidate cachedData/count, not this bit.
@@ -648,11 +680,14 @@ pub union ObjectPayload {
   MappedArguments { pub arguments: MappedArgumentsData },
   TypedArray { pub array: TypedArrayCache },
   Boxed { pub value: Value },
+  ErrorStack { pub value: Value, pub cached: bool },
   RegExp { pub regexp: RegExpData },
   GlobalObject { pub global: GlobalObjectData },
   Opaque { pub family: ObjectPayloadFamily, pub reference: ?*mut HeapHeader }
 }
 pub struct ObjectData {
+  /// Actual allocation realm, independent of mutable prototype/constructor.
+  pub creationRealm: ?*mut HeapHeader,
   pub isStandardArrayPrototype: bool,
   pub extensible: bool,
   pub freeMark: bool,
@@ -703,6 +738,15 @@ impl Copy for VarDef {}
 pub enum FunctionKind { Normal, Generator, Async, AsyncGenerator }
 pub struct FunctionDebugInfo {
   pub filename: u32,
+  /// Optional call-expression coordinates; legacy PC coordinates stay unchanged.
+  pub callSitePcToLine: Option<ByteStorage>,
+  // Node VM presentation only; lexical maps and ordinary QuickJS stacks are unchanged.
+  pub nodeVm: bool,
+  // A sourceURL suppresses execution offsets, not declaration coordinates.
+  pub nodeSourceURL: bool,
+  pub lineOffset: i32,
+  pub columnOffset: i32,
+  pub sourceColumnOffset: i32,
   /// None is stripped/unavailable source, distinct from an available empty script.
   pub source: Option<ByteStorage>,
   pub pcToLine: ByteStorage
@@ -711,6 +755,16 @@ pub struct FunctionDebugInfo {
 /// lengths/counts; code may be borrowed ROM. realm, constants, atoms and closure
 /// names are explicit owned JS edges. Debug presence replaces source has_debug.
 pub struct FunctionBytecode {
+  /// Runtime-local compilation identity, shared by the entire compiled tree.
+  pub scriptId: u64,
+  pub scriptIsEval: bool,
+  /// Optional native debugger tables; deliberately absent from QuickJS serialization.
+  pub debuggerMetadata: DebuggerMetadata,
+  // Host import callback is a traced edge, never serialized into bytecode caches.
+  pub hostImport: Value,
+  pub hostModule: Value,
+  /// Node compilation source/origin, shared across a script tree; never serialized.
+  pub hostScriptMetadata: Value,
   pub mode: u8,
   pub hasPrototype: bool,
   pub hasSimpleParameterList: bool,
@@ -763,10 +817,14 @@ pub struct VarRef {
 /// after a call (None for native/no PC), not a pointer into growable bytecode.
 pub struct StackFrame {
   pub previous: ?*mut StackFrame,
+  pub debuggerId: u64,
   /// Explicit reverse link replaces source container_of(frame, AsyncFunctionState).
   /// Borrowed here; every attached async VarRef holds a separate explicit JS edge.
   pub asyncOwner: ?*mut HeapHeader,
   pub currentFunction: Value,
+  /// Borrowed from the activation owner; snapshots retain these as JS edges.
+  pub thisValue: Value,
+  pub newTarget: Value,
   pub arguments: FrameSlots,
   pub locals: FrameSlots,
   pub stack: FrameSlots,
@@ -851,6 +909,8 @@ pub struct ModuleDef {
   pub initialize: Option<NativeFunctionId>,
   pub hasTopLevelAwait: bool,
   pub resolved: bool,
+  // Detached host modules own dependency and asynchronous-parent graph edges.
+  pub hostOwnedGraph: bool,
   pub functionCreated: bool,
   pub status: ModuleStatus,
   pub dfsIndex: i32,
@@ -868,9 +928,12 @@ pub struct ModuleDef {
   pub metaObject: Value,
   pub privateValue: Value
 }
-/// Prepared nodes own their arguments; enqueue adds an owned Context realm.
+/// Prepared nodes own their arguments and registration context; enqueue owns a realm.
 pub struct JobEntry {
   pub realm: ?*mut HeapHeader,
+  pub asyncContext: Value,
+  pub asyncToken: usize,
+  pub asyncResource: Value,
   pub function: NativeFunctionId,
   pub arguments: List<Value>
 }

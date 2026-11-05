@@ -1,14 +1,17 @@
+import js_debugger_types { State as DebuggerState }
+import js_coverage { State as CoverageState }
+import js_cpu_profile { State as CpuProfileState }
 //! Native low-level runtime ownership and configuration. Allocate through the owning
 //! RuntimeAllocator provider; JS roots use js_gc, never native container destruction.
 //! allocateContextStorage is INTERNAL storage, not JS_NewContextRaw: callers must
 //! construct BasicObjects before exposing a JavaScript context to an embedding.
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.list { List }
-import silk.option { Option }
-import silk.pointer { Pointer }
-import silk.u32
-import silk.i32
-import silk.usize
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.pointer { Pointer }
+import silk.num.u32
+import silk.num.i32
+import silk.num.usize
 import js_atoms { AtomTable }
 import js_heap { HeapCell, HeapHeader, HeapKind }
 import js_value { Value }
@@ -44,6 +47,9 @@ pub effect fn allocateRuntimeStorage(stackTop: usize) -> *mut HeapHeader
   // Until publication every owner is lexical, so any failed allocation drops all
   // atom/native storage. Standard names are permanent atoms, not dynamic retains.
   return run HeapCell.allocate<RuntimeState>(HeapKind.Auxiliary, RuntimeState {
+    debugger: DebuggerState.make(),
+    coverage: CoverageState.make(),
+    cpuProfile: CpuProfileState.make(),
     runtimeInfo: Option<ByteStorage>.none(), atoms: move atoms, classes: move registry,
     intlClassIds: [0; 10],
     intlSegmentsClassId: 0, intlSegmentIteratorClassId: 0,
@@ -55,7 +61,10 @@ pub effect fn allocateRuntimeStorage(stackTop: usize) -> *mut HeapHeader
     leakTracking: Option<LeakTrackingState>.none(), stackSize: 1048576, stackTop: stackTop,
     stackLimit: usize.wrappingSubtract(stackTop, 1048576),
     currentException: Value.Uninitialized, currentExceptionIsUncatchable: false, inOutOfMemory: false,
+    asyncContext: Value.Undefined,
+    asyncHooksEnabled: false, asyncHookActive: false, asyncTokenNext: 1, asyncPromiseParent: Value.Undefined,
     currentStackFrame: Pointer.null<StackFrame>(), interrupt: noHook(), promiseRejectionTracker: noHook(), jobs: HeapList.make(),
+    nextScriptId: 1,
     moduleLoader: ModuleLoaderHooks { normalize: Option<NativeFunctionId>.none(), load: Option<NativeFunctionId>.none(),
       checkSupportedImportAttributes: Option<NativeFunctionId>.none(), loaderHasAttributes: false, opaque: Pointer.null<u8>() },
     moduleAsyncEvaluationNextTimestamp: 0, canBlock: false,
@@ -63,6 +72,17 @@ pub effect fn allocateRuntimeStorage(stackTop: usize) -> *mut HeapHeader
       duplicate: Option<NativeFunctionId>.none(), opaque: Pointer.null<u8>() },
     stripFlags: 0, shapeHashBits: 4, shapeHashCount: 0, shapeHash: move buckets, userOpaque: Pointer.null<u8>()
   })
+}
+
+/// Allocate a compilation identity, never a filename-derived identity. Failed
+/// compilations may leave gaps; identities are never recycled within a runtime.
+pub unsafe fn allocateScriptId(runtime: *mut HeapHeader) -> u64 {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  let id = state.nextScriptId
+  if id == 18446744073709551615 { Intrinsic.trap("script identity exhausted") }
+  state.nextScriptId = id + 1
+  return id
 }
 /// Internal allocation for the intrinsic constructor. Every owned slot is valid;
 /// no JS intrinsics or objects have been constructed. Returned context owns one RC.
@@ -86,10 +106,13 @@ pub unsafe effect fn allocateContextStorage(runtime: *mut HeapHeader) -> *mut He
     arrayConstructor: Value.Null, regexpConstructor: Value.Null, promiseConstructor: Value.Null,
     nativeErrorPrototypes: [Value.Null; 9], iteratorConstructor: Value.Null, asyncIteratorPrototype: Value.Null,
     arrayPrototypeValues: Value.Null, throwTypeError: Value.Null, evalObject: Value.Null,
-    userValues: [Value.Null; 7], globalObject: Value.Null, globalVarObject: Value.Null,
+    nodeErrorStackGetter: Value.Null, nodeErrorStackSetter: Value.Null,
+    nodeErrorConstructor: Value.Null, nodeErrorFormatter: Value.Null,
+    userValues: [Value.Null; 7], globalObject: Value.Null, globalObjectStorage: Value.Null,
+    globalProxyBindings: Value.Null, globalVarObject: Value.Null,
     randomState: 0, interruptCounter: 0,
     loadedModules: ModuleList { first: Pointer.null<HeapHeader>(), last: Pointer.null<HeapHeader>() },
-    regexpCompilerEnabled: false, evalEnabled: false,
+    regexpCompilerEnabled: false, evalEnabled: false, codeGenerationAllowed: true, privateJobQueue: false,
     localeCallbacks: Option<LocaleCallbacks>.none(), userOpaque: Pointer.null<u8>()
   })
   match Pointer.nonNullMut<HeapHeader>(previous) {
@@ -113,6 +136,54 @@ pub unsafe fn contextRuntime(context: *mut HeapHeader) -> *mut HeapHeader {
 pub unsafe fn duplicateContext(context: *mut HeapHeader) -> *mut HeapHeader {
   unsafe HeapCell.retain(context)
   return context
+}
+/// Returns an owned reference to the current async context without allocating.
+pub unsafe fn getAsyncContext(runtime: *mut HeapHeader) -> Value {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  return unsafe state.asyncContext.retained()
+}
+/// Consumes value, installing the replacement before releasing the previous root.
+pub unsafe fn setAsyncContext<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, value: Value) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  let previous = Intrinsic.replace(state.asyncContext, value)
+  drop state
+  unsafe gc.release(&mut hooks, runtime, previous)
+}
+pub unsafe fn setAsyncHooksEnabled(runtime: *mut HeapHeader, enabled: bool) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.asyncHooksEnabled = enabled
+}
+/// Zero denotes an unobserved resource. Hook-created resources are not instrumented.
+pub unsafe fn allocateAsyncToken(runtime: *mut HeapHeader) -> usize {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  if !state.asyncHooksEnabled || state.asyncHookActive { return 0 }
+  let token = state.asyncTokenNext
+  state.asyncTokenNext = token + 1
+  return token
+}
+pub unsafe fn swapAsyncPromiseParent(runtime: *mut HeapHeader, parent: Value) -> Value {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  return Intrinsic.replace(state.asyncPromiseParent, parent)
+}
+/// Observer callbacks cannot throw recoverably; the embedding treats hook errors as fatal.
+/// No mutable runtime borrow survives reentrant delivery.
+pub unsafe effect fn emitAsyncLifecycle<H: HeapHooks>(hooks: &mut H, context: *mut HeapHeader,
+  event: u32, token: usize, parent: usize, resource: Value, parentResource: Value) -> () ? &mut Allocator {
+  if !resource.isObject() { return }
+  let runtime = unsafe contextRuntime(context)
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  if !state.asyncHooksEnabled || state.asyncHookActive { return }
+  state.asyncHookActive = true
+  drop state
+  run unsafe hooks.asyncLifecycle(context, event, token, parent, resource, parentResource)
+  let after = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  after.asyncHookActive = false
 }
 pub unsafe fn getRuntimeOpaque(runtime: *mut HeapHeader) -> ?*mut u8 {
   let anchor = ()

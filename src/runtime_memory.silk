@@ -6,16 +6,20 @@
 //! last allocation is reclaimed. Child allocator metadata is outside this budget.
 //! Reclamation is entirely native Silk; the C ABI is only the adoption callback ABI.
 
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.atomic { Atomic, CompareExchange, MemoryOrder }
-import silk.effect { Effect }
-import silk.layout { Layout }
-import silk.ownership { Copy, Drop }
-import silk.pointer { Pointer }
-import silk.raw_buffer { RawBuffer }
-import silk.slot { Slot }
-import silk.thread { Transferable, Concurrent }
-import silk.usize
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.concurrency.atomic { Atomic, CompareExchange, MemoryOrder }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.mem.layout { Layout }
+import silk.core.ownership { Copy, Drop }
+import silk.mem.pointer { Pointer }
+import silk.mem.raw_buffer { RawBuffer }
+import silk.mem.slot { Slot }
+import silk.concurrency.thread { Transferable, Concurrent }
+import silk.num.usize
+import silk.collections.list { List }
+import silk.core.option { Option }
+import runtime_allocation_profile { AllocationRecord, Recording, Config }
 
 /// A coherent, allocation-free snapshot. Peak usage counts successful allocations only.
 pub struct RuntimeMemoryStats {
@@ -33,7 +37,11 @@ struct Ledger {
   storage: Intrinsic.RawBuffer<Ledger>,
   references: usize,
   gate: usize,
-  stats: RuntimeMemoryStats
+  stats: RuntimeMemoryStats,
+  firstAllocation: ?*mut AllocationHeader,
+  nextAllocationId: u64,
+  nextProfileEpoch: u64,
+  profile: Option<Recording>
 }
 
 // Field addresses are obtained from a fresh typed borrow, never from assumed offsets.
@@ -50,14 +58,24 @@ impl Copy for LedgerPointers {}
 struct AllocationHeader {
   storage: Intrinsic.RawBuffer<u8>,
   ledger: LedgerPointers,
-  chargedBytes: usize
+  chargedBytes: usize,
+  record: AllocationRecord,
+  sampledEpoch: u64,
+  previous: ?*mut AllocationHeader,
+  next: ?*mut AllocationHeader
 }
+
+/// Native, allocation-free notification of actual child allocator exhaustion.
+/// Budget/layout rejection does not invoke it. The callback runs without a
+/// ledger lock and must not allocate, reenter JavaScript, or borrow this provider.
+pub type AllocationFailureHandler = extern "C" fn(usize) -> ()
 
 /// An Allocator provider whose allocations do not borrow the provider or its child.
 /// A child must honor the Allocator contract: returned owners reclaim independently.
 pub struct RuntimeAllocator<A> {
   child: A,
-  ledger: LedgerPointers
+  ledger: LedgerPointers,
+  failureHandler: Option<AllocationFailureHandler>
 }
 
 impl<A: Transferable> Transferable for RuntimeAllocator<A> {}
@@ -70,6 +88,112 @@ impl Transferable for AllocationObserver {}
 impl Concurrent for AllocationObserver {}
 impl AllocationObserver {
   pub fn stats(self: &Self) -> RuntimeMemoryStats { return ledgerStats(self.ledger) }
+  /// Install a preallocated recorder; repeated start leaves the active session
+  /// unchanged. Only the owning allocation thread may start/stop profiling.
+  pub fn startProfile(self: &Self, recording: Recording) -> bool {
+    let ledger = self.ledger
+    unsafe lockLedger(ledger)
+    let mut anchor = ()
+    let state = unsafe Pointer.borrowMut(&mut anchor, ledger.allocation)
+    match &state.profile {
+      Option<Recording>.Some {..} => {
+        drop state unsafe unlockLedger(ledger) drop recording return false
+      }
+      _ => ()
+    }
+    let mut owned = move recording
+    owned.epoch = state.nextProfileEpoch
+    state.nextProfileEpoch = state.nextProfileEpoch + 1
+    state.profile = Option<Recording>.some(move owned)
+    drop state unsafe unlockLedger(ledger)
+    return true
+  }
+  pub fn stopProfile(self: &Self) -> Option<Recording> {
+    let ledger = self.ledger
+    unsafe lockLedger(ledger)
+    let mut anchor = ()
+    let state = unsafe Pointer.borrowMut(&mut anchor, ledger.allocation)
+    let mut result = Intrinsic.replace(state.profile, Option<Recording>.none())
+    drop state unsafe unlockLedger(ledger)
+    match &mut result { Option<Recording>.Some { value } => value.finish() _ => () }
+    return move result
+  }
+  /// Snapshot without stopping. Owner thread only; the provided allocator must
+  /// be independent of this ledger. Cross-thread reclaims can continue.
+  pub effect fn profileSnapshot(self: &Self) -> Option<Recording>
+    ! OutOfMemoryError ? &mut Allocator {
+    let ledger = self.ledger
+    unsafe lockLedger(ledger)
+    let anchor = ()
+    let state = unsafe Pointer.borrow(&anchor, ledger.allocation)
+    let config = match &state.profile {
+      Option<Recording>.Some { value } => Option<Config>.some(value.config())
+      _ => Option<Config>.none()
+    }
+    drop state unsafe unlockLedger(ledger)
+    let settings = match move config {
+      Option<Config>.Some { value } => value
+      _ => { return Option<Recording>.none() }
+    }
+    let mut output = run Recording.make(settings.capacity, settings.intervalBytes,
+      settings.callback, settings.context)
+    unsafe lockLedger(ledger)
+    let current = unsafe Pointer.borrow(&anchor, ledger.allocation)
+    match &current.profile {
+      Option<Recording>.Some { value } => value.copyInto(&mut output)
+      _ => { drop current unsafe unlockLedger(ledger) return Option<Recording>.none() }
+    }
+    drop current unsafe unlockLedger(ledger)
+    output.finish()
+    return Option<Recording>.some(move output)
+  }
+  /// Finds an interior address without allocating or borrowing a JS payload.
+  pub fn lookupAllocation(self: &Self, address: usize) -> Option<AllocationRecord> {
+    let ledger = self.ledger
+    unsafe lockLedger(ledger)
+    let anchor = ()
+    let state = unsafe Pointer.borrow(&anchor, ledger.allocation)
+    let mut next = state.firstAllocation
+    let mut result = Option<AllocationRecord>.none()
+    while !Pointer.isNull(next) {
+      let node = unsafe Pointer.borrow(&anchor, unsafe Intrinsic.pointerRequalify<?*mut AllocationHeader, *mut AllocationHeader>(next))
+      let record = node.record
+      let extent = if record.requestedBytes == 0 { 1 } else { record.requestedBytes }
+      if address >= record.address && address - record.address < extent {
+        result = Option<AllocationRecord>.some(record) break
+      }
+      next = node.next
+    }
+    drop state unsafe unlockLedger(ledger)
+    return move result
+  }
+  /// Owner-thread snapshot. Reserve through an independent allocator; no engine
+  /// allocations may run concurrently, while cross-thread reclaims are supported.
+  pub effect fn liveAllocations(self: &Self) -> List<AllocationRecord>
+    ! OutOfMemoryError ? &mut Allocator {
+    let count = self.stats().allocationCount
+    let mut records = List<AllocationRecord>.make()
+    run records.reserveExact(count)
+    let empty = AllocationRecord { id: 0, address: 0, requestedBytes: 0, chargedBytes: 0 }
+    let mut index: usize = 0
+    while index < count { run records.append(empty) index = index + 1 }
+    let ledger = self.ledger
+    unsafe lockLedger(ledger)
+    let anchor = ()
+    let state = unsafe Pointer.borrow(&anchor, ledger.allocation)
+    let mut next = state.firstAllocation
+    index = 0
+    while !Pointer.isNull(next) {
+      if index == count { Intrinsic.trap("live allocation snapshot requires independent allocator") }
+      let node = unsafe Pointer.borrow(&anchor, unsafe Intrinsic.pointerRequalify<?*mut AllocationHeader, *mut AllocationHeader>(next))
+      let values = records.asMutSlice()
+      values[index] = node.record
+      next = node.next index = index + 1
+    }
+    drop state unsafe unlockLedger(ledger)
+    records.truncate(index)
+    return move records
+  }
 }
 impl Drop for AllocationObserver {
   fn drop(self: &mut Self) -> () { unsafe releaseLedger(self.ledger) }
@@ -97,7 +221,9 @@ impl<A> RuntimeAllocator<A> {
       storage: move storage,
       references: 1,
       gate: 0,
-      stats: RuntimeMemoryStats { usedBytes: 0, peakBytes: 0, allocationCount: 0, limit: usize.MAX }
+      stats: RuntimeMemoryStats { usedBytes: 0, peakBytes: 0, allocationCount: 0, limit: usize.MAX },
+      firstAllocation: Pointer.null<AllocationHeader>(), nextAllocationId: 1,
+      nextProfileEpoch: 1, profile: Option<Recording>.none()
     })
     let mut anchor = ()
     let fresh = unsafe Pointer.borrowMut(&mut anchor, address)
@@ -107,7 +233,11 @@ impl<A> RuntimeAllocator<A> {
       gate: Pointer.fromMutRef(&mut fresh.gate),
       stats: Pointer.fromMutRef(&mut fresh.stats)
     }
-    return RuntimeAllocator<A> { child: move ownedChild, ledger: ledger }
+    return RuntimeAllocator<A> { child: move ownedChild, ledger: ledger, failureHandler: Option<AllocationFailureHandler>.none() }
+  }
+
+  pub fn setFailureHandler(self: &mut Self, handler: Option<AllocationFailureHandler>) -> () {
+    self.failureHandler = move handler
   }
 
   /// Changes the budget without invalidating storage. A limit below current usage
@@ -169,8 +299,17 @@ where &mut A provides &Allocator from &mut Allocator {
     // The provider is exclusively borrowed. While the child runs, only reclaims can
     // change usage, and those only decrease it. No reservation or peak change is
     // needed: child failure leaves the ledger untouched, even across suspension.
-    let allocation = run Allocator.allocate(Layout { bytes: chargedBytes, alignment: alignment })
+    let acquired = run Effect.result(Allocator.allocate(Layout { bytes: chargedBytes, alignment: alignment }))
       |> Effect.provideMut<Allocator>(&mut self.child)
+    let allocation = match move acquired {
+      Result<Intrinsic.Allocation, OutOfMemoryError>.Success { value } => move value
+      Result<Intrinsic.Allocation, OutOfMemoryError>.Failure { error } => {
+        if let Option<AllocationFailureHandler>.Some { value: callback } = self.failureHandler {
+          unsafe callback(layout.bytes)
+        }
+        fail move error
+      }
+    }
     let mut storage = unsafe RawBuffer.from<u8>(move allocation, chargedBytes)
     let base = Slot.address(RawBuffer.slot<u8>(&mut storage, 0))
     let bytes = unsafe Pointer.assumeManyMut<u8>(base)
@@ -180,10 +319,30 @@ where &mut A provides &Allocator from &mut Allocator {
       // An Allocator loan excludes observe() on this provider; existing observers
       // cannot clone. Reclaims can only decrease the count checked above.
       let retained = Atomic.fetchAdd<usize>(ledger.references, 1, MemoryOrder.Relaxed)
-      Pointer.put<AllocationHeader>(owner, AllocationHeader {
-        storage: move storage, ledger: ledger, chargedBytes: chargedBytes
-      })
       lockLedger(ledger)
+      let mut anchor = ()
+      let control = Pointer.borrowMut(&mut anchor, ledger.allocation)
+      let record = AllocationRecord { id: control.nextAllocationId,
+        address: Pointer.address(at), requestedBytes: layout.bytes, chargedBytes: chargedBytes }
+      control.nextAllocationId = control.nextAllocationId + 1
+      let mut epoch: u64 = 0
+      match &mut control.profile {
+        Option<Recording>.Some { value } => {
+          if value.allocation(record) { epoch = value.epoch }
+        }
+        _ => ()
+      }
+      let first = control.firstAllocation
+      control.firstAllocation = owner
+      drop control
+      if !Pointer.isNull(first) {
+        let node = Pointer.borrowMut(&mut anchor, Intrinsic.pointerRequalify<?*mut AllocationHeader, *mut AllocationHeader>(first))
+        node.previous = owner
+      }
+      Pointer.put<AllocationHeader>(owner, AllocationHeader {
+        storage: move storage, ledger: ledger, chargedBytes: chargedBytes,
+        record: record, sampledEpoch: epoch, previous: Pointer.null<AllocationHeader>(), next: first
+      })
       let mut state = Pointer.read<RuntimeMemoryStats>(ledger.stats)
       state.usedBytes = state.usedBytes + chargedBytes
       state.allocationCount = state.allocationCount + 1
@@ -231,19 +390,40 @@ unsafe fn releaseLedger(ledger: LedgerPointers) -> () {
 export "C" fn silkRuntimeMemoryReclaim(context: ?*mut u8) -> () {
   let present = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(context)
   let address = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut AllocationHeader>(present)
-  let owner = unsafe Pointer.take<AllocationHeader>(address)
-  let ledger = owner.ledger
-  let chargedBytes = owner.chargedBytes
-  // Move the complete header out before freeing the storage that contained it.
-  // Free backing outside the gate, since the child may itself be a RuntimeAllocator.
-  drop owner
+  // Unlink before destroying backing: concurrent observers must never see freed
+  // headers, and child destruction can reenter another RuntimeAllocator.
+  let mut anchor = ()
+  let borrowed = unsafe Pointer.borrow(&anchor, address)
+  let ledger = borrowed.ledger
+  drop borrowed
   unsafe {
     lockLedger(ledger)
+    let owner = Pointer.take<AllocationHeader>(address)
+    let chargedBytes = owner.chargedBytes
+    let control = Pointer.borrowMut(&mut anchor, ledger.allocation)
+    if Pointer.isNull(owner.previous) { control.firstAllocation = owner.next }
+    match &mut control.profile {
+      Option<Recording>.Some { value } => {
+        if owner.sampledEpoch == value.epoch { value.reclaim(owner.record) }
+      }
+      _ => ()
+    }
+    drop control
+    if !Pointer.isNull(owner.previous) {
+      let node = Pointer.borrowMut(&mut anchor, Intrinsic.pointerRequalify<?*mut AllocationHeader, *mut AllocationHeader>(owner.previous))
+      node.next = owner.next
+    }
+    if !Pointer.isNull(owner.next) {
+      let node = Pointer.borrowMut(&mut anchor, Intrinsic.pointerRequalify<?*mut AllocationHeader, *mut AllocationHeader>(owner.next))
+      node.previous = owner.previous
+    }
+    // Accounting and list removal are one coherent transaction.
     let mut state = Pointer.read<RuntimeMemoryStats>(ledger.stats)
     state.usedBytes = state.usedBytes - chargedBytes
     state.allocationCount = state.allocationCount - 1
     Pointer.write<RuntimeMemoryStats>(ledger.stats, state)
     unlockLedger(ledger)
+    drop owner
     releaseLedger(ledger)
   }
   return ()

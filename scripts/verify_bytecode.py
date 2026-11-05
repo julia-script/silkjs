@@ -258,19 +258,19 @@ int main(int argc, char **argv) {
 '''
 
 SILK_SOURCE = r'''
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.effect { Effect }
-import silk.result { Result }
-import silk.list { List }
-import silk.slice { Slice }
-import silk.os_writer { StdoutWriter }
-import silk.writer { Writer, WriterError }
-import silk.u8
-import silk.u16
-import silk.u32
-import silk.i32
-import silk.i64
-import silk.usize
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.io.writer_native { StdoutWriter }
+import silk.io.writer { Writer, WriterError }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.i32
+import silk.num.i64
+import silk.num.usize
 import byte_buffer { ByteBuffer, readU32 }
 import js_bytecode { computeStackSize, swapBytecodeEndian, BytecodeError, BytecodeErrorKind }
 import js_debug_positions { SourcePositionCache, PcSourcePositions, PcSourcePosition,

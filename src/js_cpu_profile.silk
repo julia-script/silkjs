@@ -1,0 +1,211 @@
+//! Owner-thread cooperative CPU sampling. Only observed safepoints are samples;
+//! elapsed intervals are never expanded into synthetic samples. Native/idle/GC
+//! states require an explicit observe call. Stop transfers all native storage,
+//! containing copied metadata and no JS roots, into a read-only profile.
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import js_os_events_platform as platform
+import silk.num.usize
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types { RuntimeState, StackFrame, FunctionBytecode, FunctionDebugInfo }
+import js_backtrace as backtrace
+
+pub const JAVASCRIPT: u8 = 0
+pub const NATIVE: u8 = 1
+pub const IDLE: u8 = 2
+pub const GC: u8 = 3
+pub const NO_FUNCTION: usize = 18446744073709551615
+pub const MAX_DEPTH: usize = 256
+
+pub struct Sample {
+  pub timestampMicroseconds: i64, pub firstFrame: usize, pub frameCount: usize,
+  pub kind: u8, pub truncatedStack: bool
+}
+impl Copy for Sample {}
+pub struct Frame {
+  pub kind: u8, pub functionIndex: usize, pub functionAddress: usize,
+  // PC is copied verbatim: executing opcode for the leaf, published resume
+  // address for suspended callers. Only source-coordinate lookup subtracts one.
+  pub scriptId: u64, pub pc: Option<usize>, pub pcIsReturnAddress: bool,
+  pub line: i32, pub column: i32
+}
+impl Copy for Frame {}
+pub struct Function {
+  pub address: usize, pub scriptId: u64,
+  nameUnits: [u16; 128], urlUnits: [u16; 512], nameLength: usize, urlLength: usize
+}
+impl Function {
+  fn make() -> Self { return Self { address: 0, scriptId: 0, nameUnits: [0; 128], urlUnits: [0; 512], nameLength: 0, urlLength: 0 } }
+  pub fn name(self: &Self) -> &[u16] { return Slice.view<u16>(&self.nameUnits, 0, if self.nameLength < 128 { self.nameLength } else { 128 }) }
+  pub fn url(self: &Self) -> &[u16] { return Slice.view<u16>(&self.urlUnits, 0, if self.urlLength < 512 { self.urlLength } else { 512 }) }
+  pub fn nameTruncated(self: &Self) -> bool { return self.nameLength > 128 }
+  pub fn urlTruncated(self: &Self) -> bool { return self.urlLength > 512 }
+}
+/// Accessors expose only populated prefixes; backing capacity is never a count.
+/// Frame order is leaf first. Coordinates are zero based, -1 when unavailable.
+pub struct Profile {
+  start: i64, end: i64, interval: i64,
+  sampleStorage: List<Sample>, frameStorage: List<Frame>, functionStorage: List<Function>,
+  sampleCount: usize, frameCount: usize, functionCount: usize,
+  dropped: u64
+}
+impl Profile {
+  fn make() -> Self { return Self { start: 0, end: 0, interval: 0,
+    sampleStorage: List<Sample>.make(), frameStorage: List<Frame>.make(), functionStorage: List<Function>.make(),
+    sampleCount: 0, frameCount: 0, functionCount: 0, dropped: 0 } }
+  pub fn startMicroseconds(self: &Self) -> i64 { return self.start }
+  pub fn endMicroseconds(self: &Self) -> i64 { return self.end }
+  pub fn intervalMicroseconds(self: &Self) -> i64 { return self.interval }
+  pub fn samples(self: &Self) -> &[Sample] { return Slice.view<Sample>(self.sampleStorage.asSlice(), 0, self.sampleCount) }
+  pub fn frames(self: &Self) -> &[Frame] { return Slice.view<Frame>(self.frameStorage.asSlice(), 0, self.frameCount) }
+  pub fn functions(self: &Self) -> &[Function] { return Slice.view<Function>(self.functionStorage.asSlice(), 0, self.functionCount) }
+  /// Due observations rejected by full sample storage, not estimated missed ticks.
+  pub fn droppedObservations(self: &Self) -> u64 { return self.dropped }
+}
+pub struct State { pub enabled: bool, last: i64, profile: Profile }
+impl State { pub fn make() -> Self { return Self { enabled: false, last: 0, profile: Profile.make() } } }
+
+pub effect fn nowMicroseconds() -> i64 {
+  return platform.nowNanoseconds() / 1000
+}
+fn emptyFrame() -> Frame { return Frame { kind: NATIVE, functionIndex: NO_FUNCTION,
+  functionAddress: 0, scriptId: 0, pc: Option<usize>.none(), pcIsReturnAddress: false, line: -1, column: -1 } }
+/// False means already running or invalid bounds, with no state change. Allocation
+/// failure also leaves state unchanged. Interval must be positive; capacity limits
+/// bound observer memory independently of the program being profiled.
+pub unsafe effect fn start(runtime: *mut HeapHeader, intervalMicroseconds: i64,
+  sampleCapacity: usize, frameCapacity: usize, functionCapacity: usize) -> bool
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = () let current = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  if current.cpuProfile.enabled { return false } drop current
+  if intervalMicroseconds <= 0 || sampleCapacity == 0 || sampleCapacity > 262144 ||
+    frameCapacity == 0 || frameCapacity > 1048576 || functionCapacity == 0 || functionCapacity > 16384 { return false }
+  let mut profile = Profile.make()
+  run profile.sampleStorage.reserveExact(sampleCapacity)
+  run profile.frameStorage.reserveExact(frameCapacity)
+  run profile.functionStorage.reserveExact(functionCapacity)
+  let mut i: usize = 0
+  while i < sampleCapacity { run profile.sampleStorage.append(Sample { timestampMicroseconds: 0,
+    firstFrame: 0, frameCount: 0, kind: JAVASCRIPT, truncatedStack: false }) i = i + 1 }
+  i = 0
+  while i < frameCapacity { run profile.frameStorage.append(emptyFrame()) i = i + 1 }
+  i = 0
+  while i < functionCapacity { run profile.functionStorage.append(Function.make()) i = i + 1 }
+  profile.interval = intervalMicroseconds profile.start = run nowMicroseconds()
+  let last = profile.start
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.cpuProfile = State { enabled: true, last: last, profile: move profile }
+  return true
+}
+/// First stop transfers ownership; repeated stops return None and read no clock.
+/// Stopping does not fabricate a final sample or mutate a previously returned profile.
+pub unsafe effect fn stop(runtime: *mut HeapHeader) -> Option<Profile> {
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  if !state.cpuProfile.enabled { return Option<Profile>.none() }
+  state.cpuProfile.enabled = false
+  let mut result = Intrinsic.replace(state.cpuProfile.profile, Profile.make())
+  drop state
+  result.end = run nowMicroseconds()
+  return Option<Profile>.some(move result)
+}
+unsafe fn functionIndex(state: &mut RuntimeState, bytecode: *mut HeapHeader) -> usize {
+  let anchor = () let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  let address = Pointer.address<HeapHeader>(bytecode) let mut i: usize = 0
+  while i < state.cpuProfile.profile.functionCount {
+    let item = &state.cpuProfile.profile.functionStorage.asSlice()[i]
+    if item.address == address && item.scriptId == code.scriptId { return i }
+    i = i + 1
+  }
+  if i == state.cpuProfile.profile.functionStorage.length() { return NO_FUNCTION }
+  let item = &mut state.cpuProfile.profile.functionStorage.asMutSlice()[i]
+  item.address = address item.scriptId = code.scriptId
+  item.nameLength = state.atoms.profileText(code.name, &mut item.nameUnits)
+  if let Option<FunctionDebugInfo>.Some { value: debug } = &code.debug {
+    item.urlLength = state.atoms.profileText(debug.filename, &mut item.urlUnits)
+  }
+  state.cpuProfile.profile.functionCount = i + 1
+  return i
+}
+unsafe fn capture(state: &mut RuntimeState, bytecode: *mut HeapHeader, pc: Option<usize>, returnAddress: bool) -> Frame {
+  let index = unsafe functionIndex(&mut state, bytecode)
+  let anchor = () let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  let mut result = Frame { kind: JAVASCRIPT, functionIndex: index,
+    functionAddress: Pointer.address<HeapHeader>(bytecode), scriptId: code.scriptId, pc: pc,
+    pcIsReturnAddress: returnAddress, line: -1, column: -1 }
+  if let Option<usize>.Some { value: offset } = pc {
+    if offset <= 4294967295 {
+      if let Option<FunctionDebugInfo>.Some { value: debug } = &code.debug {
+        let coordinatePc = if returnAddress && offset != 0 { offset - 1 } else { offset }
+        let position = unsafe backtrace.location(&debug.pcToLine, usize.toU32(coordinatePc))
+        if position.line > 0 { result.line = position.line - 1 }
+        if position.column > 0 { result.column = position.column - 1 }
+      }
+    }
+  }
+  return result
+}
+unsafe fn record(runtime: *mut HeapHeader, kind: u8, bytecode: ?*mut HeapHeader, pc: usize) -> () {
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  if !state.cpuProfile.enabled { return }
+  let now = platform.nowNanoseconds() / 1000
+  if now - state.cpuProfile.last < state.cpuProfile.profile.interval { return }
+  // Schedule from the actual observation, never from a missed deadline.
+  state.cpuProfile.last = now
+  if state.cpuProfile.profile.sampleCount == state.cpuProfile.profile.sampleStorage.length() {
+    if state.cpuProfile.profile.dropped != 18446744073709551615 { state.cpuProfile.profile.dropped = state.cpuProfile.profile.dropped + 1 }
+    return
+  }
+  let first = state.cpuProfile.profile.frameCount
+  let mut current = state.currentStackFrame let mut depth: usize = 0
+  let mut top = true
+  while !Pointer.isNull<StackFrame>(current) || (top && !Pointer.isNull<HeapHeader>(bytecode)) {
+    if depth == MAX_DEPTH || state.cpuProfile.profile.frameCount == state.cpuProfile.profile.frameStorage.length() { break }
+    let mut row = emptyFrame()
+    let mut resolved = Option<*mut HeapHeader>.none() let mut location = Option<usize>.none()
+    let mut returnAddress = true
+    if let Option<*mut StackFrame>.Some { value: pointer } = Pointer.nonNullMut<StackFrame>(current) {
+      let frameAnchor = () let frame = unsafe Pointer.borrow<(), StackFrame>(&frameAnchor, pointer)
+      if let Value.Object { reference } = frame.currentFunction { row.functionAddress = Pointer.address<HeapHeader>(reference) }
+      resolved = unsafe backtrace.bytecode(frame.currentFunction)
+      // Suspended callers publish the resume PC, rather than the call opcode.
+      location = frame.currentPc
+      current = frame.previous
+    }
+    if top {
+      if let Option<*mut HeapHeader>.Some { value } = Pointer.nonNullMut<HeapHeader>(bytecode) {
+        resolved = Option<*mut HeapHeader>.some(value) location = Option<usize>.some(pc)
+        returnAddress = false
+      }
+    }
+    if let Option<*mut HeapHeader>.Some { value } = resolved { row = unsafe capture(&mut state, value, location, returnAddress) }
+    let index = state.cpuProfile.profile.frameCount
+    state.cpuProfile.profile.frameStorage.set(index, row) state.cpuProfile.profile.frameCount = index + 1
+    depth = depth + 1 top = false
+  }
+  let index = state.cpuProfile.profile.sampleCount
+  state.cpuProfile.profile.sampleStorage.set(index, Sample { timestampMicroseconds: now, firstFrame: first,
+    frameCount: depth, kind: kind, truncatedStack: !Pointer.isNull<StackFrame>(current) || (top && !Pointer.isNull<HeapHeader>(bytecode)) })
+  state.cpuProfile.profile.sampleCount = index + 1
+}
+/// Call before dispatch with the actual executing bytecode and opcode offset.
+/// Disabled execution reads only the flag, never the clock or stack. Enabled
+/// recording writes initialized native slots only: no allocator or JS callbacks.
+pub unsafe effect fn safepoint(runtime: *mut HeapHeader, bytecode: *mut HeapHeader, pc: usize) -> () {
+  unsafe record(runtime, JAVASCRIPT, bytecode, pc)
+}
+/// Call only while the named state is actually observed, on the runtime's owner
+/// thread. No background thread reads VM frames. Other kinds are ignored.
+pub unsafe effect fn observe(runtime: *mut HeapHeader, kind: u8) -> () {
+  unsafe observeNow(runtime, kind)
+}
+/// Non-effect owner-thread entry for GC lifecycle and other native callbacks.
+/// Uses the same monotonic clock and preallocated recorder as VM safepoints.
+pub unsafe fn observeNow(runtime: *mut HeapHeader, kind: u8) -> () {
+  if kind != NATIVE && kind != IDLE && kind != GC { return }
+  unsafe record(runtime, kind, Pointer.null<HeapHeader>(), 0)
+}

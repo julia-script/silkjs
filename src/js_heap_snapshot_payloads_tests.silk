@@ -1,0 +1,131 @@
+//! Native consumers of actual container payloads; snapshot allocations use a
+//! separate host allocator and must leave JS reference counts and storage intact.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.testing.testing { Testing, AssertionError }
+import silk.num.usize
+import runtime_memory { RuntimeAllocator }
+import native_stack { currentFrameAddress }
+import js_heap { HeapCell, HeapHeader }
+import js_value { Value }
+import js_core_types { ObjectData, ObjectPayload }
+import js_heap_snapshot_graph { Graph, Strength }
+import js_heap_snapshot_payloads as payloads
+import js_collection_test_support as collections
+import js_buffer_test_support as buffers
+import js_array_storage_test_support as contexts
+import js_proxy_test_support as proxies
+import js_proxy_core as core
+import js_map_storage as maps
+import js_buffer_storage as storage
+import js_dataview as dataview
+import js_object_allocate as objects
+import js_runtime as runtime
+import js_runtime_registry as registry
+import js_runtime_classes as definitions
+import js_class_data as classes
+import js_gc as gc
+import js_string_types { StringLengthError }
+import js_exceptions { JsException }
+
+unsafe effect fn observe(graph: &mut Graph, object: Value) -> usize
+  ! OutOfMemoryError ? &mut Allocator {
+  let reference = core.reference(object)
+  let owner = run unsafe graph.node(reference)
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+  match &data.payload {
+    ObjectPayload.Opaque { family, reference: optional } => {
+      let payload = unsafe maps.nonnull(optional)
+      run unsafe payloads.visit(&mut graph, owner, reference, family, payload)
+    }
+    _ => contexts.trap()
+  }
+  return owner
+}
+
+test effect fn weakMapPayloadPreservesConditionalOwnership() -> ()
+  ! OutOfMemoryError | StringLengthError | JsException | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe contexts.context(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = collections.Hooks.make(&observer)
+  run unsafe proxies.prepare(&mut hooks.base.base, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+  let definition = definitions.standardDefinition(classes.JS_CLASS_WEAKMAP)
+  let registered = run unsafe registry.registerClassAtom(rt, classes.JS_CLASS_WEAKMAP, definition.classNameAtom, move definition)
+    |> Effect.provideMut<Allocator>(&mut memory)
+  let prototype = run unsafe objects.withPrototype(&mut hooks, &observer, ctx, Value.Null) |> Effect.provideMut<Allocator>(&mut memory)
+  unsafe runtime.setClassPrototype(&mut hooks, ctx, classes.JS_CLASS_WEAKMAP, prototype)
+  let collection = run unsafe maps.create(&mut hooks, &observer, ctx, Value.Undefined, 2) |> Effect.provideMut<Allocator>(&mut memory)
+  let key = run unsafe objects.object(&mut hooks, &observer, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+  let value = run unsafe objects.object(&mut hooks, &observer, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+  let state = unsafe maps.nonnull(unsafe maps.state(collection, 2))
+  run unsafe maps.put(&mut hooks, ctx, state, key, value) |> Effect.provideMut<Allocator>(&mut memory)
+  let keyRc = unsafe contexts.rc(core.reference(key)) let valueRc = unsafe contexts.rc(core.reference(value))
+  let before = observer.stats()
+  let mut host = Allocator.systemAllocatorProvider()
+  let mut graph = Graph.make()
+  let owner = run unsafe observe(&mut graph, collection) |> Effect.provideMut<Allocator>(&mut host)
+  let keyNode = run unsafe graph.node(core.reference(key)) |> Effect.provideMut<Allocator>(&mut host)
+  let valueNode = run unsafe graph.node(core.reference(value)) |> Effect.provideMut<Allocator>(&mut host)
+  let stateNode = run unsafe graph.node(state) |> Effect.provideMut<Allocator>(&mut host)
+  let mut weak = false let mut conditional = false let mut strong = false let mut i: usize = 0
+  while i < graph.edges.length() {
+    let edge = graph.edges.get(i)
+    if edge.to == keyNode && edge.strength == Strength.Weak { weak = true }
+    if edge.to == valueNode && edge.strength == Strength.Ephemeron && edge.condition == keyNode { conditional = true }
+    if (edge.to == keyNode || edge.to == valueNode) && edge.strength == Strength.Strong { strong = true }
+    i = i + 1
+  }
+  run Testing.expect(weak && conditional && !strong, "WeakMap keys stay weak and values are conditioned on their exact key node")
+  run Testing.expect(graph.nodes.get(stateNode).nativeBytes > 0 && owner != stateNode, "map hash buckets and auxiliary state are represented")
+  run Testing.expect(unsafe contexts.rc(core.reference(key)) == keyRc && unsafe contexts.rc(core.reference(value)) == valueRc &&
+    observer.stats().usedBytes == before.usedBytes && unsafe maps.count(state) == 1, "observing leaves references, allocations and entries unchanged")
+  drop graph
+  unsafe gc.release(&mut hooks, rt, collection) unsafe gc.release(&mut hooks, rt, key) unsafe gc.release(&mut hooks, rt, value)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx)
+  run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(observer.stats().allocationCount == 0, "native collection consumer releases every engine allocation")
+}
+
+test effect fn bufferPayloadCountsSharedAllocationOnceAndViewOwnsBuffer() -> ()
+  ! OutOfMemoryError | StringLengthError | JsException | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut memory)
+  let ctx = run unsafe contexts.context(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut hooks = buffers.Hooks.make(&observer)
+  run unsafe buffers.prepare(&mut hooks, ctx) |> Effect.provideMut<Allocator>(&mut memory)
+  let original = run unsafe storage.create(&mut hooks, &observer, ctx, Value.Undefined, 8, Option<u64>.some(32), true)
+    |> Effect.provideMut<Allocator>(&mut memory)
+  let alias = run unsafe storage.duplicateShared(&mut hooks, &observer, ctx, original) |> Effect.provideMut<Allocator>(&mut memory)
+  let view = run unsafe dataview.constructor(&mut hooks, &observer, ctx, Value.Undefined, original, Value.Undefined, Value.Undefined)
+    |> Effect.provideMut<Allocator>(&mut memory)
+  let before = observer.stats()
+  let mut host = Allocator.systemAllocatorProvider() let mut graph = Graph.make()
+  let originalNode = run unsafe observe(&mut graph, original) |> Effect.provideMut<Allocator>(&mut host)
+  let mut bytes: usize = 0 let mut i: usize = 0
+  while i < graph.nodes.length() { bytes = bytes + graph.nodes.get(i).nativeBytes i = i + 1 }
+  let aliasNode = run unsafe observe(&mut graph, alias) |> Effect.provideMut<Allocator>(&mut host)
+  let viewNode = run unsafe observe(&mut graph, view) |> Effect.provideMut<Allocator>(&mut host)
+  let mut after: usize = 0 i = 0
+  while i < graph.nodes.length() { after = after + graph.nodes.get(i).nativeBytes i = i + 1 }
+  let mut strongBuffer = false let mut borrowedView = false i = 0
+  while i < graph.edges.length() {
+    let edge = graph.edges.get(i)
+    if edge.to == originalNode && edge.strength == Strength.Strong { strongBuffer = true }
+    if edge.to == viewNode && edge.strength == Strength.Borrowed { borrowedView = true }
+    i = i + 1
+  }
+  run Testing.expect(bytes >= 32 && after == bytes && originalNode != aliasNode, "shared aliases preserve object identity without double-counting physical backing")
+  run Testing.expect(strongBuffer && borrowedView, "view strongly owns its buffer while wrapper backlinks remain borrowed")
+  run Testing.expect(observer.stats().usedBytes == before.usedBytes && (unsafe storage.snapshot(core.reference(original))).byteLength == 8,
+    "buffer observation neither allocates engine storage nor changes logical length")
+  drop graph
+  unsafe gc.release(&mut hooks, rt, view) unsafe gc.release(&mut hooks, rt, alias) unsafe gc.release(&mut hooks, rt, original)
+  unsafe gc.releaseHeader(&mut hooks, rt, ctx)
+  run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  hooks.clearHostLedger()
+  run Testing.expect(observer.stats().allocationCount == 0, "native buffer consumer releases backing and view storage")
+}

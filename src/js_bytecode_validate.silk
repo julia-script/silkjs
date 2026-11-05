@@ -1,0 +1,542 @@
+//! Validation of decoder-owned script bytecode before closure creation/evaluation.
+//! Borrows every JS edge; success and failure leave ownership with the caller.
+//! Module records and functions capturing an external execution frame are not
+//! standalone scripts and are rejected by this entry point.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.ownership { Copy }
+import silk.mem.pointer { Pointer }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.i32
+import silk.num.i64
+import silk.num.usize
+import js_engine { Engine }
+import js_engine_host { EngineServices }
+import js_coercion_host { CoercionHooks }
+import js_heap { HeapHeader, HeapCell }
+import js_value { Value }
+import js_core_types { FunctionBytecode, FunctionKind, ClosureKind, ByteStorage, NativeErrorKind,
+  ObjectData, ObjectPayload, PropertySlot, VariableKind, RuntimeState, ShapeData, ModuleDef, ExportBinding }
+import js_string_types { FlatString, AtomKind }
+import js_atoms { AtomTable }
+import js_runtime as runtime
+import js_exceptions { JsException }
+import byte_buffer { readU16, readU32 }
+import js_opcode_data as op
+import js_atom_data as atoms
+import js_bytecode_validate_stack { ValidationError, require }
+import js_bytecode_validate_stack as flow
+import regexp_validate { RegExpValidationError }
+import regexp_validate as regexp
+
+pub struct FrameLimits {
+  pub arguments: usize, pub locals: usize, pub closures: usize, pub constants: usize, pub stack: u16
+}
+impl Copy for FrameLimits {}
+unsafe fn bytes(storage: &ByteStorage) -> &[u8] {
+  return match &storage.* {
+    ByteStorage.Owned { bytes } => bytes.asSlice()
+    ByteStorage.Borrowed { data, length } => unsafe Intrinsic.pointerBorrowMany<ByteStorage, u8>(storage, unsafe Pointer.assumeMany<u8>(data), length)
+  }
+}
+fn constantIndex(code: &[u8], pc: usize) -> usize {
+  if code[pc] == op.OP_push_const8 || code[pc] == op.OP_fclosure8 { return u8.toUsize(code[pc + 1]) }
+  return u32.toUsize(readU32(code, pc + 1))
+}
+fn pushConstant(opcode: u8) -> bool { return opcode == op.OP_push_const || opcode == op.OP_push_const8 }
+fn classOpcode(opcode: u8) -> bool { return opcode == op.OP_define_class || opcode == op.OP_define_class_computed }
+
+// previous[pc] is predecessor PC + 1 at instruction boundaries, zero inside an
+// operand. Decode every byte, including unreachable instructions and operands.
+effect fn decode(code: &[u8], limits: FrameLimits) -> List<usize>
+  ! ValidationError | OutOfMemoryError ? &mut Allocator {
+  run require(code.length != 0 && code.length <= 2147483647 && limits.stack <= 65534, 0)
+  let mut previous = List<usize>.make() run previous.reserveExact(code.length)
+  let mut pc: usize = 0 while pc < code.length { run previous.append(0) pc = pc + 1 }
+  pc = 0 let mut prior: usize = 0
+  while pc < code.length {
+    let opcode = code[pc] run require(opcode != 0 && u8.toUsize(opcode) < op.OP_COUNT, pc)
+    let info = op.opcodeInfo(opcode, true) let size = u8.toUsize(info.size)
+    run require(size != 0 && size <= code.length - pc, pc)
+    previous.set(pc, prior + 1) prior = pc
+    let format = info.format
+    let mut index: usize = 0 let mut bound: usize = 0 let mut indexed = true
+    if format == op.OP_FMT_loc { index = u16.toUsize(readU16(code, pc + 1)) bound = limits.locals }
+    else if format == op.OP_FMT_loc8 { index = u8.toUsize(code[pc + 1]) bound = limits.locals }
+    else if format == op.OP_FMT_arg { index = u16.toUsize(readU16(code, pc + 1)) bound = limits.arguments }
+    else if format == op.OP_FMT_var_ref { index = u16.toUsize(readU16(code, pc + 1)) bound = limits.closures }
+    else if format == op.OP_FMT_none_loc { index = u8.toUsize((opcode - op.OP_get_loc0) % 4) bound = limits.locals }
+    else if format == op.OP_FMT_none_arg { index = u8.toUsize((opcode - op.OP_get_arg0) % 4) bound = limits.arguments }
+    else if format == op.OP_FMT_none_var_ref { index = u8.toUsize((opcode - op.OP_get_var_ref0) % 4) bound = limits.closures }
+    else if format == op.OP_FMT_const || format == op.OP_FMT_const8 { index = constantIndex(code, pc) bound = limits.constants }
+    else if opcode == op.OP_make_loc_ref || opcode == op.OP_make_arg_ref || opcode == op.OP_make_var_ref_ref {
+      index = u16.toUsize(readU16(code, pc + 5)) bound = limits.locals
+      if opcode == op.OP_make_arg_ref { bound = limits.arguments }
+      else if opcode == op.OP_make_var_ref_ref { bound = limits.closures }
+    } else { indexed = false }
+    if indexed { run require(index < bound, pc) }
+    if opcode == op.OP_using_dispose || opcode == op.OP_using_dispose_async {
+      run require(u16.toUsize(readU16(code, pc + 1)) + 1 < limits.locals, pc)
+    }
+    if opcode == op.OP_special_object { run require(code[pc + 1] <= 6, pc) }
+    if opcode == op.OP_apply { run require(readU16(code, pc + 1) <= 1, pc) }
+    if opcode == op.OP_throw_error { run require(code[pc + 5] <= 5, pc) }
+    if opcode >= op.OP_with_get_var && opcode <= op.OP_with_get_ref { run require(code[pc + 9] <= 1, pc) }
+    if classOpcode(opcode) { run require(code[pc + 5] <= 1, pc) }
+    if opcode == op.OP_define_method || opcode == op.OP_define_method_computed {
+      let mut operand = pc + 1 if opcode == op.OP_define_method { operand = pc + 5 }
+      let flags = code[operand] run require(flags <= 6 && (flags & 3) != 3, pc)
+    }
+    if opcode == op.OP_iterator_call { run require(code[pc + 1] <= 3, pc) }
+    if opcode == op.OP_using_check { run require(code[pc + 1] <= 1, pc) }
+    if opcode == op.OP_eval || opcode == op.OP_apply_eval {
+      let mut operand = pc + 1 if opcode == op.OP_eval { operand = pc + 3 }
+      let scope = u16.toUsize(readU16(code, operand))
+      run require(scope < 2 || scope - 2 < limits.locals, pc)
+    }
+    pc = pc + size
+  }
+  pc = 0
+  while pc < code.length {
+    let info = op.opcodeInfo(code[pc], true)
+    if flow.branch(info.format) {
+      let destination = flow.target(code, pc, info.format)
+      run require(destination >= 0 && destination < usize.toI64(code.length), pc)
+      run require(previous.get(i64.toUsize(destination)) != 0, pc)
+    }
+    pc = pc + u8.toUsize(info.size)
+  }
+  return move previous
+}
+// Runtime-independent seam used by native regression fixtures. The owning-tree
+// entry point additionally checks constant types and closure capture metadata.
+pub effect fn validateCode(code: &[u8], limits: FrameLimits) -> ()
+  ! ValidationError | OutOfMemoryError ? &mut Allocator {
+  let boundaries = run decode(code, limits)
+  run flow.validate(code, limits.stack)
+}
+
+effect fn capture(parent: &FunctionBytecode, index: usize, argument: bool) -> () ! ValidationError {
+  let mut definition = index
+  if argument { run require(index < u16.toUsize(parent.argumentCount), 0) }
+  else {
+    run require(index < u16.toUsize(parent.variableCount), 0)
+    definition = definition + u16.toUsize(parent.argumentCount)
+  }
+  run require(definition < parent.varDefs.length(), 0)
+  let variable = parent.varDefs.get(definition)
+  run require(variable.isCaptured && variable.varRefIndex < parent.varRefCount, 0)
+}
+effect fn structure(function: &FunctionBytecode) -> ()
+  ! ValidationError | OutOfMemoryError ? &mut Allocator {
+  let args = u16.toUsize(function.argumentCount) let locals = u16.toUsize(function.variableCount)
+  run require(function.definedArgumentCount <= function.argumentCount && (function.mode & 246) == 0, 0)
+  run require(function.varDefs.length() == 0 || function.varDefs.length() == args + locals, 0)
+  // VarRef slots are non-owning caches for exactly one argument/local. Aliasing
+  // two definitions to one slot breaks cells.get's attached-slot invariant.
+  let mut occupied = List<bool>.make() run occupied.reserveExact(u16.toUsize(function.varRefCount))
+  let mut i: usize = 0
+  while i < u16.toUsize(function.varRefCount) { run occupied.append(false) i = i + 1 }
+  i = 0
+  while i < function.varDefs.length() {
+    let variable = function.varDefs.get(i)
+    if variable.isCaptured {
+      let index = u16.toUsize(variable.varRefIndex) run require(index < occupied.length(), 0)
+      run require(!occupied.get(index), 0) occupied.set(index, true)
+    }
+    i = i + 1
+  }
+}
+unsafe effect fn regexConstant(value: Value, pc: usize) -> ()
+  ! ValidationError | OutOfMemoryError | RegExpValidationError ? &mut Allocator {
+  let reference = match value { Value.String { reference } => reference _ => { fail ValidationError { pc: pc } } }
+  let anchor = () let string = unsafe HeapCell.payload<FlatString, ()>(&anchor, reference)
+  run require(!string.wide && string.length <= string.latin1.length(), pc)
+  run regexp.validate(Slice.view(string.latin1.asSlice(), 0, string.length))
+}
+effect fn evalCaptures(function: &FunctionBytecode, code: &[u8], mapped: bool) -> ()
+  ! ValidationError | OutOfMemoryError ? &mut Allocator {
+  let args = u16.toUsize(function.argumentCount) let locals = u16.toUsize(function.variableCount)
+  // Unused scopeNext fields need not form chains (arguments and synthesized
+  // locals commonly retain zero). Only direct-eval operands activate them.
+  // 0 = unseen, 1 = visiting, 2/3 = a checked body/argument terminal.
+  let mut visited = List<u8>.make()
+  let mut i: usize = 0
+  let mut body = false let mut arguments = false let mut pc: usize = 0
+  while pc < code.length {
+    let opcode = code[pc]
+    if opcode == op.OP_eval || opcode == op.OP_apply_eval {
+      let mut operand = pc + 1 if opcode == op.OP_eval { operand = pc + 3 }
+      if visited.length() == 0 {
+        run visited.reserveExact(locals)
+        i = 0 while i < locals { run visited.append(0) i = i + 1 }
+      }
+      let start = u16.toI32(readU16(code, operand)) - 2
+      let mut current = start
+      while current >= 0 {
+        let index = i32.toUsize(current)
+        run require(index < locals, pc)
+        if visited.get(index) != 0 { break }
+        visited.set(index, 1)
+        let variable = function.varDefs.get(args + index)
+        if variable.hasScope && variable.name != 0 { run capture(function, index, false) }
+        current = variable.scopeNext
+      }
+      run require(current >= -2, pc)
+      let mut terminal: u8 = 2
+      if current == -2 { terminal = 3 }
+      else if current >= 0 {
+        terminal = visited.get(i32.toUsize(current))
+        run require(terminal != 1, pc)
+      }
+      if terminal == 2 { body = true } else { arguments = true }
+      current = start
+      while current >= 0 && visited.get(i32.toUsize(current)) == 1 {
+        visited.set(i32.toUsize(current), terminal)
+        current = function.varDefs.get(args + i32.toUsize(current)).scopeNext
+      }
+    }
+    pc = pc + u8.toUsize(op.opcodeInfo(opcode, true).size)
+  }
+  i = 0
+  while i < args {
+    if mapped || (body && function.varDefs.get(i).name != 0) { run capture(function, i, true) }
+    i = i + 1
+  }
+  if body || arguments {
+    i = 0
+    while i < locals {
+      let variable = function.varDefs.get(args + i) let name = variable.name
+      let argumentVisible = name == atoms.JS_ATOM_home_object || name == atoms.JS_ATOM_this_active_func
+        || name == atoms.JS_ATOM_new_target || name == atoms.JS_ATOM_this || name == atoms.JS_ATOM__arg_var_
+        || variable.kind == VariableKind.FunctionName
+      if !variable.hasScope && name != 0 && ((body && name != atoms.JS_ATOM__ret_) || (arguments && argumentVisible)) {
+        run capture(function, i, false)
+      }
+      i = i + 1
+    }
+  }
+}
+
+unsafe effect fn instructions(function: &FunctionBytecode) -> ()
+  ! ValidationError | OutOfMemoryError | RegExpValidationError ? &mut Allocator {
+  let code = unsafe bytes(&function.code)
+  let limits = FrameLimits { arguments: u16.toUsize(function.argumentCount), locals: u16.toUsize(function.variableCount),
+    closures: function.closureVars.length(), constants: function.constants.length(), stack: function.stackSize }
+  let previous = run decode(code, limits)
+  // These factories consume internal data, never a dynamically supplied JS
+  // operand. Require their compiler producer sequence and forbid entry midway.
+  let mut protected = List<bool>.make() run protected.reserveExact(code.length)
+  let mut pc: usize = 0 while pc < code.length { run protected.append(false) pc = pc + 1 }
+  let mut regexChecked = List<bool>.make() run regexChecked.reserveExact(limits.constants)
+  let mut constant: usize = 0
+  while constant < limits.constants { run regexChecked.append(false) constant = constant + 1 }
+  let mut mapped = false let mut directEval = false
+  pc = 0
+  while pc < code.length {
+    let opcode = code[pc] let info = op.opcodeInfo(opcode, true) let next = pc + u8.toUsize(info.size)
+    if opcode == op.OP_fclosure || opcode == op.OP_fclosure8 || pushConstant(opcode) {
+      let value = function.constants.get(constantIndex(code, pc))
+      let internal = match value { Value.FunctionBytecode { .. } => true _ => false }
+      if opcode == op.OP_fclosure || opcode == op.OP_fclosure8 { run require(internal, pc) }
+      else if internal { run require(next < code.length && classOpcode(code[next]), pc) protected.set(next, true) }
+    }
+    if classOpcode(opcode) {
+      run require(pc != 0, pc) let producer = previous.get(pc) - 1
+      run require(pushConstant(code[producer]), pc)
+      let value = function.constants.get(constantIndex(code, producer))
+      let reference = match value { Value.FunctionBytecode { reference } => reference _ => { fail ValidationError { pc: pc } } }
+      let anchor = () let constructor = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference)
+      run require(constructor.kind == FunctionKind.Normal, pc) protected.set(pc, true)
+    }
+    if opcode == op.OP_regexp {
+      run require(pc != 0, pc) let producer = previous.get(pc) - 1
+      run require(pushConstant(code[producer]) && producer != 0, pc)
+      let pattern = previous.get(producer) - 1 run require(pushConstant(code[pattern]), pc)
+      run require(match function.constants.get(constantIndex(code, pattern)) { Value.String { .. } => true _ => false }, pc)
+      let pool = constantIndex(code, producer)
+      if !regexChecked.get(pool) {
+        run unsafe regexConstant(function.constants.get(pool), pc) regexChecked.set(pool, true)
+      }
+      protected.set(producer, true) protected.set(pc, true)
+    }
+    if opcode == op.OP_make_loc_ref || opcode == op.OP_make_arg_ref {
+      run capture(function, u16.toUsize(readU16(code, pc + 5)), opcode == op.OP_make_arg_ref)
+    } else if opcode == op.OP_close_loc { run capture(function, u16.toUsize(readU16(code, pc + 1)), false) }
+    if opcode == op.OP_special_object && code[pc + 1] == 1 { mapped = true }
+    if opcode == op.OP_eval || opcode == op.OP_apply_eval {
+      run require(function.varDefs.length() == limits.arguments + limits.locals, pc) directEval = true
+    }
+    if opcode == op.OP_await || opcode == op.OP_for_await_of_start
+      || opcode == op.OP_for_await_of_next || opcode == op.OP_using_dispose_async {
+      run require(function.kind == FunctionKind.Async || function.kind == FunctionKind.AsyncGenerator, pc)
+    }
+    if opcode == op.OP_return_async { run require(function.kind != FunctionKind.Normal, pc) }
+    if opcode == op.OP_async_yield_star { run require(function.kind == FunctionKind.AsyncGenerator, pc) }
+    if opcode == op.OP_initial_yield || opcode == op.OP_yield || opcode == op.OP_yield_star {
+      run require(function.kind == FunctionKind.Generator || function.kind == FunctionKind.AsyncGenerator, pc)
+    }
+    pc = next
+  }
+  pc = 0
+  while pc < code.length {
+    let info = op.opcodeInfo(code[pc], true)
+    if flow.branch(info.format) { run require(!protected.get(i64.toUsize(flow.target(code, pc, info.format))), pc) }
+    pc = pc + u8.toUsize(info.size)
+  }
+  if mapped || directEval { run evalCaptures(function, code, mapped) }
+  run flow.validate(code, function.stackSize)
+}
+
+struct Work { value: Value, parent: ?*mut HeapHeader, functionAllowed: bool }
+impl Copy for Work {}
+struct Seen { buckets: List<usize>, count: usize }
+impl Seen {
+  effect fn insert(self: &mut Self, address: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+    if self.count * 2 >= self.buckets.length() {
+      let mut size = self.buckets.length() * 2 if size == 0 { size = 32 }
+      let mut grown = List<usize>.make() run grown.reserveExact(size)
+      let mut i: usize = 0 while i < size { run grown.append(0) i = i + 1 }
+      i = 0
+      while i < self.buckets.length() {
+        let old = self.buckets.get(i)
+        if old != 0 {
+          let mut slot = pointerHash(old, size)
+          while grown.get(slot) != 0 { slot = (slot + 1) % size }
+          grown.set(slot, old)
+        }
+        i = i + 1
+      }
+      self.buckets = move grown
+    }
+    let mut slot = pointerHash(address, self.buckets.length())
+    while self.buckets.get(slot) != 0 {
+      if self.buckets.get(slot) == address { return false }
+      slot = (slot + 1) % self.buckets.length()
+    }
+    self.buckets.set(slot, address) self.count = self.count + 1 return true
+  }
+}
+fn pointerHash(address: usize, size: usize) -> usize {
+  let mut value = usize.toU64(address)
+  value = u64.wrappingMultiply(value ^ u64.shiftRight(value, 30), 0xbf58476d1ce4e5b9)
+  value = u64.wrappingMultiply(value ^ u64.shiftRight(value, 27), 0x94d049bb133111eb)
+  return u64.toUsize((value ^ u64.shiftRight(value, 31)) % usize.toU64(size))
+}
+effect fn functionAtoms(function: &FunctionBytecode, table: &AtomTable) -> () ! ValidationError {
+  run require(function.name == 0 || table.kind(function.name) == AtomKind.String, 0)
+  let mut i: usize = 0
+  while i < function.varDefs.length() {
+    let name = function.varDefs.get(i).name
+    run require(name == 0 || table.kind(name) == AtomKind.String, 0) i = i + 1
+  }
+  i = 0
+  while i < function.closureVars.length() {
+    let variable = function.closureVars.get(i)
+    run require(variable.name == 0 || table.kind(variable.name) == AtomKind.String, 0)
+    if variable.kind == ClosureKind.Global || variable.kind == ClosureKind.GlobalDeclaration {
+      run require(variable.name != 0, 0)
+    }
+    i = i + 1
+  }
+  let code = unsafe bytes(&function.code) let mut pc: usize = 0
+  while pc < code.length {
+    let info = op.opcodeInfo(code[pc], true) let format = info.format
+    if format == op.OP_FMT_atom || format == op.OP_FMT_atom_u8 || format == op.OP_FMT_atom_u16
+      || format == op.OP_FMT_atom_label_u8 {
+      let name = readU32(code, pc + 1)
+      run require((name == 0 && code[pc] == op.OP_throw_error) || table.kind(name) == AtomKind.String, pc)
+      if code[pc] == op.OP_private_symbol { run require(!AtomTable.isInteger(name), pc) }
+    }
+    pc = pc + u8.toUsize(info.size)
+  }
+}
+
+unsafe effect fn tree(compiled: Value, table: &AtomTable, moduleRoot: ?*mut HeapHeader) -> ()
+  ! ValidationError | OutOfMemoryError | RegExpValidationError ? &mut Allocator {
+  run require(match compiled { Value.FunctionBytecode { .. } => true _ => false }, 0)
+  let mut pending = List<Work>.make()
+  let mut seen = Seen { buckets: List<usize>.make(), count: 0 }
+  run pending.append(Work { value: compiled, parent: Pointer.null<HeapHeader>(), functionAllowed: true })
+  while pending.length() != 0 {
+    let last = pending.length() - 1 let work = pending.get(last) pending.truncate(last)
+    match work.value {
+      Value.FunctionBytecode { reference } => {
+        run require(work.functionAllowed, 0)
+        run require(run seen.insert(Pointer.address<HeapHeader>(reference)), 0)
+        let anchor = () let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference)
+        run structure(function)
+        let mut i: usize = 0
+        while i < function.closureVars.length() {
+          let closure = function.closureVars.get(i) let index = u16.toUsize(closure.variableIndex)
+          // Only the explicitly validated module entry receives linker cells.
+          if closure.kind == ClosureKind.ModuleImport || closure.kind == ClosureKind.ModuleDeclaration {
+            run require(!Pointer.isNull<HeapHeader>(moduleRoot) && Pointer.address<HeapHeader>(reference) ==
+              Pointer.address<HeapHeader>(unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(moduleRoot)), 0)
+          }
+          if closure.kind == ClosureKind.Local || closure.kind == ClosureKind.Argument
+            || closure.kind == ClosureKind.Reference || closure.kind == ClosureKind.GlobalReference {
+            run require(!Pointer.isNull<HeapHeader>(work.parent), 0)
+            let parent = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(work.parent))
+            if closure.kind == ClosureKind.Local || closure.kind == ClosureKind.Argument { run capture(parent, index, closure.kind == ClosureKind.Argument) }
+            else { run require(index < parent.closureVars.length(), 0) }
+          }
+          i = i + 1
+        }
+        run unsafe instructions(function)
+        run functionAtoms(function, table)
+        i = 0
+        while i < function.constants.length() {
+          run pending.append(Work { value: function.constants.get(i), parent: reference, functionAllowed: true }) i = i + 1
+        }
+      }
+      Value.Object { reference } => {
+        if !run seen.insert(Pointer.address<HeapHeader>(reference)) { continue }
+        let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+        let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, object.shape)
+        let mut key: usize = 0
+        while key < shape.properties.length() {
+          let atom = shape.properties.get(key).atom
+          run require(atom == 0 || table.kind(atom) == AtomKind.String, 0) key = key + 1
+        }
+        let mut i: usize = 0
+        while i < object.properties.length() {
+          match object.properties.get(i) {
+            PropertySlot.Value { value } => { run pending.append(Work { value: value, parent: Pointer.null<HeapHeader>(), functionAllowed: false }) }
+            _ => { fail ValidationError { pc: 0 } }
+          }
+          i = i + 1
+        }
+        match &object.payload {
+          ObjectPayload.Empty => ()
+          ObjectPayload.FastArray { array } => {
+            i = 0 while i < array.values.length() {
+              run pending.append(Work { value: array.values.get(i), parent: Pointer.null<HeapHeader>(), functionAllowed: false }) i = i + 1
+            }
+          }
+          _ => { fail ValidationError { pc: 0 } }
+        }
+      }
+      Value.Module { .. } => { fail ValidationError { pc: 0 } }
+      _ => ()
+    }
+  }
+}
+/// Requires live, exclusively borrowed, reader-owned values in this engine's
+/// atom table. Does not retain, release, mutate, evaluate, or call JavaScript.
+/// The caller releases `compiled` normally after either outcome.
+pub unsafe effect fn validate<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, compiled: Value) -> ()
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, unsafe runtime.contextRuntime(context))
+  let checked = run Effect.result(unsafe tree(compiled, &state.atoms, Pointer.null<HeapHeader>()))
+  drop state
+  match move checked {
+    Result<(), ValidationError | OutOfMemoryError | RegExpValidationError>.Success { .. } => ()
+    Result<(), ValidationError | OutOfMemoryError | RegExpValidationError>.Failure { error } => {
+      match move error {
+        OutOfMemoryError allocation => { fail move allocation }
+        ValidationError invalid => { return run unsafe engine.throwError(context, NativeErrorKind.Syntax, b"invalid cached function bytecode") }
+        RegExpValidationError invalid => { return run unsafe engine.throwError(context, NativeErrorKind.Syntax, b"invalid cached regexp bytecode") }
+      }
+    }
+  }
+}
+
+// Separate from validate(): VM script caches still reject all module roots and
+// external captures. Module tables are checked before any linker indexes them.
+unsafe effect fn moduleTree(compiled: Value, table: &AtomTable) -> ()
+  ! ValidationError | OutOfMemoryError | RegExpValidationError ? &mut Allocator {
+  let reference = match compiled { Value.Module { reference } => reference _ => { fail ValidationError { pc: 0 } } }
+  let anchor = () let module = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, reference)
+  run require(table.kind(module.name) == AtomKind.String, 0)
+  let root = match module.functionObject { Value.FunctionBytecode { reference: functionReference } => functionReference _ => { fail ValidationError { pc: 0 } } }
+  let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, root)
+  let cells = function.closureVars.length()
+  let requests = module.requestedModules.length()
+  let mut i: usize = 0
+  while i < requests {
+    let request = &module.requestedModules.asSlice()[i]
+    run require(table.kind(request.name) == AtomKind.String, 0)
+    // Attribute records must contain only strings, never executable objects.
+    if !match request.attributes { Value.Undefined => true Value.Null => true _ => false } {
+      let objectRef = match request.attributes { Value.Object { reference: attributesReference } => attributesReference _ => { fail ValidationError { pc: 0 } } }
+      let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, objectRef)
+      run require(match &object.payload { ObjectPayload.Empty => true _ => false }, 0)
+      let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, object.shape)
+      let mut j: usize = 0
+      while j < shape.properties.length() {
+        run require(table.kind(shape.properties.get(j).atom) == AtomKind.String, 0) j = j + 1
+      }
+      j = 0
+      while j < object.properties.length() {
+        run require(match object.properties.get(j) { PropertySlot.Value { value } => value.isString() _ => false }, 0) j = j + 1
+      }
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < module.exports.length() {
+    let entry = module.exports.get(i)
+    run require(table.kind(entry.exportName) == AtomKind.String, 0)
+    match entry.binding {
+      ExportBinding.Local { variableIndex, .. } => {
+        run require(variableIndex >= 0 && i32.toUsize(variableIndex) < cells, 0)
+        let kind = function.closureVars.get(i32.toUsize(variableIndex)).kind
+        run require(kind == ClosureKind.ModuleDeclaration || kind == ClosureKind.ModuleImport, 0)
+      }
+      ExportBinding.Indirect { requestedModuleIndex } => {
+        run require(requestedModuleIndex >= 0 && i32.toUsize(requestedModuleIndex) < requests, 0)
+        run require(table.kind(entry.localName) == AtomKind.String, 0)
+      }
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < module.starExports.length() {
+    let index = module.starExports.get(i).requestedModuleIndex
+    run require(index >= 0 && i32.toUsize(index) < requests, 0) i = i + 1
+  }
+  let mut imports = List<u8>.make()
+  run imports.reserveExact(cells)
+  i = 0 while i < cells { run imports.append(0) i = i + 1 }
+  i = 0
+  while i < module.imports.length() {
+    let entry = module.imports.get(i)
+    run require(entry.variableIndex >= 0 && i32.toUsize(entry.variableIndex) < cells, 0)
+    run require(entry.requestedModuleIndex >= 0 && i32.toUsize(entry.requestedModuleIndex) < requests, 0)
+    run require(table.kind(entry.importName) == AtomKind.String, 0)
+    let index = i32.toUsize(entry.variableIndex)
+    let expected = if entry.isStar { ClosureKind.ModuleDeclaration } else { ClosureKind.ModuleImport }
+    run require(function.closureVars.get(index).kind == expected && imports.get(index) == 0, 0)
+    imports.set(index, 1) i = i + 1
+  }
+  i = 0
+  while i < cells {
+    if function.closureVars.get(i).kind == ClosureKind.ModuleImport { run require(imports.get(i) == 1, 0) }
+    i = i + 1
+  }
+  run unsafe tree(module.functionObject, table, root)
+}
+pub unsafe effect fn validateModule<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, compiled: Value) -> ()
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, unsafe runtime.contextRuntime(context))
+  let checked = run Effect.result(unsafe moduleTree(compiled, &state.atoms))
+  drop state
+  match move checked {
+    Result<(), ValidationError | OutOfMemoryError | RegExpValidationError>.Success { .. } => ()
+    Result<(), ValidationError | OutOfMemoryError | RegExpValidationError>.Failure { error } => {
+      match move error {
+        OutOfMemoryError allocation => { fail move allocation }
+        _ => { return run unsafe engine.throwError(context, NativeErrorKind.Syntax, b"invalid cached module bytecode") }
+      }
+    }
+  }
+}

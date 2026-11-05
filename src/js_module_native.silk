@@ -1,11 +1,11 @@
 //! Native module/name/private/import.meta APIs, pinned quickjs.c:30629-30689,
 //! 31638-31713. Module handles borrow the context's loaded-list ownership.
-import silk.allocator { Allocator, OutOfMemoryError }
-import silk.effect { Effect }
-import silk.option { Option }
-import silk.pointer { Pointer }
-import silk.result { Result }
-import silk.i32
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.pointer { Pointer }
+import silk.core.result { Result }
+import silk.num.i32
 import runtime_memory { AllocationObserver }
 import js_heap { HeapCell, HeapHeader }
 import js_value { Value }
@@ -24,6 +24,7 @@ import js_coercion_host { CoercionHooks }
 import js_exceptions { JsException }
 import js_string_types { StringLengthError }
 import js_class_data as classes
+import native_stack as stack
 
 pub unsafe effect fn newNativeModule(context: *mut HeapHeader, name: &[u8], initialize: NativeFunctionId) -> *mut HeapHeader
   ! OutOfMemoryError | StringLengthError ? &mut Allocator {
@@ -113,15 +114,80 @@ pub unsafe fn getScriptOrModuleName(context: *mut HeapHeader, levels: i32) -> u3
     let code = match &p.payload { ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode _ => { return 0 } } drop p
     let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, code)
     if !bytecode.isDirectOrIndirectEval {
-      let name = match &bytecode.debug { Option<FunctionDebugInfo>.Some { value } => value.filename _ => { return 0 } } drop bytecode
+      let name = match bytecode.hostModule {
+        Value.Module { reference } => {
+          let module = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, reference)
+          module.name
+        }
+        _ => match &bytecode.debug { Option<FunctionDebugInfo>.Some { value } => value.filename _ => { return 0 } }
+      } drop bytecode
       let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, unsafe runtime.contextRuntime(context))
       return state.atoms.duplicate(name)
     }
     frame = previous
   }
 }
+pub unsafe effect fn configureHostCallbacks<H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  context: *mut HeapHeader, compiled: Value, callback: Value, owner: Value) -> () ! JsException ? &mut Allocator {
+  let reference = match compiled { Value.FunctionBytecode { reference } => reference _ => { return () } }
+  let rt = unsafe runtime.contextRuntime(context)
+  if unsafe runtime.checkStackOverflow(rt, stack.currentFrameAddress(), 0, true) {
+    return run unsafe hooks.throwError(context, NativeErrorKind.Internal, b"stack overflow")
+  }
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut anchor, reference)
+  let previous = Intrinsic.replace(data.hostImport, unsafe callback.retained())
+  let previousModule = Intrinsic.replace(data.hostModule, unsafe owner.retained())
+  let count = data.constants.length() drop data
+  unsafe gc.release(&mut hooks, rt, previous) unsafe gc.release(&mut hooks, rt, previousModule)
+  let mut index: usize = 0
+  while index < count {
+    let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference)
+    let child = code.constants.get(index) drop code
+    run unsafe configureHostCallbacks(&mut hooks, context, child, callback, owner)
+    index = index + 1
+  }
+}
+// Host module identity is carried by the actual executing bytecode, not its
+// filename: separate VM compilations may intentionally share an identifier.
+pub unsafe fn currentBytecode(context: *mut HeapHeader) -> ?*mut HeapHeader {
+  let anchor = () let rt = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, unsafe runtime.contextRuntime(context))
+  let mut cursor = rt.currentStackFrame drop rt
+  while let Option<*mut StackFrame>.Some { value: frame } = Pointer.nonNullMut<StackFrame>(cursor) {
+    let current = unsafe Pointer.borrow<(), StackFrame>(&anchor, frame)
+    let function = current.currentFunction cursor = current.previous drop current
+    if let Value.Object { reference } = function {
+      let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+      if let ObjectPayload.BytecodeFunction { function: closure } = &data.payload { return closure.bytecode }
+    }
+  }
+  return Pointer.null<HeapHeader>()
+}
 pub unsafe effect fn importMeta<H: HeapHooks + CoercionHooks>(hooks: &mut H, memory: &AllocationObserver,
   context: *mut HeapHeader) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  if let Option<*mut HeapHeader>.Some { value: code } = Pointer.nonNullMut<HeapHeader>(unsafe currentBytecode(context)) {
+    let anchor = () let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, code)
+    let owner = bytecode.hostModule drop bytecode
+    if let Value.Module { reference: module } = owner {
+      let data = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, module)
+      let fresh = data.metaObject.tag() == Value.Undefined.tag()
+      let callback = unsafe data.privateValue.retained() drop data
+      let made = run Effect.result(unsafe getImportMeta(&mut hooks, memory, context, module))
+      let rt = unsafe runtime.contextRuntime(context)
+      let meta = match move made {
+        Result<Value, OutOfMemoryError>.Success { value } => value
+        Result<Value, OutOfMemoryError>.Failure { error } => { unsafe gc.release(&mut hooks, rt, callback) fail move error }
+      }
+      if fresh && callback.isObject() {
+        let called = run Effect.result(unsafe hooks.call(context, callback, Value.Undefined, &[meta]))
+        unsafe gc.release(&mut hooks, rt, callback)
+        match move called {
+          Result<Value, OutOfMemoryError | JsException>.Success { value } => { unsafe gc.release(&mut hooks, rt, value) }
+          Result<Value, OutOfMemoryError | JsException>.Failure { error } => { unsafe gc.release(&mut hooks, rt, meta) fail move error }
+        }
+      } else { unsafe gc.release(&mut hooks, rt, callback) }
+      return meta
+    }
+  }
   let name = unsafe getScriptOrModuleName(context, 0)
   if name == 0 { return run unsafe hooks.throwError(context, NativeErrorKind.Type, b"import.meta not supported in this context") }
   let module = unsafe loader.findLoaded(context, name)

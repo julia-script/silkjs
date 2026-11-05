@@ -1,0 +1,132 @@
+//! Pre-effect debugger evaluation policy. A rejection is sticky and never becomes
+//! a catchable JavaScript exception. No exception value or interrupt state is changed.
+import silk.mem.pointer { Pointer }
+import silk.core.option { Option }
+import js_heap { HeapCell, HeapHeader }
+import js_core_types { RuntimeState, ObjectData, ShapeData, PropertySlot }
+import js_value { Value }
+import js_exceptions { JsException }
+import js_runtime as runtime
+import js_shapes as shapes
+import js_class_data as classes
+import js_opcode_data as op
+import js_vm_state { Machine }
+
+pub unsafe fn active(context: *mut HeapHeader) -> bool {
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, unsafe runtime.contextRuntime(context))
+  return state.debugger.restricted
+}
+// The owning evaluator saves/restores exception/evaluating state. Nested eval must
+// inherit this session, not call begin/finish. Epochs are never reused, even on failure.
+pub unsafe fn begin(rt: *mut HeapHeader) -> bool {
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+  if state.debugger.restricted || state.debugger.restrictedEpoch == 18446744073709551615 { return false }
+  state.debugger.restrictedEpoch = state.debugger.restrictedEpoch + 1
+  state.debugger.rejected = false state.debugger.restricted = true
+  return true
+}
+pub unsafe fn finish(rt: *mut HeapHeader) -> bool {
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+  let rejected = state.debugger.rejected state.debugger.restricted = false
+  return rejected
+}
+pub unsafe effect fn deny(context: *mut HeapHeader) -> () ! JsException {
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, unsafe runtime.contextRuntime(context))
+  if state.debugger.restricted { state.debugger.rejected = true fail JsException {} }
+}
+pub unsafe fn rejected(rt: *mut HeapHeader) -> bool {
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  return state.debugger.restricted && state.debugger.rejected
+}
+// Only newly allocated ordinary storage is writable. Mapped arguments, typed
+// views, proxies and host classes may alias older storage or invoke host hooks.
+pub unsafe effect fn write(context: *mut HeapHeader, value: Value) -> () ! JsException {
+  if !unsafe active(context) { return () }
+  let reference = match value { Value.Object { reference } => reference _ => { run unsafe deny(context) return () } }
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, unsafe runtime.contextRuntime(context))
+  let epoch = state.debugger.restrictedEpoch drop state
+  let header = unsafe Pointer.borrow<(), HeapHeader>(&anchor, reference)
+  let fresh = header.debuggerEpoch == epoch drop header
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+  let id = object.classId
+  let ordinary = id == classes.JS_CLASS_OBJECT || id == classes.JS_CLASS_ARRAY || id == classes.JS_CLASS_BYTECODE_FUNCTION
+  drop object
+  if !fresh || !ordinary { run unsafe deny(context) }
+}
+// Assignment may traverse old prototypes. Inspect without invoking any accessors,
+// lazy initialization or exotic hooks, even when the receiver itself is fresh.
+pub unsafe effect fn set(context: *mut HeapHeader, object: Value, atom: u32, receiver: Value) -> () ! JsException {
+  if !unsafe active(context) { return () }
+  run unsafe write(context, receiver)
+  let mut node = match object { Value.Object { reference } => reference _ => { run unsafe deny(context) return () } }
+  while true {
+    let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+    if data.isExotic && data.classId != classes.JS_CLASS_ARRAY { drop data run unsafe deny(context) return () }
+    match unsafe shapes.lookup(data.shape, atom) {
+      Option<usize>.Some { value: index } => {
+        let plain = match data.properties.get(index) { PropertySlot.Value { .. } => true _ => false }
+        drop data
+        if !plain { run unsafe deny(context) }
+        return ()
+      }
+      Option<usize>.None => ()
+    }
+    let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+    match Pointer.nonNullMut<HeapHeader>(shape.prototype) {
+      Option<*mut HeapHeader>.Some { value } => { node = value }
+      Option<*mut HeapHeader>.None => { return () }
+    }
+  }
+}
+// JS bodies are checked transitively by the interpreter. Native, bound, proxy,
+// generator and async dispatch have effects before their first JS instruction.
+pub unsafe effect fn call(context: *mut HeapHeader, function: Value) -> () ! JsException {
+  if !unsafe active(context) { return () }
+  let node = match function { Value.Object { reference } => reference _ => { return () } }
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  let bytecode = object.classId == classes.JS_CLASS_BYTECODE_FUNCTION drop object
+  if !bytecode { run unsafe deny(context) }
+}
+// Called after reading the opcode, before consuming operands. Unknown/new opcodes
+// fail closed. Operand ownership and PC are untouched on rejection.
+pub unsafe effect fn instruction(machine: &Machine, opcode: u8) -> () ! JsException {
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)
+  if !state.debugger.restricted { return () }
+  if state.debugger.rejected { fail JsException {} }
+  drop state
+  if opcode == op.OP_put_field { run unsafe write(machine.context, unsafe machine.top(2)) return () }
+  if opcode == op.OP_put_array_el { run unsafe write(machine.context, unsafe machine.top(3)) return () }
+  if opcode == op.OP_define_field || opcode == op.OP_define_method { run unsafe write(machine.context, unsafe machine.top(2)) return () }
+  if opcode == op.OP_define_array_el || opcode == op.OP_define_method_computed { run unsafe write(machine.context, unsafe machine.top(3)) return () }
+  if opcode == op.OP_set_name || opcode == op.OP_set_name_computed || opcode == op.OP_set_home_object {
+    run unsafe write(machine.context, unsafe machine.top(1)) return ()
+  }
+  if opcode == op.OP_special_object {
+    let kind = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(machine.code), machine.pc))
+    if kind <= 5 { return () }
+  }
+  if (opcode >= op.OP_push_i32 && opcode <= op.OP_object)
+    || opcode == op.OP_rest
+    || (opcode >= op.OP_drop && opcode <= op.OP_call_method)
+    || opcode == op.OP_tail_call_method || opcode == op.OP_array_from
+    || opcode == op.OP_return || opcode == op.OP_return_undef
+    || opcode == op.OP_check_ctor_return || opcode == op.OP_check_ctor || opcode == op.OP_init_ctor
+    || opcode == op.OP_throw || opcode == op.OP_throw_error || opcode == op.OP_eval
+    || opcode == op.OP_get_var_undef || opcode == op.OP_get_var
+    || opcode == op.OP_with_get_var || opcode == op.OP_with_get_ref
+    || opcode == op.OP_get_field || opcode == op.OP_get_field2
+    || (opcode >= op.OP_get_array_el && opcode <= op.OP_get_array_el3)
+    || (opcode >= op.OP_get_loc && opcode <= op.OP_get_var_ref)
+    || (opcode >= op.OP_set_loc_uninitialized && opcode <= op.OP_get_var_ref_check)
+    || (opcode >= op.OP_close_loc && opcode <= op.OP_to_propkey)
+    || (opcode >= op.OP_neg && opcode <= op.OP_typeof)
+    || (opcode >= op.OP_mul && opcode <= op.OP_gte)
+    || (opcode >= op.OP_eq && opcode <= op.OP_is_undefined_or_null)
+    || opcode == op.OP_push_bigint_i32
+    || (opcode >= op.OP_nop && opcode <= op.OP_get_var_ref3)
+    || (opcode >= op.OP_get_length && opcode <= op.OP_call3)
+    || opcode == op.OP_is_undefined || opcode == op.OP_is_null || opcode == op.OP_typeof_is_undefined || opcode == op.OP_typeof_is_function {
+    return ()
+  }
+  run unsafe deny(machine.context)
+}
