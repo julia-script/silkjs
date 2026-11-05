@@ -3,6 +3,8 @@
 //! Restricted inspector reads use retained sandbox/backing edges, never the JS
 //! handlers: current descriptors and prototypes preserve identity and mutations.
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silkjs.js_owned_value { Value, lendFor }
+import silkjs.js_realm { lendRealm }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.core.option { Option }
@@ -12,9 +14,10 @@ import silk.mem.pointer { Pointer }
 import silk.num.u32
 import silkjs.js_engine { Engine }
 import silkjs.js_engine_host { EngineServices }
-import silkjs.js_heap { HeapCell, HeapHeader }
-import silkjs.js_value { Value }
-import silkjs.js_core_types { ContextState, RuntimeState, ObjectData, ObjectPayload, ShapeData, PropertySlot, NativeFunctionData, NativeFunctionId, NativeCallProtocol, BuiltinFamily, ExoticCallbacks, PropertyDescriptor, PropertyEnum, JS_PROP_GLOBAL_DECLARATION, JS_PROP_HAS_GET, JS_PROP_HAS_SET, JS_PROP_GETSET, JS_PROP_C_W_E, JS_PROP_TMASK }
+import silkjs.js_heap { HeapCell, HeapHeader, HeapKind }
+import silkjs.thin_list { ThinList }
+import silkjs.js_value { ValueBits }
+import silkjs.js_core_types { ContextState, RuntimeState, ObjectData, ObjectPayload, ShapeData, PropertySlot, NativeFunctionData, NativeCapturedValues, NativeFunctionId, NativeCallProtocol, BuiltinFamily, ExoticCallbacks, PropertyDescriptor, PropertyEnum, JS_PROP_GLOBAL_DECLARATION, JS_PROP_HAS_GET, JS_PROP_HAS_SET, JS_PROP_GETSET, JS_PROP_C_W_E, JS_PROP_TMASK }
 import silkjs.js_runtime_registry { ClassIdAllocator }
 import silkjs.js_runtime_registry as registry
 import silkjs.js_runtime_classes as definitions
@@ -23,7 +26,7 @@ import silkjs.js_gc as gc
 import silkjs.js_object_allocate as objects
 import silkjs.js_class_data as classes
 import silkjs.js_atom_data as atoms
-import silkjs.js_intl_common as common
+import libs.core.common as common
 import silkjs.js_proxy_core as core
 import silkjs.js_proxy as proxy
 import silkjs.js_promise as promise
@@ -47,8 +50,8 @@ pub unsafe effect fn install(rt: *mut HeapHeader, namespace: &ClassIdAllocator) 
   if !run unsafe registry.registerClassAtom(rt, id, atoms.JS_ATOM_Object, move definition) { Intrinsic.trap("VM global class registration failed") }
   return id
 }
-pub unsafe effect fn make<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, handlers: Value, sandbox: Value, backingGlobal: Value, classId: u32) -> Value ! OutOfMemoryError ? &mut Allocator {
-  let mut captures = List<Value>.make()
+pub unsafe effect fn make<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, handlers: ValueBits, sandbox: ValueBits, backingGlobal: ValueBits, classId: u32) -> ValueBits ! OutOfMemoryError ? &mut Allocator {
+  let mut captures = ThinList<ValueBits>.make()
   run captures.reserveExact(3)
   run captures.append(handlers)
   run captures.append(sandbox)
@@ -56,32 +59,33 @@ pub unsafe effect fn make<'m, S: EngineServices>(engine: &mut Engine<'m, S>, con
   let anchor = () let ctx = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
   let prototype = ctx.classPrototypes.get(u32.toUsize(classes.JS_CLASS_OBJECT)) drop ctx
   let memory = engine.memory
-  let value = run unsafe objects.withPrototypeClass(&mut engine, memory, context, prototype, classId)
+  let value = run objects.withPrototypeClass(&mut engine, memory, unsafe lendRealm(&context, context), unsafe lendFor(prototype), classId)
   // All fallible allocation precedes acquiring the three captured strong edges.
+  let allocatedCell = run Effect.result(HeapCell.allocate(HeapKind.Auxiliary, NativeCapturedValues { values: move captures }))
+  let capturedCell = match move allocatedCell { Result<*mut HeapHeader, OutOfMemoryError>.Success { value: cell } => cell Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => { unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), value) fail move error } }
   let retainedHandlers = unsafe handlers.retained()
   let retainedSandbox = unsafe sandbox.retained()
   let retainedBacking = unsafe backingGlobal.retained()
-  unsafe HeapCell.retain(context)
   let mut changed = () let object = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut changed, core.reference(value))
-  object.isExotic = true
+  object.setIsExotic(true)
   object.payload = ObjectPayload.NativeFunction { function: NativeFunctionData {
-    realm: context, function: NativeFunctionId.Host { id: CALLBACK_ID }, length: 0,
-    protocol: NativeCallProtocol.Generic, magic: 0, isDataFunction: true, capturedValues: move captures
+    context: unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(capturedCell), function: NativeFunctionId.Host { id: CALLBACK_ID }, length: 0,
+    protocol: NativeCallProtocol.Data, magicBits: 0
   } }
   return value
 }
 
-struct RestrictedSources { sandbox: Value, backing: Value }
-unsafe fn restrictedSources(object: Value) -> Option<RestrictedSources> {
+struct RestrictedSources { sandbox: ValueBits, backing: ValueBits }
+unsafe fn restrictedSources(object: ValueBits) -> Option<RestrictedSources> {
   if !object.isObject() { return Option<RestrictedSources>.none() }
   let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(object))
-  if !data.isExotic { return Option<RestrictedSources>.none() }
+  if !data.isExotic() { return Option<RestrictedSources>.none() }
   return match &data.payload {
     ObjectPayload.NativeFunction { function } => {
-      if !function.isDataFunction || function.capturedValues.length() != 3 { return Option<RestrictedSources>.none() }
+      if !function.isDataFunction() || unsafe function.capturedCount() != 3 { return Option<RestrictedSources>.none() }
       if !match function.function { NativeFunctionId.Host { id } => id == CALLBACK_ID _ => false } { return Option<RestrictedSources>.none() }
-      let sandbox = function.capturedValues.get(1)
-      let backing = function.capturedValues.get(2)
+      let sandbox = unsafe function.capturedGet(1)
+      let backing = unsafe function.capturedGet(2)
       if !sandbox.isObject() || !backing.isObject() { return Option<RestrictedSources>.none() }
       return Option<RestrictedSources>.some(RestrictedSources { sandbox: sandbox, backing: backing })
     }
@@ -92,20 +96,21 @@ unsafe fn restrictedSources(object: Value) -> Option<RestrictedSources> {
 // No callback may run during this walk. The captured source owns its prototype
 // chain throughout; descriptor outputs alone acquire new owned references.
 unsafe effect fn restrictedLookup<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
-  source: Value, atom: u32, requested: bool, inherited: bool, reading: bool) -> OwnPropertyResult
+  source: ValueBits, atom: u32, requested: bool, inherited: bool, reading: bool) -> OwnPropertyResult
   ! OutOfMemoryError | JsException ? &mut Allocator {
   let mut current = core.reference(source)
   while true {
     let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, current)
-    let classId = data.classId
+    let classId = data.classId()
     let typed = classId >= classes.JS_CLASS_UINT8C_ARRAY && classId <= classes.JS_CLASS_FLOAT64_ARRAY
-    let nativeFast = data.fastArray && (classId == classes.JS_CLASS_ARRAY || classId == classes.JS_CLASS_ARGUMENTS || classId == classes.JS_CLASS_MAPPED_ARGUMENTS || typed)
-    let mut denied = classId == classes.JS_CLASS_PROXY || (data.isExotic && !nativeFast)
+    let nativeFast = data.fastArray() && (classId == classes.JS_CLASS_ARRAY || classId == classes.JS_CLASS_ARGUMENTS || classId == classes.JS_CLASS_MAPPED_ARGUMENTS || typed)
+    let mut denied = classId == classes.JS_CLASS_PROXY || (data.isExotic() && !nativeFast)
     match unsafe shapes.lookup(data.shape, atom) {
-      Option<usize>.Some { value: index } => match data.properties.get(index) {
-        PropertySlot.AutoInit { .. } => { denied = true }
+      Option<usize>.Some { value: index } => match data.properties.get(index).view((unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)).properties.get(index).flags) {
         PropertySlot.GetterSetter { .. } => { if reading { denied = true } }
-        _ => ()
+        PropertySlot.Value { .. } => ()
+        PropertySlot.VarRef { .. } => ()
+        _ => { denied = true }
       }
       Option<usize>.None => ()
     }
@@ -114,20 +119,20 @@ unsafe effect fn restrictedLookup<'m, S: EngineServices>(engine: &mut Engine<'m,
       run unsafe restricted.deny(context)
       fail JsException {}
     }
-    let object = Value.Object { reference: current }
+    let object = ValueBits.Object { reference: current }
     if requested {
-      match move run unsafe descriptors.getOwnProperty(&mut engine, context, object, atom) {
+      match move run descriptors.getOwnProperty(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(object), atom) {
         Option<PropertyDescriptor>.Some { value } => { return OwnPropertyResult.Descriptor { descriptor: move value } }
         Option<PropertyDescriptor>.None => ()
       }
-    } else if run unsafe descriptors.hasOwnProperty(&mut engine, context, object, atom) {
+    } else if run descriptors.hasOwnProperty(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(object), atom) {
       return OwnPropertyResult.Exists
     }
     if !inherited { return OwnPropertyResult.Absent }
     // Integer-indexed objects stop numeric lookup even when the index is absent.
     if typed {
       let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, unsafe runtime.contextRuntime(context))
-      if !match state.atoms.numericIndex(atom) { Value.Undefined => true _ => false } { return OwnPropertyResult.Absent }
+      if !match state.atoms.numericIndex(atom) { ValueBits.Undefined => true _ => false } { return OwnPropertyResult.Absent }
     }
     let prototypeData = unsafe HeapCell.payload<ObjectData, ()>(&anchor, current)
     let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, prototypeData.shape)
@@ -139,7 +144,7 @@ unsafe effect fn restrictedLookup<'m, S: EngineServices>(engine: &mut Engine<'m,
 }
 
 pub unsafe effect fn restrictedOwnProperty<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
-  object: Value, atom: u32, requested: bool) -> Option<OwnPropertyResult> ! OutOfMemoryError | JsException ? &mut Allocator {
+  object: ValueBits, atom: u32, requested: bool) -> Option<OwnPropertyResult> ! OutOfMemoryError | JsException ? &mut Allocator {
   let sources = match move unsafe restrictedSources(object) {
     Option<RestrictedSources>.Some { value } => move value
     Option<RestrictedSources>.None => { return Option<OwnPropertyResult>.none() }
@@ -153,7 +158,7 @@ pub unsafe effect fn restrictedOwnProperty<'m, S: EngineServices>(engine: &mut E
 }
 
 pub unsafe effect fn restrictedHasProperty<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
-  object: Value, atom: u32) -> Option<bool> ! OutOfMemoryError | JsException ? &mut Allocator {
+  object: ValueBits, atom: u32) -> Option<bool> ! OutOfMemoryError | JsException ? &mut Allocator {
   let sources = match move unsafe restrictedSources(object) {
     Option<RestrictedSources>.Some { value } => move value
     Option<RestrictedSources>.None => { return Option<bool>.none() }
@@ -165,10 +170,10 @@ pub unsafe effect fn restrictedHasProperty<'m, S: EngineServices>(engine: &mut E
 }
 
 pub unsafe effect fn restrictedGetProperty<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
-  object: Value, atom: u32, receiver: Value) -> Option<Value> ! OutOfMemoryError | JsException ? &mut Allocator {
+  object: ValueBits, atom: u32, receiver: ValueBits) -> Option<ValueBits> ! OutOfMemoryError | JsException ? &mut Allocator {
   let sources = match move unsafe restrictedSources(object) {
     Option<RestrictedSources>.Some { value } => move value
-    Option<RestrictedSources>.None => { return Option<Value>.none() }
+    Option<RestrictedSources>.None => { return Option<ValueBits>.none() }
   }
   // Reflect.has(sandbox) decides precedence before backing is even inspected.
   // Accessors cannot be invoked, so receiver never changes a successful read.
@@ -178,58 +183,58 @@ pub unsafe effect fn restrictedGetProperty<'m, S: EngineServices>(engine: &mut E
     OwnPropertyResult.Descriptor { descriptor } => OwnPropertyResult.Descriptor { descriptor: move descriptor }
     OwnPropertyResult.Exists => Intrinsic.trap("restricted VM descriptor invariant")
   }
-  return Option<Value>.some(match move found {
-    OwnPropertyResult.Descriptor { descriptor } => descriptor.value
-    OwnPropertyResult.Absent => Value.Undefined
+  return Option<ValueBits>.some(match move found {
+    OwnPropertyResult.Descriptor { descriptor } => descriptor.value.intoBits()
+    OwnPropertyResult.Absent => ValueBits.Undefined
     OwnPropertyResult.Exists => Intrinsic.trap("restricted VM descriptor invariant")
   })
 }
-pub unsafe effect fn call<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, object: Value, name: &[u8], arguments: &[Value]) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+pub unsafe effect fn call<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, object: ValueBits, name: &[u8], arguments: &[ValueBits]) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
   let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(object))
-  let handlers = match &data.payload { ObjectPayload.NativeFunction { function } => function.capturedValues.get(0) _ => Intrinsic.trap("VM global payload invariant") } drop data
+  let handlers = match &data.payload { ObjectPayload.NativeFunction { function } => unsafe function.capturedGet(0) _ => Intrinsic.trap("VM global payload invariant") } drop data
   let callback = run unsafe common.get(&mut engine, context, handlers, name)
-  let called = run Effect.result(unsafe promise.call(&mut engine, context, callback, handlers, arguments))
+  let called = run Effect.result(promise.call(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(callback), unsafe lendFor(handlers), arguments))
   unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), callback)
-  return match move called { Result<Value, JsException>.Success { value } => value Result<Value, JsException>.Failure { error } => { fail move error } }
+  return match move called { Result<Value, JsException>.Success { value } => value.intoBits() Result<Value, JsException>.Failure { error } => { fail move error } }
 }
-pub unsafe effect fn keyed<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, object: Value, name: &[u8], atom: u32, extra: &[Value]) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
-  let key = run unsafe core.atomValue(&mut engine, context, atom)
-  let mut arguments = [key, Value.Undefined, Value.Undefined, Value.Undefined]
+pub unsafe effect fn keyed<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, object: ValueBits, name: &[u8], atom: u32, extra: &[ValueBits]) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let key = run core.atomValue(&mut engine, unsafe lendRealm(&context, context), atom)
+  let mut arguments = [key, ValueBits.Undefined, ValueBits.Undefined, ValueBits.Undefined]
   let mut index: usize = 0
   while index < extra.length { arguments[index + 1] = extra[index] index = index + 1 }
-  let called = run Effect.result(unsafe call(&mut engine, context, object, name, Slice.view<Value>(&arguments, 0, extra.length + 1)))
+  let called = run Effect.result(unsafe call(&mut engine, context, object, name, Slice.view<ValueBits>(&arguments, 0, extra.length + 1)))
   unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), key)
-  return match move called { Result<Value, OutOfMemoryError | JsException>.Success { value } => value Result<Value, OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
+  return match move called { Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
 }
-pub unsafe fn truth<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, value: Value) -> bool {
+pub unsafe fn truth<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, value: ValueBits) -> bool {
   let result = unsafe primitives.toBoolean(value) != 0
   unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), value)
   return result
 }
-pub unsafe effect fn ownProperty<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, object: Value, atom: u32, requested: bool) -> OwnPropertyResult ! OutOfMemoryError | JsException ? &mut Allocator {
+pub unsafe effect fn ownProperty<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, object: ValueBits, atom: u32, requested: bool) -> OwnPropertyResult ! OutOfMemoryError | JsException ? &mut Allocator {
   let value = run unsafe keyed(&mut engine, context, object, b"getOwnPropertyDescriptor", atom, &[])
   if core.undefined(value) { return OwnPropertyResult.Absent }
   let rt = unsafe runtime.contextRuntime(context)
   if !requested { unsafe gc.release(&mut engine, rt, value) return OwnPropertyResult.Exists }
-  let converted = run Effect.result(unsafe descriptorValues.toPropertyDescriptor(&mut engine, context, value))
+  let converted = run Effect.result(descriptorValues.toPropertyDescriptor(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(value)))
   unsafe gc.release(&mut engine, rt, value)
   let mut descriptor = match move converted { Result<PropertyDescriptor, JsException>.Success { value: convertedDescriptor } => move convertedDescriptor Result<PropertyDescriptor, JsException>.Failure { error } => { fail move error } }
   if (descriptor.flags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) != 0 { descriptor.flags = descriptor.flags | JS_PROP_GETSET }
   descriptor.flags = descriptor.flags & (JS_PROP_C_W_E | JS_PROP_TMASK)
   return OwnPropertyResult.Descriptor { descriptor: move descriptor }
 }
-pub unsafe effect fn defineProperty<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, object: Value, atom: u32, value: Value, getter: Value, setter: Value, flags: u32) -> bool ! OutOfMemoryError | JsException ? &mut Allocator {
+pub unsafe effect fn defineProperty<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, object: ValueBits, atom: u32, value: ValueBits, getter: ValueBits, setter: ValueBits, flags: u32) -> bool ! OutOfMemoryError | JsException ? &mut Allocator {
   let memory = engine.memory
-  let descriptor = run unsafe descriptorValues.fromPropertyDescriptor(&mut engine, memory, context, value, getter, setter, flags)
-  let called = run Effect.result(unsafe keyed(&mut engine, context, object, b"defineProperty", atom, &[descriptor, Value.Bool { value: (flags & JS_PROP_GLOBAL_DECLARATION) != 0 }]))
+  let descriptor = run descriptorValues.fromPropertyDescriptor(&mut engine, memory, unsafe lendRealm(&context, context), unsafe lendFor(value), unsafe lendFor(getter), unsafe lendFor(setter), flags)
+  let called = run Effect.result(unsafe keyed(&mut engine, context, object, b"defineProperty", atom, &[descriptor, ValueBits.Bool { value: (flags & JS_PROP_GLOBAL_DECLARATION) != 0 }]))
   unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), descriptor)
-  let result = match move called { Result<Value, OutOfMemoryError | JsException>.Success { value: returned } => returned Result<Value, OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
+  let result = match move called { Result<ValueBits, OutOfMemoryError | JsException>.Success { value: returned } => returned Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
   return unsafe truth(&mut engine, context, result)
 }
-pub unsafe effect fn ownKeys<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, object: Value) -> List<PropertyEnum> ! OutOfMemoryError | JsException ? &mut Allocator {
+pub unsafe effect fn ownKeys<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, object: ValueBits) -> List<PropertyEnum> ! OutOfMemoryError | JsException ? &mut Allocator {
   let array = run unsafe call(&mut engine, context, object, b"ownKeys", &[])
   let mut output = List<PropertyEnum>.make()
-  let appended = run Effect.result(unsafe proxy.appendKeys(&mut engine, context, array, &mut output))
+  let appended = run Effect.result(proxy.appendKeys(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(array), &mut output))
   let rt = unsafe runtime.contextRuntime(context)
   unsafe gc.release(&mut engine, rt, array)
   match move appended {
