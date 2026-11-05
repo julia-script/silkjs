@@ -31,3 +31,30 @@ var got2 = out2.join('|');
 const expected2 = "0:string:10,1:string:20,2:string:30,3:string:40|44850|300|0,1|0,2|0=1,1=2,extra=e|0,1,inherited|x|z|||||||6||||q||e|{\"0\":0,\"1\":1,\"2\":4,\"3\":9,\"4\":16,\"5\":25}|0,1,2,3,4,5|{\"0\":\"v0\",\"1\":\"v1\",\"2\":\"v2\",\"3\":\"v3\",\"5\":\"v5\"}|v4|{\"0\":\"f\"}|{\"0\":\"b\"}|{\"2\":\"r\",\"3\":\"x\"}|9|two|3|4|bigint|3|3|998|3|7.5|1000|666|{\"a\":1,\"b\":2}|{\"b\":2}|{\"b\":\"g\"}|g";
 console.log(got2 === expected2 ? 'PASS property collection edge cases' : 'FAIL ' + got2);
 if (got2 !== expected2) throw new Error('property collection edge case regressions');
+var out3 = [];
+for (var n = 0; n < 11; n++) {
+  for (var at = -1; at < n; at++) {
+    var a = []; for (var i = 0; i < n; i++) a.push(i === at ? 's' + i : i * 1.5);
+    var b = a.slice(); a.length = 0; a = null;
+    out3.push(b.join(':'));
+  }
+}
+var objs = [];
+for (var k = 0; k < 6; k++) {
+  var o = { p: 1, q: 2, r: 3, s: 4, t: 5 }; if (k & 1) o.r = 'str' + k; if (k & 2) o.t = { deep: k };
+  objs.push({ ...o }); o = null;
+}
+out3.push(JSON.stringify(objs)); objs = null;
+var base = { x: 1, y: 2 }; var copies = []; for (var i = 0; i < 3; i++) copies.push({ ...base }); copies = null;
+var acc = { x: 1, y: 2 }; var hit = 0;
+Object.defineProperty(acc, 'y', { get: function () { hit++; return 'gy'; }, enumerable: true, configurable: true });
+var accCopy = { ...acc }; out3.push(accCopy.y, hit); acc = null;
+var withFn = { x: 1, y: 2 }; withFn.y = function () { return 'fn'; }; var fnCopy = { ...withFn }; withFn = null; out3.push(fnCopy.y());
+var sym = Symbol('k'); var withSym = { x: 1, y: 2 }; withSym[sym] = 'sv'; var symCopy = { ...withSym }; withSym = null; out3.push(symCopy[sym]);
+var del = { x: 1, y: 'two', z: 3 }; delete del.y; var delCopy = { ...del }; del = null; out3.push(JSON.stringify(delCopy));
+function Make() { this.a = 1; this.b = 2; } var made = []; for (var i = 0; i < 4; i++) made.push(new Make()); made[2].b = 'str'; Object.defineProperty(made[3], 'a', { get: function () { return 'ga'; } });
+out3.push(made.map(function (m) { return m.a + ',' + m.b; }).join(';')); made = null;
+var got3 = out3.join('|');
+const expected3 = "|0|s0|0:1.5|s0:1.5|0:s1|0:1.5:3|s0:1.5:3|0:s1:3|0:1.5:s2|0:1.5:3:4.5|s0:1.5:3:4.5|0:s1:3:4.5|0:1.5:s2:4.5|0:1.5:3:s3|0:1.5:3:4.5:6|s0:1.5:3:4.5:6|0:s1:3:4.5:6|0:1.5:s2:4.5:6|0:1.5:3:s3:6|0:1.5:3:4.5:s4|0:1.5:3:4.5:6:7.5|s0:1.5:3:4.5:6:7.5|0:s1:3:4.5:6:7.5|0:1.5:s2:4.5:6:7.5|0:1.5:3:s3:6:7.5|0:1.5:3:4.5:s4:7.5|0:1.5:3:4.5:6:s5|0:1.5:3:4.5:6:7.5:9|s0:1.5:3:4.5:6:7.5:9|0:s1:3:4.5:6:7.5:9|0:1.5:s2:4.5:6:7.5:9|0:1.5:3:s3:6:7.5:9|0:1.5:3:4.5:s4:7.5:9|0:1.5:3:4.5:6:s5:9|0:1.5:3:4.5:6:7.5:s6|0:1.5:3:4.5:6:7.5:9:10.5|s0:1.5:3:4.5:6:7.5:9:10.5|0:s1:3:4.5:6:7.5:9:10.5|0:1.5:s2:4.5:6:7.5:9:10.5|0:1.5:3:s3:6:7.5:9:10.5|0:1.5:3:4.5:s4:7.5:9:10.5|0:1.5:3:4.5:6:s5:9:10.5|0:1.5:3:4.5:6:7.5:s6:10.5|0:1.5:3:4.5:6:7.5:9:s7|0:1.5:3:4.5:6:7.5:9:10.5:12|s0:1.5:3:4.5:6:7.5:9:10.5:12|0:s1:3:4.5:6:7.5:9:10.5:12|0:1.5:s2:4.5:6:7.5:9:10.5:12|0:1.5:3:s3:6:7.5:9:10.5:12|0:1.5:3:4.5:s4:7.5:9:10.5:12|0:1.5:3:4.5:6:s5:9:10.5:12|0:1.5:3:4.5:6:7.5:s6:10.5:12|0:1.5:3:4.5:6:7.5:9:s7:12|0:1.5:3:4.5:6:7.5:9:10.5:s8|0:1.5:3:4.5:6:7.5:9:10.5:12:13.5|s0:1.5:3:4.5:6:7.5:9:10.5:12:13.5|0:s1:3:4.5:6:7.5:9:10.5:12:13.5|0:1.5:s2:4.5:6:7.5:9:10.5:12:13.5|0:1.5:3:s3:6:7.5:9:10.5:12:13.5|0:1.5:3:4.5:s4:7.5:9:10.5:12:13.5|0:1.5:3:4.5:6:s5:9:10.5:12:13.5|0:1.5:3:4.5:6:7.5:s6:10.5:12:13.5|0:1.5:3:4.5:6:7.5:9:s7:12:13.5|0:1.5:3:4.5:6:7.5:9:10.5:s8:13.5|0:1.5:3:4.5:6:7.5:9:10.5:12:s9|[{\"p\":1,\"q\":2,\"r\":3,\"s\":4,\"t\":5},{\"p\":1,\"q\":2,\"r\":\"str1\",\"s\":4,\"t\":5},{\"p\":1,\"q\":2,\"r\":3,\"s\":4,\"t\":{\"deep\":2}},{\"p\":1,\"q\":2,\"r\":\"str3\",\"s\":4,\"t\":{\"deep\":3}},{\"p\":1,\"q\":2,\"r\":3,\"s\":4,\"t\":5},{\"p\":1,\"q\":2,\"r\":\"str5\",\"s\":4,\"t\":5}]|gy|1|fn|sv|{\"x\":1,\"z\":3}|1,2;1,2;1,str;ga,2";
+console.log(got3 === expected3 ? 'PASS number-only copies and plain shapes' : 'FAIL ' + got3);
+if (got3 !== expected3) throw new Error('number-only copy regressions');
