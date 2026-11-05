@@ -23,3 +23,12 @@ if (got !== expected) throw new Error('regexp search hint regressions');
 // A branch starting with ^ adds nothing to the first-unit set: the search tries the start position before it skips.
 var r2=[' a b '.replace(/^[\s\xa0]+|[\s\xa0]+$/g, ''), ' ab  '.replace(/^\s*|\s*$/g, '-'), 'ab'.replace(/^a|b/g, '_'), 'xab'.replace(/^a|b/g, '_'), 'zéĀ'.replace(/^q|[éĀ]/g, '.')];
 if (r2.join(';') !== 'a b;-ab--;__;xa_;z..') throw new Error('anchored branch skip: ' + r2.join(';'));
+// Over long inputs a required literal is found by its least common unit; the match must not move.
+var r3 = [];
+var pad = '"a":"b",'.repeat(20);
+var w = '‰' + pad;
+var cases = [pad + 'x\\/Qngr(12)', 'x\\/Qngr(' + pad, pad + '"\\/Qngr(5)\\/"' + pad, w + '"\\/Qngr(7)\\/"', pad + '\\/Qng\\/Qngr(\\/Qngr(9)', pad];
+var res = [/\\\/Qngr\(/, /"\\\/Qngr\((-?[0-9]+)\)\\\/"/g, /(^|[^\\])"\\\/Qngr\((-?[0-9]+)\)\\\/"/g, /Qngr\(\d/, /aQ/, /\(9\)/];
+for (var c of cases) for (var re of res) { re.lastIndex = 0; var m = re.exec(c); r3.push(m ? m.index + ':' + m[0] : 'null'); r3.push(c.replace(re, '#').length); }
+for (var re of res) { var s = pad + 'Qngr(1' + pad + 'Qngr(2'; re.lastIndex = 0; r3.push(String(re.test(s))); }
+if (JSON.stringify(r3) !== "[\"161:\\\\/Qngr(\",165,\"null\",171,\"null\",171,\"163:Qngr(1\",166,\"null\",171,\"null\",171,\"1:\\\\/Qngr(\",162,\"null\",168,\"null\",168,\"null\",168,\"null\",168,\"null\",168,\"161:\\\\/Qngr(\",327,\"160:\\\"\\\\/Qngr(5)\\\\/\\\"\",321,\"159:,\\\"\\\\/Qngr(5)\\\\/\\\"\",320,\"163:Qngr(5\",328,\"null\",333,\"null\",333,\"162:\\\\/Qngr(\",168,\"161:\\\"\\\\/Qngr(7)\\\\/\\\"\",162,\"160:,\\\"\\\\/Qngr(7)\\\\/\\\"\",161,\"164:Qngr(7\",169,\"null\",174,\"null\",174,\"165:\\\\/Qngr(\",175,\"null\",181,\"null\",181,\"174:Qngr(9\",176,\"null\",181,\"178:(9)\",179,\"null\",160,\"null\",160,\"null\",160,\"null\",160,\"null\",160,\"null\",160,\"false\",\"false\",\"false\",\"true\",\"false\",\"false\"]") throw new Error('literal pivot search: ' + JSON.stringify(r3));
