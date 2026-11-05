@@ -246,3 +246,20 @@ var got13 = out13.join('|');
 const expected13 = 'true|1|true|true|3|true|true|true|true|true|true||1|1|z|4|true|true|3,1,0,2,4|0,2,4,9|150|true|true|false|149|2';
 console.log(got13 === expected13 ? 'PASS collection call answers' : 'FAIL ' + got13);
 if (got13 !== expected13) throw new Error('collection call regressions');
+var out14 = [];
+function build() { var o = {}; o.a = 1; o.b = 2; o.c = 3; o.d = 4; o.e = 5; o.f = 6; for (var i = 0; i < 8; i++) o[i] = i * 2; return o; }
+for (var r = 0; r < 40; r++) build();
+var b1 = build(); out14.push(Object.keys(b1).join(), b1[7], b1.f);
+Object.defineProperty(Object.prototype, '3', { set: function (v) { this.hit = v; }, configurable: true });
+var b2 = build(); var own3 = b2.hasOwnProperty(3), hit3 = b2.hit, keys3 = Object.keys(b2).join(); delete Object.prototype[3]; out14.push(own3, hit3, keys3);
+var b3 = build(); out14.push(b3.hasOwnProperty(3), b3[3]);
+function P() {} Object.defineProperty(P.prototype, '1', { value: 'ro', writable: false });
+function fill(o) { for (var i = 0; i < 4; i++) o[i] = 'v' + i; return o; }
+for (var r = 0; r < 30; r++) fill({});
+var p = fill(new P()); out14.push(p.hasOwnProperty(1), p[1], p[2]);
+var ne = Object.preventExtensions({ x: 1 }); fill(ne); out14.push(Object.keys(ne).join());
+var held = {}; var big = []; for (var i = 0; i < 30; i++) { held[i] = { n: i }; } out14.push(held[29].n, Object.keys(held).length);
+var got14 = out14.join('|');
+const expected14 = '0,1,2,3,4,5,6,7,a,b,c,d,e,f|14|6|false|6|0,1,2,4,5,6,7,a,b,c,d,e,f,hit|true|6|false|ro|v2|x|29|30';
+console.log(got14 === expected14 ? 'PASS verified integer-key adds' : 'FAIL ' + got14);
+if (got14 !== expected14) throw new Error('integer add regressions');
