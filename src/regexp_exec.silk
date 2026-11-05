@@ -17,6 +17,10 @@ import silk.num.u16
 import silk.num.u32
 import silk.num.u64
 import silk.num.usize
+import silk.simd.u8x16
+import silk.simd.u16x8
+import silk.simd.mask16
+import silk.simd.mask8
 import byte_buffer { readU16 }
 import regexp_opcodes
 import regexp_types { RegExpMatch, Captures, INLINE_CAPTURES, RegExpTimeout, FLAG_UNICODE, FLAG_UNICODE_SETS, FLAG_HINT, HINT_LENGTH, HINT_LITERAL, HINT_REQUIRED, HINT_ANCHORED, HINT_FIRST_SET, HINT_SET_LENGTH,
@@ -54,17 +58,16 @@ impl Units for Narrow {
   fn codeUnitAt(self: &Self, position: usize) -> u32 {
     unsafe { return u8.toU32(Pointer.read<u8>(Pointer.at<u8>(Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(self.bytes), position))) }
   }
-  // Eight bytes a step: a byte equal to unit zeroes its lane of the xor.
+  // Sixteen bytes a step: one compare and mask per vector.
   fn findUnit(self: &Self, unit: u32, from: usize, length: usize) -> usize {
     if unit > 255 { return length }
     let base = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(self.bytes)
-    let pattern = u64.wrappingMultiply(u32.toU64(unit), 0x0101010101010101)
+    let pattern = u8x16.splat(u32.toU8(unit))
     let mut at = from
-    while at < length && length - at >= 8 {
-      let word = unsafe Pointer.readUnaligned<u64>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u64>(unsafe Pointer.at<u8>(base, at)))
-      let x = u64.bitXor(word, pattern)
-      if u64.bitAnd(u64.bitAnd(u64.wrappingSubtract(x, 0x0101010101010101), u64.bitNot(x)), 0x8080808080808080) != 0 { break }
-      at = at + 8
+    while at < length && length - at >= 16 {
+      let hits = mask16.toBits(u8x16.lanesEqual(unsafe u8x16.loadUnchecked(unsafe Pointer.assumeMany<u8>(unsafe Pointer.at<u8>(base, at))), pattern))
+      if hits != 0 { return at + u32.toUsize(u64.trailingZeros(hits)) }
+      at = at + 16
     }
     while at < length && u8.toU32(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(base, at))) != unit { at = at + 1 }
     return at
@@ -78,16 +81,16 @@ impl Units for Wide {
   fn codeUnitAt(self: &Self, position: usize) -> u32 {
     unsafe { return u16.toU32(Pointer.read<u16>(Pointer.at<u16>(Intrinsic.pointerRequalify<?[*]const u16, [*]const u16>(self.words), position))) }
   }
-  // Four units a step, as Narrow.findUnit.
+  // Eight units a step, as Narrow.findUnit.
   fn findUnit(self: &Self, unit: u32, from: usize, length: usize) -> usize {
+    if unit > 0xffff { return length }
     let base = unsafe Intrinsic.pointerRequalify<?[*]const u16, [*]const u16>(self.words)
-    let pattern = u64.wrappingMultiply(u32.toU64(unit), 0x0001000100010001)
+    let pattern = u16x8.splat(u32.toU16(unit))
     let mut at = from
-    while at < length && length - at >= 4 {
-      let word = unsafe Pointer.readUnaligned<u64>(unsafe Intrinsic.pointerReinterpret<*const u16, *const align(1) u64>(unsafe Pointer.at<u16>(base, at)))
-      let x = u64.bitXor(word, pattern)
-      if u64.bitAnd(u64.bitAnd(u64.wrappingSubtract(x, 0x0001000100010001), u64.bitNot(x)), 0x8000800080008000) != 0 { break }
-      at = at + 4
+    while at < length && length - at >= 8 {
+      let hits = mask8.toBits(u16x8.lanesEqual(unsafe u16x8.loadUnchecked(unsafe Pointer.assumeMany<u16>(unsafe Pointer.at<u16>(base, at))), pattern))
+      if hits != 0 { return at + u32.toUsize(u64.trailingZeros(hits)) }
+      at = at + 8
     }
     while at < length && self.codeUnitAt(at) != unit { at = at + 1 }
     return at
@@ -195,6 +198,14 @@ effect fn growUndo(storage: ?*mut Storage, capacity: usize) -> Grown
   }
 }
 
+// A register file of more than 32 registers, all unset, in storage's spill list.
+@inlineNever
+effect fn spillRegisters(storage: &mut Storage, registerCount: usize) -> ?*mut i64 ! OutOfMemoryError ? &mut Allocator {
+  run List<i64>.reserveExact(&mut storage.spill, registerCount)
+  run List<i64>.appendRepeated(&mut storage.spill, -1, registerCount)
+  return Pointer.fromMutRef<i64>(&mut List<i64>.asMutSlice(&mut storage.spill)[0])
+}
+
 struct Frame {
   pc: usize,
   position: usize,
@@ -220,6 +231,7 @@ struct Machine {
 
 impl Machine {
   // `storage` must outlive the machine and stay in place.
+  @inlineAlways
   effect fn make(storage: &mut Storage, registerCount: usize) -> Self ! OutOfMemoryError ? &mut Allocator {
     let mut values = storage.inlineValues
     if registerCount <= 32 {
@@ -227,9 +239,7 @@ impl Machine {
       let mut index: usize = 0
       while index < registerCount { registerStore(values, index, -1) index = index + 1 }
     } else {
-      run List<i64>.reserveExact(&mut storage.spill, registerCount)
-      run List<i64>.appendRepeated(&mut storage.spill, -1, registerCount)
-      values = Pointer.fromMutRef<i64>(&mut List<i64>.asMutSlice(&mut storage.spill)[0])
+      values = run spillRegisters(&mut storage, registerCount)
     }
     return Machine { values: values, words: storage.inlineWords, capacity: UNDO_INLINE, length: 0, base: 0, storage: Pointer.fromMutRef<Storage>(&mut storage) }
   }
@@ -922,7 +932,7 @@ effect fn execute<U: Units, 'env>(bytecode: &[u8], input: &ExecInput<U>, start: 
       16 => { // REOP_match
         if registerBase <= INLINE_CAPTURES {
           // Offsets fit in i32: inputs are shorter than 2^30 units.
-          let mut inline: [i32; 20] = [0; 20]
+          let mut inline: [i32; 24] = [0; 24]
           let mut slot: usize = 0
           while slot < registerBase {
             inline[slot] = u64.wrappingToI32(i64.wrappingToU64(Machine.register(&machine, slot)))
