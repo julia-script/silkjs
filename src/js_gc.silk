@@ -15,6 +15,7 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.mem.pointer { Pointer }
+import silk.core.ownership { Copy }
 import silk.num.u8
 import silk.num.u16
 import silk.num.u32
@@ -26,7 +27,7 @@ import js_value { ValueBits }
 import js_strings { Strings }
 import js_string_types { FlatString, AtomKind, destroyFlat }
 import js_bigint { BigInt }
-import js_core_types { NO_SP, FieldCacheEntry, fieldCacheIndex, ConstructPin, ReceiverCacheEntry, EmptyShapeEntry,
+import js_core_types { NO_SP, FieldCacheEntry, fieldCacheIndex, ConstructPin, ReceiverCacheEntry, blankReceiverEntry, EmptyShapeEntry,
   RuntimeState, ContextState, GcPhase, HeapList, ObjectData, ObjectPayload,
   PropertySlot, SlotBits, ShapeData, ShapeProperty, JS_PROP_TMASK, JS_PROP_AUTOINIT, FunctionBytecode, VarRef, VarRefState, FrameSlot,
   StackFrame, AsyncFrame, ModuleDef, ExportBinding, NativeFunctionId,
@@ -619,10 +620,101 @@ unsafe fn refillReceiver<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, 
   let mut stateAnchor = ()
   let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
   let old = state.receiverCache[slot]
-  state.receiverCache[slot] = ReceiverCacheEntry { function: Pointer.address<HeapHeader>(function), version: version, index: index, empty: found }
+  let mut entry = blankReceiverEntry()
+  entry.function = Pointer.address<HeapHeader>(function) entry.version = version entry.index = index entry.empty = found
+  state.receiverCache[slot] = entry
   drop state
   unsafe releaseOptional(&mut hooks, runtime, old.empty)
+  unsafe releaseOptional(&mut hooks, runtime, old.final)
   return found
+}
+@inlineAlways
+fn receiverSlot(address: usize) -> usize {
+  return u64.toUsize(u64.shiftRight(u64.wrappingMultiply(usize.toU64(address / 16), 0x9e3779b97f4a7c15), 58))
+}
+/// The shape versions of the prototype chain from first, link by link, into
+/// chain; returns the depth, or 4 when it is longer than chain holds.
+unsafe fn chainVersions(first: ?*mut HeapHeader, chain: &mut [u64; 3]) -> usize {
+  let anchor = ()
+  let mut current = first
+  let mut depth: usize = 0
+  while !Pointer.isNull<HeapHeader>(current) {
+    if depth == 3 { return 4 }
+    let link = unsafe HeapCell.payload<ObjectData, ()>(&anchor, unsafe nonnull(current))
+    let linkShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, link.shape)
+    chain[depth] = linkShape.version
+    current = linkShape.prototype
+    depth = depth + 1
+  }
+  return depth
+}
+/// The plan's final shape (an owned reference) for `new function(...)` when the
+/// receiver cache holds a construct plan that still applies, else null.
+@inlineAlways
+pub unsafe fn plannedShape(runtime: *mut HeapHeader, function: *mut HeapHeader, bytecode: usize) -> PlannedShape {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, function)
+  let version = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)).version
+  let address = Pointer.address<HeapHeader>(function)
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let entry = &state.receiverCache[receiverSlot(address)]
+  let missed = PlannedShape { final: Pointer.null<HeapHeader>(), empty: Pointer.null<HeapHeader>(), stores: 0, sources: [0; 8] }
+  if entry.function != address || entry.version != version || entry.stores == 0 || entry.bytecode != bytecode || data.isExotic() { return missed }
+  let final = unsafe nonnull(entry.final)
+  let finalShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, final)
+  // The version fixes the record at entry.index as a data property.
+  match (unsafe js_shapes.unchecked<SlotBits>(&data.properties, entry.index)).valueBits() {
+    ValueBits.Object { reference } => {
+      if Pointer.address<HeapHeader>(reference) != Pointer.address<HeapHeader>(unsafe nonnull(finalShape.prototype)) { return missed }
+    }
+    _ => { return missed }
+  }
+  let mut current = finalShape.prototype
+  let depth = u8.toUsize(entry.depth)
+  let mut level: usize = 0
+  while level < depth {
+    let link = unsafe HeapCell.payload<ObjectData, ()>(&anchor, unsafe nonnull(current))
+    let linkShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, link.shape)
+    if linkShape.version != entry.chain[level] { return missed }
+    current = linkShape.prototype
+    level = level + 1
+  }
+  let mut headerAnchor = ()
+  let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut headerAnchor, final)
+  let count = header.referenceCount
+  if count <= 0 { return missed }
+  header.referenceCount = i32.wrappingAdd(count, 1)
+  return PlannedShape { final: entry.final, empty: entry.empty, stores: entry.stores, sources: entry.sources }
+}
+pub struct PlannedShape { pub final: ?*mut HeapHeader, pub empty: ?*mut HeapHeader, pub stores: u8, pub sources: [u8; 8] }
+impl Copy for PlannedShape {}
+/// Records a construct plan on function's receiver cache entry, whose empty shape
+/// the receiver just built had: its stores (arguments sources) took it to final.
+pub unsafe fn notePlan<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, function: *mut HeapHeader, empty: *mut HeapHeader,
+  final: *mut HeapHeader, bytecode: usize, stores: usize, sources: [u8; 8]) -> () {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, function)
+  let version = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)).version
+  drop data
+  let address = Pointer.address<HeapHeader>(function)
+  let slot = receiverSlot(address)
+  let mut chain: [u64; 3] = [0; 3]
+  let finalShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, final)
+  let depth = unsafe chainVersions(finalShape.prototype, &mut chain)
+  drop finalShape
+  if depth > 3 || stores == 0 || stores > 8 { return () }
+  let mut stateAnchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
+  let entry = state.receiverCache[slot]
+  if entry.function != address || entry.version != version || Pointer.address<HeapHeader>(unsafe nonnull(entry.empty)) != Pointer.address<HeapHeader>(empty) { return () }
+  if Pointer.address<HeapHeader>(unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(entry.final)) == Pointer.address<HeapHeader>(final) && entry.bytecode == bytecode { return () }
+  unsafe HeapCell.retain(final)
+  let mut updated = entry
+  updated.final = final updated.bytecode = bytecode updated.stores = usize.toU8(stores) updated.depth = usize.toU8(depth)
+  updated.sources = sources updated.chain = chain
+  state.receiverCache[slot] = updated
+  drop state
+  unsafe releaseOptional(&mut hooks, runtime, entry.final)
 }
 /// An owned reference to prototype's interned empty shape (js_shapes.empty),
 /// through RuntimeState.emptyShapes.
@@ -671,9 +763,10 @@ pub unsafe fn releasePins<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader)
     let old = state.constructPins[slot]
     state.constructPins[slot] = ConstructPin { final: 0, count: 0, shapes: [Pointer.null<HeapHeader>(); 8] }
     let receiver = state.receiverCache[slot]
-    state.receiverCache[slot] = ReceiverCacheEntry { function: 0, version: 0, index: 0, empty: Pointer.null<HeapHeader>() }
+    state.receiverCache[slot] = blankReceiverEntry()
     drop state
     unsafe releaseOptional(&mut hooks, runtime, receiver.empty)
+    unsafe releaseOptional(&mut hooks, runtime, receiver.final)
     let mut i: usize = 0
     while i < old.count { unsafe releaseHeader(&mut hooks, runtime, unsafe nonnull(old.shapes[i])) i = i + 1 }
     slot = slot + 1
