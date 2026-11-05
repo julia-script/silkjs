@@ -1,8 +1,8 @@
 //! Complete native Worker class and event ports, quickjs-libc.c:2356-2410,
 //! 3669-3904,4021-4040. A port is owned by its Worker object, never the event list.
 //! Source's postMessage clones ordinary ArrayBuffers; it has no transfer-list API.
-import js_owned_value { Value, ValueRef, lendBits, immediateRef }
-import js_realm { Realm, Arguments, lendRealm }
+import js_owned_value { Value, ValueRef, immediateRef }
+import js_realm { Realm, Arguments }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.collections.list { List }
@@ -16,10 +16,9 @@ import js_heap { HeapCell, HeapHeader, HeapKind, CellRef }
 import silk.core.ownership { Copy }
 import js_value { ValueBits }
 import js_intl_realm as ops
-import js_core_types { RuntimeState, ContextState, ObjectData, ObjectPayload, BuiltinFamily,
-  NativeFunctionId, NativeCallProtocol, FrameSlots, SharedArrayBufferHooks }
+import js_core_types { RuntimeState, ObjectData, ObjectPayload, BuiltinFamily,
+  NativeFunctionId, NativeCallProtocol, SharedArrayBufferHooks }
 import js_gc { HeapHooks, Tracer }
-import js_gc as gc
 import js_runtime as runtime
 import js_runtime_registry as registration
 import js_runtime_classes as classes
@@ -67,8 +66,10 @@ pub interface WorkerHooks {
 /// A worker thread's pipes to its parent.
 struct ParentPipes { receive: PipeHandle, send: PipeHandle }
 struct WorkerData { receive: PipeHandle, send: PipeHandle, port: Option<PortRef> }
+/// `linked` says whether the port is still on its runtime's list; teardown clears it
+/// before the list's ThreadState goes away.
 pub struct Port { previous: Option<PortRef>, next: Option<PortRef>,
-  owner: ?*mut ThreadState, receive: PipeHandle, callback: Value, pollIndex: usize }
+  linked: bool, receive: PipeHandle, callback: Value, pollIndex: usize }
 /// A port on the runtime's port list. Ports are freed only by their Worker's finalizer
 /// or onmessage setter, so a PortRef is used before any JS runs and dropped after.
 pub struct PortRef { cell: CellRef<Port> }
@@ -85,19 +86,8 @@ impl PortRef {
   fn setNext(self: Self, next: Option<PortRef>) -> () { let mut anchor = () let port = self.cell.getMut(&mut anchor) port.next = next }
   fn setPrevious(self: Self, previous: Option<PortRef>) -> () { let mut anchor = () let port = self.cell.getMut(&mut anchor) port.previous = previous }
 }
-/// The list-head pointer for `port`, null when there is none.
-fn headerOf(port: Option<PortRef>) -> ?*mut HeapHeader {
-  return match port { Option<PortRef>.Some { value } => value.header() _ => Pointer.null<HeapHeader>() }
-}
-// The caller proves node is null or a live Port cell.
-unsafe fn portRef(node: ?*mut HeapHeader) -> Option<PortRef> {
-  return match Pointer.nonNullMut(node) {
-    Option<*mut HeapHeader>.Some { value } => Option<PortRef>.some(PortRef { cell: unsafe CellRef<Port>.of(value) })
-    _ => Option<PortRef>.none()
-  }
-}
 /// The first port on the runtime's list.
-pub fn ports<'a>(realm: Realm<'a>) -> Option<PortRef> { let anchor = () return unsafe portRef(events.thread(realm, &anchor).workerPortsFirst) }
+pub fn ports<'a>(realm: Realm<'a>) -> Option<PortRef> { let anchor = () return events.thread(realm, &anchor).workerPortsFirst }
 /// A Worker object's native record, lent while the object is.
 struct Worker<'a> { record: CellRef<WorkerData> }
 impl<'a> Copy for Worker<'a> {}
@@ -140,22 +130,22 @@ effect fn requireWorker<'a, 'b, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a
   if Pointer.isNull<HeapHeader>(pointer) { return run ops.error(&mut hooks,realm, b"not a Worker object") }
   return Worker<'b> { record: unsafe CellRef<WorkerData>.of(nonnull(pointer)) }
 }
-unsafe fn unlinkPort(port: PortRef) -> () {
+fn unlinkPort(state: &mut ThreadState, port: PortRef) -> () {
   let mut anchor = () let node = port.cell.getMut(&mut anchor)
-  let owner = node.owner let previous = node.previous let next = node.next
-  node.owner = Pointer.null<ThreadState>() node.previous = Option<PortRef>.none() node.next = Option<PortRef>.none() drop node
-  if Pointer.isNull<ThreadState>(owner) { return () }
-  let state = unsafe Pointer.borrowMut<(), ThreadState>(&mut anchor, nonnull(owner))
-  if previous.isNone() { state.workerPortsFirst = headerOf(next) }
-  if next.isNone() { state.workerPortsLast = headerOf(previous) } drop state
+  let previous = node.previous let next = node.next
+  node.linked = false node.previous = Option<PortRef>.none() node.next = Option<PortRef>.none() drop node
+  if previous.isNone() { state.workerPortsFirst = next }
+  if next.isNone() { state.workerPortsLast = previous }
   if let Option<PortRef>.Some { value: before } = previous { before.setNext(next) }
   if let Option<PortRef>.Some { value: after } = next { after.setPrevious(previous) }
 }
+// The caller proves `rt` is the live runtime that owns the port's callback.
 unsafe fn freePort<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, optional: Option<PortRef>) -> () {
   let port = match optional { Option<PortRef>.Some { value } => value _ => { return () } }
-  unsafe unlinkPort(port)
   let mut anchor = () let node = port.cell.getMut(&mut anchor)
-  let callback = node.callback.take() drop node
+  let linked = node.linked let callback = node.callback.take() drop node
+  // A linked port's runtime still has its ThreadState; teardown unlinks every port first.
+  if linked { unlinkPort(unsafe Pointer.borrowMut<(), ThreadState>(&mut anchor, unsafe events.state(rt)), port) }
   unsafe callback.release(&mut hooks, rt)
   unsafe HeapCell.destroy<Port>(port.header())
 }
@@ -175,22 +165,21 @@ pub unsafe fn mark(rt: *mut HeapHeader, object: *mut HeapHeader, tracer: &mut Tr
   let port = record.port drop record
   if let Option<PortRef>.Some { value } = port { unsafe tracer.value(value.cell.get(&anchor).callback.view()) }
 }
-pub unsafe fn detachPorts(rt: *mut HeapHeader) -> () {
-  let pointer = unsafe events.state(rt) let mut anchor = ()
-  let state = unsafe Pointer.borrowMut<(), ThreadState>(&mut anchor, pointer)
-  let mut current = unsafe portRef(state.workerPortsFirst)
-  state.workerPortsFirst = Pointer.null<HeapHeader>() state.workerPortsLast = Pointer.null<HeapHeader>() drop state
+fn detachPorts(state: &mut ThreadState) -> () {
+  let mut current = Intrinsic.replace(state.workerPortsFirst, Option<PortRef>.none())
+  state.workerPortsLast = Option<PortRef>.none()
+  let mut anchor = ()
   while let Option<PortRef>.Some { value: port } = current {
     let node = port.cell.getMut(&mut anchor)
-    current = node.next node.owner = Pointer.null<ThreadState>() node.next = Option<PortRef>.none() node.previous = Option<PortRef>.none()
+    current = node.next node.linked = false node.next = Option<PortRef>.none() node.previous = Option<PortRef>.none()
   }
 }
-pub unsafe fn freeState<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, pointer: *mut ThreadState) -> () {
-  unsafe detachPorts(rt) let mut anchor = ()
-  let state = unsafe Pointer.borrowMut<(), ThreadState>(&mut anchor, pointer)
+/// Detaches the worker ports and drops the pipes, ahead of freeing `state`.
+pub fn freeState(state: &mut ThreadState) -> () {
+  detachPorts(&mut state)
   let receive = Intrinsic.replace(state.recvPipe, Option<PipeHandle>.none())
   let send = Intrinsic.replace(state.sendPipe, Option<PipeHandle>.none())
-  let group = Intrinsic.replace(state.workerGroup, Option<GroupHandle>.none()) drop state
+  let group = Intrinsic.replace(state.workerGroup, Option<GroupHandle>.none())
   drop receive drop send drop group
 }
 unsafe effect fn makeObject<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H, memory: &AllocationObserver,realm: Realm<'a>, newTarget: ValueRef<'b>, classId: u32, receive: &PipeHandle, send: &PipeHandle)
@@ -302,17 +291,16 @@ effect fn setOnMessage<'a, 'b, 'w, H: HeapHooks + CoercionHooks>(hooks: &mut H, 
   }
   if !hooks.isCallable(realm, callback) { return run ops.error(&mut hooks,realm, b"not a function") }
   if port.isNone() {
-    let owner = unsafe events.state(rt)
     let receive = worker.record.get(&anchor).receive.clone()
     let made = run Effect.result(HeapCell.allocate<Port>(HeapKind.Auxiliary,
-      Port { previous: Option<PortRef>.none(), next: Option<PortRef>.none(), owner: owner,
+      Port { previous: Option<PortRef>.none(), next: Option<PortRef>.none(), linked: true,
         receive: move receive, callback: Value.immediate(ValueBits.Null), pollIndex: 0 }))
     let cell = match move made { Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value
       Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => run ops.materialize(&mut hooks,realm, move error) }
     let created = PortRef { cell: unsafe CellRef<Port>.of(cell) }
     let state = events.threadMut(realm, &mut anchor)
-    let previous = unsafe portRef(state.workerPortsLast) state.workerPortsLast = created.header()
-    if previous.isNone() { state.workerPortsFirst = created.header() } drop state
+    let previous = Intrinsic.replace(state.workerPortsLast, Option<PortRef>.some(created))
+    if previous.isNone() { state.workerPortsFirst = Option<PortRef>.some(created) } drop state
     created.setPrevious(previous)
     if let Option<PortRef>.Some { value: before } = previous { before.setNext(Option<PortRef>.some(created)) }
     port = Option<PortRef>.some(created)
