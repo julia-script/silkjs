@@ -146,26 +146,55 @@ struct AllocatedNode { node: *mut HeapHeader }
 struct PreparedNode { node: *mut HeapHeader, slots: ThinList<SlotBits> }
 /// A node with room for capacity slots in its cell. A full-size one (the spare
 /// cells' size) comes from a spare cell when there is one.
+///
+/// A plain object's (plain: JS_CLASS_OBJECT, no extra values) payload is always
+/// Empty, which needs only the payload's tag word: its slots start right after
+/// that word, over the rest of the payload (objects.slotsOverPayload), so a
+/// two-slot object takes 96 bytes, not 128. Nothing may store another payload
+/// variant into such an object.
 @inlineAlways
-unsafe effect fn inlineNode(runtime: *mut HeapHeader, capacity: usize, count: usize, extra: usize) -> PreparedNode ! OutOfMemoryError ? &mut Allocator {
-  let tailBytes = capacity * Layout.of<SlotBits>().bytes + extra * Layout.of<ValueBits>().bytes
+unsafe effect fn inlineNode(runtime: *mut HeapHeader, capacity: usize, count: usize, extra: usize, plain: bool) -> PreparedNode ! OutOfMemoryError ? &mut Allocator {
+  let mut tailBytes = capacity * Layout.of<SlotBits>().bytes + extra * Layout.of<ValueBits>().bytes
+  let over = plain && extra == 0
+  if over {
+    let reused = Layout.of<ObjectPayload>().bytes - PAYLOAD_TAG_BYTES
+    if tailBytes > reused { tailBytes = tailBytes - reused } else { tailBytes = 0 }
+  }
   let mut spare = Pointer.null<HeapHeader>()
-  if extra == 0 { spare = unsafe gc.takeSpareCell(runtime, capacity) }
+  if extra == 0 { spare = unsafe gc.takeSpareCell(runtime, capacity, over) }
   let node = match Pointer.nonNullMut<HeapHeader>(spare) {
     Option<*mut HeapHeader>.Some { value } => unsafe HeapCell.reviveUninit<ObjectData>(HeapKind.Object, value)
     Option<*mut HeapHeader>.None => run HeapCell.allocateUninitWithTail<ObjectData>(HeapKind.Object, tailBytes)
   }
-  let tail = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut SlotBits>(unsafe HeapCell.tailAddress<ObjectData>(node))
+  let mut tail = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut SlotBits>(unsafe HeapCell.tailAddress<ObjectData>(node))
+  if over {
+    let mut payloadAnchor = ()
+    let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut payloadAnchor, node)
+    // The tag first: the slots below then overwrite the rest of the payload.
+    let payload = Pointer.fromMutRef<ObjectPayload>(&mut data.payload)
+    unsafe Pointer.put<ObjectPayload>(payload, ObjectPayload.Empty)
+    drop data
+    tail = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut SlotBits>(unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(
+      unsafe Intrinsic.pointerReinterpret<*mut ObjectPayload, *mut u8>(payload)), PAYLOAD_TAG_BYTES))
+  }
   let mut slots = unsafe ThinList<SlotBits>.borrowing(tail, capacity)
   let mut i: usize = 0
   while i < count { slots.push(SlotBits.value(ValueBits.Undefined)) i = i + 1 }
   return PreparedNode { node: node, slots: move slots }
 }
+/// Bytes of ObjectPayload's tag word: an Empty payload's only meaningful bytes.
+const PAYLOAD_TAG_BYTES: usize = 8
+/// Whether object (a JS_CLASS_OBJECT object) keeps its slots over its payload:
+/// all such objects with slots in their own cell do (see inlineNode).
+@inlineAlways
+pub fn slotsOverPayload(object: &ObjectData) -> bool {
+  return object.classId() == classes.JS_CLASS_OBJECT && object.properties.borrowsStorage()
+}
 /// A node for an object of shape, keeping small slot lists in its cell.
 /// plan, when not null, is the shape whose slot plan picks the tail: the empty
 /// shape a constructor's objects start from, for objects born with its final one.
 @inlineAlways
-unsafe effect fn prepareNode(runtime: *mut HeapHeader, shape: *mut HeapHeader, extra: usize, plan: ?*mut HeapHeader) -> PreparedNode ! OutOfMemoryError ? &mut Allocator {
+unsafe effect fn prepareNode(runtime: *mut HeapHeader, shape: *mut HeapHeader, extra: usize, plan: ?*mut HeapHeader, plain: bool) -> PreparedNode ! OutOfMemoryError ? &mut Allocator {
   let anchor = ()
   let data = unsafe HeapCell.payload<ShapeData, ()>(&anchor, shape)
   let capacity = data.properties.capacity()
@@ -178,11 +207,11 @@ unsafe effect fn prepareNode(runtime: *mut HeapHeader, shape: *mut HeapHeader, e
       Option<*mut HeapHeader>.Some { value } => {
         let mut tail = unsafe shapes.planInline(value, 0)
         if tail != 0 && tail < count { tail = shapes.INLINE_SLOTS }
-        if tail >= count { return run unsafe inlineNode(runtime, tail, count, extra) }
+        if tail >= count { return run unsafe inlineNode(runtime, tail, count, extra, plain) }
       }
       Option<*mut HeapHeader>.None => {
         let tail = unsafe shapes.planInline(shape, count)
-        if tail != 0 { return run unsafe inlineNode(runtime, tail, count, extra) }
+        if tail != 0 { return run unsafe inlineNode(runtime, tail, count, extra, plain) }
       }
     }
   }
@@ -264,7 +293,7 @@ unsafe effect fn initializeRetired<'a>(realm: Realm<'a>, node: *mut HeapHeader,
 unsafe effect fn freshNode<'a, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>, ownedShape: *mut HeapHeader, classId: u32,
   exotic: bool, fast: bool, extra: usize, plan: ?*mut HeapHeader) -> ValueBits ! OutOfMemoryError ? &mut Allocator {
   let runtime = realm.runtime()
-  let created = run Intrinsic.catchFailure<OutOfMemoryError>(unsafe prepareNode(runtime, ownedShape, extra, plan), failedOom)
+  let created = run Intrinsic.catchFailure<OutOfMemoryError>(unsafe prepareNode(runtime, ownedShape, extra, plan, classId == classes.JS_CLASS_OBJECT), failedOom)
   let fresh = match move created {
     PreparedNode { node, slots } => unsafe placeSlots(node, move slots)
     FailedOom { error } => {
@@ -281,7 +310,10 @@ unsafe effect fn freshNode<'a, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>, ow
   data.setIsStandardArrayPrototype(false) data.setExtensible(true) data.setFreeMark(false) data.setIsExotic(exotic)
   data.setFastArray(fast) data.setIsConstructor(false) data.setHasImmutablePrototype(false)
   data.setIsHtmlDda(false) data.setClassId(classId) data.weakRefCount = 0 data.shape = ownedShape
-  unsafe Pointer.put<ObjectPayload>(Pointer.fromMutRef<ObjectPayload>(&mut data.payload), initialPayload(classId))
+  // inlineNode already wrote a plain object's Empty payload tag; its slots fill the rest.
+  if !(classId == classes.JS_CLASS_OBJECT && extra == 0 && data.properties.borrowsStorage()) {
+    unsafe Pointer.put<ObjectPayload>(Pointer.fromMutRef<ObjectPayload>(&mut data.payload), initialPayload(classId))
+  }
   // extra value slots follow the property slots in an inline cell's tail.
   if extra != 0 && data.properties.borrowsStorage() {
     let start = unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(unsafe HeapCell.tailAddress<ObjectData>(fresh)),
