@@ -1,0 +1,216 @@
+//! Buffer-only codecs, not TextDecoder: retain BOM and UTF16 lone surrogates.
+//! Native host 18. Arguments borrow for the synchronous call; no callbacks run
+//! after taking a backing snapshot. Writes target the existing JS allocation;
+//! decoding transfers the StringBuilder's owned string, with no finalizer needed.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.num.f64
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_heap { HeapHeader }
+import silkjs.js_core_types { FrameSlots, NativeErrorKind }
+import silkjs.js_value { Value }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_coercion_host { CoercionHooks }
+import silkjs.js_string_types { StringLengthError }
+import silkjs.js_strings { Strings, StringBuilder }
+import silkjs.js_string_rope { RopeIterator }
+import silkjs.utf8 { Utf8 }
+import silkjs.js_buffer_storage { BufferState }
+import silkjs.js_buffer_storage as buffers
+import silkjs.js_typed_array_buffer as typed
+import silkjs.js_class_data as classes
+import silkjs.js_proxy_core as core
+import silkjs.js_std_support as common
+
+const END: u32 = 0xffffffff
+// RopeIterator visits each leaf once, avoiding a root traversal for every unit.
+fn unit<'a>(iterator: &mut RopeIterator<'a>) -> u32 {
+  return match iterator.next() {
+    Option<u16>.Some { value } => u16.toU32(value)
+    Option<u16>.None => END
+  }
+}
+fn scalar<'a>(iterator: &mut RopeIterator<'a>, pending: &mut u32) -> u32 {
+  let mut point = pending.*
+  pending.* = END
+  if point == END { point = unit(&mut iterator) }
+  if point >= 0xd800 && point <= 0xdbff {
+    let low = unit(&mut iterator)
+    if low >= 0xdc00 && low <= 0xdfff { return 0x10000 + (point - 0xd800) * 1024 + low - 0xdc00 }
+    pending.* = low
+    return 0xfffd
+  }
+  if point >= 0xdc00 && point <= 0xdfff { return 0xfffd }
+  return point
+}
+fn utf8Length(input: Value) -> usize {
+  let mut iterator = RopeIterator.make(&input)
+  let mut pending = END
+  let mut length: usize = 0
+  while true {
+    let point = scalar(&mut iterator, &mut pending)
+    if point == END { return length }
+    if point < 0x80 { length = length + 1 }
+    else if point < 0x800 { length = length + 2 }
+    else if point < 0x10000 { length = length + 3 }
+    else { length = length + 4 }
+  }
+}
+unsafe fn encode(input: Value, state: BufferState, offset: u64, capacity: u64, utf16: bool) -> u64 {
+  let mut iterator = RopeIterator.make(&input)
+  let mut pending = END
+  let mut written: u64 = 0
+  let mut bytes: [u8; 6] = [0; 6]
+  while written < capacity {
+    if utf16 {
+      if capacity - written < 2 { break }
+      let point = unit(&mut iterator)
+      if point == END { break }
+      unsafe buffers.storeScalar(state, offset + written, 0, u32.toU64(point & 255))
+      unsafe buffers.storeScalar(state, offset + written + 1, 0, u32.toU64(u32.shiftRight(point, 8)))
+      written = written + 2
+    } else {
+      let point = scalar(&mut iterator, &mut pending)
+      if point == END { break }
+      if point < 0x80 {
+        unsafe buffers.storeScalar(state, offset + written, 0, u32.toU64(point))
+        written = written + 1
+      } else {
+        // Only six stack bytes, never an encoded-string allocation/copy. The
+        // scalar sanitizer restricts the engine's extended UTF8 encoder to Unicode.
+        let count = Utf8.encode(point, &mut bytes)
+        if usize.toU64(count) > capacity - written { break }
+        let mut i: usize = 0
+        while i < count {
+          unsafe buffers.storeScalar(state, offset + written, 0, u8.toU64(bytes[i]))
+          written = written + 1
+          i = i + 1
+        }
+      }
+    }
+  }
+  return written
+}
+unsafe fn byte(state: BufferState, offset: u64) -> u32 {
+  return u64.toU32(unsafe buffers.loadScalar(state, offset, 0))
+}
+// Strings.fromUtf8 intentionally implements QuickJS's invalid-run skipping and
+// Utf8.decode accepts surrogate/extended sequences. Neither matches Node Buffer.
+// Consume only the maximal valid prefix; leave an offending successor for the
+// next iteration, including constrained second bytes and truncated sequences.
+unsafe fn decodeScalar(state: BufferState, index: &mut u64, end: u64) -> u32 {
+  let first = unsafe byte(state, index.*)
+  index.* = index.* + 1
+  if first < 0x80 { return first }
+  let mut count: u32 = 0
+  let mut point: u32 = 0
+  if first >= 0xc2 && first <= 0xdf { count = 1 point = first & 31 }
+  else if first >= 0xe0 && first <= 0xef { count = 2 point = first & 15 }
+  else if first >= 0xf0 && first <= 0xf4 { count = 3 point = first & 7 }
+  else { return 0xfffd }
+  let mut i: u32 = 0
+  while i < count {
+    if index.* == end { return 0xfffd }
+    let next = unsafe byte(state, index.*)
+    if next < 0x80 || next > 0xbf { return 0xfffd }
+    if i == 0 && ((first == 0xe0 && next < 0xa0) || (first == 0xed && next > 0x9f)
+      || (first == 0xf0 && next < 0x90) || (first == 0xf4 && next > 0x8f)) { return 0xfffd }
+    point = u32.shiftLeft(point, 6) | (next & 63)
+    index.* = index.* + 1
+    i = i + 1
+  }
+  return point
+}
+unsafe effect fn decode(state: BufferState, start: u64, end: u64, utf16: bool) -> Value
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let mut builder = StringBuilder.make()
+  let mut index = start
+  if utf16 {
+    run builder.reserve(u64.toUsize((end - start) / 2), true)
+    while end - index >= 2 {
+      let low = unsafe byte(state, index)
+      let high = unsafe byte(state, index + 1)
+      run builder.appendUnit(u32.toU16(low | u32.shiftLeft(high, 8)))
+      index = index + 2
+    }
+  } else {
+    // Reserve once and choose storage width before appending, so a non-ASCII
+    // suffix cannot force a copy of a large ASCII prefix. Shared loads remain
+    // atomic; concurrent mutations are safe even if the builder later widens.
+    let mut wide = false
+    while index < end {
+      if unsafe byte(state, index) >= 0x80 { wide = true break }
+      index = index + 1
+    }
+    run builder.reserve(u64.toUsize(end - start), wide)
+    index = start
+    while index < end { run builder.appendCodePoint(unsafe decodeScalar(state, &mut index, end)) }
+  }
+  return run builder.finish()
+}
+unsafe effect fn extent<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, value: Value) -> u64
+  ! JsException ? &mut Allocator {
+  if value.isNumber() {
+    let number = value.numericValue()
+    if number >= 0.0 && number <= 9007199254740991.0 && f64.trunc(number) == number { return f64.toU64(number) }
+  }
+  return run unsafe engine.throwError(context, NativeErrorKind.Range, b"Invalid Buffer codec extent")
+}
+// 0: utf8 byteLength(string)
+// 1/2: utf8/utf16le write(string, Uint8Array, offset, capacity) -> byte count
+// 3/4: utf8/utf16le decode(Uint8Array, start, end) -> owned string
+pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, argc: i32, argv: &FrameSlots) -> Value
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let operation = run unsafe extent(&mut engine, context, unsafe common.argument(argv, argc, 0))
+  let input = unsafe common.argument(argv, argc, 1)
+  if operation > 4 { return run unsafe engine.throwError(context, NativeErrorKind.Type, b"Unknown Buffer codec operation") }
+  if operation <= 2 && !input.isString() { return run unsafe engine.throwError(context, NativeErrorKind.Type, b"Buffer codec requires a string") }
+  if operation == 0 { return Value.number(usize.toF64(utf8Length(input))) }
+  let writing = operation <= 2
+  let mut receiver = input
+  let mut arg: usize = 2
+  if writing { receiver = unsafe common.argument(argv, argc, 2) arg = 3 }
+  if unsafe buffers.classId(receiver) != classes.JS_CLASS_UINT8_ARRAY {
+    return run unsafe engine.throwError(context, NativeErrorKind.Type, b"Buffer codec requires a Uint8Array")
+  }
+  let start = run unsafe extent(&mut engine, context, unsafe common.argument(argv, argc, arg))
+  let lengthOrEnd = run unsafe extent(&mut engine, context, unsafe common.argument(argv, argc, arg + 1))
+  let object = run unsafe typed.requireTypedArray(&mut engine, context, receiver)
+  let mut count = unsafe buffers.count(object)
+  if writing {
+    if lengthOrEnd == 0 { return Value.Int { value: 0 } }
+    run unsafe typed.validate(&mut engine, context, receiver)
+    if start > count || lengthOrEnd > count - start {
+      return run unsafe engine.throwError(context, NativeErrorKind.Range, b"Buffer codec write is outside view bounds")
+    }
+  } else {
+    // Coercions in Buffer.toString can detach/shrink the view after its initial
+    // length read. Node clamps the read to the live extent, including empty OOB.
+    if unsafe buffers.isOutOfBounds(object) { count = 0 }
+    if start >= count || lengthOrEnd <= start {
+      let empty = run Effect.result(Strings.fromLatin1(b""))
+      return match move empty {
+        Result<Value, OutOfMemoryError | StringLengthError>.Success { value } => value
+        Result<Value, OutOfMemoryError | StringLengthError>.Failure { error } => run unsafe core.materialize(&mut engine, context, move error)
+      }
+    }
+  }
+  let view = unsafe buffers.view(object)
+  let state = unsafe buffers.snapshot(view.buffer)
+  if writing { return Value.number(u64.toF64(unsafe encode(input, state, view.offset + start, lengthOrEnd, operation == 2))) }
+  let mut end = lengthOrEnd
+  if end > count { end = count }
+  let result = run Effect.result(unsafe decode(state, view.offset + start, view.offset + end, operation == 4))
+  return match move result {
+    Result<Value, OutOfMemoryError | StringLengthError>.Success { value } => value
+    Result<Value, OutOfMemoryError | StringLengthError>.Failure { error } => run unsafe core.materialize(&mut engine, context, move error)
+  }
+}

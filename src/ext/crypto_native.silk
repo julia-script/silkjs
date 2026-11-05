@@ -1,0 +1,1471 @@
+//! Runtime-owned OpenSSL handles and libuv work requests. Worker callbacks only
+//! touch C-owned payloads; JavaScript conversion and callback delivery stay on the loop.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.collections.list { List }
+import silk.mem.pointer { Pointer }
+import silk.mem.layout { Layout }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.i32
+import silk.num.i64
+import silk.num.usize
+import silk.num.f64
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_heap { HeapHeader }
+import silkjs.js_value { Value }
+import silkjs.js_core_types { FrameSlots, NativeErrorKind }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_coercion_host { CoercionHooks }
+import silkjs.js_errors as errors
+import silkjs.js_runtime as runtime
+import silkjs.js_exceptions as exceptions
+import silkjs.js_collection_support as owners
+import silkjs.js_intl_common as common
+import silkjs.js_buffer_storage as buffers
+import silkjs.js_promise as promise
+import libs.core.host as host
+import ext.openssl as ssl
+import ext.openssl_x509 as xssl
+import ext.openssl_provider as pssl
+
+import ext.uv_fs as uv
+import ext.uv_fs { WorkCallback, AfterCallback }
+import ext.resource_snapshot as resources
+unsafe effect fn throwPlainError<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, message: &[u8]) -> Value ! JsException ? &mut Allocator {
+  let memory = engine.memory
+  let error = run unsafe errors.newError(&mut engine, memory, context)
+  let created = run Effect.result(unsafe host.string(&mut engine, context, message))
+  let value = match move created {
+    Result<Value, JsException>.Success { value } => value
+    Result<Value, JsException>.Failure { error: failure } => { unsafe owners.release(&mut engine, context, error) fail move failure }
+  }
+  let defined = run Effect.result(unsafe common.define(&mut engine, context, error, b"message", value, 7))
+  match move defined { Result<(), JsException>.Success { .. } => () Result<(), JsException>.Failure { error: failure } => { unsafe owners.release(&mut engine, context, error) fail move failure } }
+  let rt = unsafe runtime.contextRuntime(context)
+  return run unsafe exceptions.throwValue<Value, Engine<'m, S>>(&mut engine, rt, error)
+}
+pub struct State { first: ?*mut Handle, jobs: ?*mut Job, next: i32, closing: bool }
+struct Handle { next: ?*mut Handle, id: i32, kind: i32, pointer: ?*mut u8 }
+struct Job {
+  next: ?*mut Job, request: ?*mut u8, callback: Value, done: bool,
+  op: i32, data: [?*mut u8; 8], lengths: [usize; 8], numbers: [i64; 8],
+  handle: ?*mut u8, other: ?*mut u8, retained: bool,
+  output: ?*mut u8, length: usize, capacity: usize, result: i64, resultKind: i32,
+  created: ?*mut u8, createdKind: i32, status: i32, error: ?*mut u8, codedError: bool
+}
+unsafe fn nonnull<T>(p: ?*mut T) -> *mut T { return unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(p) }
+fn nil() -> ?*mut u8 { return Pointer.null<u8>() }
+unsafe fn raw<T>(p: *mut T) -> *mut u8 { return unsafe Intrinsic.pointerReinterpret<*mut T, *mut u8>(p) }
+unsafe fn textLength(p: ?*mut u8) -> usize {
+  if Pointer.isNull<u8>(p) { return 0 }
+  let bytes = unsafe Pointer.assumeManyMut<u8>(unsafe nonnull(p)) let mut n: usize = 0
+  while unsafe Pointer.read<u8>(unsafe Pointer.atMut<u8>(bytes, n)) != 0 { n = n + 1 }
+  return n
+}
+fn equal(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length { return false } let mut i: usize = 0
+  while i < a.length { if a[i] != b[i] { return false } i = i + 1 } return true
+}
+fn operation(name: &[u8]) -> i32 {
+  if equal(name, b"random") { return 1 } if equal(name, b"equal") { return 2 }
+  if equal(name, b"pbkdf2") { return 3 } if equal(name, b"scrypt") { return 4 } if equal(name, b"hkdf") { return 5 }
+  if equal(name, b"hashCreate") { return 10 } if equal(name, b"hashUpdate") { return 11 } if equal(name, b"hashFinal") { return 12 } if equal(name, b"hashCopy") { return 13 }
+  if equal(name, b"hmacCreate") { return 14 } if equal(name, b"hmacUpdate") { return 15 } if equal(name, b"hmacFinal") { return 16 }
+  if equal(name, b"cipherCreate") { return 20 } if equal(name, b"cipherUpdate") { return 21 } if equal(name, b"cipherFinal") { return 22 } if equal(name, b"cipherAAD") { return 23 } if equal(name, b"cipherTag") { return 24 } if equal(name, b"cipherGetTag") { return 25 } if equal(name, b"cipherPadding") { return 26 }
+  if equal(name, b"keyImport") { return 30 } if equal(name, b"keyExport") { return 31 } if equal(name, b"keyGenerate") { return 32 } if equal(name, b"sign") { return 33 } if equal(name, b"verify") { return 34 } if equal(name, b"derive") { return 35 } if equal(name, b"keyType") { return 36 } if equal(name, b"keyBits") { return 37 } if equal(name, b"encrypt") { return 38 } if equal(name, b"decrypt") { return 39 }
+  if equal(name, b"ecCreate") { return 40 } if equal(name, b"ecGenerate") { return 41 } if equal(name, b"ecPublic") { return 42 } if equal(name, b"ecPrivate") { return 43 } if equal(name, b"ecSetPrivate") { return 44 } if equal(name, b"ecSetPublic") { return 45 } if equal(name, b"ecSecret") { return 46 }
+  if equal(name, b"dhCreate") { return 50 } if equal(name, b"dhGenerate") { return 51 } if equal(name, b"dhPublic") { return 52 } if equal(name, b"dhPrivate") { return 53 } if equal(name, b"dhSetPublic") { return 54 } if equal(name, b"dhSetPrivate") { return 55 } if equal(name, b"dhSecret") { return 56 } if equal(name, b"dhPrime") { return 57 } if equal(name, b"dhGenerator") { return 58 } if equal(name, b"dhCheck") { return 59 }
+  if equal(name, b"digest") { return 6 } if equal(name, b"cipherOnce") { return 7 } if equal(name, b"hmac") { return 8 }
+  if equal(name, b"hashSize") { return 9 }
+  if equal(name, b"hashes") { return 60 } if equal(name, b"ciphers") { return 61 } if equal(name, b"curves") { return 62 } if equal(name, b"getFips") { return 63 } if equal(name, b"setFips") { return 64 }
+  if equal(name, b"keyQBits") { return 65 }
+  if equal(name, b"checkPrime") { return 66 } if equal(name, b"generatePrime") { return 67 } if equal(name, b"cipherInfo") { return 68 }
+  if equal(name, b"privateEncrypt") { return 69 } if equal(name, b"publicDecrypt") { return 70 }
+  if equal(name, b"secureHeapUsed") { return 71 } if equal(name, b"setEngine") { return 72 }
+  if equal(name, b"x509Create") { return 100 } if equal(name, b"x509Raw") { return 101 } if equal(name, b"x509PEM") { return 102 }
+  if equal(name, b"x509Name") { return 103 } if equal(name, b"x509Time") { return 104 } if equal(name, b"x509Fingerprint") { return 105 }
+  if equal(name, b"x509Serial") { return 106 } if equal(name, b"x509PublicKey") { return 107 } if equal(name, b"x509CA") { return 108 }
+  if equal(name, b"x509Signature") { return 110 } if equal(name, b"x509Host") { return 111 } if equal(name, b"x509Email") { return 112 }
+  if equal(name, b"x509IP") { return 113 } if equal(name, b"x509Issued") { return 114 } if equal(name, b"x509Private") { return 115 }
+  if equal(name, b"x509Verify") { return 116 } if equal(name, b"spkacVerify") { return 117 } if equal(name, b"spkacPublic") { return 118 }
+  if equal(name, b"spkacChallenge") { return 119 } if equal(name, b"pkcs12Parse") { return 120 } if equal(name, b"x509OID") { return 121 } if equal(name, b"x509NameDER") { return 122 }
+  if equal(name, b"x509ECPublic") { return 123 } if equal(name, b"x509ECCurve") { return 124 }
+  if equal(name, b"argon2") { return 140 } if equal(name, b"macCreate") { return 141 } if equal(name, b"macUpdate") { return 142 }
+  if equal(name, b"macFinal") { return 143 } if equal(name, b"macs") { return 144 } if equal(name, b"encapsulate") { return 145 } if equal(name, b"decapsulate") { return 146 }
+  if equal(name, b"kmac") { return 147 }
+  if equal(name, b"providerRawImport") { return 148 } if equal(name, b"providerRawExport") { return 149 }
+  if equal(name, b"providerAvailable") { return 150 }
+  if equal(name, b"release") { return 99 } return 0
+}
+unsafe fn freeHandle(kind: i32, p: ?*mut u8) -> () {
+  if Pointer.isNull<u8>(p) { return () }
+  if kind == 1 { unsafe ssl.EVP_MD_CTX_free(p) }
+  if kind == 2 { unsafe ssl.HMAC_CTX_free(p) }
+  if kind == 3 { unsafe ssl.EVP_CIPHER_CTX_free(p) }
+  if kind == 4 { unsafe ssl.EVP_PKEY_free(p) }
+  if kind == 5 { unsafe ssl.EC_KEY_free(p) }
+  if kind == 6 { unsafe ssl.DH_free(p) }
+  if kind == 7 { unsafe xssl.X509_free(p) }
+  if kind == 8 { unsafe pssl.EVP_MAC_CTX_free(p) }
+}
+unsafe fn destroyJob(job: *mut Job) -> () {
+  let j = unsafe Pointer.take<Job>(job) let mut i: usize = 0
+  while i < 8 { if !Pointer.isNull<u8>(j.data[i]) { unsafe ssl.OPENSSL_cleanse(j.data[i], j.lengths[i]) } unsafe ssl.free(j.data[i]) i = i + 1 }
+  if j.retained { unsafe ssl.EVP_PKEY_free(j.handle) unsafe ssl.EVP_PKEY_free(j.other) }
+  unsafe freeHandle(j.createdKind, j.created)
+  if !Pointer.isNull<u8>(j.output) { unsafe ssl.OPENSSL_cleanse(j.output, j.capacity) }
+  unsafe ssl.free(j.output) unsafe ssl.free(j.error) unsafe ssl.free(j.request)
+  unsafe ssl.free(unsafe raw(job))
+}
+pub effect fn open() -> *mut State ! OutOfMemoryError {
+  let p = unsafe ssl.calloc(1, Layout.of<State>().bytes)
+  if Pointer.isNull<u8>(p) { fail OutOfMemoryError {} }
+  let state = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut State>(unsafe nonnull(p))
+  unsafe Pointer.put<State>(state, State { first: Pointer.null<Handle>(), jobs: Pointer.null<Job>(), next: 1, closing: false })
+  return state
+}
+pub unsafe effect fn appendResources<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State,array:Value,index:&mut u32)->() !JsException ?&mut Allocator {
+  let anchor=() let owner=unsafe Pointer.borrow<(),State>(&anchor,state) let mut cursor=owner.jobs drop owner
+  while !Pointer.isNull<Job>(cursor) {
+    let job=unsafe Pointer.borrow<(),Job>(&anchor,unsafe nonnull(cursor))
+    // Only immutable owner-thread fields: worker output/status is never inspected.
+    cursor=job.next let request=unsafe nonnull(job.request) drop job
+    run unsafe resources.appendRequest(&mut engine,context,array,&mut index,request,b"work",b"")
+  }
+}
+unsafe fn locate(state: *mut State, id: i32, kind: i32) -> ?*mut u8 {
+  let anchor = () let s = unsafe Pointer.borrow<(), State>(&anchor, state) let mut cursor = s.first drop s
+  while !Pointer.isNull<Handle>(cursor) {
+    let h = unsafe Pointer.borrow<(), Handle>(&anchor, unsafe nonnull(cursor))
+    if h.id == id && h.kind == kind { return h.pointer } cursor = h.next
+  }
+  return nil()
+}
+unsafe fn releaseHandle(state: *mut State, id: i32) -> () {
+  let mut anchor = () let s = unsafe Pointer.borrowMut<(), State>(&mut anchor, state)
+  let mut link = Pointer.fromMutRef<?*mut Handle>(&mut s.first) drop s
+  while !Pointer.isNull<Handle>(unsafe Pointer.read<?*mut Handle>(link)) {
+    let p = unsafe nonnull(unsafe Pointer.read<?*mut Handle>(link))
+    let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, p)
+    if h.id == id { unsafe Pointer.put<?*mut Handle>(link, h.next) let kind = h.kind let pointer = h.pointer drop h unsafe freeHandle(kind, pointer) unsafe ssl.free(unsafe raw(p)) return () }
+    link = Pointer.fromMutRef<?*mut Handle>(&mut h.next) drop h
+  }
+}
+unsafe fn reserve(j: &mut Job, n: usize) -> bool {
+  let mut capacity = n if capacity == 0 { capacity = 1 }
+  j.output = unsafe ssl.calloc(1, capacity) j.capacity = capacity j.length = n
+  return !Pointer.isNull<u8>(j.output)
+}
+unsafe fn recordError(j: &mut Job) -> () {
+  let code = unsafe ssl.ERR_get_error()
+  if code != 0 { unsafe ssl.ERR_error_string_n(code, j.error, 256) j.codedError = false }
+  j.status = -1
+}
+unsafe fn bnOutput(j: &mut Job, bn: ?*mut u8) -> bool {
+  if Pointer.isNull<u8>(bn) { return false }
+  let n = (unsafe ssl.BN_num_bits(bn) + 7) / 8
+  if !unsafe reserve(&mut j, i32.toUsize(n)) { return false }
+  return unsafe ssl.BN_bn2binpad(bn, j.output, n) == n
+}
+// No allocator, engine, JavaScript references or runtime-global mutation below.
+unsafe fn execute(j: &mut Job) -> bool {
+  unsafe ssl.ERR_clear_error()
+  let op = j.op let h = j.handle
+  if op == 6 || op == 7 || op == 8 { return unsafe executeOneShot(&mut j) }
+  if op >= 60 && op <= 65 { return unsafe executeInformation(&mut j) }
+  if op >= 66 && op <= 72 { return unsafe executeUtilities(&mut j) }
+  if op >= 100 && op <= 139 { return unsafe executeCertificates(&mut j) }
+  if op == 148 { return unsafe executeProviderRawImport(&mut j) }
+  if op == 149 { return unsafe executeProviderRawExport(&mut j) }
+  if op == 150 { return unsafe executeProviderAvailable(&mut j) }
+  if op >= 140 && op <= 169 { return unsafe executeProvider(&mut j) }
+  if op == 9 { let md = unsafe ssl.EVP_get_digestbyname(j.data[0]) if Pointer.isNull<u8>(md) { return false } j.resultKind = 1 j.result = i32.toI64(unsafe ssl.EVP_MD_get_size(md)) return true }
+  if op == 1 { let length = i64.toUsize(j.numbers[0]) return unsafe reserve(&mut j, length) && unsafe ssl.RAND_bytes(j.output, i64.toI32(j.numbers[0])) == 1 }
+  if op == 2 { j.resultKind = 1 j.result = 0 if j.lengths[0] != j.lengths[1] { return false } if unsafe ssl.CRYPTO_memcmp(j.data[0], j.data[1], j.lengths[0]) == 0 { j.result = 1 } return true }
+  if op == 3 {
+    let md = unsafe ssl.EVP_get_digestbyname(j.data[4]) if Pointer.isNull<u8>(md) { return false }
+    let length = i64.toUsize(j.numbers[3])
+    if !unsafe reserve(&mut j, length) { return false }
+    return unsafe ssl.PKCS5_PBKDF2_HMAC(j.data[0], usize.toI32(j.lengths[0]), j.data[1], usize.toI32(j.lengths[1]), i64.toI32(j.numbers[2]), md, usize.toI32(j.length), j.output) == 1
+  }
+  if op == 4 {
+    let length = i64.toUsize(j.numbers[2])
+    if !unsafe reserve(&mut j, length) { return false }
+    return unsafe ssl.EVP_PBE_scrypt(j.data[0], j.lengths[0], j.data[1], j.lengths[1], i64.toU64(j.numbers[3]), i64.toU64(j.numbers[4]), i64.toU64(j.numbers[5]), i64.toU64(j.numbers[6]), j.output, j.length) == 1
+  }
+  if op == 5 {
+    let md = unsafe ssl.EVP_get_digestbyname(j.data[0]) if Pointer.isNull<u8>(md) { return false }
+    let ctx = unsafe ssl.EVP_PKEY_CTX_new_id(1036, nil()) if Pointer.isNull<u8>(ctx) { return false }
+    let length = i64.toUsize(j.numbers[4])
+    let ok = unsafe ssl.EVP_PKEY_derive_init(ctx) == 1 && unsafe ssl.EVP_PKEY_CTX_set_hkdf_md(ctx, md) == 1 && unsafe ssl.EVP_PKEY_CTX_set1_hkdf_key(ctx, j.data[1], usize.toI32(j.lengths[1])) == 1 && unsafe ssl.EVP_PKEY_CTX_set1_hkdf_salt(ctx, j.data[2], usize.toI32(j.lengths[2])) == 1 && unsafe ssl.EVP_PKEY_CTX_add1_hkdf_info(ctx, j.data[3], usize.toI32(j.lengths[3])) == 1 && unsafe reserve(&mut j, length) && unsafe ssl.EVP_PKEY_derive(ctx, j.output, Pointer.fromMutRef<usize>(&mut j.length)) == 1
+    unsafe ssl.EVP_PKEY_CTX_free(ctx) return ok
+  }
+  if op == 10 || op == 14 {
+    let md = unsafe ssl.EVP_get_digestbyname(j.data[0]) if Pointer.isNull<u8>(md) { return false }
+    j.resultKind = 2
+    if op == 10 { j.createdKind = 1 j.created = unsafe ssl.EVP_MD_CTX_new() return !Pointer.isNull<u8>(j.created) && unsafe ssl.EVP_DigestInit_ex(j.created, md, nil()) == 1 }
+    j.createdKind = 2 j.created = unsafe ssl.HMAC_CTX_new()
+    return !Pointer.isNull<u8>(j.created) && unsafe ssl.HMAC_Init_ex(j.created, j.data[1], usize.toI32(j.lengths[1]), md, nil()) == 1
+  }
+  if op == 11 { j.resultKind = 4 return unsafe ssl.EVP_DigestUpdate(h, j.data[1], j.lengths[1]) == 1 }
+  if op == 15 { j.resultKind = 4 return unsafe ssl.HMAC_Update(h, j.data[1], j.lengths[1]) == 1 }
+  if op == 12 || op == 16 {
+    let mut n: u32 = 64
+    if op == 12 && j.numbers[1] >= 0 { let length = i64.toUsize(j.numbers[1]) return unsafe reserve(&mut j, length) && unsafe ssl.EVP_DigestFinalXOF(h, j.output, j.length) == 1 }
+    if !unsafe reserve(&mut j, 64) { return false }
+    let mut ok = false
+    if op == 12 { ok = unsafe ssl.EVP_DigestFinal_ex(h, j.output, Pointer.fromMutRef<u32>(&mut n)) == 1 }
+    else { ok = unsafe ssl.HMAC_Final(h, j.output, Pointer.fromMutRef<u32>(&mut n)) == 1 }
+    j.length = u32.toUsize(n) return ok
+  }
+  if op == 13 { j.resultKind = 2 j.createdKind = 1 j.created = unsafe ssl.EVP_MD_CTX_new() return !Pointer.isNull<u8>(j.created) && unsafe ssl.EVP_MD_CTX_copy_ex(j.created, h) == 1 }
+  if op == 20 {
+    let cipher = unsafe ssl.EVP_get_cipherbyname(j.data[0]) if Pointer.isNull<u8>(cipher) { return false }
+    if usize.toI32(j.lengths[1]) != unsafe ssl.EVP_CIPHER_get_key_length(cipher) { return false }
+    j.created = unsafe ssl.EVP_CIPHER_CTX_new() j.createdKind = 3 j.resultKind = 2
+    if Pointer.isNull<u8>(j.created) { return false }
+    let ctx = j.created let mode = unsafe ssl.EVP_CIPHER_get_mode(cipher)
+    if mode == 65538 { unsafe ssl.EVP_CIPHER_CTX_set_flags(ctx, 1) }
+    if unsafe ssl.EVP_CipherInit_ex(ctx, cipher, nil(), nil(), nil(), i64.toI32(j.numbers[3])) != 1 { return false }
+    if mode == 6 || mode == 7 || j.numbers[5] == 1 {
+      if unsafe ssl.EVP_CIPHER_CTX_ctrl(ctx, 9, usize.toI32(j.lengths[2]), nil()) != 1 { return false }
+      if (mode == 7 && j.numbers[3] == 1 || mode == 65539) && unsafe ssl.EVP_CIPHER_CTX_ctrl(ctx, 17, i64.toI32(j.numbers[4]), nil()) != 1 { return false }
+    } else { if usize.toI32(j.lengths[2]) != unsafe ssl.EVP_CIPHER_get_iv_length(cipher) { return false } }
+    return unsafe ssl.EVP_CipherInit_ex(ctx, nil(), nil(), j.data[1], j.data[2], i64.toI32(j.numbers[3])) == 1
+  }
+  if op == 21 || op == 22 {
+    let length = j.lengths[1] + 32
+    if !unsafe reserve(&mut j, length) { return false } let mut n: i32 = 0 let mut ok = false
+    if op == 21 { ok = unsafe ssl.EVP_CipherUpdate(h, j.output, Pointer.fromMutRef<i32>(&mut n), j.data[1], usize.toI32(j.lengths[1])) == 1 }
+    else { ok = unsafe ssl.EVP_CipherFinal_ex(h, j.output, Pointer.fromMutRef<i32>(&mut n)) == 1 }
+    if n < 0 { return false } j.length = i32.toUsize(n) return ok
+  }
+  if op == 23 {
+    j.resultKind = 4 let mut n: i32 = 0
+    if j.numbers[2] >= 0 && unsafe ssl.EVP_CipherUpdate(h, nil(), Pointer.fromMutRef<i32>(&mut n), nil(), i64.toI32(j.numbers[2])) != 1 { return false }
+    return unsafe ssl.EVP_CipherUpdate(h, nil(), Pointer.fromMutRef<i32>(&mut n), j.data[1], usize.toI32(j.lengths[1])) == 1
+  }
+  if op == 24 { j.resultKind = 4 return unsafe ssl.EVP_CIPHER_CTX_ctrl(h, 17, usize.toI32(j.lengths[1]), j.data[1]) == 1 }
+  if op == 25 { let length = i64.toUsize(j.numbers[1]) return unsafe reserve(&mut j, length) && unsafe ssl.EVP_CIPHER_CTX_ctrl(h, 16, i64.toI32(j.numbers[1]), j.output) == 1 }
+  if op == 26 { j.resultKind = 4 return unsafe ssl.EVP_CIPHER_CTX_set_padding(h, i64.toI32(j.numbers[1])) == 1 }
+  if op >= 30 && op <= 39 { return unsafe executeKey(&mut j) }
+  if op >= 40 && op <= 46 { return unsafe executeEC(&mut j) }
+  if op >= 50 && op <= 59 { return unsafe executeDH(&mut j) }
+  return false
+}
+unsafe fn decodeKey(slot: *mut ?*mut u8, format: ?*mut u8, bio: ?*mut u8, selection: i32, passphrase: ?*mut u8, length: usize) -> bool {
+  let decoder = unsafe ssl.OSSL_DECODER_CTX_new_for_pkey(slot, format, nil(), nil(), selection, nil(), nil())
+  if Pointer.isNull<u8>(decoder) { return false }
+  let ok = unsafe ssl.OSSL_DECODER_CTX_set_passphrase(decoder, passphrase, length) == 1 && unsafe ssl.OSSL_DECODER_from_bio(decoder, bio) == 1
+  unsafe ssl.OSSL_DECODER_CTX_free(decoder)
+  return ok
+}
+unsafe fn publicPart(key: ?*mut u8) -> ?*mut u8 {
+  let mut encoded = nil()
+  let length = unsafe ssl.i2d_PUBKEY(key, Pointer.fromMutRef<?*mut u8>(&mut encoded))
+  if length <= 0 { unsafe ssl.CRYPTO_free(encoded, nil(), 0) return nil() }
+  let mut cursor = encoded
+  let publicKey = unsafe ssl.d2i_PUBKEY(nil(), Pointer.fromMutRef<?*mut u8>(&mut cursor), i32.toI64(length))
+  unsafe ssl.CRYPTO_free(encoded, nil(), 0)
+  return publicKey
+}
+unsafe fn executeKey(j: &mut Job) -> bool {
+  let op = j.op let h = j.handle
+  if op == 30 {
+    j.createdKind = 4 j.resultKind = 2
+    let bio = unsafe ssl.BIO_new_mem_buf(j.data[0], usize.toI32(j.lengths[0]))
+    if Pointer.isNull<u8>(bio) { return false }
+    let mut selection: i32 = 134 if j.numbers[2] == 1 { selection = 135 }
+    // The decoder retains its EVP_PKEY** until decoder destruction. Keep that
+    // slot in C-owned storage, never in a borrowed Silk stack/Job field.
+    let slotMemory = unsafe ssl.calloc(1, Layout.of<?*mut u8>().bytes)
+    if Pointer.isNull<u8>(slotMemory) { let ignored = unsafe ssl.BIO_free(bio) return false }
+    let slot = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ?*mut u8>(unsafe nonnull(slotMemory))
+    let mut ok = unsafe decodeKey(slot, j.data[1], bio, selection, j.data[3], j.lengths[3])
+    if !ok && j.numbers[2] == 0 {
+      // createPublicKey also accepts private containers. Decode the private
+      // material, then discard it after exporting only the public parameters.
+      unsafe ssl.EVP_PKEY_free(unsafe Pointer.read<?*mut u8>(slot))
+      unsafe Pointer.put<?*mut u8>(slot, nil())
+      unsafe ssl.ERR_clear_error()
+      let reset = unsafe ssl.BIO_ctrl(bio, 1, 0, nil())
+      if reset == 1 { ok = unsafe decodeKey(slot, j.data[1], bio, 135, j.data[3], j.lengths[3]) }
+    }
+    let ignored = unsafe ssl.BIO_free(bio)
+    j.created = unsafe Pointer.read<?*mut u8>(slot) unsafe ssl.free(slotMemory)
+    if !ok || Pointer.isNull<u8>(j.created) { return false }
+    if j.numbers[2] == 0 {
+      let publicKey = unsafe publicPart(j.created)
+      unsafe ssl.EVP_PKEY_free(j.created) j.created = publicKey
+      return !Pointer.isNull<u8>(publicKey)
+    }
+    let check = unsafe ssl.EVP_PKEY_CTX_new(j.created, nil())
+    if Pointer.isNull<u8>(check) { return false }
+    let privateKey = unsafe ssl.EVP_PKEY_private_check(check) == 1
+    unsafe ssl.EVP_PKEY_CTX_free(check)
+    return privateKey
+  }
+  if op == 31 {
+    let mut selection: i32 = 134 if j.numbers[3] == 1 { selection = 135 }
+    let encoder = unsafe ssl.OSSL_ENCODER_CTX_new_for_pkey(h, selection, j.data[1], j.data[2], nil())
+    if Pointer.isNull<u8>(encoder) { return false }
+    let bio = unsafe ssl.BIO_new(unsafe ssl.BIO_s_mem())
+    if Pointer.isNull<u8>(bio) { unsafe ssl.OSSL_ENCODER_CTX_free(encoder) return false }
+    let mut ok = true
+    if j.lengths[4] != 0 { ok = unsafe ssl.OSSL_ENCODER_CTX_set_cipher(encoder, j.data[4], nil()) == 1 && unsafe ssl.OSSL_ENCODER_CTX_set_passphrase(encoder, j.data[5], j.lengths[5]) == 1 }
+    ok = ok && unsafe ssl.OSSL_ENCODER_to_bio(encoder, bio) == 1
+    if ok {
+      let size = unsafe ssl.BIO_ctrl(bio, 10, 0, nil())
+      ok = size >= 0 && unsafe reserve(&mut j, i64.toUsize(size))
+      if ok { ok = unsafe ssl.BIO_read(bio, j.output, usize.toI32(j.length)) == usize.toI32(j.length) }
+    }
+    let ignored = unsafe ssl.BIO_free(bio) unsafe ssl.OSSL_ENCODER_CTX_free(encoder) return ok
+  }
+  if op == 32 {
+    if j.numbers[7] != 0 { return unsafe generateParameters(&mut j) }
+    let ctx = unsafe ssl.EVP_PKEY_CTX_new_from_name(nil(), j.data[0], nil())
+    if Pointer.isNull<u8>(ctx) { return false }
+    j.createdKind = 4 j.resultKind = 2
+    let mut ok = unsafe ssl.EVP_PKEY_keygen_init(ctx) == 1
+    if j.numbers[1] != 0 { ok = ok && unsafe ssl.EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, i64.toI32(j.numbers[1])) == 1 }
+    if j.lengths[2] != 0 { ok = ok && unsafe ssl.EVP_PKEY_CTX_set_group_name(ctx, j.data[2]) == 1 }
+    if j.lengths[3] != 0 {
+      let exponent = unsafe ssl.BN_bin2bn(j.data[3], usize.toI32(j.lengths[3]), nil())
+      ok = ok && !Pointer.isNull<u8>(exponent) && unsafe ssl.EVP_PKEY_CTX_set1_rsa_keygen_pubexp(ctx, exponent) == 1
+      unsafe ssl.BN_free(exponent)
+    }
+    if j.lengths[4] != 0 { ok = ok && unsafe ssl.EVP_PKEY_CTX_set_rsa_pss_keygen_md_name(ctx, j.data[4], nil()) == 1 }
+    if j.lengths[5] != 0 { ok = ok && unsafe ssl.EVP_PKEY_CTX_set_rsa_pss_keygen_mgf1_md_name(ctx, j.data[5]) == 1 }
+    if j.numbers[6] >= 0 { ok = ok && unsafe ssl.EVP_PKEY_CTX_set_rsa_pss_keygen_saltlen(ctx, i64.toI32(j.numbers[6])) == 1 }
+    ok = ok && unsafe ssl.EVP_PKEY_keygen(ctx, Pointer.fromMutRef<?*mut u8>(&mut j.created)) == 1
+    unsafe ssl.EVP_PKEY_CTX_free(ctx) return ok
+  }
+  if op == 33 || op == 34 {
+    let ctx = unsafe ssl.EVP_MD_CTX_new() if Pointer.isNull<u8>(ctx) { return false }
+    let mut md = nil()
+    if j.lengths[1] != 0 { md = unsafe ssl.EVP_get_digestbyname(j.data[1]) if Pointer.isNull<u8>(md) { unsafe ssl.EVP_MD_CTX_free(ctx) return false } }
+    let mut pctx = nil() let mut ok = false
+    if op == 33 { ok = unsafe ssl.EVP_DigestSignInit(ctx, Pointer.fromMutRef<?*mut u8>(&mut pctx), md, nil(), h) == 1 }
+    else { ok = unsafe ssl.EVP_DigestVerifyInit(ctx, Pointer.fromMutRef<?*mut u8>(&mut pctx), md, nil(), h) == 1 }
+    if ok && j.numbers[4] != 0 { ok = unsafe ssl.EVP_PKEY_CTX_set_rsa_padding(pctx, i64.toI32(j.numbers[4])) == 1 }
+    if ok && j.numbers[5] != -2147483648 { ok = unsafe ssl.EVP_PKEY_CTX_set_rsa_pss_saltlen(pctx, i64.toI32(j.numbers[5])) == 1 }
+    if ok && j.lengths[6] != 0 {
+      let mut params = [unsafe providerParam(b"context-string\0", 5, j.data[6], j.lengths[6]), providerEnd()]
+      ok = unsafe pssl.EVP_PKEY_CTX_set_params(pctx, Pointer.fromMutRef<pssl.Param>(&mut params[0])) == 1
+    }
+    if op == 33 {
+      let mut n: usize = 0
+      ok = ok && unsafe ssl.EVP_DigestSign(ctx, nil(), Pointer.fromMutRef<usize>(&mut n), j.data[2], j.lengths[2]) == 1
+      ok = ok && unsafe reserve(&mut j, n) && unsafe ssl.EVP_DigestSign(ctx, j.output, Pointer.fromMutRef<usize>(&mut j.length), j.data[2], j.lengths[2]) == 1
+    } else {
+      j.resultKind = 1 j.result = 0
+      if ok { let status = unsafe ssl.EVP_DigestVerify(ctx, j.data[3], j.lengths[3], j.data[2], j.lengths[2]) if status == 1 { j.result = 1 } else { if status < 0 { ok = false } } }
+    }
+    unsafe ssl.EVP_MD_CTX_free(ctx) return ok
+  }
+  if op == 35 {
+    let ctx = unsafe ssl.EVP_PKEY_CTX_new(h, nil()) if Pointer.isNull<u8>(ctx) { return false }
+    let mut n: usize = 0
+    let ok = unsafe ssl.EVP_PKEY_derive_init(ctx) == 1 && unsafe ssl.EVP_PKEY_derive_set_peer(ctx, j.other) == 1 && unsafe ssl.EVP_PKEY_derive(ctx, nil(), Pointer.fromMutRef<usize>(&mut n)) == 1 && unsafe reserve(&mut j, n) && unsafe ssl.EVP_PKEY_derive(ctx, j.output, Pointer.fromMutRef<usize>(&mut j.length)) == 1
+    unsafe ssl.EVP_PKEY_CTX_free(ctx) return ok
+  }
+  if op == 36 {
+    let name = unsafe ssl.EVP_PKEY_get0_type_name(h) let n = unsafe textLength(name)
+    if !unsafe reserve(&mut j, n) { return false }
+    let mut i: usize = 0
+    while i < n { unsafe Pointer.put<u8>(unsafe buffers.dataAt(j.output, usize.toU64(i)), unsafe Pointer.read<u8>(unsafe buffers.dataAt(name, usize.toU64(i)))) i = i + 1 }
+    j.resultKind = 3 return true
+  }
+  if op == 37 { j.resultKind = 1 j.result = i32.toI64(unsafe ssl.EVP_PKEY_get_bits(h)) return true }
+  if op == 38 || op == 39 {
+    let ctx = unsafe ssl.EVP_PKEY_CTX_new(h, nil()) if Pointer.isNull<u8>(ctx) { return false }
+    let mut ok = false
+    if op == 38 { ok = unsafe ssl.EVP_PKEY_encrypt_init(ctx) == 1 } else { ok = unsafe ssl.EVP_PKEY_decrypt_init(ctx) == 1 }
+    ok = ok && unsafe ssl.EVP_PKEY_CTX_set_rsa_padding(ctx, i64.toI32(j.numbers[2])) == 1
+    if ok && j.lengths[3] != 0 { let md = unsafe ssl.EVP_get_digestbyname(j.data[3]) ok = !Pointer.isNull<u8>(md) && unsafe ssl.EVP_PKEY_CTX_set_rsa_oaep_md(ctx, md) == 1 }
+    if ok && j.lengths[4] != 0 {
+      let label = unsafe ssl.CRYPTO_malloc(j.lengths[4], nil(), 0)
+      if Pointer.isNull<u8>(label) { ok = false }
+      else {
+        let mut i: usize = 0
+        while i < j.lengths[4] { unsafe Pointer.put<u8>(unsafe buffers.dataAt(label, usize.toU64(i)), unsafe Pointer.read<u8>(unsafe buffers.dataAt(j.data[4], usize.toU64(i)))) i = i + 1 }
+        if unsafe ssl.EVP_PKEY_CTX_set0_rsa_oaep_label(ctx, label, usize.toI32(j.lengths[4])) != 1 { unsafe ssl.CRYPTO_free(label, nil(), 0) ok = false }
+      }
+    }
+    let mut n: usize = 0
+    if op == 38 {
+      ok = ok && unsafe ssl.EVP_PKEY_encrypt(ctx, nil(), Pointer.fromMutRef<usize>(&mut n), j.data[1], j.lengths[1]) == 1 && unsafe reserve(&mut j, n) && unsafe ssl.EVP_PKEY_encrypt(ctx, j.output, Pointer.fromMutRef<usize>(&mut j.length), j.data[1], j.lengths[1]) == 1
+    } else {
+      ok = ok && unsafe ssl.EVP_PKEY_decrypt(ctx, nil(), Pointer.fromMutRef<usize>(&mut n), j.data[1], j.lengths[1]) == 1 && unsafe reserve(&mut j, n) && unsafe ssl.EVP_PKEY_decrypt(ctx, j.output, Pointer.fromMutRef<usize>(&mut j.length), j.data[1], j.lengths[1]) == 1
+    }
+    unsafe ssl.EVP_PKEY_CTX_free(ctx) return ok
+  }
+  return false
+}
+unsafe fn executeEC(j: &mut Job) -> bool {
+  let op = j.op let h = j.handle
+  if op == 40 { j.createdKind = 5 j.resultKind = 2 j.created = unsafe ssl.EC_KEY_new_by_curve_name(unsafe ssl.OBJ_txt2nid(j.data[0])) return !Pointer.isNull<u8>(j.created) }
+  if op == 41 { j.resultKind = 4 return unsafe ssl.EC_KEY_generate_key(h) == 1 }
+  let group = unsafe ssl.EC_KEY_get0_group(h)
+  if op == 42 {
+    let point = unsafe ssl.EC_KEY_get0_public_key(h) if Pointer.isNull<u8>(point) { return false }
+    let n = unsafe ssl.EC_POINT_point2oct(group, point, i64.toI32(j.numbers[1]), nil(), 0, nil())
+    return n != 0 && unsafe reserve(&mut j, n) && unsafe ssl.EC_POINT_point2oct(group, point, i64.toI32(j.numbers[1]), j.output, n, nil()) == n
+  }
+  if op == 43 { return unsafe bnOutput(&mut j, unsafe ssl.EC_KEY_get0_private_key(h)) }
+  let point = unsafe ssl.EC_POINT_new(group) if Pointer.isNull<u8>(point) { return false }
+  let mut ok = false
+  if op == 44 {
+    let bn = unsafe ssl.BN_bin2bn(j.data[1], usize.toI32(j.lengths[1]), nil())
+    ok = !Pointer.isNull<u8>(bn) && unsafe ssl.EC_KEY_set_private_key(h, bn) == 1 && unsafe ssl.EC_POINT_mul(group, point, bn, nil(), nil(), nil()) == 1 && unsafe ssl.EC_KEY_set_public_key(h, point) == 1 && unsafe ssl.EC_KEY_check_key(h) == 1
+    unsafe ssl.BN_free(bn) j.resultKind = 4
+  } else {
+    ok = unsafe ssl.EC_POINT_oct2point(group, point, j.data[1], j.lengths[1], nil()) == 1
+    if op == 45 { ok = ok && unsafe ssl.EC_KEY_set_public_key(h, point) == 1 j.resultKind = 4 }
+    if op == 46 {
+      let n = (unsafe ssl.EC_GROUP_get_degree(group) + 7) / 8
+      ok = ok && unsafe reserve(&mut j, i32.toUsize(n))
+      if ok { let actual = unsafe ssl.ECDH_compute_key(j.output, j.length, point, h, nil()) ok = actual > 0 if ok { j.length = i32.toUsize(actual) } }
+    }
+  }
+  unsafe ssl.EC_POINT_free(point) return ok
+}
+unsafe fn executeDH(j: &mut Job) -> bool {
+  let op = j.op let h = j.handle
+  if op == 50 {
+    j.createdKind = 6 j.resultKind = 2
+    if j.lengths[2] != 0 { j.created = unsafe ssl.DH_new_by_nid(unsafe ssl.OBJ_txt2nid(j.data[2])) return !Pointer.isNull<u8>(j.created) }
+    j.created = unsafe ssl.DH_new() if Pointer.isNull<u8>(j.created) { return false }
+    if j.numbers[0] != 0 { return unsafe ssl.DH_generate_parameters_ex(j.created, i64.toI32(j.numbers[0]), i64.toI32(j.numbers[1]), nil()) == 1 }
+    let mut p = nil()
+    if j.numbers[3] == 768 { p = unsafe ssl.BN_get_rfc2409_prime_768(nil()) }
+    else { if j.numbers[3] == 1024 { p = unsafe ssl.BN_get_rfc2409_prime_1024(nil()) }
+      else { if j.numbers[3] == 1536 { p = unsafe ssl.BN_get_rfc3526_prime_1536(nil()) }
+        else { p = unsafe ssl.BN_bin2bn(j.data[0], usize.toI32(j.lengths[0]), nil()) } } }
+    let g = unsafe ssl.BN_bin2bn(j.data[1], usize.toI32(j.lengths[1]), nil())
+    if Pointer.isNull<u8>(p) || Pointer.isNull<u8>(g) { unsafe ssl.BN_free(p) unsafe ssl.BN_free(g) return false }
+    if unsafe ssl.DH_set0_pqg(j.created, p, nil(), g) != 1 { unsafe ssl.BN_free(p) unsafe ssl.BN_free(g) return false } return true
+  }
+  if op == 51 { j.resultKind = 4 return unsafe ssl.DH_generate_key(h) == 1 }
+  if op == 52 { return unsafe bnOutput(&mut j, unsafe ssl.DH_get0_pub_key(h)) }
+  if op == 53 { return unsafe bnOutput(&mut j, unsafe ssl.DH_get0_priv_key(h)) }
+  if op == 57 { return unsafe bnOutput(&mut j, unsafe ssl.DH_get0_p(h)) }
+  if op == 58 { return unsafe bnOutput(&mut j, unsafe ssl.DH_get0_g(h)) }
+  if op == 59 { let mut codes: i32 = 0 let ok = unsafe ssl.DH_check(h, Pointer.fromMutRef<i32>(&mut codes)) == 1 j.resultKind = 1 j.result = i32.toI64(codes) return ok }
+  let bn = unsafe ssl.BN_bin2bn(j.data[1], usize.toI32(j.lengths[1]), nil())
+  if Pointer.isNull<u8>(bn) { return false }
+  if op == 54 || op == 55 {
+    let mut ok = false j.resultKind = 4
+    if op == 54 { ok = unsafe ssl.DH_set0_key(h, bn, nil()) == 1 } else { ok = unsafe ssl.DH_set0_key(h, nil(), bn) == 1 }
+    if !ok { unsafe ssl.BN_free(bn) } return ok
+  }
+  let n = unsafe ssl.DH_size(h)
+  let mut ok = n > 0 && unsafe reserve(&mut j, i32.toUsize(n))
+  if ok { ok = unsafe ssl.DH_compute_key_padded(j.output, bn, h) == n }
+  unsafe ssl.BN_free(bn) return ok
+}
+unsafe effect fn prepareArgument<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, j: &mut Job, i: usize, value: Value) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  if value.isNumber() {
+    let number = value.numericValue()
+    if !f64.isFinite(number) || number < -2147483648.0 || number > 9007199254740991.0 || f64.trunc(number) != number {
+      let ignored = run unsafe engine.throwError(context, NativeErrorKind.Range, b"ERR_OUT_OF_RANGE: invalid native crypto integer") return ()
+    }
+    j.numbers[i] = f64.toI64(number) return ()
+  }
+  match value { Value.Undefined => { return () } Value.Null => { return () } _ => () }
+  if value.isString() {
+    let bytes = run unsafe host.text(&mut engine, context, value)
+    let length = bytes.length()
+    if length > 2147483647 { let ignored = run unsafe engine.throwError(context, NativeErrorKind.Range, b"ERR_OUT_OF_RANGE: crypto input exceeds INT_MAX") return () }
+    j.lengths[i] = length
+    j.data[i] = unsafe ssl.calloc(1, length + 1)
+    if Pointer.isNull<u8>(j.data[i]) { fail OutOfMemoryError {} }
+    let mut n: usize = 0 while n < length { unsafe Pointer.put<u8>(unsafe buffers.dataAt(j.data[i], usize.toU64(n)), bytes.asSlice()[n]) n = n + 1 }
+    return ()
+  }
+  let backing = run unsafe buffers.getArrayBuffer(&mut engine, context, value)
+  if backing.byteLength > 2147483647 { let ignored = run unsafe engine.throwError(context, NativeErrorKind.Range, b"ERR_OUT_OF_RANGE: crypto input exceeds INT_MAX") return () }
+  j.lengths[i] = u64.toUsize(backing.byteLength)
+  j.data[i] = unsafe ssl.calloc(1, j.lengths[i] + 1)
+  if Pointer.isNull<u8>(j.data[i]) { fail OutOfMemoryError {} }
+  let mut n: u64 = 0
+  while n < backing.byteLength { unsafe Pointer.put<u8>(unsafe buffers.dataAt(j.data[i], n), u64.toU8(unsafe buffers.loadScalar(backing, n, 0))) n = n + 1 }
+}
+fn handleKind(op: i32) -> i32 {
+  if op >= 11 && op <= 13 { return 1 } if op == 15 || op == 16 { return 2 }
+  if op >= 21 && op <= 26 { return 3 }
+  if op == 31 || op >= 33 && op <= 39 || op == 65 || op == 69 || op == 70 || op == 145 || op == 146 || op == 149 { return 4 }
+  if op >= 101 && op <= 108 || op >= 110 && op <= 116 || op == 123 || op == 124 { return 7 }
+  if op == 142 || op == 143 { return 8 }
+  if op >= 41 && op <= 46 { return 5 } if op >= 51 && op <= 59 { return 6 } return 0
+}
+unsafe effect fn prepare<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, j: &mut Job, argv: &FrameSlots, asynchronous: bool) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  let name = run unsafe host.text(&mut engine, context, unsafe common.argument(argv, 0))
+  j.op = operation(name.asSlice())
+  if j.op == 0 { let ignored = run unsafe throwPlainError(&mut engine, context, b"ERR_CRYPTO_UNSUPPORTED_OPERATION: unknown crypto operation") return () }
+  if asynchronous && !(j.op == 1 || j.op >= 3 && j.op <= 8 || j.op >= 30 && j.op <= 39 || j.op == 66 || j.op == 67 || j.op == 140 || j.op >= 145 && j.op <= 147) {
+    let ignored = run unsafe throwPlainError(&mut engine, context, b"ERR_CRYPTO_UNSUPPORTED_OPERATION: operation is not a worker job") return ()
+  }
+  let args = unsafe common.argument(argv, 1) let mut i: u32 = 0
+  while i < 8 {
+    let value = run unsafe owners.getIndex(&mut engine, context, args, i)
+    let converted = run Effect.result(unsafe prepareArgument(&mut engine, context, &mut j, u32.toUsize(i), value))
+    unsafe owners.release(&mut engine, context, value)
+    match move converted { Result<(), OutOfMemoryError | JsException>.Success { .. } => () Result<(), OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
+    i = i + 1
+  }
+  let kind = handleKind(j.op)
+  if kind != 0 {
+    j.handle = unsafe locate(state, i64.toI32(j.numbers[0]), kind)
+    if Pointer.isNull<u8>(j.handle) { let ignored = run unsafe throwPlainError(&mut engine, context, b"ERR_CRYPTO_INVALID_STATE: disposed or incompatible crypto handle") return () }
+  }
+  if j.op == 35 || j.op >= 114 && j.op <= 116 {
+    let mut otherKind: i32 = 4 if j.op == 114 { otherKind = 7 }
+    j.other = unsafe locate(state, i64.toI32(j.numbers[1]), otherKind)
+    if Pointer.isNull<u8>(j.other) { let ignored = run unsafe throwPlainError(&mut engine, context, b"ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE: invalid peer key") return () }
+  }
+  if asynchronous && kind == 4 {
+    if unsafe ssl.EVP_PKEY_up_ref(j.handle) != 1 { fail OutOfMemoryError {} }
+    j.retained = true
+    if !Pointer.isNull<u8>(j.other) && unsafe ssl.EVP_PKEY_up_ref(j.other) != 1 { j.other = nil() fail OutOfMemoryError {} }
+  }
+}
+effect fn newJob() -> *mut Job ! OutOfMemoryError {
+  let p = unsafe ssl.calloc(1, Layout.of<Job>().bytes)
+  if Pointer.isNull<u8>(p) { fail OutOfMemoryError {} }
+  let j = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Job>(unsafe nonnull(p))
+  unsafe Pointer.put<Job>(j, Job { next: Pointer.null<Job>(), request: nil(), callback: Value.Undefined, done: false, op: 0, data: [nil(); 8], lengths: [0; 8], numbers: [0; 8], handle: nil(), other: nil(), retained: false, output: nil(), length: 0, capacity: 0, result: 0, resultKind: 0, created: nil(), createdKind: 0, status: 0, error: nil(), codedError: false })
+  let mut anchor = () let entry = unsafe Pointer.borrowMut<(), Job>(&mut anchor, j)
+  entry.error = unsafe ssl.calloc(1, 256) let failed = Pointer.isNull<u8>(entry.error) drop entry
+  if failed { unsafe destroyJob(j) fail OutOfMemoryError {} }
+  return j
+}
+unsafe effect fn errorText(j: &Job) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut bytes = List<u8>.make()
+  let mut i: usize = 0
+  if !j.codedError {
+    let prefix = b"ERR_OSSL_CRYPTO_OPERATION_FAILED: "
+    while i < prefix.length { run bytes.append(prefix[i]) i = i + 1 }
+  }
+  let n = unsafe textLength(j.error)
+  if n == 0 { let text = b"Invalid crypto parameters or unsupported algorithm" i = 0 while i < text.length { run bytes.append(text[i]) i = i + 1 } }
+  else { i = 0 while i < n { run bytes.append(unsafe Pointer.read<u8>(unsafe buffers.dataAt(j.error, usize.toU64(i)))) i = i + 1 } }
+  return move bytes
+}
+unsafe effect fn finish<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, j: &mut Job) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  if j.status != 0 { let message = run unsafe errorText(&j.*) return run unsafe throwPlainError(&mut engine, context, message.asSlice()) }
+  if j.resultKind == 4 { return Value.Undefined }
+  if j.resultKind == 1 { return Value.Float64 { value: i64.toF64(j.result) } }
+  if j.resultKind == 2 {
+    let p = unsafe ssl.calloc(1, Layout.of<Handle>().bytes) if Pointer.isNull<u8>(p) { fail OutOfMemoryError {} }
+    let handle = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Handle>(unsafe nonnull(p))
+    let mut anchor = () let s = unsafe Pointer.borrowMut<(), State>(&mut anchor, state)
+    if s.next == 2147483647 { drop s unsafe ssl.free(p) return run unsafe throwPlainError(&mut engine, context, b"ERR_CRYPTO_INVALID_STATE: crypto handle identifier space exhausted") }
+    let id = s.next s.next = s.next + 1
+    unsafe Pointer.put<Handle>(handle, Handle { next: s.first, id: id, kind: j.createdKind, pointer: j.created })
+    s.first = handle j.created = nil() return Value.Int { value: id }
+  }
+  if j.resultKind == 3 {
+    let mut bytes = List<u8>.make() let mut i: usize = 0
+    while i < j.length { run bytes.append(unsafe Pointer.read<u8>(unsafe buffers.dataAt(j.output, usize.toU64(i)))) i = i + 1 }
+    return run unsafe host.string(&mut engine, context, bytes.asSlice())
+  }
+  let memory = engine.memory
+  return run unsafe buffers.newArrayBufferCopy(&mut engine, memory, context, j.output, usize.toU64(j.length))
+}
+pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, argc: i32, argv: &FrameSlots) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  let j = run newJob() let mut anchor = () let entry = unsafe Pointer.borrowMut<(), Job>(&mut anchor, j)
+  let prepared = run Effect.result(unsafe prepare(&mut engine, context, state, &mut entry, argv, false)) drop entry
+  match move prepared { Result<(), OutOfMemoryError | JsException>.Success { .. } => () Result<(), OutOfMemoryError | JsException>.Failure { error } => { unsafe destroyJob(j) fail move error } }
+  let entry2 = unsafe Pointer.borrowMut<(), Job>(&mut anchor, j)
+  if entry2.op == 99 { unsafe releaseHandle(state, i64.toI32(entry2.numbers[0])) entry2.resultKind = 4 }
+  else { if !unsafe execute(&mut entry2) { unsafe recordError(&mut entry2) } }
+  let converted = run Effect.result(unsafe finish(&mut engine, context, state, &mut entry2)) drop entry2
+  unsafe destroyJob(j)
+  return match move converted { Result<Value, OutOfMemoryError | JsException>.Success { value } => value Result<Value, OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
+}
+export "C" fn silkCryptoWork(request: *mut u8) -> () {
+  let p = unsafe uv.uv_req_get_data(request)
+  let j = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Job>(unsafe nonnull(p))
+  let mut anchor = () let entry = unsafe Pointer.borrowMut<(), Job>(&mut anchor, j)
+  if !unsafe execute(&mut entry) { unsafe recordError(&mut entry) }
+}
+export "C" fn silkCryptoAfterWork(request: *mut u8, status: i32) -> () {
+  let p = unsafe uv.uv_req_get_data(request)
+  let j = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Job>(unsafe nonnull(p))
+  let mut anchor = () let entry = unsafe Pointer.borrowMut<(), Job>(&mut anchor, j)
+  if status < 0 { entry.status = status } entry.done = true
+}
+pub unsafe effect fn submit<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, loop: *mut u8, argc: i32, argv: &FrameSlots) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  let anchor = () let s = unsafe Pointer.borrow<(), State>(&anchor, state) let closing = s.closing drop s
+  if closing { return run unsafe throwPlainError(&mut engine, context, b"ERR_CRYPTO_INVALID_STATE: crypto executor is closed") }
+  let j = run newJob() let mut mutable = () let entry = unsafe Pointer.borrowMut<(), Job>(&mut mutable, j)
+  let prepared = run Effect.result(unsafe prepare(&mut engine, context, state, &mut entry, argv, true)) drop entry
+  match move prepared { Result<(), OutOfMemoryError | JsException>.Success { .. } => () Result<(), OutOfMemoryError | JsException>.Failure { error } => { unsafe destroyJob(j) fail move error } }
+  let entry2 = unsafe Pointer.borrowMut<(), Job>(&mut mutable, j)
+  entry2.request = unsafe ssl.calloc(1, unsafe uv.uv_req_size(7))
+  if Pointer.isNull<u8>(entry2.request) { drop entry2 unsafe destroyJob(j) fail OutOfMemoryError {} }
+  entry2.callback = unsafe (unsafe common.argument(argv, 2)).retained()
+  let request = unsafe nonnull(entry2.request)
+  unsafe uv.uv_req_set_data(request, unsafe raw(j))
+  let cb: WorkCallback = silkCryptoWork let after: AfterCallback = silkCryptoAfterWork
+  let status = unsafe uv.uv_queue_work(loop, request, cb, after)
+  if status < 0 { entry2.status = status entry2.done = true }
+  let mut stateAnchor = () let s2 = unsafe Pointer.borrowMut<(), State>(&mut stateAnchor, state)
+  entry2.next = s2.jobs s2.jobs = j
+  return Value.Undefined
+}
+unsafe fn takeCompleted(state: *mut State) -> ?*mut Job {
+  let mut anchor = () let s = unsafe Pointer.borrowMut<(), State>(&mut anchor, state)
+  let mut link = Pointer.fromMutRef<?*mut Job>(&mut s.jobs) drop s
+  while !Pointer.isNull<Job>(unsafe Pointer.read<?*mut Job>(link)) {
+    let p = unsafe nonnull(unsafe Pointer.read<?*mut Job>(link)) let j = unsafe Pointer.borrowMut<(), Job>(&mut anchor, p)
+    if j.done { unsafe Pointer.put<?*mut Job>(link, j.next) return p }
+    link = Pointer.fromMutRef<?*mut Job>(&mut j.next) drop j
+  }
+  return Pointer.null<Job>()
+}
+unsafe effect fn deliver<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, j: &mut Job) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut error = Value.Null let mut value = Value.Undefined
+  if j.status != 0 { let text = run unsafe errorText(&j) error = run unsafe host.string(&mut engine, context, text.asSlice()) }
+  else { value = run unsafe finish(&mut engine, context, state, &mut j) }
+  let called = run Effect.result(unsafe promise.call(&mut engine, context, j.callback, Value.Undefined, &[error, value]))
+  unsafe owners.release(&mut engine, context, error) unsafe owners.release(&mut engine, context, value)
+  match move called { Result<Value, JsException>.Success { value: returned } => { unsafe owners.release(&mut engine, context, returned) } Result<Value, JsException>.Failure { error: failure } => { fail move failure } }
+}
+pub unsafe effect fn poll<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  while true {
+    let optional = unsafe takeCompleted(state) if Pointer.isNull<Job>(optional) { return () }
+    let j = unsafe nonnull(optional) let mut anchor = () let entry = unsafe Pointer.borrowMut<(), Job>(&mut anchor, j)
+    let delivered = run Effect.result(unsafe deliver(&mut engine, context, state, &mut entry)) let callback = entry.callback drop entry
+    unsafe owners.release(&mut engine, context, callback) unsafe destroyJob(j)
+    match move delivered { Result<(), OutOfMemoryError | JsException>.Success { .. } => () Result<(), OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
+  }
+}
+pub unsafe fn close<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, loop: *mut u8) -> () {
+  let mut anchor = () let s = unsafe Pointer.borrowMut<(), State>(&mut anchor, state) s.closing = true drop s
+  while true {
+    let s2 = unsafe Pointer.borrow<(), State>(&anchor, state) let empty = Pointer.isNull<Job>(s2.jobs) drop s2
+    if empty { break }
+    let ignored = unsafe uv.uv_run(loop, 1)
+    while true {
+      let optional = unsafe takeCompleted(state) if Pointer.isNull<Job>(optional) { break }
+      let j = unsafe nonnull(optional) let entry = unsafe Pointer.borrow<(), Job>(&anchor, j) let callback = entry.callback drop entry
+      unsafe owners.release(&mut engine, context, callback) unsafe destroyJob(j)
+    }
+  }
+  let owned = unsafe Pointer.take<State>(state) let mut cursor = owned.first
+  while !Pointer.isNull<Handle>(cursor) { let p = unsafe nonnull(cursor) let h = unsafe Pointer.take<Handle>(p) cursor = h.next unsafe freeHandle(h.kind, h.pointer) unsafe ssl.free(unsafe raw(p)) }
+  unsafe ssl.free(unsafe raw(state))
+}
+unsafe fn executeOneShot(j: &mut Job) -> bool {
+  if j.op == 6 && j.numbers[3] == 1 {
+    let md = unsafe pssl.EVP_MD_fetch(nil(), j.data[0], nil())
+    if Pointer.isNull<u8>(md) { return false }
+    let ctx = unsafe ssl.EVP_MD_CTX_new()
+    let outputLength = i64.toUsize(j.numbers[2])
+    let ok = !Pointer.isNull<u8>(ctx) && unsafe reserve(&mut j, outputLength) && unsafe ssl.EVP_DigestInit_ex(ctx, md, nil()) == 1 && unsafe ssl.EVP_DigestUpdate(ctx, j.data[1], j.lengths[1]) == 1 && unsafe ssl.EVP_DigestFinalXOF(ctx, j.output, j.length) == 1
+    unsafe ssl.EVP_MD_CTX_free(ctx) unsafe pssl.EVP_MD_free(md) return ok
+  }
+  if j.op == 6 || j.op == 8 {
+    let md = unsafe ssl.EVP_get_digestbyname(j.data[0]) if Pointer.isNull<u8>(md) { return false }
+    if !unsafe reserve(&mut j, 64) { return false }
+    let mut n: u32 = 0 let mut ok = false
+    if j.op == 6 {
+      let ctx = unsafe ssl.EVP_MD_CTX_new() if Pointer.isNull<u8>(ctx) { return false }
+      ok = unsafe ssl.EVP_DigestInit_ex(ctx, md, nil()) == 1 && unsafe ssl.EVP_DigestUpdate(ctx, j.data[1], j.lengths[1]) == 1 && unsafe ssl.EVP_DigestFinal_ex(ctx, j.output, Pointer.fromMutRef<u32>(&mut n)) == 1
+      unsafe ssl.EVP_MD_CTX_free(ctx)
+    } else {
+      let ctx = unsafe ssl.HMAC_CTX_new() if Pointer.isNull<u8>(ctx) { return false }
+      ok = unsafe ssl.HMAC_Init_ex(ctx, j.data[1], usize.toI32(j.lengths[1]), md, nil()) == 1 && unsafe ssl.HMAC_Update(ctx, j.data[2], j.lengths[2]) == 1 && unsafe ssl.HMAC_Final(ctx, j.output, Pointer.fromMutRef<u32>(&mut n)) == 1
+      unsafe ssl.HMAC_CTX_free(ctx)
+    }
+    j.length = u32.toUsize(n) return ok
+  }
+  let cipher = unsafe ssl.EVP_get_cipherbyname(j.data[0])
+  if Pointer.isNull<u8>(cipher) || usize.toI32(j.lengths[1]) != unsafe ssl.EVP_CIPHER_get_key_length(cipher) { return false }
+  let ctx = unsafe ssl.EVP_CIPHER_CTX_new() if Pointer.isNull<u8>(ctx) { return false }
+  let mode = unsafe ssl.EVP_CIPHER_get_mode(cipher)
+  let aead = mode == 6 || mode == 65539 || unsafe ssl.EVP_CIPHER_get_nid(cipher) == 1018
+  if mode == 65538 { unsafe ssl.EVP_CIPHER_CTX_set_flags(ctx, 1) }
+  let mut ok = unsafe ssl.EVP_CipherInit_ex(ctx, cipher, nil(), nil(), nil(), i64.toI32(j.numbers[4])) == 1
+  if aead { ok = ok && unsafe ssl.EVP_CIPHER_CTX_ctrl(ctx, 9, usize.toI32(j.lengths[2]), nil()) == 1 }
+  else { ok = ok && usize.toI32(j.lengths[2]) == unsafe ssl.EVP_CIPHER_get_iv_length(cipher) }
+  if mode == 65539 { let mut tagLength = i64.toI32(j.numbers[7]) if j.numbers[4] == 0 { tagLength = usize.toI32(j.lengths[6]) } ok = ok && unsafe ssl.EVP_CIPHER_CTX_ctrl(ctx, 17, tagLength, nil()) == 1 }
+  ok = ok && unsafe ssl.EVP_CipherInit_ex(ctx, nil(), nil(), j.data[1], j.data[2], i64.toI32(j.numbers[4])) == 1
+  let mut n: i32 = 0
+  if aead && j.numbers[4] == 0 { ok = ok && unsafe ssl.EVP_CIPHER_CTX_ctrl(ctx, 17, usize.toI32(j.lengths[6]), j.data[6]) == 1 }
+  if aead && j.lengths[5] != 0 { ok = ok && unsafe ssl.EVP_CipherUpdate(ctx, nil(), Pointer.fromMutRef<i32>(&mut n), j.data[5], usize.toI32(j.lengths[5])) == 1 }
+  let length = j.lengths[3] + 48
+  ok = ok && unsafe reserve(&mut j, length)
+  ok = ok && unsafe ssl.EVP_CipherUpdate(ctx, j.output, Pointer.fromMutRef<i32>(&mut n), j.data[3], usize.toI32(j.lengths[3])) == 1
+  let mut written: i32 = 0
+  if ok && n >= 0 {
+    written = n
+    ok = unsafe ssl.EVP_CipherFinal_ex(ctx, unsafe buffers.dataAt(j.output, i32.toU64(written)), Pointer.fromMutRef<i32>(&mut n)) == 1
+    written = written + n
+    if ok && aead && j.numbers[4] == 1 {
+      ok = unsafe ssl.EVP_CIPHER_CTX_ctrl(ctx, 16, i64.toI32(j.numbers[7]), unsafe buffers.dataAt(j.output, i32.toU64(written))) == 1
+      written = written + i64.toI32(j.numbers[7])
+    }
+  }
+  if written < 0 { ok = false } else { j.length = i32.toUsize(written) }
+  unsafe ssl.EVP_CIPHER_CTX_free(ctx) return ok
+}
+unsafe fn appendName(j: &mut Job, name: ?*mut u8) -> () {
+  if j.status != 0 || Pointer.isNull<u8>(name) { return () }
+  let n = unsafe textLength(name)
+  if j.length + n + 1 > j.capacity {
+    let capacity = (j.length + n + 1) * 2
+    let resized = unsafe ssl.realloc(j.output, capacity)
+    if Pointer.isNull<u8>(resized) { j.status = -1 return () }
+    j.output = resized j.capacity = capacity
+  }
+  let mut i: usize = 0
+  while i < n { unsafe Pointer.put<u8>(unsafe buffers.dataAt(j.output, usize.toU64(j.length + i)), unsafe Pointer.read<u8>(unsafe buffers.dataAt(name, usize.toU64(i)))) i = i + 1 }
+  j.length = j.length + n
+  unsafe Pointer.put<u8>(unsafe buffers.dataAt(j.output, usize.toU64(j.length)), 10) j.length = j.length + 1
+}
+export "C" fn silkCryptoAlgorithmName(algorithm: ?*mut u8, from: ?*mut u8, to: ?*mut u8, opaque: ?*mut u8) -> () {
+  let p = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Job>(unsafe nonnull(opaque))
+  let mut anchor = () let j = unsafe Pointer.borrowMut<(), Job>(&mut anchor, p)
+  let mut supported = false
+  if j.op == 60 {
+    let md = unsafe ssl.EVP_get_digestbyname(from) let ctx = unsafe ssl.EVP_MD_CTX_new()
+    supported = !Pointer.isNull<u8>(md) && !Pointer.isNull<u8>(ctx) && unsafe ssl.EVP_DigestInit_ex(ctx, md, nil()) == 1
+    unsafe ssl.EVP_MD_CTX_free(ctx)
+  } else {
+    let cipher = unsafe ssl.EVP_get_cipherbyname(from) let ctx = unsafe ssl.EVP_CIPHER_CTX_new()
+    supported = !Pointer.isNull<u8>(cipher) && !Pointer.isNull<u8>(ctx) && unsafe ssl.EVP_CipherInit_ex(ctx, cipher, nil(), nil(), nil(), 1) == 1
+    unsafe ssl.EVP_CIPHER_CTX_free(ctx)
+  }
+  if supported { unsafe appendName(&mut j, from) }
+}
+unsafe fn executeInformation(j: &mut Job) -> bool {
+  if j.op == 63 { j.resultKind = 1 j.result = i32.toI64(unsafe ssl.EVP_default_properties_is_fips_enabled(nil())) return true }
+  if j.op == 64 { j.resultKind = 4 return unsafe ssl.EVP_default_properties_enable_fips(nil(), i64.toI32(j.numbers[0])) == 1 }
+  if j.op == 65 {
+    let mut bn = nil()
+    let ok = unsafe ssl.EVP_PKEY_get_bn_param(j.handle, j.data[1], Pointer.fromMutRef<?*mut u8>(&mut bn)) == 1
+    j.resultKind = 1 if ok { j.result = i32.toI64(unsafe ssl.BN_num_bits(bn)) }
+    unsafe ssl.BN_free(bn) return ok
+  }
+  j.resultKind = 3
+  if j.op == 62 {
+    let count = unsafe ssl.EC_get_builtin_curves(Pointer.null<ssl.Curve>(), 0)
+    let allocation = unsafe ssl.calloc(count, Layout.of<ssl.Curve>().bytes)
+    if Pointer.isNull<u8>(allocation) { return false }
+    let entries = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ssl.Curve>(unsafe nonnull(allocation))
+    let ignored = unsafe ssl.EC_get_builtin_curves(entries, count) let mut i: usize = 0
+    while i < count { let anchor = () let curve = unsafe Pointer.borrow<(), ssl.Curve>(&anchor, unsafe Pointer.atMut<ssl.Curve>(unsafe Pointer.assumeManyMut<ssl.Curve>(entries), i)) let nid = curve.nid drop curve unsafe appendName(&mut j, unsafe ssl.OBJ_nid2sn(nid)) i = i + 1 }
+    unsafe ssl.free(allocation)
+  } else {
+    let cb: ssl.AlgorithmCallback = silkCryptoAlgorithmName
+    if j.op == 60 { unsafe ssl.EVP_MD_do_all_sorted(cb, unsafe raw(Pointer.fromMutRef<Job>(&mut j))) }
+    else { unsafe ssl.EVP_CIPHER_do_all_sorted(cb, unsafe raw(Pointer.fromMutRef<Job>(&mut j))) }
+  }
+  return j.status == 0
+}
+unsafe fn generateParameters(j: &mut Job) -> bool {
+  j.createdKind = 4 j.resultKind = 2
+  if j.numbers[7] == 1 {
+    let ctx = unsafe ssl.EVP_PKEY_CTX_new_from_name(nil(), j.data[0], nil())
+    if Pointer.isNull<u8>(ctx) { return false }
+    let mut parameters = nil()
+    let mut ok = unsafe ssl.EVP_PKEY_paramgen_init(ctx) == 1 && unsafe ssl.EVP_PKEY_CTX_set_dsa_paramgen_bits(ctx, i64.toI32(j.numbers[1])) == 1 && unsafe ssl.EVP_PKEY_CTX_set_dsa_paramgen_q_bits(ctx, i64.toI32(j.numbers[6])) == 1 && unsafe ssl.EVP_PKEY_paramgen(ctx, Pointer.fromMutRef<?*mut u8>(&mut parameters)) == 1
+    unsafe ssl.EVP_PKEY_CTX_free(ctx)
+    if ok {
+      let generate = unsafe ssl.EVP_PKEY_CTX_new(parameters, nil())
+      ok = !Pointer.isNull<u8>(generate) && unsafe ssl.EVP_PKEY_keygen_init(generate) == 1 && unsafe ssl.EVP_PKEY_keygen(generate, Pointer.fromMutRef<?*mut u8>(&mut j.created)) == 1
+      unsafe ssl.EVP_PKEY_CTX_free(generate)
+    }
+    unsafe ssl.EVP_PKEY_free(parameters) return ok
+  }
+  let dh = unsafe ssl.DH_new() if Pointer.isNull<u8>(dh) { return false }
+  let mut ok = false
+  if j.numbers[1] != 0 { ok = unsafe ssl.DH_generate_parameters_ex(dh, i64.toI32(j.numbers[1]), i64.toI32(j.numbers[6]), nil()) == 1 }
+  else {
+    let p = unsafe ssl.BN_bin2bn(j.data[4], usize.toI32(j.lengths[4]), nil())
+    let g = unsafe ssl.BN_bin2bn(j.data[3], usize.toI32(j.lengths[3]), nil())
+    ok = !Pointer.isNull<u8>(p) && !Pointer.isNull<u8>(g) && unsafe ssl.DH_set0_pqg(dh, p, nil(), g) == 1
+    if !ok { unsafe ssl.BN_free(p) unsafe ssl.BN_free(g) }
+  }
+  ok = ok && unsafe ssl.DH_generate_key(dh) == 1
+  if ok { j.created = unsafe ssl.EVP_PKEY_new() ok = !Pointer.isNull<u8>(j.created) && unsafe ssl.EVP_PKEY_set1_DH(j.created, dh) == 1 }
+  unsafe ssl.DH_free(dh) return ok
+}
+unsafe fn utilityWord(j: &mut Job, offset: usize, value: i32) -> () {
+  let n = i32.toU32(value) let mut i: usize = 0
+  while i < 4 { unsafe Pointer.put<u8>(unsafe buffers.dataAt(j.output, usize.toU64(offset + i)), u32.toU8(u32.shiftRight(n, usize.toU32(i * 8)) & 255)) i = i + 1 }
+}
+unsafe fn executeUtilities(j: &mut Job) -> bool {
+  if j.op == 66 {
+    let bn = unsafe ssl.BN_bin2bn(j.data[0], usize.toI32(j.lengths[0]), nil())
+    if Pointer.isNull<u8>(bn) { return false }
+    let result = unsafe ssl.BN_is_prime_ex(bn, i64.toI32(j.numbers[1]), nil(), nil())
+    unsafe ssl.BN_free(bn) j.resultKind = 1 j.result = i32.toI64(result) return result >= 0
+  }
+  if j.op == 67 {
+    let bn = unsafe ssl.BN_new() let mut add = nil() let mut rem = nil()
+    if !Pointer.isNull<u8>(j.data[2]) { add = unsafe ssl.BN_bin2bn(j.data[2], usize.toI32(j.lengths[2]), nil()) }
+    if !Pointer.isNull<u8>(j.data[3]) { rem = unsafe ssl.BN_bin2bn(j.data[3], usize.toI32(j.lengths[3]), nil()) }
+    let mut ok = !Pointer.isNull<u8>(bn) && (Pointer.isNull<u8>(j.data[2]) || !Pointer.isNull<u8>(add)) && (Pointer.isNull<u8>(j.data[3]) || !Pointer.isNull<u8>(rem))
+    if !Pointer.isNull<u8>(add) {
+      ok = ok && unsafe ssl.BN_num_bits(add) <= i64.toI32(j.numbers[0])
+      if !Pointer.isNull<u8>(rem) { ok = ok && unsafe ssl.BN_cmp(add, rem) > 0 }
+    }
+    ok = ok && unsafe ssl.BN_generate_prime_ex(bn, i64.toI32(j.numbers[0]), i64.toI32(j.numbers[1]), add, rem, nil()) == 1 && unsafe bnOutput(&mut j, bn)
+    unsafe ssl.BN_free(bn) unsafe ssl.BN_free(add) unsafe ssl.BN_free(rem) return ok
+  }
+  if j.op == 68 {
+    let mut cipherName = j.data[0]
+    if j.numbers[3] != 0 { cipherName = unsafe ssl.OBJ_nid2sn(i64.toI32(j.numbers[0])) }
+    j.resultKind = 4
+    if Pointer.isNull<u8>(cipherName) { return true }
+    let cipher = unsafe ssl.EVP_CIPHER_fetch(nil(), cipherName, nil())
+    if Pointer.isNull<u8>(cipher) { unsafe ssl.ERR_clear_error() return true }
+    let ctx = unsafe ssl.EVP_CIPHER_CTX_new() if Pointer.isNull<u8>(ctx) { unsafe ssl.EVP_CIPHER_free(cipher) return false }
+    let mode = unsafe ssl.EVP_CIPHER_get_mode(cipher)
+    if mode == 65538 { unsafe ssl.EVP_CIPHER_CTX_set_flags(ctx, 1) }
+    let mut ok = true
+    if j.numbers[4] != 0 || j.numbers[5] != 0 { ok = unsafe ssl.EVP_CipherInit_ex(ctx, cipher, nil(), nil(), nil(), 1) == 1 }
+    let mut keyLength = unsafe ssl.EVP_CIPHER_get_key_length(cipher)
+    let mut ivLength = unsafe ssl.EVP_CIPHER_get_iv_length(cipher)
+    if j.numbers[4] != 0 { keyLength = i64.toI32(j.numbers[1]) ok = ok && unsafe ssl.EVP_CIPHER_CTX_set_key_length(ctx, keyLength) == 1 }
+    if j.numbers[5] != 0 {
+      ivLength = i64.toI32(j.numbers[2])
+      if mode == 7 { ok = ok && ivLength >= 7 && ivLength <= 13 }
+      else { if mode == 65539 { ok = ok && unsafe ssl.EVP_CIPHER_CTX_ctrl(ctx, 9, ivLength, nil()) == 1 }
+      else { if mode != 6 { ok = ok && ivLength == unsafe ssl.EVP_CIPHER_get_iv_length(cipher) } } }
+    }
+    unsafe ssl.EVP_CIPHER_CTX_free(ctx)
+    if !ok { unsafe ssl.EVP_CIPHER_free(cipher) unsafe ssl.ERR_clear_error() return true }
+    let nid = unsafe ssl.EVP_CIPHER_get_nid(cipher) let mut canonical = unsafe ssl.EVP_CIPHER_get0_name(cipher)
+    if nid != 0 { canonical = unsafe ssl.OBJ_nid2sn(nid) }
+    let length = unsafe textLength(canonical)
+    if !unsafe reserve(&mut j, 20 + length) { unsafe ssl.EVP_CIPHER_free(cipher) return false }
+    unsafe utilityWord(&mut j, 0, mode) unsafe utilityWord(&mut j, 4, nid)
+    unsafe utilityWord(&mut j, 8, unsafe ssl.EVP_CIPHER_get_block_size(cipher))
+    unsafe utilityWord(&mut j, 12, keyLength) unsafe utilityWord(&mut j, 16, ivLength)
+    let mut i: usize = 0 while i < length { unsafe Pointer.put<u8>(unsafe buffers.dataAt(j.output, usize.toU64(20 + i)), unsafe Pointer.read<u8>(unsafe buffers.dataAt(canonical, usize.toU64(i)))) i = i + 1 }
+    unsafe ssl.EVP_CIPHER_free(cipher) j.resultKind = 0 return true
+  }
+  if j.op == 69 || j.op == 70 {
+    let ctx = unsafe ssl.EVP_PKEY_CTX_new(j.handle, nil()) if Pointer.isNull<u8>(ctx) { return false }
+    let mut ok = false
+    if j.op == 69 { ok = unsafe ssl.EVP_PKEY_sign_init(ctx) == 1 } else { ok = unsafe ssl.EVP_PKEY_verify_recover_init(ctx) == 1 }
+    ok = ok && unsafe ssl.EVP_PKEY_CTX_set_rsa_padding(ctx, i64.toI32(j.numbers[2])) == 1
+    let mut length: usize = 0
+    if j.op == 69 {
+      ok = ok && unsafe ssl.EVP_PKEY_sign(ctx, nil(), Pointer.fromMutRef<usize>(&mut length), j.data[1], j.lengths[1]) == 1 && unsafe reserve(&mut j, length) && unsafe ssl.EVP_PKEY_sign(ctx, j.output, Pointer.fromMutRef<usize>(&mut j.length), j.data[1], j.lengths[1]) == 1
+    } else {
+      ok = ok && unsafe ssl.EVP_PKEY_verify_recover(ctx, nil(), Pointer.fromMutRef<usize>(&mut length), j.data[1], j.lengths[1]) == 1 && unsafe reserve(&mut j, length) && unsafe ssl.EVP_PKEY_verify_recover(ctx, j.output, Pointer.fromMutRef<usize>(&mut j.length), j.data[1], j.lengths[1]) == 1
+    }
+    unsafe ssl.EVP_PKEY_CTX_free(ctx) return ok
+  }
+  if j.op == 71 {
+    j.resultKind = 1 j.result = 0
+    if unsafe ssl.CRYPTO_secure_malloc_initialized() != 0 { j.result = usize.toI64(unsafe ssl.CRYPTO_secure_used()) }
+    return true
+  }
+  if j.op == 72 {
+    j.resultKind = 1 j.result = 0 let engine = unsafe ssl.ENGINE_by_id(j.data[0])
+    if Pointer.isNull<u8>(engine) { unsafe ssl.ERR_clear_error() return true }
+    let ok = unsafe ssl.ENGINE_set_default(engine, i64.toU32(j.numbers[1])) == 1
+    let ignored = unsafe ssl.ENGINE_free(engine)
+    if ok { j.result = 1 } return ok
+  }
+  return false
+}
+
+// Certificate operations are synchronous. Native X509 ownership is kind 7;
+// extracted EVP_PKEY ownership is kind 4. Temporary PKCS#12 DER is cleansed by
+// destroyJob, and the JavaScript frame is cleansed after importing its contents.
+unsafe fn certificateCopy(j: &mut Job, input: ?*mut u8, length: usize) -> bool {
+  if !unsafe reserve(&mut j, length) { return false }
+  let mut i: usize = 0
+  while i < length { unsafe Pointer.put<u8>(unsafe buffers.dataAt(j.output, usize.toU64(i)), unsafe Pointer.read<u8>(unsafe buffers.dataAt(input, usize.toU64(i)))) i = i + 1 }
+  return true
+}
+unsafe fn certificateBIO(j: &mut Job, bio: ?*mut u8) -> bool {
+  let length = unsafe ssl.BIO_ctrl(bio, 10, 0, nil())
+  if length < 0 || length > 2147483647 || !unsafe reserve(&mut j, i64.toUsize(length)) { return false }
+  return length == 0 || unsafe ssl.BIO_read(bio, j.output, i64.toI32(length)) == i64.toI32(length)
+}
+unsafe fn certificateFrameLength(j: &mut Job, offset: usize, length: i32) -> () {
+  let n = i32.toU32(length)
+  unsafe Pointer.put<u8>(unsafe buffers.dataAt(j.output, usize.toU64(offset)), u32.toU8(n / 16777216))
+  unsafe Pointer.put<u8>(unsafe buffers.dataAt(j.output, usize.toU64(offset + 1)), u32.toU8((n / 65536) % 256))
+  unsafe Pointer.put<u8>(unsafe buffers.dataAt(j.output, usize.toU64(offset + 2)), u32.toU8((n / 256) % 256))
+  unsafe Pointer.put<u8>(unsafe buffers.dataAt(j.output, usize.toU64(offset + 3)), u32.toU8(n % 256))
+}
+unsafe fn certificatePKCS12(j: &mut Job) -> bool {
+  let mut input = j.data[0]
+  let bundle = unsafe xssl.d2i_PKCS12(nil(), Pointer.fromMutRef<?*mut u8>(&mut input), usize.toI64(j.lengths[0]))
+  if Pointer.isNull<u8>(bundle) { return false }
+  let mut key = nil() let mut cert = nil() let mut chain = nil()
+  let mut ok = unsafe xssl.PKCS12_parse(bundle, j.data[1], Pointer.fromMutRef<?*mut u8>(&mut key), Pointer.fromMutRef<?*mut u8>(&mut cert), Pointer.fromMutRef<?*mut u8>(&mut chain)) == 1
+  unsafe xssl.PKCS12_free(bundle)
+  let mut pkcs8 = nil() let mut keyLength: i32 = 0 let mut certLength: i32 = 0
+  if ok && !Pointer.isNull<u8>(key) {
+    pkcs8 = unsafe ssl.EVP_PKEY2PKCS8(key)
+    ok = !Pointer.isNull<u8>(pkcs8)
+    if ok { keyLength = unsafe ssl.i2d_PKCS8_PRIV_KEY_INFO(pkcs8, Pointer.null<?*mut u8>()) ok = keyLength > 0 }
+  }
+  if ok && !Pointer.isNull<u8>(cert) { certLength = unsafe xssl.i2d_X509(cert, Pointer.null<?*mut u8>()) ok = certLength > 0 }
+  let mut count: i32 = 0 if !Pointer.isNull<u8>(chain) { count = unsafe xssl.OPENSSL_sk_num(chain) }
+  let mut size: usize = 8
+  if ok { size = size + i32.toUsize(keyLength) + i32.toUsize(certLength) }
+  let mut i: i32 = 0
+  while ok && i < count {
+    let length = unsafe xssl.i2d_X509(unsafe xssl.OPENSSL_sk_value(chain, i), Pointer.null<?*mut u8>())
+    if length <= 0 { ok = false } else { size = size + 4 + i32.toUsize(length) }
+    i = i + 1
+  }
+  if ok { ok = size <= 2147483647 && unsafe reserve(&mut j, size) }
+  if ok {
+    unsafe certificateFrameLength(&mut j, 0, keyLength)
+    let mut output: ?*mut u8 = unsafe buffers.dataAt(j.output, 4)
+    if keyLength > 0 { ok = unsafe ssl.i2d_PKCS8_PRIV_KEY_INFO(pkcs8, Pointer.fromMutRef<?*mut u8>(&mut output)) == keyLength }
+    let mut offset = 4 + i32.toUsize(keyLength)
+    unsafe certificateFrameLength(&mut j, offset, certLength)
+    offset = offset + 4 output = unsafe buffers.dataAt(j.output, usize.toU64(offset))
+    if certLength > 0 { ok = ok && unsafe xssl.i2d_X509(cert, Pointer.fromMutRef<?*mut u8>(&mut output)) == certLength }
+    offset = offset + i32.toUsize(certLength) i = 0
+    while ok && i < count {
+      let item = unsafe xssl.OPENSSL_sk_value(chain, i)
+      let length = unsafe xssl.i2d_X509(item, Pointer.null<?*mut u8>())
+      unsafe certificateFrameLength(&mut j, offset, length) offset = offset + 4
+      output = unsafe buffers.dataAt(j.output, usize.toU64(offset))
+      ok = unsafe xssl.i2d_X509(item, Pointer.fromMutRef<?*mut u8>(&mut output)) == length
+      offset = offset + i32.toUsize(length) i = i + 1
+    }
+  }
+  if !Pointer.isNull<u8>(pkcs8) {
+    let mut secret = nil() let mut secretLength: i32 = 0
+    if unsafe xssl.PKCS8_pkey_get0(nil(), Pointer.fromMutRef<?*mut u8>(&mut secret), Pointer.fromMutRef<i32>(&mut secretLength), nil(), pkcs8) == 1 && secretLength > 0 {
+      unsafe ssl.OPENSSL_cleanse(secret, i32.toUsize(secretLength))
+    }
+  }
+  unsafe ssl.PKCS8_PRIV_KEY_INFO_free(pkcs8) unsafe ssl.EVP_PKEY_free(key) unsafe xssl.X509_free(cert)
+  i = 0 while i < count { unsafe xssl.X509_free(unsafe xssl.OPENSSL_sk_value(chain, i)) i = i + 1 }
+  unsafe xssl.OPENSSL_sk_free(chain)
+  return ok
+}
+unsafe fn certificateSPKAC(j: &mut Job) -> bool {
+  let spki = unsafe xssl.NETSCAPE_SPKI_b64_decode(j.data[0], usize.toI32(j.lengths[0]))
+  if Pointer.isNull<u8>(spki) {
+    unsafe ssl.ERR_clear_error()
+    if j.op == 117 { j.resultKind = 1 j.result = 0 } else { j.resultKind = 4 }
+    return true
+  }
+  let mut ok = true
+  if j.op == 119 {
+    // NETSCAPE_SPKI and NETSCAPE_SPKAC are public structs; only their
+    // leading pointer fields are needed, avoiding any private ABI layout.
+    let outer = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ?*mut u8>(unsafe nonnull(spki))
+    let spkac = unsafe Pointer.read<?*mut u8>(outer)
+    let fields = unsafe Pointer.assumeManyMut<?*mut u8>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ?*mut u8>(unsafe nonnull(spkac)))
+    let challenge = unsafe Pointer.read<?*mut u8>(unsafe Pointer.atMut<?*mut u8>(fields, 1))
+    let mut text = nil()
+    let length = unsafe xssl.ASN1_STRING_to_UTF8(Pointer.fromMutRef<?*mut u8>(&mut text), challenge)
+    ok = length >= 0 && unsafe certificateCopy(&mut j, text, i32.toUsize(length))
+    unsafe ssl.CRYPTO_free(text, nil(), 0)
+  } else {
+    let key = unsafe xssl.NETSCAPE_SPKI_get_pubkey(spki)
+    if j.op == 117 {
+      j.resultKind = 1 j.result = 0
+      if !Pointer.isNull<u8>(key) && unsafe xssl.NETSCAPE_SPKI_verify(spki, key) > 0 { j.result = 1 }
+      unsafe ssl.ERR_clear_error()
+    } else {
+      let bio = unsafe ssl.BIO_new(unsafe ssl.BIO_s_mem())
+      ok = !Pointer.isNull<u8>(key) && !Pointer.isNull<u8>(bio) && unsafe ssl.PEM_write_bio_PUBKEY(bio, key) == 1 && unsafe certificateBIO(&mut j, bio)
+      let ignored = unsafe ssl.BIO_free(bio)
+    }
+    unsafe ssl.EVP_PKEY_free(key)
+  }
+  unsafe xssl.NETSCAPE_SPKI_free(spki)
+  return ok
+}
+unsafe fn executeCertificates(j: &mut Job) -> bool {
+  let op = j.op let h = j.handle
+  if op >= 117 && op <= 119 { return unsafe certificateSPKAC(&mut j) }
+  if op == 120 { return unsafe certificatePKCS12(&mut j) }
+  if op == 123 || op == 124 { return unsafe certificateEC(&mut j) }
+  if op == 100 {
+    j.createdKind = 7 j.resultKind = 2
+    let bio = unsafe ssl.BIO_new_mem_buf(j.data[0], usize.toI32(j.lengths[0]))
+    if Pointer.isNull<u8>(bio) { return false }
+    j.created = unsafe xssl.PEM_read_bio_X509(bio, nil(), nil(), nil())
+    let ignored = unsafe ssl.BIO_free(bio)
+    if Pointer.isNull<u8>(j.created) {
+      unsafe ssl.ERR_clear_error() let mut input = j.data[0]
+      j.created = unsafe xssl.d2i_X509(nil(), Pointer.fromMutRef<?*mut u8>(&mut input), usize.toI64(j.lengths[0]))
+    }
+    return !Pointer.isNull<u8>(j.created)
+  }
+  if op == 101 {
+    let length = unsafe xssl.i2d_X509(h, Pointer.null<?*mut u8>())
+    if length <= 0 || !unsafe reserve(&mut j, i32.toUsize(length)) { return false }
+    let mut output = j.output
+    return unsafe xssl.i2d_X509(h, Pointer.fromMutRef<?*mut u8>(&mut output)) == length
+  }
+  if op == 102 || op == 103 || op == 104 || op == 122 {
+    let bio = unsafe ssl.BIO_new(unsafe ssl.BIO_s_mem())
+    if Pointer.isNull<u8>(bio) { return false }
+    let mut ok = false j.resultKind = 3
+    if op == 102 { ok = unsafe xssl.PEM_write_bio_X509(bio, h) == 1 }
+    if op == 103 {
+      let mut name = unsafe xssl.X509_get_subject_name(h)
+      if j.numbers[1] != 0 { name = unsafe xssl.X509_get_issuer_name(h) }
+      ok = unsafe xssl.X509_NAME_print_ex(bio, name, 0, 262163) >= 0
+    }
+    if op == 104 {
+      let mut time = unsafe xssl.X509_get0_notBefore(h)
+      if j.numbers[1] != 0 { time = unsafe xssl.X509_get0_notAfter(h) }
+      ok = unsafe xssl.ASN1_TIME_print(bio, time) == 1
+    }
+    if op == 122 {
+      let mut input = j.data[0]
+      let name = unsafe xssl.d2i_X509_NAME(nil(), Pointer.fromMutRef<?*mut u8>(&mut input), usize.toI64(j.lengths[0]))
+      ok = !Pointer.isNull<u8>(name) && unsafe xssl.X509_NAME_print_ex(bio, name, 0, i64.toU64(j.numbers[1])) >= 0
+      unsafe xssl.X509_NAME_free(name)
+    }
+    ok = ok && unsafe certificateBIO(&mut j, bio)
+    let ignored = unsafe ssl.BIO_free(bio) return ok
+  }
+  if op == 105 {
+    let md = unsafe ssl.EVP_get_digestbyname(j.data[1])
+    if Pointer.isNull<u8>(md) || !unsafe reserve(&mut j, 64) { return false }
+    let mut length: u32 = 64
+    let ok = unsafe xssl.X509_digest(h, md, j.output, Pointer.fromMutRef<u32>(&mut length)) == 1
+    j.length = u32.toUsize(length) return ok
+  }
+  if op == 106 {
+    let bn = unsafe xssl.ASN1_INTEGER_to_BN(unsafe xssl.X509_get_serialNumber(h), nil())
+    if Pointer.isNull<u8>(bn) { return false }
+    let text = unsafe xssl.BN_bn2hex(bn) unsafe ssl.BN_free(bn)
+    j.resultKind = 3
+    let ok = !Pointer.isNull<u8>(text) && unsafe certificateCopy(&mut j, text, unsafe textLength(text))
+    unsafe ssl.CRYPTO_free(text, nil(), 0) return ok
+  }
+  if op == 107 { j.resultKind = 2 j.createdKind = 4 j.created = unsafe xssl.X509_get_pubkey(h) return !Pointer.isNull<u8>(j.created) }
+  if op == 108 { j.resultKind = 1 j.result = 0 if unsafe xssl.X509_check_ca(h) > 0 { j.result = 1 } return true }
+  if op == 110 {
+    let mut algorithm = nil() let mut object = nil()
+    unsafe xssl.X509_get0_signature(nil(), Pointer.fromMutRef<?*mut u8>(&mut algorithm), h)
+    unsafe xssl.X509_ALGOR_get0(Pointer.fromMutRef<?*mut u8>(&mut object), nil(), nil(), algorithm)
+    if Pointer.isNull<u8>(object) { j.resultKind = 4 return true }
+    j.resultKind = 3
+    if j.numbers[1] == 0 {
+      let nid = unsafe xssl.OBJ_obj2nid(object)
+      if nid == 0 { j.resultKind = 4 return true }
+      let text = unsafe xssl.OBJ_nid2ln(nid)
+      return !Pointer.isNull<u8>(text) && unsafe certificateCopy(&mut j, text, unsafe textLength(text))
+    }
+    let length = unsafe xssl.OBJ_obj2txt(nil(), 0, object, 1)
+    if length < 0 || !unsafe reserve(&mut j, i32.toUsize(length) + 1) { return false }
+    j.length = i32.toUsize(length)
+    return unsafe xssl.OBJ_obj2txt(j.output, length + 1, object, 1) == length
+  }
+  if op >= 111 && op <= 113 {
+    let mut peer = nil() let mut result: i32 = 0
+    if op == 111 { result = unsafe xssl.X509_check_host(h, j.data[1], j.lengths[1], i64.toU32(j.numbers[2]), Pointer.fromMutRef<?*mut u8>(&mut peer)) }
+    if op == 112 { result = unsafe xssl.X509_check_email(h, j.data[1], j.lengths[1], i64.toU32(j.numbers[2])) }
+    if op == 113 { result = unsafe xssl.X509_check_ip_asc(h, j.data[1], i64.toU32(j.numbers[2])) }
+    let mut ok = true
+    if result == 1 {
+      j.resultKind = 3
+      if Pointer.isNull<u8>(peer) { let data = j.data[1] let length = j.lengths[1] ok = unsafe certificateCopy(&mut j, data, length) }
+      else { ok = unsafe certificateCopy(&mut j, peer, unsafe textLength(peer)) }
+    } else {
+      if result == 0 { j.resultKind = 4 } else {
+        if result == -2 { j.resultKind = 1 j.result = -2 } else { ok = false }
+      }
+    }
+    unsafe ssl.CRYPTO_free(peer, nil(), 0) return ok
+  }
+  if op >= 114 && op <= 116 {
+    j.resultKind = 1 j.result = 0
+    if op == 114 && unsafe xssl.X509_check_issued(j.other, h) == 0 { j.result = 1 }
+    if op == 115 && unsafe xssl.X509_check_private_key(h, j.other) == 1 { j.result = 1 }
+    if op == 116 && unsafe xssl.X509_verify(h, j.other) == 1 { j.result = 1 }
+    unsafe ssl.ERR_clear_error() return true
+  }
+  if op == 121 {
+    let nid = unsafe ssl.OBJ_txt2nid(j.data[0]) j.resultKind = 3
+    if nid == 0 { let data = j.data[0] let length = j.lengths[0] return unsafe certificateCopy(&mut j, data, length) }
+    let mut text = unsafe xssl.OBJ_nid2ln(nid)
+    if j.numbers[1] != 0 { text = unsafe xssl.OBJ_nid2sn(nid) }
+    return !Pointer.isNull<u8>(text) && unsafe certificateCopy(&mut j, text, unsafe textLength(text))
+  }
+  return false
+}
+
+// Provider jobs use stack OSSL_PARAM arrays; prepare owns every input byte.
+fn providerEnd() -> pssl.Param {
+  return pssl.Param { key: Pointer.null<u8>(), dataType: 0, data: nil(), dataSize: 0, returnSize: 0 }
+}
+unsafe fn providerParam(name: &[u8], kind: u32, data: ?*mut u8, size: usize) -> pssl.Param {
+  return pssl.Param { key: Pointer.fromRef<u8>(&name[0]), dataType: kind, data: data, dataSize: size, returnSize: 0 }
+}
+unsafe fn providerFailure(j: &mut Job, message: &[u8]) -> bool {
+  unsafe ssl.ERR_clear_error()
+  let mut i: usize = 0
+  while i < message.length && i < 255 {
+    unsafe Pointer.put<u8>(unsafe buffers.dataAt(j.error, usize.toU64(i)), message[i])
+    i = i + 1
+  }
+  unsafe Pointer.put<u8>(unsafe buffers.dataAt(j.error, usize.toU64(i)), 0)
+  j.codedError = true
+  return false
+}
+unsafe fn providerReadU32(data: ?*mut u8, offset: usize) -> u32 {
+  let mut n: u32 = 0 let mut i: usize = 0
+  while i < 4 {
+    let byte = unsafe Pointer.read<u8>(unsafe buffers.dataAt(data, usize.toU64(offset + i)))
+    n = n | u32.shiftLeft(u8.toU32(byte), usize.toU32(i * 8))
+    i = i + 1
+  }
+  return n
+}
+unsafe fn executeProviderArgon2(j: &mut Job) -> bool {
+  if j.lengths[7] != 8 { return unsafe providerFailure(&mut j, b"ERR_INVALID_ARG_VALUE: Invalid Argon2 cost parameters") }
+  let mut lanes = i64.toU32(j.numbers[5])
+  let mut memory = unsafe providerReadU32(j.data[7], 0)
+  let mut passes = unsafe providerReadU32(j.data[7], 4)
+  let mut libctx = nil()
+  // A private threading context must not bypass the default FIPS properties.
+  let mut kdf = unsafe pssl.EVP_KDF_fetch(nil(), j.data[0], nil())
+  if Pointer.isNull<u8>(kdf) { return false }
+  if lanes > 1 {
+    unsafe pssl.EVP_KDF_free(kdf)
+    libctx = unsafe pssl.OSSL_LIB_CTX_new()
+    if Pointer.isNull<u8>(libctx) { return false }
+    if unsafe pssl.OSSL_set_max_threads(libctx, u32.toU64(lanes)) != 1 { unsafe pssl.OSSL_LIB_CTX_free(libctx) return false }
+    kdf = unsafe pssl.EVP_KDF_fetch(libctx, j.data[0], nil())
+    if Pointer.isNull<u8>(kdf) { unsafe pssl.OSSL_LIB_CTX_free(libctx) return false }
+  }
+  let ctx = unsafe pssl.EVP_KDF_CTX_new(kdf)
+  unsafe pssl.EVP_KDF_free(kdf)
+  if Pointer.isNull<u8>(ctx) { unsafe pssl.OSSL_LIB_CTX_free(libctx) return false }
+  let mut params = [
+    unsafe providerParam(b"pass\0", 5, j.data[1], j.lengths[1]),
+    unsafe providerParam(b"salt\0", 5, j.data[2], j.lengths[2]),
+    unsafe providerParam(b"threads\0", 2, unsafe raw(Pointer.fromMutRef<u32>(&mut lanes)), 4),
+    unsafe providerParam(b"lanes\0", 2, unsafe raw(Pointer.fromMutRef<u32>(&mut lanes)), 4),
+    unsafe providerParam(b"memcost\0", 2, unsafe raw(Pointer.fromMutRef<u32>(&mut memory)), 4),
+    unsafe providerParam(b"iter\0", 2, unsafe raw(Pointer.fromMutRef<u32>(&mut passes)), 4),
+    providerEnd(), providerEnd(), providerEnd()
+  ]
+  let mut count: usize = 6
+  if j.lengths[3] != 0 { params[count] = unsafe providerParam(b"secret\0", 5, j.data[3], j.lengths[3]) count = count + 1 }
+  if j.lengths[4] != 0 { params[count] = unsafe providerParam(b"ad\0", 5, j.data[4], j.lengths[4]) }
+  let outputLength = i64.toUsize(j.numbers[6])
+  let ok = unsafe reserve(&mut j, outputLength) && unsafe pssl.EVP_KDF_derive(ctx, j.output, j.length, Pointer.fromMutRef<pssl.Param>(&mut params[0])) == 1
+  unsafe pssl.EVP_KDF_CTX_free(ctx) unsafe pssl.OSSL_LIB_CTX_free(libctx)
+  return ok
+}
+unsafe fn providerMacSupports(ctx: ?*mut u8, name: &[u8], kind: u32) -> bool {
+  let table = unsafe pssl.EVP_MAC_CTX_settable_params(ctx)
+  if Pointer.isNull<pssl.Param>(table) { return false }
+  let entry = unsafe pssl.OSSL_PARAM_locate_const(table, Pointer.fromRef<u8>(&name[0]))
+  if Pointer.isNull<pssl.Param>(entry) { return false }
+  let p = unsafe Intrinsic.pointerRequalify<?*const pssl.Param, *const pssl.Param>(entry)
+  let anchor = () let parameter = unsafe Pointer.borrow<(), pssl.Param>(&anchor, p)
+  return parameter.dataType == kind
+}
+unsafe fn providerMacOption(j: &mut Job, ctx: ?*mut u8, name: &[u8], kind: u32) -> bool {
+  if unsafe providerMacSupports(ctx, name, kind) { return true }
+  return unsafe providerFailure(&mut j, b"ERR_INVALID_ARG_VALUE: The requested options property is not supported by this MAC")
+}
+unsafe fn executeProviderMacCreate(j: &mut Job) -> bool {
+  let mac = unsafe pssl.EVP_MAC_fetch(nil(), j.data[0], nil())
+  if Pointer.isNull<u8>(mac) { return unsafe providerFailure(&mut j, b"ERR_CRYPTO_INVALID_MAC: Invalid MAC") }
+  let hmac = unsafe pssl.EVP_MAC_is_a(mac, Pointer.fromRef<u8>(&b"HMAC\0"[0])) == 1
+  let cmac = unsafe pssl.EVP_MAC_is_a(mac, Pointer.fromRef<u8>(&b"CMAC\0"[0])) == 1
+  let gmac = unsafe pssl.EVP_MAC_is_a(mac, Pointer.fromRef<u8>(&b"GMAC\0"[0])) == 1
+  j.created = unsafe pssl.EVP_MAC_CTX_new(mac) j.createdKind = 8 j.resultKind = 2
+  unsafe pssl.EVP_MAC_free(mac)
+  if Pointer.isNull<u8>(j.created) { return false }
+  if hmac && Pointer.isNull<u8>(j.data[2]) { return unsafe providerFailure(&mut j, b"ERR_INVALID_ARG_VALUE: The property 'options.digest' is required for HMAC") }
+  if (cmac || gmac) && Pointer.isNull<u8>(j.data[3]) { return unsafe providerFailure(&mut j, b"ERR_INVALID_ARG_VALUE: The property 'options.cipher' is required for CMAC or GMAC") }
+  if gmac && j.lengths[4] == 0 { return unsafe providerFailure(&mut j, b"ERR_INVALID_ARG_VALUE: The property 'options.iv' must be non-empty for GMAC") }
+  let ctx = j.created
+  let mut params: [pssl.Param; 7] = [providerEnd(); 7]
+  let mut count: usize = 0
+  if !Pointer.isNull<u8>(j.data[2]) {
+    if !unsafe providerMacOption(&mut j, ctx, b"digest\0", 4) { return false }
+    params[count] = unsafe providerParam(b"digest\0", 4, j.data[2], j.lengths[2]) count = count + 1
+  }
+  if !Pointer.isNull<u8>(j.data[3]) {
+    if !unsafe providerMacOption(&mut j, ctx, b"cipher\0", 4) { return false }
+    params[count] = unsafe providerParam(b"cipher\0", 4, j.data[3], j.lengths[3]) count = count + 1
+  }
+  if !Pointer.isNull<u8>(j.data[4]) {
+    if !unsafe providerMacOption(&mut j, ctx, b"iv\0", 5) { return false }
+    params[count] = unsafe providerParam(b"iv\0", 5, j.data[4], j.lengths[4]) count = count + 1
+  }
+  if !Pointer.isNull<u8>(j.data[5]) {
+    if !unsafe providerMacOption(&mut j, ctx, b"custom\0", 5) { return false }
+    params[count] = unsafe providerParam(b"custom\0", 5, j.data[5], j.lengths[5]) count = count + 1
+  }
+  if !Pointer.isNull<u8>(j.data[6]) {
+    if !unsafe providerMacOption(&mut j, ctx, b"salt\0", 5) { return false }
+    params[count] = unsafe providerParam(b"salt\0", 5, j.data[6], j.lengths[6]) count = count + 1
+  }
+  let mut length: usize = 0
+  if j.numbers[7] >= 0 {
+    length = i64.toUsize(j.numbers[7])
+    if !unsafe providerMacOption(&mut j, ctx, b"size\0", 2) { return false }
+    params[count] = unsafe providerParam(b"size\0", 2, unsafe raw(Pointer.fromMutRef<usize>(&mut length)), Layout.of<usize>().bytes)
+  }
+  if unsafe pssl.EVP_MAC_init(ctx, j.data[1], j.lengths[1], Pointer.fromMutRef<pssl.Param>(&mut params[0])) != 1 { return false }
+  let actual = unsafe pssl.EVP_MAC_CTX_get_mac_size(ctx)
+  if j.numbers[7] >= 0 && actual != length { return unsafe providerFailure(&mut j, b"ERR_INVALID_ARG_VALUE: The property 'options.outputLength' was not honored by this MAC") }
+  if j.numbers[7] < 0 && actual == 0 { return unsafe providerFailure(&mut j, b"ERR_CRYPTO_OPERATION_FAILED: MAC did not report an output size") }
+  return true
+}
+unsafe fn providerMacFinal(j: &mut Job, ctx: ?*mut u8) -> bool {
+  let length = unsafe pssl.EVP_MAC_CTX_get_mac_size(ctx)
+  if !unsafe reserve(&mut j, length) { return false }
+  if unsafe pssl.EVP_MAC_final(ctx, j.output, Pointer.fromMutRef<usize>(&mut j.length), length) != 1 { return false }
+  if j.length != length { return unsafe providerFailure(&mut j, b"ERR_CRYPTO_OPERATION_FAILED: MAC returned an unexpected output length") }
+  return true
+}
+// Internal byte-oriented KMAC primitive for asynchronous WebCrypto jobs.
+unsafe fn executeProviderKmac(j: &mut Job) -> bool {
+  let mac = unsafe pssl.EVP_MAC_fetch(nil(), j.data[0], nil())
+  if Pointer.isNull<u8>(mac) { return false }
+  let kmac = unsafe pssl.EVP_MAC_is_a(mac, Pointer.fromRef<u8>(&b"KMAC-128\0"[0])) == 1 || unsafe pssl.EVP_MAC_is_a(mac, Pointer.fromRef<u8>(&b"KMAC-256\0"[0])) == 1
+  if !kmac { unsafe pssl.EVP_MAC_free(mac) return unsafe providerFailure(&mut j, b"ERR_INVALID_ARG_VALUE: Expected a KMAC algorithm") }
+  let ctx = unsafe pssl.EVP_MAC_CTX_new(mac) unsafe pssl.EVP_MAC_free(mac)
+  if Pointer.isNull<u8>(ctx) { return false }
+  let mut length = i64.toUsize(j.numbers[4])
+  let mut params = [
+    unsafe providerParam(b"size\0", 2, unsafe raw(Pointer.fromMutRef<usize>(&mut length)), Layout.of<usize>().bytes),
+    unsafe providerParam(b"custom\0", 5, j.data[3], j.lengths[3]),
+    providerEnd()
+  ]
+  let ok = unsafe pssl.EVP_MAC_init(ctx, j.data[1], j.lengths[1], Pointer.fromMutRef<pssl.Param>(&mut params[0])) == 1 && unsafe pssl.EVP_MAC_update(ctx, j.data[2], j.lengths[2]) == 1 && unsafe providerMacFinal(&mut j, ctx)
+  unsafe pssl.EVP_MAC_CTX_free(ctx) return ok
+}
+export "C" fn silkCryptoMacName(name: ?*mut u8, opaque: ?*mut u8) -> () {
+  let p = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Job>(unsafe nonnull(opaque))
+  let mut anchor = () let j = unsafe Pointer.borrowMut<(), Job>(&mut anchor, p)
+  unsafe appendName(&mut j, name)
+}
+export "C" fn silkCryptoMacAlgorithm(mac: ?*mut u8, opaque: ?*mut u8) -> () {
+  let fetched = unsafe pssl.EVP_MAC_fetch(nil(), unsafe pssl.EVP_MAC_get0_name(mac), nil())
+  if Pointer.isNull<u8>(fetched) { unsafe ssl.ERR_clear_error() return () }
+  let callback: pssl.NameCallback = silkCryptoMacName
+  let ignored = unsafe pssl.EVP_MAC_names_do_all(fetched, callback, opaque)
+  unsafe pssl.EVP_MAC_free(fetched)
+}
+unsafe fn providerKemOperation(ctx: ?*mut u8, key: ?*mut u8) -> bool {
+  let table = unsafe pssl.EVP_PKEY_CTX_settable_params(ctx)
+  if Pointer.isNull<pssl.Param>(table) { return true }
+  let descriptor = unsafe pssl.OSSL_PARAM_locate_const(table, Pointer.fromRef<u8>(&b"operation\0"[0]))
+  if Pointer.isNull<pssl.Param>(descriptor) { return true }
+  let mut operation: ?*const u8 = Pointer.null<u8>()
+  if unsafe pssl.EVP_PKEY_is_a(key, Pointer.fromRef<u8>(&b"RSA\0"[0])) == 1 { operation = Pointer.fromRef<u8>(&b"RSASVE\0"[0]) }
+  else {
+    if unsafe pssl.EVP_PKEY_is_a(key, Pointer.fromRef<u8>(&b"EC\0"[0])) == 1 || unsafe pssl.EVP_PKEY_is_a(key, Pointer.fromRef<u8>(&b"X25519\0"[0])) == 1 || unsafe pssl.EVP_PKEY_is_a(key, Pointer.fromRef<u8>(&b"X448\0"[0])) == 1 { operation = Pointer.fromRef<u8>(&b"DHKEM\0"[0]) }
+  }
+  if Pointer.isNull<u8>(operation) { return true }
+  let value = unsafe Intrinsic.pointerRequalify<?*const u8, ?*mut u8>(operation)
+  let mut params = [unsafe providerParam(b"operation\0", 4, value, 0), providerEnd()]
+  return unsafe pssl.EVP_PKEY_CTX_set_params(ctx, Pointer.fromMutRef<pssl.Param>(&mut params[0])) > 0
+}
+unsafe fn executeProviderKem(j: &mut Job) -> bool {
+  let ctx = unsafe ssl.EVP_PKEY_CTX_new(j.handle, nil())
+  if Pointer.isNull<u8>(ctx) { return false }
+  let mut shared: usize = 0 let mut ciphertext: usize = 0 let mut ok = false
+  if j.op == 145 {
+    ok = unsafe pssl.EVP_PKEY_encapsulate_init(ctx, Pointer.null<pssl.Param>()) > 0 && unsafe providerKemOperation(ctx, j.handle)
+    ok = ok && unsafe pssl.EVP_PKEY_encapsulate(ctx, nil(), Pointer.fromMutRef<usize>(&mut ciphertext), nil(), Pointer.fromMutRef<usize>(&mut shared)) > 0
+    if ok {
+      let sharedCapacity = shared let cipherCapacity = ciphertext
+      ok = shared <= 4294967295 && ciphertext <= 4294967295 && unsafe reserve(&mut j, 4 + shared + ciphertext)
+      if ok {
+        let secret = unsafe buffers.dataAt(j.output, 4)
+        let wrapped = unsafe buffers.dataAt(j.output, usize.toU64(4 + shared))
+        ok = unsafe pssl.EVP_PKEY_encapsulate(ctx, wrapped, Pointer.fromMutRef<usize>(&mut ciphertext), secret, Pointer.fromMutRef<usize>(&mut shared)) > 0
+        if ok && (shared != sharedCapacity || ciphertext != cipherCapacity) { ok = unsafe providerFailure(&mut j, b"ERR_CRYPTO_OPERATION_FAILED: Unexpected KEM output length") }
+        let mut i: usize = 0 let mut n = usize.toU64(shared)
+        while ok && i < 4 { unsafe Pointer.put<u8>(unsafe buffers.dataAt(j.output, usize.toU64(i)), u64.toU8(n % 256)) n = n / 256 i = i + 1 }
+      }
+    }
+  } else {
+    ok = unsafe pssl.EVP_PKEY_decapsulate_init(ctx, Pointer.null<pssl.Param>()) > 0 && unsafe providerKemOperation(ctx, j.handle)
+    ok = ok && unsafe pssl.EVP_PKEY_decapsulate(ctx, nil(), Pointer.fromMutRef<usize>(&mut shared), j.data[1], j.lengths[1]) > 0
+    ok = ok && unsafe reserve(&mut j, shared) && unsafe pssl.EVP_PKEY_decapsulate(ctx, j.output, Pointer.fromMutRef<usize>(&mut j.length), j.data[1], j.lengths[1]) > 0
+  }
+  unsafe ssl.EVP_PKEY_CTX_free(ctx) return ok
+}
+unsafe fn executeProvider(j: &mut Job) -> bool {
+  if j.op == 140 { return unsafe executeProviderArgon2(&mut j) }
+  if j.op == 141 { return unsafe executeProviderMacCreate(&mut j) }
+  if j.op == 142 { j.resultKind = 4 return unsafe pssl.EVP_MAC_update(j.handle, j.data[1], j.lengths[1]) == 1 }
+  if j.op == 143 { let handle = j.handle return unsafe providerMacFinal(&mut j, handle) }
+  if j.op == 144 {
+    j.resultKind = 3
+    let callback: pssl.MacCallback = silkCryptoMacAlgorithm
+    unsafe pssl.EVP_MAC_do_all_provided(nil(), callback, unsafe raw(Pointer.fromMutRef<Job>(&mut j)))
+    return j.status == 0
+  }
+  if j.op == 145 || j.op == 146 { return unsafe executeProviderKem(&mut j) }
+  if j.op == 147 { return unsafe executeProviderKmac(&mut j) }
+  return false
+}
+
+unsafe fn certificateEC(j: &mut Job) -> bool {
+  let key = unsafe xssl.X509_get_pubkey(j.handle)
+  if Pointer.isNull<u8>(key) { return false }
+  let ec = unsafe xssl.EVP_PKEY_get1_EC_KEY(key) unsafe ssl.EVP_PKEY_free(key)
+  if Pointer.isNull<u8>(ec) { return false }
+  let group = unsafe ssl.EC_KEY_get0_group(ec)
+  let mut ok = true
+  if j.op == 123 {
+    let point = unsafe ssl.EC_KEY_get0_public_key(ec)
+    let length = unsafe ssl.EC_POINT_point2oct(group, point, 4, nil(), 0, nil())
+    ok = length > 0 && unsafe reserve(&mut j, length) && unsafe ssl.EC_POINT_point2oct(group, point, 4, j.output, length, nil()) == length
+  } else {
+    let nid = unsafe xssl.EC_GROUP_get_curve_name(group)
+    let mut name = nil()
+    if nid != 0 {
+      if j.numbers[1] == 0 { name = unsafe xssl.OBJ_nid2sn(nid) }
+      else { name = unsafe xssl.EC_curve_nid2nist(nid) }
+    }
+    if Pointer.isNull<u8>(name) { j.resultKind = 4 }
+    else { j.resultKind = 3 ok = unsafe certificateCopy(&mut j, name, unsafe textLength(name)) }
+  }
+  unsafe ssl.EC_KEY_free(ec) return ok
+}
+
+unsafe fn providerRawECImport(j: &mut Job) -> bool {
+  let mut nid = unsafe ssl.OBJ_txt2nid(j.data[3])
+  if nid == 0 { nid = unsafe pssl.EC_curve_nist2nid(j.data[3]) }
+  if nid == 0 { return unsafe providerFailure(&mut j, b"ERR_CRYPTO_INVALID_CURVE: Invalid EC curve name") }
+  let ec = unsafe ssl.EC_KEY_new_by_curve_name(nid)
+  if Pointer.isNull<u8>(ec) { return false }
+  let group = unsafe ssl.EC_KEY_get0_group(ec)
+  let point = unsafe ssl.EC_POINT_new(group)
+  if Pointer.isNull<u8>(point) { unsafe ssl.EC_KEY_free(ec) return false }
+  let mut ok = false
+  if j.numbers[2] == 0 {
+    ok = unsafe ssl.EC_POINT_oct2point(group, point, j.data[1], j.lengths[1], nil()) == 1 && unsafe ssl.EC_KEY_set_public_key(ec, point) == 1
+  } else {
+    let order = unsafe pssl.EC_GROUP_get0_order(group)
+    let size = (unsafe ssl.BN_num_bits(order) + 7) / 8
+    if j.lengths[1] != i32.toUsize(size) {
+      unsafe ssl.EC_POINT_free(point) unsafe ssl.EC_KEY_free(ec)
+      return unsafe providerFailure(&mut j, b"ERR_INVALID_ARG_VALUE: Invalid EC private key length")
+    }
+    let secret = unsafe ssl.BN_bin2bn(j.data[1], usize.toI32(j.lengths[1]), nil())
+    ok = !Pointer.isNull<u8>(secret) && unsafe ssl.EC_KEY_set_private_key(ec, secret) == 1 && unsafe ssl.EC_POINT_mul(group, point, secret, nil(), nil(), nil()) == 1 && unsafe ssl.EC_KEY_set_public_key(ec, point) == 1
+    unsafe ssl.BN_free(secret)
+  }
+  if ok {
+    j.created = unsafe ssl.EVP_PKEY_new()
+    ok = !Pointer.isNull<u8>(j.created) && unsafe pssl.EVP_PKEY_set1_EC_KEY(j.created, ec) == 1
+  }
+  unsafe ssl.EC_POINT_free(point) unsafe ssl.EC_KEY_free(ec)
+  return ok
+}
+unsafe fn executeProviderRawImport(j: &mut Job) -> bool {
+  j.createdKind = 4 j.resultKind = 2
+  let ec = j.lengths[0] == 2 && unsafe Pointer.read<u8>(unsafe nonnull(j.data[0])) == 69 && unsafe Pointer.read<u8>(unsafe buffers.dataAt(j.data[0], 1)) == 67
+  let mut ok = false
+  if ec { ok = unsafe providerRawECImport(&mut j) }
+  else {
+    if j.numbers[2] == 0 { j.created = unsafe pssl.EVP_PKEY_new_raw_public_key_ex(nil(), j.data[0], nil(), j.data[1], j.lengths[1]) }
+    else {
+      if j.numbers[2] == 1 { j.created = unsafe pssl.EVP_PKEY_new_raw_private_key_ex(nil(), j.data[0], nil(), j.data[1], j.lengths[1]) }
+      else {
+        let ctx = unsafe ssl.EVP_PKEY_CTX_new_from_name(nil(), j.data[0], nil())
+        if Pointer.isNull<u8>(ctx) { return false }
+        let mut params = [unsafe providerParam(b"seed\0", 5, j.data[1], j.lengths[1]), providerEnd()]
+        ok = unsafe pssl.EVP_PKEY_fromdata_init(ctx) > 0 && unsafe pssl.EVP_PKEY_fromdata(ctx, Pointer.fromMutRef<?*mut u8>(&mut j.created), 135, Pointer.fromMutRef<pssl.Param>(&mut params[0])) > 0
+        unsafe ssl.EVP_PKEY_CTX_free(ctx)
+        if !ok { return false }
+      }
+    }
+    ok = !Pointer.isNull<u8>(j.created)
+  }
+  if ok && j.numbers[4] == 1 && j.numbers[2] != 0 {
+    let privateKey = j.created
+    j.created = unsafe publicPart(privateKey)
+    unsafe ssl.EVP_PKEY_free(privateKey)
+    ok = !Pointer.isNull<u8>(j.created)
+  }
+  return ok
+}
+unsafe fn providerRawECExport(j: &mut Job) -> bool {
+  let ec = unsafe pssl.EVP_PKEY_get1_EC_KEY(j.handle)
+  if Pointer.isNull<u8>(ec) { return false }
+  let group = unsafe ssl.EC_KEY_get0_group(ec)
+  let mut ok = false
+  if j.numbers[1] == 0 {
+    let point = unsafe ssl.EC_KEY_get0_public_key(ec)
+    let form = i64.toI32(j.numbers[2])
+    if !Pointer.isNull<u8>(point) {
+      let length = unsafe ssl.EC_POINT_point2oct(group, point, form, nil(), 0, nil())
+      ok = length != 0 && unsafe reserve(&mut j, length) && unsafe ssl.EC_POINT_point2oct(group, point, form, j.output, length, nil()) == length
+    }
+  } else {
+    let secret = unsafe ssl.EC_KEY_get0_private_key(ec)
+    let order = unsafe pssl.EC_GROUP_get0_order(group)
+    let length = (unsafe ssl.BN_num_bits(order) + 7) / 8
+    ok = !Pointer.isNull<u8>(secret) && unsafe reserve(&mut j, i32.toUsize(length)) && unsafe ssl.BN_bn2binpad(secret, j.output, length) == length
+  }
+  unsafe ssl.EC_KEY_free(ec) return ok
+}
+unsafe fn executeProviderRawExport(j: &mut Job) -> bool {
+  if unsafe pssl.EVP_PKEY_is_a(j.handle, Pointer.fromRef<u8>(&b"EC\0"[0])) == 1 { return unsafe providerRawECExport(&mut j) }
+  let mut length: usize = 0
+  if j.numbers[1] == 0 {
+    return unsafe pssl.EVP_PKEY_get_raw_public_key(j.handle, nil(), Pointer.fromMutRef<usize>(&mut length)) == 1 && unsafe reserve(&mut j, length) && unsafe pssl.EVP_PKEY_get_raw_public_key(j.handle, j.output, Pointer.fromMutRef<usize>(&mut j.length)) == 1
+  }
+  if j.numbers[1] == 1 {
+    return unsafe pssl.EVP_PKEY_get_raw_private_key(j.handle, nil(), Pointer.fromMutRef<usize>(&mut length)) == 1 && unsafe reserve(&mut j, length) && unsafe pssl.EVP_PKEY_get_raw_private_key(j.handle, j.output, Pointer.fromMutRef<usize>(&mut j.length)) == 1
+  }
+  let name = Pointer.fromRef<u8>(&b"seed\0"[0])
+  return unsafe pssl.EVP_PKEY_get_octet_string_param(j.handle, name, nil(), 0, Pointer.fromMutRef<usize>(&mut length)) == 1 && unsafe reserve(&mut j, length) && unsafe pssl.EVP_PKEY_get_octet_string_param(j.handle, name, j.output, length, Pointer.fromMutRef<usize>(&mut j.length)) == 1
+}
+unsafe fn providerKind(j: &Job, name: &[u8]) -> bool {
+  if j.lengths[0] != name.length { return false }
+  let mut i: usize = 0
+  while i < name.length { if unsafe Pointer.read<u8>(unsafe buffers.dataAt(j.data[0], usize.toU64(i))) != name[i] { return false } i = i + 1 }
+  return true
+}
+unsafe fn executeProviderAvailable(j: &mut Job) -> bool {
+  j.resultKind = 1 j.result = 0
+  let mut available = false
+  if unsafe providerKind(&j.*, b"digest") {
+    let md = unsafe pssl.EVP_MD_fetch(nil(), j.data[1], nil())
+    let ctx = unsafe ssl.EVP_MD_CTX_new()
+    available = !Pointer.isNull<u8>(md) && !Pointer.isNull<u8>(ctx) && unsafe ssl.EVP_DigestInit_ex(ctx, md, nil()) == 1
+    unsafe ssl.EVP_MD_CTX_free(ctx) unsafe pssl.EVP_MD_free(md)
+  } else {
+    if unsafe providerKind(&j.*, b"cipher") {
+      let cipher = unsafe ssl.EVP_get_cipherbyname(j.data[1])
+      let ctx = unsafe ssl.EVP_CIPHER_CTX_new()
+      if !Pointer.isNull<u8>(ctx) { unsafe ssl.EVP_CIPHER_CTX_set_flags(ctx, 1) }
+      available = !Pointer.isNull<u8>(cipher) && !Pointer.isNull<u8>(ctx) && unsafe ssl.EVP_CipherInit_ex(ctx, cipher, nil(), nil(), nil(), 1) == 1
+      unsafe ssl.EVP_CIPHER_CTX_free(ctx)
+    } else {
+      if unsafe providerKind(&j.*, b"mac") { let mac = unsafe pssl.EVP_MAC_fetch(nil(), j.data[1], nil()) available = !Pointer.isNull<u8>(mac) unsafe pssl.EVP_MAC_free(mac) }
+      else {
+        if unsafe providerKind(&j.*, b"kdf") { let kdf = unsafe pssl.EVP_KDF_fetch(nil(), j.data[1], nil()) available = !Pointer.isNull<u8>(kdf) unsafe pssl.EVP_KDF_free(kdf) }
+        else { let ctx = unsafe ssl.EVP_PKEY_CTX_new_from_name(nil(), j.data[1], nil()) available = !Pointer.isNull<u8>(ctx) && unsafe ssl.EVP_PKEY_keygen_init(ctx) > 0 unsafe ssl.EVP_PKEY_CTX_free(ctx) }
+      }
+    }
+  }
+  if available { j.result = 1 }
+  unsafe ssl.ERR_clear_error() return true
+}

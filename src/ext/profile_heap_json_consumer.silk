@@ -1,0 +1,111 @@
+//! Native integration consumer; call exercise with an initialized real Engine and
+//! context. Capture and encode run on SystemAllocator. Only after observation has
+//! ended does the guest parse the final snapshot and compare it to the raw graph.
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_heap { HeapHeader }
+import silkjs.js_value { Value }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_heap_snapshot { BusyHeap }
+import silkjs.js_heap_snapshot as heap
+import silkjs.js_heap_snapshot_json as rawJson
+import silkjs.js_eval as eval
+import silkjs.js_collection_support { Scope }
+import silkjs.js_collection_support as owners
+import silkjs.js_runtime as runtime
+import ext.profile_heap_json as json
+import ext.profile_heap_json { SnapshotFormatError }
+import silkjs.runtime_memory { RuntimeAllocator }
+import silkjs.js_atomics_native { WaiterDomain, SynchronizationError }
+import silkjs.js_gc as gc
+import silkjs.js_intrinsic_install as intrinsics
+import silkjs.native_stack as stack
+import libs.core.host { Services }
+
+pub unsafe effect fn exercise<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader) -> ()
+  ! JsException | OutOfMemoryError | BusyHeap | SnapshotFormatError | AssertionError<'static> ? &mut Allocator {
+  let mut scope = Scope.make()
+  let checked = run Effect.result(unsafe exerciseOwned(&mut engine, context, &mut scope))
+  unsafe owners.cleanup(&mut engine, context, move scope)
+  match move checked {
+    Result<(), JsException | OutOfMemoryError | BusyHeap | SnapshotFormatError | AssertionError<'static>>.Success { .. } => ()
+    Result<(), JsException | OutOfMemoryError | BusyHeap | SnapshotFormatError | AssertionError<'static>>.Failure { error } => { fail move error }
+  }
+}
+unsafe effect fn exerciseOwned<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, scope: &mut Scope) -> ()
+  ! JsException | OutOfMemoryError | BusyHeap | SnapshotFormatError | AssertionError<'static> ? &mut Allocator {
+  let memory = engine.memory let rt = unsafe runtime.contextRuntime(context)
+  scope.values[0] = run unsafe eval.evaluate(&mut engine, memory, context,
+    b"(()=>{const calls={value:0},o={};Object.defineProperty(o,'getter',{get(){calls.value++;throw Error('observed getter')}});o.self=o;const key={},value={},map=new WeakMap([[key,value]]),weak=new WeakRef(key),buffer=new ArrayBuffer(513),a=new Uint8Array(buffer),b=new DataView(buffer);return [calls,o,key,value,map,weak,buffer,a,b,'L'.repeat(513)+'R'.repeat(513),123456789012345678901234567890n]})()",
+    b"native-heap-json-consumer.js", 0)
+  let mut system = Allocator.systemAllocatorProvider()
+  let before = memory.stats()
+  let mut graph = run unsafe heap.snapshot(rt, &[scope.values[0]]) |> Effect.provideMut<Allocator>(&mut system)
+  run unsafe heap.identify(&mut graph, memory) |> Effect.provideMut<Allocator>(&mut system)
+  let encoded = run json.encode(&graph) |> Effect.provideMut<Allocator>(&mut system)
+  let raw = run rawJson.encode(&graph) |> Effect.provideMut<Allocator>(&mut system)
+  let after = memory.stats()
+  run Testing.expect(before.allocationCount == after.allocationCount && before.usedBytes == after.usedBytes,
+    "native DevTools encoding makes no guest allocations")
+
+  // Exercise both sides of the exact numeric-ID boundary without any guest call.
+  let original = graph.nodes.get(0) let mut boundary = original
+  boundary.id = 9007199254740991 graph.nodes.set(0, boundary)
+  let accepted = run json.encode(&graph) |> Effect.provideMut<Allocator>(&mut system)
+  boundary.id = 9007199254740992 graph.nodes.set(0, boundary)
+  let rejected = run Effect.result(json.encode(&graph)) |> Effect.provideMut<Allocator>(&mut system)
+  graph.nodes.set(0, original)
+  match move rejected {
+    Result<List<u8>, OutOfMemoryError | SnapshotFormatError>.Success { .. } => {
+      run Testing.expect(false, "unsafe numeric node ID must be rejected")
+    }
+    Result<List<u8>, OutOfMemoryError | SnapshotFormatError>.Failure { error } => {
+      match move error { SnapshotFormatError {} => () OutOfMemoryError {} => { fail OutOfMemoryError {} } }
+    }
+  }
+
+  // JSON literals contain no user text: labels/messages are native static strings.
+  // The comparison reconstructs every raw node and edge from compact v2 fields.
+  let mut source = List<u8>.make()
+  run source.appendBytes(b"(()=>{const raw=") |> Effect.provideMut<Allocator>(&mut system)
+  run source.appendBytes(raw.asSlice()) |> Effect.provideMut<Allocator>(&mut system)
+  run source.appendBytes(b";const p=") |> Effect.provideMut<Allocator>(&mut system)
+  run source.appendBytes(encoded.asSlice()) |> Effect.provideMut<Allocator>(&mut system)
+  run source.appendBytes(b";const check=(ok,message)=>{if(!ok)throw Error(message)},s=p.silk,n=p.nodes,e=p.edges;check(s.format==='silk.heap.snapshot'&&s.version===2&&s.graphVersion===raw.version&&s.identity===raw.identity&&s.root===0&&s.rootKind===raw.nodes[0].kind,'metadata');check(!('nodes'in s)&&!('edges'in s),'no duplicate graph');check(n.length===raw.nodes.length*7&&e.length===raw.edges.length*3&&p.snapshot.node_count===raw.nodes.length&&p.snapshot.edge_count===raw.edges.length,'cardinality');check(new Set(p.strings).size===p.strings.length,'unique strings');const native=new Map(),conditions=new Map();for(let i=0;i<s.nodeNativeBytes.length;i+=2){check(s.nodeNativeBytes[i+1]>0&&!native.has(s.nodeNativeBytes[i]),'sparse native bytes');native.set(s.nodeNativeBytes[i],s.nodeNativeBytes[i+1])}for(let i=0;i<s.ephemerons.length;i+=2){check(!conditions.has(s.ephemerons[i]),'unique condition');conditions.set(s.ephemerons[i],s.ephemerons[i+1])}const groups=Array.from({length:raw.nodes.length},()=>[]);for(const edge of raw.edges)groups[edge.from].push(edge);const types={object:3,bytecode:4,shape:0,binding:0,asyncFrame:0,context:0,module:0,string:2,rope:10,bigint:13,native:8},strengths=['strong','weak','ephemeron','borrowed'];check(s.edgeStrengths.length===raw.edges.length,'strength count');let at=0;for(let i=0;i<raw.nodes.length;i++){const node=raw.nodes[i],base=i*7;check(n[base]===(i===0?9:types[node.kind])&&p.strings[n[base+1]]===(i===0?'(Silk roots)':'Silk '+node.kind)&&String(n[base+2])===node.id,'node identity and kind');check(n[base+3]===node.selfBytes+node.nativeBytes&&(native.get(i)||0)===node.nativeBytes&&n[base+4]===groups[i].length&&n[base+5]===0&&n[base+6]===0,'node accounting');for(const edge of groups[i]){const name=p.strings[e[at*3+1]],split=name.lastIndexOf('[');check(name.endsWith(']')&&name.slice(0,split)===edge.label&&Number(name.slice(split+1,-1))===edge.index,'edge label and index');check(e[at*3]===(edge.strength==='strong'?3:6)&&e[at*3+2]===edge.to*7&&strengths[s.edgeStrengths[at]]===edge.strength,'edge order and strength');check((conditions.has(at)?conditions.get(at):null)===edge.condition,'edge condition');at++}}check(at===raw.edges.length,'all edges');check(JSON.stringify(s.allocations)===JSON.stringify(raw.allocations)&&JSON.stringify(s.limitations)===JSON.stringify(raw.limitations),'backing aliases and limitations');check(s.projection.includes('ephemeron')&&s.projection.includes('weak'),'honest projection');return true})()") |> Effect.provideMut<Allocator>(&mut system)
+  scope.values[1] = run unsafe eval.evaluate(&mut engine, memory, context, source.asSlice(), b"native-heap-json-roundtrip.js", 0)
+  run Testing.expect(match scope.values[1] { Value.Bool { value } => value _ => false },
+    "actual native snapshot round-trips every graph field through compact DevTools metadata")
+  source.clear()
+  run source.appendBytes(b"(") |> Effect.provideMut<Allocator>(&mut system)
+  run source.appendBytes(accepted.asSlice()) |> Effect.provideMut<Allocator>(&mut system)
+  run source.appendBytes(b").nodes[2] === 9007199254740991") |> Effect.provideMut<Allocator>(&mut system)
+  scope.values[2] = run unsafe eval.evaluate(&mut engine, memory, context, source.asSlice(), b"native-heap-json-id-boundary.js", 0)
+  run Testing.expect(match scope.values[2] { Value.Bool { value } => value _ => false },
+    "maximum safe DevTools node ID survives numeric JSON decoding exactly")
+}
+
+test effect fn nativeSnapshotPreservesGraphAndAllocatorOwnership() -> ()
+  ! OutOfMemoryError | SynchronizationError | JsException | BusyHeap | SnapshotFormatError | AssertionError<'static> {
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let memory = run allocator.observe()
+  let mut system = Allocator.systemAllocatorProvider()
+  let domain = run WaiterDomain.make() |> Effect.provideMut<Allocator>(&mut system)
+  let rt = run runtime.allocateRuntimeStorage(stack.currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut engine = Engine { memory: &memory, domain: domain.handle(), services: Services.make() }
+  let context = run unsafe intrinsics.create(&mut engine, &memory, rt) |> Effect.provideMut<Allocator>(&mut allocator)
+  let checked = run Effect.result(unsafe exercise(&mut engine, context)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let recording = memory.stopProfile() drop recording
+  unsafe gc.releaseHeader(&mut engine, rt, context)
+  run unsafe gc.destroyRuntime(&mut engine, rt) |> Effect.provideMut<Allocator>(&mut allocator)
+  match move checked {
+    Result<(), OutOfMemoryError | JsException | BusyHeap | SnapshotFormatError | AssertionError<'static>>.Success { .. } => ()
+    Result<(), OutOfMemoryError | JsException | BusyHeap | SnapshotFormatError | AssertionError<'static>>.Failure { error } => { fail move error }
+  }
+  run Testing.expect(memory.stats().allocationCount == 0 && memory.stats().usedBytes == 0,
+    "native snapshot capture, encoding and parsing release every charged runtime owner")
+}

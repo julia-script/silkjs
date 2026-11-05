@@ -1,0 +1,243 @@
+//! Node presentation metadata shared by a compiled tree through traced JS edges.
+//! The compiler reports real source/comment spans; no rendered stack is parsed.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.num.i32
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_heap { HeapCell, HeapHeader }
+import silkjs.js_value { Value }
+import silkjs.js_core_types { ContextState, RuntimeState, FunctionBytecode, FunctionDebugInfo, ModuleDef, ObjectData, ObjectPayload, NativeErrorKind }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_string_types { StringLengthError }
+import silkjs.js_strings { Strings }
+import silkjs.js_collection_support { Scope }
+import silkjs.js_collection_support as owners
+import silkjs.js_object_allocate as objects
+import silkjs.js_intl_common as common
+import silkjs.js_runtime as runtime
+import silkjs.js_gc as gc
+import silkjs.js_backtrace as backtrace
+import silkjs.js_stack_frames as frames
+import silkjs.js_module_native as modules
+import silkjs.js_eval_compile as flags
+import silkjs.js_eval_errors as errors
+import silkjs.js_promise as promises
+import silkjs.js_atom_data as atoms
+import silkjs.js_coercion_host { CoercionHooks }
+import silkjs.native_stack as stack
+import ext.script_cache
+
+unsafe fn bytecode(value: Value) -> Option<*mut HeapHeader> {
+  if let Value.FunctionBytecode { reference } = value { return Option<*mut HeapHeader>.some(reference) }
+  if let Value.Module { reference } = value {
+    let anchor = () let module = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, reference)
+    let function = module.functionObject drop module
+    return unsafe bytecode(function)
+  }
+  return unsafe backtrace.bytecode(value)
+}
+pub unsafe fn get(value: Value) -> Value {
+  let mut compiled = value
+  if let Value.Object { reference } = value {
+    let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+    if let ObjectPayload.NativeFunction { function } = &object.payload {
+      if function.isDataFunction && function.capturedValues.length() == 1 {
+        let captured = function.capturedValues.get(0)
+        if let Value.FunctionBytecode { .. } = captured { compiled = captured }
+        if let Value.Module { .. } = captured { compiled = captured }
+      }
+    }
+  }
+  let reference = match unsafe bytecode(compiled) { Option<*mut HeapHeader>.Some { value: found } => found _ => { return Value.Undefined } }
+  let anchor = () let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference)
+  return unsafe code.hostScriptMetadata.retained()
+}
+unsafe effect fn attach<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  reference: *mut HeapHeader, metadata: Value, sourceURL: bool) -> () ! JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  if unsafe runtime.checkStackOverflow(rt, stack.currentFrameAddress(), 0, true) {
+    return run unsafe engine.throwError(context, NativeErrorKind.Internal, b"stack overflow")
+  }
+  let mut anchor = () let code = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut anchor, reference)
+  let previous = Intrinsic.replace(code.hostScriptMetadata, unsafe metadata.retained())
+  if let Option<FunctionDebugInfo>.Some { value: debug } = &mut code.debug {
+    debug.nodeVm = true
+    debug.nodeSourceURL = sourceURL
+  }
+  let count = code.constants.length() drop code
+  unsafe gc.release(&mut engine, rt, previous)
+  let mut index: usize = 0
+  while index < count {
+    let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference)
+    let value = code.constants.get(index) drop code
+    if let Value.FunctionBytecode { reference: child } = value { run unsafe attach(&mut engine, context, child, metadata, sourceURL) }
+    index = index + 1
+  }
+}
+unsafe effect fn string<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  bytes: &[u8]) -> Value ! JsException ? &mut Allocator {
+  let made = run Effect.result(Strings.fromUtf8(bytes))
+  return match move made {
+    Result<Value, OutOfMemoryError | StringLengthError>.Success { value } => value
+    Result<Value, OutOfMemoryError | StringLengthError>.Failure { error } => run unsafe errors.materialize<Value, Engine<'m, S>>(&mut engine, context, move error)
+  }
+}
+fn number(value: i32) -> Value { return Value.Int { value: value } }
+unsafe effect fn origin<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  metadata: Value, scope: &mut Scope) -> () ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  // Public-style capture owns strings only; private metadata is separately rooted.
+  let snapshots = run unsafe frames.capture(rt, 1, Value.Undefined, false)
+  if snapshots.length() == 0 { return () }
+  let caller = match Pointer.nonNullMut<HeapHeader>(unsafe modules.currentBytecode(context)) {
+    Option<*mut HeapHeader>.Some { value } => value _ => { return () }
+  }
+  let anchor = () let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, caller)
+  scope.values[4] = unsafe code.hostScriptMetadata.retained()
+  let name = code.name drop code
+  let memory = engine.memory
+  scope.values[2] = run unsafe objects.withPrototype(&mut engine, memory, context, Value.Null)
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let functionName = if name == 0 || name == atoms.JS_ATOM__eval_ { state.atoms.emptyString() }
+    else { run state.atoms.toValue(name, true) }
+  drop state
+  run unsafe common.define(&mut engine, context, scope.values[2], b"functionName", functionName, 7)
+  let frame = &snapshots.asSlice()[0]
+  if scope.values[4].isObject() {
+    scope.values[5] = run unsafe common.get(&mut engine, context, scope.values[4], b"sourceURL")
+  }
+  let hasURL = scope.values[5].isString()
+  let scriptName = if hasURL { unsafe scope.values[5].retained() } else { unsafe frame.scriptName.get().retained() }
+  run unsafe common.define(&mut engine, context, scope.values[2], b"scriptName", scriptName, 7)
+  run unsafe common.define(&mut engine, context, scope.values[2], b"lineNumber", number(frame.callLineNumber), 7)
+  run unsafe common.define(&mut engine, context, scope.values[2], b"columnNumber", number(frame.callColumnNumber), 7)
+  if frame.isEval && !hasURL && scope.values[4].isObject() {
+    let parent = run unsafe common.get(&mut engine, context, scope.values[4], b"evalOrigin")
+    run unsafe common.define(&mut engine, context, scope.values[2], b"evalOrigin", parent, 7)
+  }
+  run unsafe common.define(&mut engine, context, metadata, b"evalOrigin", scope.take(2), 7)
+}
+unsafe effect fn recordBody<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  compiled: Value, source: &[u8], filename: &[u8], mode: i32, sourceURL: &[u8], sourceMapURL: &[u8],
+  callback: Value, scope: &mut Scope) -> () ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let reference = match unsafe bytecode(compiled) { Option<*mut HeapHeader>.Some { value } => value _ => { return () } }
+  let anchor = () let state = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  let enabled = state.nodeErrorStackGetter.isObject() drop state
+  if !enabled { return () }
+  let memory = engine.memory
+  scope.values[0] = run unsafe objects.withPrototype(&mut engine, memory, context, Value.Null)
+  let metadata = scope.values[0]
+  if (mode & flags.FLAG_DEFER_HOST_SOURCE) == 0 {
+    scope.values[1] = run unsafe string(&mut engine, context, source)
+    run unsafe common.define(&mut engine, context, metadata, b"source", unsafe scope.values[1].retained(), 7)
+  }
+  let url = if sourceURL.length == 0 { Value.Null } else { run unsafe string(&mut engine, context, sourceURL) }
+  run unsafe common.define(&mut engine, context, metadata, b"sourceURL", url, 7)
+  let mapURL = if sourceMapURL.length == 0 { Value.Null } else { run unsafe string(&mut engine, context, sourceMapURL) }
+  run unsafe common.define(&mut engine, context, metadata, b"sourceMapURL", mapURL, 7)
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference)
+  let id = code.scriptId drop code
+  let identity = run frames.scriptIdString(id)
+  run unsafe common.define(&mut engine, context, metadata, b"scriptId", identity, 7)
+  let kind = mode & flags.TYPE_MASK
+  let generated = kind == flags.TYPE_DIRECT || kind == flags.TYPE_INDIRECT
+  run unsafe common.define(&mut engine, context, metadata, b"generated", Value.Bool { value: generated }, 7)
+  if generated { run unsafe origin(&mut engine, context, metadata, &mut scope) }
+  run unsafe attach(&mut engine, context, reference, metadata, sourceURL.length != 0)
+  // Public VM compilers do not populate Node's source-map registry. The loader
+  // registers CJS separately with its actual Module owner and unwrapped source.
+  let module = kind == flags.TYPE_MODULE && (mode & flags.FLAG_UNLINKED_MODULE) == 0
+  if module {
+    run unsafe modules.configureHostCallbacks(&mut engine, context,
+      Value.FunctionBytecode { reference: reference }, Value.Undefined, compiled)
+  }
+  if callback.isObject() && (module || generated) {
+    if !generated { scope.values[6] = run unsafe string(&mut engine, context, filename) }
+    scope.values[3] = run unsafe promises.call(&mut engine, context, callback, Value.Undefined,
+      &[scope.values[6], scope.values[1], metadata])
+    if module && scope.values[3].isString() {
+      run unsafe script_cache.configureVm(&mut engine, context, Value.FunctionBytecode { reference: reference }, 0, 0, 0, scope.values[3])
+    }
+  }
+}
+pub unsafe effect fn record<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  compiled: Value, source: &[u8], filename: &[u8], mode: i32, sourceURL: &[u8], sourceMapURL: &[u8],
+  callback: Value) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut scope = Scope.make()
+  let outcome = run Effect.result(unsafe recordBody(&mut engine, context, compiled, source, filename, mode, sourceURL, sourceMapURL, callback, &mut scope))
+  unsafe owners.cleanup(&mut engine, context, move scope)
+  return match move outcome {
+    Result<(), OutOfMemoryError | StringLengthError | JsException>.Success { .. } => ()
+    Result<(), OutOfMemoryError | StringLengthError | JsException>.Failure { error } => run unsafe errors.materialize<(), Engine<'m, S>>(&mut engine, context, move error)
+  }
+}
+pub unsafe effect fn setSource<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  compiled: Value, source: Value, line: i32, column: i32) -> () ! JsException ? &mut Allocator {
+  let metadata = unsafe get(compiled)
+  if !metadata.isObject() { return () }
+  let changed = run Effect.result(unsafe configureSource(&mut engine, context, metadata, source, line, column))
+  unsafe owners.release(&mut engine, context, metadata)
+  if let Result<(), JsException>.Failure { error } = move changed { fail move error }
+}
+unsafe effect fn configureSource<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  metadata: Value, source: Value, line: i32, column: i32) -> () ! JsException ? &mut Allocator {
+  run unsafe common.define(&mut engine, context, metadata, b"source", unsafe source.retained(), 7)
+  run unsafe common.define(&mut engine, context, metadata, b"lineOffset", number(line), 7)
+  run unsafe common.define(&mut engine, context, metadata, b"columnOffset", number(column), 7)
+}
+pub unsafe effect fn markFunctionBody<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  function: Value, line: i32, column: i32) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  let reference = match unsafe bytecode(function) { Option<*mut HeapHeader>.Some { value } => value _ => { return () } }
+  let mut scope = Scope.make()
+  scope.values[0] = unsafe get(function)
+  if !scope.values[0].isObject() { return () }
+  let outcome = run Effect.result(unsafe bodyMetadata(&mut engine, context, reference, line, column, &mut scope))
+  unsafe owners.cleanup(&mut engine, context, move scope)
+  if let Result<(), OutOfMemoryError | JsException>.Failure { error } = move outcome { fail move error }
+}
+unsafe effect fn bodyMetadata<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  reference: *mut HeapHeader, line: i32, column: i32, scope: &mut Scope) -> ()
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let memory = engine.memory
+  scope.values[1] = run unsafe objects.withPrototype(&mut engine, memory, context, scope.values[0])
+  run unsafe common.define(&mut engine, context, scope.values[1], b"enclosingLineNumber", number(i32.wrappingAdd(line, 1)), 7)
+  run unsafe common.define(&mut engine, context, scope.values[1], b"enclosingColumnNumber", number(i32.wrappingAdd(column, 1)), 7)
+  let mut anchor = () let code = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut anchor, reference)
+  let previous = Intrinsic.replace(code.hostScriptMetadata, scope.take(1)) drop code
+  unsafe owners.release(&mut engine, context, previous)
+}
+/// Rebuilds process-local metadata from the cache envelope's immutable text.
+/// No object graph, realm, callback, or script identity crosses the cache.
+pub unsafe effect fn restore<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  compiled: Value, source: Value, sourceURL: Value, sourceMapURL: Value) -> ()
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  if !source.isString() { return () }
+  let reference = match unsafe bytecode(compiled) { Option<*mut HeapHeader>.Some { value } => value _ => { return () } }
+  let mut scope = Scope.make()
+  let outcome = run Effect.result(unsafe restoreBody(&mut engine, context, reference, source, sourceURL, sourceMapURL, &mut scope))
+  unsafe owners.cleanup(&mut engine, context, move scope)
+  return match move outcome {
+    Result<(), OutOfMemoryError | StringLengthError | JsException>.Success { .. } => ()
+    Result<(), OutOfMemoryError | StringLengthError | JsException>.Failure { error } => run unsafe errors.materialize<(), Engine<'m, S>>(&mut engine, context, move error)
+  }
+}
+unsafe effect fn restoreBody<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  reference: *mut HeapHeader, source: Value, sourceURL: Value, sourceMapURL: Value, scope: &mut Scope) -> ()
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let memory = engine.memory
+  scope.values[0] = run unsafe objects.withPrototype(&mut engine, memory, context, Value.Null)
+  let metadata = scope.values[0]
+  run unsafe common.define(&mut engine, context, metadata, b"source", unsafe source.retained(), 7)
+  run unsafe common.define(&mut engine, context, metadata, b"sourceURL", unsafe sourceURL.retained(), 7)
+  run unsafe common.define(&mut engine, context, metadata, b"sourceMapURL", unsafe sourceMapURL.retained(), 7)
+  let anchor = () let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference)
+  let identity = run frames.scriptIdString(code.scriptId)
+  let generated = code.scriptIsEval drop code
+  run unsafe common.define(&mut engine, context, metadata, b"scriptId", identity, 7)
+  run unsafe common.define(&mut engine, context, metadata, b"generated", Value.Bool { value: generated }, 7)
+  run unsafe attach(&mut engine, context, reference, metadata, sourceURL.isString() && Strings.length(sourceURL) != 0)
+}

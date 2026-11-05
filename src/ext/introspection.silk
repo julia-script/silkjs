@@ -1,0 +1,211 @@
+//! Node introspection reads engine class IDs and internal slots, never user properties.
+//! Host IDs are 1000 + operation. Predicate names are installed on host.types;
+//! getPromiseDetails and getProxyDetails are installed directly on host.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.num.usize
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_heap { HeapCell, HeapHeader }
+import silkjs.js_core_types { ObjectData, FrameSlots, NativeErrorKind }
+import silkjs.js_value { Value }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_coercion_host { CoercionHooks }
+import silkjs.js_class_data as classes
+import silkjs.js_proxy_core as proxy
+import silkjs.js_promise as promises
+import silkjs.js_object_allocate as objects
+import silkjs.js_array_intrinsics_support as arrays
+import silkjs.js_collection_support as owners
+import silkjs.js_buffer_storage as buffers
+import silkjs.js_runtime as runtime
+import silkjs.js_intl_common as common
+
+pub const IS_ARGUMENTS_OBJECT: u32 = 0
+pub const IS_ASYNC_FUNCTION: u32 = 1
+pub const IS_GENERATOR_FUNCTION: u32 = 2
+pub const IS_GENERATOR_OBJECT: u32 = 3
+pub const IS_NATIVE_ERROR: u32 = 4
+pub const IS_PROMISE: u32 = 5
+pub const IS_PROXY: u32 = 6
+pub const IS_MAP_ITERATOR: u32 = 7
+pub const IS_SET_ITERATOR: u32 = 8
+pub const IS_MODULE_NAMESPACE_OBJECT: u32 = 9
+pub const IS_EXTERNAL: u32 = 10
+pub const IS_KEY_OBJECT: u32 = 11
+pub const IS_CRYPTO_KEY: u32 = 12
+pub const IS_SHARED_ARRAY_BUFFER: u32 = 13
+pub const GET_PROMISE_DETAILS: u32 = 14
+pub const GET_PROXY_DETAILS: u32 = 15
+pub const SERIALIZATION_INFO: u32 = 16
+pub const ARRAY_BUFFER_VIEW_FLAGS: u32 = 17
+pub const PREDICATE_COUNT: u32 = 14
+pub const OPERATION_COUNT: u32 = 18
+
+// Allocation-free name table indexed by the operation (not the host function ID).
+pub fn name(operation: u32) -> &'static [u8] {
+  return match operation {
+    0 => b"isArgumentsObject"
+    1 => b"isAsyncFunction"
+    2 => b"isGeneratorFunction"
+    3 => b"isGeneratorObject"
+    4 => b"isNativeError"
+    5 => b"isPromise"
+    6 => b"isProxy"
+    7 => b"isMapIterator"
+    8 => b"isSetIterator"
+    9 => b"isModuleNamespaceObject"
+    10 => b"isExternal"
+    11 => b"isKeyObject"
+    12 => b"isCryptoKey"
+    13 => b"isSharedArrayBuffer"
+    14 => b"getPromiseDetails"
+    15 => b"getProxyDetails"
+    16 => b"serializationInfo"
+    17 => b"getArrayBufferViewFlags"
+    _ => Intrinsic.trap("unknown introspection operation")
+  }
+}
+
+unsafe fn classId(value: Value) -> u32 {
+  if !value.isObject() { return classes.JS_INVALID_CLASS_ID }
+  let anchor = ()
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, proxy.reference(value))
+  return object.classId
+}
+
+fn predicate(operation: u32, id: u32) -> bool {
+  return match operation {
+    0 => id == classes.JS_CLASS_ARGUMENTS || id == classes.JS_CLASS_MAPPED_ARGUMENTS
+    1 => id == classes.JS_CLASS_ASYNC_FUNCTION || id == classes.JS_CLASS_ASYNC_GENERATOR_FUNCTION
+    2 => id == classes.JS_CLASS_GENERATOR_FUNCTION || id == classes.JS_CLASS_ASYNC_GENERATOR_FUNCTION
+    3 => id == classes.JS_CLASS_GENERATOR || id == classes.JS_CLASS_ASYNC_GENERATOR
+    4 => id == classes.JS_CLASS_ERROR
+    5 => id == classes.JS_CLASS_PROMISE
+    6 => id == classes.JS_CLASS_PROXY
+    7 => id == classes.JS_CLASS_MAP_ITERATOR
+    8 => id == classes.JS_CLASS_SET_ITERATOR
+    9 => id == classes.JS_CLASS_MODULE_NS
+    // QuickJS has no External value tag or External/KeyObject/CryptoKey class,
+    // and this runtime does not create those Node/WebCrypto objects. HostOpaque
+    // is generic native storage (also used by FILE), not an External brand.
+    // If a provider adds these objects, its allocated class IDs must be matched
+    // here; class names, prototypes, and Symbol.toStringTag are not identities.
+    10 => false
+    11 => false
+    12 => false
+    13 => id == classes.JS_CLASS_SHARED_ARRAY_BUFFER
+    _ => Intrinsic.trap("unknown introspection predicate")
+  }
+}
+
+// Consumes both elements on success and failure. Reserving before appending
+// avoids property setters/proxy traps and keeps partially built arrays private.
+unsafe effect fn pair<'m, S: EngineServices>(engine: &mut Engine<'m, S>,
+  context: *mut HeapHeader, first: Value, second: Value) -> Value
+  ! OutOfMemoryError ? &mut Allocator {
+  let memory = engine.memory
+  let allocated = run Effect.result(unsafe objects.array(&mut engine, memory, context))
+  let array = match move allocated {
+    Result<Value, OutOfMemoryError>.Success { value } => value
+    Result<Value, OutOfMemoryError>.Failure { error } => {
+      unsafe owners.release(&mut engine, context, first)
+      unsafe owners.release(&mut engine, context, second)
+      fail move error
+    }
+  }
+  let reserved = run Effect.result(unsafe arrays.reserve(&mut engine, context, array, 2))
+  match move reserved {
+    Result<(), OutOfMemoryError>.Success { .. } => ()
+    Result<(), OutOfMemoryError>.Failure { error } => {
+      unsafe owners.release(&mut engine, context, array)
+      unsafe owners.release(&mut engine, context, first)
+      unsafe owners.release(&mut engine, context, second)
+      fail move error
+    }
+  }
+  run unsafe arrays.appendReserved(array, first)
+  run unsafe arrays.appendReserved(array, second)
+  unsafe arrays.publishLength(array, 2)
+  return array
+}
+
+// argv and its values remain borrowed/rooted by the native call frame.
+// Detail queries on a nonmatching value return undefined; revoked proxies
+// return null without touching their target, handler, or any user code.
+pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>,
+  context: *mut HeapHeader, operation: u32, argc: i32, argv: &FrameSlots) -> Value
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  if operation >= OPERATION_COUNT { return Intrinsic.trap("unknown introspection operation") }
+  let mut value = Value.Undefined
+  if argc > 0 && argv.length() > 0 { value = unsafe argv.get(0) }
+  let id = unsafe classId(value)
+  if operation < PREDICATE_COUNT {
+    return Value.Bool { value: predicate(operation, id) }
+  }
+  if operation == SERIALIZATION_INFO {
+    // Exotics must not silently become empty ordinary objects. Recognized
+    // builtin types are subsequently encoded by their own wire-format branch.
+    let supported = !value.isObject() ||
+      (id >= classes.JS_CLASS_OBJECT && id <= classes.JS_CLASS_BOOLEAN) ||
+      id == classes.JS_CLASS_DATE ||
+      (id >= classes.JS_CLASS_REGEXP && id <= classes.JS_CLASS_SET)
+    if supported { return Value.Int { value: 0 } }
+    return Value.Int { value: 1 }
+  }
+  if operation == ARRAY_BUFFER_VIEW_FLAGS {
+    if id < classes.JS_CLASS_UINT8C_ARRAY || id > classes.JS_CLASS_DATAVIEW {
+      return run unsafe engine.throwError(context, NativeErrorKind.Type, b"ArrayBuffer view required")
+    }
+    let object = proxy.reference(value)
+    if unsafe buffers.isOutOfBounds(object) {
+      return run unsafe engine.throwError(context, NativeErrorKind.Type, b"Cannot serialize a detached or out-of-bounds ArrayBuffer view")
+    }
+    let view = unsafe buffers.view(object)
+    let backing = unsafe buffers.snapshot(view.buffer)
+    let mut flags: i32 = 0
+    if view.tracking { flags = flags + 1 }
+    if !backing.shared && backing.maxByteLength >= 0 { flags = flags + 2 }
+    return Value.Int { value: flags }
+  }
+  if operation == GET_PROMISE_DETAILS {
+    if id != classes.JS_CLASS_PROMISE { return Value.Undefined }
+    let state = unsafe promises.state(value)
+    let result = unsafe promises.result(value)
+    return run unsafe pair(&mut engine, context, Value.Int { value: state }, result)
+  }
+  if id != classes.JS_CLASS_PROXY { return Value.Undefined }
+  if unsafe proxy.isRevoked(value) { return Value.Null }
+  let target = unsafe (unsafe proxy.target(value)).retained()
+  let handler = unsafe (unsafe proxy.handler(value)).retained()
+  return run unsafe pair(&mut engine, context, target, handler)
+}
+
+/// QuickJS uses individually owned allocations, not a reserved V8 heap arena.
+/// Both heap figures therefore describe live allocator charges, excluding
+/// native ArrayBuffer backing bytes. Host-owned backing is reported externally.
+pub unsafe effect fn heapStatistics<'m, S: EngineServices>(engine: &mut Engine<'m, S>,
+  context: *mut HeapHeader) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  let memory = engine.memory
+  let charged = memory.stats().usedBytes
+  let backing = run unsafe buffers.backingUsage(unsafe runtime.contextRuntime(context))
+  let heap = charged - backing.nativeBytes
+  let object = run unsafe objects.object(&mut engine, memory, context)
+  let names = [b"heapTotal", b"heapUsed", b"external", b"arrayBuffers"]
+  let sizes = [heap, heap, backing.bytes, backing.bytes]
+  let mut index: usize = 0
+  while index < names.length {
+    let defined = run Effect.result(unsafe common.define(&mut engine, context, object,
+      names[index], Value.Float64 { value: usize.toF64(sizes[index]) }, 7))
+    match move defined {
+      Result<(), JsException>.Success { .. } => ()
+      Result<(), JsException>.Failure { error } => {
+        unsafe owners.release(&mut engine, context, object)
+        fail move error
+      }
+    }
+    index = index + 1
+  }
+  return object
+}

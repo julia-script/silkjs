@@ -1,0 +1,352 @@
+import silk.mem.allocator { Allocator, OutOfMemoryError, SystemAllocator }
+import silk.mem.pointer { Pointer }
+import silk.mem.layout { Layout }
+import silk.core.option { Option }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silkjs.runtime_memory { RuntimeAllocator }
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_heap { HeapCell, HeapHeader }
+import silkjs.js_value { Value }
+import silkjs.js_core_types { ObjectData, ObjectPayload, NativeFunctionId, ExoticCallbacks, EXOTIC_SET_PROPERTY, EXOTIC_DEFINE_OWN_PROPERTY }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_runtime_registry { ClassIdAllocator }
+import silkjs.js_runtime_registry as registry
+import silkjs.js_runtime_classes as definitions
+import silkjs.js_atom_data as atoms
+import silkjs.js_object_allocate as objects
+import silkjs.js_proxy_core as core
+import silkjs.js_runtime as runtime
+import silkjs.js_gc { Tracer }
+import silkjs.js_gc as gc
+import ext.wamr_abi as c
+
+pub const GC_MUTATION_ID: u32 = 9096
+pub const MARK_ID: u32 = 9097
+pub const FINALIZE_ID: u32 = 9098
+pub type DestroyUser = extern "C" fn(?*mut u8) -> ()
+
+// All lists here are weak except pending: it owns only newly-created handles
+// until the outermost native operation has published its returned JS values.
+pub struct State {
+  pub allocator: *mut RuntimeAllocator<SystemAllocator>,
+  pub engine: ?*mut u8,
+  pub context: ?*mut HeapHeader,
+  pub runtime: ?*mut HeapHeader,
+  pub user: ?*mut u8,
+  pub depth: u32,
+  classId: u32,
+  gcClassId: u32,
+  owners: usize,
+  references: ?*mut Reference,
+  pending: ?*mut Owner,
+  closed: bool,
+  destroyUser: Option<DestroyUser>
+}
+pub struct Bridge { engine: ?*mut u8, context: ?*mut HeapHeader }
+struct Owner {
+  state: *mut State,
+  object: *mut HeapHeader,
+  native: ?*mut u8,
+  kind: u32,
+  buffer: Value,
+  pendingNext: ?*mut Owner
+}
+struct Reference {
+  state: *mut State,
+  next: ?*mut Reference,
+  value: Value,
+  count: usize
+}
+unsafe fn nn<T>(pointer: ?*mut T) -> *mut T {
+  return unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(pointer)
+}
+unsafe fn raw<T>(pointer: *mut T) -> *mut u8 {
+  return unsafe Intrinsic.pointerReinterpret<*mut T, *mut u8>(pointer)
+}
+unsafe fn cast<T>(pointer: ?*mut u8) -> *mut T {
+  return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut T>(unsafe nn(pointer))
+}
+effect fn allocate<T>() -> *mut T ! OutOfMemoryError {
+  let pointer = unsafe c.calloc(1, Layout.of<T>().bytes)
+  if Pointer.isNull<u8>(pointer) { fail OutOfMemoryError {} }
+  return unsafe cast<T>(pointer)
+}
+pub effect fn open(allocator: *mut RuntimeAllocator<SystemAllocator>) -> *mut State ! OutOfMemoryError {
+  let state = run allocate<State>()
+  unsafe Pointer.put<State>(state, State {
+    allocator: allocator, engine: Pointer.null<u8>(), context: Pointer.null<HeapHeader>(),
+    runtime: Pointer.null<HeapHeader>(), user: Pointer.null<u8>(), depth: 0,
+    classId: 0, gcClassId: 0, owners: 0, references: Pointer.null<Reference>(),
+    pending: Pointer.null<Owner>(), closed: false, destroyUser: Option<DestroyUser>.none()
+  })
+  return state
+}
+pub unsafe fn setUser(state: *mut State, user: ?*mut u8, destroy: DestroyUser) -> () {
+  let mut anchor = () let s = unsafe Pointer.borrowMut<(), State>(&mut anchor, state)
+  s.user = user s.destroyUser = Option<DestroyUser>.some(destroy)
+}
+unsafe effect fn installClass(rt: *mut HeapHeader, namespace: &ClassIdAllocator, gcObject: bool) -> u32 ! OutOfMemoryError ? &mut Allocator {
+  let mut cached: u32 = 0 let id = namespace.allocate(&mut cached)
+  let mut definition = definitions.emptyDefinition()
+  definition.mark = Option<NativeFunctionId>.some(NativeFunctionId.Host { id: MARK_ID })
+  definition.finalizer = Option<NativeFunctionId>.some(NativeFunctionId.Host { id: FINALIZE_ID })
+  if gcObject {
+    definition.exotic = Option<ExoticCallbacks>.some(ExoticCallbacks {
+      descriptor: NativeFunctionId.Host { id: GC_MUTATION_ID },
+      methodMask: EXOTIC_SET_PROPERTY | EXOTIC_DEFINE_OWN_PROPERTY
+    })
+  }
+  if !run unsafe registry.registerClassAtom(rt, id, atoms.JS_ATOM_Object, move definition) {
+    Intrinsic.trap("WebAssembly owner class registration failed")
+  }
+  return id
+}
+pub unsafe effect fn install(state: *mut State, rt: *mut HeapHeader, namespace: &ClassIdAllocator) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = () let s = unsafe Pointer.borrow<(), State>(&anchor, state)
+  let ordinary = s.classId let gcObject = s.gcClassId drop s
+  if ordinary == 0 {
+    let id = run unsafe installClass(rt, namespace, false)
+    let changed = unsafe Pointer.borrowMut<(), State>(&mut anchor, state)
+    changed.classId = id changed.runtime = rt
+  }
+  if gcObject == 0 {
+    let id = run unsafe installClass(rt, namespace, true)
+    let changed = unsafe Pointer.borrowMut<(), State>(&mut anchor, state)
+    changed.gcClassId = id
+  }
+}
+pub unsafe effect fn rejectGcMutation<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader) -> bool ! JsException ? &mut Allocator {
+  return run unsafe core.error(&mut engine, context, b"WebAssembly GC objects do not support JavaScript properties")
+}
+unsafe fn disposeIfClosed(state: *mut State) -> () {
+  let anchor = () let s = unsafe Pointer.borrow<(), State>(&anchor, state)
+  if !s.closed || s.depth != 0 || s.owners != 0 || !Pointer.isNull<Reference>(s.references) || !Pointer.isNull<Owner>(s.pending) { return () }
+  drop s
+  let owned = unsafe Pointer.take<State>(state)
+  match move owned.destroyUser {
+    Option<DestroyUser>.Some { value: destroy } => { unsafe destroy(owned.user) }
+    Option<DestroyUser>.None => ()
+  }
+  unsafe c.free(unsafe raw(state))
+}
+unsafe fn enterOptional<'m, S: EngineServices>(state: *mut State, engine: &mut Engine<'m, S>, context: ?*mut HeapHeader) -> Bridge {
+  let mut anchor = () let s = unsafe Pointer.borrowMut<(), State>(&mut anchor, state)
+  let saved = Bridge { engine: s.engine, context: s.context }
+  s.engine = unsafe raw(Pointer.fromMutRef<Engine<'m, S>>(&mut engine))
+  s.context = context s.depth = s.depth + 1
+  return move saved
+}
+pub unsafe fn enter<'m, S: EngineServices>(state: *mut State, engine: &mut Engine<'m, S>, context: *mut HeapHeader) -> Bridge {
+  return unsafe enterOptional(state, &mut engine, context)
+}
+pub unsafe fn leave(state: *mut State, saved: Bridge) -> () {
+  let mut anchor = () let s = unsafe Pointer.borrowMut<(), State>(&mut anchor, state)
+  s.engine = saved.engine s.context = saved.context s.depth = s.depth - 1 drop s
+  unsafe disposeIfClosed(state)
+}
+
+// Called before the C handle is published or receives any strong graph edges.
+// The C adapter must abandon the unpublished handle if this allocation fails.
+pub unsafe effect fn created<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, native: ?*mut u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  let anchor = () let s = unsafe Pointer.borrow<(), State>(&anchor, state)
+  if s.closed { Intrinsic.trap("creating WebAssembly owner after close") }
+  if Pointer.isNull<u8>(native) { Intrinsic.trap("null WebAssembly owner publication") }
+  let kind = unsafe c.silk_wasm_kind(native)
+  let id = if kind == 8 { s.gcClassId } else { s.classId } drop s
+  if id == 0 || !Pointer.isNull<u8>(unsafe c.silk_wasm_get_host(native)) { Intrinsic.trap("invalid WebAssembly owner publication") }
+  let owner = run allocate<Owner>()
+  let memory = engine.memory
+  let allocated = run Effect.result(unsafe objects.withPrototypeClass(&mut engine, memory, context, Value.Null, id))
+  let value = match move allocated {
+    Result<Value, OutOfMemoryError>.Success { value } => value
+    Result<Value, OutOfMemoryError>.Failure { error } => { unsafe c.free(unsafe raw(owner)) fail move error }
+  }
+  let object = core.reference(value)
+  let mut changed = () let changedState = unsafe Pointer.borrowMut<(), State>(&mut changed, state)
+  unsafe Pointer.put<Owner>(owner, Owner { state: state, object: object, native: native,
+    kind: kind, buffer: Value.Undefined, pendingNext: changedState.pending })
+  changedState.pending = owner changedState.owners = changedState.owners + 1 drop changedState
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut changed, object)
+  data.payload = ObjectPayload.HostOpaque { data: unsafe raw(owner) }
+  if kind == 8 { data.extensible = false data.isExotic = true }
+  drop data
+  unsafe c.silk_wasm_set_host(native, unsafe raw(owner))
+}
+pub unsafe effect fn makeOwner<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, kind: u32, native: ?*mut u8) -> Value ! OutOfMemoryError ? &mut Allocator {
+  if Pointer.isNull<u8>(native) { Intrinsic.trap("null WebAssembly handle") }
+  let pointer = unsafe c.silk_wasm_get_host(native)
+  if Pointer.isNull<u8>(pointer) { Intrinsic.trap("unpublished WebAssembly handle") }
+  let anchor = () let owner = unsafe Pointer.borrow<(), Owner>(&anchor, unsafe cast<Owner>(pointer))
+  if Pointer.address<State>(owner.state) != Pointer.address<State>(state) || owner.kind != kind { Intrinsic.trap("foreign WebAssembly owner") }
+  return unsafe (Value.Object { reference: owner.object }).retained()
+}
+pub unsafe fn getNative(state: *mut State, value: Value, kind: u32) -> ?*mut u8 {
+  let anchor = () let s = unsafe Pointer.borrow<(), State>(&anchor, state)
+  let id = if kind == 8 { s.gcClassId } else { s.classId }
+  if s.closed || id == 0 || unsafe registry.getClassId(value) != id { return Pointer.null<u8>() }
+  drop s
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(value))
+  let pointer = match &object.payload { ObjectPayload.HostOpaque { data } => data _ => Pointer.null<u8>() } drop object
+  if Pointer.isNull<u8>(pointer) { return Pointer.null<u8>() }
+  let owner = unsafe Pointer.borrow<(), Owner>(&anchor, unsafe cast<Owner>(pointer))
+  if Pointer.address<State>(owner.state) != Pointer.address<State>(state) || owner.kind != kind { return Pointer.null<u8>() }
+  return owner.native
+}
+pub unsafe fn retainHandle(native: ?*mut u8) -> () {
+  if Pointer.isNull<u8>(native) { return () }
+  let pointer = unsafe c.silk_wasm_get_host(native)
+  if Pointer.isNull<u8>(pointer) { Intrinsic.trap("retaining unpublished WebAssembly handle") }
+  let anchor = () let owner = unsafe Pointer.borrow<(), Owner>(&anchor, unsafe cast<Owner>(pointer))
+  unsafe HeapCell.retain(owner.object)
+}
+pub unsafe fn releaseHandle<'m, S: EngineServices>(engine: &mut Engine<'m, S>, rt: *mut HeapHeader, native: ?*mut u8) -> () {
+  if Pointer.isNull<u8>(native) { return () }
+  let pointer = unsafe c.silk_wasm_get_host(native)
+  // During cycle finalization the target may already have removed its host slot.
+  if Pointer.isNull<u8>(pointer) { return () }
+  let anchor = () let owner = unsafe Pointer.borrow<(), Owner>(&anchor, unsafe cast<Owner>(pointer))
+  let value = Value.Object { reference: owner.object } drop owner
+  unsafe gc.release(&mut engine, rt, value)
+}
+pub unsafe fn drain<'m, S: EngineServices>(engine: &mut Engine<'m, S>, rt: *mut HeapHeader, state: *mut State) -> () {
+  let mut anchor = ()
+  while true {
+    let s = unsafe Pointer.borrowMut<(), State>(&mut anchor, state)
+    if Pointer.isNull<Owner>(s.pending) { return () }
+    let pointer = unsafe nn(s.pending) drop s
+    let owner = unsafe Pointer.borrowMut<(), Owner>(&mut anchor, pointer)
+    let next = owner.pendingNext let value = Value.Object { reference: owner.object }
+    owner.pendingNext = Pointer.null<Owner>() drop owner
+    let changed = unsafe Pointer.borrowMut<(), State>(&mut anchor, state)
+    changed.pending = next drop changed
+    unsafe gc.release(&mut engine, rt, value)
+  }
+}
+
+// Each token count corresponds to exactly one retained Value. The identity list
+// owns no extra reference; native visitors report every owning occurrence.
+pub unsafe effect fn reference(state: *mut State, value: Value) -> ?*mut u8 ! OutOfMemoryError {
+  let mut anchor = () let s = unsafe Pointer.borrow<(), State>(&anchor, state)
+  let mut cursor = s.references drop s
+  while !Pointer.isNull<Reference>(cursor) {
+    let node = unsafe Pointer.borrowMut<(), Reference>(&mut anchor, unsafe nn(cursor))
+    if unsafe core.sameValue(node.value, value) {
+      // Equal strings can have different allocations; the token releases node.value.
+      node.count = node.count + 1 let retained = unsafe node.value.retained()
+      return unsafe raw(unsafe nn(cursor))
+    }
+    cursor = node.next
+  }
+  let pointer = run allocate<Reference>()
+  let changedState = unsafe Pointer.borrowMut<(), State>(&mut anchor, state)
+  unsafe Pointer.put<Reference>(pointer, Reference { state: state, next: changedState.references, value: unsafe value.retained(), count: 1 })
+  changedState.references = pointer
+  return unsafe raw(pointer)
+}
+pub unsafe fn referenceValue(token: ?*mut u8) -> Value {
+  if Pointer.isNull<u8>(token) { return Value.Null }
+  let anchor = () let node = unsafe Pointer.borrow<(), Reference>(&anchor, unsafe cast<Reference>(token)) return node.value
+}
+pub unsafe fn retainReference(token: ?*mut u8) -> () {
+  if Pointer.isNull<u8>(token) { return () }
+  let mut anchor = () let node = unsafe Pointer.borrowMut<(), Reference>(&mut anchor, unsafe cast<Reference>(token))
+  node.count = node.count + 1 let retained = unsafe node.value.retained()
+}
+pub unsafe fn releaseReference<'m, S: EngineServices>(engine: &mut Engine<'m, S>, rt: *mut HeapHeader, token: ?*mut u8) -> () {
+  if Pointer.isNull<u8>(token) { return () }
+  let pointer = unsafe cast<Reference>(token)
+  let mut anchor = () let node = unsafe Pointer.borrowMut<(), Reference>(&mut anchor, pointer)
+  let state = node.state let value = node.value
+  node.count = node.count - 1 let last = node.count == 0 let next = node.next drop node
+  let saved = unsafe enterOptional(state, &mut engine, Pointer.null<HeapHeader>())
+  if last {
+    let s = unsafe Pointer.borrowMut<(), State>(&mut anchor, state)
+    let mut link = Pointer.fromMutRef<?*mut Reference>(&mut s.references) drop s
+    while Pointer.address<Reference>(unsafe Pointer.read<?*mut Reference>(link)) != Pointer.address<Reference>(pointer) {
+      let current = unsafe nn(unsafe Pointer.read<?*mut Reference>(link))
+      let entry = unsafe Pointer.borrowMut<(), Reference>(&mut anchor, current)
+      link = Pointer.fromMutRef<?*mut Reference>(&mut entry.next)
+    }
+    unsafe Pointer.put<?*mut Reference>(link, next)
+    let removed = unsafe Pointer.take<Reference>(pointer) drop removed
+    unsafe c.free(token)
+  }
+  unsafe gc.release(&mut engine, rt, value)
+  unsafe leave(state, move saved)
+}
+
+export "C" fn silkWasmOwnershipVisitHandle(opaque: ?*mut u8, native: ?*mut u8) -> () {
+  if Pointer.isNull<u8>(native) { return () }
+  let pointer = unsafe c.silk_wasm_get_host(native)
+  if Pointer.isNull<u8>(pointer) { Intrinsic.trap("unpublished edge in WebAssembly graph") }
+  let anchor = () let owner = unsafe Pointer.borrow<(), Owner>(&anchor, unsafe cast<Owner>(pointer))
+  let object = owner.object drop owner
+  let mut changed = () let tracer = unsafe Pointer.borrowMut<(), Tracer>(&mut changed, unsafe cast<Tracer>(opaque))
+  unsafe tracer.header(object)
+}
+export "C" fn silkWasmOwnershipVisitReference(opaque: ?*mut u8, token: ?*mut u8) -> () {
+  if Pointer.isNull<u8>(token) { return () }
+  let value = unsafe referenceValue(token)
+  let mut anchor = () let tracer = unsafe Pointer.borrowMut<(), Tracer>(&mut anchor, unsafe cast<Tracer>(opaque))
+  unsafe tracer.value(value)
+}
+pub unsafe fn mark(rt: *mut HeapHeader, object: *mut HeapHeader, tracer: &mut Tracer) -> () {
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  let pointer = match &data.payload { ObjectPayload.HostOpaque { data: opaque } => opaque _ => Pointer.null<u8>() } drop data
+  if Pointer.isNull<u8>(pointer) { return () }
+  let owner = unsafe Pointer.borrow<(), Owner>(&anchor, unsafe cast<Owner>(pointer))
+  let native = owner.native let buffer = owner.buffer drop owner
+  unsafe tracer.value(buffer)
+  unsafe c.silk_wasm_visit(native, silkWasmOwnershipVisitHandle, silkWasmOwnershipVisitReference, unsafe raw(Pointer.fromMutRef<Tracer>(&mut tracer)))
+}
+pub unsafe fn cachedBuffer(native: ?*mut u8) -> Value {
+  let pointer = unsafe c.silk_wasm_get_host(native)
+  if Pointer.isNull<u8>(pointer) { return Value.Undefined }
+  let anchor = () let owner = unsafe Pointer.borrow<(), Owner>(&anchor, unsafe cast<Owner>(pointer)) return owner.buffer
+}
+pub unsafe fn replaceBuffer<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, native: ?*mut u8, value: Value) -> () {
+  let mut anchor = () let owner = unsafe Pointer.borrowMut<(), Owner>(&mut anchor, unsafe cast<Owner>(unsafe c.silk_wasm_get_host(native)))
+  let previous = Intrinsic.replace(owner.buffer, unsafe value.retained()) drop owner
+  unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), previous)
+}
+pub unsafe fn finalize<'m, S: EngineServices>(engine: &mut Engine<'m, S>, rt: *mut HeapHeader, object: *mut HeapHeader) -> () {
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, object)
+  let payload = Intrinsic.replace(data.payload, ObjectPayload.Empty) drop data
+  let pointer = match move payload { ObjectPayload.HostOpaque { data: opaque } => opaque _ => Pointer.null<u8>() }
+  if Pointer.isNull<u8>(pointer) { return () }
+  let owner = unsafe Pointer.take<Owner>(unsafe cast<Owner>(pointer))
+  let state = owner.state
+  let saved = unsafe enterOptional(state, &mut engine, Pointer.null<HeapHeader>())
+  unsafe c.silk_wasm_set_host(owner.native, Pointer.null<u8>())
+  unsafe c.silk_wasm_free(owner.native)
+  unsafe gc.release(&mut engine, rt, owner.buffer)
+  unsafe c.free(pointer)
+  let s = unsafe Pointer.borrowMut<(), State>(&mut anchor, state)
+  s.owners = s.owners - 1 drop s
+  unsafe leave(state, move saved)
+}
+pub unsafe fn close<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State) -> () {
+  let saved = unsafe enter(state, &mut engine, context)
+  unsafe drain(&mut engine, unsafe runtime.contextRuntime(context), state)
+  let mut anchor = () let s = unsafe Pointer.borrowMut<(), State>(&mut anchor, state)
+  s.closed = true drop s
+  unsafe leave(state, move saved)
+}
+
+// Clone the native serialized module envelope, including compilation options,
+// never its realm-local owner. The span is borrowed until the source owner is
+// released; deserialization publishes a fresh destination-store owner.
+pub unsafe fn moduleBytes(state: *mut State, module: Value, length: *mut u64) -> ?*const u8 {
+  let native = unsafe getNative(state, module, 0)
+  if Pointer.isNull<u8>(native) { unsafe Pointer.put<u64>(length, 0) return Pointer.null<u8>() }
+  return unsafe c.silk_wasm_module_serialize(native, length)
+}
+pub unsafe fn cloneModule(destinationStore: ?*mut u8, bytes: ?*const u8, length: u64) -> ?*mut u8 {
+  return unsafe c.silk_wasm_module_deserialize(destinationStore, bytes, length)
+}
+// Backing leases contain native allocation state only. These operations never
+// transfer a State, Owner, Reference, Engine, or HeapHeader across runtimes.
+pub unsafe fn retainSharedLease(backing: ?*mut u8) -> () { unsafe c.silk_wasm_backing_retain(backing) }
+pub unsafe fn releaseSharedLease(backing: ?*mut u8) -> () { unsafe c.silk_wasm_backing_release(backing) }

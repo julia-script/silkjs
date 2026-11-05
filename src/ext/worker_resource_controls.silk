@@ -1,0 +1,89 @@
+//! Allocation-free, cross-thread CPU snapshots. The registry lock protects the
+//! native handle from retirement while a parent samples it. These are thread,
+//! never process, counters; an unavailable OS counter is an error, not a zero.
+import silk.mem.pointer { Pointer }
+import silk.core.ownership { Copy }
+import silk.num.i32
+import silk.num.isize
+import silk.num.usize
+import silk.num.u32
+import silk.num.u8
+
+unsafe extern "C" fn mach_thread_self() -> u32
+unsafe extern "C" static mach_task_self_: u32
+unsafe extern "C" fn mach_port_deallocate(task: u32, name: u32) -> i32
+unsafe extern "C" fn thread_info(thread: u32, flavor: i32, info: *mut i32, count: *mut u32) -> i32 with Intrinsic.foreign(noCapture: ("info", "count"))
+unsafe extern "C" fn open(path: *const u8, flags: i32, ...) -> i32 with Intrinsic.foreign(noCapture: ("path",))
+unsafe extern "C" fn pread(fd: i32, buffer: *mut u8, count: usize, offset: i64) -> isize with Intrinsic.foreign(noCapture: ("buffer",))
+unsafe extern "C" fn close(fd: i32) -> i32
+unsafe extern "C" fn sysconf(name: i32) -> isize
+
+pub struct Cpu { pub handle: usize, pub microsPerTick: f64 }
+impl Copy for Cpu {}
+pub struct Usage { pub available: bool, pub user: f64, pub system: f64 }
+impl Copy for Usage {}
+impl Cpu {
+  pub fn empty() -> Self { return Self { handle: 0, microsPerTick: 0.0 } }
+  // Called by the worker itself, before it announces online.
+  pub unsafe fn current() -> Self {
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      return Self { handle: u32.toUsize(unsafe mach_thread_self()), microsPerTick: 0.0 }
+    } else {
+      static if Intrinsic.targetOperatingSystem() == "linux" {
+        let ticks = unsafe sysconf(2) // _SC_CLK_TCK on Linux.
+        if ticks <= 0 { return Self.empty() }
+        let fd = unsafe open(Pointer.fromRef<u8>(&b"/proc/thread-self/stat\0"[0]), 524288) // O_CLOEXEC
+        if fd < 0 { return Self.empty() }
+        return Self { handle: i32.toUsize(fd) + 1, microsPerTick: 1000000.0 / isize.toF64(ticks) }
+      } else { return Self.empty() }
+    }
+  }
+  pub unsafe fn release(self: &mut Self) -> () {
+    if self.handle == 0 { return () }
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      unsafe { let ignored = mach_port_deallocate(mach_task_self_, usize.toU32(self.handle)) }
+    } else {
+      static if Intrinsic.targetOperatingSystem() == "linux" { let ignored = unsafe close(usize.toI32(self.handle - 1)) }
+    }
+    self.handle = 0
+  }
+  pub unsafe fn sample(self: &Self) -> Usage {
+    let missing = Usage { available: false, user: 0.0, system: 0.0 }
+    if self.handle == 0 { return missing }
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      // THREAD_BASIC_INFO: two time_value_t pairs followed by six integer fields.
+      let mut info: [i32; 10] = [0; 10] let mut count: u32 = 10
+      if unsafe thread_info(usize.toU32(self.handle), 3, Pointer.fromMutRef<i32>(&mut info[0]), Pointer.fromMutRef<u32>(&mut count)) != 0 || count < 4 { return missing }
+      return Usage { available: true, user: i32.toF64(info[0]) * 1000000.0 + i32.toF64(info[1]), system: i32.toF64(info[2]) * 1000000.0 + i32.toF64(info[3]) }
+    } else {
+      static if Intrinsic.targetOperatingSystem() == "linux" {
+        // The open procfs inode pins the task identity, not a reusable numeric TID.
+        // Fields 14/15 are a single kernel snapshot in clock ticks. comm can
+        // contain spaces and ')', so locate the final ')' before counting fields.
+        let mut bytes: [u8; 4096] = [0; 4096]
+        let length = unsafe pread(usize.toI32(self.handle - 1), Pointer.fromMutRef<u8>(&mut bytes[0]), 4096, 0)
+        if length <= 0 || length >= 4096 { return missing }
+        let count = isize.toUsize(length) let mut start: usize = 0 let mut at: usize = 0
+        while at < count { if bytes[at] == 41 { start = at + 1 } at = at + 1 }
+        if start == 0 { return missing }
+        at = start let mut field: u32 = 3 let mut user: f64 = 0.0 let mut system: f64 = 0.0
+        while field <= 15 {
+          while at < count && bytes[at] == 32 { at = at + 1 }
+          if at == count { return missing }
+          let begin = at
+          while at < count && bytes[at] != 32 && bytes[at] != 10 { at = at + 1 }
+          if field == 14 || field == 15 {
+            let mut digit = begin let mut value: f64 = 0.0
+            while digit < at {
+              if bytes[digit] < 48 || bytes[digit] > 57 { return missing }
+              value = value * 10.0 + u8.toF64(bytes[digit] - 48) digit = digit + 1
+            }
+            if field == 14 { user = value } else { system = value }
+          }
+          field = field + 1
+        }
+        return Usage { available: true, user: user * self.microsPerTick, system: system * self.microsPerTick }
+      } else { return missing }
+    }
+  }
+}

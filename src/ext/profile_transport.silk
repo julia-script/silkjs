@@ -1,0 +1,249 @@
+//! Worker profile requests are copied numeric packets, never JS pointers.
+//! Channel 2 requests, channel 3 replies. The owner services requests at native VM
+//! control/interrupt boundaries, even when guest JS never returns to its event loop.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.collections.list { List }
+import silk.num.usize
+import silk.num.u64
+import silk.num.u8
+import silk.num.u32
+import silk.num.i32
+import silk.num.f64
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_heap { HeapHeader }
+import silkjs.js_core_types { FrameSlots }
+import silkjs.js_value { Value }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_runtime as runtime
+import silkjs.js_cpu_profile as cpu
+import silkjs.js_cpu_profile { Profile }
+import silkjs.js_cpu_profile_json as cpuJson
+import silkjs.js_allocation_profile as allocation
+import silkjs.js_allocation_profile_json as allocationJson
+import silkjs.runtime_allocation_profile { Recording }
+import silkjs.js_heap_snapshot as heap
+import silkjs.js_heap_snapshot { BusyHeap }
+import silkjs.js_heap_snapshot_graph { Strength }
+import ext.profile_heap_json as heapJson
+import ext.profile_heap_json { SnapshotFormatError }
+import silkjs.js_object_allocate as objects
+import silkjs.js_collection_support { Scope }
+import silkjs.js_collection_support as owners
+import silkjs.js_buffer_storage as buffers
+import silkjs.js_intl_common as common
+import silkjs.js_std_support as text
+import ext.process_diagnostics as diagnostics
+
+unsafe extern "C" fn silk_diagnostics_post(target: u32, channel: u32, bytes: *const u8, length: usize) -> i32 with Intrinsic.foreign(noCapture: ("bytes",))
+unsafe extern "C" fn silk_diagnostics_post_parts(target: u32, channel: u32, prefix: *const u8, prefixLength: usize, bytes: *const u8, length: usize) -> i32 with Intrinsic.foreign(noCapture: ("prefix", "bytes"))
+unsafe extern "C" fn silk_diagnostics_take(channel: u32, length: *mut usize) -> ?*mut u8 with Intrinsic.foreign(noCapture: ("length",))
+unsafe extern "C" fn silk_diagnostics_message_pending(channel: u32) -> i32
+unsafe extern "C" fn silk_diagnostics_release(bytes: *mut u8) -> ()
+
+fn numeric(value: Value, maximum: f64) -> Option<u64> {
+  if !value.isNumber() { return Option<u64>.none() }
+  let n = value.numericValue()
+  if !(n >= 0.0) || n > maximum { return Option<u64>.none() }
+  let integer = f64.toU64(n)
+  if u64.toF64(integer) != n { return Option<u64>.none() }
+  return Option<u64>.some(integer)
+}
+pub unsafe fn request(argv: &FrameSlots) -> Value {
+  let mut fields: [u64; 5] = [0; 5]
+  let mut i: usize = 0
+  while i < 5 {
+    let value = unsafe common.argument(argv, i)
+    if i >= 3 && (match value { Value.Undefined => true _ => false }) { fields[i] = 0 }
+    else {
+      fields[i] = match numeric(value, 4294967295.0) {
+        Option<u64>.Some { value: number } => number
+        _ => { return Value.Int { value: 22 } }
+      }
+    }
+    i = i + 1
+  }
+  if fields[2] > 5 { return Value.Int { value: 22 } }
+  let words: [u64; 5] = [u32.toU64(unsafe diagnostics.silk_diagnostics_owner_id()), fields[1], fields[2], fields[3], fields[4]]
+  let mut packet: [u8; 40] = [0; 40]
+  i = 0
+  while i < 5 {
+    let mut byte: usize = 0
+    while byte < 8 {
+      packet[i * 8 + byte] = u64.toU8(u64.shiftRight(words[i], usize.toU64(byte * 8)) & 255)
+      byte = byte + 1
+    }
+    i = i + 1
+  }
+  return Value.Int { value: unsafe silk_diagnostics_post(u64.toU32(fields[0]), 2, Pointer.fromRef(&packet[0]), 40) }
+}
+unsafe fn packetWord(data: *const u8, offset: usize) -> u64 {
+  let bytes = unsafe Pointer.assumeMany<u8>(data)
+  let mut result: u64 = 0 let mut i: usize = 0
+  while i < 8 {
+    let byte = unsafe Pointer.read(unsafe Pointer.at(bytes, offset + i))
+    result = result | u64.shiftLeft(u8.toU64(byte), usize.toU64(i * 8))
+    i = i + 1
+  }
+  return result
+}
+unsafe effect fn replyValue<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  pointer: *mut u8, length: usize, scope: &mut Scope) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  let memory = engine.memory
+  scope.values[0] = run unsafe objects.withPrototype(&mut engine, memory, context, Value.Null)
+  let out = scope.values[0]
+  run unsafe common.define(&mut engine, context, out, b"id", Value.number(u64.toF64(unsafe packetWord(pointer, 0))), 7)
+  run unsafe common.define(&mut engine, context, out, b"status", Value.number(u64.toF64(unsafe packetWord(pointer, 8))), 7)
+  run unsafe common.define(&mut engine, context, out, b"encoding", Value.number(u64.toF64(unsafe packetWord(pointer, 16))), 7)
+  let bytes = unsafe Pointer.assumeMany<u8>(pointer)
+  let payload = run unsafe text.stringPointer(&mut engine, context, unsafe Pointer.at(bytes, 24), length - 24)
+  run unsafe common.define(&mut engine, context, out, b"data", payload, 7)
+  return scope.take(0)
+}
+pub unsafe effect fn poll<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader)
+  -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut length: usize = 0
+  let optional = unsafe silk_diagnostics_take(3, Pointer.fromMutRef(&mut length))
+  let pointer = match Pointer.nonNullMut(optional) {
+    Option<*mut u8>.Some { value } => value
+    _ => { return Value.Null }
+  }
+  if length < 24 { unsafe silk_diagnostics_release(pointer) return Value.Null }
+  let mut scope = Scope.make()
+  let result = run Effect.result(unsafe replyValue(&mut engine, context, pointer, length, &mut scope))
+  unsafe silk_diagnostics_release(pointer)
+  unsafe owners.cleanup(&mut engine, context, move scope)
+  return match move result {
+    Result<Value, OutOfMemoryError | JsException>.Success { value } => value
+    Result<Value, OutOfMemoryError | JsException>.Failure { error } => { fail move error }
+  }
+}
+effect fn literal(bytes: &[u8]) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<u8>.make() let mut i: usize = 0
+  while i < bytes.length { run out.append(bytes[i]) i = i + 1 }
+  return move out
+}
+unsafe effect fn capture<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  op: u64, first: u64, second: u64) -> List<u8> ! OutOfMemoryError | BusyHeap | SnapshotFormatError ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  if op == 0 {
+    let interval = if first == 0 { 1000 } else { u64.toI64(first) }
+    let capacity = if second == 0 { 16384 } else { u64.toUsize(second) }
+    let started = run unsafe cpu.start(rt, interval, capacity, 1048576, 16384)
+    return run literal(if started { b"true" } else { b"false" })
+  }
+  if op == 1 {
+    let value = match run unsafe cpu.stop(rt) {
+      Option<Profile>.Some { value } => move value
+      _ => { return run literal(b"null") }
+    }
+    return run cpuJson.encode(&value)
+  }
+  if op == 2 {
+    let interval = if first == 0 { 32768 } else { u64.toUsize(first) }
+    let capacity = if second == 0 { 2048 } else { u64.toUsize(second) }
+    if interval > 1073741824 || capacity > 16384 { return run literal(b"false") }
+    let started = run unsafe allocation.start(engine.memory, rt, capacity, interval)
+    return run literal(if started { b"true" } else { b"false" })
+  }
+  if op == 3 {
+    let value = match engine.memory.stopProfile() {
+      Option<Recording>.Some { value } => move value
+      _ => { return run literal(b"null") }
+    }
+    return run allocationJson.encode(&value)
+  }
+  if op == 5 { return run unsafe metrics(&mut engine, context) }
+  let mut graph = run unsafe heap.snapshot(rt, &[])
+  run unsafe graph.edge(0, context, b"root.embeddingContext", 0, Strength.Strong, usize.MAX)
+  run unsafe heap.identify(&mut graph, engine.memory)
+  return run heapJson.encode(&graph)
+}
+fn appendText(out: &mut [u8], at: &mut usize, bytes: &[u8]) -> () {
+  let mut i: usize = 0 while i < bytes.length { out[at.*] = bytes[i] at.* = at.* + 1 i = i + 1 }
+}
+fn appendNumber(out: &mut [u8], at: &mut usize, number: u64) -> () {
+  let mut digits: [u8; 20] = [0; 20] let mut index: usize = 20 let mut n = number
+  while true { index = index - 1 digits[index] = 48 + u64.toU8(n % 10) n = n / 10 if n == 0 { break } }
+  while index < 20 { out[at.*] = digits[index] at.* = at.* + 1 index = index + 1 }
+}
+/// Actual Silk allocation charges and buffer backing only; no V8 spaces or
+/// fictitious committed/reserved capacity. Unlimited budget is represented null.
+pub unsafe effect fn metrics<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader)
+  -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let stats = engine.memory.stats()
+  let backing = run unsafe buffers.backingUsage(unsafe runtime.contextRuntime(context))
+  let heapBytes = stats.usedBytes - backing.nativeBytes
+  let mut data: [u8; 512] = [0; 512] let mut at: usize = 0
+  appendText(&mut data, &mut at, b"{\"heapTotal\":") appendNumber(&mut data, &mut at, usize.toU64(heapBytes))
+  appendText(&mut data, &mut at, b",\"heapUsed\":") appendNumber(&mut data, &mut at, usize.toU64(heapBytes))
+  appendText(&mut data, &mut at, b",\"external\":") appendNumber(&mut data, &mut at, usize.toU64(backing.bytes))
+  appendText(&mut data, &mut at, b",\"arrayBuffers\":") appendNumber(&mut data, &mut at, usize.toU64(backing.bytes))
+  appendText(&mut data, &mut at, b",\"silk\":{\"allocatorUsedBytes\":") appendNumber(&mut data, &mut at, usize.toU64(stats.usedBytes))
+  appendText(&mut data, &mut at, b",\"allocatorPeakBytes\":") appendNumber(&mut data, &mut at, usize.toU64(stats.peakBytes))
+  appendText(&mut data, &mut at, b",\"allocationCount\":") appendNumber(&mut data, &mut at, usize.toU64(stats.allocationCount))
+  appendText(&mut data, &mut at, b",\"limitBytes\":")
+  if stats.limit == usize.MAX { appendText(&mut data, &mut at, b"null") }
+  else { appendNumber(&mut data, &mut at, usize.toU64(stats.limit)) }
+  appendText(&mut data, &mut at, b"}}")
+  let mut result = List<u8>.make() let mut index: usize = 0
+  while index < at { run result.append(data[index]) index = index + 1 }
+  return move result
+}
+// Binary reply header: little-endian u64 request ID, errno, encoding.
+// Encoding 0 is an ordinary JSON result; 1 is final DevTools snapshot JSON text.
+// Separating framing from payload avoids escaping or parsing a giant JSON string.
+unsafe fn reply(target: u32, id: u64, status: u64, encoding: u64, payload: &[u8]) -> () {
+  let words: [u64; 3] = [id, status, encoding]
+  let mut prefix: [u8; 24] = [0; 24]
+  let mut i: usize = 0
+  while i < 3 {
+    let mut byte: usize = 0
+    while byte < 8 {
+      prefix[i * 8 + byte] = u64.toU8(u64.shiftRight(words[i], usize.toU64(byte * 8)) & 255)
+      byte = byte + 1
+    }
+    i = i + 1
+  }
+  let ignored = unsafe silk_diagnostics_post_parts(target, 3, Pointer.fromRef(&prefix[0]), 24,
+    Pointer.fromRef(&payload[0]), payload.length)
+}
+/// Errors are replied to the requester, never injected into interrupted guest JS.
+/// No borrowed engine.services or user callback is retained during capture.
+pub unsafe effect fn pump<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader) -> () {
+  if unsafe silk_diagnostics_message_pending(2) == 0 { return }
+  let mut system = Allocator.systemAllocatorProvider()
+  let mut count: usize = 0
+  while count < 16 {
+    let mut length: usize = 0
+    let optional = unsafe silk_diagnostics_take(2, Pointer.fromMutRef(&mut length))
+    let pointer = match Pointer.nonNullMut(optional) { Option<*mut u8>.Some { value } => value _ => { return } }
+    if length != 40 { unsafe silk_diagnostics_release(pointer) continue }
+    let source = unsafe packetWord(pointer, 0)
+    let id = unsafe packetWord(pointer, 8)
+    let op = unsafe packetWord(pointer, 16)
+    let first = unsafe packetWord(pointer, 24)
+    let second = unsafe packetWord(pointer, 32)
+    unsafe silk_diagnostics_release(pointer)
+    if source > 4294967295 || id > 4294967295 || op > 5 {
+      if source <= 4294967295 { unsafe reply(u64.toU32(source), id, 22, 0, b"null") }
+    } else {
+      let result = run Effect.result(unsafe capture(&mut engine, context, op, first, second))
+        |> Effect.provideMut<Allocator>(&mut system)
+      match move result {
+        Result<List<u8>, OutOfMemoryError | BusyHeap | SnapshotFormatError>.Success { value } => {
+          unsafe reply(u64.toU32(source), id, 0, if op == 4 { 1 } else { 0 }, value.asSlice())
+        }
+        Result<List<u8>, OutOfMemoryError | BusyHeap | SnapshotFormatError>.Failure { error } => {
+          let code: u64 = match move error { OutOfMemoryError {} => 12 BusyHeap {} => 16 SnapshotFormatError {} => 22 }
+          unsafe reply(u64.toU32(source), id, code, 0, b"null")
+        }
+      }
+    }
+    count = count + 1
+  }
+}

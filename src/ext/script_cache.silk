@@ -1,0 +1,546 @@
+//! Runtime-only cache envelope; the engine's QuickJS wire format stays unchanged.
+//! Actual bytecode is followed by source text/directives, preorder function
+//! metadata and a 32-byte footer: "SILKSC04", bytecode length, metadata length,
+//! function count (all integers LE u64). Each of three text fields has a tag
+//! (0=absent, 1=Latin1, 2=UTF16LE), then non-absent unit count:u64 and units.
+//! Function records contain flags:u8, code/constant/map lengths:u64,
+//! line/column/wrapper offsets:u64, debugger sidecar length:u64, then maps.
+//! Flags: eval=1, debug=2, call-site map=4, Node VM coordinates=8, debugger=16.
+//! Disk caches never contain runtime script IDs. Clones preserve them directly.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.i32
+import silk.num.usize
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_heap { HeapCell, HeapHeader }
+import silkjs.js_core_types { FunctionBytecode, FunctionDebugInfo, ByteStorage, NativeErrorKind, RuntimeState, ModuleDef }
+import silkjs.js_value { Value }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_string_types { StringLengthError }
+import silkjs.js_proxy_core as core
+import silkjs.js_coercion_host { CoercionHooks }
+import silkjs.js_binary_object_writer as writer
+import silkjs.js_binary_object_reader as reader
+import silkjs.js_debug_positions as positions
+import silkjs.js_runtime as runtime
+import silkjs.js_gc as gc
+import silkjs.native_stack as stack
+import silkjs.js_strings { Strings, StringBuilder }
+import silkjs.js_string_rope { RopeIterator }
+import silkjs.js_collection_support { Scope }
+import silkjs.js_collection_support as owners
+import silkjs.js_intl_common as common
+import ext.script_metadata as scripts
+import silkjs.byte_buffer { ByteBuffer, readU32 }
+import silkjs.js_debugger_metadata { Metadata, InvalidMetadata }
+import silkjs.js_debugger_metadata as debuggerMetadata
+import silkjs.js_coverage as coverage
+
+unsafe fn storageBytes(storage: &ByteStorage) -> &[u8] {
+  return match &storage.* {
+    ByteStorage.Owned { bytes } => bytes.asSlice()
+    ByteStorage.Borrowed { data, length } => unsafe Intrinsic.pointerBorrowMany<ByteStorage, u8>(storage, unsafe Pointer.assumeMany<u8>(data), length)
+  }
+}
+effect fn validDebuggerBindings(code: &FunctionBytecode, metadata: &Metadata) -> bool
+  ! OutOfMemoryError ? &mut Allocator {
+  if metadata.closureScopes.length() != code.closureVars.length() { return false }
+  let arguments = u16.toUsize(code.argumentCount)
+  let variables = u16.toUsize(code.variableCount)
+  if code.varDefs.length() != arguments + variables { return false }
+  let mut slots = List<bool>.make()
+  run slots.reserveExact(u16.toUsize(code.varRefCount))
+  while slots.length() < u16.toUsize(code.varRefCount) { run slots.append(false) }
+  let mut index: usize = 0
+  while index < code.varDefs.length() {
+    let definition = code.varDefs.get(index)
+    let slot = u16.toUsize(definition.varRefIndex)
+    if !definition.isCaptured || slot >= slots.length() || slots.get(slot) { return false }
+    slots.set(slot, true)
+    if index >= arguments {
+      let next = definition.scopeNext
+      if next < -2 || (next >= 0 && i32.toUsize(next) >= variables) { return false }
+    }
+    index = index + 1
+  }
+  // addEvalVariables appends pseudo-bindings after recomputeScopeLinks. Their
+  // unused scopeNext can be zero (including self), but no scope head reaches
+  // them. Validate traversable chains, not unused compiler storage.
+  index = 0
+  while index < variables { slots.set(index, false) index = index + 1 }
+  let mut scopeIndex: usize = 0
+  while scopeIndex < metadata.scopes.length() {
+    let mut current = metadata.scopes.get(scopeIndex).first
+    while current >= 0 {
+      let local = i32.toUsize(current)
+      if slots.get(local) { break }
+      slots.set(local, true)
+      let next = code.varDefs.get(arguments + local).scopeNext
+      if next >= 0 {
+        let nextIndex = i32.toUsize(next)
+        let scope = metadata.localScopes.get(local)
+        let target = metadata.localScopes.get(nextIndex)
+        if scope == target {
+          if nextIndex >= local { return false }
+        } else {
+          let mut ancestor = metadata.scopes.get(i32.toUsize(scope)).parent
+          while ancestor >= 0 && ancestor != target { ancestor = metadata.scopes.get(i32.toUsize(ancestor)).parent }
+          if ancestor < 0 { return false }
+        }
+      }
+      current = next
+    }
+    scopeIndex = scopeIndex + 1
+  }
+  return true
+}
+
+struct Cursor { data: *const u8, position: usize, end: usize, remaining: usize }
+fn reference(value: Value) -> *mut HeapHeader {
+  return match value { Value.FunctionBytecode { reference } => reference _ => Intrinsic.trap("script cache bytecode invariant") }
+}
+pub unsafe fn moduleCode(value: Value) -> Value {
+  if let Value.Module { reference } = value {
+    let anchor = () let module = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, reference)
+    return module.functionObject
+  }
+  return value
+}
+effect fn invalid<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader) -> never ! JsException ? &mut Allocator {
+  return run unsafe engine.throwError(context, NativeErrorKind.Syntax, b"Invalid Silk script cache metadata")
+}
+effect fn checkStack<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader) -> () ! JsException ? &mut Allocator {
+  if unsafe runtime.checkStackOverflow(unsafe runtime.contextRuntime(context), stack.currentFrameAddress(), 0, true) {
+    return run unsafe engine.throwError(context, NativeErrorKind.Internal, b"stack overflow")
+  }
+}
+fn at(data: *const u8, index: usize) -> *const u8 {
+  return unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(data), index)
+}
+unsafe fn fixed(data: *const u8, offset: usize) -> u64 {
+  let mut value: u64 = 0 let mut i: usize = 0
+  while i < 8 {
+    value = value | u64.shiftLeft(u8.toU64(unsafe Pointer.read<u8>(at(data, offset + i))), usize.toU64(i * 8))
+    i = i + 1
+  }
+  return value
+}
+effect fn quad(bytes: &mut List<u8>, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut i: u64 = 0
+  while i < 8 { run bytes.append(u64.toU8(u64.shiftRight(value, i * 8) & 255)) i = i + 1 }
+}
+fn unsignedOffset(value: i32) -> u32 {
+  if value < 0 { return i32.toU32(-1 - value) ^ 0xffffffff }
+  return i32.toU32(value)
+}
+fn signedOffset(value: u64) -> i32 {
+  let bits = u64.toU32(value)
+  if bits >= 0x80000000 { return -1 - u32.toI32(bits ^ 0xffffffff) }
+  return u32.toI32(bits)
+}
+effect fn copyStorage(storage: &ByteStorage) -> ByteStorage ! OutOfMemoryError ? &mut Allocator {
+  let mut bytes = List<u8>.make() run bytes.reserveExact(storage.length())
+  let mut i: usize = 0
+  while i < storage.length() { run bytes.append(unsafe storage.byte(i)) i = i + 1 }
+  return ByteStorage.Owned { bytes: move bytes }
+}
+unsafe effect fn appendMetadata<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  value: Value, bytes: &mut List<u8>) -> usize ! OutOfMemoryError | JsException ? &mut Allocator {
+  run checkStack(&mut engine, context)
+  let anchor = () let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference(value))
+  let mut flags: u8 = 0 if code.scriptIsEval { flags = 1 }
+  let mut mapLength: usize = 0
+  if let Option<FunctionDebugInfo>.Some { value: debug } = &code.debug {
+    flags = flags | 2
+    if let Option<ByteStorage>.Some { value: map } = &debug.callSitePcToLine { flags = flags | 4 mapLength = map.length() }
+    if debug.nodeVm { flags = flags | 8 }
+  }
+  let mut sidecar = ByteBuffer.make()
+  if code.debuggerMetadata.enabled {
+    flags = flags | 16
+    sidecar = run debuggerMetadata.encode(&code.debuggerMetadata)
+  }
+  run bytes.append(flags)
+  run quad(&mut bytes, usize.toU64(code.code.length()))
+  run quad(&mut bytes, usize.toU64(code.constants.length()))
+  run quad(&mut bytes, usize.toU64(mapLength))
+  let mut line: i32 = 0 let mut column: i32 = 0 let mut prefix: i32 = 0
+  if let Option<FunctionDebugInfo>.Some { value: debug } = &code.debug {
+    line = debug.lineOffset column = debug.columnOffset prefix = debug.sourceColumnOffset
+  }
+  run quad(&mut bytes, u32.toU64(unsignedOffset(line)))
+  run quad(&mut bytes, u32.toU64(unsignedOffset(column)))
+  run quad(&mut bytes, u32.toU64(unsignedOffset(prefix)))
+  run quad(&mut bytes, usize.toU64(sidecar.length()))
+  if let Option<FunctionDebugInfo>.Some { value: debug } = &code.debug {
+    if let Option<ByteStorage>.Some { value: map } = &debug.callSitePcToLine {
+      run bytes.reserve(mapLength)
+      let mut i: usize = 0 while i < mapLength { run bytes.append(unsafe map.byte(i)) i = i + 1 }
+    }
+  }
+  run bytes.reserve(sidecar.length())
+  let mut sidecarIndex: usize = 0
+  while sidecarIndex < sidecar.length() { run bytes.append(sidecar.asSlice()[sidecarIndex]) sidecarIndex = sidecarIndex + 1 }
+  let mut count: usize = 1 let mut i: usize = 0
+  while i < code.constants.length() {
+    let child = code.constants.get(i)
+    if let Value.FunctionBytecode { .. } = child {
+      let childCount = run unsafe appendMetadata(&mut engine, context, child, &mut bytes)
+      count = count + childCount
+    }
+    i = i + 1
+  }
+  return count
+}
+effect fn appendText(value: Value, bytes: &mut List<u8>) -> () ! OutOfMemoryError ? &mut Allocator {
+  if !value.isString() { run bytes.append(0) return () }
+  let wide = Strings.isWide(value)
+  let length = Strings.length(value)
+  let width: usize = if wide { 2 } else { 1 }
+  run bytes.reserve(9 + length * width)
+  run bytes.append(if wide { 2 } else { 1 })
+  run quad(&mut bytes, usize.toU64(length))
+  let mut iterator = RopeIterator.make(&value)
+  while let Option<u16>.Some { value: unit } = iterator.next() {
+    let word = u16.toU32(unit)
+    run bytes.append(u32.toU8(word & 255))
+    if wide { run bytes.append(u32.toU8(u32.shiftRight(word, 8))) }
+  }
+}
+unsafe effect fn appendSourcesBody<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  compiled: Value, bytes: &mut List<u8>, scope: &mut Scope) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  scope.values[0] = unsafe scripts.get(compiled)
+  let fields = [b"source", b"sourceURL", b"sourceMapURL"]
+  let mut index: usize = 0
+  while index < fields.length {
+    if scope.values[0].isObject() { scope.values[1] = run unsafe common.get(&mut engine, context, scope.values[0], fields[index]) }
+    run appendText(scope.values[1], &mut bytes)
+    unsafe owners.release(&mut engine, context, scope.take(1))
+    index = index + 1
+  }
+}
+unsafe effect fn appendSources<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  compiled: Value, bytes: &mut List<u8>) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut scope = Scope.make()
+  let outcome = run Effect.result(unsafe appendSourcesBody(&mut engine, context, compiled, &mut bytes, &mut scope))
+  unsafe owners.cleanup(&mut engine, context, move scope)
+  if let Result<(), OutOfMemoryError | JsException>.Failure { error } = move outcome { fail move error }
+}
+pub unsafe effect fn write<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  compiled: Value) -> List<u8> ! OutOfMemoryError | JsException ? &mut Allocator {
+  return run unsafe writeBody(&mut engine, context, compiled, false)
+}
+pub unsafe effect fn writeModule<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  compiled: Value) -> List<u8> ! OutOfMemoryError | JsException ? &mut Allocator {
+  return run unsafe writeBody(&mut engine, context, compiled, true)
+}
+unsafe effect fn writeBody<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  compiled: Value, module: bool) -> List<u8> ! OutOfMemoryError | JsException ? &mut Allocator {
+  let code = if module { unsafe moduleCode(compiled) } else { compiled }
+  if let Value.FunctionBytecode { .. } = code {} else { return run invalid(&mut engine, context) }
+  // Append to the writer's owned buffer rather than copying its entire payload.
+  let mut bytes = run unsafe writer.writeObject(&mut engine, context, compiled, writer.JS_WRITE_OBJ_BYTECODE)
+  let bytecodeLength = bytes.length()
+  run unsafe appendSources(&mut engine, context, compiled, &mut bytes)
+  let count = run unsafe appendMetadata(&mut engine, context, code, &mut bytes)
+  let metadataLength = bytes.length() - bytecodeLength
+  let magic = b"SILKSC04" let mut i: usize = 0
+  while i < 8 { run bytes.append(magic[i]) i = i + 1 }
+  run quad(&mut bytes, usize.toU64(bytecodeLength))
+  run quad(&mut bytes, usize.toU64(metadataLength))
+  run quad(&mut bytes, usize.toU64(count))
+  return move bytes
+}
+// Validate the complete supplementary table, including future entries not reached
+// by a particular stack snapshot. Arithmetic is wide until its range is checked.
+fn validMap(bytes: &[u8], codeLength: usize) -> bool {
+  let initialLine = positions.readLeb128(bytes, 0)
+  if !initialLine.valid || initialLine.value >= 2147483647 { return false }
+  let initialColumn = positions.readLeb128(bytes, initialLine.next)
+  if !initialColumn.valid || initialColumn.value >= 2147483647 { return false }
+  let mut line = u32.toI64(initialLine.value) let mut column = u32.toI64(initialColumn.value)
+  let mut cursor = initialColumn.next let mut pc: u64 = 0
+  while cursor < bytes.length {
+    let opcode = bytes[cursor] cursor = cursor + 1
+    if opcode == 0 {
+      let delta = positions.readLeb128(bytes, cursor) if !delta.valid { return false }
+      pc = pc + u32.toU64(delta.value)
+      let deltaLine = positions.readSignedLeb128(bytes, delta.next) if !deltaLine.valid { return false }
+      line = line + i32.toI64(deltaLine.value) cursor = deltaLine.next
+    } else {
+      let packed = u8.toU32(opcode) - 1
+      pc = pc + u32.toU64(packed / 5) line = line + u32.toI64(packed % 5) - 1
+    }
+    let deltaColumn = positions.readSignedLeb128(bytes, cursor) if !deltaColumn.valid { return false }
+    column = column + i32.toI64(deltaColumn.value) cursor = deltaColumn.next
+    if pc > usize.toU64(codeLength) || line < 0 || line >= 2147483647 || column < 0 || column >= 2147483647 { return false }
+  }
+  return true
+}
+unsafe effect fn restoreMetadata<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  value: Value, cursor: &mut Cursor, scriptId: u64, isEval: bool) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  run checkStack(&mut engine, context)
+  if cursor.remaining == 0 || cursor.end - cursor.position < 57 { return run invalid(&mut engine, context) }
+  let flags = unsafe Pointer.read<u8>(at(cursor.data, cursor.position))
+  let codeLength = unsafe fixed(cursor.data, cursor.position + 1)
+  let constants = unsafe fixed(cursor.data, cursor.position + 9)
+  let mapLength = unsafe fixed(cursor.data, cursor.position + 17)
+  let line = unsafe fixed(cursor.data, cursor.position + 25)
+  let column = unsafe fixed(cursor.data, cursor.position + 33)
+  let prefix = unsafe fixed(cursor.data, cursor.position + 41)
+  let sidecarLength = unsafe fixed(cursor.data, cursor.position + 49)
+  cursor.position = cursor.position + 57 cursor.remaining = cursor.remaining - 1
+  if (flags & 224) != 0 || ((flags & 1) != 0) != isEval || mapLength > usize.toU64(cursor.end - cursor.position)
+    || ((flags & 4) == 0 && mapLength != 0) || ((flags & 12) != 0 && (flags & 2) == 0)
+    || line > 4294967295 || column > 4294967295 || prefix > 2147483647
+    || ((flags & 8) == 0 && (line != 0 || column != 0 || prefix != 0)) {
+    return run invalid(&mut engine, context)
+  }
+  if sidecarLength > usize.toU64(cursor.end - cursor.position) - mapLength
+    || ((flags & 16) == 0 && sidecarLength != 0) || ((flags & 16) != 0 && sidecarLength < 32) {
+    return run invalid(&mut engine, context)
+  }
+  let runtimeAnchor = () let runtimeState = unsafe HeapCell.payload<RuntimeState, ()>(&runtimeAnchor, unsafe runtime.contextRuntime(context))
+  let requiresDebuggerMetadata = runtimeState.debugger.metadataEnabled drop runtimeState
+  if requiresDebuggerMetadata && (flags & 16) == 0 { return run invalid(&mut engine, context) }
+  let mut anchor = () let code = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut anchor, reference(value))
+  let hasDebug = match &code.debug { Option<FunctionDebugInfo>.Some { .. } => true _ => false }
+  if codeLength != usize.toU64(code.code.length()) || constants != usize.toU64(code.constants.length()) || hasDebug != ((flags & 2) != 0) {
+    return run invalid(&mut engine, context)
+  }
+  code.scriptId = scriptId code.scriptIsEval = isEval
+  if let Option<FunctionDebugInfo>.Some { value: debug } = &mut code.debug {
+    debug.nodeVm = (flags & 8) != 0
+    debug.lineOffset = signedOffset(line)
+    debug.columnOffset = signedOffset(column)
+    debug.sourceColumnOffset = signedOffset(prefix)
+  }
+  if (flags & 4) != 0 {
+    let length = u64.toUsize(mapLength)
+    let mut bytes = List<u8>.make() run bytes.reserveExact(length)
+    let mut i: usize = 0
+    while i < length { run bytes.append(unsafe Pointer.read<u8>(at(cursor.data, cursor.position + i))) i = i + 1 }
+    if !validMap(bytes.asSlice(), code.code.length()) { return run invalid(&mut engine, context) }
+    if let Option<FunctionDebugInfo>.Some { value: debug } = &mut code.debug {
+      debug.callSitePcToLine = Option<ByteStorage>.some(ByteStorage.Owned { bytes: move bytes })
+    }
+  }
+  cursor.position = cursor.position + u64.toUsize(mapLength)
+  if (flags & 16) != 0 {
+    let length = u64.toUsize(sidecarLength)
+    let encoded = unsafe Intrinsic.pointerBorrowMany<Cursor, u8>(&cursor.*, unsafe Pointer.assumeMany<u8>(at(cursor.data, cursor.position)), length)
+    let decoded = run Effect.result(debuggerMetadata.decode(encoded, unsafe storageBytes(&code.code),
+      u16.toUsize(code.variableCount), u32.toUsize(readU32(encoded, 28))))
+    let metadata = match move decoded {
+      Result<Metadata, InvalidMetadata | OutOfMemoryError>.Success { value: decodedMetadata } => move decodedMetadata
+      Result<Metadata, InvalidMetadata | OutOfMemoryError>.Failure { error } => {
+        drop code
+        match move error {
+          OutOfMemoryError exhausted => { fail move exhausted }
+          InvalidMetadata malformed => { drop malformed return run invalid(&mut engine, context) }
+        }
+      }
+    }
+    if !metadata.enabled || !run validDebuggerBindings(&code, &metadata) { drop code return run invalid(&mut engine, context) }
+    code.debuggerMetadata = move metadata
+  }
+  cursor.position = cursor.position + u64.toUsize(sidecarLength)
+  let count = code.constants.length() drop code
+  let mut i: usize = 0
+  while i < count {
+    let readAnchor = () let parent = unsafe HeapCell.payload<FunctionBytecode, ()>(&readAnchor, reference(value))
+    let child = parent.constants.get(i) drop parent
+    if let Value.FunctionBytecode { .. } = child { run unsafe restoreMetadata(&mut engine, context, child, &mut cursor, scriptId, isEval) }
+    i = i + 1
+  }
+}
+unsafe effect fn readTextBody<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  cursor: &mut Cursor) -> Value ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  if cursor.position == cursor.end { return run invalid(&mut engine, context) }
+  let kind = unsafe Pointer.read<u8>(at(cursor.data, cursor.position))
+  cursor.position = cursor.position + 1
+  if kind == 0 { return Value.Null }
+  if kind > 2 || cursor.end - cursor.position < 8 { return run invalid(&mut engine, context) }
+  let length = unsafe fixed(cursor.data, cursor.position)
+  cursor.position = cursor.position + 8
+  let width: usize = if kind == 2 { 2 } else { 1 }
+  if length > usize.toU64((cursor.end - cursor.position) / width) { return run invalid(&mut engine, context) }
+  let units = u64.toUsize(length)
+  let mut builder = StringBuilder.make()
+  run builder.reserve(units, kind == 2)
+  let mut index: usize = 0
+  while index < units {
+    let mut unit = u8.toU32(unsafe Pointer.read<u8>(at(cursor.data, cursor.position)))
+    if kind == 2 { unit = unit | u32.shiftLeft(u8.toU32(unsafe Pointer.read<u8>(at(cursor.data, cursor.position + 1))), 8) }
+    run builder.appendUnit(u32.toU16(unit))
+    cursor.position = cursor.position + width
+    index = index + 1
+  }
+  return run builder.finish()
+}
+unsafe effect fn readText<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  cursor: &mut Cursor) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  let outcome = run Effect.result(unsafe readTextBody(&mut engine, context, &mut cursor))
+  return match move outcome {
+    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Success { value } => value
+    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => run unsafe core.materialize(&mut engine, context, move error)
+  }
+}
+unsafe effect fn restore<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  compiled: Value, cursor: &mut Cursor) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut scope = Scope.make()
+  let outcome = run Effect.result(unsafe restoreBody(&mut engine, context, compiled, &mut cursor, &mut scope))
+  unsafe owners.cleanup(&mut engine, context, move scope)
+  if let Result<(), OutOfMemoryError | JsException>.Failure { error } = move outcome { fail move error }
+}
+unsafe effect fn restoreBody<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  compiled: Value, cursor: &mut Cursor, scope: &mut Scope) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  // readCachedBytecode validates the whole graph inside the decoder transaction.
+  let code = unsafe moduleCode(compiled)
+  let mut index: usize = 0
+  while index < 3 { scope.values[index] = run unsafe readText(&mut engine, context, &mut cursor) index = index + 1 }
+  if cursor.end - cursor.position < 57 { return run invalid(&mut engine, context) }
+  let anchor = () let root = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference(code))
+  let scriptId = root.scriptId drop root
+  let isEval = (unsafe Pointer.read<u8>(at(cursor.data, cursor.position)) & 1) != 0
+  run unsafe restoreMetadata(&mut engine, context, code, &mut cursor, scriptId, isEval)
+  if cursor.remaining != 0 || cursor.position != cursor.end { return run invalid(&mut engine, context) }
+  run unsafe scripts.restore(&mut engine, context, code, scope.values[0], scope.values[1], scope.values[2])
+  run unsafe coverage.registerCompiled(unsafe runtime.contextRuntime(context), compiled)
+}
+// Caller retains the input bytes only for this call. Engine code and restored
+// metadata are owned copies, so a SEA mapping can be released independently.
+pub unsafe effect fn read<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  data: *const u8, length: usize) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  return run unsafe readBody(&mut engine, context, data, length, false)
+}
+pub unsafe effect fn readModule<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  data: *const u8, length: usize) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  return run unsafe readBody(&mut engine, context, data, length, true)
+}
+unsafe effect fn readBody<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  data: *const u8, length: usize, module: bool) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  if length < 32 { return run invalid(&mut engine, context) }
+  let footer = length - 32 let magic = b"SILKSC04" let mut i: usize = 0
+  while i < 8 { if unsafe Pointer.read<u8>(at(data, footer + i)) != magic[i] { return run invalid(&mut engine, context) } i = i + 1 }
+  let bytecodeLength = unsafe fixed(data, footer + 8)
+  let metadataLength = unsafe fixed(data, footer + 16)
+  let count = unsafe fixed(data, footer + 24)
+  if bytecodeLength == 0 || bytecodeLength > usize.toU64(footer) || metadataLength != usize.toU64(footer) - bytecodeLength
+    || count == 0 || count > metadataLength / 57 { return run invalid(&mut engine, context) }
+  let compiled = run unsafe reader.readCachedBytecode(&mut engine, context, data, u64.toUsize(bytecodeLength), module)
+  let mut cursor = Cursor { data: data, position: u64.toUsize(bytecodeLength), end: footer, remaining: u64.toUsize(count) }
+  let restored = run Effect.result(unsafe restore(&mut engine, context, compiled, &mut cursor))
+  return match move restored {
+    Result<(), OutOfMemoryError | JsException>.Success { .. } => compiled
+    Result<(), OutOfMemoryError | JsException>.Failure { error } => {
+      if let Value.Module { reference } = compiled { unsafe gc.detachModule(&mut engine, unsafe runtime.contextRuntime(context), reference) }
+      unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), compiled) fail move error
+    }
+  }
+}
+unsafe effect fn transfer<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  source: Value, destination: Value) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  run checkStack(&mut engine, context)
+  let sourceAnchor = () let original = unsafe HeapCell.payload<FunctionBytecode, ()>(&sourceAnchor, reference(source))
+  let mut anchor = () let target = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut anchor, reference(destination))
+  target.scriptId = original.scriptId target.scriptIsEval = original.scriptIsEval
+  target.hostScriptMetadata = unsafe original.hostScriptMetadata.retained()
+  target.debuggerMetadata = run original.debuggerMetadata.clone()
+  if let Option<FunctionDebugInfo>.Some { value: debug } = &original.debug {
+    if let Option<FunctionDebugInfo>.Some { value: targetDebug } = &mut target.debug {
+      targetDebug.nodeVm = debug.nodeVm
+      targetDebug.nodeSourceURL = debug.nodeSourceURL
+      targetDebug.lineOffset = debug.lineOffset
+      targetDebug.columnOffset = debug.columnOffset
+      targetDebug.sourceColumnOffset = debug.sourceColumnOffset
+    }
+    if let Option<ByteStorage>.Some { value: map } = &debug.callSitePcToLine {
+      let copied = run copyStorage(&map)
+      if let Option<FunctionDebugInfo>.Some { value: targetDebug } = &mut target.debug {
+        targetDebug.callSitePcToLine = Option<ByteStorage>.some(move copied)
+      }
+    }
+  }
+  let count = original.constants.length() drop target
+  let mut i: usize = 0
+  while i < count {
+    let child = original.constants.get(i)
+    if let Value.FunctionBytecode { .. } = child {
+      let readAnchor = () let parent = unsafe HeapCell.payload<FunctionBytecode, ()>(&readAnchor, reference(destination))
+      let targetChild = parent.constants.get(i) drop parent
+      run unsafe transfer(&mut engine, context, child, targetChild)
+    }
+    i = i + 1
+  }
+}
+pub unsafe effect fn clone<'m, S: EngineServices>(engine: &mut Engine<'m, S>, sourceContext: *mut HeapHeader,
+  targetContext: *mut HeapHeader, compiled: Value) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  let bytes = run unsafe writer.writeObject(&mut engine, sourceContext, compiled, writer.JS_WRITE_OBJ_BYTECODE)
+  let copied = run unsafe reader.readObject(&mut engine, targetContext, bytes.asSlice(), reader.BYTECODE)
+  let transferred = run Effect.result(unsafe transfer(&mut engine, targetContext, compiled, copied))
+  return match move transferred {
+    Result<(), OutOfMemoryError | JsException>.Success { .. } => copied
+    Result<(), OutOfMemoryError | JsException>.Failure { error } => {
+      unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(targetContext), copied) fail move error
+    }
+  }
+}
+// Only unpublished/newly cloned trees may be reconfigured. Shared Script handles
+// must be cloned first, so consuming cachedData cannot alter its producer.
+pub unsafe effect fn configureVm<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  compiled: Value, line: i32, column: i32, prefix: i32, filename: Value) -> () ! JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  let mut name: u32 = 0
+  if filename.isString() {
+    let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+    let interned = run Effect.result(state.atoms.intern(filename)) drop state
+    name = match move interned {
+      Result<u32, OutOfMemoryError | StringLengthError>.Success { value } => value
+      Result<u32, OutOfMemoryError | StringLengthError>.Failure { error } => run unsafe core.materialize(&mut engine, context, move error)
+    }
+  } else if !match filename { Value.Undefined => true _ => false } {
+    return run unsafe engine.throwError(context, NativeErrorKind.Type, b"VM cache filename must be a string")
+  }
+  let configured = run Effect.result(unsafe configureVmTree(&mut engine, context, compiled, line, column, prefix, name))
+  if name != 0 {
+    let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+    state.atoms.release(name)
+  }
+  return match move configured {
+    Result<(), JsException>.Success { .. } => ()
+    Result<(), JsException>.Failure { error } => { fail move error }
+  }
+}
+unsafe effect fn configureVmTree<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  compiled: Value, line: i32, column: i32, prefix: i32, filename: u32) -> () ! JsException ? &mut Allocator {
+  run checkStack(&mut engine, context)
+  let mut anchor = () let code = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut anchor, reference(compiled))
+  if let Option<FunctionDebugInfo>.Some { value: debug } = &mut code.debug {
+    debug.nodeVm = true debug.lineOffset = line debug.columnOffset = column debug.sourceColumnOffset = prefix
+    if filename != 0 {
+      let mut runtimeAnchor = ()
+      let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, unsafe runtime.contextRuntime(context))
+      let previous = debug.filename
+      debug.filename = state.atoms.duplicate(filename)
+      state.atoms.release(previous)
+    }
+  }
+  let count = code.constants.length() drop code
+  let mut i: usize = 0
+  while i < count {
+    let readAnchor = () let parent = unsafe HeapCell.payload<FunctionBytecode, ()>(&readAnchor, reference(compiled))
+    let child = parent.constants.get(i) drop parent
+    if let Value.FunctionBytecode { .. } = child { run unsafe configureVmTree(&mut engine, context, child, line, column, prefix, filename) }
+    i = i + 1
+  }
+}

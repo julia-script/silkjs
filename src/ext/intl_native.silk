@@ -1,0 +1,533 @@
+//! Native 8000: dispatch(engine, context, state, argc, argv).
+//! open/close belong to each runtime, including workers. No JS values are retained.
+//! A 64-entry configuration cache owns ICU formatters; eviction and close release
+//! them deterministically. Temporary results are scoped even on JS allocation failure.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.mem.layout { Layout }
+import silk.core.ownership { Drop }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.collections.list { List }
+import silk.num.i32
+import silk.num.u32
+import silk.num.usize
+import silk.num.f64
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_heap { HeapCell, HeapHeader }
+import silkjs.js_value { Value }
+import silkjs.js_core_types { FrameSlots, NativeErrorKind, RuntimeState }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_coercion_host { CoercionHooks }
+import silkjs.js_strings { Strings, StringBuilder }
+import silkjs.js_string_types { StringLengthError }
+import silkjs.js_collection_support { Scope }
+import silkjs.js_collection_support as owners
+import silkjs.js_intl_common as common
+import silkjs.js_std_support as text
+import silkjs.js_proxy_core as core
+import silkjs.js_runtime as runtime
+import silkjs.js_runtime_registry { ClassIdAllocator }
+import silkjs.js_intl_durationformat as duration
+import ext.intl_abi as c
+import ext.os_abi as memory
+import ext.fs_native as fs
+
+struct Owned { p:?*mut u8, kind:i32 }
+impl Drop for Owned {
+  fn drop(self:&mut Self)->() {
+    if Pointer.isNull<u8>(self.p) { return () }
+    let p=self.p
+    if self.kind==1 { unsafe c.ucol_close_78(p) }
+    if self.kind==2 { unsafe c.unumf_close_78(p) }
+    if self.kind==3 { unsafe c.udat_close_78(p) }
+    if self.kind==4 { unsafe c.uplrules_close_78(p) }
+    if self.kind==5 { unsafe c.ureldatefmt_close_78(p) }
+    if self.kind==6 { unsafe c.ulistfmt_close_78(p) }
+    if self.kind==7 { unsafe c.uldn_close_78(p) }
+    if self.kind==8 { unsafe c.ubrk_close_78(p) }
+    if self.kind==9 { unsafe c.unumrf_close_78(p) }
+    if self.kind==10 { unsafe c.udtitvfmt_close_78(p) }
+    if self.kind==11 { unsafe c.udatpg_close_78(p) }
+    if self.kind==12 { unsafe c.unumf_closeResult_78(p) }
+    if self.kind==13 { unsafe c.unumrf_closeResult_78(p) }
+    if self.kind==14 { unsafe c.udtitvfmt_closeResult_78(p) }
+    if self.kind==15 { unsafe c.ureldatefmt_closeResult_78(p) }
+    if self.kind==16 { unsafe c.ulistfmt_closeResult_78(p) }
+    if self.kind==17 { unsafe c.ucfpos_close_78(p) }
+    if self.kind==18 { unsafe c.ufieldpositer_close_78(p) }
+    if self.kind==19 { unsafe c.uenum_close_78(p) }
+    if self.kind==20 { unsafe c.unumsys_close_78(p) }
+    if self.kind==21 { unsafe c.ucal_close_78(p) }
+  }
+}
+struct BreakText { p:?*mut u8 }
+impl Drop for BreakText {
+  fn drop(self:&mut Self)->() { let mut status:i32=0 unsafe c.ubrk_setText_78(self.p,Pointer.null<u16>(),0,Pointer.fromMutRef<i32>(&mut status)) }
+}
+struct Entry { key:List<u8>, primary:Owned, secondary:Owned, range:Owned }
+pub struct State { entries:[?*mut Entry;64], cursor:usize, namespace:ClassIdAllocator }
+fn nil()->?*mut u8 { return Pointer.null<u8>() }
+fn empty()->Owned { return Owned { p:nil(),kind:0 } }
+unsafe fn nonnull<T>(p:?*mut T)->*mut T { return unsafe Intrinsic.pointerRequalify<?*mut T,*mut T>(p) }
+pub effect fn open(namespace:ClassIdAllocator)->*mut State !OutOfMemoryError {
+  let p=unsafe memory.calloc(1,Layout.of<State>().bytes) if Pointer.isNull<u8>(p) { fail OutOfMemoryError {} }
+  let state=unsafe Intrinsic.pointerReinterpret<*mut u8,*mut State>(unsafe nonnull(p))
+  unsafe Pointer.put<State>(state,State { entries:[Pointer.null<Entry>();64],cursor:0,namespace:move namespace }) return state
+}
+unsafe fn destroy(p:?*mut Entry)->() {
+  if Pointer.isNull<Entry>(p) { return () }
+  let value=unsafe Pointer.take<Entry>(unsafe nonnull(p)) drop value
+  unsafe memory.free(unsafe Intrinsic.pointerReinterpret<*mut Entry,*mut u8>(unsafe nonnull(p)))
+}
+pub unsafe fn close(state:*mut State)->() {
+  let value=unsafe Pointer.take<State>(state) let mut i:usize=0
+  while i<64 { unsafe destroy(value.entries[i]) i=i+1 }
+  drop value unsafe memory.free(unsafe Intrinsic.pointerReinterpret<*mut State,*mut u8>(state))
+}
+unsafe effect fn checked<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,status:i32)->() !JsException ?&mut Allocator {
+  if status>0 { return run unsafe engine.throwError(context,NativeErrorKind.Range,b"ICU rejected the locale, option, or input") }
+}
+unsafe effect fn ctext<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,value:Value)->List<u8> !OutOfMemoryError|JsException ?&mut Allocator {
+  let mut bytes=run unsafe text.text(&mut engine,context,value)
+  let mut i:usize=0 while i<bytes.length() { if bytes.asSlice()[i]==0 { return run unsafe engine.throwError(context,NativeErrorKind.Range,b"Unexpected NUL in ICU identifier") } i=i+1 }
+  run bytes.append(0) return move bytes
+}
+effect fn wide(value:Value)->List<u16> !OutOfMemoryError ?&mut Allocator {
+  let mut length:usize=0 if value.isString() { length=Strings.length(value) }
+  let mut units=run List<u16>.makeWithCapacity(length+1) let mut i:usize=0
+  while i<length { run units.append(Strings.codeUnit(value,i)) i=i+1 }
+  run units.append(0) return move units
+}
+fn wp(units:&List<u16>)->*const u16 { return Pointer.fromRef<u16>(&units.asSlice()[0]) }
+fn wl(units:&List<u16>)->i32 { return usize.toI32(units.length()-1) }
+unsafe effect fn utf16<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,p:*const u16,length:i32)->Value !JsException ?&mut Allocator {
+  let mut builder=StringBuilder.make()
+  let result=run Effect.result(unsafe copyUnits(&mut builder,p,length))
+  match move result { Result<(),OutOfMemoryError|StringLengthError>.Success { .. }=>() Result<(),OutOfMemoryError|StringLengthError>.Failure { error }=>{ return run unsafe core.materialize(&mut engine,context,move error) } }
+  let finished=run Effect.result(builder.finish())
+  return match move finished { Result<Value,OutOfMemoryError>.Success { value }=>value Result<Value,OutOfMemoryError>.Failure { error }=>run unsafe core.materialize(&mut engine,context,move error) }
+}
+unsafe effect fn copyUnits(builder:&mut StringBuilder,p:*const u16,length:i32)->() !OutOfMemoryError|StringLengthError ?&mut Allocator {
+  let many=unsafe Pointer.assumeMany<u16>(p) let mut i:i32=0
+  while i<length { run builder.appendUnit(unsafe Pointer.read<u16>(unsafe Pointer.at<u16>(many,i32.toUsize(i)))) i=i+1 }
+}
+unsafe effect fn push<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,array:Value,index:&mut u32,value:Value)->() !JsException ?&mut Allocator {
+  run unsafe common.defineIndex(&mut engine,context,array,index.*,value) index.*=index.*+1
+}
+unsafe effect fn field<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,array:Value,index:&mut u32,category:i32,id:i32,start:i32,end:i32)->() !JsException ?&mut Allocator {
+  run unsafe push(&mut engine,context,array,&mut index,Value.Int { value:category })
+  run unsafe push(&mut engine,context,array,&mut index,Value.Int { value:id })
+  run unsafe push(&mut engine,context,array,&mut index,Value.Int { value:start })
+  run unsafe push(&mut engine,context,array,&mut index,Value.Int { value:end })
+}
+unsafe effect fn formatted<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,array:Value,value:?*mut u8,status:&mut i32)->() !JsException ?&mut Allocator {
+  run unsafe checked(&mut engine,context,status.*)
+  let mut length:i32=0 let p=unsafe c.ufmtval_getString_78(value,Pointer.fromMutRef<i32>(&mut length),Pointer.fromMutRef<i32>(&mut status))
+  run unsafe checked(&mut engine,context,status.*)
+  let rendered=run unsafe utf16(&mut engine,context,p,length)
+  let mut index:u32=0 run unsafe push(&mut engine,context,array,&mut index,rendered)
+  let pos=Owned { p:unsafe c.ucfpos_open_78(Pointer.fromMutRef<i32>(&mut status)),kind:17 }
+  while unsafe c.ufmtval_nextPosition_78(value,pos.p,Pointer.fromMutRef<i32>(&mut status))!=0 {
+    let category=unsafe c.ucfpos_getCategory_78(pos.p,Pointer.fromMutRef<i32>(&mut status))
+    let id=unsafe c.ucfpos_getField_78(pos.p,Pointer.fromMutRef<i32>(&mut status))
+    let mut start:i32=0 let mut end:i32=0
+    unsafe c.ucfpos_getIndexes_78(pos.p,Pointer.fromMutRef<i32>(&mut start),Pointer.fromMutRef<i32>(&mut end),Pointer.fromMutRef<i32>(&mut status))
+    run unsafe field(&mut engine,context,array,&mut index,category,id,start,end)
+  }
+  run unsafe checked(&mut engine,context,status.*)
+}
+unsafe effect fn enumeration<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,array:Value,enumerator:Owned,status:&mut i32)->() !JsException ?&mut Allocator {
+  let owner=move enumerator run unsafe checked(&mut engine,context,status.*) let mut index:u32=0
+  while true { let mut length:i32=0 let p=unsafe c.uenum_next_78(owner.p,Pointer.fromMutRef<i32>(&mut length),Pointer.fromMutRef<i32>(&mut status))
+    run unsafe checked(&mut engine,context,status.*) if Pointer.isNull<u8>(p) { return () }
+    let value=run unsafe text.stringPointer(&mut engine,context,unsafe Intrinsic.pointerRequalify<?*const u8,*const u8>(p),i32.toUsize(length))
+    run unsafe push(&mut engine,context,array,&mut index,value)
+  }
+}
+
+unsafe effect fn acquire<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State,kind:i32,scope:&Scope)->*mut Entry !OutOfMemoryError|JsException ?&mut Allocator {
+  let key=run unsafe ctext(&mut engine,context,scope.values[0])
+  let mut anchor=() let cache=unsafe Pointer.borrowMut<(),State>(&mut anchor,state)
+  let mut i:usize=0
+  while i<64 {
+    let p=cache.entries[i]
+    if !Pointer.isNull<Entry>(p) {
+      let entryAnchor=() let entry=unsafe Pointer.borrow<(),Entry>(&entryAnchor,unsafe nonnull(p))
+      if fs.equal(entry.key.asSlice(),key.asSlice()) { return unsafe nonnull(p) }
+    }
+    i=i+1
+  }
+  let slot=cache.cursor cache.cursor=(slot+1)%64
+  unsafe destroy(cache.entries[slot]) cache.entries[slot]=Pointer.null<Entry>() drop cache
+  let locale=run unsafe ctext(&mut engine,context,scope.values[1])
+  let mut localeId:[u8;1024]=[0;1024] let mut parsed:i32=0 let mut status:i32=0
+  let ignored=unsafe c.uloc_forLanguageTag_78(text.pointer(&locale),Pointer.fromMutRef<u8>(&mut localeId[0]),1024,Pointer.fromMutRef<i32>(&mut parsed),Pointer.fromMutRef<i32>(&mut status))
+  run unsafe checked(&mut engine,context,status)
+  let lp=Pointer.fromRef<u8>(&localeId[0])
+  let skeleton=run wide(scope.values[2]) let flags=f64.toI32(scope.values[6].numericValue())
+  let mut entry=Entry { key:move key,primary:empty(),secondary:empty(),range:empty() }
+  let ep=Pointer.fromMutRef<i32>(&mut status)
+  if kind==1 {
+    entry.primary=Owned { p:unsafe c.ucol_open_78(lp,ep),kind:1 }
+    unsafe c.ucol_setAttribute_78(entry.primary.p,5,flags%4,ep)
+    if flags%4==3 { unsafe c.ucol_setAttribute_78(entry.primary.p,5,2,ep) }
+    if flags%4==2 { unsafe c.ucol_setAttribute_78(entry.primary.p,5,0,ep) unsafe c.ucol_setAttribute_78(entry.primary.p,3,17,ep) }
+    unsafe c.ucol_setAttribute_78(entry.primary.p,7,16+(flags/16)%2,ep)
+    let mut caseFirst:i32=16 if (flags/32)%4==1 { caseFirst=25 } if (flags/32)%4==2 { caseFirst=24 }
+    unsafe c.ucol_setAttribute_78(entry.primary.p,2,caseFirst,ep)
+    let mut alternate:i32=21 if (flags/128)%2==1 { alternate=20 }
+    unsafe c.ucol_setAttribute_78(entry.primary.p,1,alternate,ep)
+    unsafe c.ucol_setAttribute_78(entry.primary.p,4,17,ep)
+  }
+  if kind==2 || kind==4 {
+    let nf=Owned { p:unsafe c.unumf_openForSkeletonAndLocale_78(wp(&skeleton),wl(&skeleton),lp,ep),kind:2 }
+    entry.range=Owned { p:unsafe c.unumrf_openForSkeletonWithCollapseAndIdentityFallback_78(wp(&skeleton),wl(&skeleton),0,2,lp,nil(),ep),kind:9 }
+    if kind==2 { entry.primary=move nf }
+    else { entry.secondary=move nf entry.primary=Owned { p:unsafe c.uplrules_openForType_78(lp,flags,ep),kind:4 } }
+  }
+  if kind==3 {
+    let zone=run wide(scope.values[7])
+    let generator=Owned { p:unsafe c.udatpg_open_78(lp,ep),kind:11 }
+    let mut pattern:[u16;1024]=[0;1024]
+    let patternLength=unsafe c.udatpg_getBestPatternWithOptions_78(generator.p,wp(&skeleton),wl(&skeleton),2048,Pointer.fromMutRef<u16>(&mut pattern[0]),1024,ep)
+    run unsafe checked(&mut engine,context,status)
+    let mut timeStyle:i32=-2 let mut dateStyle:i32=-2
+    if flags!=0 { timeStyle=flags%8-1 dateStyle=flags/8-1 }
+    entry.primary=Owned { p:unsafe c.udat_open_78(timeStyle,dateStyle,lp,wp(&zone),wl(&zone),Pointer.fromRef<u16>(&pattern[0]),patternLength,ep),kind:3 }
+    run unsafe checked(&mut engine,context,status)
+    let calendar=unsafe c.udat_getCalendar_78(entry.primary.p)
+    let calendarType=unsafe c.ucal_getType_78(calendar,ep)
+    if status<=0 && unsafe Pointer.read<u8>(calendarType)==103 { unsafe c.ucal_setGregorianChange_78(calendar,-8640000000000000.0,ep) }
+    entry.secondary=Owned { p:unsafe c.ucal_clone_78(calendar,ep),kind:21 }
+    let mut intervalSkeleton:[u16;1024]=[0;1024]
+    let actualLength=unsafe c.udat_toPattern_78(entry.primary.p,0,Pointer.fromMutRef<u16>(&mut pattern[0]),1024,ep)
+    let intervalLength=unsafe c.udatpg_getSkeleton_78(generator.p,Pointer.fromRef<u16>(&pattern[0]),actualLength,Pointer.fromMutRef<u16>(&mut intervalSkeleton[0]),1024,ep)
+    entry.range=Owned { p:unsafe c.udtitvfmt_open_78(lp,Pointer.fromRef<u16>(&intervalSkeleton[0]),intervalLength,wp(&zone),wl(&zone),ep),kind:10 }
+  }
+  if kind==5 { entry.primary=Owned { p:unsafe c.ureldatefmt_open_78(lp,nil(),flags%4,256,ep),kind:5 } }
+  if kind==6 { entry.primary=Owned { p:unsafe c.ulistfmt_openForType_78(lp,flags%4,flags/4,ep),kind:6 } }
+  if kind==7 {
+    let mut contexts:[i32;3]=[flags%2,512+(flags/2)%2,768+(flags/4)%2]
+    entry.primary=Owned { p:unsafe c.uldn_openForContext_78(lp,Pointer.fromMutRef<i32>(&mut contexts[0]),3,ep),kind:7 }
+    entry.secondary=Owned { p:unsafe c.udatpg_open_78(lp,ep),kind:11 }
+  }
+  if kind==8 { entry.primary=Owned { p:unsafe c.ubrk_open_78(flags,lp,Pointer.null<u16>(),0,ep),kind:8 } }
+  run unsafe checked(&mut engine,context,status)
+  let allocation=unsafe memory.calloc(1,Layout.of<Entry>().bytes)
+  if Pointer.isNull<u8>(allocation) { fail OutOfMemoryError {} }
+  let result=unsafe Intrinsic.pointerReinterpret<*mut u8,*mut Entry>(unsafe nonnull(allocation))
+  unsafe Pointer.put<Entry>(result,move entry)
+  let updated=unsafe Pointer.borrowMut<(),State>(&mut anchor,state) updated.entries[slot]=result return result
+}
+
+unsafe effect fn body<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State,op:i32,scope:&mut Scope)->Value !OutOfMemoryError|JsException ?&mut Allocator {
+  let memoryObserver=engine.memory
+  if op==5 || op==6 || op==20 || op==21 || op==30 || op==31 || op==42 || op==50 || op==60 || op==80 {
+    scope.values[10]=run unsafe common.array(&mut engine,memoryObserver,context)
+  }
+  let array=scope.values[10] let mut index:u32=0 let mut status:i32=0
+  let ep=Pointer.fromMutRef<i32>(&mut status)
+  if op==8 { return run unsafe metadata(&mut engine,context,&mut scope) }
+  if op<=7 {
+    if op==7 {
+      let mut zone:[u16;1024]=[0;1024]
+      let length=unsafe c.ucal_getDefaultTimeZone_78(Pointer.fromMutRef<u16>(&mut zone[0]),1024,ep)
+      run unsafe checked(&mut engine,context,status)
+      return run unsafe utf16(&mut engine,context,Pointer.fromRef<u16>(&zone[0]),length)
+    }
+    if op==5 {
+      let count=unsafe c.uloc_countAvailable_78() let mut i:i32=0
+      while i<count {
+        let mut tag:[u8;1024]=[0;1024]
+        let length=unsafe c.uloc_toLanguageTag_78(unsafe c.uloc_getAvailable_78(i),Pointer.fromMutRef<u8>(&mut tag[0]),1024,0,ep)
+        run unsafe checked(&mut engine,context,status)
+        let value=run unsafe text.stringPointer(&mut engine,context,Pointer.fromRef<u8>(&tag[0]),i32.toUsize(length))
+        run unsafe push(&mut engine,context,array,&mut index,value)
+        i=i+1
+      }
+      return scope.take(10)
+    }
+    if op==6 {
+      let key=run unsafe ctext(&mut engine,context,scope.values[0]) let mut e=empty()
+      if fs.equal(key.asSlice(),b"timeZone\0") { e=Owned { p:unsafe c.ucal_openTimeZoneIDEnumeration_78(2,Pointer.null<u8>(),Pointer.null<i32>(),ep),kind:19 } }
+      if fs.equal(key.asSlice(),b"timeZoneAll\0") { e=Owned { p:unsafe c.ucal_openTimeZoneIDEnumeration_78(0,Pointer.null<u8>(),Pointer.null<i32>(),ep),kind:19 } }
+      if fs.equal(key.asSlice(),b"currency\0") { e=Owned { p:unsafe c.ucurr_openISOCurrencies_78(9,ep),kind:19 } }
+      if fs.equal(key.asSlice(),b"numberingSystem\0") { e=Owned { p:unsafe c.unumsys_openAvailableNames_78(ep),kind:19 } }
+      if fs.equal(key.asSlice(),b"calendar\0") { e=Owned { p:unsafe c.ucal_getKeywordValuesForLocale_78(Pointer.fromRef<u8>(&b"calendar\0"[0]),Pointer.fromRef<u8>(&b"und\0"[0]),0,ep),kind:19 } }
+      if fs.equal(key.asSlice(),b"collation\0") { e=Owned { p:unsafe c.ucol_getKeywordValuesForLocale_78(Pointer.fromRef<u8>(&b"collation\0"[0]),Pointer.fromRef<u8>(&b"und\0"[0]),0,ep),kind:19 } }
+      if Pointer.isNull<u8>(e.p) { return run unsafe engine.throwError(context,NativeErrorKind.Range,b"Invalid supportedValuesOf key") }
+      run unsafe enumeration(&mut engine,context,array,move e,&mut status) return scope.take(10)
+    }
+    let mut locale:[u8;1024]=[0;1024] let mut output:[u8;1024]=[0;1024] let mut parsed:i32=0
+    if op==4 {
+      let length=unsafe c.uloc_toLanguageTag_78(unsafe c.uloc_getDefault_78(),Pointer.fromMutRef<u8>(&mut output[0]),1024,0,ep)
+      run unsafe checked(&mut engine,context,status)
+      return run unsafe text.stringPointer(&mut engine,context,Pointer.fromRef<u8>(&output[0]),i32.toUsize(length))
+    }
+    let input=run unsafe ctext(&mut engine,context,scope.values[0])
+    let ignored=unsafe c.uloc_forLanguageTag_78(text.pointer(&input),Pointer.fromMutRef<u8>(&mut locale[0]),1024,Pointer.fromMutRef<i32>(&mut parsed),ep)
+    if parsed!=usize.toI32(input.length()-1) { return run unsafe engine.throwError(context,NativeErrorKind.Range,b"Invalid language tag") }
+    run unsafe checked(&mut engine,context,status)
+    if op==2 || op==3 {
+      let mut changed:[u8;1024]=[0;1024] let mut count:i32=0
+      if op==2 { count=unsafe c.uloc_addLikelySubtags_78(Pointer.fromRef<u8>(&locale[0]),Pointer.fromMutRef<u8>(&mut changed[0]),1024,ep) }
+      else { count=unsafe c.uloc_minimizeSubtags_78(Pointer.fromRef<u8>(&locale[0]),Pointer.fromMutRef<u8>(&mut changed[0]),1024,ep) }
+      run unsafe checked(&mut engine,context,status)
+      let mut i:usize=0 while i<=i32.toUsize(count) { locale[i]=changed[i] i=i+1 }
+    }
+    let length=unsafe c.uloc_toLanguageTag_78(Pointer.fromRef<u8>(&locale[0]),Pointer.fromMutRef<u8>(&mut output[0]),1024,1,ep)
+    run unsafe checked(&mut engine,context,status)
+    return run unsafe text.stringPointer(&mut engine,context,Pointer.fromRef<u8>(&output[0]),i32.toUsize(length))
+  }
+  let entryPointer=run unsafe acquire(&mut engine,context,state,op/10,&scope)
+  if op==12 || op==22 || op==52 || op==62 || op==72 || op==82 { return Value.Undefined }
+  let anchor=() let entry=unsafe Pointer.borrow<(),Entry>(&anchor,entryPointer)
+  let p=entry.primary.p let q=entry.secondary.p let range=entry.range.p drop entry
+  let input=run wide(scope.values[3])
+  let n=scope.values[4].numericValue() let n2=scope.values[5].numericValue()
+  let flags=f64.toI32(scope.values[6].numericValue())
+  if op==10 {
+    let other=run wide(scope.values[7])
+    return Value.Int { value:unsafe c.ucol_strcoll_78(p,wp(&input),wl(&input),wp(&other),wl(&other)) }
+  }
+  if op==80 {
+    unsafe c.ubrk_setText_78(p,wp(&input),wl(&input),ep)
+    let borrowed=BreakText { p:p }
+    run unsafe checked(&mut engine,context,status)
+    let ignored=unsafe c.ubrk_first_78(p)
+    while true { let end=unsafe c.ubrk_next_78(p) if end<0 { break }
+      run unsafe push(&mut engine,context,array,&mut index,Value.Int { value:end })
+      run unsafe push(&mut engine,context,array,&mut index,Value.Int { value:unsafe c.ubrk_getRuleStatus_78(p) })
+    }
+    return scope.take(10)
+  }
+  if op==42 {
+    run unsafe enumeration(&mut engine,context,array,Owned { p:unsafe c.uplrules_getKeywords_78(p,ep),kind:19 },&mut status)
+    return scope.take(10)
+  }
+  if op==32 {
+    let mut pattern:[u16;1024]=[0;1024]
+    let length=unsafe c.udat_toPattern_78(p,0,Pointer.fromMutRef<u16>(&mut pattern[0]),1024,ep)
+    run unsafe checked(&mut engine,context,status)
+    return run unsafe utf16(&mut engine,context,Pointer.fromRef<u16>(&pattern[0]),length)
+  }
+  if op==20 || op==40 {
+    let result=Owned { p:unsafe c.unumf_openResult_78(ep),kind:12 }
+    let mut formatter=p if op==40 { formatter=q }
+    if scope.values[3].isString() {
+      let decimal=run unsafe ctext(&mut engine,context,scope.values[3])
+      unsafe c.unumf_formatDecimal_78(formatter,text.pointer(&decimal),usize.toI32(decimal.length()-1),result.p,ep)
+    } else { unsafe c.unumf_formatDouble_78(formatter,n,result.p,ep) }
+    if op==40 {
+      let mut keyword:[u16;64]=[0;64]
+      let length=unsafe c.uplrules_selectFormatted_78(p,result.p,Pointer.fromMutRef<u16>(&mut keyword[0]),64,ep)
+      run unsafe checked(&mut engine,context,status)
+      return run unsafe utf16(&mut engine,context,Pointer.fromRef<u16>(&keyword[0]),length)
+    }
+    let value=unsafe c.unumf_resultAsValue_78(result.p,ep)
+    run unsafe formatted(&mut engine,context,array,value,&mut status) return scope.take(10)
+  }
+  if op==21 || op==41 {
+    let result=Owned { p:unsafe c.unumrf_openResult_78(ep),kind:13 }
+    if op==21 && scope.values[3].isString() {
+      let first=run unsafe ctext(&mut engine,context,scope.values[3])
+      let second=run unsafe ctext(&mut engine,context,scope.values[7])
+      unsafe c.unumrf_formatDecimalRange_78(range,text.pointer(&first),usize.toI32(first.length()-1),text.pointer(&second),usize.toI32(second.length()-1),result.p,ep)
+    } else { unsafe c.unumrf_formatDoubleRange_78(range,n,n2,result.p,ep) }
+    if op==41 {
+      let mut keyword:[u16;64]=[0;64]
+      let length=unsafe c.uplrules_selectForRange_78(p,result.p,Pointer.fromMutRef<u16>(&mut keyword[0]),64,ep)
+      run unsafe checked(&mut engine,context,status)
+      return run unsafe utf16(&mut engine,context,Pointer.fromRef<u16>(&keyword[0]),length)
+    }
+    let value=unsafe c.unumrf_resultAsValue_78(result.p,ep)
+    run unsafe formatted(&mut engine,context,array,value,&mut status) return scope.take(10)
+  }
+  if op==31 {
+    let result=Owned { p:unsafe c.udtitvfmt_openResult_78(ep),kind:14 }
+    let from=unsafe c.udat_getCalendar_78(p)
+    unsafe c.ucal_setMillis_78(from,n,ep) unsafe c.ucal_setMillis_78(q,n2,ep)
+    unsafe c.udtitvfmt_formatCalendarToResult_78(range,from,q,result.p,ep)
+    let value=unsafe c.udtitvfmt_resultAsValue_78(result.p,ep)
+    run unsafe formatted(&mut engine,context,array,value,&mut status) return scope.take(10)
+  }
+  if op==30 {
+    let fields=Owned { p:unsafe c.ufieldpositer_open_78(ep),kind:18 }
+    let mut output:[u16;4096]=[0;4096]
+    let length=unsafe c.udat_formatForFields_78(p,n,Pointer.fromMutRef<u16>(&mut output[0]),4096,fields.p,ep)
+    run unsafe checked(&mut engine,context,status)
+    let rendered=run unsafe utf16(&mut engine,context,Pointer.fromRef<u16>(&output[0]),length)
+    run unsafe push(&mut engine,context,array,&mut index,rendered)
+    while true { let mut start:i32=0 let mut end:i32=0
+      let id=unsafe c.ufieldpositer_next_78(fields.p,Pointer.fromMutRef<i32>(&mut start),Pointer.fromMutRef<i32>(&mut end))
+      if id<0 { break } run unsafe field(&mut engine,context,array,&mut index,1,id,start,end)
+    }
+    return scope.take(10)
+  }
+  if op==50 {
+    let result=Owned { p:unsafe c.ureldatefmt_openResult_78(ep),kind:15 }
+    if flags/4==0 { unsafe c.ureldatefmt_formatNumericToResult_78(p,n,f64.toI32(n2),result.p,ep) }
+    else { unsafe c.ureldatefmt_formatToResult_78(p,n,f64.toI32(n2),result.p,ep) }
+    let value=unsafe c.ureldatefmt_resultAsValue_78(result.p,ep)
+    run unsafe formatted(&mut engine,context,array,value,&mut status) return scope.take(10)
+  }
+  if op==60 {
+    let mut strings=List<*const u16>.make() let mut lengths=List<i32>.make()
+    let mut offset:usize=0 let count=f64.toU32(n)
+    let many=unsafe Pointer.assumeMany<u16>(wp(&input)) let mut i:u32=0
+    while i<count {
+      scope.values[9]=run unsafe owners.getIndex(&mut engine,context,scope.values[7],i)
+      let length=f64.toI32(scope.values[9].numericValue()) unsafe owners.release(&mut engine,context,scope.take(9))
+      run strings.append(unsafe Pointer.at<u16>(many,offset)) run lengths.append(length)
+      offset=offset+i32.toUsize(length) i=i+1
+    }
+    run strings.append(wp(&input)) run lengths.append(0)
+    let result=Owned { p:unsafe c.ulistfmt_openResult_78(ep),kind:16 }
+    unsafe c.ulistfmt_formatStringsToResult_78(p,Pointer.fromRef<*const u16>(&strings.asSlice()[0]),Pointer.fromRef<i32>(&lengths.asSlice()[0]),u32.toI32(count),result.p,ep)
+    let value=unsafe c.ulistfmt_resultAsValue_78(result.p,ep)
+    run unsafe formatted(&mut engine,context,array,value,&mut status) return scope.take(10)
+  }
+  if op==70 {
+    let code=run unsafe ctext(&mut engine,context,scope.values[3]) let mut output:[u16;4096]=[0;4096] let mut length:i32=0
+    let out=Pointer.fromMutRef<u16>(&mut output[0])
+    if n==0.0 { length=unsafe c.uldn_localeDisplayName_78(p,text.pointer(&code),out,4096,ep) }
+    if n==1.0 { length=unsafe c.uldn_regionDisplayName_78(p,text.pointer(&code),out,4096,ep) }
+    if n==2.0 { length=unsafe c.uldn_scriptDisplayName_78(p,text.pointer(&code),out,4096,ep) }
+    if n==3.0 {
+      let locale=run unsafe ctext(&mut engine,context,scope.values[1]) let mut choice:i8=0
+      let name=unsafe c.ucurr_getName_78(wp(&input),text.pointer(&locale),1,Pointer.fromMutRef<i8>(&mut choice),Pointer.fromMutRef<i32>(&mut length),ep)
+      run unsafe checked(&mut engine,context,status)
+      return run unsafe utf16(&mut engine,context,name,length)
+    }
+    if n==5.0 {
+      let fieldIds:[i32;13]=[0,1,2,3,4,6,9,10,11,12,13,14,15]
+      let mut width=(flags/2)%2 if flags/8!=0 { width=2 }
+      length=unsafe c.udatpg_getFieldDisplayName_78(q,fieldIds[f64.toUsize(n2)],width,out,4096,ep)
+    }
+    if n==4.0 { length=unsafe c.uldn_keyValueDisplayName_78(p,Pointer.fromRef<u8>(&b"calendar\0"[0]),text.pointer(&code),out,4096,ep) }
+    run unsafe checked(&mut engine,context,status)
+    return run unsafe utf16(&mut engine,context,Pointer.fromRef<u16>(&output[0]),length)
+  }
+  return run unsafe engine.throwError(context,NativeErrorKind.Type,b"Unknown ICU operation")
+}
+
+pub unsafe effect fn dispatch<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State,argc:i32,argv:&FrameSlots)->Value !OutOfMemoryError|JsException ?&mut Allocator {
+  if argc<2 { return run unsafe engine.throwError(context,NativeErrorKind.Type,b"intlNative requires operation and argument array") }
+  let op=f64.toI32((unsafe common.argument(argv,0)).numericValue()) let input=unsafe common.argument(argv,1)
+  let mut scope=Scope.make()
+  let outcome=run Effect.result(unsafe dispatchScoped(&mut engine,context,state,op,input,&mut scope))
+  unsafe owners.cleanup(&mut engine,context,move scope)
+  return match move outcome { Result<Value,OutOfMemoryError|JsException>.Success { value }=>value Result<Value,OutOfMemoryError|JsException>.Failure { error }=>{ fail move error } }
+}
+unsafe effect fn dispatchScoped<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State,op:i32,input:Value,scope:&mut Scope)->Value !OutOfMemoryError|JsException ?&mut Allocator {
+  let mut i:u32=0 while i<8 { scope.values[u32.toUsize(i)]=run unsafe owners.getIndex(&mut engine,context,input,i) i=i+1 }
+  if op==0 { run unsafe installForContext(&mut engine,context,state,scope.values[0]) return Value.Undefined }
+  return run unsafe body(&mut engine,context,state,op,&mut scope)
+}
+
+unsafe effect fn metadata<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,scope:&mut Scope)->Value !OutOfMemoryError|JsException ?&mut Allocator {
+  let key=run unsafe ctext(&mut engine,context,scope.values[0]) let k=key.asSlice()
+  let input=run unsafe ctext(&mut engine,context,scope.values[1])
+  let mut status:i32=0 let ep=Pointer.fromMutRef<i32>(&mut status)
+  if fs.equal(k,b"currencyDigits\0") {
+    let code=run wide(scope.values[1]) let digits=unsafe c.ucurr_getDefaultFractionDigits_78(wp(&code),ep)
+    run unsafe checked(&mut engine,context,status) return Value.Int { value:digits }
+  }
+  if fs.equal(k,b"timeZone\0") {
+    let zone=run wide(scope.values[1]) let mut out:[u16;1024]=[0;1024] let mut system:i8=0
+    let length=unsafe c.ucal_getCanonicalTimeZoneID_78(wp(&zone),wl(&zone),Pointer.fromMutRef<u16>(&mut out[0]),1024,Pointer.fromMutRef<i8>(&mut system),ep)
+    run unsafe checked(&mut engine,context,status)
+    return run unsafe utf16(&mut engine,context,Pointer.fromRef<u16>(&out[0]),length)
+  }
+  if fs.equal(k,b"numberingSystemValid\0") {
+    let system=Owned { p:unsafe c.unumsys_openByName_78(text.pointer(&input),ep),kind:20 }
+    return Value.Bool { value:status<=0 && unsafe c.unumsys_getRadix_78(system.p)==10 && unsafe c.unumsys_isAlgorithmic_78(system.p)==0 }
+  }
+  let mut locale:[u8;1024]=[0;1024] let mut parsed:i32=0
+  let ignored=unsafe c.uloc_forLanguageTag_78(text.pointer(&input),Pointer.fromMutRef<u8>(&mut locale[0]),1024,Pointer.fromMutRef<i32>(&mut parsed),ep)
+  run unsafe checked(&mut engine,context,status)
+  let lp=Pointer.fromRef<u8>(&locale[0])
+  if fs.equal(k,b"numberingSystem\0") {
+    let system=Owned { p:unsafe c.unumsys_open_78(lp,ep),kind:20 }
+    run unsafe checked(&mut engine,context,status)
+    return run unsafe text.cstring(&mut engine,context,unsafe c.unumsys_getName_78(system.p))
+  }
+  if fs.equal(k,b"hourCycle\0") {
+    let generator=Owned { p:unsafe c.udatpg_open_78(lp,ep),kind:11 }
+    let cycle=unsafe c.udatpg_getDefaultHourCycle_78(generator.p,ep)
+    run unsafe checked(&mut engine,context,status)
+    let names=[b"h11",b"h12",b"h23",b"h24"]
+    return run unsafe text.string(&mut engine,context,names[i32.toUsize(cycle)])
+  }
+  if fs.equal(k,b"direction\0") {
+    if unsafe c.uloc_isRightToLeft_78(lp)!=0 { return run unsafe text.string(&mut engine,context,b"rtl") }
+    return run unsafe text.string(&mut engine,context,b"ltr")
+  }
+  if fs.equal(k,b"collation\0") {
+    let collator=Owned { p:unsafe c.ucol_open_78(lp,ep),kind:1 }
+    run unsafe checked(&mut engine,context,status)
+    let resolved=unsafe c.ucol_getLocaleByType_78(collator.p,0,ep) let mut name:[u8;128]=[0;128]
+    let length=unsafe c.uloc_getKeywordValue_78(resolved,Pointer.fromRef<u8>(&b"collation\0"[0]),Pointer.fromMutRef<u8>(&mut name[0]),128,ep)
+    run unsafe checked(&mut engine,context,status)
+    if length==0 { return run unsafe text.string(&mut engine,context,b"default") }
+    return run unsafe text.stringPointer(&mut engine,context,Pointer.fromRef<u8>(&name[0]),i32.toUsize(length))
+  }
+  if fs.equal(k,b"calendars\0") || fs.equal(k,b"collations\0") || fs.equal(k,b"timeZones\0") || fs.equal(k,b"weekInfo\0") {
+    let memoryObserver=engine.memory scope.values[10]=run unsafe common.array(&mut engine,memoryObserver,context)
+  }
+  let array=scope.values[10]
+  if fs.equal(k,b"calendars\0") || fs.equal(k,b"collations\0") || fs.equal(k,b"timeZones\0") {
+    let mut result=empty()
+    if fs.equal(k,b"calendars\0") { result=Owned { p:unsafe c.ucal_getKeywordValuesForLocale_78(Pointer.fromRef<u8>(&b"calendar\0"[0]),lp,1,ep),kind:19 } }
+    if fs.equal(k,b"collations\0") { result=Owned { p:unsafe c.ucol_getKeywordValuesForLocale_78(Pointer.fromRef<u8>(&b"collation\0"[0]),lp,1,ep),kind:19 } }
+    if fs.equal(k,b"timeZones\0") { result=Owned { p:unsafe c.ucal_openTimeZoneIDEnumeration_78(1,text.pointer(&input),Pointer.null<i32>(),ep),kind:19 } }
+    run unsafe enumeration(&mut engine,context,array,move result,&mut status) return scope.take(10)
+  }
+  let calendar=Owned { p:unsafe c.ucal_open_78(Pointer.null<u16>(),0,lp,0,ep),kind:21 }
+  run unsafe checked(&mut engine,context,status)
+  if fs.equal(k,b"calendar\0") {
+    let name=unsafe c.ucal_getType_78(calendar.p,ep) run unsafe checked(&mut engine,context,status)
+    return run unsafe text.cstring(&mut engine,context,name)
+  }
+  if fs.equal(k,b"weekInfo\0") {
+    let mut index:u32=0
+    run unsafe push(&mut engine,context,array,&mut index,Value.Int { value:unsafe c.ucal_getAttribute_78(calendar.p,1) })
+    let mut day:i32=1 while day<=7 {
+      let kind=unsafe c.ucal_getDayOfWeekType_78(calendar.p,day,ep)
+      if kind!=0 { run unsafe push(&mut engine,context,array,&mut index,Value.Int { value:day }) }
+      day=day+1
+    }
+    run unsafe checked(&mut engine,context,status) return scope.take(10)
+  }
+  return run unsafe engine.throwError(context,NativeErrorKind.Range,b"Unknown ICU locale metadata")
+}
+
+//! Register only the engine's DurationFormat class. Its NumberFormat and
+//! ListFormat dependencies are the ICU-backed JS constructors, rooted by the
+//! context's existing intrinsic slots and released with that context.
+pub unsafe effect fn installRealm<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,namespace:&ClassIdAllocator,intl:Value)->() !JsException ?&mut Allocator {
+  let names:[&[u8];5]=[b"NumberFormat",b"DateTimeFormat",b"Collator",b"ListFormat",b"Locale"]
+  let mut i:usize=0
+  while i<5 {
+    let constructor=run unsafe common.get(&mut engine,context,intl,names[i])
+    unsafe runtime.setContextValue(&mut engine,context,usize.toI32(i),constructor)
+    i=i+1
+  }
+  let rt=unsafe runtime.contextRuntime(context) let mut anchor=()
+  let before=unsafe HeapCell.payload<RuntimeState,()>(&anchor,rt)
+  let mut cached=before.intlClassIds[9] drop before
+  if cached==0 { cached=namespace.builtin(9) }
+  let memoryObserver=engine.memory
+  let outcome=run Effect.result(unsafe duration.addDurationFormat(&mut engine,memoryObserver,context,intl,namespace,&mut cached))
+  let after=unsafe HeapCell.payloadMut<RuntimeState,()>(&mut anchor,rt)
+  after.intlClassIds[9]=cached drop after
+  match move outcome { Result<(),JsException>.Success { .. }=>() Result<(),JsException>.Failure { error }=>{ fail move error } }
+}
+
+pub unsafe effect fn installForContext<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State,intl:Value)->() !JsException ?&mut Allocator {
+  let anchor=() let stored=unsafe Pointer.borrow<(),State>(&anchor,state)
+  let namespace=stored.namespace.clone() drop stored
+  run unsafe installRealm(&mut engine,context,&namespace,intl)
+}

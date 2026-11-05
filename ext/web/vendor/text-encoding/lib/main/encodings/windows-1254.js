@@ -1,0 +1,22 @@
+/*
+ * Copyright (C) 2021 Klaus Reimer <k@ailis.de>
+ * See LICENSE.md for licensing information.
+ */
+const windows1254 = require("internal/web/vendor/text-encoding/data/windows-1254.cp");
+const { SingleByteDecoder } = require("internal/web/vendor/text-encoding/lib/main/decoders/SingleByteDecoder");
+const { SingleByteEncoder } = require("internal/web/vendor/text-encoding/lib/main/encoders/SingleByteEncoder");
+const { registerEncoding } = require("internal/web/vendor/text-encoding/lib/main/Encoding");
+registerEncoding("windows-1254", [
+    "cp1254",
+    "csisolatin5",
+    "iso-8859-9",
+    "iso-ir-148",
+    "iso8859-9",
+    "iso88599",
+    "iso_8859-9",
+    "iso_8859-9:1989",
+    "l5",
+    "latin5",
+    "windows-1254",
+    "x-cp1254"
+], SingleByteDecoder.forCodePoints(windows1254), SingleByteEncoder.forCodePoints(windows1254));

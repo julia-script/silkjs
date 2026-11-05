@@ -1,0 +1,44 @@
+/*
+ * Copyright (C) 2021 Klaus Reimer <k@ailis.de>
+ * See LICENSE.md for licensing information.
+ */
+require("internal/web/vendor/text-encoding/lib/main/encodings/big5");
+require("internal/web/vendor/text-encoding/lib/main/encodings/euc-jp");
+require("internal/web/vendor/text-encoding/lib/main/encodings/euc-kr");
+require("internal/web/vendor/text-encoding/lib/main/encodings/gb18030");
+require("internal/web/vendor/text-encoding/lib/main/encodings/gbk");
+require("internal/web/vendor/text-encoding/lib/main/encodings/ibm866");
+require("internal/web/vendor/text-encoding/lib/main/encodings/iso-2022-jp");
+require("internal/web/vendor/text-encoding/lib/main/encodings/shift_jis");
+require("internal/web/vendor/text-encoding/lib/main/encodings/utf-8");
+require("internal/web/vendor/text-encoding/lib/main/encodings/utf-16le");
+require("internal/web/vendor/text-encoding/lib/main/encodings/utf-16be");
+require("internal/web/vendor/text-encoding/lib/main/encodings/utf-16");
+require("internal/web/vendor/text-encoding/lib/main/encodings/x-user-defined");
+require("internal/web/vendor/text-encoding/lib/main/encodings/iso-8859-2");
+require("internal/web/vendor/text-encoding/lib/main/encodings/iso-8859-3");
+require("internal/web/vendor/text-encoding/lib/main/encodings/iso-8859-4");
+require("internal/web/vendor/text-encoding/lib/main/encodings/iso-8859-5");
+require("internal/web/vendor/text-encoding/lib/main/encodings/iso-8859-6");
+require("internal/web/vendor/text-encoding/lib/main/encodings/iso-8859-7");
+require("internal/web/vendor/text-encoding/lib/main/encodings/iso-8859-8");
+require("internal/web/vendor/text-encoding/lib/main/encodings/iso-8859-8-i");
+require("internal/web/vendor/text-encoding/lib/main/encodings/iso-8859-10");
+require("internal/web/vendor/text-encoding/lib/main/encodings/iso-8859-13");
+require("internal/web/vendor/text-encoding/lib/main/encodings/iso-8859-14");
+require("internal/web/vendor/text-encoding/lib/main/encodings/iso-8859-15");
+require("internal/web/vendor/text-encoding/lib/main/encodings/iso-8859-16");
+require("internal/web/vendor/text-encoding/lib/main/encodings/koi8-r");
+require("internal/web/vendor/text-encoding/lib/main/encodings/koi8-u");
+require("internal/web/vendor/text-encoding/lib/main/encodings/macintosh");
+require("internal/web/vendor/text-encoding/lib/main/encodings/windows-874");
+require("internal/web/vendor/text-encoding/lib/main/encodings/windows-1250");
+require("internal/web/vendor/text-encoding/lib/main/encodings/windows-1251");
+require("internal/web/vendor/text-encoding/lib/main/encodings/windows-1252");
+require("internal/web/vendor/text-encoding/lib/main/encodings/windows-1253");
+require("internal/web/vendor/text-encoding/lib/main/encodings/windows-1254");
+require("internal/web/vendor/text-encoding/lib/main/encodings/windows-1255");
+require("internal/web/vendor/text-encoding/lib/main/encodings/windows-1256");
+require("internal/web/vendor/text-encoding/lib/main/encodings/windows-1257");
+require("internal/web/vendor/text-encoding/lib/main/encodings/windows-1258");
+require("internal/web/vendor/text-encoding/lib/main/encodings/x-mac-cyrillic");

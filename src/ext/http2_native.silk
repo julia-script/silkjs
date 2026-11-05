@@ -1,0 +1,431 @@
+//! Owned nghttp2 memory sessions. C callbacks enqueue records only; JS drains
+//! them after dispatch returns. No engine/JS entry occurs on a C callback stack.
+//! maxSessionMemory is admission/header credit, not a hard heap cap: existing
+//! streams can exceed it while draining. Credit includes nghttp2 allocator
+//! requests, retained header octets (+32/pair), bridge records/bodies, active
+//! input and unconsumed DATA, and the transport's pending writable bytes.
+//! JS object/GC overhead, TLS internals and kernel socket memory are excluded.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.collections.list { List }
+import silk.mem.pointer { Pointer }
+import silk.mem.layout { Layout }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.i32
+import silk.num.i64
+import silk.num.usize
+import silk.num.f64
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_heap { HeapHeader }
+import silkjs.js_value { Value }
+import silkjs.js_core_types { FrameSlots }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_errors as errors
+import silkjs.js_runtime as runtime
+import silkjs.js_exceptions as exceptions
+import silkjs.js_collection_support as owners
+import silkjs.js_intl_common as common
+import silkjs.js_buffer_storage as buffers
+import libs.core.host as host
+import ext.http2_abi as c
+
+pub struct State { first: ?*mut Session, next: i32 }
+struct Record { next: ?*mut Record, data: ?*mut u8, length: usize }
+struct Body { next: ?*mut Body, id: i32, first: ?*mut Record, last: ?*mut Record, offset: usize, eof: bool, trailers: bool, notified: bool, started: bool, enabled: bool, headers: usize, pairs: usize, received: usize, queued: usize }
+struct Session { next: ?*mut Session, id: i32, ptr: ?*mut u8, first: ?*mut Record, last: ?*mut Record, bodies: ?*mut Body, memory: usize, ngMemory: usize, socketMemory: usize, maxMemory: usize, maxPairs: usize, padding: i32, invalid: u32, maxInvalid: u32, rejected: u32, maxRejected: u32 }
+struct Call { data: [?*mut u8; 6], lengths: [usize; 6], numbers: [i64; 6], output: ?*mut u8, length: usize, number: i64, binary: bool }
+fn nil() -> ?*mut u8 { return Pointer.null<u8>() }
+unsafe fn nonnull<T>(p: ?*mut T) -> *mut T { return unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(p) }
+unsafe fn raw<T>(p: *mut T) -> *mut u8 { return unsafe Intrinsic.pointerReinterpret<*mut T, *mut u8>(p) }
+unsafe fn cast<T>(p: ?*mut u8) -> *mut T { return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut T>(unsafe nonnull(p)) }
+unsafe fn at(p: ?*mut u8, n: usize) -> *mut u8 { return unsafe buffers.dataAt(p, usize.toU64(n)) }
+// nghttp2 owns these allocations. A 16-byte prefix preserves malloc alignment
+// and records the actual requested size without guessing library structures.
+unsafe fn allocationBase(p: ?*mut u8) -> *mut u8 {
+  // The pointer-width GEP index is -16 in two's-complement representation.
+  // Both the supplied payload pointer and this prefix belong to one allocation.
+  return unsafe at(p, usize.MAX - 15)
+}
+unsafe fn allocate(n: usize, zero: bool, opaque: ?*mut u8) -> ?*mut u8 {
+  if n > usize.MAX - 16 { return nil() }
+  let mut p = nil()
+  if zero { p = unsafe c.calloc(1, n + 16) } else { p = unsafe c.malloc(n + 16) }
+  if Pointer.isNull<u8>(p) { return nil() }
+  unsafe Pointer.put<usize>(unsafe cast<usize>(p), n + 16)
+  let mut anchor = () let s = unsafe Pointer.borrowMut<(), Session>(&mut anchor, unsafe cast<Session>(opaque)) s.ngMemory = s.ngMemory + n + 16
+  return unsafe at(p, 16)
+}
+export "C" fn silkHttp2Alloc(n: usize, opaque: ?*mut u8) -> ?*mut u8 { return unsafe allocate(n, false, opaque) }
+export "C" fn silkHttp2Calloc(count: usize, size: usize, opaque: ?*mut u8) -> ?*mut u8 {
+  if size != 0 && count > (usize.MAX - 16) / size { return nil() }
+  return unsafe allocate(count * size, true, opaque)
+}
+export "C" fn silkHttp2Free(p: ?*mut u8, opaque: ?*mut u8) -> () {
+  if Pointer.isNull<u8>(p) { return () }
+  let base = unsafe allocationBase(p) let n = unsafe Pointer.read<usize>(unsafe cast<usize>(base))
+  let mut anchor = () let s = unsafe Pointer.borrowMut<(), Session>(&mut anchor, unsafe cast<Session>(opaque)) s.ngMemory = s.ngMemory - n drop s
+  unsafe c.free(base)
+}
+export "C" fn silkHttp2Realloc(p: ?*mut u8, n: usize, opaque: ?*mut u8) -> ?*mut u8 {
+  if Pointer.isNull<u8>(p) { return unsafe allocate(n, false, opaque) }
+  if n == 0 { unsafe silkHttp2Free(p, opaque) return nil() }
+  if n > usize.MAX - 16 { return nil() }
+  let base = unsafe allocationBase(p) let previous = unsafe Pointer.read<usize>(unsafe cast<usize>(base))
+  let resized = unsafe c.realloc(base, n + 16) if Pointer.isNull<u8>(resized) { return nil() }
+  unsafe Pointer.put<usize>(unsafe cast<usize>(resized), n + 16)
+  let mut anchor = () let s = unsafe Pointer.borrowMut<(), Session>(&mut anchor, unsafe cast<Session>(opaque)) s.ngMemory = s.ngMemory - previous + n + 16
+  return unsafe at(resized, 16)
+}
+unsafe fn copy(dest: ?*mut u8, source: ?*mut u8, count: usize) -> () {
+  let first = unsafe Intrinsic.pointerRequalify<?*mut u8, *const u8>(source)
+  let ignored = unsafe c.memcpy(unsafe nonnull(dest), first, count)
+}
+fn equal(a: &[u8], b: &[u8]) -> bool { if a.length != b.length { return false } let mut i: usize = 0 while i < a.length { if a[i] != b[i] { return false } i = i + 1 } return true }
+unsafe fn word(p: ?*mut u8, n: usize) -> i32 { let mut v: u32 = 0 let mut i: u32 = 0 while i < 4 { v = u32.bitOr(v, u32.shiftLeft(u8.toU32(unsafe Pointer.read<u8>(unsafe at(p, n + u32.toUsize(i)))), i * 8)) i = i + 1 } return u32.wrappingToI32(v) }
+unsafe fn put(p: ?*mut u8, n: usize, v: i32) -> () { let bits = i32.wrappingToU32(v) let mut i: u32 = 0 while i < 4 { unsafe Pointer.put<u8>(unsafe at(p, n + u32.toUsize(i)), u32.wrappingToU8(u32.shiftRight(bits, i * 8))) i = i + 1 } }
+unsafe fn record(n: usize) -> ?*mut Record {
+  let p = unsafe c.calloc(1, Layout.of<Record>().bytes) if Pointer.isNull<u8>(p) { return Pointer.null<Record>() }
+  let data = unsafe c.calloc(1, n + 1) if Pointer.isNull<u8>(data) { unsafe c.free(p) return Pointer.null<Record>() }
+  let r = unsafe cast<Record>(p) unsafe Pointer.put<Record>(r, Record { next: Pointer.null<Record>(), data: data, length: n }) return r
+}
+unsafe fn freeRecords(first: ?*mut Record) -> () { let mut cursor = first while !Pointer.isNull<Record>(cursor) { let p = unsafe nonnull(cursor) let r = unsafe Pointer.take<Record>(p) cursor = r.next unsafe c.free(r.data) unsafe c.free(unsafe raw(p)) } }
+unsafe fn event(opaque: ?*mut u8, kind: i32, id: i32, flags: i32, a: i32, b: i32, data: ?*mut u8, n: usize, extra: ?*mut u8, m: usize) -> i32 {
+  let p = unsafe record(24 + n + m) if Pointer.isNull<Record>(p) { return -902 }
+  let mut anchor = () let r = unsafe Pointer.borrowMut<(), Record>(&mut anchor, unsafe nonnull(p))
+  unsafe put(r.data, 0, kind) unsafe put(r.data, 4, id) unsafe put(r.data, 8, flags) unsafe put(r.data, 12, a) unsafe put(r.data, 16, b) unsafe put(r.data, 20, usize.toI32(n + m))
+  if n != 0 { unsafe copy(unsafe at(r.data, 24), data, n) } if m != 0 { unsafe copy(unsafe at(r.data, 24 + n), extra, m) } drop r
+  let s = unsafe Pointer.borrowMut<(), Session>(&mut anchor, unsafe cast<Session>(opaque))
+  s.memory = s.memory + Layout.of<Record>().bytes + 25 + n + m
+  let previous = s.last
+  if Pointer.isNull<Record>(previous) { s.first = p }
+  s.last = p drop s
+  if !Pointer.isNull<Record>(previous) { let last = unsafe Pointer.borrowMut<(), Record>(&mut anchor, unsafe nonnull(previous)) last.next = p }
+  return 0
+}
+unsafe fn findBody(s: &Session, id: i32) -> ?*mut Body { let anchor = () let mut p = s.bodies while !Pointer.isNull<Body>(p) { let b = unsafe Pointer.borrow<(), Body>(&anchor, unsafe nonnull(p)) if b.id == id { return p } p = b.next } return Pointer.null<Body>() }
+unsafe fn freeBody(s: &mut Session, id: i32) -> () {
+  let mut link = Pointer.fromMutRef<?*mut Body>(&mut s.bodies) let mut anchor = ()
+  while !Pointer.isNull<Body>(unsafe Pointer.read<?*mut Body>(link)) {
+    let p = unsafe nonnull(unsafe Pointer.read<?*mut Body>(link)) let b = unsafe Pointer.borrowMut<(), Body>(&mut anchor, p)
+    if b.id == id { unsafe Pointer.put<?*mut Body>(link, b.next) s.memory = s.memory - Layout.of<Body>().bytes - b.headers - b.received - b.queued unsafe freeRecords(b.first) drop b let owned = unsafe Pointer.take<Body>(p) drop owned unsafe c.free(unsafe raw(p)) return () }
+    link = Pointer.fromMutRef<?*mut Body>(&mut b.next) drop b
+  }
+}
+unsafe fn body(s: &mut Session, id: i32) -> ?*mut Body {
+  let existing = unsafe findBody(&s.*, id) if !Pointer.isNull<Body>(existing) { return existing }
+  let mem = unsafe c.calloc(1, Layout.of<Body>().bytes) if Pointer.isNull<u8>(mem) { return Pointer.null<Body>() }
+  let b = unsafe cast<Body>(mem)
+  unsafe Pointer.put<Body>(b, Body { next: s.bodies, id: id, first: Pointer.null<Record>(), last: Pointer.null<Record>(), offset: 0, eof: false, trailers: false, notified: false, started: false, enabled: false, headers: 0, pairs: 0, received: 0, queued: 0 })
+  s.bodies = b s.memory = s.memory + Layout.of<Body>().bytes return b
+}
+unsafe fn available(s: &Session, n: usize) -> bool {
+  return s.memory + s.ngMemory + s.socketMemory + n <= s.maxMemory
+}
+export "C" fn silkHttp2Begin(session: ?*mut u8, frame: *mut c.Frame, opaque: ?*mut u8) -> i32 {
+  let mut anchor = () let hd = unsafe Pointer.borrow<(), c.Frame>(&anchor, frame) let mut id = hd.stream
+  if hd.kind == 5 { let h = unsafe Pointer.borrow<(), c.Push>(&anchor, unsafe cast<c.Push>(unsafe raw(frame))) id = h.promised }
+  let s = unsafe Pointer.borrowMut<(), Session>(&mut anchor, unsafe cast<Session>(opaque))
+  if Pointer.isNull<Body>(unsafe findBody(&s, id)) && !unsafe available(&s, Layout.of<Body>().bytes) {
+    let exceeded = s.rejected > s.maxRejected s.rejected = s.rejected + 1 drop s
+    if exceeded { return -902 }
+    let ignored = unsafe c.nghttp2_submit_rst_stream(session, 0, id, 11) return -521
+  }
+  let p = unsafe body(&mut s, id) s.rejected = 0 drop s
+  if Pointer.isNull<Body>(p) { return -902 }
+  let b = unsafe Pointer.borrowMut<(), Body>(&mut anchor, unsafe nonnull(p)) b.pairs = 0 return 0
+}
+export "C" fn silkHttp2Invalid(session: ?*mut u8, frame: *mut c.Frame, code: i32, opaque: ?*mut u8) -> i32 {
+  let mut anchor = () let s = unsafe Pointer.borrowMut<(), Session>(&mut anchor, unsafe cast<Session>(opaque))
+  let exceeded = s.invalid > s.maxInvalid s.invalid = s.invalid + 1 drop s
+  if exceeded { let ignored = unsafe event(opaque, 10, 0, 0, code, 0, nil(), 0, nil(), 0) return -902 }
+  return 0
+}
+export "C" fn silkHttp2Padding(session: ?*mut u8, frame: *mut c.Frame, maximum: usize, opaque: ?*mut u8) -> i64 {
+  let anchor = () let s = unsafe Pointer.borrow<(), Session>(&anchor, unsafe cast<Session>(opaque)) let hd = unsafe Pointer.borrow<(), c.Frame>(&anchor, frame)
+  if s.padding == 2 { return usize.toI64(maximum) }
+  let mut n = hd.length
+  if s.padding == 1 && (n + 9) % 8 != 0 { n = n + 8 - (n + 9) % 8 }
+  if n > maximum { n = maximum } return usize.toI64(n)
+}
+export "C" fn silkHttp2Header(session: ?*mut u8, frame: *mut c.Frame, name: ?*mut u8, nn: usize, value: ?*mut u8, vn: usize, flags: u8, opaque: ?*mut u8) -> i32 {
+  let anchor = () let hd = unsafe Pointer.borrow<(), c.Frame>(&anchor, frame) let mut id = hd.stream
+  if hd.kind == 5 { let p = unsafe Pointer.borrow<(), c.Push>(&anchor, unsafe cast<c.Push>(unsafe raw(frame))) id = p.promised }
+  let mut resourceAnchor = () let s = unsafe Pointer.borrowMut<(), Session>(&mut resourceAnchor, unsafe cast<Session>(opaque))
+  let p = unsafe findBody(&s, id) if Pointer.isNull<Body>(p) { return -521 }
+  let charge = nn + vn + 32 let fits = unsafe available(&s, charge) let limit = s.maxPairs
+  let mut bodyAnchor = () let b = unsafe Pointer.borrowMut<(), Body>(&mut bodyAnchor, unsafe nonnull(p))
+  if !fits || b.pairs >= limit { drop b drop s let ignored = unsafe c.nghttp2_submit_rst_stream(session, 0, id, 11) return -521 }
+  b.pairs = b.pairs + 1 b.headers = b.headers + charge s.memory = s.memory + charge drop b drop s
+  return unsafe event(opaque, 1, id, u8.toI32(flags), usize.toI32(nn), 0, name, nn, value, vn)
+}
+export "C" fn silkHttp2Frame(session: ?*mut u8, frame: *mut c.Frame, opaque: ?*mut u8) -> i32 {
+  let anchor = () let hd = unsafe Pointer.borrow<(), c.Frame>(&anchor, frame) let mut a: i32 = 0 let mut b: i32 = 0 let mut data = nil() let mut length: usize = 0
+  if hd.kind == 1 { let h = unsafe Pointer.borrow<(), c.Headers>(&anchor, unsafe cast<c.Headers>(unsafe raw(frame))) a = h.category }
+  if hd.kind == 5 { let p = unsafe Pointer.borrow<(), c.Push>(&anchor, unsafe cast<c.Push>(unsafe raw(frame))) a = p.promised }
+  if hd.kind == 6 { data = unsafe at(unsafe raw(frame), Layout.of<c.Frame>().bytes) length = 8 }
+  if hd.kind == 7 { let g = unsafe Pointer.borrow<(), c.Goaway>(&anchor, unsafe cast<c.Goaway>(unsafe raw(frame))) a = g.last b = u32.wrappingToI32(g.error) data = g.data length = g.length }
+  if hd.kind == 4 && u8.bitAnd(hd.flags, 1) == 0 {
+    let settings = unsafe Pointer.borrow<(), c.Settings>(&anchor, unsafe cast<c.Settings>(unsafe raw(frame)))
+    data = unsafe Intrinsic.pointerReinterpret<?*mut c.Setting, ?*mut u8>(settings.entries) length = settings.count * Layout.of<c.Setting>().bytes
+  }
+  if hd.kind == 10 {
+    let extension = unsafe Pointer.borrow<(), c.Extension>(&anchor, unsafe cast<c.Extension>(unsafe raw(frame)))
+    let alt = unsafe Pointer.borrow<(), c.AltSvc>(&anchor, unsafe cast<c.AltSvc>(extension.payload))
+    return unsafe event(opaque, 11, hd.stream, 0, usize.toI32(alt.originLength), 0, alt.origin, alt.originLength, alt.value, alt.valueLength)
+  }
+  if hd.kind == 12 {
+    let extension = unsafe Pointer.borrow<(), c.Extension>(&anchor, unsafe cast<c.Extension>(unsafe raw(frame)))
+    let origins = unsafe Pointer.borrow<(), c.Origin>(&anchor, unsafe cast<c.Origin>(extension.payload))
+    let mut i: usize = 0
+    while i < origins.count {
+      let entry = unsafe Pointer.borrow<(), c.OriginEntry>(&anchor, unsafe cast<c.OriginEntry>(unsafe at(unsafe Intrinsic.pointerReinterpret<?*mut c.OriginEntry, ?*mut u8>(origins.entries), i * Layout.of<c.OriginEntry>().bytes)))
+      let status = unsafe event(opaque, 12, 0, 0, 0, 0, entry.origin, entry.length, nil(), 0) if status != 0 { return status } i = i + 1
+    }
+    return unsafe event(opaque, 13, 0, 0, 0, 0, nil(), 0, nil(), 0)
+  }
+  let status = unsafe event(opaque, 2, hd.stream, u8.toI32(hd.flags), u8.toI32(hd.kind), a, data, length, nil(), 0)
+  if status != 0 { return status }
+  if hd.kind == 7 { return unsafe event(opaque, 8, a, 0, b, 0, data, length, nil(), 0) }
+  return 0
+}
+export "C" fn silkHttp2Sent(session: ?*mut u8, frame: *mut c.Frame, opaque: ?*mut u8) -> i32 {
+  let mut anchor = () let hd = unsafe Pointer.borrow<(), c.Frame>(&anchor, frame)
+  if hd.kind == 1 && u8.bitAnd(hd.flags, 1) == 0 {
+    let s = unsafe Pointer.borrow<(), Session>(&anchor, unsafe cast<Session>(opaque)) let p = unsafe findBody(&s, hd.stream) drop s
+    if !Pointer.isNull<Body>(p) {
+      let mut bodyAnchor = () let b = unsafe Pointer.borrowMut<(), Body>(&mut bodyAnchor, unsafe nonnull(p))
+      if b.enabled && !b.started {
+        b.started = true drop b
+        let mut provider = c.Provider { source: nil(), read: silkHttp2Read }
+        let status = unsafe c.nghttp2_submit_data(session, 1, hd.stream, Pointer.fromMutRef<c.Provider>(&mut provider))
+        if status != 0 { return unsafe event(opaque, 9, hd.stream, 0, status, 0, nil(), 0, nil(), 0) }
+      }
+    }
+  }
+  return unsafe event(opaque, 5, hd.stream, u8.toI32(hd.flags), u8.toI32(hd.kind), usize.toI32(hd.length), nil(), 0, nil(), 0)
+}
+export "C" fn silkHttp2NotSent(session: ?*mut u8, frame: *mut c.Frame, code: i32, opaque: ?*mut u8) -> i32 {
+  let anchor = () let hd = unsafe Pointer.borrow<(), c.Frame>(&anchor, frame)
+  return unsafe event(opaque, 9, hd.stream, 0, code, u8.toI32(hd.kind), nil(), 0, nil(), 0)
+}
+export "C" fn silkHttp2Data(session: ?*mut u8, flags: u8, id: i32, data: ?*mut u8, n: usize, opaque: ?*mut u8) -> i32 {
+  let mut anchor = () let s = unsafe Pointer.borrowMut<(), Session>(&mut anchor, unsafe cast<Session>(opaque))
+  let p = unsafe findBody(&s, id)
+  if !Pointer.isNull<Body>(p) { let mut ba = () let b = unsafe Pointer.borrowMut<(), Body>(&mut ba, unsafe nonnull(p)) b.received = b.received + n s.memory = s.memory + n }
+  drop s return unsafe event(opaque, 3, id, u8.toI32(flags), 0, 0, data, n, nil(), 0)
+}
+export "C" fn silkHttp2Close(session: ?*mut u8, id: i32, code: u32, opaque: ?*mut u8) -> i32 { let mut anchor = () let s = unsafe Pointer.borrowMut<(), Session>(&mut anchor, unsafe cast<Session>(opaque)) unsafe freeBody(&mut s, id) drop s return unsafe event(opaque, 4, id, 0, u32.wrappingToI32(code), 0, nil(), 0, nil(), 0) }
+export "C" fn silkHttp2Read(session: ?*mut u8, id: i32, dest: ?*mut u8, capacity: usize, flags: *mut u32, source: ?*mut u8, opaque: ?*mut u8) -> i64 {
+  let mut anchor = () let s = unsafe Pointer.borrow<(), Session>(&anchor, unsafe cast<Session>(opaque)) let p = unsafe findBody(&s, id) drop s if Pointer.isNull<Body>(p) { return -521 }
+  let b = unsafe Pointer.borrowMut<(), Body>(&mut anchor, unsafe nonnull(p)) let mut n: usize = 0
+  if !Pointer.isNull<Record>(b.first) {
+    let recordAnchor = () let r = unsafe Pointer.borrow<(), Record>(&recordAnchor, unsafe nonnull(b.first)) n = r.length - b.offset if n > capacity { n = capacity }
+    if n != 0 { unsafe copy(dest, unsafe at(r.data, b.offset), n) } b.offset = b.offset + n
+    let mut credit = n if b.offset == r.length { credit = credit + Layout.of<Record>().bytes + 1 }
+    b.queued = b.queued - credit
+    let mut sessionAnchor = () let owner = unsafe Pointer.borrowMut<(), Session>(&mut sessionAnchor, unsafe cast<Session>(opaque)) owner.memory = owner.memory - credit drop owner
+    if b.offset == r.length { let old = unsafe nonnull(b.first) b.first = r.next if Pointer.isNull<Record>(b.first) { b.last = Pointer.null<Record>() } b.offset = 0 drop r let owned = unsafe Pointer.take<Record>(old) unsafe c.free(owned.data) unsafe c.free(unsafe raw(old)) let status = unsafe event(opaque, 6, id, 0, 0, 0, nil(), 0, nil(), 0) if status != 0 { return i32.toI64(status) } }
+  }
+  if Pointer.isNull<Record>(b.first) && b.eof {
+    let mut f: u32 = 1 if b.trailers { f = 3 } unsafe Pointer.put<u32>(flags, f)
+    if b.trailers && !b.notified { b.notified = true let status = unsafe event(opaque, 7, id, 0, 0, 0, nil(), 0, nil(), 0) if status != 0 { return i32.toI64(status) } }
+  } else { if n == 0 { return -508 } }
+  return usize.toI64(n)
+}
+pub effect fn open() -> *mut State ! OutOfMemoryError { let p = unsafe c.calloc(1, Layout.of<State>().bytes) if Pointer.isNull<u8>(p) { fail OutOfMemoryError {} } let s = unsafe cast<State>(p) unsafe Pointer.put<State>(s, State { first: Pointer.null<Session>(), next: 1 }) return s }
+unsafe fn dispose(p: *mut Session) -> () {
+  let anchor = () let entry = unsafe Pointer.borrow<(), Session>(&anchor, p) let ptr = entry.ptr drop entry
+  unsafe c.nghttp2_session_del(ptr)
+  let mut s = unsafe Pointer.take<Session>(p) unsafe freeRecords(s.first)
+  while !Pointer.isNull<Body>(s.bodies) { let bodyAnchor = () let b = unsafe Pointer.borrow<(), Body>(&bodyAnchor, unsafe nonnull(s.bodies)) let id = b.id drop b unsafe freeBody(&mut s, id) }
+  unsafe c.free(unsafe raw(p))
+}
+pub unsafe fn close(state: *mut State) -> () { let s = unsafe Pointer.take<State>(state) let mut p = s.first while !Pointer.isNull<Session>(p) { let anchor = () let h = unsafe Pointer.borrow<(), Session>(&anchor, unsafe nonnull(p)) let next = h.next drop h unsafe dispose(unsafe nonnull(p)) p = next } unsafe c.free(unsafe raw(state)) }
+unsafe fn locate(state: *mut State, id: i32) -> ?*mut Session { let anchor = () let s = unsafe Pointer.borrow<(), State>(&anchor, state) let mut p = s.first drop s while !Pointer.isNull<Session>(p) { let h = unsafe Pointer.borrow<(), Session>(&anchor, unsafe nonnull(p)) if h.id == id { return p } p = h.next } return Pointer.null<Session>() }
+unsafe fn release(state: *mut State, id: i32) -> () { let mut anchor = () let s = unsafe Pointer.borrowMut<(), State>(&mut anchor, state) let mut link = Pointer.fromMutRef<?*mut Session>(&mut s.first) drop s while !Pointer.isNull<Session>(unsafe Pointer.read<?*mut Session>(link)) { let p = unsafe nonnull(unsafe Pointer.read<?*mut Session>(link)) let h = unsafe Pointer.borrowMut<(), Session>(&mut anchor, p) if h.id == id { unsafe Pointer.put<?*mut Session>(link, h.next) drop h unsafe dispose(p) return () } link = Pointer.fromMutRef<?*mut Session>(&mut h.next) drop h } }
+unsafe fn copyOutput(call: &mut Call, data: ?*mut u8, n: usize) -> i64 { call.binary = true call.output = unsafe c.calloc(1, n + 1) if Pointer.isNull<u8>(call.output) { return -901 } call.length = n if n != 0 { unsafe copy(call.output, data, n) } return 0 }
+unsafe fn execute(state: *mut State, name: &[u8], call: &mut Call) -> i64 {
+  if equal(name, b"create") {
+    let p = unsafe c.calloc(1, Layout.of<Session>().bytes) if Pointer.isNull<u8>(p) { return -901 } let h = unsafe cast<Session>(p)
+    unsafe Pointer.put<Session>(h, Session { next: Pointer.null<Session>(), id: 0, ptr: nil(), first: Pointer.null<Record>(), last: Pointer.null<Record>(), bodies: Pointer.null<Body>(), memory: Layout.of<Session>().bytes, ngMemory: 0, socketMemory: 0, maxMemory: 10000000, maxPairs: 128, padding: 0, invalid: 0, maxInvalid: 1000, rejected: 0, maxRejected: 100 })
+    let mut callbacks = nil() let mut options = nil() let mut ptr = nil()
+    let mut status = unsafe c.nghttp2_session_callbacks_new(Pointer.fromMutRef<?*mut u8>(&mut callbacks))
+    if status == 0 { status = unsafe c.nghttp2_option_new(Pointer.fromMutRef<?*mut u8>(&mut options)) }
+    if status == 0 {
+      unsafe c.nghttp2_option_set_no_auto_window_update(options, 1)
+      unsafe c.nghttp2_option_set_peer_max_concurrent_streams(options, 100)
+      unsafe c.nghttp2_option_set_builtin_recv_extension_type(options, 10)
+      unsafe c.nghttp2_option_set_builtin_recv_extension_type(options, 12)
+      if call.lengths[1] == 60 {
+        let flags = i32.wrappingToU32(unsafe word(call.data[1], 0))
+        if u32.bitAnd(flags, 1) != 0 { unsafe c.nghttp2_option_set_max_deflate_dynamic_table_size(options, u32.toUsize(i32.wrappingToU32(unsafe word(call.data[1], 4)))) }
+        if u32.bitAnd(flags, 2) != 0 { unsafe c.nghttp2_option_set_max_reserved_remote_streams(options, i32.wrappingToU32(unsafe word(call.data[1], 8))) }
+        if u32.bitAnd(flags, 4) != 0 { unsafe c.nghttp2_option_set_max_send_header_block_length(options, u32.toUsize(i32.wrappingToU32(unsafe word(call.data[1], 12)))) }
+        if u32.bitAnd(flags, 8) != 0 { unsafe c.nghttp2_option_set_peer_max_concurrent_streams(options, i32.wrappingToU32(unsafe word(call.data[1], 16))) }
+        if u32.bitAnd(flags, 16) != 0 { unsafe c.nghttp2_option_set_max_settings(options, u32.toUsize(i32.wrappingToU32(unsafe word(call.data[1], 20)))) }
+        let mut configAnchor = () let config = unsafe Pointer.borrowMut<(), Session>(&mut configAnchor, h)
+        config.maxMemory = u32.toUsize(i32.wrappingToU32(unsafe word(call.data[1], 24))) + u32.toUsize(i32.wrappingToU32(unsafe word(call.data[1], 56))) * 4294967296
+        config.maxPairs = u32.toUsize(i32.wrappingToU32(unsafe word(call.data[1], 28)))
+        config.padding = unsafe word(call.data[1], 32)
+        config.maxInvalid = i32.wrappingToU32(unsafe word(call.data[1], 36))
+        config.maxRejected = i32.wrappingToU32(unsafe word(call.data[1], 40))
+        if unsafe word(call.data[1], 52) != 0 { unsafe c.nghttp2_option_set_stream_reset_rate_limit(options, u32.toU64(i32.wrappingToU32(unsafe word(call.data[1], 44))), u32.toU64(i32.wrappingToU32(unsafe word(call.data[1], 48)))) }
+      }
+      unsafe c.nghttp2_session_callbacks_set_on_begin_headers_callback(callbacks, silkHttp2Begin)
+      unsafe c.nghttp2_session_callbacks_set_on_invalid_frame_recv_callback(callbacks, silkHttp2Invalid)
+      if call.lengths[1] == 60 && unsafe word(call.data[1], 32) != 0 { unsafe c.nghttp2_session_callbacks_set_select_padding_callback(callbacks, silkHttp2Padding) }
+      unsafe c.nghttp2_session_callbacks_set_on_header_callback(callbacks, silkHttp2Header)
+      unsafe c.nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, silkHttp2Frame)
+      unsafe c.nghttp2_session_callbacks_set_on_frame_send_callback(callbacks, silkHttp2Sent)
+      unsafe c.nghttp2_session_callbacks_set_on_frame_not_send_callback(callbacks, silkHttp2NotSent)
+      unsafe c.nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, silkHttp2Data)
+      unsafe c.nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, silkHttp2Close)
+      let mut memory = c.Memory { user: p, alloc: silkHttp2Alloc, release: silkHttp2Free, zero: silkHttp2Calloc, resize: silkHttp2Realloc }
+      if call.numbers[0] == 1 { status = unsafe c.nghttp2_session_server_new3(Pointer.fromMutRef<?*mut u8>(&mut ptr), callbacks, p, options, Pointer.fromMutRef<c.Memory>(&mut memory)) } else { status = unsafe c.nghttp2_session_client_new3(Pointer.fromMutRef<?*mut u8>(&mut ptr), callbacks, p, options, Pointer.fromMutRef<c.Memory>(&mut memory)) }
+    }
+    unsafe c.nghttp2_session_callbacks_del(callbacks) unsafe c.nghttp2_option_del(options)
+    if status != 0 { unsafe c.free(p) return i32.toI64(status) }
+    let mut anchor = () let s = unsafe Pointer.borrowMut<(), State>(&mut anchor, state)
+    let id = s.next let first = s.first s.first = h s.next = s.next + 1 drop s
+    let entry = unsafe Pointer.borrowMut<(), Session>(&mut anchor, h)
+    entry.ptr = ptr entry.id = id entry.next = first return i32.toI64(id)
+  }
+  if equal(name, b"socketMemory") {
+    let p = unsafe locate(state, i64.toI32(call.numbers[0])) if Pointer.isNull<Session>(p) { return -501 }
+    let mut anchor = () let s = unsafe Pointer.borrowMut<(), Session>(&mut anchor, unsafe nonnull(p)) s.socketMemory = i64.toUsize(call.numbers[1]) return 0
+  }
+  let id = i64.toI32(call.numbers[0]) if equal(name, b"release") { unsafe release(state, id) return 0 }
+  let p = unsafe locate(state, id) if Pointer.isNull<Session>(p) { return -501 }
+  let mut anchor = () let s = unsafe Pointer.borrowMut<(), Session>(&mut anchor, unsafe nonnull(p)) let ptr = s.ptr
+  if equal(name, b"poll") {
+    call.binary = true if Pointer.isNull<Record>(s.first) { return unsafe copyOutput(&mut call, nil(), 0) }
+    let r = unsafe Pointer.take<Record>(unsafe nonnull(s.first)) let old = s.first s.first = r.next if Pointer.isNull<Record>(s.first) { s.last = Pointer.null<Record>() }
+    s.memory = s.memory - Layout.of<Record>().bytes - r.length - 1
+    // A recv batch may close a stream before JS delivers its earlier HEADERS.
+    // Those handlers can queue a response and recreate a body; reclaim it when
+    // delivering CLOSE as well, before JS marks the stream native-closed.
+    if unsafe word(r.data, 0) == 4 { unsafe freeBody(&mut s, unsafe word(r.data, 4)) }
+    call.output = r.data call.length = r.length unsafe c.free(unsafe raw(unsafe nonnull(old))) return 0
+  }
+  if equal(name, b"recv") {
+    s.memory = s.memory + call.lengths[1] drop s
+    let result = unsafe c.nghttp2_session_mem_recv(ptr, call.data[1], call.lengths[1])
+    let entry = unsafe Pointer.borrowMut<(), Session>(&mut anchor, unsafe nonnull(p)) entry.memory = entry.memory - call.lengths[1]
+    return result
+  }
+  if equal(name, b"send") { drop s let mut data = nil() let n = unsafe c.nghttp2_session_mem_send(ptr, Pointer.fromMutRef<?*mut u8>(&mut data)) if n < 0 { return n } return unsafe copyOutput(&mut call, data, i64.toUsize(n)) }
+  let stream = i64.toI32(call.numbers[1])
+  if equal(name, b"body") {
+    let bp = unsafe body(&mut s, stream) drop s if Pointer.isNull<Body>(bp) { return -901 }
+    let b = unsafe Pointer.borrowMut<(), Body>(&mut anchor, unsafe nonnull(bp)) b.enabled = true return 0
+  }
+  if equal(name, b"write") || equal(name, b"end") {
+    let bp = unsafe findBody(&s, stream) drop s if Pointer.isNull<Body>(bp) { return -510 } let b = unsafe Pointer.borrowMut<(), Body>(&mut anchor, unsafe nonnull(bp))
+    if equal(name, b"write") { if b.eof { return -501 } let rp = unsafe c.calloc(1, Layout.of<Record>().bytes) if Pointer.isNull<u8>(rp) { return -901 } let r = unsafe cast<Record>(rp) unsafe Pointer.put<Record>(r, Record { next: Pointer.null<Record>(), data: call.data[2], length: call.lengths[2] }) call.data[2] = nil()
+      if Pointer.isNull<Record>(b.last) { b.first = r } else { let mut recordAnchor = () let last = unsafe Pointer.borrowMut<(), Record>(&mut recordAnchor, unsafe nonnull(b.last)) last.next = r } b.last = r
+      let charge = call.lengths[2] + Layout.of<Record>().bytes + 1 b.queued = b.queued + charge
+      let mut sessionAnchor = () let owner = unsafe Pointer.borrowMut<(), Session>(&mut sessionAnchor, unsafe nonnull(p)) owner.memory = owner.memory + charge
+    } else { b.eof = true b.trailers = call.numbers[2] != 0 }
+    drop b let ignored = unsafe c.nghttp2_session_resume_data(ptr, stream) return 0
+  }
+  if equal(name, b"consume") {
+    let bp = unsafe findBody(&s, stream)
+    if !Pointer.isNull<Body>(bp) { let mut ba = () let b = unsafe Pointer.borrowMut<(), Body>(&mut ba, unsafe nonnull(bp)) let mut n = i64.toUsize(call.numbers[2]) if n > b.received { n = b.received } b.received = b.received - n s.memory = s.memory - n }
+  }
+  drop s
+  if equal(name, b"wantIO") { if unsafe c.nghttp2_session_want_read(ptr) != 0 || unsafe c.nghttp2_session_want_write(ptr) != 0 { return 1 } return 0 }
+  if equal(name, b"headers") || equal(name, b"push") {
+    if stream == -1 || equal(name, b"push") { let resourceAnchor = () let owner = unsafe Pointer.borrow<(), Session>(&resourceAnchor, unsafe nonnull(p)) if !unsafe available(&owner, Layout.of<Body>().bytes + call.lengths[2]) { return -901 } }
+    let data = call.data[2] let length = call.lengths[2] let mut offset: usize = 0 let mut count: usize = 0
+    while offset + 12 <= length { let nn = unsafe word(data, offset) let vn = unsafe word(data, offset + 4) if nn < 0 || vn < 0 { return -501 } offset = offset + 12 + i32.toUsize(nn) + i32.toUsize(vn) if offset > length { return -501 } count = count + 1 }
+    if offset != length { return -501 } let memory = unsafe c.calloc(count + 1, Layout.of<c.NV>().bytes) if Pointer.isNull<u8>(memory) { return -901 } offset = 0 let mut index: usize = 0
+    while index < count { let nn = i32.toUsize(unsafe word(data, offset)) let vn = i32.toUsize(unsafe word(data, offset + 4)) let flags = i32.toU8(unsafe word(data, offset + 8)) unsafe Pointer.put<c.NV>(unsafe cast<c.NV>(unsafe at(memory, index * Layout.of<c.NV>().bytes)), c.NV { name: unsafe at(data, offset + 12), value: unsafe at(data, offset + 12 + nn), nameLength: nn, valueLength: vn, flags: flags }) offset = offset + 12 + nn + vn index = index + 1 }
+    let mut result: i32 = 0
+    if equal(name, b"push") { result = unsafe c.nghttp2_submit_push_promise(ptr, 0, stream, unsafe cast<c.NV>(memory), count, nil()) } else { result = unsafe c.nghttp2_submit_headers(ptr, i64.toU8(call.numbers[3]), stream, Pointer.null<c.Priority>(), unsafe cast<c.NV>(memory), count, nil()) }
+    unsafe c.free(memory)
+    if result >= 0 {
+      let mut ownerAnchor = () let owner = unsafe Pointer.borrowMut<(), Session>(&mut ownerAnchor, unsafe nonnull(p))
+      let mut target = stream if result > 0 { target = result }
+      let bp = unsafe body(&mut owner, target)
+      if Pointer.isNull<Body>(bp) { return -901 }
+      let mut bodyAnchor = () let b = unsafe Pointer.borrowMut<(), Body>(&mut bodyAnchor, unsafe nonnull(bp))
+      let charge = length + count * 20 b.headers = b.headers + charge owner.memory = owner.memory + charge
+    }
+    return i32.toI64(result)
+  }
+  if equal(name, b"settings") { if call.lengths[1] % 8 != 0 { return -501 } return i32.toI64(unsafe c.nghttp2_submit_settings(ptr, 0, unsafe Intrinsic.pointerReinterpret<?*mut u8, ?*mut c.Setting>(call.data[1]), call.lengths[1] / 8)) }
+  if equal(name, b"altsvc") { return i32.toI64(unsafe c.nghttp2_submit_altsvc(ptr, 0, stream, call.data[2], call.lengths[2], call.data[3], call.lengths[3])) }
+  if equal(name, b"origin") {
+    let data = call.data[1] let length = call.lengths[1] let mut count: usize = 0 let mut offset: usize = 0
+    while offset + 4 <= length { let n = unsafe word(data, offset) if n < 0 { return -501 } offset = offset + 4 + i32.toUsize(n) count = count + 1 }
+    if offset != length { return -501 }
+    let memory = unsafe c.calloc(count + 1, Layout.of<c.OriginEntry>().bytes) if Pointer.isNull<u8>(memory) { return -901 }
+    offset = 0 let mut index: usize = 0
+    while index < count { let n = i32.toUsize(unsafe word(data, offset)) unsafe Pointer.put<c.OriginEntry>(unsafe cast<c.OriginEntry>(unsafe at(memory, index * Layout.of<c.OriginEntry>().bytes)), c.OriginEntry { origin: unsafe at(data, offset + 4), length: n }) offset = offset + 4 + n index = index + 1 }
+    let result = unsafe c.nghttp2_submit_origin(ptr, 0, unsafe cast<c.OriginEntry>(memory), count) unsafe c.free(memory) return i32.toI64(result)
+  }
+  if equal(name, b"ping") { if call.lengths[1] != 8 { return -501 } return i32.toI64(unsafe c.nghttp2_submit_ping(ptr, 0, call.data[1])) }
+  if equal(name, b"rst") { return i32.toI64(unsafe c.nghttp2_submit_rst_stream(ptr, 0, stream, i64.toU32(call.numbers[2]))) }
+  if equal(name, b"goaway") { return i32.toI64(unsafe c.nghttp2_submit_goaway(ptr, 0, stream, i64.toU32(call.numbers[2]), call.data[3], call.lengths[3])) }
+  if equal(name, b"terminate") { return i32.toI64(unsafe c.nghttp2_session_terminate_session(ptr, i64.toU32(call.numbers[1]))) }
+  if equal(name, b"consume") { return i32.toI64(unsafe c.nghttp2_session_consume(ptr, stream, i64.toUsize(call.numbers[2]))) }
+  if equal(name, b"window") { return i32.toI64(unsafe c.nghttp2_session_set_local_window_size(ptr, 0, stream, i64.toI32(call.numbers[2]))) }
+  if equal(name, b"remoteSetting") { return u32.toI64(unsafe c.nghttp2_session_get_remote_settings(ptr, stream)) }
+  if equal(name, b"localSetting") { return u32.toI64(unsafe c.nghttp2_session_get_local_settings(ptr, stream)) }
+  if equal(name, b"lastStream") { return i32.toI64(unsafe c.nghttp2_session_get_last_proc_stream_id(ptr)) }
+  if equal(name, b"localWindow") { if stream == 0 { return i32.toI64(unsafe c.nghttp2_session_get_local_window_size(ptr)) } return i32.toI64(unsafe c.nghttp2_session_get_stream_local_window_size(ptr, stream)) }
+  if equal(name, b"remoteWindow") { if stream == 0 { return i32.toI64(unsafe c.nghttp2_session_get_remote_window_size(ptr)) } return i32.toI64(unsafe c.nghttp2_session_get_stream_remote_window_size(ptr, stream)) }
+  if equal(name, b"localClose") { return i32.toI64(unsafe c.nghttp2_session_get_stream_local_close(ptr, stream)) }
+  if equal(name, b"remoteClose") { return i32.toI64(unsafe c.nghttp2_session_get_stream_remote_close(ptr, stream)) }
+  if equal(name, b"streamState") || equal(name, b"weight") || equal(name, b"sumWeight") {
+    let entry = unsafe c.nghttp2_session_find_stream(ptr, stream) if Pointer.isNull<u8>(entry) { return 0 }
+    if equal(name, b"streamState") { return i32.toI64(unsafe c.nghttp2_stream_get_state(entry)) }
+    if equal(name, b"weight") { return i32.toI64(unsafe c.nghttp2_stream_get_weight(entry)) }
+    return i32.toI64(unsafe c.nghttp2_stream_get_sum_dependency_weight(entry))
+  }
+  if equal(name, b"nextStream") { return u32.toI64(unsafe c.nghttp2_session_get_next_stream_id(ptr)) }
+  if equal(name, b"setNextStream") { let ignored = unsafe c.nghttp2_session_set_next_stream_id(ptr, stream) return 0 }
+  if equal(name, b"effectiveLocalWindow") { return i32.toI64(unsafe c.nghttp2_session_get_effective_local_window_size(ptr)) }
+  if equal(name, b"effectiveRecvLength") { return i32.toI64(unsafe c.nghttp2_session_get_effective_recv_data_length(ptr)) }
+  if equal(name, b"outboundSize") { return usize.toI64(unsafe c.nghttp2_session_get_outbound_queue_size(ptr)) }
+  if equal(name, b"inflateSize") { return usize.toI64(unsafe c.nghttp2_session_get_hd_inflate_dynamic_table_size(ptr)) }
+  if equal(name, b"deflateSize") { return usize.toI64(unsafe c.nghttp2_session_get_hd_deflate_dynamic_table_size(ptr)) }
+  return -501
+}
+unsafe effect fn throwError<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, code: i32) -> Value ! JsException | OutOfMemoryError ? &mut Allocator {
+  let memory = engine.memory let error = run unsafe errors.newError(&mut engine, memory, context)
+  let built = run Effect.result(unsafe errorProperties(&mut engine, context, error, code))
+  match move built { Result<(), OutOfMemoryError | JsException>.Success { .. } => () Result<(), OutOfMemoryError | JsException>.Failure { error: failure } => { unsafe owners.release(&mut engine, context, error) fail move failure } }
+  return run unsafe exceptions.throwValue<Value, Engine<'m, S>>(&mut engine, unsafe runtime.contextRuntime(context), error)
+}
+unsafe effect fn errorProperties<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, error: Value, code: i32) -> () ! JsException | OutOfMemoryError ? &mut Allocator {
+  let p = unsafe c.nghttp2_strerror(code) let mut text = List<u8>.make() let mut n: usize = 0 while unsafe Pointer.read<u8>(unsafe at(p, n)) != 0 { run text.append(unsafe Pointer.read<u8>(unsafe at(p, n))) n = n + 1 }
+  let message = run unsafe host.string(&mut engine, context, text.asSlice()) run unsafe common.define(&mut engine, context, error, b"message", message, 7)
+  let kind = run unsafe host.string(&mut engine, context, b"ERR_HTTP2_ERROR") run unsafe common.define(&mut engine, context, error, b"code", kind, 7)
+  run unsafe common.define(&mut engine, context, error, b"errno", Value.Float64 { value: i32.toF64(code) }, 7)
+}
+unsafe effect fn argument<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, call: &mut Call, i: usize, value: Value) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  if value.isNumber() { let n = value.numericValue() if !f64.isFinite(n) || f64.trunc(n) != n || n < -2147483648.0 || n > 4294967295.0 { let ignored = run unsafe throwError(&mut engine, context, -501) return () } call.numbers[i] = f64.toI64(n) return () }
+  match value { Value.Undefined => { return () } Value.Null => { return () } _ => () }
+  let backing = run unsafe buffers.getArrayBuffer(&mut engine, context, value)
+  if backing.byteLength > usize.toU64(usize.MAX - 1) { fail OutOfMemoryError {} }
+  call.lengths[i] = u64.toUsize(backing.byteLength)
+  call.data[i] = unsafe c.calloc(1, call.lengths[i] + 1) if Pointer.isNull<u8>(call.data[i]) { fail OutOfMemoryError {} }
+  let mut n: u64 = 0 while n < backing.byteLength { unsafe Pointer.put<u8>(unsafe buffers.dataAt(call.data[i], n), u64.toU8(unsafe buffers.loadScalar(backing, n, 0))) n = n + 1 }
+}
+unsafe effect fn dispatchCall<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, argv: &FrameSlots, call: &mut Call) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  let name = run unsafe host.text(&mut engine, context, unsafe common.argument(argv, 0)) let args = unsafe common.argument(argv, 1) let mut i: u32 = 0
+  while i < 6 { let value = run unsafe owners.getIndex(&mut engine, context, args, i) let result = run Effect.result(unsafe argument(&mut engine, context, &mut call, u32.toUsize(i), value)) unsafe owners.release(&mut engine, context, value) match move result { Result<(), OutOfMemoryError | JsException>.Success { .. } => () Result<(), OutOfMemoryError | JsException>.Failure { error } => { fail move error } } i = i + 1 }
+  let result = unsafe execute(state, name.asSlice(), &mut call) if result < 0 { return run unsafe throwError(&mut engine, context, i64.toI32(result)) }
+  if !call.binary { return Value.Float64 { value: i64.toF64(result) } }
+  let memory = engine.memory return run unsafe buffers.newArrayBufferCopy(&mut engine, memory, context, call.output, usize.toU64(call.length))
+}
+pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, argc: i32, argv: &FrameSlots) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut call = Call { data: [nil(); 6], lengths: [0; 6], numbers: [0; 6], output: nil(), length: 0, number: 0, binary: false }
+  let result = run Effect.result(unsafe dispatchCall(&mut engine, context, state, argv, &mut call)) let mut i: usize = 0 while i < 6 { unsafe c.free(call.data[i]) i = i + 1 } unsafe c.free(call.output)
+  return match move result { Result<Value, OutOfMemoryError | JsException>.Success { value } => value Result<Value, OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
+}
