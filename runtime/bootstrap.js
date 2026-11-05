@@ -345,13 +345,13 @@ const performanceMilestones = {
   nodeStart: 0, environment: native.environmentTime - startTime,
   bootstrapComplete: -1, loopStart: -1, loopExit: -1,
 };
-let sleepIdleTime = 0, initialNativeIdleTime = 0;
+let initialNativeIdleTime = 0;
 const loopListeners = new Set();
 host.performanceStartTime = startTime;
 host.performanceTimeOrigin = Date.now() - (native.now() - startTime);
 host.performanceLoopStats = () => {
   if (performanceMilestones.loopStart < 0) return { idle: 0, active: 0 };
-  const idle = sleepIdleTime + native.loopIdleTime() - initialNativeIdleTime;
+  const idle = native.loopIdleTime() - initialNativeIdleTime;
   const end = performanceMilestones.loopExit < 0 ? native.now() - startTime : performanceMilestones.loopExit;
   return { idle, active: Math.max(0, end - performanceMilestones.loopStart - idle) };
 };
@@ -1097,36 +1097,32 @@ function pollWorkers() {
   }
   native.workerNative('wake', []);
 }
+// Milliseconds the native poll may wait: 0 when JavaScript work is ready, the
+// delay to the next timer, or -1 to wait for native completions alone.
+function pollTimeout(pendingPromise) {
+  if (ticks.length || immediates.size) return 0;
+  if (pendingPromise !== undefined && native.promiseState(pendingPromise) !== 0) return 0;
+  const referenced = referencedWork();
+  if (!referenced && pendingPromise === undefined) return 0;
+  let due = Infinity;
+  for (const timer of timers.values()) if (!timer._destroyed && timer._due < due) due = timer._due;
+  // A hook may await an unreferenced timer or an externally settled promise.
+  // Keep nested waits interruptible without emitting main-loop lifecycle events.
+  if (!referenced && due === Infinity) return 1;
+  if (due === Infinity) return native.hasPendingIO() ? -1 : 0;
+  return Math.max(0, Math.ceil(due - native.now()));
+}
 function loopTurn(pendingPromise) {
   const now = native.now();
   for (const timer of [...timers.values()].sort((a, b) => a._due - b._due || a._id - b._id)) {
     if (!timer._destroyed && timer._due <= now) fireTimer(timer, timers);
   }
-  const pending = pendingPromise === undefined || native.promiseState(pendingPromise) === 0;
-  native.pollIO(pending && timers.size === 0 && immediates.size === 0 && native.hasPendingIO());
+  native.pollIO(pollTimeout(pendingPromise));
   pollWorkers();
   checkpoint();
   for (const listener of loopListeners) listener();
   for (const timer of [...immediates.values()]) {
     if (!timer._destroyed) fireTimer(timer, immediates);
-  }
-  if (pendingPromise !== undefined && native.promiseState(pendingPromise) !== 0) return;
-  if (ticks.length || immediates.size) return;
-  const referenced = referencedWork();
-  if (!referenced && pendingPromise === undefined) return;
-  let due = Infinity;
-  for (const timer of timers.values()) if (!timer._destroyed && timer._due < due) due = timer._due;
-  // A hook may await an unreferenced timer or an externally settled promise.
-  // Keep nested waits interruptible without emitting main-loop lifecycle events.
-  if (!referenced && due === Infinity) due = native.now() + 1;
-  if (due !== Infinity) {
-    // libuv has no JS-timer deadline: bounded sleeps precede nonblocking polls.
-    const delay = Math.max(0, Math.ceil(due - native.now()));
-    if (delay) {
-      const idleStart = native.now();
-      try { rawOS.sleep(Math.min(delay, 1)); }
-      finally { sleepIdleTime += native.now() - idleStart; }
-    }
   }
 }
 function loop() {
