@@ -4,13 +4,13 @@
 C calls original static/public QuickJS entry points; native calls the real object
 coercion boundary with stored getters, callable closures, method replacement,
 collection inside callbacks and real pending TypeError/RangeError objects. The
-records include outputs even on failure, saturation flags, integer Value tags,
+records include outputs even on failure, saturation flags, integer ValueBits tags,
 error prototype/message, callback order, reference deltas and finalizer order.
 Both runtimes must independently have zero live allocations after teardown.
 
 Run: python3 scripts/verify_integer_coercions.py QUICKJS
 The reference uses 32-bit int/uint32 and 64-bit int64/uint64 on either pointer ABI;
-no native Value layout or C long width is assumed. Uint8Clamp assumes the source
+no native ValueBits layout or C long width is assumed. Uint8Clamp assumes the source
 round-to-nearest/ties-even floating environment. No BigInt-to-integer extension.
 """
 import argparse
@@ -175,7 +175,7 @@ import byte_buffer { ByteBuffer }
 import runtime_memory { RuntimeAllocator, AllocationObserver }
 import js_heap { HeapCell, HeapHeader, HeapKind }
 import js_core_types { RuntimeState, ContextState, ObjectData, ShapeData }
-import js_value { Value }
+import js_value { ValueBits }
 import js_runtime as runtime
 import js_gc as gc
 import js_strings { Strings }
@@ -192,7 +192,7 @@ import js_integer_coercions_test_support as transitions
 import js_integer_coercions as integer
 import js_atom_data as atoms
 import js_array_storage_test_support { trap, reference }
-unsafe fn rc(value: Value) -> i32 {
+unsafe fn rc(value: ValueBits) -> i32 {
   match value.heapReference() {
     Option<*mut HeapHeader>.None => { return 0 }
     Option<*mut HeapHeader>.Some { value: node } => {
@@ -216,17 +216,17 @@ fn number(value: f64) -> u64 {
 effect fn wide(out: &mut ByteBuffer, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
   run out.writeU32(u64.toU32(value & 0xffffffff)) run out.writeU32(u64.toU32(u64.shiftRight(value, 32)))
 }
-effect fn text(out: &mut ByteBuffer, value: Value) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn text(out: &mut ByteBuffer, value: ValueBits) -> () ! OutOfMemoryError ? &mut Allocator {
   run out.writeU32(usize.toU32(Strings.length(value))) let mut i: usize = 0
   while i < Strings.length(value) { run out.writeU32(u16.toU32(Strings.codeUnit(value, i))) i = i + 1 }
 }
-unsafe effect fn leaf(rt: *mut HeapHeader, kind: u32) -> Value
+unsafe effect fn leaf(rt: *mut HeapHeader, kind: u32) -> ValueBits
   ! OutOfMemoryError | StringLengthError | BigIntError ? &mut Allocator {
   let bits: [u64; @NUMBERS@] = [@SILK_BITS@]
-  if kind < @NUMBERS@ { return Value.Float64 { value: f64.fromBits(bits[u32.toUsize(kind)]) } }
+  if kind < @NUMBERS@ { return ValueBits.Float64 { value: f64.fromBits(bits[u32.toUsize(kind)]) } }
   let extra = kind - @NUMBERS@
-  if extra == 0 { return Value.Undefined } if extra == 1 { return Value.Null }
-  if extra == 2 { return Value.Bool { value: false } } if extra == 3 { return Value.Bool { value: true } }
+  if extra == 0 { return ValueBits.Undefined } if extra == 1 { return ValueBits.Null }
+  if extra == 2 { return ValueBits.Bool { value: false } } if extra == 3 { return ValueBits.Bool { value: true } }
   if extra == 4 { return run Strings.fromLatin1(b"") }
   if extra == 5 { return run Strings.fromLatin1(b" -0 ") }
   if extra == 6 { return run Strings.fromLatin1(b"7.9") }
@@ -240,18 +240,18 @@ unsafe effect fn leaf(rt: *mut HeapHeader, kind: u32) -> Value
   if extra == 14 {
     let description = StringOwner.adopt(run Strings.fromLatin1(b"integer-symbol"))
     let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
-    return run state.atoms.uniqueSymbol(Option<Value>.some(description.get()))
+    return run state.atoms.uniqueSymbol(Option<ValueBits>.some(description.get()))
   }
-  if extra == 15 { return Value.ShortBigInt { value: 7 } }
-  if extra == 17 { return Value.Int { value: -2147483647 - 1 } }
-  if extra == 18 { return Value.Int { value: 2147483647 } }
-  if extra == 19 { return Value.Int { value: 0 } }
-  if extra == 20 { return Value.Int { value: -1 } }
+  if extra == 15 { return ValueBits.ShortBigInt { value: 7 } }
+  if extra == 17 { return ValueBits.Int { value: -2147483647 - 1 } }
+  if extra == 18 { return ValueBits.Int { value: 2147483647 } }
+  if extra == 19 { return ValueBits.Int { value: 0 } }
+  if extra == 20 { return ValueBits.Int { value: -1 } }
   let big = run BigInt.fromI64(9007199254740993)
-  return Value.BigInt { reference: run HeapCell.allocate(HeapKind.BigInt, move big) }
+  return ValueBits.BigInt { reference: run HeapCell.allocate(HeapKind.BigInt, move big) }
 }
-struct Outputs { floating: f64, narrow: i32, wideValue: i64, unsigned: u32, index: u64, integerValue: Value, flags: u8 }
-unsafe effect fn convert(hooks: &mut Hooks, ctx: *mut HeapHeader, value: Value, op: u32, out: &mut Outputs) -> ()
+struct Outputs { floating: f64, narrow: i32, wideValue: i64, unsigned: u32, index: u64, integerValue: ValueBits, flags: u8 }
+unsafe effect fn convert(hooks: &mut Hooks, ctx: *mut HeapHeader, value: ValueBits, op: u32, out: &mut Outputs) -> ()
   ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
   if op == 0 { run unsafe integer.toFloat64(&mut hooks, ctx, &mut out.floating, value) }
   else if op == 1 { run unsafe integer.toFloat64Free(&mut hooks, ctx, &mut out.floating, unsafe value.retained()) }
@@ -280,7 +280,7 @@ unsafe effect fn convert(hooks: &mut Hooks, ctx: *mut HeapHeader, value: Value, 
   else if op == 25 { run unsafe integer.toInt64Clamp(&mut hooks, ctx, &mut out.wideValue, value, 5, 10, 20) }
   else { trap() }
 }
-unsafe fn errorKind(context: *mut HeapHeader, error: Value) -> u32 {
+unsafe fn errorKind(context: *mut HeapHeader, error: ValueBits) -> u32 {
   let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(error))
   let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, object.shape)
   let proto = shape.prototype
@@ -294,13 +294,13 @@ unsafe effect fn runCase(out: &mut ByteBuffer, hooks: &mut Hooks, memory: &Alloc
   ! OutOfMemoryError | StringLengthError | JsException | BigIntError ? &mut Allocator {
   let rt = unsafe runtime.contextRuntime(context) hooks.clear()
   let first = run unsafe leaf(rt, kind)
-  let mut second = Value.Int { value: 7 }
+  let mut second = ValueBits.Int { value: 7 }
   if (kind & 1) == 0 { second = unsafe first.retained() }
   let firstRoots = unsafe rc(first) let secondRoots = unsafe rc(second)
   let input = run unsafe transitions.make(&mut hooks, memory, context, family, first, second)
   let inputBefore = unsafe rc(input) let firstBefore = unsafe rc(first) let secondBefore = unsafe rc(second)
   let mut outputs = Outputs { floating: 17.25, narrow: 0x12345678, wideValue: 0x1234567812345678,
-    unsigned: 0x87654321, index: 0x8765432187654321, integerValue: Value.Exception, flags: 0 }
+    unsigned: 0x87654321, index: 0x8765432187654321, integerValue: ValueBits.Exception, flags: 0 }
   let outcome = run Effect.result(unsafe convert(&mut hooks, context, input, op, &mut outputs))
   let mut failed: u32 = 0
   match &outcome {

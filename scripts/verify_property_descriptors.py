@@ -154,7 +154,7 @@ import js_runtime as runtime
 import js_object_allocate as objects
 import js_class_data as classes
 import js_atom_data as atoms
-import js_value { Value }
+import js_value { ValueBits }
 import js_strings { Strings }
 import js_string_types { StringLengthError, stringReference }
 import js_var_refs as varRefs
@@ -171,16 +171,16 @@ import js_errors_test_support { FaultAllocator as OneShotAllocator }
 import js_exceptions { JsException }
 import js_exceptions as exceptions
 
-effect fn value(out: &mut ByteBuffer, item: Value) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn value(out: &mut ByteBuffer, item: ValueBits) -> () ! OutOfMemoryError ? &mut Allocator {
   match item {
-    Value.Undefined => { run out.writeU32(0) }
-    Value.Int { value: number } => { run out.writeU32(1) run out.writeU32(i32.toU32(number)) }
-    Value.String { .. } => {
+    ValueBits.Undefined => { run out.writeU32(0) }
+    ValueBits.Int { value: number } => { run out.writeU32(1) run out.writeU32(i32.toU32(number)) }
+    ValueBits.String { .. } => {
       run out.writeU32(2) run out.writeU32(usize.toU32(Strings.length(item)))
       let mut i: usize = 0
       while i < Strings.length(item) { run out.writeU32(u16.toU32(Strings.codeUnit(item, i))) i = i + 1 }
     }
-    Value.Object { .. } => { run out.writeU32(3) }
+    ValueBits.Object { .. } => { run out.writeU32(3) }
     _ => trap()
   }
 }
@@ -193,7 +193,7 @@ unsafe effect fn error<'a>(out: &mut ByteBuffer, hooks: &mut Hooks<'a>, ctx: *mu
   unsafe gc.release(&mut hooks, rt, pending)
 }
 unsafe effect fn query<'a>(out: &mut ByteBuffer, hooks: &mut Hooks<'a>, ctx: *mut HeapHeader,
-  object: Value, atom: u32, requested: bool, text: Value, leaf: Value) -> ()
+  object: ValueBits, atom: u32, requested: bool, text: ValueBits, leaf: ValueBits) -> ()
   ! OutOfMemoryError | JsException ? &mut Allocator {
   let rt = unsafe runtime.contextRuntime(ctx)
   if requested {
@@ -231,10 +231,10 @@ unsafe effect fn runCase<'a>(out: &mut ByteBuffer, hooks: &mut Hooks<'a>, memory
   ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
   hooks.exoticCalls = 0 hooks.existenceCalls = 0 hooks.failExotic = family == 12
   let rt = unsafe runtime.contextRuntime(ctx)
-  let text = run Strings.fromLatin1(b"owned") let leaf = run unsafe objects.withPrototype(&mut hooks, memory, ctx, Value.Null)
+  let text = run Strings.fromLatin1(b"owned") let leaf = run unsafe objects.withPrototype(&mut hooks, memory, ctx, ValueBits.Null)
   let key = run unsafe stored.atom(rt, b"key", 0)
-  let mut object = Value.Undefined
-  if family == 10 { object = Value.Int { value: 73 } }
+  let mut object = ValueBits.Undefined
+  if family == 10 { object = ValueBits.Int { value: 73 } }
   else if family == 9 || family == 12 {
     object = run unsafe stored.exotic(&mut hooks.stored, memory, ctx)
     run unsafe stored.store(rt, object, Entry { atom: key, flags: flags, present: true, seedEnumerable: true,
@@ -242,7 +242,7 @@ unsafe effect fn runCase<'a>(out: &mut ByteBuffer, hooks: &mut Hooks<'a>, memory
   } else if family >= 5 && family <= 7 {
     let mut classId = classes.JS_CLASS_ARRAY
     if family == 6 { classId = classes.JS_CLASS_ARGUMENTS } if family == 7 { classId = classes.JS_CLASS_MAPPED_ARGUMENTS }
-    object = run unsafe objects.withPrototypeClass(&mut hooks, memory, ctx, Value.Null, classId)
+    object = run unsafe objects.withPrototypeClass(&mut hooks, memory, ctx, ValueBits.Null, classId)
     let mut i: usize = 0
     while i < 2 {
       if family == 7 { let cell = run unsafe storage.detached(rt, unsafe text.retained()) run unsafe storage.appendMapped(object, cell) }
@@ -259,7 +259,7 @@ unsafe effect fn runCase<'a>(out: &mut ByteBuffer, hooks: &mut Hooks<'a>, memory
       match &mut p.payload { ObjectPayload.TypedArray { array } => { array.count = 0 array.cachedData = Pointer.null<u8>() } _ => trap() }
     }
   } else {
-    object = run unsafe objects.withPrototype(&mut hooks, memory, ctx, Value.Null)
+    object = run unsafe objects.withPrototype(&mut hooks, memory, ctx, ValueBits.Null)
     if family == 11 { let mut anchor = () let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, reference(object)) p.isExotic = true }
   }
   if family == 0 { run unsafe stored.add(&mut hooks, rt, object, key, u32.toU8(flags | 8), PropertySlot.Value { value: unsafe text.retained() }) }
@@ -307,8 +307,8 @@ effect fn probe(out: &mut ByteBuffer) -> AllocationObserver ! OutOfMemoryError |
   let d = descriptor(move found)
   run out.writeU32(1) run out.writeU32(d.flags)
   if d.value.isException() { run out.writeU32(1) } else { run out.writeU32(0) }
-  if match d.getter { Value.Undefined => true _ => false } { run out.writeU32(1) } else { run out.writeU32(0) }
-  if match d.setter { Value.Undefined => true _ => false } { run out.writeU32(1) } else { run out.writeU32(0) }
+  if match d.getter { ValueBits.Undefined => true _ => false } { run out.writeU32(1) } else { run out.writeU32(0) }
+  if match d.setter { ValueBits.Undefined => true _ => false } { run out.writeU32(1) } else { run out.writeU32(0) }
   if unsafe exceptions.has(rt) { run out.writeU32(1) } else { run out.writeU32(0) }
   run out.writeU32(usize.toU32(fault.failures))
   run unsafe error(&mut out, &mut hooks, ctx) |> Effect.provideMut<Allocator>(&mut fault)

@@ -1,6 +1,7 @@
 //! Arguments construction and the complete arguments exotic table from
 //! quickjs.c:16378-16513; intrinsic shape layouts from 59937-59963.
 //! Inputs are borrowed. Returned objects own values/cells; frame caches do not.
+import thin_list { ThinList }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.collections.list { List }
@@ -11,9 +12,13 @@ import silk.num.u32
 import silk.num.usize
 import runtime_memory { AllocationObserver }
 import js_heap { HeapCell, HeapHeader }
-import js_value { Value }
+import js_value { ValueBits }
+import js_owned_value { ValueRef, lendBits, immediateRef }
+import js_object_ref { ObjectRef }
+import js_intl_realm as ops
+import js_realm { Realm, lendRealm, Arguments, lendArguments }
 import js_core_types { RuntimeState, ContextState, StackFrame, FrameSlots, ObjectData, ObjectPayload,
-  FunctionBytecode, JS_MODE_STRICT, PropertySlot, JS_PROP_INITIAL_HASH_SIZE, JS_PROP_WRITABLE, JS_PROP_CONFIGURABLE,
+  FunctionBytecode, JS_MODE_STRICT, PropertySlot, SlotBits, JS_PROP_INITIAL_HASH_SIZE, JS_PROP_WRITABLE, JS_PROP_CONFIGURABLE,
   JS_PROP_GETSET, JS_PROP_NO_EXOTIC, NativeErrorKind, NativeFunctionId, BuiltinFamily }
 import js_runtime_classes { NATIVE_JS_ARGUMENTS_EXOTIC_METHODS }
 import js_gc { HeapHooks }
@@ -42,7 +47,7 @@ pub fn isTable(table: NativeFunctionId) -> bool {
 }
 /// Stable Arguments-family dispatch identity for js_throw_type_error.
 pub const THROW_TYPE_ERROR: u32 = 0
-pub unsafe fn isThrower(function: Value) -> bool {
+pub unsafe fn isThrower(function: ValueBits) -> bool {
   if !function.isObject() { return false }
   let anchor = () let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(function))
   return match &p.payload {
@@ -57,8 +62,8 @@ fn present(pointer: ?*mut HeapHeader) -> *mut HeapHeader {
   if Pointer.isNull<HeapHeader>(pointer) { trap() }
   return unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(pointer)
 }
-fn reference(value: Value) -> *mut HeapHeader {
-  return match value { Value.Object { reference } => reference _ => trap() }
+fn reference(value: ValueBits) -> *mut HeapHeader {
+  return match value { ValueBits.Object { reference } => reference _ => trap() }
 }
 unsafe effect fn fillShape(rt: *mut HeapHeader, shape: *mut HeapHeader, mapped: bool) -> ()
   ! OutOfMemoryError ? &mut Allocator {
@@ -84,10 +89,9 @@ unsafe effect fn makeShape<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader,
 /// initializes shapes only: Array.prototype.values and %ThrowTypeError% must be
 /// installed by their intrinsic owners. Existing shapes must both be absent.
 /// OOM releases partial shapes and leaves both context fields unchanged.
-pub unsafe effect fn initializeShapes<H: HeapHooks>(hooks: &mut H,
-  context: *mut HeapHeader) -> () ! OutOfMemoryError ? &mut Allocator {
-  let rt = unsafe runtime.contextRuntime(context)
-  let anchor = () let ctx = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+pub effect fn initializeShapes<'a, H: HeapHooks>(hooks: &mut H,realm: Realm<'a>) -> () ! OutOfMemoryError ? &mut Allocator { let context = realm.context()
+  let rt = realm.runtime()
+  let anchor = () let ctx = realm.state(&anchor)
   if !Pointer.isNull<HeapHeader>(ctx.argumentsShape) || !Pointer.isNull<HeapHeader>(ctx.mappedArgumentsShape) { trap() }
   let prototype = reference(ctx.classPrototypes.get(u32.toUsize(classes.JS_CLASS_OBJECT)))
   drop ctx
@@ -99,22 +103,27 @@ pub unsafe effect fn initializeShapes<H: HeapHooks>(hooks: &mut H,
       unsafe gc.releaseHeader(&mut hooks, rt, strict) fail move error
     }
   }
-  let mut changedAnchor = () let changed = unsafe HeapCell.payloadMut<ContextState, ()>(&mut changedAnchor, context)
+  let mut changedAnchor = () let changed = realm.stateMut(&mut changedAnchor)
   changed.argumentsShape = strict changed.mappedArgumentsShape = mapped
 }
-unsafe effect fn allocate<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
-  context: *mut HeapHeader, argc: usize, mapped: bool) -> Value ! OutOfMemoryError ? &mut Allocator {
+// aliased: the object's indices alias the frame's formals (MappedArguments
+// payload). A sloppy function with no mapped formal gets the mapped shape
+// (a data callee) on an ordinary fast-array arguments object instead.
+effect fn allocate<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,realm: Realm<'a>, argc: usize, mapped: bool,
+  aliased: bool) -> ValueBits ! OutOfMemoryError ? &mut Allocator { let context = realm.context()
   if argc > 2147483647 { return run Allocator.outOfMemory() }
-  let anchor = () let ctx = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  let anchor = () let ctx = realm.state(&anchor)
   let mut shape = ctx.argumentsShape let mut classId = classes.JS_CLASS_ARGUMENTS
-  if mapped { shape = ctx.mappedArgumentsShape classId = classes.JS_CLASS_MAPPED_ARGUMENTS }
+  if mapped { shape = ctx.mappedArgumentsShape }
+  if aliased { classId = classes.JS_CLASS_MAPPED_ARGUMENTS }
   let layout = present(shape) let iterator = ctx.arrayPrototypeValues let thrower = ctx.throwTypeError let rt = ctx.runtime
   drop ctx
-  // Allocation precedes retaining the three supplied slots; fromShape consumes
-  // all of them even when its object allocation or slot-capacity growth fails.
-  let mut slots = run unsafe shapes.allocateSlots(layout)
-  slots.set(0, PropertySlot.Value { value: Value.Int { value: usize.toI32(argc) } })
-  slots.set(1, PropertySlot.Value { value: unsafe iterator.retained() })
+  // The object keeps its three slots in its cell; they start Undefined and are
+  // filled in place once the object exists, so a failure retains nothing.
+  unsafe HeapCell.retain(layout)
+  let object = run unsafe objects.fromShape(&mut hooks, memory, realm, layout, classId,
+    Option<ThinList<SlotBits>>.none())
+  let mut callee = SlotBits.value(ValueBits.Undefined)
   if mapped {
     let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
     let frame = match Pointer.nonNullMut<StackFrame>(state.currentStackFrame) {
@@ -122,18 +131,21 @@ unsafe effect fn allocate<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserv
     }
     drop state
     let current = unsafe Pointer.borrow<(), StackFrame>(&anchor, frame)
-    slots.set(2, PropertySlot.Value { value: unsafe current.currentFunction.retained() })
+    callee = SlotBits.value(unsafe current.currentFunction.retained())
   } else {
     let callable = reference(thrower)
     unsafe HeapCell.retain(callable) unsafe HeapCell.retain(callable)
-    slots.set(2, PropertySlot.GetterSetter { getter: callable, setter: callable })
+    callee = SlotBits.from(PropertySlot.GetterSetter { getter: callable, setter: callable })
   }
-  unsafe HeapCell.retain(layout)
-  return run unsafe objects.fromShape(&mut hooks, memory, context, layout, classId,
-    Option<List<PropertySlot>>.some(move slots))
+  let mut objectAnchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut objectAnchor, reference(object))
+  data.properties.set(0, SlotBits.value(ValueBits.Int { value: usize.toI32(argc) }))
+  data.properties.set(1, SlotBits.value(unsafe iterator.retained()))
+  data.properties.set(2, callee)
+  return object
 }
 unsafe effect fn argumentCell(rt: *mut HeapHeader, frame: ?*mut StackFrame,
-  value: Value, index: usize, mappedCount: usize) -> *mut HeapHeader ! OutOfMemoryError ? &mut Allocator {
+  value: ValueBits, index: usize, mappedCount: usize) -> *mut HeapHeader ! OutOfMemoryError ? &mut Allocator {
   if index < mappedCount {
     let active = match Pointer.nonNullMut<StackFrame>(frame) {
       Option<*mut StackFrame>.Some { value: activeFrame } => activeFrame _ => trap()
@@ -144,24 +156,31 @@ unsafe effect fn argumentCell(rt: *mut HeapHeader, frame: ?*mut StackFrame,
   let previous = unsafe varRefs.replace(cell, unsafe value.retained())
   return cell
 }
-unsafe effect fn fill(context: *mut HeapHeader, object: Value, argv: &FrameSlots,
+unsafe effect fn fill<'a, 'b>(realm: Realm<'a>, object: ValueRef<'b>, args: Arguments<'a>,
   frame: ?*mut StackFrame, mappedCount: usize) -> () ! OutOfMemoryError ? &mut Allocator {
-  let rt = unsafe runtime.contextRuntime(context)
-  let mut anchor = () let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, reference(object))
+  let rt = realm.runtime()
+  let mut anchor = () let p = ObjectRef.of(object).dataMut(&mut anchor)
   match &mut p.payload {
     ObjectPayload.FastArray { array } => {
-      run array.values.reserveExact(argv.length())
+      if array.values.capacity() == 0 {
+        if let Option<ThinList<ValueBits>>.Some { value: spare } = unsafe shapes.takeSpareValues(rt, args.slots().length()) {
+          let empty = Intrinsic.replace(array.values, move spare) drop empty
+        }
+      }
+      let count = args.slots().length()
+      if array.values.capacity() - array.values.length() < count { run array.values.reserveExact(count) }
+      // Room for every value is reserved, so each one is a plain push.
       let mut i: usize = 0
-      while i < argv.length() {
-        let value = unsafe argv.get(i)
-        run array.values.append(unsafe value.retained()) i = i + 1
+      while i < count {
+        let value = unsafe args.slots().get(i)
+        array.values.push(unsafe value.retained()) i = i + 1
       }
     }
     ObjectPayload.MappedArguments { arguments } => {
-      run arguments.varRefs.reserveExact(argv.length())
+      run arguments.varRefs.reserveExact(args.slots().length())
       let mut i: usize = 0
-      while i < argv.length() {
-        let cell = run unsafe argumentCell(rt, frame, unsafe argv.get(i), i, mappedCount)
+      while i < args.slots().length() {
+        let cell = run unsafe argumentCell(rt, frame, unsafe args.slots().get(i), i, mappedCount)
         // Capacity was reserved before obtaining any cell ownership. Every
         // initialized prefix is immediately traced/finalized by the object.
         run arguments.varRefs.append(cell)
@@ -171,19 +190,18 @@ unsafe effect fn fill(context: *mut HeapHeader, object: Value, argv: &FrameSlots
     _ => trap()
   }
 }
-unsafe effect fn construct<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
-  context: *mut HeapHeader, argv: &FrameSlots, frame: ?*mut StackFrame,
-  mappedCount: usize, mapped: bool) -> Value ! OutOfMemoryError ? &mut Allocator {
+unsafe effect fn construct<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,realm: Realm<'a>, args: Arguments<'a>, frame: ?*mut StackFrame,
+  mappedCount: usize, mapped: bool) -> ValueBits ! OutOfMemoryError ? &mut Allocator { let context = realm.context()
   unsafe HeapCell.retain(context)
-  let rt = unsafe runtime.contextRuntime(context)
-  let allocated = run Effect.result(unsafe allocate(&mut hooks, memory, context, argv.length(), mapped))
+  let rt = realm.runtime()
+  let allocated = run Effect.result(allocate(&mut hooks, memory, realm, args.slots().length(), mapped, mapped && mappedCount != 0))
   let object = match move allocated {
-    Result<Value, OutOfMemoryError>.Success { value } => value
-    Result<Value, OutOfMemoryError>.Failure { error } => {
+    Result<ValueBits, OutOfMemoryError>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError>.Failure { error } => {
       unsafe gc.releaseHeader(&mut hooks, rt, context) fail move error
     }
   }
-  let filled = run Effect.result(unsafe fill(context, object, argv, frame, mappedCount))
+  let filled = run Effect.result(unsafe fill(realm, unsafe lendBits(&object, object), args, frame, mappedCount))
   match move filled {
     Result<(), OutOfMemoryError>.Success { .. } => {
       unsafe gc.releaseHeader(&mut hooks, rt, context) return object
@@ -195,31 +213,29 @@ unsafe effect fn construct<H: HeapHooks>(hooks: &mut H, memory: &AllocationObser
   }
 }
 /// Strict functions and functions with nonsimple parameters use unmapped values.
-pub unsafe effect fn build<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
-  context: *mut HeapHeader, argv: &FrameSlots) -> Value ! OutOfMemoryError ? &mut Allocator {
-  return run unsafe construct(&mut hooks, memory, context, argv, Pointer.null<StackFrame>(), 0, false)
+pub effect fn build<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,realm: Realm<'a>, args: Arguments<'a>) -> ValueBits ! OutOfMemoryError ? &mut Allocator {
+  return run unsafe construct(&mut hooks, memory, realm, args, Pointer.null<StackFrame>(), 0, false)
 }
 /// mappedCount is the caller-capped prefix min(actual argc, formal arg_count),
 /// NOT the formal count. Every mapped formal must be captured in bytecode with
 /// initialized frame varRef cache storage. argv's excess values become independent
 /// detached cells. The frame and its slots must stay stable and rooted until the
 /// caller detaches its references on return; callee comes from currentStackFrame.
-pub unsafe effect fn buildMapped<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
-  context: *mut HeapHeader, argv: &FrameSlots, frame: *mut StackFrame,
-  mappedCount: usize) -> Value ! OutOfMemoryError ? &mut Allocator {
-  if mappedCount > argv.length() { trap() }
-  return run unsafe construct(&mut hooks, memory, context, argv, frame, mappedCount, true)
+pub unsafe effect fn buildMapped<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,realm: Realm<'a>, args: Arguments<'a>, frame: *mut StackFrame,
+  mappedCount: usize) -> ValueBits ! OutOfMemoryError ? &mut Allocator {
+  if mappedCount > args.slots().length() { trap() }
+  return run unsafe construct(&mut hooks, memory, realm, args, frame, mappedCount, true)
 }
 /// The entire source arguments exotic table contains only this define callback.
 /// Conversion retains mapped cells, then ordinary property algorithms perform
 /// value writes or alias severance on accessor/nonwritable transitions.
-pub unsafe effect fn defineOwnProperty<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(
-  hooks: &mut H, context: *mut HeapHeader, object: Value, atom: u32,
-  value: Value, getter: Value, setter: Value, flags: u32) -> bool
+pub effect fn defineOwnProperty<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(
+  hooks: &mut H, realm: Realm<'a>, object: ValueRef<'b>, atom: u32,
+  value: ValueRef<'b>, getter: ValueRef<'b>, setter: ValueRef<'b>, flags: u32) -> bool
   ! OutOfMemoryError | JsException ? &mut Allocator {
-  let rt = unsafe runtime.contextRuntime(context)
-  let anchor = () let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(object))
-  let fast = p.fastArray
+  let rt = realm.runtime()
+  let anchor = () let p = ObjectRef.of(object).data(&anchor)
+  let fast = p.fastArray()
   let count = match &p.payload {
     ObjectPayload.FastArray { array } => array.values.length()
     ObjectPayload.MappedArguments { arguments } => arguments.varRefs.length()
@@ -227,16 +243,16 @@ pub unsafe effect fn defineOwnProperty<H: HeapHooks + OwnPropertyHooks + Coercio
   }
   drop p
   if fast {
-    let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+    let state = realm.runtimeState(&anchor)
     let index = state.atoms.arrayIndex(atom) drop state
     match move index {
       Option<u32>.Some { value: position } => {
-        if u32.toUsize(position) < count { run unsafe arrays.convertFastToSlow(&mut hooks, context, reference(object)) }
+        if u32.toUsize(position) < count { run unsafe arrays.convertFastToSlow(&mut hooks, realm, reference(object.view())) }
       }
       Option<u32>.None => ()
     }
   }
-  let defined = run Effect.result(unsafe mutations.defineProperty(&mut hooks, context, object, atom,
+  let defined = run Effect.result(mutations.defineProperty(&mut hooks, realm, object, atom,
     value, getter, setter, flags | JS_PROP_NO_EXOTIC))
   return match move defined {
     Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { value: accepted } => accepted
@@ -251,17 +267,16 @@ pub unsafe effect fn defineOwnProperty<H: HeapHooks + OwnPropertyHooks + Coercio
 }
 /// %ThrowTypeError% body, quickjs.c:16343-16351, including its ES5-compatible
 /// nonstrict ordinary-function getter exception. The setter always throws.
-pub unsafe effect fn throwTypeError<H: CoercionHooks>(hooks: &mut H,
-  context: *mut HeapHeader, receiver: Value, argc: usize) -> Value ! JsException ? &mut Allocator {
-  if receiver.isObject() && argc == 0 {
-    let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(receiver))
+pub effect fn throwTypeError<'a, 'b, H: CoercionHooks>(hooks: &mut H,realm: Realm<'a>, receiver: ValueRef<'b>, argc: usize) -> ValueBits ! JsException ? &mut Allocator {
+  if receiver.view().isObject() && argc == 0 {
+    let anchor = () let object = ObjectRef.of(receiver).data(&anchor)
     match &object.payload {
       ObjectPayload.BytecodeFunction { function } => {
         let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, function.bytecode)
-        if (bytecode.mode & JS_MODE_STRICT) == 0 && bytecode.hasPrototype { return Value.Undefined }
+        if (bytecode.mode & JS_MODE_STRICT) == 0 && bytecode.hasPrototype { return ValueBits.Undefined }
       }
       _ => ()
     }
   }
-  return run unsafe hooks.throwError(context, NativeErrorKind.Type, b"invalid property access")
+  return run ops.throwError(&mut hooks,realm, NativeErrorKind.Type, b"invalid property access")
 }

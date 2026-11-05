@@ -3,6 +3,8 @@
 //! The cell, runtime, source and compiler tree must be live and exclusively owned;
 //! allocator callbacks must not reenter them. Source is the FULL immutable parse
 //! input, not FunctionDef.source (the extracted function text).
+import thin_list { ThinList }
+import silk.core.option { Option }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.collections.list { List }
@@ -17,7 +19,7 @@ import js_heap { HeapHeader, HeapCell }
 import js_atoms { AtomTable }
 import js_atom_data as atoms
 import js_core_types { RuntimeState }
-import js_compiler_types { FunctionDef, LabelSlot, JumpSlot, RelocEntry }
+import js_compiler_types { FunctionDef, FunctionId, FunctionTree, linked, LabelSlot, JumpSlot, RelocEntry }
 import js_debug_positions { PcSourcePosition }
 import js_debugger_metadata { Location }
 import js_compiler_state { computePc2Line }
@@ -29,6 +31,7 @@ import js_opcode_data as op
 fn matchedLine(cc: &CodeContext, line: &mut i32) -> () {
   if cc.lineNumber >= 0 { line.* = cc.lineNumber }
 }
+@inlineAlways
 effect fn unchanged(fd: &mut FunctionDef, bytes: &[u8], out: &mut ByteBuffer, position: i32, length: i32, line: i32) -> ()
   ! OutOfMemoryError ? &mut Allocator {
   run addPosition(&mut fd, &out.*, line)
@@ -46,6 +49,7 @@ effect fn constantTest(fd: &mut FunctionDef, table: &mut AtomTable, bytes: &[u8]
 
 // One source switch arm per branch below. Returning next is the source's break;
 // unchanged is no_change, and emitBranch implements has_goto/has_label.
+@inlineAlways
 effect fn resolveInstruction(fd: &mut FunctionDef, table: &mut AtomTable, bytes: &[u8], out: &mut ByteBuffer,
     position: i32, line: &mut i32) -> i32 ! OutOfMemoryError ? &mut Allocator {
   let pos = i32.toUsize(position)
@@ -70,12 +74,12 @@ effect fn resolveInstruction(fd: &mut FunctionDef, table: &mut AtomTable, bytes:
     return next
   }
   if code == op.OP_call || code == op.OP_call_method {
+    // `call; return` stays two instructions rather than becoming OP_tail_call:
+    // the interpreter runs plain calls to bytecode functions in its own loop,
+    // while a tail call would recurse natively (QuickJS's tail call is no TCO).
+    // The call keeps the position a tail call reports, the return statement's.
     let count = u16.toI32(readU16(bytes, pos + 1))
-    if matchCode(&mut cc, bytes, next, &[opcode(op.OP_return), -1]) {
-      matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
-      run putShortCode(&mut out, code + 1, count)
-      return skipDeadCode(&mut fd, &mut table, bytes, cc.position, &mut line)
-    }
+    if matchCode(&mut cc, bytes, next, &[opcode(op.OP_return), -1]) { matchedLine(&cc, &mut line) }
     run addPosition(&mut fd, &out.*, line.*) run putShortCode(&mut out, code, count) return next
   }
   if code == op.OP_return || code == op.OP_return_undef || code == op.OP_return_async
@@ -113,6 +117,20 @@ effect fn resolveInstruction(fd: &mut FunctionDef, table: &mut AtomTable, bytes:
       matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*) run out.append(test)
       return run emitBranch(&mut fd, &mut table, bytes, &mut out, position, cc.position, &mut line,
         i32.toU8(cc.opcode) ^ op.OP_if_false ^ op.OP_if_true, cc.label, false)
+    }
+    // x == null and x == undefined hold exactly for undefined and null (there is
+    // no document.all), so the loose comparison becomes one test.
+    if matchCode(&mut cc, bytes, next, &[opcode(op.OP_eq), -1]) {
+      matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*) run out.append(op.OP_is_undefined_or_null) return cc.position
+    }
+    if matchCode(&mut cc, bytes, next, &[opcode(op.OP_neq), M2(op.OP_if_false, op.OP_if_true), -1]) {
+      matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*) run out.append(op.OP_is_undefined_or_null)
+      return run emitBranch(&mut fd, &mut table, bytes, &mut out, position, cc.position, &mut line,
+        i32.toU8(cc.opcode) ^ op.OP_if_false ^ op.OP_if_true, cc.label, false)
+    }
+    if matchCode(&mut cc, bytes, next, &[opcode(op.OP_neq), -1]) {
+      matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
+      run out.append(op.OP_is_undefined_or_null) run out.append(op.OP_lnot) return cc.position
     }
     if code == op.OP_null && matchCode(&mut cc, bytes, next, &[M2(op.OP_if_false, op.OP_if_true), -1]) {
       return run constantTest(&mut fd, &mut table, bytes, &mut out, position, &cc, &mut line, false)
@@ -347,9 +365,9 @@ effect fn resolve(fd: &mut FunctionDef, table: &mut AtomTable, source: &[u8]) ->
   // Surviving atom operands transfer without retain/release; removed ones were
   // released at their source rewrite. Publish before debug encoding can fail.
   fd.bytecode = move out fd.useShortOpcodes = true
-  fd.labels = List<LabelSlot>.make() fd.jumps = List<JumpSlot>.make() fd.relocations = List<RelocEntry>.make()
+  fd.labels = ThinList<LabelSlot>.make() fd.jumps = ThinList<JumpSlot>.make() fd.relocations = ThinList<RelocEntry>.make()
   run computePc2Line(&mut fd, source)
-  fd.lineNumbers = List<PcSourcePosition>.make()
+  fd.lineNumbers = ThinList<PcSourcePosition>.make()
   fd.callSiteSources = List<PcSourcePosition>.make()
 }
 effect fn failed(error: OutOfMemoryError) -> bool { drop error return false }
@@ -358,9 +376,9 @@ effect fn resolveSuccess(fd: &mut FunctionDef, table: &mut AtomTable, source: &[
 }
 // Failure is sticky and the function remains destroyable. No GC callbacks run:
 // releasing bytecode atoms affects only the runtime atom/string registry.
-pub unsafe effect fn resolveLabels(cell: *mut HeapHeader, source: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+pub effect fn resolveLabels(tree: &mut FunctionTree, cell: FunctionId, source: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
   let mut anchor = ()
-  let fd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
+  let fd = tree.getMut(cell)
   let mut runtimeAnchor = ()
   let runtime = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, fd.runtime)
   let ok = run Effect.catchAll(resolveSuccess(&mut fd.*, &mut runtime.atoms, source), failed)

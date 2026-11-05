@@ -8,15 +8,17 @@ import silk.core.option { Option }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.layout { Layout }
 import silk.mem.pointer { Pointer }
+import silk.mem.raw_buffer { RawBuffer }
+import thin_list { ThinList }
 import silk.num.usize
 import silk.num.u32
 import silk.num.u64
 import runtime_memory { AllocationObserver }
-import js_heap { HeapHeader, HeapCell, HeapKind }
-import js_value { Value }
+import js_heap { HeapHeader, HeapCell, HeapKind, CellRef }
+import js_value { ValueBits }
 import js_core_types { RuntimeState, ContextState, ObjectData, ObjectPayload, ShapeData,
-  ShapeProperty, PropertySlot, AutoInitOpaque, FunctionBytecode, FunctionDebugInfo,
-  VarDef, ClosureVar, VarRef, VarRefState, FrameSlot, FrameSlots, FrameReferences, StackFrame, AsyncFrame,
+  ShapeProperty, PropertySlot, SlotBits, AutoInitOpaque, FunctionBytecode, FunctionDebugInfo,
+  SourceText, NativeCapturedValues, NO_SP, VarDef, ClosureVar, VarRef, VarRefState, FrameSlot, StackFrame, AsyncFrame,
   ModuleDef, RequestedModule, ExportEntry, StarExportEntry, ImportEntry, ExportBinding,
   JobEntry, ByteStorage, ClassDef, WeakRefHeader, GcPhase, LeakTrackingState }
 import js_string_types { FlatString, RopeString, AtomRegistry, AtomSlot }
@@ -32,16 +34,10 @@ pub struct BusyHeap {}
 fn bytes(storage: &ByteStorage) -> usize {
   return match &storage.* { ByteStorage.Owned { bytes } => bytes.capacity() _ => 0 }
 }
-fn slotBytes(storage: &FrameSlots) -> usize {
-  return match &storage.* {
-    FrameSlots.Owned { slots } => slots.length() * Layout.of<Value>().bytes
-    FrameSlots.Borrowed { .. } => 0
-  }
-}
 unsafe fn required(pointer: ?*mut HeapHeader) -> *mut HeapHeader {
   return unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(pointer)
 }
-unsafe effect fn strong(graph: &mut Graph, from: usize, value: Value, label: &'static [u8], index: usize) -> ()
+unsafe effect fn strong(graph: &mut Graph, from: usize, value: ValueBits, label: &'static [u8], index: usize) -> ()
   ! OutOfMemoryError ? &mut Allocator {
   run unsafe graph.value(from, value, label, index, Strength.Strong, usize.MAX)
 }
@@ -80,23 +76,24 @@ unsafe effect fn object(graph: &mut Graph, index: usize, cell: *mut HeapHeader) 
   let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, cell)
   run unsafe optional(&mut graph, index, data.shape, b"shape", 0)
   run unsafe optional(&mut graph, index, data.creationRealm, b"creationRealm", 0)
-  graph.backing(index, data.properties.capacity() * Layout.of<PropertySlot>().bytes)
+  if data.properties.ownsStorage() { graph.backing(index, data.properties.capacity() * Layout.of<SlotBits>().bytes) }
   let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
   let mut i: usize = 0
   while i < shape.properties.length() {
     let property = shape.properties.get(i)
     if property.atom != 0 {
       let key = u32.toUsize(property.atom)
-      match data.properties.get(i) {
+      let slot = data.properties.get(i).view(property.flags)
+      match slot {
         PropertySlot.Value { value } => { run unsafe strong(&mut graph, index, value, b"property.atom", key) }
         PropertySlot.GetterSetter { getter, setter } => {
           run unsafe optional(&mut graph, index, getter, b"getter.atom", key)
           run unsafe optional(&mut graph, index, setter, b"setter.atom", key)
         }
         PropertySlot.VarRef { reference } => { run unsafe optional(&mut graph, index, reference, b"binding.atom", key) }
-        PropertySlot.AutoInit { realm, opaque, .. } => {
-          run unsafe optional(&mut graph, index, realm, b"initializer.realm", key)
-          match opaque {
+        _ => {
+          run unsafe optional(&mut graph, index, slot.lazyRealm(), b"initializer.realm", key)
+          match slot.lazyOpaque() {
             AutoInitOpaque.Initializer { reference } => { run unsafe optional(&mut graph, index, reference, b"initializer.callable", key) }
             AutoInitOpaque.Heap { reference } => { run unsafe graph.edge(index, reference, b"initializer.borrowed", key, Strength.Borrowed, usize.MAX) }
             _ => ()
@@ -112,28 +109,38 @@ unsafe effect fn object(graph: &mut Graph, index: usize, cell: *mut HeapHeader) 
     ObjectPayload.BytecodeFunction { function } => {
       run unsafe optional(&mut graph, index, function.bytecode, b"bytecode", 0)
       run unsafe optional(&mut graph, index, function.homeObject, b"homeObject", 0)
-      graph.backing(index, function.varRefs.capacity() * Layout.of<?*mut HeapHeader>().bytes)
+      graph.backing(index, function.varRefs.length() * Layout.of<?*mut HeapHeader>().bytes)
       i = 0 while i < function.varRefs.length() { run unsafe optional(&mut graph, index, function.varRefs.get(i), b"closure", i) i = i + 1 }
     }
     ObjectPayload.NativeFunction { function } => {
-      run unsafe optional(&mut graph, index, function.realm, b"native.realm", 0)
-      graph.backing(index, function.capturedValues.capacity() * Layout.of<Value>().bytes)
-      i = 0 while i < function.capturedValues.length() { run unsafe strong(&mut graph, index, function.capturedValues.get(i), b"native.capture", i) i = i + 1 }
+      run unsafe optional(&mut graph, index, function.realm(), b"native.realm", 0)
+      match Pointer.nonNullMut<HeapHeader>(function.captured()) {
+        Option<*mut HeapHeader>.Some { value: captured } => {
+          run unsafe optional(&mut graph, index, captured, b"native.captured", 0)
+          let captureIndex = run unsafe graph.node(captured)
+          let values = unsafe HeapCell.payload<NativeCapturedValues, ()>(&anchor, captured)
+          if values.values.ownsStorage() { graph.backing(captureIndex, values.values.capacity() * Layout.of<ValueBits>().bytes) }
+          i = 0 while i < values.values.length() {
+            run unsafe strong(&mut graph, captureIndex, values.values.get(i), b"native.capture", i) i = i + 1
+          }
+        }
+        _ => ()
+      }
     }
     ObjectPayload.FastArray { array } => {
-      graph.backing(index, array.values.capacity() * Layout.of<Value>().bytes)
+      if array.values.ownsStorage() { graph.backing(index, array.values.capacity() * Layout.of<ValueBits>().bytes) }
       i = 0 while i < array.values.length() { run unsafe strong(&mut graph, index, array.values.get(i), b"element", i) i = i + 1 }
     }
     ObjectPayload.MappedArguments { arguments } => {
-      graph.backing(index, arguments.varRefs.capacity() * Layout.of<*mut HeapHeader>().bytes)
+      if arguments.varRefs.ownsStorage() { graph.backing(index, arguments.varRefs.capacity() * Layout.of<*mut HeapHeader>().bytes) }
       i = 0 while i < arguments.varRefs.length() { run unsafe optional(&mut graph, index, arguments.varRefs.get(i), b"mappedArgument", i) i = i + 1 }
     }
     ObjectPayload.TypedArray { array } => { run unsafe payloads.typed(&mut graph, index, array.view) }
     ObjectPayload.Boxed { value } => { run unsafe strong(&mut graph, index, value, b"boxed", 0) }
     ObjectPayload.ErrorStack { value, .. } => { run unsafe strong(&mut graph, index, value, b"errorStack", 0) }
     ObjectPayload.RegExp { regexp } => {
-      run unsafe strong(&mut graph, index, regexp.pattern, b"regexp.pattern", 0)
-      run unsafe strong(&mut graph, index, regexp.bytecode, b"regexp.bytecode", 0)
+      run unsafe strong(&mut graph, index, regexp.pattern(), b"regexp.pattern", 0)
+      run unsafe strong(&mut graph, index, regexp.bytecode(), b"regexp.bytecode", 0)
     }
     ObjectPayload.GlobalObject { global } => { run unsafe strong(&mut graph, index, global.uninitializedVariables, b"global.uninitialized", 0) }
     ObjectPayload.Opaque { family, reference } => {
@@ -144,7 +151,7 @@ unsafe effect fn object(graph: &mut Graph, index: usize, cell: *mut HeapHeader) 
 unsafe effect fn context(graph: &mut Graph, index: usize, cell: *mut HeapHeader) -> ()
   ! OutOfMemoryError ? &mut Allocator {
   let anchor = () let data = unsafe HeapCell.payload<ContextState, ()>(&anchor, cell)
-  graph.backing(index, data.classPrototypes.capacity() * Layout.of<Value>().bytes)
+  graph.backing(index, data.classPrototypes.capacity() * Layout.of<ValueBits>().bytes)
   run unsafe strong(&mut graph, index, data.globalObject, b"globalObject", 0)
   run unsafe strong(&mut graph, index, data.globalObjectStorage, b"globalObjectStorage", 0)
   run unsafe strong(&mut graph, index, data.globalProxyBindings, b"globalProxyBindings", 0)
@@ -173,10 +180,9 @@ unsafe effect fn context(graph: &mut Graph, index: usize, cell: *mut HeapHeader)
   i = 0 while i < 9 { run unsafe strong(&mut graph, index, data.nativeErrorPrototypes[i], b"nativeErrorPrototype", i) i = i + 1 }
   i = 0 while i < data.classPrototypes.length() { run unsafe strong(&mut graph, index, data.classPrototypes.get(i), b"classPrototype", i) i = i + 1 }
   let mut cursor = data.loadedModules.first
-  while !Pointer.isNull<HeapHeader>(cursor) {
-    let module = unsafe required(cursor)
-    run unsafe optional(&mut graph, index, module, b"loadedModule", 0)
-    cursor = (unsafe HeapCell.payload<ModuleDef, ()>(&anchor, module)).nextModule
+  while let Option<CellRef<ModuleDef>>.Some { value: module } = cursor {
+    run unsafe optional(&mut graph, index, module.header(), b"loadedModule", 0)
+    cursor = module.get(&anchor).nextModule
   }
   if !Pointer.isNull<u8>(data.userOpaque) { run graph.limit(index, b"Context userOpaque has no native introspection contract") }
 }
@@ -185,7 +191,7 @@ unsafe effect fn module(graph: &mut Graph, index: usize, cell: *mut HeapHeader, 
   let anchor = () let data = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, cell)
   graph.backing(index, data.requestedModules.capacity() * Layout.of<RequestedModule>().bytes
     + data.exports.capacity() * Layout.of<ExportEntry>().bytes + data.starExports.capacity() * Layout.of<StarExportEntry>().bytes
-    + data.imports.capacity() * Layout.of<ImportEntry>().bytes + data.asyncParentModules.capacity() * Layout.of<*mut HeapHeader>().bytes)
+    + data.imports.capacity() * Layout.of<ImportEntry>().bytes + data.asyncParentModules.capacity() * Layout.of<CellRef<ModuleDef>>().bytes)
   run unsafe atom(&mut graph, index, table, data.name, b"module.name", 0)
   let strength = if data.hostOwnedGraph { Strength.Strong } else { Strength.Borrowed }
   let mut i: usize = 0
@@ -193,7 +199,9 @@ unsafe effect fn module(graph: &mut Graph, index: usize, cell: *mut HeapHeader, 
     let request = &data.requestedModules.asSlice()[i]
     run unsafe strong(&mut graph, index, request.attributes, b"import.attributes", i)
     run unsafe atom(&mut graph, index, table, request.name, b"import.name", i)
-    run unsafe graph.optional(index, request.module, b"import.module", i, strength, usize.MAX)
+    if let Option<CellRef<ModuleDef>>.Some { value: module } = request.module {
+      run unsafe graph.edge(index, module.header(), b"import.module", i, strength, usize.MAX)
+    }
     i = i + 1
   }
   i = 0 while i < data.exports.length() {
@@ -207,7 +215,7 @@ unsafe effect fn module(graph: &mut Graph, index: usize, cell: *mut HeapHeader, 
     run unsafe atom(&mut graph, index, table, data.imports.get(i).importName, b"import.bindingName", i) i = i + 1
   }
   i = 0 while i < data.asyncParentModules.length() {
-    run unsafe graph.edge(index, data.asyncParentModules.get(i), b"asyncParent", i, strength, usize.MAX) i = i + 1
+    run unsafe graph.edge(index, data.asyncParentModules.get(i).header(), b"asyncParent", i, strength, usize.MAX) i = i + 1
   }
   run unsafe strong(&mut graph, index, data.namespace, b"namespace", 0)
   run unsafe strong(&mut graph, index, data.functionObject, b"functionObject", 0)
@@ -223,7 +231,7 @@ unsafe effect fn visit(graph: &mut Graph, index: usize, table: &AtomTable) -> ()
   let node = graph.nodes.get(index) let cell = node.reference let anchor = ()
   // Weak references may keep only the allocation alive after payload teardown.
   // Expose that allocation, never reinterpret its destroyed children.
-  if (unsafe Pointer.borrow<(), HeapHeader>(&anchor, cell)).referenceCount <= 0 {
+  if node.kind != HeapKind.Shape && (unsafe Pointer.borrow<(), HeapHeader>(&anchor, cell)).referenceCount <= 0 {
     run graph.limit(index, b"Weak-only retained allocation; released payload is not traversed")
     return
   }
@@ -233,7 +241,8 @@ unsafe effect fn visit(graph: &mut Graph, index: usize, table: &AtomTable) -> ()
     HeapKind.Module => { run unsafe module(&mut graph, index, cell, table) }
     HeapKind.Shape => {
       let data = unsafe HeapCell.payload<ShapeData, ()>(&anchor, cell)
-      graph.backing(index, data.properties.capacity() * Layout.of<ShapeProperty>().bytes + data.hashIndices.capacity() * 4)
+      if data.properties.ownsStorage() { graph.backing(index, data.properties.capacity() * Layout.of<ShapeProperty>().bytes) }
+      if data.hashIndices.ownsStorage() { graph.backing(index, data.hashIndices.capacity() * 4) }
       run unsafe optional(&mut graph, index, data.prototype, b"prototype", 0)
       let mut i: usize = 0 while i < data.properties.length() {
         run unsafe atom(&mut graph, index, table, data.properties.get(i).atom, b"propertyName", i) i = i + 1
@@ -241,7 +250,7 @@ unsafe effect fn visit(graph: &mut Graph, index: usize, table: &AtomTable) -> ()
     }
     HeapKind.FunctionBytecode => {
       let data = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, cell)
-      graph.backing(index, bytes(&data.code) + data.constants.capacity() * Layout.of<Value>().bytes
+      graph.backing(index, bytes(&data.code) + data.constants.capacity() * Layout.of<ValueBits>().bytes
         + data.varDefs.capacity() * Layout.of<VarDef>().bytes + data.closureVars.capacity() * Layout.of<ClosureVar>().bytes)
       graph.backing(index, data.debuggerMetadata.locations.capacity() * Layout.of<Location>().bytes
         + data.debuggerMetadata.scopes.capacity() * Layout.of<Scope>().bytes
@@ -260,7 +269,15 @@ unsafe effect fn visit(graph: &mut Graph, index: usize, table: &AtomTable) -> ()
         Option<FunctionDebugInfo>.Some { value } => {
           run unsafe atom(&mut graph, index, table, value.filename, b"source.filename", 0)
           graph.backing(index, bytes(&value.pcToLine))
-          match &value.source { Option<ByteStorage>.Some { value: source } => { graph.backing(index, bytes(&source)) } _ => () }
+          match &value.source {
+            Option<SourceText>.Some { value: source } => {
+              match &source {
+                SourceText.Owned { bytes } => { graph.backing(index, bytes.capacity()) }
+                SourceText.Shared { text, .. } => { run unsafe strong(&mut graph, index, text.get(), b"source.text", 0) }
+              }
+            }
+            _ => ()
+          }
           match &value.callSitePcToLine { Option<ByteStorage>.Some { value: calls } => { graph.backing(index, bytes(&calls)) } _ => () }
         }
         _ => ()
@@ -273,7 +290,7 @@ unsafe effect fn visit(graph: &mut Graph, index: usize, table: &AtomTable) -> ()
         VarRefState.Attached { frame: pointer, slot, .. } => {
           let data = unsafe Pointer.borrow<(), StackFrame>(&anchor, pointer)
           run unsafe optional(&mut graph, index, data.asyncOwner, b"binding.asyncOwner", 0)
-          let value = match slot { FrameSlot.Argument { index: argumentIndex } => unsafe data.arguments.get(argumentIndex) FrameSlot.Local { index: localIndex } => unsafe data.locals.get(localIndex) }
+          let value = if slot.isArgument() { unsafe data.arguments.get(slot.index()) } else { unsafe data.locals.get(slot.index()) }
           run unsafe graph.value(index, value, b"binding.borrowedSlot", 0, Strength.Borrowed, usize.MAX)
         }
       }
@@ -281,14 +298,9 @@ unsafe effect fn visit(graph: &mut Graph, index: usize, table: &AtomTable) -> ()
     HeapKind.AsyncFunction => {
       let data = unsafe HeapCell.payload<AsyncFrame, ()>(&anchor, cell)
       let sf = data.frame.get()
-      graph.backing(index, Layout.of<StackFrame>().bytes
-        + slotBytes(&sf.arguments) + slotBytes(&sf.locals) + slotBytes(&sf.stack))
-      match &sf.varRefs {
-        FrameReferences.Owned { slots } => { graph.backing(index, slots.capacity() * Layout.of<?*mut HeapHeader>().bytes) }
-        _ => ()
-      }
+      graph.backing(index, data.frame.profileBytes())
       if !data.isCompleted {
-        let extent = match &sf.stackPointer { Option<usize>.Some { value } => Option<usize>.some(value) _ => Option<usize>.none() }
+        let extent = if sf.stackPointer != NO_SP { Option<usize>.some(sf.stackPointer) } else { Option<usize>.none() }
         run unsafe frame(&mut graph, index, sf, move extent, false)
         run unsafe strong(&mut graph, index, data.thisValue, b"async.this", 0)
       }
@@ -296,29 +308,65 @@ unsafe effect fn visit(graph: &mut Graph, index: usize, table: &AtomTable) -> ()
       run unsafe strong(&mut graph, index, data.resolvingFunctions[1], b"reject", 0)
     }
     HeapKind.String => {
-      let data = unsafe HeapCell.payload<FlatString, ()>(&anchor, cell)
-      graph.backing(index, data.latin1.capacity() + data.utf16.capacity() * 2)
+      let data = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, cell)
+      if !data.compact { graph.backing(index, data.latin1.capacity() + data.utf16.capacity() * 2) }
       run unsafe optional(&mut graph, index, data.registry, b"atom.registry", 0)
     }
     HeapKind.Rope => {
-      let data = unsafe HeapCell.payload<RopeString, ()>(&anchor, cell)
+      let data = unsafe HeapCell.shortPayload<RopeString, ()>(&anchor, cell)
       run unsafe strong(&mut graph, index, data.left, b"rope.left", 0)
       run unsafe strong(&mut graph, index, data.right, b"rope.right", 0)
     }
-    HeapKind.BigInt => { graph.backing(index, (unsafe HeapCell.payload<BigInt, ()>(&anchor, cell)).storageBytes()) }
+    HeapKind.BigInt => { graph.backing(index, (unsafe HeapCell.shortPayload<BigInt, ()>(&anchor, cell)).storageBytes()) }
     // Auxiliary layout is known only at its typed owning edge, never by guessing.
     HeapKind.Auxiliary => ()
   }
 }
 /// Captures owned roots and all live GC inventory without treating list membership
 /// as retention. Extra roots describe embedding handles unavailable to RuntimeState.
-pub unsafe effect fn snapshot(runtime: *mut HeapHeader, extraRoots: &[Value]) -> Graph
+pub unsafe effect fn snapshot(runtime: *mut HeapHeader, extraRoots: &[ValueBits]) -> Graph
   ! BusyHeap | OutOfMemoryError ? &mut Allocator {
   let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
   if state.gcPhase != GcPhase.None { fail BusyHeap {} }
   let mut graph = Graph.make() graph.runtime = runtime
   let root = run unsafe graph.node(runtime)
   graph.backing(root, state.classes.capacity() * Layout.of<ClassDef>().bytes + state.shapeHash.capacity() * Layout.of<?*mut HeapHeader>().bytes)
+  graph.backing(root, state.spareSlots.capacity() * Layout.of<ThinList<SlotBits>>().bytes
+    + state.spareValues.capacity() * Layout.of<ThinList<ValueBits>>().bytes
+    + state.spareCells.capacity() * Layout.of<Option<Intrinsic.RawBuffer<u8>>>().bytes)
+  let mut cacheIndex: usize = 0
+  while cacheIndex < state.spareSlots.length() {
+    let slots = &state.spareSlots.asSlice()[cacheIndex]
+    if slots.ownsStorage() { graph.backing(root, slots.capacity() * Layout.of<SlotBits>().bytes) }
+    cacheIndex = cacheIndex + 1
+  }
+  cacheIndex = 0
+  while cacheIndex < state.spareValues.length() {
+    let values = &state.spareValues.asSlice()[cacheIndex]
+    if values.ownsStorage() { graph.backing(root, values.capacity() * Layout.of<ValueBits>().bytes) }
+    cacheIndex = cacheIndex + 1
+  }
+  cacheIndex = 0
+  while cacheIndex < state.spareCells.length() {
+    if let Option<Intrinsic.RawBuffer<u8>>.Some { value } = &state.spareCells.asSlice()[cacheIndex] {
+      graph.backing(root, RawBuffer.count<u8>(&value))
+    }
+    cacheIndex = cacheIndex + 1
+  }
+  if let Option<Intrinsic.RawBuffer<ValueBits>>.Some { value } = &state.callFrames {
+    graph.backing(root, RawBuffer.count<ValueBits>(&value) * Layout.of<ValueBits>().bytes)
+  }
+  cacheIndex = 0
+  while cacheIndex < 512 {
+    run unsafe strong(&mut graph, root, state.unitStrings[cacheIndex], b"root.unitString", cacheIndex)
+    cacheIndex = cacheIndex + 1
+  }
+  let mut parked = state.parkedShapes.first
+  while !Pointer.isNull<HeapHeader>(parked) {
+    let shape = unsafe required(parked)
+    run unsafe optional(&mut graph, root, shape, b"root.parkedShape", 0)
+    parked = (unsafe Pointer.borrow<(), HeapHeader>(&anchor, shape)).next
+  }
   match &state.runtimeInfo { Option<ByteStorage>.Some { value } => { graph.backing(root, bytes(&value)) } _ => () }
   run unsafe strong(&mut graph, root, state.currentException, b"root.currentException", 0)
   run unsafe strong(&mut graph, root, state.asyncContext, b"root.asyncContext", 0)
@@ -379,7 +427,7 @@ pub unsafe effect fn snapshot(runtime: *mut HeapHeader, extraRoots: &[Value]) ->
     let cell = unsafe required(cursor) let jobIndex = run unsafe graph.node(cell)
     run unsafe optional(&mut graph, root, cell, b"root.job", 0)
     let job = unsafe HeapCell.payload<JobEntry, ()>(&anchor, cell)
-    graph.backing(jobIndex, job.arguments.capacity() * Layout.of<Value>().bytes)
+    graph.backing(jobIndex, job.arguments.capacity() * Layout.of<ValueBits>().bytes)
     run unsafe optional(&mut graph, jobIndex, job.realm, b"job.realm", 0)
     run unsafe strong(&mut graph, jobIndex, job.asyncContext, b"job.asyncContext", 0)
     run unsafe strong(&mut graph, jobIndex, job.asyncResource, b"job.asyncResource", 0)
@@ -472,12 +520,11 @@ pub unsafe effect fn identify(graph: &mut Graph, observer: &AllocationObserver) 
     while slots.get(slot) != 0 { slot = (slot + 1) % count }
     slots.set(slot, i + 1) i = i + 1
   }
-  let anchor = () let mut identities = List<usize>.make()
+  let mut identities = List<usize>.make()
   run identities.reserveExact(graph.nodes.length())
   i = 0
   while i < graph.nodes.length() {
-    let header = unsafe Pointer.borrow<(), HeapHeader>(&anchor, graph.nodes.get(i).reference)
-    let address = Pointer.address<u8>(header.allocation)
+    let address = unsafe HeapCell.allocationAddress(graph.nodes.get(i).reference)
     let mut slot = addressSlot(address, count)
     while slots.get(slot) != 0 && records.get(slots.get(slot) - 1).address != address {
       slot = (slot + 1) % count

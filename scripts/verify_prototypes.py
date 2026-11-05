@@ -164,7 +164,7 @@ import byte_buffer { ByteBuffer }
 import runtime_memory { RuntimeAllocator, AllocationObserver }
 import js_heap { HeapCell, HeapHeader }
 import js_core_types { ObjectData, EXOTIC_GET_PROTOTYPE, EXOTIC_SET_PROTOTYPE, EXOTIC_IS_EXTENSIBLE }
-import js_value { Value }
+import js_value { ValueBits }
 import js_strings { Strings }
 import js_string_types { StringLengthError }
 import js_gc as gc
@@ -178,26 +178,26 @@ import js_array_storage_test_support { FaultAllocator, reference, rc, shape, tra
 import js_exceptions { JsException }
 import js_exceptions as exceptions
 fn bit(value:bool)->u32 {if value{return 1}return 0}
-fn same(a:Value,b:Value)->bool {
+fn same(a:ValueBits,b:ValueBits)->bool {
   return a.isObject() && b.isObject() && Pointer.address<HeapHeader>(reference(a))==Pointer.address<HeapHeader>(reference(b))
 }
-fn identity(v:Value,old:Value,next:Value,object:Value,child:Value)->u32 {
+fn identity(v:ValueBits,old:ValueBits,next:ValueBits,object:ValueBits,child:ValueBits)->u32 {
   if v.tag()==2{return 0}if same(v,old){return 1}if same(v,next){return 2}
   if same(v,object){return 3}if same(v,child){return 4}return trap()
 }
 unsafe fn pending(rt:*mut HeapHeader)->u32 {
   let v=unsafe exceptions.take(rt)
-  return match v {Value.Int {value}=>i32.toU32(value) _=>trap()}
+  return match v {ValueBits.Int {value}=>i32.toU32(value) _=>trap()}
 }
-effect fn failedGet(error:JsException)->Value {drop error return Value.Exception}
+effect fn failedGet(error:JsException)->ValueBits {drop error return ValueBits.Exception}
 effect fn failedExt(error:JsException)->u32 {drop error return 7}
-unsafe effect fn ext(hooks:&mut Hooks,ctx:*mut HeapHeader,o:Value)->u32
+unsafe effect fn ext(hooks:&mut Hooks,ctx:*mut HeapHeader,o:ValueBits)->u32
   ! OutOfMemoryError | JsException ? &mut Allocator {
   return bit(run unsafe prototypes.isExtensible(&mut hooks,ctx,o))
 }
-unsafe effect fn getResult(out:&mut ByteBuffer,hooks:&mut Hooks,ctx:*mut HeapHeader,o:Value,
-  old:Value,next:Value,child:Value,consuming:bool)->() ! OutOfMemoryError ? &mut Allocator {
-  let mut v=Value.Null
+unsafe effect fn getResult(out:&mut ByteBuffer,hooks:&mut Hooks,ctx:*mut HeapHeader,o:ValueBits,
+  old:ValueBits,next:ValueBits,child:ValueBits,consuming:bool)->() ! OutOfMemoryError ? &mut Allocator {
+  let mut v=ValueBits.Null
   if consuming {v=run Effect.catch<JsException>(unsafe prototypes.getPrototypeFree(&mut hooks,ctx,unsafe o.retained()),failedGet)}
   else {v=run Effect.catch<JsException>(unsafe prototypes.getPrototype(&mut hooks,ctx,o),failedGet)}
   let rt=unsafe runtime.contextRuntime(ctx)
@@ -215,9 +215,9 @@ unsafe effect fn caseBody(out:&mut ByteBuffer,memory:&AllocationObserver,family:
   if (mask & 2)!=0 {methods=methods | EXOTIC_SET_PROTOTYPE}
   if (mask & 4)!=0 {methods=methods | EXOTIC_IS_EXTENSIBLE}
   run unsafe fixture.register(rt,methods)
-  let old=run unsafe objects.withPrototype(&mut hooks,memory,ctx,Value.Null)
-  let next=run unsafe objects.withPrototype(&mut hooks,memory,ctx,Value.Null)
-  let mut o=Value.Null let mut child=Value.Null
+  let old=run unsafe objects.withPrototype(&mut hooks,memory,ctx,ValueBits.Null)
+  let next=run unsafe objects.withPrototype(&mut hooks,memory,ctx,ValueBits.Null)
+  let mut o=ValueBits.Null let mut child=ValueBits.Null
   if family==0 {
     o=run unsafe objects.withPrototype(&mut hooks,memory,ctx,old)
     let mut anchor=() let p=unsafe HeapCell.payloadMut<ObjectData,()>(&mut anchor,reference(o))
@@ -227,18 +227,18 @@ unsafe effect fn caseBody(out:&mut ByteBuffer,memory:&AllocationObserver,family:
   } else if family==1 {
     let ids=[classes.JS_CLASS_NUMBER,classes.JS_CLASS_BOOLEAN,classes.JS_CLASS_STRING,classes.JS_CLASS_SYMBOL,classes.JS_CLASS_BIG_INT]
     let mut i:usize=0 while i<ids.length {unsafe runtime.setClassPrototype(&mut hooks,ctx,ids[i],unsafe old.retained()) i=i+1}
-    o=match flags {0=>Value.Null 1=>Value.Undefined 2=>Value.Int {value:7} 3=>Value.Bool {value:true}
-      4=>Value.Float64 {value:-0.0} 5=>Value.ShortBigInt {value:8} _=>run Strings.fromLatin1(b"primitive")}
+    o=match flags {0=>ValueBits.Null 1=>ValueBits.Undefined 2=>ValueBits.Int {value:7} 3=>ValueBits.Bool {value:true}
+      4=>ValueBits.Float64 {value:-0.0} 5=>ValueBits.ShortBigInt {value:8} _=>run Strings.fromLatin1(b"primitive")}
   } else {
     o=run unsafe fixture.exotic(&mut hooks,memory,ctx,old,(flags & 1)!=0,(flags & 2)!=0,failure)
     let mut anchor=() let p=unsafe HeapCell.payloadMut<ObjectData,()>(&mut anchor,reference(o))
     p.hasImmutablePrototype=true p.extensible=false p.isStandardArrayPrototype=true
   }
-  let mut proposed=Value.Null
+  let mut proposed=ValueBits.Null
   if proto==1 {proposed=next}
-  else if proto==2 {proposed=o if family==1 {proposed=Value.Int {value:0}}}
-  else if proto==3 {proposed=child if family!=0 {proposed=Value.Int {value:0}}}
-  else if proto==4 {proposed=Value.Int {value:0}}
+  else if proto==2 {proposed=o if family==1 {proposed=ValueBits.Int {value:0}}}
+  else if proto==3 {proposed=child if family!=0 {proposed=ValueBits.Int {value:0}}}
+  else if proto==4 {proposed=ValueBits.Int {value:0}}
   let result=run unsafe fixture.setResult(&mut hooks,ctx,o,proposed,mode)
   run out.writeU32(result)
   let mut thrown:u32=0 if result==7 {thrown=unsafe pending(rt)} run out.writeU32(thrown)
@@ -275,8 +275,8 @@ unsafe effect fn witness(out:&mut ByteBuffer)->() ! OutOfMemoryError ? &mut Allo
   let rt=run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
   let ctx=run unsafe runtime.allocateContextStorage(rt) |> Effect.provideMut<Allocator>(&mut memory)
   let mut hooks=Hooks.make()
-  let next=run unsafe objects.withPrototype(&mut hooks,&observer,ctx,Value.Null) |> Effect.provideMut<Allocator>(&mut memory)
-  let object=run unsafe objects.withPrototype(&mut hooks,&observer,ctx,Value.Null) |> Effect.provideMut<Allocator>(&mut memory)
+  let next=run unsafe objects.withPrototype(&mut hooks,&observer,ctx,ValueBits.Null) |> Effect.provideMut<Allocator>(&mut memory)
+  let object=run unsafe objects.withPrototype(&mut hooks,&observer,ctx,ValueBits.Null) |> Effect.provideMut<Allocator>(&mut memory)
   let shapeNode=unsafe shape(object)
   unsafe HeapCell.retain(shapeNode)
   let mut anchor=() let p=unsafe HeapCell.payloadMut<ObjectData,()>(&mut anchor,reference(object)) p.isStandardArrayPrototype=true drop p

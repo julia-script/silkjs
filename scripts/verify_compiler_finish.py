@@ -90,7 +90,7 @@ S_HELPERS = r'''
 import js_compiler_finish { createFunction }
 import js_bytecode { BytecodeError }
 fn functionKind(k:FunctionKind)->i32 { return match k { FunctionKind.Normal=>0 FunctionKind.Generator=>1 FunctionKind.Async=>2 FunctionKind.AsyncGenerator=>3 } }
-fn ref(value:Value)->*mut HeapHeader { return match value { Value.FunctionBytecode { reference }=>reference _=>Intrinsic.trap("QuickJS invariant violated") } }
+fn ref(value:ValueBits)->*mut HeapHeader { return match value { ValueBits.FunctionBytecode { reference }=>reference _=>Intrinsic.trap("QuickJS invariant violated") } }
 effect fn dumpFinal(out:&mut ByteBuffer,cell:*mut HeapHeader)->() ! OutOfMemoryError ? &mut Allocator {
  let a=() let b=unsafe HeapCell.payload<FunctionBytecode,()>(&a,cell)
  run word(&mut out,u8.toI32(b.mode)) run bit(&mut out,b.hasPrototype) run bit(&mut out,b.hasSimpleParameterList)
@@ -122,7 +122,7 @@ effect fn dumpFinal(out:&mut ByteBuffer,cell:*mut HeapHeader)->() ! OutOfMemoryE
  }
  run word(&mut out,usize.toI32(b.constants.length())) i=0
  while i<b.constants.length() { let v=b.constants.get(i) run word(&mut out,v.tag())
-  match v { Value.FunctionBytecode { reference }=>{ run dumpFinal(&mut out,reference) } Value.Int { value }=>{ run word(&mut out,value) } _=>() } i=i+1
+  match v { ValueBits.FunctionBytecode { reference }=>{ run dumpFinal(&mut out,reference) } ValueBits.Int { value }=>{ run word(&mut out,value) } _=>() } i=i+1
  }
 }
 effect fn make(runtime:*mut HeapHeader,context:*mut HeapHeader,parent:?*mut HeapHeader,strip:i32,eval:bool,parameters:bool,depth:i32,flavor:i32)->*mut HeapHeader ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
@@ -145,8 +145,8 @@ effect fn make(runtime:*mut HeapHeader,context:*mut HeapHeader,parent:?*mut Heap
   let mut v=fd.vars.get(i32.toUsize(x)) v.isLexical=true fd.vars.set(i32.toUsize(x),v)
  }
  if !fd.stripSource && (flavor&4)==0 { run fd.source.appendSlice(b"native body") }
- run fd.constants.append(Value.Int { value:123 })
- if depth>0 { run fd.constants.append(Value.Undefined) run fd.constants.append(Value.Undefined) }
+ run fd.constants.append(ValueBits.Int { value:123 })
+ if depth>0 { run fd.constants.append(ValueBits.Undefined) run fd.constants.append(ValueBits.Undefined) }
  drop rt drop fd
  if depth>0 {
   let child=run make(runtime,context,cell,strip,eval,parameters,depth-1,flavor)

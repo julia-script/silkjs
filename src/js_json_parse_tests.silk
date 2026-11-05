@@ -5,11 +5,13 @@ import silk.core.result { Result }
 import silk.testing.testing { Testing, AssertionError }
 import silk.num.usize
 import byte_buffer { ByteBuffer }
-import runtime_memory { RuntimeAllocator }
+import runtime_memory { RuntimeAllocator, AllocationObserver }
 import native_stack { currentFrameAddress }
 import js_heap { HeapCell, HeapHeader }
 import js_core_types { RuntimeState, ObjectData, ObjectPayload, PropertySlot }
-import js_value { Value }
+import js_value { ValueBits }
+import js_owned_value { lendBits, immediateRef, lendFor, ValueRef }
+import js_realm { Realm, lendRealm }
 import js_runtime as runtime
 import js_gc as gc
 import js_shapes as shapes
@@ -23,6 +25,13 @@ import js_json_parse { ParsedJson, JsonParseRecords, JsonRecordKind, JsonSourceS
 import js_json_parse_test_support as fixture
 import js_array_storage_test_support { Hooks, FaultAllocator, reference, rc, trap }
 
+// Provides the allocator inside a helper: piping json.parse's result through
+// Effect.provideMut at the call site keeps `hooks` borrowed on dev.49 (silk-lang/silk#2807).
+effect fn parseWith<'a, 'b, 'src, A: Allocator>(hooks: &mut Hooks, ledger: &AllocationObserver, realm: Realm<'a>, source: &'src [u8],
+  filename: ValueRef<'b>, extended: bool, memory: &mut A) -> ParsedJson<'src>
+  ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow {
+  return run json.parse(&mut hooks, ledger, realm, source, filename, extended, true) |> Effect.provideMut<Allocator>(&mut memory)
+}
 fn index(value: Option<usize>) -> usize {
   return match move value { Option<usize>.Some { value: found } => found _ => trap() }
 }
@@ -41,9 +50,10 @@ unsafe fn releaseAtom(rt: *mut HeapHeader, atom: u32) -> () {
   let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
   state.atoms.release(atom)
 }
-unsafe fn own(value: Value, atom: u32) -> Value {
+unsafe fn own(value: ValueBits, atom: u32) -> ValueBits {
   let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(value))
-  return match object.properties.get(index(unsafe shapes.lookup(object.shape, atom))) {
+  let at = index(unsafe shapes.lookup(object.shape, atom))
+  return match object.properties.get(at).view(unsafe shapes.slotFlags(object.shape, at)) {
     PropertySlot.Value { value: found } => found _ => trap()
   }
 }
@@ -63,7 +73,7 @@ effect fn sweep(source: &[u8], capture: bool, malformed: bool) -> ()
     let ctx = run unsafe fixture.context(rt, &ledger, &mut hooks) |> Effect.provideMut<Allocator>(&mut memory)
     let filename = StringOwner.adopt(run Strings.fromLatin1(b"oom.json") |> Effect.provideMut<Allocator>(&mut memory))
     let mut fault = FaultAllocator { parent: move memory, remaining: budget }
-    let result = run Effect.result(unsafe json.parse(&mut hooks, &ledger, ctx, source, filename.get(), false, capture))
+    let result = run Effect.result(json.parse(&mut hooks, &ledger, unsafe lendRealm(&ctx, ctx), source, unsafe lendFor(filename.get()), false, capture))
       |> Effect.provideMut<Allocator>(&mut fault)
     match move result {
       Result<ParsedJson, OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow>.Success { value } => {
@@ -116,8 +126,7 @@ test effect fn jsonDetachedRecordsKeepDisplacedOriginalsAndBorrowedPrimitiveSour
   run source.appendSlice(b" {\"x\": \"fi\\u0072st\", \"x\": \"last\", \"array\":[null]} ") |> Effect.provideMut<Allocator>(&mut memory)
   let filename = StringOwner.adopt(run Strings.fromLatin1(b"borrowed.json") |> Effect.provideMut<Allocator>(&mut memory))
   let key = run unsafe intern(rt, b"x") |> Effect.provideMut<Allocator>(&mut memory)
-  let mut parsed = run unsafe json.parse(&mut hooks, &ledger, ctx, source.asSlice(), filename.get(), false, true)
-    |> Effect.provideMut<Allocator>(&mut memory)
+  let mut parsed = run parseWith(&mut hooks, &ledger, unsafe lendRealm(&ctx, ctx), source.asSlice(), unsafe lendFor(filename.get()), false, &mut memory)
   let graph = parsed.takeValue()
   let transferred = parsed.takeRecords()
   let mut records = match move transferred { Option<JsonParseRecords>.Some { value } => move value _ => trap() }
@@ -163,8 +172,7 @@ test effect fn jsonDestroyingTransferredRecordsDoesNotConsumeTransferredValue() 
   let mut hooks = Hooks { finalized: 0 }
   let ctx = run unsafe fixture.context(rt, &ledger, &mut hooks) |> Effect.provideMut<Allocator>(&mut memory)
   let filename = StringOwner.adopt(run Strings.fromLatin1(b"transfer.json") |> Effect.provideMut<Allocator>(&mut memory))
-  let mut parsed = run unsafe json.parse(&mut hooks, &ledger, ctx, b"[\"kept\",{\"n\":1}]", filename.get(), false, true)
-    |> Effect.provideMut<Allocator>(&mut memory)
+  let mut parsed = run parseWith(&mut hooks, &ledger, unsafe lendRealm(&ctx, ctx), b"[\"kept\",{\"n\":1}]", unsafe lendFor(filename.get()), false, &mut memory)
   let value = parsed.takeValue()
   let transferred = parsed.takeRecords()
   let mut records = match move transferred { Option<JsonParseRecords>.Some { value: found } => move found _ => trap() }
@@ -188,13 +196,14 @@ test effect fn jsonRuntimeStackBudgetRejectsRecursionAndRuntimeRemainsReusable()
   let rt = run runtime.allocateRuntimeStorage(currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut memory)
   let mut hooks = Hooks { finalized: 0 }
   let ctx = run unsafe fixture.context(rt, &ledger, &mut hooks) |> Effect.provideMut<Allocator>(&mut memory)
+  let realm = unsafe lendRealm(&ctx, ctx)
   let filename = StringOwner.adopt(run Strings.fromLatin1(b"stack.json") |> Effect.provideMut<Allocator>(&mut memory))
   let mut source = ByteBuffer.make() let mut i: usize = 0
   while i < 2048 { run source.appendSlice(b"{\"a\":[") |> Effect.provideMut<Allocator>(&mut memory) i = i + 1 }
   run source.appendSlice(b"null") |> Effect.provideMut<Allocator>(&mut memory)
   i = 0 while i < 2048 { run source.appendSlice(b"]}") |> Effect.provideMut<Allocator>(&mut memory) i = i + 1 }
   unsafe runtime.updateStackTop(rt, currentFrameAddress()) unsafe runtime.setMaxStackSize(rt, 65536)
-  let result = run Effect.result(unsafe json.parse(&mut hooks, &ledger, ctx, source.asSlice(), filename.get(), false, true))
+  let result = run Effect.result(json.parse(&mut hooks, &ledger, realm, source.asSlice(), unsafe lendFor(filename.get()), false, true))
     |> Effect.provideMut<Allocator>(&mut memory)
   let mut overflow = false
   match move result {
@@ -207,8 +216,7 @@ test effect fn jsonRuntimeStackBudgetRejectsRecursionAndRuntimeRemainsReusable()
   run Testing.expect(overflow && hooks.finalized > 0,
     "finite native frame budget rejects nested parsing after allocation and unwinds the partially built graph")
   unsafe runtime.updateStackTop(rt, currentFrameAddress()) unsafe runtime.setMaxStackSize(rt, 1048576)
-  let mut resumed = run unsafe json.parse(&mut hooks, &ledger, ctx, b"[{\"ok\":[true]}]", filename.get(), false, true)
-    |> Effect.provideMut<Allocator>(&mut memory)
+  let mut resumed = run parseWith(&mut hooks, &ledger, realm, b"[{\"ok\":[true]}]", unsafe lendFor(filename.get()), false, &mut memory)
   run Testing.expect(resumed.value().isObject(), "stack rejection does not poison runtime, atom, or cached-shape ownership")
   unsafe resumed.destroy(&mut hooks) drop resumed drop filename drop source
   unsafe gc.releaseHeader(&mut hooks, rt, ctx) run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
@@ -222,37 +230,36 @@ test effect fn jsonDuplicateLookupChangesAtNineAndBareNonfiniteRecordsStayEmpty(
   let rt = run runtime.allocateRuntimeStorage(currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut memory)
   let mut hooks = Hooks { finalized: 0 }
   let ctx = run unsafe fixture.context(rt, &ledger, &mut hooks) |> Effect.provideMut<Allocator>(&mut memory)
+  let realm = unsafe lendRealm(&ctx, ctx)
   let filename = StringOwner.adopt(run Strings.fromLatin1(b"records.json") |> Effect.provideMut<Allocator>(&mut memory))
   let key = run unsafe intern(rt, b"x") |> Effect.provideMut<Allocator>(&mut memory)
   let mut count: usize = 8
   while count <= 9 {
     let mut source: &[u8] = b"{\"x\":1,\"a\":0,\"b\":0,\"c\":0,\"d\":0,\"e\":0,\"f\":0,\"x\":2}"
     if count == 9 { source = b"{\"x\":1,\"a\":0,\"b\":0,\"c\":0,\"d\":0,\"e\":0,\"f\":0,\"g\":0,\"x\":2}" }
-    let mut parsed = run unsafe json.parse(&mut hooks, &ledger, ctx, source, filename.get(), false, true)
-      |> Effect.provideMut<Allocator>(&mut memory)
+    let mut parsed = run parseWith(&mut hooks, &ledger, realm, source, unsafe lendFor(filename.get()), false, &mut memory)
     match &parsed.records().* {
       Option<JsonParseRecords>.Some { value: records } => {
         let root = index(records.root()) let found = index(records.find(root, key))
         let mut expected: i32 = 1
         if count == 9 { expected = 2 }
         run Testing.expect(records.childCount(root) == count
-          && match records.originalValue(found) { Value.Int { value } => value == expected _ => false }
-          && match unsafe own(parsed.value(), key) { Value.Int { value } => value == 2 _ => false },
+          && match records.originalValue(found) { ValueBits.Int { value } => value == expected _ => false }
+          && match unsafe own(parsed.value(), key) { ValueBits.Int { value } => value == 2 _ => false },
           "eight records expose the first duplicate, nine expose the newest, while both value graphs use the last definition")
       }
       _ => trap()
     }
     unsafe parsed.destroy(&mut hooks) count = count + 1
   }
-  let mut nonfinite = run unsafe json.parse(&mut hooks, &ledger, ctx, b"[NaN,Infinity,-Infinity]", filename.get(), true, true)
-    |> Effect.provideMut<Allocator>(&mut memory)
+  let mut nonfinite = run parseWith(&mut hooks, &ledger, realm, b"[NaN,Infinity,-Infinity]", unsafe lendFor(filename.get()), true, &mut memory)
   match &nonfinite.records().* {
     Option<JsonParseRecords>.Some { value: records } => {
       let root = index(records.root()) let mut i: usize = 0
       while i < 2 {
         let child = index(records.arrayElement(root, i))
         run Testing.expect(records.kind(child) == JsonRecordKind.Empty
-          && match records.originalValue(child) { Value.Undefined => true _ => false }
+          && match records.originalValue(child) { ValueBits.Undefined => true _ => false }
           && match records.sourceSpan(child) { Option<JsonSourceSpan>.None => true _ => false },
           "bare extended nonfinite identifiers deliberately retain neither an original value nor a primitive source span")
         i = i + 1

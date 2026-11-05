@@ -1,0 +1,147 @@
+//! The owning JavaScript value handle.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy, Drop }
+import js_heap { HeapHeader }
+import js_value { ValueBits }
+import js_gc { HeapHooks }
+import js_gc as gc
+
+/// A JavaScript value that owns one reference count when it points at a heap cell.
+///
+/// `Value` is affine: duplicate it with `dup`, and it releases its count automatically on
+/// every exit from its scope, typed failures included. The Drop hook only decrements; a
+/// cell whose count reaches zero is queued and finalized at the next drain point (an
+/// allocation, a GC pass, the job loop or runtime teardown). Use `release` when the cell
+/// must be freed immediately.
+///
+/// Heap storage (object slots, the operand stack, records) holds `ValueBits`, which own
+/// nothing by themselves; `intoBits` and `adoptBits` move a count across that boundary.
+/// Auxiliary payloads that keep a variable number of values can use `ValueList` instead,
+/// so their finalizer needs no release loop.
+pub struct Value { bits: ValueBits }
+
+impl Drop for Value {
+  fn drop(self: &mut Value) -> () {
+    let bits = Intrinsic.replace(self.bits, ValueBits.Undefined)
+    // Inline exit for immediates, which most drops are; only heap values call out.
+    match bits {
+      ValueBits.Int { .. } => { return () }
+      ValueBits.Float64 { .. } => { return () }
+      ValueBits.Bool { .. } => { return () }
+      ValueBits.Undefined => { return () }
+      ValueBits.Null => { return () }
+      _ => ()
+    }
+    unsafe gc.releaseDeferred(bits)
+  }
+}
+
+impl Value {
+  /// An owner of a value that holds no heap reference, such as a number or `undefined`.
+  pub fn immediate(bits: ValueBits) -> Value {
+    match ValueBits.heapReference(&bits) {
+      Option<*mut HeapHeader>.Some { .. } => { return Intrinsic.trap("Value.immediate given a heap reference") }
+      Option<*mut HeapHeader>.None => ()
+    }
+    return Value { bits: bits }
+  }
+
+  /// Takes over one count that `bits` already owns, for example one held in heap storage.
+  /// The caller proves that count exists and that nothing else will release it.
+  pub unsafe fn adoptBits(bits: ValueBits) -> Value { return Value { bits: bits } }
+
+  /// A new owner of the borrowed `bits`: adds one count.
+  /// The caller proves `bits` is live for the duration of the call.
+  pub unsafe fn retain(bits: ValueBits) -> Value { return Value { bits: unsafe bits.retained() } }
+
+  /// Hands this value's count to the caller, for storing in heap storage.
+  pub fn intoBits(self: Value) -> ValueBits {
+    let mut owner = move self
+    return Intrinsic.replace(owner.bits, ValueBits.Undefined)
+  }
+
+  /// Moves the value out of a field or slot, leaving `undefined` in its place.
+  pub fn take(self: &mut Self) -> Value { return Value { bits: Intrinsic.replace(self.bits, ValueBits.Undefined) } }
+
+  /// The value's representation, borrowed: the result owns no count.
+  pub fn view(self: &Self) -> ValueBits { return self.bits }
+
+  /// A second owner of the same value: adds one count.
+  @inlineAlways pub fn dup(self: &Self) -> Value { return Value { bits: unsafe self.bits.retained() } }
+
+  /// Lends the value for as long as this owner is borrowed.
+  pub fn borrow<'a>(self: &'a Self) -> ValueRef<'a> { return ValueRef<'a> { bits: self.bits } }
+
+  /// Releases the count now and, if it was the last one, finalizes and frees the cell
+  /// before returning.
+  /// The caller proves `runtime` is the live runtime that owns the cell.
+  pub unsafe fn release<H: HeapHooks>(self: Value, hooks: &mut H, runtime: *mut HeapHeader) -> () {
+    let bits = Value.intoBits(move self)
+    unsafe gc.release(&mut hooks, runtime, bits)
+  }
+}
+
+/// A borrowed value: it holds no count, and its lifetime keeps it from outliving the owner
+/// that lends it (a `Value`, or the caller's frame for a native call's receiver and
+/// arguments). It is one word, the same as `ValueBits`; the lifetime is compile-time only.
+pub struct ValueRef<'a> { bits: ValueBits }
+impl<'a> Copy for ValueRef<'a> {}
+
+impl<'a> ValueRef<'a> {
+  /// The representation, for code that still takes `ValueBits`.
+  pub fn view(self: ValueRef<'a>) -> ValueBits { return self.bits }
+
+  /// A new owner of the lent value: adds one count.
+  @inlineAlways pub fn dup(self: ValueRef<'a>) -> Value { return Value { bits: unsafe self.bits.retained() } }
+  /// Itself: lets code holding either a Value or a ValueRef lend it the same way.
+  pub fn borrow(self: ValueRef<'a>) -> ValueRef<'a> { return self }
+}
+
+/// Lends `bits` for as long as `anchor` is borrowed.
+/// The caller proves `bits` stays live and owned elsewhere for that whole borrow.
+pub unsafe fn lendBits<'a, T>(anchor: &'a T, bits: ValueBits) -> ValueRef<'a> { return ValueRef<'a> { bits: bits } }
+/// Lends `bits` for a caller-chosen 'a. The caller proves an owner keeps `bits` alive for
+/// all of 'a; js_realm uses it for values the realm itself owns.
+pub unsafe fn lendFor<'a>(bits: ValueBits) -> ValueRef<'a> { return ValueRef<'a> { bits: bits } }
+
+/// Lends a value that holds no heap reference, such as a number or `undefined`.
+pub fn immediateRef(bits: ValueBits) -> ValueRef<'static> {
+  match ValueBits.heapReference(&bits) {
+    Option<*mut HeapHeader>.Some { .. } => { return Intrinsic.trap("immediateRef given a heap reference") }
+    Option<*mut HeapHeader>.None => ()
+  }
+  return ValueRef<'static> { bits: bits }
+}
+
+/// A growable list that owns one count per element and releases them all when dropped.
+pub struct ValueList { items: List<Value> }
+
+impl ValueList {
+  pub fn make() -> ValueList { return ValueList { items: List<Value>.make() } }
+
+  pub fn length(self: &Self) -> usize { return self.items.length() }
+
+  pub fn capacity(self: &Self) -> usize { return self.items.capacity() }
+
+  /// The element at `index`, borrowed: the list keeps its count. Traps when out of range.
+  pub fn get(self: &Self, index: usize) -> ValueBits { return self.items.asSlice()[index].view() }
+
+  /// The element at `index`, lent for as long as the list stays borrowed. Traps when out of range.
+  pub fn borrow<'a>(self: &'a Self, index: usize) -> ValueRef<'a> { return ValueRef<'a> { bits: self.items.asSlice()[index].view() } }
+
+  pub effect fn append(self: &mut Self, value: Value) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.items.append(move value)
+  }
+
+  pub effect fn reserveExact(self: &mut Self, additional: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.items.reserveExact(additional)
+  }
+
+  /// Stores `value` at `index` and releases the element it replaces. Traps when out of range.
+  pub fn set(self: &mut Self, index: usize, value: Value) -> () { self.items.set(index, move value) }
+
+  /// Moves the element at `index` out, leaving undefined. Traps when out of range.
+  pub fn take(self: &mut Self, index: usize) -> Value { return Intrinsic.replace(self.items.asMutSlice()[index], Value.immediate(ValueBits.Undefined)) }
+}

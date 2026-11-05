@@ -92,6 +92,7 @@ def main():
     build = args.build_dir.resolve(); build.mkdir(parents=True, exist_ok=True)
     shutil.copytree(ROOT/'src', build/'src', dirs_exist_ok=True)
     shutil.copyfile(ROOT/'silk.toml', build/'silk.toml')
+    shutil.copyfile(ROOT/'startup.order', build/'startup.order')
     (build/'src/js_temporal_objects_cases_generated.silk').write_text(generated(native_selected, not args.skip_faults))
     (build/'cases.json').write_text(json.dumps(native_selected, ensure_ascii=True, indent=2))
     (build/'oracle.c').write_text(c_source(clean_cases))

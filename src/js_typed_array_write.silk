@@ -13,7 +13,9 @@ import silk.num.u32
 import silk.num.u64
 import js_heap { HeapCell, HeapHeader }
 import js_core_types { ObjectData, ObjectPayload }
-import js_value { Value }
+import js_value { ValueBits }
+import js_owned_value { ValueRef, Value }
+import js_realm { Realm, lendRealm }
 import js_gc { HeapHooks }
 import js_gc as gc
 import js_runtime as runtime
@@ -25,6 +27,7 @@ import js_string_types { StringLengthError }
 import js_exceptions { JsException }
 import js_class_data as classes
 import js_math as math
+import js_primitives as primitive
 import js_buffer_storage as storage
 
 fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
@@ -35,7 +38,7 @@ unsafe fn store<T: Copy>(object: *mut HeapHeader, index: u64, value: T) -> () {
   let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
   let mut data = Pointer.null<u8>()
   let mut shared = false
-  let shift = storage.sizeLog2(p.classId)
+  let shift = storage.sizeLog2(p.classId())
   match &p.payload {
     ObjectPayload.TypedArray { array } => {
       if index >= array.count { return () }
@@ -63,32 +66,120 @@ unsafe fn store<T: Copy>(object: *mut HeapHeader, index: u64, value: T) -> () {
   unsafe Pointer.write<T>(unsafe Pointer.atMut<T>(unsafe Pointer.assumeManyMut<T>(typed), u64.toUsize(index)), value)
 }
 
+unsafe fn rawStore<T: Copy>(data: ?*mut u8, index: u64, value: T) -> () {
+  let pointer = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(data)
+  let typed = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut T>(pointer)
+  unsafe Pointer.write<T>(unsafe Pointer.atMut<T>(unsafe Pointer.assumeManyMut<T>(typed), u64.toUsize(index)), value)
+}
+
+/// quickWrite for an Int value: every conversion is inline, so the caller's
+/// fast path makes no calls. Float16 arrays return false.
+@inlineAlways
+pub unsafe fn quickWriteInt(object: *mut HeapHeader, index: u64, integer: i32) -> bool {
+  let anchor = ()
+  let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  let classId = p.classId()
+  if classId < classes.JS_CLASS_UINT8C_ARRAY || classId > classes.JS_CLASS_FLOAT64_ARRAY
+    || classId == classes.JS_CLASS_BIG_INT64_ARRAY || classId == classes.JS_CLASS_BIG_UINT64_ARRAY {
+    return false
+  }
+  let mut data = Pointer.null<u8>()
+  match &p.payload {
+    ObjectPayload.TypedArray { array } => {
+      if index >= array.count || array.shared { return false }
+      data = array.cachedData
+    }
+    _ => { return false }
+  }
+  drop p
+  if classId >= classes.JS_CLASS_FLOAT16_ARRAY {
+    if classId == classes.JS_CLASS_FLOAT64_ARRAY { unsafe rawStore<f64>(data, index, i32.toF64(integer)) }
+    else if classId == classes.JS_CLASS_FLOAT32_ARRAY { unsafe rawStore<f32>(data, index, f64.toF32(i32.toF64(integer))) }
+    // Float16 rounding calls out; leave it to the generic store.
+    else { return false }
+    return true
+  }
+  let mut clamped = integer
+  if classId == classes.JS_CLASS_UINT8C_ARRAY {
+    if clamped < 0 { clamped = 0 } else if clamped > 255 { clamped = 255 }
+  }
+  let bits = i32.wrappingToU32(clamped)
+  if classId <= classes.JS_CLASS_UINT8_ARRAY { unsafe rawStore<u8>(data, index, u32.toU8(bits & 0xff)) }
+  else if classId <= classes.JS_CLASS_UINT16_ARRAY { unsafe rawStore<u16>(data, index, u32.toU16(bits & 0xffff)) }
+  else { unsafe rawStore<u32>(data, index, bits) }
+  return true
+}
+/// put_array_el fast path: a Number stored in bounds of an unshared non-BigInt
+/// view, where conversion runs no user code. False leaves the write untouched.
+/// Inlined into the interpreter's typed-array store helper for non-Int values.
+@inlineAlways
+pub unsafe fn quickWrite(object: *mut HeapHeader, index: u64, value: ValueBits) -> bool {
+  let anchor = ()
+  let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  let classId = p.classId()
+  if classId < classes.JS_CLASS_UINT8C_ARRAY || classId > classes.JS_CLASS_FLOAT64_ARRAY
+    || classId == classes.JS_CLASS_BIG_INT64_ARRAY || classId == classes.JS_CLASS_BIG_UINT64_ARRAY {
+    return false
+  }
+  let mut data = Pointer.null<u8>()
+  match &p.payload {
+    ObjectPayload.TypedArray { array } => {
+      if index >= array.count || array.shared { return false }
+      data = array.cachedData
+    }
+    _ => { return false }
+  }
+  drop p
+  let mut integer: i32 = 0 let mut number: f64 = 0.0 let mut isInt = false
+  match value {
+    ValueBits.Int { value: x } => { integer = x isInt = true }
+    ValueBits.Float64 { value: x } => { number = x }
+    _ => { return false }
+  }
+  if classId >= classes.JS_CLASS_FLOAT16_ARRAY {
+    if isInt { number = i32.toF64(integer) }
+    if classId == classes.JS_CLASS_FLOAT64_ARRAY { unsafe rawStore<f64>(data, index, number) }
+    else if classId == classes.JS_CLASS_FLOAT32_ARRAY { unsafe rawStore<f32>(data, index, f64.toF32(number)) }
+    else { unsafe rawStore<u16>(data, index, u64.toU16(math.toFp16(number))) }
+    return true
+  }
+  if classId == classes.JS_CLASS_UINT8C_ARRAY {
+    if !isInt { integer = primitive.numberToUint8Clamp(number) }
+    else if integer < 0 { integer = 0 }
+    else if integer > 255 { integer = 255 }
+  } else if !isInt { integer = primitive.numberToInt32(number) }
+  let bits = i32.wrappingToU32(integer)
+  if classId <= classes.JS_CLASS_UINT8_ARRAY { unsafe rawStore<u8>(data, index, u32.toU8(bits & 0xff)) }
+  else if classId <= classes.JS_CLASS_UINT16_ARRAY { unsafe rawStore<u16>(data, index, u32.toU16(bits & 0xffff)) }
+  else { unsafe rawStore<u32>(data, index, bits) }
+  return true
+}
+
 // Consumes value even on conversion failure. Class identity cannot change while
 // user code runs; the view's count and cachedData can, and are never cached here.
-unsafe effect fn convertFree<H: HeapHooks + CoercionHooks>(hooks: &mut H,
-  context: *mut HeapHeader, object: *mut HeapHeader, index: u64, value: Value,
+unsafe effect fn convertFree<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, object: *mut HeapHeader, index: u64, value: ValueBits,
   write: bool) -> () ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
   let anchor = ()
   let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
-  let classId = p.classId
+  let classId = p.classId()
   drop p
   if classId < classes.JS_CLASS_UINT8C_ARRAY || classId > classes.JS_CLASS_FLOAT64_ARRAY { invariant() }
   if classId == classes.JS_CLASS_BIG_INT64_ARRAY || classId == classes.JS_CLASS_BIG_UINT64_ARRAY {
     let mut converted: i64 = 0
-    run unsafe bigint.toBigInt64Free(&mut hooks, context, &mut converted, value)
+    run unsafe bigint.toBigInt64Free(&mut hooks, realm, &mut converted, value)
     if write { unsafe store<i64>(object, index, converted) }
   } else if !write {
     // Canonical non-integer/missing indices still perform ToNumber, not an
     // integer/clamp conversion and never a bounds-dependent early return.
     let mut converted: f64 = 0.0
-    run unsafe integer.toFloat64Free(&mut hooks, context, &mut converted, value)
+    run integer.toFloat64Free(&mut hooks, realm, &mut converted, unsafe Value.adoptBits(value))
   } else if classId == classes.JS_CLASS_UINT8C_ARRAY {
     let mut converted: i32 = 0
-    run unsafe integer.toUint8ClampFree(&mut hooks, context, &mut converted, value)
+    run integer.toUint8ClampFree(&mut hooks, realm, &mut converted, unsafe Value.adoptBits(value))
     unsafe store<u8>(object, index, u32.toU8(i32.toU32(converted)))
   } else if classId <= classes.JS_CLASS_UINT32_ARRAY {
     let mut converted: u32 = 0
-    run unsafe integer.toUint32Free(&mut hooks, context, &mut converted, value)
+    run integer.toUint32Free(&mut hooks, realm, &mut converted, unsafe Value.adoptBits(value))
     if classId == classes.JS_CLASS_INT8_ARRAY || classId == classes.JS_CLASS_UINT8_ARRAY {
       unsafe store<u8>(object, index, u32.toU8(converted & 0xff))
     } else if classId == classes.JS_CLASS_INT16_ARRAY || classId == classes.JS_CLASS_UINT16_ARRAY {
@@ -98,7 +189,7 @@ unsafe effect fn convertFree<H: HeapHooks + CoercionHooks>(hooks: &mut H,
     }
   } else {
     let mut converted: f64 = 0.0
-    run unsafe integer.toFloat64Free(&mut hooks, context, &mut converted, value)
+    run integer.toFloat64Free(&mut hooks, realm, &mut converted, unsafe Value.adoptBits(value))
     if classId == classes.JS_CLASS_FLOAT16_ARRAY {
       unsafe store<u16>(object, index, u64.toU16(math.toFp16(converted)))
     } else if classId == classes.JS_CLASS_FLOAT32_ARRAY {
@@ -109,15 +200,14 @@ unsafe effect fn convertFree<H: HeapHooks + CoercionHooks>(hooks: &mut H,
   }
 }
 
-unsafe effect fn rootedFree<H: HeapHooks + CoercionHooks>(hooks: &mut H,
-  context: *mut HeapHeader, object: *mut HeapHeader, index: u64, value: Value,
-  write: bool) -> () ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
-  let rt = unsafe runtime.contextRuntime(context)
+unsafe effect fn rootedFree<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, object: *mut HeapHeader, index: u64, value: ValueBits,
+  write: bool) -> () ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator { let context = realm.context()
+  let rt = realm.runtime()
   unsafe HeapCell.retain(context)
   unsafe HeapCell.retain(object)
   // The conversion owns value through its callbacks and releases it at the
   // source conversion boundary, before any later semantic error is thrown.
-  let result = run Effect.result(unsafe convertFree(&mut hooks, context, object, index, value, write))
+  let result = run Effect.result(unsafe convertFree(&mut hooks, realm, object, index, value, write))
   unsafe gc.releaseHeader(&mut hooks, rt, object)
   unsafe gc.releaseHeader(&mut hooks, rt, context)
   return match move result {
@@ -127,31 +217,27 @@ unsafe effect fn rootedFree<H: HeapHooks + CoercionHooks>(hooks: &mut H,
 }
 
 // Consumes value on success, conversion failure, and out-of-bounds writes.
-pub unsafe effect fn writeIndexFree<H: HeapHooks + CoercionHooks>(hooks: &mut H,
-  context: *mut HeapHeader, object: *mut HeapHeader, index: u64, value: Value) -> ()
+pub unsafe effect fn writeIndexFree<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, object: *mut HeapHeader, index: u64, value: ValueBits) -> ()
   ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
-  run unsafe rootedFree(&mut hooks, context, object, index, value, true)
+  run unsafe rootedFree(&mut hooks, realm, object, index, value, true)
 }
 
 // Requires a live typed-array object; out-of-bounds (including detached) writes
 // succeed silently, but conversion errors still propagate. All inputs borrowed.
-pub unsafe effect fn writeIndex<H: HeapHooks + CoercionHooks>(hooks: &mut H,
-  context: *mut HeapHeader, object: *mut HeapHeader, index: u64, value: Value) -> ()
+pub unsafe effect fn writeIndex<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, object: *mut HeapHeader, index: u64, value: ValueBits) -> ()
   ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
-  run unsafe writeIndexFree(&mut hooks, context, object, index, unsafe value.retained())
+  run unsafe writeIndexFree(&mut hooks, realm, object, index, unsafe value.retained())
 }
 
 // Consumes value at the same conversion boundary as SetPropertyInternal.
-pub unsafe effect fn convertOutOfBoundsFree<H: HeapHooks + CoercionHooks>(hooks: &mut H,
-  context: *mut HeapHeader, object: *mut HeapHeader, value: Value) -> ()
+pub unsafe effect fn convertOutOfBoundsFree<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, object: *mut HeapHeader, value: ValueBits) -> ()
   ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
-  run unsafe rootedFree(&mut hooks, context, object, 0, value, false)
+  run unsafe rootedFree(&mut hooks, realm, object, 0, value, false)
 }
 
 // SetPropertyInternal's canonical numeric-index miss still coerces the value by
 // element family: strict BigInt64 for BigInt views, ToNumber for all other views.
-pub unsafe effect fn convertOutOfBounds<H: HeapHooks + CoercionHooks>(hooks: &mut H,
-  context: *mut HeapHeader, object: *mut HeapHeader, value: Value) -> ()
+pub unsafe effect fn convertOutOfBounds<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, object: *mut HeapHeader, value: ValueBits) -> ()
   ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
-  run unsafe convertOutOfBoundsFree(&mut hooks, context, object, unsafe value.retained())
+  run unsafe convertOutOfBoundsFree(&mut hooks, realm, object, unsafe value.retained())
 }

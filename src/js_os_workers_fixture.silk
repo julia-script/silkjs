@@ -1,6 +1,7 @@
 //! Actual detached Session/Worker ownership and independent allocation sweeps.
 //! Root teardown never stops or joins children. Host-fed input proves that a
 //! child outlives its original Process/WaiterDomain; ledgers settle at real exit.
+import js_realm { lendRealm, lendArguments }
 import silk.mem.allocator { Allocator, OutOfMemoryError, SystemAllocator }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
@@ -16,7 +17,8 @@ import runtime_memory { RuntimeAllocator, AllocationObserver }
 import js_atomics_native { WaiterDomain, SynchronizationError }
 import js_runtime_registry { ClassIdAllocator }
 import js_heap { HeapHeader }
-import js_value { Value }
+import js_value { ValueBits }
+import js_owned_value { Value, lendBits, immediateRef }
 import js_core_types { FrameSlots }
 import js_exceptions { JsException }
 import js_exceptions as exceptions
@@ -30,28 +32,29 @@ import js_os_events { ThreadState }
 import js_os_events as events
 import js_os_workers_resources { Snapshot, Resources }
 import js_os_workers as workers
+import js_os_workers { PortRef }
+import silk.core.option { Option }
 import js_os_events_platform { PollFd, Signals }
 import js_os_events_platform as platform
 import js_std_native as native
-struct FaultAllocator { parent: RuntimeAllocator<SystemAllocator>, remaining: usize, failed: bool }
-impl Allocator for FaultAllocator {
-  effect fn allocate(self: &mut Self, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
-    if self.remaining == 0 { self.remaining = usize.MAX self.failed = true return run Allocator.outOfMemory() }
-    if self.remaining != usize.MAX { self.remaining = self.remaining - 1 }
-    return run Allocator.allocate(move layout) |> Effect.provideMut<Allocator>(&mut self.parent)
-  }
-}
+import js_fault_allocator { FailOnce }
 unsafe extern "C" fn fcntl(fd: i32, command: i32, ...) -> i32
 unsafe extern "C" fn close(fd: i32) -> i32
-unsafe extern "C" fn pipe(fds: *mut i32) -> i32 with Intrinsic.foreign(noCapture: ("fds",))
+@foreign(noCapture: .("fds"))
+unsafe extern "C" fn pipe(fds: *mut i32) -> i32
 unsafe extern "C" fn dup(fd: i32) -> i32
 unsafe extern "C" fn dup2(fd: i32, target: i32) -> i32
-unsafe extern "C" fn write(fd: i32, data: *const u8, length: usize) -> i64 with Intrinsic.foreign(noCapture: ("data",))
-unsafe extern "C" fn dprintf(fd: i32, format: *const u8, ...) -> i32 with Intrinsic.foreign(noCapture: ("format",))
-unsafe extern "C" fn ftrylockfile(file: *mut native.File) -> i32 with Intrinsic.foreign(noCapture: ("file",))
-unsafe extern "C" fn funlockfile(file: *mut native.File) -> () with Intrinsic.foreign(noCapture: ("file",))
+@foreign(noCapture: .("data"))
+unsafe extern "C" fn write(fd: i32, data: *const u8, length: usize) -> i64
+@foreign(noCapture: .("format"))
+unsafe extern "C" fn dprintf(fd: i32, format: *const u8, ...) -> i32
+@foreign(noCapture: .("file"))
+unsafe extern "C" fn ftrylockfile(file: *mut native.File) -> i32
+@foreign(noCapture: .("file"))
+unsafe extern "C" fn funlockfile(file: *mut native.File) -> ()
 extern "C" struct Timespec { seconds: i64, nanoseconds: i64 }
-unsafe extern "C" fn nanosleep(request: *const Timespec, remaining: ?*mut Timespec) -> i32 with Intrinsic.foreign(noCapture: ("request", "remaining"))
+@foreign(noCapture: ("request", "remaining"))
+unsafe extern "C" fn nanosleep(request: *const Timespec, remaining: ?*mut Timespec) -> i32
 unsafe extern "C" fn getpid() -> i32
 unsafe extern "C" fn kill(pid: i32, number: i32) -> i32
 unsafe extern "C" fn sigaction(number: i32, action: ?*const u8, previous: ?*mut u8) -> i32
@@ -145,7 +148,7 @@ fn survivorSource(priorError: bool) -> &'static [u8] {
   return b"import * as std from 'std';if(std.in.error()||std.in.eof())throw Error('detached Worker poisoned shared stdin');if(std.in.getline()!=='SURVIVOR'||std.in.error()||std.in.eof())throw Error('independent Process could not read shared stdin');"
 }
 effect fn detachedInput(namespace: &ClassIdAllocator, process: &Process,
-    domain: &WaiterDomain, memory: &AllocationObserver, allocator: &mut FaultAllocator, priorError: bool) -> i32 ! OutOfMemoryError | SynchronizationError {
+    domain: &WaiterDomain, memory: &AllocationObserver, allocator: &mut FailOnce, priorError: bool) -> i32 ! OutOfMemoryError | SynchronizationError {
   let before = allocator.parent.stats() let fdBefore = descriptors()
   let file = unsafe native.input()
   if unsafe native.ferror(file) != 0 || unsafe native.feof(file) != 0 { return 110 }
@@ -167,23 +170,21 @@ effect fn detachedInput(namespace: &ClassIdAllocator, process: &Process,
   let mut active = match move opened { Result.Success { value } => move value Result.Failure { .. } => { return 115 } }
   let anchor = () let state = unsafe Pointer.borrow<(), ThreadState>(&anchor, unsafe events.state(active.runtime))
   let resources = state.resources.clone() drop state
-  let started = run Effect.result(unsafe libc.evalBuffer(&mut active.engine, active.context,
+  let started = run Effect.result(libc.evalBuffer(&mut active.engine, active.context.realm(),
     b"import * as os from 'os';globalThis.worker=new os.Worker('./libc_worker_detached_child.mjs');worker.onmessage=()=>{};",
     b"tests/fixtures/libc_worker_main.mjs", 1)) |> Effect.provideMut<Allocator>(&mut allocator)
   let mut passed = false
   match move started {
-    Result<Value, OutOfMemoryError | JsException>.Success { value } => {
+    Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => {
       passed = true unsafe gc.release(&mut active.engine, active.runtime, value) }
-    Result<Value, OutOfMemoryError | JsException>.Failure { .. } => ()
+    Result<ValueBits, OutOfMemoryError | JsException>.Failure { .. } => ()
   }
   let mut fds = List<PollFd>.make()
   if passed {
-    let state = unsafe Pointer.borrow<(), ThreadState>(&anchor, unsafe events.state(active.runtime))
-    let receiver = state.workerPortsFirst drop state
-    passed = !Pointer.isNull<HeapHeader>(receiver)
-    if passed {
-      let node = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(receiver)
-      let appended = run Effect.result(fds.append(PollFd { fd: unsafe workers.portFd(node), events: 1, revents: 0 })) |> Effect.provideMut<Allocator>(&mut allocator)
+    let receiver = workers.ports(active.context.realm())
+    passed = receiver.isSome()
+    if let Option<PortRef>.Some { value: port } = receiver {
+      let appended = run Effect.result(fds.append(PollFd { fd: port.fd(), events: 1, revents: 0 })) |> Effect.provideMut<Allocator>(&mut allocator)
       match move appended { Result.Success { .. } => { passed = platform.poll(&mut fds, 10000) > 0 }
         Result.Failure { .. } => { passed = false } }
     }
@@ -216,14 +217,14 @@ effect fn detachedInput(namespace: &ClassIdAllocator, process: &Process,
   let line = b"SURVIVOR\n"
   passed = unsafe write(redirect.writer, Pointer.fromRef(&line[0]), line.length) == usize.toI64(line.length)
   if passed {
-    let checked = run Effect.result(unsafe libc.evalBuffer(&mut second.engine, second.context,
+    let checked = run Effect.result(libc.evalBuffer(&mut second.engine, second.context.realm(),
       survivorSource(priorError),
       b"worker-fixture:shared-stdin-check", 1)) |> Effect.provideMut<Allocator>(&mut allocator)
     passed = false
     match move checked {
-      Result<Value, OutOfMemoryError | JsException>.Success { value } => {
+      Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => {
         passed = true unsafe gc.release(&mut second.engine, second.runtime, value) }
-      Result<Value, OutOfMemoryError | JsException>.Failure { .. } => ()
+      Result<ValueBits, OutOfMemoryError | JsException>.Failure { .. } => ()
     }
   }
   if unsafe exceptions.has(second.runtime) { unsafe gc.release(&mut second.engine, second.runtime, unsafe exceptions.take(second.runtime)) }
@@ -235,7 +236,7 @@ effect fn detachedInput(namespace: &ClassIdAllocator, process: &Process,
   return 0
 }
 pub effect fn main() -> i32 ! OutOfMemoryError | SynchronizationError | WriterError {
-  let mut allocator = FaultAllocator { parent: run RuntimeAllocator.make(Allocator.systemAllocatorProvider()), remaining: usize.MAX, failed: false }
+  let mut allocator = run FailOnce.make()
   let memory = run allocator.parent.observe()
   let namespace = run ClassIdAllocator.make() |> Effect.provideMut<Allocator>(&mut allocator)
   let process = run Process.make(&namespace)
@@ -249,15 +250,15 @@ pub effect fn main() -> i32 ! OutOfMemoryError | SynchronizationError | WriterEr
   let mut active = match move opened { Result.Success { value } => move value Result.Failure { .. } => { return 10 } }
   let anchor = () let state = unsafe Pointer.borrow<(), ThreadState>(&anchor, unsafe events.state(active.runtime))
   let resources = state.resources.clone() drop state
-  let rejected = run Effect.result(unsafe libc.evalBuffer(&mut active.engine, active.context,
+  let rejected = run Effect.result(libc.evalBuffer(&mut active.engine, active.context.realm(),
     foreignOwnerSource(), b"tests/fixtures/libc_worker_main.mjs", 1)) |> Effect.provideMut<Allocator>(&mut allocator)
   let mut passed = false
   match move rejected {
-    Result<Value, OutOfMemoryError | JsException>.Success { value } => {
+    Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => {
       passed = true
       unsafe gc.release(&mut active.engine, active.runtime, value)
     }
-    Result<Value, OutOfMemoryError | JsException>.Failure { .. } => ()
+    Result<ValueBits, OutOfMemoryError | JsException>.Failure { .. } => ()
   }
   if unsafe exceptions.has(active.runtime) { unsafe gc.release(&mut active.engine, active.runtime, unsafe exceptions.take(active.runtime)) }
   run unsafe active.close() |> Effect.provideMut<Allocator>(&mut allocator)
@@ -289,66 +290,64 @@ pub effect fn main() -> i32 ! OutOfMemoryError | SynchronizationError | WriterEr
         let mut active = match move opened { Result.Success { value } => move value Result.Failure { .. } => { return 2 } }
         let anchor = () let state = unsafe Pointer.borrow<(), ThreadState>(&anchor, unsafe events.state(active.runtime))
         let resources = state.resources.clone() drop state
-        let imported = run Effect.result(unsafe libc.evalBuffer(&mut active.engine, active.context,
+        let imported = run Effect.result(libc.evalBuffer(&mut active.engine, active.context.realm(),
           b"import * as o from 'os';import * as s from 'std';globalThis.os=o;globalThis.std=s;",
           b"worker-fixture:imports", 1)) |> Effect.provideMut<Allocator>(&mut allocator)
         match move imported {
-          Result<Value, OutOfMemoryError | JsException>.Success { value } => {
+          Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => {
             unsafe gc.release(&mut active.engine, active.runtime, value) }
-          Result<Value, OutOfMemoryError | JsException>.Failure { .. } => {
+          Result<ValueBits, OutOfMemoryError | JsException>.Failure { .. } => {
             run unsafe active.close() |> Effect.provideMut<Allocator>(&mut allocator) return 3 }
         }
-        let prepared = run Effect.result(unsafe evaluation.evaluate(&mut active.engine, &memory, active.context,
+        let prepared = run Effect.result(evaluation.evaluate(&mut active.engine, &memory, active.context.realm(),
           source(operation), b"tests/fixtures/worker-fault.js", 0)) |> Effect.provideMut<Allocator>(&mut allocator)
-        let function = match move prepared { Result<Value, JsException>.Success { value } => value
+        let function = match move prepared { Result<Value, JsException>.Success { value } => value.intoBits()
           Result<Value, JsException>.Failure { .. } => { run unsafe active.close() |> Effect.provideMut<Allocator>(&mut allocator) return 4 } }
-        let mut slot = Value.Undefined let arguments = FrameSlots.Borrowed { data: Pointer.fromMutRef<Value>(&mut slot), length: 0 }
-        let mut delivery = Pointer.null<HeapHeader>()
+        let mut slot = ValueBits.Undefined let arguments = FrameSlots { data: Pointer.fromMutRef<ValueBits>(&mut slot), count: 0 }
+        let mut delivery = Option<PortRef>.none()
         if operation >= 6 {
-          let sent = run Effect.result(unsafe active.engine.callArguments(active.context, function, Value.Undefined, &arguments)) |> Effect.provideMut<Allocator>(&mut allocator)
+          let sent = run Effect.result(active.engine.callArguments(active.context.realm(), unsafe lendBits(&function, function), immediateRef(ValueBits.Undefined), unsafe lendArguments(&arguments))) |> Effect.provideMut<Allocator>(&mut allocator)
           match move sent {
-            Result<Value, OutOfMemoryError | JsException>.Success { value } => { unsafe gc.release(&mut active.engine, active.runtime, value) }
-            Result<Value, OutOfMemoryError | JsException>.Failure { .. } => {
+            Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => { unsafe gc.release(&mut active.engine, active.runtime, value) }
+            Result<ValueBits, OutOfMemoryError | JsException>.Failure { .. } => {
               unsafe gc.release(&mut active.engine, active.runtime, function)
               run unsafe active.close() |> Effect.provideMut<Allocator>(&mut allocator) return 5
             }
           }
-          let threadState = unsafe Pointer.borrow<(), ThreadState>(&anchor, unsafe events.state(active.runtime))
-          delivery = threadState.workerPortsFirst drop threadState
-          if Pointer.isNull<HeapHeader>(delivery) { return Intrinsic.trap("missing worker receiver") }
-          let node = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(delivery)
+          delivery = workers.ports(active.context.realm())
+          let port = match delivery { Option<PortRef>.Some { value } => value _ => { return Intrinsic.trap("missing worker receiver") } }
           let mut fds = List<PollFd>.make()
-          run fds.append(PollFd { fd: unsafe workers.portFd(node), events: 1, revents: 0 }) |> Effect.provideMut<Allocator>(&mut allocator)
+          run fds.append(PollFd { fd: port.fd(), events: 1, revents: 0 }) |> Effect.provideMut<Allocator>(&mut allocator)
           if platform.poll(&mut fds, 10000) <= 0 {
             unsafe gc.release(&mut active.engine, active.runtime, function)
             run unsafe active.close() |> Effect.provideMut<Allocator>(&mut allocator) return 6
           }
         }
         if mode == 0 { allocator.remaining = ordinal } else { resources.failAfter(ordinal) }
-        let mut called = Result<Value, OutOfMemoryError | JsException>.Success { value: Value.Undefined }
+        let mut called = Result<ValueBits, OutOfMemoryError | JsException>.Success { value: ValueBits.Undefined }
         if operation >= 6 {
-          let node = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(delivery)
-          let handled = run Effect.result(unsafe workers.handlePostedMessage(&mut active.engine, &memory, active.context, node)) |> Effect.provideMut<Allocator>(&mut allocator)
+          let port = match delivery { Option<PortRef>.Some { value } => value _ => { return Intrinsic.trap("missing worker receiver") } }
+          let handled = run Effect.result(workers.handlePostedMessage(&mut active.engine, &memory, active.context.realm(), port)) |> Effect.provideMut<Allocator>(&mut allocator)
           called = match move handled {
-            Result<bool, JsException>.Success { value } => Result<Value, OutOfMemoryError | JsException>.Success { value: Value.Bool { value: value } }
-            Result<bool, JsException>.Failure { error } => Result<Value, OutOfMemoryError | JsException>.Failure { error: move error }
+            Result<bool, JsException>.Success { value } => Result<ValueBits, OutOfMemoryError | JsException>.Success { value: ValueBits.Bool { value: value } }
+            Result<bool, JsException>.Failure { error } => Result<ValueBits, OutOfMemoryError | JsException>.Failure { error: move error }
           }
         } else {
-          called = run Effect.result(unsafe active.engine.callArguments(active.context, function, Value.Undefined, &arguments)) |> Effect.provideMut<Allocator>(&mut allocator)
+          called = run Effect.result(active.engine.callArguments(active.context.realm(), unsafe lendBits(&function, function), immediateRef(ValueBits.Undefined), unsafe lendArguments(&arguments))) |> Effect.provideMut<Allocator>(&mut allocator)
         }
         allocator.remaining = usize.MAX
         let mut clean = false
-        match move called { Result<Value, OutOfMemoryError | JsException>.Success { value } => {
-          clean = match value { Value.Bool { value: result } => result _ => false }
+        match move called { Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => {
+          clean = match value { ValueBits.Bool { value: result } => result _ => false }
           unsafe gc.release(&mut active.engine, active.runtime, value) }
-          Result<Value, OutOfMemoryError | JsException>.Failure { .. } => () }
+          Result<ValueBits, OutOfMemoryError | JsException>.Failure { .. } => () }
         if operation >= 6 && clean {
-          let observed = run Effect.result(unsafe evaluation.evaluate(&mut active.engine, &memory, active.context,
+          let observed = run Effect.result(evaluation.evaluate(&mut active.engine, &memory, active.context.realm(),
             b"received===true", b"worker-delivery-result.js", 0)) |> Effect.provideMut<Allocator>(&mut allocator)
           match move observed {
             Result<Value, JsException>.Success { value } => {
-              clean = match value { Value.Bool { value: result } => result _ => false }
-              unsafe gc.release(&mut active.engine, active.runtime, value)
+              clean = match value.view() { ValueBits.Bool { value: result } => result _ => false }
+              active.release(move value)
             }
             Result<Value, JsException>.Failure { .. } => { clean = false }
           }
@@ -356,17 +355,17 @@ pub effect fn main() -> i32 ! OutOfMemoryError | SynchronizationError | WriterEr
         unsafe gc.release(&mut active.engine, active.runtime, function)
         if unsafe exceptions.has(active.runtime) {
           if !allocator.failed && resources.snapshot().failures == 0 {
-            run unsafe libc.dumpError(&mut active.engine, active.context) |> Effect.provideMut<Allocator>(&mut allocator)
+            run libc.dumpError(&mut active.engine, active.context.realm()) |> Effect.provideMut<Allocator>(&mut allocator)
           } else { unsafe gc.release(&mut active.engine, active.runtime, unsafe exceptions.take(active.runtime)) }
         }
         let mut keeper: i32 = -1
         if operation == 9 {
-          let kept = run Effect.result(unsafe evaluation.evaluate(&mut active.engine, &memory, active.context,
+          let kept = run Effect.result(evaluation.evaluate(&mut active.engine, &memory, active.context.realm(),
             b"keeper", b"worker-descriptor-result.js", 0)) |> Effect.provideMut<Allocator>(&mut allocator)
           match move kept {
             Result<Value, JsException>.Success { value } => {
-              match value { Value.Int { value: fd } => { keeper = fd } _ => { clean = false } }
-              unsafe gc.release(&mut active.engine, active.runtime, value)
+              match value.view() { ValueBits.Int { value: fd } => { keeper = fd } _ => { clean = false } }
+              active.release(move value)
             }
             Result<Value, JsException>.Failure { .. } => { clean = false }
           }

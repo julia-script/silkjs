@@ -109,7 +109,7 @@ import byte_buffer { ByteBuffer }
 import runtime_memory { RuntimeAllocator, AllocationObserver }
 import js_heap { HeapCell, HeapHeader }
 import js_core_types { RuntimeState, ContextState, ObjectData, ObjectPayload, PropertyDescriptor, JS_PROP_HAS_VALUE, JS_PROP_THROW }
-import js_value { Value }
+import js_value { ValueBits }
 import js_bigint { BigInt, BigIntError }
 import js_bigint_coercions_test_support as support
 import js_strings { Strings }
@@ -137,7 +137,7 @@ import js_errors_test_support { FaultAllocator }
 import js_exceptions { JsException }
 import js_exceptions as exceptions
 @SERIALIZER@
-effect fn thrown(error: JsException) -> Value { drop error return Value.Exception }
+effect fn thrown(error: JsException) -> ValueBits { drop error return ValueBits.Exception }
 effect fn ignored(error: JsException) -> () { drop error }
 effect fn flag(out: &mut ByteBuffer, yes: bool) -> () ! OutOfMemoryError ? &mut Allocator {
  let mut word: u32 = 0 if yes { word = 1 } run out.writeU32(word)
@@ -159,7 +159,7 @@ unsafe effect fn pending<'a>(out: &mut ByteBuffer, hooks: &mut Hooks<'a>, ctx: *
  } else { run out.writeU32(99) run value(&mut out, error) }
  unsafe gc.release(&mut hooks, rt, error)
 }
-unsafe effect fn descriptor<'a>(out: &mut ByteBuffer, hooks: &mut Hooks<'a>, ctx: *mut HeapHeader, object: Value, atom: u32) -> ()
+unsafe effect fn descriptor<'a>(out: &mut ByteBuffer, hooks: &mut Hooks<'a>, ctx: *mut HeapHeader, object: ValueBits, atom: u32) -> ()
  ! OutOfMemoryError | JsException ? &mut Allocator {
  let found = run unsafe descriptors.getOwnProperty(&mut hooks, ctx, object, atom)
  match move found {
@@ -170,15 +170,15 @@ unsafe effect fn descriptor<'a>(out: &mut ByteBuffer, hooks: &mut Hooks<'a>, ctx
   }
  }
 }
-unsafe effect fn leaf<'a>(hooks: &mut Hooks<'a>, memory: &AllocationObserver, ctx: *mut HeapHeader, kind: usize) -> Value
+unsafe effect fn leaf<'a>(hooks: &mut Hooks<'a>, memory: &AllocationObserver, ctx: *mut HeapHeader, kind: usize) -> ValueBits
  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
  let rt = unsafe runtime.contextRuntime(ctx)
  @SILK_LEAVES@
- if kind == @KINDS@ { return run unsafe objects.withPrototype(&mut hooks, memory, ctx, Value.Null) }
+ if kind == @KINDS@ { return run unsafe objects.withPrototype(&mut hooks, memory, ctx, ValueBits.Null) }
  if kind == @KINDS@ + 1 { return run unsafe objects.withClass(&mut hooks, memory, ctx, classes.JS_CLASS_ERROR) }
- if kind == @KINDS@ + 2 { return Value.Exception }
- if kind == @KINDS@ + 3 { return Value.Uninitialized }
- if kind == @KINDS@ + 4 { return Value.CatchOffset { offset: 17 } }
+ if kind == @KINDS@ + 2 { return ValueBits.Exception }
+ if kind == @KINDS@ + 3 { return ValueBits.Uninitialized }
+ if kind == @KINDS@ + 4 { return ValueBits.CatchOffset { offset: 17 } }
  if kind == @KINDS@ + 5 { return run Strings.fromUtf16(&[97,233,0xd83d,0xde00,0xd800]) }
  return trap()
 }
@@ -188,8 +188,8 @@ unsafe effect fn boxCase<'a>(out: &mut ByteBuffer, hooks: &mut Hooks<'a>, memory
  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
  let rt = unsafe runtime.contextRuntime(ctx) run out.writeU32(0) run out.writeU32(usize.toU32(kind)) run flag(&mut out, consuming)
  let input = run unsafe leaf(&mut hooks, memory, ctx, kind) let before = unsafe count(input)
- if input.isException() { run Effect.catch<JsException>(unsafe exceptions.throwValue<(), Hooks<'a>>(&mut hooks, rt, Value.Int { value: 123 }), ignored) }
- let mut result = Value.Undefined
+ if input.isException() { run Effect.catch<JsException>(unsafe exceptions.throwValue<(), Hooks<'a>>(&mut hooks, rt, ValueBits.Int { value: 123 }), ignored) }
+ let mut result = ValueBits.Undefined
  if consuming { result = run Effect.catch<JsException>(unsafe boxing.toObjectFree(&mut hooks, memory, ctx, unsafe input.retained()), thrown) }
  else { result = run Effect.catch<JsException>(unsafe boxing.toObject(&mut hooks, memory, ctx, input), thrown) }
  run value(&mut out, result)
@@ -214,10 +214,10 @@ unsafe effect fn dataCase<'a>(out: &mut ByteBuffer, hooks: &mut Hooks<'a>, memor
  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
  run out.writeU32(1) run out.writeU32(usize.toU32(destination)) run out.writeU32(usize.toU32(kind))
  let cls = [classes.JS_CLASS_NUMBER,classes.JS_CLASS_STRING,classes.JS_CLASS_BOOLEAN,classes.JS_CLASS_SYMBOL,classes.JS_CLASS_DATE,classes.JS_CLASS_BIG_INT,classes.JS_CLASS_OBJECT,0,0][destination]
- let rt = unsafe runtime.contextRuntime(ctx) let mut object = Value.Null
- if destination == 7 { object = Value.Exception } else if destination != 8 { object = run unsafe objects.withClass(&mut hooks, memory, ctx, cls) }
+ let rt = unsafe runtime.contextRuntime(ctx) let mut object = ValueBits.Null
+ if destination == 7 { object = ValueBits.Exception } else if destination != 8 { object = run unsafe objects.withClass(&mut hooks, memory, ctx, cls) }
  if cls != 0 && boxed(cls) { run unsafe boxing.setObjectData(&mut hooks, ctx, object, run Strings.fromLatin1(b"old-owned")) }
- if destination == 7 { run Effect.catch<JsException>(unsafe exceptions.throwValue<(), Hooks<'a>>(&mut hooks, rt, Value.Int { value: 123 }), ignored) }
+ if destination == 7 { run Effect.catch<JsException>(unsafe exceptions.throwValue<(), Hooks<'a>>(&mut hooks, rt, ValueBits.Int { value: 123 }), ignored) }
  let input = run unsafe leaf(&mut hooks, memory, ctx, kind) let before = unsafe count(input)
  let attempt = run Effect.result(unsafe boxing.setObjectData(&mut hooks, ctx, object, unsafe input.retained()))
  let success = match move attempt { Result<(), JsException>.Success { .. } => true Result<(), JsException>.Failure { .. } => false }
@@ -234,14 +234,14 @@ unsafe effect fn stringCase<'a>(out: &mut ByteBuffer, hooks: &mut Hooks<'a>, mem
  let keys: [&[u8]; @KEY_COUNT@] = [@SILK_KEYS@] let atom = run unsafe stored.atom(rt, keys[key], 0)
  run unsafe descriptor(&mut out, &mut hooks, ctx, object, atom)
  let exists = run unsafe descriptors.hasOwnProperty(&mut hooks, ctx, object, atom) let mut found: u32 = 1 if exists { found = 2 } run out.writeU32(found)
- let mut replacement = Value.Undefined
+ let mut replacement = ValueBits.Undefined
  if variant == 1 { let mut unit: u16 = 120 if key < 5 { unit = Strings.codeUnit(text, key) } replacement = run Strings.fromCodePoint(u16.toU32(unit)) }
  else if variant == 2 { replacement = run Strings.fromLatin1(b"wrong") }
- else if variant == 3 { replacement = Value.Int { value: 97 } }
- else if variant == 4 { replacement = run unsafe objects.withPrototype(&mut hooks, memory, ctx, Value.Null) }
+ else if variant == 3 { replacement = ValueBits.Int { value: 97 } }
+ else if variant == 4 { replacement = run unsafe objects.withPrototype(&mut hooks, memory, ctx, ValueBits.Null) }
  let attributes: [u32; @FLAG_COUNT@] = [@FLAGS@] let mut flags = attributes[attr]
  if variant != 0 { flags = flags | JS_PROP_HAS_VALUE } if throwing { flags = flags | JS_PROP_THROW }
- let attempt = run Effect.result(unsafe mutations.defineProperty(&mut hooks, ctx, object, atom, replacement, Value.Undefined, Value.Undefined, flags))
+ let attempt = run Effect.result(unsafe mutations.defineProperty(&mut hooks, ctx, object, atom, replacement, ValueBits.Undefined, ValueBits.Undefined, flags))
  let mut result: u32 = 0
  match move attempt {
   Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { value: accepted } => { result = 1 if accepted { result = 2 } }
@@ -261,7 +261,7 @@ effect fn failureCase(out: &mut ByteBuffer, mode: usize) -> ()
  let mut hooks = Hooks.make(&observer) run unsafe fixture.prepare(&mut hooks, ctx) |> Effect.provideMut<Allocator>(&mut memory)
  let mut kind: usize = @KINDS@ + 5 if mode != 0 { kind = @KINDS@ - 2 }
  let input = run unsafe leaf(&mut hooks, &observer, ctx, kind) |> Effect.provideMut<Allocator>(&mut memory)
- let mut object = Value.Undefined
+ let mut object = ValueBits.Undefined
  if mode == 0 { object = run unsafe boxing.toObject(&mut hooks, &observer, ctx, input) |> Effect.provideMut<Allocator>(&mut memory) }
  run out.writeU32(3) run out.writeU32(usize.toU32(mode)) hooks.watched = input memory.armed = true
  if mode == 0 {
@@ -293,7 +293,7 @@ effect fn probe() -> i32 ! OutOfMemoryError | StringLengthError | BigIntError | 
  let mut hooks = Hooks.make(&observer) run unsafe fixture.prepare(&mut hooks, ctx) |> Effect.provideMut<Allocator>(&mut memory)
  let classesToSet = [classes.JS_CLASS_NUMBER,classes.JS_CLASS_STRING,classes.JS_CLASS_BOOLEAN,classes.JS_CLASS_SYMBOL,classes.JS_CLASS_BIG_INT]
  let mut index: usize = 0 while index < classesToSet.length {
-  let proto = run unsafe objects.withPrototype(&mut hooks, &observer, ctx, Value.Null) |> Effect.provideMut<Allocator>(&mut memory)
+  let proto = run unsafe objects.withPrototype(&mut hooks, &observer, ctx, ValueBits.Null) |> Effect.provideMut<Allocator>(&mut memory)
   unsafe runtime.setClassPrototype(&mut hooks, ctx, classesToSet[index], proto) index = index + 1
  }
  let mut out = ByteBuffer.make() let mut kind: usize = 0

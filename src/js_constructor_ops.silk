@@ -1,5 +1,6 @@
 //! Constructor realm/prototype and species selection, quickjs.c:21163-21234,
 //! 41687-41715. Inputs and returned realms are borrowed; returned Values are owned.
+import js_realm { lendRealm, Realm }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
@@ -7,34 +8,43 @@ import silk.mem.pointer { Pointer }
 import silk.num.u32
 import runtime_memory { AllocationObserver }
 import js_heap { HeapCell, HeapHeader }
-import js_value { Value }
-import js_core_types { ContextState, ObjectData, ObjectPayload, FunctionBytecode }
+import js_value { ValueBits }
+import js_owned_value { Value, lendBits, immediateRef, ValueRef, lendFor }
+import js_core_types { ContextState, ObjectData, ObjectPayload, FunctionBytecode, PropertySlot, ShapeData, JS_PROP_TMASK }
+import js_shapes as shapes
+import silk.core.option { Option }
+import silk.num.u8
 import js_gc { HeapHooks }
 import js_gc as gc
 import js_runtime as runtime
 import js_coercion_host { CoercionHooks }
 import js_exceptions { JsException }
 import js_proxy_core as core
+import js_proxy_core { Proxy }
 import js_bound_functions as bound
 import js_object_allocate as objects
 import js_boxing as boxing
 import js_class_data as classes
 import js_atom_data as atoms
+/// Failures caught without wrapping the success in a Result (see js_caught).
+struct FailedOom { error: OutOfMemoryError }
+effect fn failedOom(error: OutOfMemoryError) -> FailedOom { return FailedOom { error: move error } }
+struct FailedOomJs { error: OutOfMemoryError | JsException }
+effect fn failedOomJs(error: OutOfMemoryError | JsException) -> FailedOomJs { return FailedOomJs { error: move error } }
 
 fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
 
 /// The function remains rooted by the caller throughout traversal. No retain is
 /// performed on the borrowed realm, including proxy and bound-function targets.
-pub unsafe effect fn getFunctionRealm<H: CoercionHooks>(hooks: &mut H,
-  context: *mut HeapHeader, function: Value) -> *mut HeapHeader ! JsException ? &mut Allocator {
+pub unsafe effect fn getFunctionRealm<'a, H: CoercionHooks>(hooks: &mut H,realm: Realm<'a>, function: ValueBits) -> *mut HeapHeader ! JsException ? &mut Allocator { let context = realm.context()
   let mut cursor = function
   while cursor.isObject() {
     let anchor = ()
     let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(cursor))
-    let classId = object.classId
+    let classId = object.classId()
     if classId == classes.JS_CLASS_C_FUNCTION {
       let realm = match &object.payload {
-        ObjectPayload.NativeFunction { function: native } => native.realm
+        ObjectPayload.NativeFunction { function: native } => native.realm()
         _ => invariant()
       }
       return unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(realm)
@@ -51,76 +61,105 @@ pub unsafe effect fn getFunctionRealm<H: CoercionHooks>(hooks: &mut H,
     }
     drop object
     if classId == classes.JS_CLASS_PROXY {
-      if Pointer.isNull<HeapHeader>(unsafe core.storage(core.reference(cursor))) { return context }
-      if unsafe core.isRevoked(cursor) { return run unsafe core.error(&mut hooks, context, b"revoked proxy") }
-      cursor = unsafe core.target(cursor)
-    } else if classId == classes.JS_CLASS_BOUND_FUNCTION { cursor = unsafe bound.target(cursor) }
+      let held = unsafe lendFor(cursor)
+      if !Proxy.attached(held) { return context }
+      let proxy = Proxy.of(held)
+      if proxy.isRevoked() { return run core.error(&mut hooks, realm, b"revoked proxy") }
+      cursor = proxy.target().view()
+    } else if classId == classes.JS_CLASS_BOUND_FUNCTION { cursor = bound.target(unsafe lendFor(cursor)).view() }
     else { return context }
   }
   return context
 }
-unsafe fn classPrototype(context: *mut HeapHeader, classId: u32) -> Value {
-  let anchor = () let state = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+fn classPrototype<'a>(realm: Realm<'a>, classId: u32) -> ValueBits { let context = realm.context()
+  let anchor = () let state = realm.state(&anchor)
   return unsafe state.classPrototypes.get(u32.toUsize(classId)).retained()
 }
-pub unsafe effect fn createFromConstructor<H: HeapHooks + CoercionHooks>(hooks: &mut H,
-  memory: &AllocationObserver, context: *mut HeapHeader, newTarget: Value,
-  classId: u32) -> Value ! JsException ? &mut Allocator {
-  let mut prototype = Value.Undefined
-  if core.undefined(newTarget) { prototype = unsafe classPrototype(context, classId) }
+/// newTarget's own plain data `prototype`, retained, or Uninitialized when newTarget
+/// is exotic or that property is missing or not a data property; the caller then
+/// takes the generic getter, which observes the same value for ordinary objects.
+@inlineAlways
+unsafe fn ownPrototype(newTarget: ValueBits) -> ValueBits {
+  let node = match newTarget { ValueBits.Object { reference } => reference _ => { return ValueBits.Uninitialized } }
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  if data.isExotic() { return ValueBits.Uninitialized }
+  match unsafe shapes.lookup(data.shape, atoms.JS_ATOM_prototype) {
+    Option<usize>.Some { value: index } => {
+      let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+      if (u8.toU32(shape.properties.get(index).flags) & JS_PROP_TMASK) != 0 { return ValueBits.Uninitialized }
+      return match data.properties.get(index).view(shape.properties.get(index).flags) {
+        PropertySlot.Value { value } => unsafe value.retained()
+        _ => ValueBits.Uninitialized
+      }
+    }
+    Option<usize>.None => { return ValueBits.Uninitialized }
+  }
+}
+/// A new object of `classId` whose prototype comes from `newTarget` (undefined: the realm's class prototype).
+@inlineAlways
+pub effect fn create<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>,
+  newTarget: ValueRef<'b>, classId: u32) -> Value ! JsException ? &mut Allocator {
+  return unsafe Value.adoptBits(run unsafe createFromConstructor(&mut hooks, memory, realm, newTarget.view(), classId))
+}
+pub unsafe effect fn createFromConstructor<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, newTarget: ValueBits,
+  classId: u32) -> ValueBits ! JsException ? &mut Allocator {
+  let mut prototype = ValueBits.Undefined
+  if core.undefined(newTarget) { prototype = classPrototype(realm, classId) }
   else {
-    let got = run Effect.result(unsafe hooks.getProperty(context, newTarget, atoms.JS_ATOM_prototype))
-    prototype = match move got {
-      Result<Value, OutOfMemoryError | JsException>.Success { value } => value
-      Result<Value, OutOfMemoryError | JsException>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error)
+    prototype = unsafe ownPrototype(newTarget)
+    match prototype {
+      ValueBits.Uninitialized => {
+        let got = run Intrinsic.catchFailure<OutOfMemoryError | JsException>(hooks.getProperty(realm, unsafe lendBits(&newTarget, newTarget), atoms.JS_ATOM_prototype), failedOomJs)
+        prototype = match move got {
+          ValueBits value => value
+          FailedOomJs { error } => run core.materialize(&mut hooks, realm, move error)
+        }
+      }
+      _ => ()
     }
     if !prototype.isObject() {
-      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), prototype)
-      let realm = run unsafe getFunctionRealm(&mut hooks, context, newTarget)
-      prototype = unsafe classPrototype(realm, classId)
+      unsafe gc.release(&mut hooks, realm.runtime(), prototype)
+      let functionRealm = run unsafe getFunctionRealm(&mut hooks, realm, newTarget)
+      prototype = classPrototype(unsafe lendRealm(&functionRealm, functionRealm), classId)
     }
   }
-  let created = run Effect.result(unsafe objects.withPrototypeClass(&mut hooks, memory, context, prototype, classId))
+  let created = run Intrinsic.catchFailure<OutOfMemoryError>(objects.withPrototypeClass(&mut hooks, memory, realm, unsafe lendBits(&prototype, prototype), classId), failedOom)
   // Materialize before release, so finalizers observe the source pending error.
   let result = match move created {
-    Result<Value, OutOfMemoryError>.Success { value } => value
-    Result<Value, OutOfMemoryError>.Failure { error } => run Effect.catch<JsException>(unsafe core.materialize(&mut hooks, context, move error), core.exceptionValue)
+    ValueBits value => value
+    FailedOom { error } => run Effect.catch<JsException>(core.materialize(&mut hooks, realm, move error), core.exceptionValue)
   }
-  unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), prototype)
+  unsafe gc.release(&mut hooks, realm.runtime(), prototype)
   if result.isException() { fail JsException {} }
   return result
 }
 
 /// Reads constructor and Symbol.species in order, preserving accessor exceptions.
 /// Neither the object nor the default constructor is consumed.
-pub unsafe effect fn speciesConstructor<H: HeapHooks + CoercionHooks>(hooks: &mut H,
-  context: *mut HeapHeader, object: Value, defaultConstructor: Value) -> Value
+pub effect fn speciesConstructor<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, defaultConstructor: ValueRef<'b>) -> Value
   ! JsException ? &mut Allocator {
-  if !object.isObject() { return run unsafe core.error(&mut hooks, context, b"not an object") }
-  let gotConstructor = run Effect.result(unsafe hooks.getProperty(context, object, atoms.JS_ATOM_constructor))
+  if !object.view().isObject() { return run core.error(&mut hooks, realm, b"not an object") }
+  let gotConstructor = run Intrinsic.catchFailure<OutOfMemoryError | JsException>(hooks.getProperty(realm, object, atoms.JS_ATOM_constructor), failedOomJs)
   let constructor = match move gotConstructor {
-    Result<Value, OutOfMemoryError | JsException>.Success { value } => value
-    Result<Value, OutOfMemoryError | JsException>.Failure { error } => run unsafe core.materialize(&mut hooks, context, move error)
+    ValueBits value => unsafe Value.adoptBits(value)
+    FailedOomJs { error } => run core.materialize(&mut hooks, realm, move error)
   }
-  if core.undefined(constructor) { return unsafe defaultConstructor.retained() }
-  let rt = unsafe runtime.contextRuntime(context)
-  if !constructor.isObject() {
-    unsafe gc.release(&mut hooks, rt, constructor)
-    return run unsafe core.error(&mut hooks, context, b"not an object")
+  if core.undefined(constructor.view()) { return defaultConstructor.dup() }
+  if !constructor.view().isObject() {
+    drop constructor
+    return run core.error(&mut hooks, realm, b"not an object")
   }
-  let gotSpecies = run Effect.result(unsafe hooks.getProperty(context, constructor, atoms.JS_ATOM_Symbol_species))
+  let gotSpecies = run Intrinsic.catchFailure<OutOfMemoryError | JsException>(hooks.getProperty(realm, constructor.borrow(), atoms.JS_ATOM_Symbol_species), failedOomJs)
+  drop constructor
   let species = match move gotSpecies {
-    Result<Value, OutOfMemoryError | JsException>.Success { value } => value
-    Result<Value, OutOfMemoryError | JsException>.Failure { error } =>
-      run Effect.catch<JsException>(unsafe core.materialize(&mut hooks, context, move error), core.exceptionValue)
+    ValueBits value => unsafe Value.adoptBits(value)
+    FailedOomJs { error } => run core.materialize(&mut hooks, realm, move error)
   }
-  unsafe gc.release(&mut hooks, rt, constructor)
-  if species.isException() { fail JsException {} }
-  if species.tag() == 2 || core.undefined(species) { return unsafe defaultConstructor.retained() }
-  if !unsafe boxing.isConstructor(species) {
-    let pending = run Effect.catch<JsException>(unsafe core.throwNotConstructor(&mut hooks, context, species), core.exceptionValue)
-    unsafe gc.release(&mut hooks, rt, species)
-    fail JsException {}
+  if species.view().tag() == 2 || core.undefined(species.view()) { return defaultConstructor.dup() }
+  if !unsafe boxing.isConstructor(species.view()) {
+    return run core.throwNotConstructor(&mut hooks, realm, species.borrow())
   }
-  return species
+  return move species
 }

@@ -1,5 +1,5 @@
 //! Production integration of the native VM, builtins, properties, GC and jobs.
-//! Runtime/context/Value ownership remains explicit. The caller keeps memory and
+//! Runtime/context/ValueBits ownership remains explicit. The caller keeps memory and
 //! the Atomics waiter-domain owner alive, and exclusively executes each runtime.
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
@@ -9,10 +9,13 @@ import silk.collections.list { List }
 import silk.mem.pointer { Pointer }
 import silk.num.u32
 import runtime_memory { AllocationObserver }
-import js_heap { HeapCell, HeapHeader }
-import js_value { Value }
+import js_heap { HeapCell, HeapHeader, CellRef }
+import js_value { ValueBits }
+import js_owned_value { lendBits, immediateRef, ValueRef, Value }
+import js_object_ref { ObjectRef }
+import js_realm { Realm, lendRealm, Arguments }
 import js_core_types { RuntimeState, ObjectData, NativeFunctionId, BuiltinFamily, NativeErrorKind,
-  FrameSlots, PropertyDescriptor, PropertyEnum, WeakRefHeader, AutoInitKind, AutoInitOpaque }
+  FrameSlots, PropertyDescriptor, PropertyEnum, WeakRefHeader, AutoInitKind, AutoInitOpaque, ModuleDef }
 import js_gc { HeapHooks, Tracer }
 import js_coercion_host { CoercionHooks }
 import js_call_host { CallHooks }
@@ -42,6 +45,7 @@ import js_runtime as runtime
 import js_runtime_classes as ids
 import js_class_data as classes
 import js_vm as vm
+import js_vm_activation as activation
 import js_eval as evaluation
 import js_module_dynamic_import as imports
 import js_builtin_dispatch as builtins
@@ -78,15 +82,15 @@ fn invalid() -> never { return Intrinsic.trap("invalid native engine dispatch") 
 fn runtimeMethod(id: NativeFunctionId) -> u32 {
   return match id { NativeFunctionId.Builtin { family: BuiltinFamily.Runtime, method } => method _ => invalid() }
 }
-fn reference(value: Value) -> *mut HeapHeader { return match value { Value.Object { reference } => reference _ => invalid() } }
+fn reference(value: ValueBits) -> *mut HeapHeader { return match value { ValueBits.Object { reference } => reference _ => invalid() } }
 
 impl<'m, S: EngineServices> HeapHooks for Engine<'m, S> {
   unsafe fn gcLifecycle(self: &mut Self, rt: *mut HeapHeader, event: u32) -> () {
     unsafe EngineServices.gcLifecycle(&mut self, rt, event)
   }
-  unsafe effect fn asyncLifecycle(self: &mut Self, context: *mut HeapHeader, event: u32,
-    token: usize, parent: usize, resource: Value, parentResource: Value) -> () ? &mut Allocator {
-    run unsafe EngineServices.asyncLifecycle(&mut self, context, event, token, parent, resource, parentResource)
+  effect fn asyncLifecycle<'r, 'v, 'w>(self: &mut Self, realm: Realm<'r>, event: u32,
+    token: usize, parent: usize, resource: ValueRef<'v>, parentResource: ValueRef<'w>) -> () ? &mut Allocator {
+    run EngineServices.asyncLifecycle(&mut self, realm, event, token, parent, resource, parentResource)
   }
   unsafe fn asyncDestroy(self: &mut Self, rt: *mut HeapHeader, token: usize) -> () {
     unsafe EngineServices.asyncDestroy(&mut self, rt, token)
@@ -112,188 +116,192 @@ impl<'m, S: EngineServices> HeapHooks for Engine<'m, S> {
   }
 }
 impl<'m, S: EngineServices> CoercionHooks for Engine<'m, S> {
-  unsafe effect fn getProperty(self: &mut Self, context: *mut HeapHeader, object: Value, atom: u32) -> Value
-    ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe properties.getProperty(&mut self, context, object, atom) }
-  unsafe fn isCallable(self: &mut Self, context: *mut HeapHeader, value: Value) -> bool {
-    if !value.isObject() { return false }
-    let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(value))
-    let classId = object.classId drop object
+  effect fn getProperty<'r, 'v>(self: &mut Self, realm: Realm<'r>, object: ValueRef<'v>, atom: u32) -> ValueBits
+    ! OutOfMemoryError | JsException ? &mut Allocator { return run properties.getProperty(&mut self, realm, object, atom) }
+  fn isCallable<'r, 'v>(self: &mut Self, realm: Realm<'r>, value: ValueRef<'v>) -> bool {
+    if !value.view().isObject() { return false }
+    let anchor = () let object = ObjectRef.of(value).data(&anchor)
+    let classId = object.classId() drop object
     if classId == classes.JS_CLASS_BYTECODE_FUNCTION { return true }
-    if classId == classes.JS_CLASS_PROXY { return unsafe proxyCore.isCallable(value) }
-    let rt = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, unsafe runtime.contextRuntime(context))
+    if classId == classes.JS_CLASS_PROXY { return proxyCore.isCallable(value) }
+    let rt = realm.runtimeState(&anchor)
     return match &rt.classes.asSlice()[u32.toUsize(classId)].call { Option<NativeFunctionId>.Some { .. } => true _ => false }
   }
-  unsafe effect fn call(self: &mut Self, context: *mut HeapHeader, function: Value, receiver: Value, argv: &[Value]) -> Value
-    ! OutOfMemoryError | JsException ? &mut Allocator {
-    let mut data = unsafe Intrinsic.pointerRequalify<[*]mut Value, *mut Value>(unsafe Intrinsic.stackAllocate<Value>(0))
-    if argv.length != 0 { data = unsafe Intrinsic.pointerRequalify<*const Value, *mut Value>(Pointer.fromRef<Value>(&argv[0])) }
-    let slots = FrameSlots.Borrowed { data: data, length: argv.length }
+  unsafe effect fn call<'r, 'v, 'w>(self: &mut Self, realm: Realm<'r>, function: ValueRef<'v>, receiver: ValueRef<'w>, argv: &[ValueBits]) -> ValueBits
+    ! OutOfMemoryError | JsException ? &mut Allocator { let context = realm.context()
+    let mut data = unsafe Intrinsic.pointerRequalify<[*]mut ValueBits, *mut ValueBits>(unsafe Intrinsic.stackAllocate<ValueBits>(0))
+    if argv.length != 0 { data = unsafe Intrinsic.pointerRequalify<*const ValueBits, *mut ValueBits>(Pointer.fromRef<ValueBits>(&argv[0])) }
+    let slots = FrameSlots { data: data, count: argv.length }
     let memory = self.memory
     // The public VM call copies writable formal slots; argv itself stays borrowed.
-    return run unsafe vm.call(&mut self, memory, context, function, receiver, &slots)
+    // vm.call, inlined: sort and iteration callbacks come through here per element.
+    return run unsafe vm.callInternal(&mut self, memory, context, function.view(), receiver.view(), ValueBits.Undefined, &slots, activation.COPY_ARGUMENTS)
   }
-  unsafe effect fn throwError(self: &mut Self, context: *mut HeapHeader, kind: NativeErrorKind, message: &[u8]) -> never ! JsException ? &mut Allocator {
-    let memory = self.memory return run unsafe errors.throwError(&mut self, memory, context, kind, message)
+  effect fn throwError<'r>(self: &mut Self, realm: Realm<'r>, kind: NativeErrorKind, message: &[u8]) -> never ! JsException ? &mut Allocator { let context = realm.context()
+    let memory = self.memory let anchor = () return run errors.throwError(&mut self, memory, realm, kind, message)
   }
-  unsafe effect fn throwOutOfMemory(self: &mut Self, context: *mut HeapHeader) -> never ! JsException ? &mut Allocator {
-    let memory = self.memory return run unsafe errors.throwOutOfMemory(&mut self, memory, context)
+  effect fn throwOutOfMemory<'r>(self: &mut Self, realm: Realm<'r>) -> never ! JsException ? &mut Allocator { let context = realm.context()
+    let memory = self.memory let anchor = () return run errors.throwOutOfMemory(&mut self, memory, realm)
   }
 }
 impl<'m, S: EngineServices> CallHooks for Engine<'m, S> {
-  unsafe effect fn callArguments(self: &mut Self, context: *mut HeapHeader, function: Value, receiver: Value, argv: &FrameSlots) -> Value
-    ! OutOfMemoryError | JsException ? &mut Allocator {
-    let memory = self.memory return run unsafe vm.call(&mut self, memory, context, function, receiver, argv)
+  effect fn callArguments<'r, 'v, 'w, 'x>(self: &mut Self, realm: Realm<'r>, function: ValueRef<'v>, receiver: ValueRef<'w>, argv: Arguments<'x>) -> ValueBits
+    ! OutOfMemoryError | JsException ? &mut Allocator { let context = realm.context()
+    let memory = self.memory
+    return run unsafe vm.callInternal(&mut self, memory, context, function.view(), receiver.view(), ValueBits.Undefined, argv.slots(), activation.COPY_ARGUMENTS)
   }
-  unsafe effect fn construct(self: &mut Self, context: *mut HeapHeader, function: Value, newTarget: Value, argv: &FrameSlots) -> Value
-    ! OutOfMemoryError | JsException ? &mut Allocator {
-    let memory = self.memory return run unsafe vm.construct(&mut self, memory, context, function, newTarget, argv)
+  effect fn construct<'r, 'v, 'w, 'x>(self: &mut Self, realm: Realm<'r>, function: ValueRef<'v>, newTarget: ValueRef<'w>, argv: Arguments<'x>) -> ValueBits
+    ! OutOfMemoryError | JsException ? &mut Allocator { let context = realm.context()
+    let memory = self.memory return run unsafe vm.construct(&mut self, memory, context, function.view(), newTarget.view(), argv.slots())
   }
 }
 impl<'m, S: EngineServices> OwnKeysHooks for Engine<'m, S> {
-  unsafe effect fn getOwnProperty(self: &mut Self, context: *mut HeapHeader, object: Value, atom: u32) -> Option<PropertyDescriptor>
-    ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe descriptors.getOwnProperty(&mut self, context, object, atom) }
-  unsafe effect fn getOwnKeys(self: &mut Self, context: *mut HeapHeader, table: NativeFunctionId, object: Value) -> List<PropertyEnum>
+  effect fn getOwnProperty<'r, 'v>(self: &mut Self, realm: Realm<'r>, object: ValueRef<'v>, atom: u32) -> Option<PropertyDescriptor>
+    ! OutOfMemoryError | JsException ? &mut Allocator { return run descriptors.getOwnProperty(&mut self, realm, object, atom) }
+  effect fn getOwnKeys<'r, 'v>(self: &mut Self, realm: Realm<'r>, table: NativeFunctionId, object: ValueRef<'v>) -> List<PropertyEnum>
     ! OutOfMemoryError | JsException ? &mut Allocator {
-    if let NativeFunctionId.Host { id } = table { return run unsafe EngineServices.ownKeys(&mut self, id, context, object) }
+    if let NativeFunctionId.Host { id } = table { return run EngineServices.ownKeys(&mut self, id, realm, object) }
     if runtimeMethod(table) != ids.NATIVE_JS_PROXY_EXOTIC_METHODS { invalid() }
-    return run unsafe proxy.ownKeys(&mut self, context, object)
+    return run proxy.ownKeys(&mut self, realm, object)
   }
 }
 impl<'m, S: EngineServices> OwnPropertyHooks for Engine<'m, S> {
-  unsafe effect fn restrictedOwnProperty(self: &mut Self, context: *mut HeapHeader, table: NativeFunctionId, object: Value, atom: u32, requested: bool) -> Option<OwnPropertyResult>
+  effect fn restrictedOwnProperty<'r, 'v>(self: &mut Self, realm: Realm<'r>, table: NativeFunctionId, object: ValueRef<'v>, atom: u32, requested: bool) -> Option<OwnPropertyResult>
     ! OutOfMemoryError | JsException ? &mut Allocator {
-    if let NativeFunctionId.Host { id } = table { return run unsafe EngineServices.restrictedOwnProperty(&mut self, id, context, object, atom, requested) }
+    if let NativeFunctionId.Host { id } = table { return run EngineServices.restrictedOwnProperty(&mut self, id, realm, object, atom, requested) }
     return Option<OwnPropertyResult>.none()
   }
-  unsafe effect fn instantiateAutoInit(self: &mut Self, context: *mut HeapHeader, object: Value, atom: u32) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
-    run unsafe automatic.instantiate(&mut self, context, object, atom)
+  effect fn instantiateAutoInit<'r, 'v>(self: &mut Self, realm: Realm<'r>, object: ValueRef<'v>, atom: u32) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+    run automatic.instantiate(&mut self, realm, object, atom)
   }
-  unsafe effect fn readTypedIndex(self: &mut Self, context: *mut HeapHeader, object: Value, index: u64) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
-    return match move run unsafe typed.readIndex(reference(object), index) { Option<Value>.Some { value } => value _ => Value.Undefined }
+  effect fn readTypedIndex<'r, 'v>(self: &mut Self, realm: Realm<'r>, object: ValueRef<'v>, index: u64) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+    return match move run unsafe typed.readIndex(reference(object.view()), index) { Option<ValueBits>.Some { value } => value _ => ValueBits.Undefined }
   }
-  unsafe effect fn getExoticOwnProperty(self: &mut Self, context: *mut HeapHeader, table: NativeFunctionId, object: Value, atom: u32, requested: bool) -> OwnPropertyResult
+  effect fn getExoticOwnProperty<'r, 'v>(self: &mut Self, realm: Realm<'r>, table: NativeFunctionId, object: ValueRef<'v>, atom: u32, requested: bool) -> OwnPropertyResult
     ! OutOfMemoryError | JsException ? &mut Allocator {
-    if let NativeFunctionId.Host { id } = table { return run unsafe EngineServices.ownProperty(&mut self, id, context, object, atom, requested) }
+    if let NativeFunctionId.Host { id } = table { return run EngineServices.ownProperty(&mut self, id, realm, object, atom, requested) }
     let method = runtimeMethod(table)
-    if method == ids.NATIVE_JS_STRING_EXOTIC_METHODS { return run unsafe stringExotic.getOwnProperty(&mut self, context, object, atom, requested) }
-    if method == ids.NATIVE_JS_PROXY_EXOTIC_METHODS { return run unsafe proxyDescriptors.getOwnProperty(&mut self, context, object, atom, requested) }
+    if method == ids.NATIVE_JS_STRING_EXOTIC_METHODS { return run stringExotic.getOwnProperty(&mut self, realm, object, atom, requested) }
+    if method == ids.NATIVE_JS_PROXY_EXOTIC_METHODS { return run proxyDescriptors.getOwnProperty(&mut self, realm, object, atom, requested) }
     return invalid()
   }
-  unsafe effect fn throwUninitialized(self: &mut Self, context: *mut HeapHeader, atom: u32) -> never ! JsException ? &mut Allocator {
-    let anchor = () let rt = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, unsafe runtime.contextRuntime(context))
+  effect fn throwUninitialized<'r>(self: &mut Self, realm: Realm<'r>, atom: u32) -> never ! JsException ? &mut Allocator { let context = realm.context()
+    let anchor = () let rt = realm.runtimeState(&anchor)
     let mut message = DiagnosticMessage.make() message.appendAtom(&rt.atoms, atom) drop rt
     message.append(b" is not initialized")
-    let memory = self.memory return run unsafe errors.throwError(&mut self, memory, context, NativeErrorKind.Reference, message.bytes())
+    let memory = self.memory return run errors.throwError(&mut self, memory, realm, NativeErrorKind.Reference, message.bytes())
   }
-  unsafe effect fn throwNotObject(self: &mut Self, context: *mut HeapHeader) -> never ! JsException ? &mut Allocator {
-    let memory = self.memory return run unsafe errors.throwNotAnObject(&mut self, memory, context)
+  effect fn throwNotObject<'r>(self: &mut Self, realm: Realm<'r>) -> never ! JsException ? &mut Allocator { let context = realm.context()
+    let memory = self.memory let anchor = () return run errors.throwNotAnObject(&mut self, memory, realm)
   }
 }
 impl<'m, S: EngineServices> HasPropertyHooks for Engine<'m, S> {
-  unsafe effect fn restrictedHasProperty(self: &mut Self, context: *mut HeapHeader, table: NativeFunctionId, object: Value, atom: u32) -> Option<bool>
+  effect fn restrictedHasProperty<'r, 'v>(self: &mut Self, realm: Realm<'r>, table: NativeFunctionId, object: ValueRef<'v>, atom: u32) -> Option<bool>
     ! OutOfMemoryError | JsException ? &mut Allocator {
-    if let NativeFunctionId.Host { id } = table { return run unsafe EngineServices.restrictedHasProperty(&mut self, id, context, object, atom) }
+    if let NativeFunctionId.Host { id } = table { return run EngineServices.restrictedHasProperty(&mut self, id, realm, object, atom) }
     return Option<bool>.none()
   }
-  unsafe effect fn hasExoticProperty(self: &mut Self, context: *mut HeapHeader, table: NativeFunctionId, object: Value, atom: u32) -> bool
+  effect fn hasExoticProperty<'r, 'v>(self: &mut Self, realm: Realm<'r>, table: NativeFunctionId, object: ValueRef<'v>, atom: u32) -> bool
     ! OutOfMemoryError | JsException ? &mut Allocator {
-    if let NativeFunctionId.Host { id } = table { return run unsafe EngineServices.hasProperty(&mut self, id, context, object, atom) }
+    if let NativeFunctionId.Host { id } = table { return run EngineServices.hasProperty(&mut self, id, realm, object, atom) }
     let method = runtimeMethod(table)
-    if method == ids.NATIVE_JS_MODULE_NS_EXOTIC_METHODS { return unsafe namespaces.hasProperty(object, atom) }
-    if method == ids.NATIVE_JS_PROXY_EXOTIC_METHODS { return run unsafe proxy.has(&mut self, context, object, atom) }
+    if method == ids.NATIVE_JS_MODULE_NS_EXOTIC_METHODS { return unsafe namespaces.hasProperty(object.view(), atom) }
+    if method == ids.NATIVE_JS_PROXY_EXOTIC_METHODS { return run proxy.has(&mut self, realm, object, atom) }
     return invalid()
   }
 }
 impl<'m, S: EngineServices> GetPropertyHooks for Engine<'m, S> {
-  unsafe effect fn restrictedGetProperty(self: &mut Self, context: *mut HeapHeader, table: NativeFunctionId, object: Value, atom: u32, receiver: Value) -> Option<Value>
+  effect fn restrictedGetProperty<'r, 'v, 'w>(self: &mut Self, realm: Realm<'r>, table: NativeFunctionId, object: ValueRef<'v>, atom: u32, receiver: ValueRef<'w>) -> Option<ValueBits>
     ! OutOfMemoryError | JsException ? &mut Allocator {
-    if let NativeFunctionId.Host { id } = table { return run unsafe EngineServices.restrictedGetProperty(&mut self, id, context, object, atom, receiver) }
-    return Option<Value>.none()
+    if let NativeFunctionId.Host { id } = table { return run EngineServices.restrictedGetProperty(&mut self, id, realm, object, atom, receiver) }
+    return Option<ValueBits>.none()
   }
-  unsafe effect fn getExoticProperty(self: &mut Self, context: *mut HeapHeader, table: NativeFunctionId, object: Value, atom: u32, receiver: Value) -> Value
+  effect fn getExoticProperty<'r, 'v, 'w>(self: &mut Self, realm: Realm<'r>, table: NativeFunctionId, object: ValueRef<'v>, atom: u32, receiver: ValueRef<'w>) -> ValueBits
     ! OutOfMemoryError | JsException ? &mut Allocator {
-    if let NativeFunctionId.Host { id } = table { return run unsafe EngineServices.getProperty(&mut self, id, context, object, atom, receiver) }
+    if let NativeFunctionId.Host { id } = table { return run EngineServices.getProperty(&mut self, id, realm, object, atom, receiver) }
     if runtimeMethod(table) != ids.NATIVE_JS_PROXY_EXOTIC_METHODS { invalid() }
-    return run unsafe proxy.get(&mut self, context, object, atom, receiver)
+    return run proxy.get(&mut self, realm, object, atom, receiver)
   }
 }
 impl<'m, S: EngineServices> PropertyWriteHooks for Engine<'m, S> {
-  unsafe effect fn setExoticProperty(self: &mut Self, context: *mut HeapHeader, table: NativeFunctionId, object: Value, atom: u32, value: Value, receiver: Value, flags: u32) -> bool
+  effect fn setExoticProperty<'r, 'v, 'w, 'x>(self: &mut Self, realm: Realm<'r>, table: NativeFunctionId, object: ValueRef<'v>, atom: u32, value: ValueRef<'w>, receiver: ValueRef<'x>, flags: u32) -> bool
     ! OutOfMemoryError | JsException ? &mut Allocator {
-    if let NativeFunctionId.Host { id } = table { return run unsafe EngineServices.setProperty(&mut self, id, context, object, atom, value, receiver, flags) }
+    if let NativeFunctionId.Host { id } = table { return run EngineServices.setProperty(&mut self, id, realm, object, atom, value, receiver, flags) }
     if runtimeMethod(table) != ids.NATIVE_JS_PROXY_EXOTIC_METHODS { invalid() }
-    return run unsafe proxy.set(&mut self, context, object, atom, value, receiver, flags)
+    return run proxy.set(&mut self, realm, object, atom, value, receiver, flags)
   }
-  unsafe effect fn defineExoticProperty(self: &mut Self, context: *mut HeapHeader, table: NativeFunctionId, object: Value, atom: u32, value: Value, getter: Value, setter: Value, flags: u32) -> bool
+  effect fn defineExoticProperty<'r, 'v, 'w, 'x, 'y>(self: &mut Self, realm: Realm<'r>, table: NativeFunctionId, object: ValueRef<'v>, atom: u32, value: ValueRef<'w>, getter: ValueRef<'x>, setter: ValueRef<'y>, flags: u32) -> bool
     ! OutOfMemoryError | JsException ? &mut Allocator {
-    if let NativeFunctionId.Host { id } = table { return run unsafe EngineServices.defineProperty(&mut self, id, context, object, atom, value, getter, setter, flags) }
+    if let NativeFunctionId.Host { id } = table { return run EngineServices.defineProperty(&mut self, id, realm, object, atom, value, getter, setter, flags) }
     let method = runtimeMethod(table)
-    if method == ids.NATIVE_JS_ARGUMENTS_EXOTIC_METHODS { return run unsafe arguments.defineOwnProperty(&mut self, context, object, atom, value, getter, setter, flags) }
-    if method == ids.NATIVE_JS_STRING_EXOTIC_METHODS { return run unsafe stringExotic.defineOwnProperty(&mut self, context, object, atom, value, getter, setter, flags) }
+    if method == ids.NATIVE_JS_ARGUMENTS_EXOTIC_METHODS { return run arguments.defineOwnProperty(&mut self, realm, object, atom, value, getter, setter, flags) }
+    if method == ids.NATIVE_JS_STRING_EXOTIC_METHODS { return run stringExotic.defineOwnProperty(&mut self, realm, object, atom, value, getter, setter, flags) }
     if method == ids.NATIVE_JS_PROXY_EXOTIC_METHODS {
-      let memory = self.memory return run unsafe proxyDescriptors.defineOwnProperty(&mut self, memory, context, object, atom, value, getter, setter, flags)
+      let memory = self.memory return run proxyDescriptors.defineOwnProperty(&mut self, memory, realm, object, atom, value, getter, setter, flags)
     }
     return invalid()
   }
-  unsafe effect fn deleteExoticProperty(self: &mut Self, context: *mut HeapHeader, table: NativeFunctionId, object: Value, atom: u32) -> bool
+  effect fn deleteExoticProperty<'r, 'v>(self: &mut Self, realm: Realm<'r>, table: NativeFunctionId, object: ValueRef<'v>, atom: u32) -> bool
     ! OutOfMemoryError | JsException ? &mut Allocator {
-    if let NativeFunctionId.Host { id } = table { return run unsafe EngineServices.deleteProperty(&mut self, id, context, object, atom) }
+    if let NativeFunctionId.Host { id } = table { return run EngineServices.deleteProperty(&mut self, id, realm, object, atom) }
     let method = runtimeMethod(table)
-    if method == ids.NATIVE_JS_STRING_EXOTIC_METHODS { return unsafe stringExotic.deleteProperty(object, atom) }
-    if method == ids.NATIVE_JS_PROXY_EXOTIC_METHODS { return run unsafe proxy.deleteProperty(&mut self, context, object, atom) }
+    if method == ids.NATIVE_JS_STRING_EXOTIC_METHODS { return unsafe stringExotic.deleteProperty(object.view(), atom) }
+    if method == ids.NATIVE_JS_PROXY_EXOTIC_METHODS { return run proxy.deleteProperty(&mut self, realm, object, atom) }
     return invalid()
   }
-  unsafe effect fn isExoticExtensible(self: &mut Self, context: *mut HeapHeader, table: NativeFunctionId, object: Value) -> bool
-    ! OutOfMemoryError | JsException ? &mut Allocator { return run unsafe PrototypeHooks.isExtensible(&mut self, context, table, object) }
+  effect fn isExoticExtensible<'r, 'v>(self: &mut Self, realm: Realm<'r>, table: NativeFunctionId, object: ValueRef<'v>) -> bool
+    ! OutOfMemoryError | JsException ? &mut Allocator { return run PrototypeHooks.isExtensible(&mut self, realm, table, object) }
 }
 impl<'m, S: EngineServices> PrototypeHooks for Engine<'m, S> {
-  unsafe effect fn getPrototype(self: &mut Self, context: *mut HeapHeader, table: NativeFunctionId, object: Value) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
-    if let NativeFunctionId.Host { id } = table { return run unsafe EngineServices.getPrototype(&mut self, id, context, object) }
+  effect fn getPrototype<'r, 'v>(self: &mut Self, realm: Realm<'r>, table: NativeFunctionId, object: ValueRef<'v>) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+    if let NativeFunctionId.Host { id } = table { return run EngineServices.getPrototype(&mut self, id, realm, object) }
     if runtimeMethod(table) != ids.NATIVE_JS_PROXY_EXOTIC_METHODS { invalid() }
-    return run unsafe proxy.getPrototype(&mut self, context, object)
+    return run proxy.getPrototype(&mut self, realm, object)
   }
-  unsafe effect fn setPrototype(self: &mut Self, context: *mut HeapHeader, table: NativeFunctionId, object: Value, prototype: Value) -> bool ! OutOfMemoryError | JsException ? &mut Allocator {
-    if let NativeFunctionId.Host { id } = table { return run unsafe EngineServices.setPrototype(&mut self, id, context, object, prototype) }
+  effect fn setPrototype<'r, 'v, 'w>(self: &mut Self, realm: Realm<'r>, table: NativeFunctionId, object: ValueRef<'v>, prototype: ValueRef<'w>) -> bool ! OutOfMemoryError | JsException ? &mut Allocator {
+    if let NativeFunctionId.Host { id } = table { return run EngineServices.setPrototype(&mut self, id, realm, object, prototype) }
     if runtimeMethod(table) != ids.NATIVE_JS_PROXY_EXOTIC_METHODS { invalid() }
-    return run unsafe proxy.setPrototype(&mut self, context, object, prototype)
+    return run proxy.setPrototype(&mut self, realm, object, prototype)
   }
-  unsafe effect fn isExtensible(self: &mut Self, context: *mut HeapHeader, table: NativeFunctionId, object: Value) -> bool ! OutOfMemoryError | JsException ? &mut Allocator {
-    if let NativeFunctionId.Host { id } = table { return run unsafe EngineServices.isExtensible(&mut self, id, context, object) }
+  effect fn isExtensible<'r, 'v>(self: &mut Self, realm: Realm<'r>, table: NativeFunctionId, object: ValueRef<'v>) -> bool ! OutOfMemoryError | JsException ? &mut Allocator {
+    if let NativeFunctionId.Host { id } = table { return run EngineServices.isExtensible(&mut self, id, realm, object) }
     if runtimeMethod(table) != ids.NATIVE_JS_PROXY_EXOTIC_METHODS { invalid() }
-    return run unsafe proxy.isExtensible(&mut self, context, object)
+    return run proxy.isExtensible(&mut self, realm, object)
   }
-  unsafe effect fn preventExtensions(self: &mut Self, context: *mut HeapHeader, table: NativeFunctionId, object: Value) -> bool ! OutOfMemoryError | JsException ? &mut Allocator {
-    if let NativeFunctionId.Host { id } = table { return run unsafe EngineServices.preventExtensions(&mut self, id, context, object) }
+  effect fn preventExtensions<'r, 'v>(self: &mut Self, realm: Realm<'r>, table: NativeFunctionId, object: ValueRef<'v>) -> bool ! OutOfMemoryError | JsException ? &mut Allocator {
+    if let NativeFunctionId.Host { id } = table { return run EngineServices.preventExtensions(&mut self, id, realm, object) }
     if runtimeMethod(table) != ids.NATIVE_JS_PROXY_EXOTIC_METHODS { invalid() }
-    return run unsafe proxy.preventExtensions(&mut self, context, object)
+    return run proxy.preventExtensions(&mut self, realm, object)
   }
 }
 impl<'m, S: EngineServices> ErrorHooks for Engine<'m, S> {
-  unsafe effect fn defineErrorProperty(self: &mut Self, context: *mut HeapHeader, object: Value, atom: u32, value: Value, flags: u32) -> bool ! JsException ? &mut Allocator {
-    let result = run Effect.result(unsafe mutations.definePropertyValue(&mut self, context, object, atom, value, flags))
+  unsafe effect fn defineErrorProperty<'r, 'v>(self: &mut Self, realm: Realm<'r>, object: ValueRef<'v>, atom: u32, value: ValueBits, flags: u32) -> bool ! JsException ? &mut Allocator {
+    let result = run Effect.result(mutations.definePropertyValue(&mut self, realm, object, atom, unsafe Value.adoptBits(value), flags))
     return match move result {
       Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { value: accepted } => accepted
-      Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => run unsafe proxyCore.materialize(&mut self, context, move error)
+      Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => run proxyCore.materialize(&mut self, realm, move error)
     }
   }
 }
 impl<'m, S: EngineServices> AutoInitHooks for Engine<'m, S> {
-  unsafe effect fn initializeProperty(self: &mut Self, realm: *mut HeapHeader, owner: Value, atom: u32, kind: AutoInitKind, opaque: AutoInitOpaque) -> InitializedProperty ! JsException ? &mut Allocator {
+  effect fn initializeProperty<'r, 'v>(self: &mut Self, realm: Realm<'r>, owner: ValueRef<'v>, atom: u32, kind: AutoInitKind, opaque: AutoInitOpaque) -> InitializedProperty ! JsException ? &mut Allocator { let context = realm.context()
     let memory = self.memory
     match kind {
-      AutoInitKind.Prototype => { return InitializedProperty.Value { value: run unsafe closures.instantiatePrototype(&mut self, memory, realm, owner) } }
+      AutoInitKind.Prototype => { return InitializedProperty.Value { value: run unsafe closures.instantiatePrototype(&mut self, memory, context, owner.view()) } }
       AutoInitKind.ModuleNamespace => {
-        let module = match opaque { AutoInitOpaque.Heap { reference } => reference _ => invalid() }
-        return run unsafe namespaces.initializeProperty(&mut self, memory, realm, module, atom)
+        let module = match opaque { AutoInitOpaque.Heap { reference } => unsafe CellRef<ModuleDef>.of(reference) _ => invalid() }
+        return run namespaces.initializeProperty(&mut self, memory, realm, module, atom)
       }
       AutoInitKind.Property => {
         if let AutoInitOpaque.Initializer { reference } = opaque {
-          return InitializedProperty.Value { value: run unsafe promise.call(&mut self, realm, Value.Object { reference: reference }, owner, &[]) }
+          let function = ValueBits.Object { reference: reference }
+          let value = run promise.call(&mut self, realm, unsafe lendBits(&function, function), owner, &[])
+          return InitializedProperty.Value { value: value.intoBits() }
         }
         if let AutoInitOpaque.Native { descriptor } = opaque {
-          return InitializedProperty.Value { value: run unsafe definitions.initialize(&mut self, memory, realm, owner, atom, descriptor) }
+          return InitializedProperty.Value { value: run definitions.initialize(&mut self, memory, realm, owner, atom, descriptor) }
         }
-        return run unsafe EngineServices.initializeProperty(&mut self, realm, owner, atom, kind, opaque)
+        return run EngineServices.initializeProperty(&mut self, realm, owner, atom, kind, opaque)
       }
     }
   }
@@ -310,99 +318,101 @@ impl<'m, S: EngineServices> IntrinsicDefinitions for Engine<'m, S> {
   }
 }
 impl<'m, S: EngineServices> NativeFunctionHooks for Engine<'m, S> {
-  unsafe effect fn nativeGeneric(self: &mut Self, id: NativeFunctionId, context: *mut HeapHeader, receiver: Value, argc: i32, argv: &FrameSlots) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
-    if let NativeFunctionId.Host { id: host } = id { return run unsafe EngineServices.nativeGeneric(&mut self, host, context, receiver, argc, argv) }
-    let memory = self.memory let domain = self.domain return run unsafe builtins.generic(&mut self, memory, domain, context, id, receiver, argc, argv, 0)
+  @inlineAlways
+  effect fn nativeGeneric<'r, 'v, 'w>(self: &mut Self, id: NativeFunctionId, realm: Realm<'r>, receiver: ValueRef<'v>, argc: i32, argv: Arguments<'w>) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator { let context = realm.context()
+    if let NativeFunctionId.Host { id: host } = id { return run EngineServices.nativeGeneric(&mut self, host, realm, receiver, argc, argv) }
+    let memory = self.memory let domain = self.domain return run unsafe builtins.generic(&mut self, memory, domain, context, id, receiver.view(), argc, argv.slots(), 0)
   }
-  unsafe effect fn nativeMagic(self: &mut Self, id: NativeFunctionId, context: *mut HeapHeader, receiver: Value, argc: i32, argv: &FrameSlots, magic: i32) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
-    if let NativeFunctionId.Host { id: host } = id { return run unsafe EngineServices.nativeMagic(&mut self, host, context, receiver, argc, argv, magic) }
-    let memory = self.memory let domain = self.domain return run unsafe builtins.generic(&mut self, memory, domain, context, id, receiver, argc, argv, magic)
+  effect fn nativeMagic<'r, 'v, 'w>(self: &mut Self, id: NativeFunctionId, realm: Realm<'r>, receiver: ValueRef<'v>, argc: i32, argv: Arguments<'w>, magic: i32) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator { let context = realm.context()
+    if let NativeFunctionId.Host { id: host } = id { return run EngineServices.nativeMagic(&mut self, host, realm, receiver, argc, argv, magic) }
+    let memory = self.memory let domain = self.domain return run unsafe builtins.generic(&mut self, memory, domain, context, id, receiver.view(), argc, argv.slots(), magic)
   }
-  unsafe effect fn nativeFlags(self: &mut Self, id: NativeFunctionId, context: *mut HeapHeader, function: Value, receiver: Value, argc: i32, argv: &FrameSlots, flags: i32) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
-    if let NativeFunctionId.Host { id: host } = id { return run unsafe EngineServices.nativeFlags(&mut self, host, context, function, receiver, argc, argv, flags) }
-    let memory = self.memory let domain = self.domain return run unsafe builtins.flags(&mut self, memory, domain, context, id, function, receiver, argc, argv, flags)
+  effect fn nativeFlags<'r, 'v, 'w, 'x>(self: &mut Self, id: NativeFunctionId, realm: Realm<'r>, function: ValueRef<'v>, receiver: ValueRef<'w>, argc: i32, argv: Arguments<'x>, flags: i32) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator { let context = realm.context()
+    if let NativeFunctionId.Host { id: host } = id { return run EngineServices.nativeFlags(&mut self, host, realm, function, receiver, argc, argv, flags) }
+    let memory = self.memory let domain = self.domain return run unsafe builtins.flags(&mut self, memory, domain, context, id, function.view(), receiver.view(), argc, argv.slots(), flags)
   }
+  effect fn nativeClockMilliseconds(self: &mut Self) -> Option<i64> { return Option<i64>.some(run platform.nowMilliseconds()) }
   fn nativeFloatUnary(self: &mut Self, id: NativeFunctionId, value: f64) -> f64 {
     return match id { NativeFunctionId.Host { id: host } => EngineServices.nativeFloatUnary(&mut self, host, value) _ => builtins.floatUnary(id, value) }
   }
   fn nativeFloatBinary(self: &mut Self, id: NativeFunctionId, left: f64, right: f64) -> f64 {
     return match id { NativeFunctionId.Host { id: host } => EngineServices.nativeFloatBinary(&mut self, host, left, right) _ => builtins.floatBinary(id, left, right) }
   }
-  unsafe effect fn nativeGetter(self: &mut Self, id: NativeFunctionId, context: *mut HeapHeader, receiver: Value) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
-    if let NativeFunctionId.Host { id: host } = id { return run unsafe EngineServices.nativeGetter(&mut self, host, context, receiver) }
-    let argv = FrameSlots.Borrowed { data: unsafe Intrinsic.pointerRequalify<[*]mut Value, *mut Value>(unsafe Intrinsic.stackAllocate<Value>(0)), length: 0 }
-    let memory = self.memory let domain = self.domain return run unsafe builtins.generic(&mut self, memory, domain, context, id, receiver, 0, &argv, 0)
+  effect fn nativeGetter<'r, 'v>(self: &mut Self, id: NativeFunctionId, realm: Realm<'r>, receiver: ValueRef<'v>) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator { let context = realm.context()
+    if let NativeFunctionId.Host { id: host } = id { return run EngineServices.nativeGetter(&mut self, host, realm, receiver) }
+    let argv = FrameSlots { data: unsafe Intrinsic.pointerRequalify<[*]mut ValueBits, *mut ValueBits>(unsafe Intrinsic.stackAllocate<ValueBits>(0)), count: 0 }
+    let memory = self.memory let domain = self.domain return run unsafe builtins.generic(&mut self, memory, domain, context, id, receiver.view(), 0, &argv, 0)
   }
-  unsafe effect fn nativeSetter(self: &mut Self, id: NativeFunctionId, context: *mut HeapHeader, receiver: Value, value: Value) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
-    if let NativeFunctionId.Host { id: host } = id { return run unsafe EngineServices.nativeSetter(&mut self, host, context, receiver, value) }
-    let argv = FrameSlots.Borrowed { data: unsafe Intrinsic.pointerRequalify<*const Value, *mut Value>(Pointer.fromRef<Value>(&value)), length: 1 }
-    let memory = self.memory let domain = self.domain return run unsafe builtins.generic(&mut self, memory, domain, context, id, receiver, 1, &argv, 0)
+  effect fn nativeSetter<'r, 'v, 'w>(self: &mut Self, id: NativeFunctionId, realm: Realm<'r>, receiver: ValueRef<'v>, value: ValueRef<'w>) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator { let context = realm.context()
+    if let NativeFunctionId.Host { id: host } = id { return run EngineServices.nativeSetter(&mut self, host, realm, receiver, value) }
+    let valueBits = value.view() let argv = FrameSlots { data: unsafe Intrinsic.pointerRequalify<*const ValueBits, *mut ValueBits>(Pointer.fromRef<ValueBits>(&valueBits)), count: 1 }
+    let memory = self.memory let domain = self.domain return run unsafe builtins.generic(&mut self, memory, domain, context, id, receiver.view(), 1, &argv, 0)
   }
-  unsafe effect fn nativeGetterMagic(self: &mut Self, id: NativeFunctionId, context: *mut HeapHeader, receiver: Value, magic: i32) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
-    if let NativeFunctionId.Host { id: host } = id { return run unsafe EngineServices.nativeGetterMagic(&mut self, host, context, receiver, magic) }
-    let argv = FrameSlots.Borrowed { data: unsafe Intrinsic.pointerRequalify<[*]mut Value, *mut Value>(unsafe Intrinsic.stackAllocate<Value>(0)), length: 0 }
-    let memory = self.memory let domain = self.domain return run unsafe builtins.generic(&mut self, memory, domain, context, id, receiver, 0, &argv, magic)
+  effect fn nativeGetterMagic<'r, 'v>(self: &mut Self, id: NativeFunctionId, realm: Realm<'r>, receiver: ValueRef<'v>, magic: i32) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator { let context = realm.context()
+    if let NativeFunctionId.Host { id: host } = id { return run EngineServices.nativeGetterMagic(&mut self, host, realm, receiver, magic) }
+    let argv = FrameSlots { data: unsafe Intrinsic.pointerRequalify<[*]mut ValueBits, *mut ValueBits>(unsafe Intrinsic.stackAllocate<ValueBits>(0)), count: 0 }
+    let memory = self.memory let domain = self.domain return run unsafe builtins.generic(&mut self, memory, domain, context, id, receiver.view(), 0, &argv, magic)
   }
-  unsafe effect fn nativeSetterMagic(self: &mut Self, id: NativeFunctionId, context: *mut HeapHeader, receiver: Value, value: Value, magic: i32) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
-    if let NativeFunctionId.Host { id: host } = id { return run unsafe EngineServices.nativeSetterMagic(&mut self, host, context, receiver, value, magic) }
-    let argv = FrameSlots.Borrowed { data: unsafe Intrinsic.pointerRequalify<*const Value, *mut Value>(Pointer.fromRef<Value>(&value)), length: 1 }
-    let memory = self.memory let domain = self.domain return run unsafe builtins.generic(&mut self, memory, domain, context, id, receiver, 1, &argv, magic)
+  effect fn nativeSetterMagic<'r, 'v, 'w>(self: &mut Self, id: NativeFunctionId, realm: Realm<'r>, receiver: ValueRef<'v>, value: ValueRef<'w>, magic: i32) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator { let context = realm.context()
+    if let NativeFunctionId.Host { id: host } = id { return run EngineServices.nativeSetterMagic(&mut self, host, realm, receiver, value, magic) }
+    let valueBits = value.view() let argv = FrameSlots { data: unsafe Intrinsic.pointerRequalify<*const ValueBits, *mut ValueBits>(Pointer.fromRef<ValueBits>(&valueBits)), count: 1 }
+    let memory = self.memory let domain = self.domain return run unsafe builtins.generic(&mut self, memory, domain, context, id, receiver.view(), 1, &argv, magic)
   }
-  unsafe effect fn nativeIteratorNext(self: &mut Self, id: NativeFunctionId, context: *mut HeapHeader, receiver: Value, argc: i32, argv: &FrameSlots, magic: i32) -> NativeIteratorResult ! OutOfMemoryError | JsException ? &mut Allocator {
-    if let NativeFunctionId.Host { id: host } = id { return run unsafe EngineServices.nativeIteratorNext(&mut self, host, context, receiver, argc, argv, magic) }
-    let memory = self.memory let domain = self.domain return run unsafe builtins.iterator(&mut self, memory, domain, context, id, receiver, argc, argv, magic)
+  effect fn nativeIteratorNext<'r, 'v, 'w>(self: &mut Self, id: NativeFunctionId, realm: Realm<'r>, receiver: ValueRef<'v>, argc: i32, argv: Arguments<'w>, magic: i32) -> NativeIteratorResult ! OutOfMemoryError | JsException ? &mut Allocator { let context = realm.context()
+    if let NativeFunctionId.Host { id: host } = id { return run EngineServices.nativeIteratorNext(&mut self, host, realm, receiver, argc, argv, magic) }
+    let memory = self.memory let domain = self.domain return run unsafe builtins.iterator(&mut self, memory, domain, context, id, receiver.view(), argc, argv.slots(), magic)
   }
-  unsafe effect fn nativeData(self: &mut Self, id: NativeFunctionId, context: *mut HeapHeader, receiver: Value, argc: i32, argv: &FrameSlots, magic: i32, captured: &FrameSlots) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
-    if let NativeFunctionId.Host { id: host } = id { return run unsafe EngineServices.nativeData(&mut self, host, context, receiver, argc, argv, magic, captured) }
-    let memory = self.memory let domain = self.domain return run unsafe builtins.data(&mut self, memory, domain, context, id, receiver, argc, argv, magic, captured)
+  effect fn nativeData<'r, 'v, 'w, 'x>(self: &mut Self, id: NativeFunctionId, realm: Realm<'r>, receiver: ValueRef<'v>, argc: i32, argv: Arguments<'w>, magic: i32, captured: Arguments<'x>) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator { let context = realm.context()
+    if let NativeFunctionId.Host { id: host } = id { return run EngineServices.nativeData(&mut self, host, realm, receiver, argc, argv, magic, captured) }
+    let memory = self.memory let domain = self.domain return run unsafe builtins.data(&mut self, memory, domain, context, id, receiver.view(), argc, argv.slots(), magic, captured.slots())
   }
 }
 impl<'m, S: EngineServices> JobDispatcher for Engine<'m, S> {
-  unsafe effect fn dispatchJob(self: &mut Self, context: *mut HeapHeader, function: NativeFunctionId, argv: &[Value]) -> Value ! OutOfMemoryError ? &mut Allocator {
-    if let NativeFunctionId.Host { id } = function { return run unsafe EngineServices.job(&mut self, id, context, argv) }
+  unsafe effect fn dispatchJob<'r>(self: &mut Self, realm: Realm<'r>, function: NativeFunctionId, argv: &[ValueBits]) -> ValueBits ! OutOfMemoryError ? &mut Allocator { let context = realm.context()
+    if let NativeFunctionId.Host { id } = function { return run unsafe EngineServices.job(&mut self, id, realm, argv) }
     let memory = self.memory let domain = self.domain return run unsafe builtins.job(&mut self, memory, domain, context, function, argv)
   }
 }
 impl<'m, S: EngineServices> EvalHooks for Engine<'m, S> {
-  unsafe effect fn evaluateObject(self: &mut Self, context: *mut HeapHeader, receiver: Value, input: Value, flags: i32, scope: i32) -> Value ! JsException ? &mut Allocator {
-    let memory = self.memory return run unsafe evaluation.evaluateObject(&mut self, memory, context, receiver, input, flags, scope)
+  effect fn evaluateObject<'r, 'v, 'w>(self: &mut Self, realm: Realm<'r>, receiver: ValueRef<'v>, input: ValueRef<'w>, flags: i32, scope: i32) -> ValueBits ! JsException ? &mut Allocator {
+    let memory = self.memory return run evaluation.evaluateObject(&mut self, memory, realm, receiver, input, flags, scope)
   }
-  unsafe effect fn dynamicImport(self: &mut Self, context: *mut HeapHeader, specifier: Value, options: Value) -> Value ! JsException ? &mut Allocator {
-    let memory = self.memory return run unsafe imports.dynamicImport(&mut self, memory, context, specifier, options)
+  effect fn dynamicImport<'r, 'v, 'w>(self: &mut Self, realm: Realm<'r>, specifier: ValueRef<'v>, options: ValueRef<'w>) -> ValueBits ! JsException ? &mut Allocator {
+    let memory = self.memory return run imports.dynamicImport(&mut self, memory, realm, specifier, options)
   }
 }
 impl<'m, S: EngineServices> InterruptHooks for Engine<'m, S> {
-  unsafe effect fn debugger(self: &mut Self, context: *mut HeapHeader, event: u32) -> () ? &mut Allocator {
-    run unsafe EngineServices.debugger(&mut self, context, event)
+  effect fn debugger<'r>(self: &mut Self, realm: Realm<'r>, event: u32) -> () ? &mut Allocator {
+    run EngineServices.debugger(&mut self, realm, event)
   }
   unsafe effect fn interrupt(self: &mut Self, rt: *mut HeapHeader, callback: NativeFunctionId, opaque: ?*mut u8) -> bool ? &mut Allocator {
     return run unsafe EngineServices.interrupt(&mut self, rt, callback, opaque)
   }
 }
 impl<'m, S: EngineServices> PromiseHooks for Engine<'m, S> {
-  unsafe effect fn promiseRejection(self: &mut Self, context: *mut HeapHeader, callback: NativeFunctionId, promise: Value, reason: Value, handled: bool, opaque: ?*mut u8) -> () ? &mut Allocator {
-    run unsafe EngineServices.promiseRejection(&mut self, context, callback, promise, reason, handled, opaque)
+  unsafe effect fn promiseRejection<'r, 'v, 'w>(self: &mut Self, realm: Realm<'r>, callback: NativeFunctionId, promise: ValueRef<'v>, reason: ValueRef<'w>, handled: bool, opaque: ?*mut u8) -> () ? &mut Allocator {
+    run unsafe EngineServices.promiseRejection(&mut self, realm, callback, promise, reason, handled, opaque)
   }
 }
 impl<'m, S: EngineServices> ModuleHostHooks for Engine<'m, S> {
-  unsafe effect fn compiledSource(self: &mut Self, context: *mut HeapHeader,
-    compiled: Value, source: &[u8], filename: &[u8], flags: i32,
+  effect fn compiledSource<'r, 'v>(self: &mut Self, realm: Realm<'r>,
+    compiled: ValueRef<'v>, source: &[u8], filename: &[u8], flags: i32,
     sourceURL: &[u8], sourceMapURL: &[u8]) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
-    run unsafe EngineServices.compiledSource(&mut self, context, compiled, source, filename, flags, sourceURL, sourceMapURL)
+    run EngineServices.compiledSource(&mut self, realm, compiled, source, filename, flags, sourceURL, sourceMapURL)
   }
-  unsafe effect fn normalizeModule(self: &mut Self, context: *mut HeapHeader, callback: NativeFunctionId, opaque: ?*mut u8, base: &[u8], name: &[u8], attributes: Value) -> List<u8> ! OutOfMemoryError | JsException ? &mut Allocator {
-    return run unsafe EngineServices.normalizeModule(&mut self, context, callback, opaque, base, name, attributes)
+  unsafe effect fn normalizeModule<'r, 'v>(self: &mut Self, realm: Realm<'r>, callback: NativeFunctionId, opaque: ?*mut u8, base: &[u8], name: &[u8], attributes: ValueRef<'v>) -> List<u8> ! OutOfMemoryError | JsException ? &mut Allocator {
+    return run unsafe EngineServices.normalizeModule(&mut self, realm, callback, opaque, base, name, attributes)
   }
-  unsafe effect fn loadModule(self: &mut Self, context: *mut HeapHeader, callback: NativeFunctionId, opaque: ?*mut u8, name: &[u8], attributes: Value) -> *mut HeapHeader ! OutOfMemoryError | JsException ? &mut Allocator {
-    return run unsafe EngineServices.loadModule(&mut self, context, callback, opaque, name, attributes)
+  unsafe effect fn loadModule<'r, 'v>(self: &mut Self, realm: Realm<'r>, callback: NativeFunctionId, opaque: ?*mut u8, name: &[u8], attributes: ValueRef<'v>) -> CellRef<ModuleDef> ! OutOfMemoryError | JsException ? &mut Allocator {
+    return run unsafe EngineServices.loadModule(&mut self, realm, callback, opaque, name, attributes)
   }
-  unsafe effect fn initializeModule(self: &mut Self, context: *mut HeapHeader, callback: NativeFunctionId, module: *mut HeapHeader) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
-    run unsafe EngineServices.initializeModule(&mut self, context, callback, module)
+  effect fn initializeModule<'r>(self: &mut Self, realm: Realm<'r>, callback: NativeFunctionId, module: CellRef<ModuleDef>) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+    run EngineServices.initializeModule(&mut self, realm, callback, module)
   }
 }
 impl<'m, S: EngineServices> ModuleAttributeHooks for Engine<'m, S> {
-  unsafe effect fn checkModuleAttributes(self: &mut Self, context: *mut HeapHeader, callback: NativeFunctionId, opaque: ?*mut u8, attributes: Value) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
-    run unsafe EngineServices.checkModuleAttributes(&mut self, context, callback, opaque, attributes)
+  unsafe effect fn checkModuleAttributes<'r, 'v>(self: &mut Self, realm: Realm<'r>, callback: NativeFunctionId, opaque: ?*mut u8, attributes: ValueRef<'v>) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+    run unsafe EngineServices.checkModuleAttributes(&mut self, realm, callback, opaque, attributes)
   }
 }
 impl<'m, S: EngineServices> BufferHooks for Engine<'m, S> {
@@ -420,17 +430,17 @@ impl<'m, S: EngineServices> BufferHooks for Engine<'m, S> {
   }
 }
 impl<'m, S: EngineServices> WorkerHooks for Engine<'m, S> {
-  unsafe effect fn writeWorkerMessage(self: &mut Self, context: *mut HeapHeader,
-    value: Value) -> WriteResult ! JsException ? &mut Allocator {
-    return run unsafe binaryWriter.writeObject2(&mut self, context, value, 12)
+  effect fn writeWorkerMessage<'r, 'v>(self: &mut Self, realm: Realm<'r>,
+    value: ValueRef<'v>) -> WriteResult ! JsException ? &mut Allocator {
+    return run binaryWriter.writeObject2(&mut self, realm, value, 12)
   }
-  unsafe effect fn readWorkerMessage(self: &mut Self, context: *mut HeapHeader,
-    data: *const u8, length: usize, leases: &[SharedLease]) -> Value ! JsException ? &mut Allocator {
-    return run unsafe binaryReader.readObjectTrustedLeases(&mut self, context, data, length, 12, leases)
+  unsafe effect fn readWorkerMessage<'r>(self: &mut Self, realm: Realm<'r>,
+    data: *const u8, length: usize, leases: &[SharedLease]) -> ValueBits ! JsException ? &mut Allocator {
+    return run binaryReader.readObjectTrustedLeases(&mut self, realm, data, length, 12, leases)
   }
-  unsafe effect fn startWorker(self: &mut Self, context: *mut HeapHeader,
+  effect fn startWorker<'r>(self: &mut Self, realm: Realm<'r>,
     args: WorkerStart) -> () ! JsException ? &mut Allocator {
-    run unsafe EngineServices.startWorker(&mut self, context, move args)
+    run EngineServices.startWorker(&mut self, realm, move args)
   }
 }
 impl<'m, S: EngineServices> DateHooks for Engine<'m, S> {

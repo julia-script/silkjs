@@ -278,6 +278,7 @@ def suite(qjs, qjsc, reference, compiler, stdlib, env, output, bjson_plugin=None
                 installation = work / "read-only-install"
                 shutil.copytree(ROOT / "src", installation / "src")
                 shutil.copy2(ROOT / "silk.toml", installation / "silk.toml")
+                shutil.copy2(ROOT / "startup.order", installation / "startup.order")
                 installed_paths = list(installation.rglob("*")) + [installation]
                 for installed in installed_paths:
                     installed.chmod(0o555 if installed.is_dir() else 0o444)

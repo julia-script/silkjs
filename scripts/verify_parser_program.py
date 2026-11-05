@@ -310,7 +310,7 @@ import js_tokens { LexError }
 import js_bigint { BigInt, BigIntError }
 import js_strings { Strings }
 import js_string_types { StringOwner, StringLengthError }
-import js_value { Value }
+import js_value { ValueBits }
 import js_class_data as classes
 import js_debug_positions { SourcePositionCache }
 import runtime_memory { RuntimeAllocator, AllocationObserver }
@@ -332,7 +332,7 @@ effect fn field(out:&mut ByteBuffer,s:&[u8],n:u32)->() ! OutOfMemoryError ? &mut
 effect fn bytes(out:&mut ByteBuffer,s:&[u8],data:&[u8])->() ! OutOfMemoryError ? &mut Allocator {
  run header(&mut out,s,data.length) let mut i:usize=0 while i<data.length {run out.writeU32(u8.toU32(data[i])) i=i+1}
 }
-effect fn string(out:&mut ByteBuffer,s:&[u8],value:Value)->() ! OutOfMemoryError ? &mut Allocator {
+effect fn string(out:&mut ByteBuffer,s:&[u8],value:ValueBits)->() ! OutOfMemoryError ? &mut Allocator {
  if !value.isString(){trap()} run header(&mut out,s,Strings.length(value)) let mut i:usize=0
  while i<Strings.length(value){run out.writeU32(u16.toU32(Strings.codeUnit(value,i))) i=i+1}
 }
@@ -343,17 +343,17 @@ effect fn atom(out:&mut ByteBuffer,rt:*mut HeapHeader,s:&[u8],a:u32)->() ! OutOf
   let mut hooks=Hooks.make(false) unsafe gc.release(&mut hooks,rt,text)}
  run end(&mut out)
 }
-effect fn value(out:&mut ByteBuffer,rt:*mut HeapHeader,ctx:*mut HeapHeader,v:Value)->() ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+effect fn value(out:&mut ByteBuffer,rt:*mut HeapHeader,ctx:*mut HeapHeader,v:ValueBits)->() ! OutOfMemoryError | StringLengthError ? &mut Allocator {
  run field(&mut out,b"tag",bits(v.tag()))
  match v {
-  Value.Int {value:n}=>{run field(&mut out,b"payload",bits(n))}
-  Value.Bool {value:b}=>{run field(&mut out,b"payload",flag(b))}
-  Value.ShortBigInt {value:n}=>{run field(&mut out,b"payload",bits(n))}
-  Value.Float64 {value:n}=>{let v=f64.toBits(n) run header(&mut out,b"bits",2) run out.writeU32(u64.toU32(v&0xffffffff)) run out.writeU32(u64.toU32(u64.shiftRight(v,32)))}
-  Value.String {..}=>{run string(&mut out,b"utf16",v)}
-  Value.BigInt {reference:p}=>{let anchor=() let n=unsafe HeapCell.payload<BigInt,()>(&anchor,p) run header(&mut out,b"limbs",n.length()) let mut i:usize=0 while i<n.length(){run out.writeU32(n.limbs()[i]) i=i+1}}
-  Value.FunctionBytecode {reference:p}=>{run begin(&mut out,b"function") run final(&mut out,rt,ctx,p) run end(&mut out)}
-  Value.Object {reference:p}=>{
+  ValueBits.Int {value:n}=>{run field(&mut out,b"payload",bits(n))}
+  ValueBits.Bool {value:b}=>{run field(&mut out,b"payload",flag(b))}
+  ValueBits.ShortBigInt {value:n}=>{run field(&mut out,b"payload",bits(n))}
+  ValueBits.Float64 {value:n}=>{let v=f64.toBits(n) run header(&mut out,b"bits",2) run out.writeU32(u64.toU32(v&0xffffffff)) run out.writeU32(u64.toU32(u64.shiftRight(v,32)))}
+  ValueBits.String {..}=>{run string(&mut out,b"utf16",v)}
+  ValueBits.BigInt {reference:p}=>{let anchor=() let n=unsafe HeapCell.payload<BigInt,()>(&anchor,p) run header(&mut out,b"limbs",n.length()) let mut i:usize=0 while i<n.length(){run out.writeU32(n.limbs()[i]) i=i+1}}
+  ValueBits.FunctionBytecode {reference:p}=>{run begin(&mut out,b"function") run final(&mut out,rt,ctx,p) run end(&mut out)}
+  ValueBits.Object {reference:p}=>{
    let anchor=() let o=unsafe HeapCell.payload<ObjectData,()>(&anchor,p) let sh=unsafe HeapCell.payload<ShapeData,()>(&anchor,o.shape)
    run field(&mut out,b"class",o.classId) run field(&mut out,b"extensible",flag(o.extensible)) run field(&mut out,b"fastArray",flag(o.fastArray))
    let mut prototype:u32=0
@@ -373,7 +373,7 @@ effect fn value(out:&mut ByteBuffer,rt:*mut HeapHeader,ctx:*mut HeapHeader,v:Val
     while i<array.values.length(){run begin(&mut out,b"element") run value(&mut out,rt,ctx,array.values.get(i)) run end(&mut out) i=i+1}
    } _=>trap()}}
   }
-  Value.Null=>() Value.Undefined=>() Value.Uninitialized=>() _=>trap()
+  ValueBits.Null=>() ValueBits.Undefined=>() ValueBits.Uninitialized=>() _=>trap()
  }
 }
 effect fn code(out:&mut ByteBuffer,rt:*mut HeapHeader,data:&ByteStorage,short:bool)->() ! OutOfMemoryError | StringLengthError ? &mut Allocator {
@@ -532,7 +532,7 @@ def native_failure(parser=True):
  LexError e=>{{let diagnostic=run parser.lexicalError(move e) run syntax(&mut out,move diagnostic)}}
  CompilerError e=>{{run compilerDiagnostic(&mut out,move e)}}
  JsException e=>{{let anchor=() let data=unsafe HeapCell.payload<RuntimeState,()>(&anchor,rt)
-  match data.currentException {{Value.Int {{value:n}}=>{{run field(&mut out,b"hostException",bits(n))}} _=>trap()}}}}
+  match data.currentException {{ValueBits.Int {{value:n}}=>{{run field(&mut out,b"hostException",bits(n))}} _=>trap()}}}}
  OutOfMemoryError e=>{{fail move e}} StringLengthError e=>{{fail move e}} BigIntError e=>{{fail move e}} ParserStackOverflow e=>{{fail move e}}
 }}''' if parser else '''match move error {
  CompilerError e=>{run compilerDiagnostic(&mut out,move e)}
@@ -617,12 +617,12 @@ effect fn body{number}(out:&mut ByteBuffer,memory:&AllocationObserver)->() ! {ER
   if !Pointer.isNull<HeapHeader>(moduleCell){{run begin(&mut out,b"moduleBefore") run module(&mut out,rt,ctx,present(moduleCell)) run end(&mut out)}}
   let assembled=run Effect.result(unsafe createFunction(&mut hooks,root,source))
   match move assembled {{
-   Result<Value,OutOfMemoryError | StringLengthError | CompilerError | BytecodeError>.Success {{value:compiled}}=>{{
+   Result<ValueBits,OutOfMemoryError | StringLengthError | CompilerError | BytecodeError>.Success {{value:compiled}}=>{{
     run field(&mut out,b"assemblySuccess",1) run begin(&mut out,b"bytecode")
-    match compiled {{Value.FunctionBytecode {{reference:p}}=>{{run final(&mut out,rt,ctx,p)}} _=>trap()}}
+    match compiled {{ValueBits.FunctionBytecode {{reference:p}}=>{{run final(&mut out,rt,ctx,p)}} _=>trap()}}
     run end(&mut out) unsafe gc.release(&mut hooks,rt,compiled)
    }}
-   Result<Value,OutOfMemoryError | StringLengthError | CompilerError | BytecodeError>.Failure {{error}}=>{{
+   Result<ValueBits,OutOfMemoryError | StringLengthError | CompilerError | BytecodeError>.Failure {{error}}=>{{
     success=false run field(&mut out,b"assemblySuccess",0) run begin(&mut out,b"diagnostic")
     {native_failure(parser=False)} run end(&mut out)
    }}

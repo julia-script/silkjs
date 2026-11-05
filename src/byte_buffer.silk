@@ -2,6 +2,9 @@
 // QuickJS Copyright (c) 2017-2021 Fabrice Bellard and Charlie Gordon; LICENSE.quickjs.
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.pointer { Pointer }
+import silk.collections.slice { Slice }
 import silk.num.u8
 import silk.num.u16
 import silk.num.u32
@@ -9,67 +12,165 @@ import silk.num.u64
 import silk.num.usize
 
 /// Owned growable bytes. Growth failures preserve the previous buffer contents.
-pub struct ByteBuffer { bytes: List<u8> }
+/// The list is kept zero-filled to its capacity, so writes within the spare region
+/// need no allocator; `count` is the used length.
+pub struct ByteBuffer { bytes: List<u8>, count: usize }
 
 impl ByteBuffer {
-  pub fn make() -> ByteBuffer { return ByteBuffer { bytes: List<u8>.make() } }
-  pub fn length(self: &Self) -> usize { return self.bytes.length() }
-  pub fn capacity(self: &Self) -> usize { return self.bytes.capacity() }
-  pub fn asSlice(self: &Self) -> &[u8] { return self.bytes.asSlice() }
-  pub fn asMutSlice(self: &mut Self) -> &mut [u8] { return self.bytes.asMutSlice() }
-  pub fn get(self: &Self, index: usize) -> u8 { return self.bytes.get(index) }
-  pub fn set(self: &mut Self, index: usize, value: u8) -> () { self.bytes.set(index, value) }
-  pub fn truncate(self: &mut Self, length: usize) -> () { self.bytes.truncate(length) }
-  pub fn clear(self: &mut Self) -> () { self.bytes.clear() }
+  pub fn make() -> ByteBuffer { return ByteBuffer { bytes: List<u8>.make(), count: 0 } }
+  pub fn length(self: &Self) -> usize { return self.count }
+  pub fn capacity(self: &Self) -> usize { return self.bytes.length() }
+  pub fn asSlice(self: &Self) -> &[u8] { return Slice.view(self.bytes.asSlice(), 0, self.count) }
+  pub fn asMutSlice(self: &mut Self) -> &mut [u8] {
+    self.bytes.truncate(self.count)
+    return self.bytes.asMutSlice()
+  }
+  pub fn get(self: &Self, index: usize) -> u8 {
+    if index >= self.count { Intrinsic.trap("ByteBuffer.get: index out of range") }
+    return self.bytes.get(index)
+  }
+  pub fn set(self: &mut Self, index: usize, value: u8) -> () {
+    if index >= self.count { Intrinsic.trap("ByteBuffer.set: index out of range") }
+    self.bytes.set(index, value)
+  }
+  pub fn truncate(self: &mut Self, length: usize) -> () { if length < self.count { self.count = length } }
+  pub fn clear(self: &mut Self) -> () { self.count = 0 }
   pub fn intoList(self: Self) -> List<u8> {
-    return match move self { ByteBuffer { bytes } => move bytes }
+    return match move self {
+      ByteBuffer { bytes, count } => {
+        let mut list = move bytes
+        list.truncate(count)
+        return move list
+      }
+    }
   }
 
+  /// Releases the spare capacity of a finished buffer, so a long-lived copy keeps
+  /// only its used bytes. On failure the buffer is unchanged.
+  pub effect fn shrinkToFit(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.bytes.capacity() == self.count { return () }
+    self.bytes.truncate(self.count)
+    run self.bytes.shrinkToFit()
+  }
+  /// Makes `count + additional` bytes writable, growing geometrically.
+  // Inline room check; growth stays out of line.
+  @inlineAlways
+  effect fn ensure(self: &mut Self, additional: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    let writable = self.bytes.length()
+    if self.count <= writable && additional <= writable - self.count { return () }
+    run self.grow(additional)
+  }
+  @inlineNever
+  effect fn grow(self: &mut Self, additional: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    let needed = match move usize.checkedAdd(self.count, additional) {
+      Option<usize>.Some { value } => value
+      Option<usize>.None => run Allocator.outOfMemory()
+    }
+    let writable = self.bytes.length()
+    if needed <= writable { return () }
+    run self.bytes.reserve(needed - writable)
+    // Zero only a quarter past what is needed, not the whole doubled capacity:
+    // untouched capacity costs no page faults, and the writable end still
+    // moves geometrically.
+    let mut fill = needed + needed / 4 + 16
+    if fill > self.bytes.capacity() { fill = self.bytes.capacity() }
+    run self.bytes.appendRepeated(0, fill - writable)
+  }
   pub effect fn reserve(self: &mut Self, additional: usize) -> () ! OutOfMemoryError ? &mut Allocator {
-    run self.bytes.reserve(additional)
+    run self.ensure(additional)
   }
   /// Reserves additional bytes without applying a second geometric growth policy.
   pub effect fn reserveExact(self: &mut Self, additional: usize) -> () ! OutOfMemoryError ? &mut Allocator {
-    run self.bytes.reserveExact(additional)
+    let needed = match move usize.checkedAdd(self.count, additional) {
+      Option<usize>.Some { value } => value
+      Option<usize>.None => run Allocator.outOfMemory()
+    }
+    let writable = self.bytes.length()
+    if needed <= writable { return () }
+    run self.bytes.reserveExact(needed - writable)
+    let spare = self.bytes.capacity() - writable
+    run self.bytes.appendRepeated(0, spare)
+  }
+  /// Appends without allocating; returns false when no spare byte is writable.
+  pub fn appendWithin(self: &mut Self, value: u8) -> bool {
+    let index = self.count
+    if index >= self.bytes.length() { return false }
+    self.bytes.set(index, value)
+    self.count = index + 1
+    return true
+  }
+  // Appends all of value within the current capacity, or nothing and false.
+  @inlineAlways
+  pub fn appendSliceWithin(self: &mut Self, value: &[u8]) -> bool {
+    let base = self.count
+    let count = value.length
+    let dest = self.bytes.asMutSlice()
+    if base > dest.length || count > dest.length - base { return false }
+    copyBytes(&mut dest, base, value)
+    self.count = base + count
+    return true
+  }
+  @inlineAlways
+  pub fn appendWithinU16(self: &mut Self, value: u16) -> bool {
+    let index = self.count
+    if self.bytes.length() - index < 2 { return false }
+    self.bytes.set(index, u16.toU8(value & 255))
+    self.bytes.set(index + 1, u16.toU8(u16.shiftRight(value, 8)))
+    self.count = index + 2
+    return true
+  }
+  @inlineAlways
+  pub fn appendWithinU32(self: &mut Self, value: u32) -> bool {
+    let index = self.count
+    if self.bytes.length() - index < 4 { return false }
+    self.bytes.set(index, u32.toU8(value & 255))
+    self.bytes.set(index + 1, u32.toU8(u32.shiftRight(value, 8) & 255))
+    self.bytes.set(index + 2, u32.toU8(u32.shiftRight(value, 16) & 255))
+    self.bytes.set(index + 3, u32.toU8(u32.shiftRight(value, 24)))
+    self.count = index + 4
+    return true
   }
   pub effect fn append(self: &mut Self, value: u8) -> () ! OutOfMemoryError ? &mut Allocator {
-    run self.bytes.append(value)
+    if self.appendWithin(value) { return () }
+    run self.ensure(1)
+    let index = self.count
+    self.bytes.set(index, value)
+    self.count = index + 1
   }
   pub effect fn appendSlice(self: &mut Self, value: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
-    run self.bytes.reserve(value.length)
-    let mut i: usize = 0
-    while i < value.length {
-      run self.bytes.append(value[i])
-      i = i + 1
-    }
+    run self.ensure(value.length)
+    let base = self.count
+    let count = value.length
+    // One borrow of the filled storage instead of a checked List.set per byte.
+    let dest = self.bytes.asMutSlice()
+    if dest.length < base + count { Intrinsic.trap("ByteBuffer.appendSlice: storage too short") }
+    copyBytes(&mut dest, base, value)
+    self.count = base + count
   }
 
   /// Copies a range of the original contents to the end, surviving relocation.
   /// offset and length must describe a range entirely within the old contents.
   pub effect fn appendSelf(self: &mut Self, offset: usize, length: usize) -> () ! OutOfMemoryError ? &mut Allocator {
-    let size = self.bytes.length()
+    let size = self.count
     if offset > size || length > size - offset { Intrinsic.trap("QuickJS invariant violated") }
-    run self.bytes.reserve(length)
+    run self.ensure(length)
+    // The source range ends at or before the old length, so it never overlaps the destination.
     let mut i: usize = 0
     while i < length {
       let byte = self.bytes.get(offset + i)
-      run self.bytes.append(byte)
+      self.bytes.set(size + i, byte)
       i = i + 1
     }
+    self.count = size + length
   }
 
   /// Inserts zero-filled bytes, shifting the suffix exactly once.
   pub effect fn insertZeroes(self: &mut Self, offset: usize, length: usize) -> () ! OutOfMemoryError ? &mut Allocator {
-    let oldLength = self.bytes.length()
+    let oldLength = self.count
     if offset > oldLength { Intrinsic.trap("QuickJS invariant violated") }
     if length == 0 { return () }
-    run self.bytes.reserve(length)
-    let mut i: usize = 0
-    while i < length {
-      run self.bytes.append(0)
-      i = i + 1
-    }
-    i = oldLength
+    run self.ensure(length)
+    let mut i = oldLength
     while i > offset {
       i = i - 1
       let byte = self.bytes.get(i)
@@ -80,50 +181,84 @@ impl ByteBuffer {
       self.bytes.set(offset + i, 0)
       i = i + 1
     }
+    self.count = oldLength + length
   }
 
   /// Appends a fixed-width little-endian operand without partial writes on OOM.
   pub effect fn writeU16(self: &mut Self, value: u16) -> () ! OutOfMemoryError ? &mut Allocator {
-    run self.bytes.reserve(2)
-    run self.bytes.append(u16.toU8(value & 255))
-    run self.bytes.append(u16.toU8(u16.shiftRight(value, 8)))
+    run self.ensure(2)
+    drop self.appendWithinU16(value)
   }
   pub effect fn writeU32(self: &mut Self, value: u32) -> () ! OutOfMemoryError ? &mut Allocator {
-    run self.bytes.reserve(4)
-    let mut shift: u32 = 0
-    while shift < 32 {
-      run self.bytes.append(u32.toU8(u32.shiftRight(value, shift) & 255))
-      shift = shift + 8
-    }
+    run self.ensure(4)
+    drop self.appendWithinU32(value)
   }
   pub effect fn writeU64(self: &mut Self, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
-    run self.bytes.reserve(8)
-    let mut shift: u64 = 0
-    while shift < 64 {
-      run self.bytes.append(u64.toU8(u64.shiftRight(value, shift) & 255))
-      shift = shift + 8
-    }
+    run self.ensure(8)
+    let base = self.count
+    let mut i: usize = 0
+    while i < 8 { self.bytes.set(base + i, u64.toU8(u64.shiftRight(value, usize.toU64(i * 8)) & 255)) i = i + 1 }
+    self.count = base + 8
   }
   pub fn patchU16(self: &mut Self, offset: usize, value: u16) -> () {
-    self.bytes.set(offset, u16.toU8(value & 255))
-    self.bytes.set(offset + 1, u16.toU8(u16.shiftRight(value, 8)))
+    self.set(offset, u16.toU8(value & 255))
+    self.set(offset + 1, u16.toU8(u16.shiftRight(value, 8)))
   }
   pub fn patchU32(self: &mut Self, offset: usize, value: u32) -> () {
     let mut i: usize = 0
     while i < 4 {
-      self.bytes.set(offset + i, u32.toU8(u32.shiftRight(value, usize.toU32(i * 8)) & 255))
+      self.set(offset + i, u32.toU8(u32.shiftRight(value, usize.toU32(i * 8)) & 255))
       i = i + 1
     }
   }
 }
 
-/// Reads a little-endian operand. The complete operand must be within bytes.
-pub fn readU16(bytes: &[u8], offset: usize) -> u16 {
-  return u8.toU16(bytes[offset]) | u16.shiftLeft(u8.toU16(bytes[offset + 1]), 8)
+// Slice.copyInto (dev.23) adds offset + index with an overflow check inside its
+// loop, which keeps LLVM from vectorizing the copy. Offsetting the base once
+// leaves a plain loop that LLVM vectorizes.
+@inlineAlways
+fn copyBytes(destination: &mut [u8], offset: usize, source: &[u8]) -> () {
+  let count = source.length
+  if offset > destination.length || count > destination.length - offset { Intrinsic.trap("ByteBuffer: copy past the end") }
+  if count == 0 { return () }
+  // Both slices are nonempty, and offset + count is within destination.
+  unsafe {
+    let output = Intrinsic.pointerRequalify<?[*]mut u8, [*]mut u8>(Pointer.fromMutSlice<u8>(&mut destination))
+    let start = Pointer.assumeManyMut<u8>(Pointer.atMut<u8>(output, offset))
+    let input = Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(source))
+    let mut index: usize = 0
+    while index < count {
+      Pointer.write<u8>(Pointer.atMut<u8>(start, index), Pointer.read<u8>(Pointer.at<u8>(input, index)))
+      index = index + 1
+    }
+  }
 }
+
+/// Reads a little-endian operand. The complete operand must be within bytes.
+/// One range check covers the operand, so LLVM can combine the byte loads.
+@inlineAlways
+pub fn readU16(bytes: &[u8], offset: usize) -> u16 {
+  let base = operand(bytes, offset, 2)
+  unsafe {
+    return u8.toU16(Pointer.read<u8>(Pointer.at<u8>(base, 0))) | u16.shiftLeft(u8.toU16(Pointer.read<u8>(Pointer.at<u8>(base, 1))), 8)
+  }
+}
+@inlineAlways
 pub fn readU32(bytes: &[u8], offset: usize) -> u32 {
-  return u8.toU32(bytes[offset]) | u32.shiftLeft(u8.toU32(bytes[offset + 1]), 8)
-    | u32.shiftLeft(u8.toU32(bytes[offset + 2]), 16) | u32.shiftLeft(u8.toU32(bytes[offset + 3]), 24)
+  let base = operand(bytes, offset, 4)
+  unsafe {
+    return u8.toU32(Pointer.read<u8>(Pointer.at<u8>(base, 0))) | u32.shiftLeft(u8.toU32(Pointer.read<u8>(Pointer.at<u8>(base, 1))), 8)
+      | u32.shiftLeft(u8.toU32(Pointer.read<u8>(Pointer.at<u8>(base, 2))), 16) | u32.shiftLeft(u8.toU32(Pointer.read<u8>(Pointer.at<u8>(base, 3))), 24)
+  }
+}
+/// The start of the width-byte operand at offset, trapping unless it is in bytes.
+@inlineAlways
+fn operand(bytes: &[u8], offset: usize, width: usize) -> [*]const u8 {
+  if offset >= bytes.length || bytes.length - offset < width { Intrinsic.trap("ByteBuffer: operand past the end") }
+  unsafe {
+    let start = Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(bytes))
+    return Pointer.assumeMany<u8>(Pointer.at<u8>(start, offset))
+  }
 }
 pub fn readU64(bytes: &[u8], offset: usize) -> u64 {
   return u32.toU64(readU32(bytes, offset)) | u64.shiftLeft(u32.toU64(readU32(bytes, offset + 4)), 32)

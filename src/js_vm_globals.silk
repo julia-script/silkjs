@@ -1,4 +1,5 @@
 //! Global lexical cells, reference objects, and Object Environment Records.
+import js_realm { lendRealm }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
@@ -10,8 +11,9 @@ import runtime_memory { AllocationObserver }
 import js_vm_state { Machine }
 import js_vm_property_ops as shared
 import js_heap { HeapCell, HeapHeader }
-import js_value { Value }
-import js_core_types { FunctionBytecode, ClosureVar, VarRef, ObjectData, PropertySlot,
+import js_value { ValueBits }
+import js_owned_value { lendBits, immediateRef }
+import js_core_types { FunctionBytecode, ClosureVar, VarRef, VarRefState, ObjectData, PropertySlot, SlotBits,
   JS_PROP_WRITABLE, JS_PROP_VARREF, JS_PROP_THROW_STRICT }
 import js_gc { HeapHooks }
 import js_gc as gc
@@ -32,6 +34,11 @@ import js_bigint { BigIntError }
 import js_exceptions { JsException }
 import js_opcode_data as op
 import js_atom_data as atoms
+/// Failures caught without wrapping the success in a Result (see js_caught).
+struct FailedOom { error: OutOfMemoryError }
+effect fn failedOom(error: OutOfMemoryError) -> FailedOom { return FailedOom { error: move error } }
+struct FailedOomJs { error: OutOfMemoryError | JsException }
+effect fn failedOomJs(error: OutOfMemoryError | JsException) -> FailedOomJs { return FailedOomJs { error: move error } }
 
 fn trap() -> never { return Intrinsic.trap("QuickJS invariant violated") }
 unsafe fn reference(machine: &Machine, index: usize) -> *mut HeapHeader {
@@ -44,19 +51,19 @@ unsafe fn capture(machine: &Machine, index: usize) -> ClosureVar {
   return code.closureVars.get(index)
 }
 unsafe effect fn unscopable<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + CoercionHooks>(hooks: &mut H,
-  machine: &Machine, object: Value, atom: u32) -> bool ! OutOfMemoryError | JsException ? &mut Allocator {
-  let list = run unsafe getters.getProperty(&mut hooks, machine.context, object, atoms.JS_ATOM_Symbol_unscopables)
+  machine: &Machine, object: ValueBits, atom: u32) -> bool ! OutOfMemoryError | JsException ? &mut Allocator {
+  let list = run getters.getProperty(&mut hooks, unsafe lendRealm(&machine.context, machine.context), unsafe lendBits(&object, object), atoms.JS_ATOM_Symbol_unscopables)
   let mut excluded = false
   let mut failure = false
   if list.isObject() {
-    let fetched = run Effect.result(unsafe getters.getProperty(&mut hooks, machine.context, list, atom))
+    let fetched = run Intrinsic.catchFailure<OutOfMemoryError | JsException>(getters.getProperty(&mut hooks, unsafe lendRealm(&machine.context, machine.context), unsafe lendBits(&list, list), atom), failedOomJs)
     match move fetched {
-      Result<Value, OutOfMemoryError | JsException>.Success { value } => {
+      ValueBits value => {
         let truth = unsafe primitives.toBoolean(value)
         unsafe gc.release(&mut hooks, machine.runtime, value)
         if truth < 0 { failure = true } else { excluded = truth != 0 }
       }
-      Result<Value, OutOfMemoryError | JsException>.Failure { error } => {
+      FailedOomJs { error } => {
         let pending = run Effect.catch<JsException>(unsafe shared.materialize(&mut hooks, machine.context, move error), shared.exceptionValue)
         failure = true
       }
@@ -67,25 +74,68 @@ unsafe effect fn unscopable<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks +
   return excluded
 }
 unsafe effect fn installReference<H: HeapHooks>(hooks: &mut H, machine: &Machine,
-  object: Value, atom: u32, cell: *mut HeapHeader) -> () ! OutOfMemoryError ? &mut Allocator {
-  let node = match object { Value.Object { reference } => reference _ => trap() }
+  object: ValueBits, atom: u32, cell: *mut HeapHeader) -> () ! OutOfMemoryError ? &mut Allocator {
+  let node = match object { ValueBits.Object { reference } => reference _ => trap() }
   let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
   let added = run unsafe shapes.addProperty(machine.runtime, &mut data, atom, u32.toU8(JS_PROP_WRITABLE | JS_PROP_VARREF))
-  data.properties.set(added.index, PropertySlot.VarRef { reference: cell }) drop data
+  data.properties.set(added.index, SlotBits.from(PropertySlot.VarRef { reference: cell })) drop data
   unsafe gc.releaseOptional(&mut hooks, machine.runtime, added.retiredShape)
 }
+// get_var/put_var fast paths for an initialized, writable binding, inlined into
+// the dispatch match. false consumes nothing, leaving the opcode to step.
+@inlineAlways
+pub unsafe fn pushInitialized(machine: &mut Machine) -> bool {
+  let index = u16.toUsize(unsafe machine.peekU16())
+  let cell = unsafe reference(&machine.*, index)
+  let anchor = () let data = unsafe HeapCell.payload<VarRef, ()>(&anchor, cell)
+  let state = data.state drop data
+  let value = match state { VarRefState.Detached { value } => value _ => unsafe cells.read(cell) }
+  if match value { ValueBits.Uninitialized => true _ => false } { return false }
+  unsafe machine.skip(2)
+  unsafe machine.push(unsafe value.retained())
+  return true
+}
+@inlineAlways
+pub unsafe fn storeInitialized<H: HeapHooks>(hooks: &mut H, machine: &mut Machine) -> bool {
+  let index = u16.toUsize(unsafe machine.peekU16())
+  let cell = unsafe reference(&machine.*, index)
+  let mut cellAnchor = () let binding = unsafe HeapCell.payloadMut<VarRef, ()>(&mut cellAnchor, cell)
+  if binding.isConst { return false }
+  match binding.state {
+    VarRefState.Detached { value: previous } => {
+      if match previous { ValueBits.Uninitialized => true _ => false } { return false }
+      binding.state = VarRefState.Detached { value: unsafe machine.top(1) } drop binding
+      unsafe machine.skip(2)
+      unsafe gc.release(&mut hooks, machine.runtime, previous) unsafe machine.discard(1)
+      return true
+    }
+    _ => ()
+  }
+  drop binding
+  if match unsafe cells.read(cell) { ValueBits.Uninitialized => true _ => false } { return false }
+  let anchor = () let data = unsafe HeapCell.payload<VarRef, ()>(&anchor, cell)
+  let constant = data.isConst drop data
+  if constant { return false }
+  unsafe machine.skip(2)
+  let previous = unsafe cells.replace(cell, unsafe machine.top(1))
+  unsafe gc.release(&mut hooks, machine.runtime, previous) unsafe machine.discard(1)
+  return true
+}
+
+// The family fallback: rare on hot paths, so its call sites are laid out cold.
+@cold
 pub unsafe effect fn step<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + CoercionHooks + PropertyWriteHooks>(
   hooks: &mut H, memory: &AllocationObserver, machine: &mut Machine, opcode: u8) -> bool
   ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
   if opcode == op.OP_get_var_undef || opcode == op.OP_get_var {
     let index = u16.toUsize(unsafe machine.readU16())
     let value = unsafe cells.read(unsafe reference(&machine.*, index))
-    if match value { Value.Uninitialized => true _ => false } {
+    if match value { ValueBits.Uninitialized => true _ => false } {
       let variable = unsafe capture(&machine.*, index)
-      if variable.isLexical { return run unsafe OwnPropertyHooks.throwUninitialized(&mut hooks, machine.context, variable.name) }
+      if variable.isLexical { return run OwnPropertyHooks.throwUninitialized(&mut hooks, unsafe lendRealm(&machine.context, machine.context), variable.name) }
       unsafe machine.publishPc()
       let object = unsafe shared.global(&machine.*)
-      let result = run unsafe getters.getPropertyReceiver(&mut hooks, machine.context, object, variable.name, object, opcode == op.OP_get_var)
+      let result = run getters.getPropertyReceiver(&mut hooks, unsafe lendRealm(&machine.context, machine.context), unsafe lendBits(&object, object), variable.name, unsafe lendBits(&object, object), opcode == op.OP_get_var)
       unsafe machine.push(result)
     } else { unsafe machine.push(unsafe value.retained()) }
     return true
@@ -95,31 +145,31 @@ pub unsafe effect fn step<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + H
     let old = unsafe cells.read(cell)
     let anchor = () let data = unsafe HeapCell.payload<VarRef, ()>(&anchor, cell)
     let constant = data.isConst let lexical = data.isLexical drop data
-    if match old { Value.Uninitialized => true _ => false } || constant {
+    if match old { ValueBits.Uninitialized => true _ => false } || constant {
       let variable = unsafe capture(&machine.*, index)
       if lexical {
         if opcode != op.OP_put_var_init {
-          if match old { Value.Uninitialized => true _ => false } {
-            return run unsafe OwnPropertyHooks.throwUninitialized(&mut hooks, machine.context, variable.name)
+          if match old { ValueBits.Uninitialized => true _ => false } {
+            return run OwnPropertyHooks.throwUninitialized(&mut hooks, unsafe lendRealm(&machine.context, machine.context), variable.name)
           }
           return run unsafe shared.throwName(&mut hooks, &machine.*, variable.name, true)
         }
       } else {
         unsafe machine.publishPc()
         let object = unsafe shared.global(&machine.*)
-        let present = run unsafe queries.hasProperty(&mut hooks, machine.context, object, variable.name)
+        let present = run queries.hasProperty(&mut hooks, unsafe lendRealm(&machine.context, machine.context), unsafe lendBits(&object, object), variable.name)
         if !present && unsafe shared.strict(&machine.*) {
           return run unsafe shared.throwName(&mut hooks, &machine.*, variable.name, false)
         }
-        let result = run Effect.result(unsafe mutations.setPropertyInternal(&mut hooks, machine.context, object,
-          variable.name, unsafe machine.top(1), object, JS_PROP_THROW_STRICT))
+        let result = run Effect.result(unsafe mutations.setPropertyInternal(&mut hooks, unsafe lendRealm(&machine.context, machine.context), unsafe lendBits(&object, object),
+          variable.name, unsafe machine.top(1), unsafe lendBits(&object, object), JS_PROP_THROW_STRICT))
         let failure = run unsafe shared.failed(&mut hooks, machine.context, move result)
-        machine.sp = machine.sp - 1
+        unsafe machine.discard(1)
         if failure { fail JsException {} } return true
       }
     }
     let previous = unsafe cells.replace(cell, unsafe machine.top(1))
-    unsafe gc.release(&mut hooks, machine.runtime, previous) machine.sp = machine.sp - 1
+    unsafe gc.release(&mut hooks, machine.runtime, previous) unsafe machine.discard(1)
     return true
   }
   if opcode == op.OP_make_var_ref {
@@ -129,12 +179,12 @@ pub unsafe effect fn step<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + H
   }
   if opcode == op.OP_make_loc_ref || opcode == op.OP_make_arg_ref || opcode == op.OP_make_var_ref_ref {
     let atom = unsafe machine.readU32() let index = u16.toUsize(unsafe machine.readU16())
-    let allocated = run Effect.result(unsafe objects.withPrototype(&mut hooks, memory, machine.context, Value.Null))
+    let allocated = run Intrinsic.catchFailure<OutOfMemoryError>(objects.withPrototype(&mut hooks, memory, unsafe lendRealm(&machine.context, machine.context), immediateRef(ValueBits.Null)), failedOom)
     let object = match move allocated {
-      Result<Value, OutOfMemoryError>.Success { value } => value
-      Result<Value, OutOfMemoryError>.Failure { error } => {
+      ValueBits value => value
+      FailedOom { error } => {
         let pending = run Effect.catch<JsException>(unsafe shared.materialize(&mut hooks, machine.context, move error), shared.exceptionValue)
-        unsafe machine.push(Value.Exception) fail JsException {}
+        unsafe machine.push(ValueBits.Exception) fail JsException {}
       }
     }
     unsafe machine.push(object)
@@ -157,46 +207,46 @@ pub unsafe effect fn step<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + H
   }
   if opcode == op.OP_delete_var {
     let atom = unsafe machine.readU32() unsafe machine.publishPc()
-    let removed = run unsafe globals.deleteGlobalVar(&mut hooks, machine.context, atom)
-    unsafe machine.push(Value.Bool { value: removed }) return true
+    let realmAnchor = () let removed = run globals.deleteGlobalVar(&mut hooks, unsafe lendRealm(&realmAnchor, machine.context), atom)
+    unsafe machine.push(ValueBits.Bool { value: removed }) return true
   }
   if opcode >= op.OP_with_get_var && opcode <= op.OP_with_get_ref {
     let atom = unsafe machine.readU32() let displacement = unsafe machine.readI32()
     let isWith = unsafe machine.readU8() != 0 unsafe machine.publishPc()
     let object = unsafe machine.top(1)
-    let mut found = run unsafe queries.hasProperty(&mut hooks, machine.context, object, atom)
+    let mut found = run queries.hasProperty(&mut hooks, unsafe lendRealm(&machine.context, machine.context), unsafe lendBits(&object, object), atom)
     if found && isWith { found = !run unsafe unscopable(&mut hooks, &machine.*, object, atom) }
     if !found {
-      unsafe gc.release(&mut hooks, machine.runtime, object) machine.sp = machine.sp - 1 return true
+      unsafe gc.release(&mut hooks, machine.runtime, object) unsafe machine.discard(1) return true
     }
     if opcode == op.OP_with_get_var || opcode == op.OP_with_get_ref {
       // GetBindingValue deliberately performs a second HasProperty after @@unscopables.
-      let exists = run unsafe queries.hasProperty(&mut hooks, machine.context, object, atom)
-      let mut value = Value.Undefined
-      if exists { value = run unsafe getters.getProperty(&mut hooks, machine.context, object, atom) }
+      let exists = run queries.hasProperty(&mut hooks, unsafe lendRealm(&machine.context, machine.context), unsafe lendBits(&object, object), atom)
+      let mut value = ValueBits.Undefined
+      if exists { value = run getters.getProperty(&mut hooks, unsafe lendRealm(&machine.context, machine.context), unsafe lendBits(&object, object), atom) }
       else if opcode == op.OP_with_get_var && unsafe shared.strict(&machine.*) {
         return run unsafe shared.throwName(&mut hooks, &machine.*, atom, false)
       }
       if opcode == op.OP_with_get_ref { unsafe machine.push(value) }
       else { unsafe machine.set(1, value) unsafe gc.release(&mut hooks, machine.runtime, object) }
     } else if opcode == op.OP_with_put_var {
-      let present = run unsafe queries.hasProperty(&mut hooks, machine.context, object, atom)
+      let present = run queries.hasProperty(&mut hooks, unsafe lendRealm(&machine.context, machine.context), unsafe lendBits(&object, object), atom)
       if !present && unsafe shared.strict(&machine.*) {
         return run unsafe shared.throwName(&mut hooks, &machine.*, atom, false)
       }
-      let result = run Effect.result(unsafe mutations.setPropertyInternal(&mut hooks, machine.context, object,
-        atom, unsafe machine.top(2), object, JS_PROP_THROW_STRICT))
+      let result = run Effect.result(unsafe mutations.setPropertyInternal(&mut hooks, unsafe lendRealm(&machine.context, machine.context), unsafe lendBits(&object, object),
+        atom, unsafe machine.top(2), unsafe lendBits(&object, object), JS_PROP_THROW_STRICT))
       let failure = run unsafe shared.failed(&mut hooks, machine.context, move result)
-      unsafe gc.release(&mut hooks, machine.runtime, object) machine.sp = machine.sp - 2
+      unsafe gc.release(&mut hooks, machine.runtime, object) unsafe machine.discard(2)
       if failure { fail JsException {} }
     } else if opcode == op.OP_with_delete_var {
-      let removed = run unsafe deletion.deleteProperty(&mut hooks, memory, machine.context, object, atom, 0)
-      unsafe gc.release(&mut hooks, machine.runtime, object) unsafe machine.set(1, Value.Bool { value: removed })
+      let removed = run deletion.deleteProperty(&mut hooks, memory, unsafe lendRealm(&machine.context, machine.context), unsafe lendBits(&object, object), atom, 0)
+      unsafe gc.release(&mut hooks, machine.runtime, object) unsafe machine.set(1, ValueBits.Bool { value: removed })
     } else {
       let key = run unsafe shared.atomValueUnchecked(&mut hooks, &machine.*, atom) unsafe machine.push(key)
     }
     // diff's origin is its own first byte, five bytes before the advanced PC.
-    machine.jump(displacement, 5) return true
+    unsafe machine.jump(displacement, 5) return true
   }
   return false
 }

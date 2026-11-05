@@ -2,8 +2,9 @@
 //! value; the private dense Array independently roots the active ancestor stack.
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
-import silk.core.result { Result }
 import silk.mem.pointer { Pointer }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
 import silk.num.f64
 import silk.num.i32
 import silk.num.i64
@@ -11,24 +12,24 @@ import silk.num.u8
 import silk.num.u16
 import silk.num.usize
 import js_heap { HeapHeader }
-import js_value { Value }
-import js_core_types { FrameSlots, JS_PROP_C_W_E, NativeErrorKind }
+import js_value { ValueBits }
+import js_realm { Realm, lendRealm }
+import js_owned_value { Value, lendBits, immediateRef, ValueRef, lendFor }
+import js_core_types { FrameSlots, PropertyEnum, JS_PROP_C_W_E, NativeErrorKind }
 import js_gc { HeapHooks }
 import js_coercion_host { CoercionHooks }
 import js_property_host { OwnPropertyHooks, OwnKeysHooks }
 import js_property_write_host { PropertyWriteHooks }
 import js_call_host { CallHooks }
 import js_error_host { ErrorHooks }
-import js_json_intrinsics_support { Scope }
 import js_json_intrinsics_support as support
-import js_function_intrinsics_support { Roots }
 import js_function_intrinsics_support as shared
 import js_collection_support as calls
 import js_array_intrinsics_support as arrays
 import js_string_intrinsics_support as stringSupport
 import js_function_invoke as invoke
 import js_object_allocate as objects
-import js_property_names { OwnKeysError }
+import js_property_names { OwnKeysError, OwnedNames, OwnedAtom }
 import js_property_names as names
 import js_property_mutations as properties
 import js_integer_coercions as integers
@@ -38,304 +39,397 @@ import js_runtime as runtime
 import js_atom_data as atoms
 import js_class_data as classes
 import js_strings { Strings, StringBuilder }
-import js_string_types { StringLengthError }
+import js_string_types { StringLengthError, latin1Bytes, stringReference }
 import js_bigint { BigIntError }
 import js_exceptions { JsException }
 import runtime_memory { AllocationObserver }
+/// Failures caught without wrapping the success in a Result (see js_caught).
+struct FailedSerialize { error: OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | JsException }
+effect fn failedSerialize(error: OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | JsException) -> FailedSerialize { return FailedSerialize { error: move error } }
+struct FailedOomLengthBigIntJs { error: OutOfMemoryError | StringLengthError | BigIntError | JsException }
+effect fn failedOomLengthBigIntJs(error: OutOfMemoryError | StringLengthError | BigIntError | JsException) -> FailedOomLengthBigIntJs { return FailedOomLengthBigIntJs { error: move error } }
 
-struct State { roots: Roots, replacer: Value, buffer: StringBuilder, failed: bool }
+// empty: "" (the root indentation), gap: the indent step, wrapper: the root holder,
+// list: the replacer's property list (undefined when absent), stack: the active ancestors.
+struct State { empty: Value, gap: Value, wrapper: Value, list: Value, stack: Value, replacer: ValueBits, buffer: StringBuilder, failed: bool }
 impl State {
-  fn make() -> Self { return Self { roots: Roots.make(), replacer: Value.Undefined, buffer: StringBuilder.make(), failed: false } }
+  fn make() -> Self {
+    return Self { empty: Value.immediate(ValueBits.Undefined), gap: Value.immediate(ValueBits.Undefined), wrapper: Value.immediate(ValueBits.Undefined),
+      list: Value.immediate(ValueBits.Undefined), stack: Value.immediate(ValueBits.Undefined), replacer: ValueBits.Undefined, buffer: StringBuilder.make(), failed: false }
+  }
 }
+// One property visit: the key string (undefined for array elements until needed) and the value read.
+struct Entry { name: Value, element: Value }
 // Source ignores punctuation/separator write returns. Their failures poison the
 // buffer and install an exception, but later getters/replacers still run and may
 // replace it. Checked quoted/primitive writes and finalization observe the poison.
-unsafe effect fn bufferResult<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
-  state: &mut State, result: Result<(), OutOfMemoryError | StringLengthError>) -> () ? &mut Allocator {
-  match move result {
-    Result<(), OutOfMemoryError | StringLengthError>.Success { .. } => ()
-    Result<(), OutOfMemoryError | StringLengthError>.Failure { error } => {
-      state.failed = true
-      let retired = Intrinsic.replace(state.buffer, StringBuilder.make()) drop retired
-      let ignored = run Effect.catch<JsException>(unsafe shared.materializeValue(&mut hooks, context, move error), shared.exceptionValue)
-    }
-  }
+struct FailedBuffer { error: OutOfMemoryError | StringLengthError }
+effect fn failedBuffer(error: OutOfMemoryError | StringLengthError) -> FailedBuffer { return FailedBuffer { error: move error } }
+effect fn unitWritten(buffer: &mut StringBuilder, unit: u16) -> bool ! OutOfMemoryError | StringLengthError ? &mut Allocator { run buffer.appendUnit(unit) return true }
+effect fn textWritten(buffer: &mut StringBuilder, text: ValueBits) -> bool ! OutOfMemoryError | StringLengthError ? &mut Allocator { run buffer.append(text) return true }
+effect fn bufferFailed<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
+  state: &mut State, error: OutOfMemoryError | StringLengthError) -> () ? &mut Allocator {
+  state.failed = true
+  let retired = Intrinsic.replace(state.buffer, StringBuilder.make()) drop retired
+  let ignored = run Effect.catch<JsException>(shared.materializeValue(&mut hooks, realm, move error), shared.exceptionValue)
 }
-unsafe effect fn putUnit<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader, state: &mut State, unit: u16) -> () ? &mut Allocator {
+effect fn putUnit<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>, state: &mut State, unit: u16) -> () ? &mut Allocator {
   if state.failed { return () }
-  let result = run Effect.result(state.buffer.appendUnit(unit))
-  run unsafe bufferResult(&mut hooks, context, &mut state, move result)
+  let result = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError>(unitWritten(&mut state.buffer, unit), failedBuffer)
+  match move result { bool written => () FailedBuffer { error } => { run bufferFailed(&mut hooks, realm, &mut state, move error) } }
 }
-unsafe effect fn appendUnchecked<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader, state: &mut State, text: Value) -> () ? &mut Allocator {
+effect fn appendUnchecked<'a, 'b, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>, state: &mut State, text: ValueRef<'b>) -> () ? &mut Allocator {
   if state.failed { return () }
-  let result = run Effect.result(state.buffer.append(text))
-  run unsafe bufferResult(&mut hooks, context, &mut state, move result)
+  let result = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError>(textWritten(&mut state.buffer, text.view()), failedBuffer)
+  match move result { bool written => () FailedBuffer { error } => { run bufferFailed(&mut hooks, realm, &mut state, move error) } }
 }
 // Operates on UTF-16 code units: paired surrogates pass through; lone units use
 // lowercase escapes, including a high surrogate immediately before end-of-input.
-effect fn quote(buffer: &mut StringBuilder, text: Value) -> () ! OutOfMemoryError | StringLengthError ? &mut Allocator {
-  run buffer.appendUnit(34)
+// Escapes one unit that is not a surrogate pair half and needs escaping.
+effect fn escapeUnit(buffer: &mut StringBuilder, unit: u16) -> () ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let mut escape: u16 = 0
+  if unit == 9 { escape = 116 } else if unit == 13 { escape = 114 }
+  else if unit == 10 { escape = 110 } else if unit == 8 { escape = 98 }
+  else if unit == 12 { escape = 102 } else if unit == 34 || unit == 92 { escape = unit }
+  if escape != 0 { run buffer.appendUnit(92) run buffer.appendUnit(escape) return () }
+  let hex = b"0123456789abcdef"
+  run buffer.appendLatin1(b"\\u")
+  run buffer.appendUnit(u8.toU16(hex[u16.toUsize(u16.shiftRight(unit, 12) & 15)]))
+  run buffer.appendUnit(u8.toU16(hex[u16.toUsize(u16.shiftRight(unit, 8) & 15)]))
+  run buffer.appendUnit(u8.toU16(hex[u16.toUsize(u16.shiftRight(unit, 4) & 15)]))
+  run buffer.appendUnit(u8.toU16(hex[u16.toUsize(unit & 15)]))
+}
+// open and close wrap the quoted text; each includes its quote mark, so a
+// key and its separators go out in one write when nothing needs escaping.
+effect fn quote(buffer: &mut StringBuilder, text: ValueBits, open: &[u8], close: &[u8]) -> () ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let length = Strings.length(text)
+  if text.tag() == -7 && !Strings.isWide(text) {
+    // Flat Latin-1 text has no surrogates: scan its bytes directly.
+    let bytes = unsafe latin1Bytes(&text, stringReference(text))
+    let mut clean: usize = 0
+    while clean < length {
+      let c = bytes[clean]
+      if c < 32 || c == 34 || c == 92 { break }
+      clean = clean + 1
+    }
+    if clean == length { return run buffer.appendFramedLatin1(open, Slice.view(bytes, 0, length), close) }
+    run buffer.appendLatin1(open)
+    let mut start: usize = 0
+    let mut at: usize = clean
+    while at < length {
+      let c = bytes[at]
+      if c >= 32 && c != 34 && c != 92 { at = at + 1 continue }
+      if start < at { run buffer.appendRange(text, start, at) }
+      run escapeUnit(&mut buffer, u8.toU16(c))
+      at = at + 1
+      start = at
+    }
+    if start < length { run buffer.appendRange(text, start, length) }
+    run buffer.appendLatin1(close)
+    return ()
+  }
+  run buffer.appendLatin1(open)
+  // Units that need no escaping are copied a run at a time.
+  let mut runStart: usize = 0
   let mut i: usize = 0
-  while i < Strings.length(text) {
-    let unit = Strings.codeUnit(text, i) i = i + 1
+  while i < length {
+    let unit = Strings.codeUnit(text, i)
+    if unit >= 32 && unit != 34 && unit != 92 && (unit < 0xd800 || unit > 0xdfff) { i = i + 1 continue }
+    if runStart < i { run buffer.appendRange(text, runStart, i) }
+    i = i + 1
     let mut escape: u16 = 0
     if unit == 9 { escape = 116 } else if unit == 13 { escape = 114 }
     else if unit == 10 { escape = 110 } else if unit == 8 { escape = 98 }
     else if unit == 12 { escape = 102 } else if unit == 34 || unit == 92 { escape = unit }
     if escape != 0 { run buffer.appendUnit(92) run buffer.appendUnit(escape) }
-    else if unit >= 0xd800 && unit <= 0xdbff && i < Strings.length(text) && Strings.codeUnit(text, i) >= 0xdc00 && Strings.codeUnit(text, i) <= 0xdfff {
+    else if unit >= 0xd800 && unit <= 0xdbff && i < length && Strings.codeUnit(text, i) >= 0xdc00 && Strings.codeUnit(text, i) <= 0xdfff {
       run buffer.appendUnit(unit) run buffer.appendUnit(Strings.codeUnit(text, i)) i = i + 1
-    } else if unit < 32 || (unit >= 0xd800 && unit <= 0xdfff) {
+    } else {
       let hex = b"0123456789abcdef"
       run buffer.appendLatin1(b"\\u")
       run buffer.appendUnit(u8.toU16(hex[u16.toUsize(u16.shiftRight(unit, 12) & 15)]))
       run buffer.appendUnit(u8.toU16(hex[u16.toUsize(u16.shiftRight(unit, 8) & 15)]))
       run buffer.appendUnit(u8.toU16(hex[u16.toUsize(u16.shiftRight(unit, 4) & 15)]))
       run buffer.appendUnit(u8.toU16(hex[u16.toUsize(unit & 15)]))
-    } else { run buffer.appendUnit(unit) }
-  }
-  run buffer.appendUnit(34)
-}
-// Consumes value even when toJSON/replacer throws. Replacer observes the original
-// holder and the post-toJSON value, before boxed-primitive unwrapping.
-unsafe effect fn checkBody<H: HeapHooks + CoercionHooks + CallHooks>(hooks: &mut H, context: *mut HeapHeader,
-  replacer: Value, holder: Value, key: Value, roots: &mut Roots) -> Value ! JsException ? &mut Allocator {
-  if roots.values[0].isObject() || roots.values[0].isBigInt() {
-    roots.values[1] = run unsafe shared.get(&mut hooks, context, roots.values[0], atoms.JS_ATOM_toJSON)
-    if unsafe hooks.isCallable(context, roots.values[1]) {
-      let mut argument = key
-      let args = FrameSlots.Borrowed { data: Pointer.fromMutRef<Value>(&mut argument), length: 1 }
-      roots.values[2] = run unsafe calls.call(&mut hooks, context, roots.values[1], roots.values[0], &args)
-      unsafe roots.release(&mut hooks, context, 0) roots.values[0] = roots.take(2)
     }
-    unsafe roots.release(&mut hooks, context, 1)
+    runStart = i
   }
-  if !shared.undefined(replacer) {
-    let mut arguments = [key, roots.values[0]]
-    let args = FrameSlots.Borrowed { data: Pointer.fromMutRef<Value>(&mut arguments[0]), length: 2 }
-    roots.values[2] = run unsafe calls.call(&mut hooks, context, replacer, holder, &args)
-    unsafe roots.release(&mut hooks, context, 0) roots.values[0] = roots.take(2)
+  if runStart < length { run buffer.appendRange(text, runStart, length) }
+  run buffer.appendLatin1(close)
+}
+// Array element keys are only observable through toJSON or a replacer, so the
+// index string is made on first use. index is negative for object entries.
+effect fn indexKey<'a, H: HeapHooks + CoercionHooks + CallHooks>(hooks: &mut H, realm: Realm<'a>, name: &mut Value, index: i64) -> () ! JsException ? &mut Allocator {
+  if index < 0 || !shared.undefined(name.view()) { return () }
+  name.* = run shared.string(&mut hooks, realm, immediateRef(ValueBits.number(i64.toF64(index))))
+}
+// Replaces value in place; on a throw the caller's owner still releases it. Replacer
+// observes the original holder and the post-toJSON value, before boxed-primitive unwrapping.
+effect fn check<'a, 'b, H: HeapHooks + CoercionHooks + CallHooks>(hooks: &mut H, realm: Realm<'a>,
+  replacer: ValueRef<'b>, holder: ValueRef<'b>, value: &mut Value, name: &mut Value, index: i64) -> () ! JsException ? &mut Allocator {
+  if value.view().isObject() || value.view().isBigInt() {
+    let method = run shared.get(&mut hooks, realm, value.borrow(), atoms.JS_ATOM_toJSON)
+    if hooks.isCallable(realm, method.borrow()) {
+      run indexKey(&mut hooks, realm, &mut name, index)
+      let mut argument = name.view()
+      let args = FrameSlots { data: Pointer.fromMutRef<ValueBits>(&mut argument), count: 1 }
+      value.* = run unsafe calls.call(&mut hooks, realm, method.borrow(), value.borrow(), &args)
+    }
   }
-  let value = roots.values[0]
-  if value.isObject() { if unsafe hooks.isCallable(context, value) { return Value.Undefined } return roots.take(0) }
-  if value.isString() || value.isNumber() || value.isBigInt() || value.tag() == 1 || value.tag() == 2 { return roots.take(0) }
-  return Value.Undefined
+  if !shared.undefined(replacer.view()) {
+    run indexKey(&mut hooks, realm, &mut name, index)
+    let mut arguments = [name.view(), value.view()]
+    let args = FrameSlots { data: Pointer.fromMutRef<ValueBits>(&mut arguments[0]), count: 2 }
+    value.* = run unsafe calls.call(&mut hooks, realm, replacer, holder, &args)
+  }
+  let current = value.view()
+  if current.isObject() { if hooks.isCallable(realm, value.borrow()) { value.* = Value.immediate(ValueBits.Undefined) } return () }
+  if current.isString() || current.isNumber() || current.isBigInt() || current.tag() == 1 || current.tag() == 2 { return () }
+  value.* = Value.immediate(ValueBits.Undefined)
 }
-unsafe effect fn check<H: HeapHooks + CoercionHooks + CallHooks>(hooks: &mut H, context: *mut HeapHeader,
-  replacer: Value, holder: Value, value: Value, key: Value) -> Value ! JsException ? &mut Allocator {
-  let mut roots = Roots.make() roots.values[0] = value
-  let result = run Effect.result(unsafe checkBody(&mut hooks, context, replacer, holder, key, &mut roots))
-  unsafe roots.clear(&mut hooks, context)
-  return match move result { Result<Value, JsException>.Success { value: output } => output Result<Value, JsException>.Failure { error } => { fail move error } }
+effect fn keyNames<'a, 'b, H: HeapHooks + OwnKeysHooks>(hooks: &mut H, realm: Realm<'a>, value: ValueRef<'b>, wanted: bool) -> OwnedNames
+  ! OutOfMemoryError | StringLengthError | OwnKeysError | JsException ? &mut Allocator {
+  let rt = realm.runtime()
+  if !wanted { return unsafe OwnedNames.adopt(rt, List<PropertyEnum>.make()) }
+  let listed = run names.getOwnPropertyNames(&mut hooks, realm, value, names.JS_GPN_ENUM_ONLY | names.JS_GPN_STRING_MASK)
+  return unsafe OwnedNames.adopt(rt, move listed)
 }
-unsafe effect fn serializeBody<H: HeapHooks + CoercionHooks + OwnPropertyHooks + OwnKeysHooks + PropertyWriteHooks + CallHooks + ErrorHooks>(hooks: &mut H,
-  memory: &AllocationObserver, context: *mut HeapHeader, state: &mut State, indentation: Value, scope: &mut Scope) -> ()
+effect fn readEntry<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H, realm: Realm<'a>, state: &State,
+  object: ValueRef<'b>, array: bool, keys: &OwnedNames, index: i64) -> Entry ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  if array {
+    // A fast array element in range is an own data property: Get is a plain read.
+    if index < arrays.fastCount(object) {
+      return Entry { name: Value.immediate(ValueBits.Undefined), element: arrays.fastGet(object, index) }
+    }
+    let element = run stringSupport.getIndex(&mut hooks, realm, object.borrow(), index)
+    return Entry { name: Value.immediate(ValueBits.Undefined), element: move element }
+  }
+  if shared.undefined(state.list.view()) {
+    // The key string round-trips to this same atom, so read by atom.
+    let atom = keys.get(i64.toUsize(index)).atom
+    let name = unsafe Value.adoptBits(run shared.atomString(realm, atom))
+    let element = run shared.get(&mut hooks, realm, object.borrow(), atom)
+    return Entry { name: move name, element: move element }
+  }
+  let name = run stringSupport.getIndex(&mut hooks, realm, state.list.borrow(), index)
+  // The source uses GetPropertyValue, including coercion of any inherited
+  // property-list hole; use the same owned-key conversion boundary.
+  let element = unsafe Value.adoptBits(run getKey(&mut hooks, realm, object, name.borrow()))
+  return Entry { name: move name, element: move element }
+}
+effect fn serializeBody<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + OwnKeysHooks + PropertyWriteHooks + CallHooks + ErrorHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, state: &mut State, mut value: Value, indentation: ValueRef<'b>) -> bool
   ! OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | JsException ? &mut Allocator {
-  run unsafe support.stack(&mut hooks, memory, context)
-  let class = unsafe support.classId(scope.roots.values[0])
+  run support.stack(&mut hooks, memory, realm)
+  let class = unsafe support.classId(value.view())
   if class == classes.JS_CLASS_STRING {
-    scope.roots.values[1] = run unsafe shared.string(&mut hooks, context, scope.roots.values[0])
-    unsafe scope.roots.release(&mut hooks, context, 0) scope.roots.values[0] = scope.roots.take(1)
+    value = run shared.string(&mut hooks, realm, value.borrow())
   } else if class == classes.JS_CLASS_NUMBER {
-    scope.roots.values[1] = run unsafe coercions.toNumber(&mut hooks, context, scope.roots.values[0])
-    unsafe scope.roots.release(&mut hooks, context, 0) scope.roots.values[0] = scope.roots.take(1)
+    value = unsafe Value.adoptBits(run unsafe coercions.toNumber(&mut hooks, realm, value.view()))
   } else if class == classes.JS_CLASS_BOOLEAN || class == classes.JS_CLASS_BIG_INT {
-    scope.roots.values[1] = unsafe support.boxed(scope.roots.values[0])
-    unsafe scope.roots.release(&mut hooks, context, 0) scope.roots.values[0] = scope.roots.take(1)
+    value = unsafe Value.adoptBits(unsafe support.boxed(value.view()))
   } else if class == classes.JS_CLASS_RAWJSON {
-    scope.roots.values[1] = run unsafe shared.get(&mut hooks, context, scope.roots.values[0], atoms.JS_ATOM_rawJSON)
+    let raw = run shared.get(&mut hooks, realm, value.borrow(), atoms.JS_ATOM_rawJSON)
     if state.failed { fail JsException {} }
-    run state.buffer.append(scope.roots.values[1]) return ()
+    run state.buffer.append(raw.view()) return true
   }
-  let value = scope.roots.values[0]
-  if !value.isObject() {
-    if value.isString() { if state.failed { fail JsException {} } run quote(&mut state.buffer, value) return () }
-    if value.isBigInt() { return run unsafe hooks.throwError(context, NativeErrorKind.Type, b"Do not know how to serialize a BigInt") }
-    let mut primitive = value
-    match value { Value.Float64 { value: number } => { if !f64.isFinite(number) { primitive = Value.Null } } _ => () }
-    scope.roots.values[1] = run unsafe shared.string(&mut hooks, context, primitive)
+  let current = value.view()
+  if !current.isObject() {
+    if current.isString() { if state.failed { fail JsException {} } run quote(&mut state.buffer, current, b"\"", b"\"") return true }
+    if current.isBigInt() { return run hooks.throwError(realm, NativeErrorKind.Type, b"Do not know how to serialize a BigInt") }
+    let mut primitive = current
+    match current {
+      ValueBits.Int { value: integer } => { if state.failed { fail JsException {} } run state.buffer.appendInteger(integer) return true }
+      ValueBits.Float64 { value: number } => { if !f64.isFinite(number) { primitive = ValueBits.Null } }
+      _ => ()
+    }
+    match primitive {
+      ValueBits.Bool { value: flag } => {
+        if state.failed { fail JsException {} }
+        if flag { run state.buffer.appendLatin1(b"true") } else { run state.buffer.appendLatin1(b"false") }
+        return true
+      }
+      ValueBits.Null => { if state.failed { fail JsException {} } run state.buffer.appendLatin1(b"null") return true }
+      _ => ()
+    }
+    let text = run shared.string(&mut hooks, realm, unsafe lendBits(&primitive, primitive))
     if state.failed { fail JsException {} }
-    run state.buffer.append(scope.roots.values[1]) return ()
+    run state.buffer.append(text.view()) return true
   }
-  let stack = state.roots.values[4]
-  let count = unsafe arrays.fastCount(stack)
+  let stack = state.stack.view()
+  let held = unsafe lendBits(&stack, stack)
+  let count = arrays.fastCount(held)
   let mut i: i64 = 0
   while i < count {
-    if unsafe core.sameValue(unsafe arrays.fastBorrow(stack, i), value) { return run unsafe hooks.throwError(context, NativeErrorKind.Type, b"circular reference") }
+    if unsafe core.sameValue(arrays.fastBorrow(held, i).view(), current) { return run hooks.throwError(realm, NativeErrorKind.Type, b"circular reference") }
     i = i + 1
   }
-  scope.roots.values[4] = run Strings.concat(indentation, state.roots.values[1])
-  if Strings.length(state.roots.values[1]) != 0 {
-    scope.roots.values[5] = run Strings.fromLatin1(b"\n")
-    scope.roots.values[7] = run Strings.concat(scope.roots.values[5], scope.roots.values[4])
-    unsafe scope.roots.release(&mut hooks, context, 5) scope.roots.values[5] = scope.roots.take(7)
-    scope.roots.values[6] = run Strings.fromLatin1(b" ")
-  } else {
-    scope.roots.values[5] = unsafe state.roots.values[0].retained()
-    scope.roots.values[6] = unsafe state.roots.values[0].retained()
+  let inner = unsafe Value.adoptBits(run Strings.concat(indentation.view(), state.gap.view()))
+  let mut lineBreak = state.empty.dup()
+  let mut separator = state.empty.dup()
+  // Without a gap both are empty and their appends are skipped.
+  let pretty = Strings.length(state.gap.view()) != 0
+  if pretty {
+    let newline = unsafe Value.adoptBits(run Strings.fromLatin1(b"\n"))
+    lineBreak = unsafe Value.adoptBits(run Strings.concat(newline.view(), inner.view()))
+    separator = unsafe Value.adoptBits(run Strings.fromLatin1(b" "))
   }
-  run unsafe arrays.reserve(&mut hooks, context, stack, count + 1)
-  run unsafe arrays.appendReserved(stack, unsafe value.retained())
-  unsafe arrays.publishLength(stack, count + 1)
-  let array = run unsafe arrays.isArray(&mut hooks, context, value)
+  run arrays.reserve(&mut hooks, realm, held, count + 1)
+  run arrays.appendReserved(held, unsafe Value.retain(current))
+  arrays.publishLength(held, count + 1)
+  let array = run arrays.isArray(&mut hooks, realm, value.borrow())
+  let listed = !array && shared.undefined(state.list.view())
   let mut length: i64 = 0
-  if array { run unsafe invoke.getLength64(&mut hooks, context, &mut length, value) }
-  else if !shared.undefined(state.roots.values[3]) { run unsafe invoke.getLength64(&mut hooks, context, &mut length, state.roots.values[3]) }
-  else {
-    scope.keys = run unsafe names.getOwnPropertyNames(&mut hooks, context, value, names.JS_GPN_ENUM_ONLY | names.JS_GPN_STRING_MASK)
-    length = usize.toI64(scope.keys.length())
-  }
-  if array { run unsafe putUnit(&mut hooks, context, &mut state, 91) } else { run unsafe putUnit(&mut hooks, context, &mut state, 123) }
+  if array { run invoke.getLength64(&mut hooks, realm, &mut length, value.borrow()) }
+  else if !listed { run invoke.getLength64(&mut hooks, realm, &mut length, state.list.borrow()) }
+  let keys = run keyNames(&mut hooks, realm, value.borrow(), listed)
+  if listed { length = usize.toI64(keys.length()) }
+  if array { run putUnit(&mut hooks, realm, &mut state, 91) } else { run putUnit(&mut hooks, realm, &mut state, 123) }
   let mut index: i64 = 0 let mut content = false
   while index < length {
     if array {
-      if index != 0 { run unsafe putUnit(&mut hooks, context, &mut state, 44) }
-      run unsafe appendUnchecked(&mut hooks, context, &mut state, scope.roots.values[5])
-      scope.roots.values[2] = run unsafe stringSupport.getIndex(&mut hooks, context, value, index)
-      scope.roots.values[1] = run unsafe shared.string(&mut hooks, context, Value.number(i64.toF64(index)))
-    } else {
-      if shared.undefined(state.roots.values[3]) {
-        scope.roots.values[1] = run unsafe shared.atomString(context, scope.keys.get(i64.toUsize(index)).atom)
-      } else { scope.roots.values[1] = run unsafe stringSupport.getIndex(&mut hooks, context, state.roots.values[3], index) }
-      // The source uses GetPropertyValue, including coercion of any inherited
-      // property-list hole; use the same owned-key conversion boundary.
-      scope.roots.values[2] = run unsafe getKey(&mut hooks, context, value, scope.roots.values[1], &mut scope)
+      if index != 0 { run putUnit(&mut hooks, realm, &mut state, 44) }
+      if pretty { run appendUnchecked(&mut hooks, realm, &mut state, lineBreak.borrow()) }
     }
-    scope.roots.values[2] = run unsafe check(&mut hooks, context, state.replacer, value, scope.roots.take(2), scope.roots.values[1])
-    if array && shared.undefined(scope.roots.values[2]) { scope.roots.values[2] = Value.Null }
-    if !shared.undefined(scope.roots.values[2]) {
+    let mut entry = run readEntry(&mut hooks, realm, &state, value.borrow(), array, &keys, index)
+    let element = entry.element.view()
+    if shared.undefined(state.replacer) && !element.isObject() && !element.isBigInt() {
+      // Without a replacer or a toJSON holder, check only filters by type and
+      // never reads the key, so array index keys are not materialized.
+      if !(element.isString() || element.isNumber() || element.tag() == 1 || element.tag() == 2) { entry.element = Value.immediate(ValueBits.Undefined) }
+    } else {
+      let mut keyIndex: i64 = -1
+      if array { keyIndex = index }
+      run check(&mut hooks, realm, unsafe lendBits(&state, state.replacer), value.borrow(), &mut entry.element, &mut entry.name, keyIndex)
+    }
+    if array && shared.undefined(entry.element.view()) { entry.element = Value.immediate(ValueBits.Null) }
+    if !shared.undefined(entry.element.view()) {
       if !array {
-        if content { run unsafe putUnit(&mut hooks, context, &mut state, 44) }
-        run unsafe appendUnchecked(&mut hooks, context, &mut state, scope.roots.values[5])
-        scope.roots.values[3] = run unsafe shared.string(&mut hooks, context, scope.roots.values[1])
+        // Without a gap the comma and colon are written with the quoted key.
+        let mut open: &[u8] = b"\""
+        if pretty {
+          if content { run putUnit(&mut hooks, realm, &mut state, 44) }
+          run appendUnchecked(&mut hooks, realm, &mut state, lineBreak.borrow())
+        } else if content { open = b",\"" }
         if state.failed { fail JsException {} }
-        run quote(&mut state.buffer, scope.roots.values[3])
-        unsafe scope.roots.release(&mut hooks, context, 3)
-        run unsafe putUnit(&mut hooks, context, &mut state, 58)
-        run unsafe appendUnchecked(&mut hooks, context, &mut state, scope.roots.values[6])
+        // Keys are strings already; ToString would only add and drop a count.
+        if entry.name.view().isString() { run quote(&mut state.buffer, entry.name.view(), open, b"\":") }
+        else {
+          let text = run shared.string(&mut hooks, realm, entry.name.borrow())
+          run quote(&mut state.buffer, text.view(), open, b"\":")
+        }
+        if pretty { run appendUnchecked(&mut hooks, realm, &mut state, separator.borrow()) }
       }
-      run unsafe serialize(&mut hooks, memory, context, &mut state, scope.roots.take(2), scope.roots.values[4])
+      run serialize(&mut hooks, memory, realm, &mut state, entry.element.take(), inner.borrow())
       content = true
     }
-    unsafe scope.roots.release(&mut hooks, context, 1)
     index = index + 1
   }
-  if content && Strings.length(state.roots.values[1]) != 0 {
-    run unsafe putUnit(&mut hooks, context, &mut state, 10)
-    run unsafe appendUnchecked(&mut hooks, context, &mut state, indentation)
+  if content && pretty {
+    run putUnit(&mut hooks, realm, &mut state, 10)
+    run appendUnchecked(&mut hooks, realm, &mut state, indentation)
   }
-  if array { run unsafe putUnit(&mut hooks, context, &mut state, 93) } else { run unsafe putUnit(&mut hooks, context, &mut state, 125) }
+  if array { run putUnit(&mut hooks, realm, &mut state, 93) } else { run putUnit(&mut hooks, realm, &mut state, 125) }
+  return true
 }
-unsafe effect fn getKey<H: HeapHooks + CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
-  object: Value, key: Value, scope: &mut Scope) -> Value ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
-  scope.atom = run unsafe coercions.valueToAtom(&mut hooks, context, key)
-  let result = run unsafe shared.get(&mut hooks, context, object, scope.atom)
-  unsafe properties.releaseAtom(unsafe runtime.contextRuntime(context), scope.atom) scope.atom = 0
-  return result
+effect fn getKey<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
+  object: ValueRef<'b>, key: ValueRef<'b>) -> ValueBits ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  let atom = unsafe OwnedAtom.adopt(realm.runtime(), run coercions.valueToAtom(&mut hooks, realm, key))
+  return (run shared.get(&mut hooks, realm, object, atom.get())).intoBits()
 }
 // Each recursive frame truncates to its entry stack depth on success and failure.
-unsafe effect fn serialize<H: HeapHooks + CoercionHooks + OwnPropertyHooks + OwnKeysHooks + PropertyWriteHooks + CallHooks + ErrorHooks>(hooks: &mut H,
-  memory: &AllocationObserver, context: *mut HeapHeader, state: &mut State, value: Value, indentation: Value) -> () ! JsException ? &mut Allocator {
-  let mut scope = Scope.make() scope.roots.values[0] = value
-  let stackLength = unsafe arrays.fastCount(state.roots.values[4])
-  let result = run Effect.result(unsafe serializeBody(&mut hooks, memory, context, &mut state, indentation, &mut scope))
+effect fn serialize<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + OwnKeysHooks + PropertyWriteHooks + CallHooks + ErrorHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, state: &mut State, value: Value, indentation: ValueRef<'b>) -> () ! JsException ? &mut Allocator {
+  let stackLength = arrays.fastCount(state.stack.borrow())
+  let result = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | JsException>(serializeBody(&mut hooks, memory, realm, &mut state, move value, indentation), failedSerialize)
   let marker = match move result {
-    Result<(), OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | JsException>.Success { .. } => Value.Undefined
-    Result<(), OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | JsException>.Failure { error } =>
-      run Effect.catch<JsException>(unsafe support.materialize<Value, H>(&mut hooks, memory, context, move error), shared.exceptionValue)
+    bool done => ValueBits.Undefined
+    FailedSerialize { error } =>
+      run Effect.catch<JsException>(support.materialize<ValueBits, H>(&mut hooks, memory, realm, move error), shared.exceptionValue)
   }
-  if unsafe arrays.fastCount(state.roots.values[4]) > stackLength {
-    let retired = unsafe arrays.popFast(state.roots.values[4], false)
-    unsafe arrays.publishLength(state.roots.values[4], stackLength)
-    unsafe calls.release(&mut hooks, context, retired)
+  if arrays.fastCount(state.stack.borrow()) > stackLength {
+    let retired = arrays.popFast(state.stack.borrow(), false).intoBits()
+    arrays.publishLength(state.stack.borrow(), stackLength)
+    unsafe calls.release(&mut hooks, realm, retired)
   }
-  unsafe scope.clear(&mut hooks, context)
   if marker.isException() { fail JsException {} }
 }
-unsafe effect fn initialize<H: HeapHooks + CoercionHooks + OwnPropertyHooks + OwnKeysHooks + PropertyWriteHooks + CallHooks + ErrorHooks>(hooks: &mut H,
-  memory: &AllocationObserver, context: *mut HeapHeader, input: Value, replacer: Value, space: Value, state: &mut State) -> Value
+unsafe effect fn initialize<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + OwnKeysHooks + PropertyWriteHooks + CallHooks + ErrorHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, input: ValueRef<'b>, replacer: ValueRef<'b>, space: ValueRef<'b>, state: &mut State) -> ValueBits
   ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
-  state.roots.values[0] = run unsafe shared.atomString(context, atoms.JS_ATOM_empty_string)
+  state.empty = unsafe Value.adoptBits(run shared.atomString(realm, atoms.JS_ATOM_empty_string))
   // Source creates this before inspecting replacer, even for undefined output.
-  state.roots.values[4] = run unsafe objects.array(&mut hooks, memory, context)
-  if unsafe hooks.isCallable(context, replacer) { state.replacer = replacer }
-  else if run unsafe arrays.isArray(&mut hooks, context, replacer) {
-    state.roots.values[3] = run unsafe objects.array(&mut hooks, memory, context)
-    let mut length: i64 = 0 run unsafe invoke.getLength64(&mut hooks, context, &mut length, replacer)
+  state.stack = run objects.newArray(&mut hooks, memory, realm)
+  if hooks.isCallable(realm, replacer) { state.replacer = replacer.view() }
+  else if run arrays.isArray(&mut hooks, realm, replacer) {
+    state.list = run objects.newArray(&mut hooks, memory, realm)
+    let mut length: i64 = 0 run invoke.getLength64(&mut hooks, realm, &mut length, replacer)
     let mut i: i64 = 0 let mut next: i64 = 0
     while i < length {
-      state.roots.values[5] = run unsafe stringSupport.getIndex(&mut hooks, context, replacer, i)
-      let value = state.roots.values[5] let class = unsafe support.classId(value)
-      if value.isString() || value.isNumber() || class == classes.JS_CLASS_STRING || class == classes.JS_CLASS_NUMBER {
-        if !value.isString() {
-          state.roots.values[6] = run unsafe shared.string(&mut hooks, context, value)
-          unsafe state.roots.release(&mut hooks, context, 5) state.roots.values[5] = state.roots.take(6)
-        }
-        let mut count: i64 = 0 run unsafe invoke.getLength64(&mut hooks, context, &mut count, state.roots.values[3])
+      let mut item = run stringSupport.getIndex(&mut hooks, realm, replacer, i)
+      let class = unsafe support.classId(item.view())
+      if item.view().isString() || item.view().isNumber() || class == classes.JS_CLASS_STRING || class == classes.JS_CLASS_NUMBER {
+        if !item.view().isString() { item = run shared.string(&mut hooks, realm, item.borrow()) }
+        let mut count: i64 = 0 run invoke.getLength64(&mut hooks, realm, &mut count, state.list.borrow())
         let mut j: i64 = 0 let mut present = false
         while j < count {
-          state.roots.values[6] = run unsafe stringSupport.getIndex(&mut hooks, context, state.roots.values[3], j)
-          present = unsafe core.sameValue(state.roots.values[6], state.roots.values[5])
-          unsafe state.roots.release(&mut hooks, context, 6)
+          let existing = run stringSupport.getIndex(&mut hooks, realm, state.list.borrow(), j)
+          present = core.same(existing.borrow(), item.borrow())
           if present { break } j = j + 1
         }
         if !present {
           // Pinned source intentionally ignores this SetProperty return value.
           // Preserve the pending exception while continuing list construction.
-          let set = run Effect.result(unsafe properties.setPropertyInt64(&mut hooks, context, state.roots.values[3], next, state.roots.take(5)))
+          let set = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError | BigIntError | JsException>(properties.setPropertyInt64(&mut hooks, realm, state.list.borrow(), next, unsafe Value.adoptBits(item.take().intoBits())), failedOomLengthBigIntJs)
           match move set {
-            Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { .. } => ()
-            Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => {
-              let ignored = run Effect.catch<JsException>(unsafe support.materialize<Value, H>(&mut hooks, memory, context, move error), shared.exceptionValue)
+            bool stored => ()
+            FailedOomLengthBigIntJs { error } => {
+              let ignored = run Effect.catch<JsException>(support.materialize<ValueBits, H>(&mut hooks, memory, realm, move error), shared.exceptionValue)
             }
           }
           next = next + 1
         }
       }
-      unsafe state.roots.release(&mut hooks, context, 5) i = i + 1
+      i = i + 1
     }
   }
-  state.roots.values[5] = unsafe space.retained()
-  let class = unsafe support.classId(space)
-  if class == classes.JS_CLASS_NUMBER {
-    state.roots.values[6] = run unsafe coercions.toNumber(&mut hooks, context, space)
-    unsafe state.roots.release(&mut hooks, context, 5) state.roots.values[5] = state.roots.take(6)
-  } else if class == classes.JS_CLASS_STRING {
-    state.roots.values[6] = run unsafe shared.string(&mut hooks, context, space)
-    unsafe state.roots.release(&mut hooks, context, 5) state.roots.values[5] = state.roots.take(6)
-  }
-  let spacing = state.roots.values[5]
-  if spacing.isNumber() {
-    let mut count: i32 = 0 run unsafe integers.toInt32Clamp(&mut hooks, context, &mut count, spacing, 0, 10, 0)
+  let mut spacing = space.dup()
+  let class = unsafe support.classId(space.view())
+  if class == classes.JS_CLASS_NUMBER { spacing = unsafe Value.adoptBits(run unsafe coercions.toNumber(&mut hooks, realm, space.view())) }
+  else if class == classes.JS_CLASS_STRING { spacing = run shared.string(&mut hooks, realm, space) }
+  let spaced = spacing.view()
+  if spaced.isNumber() {
+    let mut count: i32 = 0 run integers.toInt32Clamp(&mut hooks, realm, &mut count, unsafe lendFor(spaced), 0, 10, 0)
     let mut gap = StringBuilder.make() let mut i: i32 = 0
     while i < count { run gap.appendUnit(32) i = i + 1 }
-    state.roots.values[1] = run gap.finish()
-  } else if spacing.isString() {
-    let mut count = Strings.length(spacing) if count > 10 { count = 10 }
-    state.roots.values[1] = run Strings.substring(spacing, 0, count)
-  } else { state.roots.values[1] = unsafe state.roots.values[0].retained() }
-  unsafe state.roots.release(&mut hooks, context, 5)
-  state.roots.values[2] = run unsafe objects.object(&mut hooks, memory, context)
-  let defined = run unsafe properties.definePropertyValue(&mut hooks, context, state.roots.values[2], atoms.JS_ATOM_empty_string, unsafe input.retained(), JS_PROP_C_W_E)
-  state.roots.values[5] = run unsafe check(&mut hooks, context, state.replacer, state.roots.values[2], unsafe input.retained(), state.roots.values[0])
-  if shared.undefined(state.roots.values[5]) { return Value.Undefined }
-  let value = state.roots.take(5)
-  let indentation = state.roots.values[0]
-  run unsafe serialize(&mut hooks, memory, context, &mut state, value, indentation)
+    state.gap = unsafe Value.adoptBits(run gap.finish())
+  } else if spaced.isString() {
+    let mut count = Strings.length(spaced) if count > 10 { count = 10 }
+    state.gap = unsafe Value.adoptBits(run Strings.substring(spaced, 0, count))
+  } else { state.gap = state.empty.dup() }
+  drop spacing
+  state.wrapper = run objects.newObject(&mut hooks, memory, realm)
+  let defined = run properties.definePropertyValue(&mut hooks, realm, state.wrapper.borrow(), atoms.JS_ATOM_empty_string, input.dup(), JS_PROP_C_W_E)
+  let mut root = input.dup()
+  let mut rootName = state.empty.dup()
+  run check(&mut hooks, realm, unsafe lendBits(&state, state.replacer), state.wrapper.borrow(), &mut root, &mut rootName, -1)
+  if shared.undefined(root.view()) { return ValueBits.Undefined }
+  let indentation = state.empty.view()
+  run serialize(&mut hooks, memory, realm, &mut state, move root, unsafe lendBits(&indentation, indentation))
   if state.failed { fail JsException {} }
   let buffer = Intrinsic.replace(state.buffer, StringBuilder.make())
   return run buffer.finish()
 }
-pub unsafe effect fn stringify<H: HeapHooks + CoercionHooks + OwnPropertyHooks + OwnKeysHooks + PropertyWriteHooks + CallHooks + ErrorHooks>(hooks: &mut H,
-  memory: &AllocationObserver, context: *mut HeapHeader, input: Value, replacer: Value, space: Value) -> Value ! JsException ? &mut Allocator {
+pub effect fn stringify<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + OwnKeysHooks + PropertyWriteHooks + CallHooks + ErrorHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, input: ValueRef<'b>, replacer: ValueRef<'b>, space: ValueRef<'b>) -> ValueBits ! JsException ? &mut Allocator {
   let mut state = State.make()
-  let result = run Effect.result(unsafe initialize(&mut hooks, memory, context, input, replacer, space, &mut state))
+  let result = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError | BigIntError | JsException>(unsafe initialize(&mut hooks, memory, realm, input, replacer, space, &mut state), failedOomLengthBigIntJs)
   let output = match move result {
-    Result<Value, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { value } => value
-    Result<Value, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } =>
-      run Effect.catch<JsException>(unsafe support.materialize<Value, H>(&mut hooks, memory, context, move error), shared.exceptionValue)
+    ValueBits value => value
+    FailedOomLengthBigIntJs { error } =>
+      run Effect.catch<JsException>(support.materialize<ValueBits, H>(&mut hooks, memory, realm, move error), shared.exceptionValue)
   }
-  unsafe state.roots.clear(&mut hooks, context)
+  drop state
   if output.isException() { fail JsException {} }
   return output
 }

@@ -2,23 +2,32 @@
 //! 6052-6183,17865-17995. No bytecode VM, bound-function or proxy dispatch.
 //! Callers own the context, function, receiver and argv throughout a call, exactly
 //! like JS_CallInternal. Published frames borrow stable stack/caller storage.
+import thin_list { ThinList }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.collections.list { List }
 import silk.core.option { Option }
+import silk.core.ownership { Copy }
 import silk.mem.pointer { Pointer }
 import silk.collections.slice { Slice }
 import silk.mem.layout { Layout }
 import silk.num.i32
+import silk.num.i64
+import silk.num.u16
+import silk.num.f64
 import silk.num.u8
 import silk.num.u32
 import silk.num.usize
 import runtime_memory { AllocationObserver }
-import js_heap { HeapCell, HeapHeader }
-import js_value { Value }
-import js_core_types { RuntimeState, ContextState, ObjectData, ObjectPayload, NativeFunctionData,
-  NativeFunctionId, NativeCallProtocol, NativeErrorKind, StackFrame, FrameSlots, FrameReferences,
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_value { ValueBits }
+import js_owned_value { Value, ValueRef, lendBits, immediateRef, lendFor }
+import js_object_ref { ObjectRef }
+import js_intl_realm as ops
+import js_realm { Realm, lendRealm, Arguments, lendArguments }
+import js_core_types { NO_PC, NO_SP, PropertySlot, SlotBits, RuntimeState, ContextState, ObjectData, ObjectPayload, NativeFunctionData, NativeCapturedValues,
+  NativeFunctionId, NativeCallProtocol, BuiltinFamily, NativeErrorKind, StackFrame, FrameSlots, FrameReferences,
   JS_PROP_HAS_VALUE, JS_PROP_HAS_CONFIGURABLE, JS_PROP_HAS_WRITABLE, JS_PROP_HAS_ENUMERABLE,
   JS_CALL_FLAG_CONSTRUCTOR }
 import js_gc { HeapHooks }
@@ -26,6 +35,7 @@ import js_gc as gc
 import js_runtime as runtime
 import js_object_allocate as objects
 import js_property_mutations as properties
+import js_shapes as shapes
 import js_coercions as coercions
 import js_coercion_host { CoercionHooks }
 import js_property_host { OwnPropertyHooks }
@@ -36,65 +46,108 @@ import js_bigint { BigIntError }
 import js_exceptions { JsException }
 import js_atom_data as atoms
 import js_class_data as classes
+import js_collection_intrinsics as collections
+import js_number_intrinsics as numberIntrinsics
+import js_string_intrinsics_metadata as stringIds
+import js_math_intrinsics_callbacks as mathIds
+import js_math as math
+import js_array_intrinsics_support as arraySupport
+import js_strings { Strings }
+import js_unit_strings as unitStrings
+import dtoa { Dtoa }
 import native_stack { currentFrameAddress }
 import js_debugger_restricted as restricted
+/// Failures caught without wrapping the success in a Result (see js_caught).
+struct FailedOomLength { error: OutOfMemoryError | StringLengthError }
+effect fn failedOomLength(error: OutOfMemoryError | StringLengthError) -> FailedOomLength { return FailedOomLength { error: move error } }
+
+/// A failure caught without wrapping the success in a Result (see js_caught).
+struct HostFailed { error: OutOfMemoryError | JsException }
+effect fn hostFailed(error: OutOfMemoryError | JsException) -> HostFailed { return HostFailed { error: move error } }
+struct TextFailed { error: OutOfMemoryError | StringLengthError | JsException }
+effect fn textFailed(error: OutOfMemoryError | StringLengthError | JsException) -> TextFailed { return TextFailed { error: move error } }
 
 fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
-fn reference(value: Value) -> *mut HeapHeader {
-  return match value { Value.Object { reference } => reference _ => invariant() }
+fn reference(value: ValueBits) -> *mut HeapHeader {
+  return match value { ValueBits.Object { reference } => reference _ => invariant() }
 }
-unsafe effect fn materialize<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
-  error: OutOfMemoryError | StringLengthError | BigIntError | JsException) -> Value ! JsException ? &mut Allocator {
+effect fn materialize<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
+  error: OutOfMemoryError | StringLengthError | BigIntError | JsException) -> ValueBits ! JsException ? &mut Allocator {
   match move error {
-    OutOfMemoryError allocation => { return run unsafe hooks.throwOutOfMemory(context) }
-    StringLengthError length => { return run unsafe hooks.throwError(context, NativeErrorKind.Internal, b"string too long") }
+    OutOfMemoryError allocation => { return run hooks.throwOutOfMemory(realm) }
+    StringLengthError length => { return run hooks.throwError(realm, NativeErrorKind.Internal, b"string too long") }
     BigIntError impossible => invariant()
     JsException signal => { fail move signal }
   }
 }
-effect fn exceptionValue(error: JsException) -> Value { drop error return Value.Exception }
-unsafe effect fn define<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,
-  context: *mut HeapHeader, object: Value, atom: u32, value: Value, flags: u32) -> () ! JsException ? &mut Allocator {
-  let result = run Effect.result(unsafe properties.defineProperty(&mut hooks, context, object, atom,
-    value, Value.Undefined, Value.Undefined,
+effect fn exceptionValue(error: JsException) -> ValueBits { drop error return ValueBits.Exception }
+unsafe effect fn define<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, atom: u32, value: ValueBits, flags: u32) -> () ! JsException ? &mut Allocator {
+  let result = run Effect.result(properties.defineProperty(&mut hooks, realm, object, atom,
+    unsafe lendBits(&value, value), immediateRef(ValueBits.Undefined), immediateRef(ValueBits.Undefined),
     flags | JS_PROP_HAS_VALUE | JS_PROP_HAS_CONFIGURABLE | JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE))
   let mut failed = false
   match move result {
     Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { .. } => ()
     Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => {
       // Source materializes the pending error BEFORE consuming the supplied value.
-      let pending = run Effect.catch<JsException>(unsafe materialize(&mut hooks, context, move error), exceptionValue)
+      let pending = run Effect.catch<JsException>(materialize(&mut hooks, realm, move error), exceptionValue)
       failed = true
     }
   }
-  unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), value)
+  unsafe gc.release(&mut hooks, realm.runtime(), value)
   if failed { fail JsException {} }
 }
-unsafe effect fn atomString<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader, atom: u32) -> Value
+pub effect fn atomString<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>, atom: u32) -> ValueBits
   ! JsException ? &mut Allocator {
-  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, unsafe runtime.contextRuntime(context))
-  let converted = run Effect.result(state.atoms.toValue(atom, true)) drop state
+  let anchor = () let state = realm.runtimeState(&anchor)
+  let converted = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError>(state.atoms.toValue(atom, true), failedOomLength) drop state
   return match move converted {
-    Result<Value, OutOfMemoryError | StringLengthError>.Success { value } => value
-    Result<Value, OutOfMemoryError | StringLengthError>.Failure { error } => run unsafe materialize(&mut hooks, context, move error)
+    ValueBits value => value
+    FailedOomLength { error } => run materialize(&mut hooks, realm, move error)
   }
 }
-unsafe effect fn defineName<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,
-  context: *mut HeapHeader, function: Value, name: u32) -> Value ! JsException ? &mut Allocator {
-  let text = run unsafe atomString(&mut hooks, context, name)
-  run unsafe define(&mut hooks, context, function, atoms.JS_ATOM_name, text, 1)
-  return Value.Undefined
+effect fn defineName<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, function: ValueRef<'b>, name: u32) -> ValueBits ! JsException ? &mut Allocator {
+  let text = run atomString(&mut hooks, realm, name)
+  if run unsafe appendFresh(&mut hooks, realm, function, atoms.JS_ATOM_name, text) { return ValueBits.Undefined }
+  run unsafe define(&mut hooks, realm, function, atoms.JS_ATOM_name, text, 1)
+  return ValueBits.Undefined
 }
-unsafe effect fn defineLength<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,
-  context: *mut HeapHeader, function: Value, length: i32) -> Value ! JsException ? &mut Allocator {
-  run unsafe define(&mut hooks, context, function, atoms.JS_ATOM_length, Value.Int { value: length }, 1)
-  return Value.Undefined
+effect fn defineLength<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, function: ValueRef<'b>, length: i32) -> ValueBits ! JsException ? &mut Allocator {
+  let value = ValueBits.Int { value: length }
+  if run unsafe appendFresh(&mut hooks, realm, function, atoms.JS_ATOM_length, value) { return ValueBits.Undefined }
+  run unsafe define(&mut hooks, realm, function, atoms.JS_ATOM_length, value, 1)
+  return ValueBits.Undefined
 }
+// A new function has no own property yet with this name, so a configurable,
+// read-only data property is just a shape transition plus one slot. Returns
+// false, consuming nothing, when the generic definition is needed (an existing
+// property, a non-extensible or exotic object) or the transition can't allocate.
+unsafe effect fn appendFresh<'a, 'b, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>, function: ValueRef<'b>,
+  atom: u32, value: ValueBits) -> bool ? &mut Allocator {
+  let reference = match function.view() { ValueBits.Object { reference } => reference _ => { return false } }
+  let rt = realm.runtime()
+  let mut anchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, reference)
+  if !data.extensible() || data.isExotic() { return false }
+  match unsafe shapes.lookup(data.shape, atom) { Option<usize>.Some { .. } => { return false } Option<usize>.None => () }
+  let added = run Intrinsic.catchFailure<OutOfMemoryError>(unsafe shapes.addProperty(rt, &mut data, atom, 1), failedAppend)
+  match move added {
+    shapes.AddResult result => {
+      data.properties.set(result.index, SlotBits.value(value))
+      drop data
+      unsafe gc.releaseOptional(&mut hooks, rt, result.retiredShape)
+      return true
+    }
+    FailedAppend { error } => { drop error return false }
+  }
+}
+struct FailedAppend { error: OutOfMemoryError }
+effect fn failedAppend(error: OutOfMemoryError) -> FailedAppend { return FailedAppend { error: move error } }
 // Metadata failure must remain an exception, never a successful partial function.
-pub unsafe effect fn setFunctionProperties<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(
-  hooks: &mut H, context: *mut HeapHeader, function: Value, name: u32, length: i32) -> () ! JsException ? &mut Allocator {
-  let definedLength = run unsafe defineLength(&mut hooks, context, function, length)
-  let definedName = run unsafe defineName(&mut hooks, context, function, name)
+pub effect fn setFunctionProperties<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(
+  hooks: &mut H, realm: Realm<'a>, function: ValueRef<'b>, name: u32, length: i32) -> () ! JsException ? &mut Allocator {
+  let definedLength = run defineLength(&mut hooks, realm, function, length)
+  let definedName = run defineName(&mut hooks, realm, function, name)
 }
 pub fn constructorProtocol(protocol: NativeCallProtocol) -> bool {
   return protocol == NativeCallProtocol.Constructor || protocol == NativeCallProtocol.ConstructorMagic
@@ -106,121 +159,124 @@ pub fn ordinaryMagic(magic: i32) -> i32 {
   if low >= 32768 { return low - 65536 }
   return low
 }
-unsafe fn functionPrototype(context: *mut HeapHeader) -> Value {
-  let anchor = () let state = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+fn functionPrototype<'a>(realm: Realm<'a>) -> ValueBits { let context = realm.context()
+  let anchor = () let state = realm.state(&anchor)
   return state.functionPrototype
 }
-unsafe effect fn internName(context: *mut HeapHeader, name: &[u8]) -> u32
+effect fn internName<'a>(realm: Realm<'a>, name: &[u8]) -> u32
   ! OutOfMemoryError | StringLengthError ? &mut Allocator {
   let mut length: usize = 0
   while length < name.length && name[length] != 0 { length = length + 1 }
-  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, unsafe runtime.contextRuntime(context))
+  let mut anchor = () let state = realm.runtimeStateMut(&mut anchor)
   return run state.atoms.internUtf8(Slice.view(name, 0, length))
 }
-pub unsafe effect fn newFunctionWithPrototype<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(
-  hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, id: NativeFunctionId, name: &[u8],
-  length: i32, protocol: NativeCallProtocol, magic: i32, prototype: Value, fields: i32) -> Value ! JsException ? &mut Allocator {
-  let allocated = run Effect.result(unsafe allocateFunction(&mut hooks, memory, context, prototype, classes.JS_CLASS_C_FUNCTION, fields))
+pub effect fn newFunctionWithPrototype<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(
+  hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, id: NativeFunctionId, name: &[u8],
+  length: i32, protocol: NativeCallProtocol, magic: i32, prototype: ValueRef<'b>, fields: i32) -> ValueBits ! JsException ? &mut Allocator { let context = realm.context()
+  if protocol == NativeCallProtocol.Data { Intrinsic.trap("an ordinary native function cannot use the data protocol") }
+  let allocated = run Effect.result(allocateFunction(&mut hooks, memory, realm, prototype, classes.JS_CLASS_C_FUNCTION, fields))
   let object = match move allocated {
-    Result<Value, OutOfMemoryError>.Success { value } => value
-    Result<Value, OutOfMemoryError>.Failure { .. } => { return run unsafe hooks.throwOutOfMemory(context) }
+    Result<ValueBits, OutOfMemoryError>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError>.Failure { .. } => { return run hooks.throwOutOfMemory(realm) }
   }
-  let rt = unsafe runtime.contextRuntime(context)
+  let rt = realm.runtime()
   let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, reference(object))
   unsafe HeapCell.retain(context)
   data.payload = ObjectPayload.NativeFunction { function: NativeFunctionData {
-    realm: context, function: id, length: i32.toU8(length & 255), protocol: protocol,
-    magic: ordinaryMagic(magic), isDataFunction: false, capturedValues: List<Value>.make()
+    context: context, function: id, length: i32.toU8(length & 255), protocol: protocol,
+    magicBits: i32.toU16(magic & 65535)
   } }
-  data.isConstructor = constructorProtocol(protocol) drop data
-  let interned = run Effect.result(unsafe internName(context, name))
+  data.setIsConstructor(constructorProtocol(protocol)) drop data
+  let interned = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError>(internName(realm, name), failedOomLength)
   let atom = match move interned {
-    Result<u32, OutOfMemoryError | StringLengthError>.Success { value } => value
-    Result<u32, OutOfMemoryError | StringLengthError>.Failure { error } => {
-      let pending = run Effect.catch<JsException>(unsafe materialize(&mut hooks, context, move error), exceptionValue)
+    u32 value => value
+    FailedOomLength { error } => {
+      let pending = run Effect.catch<JsException>(materialize(&mut hooks, realm, move error), exceptionValue)
       unsafe gc.release(&mut hooks, rt, object)
       fail JsException {}
     }
   }
-  let configured = run Effect.result(unsafe setFunctionProperties(&mut hooks, context, object, atom, length))
+  let configured = run Effect.result(setFunctionProperties(&mut hooks, realm, unsafe lendBits(&object, object), atom, length))
   unsafe properties.releaseAtom(rt, atom)
   return match move configured {
     Result<(), JsException>.Success { .. } => object
     Result<(), JsException>.Failure { error } => { unsafe gc.release(&mut hooks, rt, object) fail move error }
   }
 }
-unsafe effect fn allocateFunction<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
-  context: *mut HeapHeader, prototype: Value, classId: u32, fields: i32) -> Value ! OutOfMemoryError ? &mut Allocator {
-  if fields > 0 { return run unsafe objects.withPrototypeClassCapacity(&mut hooks, memory, context, prototype, classId, fields) }
-  return run unsafe objects.withPrototypeClass(&mut hooks, memory, context, prototype, classId)
+effect fn allocateFunction<'a, 'b, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,realm: Realm<'a>, prototype: ValueRef<'b>, classId: u32, fields: i32) -> ValueBits ! OutOfMemoryError ? &mut Allocator {
+  if fields > 0 { return run objects.withPrototypeClassCapacity(&mut hooks, memory, realm, prototype, classId, fields) }
+  return run objects.withPrototypeClass(&mut hooks, memory, realm, prototype, classId)
 }
-pub unsafe effect fn newFunction<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,
-  memory: &AllocationObserver, context: *mut HeapHeader, id: NativeFunctionId, name: &[u8], length: i32,
-  protocol: NativeCallProtocol, magic: i32) -> Value ! JsException ? &mut Allocator {
-  return run unsafe newFunctionWithPrototype(&mut hooks, memory, context, id, name, length, protocol, magic, unsafe functionPrototype(context), 0)
+pub effect fn newFunction<'a, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, id: NativeFunctionId, name: &[u8], length: i32,
+  protocol: NativeCallProtocol, magic: i32) -> ValueBits ! JsException ? &mut Allocator {
+  return run newFunctionWithPrototype(&mut hooks, memory, realm, id, name, length, protocol, magic, unsafe lendFor(functionPrototype(realm)), 0)
 }
-pub unsafe effect fn newDataFunction<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,
-  memory: &AllocationObserver, context: *mut HeapHeader, id: NativeFunctionId, length: i32, magic: i32,
-  captured: &[Value]) -> Value ! JsException ? &mut Allocator {
+pub effect fn newDataFunction<'a, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, id: NativeFunctionId, length: i32, magic: i32,
+  captured: &[ValueBits]) -> ValueBits ! JsException ? &mut Allocator {
   // JS_NewCFunctionData's data_len field is uint8; its callers must supply <=255.
   if captured.length > 255 { invariant() }
-  let allocated = run Effect.result(unsafe allocateFunction(&mut hooks, memory, context, unsafe functionPrototype(context), classes.JS_CLASS_C_FUNCTION_DATA, 0))
+  let allocated = run Effect.result(allocateFunction(&mut hooks, memory, realm, unsafe lendFor(functionPrototype(realm)), classes.JS_CLASS_C_FUNCTION_DATA, 0))
   let object = match move allocated {
-    Result<Value, OutOfMemoryError>.Success { value } => value
-    Result<Value, OutOfMemoryError>.Failure { .. } => { return run unsafe hooks.throwOutOfMemory(context) }
+    Result<ValueBits, OutOfMemoryError>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError>.Failure { .. } => { return run hooks.throwOutOfMemory(realm) }
   }
   let capturedResult = run Effect.result(copyCaptured(captured))
   let values = match move capturedResult {
-    Result<List<Value>, OutOfMemoryError>.Success { value } => move value
-    Result<List<Value>, OutOfMemoryError>.Failure { .. } => {
-      let pending = run Effect.catch<JsException>(unsafe oom(&mut hooks, context), exceptionValue)
-      unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), object)
+    Result<?*mut HeapHeader, OutOfMemoryError>.Success { value } => value
+    Result<?*mut HeapHeader, OutOfMemoryError>.Failure { .. } => {
+      let pending = run Effect.catch<JsException>(oom(&mut hooks, realm), exceptionValue)
+      unsafe gc.release(&mut hooks, realm.runtime(), object)
       fail JsException {}
     }
   }
   let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, reference(object))
   data.payload = ObjectPayload.NativeFunction { function: NativeFunctionData {
-    realm: Pointer.null<HeapHeader>(), function: id, length: i32.toU8(length & 255), protocol: NativeCallProtocol.Generic,
-    magic: magic & 65535, isDataFunction: true, capturedValues: move values
+    context: values, function: id, length: i32.toU8(length & 255), protocol: NativeCallProtocol.Data,
+    magicBits: i32.toU16(magic & 65535)
   } } drop data
-  let configured = run Effect.result(unsafe setFunctionProperties(&mut hooks, context, object, atoms.JS_ATOM_empty_string, length))
+  let configured = run Effect.result(setFunctionProperties(&mut hooks, realm, unsafe lendBits(&object, object), atoms.JS_ATOM_empty_string, length))
   return match move configured {
     Result<(), JsException>.Success { .. } => object
-    Result<(), JsException>.Failure { error } => { unsafe gc.release(&mut hooks, unsafe runtime.contextRuntime(context), object) fail move error }
+    Result<(), JsException>.Failure { error } => { unsafe gc.release(&mut hooks, realm.runtime(), object) fail move error }
   }
 }
-unsafe effect fn oom<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader) -> Value ! JsException ? &mut Allocator {
-  return run unsafe hooks.throwOutOfMemory(context)
+effect fn oom<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>) -> ValueBits ! JsException ? &mut Allocator {
+  return run hooks.throwOutOfMemory(realm)
 }
-effect fn copyCaptured(captured: &[Value]) -> List<Value> ! OutOfMemoryError ? &mut Allocator {
-  let mut values = List<Value>.make()
+// The NativeCapturedValues cell holding a retained copy of captured, or null when
+// captured is empty. Nothing is retained unless the whole cell was allocated.
+effect fn copyCaptured(captured: &[ValueBits]) -> ?*mut HeapHeader ! OutOfMemoryError ? &mut Allocator {
+  if captured.length == 0 { return Pointer.null<HeapHeader>() }
+  let mut values = ThinList<ValueBits>.make()
   run values.reserveExact(captured.length)
   let mut i: usize = 0
   while i < captured.length { run values.append(captured[i]) i = i + 1 }
+  let cell = run HeapCell.allocate(HeapKind.Auxiliary, NativeCapturedValues { values: move values })
   i = 0
   while i < captured.length { let retained = unsafe captured[i].retained() i = i + 1 }
-  return move values
+  return unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cell)
 }
 
-unsafe effect fn iteratorProperties<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,
-  context: *mut HeapHeader, object: Value, value: Value, done: i32) -> () ! JsException ? &mut Allocator {
-  run unsafe define(&mut hooks, context, object, atoms.JS_ATOM_value, value, 7)
-  run unsafe define(&mut hooks, context, object, atoms.JS_ATOM_done, Value.Bool { value: done != 0 }, 7)
+unsafe effect fn iteratorProperties<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, value: ValueBits, done: i32) -> () ! JsException ? &mut Allocator {
+  run unsafe define(&mut hooks, realm, object, atoms.JS_ATOM_value, value, 7)
+  run unsafe define(&mut hooks, realm, object, atoms.JS_ATOM_done, ValueBits.Bool { value: done != 0 }, 7)
 }
 // Consumes value, including allocation/property failure, exactly like the source.
-pub unsafe effect fn createIteratorResult<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,
-  memory: &AllocationObserver, context: *mut HeapHeader, value: Value, done: i32) -> Value ! JsException ? &mut Allocator {
-  let rt = unsafe runtime.contextRuntime(context)
-  let allocated = run Effect.result(unsafe objects.object(&mut hooks, memory, context))
+pub unsafe effect fn createIteratorResult<'a, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, value: ValueBits, done: i32) -> ValueBits ! JsException ? &mut Allocator {
+  let rt = realm.runtime()
+  let allocated = run Effect.result(objects.object(&mut hooks, memory, realm))
   let object = match move allocated {
-    Result<Value, OutOfMemoryError>.Success { value: allocatedObject } => allocatedObject
-    Result<Value, OutOfMemoryError>.Failure { .. } => {
-      let pending = run Effect.catch<JsException>(unsafe oom(&mut hooks, context), exceptionValue)
+    Result<ValueBits, OutOfMemoryError>.Success { value: allocatedObject } => allocatedObject
+    Result<ValueBits, OutOfMemoryError>.Failure { .. } => {
+      let pending = run Effect.catch<JsException>(oom(&mut hooks, realm), exceptionValue)
       unsafe gc.release(&mut hooks, rt, value)
       fail JsException {}
     }
   }
-  let installed = run Effect.result(unsafe iteratorProperties(&mut hooks, context, object, value, done))
+  let installed = run Effect.result(unsafe iteratorProperties(&mut hooks, realm, unsafe lendBits(&object, object), value, done))
   match move installed {
     Result<(), JsException>.Success { .. } => { return object }
     Result<(), JsException>.Failure { error } => {
@@ -229,148 +285,623 @@ pub unsafe effect fn createIteratorResult<H: HeapHooks + OwnPropertyHooks + Coer
     }
   }
 }
-unsafe effect fn dispatch<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + NativeFunctionHooks>(
-  hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, function: Value, id: NativeFunctionId,
-  protocol: NativeCallProtocol, magic: i32, mut receiver: Value, argc: i32, argv: &FrameSlots, flags: i32) -> Value
+@inlineAlways
+unsafe effect fn dispatch<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + NativeFunctionHooks>(
+  hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, function: ValueRef<'b>, id: NativeFunctionId,
+  protocol: NativeCallProtocol, magic: i32, mut receiver: ValueBits, argc: i32, args: Arguments<'a>, flags: i32) -> ValueBits
   ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
   if (flags & u32.toI32(JS_CALL_FLAG_CONSTRUCTOR)) == 0 {
     if protocol == NativeCallProtocol.Constructor || protocol == NativeCallProtocol.ConstructorMagic {
-      return run unsafe hooks.throwError(context, NativeErrorKind.Type, b"must be called with new")
+      return run hooks.throwError(realm, NativeErrorKind.Type, b"must be called with new")
     }
     if protocol == NativeCallProtocol.ConstructorOrFunction || protocol == NativeCallProtocol.ConstructorOrFunctionMagic {
-      receiver = Value.Undefined
+      receiver = ValueBits.Undefined
+    }
+  }
+  if protocol == NativeCallProtocol.GenericMagic {
+    if let NativeFunctionId.Builtin { family, method } = id {
+      if family == BuiltinFamily.Map || family == BuiltinFamily.Set || family == BuiltinFamily.WeakMap || family == BuiltinFamily.WeakSet {
+        let quick = run collections.quickMethod(&mut hooks, realm, family, method, unsafe lendBits(&receiver, receiver), args)
+        if let Option<ValueBits>.Some { value } = move quick { return value }
+      }
     }
   }
   match protocol {
-    NativeCallProtocol.Generic => { return run unsafe hooks.nativeGeneric(id, context, receiver, argc, argv) }
-    NativeCallProtocol.Constructor => { return run unsafe hooks.nativeGeneric(id, context, receiver, argc, argv) }
-    NativeCallProtocol.ConstructorOrFunction => { return run unsafe hooks.nativeGeneric(id, context, receiver, argc, argv) }
-    NativeCallProtocol.GenericMagic => { return run unsafe hooks.nativeMagic(id, context, receiver, argc, argv, magic) }
-    NativeCallProtocol.ConstructorMagic => { return run unsafe hooks.nativeMagic(id, context, receiver, argc, argv, magic) }
-    NativeCallProtocol.ConstructorOrFunctionMagic => { return run unsafe hooks.nativeMagic(id, context, receiver, argc, argv, magic) }
+    // Data functions return through nativeData before any protocol dispatch.
+    NativeCallProtocol.Data => { return Intrinsic.trap("data function dispatched by protocol") }
+    NativeCallProtocol.Generic => { return run hooks.nativeGeneric(id, realm, unsafe lendBits(&receiver, receiver), argc, unsafe lendArguments(args.slots())) }
+    NativeCallProtocol.Constructor => { return run hooks.nativeGeneric(id, realm, unsafe lendBits(&receiver, receiver), argc, unsafe lendArguments(args.slots())) }
+    NativeCallProtocol.ConstructorOrFunction => { return run hooks.nativeGeneric(id, realm, unsafe lendBits(&receiver, receiver), argc, unsafe lendArguments(args.slots())) }
+    NativeCallProtocol.GenericMagic => { return run hooks.nativeMagic(id, realm, unsafe lendBits(&receiver, receiver), argc, unsafe lendArguments(args.slots()), magic) }
+    NativeCallProtocol.ConstructorMagic => { return run hooks.nativeMagic(id, realm, unsafe lendBits(&receiver, receiver), argc, unsafe lendArguments(args.slots()), magic) }
+    NativeCallProtocol.ConstructorOrFunctionMagic => { return run hooks.nativeMagic(id, realm, unsafe lendBits(&receiver, receiver), argc, unsafe lendArguments(args.slots()), magic) }
     NativeCallProtocol.ConstructorOrFunctionFlags => {
-      return run unsafe hooks.nativeFlags(id, context, function, receiver, argc, argv, flags)
+      return run hooks.nativeFlags(id, realm, unsafe lendBits(&function, function.view()), unsafe lendBits(&receiver, receiver), argc, unsafe lendArguments(args.slots()), flags)
     }
-    NativeCallProtocol.Getter => { return run unsafe hooks.nativeGetter(id, context, receiver) }
-    NativeCallProtocol.Setter => { return run unsafe hooks.nativeSetter(id, context, receiver, unsafe argv.get(0)) }
-    NativeCallProtocol.GetterMagic => { return run unsafe hooks.nativeGetterMagic(id, context, receiver, magic) }
-    NativeCallProtocol.SetterMagic => { return run unsafe hooks.nativeSetterMagic(id, context, receiver, unsafe argv.get(0), magic) }
+    NativeCallProtocol.Getter => { return run hooks.nativeGetter(id, realm, unsafe lendBits(&receiver, receiver)) }
+    NativeCallProtocol.Setter => { return run hooks.nativeSetter(id, realm, unsafe lendBits(&receiver, receiver), unsafe lendFor(unsafe args.slots().get(0))) }
+    NativeCallProtocol.GetterMagic => { return run hooks.nativeGetterMagic(id, realm, unsafe lendBits(&receiver, receiver), magic) }
+    NativeCallProtocol.SetterMagic => { return run hooks.nativeSetterMagic(id, realm, unsafe lendBits(&receiver, receiver), unsafe lendFor(unsafe args.slots().get(0)), magic) }
     NativeCallProtocol.FloatUnary => {
-      let number = run unsafe coercions.toNumber(&mut hooks, context, unsafe argv.get(0))
-      return Value.number(hooks.nativeFloatUnary(id, number.numericValue()))
+      let number = run unsafe coercions.toNumber(&mut hooks, realm, unsafe args.slots().get(0))
+      return ValueBits.number(hooks.nativeFloatUnary(id, number.numericValue()))
     }
     NativeCallProtocol.FloatBinary => {
-      let left = run unsafe coercions.toNumber(&mut hooks, context, unsafe argv.get(0))
-      let right = run unsafe coercions.toNumber(&mut hooks, context, unsafe argv.get(1))
-      return Value.number(hooks.nativeFloatBinary(id, left.numericValue(), right.numericValue()))
+      let left = run unsafe coercions.toNumber(&mut hooks, realm, unsafe args.slots().get(0))
+      let right = run unsafe coercions.toNumber(&mut hooks, realm, unsafe args.slots().get(1))
+      return ValueBits.number(hooks.nativeFloatBinary(id, left.numericValue(), right.numericValue()))
     }
     NativeCallProtocol.IteratorNext => {
-      let result = run unsafe hooks.nativeIteratorNext(id, context, receiver, argc, argv, magic)
+      let result = run hooks.nativeIteratorNext(id, realm, unsafe lendBits(&receiver, receiver), argc, unsafe lendArguments(args.slots()), magic)
       if result.done == 2 { return result.value }
-      return run unsafe createIteratorResult(&mut hooks, memory, context, result.value, result.done)
+      return run unsafe createIteratorResult(&mut hooks, memory, realm, result.value, result.done)
     }
   }
+}
+/// call's common case: an ordinary native function with the Generic or
+/// GenericMagic protocol, called (not constructed) with at least its declared
+/// length of arguments. It builds the same native frame without call's padding,
+/// data-function and protocol branches, whose register pressure cost about
+/// 150 Ir a call. None declines (call then handles it, stack overflow included).
+@inlineNever
+pub effect fn callPlain<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + NativeFunctionHooks>(
+  hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, function: ValueRef<'b>,
+  receiver: ValueRef<'b>, args: Arguments<'a>) -> Option<ValueBits> ! JsException ? &mut Allocator {
+  let arguments = args.slots()
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(function.view()))
+  let mut id = NativeFunctionId.Host { id: 0 } let mut protocol = NativeCallProtocol.Data let mut magic: i32 = 0
+  let mut length: usize = 0 let mut nativeRealm = Pointer.null<HeapHeader>()
+  match &object.payload {
+    ObjectPayload.NativeFunction { function: native } => {
+      id = native.function protocol = native.protocol magic = native.magic()
+      length = u8.toUsize(native.length) nativeRealm = native.realm()
+    }
+    _ => ()
+  }
+  drop object
+  let magical = protocol == NativeCallProtocol.GenericMagic
+  if !magical && protocol != NativeCallProtocol.Generic { return Option<ValueBits>.none() }
+  let argc = arguments.length()
+  if argc < length { return Option<ValueBits>.none() }
+  run unsafe restricted.deny(realm.context())
+  let rt = realm.runtime()
+  if unsafe runtime.checkStackOverflow(rt, currentFrameAddress(), length * Layout.of<ValueBits>().bytes, true) { return Option<ValueBits>.none() }
+  let empty = unsafe Intrinsic.pointerRequalify<[*]mut ValueBits, *mut ValueBits>(unsafe Intrinsic.stackAllocate<ValueBits>(0))
+  let mut data = empty
+  if argc != 0 { data = arguments.data }
+  let argv = FrameSlots { data: data, count: argc }
+  let calleeContext = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(nativeRealm)
+  let calleeContextRealm = unsafe lendRealm(&calleeContext, calleeContext)
+  let mut beforeAnchor = () let before = realm.runtimeStateMut(&mut beforeAnchor)
+  let previous = before.currentStackFrame drop before
+  let emptyRefs = unsafe Intrinsic.pointerRequalify<[*]mut ?*mut HeapHeader, *mut ?*mut HeapHeader>(unsafe Intrinsic.stackAllocate<?*mut HeapHeader>(0))
+  let framePointer = unsafe Intrinsic.pointerRequalify<[*]mut StackFrame, *mut StackFrame>(unsafe Intrinsic.stackAllocate<StackFrame>(1))
+  unsafe Pointer.put<StackFrame>(framePointer, StackFrame {
+    debuggerId: 0,
+    thisValue: receiver.view(), newTarget: ValueBits.Undefined,
+    previous: previous, asyncOwner: Pointer.null<HeapHeader>(), currentFunction: function.view(),
+    arguments: FrameSlots { data: data, count: argc },
+    locals: FrameSlots { data: empty, count: 0 }, stack: FrameSlots { data: empty, count: 0 },
+    varRefs: FrameReferences { data: emptyRefs, count: 0 }, currentPc: NO_PC,
+    argumentCount: usize.toI32(argc), mode: 0, stackPointer: NO_SP
+  })
+  let mut publishAnchor = () let published = realm.runtimeStateMut(&mut publishAnchor)
+  published.currentStackFrame = framePointer drop published
+  let result = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError | JsException>(unsafe dispatchPlain(&mut hooks, memory,
+    calleeContextRealm, id, magical, magic, receiver.view(), usize.toI32(argc), unsafe lendArguments(&argv)), textFailed)
+  let outward = match move result {
+    ValueBits value => Result<ValueBits, JsException>.Success { value: value }
+    TextFailed { error } =>
+      run Effect.result(materialize(&mut hooks, calleeContextRealm, move error))
+  }
+  let mut restoreAnchor = () let restored = realm.runtimeStateMut(&mut restoreAnchor)
+  restored.currentStackFrame = previous drop restored
+  return match move outward {
+    Result<ValueBits, JsException>.Success { value } => Option<ValueBits>.some(value)
+    Result<ValueBits, JsException>.Failure { error } => { fail move error }
+  }
+}
+/// dispatch for callPlain's two protocols.
+@inlineAlways
+unsafe effect fn dispatchPlain<'a, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + NativeFunctionHooks>(
+  hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, id: NativeFunctionId, magical: bool, magic: i32,
+  receiver: ValueBits, argc: i32, args: Arguments<'a>) -> ValueBits
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  if !magical { return run hooks.nativeGeneric(id, realm, unsafe lendBits(&receiver, receiver), argc, unsafe lendArguments(args.slots())) }
+  if let NativeFunctionId.Builtin { family, method } = id {
+    if family == BuiltinFamily.Map || family == BuiltinFamily.Set || family == BuiltinFamily.WeakMap || family == BuiltinFamily.WeakSet {
+      let quick = run collections.quickMethod(&mut hooks, realm, family, method, unsafe lendBits(&receiver, receiver), args)
+      if let Option<ValueBits>.Some { value } = move quick { return value }
+    }
+  }
+  return run hooks.nativeMagic(id, realm, unsafe lendBits(&receiver, receiver), argc, unsafe lendArguments(args.slots()), magic)
 }
 struct CallData {
   function: NativeFunctionId, protocol: NativeCallProtocol, magic: i32,
   length: u8, isDataFunction: bool, realm: ?*mut HeapHeader,
-  capturedCount: usize, capturedPointer: ?[*]const Value
+  capturedCount: usize, capturedPointer: ?[*]const ValueBits
 }
-unsafe fn callData(function: Value) -> CallData {
+unsafe fn callData(function: ValueBits) -> CallData {
   let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(function))
   match &object.payload {
     ObjectPayload.NativeFunction { function: native } => {
       return CallData {
-        function: native.function, protocol: native.protocol, magic: native.magic,
-        length: native.length, isDataFunction: native.isDataFunction, realm: native.realm,
-        capturedCount: native.capturedValues.length(),
-        capturedPointer: Pointer.fromSlice<Value>(native.capturedValues.asSlice())
+        function: native.function, protocol: native.protocol, magic: native.magic(),
+        length: native.length, isDataFunction: native.isDataFunction(), realm: native.realm(),
+        capturedCount: unsafe native.capturedCount(),
+        capturedPointer: unsafe native.capturedPointer()
       }
     }
     _ => invariant()
   }
 }
+// Frameless results for the hottest String builtins when they cannot throw,
+// allocate or call back into JS: charCodeAt and charAt on a flat string with an
+// integer index, and fromCharCode of one integer. Anything else returns
+// Uninitialized and takes the full native call.
+@inlineNever
+fn quickString<'a, 'b>(realm: Realm<'a>, method: u32, receiver: ValueRef<'b>, argv: FrameSlots) -> ValueBits {
+  if argv.length() == 0 { return ValueBits.Uninitialized }
+  let index = match unsafe argv.get(0) {
+    ValueBits.Int { value } => value
+    _ => { return ValueBits.Uninitialized }
+  }
+  if method == stringIds.FROM_CHAR_CODE {
+    if argv.length() != 1 { return ValueBits.Uninitialized }
+    return unitStrings.cached(realm, i32.toU32(i32.bitAnd(index, 65535)))
+  }
+  if method != stringIds.CHAR_CODE_AT && method != stringIds.CHAR_AT { return ValueBits.Uninitialized }
+  // Unflattened ropes take the full path, which memoizes the flat text.
+  let text = Strings.flatView(receiver.view())
+  if text.tag() != -7 { return ValueBits.Uninitialized }
+  if index < 0 || i32.toUsize(index) >= Strings.length(text) {
+    if method == stringIds.CHAR_CODE_AT { return ValueBits.Float64 { value: f64.fromBits(0x7ff8000000000000) } }
+    return ValueBits.Uninitialized
+  }
+  let unit = Strings.codeUnit(text, i32.toUsize(index))
+  if method == stringIds.CHAR_CODE_AT { return ValueBits.Int { value: u16.toI32(unit) } }
+  return unitStrings.cached(realm, u16.toU32(unit))
+}
+// Frameless results for Math builtins whose arguments are already numbers:
+// no coercion runs, so nothing can throw, allocate or call back into JS.
+// Any other argument (or argument count the full path special-cases) returns
+// Uninitialized and takes the full native call.
+@inlineNever
+fn quickMath(method: u32, argv: FrameSlots) -> ValueBits {
+  let argc = argv.length()
+  if argc == 0 { return ValueBits.Uninitialized }
+  if method <= mathIds.MAX {
+    let isMax = method == mathIds.MAX
+    let mut index: usize = 0
+    let mut integer: i32 = 0
+    match unsafe argv.get(0) {
+      ValueBits.Int { value } => {
+        integer = value index = 1
+        while index < argc {
+          match unsafe argv.get(index) {
+            ValueBits.Int { value: next } => {
+              if (isMax && next > integer) || (!isMax && next < integer) { integer = next }
+              index = index + 1
+            }
+            _ => { break }
+          }
+        }
+        if index == argc { return ValueBits.Int { value: integer } }
+      }
+      _ => ()
+    }
+    let mut result: f64 = 0.0
+    if index != 0 { result = i32.toF64(integer) }
+    else {
+      result = match unsafe argv.get(0) {
+        ValueBits.Float64 { value } => value
+        _ => { return ValueBits.Uninitialized }
+      }
+      index = 1
+    }
+    while index < argc {
+      let next = match unsafe argv.get(index) {
+        ValueBits.Int { value } => i32.toF64(value)
+        ValueBits.Float64 { value } => value
+        _ => { return ValueBits.Uninitialized }
+      }
+      if !f64.isNaN(result) {
+        if f64.isNaN(next) { result = next }
+        else if isMax { result = math.max(result, next) }
+        else { result = math.min(result, next) }
+      }
+      index = index + 1
+    }
+    return ValueBits.number(result)
+  }
+  let protocol = mathIds.protocol(method)
+  let value = match unsafe argv.get(0) {
+    ValueBits.Int { value: integer } => {
+      if method == mathIds.FLOOR || method == mathIds.CEIL || method == mathIds.TRUNC || method == mathIds.ROUND {
+        return ValueBits.Int { value: integer }
+      }
+      i32.toF64(integer)
+    }
+    ValueBits.Float64 { value } => value
+    _ => { return ValueBits.Uninitialized }
+  }
+  if protocol == NativeCallProtocol.FloatUnary { return ValueBits.number(mathIds.unary(method, value)) }
+  if protocol == NativeCallProtocol.FloatBinary && argc >= 2 {
+    let right = match unsafe argv.get(1) {
+      ValueBits.Int { value: integer } => i32.toF64(integer)
+      ValueBits.Float64 { value: number } => number
+      _ => { return ValueBits.Uninitialized }
+    }
+    return ValueBits.number(mathIds.binary(method, value, right))
+  }
+  return ValueBits.Uninitialized
+}
+/// What quick and quickWrite read of a native function: read once per call.
+pub struct QuickTarget { pub id: NativeFunctionId, pub protocol: NativeCallProtocol, pub realm: ?*mut HeapHeader }
+impl Copy for QuickTarget {}
+/// function's QuickTarget when quick or quickWrite may answer a call to it: only
+/// builtins of these families have frameless paths, so every other native call
+/// skips both scans after a single switch.
+@inlineAlways
+pub unsafe fn quickTarget(function: ValueBits) -> Option<QuickTarget> {
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(function))
+  let mut target = QuickTarget { id: NativeFunctionId.Host { id: 0 }, protocol: NativeCallProtocol.Data, realm: Pointer.null<HeapHeader>() }
+  match &object.payload {
+    ObjectPayload.NativeFunction { function: native } => { target = QuickTarget { id: native.function, protocol: native.protocol, realm: native.realm() } }
+    _ => ()
+  }
+  drop object
+  if let NativeFunctionId.Builtin { family, method } = target.id {
+    if quickFamily(family) { return Option<QuickTarget>.some(target) }
+  }
+  return Option<QuickTarget>.none()
+}
+@inlineAlways
+fn quickFamily(family: BuiltinFamily) -> bool {
+  return match family {
+    BuiltinFamily.Array => true BuiltinFamily.Number => true BuiltinFamily.BigInt => true
+    BuiltinFamily.String => true BuiltinFamily.Date => true BuiltinFamily.Math => true
+    BuiltinFamily.Map => true BuiltinFamily.Set => true BuiltinFamily.WeakMap => true BuiltinFamily.WeakSet => true
+    _ => false
+  }
+}
+/// The frameless answer of a hot builtin that cannot throw, for callers that
+/// have not built the native frame yet; Uninitialized declines.
+@inlineAlways
+pub fn quick<'a, 'b, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>, target: &QuickTarget, receiver: ValueRef<'b>,
+  argv: FrameSlots) -> ValueBits {
+  let id = target.id let isData = target.protocol == NativeCallProtocol.Data
+  if let NativeFunctionId.Builtin { family, method } = id {
+    if family == BuiltinFamily.String && !isData { return quickString(realm, method, receiver, argv) }
+    if method >= collections.GET && method <= collections.DELETE && (family == BuiltinFamily.Map
+      || family == BuiltinFamily.Set || family == BuiltinFamily.WeakMap || family == BuiltinFamily.WeakSet) {
+      return collections.quickRead(&mut hooks, realm, family, method, receiver, argv)
+    }
+    if family == BuiltinFamily.Math && !isData { return quickMath(method, argv) }
+  }
+  return ValueBits.Uninitialized
+}
+// RegExp.prototype.exec's method id in js_regexp_intrinsics.
+const REGEXP_EXEC: u32 = 7
+/// The realm of function when it is the intrinsic RegExp.prototype.exec, else
+/// null: the VM answers that call with js_regexp_intrinsics_exec.quickExec.
+@inlineAlways
+pub unsafe fn regexpExecRealm(function: ValueBits) -> ?*mut HeapHeader {
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(function))
+  match &object.payload {
+    ObjectPayload.NativeFunction { function: native } => {
+      if let NativeFunctionId.Builtin { family, method } = native.function {
+        if family == BuiltinFamily.RegExp && method == REGEXP_EXEC && native.protocol != NativeCallProtocol.Data { return native.realm() }
+      }
+    }
+    _ => ()
+  }
+  return Pointer.null<HeapHeader>()
+}
+const ARRAY_PUSH: u32 = 29
+const ARRAY_POP: u32 = 27
+// BigInt's constructor id in js_bigint_intrinsics.
+const BIGINT_CONSTRUCTOR: u32 = 0
+// Number.prototype.toString's method id in js_number_intrinsics.
+const NUMBER_TO_STRING: u32 = 8
+// Date.now's method id in js_date_intrinsics_metadata.
+const DATE_NOW: u32 = 1
+// Array.prototype.push onto a fast array with a writable int length: the same
+// fast path the builtin takes, minus the native frame. Growth can fail only on
+// allocation; then it declines and the full call reports the failure.
+@inlineNever
+unsafe effect fn quickPush<'a, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>, receiver: ValueBits, argv: &FrameSlots)
+  -> Option<ValueBits> ? &mut Allocator {
+  if argv.length() == 1 {
+    let value = unsafe argv.get(0)
+    let pushed = unsafe arraySupport.pushOne(receiver, value)
+    if pushed >= 0 { return Option<ValueBits>.some(ValueBits.Int { value: i64.toI32(pushed) }) }
+  }
+  let held = unsafe lendBits(&receiver, receiver)
+  let count = arraySupport.fastCount(held)
+  if count < 0 || arraySupport.intLength(held) != count || !arraySupport.writableLength(held)
+    || !unsafe properties.canExtendFast(reference(receiver)) { return Option<ValueBits>.none() }
+  let newLength = count + usize.toI64(argv.length())
+  if newLength > 2147483647 { return Option<ValueBits>.none() }
+  let reserved = run Effect.result(arraySupport.reserve(&mut hooks, realm, held, newLength))
+  if let Result<(), OutOfMemoryError>.Failure { error } = move reserved { drop error return Option<ValueBits>.none() }
+  let mut index: usize = 0
+  while index < argv.length() { run arraySupport.appendReserved(held, unsafe Value.retain(unsafe argv.get(index))) index = index + 1 }
+  arraySupport.publishLength(held, newLength)
+  return Option<ValueBits>.some(ValueBits.Int { value: i64.toI32(newLength) })
+}
+/// objectMethod's answers: a builtin the VM answers without a frame when it is
+/// called as a method on an object with one argument.
+pub const OBJECT_METHOD_NONE: u8 = 0
+pub const OBJECT_METHOD_PUSH: u8 = 1
+pub const OBJECT_METHOD_FROM_CHAR_CODE: u8 = 2
+/// Which of Array.prototype.push and String.fromCharCode function is, if either.
+@inlineAlways
+pub unsafe fn objectMethod(function: ValueBits) -> u8 {
+  let object = match function { ValueBits.Object { reference } => reference _ => { return OBJECT_METHOD_NONE } }
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  if data.classId() != classes.JS_CLASS_C_FUNCTION { return OBJECT_METHOD_NONE }
+  return match &data.payload {
+    ObjectPayload.NativeFunction { function: native } => match native.function {
+      NativeFunctionId.Builtin { family, method } => {
+        if family == BuiltinFamily.Array && method == ARRAY_PUSH && native.protocol == NativeCallProtocol.GenericMagic { OBJECT_METHOD_PUSH }
+        else if family == BuiltinFamily.String && method == stringIds.FROM_CHAR_CODE && native.protocol != NativeCallProtocol.Data { OBJECT_METHOD_FROM_CHAR_CODE }
+        else { OBJECT_METHOD_NONE }
+      }
+      _ => OBJECT_METHOD_NONE
+    }
+    _ => OBJECT_METHOD_NONE
+  }
+}
+/// String.fromCharCode(value) for an Int value whose code unit is cached as a
+/// one-unit string (js_unit_strings): that string, retained; else Uninitialized
+/// to decline.
+@inlineAlways
+pub unsafe fn unitStringOf(runtime: *mut HeapHeader, value: ValueBits) -> ValueBits {
+  let code = match value { ValueBits.Int { value: integer } => i32.toU32(i32.bitAnd(integer, 65535)) _ => { return ValueBits.Uninitialized } }
+  if code > 255 { return ValueBits.Uninitialized }
+  let anchor = () let registry = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let entry = registry.unitStrings[u32.toUsize(code)]
+  drop registry
+  if entry.isString() { return Strings.duplicate(entry) }
+  return ValueBits.Uninitialized
+}
+/// Whether function is the intrinsic String.prototype.charCodeAt.
+@inlineAlways
+pub unsafe fn isCharCodeAt(function: ValueBits) -> bool {
+  let object = match function { ValueBits.Object { reference } => reference _ => { return false } }
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  if data.classId() != classes.JS_CLASS_C_FUNCTION { return false }
+  return match &data.payload {
+    ObjectPayload.NativeFunction { function: native } => native.protocol != NativeCallProtocol.Data && match native.function {
+      NativeFunctionId.Builtin { family, method } => family == BuiltinFamily.String && method == stringIds.CHAR_CODE_AT
+      _ => false
+    }
+    _ => false
+  }
+}
+/// receiver.charCodeAt(value) for the intrinsic method (isCharCodeAt): the
+/// code unit when receiver is a flat string and value an Int index inside it,
+/// else -1 to decline (ropes, other receivers and out-of-range indices take the
+/// quick path or the full call).
+@inlineAlways
+pub unsafe fn charCodeOf(receiver: ValueBits, value: ValueBits) -> i32 {
+  let index = match value { ValueBits.Int { value: integer } => integer _ => { return -1 } }
+  if index < 0 { return -1 }
+  let text = Strings.flatView((unsafe lendBits(&receiver, receiver)).view())
+  if text.tag() != -7 || i32.toUsize(index) >= Strings.length(text) { return -1 }
+  return u16.toI32(Strings.codeUnit(text, i32.toUsize(index)))
+}
+/// Array.prototype.pop on a fast Array whose writable length matches its dense
+/// count: remove the last value and publish the new length, with no frame.
+unsafe fn quickPop(receiver: ValueBits) -> Option<ValueBits> {
+  let held = unsafe lendBits(&receiver, receiver)
+  let count = arraySupport.fastCount(held)
+  if count < 0 || arraySupport.intLength(held) != count || !arraySupport.writableLength(held) {
+    return Option<ValueBits>.none()
+  }
+  if count == 0 { return Option<ValueBits>.some(ValueBits.Undefined) }
+  let removed = arraySupport.popFast(held, false).intoBits()
+  arraySupport.publishLength(held, count - 1)
+  return Option<ValueBits>.some(removed)
+}
+/// Map.prototype.set and Set.prototype.add before the native frame is built.
+/// They can fail only on allocation, so skipping the frame changes no observable
+/// state; None declines (weak collections with a non-object key and every other
+/// method keep the full path).
+@inlineAlways
+pub unsafe effect fn quickWrite<H: HeapHooks + CoercionHooks + NativeFunctionHooks>(hooks: &mut H, target: &QuickTarget, receiver: ValueBits,
+  argv: &FrameSlots) -> Option<ValueBits> ! JsException ? &mut Allocator {
+  let id = target.id let realm = target.realm
+  let native = target.protocol != NativeCallProtocol.Data
+  let usable = target.protocol == NativeCallProtocol.GenericMagic
+  let converts = target.protocol == NativeCallProtocol.ConstructorOrFunction
+  // Array push/pop come first: they are the hottest frameless methods.
+  if let NativeFunctionId.Builtin { family, method } = id {
+    if family == BuiltinFamily.Array {
+      if !usable { return Option<ValueBits>.none() }
+      if method == ARRAY_PUSH {
+        if let Option<*mut HeapHeader>.Some { value } = Pointer.nonNullMut<HeapHeader>(realm) {
+          return run unsafe quickPush(&mut hooks, unsafe lendRealm(&value, value), receiver, argv)
+        }
+      }
+      if method == ARRAY_POP { return unsafe quickPop(receiver) }
+      return Option<ValueBits>.none()
+    }
+  }
+  // Date.now(): the host clock, no frame. Hosts without a frameless clock decline.
+  if native {
+    if let NativeFunctionId.Builtin { family, method } = id {
+      if method == DATE_NOW && family == BuiltinFamily.Date {
+        if let Option<i64>.Some { value: milliseconds } = run hooks.nativeClockMilliseconds() {
+          return Option<ValueBits>.some(ValueBits.number(i64.toF64(milliseconds)))
+        }
+      }
+    }
+  }
+  // String(n) for an Int n, called as a function: the decimal text, with no frame
+  // and no ToString chain. Callers have already excluded construction.
+  if converts && argv.length() >= 1 {
+    if let NativeFunctionId.Builtin { family, method } = id {
+      // BigInt(n) for an Int n: the short BigInt, no frame.
+      if family == BuiltinFamily.BigInt && method == BIGINT_CONSTRUCTOR {
+        if let ValueBits.Int { value: number } = unsafe argv.get(0) {
+          return Option<ValueBits>.some(ValueBits.ShortBigInt { value: i32.toI64(number) })
+        }
+      }
+      if family == BuiltinFamily.String && method == stringIds.CONSTRUCTOR {
+        if let ValueBits.Int { value: number } = unsafe argv.get(0) {
+          if number >= 0 && number < 256 {
+            if let Option<*mut HeapHeader>.Some { value } = Pointer.nonNullMut<HeapHeader>(realm) {
+              let cached = run Effect.result(unitStrings.decimal(unsafe lendRealm(&value, value), i32.toU32(number)))
+              if let Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value: text } = move cached { return Option<ValueBits>.some(text) }
+            }
+          }
+          let mut digits: [u8; 16] = [0; 16]
+          let count = Dtoa.i32toa(&mut digits, number)
+          let made = run Effect.result(Strings.joinLatin1(Slice.view<u8>(&digits, 0, count), Slice.view<u8>(&digits, 0, 0)))
+          return match move made {
+            Result<ValueBits, OutOfMemoryError>.Success { value: text } => Option<ValueBits>.some(text)
+            Result<ValueBits, OutOfMemoryError>.Failure { error } => { drop error Option<ValueBits>.none() }
+          }
+        }
+      }
+    }
+  }
+  // Number formatting on a primitive receiver (toFixed and friends use the plain
+  // Generic protocol, so this sits before the GenericMagic gate).
+  if native {
+    if let NativeFunctionId.Builtin { family, method } = id {
+      if family == BuiltinFamily.Number && method != NUMBER_TO_STRING {
+        let mut argument = ValueBits.Undefined
+        if argv.length() >= 1 { argument = unsafe argv.get(0) }
+        return run numberIntrinsics.quickFormat(method, receiver, argument)
+      }
+    }
+  }
+  if !usable { return Option<ValueBits>.none() }
+  if let NativeFunctionId.Builtin { family, method } = id {
+    // Weak collections only for object keys: any other key throws, and that
+    // error belongs to the full call with its native frame.
+    let weakObjectKey = (family == BuiltinFamily.WeakMap || family == BuiltinFamily.WeakSet)
+      && argv.length() >= 1 && (unsafe argv.get(0)).isObject()
+    if method == collections.SET && (family == BuiltinFamily.Map || family == BuiltinFamily.Set || weakObjectKey) {
+      if let Option<*mut HeapHeader>.Some { value } = Pointer.nonNullMut<HeapHeader>(realm) {
+        return run collections.quickMethod(&mut hooks, unsafe lendRealm(&value, value), family, method, unsafe lendBits(&receiver, receiver), unsafe lendArguments(argv))
+      }
+    }
+    // (n).toString() and n.toString(10) on an Int: the decimal text, no frame.
+    if method == NUMBER_TO_STRING && family == BuiltinFamily.Number {
+      if let ValueBits.Int { value: number } = receiver {
+        if number >= 0 && number < 256 && argv.length() == 0 {
+          if let Option<*mut HeapHeader>.Some { value } = Pointer.nonNullMut<HeapHeader>(realm) {
+            let cached = run Effect.result(unitStrings.decimal(unsafe lendRealm(&value, value), i32.toU32(number)))
+            if let Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value: digit } = move cached { return Option<ValueBits>.some(digit) }
+          }
+        }
+        let mut decimal = argv.length() == 0
+        if !decimal {
+          decimal = match unsafe argv.get(0) {
+            ValueBits.Undefined => true
+            ValueBits.Int { value: radix } => radix == 10
+            _ => false
+          }
+        }
+        if decimal {
+          let mut digits: [u8; 16] = [0; 16]
+          let count = Dtoa.i32toa(&mut digits, number)
+          let made = run Effect.result(Strings.joinLatin1(Slice.view<u8>(&digits, 0, count), Slice.view<u8>(&digits, 0, 0)))
+          return match move made {
+            Result<ValueBits, OutOfMemoryError>.Success { value: text } => Option<ValueBits>.some(text)
+            Result<ValueBits, OutOfMemoryError>.Failure { error } => { drop error Option<ValueBits>.none() }
+          }
+        }
+      }
+      let mut argument = ValueBits.Undefined
+      if argv.length() >= 1 { argument = unsafe argv.get(0) }
+      return run numberIntrinsics.quickFormat(method, receiver, argument)
+    }
+  }
+  return Option<ValueBits>.none()
+}
 // No allocation/copy on the adequate-argv path. Short argv uses native alloca
 // AFTER the real stack guard, and its storage never escapes this activation.
 // arguments.length() is the actual argc, not the caller's spare slot capacity.
-pub unsafe effect fn call<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + NativeFunctionHooks>(
-  hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, function: Value,
-  receiver: Value, arguments: &FrameSlots, flags: i32) -> Value ! JsException ? &mut Allocator {
-  run unsafe restricted.deny(context)
-  let rt = unsafe runtime.contextRuntime(context)
-  let native = unsafe callData(function)
+pub effect fn call<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + NativeFunctionHooks>(
+  hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, function: ValueRef<'b>,
+  receiver: ValueRef<'b>, args: Arguments<'a>, flags: i32) -> ValueBits ! JsException ? &mut Allocator { let arguments = args.slots()
+  run unsafe restricted.deny(realm.context())
+  let rt = realm.runtime()
+  let native = unsafe callData(function.view())
   let id = native.function let protocol = native.protocol let magic = native.magic
-  let length = u8.toUsize(native.length) let isData = native.isDataFunction let realm = native.realm
+  let length = u8.toUsize(native.length) let isData = native.isDataFunction let nativeRealm = native.realm
   let capturedCount = native.capturedCount
   let capturedPointer = native.capturedPointer
-  if !isData && unsafe runtime.checkStackOverflow(rt, currentFrameAddress(), length * Layout.of<Value>().bytes, true) {
-    return run unsafe hooks.throwError(context, NativeErrorKind.Internal, b"stack overflow")
+  if !isData && unsafe runtime.checkStackOverflow(rt, currentFrameAddress(), length * Layout.of<ValueBits>().bytes, true) {
+    return run ops.throwError(&mut hooks,realm, NativeErrorKind.Internal, b"stack overflow")
   }
-  let empty = unsafe Intrinsic.pointerRequalify<[*]mut Value, *mut Value>(unsafe Intrinsic.stackAllocate<Value>(0))
+  let empty = unsafe Intrinsic.pointerRequalify<[*]mut ValueBits, *mut ValueBits>(unsafe Intrinsic.stackAllocate<ValueBits>(0))
   let mut data = empty
   let argc = arguments.length()
   let mut count = argc
   if argc < length {
-    data = unsafe Intrinsic.pointerRequalify<[*]mut Value, *mut Value>(unsafe Intrinsic.stackAllocate<Value>(length))
-    let many = unsafe Pointer.assumeManyMut<Value>(data)
+    data = unsafe Intrinsic.pointerRequalify<[*]mut ValueBits, *mut ValueBits>(unsafe Intrinsic.stackAllocate<ValueBits>(length))
+    let many = unsafe Pointer.assumeManyMut<ValueBits>(data)
     let mut i: usize = 0
     while i < length {
-      let mut value = Value.Undefined
+      let mut value = ValueBits.Undefined
       if i < argc { value = unsafe arguments.get(i) }
-      unsafe Pointer.write<Value>(unsafe Pointer.atMut<Value>(many, i), value)
+      unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(many, i), value)
       i = i + 1
     }
     count = length
   } else if argc != 0 {
-    data = match &arguments.* {
-      FrameSlots.Borrowed { data: pointer, .. } => pointer
-      FrameSlots.Owned { slots } => unsafe Intrinsic.pointerRequalify<*const Value, *mut Value>(Pointer.fromRef<Value>(&slots.view()[0]))
-    }
+    data = arguments.data
   }
-  let argv = FrameSlots.Borrowed { data: data, length: count }
+  let argv = FrameSlots { data: data, count: count }
   if isData {
     let mut captureData = empty
     if capturedCount != 0 {
-      captureData = unsafe Intrinsic.pointerRequalify<?[*]const Value, *mut Value>(capturedPointer)
+      captureData = unsafe Intrinsic.pointerRequalify<?[*]const ValueBits, *mut ValueBits>(capturedPointer)
     }
-    let captured = FrameSlots.Borrowed { data: captureData, length: capturedCount }
-    let result = run Effect.result(unsafe hooks.nativeData(id, context, receiver, usize.toI32(argc), &argv, magic, &captured))
+    let captured = FrameSlots { data: captureData, count: capturedCount }
+    let result = run Intrinsic.catchFailure<OutOfMemoryError | JsException>(
+      hooks.nativeData(id, realm, receiver, usize.toI32(argc), unsafe lendArguments(&argv), magic, unsafe lendArguments(&captured)), hostFailed)
     return match move result {
-      Result<Value, OutOfMemoryError | JsException>.Success { value } => value
-      Result<Value, OutOfMemoryError | JsException>.Failure { error } => run unsafe materialize(&mut hooks, context, move error)
+      ValueBits value => value
+      HostFailed { error } => run materialize(&mut hooks, realm, move error)
     }
   }
-  let calleeContext = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(realm)
-  let mut beforeAnchor = () let before = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut beforeAnchor, rt)
+  let calleeContext = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(nativeRealm)
+  let calleeContextRealm = unsafe lendRealm(&calleeContext, calleeContext)
+  let mut beforeAnchor = () let before = realm.runtimeStateMut(&mut beforeAnchor)
   let previous = before.currentStackFrame drop before
   let emptyRefs = unsafe Intrinsic.pointerRequalify<[*]mut ?*mut HeapHeader, *mut ?*mut HeapHeader>(unsafe Intrinsic.stackAllocate<?*mut HeapHeader>(0))
-  let mut frame = StackFrame {
+  // Raw stack storage: every slot range is Borrowed, so the frame needs no drop glue.
+  let framePointer = unsafe Intrinsic.pointerRequalify<[*]mut StackFrame, *mut StackFrame>(unsafe Intrinsic.stackAllocate<StackFrame>(1))
+  unsafe Pointer.put<StackFrame>(framePointer, StackFrame {
     debuggerId: 0,
-    previous: previous, asyncOwner: Pointer.null<HeapHeader>(), currentFunction: function,
-    thisValue: receiver, newTarget: if (flags & u32.toI32(JS_CALL_FLAG_CONSTRUCTOR)) != 0 { receiver } else { Value.Undefined },
-    arguments: FrameSlots.Borrowed { data: data, length: count },
-    locals: FrameSlots.Borrowed { data: empty, length: 0 }, stack: FrameSlots.Borrowed { data: empty, length: 0 },
-    varRefs: FrameReferences.Borrowed { data: emptyRefs, length: 0 }, currentPc: Option<usize>.none(),
-    argumentCount: usize.toI32(count), mode: 0, stackPointer: Option<usize>.none()
-  }
-  let framePointer = Pointer.fromMutRef<StackFrame>(&mut frame)
-  let mut publishAnchor = () let published = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut publishAnchor, rt)
+    thisValue: receiver.view(), newTarget: if (flags & u32.toI32(JS_CALL_FLAG_CONSTRUCTOR)) != 0 { receiver.view() } else { ValueBits.Undefined },
+    previous: previous, asyncOwner: Pointer.null<HeapHeader>(), currentFunction: function.view(),
+    arguments: FrameSlots { data: data, count: count },
+    locals: FrameSlots { data: empty, count: 0 }, stack: FrameSlots { data: empty, count: 0 },
+    varRefs: FrameReferences { data: emptyRefs, count: 0 }, currentPc: NO_PC,
+    argumentCount: usize.toI32(count), mode: 0, stackPointer: NO_SP
+  })
+  let mut publishAnchor = () let published = realm.runtimeStateMut(&mut publishAnchor)
   published.currentStackFrame = framePointer drop published
-  let result = run Effect.result(unsafe dispatch(&mut hooks, memory, calleeContext, function, id, protocol,
-    magic, receiver, usize.toI32(argc), &argv, flags))
+  let result = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError | JsException>(unsafe dispatch(&mut hooks, memory,
+    calleeContextRealm, function, id, protocol, magic, receiver.view(), usize.toI32(argc), unsafe lendArguments(&argv), flags), textFailed)
   // Materialize while the frame/realm is still active, including error backtraces.
-  let outward = run Effect.result(unsafe dispatchResult(&mut hooks, calleeContext, move result))
-  let mut restoreAnchor = () let restored = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut restoreAnchor, rt)
+  let outward = match move result {
+    ValueBits value => Result<ValueBits, JsException>.Success { value: value }
+    TextFailed { error } =>
+      run Effect.result(materialize(&mut hooks, calleeContextRealm, move error))
+  }
+  let mut restoreAnchor = () let restored = realm.runtimeStateMut(&mut restoreAnchor)
   restored.currentStackFrame = previous drop restored
   return match move outward {
-    Result<Value, JsException>.Success { value } => value
-    Result<Value, JsException>.Failure { error } => { fail move error }
-  }
-}
-unsafe effect fn dispatchResult<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
-  result: Result<Value, OutOfMemoryError | StringLengthError | JsException>) -> Value ! JsException ? &mut Allocator {
-  return match move result {
-    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Success { value } => value
-    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => run unsafe materialize(&mut hooks, context, move error)
+    Result<ValueBits, JsException>.Success { value } => value
+    Result<ValueBits, JsException>.Failure { error } => { fail move error }
   }
 }

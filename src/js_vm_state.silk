@@ -1,8 +1,10 @@
 //! Allocation-free interpreter activation over the stable frame's native slots.
 //! Only verified, little-endian compiler/reader bytecode may enter the
 //! interpreter. Code, constants, closure references and original arguments remain
-//! live and address-stable throughout dispatch. Slots below sp own their values;
-//! slots above sp may be uninitialized or contain stale, non-owning bits.
+//! live and address-stable throughout dispatch. Slots below top own their values;
+//! slots at and above top may be uninitialized or contain stale, non-owning bits.
+import thin_list { ThinList, BoxList }
+import silk.core.ownership { Copy }
 import silk.mem.pointer { Pointer }
 import silk.core.option { Option }
 import silk.collections.list { List }
@@ -10,141 +12,280 @@ import silk.num.u8
 import silk.num.u16
 import silk.num.u32
 import silk.num.i32
+import silk.num.usize
+import silk.num.i64
+import silk.mem.layout { Layout }
 import js_heap { HeapCell, HeapHeader }
-import js_value { Value }
-import js_core_types { FrameSlots, StackFrame, RuntimeState, ObjectData, ObjectPayload }
+import js_value { ValueBits }
+import js_core_types { FrameSlots, StackFrame, RuntimeState, FunctionBytecode, ObjectData, ObjectPayload }
 import js_debugger_types { Activation as DebugActivation }
+import js_debugger_metadata { Location as DebugLocation }
 
 pub struct Machine {
   pub context: *mut HeapHeader,
   pub callerContext: *mut HeapHeader,
   pub runtime: *mut HeapHeader,
-  pub function: Value,
   pub bytecode: *mut HeapHeader,
   pub frame: *mut StackFrame,
   pub code: *const u8,
-  pub constants: *const Value,
+  pub constants: *const ValueBits,
   pub closureReferences: *const ?*mut HeapHeader,
   pub originalArguments: *const FrameSlots,
-  pub arguments: *mut Value,
-  pub locals: *mut Value,
-  pub stack: *mut Value,
-  pub thisValue: Value,
-  pub newTarget: Value,
+  pub arguments: *mut ValueBits,
+  pub locals: *mut ValueBits,
+  pub stack: *mut ValueBits,
+  pub thisValue: ValueBits,
+  pub newTarget: ValueBits,
   pub argumentCount: usize,
-  pub pc: usize,
-  pub sp: usize,
+  /// The next bytecode byte and the first free stack slot, as raw pointers so
+  /// dispatch needs neither base in a register; pc() and sp() give indexes.
+  pub ip: *const u8,
+  pub stackTop: *mut ValueBits,
+  /// The js_vm_activation.InlineFrame holding this frame when the running
+  /// dispatch loop entered it by an inline call; null for the loop's own frame.
+  pub record: ?*mut u8,
 }
+/// Raw pointers and bits only: execute keeps a register copy (see js_vm.sync).
+impl Copy for Machine {}
 
+/// Pointer arithmetic by a possibly negative element count: element offsets
+/// are plain wrapping multiplies, so a wrapped usize steps backwards.
+unsafe fn codeAt(pointer: *const u8, offset: usize) -> *const u8 {
+  return unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(pointer), offset)
+}
+pub unsafe fn cellAt(pointer: *mut ValueBits, offset: usize) -> *mut ValueBits {
+  return unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(pointer), offset)
+}
 impl Machine {
+  /// The byte offset of ip in the code.
+  @inlineAlways
+  pub fn pc(self: &Self) -> usize {
+    return usize.wrappingSubtract(Pointer.address<u8>(self.ip), Pointer.address<u8>(self.code))
+  }
+  @inlineAlways
+  pub unsafe fn setPc(self: &mut Self, pc: usize) -> () { self.ip = unsafe codeAt(self.code, pc) }
+  /// The slot index of top in the operand stack.
+  @inlineAlways
+  pub fn sp(self: &Self) -> usize {
+    return usize.wrappingSubtract(Pointer.address<ValueBits>(self.stackTop), Pointer.address<ValueBits>(self.stack)) / Layout.of<ValueBits>().bytes
+  }
+  @inlineAlways
+  pub unsafe fn setSp(self: &mut Self, sp: usize) -> () { self.stackTop = unsafe cellAt(self.stack, sp) }
+  /// Gives up the top count slots without reading them.
+  @inlineAlways
+  pub unsafe fn discard(self: &mut Self, count: usize) -> () { self.stackTop = unsafe cellAt(self.stackTop, usize.wrappingSubtract(0, count)) }
+  /// Claims count slots a callee already initialized above top.
+  @inlineAlways
+  pub unsafe fn advance(self: &mut Self, count: usize) -> () { self.stackTop = unsafe cellAt(self.stackTop, count) }
+  /// The cell depth slots below top; depth 1 is the top value.
+  @inlineAlways
+  pub unsafe fn topCell(self: &Self, depth: usize) -> *mut ValueBits { return unsafe cellAt(self.stackTop, usize.wrappingSubtract(0, depth)) }
+  @inlineAlways
   pub unsafe fn readU8(self: &mut Self) -> u8 {
-    let value = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(self.code), self.pc))
-    self.pc = self.pc + 1
+    let value = unsafe Pointer.read<u8>(self.ip)
+    // ip and top stay inside verified bytecode and its declared stack.
+    self.ip = unsafe codeAt(self.ip, 1)
     return value
   }
+  @inlineAlways
   pub unsafe fn readU16(self: &mut Self) -> u16 {
     let a = u8.toU16(unsafe self.readU8())
     let b = u8.toU16(unsafe self.readU8())
     return a | u16.shiftLeft(b, 8)
   }
+  /// The bytecode byte offset bytes past pc, without consuming it.
+  @inlineAlways
+  pub unsafe fn peekU8(self: &Self, offset: usize) -> u8 {
+    return unsafe Pointer.read<u8>(unsafe codeAt(self.ip, offset))
+  }
+  /// Reads the u16 operand at pc without consuming it.
+  @inlineAlways
+  pub unsafe fn peekU16(self: &Self) -> u16 {
+    let a = u8.toU16(unsafe Pointer.read<u8>(self.ip))
+    let b = u8.toU16(unsafe Pointer.read<u8>(unsafe codeAt(self.ip, 1)))
+    return a | u16.shiftLeft(b, 8)
+  }
+  /// Reads the u16 at pc + offset without consuming it.
+  @inlineAlways
+  pub unsafe fn peekU16At(self: &Self, offset: usize) -> u16 {
+    let a = u8.toU16(unsafe Pointer.read<u8>(unsafe codeAt(self.ip, offset)))
+    let b = u8.toU16(unsafe Pointer.read<u8>(unsafe codeAt(self.ip, offset + 1)))
+    return a | u16.shiftLeft(b, 8)
+  }
+  @inlineAlways
   pub unsafe fn readU32(self: &mut Self) -> u32 {
     let a = u16.toU32(unsafe self.readU16())
     let b = u16.toU32(unsafe self.readU16())
     return a | u32.shiftLeft(b, 16)
   }
+  @inlineAlways
   pub unsafe fn readI8(self: &mut Self) -> i32 {
     let value = u8.toI32(unsafe self.readU8())
     if value < 128 { return value }
     return value - 256
   }
+  @inlineAlways
   pub unsafe fn readI16(self: &mut Self) -> i32 {
     let value = u16.toI32(unsafe self.readU16())
     if value < 32768 { return value }
     return value - 65536
   }
+  @inlineAlways
   pub unsafe fn readI32(self: &mut Self) -> i32 {
     let value = unsafe self.readU32()
     if value <= 2147483647 { return u32.toI32(value) }
     return -1 - u32.toI32(4294967295 - value)
   }
   /// Relative operands are based at their first byte, not the next instruction.
+  @inlineAlways
   pub fn target(self: &Self, displacement: i32, width: usize) -> usize {
-    let origin = self.pc - width
+    let origin = self.pc() - width
     if displacement >= 0 { return origin + i32.toUsize(displacement) }
     return origin - (i32.toUsize(-(displacement + 1)) + 1)
   }
-  pub fn jump(self: &mut Self, displacement: i32, width: usize) -> () {
-    self.pc = self.target(displacement, width)
+  /// Steps over operands already read with peekU16/peekU16At.
+  @inlineAlways
+  pub unsafe fn skip(self: &mut Self, count: usize) -> () {
+    self.ip = unsafe codeAt(self.ip, count)
+  }
+  @inlineAlways
+  pub unsafe fn jump(self: &mut Self, displacement: i32, width: usize) -> () {
+    self.ip = unsafe codeAt(self.ip, usize.wrappingSubtract(i64.wrappingToUsize(i32.toI64(displacement)), width))
   }
   /// Must precede calls that can expose this frame through a nested invocation.
+  @inlineAlways
   pub unsafe fn publishPc(self: &Self) -> () {
     let mut anchor = ()
     let frame = unsafe Pointer.borrowMut<(), StackFrame>(&mut anchor, self.frame)
-    frame.currentPc = Option<usize>.some(self.pc)
+    frame.currentPc = self.pc()
     drop frame
     let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, self.runtime)
     if state.debugger.evaluating || state.debugger.callbackActive { return }
+    let observing = state.debugger.enabled || state.coverage.enabled || state.cpuProfile.enabled
     let current = state.debugger.active drop state
     if let Option<*mut DebugActivation>.Some { value } = Pointer.nonNullMut<DebugActivation>(current) {
       let active = unsafe Pointer.borrowMut<(), DebugActivation>(&mut anchor, value)
-      if Pointer.address<StackFrame>(active.frame) == Pointer.address<StackFrame>(self.frame) { active.sp = self.sp }
+      if Pointer.address<StackFrame>(active.frame) == Pointer.address<StackFrame>(self.frame) {
+        active.sp = self.sp()
+        if !observing {
+          // A parked return PC points past the call; use a byte inside it so a
+          // following scope exit cannot hide the caller's lexical bindings.
+          let pc = self.pc()
+          let parked = if pc == 0 { 0 } else { pc - 1 }
+          let codeAnchor = () let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&codeAnchor, self.bytecode)
+          active.pc = match code.debuggerMetadata.locationAtOrBefore(usize.toU32(parked)) {
+            Option<DebugLocation>.Some { value: location } => u32.toUsize(location.pc)
+            _ => parked
+          }
+        }
+      }
     }
   }
-  pub unsafe fn slot(self: &Self, index: usize) -> *mut Value {
-    return unsafe Pointer.atMut<Value>(unsafe Pointer.assumeManyMut<Value>(self.stack), index)
+  @inlineAlways
+  pub unsafe fn slot(self: &Self, index: usize) -> *mut ValueBits {
+    return unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(self.stack), index)
   }
   /// Transfers an owned value into previously inactive storage. No old read.
-  pub unsafe fn push(self: &mut Self, value: Value) -> () {
-    unsafe Pointer.write<Value>(unsafe self.slot(self.sp), value)
-    self.sp = self.sp + 1
+  @inlineAlways
+  pub unsafe fn push(self: &mut Self, value: ValueBits) -> () {
+    unsafe Pointer.write<ValueBits>(self.stackTop, value)
+    self.stackTop = unsafe cellAt(self.stackTop, 1)
+  }
+  /// Pushes a retained copy of an initialized cell (a local, argument or operand).
+  @inlineAlways
+  pub unsafe fn pushCopy(self: &mut Self, from: *mut ValueBits) -> () {
+    // Both words are read before the retain: its count store could alias the
+    // cell, so reading after it would load them again.
+    let source = unsafe Pointer.assumeManyMut<u64>(unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut u64>(from))
+    let low = unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(source, 0))
+    let high = unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(source, 1))
+    let value = unsafe Pointer.read<ValueBits>(from)
+    drop unsafe value.retained()
+    let target = unsafe Pointer.assumeManyMut<u64>(unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut u64>(self.stackTop))
+    unsafe Pointer.write<u64>(unsafe Pointer.atMut<u64>(target, 0), low)
+    unsafe Pointer.write<u64>(unsafe Pointer.atMut<u64>(target, 1), high)
+    self.stackTop = unsafe cellAt(self.stackTop, 1)
+  }
+  @inlineAlways
+  pub unsafe fn argumentCell(self: &Self, index: usize) -> *mut ValueBits {
+    return unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(self.arguments), index)
+  }
+  @inlineAlways
+  pub unsafe fn localCell(self: &Self, index: usize) -> *mut ValueBits {
+    return unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(self.locals), index)
   }
   /// Transfers the top owner out; intentionally does not clear inactive storage.
-  pub unsafe fn pop(self: &mut Self) -> Value {
-    self.sp = self.sp - 1
-    return unsafe Pointer.read<Value>(unsafe self.slot(self.sp))
+  @inlineAlways
+  pub unsafe fn pop(self: &mut Self) -> ValueBits {
+    self.stackTop = unsafe cellAt(self.stackTop, usize.wrappingSubtract(0, 1))
+    return unsafe Pointer.read<ValueBits>(self.stackTop)
   }
   /// depth 1 is the top. The result borrows that slot's JavaScript ownership.
-  pub unsafe fn top(self: &Self, depth: usize) -> Value {
-    return unsafe Pointer.read<Value>(unsafe self.slot(self.sp - depth))
+  @inlineAlways
+  pub unsafe fn top(self: &Self, depth: usize) -> ValueBits {
+    return unsafe Pointer.read<ValueBits>(unsafe cellAt(self.stackTop, usize.wrappingSubtract(0, depth)))
   }
   /// Transfers ownership; caller must handle any owner previously in this slot.
-  pub unsafe fn set(self: &Self, depth: usize, value: Value) -> () {
-    unsafe Pointer.write<Value>(unsafe self.slot(self.sp - depth), value)
+  @inlineAlways
+  pub unsafe fn set(self: &Self, depth: usize, value: ValueBits) -> () {
+    unsafe Pointer.write<ValueBits>(unsafe cellAt(self.stackTop, usize.wrappingSubtract(0, depth)), value)
   }
-  pub unsafe fn argument(self: &Self, index: usize) -> Value {
-    return unsafe Pointer.read<Value>(unsafe Pointer.atMut<Value>(unsafe Pointer.assumeManyMut<Value>(self.arguments), index))
+  @inlineAlways
+  pub unsafe fn argument(self: &Self, index: usize) -> ValueBits {
+    return unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(self.arguments), index))
   }
-  pub unsafe fn local(self: &Self, index: usize) -> Value {
-    return unsafe Pointer.read<Value>(unsafe Pointer.atMut<Value>(unsafe Pointer.assumeManyMut<Value>(self.locals), index))
+  @inlineAlways
+  pub unsafe fn local(self: &Self, index: usize) -> ValueBits {
+    return unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(self.locals), index))
   }
-  pub unsafe fn setArgument(self: &Self, index: usize, value: Value) -> Value {
-    let slot = unsafe Pointer.atMut<Value>(unsafe Pointer.assumeManyMut<Value>(self.arguments), index)
-    let previous = unsafe Pointer.read<Value>(slot)
-    unsafe Pointer.write<Value>(slot, value)
+  @inlineAlways
+  pub unsafe fn setArgument(self: &Self, index: usize, value: ValueBits) -> ValueBits {
+    let slot = unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(self.arguments), index)
+    let previous = unsafe Pointer.read<ValueBits>(slot)
+    unsafe Pointer.write<ValueBits>(slot, value)
     return previous
   }
-  pub unsafe fn setLocal(self: &Self, index: usize, value: Value) -> Value {
-    let slot = unsafe Pointer.atMut<Value>(unsafe Pointer.assumeManyMut<Value>(self.locals), index)
-    let previous = unsafe Pointer.read<Value>(slot)
-    unsafe Pointer.write<Value>(slot, value)
+  @inlineAlways
+  pub unsafe fn setLocal(self: &Self, index: usize, value: ValueBits) -> ValueBits {
+    let slot = unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(self.locals), index)
+    let previous = unsafe Pointer.read<ValueBits>(slot)
+    unsafe Pointer.write<ValueBits>(slot, value)
     return previous
   }
-  pub unsafe fn constant(self: &Self, index: usize) -> Value {
-    return unsafe Pointer.read<Value>(unsafe Pointer.at<Value>(unsafe Pointer.assumeMany<Value>(self.constants), index))
+  @inlineAlways
+  pub unsafe fn constant(self: &Self, index: usize) -> ValueBits {
+    return unsafe Pointer.read<ValueBits>(unsafe Pointer.at<ValueBits>(unsafe Pointer.assumeMany<ValueBits>(self.constants), index))
   }
+  @inlineAlways
   pub unsafe fn closureReference(self: &Self, index: usize) -> ?*mut HeapHeader {
     return unsafe Pointer.read<?*mut HeapHeader>(unsafe Pointer.at<?*mut HeapHeader>(
       unsafe Pointer.assumeMany<?*mut HeapHeader>(self.closureReferences), index))
   }
+  /// The running function, kept only in the frame: every machine has one.
+  @inlineAlways
+  pub unsafe fn currentFunction(self: &Self) -> ValueBits {
+    let anchor = () let frame = unsafe Pointer.borrow<(), StackFrame>(&anchor, self.frame)
+    return frame.currentFunction
+  }
   /// Only this immutable capture table may stay borrowed across nested calls;
   /// the function payload itself may have its home object changed by reentry.
-  pub unsafe fn inheritedList(self: &Self) -> *const List<?*mut HeapHeader> {
-    let node = match self.function { Value.Object { reference } => reference _ => invariant() }
+  @inlineAlways
+  pub unsafe fn inheritedList(self: &Self) -> *const BoxList<?*mut HeapHeader> {
+    let node = match unsafe self.currentFunction() { ValueBits.Object { reference } => reference _ => invariant() }
     let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
     return match &data.payload {
-      ObjectPayload.BytecodeFunction { function } => Pointer.fromRef<List<?*mut HeapHeader>>(&function.varRefs)
+      ObjectPayload.BytecodeFunction { function } => Pointer.fromRef<BoxList<?*mut HeapHeader>>(&function.varRefs)
       _ => invariant()
     }
   }
 }
 fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+
+/// Copies one initialized cell as two words. Copying ValueBits as a value goes
+/// through per-field byte spills (about 12 instructions); the cell bits are the value.
+pub unsafe fn copyCell(from: *mut ValueBits, to: *mut ValueBits) -> () {
+  let source = unsafe Pointer.assumeManyMut<u64>(unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut u64>(from))
+  let target = unsafe Pointer.assumeManyMut<u64>(unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut u64>(to))
+  unsafe Pointer.write<u64>(unsafe Pointer.atMut<u64>(target, 0), unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(source, 0)))
+  unsafe Pointer.write<u64>(unsafe Pointer.atMut<u64>(target, 1), unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(source, 1)))
+}

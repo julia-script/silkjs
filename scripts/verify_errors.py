@@ -157,7 +157,7 @@ import runtime_memory { RuntimeAllocator, AllocationObserver }
 import native_stack { currentFrameAddress }
 import js_heap { HeapHeader }
 import js_core_types { NativeErrorKind, PropertySlot, StackFrame, JS_MODE_BACKTRACE_BARRIER }
-import js_value { Value }
+import js_value { ValueBits }
 import js_strings { Strings }
 import js_string_types { StringLengthError, StringOwner }
 import js_runtime as runtime
@@ -176,16 +176,16 @@ fn bit(value: bool)->u32 {if value{return 1}return 0}
 fn signed(value:i32)->u32 {
  if value<0{return i32.toU32(-(value+1))^0xffffffff}return i32.toU32(value)
 }
-effect fn value(out:&mut ByteBuffer,v:Value)->() ! OutOfMemoryError ? &mut Allocator {
+effect fn value(out:&mut ByteBuffer,v:ValueBits)->() ! OutOfMemoryError ? &mut Allocator {
  run out.writeU32(i32.toU32(v.tag()+10))
  if v.isString(){run out.writeU32(usize.toU32(Strings.length(v))) let mut i:usize=0
  while i<Strings.length(v){run out.writeU32(u16.toU32(Strings.codeUnit(v,i))) i=i+1}}
- else {match v {Value.Int {value:n}=>{run out.writeU32(signed(n))} _=>()}}
+ else {match v {ValueBits.Int {value:n}=>{run out.writeU32(signed(n))} _=>()}}
 }
-effect fn property(out:&mut ByteBuffer,object:Value,atom:u32)->() ! OutOfMemoryError ? &mut Allocator {
+effect fn property(out:&mut ByteBuffer,object:ValueBits,atom:u32)->() ! OutOfMemoryError ? &mut Allocator {
  let p=unsafe fixture.property(object,atom) run out.writeU32(bit(p.present)) run out.writeU32(p.flags) run value(&mut out,p.value)
 }
-effect fn record<'a>(out:&mut ByteBuffer,hooks:&Hooks<'a>,rt:*mut HeapHeader,ctx:*mut HeapHeader,object:Value)->()
+effect fn record<'a>(out:&mut ByteBuffer,hooks:&Hooks<'a>,rt:*mut HeapHeader,ctx:*mut HeapHeader,object:ValueBits)->()
  ! OutOfMemoryError ? &mut Allocator {
  run out.writeU32(unsafe fixture.prototypeIndex(ctx,object)) run out.writeU32(bit(unsafe fixture.uncatchable(rt)))
  run out.writeU32(bit(unsafe fixture.inOom(rt))) run out.writeU32(usize.toU32(hooks.finalized))
@@ -193,7 +193,7 @@ effect fn record<'a>(out:&mut ByteBuffer,hooks:&Hooks<'a>,rt:*mut HeapHeader,ctx
  run value(&mut out,object)
  let properties:[u32;6]=[atoms.JS_ATOM_message,atoms.JS_ATOM_stack,atoms.JS_ATOM_fileName,atoms.JS_ATOM_lineNumber,atoms.JS_ATOM_columnNumber,atoms.JS_ATOM_name]
  let mut i:usize=0 while i<6 {run property(&mut out,object,properties[i]) i=i+1}
- let name=match unsafe trace.propertyString(object,atoms.JS_ATOM_name){Option<Value>.Some {value:v}=>v _=>Value.Undefined}
+ let name=match unsafe trace.propertyString(object,atoms.JS_ATOM_name){Option<ValueBits>.Some {value:v}=>v _=>ValueBits.Undefined}
  run value(&mut out,name)
 }
 effect fn ignore(error:JsException)->(){drop error}
@@ -204,7 +204,7 @@ effect fn body(out:&mut ByteBuffer,memory:&AllocationObserver,family:usize,which
  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
  let rt=run runtime.allocateRuntimeStorage(currentFrameAddress()) let ctx=run unsafe runtime.allocateContextStorage(rt)
  let mut hooks=Hooks.make(memory) run unsafe fixture.prepare(&mut hooks,memory,ctx)
- let parent=run unsafe objects.withPrototype(&mut hooks,memory,ctx,Value.Null)
+ let parent=run unsafe objects.withPrototype(&mut hooks,memory,ctx,ValueBits.Null)
  let parentName=run Strings.fromLatin1(b"host") run unsafe frames.add(&mut hooks,rt,parent,atoms.JS_ATOM_name,3,PropertySlot.Value {value:parentName})
  let host=run unsafe frames.native(&mut hooks,memory,ctx,parent)
  let code=run unsafe frames.compiled(&mut hooks,memory,ctx,b"\0\0\x08\x04",true,true)
@@ -222,13 +222,13 @@ effect fn body(out:&mut ByteBuffer,memory:&AllocationObserver,family:usize,which
  else if message==5{text=b""}
  if family==0||family==4{let old=run unsafe fixture.watched(&mut hooks,memory,ctx)
  run unsafe fixture.putPending(&mut hooks,rt,old) unsafe exceptions.setUncatchable(rt,true)}
- let mut object=Value.Undefined
+ let mut object=ValueBits.Undefined
  if family==0{object=run unsafe fixture.capture(&mut hooks,memory,ctx,fixture.kind(which),text,policy)}
  else if family==1{object=run unsafe errors.newError(&mut hooks,memory,ctx)}
  else if family==2{
   object=run unsafe errors.newError(&mut hooks,memory,ctx) if sealed{unsafe fixture.preventExtensions(object)}
-  let filename=StringOwner.adopt(run Strings.fromLatin1(b"parse.js")) let mut originValue=Option<Value>.none()
-  if origin!=0{originValue=Option<Value>.some(filename.get())} let mut line:i32=13 if origin==1{line= -1}
+  let filename=StringOwner.adopt(run Strings.fromLatin1(b"parse.js")) let mut originValue=Option<ValueBits>.none()
+  if origin!=0{originValue=Option<ValueBits>.some(filename.get())} let mut line:i32=13 if origin==1{line= -1}
   run unsafe errors.buildBacktrace(&mut hooks,memory,ctx,object,move originValue,line,7,policy)
  }else if family==3{object=run unsafe fixture.captureOom(&mut hooks,memory,ctx)}
  else if family==4{unsafe fixture.setOom(rt,true) object=run unsafe fixture.captureOom(&mut hooks,memory,ctx)}
@@ -267,8 +267,8 @@ effect fn sweep(traced:bool)->() ! OutOfMemoryError | StringLengthError ? &mut A
   let rt=run runtime.allocateRuntimeStorage(currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut memory)
   let ctx=run unsafe runtime.allocateContextStorage(rt) |> Effect.provideMut<Allocator>(&mut memory)
   let mut hooks=Hooks.make(&observer) run unsafe fixture.prepare(&mut hooks,&observer,ctx) |> Effect.provideMut<Allocator>(&mut memory)
-  let mut function=Value.Undefined
-  if traced{function=run unsafe frames.native(&mut hooks,&observer,ctx,Value.Null) |> Effect.provideMut<Allocator>(&mut memory)}
+  let mut function=ValueBits.Undefined
+  if traced{function=run unsafe frames.native(&mut hooks,&observer,ctx,ValueBits.Null) |> Effect.provideMut<Allocator>(&mut memory)}
   let mut frame=run frames.frame(function) |> Effect.provideMut<Allocator>(&mut memory)
   if traced{unsafe frames.publish(rt,Pointer.fromMutRef<StackFrame>(&mut frame))}
   let mut fault=FaultAllocator {parent:move memory,armed:true,remaining:cut,persistent:mode==1,failures:0}

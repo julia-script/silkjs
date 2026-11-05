@@ -108,7 +108,7 @@ import js_heap { HeapCell, HeapHeader }
 import js_core_types { RuntimeState, NativeFunctionId, WeakRefHeader, ExoticCallbacks }
 import js_gc { HeapHooks, Tracer }
 import js_gc as gc
-import js_value { Value }
+import js_value { ValueBits }
 import js_strings { Strings }
 import js_string_types { StringLengthError }
 import js_runtime as rtapi
@@ -123,8 +123,8 @@ fn flag(value:bool) -> u32 { if value { return 1 } return 0 }
 fn present(value:&Option<NativeFunctionId>) -> u32 {
   return match &value.* { Option<NativeFunctionId>.Some {..} => 1 Option<NativeFunctionId>.None => 0 }
 }
-unsafe fn rc(value:Value) -> u32 {
-  let reference=match value { Value.String {reference} => reference _ => trap() }
+unsafe fn rc(value:ValueBits) -> u32 {
+  let reference=match value { ValueBits.String {reference} => reference _ => trap() }
   let anchor=() unsafe { return i32.toU32(Pointer.borrow<(),HeapHeader>(&anchor,reference).referenceCount) }
 }
 struct Hooks { sequence:u32 }
@@ -135,7 +135,7 @@ impl HeapHooks for Hooks {
   unsafe fn destroyAuxiliary(self:&mut Self,rt:*mut HeapHeader,node:*mut HeapHeader)->() { trap() }
 }
 impl JobDispatcher for Hooks {
-  unsafe effect fn dispatchJob(self:&mut Self,context:*mut HeapHeader,function:NativeFunctionId,arguments:&[Value])->Value
+  unsafe effect fn dispatchJob(self:&mut Self,context:*mut HeapHeader,function:NativeFunctionId,arguments:&[ValueBits])->ValueBits
     ! OutOfMemoryError ? &mut Allocator {
     let id=match function { NativeFunctionId.Host {id} => id _ => trap() }
     self.sequence=self.sequence*10+id
@@ -146,10 +146,10 @@ impl JobDispatcher for Hooks {
     if id==2 {
       let mut anchor=() let rt=unsafe rtapi.contextRuntime(context)
       let state=unsafe HeapCell.payloadMut<RuntimeState,()>(&mut anchor,rt)
-      state.currentException=Value.Int {value:42}
-      return Value.Exception
+      state.currentException=ValueBits.Int {value:42}
+      return ValueBits.Exception
     }
-    return Value.Undefined
+    return ValueBits.Undefined
   }
 }
 effect fn exercise(out:&mut ByteBuffer)->() ! OutOfMemoryError | StringLengthError ? &mut Allocator {
@@ -196,12 +196,12 @@ effect fn exercise(out:&mut ByteBuffer)->() ! OutOfMemoryError | StringLengthErr
   let text=run Strings.fromLatin1(b"runtime-root-string") |> Effect.provideMut<Allocator>(&mut memory)
   unsafe rtapi.setContextValue(&mut hooks,first,0,text)
   let copy=unsafe rtapi.getContextValue(first,0) run out.writeU32(unsafe rc(copy))
-  unsafe rtapi.setClassPrototype(&mut hooks,first,67,copy) unsafe rtapi.setContextValue(&mut hooks,first,0,Value.Null)
+  unsafe rtapi.setClassPrototype(&mut hooks,first,67,copy) unsafe rtapi.setContextValue(&mut hooks,first,0,ValueBits.Null)
   let again=unsafe rtapi.getClassPrototype(first,67) run out.writeU32(unsafe rc(again))
   unsafe rtapi.setContextValue(&mut hooks,first,-1,again)
   let invalidRoot=unsafe rtapi.getContextValue(first,7)
   run out.writeU32(i32.toU32(invalidRoot.tag()))
-  unsafe rtapi.setClassPrototype(&mut hooks,first,67,Value.Null)
+  unsafe rtapi.setClassPrototype(&mut hooks,first,67,ValueBits.Null)
   unsafe rtapi.updateStackTop(rt,8192) unsafe rtapi.setMaxStackSize(rt,1024)
   let stacked=unsafe HeapCell.payload<RuntimeState,()>(&anchor,rt)
   run out.writeU32(usize.toU32(stacked.stackLimit)) drop stacked

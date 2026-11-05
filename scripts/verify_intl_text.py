@@ -107,7 +107,7 @@ import byte_buffer { ByteBuffer }
 import runtime_memory { RuntimeAllocator }
 import js_string_types { StringOwner, StringLengthError }
 import js_strings { Strings }
-import js_value { Value }
+import js_value { ValueBits }
 import intl_collation as col
 import intl_collation { CollationOptions }
 import intl_segmentation as seg
@@ -256,6 +256,7 @@ def main():
         expected=process([str(tmp/'oracle')],args.timeout,owner='Pinned Intl text C execution')
         shutil.copytree(ROOT/'src',tmp/'src')
         shutil.copyfile(ROOT/'silk.toml',tmp/'silk.toml')
+        shutil.copyfile(ROOT/'startup.order',tmp/'startup.order')
         (tmp/'src/intl_text_probe.silk').write_text(native_source(values,units,pairs))
         process([executable_path(args.silk),'build','src/intl_text_probe.silk','-o',str(tmp/'native'),'--stdlib',str(args.stdlib.resolve()),'--optimization','speed','--debug','false'],args.timeout,owner='Native Intl text compilation',cwd=tmp)
         actual=process([str(tmp/'native')],args.timeout,owner='Native Intl text execution')

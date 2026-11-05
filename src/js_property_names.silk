@@ -1,10 +1,14 @@
 //! JS_GetOwnPropertyNames / JS_FreePropertyEnum, quickjs.c:8676-8921.
 //! Context, object and hooks are borrowed; results own their atoms. Caller keeps
 //! the runtime alive. No object/shape/runtime payload borrow crosses host dispatch.
+import js_shapes
+import js_object_ref { ObjectRef }
+import js_realm { lendRealm, Realm }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.collections.list { List }
 import silk.core.option { Option }
+import silk.core.ownership { Drop }
 import silk.core.result { Result }
 import silk.num.u8
 import silk.num.u32
@@ -15,7 +19,8 @@ import js_core_types { RuntimeState, ObjectData, ObjectPayload, ShapeData, Prope
   PropertyEnum, PropertyDescriptor, NativeFunctionId, ExoticCallbacks,
   EXOTIC_GET_OWN_PROPERTY_NAMES, JS_PROP_ENUMERABLE, JS_PROP_TMASK, JS_PROP_VARREF }
 import js_heap { HeapCell, HeapHeader }
-import js_value { Value }
+import js_value { ValueBits }
+import js_owned_value { lendBits, immediateRef, ValueRef }
 import js_string_types { AtomKind, StringOwner, StringLengthError }
 import js_strings { Strings }
 import js_gc { HeapHooks }
@@ -24,7 +29,6 @@ import js_runtime as runtime
 import js_var_refs as varRefs
 import js_class_data as classes
 import js_property_host { OwnKeysHooks }
-import js_property_ownership { releaseDescriptor }
 import js_exceptions { JsException }
 
 pub const JS_GPN_STRING_MASK: u32 = 1
@@ -53,8 +57,8 @@ fn included(kind: AtomKind, enumerable: bool, flags: u32) -> bool {
 // Fast Arguments and mapped Arguments use the same source count as fast Arrays;
 // typed views use their cached element count, never byte length or backing size.
 fn indexedLength(object: &ObjectData) -> usize {
-  if !object.isExotic { return 0 }
-  if object.fastArray {
+  if !object.isExotic() { return 0 }
+  if object.fastArray() {
     return match &object.payload {
       ObjectPayload.FastArray { array } => array.values.length()
       ObjectPayload.MappedArguments { arguments } => arguments.varRefs.length()
@@ -63,21 +67,22 @@ fn indexedLength(object: &ObjectData) -> usize {
       _ => trap()
     }
   }
-  if object.classId == classes.JS_CLASS_STRING {
+  if object.classId() == classes.JS_CLASS_STRING {
     return match &object.payload {
-      ObjectPayload.Boxed { value: Value.String { reference } } => Strings.length(Value.String { reference: reference })
+      ObjectPayload.Boxed { value: ValueBits.String { reference } } => Strings.length(ValueBits.String { reference: reference })
       _ => 0
     }
   }
   return 0
 }
 struct Counts { numbers: usize, strings: usize, symbols: usize }
-unsafe effect fn countShape(rt: *mut HeapHeader, node: *mut HeapHeader, flags: u32) -> Counts
+@inlineAlways
+effect fn countShape<'a, 'o>(realm: Realm<'a>, node: ObjectRef<'o>, flags: u32) -> Counts
   ! OutOfMemoryError | OwnKeysError | StringLengthError ? &mut Allocator {
   let anchor = ()
-  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  let object = node.data(&anchor)
   let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, object.shape)
-  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let state = realm.runtimeState(&anchor)
   let mut counts = Counts { numbers: 0, strings: 0, symbols: 0 }
   let mut i: usize = 0
   while i < shape.properties.length() {
@@ -88,8 +93,8 @@ unsafe effect fn countShape(rt: *mut HeapHeader, node: *mut HeapHeader, flags: u
       if included(kind, enumerable, flags) {
         if (u8.toU32(property.flags) & JS_PROP_TMASK) == JS_PROP_VARREF
           && (flags & (JS_GPN_SET_ENUM | JS_GPN_ENUM_ONLY)) != 0 {
-          let reference = match object.properties.get(i) { PropertySlot.VarRef { reference } => reference _ => trap() }
-          if match unsafe varRefs.read(reference) { Value.Uninitialized => true _ => false } {
+          let reference = match object.properties.get(i).view(unsafe js_shapes.slotFlags(object.shape, i)) { PropertySlot.VarRef { reference } => reference _ => trap() }
+          if match unsafe varRefs.read(reference) { ValueBits.Uninitialized => true _ => false } {
             let name = StringOwner.adopt(run state.atoms.toValue(property.atom, true))
             fail OwnKeysError.Uninitialized { name: move name }
           }
@@ -108,14 +113,15 @@ unsafe effect fn countShape(rt: *mut HeapHeader, node: *mut HeapHeader, flags: u
   if (flags & JS_GPN_STRING_MASK) != 0 { counts.numbers = counts.numbers + indexedLength(object) }
   return move counts
 }
-unsafe fn ownKeysTable(rt: *mut HeapHeader, node: *mut HeapHeader) -> Option<NativeFunctionId> {
+@inlineAlways
+fn ownKeysTable<'a, 'o>(realm: Realm<'a>, node: ObjectRef<'o>) -> Option<NativeFunctionId> {
   let anchor = ()
-  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
-  if !object.isExotic || object.fastArray || object.classId == classes.JS_CLASS_STRING {
+  let object = node.data(&anchor)
+  if !object.isExotic() || object.fastArray() || object.classId() == classes.JS_CLASS_STRING {
     return Option<NativeFunctionId>.none()
   }
-  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
-  match &state.classes.asSlice()[u32.toUsize(object.classId)].exotic {
+  let state = realm.runtimeState(&anchor)
+  match &state.classes.asSlice()[u32.toUsize(object.classId())].exotic {
     Option<ExoticCallbacks>.Some { value } => {
       if (value.methodMask & EXOTIC_GET_OWN_PROPERTY_NAMES) != 0 {
         return Option<NativeFunctionId>.some(value.descriptor)
@@ -125,9 +131,10 @@ unsafe fn ownKeysTable(rt: *mut HeapHeader, node: *mut HeapHeader) -> Option<Nat
   }
   return Option<NativeFunctionId>.none()
 }
-unsafe fn atomKind(rt: *mut HeapHeader, atom: u32) -> AtomKind {
+@inlineAlways
+fn atomKind<'a>(realm: Realm<'a>, atom: u32) -> AtomKind {
   let anchor = ()
-  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let state = realm.runtimeState(&anchor)
   return state.atoms.propertyKind(atom)
 }
 fn numericKey(atoms: &AtomTable, entry: PropertyEnum) -> u64 {
@@ -163,15 +170,13 @@ fn sortNumeric(atoms: &AtomTable, names: &mut List<PropertyEnum>, count: usize) 
     sift(atoms, &mut names, 0, end)
   }
 }
-unsafe effect fn enumerate<H: HeapHooks + OwnKeysHooks>(hooks: &mut H,
-  context: *mut HeapHeader, rt: *mut HeapHeader, node: *mut HeapHeader, flags: u32,
+effect fn enumerate<'a, 'o, H: HeapHooks + OwnKeysHooks>(hooks: &mut H,realm: Realm<'a>, node: ObjectRef<'o>, flags: u32,
   names: &mut List<PropertyEnum>, exotic: &mut List<PropertyEnum>) -> ()
   ! OutOfMemoryError | OwnKeysError | JsException | StringLengthError ? &mut Allocator {
-  let counts = run unsafe countShape(rt, node, flags)
-  let objectValue = Value.Object { reference: node }
-  match unsafe ownKeysTable(rt, node) {
+  let counts = run countShape(realm, node, flags)
+  match ownKeysTable(realm, node) {
     Option<NativeFunctionId>.Some { value: table } => {
-      exotic.* = run unsafe OwnKeysHooks.getOwnKeys(&mut hooks, context, table, objectValue)
+      exotic.* = run OwnKeysHooks.getOwnKeys(&mut hooks, realm, table, node.value())
     }
     Option<NativeFunctionId>.None => ()
   }
@@ -179,14 +184,14 @@ unsafe effect fn enumerate<H: HeapHooks + OwnKeysHooks>(hooks: &mut H,
   let mut i: usize = 0
   while i < exotic.length() {
     let item = exotic.get(i)
-    if selected(unsafe atomKind(rt, item.atom), flags) {
+    if selected(atomKind(realm, item.atom), flags) {
       let mut enumerable = false
       if (flags & (JS_GPN_SET_ENUM | JS_GPN_ENUM_ONLY)) != 0 {
-        let descriptor = run unsafe OwnKeysHooks.getOwnProperty(&mut hooks, context, objectValue, item.atom)
+        let descriptor = run OwnKeysHooks.getOwnProperty(&mut hooks, realm, node.value(), item.atom)
         match move descriptor {
           Option<PropertyDescriptor>.Some { value } => {
             enumerable = (value.flags & JS_PROP_ENUMERABLE) != 0
-            unsafe releaseDescriptor(&mut hooks, rt, move value)
+            drop value
           }
           Option<PropertyDescriptor>.None => ()
         }
@@ -199,8 +204,8 @@ unsafe effect fn enumerate<H: HeapHooks + OwnKeysHooks>(hooks: &mut H,
   // Typed element enumeration includes 0xffffffff; ordinary key-list limits
   // remain unchanged. Native allocation failure, not uint32 wrapping, bounds it.
   let limitAnchor = ()
-  let limitedObject = unsafe HeapCell.payload<ObjectData, ()>(&limitAnchor, node)
-  let typed = limitedObject.classId >= classes.JS_CLASS_UINT8C_ARRAY && limitedObject.classId <= classes.JS_CLASS_FLOAT64_ARRAY
+  let limitedObject = node.data(&limitAnchor)
+  let typed = limitedObject.classId() >= classes.JS_CLASS_UINT8C_ARRAY && limitedObject.classId() <= classes.JS_CLASS_FLOAT64_ARRAY
   drop limitedObject
   let mut limit: usize = 2147483647
   if typed { limit = usize.MAX }
@@ -216,14 +221,15 @@ unsafe effect fn enumerate<H: HeapHooks + OwnKeysHooks>(hooks: &mut H,
   // Initialized null atoms make cleanup safe at every partially filled position.
   while names.length() < total { run names.append(PropertyEnum { atom: 0, isEnumerable: false }) }
   let anchor = ()
-  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  let object = node.data(&anchor)
   let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, object.shape)
   let mut stateAnchor = ()
-  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, rt)
+  let state = realm.runtimeStateMut(&mut stateAnchor)
   let mut numberIndex: usize = 0
   let mut stringIndex = counts.numbers
   let mut symbolIndex = counts.numbers + counts.strings
   let mut needsSort = false
+  let mut previousIndex: u32 = 0
   i = 0
   while i < shape.properties.length() {
     let property = shape.properties.get(i)
@@ -233,7 +239,12 @@ unsafe effect fn enumerate<H: HeapHooks + OwnKeysHooks>(hooks: &mut H,
       if included(kind, enumerable, flags) {
         let mut index: usize = 0
         match state.atoms.arrayIndex(property.atom) {
-          Option<u32>.Some { .. } => { index = numberIndex numberIndex = numberIndex + 1 needsSort = true }
+          Option<u32>.Some { value: key } => {
+            // Keys added in ascending order, the common case, need no sort.
+            if numberIndex != 0 && key < previousIndex { needsSort = true }
+            previousIndex = key
+            index = numberIndex numberIndex = numberIndex + 1
+          }
           Option<u32>.None => {
             if kind == AtomKind.String { index = stringIndex stringIndex = stringIndex + 1 }
             else { index = symbolIndex symbolIndex = symbolIndex + 1 }
@@ -246,6 +257,8 @@ unsafe effect fn enumerate<H: HeapHooks + OwnKeysHooks>(hooks: &mut H,
   }
   if (flags & JS_GPN_STRING_MASK) != 0 {
     let length = indexedLength(object)
+    // Indexed elements follow the shape's numeric keys, so together they need sorting.
+    if length != 0 && numberIndex != 0 { needsSort = true }
     i = 0
     while i < length {
       let atom = run state.atoms.internInt64(usize.toI64(i))
@@ -268,6 +281,39 @@ unsafe effect fn enumerate<H: HeapHooks + OwnKeysHooks>(hooks: &mut H,
   if needsSort && counts.numbers > 1 { sortNumeric(&state.atoms, &mut names, counts.numbers) }
 }
 
+/// Owns one atom reference; dropping it releases the atom. The runtime must outlive the owner.
+pub struct OwnedAtom { runtime: *mut HeapHeader, atom: u32 }
+impl Drop for OwnedAtom {
+  fn drop(self: &mut Self) -> () {
+    let mut anchor = ()
+    let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, self.runtime)
+    state.atoms.release(self.atom)
+  }
+}
+impl OwnedAtom {
+  pub unsafe fn adopt(runtime: *mut HeapHeader, atom: u32) -> OwnedAtom { return OwnedAtom { runtime: runtime, atom: atom } }
+  pub fn get(self: &Self) -> u32 { return self.atom }
+}
+/// Owns a native name list and the atom in each entry; dropping it releases them.
+/// The runtime must outlive the owner.
+pub struct OwnedNames { runtime: *mut HeapHeader, names: List<PropertyEnum> }
+impl Drop for OwnedNames {
+  fn drop(self: &mut Self) -> () {
+    let mut anchor = ()
+    let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, self.runtime)
+    let mut i: usize = 0
+    while i < self.names.length() { state.atoms.release(self.names.get(i).atom) i = i + 1 }
+  }
+}
+impl OwnedNames {
+  pub unsafe fn adopt(runtime: *mut HeapHeader, names: List<PropertyEnum>) -> OwnedNames { return OwnedNames { runtime: runtime, names: move names } }
+  pub fn length(self: &Self) -> usize { return self.names.length() }
+  pub fn get(self: &Self, index: usize) -> PropertyEnum { return self.names.get(index) }
+  /// Changes only an entry's enumerable flag; the atom and its count stay as they are.
+  pub fn setEnumerable(self: &mut Self, index: usize, enumerable: bool) -> () {
+    let mut entry = self.names.get(index) entry.isEnumerable = enumerable self.names.set(index, entry)
+  }
+}
 // Consumes the native list and every owned atom; runtime must still be live.
 pub unsafe fn releaseNames(runtime: *mut HeapHeader, names: List<PropertyEnum>) -> () {
   let mut anchor = ()
@@ -275,16 +321,15 @@ pub unsafe fn releaseNames(runtime: *mut HeapHeader, names: List<PropertyEnum>) 
   let mut i: usize = 0
   while i < names.length() { state.atoms.release(names.get(i).atom) i = i + 1 }
 }
-pub unsafe effect fn getOwnPropertyNames<H: HeapHooks + OwnKeysHooks>(hooks: &mut H,
-  context: *mut HeapHeader, object: Value, flags: u32) -> List<PropertyEnum>
-  ! OutOfMemoryError | OwnKeysError | JsException | StringLengthError ? &mut Allocator {
-  let node = match object { Value.Object { reference } => reference _ => { fail OwnKeysError.NotObject } }
-  let rt = unsafe runtime.contextRuntime(context)
+pub effect fn getOwnPropertyNames<'a, 'b, H: HeapHooks + OwnKeysHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, flags: u32) -> List<PropertyEnum>
+  ! OutOfMemoryError | OwnKeysError | JsException | StringLengthError ? &mut Allocator { let context = realm.context()
+  let node = match object.view() { ValueBits.Object { reference } => reference _ => { fail OwnKeysError.NotObject } }
+  let rt = realm.runtime()
   unsafe HeapCell.retain(context)
   unsafe HeapCell.retain(node)
   let mut names = List<PropertyEnum>.make()
   let mut exotic = List<PropertyEnum>.make()
-  let result = run Effect.result(unsafe enumerate(&mut hooks, context, rt, node, flags, &mut names, &mut exotic))
+  let result = run Effect.result(enumerate(&mut hooks, realm, unsafe ObjectRef.lend(&object, node), flags, &mut names, &mut exotic))
   unsafe releaseNames(rt, move exotic)
   unsafe gc.releaseHeader(&mut hooks, rt, node)
   unsafe gc.releaseHeader(&mut hooks, rt, context)

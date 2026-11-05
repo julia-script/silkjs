@@ -6,15 +6,20 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.core.option { Option }
-import silk.collections.list { List }
+
 import silk.mem.pointer { Pointer }
 import silk.mem.layout { Layout }
 import silk.num.f64
 import silk.num.i32
 import silk.num.usize
 import runtime_memory { AllocationObserver }
-import js_heap { HeapCell, HeapHeader, HeapKind }
-import js_value { Value }
+import js_heap { HeapCell, HeapHeader, HeapKind, CellRef }
+import js_object_ref { ObjectRef }
+import silk.core.ownership { Copy }
+import js_owned_value { Value, ValueList, ValueRef, lendBits, lendFor, immediateRef }
+import js_value { ValueBits }
+import js_intl_realm as ops
+import js_realm { Realm, lendRealm, Arguments, lendArguments }
 import js_core_types { RuntimeState, ObjectData, ObjectPayload, ObjectPayloadFamily, NativeErrorKind, FrameSlots, JS_CALL_FLAG_CONSTRUCTOR }
 import js_gc { HeapHooks, Tracer }
 import js_gc as gc
@@ -39,11 +44,11 @@ import native_stack { currentFrameAddress }
 pub struct BoundFunctionData {
   pub target: Value,
   pub boundThis: Value,
-  pub arguments: List<Value>
+  pub arguments: ValueList
 }
 fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
-fn reference(input: Value) -> *mut HeapHeader {
-  return match input { Value.Object { reference } => reference _ => invariant() }
+fn reference(input: ValueBits) -> *mut HeapHeader {
+  return match input { ValueBits.Object { reference } => reference _ => invariant() }
 }
 unsafe fn storage(object: *mut HeapHeader) -> ?*mut HeapHeader {
   let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
@@ -53,20 +58,36 @@ unsafe fn storage(object: *mut HeapHeader) -> ?*mut HeapHeader {
     _ => invariant()
   }
 }
-// Borrowed target for instanceof and realm traversal, not an owning public result.
-pub unsafe fn target(function: Value) -> Value {
-  let node = match Pointer.nonNullMut<HeapHeader>(unsafe storage(reference(function))) {
-    Option<*mut HeapHeader>.Some { value } => value _ => invariant()
+/// A bound function's native record, lent for as long as the function object is.
+pub struct Bound<'a> { data: CellRef<BoundFunctionData> }
+impl<'a> Copy for Bound<'a> {}
+impl<'a> Bound<'a> {
+  /// The record of `function`, which must be a bound function whose record is attached.
+  pub fn of(function: ValueRef<'a>) -> Bound<'a> {
+    let anchor = () let data = ObjectRef.of(function).data(&anchor)
+    let node = match &data.payload {
+      ObjectPayload.Opaque { family: ObjectPayloadFamily.BoundFunction, reference } => reference
+      _ => Pointer.null<HeapHeader>()
+    }
+    return match Pointer.nonNullMut<HeapHeader>(node) {
+      Option<*mut HeapHeader>.Some { value } => Bound<'a> { data: unsafe CellRef<BoundFunctionData>.of(value) }
+      _ => invariant()
+    }
   }
-  let anchor = () let data = unsafe HeapCell.payload<BoundFunctionData, ()>(&anchor, node)
-  return data.target
+  /// The target, owned by the record until the function is finalized.
+  pub fn target(self: Bound<'a>) -> ValueRef<'a> { let anchor = () return self.data.get(&anchor).target.borrow() }
+  pub fn boundThis(self: Bound<'a>) -> ValueRef<'a> { let anchor = () return self.data.get(&anchor).boundThis.borrow() }
+  pub fn count(self: Bound<'a>) -> usize { let anchor = () return self.data.get(&anchor).arguments.length() }
+  pub fn argument(self: Bound<'a>, index: usize) -> ValueRef<'a> { let anchor = () return self.data.get(&anchor).arguments.borrow(index) }
 }
+/// Lent target for instanceof and realm traversal, not an owning result.
+pub fn target<'b>(function: ValueRef<'b>) -> ValueRef<'b> { return Bound.of(function).target() }
 pub unsafe fn mark(object: *mut HeapHeader, tracer: &mut Tracer) -> () {
   let node = match Pointer.nonNullMut<HeapHeader>(unsafe storage(object)) {
     Option<*mut HeapHeader>.Some { value } => value _ => { return () }
   }
   let anchor = () let data = unsafe HeapCell.payload<BoundFunctionData, ()>(&anchor, node)
-  unsafe tracer.value(data.target) unsafe tracer.value(data.boundThis)
+  unsafe tracer.value(data.target.view()) unsafe tracer.value(data.boundThis.view())
   let mut i: usize = 0
   while i < data.arguments.length() { unsafe tracer.value(data.arguments.get(i)) i = i + 1 }
 }
@@ -77,54 +98,47 @@ pub unsafe fn finalize<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, object:
   // Detach before releasing any child: child finalizers may observe this object.
   let mut anchor = () let objectData = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, object)
   objectData.payload = ObjectPayload.Empty drop objectData
-  let data = unsafe HeapCell.payloadMut<BoundFunctionData, ()>(&mut anchor, node)
-  let function = data.target let receiver = data.boundThis
-  data.target = Value.Undefined data.boundThis = Value.Undefined
-  let arguments = Intrinsic.replace(data.arguments, List<Value>.make()) drop data
+  // Destroying the payload drops the target, receiver and bound arguments.
   unsafe HeapCell.destroy<BoundFunctionData>(node)
-  unsafe gc.release(&mut hooks, rt, function) unsafe gc.release(&mut hooks, rt, receiver)
-  let mut i: usize = 0
-  while i < arguments.length() { unsafe gc.release(&mut hooks, rt, arguments.get(i)) i = i + 1 }
 }
-unsafe effect fn materialize<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader,
-  error: OutOfMemoryError | StringLengthError | BigIntError | JsException) -> Value ! JsException ? &mut Allocator {
+effect fn materialize<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
+  error: OutOfMemoryError | StringLengthError | BigIntError | JsException) -> ValueBits ! JsException ? &mut Allocator {
   match move error {
-    OutOfMemoryError allocation => { return run unsafe hooks.throwOutOfMemory(context) }
-    StringLengthError length => { return run unsafe hooks.throwError(context, NativeErrorKind.Internal, b"string too long") }
+    OutOfMemoryError allocation => { return run hooks.throwOutOfMemory(realm) }
+    StringLengthError length => { return run hooks.throwError(realm, NativeErrorKind.Internal, b"string too long") }
     BigIntError impossible => invariant()
     JsException signal => { fail move signal }
   }
 }
-effect fn exceptionValue(error: JsException) -> Value { drop error return Value.Exception }
-unsafe effect fn define<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,
-  context: *mut HeapHeader, object: Value, atom: u32, input: Value) -> Value ! JsException ? &mut Allocator {
-  let result = run Effect.result(unsafe properties.definePropertyValue(&mut hooks, context, object, atom, input, 1))
+effect fn exceptionValue(error: JsException) -> ValueBits { drop error return ValueBits.Exception }
+unsafe effect fn define<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, atom: u32, input: ValueBits) -> ValueBits ! JsException ? &mut Allocator {
+  let result = run Effect.result(properties.definePropertyValue(&mut hooks, realm, object, atom, unsafe Value.adoptBits(input), 1))
   match move result {
     Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { .. } => ()
     Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => {
-      return run unsafe materialize(&mut hooks, context, move error)
+      return run materialize(&mut hooks, realm, move error)
     }
   }
-  return Value.Undefined
+  return ValueBits.Undefined
 }
-fn adjustedLength(input: Value, count: usize) -> Value {
+fn adjustedLength(input: ValueBits, count: usize) -> ValueBits {
   match input {
-    Value.Int { value } => {
-      if value <= 0 || i32.toUsize(value) <= count { return Value.Int { value: 0 } }
-      return Value.Int { value: value - usize.toI32(count) }
+    ValueBits.Int { value } => {
+      if value <= 0 || i32.toUsize(value) <= count { return ValueBits.Int { value: 0 } }
+      return ValueBits.Int { value: value - usize.toI32(count) }
     }
-    Value.Float64 { value } => {
+    ValueBits.Float64 { value } => {
       let mut number = 0.0
       if !f64.isNaN(value) {
         number = f64.trunc(value)
         if number <= usize.toF64(count) { number = 0.0 } else { number = number - usize.toF64(count) }
       }
-      return Value.number(number)
+      return ValueBits.number(number)
     }
-    _ => { return Value.Int { value: 0 } }
+    _ => { return ValueBits.Int { value: 0 } }
   }
 }
-effect fn prefixedName(input: Value) -> Value ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+effect fn prefixedName(input: ValueBits) -> ValueBits ! OutOfMemoryError | StringLengthError ? &mut Allocator {
   // Own the getter result through every builder failure, without converting
   // symbols, objects or other nonstrings. UTF16 units, including surrogates, stay.
   let owner = StringOwner.adopt(input)
@@ -133,135 +147,121 @@ effect fn prefixedName(input: Value) -> Value ! OutOfMemoryError | StringLengthE
   run builder.appendLatin1(b"bound ") run builder.append(input)
   return run builder.finish()
 }
-unsafe effect fn decorate<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,
-  context: *mut HeapHeader, object: Value, function: Value, count: usize) -> ()
+effect fn decorate<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, function: ValueRef<'b>, count: usize) -> ()
   ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
-  let rt = unsafe runtime.contextRuntime(context)
-  let present = run unsafe descriptors.hasOwnProperty(&mut hooks, context, function, atoms.JS_ATOM_length)
-  let mut length = Value.Int { value: 0 }
+  let present = run descriptors.hasOwnProperty(&mut hooks, realm, function, atoms.JS_ATOM_length)
+  let mut length = ValueBits.Int { value: 0 }
   if present {
-    let input = run unsafe hooks.getProperty(context, function, atoms.JS_ATOM_length)
-    length = adjustedLength(input, count)
-    unsafe gc.release(&mut hooks, rt, input)
+    let input = unsafe Value.adoptBits(run hooks.getProperty(realm, function.borrow(), atoms.JS_ATOM_length))
+    length = adjustedLength(input.view(), count)
   }
   // C deliberately ignores definition errors but continues to run the name getter.
-  let ignoredLength = run Effect.catch<JsException>(unsafe define(&mut hooks, context, object, atoms.JS_ATOM_length, length), exceptionValue)
-  let mut name = run unsafe hooks.getProperty(context, function, atoms.JS_ATOM_name)
+  let ignoredLength = run Effect.catch<JsException>(unsafe define(&mut hooks, realm, object, atoms.JS_ATOM_length, length), exceptionValue)
+  let mut name = run hooks.getProperty(realm, function.borrow(), atoms.JS_ATOM_name)
   if !name.isString() {
-    unsafe gc.release(&mut hooks, rt, name)
-    let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+    drop unsafe Value.adoptBits(name)
+    let anchor = () let state = realm.runtimeState(&anchor)
     name = run state.atoms.toValue(atoms.JS_ATOM_empty_string, true)
   }
   let prefixed = run prefixedName(name)
-  let ignoredName = run Effect.catch<JsException>(unsafe define(&mut hooks, context, object, atoms.JS_ATOM_name, prefixed), exceptionValue)
+  let ignoredName = run Effect.catch<JsException>(unsafe define(&mut hooks, realm, object, atoms.JS_ATOM_name, prefixed), exceptionValue)
 }
-unsafe effect fn allocatePayload(function: Value, arguments: &FrameSlots) -> *mut HeapHeader ! OutOfMemoryError ? &mut Allocator {
-  let mut values = List<Value>.make()
+unsafe effect fn allocatePayload(function: ValueBits, arguments: &FrameSlots) -> *mut HeapHeader ! OutOfMemoryError ? &mut Allocator {
+  let mut values = ValueList.make()
   let mut count: usize = 0 if arguments.length() != 0 { count = arguments.length() - 1 }
   run values.reserveExact(count)
   let mut i: usize = 0
-  while i < count { run values.append(unsafe arguments.get(i + 1)) i = i + 1 }
-  let mut receiver = Value.Undefined if arguments.length() != 0 { receiver = unsafe arguments.get(0) }
-  // No JS edge is owned until all native allocation succeeds.
-  let node = run HeapCell.allocate(HeapKind.Auxiliary, BoundFunctionData { target: function, boundThis: receiver, arguments: move values })
-  let retainedFunction = unsafe function.retained() let retainedReceiver = unsafe receiver.retained()
-  i = 0 while i < count { let input = unsafe arguments.get(i + 1) let retained = unsafe input.retained() i = i + 1 }
-  return node
+  while i < count { run values.append(unsafe Value.retain(unsafe arguments.get(i + 1))) i = i + 1 }
+  let mut receiver = ValueBits.Undefined if arguments.length() != 0 { receiver = unsafe arguments.get(0) }
+  // A failed allocation drops the payload, which gives every count back.
+  return run HeapCell.allocate(HeapKind.Auxiliary, BoundFunctionData { target: unsafe Value.retain(function),
+    boundThis: unsafe Value.retain(receiver), arguments: move values })
 }
-pub unsafe effect fn bind<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + PrototypeHooks>(
-  hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, function: Value, arguments: &FrameSlots) -> Value
+pub unsafe effect fn bind<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + PrototypeHooks>(
+  hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, function: ValueRef<'b>, arguments: &FrameSlots) -> ValueBits
   ! JsException ? &mut Allocator {
-  if !unsafe hooks.isCallable(context, function) { return run unsafe hooks.throwError(context, NativeErrorKind.Type, b"not a function") }
-  let result = run Effect.result(unsafe create(&mut hooks, memory, context, function, arguments))
+  if !hooks.isCallable(realm, function.borrow()) { return run hooks.throwError(realm, NativeErrorKind.Type, b"not a function") }
+  let result = run Effect.result(unsafe create(&mut hooks, memory, realm, function, arguments))
   return match move result {
-    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Success { value } => value
-    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => run unsafe materialize(&mut hooks, context, move error)
+    Result<ValueBits, OutOfMemoryError | StringLengthError | JsException>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => run materialize(&mut hooks, realm, move error)
   }
 }
-unsafe effect fn create<H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + PrototypeHooks>(
-  hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, function: Value, arguments: &FrameSlots) -> Value
+unsafe effect fn create<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + PrototypeHooks>(
+  hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, function: ValueRef<'b>, arguments: &FrameSlots) -> ValueBits
   ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
-  let rt = unsafe runtime.contextRuntime(context)
-  let prototype = run unsafe prototypes.getPrototype(&mut hooks, context, function)
-  let allocated = run Effect.result(unsafe objects.withPrototypeClass(&mut hooks, memory, context, prototype, classes.JS_CLASS_BOUND_FUNCTION))
+  let prototype = run prototypes.prototypeOf(&mut hooks, realm, function)
+  let allocated = run Effect.result(objects.newWithPrototypeClass(&mut hooks, memory, realm, prototype.borrow(), classes.JS_CLASS_BOUND_FUNCTION))
   let object = match move allocated {
-    Result<Value, OutOfMemoryError>.Success { value } => value
+    Result<Value, OutOfMemoryError>.Success { value } => move value
     Result<Value, OutOfMemoryError>.Failure { error } => {
-      let pending = run Effect.catch<JsException>(unsafe materialize(&mut hooks, context, move error), exceptionValue)
-      unsafe gc.release(&mut hooks, rt, prototype)
+      let pending = run Effect.catch<JsException>(materialize(&mut hooks, realm, move error), exceptionValue)
       fail JsException {}
     }
   }
-  unsafe gc.release(&mut hooks, rt, prototype)
-  let anchor = () let source = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(function))
-  let constructor = source.isConstructor drop source
-  let mut mutableAnchor = () let output = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut mutableAnchor, reference(object))
-  output.isConstructor = constructor drop output
-  let payload = run Effect.result(unsafe allocatePayload(function, arguments))
+  drop prototype
+  let anchor = () let constructor = ObjectRef.of(function).data(&anchor).isConstructor()
+  let held = ObjectRef.of(object.borrow())
+  let mut mutableAnchor = () held.dataMut(&mut mutableAnchor).setIsConstructor(constructor)
+  let payload = run Effect.result(unsafe allocatePayload(function.view(), arguments))
   match move payload {
     Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => {
-      let pending = run Effect.catch<JsException>(unsafe materialize(&mut hooks, context, move error), exceptionValue)
-      unsafe gc.release(&mut hooks, rt, object) fail JsException {}
+      let pending = run Effect.catch<JsException>(materialize(&mut hooks, realm, move error), exceptionValue)
+      fail JsException {}
     }
     Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => {
-      let installed = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut mutableAnchor, reference(object))
-      installed.payload = ObjectPayload.Opaque { family: ObjectPayloadFamily.BoundFunction, reference: value }
+      let installed = held.dataMut(&mut mutableAnchor) installed.payload = ObjectPayload.Opaque { family: ObjectPayloadFamily.BoundFunction, reference: value }
     }
   }
   let mut count: usize = 0 if arguments.length() != 0 { count = arguments.length() - 1 }
-  let decorated = run Effect.result(unsafe decorate(&mut hooks, context, object, function, count))
+  let decorated = run Effect.result(decorate(&mut hooks, realm, object.borrow(), function, count))
   match move decorated {
-    Result<(), OutOfMemoryError | StringLengthError | JsException>.Success { .. } => { return object }
+    Result<(), OutOfMemoryError | StringLengthError | JsException>.Success { .. } => { return object.intoBits() }
     Result<(), OutOfMemoryError | StringLengthError | JsException>.Failure { error } => {
-      let pending = run Effect.catch<JsException>(unsafe materialize(&mut hooks, context, move error), exceptionValue)
-      unsafe gc.release(&mut hooks, rt, object) fail JsException {}
+      let pending = run Effect.catch<JsException>(materialize(&mut hooks, realm, move error), exceptionValue)
+      fail JsException {}
     }
   }
 }
-pub unsafe effect fn call<H: CoercionHooks + CallHooks>(hooks: &mut H, context: *mut HeapHeader,
-  function: Value, receiver: Value, arguments: &FrameSlots, flags: u32) -> Value ! JsException ? &mut Allocator {
-  let node = match Pointer.nonNullMut<HeapHeader>(unsafe storage(reference(function))) {
-    Option<*mut HeapHeader>.Some { value } => value _ => invariant()
-  }
-  let anchor = () let data = unsafe HeapCell.payload<BoundFunctionData, ()>(&anchor, node)
-  let count = data.arguments.length() let callee = data.target let boundThis = data.boundThis drop data
-  let rt = unsafe runtime.contextRuntime(context)
+pub effect fn call<'a, 'b, H: CoercionHooks + CallHooks>(hooks: &mut H, realm: Realm<'a>,
+  function: ValueRef<'b>, receiver: ValueRef<'b>, args: Arguments<'a>, flags: u32) -> ValueBits ! JsException ? &mut Allocator { let arguments = args.slots()
+  let record = Bound.of(function)
+  let count = record.count() let callee = record.target() let boundThis = record.boundThis()
+  let rt = realm.runtime()
   if arguments.length() > 2147483647 || count > 2147483647 - arguments.length() {
-    return run unsafe hooks.throwError(context, NativeErrorKind.Internal, b"stack overflow")
+    return run ops.throwError(&mut hooks,realm, NativeErrorKind.Internal, b"stack overflow")
   }
   let total = count + arguments.length()
-  if unsafe runtime.checkStackOverflow(rt, currentFrameAddress(), total * Layout.of<Value>().bytes, true) {
-    return run unsafe hooks.throwError(context, NativeErrorKind.Internal, b"stack overflow")
+  if unsafe runtime.checkStackOverflow(rt, currentFrameAddress(), total * Layout.of<ValueBits>().bytes, true) {
+    return run ops.throwError(&mut hooks,realm, NativeErrorKind.Internal, b"stack overflow")
   }
   let constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0
   let mut newTarget = receiver
-  if constructor && receiver.isObject() && Pointer.address(reference(receiver)) == Pointer.address(reference(function)) { newTarget = callee }
+  if constructor && receiver.view().isObject() && Pointer.address(reference(receiver.view())) == Pointer.address(reference(function.view())) { newTarget = callee }
   if count == 0 {
-    let result = run Effect.result(unsafe invoke(&mut hooks, context, callee, boundThis, newTarget, arguments, constructor))
+    let result = run Effect.result(invoke(&mut hooks, realm, callee, boundThis, newTarget, args, constructor))
     return match move result {
-      Result<Value, OutOfMemoryError | JsException>.Success { value } => value
-      Result<Value, OutOfMemoryError | JsException>.Failure { error } => run unsafe materialize(&mut hooks, context, move error)
+      Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value
+      Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => run materialize(&mut hooks, realm, move error)
     }
   }
-  let buffer = unsafe Intrinsic.pointerRequalify<[*]mut Value, *mut Value>(unsafe Intrinsic.stackAllocate<Value>(total))
-  let many = unsafe Pointer.assumeManyMut<Value>(buffer)
-  let payload = unsafe HeapCell.payload<BoundFunctionData, ()>(&anchor, node)
+  let buffer = unsafe Intrinsic.pointerRequalify<[*]mut ValueBits, *mut ValueBits>(unsafe Intrinsic.stackAllocate<ValueBits>(total))
+  let many = unsafe Pointer.assumeManyMut<ValueBits>(buffer)
   let mut i: usize = 0
-  while i < count { unsafe Pointer.write<Value>(unsafe Pointer.atMut<Value>(many, i), payload.arguments.get(i)) i = i + 1 }
-  drop payload
+  while i < count { unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(many, i), record.argument(i).view()) i = i + 1 }
   i = 0 while i < arguments.length() {
-    unsafe Pointer.write<Value>(unsafe Pointer.atMut<Value>(many, count + i), unsafe arguments.get(i)) i = i + 1
+    unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(many, count + i), unsafe arguments.get(i)) i = i + 1
   }
-  let slots = FrameSlots.Borrowed { data: buffer, length: total }
-  let result = run Effect.result(unsafe invoke(&mut hooks, context, callee, boundThis, newTarget, &slots, constructor))
+  let slots = FrameSlots { data: buffer, count: total }
+  let result = run Effect.result(invoke(&mut hooks, realm, callee, boundThis, newTarget, unsafe lendArguments(&slots), constructor))
   return match move result {
-    Result<Value, OutOfMemoryError | JsException>.Success { value } => value
-    Result<Value, OutOfMemoryError | JsException>.Failure { error } => run unsafe materialize(&mut hooks, context, move error)
+    Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => run materialize(&mut hooks, realm, move error)
   }
 }
-unsafe effect fn invoke<H: CallHooks>(hooks: &mut H, context: *mut HeapHeader, function: Value,
-  receiver: Value, newTarget: Value, arguments: &FrameSlots, constructor: bool) -> Value
+effect fn invoke<'a, 'b, 'c, H: CallHooks>(hooks: &mut H, realm: Realm<'a>, function: ValueRef<'b>,
+  receiver: ValueRef<'b>, newTarget: ValueRef<'b>, arguments: Arguments<'c>, constructor: bool) -> ValueBits
   ! OutOfMemoryError | JsException ? &mut Allocator {
-  if constructor { return run unsafe hooks.construct(context, function, newTarget, arguments) }
-  return run unsafe hooks.callArguments(context, function, receiver, arguments)
+  if constructor { return run hooks.construct(realm, function.borrow(), newTarget.borrow(), arguments) }
+  return run hooks.callArguments(realm, function.borrow(), receiver.borrow(), arguments)
 }

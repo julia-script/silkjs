@@ -1,32 +1,35 @@
 //! Stable-frame layout, initialization and teardown for JS_CallInternal.
 //! Native stack allocation itself stays in the interpreter entry function: a
 //! helper must never return alloca storage from its own native activation.
+import silk.num.u8
 import silk.mem.layout { Layout }
 import silk.core.option { Option }
 import silk.mem.pointer { Pointer }
 import silk.num.u16
 import silk.num.usize
 import js_heap { HeapCell, HeapHeader }
-import js_value { Value }
-import js_core_types { FunctionBytecode, ObjectData, ObjectPayload, FrameSlots, FrameReferences, StackFrame, RuntimeState }
+import js_value { ValueBits }
+import js_core_types { NO_SP, FunctionBytecode, ObjectData, ObjectPayload, FrameSlots, FrameReferences, StackFrame, RuntimeState }
 import js_gc { HeapHooks }
 import js_gc as gc
-import js_vm_state { Machine }
+import js_vm_state { Machine, copyCell }
+import js_debugger as debugger
+import js_debugger_types { Activation as DebugActivation }
 
 pub const COPY_ARGUMENTS: u32 = 2
 pub struct Description {
   pub bytecode: *mut HeapHeader,
   pub realm: *mut HeapHeader,
   pub code: *const u8,
-  pub constants: *const Value,
+  pub constants: *const ValueBits,
   pub closureReferences: *const ?*mut HeapHeader,
   pub arguments: usize,
   pub locals: usize,
   pub stack: usize,
   pub references: usize,
   pub mode: u8,
-}
-pub struct StorageLayout {
+  /// Storage layout for an entry with actualArguments and flags: copied
+  /// arguments, locals and stack, then the reference cache rounded to slots.
   pub copiedArguments: usize,
   pub values: usize,
   pub allocationSlots: usize,
@@ -35,9 +38,10 @@ pub struct StorageLayout {
 
 /// function is a rooted, fully linked BytecodeFunction with nonempty verified code.
 /// Empty-table pointers are aligned non-null sentinels and are never dereferenced.
-pub unsafe fn describe(function: Value, emptyValue: *mut Value,
-  emptyReferences: *mut ?*mut HeapHeader) -> Description {
-  let object = match function { Value.Object { reference } => reference _ => trap() }
+@inlineAlways
+pub unsafe fn describe(function: ValueBits, emptyValue: *mut ValueBits,
+  emptyReferences: *mut ?*mut HeapHeader, actualArguments: usize, flags: u32) -> Description {
+  let object = match function { ValueBits.Object { reference } => reference _ => trap() }
   let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
   let mut references = unsafe Intrinsic.pointerRequalify<*mut ?*mut HeapHeader, *const ?*mut HeapHeader>(emptyReferences)
   let mut bytecode = object
@@ -50,92 +54,147 @@ pub unsafe fn describe(function: Value, emptyValue: *mut Value,
   }
   drop data
   let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
-  let mut constants = unsafe Intrinsic.pointerRequalify<*mut Value, *const Value>(emptyValue)
-  if code.constants.length() != 0 { constants = Pointer.fromRef<Value>(&code.constants.asSlice()[0]) }
+  let mut constants = unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(emptyValue)
+  if code.constants.length() != 0 { constants = Pointer.fromRef<ValueBits>(&code.constants.asSlice()[0]) }
+  let arguments = u16.toUsize(code.argumentCount)
+  let locals = u16.toUsize(code.variableCount)
+  let stack = u16.toUsize(code.stackSize)
+  let referenceCount = u16.toUsize(code.varRefCount)
+  let mut copied: usize = 0
+  if actualArguments < arguments || ((flags & COPY_ARGUMENTS) != 0 && !code.borrowsArguments) { copied = arguments }
+  let values = copied + locals + stack
+  let slotBytes = Layout.of<ValueBits>().bytes
+  let referenceBytes = referenceCount * Layout.of<?*mut HeapHeader>().bytes
+  let slots = values + (referenceBytes + slotBytes - 1) / slotBytes
   return Description { bytecode: bytecode, realm: code.realm,
     code: unsafe code.code.pointerAt(0), constants: constants, closureReferences: references,
-    arguments: u16.toUsize(code.argumentCount), locals: u16.toUsize(code.variableCount),
-    stack: u16.toUsize(code.stackSize), references: u16.toUsize(code.varRefCount), mode: code.mode }
+    arguments: arguments, locals: locals, stack: stack, references: referenceCount, mode: code.mode,
+    copiedArguments: copied, values: values, allocationSlots: slots, bytes: slots * slotBytes }
 }
 fn trap() -> never { return Intrinsic.trap("QuickJS invariant violated") }
 
-pub fn layout(description: &Description, actualArguments: usize, flags: u32) -> StorageLayout {
-  let mut copied: usize = 0
-  if actualArguments < description.arguments || (flags & COPY_ARGUMENTS) != 0 { copied = description.arguments }
-  let values = copied + description.locals + description.stack
-  let slotBytes = Layout.of<Value>().bytes
-  let referenceBytes = description.references * Layout.of<?*mut HeapHeader>().bytes
-  let slots = values + (referenceBytes + slotBytes - 1) / slotBytes
-  return StorageLayout { copiedArguments: copied, values: values, allocationSlots: slots, bytes: slots * slotBytes }
-}
-
-/// Returns a borrowed pointer, never an ownership transfer. A mutable use through
-/// an Owned descriptor additionally requires exclusive access to its slot storage.
-pub unsafe fn data(slots: &FrameSlots, empty: *mut Value) -> *mut Value {
+/// Returns a borrowed pointer, never an ownership transfer.
+pub unsafe fn data(slots: &FrameSlots, empty: *mut ValueBits) -> *mut ValueBits {
   if slots.length() == 0 { return empty }
-  return match &slots.* {
-    FrameSlots.Borrowed { data: pointer, .. } => pointer
-    FrameSlots.Owned { slots: owned } => unsafe Intrinsic.pointerRequalify<*const Value, *mut Value>(Pointer.fromRef<Value>(&owned.view()[0]))
-  }
+  return slots.data
 }
 
-/// storage has allocationSlots aligned Value cells; stack capacity remains raw.
-/// The reference cache occupies the rounded tail, aligned by Value's pointer arm.
-pub unsafe fn initialize(description: &Description, sizes: &StorageLayout, storage: *mut Value,
-  function: Value, originalArguments: &FrameSlots, previous: ?*mut StackFrame) -> StackFrame {
-  let many = unsafe Pointer.assumeManyMut<Value>(storage)
+/// storage has allocationSlots aligned ValueBits cells; stack capacity remains raw.
+/// The reference cache occupies the rounded tail, aligned by ValueBits's pointer arm.
+/// The entry owner keeps Entry address-stable for the whole dispatch and points
+/// machine.frame at entry.frame before publishing it.
+pub struct Entry {
+  pub frame: StackFrame,
+  pub machine: Machine,
+}
+@inlineAlways
+pub unsafe fn enter(description: &Description, storage: *mut ValueBits,
+  function: ValueBits, originalArguments: &FrameSlots, previous: ?*mut StackFrame, runtime: *mut HeapHeader,
+  callerContext: *mut HeapHeader, receiver: ValueBits, newTarget: ValueBits, empty: *mut ValueBits) -> Entry {
+  let views = unsafe prepare(description, storage, originalArguments, empty)
+  let mut frame = stackFrame(description, &views, function, previous)
+  frame.thisValue = receiver frame.newTarget = newTarget
+  return Entry { frame: move frame,
+    machine: calleeMachine(description, &views, runtime, callerContext, function,
+      unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut StackFrame>(storage), Pointer.fromRef<FrameSlots>(originalArguments),
+      originalArguments.length(), receiver, newTarget, Pointer.null<u8>()) }
+}
+struct Views {
+  arguments: *mut ValueBits,
+  count: usize,
+  locals: *mut ValueBits,
+  localView: *mut ValueBits,
+  stack: *mut ValueBits,
+  stackView: *mut ValueBits,
+  references: *mut ?*mut HeapHeader,
+}
+/// Copies or fills the arguments, clears locals and the reference cache in storage.
+@inlineAlways
+unsafe fn prepare(description: &Description, storage: *mut ValueBits, originalArguments: &FrameSlots,
+  empty: *mut ValueBits) -> Views {
+  let many = unsafe Pointer.assumeManyMut<ValueBits>(storage)
+  let copied = description.copiedArguments
+  let originalCount = originalArguments.length()
+  let mut present = originalCount
+  if copied < present { present = copied }
+  let source = unsafe Pointer.assumeManyMut<ValueBits>(unsafe data(originalArguments, empty))
   let mut index: usize = 0
-  while index < sizes.copiedArguments {
-    let mut value = Value.Undefined
-    if index < originalArguments.length() {
-      let original = unsafe originalArguments.get(index)
-      value = unsafe original.retained()
-    }
-    unsafe Pointer.write<Value>(unsafe Pointer.atMut<Value>(many, index), value)
+  while index < present {
+    let from = unsafe Pointer.atMut<ValueBits>(source, index)
+    let value = unsafe Pointer.read<ValueBits>(from)
+    drop unsafe value.retained()
+    unsafe copyCell(from, unsafe Pointer.atMut<ValueBits>(many, index))
     index = index + 1
   }
-  let locals = unsafe Pointer.atMut<Value>(many, sizes.copiedArguments)
+  while index < copied {
+    unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(many, index), ValueBits.Undefined)
+    index = index + 1
+  }
+  let localCount = description.locals
+  let locals = unsafe Pointer.atMut<ValueBits>(many, copied)
+  let localMany = unsafe Pointer.assumeManyMut<ValueBits>(locals)
   index = 0
-  while index < description.locals {
-    unsafe Pointer.write<Value>(unsafe Pointer.atMut<Value>(unsafe Pointer.assumeManyMut<Value>(locals), index), Value.Undefined)
+  while index < localCount {
+    unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(localMany, index), ValueBits.Undefined)
     index = index + 1
   }
-  let stack = unsafe Pointer.atMut<Value>(many, sizes.copiedArguments + description.locals)
-  let references = unsafe Intrinsic.pointerReinterpret<*mut Value, *mut ?*mut HeapHeader>(unsafe Pointer.atMut<Value>(many, sizes.values))
+  let stack = unsafe Pointer.atMut<ValueBits>(many, copied + localCount)
+  let references = unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut ?*mut HeapHeader>(unsafe Pointer.atMut<ValueBits>(many, description.values))
+  let referenceMany = unsafe Pointer.assumeManyMut<?*mut HeapHeader>(references)
   index = 0
   while index < description.references {
-    unsafe Pointer.write<?*mut HeapHeader>(unsafe Pointer.atMut<?*mut HeapHeader>(unsafe Pointer.assumeManyMut<?*mut HeapHeader>(references), index), Pointer.null<HeapHeader>())
+    unsafe Pointer.write<?*mut HeapHeader>(unsafe Pointer.atMut<?*mut HeapHeader>(referenceMany, index), Pointer.null<HeapHeader>())
     index = index + 1
   }
-  let mut arguments = unsafe data(originalArguments, storage)
-  let mut count = originalArguments.length()
-  if sizes.copiedArguments != 0 { arguments = storage count = sizes.copiedArguments }
+  let mut arguments = empty
+  let mut count = originalCount
+  if copied != 0 { arguments = storage count = copied } else if originalCount != 0 { arguments = unsafe data(originalArguments, empty) }
+  let mut localView = empty if localCount != 0 { localView = locals }
+  let mut stackView = empty if description.stack != 0 { stackView = stack }
+  return Views { arguments: arguments, count: count, locals: locals, localView: localView,
+    stack: stack, stackView: stackView, references: references }
+}
+@inlineAlways
+fn stackFrame(description: &Description, views: &Views, function: ValueBits, previous: ?*mut StackFrame) -> StackFrame {
   return StackFrame { previous: previous, asyncOwner: Pointer.null<HeapHeader>(), currentFunction: function,
-    debuggerId: 0,
-    thisValue: Value.Undefined, newTarget: Value.Undefined,
-    arguments: FrameSlots.Borrowed { data: arguments, length: count },
-    locals: FrameSlots.Borrowed { data: locals, length: description.locals },
-    stack: FrameSlots.Borrowed { data: stack, length: description.stack },
-    varRefs: FrameReferences.Borrowed { data: references, length: description.references },
-    currentPc: Option<usize>.some(0), argumentCount: usize.toI32(count), mode: description.mode,
-    stackPointer: Option<usize>.none() }
+    debuggerId: 0, thisValue: ValueBits.Undefined, newTarget: ValueBits.Undefined,
+    arguments: FrameSlots { data: views.arguments, count: views.count },
+    locals: FrameSlots { data: views.locals, count: description.locals },
+    stack: FrameSlots { data: views.stack, count: description.stack },
+    varRefs: FrameReferences { data: views.references, count: description.references },
+    currentPc: 0, argumentCount: usize.toI32(views.count), mode: u8.toU32(description.mode),
+    stackPointer: NO_SP }
+}
+@inlineAlways
+fn calleeMachine(description: &Description, views: &Views, runtime: *mut HeapHeader, callerContext: *mut HeapHeader,
+  function: ValueBits, frame: *mut StackFrame, originalArguments: *const FrameSlots, originalCount: usize,
+  receiver: ValueBits, newTarget: ValueBits, record: ?*mut u8) -> Machine {
+  return Machine { context: description.realm, callerContext: callerContext, runtime: runtime,
+    bytecode: description.bytecode, frame: frame,
+    code: description.code, constants: description.constants, closureReferences: description.closureReferences,
+    originalArguments: originalArguments,
+    arguments: views.arguments, locals: views.localView, stack: views.stackView, thisValue: receiver, newTarget: newTarget,
+    argumentCount: originalCount, ip: description.code, stackTop: views.stackView, record: record }
 }
 
 /// The frame and original argument descriptor must remain address-stable for the
 /// whole dispatch. No projected payload/slot borrow escapes this snapshot.
 pub unsafe fn machine(description: &Description, runtime: *mut HeapHeader, callerContext: *mut HeapHeader,
-  frame: *mut StackFrame, originalArguments: &FrameSlots, receiver: Value, newTarget: Value,
-  empty: *mut Value, pc: usize, sp: usize) -> Machine {
+  frame: *mut StackFrame, originalArguments: &FrameSlots, receiver: ValueBits, newTarget: ValueBits,
+  empty: *mut ValueBits, pc: usize, sp: usize) -> Machine {
   let mut anchor = () let activation = unsafe Pointer.borrowMut<(), StackFrame>(&mut anchor, frame)
   activation.thisValue = receiver
   activation.newTarget = newTarget
+  let stackData = unsafe data(&activation.stack, empty)
   return Machine { context: description.realm, callerContext: callerContext, runtime: runtime,
-    function: activation.currentFunction, bytecode: description.bytecode, frame: frame,
+    bytecode: description.bytecode, frame: frame,
     code: description.code, constants: description.constants, closureReferences: description.closureReferences,
     originalArguments: Pointer.fromRef<FrameSlots>(originalArguments),
     arguments: unsafe data(&activation.arguments, empty), locals: unsafe data(&activation.locals, empty),
-    stack: unsafe data(&activation.stack, empty), thisValue: receiver, newTarget: newTarget,
-    argumentCount: originalArguments.length(), pc: pc, sp: sp }
+    stack: stackData, thisValue: receiver, newTarget: newTarget,
+    argumentCount: originalArguments.length(),
+    ip: unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(description.code), pc),
+    stackTop: unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(stackData), sp), record: Pointer.null<u8>() }
 }
 
 pub unsafe fn publish(runtime: *mut HeapHeader, frame: ?*mut StackFrame) -> () {
@@ -145,22 +204,254 @@ pub unsafe fn publish(runtime: *mut HeapHeader, frame: ?*mut StackFrame) -> () {
 
 /// Detached references retain their values before any activation-owned slot is
 /// released. Runtime frame publication is restored by the entry owner afterward.
-pub unsafe fn release<H: HeapHooks>(hooks: &mut H, description: &Description, sizes: &StorageLayout,
-  activation: &Machine) -> () {
-  if description.references != 0 { unsafe gc.detachFrameReferences(&mut hooks, activation.runtime, activation.frame) }
+@inlineAlways
+pub unsafe fn release<H: HeapHooks>(hooks: &mut H, description: &Description, activation: &Machine) -> () {
+  unsafe releaseSlots(&mut hooks, description.copiedArguments, description.locals, description.references, activation)
+}
+@inlineAlways
+unsafe fn releaseSlots<H: HeapHooks>(hooks: &mut H, copiedArguments: usize, locals: usize, references: usize, activation: &Machine) -> () {
+  if references != 0 { unsafe gc.detachFrameReferences(&mut hooks, activation.runtime, activation.frame) }
   let mut index: usize = 0
-  while index < sizes.copiedArguments {
+  while index < copiedArguments {
     unsafe gc.release(&mut hooks, activation.runtime, unsafe activation.argument(index))
     index = index + 1
   }
   index = 0
-  while index < description.locals {
+  while index < locals {
     unsafe gc.release(&mut hooks, activation.runtime, unsafe activation.local(index))
     index = index + 1
   }
+  // By cell up to the stack top: sp() would divide by the cell size every slot.
+  let end = Pointer.address<ValueBits>(activation.stackTop)
+  let mut cell = activation.stack
+  while Pointer.address<ValueBits>(cell) != end {
+    unsafe gc.release(&mut hooks, activation.runtime, unsafe Pointer.read<ValueBits>(cell))
+    cell = unsafe slotAt(cell, 1)
+  }
+}
+
+/// An inline call frame (js_vm.callInline) at the top of the runtime's call-frame
+/// region: the published StackFrame first, then the callee's Machine, then this
+/// tail, then the frame's slot storage. Records never move while live, and a
+/// frame's address is its record's, so the running machine is found from the
+/// runtime's current frame (innermost).
+pub struct InlineTail {
+  /// The machine to resume when this frame returns.
+  pub caller: *mut Machine,
+  /// The caller's argument operands; the callee machine's originalArguments.
+  pub arguments: FrameSlots,
+  /// The caller's operand cell holding the callee (the receiver for a method
+  /// call), the first operand released when the call completes.
+  pub first: *mut ValueBits,
+  pub observation: DebugActivation,
+}
+@inlineAlways
+fn slotsFor(bytes: usize) -> usize {
+  let slot = Layout.of<ValueBits>().bytes
+  return (bytes + slot - 1) / slot
+}
+@inlineAlways
+fn frameSlots() -> usize { return slotsFor(Layout.of<StackFrame>().bytes) }
+@inlineAlways
+fn machineSlots() -> usize { return slotsFor(Layout.of<Machine>().bytes) }
+/// Region slots taken by a record ahead of its slot storage.
+@inlineAlways
+fn recordSlots() -> usize {
+  return frameSlots() + machineSlots() + slotsFor(Layout.of<InlineTail>().bytes)
+}
+@inlineAlways
+unsafe fn slotAt(base: *mut ValueBits, index: usize) -> *mut ValueBits {
+  return unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(base), index)
+}
+/// Enters function, a rooted BytecodeFunction, in a new inline frame whose
+/// arguments are the caller's count operands. Returns the callee's machine, or
+/// None with nothing changed when the region lacks room.
+/// For a base-class construct call newTarget is new.target and receiver the new
+/// object, owned by the frame from here on (see constructing).
+/// When copy is set, arguments need not outlive the call: the frame takes its own
+/// retained copies of them (an applied array's elements) and the caller's
+/// operands from first on are released as usual when it returns.
+@inlineAlways
+pub unsafe fn enterInline(runtime: *mut HeapHeader, function: ValueBits, arguments: FrameSlots, first: *mut ValueBits,
+  caller: *mut Machine, callerContext: *mut HeapHeader, receiver: ValueBits, newTarget: ValueBits, construct: bool,
+  copy: bool) -> Option<*mut Machine> {
+  let object = match function { ValueBits.Object { reference } => reference _ => trap() }
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  // Empty tables point at the caller's machine: aligned, non-null, never read
+  // and live for the whole call.
+  let empty = unsafe Intrinsic.pointerReinterpret<*mut Machine, *mut ValueBits>(caller)
+  let mut closureReferences = unsafe Intrinsic.pointerRequalify<*mut ?*mut HeapHeader, *const ?*mut HeapHeader>(unsafe Intrinsic.pointerReinterpret<*mut Machine, *mut ?*mut HeapHeader>(caller))
+  let mut bytecode = object
+  match &data.payload {
+    ObjectPayload.BytecodeFunction { function: closure } => {
+      if closure.varRefs.length() != 0 { closureReferences = Pointer.fromRef<?*mut HeapHeader>(&closure.varRefs.asSlice()[0]) }
+      bytecode = closure.bytecode
+    }
+    _ => trap()
+  }
+  drop data
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  let count = arguments.length()
+  let declared = u16.toUsize(code.argumentCount)
+  let localCount = u16.toUsize(code.variableCount)
+  let stackCount = u16.toUsize(code.stackSize)
+  let referenceCount = u16.toUsize(code.varRefCount)
+  let mut copied: usize = 0
+  if count < declared { copied = declared } else if copy { copied = count }
+  let values = copied + localCount + stackCount
+  let slot = Layout.of<ValueBits>().bytes
+  let slots = recordSlots() + values + (referenceCount * Layout.of<?*mut HeapHeader>().bytes + slot - 1) / slot
+  let mut stateAnchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
+  // Without a region both bounds are null, so there is never room.
+  let top = unsafe Intrinsic.pointerRequalify<?*mut ValueBits, *mut ValueBits>(state.callFramesTop)
+  let room = usize.wrappingSubtract(Pointer.address<ValueBits>(unsafe Intrinsic.pointerRequalify<?*mut ValueBits, *mut ValueBits>(state.callFramesEnd)), Pointer.address<ValueBits>(top))
+  if slots > room / slot { return Option<*mut Machine>.none() }
+  state.callFramesTop = unsafe slotAt(top, slots)
+  let previous = state.currentStackFrame
+  let frame = unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut StackFrame>(top)
+  state.currentStackFrame = frame
+  drop state
+  let machine = unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut Machine>(unsafe slotAt(top, frameSlots()))
+  let tail = unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut InlineTail>(unsafe slotAt(top, frameSlots() + machineSlots()))
+  let storage = unsafe slotAt(top, recordSlots())
+  let mut argumentData = empty
+  if count != 0 { argumentData = arguments.data }
+  let mut argumentCount = count
+  if copied != 0 {
+    // Too few arguments (or copy): the frame gets its own copies, padded with undefined.
+    let many = unsafe Pointer.assumeManyMut<ValueBits>(storage)
+    let source = unsafe Pointer.assumeManyMut<ValueBits>(argumentData)
+    let mut index: usize = 0
+    while index < count {
+      let from = unsafe Pointer.atMut<ValueBits>(source, index)
+      let value = unsafe Pointer.read<ValueBits>(from)
+      drop unsafe value.retained()
+      unsafe copyCell(from, unsafe Pointer.atMut<ValueBits>(many, index))
+      index = index + 1
+    }
+    while index < copied { unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(many, index), ValueBits.Undefined) index = index + 1 }
+    argumentData = storage argumentCount = copied
+  }
+  let locals = unsafe slotAt(storage, copied)
+  let mut index: usize = 0
+  while index < localCount { unsafe Pointer.write<ValueBits>(unsafe slotAt(locals, index), ValueBits.Undefined) index = index + 1 }
+  let stack = unsafe slotAt(locals, localCount)
+  let references = unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut ?*mut HeapHeader>(unsafe slotAt(stack, stackCount))
   index = 0
-  while index < activation.sp {
-    unsafe gc.release(&mut hooks, activation.runtime, unsafe Pointer.read<Value>(unsafe activation.slot(index)))
+  while index < referenceCount {
+    unsafe Pointer.write<?*mut HeapHeader>(unsafe Pointer.atMut<?*mut HeapHeader>(unsafe Pointer.assumeManyMut<?*mut HeapHeader>(references), index), Pointer.null<HeapHeader>())
     index = index + 1
   }
+  // Region addresses stay valid for empty tables, so the views need no stand-in.
+  let localView = locals
+  let stackView = stack
+  unsafe Pointer.put<StackFrame>(frame, StackFrame { previous: previous, asyncOwner: Pointer.null<HeapHeader>(), currentFunction: function,
+    debuggerId: 0, thisValue: receiver, newTarget: newTarget,
+    arguments: FrameSlots { data: argumentData, count: argumentCount },
+    locals: FrameSlots { data: locals, count: localCount },
+    stack: FrameSlots { data: stack, count: stackCount },
+    varRefs: FrameReferences { data: references, count: referenceCount },
+    currentPc: 0, argumentCount: usize.toI32(argumentCount), mode: u8.toU32(code.mode),
+    stackPointer: NO_SP })
+  let mut original = arguments
+  if copy { original = FrameSlots { data: storage, count: count } }
+  let ip = unsafe code.code.pointerAt(0)
+  let mut constants = unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(empty)
+  if code.constants.length() != 0 { constants = Pointer.fromRef<ValueBits>(&code.constants.asSlice()[0]) }
+  // callerContext, originalArguments, argumentCount and newTarget are left
+  // unwritten: an inline frame derives them from its tail (callerContextOf etc).
+  let mut calleeAnchor = () let callee = unsafe Pointer.borrowMut<(), Machine>(&mut calleeAnchor, machine)
+  callee.context = code.realm callee.runtime = runtime callee.bytecode = bytecode
+  callee.frame = frame callee.code = ip callee.constants = constants callee.closureReferences = closureReferences
+  callee.arguments = argumentData callee.locals = localView callee.stack = stackView callee.thisValue = receiver
+  callee.ip = ip callee.stackTop = stackView
+  callee.record = unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(unsafe Intrinsic.pointerReinterpret<*mut InlineTail, *mut u8>(tail)), boolToUsize(construct))
+  drop callee
+  drop code
+  let calleeView = unsafe Pointer.borrow<(), Machine>(&anchor, machine)
+  let observation = unsafe debugger.enter(&calleeView)
+  drop calleeView
+  unsafe Pointer.put<InlineTail>(tail, InlineTail { caller: caller, arguments: original, first: first, observation: move observation })
+  let mut debugAnchor = () let debugTail = unsafe Pointer.borrowMut<(), InlineTail>(&mut debugAnchor, tail)
+  let active = Pointer.fromMutRef<DebugActivation>(&mut debugTail.observation)
+  drop debugTail
+  unsafe debugger.publish(runtime, active)
+  return Option<*mut Machine>.some(machine)
+}
+@inlineAlways
+fn boolToUsize(value: bool) -> usize { if value { return 1 } return 0 }
+/// Whether machine runs an inline construct frame: its record pointer is tagged
+/// in bit 0, and its thisValue is the receiver the frame owns.
+@inlineAlways
+pub fn constructing(machine: &Machine) -> bool {
+  return (Pointer.address<u8>(machine.record) & 1) != 0
+}
+/// The tail of the inline frame machine runs; record must be non-null.
+@inlineAlways
+unsafe fn tailOf(machine: &Machine) -> *mut InlineTail {
+  let top = unsafe Intrinsic.pointerReinterpret<*mut StackFrame, *mut ValueBits>(machine.frame)
+  return unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut InlineTail>(unsafe slotAt(top, frameSlots() + machineSlots()))
+}
+/// The realm of the code that called machine's function.
+pub unsafe fn callerContextOf(machine: &Machine) -> *mut HeapHeader {
+  if Pointer.isNull<u8>(machine.record) { return machine.callerContext }
+  let anchor = () let tail = unsafe Pointer.borrow<(), InlineTail>(&anchor, unsafe tailOf(machine))
+  let caller = unsafe Pointer.borrow<(), Machine>(&anchor, tail.caller)
+  return caller.context
+}
+/// The arguments the frame was called with, before any padding copy.
+pub unsafe fn originalArgumentsOf(machine: &Machine) -> *const FrameSlots {
+  if Pointer.isNull<u8>(machine.record) { return machine.originalArguments }
+  let anchor = () let tail = unsafe Pointer.borrow<(), InlineTail>(&anchor, unsafe tailOf(machine))
+  return Pointer.fromRef<FrameSlots>(&tail.arguments)
+}
+pub unsafe fn argumentCountOf(machine: &Machine) -> usize {
+  if Pointer.isNull<u8>(machine.record) { return machine.argumentCount }
+  let anchor = () let tail = unsafe Pointer.borrow<(), InlineTail>(&anchor, unsafe tailOf(machine))
+  return tail.arguments.length()
+}
+/// new.target: an inline construct frame's is the caller operand just above
+/// the constructor (both stay on the caller's stack until the frame returns).
+pub unsafe fn newTargetOf(machine: &Machine) -> ValueBits {
+  if Pointer.isNull<u8>(machine.record) { return machine.newTarget }
+  if !constructing(machine) { return ValueBits.Undefined }
+  let anchor = () let tail = unsafe Pointer.borrow<(), InlineTail>(&anchor, unsafe tailOf(machine))
+  return unsafe Pointer.read<ValueBits>(unsafe slotAt(tail.first, 1))
+}
+pub struct InlineExit {
+  pub caller: *mut Machine,
+  pub first: *mut ValueBits,
+}
+/// Leaves the inline frame machine runs: releases its slots, publishes the frame
+/// below it and pops its record. Returns the caller and its first call operand.
+@inlineAlways
+pub unsafe fn leaveInline<H: HeapHooks>(hooks: &mut H, machine: &Machine) -> InlineExit {
+  // The tail sits at a fixed offset from the frame, so record is only read as a flag.
+  let top = unsafe Intrinsic.pointerReinterpret<*mut StackFrame, *mut ValueBits>(machine.frame)
+  let anchor = () let tail = unsafe Pointer.borrow<(), InlineTail>(&anchor, unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut InlineTail>(unsafe slotAt(top, frameSlots() + machineSlots())))
+  let exit = InlineExit { caller: tail.caller, first: tail.first }
+  unsafe debugger.leave(machine.runtime, &tail.observation)
+  drop tail
+  let frame = unsafe Pointer.borrow<(), StackFrame>(&anchor, machine.frame)
+  let previous = frame.previous
+  let mut copied: usize = 0
+  if Pointer.address<ValueBits>(frame.arguments.data) == Pointer.address<ValueBits>(unsafe slotAt(top, recordSlots())) { copied = frame.arguments.count }
+  let locals = frame.locals.count let references = frame.varRefs.count
+  drop frame
+  unsafe releaseSlots(&mut hooks, copied, locals, references, machine)
+  let mut stateAnchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, machine.runtime)
+  state.currentStackFrame = previous
+  state.callFramesTop = top
+  return move exit
+}
+/// The machine of the innermost frame a dispatch loop over base runs: base, or the
+/// inline frame published above it. A loop's inline frames are the only frames
+/// published above its own while it runs or unwinds.
+@inlineAlways
+pub unsafe fn innermost(base: &mut Machine) -> *mut Machine {
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, base.runtime)
+  let current = state.currentStackFrame drop state
+  if Pointer.address<StackFrame>(current) == Pointer.address<StackFrame>(base.frame) { return Pointer.fromMutRef<Machine>(&mut base) }
+  let frame = match Pointer.nonNullMut<StackFrame>(current) { Option<*mut StackFrame>.Some { value } => value _ => trap() }
+  return unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut Machine>(unsafe slotAt(unsafe Intrinsic.pointerReinterpret<*mut StackFrame, *mut ValueBits>(frame), frameSlots()))
 }

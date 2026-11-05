@@ -7,7 +7,9 @@ import silk.core.result { Result }
 import silk.num.i32
 import silk.num.i64
 import js_heap { HeapCell, HeapHeader }
-import js_value { Value }
+import js_value { ValueBits }
+import js_owned_value { Value, lendBits, immediateRef, ValueRef }
+import js_realm { Realm, lendRealm }
 import js_engine { Engine }
 import js_libc_services { LibcServices }
 import js_libc as libc
@@ -16,196 +18,175 @@ import js_runtime as runtime
 import js_runtime_jobs as jobs
 import js_promise as promise
 import js_exceptions { JsException }
-import js_exceptions as exceptions
 import js_os_events as events
-import js_os_events { ReadWriteHandler, SignalHandler, Timer, Rejection }
+import js_os_events { Entry, ReadWriteHandler, SignalHandler, Timer }
 import js_os_events_platform { PollFd }
 import js_os_events_platform as platform
 import js_os_workers as workers
-import js_os_workers_transport { Pipe }
+import js_os_workers { PortRef }
 
 pub struct UnhandledRejection { pub code: i32 }
-unsafe effect fn reportError<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader) -> () ? &mut Allocator {
-  run unsafe libc.dumpError(&mut engine, context)
+effect fn reportError<'a, 'm>(engine: &mut Engine<'m, LibcServices>, realm: Realm<'a>) -> () ? &mut Allocator {
+  run libc.dumpError(&mut engine, realm)
 }
-unsafe effect fn callHandler<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader, function: Value) -> () ? &mut Allocator {
+effect fn callHandler<'a, 'b, 'm>(engine: &mut Engine<'m, LibcServices>, realm: Realm<'a>, function: ValueRef<'b>) -> () ? &mut Allocator {
   // A callback may clear itself, another descriptor or the entire timer list.
-  let retained = unsafe function.retained()
-  let called = run Effect.result(unsafe promise.call(&mut engine, context, retained, Value.Undefined, &[]))
-  let rt = unsafe runtime.contextRuntime(context)
-  unsafe gc.release(&mut engine, rt, retained)
+  let retained = function.dup()
+  let called = run Effect.result(promise.call(&mut engine, realm, retained.borrow(), immediateRef(ValueBits.Undefined), &[]))
+  drop retained
   match move called {
-    Result<Value, JsException>.Success { value } => {
-      if value.isException() { run unsafe reportError(&mut engine, context) }
-      unsafe gc.release(&mut engine, rt, value)
+    Result<Value, JsException>.Success { value: result } => {
+      if result.view().isException() { run reportError(&mut engine, realm) }
     }
-    Result<Value, JsException>.Failure { .. } => { run unsafe reportError(&mut engine, context) }
+    Result<Value, JsException>.Failure { .. } => { run reportError(&mut engine, realm) }
   }
 }
 // True means one poll turn completed, false means there are no live event sources.
-pub unsafe effect fn poll<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader) -> bool ! OutOfMemoryError ? &mut Allocator {
-  let rt = unsafe runtime.contextRuntime(context) let ts = unsafe events.state(rt)
-  let mut anchor = () let data = unsafe Pointer.borrowMut(&mut anchor, ts)
+pub effect fn poll<'a, 'm>(engine: &mut Engine<'m, LibcServices>, realm: Realm<'a>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = () let data = events.threadMut(realm, &mut anchor)
   if !data.pollingEnabled { return false }
-  let main = Pointer.isNull<Pipe>(data.recvPipe)
+  let main = data.recvPipe.isNone()
   if main { platform.collect(&mut data.signals) }
-  let mut cursor = data.signalHandlers.first drop data
+  let mut signals = data.signalHandlers() drop data
   if main {
-    while let Option<*mut HeapHeader>.Some { value: node } = Pointer.nonNullMut(cursor) {
-      let handler = unsafe HeapCell.payload<SignalHandler, ()>(&anchor, node)
-      let number = handler.number let function = handler.function drop handler
-      let data = unsafe Pointer.borrowMut(&mut anchor, ts) let ready = platform.take(&mut data.signals, number) drop data
-      if ready { run unsafe callHandler(&mut engine, context, function) return true }
-      cursor = unsafe events.next(node)
+    while let Option<Entry<SignalHandler>>.Some { value: handler } = signals {
+      let number = handler.get(&anchor).number
+      let ready = platform.take(&mut events.threadMut(realm, &mut anchor).signals, number)
+      if ready { let function = handler.get(&anchor).function.dup() run callHandler(&mut engine, realm, function.borrow()) return true }
+      signals = handler.next()
     }
   }
-  let liveState = unsafe Pointer.borrow(&anchor, ts)
-  if liveState.readWriteHandlers.isEmpty() && liveState.timers.isEmpty() && Pointer.isNull<HeapHeader>(liveState.workerPortsFirst) { return false }
-  let hasTimers = !liveState.timers.isEmpty() cursor = liveState.timers.first drop liveState
+  let liveState = events.thread(realm, &anchor)
+  let mut timers = liveState.timers()
+  if liveState.readWriteHandlers().isNone() && timers.isNone() && Pointer.isNull<HeapHeader>(liveState.workerPortsFirst) { return false }
+  drop liveState
   let mut minDelay: i32 = -1
-  if hasTimers {
+  if timers.isSome() {
     minDelay = 10000 let now = platform.nowMilliseconds()
-    while let Option<*mut HeapHeader>.Some { value: node } = Pointer.nonNullMut(cursor) {
-      let timer = unsafe HeapCell.payloadMut<Timer, ()>(&mut anchor, node)
-      let delay = i64.wrappingSubtract(timer.timeout, now)
+    while let Option<Entry<Timer>>.Some { value: timer } = timers {
+      let delay = i64.wrappingSubtract(timer.get(&anchor).timeout, now)
       if delay <= 0 {
-        let function = Intrinsic.replace(timer.function, Value.Undefined) drop timer
-        unsafe events.freeTimer(&mut engine, rt, node)
-        run unsafe callHandler(&mut engine, context, function)
-        unsafe gc.release(&mut engine, rt, function)
+        let function = timer.getMut(&mut anchor).function.take()
+        events.removeTimer(&mut engine, realm, timer)
+        run callHandler(&mut engine, realm, function.borrow())
         return true
       }
       if delay < i32.toI64(minDelay) { minDelay = i64.toI32(delay) }
-      drop timer cursor = unsafe events.next(node)
+      timers = timer.next()
     }
   }
-  let pollSetup = unsafe Pointer.borrowMut(&mut anchor, ts) pollSetup.pollFds.clear()
-  cursor = pollSetup.readWriteHandlers.first drop pollSetup
-  while let Option<*mut HeapHeader>.Some { value: node } = Pointer.nonNullMut(cursor) {
-    let handler = unsafe HeapCell.payloadMut<ReadWriteHandler, ()>(&mut anchor, node)
+  let pollSetup = events.threadMut(realm, &mut anchor) pollSetup.pollFds.clear()
+  let mut handlers = pollSetup.readWriteHandlers() drop pollSetup
+  while let Option<Entry<ReadWriteHandler>>.Some { value: handler } = handlers {
+    let record = handler.get(&anchor)
     let mut flags: i16 = 0
-    if !events.null(handler.read) { flags = flags | platform.READABLE }
-    if !events.null(handler.write) { flags = flags | platform.WRITABLE }
-    let fd = handler.fd drop handler
+    if !events.null(record.read.view()) { flags = flags | platform.READABLE }
+    if !events.null(record.write.view()) { flags = flags | platform.WRITABLE }
+    let fd = record.fd drop record
     if flags != 0 {
-      let data = unsafe Pointer.borrowMut(&mut anchor, ts) let index = data.pollFds.length()
+      let data = events.threadMut(realm, &mut anchor) let index = data.pollFds.length()
       run data.pollFds.append(PollFd { fd: fd, events: flags, revents: 0 }) drop data
-      let handler = unsafe HeapCell.payloadMut<ReadWriteHandler, ()>(&mut anchor, node) handler.pollIndex = index
+      let record = handler.getMut(&mut anchor) record.pollIndex = index
     }
-    cursor = unsafe events.next(node)
+    handlers = handler.next()
   }
-  let portsBeforePoll = unsafe Pointer.borrow(&anchor, ts) cursor = portsBeforePoll.workerPortsFirst drop portsBeforePoll
-  while let Option<*mut HeapHeader>.Some { value: node } = Pointer.nonNullMut(cursor) {
-    let fd = unsafe workers.portFd(node)
+  let mut ports = workers.ports(realm)
+  while let Option<PortRef>.Some { value: port } = ports {
+    let fd = port.fd()
     if fd >= 0 {
-      let data = unsafe Pointer.borrowMut(&mut anchor, ts) let index = data.pollFds.length()
+      let data = events.threadMut(realm, &mut anchor) let index = data.pollFds.length()
       run data.pollFds.append(PollFd { fd: fd, events: platform.READABLE, revents: 0 }) drop data
-      unsafe workers.portSetPollIndex(node, index)
+      port.setPollIndex(index)
     }
-    cursor = unsafe workers.portNext(node)
+    ports = port.next()
   }
-  let pollState = unsafe Pointer.borrowMut(&mut anchor, ts)
+  let pollState = events.threadMut(realm, &mut anchor)
   // Signal watchers alone do not keep the source loop alive. When another source
   // is live their kernel queue closes the check-then-sleep race in source signal().
   if main && pollState.signals.fd >= 0 { run pollState.pollFds.append(PollFd { fd: pollState.signals.fd, events: platform.READABLE, revents: 0 }) }
   let ready = platform.poll(&mut pollState.pollFds, minDelay)
-  cursor = pollState.readWriteHandlers.first drop pollState
+  handlers = pollState.readWriteHandlers() drop pollState
   if ready <= 0 { return true }
   // Keep source ordering: descriptors before ports, even if the signal queue woke
   // this poll. The following turn checks pending signals before timers/descriptors.
-  while let Option<*mut HeapHeader>.Some { value: node } = Pointer.nonNullMut(cursor) {
-    let handler = unsafe HeapCell.payload<ReadWriteHandler, ()>(&anchor, node)
-    let index = handler.pollIndex let read = handler.read let write = handler.write drop handler
-    let data = unsafe Pointer.borrow(&anchor, ts) let flags = data.pollFds.asSlice()[index].revents drop data
-    if !events.null(read) && (flags & (platform.FAILED | platform.READABLE)) != 0 {
-      run unsafe callHandler(&mut engine, context, read) return true
+  while let Option<Entry<ReadWriteHandler>>.Some { value: handler } = handlers {
+    let index = handler.get(&anchor).pollIndex
+    let flags = events.thread(realm, &anchor).pollFds.asSlice()[index].revents
+    let record = handler.get(&anchor)
+    if !events.null(record.read.view()) && (flags & (platform.FAILED | platform.READABLE)) != 0 {
+      let read = record.read.dup() drop record run callHandler(&mut engine, realm, read.borrow()) return true
     }
-    if !events.null(write) && (flags & (platform.FAILED | platform.WRITABLE)) != 0 {
-      run unsafe callHandler(&mut engine, context, write) return true
+    if !events.null(record.write.view()) && (flags & (platform.FAILED | platform.WRITABLE)) != 0 {
+      let write = record.write.dup() drop record run callHandler(&mut engine, realm, write.borrow()) return true
     }
-    cursor = unsafe events.next(node)
+    drop record handlers = handler.next()
   }
-  let portsAfterPoll = unsafe Pointer.borrow(&anchor, ts) cursor = portsAfterPoll.workerPortsFirst drop portsAfterPoll
-  while let Option<*mut HeapHeader>.Some { value: node } = Pointer.nonNullMut(cursor) {
-    if unsafe workers.portFd(node) >= 0 {
-      let index = unsafe workers.portPollIndex(node)
-      let data = unsafe Pointer.borrow(&anchor, ts) let flags = data.pollFds.asSlice()[index].revents drop data
+  ports = workers.ports(realm)
+  while let Option<PortRef>.Some { value: port } = ports {
+    if port.fd() >= 0 {
+      let index = port.pollIndex()
+      let flags = events.thread(realm, &anchor).pollFds.asSlice()[index].revents
       if flags != 0 {
         let memory = engine.memory
-        let handled = run Effect.result(unsafe workers.handlePostedMessage(&mut engine, memory, context, node))
+        let handled = run Effect.result(workers.handlePostedMessage(&mut engine, memory, realm, port))
         match move handled {
           Result<bool, JsException>.Success { value } => { if value { return true } }
-          Result<bool, JsException>.Failure { .. } => { run unsafe reportError(&mut engine, context) return true }
+          Result<bool, JsException>.Failure { .. } => { run reportError(&mut engine, realm) return true }
         }
       }
     }
-    cursor = unsafe workers.portNext(node)
+    ports = port.next()
   }
   return true
 }
-// Remove before printing: JS Error stack getters or the value printer can reenter
-// user code. Captured reasons remain owned across such callbacks.
-unsafe fn takeRejection<'m>(engine: &mut Engine<'m, LibcServices>, rt: *mut HeapHeader) -> Option<Value> {
-  let mut anchor = () let data = unsafe Pointer.borrowMut(&mut anchor, unsafe events.state(rt))
-  let first = unsafe data.rejections.popFront() drop data
-  let node = match move first { Option<*mut HeapHeader>.Some { value } => value _ => { return Option<Value>.none() } }
-  let entry = unsafe HeapCell.payload<Rejection, ()>(&anchor, node)
-  let rejected = entry.promise let reason = entry.reason drop entry
-  unsafe HeapCell.destroy<Rejection>(node)
-  unsafe gc.release(&mut engine, rt, rejected)
-  return Option<Value>.some(reason)
-}
-pub unsafe effect fn checkRejections<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader) -> () ! UnhandledRejection ? &mut Allocator {
-  let rt = unsafe runtime.contextRuntime(context) let mut rejected = false
-  while let Option<Value>.Some { value: reason } = unsafe takeRejection(&mut engine, rt) {
+// Rejections are removed before printing: JS Error stack getters or the value
+// printer can reenter user code. Captured reasons remain owned across such callbacks.
+pub effect fn checkRejections<'a, 'm>(engine: &mut Engine<'m, LibcServices>, realm: Realm<'a>) -> () ! UnhandledRejection ? &mut Allocator {
+  let mut rejected = false
+  while let Option<Value>.Some { value: reason } = events.takeRejection(&mut engine, realm) {
     rejected = true platform.rejectionPrefix()
-    run unsafe libc.dumpValue(&mut engine, context, reason)
-    unsafe gc.release(&mut engine, rt, reason)
+    run libc.dumpValue(&mut engine, realm, reason.borrow())
   }
   if rejected { fail UnhandledRejection { code: 1 } }
 }
-pub unsafe effect fn eventLoop<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader) -> () ! OutOfMemoryError | UnhandledRejection ? &mut Allocator {
-  let rt = unsafe runtime.contextRuntime(context)
+pub effect fn eventLoop<'a, 'm>(engine: &mut Engine<'m, LibcServices>, realm: Realm<'a>) -> () ! OutOfMemoryError | UnhandledRejection ? &mut Allocator {
+  let rt = realm.runtime()
   while true {
     while true {
       let job = run unsafe jobs.executePendingJob(&mut engine, rt)
       if job.status <= 0 {
-        if job.status < 0 { run unsafe reportError(&mut engine, context) }
+        if job.status < 0 { run reportError(&mut engine, realm) }
         break
       }
     }
-    run unsafe checkRejections(&mut engine, context)
-    if !run unsafe poll(&mut engine, context) { return () }
+    run checkRejections(&mut engine, realm)
+    if !run poll(&mut engine, realm) { return () }
   }
 }
-unsafe effect fn awaitBody<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader, value: Value) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
-  let rt = unsafe runtime.contextRuntime(context)
+effect fn awaitBody<'a, 'b, 'm>(engine: &mut Engine<'m, LibcServices>, realm: Realm<'a>, value: ValueRef<'b>) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let rt = realm.runtime()
   while true {
-    let status = unsafe promise.state(value)
-    if status == promise.FULFILLED { return unsafe promise.result(value) }
+    let status = promise.stateOf(value)
+    if status == promise.FULFILLED { return promise.resultOf(value).intoBits() }
     if status == promise.REJECTED {
-      return run unsafe exceptions.throwValue<Value, Engine<'m, LibcServices>>(&mut engine, rt, unsafe promise.result(value))
+      return run realm.throwValue<ValueBits, Engine<'m, LibcServices>>(&mut engine, promise.resultOf(value))
     }
-    if status != promise.PENDING { return unsafe value.retained() }
+    if status != promise.PENDING { return value.dup().intoBits() }
     let job = run unsafe jobs.executePendingJob(&mut engine, rt)
-    if job.status < 0 { run unsafe reportError(&mut engine, context) }
+    if job.status < 0 { run reportError(&mut engine, realm) }
     if job.status == 0 {
-      if let Option<Value>.Some { value: reason } = unsafe takeRejection(&mut engine, rt) {
+      if let Option<Value>.Some { value: reason } = events.takeRejection(&mut engine, realm) {
         // Await's caller owns error reporting. Do not print then throw a second copy.
-        return run unsafe exceptions.throwValue<Value, Engine<'m, LibcServices>>(&mut engine, rt, reason)
+        return run realm.throwValue<ValueBits, Engine<'m, LibcServices>>(&mut engine, move reason)
       }
-      let polled = run unsafe poll(&mut engine, context)
+      let polled = run poll(&mut engine, realm)
       // As in js_std_await, a pending promise without an event source remains
       // pending. Do not synthesize a fulfilled value or an unrelated rejection.
     }
   }
 }
 // Consumes value on every success/failure path, unlike the borrowed await body.
-pub unsafe effect fn awaitValue<'m>(engine: &mut Engine<'m, LibcServices>, context: *mut HeapHeader, value: Value) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
-  let awaited = run Effect.result(unsafe awaitBody(&mut engine, context, value))
-  unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), value)
-  return match move awaited {
-    Result<Value, OutOfMemoryError | JsException>.Success { value: result } => result
-    Result<Value, OutOfMemoryError | JsException>.Failure { error } => { fail move error }
-  }
+pub unsafe effect fn awaitValue<'a, 'b, 'm>(engine: &mut Engine<'m, LibcServices>, realm: Realm<'a>, value: ValueBits) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let owned = unsafe Value.adoptBits(value)
+  return run awaitBody(&mut engine, realm, owned.borrow())
 }

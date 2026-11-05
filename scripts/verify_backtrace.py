@@ -87,7 +87,7 @@ import runtime_memory { RuntimeAllocator, AllocationObserver }
 import native_stack { currentFrameAddress }
 import js_heap { HeapCell, HeapHeader }
 import js_core_types { RuntimeState, PropertySlot, StackFrame, JS_MODE_BACKTRACE_BARRIER }
-import js_value { Value }
+import js_value { ValueBits }
 import js_strings { Strings, StringBuilder }
 import js_string_types { StringOwner, StringLengthError }
 import js_runtime as runtime
@@ -103,7 +103,7 @@ fn bit(value: bool) -> u32 { if value { return 1 } return 0 }
 unsafe fn oom(rt: *mut HeapHeader, flag: bool) -> () {
  let mut anchor=() let state=unsafe HeapCell.payloadMut<RuntimeState,()>(&mut anchor,rt) state.inOutOfMemory=flag
 }
-effect fn name(kind: u32) -> Value ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+effect fn name(kind: u32) -> ValueBits ! OutOfMemoryError | StringLengthError ? &mut Allocator {
  if kind==2 { return run Strings.fromLatin1(b"") }
  if kind==3 { return run Strings.fromLatin1(b"pre\0post") }
  if kind==4 { return run Strings.fromUtf16(&[0xd834,0xdd1e,0xd800,0x00e9]) }
@@ -118,16 +118,16 @@ effect fn body(memory: &AllocationObserver,n:u32,t:u32,pc:usize,skip:u32,barrier
  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
  let rt=run runtime.allocateRuntimeStorage(currentFrameAddress()) let ctx=run unsafe runtime.allocateContextStorage(rt)
  let mut hooks=Hooks {finalized:0}
- let parent=run unsafe objects.withPrototype(&mut hooks,memory,ctx,Value.Null)
+ let parent=run unsafe objects.withPrototype(&mut hooks,memory,ctx,ValueBits.Null)
  let middle=run unsafe objects.withPrototype(&mut hooks,memory,ctx,parent)
  let inherited=run Strings.fromLatin1(b"inherited")
  run unsafe fixture.add(&mut hooks,rt,parent,atoms.JS_ATOM_name,7,PropertySlot.Value {value:inherited})
- let mut proto=Value.Null if n==7||n==9 {proto=parent} else if n==8 {proto=middle}
+ let mut proto=ValueBits.Null if n==7||n==9 {proto=parent} else if n==8 {proto=middle}
  let first=run unsafe fixture.native(&mut hooks,memory,ctx,proto)
  if n==5 {
-  let getter=run unsafe fixture.native(&mut hooks,memory,ctx,Value.Null)
+  let getter=run unsafe fixture.native(&mut hooks,memory,ctx,ValueBits.Null)
   run unsafe fixture.add(&mut hooks,rt,first,atoms.JS_ATOM_name,17,PropertySlot.GetterSetter {getter:reference(getter),setter:Pointer.null<HeapHeader>()})
- } else if n==9 {run unsafe fixture.add(&mut hooks,rt,first,atoms.JS_ATOM_name,7,PropertySlot.Value {value:Value.Int {value:7}})}
+ } else if n==9 {run unsafe fixture.add(&mut hooks,rt,first,atoms.JS_ATOM_name,7,PropertySlot.Value {value:ValueBits.Int {value:7}})}
  else if n>0&&n<7 {let text=run name(n) run unsafe fixture.add(&mut hooks,rt,first,atoms.JS_ATOM_name,7,PropertySlot.Value {value:text})}
  let mut table:&'static [u8]=b"\0\0\x08\x04"
  if t==2 {table=b""} else if t==3 {table=b"\0"} else if t==4 {table=b"\x03\x04"} else if t==5 {table=b"\xff\xff\xff\xff\x0f\0"}
@@ -138,15 +138,15 @@ effect fn body(memory: &AllocationObserver,n:u32,t:u32,pc:usize,skip:u32,barrier
  let mut mid=run fixture.frame(worker) mid.currentPc=Option<usize>.some(pc) mid.previous=Pointer.fromMutRef<StackFrame>(&mut bottom)
  let mut top=run fixture.frame(first) top.previous=Pointer.fromMutRef<StackFrame>(&mut mid) if barrier==1 {top.mode=JS_MODE_BACKTRACE_BARRIER}
  unsafe fixture.publish(rt,Pointer.fromMutRef<StackFrame>(&mut top))
- let peek=match unsafe trace.propertyString(first,atoms.JS_ATOM_name) {Option<Value>.Some {..}=>true _=>false}
+ let peek=match unsafe trace.propertyString(first,atoms.JS_ATOM_name) {Option<ValueBits>.Some {..}=>true _=>false}
  let immediate=unsafe trace.shouldAttachImmediately(rt)
  unsafe fixture.publish(rt,Pointer.fromMutRef<StackFrame>(&mut mid)) let deferred=unsafe trace.shouldAttachImmediately(rt)
  unsafe fixture.publish(rt,Pointer.fromMutRef<StackFrame>(&mut top)) unsafe oom(rt,true)
  let suppressed=unsafe trace.shouldAttachImmediately(rt) unsafe oom(rt,false)
- let error=run unsafe objects.withPrototypeClass(&mut hooks,memory,ctx,Value.Null,classes.JS_CLASS_ERROR)
+ let error=run unsafe objects.withPrototypeClass(&mut hooks,memory,ctx,ValueBits.Null,classes.JS_CLASS_ERROR)
  let before=unsafe trace.isNeeded(error)
  let filename=StringOwner.adopt(run Strings.fromLatin1(b"parse.js"))
- let mut originValue=Option<Value>.none() if origin!=0 {originValue=Option<Value>.some(filename.get())}
+ let mut originValue=Option<ValueBits>.none() if origin!=0 {originValue=Option<ValueBits>.some(filename.get())}
  let mut line:i32=13 if origin==1 {line= -1}
  let stack=StringOwner.adopt(run unsafe trace.format(rt,move originValue,line,7,skip))
  run unsafe fixture.add(&mut hooks,rt,error,atoms.JS_ATOM_stack,3,PropertySlot.Value {value:unsafe stack.get().retained()})

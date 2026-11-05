@@ -15,15 +15,15 @@ import silk.num.i32
 import silk.num.usize
 import byte_buffer { ByteBuffer }
 import js_heap { HeapCell, HeapHeader, HeapKind }
-import js_value { Value }
+import js_value { ValueBits }
 import js_gc { HeapHooks }
 import js_gc
-import js_core_types { FunctionBytecode, FunctionDebugInfo, ByteStorage, VarDef, ClosureVar, ClosureKind, RuntimeState }
-import js_compiler_types { FunctionDef, CompilerVar, CompilerError, CompilerErrorKind }
+import js_core_types { FunctionBytecode, FunctionDebugInfo, FunctionKind, ByteStorage, SourceText, VarDef, ClosureVar, ClosureKind, RuntimeState }
+import js_compiler_types { FunctionDef, FunctionId, FunctionTree, linked, CompilerVar, CompilerError, CompilerErrorKind }
 import js_compiler_state as state
 import js_compiler_variables as variables
 import js_compiler_labels { resolveLabels }
-import js_bytecode { computeStackSize, BytecodeError }
+import js_bytecode { analyze, lazyArgumentsSite, SPECIAL_LAZY_ARGUMENTS, BytecodeError }
 import js_string_types { StringLengthError }
 import js_debugger_metadata { Metadata as DebuggerMetadata, Scope }
 import js_debug_positions { SourcePositionCache }
@@ -40,32 +40,31 @@ fn keepClosureName(kind: ClosureKind) -> bool {
     || kind == ClosureKind.Global || kind == ClosureKind.ModuleDeclaration || kind == ClosureKind.ModuleImport
 }
 
-unsafe effect fn assemble<H: HeapHooks>(hooks: &mut H, cell: *mut HeapHeader, source: &[u8]) -> Value
+effect fn assemble<H: HeapHooks>(hooks: &mut H, tree: &mut FunctionTree, cell: FunctionId, source: &[u8]) -> ValueBits
   ! OutOfMemoryError | StringLengthError | CompilerError | BytecodeError ? &mut Allocator {
   let mut anchor = ()
-  let initial = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
+  let initial = tree.getMut(cell)
   if initial.debuggerMetadata.enabled {
     initial.debuggerMetadata.sourceLength = usize.toU32(source.length)
   }
   variables.recomputeScopeLinks(&mut initial)
   let eval = initial.hasEvalCall let global = initial.isEval let debug = initial.debuggerMetadata.enabled
   drop initial
-  if eval { run unsafe variables.addEvalVariables(cell) }
-  else if debug { run unsafe variables.addDebuggerVariables(cell) }
-  if global { run unsafe variables.addGlobalVariables(cell) }
+  if eval { run variables.addEvalVariables(&mut tree, cell) }
+  else if debug { run variables.addDebuggerVariables(&mut tree, cell) }
+  if global { run variables.addGlobalVariables(&mut tree, cell) }
   while true {
-    let parent = unsafe HeapCell.payload<FunctionDef, ()>(&anchor, cell)
+    let parent = tree.get(cell)
     let child = parent.firstChild drop parent
-    if Pointer.isNull<HeapHeader>(child) { break }
-    let childCell = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(child)
-    let childFd = unsafe HeapCell.payload<FunctionDef, ()>(&anchor, childCell)
+    let childCell = match child { Option<FunctionId>.Some { value } => value _ => { break } }
+    let childFd = tree.get(childCell)
     let index = i32.toUsize(childFd.parentConstantPoolIndex) drop childFd
     // createFunction unlinks this child on both outcomes; no dangling list cursor.
-    let value = run unsafe createFunction(&mut hooks, childCell, source)
-    let parentWrite = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
+    let value = run createFunction(&mut hooks, &mut tree, childCell, source)
+    let parentWrite = tree.getMut(cell)
     parentWrite.constants.set(index, value)
   }
-  let capture = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
+  let capture = tree.getMut(cell)
   if capture.debuggerMetadata.enabled {
     if capture.args.length() + capture.vars.length() > 65535 {
       let runtimeAnchor = () let rt = unsafe HeapCell.payload<RuntimeState, ()>(&runtimeAnchor, capture.runtime)
@@ -77,10 +76,11 @@ unsafe effect fn assemble<H: HeapHooks>(hooks: &mut H, cell: *mut HeapHeader, so
     while index < capture.vars.length() { state.captureVar(&mut capture, usize.toI32(index), false) index = index + 1 }
   }
   drop capture
-  run unsafe variables.resolveVariables(cell)
-  run unsafe resolveLabels(cell, source)
-  let fd = unsafe HeapCell.payloadMut<FunctionDef, ()>(&mut anchor, cell)
-  let stackSize = run computeStackSize(fd.bytecode.asSlice())
+  run variables.resolveVariables(&mut tree, cell)
+  run resolveLabels(&mut tree, cell, source)
+  let fd = tree.getMut(cell)
+  let facts = run analyze(fd.bytecode.asSlice())
+  let stackSize = facts.stackSize
   if fd.debuggerMetadata.enabled {
     if fd.args.length() + fd.vars.length() > 65535 {
       let runtimeAnchor = () let rt = unsafe HeapCell.payload<RuntimeState, ()>(&runtimeAnchor, fd.runtime)
@@ -118,7 +118,15 @@ unsafe effect fn assemble<H: HeapHooks>(hooks: &mut H, cell: *mut HeapHeader, so
       index = index + 1
     }
   }
+  let borrowsArguments = fd.functionKind == FunctionKind.Normal && fd.varRefCount == 0 && !facts.writesArguments
   let strip = fd.stripDebug && !fd.hasEvalCall && !fd.debuggerMetadata.enabled
+  // function() { target.apply(this, arguments) }: no formal can alias the
+  // arguments object, so it is built only if the VM cannot apply in place.
+  if fd.functionKind == FunctionKind.Normal && fd.args.length() == 0 && fd.hasSimpleParameterList && !fd.hasEvalCall
+    && fd.argumentsVarIndex >= 0 && fd.argumentsArgIndex < 0 && !fd.vars.get(i32.toUsize(fd.argumentsVarIndex)).isCaptured {
+    let site = lazyArgumentsSite(fd.bytecode.asSlice(), i32.toUsize(fd.argumentsVarIndex))
+    if site != usize.MAX { fd.bytecode.set(site, SPECIAL_LAZY_ARGUMENTS) }
+  }
   // Only this representation differs from the transient IR. Until allocation
   // commits, these names borrow fd's references; List drop releases no JS atoms.
   let mut definitions = List<VarDef>.make()
@@ -127,15 +135,21 @@ unsafe effect fn assemble<H: HeapHooks>(hooks: &mut H, cell: *mut HeapHeader, so
   while i < fd.args.length() { run definitions.append(definition(fd.args.get(i), strip)) i = i + 1 }
   i = 0
   while i < fd.vars.length() { run definitions.append(definition(fd.vars.get(i), strip)) i = i + 1 }
+  // The published function keeps its lists for its whole life: drop the spare room
+  // growth left behind. Failure leaves fd intact and destructible.
+  run fd.bytecode.shrinkToFit()
+  run fd.pc2line.shrinkToFit()
+  run fd.constants.shrinkToFit()
+  run fd.closureVars.shrinkToFit()
   let runtime = fd.runtime let context = fd.context
   // Allocate BEFORE moving any JS edge. OOM leaves the complete fd destructible.
   let result = run HeapCell.allocate(HeapKind.FunctionBytecode, FunctionBytecode {
     scriptId: fd.scriptId,
     scriptIsEval: fd.scriptIsEval || fd.evalType == 2 || fd.evalType == 3,
     debuggerMetadata: DebuggerMetadata.make(),
-    hostImport: Value.Undefined,
-    hostModule: Value.Undefined,
-    hostScriptMetadata: Value.Undefined,
+    hostImport: ValueBits.Undefined,
+    hostModule: ValueBits.Undefined,
+    hostScriptMetadata: ValueBits.Undefined,
     mode: fd.jsMode, hasPrototype: fd.hasPrototype, hasSimpleParameterList: fd.hasSimpleParameterList,
     isDerivedClassConstructor: fd.isDerivedClassConstructor,
     needsHomeObject: fd.homeObjectVarIndex >= 0 || fd.needHomeObject, kind: fd.functionKind,
@@ -146,8 +160,8 @@ unsafe effect fn assemble<H: HeapHooks>(hooks: &mut H, cell: *mut HeapHeader, so
     varDefs: move definitions, closureVars: List<ClosureVar>.make(),
     argumentCount: usize.toU16(fd.args.length()), variableCount: usize.toU16(fd.vars.length()),
     definedArgumentCount: i32.toU16(fd.definedArgCount), stackSize: stackSize,
-    varRefCount: i32.toU16(fd.varRefCount), realm: context,
-    constants: List<Value>.make(), debug: Option<FunctionDebugInfo>.none()
+    varRefCount: i32.toU16(fd.varRefCount), borrowsArguments: borrowsArguments, realm: context,
+    constants: List<ValueBits>.make(), debug: Option<FunctionDebugInfo>.none()
   })
   // No fallible operations after this point. All native buffers move, never copy.
   let mut resultAnchor = () let mut runtimeAnchor = ()
@@ -157,7 +171,7 @@ unsafe effect fn assemble<H: HeapHooks>(hooks: &mut H, cell: *mut HeapHeader, so
   b.code = ByteStorage.Owned { bytes: code.intoList() }
   b.debuggerMetadata = Intrinsic.replace(fd.debuggerMetadata, DebuggerMetadata.make())
   b.name = fd.functionName fd.functionName = 0
-  b.constants = Intrinsic.replace(fd.constants, List<Value>.make())
+  b.constants = Intrinsic.replace(fd.constants, List<ValueBits>.make())
   i = 0
   while i < fd.args.length() {
     let mut v = fd.args.get(i) if strip { rt.atoms.release(v.name) }
@@ -180,11 +194,7 @@ unsafe effect fn assemble<H: HeapHooks>(hooks: &mut H, cell: *mut HeapHeader, so
   if !fd.stripDebug {
     let lines = Intrinsic.replace(fd.pc2line, ByteBuffer.make())
     let callLines = Intrinsic.replace(fd.callSitePc2line, ByteBuffer.make())
-    let mut text = Option<ByteStorage>.none()
-    if fd.source.length() != 0 {
-      let bytes = Intrinsic.replace(fd.source, ByteBuffer.make())
-      text = Option<ByteStorage>.some(ByteStorage.Owned { bytes: bytes.intoList() })
-    }
+    let text = Intrinsic.replace(fd.source, Option<SourceText>.none())
     b.debug = Option<FunctionDebugInfo>.some(FunctionDebugInfo {
       callSitePcToLine: Option<ByteStorage>.some(ByteStorage.Owned { bytes: callLines.intoList() }),
       nodeVm: fd.nodeVmDiagnostics, nodeSourceURL: false, lineOffset: 0, columnOffset: 0, sourceColumnOffset: 0,
@@ -195,18 +205,18 @@ unsafe effect fn assemble<H: HeapHooks>(hooks: &mut H, cell: *mut HeapHeader, so
   drop rt drop b drop fd
   unsafe HeapCell.retain(context)
   unsafe js_gc.publish(runtime, result)
-  return Value.FunctionBytecode { reference: result }
+  return ValueBits.FunctionBytecode { reference: result }
 }
 
-pub unsafe effect fn createFunction<H: HeapHooks>(hooks: &mut H, cell: *mut HeapHeader, source: &[u8]) -> Value
+pub effect fn createFunction<H: HeapHooks>(hooks: &mut H, tree: &mut FunctionTree, cell: FunctionId, source: &[u8]) -> ValueBits
   ! OutOfMemoryError | StringLengthError | CompilerError | BytecodeError ? &mut Allocator {
-  let outcome = run Effect.result(unsafe assemble(&mut hooks, cell, source))
+  let outcome = run Effect.result(assemble(&mut hooks, &mut tree, cell, source))
   // Shared teardown releases stripped atoms/source, remaining parser-only owners,
   // failed descendants, and any already assembled children in constant slots.
   // Successful transfer zeroes all edges now owned by the published bytecode.
-  unsafe state.destroyFunction(&mut hooks, cell)
+  state.destroyFunction(&mut hooks, &mut tree, cell)
   return match move outcome {
-    Result<Value, OutOfMemoryError | StringLengthError | CompilerError | BytecodeError>.Success { value } => value
-    Result<Value, OutOfMemoryError | StringLengthError | CompilerError | BytecodeError>.Failure { error } => { fail move error }
+    Result<ValueBits, OutOfMemoryError | StringLengthError | CompilerError | BytecodeError>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError | StringLengthError | CompilerError | BytecodeError>.Failure { error } => { fail move error }
   }
 }

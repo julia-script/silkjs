@@ -1,6 +1,7 @@
 //! RegExp builtin execution and dynamic RegExpExec, quickjs.c:50395-50414,
 //! 50470-50720,50839-50871. Inputs are borrowed; returned Values are owned.
 //! Capture offsets remain UTF-16 code-unit offsets, including Unicode modes.
+import thin_list { ThinList }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
@@ -15,8 +16,12 @@ import silk.num.u32
 import silk.num.usize
 import runtime_memory { AllocationObserver }
 import js_heap { HeapCell, HeapHeader }
-import js_value { Value }
-import js_core_types { ContextState, RuntimeState, ObjectData, ObjectPayload, PropertySlot,
+import js_value { ValueBits }
+import js_intl_realm as ops
+import js_owned_value { Value, immediateRef, ValueRef, lendFor }
+import js_object_ref { ObjectRef }
+import js_realm { Realm, lendRealm }
+import js_core_types { ContextState, RuntimeState, ObjectData, ObjectPayload, PropertySlot, SlotBits,
   ShapeData, NativeFunctionId, NativeErrorKind, JS_PROP_WRITABLE, JS_PROP_C_W_E, JS_PROP_THROW }
 import js_gc { HeapHooks }
 import js_coercion_host { CoercionHooks }
@@ -25,7 +30,7 @@ import js_property_host { OwnPropertyHooks }
 import js_property_write_host { PropertyWriteHooks }
 import js_interrupt_host { InterruptHooks }
 import js_exceptions { JsException }
-import js_string_types { FlatString, StringOwner, StringLengthError, stringReference }
+import js_string_types { FlatString, StringOwner, StringLengthError, stringReference, latin1Bytes }
 import js_strings { Strings }
 import js_runtime as runtime
 import js_errors as errors
@@ -43,10 +48,10 @@ import byte_buffer { readU16, readU32 }
 
 // Unlike VM polling, the regexp engine already maintains its own 10,000-event
 // counter. Calling js_interrupts.poll here would incorrectly square that interval.
-unsafe effect fn interrupted<H: InterruptHooks>(hooks: &mut H, context: *mut HeapHeader) -> bool ? &mut Allocator {
-  let rt = unsafe runtime.contextRuntime(context)
+effect fn interrupted<'a, H: InterruptHooks>(hooks: &mut H, realm: Realm<'a>) -> bool ? &mut Allocator {
+  let rt = realm.runtime()
   let anchor = ()
-  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let state = realm.runtimeState(&anchor)
   let opaque = state.interrupt.opaque
   let callback = match &state.interrupt.callback {
     Option<NativeFunctionId>.Some { value } => Option<NativeFunctionId>.some(value)
@@ -61,146 +66,201 @@ unsafe effect fn interrupted<H: InterruptHooks>(hooks: &mut H, context: *mut Hea
 
 // Shared with the source optimized replacement path. Both inputs must be flat
 // strings with previously validated regexp bytes; the owner keeps them live during callbacks.
-pub unsafe effect fn execute<H: HeapHooks + CoercionHooks + InterruptHooks>(hooks: &mut H,
-  memory: &AllocationObserver, context: *mut HeapHeader, bytecode: Value, string: Value,
+pub effect fn execute<'a, 'b, H: HeapHooks + CoercionHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, bytecode: ValueRef<'b>, string: ValueRef<'b>,
   start: usize) -> RegExpMatch ! JsException ? &mut Allocator {
   let anchor = ()
-  let code = unsafe HeapCell.payload<FlatString, ()>(&anchor, stringReference(bytecode))
-  let input = unsafe HeapCell.payload<FlatString, ()>(&anchor, stringReference(string))
-  let attempted = run Effect.result(unsafe executeFlat(&mut hooks, context, &code, &input, start))
+  let code = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(bytecode.view()))
+  let input = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(string.view()))
+  let mut inputBytes = Slice.view(code.latin1.asSlice(), 0, 0)
+  if !input.wide { inputBytes = unsafe latin1Bytes(&anchor, stringReference(string.view())) }
+  let attempted = run Effect.result(executeFlat(&mut hooks, realm, &code, &input, inputBytes, start))
   drop input drop code
   return match move attempted {
     Result<RegExpMatch, OutOfMemoryError | RegExpTimeout | RegExpValidationError>.Success { value } => move value
     Result<RegExpMatch, OutOfMemoryError | RegExpTimeout | RegExpValidationError>.Failure { error } => {
       match move error {
-        RegExpTimeout timeout => { return run unsafe errors.throwInterrupted(&mut hooks, memory, context) }
+        RegExpTimeout timeout => { return run errors.throwInterrupted(&mut hooks, memory, realm) }
         RegExpValidationError invalid => {
-          return run unsafe hooks.throwError(context, NativeErrorKind.Internal, b"invalid regexp execution state")
+          return run hooks.throwError(realm, NativeErrorKind.Internal, b"invalid regexp execution state")
         }
         OutOfMemoryError allocation => {
-          return run unsafe hooks.throwError(context, NativeErrorKind.Internal, b"out of memory in regexp execution")
+          return run hooks.throwError(realm, NativeErrorKind.Internal, b"out of memory in regexp execution")
         }
       }
     }
   }
 }
-unsafe effect fn executeFlat<H: InterruptHooks>(hooks: &mut H, context: *mut HeapHeader,
-  code: &FlatString, input: &FlatString, start: usize) -> RegExpMatch
+effect fn executeFlat<'a, H: InterruptHooks>(hooks: &mut H, realm: Realm<'a>,
+  code: &FlatString, input: &FlatString, inputBytes: &[u8], start: usize) -> RegExpMatch
   ! OutOfMemoryError | RegExpTimeout | RegExpValidationError ? &mut Allocator {
-  if start > input.length || input.length > i32.toUsize(i32.MAX) {
+  if start > input.length() || input.length() > i32.toUsize(i32.MAX) {
     fail RegExpValidationError { offset: 0 }
   }
   let captures = u8.toUsize(code.latin1.get(2))
   if input.wide {
-    let matched = run RegExpExecutor.execute16(code.latin1.asSlice(), Slice.view(input.utf16.asSlice(), 0, input.length), start,
-      effect fn() -> bool ? &mut Allocator { return run unsafe interrupted(&mut hooks, context) })
-    run validateMatch(&matched, captures, input.length)
+    let matched = run RegExpExecutor.execute16(code.latin1.asSlice(), Slice.view(input.wideUnits(), 0, input.length()), start,
+      effect fn() -> bool ? &mut Allocator { return run interrupted(&mut hooks, realm) })
+    run validateMatch(&matched, captures, input.length())
     return move matched
   }
-  let matched = run RegExpExecutor.execute8(code.latin1.asSlice(), Slice.view(input.latin1.asSlice(), 0, input.length), start,
-    effect fn() -> bool ? &mut Allocator { return run unsafe interrupted(&mut hooks, context) })
-  run validateMatch(&matched, captures, input.length)
+  let matched = run RegExpExecutor.execute8(code.latin1.asSlice(), Slice.view(inputBytes, 0, input.length()), start,
+    effect fn() -> bool ? &mut Allocator { return run interrupted(&mut hooks, realm) })
+  run validateMatch(&matched, captures, input.length())
   return move matched
 }
 
 // The non-configurable lastIndex slot is always first, even after other properties
 // are added. The ToLength helper retains nonintegers before coercion can reenter.
-pub unsafe effect fn getLastIndex<H: HeapHooks + CoercionHooks>(hooks: &mut H,
-  context: *mut HeapHeader, receiver: Value) -> i64 ! JsException ? &mut Allocator {
+pub effect fn getLastIndex<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, receiver: ValueRef<'b>) -> i64 ! JsException ? &mut Allocator {
   let anchor = ()
-  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(receiver))
-  let stored = match object.properties.get(0) {
-    PropertySlot.Value { value } => value
-    _ => Intrinsic.trap("QuickJS invariant violated")
-  }
+  let object = ObjectRef.of(receiver).data(&anchor)
+  let stored = object.properties.get(0).valueBits()
   drop object
   match stored {
-    Value.Int { value } => { if value < 0 { return 0 } return i32.toI64(value) }
+    ValueBits.Int { value } => { if value < 0 { return 0 } return i32.toI64(value) }
     _ => ()
   }
-  return run unsafe support.length(&mut hooks, context, stored)
+  return run unsafe support.length(&mut hooks, realm, stored)
 }
-pub unsafe effect fn setLastIndex<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks>(
-  hooks: &mut H, context: *mut HeapHeader, receiver: Value, index: i32) -> ()
+pub effect fn setLastIndex<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks>(
+  hooks: &mut H, realm: Realm<'a>, receiver: ValueRef<'b>, index: i32) -> ()
   ! JsException ? &mut Allocator {
   let mut anchor = ()
-  let object = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, core.reference(receiver))
+  let object = ObjectRef.of(receiver).dataMut(&mut anchor)
   let shapeAnchor = ()
   let shape = unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, object.shape)
   let writable = (u8.toU32(shape.properties.get(0).flags) & JS_PROP_WRITABLE) != 0
   drop shape
-  let integer = match object.properties.get(0) {
-    PropertySlot.Value { value: Value.Int { .. } } => true
+  let integer = match object.properties.get(0).valueBits() {
+    ValueBits.Int { .. } => true
     _ => false
   }
   if integer && writable {
-    object.properties.set(0, PropertySlot.Value { value: Value.Int { value: index } })
+    object.properties.set(0, SlotBits.value(ValueBits.Int { value: index }))
     return ()
   }
   drop object
-  run unsafe support.set(&mut hooks, context, receiver, atoms.JS_ATOM_lastIndex, Value.Int { value: index })
+  run support.set(&mut hooks, realm, receiver, atoms.JS_ATOM_lastIndex, Value.immediate(ValueBits.Int { value: index }))
 }
 
-unsafe fn hasOwn(object: Value, atom: u32) -> bool {
+fn hasOwn<'v>(object: ValueRef<'v>, atom: u32) -> bool {
   let anchor = ()
-  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(object))
+  let data = ObjectRef.of(object).data(&anchor)
   return match unsafe shapes.lookup(data.shape, atom) {
     Option<usize>.Some { .. } => true Option<usize>.None => false
   }
 }
 
-// All JS references under construction stay in this cleanup ledger until their
-// ownership has actually transferred. Native lists are affine and drop on failure.
-struct ResultState {
-  object: Value,
-  groups: Value,
-  indices: Value,
-  indicesGroups: Value,
-  temporary: Value,
-  groupName: u32
-}
-unsafe effect fn resultArray<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
-  context: *mut HeapHeader, string: Value, groups: Value, count: usize, index: i32) -> Value
-  ! OutOfMemoryError ? &mut Allocator {
-  let mut slots = List<PropertySlot>.make()
+effect fn resultArray<'a, 'b, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,realm: Realm<'a>, string: ValueRef<'b>, groups: ValueRef<'b>, count: usize, index: i32) -> ValueBits
+  ! OutOfMemoryError ? &mut Allocator { let context = realm.context()
+  // A parked four-slot list of a dead object when one is spare, else a new one.
+  let mut slots = match unsafe shapes.takeSpareSlots(realm.runtime(), 4) {
+    Option<ThinList<SlotBits>>.Some { value } => move value
+    Option<ThinList<SlotBits>>.None => ThinList<SlotBits>.make()
+  }
   run slots.reserveExact(4)
-  run slots.append(PropertySlot.Value { value: Value.Int { value: usize.toI32(count) } })
-  run slots.append(PropertySlot.Value { value: Value.Int { value: index } })
+  run slots.append(SlotBits.value(ValueBits.Int { value: usize.toI32(count) }))
+  run slots.append(SlotBits.value(ValueBits.Int { value: index }))
   // Append inert placeholders before acquiring the two reference-counted slots.
-  run slots.append(PropertySlot.Value { value: Value.Undefined })
-  run slots.append(PropertySlot.Value { value: Value.Undefined })
-  slots.set(2, PropertySlot.Value { value: unsafe string.retained() })
-  slots.set(3, PropertySlot.Value { value: unsafe groups.retained() })
+  run slots.append(SlotBits.value(ValueBits.Undefined))
+  run slots.append(SlotBits.value(ValueBits.Undefined))
+  slots.set(2, SlotBits.value(unsafe string.view().retained()))
+  slots.set(3, SlotBits.value(unsafe groups.view().retained()))
   let anchor = ()
-  let ctx = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  let ctx = realm.state(&anchor)
   let shape = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(ctx.regexpResultShape)
   drop ctx
   unsafe HeapCell.retain(shape)
-  return run unsafe allocate.fromShape(&mut hooks, memory, context, shape, classes.JS_CLASS_ARRAY,
-    Option<List<PropertySlot>>.some(move slots))
+  return run unsafe allocate.fromShape(&mut hooks, memory, realm, shape, classes.JS_CLASS_ARRAY,
+    Option<ThinList<SlotBits>>.some(move slots))
 }
-unsafe effect fn buildResult<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks>(
-  hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, string: Value,
-  bytecode: Value, matched: &RegExpMatch, state: &mut ResultState) -> Value
+/// The exec result for a match: plain captures inline, named groups or match
+/// indices (the d flag) through buildDecoratedResult.
+effect fn buildResult<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks>(
+  hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, string: ValueRef<'b>,
+  bytecode: ValueRef<'b>, matched: &RegExpMatch, groupName: &mut u32) -> Value
   ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
   let anchor = ()
-  let code = unsafe HeapCell.payload<FlatString, ()>(&anchor, stringReference(bytecode))
+  let code = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(bytecode.view()))
+  let bytes = code.latin1.asSlice()
+  let flags = u16.toU32(readU16(bytes, 0))
+  let count = u8.toUsize(bytes[2])
+  drop code
+  if (flags & (FLAG_NAMED_GROUPS | FLAG_INDICES)) != 0 {
+    return run buildDecoratedResult(&mut hooks, memory, realm, string, bytecode, matched, &mut groupName)
+  }
+  let object = unsafe Value.adoptBits(run resultArray(&mut hooks, memory, realm, string, immediateRef(ValueBits.Undefined),
+    count, matched.captures.get(0)))
+  let mut arrayAnchor = ()
+  let arrayObject = ObjectRef.of(object.borrow()).dataMut(&mut arrayAnchor)
+  match &mut arrayObject.payload {
+    ObjectPayload.FastArray { array } => {
+      if array.values.capacity() == 0 {
+        if let Option<ThinList<ValueBits>>.Some { value: spare } = unsafe shapes.takeSpareValues(realm.runtime(), count) {
+          let empty = Intrinsic.replace(array.values, move spare) drop empty
+        }
+      }
+      run array.values.reserveExact(count)
+    }
+    _ => { Intrinsic.trap("QuickJS invariant violated") }
+  }
+  drop arrayObject
+  let mut i: usize = 0
+  while i < count {
+    let start = matched.captures.get(i * 2)
+    let end = matched.captures.get(i * 2 + 1)
+    let mut capture = Value.immediate(ValueBits.Undefined)
+    if start >= 0 && end >= 0 { capture = unsafe Value.adoptBits(run Strings.substring(string.view(), i32.toUsize(start), i32.toUsize(end))) }
+    run append(object.borrow(), move capture)
+    i = i + 1
+  }
+  return move object
+}
+/// Appends capture to the result array's dense values.
+@inlineAlways
+effect fn append<'o>(object: ValueRef<'o>, capture: Value) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = ()
+  let output = ObjectRef.of(object).dataMut(&mut anchor)
+  match &mut output.payload {
+    ObjectPayload.FastArray { array } => { run array.values.append(capture.view()) }
+    _ => { Intrinsic.trap("QuickJS invariant violated") }
+  }
+  let _stored = capture.intoBits()
+}
+@cold
+effect fn buildDecoratedResult<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks>(
+  hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, string: ValueRef<'b>,
+  bytecode: ValueRef<'b>, matched: &RegExpMatch, groupName: &mut u32) -> Value
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let anchor = ()
+  let code = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(bytecode.view()))
   let bytes = code.latin1.asSlice()
   let flags = u16.toU32(readU16(bytes, 0))
   let named = (flags & FLAG_NAMED_GROUPS) != 0
   let count = u8.toUsize(bytes[2])
   let mut nameOffset = u32.toUsize(readU32(bytes, 4)) + 8
-  if named { state.groups = run unsafe support.object(&mut hooks, memory, context, Value.Null) }
+  let mut groups = Value.immediate(ValueBits.Undefined)
+  let mut indices = Value.immediate(ValueBits.Undefined)
+  let mut indicesGroups = Value.immediate(ValueBits.Undefined)
+  if named { groups = run support.object(&mut hooks, memory, realm, immediateRef(ValueBits.Null)) }
   if (flags & FLAG_INDICES) != 0 {
-    state.indices = run unsafe support.array(&mut hooks, memory, context)
-    if named { state.indicesGroups = run unsafe support.object(&mut hooks, memory, context, Value.Null) }
+    indices = run support.array(&mut hooks, memory, realm)
+    if named { indicesGroups = run support.object(&mut hooks, memory, realm, immediateRef(ValueBits.Null)) }
   }
-  state.object = run unsafe resultArray(&mut hooks, memory, context, string, state.groups,
-    count, matched.captures.get(0))
+  let object = unsafe Value.adoptBits(run resultArray(&mut hooks, memory, realm, string, groups.borrow(),
+    count, matched.captures.get(0)))
   let mut arrayAnchor = ()
-  let arrayObject = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut arrayAnchor, core.reference(state.object))
+  let arrayObject = ObjectRef.of(object.borrow()).dataMut(&mut arrayAnchor)
   match &mut arrayObject.payload {
-    ObjectPayload.FastArray { array } => { run array.values.reserveExact(count) }
+    ObjectPayload.FastArray { array } => {
+      if array.values.capacity() == 0 {
+        if let Option<ThinList<ValueBits>>.Some { value: spare } = unsafe shapes.takeSpareValues(realm.runtime(), count) {
+          let empty = Intrinsic.replace(array.values, move spare) drop empty
+        }
+      }
+      run array.values.reserveExact(count)
+    }
     _ => { Intrinsic.trap("QuickJS invariant violated") }
   }
   drop arrayObject
@@ -211,9 +271,8 @@ unsafe effect fn buildResult<H: HeapHooks + CoercionHooks + OwnPropertyHooks + P
       while bytes[nameEnd] != 0 { nameEnd = nameEnd + 1 }
       if nameEnd != nameOffset {
         let mut atomAnchor = ()
-        let rt = unsafe runtime.contextRuntime(context)
-        let runtimeState = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut atomAnchor, rt)
-        state.groupName = run runtimeState.atoms.internUtf8(Slice.view(bytes, nameOffset, nameEnd - nameOffset))
+        let runtimeState = realm.runtimeStateMut(&mut atomAnchor)
+        groupName.* = run runtimeState.atoms.internUtf8(Slice.view(bytes, nameOffset, nameEnd - nameOffset))
       }
       // Each compiler name record ends in NUL followed by its duplicate-name scope.
       nameOffset = nameEnd + 2
@@ -221,123 +280,170 @@ unsafe effect fn buildResult<H: HeapHooks + CoercionHooks + OwnPropertyHooks + P
     let start = matched.captures.get(i * 2)
     let end = matched.captures.get(i * 2 + 1)
     let present = start >= 0 && end >= 0
+    let name = groupName.*
     if (flags & FLAG_INDICES) != 0 {
+      let mut pair = Value.immediate(ValueBits.Undefined)
       if present {
-        state.temporary = run unsafe support.array(&mut hooks, memory, context)
-        run unsafe support.defineIndex(&mut hooks, context, state.temporary, 0, Value.Int { value: start })
-        run unsafe support.defineIndex(&mut hooks, context, state.temporary, 1, Value.Int { value: end })
+        pair = run support.array(&mut hooks, memory, realm)
+        run support.defineIndex(&mut hooks, realm, pair.borrow(), 0, Value.immediate(ValueBits.Int { value: start }))
+        run support.defineIndex(&mut hooks, realm, pair.borrow(), 1, Value.immediate(ValueBits.Int { value: end }))
       }
-      if state.groupName != 0 && (present || !unsafe hasOwn(state.indicesGroups, state.groupName)) {
-        let pair = unsafe state.temporary.retained()
-        run unsafe support.define(&mut hooks, context, state.indicesGroups, state.groupName,
-          pair, JS_PROP_C_W_E | JS_PROP_THROW)
+      if name != 0 && (present || !hasOwn(indicesGroups.borrow(), name)) {
+        run support.define(&mut hooks, realm, indicesGroups.borrow(), name, pair.dup(), JS_PROP_C_W_E | JS_PROP_THROW)
       }
-      let pair = state.temporary
-      state.temporary = Value.Undefined
-      run unsafe support.defineIndex(&mut hooks, context, state.indices, usize.toI64(i), pair)
+      run support.defineIndex(&mut hooks, realm, indices.borrow(), usize.toI64(i), move pair)
     }
-    if present { state.temporary = run Strings.substring(string, i32.toUsize(start), i32.toUsize(end)) }
-    if state.groupName != 0 {
-      if present || !unsafe hasOwn(state.groups, state.groupName) {
-        let capture = unsafe state.temporary.retained()
-        run unsafe support.define(&mut hooks, context, state.groups, state.groupName,
-          capture, JS_PROP_C_W_E | JS_PROP_THROW)
+    let mut capture = Value.immediate(ValueBits.Undefined)
+    if present { capture = unsafe Value.adoptBits(run Strings.substring(string.view(), i32.toUsize(start), i32.toUsize(end))) }
+    if name != 0 {
+      if present || !hasOwn(groups.borrow(), name) {
+        run support.define(&mut hooks, realm, groups.borrow(), name, capture.dup(), JS_PROP_C_W_E | JS_PROP_THROW)
       }
-      unsafe properties.releaseAtom(unsafe runtime.contextRuntime(context), state.groupName)
-      state.groupName = 0
+      unsafe properties.releaseAtom(realm.runtime(), name)
+      groupName.* = 0
     }
-    let mut appendAnchor = ()
-    let output = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut appendAnchor, core.reference(state.object))
-    match &mut output.payload {
-      ObjectPayload.FastArray { array } => { run array.values.append(state.temporary) }
-      _ => { Intrinsic.trap("QuickJS invariant violated") }
-    }
-    state.temporary = Value.Undefined
+    run append(object.borrow(), move capture)
     i = i + 1
   }
   if (flags & FLAG_INDICES) != 0 {
-    let groups = state.indicesGroups
-    state.indicesGroups = Value.Undefined
-    run unsafe support.define(&mut hooks, context, state.indices, atoms.JS_ATOM_groups,
-      groups, JS_PROP_C_W_E | JS_PROP_THROW)
-    let indices = state.indices
-    state.indices = Value.Undefined
-    run unsafe support.define(&mut hooks, context, state.object, atoms.JS_ATOM_indices,
-      indices, JS_PROP_C_W_E | JS_PROP_THROW)
+    run support.define(&mut hooks, realm, indices.borrow(), atoms.JS_ATOM_groups, move indicesGroups, JS_PROP_C_W_E | JS_PROP_THROW)
+    run support.define(&mut hooks, realm, object.borrow(), atoms.JS_ATOM_indices, move indices, JS_PROP_C_W_E | JS_PROP_THROW)
   }
-  let result = state.object
-  state.object = Value.Undefined
-  return result
+  return move object
 }
 
-unsafe effect fn builtinExec<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + InterruptHooks>(
-  hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, receiver: Value,
-  input: Value) -> Value ! JsException ? &mut Allocator {
-  if !unsafe support.regexp(receiver) {
-    return run unsafe core.error(&mut hooks, context, b"RegExp object expected")
+effect fn builtinExec<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + InterruptHooks>(
+  hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, receiver: ValueRef<'b>,
+  input: ValueRef<'b>) -> ValueBits ! JsException ? &mut Allocator {
+  if !support.regexp(receiver) {
+    return run ops.error(&mut hooks,realm, b"RegExp object expected")
   }
-  let string = StringOwner.adopt(run unsafe support.string(&mut hooks, context, input))
-  let mut lastIndex = run unsafe getLastIndex(&mut hooks, context, receiver)
+  let string = StringOwner.adopt((run support.string(&mut hooks, realm, input)).intoBits())
+  let mut lastIndex = run getLastIndex(&mut hooks, realm, receiver)
   // Read the current bytecode AFTER both coercions: they may invoke compile().
-  let fields = unsafe support.fields(receiver)
-  let code = StringOwner.borrowed(fields.bytecode)
+  let fields = support.fields(receiver)
+  let code = StringOwner.borrowed(fields.bytecode())
   let anchor = ()
-  let flat = unsafe HeapCell.payload<FlatString, ()>(&anchor, stringReference(code.get()))
+  let flat = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(code.get()))
   let flags = u16.toU32(readU16(flat.latin1.asSlice(), 0))
   drop flat
   let updatesIndex = (flags & (FLAG_GLOBAL | FLAG_STICKY)) != 0
   if !updatesIndex { lastIndex = 0 }
   if lastIndex > usize.toI64(Strings.length(string.get())) {
-    run unsafe setLastIndex(&mut hooks, context, receiver, 0)
-    return Value.Null
+    run setLastIndex(&mut hooks, realm, receiver, 0)
+    return ValueBits.Null
   }
-  let matched = run unsafe execute(&mut hooks, memory, context, code.get(), string.get(), i64.toUsize(lastIndex))
+  let matched = run execute(&mut hooks, memory, realm, unsafe lendFor(code.get()), unsafe lendFor(string.get()), i64.toUsize(lastIndex))
   if !matched.matched {
-    if updatesIndex { run unsafe setLastIndex(&mut hooks, context, receiver, 0) }
-    return Value.Null
+    if updatesIndex { run setLastIndex(&mut hooks, realm, receiver, 0) }
+    return ValueBits.Null
   }
-  if updatesIndex { run unsafe setLastIndex(&mut hooks, context, receiver, matched.captures.get(1)) }
-  let mut state = ResultState { object: Value.Undefined, groups: Value.Undefined,
-    indices: Value.Undefined, indicesGroups: Value.Undefined, temporary: Value.Undefined, groupName: 0 }
-  let built = run Effect.result(unsafe buildResult(&mut hooks, memory, context, string.get(), code.get(), &matched, &mut state))
-  unsafe properties.releaseAtom(unsafe runtime.contextRuntime(context), state.groupName)
-  unsafe support.release(&mut hooks, context, state.temporary)
-  unsafe support.release(&mut hooks, context, state.indicesGroups)
-  unsafe support.release(&mut hooks, context, state.indices)
-  unsafe support.release(&mut hooks, context, state.groups)
-  unsafe support.release(&mut hooks, context, state.object)
+  if updatesIndex { run setLastIndex(&mut hooks, realm, receiver, matched.captures.get(1)) }
+  let mut groupName: u32 = 0
+  let built = run Effect.result(buildResult(&mut hooks, memory, realm, unsafe lendFor(string.get()), unsafe lendFor(code.get()), &matched, &mut groupName))
+  if groupName != 0 { unsafe properties.releaseAtom(realm.runtime(), groupName) }
   return match move built {
-    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Success { value } => value
+    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Success { value } => value.intoBits()
     Result<Value, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => {
-      return run unsafe support.materialize(&mut hooks, context, move error)
+      return run support.materialize(&mut hooks, realm, move error)
     }
   }
 }
 
-pub unsafe effect fn regExpExec<H: HeapHooks + CoercionHooks + CallHooks + OwnPropertyHooks + PropertyWriteHooks + InterruptHooks>(
-  hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, receiver: Value,
-  string: Value) -> Value ! JsException ? &mut Allocator {
-  let method = run unsafe support.get(&mut hooks, context, receiver, atoms.JS_ATOM_exec)
-  if unsafe hooks.isCallable(context, method) {
-    let result = run unsafe core.callFree(&mut hooks, context, method, receiver, &[string])
-    if !result.isObject() && result.tag() != Value.Null.tag() {
-      unsafe support.release(&mut hooks, context, result)
-      return run unsafe core.error(&mut hooks, context, b"RegExp exec method must return an object or null")
+pub effect fn regExpExec<'a, 'b, H: HeapHooks + CoercionHooks + CallHooks + OwnPropertyHooks + PropertyWriteHooks + InterruptHooks>(
+  hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, receiver: ValueRef<'b>,
+  string: ValueRef<'b>) -> Value ! JsException ? &mut Allocator {
+  let method = run support.get(&mut hooks, realm, receiver, atoms.JS_ATOM_exec)
+  if hooks.isCallable(realm, method.borrow()) {
+    let result = run core.invoke(&mut hooks, realm, move method, receiver, &[string.view()])
+    if !result.view().isObject() && result.view().tag() != ValueBits.Null.tag() {
+      drop result
+      return run ops.error(&mut hooks,realm, b"RegExp exec method must return an object or null")
     }
-    return result
+    return move result
   }
-  unsafe support.release(&mut hooks, context, method)
-  return run unsafe builtinExec(&mut hooks, memory, context, receiver, string)
+  drop method
+  return unsafe Value.adoptBits(run builtinExec(&mut hooks, memory, realm, receiver, string))
 }
 
-pub unsafe effect fn exec<H: HeapHooks + CoercionHooks + CallHooks + OwnPropertyHooks + PropertyWriteHooks + InterruptHooks>(
-  hooks: &mut H, memory: &AllocationObserver, context: *mut HeapHeader, receiver: Value,
-  input: Value, test: bool) -> Value ! JsException ? &mut Allocator {
-  if !test { return run unsafe builtinExec(&mut hooks, memory, context, receiver, input) }
+pub effect fn exec<'a, 'b, H: HeapHooks + CoercionHooks + CallHooks + OwnPropertyHooks + PropertyWriteHooks + InterruptHooks>(
+  hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, receiver: ValueRef<'b>,
+  input: ValueRef<'b>, test: bool) -> ValueBits ! JsException ? &mut Allocator {
+  if !test { return run builtinExec(&mut hooks, memory, realm, receiver, input) }
   // Pinned test delegates directly, so an override observes the ORIGINAL argument
   // (not ToString(input)), and arbitrary receivers are permitted by that override.
-  let result = run unsafe regExpExec(&mut hooks, memory, context, receiver, input)
-  let matched = result.tag() != Value.Null.tag()
-  unsafe support.release(&mut hooks, context, result)
-  return Value.Bool { value: matched }
+  let result = run regExpExec(&mut hooks, memory, realm, receiver, input)
+  let matched = result.view().tag() != ValueBits.Null.tag()
+  drop result
+  return ValueBits.Bool { value: matched }
+}
+
+/// RegExp.prototype.exec without the native call layers, for the VM's quick
+/// call path: a RegExp receiver, a flat string argument and an Int lastIndex
+/// (writable when the g or y flag updates it), with neither named groups nor
+/// the d flag. Nothing here can run user code; allocation, regexp timeout and
+/// execution validation failures decline (none) having changed nothing, and
+/// the full call reruns it and reports the failure. lastIndex is
+/// written after the result is built, which no script can observe.
+pub effect fn quickExec<'a, H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + InterruptHooks>(
+  hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, receiver: ValueBits, input: ValueBits) -> Option<ValueBits>
+  ? &mut Allocator {
+  if !support.regexp(unsafe lendFor(receiver)) || input.tag() != -7 { return Option<ValueBits>.none() }
+  let anchor = ()
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(receiver))
+  let stored = match object.properties.get(0).valueBits() {
+    ValueBits.Int { value } => value
+    _ => { return Option<ValueBits>.none() }
+  }
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, object.shape)
+  let writable = (u8.toU32(shape.properties.get(0).flags) & JS_PROP_WRITABLE) != 0
+  drop shape
+  let code = match &object.payload {
+    ObjectPayload.RegExp { regexp } => regexp.bytecode()
+    _ => { return Option<ValueBits>.none() }
+  }
+  drop object
+  let flat = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(code))
+  let flags = u16.toU32(readU16(flat.latin1.asSlice(), 0))
+  drop flat
+  if (flags & (FLAG_NAMED_GROUPS | FLAG_INDICES)) != 0 { return Option<ValueBits>.none() }
+  let updatesIndex = (flags & (FLAG_GLOBAL | FLAG_STICKY)) != 0
+  if updatesIndex && !writable { return Option<ValueBits>.none() }
+  let mut lastIndex: usize = 0
+  if updatesIndex && stored > 0 { lastIndex = i32.toUsize(stored) }
+  if lastIndex > Strings.length(input) {
+    unsafe quickLastIndex(receiver, 0)
+    return Option<ValueBits>.some(ValueBits.Null)
+  }
+  // The receiver keeps code alive: nothing below can replace its bytecode.
+  let codeFlat = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(code))
+  let text = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(input))
+  let mut inputBytes = Slice.view(codeFlat.latin1.asSlice(), 0, 0)
+  if !text.wide { inputBytes = unsafe latin1Bytes(&anchor, stringReference(input)) }
+  let attempted = run Effect.result(executeFlat(&mut hooks, realm, &codeFlat, &text, inputBytes, lastIndex))
+  drop text drop codeFlat
+  let matched = match move attempted {
+    Result<RegExpMatch, OutOfMemoryError | RegExpTimeout | RegExpValidationError>.Success { value } => move value
+    Result<RegExpMatch, OutOfMemoryError | RegExpTimeout | RegExpValidationError>.Failure { .. } => { return Option<ValueBits>.none() }
+  }
+  if !matched.matched {
+    if updatesIndex { unsafe quickLastIndex(receiver, 0) }
+    return Option<ValueBits>.some(ValueBits.Null)
+  }
+  // No named groups here, so no group-name atom is ever interned.
+  let mut groupName: u32 = 0
+  let built = run Effect.result(buildResult(&mut hooks, memory, realm, unsafe lendFor(input), unsafe lendFor(code), &matched, &mut groupName))
+  return match move built {
+    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Success { value } => {
+      if updatesIndex { unsafe quickLastIndex(receiver, matched.captures.get(1)) }
+      Option<ValueBits>.some(value.intoBits())
+    }
+    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Failure { .. } => Option<ValueBits>.none()
+  }
+}
+/// Stores an Int lastIndex into a slot quickExec found Int and writable.
+unsafe fn quickLastIndex(receiver: ValueBits, index: i32) -> () {
+  let mut anchor = ()
+  let object = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, core.reference(receiver))
+  object.properties.set(0, SlotBits.value(ValueBits.Int { value: index }))
 }
