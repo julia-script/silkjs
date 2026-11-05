@@ -4,7 +4,8 @@
 // array holes and out-of-range indexes, int overflow, -0, NaN, strings, strict
 // and loose equality, a callee replaced mid-loop, and setters that store one
 // field on plain, frozen, accessor and array receivers, leaves calling leaves
-// (and setters, natives and non-functions), and leaves that keep declining.
+// (and setters, natives and non-functions), leaves that keep declining, and
+// locals read before any write.
 // Expected values come from V8.
 var r=[];
 function P(x,y){ this.x=x; this.y=y; this.items=[1,2,3]; }
@@ -77,7 +78,12 @@ try { qq.notFn(); } catch(e) { r.push(e.constructor.name); }
 qq.inner=null; try { qq.innerX(); } catch(e) { r.push(e.constructor.name); }
 qq.inner={ getX: function(){ return 'other'; }, deep: function(){ return 'd'; } }; r.push(qq.innerX(), qq.twoDeep());
 var flip=new P(1,1), ft=0; for (var n=0;n<400;n++){ flip.items = (n%2) ? [n] : [,]; ft += flip.at(0) === undefined ? 1 : flip.at(0); } r.push(ft);
+function maybe(c){ var x; if (c) x = 1; return x; }
+function unset(){ var y; return y; }
+function later2(c){ var a = c ? 2 : 3; var b; if (a > 2) b = a; return b === undefined ? 'u' : b; }
+function strictMaybe(c){ "use strict"; var z; if (c) z = this; return z; }
+var mt=[]; for (var w=0;w<6;w++){ mt.push(maybe(w%2), unset(), later2(w%2), typeof strictMaybe.call(w, w%2)); } r.push(mt.join('/'));
 const got = r.join();
-const expected = '10199,,,,,3,42,-42,3,1,proxied,true,true,false,true,false,true,true,false,true,true,false,true,2147483648,true,false,2147483648,a1,0.75,-2147483649,NaN,NaN,5,6,-13,true,true,false,object,object,true,true,,ReferenceError,7,11,21,505,TypeError,2,3,9,own0,5,5,,1,49,true,1,3,n,2,0,TypeError,5,g,1,TypeError,prim,99900,2,300,299,3,4,4,TypeError,TypeError,other,d,40200';
+const expected = '10199,,,,,3,42,-42,3,1,proxied,true,true,false,true,false,true,true,false,true,true,false,true,2147483648,true,false,2147483648,a1,0.75,-2147483649,NaN,NaN,5,6,-13,true,true,false,object,object,true,true,,ReferenceError,7,11,21,505,TypeError,2,3,9,own0,5,5,,1,49,true,1,3,n,2,0,TypeError,5,g,1,TypeError,prim,99900,2,300,299,3,4,4,TypeError,TypeError,other,d,40200,//3/undefined/1//u/number///3/undefined/1//u/number///3/undefined/1//u/number';
 console.log(got === expected ? 'PASS leaf calls' : 'FAIL ' + got);
 if (got !== expected) throw new Error('leaf call regressions');
