@@ -93,22 +93,6 @@ def build_http_parser(native, environment, release):
                    env=environment, check=True)
 
 
-def build_sea(native, environment, release):
-    directory = ROOT / 'build/sea'
-    directory.mkdir(parents=True, exist_ok=True)
-    compiler = shlex.split(environment.get('CC', 'cc'))
-    flags = ['-std=c11', '-pthread', '-fPIC', '-O2' if release else '-O0', '-g']
-    if platform.system() == 'Darwin':
-        flags += ['-isysroot', environment['SDKROOT'], '-mmacosx-version-min=11.0']
-    destination = directory / 'sea_bridge.o'
-    subprocess.run(compiler + flags + ['-c', str(ROOT / 'src/ext/sea_bridge.c'), '-o', str(destination)],
-                   env=environment, check=True)
-    archive = native / 'libsilk_sea.a'
-    archive.unlink(missing_ok=True)
-    subprocess.run(shlex.split(environment.get('AR', 'ar')) + ['rcs', str(archive), str(destination)],
-                   env=environment, check=True)
-
-
 def build_util(native, uv_include, environment, release):
     directory = ROOT / 'build/util'
     directory.mkdir(parents=True, exist_ok=True)
@@ -168,6 +152,5 @@ def build(native, environment, release=False):
     }, environment, release)
     shutil.copyfile(wasi / 'libuvwasi.a', native / 'libuvwasi.a')
     build_http_parser(native, environment, release)
-    build_sea(native, environment, release)
     build_util(native, uv_include, environment, release)
     build_napi(native, uv_include, environment, release)
