@@ -1,0 +1,138 @@
+//! Per-activation scopes for captured variables (HeapKind.Scope, ScopeData).
+//! A scope function (FunctionBytecode.scopeSlots != 0) allocates one scope at entry
+//! holding every captured variable that does not need a per-variable cell; its
+//! closures keep the scope alive through BytecodeClosure.scope, and var-ref
+//! operands with SCOPE_OPERAND set address (depth, slot) from Machine.scope.
+//! The spare bin (takeScope) and the frame-exit fast free belong to the
+//! allocation stream; this module keeps their interface.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.layout { Layout }
+import silk.mem.pointer { Pointer }
+import silk.core.option { Option }
+import silk.num.u16
+import silk.num.u32
+import silk.num.usize
+import runtime_memory { AllocationObserver }
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_value { ValueBits }
+import js_core_types { ScopeData, scopeSlot, FunctionBytecode, FrameSlots, ClosureKind }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtimeApi
+
+/// Set in a var-ref opcode's u16 operand when it names a scope slot:
+/// SCOPE_OPERAND | depth << SCOPE_DEPTH_SHIFT | slot.
+pub const SCOPE_OPERAND: u16 = 0x8000
+pub const SCOPE_DEPTH_SHIFT: u16 = 12
+pub const SCOPE_DEPTH_MAX: usize = 7
+pub const SCOPE_SLOT_MASK: u16 = 0x0fff
+pub const SCOPE_SLOTS_MAX: usize = 4096
+
+fn trap() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+fn present(value: ?*mut HeapHeader) -> *mut HeapHeader {
+  return match Pointer.nonNullMut<HeapHeader>(value) { Option<*mut HeapHeader>.Some { value: reference } => reference _ => trap() }
+}
+
+/// A spare scope of exactly slots slots, published with count 1, or null when
+/// none is parked. Never allocates. Its slots and parent are unset until beginScope.
+pub unsafe fn takeScope(runtime: *mut HeapHeader, slots: usize) -> ?*mut HeapHeader {
+  return Pointer.null<HeapHeader>()
+}
+
+/// A fresh scope of slots slots, published with count 1. May collect first, as
+/// object allocation does. Its slots and parent are unset until beginScope, which
+/// must run before anything can trace it (no allocation in between).
+pub unsafe effect fn allocateScope<H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver, runtime: *mut HeapHeader,
+  slots: usize) -> *mut HeapHeader ! OutOfMemoryError ? &mut Allocator {
+  let collected = run unsafe runtimeApi.triggerGC(memory, &mut hooks, runtime, Layout.of<ScopeData>().bytes + slots * Layout.of<ValueBits>().bytes, false)
+  let scope = run HeapCell.allocateUninitWithTail<ScopeData>(HeapKind.Scope, slots * Layout.of<ValueBits>().bytes)
+  let mut anchor = ()
+  let data = unsafe HeapCell.payloadMut<ScopeData, ()>(&mut anchor, scope)
+  data.parent = Pointer.null<HeapHeader>()
+  data.count = usize.toU32(slots)
+  drop data
+  let mut index: usize = 0
+  while index < slots { unsafe Pointer.write<ValueBits>(unsafe scopeSlot(scope, index), ValueBits.Undefined) index = index + 1 }
+  unsafe gc.publish(runtime, scope)
+  return scope
+}
+
+/// Fills a scope from takeScope/allocateScope for one activation of bytecode:
+/// takes ownership of parent, sets var slots Undefined and lexical slots
+/// Uninitialized, then copies (retaining) each scope parameter from arguments.
+/// arguments covers at least the declared parameters (missing ones Undefined).
+@inlineAlways
+pub unsafe fn beginScope(scope: *mut HeapHeader, parent: ?*mut HeapHeader, bytecode: *mut HeapHeader,
+  arguments: &FrameSlots) -> () {
+  let mut anchor = ()
+  let data = unsafe HeapCell.payloadMut<ScopeData, ()>(&mut anchor, scope)
+  data.parent = parent
+  let count = u32.toUsize(data.count)
+  drop data
+  let codeAnchor = ()
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&codeAnchor, bytecode)
+  let vars = u16.toUsize(code.scopeVarSlots)
+  let mut index: usize = 0
+  while index < vars { unsafe Pointer.write<ValueBits>(unsafe scopeSlot(scope, index), ValueBits.Undefined) index = index + 1 }
+  while index < count { unsafe Pointer.write<ValueBits>(unsafe scopeSlot(scope, index), ValueBits.Uninitialized) index = index + 1 }
+  let pairs = code.scopeParameters.asSlice()
+  let mut at: usize = 0
+  while at + 1 < pairs.length {
+    let argument = u32.toUsize(pairs[at]) let slot = u32.toUsize(pairs[at + 1])
+    let mut value = ValueBits.Undefined
+    if argument < arguments.length() { value = unsafe (unsafe arguments.get(argument)).retained() }
+    unsafe Pointer.write<ValueBits>(unsafe scopeSlot(scope, slot), value)
+    at = at + 2
+  }
+}
+
+/// The scope depth hops above scope.
+@inlineAlways
+pub unsafe fn ancestor(scope: *mut HeapHeader, depth: usize) -> *mut HeapHeader {
+  let mut current = scope
+  let mut hops = depth
+  while hops != 0 {
+    let anchor = ()
+    let data = unsafe HeapCell.payload<ScopeData, ()>(&anchor, current)
+    current = present(data.parent)
+    hops = hops - 1
+  }
+  return current
+}
+
+/// The address of slot in the scope depth hops above scope.
+@inlineAlways
+pub unsafe fn slotAt(scope: *mut HeapHeader, depth: usize, slot: usize) -> *mut ValueBits {
+  return unsafe scopeSlot(unsafe ancestor(scope, depth), slot)
+}
+
+/// The slot a SCOPE_OPERAND operand names, from the running scope.
+@inlineAlways
+pub unsafe fn operandSlot(scope: ?*mut HeapHeader, operand: u16) -> *mut ValueBits {
+  let depth = u16.toUsize(u16.shiftRight(operand, SCOPE_DEPTH_SHIFT) & 7)
+  return unsafe slotAt(present(scope), depth, u16.toUsize(operand & SCOPE_SLOT_MASK))
+}
+
+/// Drops one activation's reference to its own scope at frame exit.
+pub unsafe fn releaseScope<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, scope: *mut HeapHeader) -> () {
+  unsafe gc.releaseObjectHeader(&mut hooks, runtime, scope)
+}
+
+/// The name of the variable a SCOPE_OPERAND operand names in bytecode, for errors; 0 when stripped.
+pub fn operandName(bytecode: &FunctionBytecode, operand: u16) -> u32 {
+  let depth = u16.shiftRight(operand, SCOPE_DEPTH_SHIFT) & 7
+  let slot = u16.toUsize(operand & SCOPE_SLOT_MASK)
+  if depth == 0 && bytecode.scopeSlots != 0 {
+    if slot >= bytecode.scopeVariables.length() { return 0 }
+    let index = u16.toUsize(bytecode.scopeVariables.get(slot))
+    if index >= bytecode.varDefs.length() { return 0 }
+    return bytecode.varDefs.get(index).name
+  }
+  let mut i: usize = 0
+  while i < bytecode.closureVars.length() {
+    let v = bytecode.closureVars.get(i)
+    if v.kind == ClosureKind.Scope && v.variableIndex == operand { return v.name }
+    i = i + 1
+  }
+  return 0
+}
