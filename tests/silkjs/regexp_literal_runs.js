@@ -1,0 +1,15 @@
+// SilkJS regression test: literal and required-run searches, including runs stored as bytes
+// (HINT_RUN_BYTES) and one-unit literals. Expected values come from V8.
+var r = [];
+var pats = [/=/, /the quick brown fox/, /quick brown fox jumped over/, /abcdefgh/, /abcdefghi/, /x(y)abcdefghijk/, /ab+cdefghijklmnop/, /ā=/, /a=ā/, /=ā/g, /é€/, /ééééééééé/];
+var inputs = ['the quick brown fox jumped over the lazy dog', 'the quick brown fo', 'abcdefgh', 'xxabcdefghi', 'xyabcdefghijk.xyabcdefghijk', 'abbbbcdefghijklmnop', 'ā=ā=ā', 'a=āa=b', '', 'ééééééééééé€', 'é€', 'abcdefg' + 'abcdefgh'.repeat(3)];
+for (var i = 0; i < pats.length; i++) for (var j = 0; j < inputs.length; j++) {
+  var m = pats[i].exec(inputs[j]); pats[i].lastIndex = 0;
+  r.push(i + ',' + j + ':' + (m ? JSON.stringify(m) + '@' + m.index : 'null'));
+}
+var g = /bc/g; g.lastIndex = 2; r.push(JSON.stringify(g.exec('abcabc')), g.lastIndex);
+r.push('a=b=c'.split(/=/).join('|'), 'x--y--z'.replace(/--/g, '+'), JSON.stringify('abcdefgh abcdefgh'.match(/abcdefgh/g)));
+const got = r.join('\n');
+const expected = "0,0:null\n0,1:null\n0,2:null\n0,3:null\n0,4:null\n0,5:null\n0,6:[\"=\"]@1\n0,7:[\"=\"]@1\n0,8:null\n0,9:null\n0,10:null\n0,11:null\n1,0:[\"the quick brown fox\"]@0\n1,1:null\n1,2:null\n1,3:null\n1,4:null\n1,5:null\n1,6:null\n1,7:null\n1,8:null\n1,9:null\n1,10:null\n1,11:null\n2,0:[\"quick brown fox jumped over\"]@4\n2,1:null\n2,2:null\n2,3:null\n2,4:null\n2,5:null\n2,6:null\n2,7:null\n2,8:null\n2,9:null\n2,10:null\n2,11:null\n3,0:null\n3,1:null\n3,2:[\"abcdefgh\"]@0\n3,3:[\"abcdefgh\"]@2\n3,4:[\"abcdefgh\"]@2\n3,5:null\n3,6:null\n3,7:null\n3,8:null\n3,9:null\n3,10:null\n3,11:[\"abcdefgh\"]@7\n4,0:null\n4,1:null\n4,2:null\n4,3:[\"abcdefghi\"]@2\n4,4:[\"abcdefghi\"]@2\n4,5:null\n4,6:null\n4,7:null\n4,8:null\n4,9:null\n4,10:null\n4,11:null\n5,0:null\n5,1:null\n5,2:null\n5,3:null\n5,4:[\"xyabcdefghijk\",\"y\"]@0\n5,5:null\n5,6:null\n5,7:null\n5,8:null\n5,9:null\n5,10:null\n5,11:null\n6,0:null\n6,1:null\n6,2:null\n6,3:null\n6,4:null\n6,5:[\"abbbbcdefghijklmnop\"]@0\n6,6:null\n6,7:null\n6,8:null\n6,9:null\n6,10:null\n6,11:null\n7,0:null\n7,1:null\n7,2:null\n7,3:null\n7,4:null\n7,5:null\n7,6:[\"ā=\"]@0\n7,7:null\n7,8:null\n7,9:null\n7,10:null\n7,11:null\n8,0:null\n8,1:null\n8,2:null\n8,3:null\n8,4:null\n8,5:null\n8,6:null\n8,7:[\"a=ā\"]@0\n8,8:null\n8,9:null\n8,10:null\n8,11:null\n9,0:null\n9,1:null\n9,2:null\n9,3:null\n9,4:null\n9,5:null\n9,6:[\"=ā\"]@1\n9,7:[\"=ā\"]@1\n9,8:null\n9,9:null\n9,10:null\n9,11:null\n10,0:null\n10,1:null\n10,2:null\n10,3:null\n10,4:null\n10,5:null\n10,6:null\n10,7:null\n10,8:null\n10,9:[\"é€\"]@10\n10,10:[\"é€\"]@0\n10,11:null\n11,0:null\n11,1:null\n11,2:null\n11,3:null\n11,4:null\n11,5:null\n11,6:null\n11,7:null\n11,8:null\n11,9:[\"ééééééééé\"]@0\n11,10:null\n11,11:null\n[\"bc\"]\n6\na|b|c\nx+y+z\n[\"abcdefgh\",\"abcdefgh\"]";
+console.log(got === expected ? 'PASS regexp literal runs' : 'FAIL ' + JSON.stringify(got));
+if (got !== expected) throw new Error('regexp literal run regressions');
