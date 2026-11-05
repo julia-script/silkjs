@@ -58,3 +58,54 @@ var got3 = out3.join('|');
 const expected3 = "|0|s0|0:1.5|s0:1.5|0:s1|0:1.5:3|s0:1.5:3|0:s1:3|0:1.5:s2|0:1.5:3:4.5|s0:1.5:3:4.5|0:s1:3:4.5|0:1.5:s2:4.5|0:1.5:3:s3|0:1.5:3:4.5:6|s0:1.5:3:4.5:6|0:s1:3:4.5:6|0:1.5:s2:4.5:6|0:1.5:3:s3:6|0:1.5:3:4.5:s4|0:1.5:3:4.5:6:7.5|s0:1.5:3:4.5:6:7.5|0:s1:3:4.5:6:7.5|0:1.5:s2:4.5:6:7.5|0:1.5:3:s3:6:7.5|0:1.5:3:4.5:s4:7.5|0:1.5:3:4.5:6:s5|0:1.5:3:4.5:6:7.5:9|s0:1.5:3:4.5:6:7.5:9|0:s1:3:4.5:6:7.5:9|0:1.5:s2:4.5:6:7.5:9|0:1.5:3:s3:6:7.5:9|0:1.5:3:4.5:s4:7.5:9|0:1.5:3:4.5:6:s5:9|0:1.5:3:4.5:6:7.5:s6|0:1.5:3:4.5:6:7.5:9:10.5|s0:1.5:3:4.5:6:7.5:9:10.5|0:s1:3:4.5:6:7.5:9:10.5|0:1.5:s2:4.5:6:7.5:9:10.5|0:1.5:3:s3:6:7.5:9:10.5|0:1.5:3:4.5:s4:7.5:9:10.5|0:1.5:3:4.5:6:s5:9:10.5|0:1.5:3:4.5:6:7.5:s6:10.5|0:1.5:3:4.5:6:7.5:9:s7|0:1.5:3:4.5:6:7.5:9:10.5:12|s0:1.5:3:4.5:6:7.5:9:10.5:12|0:s1:3:4.5:6:7.5:9:10.5:12|0:1.5:s2:4.5:6:7.5:9:10.5:12|0:1.5:3:s3:6:7.5:9:10.5:12|0:1.5:3:4.5:s4:7.5:9:10.5:12|0:1.5:3:4.5:6:s5:9:10.5:12|0:1.5:3:4.5:6:7.5:s6:10.5:12|0:1.5:3:4.5:6:7.5:9:s7:12|0:1.5:3:4.5:6:7.5:9:10.5:s8|0:1.5:3:4.5:6:7.5:9:10.5:12:13.5|s0:1.5:3:4.5:6:7.5:9:10.5:12:13.5|0:s1:3:4.5:6:7.5:9:10.5:12:13.5|0:1.5:s2:4.5:6:7.5:9:10.5:12:13.5|0:1.5:3:s3:6:7.5:9:10.5:12:13.5|0:1.5:3:4.5:s4:7.5:9:10.5:12:13.5|0:1.5:3:4.5:6:s5:9:10.5:12:13.5|0:1.5:3:4.5:6:7.5:s6:10.5:12:13.5|0:1.5:3:4.5:6:7.5:9:s7:12:13.5|0:1.5:3:4.5:6:7.5:9:10.5:s8:13.5|0:1.5:3:4.5:6:7.5:9:10.5:12:s9|[{\"p\":1,\"q\":2,\"r\":3,\"s\":4,\"t\":5},{\"p\":1,\"q\":2,\"r\":\"str1\",\"s\":4,\"t\":5},{\"p\":1,\"q\":2,\"r\":3,\"s\":4,\"t\":{\"deep\":2}},{\"p\":1,\"q\":2,\"r\":\"str3\",\"s\":4,\"t\":{\"deep\":3}},{\"p\":1,\"q\":2,\"r\":3,\"s\":4,\"t\":5},{\"p\":1,\"q\":2,\"r\":\"str5\",\"s\":4,\"t\":5}]|gy|1|fn|sv|{\"x\":1,\"z\":3}|1,2;1,2;1,str;ga,2";
 console.log(got3 === expected3 ? 'PASS number-only copies and plain shapes' : 'FAIL ' + got3);
 if (got3 !== expected3) throw new Error('number-only copy regressions');
+var out5 = [];
+function S(x) { return JSON.stringify(x); }
+var base = { a: 1, b: 'two', c: { d: 3 } };
+for (var i = 0; i < 3; i++) { var cl = { ...base }; out5.push(S(cl)); }
+var ext = { ...base, a: 9, z: 1 }; out5.push(S(ext), S(base));
+var pre = { z: 0, ...base }; out5.push(S(pre));
+var arrSrc = { ...[5, 6] }; out5.push(S(arrSrc));
+var strSrc = { ...'hi' }; out5.push(S(strSrc)); var { 0: s0, ...rs } = 'abc'; out5.push(s0, S(rs), S({ ...'' }), S({ x: 1, ...'q' }));
+var nul = { ...null, ...undefined, ...7 }; out5.push(S(nul));
+var proto = Object.create({ inh: 1 }); proto.own = 2; out5.push(S({ ...proto }));
+var sym = Symbol('s'); var withSym = { [sym]: 4, k: 5 }; var ws = { ...withSym }; out5.push(ws[sym], ws.k);
+var getterSrc = { get g() { return 'gv'; } }; var gs = { ...getterSrc }; out5.push(S(Object.getOwnPropertyDescriptor(gs, 'g')));
+var prox = new Proxy({ p: 1 }, {}); out5.push(S({ ...prox }));
+var m = new Map([[1, 'a']]); out5.push(S({ ...m }));
+var nested = { o: { x: 1 } }; var nc = { ...nested }; nc.o.x = 2; out5.push(nested.o.x);
+var { a: ra, ...rest } = base; out5.push(ra, S(rest));
+var srt = [3, 1, 2, 10, 1, 20, 5]; out5.push(srt.slice().sort().join());
+var hol = [3, , 1, undefined, 2]; hol.sort(); out5.push(hol.length, S(hol), 1 in hol, 3 in hol, 4 in hol);
+var dups = ['b', 'a', 'b', 'a', 'c', 'a']; out5.push(dups.sort().join());
+var mixedSort = [10, '9', 'a', 1, true, null, 'B']; out5.push(mixedSort.sort().join());
+var big = []; for (var i = 0; i < 200; i++) big.push((i * 37) % 101); big.sort(); out5.push(big.slice(0, 8).join(), big.slice(-4).join());
+var stable = []; for (var i = 0; i < 40; i++) stable.push({ k: i % 3, i: i }); stable.sort(function (x, y) { return x.k - y.k; });
+out5.push(stable.map(function (e) { return e.i; }).join());
+var objSort = { 0: 'c', 1: 'a', 2: 'b', length: 3 }; Array.prototype.sort.call(objSort); out5.push(S(objSort));
+var protoHole = [3, , 1]; Array.prototype[1] = 0; protoHole.sort(); delete Array.prototype[1]; out5.push(S(protoHole));
+var p1 = [1, 2, 3]; out5.push(p1.pop(), p1.pop(), p1.length, S(p1));
+var p0 = []; out5.push(p0.pop(), p0.length);
+var ph = [1, , 3]; out5.push(ph.pop(), ph.pop(), ph.length);
+var pobj = { 0: 'x', 1: 'y', length: 2 }; out5.push(Array.prototype.pop.call(pobj), pobj.length, 1 in pobj);
+var pfrozen = Object.freeze([1]); try { pfrozen.pop(); out5.push('nothrow'); } catch (e) { out5.push(e.constructor.name); }
+var pheap = [{ v: 1 }, 'str', 2n]; out5.push(typeof pheap.pop(), pheap.pop(), pheap.pop().v);
+var mp = new Map(); for (var i = 0; i < 20; i++) mp.set('k' + i, i); out5.push(mp.get('k7'), mp.has('k19'), mp.has('k20'), mp.delete('k3'), mp.delete('k3'), mp.size);
+out5.push(mp.set('n', 1) === mp, mp.get(undefined), mp.get());
+var nanMap = new Map(); nanMap.set(NaN, 'nan').set(-0, 'zero'); out5.push(nanMap.get(NaN), nanMap.get(0), nanMap.has(+0));
+var st = new Set(); out5.push(st.add(1) === st, st.has(1), st.has('1'), st.delete(1), st.size);
+var wm = new WeakMap(); var key = {}; out5.push(wm.set(key, 'w') === wm, wm.get(key), wm.has(key), wm.has({}), wm.delete(key), wm.has(key));
+try { wm.set(1, 2); out5.push('nothrow'); } catch (e) { out5.push(e.constructor.name); }
+out5.push(wm.get(1), wm.has('x'), wm.delete(3));
+var wsx = new WeakSet(); var wk = {}; out5.push(wsx.add(wk) === wsx, wsx.has(wk), wsx.delete(wk), wsx.has(wk));
+try { wsx.add(1); out5.push('nothrow'); } catch (e) { out5.push(e.constructor.name); }
+try { Map.prototype.get.call(new Set(), 1); out5.push('nothrow'); } catch (e) { out5.push(e.constructor.name); }
+try { Map.prototype.set.call({}, 1, 2); out5.push('nothrow'); } catch (e) { out5.push(e.constructor.name); }
+class MyMap extends Map { set(k, v) { return super.set(k, v * 2); } }
+var mm = new MyMap(); mm.set('a', 2); out5.push(mm.get('a'), mm.has('a'));
+var shadow = new Map(); shadow.get = function () { return 'own'; }; out5.push(shadow.get(1));
+var callGet = new Map([[1, 2]]); var g = callGet.get; out5.push(g.call(callGet, 1));
+var wSym = new WeakMap(); try { wSym.set(Symbol('ok'), 1); out5.push(wSym.has(Symbol.for('reg'))); } catch (e) { out5.push(e.constructor.name); }
+var got5 = out5.join('|');
+const expected5 = "{\"a\":1,\"b\":\"two\",\"c\":{\"d\":3}}|{\"a\":1,\"b\":\"two\",\"c\":{\"d\":3}}|{\"a\":1,\"b\":\"two\",\"c\":{\"d\":3}}|{\"a\":9,\"b\":\"two\",\"c\":{\"d\":3},\"z\":1}|{\"a\":1,\"b\":\"two\",\"c\":{\"d\":3}}|{\"z\":0,\"a\":1,\"b\":\"two\",\"c\":{\"d\":3}}|{\"0\":5,\"1\":6}|{\"0\":\"h\",\"1\":\"i\"}|a|{\"1\":\"b\",\"2\":\"c\"}|{}|{\"0\":\"q\",\"x\":1}|{}|{\"own\":2}|4|5|{\"value\":\"gv\",\"writable\":true,\"enumerable\":true,\"configurable\":true}|{\"p\":1}|{}|2|1|{\"b\":\"two\",\"c\":{\"d\":3}}|1,1,10,2,20,3,5|5|[1,2,3,null,null]|true|true|false|a,a,a,b,b,c|1,10,9,B,a,,true|0,0,1,1,10,10,100,100|98,98,99,99|0,3,6,9,12,15,18,21,24,27,30,33,36,39,1,4,7,10,13,16,19,22,25,28,31,34,37,2,5,8,11,14,17,20,23,26,29,32,35,38|{\"0\":\"a\",\"1\":\"b\",\"2\":\"c\",\"length\":3}|[0,1,3]|3|2|1|[1]||0|3||1|y|1|false|TypeError|bigint|str|1|7|true|false|true|false|19|true|||nan|zero|true|true|true|false|true|0|true|w|true|false|true|false|TypeError||false|false|true|true|true|false|TypeError|TypeError|TypeError|4|true|own|2|false";
+console.log(got5 === expected5 ? 'PASS spread, sort, pop and collection methods' : 'FAIL ' + got5);
+if (got5 !== expected5) throw new Error('spread, sort, pop or collection regressions');
