@@ -13,7 +13,7 @@ Requirements:
 - The Silk launcher; `silk.toml` pins the compiler version.
 - Python 3.12 or newer, Clang 22 or newer, CMake, `patch`, and `pkg-config`.
 - A macOS SDK supporting the compiler's macOS 11 deployment target. The build selects the installed macOS 15.5 SDK when `SDKROOT` is unset; otherwise set `SDKROOT` explicitly.
-- Development headers and static archives for libuv 1.50 or newer, OpenSSL 3.2 or newer, c-ares, Brotli, Zstandard, nghttp2, SQLite, and **ICU 78**. They must be discoverable through `pkg-config`. The build adds Homebrew's `icu4c@78` and `sqlite` package-config directories when available.
+- Development headers and static archives for libuv 1.50 or newer, OpenSSL 3.2 or newer, c-ares, Brotli, Zstandard, nghttp2, and **ICU 78**. They must be discoverable through `pkg-config`. The build adds Homebrew's `icu4c@78` package-config directory when available. SQLite needs nothing installed: the `db-sqlite` package from [silk-lang/nonstd](https://github.com/silk-lang/nonstd) compiles its pinned amalgamation into the executable.
 - On GNU/Linux, the executable links libc++, so build ICU with `CXXFLAGS=-stdlib=libc++ LDFLAGS=-stdlib=libc++`. Distribution packages are often too old: Ubuntu 24.04 has libuv 1.48, OpenSSL 3.0 and ICU 74.
 - Network access on the first build to retrieve checksum-verified source dependencies.
 
