@@ -31,6 +31,14 @@ for (var i = 0; i < 3000; i++) {
   var held = new P2(o, [i]);
   o = null;
   check(held.a.n === i && held.b[0] === i, "held " + i);
+  // Arguments stored twice, or not at all, keep every reference.
+  var first = {m: i}, second = [i], third = {t: i};
+  var twice = new P6(first, second, third, "x" + i);
+  first = second = third = null;
+  check(twice.a === twice.e && twice.b === twice.f && twice.a.m === i && twice.f[0] === i && twice.c.t === i, "twice " + i);
+  var unused = {u: i};
+  var dropped = new P2("k" + i, unused, unused, {});
+  check(dropped.b === unused && unused.u === i, "extra kept " + i);
 }
 
 // A setter appears on the prototype after many fast constructions.
