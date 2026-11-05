@@ -14,6 +14,16 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# silkjs's own final opcodes, numbered after QuickJS's: (name, size, pops, pushes, format).
+EXTENSIONS = [
+    ('get_loc_field8', 6, 0, 1, 'atom_u8'),  # get_loc8 index, then get_field atom
+    ('get_arg_field8', 6, 0, 1, 'atom_u8'),  # get_arg index, then get_field atom
+    ('get_loc_length8', 2, 0, 1, 'loc8'),  # get_loc8 index, then get_length
+    ('get_arg_length8', 2, 0, 1, 'loc8'),  # get_arg index, then get_length
+    ('get_loc_el8', 3, 0, 1, 'u16'),  # get_loc8 array, get_loc8 index, then get_array_el
+    ('get_arg_el8', 3, 0, 1, 'u16'),  # get_arg array, get_loc8 index, then get_array_el
+]
+
 
 def literal(data):
     return 'b"' + ''.join(f'\\x{byte:02x}' for byte in data) + '"'
@@ -74,6 +84,7 @@ def main():
     source = sources['quickjs-opcode.h']
     formats = re.findall(r'^FMT\((\w+)\)', source, re.M)
     entries = re.findall(r'^(DEF|def)\(\s*(\w+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\w+)\)', source, re.M)
+    entries += [('DEF', name, str(size), str(pops), str(pushes), fmt) for name, size, pops, pushes, fmt in EXTENSIONS]
     regular = [entry for entry in entries if entry[0] == 'DEF']
     temporary = [entry for entry in entries if entry[0] == 'def']
     regular_ids = {entry[1]: index for index, entry in enumerate(regular)}
