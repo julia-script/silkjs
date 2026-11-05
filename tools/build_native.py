@@ -120,7 +120,7 @@ def build_util(native, uv_include, environment, release):
     if platform.system() == 'Darwin':
         flags += ['-isysroot', environment['SDKROOT'], '-mmacosx-version-min=11.0']
     objects = []
-    for name in ('util_error_bridge', 'process_diagnostics', 'inspector_transport'):
+    for name in ('process_diagnostics', 'inspector_transport'):
         destination = directory / (name + '.o')
         subprocess.run(compiler + flags + ['-c', str(ROOT / 'src/ext' / (name + '.c')),
                                           '-o', str(destination)], env=environment, check=True)
