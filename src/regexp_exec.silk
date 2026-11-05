@@ -24,7 +24,7 @@ import silk.simd.mask8
 import silk.simd.i64x2
 import byte_buffer { readU16, readU32 }
 import regexp_opcodes
-import regexp_types { RegExpMatch, Captures, INLINE_CAPTURES, RegExpTimeout, FLAG_UNICODE, FLAG_UNICODE_SETS, FLAG_HINT, HINT_LENGTH, HINT_LITERAL, HINT_REQUIRED, HINT_ANCHORED, HINT_FIRST_SET, HINT_SET_LENGTH, HINT_RUN_BYTES,
+import regexp_types { RegExpMatch, Captures, INLINE_CAPTURES, RegExpTimeout, FLAG_UNICODE, FLAG_UNICODE_SETS, FLAG_HINT, HINT_LENGTH, HINT_LITERAL, HINT_REQUIRED, HINT_ANCHORED, HINT_FIRST_SET, HINT_SET_LENGTH, HINT_RUN_BYTES, HINT_RUN_UNITS,
   REOP_CLASS, REOP_CLASS_I, CLASS_BITS_LENGTH, REOP_STAR, REOP_PLUS }
 import unicode_case { UnicodeCase }
 
@@ -53,6 +53,9 @@ interface Units {
   // Whether the count units from at equal the count bytes at bytes (the caller
   // keeps at + count within the input).
   fn equalsBytes(self: &Self, at: usize, bytes: [*]const u8, count: usize) -> bool
+  // Whether the count units from at equal the count two-byte units (low byte
+  // first) at bytes, under equalsBytes's bounds.
+  fn equalsUnits(self: &Self, at: usize, bytes: [*]const u8, count: usize) -> bool
 }
 
 struct Narrow { bytes: ?[*]const u8 }
@@ -105,6 +108,17 @@ impl Units for Narrow {
     }
     while k < count {
       if unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(base, usize.wrappingAdd(at, k))) != unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(bytes, k)) { return false }
+      k = k + 1
+    }
+    return true
+  }
+  // The run holds a unit above 255 (see HINT_RUN_UNITS), so it compares unit by unit.
+  fn equalsUnits(self: &Self, at: usize, bytes: [*]const u8, count: usize) -> bool {
+    let mut k: usize = 0
+    while k < count {
+      let low = u8.toU32(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(bytes, k + k)))
+      let high = u8.toU32(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(bytes, k + k + 1)))
+      if self.codeUnitAt(usize.wrappingAdd(at, k)) != low + high * 256 { return false }
       k = k + 1
     }
     return true
@@ -166,6 +180,24 @@ impl Units for Wide {
     let mut k: usize = 0
     while k < count {
       if self.codeUnitAt(usize.wrappingAdd(at, k)) != u8.toU32(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(bytes, k))) { return false }
+      k = k + 1
+    }
+    return true
+  }
+  // Four units a step as one 64-bit word, then units.
+  fn equalsUnits(self: &Self, at: usize, bytes: [*]const u8, count: usize) -> bool {
+    let base = unsafe Intrinsic.pointerReinterpret<[*]const u16, [*]const u8>(unsafe Intrinsic.pointerRequalify<?[*]const u16, [*]const u16>(self.words))
+    let from = usize.wrappingAdd(at, at)
+    let total = count + count
+    let mut k: usize = 0
+    while total - k >= 8 {
+      let left = unsafe Pointer.readUnaligned<u64>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u64>(unsafe Pointer.at<u8>(base, usize.wrappingAdd(from, k))))
+      let right = unsafe Pointer.readUnaligned<u64>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u64>(unsafe Pointer.at<u8>(bytes, k)))
+      if left != right { return false }
+      k = k + 8
+    }
+    while k < total {
+      if unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(base, usize.wrappingAdd(from, k))) != unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(bytes, k)) { return false }
       k = k + 1
     }
     return true
@@ -786,7 +818,7 @@ impl RegExpExecutor {
     let packed = u16.toUsize(readU16(bytecode, hint + 4))
     let count = packed & 255
     let view = ExecInput<Narrow> { units: Narrow { bytes: Pointer.fromSlice<u8>(input) }, unicode: false, length: input.length }
-    return literalSearch(opcodes(bytecode), u16.toUsize(readU16(bytecode, hint + 2)), count, packed / 256, hint - count, &view, start)
+    return literalSearch(opcodes(bytecode), u16.toUsize(readU16(bytecode, hint + 2)), count, packed / 256, hint - count, false, &view, start)
   }
 
   /// execute16 in match8's form.
@@ -806,7 +838,7 @@ fn literalHint(bytecode: &[u8]) -> usize {
   if (u16.toU32(readU16(bytecode, regexp_opcodes.RE_HEADER_FLAGS)) & FLAG_HINT) == 0 { return 0 }
   let hint = regexp_opcodes.RE_HEADER_LEN + u32.toUsize(readU32(bytecode, regexp_opcodes.RE_HEADER_BYTECODE_LEN)) - HINT_LENGTH
   let kindByte = bytecode[hint + 1]
-  if u8.bitAnd(kindByte, 63) != HINT_LITERAL || u8.bitAnd(kindByte, HINT_RUN_BYTES) == 0 { return 0 }
+  if u8.bitAnd(kindByte, 31) != HINT_LITERAL || u8.bitAnd(kindByte, HINT_RUN_BYTES) == 0 { return 0 }
   return hint
 }
 
@@ -965,7 +997,8 @@ fn greedyRun<U: Units>(bytecode: &[u8], ops: [*]const u8, at: usize, input: &Exe
 
 /// The first position at or after start where the count REOP_char steps from
 /// first match, or -1; every character is one unit.
-fn literalSearch<U: Units>(ops: [*]const u8, first: usize, count: usize, pivotAt: usize, runAt: usize, input: &ExecInput<U>, start: usize) -> i64 {
+fn literalSearch<U: Units>(ops: [*]const u8, first: usize, count: usize, pivotAt: usize, runAt: usize, runUnits: bool,
+  input: &ExecInput<U>, start: usize) -> i64 {
   if count > input.length { return -1 }
   // Candidates start at or below last.
   let last = input.length - count
@@ -990,7 +1023,9 @@ fn literalSearch<U: Units>(ops: [*]const u8, first: usize, count: usize, pivotAt
     if hit > last + pivot { return -1 }
     at = hit - pivot
     // The run's bytes (HINT_RUN_BYTES) compare a word at a time.
-    if runAt != usize.MAX {
+    if runUnits {
+      if input.units.equalsUnits(at, unsafe Pointer.assumeMany<u8>(unsafe Pointer.at<u8>(ops, runAt)), count) { return usize.toI64(at) }
+    } else if runAt != usize.MAX {
       if input.units.equalsBytes(at, unsafe Pointer.assumeMany<u8>(unsafe Pointer.at<u8>(ops, runAt)), count) { return usize.toI64(at) }
     } else {
       let mut k: usize = 0
@@ -1027,7 +1062,7 @@ effect fn execute<U: Units, 'env>(bytecode: &[u8], input: &ExecInput<U>, start: 
     let kindByte = unsafe op8(ops, hint + 1)
     planFirst = u16.toUsize(unsafe rangeU16(ops, hint + 6))
     planOp = unsafe op8(ops, hint + 8)
-    let kind = u8.bitAnd(kindByte, 63)
+    let kind = u8.bitAnd(kindByte, 31)
     if u8.bitAnd(kindByte, HINT_FIRST_SET) != 0 { setAt = hint - HINT_SET_LENGTH }
     if kind == HINT_ANCHORED {
       // Only position 0 can match (a u/v-mode start inside a surrogate pair
@@ -1043,11 +1078,14 @@ effect fn execute<U: Units, 'env>(bytecode: &[u8], input: &ExecInput<U>, start: 
       let literalCount = packed & 255
       // The run's bytes sit before the bitmap, or before the trailer without one.
       let mut runAt = usize.MAX
-      if u8.bitAnd(kindByte, HINT_RUN_BYTES) != 0 {
-        runAt = hint - literalCount
-        if setAt != usize.MAX { runAt = setAt - literalCount }
+      let mut runWidth: usize = 0
+      if u8.bitAnd(kindByte, HINT_RUN_BYTES) != 0 { runWidth = 1 }
+      else if u8.bitAnd(kindByte, HINT_RUN_UNITS) != 0 { runWidth = 2 }
+      if runWidth != 0 {
+        runAt = hint - literalCount * runWidth
+        if setAt != usize.MAX { runAt = setAt - literalCount * runWidth }
       }
-      let found = literalSearch(ops, literalAt, literalCount, packed / 256, runAt, input, start)
+      let found = literalSearch(ops, literalAt, literalCount, packed / 256, runAt, runWidth == 2, input, start)
       if found < 0 || kind == HINT_LITERAL { return literalMatch(found, literalCount, &mut out) }
     }
   }
