@@ -13,7 +13,10 @@ m(/\bfoo\b/,'a foo b'); m(/foo\b/,'foobar foo'); m(/A/i,'xa'); m(/(a)\1bc/,'aabc
 r.push('xAbAbx'.replace(/Ab/g,'-'), 'a,b;c'.split(/;/).join('|'), 'abcabc'.split(/bc/).length, 'q1q2'.replace(/q/g, function(m,i){return '['+i+']'}));
 r.push('aXbXc'.replace(/X/g,'$&$&'), 'aXb'.replace(/X/,"$'"), JSON.stringify('xyzxyz'.match(/yz/g)), 'hello'.search(/ll/), String(/ab/g.flags), String(/a\.b/.source), /zz/.test('azz'));
 r.push(JSON.stringify([...'a1b1'.matchAll(/1/g)].map(x => x.index)), 'abc'.replaceAll(/b/g, 'B'));
+// First-unit sets: the search skips to units a match can start with.
+m(/\s?;\s?/,'a b ; c'); m(/[xy]?z/,'aaaz'); m(/(?:ab|cd)e/,'abcde'); m(/[^a]b/,'aab'); m(/k|Z/i,'aaZ'); m(/a*$/,'bcaa'); m(/\d+$/m,'x1\ny22'); m(/[a-c]?\u0100/,'zz\u0100'); m(/\Sx/,'  ax'); m(/ x/,'\u00a0 x');
+r.push('a ; b;c'.split(/\s?;\s?/).join('|'), 'xx yy'.replace(/\s*y/g, '_'));
 const got = JSON.stringify(r.join(';'));
-const expected = "\"2:abc:0;5:abc:8;null;null;null;1:/:0;1:x:0;2:\u0100y:0;1:\u20ac:0;2:ab:0;2:ab:0;1:ab:0;null;0:ab:2;1:abc|b:0;1:abc|:0;0:qbcd|b:0;3:12px:0;1:1.25|1|25:0;0:aaabc:0;0:ababcd:0;0:ababcd:0;0:ababcd:0;3:x:0;4:xy:0;5:c:0;1: \\\"\\\\/Date(12)\\\\/\\\"| |12:16;null;1: ; :0;null;1:cd:0;0:abc:0;0:ab:0;null;1:abc|ab:0;2:foo:0;7:foo:0;1:a:0;0:aabc|a:0;x--x;a,b|c;3;[0]1[2]2;aXXbXXc;abb;[\\\"yz\\\",\\\"yz\\\"];2;g;a\\\\.b;true;[1,3];aBc\"";
+const expected = "\"2:abc:0;5:abc:8;null;null;null;1:/:0;1:x:0;2:\u0100y:0;1:\u20ac:0;2:ab:0;2:ab:0;1:ab:0;null;0:ab:2;1:abc|b:0;1:abc|:0;0:qbcd|b:0;3:12px:0;1:1.25|1|25:0;0:aaabc:0;0:ababcd:0;0:ababcd:0;0:ababcd:0;3:x:0;4:xy:0;5:c:0;1: \\\"\\\\/Date(12)\\\\/\\\"| |12:16;null;1: ; :0;null;1:cd:0;0:abc:0;0:ab:0;null;1:abc|ab:0;2:foo:0;7:foo:0;1:a:0;0:aabc|a:0;x--x;a,b|c;3;[0]1[2]2;aXXbXXc;abb;[\\\"yz\\\",\\\"yz\\\"];2;g;a\\\\.b;true;[1,3];aBc;3: ; :0;3:z:0;2:cde:0;null;2:Z:0;2:aa:0;1:1:0;2:\u0100:0;2:ax:0;1: x:0;a|b|c;xx__\"";
 console.log(got === expected ? 'PASS regexp search hints' : 'FAIL ' + got);
 if (got !== expected) throw new Error('regexp search hint regressions');
