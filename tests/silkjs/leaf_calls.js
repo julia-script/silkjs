@@ -101,7 +101,19 @@ function tdzRead(){ var f=function(){ return late; }; var out; try { out = f(); 
 r.push(tdzRead(), tdzRead());
 function dv(a,b){ return a / b; }
 var dvs=[]; for (var u3=0;u3<3;u3++){ dvs.push(dv(6,3), dv(1,2), dv(1,0), dv(-1,0), dv(0,-5), 1/dv(0,-5), dv(7.5,2.5), dv(3,1.5), dv('6',2), dv(0,0)); } r.push(dvs.join(':'));
+function argField(o){ return o.x; }
+function locLength(){ var a = this.items; return a.length; }
+function locEl(k){ var a = this.items, i = k; return a[i]; }
+function argEl(a){ var i = 1; return a[i]; }
+function maybeEl(c){ var a; if (c) a = this.items; var i = 0; return c ? a[i] : 'none'; }
+var fz = [], fo = { items: [5, , 7] }, fs = { items: 'str' };
+for (var u4 = 0; u4 < 3; u4++) {
+  fz.push(argField({ x: u4 }), argField(1), argField('s'), argField(new Proxy({ x: 'p' }, {})));
+  fz.push(locLength.call(fo), locLength.call(fs), locEl.call(fo, 0), locEl.call(fo, 1), locEl.call(fo, 9), locEl.call(fs, 1), locEl.call(fo, '2'));
+  fz.push(argEl([1, 2]), argEl('xy'), argEl({ 1: 'one' }), maybeEl.call(fo, true), maybeEl.call(fo, false));
+}
+r.push(fz.join('|'));
 const got = r.join();
-const expected = '10199,,,,,3,42,-42,3,1,proxied,true,true,false,true,false,true,true,false,true,true,false,true,2147483648,true,false,2147483648,a1,0.75,-2147483649,NaN,NaN,5,6,-13,true,true,false,object,object,true,true,,ReferenceError,7,11,21,505,TypeError,2,3,9,own0,5,5,,1,49,true,1,3,n,2,0,TypeError,5,g,1,TypeError,prim,99900,2,300,299,3,4,4,TypeError,TypeError,other,d,40200,//3/undefined/1//u/number///3/undefined/1//u/number///3/undefined/1//u/number,TypeError,TypeError,true,3,9,80600,7,199,2,1,g,840,ReferenceError4,ReferenceError4,2:0.5:Infinity:-Infinity:0:-Infinity:3:2:3:NaN:2:0.5:Infinity:-Infinity:0:-Infinity:3:2:3:NaN:2:0.5:Infinity:-Infinity:0:-Infinity:3:2:3:NaN';
+const expected = '10199,,,,,3,42,-42,3,1,proxied,true,true,false,true,false,true,true,false,true,true,false,true,2147483648,true,false,2147483648,a1,0.75,-2147483649,NaN,NaN,5,6,-13,true,true,false,object,object,true,true,,ReferenceError,7,11,21,505,TypeError,2,3,9,own0,5,5,,1,49,true,1,3,n,2,0,TypeError,5,g,1,TypeError,prim,99900,2,300,299,3,4,4,TypeError,TypeError,other,d,40200,//3/undefined/1//u/number///3/undefined/1//u/number///3/undefined/1//u/number,TypeError,TypeError,true,3,9,80600,7,199,2,1,g,840,ReferenceError4,ReferenceError4,2:0.5:Infinity:-Infinity:0:-Infinity:3:2:3:NaN:2:0.5:Infinity:-Infinity:0:-Infinity:3:2:3:NaN:2:0.5:Infinity:-Infinity:0:-Infinity:3:2:3:NaN,0|||p|3|3|5|||t|7|2|y|one|5|none|1|||p|3|3|5|||t|7|2|y|one|5|none|2|||p|3|3|5|||t|7|2|y|one|5|none';
 console.log(got === expected ? 'PASS leaf calls' : 'FAIL ' + got);
 if (got !== expected) throw new Error('leaf call regressions');
