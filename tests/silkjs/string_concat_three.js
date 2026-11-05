@@ -19,6 +19,18 @@ for (var i = 0; i < 200; i++) {
   var rope = ("r" + i).repeat(40) + tag;
   check(leaf(rope) === "String for key ".concat(rope, " in leaf node"), "rope " + i);
 }
+// Repeated joins of the same pieces may share one result; appending to one
+// copy must never show through the others.
+var tagged = "k" + 7;
+var first = leaf(tagged), second = leaf(tagged);
+first += "!";
+var third = leaf(tagged);
+third += "?";
+check(first === "String for key k7 in leaf node!" && second === "String for key k7 in leaf node", "shared append " + first + "|" + second);
+check(third === "String for key k7 in leaf node?" && leaf(tagged) === second, "shared append again");
+var built = [];
+for (var i = 0; i < 50; i++) { var s = leaf(tagged); for (var j = 0; j < i % 5; j++) s += j; built.push(s); }
+for (var i = 0; i < 50; i++) { var expected = "String for key k7 in leaf node"; for (var j = 0; j < i % 5; j++) expected += j; check(built[i] === expected, "built " + i); }
 var o = { toString: function () { return "obj"; } };
 check(leaf(o) === "String for key obj in leaf node", "object tag");
 check(mixed("", "") === "é!", "empty");
