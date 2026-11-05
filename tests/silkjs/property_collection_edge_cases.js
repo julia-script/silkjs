@@ -175,3 +175,91 @@ var got10 = out10.join('|');
 const expected10 = "true|2,4,6,8|1,3|1|2,3,4,9|1,2|true|true|true|2|1|false|sp2|6|false|true|5,6|true|true|true|2";
 console.log(got10 === expected10 ? 'PASS array species shortcuts' : 'FAIL ' + got10);
 if (got10 !== expected10) throw new Error('array species regressions');
+var out11 = [];
+function P() {} P.prototype.z = 0;
+function make(x, y) { var o = new P(); o.x = x; o.y = y; o.z = x + y; return o; }
+for (var i = 0; i < 50; i++) make(i, 1);
+var a = make(1, 2); out11.push(a.x, a.y, a.z, Object.keys(a).join());
+Object.defineProperty(P.prototype, 'z', { set: function (v) { this.seen = v; }, get: function () { return 'g'; }, configurable: true });
+var b = make(3, 4); out11.push(b.z, b.seen, b.hasOwnProperty('z'), Object.keys(b).join());
+Object.defineProperty(P.prototype, 'z', { value: 9, writable: false, configurable: true });
+var c = make(5, 6); out11.push(c.z, c.hasOwnProperty('z'));
+delete P.prototype.z;
+var d = make(7, 8); out11.push(d.z, d.hasOwnProperty('z'));
+function addTo(o, v) { o.w = v; return o; }
+for (var i = 0; i < 20; i++) addTo({ k: i }, i);
+var frozen = Object.preventExtensions({ k: 1 }); addTo(frozen, 2); out11.push(frozen.w, Object.keys(frozen).join());
+var sealedProto = { k: 1 }; Object.defineProperty(Object.prototype, 'w', { set: function (v) { this.viaSetter = v; }, configurable: true });
+var e = addTo({ k: 3 }, 4); out11.push(e.viaSetter, e.hasOwnProperty('w')); delete Object.prototype.w;
+var f = addTo({ k: 5 }, 6); out11.push(f.w, Object.keys(f).join());
+var arr = addTo([1], 7); out11.push(arr.w, arr.length);
+var shapes = [{ k: 1 }, { m: 1 }, { k: 1, m: 2 }];
+for (var i = 0; i < 30; i++) { var s = addTo(Object.assign({}, shapes[i % 3]), i); if (i >= 27) out11.push(Object.keys(s).join() + '=' + s.w); }
+function strictAdd(o) { 'use strict'; o.q = 1; return o; }
+for (var i = 0; i < 10; i++) strictAdd({});
+try { strictAdd(Object.freeze({})); out11.push('no throw'); } catch (err) { out11.push(err instanceof TypeError); }
+var got11 = out11.join('|');
+const expected11 = "1|2|3|x,y,z|g|7|false|x,y,seen|9|false|15|true||k|4|false|6|k,w|7|1|k,w=27|m,w=28|k,m,w=29|true";
+console.log(got11 === expected11 ? 'PASS put_field add site cache' : 'FAIL ' + got11);
+if (got11 !== expected11) throw new Error('add site cache regressions');
+var out12 = [];
+var o = { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9, j: 10, k: 11, l: 12 };
+for (var n = 0; n < 6; n++) o[n] = 'n' + n;
+var ks = Object.keys(o); out12.push(ks.length);
+out12.push(delete o.a, delete o.zz, delete o.c, delete o[2], delete o.e);
+out12.push(Object.keys(o).join());
+for (var key of ['b', 'd', 'f', 'g', 'h', 'i', 0, 1]) delete o[key];
+out12.push(Object.keys(o).join(), JSON.stringify(o));
+o.a = 'again'; o.b = 'b2'; out12.push(Object.keys(o).join(), o.a, o.b, o.j, o[3]);
+var fl = []; for (var k in o) fl.push(k); out12.push(fl.join());
+var nc = { x: 1, y: 2, z: 3 }; delete nc.x; Object.defineProperty(nc, 'w', { value: 4, configurable: false, enumerable: true });
+out12.push(delete nc.w, nc.w, delete nc.y, Object.keys(nc).join());
+(function () { 'use strict'; try { delete nc.w; out12.push('no throw'); } catch (err) { out12.push(err.constructor.name); } })();
+var gs = { p: 1, q: 2 }; delete gs.p; Object.defineProperty(gs, 'r', { get: function () { return 'got'; }, configurable: true, enumerable: true });
+out12.push(gs.r, delete gs.r, gs.r, Object.keys(gs).join());
+var held = { v: { inner: 1 }, s: 'str' + Math.random().toString().slice(0, 1), t: 0 }; delete held.t; var inner = held.v; delete held.v; out12.push(inner.inner, delete held.s, Object.keys(held).length);
+var proto = { pp: 'proto' }; var child = Object.create(proto); child.pp = 'own'; child.q = 1; delete child.q; out12.push(delete child.pp, child.pp);
+var fr = { m: 1, n: 2 }; delete fr.m; Object.freeze(fr); out12.push(delete fr.n, fr.n);
+var big = {}; for (var i = 0; i < 40; i++) big['k' + i] = i; delete big.k0; for (var i = 1; i < 40; i += 2) delete big['k' + i];
+out12.push(Object.keys(big).length, big.k2, big.k38, big.k39, Object.keys(big).slice(0, 4).join());
+big.k1 = 'back'; out12.push(Object.keys(big).pop(), big.k1);
+var arrLike = [1, 2, 3]; arrLike.extra = 1; delete arrLike.extra; out12.push(delete arrLike[1], arrLike.length, 1 in arrLike);
+var fnObj = function () {}; fnObj.a = 1; fnObj.b = 2; delete fnObj.a; out12.push(delete fnObj.b, 'b' in fnObj);
+var got12 = out12.join('|');
+const expected12 = '18|true|true|true|true|true|0,1,3,4,5,b,d,f,g,h,i,j,k,l|3,4,5,j,k,l|{"3":"n3","4":"n4","5":"n5","j":10,"k":11,"l":12}|3,4,5,j,k,l,a,b|again|b2|10|n3|3,4,5,j,k,l,a,b|false|4|true|z,w|TypeError|got|true||q|1|true|0|true|proto|false|2|19|2|38||k2,k4,k6,k8|k1|back|true|3|false|true|false';
+console.log(got12 === expected12 ? 'PASS in-place deletes' : 'FAIL ' + got12);
+if (got12 !== expected12) throw new Error('delete regressions');
+var out13 = [];
+var st = new Set(); out13.push(st.add(1) === st, st.add(1).size, st.add(-0).has(0), st.add('x', 'extra').has('x'), st.size);
+var ws = new WeakSet(); var wk = {}; out13.push(ws.add(wk) === ws, ws.has(wk));
+try { ws.add(1); out13.push('no throw'); } catch (err) { out13.push(err instanceof TypeError); }
+var wm = new WeakMap(); try { wm.set('s', 1); out13.push('no throw'); } catch (err) { out13.push(err instanceof TypeError); }
+var mp = new Map(); out13.push(mp.set('k') === mp, mp.has('k'), mp.get('k'), mp.size, mp.set(NaN, 1).get(NaN), mp.set(-0, 'z').get(0));
+class DoublingMap extends Map { set(k, v) { return super.set(k, v * 2); } } var mm = new DoublingMap(); mm.set('a', 2); out13.push(mm.get('a'));
+var notSet = { add: Set.prototype.add }; try { notSet.add(1); out13.push('no throw'); } catch (err) { out13.push(err instanceof TypeError); }
+var setAsMap = new Set(); setAsMap.set = Map.prototype.set; try { setAsMap.set(1, 2); out13.push('no throw'); } catch (err) { out13.push(err instanceof TypeError); }
+var order = new Set([3, 1]); for (var i = 0; i < 5; i++) order.add(i); out13.push(Array.from(order).join());
+var it = order.values(); it.next(); order.delete(1); order.add(9); var rest = []; for (var v of it) rest.push(v); out13.push(rest.join());
+var big = new Set(); for (var i = 0; i < 300; i++) big.add('s' + (i % 150)); out13.push(big.size, big.has('s149'), big.delete('s3'), big.has('s3'), big.size);
+var objs = new Set(); var o1 = {}; objs.add(o1); objs.add(o1); objs.add({}); out13.push(objs.size);
+var got13 = out13.join('|');
+const expected13 = 'true|1|true|true|3|true|true|true|true|true|true||1|1|z|4|true|true|3,1,0,2,4|0,2,4,9|150|true|true|false|149|2';
+console.log(got13 === expected13 ? 'PASS collection call answers' : 'FAIL ' + got13);
+if (got13 !== expected13) throw new Error('collection call regressions');
+var out14 = [];
+function build() { var o = {}; o.a = 1; o.b = 2; o.c = 3; o.d = 4; o.e = 5; o.f = 6; for (var i = 0; i < 8; i++) o[i] = i * 2; return o; }
+for (var r = 0; r < 40; r++) build();
+var b1 = build(); out14.push(Object.keys(b1).join(), b1[7], b1.f);
+Object.defineProperty(Object.prototype, '3', { set: function (v) { this.hit = v; }, configurable: true });
+var b2 = build(); var own3 = b2.hasOwnProperty(3), hit3 = b2.hit, keys3 = Object.keys(b2).join(); delete Object.prototype[3]; out14.push(own3, hit3, keys3);
+var b3 = build(); out14.push(b3.hasOwnProperty(3), b3[3]);
+function P() {} Object.defineProperty(P.prototype, '1', { value: 'ro', writable: false });
+function fill(o) { for (var i = 0; i < 4; i++) o[i] = 'v' + i; return o; }
+for (var r = 0; r < 30; r++) fill({});
+var p = fill(new P()); out14.push(p.hasOwnProperty(1), p[1], p[2]);
+var ne = Object.preventExtensions({ x: 1 }); fill(ne); out14.push(Object.keys(ne).join());
+var held = {}; var big = []; for (var i = 0; i < 30; i++) { held[i] = { n: i }; } out14.push(held[29].n, Object.keys(held).length);
+var got14 = out14.join('|');
+const expected14 = '0,1,2,3,4,5,6,7,a,b,c,d,e,f|14|6|false|6|0,1,2,4,5,6,7,a,b,c,d,e,f,hit|true|6|false|ro|v2|x|29|30';
+console.log(got14 === expected14 ? 'PASS verified integer-key adds' : 'FAIL ' + got14);
+if (got14 !== expected14) throw new Error('integer add regressions');

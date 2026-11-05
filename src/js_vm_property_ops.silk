@@ -19,7 +19,7 @@ import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
 import js_owned_value { lendBits, immediateRef, lendFor }
 import js_core_types { RuntimeState, FieldCacheEntry, FIELD_PASS_THROUGH, fieldCacheIndex, ContextState, ObjectData, ObjectPayload, ShapeData, ShapeProperty,
-  PropertySlot, SlotBits, NativeErrorKind, JS_PROP_TMASK, JS_PROP_GETSET, JS_PROP_WRITABLE, JS_PROP_LENGTH, JS_PROP_THROW_STRICT, JS_PROP_C_W_E }
+  PropertySlot, SlotBits, NativeErrorKind, JS_PROP_TMASK, JS_PROP_GETSET, JS_PROP_WRITABLE, JS_PROP_LENGTH, JS_PROP_THROW_STRICT, JS_PROP_C_W_E, JS_PROP_CONFIGURABLE }
 import js_gc { HeapHooks }
 import js_gc as gc
 import js_property_host { OwnPropertyHooks, GetPropertyHooks, HasPropertyHooks }
@@ -825,10 +825,19 @@ pub unsafe effect fn addElementOperand<H: HeapHooks>(hooks: &mut H, machine: &mu
   if !plain { return false }
   let value = unsafe machine.top(1)
   if present { if !unsafe putFieldFast(&mut hooks, &machine.*, object, atom, value) { return false } }
-  else if !run unsafe putFieldAdd(&mut hooks, machine.runtime, object, atom, value, true) { return false }
+  else if !run unsafe addElementQuick(machine.runtime, node, atom, unsafe machine.topCell(1)) {
+    if !run unsafe putFieldAdd(&mut hooks, machine.runtime, object, atom, value, true) { return false }
+  }
   unsafe machine.discard(3)
   unsafe gc.releaseObjectHeader(&mut hooks, machine.runtime, node)
   return true
+}
+/// addElementOperand's add along a verified memo entry (quickAddFill, with no
+/// site entry: the key varies at a put_array_el site), growing a full slot list.
+unsafe effect fn addElementQuick(runtime: *mut HeapHeader, node: *mut HeapHeader, atom: u32, source: *mut ValueBits) -> bool ? &mut Allocator {
+  if unsafe quickAddFill(runtime, 0, node, atom, source) { return true }
+  if !run unsafe growForVerifiedAdd(runtime, node, atom) { return false }
+  return unsafe quickAddFill(runtime, 0, node, atom, source)
 }
 /// writeElementOperand one past the end of a fast Array with room for it, as
 /// putArrayFast appends (a[a.length] = x); anything else is left for step.
@@ -890,11 +899,15 @@ unsafe fn writeTypedNumberOperand<H: HeapHooks>(hooks: &mut H, machine: &mut Mac
 // cell holding the value, whose count the property takes. No ValueBits copies.
 // A missing key goes straight to the ordinary add, so execute makes one call.
 @inlineNever
-unsafe effect fn writeField<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node: *mut HeapHeader, atom: u32, source: *mut ValueBits) -> bool ? &mut Allocator {
+unsafe effect fn writeField<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, site: usize, node: *mut HeapHeader, atom: u32, source: *mut ValueBits) -> bool ? &mut Allocator {
   let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
   let index = match unsafe shapes.lookup(data.shape, atom) {
     Option<usize>.Some { value: slot } => slot
-    Option<usize>.None => { drop data return run unsafe addFieldQuick(&mut hooks, runtime, node, atom, source) }
+    Option<usize>.None => {
+      drop data
+      if unsafe siteAdd(runtime, site, node, atom, source) { return true }
+      return run unsafe addFieldQuick(&mut hooks, runtime, site, node, atom, source)
+    }
   }
   let shapeAnchor = () let shape = unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, data.shape)
   let flags = u8.toU32((unsafe shapes.unchecked<ShapeProperty>(&shape.properties, index)).flags) drop shape
@@ -950,9 +963,32 @@ pub unsafe fn writeOwnField(node: *mut HeapHeader, atom: u32, source: *mut Value
 /// addField's verified-memo case in a frame of its own: a leaf with no spills
 /// unless it falls back to the full add.
 @inlineNever
-unsafe effect fn addFieldQuick<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node: *mut HeapHeader, atom: u32, source: *mut ValueBits) -> bool ? &mut Allocator {
-  if unsafe quickAdd(runtime, node, atom, source) { return true }
+unsafe effect fn addFieldQuick<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, site: usize, node: *mut HeapHeader, atom: u32, source: *mut ValueBits) -> bool ? &mut Allocator {
+  if unsafe quickAddFill(runtime, site, node, atom, source) { return true }
+  // A verified add whose slot list is full: grow it as addProperty would, then
+  // the swap fits (objects built property by property past their first slots).
+  if run unsafe growForVerifiedAdd(runtime, node, atom) {
+    if unsafe quickAddFill(runtime, site, node, atom, source) { return true }
+  }
   return run unsafe addField(&mut hooks, runtime, node, atom, source)
+}
+/// Grows node's slot list to the capacity of its verified add target for atom
+/// when the list is full. False when there is no such add, the list has room,
+/// or the allocation fails (nothing is changed then).
+@inlineNever
+unsafe effect fn growForVerifiedAdd(runtime: *mut HeapHeader, node: *mut HeapHeader, atom: u32) -> bool ? &mut Allocator {
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+  if !unsafe addsInPlace(&data) || data.properties.length() < data.properties.capacity() { return false }
+  let index = unsafe shapes.verifiedAddIndex(runtime, data.shape, atom)
+  if index == usize.MAX { return false }
+  let stateAnchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&stateAnchor, runtime)
+  let found = state.transitions[index].target
+  drop state
+  let grown = run Effect.result(unsafe shapes.growForAdd(runtime, &mut data, unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(found)))
+  return match move grown {
+    Result<(), OutOfMemoryError>.Success { .. } => true
+    Result<(), OutOfMemoryError>.Failure { error } => { drop error false }
+  }
 }
 @inlineNever
 unsafe effect fn addField<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node: *mut HeapHeader, atom: u32, source: *mut ValueBits) -> bool ? &mut Allocator {
@@ -1046,18 +1082,52 @@ unsafe effect fn putFieldAdd<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHead
   unsafe gc.retireShape(&mut hooks, runtime, added.retiredShape)
   return true
 }
-/// putFieldAdd along a verified memo entry (shapes.verifiedAdd): the walk was
-/// done for this shape and prototype versions, so the add is a shape swap and a
-/// slot append. Declines (changing nothing) when the target or the object's slot
+/// FieldCacheEntry.protoKey of a put_field site's add entry, whose key is the
+/// index of the add's memo entry (shapes.verifiedAddIndex). get_field reads
+/// never take it: no shape has version 0, the key's upper bits.
+const FIELD_ADD_ENTRY: u64 = 0xffffffffffffffff
+/// An ordinary extensible object, the only kind put_field adds to in place.
+@inlineAlways
+unsafe fn addsInPlace(data: &ObjectData) -> bool {
+  return data.classId() == classes.JS_CLASS_OBJECT && !data.isExotic() && data.extensible() && !data.isStandardArrayPrototype()
+}
+/// quickAdd through the put_field site's cached memo index: the add the site
+/// made last time, when the object's shape and its prototypes still match it.
+/// Skips the memo's hash and way search and the own-key lookup (a verified
+/// memo entry exists only for an atom its base lacks).
+@inlineAlways
+unsafe fn siteAdd(runtime: *mut HeapHeader, site: usize, node: *mut HeapHeader, atom: u32, source: *mut ValueBits) -> bool {
+  let stateAnchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&stateAnchor, runtime)
+  let entry = state.fieldCache[fieldCacheIndex(site)]
+  drop state
+  if entry.site != site || entry.protoKey != FIELD_ADD_ENTRY { return false }
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+  if !unsafe addsInPlace(&data) { return false }
+  let found = unsafe shapes.verifiedAddAt(runtime, u64.toUsize(entry.key), data.shape, atom)
+  if Pointer.isNull<HeapHeader>(found) { return false }
+  return unsafe shapes.swapAdd(&mut data, unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(found), unsafe Pointer.read<ValueBits>(source))
+}
+/// putFieldAdd along a verified memo entry (shapes.verifiedAdd), whose index it
+/// records for the put_field site (0 for none): the walk was done for this
+/// shape and prototype versions, so the add is a shape swap and a slot append. Declines (changing nothing) when the target or the object's slot
 /// list would need anything else: growth, or a reference count reaching or
 /// leaving zero. Takes the value at source only when it returns true.
 @inlineAlways
-unsafe fn quickAdd(runtime: *mut HeapHeader, node: *mut HeapHeader, atom: u32, source: *mut ValueBits) -> bool {
+unsafe fn quickAddFill(runtime: *mut HeapHeader, site: usize, node: *mut HeapHeader, atom: u32, source: *mut ValueBits) -> bool {
   let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
-  if data.classId() != classes.JS_CLASS_OBJECT || data.isExotic() || !data.extensible() || data.isStandardArrayPrototype() { return false }
-  let found = unsafe shapes.verifiedAdd(runtime, data.shape, atom)
-  if Pointer.isNull<HeapHeader>(found) { return false }
-  return unsafe shapes.swapAdd(&mut data, unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(found), unsafe Pointer.read<ValueBits>(source))
+  if !unsafe addsInPlace(&data) { return false }
+  let index = unsafe shapes.verifiedAddIndex(runtime, data.shape, atom)
+  if index == usize.MAX { return false }
+  let stateAnchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&stateAnchor, runtime)
+  let found = state.transitions[index].target
+  drop state
+  if !unsafe shapes.swapAdd(&mut data, unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(found), unsafe Pointer.read<ValueBits>(source)) { return false }
+  drop data
+  if site != 0 {
+    let mut cacheAnchor = () let cache = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut cacheAnchor, runtime)
+    cache.fieldCache[fieldCacheIndex(site)] = FieldCacheEntry { site: site, key: usize.toU64(index), protoKey: FIELD_ADD_ENTRY, midKey: 0, farKey: 0 }
+  }
+  return true
 }
 @inlineNever
 unsafe effect fn putFieldAddStep<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader,
@@ -1074,7 +1144,7 @@ pub unsafe effect fn putFieldOperand<H: HeapHooks>(hooks: &mut H, machine: &mut 
     _ => { return false }
   }
   let atom = unsafe fieldAtom(&machine.*)
-  if !unsafe writeOwnField(node, atom, unsafe machine.topCell(1)) && !run unsafe writeField(&mut hooks, machine.runtime, node, atom, unsafe machine.topCell(1)) { return false }
+  if !unsafe writeOwnField(node, atom, unsafe machine.topCell(1)) && !run unsafe writeField(&mut hooks, machine.runtime, Pointer.address<u8>(machine.ip), node, atom, unsafe machine.topCell(1)) { return false }
   unsafe machine.skip(4)
   unsafe machine.discard(2)
   unsafe gc.releaseObjectHeader(&mut hooks, machine.runtime, node)
@@ -1187,7 +1257,10 @@ pub unsafe effect fn deleteOperation<H: HeapHooks + OwnPropertyHooks + GetProper
   // operand stack keeps the key, so its atom needs no reference of its own.
   let borrowed = unsafe borrowedKeyAtom(machine.runtime, key)
   if borrowed != 0 && target.isObject() {
-    let removed = run unsafe deleteOperand(&mut hooks, memory, unsafe lendRealm(&machine.context, machine.context), target, borrowed)
+    let mut removed = true
+    if !run unsafe quickDelete(&mut hooks, machine.runtime, proxyCore.reference(target), borrowed) {
+      removed = run unsafe deleteOperand(&mut hooks, memory, unsafe lendRealm(&machine.context, machine.context), target, borrowed)
+    }
     unsafe gc.release(&mut hooks, machine.runtime, target)
     unsafe gc.release(&mut hooks, machine.runtime, key)
     unsafe machine.set(2, ValueBits.Bool { value: removed }) unsafe machine.discard(1)
@@ -1204,6 +1277,28 @@ pub unsafe effect fn deleteOperation<H: HeapHooks + OwnPropertyHooks + GetProper
   unsafe gc.release(&mut hooks, machine.runtime, unsafe machine.top(2))
   unsafe gc.release(&mut hooks, machine.runtime, unsafe machine.top(1))
   unsafe machine.set(2, ValueBits.Bool { value: removed }) unsafe machine.discard(1)
+  return true
+}
+/// OP_delete of an own configurable data property of an ordinary object whose
+/// shape it owns alone (every delete after an object's first): the record and
+/// slot are cleared in place (shapes.deleteUnshared), without deleteOwn's
+/// layers. False declines with nothing changed.
+@inlineNever
+unsafe effect fn quickDelete<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node: *mut HeapHeader, atom: u32) -> bool ? &mut Allocator {
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+  if data.classId() != classes.JS_CLASS_OBJECT || data.isExotic() { return false }
+  let shapeAnchor = () let shape = unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, data.shape)
+  if shape.isHashed { return false }
+  drop shape
+  let index = match unsafe shapes.lookup(data.shape, atom) { Option<usize>.Some { value } => value Option<usize>.None => { return false } }
+  let recordAnchor = () let records = unsafe HeapCell.payload<ShapeData, ()>(&recordAnchor, data.shape)
+  let flags = u8.toU32((unsafe shapes.unchecked<ShapeProperty>(&records.properties, index)).flags)
+  drop records
+  if (flags & (JS_PROP_TMASK | JS_PROP_CONFIGURABLE)) != JS_PROP_CONFIGURABLE { return false }
+  let old = (unsafe shapes.unchecked<SlotBits>(&data.properties, index)).valueBits()
+  if unsafe shapes.deleteUnshared(runtime, &mut data, atom, index) { run unsafe shapes.compactAfterDelete(&mut data) }
+  drop data
+  unsafe gc.release(&mut hooks, runtime, old)
   return true
 }
 /// The atom key names without a reference of its own, or 0 when it needs
