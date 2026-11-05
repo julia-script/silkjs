@@ -1355,7 +1355,7 @@ unsafe fn destroyGc<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node:
   }
 }
 /// Entries in RuntimeState.spareCells for each tail size.
-pub const SPARE_CELLS: usize = 64
+pub const SPARE_CELLS: usize = js_shapes.SPARE_OBJECT_CELLS
 /// Frees a dead object cell whose payload owns nothing. A cell whose slots were
 /// its own tail of INLINE_SLOTS or PAIR_SLOTS (tail; 0 for any other cell) keeps
 /// its storage in the runtime's spare cells when there is room.
@@ -1373,31 +1373,49 @@ unsafe fn recycleObjectCell(runtime: *mut HeapHeader, node: *mut HeapHeader, tai
   }
   let mut index = count
   if pair { index = SPARE_CELLS + count state.sparePairCellCount = count + 1 } else { state.spareCellCount = count + 1 }
-  let storage = unsafe HeapCell.takeStorage<ObjectData>(node)
-  let empty = Intrinsic.replace(state.spareCells.asMutSlice()[index], Option<Intrinsic.RawBuffer<u8>>.some(move storage))
-  drop empty
+  // The whole cell parks: its header keeps the owner byte reuse needs.
+  let parked = state.spareCells.asMutSlice()
+  parked[index] = node
 }
-/// Storage for a new object cell with an inline tail of capacity slots
-/// (INLINE_SLOTS or PAIR_SLOTS) from the runtime's spare cells, if any.
+/// A dead object cell with an inline tail of capacity slots (INLINE_SLOTS or
+/// PAIR_SLOTS) from the runtime's spare cells, or null. Its storage is the
+/// caller's: revive it with HeapCell.reviveUninit.
 @inlineAlways
-pub unsafe fn takeSpareCell(runtime: *mut HeapHeader, capacity: usize) -> Option<Intrinsic.RawBuffer<u8>> {
+pub unsafe fn takeSpareCell(runtime: *mut HeapHeader, capacity: usize) -> ?*mut HeapHeader {
   let mut anchor = ()
   let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  let mut index: usize = 0
   if capacity == js_shapes.INLINE_SLOTS {
     let count = state.spareCellCount
-    if count == 0 { return Option<Intrinsic.RawBuffer<u8>>.none() }
+    if count == 0 { return Pointer.null<HeapHeader>() }
     state.spareCellCount = count - 1
-    return Intrinsic.replace(state.spareCells.asMutSlice()[count - 1], Option<Intrinsic.RawBuffer<u8>>.none())
+    index = count - 1
+  } else {
+    let count = state.sparePairCellCount
+    if count == 0 { return Pointer.null<HeapHeader>() }
+    state.sparePairCellCount = count - 1
+    index = SPARE_CELLS + count - 1
   }
-  let count = state.sparePairCellCount
-  if count == 0 { return Option<Intrinsic.RawBuffer<u8>>.none() }
-  state.sparePairCellCount = count - 1
-  return Intrinsic.replace(state.spareCells.asMutSlice()[SPARE_CELLS + count - 1], Option<Intrinsic.RawBuffer<u8>>.none())
+  return state.spareCells.asSlice()[index]
 }
 unsafe fn valuesInTail(node: *mut HeapHeader) -> bool {
   let anchor = ()
   let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
   return match &object.payload { ObjectPayload.FastArray { array } => array.values.borrowsStorage() _ => false }
+}
+/// destroyObject's class finalizer call, for classes other than JS_CLASS_OBJECT.
+unsafe fn finalizeObjectClass<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node: *mut HeapHeader, classId: u32) -> () {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let callback = match &state.classes.asSlice()[u32.toUsize(classId)].finalizer {
+    Option<NativeFunctionId>.Some { value } => Option<NativeFunctionId>.some(value)
+    Option<NativeFunctionId>.None => Option<NativeFunctionId>.none()
+  }
+  drop state
+  match move callback {
+    Option<NativeFunctionId>.Some { value } => { unsafe HeapHooks.finalizeClass(&mut hooks, runtime, node, value) }
+    Option<NativeFunctionId>.None => ()
+  }
 }
 unsafe fn destroyObject<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node: *mut HeapHeader) -> () {
   let mut anchor = ()
@@ -1434,19 +1452,11 @@ unsafe fn destroyObject<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, n
   if classId == JS_CLASS_ARRAY && tail != 0 && unsafe valuesInTail(node) { tail = 0 }
   if properties.ownsStorage() { unsafe js_shapes.parkSlots(runtime, move properties) } else { drop properties }
   unsafe releaseObjectHeader(&mut hooks, runtime, shape)
-  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
-  let callback = match &state.classes.asSlice()[u32.toUsize(classId)].finalizer {
-    Option<NativeFunctionId>.Some { value } => Option<NativeFunctionId>.some(value)
-    Option<NativeFunctionId>.None => Option<NativeFunctionId>.none()
-  }
-  drop state
-  match move callback {
-    Option<NativeFunctionId>.Some { value } => { unsafe HeapHooks.finalizeClass(&mut hooks, runtime, node, value) }
-    Option<NativeFunctionId>.None => ()
-  }
+  // Plain objects (the bulk of what dies) have no class finalizer.
+  if classId != JS_CLASS_OBJECT { unsafe finalizeObjectClass(&mut hooks, runtime, node, classId) }
   let finalizedObject = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
   finalizedObject.setClassId(0)
-  finalizedObject.payload = ObjectPayload.Empty
+  match &finalizedObject.payload { ObjectPayload.Empty => () _ => { finalizedObject.payload = ObjectPayload.Empty } }
   let weak = finalizedObject.weakRefCount
   drop finalizedObject
   unsafe unlinkGc(runtime, node)
@@ -1552,6 +1562,195 @@ pub unsafe fn detachFrameReferences<H: HeapHooks>(hooks: &mut H, runtime: *mut H
     }
     index = index + 1
   }
+}
+
+/// Captured cells a returning frame detached, retained until its slots are
+/// released (releaseFrameCycles). Only the first FRAME_CYCLE_CELLS are kept.
+pub const FRAME_CYCLE_CELLS: usize = 16
+pub struct FrameCaptures {
+  cells: [?*mut HeapHeader; 16],
+  count: usize
+}
+impl FrameCaptures {
+  @inlineAlways
+  pub fn make() -> Self { return Self { cells: [Pointer.null<HeapHeader>(); 16], count: 0 } }
+}
+/// detachFrameReferences that also retains each detached cell in captures.
+pub unsafe fn detachFrameCaptures<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, frame: *mut StackFrame,
+  captures: &mut FrameCaptures) -> () {
+  let anchor = ()
+  let mut index: usize = 0
+  while true {
+    let sf = unsafe Pointer.borrow<(), StackFrame>(&anchor, frame)
+    if index == sf.varRefs.length() { return () }
+    let reference = unsafe sf.varRefs.get(index)
+    drop sf
+    if !Pointer.isNull<HeapHeader>(reference) {
+      let cell = unsafe nonnull(reference)
+      unsafe detachVarRef(&mut hooks, runtime, cell)
+      if captures.count < FRAME_CYCLE_CELLS {
+        unsafe HeapCell.retain(cell)
+        captures.cells[captures.count] = reference
+        captures.count = captures.count + 1
+      }
+    }
+    index = index + 1
+  }
+}
+/// The bytecode closure a detached cell holds, or null.
+unsafe fn capturedClosure(cell: *mut HeapHeader) -> ?*mut HeapHeader {
+  let anchor = ()
+  let captured = unsafe HeapCell.payload<VarRef, ()>(&anchor, cell)
+  let value = match captured.state { VarRefState.Detached { value } => value _ => { return Pointer.null<HeapHeader>() } }
+  drop captured
+  let object = match value { ValueBits.Object { reference } => reference _ => { return Pointer.null<HeapHeader>() } }
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  if data.classId() != JS_CLASS_BYTECODE_FUNCTION { return Pointer.null<HeapHeader>() }
+  return object
+}
+fn findCell(cells: &[?*mut HeapHeader; 16], count: usize, cell: ?*mut HeapHeader) -> usize {
+  let mut i: usize = 0
+  while i < count { if same(cells[i], cell) { return i } i = i + 1 }
+  return count
+}
+/// Numbers each captured cell (VarRef.frameIndex = index + 1), or clears them.
+unsafe fn numberCells(cells: &[?*mut HeapHeader; 16], total: usize, numbered: bool) -> () {
+  let mut i: usize = 0
+  while i < total {
+    let mut anchor = ()
+    let reference = unsafe HeapCell.payloadMut<VarRef, ()>(&mut anchor, unsafe nonnull(cells[i]))
+    reference.frameIndex = 0
+    if numbered { reference.frameIndex = usize.toU8(i + 1) }
+    i = i + 1
+  }
+}
+/// The index of cell among numbered cells, or total when it is not one of them.
+@inlineAlways
+unsafe fn numberedCell(cells: &[?*mut HeapHeader; 16], total: usize, cell: ?*mut HeapHeader) -> usize {
+  if Pointer.isNull<HeapHeader>(cell) { return total }
+  let anchor = ()
+  let index = u8.toUsize((unsafe HeapCell.payload<VarRef, ()>(&anchor, unsafe nonnull(cell))).frameIndex)
+  if index == 0 || index > total || !same(cells[index - 1], cell) { return total }
+  return index - 1
+}
+/// Run after a returning frame released its slots: frees the cycles made only
+/// of the cells it captured and the closures they hold, the common shape of a
+/// recursive local function (closure -> captured cell -> closure). Trial
+/// deletion over that small set: a member is live when references from outside
+/// the set remain (its count exceeds the set's own edges to it), and so is all
+/// it reaches inside the set. Each dead cell drops its closure, which frees the
+/// rest by reference counting. Releases the retains captures holds.
+pub unsafe fn releaseFrameCycles<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, captures: &mut FrameCaptures) -> () {
+  let total = captures.count
+  let mut closures: [?*mut HeapHeader; 16] = [Pointer.null<HeapHeader>(); 16]
+  let mut owner: [usize; 16] = [16; 16]
+  let mut closureCount: usize = 0
+  let mut i: usize = 0
+  while i < total {
+    let cell = unsafe nonnull(captures.cells[i])
+    // A count of one is captures' own retain: the cell dies on its release.
+    if unsafe count(cell) > 1 {
+      let closure = unsafe capturedClosure(cell)
+      if !Pointer.isNull<HeapHeader>(closure) {
+        let at = findCell(&closures, closureCount, closure)
+        if at == closureCount { closures[closureCount] = closure closureCount = closureCount + 1 }
+        owner[i] = at
+      }
+    }
+    i = i + 1
+  }
+  if closureCount != 0 {
+    // A closure is live when references from outside the set remain: its count
+    // exceeds the cells in the set that hold it. With every closure live no
+    // cell can die (a cell only dies by dropping a dead closure), the usual
+    // case for closures that escape.
+    let mut closureEdges: [i32; 16] = [0; 16]
+    i = 0
+    while i < total { if owner[i] < 16 { closureEdges[owner[i]] = closureEdges[owner[i]] + 1 } i = i + 1 }
+    let mut closureLive: [bool; 16] = [false; 16]
+    let mut anyDead = false
+    let mut j: usize = 0
+    while j < closureCount {
+      closureLive[j] = unsafe count(unsafe nonnull(closures[j])) > closureEdges[j]
+      if !closureLive[j] { anyDead = true }
+      j = j + 1
+    }
+    if anyDead { unsafe dropDeadCycles(&mut hooks, runtime, &captures.cells, total, &closures, closureCount, &owner, &mut closureLive) }
+  }
+  i = 0
+  while i < total { unsafe releaseHeader(&mut hooks, runtime, unsafe nonnull(captures.cells[i])) i = i + 1 }
+  captures.count = 0
+}
+/// The edges closure -> captured cell inside the set, read once. More than
+/// FRAME_CYCLE_EDGES and the set is left to the cycle collector.
+const FRAME_CYCLE_EDGES: usize = 48
+/// releaseFrameCycles once some closure has no reference from outside the set:
+/// finds what the live members reach and clears the cells left dead.
+@inlineNever
+unsafe fn dropDeadCycles<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, cells: &[?*mut HeapHeader; 16], total: usize,
+  closures: &[?*mut HeapHeader; 16], closureCount: usize, owner: &[usize; 16], closureLive: &mut [bool; 16]) -> () {
+  let mut edgeFrom: [u8; 48] = [0; 48]
+  let mut edgeTo: [u8; 48] = [0; 48]
+  let mut edges: usize = 0
+  let mut cellEdges: [i32; 16] = [0; 16]
+  let anchor = ()
+  unsafe numberCells(&cells, total, true)
+  let mut j: usize = 0
+  while j < closureCount {
+    let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, unsafe nonnull(closures[j]))
+    match &data.payload {
+      ObjectPayload.BytecodeFunction { function } => {
+        let mut k: usize = 0
+        while k < function.varRefs.length() {
+          let at = unsafe numberedCell(&cells, total, function.varRefs.get(k))
+          if at < total {
+            if edges == FRAME_CYCLE_EDGES { unsafe numberCells(&cells, total, false) return () }
+            cellEdges[at] = cellEdges[at] + 1
+            edgeFrom[edges] = usize.toU8(j) edgeTo[edges] = usize.toU8(at) edges = edges + 1
+          }
+          k = k + 1
+        }
+      }
+      _ => ()
+    }
+    j = j + 1
+  }
+  unsafe numberCells(&cells, total, false)
+  let mut cellLive: [bool; 16] = [false; 16]
+  let mut i: usize = 0
+  while i < total { cellLive[i] = owner[i] >= 16 || unsafe count(unsafe nonnull(cells[i])) - 1 > cellEdges[i] i = i + 1 }
+  // Liveness flows along the set's edges until nothing changes.
+  let mut changed = true
+  while changed {
+    changed = false
+    i = 0
+    while i < total {
+      if cellLive[i] && owner[i] < 16 && !closureLive[owner[i]] { closureLive[owner[i]] = true changed = true }
+      i = i + 1
+    }
+    let mut e: usize = 0
+    while e < edges {
+      let to = u8.toUsize(edgeTo[e])
+      if closureLive[u8.toUsize(edgeFrom[e])] && !cellLive[to] { cellLive[to] = true changed = true }
+      e = e + 1
+    }
+  }
+  // Dead cells give up their closures; the cells themselves die when the
+  // closures and captures' retains are released.
+  let mut dropped: [ValueBits; 16] = [ValueBits.Undefined; 16]
+  let mut droppedCount: usize = 0
+  i = 0
+  while i < total {
+    if !cellLive[i] && owner[i] < 16 {
+      let mut cellAnchor = ()
+      let reference = unsafe HeapCell.payloadMut<VarRef, ()>(&mut cellAnchor, unsafe nonnull(cells[i]))
+      match reference.state { VarRefState.Detached { value } => { dropped[droppedCount] = value droppedCount = droppedCount + 1 } _ => () }
+      reference.state = VarRefState.Detached { value: ValueBits.Undefined }
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < droppedCount { unsafe release(&mut hooks, runtime, dropped[i]) i = i + 1 }
 }
 
 unsafe fn releaseAtom(runtime: *mut HeapHeader, atom: u32) -> () {
@@ -2008,6 +2207,8 @@ pub unsafe effect fn destroyRuntime<H: HeapHooks>(hooks: &mut H, runtime: *mut H
     index = index + 1
   }
   drop finalState
+  // Spare object cells are bare pointers: free them before the state goes.
+  unsafe js_shapes.flushSpareSlots(runtime)
   require(unsafe count(runtime) == 1)
   require(unsafe HeapCell.decrement(runtime))
   unsafe HeapCell.destroy<RuntimeState>(runtime)
