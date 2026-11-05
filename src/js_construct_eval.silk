@@ -1,0 +1,570 @@
+// Frameless runs of small constructor bodies: new F(...) whose body only stores
+// values computed from its arguments and constants into `this` (Class.create
+// initializers such as `this.x = (x ? x : 0)` or `if (!r) r = 0; this.red = r`;
+// js_bytecode.CONSTRUCT_EVAL). The body is read once into a recipe: each store's
+// value as a small expression over the arguments (argument, constant, `!`, and
+// the choice an if/else or a conditional makes on a value's truthiness). Every
+// such expression is pure, so a construction evaluates the recipe and makes the
+// stores at once, by the final shape a run from the same empty shape reached
+// before or by verified adds. Bodies the recipe cannot express, and objects the
+// fast path does not cover, decline with nothing changed; the caller then
+// enters the usual frame.
+import silk.mem.pointer { Pointer }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.num.u8
+import silk.num.f64
+import silk.num.u32
+import silk.num.u64
+import silk.num.i32
+import silk.num.i64
+import silk.num.usize
+import js_heap { HeapCell, HeapHeader }
+import js_value { ValueBits }
+import js_core_types { ObjectData, ObjectPayload, FunctionBytecode, FrameSlots, RuntimeState, ShapeData, SlotBits, ConstructCacheEntry, ConstructRecipe, blankRecipe }
+import js_shapes as shapes
+import js_primitives as primitives
+import js_class_data as classes
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_object_allocate as objects
+import js_realm { Realm }
+import runtime_memory { AllocationObserver }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+/// Recipe node kinds: a constant (constants[a]), argument a, the receiver,
+/// !node a, and truthy(node a) ? node b : node c.
+const RECIPE_CONST: u8 = 0
+const RECIPE_ARG: u8 = 1
+const RECIPE_RECEIVER: u8 = 2
+const RECIPE_NOT: u8 = 3
+const RECIPE_SELECT: u8 = 4
+const NODES_MAX: usize = 16
+const CONSTANTS_MAX: usize = 8
+const STORES_MAX: usize = 8
+const STACK_MAX: usize = 8
+/// Arguments and locals a body may use.
+const SLOTS_MAX: usize = 4
+
+@inlineAlways
+unsafe fn byteAt(bytes: *const u8, index: usize) -> u8 {
+  return unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(bytes), index))
+}
+@inlineAlways
+fn signed8(value: u8) -> i64 {
+  if value >= 128 { return u8.toI64(value) - 256 }
+  return u8.toI64(value)
+}
+@inlineAlways
+fn truthy(value: ValueBits) -> bool {
+  return match value {
+    ValueBits.Int { value: number } => number != 0
+    ValueBits.Bool { value: flag } => flag
+    ValueBits.Undefined => false
+    ValueBits.Null => false
+    ValueBits.Float64 { value: number } => number == number && number != 0.0
+    _ => unsafe primitives.toBoolean(value) > 0
+  }
+}
+@inlineAlways
+fn cacheSlot(code: usize) -> usize { return (code ^ usize.shiftRight(code, 10)) / 8 & 63 }
+@inlineAlways
+unsafe fn headerCount(header: *mut HeapHeader) -> i32 {
+  let anchor = ()
+  return (unsafe Pointer.borrow<(), HeapHeader>(&anchor, header)).referenceCount
+}
+
+/// The symbolic machine state while a body is read: node indexes (255 for none).
+struct Symbols {
+  stack: [u8; 8],
+  depth: usize,
+  arguments: [u8; 4],
+  locals: [u8; 4]
+}
+impl Copy for Symbols {}
+
+/// Whether no store of recipe can put the receiver itself (a cycle no count
+/// would see): no root is the receiver node or a choice that may yield it.
+fn selfFree(recipe: &ConstructRecipe) -> bool {
+  let mut reaches: u32 = 0
+  let count = u8.toUsize(recipe.nodeCount)
+  let mut index: usize = 0
+  while index < count && index < NODES_MAX {
+    let word = recipe.nodes[index]
+    let kind = word & 255
+    let b = u32.shiftRight(word, 16) & 255
+    let c = u32.shiftRight(word, 24)
+    if kind == u8.toU32(RECIPE_RECEIVER) { reaches = reaches | u32.shiftLeft(1, usize.toU32(index)) }
+    if kind == u8.toU32(RECIPE_SELECT) && ((u32.shiftRight(reaches, b) | u32.shiftRight(reaches, c)) & 1) != 0 { reaches = reaches | u32.shiftLeft(1, usize.toU32(index)) }
+    index = index + 1
+  }
+  index = 0
+  while index < u8.toUsize(recipe.stores) && index < STORES_MAX {
+    if (u32.shiftRight(reaches, u8.toU32(recipe.roots[index])) & 1) != 0 { return false }
+    index = index + 1
+  }
+  return true
+}
+/// Whether two immediates are the same value bit for bit (0 and -0 differ).
+fn sameImmediate(left: ValueBits, right: ValueBits) -> bool {
+  return match left {
+    ValueBits.Int { value: number } => match right { ValueBits.Int { value: other } => number == other _ => false }
+    ValueBits.Bool { value: flag } => match right { ValueBits.Bool { value: other } => flag == other _ => false }
+    ValueBits.Float64 { value: number } => match right { ValueBits.Float64 { value: other } => f64.toBits(number) == f64.toBits(other) _ => false }
+    ValueBits.Null => match right { ValueBits.Null => true _ => false }
+    ValueBits.Undefined => match right { ValueBits.Undefined => true _ => false }
+    _ => false
+  }
+}
+@inlineAlways
+fn pack(kind: u32, a: u32, b: u32, c: u32) -> u32 {
+  return kind | u32.shiftLeft(a, 8) | u32.shiftLeft(b, 16) | u32.shiftLeft(c, 24)
+}
+/// Folds and prunes recipe's nodes: a choice on !x becomes the swapped choice
+/// on x, a choice between one node twice is that node, and nodes no store
+/// needs are dropped (the receiver and undefined keep places 0 and 1).
+fn simplify(recipe: &mut ConstructRecipe) -> () {
+  let count = u8.toUsize(recipe.nodeCount)
+  let mut same: [u8; 16] = [0; 16]
+  let mut index: usize = 0
+  while index < count && index < NODES_MAX {
+    same[index] = usize.toU8(index)
+    let word = recipe.nodes[index]
+    let kind = word & 255
+    let mut a = u32.shiftRight(word, 8) & 255
+    let mut b = u32.shiftRight(word, 16) & 255
+    let mut c = u32.shiftRight(word, 24)
+    if kind == u8.toU32(RECIPE_NOT) { a = u8.toU32(same[u32.toUsize(a) & 15]) recipe.nodes[index] = pack(kind, a, 0, 0) }
+    if kind == u8.toU32(RECIPE_SELECT) {
+      a = u8.toU32(same[u32.toUsize(a) & 15]) b = u8.toU32(same[u32.toUsize(b) & 15]) c = u8.toU32(same[u32.toUsize(c) & 15])
+      let condition = recipe.nodes[u32.toUsize(a) & 15]
+      if (condition & 255) == u8.toU32(RECIPE_NOT) { a = u32.shiftRight(condition, 8) & 255 let swap = b b = c c = swap }
+      if b == c { same[index] = u32.toU8(b) }
+      recipe.nodes[index] = pack(kind, a, b, c)
+    }
+    index = index + 1
+  }
+  let stores = u8.toUsize(recipe.stores)
+  let mut live: u32 = 3
+  index = 0
+  while index < stores && index < STORES_MAX {
+    recipe.roots[index] = same[u8.toUsize(recipe.roots[index]) & 15]
+    live = live | u32.shiftLeft(1, u8.toU32(recipe.roots[index]))
+    index = index + 1
+  }
+  index = count
+  while index > 2 {
+    index = index - 1
+    if (u32.shiftRight(live, usize.toU32(index)) & 1) != 0 && u8.toUsize(same[index & 15]) == index {
+      let word = recipe.nodes[index & 15]
+      let kind = word & 255
+      if kind == u8.toU32(RECIPE_NOT) || kind == u8.toU32(RECIPE_SELECT) { live = live | u32.shiftLeft(1, u32.shiftRight(word, 8) & 255) }
+      if kind == u8.toU32(RECIPE_SELECT) { live = live | u32.shiftLeft(1, u32.shiftRight(word, 16) & 255) | u32.shiftLeft(1, u32.shiftRight(word, 24)) }
+    }
+  }
+  let mut place: [u8; 16] = [0; 16]
+  let mut next: usize = 0
+  index = 0
+  while index < count && index < NODES_MAX {
+    if index < 2 || ((u32.shiftRight(live, usize.toU32(index)) & 1) != 0 && u8.toUsize(same[index]) == index) {
+      let word = recipe.nodes[index]
+      let kind = word & 255
+      let mut packed = word
+      if kind == u8.toU32(RECIPE_NOT) { packed = pack(kind, u8.toU32(place[u32.toUsize(u32.shiftRight(word, 8) & 15)]), 0, 0) }
+      if kind == u8.toU32(RECIPE_SELECT) {
+        packed = pack(kind, u8.toU32(place[u32.toUsize(u32.shiftRight(word, 8) & 15)]), u8.toU32(place[u32.toUsize(u32.shiftRight(word, 16) & 15)]),
+          u8.toU32(place[u32.toUsize(u32.shiftRight(word, 24) & 15)]))
+      }
+      place[index] = usize.toU8(next)
+      recipe.nodes[next & 15] = packed
+      next = next + 1
+    }
+    index = index + 1
+  }
+  index = 0
+  while index < stores && index < STORES_MAX { recipe.roots[index] = place[u8.toUsize(recipe.roots[index]) & 15] index = index + 1 }
+  recipe.nodeCount = usize.toU8(next)
+}
+/// Appends a node to recipe; 255 when it is full.
+fn addNode(recipe: &mut ConstructRecipe, kind: u8, a: u8, b: u8, c: u8) -> u8 {
+  let count = u8.toUsize(recipe.nodeCount)
+  if count >= NODES_MAX { return 255 }
+  recipe.nodes[count] = u8.toU32(kind) | u32.shiftLeft(u8.toU32(a), 8) | u32.shiftLeft(u8.toU32(b), 16) | u32.shiftLeft(u8.toU32(c), 24)
+  recipe.nodeCount = recipe.nodeCount + 1
+  return usize.toU8(count)
+}
+/// A constant node for value, an immediate; 255 when recipe is full.
+fn constantNode(recipe: &mut ConstructRecipe, constants: &mut usize, value: ValueBits) -> u8 {
+  let count = u8.toUsize(recipe.nodeCount)
+  let mut node: usize = 0
+  while node < count && node < NODES_MAX {
+    let word = recipe.nodes[node]
+    if (word & 255) == u8.toU32(RECIPE_CONST) && sameImmediate(recipe.constants[u32.toUsize(u32.shiftRight(word, 8) & 7)], value) { return usize.toU8(node) }
+    node = node + 1
+  }
+  if constants.* >= CONSTANTS_MAX { return 255 }
+  let index = constants.*
+  recipe.constants[index] = value
+  constants.* = index + 1
+  return addNode(&mut recipe, RECIPE_CONST, usize.toU8(index), 0, 0)
+}
+/// An argument's node, made the first time it is read.
+fn argumentNode(recipe: &mut ConstructRecipe, symbols: &mut Symbols, index: usize) -> u8 {
+  if symbols.arguments[index] == 255 { symbols.arguments[index] = addNode(&mut recipe, RECIPE_ARG, usize.toU8(index), 0, 0) }
+  return symbols.arguments[index]
+}
+fn push(symbols: &mut Symbols, node: u8) -> bool {
+  if node == 255 || symbols.depth >= STACK_MAX { return false }
+  symbols.stack[symbols.depth] = node
+  symbols.depth = symbols.depth + 1
+  return true
+}
+/// One instruction of a straight stretch (no branch, store or return) at pc,
+/// applied to symbols; the next pc, or usize.MAX when it is not covered.
+unsafe fn straight(bytes: *const u8, pc: usize, recipe: &mut ConstructRecipe, constants: &mut usize, symbols: &mut Symbols,
+  receiver: u8, undefined: u8, pool: &FunctionBytecode) -> usize {
+  let opcode = unsafe byteAt(bytes, pc)
+  let declined = usize.MAX
+  if opcode == 8 { if !push(&mut symbols, receiver) { return declined } return pc + 1 } // OP_push_this
+  if opcode == 6 { if !push(&mut symbols, undefined) { return declined } return pc + 1 } // OP_undefined
+  if opcode == 7 || opcode == 9 || opcode == 10 || (opcode >= 184 && opcode <= 192) { // null, false, true, push_minus1..push_7
+    let mut value = ValueBits.Null
+    if opcode == 9 { value = ValueBits.Bool { value: false } }
+    if opcode == 10 { value = ValueBits.Bool { value: true } }
+    if opcode >= 184 { value = ValueBits.Int { value: u8.toI32(opcode - 184) - 1 } }
+    if !push(&mut symbols, constantNode(&mut recipe, &mut constants, value)) { return declined }
+    return pc + 1
+  }
+  if opcode == 193 { // OP_push_i8
+    if !push(&mut symbols, constantNode(&mut recipe, &mut constants, ValueBits.Int { value: i64.toI32(signed8(unsafe byteAt(bytes, pc + 1))) })) { return declined }
+    return pc + 2
+  }
+  if opcode == 195 { // OP_push_const8
+    let slot = u8.toUsize(unsafe byteAt(bytes, pc + 1))
+    if slot >= pool.constants.length() { return declined }
+    let value = pool.constants.asSlice()[slot]
+    // Only immediates: a heap constant would need the bytecode kept alive.
+    match value.heapReference() { Option<*mut HeapHeader>.Some { .. } => { return declined } Option<*mut HeapHeader>.None => () }
+    if !push(&mut symbols, constantNode(&mut recipe, &mut constants, value)) { return declined }
+    return pc + 2
+  }
+  if opcode == 14 { if symbols.depth == 0 { return declined } symbols.depth = symbols.depth - 1 return pc + 1 } // OP_drop
+  if opcode == 17 { if symbols.depth == 0 { return declined } let top = symbols.stack[symbols.depth - 1] if !push(&mut symbols, top) { return declined } return pc + 1 } // OP_dup
+  if opcode == 148 { // OP_lnot
+    if symbols.depth == 0 { return declined }
+    let node = addNode(&mut recipe, RECIPE_NOT, symbols.stack[symbols.depth - 1], 0, 0)
+    if node == 255 { return declined }
+    symbols.stack[symbols.depth - 1] = node
+    return pc + 1
+  }
+  if opcode >= 213 && opcode <= 216 { let node = argumentNode(&mut recipe, &mut symbols, u8.toUsize(opcode - 213)) if !push(&mut symbols, node) { return declined } return pc + 1 } // get_arg0-3
+  if opcode >= 201 && opcode <= 204 { let node = symbols.locals[u8.toUsize(opcode - 201)] if !push(&mut symbols, node) { return declined } return pc + 1 } // get_loc0-3
+  if symbols.depth == 0 { return declined }
+  let top = symbols.stack[symbols.depth - 1]
+  if opcode >= 217 && opcode <= 220 { symbols.arguments[u8.toUsize(opcode - 217)] = top symbols.depth = symbols.depth - 1 return pc + 1 } // put_arg0-3
+  if opcode >= 221 && opcode <= 224 { symbols.arguments[u8.toUsize(opcode - 221)] = top return pc + 1 } // set_arg0-3
+  if opcode >= 205 && opcode <= 208 { symbols.locals[u8.toUsize(opcode - 205)] = top symbols.depth = symbols.depth - 1 return pc + 1 } // put_loc0-3
+  if opcode >= 209 && opcode <= 212 { symbols.locals[u8.toUsize(opcode - 209)] = top return pc + 1 } // set_loc0-3
+  return declined
+}
+/// Runs straight instructions from pc up to end exactly; false when one is not covered.
+unsafe fn stretch(bytes: *const u8, from: usize, end: usize, recipe: &mut ConstructRecipe, constants: &mut usize, symbols: &mut Symbols,
+  receiver: u8, undefined: u8, pool: &FunctionBytecode) -> bool {
+  let mut pc = from
+  while pc < end {
+    pc = unsafe straight(bytes, pc, &mut recipe, &mut constants, &mut symbols, receiver, undefined, &pool)
+    if pc == usize.MAX { return false }
+  }
+  return pc == end
+}
+/// The node for the merge of one slot after a two-way branch on cond.
+fn merged(recipe: &mut ConstructRecipe, cond: u8, whenTrue: u8, whenFalse: u8) -> u8 {
+  if whenTrue == whenFalse { return whenTrue }
+  if whenTrue == 255 || whenFalse == 255 { return 255 }
+  return addNode(&mut recipe, RECIPE_SELECT, cond, whenTrue, whenFalse)
+}
+/// Reads a CONSTRUCT_EVAL body into recipe: false when it holds anything the
+/// recipe cannot express (a store into another object, nested branches, too many nodes).
+unsafe fn analyze(bytes: *const u8, length: usize, pool: &FunctionBytecode, recipe: &mut ConstructRecipe) -> bool {
+  recipe.* = blankRecipe()
+  let mut constants: usize = 0
+  let receiver = addNode(&mut recipe, RECIPE_RECEIVER, 0, 0, 0)
+  let undefined = constantNode(&mut recipe, &mut constants, ValueBits.Undefined)
+  let mut symbols = Symbols { stack: [255; 8], depth: 0, arguments: [255; 4], locals: [undefined; 4] }
+  let mut pc: usize = 0
+  while pc < length {
+    let opcode = unsafe byteAt(bytes, pc)
+    if opcode == 41 { // OP_return_undef
+      if symbols.depth != 0 || recipe.stores == 0 { return false }
+      simplify(&mut recipe)
+      return selfFree(&recipe)
+    }
+    if opcode == 63 { // OP_put_field
+      if symbols.depth < 2 || u8.toUsize(recipe.stores) >= STORES_MAX || pc + 5 > length { return false }
+      let value = symbols.stack[symbols.depth - 1]
+      if symbols.stack[symbols.depth - 2] != receiver || value == receiver { return false }
+      let store = u8.toUsize(recipe.stores)
+      recipe.roots[store] = value
+      recipe.atoms[store] = u8.toU32(unsafe byteAt(bytes, pc + 1)) | u32.shiftLeft(u8.toU32(unsafe byteAt(bytes, pc + 2)), 8)
+        | u32.shiftLeft(u8.toU32(unsafe byteAt(bytes, pc + 3)), 16) | u32.shiftLeft(u8.toU32(unsafe byteAt(bytes, pc + 4)), 24)
+      recipe.stores = recipe.stores + 1
+      symbols.depth = symbols.depth - 2
+      pc = pc + 5
+    } else if opcode == 238 || opcode == 239 { // OP_if_false8, OP_if_true8
+      if symbols.depth == 0 || pc + 2 > length { return false }
+      symbols.depth = symbols.depth - 1
+      let cond = symbols.stack[symbols.depth]
+      let target = i64.toUsize(usize.toI64(pc + 1) + signed8(unsafe byteAt(bytes, pc + 1)))
+      if target <= pc + 1 || target > length { return false }
+      // The fall-through arm runs to target, or to a goto8 just before it
+      // that skips the other arm (an if/else or a conditional expression).
+      let mut armEnd = target let mut join = target
+      if target >= pc + 4 && unsafe byteAt(bytes, target - 2) == 240 {
+        let after = i64.toUsize(usize.toI64(target - 1) + signed8(unsafe byteAt(bytes, target - 1)))
+        if after <= target || after > length { return false }
+        armEnd = target - 2 join = after
+      }
+      let mut fallen = symbols let mut jumped = symbols
+      if !unsafe stretch(bytes, pc + 2, armEnd, &mut recipe, &mut constants, &mut fallen, receiver, undefined, &pool) { return false }
+      if !unsafe stretch(bytes, target, join, &mut recipe, &mut constants, &mut jumped, receiver, undefined, &pool) { return false }
+      if fallen.depth != jumped.depth { return false }
+      // if_false8 falls through when cond is truthy; if_true8 when it is not.
+      let mut whenTrue = fallen let mut whenFalse = jumped
+      if opcode == 239 { whenTrue = jumped whenFalse = fallen }
+      let mut index: usize = 0
+      while index < fallen.depth { symbols.stack[index] = merged(&mut recipe, cond, whenTrue.stack[index], whenFalse.stack[index]) if symbols.stack[index] == 255 { return false } index = index + 1 }
+      symbols.depth = fallen.depth
+      index = 0
+      while index < SLOTS_MAX {
+        symbols.arguments[index] = merged(&mut recipe, cond, whenTrue.arguments[index], whenFalse.arguments[index])
+        symbols.locals[index] = merged(&mut recipe, cond, whenTrue.locals[index], whenFalse.locals[index])
+        if symbols.locals[index] == 255 { return false }
+        // An argument read in only one arm is still its own node in the other.
+        if symbols.arguments[index] == 255 && (whenTrue.arguments[index] != 255 || whenFalse.arguments[index] != 255) {
+          let own = argumentNode(&mut recipe, &mut symbols, index)
+          let mut left = whenTrue.arguments[index] if left == 255 { left = own }
+          let mut right = whenFalse.arguments[index] if right == 255 { right = own }
+          symbols.arguments[index] = merged(&mut recipe, cond, left, right)
+          if symbols.arguments[index] == 255 { return false }
+        }
+        index = index + 1
+      }
+      pc = join
+    } else {
+      pc = unsafe straight(bytes, pc, &mut recipe, &mut constants, &mut symbols, receiver, undefined, &pool)
+      if pc == usize.MAX { return false }
+    }
+  }
+  return false
+}
+
+/// Runs function's body (a base-class bytecode constructor of form
+/// CONSTRUCT_EVAL) on receiver, a new ordinary object, with arguments argv.
+/// True when its stores were made; false, with nothing changed, when the body
+/// or the object is not covered. On success the run is noted as owner's
+/// construct plan (owner is the constructor new ran: function itself, or the
+/// wrapper that forwarded to it), which planned then follows.
+pub unsafe fn construct<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, owner: *mut HeapHeader, function: ValueBits, receiver: ValueBits,
+  argv: &FrameSlots) -> bool {
+  let node = match receiver { ValueBits.Object { reference } => reference _ => { return false } }
+  let callee = match function { ValueBits.Object { reference } => reference _ => { return false } }
+  let mut anchor = ()
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, callee)
+  let bytecode = match &object.payload { ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode _ => { return false } }
+  drop object
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  let length = code.code.length()
+  if length == 0 { return false }
+  let bytes = unsafe code.code.pointerAt(0)
+  let address = Pointer.address<u8>(bytes)
+  let slot = cacheSlot(address)
+  let mut stateAnchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
+  let entry = &mut state.constructCache[slot]
+  if entry.code != address {
+    // First run of this body here: read it, and forget the shapes the slot's
+    // previous body reached.
+    let old = entry.final
+    entry.code = address entry.final = Pointer.null<HeapHeader>() entry.base = 0
+    if !unsafe analyze(bytes, length, &code, &mut entry.recipe) { entry.recipe.stores = 0 }
+    drop entry drop state drop code
+    match Pointer.nonNullMut<HeapHeader>(old) { Option<*mut HeapHeader>.Some { value } => { unsafe gc.releaseHeader(&mut hooks, runtime, value) } Option<*mut HeapHeader>.None => () }
+    return unsafe construct(&mut hooks, runtime, owner, function, receiver, argv)
+  }
+  drop code
+  let stores = u8.toUsize(entry.recipe.stores)
+  if stores == 0 { return false }
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+  if data.classId() != classes.JS_CLASS_OBJECT || data.isExotic() || !data.extensible() || data.isStandardArrayPrototype() { return false }
+  if data.properties.length() != 0 || data.properties.capacity() < stores { return false }
+  let mut values = FrameSlots { data: unsafe Intrinsic.pointerRequalify<[*]mut ValueBits, *mut ValueBits>(unsafe Intrinsic.stackAllocate<ValueBits>(NODES_MAX)), count: NODES_MAX }
+  unsafe evaluate(&entry.recipe, receiver, argv, &mut values)
+  let base = data.shape
+  let readAnchor = ()
+  let baseShape = unsafe HeapCell.payload<ShapeData, ()>(&readAnchor, base)
+  let baseVersion = baseShape.version
+  let prototype = baseShape.prototype
+  drop baseShape
+  if unsafe headerCount(base) <= 1 { return false }
+  let baseAddress = Pointer.address<HeapHeader>(base)
+  let mut final = Pointer.null<HeapHeader>()
+  if entry.base == baseAddress && entry.baseVersion == baseVersion && unsafe chainMatches(&entry, prototype) { final = entry.final }
+  let mut old = Pointer.null<HeapHeader>()
+  if Pointer.isNull<HeapHeader>(final) {
+    // Every add must follow a verified memo entry; a repeated key would
+    // overwrite rather than add.
+    let mut shape = base
+    let mut index: usize = 0
+    while index < stores {
+      let atom = entry.recipe.atoms[index]
+      let mut earlier: usize = 0
+      while earlier < index { if entry.recipe.atoms[earlier] == atom { return false } earlier = earlier + 1 }
+      let found = unsafe shapes.verifiedAdd(runtime, shape, atom)
+      if Pointer.isNull<HeapHeader>(found) { return false }
+      shape = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(found)
+      index = index + 1
+    }
+    let mut chain: [u64; 3] = [0; 3]
+    let links = unsafe chainOf(prototype, &mut chain)
+    if links > 3 || unsafe headerCount(shape) <= 0 { return false }
+    unsafe HeapCell.retain(shape)
+    old = entry.final
+    entry.base = baseAddress entry.baseVersion = baseVersion entry.final = shape entry.chain = chain entry.depth = usize.toU8(links)
+    final = shape
+  }
+  let roots = entry.recipe.roots
+  drop entry drop state drop data
+  let reached = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(final)
+  unsafe install(node, base, reached, &roots, &values, stores)
+  // Shapes are freed only by the collector's release path, never by JS.
+  unsafe releaseOptional(&mut hooks, runtime, old)
+  unsafe gc.notePlan(&mut hooks, runtime, owner, base, reached, Pointer.address<HeapHeader>(bytecode), stores, [0; 8])
+  return true
+}
+fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+@inlineAlways
+unsafe fn releaseOptional<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, shape: ?*mut HeapHeader) -> () {
+  match Pointer.nonNullMut<HeapHeader>(shape) { Option<*mut HeapHeader>.Some { value } => { unsafe gc.releaseHeader(&mut hooks, runtime, value) } Option<*mut HeapHeader>.None => () }
+}
+/// Evaluates recipe's nodes into values (NODES_MAX slots); nodes refer only to
+/// earlier ones, so every read is of an initialized slot. Nothing is retained.
+@inlineAlways
+unsafe fn evaluate(recipe: &ConstructRecipe, receiver: ValueBits, argv: &FrameSlots, values: &mut FrameSlots) -> () {
+  let count = u8.toUsize(recipe.nodeCount)
+  let given = argv.count
+  // analyze puts the receiver and undefined first.
+  unsafe values.write(0, receiver)
+  unsafe values.write(1, ValueBits.Undefined)
+  let mut index: usize = 2
+  while index < count {
+    let word = recipe.nodes[index & 15]
+    let kind = word & 255
+    let a = u32.toUsize(u32.shiftRight(word, 8) & 255)
+    let mut value = ValueBits.Undefined
+    if kind == u8.toU32(RECIPE_ARG) { if a < given { value = unsafe argv.get(a) } }
+    else if kind == u8.toU32(RECIPE_CONST) { value = recipe.constants[a & 7] }
+    else if kind == u8.toU32(RECIPE_RECEIVER) { value = receiver }
+    else if kind == u8.toU32(RECIPE_NOT) { value = ValueBits.Bool { value: !truthy(unsafe values.get(a)) } }
+    else if truthy(unsafe values.get(a)) { value = unsafe values.get(u32.toUsize(u32.shiftRight(word, 16) & 255)) }
+    else { value = unsafe values.get(u32.toUsize(u32.shiftRight(word, 24))) }
+    unsafe values.write(index, value)
+    index = index + 1
+  }
+}
+/// new owner(...) built straight from owner's construct plan, when construct
+/// noted it for function's body and that body's recipe still reaches the plan's
+/// final shape from its empty one: the object comes with its final shape and
+/// gets the recipe's values as its slots. Uninitialized, with nothing changed,
+/// otherwise.
+pub unsafe effect fn planned<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, owner: *mut HeapHeader,
+  function: *mut HeapHeader, argv: &FrameSlots) -> ValueBits ! OutOfMemoryError ? &mut Allocator {
+  let runtime = realm.runtime()
+  let anchor = ()
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, function)
+  let bytecode = match &object.payload { ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode _ => { return ValueBits.Uninitialized } }
+  drop object
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  if code.code.length() == 0 { return ValueBits.Uninitialized }
+  let address = Pointer.address<u8>(unsafe code.code.pointerAt(0))
+  drop code
+  let plan = unsafe gc.plannedShape(runtime, owner, Pointer.address<HeapHeader>(bytecode))
+  let final = match Pointer.nonNullMut<HeapHeader>(plan.final) {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => { return ValueBits.Uninitialized }
+  }
+  let empty = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(plan.empty)
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let entry = &state.constructCache[cacheSlot(address)]
+  let stores = u8.toUsize(entry.recipe.stores)
+  if entry.code != address || stores != u8.toUsize(plan.stores) || entry.base != Pointer.address<HeapHeader>(empty)
+    || Pointer.address<HeapHeader>(unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(entry.final)) != Pointer.address<HeapHeader>(final) {
+    drop entry drop state
+    // plannedShape's reference to final.
+    unsafe gc.releaseHeader(&mut hooks, runtime, final)
+    return ValueBits.Uninitialized
+  }
+  // The recipe is selfFree, so the receiver is never a store value here.
+  let mut values = FrameSlots { data: unsafe Intrinsic.pointerRequalify<[*]mut ValueBits, *mut ValueBits>(unsafe Intrinsic.stackAllocate<ValueBits>(NODES_MAX)), count: NODES_MAX }
+  unsafe evaluate(&entry.recipe, ValueBits.Undefined, argv, &mut values)
+  let roots = entry.recipe.roots
+  drop entry drop state
+  let created = run unsafe objects.ordinaryFromPlan(&mut hooks, memory, realm, final, empty)
+  let node = match created { ValueBits.Object { reference } => reference _ => invariant() }
+  let mut nodeAnchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut nodeAnchor, node)
+  let mut index: usize = 0
+  while index < stores {
+    data.properties.set(index, SlotBits.value(unsafe (unsafe values.get(u8.toUsize(roots[index & 7]))).retained()))
+    index = index + 1
+  }
+  return created
+}
+/// Gives node the final shape (the empty base keeps other holders) and the
+/// recipe's store values, retained, as its slots.
+@inlineAlways
+unsafe fn install(node: *mut HeapHeader, base: *mut HeapHeader, final: *mut HeapHeader, roots: &[u8; 8], values: &FrameSlots, stores: usize) -> () {
+  unsafe HeapCell.retain(final)
+  let mut headerAnchor = ()
+  let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut headerAnchor, base)
+  header.referenceCount = i32.wrappingSubtract(header.referenceCount, 1)
+  drop header
+  let mut dataAnchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut dataAnchor, node)
+  data.shape = final
+  let mut index: usize = 0
+  while index < stores {
+    unsafe data.properties.pushUnchecked(SlotBits.value(unsafe (unsafe values.get(u8.toUsize(roots[index & 7]))).retained()))
+    index = index + 1
+  }
+}
+/// Shape versions along the chain from first, up to 3 links; 4 when longer.
+unsafe fn chainOf(first: ?*mut HeapHeader, chain: &mut [u64; 3]) -> usize {
+  let anchor = ()
+  let mut current = first
+  let mut depth: usize = 0
+  while !Pointer.isNull<HeapHeader>(current) {
+    if depth == 3 { return 4 }
+    let link = unsafe HeapCell.payload<ObjectData, ()>(&anchor, unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(current))
+    let linkShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, link.shape)
+    chain[depth] = linkShape.version
+    current = linkShape.prototype
+    depth = depth + 1
+  }
+  return depth
+}
+@inlineAlways
+unsafe fn chainMatches(entry: &ConstructCacheEntry, first: ?*mut HeapHeader) -> bool {
+  let anchor = ()
+  let mut current = first
+  let depth = u8.toUsize(entry.depth)
+  let mut level: usize = 0
+  while level < depth {
+    if Pointer.isNull<HeapHeader>(current) { return false }
+    let link = unsafe HeapCell.payload<ObjectData, ()>(&anchor, unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(current))
+    let linkShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, link.shape)
+    if linkShape.version != entry.chain[level] { return false }
+    current = linkShape.prototype
+    level = level + 1
+  }
+  return Pointer.isNull<HeapHeader>(current)
+}
