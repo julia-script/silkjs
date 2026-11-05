@@ -4,6 +4,7 @@ import js_realm { lendRealm, Realm }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
+import silk.core.ownership { Copy }
 import silk.mem.pointer { Pointer }
 import silk.num.u32
 import silk.num.usize
@@ -11,7 +12,7 @@ import runtime_memory { AllocationObserver }
 import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
 import js_owned_value { Value, lendBits, immediateRef, ValueRef }
-import js_core_types { ContextState, ObjectData, ObjectPayload, FunctionBytecode, FrameSlots, PropertySlot, ShapeData, SlotBits, JS_PROP_TMASK }
+import js_core_types { ContextState, ObjectData, ObjectPayload, FunctionBytecode, FrameSlots, PropertySlot, ShapeData, SlotBits, JS_PROP_TMASK, ForwardEntry }
 import js_shapes as shapes
 import silk.core.option { Option }
 import silk.num.u8
@@ -221,6 +222,82 @@ pub unsafe fn forwardedAtom(function: ValueBits) -> u32 {
 unsafe fn atomAt(bytes: *const u8, at: usize) -> u32 {
   return u8.toU32(unsafe codeByte(bytes, at)) | u32.shiftLeft(u8.toU32(unsafe codeByte(bytes, at + 1)), 8)
     | u32.shiftLeft(u8.toU32(unsafe codeByte(bytes, at + 2)), 16) | u32.shiftLeft(u8.toU32(unsafe codeByte(bytes, at + 3)), 24)
+}
+/// A forwarded construct's target and the apply its prototype holds, as the
+/// receiver cache vouches for them (cachedForward).
+pub struct Forwarded { pub target: ValueBits, pub method: ValueBits }
+impl Copy for Forwarded {}
+/// The prototype of receiver's shape, the holder of a forwarded target.
+@inlineAlways
+unsafe fn shapePrototype(object: *mut HeapHeader) -> ?*mut HeapHeader {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  return (unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)).prototype
+}
+@inlineAlways
+unsafe fn shapeVersion(object: *mut HeapHeader) -> u64 {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  return (unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)).version
+}
+@inlineAlways
+unsafe fn slotValue(object: *mut HeapHeader, index: u32) -> ValueBits {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  return (unsafe shapes.unchecked<SlotBits>(&data.properties, u32.toUsize(index))).valueBits()
+}
+/// receiver[name] and its apply for `new wrapper(...)` when wrapper's receiver
+/// cache entry recorded where they live (noteForward) and the shape versions
+/// still match: then both are the data properties a full lookup finds. The
+/// target is Undefined otherwise. Neither is retained.
+pub unsafe fn cachedForward(runtime: *mut HeapHeader, wrapper: *mut HeapHeader, receiver: *mut HeapHeader, name: u32) -> Forwarded {
+  let missed = Forwarded { target: ValueBits.Undefined, method: ValueBits.Undefined }
+  let entry = unsafe gc.forwardEntry(runtime, wrapper)
+  if entry.atom != name { return missed }
+  let holder = match Pointer.nonNullMut<HeapHeader>(unsafe shapePrototype(receiver)) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return missed } }
+  if unsafe shapeVersion(holder) != entry.holderVersion { return missed }
+  let target = unsafe slotValue(holder, entry.holderIndex)
+  let function = match target { ValueBits.Object { reference } => reference _ => { return missed } }
+  if unsafe shapeVersion(function) != entry.targetVersion { return missed }
+  let methods = match Pointer.nonNullMut<HeapHeader>(unsafe shapePrototype(function)) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return missed } }
+  if unsafe shapeVersion(methods) != entry.applyVersion { return missed }
+  return Forwarded { target: target, method: unsafe slotValue(methods, entry.applyIndex) }
+}
+/// The slot of an own data property atom of object, else u32.MAX.
+unsafe fn ownDataSlot(object: *mut HeapHeader, atom: u32) -> u32 {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  if data.isExotic() { return u32.MAX }
+  return match unsafe shapes.lookup(data.shape, atom) {
+    Option<usize>.Some { value: index } => {
+      let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+      if (u8.toU32(shape.properties.get(index).flags) & JS_PROP_TMASK) != 0 { u32.MAX } else { usize.toU32(index) }
+    }
+    Option<usize>.None => u32.MAX
+  }
+}
+/// Records on wrapper's receiver cache entry where a full lookup found target,
+/// receiver[name], and its apply (a data property of target's prototype), when
+/// both sit one link up: target an own property of receiver's prototype, apply
+/// not an own property of target. Otherwise the entry is left as it was.
+pub unsafe fn noteForward(runtime: *mut HeapHeader, wrapper: *mut HeapHeader, receiver: *mut HeapHeader, name: u32, target: *mut HeapHeader) -> () {
+  let holder = match Pointer.nonNullMut<HeapHeader>(unsafe shapePrototype(receiver)) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return () } }
+  let holderIndex = unsafe ownDataSlot(holder, name)
+  if holderIndex == u32.MAX { return () }
+  match unsafe slotValue(holder, holderIndex) {
+    ValueBits.Object { reference } => { if Pointer.address<HeapHeader>(reference) != Pointer.address<HeapHeader>(target) { return () } }
+    _ => { return () }
+  }
+  let anchor = ()
+  let own = unsafe HeapCell.payload<ObjectData, ()>(&anchor, target)
+  let present = unsafe shapes.lookup(own.shape, atoms.JS_ATOM_apply)
+  drop own
+  if let Option<usize>.Some { .. } = present { return () }
+  let methods = match Pointer.nonNullMut<HeapHeader>(unsafe shapePrototype(target)) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return () } }
+  let applyIndex = unsafe ownDataSlot(methods, atoms.JS_ATOM_apply)
+  if applyIndex == u32.MAX { return () }
+  unsafe gc.noteForward(runtime, wrapper, ForwardEntry { atom: name, holderIndex: holderIndex, applyIndex: applyIndex,
+    holderVersion: unsafe shapeVersion(holder), targetVersion: unsafe shapeVersion(target), applyVersion: unsafe shapeVersion(methods) })
 }
 /// new function(...) from function's construct plan (gc.plannedShape): the object
 /// gets the plan's final shape and its argument values directly. Uninitialized

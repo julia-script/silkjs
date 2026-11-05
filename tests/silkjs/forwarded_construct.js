@@ -66,4 +66,27 @@ V.prototype.initialize = function (x, y, z) { this.x = x; this.y = y; this.z = z
 var sum = 0;
 for (var i = 0; i < 1000; i++) { var v = new V(i, 1, 2); sum += v.x + v.y + v.z; }
 check(sum === 499500 + 3000, "loop");
+
+// Changes after the lookups were cached.
+var K = wrap();
+K.prototype.initialize = function (a) { this.a = a; };
+for (var i = 0; i < 5; i++) new K(i);
+K.prototype.initialize = function (a) { this.b = a; };
+var k = new K(1);
+check(k.b === 1 && k.a === undefined, "reassigned initialize");
+var applies = 0;
+K.prototype.initialize.apply = function (self, args) { applies++; self.c = args[0]; };
+k = new K(2);
+check(applies === 1 && k.c === 2 && k.b === undefined, "own apply added later");
+delete K.prototype.initialize.apply;
+var original = Function.prototype.apply;
+Function.prototype.apply = function (self, args) { applies++; return original.call(this, self, args); };
+k = new K(3);
+check(applies === 2 && k.b === 3, "Function.prototype.apply replaced");
+Function.prototype.apply = original;
+k = new K(4);
+check(applies === 2 && k.b === 4, "Function.prototype.apply restored");
+Object.defineProperty(K.prototype, "initialize", { get: function () { applies++; return function (a) { this.d = a; }; } });
+k = new K(5);
+check(applies === 3 && k.d === 5, "initialize turned getter");
 console.log("ok");
