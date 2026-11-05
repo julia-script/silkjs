@@ -18,7 +18,7 @@ import runtime_memory { AllocationObserver }
 import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
 import js_intl_realm as ops
-import js_owned_value { Value, lendBits, immediateRef, ValueRef, lendFor }
+import js_owned_value { Value, immediateRef, ValueRef, lendFor }
 import js_object_ref { ObjectRef }
 import js_realm { Realm, lendRealm }
 import js_core_types { ContextState, RuntimeState, ObjectData, ObjectPayload, PropertySlot, SlotBits,
@@ -132,24 +132,14 @@ pub effect fn setLastIndex<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHoo
   run support.set(&mut hooks, realm, receiver, atoms.JS_ATOM_lastIndex, Value.immediate(ValueBits.Int { value: index }))
 }
 
-unsafe fn hasOwn(object: ValueBits, atom: u32) -> bool {
+fn hasOwn<'v>(object: ValueRef<'v>, atom: u32) -> bool {
   let anchor = ()
-  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(object))
+  let data = ObjectRef.of(object).data(&anchor)
   return match unsafe shapes.lookup(data.shape, atom) {
     Option<usize>.Some { .. } => true Option<usize>.None => false
   }
 }
 
-// All JS references under construction stay in this cleanup ledger until their
-// ownership has actually transferred. Native lists are affine and drop on failure.
-struct ResultState {
-  object: ValueBits,
-  groups: ValueBits,
-  indices: ValueBits,
-  indicesGroups: ValueBits,
-  temporary: ValueBits,
-  groupName: u32
-}
 effect fn resultArray<'a, 'b, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,realm: Realm<'a>, string: ValueRef<'b>, groups: ValueRef<'b>, count: usize, index: i32) -> ValueBits
   ! OutOfMemoryError ? &mut Allocator { let context = realm.context()
   // A parked four-slot list of a dead object when one is spare, else a new one.
@@ -177,7 +167,7 @@ effect fn resultArray<'a, 'b, H: HeapHooks>(hooks: &mut H, memory: &AllocationOb
 /// indices (the d flag) through buildDecoratedResult.
 effect fn buildResult<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks>(
   hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, string: ValueRef<'b>,
-  bytecode: ValueRef<'b>, matched: &RegExpMatch, state: &mut ResultState) -> ValueBits
+  bytecode: ValueRef<'b>, matched: &RegExpMatch, groupName: &mut u32) -> Value
   ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
   let anchor = ()
   let code = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(bytecode.view()))
@@ -186,12 +176,12 @@ effect fn buildResult<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
   let count = u8.toUsize(bytes[2])
   drop code
   if (flags & (FLAG_NAMED_GROUPS | FLAG_INDICES)) != 0 {
-    return run buildDecoratedResult(&mut hooks, memory, realm, string, bytecode, matched, &mut state)
+    return run buildDecoratedResult(&mut hooks, memory, realm, string, bytecode, matched, &mut groupName)
   }
-  state.object = run resultArray(&mut hooks, memory, realm, string, immediateRef(ValueBits.Undefined),
-    count, matched.captures.get(0))
+  let object = unsafe Value.adoptBits(run resultArray(&mut hooks, memory, realm, string, immediateRef(ValueBits.Undefined),
+    count, matched.captures.get(0)))
   let mut arrayAnchor = ()
-  let arrayObject = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut arrayAnchor, core.reference(state.object))
+  let arrayObject = ObjectRef.of(object.borrow()).dataMut(&mut arrayAnchor)
   match &mut arrayObject.payload {
     ObjectPayload.FastArray { array } => {
       if array.values.capacity() == 0 {
@@ -208,24 +198,28 @@ effect fn buildResult<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
   while i < count {
     let start = matched.captures.get(i * 2)
     let end = matched.captures.get(i * 2 + 1)
-    if start >= 0 && end >= 0 { state.temporary = run Strings.substring(string.view(), i32.toUsize(start), i32.toUsize(end)) }
-    let mut appendAnchor = ()
-    let output = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut appendAnchor, core.reference(state.object))
-    match &mut output.payload {
-      ObjectPayload.FastArray { array } => { run array.values.append(state.temporary) }
-      _ => { Intrinsic.trap("QuickJS invariant violated") }
-    }
-    state.temporary = ValueBits.Undefined
+    let mut capture = Value.immediate(ValueBits.Undefined)
+    if start >= 0 && end >= 0 { capture = unsafe Value.adoptBits(run Strings.substring(string.view(), i32.toUsize(start), i32.toUsize(end))) }
+    run append(object.borrow(), move capture)
     i = i + 1
   }
-  let result = state.object
-  state.object = ValueBits.Undefined
-  return result
+  return move object
+}
+/// Appends capture to the result array's dense values.
+@inlineAlways
+effect fn append<'o>(object: ValueRef<'o>, capture: Value) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = ()
+  let output = ObjectRef.of(object).dataMut(&mut anchor)
+  match &mut output.payload {
+    ObjectPayload.FastArray { array } => { run array.values.append(capture.view()) }
+    _ => { Intrinsic.trap("QuickJS invariant violated") }
+  }
+  let _stored = capture.intoBits()
 }
 @cold
 effect fn buildDecoratedResult<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks>(
   hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, string: ValueRef<'b>,
-  bytecode: ValueRef<'b>, matched: &RegExpMatch, state: &mut ResultState) -> ValueBits
+  bytecode: ValueRef<'b>, matched: &RegExpMatch, groupName: &mut u32) -> Value
   ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
   let anchor = ()
   let code = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(bytecode.view()))
@@ -234,15 +228,18 @@ effect fn buildDecoratedResult<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropert
   let named = (flags & FLAG_NAMED_GROUPS) != 0
   let count = u8.toUsize(bytes[2])
   let mut nameOffset = u32.toUsize(readU32(bytes, 4)) + 8
-  if named { state.groups = (run support.object(&mut hooks, memory, realm, immediateRef(ValueBits.Null))).intoBits() }
+  let mut groups = Value.immediate(ValueBits.Undefined)
+  let mut indices = Value.immediate(ValueBits.Undefined)
+  let mut indicesGroups = Value.immediate(ValueBits.Undefined)
+  if named { groups = run support.object(&mut hooks, memory, realm, immediateRef(ValueBits.Null)) }
   if (flags & FLAG_INDICES) != 0 {
-    state.indices = (run support.array(&mut hooks, memory, realm)).intoBits()
-    if named { state.indicesGroups = (run support.object(&mut hooks, memory, realm, immediateRef(ValueBits.Null))).intoBits() }
+    indices = run support.array(&mut hooks, memory, realm)
+    if named { indicesGroups = run support.object(&mut hooks, memory, realm, immediateRef(ValueBits.Null)) }
   }
-  state.object = run resultArray(&mut hooks, memory, realm, string, unsafe lendBits(&state, state.groups),
-    count, matched.captures.get(0))
+  let object = unsafe Value.adoptBits(run resultArray(&mut hooks, memory, realm, string, groups.borrow(),
+    count, matched.captures.get(0)))
   let mut arrayAnchor = ()
-  let arrayObject = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut arrayAnchor, core.reference(state.object))
+  let arrayObject = ObjectRef.of(object.borrow()).dataMut(&mut arrayAnchor)
   match &mut arrayObject.payload {
     ObjectPayload.FastArray { array } => {
       if array.values.capacity() == 0 {
@@ -262,9 +259,8 @@ effect fn buildDecoratedResult<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropert
       while bytes[nameEnd] != 0 { nameEnd = nameEnd + 1 }
       if nameEnd != nameOffset {
         let mut atomAnchor = ()
-        let rt = realm.runtime()
         let runtimeState = realm.runtimeStateMut(&mut atomAnchor)
-        state.groupName = run runtimeState.atoms.internUtf8(Slice.view(bytes, nameOffset, nameEnd - nameOffset))
+        groupName.* = run runtimeState.atoms.internUtf8(Slice.view(bytes, nameOffset, nameEnd - nameOffset))
       }
       // Each compiler name record ends in NUL followed by its duplicate-name scope.
       nameOffset = nameEnd + 2
@@ -272,53 +268,36 @@ effect fn buildDecoratedResult<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropert
     let start = matched.captures.get(i * 2)
     let end = matched.captures.get(i * 2 + 1)
     let present = start >= 0 && end >= 0
+    let name = groupName.*
     if (flags & FLAG_INDICES) != 0 {
+      let mut pair = Value.immediate(ValueBits.Undefined)
       if present {
-        state.temporary = (run support.array(&mut hooks, memory, realm)).intoBits()
-        run support.defineIndex(&mut hooks, realm, unsafe lendBits(&state, state.temporary), 0, Value.immediate(ValueBits.Int { value: start }))
-        run support.defineIndex(&mut hooks, realm, unsafe lendBits(&state, state.temporary), 1, Value.immediate(ValueBits.Int { value: end }))
+        pair = run support.array(&mut hooks, memory, realm)
+        run support.defineIndex(&mut hooks, realm, pair.borrow(), 0, Value.immediate(ValueBits.Int { value: start }))
+        run support.defineIndex(&mut hooks, realm, pair.borrow(), 1, Value.immediate(ValueBits.Int { value: end }))
       }
-      if state.groupName != 0 && (present || !unsafe hasOwn(state.indicesGroups, state.groupName)) {
-        let pair = unsafe state.temporary.retained()
-        run support.define(&mut hooks, realm, unsafe lendBits(&state, state.indicesGroups), state.groupName,
-          unsafe Value.adoptBits(pair), JS_PROP_C_W_E | JS_PROP_THROW)
+      if name != 0 && (present || !hasOwn(indicesGroups.borrow(), name)) {
+        run support.define(&mut hooks, realm, indicesGroups.borrow(), name, pair.dup(), JS_PROP_C_W_E | JS_PROP_THROW)
       }
-      let pair = state.temporary
-      state.temporary = ValueBits.Undefined
-      run support.defineIndex(&mut hooks, realm, unsafe lendBits(&state, state.indices), usize.toI64(i), unsafe Value.adoptBits(pair))
+      run support.defineIndex(&mut hooks, realm, indices.borrow(), usize.toI64(i), move pair)
     }
-    if present { state.temporary = run Strings.substring(string.view(), i32.toUsize(start), i32.toUsize(end)) }
-    if state.groupName != 0 {
-      if present || !unsafe hasOwn(state.groups, state.groupName) {
-        let capture = unsafe state.temporary.retained()
-        run support.define(&mut hooks, realm, unsafe lendBits(&state, state.groups), state.groupName,
-          unsafe Value.adoptBits(capture), JS_PROP_C_W_E | JS_PROP_THROW)
+    let mut capture = Value.immediate(ValueBits.Undefined)
+    if present { capture = unsafe Value.adoptBits(run Strings.substring(string.view(), i32.toUsize(start), i32.toUsize(end))) }
+    if name != 0 {
+      if present || !hasOwn(groups.borrow(), name) {
+        run support.define(&mut hooks, realm, groups.borrow(), name, capture.dup(), JS_PROP_C_W_E | JS_PROP_THROW)
       }
-      unsafe properties.releaseAtom(realm.runtime(), state.groupName)
-      state.groupName = 0
+      unsafe properties.releaseAtom(realm.runtime(), name)
+      groupName.* = 0
     }
-    let mut appendAnchor = ()
-    let output = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut appendAnchor, core.reference(state.object))
-    match &mut output.payload {
-      ObjectPayload.FastArray { array } => { run array.values.append(state.temporary) }
-      _ => { Intrinsic.trap("QuickJS invariant violated") }
-    }
-    state.temporary = ValueBits.Undefined
+    run append(object.borrow(), move capture)
     i = i + 1
   }
   if (flags & FLAG_INDICES) != 0 {
-    let groups = state.indicesGroups
-    state.indicesGroups = ValueBits.Undefined
-    run support.define(&mut hooks, realm, unsafe lendBits(&state, state.indices), atoms.JS_ATOM_groups,
-      unsafe Value.adoptBits(groups), JS_PROP_C_W_E | JS_PROP_THROW)
-    let indices = state.indices
-    state.indices = ValueBits.Undefined
-    run support.define(&mut hooks, realm, unsafe lendBits(&state, state.object), atoms.JS_ATOM_indices,
-      unsafe Value.adoptBits(indices), JS_PROP_C_W_E | JS_PROP_THROW)
+    run support.define(&mut hooks, realm, indices.borrow(), atoms.JS_ATOM_groups, move indicesGroups, JS_PROP_C_W_E | JS_PROP_THROW)
+    run support.define(&mut hooks, realm, object.borrow(), atoms.JS_ATOM_indices, move indices, JS_PROP_C_W_E | JS_PROP_THROW)
   }
-  let result = state.object
-  state.object = ValueBits.Undefined
-  return result
+  return move object
 }
 
 effect fn builtinExec<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + InterruptHooks>(
@@ -348,18 +327,12 @@ effect fn builtinExec<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
     return ValueBits.Null
   }
   if updatesIndex { run setLastIndex(&mut hooks, realm, receiver, matched.captures.get(1)) }
-  let mut state = ResultState { object: ValueBits.Undefined, groups: ValueBits.Undefined,
-    indices: ValueBits.Undefined, indicesGroups: ValueBits.Undefined, temporary: ValueBits.Undefined, groupName: 0 }
-  let built = run Effect.result(buildResult(&mut hooks, memory, realm, unsafe lendFor(string.get()), unsafe lendFor(code.get()), &matched, &mut state))
-  if state.groupName != 0 { unsafe properties.releaseAtom(realm.runtime(), state.groupName) }
-  unsafe support.release(&mut hooks, realm, state.temporary)
-  unsafe support.release(&mut hooks, realm, state.indicesGroups)
-  unsafe support.release(&mut hooks, realm, state.indices)
-  unsafe support.release(&mut hooks, realm, state.groups)
-  unsafe support.release(&mut hooks, realm, state.object)
+  let mut groupName: u32 = 0
+  let built = run Effect.result(buildResult(&mut hooks, memory, realm, unsafe lendFor(string.get()), unsafe lendFor(code.get()), &matched, &mut groupName))
+  if groupName != 0 { unsafe properties.releaseAtom(realm.runtime(), groupName) }
   return match move built {
-    Result<ValueBits, OutOfMemoryError | StringLengthError | JsException>.Success { value } => value
-    Result<ValueBits, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => {
+    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Success { value } => value.intoBits()
+    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => {
       return run support.materialize(&mut hooks, realm, move error)
     }
   }
@@ -445,17 +418,15 @@ pub effect fn quickExec<'a, H: HeapHooks + CoercionHooks + OwnPropertyHooks + Pr
     if updatesIndex { unsafe quickLastIndex(receiver, 0) }
     return Option<ValueBits>.some(ValueBits.Null)
   }
-  let mut state = ResultState { object: ValueBits.Undefined, groups: ValueBits.Undefined,
-    indices: ValueBits.Undefined, indicesGroups: ValueBits.Undefined, temporary: ValueBits.Undefined, groupName: 0 }
-  let built = run Effect.result(buildResult(&mut hooks, memory, realm, unsafe lendFor(input), unsafe lendFor(code), &matched, &mut state))
-  unsafe support.release(&mut hooks, realm, state.temporary)
-  unsafe support.release(&mut hooks, realm, state.object)
+  // No named groups here, so no group-name atom is ever interned.
+  let mut groupName: u32 = 0
+  let built = run Effect.result(buildResult(&mut hooks, memory, realm, unsafe lendFor(input), unsafe lendFor(code), &matched, &mut groupName))
   return match move built {
-    Result<ValueBits, OutOfMemoryError | StringLengthError | JsException>.Success { value } => {
+    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Success { value } => {
       if updatesIndex { unsafe quickLastIndex(receiver, matched.captures.get(1)) }
-      Option<ValueBits>.some(value)
+      Option<ValueBits>.some(value.intoBits())
     }
-    Result<ValueBits, OutOfMemoryError | StringLengthError | JsException>.Failure { .. } => Option<ValueBits>.none()
+    Result<Value, OutOfMemoryError | StringLengthError | JsException>.Failure { .. } => Option<ValueBits>.none()
   }
 }
 /// Stores an Int lastIndex into a slot quickExec found Int and writable.
