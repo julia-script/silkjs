@@ -484,10 +484,11 @@ for (const name of ['Crypto', 'SubtleCrypto', 'CryptoKey']) {
     configurable: true,
   });
 }
-const performanceHooks = internalRequire('perf_hooks');
-globalThis.performance = performanceHooks.performance;
-for (const name of ['Performance', 'PerformanceEntry', 'PerformanceMark', 'PerformanceMeasure', 'PerformanceObserver', 'PerformanceObserverEntryList', 'PerformanceResourceTiming'])
-  globalThis[name] = performanceHooks[name];
+{
+  const loadPerformance = () => internalRequire('perf_hooks');
+  for (const name of ['performance', 'Performance', 'PerformanceEntry', 'PerformanceMark', 'PerformanceMeasure', 'PerformanceObserver', 'PerformanceObserverEntryList', 'PerformanceResourceTiming'])
+    webGlobals.defineLazy(globalThis, name, loadPerformance);
+}
 host.path = internalRequire('path');
 const publicBuiltinNames = [...factories.keys()].filter(name => !name.startsWith('internal/'));
 const publicBuiltinHas = Set.prototype.has.bind(new Set(publicBuiltinNames));

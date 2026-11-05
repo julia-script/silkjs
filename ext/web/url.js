@@ -2,7 +2,8 @@
 
 const whatwg = require('internal/web/vendor/whatwg-url/index');
 const { URL, URLSearchParams } = whatwg;
-const tr46 = require('internal/web/vendor/tr46/index');
+let tr46Module;
+const tr46 = { toUnicode: (...args) => (tr46Module ||= require('internal/web/vendor/tr46/index')).toUnicode(...args) };
 const { createObjectURL, revokeObjectURL } = require('internal/web/blob');
 const { validateString, codes: { ERR_INVALID_ARG_TYPE } } = require('internal/path_events/support');
 const idnaOptions = { checkHyphens: false, checkBidi: true, checkJoiners: true, useSTD3ASCIIRules: false, transitionalProcessing: false, verifyDNSLength: false };

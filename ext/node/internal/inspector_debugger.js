@@ -2,7 +2,7 @@
 
 const native = require('internal/host').inspectorNative;
 const { protocolError, unsupported } = require('internal/inspector_values');
-const { createHash } = require('crypto');
+const createHash = algorithm => require('crypto').createHash(algorithm);
 const contexts = require('internal/inspector_contexts');
 const pendingScripts = new Map();
 const hashes = new Map();
