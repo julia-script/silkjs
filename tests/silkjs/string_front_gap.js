@@ -30,7 +30,14 @@ r.push(q.length, p.length, p.slice(1) === q, q.charAt(0));
 // Number conversion and String methods on a gapped string.
 var d = ''; for (var i = 0; i < 70; i++) d = (i % 10) + d;
 r.push(d.slice(0, 6), d.length, d.toUpperCase().length, d.trim().length, (' ' + d).trim() === d, d.codePointAt(69));
+// The store after the add: a high local slot, and a store whose value is used.
+function manyLocals(n) {
+  var a = 1, b = 2, c = 3, d = 4, e = 5, f = '', g = '', used = [];
+  for (var i = 0; i < n; i++) { f = 'f' + f; used.push((g = 'g' + g).length); }
+  return [a + b + c + d + e, f.length, f === 'f'.repeat(n), g.length, used[n - 1]];
+}
+r.push(manyLocals(150).join(','));
 const got = r.join('|');
-const expected = '3000|106|97|jihgf|edcba|10|2997|3120|edcbaENDENDENDE|true|10000|6668|true|true|1|70|2|true|true|true|true|xxx|"kkkk"|36|111|955|91|www|955|203|204|true|z|987654|70|70|70|true|48';
+const expected = '3000|106|97|jihgf|edcba|10|2997|3120|edcbaENDENDENDE|true|10000|6668|true|true|1|70|2|true|true|true|true|xxx|"kkkk"|36|111|955|91|www|955|203|204|true|z|987654|70|70|70|true|48|15,150,true,150,150';
 console.log(got === expected ? 'PASS string front gap' : 'FAIL ' + got);
 if (got !== expected) throw new Error('string front gap regressions');
