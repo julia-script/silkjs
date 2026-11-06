@@ -1,5 +1,7 @@
 //! Runtime-owned OpenSSL handles and libuv work requests. Worker callbacks only
 //! touch C-owned payloads; JavaScript conversion and callback delivery stay on the loop.
+import ext.blocking_pool as pool
+import ext.fs_async as fs_async
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silkjs.js_owned_value { Value,  lendFor }
 import silkjs.js_realm { lendRealm }
@@ -53,7 +55,7 @@ unsafe effect fn throwPlainError<'m, S: EngineServices>(engine: &mut Engine<'m, 
 pub struct State { first: ?*mut Handle, jobs: ?*mut Job, next: i32, closing: bool }
 struct Handle { next: ?*mut Handle, id: i32, kind: i32, pointer: ?*mut u8 }
 struct Job {
-  next: ?*mut Job, request: ?*mut u8, callback: ValueBits, done: bool,
+  next: ?*mut Job, work: pool.Job, callback: ValueBits, done: bool,
   op: i32, data: [?*mut u8; 8], lengths: [usize; 8], numbers: [i64; 8],
   handle: ?*mut u8, other: ?*mut u8, retained: bool,
   output: ?*mut u8, length: usize, capacity: usize, result: i64, resultKind: i32,
@@ -120,7 +122,7 @@ unsafe fn destroyJob(job: *mut Job) -> () {
   if j.retained { unsafe ssl.EVP_PKEY_free(j.handle) unsafe ssl.EVP_PKEY_free(j.other) }
   unsafe freeHandle(j.createdKind, j.created)
   if !Pointer.isNull<u8>(j.output) { unsafe ssl.OPENSSL_cleanse(j.output, j.capacity) }
-  unsafe ssl.free(j.output) unsafe ssl.free(j.error) unsafe ssl.free(j.request)
+  unsafe ssl.free(j.output) unsafe ssl.free(j.error)
   unsafe ssl.free(unsafe raw(job))
 }
 pub effect fn open() -> *mut State ! OutOfMemoryError {
@@ -133,9 +135,10 @@ pub effect fn open() -> *mut State ! OutOfMemoryError {
 pub unsafe effect fn appendResources<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State,array:ValueBits,index:&mut u32)->() !JsException ?&mut Allocator {
   let anchor=() let owner=unsafe Pointer.borrow<(),State>(&anchor,state) let mut cursor=owner.jobs drop owner
   while !Pointer.isNull<Job>(cursor) {
+    let request=unsafe raw(unsafe nonnull(cursor))
     let job=unsafe Pointer.borrow<(),Job>(&anchor,unsafe nonnull(cursor))
     // Only immutable owner-thread fields: worker output/status is never inspected.
-    cursor=job.next let request=unsafe nonnull(job.request) drop job
+    cursor=job.next drop job
     run unsafe resources.appendRequest(&mut engine,context,array,&mut index,request,b"work",b"")
   }
 }
@@ -540,7 +543,7 @@ effect fn newJob() -> *mut Job ! OutOfMemoryError {
   let p = unsafe ssl.calloc(1, Layout.of<Job>().bytes)
   if Pointer.isNull<u8>(p) { fail OutOfMemoryError {} }
   let j = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Job>(unsafe nonnull(p))
-  unsafe Pointer.put<Job>(j, Job { next: Pointer.null<Job>(), request: nil(), callback: ValueBits.Undefined, done: false, op: 0, data: [nil(); 8], lengths: [0; 8], numbers: [0; 8], handle: nil(), other: nil(), retained: false, output: nil(), length: 0, capacity: 0, result: 0, resultKind: 0, created: nil(), createdKind: 0, status: 0, error: nil(), codedError: false })
+  unsafe Pointer.put<Job>(j, Job { next: Pointer.null<Job>(), work: pool.job(silkCryptoWork, silkCryptoAfterWork, unsafe raw(j)), callback: ValueBits.Undefined, done: false, op: 0, data: [nil(); 8], lengths: [0; 8], numbers: [0; 8], handle: nil(), other: nil(), retained: false, output: nil(), length: 0, capacity: 0, result: 0, resultKind: 0, created: nil(), createdKind: 0, status: 0, error: nil(), codedError: false })
   let mut anchor = () let entry = unsafe Pointer.borrowMut<(), Job>(&mut anchor, j)
   entry.error = unsafe ssl.calloc(1, 256) let failed = Pointer.isNull<u8>(entry.error) drop entry
   if failed { unsafe destroyJob(j) fail OutOfMemoryError {} }
@@ -590,35 +593,30 @@ pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>,
   unsafe destroyJob(j)
   return match move converted { Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
 }
-export "C" fn silkCryptoWork(request: *mut u8) -> () {
-  let p = unsafe uv.uv_req_get_data(request)
+// Runs on a blocking worker.
+export "C" fn silkCryptoWork(p: ?*mut u8) -> () {
   let j = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Job>(unsafe nonnull(p))
   let mut anchor = () let entry = unsafe Pointer.borrowMut<(), Job>(&mut anchor, j)
   if !unsafe execute(&mut entry) { unsafe recordError(&mut entry) }
 }
-export "C" fn silkCryptoAfterWork(request: *mut u8, status: i32) -> () {
-  let p = unsafe uv.uv_req_get_data(request)
+export "C" fn silkCryptoAfterWork(p: ?*mut u8) -> () {
   let j = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Job>(unsafe nonnull(p))
   let mut anchor = () let entry = unsafe Pointer.borrowMut<(), Job>(&mut anchor, j)
-  if status < 0 { entry.status = status } entry.done = true
+  entry.done = true
 }
-pub unsafe effect fn submit<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, loop: *mut u8, argc: i32, argv: &FrameSlots) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+pub unsafe effect fn submit<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, io: *mut fs_async.State, argc: i32, argv: &FrameSlots) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
   let anchor = () let s = unsafe Pointer.borrow<(), State>(&anchor, state) let closing = s.closing drop s
   if closing { return run unsafe throwPlainError(&mut engine, context, b"ERR_CRYPTO_INVALID_STATE: crypto executor is closed") }
   let j = run newJob() let mut mutable = () let entry = unsafe Pointer.borrowMut<(), Job>(&mut mutable, j)
   let prepared = run Effect.result(unsafe prepare(&mut engine, context, state, &mut entry, argv, true)) drop entry
   match move prepared { Result<(), OutOfMemoryError | JsException>.Success { .. } => () Result<(), OutOfMemoryError | JsException>.Failure { error } => { unsafe destroyJob(j) fail move error } }
   let entry2 = unsafe Pointer.borrowMut<(), Job>(&mut mutable, j)
-  entry2.request = unsafe ssl.calloc(1, unsafe uv.uv_req_size(7))
-  if Pointer.isNull<u8>(entry2.request) { drop entry2 unsafe destroyJob(j) fail OutOfMemoryError {} }
   entry2.callback = unsafe (unsafe common.argument(argv, 2)).retained()
-  let request = unsafe nonnull(entry2.request)
-  unsafe uv.uv_req_set_data(request, unsafe raw(j))
-  let cb: WorkCallback = silkCryptoWork let after: AfterCallback = silkCryptoAfterWork
-  let status = unsafe uv.uv_queue_work(loop, request, cb, after)
-  if status < 0 { entry2.status = status entry2.done = true }
   let mut stateAnchor = () let s2 = unsafe Pointer.borrowMut<(), State>(&mut stateAnchor, state)
-  entry2.next = s2.jobs s2.jobs = j
+  entry2.next = s2.jobs s2.jobs = j drop s2
+  let job = Pointer.fromMutRef<pool.Job>(&mut entry2.work) drop entry2
+  let status = run unsafe fs_async.queueWork(io, job)
+  if status < 0 { let entry3 = unsafe Pointer.borrowMut<(), Job>(&mut mutable, j) entry3.status = status entry3.done = true }
   return ValueBits.Undefined
 }
 unsafe fn takeCompleted(state: *mut State) -> ?*mut Job {
@@ -648,12 +646,12 @@ pub unsafe effect fn poll<'m, S: EngineServices>(engine: &mut Engine<'m, S>, con
     match move delivered { Result<(), OutOfMemoryError | JsException>.Success { .. } => () Result<(), OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
   }
 }
-pub unsafe fn close<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, loop: *mut u8) -> () {
+pub unsafe fn close<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, io: *mut fs_async.State) -> () {
   let mut anchor = () let s = unsafe Pointer.borrowMut<(), State>(&mut anchor, state) s.closing = true drop s
   while true {
     let s2 = unsafe Pointer.borrow<(), State>(&anchor, state) let empty = Pointer.isNull<Job>(s2.jobs) drop s2
     if empty { break }
-    let ignored = unsafe uv.uv_run(loop, 1)
+    run unsafe fs_async.waitWork(io)
     while true {
       let optional = unsafe takeCompleted(state) if Pointer.isNull<Job>(optional) { break }
       let j = unsafe nonnull(optional) let entry = unsafe Pointer.borrow<(), Job>(&anchor, j) let callback = entry.callback drop entry

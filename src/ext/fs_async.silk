@@ -42,6 +42,14 @@ import ext.fs_native as fs
 import ext.fs_descriptors as descriptors
 import libs.core.common as common
 import ext.os_abi as osabi
+import silk.core.option { Option }
+import silk.io.reactor { Interest, ReadyEvent, Reactor, ReactorError }
+import ext.blocking_pool as pool
+import ext.blocking_pool { Pool }
+import ext.fs_ops as ops
+import silk.concurrency.thread_native { SpawnError }
+import silk.platform.native.clock { NativeClock }
+import silk.system.system_clock { SystemClock }
 import ext.uv_net as net
 
 unsafe extern "C" fn calloc(count: usize, size: usize) -> ?*mut u8
@@ -57,22 +65,25 @@ unsafe extern "C" fn uv_loop_alive(loop: *const u8) -> i32
 unsafe extern "C" fn uv_cancel(request: *mut u8) -> i32
 @foreign(noCapture: .("loop"))
 unsafe extern "C" fn uv_loop_configure(loop: *mut u8, option: i32, ...) -> i32
-unsafe extern "C" fn uv_timer_init(loop: *mut u8, timer: *mut u8) -> i32
-@deferredCallbacks("callback")
-unsafe extern "C" fn uv_timer_start(timer: *mut u8, callback: extern "C" fn(*mut u8) -> (), timeout: u64, repeat: u64) -> i32
-unsafe extern "C" fn uv_timer_stop(timer: *mut u8) -> i32
-// Ends a blocking run when the next JavaScript timer is due.
-export "C" fn deadlineReached(timer: *mut u8) -> () { return () }
-export "C" fn deadlineClosed(timer: *mut u8) -> () { return () }
+@foreign(noCapture: .("loop"))
+unsafe extern "C" fn uv_backend_fd(loop: *const u8) -> i32
+@foreign(noCapture: .("loop"))
+unsafe extern "C" fn uv_backend_timeout(loop: *const u8) -> i32
+// The token of libuv's backend descriptor in the runtime reactor.
+const LIBUV_TOKEN: u64 = 1
 @foreign(noCapture: .("loop"))
 unsafe extern "C" fn uv_metrics_idle_time(loop: *mut u8) -> u64
 
-pub struct State { loop: *mut u8, deadline: *mut u8, first: ?*mut Request, delivering: ?*mut Request, watches: ?*mut Watch, nextWatch: i32, closing: bool, polling: bool, descriptors: descriptors.State }
+// The reactor is the loop's only blocking wait. libuv runs as a guest: its backend descriptor is
+// registered in the reactor, and each turn runs libuv without blocking.
+pub struct State { loop: *mut u8, reactor: Reactor, pool: Pool, idle: u64, inflight: usize, first: ?*mut Request, delivering: ?*mut Request, watches: ?*mut Watch, nextWatch: i32, closing: bool, polling: bool, descriptors: descriptors.State }
+// A request is native memory that the loop owns. While it is queued or running, a worker reads
+// `call` and writes `result`; the loop reads them again only after the pool returns `job`.
 struct Request {
-  next: ?*mut Request, native: *mut u8, done: bool, status: i32, requestKind: i32,
+  next: ?*mut Request, job: pool.Job, done: bool, status: i32, requestKind: i32,
   tracking: *mut descriptors.State, descriptorSettled: bool,
-  callback: ValueBits, args: [ValueBits; 5], operation: List<u8>, path: List<u8>, dest: List<u8>,
-  buffer: uv.UvBuf, offset: u64, bigint: bool, work: ?*mut u8, workMode: u32, workStatus: i32
+  callback: ValueBits, args: [ValueBits; 5], operation: List<u8>, call: ops.Call, result: ops.Outcome,
+  offset: u64, bigint: bool
 }
 unsafe fn nonnull<T>(pointer: ?*mut T) -> *mut T { return unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(pointer) }
 effect fn allocate(size: usize) -> *mut u8 ! OutOfMemoryError {
@@ -84,7 +95,7 @@ fn equal(a: &[u8], b: &[u8]) -> bool {
   if a.length != b.length { return false }
   let mut i: usize = 0 while i < a.length { if a[i] != b[i] { return false } i = i + 1 } return true
 }
-pub effect fn make() -> *mut State ! OutOfMemoryError {
+pub effect fn make() -> *mut State ! OutOfMemoryError ? &mut Allocator {
   let loop = run allocate(unsafe uv_loop_size())
   if unsafe uv_loop_init(loop) != 0 { unsafe free(loop) fail OutOfMemoryError {} }
   if unsafe uv_loop_configure(loop, 1) != 0 {
@@ -96,14 +107,20 @@ pub effect fn make() -> *mut State ! OutOfMemoryError {
     Result<*mut u8, OutOfMemoryError>.Success { value } => value
     Result<*mut u8, OutOfMemoryError>.Failure { error } => { let ignored = unsafe uv_loop_close(loop) unsafe free(loop) fail move error }
   }
-  let timerAllocated = run Effect.result(allocate(unsafe uv_handle_size(13)))
-  let deadline = match move timerAllocated {
-    Result<*mut u8, OutOfMemoryError>.Success { value } => value
-    Result<*mut u8, OutOfMemoryError>.Failure { error } => { unsafe free(raw) let ignored = unsafe uv_loop_close(loop) unsafe free(loop) fail move error }
+  let made = run Effect.result(Reactor.make())
+  let mut reactor = match move made {
+    Result<Reactor, ReactorError | OutOfMemoryError>.Success { value } => move value
+    Result<Reactor, ReactorError | OutOfMemoryError>.Failure { .. } => Intrinsic.trap("the runtime reactor cannot be opened")
   }
-  if unsafe uv_timer_init(loop, deadline) != 0 { Intrinsic.trap("libuv deadline timer cannot be initialized") }
+  let registered = run Effect.result(reactor.register(unsafe uv_backend_fd(loop), LIBUV_TOKEN, Interest.readOnly()))
+  if let Result<(), ReactorError>.Failure { .. } = move registered { Intrinsic.trap("libuv's backend descriptor cannot join the runtime reactor") }
+  let made2 = run Effect.result(Pool.make(reactor.waker()))
+  let workers = match move made2 {
+    Result<Pool, OutOfMemoryError>.Success { value } => move value
+    Result<Pool, OutOfMemoryError>.Failure { error } => { let ignored = unsafe uv_loop_close(loop) unsafe free(loop) unsafe free(raw) fail move error }
+  }
   let state = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut State>(raw)
-  unsafe Pointer.put<State>(state, State { loop: loop, deadline: deadline, first: Pointer.null<Request>(), delivering: Pointer.null<Request>(), watches: Pointer.null<Watch>(), nextWatch: 1, closing: false, polling: false, descriptors: descriptors.make() })
+  unsafe Pointer.put<State>(state, State { loop: loop, reactor: move reactor, pool: move workers, idle: 0, inflight: 0, first: Pointer.null<Request>(), delivering: Pointer.null<Request>(), watches: Pointer.null<Watch>(), nextWatch: 1, closing: false, polling: false, descriptors: descriptors.make() })
   return state
 }
 pub unsafe fn descriptorState(pointer: *mut State) -> *mut descriptors.State {
@@ -116,7 +133,7 @@ pub unsafe fn trackDescriptors(pointer: *mut State, enabled: bool) -> () {
 }
 pub unsafe fn idleNanoseconds(pointer: *mut State) -> u64 {
   let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer)
-  return unsafe uv_metrics_idle_time(state.loop)
+  return unsafe uv_metrics_idle_time(state.loop) + state.idle
 }
 
 @callbacks("callback")
@@ -179,8 +196,7 @@ fn resourceName(kind: i32) -> &'static [u8] {
 }
 unsafe effect fn requestResource<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, array: ValueBits, index: &mut u32, pointer: *mut Request) -> () ! JsException ? &mut Allocator {
   let anchor = () let entry = unsafe Pointer.borrow<(), Request>(&anchor, pointer)
-  let mut native = entry.native let mut kind: &[u8] = b"fs" let requestKind = entry.requestKind
-  if !Pointer.isNull<u8>(entry.work) { kind = b"work" native = unsafe nonnull(entry.work) }
+  let native = unsafe Intrinsic.pointerReinterpret<*mut Request, *mut u8>(pointer) let kind: &[u8] = b"fs" let requestKind = entry.requestKind
   drop entry
   let mut name: &[u8] = b"FSReqCallback"
   if requestKind == 1 { name = b"FSReqPromise" }
@@ -224,36 +240,63 @@ pub unsafe effect fn resourceSnapshot<'m, S: EngineServices>(engine: &mut Engine
   unsafe owners.cleanup(&mut engine, context, move scope)
   return match move outcome { Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
 }
-export "C" fn completed(native: *mut u8) -> () {
-  let raw = unsafe uv.uv_req_get_data(native)
-  let request = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Request>(unsafe nonnull(raw))
+// Runs on a blocking worker.
+export "C" fn runRequest(data: ?*mut u8) -> () {
+  let request = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Request>(unsafe nonnull(data))
   let mut anchor = () let entry = unsafe Pointer.borrowMut<(), Request>(&mut anchor, request)
-  entry.done = true
+  unsafe ops.execute(&entry.call, &mut entry.result)
 }
-export "C" fn lchmodWork(native: *mut u8) -> () {
-  let raw = unsafe uv.uv_req_get_data(native)
-  let request = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Request>(unsafe nonnull(raw))
-  let mut anchor = () let entry = unsafe Pointer.borrowMut<(), Request>(&mut anchor, request)
-  entry.workStatus = unsafe fs.lchmodNative(host.pointer(&entry.path), entry.workMode)
+unsafe fn owner(job: *mut pool.Job) -> *mut Request {
+  let anchor = () let entry = unsafe Pointer.borrow<(), pool.Job>(&anchor, job)
+  return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Request>(unsafe nonnull(entry.data))
 }
-export "C" fn workCompleted(native: *mut u8, status: i32) -> () {
-  let raw = unsafe uv.uv_req_get_data(native)
-  let request = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Request>(unsafe nonnull(raw))
+// Runs on the loop thread when the pool hands a request's job back.
+export "C" fn finishRequest(data: ?*mut u8) -> () {
+  let request = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Request>(unsafe nonnull(data))
   let mut anchor = () let entry = unsafe Pointer.borrowMut<(), Request>(&mut anchor, request)
-  entry.status = entry.workStatus if status < 0 { entry.status = status } entry.done = true
+  entry.status = entry.result.code entry.done = true
+}
+// Hands each finished job back to its owner.
+unsafe fn collectFinished(pointer: *mut State) -> () {
+  while true {
+    let mut anchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer)
+    let job = state.pool.takeDone()
+    if Pointer.isNull<pool.Job>(job) { break }
+    state.inflight = state.inflight - 1 drop state
+    let other = () let entry = unsafe Pointer.borrow<(), pool.Job>(&other, unsafe pool.nonnull(job))
+    let finish = entry.finish let data = entry.data drop entry
+    unsafe finish(data)
+  }
+}
+/// Queues `job` on the loop's blocking threads. Its `finish` runs in a later poll, on this thread.
+/// Returns 0, or a negative code when no thread could start.
+pub unsafe effect fn queueWork(pointer: *mut State, job: *mut pool.Job) -> i32 {
+  let mut anchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer)
+  let submitted = run Effect.result(unsafe state.pool.submit(job))
+  match move submitted {
+    Result<(), OutOfMemoryError | SpawnError>.Success { .. } => { state.inflight = state.inflight + 1 return 0 }
+    Result<(), OutOfMemoryError | SpawnError>.Failure { .. } => { return -11 }
+  }
+}
+/// Waits up to 10 ms for blocking work, then runs `finish` for each finished job. Executors call it
+/// while they close, before the loop itself closes.
+pub unsafe effect fn waitWork(pointer: *mut State) -> () {
+  let mut events = [ReadyEvent.empty()]
+  let mut anchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer)
+  let waited = run Effect.result(state.reactor.wait(&mut events, Option<u64>.some(10000000)))
+  if let Result<usize, ReactorError>.Failure { .. } = move waited { Intrinsic.trap("the runtime reactor wait failed") }
+  drop state
+  unsafe collectFinished(pointer)
 }
 unsafe fn release<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pointer: *mut Request) -> () {
   let request = unsafe Pointer.take<Request>(pointer)
   // A successful open may complete after termination, without reaching JS.
   // Successful closes must also leave the registry even when delivery is skipped.
-  if !request.descriptorSettled && request.done && request.status >= 0 && Pointer.isNull<u8>(request.work) {
-    let outcome = unsafe uv.uv_fs_get_result(request.native)
-    if outcome >= 0 {
-      if equal(request.operation.asSlice(), b"open") { unsafe descriptors.close(isize.toI32(outcome)) }
-      else if equal(request.operation.asSlice(), b"close") { unsafe descriptors.forget(request.tracking, f64.toI32(request.args[0].numericValue())) }
-    }
+  if !request.descriptorSettled && request.done && request.status >= 0 {
+    if request.call.op == ops.OPEN { unsafe descriptors.close(i64.toI32(request.result.count)) }
+    else if request.call.op == ops.CLOSE { unsafe descriptors.forget(request.tracking, request.call.fd) }
   }
-  unsafe uv.freeRequest(request.native) unsafe free(request.buffer.base) unsafe free(request.work)
+  unsafe free(request.call.buffer)
   unsafe owners.release(&mut engine, context, request.callback)
   let mut i: usize = 0 while i < 5 { unsafe owners.release(&mut engine, context, request.args[i]) i = i + 1 }
   drop request
@@ -269,25 +312,32 @@ unsafe effect fn prepare<'m, S: EngineServices>(engine: &mut Engine<'m, S>, cont
   request.operation = run host.text(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(operation))
   let mut i: u32 = 0
   while i < 5 { request.args[u32.toUsize(i)] = run unsafe owners.getIndex(&mut engine, context, args, i) i = i + 1 }
-  let op = request.operation.asSlice()
-  let pathless = equal(op, b"close") || equal(op, b"fstat") || equal(op, b"fsync") || equal(op, b"fdatasync") || equal(op, b"fchmod") || equal(op, b"fchown") || equal(op, b"ftruncate") || equal(op, b"futimes") || equal(op, b"read") || equal(op, b"write")
-  if !pathless { request.path = run host.text(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(request.args[0])) }
-  run request.path.append(0)
-  if equal(op, b"rename") || equal(op, b"link") || equal(op, b"symlink") || equal(op, b"copyFile") { request.dest = run host.text(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(request.args[1])) }
-  run request.dest.append(0)
+  let op = ops.code(request.operation.asSlice())
+  request.call.op = op
+  if op == 0 { return () }
+  if ops.takesDescriptor(op) { request.call.fd = i64.toI32(run unsafe integer(&mut engine, context, request.args[0])) }
+  else { request.call.path = run host.text(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(request.args[0])) }
+  if ops.takesDestination(op) { request.call.dest = run host.text(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(request.args[1])) }
   request.bigint = match request.args[1] { ValueBits.Bool { value } => value _ => false }
-  if equal(op, b"read") || equal(op, b"write") {
+  if op == ops.OPEN || op == ops.CHMOD || op == ops.FCHMOD || op == ops.LCHMOD || op == ops.MKDIR || op == ops.ACCESS || op == ops.CHOWN || op == ops.FCHOWN || op == ops.LCHOWN || op == ops.FTRUNCATE { request.call.a = run unsafe integer(&mut engine, context, request.args[1]) }
+  if op == ops.OPEN || op == ops.CHOWN || op == ops.FCHOWN || op == ops.LCHOWN || op == ops.SYMLINK || op == ops.COPYFILE { request.call.b = run unsafe integer(&mut engine, context, request.args[2]) }
+  if op == ops.UTIMES || op == ops.LUTIMES || op == ops.FUTIMES {
+    request.call.atime = run unsafe owners.number(&mut engine, context, request.args[1])
+    request.call.mtime = run unsafe owners.number(&mut engine, context, request.args[2])
+  }
+  if op == ops.READ || op == ops.WRITE {
     let offset = run unsafe integer(&mut engine, context, request.args[2])
     let length = run unsafe integer(&mut engine, context, request.args[3])
+    request.call.position = run unsafe integer(&mut engine, context, request.args[4])
     let backing = run buffers.getArrayBuffer(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(request.args[1]))
     if offset < 0 || length < 0 || offset > u64.toI64(backing.byteLength) || length > u64.toI64(backing.byteLength) - offset {
       let ignored = run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Range, b"filesystem buffer range is out of bounds") return ()
     }
     request.offset = i64.toU64(offset)
     let mut capacity = i64.toUsize(length) if capacity == 0 { capacity = 1 }
-    request.buffer.base = run allocate(capacity) request.buffer.len = i64.toUsize(length)
-    if equal(op, b"write") {
-      let data = unsafe Pointer.assumeManyMut<u8>(unsafe nonnull(request.buffer.base))
+    request.call.buffer = run allocate(capacity) request.call.length = i64.toUsize(length)
+    if op == ops.WRITE {
+      let data = unsafe Pointer.assumeManyMut<u8>(unsafe nonnull(request.call.buffer))
       let mut index: u64 = 0
       while index < i64.toU64(length) {
         unsafe Pointer.put<u8>(unsafe Pointer.atMut<u8>(data, u64.toUsize(index)), u64.toU8(unsafe buffers.loadScalar(backing, request.offset + index, 0)))
@@ -296,81 +346,36 @@ unsafe effect fn prepare<'m, S: EngineServices>(engine: &mut Engine<'m, S>, cont
     }
   }
 }
-unsafe effect fn start<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, loop: *mut u8, request: &mut Request) -> i32 ! OutOfMemoryError | JsException ? &mut Allocator {
-  let op = request.operation.asSlice() let req = request.native let cb: uv.FsCallback = completed
-  let path = host.pointer(&request.path) let dest = host.pointer(&request.dest)
-  let mut fd: i32 = 0 let mut a: i64 = 0 let mut b: i64 = 0
-  if equal(op, b"close") || equal(op, b"fstat") || equal(op, b"fsync") || equal(op, b"fdatasync") || equal(op, b"fchmod") || equal(op, b"fchown") || equal(op, b"ftruncate") || equal(op, b"futimes") || equal(op, b"read") || equal(op, b"write") { fd = i64.toI32(run unsafe integer(&mut engine, context, request.args[0])) }
-  if equal(op, b"open") || equal(op, b"chmod") || equal(op, b"fchmod") || equal(op, b"mkdir") || equal(op, b"access") || equal(op, b"chown") || equal(op, b"fchown") || equal(op, b"lchown") || equal(op, b"ftruncate") { a = run unsafe integer(&mut engine, context, request.args[1]) }
-  if equal(op, b"open") || equal(op, b"chown") || equal(op, b"fchown") || equal(op, b"lchown") || equal(op, b"symlink") || equal(op, b"copyFile") { b = run unsafe integer(&mut engine, context, request.args[2]) }
-  if equal(op, b"lchmod") {
-    request.workMode = i64.toU32(run unsafe integer(&mut engine, context, request.args[1]))
-    request.work = run allocate(unsafe uv.uv_req_size(7))
-    let raw = unsafe uv.uv_req_get_data(req)
-    let work = unsafe nonnull(request.work)
-    unsafe uv.uv_req_set_data(work, raw)
-    return unsafe uv.uv_queue_work(loop, work, lchmodWork, workCompleted)
-  }
-  if equal(op, b"stat") { return unsafe uv.uv_fs_stat(loop, req, path, cb) }
-  if equal(op, b"lstat") { return unsafe uv.uv_fs_lstat(loop, req, path, cb) }
-  if equal(op, b"fstat") { return unsafe uv.uv_fs_fstat(loop, req, fd, cb) }
-  if equal(op, b"statfs") { return unsafe uv.uv_fs_statfs(loop, req, path, cb) }
-  if equal(op, b"open") { return unsafe uv.uv_fs_open(loop, req, path, i64.toI32(a), i64.toI32(b), cb) }
-  if equal(op, b"close") { return unsafe uv.uv_fs_close(loop, req, fd, cb) }
-  if equal(op, b"fsync") { return unsafe uv.uv_fs_fsync(loop, req, fd, cb) }
-  if equal(op, b"fdatasync") { return unsafe uv.uv_fs_fdatasync(loop, req, fd, cb) }
-  if equal(op, b"access") { return unsafe uv.uv_fs_access(loop, req, path, i64.toI32(a), cb) }
-  if equal(op, b"mkdir") { return unsafe uv.uv_fs_mkdir(loop, req, path, i64.toI32(a), cb) }
-  if equal(op, b"chmod") { return unsafe uv.uv_fs_chmod(loop, req, path, i64.toI32(a), cb) }
-  if equal(op, b"fchmod") { return unsafe uv.uv_fs_fchmod(loop, req, fd, i64.toI32(a), cb) }
-  if equal(op, b"chown") { return unsafe uv.uv_fs_chown(loop, req, path, i64.toU32(a), i64.toU32(b), cb) }
-  if equal(op, b"lchown") { return unsafe uv.uv_fs_lchown(loop, req, path, i64.toU32(a), i64.toU32(b), cb) }
-  if equal(op, b"fchown") { return unsafe uv.uv_fs_fchown(loop, req, fd, i64.toU32(a), i64.toU32(b), cb) }
-  if equal(op, b"unlink") { return unsafe uv.uv_fs_unlink(loop, req, path, cb) }
-  if equal(op, b"rmdir") { return unsafe uv.uv_fs_rmdir(loop, req, path, cb) }
-  if equal(op, b"rename") { return unsafe uv.uv_fs_rename(loop, req, path, dest, cb) }
-  if equal(op, b"link") { return unsafe uv.uv_fs_link(loop, req, path, dest, cb) }
-  if equal(op, b"symlink") { return unsafe uv.uv_fs_symlink(loop, req, path, dest, i64.toI32(b), cb) }
-  if equal(op, b"copyFile") { return unsafe uv.uv_fs_copyfile(loop, req, path, dest, i64.toI32(b), cb) }
-  if equal(op, b"readlink") { return unsafe uv.uv_fs_readlink(loop, req, path, cb) }
-  if equal(op, b"realpath") { return unsafe uv.uv_fs_realpath(loop, req, path, cb) }
-  if equal(op, b"mkdtemp") { return unsafe uv.uv_fs_mkdtemp(loop, req, path, cb) }
-  if equal(op, b"scandir") { return unsafe uv.uv_fs_scandir(loop, req, path, 0, cb) }
-  if equal(op, b"ftruncate") { return unsafe uv.uv_fs_ftruncate(loop, req, fd, a, cb) }
-  if equal(op, b"read") || equal(op, b"write") {
-    let position = run unsafe integer(&mut engine, context, request.args[4])
-    if equal(op, b"read") { return unsafe uv.uv_fs_read(loop, req, fd, Pointer.fromRef<uv.UvBuf>(&request.buffer), 1, position, cb) }
-    return unsafe uv.uv_fs_write(loop, req, fd, Pointer.fromRef<uv.UvBuf>(&request.buffer), 1, position, cb)
-  }
-  if equal(op, b"utimes") || equal(op, b"futimes") || equal(op, b"lutimes") {
-    let atime = run unsafe owners.number(&mut engine, context, request.args[1]) let mtime = run unsafe owners.number(&mut engine, context, request.args[2])
-    if equal(op, b"utimes") { return unsafe uv.uv_fs_utime(loop, req, path, atime, mtime, cb) }
-    if equal(op, b"lutimes") { return unsafe uv.uv_fs_lutime(loop, req, path, atime, mtime, cb) }
-    return unsafe uv.uv_fs_futime(loop, req, fd, atime, mtime, cb)
-  }
-  // Unknown private primitive: fail closed with platform-correct ENOSYS.
-  static if Intrinsic.targetOperatingSystem() == "darwin" { return unsafe uv.uv_translate_sys_error(78) }
-  else { return unsafe uv.uv_translate_sys_error(38) }
-}
 pub unsafe effect fn submit<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pointer: *mut State, operation: ValueBits, args: ValueBits, callback: ValueBits, requestKind: i32) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
-  let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer) let loop = state.loop let closing = state.closing drop state
+  let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer) let closing = state.closing drop state
   if closing { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Internal, b"filesystem executor is closed") }
-  let native = run uv.allocateRequest()
-  let allocated = run Effect.result(allocate(Layout.of<Request>().bytes))
-  let raw = match move allocated { Result<*mut u8, OutOfMemoryError>.Success { value } => value Result<*mut u8, OutOfMemoryError>.Failure { error } => { unsafe uv.freeRequest(native) fail move error } }
+  let raw = run allocate(Layout.of<Request>().bytes)
   let request = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Request>(raw)
-  unsafe Pointer.put<Request>(request, Request { next: Pointer.null<Request>(), native: native, done: false, status: 0, requestKind: requestKind, tracking: unsafe descriptorState(pointer), descriptorSettled: false, callback: unsafe callback.retained(), args: [ValueBits.Undefined; 5], operation: List<u8>.make(), path: List<u8>.make(), dest: List<u8>.make(), buffer: uv.UvBuf { base: Pointer.null<u8>(), len: 0 }, offset: 0, bigint: false, work: Pointer.null<u8>(), workMode: 0, workStatus: 0 })
+  unsafe Pointer.put<Request>(request, Request { next: Pointer.null<Request>(), job: pool.job(runRequest, finishRequest, raw), done: false, status: 0, requestKind: requestKind, tracking: unsafe descriptorState(pointer), descriptorSettled: false, callback: unsafe callback.retained(), args: [ValueBits.Undefined; 5], operation: List<u8>.make(), call: ops.call(0), result: ops.outcome(), offset: 0, bigint: false })
   let mut mutable = () let entry = unsafe Pointer.borrowMut<(), Request>(&mut mutable, request)
   let prepared = run Effect.result(unsafe prepare(&mut engine, context, &mut entry, operation, args)) drop entry
   match move prepared { Result<(), OutOfMemoryError | JsException>.Success { .. } => () Result<(), OutOfMemoryError | JsException>.Failure { error } => { unsafe release(&mut engine, context, request) fail move error } }
-  unsafe uv.uv_req_set_data(native, raw)
-  let entry2 = unsafe Pointer.borrowMut<(), Request>(&mut mutable, request)
-  let started = run Effect.result(unsafe start(&mut engine, context, loop, &mut entry2)) drop entry2
-  let status = match move started { Result<i32, OutOfMemoryError | JsException>.Success { value } => value Result<i32, OutOfMemoryError | JsException>.Failure { error } => { unsafe release(&mut engine, context, request) fail move error } }
   let state2 = unsafe Pointer.borrowMut<(), State>(&mut mutable, pointer)
-  let mut entryAnchor = () let entry3 = unsafe Pointer.borrowMut<(), Request>(&mut entryAnchor, request)
-  entry3.next = state2.first entry3.status = status entry3.done = status < 0 state2.first = request drop entry3 drop state2
+  let mut entryAnchor = () let entry2 = unsafe Pointer.borrowMut<(), Request>(&mut entryAnchor, request)
+  entry2.next = state2.first state2.first = request
+  if entry2.call.op == 0 {
+    // Unknown private primitive: fail closed with platform-correct ENOSYS.
+    static if Intrinsic.targetOperatingSystem() == "darwin" { entry2.status = -78 } else { entry2.status = -38 }
+    entry2.done = true return ValueBits.Undefined
+  }
+  let job = Pointer.fromMutRef<pool.Job>(&mut entry2.job) drop entry2 drop state2
+  let status = run unsafe queueWork(pointer, job)
+  if status < 0 { let entry3 = unsafe Pointer.borrowMut<(), Request>(&mut entryAnchor, request) entry3.status = status entry3.done = true }
   return ValueBits.Undefined
+}
+unsafe fn allFinished(pointer: *mut State) -> bool {
+  let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer)
+  let mut request = state.first drop state
+  while !Pointer.isNull<Request>(request) {
+    let entry = unsafe Pointer.borrow<(), Request>(&anchor, unsafe nonnull(request))
+    if !entry.done { return false } request = entry.next
+  }
+  return true
 }
 unsafe fn takeCompleted(pointer: *mut State) -> ?*mut Request {
   let mut anchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer)
@@ -386,22 +391,18 @@ unsafe fn takeCompleted(pointer: *mut State) -> ?*mut Request {
 unsafe effect fn deliver<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pointer: *mut Request) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
   let mut anchor = () let request = unsafe Pointer.borrowMut<(), Request>(&mut anchor, pointer)
   let mut status = request.status
-  if status >= 0 && Pointer.isNull<u8>(request.work) { let outcome = unsafe uv.uv_fs_get_result(request.native) if outcome < 0 { status = isize.toI32(outcome) } else { status = 0 } }
+  let op = request.call.op
   if status == 0 {
-    if equal(request.operation.asSlice(), b"open") {
-      run unsafe descriptors.acquire(request.tracking, isize.toI32(unsafe uv.uv_fs_get_result(request.native)))
-    } else if equal(request.operation.asSlice(), b"close") {
-      unsafe descriptors.forget(request.tracking, f64.toI32(request.args[0].numericValue()))
-    }
+    if op == ops.OPEN { run unsafe descriptors.acquire(request.tracking, i64.toI32(request.result.count)) }
+    else if op == ops.CLOSE { unsafe descriptors.forget(request.tracking, request.call.fd) }
     request.descriptorSettled = true
   }
-  if status == 0 && equal(request.operation.asSlice(), b"read") {
-    let count = unsafe uv.uv_fs_get_result(request.native)
+  if status == 0 && op == ops.READ {
     let backing = unsafe buffers.snapshot(core.reference(request.args[1]))
-    let amount = isize.toU64(count)
+    let amount = i64.toU64(request.result.count)
     if backing.detached || request.offset > backing.byteLength || amount > backing.byteLength - request.offset { status = -22 }
     else {
-      let source = unsafe Pointer.assumeManyMut<u8>(unsafe nonnull(request.buffer.base)) let mut i: u64 = 0
+      let source = unsafe Pointer.assumeManyMut<u8>(unsafe nonnull(request.call.buffer)) let mut i: u64 = 0
       while i < amount { unsafe buffers.storeScalar(backing, request.offset + i, 0, u8.toU64(unsafe Pointer.read<u8>(unsafe Pointer.atMut<u8>(source, u64.toUsize(i))))) i = i + 1 }
     }
   }
@@ -409,7 +410,7 @@ unsafe effect fn deliver<'m, S: EngineServices>(engine: &mut Engine<'m, S>, cont
   let mut code = ValueBits.Undefined
   if status < 0 { code = (run systemErrors.nameValue(&mut engine, unsafe lendRealm(&context, context), status)).intoBits() }
   let mut converted = Result<ValueBits, OutOfMemoryError | JsException>.Success { value: ValueBits.Undefined }
-  if status >= 0 && Pointer.isNull<u8>(request.work) { converted = run Effect.result(unsafe fs.result(&mut engine, context, request.native, request.operation.asSlice(), request.bigint)) }
+  if status >= 0 { converted = run Effect.result(unsafe ops.value(&mut engine, context, op, &request.result, request.bigint)) }
   let result = match move converted {
     Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value
     Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => { unsafe owners.release(&mut engine, context, code) fail move error }
@@ -421,7 +422,7 @@ unsafe effect fn deliver<'m, S: EngineServices>(engine: &mut Engine<'m, S>, cont
 }
 pub unsafe fn hasPending(pointer: *mut State) -> bool {
   let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer)
-  return !Pointer.isNull<Request>(state.first) || unsafe uv_loop_alive(state.loop) != 0
+  return !Pointer.isNull<Request>(state.first) || state.inflight > 0 || unsafe uv_loop_alive(state.loop) != 0
 }
 unsafe effect fn deliverCompleted<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pointer: *mut State, request: *mut Request) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
   let mut anchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer)
@@ -435,18 +436,18 @@ unsafe effect fn deliverCompleted<'m, S: EngineServices>(engine: &mut Engine<'m,
 // `timeout` is in milliseconds: 0 polls without waiting, a negative value waits while native work is
 // pending, and a positive value also waits for that long, for the next JavaScript timer.
 unsafe effect fn pollInner<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pointer: *mut State, timeout: i64, pollAnchor: *mut u8) -> bool ! OutOfMemoryError | JsException ? &mut Allocator {
-  let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer) let loop = state.loop let deadline = state.deadline drop state
+  let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer) let loop = state.loop drop state
   // Process already-completed submissions before any potentially blocking run.
   let mut ran = false
   let mut mode: i32 = 2
   if timeout > 0 || (timeout < 0 && unsafe hasPending(pointer)) { mode = 1 }
+  unsafe collectFinished(pointer)
   let immediate = unsafe takeCompleted(pointer)
   if !Pointer.isNull<Request>(immediate) {
     run unsafe deliverCompleted(&mut engine, context, pointer, unsafe nonnull(immediate))
     ran = true mode = 2
   }
-  let armed = mode == 1 && timeout > 0
-  if armed { let ignored = unsafe uv_timer_start(deadline, deadlineReached, i64.toU64(timeout), 0) }
+  if mode == 1 { run unsafe waitReady(pointer, loop, timeout) mode = 2 }
   // JS timers can keep the runtime alive while every libuv handle is unrefed.
   // UV_RUN_NOWAIT otherwise skips polling entirely. Borrow the existing wake
   // handle's reference only across native callbacks, never across JS delivery.
@@ -454,7 +455,7 @@ unsafe effect fn pollInner<'m, S: EngineServices>(engine: &mut Engine<'m, S>, co
   if borrowedRef { unsafe uv_ref(pollAnchor) }
   let ignored = unsafe uv.uv_run(loop, mode)
   if borrowedRef { unsafe uv_unref(pollAnchor) }
-  if armed { let stopped = unsafe uv_timer_stop(deadline) }
+  unsafe collectFinished(pointer)
   while true {
     let entry = unsafe takeCompleted(pointer) if Pointer.isNull<Request>(entry) { break }
     run unsafe deliverCompleted(&mut engine, context, pointer, unsafe nonnull(entry))
@@ -462,6 +463,22 @@ unsafe effect fn pollInner<'m, S: EngineServices>(engine: &mut Engine<'m, S>, co
   }
   if run unsafe pollWatches(&mut engine, context, pointer) { ran = true }
   return ran
+}
+// Blocks in the reactor until a descriptor is ready, a waker fires, libuv's next timer is due, or
+// `timeout` milliseconds pass (a negative `timeout` waits without a JavaScript limit).
+unsafe effect fn waitReady(pointer: *mut State, loop: *mut u8, timeout: i64) -> () {
+  let guest = unsafe uv_backend_timeout(loop)
+  let mut limit = timeout
+  if guest >= 0 && (limit < 0 || i32.toI64(guest) < limit) { limit = i32.toI64(guest) }
+  let nanoseconds = if limit < 0 { Option<u64>.none() } else { Option<u64>.some(i64.toU64(limit) * 1000000) }
+  let mut events = [ReadyEvent.empty(), ReadyEvent.empty(), ReadyEvent.empty(), ReadyEvent.empty()]
+  let mut anchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer)
+  let started = run NativeClock.now(true)
+  let waited = run Effect.result(state.reactor.wait(&mut events, nanoseconds))
+  if let Result<usize, ReactorError>.Failure { .. } = move waited { Intrinsic.trap("the runtime reactor wait failed") }
+  let ended = run NativeClock.now(true)
+  let elapsed = (SystemClock.seconds(&ended) - SystemClock.seconds(&started)) * 1000000000 + SystemClock.nanoseconds(&ended) - SystemClock.nanoseconds(&started)
+  if elapsed > 0 { state.idle = state.idle + i64.toU64(elapsed) }
 }
 pub unsafe effect fn poll<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pointer: *mut State, timeout: i64, pollAnchor: *mut u8) -> bool ! OutOfMemoryError | JsException ? &mut Allocator {
   let mut anchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer)
@@ -686,16 +703,24 @@ unsafe effect fn pollWatches<'m, S: EngineServices>(engine: &mut Engine<'m, S>, 
 }
 pub unsafe fn close<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pointer: *mut State) -> () {
   let mut anchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer)
-  state.closing = true let loop = state.loop let mut request = state.first let mut watch = state.watches drop state
-  while !Pointer.isNull<Request>(request) {
-    let entry = unsafe Pointer.borrow<(), Request>(&anchor, unsafe nonnull(request))
-    if !entry.done { let mut native = entry.native if !Pointer.isNull<u8>(entry.work) { native = unsafe nonnull(entry.work) } let ignored = unsafe uv_cancel(native) } request = entry.next
+  state.closing = true let loop = state.loop let mut watch = state.watches drop state
+  // Jobs that no worker started are cancelled; running ones finish below.
+  let cancelling = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer)
+  while true {
+    let job = cancelling.pool.takeQueued()
+    if Pointer.isNull<pool.Job>(job) { break }
+    cancelling.inflight = cancelling.inflight - 1
+    // Other executors drain their own work before the loop closes, so a queued job is a request.
+    let mut other = () let entry = unsafe Pointer.borrowMut<(), Request>(&mut other, unsafe owner(unsafe pool.nonnull(job)))
+    static if Intrinsic.targetOperatingSystem() == "darwin" { entry.status = -89 } else { entry.status = -125 }
+    entry.done = true
   }
+  drop cancelling
+  while !unsafe allFinished(pointer) { run unsafe waitWork(pointer) }
+
   while !Pointer.isNull<Watch>(watch) {
     let owner = unsafe nonnull(watch) let entry = unsafe Pointer.borrow<(), Watch>(&anchor, owner) watch = entry.next drop entry unsafe stopWatch(owner)
   }
-  let deadlineAnchor = unsafe Pointer.borrow<(), State>(&anchor, pointer) let deadline = deadlineAnchor.deadline drop deadlineAnchor
-  unsafe uv_close(deadline, deadlineClosed)
   // Cancellation cannot interrupt a running syscall. Drain until every request
   // and handle has completed before freeing native memory or JS roots.
   let ignored = unsafe uv.uv_run(loop, 0)
@@ -704,7 +729,9 @@ pub unsafe fn close<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: 
   while !Pointer.isNull<Watch>(watch) {
     let owner = unsafe nonnull(watch) let entry = unsafe Pointer.borrow<(), Watch>(&anchor, owner) watch = entry.next drop entry unsafe releaseWatch(&mut engine, context, owner)
   }
+  // Dropping the reactor closes its kernel queue, which also forgets libuv's backend descriptor.
+  drop state2
   let status = unsafe uv_loop_close(loop)
   if status != 0 { Intrinsic.trap("filesystem loop still owns foreign handles at close") }
-  unsafe free(state2.deadline) unsafe free(loop) unsafe free(unsafe Intrinsic.pointerReinterpret<*mut State, *mut u8>(pointer))
+  unsafe free(loop) unsafe free(unsafe Intrinsic.pointerReinterpret<*mut State, *mut u8>(pointer))
 }
