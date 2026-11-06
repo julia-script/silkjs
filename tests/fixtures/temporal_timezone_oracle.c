@@ -42,7 +42,7 @@ static void name(const char *s) {
     printf("  assert(bytesEqual(tz.ti_canonicalize_timezone_alias(b\"%s\"), b\"%s\"))\n", s, ti_canonicalize_timezone_alias(s));
 }
 int main(void) {
-    puts("import temporal_timezone as tz\nimport silk.i64\nimport silk.u8\nfn assert(ok: bool) -> () { if !ok { Intrinsic.trap(\"Timezone C contrast failed\") } }\nfn bytesEqual(a: &[u8], b: &[u8]) -> bool {\n  if a.length != b.length { return false }\n  let mut i: usize = 0\n  while i < a.length { if a[i] != b[i] { return false } i = i + 1 }\n  return true\n}\nfn names() -> () {");
+    puts("import temporal_timezone as tz\nimport silk.num.i64\nimport silk.num.u8\nfn assert(ok: bool) -> () { if !ok { Intrinsic.trap(\"Timezone C contrast failed\") } }\nfn bytesEqual(a: &[u8], b: &[u8]) -> bool {\n  if a.length != b.length { return false }\n  let mut i: usize = 0\n  while i < a.length { if a[i] != b[i] { return false } i = i + 1 }\n  return true\n}\nfn names() -> () {");
     for (int i = 0; i < ti_tz_name_count; ++i) {
         name(ti_tz_names[i]);
         char lower[256];

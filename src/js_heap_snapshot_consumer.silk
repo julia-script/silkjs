@@ -1,0 +1,160 @@
+//! Native regression consumer: call exercise with a real initialized Engine and
+//! intrinsic context. Evaluated fixtures use owned values and a borrowed Realm;
+//! capture reads ValueBits using an independent allocator without retaining roots.
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.testing.testing { Testing, AssertionError }
+import silk.num.usize
+import js_engine { Engine }
+import js_heap { HeapHeader, HeapCell, HeapKind }
+import js_core_types { RuntimeState, ObjectData, ObjectPayload }
+import js_value { ValueBits }
+import js_realm { lendRealm }
+import js_exceptions { JsException }
+import js_debugger_execution_consumer { Services }
+import js_heap_snapshot { BusyHeap }
+import js_heap_snapshot_graph { Graph, Strength }
+import js_heap_snapshot as heap
+import js_heap_snapshot_json as json
+import js_eval as eval
+import js_runtime as runtime
+
+struct HeaderState {
+  reference: *mut HeapHeader, count: i32, mark: u8, previous: usize, next: usize
+}
+impl Copy for HeaderState {}
+fn reference(value: ValueBits) -> *mut HeapHeader {
+  return match value.heapReference() { Option<*mut HeapHeader>.Some { value: header } => header _ => Intrinsic.trap("heap consumer expected heap reference") }
+}
+unsafe fn element(array: ValueBits, index: usize) -> ValueBits {
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(array))
+  return match &object.payload { ObjectPayload.FastArray { array: storage } => storage.values.get(index) _ => Intrinsic.trap("heap consumer expected dense fixture array") }
+}
+fn equal(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut i: usize = 0 while i < left.length { if left[i] != right[i] { return false } i = i + 1 }
+  return true
+}
+fn indexOf(graph: &Graph, cell: *mut HeapHeader) -> usize {
+  let mut i: usize = 0
+  while i < graph.nodes.length() {
+    if Pointer.address<HeapHeader>(graph.nodes.get(i).reference) == Pointer.address<HeapHeader>(cell) { return i }
+    i = i + 1
+  }
+  return usize.MAX
+}
+fn edge(graph: &Graph, from: usize, to: usize, strength: Strength) -> bool {
+  let mut i: usize = 0 while i < graph.edges.length() {
+    let value = graph.edges.get(i)
+    if value.from == from && value.to == to && value.strength == strength { return true }
+    i = i + 1
+  }
+  return false
+}
+unsafe effect fn headers(runtime: *mut HeapHeader) -> List<HeaderState>
+  ! OutOfMemoryError ? &mut Allocator {
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let mut cursor = state.gcObjects.first let mut result = List<HeaderState>.make()
+  while !Pointer.isNull<HeapHeader>(cursor) {
+    let cell = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(cursor)
+    let header = unsafe Pointer.borrow<(), HeapHeader>(&anchor, cell)
+    run result.append(HeaderState { reference: cell, count: header.referenceCount, mark: header.mark,
+      previous: Pointer.address<HeapHeader>(header.previous), next: Pointer.address<HeapHeader>(header.next) })
+    cursor = header.next
+  }
+  return move result
+}
+unsafe effect fn unchanged(before: &List<HeaderState>) -> () ! AssertionError<'static> {
+  let anchor = () let mut i: usize = 0
+  while i < before.length() {
+    let saved = before.get(i) let current = unsafe Pointer.borrow<(), HeapHeader>(&anchor, saved.reference)
+    run Testing.expect(current.referenceCount == saved.count && current.mark == saved.mark
+      && Pointer.address<HeapHeader>(current.previous) == saved.previous && Pointer.address<HeapHeader>(current.next) == saved.next,
+      "snapshot, encoding and prototype queries preserve every live GC header")
+    i = i + 1
+  }
+}
+pub unsafe effect fn exercise<'m>(engine: &mut Engine<'m, Services>, context: *mut HeapHeader) -> ()
+  ! JsException | OutOfMemoryError | BusyHeap | AssertionError<'static> ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context) let memory = engine.memory
+  let realmAnchor = () let realm = unsafe lendRealm(&realmAnchor, context)
+  // repeat() returns flat storage. Both leaves exceed ROPE_SHORT_LENGTH (512),
+  // so concatenation must construct the two-child rope rather than merge flats.
+  let source = b"globalThis.__heapGetterCalls=0;(()=>{const p={};const o=Object.create(p);Object.defineProperty(o,'danger',{get(){++globalThis.__heapGetterCalls;throw Error('getter called')}});o.self=o;const k={},v={};const w=new WeakMap([[k,v]]);const r=new WeakRef(k);const b=new ArrayBuffer(96);const t=new Uint8Array(b,8,16);const s='heap-'+String(123456789);const n=123456789012345678901234567890n;const f=()=>o;const left='L'.repeat(513),right='R'.repeat(513);const rope=left+right;const longText='S'.repeat(4097);const wideInt=2n**400n;return [p,o,k,v,w,r,b,t,f,s,n,f.bind(null),new Proxy(o,{getPrototypeOf(){throw Error('proxy trap called')}}),Promise.resolve(o),left,right,rope,longText,wideInt]})()"
+  let fixtureOwner = run eval.evaluate(&mut engine, memory, realm, source, b"heap-snapshot-consumer.js", 0)
+  let fixture = fixtureOwner.view()
+  let mut observerMemory = Allocator.systemAllocatorProvider()
+  let before = run unsafe headers(rt) |> Effect.provideMut<Allocator>(&mut observerMemory)
+  let ledger = memory.stats()
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let first = Pointer.address<HeapHeader>(state.gcObjects.first) let last = Pointer.address<HeapHeader>(state.gcObjects.last)
+  let zeroFirst = Pointer.address<HeapHeader>(state.zeroReferenceObjects.first) let zeroLast = Pointer.address<HeapHeader>(state.zeroReferenceObjects.last)
+  let temporaryFirst = Pointer.address<HeapHeader>(state.temporaryGcObjects.first) let temporaryLast = Pointer.address<HeapHeader>(state.temporaryGcObjects.last)
+  let phase = state.gcPhase drop state
+  let mut graph = run unsafe heap.snapshot(rt, &[fixture]) |> Effect.provideMut<Allocator>(&mut observerMemory)
+  let mut again = run unsafe heap.snapshot(rt, &[fixture]) |> Effect.provideMut<Allocator>(&mut observerMemory)
+  run unsafe heap.identify(&mut graph, memory) |> Effect.provideMut<Allocator>(&mut observerMemory)
+  run unsafe heap.identify(&mut again, memory) |> Effect.provideMut<Allocator>(&mut observerMemory)
+  run Testing.expect(graph.allocationIdentity && again.allocationIdentity, "real runtime allocations have monotonic journal identities")
+  let p = reference(unsafe element(fixture, 0)) let o = reference(unsafe element(fixture, 1))
+  let key = indexOf(&graph, reference(unsafe element(fixture, 2)))
+  let value = indexOf(&graph, reference(unsafe element(fixture, 3)))
+  let objectIndex = indexOf(&graph, o)
+  run Testing.expect(objectIndex != usize.MAX && key != usize.MAX && value != usize.MAX, "real fixture references appear in graph")
+  run Testing.expect(graph.nodes.get(objectIndex).id == again.nodes.get(indexOf(&again, o)).id, "live object IDs remain stable across captures")
+  run Testing.expect(edge(&graph, objectIndex, objectIndex, Strength.Strong), "self-cycle is retained without recursive traversal")
+  let queried = run unsafe heap.queryObjects(&graph, p) |> Effect.provideMut<Allocator>(&mut observerMemory)
+  let mut found = false let mut i: usize = 0
+  while i < queried.length() { if Pointer.address<HeapHeader>(queried.get(i)) == Pointer.address<HeapHeader>(o) { found = true } i = i + 1 }
+  run Testing.expect(found, "queryObjects finds an object by its stored prototype")
+  let mut weak = false let mut ephemeron = false let mut accessor = false
+  i = 0 while i < graph.edges.length() {
+    let relation = graph.edges.get(i)
+    if relation.to == key && relation.strength == Strength.Weak { weak = true }
+    if relation.to == value && relation.strength == Strength.Ephemeron && relation.condition == key { ephemeron = true }
+    if relation.from == objectIndex && equal(relation.label, b"getter.atom") { accessor = true }
+    i = i + 1
+  }
+  run Testing.expect(weak && ephemeron, "WeakRef/WeakMap retain weak key and conditional value semantics")
+  run Testing.expect(accessor, "getter callable is observed as an edge, not invoked")
+  // Short strings and BigInts up to INLINE_LIMBS keep their data in the cell,
+  // so it is counted in selfBytes; longer ones own a separate buffer.
+  let stringIndex = indexOf(&graph, reference(unsafe element(fixture, 9)))
+  let bigintIndex = indexOf(&graph, reference(unsafe element(fixture, 10)))
+  run Testing.expect(graph.nodes.get(stringIndex).nativeBytes == 0 && graph.nodes.get(bigintIndex).nativeBytes == 0,
+    "inline string and BigInt leaves report no separate native backing")
+  let longStringIndex = indexOf(&graph, reference(unsafe element(fixture, 17)))
+  let wideBigIntIndex = indexOf(&graph, reference(unsafe element(fixture, 18)))
+  run Testing.expect(graph.nodes.get(longStringIndex).nativeBytes > 4097 && graph.nodes.get(wideBigIntIndex).nativeBytes >= 13 * 4,
+    "separately allocated string and BigInt leaves include actual native backing")
+  let left = indexOf(&graph, reference(unsafe element(fixture, 14)))
+  let right = indexOf(&graph, reference(unsafe element(fixture, 15)))
+  let rope = indexOf(&graph, reference(unsafe element(fixture, 16)))
+  run Testing.expect(graph.nodes.get(rope).kind == HeapKind.Rope && edge(&graph, rope, left, Strength.Strong)
+    && edge(&graph, rope, right, Strength.Strong), "rope traversal preserves both children without flattening")
+  let mut bufferBacking = false i = 0
+  while i < graph.allocations.length() { if graph.allocations.get(i).bytes >= 96 { bufferBacking = true } i = i + 1 }
+  run Testing.expect(bufferBacking, "ArrayBuffer emits its actual native backing allocation")
+  let encoded = run json.encode(&graph) |> Effect.provideMut<Allocator>(&mut observerMemory)
+  run Testing.expect(encoded.length() > 2 && encoded.get(0) == 123 && encoded.get(encoded.length() - 1) == 125,
+    "native consumer serializes the explicit graph JSON envelope")
+  run unsafe unchanged(&before)
+  let after = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  run Testing.expect(first == Pointer.address<HeapHeader>(after.gcObjects.first) && last == Pointer.address<HeapHeader>(after.gcObjects.last)
+    && zeroFirst == Pointer.address<HeapHeader>(after.zeroReferenceObjects.first) && zeroLast == Pointer.address<HeapHeader>(after.zeroReferenceObjects.last)
+    && temporaryFirst == Pointer.address<HeapHeader>(after.temporaryGcObjects.first) && temporaryLast == Pointer.address<HeapHeader>(after.temporaryGcObjects.last)
+    && phase == after.gcPhase, "snapshot preserves all GC list endpoints and phase")
+  drop after
+  let afterLedger = memory.stats()
+  run Testing.expect(ledger.allocationCount == afterLedger.allocationCount && ledger.usedBytes == afterLedger.usedBytes,
+    "graph allocation is independent of the measured runtime ledger")
+  let callsOwner = run eval.evaluate(&mut engine, memory, realm, b"globalThis.__heapGetterCalls", b"heap-snapshot-consumer.js", 0)
+  let calls = callsOwner.view()
+  run Testing.expect(calls.isNumber() && calls.numericValue() == 0.0, "capture and query never execute getters or proxy traps")
+  unsafe callsOwner.release(&mut engine, rt)
+  unsafe fixtureOwner.release(&mut engine, rt)
+}

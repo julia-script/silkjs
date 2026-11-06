@@ -24,15 +24,18 @@ import js_gc { HeapHooks }
 import js_gc
 import js_core_types { FunctionBytecode, FunctionDebugInfo, FunctionKind, ByteStorage, SourceText, VarDef, ClosureVar, ClosureKind, RuntimeState, ModuleDef }
 import thin_list { ThinList }
-import js_compiler_types { ScopeTable, FunctionDef, FunctionId, FunctionTree, linked, CompilerVar, CompilerError, PendingFunction, ParseFunctionKind }
+import js_compiler_types { ScopeTable, FunctionDef, FunctionId, FunctionTree, linked, CompilerVar, CompilerError, CompilerErrorKind, PendingFunction, ParseFunctionKind }
 import js_compiler_state as state
 import js_compiler_variables as variables
 import js_compiler_labels { resolveLabels }
 import js_bytecode { analyze, constructForm, leafCode, leafPrefill, LEAF_CELLS, LEAF_CREDITS, LEAF_PREFILL, lazyArgumentsSite, lazyArgumentsAlias, SPECIAL_LAZY_ARGUMENTS, BytecodeError, leafAccessor, LEAF_ACCESSOR }
 import js_string_types { StringLengthError, StringOwner, latin1Bytes, stringReference }
 import js_strings { Strings }
+import js_debugger_metadata { Metadata as DebuggerMetadata, Scope }
 import js_debug_positions { SourcePositionCache, SourceLocation, definitionPc2Line }
 import js_opcode_data as op
+import js_invariant { present }
+import silk.num.u32
 
 fn definition(v: CompilerVar, strip: bool) -> VarDef {
   let mut name = v.name if strip { name = 0 }
@@ -49,10 +52,14 @@ effect fn assemble<H: HeapHooks>(hooks: &mut H, tree: &mut FunctionTree, cell: F
   ! OutOfMemoryError | StringLengthError | CompilerError | BytecodeError ? &mut Allocator {
   let mut anchor = ()
   let initial = tree.getMut(cell)
+  if initial.debuggerMetadata.enabled {
+    initial.debuggerMetadata.sourceLength = usize.toU32(source.length)
+  }
   variables.recomputeScopeLinks(&mut initial)
-  let eval = initial.hasEvalCall let global = initial.isEval
+  let eval = initial.hasEvalCall let global = initial.isEval let debug = initial.debuggerMetadata.enabled
   drop initial
   if eval { run variables.addEvalVariables(&mut tree, cell) }
+  else if debug { run variables.addDebuggerVariables(&mut tree, cell) }
   if global { run variables.addGlobalVariables(&mut tree, cell) }
   while true {
     let parent = tree.get(cell)
@@ -65,10 +72,23 @@ effect fn assemble<H: HeapHooks>(hooks: &mut H, tree: &mut FunctionTree, cell: F
     let parentWrite = tree.getMut(cell)
     parentWrite.constants.set(index, value)
   }
+  let capture = tree.getMut(cell)
+  if capture.debuggerMetadata.enabled {
+    if capture.args.length() + capture.vars.length() > 65535 {
+      let runtimeAnchor = () let rt = unsafe HeapCell.payload<RuntimeState, ()>(&runtimeAnchor, capture.runtime)
+      let error = run CompilerError.make(&rt.atoms, CompilerErrorKind.TooManyLocals, 0) fail move error
+    }
+    let mut index: usize = 0
+    while index < capture.args.length() { state.captureVar(&mut capture, usize.toI32(index), true) index = index + 1 }
+    index = 0
+    while index < capture.vars.length() { state.captureVar(&mut capture, usize.toI32(index), false) index = index + 1 }
+  }
+  drop capture
   run variables.resolveVariables(&mut tree, cell)
   if deferrable(tree.get(cell), source) { return run defer(&mut tree, cell, source) }
   run resolveLabels(&mut tree, cell, source)
   let fd = tree.getMut(cell)
+  run debuggerDetails(&mut fd, source)
   let header = run finalHeader(&mut fd)
   let runtime = fd.runtime let context = fd.context
   // Allocate BEFORE moving any JS edge. OOM leaves the complete fd destructible.
@@ -80,13 +100,53 @@ effect fn assemble<H: HeapHooks>(hooks: &mut H, tree: &mut FunctionTree, cell: F
   return ValueBits.FunctionBytecode { reference: result }
 }
 
+/// The debugger's scope, local and location tables for fd, before finalHeader.
+effect fn debuggerDetails(fd: &mut FunctionDef, source: &[u8]) -> () ! OutOfMemoryError | CompilerError | StringLengthError ? &mut Allocator {
+  if !fd.debuggerMetadata.enabled { return () }
+  if fd.args.length() + fd.vars.length() > 65535 {
+    let runtimeAnchor = () let rt = unsafe HeapCell.payload<RuntimeState, ()>(&runtimeAnchor, fd.runtime)
+    let error = run CompilerError.make(&rt.atoms, CompilerErrorKind.TooManyLocals, 0) fail move error
+  }
+  fd.debuggerMetadata.hasParameterExpressions = fd.hasParameterExpressions
+  let mut index: usize = 0
+  while index < fd.scopes.length() {
+    let scope = fd.scopes.get(index)
+    run fd.debuggerMetadata.scopes.append(Scope { parent: scope.parent, first: scope.first })
+    index = index + 1
+  }
+  index = 0
+  while index < fd.vars.length() {
+    state.captureVar(&mut fd, usize.toI32(index), false)
+    run fd.debuggerMetadata.localScopes.append(fd.vars.get(index).scopeLevel)
+    index = index + 1
+  }
+  // Reuse the parser-owned ECMAScript cache across the compilation tree.
+  // A fresh cache per function repeatedly scans overlapping source prefixes.
+  let mut fallbackCoordinates = SourcePositionCache.make()
+  let coordinatePointer = if Pointer.isNull<SourcePositionCache>(fd.sourceCache) {
+    Pointer.fromMutRef<SourcePositionCache>(&mut fallbackCoordinates)
+  } else {
+    present(fd.sourceCache)
+  }
+  let mut coordinateAnchor = ()
+  let coordinates = unsafe Pointer.borrowMut<(), SourcePositionCache>(&mut coordinateAnchor, coordinatePointer)
+  index = 0
+  while index < fd.debuggerMetadata.locations.length() {
+    let mut location = fd.debuggerMetadata.locations.get(index)
+    let point = coordinates.locateEcma(source, u32.toUsize(location.sourcePosition))
+    location.line = point.line location.column = point.column
+    fd.debuggerMetadata.locations.set(index, location)
+    index = index + 1
+  }
+}
+
 /// The finished header for fd after label resolution; its lists stay in fd
 /// until transfer. Failure leaves fd intact and destructible.
 effect fn finalHeader(fd: &mut FunctionDef) -> FunctionBytecode ! OutOfMemoryError | BytecodeError ? &mut Allocator {
   let facts = run analyze(fd.bytecode.asSlice())
   let stackSize = facts.stackSize
   let borrowsArguments = fd.functionKind == FunctionKind.Normal && fd.varRefCount == 0 && !facts.writesArguments
-  let strip = fd.stripDebug && !fd.hasEvalCall
+  let strip = fd.stripDebug && !fd.hasEvalCall && !fd.debuggerMetadata.enabled
   // function() { target.apply(this, arguments) }: no formal can alias the
   // arguments object, so it is built only if the VM cannot apply in place.
   if fd.functionKind == FunctionKind.Normal && fd.args.length() == 0 && fd.hasSimpleParameterList && !fd.hasEvalCall
@@ -119,6 +179,12 @@ effect fn finalHeader(fd: &mut FunctionDef) -> FunctionBytecode ! OutOfMemoryErr
   run fd.constants.shrinkToFit()
   run fd.closureVars.shrinkToFit()
   return FunctionBytecode {
+    scriptId: fd.scriptId,
+    scriptIsEval: fd.scriptIsEval || fd.evalType == 2 || fd.evalType == 3,
+    debuggerMetadata: DebuggerMetadata.make(),
+    hostImport: ValueBits.Undefined,
+    hostModule: ValueBits.Undefined,
+    hostScriptMetadata: ValueBits.Undefined,
     mode: fd.jsMode, hasPrototype: fd.hasPrototype, hasSimpleParameterList: fd.hasSimpleParameterList,
     isDerivedClassConstructor: fd.isDerivedClassConstructor,
     needsHomeObject: fd.homeObjectVarIndex >= 0 || fd.needHomeObject, kind: fd.functionKind,
@@ -138,12 +204,13 @@ effect fn finalHeader(fd: &mut FunctionDef) -> FunctionBytecode ! OutOfMemoryErr
 /// bytecode cell result, whose header finalHeader made. Never allocates; all
 /// native buffers move, never copy.
 fn transfer(fd: &mut FunctionDef, result: *mut HeapHeader) -> () {
-  let strip = fd.stripDebug && !fd.hasEvalCall
+  let strip = fd.stripDebug && !fd.hasEvalCall && !fd.debuggerMetadata.enabled
   let mut resultAnchor = () let mut runtimeAnchor = ()
   let b = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut resultAnchor, result)
   let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, fd.runtime)
   let code = Intrinsic.replace(fd.bytecode, ByteBuffer.make())
   b.code = ByteStorage.Owned { bytes: code.intoList() }
+  b.debuggerMetadata = Intrinsic.replace(fd.debuggerMetadata, DebuggerMetadata.make())
   b.name = fd.functionName fd.functionName = 0
   b.constants = Intrinsic.replace(fd.constants, List<ValueBits>.make())
   let mut i: usize = 0
@@ -167,8 +234,11 @@ fn transfer(fd: &mut FunctionDef, result: *mut HeapHeader) -> () {
   b.closureVars = Intrinsic.replace(fd.closureVars, List<ClosureVar>.make())
   if !fd.stripDebug {
     let lines = Intrinsic.replace(fd.pc2line, ByteBuffer.make())
+    let callLines = Intrinsic.replace(fd.callSitePc2line, ByteBuffer.make())
     let text = Intrinsic.replace(fd.source, Option<SourceText>.none())
     b.debug = Option<FunctionDebugInfo>.some(FunctionDebugInfo {
+      callSitePcToLine: Option<ByteStorage>.some(ByteStorage.Owned { bytes: callLines.intoList() }),
+      nodeVm: fd.nodeVmDiagnostics, nodeSourceURL: false, lineOffset: 0, columnOffset: 0, sourceColumnOffset: 0,
       filename: fd.filename, source: move text, pcToLine: ByteStorage.Owned { bytes: lines.intoList() }
     })
     fd.filename = 0
@@ -185,6 +255,8 @@ const STUB_STACK: u16 = 0xffff
 fn deferrable(fd: &FunctionDef, source: &[u8]) -> bool {
   match fd.parent { Option<FunctionId>.Some { .. } => () _ => { return false } }
   if fd.functionKind != FunctionKind.Normal || fd.isDerivedClassConstructor || fd.hasEvalCall || fd.isEval || fd.bytecodeError { return false }
+  // The debugger reads every function's final code, scopes and locations.
+  if fd.debuggerMetadata.enabled { return false }
   if fd.functionType != ParseFunctionKind.Statement && fd.functionType != ParseFunctionKind.Var
     && fd.functionType != ParseFunctionKind.Expression && fd.functionType != ParseFunctionKind.Arrow { return false }
   match &fd.module { Option<CellRef<ModuleDef>>.Some { .. } => { return false } _ => () }
@@ -228,6 +300,12 @@ effect fn defer(tree: &mut FunctionTree, cell: FunctionId, source: &[u8]) -> Val
   run code.reserveExact(1)
   run code.append(op.OP_invalid)
   let result = run HeapCell.allocate(HeapKind.FunctionBytecode, FunctionBytecode {
+    scriptId: def.scriptId,
+    scriptIsEval: def.scriptIsEval || def.evalType == 2 || def.evalType == 3,
+    debuggerMetadata: DebuggerMetadata.make(),
+    hostImport: ValueBits.Undefined,
+    hostModule: ValueBits.Undefined,
+    hostScriptMetadata: ValueBits.Undefined,
     mode: def.jsMode, hasPrototype: def.hasPrototype, hasSimpleParameterList: def.hasSimpleParameterList,
     isDerivedClassConstructor: def.isDerivedClassConstructor,
     needsHomeObject: def.homeObjectVarIndex >= 0 || def.needHomeObject, kind: def.functionKind,
@@ -260,6 +338,8 @@ effect fn defer(tree: &mut FunctionTree, cell: FunctionId, source: &[u8]) -> Val
       _ => ()
     }
     b.debug = Option<FunctionDebugInfo>.some(FunctionDebugInfo {
+      callSitePcToLine: Option<ByteStorage>.none(),
+      nodeVm: def.nodeVmDiagnostics, nodeSourceURL: false, lineOffset: 0, columnOffset: 0, sourceColumnOffset: 0,
       filename: rt.atoms.duplicate(def.filename), source: move text, pcToLine: ByteStorage.Owned { bytes: move table }
     })
   }
@@ -321,6 +401,8 @@ pub unsafe effect fn finish<H: HeapHooks>(hooks: &mut H, node: *mut HeapHeader) 
     Result<FunctionBytecode, OutOfMemoryError | BytecodeError>.Success { value: header } => {
       let b = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut anchor, node)
       let stub = Intrinsic.replace(b.*, move header)
+      // configureHostCallbacks may have given the stub its host values: they own references.
+      b.hostImport = stub.hostImport b.hostModule = stub.hostModule b.hostScriptMetadata = stub.hostScriptMetadata
       drop b
       let mut runtimeAnchor = ()
       let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, done.runtime)

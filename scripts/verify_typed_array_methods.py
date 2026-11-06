@@ -118,7 +118,7 @@ pub effect fn main() -> i32 ! OutOfMemoryError | StringLengthError | BigIntError
   while cutoff < CUTOFFS {
    let row = run oracle.isolated(mode, ARMED, cutoff)
    let mut field: usize = 0
-   while field < 16 { run out.writeU32(row[field]) |> Effect.provideMut<Allocator>(&mut system) field = field + 1 }
+   while field < 16 { run out.writeU64(row[field]) |> Effect.provideMut<Allocator>(&mut system) field = field + 1 }
    cutoff = cutoff + 1
   }
   mode = mode + 1
@@ -129,9 +129,10 @@ pub effect fn main() -> i32 ! OutOfMemoryError | StringLengthError | BigIntError
 '''
 
 def records(raw, count, label):
-    if len(raw) != count * 64:
-        raise SystemExit(f'{label}: expected {count * 64} bytes, got {len(raw)}')
-    rows = list(struct.iter_unpack('<16I', raw))
+    word_bytes = 8 if len(raw) == count * 128 else 4
+    if len(raw) != count * 16 * word_bytes:
+        raise SystemExit(f'{label}: expected {count * 64} or {count * 128} bytes, got {len(raw)}')
+    rows = list(struct.iter_unpack('<16Q' if word_bytes == 8 else '<16I', raw))
     for row in rows:
         if row[14:] != (0, 0):
             raise SystemExit(f'{label}: residual allocations/bytes {row[14:]}')

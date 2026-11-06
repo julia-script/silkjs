@@ -1,0 +1,475 @@
+//! Validation of serialized QuickJS regexp programs, without compiling or executing them.
+//! The executor still requires start <= input.length and input.length <= i32.MAX.
+//! This proves bytecode/undo-stack/register access safety, not regexp-source equivalence,
+//! capture endpoint ordering for result builders, or a bound on execution resources.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.num.i32
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import byte_buffer { readU16, readU32 }
+import regexp_opcodes as op
+import regexp_types as re
+
+pub struct RegExpValidationError { pub offset: usize }
+
+struct Instruction {
+  offset: usize,
+  target: usize,
+  // Zero means the outer program; otherwise this is the assertion opener's index + 1.
+  owner: usize,
+  opcode: u8,
+  seen: bool,
+  queued: bool,
+  counters: [u64; 4],
+  positions: [u64; 4]
+}
+
+fn assertion(opcode: u8) -> bool {
+  return opcode == op.REOP_lookahead || opcode == op.REOP_negative_lookahead
+}
+fn isLoop(opcode: u8) -> bool { return opcode >= op.REOP_loop && opcode <= op.REOP_loop_check_adv_split_next_first }
+fn advanceLoop(opcode: u8) -> bool {
+  return opcode == op.REOP_loop_check_adv_split_goto_first || opcode == op.REOP_loop_check_adv_split_next_first
+}
+fn reference(opcode: u8) -> bool {
+  return opcode >= op.REOP_back_reference && opcode <= op.REOP_backward_back_reference_i
+}
+fn range(opcode: u8) -> bool { return opcode >= op.REOP_range && opcode <= op.REOP_range32_i }
+fn class(opcode: u8) -> bool { return opcode == re.REOP_CLASS || opcode == re.REOP_CLASS_I }
+fn greedy(opcode: u8) -> bool { return opcode == re.REOP_STAR || opcode == re.REOP_PLUS }
+// The one-character steps the executor runs in place for REOP_STAR and REOP_PLUS (greedyRun).
+fn oneStep(opcode: u8) -> bool {
+  return opcode == op.REOP_char || opcode == op.REOP_char_i || (opcode >= op.REOP_dot && opcode <= op.REOP_not_space) ||
+    class(opcode) || range(opcode)
+}
+// The first steps a search may skip ahead to (the hint plan's opcode, see skipAhead).
+fn skippable(opcode: u8) -> bool {
+  return opcode == op.REOP_char || opcode == op.REOP_char_i || opcode == op.REOP_line_start ||
+    opcode == op.REOP_space || opcode == op.REOP_not_space || class(opcode) || range(opcode)
+}
+fn terminal(opcode: u8) -> bool {
+  return opcode == op.REOP_match || opcode == op.REOP_lookahead_match || opcode == op.REOP_negative_lookahead_match
+}
+fn branches(opcode: u8) -> bool {
+  return (opcode >= op.REOP_goto && opcode <= op.REOP_split_next_first) || assertion(opcode) || isLoop(opcode) || greedy(opcode)
+}
+
+// The search hint trailer (regexp_types.FLAG_HINT) as the executor reads it.
+struct Trailer {
+  present: bool,
+  // The end of the instructions: the final REOP_match is the byte before it.
+  programEnd: usize,
+  kind: u8,
+  literalAt: usize,
+  count: usize,
+  runAt: usize,
+  runWidth: usize,
+  planFirst: usize,
+  planOp: u8
+}
+
+effect fn trailer(bytes: &[u8], end: usize) -> Trailer ! RegExpValidationError {
+  if end - op.RE_HEADER_LEN <= re.HINT_LENGTH { fail RegExpValidationError { offset: end } }
+  let hint = end - re.HINT_LENGTH
+  if bytes[hint] != re.HINT_OPCODE { fail RegExpValidationError { offset: hint } }
+  let kindByte = bytes[hint + 1]
+  let kind = u8.bitAnd(kindByte, 31)
+  let firstSet = u8.bitAnd(kindByte, re.HINT_FIRST_SET) != 0
+  let runBytes = u8.bitAnd(kindByte, re.HINT_RUN_BYTES) != 0
+  let runUnits = u8.bitAnd(kindByte, re.HINT_RUN_UNITS) != 0
+  let literal = kind == re.HINT_LITERAL || kind == re.HINT_REQUIRED
+  if kind > re.HINT_ANCHORED || (runBytes && runUnits) || ((runBytes || runUnits) && !literal) ||
+    (firstSet && (kind == re.HINT_LITERAL || kind == re.HINT_ANCHORED)) {
+    fail RegExpValidationError { offset: hint + 1 }
+  }
+  let packed = u16.toUsize(readU16(bytes, hint + 4))
+  let count = packed % 256
+  if literal && (count == 0 || packed / 256 >= count) { fail RegExpValidationError { offset: hint + 4 } }
+  let mut cursor = hint
+  if firstSet {
+    if cursor - op.RE_HEADER_LEN <= re.HINT_SET_LENGTH { fail RegExpValidationError { offset: hint + 1 } }
+    cursor = cursor - re.HINT_SET_LENGTH
+  }
+  let mut runWidth: usize = 0
+  if runBytes { runWidth = 1 } else if runUnits { runWidth = 2 }
+  if cursor - op.RE_HEADER_LEN <= count * runWidth { fail RegExpValidationError { offset: hint + 1 } }
+  cursor = cursor - count * runWidth
+  return Trailer { present: true, programEnd: cursor, kind: kind, literalAt: u16.toUsize(readU16(bytes, hint + 2)),
+    count: count, runAt: cursor, runWidth: runWidth, planFirst: u16.toUsize(readU16(bytes, hint + 6)), planOp: bytes[hint + 8] }
+}
+
+effect fn branchTarget(bytes: &[u8], operand: usize, end: usize) -> usize ! RegExpValidationError {
+  let base = operand + 4
+  let displacement = readU32(bytes, operand)
+  let mut target: usize = 0
+  if displacement < 0x80000000 {
+    let distance = u32.toUsize(displacement)
+    if distance >= end - base { fail RegExpValidationError { offset: operand } }
+    target = base + distance
+  } else {
+    let distance = u32.toUsize(0xffffffff - displacement) + 1
+    if distance > base - op.RE_HEADER_LEN { fail RegExpValidationError { offset: operand } }
+    target = base - distance
+  }
+  return target
+}
+
+// Names are consumed as UTF-8 by the result builder. Validate before its unchecked
+// NUL scan, including the scope byte after every record (also unnamed captures).
+effect fn names(bytes: &[u8], start: usize, count: usize, flags: u32) -> () ! RegExpValidationError {
+  let mut at = start
+  let mut capture: usize = 1
+  let mut named = false
+  if (flags & re.FLAG_NAMED_GROUPS) != 0 {
+    while capture < count {
+      if at >= bytes.length { fail RegExpValidationError { offset: at } }
+      let first = at
+      while at < bytes.length && bytes[at] != 0 {
+        let lead = bytes[at]
+        if lead < 0x80 { at = at + 1 }
+        else {
+          let mut width: usize = 0
+          let mut value: u32 = 0
+          let mut minimum: u32 = 0
+          if lead >= 0xc2 && lead <= 0xdf { width = 2 value = u8.toU32(lead & 31) minimum = 0x80 }
+          else if lead >= 0xe0 && lead <= 0xef { width = 3 value = u8.toU32(lead & 15) minimum = 0x800 }
+          else if lead >= 0xf0 && lead <= 0xf4 { width = 4 value = u8.toU32(lead & 7) minimum = 0x10000 }
+          else { fail RegExpValidationError { offset: at } }
+          if width > bytes.length - at { fail RegExpValidationError { offset: at } }
+          let mut index: usize = 1
+          while index < width {
+            let continuation = bytes[at + index]
+            if continuation < 0x80 || continuation > 0xbf { fail RegExpValidationError { offset: at + index } }
+            value = value * 64 + u8.toU32(continuation & 63)
+            index = index + 1
+          }
+          if value < minimum || value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff) {
+            fail RegExpValidationError { offset: at }
+          }
+          at = at + width
+        }
+      }
+      if bytes.length - at < 2 { fail RegExpValidationError { offset: at } }
+      named = named || at != first
+      at = at + 2
+      capture = capture + 1
+    }
+    if !named { fail RegExpValidationError { offset: start } }
+  }
+  if at != bytes.length { fail RegExpValidationError { offset: at } }
+}
+
+effect fn decode(bytes: &[u8], end: usize, captures: usize, registers: usize) -> List<Instruction>
+  ! RegExpValidationError | OutOfMemoryError ? &mut Allocator {
+  let mut instructions = List<Instruction>.make()
+  let mut at = op.RE_HEADER_LEN
+  let mut owner: usize = 0
+  while at < end {
+    if owner != 0 && at == instructions.asSlice()[owner - 1].target {
+      owner = instructions.asSlice()[owner - 1].owner
+    }
+    let opcode = bytes[at]
+    if opcode == op.REOP_invalid || (u8.toUsize(opcode) >= op.REOP_COUNT && !class(opcode) && !greedy(opcode)) {
+      fail RegExpValidationError { offset: at }
+    }
+    let mut length: usize = 5
+    if class(opcode) { length = 3 } else if !greedy(opcode) { length = op.opcodeSize(opcode) }
+    if length > end - at { fail RegExpValidationError { offset: at } }
+    if range(opcode) || class(opcode) {
+      let count = u16.toUsize(readU16(bytes, at + 1))
+      let mut width: usize = 4
+      if opcode == op.REOP_range32 || opcode == op.REOP_range32_i { width = 8 }
+      // A class's Latin-1 bitmap follows its table.
+      let mut bitmap: usize = 0
+      if class(opcode) { bitmap = re.CLASS_BITS_LENGTH }
+      if end - at - length < bitmap { fail RegExpValidationError { offset: at } }
+      // rangeContains reads the final narrow entry even before its binary search.
+      if count == 0 || count > (end - at - length - bitmap) / width { fail RegExpValidationError { offset: at } }
+      let mut index: usize = 0
+      let mut previous: u32 = 0
+      while index < count {
+        let offset = at + length + index * width
+        let mut first: u32 = 0
+        let mut last: u32 = 0
+        if width == 8 { first = readU32(bytes, offset) last = readU32(bytes, offset + 4) }
+        else { first = u16.toU32(readU16(bytes, offset)) last = u16.toU32(readU16(bytes, offset + 2)) }
+        if first > last || (index != 0 && first <= previous) { fail RegExpValidationError { offset: offset } }
+        previous = last
+        index = index + 1
+      }
+      length = length + count * width + bitmap
+    } else if reference(opcode) {
+      let count = u8.toUsize(bytes[at + 1])
+      if count == 0 || count > end - at - length { fail RegExpValidationError { offset: at } }
+      let mut index: usize = 0
+      while index < count {
+        if u8.toUsize(bytes[at + length + index]) >= captures { fail RegExpValidationError { offset: at + length + index } }
+        index = index + 1
+      }
+      length = length + count
+    }
+    if opcode == op.REOP_save_start || opcode == op.REOP_save_end || opcode == op.REOP_save_reset {
+      if u8.toUsize(bytes[at + 1]) >= captures { fail RegExpValidationError { offset: at + 1 } }
+      if opcode == op.REOP_save_reset && (bytes[at + 1] > bytes[at + 2] || u8.toUsize(bytes[at + 2]) >= captures) {
+        fail RegExpValidationError { offset: at + 2 }
+      }
+    }
+    if isLoop(opcode) || opcode == op.REOP_set_i32 || opcode == op.REOP_set_char_pos || opcode == op.REOP_check_advance {
+      let register = u8.toUsize(bytes[at + 1])
+      if register >= registers || (advanceLoop(opcode) && register + 1 >= registers) {
+        fail RegExpValidationError { offset: at + 1 }
+      }
+    }
+    let next = at + length
+    let mut target: usize = 0
+    if branches(opcode) {
+      // Every displacement is the instruction's final four bytes, including loops.
+      target = run branchTarget(bytes, next - 4, end)
+    }
+    if owner != 0 && next > instructions.asSlice()[owner - 1].target { fail RegExpValidationError { offset: at } }
+    if assertion(opcode) {
+      if target <= next || (owner != 0 && target >= instructions.asSlice()[owner - 1].target) {
+        fail RegExpValidationError { offset: at }
+      }
+    } else if opcode == op.REOP_match {
+      if owner != 0 || next != end { fail RegExpValidationError { offset: at } }
+    } else if opcode == op.REOP_lookahead_match || opcode == op.REOP_negative_lookahead_match {
+      if owner == 0 { fail RegExpValidationError { offset: at } }
+      let opener = &instructions.asSlice()[owner - 1]
+      let positive = opener.opcode == op.REOP_lookahead
+      if next != opener.target || positive != (opcode == op.REOP_lookahead_match) {
+        fail RegExpValidationError { offset: at }
+      }
+    } else if next == end || (owner != 0 && next == instructions.asSlice()[owner - 1].target) {
+      fail RegExpValidationError { offset: at }
+    }
+    run instructions.append(Instruction { offset: at, target: target, owner: owner,
+      opcode: opcode, seen: false, queued: false, counters: [0; 4], positions: [0; 4] })
+    if assertion(opcode) { owner = instructions.length() }
+    at = next
+  }
+  if owner != 0 || instructions.length() == 0 || instructions.asSlice()[instructions.length() - 1].opcode != op.REOP_match {
+    fail RegExpValidationError { offset: end }
+  }
+  return move instructions
+}
+
+effect fn instructionAt(instructions: &[Instruction], offset: usize) -> usize ! RegExpValidationError {
+  let mut low: usize = 0
+  let mut high = instructions.length
+  while low < high {
+    let middle = low + (high - low) / 2
+    if instructions[middle].offset < offset { low = middle + 1 } else { high = middle }
+  }
+  if low == instructions.length || instructions[low].offset != offset { fail RegExpValidationError { offset: offset } }
+  return low
+}
+
+// Resolve every branch, including unreachable instructions, and prohibit entry to
+// or escape from assertion bodies. Splits can then only put same-region frames
+// above the matching assertion frame; either finish operation is safe to unwind.
+effect fn link(instructions: &mut [Instruction]) -> () ! RegExpValidationError {
+  let mut index: usize = 0
+  while index < instructions.length {
+    if branches(instructions[index].opcode) {
+      let target = run instructionAt(&instructions, instructions[index].target)
+      if instructions[target].owner != instructions[index].owner { fail RegExpValidationError { offset: instructions[index].offset } }
+      instructions[index].target = target
+    }
+    index = index + 1
+  }
+}
+
+fn bit(index: usize) -> u64 { return u64.shiftLeft(1, usize.toU64(index % 64)) }
+fn contains(bits: &[u64; 4], index: usize) -> bool { return (bits[index / 64] & bit(index)) != 0 }
+fn set(bits: &mut [u64; 4], index: usize, value: bool) -> () {
+  let word = index / 64
+  let mask = bit(index)
+  if value { bits[word] = bits[word] | mask } else { bits[word] = bits[word] & (u64.MAX ^ mask) }
+}
+
+effect fn merge(instructions: &mut [Instruction], work: &mut List<usize>, target: usize,
+  counters: &[u64; 4], positions: &[u64; 4]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let node = &mut instructions[target]
+  let mut changed = !node.seen
+  let mut word: usize = 0
+  while word < 4 {
+    let mut counter = counters[word]
+    let mut position = positions[word]
+    if node.seen { counter = counter & node.counters[word] position = position & node.positions[word] }
+    changed = changed || counter != node.counters[word] || position != node.positions[word]
+    node.counters[word] = counter
+    node.positions[word] = position
+    word = word + 1
+  }
+  node.seen = true
+  if changed && !node.queued { node.queued = true run work.append(target) }
+}
+
+// Must-defined register types include both split alternatives, counter backedges,
+// negative-assertion rollback, and positive-assertion committed writes. A plain
+// linear register-depth check would miss jumps bypassing initialization.
+effect fn registers(bytes: &[u8], instructions: &mut [Instruction]) -> ()
+  ! RegExpValidationError | OutOfMemoryError ? &mut Allocator {
+  let mut work = List<usize>.make()
+  run merge(&mut instructions, &mut work, 0, &[0; 4], &[0; 4])
+  while work.length() != 0 {
+    let index = work.get(work.length() - 1)
+    let remaining = work.length() - 1
+    work.truncate(remaining)
+    instructions[index].queued = false
+    let opcode = instructions[index].opcode
+    let at = instructions[index].offset
+    let target = instructions[index].target
+    let owner = instructions[index].owner
+    let mut counters = instructions[index].counters
+    let mut positions = instructions[index].positions
+    if isLoop(opcode) || opcode == op.REOP_check_advance || opcode == op.REOP_set_i32 || opcode == op.REOP_set_char_pos {
+      let register = u8.toUsize(bytes[at + 1])
+      if isLoop(opcode) && !contains(&counters, register) { fail RegExpValidationError { offset: at } }
+      if advanceLoop(opcode) && !contains(&positions, register + 1) { fail RegExpValidationError { offset: at } }
+      if opcode == op.REOP_check_advance && !contains(&positions, register) { fail RegExpValidationError { offset: at } }
+      if opcode == op.REOP_set_i32 || opcode == op.REOP_set_char_pos {
+        set(&mut counters, register, opcode == op.REOP_set_i32)
+        set(&mut positions, register, opcode == op.REOP_set_char_pos)
+      }
+    }
+    if opcode == op.REOP_lookahead_match {
+      let resume = instructions[owner - 1].target
+      run merge(&mut instructions, &mut work, resume, &counters, &positions)
+    } else if !terminal(opcode) {
+      if branches(opcode) && opcode != op.REOP_lookahead {
+        run merge(&mut instructions, &mut work, target, &counters, &positions)
+      }
+      if opcode != op.REOP_goto { run merge(&mut instructions, &mut work, index + 1, &counters, &positions) }
+    }
+  }
+}
+
+// REOP_STAR and REOP_PLUS run their one-character step in place, so they must
+// mark exactly the loops the compiler marks: `STAR exit, x, goto STAR` then exit,
+// and `x, PLUS x`.
+effect fn greedyLoops(instructions: &[Instruction]) -> () ! RegExpValidationError {
+  let mut index: usize = 0
+  while index < instructions.length {
+    let opcode = instructions[index].opcode
+    if opcode == re.REOP_STAR {
+      if index + 3 >= instructions.length || !oneStep(instructions[index + 1].opcode) ||
+        instructions[index + 2].opcode != op.REOP_goto || instructions[index + 2].target != index ||
+        instructions[index].target != index + 3 {
+        fail RegExpValidationError { offset: instructions[index].offset }
+      }
+    } else if opcode == re.REOP_PLUS {
+      if index == 0 || instructions[index].target != index - 1 || !oneStep(instructions[index - 1].opcode) {
+        fail RegExpValidationError { offset: instructions[index].offset }
+      }
+    }
+    index = index + 1
+  }
+}
+
+// What the executor takes from the hint trailer: the search prefix it skips
+// (`split_goto_first, any, goto` before save_start), the literal run of REOP_char
+// steps and its copy, and the first step the plan names.
+effect fn hintTargets(bytes: &[u8], instructions: &[Instruction], hint: &Trailer) -> () ! RegExpValidationError {
+  let base = op.RE_HEADER_LEN
+  if hint.kind == re.HINT_ANCHORED || hint.planFirst != 0 {
+    if instructions.length < 4 || instructions[0].opcode != op.REOP_split_goto_first || instructions[1].opcode != op.REOP_any ||
+      instructions[2].opcode != op.REOP_goto || instructions[3].offset != base + 11 || instructions[3].opcode != op.REOP_save_start {
+      fail RegExpValidationError { offset: base }
+    }
+  }
+  if hint.kind == re.HINT_LITERAL || hint.kind == re.HINT_REQUIRED {
+    let first = run instructionAt(instructions, hint.literalAt)
+    if instructions.length - first < hint.count { fail RegExpValidationError { offset: hint.literalAt } }
+    let mut k: usize = 0
+    while k < hint.count {
+      let step = &instructions[first + k]
+      if step.opcode != op.REOP_char || step.offset != hint.literalAt + k * 3 { fail RegExpValidationError { offset: step.offset } }
+      let unit = readU16(bytes, step.offset + 1)
+      if hint.runWidth == 1 && unit != u8.toU16(bytes[hint.runAt + k]) { fail RegExpValidationError { offset: hint.runAt + k } }
+      if hint.runWidth == 2 && unit != readU16(bytes, hint.runAt + k * 2) { fail RegExpValidationError { offset: hint.runAt + k * 2 } }
+      k = k + 1
+    }
+  }
+  if hint.planFirst != 0 && hint.planOp != 0 {
+    let step = run instructionAt(instructions, hint.planFirst)
+    if instructions[step].opcode != hint.planOp || !skippable(hint.planOp) { fail RegExpValidationError { offset: hint.planFirst } }
+  }
+}
+
+// The immutable bytes validated here must be the same bytes subsequently executed.
+// No source text, compiler, interpreter, or user callback is consulted.
+pub effect fn validate(bytecode: &[u8]) -> ()
+  ! RegExpValidationError | OutOfMemoryError ? &mut Allocator {
+  if bytecode.length < op.RE_HEADER_LEN { fail RegExpValidationError { offset: bytecode.length } }
+  let flags = u16.toU32(readU16(bytecode, op.RE_HEADER_FLAGS))
+  if (flags & 0xfc00) != 0 || (flags & re.FLAG_UNICODE) != 0 && (flags & re.FLAG_UNICODE_SETS) != 0 {
+    fail RegExpValidationError { offset: op.RE_HEADER_FLAGS }
+  }
+  let captures = u8.toUsize(bytecode[op.RE_HEADER_CAPTURE_COUNT])
+  let registerCount = u8.toUsize(bytecode[op.RE_HEADER_REGISTER_COUNT])
+  if captures == 0 { fail RegExpValidationError { offset: op.RE_HEADER_CAPTURE_COUNT } }
+  let length = u32.toUsize(readU32(bytecode, op.RE_HEADER_BYTECODE_LEN))
+  if length == 0 || length > bytecode.length - op.RE_HEADER_LEN { fail RegExpValidationError { offset: op.RE_HEADER_BYTECODE_LEN } }
+  let end = op.RE_HEADER_LEN + length
+  run names(bytecode, end, captures, flags)
+  let mut hint = Trailer { present: false, programEnd: end, kind: re.HINT_NONE, literalAt: 0, count: 0, runAt: 0,
+    runWidth: 0, planFirst: 0, planOp: 0 }
+  if (flags & re.FLAG_HINT) != 0 { hint = run trailer(bytecode, end) }
+  let mut instructions = run decode(bytecode, hint.programEnd, captures, registerCount)
+  run link(instructions.asMutSlice())
+  run greedyLoops(instructions.asSlice())
+  if hint.present { run hintTargets(bytecode, instructions.asSlice(), &hint) }
+  run registers(bytecode, instructions.asMutSlice())
+}
+
+// Dynamic complement to validate(): bytecode validation cannot establish an
+// ordering between input-dependent capture endpoints. Check before any substring,
+// lastIndex update, or optimized replacement consumer sees the executor result.
+// Captures in lookbehind/lookahead need not lie inside group zero.
+pub effect fn validateMatch(matched: &re.RegExpMatch, captureCount: usize, inputLength: usize) -> ()
+  ! RegExpValidationError {
+  if inputLength > i32.toUsize(i32.MAX) || captureCount == 0 || captureCount > op.CAPTURE_COUNT_MAX {
+    fail RegExpValidationError { offset: op.RE_HEADER_CAPTURE_COUNT }
+  }
+  let captures = matched.captures.asSlice()
+  if !matched.matched {
+    if captures.length != 0 { fail RegExpValidationError { offset: op.RE_HEADER_CAPTURE_COUNT } }
+    return ()
+  }
+  if captures.length != captureCount * 2 { fail RegExpValidationError { offset: op.RE_HEADER_CAPTURE_COUNT } }
+  let mut index: usize = 0
+  while index < captures.length {
+    let start = captures[index]
+    let end = captures[index + 1]
+    if start == -1 && end == -1 && index != 0 { index = index + 2 }
+    else {
+      if start < 0 || end < start || i32.toUsize(end) > inputLength {
+        fail RegExpValidationError { offset: op.RE_HEADER_CAPTURE_COUNT }
+      }
+      index = index + 2
+    }
+  }
+}
+
+/// validateMatch's offset checks for a successful match whose offsets were
+/// written into captures (RegExpExecutor.match8 and match16).
+pub fn validateCaptures(captures: &[i32], captureCount: usize, inputLength: usize) -> bool {
+  if inputLength > i32.toUsize(i32.MAX) || captureCount == 0 || captureCount > op.CAPTURE_COUNT_MAX { return false }
+  if captures.length < captureCount * 2 { return false }
+  let mut index: usize = 0
+  while index < captureCount * 2 {
+    let start = captures[index]
+    let end = captures[index + 1]
+    if !(start == -1 && end == -1 && index != 0) {
+      if start < 0 || end < start || i32.toUsize(end) > inputLength { return false }
+    }
+    index = index + 2
+  }
+  return true
+}

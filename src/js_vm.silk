@@ -16,6 +16,7 @@ import silk.num.usize
 import runtime_memory { AllocationObserver }
 import native_stack { currentFrameAddress }
 import js_heap { HeapCell, HeapHeader }
+import js_strings { Strings }
 import js_value { ValueBits }
 import js_owned_value { lendBits, immediateRef, lendFor }
 import js_realm { Realm, lendRealm, lendArguments }
@@ -70,6 +71,9 @@ import js_parser_diagnostics { DiagnosticMessage }
 import js_opcode_data as op
 import js_atom_data as atoms
 import js_class_data as classes
+import js_debugger as debugger
+import js_debugger_types { Activation as DebugActivation }
+import js_debugger_restricted as restricted
 import js_array_intrinsics_support as arraySupport
 import js_native_functions as nativeFunctions
 import js_regexp_intrinsics_exec as regexpExec
@@ -191,6 +195,7 @@ pub unsafe effect fn callInternal<H: HeapHooks + CoercionHooks + OwnPropertyHook
   + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
   memory: &AllocationObserver, context: *mut HeapHeader, function: ValueBits, receiver: ValueBits, newTarget: ValueBits,
   argv: &FrameSlots, flags: u32) -> ValueBits ! JsException ? &mut Allocator {
+  run unsafe restricted.call(context, function)
   // Raw stack storage: the entry's frame slots are all Borrowed, so it needs no drop glue.
   // Allocated first, at a fixed size, so it is a frame slot rather than part of
   // the dynamic allocation below.
@@ -219,6 +224,8 @@ pub unsafe effect fn callInternal<H: HeapHooks + CoercionHooks + OwnPropertyHook
   entry.machine.frame = framePointer
   let machine = &mut entry.machine
   unsafe activation.publish(rt, framePointer)
+  let mut observation = unsafe debugger.enter(&machine)
+  unsafe debugger.publish(rt, Pointer.fromMutRef<DebugActivation>(&mut observation))
   // dispatch, inlined: failures are caught once per run of execute and unwound here.
   let mut completed = false
   let mut value = ValueBits.Undefined
@@ -228,11 +235,15 @@ pub unsafe effect fn callInternal<H: HeapHooks + CoercionHooks + OwnPropertyHook
     match move executed {
       ValueBits returned => { value = returned completed = true break }
       Failed { error } => {
-        let pending = run Effect.catch<JsException>(core.materialize(&mut hooks, unsafe lendRealm(&machine.context, machine.context), move error), core.exceptionValue)
+        if !unsafe restricted.rejected(machine.runtime) {
+          let pending = run Effect.catch<JsException>(core.materialize(&mut hooks, unsafe lendRealm(&machine.context, machine.context), move error), core.exceptionValue)
+          run unsafe exceptionBoundary(&mut hooks, memory, &mut machine)
+        } else { drop error }
         if !run unsafe unwindFrames(&mut hooks, memory, &mut machine) { break }
       }
     }
   }
+  unsafe debugger.leave(rt, &observation)
   unsafe activation.release(&mut hooks, &description, &machine)
   unsafe activation.publish(rt, prior)
   if !completed { fail JsException {} }
@@ -251,6 +262,7 @@ pub unsafe effect fn constructInternal<H: HeapHooks + CoercionHooks + OwnPropert
   + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
   memory: &AllocationObserver, context: *mut HeapHeader, function: ValueBits, newTarget: ValueBits, argv: &FrameSlots, flags: u32) -> ValueBits
   ! JsException ? &mut Allocator {
+  run unsafe restricted.call(context, function)
   run interrupts.poll(&mut hooks, memory, unsafe lendRealm(&context, context))
   if !function.isObject() { return run core.error(&mut hooks, unsafe lendRealm(&context, context), b"not a function") }
   if !unsafe boxing.isConstructor(function) { return run core.throwNotConstructor(&mut hooks, unsafe lendRealm(&context, context), unsafe lendBits(&function, function)) }
@@ -262,9 +274,10 @@ pub unsafe effect fn constructInternal<H: HeapHooks + CoercionHooks + OwnPropert
   let bytecode = match &object.payload { ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode _ => invariant() }
   drop object
   let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  let realm = code.realm
   let derived = code.isDerivedClassConstructor drop code
   if derived { return run unsafe callInternal(&mut hooks, memory, context, function, ValueBits.Undefined, newTarget, argv, constructorFlags) }
-  let receiver = run unsafe constructors.createReceiver(&mut hooks, memory, unsafe lendRealm(&context, context), newTarget)
+  let receiver = run unsafe constructors.createReceiver(&mut hooks, memory, unsafe lendRealm(&realm, realm), newTarget)
   return run unsafe constructWith(&mut hooks, memory, context, function, receiver, newTarget, argv, constructorFlags)
 }
 /// Runs base-class constructor function on receiver, owned here, and applies
@@ -288,6 +301,7 @@ unsafe effect fn constructWith<H: HeapHooks + CoercionHooks + OwnPropertyHooks +
 pub unsafe effect fn resume<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks
   + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
   memory: &AllocationObserver, context: *mut HeapHeader, state: *mut HeapHeader) -> ValueBits ! JsException ? &mut Allocator {
+  run unsafe restricted.deny(context)
   run interrupts.poll(&mut hooks, memory, unsafe lendRealm(&context, context))
   let rt = unsafe runtime.contextRuntime(context)
   let prior = unsafe previous(rt)
@@ -316,6 +330,7 @@ pub unsafe effect fn resume<H: HeapHooks + CoercionHooks + OwnPropertyHooks + Ge
 }
 unsafe effect fn unwind<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + CallHooks + ErrorHooks>(hooks: &mut H,
   memory: &AllocationObserver, machine: &mut Machine) -> bool ? &mut Allocator {
+  if unsafe restricted.rejected(machine.runtime) { return false }
   let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)
   let error = state.currentException drop state
   if unsafe backtrace.isNeeded(error) {
@@ -358,6 +373,19 @@ unsafe effect fn unwind<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPro
 unsafe effect fn dispatch<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks
   + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
   memory: &AllocationObserver, machine: &mut Machine, throwing: bool) -> ValueBits ! JsException ? &mut Allocator {
+  let mut observation = unsafe debugger.enter(&machine)
+  unsafe debugger.publish(machine.runtime, Pointer.fromMutRef<DebugActivation>(&mut observation))
+  let result = run Effect.result(unsafe dispatchBody(&mut hooks, memory, &mut machine, throwing))
+  unsafe debugger.leave(machine.runtime, &observation)
+  return match move result {
+    Result<ValueBits, JsException>.Success { value } => value
+    Result<ValueBits, JsException>.Failure { error } => { fail move error }
+  }
+}
+unsafe effect fn dispatchBody<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks
+  + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
+  memory: &AllocationObserver, machine: &mut Machine, throwing: bool) -> ValueBits ! JsException ? &mut Allocator {
+  if throwing { run unsafe debugger.boundary(&mut hooks, memory, &machine, machine.pc(), true) }
   if throwing && !run unsafe unwind(&mut hooks, memory, &mut machine) { fail JsException {} }
   while true {
     let executed = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError | BigIntError | JsException>(
@@ -365,11 +393,27 @@ unsafe effect fn dispatch<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetP
     match move executed {
       ValueBits value => { return value }
       Failed { error } => {
-        let pending = run Effect.catch<JsException>(core.materialize(&mut hooks, unsafe lendRealm(&machine.context, machine.context), move error), core.exceptionValue)
+        if !unsafe restricted.rejected(machine.runtime) {
+          let pending = run Effect.catch<JsException>(core.materialize(&mut hooks, unsafe lendRealm(&machine.context, machine.context), move error), core.exceptionValue)
+          run unsafe exceptionBoundary(&mut hooks, memory, &mut machine)
+        } else { drop error }
         if !run unsafe unwindFrames(&mut hooks, memory, &mut machine) { fail JsException {} }
       }
     }
   }
+}
+unsafe effect fn exceptionBoundary<H: HeapHooks + CoercionHooks + ErrorHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, base: &mut Machine) -> () ? &mut Allocator {
+  let current = unsafe activation.innermost(&mut base)
+  let anchor = () let machine = unsafe Pointer.borrow<(), Machine>(&anchor, current)
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)
+  let active = state.debugger.active drop state
+  let mut pc = machine.pc()
+  if let Option<*mut DebugActivation>.Some { value } = Pointer.nonNullMut<DebugActivation>(active) {
+    let snapshot = unsafe Pointer.borrow<(), DebugActivation>(&anchor, value)
+    pc = snapshot.pc
+  }
+  run Effect.catch<JsException>(unsafe debugger.boundary(&mut hooks, memory, &machine, pc, true), ignoreClose)
 }
 /// Copies the registers that dispatch changes (pc and sp) between the shared
 /// machine and execute's local copy.
@@ -403,6 +447,28 @@ unsafe fn refresh(from: &Machine, to: &mut Machine) -> () {
   to.newTarget = from.newTarget
   to.argumentCount = from.argumentCount
 }
+unsafe fn observationFlag(runtime: *mut HeapHeader) -> *const bool {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  return Pointer.fromRef<bool>(&state.observeInstructions)
+}
+/// The debugger, coverage and CPU profile boundary before the instruction at
+/// machine's pc; run only while RuntimeState.observeInstructions is set.
+@inlineNever
+unsafe effect fn observeInstruction<H: HeapHooks + CoercionHooks + ErrorHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, machine: &Machine) -> () ! JsException ? &mut Allocator {
+  let stateAnchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&stateAnchor, machine.runtime)
+  let observing = state.debugger.enabled || state.coverage.enabled || state.cpuProfile.enabled
+  drop state
+  if observing { run unsafe debugger.boundary(&mut hooks, memory, &machine, machine.pc(), false) }
+}
+/// The restricted-evaluation check of opcode, whose operands follow machine's pc.
+@inlineNever
+unsafe effect fn restrictInstruction(machine: &Machine, opcode: u8) -> () ! JsException {
+  let stateAnchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&stateAnchor, machine.runtime)
+  let restricting = state.debugger.restricted drop state
+  if restricting { run unsafe restricted.instruction(&machine, opcode) }
+}
 // One match routes every opcode. Patterns must be integer literals, so each arm
 // names its opcode in a trailing comment; scripts/check_opcode_dispatch.py checks
 // them against js_opcode_data. Hot opcodes run inline; the rest go straight to
@@ -412,6 +478,52 @@ unsafe effect fn execute<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPr
   + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
   memory: &AllocationObserver, base: &mut Machine) -> ValueBits
   ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  // Two copies of the loop: the plain one tests nothing per instruction, the
+  // observed one runs the debugger, coverage, profiler and restricted checks
+  // before each. A run moves between them when RuntimeState.observeInstructions
+  // changes: the observed loop sees it at its next instruction, the plain one
+  // at its next interrupt poll (js_debugger.configure forces one).
+  while true {
+    let mut handoff = false
+    let flagAnchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&flagAnchor, base.runtime)
+    let observed = state.observeInstructions drop state
+    let mut result = ValueBits.Undefined
+    if observed { result = run unsafe executeObserved(&mut hooks, memory, &mut base, &mut handoff) }
+    else { result = run unsafe executePlain(&mut hooks, memory, &mut base, &mut handoff) }
+    if !handoff { return result }
+  }
+  return ValueBits.Undefined
+}
+@inlineNever
+unsafe effect fn executePlain<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks
+  + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
+  memory: &AllocationObserver, base: &mut Machine, handoff: &mut bool) -> ValueBits
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  let mode = PlainRun { unused: 0 }
+  return run unsafe executeLoop(&mut hooks, memory, &mut base, &mode, &mut handoff)
+}
+@inlineNever
+unsafe effect fn executeObserved<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks
+  + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
+  memory: &AllocationObserver, base: &mut Machine, handoff: &mut bool) -> ValueBits
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  let mode = ObservedRun { unused: 0 }
+  return run unsafe executeLoop(&mut hooks, memory, &mut base, &mode, &mut handoff)
+}
+/// Which copy of the dispatch loop a run is in: a type, so each copy is its
+/// own instance with the answer constant.
+interface Observation { fn observes(self: &Self) -> bool }
+struct PlainRun { unused: u8 }
+impl Observation for PlainRun { @inlineAlways fn observes(self: &Self) -> bool { return false } }
+struct ObservedRun { unused: u8 }
+impl Observation for ObservedRun { @inlineAlways fn observes(self: &Self) -> bool { return true } }
+/// The dispatch loop. Returns with handoff set (and the frames' state written
+/// back) when the run must continue in the other copy.
+unsafe effect fn executeLoop<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks
+  + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks, O: Observation>(hooks: &mut H,
+  memory: &AllocationObserver, base: &mut Machine, mode: &O, handoff: &mut bool) -> ValueBits
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  let observe = mode.observes()
   // The running frame's machine: base or an inline call frame above it.
   let mut current = unsafe activation.innermost(&mut base)
   // Registers: pc and sp live in a local copy, written back around calls out.
@@ -419,9 +531,22 @@ unsafe effect fn execute<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPr
   // Jumps poll through this pointer. Inline callees may run in another realm;
   // polling the first frame's counter still bounds the time between polls.
   let interruptCounter = unsafe interrupts.counter(m.context)
+  // One runtime serves every frame, so the flag's address holds for the whole run.
+  let observeInstructions = unsafe observationFlag(m.runtime)
   while true {
     let mut anchor = () let machine = unsafe Pointer.borrowMut<(), Machine>(&mut anchor, current)
+    if observe {
+      unsafe sync(&m, &mut machine)
+      if !unsafe Pointer.read<bool>(observeInstructions) { handoff.* = true return ValueBits.Undefined }
+      run unsafe observeInstruction(&mut hooks, memory, &machine)
+      unsafe sync(&machine, &mut m)
+    }
     let opcode = unsafe m.readU8()
+    if observe {
+      // The restricted check reads the operands after the opcode.
+      unsafe sync(&m, &mut machine)
+      run unsafe restrictInstruction(&machine, opcode)
+    }
     match opcode {
       // Literals and stack shuffles.
       1 => { unsafe refresh(&machine, &mut m) let n = unsafe m.readI32() unsafe m.push(ValueBits.Int { value: n }) } // OP_push_i32
@@ -506,7 +631,7 @@ unsafe effect fn execute<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPr
         let value = unsafe m.pop()
         if match value { ValueBits.Null => true ValueBits.Undefined => true _ => false } { unsafe m.jump(displacement, 1) }
         else { unsafe locals.releaseIn(&mut hooks, &machine, value) }
-        if displacement < 0 && unsafe interrupts.dueAt(interruptCounter) { unsafe sync(&m, &mut machine) run interrupts.handle(&mut hooks, memory, unsafe lendRealm(&machine.context, machine.context)) unsafe sync(&machine, &mut m) }
+        if displacement < 0 && unsafe interrupts.dueAt(interruptCounter) { unsafe sync(&m, &mut machine) run interrupts.handle(&mut hooks, memory, unsafe lendRealm(&machine.context, machine.context)) if !observe && unsafe Pointer.read<bool>(observeInstructions) { handoff.* = true return ValueBits.Undefined } unsafe sync(&machine, &mut m) }
       }
       222 => { // OP_if_not_nullish8: is_undefined_or_null, then if_false8; a padding byte comes first
         unsafe refresh(&machine, &mut m)
@@ -516,7 +641,7 @@ unsafe effect fn execute<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPr
         if match value { ValueBits.Null => false ValueBits.Undefined => false _ => true } {
           unsafe locals.releaseIn(&mut hooks, &machine, value) unsafe m.jump(displacement, 1)
         }
-        if displacement < 0 && unsafe interrupts.dueAt(interruptCounter) { unsafe sync(&m, &mut machine) run interrupts.handle(&mut hooks, memory, unsafe lendRealm(&machine.context, machine.context)) unsafe sync(&machine, &mut m) }
+        if displacement < 0 && unsafe interrupts.dueAt(interruptCounter) { unsafe sync(&m, &mut machine) run interrupts.handle(&mut hooks, memory, unsafe lendRealm(&machine.context, machine.context)) if !observe && unsafe Pointer.read<bool>(observeInstructions) { handoff.* = true return ValueBits.Undefined } unsafe sync(&machine, &mut m) }
       }
       223 => { // OP_if_null8: is_null, then if_true8; a padding byte comes first
         unsafe refresh(&machine, &mut m)
@@ -575,40 +700,40 @@ unsafe effect fn execute<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPr
         unsafe refresh(&machine, &mut m)
         let displacement = unsafe m.readI32()
         if !unsafe controlInstructions.condition(&mut hooks, &mut m) { unsafe m.jump(displacement, 4) }
-        if displacement < 0 && unsafe interrupts.dueAt(interruptCounter) { unsafe sync(&m, &mut machine) run interrupts.handle(&mut hooks, memory, unsafe lendRealm(&machine.context, machine.context)) unsafe sync(&machine, &mut m) }
+        if displacement < 0 && unsafe interrupts.dueAt(interruptCounter) { unsafe sync(&m, &mut machine) run interrupts.handle(&mut hooks, memory, unsafe lendRealm(&machine.context, machine.context)) if !observe && unsafe Pointer.read<bool>(observeInstructions) { handoff.* = true return ValueBits.Undefined } unsafe sync(&machine, &mut m) }
       }
       105 => { // OP_if_true
         unsafe refresh(&machine, &mut m)
         let displacement = unsafe m.readI32()
         if unsafe controlInstructions.condition(&mut hooks, &mut m) { unsafe m.jump(displacement, 4) }
-        if displacement < 0 && unsafe interrupts.dueAt(interruptCounter) { unsafe sync(&m, &mut machine) run interrupts.handle(&mut hooks, memory, unsafe lendRealm(&machine.context, machine.context)) unsafe sync(&machine, &mut m) }
+        if displacement < 0 && unsafe interrupts.dueAt(interruptCounter) { unsafe sync(&m, &mut machine) run interrupts.handle(&mut hooks, memory, unsafe lendRealm(&machine.context, machine.context)) if !observe && unsafe Pointer.read<bool>(observeInstructions) { handoff.* = true return ValueBits.Undefined } unsafe sync(&machine, &mut m) }
       }
       238 => { // OP_if_false8
         unsafe refresh(&machine, &mut m)
         let displacement = unsafe m.readI8()
         if !unsafe controlInstructions.condition(&mut hooks, &mut m) { unsafe m.jump(displacement, 1) }
-        if displacement < 0 && unsafe interrupts.dueAt(interruptCounter) { unsafe sync(&m, &mut machine) run interrupts.handle(&mut hooks, memory, unsafe lendRealm(&machine.context, machine.context)) unsafe sync(&machine, &mut m) }
+        if displacement < 0 && unsafe interrupts.dueAt(interruptCounter) { unsafe sync(&m, &mut machine) run interrupts.handle(&mut hooks, memory, unsafe lendRealm(&machine.context, machine.context)) if !observe && unsafe Pointer.read<bool>(observeInstructions) { handoff.* = true return ValueBits.Undefined } unsafe sync(&machine, &mut m) }
       }
       239 => { // OP_if_true8
         unsafe refresh(&machine, &mut m)
         let displacement = unsafe m.readI8()
         if unsafe controlInstructions.condition(&mut hooks, &mut m) { unsafe m.jump(displacement, 1) }
-        if displacement < 0 && unsafe interrupts.dueAt(interruptCounter) { unsafe sync(&m, &mut machine) run interrupts.handle(&mut hooks, memory, unsafe lendRealm(&machine.context, machine.context)) unsafe sync(&machine, &mut m) }
+        if displacement < 0 && unsafe interrupts.dueAt(interruptCounter) { unsafe sync(&m, &mut machine) run interrupts.handle(&mut hooks, memory, unsafe lendRealm(&machine.context, machine.context)) if !observe && unsafe Pointer.read<bool>(observeInstructions) { handoff.* = true return ValueBits.Undefined } unsafe sync(&machine, &mut m) }
       }
       106 => { // OP_goto
         unsafe refresh(&machine, &mut m)
         let displacement = unsafe m.readI32() unsafe m.jump(displacement, 4)
-        if displacement < 0 && unsafe interrupts.dueAt(interruptCounter) { unsafe sync(&m, &mut machine) run interrupts.handle(&mut hooks, memory, unsafe lendRealm(&machine.context, machine.context)) unsafe sync(&machine, &mut m) }
+        if displacement < 0 && unsafe interrupts.dueAt(interruptCounter) { unsafe sync(&m, &mut machine) run interrupts.handle(&mut hooks, memory, unsafe lendRealm(&machine.context, machine.context)) if !observe && unsafe Pointer.read<bool>(observeInstructions) { handoff.* = true return ValueBits.Undefined } unsafe sync(&machine, &mut m) }
       }
       240 => { // OP_goto8
         unsafe refresh(&machine, &mut m)
         let displacement = unsafe m.readI8() unsafe m.jump(displacement, 1)
-        if displacement < 0 && unsafe interrupts.dueAt(interruptCounter) { unsafe sync(&m, &mut machine) run interrupts.handle(&mut hooks, memory, unsafe lendRealm(&machine.context, machine.context)) unsafe sync(&machine, &mut m) }
+        if displacement < 0 && unsafe interrupts.dueAt(interruptCounter) { unsafe sync(&m, &mut machine) run interrupts.handle(&mut hooks, memory, unsafe lendRealm(&machine.context, machine.context)) if !observe && unsafe Pointer.read<bool>(observeInstructions) { handoff.* = true return ValueBits.Undefined } unsafe sync(&machine, &mut m) }
       }
       241 => { // OP_goto16
         unsafe refresh(&machine, &mut m)
         let displacement = unsafe m.readI16() unsafe m.jump(displacement, 2)
-        if displacement < 0 && unsafe interrupts.dueAt(interruptCounter) { unsafe sync(&m, &mut machine) run interrupts.handle(&mut hooks, memory, unsafe lendRealm(&machine.context, machine.context)) unsafe sync(&machine, &mut m) }
+        if displacement < 0 && unsafe interrupts.dueAt(interruptCounter) { unsafe sync(&m, &mut machine) run interrupts.handle(&mut hooks, memory, unsafe lendRealm(&machine.context, machine.context)) if !observe && unsafe Pointer.read<bool>(observeInstructions) { handoff.* = true return ValueBits.Undefined } unsafe sync(&machine, &mut m) }
       }
       48 => { unsafe sync(&m, &mut machine) drop run unsafe controlInstructions.step(&mut hooks, memory, &mut machine, opcode) unsafe sync(&machine, &mut m) } // OP_throw
       49 => { unsafe sync(&m, &mut machine) drop run unsafe controlInstructions.step(&mut hooks, memory, &mut machine, opcode) unsafe sync(&machine, &mut m) } // OP_throw_error
@@ -1268,9 +1393,62 @@ unsafe fn charCodeAnswer<H: HeapHooks>(hooks: &mut H, machine: &mut Machine) -> 
 @inlineAlways
 unsafe fn answerOne<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, answer: ValueBits) -> u8 {
   unsafe machine.skip(2)
+  // Every operand usually keeps another holder (the array or string, the
+  // builtin, a small argument): drop one reference each inline. A last
+  // reference goes to a tail call, so this path needs no frame.
+  let base = unsafe operandCell(machine.stackTop, 3)
+  let many = unsafe Pointer.assumeManyMut<ValueBits>(base)
+  let first = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(many, 0))
+  let second = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(many, 1))
+  let third = unsafe Pointer.read<ValueBits>(unsafe Pointer.atMut<ValueBits>(many, 2))
+  if !(unsafe keepsHolder(first) && unsafe keepsHolder(second) && unsafe keepsHolder(third)) {
+    // Scalars only, so the call stays in tail position (a ValueBits goes by pointer).
+    let mut text = Pointer.null<HeapHeader>() let mut integer: i32 = 0
+    match answer {
+      ValueBits.String { reference } => { text = reference }
+      ValueBits.Int { value } => { integer = value }
+      _ => invariant()
+    }
+    return unsafe answerReleasing(&mut hooks, &mut machine, text, integer)
+  }
+  unsafe dropShared(first) unsafe dropShared(second) unsafe dropShared(third)
+  unsafe Pointer.write<ValueBits>(base, answer)
+  machine.stackTop = unsafe Pointer.atMut<ValueBits>(many, 1)
+  return PUSH_ANSWERED
+}
+/// Whether releasing value leaves it alive: an immediate, or a cell with another holder.
+@inlineAlways
+unsafe fn keepsHolder(value: ValueBits) -> bool {
+  match ValueBits.heapReference(&value) {
+    Option<*mut HeapHeader>.Some { value: node } => {
+      let anchor = ()
+      let header = unsafe Pointer.borrow<(), HeapHeader>(&anchor, node)
+      return header.referenceCount > 1
+    }
+    Option<*mut HeapHeader>.None => { return true }
+  }
+}
+/// Drops one reference of a value keepsHolder accepted.
+@inlineAlways
+unsafe fn dropShared(value: ValueBits) -> () {
+  match ValueBits.heapReference(&value) {
+    Option<*mut HeapHeader>.Some { value: node } => {
+      let mut anchor = ()
+      let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, node)
+      header.referenceCount = i32.wrappingSubtract(header.referenceCount, 1)
+    }
+    Option<*mut HeapHeader>.None => ()
+  }
+}
+/// answerOne's ending when an operand loses its last reference.
+@inlineNever
+unsafe fn answerReleasing<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, text: ?*mut HeapHeader, integer: i32) -> u8 {
   let first = machine.sp() - 3
   unsafe releaseOperands(&mut hooks, &mut machine, first)
-  unsafe machine.push(answer)
+  match Pointer.nonNullMut<HeapHeader>(text) {
+    Option<*mut HeapHeader>.Some { value } => { unsafe machine.push(ValueBits.String { reference: value }) }
+    Option<*mut HeapHeader>.None => { unsafe machine.push(ValueBits.Int { value: integer }) }
+  }
   return PUSH_ANSWERED
 }
 /// call_method answers for pushInline's PUSH_NUMBER: an intrinsic Number method
@@ -1716,8 +1894,9 @@ unsafe effect fn constructInline<H: HeapHooks + CoercionHooks + OwnPropertyHooks
   let first = unsafe operandCell(data, 2)
   let running = Pointer.fromMutRef<Machine>(&mut machine)
   let context = machine.context
+  let mut realm = context
   let mut result = ValueBits.Undefined
-  if unsafe isDerivedConstructor(function) {
+  if unsafe isDerivedConstructor(function, &mut realm) {
     result = run unsafe constructInternal(&mut hooks, memory, context, function, newTarget, &argv, 0)
   } else {
     if interrupts.due(unsafe lendRealm(&context, context)) { run interrupts.handle(&mut hooks, memory, unsafe lendRealm(&context, context)) }
@@ -1725,8 +1904,8 @@ unsafe effect fn constructInline<H: HeapHooks + CoercionHooks + OwnPropertyHooks
     if unsafe sameValueBits(function, newTarget) && form != CONSTRUCT_GENERIC {
       let mut planned = ValueBits.Uninitialized
       let mut consumed = false
-      if form == CONSTRUCT_STORES { planned = run unsafe constructPlanned(&mut hooks, memory, context, function, &argv, &mut consumed) }
-      else { planned = run unsafe constructRecipe(&mut hooks, memory, context, machine.runtime, function, form, &argv) }
+      if form == CONSTRUCT_STORES { planned = run unsafe constructPlanned(&mut hooks, memory, realm, function, &argv, &mut consumed) }
+      else { planned = run unsafe constructRecipe(&mut hooks, memory, realm, machine.runtime, function, form, &argv) }
       match planned {
         ValueBits.Object { reference } => {
           unsafe gc.pinConstructed(&mut hooks, machine.runtime, reference)
@@ -1738,7 +1917,7 @@ unsafe effect fn constructInline<H: HeapHooks + CoercionHooks + OwnPropertyHooks
         _ => ()
       }
     }
-    let receiver = run unsafe constructors.createReceiver(&mut hooks, memory, unsafe lendRealm(&context, context), newTarget)
+    let receiver = run unsafe constructors.createReceiver(&mut hooks, memory, unsafe lendRealm(&realm, realm), newTarget)
     if form == CONSTRUCT_STORES && unsafe constructors.simpleConstruct(&mut hooks, machine.runtime, function, receiver, &argv) {
       match receiver { ValueBits.Object { reference } => { unsafe gc.pinConstructed(&mut hooks, machine.runtime, reference) } _ => () }
       unsafe releaseOperandsFrom(&mut hooks, &mut machine, first) unsafe machine.push(receiver)
@@ -1841,11 +2020,12 @@ unsafe effect fn constructPlanned<H: HeapHooks + CoercionHooks>(hooks: &mut H, m
     Result<ValueBits, OutOfMemoryError>.Failure { error } => run core.materialize(&mut hooks, realm, move error)
   }
 }
-unsafe fn isDerivedConstructor(function: ValueBits) -> bool {
+unsafe fn isDerivedConstructor(function: ValueBits, realm: &mut *mut HeapHeader) -> bool {
   let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(function))
   let bytecode = match &object.payload { ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode _ => invariant() }
   drop object
   let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  realm.* = code.realm
   return code.isDerivedClassConstructor
 }
 /// Completes an inline call with value: leaves the callee frame, then finishes the
@@ -1919,6 +2099,7 @@ unsafe effect fn instruction<H: HeapHooks + CoercionHooks + OwnPropertyHooks + G
   + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
   memory: &AllocationObserver, machine: &mut Machine, opcode: u8) -> Step
   ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+
   if opcode == op.OP_apply {
     let magic = u16.toI32(unsafe machine.readU16()) unsafe machine.publishPc()
     let argv = FrameSlots { data: unsafe machine.topCell(2), count: 2 }

@@ -145,7 +145,7 @@ def native(temp, silk, stdlib, cases, cutoffs=1, armed=False):
   while cutoff < {cutoffs} {{
    let row = run oracle.isolated(cases[at].scenario, cases[at].kind, false, {str(armed).lower()}, cutoff)
    let mut field: usize = 0
-   while field < 16 {{ run out.writeU32(row[field]) |> Effect.provideMut<Allocator>(&mut system) field = field + 1 }}
+   while field < 16 {{ run out.writeU64(row[field]) |> Effect.provideMut<Allocator>(&mut system) field = field + 1 }}
    cutoff = cutoff + 1
   }}
   at = at + 1

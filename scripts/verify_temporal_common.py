@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import random
 import re
+import timezone_tables
 import shutil
 import struct
 import subprocess
@@ -38,7 +39,6 @@ PINS = {
  'temporal/plaindate.c':'c71ee6fdb4219a36939f2ef9d5f664ddcb0fbbedf71fd325a4f6256132187906',
  'temporal/timezone.c':'8c076209df4e4e27013113903b6ee984163e42ef3e509ede8206a5197938482b',
  'temporal/timezone.h':'a0aed883c00fcd0ccb82892793c2699789d10b14900ce3ff316c894da690327a',
- 'temporal/tzdata_generated.c':'42f37b41d40530a2b42fcc1f0bd8b3499595415a0cb12ec06065fe7b3ccc379b',
  'cutils.c':'b73a403a59da30726257ddbdf5e399298941c1def997782ee0d4d33f796a80a2',
  'cutils.h':'d2da6d06a75b9e6c116c82b7a41df6bcc170c8b1779f374fa953ecf688eda647',
  'quickjs.h':'09d208759171634a5b1e60aa314fd00da5d088ac28621b7ae4682ba2fb103415',
@@ -262,11 +262,8 @@ def corpus(reference):
     calendars='buddhist chinese coptic dangi ethioaa ethiopic gregory hebrew indian islamic-civil islamic-tbla islamic-umalqura iso8601 japanese persian roc ethiopic-amete-alem islamicc auto invalid'.split()
     extra = {s.encode() for s in calendars + [s.upper() for s in calendars] + 'year years month months week weeks day days hour hours minute minutes second seconds millisecond milliseconds microsecond microseconds nanosecond nanoseconds'.split()}
     for s in list(extra): extra.update([s+b'\0',s+b'\0junk',b'\0'+s,s+b'[u-ca=iso8601]'])
-    # Enumerate every name in the pinned C table (inputs only; matching is C).
-    source=(reference/'temporal/tzdata_generated.c').read_text()
-    names=re.search(r'const char \*\s*(?:const\s+)?ti_tz_names\[\]\s*=\s*\{(.*?)\n\};',source,re.S)
-    if not names: raise ValueError('Pinned timezone names declaration not found')
-    for name in re.findall(r'"([^"\\]*)"',names.group(1)):
+    # Enumerate every available name in the checked-in tables (inputs only; matching is C).
+    for name in timezone_tables.tables()[3]:
         extra.add(name.encode());extra.add(name.swapcase().encode());extra.add(('2024-01-01T00:00['+name+']').encode())
     for sign in ['+','-']:
         for hour in [0,1,23,24,99]:
@@ -514,8 +511,8 @@ def main():
         (tmp/'cases.bin').write_bytes(data)
         flags=['-fsanitize=address,undefined','-fno-sanitize-recover=all','-fno-omit-frame-pointer'] if args.sanitize_c else []
         compile_c=[executable_path(args.cc),'-std=gnu11','-O2','-D_DEFAULT_SOURCE','-include','strings.h',*flags,*args.cflag,
-                   '-I',str(tmp),'-I',str(reference),str(ROOT/'tests/fixtures/temporal_common_oracle.c'),
-                   *(str(reference/file) for file in ['temporal/calendar.c','temporal/timezone.c','temporal/tzdata_generated.c','cutils.c']),'-lm','-o',str(tmp/'oracle')]
+                   '-I',str(tmp),'-I',str(reference/'temporal'),'-I',str(reference),str(ROOT/'tests/fixtures/temporal_common_oracle.c'),
+                   *(str(reference/file) for file in ['temporal/calendar.c','temporal/timezone.c','cutils.c']),str(timezone_tables.write_c(tmp/'tz')),'-lm','-o',str(tmp/'oracle')]
         process(compile_c,args.timeout,owner='Shared Temporal C oracle compilation')
         expected=process([str(tmp/'oracle'),str(tmp/'cases.bin')],args.timeout,owner='Pinned shared Temporal C oracle')
         if len(expected)!=320*len(rows): raise SystemExit(f'C record count: {len(expected)} bytes, expected {320*len(rows)}')

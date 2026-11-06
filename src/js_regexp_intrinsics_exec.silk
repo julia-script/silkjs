@@ -6,7 +6,6 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.core.option { Option }
-import silk.collections.list { List }
 import silk.collections.slice { Slice }
 import silk.num.i32
 import silk.num.i64
@@ -20,7 +19,7 @@ import js_value { ValueBits }
 import js_intl_realm as ops
 import js_owned_value { Value, lendBits, immediateRef, ValueRef, lendFor }
 import js_object_ref { ObjectRef }
-import js_realm { Realm, lendRealm }
+import js_realm { Realm }
 import js_core_types { ContextState, RuntimeState, ObjectData, ObjectPayload, PropertySlot, SlotBits,
   ShapeData, NativeFunctionId, NativeErrorKind, JS_PROP_WRITABLE, JS_PROP_C_W_E, JS_PROP_THROW }
 import js_gc { HeapHooks }
@@ -44,6 +43,7 @@ import js_class_data as classes
 import js_regexp_intrinsics_support as support
 import regexp_exec { RegExpExecutor }
 import regexp_types { RegExpMatch, Captures, RegExpTimeout, FLAG_GLOBAL, FLAG_STICKY, FLAG_INDICES, FLAG_NAMED_GROUPS }
+import regexp_validate { RegExpValidationError, validateMatch, validateCaptures }
 import byte_buffer { readU16, readU32 }
 
 // Unlike VM polling, the regexp engine already maintains its own 10,000-event
@@ -77,10 +77,13 @@ pub effect fn execute<'a, 'b, H: HeapHooks + CoercionHooks + InterruptHooks>(hoo
   let attempted = run Effect.result(executeFlat(&mut hooks, realm, &code, &input, inputBytes, start))
   drop input drop code
   return match move attempted {
-    Result<RegExpMatch, OutOfMemoryError | RegExpTimeout>.Success { value } => move value
-    Result<RegExpMatch, OutOfMemoryError | RegExpTimeout>.Failure { error } => {
+    Result<RegExpMatch, OutOfMemoryError | RegExpTimeout | RegExpValidationError>.Success { value } => move value
+    Result<RegExpMatch, OutOfMemoryError | RegExpTimeout | RegExpValidationError>.Failure { error } => {
       match move error {
         RegExpTimeout timeout => { return run errors.throwInterrupted(&mut hooks, memory, realm) }
+        RegExpValidationError invalid => {
+          return run hooks.throwError(realm, NativeErrorKind.Internal, b"invalid regexp execution state")
+        }
         OutOfMemoryError allocation => {
           return run hooks.throwError(realm, NativeErrorKind.Internal, b"out of memory in regexp execution")
         }
@@ -101,10 +104,13 @@ pub effect fn matchInto<'a, 'b, H: HeapHooks + CoercionHooks + InterruptHooks>(h
   let attempted = run Effect.result(executeInto(&mut hooks, realm, &code, &input, inputBytes, start, &mut out))
   drop input drop code
   return match move attempted {
-    Result<bool, OutOfMemoryError | RegExpTimeout>.Success { value } => value
-    Result<bool, OutOfMemoryError | RegExpTimeout>.Failure { error } => {
+    Result<bool, OutOfMemoryError | RegExpTimeout | RegExpValidationError>.Success { value } => value
+    Result<bool, OutOfMemoryError | RegExpTimeout | RegExpValidationError>.Failure { error } => {
       match move error {
         RegExpTimeout timeout => { return run errors.throwInterrupted(&mut hooks, memory, realm) }
+        RegExpValidationError invalid => {
+          return run hooks.throwError(realm, NativeErrorKind.Internal, b"invalid regexp execution state")
+        }
         OutOfMemoryError allocation => {
           return run hooks.throwError(realm, NativeErrorKind.Internal, b"out of memory in regexp execution")
         }
@@ -120,10 +126,13 @@ pub effect fn matchLatin1<'a, H: HeapHooks + CoercionHooks + InterruptHooks>(hoo
   ! JsException ? &mut Allocator {
   let attempted = run Effect.result(narrowInto(&mut hooks, realm, code, text, start, &mut out))
   return match move attempted {
-    Result<bool, OutOfMemoryError | RegExpTimeout>.Success { value } => value
-    Result<bool, OutOfMemoryError | RegExpTimeout>.Failure { error } => {
+    Result<bool, OutOfMemoryError | RegExpTimeout | RegExpValidationError>.Success { value } => value
+    Result<bool, OutOfMemoryError | RegExpTimeout | RegExpValidationError>.Failure { error } => {
       match move error {
         RegExpTimeout timeout => { return run errors.throwInterrupted(&mut hooks, memory, realm) }
+        RegExpValidationError invalid => {
+          return run hooks.throwError(realm, NativeErrorKind.Internal, b"invalid regexp execution state")
+        }
         OutOfMemoryError allocation => {
           return run hooks.throwError(realm, NativeErrorKind.Internal, b"out of memory in regexp execution")
         }
@@ -134,10 +143,13 @@ pub effect fn matchLatin1<'a, H: HeapHooks + CoercionHooks + InterruptHooks>(hoo
 @inlineAlways
 effect fn executeInto<'a, H: InterruptHooks>(hooks: &mut H, realm: Realm<'a>,
   code: &FlatString, input: &FlatString, inputBytes: &[u8], start: usize, out: &mut Captures) -> bool
-  ! OutOfMemoryError | RegExpTimeout ? &mut Allocator {
+  ! OutOfMemoryError | RegExpTimeout | RegExpValidationError ? &mut Allocator {
+  if start > input.length() || input.length() > i32.toUsize(i32.MAX) { fail RegExpValidationError { offset: 0 } }
   if input.wide {
-    return run RegExpExecutor.match16(code.latin1.asSlice(), Slice.view(input.wideUnits(), 0, input.length()), start,
+    let matched = run RegExpExecutor.match16(code.latin1.asSlice(), Slice.view(input.wideUnits(), 0, input.length()), start,
       effect fn() -> bool ? &mut Allocator { return run interrupted(&mut hooks, realm) }, &mut out)
+    if matched && !validateCaptures(out.asSlice(), u8.toUsize(code.latin1.get(2)), input.length()) { fail RegExpValidationError { offset: 0 } }
+    return matched
   }
   return run narrowInto(&mut hooks, realm, code.latin1.asSlice(), Slice.view(inputBytes, 0, input.length()), start, &mut out)
 }
@@ -146,19 +158,28 @@ effect fn executeInto<'a, H: InterruptHooks>(hooks: &mut H, realm: Realm<'a>,
 /// replace share this one (one copy of its hot code in the instruction cache).
 @inlineAlways
 effect fn narrowInto<'a, H: InterruptHooks>(hooks: &mut H, realm: Realm<'a>, code: &[u8], text: &[u8], start: usize,
-  out: &mut Captures) -> bool ! OutOfMemoryError | RegExpTimeout ? &mut Allocator {
-  return run RegExpExecutor.match8(code, text, start,
+  out: &mut Captures) -> bool ! OutOfMemoryError | RegExpTimeout | RegExpValidationError ? &mut Allocator {
+  if start > text.length || text.length > i32.toUsize(i32.MAX) || code.length < 3 { fail RegExpValidationError { offset: 0 } }
+  let matched = run RegExpExecutor.match8(code, text, start,
     effect fn() -> bool ? &mut Allocator { return run interrupted(&mut hooks, realm) }, &mut out)
+  if matched && !validateCaptures(out.asSlice(), u8.toUsize(code[2]), text.length) { fail RegExpValidationError { offset: 0 } }
+  return matched
 }
 effect fn executeFlat<'a, H: InterruptHooks>(hooks: &mut H, realm: Realm<'a>,
   code: &FlatString, input: &FlatString, inputBytes: &[u8], start: usize) -> RegExpMatch
-  ! OutOfMemoryError | RegExpTimeout ? &mut Allocator {
+  ! OutOfMemoryError | RegExpTimeout | RegExpValidationError ? &mut Allocator {
+  if start > input.length() || input.length() > i32.toUsize(i32.MAX) { fail RegExpValidationError { offset: 0 } }
+  let captures = u8.toUsize(code.latin1.get(2))
   if input.wide {
-    return run RegExpExecutor.execute16(code.latin1.asSlice(), Slice.view(input.wideUnits(), 0, input.length()), start,
+    let matched = run RegExpExecutor.execute16(code.latin1.asSlice(), Slice.view(input.wideUnits(), 0, input.length()), start,
       effect fn() -> bool ? &mut Allocator { return run interrupted(&mut hooks, realm) })
+    run validateMatch(&matched, captures, input.length())
+    return move matched
   }
-  return run RegExpExecutor.execute8(code.latin1.asSlice(), Slice.view(inputBytes, 0, input.length()), start,
+  let matched = run RegExpExecutor.execute8(code.latin1.asSlice(), Slice.view(inputBytes, 0, input.length()), start,
     effect fn() -> bool ? &mut Allocator { return run interrupted(&mut hooks, realm) })
+  run validateMatch(&matched, captures, input.length())
+  return move matched
 }
 
 // The non-configurable lastIndex slot is always first, even after other properties
@@ -391,13 +412,13 @@ effect fn buildDecoratedResult<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropert
 effect fn builtinExec<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + InterruptHooks>(
   hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, receiver: ValueRef<'b>,
   input: ValueRef<'b>) -> ValueBits ! JsException ? &mut Allocator {
-  if !unsafe support.regexp(receiver.view()) {
+  if !support.regexp(receiver) {
     return run ops.error(&mut hooks,realm, b"RegExp object expected")
   }
   let string = StringOwner.adopt((run support.string(&mut hooks, realm, input)).intoBits())
   let mut lastIndex = run getLastIndex(&mut hooks, realm, receiver)
   // Read the current bytecode AFTER both coercions: they may invoke compile().
-  let fields = unsafe support.fields(receiver.view())
+  let fields = support.fields(receiver)
   let code = StringOwner.borrowed(fields.bytecode())
   let anchor = ()
   let flat = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(code.get()))
@@ -471,7 +492,7 @@ pub effect fn exec<'a, 'b, H: HeapHooks + CoercionHooks + CallHooks + OwnPropert
 pub effect fn quickExec<'a, H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + InterruptHooks>(
   hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, receiver: ValueBits, input: ValueBits, test: bool) -> Option<ValueBits>
   ? &mut Allocator {
-  if !unsafe support.regexp(receiver) || input.tag() != -7 { return Option<ValueBits>.none() }
+  if !support.regexp(unsafe lendBits(&receiver, receiver)) || input.tag() != -7 { return Option<ValueBits>.none() }
   let anchor = ()
   let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(receiver))
   let stored = match object.properties.get(0).valueBits() {
@@ -543,8 +564,8 @@ effect fn answer<'a, H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyW
   let attempted = run Effect.result(executeInto(&mut hooks, realm, &codeFlat, &text, inputBytes, lastIndex, &mut captures))
   drop text drop codeFlat
   let matched = match move attempted {
-    Result<bool, OutOfMemoryError | RegExpTimeout>.Success { value } => value
-    Result<bool, OutOfMemoryError | RegExpTimeout>.Failure { .. } => { return Option<ValueBits>.none() }
+    Result<bool, OutOfMemoryError | RegExpTimeout | RegExpValidationError>.Success { value } => value
+    Result<bool, OutOfMemoryError | RegExpTimeout | RegExpValidationError>.Failure { .. } => { return Option<ValueBits>.none() }
   }
   if !matched {
     if test { return Option<ValueBits>.some(ValueBits.Bool { value: false }) }

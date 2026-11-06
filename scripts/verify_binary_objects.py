@@ -4,10 +4,12 @@
 The oracle is a separate process, not a binding. Source expressions create the
 actual graphs and compiled functions/modules in both Engines. Wire bytes travel
 in both directions. SAB address words are relocated explicitly, preserving
-pointer-equivalence classes; all other bytes compare exactly. Native truncation
-and allocation-failure sweeps always require zero final allocation/byte ledgers.
+pointer-equivalence classes. Value encodings and reserialized decoded bytecode
+compare exactly; independent compilations must cross-execute and preserve their
+own bytes on roundtrip, not make identical instruction-selection decisions.
+Native truncation and allocation-failure sweeps require zero final ledgers.
 C reader inputs outside its documented trusted-bytecode precondition are never
-executed. Metadata-only module cases still compare the complete serialized bytes.
+executed. Metadata-only modules still require exact decoded reserialization.
 """
 import argparse
 from dataclasses import dataclass, replace
@@ -75,6 +77,13 @@ CASES = [
     Case('compile-closure', '(function(a){return function(b){return a+b}})(20)(22)', '__binary === 42', BYTECODE, COMPILE),
     Case('compile-control', '(()=>{let n=0;for(let i=0;i<7;i++){try{if(i===3)throw 2;n+=i}catch(e){n+=e}finally{n++}}return n})()', '__binary === 27', BYTECODE, COMPILE),
     Case('compile-generator', 'function* g(a){yield a;return 42} let it=g(9);it.next();it.next().value', '__binary === 42', BYTECODE, COMPILE),
+    Case('compile-generator-delegation', 'function* a(){yield 1;yield 2}function* b(){yield* a()}[...b()].join(",")', '__binary === "1,2"', BYTECODE, COMPILE),
+    Case('compile-async-generator', '(async function*(){yield await 1;yield* [2]})', 'typeof __binary === "function"', BYTECODE, COMPILE),
+    Case('compile-iterators', '(()=>{let n=0;for(const x of [1,2,3]){if(x===3)break;n+=x}for(const k in {a:1,b:2})n++;return n})()', '__binary === 5', BYTECODE, COMPILE),
+    Case('compile-direct-eval', '((a)=>{let b=2;return eval("a+b")})(40)', '__binary === 42', BYTECODE, COMPILE),
+    Case('compile-mapped-arguments', '(function(a){arguments[0]=42;return a})(0)', '__binary === 42', BYTECODE, COMPILE),
+    Case('compile-private-fields', 'class C{#x=40;m(){return this.#x+2}}new C().m()', '__binary === 42', BYTECODE, COMPILE),
+    Case('compile-regexp', '/(?<a>a+)(b)/u.exec("aab").groups.a', '__binary === "aa"', BYTECODE, COMPILE),
     Case('compile-class', 'class A{m(){return 20}}class B extends A{m(){return super.m()+22}}new B().m()', '__binary === 42', BYTECODE, COMPILE),
     Case('compile-template', '(function(a){return a.raw[0]})`x`', '__binary === "x"', BYTECODE, COMPILE),
     Case('compile-template-cache', '(function(){function f(a){return a[0].length}return f`abcdefghijklmnopqrstuvwxyz01234567890123456789`})()', '__binary === 46', BYTECODE, COMPILE),
@@ -333,7 +342,12 @@ def compare(job, actual):
         return
     if job.mode != 2 and row[3] != 1:
         raise AssertionError(f'{label}: real Engine semantic/identity/execution check failed: {row}')
-    for name, left, right in [('write', expected[0], actual[0]), ('rewrite', expected[1], actual[1])]:
+    comparisons = [('write', expected[0], actual[0]), ('rewrite', expected[1], actual[1])]
+    if job.mode == 0 and job.case.evaluation & COMPILE:
+        # Independently compiled instruction sequences are not a wire contract.
+        # Keep native roundtrip identity; main also executes native output in C.
+        comparisons = [('native bytecode roundtrip', actual[0], actual[1])]
+    for name, left, right in comparisons:
         if normalized(left) != normalized(right):
             a, b = normalized(left), normalized(right)
             at = next((i for i, pair in enumerate(zip(a, b)) if pair[0] != pair[1]), min(len(a), len(b)))
@@ -365,6 +379,7 @@ def main():
         temp = Path(directory).resolve()
         shutil.copytree(ROOT / 'src', temp / 'src')
         shutil.copy2(ROOT / 'silk.toml', temp / 'silk.toml')
+        shutil.copy2(ROOT / 'startup.order', temp / 'startup.order')
         executable = temp / 'binary-objects-c'
         run([args.cc, '-O2', '-std=gnu11', '-fwrapv', '-funsigned-char', '-U__SIZEOF_INT128__',
              '-D_GNU_SOURCE', '-D__SANITIZE_ADDRESS__', '-DCONFIG_VERSION="binary-object-oracle"',
@@ -404,7 +419,7 @@ def main():
                     raise AssertionError(f'C/{job.case.name}: native wire decode/execution failed {cross[2]}')
                 if normalized(cross[1]) != normalized(result[0]):
                     raise AssertionError(f'C/{job.case.name}: native wire reserialization differs')
-        print(f'Engine cross-read/write: {len(jobs)} records; every ledger zero; all address-independent bytes exact')
+        print(f'Engine cross-read/write: {len(jobs)} records; zero ledgers; exact value/decoded bytes and cross-executed compilations')
         print('Golden SHA256:', hashlib.sha256(b''.join(normalized(golden[c.name][0]) for c in selected)).hexdigest())
 
         # Every proper prefix of every successful C stream must fail natively.
@@ -431,6 +446,29 @@ def main():
         for index, data in enumerate(invalid):
             case = Case('invalid-' + str(index), '', '', REFERENCE)
             boundary_jobs.append(Job(case, 2, data))
+        # Empty function bodies are reader-only fixtures, never executed or sent
+        # to C. Exercise overflow before narrowing, including partial owners.
+        function_header = b'\x05\x00\x0c\x00\x00\x00\x00'
+        for overflow in (b'\x80\x80\x04', b'\xff\xff\xff\xff\x0f',
+                         b'\x80\x80\x80\x80\x10'):
+            for field, name in enumerate(('argc', 'varc', 'defined', 'stack', 'refs')):
+                fields = [b'\x00'] * 9
+                fields[field] = overflow
+                data = function_header + b''.join(fields)
+                boundary_jobs.append(Job(Case(f'uint16-{name}-{overflow.hex()}', '', '', BYTECODE), 2, data))
+            data = function_header + b'\x00' * 8 + b'\x01\x00\x00' + overflow + b'\x00'
+            boundary_jobs.append(Job(Case(f'uint16-var-ref-{overflow.hex()}', '', '', BYTECODE), 2, data))
+            data = function_header + b'\x00' * 5 + b'\x01\x00\x00\x00\x00' + overflow + b'\x00\x00'
+            boundary_jobs.append(Job(Case(f'uint16-closure-index-{overflow.hex()}', '', '', BYTECODE), 2, data))
+        for bit in range(12, 16):
+            data = b'\x05\x00\x0c' + struct.pack('<H', 1 << bit) + b'\x00' * 11
+            boundary_jobs.append(Job(Case(f'reserved-function-flag-{bit}', '', '', BYTECODE), 2, data))
+        for bit in range(9, 16):
+            data = function_header + b'\x00' * 5 + b'\x01\x00\x00\x00\x00\x00' + struct.pack('<H', 1 << bit)
+            boundary_jobs.append(Job(Case(f'reserved-closure-flag-{bit}', '', '', BYTECODE), 2, data))
+        for last in (0x10, 0x7f, 0x80, 0x8f):
+            data = b'\x05\x00\x05\x80\x80\x80\x80' + bytes([last])
+            boundary_jobs.append(Job(Case(f'leb-overflow-{last}', '', ''), 2, data))
         # Admission gates: bytecode/module and references cannot cross disabled flags.
         for case in selected:
             if not case.reject and case.flags & BYTECODE and case.evaluation & COMPILE:
@@ -448,6 +486,51 @@ def main():
             for job, result in zip(batch, native(temp, args, batch)):
                 compare(job, result)
         print(f'Native malformed/truncation boundaries: {len(boundary_jobs)}, zero ledgers')
+
+        # Unlike the C oracle, mode7 only validates decoded executable trees.
+        # None of these adversarial programs is ever evaluated.
+        def compiled_body(code, *, argc=0, varc=0, stack=0, refs=0, kind=0,
+                          definitions=(), closures=(), constants=()):
+            counts = bytes((argc, varc, argc, stack, refs, len(closures),
+                            len(constants), len(code), len(definitions)))
+            variables = b''.join(bytes((0, scope, ref, flags))
+                                 for scope, ref, flags in definitions)
+            captures = b''.join(bytes((0, index)) + struct.pack('<H', kind)
+                                for index, kind in closures)
+            return b'\x0c' + struct.pack('<H', kind << 4) + b'\x00\x00' + counts + variables + captures + bytes(code) + b''.join(constants)
+
+        child = compiled_body([225, 40], stack=1, closures=((1, 0),))
+        malformed_code = [
+            ('forged-ret', compiled_body([185, 109], stack=1)),
+            ('generator-return-in-normal-function', compiled_body([185, 47], stack=1)),
+            ('async-delegation-in-async-function', compiled_body([185, 136, 14, 47], stack=2, kind=2)),
+            ('forged-enumerator', compiled_body([6, 125, 14, 14, 14, 41], stack=3)),
+            ('closure-without-parent', compiled_body([41], closures=((0, 0),))),
+            ('nested-capture-index', compiled_body([196, 0, 14, 41], varc=1, stack=1,
+                refs=1, definitions=((0, 0, 64),), constants=(child,))),
+            ('aliased-frame-cells', compiled_body([41], varc=2, refs=1,
+                definitions=((0, 0, 64), (0, 0, 64)))),
+            ('scope-cycle', compiled_body([6, 50, 0, 0, 2, 0, 14, 41], varc=1, stack=1, definitions=((1, 0, 0),))),
+            ('scope-link-out-of-range', compiled_body([6, 50, 0, 0, 2, 0, 14, 41], varc=1, stack=1, definitions=((2, 0, 0),))),
+            ('closure-constant-type', compiled_body([196, 0, 40], stack=1, constants=(b'\x02',))),
+            ('class-constant-type', compiled_body([6, 195, 0, 83, 0, 0, 0, 0, 0, 14, 40],
+                stack=2, constants=(b'\x02',))),
+            ('regexp-bytecode', compiled_body([195, 0, 195, 1, 52, 40], stack=2,
+                constants=(b'\x07\x00', b'\x07\x00'))),
+            ('branch-into-operand', compiled_body([240, 2, 1, 0, 0, 0, 0, 40], stack=1)),
+        ]
+        validator_jobs = [
+            Job(Case('validate-' + name, '', '', BYTECODE), 7, b'\x05\x00' + payload)
+            for name, payload in malformed_code
+        ]
+        accepted_validation = (b'', b'', (7, 1, 0, 1, 0, 0, 0, 0, 0, 0))
+        for case in selected:
+            if not case.reject and case.flags & BYTECODE and case.evaluation & COMPILE and not case.evaluation & 1:
+                validator_jobs.append(Job(replace(case, check=''), 7, golden[case.name][0],
+                                          expected=accepted_validation, label=case.name + '/validated'))
+        for job, result in zip(validator_jobs, native(temp, args, validator_jobs)):
+            compare(job, result)
+        print(f'Decoded executable safety boundaries: {len(validator_jobs)}, no adversarial execution, zero ledgers')
 
         rom_jobs = []
         for case in selected:

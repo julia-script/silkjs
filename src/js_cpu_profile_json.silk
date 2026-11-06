@@ -1,0 +1,141 @@
+//! Post-stop CDP CPU profile encoding. Builds the observed calling-context tree;
+//! root is the only unconditional synthetic node. State nodes require an actual
+//! native/idle/GC sample. JSON owns its bytes independently of the native profile.
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u16
+import silk.num.u64
+import silk.num.usize
+import silk.num.i32
+import byte_buffer { ByteBuffer }
+import js_value_print_text as text
+import js_cpu_profile { Profile, Frame }
+import js_cpu_profile as cpu
+
+const NONE: usize = 18446744073709551615
+struct Node { parent: usize, firstChild: usize, nextSibling: usize, frame: Frame, hits: u64 }
+impl Copy for Node {}
+fn empty(kind: u8) -> Frame { return Frame { kind: kind, functionIndex: cpu.NO_FUNCTION,
+  functionAddress: 0, scriptId: 0, pc: Option<usize>.none(), pcIsReturnAddress: false, line: -1, column: -1 } }
+fn pc(frame: Frame) -> usize { return match frame.pc { Option<usize>.Some { value } => value _ => NONE } }
+fn same(a: Frame, b: Frame) -> bool { return a.kind == b.kind && a.functionAddress == b.functionAddress &&
+  a.scriptId == b.scriptId && pc(a) == pc(b) && a.pcIsReturnAddress == b.pcIsReturnAddress && a.line == b.line && a.column == b.column }
+fn hash(parent: usize, frame: Frame, capacity: usize) -> usize {
+  let mut value = u64.wrappingMultiply(usize.toU64(parent + 1), 11400714819323198485)
+  value = u64.wrappingMultiply(value ^ usize.toU64(frame.functionAddress), 1099511628211)
+  value = u64.wrappingMultiply(value ^ frame.scriptId, 1099511628211)
+  value = u64.wrappingMultiply(value ^ usize.toU64(pc(frame)), 1099511628211)
+  return u64.toUsize(value % usize.toU64(capacity))
+}
+effect fn intern(nodes: &mut List<Node>, slots: &mut List<usize>, parent: usize, frame: Frame) -> usize
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut slot = hash(parent, frame, slots.length())
+  while slots.get(slot) != NONE {
+    let index = slots.get(slot) let node = nodes.get(index)
+    if node.parent == parent && same(node.frame, frame) { return index }
+    slot = slot + 1 if slot == slots.length() { slot = 0 }
+  }
+  let index = nodes.length() let mut owner = nodes.get(parent)
+  run nodes.append(Node { parent: parent, firstChild: NONE, nextSibling: owner.firstChild, frame: frame, hits: 0 })
+  owner.firstChild = index nodes.set(parent, owner) slots.set(slot, index)
+  return index
+}
+effect fn quoted(out: &mut ByteBuffer, units: &[u16]) -> () ! OutOfMemoryError ? &mut Allocator {
+  run out.append(34) let mut i: usize = 0 let digits = b"0123456789abcdef"
+  while i < units.length {
+    let unit = units[i]
+    if unit >= 32 && unit < 127 && unit != 34 && unit != 92 { run out.append(u16.toU8(unit)) }
+    else {
+      run out.appendSlice(b"\\u")
+      run out.append(digits[u16.toUsize(u16.shiftRight(unit, 12) & 15)])
+      run out.append(digits[u16.toUsize(u16.shiftRight(unit, 8) & 15)])
+      run out.append(digits[u16.toUsize(u16.shiftRight(unit, 4) & 15)])
+      run out.append(digits[u16.toUsize(unit & 15)])
+    }
+    i = i + 1
+  }
+  run out.append(34)
+}
+effect fn callFrame(out: &mut ByteBuffer, profile: &Profile, frame: Frame, root: bool) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  run out.appendSlice(b"{\"functionName\":")
+  let functions = profile.functions()
+  if root { run out.appendSlice(b"\"(root)\"") }
+  else if frame.kind == cpu.NATIVE { run out.appendSlice(b"\"(native)\"") }
+  else if frame.kind == cpu.IDLE { run out.appendSlice(b"\"(idle)\"") }
+  else if frame.kind == cpu.GC { run out.appendSlice(b"\"(garbage collector)\"") }
+  else if frame.functionIndex < functions.length { run quoted(&mut out, functions[frame.functionIndex].name()) }
+  else { run out.appendSlice(b"\"\"") }
+  run out.appendSlice(b",\"scriptId\":\"") run text.unsigned(&mut out, frame.scriptId)
+  run out.appendSlice(b"\",\"url\":")
+  if frame.functionIndex < functions.length { run quoted(&mut out, functions[frame.functionIndex].url()) }
+  else { run out.appendSlice(b"\"\"") }
+  run out.appendSlice(b",\"lineNumber\":") run text.signed(&mut out, i32.toI64(frame.line))
+  run out.appendSlice(b",\"columnNumber\":") run text.signed(&mut out, i32.toI64(frame.column))
+  run out.append(125)
+}
+pub effect fn encode(profile: &Profile) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let samples = profile.samples() let frames = profile.frames()
+  let bound = frames.length + samples.length + 1
+  let mut nodes = List<Node>.make() let mut slots = List<usize>.make() let mut leaves = List<usize>.make()
+  run nodes.reserveExact(bound) run slots.reserveExact(bound * 2) run leaves.reserveExact(samples.length)
+  let mut i: usize = 0
+  while i < bound * 2 { run slots.append(NONE) i = i + 1 }
+  run nodes.append(Node { parent: NONE, firstChild: NONE, nextSibling: NONE, frame: empty(cpu.JAVASCRIPT), hits: 0 })
+  i = 0 let mut truncated = false
+  while i < samples.length {
+    let sample = samples[i] let mut parent: usize = 0 let mut remaining = sample.frameCount
+    if sample.truncatedStack { truncated = true }
+    while remaining != 0 {
+      remaining = remaining - 1 let frame = frames[sample.firstFrame + remaining]
+      if frame.kind == cpu.JAVASCRIPT && frame.functionIndex == cpu.NO_FUNCTION { truncated = true }
+      parent = run intern(&mut nodes, &mut slots, parent, frame)
+    }
+    if sample.kind != cpu.JAVASCRIPT { parent = run intern(&mut nodes, &mut slots, parent, empty(sample.kind)) }
+    let mut leaf = nodes.get(parent) leaf.hits = leaf.hits + 1 nodes.set(parent, leaf)
+    run leaves.append(parent + 1) i = i + 1
+  }
+  let functions = profile.functions() i = 0
+  while i < functions.length { if functions[i].nameTruncated() || functions[i].urlTruncated() { truncated = true } i = i + 1 }
+  let mut out = ByteBuffer.make() run out.appendSlice(b"{\"nodes\":[") i = 0
+  while i < nodes.length() {
+    if i != 0 { run out.append(44) }
+    let node = nodes.get(i)
+    run out.appendSlice(b"{\"id\":") run text.unsigned(&mut out, usize.toU64(i + 1))
+    run out.appendSlice(b",\"callFrame\":") run callFrame(&mut out, &profile, node.frame, i == 0)
+    run out.appendSlice(b",\"hitCount\":") run text.unsigned(&mut out, node.hits)
+    run out.appendSlice(b",\"children\":[") let mut child = node.firstChild let mut first = true
+    while child != NONE {
+      if !first { run out.append(44) } first = false
+      run text.unsigned(&mut out, usize.toU64(child + 1)) child = nodes.get(child).nextSibling
+    }
+    run out.appendSlice(b"],\"silk\":{\"functionAddress\":\"") run text.unsigned(&mut out, usize.toU64(node.frame.functionAddress))
+    run out.appendSlice(b"\",\"pc\":")
+    match node.frame.pc {
+      Option<usize>.Some { value } => { run text.unsigned(&mut out, usize.toU64(value)) }
+      Option<usize>.None => { run out.appendSlice(b"null") }
+    }
+    run out.appendSlice(b",\"pcIsReturnAddress\":")
+    if node.frame.pcIsReturnAddress { run out.appendSlice(b"true") } else { run out.appendSlice(b"false") }
+    run out.appendSlice(b"}}") i = i + 1
+  }
+  run out.appendSlice(b"],\"startTime\":") run text.signed(&mut out, profile.startMicroseconds())
+  run out.appendSlice(b",\"endTime\":") run text.signed(&mut out, profile.endMicroseconds())
+  run out.appendSlice(b",\"samples\":[") i = 0
+  while i < leaves.length() { if i != 0 { run out.append(44) } run text.unsigned(&mut out, usize.toU64(leaves.get(i))) i = i + 1 }
+  run out.appendSlice(b"],\"timeDeltas\":[") i = 0 let mut previous = profile.startMicroseconds()
+  while i < samples.length {
+    if i != 0 { run out.append(44) }
+    run text.signed(&mut out, samples[i].timestampMicroseconds - previous)
+    previous = samples[i].timestampMicroseconds i = i + 1
+  }
+  run out.appendSlice(b"],\"silk\":{\"safepointBias\":true,\"droppedObservations\":")
+  run text.unsigned(&mut out, profile.droppedObservations())
+  run out.appendSlice(b",\"truncated\":")
+  if truncated { run out.appendSlice(b"true") } else { run out.appendSlice(b"false") }
+  run out.appendSlice(b",\"intervalMicroseconds\":") run text.signed(&mut out, profile.intervalMicroseconds())
+  run out.appendSlice(b"}}")
+  return out.intoList()
+}
