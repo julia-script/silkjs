@@ -23,7 +23,7 @@ import silk.num.u32
 import silk.num.u64
 import silk.num.i32
 import silk.num.usize
-import js_heap { HeapCell, HeapHeader, HeapKind, CellRef }
+import js_heap { HeapCell, HeapHeader, HeapKind, CellRef, CellLinks }
 import js_value { ValueBits }
 import js_owned_value { ValueRef }
 import js_realm { Realm }
@@ -76,9 +76,13 @@ pub interface HeapHooks {
 }
 
 enum MarkOperation { Decrement, RestoreReachable, RestoreUnreachable }
+/// Cells a restore pass found reachable whose children it has yet to restore.
+/// One that does not fit is marked MARK_RESTORE and found by a rescan.
+const RESTORE_STACK: usize = 1024
+struct RestoreStack { cells: [?*mut HeapHeader; 1024], depth: usize, overflowed: bool }
 /// Borrowed stack-local marking capability, valid only during its callback. It
 /// does not own/retain runtime and must not escape or be used after collection.
-pub struct Tracer { runtime: *mut HeapHeader, operation: MarkOperation }
+pub struct Tracer { runtime: *mut HeapHeader, operation: MarkOperation, stack: *mut RestoreStack }
 impl Tracer {
   pub unsafe fn header(self: &mut Self, child: *mut HeapHeader) -> () {
     let mut anchor = ()
@@ -86,25 +90,15 @@ impl Tracer {
     if self.operation == MarkOperation.Decrement {
       require(h.referenceCount > 0)
       h.referenceCount = i32.wrappingSubtract(h.referenceCount, 1)
-      let moveToTemporary = h.referenceCount == 0 && h.mark == 1
-      drop h
-      if moveToTemporary {
-        unsafe unlinkGc(self.runtime, child)
-        unsafe appendTemporary(self.runtime, child)
-      }
     } else {
       h.referenceCount = i32.wrappingAdd(h.referenceCount, 1)
-      let reachable = self.operation == MarkOperation.RestoreReachable && h.referenceCount == 1
-      if reachable { h.mark = 0 }
+      let reachable = self.operation == MarkOperation.RestoreReachable && h.referenceCount == 1 && h.mark == 1
       drop h
-      if reachable {
-        unsafe unlinkGc(self.runtime, child)
-        unsafe appendGc(self.runtime, child)
-      }
+      if reachable { unsafe pushRestore(self.stack, child) }
     }
   }
   /// header for an operation known where it is inlined, so the per-edge work is
-  /// a count update; the relinks stay out of line.
+  /// a count update; the restore push stays out of line.
   @inlineAlways
   unsafe fn edgeAs(self: &mut Self, child: *mut HeapHeader, operation: MarkOperation) -> () {
     let mut anchor = ()
@@ -112,13 +106,11 @@ impl Tracer {
     if operation == MarkOperation.Decrement {
       require(h.referenceCount > 0)
       h.referenceCount = i32.wrappingSubtract(h.referenceCount, 1)
-      if h.referenceCount == 0 && h.mark == 1 { drop h unsafe moveToTemporary(self.runtime, child) }
     } else {
       h.referenceCount = i32.wrappingAdd(h.referenceCount, 1)
-      if operation == MarkOperation.RestoreReachable && h.referenceCount == 1 {
-        h.mark = 0
+      if operation == MarkOperation.RestoreReachable && h.referenceCount == 1 && h.mark == 1 {
         drop h
-        unsafe moveToGc(self.runtime, child)
+        unsafe pushRestore(self.stack, child)
       }
     }
   }
@@ -149,15 +141,28 @@ impl Tracer {
   }
 }
 
-@inlineNever
-unsafe fn moveToTemporary(runtime: *mut HeapHeader, child: *mut HeapHeader) -> () {
-  unsafe unlinkGc(runtime, child)
-  unsafe appendTemporary(runtime, child)
+/// A trial-deleted cell (mark 1) just found reachable: its children are restored
+/// from the stack, or from a rescan when the stack is full.
+@inlineAlways
+unsafe fn pushRestore(stack: *mut RestoreStack, child: *mut HeapHeader) -> () {
+  let mut anchor = ()
+  let restore = unsafe Pointer.borrowMut<(), RestoreStack>(&mut anchor, stack)
+  let depth = restore.depth
+  if depth == RESTORE_STACK { drop restore unsafe overflowRestore(stack, child) return () }
+  restore.cells[depth] = child
+  restore.depth = depth + 1
+  drop restore
+  unsafe mark(child, 0)
+  // The restore scan may have passed child already, uncounted.
+  if unsafe HeapCell.isPooledCell(child) { unsafe memory.clearPending(unsafe blockAt(child)) }
 }
 @inlineNever
-unsafe fn moveToGc(runtime: *mut HeapHeader, child: *mut HeapHeader) -> () {
-  unsafe unlinkGc(runtime, child)
-  unsafe appendGc(runtime, child)
+unsafe fn overflowRestore(stack: *mut RestoreStack, child: *mut HeapHeader) -> () {
+  let mut anchor = ()
+  let restore = unsafe Pointer.borrowMut<(), RestoreStack>(&mut anchor, stack)
+  restore.overflowed = true
+  drop restore
+  unsafe mark(child, MARK_RESTORE)
 }
 fn require(condition: bool) -> () { if !condition { invariantFailure() } }
 fn invariantFailure() -> never { return Intrinsic.trap("QuickJS invariant violated") }
@@ -182,49 +187,48 @@ unsafe fn count(node: *mut HeapHeader) -> i32 {
   let anchor = ()
   unsafe { return Pointer.borrow<(), HeapHeader>(&anchor, node).referenceCount }
 }
+/// A cell's address as the block runtime_memory knows it by.
 @inlineAlways
-unsafe fn next(node: *mut HeapHeader) -> ?*mut HeapHeader {
+unsafe fn blockAt(cell: *mut HeapHeader) -> *mut u8 {
+  return unsafe Intrinsic.pointerReinterpret<*mut HeapHeader, *mut u8>(cell)
+}
+@inlineAlways
+unsafe fn cellIn(arena: *mut u8, word: usize, bit: u32) -> *mut HeapHeader {
+  return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut HeapHeader>(unsafe memory.cellAt(arena, word, bit))
+}
+/// Starts loading a cell's first two cache lines, so a heap walk overlaps the
+/// next cell's misses with this one's work.
+@inlineAlways
+unsafe fn prefetchCell(cell: *mut HeapHeader) -> () {
+  let address = Pointer.address<HeapHeader>(cell)
+  unsafe memory.prefetch(address)
+  unsafe memory.prefetch(address + 64)
+}
+/// The successor of a linked cell in its HeapList.
+@inlineAlways
+unsafe fn linkedNext(node: *mut HeapHeader) -> ?*mut HeapHeader {
   let anchor = ()
-  unsafe { return Pointer.borrow<(), HeapHeader>(&anchor, node).next }
-}
-/// Starts loading a list cell's first three cache lines (a 160-byte object cell
-/// at most), so a list walk overlaps the next cells' misses with this one's work.
-@inlineAlways
-unsafe fn prefetchCell(cell: ?*mut HeapHeader) -> () {
-  match Pointer.nonNullMut<HeapHeader>(cell) {
-    Option<*mut HeapHeader>.Some { value } => {
-      let address = Pointer.address<HeapHeader>(value)
-      unsafe memory.prefetch(address)
-      unsafe memory.prefetch(address + 64)
-      unsafe memory.prefetch(address + 128)
-    }
-    Option<*mut HeapHeader>.None => ()
-  }
-}
-/// The successor of cell, or null for a null cell.
-@inlineAlways
-unsafe fn nextOf(cell: ?*mut HeapHeader) -> ?*mut HeapHeader {
-  match Pointer.nonNullMut<HeapHeader>(cell) {
-    Option<*mut HeapHeader>.Some { value } => { return unsafe next(value) }
-    Option<*mut HeapHeader>.None => { return cell }
-  }
+  return (unsafe Pointer.borrow<(), CellLinks>(&anchor, unsafe HeapCell.links(node))).next
 }
 @inlineAlways
-unsafe fn previousOf(cell: ?*mut HeapHeader) -> ?*mut HeapHeader {
-  match Pointer.nonNullMut<HeapHeader>(cell) {
-    Option<*mut HeapHeader>.Some { value } => { return unsafe previous(value) }
-    Option<*mut HeapHeader>.None => { return cell }
-  }
-}
-@inlineAlways
-unsafe fn previous(node: *mut HeapHeader) -> ?*mut HeapHeader {
+unsafe fn firstArena(runtime: *mut HeapHeader) -> ?*mut u8 {
   let anchor = ()
-  unsafe { return Pointer.borrow<(), HeapHeader>(&anchor, node).previous }
+  return (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)).gcArenas
 }
 @inlineAlways
-unsafe fn lastTemporary(runtime: *mut HeapHeader) -> ?*mut HeapHeader {
+unsafe fn firstPendingArena(runtime: *mut HeapHeader) -> ?*mut u8 {
   let anchor = ()
-  unsafe { return HeapCell.payload<RuntimeState, ()>(&anchor, runtime).temporaryGcObjects.last }
+  return (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)).gcPendingArenas
+}
+@inlineAlways
+unsafe fn listPending(runtime: *mut HeapHeader, arena: *mut u8) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  unsafe memory.listPending(arena, Pointer.fromMutRef<?*mut u8>(&mut state.gcPendingArenas))
+}
+@inlineAlways
+unsafe fn present(pointer: ?*mut u8) -> *mut u8 {
+  return unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(pointer)
 }
 @inlineAlways
 unsafe fn markOf(node: *mut HeapHeader) -> u8 {
@@ -248,23 +252,34 @@ unsafe fn setPhase(runtime: *mut HeapHeader, value: GcPhase) -> () {
   let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
   state.gcPhase = value
 }
+/// Makes node a member of the runtime's GC heap: a bit in its arena when it is a
+/// pooled cell, else gcObjects.
 @inlineAlways
-unsafe fn appendGc(runtime: *mut HeapHeader, node: *mut HeapHeader) -> () {
+unsafe fn join(runtime: *mut HeapHeader, node: *mut HeapHeader) -> () {
   let mut anchor = ()
   let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  if unsafe HeapCell.isPooledCell(node) {
+    unsafe memory.addCell(unsafe blockAt(node), Pointer.address<HeapHeader>(runtime), Pointer.fromMutRef<?*mut u8>(&mut state.gcArenas))
+    return ()
+  }
   unsafe state.gcObjects.pushBack(node)
+}
+/// Ends node's membership: clears its arena bit, or takes it out of whichever
+/// runtime list holds it (none is fine).
+@inlineAlways
+unsafe fn leave(runtime: *mut HeapHeader, node: *mut HeapHeader) -> () {
+  if unsafe HeapCell.isPooledCell(node) { unsafe memory.removeCell(unsafe blockAt(node)) return () }
+  unsafe unlinkGc(runtime, node)
 }
 unsafe fn appendTemporary(runtime: *mut HeapHeader, node: *mut HeapHeader) -> () {
   let mut anchor = ()
   let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
   unsafe state.temporaryGcObjects.pushBack(node)
 }
-@inlineAlways
-unsafe fn appendZero(runtime: *mut HeapHeader, node: *mut HeapHeader, front: bool) -> () {
+unsafe fn appendZombie(runtime: *mut HeapHeader, node: *mut HeapHeader) -> () {
   let mut anchor = ()
   let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
-  if front { unsafe state.zeroReferenceObjects.pushFront(node) }
-  else { unsafe state.zeroReferenceObjects.pushBack(node) }
+  unsafe state.zombieGcObjects.pushBack(node)
 }
 @inlineAlways
 unsafe fn firstGc(runtime: *mut HeapHeader, which: u8) -> ?*mut HeapHeader {
@@ -272,17 +287,23 @@ unsafe fn firstGc(runtime: *mut HeapHeader, which: u8) -> ?*mut HeapHeader {
   let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
   if which == 0 { return state.gcObjects.first }
   if which == 1 { return state.temporaryGcObjects.first }
-  return state.zeroReferenceObjects.first
+  if which == 2 { return state.zeroReferenceObjects.first }
+  return state.zombieGcObjects.first
+}
+@inlineAlways
+unsafe fn sameEnd(list: &mut HeapList, node: *mut HeapHeader, previous: ?*mut HeapHeader, following: ?*mut HeapHeader, front: bool) -> () {
+  if front { if same(list.first, node) { list.first = following } }
+  else { if same(list.last, node) { list.last = previous } }
 }
 // Unlike C sentinel lists, a null-ended list needs its endpoints repaired. Only a
 // node with no predecessor can be a list's first and only one with no successor
 // its last, so the endpoint checks run just on those sides. This gives constant-
-// time unlink without walking to a sentinel or adding a second membership field
-// to the shared header.
-@inlineAlways
+// time unlink of a linked cell from whichever runtime list holds it.
+@inlineNever
 unsafe fn unlinkGc(runtime: *mut HeapHeader, node: *mut HeapHeader) -> () {
+  if !unsafe HeapCell.isLinked(node) { return () }
   let mut anchor = ()
-  let h = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, node)
+  let h = unsafe Pointer.borrowMut<(), CellLinks>(&mut anchor, unsafe HeapCell.links(node))
   let previous = h.previous
   let following = h.next
   h.previous = Pointer.null<HeapHeader>()
@@ -290,28 +311,61 @@ unsafe fn unlinkGc(runtime: *mut HeapHeader, node: *mut HeapHeader) -> () {
   drop h
   match Pointer.nonNullMut<HeapHeader>(previous) {
     Option<*mut HeapHeader>.Some { value } => {
-      let h = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, value)
+      let h = unsafe Pointer.borrowMut<(), CellLinks>(&mut anchor, unsafe HeapCell.links(value))
       h.next = following
     }
     Option<*mut HeapHeader>.None => {
       let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
-      if same(state.gcObjects.first, node) { state.gcObjects.first = following }
-      if same(state.temporaryGcObjects.first, node) { state.temporaryGcObjects.first = following }
-      if same(state.zeroReferenceObjects.first, node) { state.zeroReferenceObjects.first = following }
+      unsafe sameEnd(&mut state.gcObjects, node, previous, following, true)
+      unsafe sameEnd(&mut state.temporaryGcObjects, node, previous, following, true)
+      unsafe sameEnd(&mut state.zeroReferenceObjects, node, previous, following, true)
+      unsafe sameEnd(&mut state.zombieGcObjects, node, previous, following, true)
     }
   }
   match Pointer.nonNullMut<HeapHeader>(following) {
     Option<*mut HeapHeader>.Some { value } => {
-      let h = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, value)
+      let h = unsafe Pointer.borrowMut<(), CellLinks>(&mut anchor, unsafe HeapCell.links(value))
       h.previous = previous
     }
     Option<*mut HeapHeader>.None => {
       let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
-      if same(state.gcObjects.last, node) { state.gcObjects.last = previous }
-      if same(state.temporaryGcObjects.last, node) { state.temporaryGcObjects.last = previous }
-      if same(state.zeroReferenceObjects.last, node) { state.zeroReferenceObjects.last = previous }
+      unsafe sameEnd(&mut state.gcObjects, node, previous, following, false)
+      unsafe sameEnd(&mut state.temporaryGcObjects, node, previous, following, false)
+      unsafe sameEnd(&mut state.zeroReferenceObjects, node, previous, following, false)
+      unsafe sameEnd(&mut state.zombieGcObjects, node, previous, following, false)
     }
   }
+}
+
+/// A walk over every published GC cell of a runtime (qjs_stats): the cells may not
+/// change while it runs.
+pub struct CellWalk { arena: ?*mut u8, word: usize, bits: u64, linked: ?*mut HeapHeader }
+pub unsafe fn walkCells(runtime: *mut HeapHeader) -> CellWalk {
+  let arena = unsafe firstArena(runtime)
+  let mut bits: u64 = 0
+  if !Pointer.isNull<u8>(arena) { bits = unsafe memory.cellWord(unsafe present(arena), 0) }
+  return CellWalk { arena: arena, word: 0, bits: bits, linked: unsafe firstGc(runtime, 0) }
+}
+/// The walk's next cell, or null at its end.
+pub unsafe fn nextCell(walk: &mut CellWalk) -> ?*mut HeapHeader {
+  while !Pointer.isNull<u8>(walk.arena) {
+    let arena = unsafe present(walk.arena)
+    if walk.bits != 0 {
+      let bit = u64.trailingZeros(walk.bits)
+      walk.bits = u64.bitAnd(walk.bits, walk.bits - 1)
+      return unsafe cellIn(arena, walk.word, bit)
+    }
+    walk.word = walk.word + 1
+    if walk.word == memory.CELL_WORDS {
+      walk.arena = unsafe memory.nextCellArena(arena)
+      walk.word = 0
+      if Pointer.isNull<u8>(walk.arena) { break }
+    }
+    walk.bits = unsafe memory.cellWord(unsafe present(walk.arena), walk.word)
+  }
+  let node = walk.linked
+  if !Pointer.isNull<HeapHeader>(node) { walk.linked = unsafe linkedNext(unsafe nonnull(node)) }
+  return node
 }
 
 /// Publishes one fully initialized, detached GC cell. Its initial owned reference
@@ -322,8 +376,6 @@ pub unsafe fn publish(runtime: *mut HeapHeader, node: *mut HeapHeader) -> () {
     || k == HeapKind.VarRef || k == HeapKind.AsyncFunction || k == HeapKind.Context || k == HeapKind.Module)
   let mut anchor = ()
   let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, node)
-  // A spare cell revived where it was parked is still in gcObjects.
-  let linked = header.mark == MARK_LINKED
   header.mark = 0
   drop header
   if k == HeapKind.Module {
@@ -332,7 +384,7 @@ pub unsafe fn publish(runtime: *mut HeapHeader, node: *mut HeapHeader) -> () {
     drop module
   }
   unsafe noteFresh(runtime, node)
-  if !linked { unsafe appendGc(runtime, node) }
+  unsafe join(runtime, node)
 }
 
 /// Records node as allocated during a restricted debugger evaluation, the
@@ -350,12 +402,10 @@ unsafe fn noteFresh(runtime: *mut HeapHeader, node: *mut HeapHeader) -> () {
 pub unsafe fn publishObject(runtime: *mut HeapHeader, node: *mut HeapHeader) -> () {
   let mut anchor = ()
   let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, node)
-  // A spare cell revived where it was parked is still in gcObjects.
-  let linked = header.mark == MARK_LINKED
   header.mark = 0
   drop header
   unsafe noteFresh(runtime, node)
-  if !linked { unsafe appendGc(runtime, node) }
+  unsafe join(runtime, node)
 }
 
 /// Drops one strong reference without access to the engine, for an owning `Value`'s Drop
@@ -401,16 +451,14 @@ unsafe fn queueIfDead(node: *mut HeapHeader) -> () {
   let runtime = unsafe runtimeOf(node)
   // During cycle removal the collector owns every dead cell; queueing would double-free.
   if unsafe phase(runtime) == GcPhase.RemoveCycles { return () }
-  unsafe unlinkGc(runtime, node)
-  unsafe appendZero(runtime, node, true)
-  unsafe mark(node, 1)
+  unsafe queueZero(runtime, node, true)
 }
 
 /// Finalizes and frees every cell queued by `releaseDeferred`. Safe to call at any point
 /// that holds the engine and is outside a GC pass; it does nothing when the queue is empty.
 pub unsafe fn drainPending<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader) -> () {
   if unsafe phase(runtime) != GcPhase.None { return () }
-  if Pointer.isNull<HeapHeader>(unsafe firstGc(runtime, 2)) && unsafe zeroStackEmpty(runtime) { return () }
+  if unsafe zeroQueueEmpty(runtime) { return () }
   unsafe drainZero(&mut hooks, runtime)
 }
 
@@ -539,7 +587,7 @@ pub unsafe fn releaseLast<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader,
 }
 @inlineNever
 unsafe fn releaseLastShape<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node: *mut HeapHeader) -> () {
-  unsafe unlinkGc(runtime, node)
+  unsafe leave(runtime, node)
   // Cycle removal may be destroying this shape's prototype, so nothing is kept then.
   let mut doomed: ?*mut HeapHeader = node
   if unsafe phase(runtime) != GcPhase.RemoveCycles { doomed = unsafe js_shapes.park(runtime, node) }
@@ -647,7 +695,7 @@ pub unsafe fn receiverShape<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeade
     return unsafe refillReceiver(&mut hooks, runtime, function, slot)
   }
   // The version fixes the record at entry.index as a data property.
-  let prototype = (unsafe js_shapes.unchecked<SlotBits>(&data.properties, entry.index)).valueBits()
+  let prototype = (unsafe data.slotUnchecked(entry.index)).valueBits()
   drop data
   let empty = unsafe nonnull(entry.empty)
   let held = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, empty)).prototype
@@ -672,7 +720,7 @@ unsafe fn refillReceiver<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, 
     Option<usize>.None => { return Pointer.null<HeapHeader>() }
   }
   if (u8.toU32(shape.properties.get(index).flags) & JS_PROP_TMASK) != 0 { return Pointer.null<HeapHeader>() }
-  let prototype = match data.properties.get(index).valueBits() {
+  let prototype = match data.slot(index).valueBits() {
     ValueBits.Object { reference } => reference
     _ => { return Pointer.null<HeapHeader>() }
   }
@@ -750,7 +798,7 @@ pub unsafe fn plannedShape(runtime: *mut HeapHeader, function: *mut HeapHeader, 
   let final = unsafe nonnull(entry.final)
   let finalShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, final)
   // The version fixes the record at entry.index as a data property.
-  match (unsafe js_shapes.unchecked<SlotBits>(&data.properties, entry.index)).valueBits() {
+  match (unsafe data.slotUnchecked(entry.index)).valueBits() {
     ValueBits.Object { reference } => {
       if Pointer.address<HeapHeader>(reference) != Pointer.address<HeapHeader>(unsafe nonnull(finalShape.prototype)) { return missed }
     }
@@ -993,34 +1041,50 @@ pub unsafe fn flushParkedShapes<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapH
 }
 /// Entries in RuntimeState.zeroStack.
 pub const ZERO_STACK: usize = 256
-/// HeapHeader.mark of a dead object cell parked in the spare cells while still
-/// linked into gcObjects (see parkLinked).
-pub const MARK_LINKED: u8 = js_shapes.SPARE_CELL_LINKED
+/// HeapHeader.mark of a dead cell kept during cycle removal for its weak references
+/// or remaining counts, destroyed after the pass (destroyZombie).
+pub const MARK_ZOMBIE: u8 = 2
+/// HeapHeader.mark of a cell found reachable when the restore stack was full.
+const MARK_RESTORE: u8 = 3
 @inlineAlways
 unsafe fn enqueueZero<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader,
   node: *mut HeapHeader, markPending: bool) -> () {
   let current = unsafe phase(runtime)
   if current == GcPhase.RemoveCycles { return () }
-  // A dead object still in gcObjects (mark 0) waits on the zero stack, linked
-  // where it is: unlinking it reads and writes its list neighbours, cells from
-  // long ago that are rarely cached, and destroyObject may park it linked.
-  if unsafe kind(node) == HeapKind.Object && unsafe markOf(node) == 0 {
-    let mut anchor = ()
+  unsafe queueZero(runtime, node, markPending)
+  if current == GcPhase.None { unsafe drainZero(&mut hooks, runtime) }
+}
+/// Queues dead node for drainZero: on the zero stack, else (full) in its arena's
+/// scratch bits or, for a linked cell, on zeroReferenceObjects. Its membership stays.
+@inlineAlways
+unsafe fn queueZero(runtime: *mut HeapHeader, node: *mut HeapHeader, markPending: bool) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  let depth = u16.toUsize(state.zeroStackCount)
+  if depth < ZERO_STACK {
+    state.zeroStack[depth] = node
+    state.zeroStackCount = usize.toU16(depth + 1)
+    drop state
+    if markPending { unsafe mark(node, 1) }
+    return ()
+  }
+  drop state
+  unsafe overflowZero(runtime, node)
+  if markPending { unsafe mark(node, 1) }
+}
+@inlineNever
+unsafe fn overflowZero(runtime: *mut HeapHeader, node: *mut HeapHeader) -> () {
+  let mut anchor = ()
+  if unsafe HeapCell.isPooledCell(node) {
+    unsafe memory.setPending(unsafe blockAt(node))
+    unsafe listPending(runtime, unsafe memory.blockArena(unsafe blockAt(node)))
     let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
-    let depth = u16.toUsize(state.zeroStackCount)
-    if depth < ZERO_STACK {
-      state.zeroStack[depth] = node
-      state.zeroStackCount = usize.toU16(depth + 1)
-      drop state
-      unsafe mark(node, 1)
-      if current == GcPhase.None { unsafe drainZero(&mut hooks, runtime) }
-      return ()
-    }
+    state.zeroPending = state.zeroPending + 1
+    return ()
   }
   unsafe unlinkGc(runtime, node)
-  unsafe appendZero(runtime, node, true)
-  if markPending { unsafe mark(node, 1) }
-  if current == GcPhase.None { unsafe drainZero(&mut hooks, runtime) }
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  unsafe state.zeroReferenceObjects.pushFront(node)
 }
 /// The next cell on the zero stack, or null.
 @inlineAlways
@@ -1037,76 +1101,87 @@ unsafe fn zeroStackEmpty(runtime: *mut HeapHeader) -> bool {
   let anchor = ()
   return (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)).zeroStackCount == 0
 }
-/// Drains the zero stack and queue without recursive object destruction.
+@inlineAlways
+unsafe fn zeroQueueEmpty(runtime: *mut HeapHeader) -> bool {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  return state.zeroStackCount == 0 && state.zeroPending == 0 && state.zeroReferenceObjects.isEmpty()
+}
+/// Moves pooled dead cells marked in arena scratch bits back onto the zero stack,
+/// as many as fit. Only drainZero's overflow sets those bits outside a collection.
+@inlineNever
+unsafe fn refillZero(runtime: *mut HeapHeader) -> () {
+  let mut cursor = unsafe firstPendingArena(runtime)
+  while !Pointer.isNull<u8>(cursor) {
+    let arena = unsafe present(cursor)
+    let mut word: usize = 0
+    while word < memory.CELL_WORDS {
+      let mut bits = unsafe memory.pendingWord(arena, word)
+      while bits != 0 {
+        let mut anchor = ()
+        let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+        let depth = u16.toUsize(state.zeroStackCount)
+        if depth == ZERO_STACK || state.zeroPending == 0 { drop state unsafe memory.setPendingWord(arena, word, bits) return () }
+        let bit = u64.trailingZeros(bits)
+        bits = u64.bitAnd(bits, bits - 1)
+        state.zeroStack[depth] = unsafe cellIn(arena, word, bit)
+        state.zeroStackCount = usize.toU16(depth + 1)
+        state.zeroPending = state.zeroPending - 1
+      }
+      unsafe memory.setPendingWord(arena, word, 0)
+      word = word + 1
+    }
+    // Drained: later refills start past it. Only drainZero lists arenas outside a collection.
+    let mut anchor = ()
+    let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+    unsafe memory.popPendingArena(Pointer.fromMutRef<?*mut u8>(&mut state.gcPendingArenas))
+    drop state
+    cursor = unsafe firstPendingArena(runtime)
+  }
+  let anchor = ()
+  require((unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)).zeroPending == 0)
+}
+/// Drains the zero stack and queues without recursive object destruction.
 /// Reentrant releases only push work while Decrement is active. Caller must be
 /// at phase None.
 pub unsafe fn drainZero<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader) -> () {
   require(unsafe phase(runtime) == GcPhase.None)
   unsafe setPhase(runtime, GcPhase.Decrement)
   while true {
-    // Stacked cells first: they died most recently, like the queue's front.
+    // Stacked cells first: they died most recently.
     let stacked = unsafe popZeroStack(runtime)
     match Pointer.nonNullMut<HeapHeader>(stacked) {
       Option<*mut HeapHeader>.Some { value } => {
         require(unsafe count(value) == 0)
-        unsafe destroyObject(&mut hooks, runtime, value, true)
+        if unsafe kind(value) == HeapKind.Object { unsafe destroyObject(&mut hooks, runtime, value, true) }
+        else { unsafe destroyGc(&mut hooks, runtime, value) }
       }
       Option<*mut HeapHeader>.None => {
-        if Pointer.isNull<HeapHeader>(unsafe firstGc(runtime, 2)) { break }
-        let node = unsafe nonnull(unsafe firstGc(runtime, 2))
-        require(unsafe count(node) == 0)
-        unsafe destroyGc(&mut hooks, runtime, node)
+        if !Pointer.isNull<HeapHeader>(unsafe firstGc(runtime, 2)) {
+          let node = unsafe nonnull(unsafe firstGc(runtime, 2))
+          require(unsafe count(node) == 0)
+          unsafe destroyGc(&mut hooks, runtime, node)
+        } else {
+          let anchor = ()
+          let pending = (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)).zeroPending
+          if pending == 0 { break }
+          unsafe refillZero(runtime)
+        }
       }
     }
   }
   unsafe setPhase(runtime, GcPhase.None)
 }
-/// Unlinks every spare cell parked while linked (MARK_LINKED), so the passes
-/// over gcObjects see live cells only.
-unsafe fn unlinkParkedCells(runtime: *mut HeapHeader) -> () {
-  let mut anchor = ()
-  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
-  let counts = state.spareCellCounts
-  let available = state.spareCells.length()
-  drop state
-  // Only each bin's live prefix: a scan of all SPARE_CELLS * SPARE_BINS
-  // entries cost ~160K instructions per collection.
-  let mut bin: usize = 0
-  while bin < SPARE_BINS {
-    let mut index = bin * SPARE_CELLS
-    let mut end = index + counts[bin]
-    if end > available { end = available }
-    while index < end {
-      let cells = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
-      let cell = cells.spareCells.asSlice()[index]
-      drop cells
-      unsafe unlinkParked(runtime, unsafe nonnull(cell))
-      index = index + 1
-    }
-    bin = bin + 1
-  }
-  let mut index: usize = 0
-  let refs = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
-  let parkedRefs = u16.toUsize(refs.spareVarRefCount)
-  drop refs
-  while index < parkedRefs {
-    let entries = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
-    let cell = entries.spareVarRefs[index]
-    drop entries
-    unsafe unlinkParked(runtime, unsafe nonnull(cell))
-    index = index + 1
-  }
-}
-/// Takes a cell parked with MARK_LINKED out of gcObjects; others are unchanged.
-@inlineAlways
-pub unsafe fn unlinkParked(runtime: *mut HeapHeader, cell: *mut HeapHeader) -> () {
-  if unsafe markOf(cell) != MARK_LINKED { return () }
-  unsafe unlinkGc(runtime, cell)
-  unsafe mark(cell, 0)
-}
 
 /// Runs source weak cleanup before cycle collection. This deliberately does not
 /// sweep newly dead cycle targets until the NEXT weak pass, matching JS_RunGC.
+///
+/// Trial deletion over the runtime's GC cells, which are its arenas' cell bits
+/// (address order) plus the linked cells in gcObjects: decrement every child
+/// count; restore the children of every cell left with an outside count, and of
+/// every cell that restoring makes reachable; restore the counts held by the
+/// rest, then destroy them. Arena scratch bits mark the pooled cells the restore
+/// walk found without outside counts; temporaryGcObjects takes linked ones.
 pub unsafe effect fn collect<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader,
   removeWeakObjects: bool) -> () ? &mut Allocator {
   require(unsafe phase(runtime) == GcPhase.None)
@@ -1115,88 +1190,256 @@ pub unsafe effect fn collect<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHead
   unsafe releaseLiterals(&mut hooks, runtime)
   unsafe drainPending(&mut hooks, runtime)
   unsafe flushParkedShapes(&mut hooks, runtime)
-  require(Pointer.isNull<HeapHeader>(unsafe firstGc(runtime, 1)))
-  require(Pointer.isNull<HeapHeader>(unsafe firstGc(runtime, 2)) && unsafe zeroStackEmpty(runtime))
+  require(Pointer.isNull<HeapHeader>(unsafe firstGc(runtime, 1)) && Pointer.isNull<HeapHeader>(unsafe firstGc(runtime, 3)))
+  require(unsafe zeroQueueEmpty(runtime))
   unsafe HeapHooks.gcLifecycle(&mut hooks, runtime, 0)
   if removeWeakObjects { run unsafe sweepWeak(&mut hooks, runtime) }
-  // After sweepWeak, whose releases may park more cells.
-  unsafe unlinkParkedCells(runtime)
-  let mut tracer = Tracer { runtime: runtime, operation: MarkOperation.Decrement }
+  let mut stack = RestoreStack { cells: [Pointer.null<HeapHeader>(); 1024], depth: 0, overflowed: false }
+  let mut tracer = Tracer { runtime: runtime, operation: MarkOperation.Decrement, stack: Pointer.fromMutRef<RestoreStack>(&mut stack) }
   unsafe decrementPass(&mut hooks, runtime, &mut tracer)
   tracer.operation = MarkOperation.RestoreReachable
   unsafe restorePass(&mut hooks, runtime, &mut tracer)
-  // Restoring counts moves no node, so the order is free: walking back from the
-  // last node starts with the cells the passes above touched most recently,
-  // which are still cached when the heap is larger than the cache.
   tracer.operation = MarkOperation.RestoreUnreachable
-  let mut cursor = unsafe lastTemporary(runtime)
-  while !Pointer.isNull<HeapHeader>(cursor) {
-    let node = unsafe nonnull(cursor)
-    cursor = unsafe previous(node)
-    unsafe prefetchCell(unsafe previousOf(cursor))
-    unsafe traceRestoreUnreachable(&mut hooks, node, &mut tracer)
-  }
+  unsafe unreachablePass(&mut hooks, runtime, &mut tracer)
   unsafe setPhase(runtime, GcPhase.RemoveCycles)
-  while !Pointer.isNull<HeapHeader>(unsafe firstGc(runtime, 1)) {
-    let node = unsafe nonnull(unsafe firstGc(runtime, 1))
-    unsafe prefetchCell(unsafe nextOf(unsafe next(node)))
-    let k = unsafe kind(node)
-    if k == HeapKind.Object || k == HeapKind.FunctionBytecode || k == HeapKind.AsyncFunction || k == HeapKind.Module {
-      unsafe destroyGc(&mut hooks, runtime, node)
-    } else {
-      // Shapes/contexts/varrefs are released by their owning value/activation.
-      // Keep their headers alive and linked until that owner is finalized.
-      require(k == HeapKind.Shape || k == HeapKind.Context || k == HeapKind.VarRef)
-      unsafe unlinkGc(runtime, node)
-      unsafe appendZero(runtime, node, false)
-    }
-  }
+  unsafe removeCycles(&mut hooks, runtime)
   unsafe setPhase(runtime, GcPhase.None)
-  while !Pointer.isNull<HeapHeader>(unsafe firstGc(runtime, 2)) {
-    let node = unsafe nonnull(unsafe firstGc(runtime, 2))
-    unsafe unlinkGc(runtime, node)
-    unsafe destroyZombie(node)
-  }
+  unsafe destroyZombies(runtime)
   unsafe HeapHooks.gcLifecycle(&mut hooks, runtime, 1)
 }
-
-/// collect's first pass: subtract every internal edge, parking each cell whose
-/// count reaches zero. traceAs is inlined into each pass's loop: the passes
-/// run once per cell of the heap, and a call per cell costs a fifth of a pass.
+/// Pass 1: every member's children lose the counts it holds; members get mark 1.
 @inlineNever
 unsafe fn decrementPass<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, tracer: &mut Tracer) -> () {
-  let mut cursor = unsafe firstGc(runtime, 0)
-  while !Pointer.isNull<HeapHeader>(cursor) {
-    let node = unsafe nonnull(cursor)
-    // Later nodes cannot move until visited (mark==0), so this saved successor is
-    // stable even if a back edge moves an earlier node to the temporary list.
-    cursor = unsafe next(node)
-    // The successor's header was prefetched an iteration ago, so reading its
-    // link is cheap; prefetch the cell after it.
-    unsafe prefetchCell(unsafe nextOf(cursor))
-    unsafe traceAs(&mut hooks, node, &mut tracer, MarkOperation.Decrement)
+  let mut cursor = unsafe firstArena(runtime)
+  while !Pointer.isNull<u8>(cursor) {
+    let arena = unsafe present(cursor)
+    let mut word: usize = 0
+    while word < memory.CELL_WORDS {
+      let mut bits = unsafe memory.cellWord(arena, word)
+      while bits != 0 {
+        let node = unsafe cellIn(arena, word, u64.trailingZeros(bits))
+        bits = u64.bitAnd(bits, bits - 1)
+        if bits != 0 { unsafe prefetchCell(unsafe cellIn(arena, word, u64.trailingZeros(bits))) }
+        unsafe traceAs(&mut hooks, node, &mut tracer, MarkOperation.Decrement)
+        unsafe mark(node, 1)
+      }
+      word = word + 1
+    }
+    cursor = unsafe memory.nextCellArena(arena)
+  }
+  let mut linked = unsafe firstGc(runtime, 0)
+  while !Pointer.isNull<HeapHeader>(linked) {
+    let node = unsafe nonnull(linked)
+    linked = unsafe linkedNext(node)
+    unsafe traceDecrement(&mut hooks, node, &mut tracer)
     unsafe mark(node, 1)
-    if unsafe count(node) == 0 {
+  }
+}
+/// Restores the children of node, found reachable (mark 0), then of every cell
+/// that makes reachable in turn.
+@inlineAlways
+unsafe fn restoreFrom<H: HeapHooks>(hooks: &mut H, node: *mut HeapHeader, tracer: &mut Tracer) -> () {
+  unsafe traceAs(&mut hooks, node, &mut tracer, MarkOperation.RestoreReachable)
+  unsafe drainRestore(&mut hooks, &mut tracer)
+}
+@inlineNever
+unsafe fn drainRestore<H: HeapHooks>(hooks: &mut H, tracer: &mut Tracer) -> () {
+  while true {
+    let mut anchor = ()
+    let stack = unsafe Pointer.borrowMut<(), RestoreStack>(&mut anchor, tracer.stack)
+    if stack.depth == 0 { return () }
+    stack.depth = stack.depth - 1
+    let next = unsafe nonnull(stack.cells[stack.depth])
+    if stack.depth != 0 { unsafe prefetchCell(unsafe nonnull(stack.cells[stack.depth - 1])) }
+    drop stack
+    unsafe traceAs(&mut hooks, next, &mut tracer, MarkOperation.RestoreReachable)
+  }
+}
+/// Pass 2: a member still counted from outside (mark 1, count above zero) is
+/// reachable; so is everything it reaches. Pooled members left at zero for now
+/// get their scratch bit for the passes after this one.
+@inlineNever
+unsafe fn restorePass<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, tracer: &mut Tracer) -> () {
+  let mut cursor = unsafe firstArena(runtime)
+  while !Pointer.isNull<u8>(cursor) {
+    let arena = unsafe present(cursor)
+    let mut word: usize = 0
+    while word < memory.CELL_WORDS {
+      let mut bits = unsafe memory.cellWord(arena, word)
+      let mut uncounted: u64 = 0
+      while bits != 0 {
+        let bit = u64.trailingZeros(bits)
+        let node = unsafe cellIn(arena, word, bit)
+        bits = u64.bitAnd(bits, bits - 1)
+        if bits != 0 { unsafe prefetchCell(unsafe cellIn(arena, word, u64.trailingZeros(bits))) }
+        if unsafe markOf(node) == 1 {
+          if unsafe count(node) > 0 { unsafe mark(node, 0) unsafe restoreFrom(&mut hooks, node, &mut tracer) }
+          else { uncounted = u64.bitOr(uncounted, u64.shiftLeft(1, u32.toU64(bit))) }
+        }
+      }
+      if uncounted != 0 {
+        unsafe memory.setPendingWord(arena, word, u64.bitOr(unsafe memory.pendingWord(arena, word), uncounted))
+        unsafe listPending(runtime, arena)
+      }
+      word = word + 1
+    }
+    cursor = unsafe memory.nextCellArena(arena)
+  }
+  let mut linked = unsafe firstGc(runtime, 0)
+  while !Pointer.isNull<HeapHeader>(linked) {
+    let node = unsafe nonnull(linked)
+    linked = unsafe linkedNext(node)
+    if unsafe markOf(node) == 1 && unsafe count(node) > 0 { unsafe mark(node, 0) unsafe restoreFrom(&mut hooks, node, &mut tracer) }
+  }
+  while true {
+    let mut anchor = ()
+    let stack = unsafe Pointer.borrowMut<(), RestoreStack>(&mut anchor, tracer.stack)
+    if !stack.overflowed { return () }
+    stack.overflowed = false
+    drop stack
+    unsafe rescanRestore(&mut hooks, runtime, &mut tracer)
+  }
+}
+/// Restores the cells marked MARK_RESTORE when the restore stack was full.
+@inlineNever
+unsafe fn rescanRestore<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, tracer: &mut Tracer) -> () {
+  let mut cursor = unsafe firstArena(runtime)
+  while !Pointer.isNull<u8>(cursor) {
+    let arena = unsafe present(cursor)
+    let mut word: usize = 0
+    while word < memory.CELL_WORDS {
+      let mut bits = unsafe memory.cellWord(arena, word)
+      while bits != 0 {
+        let node = unsafe cellIn(arena, word, u64.trailingZeros(bits))
+        bits = u64.bitAnd(bits, bits - 1)
+        if unsafe markOf(node) == MARK_RESTORE {
+          unsafe mark(node, 0)
+          unsafe memory.clearPending(unsafe blockAt(node))
+          unsafe restoreFrom(&mut hooks, node, &mut tracer)
+        }
+      }
+      word = word + 1
+    }
+    cursor = unsafe memory.nextCellArena(arena)
+  }
+  let mut linked = unsafe firstGc(runtime, 0)
+  while !Pointer.isNull<HeapHeader>(linked) {
+    let node = unsafe nonnull(linked)
+    linked = unsafe linkedNext(node)
+    if unsafe markOf(node) == MARK_RESTORE { unsafe mark(node, 0) unsafe restoreFrom(&mut hooks, node, &mut tracer) }
+  }
+}
+/// Pass 3: what is still marked 1 is garbage. Restoring the counts its edges hold
+/// moves no cell; linked garbage moves to temporaryGcObjects.
+@inlineNever
+unsafe fn unreachablePass<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, tracer: &mut Tracer) -> () {
+  let mut cursor = unsafe firstPendingArena(runtime)
+  while !Pointer.isNull<u8>(cursor) {
+    let arena = unsafe present(cursor)
+    let mut word: usize = 0
+    while word < memory.CELL_WORDS {
+      let mut bits = unsafe memory.pendingWord(arena, word)
+      while bits != 0 {
+        let node = unsafe cellIn(arena, word, u64.trailingZeros(bits))
+        bits = u64.bitAnd(bits, bits - 1)
+        if bits != 0 { unsafe prefetchCell(unsafe cellIn(arena, word, u64.trailingZeros(bits))) }
+        if unsafe markOf(node) == 1 { unsafe traceAs(&mut hooks, node, &mut tracer, MarkOperation.RestoreUnreachable) }
+      }
+      word = word + 1
+    }
+    cursor = unsafe memory.nextPendingArena(arena)
+  }
+  let mut linked = unsafe firstGc(runtime, 0)
+  while !Pointer.isNull<HeapHeader>(linked) {
+    let node = unsafe nonnull(linked)
+    linked = unsafe linkedNext(node)
+    if unsafe markOf(node) == 1 {
       unsafe unlinkGc(runtime, node)
       unsafe appendTemporary(runtime, node)
+      unsafe traceRestoreUnreachable(&mut hooks, node, &mut tracer)
     }
   }
 }
-/// collect's second pass: restore the edges of every cell still counted,
-/// reviving the parked cells they reach onto the end of the list.
+/// Whether a garbage cell of kind k is destroyed by the collector; shapes,
+/// contexts, VarRefs and scopes go when their owning values release them.
+@inlineAlways
+fn valueKind(k: HeapKind) -> bool {
+  return k == HeapKind.Object || k == HeapKind.FunctionBytecode || k == HeapKind.AsyncFunction || k == HeapKind.Module
+}
+/// Pass 4 (phase RemoveCycles): destroys the garbage. A cell kept for weak
+/// references or counts still held by other garbage gets MARK_ZOMBIE and stays a
+/// member (pooled) or goes to zombieGcObjects (linked) until destroyZombies.
 @inlineNever
-unsafe fn restorePass<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, tracer: &mut Tracer) -> () {
-  let mut cursor = unsafe firstGc(runtime, 0)
-  while !Pointer.isNull<HeapHeader>(cursor) {
-    let node = unsafe nonnull(cursor)
-    require(unsafe count(node) > 0)
-    unsafe mark(node, 0)
-    unsafe prefetchCell(unsafe nextOf(unsafe next(node)))
-    unsafe traceAs(&mut hooks, node, &mut tracer, MarkOperation.RestoreReachable)
-    // Read AFTER tracing: newly reachable nodes append to this traversal.
-    cursor = unsafe next(node)
+unsafe fn removeCycles<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader) -> () {
+  let mut cursor = unsafe firstPendingArena(runtime)
+  while !Pointer.isNull<u8>(cursor) {
+    let arena = unsafe present(cursor)
+    let mut word: usize = 0
+    while word < memory.CELL_WORDS {
+      let mut bits = unsafe memory.pendingWord(arena, word)
+      while bits != 0 {
+        let node = unsafe cellIn(arena, word, u64.trailingZeros(bits))
+        bits = u64.bitAnd(bits, bits - 1)
+        // Destroying garbage frees other cells: only a cell still published counts.
+        if unsafe memory.isCell(unsafe blockAt(node)) && unsafe markOf(node) == 1 && valueKind(unsafe kind(node)) {
+          unsafe destroyGc(&mut hooks, runtime, node)
+        }
+      }
+      word = word + 1
+    }
+    cursor = unsafe memory.nextPendingArena(arena)
+  }
+  while !Pointer.isNull<HeapHeader>(unsafe firstGc(runtime, 1)) {
+    let node = unsafe nonnull(unsafe firstGc(runtime, 1))
+    unsafe unlinkGc(runtime, node)
+    unsafe appendZombie(runtime, node)
+    let k = unsafe kind(node)
+    if valueKind(k) { unsafe destroyGc(&mut hooks, runtime, node) }
+    // Shapes/contexts stay listed until their owning values release them.
+    else { require(k == HeapKind.Shape || k == HeapKind.Context || k == HeapKind.VarRef) }
   }
 }
+/// After cycle removal: frees the zombies, and clears the scratch bits.
+@inlineNever
+unsafe fn destroyZombies(runtime: *mut HeapHeader) -> () {
+  let mut cursor = unsafe firstPendingArena(runtime)
+  while !Pointer.isNull<u8>(cursor) {
+    let arena = unsafe present(cursor)
+    let mut word: usize = 0
+    while word < memory.CELL_WORDS {
+      let mut bits = unsafe memory.pendingWord(arena, word)
+      unsafe memory.setPendingWord(arena, word, 0)
+      while bits != 0 {
+        let node = unsafe cellIn(arena, word, u64.trailingZeros(bits))
+        bits = u64.bitAnd(bits, bits - 1)
+        if unsafe memory.isCell(unsafe blockAt(node)) {
+          let m = unsafe markOf(node)
+          // Every non-value garbage cell went with its owner.
+          require(m != 1 && m != MARK_RESTORE)
+          if m == MARK_ZOMBIE {
+            unsafe memory.removeCell(unsafe blockAt(node))
+            unsafe mark(node, 0)
+            unsafe destroyZombie(node)
+          }
+        }
+      }
+      word = word + 1
+    }
+    cursor = unsafe memory.nextPendingArena(arena)
+  }
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  unsafe memory.clearPendingList(Pointer.fromMutRef<?*mut u8>(&mut state.gcPendingArenas))
+  drop state
+  while !Pointer.isNull<HeapHeader>(unsafe firstGc(runtime, 3)) {
+    let node = unsafe nonnull(unsafe firstGc(runtime, 3))
+    unsafe unlinkGc(runtime, node)
+    require(unsafe markOf(node) == MARK_ZOMBIE)
+    unsafe mark(node, 0)
+    unsafe destroyZombie(node)
+  }
+}
+
 pub unsafe effect fn sweepWeak<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader) -> () ? &mut Allocator {
   require(unsafe phase(runtime) == GcPhase.None)
   unsafe setPhase(runtime, GcPhase.Decrement)
@@ -1252,6 +1495,10 @@ pub unsafe fn releaseProperty<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHea
 /// traceChildren specialized per collect pass: plain objects and fast arrays,
 /// the bulk of most heaps, trace their edges with the pass's count update inline.
 @inlineNever
+unsafe fn traceDecrement<H: HeapHooks>(hooks: &mut H, node: *mut HeapHeader, tracer: &mut Tracer) -> () {
+  unsafe traceAs(&mut hooks, node, &mut tracer, MarkOperation.Decrement)
+}
+@inlineNever
 unsafe fn traceRestoreUnreachable<H: HeapHooks>(hooks: &mut H, node: *mut HeapHeader, tracer: &mut Tracer) -> () {
   unsafe traceAs(&mut hooks, node, &mut tracer, MarkOperation.RestoreUnreachable)
 }
@@ -1289,7 +1536,7 @@ unsafe fn traceAs<H: HeapHooks>(hooks: &mut H, node: *mut HeapHeader, tracer: &m
   while index < propertyCount {
     let entry = unsafe js_shapes.unchecked<ShapeProperty>(&metadata.properties, index)
     if entry.atom != 0 {
-      let slot = unsafe js_shapes.unchecked<SlotBits>(&object.properties, index)
+      let slot = unsafe object.slotUnchecked(index)
       if (u8.toU32(entry.flags) & JS_PROP_TMASK) == 0 { unsafe tracer.valueAs(slot.valueBits(), operation) }
       else { unsafe traceProperty(slot.view(entry.flags), &mut tracer) }
     }
@@ -1378,8 +1625,8 @@ unsafe fn traceChildren<H: HeapHooks>(hooks: &mut H, node: *mut HeapHeader, trac
       while index < metadata.properties.length() {
         let entry = metadata.properties.get(index)
         if entry.atom != 0 {
-          if (u8.toU32(entry.flags) & JS_PROP_TMASK) == 0 { unsafe tracer.value(object.properties.get(index).valueBits()) }
-          else { unsafe traceProperty(object.properties.get(index).view(entry.flags), &mut tracer) }
+          if (u8.toU32(entry.flags) & JS_PROP_TMASK) == 0 { unsafe tracer.value(object.slot(index).valueBits()) }
+          else { unsafe traceProperty(object.slot(index).view(entry.flags), &mut tracer) }
         }
         index = index + 1
       }
@@ -1853,9 +2100,8 @@ unsafe fn releaseDraining<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader,
 unsafe fn destroyUnlinked<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node: *mut HeapHeader) -> () {
   unsafe destroyObject(&mut hooks, runtime, node, false)
 }
-/// linked: node is still in gcObjects (from the zero stack); a cell that parks
-/// can then stay there, marked MARK_LINKED. Otherwise it is in a GC list that
-/// destroyObject unlinks it from.
+/// linked: node comes from drainZero's stack (phase Decrement), so its dying
+/// children go straight onto the zero stack; otherwise it is cycle garbage.
 // Inlined: drainZero's loop runs it for nearly every dying object, and the
 // call's frame setup and spills were ~15% of its instructions.
 @inlineAlways
@@ -1868,8 +2114,8 @@ unsafe fn destroyObject<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, n
   let classId = object.classId()
   // A plain object's slots in its own cell start over its payload (a small cell,
   // js_object_allocate.slotsOverPayload).
-  let small = classId == JS_CLASS_OBJECT && object.properties.borrowsStorage()
-  let properties = Intrinsic.replace(object.properties, ThinList<SlotBits>.make())
+  let small = classId == JS_CLASS_OBJECT && object.slotsInCell()
+  let properties = object.takeSlots()
   let realm = object.creationRealm
   object.creationRealm = Pointer.null<HeapHeader>()
   drop object
@@ -1942,27 +2188,27 @@ unsafe fn destroyObject<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, n
   let weak = finalizedObject.weakRefCount
   drop finalizedObject
   // The properties were moved out and the payload reset to Empty above.
-  if linked && weak == 0 {
-    // Never during cycle removal: only drainZero's stack passes linked.
-    if unsafe parkCell(runtime, node, tail, small) { unsafe mark(node, MARK_LINKED) return () }
-  }
-  unsafe unlinkGc(runtime, node)
-  // A zombie kept for its weak references keeps its mark (see releaseWeak);
-  // a parked cell has mark 0, as reviveUninit keeps it.
+  // A parked cell has mark 0, as reviveUninit keeps it.
   if unsafe phase(runtime) == GcPhase.RemoveCycles {
-    if unsafe count(node) == 0 && weak == 0 { unsafe mark(node, 0) unsafe recycleObjectCell(runtime, node, tail, small) }
-    else { unsafe appendZero(runtime, node, false) }
-  } else {
+    // A zombie kept for its weak references or remaining counts stays a member
+    // (or on zombieGcObjects) until destroyZombies.
+    if unsafe count(node) != 0 || weak != 0 { unsafe mark(node, MARK_ZOMBIE) return () }
+    unsafe leave(runtime, node)
     unsafe mark(node, 0)
-    if weak == 0 { unsafe recycleObjectCell(runtime, node, tail, small) }
+    unsafe recycleObjectCell(runtime, node, tail, small)
+    return ()
   }
+  unsafe leave(runtime, node)
+  unsafe mark(node, 0)
+  // A zombie kept for its weak references is detached with mark 0 (see releaseWeak).
+  if weak == 0 { unsafe recycleObjectCell(runtime, node, tail, small) }
 }
 unsafe fn finishTyped(runtime: *mut HeapHeader, node: *mut HeapHeader) -> bool {
-  unsafe unlinkGc(runtime, node)
   if unsafe phase(runtime) == GcPhase.RemoveCycles && unsafe count(node) != 0 {
-    unsafe appendZero(runtime, node, false)
+    unsafe mark(node, MARK_ZOMBIE)
     return false
   }
+  unsafe leave(runtime, node)
   return true
 }
 unsafe fn destroyZombie(node: *mut HeapHeader) -> () {
@@ -2003,23 +2249,10 @@ unsafe fn destroyVarRef<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, n
       if asynchronous { unsafe releaseHeader(&mut hooks, runtime, unsafe nonnull(owner)) }
     }
   }
-  // A cell still in gcObjects (mark 0, outside cycle removal) parks there.
-  if unsafe markOf(node) == 0 && unsafe phase(runtime) != GcPhase.RemoveCycles && unsafe linkedIn(runtime, node)
-    && unsafe parkVarRef(runtime, node) {
-    unsafe mark(node, MARK_LINKED)
-    return ()
-  }
-  unsafe unlinkGc(runtime, node)
+  unsafe leave(runtime, node)
+  // Outside cycle removal a dead cell parks for reuse, unpublished.
+  if unsafe markOf(node) == 0 && unsafe phase(runtime) != GcPhase.RemoveCycles && unsafe parkVarRef(runtime, node) { return () }
   unsafe HeapCell.destroy<VarRef>(node)
-}
-/// Whether node is in a GC list (with mark 0: gcObjects).
-@inlineAlways
-unsafe fn linkedIn(runtime: *mut HeapHeader, node: *mut HeapHeader) -> bool {
-  let anchor = ()
-  let header = unsafe Pointer.borrow<(), HeapHeader>(&anchor, node)
-  if !Pointer.isNull<HeapHeader>(header.previous) || !Pointer.isNull<HeapHeader>(header.next) { return true }
-  drop header
-  return same((unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)).gcObjects.first, node)
 }
 /// Entries in RuntimeState.spareVarRefs.
 const SPARE_VAR_REFS: usize = 512
@@ -2044,15 +2277,12 @@ pub unsafe fn takeSpareVarRef(runtime: *mut HeapHeader) -> ?*mut HeapHeader {
   state.spareVarRefCount = usize.toU16(count - 1)
   return state.spareVarRefs[count - 1]
 }
-/// Frees every spare VarRef cell, unlinking any still in gcObjects.
+/// Frees every spare VarRef cell.
 pub unsafe fn flushSpareVarRefs(runtime: *mut HeapHeader) -> () {
   while true {
     let cell = unsafe takeSpareVarRef(runtime)
     match Pointer.nonNullMut<HeapHeader>(cell) {
-      Option<*mut HeapHeader>.Some { value } => {
-        unsafe unlinkParked(runtime, value)
-        unsafe HeapCell.destroy<VarRef>(value)
-      }
+      Option<*mut HeapHeader>.Some { value } => { unsafe HeapCell.destroy<VarRef>(value) }
       Option<*mut HeapHeader>.None => { return () }
     }
   }
@@ -2713,7 +2943,7 @@ unsafe fn destroyContext<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, 
   if same(state.contexts.first, node) { state.contexts.first = following }
   if same(state.contexts.last, node) { state.contexts.last = previous }
   drop state
-  unsafe unlinkGc(runtime, node)
+  unsafe leave(runtime, node)
   unsafe HeapCell.destroy<ContextState>(node)
 }
 
@@ -2905,7 +3135,16 @@ pub unsafe effect fn destroyRuntime<H: HeapHooks>(hooks: &mut H, runtime: *mut H
   }
   run unsafe collect(&mut hooks, runtime, false)
   let finalState = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
-  require(finalState.gcObjects.isEmpty() && finalState.zeroReferenceObjects.isEmpty() && finalState.temporaryGcObjects.isEmpty())
+  require(finalState.gcObjects.isEmpty() && finalState.zeroReferenceObjects.isEmpty() && finalState.temporaryGcObjects.isEmpty()
+    && finalState.zombieGcObjects.isEmpty() && finalState.zeroPending == 0)
+  let mut arenas = finalState.gcArenas
+  while !Pointer.isNull<u8>(arenas) {
+    let arena = unsafe present(arenas)
+    require(!unsafe memory.arenaHasCells(arena))
+    arenas = unsafe memory.nextCellArena(arena)
+  }
+  unsafe memory.clearPendingList(Pointer.fromMutRef<?*mut u8>(&mut finalState.gcPendingArenas))
+  unsafe memory.releaseCellArenas(Pointer.fromMutRef<?*mut u8>(&mut finalState.gcArenas))
   require(Pointer.isNull<HeapHeader>(finalState.contexts.first) && Pointer.isNull<WeakRefHeader>(finalState.weakReferences.first))
   let mut index: usize = 0
   while index < finalState.classes.length() {
