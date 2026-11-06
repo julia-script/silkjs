@@ -38,7 +38,8 @@ START_SENTINEL = -(1 << (8 * START_BYTES - 1))
 
 
 def tzif(data):
-    """Returns the initial offset, the (time, offset) transitions and the POSIX footer."""
+    """Returns the initial (offset, daylight) type, the (time, offset, daylight) transitions and the
+    POSIX footer."""
     if data[:4] != b'TZif' or data[4] < ord('2'):
         raise ValueError('expected a TZif version 2 or later file')
 
@@ -53,10 +54,10 @@ def tzif(data):
     at += time * 8
     indices = data[at:at + time]
     at += time
-    offsets = [struct.unpack_from('>lBB', data, at + 6 * index)[0] for index in range(types)]
+    offsets = [struct.unpack_from('>lBB', data, at + 6 * index)[:2] for index in range(types)]
     at += types * 6 + chars + leap * 12 + isstd + isut
     footer = data[at:].strip(b'\n').decode()
-    return offsets[0], [(t, offsets[i]) for t, i in zip(times, indices)], footer
+    return offsets[0], [(t, *offsets[i]) for t, i in zip(times, indices)], footer
 
 
 def seconds(text):
@@ -83,7 +84,8 @@ def day(year, month, week, weekday):
 
 
 def footer(text, start, end):
-    """The (time, offset) transitions the POSIX rule `text` implies in years `start` to `end`."""
+    """The (time, offset, daylight) transitions the POSIX rule `text` implies in years `start` to
+    `end`."""
     match = POSIX.fullmatch(text)
     if not match:
         raise ValueError(f'unsupported POSIX TZ footer: {text!r}')
@@ -91,28 +93,59 @@ def footer(text, start, end):
     if match[3] is None:
         return []
     daylight = -seconds(match[2]) if match[2] else standard + 3600
-    rules = [(match[3], match[4], match[5], match[6], standard, daylight), (match[7], match[8], match[9], match[10], daylight, standard)]
+    rules = [(match[3], match[4], match[5], match[6], standard, daylight, 1), (match[7], match[8], match[9], match[10], daylight, standard, 0)]
     out = []
     for year in range(start, end + 1):
-        for month, week, weekday, time, before, after in rules:
+        for month, week, weekday, time, before, after, isDaylight in rules:
             date = day(year, int(month), int(week), int(weekday))
             local = calendar.timegm((year, int(month), date, 0, 0, 0)) + seconds(time or '2')
-            out.append((local - before, after))
+            out.append((local - before, after, isDaylight))
     return sorted(out)
 
 
 def transitions(data):
+    """The (time, offset, daylight) offset changes of a zone, and the (time, daylight) changes of
+    daylight saving time alone, with the offset kept."""
     initial, listed, rule = tzif(data)
     last = listed[-1][0] if listed else calendar.timegm((1970, 1, 1, 0, 0, 0))
     year = time.gmtime(last).tm_year
     implied = [item for item in footer(rule, year, LAST_YEAR) if item[0] > last]
-    out = [(INT64_MIN, initial)]
-    for at, offset in listed + implied:
-        if at > calendar.timegm((LAST_YEAR, 12, 31, 23, 59, 59)):
+    rows = [(INT64_MIN, *initial)]
+    for row in listed + implied:
+        if row[0] > calendar.timegm((LAST_YEAR, 12, 31, 23, 59, 59)):
             break
-        if offset != out[-1][1]:
-            out.append((at, offset))
-    return out
+        if row[1:] != rows[-1][1:]:
+            rows.append(row)
+    rows = rearguard(rows)
+    # A transition is an offset change: Temporal reports those. A change of the daylight flag
+    # alone goes to the second list.
+    out = [rows[0]]
+    changes = []
+    current = rows[0][2]
+    for row in rows[1:]:
+        if row[1] != out[-1][1]:
+            out.append(row)
+            current = row[2]
+        elif row[2] != current:
+            changes.append((row[0], row[2]))
+            current = row[2]
+    return out, changes
+
+
+def rearguard(rows):
+    """Flips negative daylight saving time, as Ireland's winter GMT, to the positive form ICU
+    and CLDR use: the lower offset is standard time, and the higher one between two such
+    periods daylight time."""
+    negative = set()
+    for at, row in enumerate(rows):
+        neighbors = [n for n in (at - 1, at + 1) if 0 <= n < len(rows) and not rows[n][2]]
+        if row[2] and any(row[1] < rows[n][1] for n in neighbors):
+            negative.add(at)
+    flags = [0 if at in negative else row[2] for at, row in enumerate(rows)]
+    for at in range(1, len(rows) - 1):
+        if at not in negative and not rows[at][2] and at - 1 in negative and at + 1 in negative:
+            flags[at] = 1
+    return [(row[0], row[1], flag) for row, flag in zip(rows, flags)]
 
 
 def strings(out, name, entries):
@@ -153,11 +186,20 @@ def generate(package):
     starts = []
     counts = []
     for name in zoneNames:
-        table = transitions((zoneinfo / name).read_bytes())
-        counts.append((zones.index(RENAMED.get(name, name)), table))
+        table, changes = transitions((zoneinfo / name).read_bytes())
+        counts.append((zones.index(RENAMED.get(name, name)), table, changes))
     counts.sort()
-    tables = [table for _, table in counts]
-    offsetList = sorted({offset for table in tables for _, offset in table})
+    tables = [table for _, table, _ in counts]
+    daylightChanges = bytearray()
+    changeStarts = []
+    changeCount = 0
+    for zone, _, changes in counts:
+        changeStarts.append(changeCount)
+        for at, isDaylight in changes:
+            daylightChanges += struct.pack('<qb', at, isDaylight)
+            changeCount += 1
+    changeStarts.append(changeCount)
+    offsetList = sorted({offset for table in tables for _, offset, _ in table})
     offsetIndex = {offset: at for at, offset in enumerate(offsetList)}
     total = 0
     for table in tables:
@@ -166,11 +208,16 @@ def generate(package):
     if total >= 65536 or len(offsetList) >= 65536:
         raise ValueError('time zone data outgrew 16-bit indices')
     for table in tables:
-        for at, _ in table:
+        for at, _, _ in table:
             blob += (START_SENTINEL if at == INT64_MIN else at).to_bytes(START_BYTES, 'little', signed=True)
     for table in tables:
-        for _, offset in table:
+        for _, offset, _ in table:
             blob += struct.pack('<H', offsetIndex[offset])
+    daylight = bytearray((total + 7) // 8)
+    flat = [isDaylight for table in tables for _, _, isDaylight in table]
+    for at, isDaylight in enumerate(flat):
+        if isDaylight:
+            daylight[at // 8] |= 1 << (at % 8)
     for offset in offsetList:
         blob += struct.pack('<l', offset)
 
@@ -180,7 +227,7 @@ def generate(package):
            f'// Every UTC offset change through {LAST_YEAR}; the last offset holds after it.',
            '// IANA time zone data is in the public domain.',
            '//! Tables read by `temporal_timezone` and `js_intl_locale_info`.',
-           'import silk.collections.slice { Slice }', 'import silk.num.u8', 'import silk.num.i32', 'import silk.num.i64', '']
+           'import silk.collections.slice { Slice }', 'import silk.num.u8', 'import silk.num.i32', 'import silk.num.i64', 'import silk.num.usize', '']
     for name, count in [('zone', len(zones)), ('alias', len(aliases)), ('name', len(names)), ('region', len(regions))]:
         out.append(f'pub const ti_tz_{name}_count: i32 = {count}')
     out += [f'const TRANSITION_COUNT: usize = {total}', f'const OFFSET_COUNT: usize = {len(offsetList)}', '',
@@ -216,7 +263,19 @@ def generate(package):
             'pub fn tzTransitionOffset(id: i32, index: i32) -> i32 {',
             '  let data = transitions()',
             '  let slot = read16(data, TRANSITION_COUNT * ' + str(START_BYTES) + ' + i32.toUsize(transitionBase(id) + index) * 2)',
-            '  return i64.toI32(readSigned(data, TRANSITION_COUNT * ' + str(START_BYTES + 2) + ' + slot * 4, 4))', '}', '']
+            '  return i64.toI32(readSigned(data, TRANSITION_COUNT * ' + str(START_BYTES + 2) + ' + slot * 4, 4))', '}',
+            '/// One bit per transition, set where its offset is daylight saving time.',
+            "fn daylightBits() -> &'static [u8] {", '  return ' + compact(daylight), '}',
+            '/// Whether transition `index` of zone `id` starts daylight saving time.',
+            'pub fn tzTransitionIsDaylight(id: i32, index: i32) -> bool {',
+            '  let at = i32.toUsize(transitionBase(id) + index)',
+            '  return u8.toUsize(daylightBits()[at / 8]) / usize.shiftLeft(1, at % 8) % 2 == 1', '}',
+            '/// Changes of daylight saving time that keep the offset: per change its i64 UTC second and',
+            '/// new flag, by zone and time.',
+            "fn daylightChanges() -> &'static [u8] {", '  return ' + compact(daylightChanges), '}',
+            'pub fn tzDaylightChangeAt(index: i32) -> i64 { return readSigned(daylightChanges(), i32.toUsize(index) * 9, 8) }',
+            'pub fn tzDaylightChangeIsDaylight(index: i32) -> bool { return daylightChanges()[i32.toUsize(index) * 9 + 8] == 1 }', '']
+    ints('tzDaylightChangeBase', changeStarts)
     return '\n'.join(out)
 
 
