@@ -4,19 +4,19 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.mem.pointer { Pointer }
+import silk.mem.layout { Layout }
+import js_heap_snapshot_graph { Graph, Strength }
 import silk.num.usize
 import silk.core.ownership { Copy }
 import silk.core.option { Option }
 import js_heap { HeapCell, HeapHeader, HeapKind }
 import js_value { ValueBits }
-import js_owned_value { Value, ValueList, ValueRef, lendBits, immediateRef }
+import js_owned_value { Value, ValueList, ValueRef, lendBits }
 import js_object_ref { ObjectRef }
 import js_intl_realm as ops
-import js_realm { Realm, lendRealm, Arguments, lendArguments }
-import js_core_types { ObjectData, ObjectPayload, ObjectPayloadFamily, FrameSlots }
+import js_realm { Realm, Arguments }
+import js_core_types { ObjectData, ObjectPayload, ObjectPayloadFamily }
 import js_gc { HeapHooks, Tracer }
-import js_gc as gc
-import js_runtime as runtime
 import js_coercion_host { CoercionHooks }
 import js_property_host { OwnPropertyHooks, GetPropertyHooks }
 import js_call_host { CallHooks }
@@ -32,6 +32,18 @@ import js_exceptions { JsException }
 import runtime_memory { AllocationObserver }
 
 struct Concat { index: usize, count: usize, running: bool, iterator: Value, next: Value, pairs: ValueList }
+
+pub unsafe effect fn snapshot(graph: &mut Graph, owner: usize, reference: *mut HeapHeader) -> () ! OutOfMemoryError ? &mut Allocator {
+  let anchor = () let data = unsafe HeapCell.payload<Concat, ()>(&anchor, reference)
+  run unsafe graph.value(owner, data.iterator.view(), b"iterator", 0, Strength.Strong, usize.MAX)
+  run unsafe graph.value(owner, data.next.view(), b"next", 0, Strength.Strong, usize.MAX)
+  graph.backing(owner, data.pairs.capacity() * Layout.of<Value>().bytes)
+  let mut index = data.index
+  while index < data.count {
+    run unsafe graph.value(owner, data.pairs.get(index), b"iterable", index, Strength.Strong, usize.MAX)
+    index = index + 1
+  }
+}
 unsafe fn payload(object: *mut HeapHeader) -> ?*mut HeapHeader {
   let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
   return match &data.payload {
@@ -39,8 +51,9 @@ unsafe fn payload(object: *mut HeapHeader) -> ?*mut HeapHeader {
     _ => Pointer.null<HeapHeader>()
   }
 }
-unsafe fn nonnull(node: ?*mut HeapHeader) -> *mut HeapHeader {
-  return unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(node)
+/// The non-null pointer; traps on null.
+fn nonnull(node: ?*mut HeapHeader) -> *mut HeapHeader {
+  return match Pointer.nonNullMut<HeapHeader>(node) { Option<*mut HeapHeader>.Some { value: found } => found _ => Intrinsic.trap("unexpected null pointer") }
 }
 /// The Concat state an Iterator.concat object owns, lent for as long as the object.
 struct State<'a> { node: *mut HeapHeader }
@@ -143,6 +156,13 @@ effect fn advance<'a, 's, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetP
     advanced.index = index + 2
   }
 }
+effect fn closeInner<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + CallHooks + NativeFunctionHooks>(
+  hooks: &mut H, realm: Realm<'a>, iterator: ValueRef<'b>) -> () ! JsException ? &mut Allocator {
+  let method = run owners.get(&mut hooks, realm, iterator, atoms.JS_ATOM_return)
+  match method.view() { ValueBits.Undefined => { return () } ValueBits.Null => { return () } _ => () }
+  let result = unsafe Value.adoptBits(run support.callZero(&mut hooks, realm, method.borrow(), iterator))
+  if !result.view().isObject() { return run ops.error(&mut hooks,realm, b"iterator result is not an object") }
+}
 pub effect fn next<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + CallHooks + NativeFunctionHooks>(
   hooks: &mut H, realm: Realm<'a>, receiver: ValueRef<'b>, magic: i32) -> NativeIteratorResult ! JsException ? &mut Allocator {
   if !receiver.view().isObject() { return run ops.error(&mut hooks,realm, b"incompatible iterator receiver") }
@@ -157,23 +177,21 @@ pub effect fn next<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + Get
   let executing = state.running let iterator = state.iterator.view() drop state
   if executing { return run ops.error(&mut hooks,realm, b"already running") }
   if magic == 1 {
-    let mut returned = Result<ValueBits, JsException>.Success { value: ValueBits.Undefined }
+    // return() completes the concat iterator and closes the open inner iterator
+    // (IteratorClose): a missing return method is skipped, a throw propagates, and
+    // a non-object result is a TypeError. The result is always a fresh
+    // { value: undefined, done: true }, and the iterator stays completed even when
+    // closing fails.
+    let mut closed = Result<(), JsException>.Success { value: () }
     if !core.undefined(iterator) {
       running(&mut hooks, node, true)
-      let fetched = run Effect.result(owners.get(&mut hooks, realm, unsafe lendBits(&iterator, iterator), atoms.JS_ATOM_return))
-      let method = match move fetched {
-        Result<Value, JsException>.Success { value } => move value
-        Result<Value, JsException>.Failure { error } => { running(&mut hooks, node, false) fail move error }
-      }
-      returned = run Effect.result(support.callZero(&mut hooks, realm, method.borrow(), unsafe lendBits(&iterator, iterator)))
-      drop method running(&mut hooks, node, false)
+      closed = run Effect.result(closeInner(&mut hooks, realm, unsafe lendBits(&iterator, iterator)))
+      running(&mut hooks, node, false)
     }
     clearPairs(&mut hooks, node) clearCurrent(&mut hooks, node)
-    // Pinned concat.return leaves pdone FALSE and returns the unparsed return
-    // value, even before start; do not normalize it to generic helper semantics.
-    return match move returned {
-      Result<ValueBits, JsException>.Success { value } => NativeIteratorResult { value: value, done: 0 }
-      Result<ValueBits, JsException>.Failure { error } => { fail move error }
+    return match move closed {
+      Result<(), JsException>.Success { .. } => NativeIteratorResult { value: ValueBits.Undefined, done: 1 }
+      Result<(), JsException>.Failure { error } => { fail move error }
     }
   }
   running(&mut hooks, node, true)
@@ -181,19 +199,22 @@ pub effect fn next<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + Get
   running(&mut hooks, node, false)
   return match move result {
     Result<NativeIteratorResult, JsException>.Success { value } => move value
-    Result<NativeIteratorResult, JsException>.Failure { error } => { fail move error }
+    Result<NativeIteratorResult, JsException>.Failure { error } => {
+      // An abrupt step completes the iterator: nothing is stepped, opened or closed later.
+      clearPairs(&mut hooks, node) clearCurrent(&mut hooks, node) fail move error
+    }
   }
 }
 pub unsafe fn mark(object: *mut HeapHeader, tracer: &mut Tracer) -> () {
   let optional = unsafe payload(object) if Pointer.isNull<HeapHeader>(optional) { return }
-  let anchor = () let state = unsafe HeapCell.payload<Concat, ()>(&anchor, unsafe nonnull(optional))
+  let anchor = () let state = unsafe HeapCell.payload<Concat, ()>(&anchor, nonnull(optional))
   unsafe tracer.value(state.iterator.view()) unsafe tracer.value(state.next.view())
   let mut index: usize = 0
   while index < state.pairs.length() { unsafe tracer.value(state.pairs.get(index)) index = index + 1 }
 }
 pub unsafe fn finalize<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, object: *mut HeapHeader) -> () {
   let optional = unsafe payload(object) if Pointer.isNull<HeapHeader>(optional) { return }
-  let node = unsafe nonnull(optional) let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, object)
+  let node = nonnull(optional) let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, object)
   data.payload = ObjectPayload.Empty drop data
   unsafe HeapCell.destroy<Concat>(node)
 }

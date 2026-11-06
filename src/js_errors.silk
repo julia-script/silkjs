@@ -10,13 +10,12 @@ import silk.collections.slice { Slice }
 import silk.num.u32
 import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
-import js_owned_value { ValueRef, lendBits, immediateRef }
-import js_realm { Realm, lendRealm }
-import js_core_types { ContextState, RuntimeState, ObjectData, PropertySlot, SlotBits, NativeErrorKind,
-  JS_PROP_WRITABLE, JS_PROP_CONFIGURABLE }
+import js_owned_value { ValueRef, lendBits }
+import js_realm { Realm }
+import js_core_types { ContextState, RuntimeState, ObjectData, ObjectPayload, PropertySlot, SlotBits, NativeErrorKind,
+  JS_PROP_WRITABLE, JS_PROP_CONFIGURABLE, JS_PROP_GETSET }
 import js_gc { HeapHooks }
 import js_gc as gc
-import js_runtime as runtime
 import js_object_allocate as objects
 import js_shapes as shapes
 import js_shapes { AddResult }
@@ -25,6 +24,7 @@ import js_atom_data as atoms
 import js_strings { Strings, StringBuilder }
 import js_string_types { StringLengthError }
 import js_backtrace as trace
+import js_node_stack as nodeStack
 import js_error_host { ErrorHooks }
 import js_exceptions { JsException }
 import js_exceptions as exceptions
@@ -182,13 +182,84 @@ effect fn finishStack<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserv
     }
   }
 }
+// Conversion happens only at the engine's own stack attachment boundary. Frames
+// remain private and immutable until the first successful native accessor read.
+effect fn makeNodeStackLazy<'a, 'b, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>,
+  object: ValueRef<'b>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let rt = realm.runtime()
+  let anchor = ()
+  let ctx = realm.state(&anchor)
+  let getter = ctx.nodeErrorStackGetter
+  let setter = ctx.nodeErrorStackSetter
+  drop ctx
+  if !getter.isObject() { return () }
+  let node = match object.view() { ValueBits.Object { reference } => reference _ => { return () } }
+  let mut objectAnchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut objectAnchor, node)
+  if data.classId() != classes.JS_CLASS_ERROR { return () }
+  let index = match unsafe shapes.lookup(data.shape, atoms.JS_ATOM_stack) {
+    Option<usize>.Some { value } => value
+    Option<usize>.None => { return () }
+  }
+  let flags = unsafe shapes.slotFlags(data.shape, index)
+  let stack = match data.properties.get(index).view(flags) {
+    PropertySlot.Value { value } => value
+    _ => { return () }
+  }
+  if (flags & u32.toU8(JS_PROP_CONFIGURABLE)) == 0 { return () }
+  run unsafe shapes.updateFlags(rt, &mut data, index, u32.toU8(JS_PROP_CONFIGURABLE | JS_PROP_GETSET))
+  let getterNode = match getter { ValueBits.Object { reference } => reference _ => invalidFreshObject() }
+  let setterNode = match setter { ValueBits.Object { reference } => reference _ => invalidFreshObject() }
+  unsafe HeapCell.retain(getterNode)
+  unsafe HeapCell.retain(setterNode)
+  data.properties.set(index, SlotBits.from(PropertySlot.GetterSetter { getter: getterNode, setter: setterNode }))
+  let previous = Intrinsic.replace(data.payload, ObjectPayload.ErrorStack { value: stack, cached: false })
+  drop data
+  match move previous {
+    ObjectPayload.Empty => ()
+    ObjectPayload.ErrorStack { value, .. } => unsafe gc.release(&mut hooks, rt, value)
+    _ => invalidFreshObject()
+  }
+}
+effect fn nodeStackLazy<'a, 'b, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
+  realm: Realm<'a>, object: ValueRef<'b>) -> () ? &mut Allocator {
+  let result = run Effect.result(makeNodeStackLazy(&mut hooks, realm, object))
+  match move result {
+    Result<(), OutOfMemoryError>.Success { .. } => ()
+    Result<(), OutOfMemoryError>.Failure { .. } =>
+      run Effect.catchAll(outOfMemory(&mut hooks, memory, realm), ignoreException)
+  }
+}
+fn nodeStacksEnabled<'a>(realm: Realm<'a>) -> bool {
+  let anchor = ()
+  let state = realm.state(&anchor)
+  return state.nodeErrorFormatter.isObject()
+}
+effect fn capturedNodeStack<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
+  realm: Realm<'a>, flags: u32) -> ValueBits ? &mut Allocator {
+  let count = match unsafe nodeStack.limit(realm.context()) {
+    Option<usize>.Some { value } => value
+    Option<usize>.None => { return ValueBits.Undefined }
+  }
+  let captured = run Effect.result(unsafe nodeStack.capture(&mut hooks, memory, realm.context(),
+    count, ValueBits.Undefined, (flags & trace.SKIP_FIRST_LEVEL) != 0))
+  return run stringResult(&mut hooks, memory, realm, move captured)
+}
 effect fn freshBacktrace<'a, 'b, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,realm: Realm<'a>, object: ValueRef<'b>) -> () ? &mut Allocator {
   let rt = realm.runtime()
+  if nodeStacksEnabled(realm) {
+    let captured = run capturedNodeStack(&mut hooks, memory, realm, 0)
+    if captured.isException() { return () }
+    run Effect.catchAll(unsafe defineFresh(&mut hooks, memory, realm, object, atoms.JS_ATOM_stack, captured), ignoreException)
+    run nodeStackLazy(&mut hooks, memory, realm, object)
+    return ()
+  }
   let mut builder = StringBuilder.make()
   let appended = run Effect.result(unsafe trace.appendFrames(rt, &mut builder, 0))
   let buffered = bufferStatus(move appended)
   let stack = run finishStack(&mut hooks, memory, realm, move builder, buffered)
   run Effect.catchAll(unsafe defineFresh(&mut hooks, memory, realm, object, atoms.JS_ATOM_stack, stack), ignoreException)
+  run nodeStackLazy(&mut hooks, memory, realm, object)
 }
 effect fn installError<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,realm: Realm<'a>, kind: NativeErrorKind, message: &[u8], addBacktrace: bool) -> ()
   ! JsException ? &mut Allocator { let context = realm.context()
@@ -255,6 +326,13 @@ pub effect fn buildBacktrace<'a, 'b, H: HeapHooks + ErrorHooks>(hooks: &mut H,
   filename: Option<ValueBits>, line: i32, column: i32, flags: u32) -> () ? &mut Allocator {
   if !object.view().isObject() { return () }
   let rt = realm.runtime()
+  if nodeStacksEnabled(realm) {
+    let captured = run capturedNodeStack(&mut hooks, memory, realm, flags)
+    if captured.isException() { return () }
+    let attached = run unsafe defineAttached(&mut hooks, realm, object, atoms.JS_ATOM_stack, captured)
+    if attached { run nodeStackLazy(&mut hooks, memory, realm, object) }
+    return ()
+  }
   let mut builder = StringBuilder.make()
   let mut source = Option<ValueBits>.none()
   match &filename {
@@ -280,6 +358,7 @@ pub effect fn buildBacktrace<'a, 'b, H: HeapHooks + ErrorHooks>(hooks: &mut H,
   }
   let stack = run finishStack(&mut hooks, memory, realm, move builder, buffered)
   let attached = run unsafe defineAttached(&mut hooks, realm, object, atoms.JS_ATOM_stack, stack)
+  if attached { run nodeStackLazy(&mut hooks, memory, realm, object) }
 }
 
 pub effect fn throwStackOverflow<'a, H: HeapHooks>(hooks: &mut H,

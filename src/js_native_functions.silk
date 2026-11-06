@@ -22,7 +22,7 @@ import silk.num.usize
 import runtime_memory { AllocationObserver }
 import js_heap { HeapCell, HeapHeader, HeapKind }
 import js_value { ValueBits }
-import js_owned_value { ValueRef, lendBits, immediateRef, lendFor }
+import js_owned_value { Value, ValueRef, lendBits, immediateRef, lendFor }
 import js_object_ref { ObjectRef }
 import js_intl_realm as ops
 import js_realm { Realm, lendRealm, Arguments, lendArguments }
@@ -56,6 +56,7 @@ import js_array_intrinsics_support as arraySupport
 import js_strings { Strings }
 import js_unit_strings as unitStrings
 import native_stack { currentFrameAddress }
+import js_debugger_restricted as restricted
 /// Failures caught without wrapping the success in a Result (see js_caught).
 struct FailedOomLength { error: OutOfMemoryError | StringLengthError }
 effect fn failedOomLength(error: OutOfMemoryError | StringLengthError) -> FailedOomLength { return FailedOomLength { error: move error } }
@@ -65,7 +66,6 @@ struct HostFailed { error: OutOfMemoryError | JsException }
 effect fn hostFailed(error: OutOfMemoryError | JsException) -> HostFailed { return HostFailed { error: move error } }
 struct TextFailed { error: OutOfMemoryError | StringLengthError | JsException }
 effect fn textFailed(error: OutOfMemoryError | StringLengthError | JsException) -> TextFailed { return TextFailed { error: move error } }
-
 
 fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
 fn reference(value: ValueBits) -> *mut HeapHeader {
@@ -363,6 +363,7 @@ pub effect fn callPlain<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks 
   if !magical && protocol != NativeCallProtocol.Generic { return Option<ValueBits>.none() }
   let argc = arguments.length()
   if argc < length { return Option<ValueBits>.none() }
+  run unsafe restricted.deny(realm.context())
   let rt = realm.runtime()
   if unsafe runtime.checkStackOverflow(rt, currentFrameAddress(), length * Layout.of<ValueBits>().bytes, true) { return Option<ValueBits>.none() }
   let empty = unsafe Intrinsic.pointerRequalify<[*]mut ValueBits, *mut ValueBits>(unsafe Intrinsic.stackAllocate<ValueBits>(0))
@@ -376,6 +377,8 @@ pub effect fn callPlain<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks 
   let emptyRefs = unsafe Intrinsic.pointerRequalify<[*]mut ?*mut HeapHeader, *mut ?*mut HeapHeader>(unsafe Intrinsic.stackAllocate<?*mut HeapHeader>(0))
   let framePointer = unsafe Intrinsic.pointerRequalify<[*]mut StackFrame, *mut StackFrame>(unsafe Intrinsic.stackAllocate<StackFrame>(1))
   unsafe Pointer.put<StackFrame>(framePointer, StackFrame {
+    debuggerId: 0,
+    thisValue: receiver.view(), newTarget: ValueBits.Undefined,
     previous: previous, asyncOwner: Pointer.null<HeapHeader>(), currentFunction: function.view(),
     arguments: FrameSlots { data: data, count: argc },
     locals: FrameSlots { data: empty, count: 0 }, stack: FrameSlots { data: empty, count: 0 },
@@ -636,16 +639,17 @@ unsafe effect fn quickPush<'a, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>, re
     let pushed = unsafe arraySupport.pushOne(receiver, value)
     if pushed >= 0 { return Option<ValueBits>.some(ValueBits.Int { value: i64.toI32(pushed) }) }
   }
-  let count = unsafe arraySupport.fastCount(receiver)
-  if count < 0 || unsafe arraySupport.intLength(receiver) != count || !unsafe arraySupport.writableLength(receiver)
+  let held = unsafe lendBits(&receiver, receiver)
+  let count = arraySupport.fastCount(held)
+  if count < 0 || arraySupport.intLength(held) != count || !arraySupport.writableLength(held)
     || !unsafe properties.canExtendFast(reference(receiver)) { return Option<ValueBits>.none() }
   let newLength = count + usize.toI64(argv.length())
   if newLength > 2147483647 { return Option<ValueBits>.none() }
-  let reserved = run Effect.result(arraySupport.reserve(&mut hooks, realm, unsafe lendBits(&receiver, receiver), newLength))
+  let reserved = run Effect.result(arraySupport.reserve(&mut hooks, realm, held, newLength))
   if let Result<(), OutOfMemoryError>.Failure { error } = move reserved { drop error return Option<ValueBits>.none() }
   let mut index: usize = 0
-  while index < argv.length() { run unsafe arraySupport.appendReserved(receiver, unsafe (unsafe argv.get(index)).retained()) index = index + 1 }
-  unsafe arraySupport.publishLength(receiver, newLength)
+  while index < argv.length() { run arraySupport.appendReserved(held, unsafe Value.retain(unsafe argv.get(index))) index = index + 1 }
+  arraySupport.publishLength(held, newLength)
   return Option<ValueBits>.some(ValueBits.Int { value: i64.toI32(newLength) })
 }
 /// objectMethod's answers: a builtin the VM answers without a frame when it is
@@ -656,6 +660,8 @@ pub const OBJECT_METHOD_FROM_CHAR_CODE: u8 = 2
 pub const OBJECT_METHOD_POP: u8 = 3
 /// A Map, Set, WeakMap or WeakSet method: quickCollection decides.
 pub const OBJECT_METHOD_COLLECTION: u8 = 4
+/// A Math method: mathCall answers it through quickMath when its arguments are numbers.
+pub const OBJECT_METHOD_MATH: u8 = 5
 /// Which of Array.prototype.push and String.fromCharCode function is, if either.
 @inlineAlways
 pub unsafe fn objectMethod(function: ValueBits) -> u8 {
@@ -669,12 +675,29 @@ pub unsafe fn objectMethod(function: ValueBits) -> u8 {
         else if family == BuiltinFamily.Array && method == ARRAY_POP && native.protocol == NativeCallProtocol.GenericMagic { OBJECT_METHOD_POP }
         else if family == BuiltinFamily.Map || family == BuiltinFamily.Set || family == BuiltinFamily.WeakMap || family == BuiltinFamily.WeakSet { OBJECT_METHOD_COLLECTION }
         else if family == BuiltinFamily.String && method == stringIds.FROM_CHAR_CODE && native.protocol != NativeCallProtocol.Data { OBJECT_METHOD_FROM_CHAR_CODE }
+        else if family == BuiltinFamily.Math && native.protocol != NativeCallProtocol.Data { OBJECT_METHOD_MATH }
         else { OBJECT_METHOD_NONE }
       }
       _ => OBJECT_METHOD_NONE
     }
     _ => OBJECT_METHOD_NONE
   }
+}
+/// Math.method(argv) for a function objectMethod classified OBJECT_METHOD_MATH:
+/// quickMath's answer, or Uninitialized when an argument is not a number.
+pub unsafe fn mathCall(function: ValueBits, argv: FrameSlots) -> ValueBits {
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(function))
+  let mut method: u32 = 0
+  let mut found = false
+  match &object.payload {
+    ObjectPayload.NativeFunction { function: native } => {
+      if let NativeFunctionId.Builtin { family, method: id } = native.function { method = id found = true }
+    }
+    _ => ()
+  }
+  drop object
+  if !found { return ValueBits.Uninitialized }
+  return quickMath(method, argv)
 }
 /// get, has and delete (one argument) or set and add (two) of a Map, Set,
 /// WeakMap or WeakSet called as a method (objectMethod's COLLECTION): the
@@ -738,6 +761,48 @@ pub unsafe fn isCharCodeAt(function: ValueBits) -> bool {
     _ => false
   }
 }
+/// Whether function is an intrinsic Number.prototype method, which quickWrite
+/// answers on a number receiver (or declines, for the full call).
+pub unsafe fn isNumberMethod(function: ValueBits) -> bool {
+  let object = match function { ValueBits.Object { reference } => reference _ => { return false } }
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  if data.classId() != classes.JS_CLASS_C_FUNCTION { return false }
+  return match &data.payload {
+    ObjectPayload.NativeFunction { function: native } => native.protocol != NativeCallProtocol.Data && match native.function {
+      NativeFunctionId.Builtin { family, method } => family == BuiltinFamily.Number
+      _ => false
+    }
+    _ => false
+  }
+}
+/// quickWrite's Number answer for function, an isNumberMethod builtin, called on
+/// the number receiver with argument (Undefined when absent). Uninitialized
+/// declines. Inlined into the VM's numberInline, which owns the frame.
+@inlineAlways
+pub unsafe effect fn numberMethodCall(function: ValueBits, receiver: ValueBits, argument: ValueBits) -> ValueBits ? &mut Allocator {
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(function))
+  let mut method: u32 = 0 let mut protocol = NativeCallProtocol.Data let mut realm = Pointer.null<HeapHeader>()
+  match &object.payload {
+    ObjectPayload.NativeFunction { function: native } => {
+      if let NativeFunctionId.Builtin { family, method: id } = native.function {
+        if family == BuiltinFamily.Number { method = id protocol = native.protocol realm = native.realm() }
+      }
+    }
+    _ => ()
+  }
+  drop object
+  if protocol == NativeCallProtocol.Data { return ValueBits.Uninitialized }
+  if method == NUMBER_TO_STRING {
+    if protocol != NativeCallProtocol.GenericMagic { return ValueBits.Uninitialized }
+    if let ValueBits.Int { value: number } = receiver {
+      let decimal = match argument { ValueBits.Undefined => true ValueBits.Int { value: radix } => radix == 10 _ => false }
+      if decimal {
+        return match move run integerText(realm, number) { Option<ValueBits>.Some { value } => value Option<ValueBits>.None => ValueBits.Uninitialized }
+      }
+    }
+  }
+  return run numberIntrinsics.quickFormatBits(method, receiver, argument)
+}
 /// receiver.charCodeAt(value) for the intrinsic method (isCharCodeAt): the
 /// code unit when receiver is a flat string and value an Int index inside it,
 /// else -1 to decline (ropes, other receivers and out-of-range indices take the
@@ -753,13 +818,14 @@ pub unsafe fn charCodeOf(receiver: ValueBits, value: ValueBits) -> i32 {
 /// Array.prototype.pop on a fast Array whose writable length matches its dense
 /// count: remove the last value and publish the new length, with no frame.
 pub unsafe fn quickPop(receiver: ValueBits) -> Option<ValueBits> {
-  let count = unsafe arraySupport.fastCount(receiver)
-  if count < 0 || unsafe arraySupport.intLength(receiver) != count || !unsafe arraySupport.writableLength(receiver) {
+  let held = unsafe lendBits(&receiver, receiver)
+  let count = arraySupport.fastCount(held)
+  if count < 0 || arraySupport.intLength(held) != count || !arraySupport.writableLength(held) {
     return Option<ValueBits>.none()
   }
   if count == 0 { return Option<ValueBits>.some(ValueBits.Undefined) }
-  let removed = unsafe arraySupport.popFast(receiver, false)
-  unsafe arraySupport.publishLength(receiver, count - 1)
+  let removed = arraySupport.popFast(held, false).intoBits()
+  arraySupport.publishLength(held, count - 1)
   return Option<ValueBits>.some(removed)
 }
 /// The decimal text of an Int for Number.prototype.toString: the realm's cached
@@ -773,11 +839,34 @@ effect fn integerText(realm: ?*mut HeapHeader, number: i32) -> Option<ValueBits>
       if let Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value: digit } = move cached { return Option<ValueBits>.some(digit) }
     }
   }
+  if let Option<*mut HeapHeader>.Some { value } = Pointer.nonNullMut<HeapHeader>(realm) {
+    let recent = run Effect.result(unitStrings.integer(unsafe lendRealm(&value, value), number))
+    return match move recent {
+      Result<ValueBits, OutOfMemoryError>.Success { value: text } => Option<ValueBits>.some(text)
+      Result<ValueBits, OutOfMemoryError>.Failure { error } => { drop error Option<ValueBits>.none() }
+    }
+  }
   let made = run Effect.result(Strings.fromInteger(number))
   return match move made {
     Result<ValueBits, OutOfMemoryError>.Success { value: text } => Option<ValueBits>.some(text)
     Result<ValueBits, OutOfMemoryError>.Failure { error } => { drop error Option<ValueBits>.none() }
   }
+}
+/// String(n) for an Int n, called as a function on the intrinsic String
+/// constructor: its decimal text, which quickInline answers before trying the
+/// general quick and quickWrite dispatch. None declines (another callee or
+/// argument, or allocation failure, which the full call then reports).
+@inlineAlways
+pub effect fn stringOfInteger(target: &QuickTarget, argv: &FrameSlots) -> Option<ValueBits> ? &mut Allocator {
+  if target.protocol != NativeCallProtocol.ConstructorOrFunction { return Option<ValueBits>.none() }
+  let number = match unsafe argv.get(0) { ValueBits.Int { value } => value _ => { return Option<ValueBits>.none() } }
+  match target.id {
+    NativeFunctionId.Builtin { family, method } => {
+      if family != BuiltinFamily.String || method != stringIds.CONSTRUCTOR { return Option<ValueBits>.none() }
+    }
+    _ => { return Option<ValueBits>.none() }
+  }
+  return run integerText(target.realm, number)
 }
 /// `n.toString()` on an Int n when function is the intrinsic
 /// Number.prototype.toString: the VM answers get_field2 + call_method 0 with
@@ -907,6 +996,7 @@ pub unsafe effect fn quickWrite<H: HeapHooks + CoercionHooks + NativeFunctionHoo
 pub effect fn call<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + NativeFunctionHooks>(
   hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, function: ValueRef<'b>,
   receiver: ValueRef<'b>, args: Arguments<'a>, flags: i32) -> ValueBits ! JsException ? &mut Allocator { let arguments = args.slots()
+  run unsafe restricted.deny(realm.context())
   let rt = realm.runtime()
   let native = unsafe callData(function.view())
   let id = native.function let protocol = native.protocol let magic = native.magic
@@ -956,6 +1046,8 @@ pub effect fn call<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + Pro
   // Raw stack storage: every slot range is Borrowed, so the frame needs no drop glue.
   let framePointer = unsafe Intrinsic.pointerRequalify<[*]mut StackFrame, *mut StackFrame>(unsafe Intrinsic.stackAllocate<StackFrame>(1))
   unsafe Pointer.put<StackFrame>(framePointer, StackFrame {
+    debuggerId: 0,
+    thisValue: receiver.view(), newTarget: if (flags & u32.toI32(JS_CALL_FLAG_CONSTRUCTOR)) != 0 { receiver.view() } else { ValueBits.Undefined },
     previous: previous, asyncOwner: Pointer.null<HeapHeader>(), currentFunction: function.view(),
     arguments: FrameSlots { data: data, count: count },
     locals: FrameSlots { data: empty, count: 0 }, stack: FrameSlots { data: empty, count: 0 },

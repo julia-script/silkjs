@@ -4,12 +4,10 @@
 //! addGlobalVariables (isEval), before resolving children and this function.
 //! Compiler trees and their runtime are exclusively borrowed; no GC hooks run.
 import thin_list { ThinList }
-import silk.core.option { Option }
 import silk.collections.slice { Slice }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
-import silk.mem.pointer { Pointer }
 import silk.collections.list { List }
 import silk.num.i32
 import silk.num.u8
@@ -21,14 +19,16 @@ import js_heap { HeapHeader, HeapCell }
 import js_atoms { AtomTable }
 import js_atom_data as atoms
 import js_opcode_data as op
-import js_core_types { RuntimeState, ModuleDef, ExportBinding, FunctionBytecode, ClosureVar, ClosureKind, VariableKind, JS_MODE_STRICT, linkedModule }
+import js_core_types { RuntimeState, ExportBinding, FunctionBytecode, ClosureVar, ClosureKind, VariableKind, JS_MODE_STRICT, linkedModule }
 import js_compiler_types { FunctionDef, FunctionId, FunctionTree, linked, CompilerVar, GlobalVar, CompilerError, CompilerErrorKind, ARGUMENT_VAR_OFFSET, ARG_SCOPE_END }
 import js_compiler_state as state
 import js_compiler_emit as emit
 import js_compiler_code { CodeContext, matchCode, M2, opcode, skipDeadCode, getLabelPosition, signedWord, unsignedWord }
 import js_string_types { StringLengthError }
+import js_debug_positions { PcSourcePosition }
+import js_debugger_metadata { Location, ClosureScope }
+import js_invariant { present }
 
-fn present(value: ?*mut HeapHeader) -> *mut HeapHeader { return unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(value) }
 fn globalKind(kind: ClosureKind) -> bool { return kind == ClosureKind.Global || kind == ClosureKind.GlobalDeclaration || kind == ClosureKind.GlobalReference }
 fn pseudo(name: u32) -> bool { return name == atoms.JS_ATOM_home_object || name == atoms.JS_ATOM_this_active_func || name == atoms.JS_ATOM_new_target || name == atoms.JS_ATOM_this }
 fn argumentVisible(name: u32, kind: VariableKind) -> bool { return pseudo(name) || name == atoms.JS_ATOM__arg_var_ || kind == VariableKind.FunctionName }
@@ -89,6 +89,35 @@ effect fn addThisBindings(fd: &mut FunctionDef, table: &mut AtomTable) -> ()
   if fd.isDerivedClassConstructor { let c = run resolvePseudo(&mut fd, &mut table, atoms.JS_ATOM_this_active_func) }
   if fd.hasHomeObject { let d = run resolvePseudo(&mut fd, &mut table, atoms.JS_ATOM_home_object) }
 }
+// Debug metadata reserves capture slots for the current activation, but must not
+// turn every child into a direct eval: capturing unused ancestor values changes
+// WeakRef/finalization behavior after those ancestors return. Only syntactic eval
+// uses addEvalVariables's ancestor walk below.
+pub effect fn addDebuggerVariables(tree: &mut FunctionTree, cell: FunctionId) -> ()
+  ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  let mut anchor = () let mut ra = ()
+  let fd = tree.getMut(cell)
+  let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ra, fd.runtime)
+  if !fd.isEval && (fd.jsMode & JS_MODE_STRICT) == 0 {
+    fd.varObjectIndex = run state.addVar(&mut fd, &mut rt.atoms, atoms.JS_ATOM__var_)
+    if fd.hasParameterExpressions {
+      fd.argVarObjectIndex = run state.addVar(&mut fd, &mut rt.atoms, atoms.JS_ATOM__arg_var_)
+    }
+  }
+  if fd.hasThisBinding { run addThisBindings(&mut fd, &mut rt.atoms) }
+  if fd.hasArgumentsBinding {
+    let added = run state.addArgumentsVar(&mut fd, &mut rt.atoms)
+    if fd.hasParameterExpressions && (fd.jsMode & JS_MODE_STRICT) == 0 {
+      run state.addArgumentsArg(&mut fd, &mut rt.atoms)
+    }
+  }
+  if fd.isFuncExpr && fd.functionName != 0 {
+    let name = fd.functionName let added = run state.addFunctionVar(&mut fd, &mut rt.atoms, name)
+  }
+  if fd.args.length() + fd.vars.length() > 65535 {
+    let error = run CompilerError.make(&rt.atoms, CompilerErrorKind.TooManyLocals, 0) fail move error
+  }
+}
 pub effect fn addEvalVariables(tree: &mut FunctionTree, cell: FunctionId) -> ()
   ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
   let mut anchor = () let mut ra = ()
@@ -105,6 +134,9 @@ pub effect fn addEvalVariables(tree: &mut FunctionTree, cell: FunctionId) -> ()
     if fd.hasParameterExpressions && (fd.jsMode & JS_MODE_STRICT) == 0 { run state.addArgumentsArg(&mut fd, &mut rt.atoms) }
   }
   if fd.isFuncExpr && fd.functionName != 0 { let name = fd.functionName let added = run state.addFunctionVar(&mut fd, &mut rt.atoms, name) }
+  if fd.debuggerMetadata.enabled && fd.args.length() + fd.vars.length() > 65535 {
+    let error = run CompilerError.make(&rt.atoms, CompilerErrorKind.TooManyLocals, 0) fail move error
+  }
   let mut i: usize = 0
   while i < fd.args.length() { state.captureVar(&mut fd, usize.toI32(i), true) i = i + 1 }
   i = 0
@@ -168,8 +200,20 @@ pub effect fn addEvalVariables(tree: &mut FunctionTree, cell: FunctionId) -> ()
 }
 // Direct-eval snapshots preallocate the combined argument/local/closure bound,
 // unlike incremental addClosureVar, and must not impose its 65534-entry limit.
+fn snapshotOrigin(bytecode: &FunctionBytecode, kind: ClosureKind, index: i32) -> ClosureScope {
+  if !bytecode.debuggerMetadata.enabled { return ClosureScope { depth: 0, scope: -1 } }
+  if kind == ClosureKind.Local {
+    return ClosureScope { depth: 1, scope: bytecode.debuggerMetadata.localScopes.get(i32.toUsize(index)) }
+  }
+  if kind == ClosureKind.Argument { return ClosureScope { depth: 1, scope: 0 } }
+  let mut origin = bytecode.debuggerMetadata.closureScopes.get(i32.toUsize(index))
+  if origin.depth != 0 { origin.depth = origin.depth + 1 }
+  return origin
+}
 effect fn snapshotClosure(fd: &mut FunctionDef, table: &mut AtomTable, kind: ClosureKind,
-    index: i32, name: u32, constant: bool, lexical: bool, variableKind: VariableKind) -> () ! OutOfMemoryError ? &mut Allocator {
+    index: i32, name: u32, constant: bool, lexical: bool, variableKind: VariableKind,
+    origin: ClosureScope) -> () ! OutOfMemoryError ? &mut Allocator {
+  if fd.debuggerMetadata.enabled { run fd.debuggerMetadata.closureScopes.append(origin) }
   run fd.closureVars.append(ClosureVar { kind: kind, variableIndex: i32.toU16(index & 65535),
     name: table.duplicate(name), isConst: constant, isLexical: lexical, variableKind: variableKind })
 }
@@ -178,27 +222,33 @@ pub effect fn addClosureVariables(fd: &mut FunctionDef, table: &mut AtomTable, b
   let mut index = scopeIndex let args = u16.toUsize(bytecode.argumentCount) let vars = u16.toUsize(bytecode.variableCount)
   let mut old: usize = 0 while old < fd.closureVars.length() { table.release(fd.closureVars.get(old).name) old = old + 1 }
   fd.closureVars = List<ClosureVar>.make()
+  fd.debuggerMetadata.closureScopes = List<ClosureScope>.make()
   state.resetClosureIndex(&mut fd)
   run fd.closureVars.reserveExact(args + vars + bytecode.closureVars.length())
   while index >= 0 {
     let v = bytecode.varDefs.get(args + i32.toUsize(index))
-    if v.hasScope { run snapshotClosure(&mut fd, &mut table, ClosureKind.Local, index, v.name, v.isConst, v.isLexical, v.kind) }
+    if v.hasScope { run snapshotClosure(&mut fd, &mut table, ClosureKind.Local, index, v.name, v.isConst, v.isLexical, v.kind,
+      snapshotOrigin(bytecode, ClosureKind.Local, index)) }
     index = v.scopeNext
   }
   let argScope = index == ARG_SCOPE_END let mut i: usize = 0
-  if !argScope { while i < args { let v = bytecode.varDefs.get(i) run snapshotClosure(&mut fd, &mut table, ClosureKind.Argument, usize.toI32(i), v.name, false, false, VariableKind.Normal) i = i + 1 } }
+  if !argScope { while i < args { let v = bytecode.varDefs.get(i)
+    run snapshotClosure(&mut fd, &mut table, ClosureKind.Argument, usize.toI32(i), v.name, false, false, VariableKind.Normal,
+      snapshotOrigin(bytecode, ClosureKind.Argument, usize.toI32(i))) i = i + 1 } }
   i = 0
   while i < vars {
     let v = bytecode.varDefs.get(args + i)
     if !v.hasScope && ((!argScope && v.name != atoms.JS_ATOM__ret_) || (argScope && argumentVisible(v.name, v.kind))) {
-      run snapshotClosure(&mut fd, &mut table, ClosureKind.Local, usize.toI32(i), v.name, v.isConst, v.isLexical, v.kind)
+      run snapshotClosure(&mut fd, &mut table, ClosureKind.Local, usize.toI32(i), v.name, v.isConst, v.isLexical, v.kind,
+        snapshotOrigin(bytecode, ClosureKind.Local, usize.toI32(i)))
     }
     i = i + 1
   }
   i = 0
   while i < bytecode.closureVars.length() {
     let v = bytecode.closureVars.get(i)
-    if !globalKind(v.kind) { run snapshotClosure(&mut fd, &mut table, ClosureKind.Reference, usize.toI32(i), v.name, v.isConst, v.isLexical, v.variableKind) }
+    if !globalKind(v.kind) { run snapshotClosure(&mut fd, &mut table, ClosureKind.Reference, usize.toI32(i), v.name, v.isConst, v.isLexical, v.variableKind,
+      snapshotOrigin(bytecode, ClosureKind.Reference, usize.toI32(i))) }
     i = i + 1
   }
 }
@@ -580,7 +630,12 @@ effect fn hoisted(fd: &mut FunctionDef, table: &mut AtomTable) -> () ! OutOfMemo
         if v.name == atoms.JS_ATOM__default_ { run atomOp(&mut fd, &mut table, op.OP_set_name, atoms.JS_ATOM_default) }
       } else { run emit.emitU8(&mut fd, op.OP_undefined) }
       if object { run atomOp(&mut fd, &mut table, op.OP_define_field, v.name) run emit.emitU8(&mut fd, op.OP_drop) }
-      else { run pair(&mut fd, op.OP_put_var_ref, usize.toI32(index)) }
+      else {
+        let capture = fd.closureVars.get(index)
+        let mut store = op.OP_put_var_ref
+        if globalKind(capture.kind) && !capture.isLexical { store = op.OP_put_var }
+        run pair(&mut fd, store, usize.toI32(index))
+      }
     }
     table.release(v.name)
     let mut cleared = v cleared.name = 0 fd.globalVars.set(i, cleared)
@@ -597,26 +652,19 @@ fn atomOperand(code: u8) -> bool {
   let format = op.opcodeInfo(code, false).format
   return format == op.OP_FMT_atom || format == op.OP_FMT_atom_u8 || format == op.OP_FMT_atom_u16 || format == op.OP_FMT_atom_label_u8 || format == op.OP_FMT_atom_label_u16
 }
-// Retain copied operands only once their full word is committed. The input keeps
-// its original references until pass cleanup, including exceptional exits.
+// A copied atom operand moves: once the whole instruction is committed, the
+// input's operand is zeroed, so pass cleanup releases nothing for it. Until
+// then the input keeps its reference, including on exceptional exits.
 @inlineAlways
-effect fn copyInstruction(fd: &mut FunctionDef, table: &mut AtomTable, input: &ByteBuffer, position: usize) -> () ? &mut Allocator {
+effect fn copyInstruction(fd: &mut FunctionDef, input: &mut ByteBuffer, position: usize) -> () ? &mut Allocator {
   let code = input.get(position) let size = u8.toUsize(op.opcodeInfo(code, false).size)
-  if !atomOperand(code) {
-    // Claim the whole instruction once; a failed claim is sticky, like emitU8's.
-    let bytes = input.asSlice()
-    if position + size > bytes.length { Intrinsic.trap("QuickJS invariant violated") }
-    if run emit.claimBytecode(&mut fd, size) {
-      if !fd.bytecode.appendSliceWithin(Slice.view<u8>(bytes, position, size)) { fd.bytecodeError = true }
-    }
-    return ()
+  let bytes = input.asSlice()
+  if position + size > bytes.length { Intrinsic.trap("QuickJS invariant violated") }
+  // Claim the whole instruction once; a failed claim is sticky, like emitU8's.
+  if run emit.claimBytecode(&mut fd, size) {
+    if !fd.bytecode.appendSliceWithin(Slice.view<u8>(bytes, position, size)) { fd.bytecodeError = true return () }
+    if atomOperand(code) { input.patchU32(position + 1, 0) }
   }
-  run emit.emitU8(&mut fd, code)
-  let mut offset: usize = 1
-  if atomOperand(code) {
-    run emit.emitAtom(&mut fd, &mut table, readU32(input.asSlice(), position + 1)) offset = 5
-  }
-  while offset < size { run emit.emitU8(&mut fd, input.get(position + offset)) offset = offset + 1 }
 }
 effect fn lineOut(fd: &mut FunctionDef, line: i32) -> () ? &mut Allocator {
   fd.lineNumberCapacity = fd.lineNumberCapacity + 1
@@ -627,6 +675,14 @@ effect fn resolvePass(tree: &mut FunctionTree, cell: FunctionId, input: &mut Byt
   let mut anchor = () let mut ra = ()
   let initial = tree.getMut(cell)
   let runtime = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ra, initial.runtime)
+  let mut calls = Intrinsic.replace(initial.callSiteSources, List<PcSourcePosition>.make())
+  let mut callIndex: usize = 0 let mut callOutput: usize = 0
+  let debug = initial.debuggerMetadata.enabled
+  let locations = Intrinsic.replace(initial.debuggerMetadata.locations, List<Location>.make())
+  let mut locationIndex: usize = 0
+  let mut location = Location { pc: 0, sourcePosition: initial.sourcePosition,
+    line: 0, column: 0, scope: 0, debuggerStatement: false, statementStart: false }
+  let mut pendingStatementStart = false
   let mut i: usize = 0
   while i < initial.globalVars.length() {
     let global = initial.globalVars.get(i) let mut j: usize = 0
@@ -647,6 +703,29 @@ effect fn resolvePass(tree: &mut FunctionTree, cell: FunctionId, input: &mut Byt
   while position.* < input.length() {
     let p = position.* let code = input.get(p)
     let size = u8.toUsize(op.opcodeInfo(code, false).size) let mut next = p + size
+    let mut outputStart: usize = 0
+    if debug {
+      while locationIndex < locations.length() && locations.get(locationIndex).pc <= usize.toU32(p) {
+        location = locations.get(locationIndex) locationIndex = locationIndex + 1
+      }
+      if location.pc == usize.toU32(p) && location.statementStart { pendingStatementStart = true }
+      let fd = tree.get(cell)
+      outputStart = fd.bytecode.length()
+    }
+    while callIndex < calls.length() && calls.get(callIndex).pc < usize.toU32(p) {
+      callIndex = callIndex + 1
+    }
+    if callIndex < calls.length() && calls.get(callIndex).pc == usize.toU32(p) {
+      let fd = tree.get(cell)
+      if code == op.OP_call || code == op.OP_call_method || code == op.OP_call_constructor
+        || code == op.OP_apply || code == op.OP_eval || code == op.OP_apply_eval {
+        let sourcePosition = calls.get(callIndex).sourcePosition
+        calls.set(callOutput, PcSourcePosition {
+          pc: usize.toU32(fd.bytecode.length()), sourcePosition: sourcePosition })
+        callOutput = callOutput + 1
+      }
+      callIndex = callIndex + 1
+    }
     if code == op.OP_scope_get_var_checkthis || code == op.OP_scope_get_var_undef || code == op.OP_scope_get_var
       || code == op.OP_scope_put_var || code == op.OP_scope_delete_var || code == op.OP_scope_get_ref || code == op.OP_scope_put_var_init || code == op.OP_scope_make_ref {
       let name = readU32(input.asSlice(), p + 1) let mut label: i32 = -1 let mut scopeOffset: usize = 5
@@ -677,16 +756,16 @@ effect fn resolvePass(tree: &mut FunctionTree, cell: FunctionId, input: &mut Byt
         fd.jumpCapacity = fd.jumpCapacity + 1
         let label = u32.toI32(readU32(input.asSlice(), p + 1))
         let target = fd.labels.get(i32.toUsize(label)).position
-        if matchCode(&mut cc, input.asSlice(), target, &[opcode(op.OP_ret), -1]) { let count = emit.updateLabel(&mut fd, label, -1) copy = false }
+        if !debug && matchCode(&mut cc, input.asSlice(), target, &[opcode(op.OP_ret), -1]) { let count = emit.updateLabel(&mut fd, label, -1) copy = false }
       } else if code == op.OP_insert3 {
-        if matchCode(&mut cc, input.asSlice(), usize.toI32(next), &[M2(op.OP_put_array_el, op.OP_put_ref_value), opcode(op.OP_drop), -1]) {
+        if !debug && matchCode(&mut cc, input.asSlice(), usize.toI32(next), &[M2(op.OP_put_array_el, op.OP_put_ref_value), opcode(op.OP_drop), -1]) {
           run emit.emitU8(&mut fd, i32.toU8(cc.opcode)) next = i32.toUsize(cc.position)
           if cc.lineNumber != -1 && cc.lineNumber != line { line = cc.lineNumber run lineOut(&mut fd, line) } copy = false
         }
       } else if code == op.OP_goto || code == op.OP_tail_call || code == op.OP_tail_call_method || code == op.OP_return
         || code == op.OP_return_undef || code == op.OP_throw || code == op.OP_throw_error || code == op.OP_ret {
         if code == op.OP_goto { fd.jumpCapacity = fd.jumpCapacity + 1 }
-        run copyInstruction(&mut fd, &mut rt.atoms, &input.*, p)
+        run copyInstruction(&mut fd, &mut input, p)
         let mut deadLine: i32 = -1
         let end = i32.toUsize(skipDeadCode(&mut fd, &mut rt.atoms, input.asSlice(), usize.toI32(next), &mut deadLine))
         // skipDeadCode released these original operands; zero them before cleanup.
@@ -722,7 +801,7 @@ effect fn resolvePass(tree: &mut FunctionTree, cell: FunctionId, input: &mut Byt
         if readU32(input.asSlice(), p + 1) == 0 { copy = false }
       } else if code == op.OP_if_false || code == op.OP_if_true || code == op.OP_catch { fd.jumpCapacity = fd.jumpCapacity + 1 }
       else if code == op.OP_dup {
-        if matchCode(&mut cc, input.asSlice(), usize.toI32(next), &[M2(op.OP_if_false, op.OP_if_true), opcode(op.OP_drop), -1]) {
+        if !debug && matchCode(&mut cc, input.asSlice(), usize.toI32(next), &[M2(op.OP_if_false, op.OP_if_true), opcode(op.OP_drop), -1]) {
           let first = cc.label let mut target = first let branch = cc.opcode let after = cc.position let branchLine = cc.lineNumber
           let mut targetPosition = getLabelPosition(&fd.*, input.asSlice(), target)
           while matchCode(&mut cc, input.asSlice(), targetPosition, &[opcode(op.OP_dup), branch, opcode(op.OP_drop), -1]) {
@@ -736,14 +815,35 @@ effect fn resolvePass(tree: &mut FunctionTree, cell: FunctionId, input: &mut Byt
             copy = false
           }
         }
-      } else if code == op.OP_nop || code == op.OP_set_class_name { copy = false }
+      } else if code == op.OP_nop {
+        copy = debug && location.pc == usize.toU32(p) && location.debuggerStatement
+      } else if code == op.OP_set_class_name { copy = false }
       else if code == op.OP_get_field_opt_chain {
         run atomOp(&mut fd, &mut rt.atoms, op.OP_get_field, readU32(input.asSlice(), p + 1)) copy = false
       } else if code == op.OP_get_array_el_opt_chain { run emit.emitU8(&mut fd, op.OP_get_array_el) copy = false }
-      if copy { run copyInstruction(&mut fd, &mut rt.atoms, &input.*, p) }
+      if copy { run copyInstruction(&mut fd, &mut input, p) }
+    }
+    if debug {
+      let fd = tree.getMut(cell)
+      let mut at = outputStart
+      while at < fd.bytecode.length() {
+        let emitted = fd.bytecode.get(at)
+        let emittedSize = u8.toUsize(op.opcodeInfo(emitted, false).size)
+        if emitted != op.OP_line_num && emitted != op.OP_label {
+          let mut mapped = location mapped.pc = usize.toU32(at)
+          mapped.debuggerStatement = location.debuggerStatement && location.pc == usize.toU32(p) && emitted == op.OP_nop
+          mapped.statementStart = pendingStatementStart
+          pendingStatementStart = false
+          run fd.debuggerMetadata.record(mapped)
+        }
+        at = at + emittedSize
+      }
     }
     position.* = next
   }
+  calls.truncate(callOutput)
+  let fd = tree.getMut(cell)
+  fd.callSiteSources = move calls
 }
 pub effect fn resolveVariables(tree: &mut FunctionTree, cell: FunctionId) -> ()
   ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
@@ -766,7 +866,7 @@ pub effect fn resolveVariables(tree: &mut FunctionTree, cell: FunctionId) -> ()
       // diagnostics independently and leaves a destructible, atom-owning buffer.
       while position < input.length() {
         let size = u8.toUsize(op.opcodeInfo(input.get(position), false).size)
-        run copyInstruction(&mut fd, &mut rt.atoms, &input, position) position = position + size
+        run copyInstruction(&mut fd, &mut input, position) position = position + size
       }
       emit.freeBytecodeAtoms(&mut rt.atoms, input.asSlice(), false)
       fail move error

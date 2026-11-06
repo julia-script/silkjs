@@ -166,9 +166,10 @@ pub effect fn main() -> i32 ! OutOfMemoryError | StringLengthError | BigIntError
 
 
 def records(data, count, owner):
-    if len(data) != count * 56:
-        raise SystemExit(f'{owner}: expected {count * 56} bytes, got {len(data)}')
-    rows = list(struct.iter_unpack('<14I', data))
+    word_bytes = 8 if len(data) == count * 112 else 4
+    if len(data) != count * 14 * word_bytes:
+        raise SystemExit(f'{owner}: expected {count * 56} or {count * 112} bytes, got {len(data)}')
+    rows = list(struct.iter_unpack('<14Q' if word_bytes == 8 else '<14I', data))
     for index, row in enumerate(rows):
         if row[12:] != (0, 0):
             raise SystemExit(f'{owner} row {index}: leaked allocation/byte ledger {row[12:]}')
@@ -186,7 +187,7 @@ def native(temp, silk, stdlib, cases, cutoffs=1, armed=False):
   while cutoff < {cutoffs} {{
    let row = run oracle.isolated(cases[at].scenario, cases[at].kind, cases[at].method, {str(armed).lower()}, cutoff)
    let mut field: usize = 0
-   while field < 14 {{ run out.writeU32(row[field]) |> Effect.provideMut<Allocator>(&mut system) field = field + 1 }}
+   while field < 14 {{ run out.writeU64(row[field]) |> Effect.provideMut<Allocator>(&mut system) field = field + 1 }}
    cutoff = cutoff + 1
   }}
   at = at + 1

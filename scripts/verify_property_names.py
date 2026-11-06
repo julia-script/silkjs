@@ -254,7 +254,7 @@ unsafe effect fn runCase(out:&mut ByteBuffer,hooks:&mut Hooks,memory:&Allocation
     let allocated=run HeapCell.allocate(HeapKind.Auxiliary,BorrowedView {bytes:move bytes}) view=allocated
     let mut anchor=() let backing=unsafe HeapCell.payloadMut<BorrowedView,()>(&mut anchor,allocated)
     let mut pointer: ?*mut u8=Pointer.fromMutRef<u8>(&mut backing.bytes.asMutSlice()[0]) drop backing
-    let mut count:u32=3 if family==7 {count=0 pointer=Pointer.null<u8>()}
+    let mut count:u64=3 if family==7 {count=0 pointer=Pointer.null<u8>()}
     let p=unsafe HeapCell.payloadMut<ObjectData,()>(&mut anchor,reference(object))
     p.payload=ObjectPayload.TypedArray {array:TypedArrayCache {view:allocated,shared:false,cachedData:pointer,count:count,requiresExtensible:false}}
   }

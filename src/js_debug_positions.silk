@@ -45,13 +45,25 @@ impl Copy for PcSourcePosition {}
 pub struct SourcePositionCache {
   cursor: usize, line: i32, column: i32,
   markCursor: usize, markLine: i32, markColumn: i32,
-  checkpoints: List<SourceLocation>, covered: usize
+  ecmaCursor: usize, ecmaLine: i32, ecmaColumn: i32,
+  checkpoints: List<SourceLocation>, covered: usize,
+  ecmaCheckpoints: List<SourceLocation>, ecmaCovered: usize
 }
 const CHECKPOINT_BYTES: usize = 256
 impl SourcePositionCache {
   pub fn make() -> SourcePositionCache {
     return SourcePositionCache { cursor: 0, line: 0, column: 0, markCursor: 0, markLine: 0, markColumn: 0,
-      checkpoints: List<SourceLocation>.make(), covered: 0 }
+      ecmaCursor: 0, ecmaLine: 0, ecmaColumn: 0,
+      checkpoints: List<SourceLocation>.make(), covered: 0,
+      ecmaCheckpoints: List<SourceLocation>.make(), ecmaCovered: 0 }
+  }
+  /// A cache whose cursor already stands at offset, at (line, column): later
+  /// offsets are counted from there.
+  pub fn at(offset: usize, line: i32, column: i32) -> SourcePositionCache {
+    return SourcePositionCache { cursor: offset, line: line, column: column, markCursor: 0, markLine: 0, markColumn: 0,
+      ecmaCursor: 0, ecmaLine: 0, ecmaColumn: 0,
+      checkpoints: List<SourceLocation>.make(), covered: 0,
+      ecmaCheckpoints: List<SourceLocation>.make(), ecmaCovered: 0 }
   }
   /// Reserves checkpoints for a source of `length` bytes. Without it the cache works
   /// from its cursor and mark alone.
@@ -60,6 +72,9 @@ impl SourcePositionCache {
     self.checkpoints = run List<SourceLocation>.makeWithCapacity(count)
     run self.checkpoints.appendRepeated(SourceLocation { line: 0, column: 0 }, count)
     self.covered = 1
+    self.ecmaCheckpoints = run List<SourceLocation>.makeWithCapacity(count)
+    run self.ecmaCheckpoints.appendRepeated(SourceLocation { line: 0, column: 0 }, count)
+    self.ecmaCovered = 1
   }
   @inlineAlways
   pub fn locate(self: &mut Self, source: &[u8], offset: usize) -> SourceLocation {
@@ -96,6 +111,73 @@ impl SourcePositionCache {
     }
     self.cursor = offset
     return SourceLocation { line: self.line, column: self.column }
+  }
+  // Same checkpoint scheme as locateFromCheckpoint: a step back or a long step forward
+  // restarts from the checkpoint at or below `offset`, so no lookup scans more than
+  // CHECKPOINT_BYTES past what the checkpoints already cover.
+  fn locateEcmaFromCheckpoint(self: &mut Self, source: &[u8], offset: usize) -> SourceLocation {
+    let mut from = self.ecmaCursor
+    let mut at = SourceLocation { line: self.ecmaLine, column: self.ecmaColumn }
+    if offset < self.ecmaCursor || offset - self.ecmaCursor > CHECKPOINT_BYTES {
+      let mut index = offset / CHECKPOINT_BYTES
+      if index >= self.ecmaCovered { index = self.ecmaCovered - 1 }
+      let start = index * CHECKPOINT_BYTES
+      if self.ecmaCursor > offset || self.ecmaCursor < start {
+        from = start
+        at = self.ecmaCheckpoints.get(index)
+      }
+    }
+    while self.ecmaCovered < self.ecmaCheckpoints.length() {
+      let boundary = self.ecmaCovered * CHECKPOINT_BYTES
+      if boundary > offset || boundary < from { break }
+      at = scanEcma(source, from, boundary, at)
+      self.ecmaCheckpoints.set(self.ecmaCovered, at)
+      self.ecmaCovered = self.ecmaCovered + 1
+      from = boundary
+    }
+    at = scanEcma(source, from, offset, at)
+    self.ecmaCursor = offset self.ecmaLine = at.line self.ecmaColumn = at.column
+    return at
+  }
+  /// ECMAScript stack coordinates: UTF-16 columns and all line terminators.
+  /// Kept separate from QuickJS's legacy scalar/LF coordinate policy.
+  pub fn locateEcma(self: &mut Self, source: &[u8], offset: usize) -> SourceLocation {
+    if offset > source.length { Intrinsic.trap("SourcePositionCache.locateEcma: offset past source") }
+    if self.ecmaCovered != 0 { return self.locateEcmaFromCheckpoint(source, offset) }
+    if offset >= self.ecmaCursor {
+      let mut i = self.ecmaCursor
+      while i < offset {
+        let c = source[i]
+        if ecmaTerminator(source, i) {
+          if c != 10 || i == 0 || source[i - 1] != 13 { self.ecmaLine = self.ecmaLine + 1 }
+          self.ecmaColumn = 0
+        } else { self.ecmaColumn = self.ecmaColumn + utf16Width(c) }
+        i = i + 1
+      }
+    } else {
+      // Reverse only the traversed delta, never the whole source prefix.
+      let mut lines: i32 = 0 let mut columns: i32 = 0
+      let mut i = offset
+      while i < self.ecmaCursor {
+        let c = source[i]
+        if ecmaTerminator(source, i) {
+          if c != 10 || i == 0 || source[i - 1] != 13 { lines = lines + 1 }
+          columns = 0
+        } else { columns = columns + utf16Width(c) }
+        i = i + 1
+      }
+      if lines == 0 { self.ecmaColumn = self.ecmaColumn - columns }
+      else {
+        self.ecmaLine = self.ecmaLine - lines self.ecmaColumn = 0 i = offset
+        while i > 0 {
+          i = i - 1
+          if ecmaTerminator(source, i) { break }
+          self.ecmaColumn = self.ecmaColumn + utf16Width(source[i])
+        }
+      }
+    }
+    self.ecmaCursor = offset
+    return SourceLocation { line: self.ecmaLine, column: self.ecmaColumn }
   }
   @inlineAlways
   fn locateFromCheckpoint(self: &mut Self, source: &[u8], offset: usize) -> SourceLocation {
@@ -229,6 +311,45 @@ unsafe fn columnBefore(bytes: ?[*]const u8, offset: usize) -> i32 {
   return column
 }
 
+const CARRIAGE_RETURNS: u64 = 0x0d0d0d0d0d0d0d0d
+// Advances ECMAScript coordinates over bytes [from, to). A word of ASCII with no CR or LF
+// adds eight columns at once; any other word goes byte by byte.
+fn scanEcma(source: &[u8], from: usize, to: usize, start: SourceLocation) -> SourceLocation {
+  let mut line = start.line
+  let mut column = start.column
+  let mut i = from
+  let bytes = Pointer.fromSlice<u8>(source)
+  while i < to {
+    if to - i >= 8 {
+      let word = unsafe wordAt(bytes, i)
+      let other = u64.bitXor(word, CARRIAGE_RETURNS)
+      let returns = u64.bitAnd(u64.bitNot(u64.bitOr(u64.wrappingAdd(u64.bitAnd(other, LOW), LOW), other)), HIGH)
+      if u64.bitOr(u64.bitOr(u64.bitAnd(word, HIGH), newlinesIn(word)), returns) == 0 {
+        column = column + 8
+        i = i + 8
+        continue
+      }
+    }
+    let c = source[i]
+    if ecmaTerminator(source, i) {
+      if c != 10 || i == 0 || source[i - 1] != 13 { line = line + 1 }
+      column = 0
+    } else { column = column + utf16Width(c) }
+    i = i + 1
+  }
+  return SourceLocation { line: line, column: column }
+}
+fn utf16Width(byte: u8) -> i32 {
+  if byte >= 240 { return 2 }
+  if byte < 128 || byte >= 192 { return 1 }
+  return 0
+}
+fn ecmaTerminator(source: &[u8], offset: usize) -> bool {
+  let c = source[offset]
+  return c == 13 || c == 10 || (c == 226 && offset + 2 < source.length
+    && source[offset + 1] == 128 && (source[offset + 2] == 168 || source[offset + 2] == 169))
+}
+
 // Mirrors add_pc2line_info's bounded collector. A zero capacity disables it;
 // full collectors, descending PCs and duplicate source positions are ignored.
 pub struct PcSourcePositions {
@@ -330,18 +451,40 @@ fn putLeb128(buffer: &mut [u8; 16], at: usize, value: u32) -> usize {
   return index + 1
 }
 
+/// A line table holding only the function's own position, the table a function
+/// waiting for its deferred compile reports (js_compiler_finish.defer).
+pub effect fn definitionPc2Line(at: SourceLocation) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut header: [u8; 16] = [0; 16]
+  let mut written = putLeb128(&mut header, 0, i32.toU32(at.line))
+  written = putLeb128(&mut header, written, i32.toU32(at.column))
+  let mut out = List<u8>.make()
+  run out.reserveExact(written)
+  let mut i: usize = 0
+  while i < written { run out.append(header[i]) i = i + 1 }
+  return move out
+}
 // Source offsets must be in bounds except NO_SOURCE_POSITION entries, which are
 // skipped. The returned buffer is owned and can be moved into FunctionBytecode.
 // A stripped function omits this call and has an empty table.
-// cache carries the last located offset between calls, so functions compiled in
-// source order cost O(distance) each instead of rescanning from the start.
 pub effect fn encodePc2Line(source: &[u8], functionSourcePosition: u32, positions: &[PcSourcePosition],
   cache: &mut SourcePositionCache) -> ByteBuffer ! OutOfMemoryError ? &mut Allocator {
+  return run encodePositions(source, functionSourcePosition, positions, &mut cache, false)
+}
+// Entries are final call-instruction PCs, not legacy statement source markers.
+// The caller shares an ECMAScript-only cache across the compilation tree.
+pub effect fn encodeCallSitePc2Line(source: &[u8], functionSourcePosition: u32,
+  positions: &[PcSourcePosition], cache: &mut SourcePositionCache) -> ByteBuffer
+  ! OutOfMemoryError ? &mut Allocator {
+  return run encodePositions(source, functionSourcePosition, positions, &mut cache, true)
+}
+effect fn encodePositions(source: &[u8], functionSourcePosition: u32,
+  positions: &[PcSourcePosition], cache: &mut SourcePositionCache, ecma: bool) -> ByteBuffer
+  ! OutOfMemoryError ? &mut Allocator {
   let mut out = ByteBuffer.make()
-  // Most entries take one or two bytes; a short reservation up front keeps the appends below on
-  // their inlined fast path.
+  // Keep the upstream encoder's reserved-buffer append fast path.
   run out.reserve(positions.length * 2 + 10)
-  let mut last = cache.locate(source, u32.toUsize(functionSourcePosition))
+  let mut last = if ecma { cache.locateEcma(source, u32.toUsize(functionSourcePosition)) }
+    else { cache.locate(source, u32.toUsize(functionSourcePosition)) }
   let mut lastPc: u32 = 0
   let mut header: [u8; 16] = [0; 16]
   let mut written = putLeb128(&mut header, 0, i32.toU32(last.line))
@@ -355,7 +498,8 @@ pub effect fn encodePc2Line(source: &[u8], functionSourcePosition: u32, position
     let diffPc = u32.wrappingSubtract(entry.pc, lastPc)
     // The original subtracts unsigned PCs and then interprets the delta as int.
     if diffPc >= 0x80000000 { continue }
-    let current = cache.locate(source, u32.toUsize(entry.sourcePosition))
+    let offset = u32.toUsize(entry.sourcePosition)
+    let current = if ecma { cache.locateEcma(source, offset) } else { cache.locate(source, offset) }
     let diffLine = current.line - last.line
     let diffColumn = current.column - last.column
     if diffLine == 0 && diffColumn == 0 { continue }
