@@ -113,7 +113,69 @@ for (var u4 = 0; u4 < 3; u4++) {
   fz.push(argEl([1, 2]), argEl('xy'), argEl({ 1: 'one' }), maybeEl.call(fo, true), maybeEl.call(fo, false));
 }
 r.push(fz.join('|'));
+function AC(f){ this.f = f; }
+AC.prototype.get = function(){ return this.f; };
+AC.prototype.size = function(){ return this.f.length; };
+AC.prototype.at = function(i){ return this.f[i]; };
+function AW(c){ this.c = c; }
+AW.prototype.size = function(){ return this.c.size(); };
+AW.prototype.at = function(i){ return this.c.at(i); };
+AW.prototype.get = function(){ return this.c.get(); };
+var acp = Object.create(Object.create(AC.prototype, { f: { value: [8, 9], writable: true } }));
+var acg = new AC(0); Object.defineProperty(acg, 'f', { get: function(){ return ['g', 'h']; } });
+var acs = [new AC([1, , 3]), new AC('str'), new AC(new Int8Array([4, 5])), new AC({ length: 'L', 1: 'o1' }), acp, acg, new AC(null), new AC(undefined)];
+var az = [];
+for (var u5 = 0; u5 < 3; u5++) {
+  for (var q = 0; q < acs.length; q++) {
+    var ac = acs[q], aw = new AW(ac);
+    var one = function(f){ try { return String(f()); } catch (e) { return e.constructor.name; } };
+    az.push(one(function(){ return ac.size(); }), one(function(){ return ac.at(1); }), one(function(){ return ac.at(-1); }),
+      one(function(){ return ac.at(1.5); }), one(function(){ return ac.at('1'); }), one(function(){ return ac.at(7); }),
+      one(function(){ return ac.at(); }), one(function(){ return typeof ac.get(); }),
+      one(function(){ return aw.size(); }), one(function(){ return aw.at(2); }), one(function(){ return typeof aw.get(); }));
+  }
+  az.push(one(function(){ return AC.prototype.size.call('abc'); }), String(AC.prototype.get.call(5)), AC.prototype.at.call({ f: [0, 'x'] }, 1), AC.prototype.size.call({ f: 'abcd' }));
+  acs[0].f.push(u5);
+}
+r.push(az.join('/'));
+var fwOwn = { size: function(){ return 'own'; }, at: function(i){ return 'at' + i; }, get: function(){ return 'g'; } };
+var fwTargets = [fwOwn, { size: Math.max, at: Math.abs, get: Math.random === 0 ? 0 : String }, [1, 2], null, 7, 'str', new AW(new AC([3, 4])),
+  new AC({ length: 2 }), { size: AC.prototype.size, at: AC.prototype.at, get: AC.prototype.get, f: ['m', 'n'] }];
+var fz2 = [];
+for (var u6 = 0; u6 < 3; u6++) {
+  for (var q2 = 0; q2 < fwTargets.length; q2++) {
+    var fw = new AW(fwTargets[q2]);
+    var one2 = function(f){ try { var v = f(); return typeof v == 'function' ? 'fn' : String(v); } catch (e) { return e.constructor.name; } };
+    fz2.push(one2(function(){ return fw.size(); }), one2(function(){ return fw.at(1); }), one2(function(){ return fw.at('0'); }), one2(function(){ return fw.at(); }), one2(function(){ return fw.get(); }));
+  }
+}
+r.push(fz2.join('/'));
+var SelDir = { FWD: 1, BACK: 0 }, SELK = 'k', selObj = {};
+function SL(d, b, c){ this.d = d; this.b = b; this.c = c; }
+SL.prototype.eqf = function(){ return this.d == SelDir.FWD ? this.b : this.c; };
+SL.prototype.nef = function(){ return this.d != SelDir.FWD ? this.b : this.c; };
+SL.prototype.seq = function(){ return this.d === SELK ? this.b : this.c; };
+SL.prototype.sne = function(){ return this.d !== selObj ? this.b : this.c; };
+SL.prototype.tdz = function(){ return this.d == selLate ? this.b : this.c; };
+var SW = function(t){ this.t = t; };
+SW.prototype.eqf = function(){ return this.t.eqf(); };
+var sz = [], sels = [new SL(1, 'B', 'C'), new SL(0, 'B', 'C'), new SL('1', 'B', 'C'), new SL('k', 'B', 'C'), new SL(selObj, 'B', 'C'),
+  new SL(null, 'B', 'C'), new SL(undefined, 'B', 'C'), new SL(1.0, 'B', 'C'), new SL(1.5, 'B', 'C'), new SL(true, 'B', 'C'), new SL(['1'], 'B', 'C'),
+  Object.create(SL.prototype), { d: 1, b: 'pb', c: 'pc', eqf: SL.prototype.eqf }];
+for (var u7 = 0; u7 < 3; u7++) {
+  for (var q3 = 0; q3 < sels.length; q3++) {
+    var sl = sels[q3];
+    var one3 = function(f){ try { return String(f()); } catch (e) { return e.constructor.name; } };
+    sz.push(one3(function(){ return sl.eqf(); }), one3(function(){ return sl.nef(); }), one3(function(){ return sl.seq(); }),
+      one3(function(){ return sl.sne(); }), one3(function(){ return sl.tdz(); }), one3(function(){ return new SW(sl).eqf(); }));
+  }
+  if (u7 == 1) { SelDir.FWD = '1'; SELK = 1; }
+  sz.push(one3(function(){ return SL.prototype.eqf.call(3); }));
+}
+let selLate = 0;
+sz.push(new SL(0, 'B', 'C').tdz(), new SL(1, 'B', 'C').tdz());
+r.push(sz.join('/'));
 const got = r.join();
-const expected = '10199,,,,,3,42,-42,3,1,proxied,true,true,false,true,false,true,true,false,true,true,false,true,2147483648,true,false,2147483648,a1,0.75,-2147483649,NaN,NaN,5,6,-13,true,true,false,object,object,true,true,,ReferenceError,7,11,21,505,TypeError,2,3,9,own0,5,5,,1,49,true,1,3,n,2,0,TypeError,5,g,1,TypeError,prim,99900,2,300,299,3,4,4,TypeError,TypeError,other,d,40200,//3/undefined/1//u/number///3/undefined/1//u/number///3/undefined/1//u/number,TypeError,TypeError,true,3,9,80600,7,199,2,1,g,840,ReferenceError4,ReferenceError4,2:0.5:Infinity:-Infinity:0:-Infinity:3:2:3:NaN:2:0.5:Infinity:-Infinity:0:-Infinity:3:2:3:NaN:2:0.5:Infinity:-Infinity:0:-Infinity:3:2:3:NaN,0|||p|3|3|5|||t|7|2|y|one|5|none|1|||p|3|3|5|||t|7|2|y|one|5|none|2|||p|3|3|5|||t|7|2|y|one|5|none';
+const expected = '10199,,,,,3,42,-42,3,1,proxied,true,true,false,true,false,true,true,false,true,true,false,true,2147483648,true,false,2147483648,a1,0.75,-2147483649,NaN,NaN,5,6,-13,true,true,false,object,object,true,true,,ReferenceError,7,11,21,505,TypeError,2,3,9,own0,5,5,,1,49,true,1,3,n,2,0,TypeError,5,g,1,TypeError,prim,99900,2,300,299,3,4,4,TypeError,TypeError,other,d,40200,//3/undefined/1//u/number///3/undefined/1//u/number///3/undefined/1//u/number,TypeError,TypeError,true,3,9,80600,7,199,2,1,g,840,ReferenceError4,ReferenceError4,2:0.5:Infinity:-Infinity:0:-Infinity:3:2:3:NaN:2:0.5:Infinity:-Infinity:0:-Infinity:3:2:3:NaN:2:0.5:Infinity:-Infinity:0:-Infinity:3:2:3:NaN,0|||p|3|3|5|||t|7|2|y|one|5|none|1|||p|3|3|5|||t|7|2|y|one|5|none|2|||p|3|3|5|||t|7|2|y|one|5|none,3/undefined/undefined/undefined/undefined/undefined/undefined/object/3/3/object/3/t/undefined/undefined/t/undefined/undefined/string/3/r/string/2/5/undefined/undefined/5/undefined/undefined/object/2/undefined/object/L/o1/undefined/undefined/o1/undefined/undefined/object/L/undefined/object/2/9/undefined/undefined/9/undefined/undefined/object/2/undefined/object/2/h/undefined/undefined/h/undefined/undefined/object/2/undefined/object/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/object/TypeError/TypeError/object/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/undefined/TypeError/TypeError/undefined/TypeError/undefined/x/4/4/undefined/undefined/undefined/undefined/undefined/undefined/object/4/3/object/3/t/undefined/undefined/t/undefined/undefined/string/3/r/string/2/5/undefined/undefined/5/undefined/undefined/object/2/undefined/object/L/o1/undefined/undefined/o1/undefined/undefined/object/L/undefined/object/2/9/undefined/undefined/9/undefined/undefined/object/2/undefined/object/2/h/undefined/undefined/h/undefined/undefined/object/2/undefined/object/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/object/TypeError/TypeError/object/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/undefined/TypeError/TypeError/undefined/TypeError/undefined/x/4/5/undefined/undefined/undefined/undefined/undefined/undefined/object/5/3/object/3/t/undefined/undefined/t/undefined/undefined/string/3/r/string/2/5/undefined/undefined/5/undefined/undefined/object/2/undefined/object/L/o1/undefined/undefined/o1/undefined/undefined/object/L/undefined/object/2/9/undefined/undefined/9/undefined/undefined/object/2/undefined/object/2/h/undefined/undefined/h/undefined/undefined/object/2/undefined/object/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/object/TypeError/TypeError/object/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/undefined/TypeError/TypeError/undefined/TypeError/undefined/x/4,own/at1/at0/atundefined/g/-Infinity/1/0/NaN//TypeError/2/1/1/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/t/s/s/TypeError/2/4/3/undefined/3,4/2/undefined/undefined/undefined/[object Object]/2/n/m/undefined/m,n/own/at1/at0/atundefined/g/-Infinity/1/0/NaN//TypeError/2/1/1/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/t/s/s/TypeError/2/4/3/undefined/3,4/2/undefined/undefined/undefined/[object Object]/2/n/m/undefined/m,n/own/at1/at0/atundefined/g/-Infinity/1/0/NaN//TypeError/2/1/1/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/TypeError/t/s/s/TypeError/2/4/3/undefined/3,4/2/undefined/undefined/undefined/[object Object]/2/n/m/undefined/m,n,B/C/C/B/ReferenceError/B/C/B/C/B/ReferenceError/C/B/C/C/B/ReferenceError/B/C/B/B/B/ReferenceError/C/C/B/C/C/ReferenceError/C/C/B/C/B/ReferenceError/C/C/B/C/B/ReferenceError/C/B/C/C/B/ReferenceError/B/C/B/C/B/ReferenceError/C/B/C/C/B/ReferenceError/B/B/C/C/B/ReferenceError/B/undefined/undefined/undefined/undefined/ReferenceError/undefined/pb/TypeError/TypeError/TypeError/TypeError/pb/undefined/B/C/C/B/ReferenceError/B/C/B/C/B/ReferenceError/C/B/C/C/B/ReferenceError/B/C/B/B/B/ReferenceError/C/C/B/C/C/ReferenceError/C/C/B/C/B/ReferenceError/C/C/B/C/B/ReferenceError/C/B/C/C/B/ReferenceError/B/C/B/C/B/ReferenceError/C/B/C/C/B/ReferenceError/B/B/C/C/B/ReferenceError/B/undefined/undefined/undefined/undefined/ReferenceError/undefined/pb/TypeError/TypeError/TypeError/TypeError/pb/undefined/B/C/B/B/ReferenceError/B/C/B/C/B/ReferenceError/C/B/C/C/B/ReferenceError/B/C/B/C/B/ReferenceError/C/C/B/C/C/ReferenceError/C/C/B/C/B/ReferenceError/C/C/B/C/B/ReferenceError/C/B/C/B/B/ReferenceError/B/C/B/C/B/ReferenceError/C/B/C/C/B/ReferenceError/B/B/C/C/B/ReferenceError/B/undefined/undefined/undefined/undefined/ReferenceError/undefined/pb/TypeError/TypeError/TypeError/TypeError/pb/undefined/B/C';
 console.log(got === expected ? 'PASS leaf calls' : 'FAIL ' + got);
 if (got !== expected) throw new Error('leaf call regressions');

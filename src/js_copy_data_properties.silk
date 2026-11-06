@@ -2,7 +2,7 @@
 //! roots through callbacks; only the enumerator's atoms and fetched values are owned.
 //! Ordinary sources snapshot enumerability. Exotic ownKeys sources recheck each
 //! descriptor AFTER exclusion, preserving observable proxy/getter ordering.
-import js_realm { lendRealm, Realm }
+import js_realm { Realm }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
@@ -11,7 +11,7 @@ import silk.num.u32
 import silk.mem.pointer { Pointer }
 import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
-import js_owned_value { lendBits, immediateRef, ValueRef }
+import js_owned_value { lendBits, immediateRef, ValueRef, Value }
 import js_core_types { RuntimeState, ObjectData, ExoticCallbacks, PropertyDescriptor, ShapeData, ShapeProperty, SlotBits,
   PropertyEnum, EXOTIC_GET_OWN_PROPERTY_NAMES, JS_PROP_ENUMERABLE, JS_PROP_C_W_E, JS_PROP_TMASK }
 import js_shapes as shapes
@@ -21,7 +21,7 @@ import js_gc as gc
 import silk.num.u8
 import js_gc { HeapHooks }
 import js_runtime as runtime
-import js_coercion_host { CoercionHooks }
+import js_coercion_host { CoercionHooks, getPropertyOwned }
 import js_property_host { OwnKeysHooks, OwnPropertyHooks }
 import js_property_write_host { PropertyWriteHooks }
 import js_property_names as names
@@ -31,10 +31,10 @@ import js_property_mutations as mutations
 import js_string_types { StringLengthError }
 import js_bigint { BigIntError }
 import js_exceptions { JsException }
+import js_invariant { invariant }
 
-fn trap() -> never { return Intrinsic.trap("QuickJS invariant violated") }
 fn enumerationFlags<'a, 'b>(realm: Realm<'a>, source: ValueRef<'b>) -> u32 {
-  let node = match source.view() { ValueBits.Object { reference } => reference _ => trap() }
+  let node = match source.view() { ValueBits.Object { reference } => reference _ => invariant() }
   let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
   let flags = JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK | JS_GPN_ENUM_ONLY
   if !object.isExotic() { return flags }
@@ -90,7 +90,7 @@ unsafe effect fn addDataProperty<H: HeapHooks>(hooks: &mut H, runtime: *mut Heap
 // same prototype: defining each property in order would walk the same transitions
 // to the same shape, so the target shares it and copies the slots. Nothing is
 // observable in between. Returns false, before any change, when it does not apply.
-unsafe effect fn cloneInto<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, target: ValueBits, source: ValueBits) -> bool
+pub unsafe effect fn cloneInto<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, target: ValueBits, source: ValueBits) -> bool
   ! OutOfMemoryError ? &mut Allocator {
   let from = match plainObject(source) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return false } }
   let into = match plainObject(target) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return false } }
@@ -102,11 +102,20 @@ unsafe effect fn cloneInto<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader
   let shapeData = unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, shape)
   let count = shapeData.properties.length()
   if !shapeData.isHashed || shapeData.deletedPropertyCount != 0 || count == 0 || sourceData.properties.length() != count { return false }
+  let version = shapeData.version
+  let stateAnchor = ()
+  let known = (unsafe HeapCell.payload<RuntimeState, ()>(&stateAnchor, runtime)).plainCloneVersion == version
   let mut i: usize = 0
-  while i < count {
-    let property = unsafe shapes.unchecked<ShapeProperty>(&shapeData.properties, i)
-    if u8.toU32(property.flags) != JS_PROP_C_W_E || property.atom == 0 { return false }
-    i = i + 1
+  if !known {
+    while i < count {
+      let property = unsafe shapes.unchecked<ShapeProperty>(&shapeData.properties, i)
+      if u8.toU32(property.flags) != JS_PROP_C_W_E || property.atom == 0 { return false }
+      i = i + 1
+    }
+    let mut noteAnchor = ()
+    let note = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut noteAnchor, runtime)
+    note.plainCloneVersion = version
+    drop note
   }
   let prototype = shapeData.prototype
   let capacity = shapeData.properties.capacity()
@@ -122,10 +131,18 @@ unsafe effect fn cloneInto<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader
   if !fits { return false }
   // Reserving first: once it succeeds, the appends cannot fail.
   if targetData.properties.capacity() < capacity { run targetData.properties.reserveExact(capacity) }
+  // One block copy of the plain value slots, then a retain pass over the heap ones.
+  // Every record is plain data, so each slot is a ValueBits: copy and scan for
+  // heap values in one pass.
+  let first = unsafe Intrinsic.pointerRequalify<?[*]const SlotBits, [*]const SlotBits>(Pointer.fromSlice<SlotBits>(sourceData.properties.asSlice()))
+  let spare = unsafe Intrinsic.pointerReinterpret<[*]mut SlotBits, [*]mut ValueBits>(unsafe targetData.properties.spareFor(count))
+  let heap = unsafe ValueBits.copyScan(spare, unsafe Intrinsic.pointerReinterpret<[*]const SlotBits, [*]const ValueBits>(first), count)
+  unsafe targetData.properties.extendFilled(count)
   i = 0
+  if !heap { i = count }
   while i < count {
-    let value = unsafe sourceData.properties.get(i).valueBits().retained()
-    run targetData.properties.append(SlotBits.value(value))
+    let slot = unsafe targetData.properties.getUnchecked(i) let value = slot.valueBits()
+    if let Option<*mut HeapHeader>.Some { value: cell } = ValueBits.heapReference(&value) { unsafe HeapCell.retain(cell) }
     i = i + 1
   }
   unsafe shapes.take(runtime, shape)
@@ -175,12 +192,12 @@ effect fn copy<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + Propert
       }
       if !enumerable { continue }
     }
-    let value = run hooks.getProperty(realm, source.borrow(), atom)
+    let value = run getPropertyOwned(&mut hooks, realm, source.borrow(), atom)
     if assignment {
-      let accepted = run unsafe mutations.setProperty(&mut hooks, realm, target.borrow(), atom, value)
+      let accepted = run mutations.setProperty(&mut hooks, realm, target.borrow(), atom, move value)
     } else {
       // A nonthrowing false result is intentionally ignored, just like the source.
-      let accepted = run unsafe mutations.definePropertyValue(&mut hooks, realm, target.borrow(), atom, value, JS_PROP_C_W_E)
+      let accepted = run mutations.definePropertyValue(&mut hooks, realm, target.borrow(), atom, move value, JS_PROP_C_W_E)
     }
   }
 }

@@ -1,0 +1,293 @@
+//! Run with the execution consumer's real initialized Engine<Services> and context.
+//! Exercises compiler tables, wire neutrality, side-table restoration, and a PC breakpoint.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.mem.pointer { Pointer }
+import silk.testing.testing { Testing, AssertionError }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.usize
+import js_engine { Engine }
+import js_heap { HeapCell, HeapHeader }
+import js_core_types { FunctionBytecode, ByteStorage, StackFrame }
+import js_value { ValueBits }
+import js_owned_value { Value, lendBits, immediateRef }
+import js_realm { lendRealm }
+import js_exceptions { JsException }
+import js_runtime as runtime
+import js_gc as gc
+import js_eval as eval
+import js_eval_compile as flags
+import js_opcode_data as op
+import js_debugger as debugger
+import js_debugger_metadata { Metadata, InvalidMetadata }
+import js_debugger_metadata as metadata
+import js_debugger_execution_consumer { Services }
+import js_binary_object_writer as writer
+import js_binary_object_reader as reader
+
+fn reference(value: ValueBits) -> *mut HeapHeader {
+  return match value { ValueBits.FunctionBytecode { reference } => reference _ => Intrinsic.trap("metadata consumer expected bytecode") }
+}
+unsafe fn bytes(storage: &ByteStorage) -> &[u8] {
+  return match &storage.* {
+    ByteStorage.Owned { bytes } => bytes.asSlice()
+    ByteStorage.Borrowed { data, length } => unsafe Intrinsic.pointerBorrowMany<ByteStorage, u8>(storage, unsafe Pointer.assumeMany<u8>(data), length)
+  }
+}
+unsafe effect fn compile<'m>(engine: &mut Engine<'m, Services>, context: *mut HeapHeader,
+  source: &[u8], debug: bool) -> ValueBits ! JsException ? &mut Allocator {
+  let memory = engine.memory let mut mode = flags.FLAG_COMPILE_ONLY
+  if debug { mode = mode | flags.FLAG_DEBUGGER }
+  return Value.intoBits(run eval.evaluate(&mut engine, memory, unsafe lendRealm(&context, context), source, b"debugger-metadata-consumer.js", mode))
+}
+unsafe effect fn entryRange<'m>(engine: &mut Engine<'m, Services>, context: *mut HeapHeader,
+  source: &[u8], expectedStops: usize, caseId: u32) -> () ! JsException | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let realm = unsafe lendRealm(&context, context)
+  let rt = unsafe runtime.contextRuntime(context) let memory = engine.memory
+  let initialized = Value.intoBits(run eval.evaluate(&mut engine, memory, realm, b"globalThis.entryRan=0", b"debugger-entry-init.js", 0))
+  unsafe gc.release(&mut engine, rt, initialized)
+  let compiled = run unsafe compile(&mut engine, context, source, true)
+  let anchor = () let root = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference(compiled))
+  let entry = reference(root.constants.get(0)) drop root
+  engine.services.scenario = 9 engine.services.stops = 0 engine.services.failures = 0
+  let prefix = b"(function(){" let suffix = b"})()"
+  engine.services.phase = prefix.length engine.services.depth = source.length - suffix.length
+  let child = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, entry)
+  let last = child.debuggerMetadata.locations.get(child.debuggerMetadata.locations.length() - 1)
+  run Testing.expect(u32.toUsize(last.sourcePosition) == engine.services.depth,
+    "implicit return metadata belongs to the excluded closing delimiter, not the preceding user expression")
+  run Testing.expect(last.statementStart, "implicit return is a closing-delimiter stepping boundary")
+  drop child
+  unsafe debugger.requestPauseOnEntry(rt, entry, usize.toU32(engine.services.phase), usize.toU32(engine.services.depth))
+  // Identical filename, different bytecode/script: neither it nor the parent
+  // wrapper activation may consume the entry request.
+  let intervening = run unsafe compile(&mut engine, context, b"0", true)
+  let ignored = run unsafe eval.execute(&mut engine, memory, realm, intervening, immediateRef(ValueBits.Undefined), Pointer.null<StackFrame>())
+  unsafe gc.release(&mut engine, rt, ignored)
+  run Testing.expect(engine.services.stops == 0, "entry request ignores unrelated bytecode with the same filename")
+  let value = run unsafe eval.execute(&mut engine, memory, realm, unsafe compiled.retained(), immediateRef(ValueBits.Undefined), Pointer.null<StackFrame>())
+  // Empty entries stay armed: cancel before releasing their root.
+  unsafe debugger.configure(rt, false)
+  unsafe gc.release(&mut engine, rt, compiled)
+  unsafe gc.release(&mut engine, rt, value)
+  let message = match caseId {
+    0 => "plain entry pauses exactly once inside user source"
+    1 => "directive/Unicode entry pauses exactly once inside user source"
+    2 => "comment-only entry never pauses on the wrapper"
+    _ => "directive-only entry pauses once on the preserved user directive"
+  }
+  run Testing.expect(engine.services.stops == expectedStops, message)
+  run Testing.expect(engine.services.failures == 0, "entry pause has an in-range location and precedes its first user assignment")
+  unsafe debugger.configure(rt, true)
+}
+unsafe effect fn statementBoundaries<'m>(engine: &mut Engine<'m, Services>, context: *mut HeapHeader,
+  source: &[u8], bounds: &[usize]) -> ()
+  ! JsException | OutOfMemoryError | InvalidMetadata | AssertionError<'static> ? &mut Allocator {
+  let compiled = run unsafe compile(&mut engine, context, source, true)
+  let anchor = () let root = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference(compiled))
+  let childReference = reference(root.constants.get(0)) drop root
+  let child = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, childReference)
+  let cloned = run child.debuggerMetadata.clone()
+  let encoded = run metadata.encode(&cloned)
+  let restored = run metadata.decode(encoded.asSlice(), unsafe bytes(&child.code),
+    u16.toUsize(child.variableCount), source.length)
+  let mut starts: usize = 0 let mut intermediates: usize = 0 let mut i: usize = 0
+  while i < child.debuggerMetadata.locations.length() {
+    let location = child.debuggerMetadata.locations.get(i)
+    run Testing.expect(location.statementStart == restored.locations.get(i).statementStart,
+      "cached statement boundaries survive cloning and codec restoration")
+    if location.statementStart {
+      run Testing.expect(starts + 1 < bounds.length, "expression intermediates must not become statement boundaries")
+      let position = u32.toUsize(location.sourcePosition)
+      run Testing.expect(position >= bounds[starts] && position < bounds[starts + 1],
+        "each same-line statement starts inside its own source range, never in the function prologue")
+      let opcode = unsafe child.code.byte(u32.toUsize(location.pc))
+      run Testing.expect(opcode != op.OP_return && opcode != op.OP_return_undef
+        && opcode != op.OP_call && opcode != op.OP_call_method,
+        "a call-valued statement starts before its arguments, call, and return")
+      starts = starts + 1
+    } else { intermediates = intermediates + 1 }
+    i = i + 1
+  }
+  run Testing.expect(starts + 1 == bounds.length && intermediates > starts,
+    "distinct same-line statements remain distinct while their expression points stay available")
+  drop child
+  unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), compiled)
+}
+pub unsafe effect fn exercise<'m>(engine: &mut Engine<'m, Services>, context: *mut HeapHeader) -> ()
+  ! JsException | OutOfMemoryError | InvalidMetadata | AssertionError<'static> ? &mut Allocator {
+  let realm = unsafe lendRealm(&context, context)
+  let rt = unsafe runtime.contextRuntime(context)
+  run unsafe statementBoundaries(&mut engine, context,
+    b"(function(x){x=fn(x+1);x=fn(x+2);return fn(x+3)})",
+    &[b"(function(x){".length, b"(function(x){x=fn(x+1);".length,
+      b"(function(x){x=fn(x+1);x=fn(x+2);".length,
+      b"(function(x){x=fn(x+1);x=fn(x+2);return fn(x+3)".length])
+  run unsafe statementBoundaries(&mut engine, context, b"(x=>fn(x+1))",
+    &[b"(x=>".length, b"(x=>fn(x+1)".length])
+  run unsafe statementBoundaries(&mut engine, context,
+    b"(function(x){while(fn(x)){x=fn(x+1);}return x})",
+    &[b"(function(x){".length, b"(function(x){while(fn(x)){".length,
+      b"(function(x){while(fn(x)){x=fn(x+1);}".length,
+      b"(function(x){while(fn(x)){x=fn(x+1);}return x".length])
+  run unsafe statementBoundaries(&mut engine, context, b"(function(x=fn(0)){return fn(x)})",
+    &[b"(function(x=fn(0)){".length, b"(function(x=fn(0)){return fn(x)".length])
+  let source = b"(function(flag=true){let x=0;if(flag){debugger;debugger;x=1;}for(let i=0;i<2;i++){x+=i;}try{x+=0}catch(e){x=9}try{x+=0}finally{x+=0}return x})()"
+  unsafe debugger.configure(rt, false)
+  let ordinary = run unsafe compile(&mut engine, context, source, false)
+  let baseline = run writer.writeObject(&mut engine, realm, unsafe lendBits(&ordinary, ordinary), writer.JS_WRITE_OBJ_BYTECODE)
+  unsafe debugger.configure(rt, true)
+  let ordinaryEnabled = run unsafe compile(&mut engine, context, source, false)
+  let enabledWire = run writer.writeObject(&mut engine, realm, unsafe lendBits(&ordinaryEnabled, ordinaryEnabled), writer.JS_WRITE_OBJ_BYTECODE)
+  run Testing.expect((baseline.asSlice() == enabledWire.asSlice()),
+    "runtime debugger configuration alone leaves default compilation and QuickJS bytes unchanged")
+  let anchor = ()
+  let defaultCode = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference(ordinaryEnabled))
+  run Testing.expect(!defaultCode.debuggerMetadata.enabled && defaultCode.debuggerMetadata.locations.length() == 0,
+    "default compilation does not allocate debugger tables")
+  drop defaultCode
+  unsafe gc.release(&mut engine, rt, ordinary) unsafe gc.release(&mut engine, rt, ordinaryEnabled)
+
+  let compiled = run unsafe compile(&mut engine, context, source, true)
+  let top = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference(compiled))
+  let childReference = reference(top.constants.get(0)) drop top
+  let child = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, childReference)
+  let code = unsafe bytes(&child.code)
+  run Testing.expect(child.debuggerMetadata.validate(code, u16.toUsize(child.variableCount), source.length),
+    "opted-in relocated metadata validates against final bytecode")
+  run Testing.expect(child.debuggerMetadata.catchTargets.length() == 1
+    && child.debuggerMetadata.catches(child.debuggerMetadata.catchTargets.get(0)),
+    "source catch targets exclude catch-body cleanup and finally-only handlers")
+  run Testing.expect(child.debuggerMetadata.closureScopes.length() == child.closureVars.length(),
+    "closure scope origins stay parallel to captured variables")
+  let mut sites: usize = 0 let mut prior: u32 = 0 let mut breakpoint: usize = 0
+  let mut picked = false let mut i: usize = 0
+  while i < child.debuggerMetadata.locations.length() {
+    let location = child.debuggerMetadata.locations.get(i)
+    if location.debuggerStatement {
+      run Testing.expect(location.statementStart, "debugger sites retain both debugger and statement markers")
+      if sites == 1 { run Testing.expect(location.pc == prior + 1, "consecutive debugger sites remain distinct after shrinking") }
+      prior = location.pc sites = sites + 1
+    } else if !picked { breakpoint = u32.toUsize(location.pc) picked = true }
+    i = i + 1
+  }
+  run Testing.expect(sites == 2 && picked, "compiler exposes debugger sites and an ordinary executable PC")
+  let mut pc: usize = 0 let mut shortJump = false
+  while pc < code.length {
+    let opcode = code[pc]
+    if opcode == op.OP_goto8 || opcode == op.OP_if_false8 || opcode == op.OP_if_true8 { shortJump = true }
+    pc = pc + u8.toUsize(op.opcodeInfo(opcode, true).size)
+  }
+  run Testing.expect(shortJump, "debug compilation still shrinks branch displacements")
+  let cloned = run child.debuggerMetadata.clone()
+  let mut encoded = run metadata.encode(&cloned)
+  let restored = run metadata.decode(encoded.asSlice(), code, u16.toUsize(child.variableCount), source.length)
+  let reencoded = run metadata.encode(&restored)
+  run Testing.expect((encoded.asSlice() == reencoded.asSlice()), "metadata clone and codec roundtrip preserve every field")
+  encoded.set(0, 2)
+  let oldVersion = run Effect.result(metadata.decode(encoded.asSlice(), code, u16.toUsize(child.variableCount), source.length))
+  match move oldVersion {
+    Result<Metadata, InvalidMetadata | OutOfMemoryError>.Success { value } => {
+      drop value run Testing.expect(false, "old caches without statement semantics must be rejected")
+    }
+    Result<Metadata, InvalidMetadata | OutOfMemoryError>.Failure { error } => {
+      match move error { InvalidMetadata e => { drop e } OutOfMemoryError e => { fail move e } }
+    }
+  }
+  encoded.set(0, u32.toU8(metadata.CACHE_VERSION))
+  encoded.set(4, 4)
+  let rejected = run Effect.result(metadata.decode(encoded.asSlice(), code, u16.toUsize(child.variableCount), source.length))
+  match move rejected {
+    Result<Metadata, InvalidMetadata | OutOfMemoryError>.Success { value } => {
+      drop value run Testing.expect(false, "cache decoder rejects unknown flags")
+    }
+    Result<Metadata, InvalidMetadata | OutOfMemoryError>.Failure { error } => {
+      match move error { InvalidMetadata e => { drop e } OutOfMemoryError e => { fail move e } }
+    }
+  }
+  drop child
+  let wire = run writer.writeObject(&mut engine, realm, unsafe lendBits(&compiled, compiled), writer.JS_WRITE_OBJ_BYTECODE)
+  let mut writeAnchor = ()
+  let mutable = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut writeAnchor, childReference)
+  let saved = Intrinsic.replace(mutable.debuggerMetadata, Metadata.make()) drop mutable
+  let withoutTables = run writer.writeObject(&mut engine, realm, unsafe lendBits(&compiled, compiled), writer.JS_WRITE_OBJ_BYTECODE)
+  run Testing.expect((wire.asSlice() == withoutTables.asSlice()), "native debugger metadata never enters QuickJS bytes")
+  let restoredChild = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut writeAnchor, childReference)
+  restoredChild.debuggerMetadata = move saved drop restoredChild
+
+  let decoded = run reader.readObject(&mut engine, realm, wire.asSlice(), reader.BYTECODE)
+  let decodedTop = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference(decoded))
+  let decodedChild = reference(decodedTop.constants.get(0)) drop decodedTop
+  let decodedMutable = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut writeAnchor, decodedChild)
+  run Testing.expect(!decodedMutable.debuggerMetadata.enabled, "QuickJS reader does not fabricate absent debugger metadata")
+  run Testing.expect(restored.validate(unsafe bytes(&decodedMutable.code), u16.toUsize(decodedMutable.variableCount), source.length),
+    "separate metadata validates against roundtripped bytecode before attachment")
+  decodedMutable.debuggerMetadata = move restored drop decodedMutable
+  let originSource = b"(function(){let x=1;{let x=2;return ()=>eval('x')}})()"
+  let originCompiled = run unsafe compile(&mut engine, context, originSource, true)
+  let originRoot = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference(originCompiled))
+  let originOuter = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference(originRoot.constants.get(0)))
+  let originInner = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference(originOuter.constants.get(0)))
+  let mut shadowed = false i = 0
+  while i < originInner.closureVars.length() {
+    let name = originInner.closureVars.get(i).name let first = originInner.debuggerMetadata.closureScopes.get(i)
+    let mut j = i + 1
+    while j < originInner.closureVars.length() {
+      let second = originInner.debuggerMetadata.closureScopes.get(j)
+      if name != 0 && name == originInner.closureVars.get(j).name && first.depth > 0
+        && first.depth == second.depth && first.scope != second.scope { shadowed = true }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  run Testing.expect(shadowed, "genuine direct eval retains same-name inherited lexical scope identities")
+  drop originInner drop originOuter drop originRoot
+  unsafe gc.release(&mut engine, rt, originCompiled)
+  // A pending reaction captures `resolved`, not the unrelated weak target in
+  // the same outer activation. Debug metadata must not add a strong edge.
+  let memory = engine.memory
+  let setup = Value.intoBits(run eval.evaluate(&mut engine, memory, realm,
+    b"globalThis.debugRetentionResolved=false;globalThis.debugRetentionPromise=new Promise(()=>{});globalThis.debugRetentionWeak=(function weakWait(){const resource={};const reference=new WeakRef(resource);debugRetentionPromise.then(()=>{debugRetentionResolved=true});return reference})()",
+    b"debugger-weak-retention.js", flags.FLAG_DEBUGGER))
+  unsafe gc.release(&mut engine, rt, setup)
+  run unsafe gc.collect(&mut engine, rt, true)
+  run unsafe gc.collect(&mut engine, rt, true)
+  let collected = Value.intoBits(run eval.evaluate(&mut engine, memory, realm,
+    b"debugRetentionWeak.deref()===undefined&&!debugRetentionResolved",
+    b"debugger-weak-retention.js", flags.FLAG_DEBUGGER))
+  let cleared = match collected { ValueBits.Bool { value } => value _ => false }
+  unsafe gc.release(&mut engine, rt, collected)
+  run Testing.expect(cleared, "debug-only capture slots do not retain an unused outer weak target in a pending reaction")
+  let captureSetup = Value.intoBits(run eval.evaluate(&mut engine, memory, realm,
+    b"globalThis.debugActualCapture=(function(){const resource={answer:42};return {weak:new WeakRef(resource),read:()=>resource.answer}})()",
+    b"debugger-real-capture.js", flags.FLAG_DEBUGGER))
+  unsafe gc.release(&mut engine, rt, captureSetup)
+  run unsafe gc.collect(&mut engine, rt, true)
+  let retained = Value.intoBits(run eval.evaluate(&mut engine, memory, realm,
+    b"debugActualCapture.weak.deref()!==undefined&&debugActualCapture.read()===42",
+    b"debugger-real-capture.js", flags.FLAG_DEBUGGER))
+  let live = match retained { ValueBits.Bool { value } => value _ => false }
+  unsafe gc.release(&mut engine, rt, retained)
+  run Testing.expect(live, "source-captured bindings retain their actual cells and values")
+  let cleanup = Value.intoBits(run eval.evaluate(&mut engine, memory, realm,
+    b"delete globalThis.debugRetentionWeak;delete globalThis.debugRetentionPromise;delete globalThis.debugRetentionResolved;delete globalThis.debugActualCapture",
+    b"debugger-weak-retention.js", flags.FLAG_DEBUGGER))
+  unsafe gc.release(&mut engine, rt, cleanup)
+  engine.services.scenario = 0 engine.services.stops = 0 engine.services.stop = false
+  unsafe debugger.clearBreakpoints(rt)
+  run Testing.expect(run unsafe debugger.addBreakpoint(rt, decodedChild, breakpoint), "breakpoint accepts a real executable metadata PC")
+  let value = run unsafe eval.execute(&mut engine, memory, realm, decoded, immediateRef(ValueBits.Undefined), Pointer.null<StackFrame>())
+  run Testing.expect(value.isNumber() && value.numericValue() == 2.0, "roundtripped debug bytecode executes the original program")
+  unsafe gc.release(&mut engine, rt, value)
+  run Testing.expect(engine.services.stops == 3, "one explicit PC breakpoint and two consecutive debugger statements really suspend")
+  unsafe debugger.clearBreakpoints(rt)
+  unsafe gc.release(&mut engine, rt, compiled)
+  run unsafe entryRange(&mut engine, context, b"(function(){entryRan=1;})()", 1, 0)
+  run unsafe entryRange(&mut engine, context, b"(function(){'use strict';\n/* \xc3\xa9\xf0\x9f\x98\x80 */entryRan=1;\n})()", 1, 1)
+  run unsafe entryRange(&mut engine, context, b"(function(){/* empty user source */})()", 0, 2)
+  run unsafe entryRange(&mut engine, context, b"(function(){'use strict';})()", 1, 3)
+  unsafe debugger.configure(rt, false)
+}

@@ -2,16 +2,23 @@
 //! Latin-1 units come from a per-runtime table filled on first use, so a hit
 //! retains one cell instead of allocating. The runtime owns one reference to
 //! each entry, and destroyRuntime releases them. Entries 256 to 511 hold the
-//! decimal text of the indices 10 to 255, for for-in keys.
+//! decimal text of the indices 10 to 255, for for-in keys. Entries 512 to 767
+//! hold recent short Latin-1 substrings by content (see substring), and entry
+//! 768 the empty string.
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
 import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.num.i32
+import silk.mem.pointer { Pointer }
 import silk.collections.slice { Slice }
 import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
 import js_owned_value { ValueRef }
 import js_realm { Realm, lendRealm }
 import js_core_types { RuntimeState, ContextState }
-import js_string_types { StringLengthError }
+import js_string_types { FlatString, StringLengthError, latin1Bytes, stringReference, releaseString }
 import js_strings { Strings }
 
 @inlineAlways
@@ -88,4 +95,183 @@ pub effect fn decimal<'a>(realm: Realm<'a>, index: u32) -> ValueBits
   filled.unitStrings[u32.toUsize(index) + 256] = Strings.duplicate(made)
   drop filled
   return made
+}
+
+/// Where the substring entries start in the unit table, how many there are,
+/// and the longest substring they hold.
+const SUBSTRING_BASE: usize = 512
+const SUBSTRING_LONGEST: usize = 32
+const EMPTY_ENTRY: usize = 768
+
+/// value's units from start to end, as Strings.substring makes them. A short
+/// Latin-1 piece of a flat Latin-1 string comes from the runtime's table of
+/// recent substrings when one there has the same units (exec results take the
+/// same protocol, host or key from many inputs), else is made and replaces the
+/// entry its units hash to. An entry only keeps one short string alive.
+pub unsafe effect fn substring(runtime: *mut HeapHeader, value: ValueBits, start: usize, end: usize) -> ValueBits
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let count = end - start
+  if count > SUBSTRING_LONGEST || value.tag() != -7 { return run general(value, start, end) }
+  let length = flatLatin1Length(value)
+  if length == usize.MAX { return run unsafe wideSubstring(runtime, value, start, end) }
+  if end > length || (start == 0 && end == length) { return run general(value, start, end) }
+  if count == 0 { return run unsafe empty(runtime) }
+  let bytes = Slice.view(unsafe latin1Bytes(&value, stringReference(value)), start, count)
+  if count == 1 { return run unsafe unit(runtime, u8.toU32(bytes[0])) }
+  let slot = SUBSTRING_BASE + slotOf(bytes)
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let cached = state.unitStrings[slot]
+  drop state
+  if cached.tag() == -7 && flatLatin1Length(cached) == count && sameBytes(unsafe latin1Bytes(&cached, stringReference(cached)), bytes) {
+    return Strings.duplicate(cached)
+  }
+  return run unsafe replaceEntry(runtime, slot, bytes)
+}
+/// substring for a flat UTF-16 value: a short piece holding a unit above 255
+/// (a wide string either way) uses the table by its bytes as well.
+@inlineNever
+unsafe effect fn wideSubstring(runtime: *mut HeapHeader, value: ValueBits, start: usize, end: usize) -> ValueBits
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let count = end - start
+  let flat = unsafe HeapCell.shortPayload<FlatString, ValueBits>(&value, stringReference(value))
+  if !flat.wide || end > flat.length() || count < 2 || (start == 0 && end == flat.length()) {
+    drop flat
+    return run Strings.substring(value, start, end)
+  }
+  let units = Slice.view(flat.wideUnits(), start, count)
+  let mut wide = false
+  let mut k: usize = 0
+  while k < count { if units[k] > 255 { wide = true } k = k + 1 }
+  if !wide {
+    drop flat
+    return run Strings.substring(value, start, end)
+  }
+  let bytes = Slice.asBytes<u16>(units)
+  let slot = SUBSTRING_BASE + slotOf(bytes)
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let cached = state.unitStrings[slot]
+  drop state
+  if cached.tag() == -7 {
+    let entry = unsafe HeapCell.shortPayload<FlatString, ValueBits>(&cached, stringReference(cached))
+    if entry.wide && entry.length() == count && sameBytes(Slice.asBytes<u16>(entry.wideUnits()), bytes) {
+      return Strings.duplicate(cached)
+    }
+  }
+  let made = run Strings.joinWide(units)
+  let mut fillAnchor = ()
+  let filled = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut fillAnchor, runtime)
+  let old = filled.unitStrings[slot]
+  filled.unitStrings[slot] = Strings.duplicate(made)
+  drop filled
+  releaseString(old)
+  return made
+}
+// The rest stays out of line, so a table hit is all a result piece runs.
+@inlineNever
+effect fn general(value: ValueBits, start: usize, end: usize) -> ValueBits ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  return run Strings.substring(value, start, end)
+}
+@inlineNever
+unsafe effect fn replaceEntry(runtime: *mut HeapHeader, slot: usize, bytes: &[u8]) -> ValueBits
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let made = run Strings.joinLatin1(bytes, Slice.view(bytes, 0, 0))
+  let mut fillAnchor = ()
+  let filled = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut fillAnchor, runtime)
+  let old = filled.unitStrings[slot]
+  filled.unitStrings[slot] = Strings.duplicate(made)
+  drop filled
+  releaseString(old)
+  return made
+}
+
+/// The length of a flat string (tag -7) when it is Latin-1, else usize.MAX.
+@inlineAlways
+fn flatLatin1Length(value: ValueBits) -> usize {
+  let flat = unsafe HeapCell.shortPayload<FlatString, ValueBits>(&value, stringReference(value))
+  if flat.wide { return usize.MAX }
+  return flat.length()
+}
+/// The empty string, from the table's last entry.
+unsafe effect fn empty(runtime: *mut HeapHeader) -> ValueBits ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let cached = state.unitStrings[EMPTY_ENTRY]
+  drop state
+  if cached.isString() { return Strings.duplicate(cached) }
+  let bytes: [u8; 1] = [0]
+  let made = run Strings.fromLatin1(Slice.view<u8>(&bytes, 0, 0))
+  let mut fillAnchor = ()
+  let filled = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut fillAnchor, runtime)
+  filled.unitStrings[EMPTY_ENTRY] = Strings.duplicate(made)
+  drop filled
+  return made
+}
+@inlineAlways
+fn word(bytes: &[u8], at: usize) -> u64 {
+  return unsafe Pointer.readUnaligned<u64>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u64>(
+    unsafe Pointer.at<u8>(unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(bytes)), at)))
+}
+@inlineAlways
+fn half(bytes: &[u8], at: usize) -> u64 {
+  return u32.toU64(unsafe Pointer.readUnaligned<u32>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u32>(
+    unsafe Pointer.at<u8>(unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(bytes)), at))))
+}
+/// The first and last eight (or four, or two) bytes of 2 to 64, read so that
+/// together they cover bytes up to 16 long.
+@inlineAlways
+fn ends(bytes: &[u8]) -> u64 {
+  let n = bytes.length
+  if n >= 8 { return u64.bitXor(word(bytes, 0), u64.wrappingMultiply(word(bytes, n - 8), 0x9e3779b97f4a7c15)) }
+  if n >= 4 { return u64.bitOr(half(bytes, 0), u64.shiftLeft(half(bytes, n - 4), 32)) }
+  return u64.bitOr(u8.toU64(bytes[0]), u64.bitOr(u64.shiftLeft(u8.toU64(bytes[1]), 8), u64.shiftLeft(u8.toU64(bytes[n - 1]), 16)))
+}
+@inlineAlways
+fn slotOf(bytes: &[u8]) -> usize {
+  let mut h = u64.bitXor(ends(bytes), usize.toU64(bytes.length))
+  if bytes.length > 16 { h = u64.bitXor(h, u64.wrappingMultiply(word(bytes, 8), 0xc2b2ae3d27d4eb4f)) }
+  return u64.toUsize(u64.shiftRight(u64.wrappingMultiply(h, 0xff51afd7ed558ccd), 56))
+}
+/// Whether a and b (the same length, 2 to 64) hold the same bytes.
+@inlineAlways
+fn sameBytes(a: &[u8], b: &[u8]) -> bool {
+  let n = b.length
+  if n >= 8 {
+    let mut k: usize = 0
+    while n - k > 8 {
+      if word(a, k) != word(b, k) { return false }
+      k = k + 8
+    }
+    return word(a, n - 8) == word(b, n - 8)
+  }
+  if n >= 4 { return half(a, 0) == half(b, 0) && half(a, n - 4) == half(b, n - 4) }
+  return a[0] == b[0] && a[1] == b[1] && a[n - 1] == b[n - 1]
+}
+
+/// The decimal text of number, retained: from the runtime's recent-integer
+/// table when it holds number, else new and remembered there. Like V8's number
+/// string cache, it lets loops that rebuild the same keys (String(i) used for
+/// a Map key and then for its lookup) reuse one string. Strings have no
+/// identity, so sharing is unobservable.
+pub effect fn integer<'a>(realm: Realm<'a>, number: i32) -> ValueBits ! OutOfMemoryError ? &mut Allocator {
+  let anchor = ()
+  let state = realm.state(&anchor)
+  let runtime = state.runtime
+  drop state
+  let slot = i32.toUsize(i32.bitAnd(number, 1023))
+  let registry = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let cached = registry.numberStrings[slot]
+  let hit = registry.numberStringKeys[slot] == number && cached.isString()
+  drop registry
+  if hit { return Strings.duplicate(cached) }
+  let text = run Strings.fromInteger(number)
+  let mut writeAnchor = ()
+  let table = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut writeAnchor, runtime)
+  let old = table.numberStrings[slot]
+  table.numberStrings[slot] = Strings.duplicate(text)
+  table.numberStringKeys[slot] = number
+  drop table
+  releaseString(old)
+  return text
 }

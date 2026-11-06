@@ -190,6 +190,7 @@ import byte_buffer { ByteBuffer, readU32 }
 import js_primitives as primitive
 import js_primitives { EqualityMode }
 import js_value { ValueBits }
+import js_debugger_metadata { Metadata as DebuggerMetadata }
 import js_heap { HeapCell, HeapHeader, HeapKind }
 import js_strings { Strings }
 import js_string_types { StringLengthError, RopeString, StringOwner }
@@ -264,6 +265,8 @@ effect fn internal(kind:u8,realm:*mut HeapHeader)->ValueBits ! OutOfMemoryError 
     return ValueBits.Module { reference:reference }
   }
   let reference=run HeapCell.allocate<FunctionBytecode>(HeapKind.FunctionBytecode,FunctionBytecode {
+    scriptId:0,scriptIsEval:false,
+    debuggerMetadata:DebuggerMetadata.make(),
     mode:0,hasPrototype:false,hasSimpleParameterList:true,isDerivedClassConstructor:false,
     needsHomeObject:false,kind:FunctionKind.Normal,newTargetAllowed:false,superCallAllowed:false,
     superAllowed:false,argumentsAllowed:false,readOnlyBytecode:false,isDirectOrIndirectEval:false,

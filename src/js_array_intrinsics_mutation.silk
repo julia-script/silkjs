@@ -3,27 +3,30 @@
 //! its final public length remains the pre-species snapshot (pinned behavior).
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
-import silk.core.result { Result }
 import silk.mem.pointer { Pointer }
+import silk.core.result { Result }
 import silk.num.i64
 import silk.num.u32
 import silk.num.usize
-import js_heap { HeapHeader }
+import js_heap { HeapCell, HeapHeader }
+import js_atoms { ATOM_INTEGER_TAG }
+import js_class_data as classes
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.num.u8
 import js_value { ValueBits }
 import js_intl_realm as ops
 import js_realm { Realm, lendRealm, Arguments, lendArguments }
-import js_owned_value { Value, ValueRef, lendBits, immediateRef }
-import js_core_types { NativeErrorKind, JS_PROP_THROW }
+import js_owned_value { Value, ValueRef, lendBits, immediateRef, lendFor }
+import js_core_types { NativeErrorKind, JS_PROP_THROW, JS_PROP_TMASK, ObjectData, ObjectPayload, ShapeData }
 import js_gc { HeapHooks }
 import js_coercion_host { CoercionHooks }
 import js_property_host { OwnPropertyHooks, GetPropertyHooks, HasPropertyHooks }
 import js_property_write_host { PropertyWriteHooks }
 import js_call_host { CallHooks }
-import js_typed_array_methods_support as arguments
 import js_typed_array_methods_array_species as species
 import js_array_intrinsics_support as support
 import js_array_construction as construction
-import js_collection_support as owners
 import js_function_invoke as invoke
 import js_boxing as boxing
 import js_property_get as properties
@@ -42,7 +45,7 @@ effect fn clamp<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H, realm: Real
   value: ValueRef<'b>, minimum: i64, maximum: i64, negativeOffset: i64) -> i64
   ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
   let mut output: i64 = 0
-  run integers.int64Clamp(&mut hooks, realm, &mut output, value.borrow(), minimum, maximum, negativeOffset)
+  run integers.toInt64Clamp(&mut hooks, realm, &mut output, value.borrow(), minimum, maximum, negativeOffset)
   return output
 }
 effect fn indexError<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>, index: i64) -> never ! JsException ? &mut Allocator {
@@ -59,43 +62,135 @@ effect fn indexError<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>, inde
 }
 effect fn spliceFast<'a, 'b, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>, object: ValueRef<'b>,
   start: i64, removed: i64, added: i64, args: Arguments<'a>) -> () ! OutOfMemoryError ? &mut Allocator {
-  let count = unsafe support.fastCount(object.view()) let final = start + removed
+  let count = support.fastCount(object) let final = start + removed
   let newCount = count + added - removed
   if removed > added {
     let mut index = start + added
     while index < final {
-      let value = unsafe support.fastTake(object.view(), index)
-      unsafe owners.release(&mut hooks, realm, value)
+      realm.release(&mut hooks, support.fastTake(object, index))
       index = index + 1
     }
     // The tail moves down as is; the slots past newCount are cut off.
-    unsafe support.fastMove(object.view(), final, final + added - removed, count - final)
-    unsafe support.truncate(object.view(), newCount)
+    unsafe support.fastMove(object, final, final + added - removed, count - final)
+    unsafe support.truncate(object, newCount)
   } else if added > removed {
     run support.reserve(&mut hooks, realm, object, newCount)
     let mut index = count
-    while index < newCount { run unsafe support.appendReserved(object.view(), ValueBits.Undefined) index = index + 1 }
+    while index < newCount { run support.appendReserved(object, Value.immediate(ValueBits.Undefined)) index = index + 1 }
     // The tail moves up as is; the gap it leaves becomes undefined, which the
     // added values below then replace.
-    unsafe support.fastMove(object.view(), final, final + added - removed, count - final)
-    unsafe support.fastFill(object.view(), final, added - removed)
+    unsafe support.fastMove(object, final, final + added - removed, count - final)
+    unsafe support.fastFill(object, final, added - removed)
   }
   let mut index: i64 = 0
   while index < added {
-    unsafe support.fastReplace(&mut hooks, realm, object, start + index, unsafe (unsafe args.slots().get(i64.toUsize(index) + 2)).retained())
+    support.fastReplace(&mut hooks, realm, object, start + index, args.get(i64.toUsize(index) + 2).dup())
     index = index + 1
   }
 }
 // Copies each present element of object[start, start + count) to output[0, count).
+struct SparseEntry { index: u32, slot: usize }
+impl Copy for SparseEntry {}
+/// The own integer-keyed records of a slow Array in [low, high), into found,
+/// when its prototypes hold no indexed properties and each record is plain
+/// data: 0 when they came in ascending order, 1 when not, -1 when it does not apply.
+effect fn sparseEntries(source: *mut HeapHeader, low: u32, high: u32, found: &mut List<SparseEntry>) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  let mut ascending: i32 = 0
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, source)
+  if data.classId() != classes.JS_CLASS_ARRAY || data.fastArray() { return -1 }
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+  let mut prototype = shape.prototype
+  let mut depth: usize = 0
+  while !Pointer.isNull<HeapHeader>(prototype) {
+    if depth >= 8 { return -1 }
+    let node = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(prototype)
+    let holder = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+    if holder.classId() == classes.JS_CLASS_ARRAY {
+      match &holder.payload {
+        ObjectPayload.FastArray { array } => { if array.values.length() != 0 { return -1 } }
+        _ => ()
+      }
+    } else if holder.classId() != classes.JS_CLASS_OBJECT || holder.isExotic() { return -1 }
+    let records = unsafe HeapCell.payload<ShapeData, ()>(&anchor, holder.shape)
+    let mut r: usize = 0
+    while r < records.properties.length() {
+      if (records.properties.get(r).atom & ATOM_INTEGER_TAG) != 0 { return -1 }
+      r = r + 1
+    }
+    prototype = records.prototype
+    depth = depth + 1
+  }
+  let mut i: usize = 0
+  let mut last: u32 = 0
+  while i < shape.properties.length() {
+    let record = shape.properties.get(i)
+    if (record.atom & ATOM_INTEGER_TAG) != 0 {
+      let index = record.atom & ~ATOM_INTEGER_TAG
+      if index >= low && index < high {
+        if (u8.toU32(record.flags) & JS_PROP_TMASK) != 0 { return -1 }
+        if found.length() != 0 && index < last { ascending = 1 }
+        last = index
+        run found.append(SparseEntry { index: index, slot: i })
+      }
+    }
+    i = i + 1
+  }
+  return ascending
+}
+/// copyPresent for a slow (sparse) Array whose prototypes hold no indexed
+/// properties: its present elements are its own integer-keyed records, so
+/// those are visited in index order instead of probing every index of the
+/// range. All of them must be plain data, so no code runs. False, before any
+/// change, when that does not hold.
+effect fn copySparse<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + PropertyWriteHooks>(
+  hooks: &mut H, realm: Realm<'a>, object: ValueRef<'b>, start: i64, count: i64, output: ValueRef<'b>) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  let source = match object.view() { ValueBits.Object { reference } => reference _ => { return false } }
+  if start < 0 || start + count > 2147483647 { return false }
+  // Defining on a distinct Array runs no code that could change the source.
+  let target = match output.view() { ValueBits.Object { reference } => reference _ => { return false } }
+  if Pointer.address<HeapHeader>(target) == Pointer.address<HeapHeader>(source) { return false }
+  let targetAnchor = ()
+  if (unsafe HeapCell.payload<ObjectData, ()>(&targetAnchor, target)).classId() != classes.JS_CLASS_ARRAY { return false }
+  let low = i64.toU32(start) let high = i64.toU32(start + count)
+  let mut found = List<SparseEntry>.make()
+  let order = run sparseEntries(source, low, high, &mut found)
+  if order < 0 { return false }
+  let ascending = order == 0
+  if !ascending {
+    // Rare (filled from the top down): insertion order, bounded to stay linear-ish.
+    if found.length() > 256 { return false }
+    let mut i: usize = 1
+    while i < found.length() {
+      let item = found.get(i) let mut j = i
+      while j > 0 && found.get(j - 1).index > item.index { let moved = found.get(j - 1) found.set(j, moved) j = j - 1 }
+      found.set(j, item)
+      i = i + 1
+    }
+  }
+  let mut k: usize = 0
+  while k < found.length() {
+    let entry = found.get(k)
+    let anchor = ()
+    let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, source)
+    let value = unsafe data.properties.get(entry.slot).valueBits().retained()
+    drop data
+    let written = run mutations.createDataPropertyUint32(&mut hooks, realm, output, u32.toI64(entry.index - low), unsafe Value.adoptBits(value), JS_PROP_THROW)
+    k = k + 1
+  }
+  return true
+}
 effect fn copyPresent<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + PropertyWriteHooks>(
   hooks: &mut H, realm: Realm<'a>, object: ValueRef<'b>, start: i64, count: i64, output: ValueRef<'b>) -> ()
   ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  if count > 32 && run copySparse(&mut hooks, realm, object, start, count, output) { return () }
   let mut index: i64 = 0
   while index < count {
     let mut value = ValueBits.Undefined
     let present = run properties.tryGetPropertyInt64(&mut hooks, realm, object, start + index, &mut value)
     if present {
-      let written = run unsafe mutations.createDataPropertyUint32(&mut hooks, realm, output, u32.toI64(i64.toU32(index)), value, JS_PROP_THROW)
+      let written = run mutations.createDataPropertyUint32(&mut hooks, realm, output, u32.toI64(i64.toU32(index)), unsafe Value.adoptBits(value), JS_PROP_THROW)
     }
     index = index + 1
   }
@@ -105,37 +200,37 @@ effect fn body<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetProp
   args: Arguments<'a>) -> ValueBits
   ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
   if method == 29 {
-    let count = unsafe support.fastCount(receiver.view())
-    if count >= 0 && unsafe support.intLength(receiver.view()) == count && unsafe support.writableLength(receiver.view()) && unsafe mutations.canExtendFast(core.reference(receiver.view())) {
+    let count = support.fastCount(receiver)
+    if count >= 0 && support.intLength(receiver) == count && support.writableLength(receiver) && unsafe mutations.canExtendFast(core.reference(receiver.view())) {
       let newLength = count + usize.toI64(args.slots().length())
       if newLength <= 2147483647 {
         run support.reserve(&mut hooks, realm, receiver, newLength)
         let mut index: usize = 0
-        while index < args.slots().length() { run unsafe support.appendReserved(receiver.view(), unsafe (unsafe args.slots().get(index)).retained()) index = index + 1 }
-        unsafe support.publishLength(receiver.view(), newLength)
+        while index < args.slots().length() { run support.appendReserved(receiver, args.get(index).dup()) index = index + 1 }
+        support.publishLength(receiver, newLength)
         return ValueBits.number(i64.toF64(newLength))
       }
     }
   }
   let owned = run boxing.toObjectValue(&mut hooks, memory, realm, receiver)
-  let object = owned.view() let mut length: i64 = 0
+  let object = owned.borrow() let mut length: i64 = 0
   run invoke.getLength64(&mut hooks, realm, &mut length, owned.borrow())
   let a = args.get(0).view() let b = args.get(1).view()
   if method == 7 {
-    let mut index: i64 = 0 run unsafe integers.toInt64Sat(&mut hooks, realm, &mut index, a)
+    let mut index: i64 = 0 run integers.toInt64Sat(&mut hooks, realm, &mut index, unsafe lendFor(a))
     if index < 0 { index = length + index }
     if index < 0 || index >= length { return run indexError(&mut hooks, realm, index) }
-    let output = unsafe Value.adoptBits(run construction.allocateFast(&mut hooks, memory, realm, length))
-    let dense = unsafe support.fastCount(object) == length
+    let output = run construction.allocateFast(&mut hooks, memory, realm, length)
+    let dense = support.fastCount(object) == length
     let mut at: i64 = 0
     while at < length {
       let mut value = ValueBits.Undefined
       if at == index { value = unsafe b.retained() }
-      else if dense { value = unsafe support.fastGet(object, at) }
+      else if dense { value = support.fastGet(object, at).intoBits() }
       else {
         let present = run properties.tryGetPropertyInt64(&mut hooks, realm, owned.borrow(), at, &mut value)
       }
-      unsafe support.fastReplace(&mut hooks, realm, output.borrow(), at, value)
+      support.fastReplace(&mut hooks, realm, output.borrow(), at, unsafe Value.adoptBits(value))
       at = at + 1
     }
     return output.intoBits()
@@ -145,12 +240,12 @@ effect fn body<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetProp
     let mut removedValue = Value.immediate(ValueBits.Undefined)
     if length > 0 {
       newLength = length - 1
-      if unsafe support.fastCount(object) == length {
-        removedValue = unsafe Value.adoptBits(unsafe support.popFast(object, method == 28))
+      if support.fastCount(object) == length {
+        removedValue = support.popFast(object, method == 28)
         // A fast Array's writable length takes the new count directly: [[Set]] on
         // it would reach the same store, and no accessor can observe the write.
-        if unsafe support.writableLength(object) {
-          unsafe support.publishLength(object, newLength)
+        if support.writableLength(object) {
+          support.publishLength(object, newLength)
           return removedValue.intoBits()
         }
       }
@@ -161,7 +256,7 @@ effect fn body<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetProp
         let deleted = run deletion.deletePropertyInt64(&mut hooks, memory, realm, owned.borrow(), newLength, JS_PROP_THROW)
       }
     }
-    let written = run unsafe mutations.setProperty(&mut hooks, realm, owned.borrow(), atoms.JS_ATOM_length, ValueBits.number(i64.toF64(newLength)))
+    let written = run mutations.setProperty(&mut hooks, realm, owned.borrow(), atoms.JS_ATOM_length, Value.immediate(ValueBits.number(i64.toF64(newLength))))
     return removedValue.intoBits()
   }
   if method == 29 || method == 30 {
@@ -174,14 +269,14 @@ effect fn body<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetProp
     }
     let mut index: usize = 0
     while index < args.slots().length() {
-      let written = run unsafe mutations.setPropertyInt64(&mut hooks, realm, owned.borrow(), start + usize.toI64(index), unsafe (unsafe args.slots().get(index)).retained())
+      let written = run mutations.setPropertyInt64(&mut hooks, realm, owned.borrow(), start + usize.toI64(index), args.get(index).dup())
       index = index + 1
     }
-    let written = run unsafe mutations.setProperty(&mut hooks, realm, owned.borrow(), atoms.JS_ATOM_length, ValueBits.number(i64.toF64(newLength)))
+    let written = run mutations.setProperty(&mut hooks, realm, owned.borrow(), atoms.JS_ATOM_length, Value.immediate(ValueBits.number(i64.toF64(newLength))))
     return ValueBits.number(i64.toF64(newLength))
   }
   if method == 31 {
-    if unsafe support.fastCount(object) == length { unsafe support.reverseFast(object) return owned.intoBits() }
+    if support.fastCount(object) == length { support.reverseFast(object) return owned.intoBits() }
     let mut low: i64 = 0 let mut high = length - 1
     while low < high {
       let mut lowBits = ValueBits.Undefined let mut highBits = ValueBits.Undefined
@@ -189,30 +284,30 @@ effect fn body<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetProp
       let lowValue = unsafe Value.adoptBits(lowBits)
       let highPresent = run properties.tryGetPropertyInt64(&mut hooks, realm, owned.borrow(), high, &mut highBits)
       if highPresent {
-        let written = run unsafe mutations.setPropertyInt64(&mut hooks, realm, owned.borrow(), low, highBits)
+        let written = run mutations.setPropertyInt64(&mut hooks, realm, owned.borrow(), low, unsafe Value.adoptBits(highBits))
         if lowPresent {
-          let written = run unsafe mutations.setPropertyInt64(&mut hooks, realm, owned.borrow(), high, lowValue.intoBits())
+          let written = run mutations.setPropertyInt64(&mut hooks, realm, owned.borrow(), high, move lowValue)
         } else {
           drop lowValue
           let deleted = run deletion.deletePropertyInt64(&mut hooks, memory, realm, owned.borrow(), high, JS_PROP_THROW)
         }
       } else if lowPresent {
         let deleted = run deletion.deletePropertyInt64(&mut hooks, memory, realm, owned.borrow(), low, JS_PROP_THROW)
-        let written = run unsafe mutations.setPropertyInt64(&mut hooks, realm, owned.borrow(), high, lowValue.intoBits())
+        let written = run mutations.setPropertyInt64(&mut hooks, realm, owned.borrow(), high, move lowValue)
       } else { drop lowValue }
       low = low + 1 high = high - 1
     }
     return owned.intoBits()
   }
   if method == 32 {
-    let output = unsafe Value.adoptBits(run construction.allocateFast(&mut hooks, memory, realm, length))
-    let dense = unsafe support.fastCount(object) == length
+    let output = run construction.allocateFast(&mut hooks, memory, realm, length)
+    let dense = support.fastCount(object) == length
     let mut index: i64 = 0
     while index < length {
       let mut value = ValueBits.Undefined
-      if dense { value = unsafe support.fastGet(object, length - index - 1) }
+      if dense { value = support.fastGet(object, length - index - 1).intoBits() }
       else { let present = run properties.tryGetPropertyInt64(&mut hooks, realm, owned.borrow(), length - index - 1, &mut value) }
-      unsafe support.fastReplace(&mut hooks, realm, output.borrow(), index, value)
+      support.fastReplace(&mut hooks, realm, output.borrow(), index, unsafe Value.adoptBits(value))
       index = index + 1
     }
     return output.intoBits()
@@ -232,15 +327,15 @@ effect fn body<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetProp
   if method == 33 {
     let mut end = length if !core.undefined(b) { end = run clamp(&mut hooks, realm, args.get(1), 0, length, length) }
     let mut count = end - start if count < 0 { count = 0 }
-    let constructor = unsafe Value.adoptBits(run species.getConstructor(&mut hooks, memory, realm, owned.borrow()))
-    let dense = unsafe support.fastCount(object)
+    let constructor = run species.getConstructor(&mut hooks, memory, realm, owned.borrow())
+    let dense = support.fastCount(object)
     if core.undefined(constructor.view()) && dense >= 0 && start + count <= dense {
       return run support.denseSlice(&mut hooks, memory, realm, owned.borrow(), start, count)
     }
-    let output = unsafe Value.adoptBits(run species.createFromConstructor(&mut hooks, memory, realm, constructor.borrow(), count))
+    let output = run species.createFromConstructor(&mut hooks, memory, realm, constructor.borrow(), count)
     drop constructor
     run copyPresent(&mut hooks, realm, owned.borrow(), start, count, output.borrow())
-    let written = run unsafe mutations.setProperty(&mut hooks, realm, output.borrow(), atoms.JS_ATOM_length, ValueBits.number(i64.toF64(count)))
+    let written = run mutations.setProperty(&mut hooks, realm, output.borrow(), atoms.JS_ATOM_length, Value.immediate(ValueBits.number(i64.toF64(count))))
     return output.intoBits()
   }
   let mut removed: i64 = 0 let mut added: i64 = 0
@@ -255,33 +350,33 @@ effect fn body<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetProp
     return run ops.error(&mut hooks,realm, b"Array loo long")
   }
   if method == 35 {
-    let output = unsafe Value.adoptBits(run construction.allocateFast(&mut hooks, memory, realm, newLength))
-    let dense = unsafe support.fastCount(object) == length
+    let output = run construction.allocateFast(&mut hooks, memory, realm, newLength)
+    let dense = support.fastCount(object) == length
     let mut index: i64 = 0
     while index < newLength {
       let mut value = ValueBits.Undefined
       if index >= start && index < start + added { value = unsafe (unsafe args.slots().get(i64.toUsize(index - start) + 2)).retained() }
       else {
         let mut from = index if index >= start { from = index - added + removed }
-        if dense { value = unsafe support.fastGet(object, from) }
+        if dense { value = support.fastGet(object, from).intoBits() }
         else { let present = run properties.tryGetPropertyInt64(&mut hooks, realm, owned.borrow(), from, &mut value) }
       }
-      unsafe support.fastReplace(&mut hooks, realm, output.borrow(), index, value)
+      support.fastReplace(&mut hooks, realm, output.borrow(), index, unsafe Value.adoptBits(value))
       index = index + 1
     }
     return output.intoBits()
   }
-  let constructor = unsafe Value.adoptBits(run species.getConstructor(&mut hooks, memory, realm, owned.borrow()))
-  let dense = unsafe support.fastCount(object)
+  let constructor = run species.getConstructor(&mut hooks, memory, realm, owned.borrow())
+  let dense = support.fastCount(object)
   let mut output = Value.immediate(ValueBits.Undefined)
-  if core.undefined(constructor.view()) && dense >= 0 && start + removed <= dense && unsafe support.writableLength(object) && unsafe mutations.canExtendFast(core.reference(object)) {
+  if core.undefined(constructor.view()) && dense >= 0 && start + removed <= dense && support.writableLength(object) && unsafe mutations.canExtendFast(core.reference(object.view())) {
     output = unsafe Value.adoptBits(run support.denseSlice(&mut hooks, memory, realm, owned.borrow(), start, removed))
     run spliceFast(&mut hooks, realm, owned.borrow(), start, removed, added, args)
   } else {
-    output = unsafe Value.adoptBits(run species.createFromConstructor(&mut hooks, memory, realm, constructor.borrow(), removed))
+    output = run species.createFromConstructor(&mut hooks, memory, realm, constructor.borrow(), removed)
     drop constructor
     run copyPresent(&mut hooks, realm, owned.borrow(), start, removed, output.borrow())
-    let written = run unsafe mutations.setProperty(&mut hooks, realm, output.borrow(), atoms.JS_ATOM_length, ValueBits.number(i64.toF64(removed)))
+    let written = run mutations.setProperty(&mut hooks, realm, output.borrow(), atoms.JS_ATOM_length, Value.immediate(ValueBits.number(i64.toF64(removed))))
     let mut index: i64 = 0
     if added != removed {
       let mut direction: i64 = 1 if added > removed { direction = -1 }
@@ -291,11 +386,11 @@ effect fn body<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetProp
     }
     index = 0
     while index < added {
-      let written = run unsafe mutations.setPropertyInt64(&mut hooks, realm, owned.borrow(), start + index, unsafe (unsafe args.slots().get(i64.toUsize(index) + 2)).retained())
+      let written = run mutations.setPropertyInt64(&mut hooks, realm, owned.borrow(), start + index, args.get(i64.toUsize(index) + 2).dup())
       index = index + 1
     }
   }
-  let written = run unsafe mutations.setProperty(&mut hooks, realm, owned.borrow(), atoms.JS_ATOM_length, ValueBits.number(i64.toF64(newLength)))
+  let written = run mutations.setProperty(&mut hooks, realm, owned.borrow(), atoms.JS_ATOM_length, Value.immediate(ValueBits.number(i64.toF64(newLength))))
   return output.intoBits()
 }
 pub effect fn call<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + PropertyWriteHooks + CallHooks>(

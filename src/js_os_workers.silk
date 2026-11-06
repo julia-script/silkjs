@@ -1,8 +1,8 @@
 //! Complete native Worker class and event ports, quickjs-libc.c:2356-2410,
 //! 3669-3904,4021-4040. A port is owned by its Worker object, never the event list.
 //! Source's postMessage clones ordinary ArrayBuffers; it has no transfer-list API.
-import js_owned_value { Value, ValueRef, lendBits, immediateRef }
-import js_realm { Realm, Arguments, lendRealm }
+import js_owned_value { Value, ValueRef, immediateRef }
+import js_realm { Realm, Arguments }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.collections.list { List }
@@ -16,14 +16,13 @@ import js_heap { HeapCell, HeapHeader, HeapKind, CellRef }
 import silk.core.ownership { Copy }
 import js_value { ValueBits }
 import js_intl_realm as ops
-import js_core_types { RuntimeState, ContextState, ObjectData, ObjectPayload, BuiltinFamily,
-  NativeFunctionId, NativeCallProtocol, FrameSlots, SharedArrayBufferHooks }
+import js_core_types { RuntimeState, ObjectData, ObjectPayload, BuiltinFamily,
+  NativeFunctionId, NativeCallProtocol, SharedArrayBufferHooks }
 import js_gc { HeapHooks, Tracer }
-import js_gc as gc
 import js_runtime as runtime
 import js_runtime_registry as registration
 import js_runtime_classes as classes
-import js_coercion_host { CoercionHooks }
+import js_coercion_host { CoercionHooks, getPropertyOwned }
 import js_property_host { OwnPropertyHooks, GetPropertyHooks }
 import js_property_write_host { PropertyWriteHooks }
 import js_exceptions { JsException }
@@ -36,7 +35,7 @@ import js_intl_common as common
 import js_object_allocate as objects
 import js_module_native as modules
 import js_atom_data as atoms
-import js_binary_object_writer { WriteResult }
+import js_binary_object_writer { WriteResult, SharedLease }
 import js_os_events { ThreadState }
 import js_os_events as events
 import js_os_workers_transport { PipeHandle, GroupHandle, MessageBox, WorkerStart, TransportError }
@@ -58,7 +57,7 @@ pub interface WorkerHooks {
   effect fn writeWorkerMessage<'r, 'v>(self: &mut Self, realm: Realm<'r>,
     value: ValueRef<'v>) -> WriteResult ! JsException ? &mut Allocator
   unsafe effect fn readWorkerMessage<'r>(self: &mut Self, realm: Realm<'r>,
-    data: *const u8, length: usize) -> ValueBits ! JsException ? &mut Allocator
+    data: *const u8, length: usize, leases: &[SharedLease]) -> ValueBits ! JsException ? &mut Allocator
   /// Consumes args, including on failure. The embedding clones native module and
   /// plugin registries using a cross-thread allocator before transport.start.
   effect fn startWorker<'r>(self: &mut Self, realm: Realm<'r>,
@@ -67,8 +66,10 @@ pub interface WorkerHooks {
 /// A worker thread's pipes to its parent.
 struct ParentPipes { receive: PipeHandle, send: PipeHandle }
 struct WorkerData { receive: PipeHandle, send: PipeHandle, port: Option<PortRef> }
+/// `linked` says whether the port is still on its runtime's list; teardown clears it
+/// before the list's ThreadState goes away.
 pub struct Port { previous: Option<PortRef>, next: Option<PortRef>,
-  owner: ?*mut ThreadState, receive: PipeHandle, callback: Value, pollIndex: usize }
+  linked: bool, receive: PipeHandle, callback: Value, pollIndex: usize }
 /// A port on the runtime's port list. Ports are freed only by their Worker's finalizer
 /// or onmessage setter, so a PortRef is used before any JS runs and dropped after.
 pub struct PortRef { cell: CellRef<Port> }
@@ -85,24 +86,16 @@ impl PortRef {
   fn setNext(self: Self, next: Option<PortRef>) -> () { let mut anchor = () let port = self.cell.getMut(&mut anchor) port.next = next }
   fn setPrevious(self: Self, previous: Option<PortRef>) -> () { let mut anchor = () let port = self.cell.getMut(&mut anchor) port.previous = previous }
 }
-/// The list-head pointer for `port`, null when there is none.
-fn headerOf(port: Option<PortRef>) -> ?*mut HeapHeader {
-  return match port { Option<PortRef>.Some { value } => value.header() _ => Pointer.null<HeapHeader>() }
-}
-// The caller proves node is null or a live Port cell.
-unsafe fn portRef(node: ?*mut HeapHeader) -> Option<PortRef> {
-  return match Pointer.nonNullMut(node) {
-    Option<*mut HeapHeader>.Some { value } => Option<PortRef>.some(PortRef { cell: unsafe CellRef<Port>.of(value) })
-    _ => Option<PortRef>.none()
-  }
-}
 /// The first port on the runtime's list.
-pub fn ports<'a>(realm: Realm<'a>) -> Option<PortRef> { let anchor = () return unsafe portRef(events.thread(realm, &anchor).workerPortsFirst) }
+pub fn ports<'a>(realm: Realm<'a>) -> Option<PortRef> { let anchor = () return events.thread(realm, &anchor).workerPortsFirst }
 /// A Worker object's native record, lent while the object is.
 struct Worker<'a> { record: CellRef<WorkerData> }
 impl<'a> Copy for Worker<'a> {}
 pub fn id(method: u32) -> NativeFunctionId { return NativeFunctionId.Builtin { family: BuiltinFamily.Os, method: method } }
-unsafe fn nonnull<T>(pointer: ?*mut T) -> *mut T { return unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(pointer) }
+/// The non-null pointer; traps on null.
+fn nonnull<T>(pointer: ?*mut T) -> *mut T {
+  return match Pointer.nonNullMut<T>(pointer) { Option<*mut T>.Some { value: found } => found _ => Intrinsic.trap("unexpected null pointer") }
+}
 fn invariant() -> never { return Intrinsic.trap("Worker runtime initialization invariant") }
 pub unsafe effect fn allocateShared(rt: *mut HeapHeader, length: usize) -> ?*mut u8 ! OutOfMemoryError {
   let anchor = () let state = unsafe Pointer.borrow<(), ThreadState>(&anchor, unsafe events.state(rt))
@@ -129,37 +122,37 @@ unsafe fn storage(rt: *mut HeapHeader, value: ValueBits) -> ?*mut HeapHeader {
       NativeFunctionId.Builtin { family: BuiltinFamily.Os, method } => method == FINALIZER _ => false }
     _ => false }
   if !branded { return Pointer.null<HeapHeader>() }
-  return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut HeapHeader>(unsafe nonnull(pointer))
+  return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut HeapHeader>(nonnull(pointer))
 }
 effect fn requireWorker<'a, 'b, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
   value: ValueRef<'b>) -> Worker<'b> ! JsException ? &mut Allocator {
   let pointer = unsafe storage(realm.runtime(), value.view())
   if Pointer.isNull<HeapHeader>(pointer) { return run ops.error(&mut hooks,realm, b"not a Worker object") }
-  return Worker<'b> { record: unsafe CellRef<WorkerData>.of(unsafe nonnull(pointer)) }
+  return Worker<'b> { record: unsafe CellRef<WorkerData>.of(nonnull(pointer)) }
 }
-unsafe fn unlinkPort(port: PortRef) -> () {
+fn unlinkPort(state: &mut ThreadState, port: PortRef) -> () {
   let mut anchor = () let node = port.cell.getMut(&mut anchor)
-  let owner = node.owner let previous = node.previous let next = node.next
-  node.owner = Pointer.null<ThreadState>() node.previous = Option<PortRef>.none() node.next = Option<PortRef>.none() drop node
-  if Pointer.isNull<ThreadState>(owner) { return () }
-  let state = unsafe Pointer.borrowMut<(), ThreadState>(&mut anchor, unsafe nonnull(owner))
-  if previous.isNone() { state.workerPortsFirst = headerOf(next) }
-  if next.isNone() { state.workerPortsLast = headerOf(previous) } drop state
+  let previous = node.previous let next = node.next
+  node.linked = false node.previous = Option<PortRef>.none() node.next = Option<PortRef>.none() drop node
+  if previous.isNone() { state.workerPortsFirst = next }
+  if next.isNone() { state.workerPortsLast = previous }
   if let Option<PortRef>.Some { value: before } = previous { before.setNext(next) }
   if let Option<PortRef>.Some { value: after } = next { after.setPrevious(previous) }
 }
+// The caller proves `rt` is the live runtime that owns the port's callback.
 unsafe fn freePort<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, optional: Option<PortRef>) -> () {
   let port = match optional { Option<PortRef>.Some { value } => value _ => { return () } }
-  unsafe unlinkPort(port)
   let mut anchor = () let node = port.cell.getMut(&mut anchor)
-  let callback = node.callback.take() drop node
+  let linked = node.linked let callback = node.callback.take() drop node
+  // A linked port's runtime still has its ThreadState; teardown unlinks every port first.
+  if linked { unlinkPort(unsafe Pointer.borrowMut<(), ThreadState>(&mut anchor, unsafe events.state(rt)), port) }
   unsafe callback.release(&mut hooks, rt)
   unsafe HeapCell.destroy<Port>(port.header())
 }
 pub unsafe fn finalize<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, object: *mut HeapHeader) -> () {
   let optional = unsafe storage(rt, ValueBits.Object { reference: object })
   if Pointer.isNull<HeapHeader>(optional) { return () }
-  let node = unsafe nonnull(optional) let mut anchor = ()
+  let node = nonnull(optional) let mut anchor = ()
   let owner = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, object) owner.payload = ObjectPayload.Empty drop owner
   let record = unsafe HeapCell.payload<WorkerData, ()>(&anchor, node)
   let port = record.port drop record
@@ -168,45 +161,44 @@ pub unsafe fn finalize<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, object:
 pub unsafe fn mark(rt: *mut HeapHeader, object: *mut HeapHeader, tracer: &mut Tracer) -> () {
   let optional = unsafe storage(rt, ValueBits.Object { reference: object })
   if Pointer.isNull<HeapHeader>(optional) { return () }
-  let anchor = () let record = unsafe HeapCell.payload<WorkerData, ()>(&anchor, unsafe nonnull(optional))
+  let anchor = () let record = unsafe HeapCell.payload<WorkerData, ()>(&anchor, nonnull(optional))
   let port = record.port drop record
   if let Option<PortRef>.Some { value } = port { unsafe tracer.value(value.cell.get(&anchor).callback.view()) }
 }
-pub unsafe fn detachPorts(rt: *mut HeapHeader) -> () {
-  let pointer = unsafe events.state(rt) let mut anchor = ()
-  let state = unsafe Pointer.borrowMut<(), ThreadState>(&mut anchor, pointer)
-  let mut current = unsafe portRef(state.workerPortsFirst)
-  state.workerPortsFirst = Pointer.null<HeapHeader>() state.workerPortsLast = Pointer.null<HeapHeader>() drop state
+fn detachPorts(state: &mut ThreadState) -> () {
+  let mut current = Intrinsic.replace(state.workerPortsFirst, Option<PortRef>.none())
+  state.workerPortsLast = Option<PortRef>.none()
+  let mut anchor = ()
   while let Option<PortRef>.Some { value: port } = current {
     let node = port.cell.getMut(&mut anchor)
-    current = node.next node.owner = Pointer.null<ThreadState>() node.next = Option<PortRef>.none() node.previous = Option<PortRef>.none()
+    current = node.next node.linked = false node.next = Option<PortRef>.none() node.previous = Option<PortRef>.none()
   }
 }
-pub unsafe fn freeState<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, pointer: *mut ThreadState) -> () {
-  unsafe detachPorts(rt) let mut anchor = ()
-  let state = unsafe Pointer.borrowMut<(), ThreadState>(&mut anchor, pointer)
+/// Detaches the worker ports and drops the pipes, ahead of freeing `state`.
+pub fn freeState(state: &mut ThreadState) -> () {
+  detachPorts(&mut state)
   let receive = Intrinsic.replace(state.recvPipe, Option<PipeHandle>.none())
   let send = Intrinsic.replace(state.sendPipe, Option<PipeHandle>.none())
-  let group = Intrinsic.replace(state.workerGroup, Option<GroupHandle>.none()) drop state
+  let group = Intrinsic.replace(state.workerGroup, Option<GroupHandle>.none())
   drop receive drop send drop group
 }
 unsafe effect fn makeObject<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H, memory: &AllocationObserver,realm: Realm<'a>, newTarget: ValueRef<'b>, classId: u32, receive: &PipeHandle, send: &PipeHandle)
-  -> ValueBits ! JsException ? &mut Allocator { let context = realm.context()
+  -> Value ! JsException ? &mut Allocator { let context = realm.context()
   // Unlike CreateFromConstructor, source uses a non-object prototype as null.
   let mut prototype = Value.immediate(ValueBits.Undefined)
   if core.undefined(newTarget.view()) {
     let anchor = () let state = realm.state(&anchor)
     prototype = unsafe Value.retain(state.classPrototypes.get(u32.toUsize(classId)))
   } else {
-    let got = run Effect.result(hooks.getProperty(realm, newTarget, atoms.JS_ATOM_prototype))
+    let got = run Effect.result(getPropertyOwned(&mut hooks, realm, newTarget, atoms.JS_ATOM_prototype))
     prototype = match move got {
-      Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => unsafe Value.adoptBits(value)
-      Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => run ops.materialize(&mut hooks,realm, move error) }
+      Result<Value, OutOfMemoryError | JsException>.Success { value } => move value
+      Result<Value, OutOfMemoryError | JsException>.Failure { error } => run ops.materialize(&mut hooks,realm, move error) }
   }
-  let made = run Effect.result(objects.withPrototypeClass(&mut hooks, memory, realm, prototype.borrow(), classId))
+  let made = run Effect.result(objects.newWithPrototypeClass(&mut hooks, memory, realm, prototype.borrow(), classId))
   let object = match move made {
-    Result<ValueBits, OutOfMemoryError>.Success { value } => unsafe Value.adoptBits(value)
-    Result<ValueBits, OutOfMemoryError>.Failure { error } => run ops.materialize(&mut hooks,realm, move error) }
+    Result<Value, OutOfMemoryError>.Success { value } => move value
+    Result<Value, OutOfMemoryError>.Failure { error } => run ops.materialize(&mut hooks,realm, move error) }
   let allocated = run Effect.result(HeapCell.allocate<WorkerData>(HeapKind.Auxiliary,
     WorkerData { receive: receive.clone(), send: send.clone(), port: Option<PortRef>.none() }))
   let node = match move allocated {
@@ -215,7 +207,7 @@ unsafe effect fn makeObject<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H,
   }
   let mut anchor = () let owner = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, core.reference(object.view()))
   owner.payload = ObjectPayload.HostOpaque { data: unsafe Intrinsic.pointerReinterpret<*mut HeapHeader, *mut u8>(node) } drop owner
-  return object.intoBits()
+  return move object
 }
 effect fn systemCString<'a, 'b>(realm: Realm<'a>, value: ValueRef<'b>) -> List<u8> ! OutOfMemoryError {
   let anchor = () let state = events.thread(realm, &anchor)
@@ -285,7 +277,7 @@ effect fn constructor<'a, 'b, H: HeapHooks + CoercionHooks + WorkerHooks>(hooks:
   let filename = match move converted { Result<List<u8>, OutOfMemoryError>.Success { value } => move value
     Result<List<u8>, OutOfMemoryError>.Failure { error } => run ops.materialize(&mut hooks,realm, move error) }
   let args = run makeStart(&mut hooks, realm, move filename, move basename)
-  let object = unsafe Value.adoptBits(run unsafe makeObject(&mut hooks, memory, realm, newTarget, classId, &args.sendPipe, &args.recvPipe))
+  let object = run unsafe makeObject(&mut hooks, memory, realm, newTarget, classId, &args.sendPipe, &args.recvPipe)
   run hooks.startWorker(realm, move args)
   return object.intoBits()
 }
@@ -299,17 +291,16 @@ effect fn setOnMessage<'a, 'b, 'w, H: HeapHooks + CoercionHooks>(hooks: &mut H, 
   }
   if !hooks.isCallable(realm, callback) { return run ops.error(&mut hooks,realm, b"not a function") }
   if port.isNone() {
-    let owner = unsafe events.state(rt)
     let receive = worker.record.get(&anchor).receive.clone()
     let made = run Effect.result(HeapCell.allocate<Port>(HeapKind.Auxiliary,
-      Port { previous: Option<PortRef>.none(), next: Option<PortRef>.none(), owner: owner,
+      Port { previous: Option<PortRef>.none(), next: Option<PortRef>.none(), linked: true,
         receive: move receive, callback: Value.immediate(ValueBits.Null), pollIndex: 0 }))
     let cell = match move made { Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value
       Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => run ops.materialize(&mut hooks,realm, move error) }
     let created = PortRef { cell: unsafe CellRef<Port>.of(cell) }
     let state = events.threadMut(realm, &mut anchor)
-    let previous = unsafe portRef(state.workerPortsLast) state.workerPortsLast = created.header()
-    if previous.isNone() { state.workerPortsFirst = created.header() } drop state
+    let previous = Intrinsic.replace(state.workerPortsLast, Option<PortRef>.some(created))
+    if previous.isNone() { state.workerPortsFirst = Option<PortRef>.some(created) } drop state
     created.setPrevious(previous)
     if let Option<PortRef>.Some { value: before } = previous { before.setNext(Option<PortRef>.some(created)) }
     port = Option<PortRef>.some(created)
@@ -343,7 +334,7 @@ pub effect fn dispatch<'a, H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + 
 unsafe effect fn deliver<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + WorkerHooks>(
   hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, callback: ValueRef<'b>,
   message: MessageBox) -> () ! JsException ? &mut Allocator {
-  let decoded = run Effect.result(unsafe hooks.readWorkerMessage(realm, message.data(), message.length()))
+  let decoded = run Effect.result(unsafe hooks.readWorkerMessage(realm, message.data(), message.length(), message.leases()))
   drop message
   let value = match move decoded { Result<ValueBits, JsException>.Success { value } => unsafe Value.adoptBits(value)
     Result<ValueBits, JsException>.Failure { error } => { fail move error } }
@@ -396,7 +387,7 @@ pub effect fn createConstructor<'a, H: HeapHooks + CoercionHooks + OwnPropertyHo
     Option<NativeFunctionId>.some(id(PROTOTYPE_TABLE)), intrinsic.JS_NEW_CTOR_NO_GLOBAL))
   match &pipes {
     Option<ParentPipes>.Some { value } => {
-      let parent = unsafe Value.adoptBits(run unsafe makeObject(&mut hooks, memory, realm, immediateRef(ValueBits.Undefined), classId, &value.receive, &value.send))
+      let parent = run unsafe makeObject(&mut hooks, memory, realm, immediateRef(ValueBits.Undefined), classId, &value.receive, &value.send)
       run common.define(&mut hooks, realm, ctor.borrow(), b"parent", move parent, 7)
     }
     Option<ParentPipes>.None => ()
