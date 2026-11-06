@@ -42,7 +42,7 @@ captureShape(/(a+)(b+)/.exec('a'.repeat(70) + 'b'.repeat(80)),
 captureShape(/(a)(\u0100)(.)/u.exec('xa\u0100😀'), 'xa\u0100😀', 1, ['a\u0100😀', 'a', '\u0100', '😀']);
 captureShape(/(a)(bc)/.exec('\u0100abc\u0100'), '\u0100abc\u0100', 1, ['abc', 'a', 'bc']);
 // Both sides of the 16-value inline-storage limit, with absent captures too.
-for (var count of [15, 16, 20]) {
+for (var count of [14, 15, 18]) {
   var re = new RegExp('(a)'.repeat(count) + '(z)?');
   var input = 'a'.repeat(count);
   var expected = [input];
