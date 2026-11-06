@@ -3,8 +3,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Native bytes only. The owner must keep wake (an optional uv_async_t) alive
- * until destroy. No callback enters JS and no JS/engine value may be passed.
+/* Native bytes only. wake is an optional runtime loop waker, from the Silk
+ * side's fs_async.wakerAddress; the owner keeps it alive until destroy. No callback enters JS and no JS/engine value may be passed.
  * create/start/stop/destroy/url are owner-thread lifecycle operations. All other
  * operations are thread-safe while the handle lives. destroy requires callers
  * to have retired their references; stop joins the I/O thread before returning.
@@ -16,6 +16,8 @@ typedef struct silk_inspector_packet silk_inspector_packet;
 enum { SILK_INSPECTOR_OPEN = 1, SILK_INSPECTOR_MESSAGE = 2, SILK_INSPECTOR_CLOSE = 3 };
 enum { SILK_INSPECTOR_ROUTE_RESPONSE = 4, SILK_INSPECTOR_OWNER_ATTACHED = 5,
        SILK_INSPECTOR_OWNER_DETACHED = 6 };
+/* Defined by the runtime: ends the current or next wait of the loop that owns wake. */
+void silk_runtime_wake(void *wake);
 silk_inspector *silk_inspector_create(void *wake);
 int silk_inspector_start(silk_inspector *, const unsigned char *host, size_t length, uint16_t port);
 void silk_inspector_stop(silk_inspector *);
