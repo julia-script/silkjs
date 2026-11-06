@@ -6,6 +6,7 @@ import js_compiler_types { PendingFunction }
 import silk.mem.box { Box }
 import silk.num.u8
 import silk.mem.layout { Layout }
+import silk.mem.raw_buffer { RawBuffer }
 import silk.core.option { Option }
 import silk.mem.pointer { Pointer }
 import silk.num.u16
@@ -484,14 +485,24 @@ pub unsafe fn enterDecoded(runtime: *mut HeapHeader, function: ValueBits, decode
   drop callee
   if scopeSlots != 0 { unsafe beginFrameScope(machine, unsafe slotAt(top, slots - scopes.frameCells(scopeSlots)), scopeSlots, bytecode, &arguments) }
   drop code
-  let calleeView = unsafe Pointer.borrow<(), Machine>(&anchor, machine)
-  let observation = unsafe debugger.enter(&calleeView)
-  drop calleeView
-  unsafe Pointer.put<InlineTail>(tail, InlineTail { caller: caller, arguments: original, first: first, observation: move observation })
-  let mut debugAnchor = () let debugTail = unsafe Pointer.borrowMut<(), InlineTail>(&mut debugAnchor, tail)
-  let active = Pointer.fromMutRef<DebugActivation>(&mut debugTail.observation)
-  drop debugTail
-  unsafe debugger.publish(runtime, active)
+  // Debugger activations are kept only while instructions are observed: an
+  // unobserved frame stores just tracked = false, and adoptFrames links it in
+  // when observation turns on.
+  let flagAnchor = () let observed = (unsafe HeapCell.payload<RuntimeState, ()>(&flagAnchor, runtime)).observeInstructions
+  if observed {
+    let calleeView = unsafe Pointer.borrow<(), Machine>(&anchor, machine)
+    let observation = unsafe debugger.enter(&calleeView)
+    drop calleeView
+    unsafe Pointer.put<InlineTail>(tail, InlineTail { caller: caller, arguments: original, first: first, observation: move observation })
+    let mut debugAnchor = () let debugTail = unsafe Pointer.borrowMut<(), InlineTail>(&mut debugAnchor, tail)
+    let active = Pointer.fromMutRef<DebugActivation>(&mut debugTail.observation)
+    drop debugTail
+    unsafe debugger.publish(runtime, active)
+  } else {
+    let mut debugAnchor = () let debugTail = unsafe Pointer.borrowMut<(), InlineTail>(&mut debugAnchor, tail)
+    debugTail.caller = caller debugTail.arguments = original debugTail.first = first
+    debugTail.observation.tracked = false
+  }
   return Option<*mut Machine>.some(machine)
 }
 /// enterInline's scope-function tail, out of line so a plain call has no
@@ -547,6 +558,90 @@ pub fn forwarded(machine: &Machine) -> bool {
 pub unsafe fn markForwarded(machine: *mut Machine) -> () {
   let mut anchor = () let callee = unsafe Pointer.borrowMut<(), Machine>(&mut anchor, machine)
   callee.record = unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(callee.record)), 2)
+}
+/// Gives every live inline frame entered while instructions were not observed
+/// its debugger activation, linked in stack order with the activations already
+/// kept (base frames, frames entered while observed), so the debugger, coverage
+/// and profiler see the whole stack. Runs once after observation turns on
+/// (RuntimeState.adoptFrames), before the first observed instruction.
+pub unsafe fn adoptFrames(runtime: *mut HeapHeader) -> () {
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  if !state.adoptFrames || state.debugger.evaluating || state.debugger.callbackActive { return () }
+  state.adoptFrames = false
+  let mut start: usize = 0 let mut end: usize = 0
+  if let Option<Intrinsic.RawBuffer<ValueBits>>.Some { value } = &state.callFrames {
+    let count = RawBuffer.count<ValueBits>(&value)
+    if count != 0 {
+      start = Pointer.address<ValueBits>(Pointer.fromRef<ValueBits>(&(unsafe RawBuffer.view<ValueBits>(&value, 0, count))[0]))
+      end = start + count * Layout.of<ValueBits>().bytes
+    }
+  }
+  let mut frame = state.currentStackFrame
+  let mut kept = state.debugger.active
+  drop state
+  // Innermost first: child is the activation of the frame just inside this one,
+  // whose previous becomes this frame's activation.
+  let mut child: ?*mut DebugActivation = Pointer.null<DebugActivation>()
+  let mut innermost: ?*mut DebugActivation = Pointer.null<DebugActivation>()
+  while let Option<*mut StackFrame>.Some { value: current } = Pointer.nonNullMut<StackFrame>(frame) {
+    let address = Pointer.address<StackFrame>(current)
+    let mut own: ?*mut DebugActivation = Pointer.null<DebugActivation>()
+    let mut last: ?*mut DebugActivation = Pointer.null<DebugActivation>()
+    // Kept activations of this frame (a base frame can hold two) stay linked
+    // among themselves.
+    while let Option<*mut DebugActivation>.Some { value: active } = Pointer.nonNullMut<DebugActivation>(kept) {
+      let view = unsafe Pointer.borrow<(), DebugActivation>(&anchor, active)
+      if Pointer.address<StackFrame>(view.frame) != address { break }
+      if Pointer.isNull<DebugActivation>(own) { own = kept }
+      last = kept
+      kept = view.previous
+    }
+    if Pointer.isNull<DebugActivation>(own) && address >= start && address < end {
+      let machine = unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut Machine>(unsafe slotAt(unsafe Intrinsic.pointerReinterpret<*mut StackFrame, *mut ValueBits>(current), frameSlots()))
+      let tail = unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut InlineTail>(unsafe slotAt(unsafe Intrinsic.pointerReinterpret<*mut StackFrame, *mut ValueBits>(current), frameSlots() + machineSlots()))
+      let mut tailAnchor = () let record = unsafe Pointer.borrowMut<(), InlineTail>(&mut tailAnchor, tail)
+      if !record.observation.tracked {
+        let machineAnchor = () let view = unsafe Pointer.borrow<(), Machine>(&machineAnchor, machine)
+        record.observation = unsafe debugger.enter(&view)
+        record.observation.tracked = true
+        let suspended = !Pointer.isNull<DebugActivation>(child)
+        drop view
+        own = Pointer.fromMutRef<DebugActivation>(&mut record.observation)
+        last = own
+        // A frame below the innermost is parked in a call.
+        unsafe debugger.adopted(Pointer.fromMutRef<DebugActivation>(&mut record.observation), current, suspended)
+      }
+    }
+    if !Pointer.isNull<DebugActivation>(own) {
+      if let Option<*mut DebugActivation>.Some { value: inner } = Pointer.nonNullMut<DebugActivation>(child) {
+        let mut innerAnchor = () let link = unsafe Pointer.borrowMut<(), DebugActivation>(&mut innerAnchor, inner)
+        link.previous = own
+      } else { innermost = own }
+      child = last
+    }
+    let frameAnchor = () frame = (unsafe Pointer.borrow<(), StackFrame>(&frameAnchor, current)).previous
+  }
+  if let Option<*mut DebugActivation>.Some { value: outer } = Pointer.nonNullMut<DebugActivation>(child) {
+    let mut outerAnchor = () let link = unsafe Pointer.borrowMut<(), DebugActivation>(&mut outerAnchor, outer)
+    link.previous = kept
+  }
+  if Pointer.isNull<DebugActivation>(innermost) { return () }
+  // Depths count the activations below each one.
+  let mut total: usize = 0
+  let mut walk = innermost
+  while let Option<*mut DebugActivation>.Some { value } = Pointer.nonNullMut<DebugActivation>(walk) {
+    total = total + 1
+    walk = (unsafe Pointer.borrow<(), DebugActivation>(&anchor, value)).previous
+  }
+  walk = innermost
+  while let Option<*mut DebugActivation>.Some { value } = Pointer.nonNullMut<DebugActivation>(walk) {
+    total = total - 1
+    let mut depthAnchor = () let link = unsafe Pointer.borrowMut<(), DebugActivation>(&mut depthAnchor, value)
+    link.depth = total
+    walk = link.previous
+  }
+  let mut publishAnchor = () let published = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut publishAnchor, runtime)
+  published.debugger.active = innermost
 }
 /// The tail of the inline frame machine runs; record must be non-null.
 @inlineAlways

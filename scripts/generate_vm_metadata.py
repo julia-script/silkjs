@@ -25,11 +25,23 @@ EXTENSIONS = [
 ]
 
 # Upstream final opcodes whose numbers silkjs reuses: name -> (name, size, pops, pushes, format).
-# set_arg0/1 are emitted as set_arg; the fused branches keep is_undefined_or_null's
-# byte, a padding byte (the old if_*8 opcode), then the if_*8 displacement.
+# set_arg0-3 are emitted as set_arg; the fused branches keep the test's byte
+# (is_undefined_or_null or is_null), a padding byte (the old if_*8 opcode), then
+# the if_*8 displacement.
 REPLACEMENTS = {
     'set_arg0': ('if_nullish8', 3, 1, 0, 'u16'),  # is_undefined_or_null, then if_true8
     'set_arg1': ('if_not_nullish8', 3, 1, 0, 'u16'),  # is_undefined_or_null, then if_false8
+    'set_arg2': ('if_null8', 3, 1, 0, 'u16'),  # is_null, then if_true8
+    'set_arg3': ('if_not_null8', 3, 1, 0, 'u16'),  # is_null, then if_false8
+    # The short var_ref forms are never emitted (get/put/set_var_ref take a u16
+    # index); their first six numbers hold the depth-0 scope opcodes, each with
+    # a u16 slot of the running frame's scope.
+    'get_var_ref0': ('get_scope0', 3, 0, 1, 'u16'),
+    'get_var_ref1': ('put_scope0', 3, 1, 0, 'u16'),
+    'get_var_ref2': ('set_scope0', 3, 1, 1, 'u16'),
+    'get_var_ref3': ('get_scope0_check', 3, 0, 1, 'u16'),
+    'put_var_ref0': ('put_scope0_check', 3, 1, 0, 'u16'),
+    'put_var_ref1': ('put_scope0_check_init', 3, 1, 0, 'u16'),
 }
 
 

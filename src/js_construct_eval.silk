@@ -10,6 +10,8 @@
 // fast path does not cover, decline with nothing changed; the caller then
 // enters the usual frame.
 import silk.mem.pointer { Pointer }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
 import silk.num.u8
@@ -66,8 +68,24 @@ fn truthy(value: ValueBits) -> bool {
     _ => unsafe primitives.toBoolean(value) > 0
   }
 }
+/// The first of the two constructCache ways for the body whose code starts at
+/// code. Bytecode arrays come from aligned size classes, so the low address bits
+/// barely vary: a multiplicative hash spreads them over all 64 entries.
 @inlineAlways
-fn cacheSlot(code: usize) -> usize { return (code ^ usize.shiftRight(code, 10)) / 8 & 63 }
+fn cacheSlot(code: usize) -> usize {
+  return u64.toUsize(u64.shiftRight(u64.wrappingMultiply(usize.toU64(code / 16), 0x9e3779b97f4a7c15), 58)) & 62
+}
+/// The entry holding code's body, else the one to fill: each hash has two ways,
+/// so two hot constructors that hash alike do not evict each other on every new.
+@inlineAlways
+fn cacheWay(state: &RuntimeState, code: usize) -> usize {
+  let first = cacheSlot(code) let second = first + 1
+  if state.constructCache[first].code == code { return first }
+  if state.constructCache[second].code == code { return second }
+  if state.constructCache[first].code == 0 { return first }
+  if state.constructCache[second].code == 0 { return second }
+  return first
+}
 @inlineAlways
 unsafe fn headerCount(header: *mut HeapHeader) -> i32 {
   let anchor = ()
@@ -262,7 +280,6 @@ unsafe fn straight(bytes: *const u8, pc: usize, recipe: &mut ConstructRecipe, co
   if symbols.depth == 0 { return declined }
   let top = symbols.stack[symbols.depth - 1]
   if opcode >= 217 && opcode <= 220 { symbols.arguments[u8.toUsize(opcode - 217)] = top symbols.depth = symbols.depth - 1 return pc + 1 } // put_arg0-3
-  if opcode == 223 || opcode == 224 { symbols.arguments[u8.toUsize(opcode - 221)] = top return pc + 1 } // set_arg2-3
   if opcode >= 205 && opcode <= 208 { symbols.locals[u8.toUsize(opcode - 205)] = top symbols.depth = symbols.depth - 1 return pc + 1 } // put_loc0-3
   if opcode >= 209 && opcode <= 212 { symbols.locals[u8.toUsize(opcode - 209)] = top return pc + 1 } // set_loc0-3
   return declined
@@ -377,9 +394,10 @@ pub unsafe fn construct<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, o
   if length == 0 { return false }
   let bytes = unsafe code.code.pointerAt(0)
   let address = Pointer.address<u8>(bytes)
-  let slot = cacheSlot(address)
   let mut stateAnchor = ()
   let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
+  let epoch = state.shapeEpoch
+  let slot = cacheWay(&state.*, address)
   let entry = &mut state.constructCache[slot]
   if entry.code != address {
     // First run of this body here: read it, and forget the shapes the slot's
@@ -396,7 +414,7 @@ pub unsafe fn construct<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, o
   if stores == 0 { return false }
   let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
   if data.classId() != classes.JS_CLASS_OBJECT || data.isExotic() || !data.extensible() || data.isStandardArrayPrototype() { return false }
-  if data.properties.length() != 0 || data.properties.capacity() < stores { return false }
+  if data.slotCount() != 0 || data.slotCapacity() < stores { return false }
   let mut values = FrameSlots { data: unsafe Intrinsic.pointerRequalify<[*]mut ValueBits, *mut ValueBits>(unsafe Intrinsic.stackAllocate<ValueBits>(NODES_MAX)), count: NODES_MAX }
   unsafe evaluate(&entry.recipe, receiver, argv, &mut values)
   let base = data.shape
@@ -408,7 +426,10 @@ pub unsafe fn construct<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, o
   if unsafe headerCount(base) <= 1 { return false }
   let baseAddress = Pointer.address<HeapHeader>(base)
   let mut final = Pointer.null<HeapHeader>()
-  if entry.base == baseAddress && entry.baseVersion == baseVersion && unsafe chainMatches(&entry, prototype) { final = entry.final }
+  if entry.base == baseAddress && entry.baseVersion == baseVersion {
+    // An unchanged epoch: no prototype changed since the chain last matched.
+    if entry.epoch == epoch || unsafe chainMatches(&entry, prototype) { entry.epoch = epoch final = entry.final }
+  }
   let mut old = Pointer.null<HeapHeader>()
   if Pointer.isNull<HeapHeader>(final) {
     // Every add must follow a verified memo entry; a repeated key would
@@ -430,6 +451,7 @@ pub unsafe fn construct<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, o
     unsafe HeapCell.retain(shape)
     old = entry.final
     entry.base = baseAddress entry.baseVersion = baseVersion entry.final = shape entry.chain = chain entry.depth = usize.toU8(links)
+    entry.epoch = epoch
     final = shape
   }
   let roots = entry.recipe.roots
@@ -440,6 +462,40 @@ pub unsafe fn construct<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, o
   unsafe releaseOptional(&mut hooks, runtime, old)
   unsafe gc.notePlan(&mut hooks, runtime, owner, base, reached, Pointer.address<HeapHeader>(bytecode), stores, [0; 8])
   return true
+}
+/// construct, after growing receiver's slots when they are what declined it: a
+/// receiver whose slot plan gave it a smaller tail than the body's stores would
+/// otherwise never take this path, so no construct plan would ever be noted.
+pub unsafe effect fn constructGrowing<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, owner: *mut HeapHeader, function: ValueBits,
+  receiver: ValueBits, argv: &FrameSlots) -> bool ? &mut Allocator {
+  if unsafe construct(&mut hooks, runtime, owner, function, receiver, argv) { return true }
+  let stores = unsafe cachedStores(runtime, function)
+  let node = match receiver { ValueBits.Object { reference } => reference _ => { return false } }
+  let mut anchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+  if stores == 0 || data.classId() != classes.JS_CLASS_OBJECT || data.slotCount() != 0 || data.slotCapacity() >= stores { return false }
+  let grown = run Effect.result(unsafe shapes.reserveSlots(runtime, &mut data, stores))
+  drop data
+  return match move grown {
+    Result<(), OutOfMemoryError>.Success { .. } => unsafe construct(&mut hooks, runtime, owner, function, receiver, argv)
+    Result<(), OutOfMemoryError>.Failure { error } => { drop error false }
+  }
+}
+/// The stores of the recipe cached for function's body, or 0.
+unsafe fn cachedStores(runtime: *mut HeapHeader, function: ValueBits) -> usize {
+  let callee = match function { ValueBits.Object { reference } => reference _ => { return 0 } }
+  let anchor = ()
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, callee)
+  let bytecode = match &object.payload { ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode _ => { return 0 } }
+  drop object
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  if code.code.length() == 0 { return 0 }
+  let address = Pointer.address<u8>(unsafe code.code.pointerAt(0))
+  drop code
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let entry = &state.constructCache[cacheWay(&state.*, address)]
+  if entry.code != address { return 0 }
+  return u8.toUsize(entry.recipe.stores)
 }
 fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
 @inlineAlways
@@ -494,9 +550,9 @@ pub unsafe effect fn planned<'a, H: HeapHooks>(hooks: &mut H, memory: &Allocatio
   }
   let empty = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(plan.empty)
   let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
-  let entry = &state.constructCache[cacheSlot(address)]
+  let entry = &state.constructCache[cacheWay(&state.*, address)]
   let stores = u8.toUsize(entry.recipe.stores)
-  if entry.code != address || stores != u8.toUsize(plan.stores) || entry.base != Pointer.address<HeapHeader>(empty)
+  if entry.code != address || stores != plan.stores || entry.base != Pointer.address<HeapHeader>(empty)
     || Pointer.address<HeapHeader>(unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(entry.final)) != Pointer.address<HeapHeader>(final) {
     drop entry drop state
     // plannedShape's reference to final.
@@ -508,13 +564,13 @@ pub unsafe effect fn planned<'a, H: HeapHooks>(hooks: &mut H, memory: &Allocatio
   unsafe evaluate(&entry.recipe, ValueBits.Undefined, argv, &mut values)
   let roots = entry.recipe.roots
   drop entry drop state
-  let created = run unsafe objects.ordinaryFromPlan(&mut hooks, memory, realm, final, empty)
+  let created = run unsafe objects.ordinaryFromPlan(&mut hooks, memory, realm, final, empty, stores)
   let node = match created { ValueBits.Object { reference } => reference _ => invariant() }
   let mut nodeAnchor = ()
   let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut nodeAnchor, node)
   let mut index: usize = 0
   while index < stores {
-    data.properties.set(index, SlotBits.value(unsafe (unsafe values.get(u8.toUsize(roots[index & 7]))).retained()))
+    data.setSlot(index, SlotBits.value(unsafe (unsafe values.get(u8.toUsize(roots[index & 7]))).retained()))
     index = index + 1
   }
   return created
@@ -533,7 +589,7 @@ unsafe fn install(node: *mut HeapHeader, base: *mut HeapHeader, final: *mut Heap
   data.shape = final
   let mut index: usize = 0
   while index < stores {
-    unsafe data.properties.pushUnchecked(SlotBits.value(unsafe (unsafe values.get(u8.toUsize(roots[index & 7]))).retained()))
+    unsafe data.pushSlotUnchecked(SlotBits.value(unsafe (unsafe values.get(u8.toUsize(roots[index & 7]))).retained()))
     index = index + 1
   }
 }

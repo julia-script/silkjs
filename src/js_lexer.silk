@@ -80,6 +80,7 @@ pub const SKIP_HAS_SEMI: u32 = 1
 pub const SKIP_HAS_ELLIPSIS: u32 = 2
 pub const SKIP_HAS_ASSIGNMENT: u32 = 4
 const SKIP_CACHE_MIN_TOKENS: u32 = 16
+const NAME_UNSURE: usize = 0xffffffffffffffff
 
 /// Results of skipParens by the source offset of the opening bracket. One scan
 /// over `{ a: { b: [...] } }` records every nested span it closes, so the
@@ -430,9 +431,11 @@ impl<'src> Lexer<'src> {
     let mut count: usize = 0
     // ASCII fast path: a plain identifier needs none of the escape or decode checks.
     let mut fast = false
+    let mut hash: u32 = 1
     if !privateName && p < self.source.length && isAsciiIdentFirst(u8.toU32(self.source[p])) {
+      hash = AtomTable.asciiHashStep(hash, self.source[p])
       let mut q = p + 1
-      while q < self.source.length && isAsciiIdentNext(u8.toU32(self.source[q])) { q = q + 1 }
+      while q < self.source.length && isAsciiIdentNext(u8.toU32(self.source[q])) { hash = AtomTable.asciiHashStep(hash, self.source[q]) q = q + 1 }
       if q >= self.source.length || (self.source[q] < 128 && self.source[q] != 92) {
         p = q
         count = q - first
@@ -473,8 +476,13 @@ impl<'src> Lexer<'src> {
     if !requiresDecode {
       let spelling = Slice.view<u8>(self.source, start, p - start)
       // No decode needed means plain ASCII; identifiers never spell integer atoms.
-      if self.probe { atom = table.lookupAsciiName(spelling) }
-      else { atom = run table.internAsciiName(spelling) }
+      // Keywords are constant atoms: spelled out here, they skip the table probe.
+      if fast { atom = keywordAtom(spelling) }
+      if atom == 0 {
+        if self.probe { atom = table.lookupAsciiName(spelling) }
+        else if fast { atom = run table.internAsciiNameHashed(spelling, AtomTable.asciiHashFinish(hash)) }
+        else { atom = run table.internAsciiName(spelling) }
+      }
     } else {
       let mut builder = StringBuilder.make()
       if privateName { run builder.appendCodePoint(35) }
@@ -513,6 +521,68 @@ impl<'src> Lexer<'src> {
     self.offset = p
     return Token { kind: kind, start: start, end: p, gotLineFeed: self.gotLineFeed,
       payload: TokenPayload.Identifier { atom: atom, owner: move owner, hasEscape: hasEscape, isReserved: isReserved } }
+  }
+  /// Byte-level lookahead support. plainSpace skips spaces, tabs and line breaks
+  /// only; a comment or any other trivia stops it, and callers treat what follows
+  /// as unknown.
+  fn plainSpace(self: &Self, p: usize) -> usize {
+    let mut q = p
+    while q < self.source.length {
+      let c = self.source[q]
+      if c != 32 && c != 9 && c != 10 && c != 13 { break }
+      q = q + 1
+    }
+    return q
+  }
+  fn keywordHere(self: &Self, atom: u32) -> bool {
+    let context = &self.context
+    return atom <= atoms.JS_ATOM_LAST_KEYWORD || (context.strict && atom <= atoms.JS_ATOM_LAST_STRICT_KEYWORD)
+      || (atom == atoms.JS_ATOM_yield && context.generator)
+      || (atom == atoms.JS_ATOM_await && (context.module || context.asyncFunction))
+  }
+  /// The end of the ASCII identifier name at p, NAME_UNSURE when an escape or
+  /// non-ASCII byte makes only the full lexer able to tell, or 0 when p starts
+  /// no identifier name.
+  fn nameEnd(self: &Self, p: usize) -> usize {
+    let source = self.source
+    if p >= source.length { return 0 }
+    let first = source[p]
+    if first >= 128 || first == 92 { return NAME_UNSURE }
+    if !isAsciiIdentFirst(u8.toU32(first)) { return 0 }
+    let mut q = p + 1
+    while q < source.length && isAsciiIdentNext(u8.toU32(source[q])) { q = q + 1 }
+    if q < source.length && (source[q] >= 128 || source[q] == 92) { return NAME_UNSURE }
+    return q
+  }
+  /// Whether the ASCII name [p, end) lexes as a keyword in this context. Every
+  /// keyword is lower case and two to ten letters long.
+  fn keywordName(self: &Self, table: &mut AtomTable, p: usize, end: usize) -> bool {
+    let first = self.source[p]
+    if first < 97 || first > 122 || end - p < 2 || end - p > 10 { return false }
+    let atom = table.lookupAsciiName(Slice.view<u8>(self.source, p, end - p))
+    return atom != 0 && self.keywordHere(atom)
+  }
+  fn spells(self: &Self, p: usize, end: usize, text: &[u8]) -> bool {
+    return end - p == text.length && starts(self.source, p, text)
+  }
+  fn unsureByte(self: &Self, p: usize) -> bool {
+    if p >= self.source.length { return true }
+    let c = self.source[p]
+    return c == 47 || c == 92 || c >= 128
+  }
+  /// After `let` at current: 1 when a lexical declaration certainly follows
+  /// (as isLet judges it), 0 when certainly not, -1 when only the lexer can tell.
+  pub fn letAhead(self: &Self, current: &Token, table: &mut AtomTable) -> i32 {
+    let mut p = current.end
+    while p < self.source.length && (self.source[p] == 32 || self.source[p] == 9) { p = p + 1 }
+    if p >= self.source.length { return -1 }
+    let c = self.source[p]
+    if c == 91 || c == 123 { return 1 }
+    if c == 10 || c == 13 || self.unsureByte(p) { return -1 }
+    let end = self.nameEnd(p)
+    if end == 0 { return 0 }
+    if end == NAME_UNSURE || self.keywordName(&mut table, p, end) { return -1 }
+    return 1
   }
   // Non-mutating parser heuristic. A separate cursor owns temporary tokens;
   // original token and cursor retain exact ownership and source position.
@@ -615,6 +685,28 @@ impl Lexer {
   /// code may write `for (var x = 1 in o)`.
   pub effect fn classicForHead(self: &Self, current: &Token, table: &mut AtomTable) -> bool
     ! LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    // Byte-level first: `(;`, or `(let x =` / `(const x =` in plain ASCII.
+    let mut p = self.plainSpace(current.end)
+    if p < self.source.length && self.source[p] == 59 { return true }
+    let word = self.nameEnd(p)
+    if word != NAME_UNSURE {
+      if word == 0 || !(self.spells(p, word, b"let") || self.spells(p, word, b"const")) {
+        if !self.unsureByte(p) { return false }
+      } else {
+        p = self.plainSpace(word)
+        let name = self.nameEnd(p)
+        if name == 0 { if !self.unsureByte(p) { return false } }
+        else if name != NAME_UNSURE {
+          if self.keywordName(&mut table, p, name) { return false }
+          p = self.plainSpace(name)
+          if p + 1 < self.source.length && self.source[p] == 61 {
+            let after = self.source[p + 1]
+            return after != 61 && after != 62
+          }
+          if !self.unsureByte(p) { return false }
+        }
+      }
+    }
     let mut probe = Lexer.make(self.source, self.context)
     probe.probe = true
     let open = run probe.seek(self.save(current), &mut table)
@@ -626,6 +718,92 @@ impl Lexer {
     if name.kind != tok.TOK_IDENT { return false }
     let after = run probe.next(&mut table) |> Effect.catch<LexError>(lookaheadError)
     return after.kind == 61
+  }
+  /// Whether the `(` at current opens a parameter list of plain names, such as
+  /// `(a, b)`: no defaults, patterns or rest, so no parameter expressions. At
+  /// most 16 names are probed. False means unknown and the caller scans with
+  /// skipParens.
+  pub effect fn plainParameters(self: &Self, current: &Token, table: &mut AtomTable) -> bool
+    ! LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    // Byte-level first: plain ASCII names, commas and spaces.
+    let mut p = current.end
+    let mut names = 0
+    while names < 16 {
+      p = self.plainSpace(p)
+      if p < self.source.length && self.source[p] == 41 { return true }
+      let end = self.nameEnd(p)
+      if end == NAME_UNSURE { break }
+      if end == 0 { if self.unsureByte(p) { break } return false }
+      if self.keywordName(&mut table, p, end) { return false }
+      p = self.plainSpace(end)
+      if p < self.source.length && self.source[p] == 41 { return true }
+      if p < self.source.length && self.source[p] == 44 { p = p + 1 names = names + 1 continue }
+      if self.unsureByte(p) { break }
+      return false
+    }
+    if names >= 16 { return false }
+    let mut probe = Lexer.make(self.source, self.context)
+    probe.probe = true
+    let open = run probe.seek(self.save(current), &mut table)
+    drop open
+    let mut count = 0
+    while count < 16 {
+      let name = run probe.next(&mut table) |> Effect.catch<LexError>(lookaheadError)
+      if name.kind == 41 { return true }
+      if name.kind != tok.TOK_IDENT { return false }
+      let after = run probe.next(&mut table) |> Effect.catch<LexError>(lookaheadError)
+      if after.kind == 41 { return true }
+      if after.kind != 44 { return false }
+      count = count + 1
+    }
+    return false
+  }
+  /// Whether the `{` at current opens an object literal that cannot be an
+  /// assignment pattern, judged from its first property: `{ key: literal`, where
+  /// the value is a number, string, template, null, true or false, which no
+  /// pattern accepts as a target. False means unknown and the caller scans with
+  /// skipParens.
+  pub effect fn literalObjectStart(self: &Self, current: &Token, table: &mut AtomTable) -> bool
+    ! LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    // Byte-level first: `{ name: value` with an ASCII name key and a quoted
+    // string, decimal digits, null, true or false value.
+    let mut p = self.plainSpace(current.end)
+    let keyEnd = self.nameEnd(p)
+    if keyEnd != 0 && keyEnd != NAME_UNSURE {
+      p = self.plainSpace(keyEnd)
+      if p < self.source.length && self.source[p] == 58 {
+        p = self.plainSpace(p + 1)
+        if p < self.source.length {
+          let c = self.source[p]
+          if c == 34 || c == 39 {
+            let mut q = p + 1
+            while q < self.source.length && self.source[q] != c && self.source[q] != 92 && self.source[q] != 10 && self.source[q] != 13 && self.source[q] < 128 { q = q + 1 }
+            if q < self.source.length && self.source[q] == c { return true }
+          } else if c >= 49 && c <= 57 || (c == 48 && !(p + 1 < self.source.length && self.source[p + 1] >= 48 && self.source[p + 1] <= 57)) {
+            let mut q = p + 1
+            while q < self.source.length && self.source[q] >= 48 && self.source[q] <= 57 { q = q + 1 }
+            if q >= self.source.length || !(isAsciiIdentNext(u8.toU32(self.source[q])) || self.source[q] == 46 || self.source[q] == 92 || self.source[q] >= 128) { return true }
+          } else {
+            let word = self.nameEnd(p)
+            if word != NAME_UNSURE && word != 0 {
+              return self.spells(p, word, b"null") || self.spells(p, word, b"true") || self.spells(p, word, b"false")
+            }
+          }
+        }
+      } else if !self.unsureByte(p) { return false }
+    }
+    let mut probe = Lexer.make(self.source, self.context)
+    probe.probe = true
+    let open = run probe.seek(self.save(current), &mut table)
+    drop open
+    let key = run probe.next(&mut table) |> Effect.catch<LexError>(lookaheadError)
+    if key.kind != tok.TOK_IDENT && key.kind != tok.TOK_STRING && key.kind != tok.TOK_NUMBER && !key.isIdentifierName() { return false }
+    let colon = run probe.next(&mut table) |> Effect.catch<LexError>(lookaheadError)
+    if colon.kind != 58 { return false }
+    let value = run probe.next(&mut table) |> Effect.catch<LexError>(lookaheadError)
+    let kind = value.kind
+    return kind == tok.TOK_NUMBER || kind == tok.TOK_STRING || kind == tok.TOK_TEMPLATE
+      || kind == tok.TOK_NULL || kind == tok.TOK_TRUE || kind == tok.TOK_FALSE
   }
 }
 
@@ -660,4 +838,65 @@ pub fn isRegExpAllowed(kind: i32) -> bool {
 
 effect fn lookaheadError(error: LexError) -> Token {
   return Token.empty(tok.TOK_ERROR, error.offset, error.offset)
+}
+
+/// The constant atom of a reserved word (null through super, and let) spelled by
+/// ASCII bytes, or 0. Constant atoms carry no reference count, so a hit is the
+/// same as interning the spelling.
+fn keywordAtom(spelling: &[u8]) -> u32 {
+  let length = spelling.length
+  if length < 2 || length > 10 { return 0 }
+  let c0 = spelling[0] let c1 = spelling[1]
+  if c0 < 97 || c0 > 119 { return 0 }
+  let mut atom: u32 = 0
+  if length == 2 {
+    if c0 == 105 { if c1 == 102 { atom = atoms.JS_ATOM_if } else if c1 == 110 { atom = atoms.JS_ATOM_in } }
+    else if c0 == 100 { atom = atoms.JS_ATOM_do }
+  } else if length == 3 {
+    if c0 == 102 { atom = atoms.JS_ATOM_for } else if c0 == 108 { atom = atoms.JS_ATOM_let }
+    else if c0 == 110 { atom = atoms.JS_ATOM_new } else if c0 == 118 { atom = atoms.JS_ATOM_var }
+    else if c0 == 116 { atom = atoms.JS_ATOM_try }
+  } else if length == 4 {
+    if c0 == 116 { if c1 == 104 { atom = atoms.JS_ATOM_this } else { atom = atoms.JS_ATOM_true } }
+    else if c0 == 110 { atom = atoms.JS_ATOM_null }
+    else if c0 == 101 { if c1 == 108 { atom = atoms.JS_ATOM_else } else { atom = atoms.JS_ATOM_enum } }
+    else if c0 == 99 { atom = atoms.JS_ATOM_case } else if c0 == 118 { atom = atoms.JS_ATOM_void }
+    else if c0 == 119 { atom = atoms.JS_ATOM_with }
+  } else if length == 5 {
+    if c0 == 99 {
+      if c1 == 111 { atom = atoms.JS_ATOM_const } else if c1 == 97 { atom = atoms.JS_ATOM_catch } else { atom = atoms.JS_ATOM_class }
+    }
+    else if c0 == 102 { atom = atoms.JS_ATOM_false } else if c0 == 119 { atom = atoms.JS_ATOM_while }
+    else if c0 == 98 { atom = atoms.JS_ATOM_break } else if c0 == 116 { atom = atoms.JS_ATOM_throw }
+    else if c0 == 115 { atom = atoms.JS_ATOM_super }
+  } else if length == 6 {
+    if c0 == 114 { atom = atoms.JS_ATOM_return } else if c0 == 116 { atom = atoms.JS_ATOM_typeof }
+    else if c0 == 100 { atom = atoms.JS_ATOM_delete } else if c0 == 115 { atom = atoms.JS_ATOM_switch }
+    else if c0 == 101 { atom = atoms.JS_ATOM_export } else if c0 == 105 { atom = atoms.JS_ATOM_import }
+  } else if length == 7 {
+    if c0 == 100 { atom = atoms.JS_ATOM_default } else if c0 == 102 { atom = atoms.JS_ATOM_finally }
+    else if c0 == 101 { atom = atoms.JS_ATOM_extends }
+  } else if length == 8 {
+    if c0 == 102 { atom = atoms.JS_ATOM_function } else if c0 == 99 { atom = atoms.JS_ATOM_continue }
+    else if c0 == 100 { atom = atoms.JS_ATOM_debugger }
+  } else if length == 10 {
+    if c0 == 105 { atom = atoms.JS_ATOM_instanceof }
+  }
+  if atom == 0 { return 0 }
+  let text = keywordText(atom)
+  if text.length != length { return 0 }
+  let mut i: usize = 1
+  while i < length { if text[i] != spelling[i] { return 0 } i = i + 1 }
+  return atom
+}
+fn keywordText(atom: u32) -> &'static [u8] {
+  return match atom {
+    1 => b"null" 2 => b"false" 3 => b"true" 4 => b"if" 5 => b"else" 6 => b"return" 7 => b"var" 8 => b"this"
+    9 => b"delete" 10 => b"void" 11 => b"typeof" 12 => b"new" 13 => b"in" 14 => b"instanceof" 15 => b"do"
+    16 => b"while" 17 => b"for" 18 => b"break" 19 => b"continue" 20 => b"switch" 21 => b"case" 22 => b"default"
+    23 => b"throw" 24 => b"try" 25 => b"catch" 26 => b"finally" 27 => b"function" 28 => b"debugger" 29 => b"with"
+    30 => b"class" 31 => b"const" 32 => b"enum" 33 => b"export" 34 => b"extends" 35 => b"import" 36 => b"super"
+    39 => b"let"
+    _ => b""
+  }
 }

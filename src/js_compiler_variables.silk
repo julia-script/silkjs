@@ -308,8 +308,11 @@ pub effect fn addGlobalVariables(tree: &mut FunctionTree, cell: FunctionId) -> (
 
 struct Binding { index: i32, storage: i32, constant: bool, lexical: bool, kind: VariableKind }
 fn localBinding(v: CompilerVar, index: i32) -> Binding { return Binding { index: index, storage: 0, constant: v.isConst, lexical: v.isLexical, kind: v.kind } }
+@inlineAlways
 effect fn pair(fd: &mut FunctionDef, code: u8, index: i32) -> () ? &mut Allocator {
-  run emit.emitU8(&mut fd, code) run emit.emitU16(&mut fd, i32.toU16(index))
+  if run emit.claimBytecode(&mut fd, 3) {
+    if !(fd.bytecode.appendWithin(code) && fd.bytecode.appendWithinU16(i32.toU16(index))) { fd.bytecodeError = true }
+  }
 }
 effect fn atomOp(fd: &mut FunctionDef, table: &mut AtomTable, code: u8, name: u32) -> () ? &mut Allocator {
   run emit.emitU8(&mut fd, code) run emit.emitAtom(&mut fd, &mut table, name)
@@ -318,7 +321,9 @@ effect fn throwReadOnly(fd: &mut FunctionDef, table: &mut AtomTable, name: u32) 
   run atomOp(&mut fd, &mut table, op.OP_throw_error, name) run emit.emitU8(&mut fd, 0)
 }
 effect fn labelOut(fd: &mut FunctionDef, label: i32) -> () ? &mut Allocator {
-  run emit.emitU8(&mut fd, op.OP_label) run emit.emitU32(&mut fd, i32.toU32(label))
+  if run emit.claimBytecode(&mut fd, 5) {
+    if !(fd.bytecode.appendWithin(op.OP_label) && fd.bytecode.appendWithinU32(i32.toU32(label))) { fd.bytecodeError = true }
+  }
   let mut slot = fd.labels.get(i32.toUsize(label)) slot.position2 = usize.toI32(fd.bytecode.length()) fd.labels.set(i32.toUsize(label), slot)
 }
 effect fn objectTest(tree: &mut FunctionTree, cell: FunctionId, owner: FunctionId, index: i32, closure: bool,
@@ -670,8 +675,11 @@ effect fn lineOut(fd: &mut FunctionDef, line: i32) -> () ? &mut Allocator {
   fd.lineNumberCapacity = fd.lineNumberCapacity + 1
   run emit.emitU8(&mut fd, op.OP_line_num) run emit.emitU32(&mut fd, unsignedWord(line))
 }
-effect fn resolvePass(tree: &mut FunctionTree, cell: FunctionId, input: &mut ByteBuffer, position: &mut usize) -> ()
+/// Returns whether input may still hold atom operands the pass left in place;
+/// scope operands are released as they are resolved, and copies move theirs.
+effect fn resolvePass(tree: &mut FunctionTree, cell: FunctionId, input: &mut ByteBuffer, position: &mut usize) -> bool
   ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  let mut leftovers = false
   let mut anchor = () let mut ra = ()
   let initial = tree.getMut(cell)
   let runtime = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ra, initial.runtime)
@@ -702,6 +710,40 @@ effect fn resolvePass(tree: &mut FunctionTree, cell: FunctionId, input: &mut Byt
   let mut line: i32 = 0 let mut cc = CodeContext.make()
   while position.* < input.length() {
     let p = position.* let code = input.get(p)
+    // Calls with recorded source positions and debugger locations are mapped
+    // instruction by instruction below, so a run stops before the next call.
+    while callIndex < calls.length() && calls.get(callIndex).pc < usize.toU32(p) { callIndex = callIndex + 1 }
+    let mut stop = input.length()
+    if callIndex < calls.length() { stop = u32.toUsize(calls.get(callIndex).pc) }
+    if !debug && stop > p && (emit.passClass(code) & emit.PASS_SPECIAL) == 0 {
+      // A run of verbatim instructions: one claim and one append for all of them.
+      let fd = tree.getMut(cell)
+      let mut q = p let mut atomsSeen = false
+      let bytes = input.asSlice()
+      while q < stop {
+        let c = bytes[q] let cls = emit.passClass(c)
+        if (cls & emit.PASS_SPECIAL) != 0 { break }
+        if (cls & emit.PASS_ATOM) != 0 { atomsSeen = true }
+        else if c == op.OP_line_num {
+          line = signedWord(readU32(bytes, q + 1)) fd.lineNumberCapacity = fd.lineNumberCapacity + 1
+        }
+        q = q + u8.toUsize(cls & 0x3f)
+      }
+      if q > input.length() { Intrinsic.trap("QuickJS invariant violated") }
+      if run emit.claimBytecode(&mut fd, q - p) {
+        if !fd.bytecode.appendSliceWithin(Slice.view<u8>(input.asSlice(), p, q - p)) { fd.bytecodeError = true }
+        else if atomsSeen {
+          let mut r = p
+          while r < q {
+            let cls = emit.passClass(input.get(r))
+            if (cls & emit.PASS_ATOM) != 0 { input.patchU32(r + 1, 0) }
+            r = r + u8.toUsize(cls & 0x3f)
+          }
+        }
+      }
+      position.* = q
+      continue
+    }
     let size = u8.toUsize(op.opcodeInfo(code, false).size) let mut next = p + size
     let mut outputStart: usize = 0
     if debug {
@@ -736,7 +778,13 @@ effect fn resolvePass(tree: &mut FunctionTree, cell: FunctionId, input: &mut Byt
       }
       let scope = u16.toI32(readU16(input.asSlice(), p + scopeOffset))
       next = i32.toUsize(run resolveScope(&mut tree, cell, &mut input, name, scope, code, label, usize.toI32(next)))
+      // Resolved: the operand's reference goes now instead of in a cleanup walk.
+      let owner = tree.getMut(cell)
+      let mut ownerAnchor = ()
+      let names = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ownerAnchor, owner.runtime)
+      names.atoms.release(name) input.patchU32(p + 1, 0)
     } else if code == op.OP_scope_get_private_field || code == op.OP_scope_get_private_field2 || code == op.OP_scope_put_private_field || code == op.OP_scope_in_private_field {
+      leftovers = true
       let name = readU32(input.asSlice(), p + 1) let scope = u16.toI32(readU16(input.asSlice(), p + 5))
       run resolvePrivate(&mut tree, cell, name, scope, code)
     } else {
@@ -771,9 +819,9 @@ effect fn resolvePass(tree: &mut FunctionTree, cell: FunctionId, input: &mut Byt
         // skipDeadCode released these original operands; zero them before cleanup.
         let mut dead = next
         while dead < end {
-          let deadCode = input.get(dead) let deadSize = u8.toUsize(op.opcodeInfo(deadCode, false).size)
-          if atomOperand(deadCode) { input.patchU32(dead + 1, 0) }
-          dead = dead + deadSize
+          let cls = emit.passClass(input.get(dead))
+          if (cls & emit.PASS_ATOM) != 0 { input.patchU32(dead + 1, 0) }
+          dead = dead + u8.toUsize(cls & 0x3f)
         }
         next = end
         if end < input.length() && deadLine >= 0 && deadLine != line { line = deadLine run lineOut(&mut fd, line) }
@@ -819,6 +867,7 @@ effect fn resolvePass(tree: &mut FunctionTree, cell: FunctionId, input: &mut Byt
         copy = debug && location.pc == usize.toU32(p) && location.debuggerStatement
       } else if code == op.OP_set_class_name { copy = false }
       else if code == op.OP_get_field_opt_chain {
+        leftovers = true
         run atomOp(&mut fd, &mut rt.atoms, op.OP_get_field, readU32(input.asSlice(), p + 1)) copy = false
       } else if code == op.OP_get_array_el_opt_chain { run emit.emitU8(&mut fd, op.OP_get_array_el) copy = false }
       if copy { run copyInstruction(&mut fd, &mut input, p) }
@@ -844,24 +893,29 @@ effect fn resolvePass(tree: &mut FunctionTree, cell: FunctionId, input: &mut Byt
   calls.truncate(callOutput)
   let fd = tree.getMut(cell)
   fd.callSiteSources = move calls
+  return leftovers
 }
 pub effect fn resolveVariables(tree: &mut FunctionTree, cell: FunctionId) -> ()
   ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
   let mut anchor = () let mut ra = ()
   let initial = tree.getMut(cell)
   if initial.bytecodeError { fail OutOfMemoryError {} }
-  let mut input = Intrinsic.replace(initial.bytecode, ByteBuffer.make()) drop initial
+  let mut input = Intrinsic.replace(initial.bytecode, ByteBuffer.make())
+  // The output is about the input's size: claim it once instead of growing to it.
+  let claimed = run emit.claimBytecode(&mut initial, input.length() + input.length() / 8 + 16)
+  drop initial
   let mut position: usize = 0
   let outcome = run Effect.result(resolvePass(&mut tree, cell, &mut input, &mut position))
   let fd = tree.getMut(cell)
   let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ra, fd.runtime)
   match move outcome {
-    Result<(), OutOfMemoryError | StringLengthError | CompilerError>.Success { .. } => {
-      emit.freeBytecodeAtoms(&mut rt.atoms, input.asSlice(), false)
+    Result<bool, OutOfMemoryError | StringLengthError | CompilerError>.Success { value: leftovers } => {
+      // A failed append (bytecodeError) leaves its operand in input too.
+      if leftovers || fd.bytecodeError { emit.freeBytecodeAtoms(&mut rt.atoms, input.asSlice(), false) }
       if fd.bytecodeError { fail OutOfMemoryError {} }
       return ()
     }
-    Result<(), OutOfMemoryError | StringLengthError | CompilerError>.Failure { error } => {
+    Result<bool, OutOfMemoryError | StringLengthError | CompilerError>.Failure { error } => {
       // Preserve the unprocessed suffix just as source fail: does. This retains
       // diagnostics independently and leaves a destructible, atom-owning buffer.
       while position < input.length() {
