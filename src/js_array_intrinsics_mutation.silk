@@ -8,12 +8,17 @@ import silk.mem.pointer { Pointer }
 import silk.num.i64
 import silk.num.u32
 import silk.num.usize
-import js_heap { HeapHeader }
+import js_heap { HeapCell, HeapHeader }
+import js_atoms { ATOM_INTEGER_TAG }
+import js_class_data as classes
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.num.u8
 import js_value { ValueBits }
 import js_intl_realm as ops
 import js_realm { Realm, lendRealm, Arguments, lendArguments }
 import js_owned_value { Value, ValueRef, lendBits, immediateRef, lendFor }
-import js_core_types { NativeErrorKind, JS_PROP_THROW }
+import js_core_types { NativeErrorKind, JS_PROP_THROW, JS_PROP_TMASK, ObjectData, ObjectPayload, ShapeData }
 import js_gc { HeapHooks }
 import js_coercion_host { CoercionHooks }
 import js_property_host { OwnPropertyHooks, GetPropertyHooks, HasPropertyHooks }
@@ -86,9 +91,102 @@ effect fn spliceFast<'a, 'b, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>, obje
   }
 }
 // Copies each present element of object[start, start + count) to output[0, count).
+struct SparseEntry { index: u32, slot: usize }
+impl Copy for SparseEntry {}
+/// The own integer-keyed records of a slow Array in [low, high), into found,
+/// when its prototypes hold no indexed properties and each record is plain
+/// data: 0 when they came in ascending order, 1 when not, -1 when it does not apply.
+effect fn sparseEntries(source: *mut HeapHeader, low: u32, high: u32, found: &mut List<SparseEntry>) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  let mut ascending: i32 = 0
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, source)
+  if data.classId() != classes.JS_CLASS_ARRAY || data.fastArray() { return -1 }
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+  let mut prototype = shape.prototype
+  let mut depth: usize = 0
+  while !Pointer.isNull<HeapHeader>(prototype) {
+    if depth >= 8 { return -1 }
+    let node = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(prototype)
+    let holder = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+    if holder.classId() == classes.JS_CLASS_ARRAY {
+      match &holder.payload {
+        ObjectPayload.FastArray { array } => { if array.values.length() != 0 { return -1 } }
+        _ => ()
+      }
+    } else if holder.classId() != classes.JS_CLASS_OBJECT || holder.isExotic() { return -1 }
+    let records = unsafe HeapCell.payload<ShapeData, ()>(&anchor, holder.shape)
+    let mut r: usize = 0
+    while r < records.properties.length() {
+      if (records.properties.get(r).atom & ATOM_INTEGER_TAG) != 0 { return -1 }
+      r = r + 1
+    }
+    prototype = records.prototype
+    depth = depth + 1
+  }
+  let mut i: usize = 0
+  let mut last: u32 = 0
+  while i < shape.properties.length() {
+    let record = shape.properties.get(i)
+    if (record.atom & ATOM_INTEGER_TAG) != 0 {
+      let index = record.atom & ~ATOM_INTEGER_TAG
+      if index >= low && index < high {
+        if (u8.toU32(record.flags) & JS_PROP_TMASK) != 0 { return -1 }
+        if found.length() != 0 && index < last { ascending = 1 }
+        last = index
+        run found.append(SparseEntry { index: index, slot: i })
+      }
+    }
+    i = i + 1
+  }
+  return ascending
+}
+/// copyPresent for a slow (sparse) Array whose prototypes hold no indexed
+/// properties: its present elements are its own integer-keyed records, so
+/// those are visited in index order instead of probing every index of the
+/// range. All of them must be plain data, so no code runs. False, before any
+/// change, when that does not hold.
+effect fn copySparse<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + PropertyWriteHooks>(
+  hooks: &mut H, realm: Realm<'a>, object: ValueRef<'b>, start: i64, count: i64, output: ValueRef<'b>) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  let source = match object.view() { ValueBits.Object { reference } => reference _ => { return false } }
+  if start < 0 || start + count > 2147483647 { return false }
+  // Defining on a distinct Array runs no code that could change the source.
+  let target = match output.view() { ValueBits.Object { reference } => reference _ => { return false } }
+  if Pointer.address<HeapHeader>(target) == Pointer.address<HeapHeader>(source) { return false }
+  let targetAnchor = ()
+  if (unsafe HeapCell.payload<ObjectData, ()>(&targetAnchor, target)).classId() != classes.JS_CLASS_ARRAY { return false }
+  let low = i64.toU32(start) let high = i64.toU32(start + count)
+  let mut found = List<SparseEntry>.make()
+  let order = run sparseEntries(source, low, high, &mut found)
+  if order < 0 { return false }
+  let ascending = order == 0
+  if !ascending {
+    // Rare (filled from the top down): insertion order, bounded to stay linear-ish.
+    if found.length() > 256 { return false }
+    let mut i: usize = 1
+    while i < found.length() {
+      let item = found.get(i) let mut j = i
+      while j > 0 && found.get(j - 1).index > item.index { let moved = found.get(j - 1) found.set(j, moved) j = j - 1 }
+      found.set(j, item)
+      i = i + 1
+    }
+  }
+  let mut k: usize = 0
+  while k < found.length() {
+    let entry = found.get(k)
+    let anchor = ()
+    let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, source)
+    let value = unsafe data.properties.get(entry.slot).valueBits().retained()
+    drop data
+    let written = run mutations.createDataPropertyUint32(&mut hooks, realm, output, u32.toI64(entry.index - low), unsafe Value.adoptBits(value), JS_PROP_THROW)
+    k = k + 1
+  }
+  return true
+}
 effect fn copyPresent<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + PropertyWriteHooks>(
   hooks: &mut H, realm: Realm<'a>, object: ValueRef<'b>, start: i64, count: i64, output: ValueRef<'b>) -> ()
   ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  if count > 32 && run copySparse(&mut hooks, realm, object, start, count, output) { return () }
   let mut index: i64 = 0
   while index < count {
     let mut value = ValueBits.Undefined

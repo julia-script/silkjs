@@ -13,7 +13,12 @@ import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
 import js_owned_value { Value, lendBits, immediateRef, ValueRef }
 import js_object_ref { ObjectRef }
-import js_core_types { ObjectData, ObjectPayload, NativeCallProtocol, NativeErrorKind, FrameSlots, NativeFunctionId, BuiltinFamily }
+import js_core_types { ObjectData, ObjectPayload, NativeCallProtocol, NativeErrorKind, FrameSlots, NativeFunctionId, BuiltinFamily, ContextState, ShapeData, JS_PROP_TMASK }
+import js_shapes as shapes
+import js_array_intrinsics_support as fastArrays
+import silk.num.u8
+import silk.num.u32
+import silk.num.i64
 import js_gc { HeapHooks }
 import js_gc as gc
 import js_runtime as runtime
@@ -227,12 +232,126 @@ pub effect fn close<'a, 'b, H: HeapHooks + OwnPropertyHooks + GetPropertyHooks +
     Result<(), JsException>.Failure { error } => { fail move error }
   }
 }
+// A for-of record over a fast Array whose @@iterator is the realm's built-in
+// values() and whose iterator prototype's next is the built-in one keeps the
+// array itself in the iterator slot and the next index as an Int in the method
+// slot. The Array Iterator it stands for cannot be observed while it steps:
+// next reads only its internal slots, and the length and element reads see the
+// array as the receiver. Only a `return` method found at close could see it,
+// and then closeStandIn builds it.
+
+/// The next index of a stand-in record's method slot, or -1 for a real record.
+pub fn standInIndex(method: ValueBits) -> i32 {
+  return match method { ValueBits.Int { value } => value _ => -1 }
+}
+/// The element a stand-in record at position steps to, retained, while the
+/// array is still a fast Array holding it; Uninitialized when the step needs
+/// forOfNext.
+@inlineAlways
+pub unsafe fn standInElement(array: ValueBits, position: i32) -> ValueBits {
+  let reference = match array { ValueBits.Object { reference } => reference _ => { return ValueBits.Uninitialized } }
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+  if !data.fastArray() || position == 2147483647 { return ValueBits.Uninitialized }
+  match &data.payload {
+    ObjectPayload.FastArray { array: items } => {
+      let index = i32.toUsize(position)
+      if index < items.values.length() { return unsafe (unsafe items.values.getUnchecked(index)).retained() }
+    }
+    _ => ()
+  }
+  return ValueBits.Uninitialized
+}
+unsafe fn iteratorPrototype<'a>(realm: Realm<'a>) -> ValueBits {
+  let anchor = ()
+  let context = unsafe HeapCell.payload<ContextState, ()>(&anchor, realm.context())
+  return context.classPrototypes.get(u32.toUsize(classes.JS_CLASS_ARRAY_ITERATOR))
+}
+unsafe fn builtinValues<'a>(realm: Realm<'a>, method: ValueBits) -> bool {
+  let mut kind: u32 = 0
+  let home = arrayFactory(unsafe lendBits(&method, method), &mut kind)
+  if kind != arrayIterator.VALUE || Pointer.address<HeapHeader>(home) != Pointer.address<HeapHeader>(realm.context()) { return false }
+  let prototype = unsafe iteratorPrototype(realm)
+  let reference = match prototype { ValueBits.Object { reference } => reference _ => { return false } }
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+  if data.isExotic() { return false }
+  return match unsafe shapes.lookup(data.shape, atoms.JS_ATOM_next) {
+    Option<usize>.Some { value: index } => {
+      if (u8.toU32(unsafe shapes.slotFlagsUnchecked(data.shape, index)) & JS_PROP_TMASK) != 0 { return false }
+      return arrayIteratorNext(data.properties.get(index).valueBits())
+    }
+    Option<usize>.None => false
+  }
+}
+/// Whether getting `return` from a fresh Array Iterator of realm would find
+/// nothing without running code: no ordinary object on its prototype chain
+/// has the key, and none is exotic.
+unsafe fn returnAbsent<'a>(realm: Realm<'a>) -> bool {
+  let mut current = match unsafe iteratorPrototype(realm) { ValueBits.Object { reference } => reference _ => { return false } }
+  while true {
+    let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, current)
+    if data.isExotic() { return false }
+    if let Option<usize>.Some { .. } = unsafe shapes.lookup(data.shape, atoms.JS_ATOM_return) { return false }
+    let shapeData = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+    match Pointer.nonNullMut<HeapHeader>(shapeData.prototype) {
+      Option<*mut HeapHeader>.Some { value } => { current = value }
+      Option<*mut HeapHeader>.None => { return true }
+    }
+  }
+  return true
+}
+/// IteratorClose of a stand-in record over array at index: nothing when no
+/// `return` can be found, otherwise the iterator is built and closed.
+pub effect fn closeStandIn<'a, 'b, H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + CoercionHooks + CallHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, array: ValueRef<'b>, index: i32, pending: bool) -> () ! JsException ? &mut Allocator {
+  if unsafe returnAbsent(realm) { return () }
+  let built = run Intrinsic.catchFailure<JsException>(arrayIterator.createForObject(&mut hooks, memory, realm, array, arrayIterator.VALUE), failedJs)
+  let iterator = match move built {
+    ValueBits value => value
+    FailedJs { error } => { fail move error }
+  }
+  unsafe arrayIterator.resumeAt(iterator, i32.toU32(index))
+  let closed = run Effect.result(close(&mut hooks, realm, unsafe lendBits(&iterator, iterator), pending))
+  unsafe gc.release(&mut hooks, realm.runtime(), iterator)
+  match move closed {
+    Result<(), JsException>.Success { .. } => ()
+    Result<(), JsException>.Failure { error } => { fail move error }
+  }
+}
+// getIterator's sync tail once @@iterator is fetched.
+effect fn fromMethod<'a, 'b, H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + CoercionHooks + CallHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, object: ValueRef<'b>, method: Value) -> Value ! JsException ? &mut Allocator {
+  if !hooks.isCallable(realm, method.borrow()) {
+    drop method
+    return run hooks.throwError(realm, NativeErrorKind.Type, b"value is not iterable")
+  }
+  if object.view().isObject() {
+    let mut kind: u32 = 0
+    let home = arrayFactory(method.borrow(), &mut kind)
+    if let Option<*mut HeapHeader>.Some { value: context } = Pointer.nonNullMut<HeapHeader>(home) {
+      drop method
+      return unsafe Value.adoptBits(run arrayIterator.createForObject(&mut hooks, memory, unsafe lendRealm(&context, context), object, kind))
+    }
+  }
+  return run acquire(&mut hooks, realm, object, method.borrow())
+}
 // inputIndex is source sp[-1]; its successor is sp[0]. On acquisition failure
 // the input remains owned in place; on next getter failure the iterator replaces it.
 pub effect fn forOfStart<'a, H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + CoercionHooks + CallHooks>(hooks: &mut H,
   memory: &AllocationObserver, realm: Realm<'a>, slots: &mut FrameSlots, inputIndex: usize, isAsync: bool) -> () ! JsException ? &mut Allocator {
   let input = unsafe slots.get(inputIndex)
-  let iterator = (run getIterator(&mut hooks, memory, realm, unsafe lendBits(&input, input), isAsync)).intoBits()
+  let mut iterator = ValueBits.Undefined
+  if !isAsync && fastArrays.fastCount(unsafe lendBits(&input, input)) >= 0 {
+    // GetIterator's one observable step is this get; the rest is decided by it.
+    let method = run get(&mut hooks, realm, unsafe lendBits(&input, input), atoms.JS_ATOM_Symbol_iterator)
+    if unsafe builtinValues(realm, method.view()) {
+      drop method
+      unsafe slots.write(inputIndex + 1, ValueBits.Int { value: 0 })
+      return ()
+    }
+    iterator = (run fromMethod(&mut hooks, memory, realm, unsafe lendBits(&input, input), move method)).intoBits()
+  } else {
+    iterator = (run getIterator(&mut hooks, memory, realm, unsafe lendBits(&input, input), isAsync)).intoBits()
+  }
   unsafe gc.release(&mut hooks, realm.runtime(), input)
   let replaced = unsafe slots.replace(inputIndex, iterator)
   let method = run get(&mut hooks, realm, unsafe lendBits(&iterator, iterator), atoms.JS_ATOM_next)
@@ -258,7 +377,27 @@ fn arrayIteratorNext(method: ValueBits) -> bool {
 pub effect fn forOfNext<'a, H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + CoercionHooks + CallHooks + NativeFunctionHooks>(hooks: &mut H,realm: Realm<'a>, slots: &mut FrameSlots, iteratorIndex: usize, outputIndex: usize) -> () ! JsException ? &mut Allocator {
   let iterator = unsafe slots.get(iteratorIndex)
   let mut value = ValueBits.Undefined let mut done = true
-  if iterator.tag() != 3 {
+  let position = standInIndex(unsafe slots.get(iteratorIndex + 1))
+  if position >= 0 && iterator.tag() != 3 {
+    let count = fastArrays.fastCount(unsafe lendBits(&iterator, iterator))
+    let index = i32.toI64(position)
+    if index < count && position < 2147483647 {
+      unsafe slots.write(iteratorIndex + 1, ValueBits.Int { value: position + 1 })
+      unsafe slots.write(outputIndex, fastArrays.fastGet(unsafe lendBits(&iterator, iterator), index).intoBits())
+      unsafe slots.write(outputIndex + 1, ValueBits.Bool { value: false })
+      return ()
+    }
+    if count < 0 || index < count || fastArrays.intLength(unsafe lendBits(&iterator, iterator)) != count {
+      // Advance before the get: a throwing accessor must not repeat.
+      if position < 2147483647 { unsafe slots.write(iteratorIndex + 1, ValueBits.Int { value: position + 1 }) }
+      let stepped = run Intrinsic.catchFailure<JsException>(arrayIterator.valuesAt(&mut hooks, realm, unsafe lendBits(&iterator, iterator), i32.toU32(position), &mut done), failedJs)
+      match move stepped {
+        ValueBits output => { value = output }
+        FailedJs { error } => { unsafe retire(&mut slots, iteratorIndex) fail move error }
+      }
+    }
+    if done { unsafe retire(&mut slots, iteratorIndex) }
+  } else if position < 0 && iterator.tag() != 3 {
     let method = unsafe slots.get(iteratorIndex + 1)
     // The built-in array iterator over a dense fast Array steps without a call.
     if arrayIteratorNext(method) && unsafe arrayIterator.denseStep(iterator, &mut value) {
