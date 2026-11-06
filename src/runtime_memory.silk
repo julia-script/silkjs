@@ -22,6 +22,8 @@ import silk.num.usize
 import silk.collections.list { List }
 import silk.core.option { Option }
 import runtime_allocation_profile { AllocationRecord, Recording, Config }
+import silk.num.u64
+import silk.num.u32
 
 /// A coherent, allocation-free snapshot. Peak usage counts successful allocations only.
 pub struct RuntimeMemoryStats {
@@ -97,7 +99,15 @@ struct ArenaHeader {
   next: ?*mut ArenaHeader,
   nextLive: ?*mut ArenaHeader,
   records: *mut PoolRecord,
-  carved: usize
+  carved: usize,
+  // Heap-cell membership for one runtime's collector (js_gc), which reads and
+  // writes these on its own thread only: the runtime whose GC cells this arena
+  // holds (0 for none), its next such arena, a bit per granule that starts a
+  // published cell, and a bit per granule of collector scratch.
+  cellOwner: usize,
+  cellNext: ?*mut u8,
+  cells: [u64; 16],
+  pending: [u64; 16]
 }
 
 @inlineAlways
@@ -661,7 +671,8 @@ effect fn takeArena<A>(self: &mut RuntimeAllocator<A>, class: usize, requestedBy
         let state = Pointer.borrowMut(&mut anchor, ledger.allocation)
         Pointer.put<ArenaHeader>(owner, ArenaHeader { ledger: ledger.allocation, class: class,
           storage: Option<Intrinsic.RawBuffer<u8>>.none(), next: Pointer.null<ArenaHeader>(),
-          nextLive: state.firstPooledArena, records: Intrinsic.pointerRequalify<?*mut PoolRecord, *mut PoolRecord>(spareRecords), carved: 0 })
+          nextLive: state.firstPooledArena, records: Intrinsic.pointerRequalify<?*mut PoolRecord, *mut PoolRecord>(spareRecords), carved: 0,
+          cellOwner: 0, cellNext: Pointer.null<u8>(), cells: [0; 16], pending: [0; 16] })
         state.firstPooledArena = owner
         drop state
         unlockLedger(ledger)
@@ -702,7 +713,8 @@ effect fn takeArena<A>(self: &mut RuntimeAllocator<A>, class: usize, requestedBy
     let pool = Pointer.borrowMut<(), Pool>(&mut poolAnchor, poolOf(ledger))
     Pointer.put<ArenaHeader>(owner, ArenaHeader { ledger: ledger.allocation, class: class,
       storage: Option<Intrinsic.RawBuffer<u8>>.some(move groupStorage), next: pool.arenas,
-      nextLive: firstLive, records: records, carved: 0 })
+      nextLive: firstLive, records: records, carved: 0,
+      cellOwner: 0, cellNext: Pointer.null<u8>(), cells: [0; 16], pending: [0; 16] })
     pool.arenas = Intrinsic.pointerRequalify<*mut ArenaHeader, ?*mut ArenaHeader>(owner)
     // A racing refill's leftover spares stay owned by its group, unused.
     pool.spare = Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(second)
@@ -1350,4 +1362,129 @@ pub unsafe fn adoptUnpooledBlock(block: *mut u8) -> Intrinsic.RawBuffer<u8> {
   let reclaim: extern "C" fn(?*mut u8) -> () = silkRuntimeMemoryReclaim
   let allocation = unsafe Intrinsic.allocationAdopt(block, Layout { bytes: bytes, alignment: POOL_GRANULE }, reclaim, header)
   return unsafe RawBuffer.from<u8>(move allocation, bytes)
+}
+
+// Heap-cell membership. A runtime's GC cells in pooled blocks are found through
+// their arenas instead of per-cell links: each arena keeps a bit per granule that
+// starts a published cell, and the runtime keeps the list of arenas it claimed.
+// Only the runtime's thread touches these fields; pooled blocks themselves may
+// still be released from any thread.
+
+/// Bitmap words per arena (one bit per granule).
+pub const CELL_WORDS: usize = 16
+
+@inlineAlways
+unsafe fn cellGranule(block: *mut u8) -> usize {
+  return usize.shiftRight(usize.bitAnd(Pointer.address<u8>(block), ARENA_BYTES - 1), 4)
+}
+@inlineAlways
+unsafe fn arenaRef(arena: *mut u8) -> *mut ArenaHeader {
+  return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ArenaHeader>(arena)
+}
+
+/// Publishes pooled block as a GC cell of owner (a runtime's address), claiming its
+/// arena onto the list at head the first time. Traps if another runtime's cells use
+/// the arena: runtimes do not share a provider.
+@inlineAlways
+pub unsafe fn addCell(block: *mut u8, owner: usize, head: *mut ?*mut u8) -> () {
+  let arenaAddress = unsafe arenaOf(block)
+  let mut anchor = ()
+  let arena = unsafe Pointer.borrowMut<(), ArenaHeader>(&mut anchor, arenaAddress)
+  let claimed = arena.cellOwner == owner
+  drop arena
+  if !claimed { unsafe claimCells(arenaAddress, owner, head) }
+  let claimedArena = unsafe Pointer.borrowMut<(), ArenaHeader>(&mut anchor, arenaAddress)
+  let granule = unsafe cellGranule(block)
+  let word = usize.shiftRight(granule, 6)
+  claimedArena.cells[word] = u64.bitOr(claimedArena.cells[word], u64.shiftLeft(1, usize.toU64(usize.bitAnd(granule, 63))))
+}
+@inlineNever
+unsafe fn claimCells(arenaAddress: *mut ArenaHeader, owner: usize, head: *mut ?*mut u8) -> () {
+  let mut anchor = ()
+  let arena = unsafe Pointer.borrowMut<(), ArenaHeader>(&mut anchor, arenaAddress)
+  if arena.cellOwner != 0 { Intrinsic.trap("a pool arena holds GC cells of two runtimes") }
+  arena.cellOwner = owner
+  arena.cellNext = unsafe Pointer.read<?*mut u8>(head)
+  drop arena
+  unsafe Pointer.write<?*mut u8>(head, unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(unsafe Intrinsic.pointerReinterpret<*mut ArenaHeader, *mut u8>(arenaAddress)))
+}
+/// Withdraws pooled block's GC-cell bit (idempotent).
+@inlineAlways
+pub unsafe fn removeCell(block: *mut u8) -> () {
+  let mut anchor = ()
+  let arena = unsafe Pointer.borrowMut<(), ArenaHeader>(&mut anchor, unsafe arenaOf(block))
+  let granule = unsafe cellGranule(block)
+  let word = usize.shiftRight(granule, 6)
+  arena.cells[word] = u64.bitAnd(arena.cells[word], u64.bitNot(u64.shiftLeft(1, usize.toU64(usize.bitAnd(granule, 63)))))
+}
+/// Whether pooled block is a published GC cell.
+@inlineAlways
+pub unsafe fn isCell(block: *mut u8) -> bool {
+  let anchor = ()
+  let arena = unsafe Pointer.borrow<(), ArenaHeader>(&anchor, unsafe arenaOf(block))
+  let granule = unsafe cellGranule(block)
+  return u64.bitAnd(arena.cells[usize.shiftRight(granule, 6)], u64.shiftLeft(1, usize.toU64(usize.bitAnd(granule, 63)))) != 0
+}
+/// Sets pooled block's scratch bit.
+@inlineAlways
+pub unsafe fn setPending(block: *mut u8) -> () {
+  let mut anchor = ()
+  let arena = unsafe Pointer.borrowMut<(), ArenaHeader>(&mut anchor, unsafe arenaOf(block))
+  let granule = unsafe cellGranule(block)
+  let word = usize.shiftRight(granule, 6)
+  arena.pending[word] = u64.bitOr(arena.pending[word], u64.shiftLeft(1, usize.toU64(usize.bitAnd(granule, 63))))
+}
+/// Word index of arena's cell bitmap.
+@inlineAlways
+pub unsafe fn cellWord(arena: *mut u8, index: usize) -> u64 {
+  let anchor = ()
+  return (unsafe Pointer.borrow<(), ArenaHeader>(&anchor, unsafe arenaRef(arena))).cells[index]
+}
+/// Word index of arena's scratch bitmap.
+@inlineAlways
+pub unsafe fn pendingWord(arena: *mut u8, index: usize) -> u64 {
+  let anchor = ()
+  return (unsafe Pointer.borrow<(), ArenaHeader>(&anchor, unsafe arenaRef(arena))).pending[index]
+}
+@inlineAlways
+pub unsafe fn setPendingWord(arena: *mut u8, index: usize, value: u64) -> () {
+  let mut anchor = ()
+  let header = unsafe Pointer.borrowMut<(), ArenaHeader>(&mut anchor, unsafe arenaRef(arena))
+  header.pending[index] = value
+}
+/// The block at granule bit of word index in arena.
+@inlineAlways
+pub unsafe fn cellAt(arena: *mut u8, index: usize, bit: u32) -> *mut u8 {
+  return unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(arena), usize.shiftLeft(index * 64 + u32.toUsize(bit), 4))
+}
+/// The next arena after arena on its runtime's list, or null.
+@inlineAlways
+pub unsafe fn nextCellArena(arena: *mut u8) -> ?*mut u8 {
+  let anchor = ()
+  return (unsafe Pointer.borrow<(), ArenaHeader>(&anchor, unsafe arenaRef(arena))).cellNext
+}
+/// Whether any cell bit is set in arena.
+pub unsafe fn arenaHasCells(arena: *mut u8) -> bool {
+  let mut index: usize = 0
+  while index < CELL_WORDS {
+    if unsafe cellWord(arena, index) != 0 { return true }
+    index = index + 1
+  }
+  return false
+}
+/// Gives up every arena on the list at head (a runtime ending): their cell and
+/// scratch bits must be clear already.
+pub unsafe fn releaseCellArenas(head: *mut ?*mut u8) -> () {
+  let mut cursor = unsafe Pointer.read<?*mut u8>(head)
+  unsafe Pointer.write<?*mut u8>(head, Pointer.null<u8>())
+  while !Pointer.isNull<u8>(cursor) {
+    let arena = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(cursor)
+    let mut anchor = ()
+    let header = unsafe Pointer.borrowMut<(), ArenaHeader>(&mut anchor, unsafe arenaRef(arena))
+    cursor = header.cellNext
+    header.cellNext = Pointer.null<u8>()
+    header.cellOwner = 0
+    header.pending = [0; 16]
+    header.cells = [0; 16]
+  }
 }
