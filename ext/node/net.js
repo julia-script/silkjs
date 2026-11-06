@@ -567,6 +567,16 @@ Server.prototype.listen = function(...args) {
         if (status < 0) { failed(nativeError(status, 'chmod', address)); return; }
       }
       status = this._transport.call('listen', backlog);
+      // The bind of a TCP server takes effect at listen, so a host without IPv6 fails here.
+      if (status < 0 && kind === 1 && options.fd === undefined && options.host === undefined && address === '::') {
+        this._transport.onEvent = () => {};
+        this._transport.close();
+        this._transport = new Transport(1, (...event) => this._onNative(...event));
+        if (this._unrefed) this._transport.unref();
+        address = '0.0.0.0';
+        status = this._transport.call('bind', address, port, 0);
+        if (status >= 0) status = this._transport.call('listen', backlog);
+      }
       if (status < 0) { failed(nativeError(status, 'listen', address, port)); return; }
       this._starting = false;
       this._listening = true;

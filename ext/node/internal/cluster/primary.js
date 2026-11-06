@@ -106,7 +106,7 @@ function query(worker, message) {
   }
   server.on('connection', socket => { entry.queue.push(socket); distribute(entry); });
   if (!entry.shared) { server.listen({ ...options, exclusive: true }, ready); return; }
-  // A bound, non-listening primary descriptor cannot steal accepts from workers.
+  // A passive primary descriptor cannot steal accepts from workers.
   // SCM_RIGHTS duplicates this same socket; each child registers its own watcher.
   const { Transport, native, error: nativeError } = require('internal/net/transport');
   const bind = address => {
@@ -120,6 +120,12 @@ function query(worker, message) {
       if (kind === 2 && (options.readableAll || options.writableAll)) {
         status = server._transport.call('chmod', !!options.readableAll, !!options.writableAll);
         if (status < 0) { failed(nativeError(status, 'chmod', address)); return; }
+      }
+      // A passive listen makes the bound socket that workers share, and never accepts here.
+      if (options.fd === undefined) {
+        status = server._transport.call('listen', options.backlog || 511, true);
+        if (status < 0 && address === '::' && !options.host) { server._transport.close(); bind('0.0.0.0'); return; }
+        if (status < 0) { failed(nativeError(status, 'listen', address, options.port)); return; }
       }
       ready();
     } catch (error) { failed(error); }

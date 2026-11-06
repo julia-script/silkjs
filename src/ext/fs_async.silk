@@ -81,7 +81,8 @@ unsafe extern "C" fn uv_metrics_idle_time(loop: *mut u8) -> u64
 // `waker` ends a reactor wait from any thread. `held` counts the sources, such as worker message
 // ports, that keep the loop alive while they wait for a wake. `anchor` is an unreferenced libuv async
 // handle whose reference poll borrows so that libuv runs while only JavaScript timers are pending.
-pub struct State { loop: *mut u8, reactor: Reactor, pool: Pool, waker: Waker, anchor: *mut u8, held: usize, due: u64, idle: u64, inflight: usize, first: ?*mut Request, delivering: ?*mut Request, watches: ?*mut Watch, nextWatch: i32, closing: bool, polling: bool, descriptors: descriptors.State }
+// `ready` keeps the events of the last reactor wait, for the executors whose descriptors are in it.
+pub struct State { loop: *mut u8, reactor: Reactor, pool: Pool, waker: Waker, anchor: *mut u8, held: usize, due: u64, idle: u64, ready: [ReadyEvent; 64], readyCount: usize, inflight: usize, first: ?*mut Request, delivering: ?*mut Request, watches: ?*mut Watch, nextWatch: i32, closing: bool, polling: bool, descriptors: descriptors.State }
 // A request is native memory that the loop owns. While it is queued or running, a worker reads
 // `call` and writes `result`; the loop reads them again only after the pool returns `job`.
 struct Request {
@@ -130,7 +131,7 @@ pub effect fn make() -> *mut State ! OutOfMemoryError ? &mut Allocator {
     Result<Pool, OutOfMemoryError>.Failure { error } => { unsafe uv_close(loopAnchor, silkLoopAnchorClosed) let drained = unsafe uv.uv_run(loop, 0) let ignored = unsafe uv_loop_close(loop) unsafe free(loop) unsafe free(raw) fail move error }
   }
   let state = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut State>(raw)
-  unsafe Pointer.put<State>(state, State { loop: loop, waker: reactor.waker(), reactor: move reactor, pool: move workers, anchor: loopAnchor, held: 0, due: 0, idle: 0, inflight: 0, first: Pointer.null<Request>(), delivering: Pointer.null<Request>(), watches: Pointer.null<Watch>(), nextWatch: 1, closing: false, polling: false, descriptors: descriptors.make() })
+  unsafe Pointer.put<State>(state, State { loop: loop, waker: reactor.waker(), reactor: move reactor, pool: move workers, anchor: loopAnchor, held: 0, due: 0, idle: 0, ready: [ReadyEvent.empty(); 64], readyCount: 0, inflight: 0, first: Pointer.null<Request>(), delivering: Pointer.null<Request>(), watches: Pointer.null<Watch>(), nextWatch: 1, closing: false, polling: false, descriptors: descriptors.make() })
   return state
 }
 pub unsafe fn descriptorState(pointer: *mut State) -> *mut descriptors.State {
@@ -170,19 +171,38 @@ pub unsafe fn unhold(pointer: *mut State) -> () {
   if state.held == 0 { Intrinsic.trap("the runtime loop was released more often than held") }
   state.held = state.held - 1
 }
-// Tokens of descriptors other executors add to the reactor: the descriptor plus this offset.
-const DESCRIPTOR_TOKENS: u64 = 16
-/// Adds `fd` to the loop's reactor, so that the next wait ends when it is readable. The executor
-/// that owns `fd` reads it in its own poll and must call `forgetDescriptor` before it closes `fd`.
-pub unsafe fn watchDescriptor(pointer: *mut State, fd: i32) -> bool {
+/// The first token of each executor that adds descriptors to the reactor. Token 1 is libuv's.
+pub const DESCRIPTOR_TOKENS: u64 = 16
+pub const NET_TOKENS: u64 = 4611686018427387904
+/// Adds `fd` to the loop's reactor under `token`, so that a wait ends when `fd` is ready for
+/// `interest`. The executor that owns `fd` finds its events with `readyCount` and `readyAt` in its
+/// own poll, and must call `forgetDescriptor` before it closes `fd`. Returns the errno of a failure,
+/// or 0.
+pub unsafe fn watchDescriptor(pointer: *mut State, fd: i32, token: u64, interest: Interest) -> i32 {
   let mut anchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer)
-  let registered = run Effect.result(state.reactor.register(fd, i32.toU64(fd) + DESCRIPTOR_TOKENS, Interest.readOnly()))
-  return match move registered { Result<(), ReactorError>.Success { .. } => true Result<(), ReactorError>.Failure { .. } => false }
+  let registered = run Effect.result(state.reactor.register(fd, token, interest))
+  return match move registered { Result<(), ReactorError>.Success { .. } => 0 Result<(), ReactorError>.Failure { error } => error.code }
+}
+/// Changes the token or interest of a descriptor that `watchDescriptor` added. Returns the errno of
+/// a failure, or 0.
+pub unsafe fn modifyDescriptor(pointer: *mut State, fd: i32, token: u64, interest: Interest) -> i32 {
+  let mut anchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer)
+  let modified = run Effect.result(state.reactor.modify(fd, token, interest))
+  return match move modified { Result<(), ReactorError>.Success { .. } => 0 Result<(), ReactorError>.Failure { error } => error.code }
 }
 pub unsafe fn forgetDescriptor(pointer: *mut State, fd: i32) -> () {
   let mut anchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer)
   let removed = run Effect.result(state.reactor.deregister(fd))
   if let Result<(), ReactorError>.Failure { .. } = move removed { Intrinsic.trap("a descriptor cannot leave the runtime reactor") }
+}
+/// The number of events that the last reactor wait found. Each poll waits once, with no timeout
+/// when it must not block, so an executor that polls after the loop sees the events of this turn.
+/// The reactor is level-triggered: a descriptor that stays ready is in the next wait again.
+pub unsafe fn readyCount(pointer: *mut State) -> usize {
+  let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer) return state.readyCount
+}
+pub unsafe fn readyAt(pointer: *mut State, index: usize) -> ReadyEvent {
+  let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer) return state.ready[index]
 }
 /// Ends the next wait no later than `deadline`, a monotonic `NativeClock` time in nanoseconds.
 /// Each wait consumes the deadlines given before it, so an executor gives its deadline every poll.
@@ -513,7 +533,8 @@ unsafe effect fn pollInner<'m, S: EngineServices>(engine: &mut Engine<'m, S>, co
     run unsafe deliverCompleted(&mut engine, context, pointer, unsafe nonnull(immediate))
     ran = true mode = 2
   }
-  if mode == 1 { run unsafe waitReady(pointer, loop, timeout) mode = 2 }
+  // A turn that must not block still checks the reactor once, so the executors see their events.
+  run unsafe waitReady(pointer, loop, if mode == 1 { timeout } else { 0 }) mode = 2
   // JS timers can keep the runtime alive while every libuv handle is unrefed.
   // UV_RUN_NOWAIT otherwise skips polling entirely. Borrow the loop anchor's
   // reference only across native callbacks, never across JS delivery.
@@ -543,7 +564,7 @@ unsafe effect fn waitReady(pointer: *mut State, loop: *mut u8, timeout: i64) -> 
   let mut limit = timeout
   if guest >= 0 && (limit < 0 || i32.toI64(guest) < limit) { limit = i32.toI64(guest) }
   let mut nanoseconds = if limit < 0 { Option<u64>.none() } else { Option<u64>.some(i64.toU64(limit) * 1000000) }
-  let mut events = [ReadyEvent.empty(), ReadyEvent.empty(), ReadyEvent.empty(), ReadyEvent.empty()]
+  let mut events = [ReadyEvent.empty(); 64]
   let mut anchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer)
   let started = run NativeClock.now(true)
   let due = state.due state.due = 0
@@ -554,7 +575,8 @@ unsafe effect fn waitReady(pointer: *mut State, loop: *mut u8, timeout: i64) -> 
     nanoseconds = Option<u64>.some(capped)
   }
   let waited = run Effect.result(state.reactor.wait(&mut events, nanoseconds))
-  if let Result<usize, ReactorError>.Failure { .. } = move waited { Intrinsic.trap("the runtime reactor wait failed") }
+  state.readyCount = match move waited { Result<usize, ReactorError>.Success { value } => value Result<usize, ReactorError>.Failure { .. } => Intrinsic.trap("the runtime reactor wait failed") }
+  state.ready = events
   let ended = run NativeClock.now(true)
   let elapsed = (SystemClock.seconds(&ended) - SystemClock.seconds(&started)) * 1000000000 + SystemClock.nanoseconds(&ended) - SystemClock.nanoseconds(&started)
   if elapsed > 0 { state.idle = state.idle + i64.toU64(elapsed) }
