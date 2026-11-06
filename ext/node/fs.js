@@ -91,7 +91,7 @@ fs.readdirSync = function readdirSync(path, options) {
   path = c.path(path); const o = opts(options, { encoding: 'utf8', withFileTypes: false, recursive: false }); c.encoding(o.encoding, 'utf8', true);
   const output = [];
   function visit(dir, relative) {
-    for (const name of c.pair(os.readdir(dir), 'scandir', dir)) {
+    for (const name of c.native('scandir', [dir])) {
       if (name === '.' || name === '..') continue;
       const full = p.join(dir, name); const rel = relative ? p.join(relative, name) : name;
       const info = o.withFileTypes || o.recursive ? fs.lstatSync(full) : null;
