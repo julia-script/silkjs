@@ -35,9 +35,11 @@ import sys
 import time
 from pathlib import Path
 
+from toolchain import release_binary
+
 ROOT = Path(__file__).resolve().parents[1]
 BENCH = ROOT / 'bench'
-DEFAULT_BINARY = ROOT / 'build/llvm/x86_64-unknown-linux-gnu/release/silkjs'
+DEFAULT_BINARY = release_binary()
 MICRO_LINE = re.compile(r'^\s*(\S+)\s+(\d+)\s+([0-9.]+)')
 
 
