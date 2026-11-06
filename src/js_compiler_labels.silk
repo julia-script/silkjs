@@ -12,6 +12,7 @@ import silk.num.i32
 import silk.num.u8
 import silk.num.u16
 import silk.num.u32
+import silk.num.u64
 import silk.num.usize
 import byte_buffer { ByteBuffer, readU16, readU32 }
 import js_heap { HeapCell }
@@ -51,7 +52,7 @@ effect fn constantTest(fd: &mut FunctionDef, table: &mut AtomTable, bytes: &[u8]
 // unchanged is no_change, and emitBranch implements has_goto/has_label.
 @inlineAlways
 effect fn resolveInstruction(fd: &mut FunctionDef, table: &mut AtomTable, bytes: &[u8], out: &mut ByteBuffer,
-    position: i32, line: &mut i32) -> i32 ! OutOfMemoryError ? &mut Allocator {
+    position: i32, line: &mut i32, dead: u64) -> i32 ! OutOfMemoryError ? &mut Allocator {
   let pos = i32.toUsize(position)
   let code = bytes[pos]
   let length = u8.toI32(op.opcodeInfo(code, false).size)
@@ -196,6 +197,10 @@ effect fn resolveInstruction(fd: &mut FunctionDef, table: &mut AtomTable, bytes:
       matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
       run out.append(op.OP_put_var) run out.writeU16(i32.toU16(cc.index)) return cc.position
     }
+    // A copy stored to a write-only local: the store and its dup vanish.
+    if matchCode(&mut cc, bytes, next, &[opcode(op.OP_put_loc), -1, -1]) && isDead(dead, cc.index) {
+      matchedLine(&cc, &mut line) return cc.position
+    }
     if matchCode(&mut cc, bytes, next, &[M4(op.OP_put_loc, op.OP_put_loc_check, op.OP_put_arg, op.OP_put_var_ref), -1, -1]) {
       matchedLine(&cc, &mut line)
       let mut replacement = i32.toU8(cc.opcode + 1)
@@ -214,6 +219,13 @@ effect fn resolveInstruction(fd: &mut FunctionDef, table: &mut AtomTable, bytes:
     }
   } else if code == op.OP_get_loc {
     let index = u16.toI32(readU16(bytes, pos + 1))
+    // `dead = local;` as a statement reads nothing and stores nowhere.
+    if matchCode(&mut cc, bytes, next, &[opcode(op.OP_dup), opcode(op.OP_put_loc), -1, opcode(op.OP_drop), -1]) && isDead(dead, cc.index) {
+      matchedLine(&cc, &mut line) return cc.position
+    }
+    if matchCode(&mut cc, bytes, next, &[opcode(op.OP_put_loc), -1, -1]) && isDead(dead, cc.index) {
+      matchedLine(&cc, &mut line) return cc.position
+    }
     // The source intentionally leaves get_loc >=256 unchanged, rather than
     // examining its peepholes (the three-byte encoding is already minimal).
     if index < 256 {
@@ -269,6 +281,9 @@ effect fn resolveInstruction(fd: &mut FunctionDef, table: &mut AtomTable, bytes:
     run addPosition(&mut fd, &out.*, line.*) run putShortCode(&mut out, code, index) return next
   } else if code == op.OP_put_loc || code == op.OP_put_loc_check || code == op.OP_put_arg || code == op.OP_put_var_ref {
     let index = u16.toI32(readU16(bytes, pos + 1))
+    if code == op.OP_put_loc && isDead(dead, index) {
+      run addPosition(&mut fd, &out.*, line.*) run out.append(op.OP_drop) return next
+    }
     if matchCode(&mut cc, bytes, next, &[opcode(code) - 1, index, -1]) {
       matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*) run putShortCode(&mut out, code + 1, index) return cc.position
     }
@@ -339,6 +354,7 @@ effect fn resolve(fd: &mut FunctionDef, table: &mut AtomTable, source: &[u8]) ->
   run fd.debuggerMetadata.locations.reserveExact(locations.length())
   let mut locationIndex: usize = 0
   let input = Intrinsic.replace(fd.bytecode, ByteBuffer.make())
+  let dead = writeOnlyLocals(&fd, input.asSlice())
   run initializeLocals(&mut fd, &mut out)
   let mut position: i32 = 0 let mut line = signedWord(fd.sourcePosition)
   while i32.toUsize(position) < input.length() {
@@ -354,7 +370,7 @@ effect fn resolve(fd: &mut FunctionDef, table: &mut AtomTable, source: &[u8]) ->
     }
     let start = out.length()
     let inputPosition = position
-    position = run resolveInstruction(&mut fd, &mut table, input.asSlice(), &mut out, position, &mut line)
+    position = run resolveInstruction(&mut fd, &mut table, input.asSlice(), &mut out, position, &mut line, dead)
     while locationIndex < locations.length() && locations.get(locationIndex).pc < i32.toU32(inputPosition) {
       locationIndex = locationIndex + 1
     }
@@ -401,6 +417,49 @@ effect fn resolve(fd: &mut FunctionDef, table: &mut AtomTable, source: &[u8]) ->
   run computePc2Line(&mut fd, source)
   fd.lineNumbers = ThinList<PcSourcePosition>.make()
   fd.callSiteSources = List<PcSourcePosition>.make()
+}
+/// Locals below 64 that the function stores with put_loc and never reads, so
+/// their stores can go. Not for captured locals (a nested function may read
+/// them), functions with eval (which can name any local at run time) or code
+/// compiled for the debugger; the
+/// special locals (this, arguments, new.target, ...) always stay.
+fn writeOnlyLocals(fd: &FunctionDef, bytes: &[u8]) -> u64 {
+  // A debugger can read any local, so debug code keeps every store.
+  if fd.hasEvalCall || fd.isEval || fd.module.isSome() || fd.debuggerMetadata.enabled { return 0 }
+  let mut written: u64 = 0 let mut read: u64 = 0
+  let mut pos: usize = 0
+  while pos < bytes.length {
+    let code = bytes[pos]
+    let info = op.opcodeInfo(code, false)
+    let mut index: i32 = -1
+    if info.format == op.OP_FMT_loc { index = u16.toI32(readU16(bytes, pos + 1)) }
+    else if code == op.OP_make_loc_ref { index = u16.toI32(readU16(bytes, pos + 5)) }
+    else if info.format == op.OP_FMT_none_loc || info.format == op.OP_FMT_loc8 { return 0 }
+    if index >= 64 { if code != op.OP_put_loc { return 0 } }
+    else if index >= 0 {
+      let bit = u64.shiftLeft(1, i32.toU64(index))
+      if code == op.OP_put_loc { written = written | bit } else { read = read | bit }
+    }
+    pos = pos + u8.toUsize(info.size)
+  }
+  let mut dead = written & ~read
+  let mut i: usize = 0
+  while i < fd.vars.length() && i < 64 {
+    if fd.vars.get(i).isCaptured { dead = dead & ~u64.shiftLeft(1, usize.toU64(i)) }
+    i = i + 1
+  }
+  dead = dead & ~special(fd.thisVarIndex) & ~special(fd.argumentsVarIndex) & ~special(fd.argumentsArgIndex)
+  dead = dead & ~special(fd.functionVarIndex) & ~special(fd.evalReturnIndex) & ~special(fd.newTargetVarIndex)
+  dead = dead & ~special(fd.thisActiveFunctionVarIndex) & ~special(fd.homeObjectVarIndex)
+  dead = dead & ~special(fd.varObjectIndex) & ~special(fd.argVarObjectIndex)
+  return dead
+}
+fn special(index: i32) -> u64 {
+  if index < 0 || index >= 64 { return 0 }
+  return u64.shiftLeft(1, i32.toU64(index))
+}
+fn isDead(dead: u64, index: i32) -> bool {
+  return index >= 0 && index < 64 && u64.shiftRight(dead, i32.toU64(index)) & 1 != 0
 }
 effect fn failed(error: OutOfMemoryError) -> bool { drop error return false }
 effect fn resolveSuccess(fd: &mut FunctionDef, table: &mut AtomTable, source: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
