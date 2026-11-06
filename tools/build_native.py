@@ -114,28 +114,6 @@ def build_util(native, uv_include, environment, release):
     subprocess.run(shlex.split(environment.get('AR', 'ar')) + ['rcs', str(archive), *objects],
                    env=environment, check=True)
 
-def build_napi(native, uv_include, environment, release):
-    directory = ROOT / 'build/napi'
-    directory.mkdir(parents=True, exist_ok=True)
-    compiler = shlex.split(environment.get('CC', 'cc'))
-    flags = ['-std=gnu11', '-pthread', '-fPIC', '-fvisibility=default',
-             '-I' + uv_include, '-I' + str(ROOT / 'vendor/node-api'),
-             '-O2' if release else '-O0', '-g']
-    if platform.system() == 'Darwin':
-        flags += ['-isysroot', environment['SDKROOT'], '-mmacosx-version-min=11.0']
-    objects = []
-    for name in ('napi_core', 'napi_values'):
-        destination = directory / (name + '.o')
-        subprocess.run(compiler + flags + ['-c', str(ROOT / 'src/ext' / (name + '.c')),
-                                          '-o', str(destination)], env=environment, check=True)
-        objects.append(str(destination))
-    archive = native / 'libsilk_napi.a'
-    archive.unlink(missing_ok=True)
-    subprocess.run(shlex.split(environment.get('AR', 'ar')) + ['rcs', str(archive), *objects],
-                   env=environment, check=True)
-
-
-
 def build(native, environment, release=False):
     wamr = ROOT / 'build/wamr'
     cmake_build(ROOT / 'src/ext/wamr', wamr, 'silk_wamr', {
@@ -153,4 +131,3 @@ def build(native, environment, release=False):
     shutil.copyfile(wasi / 'libuvwasi.a', native / 'libuvwasi.a')
     build_http_parser(native, environment, release)
     build_util(native, uv_include, environment, release)
-    build_napi(native, uv_include, environment, release)
