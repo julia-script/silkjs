@@ -1011,8 +1011,14 @@ diagnostic frames; no additional stdlib upstream change was needed.
 
 ## Native addon value ownership and ABI boundaries
 
-`src/ext/napi_core.c`, `napi_values.c`, `napi_bridge.h`, and
+`src/ext/napi_core.silk`, `napi_values.silk`, `napi_async.silk`, and
 `napi_native.silk` implement Node-API value handles over real SilkJS values.
+They are written in Silk with no C glue: the library registry and the
+per-thread fatal report contexts that `napi_module_register` and
+`napi_fatal_error` need without an environment live behind
+`Intrinsic.processWord`, and addons resolve the `export "C"` entry points
+against the executable through `--export-dynamic` (`-export_dynamic` on
+Darwin).
 Handle scopes own retained values; escaping transfers a retained owner to the
 parent scope. Strong and weak references use the engine's actual ownership
 and weak-liveness primitives. Native callbacks, classes, external buffers,
