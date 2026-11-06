@@ -80,6 +80,7 @@ pub const SKIP_HAS_SEMI: u32 = 1
 pub const SKIP_HAS_ELLIPSIS: u32 = 2
 pub const SKIP_HAS_ASSIGNMENT: u32 = 4
 const SKIP_CACHE_MIN_TOKENS: u32 = 16
+const NAME_UNSURE: usize = 0xffffffffffffffff
 
 /// Results of skipParens by the source offset of the opening bracket. One scan
 /// over `{ a: { b: [...] } }` records every nested span it closes, so the
@@ -430,9 +431,11 @@ impl<'src> Lexer<'src> {
     let mut count: usize = 0
     // ASCII fast path: a plain identifier needs none of the escape or decode checks.
     let mut fast = false
+    let mut hash: u32 = 1
     if !privateName && p < self.source.length && isAsciiIdentFirst(u8.toU32(self.source[p])) {
+      hash = AtomTable.asciiHashStep(hash, self.source[p])
       let mut q = p + 1
-      while q < self.source.length && isAsciiIdentNext(u8.toU32(self.source[q])) { q = q + 1 }
+      while q < self.source.length && isAsciiIdentNext(u8.toU32(self.source[q])) { hash = AtomTable.asciiHashStep(hash, self.source[q]) q = q + 1 }
       if q >= self.source.length || (self.source[q] < 128 && self.source[q] != 92) {
         p = q
         count = q - first
@@ -474,6 +477,7 @@ impl<'src> Lexer<'src> {
       let spelling = Slice.view<u8>(self.source, start, p - start)
       // No decode needed means plain ASCII; identifiers never spell integer atoms.
       if self.probe { atom = table.lookupAsciiName(spelling) }
+      else if fast { atom = run table.internAsciiNameHashed(spelling, AtomTable.asciiHashFinish(hash)) }
       else { atom = run table.internAsciiName(spelling) }
     } else {
       let mut builder = StringBuilder.make()
@@ -513,6 +517,68 @@ impl<'src> Lexer<'src> {
     self.offset = p
     return Token { kind: kind, start: start, end: p, gotLineFeed: self.gotLineFeed,
       payload: TokenPayload.Identifier { atom: atom, owner: move owner, hasEscape: hasEscape, isReserved: isReserved } }
+  }
+  /// Byte-level lookahead support. plainSpace skips spaces, tabs and line breaks
+  /// only; a comment or any other trivia stops it, and callers treat what follows
+  /// as unknown.
+  fn plainSpace(self: &Self, p: usize) -> usize {
+    let mut q = p
+    while q < self.source.length {
+      let c = self.source[q]
+      if c != 32 && c != 9 && c != 10 && c != 13 { break }
+      q = q + 1
+    }
+    return q
+  }
+  fn keywordHere(self: &Self, atom: u32) -> bool {
+    let context = &self.context
+    return atom <= atoms.JS_ATOM_LAST_KEYWORD || (context.strict && atom <= atoms.JS_ATOM_LAST_STRICT_KEYWORD)
+      || (atom == atoms.JS_ATOM_yield && context.generator)
+      || (atom == atoms.JS_ATOM_await && (context.module || context.asyncFunction))
+  }
+  /// The end of the ASCII identifier name at p, NAME_UNSURE when an escape or
+  /// non-ASCII byte makes only the full lexer able to tell, or 0 when p starts
+  /// no identifier name.
+  fn nameEnd(self: &Self, p: usize) -> usize {
+    let source = self.source
+    if p >= source.length { return 0 }
+    let first = source[p]
+    if first >= 128 || first == 92 { return NAME_UNSURE }
+    if !isAsciiIdentFirst(u8.toU32(first)) { return 0 }
+    let mut q = p + 1
+    while q < source.length && isAsciiIdentNext(u8.toU32(source[q])) { q = q + 1 }
+    if q < source.length && (source[q] >= 128 || source[q] == 92) { return NAME_UNSURE }
+    return q
+  }
+  /// Whether the ASCII name [p, end) lexes as a keyword in this context. Every
+  /// keyword is lower case and two to ten letters long.
+  fn keywordName(self: &Self, table: &mut AtomTable, p: usize, end: usize) -> bool {
+    let first = self.source[p]
+    if first < 97 || first > 122 || end - p < 2 || end - p > 10 { return false }
+    let atom = table.lookupAsciiName(Slice.view<u8>(self.source, p, end - p))
+    return atom != 0 && self.keywordHere(atom)
+  }
+  fn spells(self: &Self, p: usize, end: usize, text: &[u8]) -> bool {
+    return end - p == text.length && starts(self.source, p, text)
+  }
+  fn unsureByte(self: &Self, p: usize) -> bool {
+    if p >= self.source.length { return true }
+    let c = self.source[p]
+    return c == 47 || c == 92 || c >= 128
+  }
+  /// After `let` at current: 1 when a lexical declaration certainly follows
+  /// (as isLet judges it), 0 when certainly not, -1 when only the lexer can tell.
+  pub fn letAhead(self: &Self, current: &Token, table: &mut AtomTable) -> i32 {
+    let mut p = current.end
+    while p < self.source.length && (self.source[p] == 32 || self.source[p] == 9) { p = p + 1 }
+    if p >= self.source.length { return -1 }
+    let c = self.source[p]
+    if c == 91 || c == 123 { return 1 }
+    if c == 10 || c == 13 || self.unsureByte(p) { return -1 }
+    let end = self.nameEnd(p)
+    if end == 0 { return 0 }
+    if end == NAME_UNSURE || self.keywordName(&mut table, p, end) { return -1 }
+    return 1
   }
   // Non-mutating parser heuristic. A separate cursor owns temporary tokens;
   // original token and cursor retain exact ownership and source position.
@@ -615,6 +681,28 @@ impl Lexer {
   /// code may write `for (var x = 1 in o)`.
   pub effect fn classicForHead(self: &Self, current: &Token, table: &mut AtomTable) -> bool
     ! LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    // Byte-level first: `(;`, or `(let x =` / `(const x =` in plain ASCII.
+    let mut p = self.plainSpace(current.end)
+    if p < self.source.length && self.source[p] == 59 { return true }
+    let word = self.nameEnd(p)
+    if word != NAME_UNSURE {
+      if word == 0 || !(self.spells(p, word, b"let") || self.spells(p, word, b"const")) {
+        if !self.unsureByte(p) { return false }
+      } else {
+        p = self.plainSpace(word)
+        let name = self.nameEnd(p)
+        if name == 0 { if !self.unsureByte(p) { return false } }
+        else if name != NAME_UNSURE {
+          if self.keywordName(&mut table, p, name) { return false }
+          p = self.plainSpace(name)
+          if p + 1 < self.source.length && self.source[p] == 61 {
+            let after = self.source[p + 1]
+            return after != 61 && after != 62
+          }
+          if !self.unsureByte(p) { return false }
+        }
+      }
+    }
     let mut probe = Lexer.make(self.source, self.context)
     probe.probe = true
     let open = run probe.seek(self.save(current), &mut table)
@@ -633,6 +721,23 @@ impl Lexer {
   /// skipParens.
   pub effect fn plainParameters(self: &Self, current: &Token, table: &mut AtomTable) -> bool
     ! LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    // Byte-level first: plain ASCII names, commas and spaces.
+    let mut p = current.end
+    let mut names = 0
+    while names < 16 {
+      p = self.plainSpace(p)
+      if p < self.source.length && self.source[p] == 41 { return true }
+      let end = self.nameEnd(p)
+      if end == NAME_UNSURE { break }
+      if end == 0 { if self.unsureByte(p) { break } return false }
+      if self.keywordName(&mut table, p, end) { return false }
+      p = self.plainSpace(end)
+      if p < self.source.length && self.source[p] == 41 { return true }
+      if p < self.source.length && self.source[p] == 44 { p = p + 1 names = names + 1 continue }
+      if self.unsureByte(p) { break }
+      return false
+    }
+    if names >= 16 { return false }
     let mut probe = Lexer.make(self.source, self.context)
     probe.probe = true
     let open = run probe.seek(self.save(current), &mut table)
@@ -656,6 +761,33 @@ impl Lexer {
   /// skipParens.
   pub effect fn literalObjectStart(self: &Self, current: &Token, table: &mut AtomTable) -> bool
     ! LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+    // Byte-level first: `{ name: value` with an ASCII name key and a quoted
+    // string, decimal digits, null, true or false value.
+    let mut p = self.plainSpace(current.end)
+    let keyEnd = self.nameEnd(p)
+    if keyEnd != 0 && keyEnd != NAME_UNSURE {
+      p = self.plainSpace(keyEnd)
+      if p < self.source.length && self.source[p] == 58 {
+        p = self.plainSpace(p + 1)
+        if p < self.source.length {
+          let c = self.source[p]
+          if c == 34 || c == 39 {
+            let mut q = p + 1
+            while q < self.source.length && self.source[q] != c && self.source[q] != 92 && self.source[q] != 10 && self.source[q] != 13 && self.source[q] < 128 { q = q + 1 }
+            if q < self.source.length && self.source[q] == c { return true }
+          } else if c >= 49 && c <= 57 || (c == 48 && !(p + 1 < self.source.length && self.source[p + 1] >= 48 && self.source[p + 1] <= 57)) {
+            let mut q = p + 1
+            while q < self.source.length && self.source[q] >= 48 && self.source[q] <= 57 { q = q + 1 }
+            if q >= self.source.length || !(isAsciiIdentNext(u8.toU32(self.source[q])) || self.source[q] == 46 || self.source[q] == 92 || self.source[q] >= 128) { return true }
+          } else {
+            let word = self.nameEnd(p)
+            if word != NAME_UNSURE && word != 0 {
+              return self.spells(p, word, b"null") || self.spells(p, word, b"true") || self.spells(p, word, b"false")
+            }
+          }
+        }
+      } else if !self.unsureByte(p) { return false }
+    }
     let mut probe = Lexer.make(self.source, self.context)
     probe.probe = true
     let open = run probe.seek(self.save(current), &mut table)
