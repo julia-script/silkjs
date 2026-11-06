@@ -23,8 +23,10 @@ import sys
 import time
 from pathlib import Path
 
+from toolchain import release_binary
+
 ROOT = Path(__file__).resolve().parents[1]
-BINARY = ROOT / 'build/llvm/x86_64-unknown-linux-gnu/release/silkjs'
+BINARY = release_binary()
 # (script, extra qjs arguments); upstream's Makefile `test` target uses the same flags.
 UPSTREAM = [
     ('test_closure.js', []), ('test_language.js', []), ('test_builtin.js', ['--std']),
