@@ -19,6 +19,7 @@ import silk.mem.raw_buffer { RawBuffer }
 import silk.mem.slot { Slot }
 import silk.concurrency.thread { Transferable, Concurrent }
 import silk.num.usize
+import silk.num.u64
 import silk.collections.list { List }
 import silk.core.option { Option }
 import runtime_allocation_profile { AllocationRecord, Recording, Config }
@@ -95,6 +96,8 @@ struct Pool {
 struct ArenaHeader {
   ledger: *mut Ledger,
   class: usize,
+  // recordReciprocal(class): turns a granule offset into a block index without a divide.
+  reciprocal: usize,
   storage: Option<Intrinsic.RawBuffer<u8>>,
   next: ?*mut ArenaHeader,
   nextLive: ?*mut ArenaHeader,
@@ -123,8 +126,18 @@ unsafe fn pooledRecord(block: *mut u8) -> *mut PoolRecord {
   let anchor = ()
   let arena = unsafe Pointer.borrow<(), ArenaHeader>(&anchor, unsafe arenaOf(block))
   let offset = usize.bitAnd(Pointer.address(block), ARENA_BYTES - 1)
+  let granule = usize.shiftRight(usize.wrappingSubtract(offset, firstPoolOffset()), 4)
   return unsafe Pointer.atMut<PoolRecord>(unsafe Pointer.assumeManyMut<PoolRecord>(arena.records),
-    (offset - firstPoolOffset()) / classBytes(arena.class))
+    usize.shiftRight(usize.wrappingMultiply(granule, arena.reciprocal), RECIPROCAL_SHIFT))
+}
+
+// ceil(2^RECIPROCAL_SHIFT / (class + 1)). For every granule offset below
+// ARENA_RECORDS and every class, (granule * reciprocal) >> RECIPROCAL_SHIFT equals
+// granule / (class + 1): the rounding error stays below 2^RECIPROCAL_SHIFT / granule.
+const RECIPROCAL_SHIFT: usize = 20
+fn recordReciprocal(class: usize) -> usize {
+  let divisor = class + 1
+  return (usize.shiftLeft(1, RECIPROCAL_SHIFT) + divisor - 1) / divisor
 }
 
 @inlineAlways
@@ -194,7 +207,7 @@ struct BlockHeader {
 
 // The bytes of one block of class.
 @inlineAlways
-fn classBytes(class: usize) -> usize { return (class + 1) * POOL_GRANULE }
+fn classBytes(class: usize) -> usize { return usize.shiftLeft(usize.wrappingAdd(class, 1), 4) }
 @inlineAlways
 unsafe fn poolLink(block: *mut u8) -> *mut ?*mut u8 {
   return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ?*mut u8>(block)
@@ -608,14 +621,24 @@ effect fn allocatePooledSlow<A>(self: &mut RuntimeAllocator<A>, layout: Layout, 
 unsafe fn recordPooled(ledger: LedgerPointers, block: *mut u8, requestedBytes: usize) -> () {
   let mut anchor = ()
   let state = unsafe Pointer.borrowMut(&mut anchor, ledger.allocation)
-  let record = AllocationRecord { id: state.nextAllocationId, address: Pointer.address(block),
-    requestedBytes: requestedBytes, chargedBytes: unsafe pooledBlockBytes(block) }
-  state.nextAllocationId = state.nextAllocationId + 1
+  let id = state.nextAllocationId
+  // A 64-bit count of allocations cannot wrap in practice; ids stay nonzero.
+  state.nextAllocationId = u64.wrappingAdd(id, 1)
   let profiling = state.profiling
   drop state
-  let epoch = if profiling { unsafe profilePooledAllocation(ledger, record) } else { 0 }
+  if profiling { return unsafe recordProfiledPooled(ledger, block, requestedBytes, id) }
   unsafe Pointer.write<PoolRecord>(unsafe pooledRecord(block),
-    PoolRecord { id: record.id, requestedBytes: requestedBytes, sampledEpoch: epoch })
+    PoolRecord { id: id, requestedBytes: requestedBytes, sampledEpoch: 0 })
+}
+
+// recordPooled while profiling, out of line so the common path keeps no frame.
+@inlineNever
+unsafe fn recordProfiledPooled(ledger: LedgerPointers, block: *mut u8, requestedBytes: usize, id: u64) -> () {
+  let record = AllocationRecord { id: id, address: Pointer.address(block),
+    requestedBytes: requestedBytes, chargedBytes: unsafe pooledBlockBytes(block) }
+  let epoch = unsafe profilePooledAllocation(ledger, record)
+  unsafe Pointer.write<PoolRecord>(unsafe pooledRecord(block),
+    PoolRecord { id: id, requestedBytes: requestedBytes, sampledEpoch: epoch })
 }
 
 @inlineAlways
@@ -674,7 +697,7 @@ effect fn takeArena<A>(self: &mut RuntimeAllocator<A>, class: usize, requestedBy
         lockLedger(ledger)
         let mut anchor = ()
         let state = Pointer.borrowMut(&mut anchor, ledger.allocation)
-        Pointer.put<ArenaHeader>(owner, ArenaHeader { ledger: ledger.allocation, class: class,
+        Pointer.put<ArenaHeader>(owner, ArenaHeader { ledger: ledger.allocation, class: class, reciprocal: recordReciprocal(class),
           storage: Option<Intrinsic.RawBuffer<u8>>.none(), next: Pointer.null<ArenaHeader>(),
           nextLive: state.firstPooledArena, records: Intrinsic.pointerRequalify<?*mut PoolRecord, *mut PoolRecord>(spareRecords), carved: 0,
           cellOwner: 0, cellNext: Pointer.null<u8>(), pendingNext: Pointer.null<u8>(), pendingListed: false, cells: [0; 16], pending: [0; 16] })
@@ -716,7 +739,7 @@ effect fn takeArena<A>(self: &mut RuntimeAllocator<A>, class: usize, requestedBy
     drop state
     let mut poolAnchor = ()
     let pool = Pointer.borrowMut<(), Pool>(&mut poolAnchor, poolOf(ledger))
-    Pointer.put<ArenaHeader>(owner, ArenaHeader { ledger: ledger.allocation, class: class,
+    Pointer.put<ArenaHeader>(owner, ArenaHeader { ledger: ledger.allocation, class: class, reciprocal: recordReciprocal(class),
       storage: Option<Intrinsic.RawBuffer<u8>>.some(move groupStorage), next: pool.arenas,
       nextLive: firstLive, records: records, carved: 0,
       cellOwner: 0, cellNext: Pointer.null<u8>(), pendingNext: Pointer.null<u8>(), pendingListed: false, cells: [0; 16], pending: [0; 16] })
@@ -973,7 +996,7 @@ unsafe fn takeOwned(ledger: LedgerPointers, class: usize) -> ?*mut u8 {
   // now, so each block's load has two allocations of this class to land in.
   unsafe prefetch(Pointer.address<u8>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(next)))
   unsafe prefetch(Pointer.address<u8>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(skip)))
-  pool.ownerCounts[class] = pool.ownerCounts[class] - 1
+  pool.ownerCounts[class] = usize.wrappingSubtract(pool.ownerCounts[class], 1)
   let used = usize.wrappingAdd(pool.ownerUsed, classBytes(class))
   unsafe Atomic.store<usize>(Pointer.fromMutRef<usize>(&mut pool.ownerUsed), used, MemoryOrder.Relaxed)
   unsafe Atomic.store<usize>(Pointer.fromMutRef<usize>(&mut pool.ownerAllocations), usize.wrappingAdd(pool.ownerAllocations, 1), MemoryOrder.Relaxed)
