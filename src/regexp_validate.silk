@@ -39,11 +39,67 @@ fn reference(opcode: u8) -> bool {
   return opcode >= op.REOP_back_reference && opcode <= op.REOP_backward_back_reference_i
 }
 fn range(opcode: u8) -> bool { return opcode >= op.REOP_range && opcode <= op.REOP_range32_i }
+fn class(opcode: u8) -> bool { return opcode == re.REOP_CLASS || opcode == re.REOP_CLASS_I }
+fn greedy(opcode: u8) -> bool { return opcode == re.REOP_STAR || opcode == re.REOP_PLUS }
+// The one-character steps the executor runs in place for REOP_STAR and REOP_PLUS (greedyRun).
+fn oneStep(opcode: u8) -> bool {
+  return opcode == op.REOP_char || opcode == op.REOP_char_i || (opcode >= op.REOP_dot && opcode <= op.REOP_not_space) ||
+    class(opcode) || range(opcode)
+}
+// The first steps a search may skip ahead to (the hint plan's opcode, see skipAhead).
+fn skippable(opcode: u8) -> bool {
+  return opcode == op.REOP_char || opcode == op.REOP_char_i || opcode == op.REOP_line_start ||
+    opcode == op.REOP_space || opcode == op.REOP_not_space || class(opcode) || range(opcode)
+}
 fn terminal(opcode: u8) -> bool {
   return opcode == op.REOP_match || opcode == op.REOP_lookahead_match || opcode == op.REOP_negative_lookahead_match
 }
 fn branches(opcode: u8) -> bool {
-  return (opcode >= op.REOP_goto && opcode <= op.REOP_split_next_first) || assertion(opcode) || isLoop(opcode)
+  return (opcode >= op.REOP_goto && opcode <= op.REOP_split_next_first) || assertion(opcode) || isLoop(opcode) || greedy(opcode)
+}
+
+// The search hint trailer (regexp_types.FLAG_HINT) as the executor reads it.
+struct Trailer {
+  present: bool,
+  // The end of the instructions: the final REOP_match is the byte before it.
+  programEnd: usize,
+  kind: u8,
+  literalAt: usize,
+  count: usize,
+  runAt: usize,
+  runWidth: usize,
+  planFirst: usize,
+  planOp: u8
+}
+
+effect fn trailer(bytes: &[u8], end: usize) -> Trailer ! RegExpValidationError {
+  if end - op.RE_HEADER_LEN <= re.HINT_LENGTH { fail RegExpValidationError { offset: end } }
+  let hint = end - re.HINT_LENGTH
+  if bytes[hint] != re.HINT_OPCODE { fail RegExpValidationError { offset: hint } }
+  let kindByte = bytes[hint + 1]
+  let kind = u8.bitAnd(kindByte, 31)
+  let firstSet = u8.bitAnd(kindByte, re.HINT_FIRST_SET) != 0
+  let runBytes = u8.bitAnd(kindByte, re.HINT_RUN_BYTES) != 0
+  let runUnits = u8.bitAnd(kindByte, re.HINT_RUN_UNITS) != 0
+  let literal = kind == re.HINT_LITERAL || kind == re.HINT_REQUIRED
+  if kind > re.HINT_ANCHORED || (runBytes && runUnits) || ((runBytes || runUnits) && !literal) ||
+    (firstSet && (kind == re.HINT_LITERAL || kind == re.HINT_ANCHORED)) {
+    fail RegExpValidationError { offset: hint + 1 }
+  }
+  let packed = u16.toUsize(readU16(bytes, hint + 4))
+  let count = packed % 256
+  if literal && (count == 0 || packed / 256 >= count) { fail RegExpValidationError { offset: hint + 4 } }
+  let mut cursor = hint
+  if firstSet {
+    if cursor - op.RE_HEADER_LEN <= re.HINT_SET_LENGTH { fail RegExpValidationError { offset: hint + 1 } }
+    cursor = cursor - re.HINT_SET_LENGTH
+  }
+  let mut runWidth: usize = 0
+  if runBytes { runWidth = 1 } else if runUnits { runWidth = 2 }
+  if cursor - op.RE_HEADER_LEN <= count * runWidth { fail RegExpValidationError { offset: hint + 1 } }
+  cursor = cursor - count * runWidth
+  return Trailer { present: true, programEnd: cursor, kind: kind, literalAt: u16.toUsize(readU16(bytes, hint + 2)),
+    count: count, runAt: cursor, runWidth: runWidth, planFirst: u16.toUsize(readU16(bytes, hint + 6)), planOp: bytes[hint + 8] }
 }
 
 effect fn branchTarget(bytes: &[u8], operand: usize, end: usize) -> usize ! RegExpValidationError {
@@ -117,15 +173,22 @@ effect fn decode(bytes: &[u8], end: usize, captures: usize, registers: usize) ->
       owner = instructions.asSlice()[owner - 1].owner
     }
     let opcode = bytes[at]
-    if opcode == op.REOP_invalid || u8.toUsize(opcode) >= op.REOP_COUNT { fail RegExpValidationError { offset: at } }
-    let mut length = op.opcodeSize(opcode)
+    if opcode == op.REOP_invalid || (u8.toUsize(opcode) >= op.REOP_COUNT && !class(opcode) && !greedy(opcode)) {
+      fail RegExpValidationError { offset: at }
+    }
+    let mut length: usize = 5
+    if class(opcode) { length = 3 } else if !greedy(opcode) { length = op.opcodeSize(opcode) }
     if length > end - at { fail RegExpValidationError { offset: at } }
-    if range(opcode) {
+    if range(opcode) || class(opcode) {
       let count = u16.toUsize(readU16(bytes, at + 1))
       let mut width: usize = 4
       if opcode == op.REOP_range32 || opcode == op.REOP_range32_i { width = 8 }
+      // A class's Latin-1 bitmap follows its table.
+      let mut bitmap: usize = 0
+      if class(opcode) { bitmap = re.CLASS_BITS_LENGTH }
+      if end - at - length < bitmap { fail RegExpValidationError { offset: at } }
       // rangeContains reads the final narrow entry even before its binary search.
-      if count == 0 || count > (end - at - length) / width { fail RegExpValidationError { offset: at } }
+      if count == 0 || count > (end - at - length - bitmap) / width { fail RegExpValidationError { offset: at } }
       let mut index: usize = 0
       let mut previous: u32 = 0
       while index < count {
@@ -138,7 +201,7 @@ effect fn decode(bytes: &[u8], end: usize, captures: usize, registers: usize) ->
         previous = last
         index = index + 1
       }
-      length = length + count * width
+      length = length + count * width + bitmap
     } else if reference(opcode) {
       let count = u8.toUsize(bytes[at + 1])
       if count == 0 || count > end - at - length { fail RegExpValidationError { offset: at } }
@@ -287,13 +350,65 @@ effect fn registers(bytes: &[u8], instructions: &mut [Instruction]) -> ()
   }
 }
 
+// REOP_STAR and REOP_PLUS run their one-character step in place, so they must
+// mark exactly the loops the compiler marks: `STAR exit, x, goto STAR` then exit,
+// and `x, PLUS x`.
+effect fn greedyLoops(instructions: &[Instruction]) -> () ! RegExpValidationError {
+  let mut index: usize = 0
+  while index < instructions.length {
+    let opcode = instructions[index].opcode
+    if opcode == re.REOP_STAR {
+      if index + 3 >= instructions.length || !oneStep(instructions[index + 1].opcode) ||
+        instructions[index + 2].opcode != op.REOP_goto || instructions[index + 2].target != index ||
+        instructions[index].target != index + 3 {
+        fail RegExpValidationError { offset: instructions[index].offset }
+      }
+    } else if opcode == re.REOP_PLUS {
+      if index == 0 || instructions[index].target != index - 1 || !oneStep(instructions[index - 1].opcode) {
+        fail RegExpValidationError { offset: instructions[index].offset }
+      }
+    }
+    index = index + 1
+  }
+}
+
+// What the executor takes from the hint trailer: the search prefix it skips
+// (`split_goto_first, any, goto` before save_start), the literal run of REOP_char
+// steps and its copy, and the first step the plan names.
+effect fn hintTargets(bytes: &[u8], instructions: &[Instruction], hint: &Trailer) -> () ! RegExpValidationError {
+  let base = op.RE_HEADER_LEN
+  if hint.kind == re.HINT_ANCHORED || hint.planFirst != 0 {
+    if instructions.length < 4 || instructions[0].opcode != op.REOP_split_goto_first || instructions[1].opcode != op.REOP_any ||
+      instructions[2].opcode != op.REOP_goto || instructions[3].offset != base + 11 || instructions[3].opcode != op.REOP_save_start {
+      fail RegExpValidationError { offset: base }
+    }
+  }
+  if hint.kind == re.HINT_LITERAL || hint.kind == re.HINT_REQUIRED {
+    let first = run instructionAt(instructions, hint.literalAt)
+    if instructions.length - first < hint.count { fail RegExpValidationError { offset: hint.literalAt } }
+    let mut k: usize = 0
+    while k < hint.count {
+      let step = &instructions[first + k]
+      if step.opcode != op.REOP_char || step.offset != hint.literalAt + k * 3 { fail RegExpValidationError { offset: step.offset } }
+      let unit = readU16(bytes, step.offset + 1)
+      if hint.runWidth == 1 && unit != u8.toU16(bytes[hint.runAt + k]) { fail RegExpValidationError { offset: hint.runAt + k } }
+      if hint.runWidth == 2 && unit != readU16(bytes, hint.runAt + k * 2) { fail RegExpValidationError { offset: hint.runAt + k * 2 } }
+      k = k + 1
+    }
+  }
+  if hint.planFirst != 0 && hint.planOp != 0 {
+    let step = run instructionAt(instructions, hint.planFirst)
+    if instructions[step].opcode != hint.planOp || !skippable(hint.planOp) { fail RegExpValidationError { offset: hint.planFirst } }
+  }
+}
+
 // The immutable bytes validated here must be the same bytes subsequently executed.
 // No source text, compiler, interpreter, or user callback is consulted.
 pub effect fn validate(bytecode: &[u8]) -> ()
   ! RegExpValidationError | OutOfMemoryError ? &mut Allocator {
   if bytecode.length < op.RE_HEADER_LEN { fail RegExpValidationError { offset: bytecode.length } }
   let flags = u16.toU32(readU16(bytecode, op.RE_HEADER_FLAGS))
-  if (flags & 0xfe00) != 0 || (flags & re.FLAG_UNICODE) != 0 && (flags & re.FLAG_UNICODE_SETS) != 0 {
+  if (flags & 0xfc00) != 0 || (flags & re.FLAG_UNICODE) != 0 && (flags & re.FLAG_UNICODE_SETS) != 0 {
     fail RegExpValidationError { offset: op.RE_HEADER_FLAGS }
   }
   let captures = u8.toUsize(bytecode[op.RE_HEADER_CAPTURE_COUNT])
@@ -303,8 +418,13 @@ pub effect fn validate(bytecode: &[u8]) -> ()
   if length == 0 || length > bytecode.length - op.RE_HEADER_LEN { fail RegExpValidationError { offset: op.RE_HEADER_BYTECODE_LEN } }
   let end = op.RE_HEADER_LEN + length
   run names(bytecode, end, captures, flags)
-  let mut instructions = run decode(bytecode, end, captures, registerCount)
+  let mut hint = Trailer { present: false, programEnd: end, kind: re.HINT_NONE, literalAt: 0, count: 0, runAt: 0,
+    runWidth: 0, planFirst: 0, planOp: 0 }
+  if (flags & re.FLAG_HINT) != 0 { hint = run trailer(bytecode, end) }
+  let mut instructions = run decode(bytecode, hint.programEnd, captures, registerCount)
   run link(instructions.asMutSlice())
+  run greedyLoops(instructions.asSlice())
+  if hint.present { run hintTargets(bytecode, instructions.asSlice(), &hint) }
   run registers(bytecode, instructions.asMutSlice())
 }
 
@@ -335,4 +455,21 @@ pub effect fn validateMatch(matched: &re.RegExpMatch, captureCount: usize, input
       index = index + 2
     }
   }
+}
+
+/// validateMatch's offset checks for a successful match whose offsets were
+/// written into captures (RegExpExecutor.match8 and match16).
+pub fn validateCaptures(captures: &[i32], captureCount: usize, inputLength: usize) -> bool {
+  if inputLength > i32.toUsize(i32.MAX) || captureCount == 0 || captureCount > op.CAPTURE_COUNT_MAX { return false }
+  if captures.length < captureCount * 2 { return false }
+  let mut index: usize = 0
+  while index < captureCount * 2 {
+    let start = captures[index]
+    let end = captures[index + 1]
+    if !(start == -1 && end == -1 && index != 0) {
+      if start < 0 || end < start || i32.toUsize(end) > inputLength { return false }
+    }
+    index = index + 2
+  }
+  return true
 }

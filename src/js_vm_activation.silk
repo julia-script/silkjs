@@ -1,6 +1,9 @@
 //! Stable-frame layout, initialization and teardown for JS_CallInternal.
 //! Native stack allocation itself stays in the interpreter entry function: a
 //! helper must never return alloca storage from its own native activation.
+import silk.core.ownership { Copy }
+import js_compiler_types { PendingFunction }
+import silk.mem.box { Box }
 import silk.num.u8
 import silk.mem.layout { Layout }
 import silk.core.option { Option }
@@ -10,7 +13,7 @@ import silk.num.usize
 import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
 import js_core_types { NO_SP, FunctionBytecode, ObjectData, ObjectPayload, FrameSlots, FrameReferences, StackFrame, RuntimeState }
-import js_gc { HeapHooks }
+import js_gc { HeapHooks, FrameCaptures }
 import js_gc as gc
 import js_vm_state { Machine, copyCell }
 import js_debugger as debugger
@@ -72,6 +75,16 @@ pub unsafe fn describe(function: ValueBits, emptyValue: *mut ValueBits,
     copiedArguments: copied, values: values, allocationSlots: slots, bytes: slots * slotBytes }
 }
 fn trap() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+/// The bytecode cell behind a bytecode function object while it is still a
+/// stub (js_compiler_finish.defer), else null.
+pub unsafe fn pendingBytecode(function: ValueBits) -> ?*mut HeapHeader {
+  let object = match function { ValueBits.Object { reference } => reference _ => trap() }
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  let bytecode = match &data.payload { ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode _ => trap() }
+  drop data
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  return match &code.pending { Option<Box<PendingFunction>>.Some { .. } => bytecode _ => Pointer.null<HeapHeader>() }
+}
 
 /// Returns a borrowed pointer, never an ownership transfer.
 pub unsafe fn data(slots: &FrameSlots, empty: *mut ValueBits) -> *mut ValueBits {
@@ -210,7 +223,23 @@ pub unsafe fn release<H: HeapHooks>(hooks: &mut H, description: &Description, ac
 }
 @inlineAlways
 unsafe fn releaseSlots<H: HeapHooks>(hooks: &mut H, copiedArguments: usize, locals: usize, references: usize, activation: &Machine) -> () {
-  if references != 0 { unsafe gc.detachFrameReferences(&mut hooks, activation.runtime, activation.frame) }
+  if references != 0 { unsafe releaseCapturingSlots(&mut hooks, copiedArguments, locals, activation) return () }
+  unsafe releaseOwnSlots(&mut hooks, copiedArguments, locals, activation)
+}
+/// releaseSlots for a frame whose variables closures captured: once the slots
+/// are gone, cycles among the captured cells and their closures are freed now
+/// instead of waiting for a cycle collection.
+@inlineNever
+unsafe fn releaseCapturingSlots<H: HeapHooks>(hooks: &mut H, copiedArguments: usize, locals: usize, activation: &Machine) -> () {
+  unsafe gc.dropFrameClosures(&mut hooks, activation.runtime, activation.frame)
+  let mut captures = FrameCaptures.make()
+  unsafe gc.detachFrameCaptures(&mut hooks, activation.runtime, activation.frame, &mut captures)
+  unsafe releaseOwnSlots(&mut hooks, copiedArguments, locals, activation)
+  // Most frames' local closures already died in dropFrameClosures, leaving no cells.
+  if !captures.isEmpty() { unsafe gc.releaseFrameCycles(&mut hooks, activation.runtime, &mut captures) }
+}
+@inlineAlways
+unsafe fn releaseOwnSlots<H: HeapHooks>(hooks: &mut H, copiedArguments: usize, locals: usize, activation: &Machine) -> () {
   let mut index: usize = 0
   while index < copiedArguments {
     unsafe gc.release(&mut hooks, activation.runtime, unsafe activation.argument(index))
@@ -275,21 +304,40 @@ unsafe fn slotAt(base: *mut ValueBits, index: usize) -> *mut ValueBits {
 pub unsafe fn enterInline(runtime: *mut HeapHeader, function: ValueBits, arguments: FrameSlots, first: *mut ValueBits,
   caller: *mut Machine, callerContext: *mut HeapHeader, receiver: ValueBits, newTarget: ValueBits, construct: bool,
   copy: bool) -> Option<*mut Machine> {
+  let callee = unsafe calleeOf(function)
+  return unsafe enterDecoded(runtime, function, callee, arguments, first, caller, callerContext, receiver, newTarget, construct, copy)
+}
+/// A bytecode function's object and FunctionBytecode, read once per call
+/// (enterDecoded); its closure reference table is read only once a frame is entered.
+pub struct Callee { pub object: *mut HeapHeader, pub bytecode: *mut HeapHeader }
+impl Copy for Callee {}
+/// function's Callee; function must be a bytecode function.
+@inlineAlways
+pub unsafe fn calleeOf(function: ValueBits) -> Callee {
   let object = match function { ValueBits.Object { reference } => reference _ => trap() }
   let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  let bytecode = match &data.payload { ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode _ => trap() }
+  return Callee { object: object, bytecode: bytecode }
+}
+/// enterInline once the callee is decoded (calleeOf with the same caller).
+@inlineAlways
+pub unsafe fn enterDecoded(runtime: *mut HeapHeader, function: ValueBits, decoded: Callee, arguments: FrameSlots, first: *mut ValueBits,
+  caller: *mut Machine, callerContext: *mut HeapHeader, receiver: ValueBits, newTarget: ValueBits, construct: bool,
+  copy: bool) -> Option<*mut Machine> {
+  let anchor = ()
   // Empty tables point at the caller's machine: aligned, non-null, never read
   // and live for the whole call.
   let empty = unsafe Intrinsic.pointerReinterpret<*mut Machine, *mut ValueBits>(caller)
   let mut closureReferences = unsafe Intrinsic.pointerRequalify<*mut ?*mut HeapHeader, *const ?*mut HeapHeader>(unsafe Intrinsic.pointerReinterpret<*mut Machine, *mut ?*mut HeapHeader>(caller))
-  let mut bytecode = object
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, decoded.object)
   match &data.payload {
     ObjectPayload.BytecodeFunction { function: closure } => {
       if closure.varRefs.length() != 0 { closureReferences = Pointer.fromRef<?*mut HeapHeader>(&closure.varRefs.asSlice()[0]) }
-      bytecode = closure.bytecode
     }
     _ => trap()
   }
   drop data
+  let bytecode = decoded.bytecode
   let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
   let count = arguments.length()
   let declared = u16.toUsize(code.argumentCount)
@@ -355,14 +403,25 @@ pub unsafe fn enterInline(runtime: *mut HeapHeader, function: ValueBits, argumen
     stackPointer: NO_SP })
   let mut original = arguments
   if copy { original = FrameSlots { data: storage, count: count } }
-  let ip = unsafe code.code.pointerAt(0)
+  let start = unsafe code.code.start()
+  let mut ip = start
+  // A method's `push_this put_locK` prologue runs here for an object receiver
+  // (push_this needs no conversion then): one dispatch round less per call.
+  // Code never ends in push_this, so a second byte follows one.
+  if unsafe Pointer.read<u8>(ip) == 8 && receiver.isObject() { // OP_push_this
+    let second = u8.wrappingSubtract(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(ip), 1)), 205)
+    if second < 4 { // OP_put_loc0-3
+      unsafe Pointer.write<ValueBits>(unsafe slotAt(locals, u8.toUsize(second)), unsafe receiver.retained())
+      ip = unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(ip), 2)
+    }
+  }
   let mut constants = unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(empty)
   if code.constants.length() != 0 { constants = Pointer.fromRef<ValueBits>(&code.constants.asSlice()[0]) }
   // callerContext, originalArguments, argumentCount and newTarget are left
   // unwritten: an inline frame derives them from its tail (callerContextOf etc).
   let mut calleeAnchor = () let callee = unsafe Pointer.borrowMut<(), Machine>(&mut calleeAnchor, machine)
   callee.context = code.realm callee.runtime = runtime callee.bytecode = bytecode
-  callee.frame = frame callee.code = ip callee.constants = constants callee.closureReferences = closureReferences
+  callee.frame = frame callee.code = start callee.constants = constants callee.closureReferences = closureReferences
   callee.arguments = argumentData callee.locals = localView callee.stack = stackView callee.thisValue = receiver
   callee.ip = ip callee.stackTop = stackView
   callee.record = unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(unsafe Intrinsic.pointerReinterpret<*mut InlineTail, *mut u8>(tail)), boolToUsize(construct))
@@ -385,6 +444,19 @@ fn boolToUsize(value: bool) -> usize { if value { return 1 } return 0 }
 @inlineAlways
 pub fn constructing(machine: &Machine) -> bool {
   return (Pointer.address<u8>(machine.record) & 1) != 0
+}
+/// Whether machine's construct frame runs a forwarded initializer (see
+/// markForwarded): bit 1 of its record.
+@inlineAlways
+pub fn forwarded(machine: &Machine) -> bool {
+  return (Pointer.address<u8>(machine.record) & 2) != 0
+}
+/// Tags the construct frame machine as forwarded: it runs the function a
+/// constructor wrapper calls as this[name].apply(this, arguments), so new.target
+/// is undefined in it and its result is ignored for the receiver it owns.
+pub unsafe fn markForwarded(machine: *mut Machine) -> () {
+  let mut anchor = () let callee = unsafe Pointer.borrowMut<(), Machine>(&mut anchor, machine)
+  callee.record = unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(callee.record)), 2)
 }
 /// The tail of the inline frame machine runs; record must be non-null.
 @inlineAlways
@@ -414,7 +486,7 @@ pub unsafe fn argumentCountOf(machine: &Machine) -> usize {
 /// the constructor (both stay on the caller's stack until the frame returns).
 pub unsafe fn newTargetOf(machine: &Machine) -> ValueBits {
   if Pointer.isNull<u8>(machine.record) { return machine.newTarget }
-  if !constructing(machine) { return ValueBits.Undefined }
+  if !constructing(machine) || forwarded(machine) { return ValueBits.Undefined }
   let anchor = () let tail = unsafe Pointer.borrow<(), InlineTail>(&anchor, unsafe tailOf(machine))
   return unsafe Pointer.read<ValueBits>(unsafe slotAt(tail.first, 1))
 }
@@ -434,11 +506,24 @@ pub unsafe fn leaveInline<H: HeapHooks>(hooks: &mut H, machine: &Machine) -> Inl
   drop tail
   let frame = unsafe Pointer.borrow<(), StackFrame>(&anchor, machine.frame)
   let previous = frame.previous
-  let mut copied: usize = 0
-  if Pointer.address<ValueBits>(frame.arguments.data) == Pointer.address<ValueBits>(unsafe slotAt(top, recordSlots())) { copied = frame.arguments.count }
-  let locals = frame.locals.count let references = frame.varRefs.count
-  drop frame
-  unsafe releaseSlots(&mut hooks, copied, locals, references, machine)
+  let storage = unsafe slotAt(top, recordSlots())
+  if frame.varRefs.count != 0 {
+    let mut copied: usize = 0
+    if Pointer.address<ValueBits>(frame.arguments.data) == Pointer.address<ValueBits>(storage) { copied = frame.arguments.count }
+    let locals = frame.locals.count
+    drop frame
+    unsafe releaseCapturingSlots(&mut hooks, copied, locals, machine)
+  } else {
+    drop frame
+    // The record's storage holds any copied arguments, then the locals, then
+    // the operand stack, back to back: one pass up to the stack top releases all.
+    let end = Pointer.address<ValueBits>(machine.stackTop) let runtime = machine.runtime
+    let mut cell = storage
+    while Pointer.address<ValueBits>(cell) != end {
+      unsafe gc.release(&mut hooks, runtime, unsafe Pointer.read<ValueBits>(cell))
+      cell = unsafe slotAt(cell, 1)
+    }
+  }
   let mut stateAnchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, machine.runtime)
   state.currentStackFrame = previous
   state.callFramesTop = top
