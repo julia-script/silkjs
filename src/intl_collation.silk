@@ -1,155 +1,1490 @@
-// Pinned intl/collator.c:422-747; LICENSE.quickjs. No C runtime dependency.
-// Function inventory: is_combining_mark, is_significant, compare_case_order,
-// transform_string, js_UTF32_compare_len and js_string_normalize1 are below;
-// compare is the non-JS body of js_collator_bound_compare. locale_has_key and
-// is_collation_supported remain exclusively in intl_shared.silk.
-// JS-only exclusions: finalizer, get_locale, constructor, get_compare,
-// resolvedOptions, supportedLocalesOf, class/function tables and add_collator.
-// Numeric is deliberately inert in the pin; emoji/eor/default share weights.
+//! CLDR collation the way ICU does it, for `Intl.Collator` and `String.prototype.localeCompare`.
+//!
+//! Text is decomposed (NFD) and turned into collation elements (CEs) from the CLDR root
+//! collation, with the locale's tailoring on top: contractions such as Czech `ch`, expansions
+//! such as German phonebook `ä` = `ae`, the Swedish letters after `z`, script reordering, and
+//! the Chinese, Japanese and Korean Han orders. Strings then compare level by level: primary
+//! (base letters), secondary (accents), the case level when asked for, and tertiary (case and
+//! variants), with ICU's options for case first, shifted punctuation, backwards accents and
+//! numeric digit runs. `intl_collation_data` has the tables and their layout.
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
 import silk.text.string { String }
+import silk.num.u8
 import silk.num.u32
+import silk.num.u64
+import silk.num.i32
+import silk.num.usize
 import js_value { ValueBits }
 import js_strings { Strings }
+import js_string_rope { stringWide }
 import unicode_normalization { UnicodeNormalization, Normalization }
-import unicode_case { UnicodeCase }
+import js_intl_locale_info_tags as tags
+import js_intl_locale_info_tags { Buffer }
+import intl_collation_data as data
 
-// Values correspond exactly to the three C enums. make() resolves only the
-// locale-dependent algorithm flags and defaults; JS option parsing stays outside.
-// No borrowed locale or string owner is retained by this value.
+const NONE: usize = 18446744073709551615
+const UNKNOWN: usize = 18446744073709551614
+const CASE_MASK: u32 = 49152
+const HAN_REFERENCE: u32 = 65535
+const TYPE_STANDARD: usize = 0
+const TYPE_SEARCH: usize = 1
+
+/// The collator settings. `usage`, `sensitivity`, `caseFirst`, `numeric` and
+/// `ignorePunctuation` hold the resolved JS options (sensitivity: 0 base, 1 accent, 2 case,
+/// 3 variant; caseFirst: 0 upper, 1 lower, 2 false). `record` is the tailoring in use, an
+/// offset into `data.records()`, or NONE for the plain root order.
 pub struct CollationOptions {
   pub usage: i32,
   pub sensitivity: i32,
   pub caseFirst: i32,
   pub numeric: bool,
   pub ignorePunctuation: bool,
-  pub german: bool,
-  pub turkic: bool,
-  pub phonebook: bool
+  pub record: usize,
+  t: Tailoring,
+  /// The fast-pass primaries of each code point below LATIN_LIMIT under these settings, two
+  /// per code point with reordering and shifting applied, PRIMARY_BAIL first for one that
+  /// needs the full path; `latin1Bail` says whether any Latin-1 one does.
+  latin: [u32; 768],
+  latin1Bail: bool,
+  /// The raw fast-path CEs of each Latin-1 code point, six words each (see `latinCes`).
+  latin1Ces: [u32; 1536],
+  /// For each Latin-1 code point whose `latin` entry is PRIMARY_PAIR (at the offset its
+  /// second word gives): how many two-code-point contractions start with it, its own two
+  /// primaries, then each such contraction's second code point and two primaries.
+  pairs: List<u32>,
+  /// The code points a context mapping of the tailoring applies to (all from LATIN_LIMIT
+  /// up, or `fast` is false), sorted.
+  targets: List<u32>,
+  /// Whether compares may try the fast pass: no context mapping applies below LATIN_LIMIT.
+  fast: bool,
+  /// Whether `latin`, `latin1Bail`, `latin1Ces`, `pairs`, `targets` and `fast` are filled;
+  /// the first compare fills them.
+  filled: bool,
+  /// Fast-pass entries of other code points, filled as compares meet them: empty, or
+  /// WIDE_SLOTS direct-mapped entries of WIDE_WORDS words (see `wideEntry`).
+  wide: List<u32>
 }
 impl CollationOptions {
+  /// The defaults of `locale` with `collation` (a `co` value or "default").
   pub fn make(locale: string, collation: string) -> Self {
-    return CollationOptions { usage: 0, sensitivity: 3, caseFirst: 2,
-      numeric: false, ignorePunctuation: language(locale, "th"),
-      german: language(locale, "de"), turkic: language(locale, "tr") || language(locale, "az"),
-      phonebook: language(collation, "phonebk") && String.utf8Bytes(collation).length == 7 }
+    let mut options = CollationOptions { usage: 0, sensitivity: 3, caseFirst: 2, numeric: false,
+      ignorePunctuation: false, record: NONE, t: tailoring(NONE), latin: [0; 768], latin1Bail: false, latin1Ces: [0; 1536], pairs: List<u32>.make(), targets: List<u32>.make(), fast: false, filled: false, wide: List<u32>.make() }
+    options.select(locale, collation, false, false)
+    return move options
+  }
+  /// Picks the tailoring for `locale`, `collation` and the usage. Unless the caller set them
+  /// explicitly, caseFirst and ignorePunctuation take the tailoring's defaults.
+  pub fn select(self: &mut Self, locale: string, collation: string, caseFirstSet: bool, punctuationSet: bool) -> () {
+    self.record = findRecord(locale, collation, self.usage == 1)
+    self.t = tailoring(self.record)
+    let flags = recordFlags(self.record)
+    if !caseFirstSet {
+      self.caseFirst = 2
+      if u32.bitAnd(flags, 3) == 2 { self.caseFirst = 0 } else if u32.bitAnd(flags, 3) == 1 { self.caseFirst = 1 }
+    }
+    if !punctuationSet { self.ignorePunctuation = u32.bitAnd(flags, 8) != 0 }
+    self.filled = false
+    self.wide.clear()
+  }
+  /// Fills `latin`, `latin1Bail`, `latin1Ces`, `pairs`, `targets` and `fast` for the
+  /// current settings.
+  effect fn fillLatin1(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    self.filled = true
+    self.latin1Bail = false
+    let mut c: u32 = 0
+    while c < data.LATIN_LIMIT {
+      let mut ces: [u32; 6] = [0; 6]
+      let covered = self.t.latinCes(c, Slice.viewMut<u32>(&mut ces, 0, 6))
+      let mut k: usize = 0
+      while c < 256 && k < 6 { self.latin1Ces[u32.toUsize(c) * 6 + k] = ces[k] k = k + 1 }
+      let mut first = ces[0] let mut second = ces[3]
+      let at = u32.toUsize(c) * 2
+      if !covered || (self.numeric && c >= 48 && c <= 57) {
+        self.latin[at] = PRIMARY_BAIL self.latin[at + 1] = 0
+        if c < 256 { self.latin1Bail = true }
+      } else {
+        first = primaryWeight(&self.t, first, self.ignorePunctuation)
+        second = primaryWeight(&self.t, second, self.ignorePunctuation)
+        if first == 0 { first = second second = 0 }
+        self.latin[at] = first self.latin[at + 1] = second
+      }
+      c = c + 1
+    }
+    let mut pairs = List<u32>.make()
+    let mut leads: [u32; 256] = [0; 256]
+    c = 0
+    while c < 256 {
+      leads[u32.toUsize(c)] = c
+      if c >= 192 {
+        let single = [c]
+        let points = run UnicodeNormalization.normalize(Slice.view<u32>(&single, 0, 1), Normalization.Nfd)
+        leads[u32.toUsize(c)] = points.get(0)
+      }
+      c = c + 1
+    }
+    c = 0
+    while c < 256 {
+      if self.latin[u32.toUsize(c) * 2] == PRIMARY_BAIL && !(self.numeric && c >= 48 && c <= 57) {
+        let at = pairs.length()
+        let found = run latinPairs(&self.t, c, self.ignorePunctuation, &leads, &mut pairs)
+        if found { self.latin[u32.toUsize(c) * 2] = PRIMARY_PAIR self.latin[u32.toUsize(c) * 2 + 1] = usize.toU32(at) }
+        else { pairs.truncate(at) }
+      }
+      c = c + 1
+    }
+    self.pairs = move pairs
+    let mut targets = List<u32>.make()
+    self.fast = true
+    let bytes = data.records()
+    let mut n: usize = 0
+    while n < self.t.contexts() {
+      let entry = self.t.entry(1, n)
+      let target = read24(bytes, entry + 1)
+      if target < data.LATIN_LIMIT { self.fast = false }
+      run targets.append(target)
+      n = n + 1
+    }
+    run targets.sort()
+    self.targets = move targets
   }
 }
-fn language(locale: string, base: string) -> bool {
-  let bytes = String.utf8Bytes(locale)
-  let prefix = String.utf8Bytes(base)
-  if bytes.length < prefix.length { return false }
+/// Appends the `pairs` row of Latin-1 code point `c` (see `CollationOptions.pairs`) and
+/// returns true, or false when the fast pass cannot cover `c` in Latin-1 text that way:
+/// it is not a contraction start, a contraction from it takes more than two Latin-1 code
+/// points, a root contraction or prefix mapping involves it, or the CEs of `c` (alone or
+/// with a code point after it) have more than two primaries. `leads` has the first code
+/// point of the NFD of each Latin-1 code point.
+effect fn latinPairs(t: &Tailoring, c: u32, shifted: bool, leads: &[u32; 256], out: &mut List<u32>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let single = [c]
+  let key = Slice.view<u32>(&single, 0, 1)
+  let count = t.entries()
+  if count == 0 || !t.mayStart(c) { return false }
+  if c >= 128 {
+    if !t.suppresses(c) && rootPrefix(key) { return false }
+    let item = rootItem(c)
+    if item != NONE && u32.bitAnd(itemFlags(item), 4) != 0 { return false }
+  }
+  // The code points that may follow `c` in a contraction.
+  let mut follows: [bool; 256] = [false; 256]
+  let bytes = data.records()
+  let mut n = lowerBound(t, 0, count, key)
+  while n < count {
+    let entry = t.entry(0, n)
+    if read24(bytes, entry + 1) != c { break }
+    let length = u8.toUsize(bytes[entry])
+    n = n + 1
+    if length == 1 { continue }
+    let d = read24(bytes, entry + 4)
+    if d >= 256 { continue }
+    if length > 2 && read24(bytes, entry + 7) < 256 { return false }
+    follows[u32.toUsize(d)] = true
+  }
+  run out.append(0)
+  let row = out.length() - 1
+  if !(run latinPrimariesOf(t, c, 256, shifted, &mut out)) { return false }
+  let mut d: u32 = 0
+  let mut rows: u32 = 0
+  while d < 256 {
+    if follows[u32.toUsize(leads[u32.toUsize(d)])] {
+      run out.append(d)
+      if !(run latinPrimariesOf(t, c, d, shifted, &mut out)) { return false }
+      rows = rows + 1
+    }
+    d = d + 1
+  }
+  out.set(row, rows)
+  return rows > 0
+}
+/// Appends the first two primaries of the NFD of `c` (followed by `d` unless that is 256),
+/// weighted; false when there are more.
+effect fn latinPrimariesOf(t: &Tailoring, c: u32, d: u32, shifted: bool, out: &mut List<u32>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let text = [c, d]
+  let mut length: usize = 2
+  if d == 256 { length = 1 }
+  let mut points = run UnicodeNormalization.normalize(Slice.view<u32>(&text, 0, length), Normalization.Nfd)
+  let mut ces = List<u32>.make()
+  run collect(t, &mut points, 0, false, &mut ces)
+  let mut primaries: [u32; 2] = [0; 2]
+  let mut n: usize = 0
   let mut i: usize = 0
-  while i < prefix.length { if bytes[i] != prefix[i] { return false } i = i + 1 }
-  return bytes.length == prefix.length || bytes[prefix.length] == 45
-}
-pub fn is_combining_mark(c: u32) -> bool {
-  return (c >= 0x0300 && c <= 0x036f) || (c >= 0x1ab0 && c <= 0x1aff)
-    || (c >= 0x1dc0 && c <= 0x1dff) || (c >= 0x20d0 && c <= 0x20ff)
-    || (c >= 0xfe20 && c <= 0xfe2f)
-}
-pub fn is_significant(c: u32) -> bool {
-  if c >= 48 && c <= 57 { return true }
-  if c < 128 { return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) }
-  return UnicodeCase.isIdStart(c)
-}
-pub fn compare_case_order(a: u32, b: u32, caseFirst: i32) -> i32 {
-  if a >= 65 && a <= 90 && b >= 97 && b <= 122 {
-    if caseFirst == 0 { return -1 } return 1
+  while i + 2 < ces.length() {
+    let w = primaryWeight(t, ces.get(i), shifted)
+    if w != 0 { if n == 2 { return false } primaries[n] = w n = n + 1 }
+    i = i + 3
   }
-  if a >= 97 && a <= 122 && b >= 65 && b <= 90 {
-    if caseFirst == 0 { return 1 } return -1
-  }
-  if a < b { return -1 } if a > b { return 1 } return 0
+  run out.append(primaries[0]) run out.append(primaries[1])
+  return true
 }
-// Input is borrowed Unicode points (including lone surrogates); returned List
-// owns its allocation. Every intermediate List drops on success and failure.
-pub effect fn transform_string(options: &CollationOptions, source: &[u32], level: i32) -> List<u32>
-  ! OutOfMemoryError ? &mut Allocator {
-  let phonebook = options.phonebook || (options.usage == 1 && options.german)
-  let germanSort = options.usage == 0 && options.german && !phonebook
-  let nfd = run UnicodeNormalization.normalize(source, Normalization.Nfd)
-  let points = nfd.asSlice()
-  let mut result = List<u32>.make()
-  run result.reserveExact(points.length * 4 + 4)
+
+@inlineAlways
+fn read16(b: &[u8], at: usize) -> u32 { return u32.bitOr(u8.toU32(b[at]), u32.shiftLeft(u8.toU32(b[at + 1]), 8)) }
+@inlineAlways
+fn read24(b: &[u8], at: usize) -> u32 { return u32.bitOr(read16(b, at), u32.shiftLeft(u8.toU32(b[at + 2]), 16)) }
+@inlineAlways
+fn read32(b: &[u8], at: usize) -> u32 { return u32.bitOr(read16(b, at), u32.shiftLeft(read16(b, at + 2), 16)) }
+@inlineAlways
+fn offset(b: &[u8], at: usize) -> usize { return u32.toUsize(read32(b, at)) }
+
+// ---------------------------------------------------------------------------
+// Picking the tailoring
+
+/// The collation type id of a `co` value: NONE for "default", UNKNOWN for no such type.
+fn typeId(collation: string) -> usize {
+  let mut name = collation
+  if collation == "trad" { name = "traditional" }
+  else if collation == "phonebk" { name = "phonebook" }
+  else if collation == "dict" { name = "dictionary" }
+  else if collation == "default" || collation == "" { return NONE }
   let mut i: usize = 0
-  while i < points.length {
-    let c = points[i]
+  while i < data.TYPES.length { if data.TYPES[i] == name { return i } i = i + 1 }
+  return UNKNOWN
+}
+/// The offset of the locale table row for `name`, or NONE.
+fn localeRow(name: string) -> usize {
+  let table = data.locales()
+  let index = data.localeIndex()
+  let wanted = String.utf8Bytes(name)
+  let mut lo: usize = 0 let mut hi = data.LOCALE_COUNT
+  while lo < hi {
+    let mid = lo + (hi - lo) / 2
+    let at = offset(index, mid * 4)
+    let length = u8.toUsize(table[at])
+    let mut i: usize = 0
+    while i < length && i < wanted.length && table[at + 1 + i] == wanted[i] { i = i + 1 }
+    let mut order: i32 = 0
+    if i < length && i < wanted.length { if table[at + 1 + i] < wanted[i] { order = -1 } else { order = 1 } }
+    else if length < wanted.length { order = -1 } else if length > wanted.length { order = 1 }
+    if order == 0 { return at }
+    if order < 0 { lo = mid + 1 } else { hi = mid }
+  }
+  return NONE
+}
+fn rowDefault(row: usize) -> usize { let table = data.locales() return u8.toUsize(table[row + 1 + u8.toUsize(table[row])]) }
+/// The record offset of type `id` in the row, or NONE.
+fn rowRecord(row: usize, id: usize) -> usize {
+  let table = data.locales()
+  let length = u8.toUsize(table[row])
+  let count = u8.toUsize(table[row + length + 2])
+  let mut i: usize = 0
+  while i < count {
+    let at = row + length + 3 + i * 5
+    if u8.toUsize(table[at]) == id { return offset(table, at + 1) }
     i = i + 1
-    if options.ignorePunctuation && !is_significant(c) { continue }
-    if (level == 0 || level == 2) && is_combining_mark(c) { continue }
-    if level == 0 || level == 1 {
-      if i < points.length && points[i] == 0x0308 && (phonebook || germanSort) {
-        let mut base: u32 = 0
-        if c == 65 || c == 97 { base = 97 }
-        else if c == 79 || c == 111 { base = 111 }
-        else if c == 85 || c == 117 { base = 117 }
-        if base != 0 {
-          run result.append(base)
-          if phonebook { run result.append(101) } else { run result.append(1) }
-          i = i + 1
-          continue
-        }
-      }
-      if phonebook && c == 0x00df {
-        run result.append(115) run result.append(115) continue
-      }
-      let folded = UnicodeCase.convert(c, 2)
-      if options.turkic && folded.length == 1 && folded.points[0] == 0x0131 {
-        run result.append(0x68) run result.append(0xffff) continue
-      }
-      let mut j: usize = 0
-      while j < folded.length { run result.append(folded.points[j]) j = j + 1 }
-    } else { run result.append(c) }
   }
+  return NONE
+}
+fn contains(text: string, part: string) -> bool {
+  let bytes = String.utf8Bytes(text) let wanted = String.utf8Bytes(part)
+  let mut at: usize = 0
+  while at + wanted.length <= bytes.length {
+    let mut i: usize = 0
+    while i < wanted.length && bytes[at + i] == wanted[i] { i = i + 1 }
+    if i == wanted.length { return true }
+    at = at + 1
+  }
+  return false
+}
+/// The locale table rows to search for `locale`, most specific first, ending with root.
+struct Candidates { rows: [usize; 6], count: usize }
+impl Candidates {
+  fn add(self: &mut Self, row: usize) -> () {
+    if row == NONE || self.count == 6 { return }
+    let mut i: usize = 0
+    while i < self.count { if self.rows[i] == row { return } i = i + 1 }
+    self.rows[self.count] = row self.count = self.count + 1
+  }
+  fn find(self: &Self, id: usize) -> usize {
+    let mut i: usize = 0
+    while i < self.count { let record = rowRecord(self.rows[i], id) if record != NONE { return record } i = i + 1 }
+    return NONE
+  }
+}
+fn candidates(locale: string) -> Candidates {
+  let mut result = Candidates { rows: [NONE; 6], count: 0 }
+  let mut base = Buffer.make()
+  tags.base(locale, &mut base)
+  let name = tags.parse(base.view())
+  let language = name.language
+  let mut script = name.script
+  let region = name.region
+  let mut posix = contains(locale, "-va-posix")
+  let mut i = name.variant
+  while i < name.count { if name.parts[i] == "posix" || name.parts[i] == "POSIX" { posix = true } i = i + 1 }
+  // ICU reads zh-TW, zh-HK and zh-MO as Traditional Chinese.
+  if language == "zh" && script == "" && (region == "TW" || region == "HK" || region == "MO") { script = "Hant" }
+  if posix && language == "en" { result.add(localeRow("en_US_POSIX")) }
+  if script != "" && region != "" {
+    let mut key = Buffer.make() key.append(language) key.append("_") key.append(script) key.append("_") key.append(region)
+    result.add(localeRow(key.view()))
+  }
+  if script != "" { let mut key = Buffer.make() key.append(language) key.append("_") key.append(script) result.add(localeRow(key.view())) }
+  if region != "" { let mut key = Buffer.make() key.append(language) key.append("_") key.append(region) result.add(localeRow(key.view())) }
+  if language != "" { result.add(localeRow(language)) }
+  result.add(localeRow("root"))
   return move result
 }
-// Preserve the full signed difference, not merely the sign, as observable in C.
-pub fn js_UTF32_compare_len(a: &[u32], b: &[u32]) -> i32 {
+/// The record ICU would load for `locale` with `collation`; usage "search" picks the search
+/// tailoring like V8 does.
+fn findRecord(locale: string, collation: string, search: bool) -> usize {
+  let list = candidates(locale)
+  if list.count == 0 { return NONE }
+  let fallback = rowDefault(list.rows[0])
+  let mut id = typeId(collation)
+  if search { id = TYPE_SEARCH }
+  if id == NONE || id == UNKNOWN { id = fallback }
+  let record = list.find(id)
+  if record != NONE { return record }
+  return list.find(fallback)
+}
+/// Whether `collation` (a `co` value) is a collation type of `locale`.
+pub fn isSupported(collation: string, locale: string) -> bool {
+  if collation == "default" { return true }
+  let id = typeId(collation)
+  if id == NONE || id == UNKNOWN || id == TYPE_STANDARD || id == TYPE_SEARCH { return false }
+  return candidates(locale).find(id) != NONE
+}
+/// Every supported `co` value in sorted order, for `Intl.supportedValuesOf("collation")`.
+pub const NAMES: [string; 12] = ["compat", "dict", "emoji", "eor", "phonebk", "phonetic", "pinyin", "searchjl", "stroke", "trad", "unihan", "zhuyin"]
+/// The `index`th collation type of `locale` in sorted `co` order (what
+/// `Intl.Locale.prototype.getCollations` lists), or "" past the end.
+pub fn collationName(locale: string, index: usize) -> string<'static> {
+  let list = candidates(locale)
+  let mut seen: usize = 0
   let mut i: usize = 0
-  while i < a.length && i < b.length {
-    let difference = u32.toI32(a[i]) - u32.toI32(b[i])
-    if difference != 0 { return difference }
+  while i < NAMES.length {
+    let id = typeId(NAMES[i])
+    if id != UNKNOWN && list.find(id) != NONE { if seen == index { return NAMES[i] } seen = seen + 1 }
     i = i + 1
   }
-  if a.length < b.length { return -1 } if a.length > b.length { return 1 } return 0
+  return ""
 }
-// The caller keeps value's existing flat/rope string owner alive through return.
-// Like JS_ToUTF32String, no replacement of malformed UTF-16 occurs.
-pub effect fn normalize_string(value: ValueBits) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
+fn recordFlags(record: usize) -> u32 { if record == NONE { return 0 } return u8.toU32(data.records()[record]) }
+
+// ---------------------------------------------------------------------------
+// Tailoring records
+
+/// A tailoring record with its twelve header fields read once (`f`).
+/// `latin` has a bit for each code point below LATIN_LIMIT that starts an entry.
+struct Tailoring { present: bool, at: usize, flags: u32, reorders: usize, suppressed: usize, f: [usize; 14], latin: [u64; 10] }
+const LATIN_LIMIT: u32 = 640
+fn tailoring(record: usize) -> Tailoring {
+  if record == NONE { return Tailoring { present: false, at: 0, flags: 0, reorders: 0, suppressed: 0, f: [0; 14], latin: [0; 10] } }
+  let bytes = data.records()
+  let reorders = u8.toUsize(bytes[record + 1])
+  let suppressed = u32.toUsize(read16(bytes, record + 2))
+  let fields = record + 4 + reorders * 12 + suppressed * 4
+  let mut f: [usize; 14] = [0; 14]
+  let mut i: usize = 0
+  while i < 14 { f[i] = offset(bytes, fields + i * 4) i = i + 1 }
+  let mut t = Tailoring { present: true, at: record, flags: u8.toU32(bytes[record]), reorders: reorders, suppressed: suppressed, f: f, latin: [0; 10] }
+  i = 0
+  while i < t.entries() {
+    let c = read24(bytes, t.entry(0, i) + 1)
+    if c < LATIN_LIMIT { let word = u32.toUsize(c / 64) t.latin[word] = u64.bitOr(t.latin[word], u64.shiftLeft(1, u32.toU64(c % 64))) }
+    i = i + 1
+  }
+  return move t
+}
+impl Tailoring {
+  fn field(self: &Self, n: usize) -> usize { return self.f[n] }
+  /// False when no entry starts with `c`.
+  fn mayStart(self: &Self, c: u32) -> bool {
+    if c >= LATIN_LIMIT { return self.entries() > 0 }
+    return u64.bitAnd(u64.shiftRight(self.latin[u32.toUsize(c / 64)], u32.toU64(c % 64)), 1) != 0
+  }
+  fn entries(self: &Self) -> usize { if !self.present { return 0 } return self.field(0) }
+  fn contexts(self: &Self) -> usize { if !self.present { return 0 } return self.field(1) }
+  fn chains(self: &Self) -> usize { if !self.present { return 0 } return self.field(2) }
+  /// The start of entry `n` of the entry list (list 0) or the context list (list 1).
+  @inlineAlways
+  fn entry(self: &Self, list: usize, n: usize) -> usize {
+    let index = self.at + self.f[4 + list * 2]
+    return self.at + self.f[5 + list * 2] + offset(data.records(), index + n * 4)
+  }
+  fn suppresses(self: &Self, c: u32) -> bool {
+    let bytes = data.records()
+    let mut i: usize = 0
+    while i < self.suppressed { if read32(bytes, self.at + 4 + self.reorders * 12 + i * 4) == c { return true } i = i + 1 }
+    return false
+  }
+  fn reorder(self: &Self, p: u32) -> u32 {
+    let bytes = data.records()
+    let mut i: usize = 0
+    while i < self.reorders {
+      let at = self.at + 4 + i * 12
+      if p >= read32(bytes, at) && p < read32(bytes, at + 4) { return u32.wrappingAdd(p, read32(bytes, at + 8)) }
+      i = i + 1
+    }
+    return p
+  }
+  /// Where the fast-path CEs of `c` are (see `data.latinRoot()`): their table and offset.
+  /// `c` is below LATIN_LIMIT.
+  fn latinRow(self: &Self, c: u32, at: &mut usize) -> &'static [u8] {
+    at.* = u32.toUsize(c) * 20
+    if !self.present { return data.latinRoot() }
+    let bytes = data.records()
+    let bits = self.at + self.f[12]
+    let byte = bytes[bits + u32.toUsize(c / 8)]
+    if u8.bitAnd(u8.shiftRight(byte, u32.toU8(c % 8)), 1) == 0 { return data.latinRoot() }
+    let mut rank: usize = 0
+    let mut i: usize = 0
+    while i < u32.toUsize(c / 8) { rank = rank + u32.toUsize(u8.countOnes(bytes[bits + i])) i = i + 1 }
+    rank = rank + u32.toUsize(u8.countOnes(u8.bitAnd(byte, u32.toU8(u32.shiftLeft(1, c % 8) - 1))))
+    at.* = self.at + self.f[13] + rank * 20
+    return bytes
+  }
+  /// The fast-path primaries of `c`, false when `c` needs the full path.
+  @inlineAlways
+  fn latinPrimaries(self: &Self, c: u32, first: &mut u32, second: &mut u32) -> bool {
+    if c >= data.LATIN_LIMIT { return false }
+    let mut at: usize = 0
+    let table = self.latinRow(c, &mut at)
+    first.* = read32(table, at)
+    second.* = read32(table, at + 10)
+    return first.* != data.LATIN_BAIL
+  }
+  /// The two fast-path CEs of `c` as six words (zero for a missing CE), false when `c`
+  /// needs the full path.
+  fn latinCes(self: &Self, c: u32, out: &mut [u32]) -> bool {
+    if c >= data.LATIN_LIMIT { return false }
+    let mut at: usize = 0
+    let table = self.latinRow(c, &mut at)
+    let mut n: usize = 0
+    while n < 2 {
+      out[n * 3] = read32(table, at + n * 10)
+      out[n * 3 + 1] = read32(table, at + n * 10 + 4)
+      out[n * 3 + 2] = read16(table, at + n * 10 + 8)
+      n = n + 1
+    }
+    return out[0] != data.LATIN_BAIL
+  }
+  /// The chain member number of `c`, or NONE.
+  fn member(self: &Self, c: u32) -> usize {
+    if self.chains() == 0 || c >= 262144 { return NONE }
+    let bytes = data.records()
+    let table = self.at + self.field(10)
+    let slot = read16(bytes, table + u32.toUsize(u32.shiftRight(c, 8)) * 2)
+    if slot == 65535 { return NONE }
+    let page = table + 2048 + u32.toUsize(slot) * 36
+    let bit = u32.toUsize(u32.bitAnd(c, 255))
+    let byte = bytes[page + 4 + bit / 8]
+    if u8.bitAnd(u8.shiftRight(byte, usize.toU8(bit % 8)), 1) == 0 { return NONE }
+    let mut rank = offset(bytes, page)
+    let mut i: usize = 0
+    while i < bit / 8 { rank = rank + u32.toUsize(u8.countOnes(bytes[page + 4 + i])) i = i + 1 }
+    let below = u8.bitAnd(byte, usize.toU8(usize.shiftLeft(1, bit % 8) - 1))
+    rank = rank + u32.toUsize(u8.countOnes(below))
+    let values = self.at + self.field(11)
+    if self.field(3) == 2 { return u32.toUsize(read16(bytes, values + rank * 2)) }
+    return u32.toUsize(read24(bytes, values + rank * 3))
+  }
+  /// Appends the CEs of chain member `k`.
+  effect fn chainCes(self: &Self, k: usize, out: &mut List<u32>) -> () ! OutOfMemoryError ? &mut Allocator {
+    let bytes = data.records()
+    let index = self.at + self.field(8)
+    let chains = self.at + self.field(9)
+    let mut lo: usize = 0 let mut hi = self.chains()
+    while hi - lo > 1 {
+      let mid = lo + (hi - lo) / 2
+      if offset(bytes, chains + offset(bytes, index + mid * 4)) <= k { lo = mid } else { hi = mid }
+    }
+    let chain = chains + offset(bytes, index + lo * 4)
+    let n = usize.toU32(k - offset(bytes, chain))
+    let level = u8.toUsize(bytes[chain + 4])
+    run appendTailored(bytes, chain + 6, u8.toUsize(bytes[chain + 5]), &mut out)
+    let last = out.length() + level - 4
+    let value = out.get(last) + n
+    out.set(last, value)
+  }
+}
+/// Appends `count` tailored CEs that start at `at`.
+effect fn appendTailored(bytes: &[u8], at: usize, count: usize, out: &mut List<u32>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut position = at
+  let mut i: usize = 0
+  while i < count {
+    let flags = bytes[position]
+    let p = read32(bytes, position + 1)
+    position = position + 5
+    let mut s = data.COMMON_SECONDARY
+    let mut t = data.COMMON_TERTIARY
+    if u8.bitAnd(flags, 1) != 0 { s = read32(bytes, position) position = position + 4 }
+    if u8.bitAnd(flags, 2) != 0 { t = read16(bytes, position) position = position + 2 }
+    run out.append(p) run out.append(s) run out.append(t)
+    i = i + 1
+  }
+}
+/// The end of the CEs of the entry at `at`, as `appendTailored` reads them.
+fn entryCes(bytes: &[u8], at: usize) -> usize { return at + 1 + u8.toUsize(bytes[at]) * 3 }
+/// Orders the code points of an entry against `key`: <0, 0 or >0. With `prefix`, an entry that
+/// starts with `key` counts as equal.
+@inlineAlways
+fn compareKey(bytes: &[u8], entry: usize, key: &[u32], prefix: bool) -> i32 {
+  let length = u8.toUsize(bytes[entry])
+  let mut i: usize = 0
+  while i < length && i < key.length {
+    let c = read24(bytes, entry + 1 + i * 3)
+    if c < key[i] { return -1 } if c > key[i] { return 1 }
+    i = i + 1
+  }
+  if length == key.length { return 0 }
+  if length < key.length { return -1 }
+  if prefix { return 0 }
+  return 1
+}
+/// The first entry of list 0 or 1 whose code points are not below `key`.
+fn lowerBound(t: &Tailoring, list: usize, count: usize, key: &[u32]) -> usize {
+  let bytes = data.records()
+  let mut lo: usize = 0 let mut hi = count
+  while lo < hi {
+    let mid = lo + (hi - lo) / 2
+    if compareKey(bytes, t.entry(list, mid), key, false) < 0 { lo = mid + 1 } else { hi = mid }
+  }
+  return lo
+}
+/// The tailored entry for exactly `key` in list 0 or 1, or NONE.
+fn tailoredEntry(t: &Tailoring, list: usize, key: &[u32]) -> usize {
+  let mut count = t.entries() if list == 1 { count = t.contexts() }
+  if count == 0 || (list == 0 && !t.mayStart(key[0])) { return NONE }
+  let n = lowerBound(t, list, count, key)
+  if n < count && compareKey(data.records(), t.entry(list, n), key, false) == 0 { return t.entry(list, n) }
+  return NONE
+}
+fn tailoredPrefix(t: &Tailoring, key: &[u32]) -> bool {
+  let count = t.entries()
+  if count == 0 || !t.mayStart(key[0]) { return false }
+  let n = lowerBound(t, 0, count, key)
+  return n < count && compareKey(data.records(), t.entry(0, n), key, true) == 0
+}
+
+// ---------------------------------------------------------------------------
+// The root collation
+
+fn rootContraction(n: usize) -> usize { return offset(data.contractionIndex(), n * 4) }
+fn rootLowerBound(key: &[u32]) -> usize {
+  let bytes = data.contractions()
+  let mut lo: usize = 0 let mut hi = data.CONTRACTION_COUNT
+  while lo < hi {
+    let mid = lo + (hi - lo) / 2
+    if compareKey(bytes, rootContraction(mid), key, false) < 0 { lo = mid + 1 } else { hi = mid }
+  }
+  return lo
+}
+/// The root contraction for exactly `key`, or NONE.
+fn rootEntry(key: &[u32]) -> usize {
+  let n = rootLowerBound(key)
+  if n < data.CONTRACTION_COUNT && compareKey(data.contractions(), rootContraction(n), key, false) == 0 { return rootContraction(n) }
+  return NONE
+}
+fn rootPrefix(key: &[u32]) -> bool {
+  let n = rootLowerBound(key)
+  return n < data.CONTRACTION_COUNT && compareKey(data.contractions(), rootContraction(n), key, true) == 0
+}
+/// The root item that covers `c`, or NONE.
+fn rootItem(c: u32) -> usize {
+  let items = data.items()
+  let mut lo: usize = 0 let mut hi = data.ITEM_COUNT
+  while lo < hi {
+    let mid = lo + (hi - lo) / 2
+    if u32.shiftRight(read32(items, mid * 8), 11) <= c { lo = mid + 1 } else { hi = mid }
+  }
+  if lo == 0 { return NONE }
+  let head = read32(items, (lo - 1) * 8)
+  if c - u32.shiftRight(head, 11) <= u32.bitAnd(head, 255) { return lo - 1 }
+  return NONE
+}
+fn itemFlags(item: usize) -> u32 { return u32.bitAnd(u32.shiftRight(read32(data.items(), item * 8), 8), 7) }
+/// Appends root CE word `word`; `next` is the word after it, which a Han reference uses.
+effect fn appendWord(word: u32, next: u32, out: &mut List<u32>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let rank = u32.shiftRight(word, 16)
+  let st = data.secondaryTertiary()
+  let at = u32.toUsize(u32.bitAnd(word, 65535)) * 6
+  let s = read32(st, at)
+  let t = read16(st, at + 4)
+  if rank == HAN_REFERENCE { run appendHan(next, s, t, &mut out) return }
+  run out.append(u32.shiftLeft(rank, 16)) run out.append(s) run out.append(t)
+}
+/// Appends the `count` root CE words that start at `at`.
+effect fn appendWords(bytes: &[u8], at: usize, count: usize, out: &mut List<u32>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut i: usize = 0
+  while i < count {
+    let word = read32(bytes, at + i * 4)
+    let mut next: u32 = 0
+    if i + 1 < count { next = read32(bytes, at + i * 4 + 4) }
+    run appendWord(word, next, &mut out)
+    if u32.shiftRight(word, 16) == HAN_REFERENCE { i = i + 1 }
+    i = i + 1
+  }
+}
+/// Appends the root CEs of the single code point `c`.
+effect fn appendRoot(c: u32, out: &mut List<u32>) -> () ! OutOfMemoryError ? &mut Allocator {
+  if c < 128 { run appendWord(read32(data.ascii(), u32.toUsize(c) * 4), 0, &mut out) return }
+  let item = rootItem(c)
+  if item == NONE { run appendImplicit(c, &mut out) return }
+  let items = data.items()
+  let head = read32(items, item * 8)
+  let value = read32(items, item * 8 + 4)
+  if u32.bitAnd(head, 256) != 0 {
+    run appendWords(data.pool(), u32.toUsize(u32.shiftRight(value, 8)) * 4, u32.toUsize(u32.bitAnd(value, 255)), &mut out)
+    return
+  }
+  run appendWord(value + u32.shiftLeft(c - u32.shiftRight(head, 11), 16), 0, &mut out)
+}
+/// The radical-stroke segment of a Han code point, or NONE if `c` is not one.
+fn hanSegment(c: u32) -> usize {
+  let index = data.hanIndex()
+  let mut lo: usize = 0 let mut hi = data.HAN_INDEX_COUNT
+  while lo < hi {
+    let mid = lo + (hi - lo) / 2
+    if read32(index, mid * 12) <= c { lo = mid + 1 } else { hi = mid }
+  }
+  if lo == 0 { return NONE }
+  let runs = data.hanRuns()
+  let mut at = offset(index, (lo - 1) * 12 + 4)
+  let mut end = read32(index, (lo - 1) * 12)
+  let mut segment = offset(index, (lo - 1) * 12 + 8)
+  let mut n: usize = 0
+  while n < 64 && at < runs.length {
+    let gap = leb(runs, &mut at)
+    let length = leb(runs, &mut at) + 1
+    let change = leb(runs, &mut at)
+    if u32.bitAnd(change, 1) == 0 { segment = segment + u32.toUsize(u32.shiftRight(change, 1)) }
+    else { segment = segment - u32.toUsize(u32.shiftRight(change, 1)) - 1 }
+    let start = end + gap
+    if c < start { return NONE }
+    if c < start + length { return segment }
+    end = start + length
+    n = n + 1
+  }
+  return NONE
+}
+fn leb(bytes: &[u8], at: &mut usize) -> u32 {
+  let mut value: u32 = 0 let mut shift: u32 = 0
+  while true {
+    let b = bytes[at.*]
+    at.* = at.* + 1
+    value = u32.bitOr(value, u32.shiftLeft(u8.toU32(u8.bitAnd(b, 127)), shift))
+    if u8.bitAnd(b, 128) == 0 { break }
+    shift = shift + 7
+  }
+  return value
+}
+/// Appends the two CEs of Han code point `c`: radical-stroke segment, then block and offset.
+effect fn appendHan(c: u32, s: u32, t: u32, out: &mut List<u32>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let segment = hanSegment(c)
+  if segment == NONE { run appendUnassigned(c, &mut out) return }
+  let blocks = data.hanBlocks()
+  let mut block: u32 = 0 let mut first: u32 = 0
+  let mut i: usize = 0
+  while i < blocks.length / 8 {
+    if c >= read32(blocks, i * 8) && c <= read32(blocks, i * 8 + 4) {
+      first = read32(blocks, i * 8)
+      if i >= 2 { block = usize.toU32(i - 1) }
+      break
+    }
+    i = i + 1
+  }
+  // The core block and the compatibility ideographs after it share block 0.
+  let mut position = c - first
+  if i == 1 { position = c - 19968 }
+  run out.append(data.HAN_PRIMARY + u32.shiftLeft(usize.toU32(segment), 8)) run out.append(s) run out.append(t)
+  run out.append(data.HAN_PRIMARY + u32.shiftLeft(block, 17) + position + 1) run out.append(0) run out.append(0)
+}
+effect fn appendUnassigned(c: u32, out: &mut List<u32>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut p = data.UNASSIGNED_PRIMARY + c + 1
+  if c == 65533 { p = data.FFFD_PRIMARY } else if c == 65535 { p = data.FFFF_PRIMARY }
+  run out.append(p) run out.append(data.COMMON_SECONDARY) run out.append(data.COMMON_TERTIARY)
+}
+/// Appends the implicit CEs of a code point without a root mapping.
+effect fn appendImplicit(c: u32, out: &mut List<u32>) -> () ! OutOfMemoryError ? &mut Allocator {
+  if c >= 13312 && c <= 210041 { run appendHan(c, data.COMMON_SECONDARY, data.COMMON_TERTIARY, &mut out) return }
+  run appendUnassigned(c, &mut out)
+}
+/// The value of decimal digit `c`, or -1.
+fn digitValue(c: u32) -> i32 {
+  if c >= 48 && c <= 57 { return u32.toI32(c - 48) }
+  if c < 1632 { return -1 }
+  let table = data.digits()
+  let mut lo: usize = 0 let mut hi = data.DIGIT_RUN_COUNT
+  while lo < hi {
+    let mid = lo + (hi - lo) / 2
+    if read32(table, mid * 8) <= c { lo = mid + 1 } else { hi = mid }
+  }
+  if lo == 0 { return -1 }
+  let at = (lo - 1) * 8
+  let start = read32(table, at)
+  if c - start < u8.toU32(table[at + 5]) { return u32.toI32(c - start + u8.toU32(table[at + 4])) }
+  return -1
+}
+
+// ---------------------------------------------------------------------------
+// Collation elements of a string
+
+/// What a key maps to: kind 0 a tailored entry, 1 a root contraction, 2 the root CEs of a
+/// single code point, 3 a chain member; `at` is the entry, the code point or the member.
+struct Match { kind: u32, at: usize }
+const NO_MATCH: u32 = 9
+
+/// The mapping of `key` in the tailoring or the root.
+fn find(t: &Tailoring, key: &[u32]) -> Match {
+  let entry = tailoredEntry(t, 0, key)
+  if entry != NONE { return Match { kind: 0, at: entry } }
+  if key.length == 1 {
+    let k = t.member(key[0])
+    if k != NONE { return Match { kind: 3, at: k } }
+    return Match { kind: 2, at: u32.toUsize(key[0]) }
+  }
+  // The generator checks that no root contraction starts with an ASCII code point.
+  if key[0] < 128 || t.suppresses(key[0]) { return Match { kind: NO_MATCH, at: 0 } }
+  let root = rootEntry(key)
+  if root != NONE { return Match { kind: 1, at: root } }
+  return Match { kind: NO_MATCH, at: 0 }
+}
+/// Whether a contraction of the tailoring or the root may start with `c`. A cheap superset
+/// of what `isPrefix` accepts for a key that starts with `c`.
+fn startsContraction(t: &Tailoring, c: u32) -> bool {
+  let count = t.entries()
+  if count > 0 && t.mayStart(c) {
+    let single = [c]
+    let bytes = data.records()
+    let mut n = lowerBound(t, 0, count, Slice.view<u32>(&single, 0, 1))
+    if n < count && u8.toUsize(bytes[t.entry(0, n)]) == 1 && read24(bytes, t.entry(0, n) + 1) == c { n = n + 1 }
+    if n < count && read24(data.records(), t.entry(0, n) + 1) == c { return true }
+  }
+  if c < 128 { return false }
+  let item = rootItem(c)
+  return item != NONE && u32.bitAnd(itemFlags(item), 2) != 0
+}
+fn isPrefix(t: &Tailoring, key: &[u32]) -> bool {
+  if tailoredPrefix(t, key) { return true }
+  if key[0] < 128 || t.suppresses(key[0]) { return false }
+  return rootPrefix(key)
+}
+effect fn appendMatch(t: &Tailoring, found: Match, out: &mut List<u32>) -> () ! OutOfMemoryError ? &mut Allocator {
+  if found.kind == 0 {
+    let bytes = data.records()
+    let ces = entryCes(bytes, found.at)
+    run appendTailored(bytes, ces + 1, u8.toUsize(bytes[ces]), &mut out)
+  } else if found.kind == 1 {
+    let bytes = data.contractions()
+    let ces = entryCes(bytes, found.at)
+    run appendWords(bytes, ces + 1, u8.toUsize(bytes[ces]), &mut out)
+  } else if found.kind == 3 {
+    run t.chainCes(found.at, &mut out)
+  } else {
+    run appendRoot(usize.toU32(found.at), &mut out)
+  }
+}
+/// The tailored context entry for code points `key` after `before` (the code points
+/// before them, nearest first), or NONE.
+fn contextEntry(t: &Tailoring, key: &[u32], before: &[u32]) -> usize {
+  let mut probe: [u32; 5] = [0; 5]
+  let mut n: usize = 0
+  while n < key.length { probe[n] = key[n] n = n + 1 }
+  probe[n] = data.CONTEXT_SEPARATOR n = n + 1
+  let mut k: usize = 0
+  while k < before.length { probe[n] = before[k] n = n + 1 k = k + 1 }
+  return tailoredEntry(t, 1, Slice.view<u32>(&probe, 0, n))
+}
+/// Whether a tailored context entry's key starts with `c` then `next`.
+fn contextKeyStarts(t: &Tailoring, c: u32, next: u32) -> bool {
+  let key = [c, next]
+  let view = Slice.view<u32>(&key, 0, 2)
+  let count = t.contexts()
+  let n = lowerBound(t, 1, count, view)
+  return n < count && compareKey(data.records(), t.entry(1, n), view, true) == 0
+}
+/// The tailored context entry that applies at `points[i]` (i > start): the longest context
+/// first, then the longest key; NONE if there is none. `length` gets the key length.
+fn findContext(t: &Tailoring, points: &List<u32>, i: usize, start: usize, length: &mut usize) -> usize {
+  let mut before: [u32; 2] = [0; 2]
+  let mut p: usize = 2
+  while p >= 1 {
+    if i - start >= p {
+      before[0] = points.get(i - 1)
+      if p == 2 { before[1] = points.get(i - 2) }
+      let mut k: usize = 2
+      while k >= 1 {
+        if i + k <= points.length() {
+          let entry = contextEntry(t, Slice.view<u32>(points.asSlice(), i, k), Slice.view<u32>(&before, 0, p))
+          if entry != NONE { length.* = k return entry }
+        }
+        k = k - 1
+      }
+    }
+    p = p - 1
+  }
+  return NONE
+}
+/// Appends the CEs of `points[i]` (i > start) and returns how many code points they cover
+/// if a context or prefix mapping applies, else 0.
+effect fn contextual(t: &Tailoring, points: &List<u32>, i: usize, start: usize, out: &mut List<u32>) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let previous = points.get(i - 1)
+  let c = points.get(i)
+  if t.contexts() > 0 {
+    let mut length: usize = 0
+    let entry = findContext(t, points, i, start, &mut length)
+    if entry != NONE { run appendMatch(t, Match { kind: 0, at: entry }, &mut out) return length }
+  }
+  if c < 128 { return 0 }
+  let item = rootItem(c)
+  if item == NONE || u32.bitAnd(itemFlags(item), 4) == 0 { return 0 }
+  let single = [c]
+  if tailoredEntry(t, 0, Slice.view<u32>(&single, 0, 1)) != NONE { return 0 }
+  let table = data.prefixes()
+  let mut n: usize = 0
+  while n < data.PREFIX_COUNT {
+    if read24(table, n * 10) == previous && read24(table, n * 10 + 3) == c {
+      run appendWord(read32(table, n * 10 + 6), 0, &mut out)
+      return 1
+    }
+    n = n + 1
+  }
+  return 0
+}
+/// Appends the CEs of the NFD code points `points` as (primary, secondary, tertiary) triples.
+/// Collation starts at `start`; the code points before it are not looked at.
+/// Marks that a discontiguous contraction takes are removed from `points`.
+effect fn collect(t: &Tailoring, points: &mut List<u32>, start: usize, numeric: bool, out: &mut List<u32>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut key = List<u32>.make()
+  let mut i = start
+  while i < points.length() {
+    let c = points.get(i)
+    if numeric && digitValue(c) >= 0 {
+      let mut end = i
+      while end < points.length() && digitValue(points.get(end)) >= 0 { end = end + 1 }
+      let mut first = i
+      while first + 1 < end && digitValue(points.get(first)) == 0 { first = first + 1 }
+      let mut count = end - first
+      if count > 254 { count = 254 }
+      run out.append(data.NUMERIC_PRIMARY + usize.toU32(count)) run out.append(data.COMMON_SECONDARY) run out.append(data.COMMON_TERTIARY)
+      while first < end {
+        run out.append(data.NUMERIC_PRIMARY + 256 + i32.toU32(digitValue(points.get(first))))
+        run out.append(data.COMMON_SECONDARY) run out.append(data.COMMON_TERTIARY)
+        first = first + 1
+      }
+      i = end
+      continue
+    }
+    if i > start {
+      let applied = run contextual(t, &points, i, start, &mut out)
+      if applied > 0 { i = i + applied continue }
+    }
+    let mut length: usize = 1
+    let mut found = find(t, Slice.view<u32>(points.asSlice(), i, 1))
+    if !startsContraction(t, c) { run appendMatch(t, move found, &mut out) i = i + 1 continue }
+    let mut k = i + 2
+    while k <= points.length() && isPrefix(t, Slice.view<u32>(points.asSlice(), i, k - i)) {
+      let longer = find(t, Slice.view<u32>(points.asSlice(), i, k - i))
+      if longer.kind != NO_MATCH { found = move longer length = k - i }
+      k = k + 1
+    }
+    key.clear()
+    let mut n: usize = 0
+    while n < length { run key.append(points.get(i + n)) n = n + 1 }
+    // Discontiguous extension over unblocked non-starters (UCA S2.1).
+    let mut j = i + length
+    let mut lastClass: u32 = 0
+    let mut skipped = false
+    while j < points.length() {
+      let mark = points.get(j)
+      let class = UnicodeNormalization.combiningClass(mark)
+      if class == 0 { break }
+      if !skipped || lastClass < class {
+        run key.append(mark)
+        if isPrefix(t, key.asSlice()) {
+          let longer = find(t, key.asSlice())
+          if longer.kind != NO_MATCH { found = move longer drop points.remove(j) continue }
+        }
+        drop key.pop()
+      }
+      skipped = true
+      lastClass = class
+      j = j + 1
+    }
+    run appendMatch(t, move found, &mut out)
+    i = i + length
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Comparison
+
+/// Comparison settings from the options and the tailoring.
+struct Levels { strength: u32, caseLevel: bool, caseFirst: u32, shifted: bool, backwards: bool }
+
+/// Clears variable CEs and the ignorables after them (shifted), then reorders primaries.
+fn prepare(t: &Tailoring, levels: &Levels, ces: &mut [u32]) -> () {
+  let mut variable = false
+  let mut i: usize = 0
+  while i + 2 < ces.length {
+    let p = ces[i]
+    if levels.shifted {
+      if p != 0 && p < data.VARIABLE_LIMIT { variable = true ces[i] = 0 ces[i + 1] = 0 ces[i + 2] = 0 }
+      else if p == 0 && variable { ces[i + 1] = 0 ces[i + 2] = 0 }
+      else if p != 0 { variable = false }
+    }
+    if ces[i] != 0 && t.reorders > 0 { ces[i] = t.reorder(ces[i]) }
+    i = i + 3
+  }
+}
+/// Compares the nonzero weights at `level` (0 primary, 1 secondary) in order.
+fn compareLevel(a: &[u32], b: &[u32], level: usize) -> i32 {
+  let mut i: usize = 0 let mut j: usize = 0
+  while true {
+    while i < a.length && a[i + level] == 0 { i = i + 3 }
+    while j < b.length && b[j + level] == 0 { j = j + 3 }
+    if i >= a.length || j >= b.length { if i < a.length { return 1 } if j < b.length { return -1 } return 0 }
+    if a[i + level] != b[j + level] { if a[i + level] < b[j + level] { return -1 } return 1 }
+    i = i + 3 j = j + 3
+  }
+  return 0
+}
+/// Compares the nonzero secondaries from the end (French accents).
+fn compareBackwards(a: &[u32], b: &[u32]) -> i32 {
+  let mut i = a.length let mut j = b.length
+  while true {
+    while i > 0 && a[i - 2] == 0 { i = i - 3 }
+    while j > 0 && b[j - 2] == 0 { j = j - 3 }
+    if i == 0 || j == 0 { if i > 0 { return 1 } if j > 0 { return -1 } return 0 }
+    if a[i - 2] != b[j - 2] { if a[i - 2] < b[j - 2] { return -1 } return 1 }
+    i = i - 3 j = j - 3
+  }
+  return 0
+}
+/// The case level weight of CE `i`, or NONE when the CE has none.
+fn caseWeight(levels: &Levels, ces: &[u32], i: usize) -> usize {
+  if levels.strength == 1 { if ces[i] == 0 || (ces[i + 1] == 0 && ces[i + 2] == 0) { return NONE } }
+  else if ces[i + 1] == 0 { return NONE }
+  let mut value = u32.bitAnd(ces[i + 2], CASE_MASK)
+  if levels.caseFirst == 2 { value = CASE_MASK - value }
+  return u32.toUsize(value)
+}
+fn compareCase(levels: &Levels, a: &[u32], b: &[u32]) -> i32 {
+  let mut i: usize = 0 let mut j: usize = 0
+  while true {
+    while i < a.length && caseWeight(levels, a, i) == NONE { i = i + 3 }
+    while j < b.length && caseWeight(levels, b, j) == NONE { j = j + 3 }
+    if i >= a.length || j >= b.length { if i < a.length { return 1 } if j < b.length { return -1 } return 0 }
+    let x = caseWeight(levels, a, i) let y = caseWeight(levels, b, j)
+    if x != y { if x < y { return -1 } return 1 }
+    i = i + 3 j = j + 3
+  }
+  return 0
+}
+/// The tertiary weight of CE `i` with ICU's case handling, or 0 when it has none.
+fn tertiaryWeight(levels: &Levels, ces: &[u32], i: usize) -> u32 {
+  let withCase = !levels.caseLevel && levels.caseFirst != 0
+  let mut t = ces[i + 2]
+  if !withCase { t = u32.bitAnd(t, 16383) }
+  if t == 0 { return 0 }
+  if withCase && levels.caseFirst == 2 {
+    if ces[i + 1] != 0 || ces[i] != 0 { t = u32.bitXor(t, CASE_MASK) } else { t = t + 16384 }
+  }
+  return t
+}
+fn compareTertiary(levels: &Levels, a: &[u32], b: &[u32]) -> i32 {
+  let mut i: usize = 0 let mut j: usize = 0
+  while true {
+    while i < a.length && tertiaryWeight(levels, a, i) == 0 { i = i + 3 }
+    while j < b.length && tertiaryWeight(levels, b, j) == 0 { j = j + 3 }
+    if i >= a.length || j >= b.length { if i < a.length { return 1 } if j < b.length { return -1 } return 0 }
+    let x = tertiaryWeight(levels, a, i) let y = tertiaryWeight(levels, b, j)
+    if x != y { if x < y { return -1 } return 1 }
+    i = i + 3 j = j + 3
+  }
+  return 0
+}
+
+// The caller keeps value's flat or rope string owner alive through return. Like
+// JS_ToUTF32String, malformed UTF-16 stays as lone surrogates.
+effect fn codePoints(value: ValueBits) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
   let mut points = List<u32>.make()
   run points.reserveExact(Strings.length(value))
   let mut index: usize = 0
   while index < Strings.length(value) { run points.append(Strings.codePoint(value, &mut index)) }
-  return run UnicodeNormalization.normalize(points.asSlice(), Normalization.Nfd)
+  return move points
 }
-// sensitivity: 0 base, 1 accent, 2 case, 3 variant; caseFirst: 0 upper,
-// 1 lower, 2 false. Options have already passed the JS enum validation.
-// Unlike C's pending-exception/NULL temporary convention, allocation failure is
-// explicit in the effect row; no temporary owner escapes or is leaked.
-pub effect fn compare(a: ValueBits, b: ValueBits, options: &CollationOptions) -> i32
-  ! OutOfMemoryError ? &mut Allocator {
-  let first = run normalize_string(a)
-  let second = run normalize_string(b)
-  let mut level = options.sensitivity
-  if level == 3 { level = 1 }
-  let keyA = run transform_string(options, first.asSlice(), level)
-  let keyB = run transform_string(options, second.asSlice(), level)
-  let mut comparison = js_UTF32_compare_len(keyA.asSlice(), keyB.asSlice())
-  if options.sensitivity == 3 && comparison == 0 {
-    let caseA = run transform_string(options, first.asSlice(), 3)
-    let caseB = run transform_string(options, second.asSlice(), 3)
-    let aPoints = caseA.asSlice()
-    let bPoints = caseB.asSlice()
-    let mut i: usize = 0
-    while i < aPoints.length && i < bPoints.length {
-      comparison = compare_case_order(aPoints[i], bPoints[i], options.caseFirst)
-      if comparison != 0 { return comparison }
-      i = i + 1
-    }
-    if aPoints.length < bPoints.length { return -1 }
-    if aPoints.length > bPoints.length { return 1 }
+/// NFD of `points` from `start`, and where it starts in the result. Code points below
+/// U+00C0 never decompose, so text made only of them stays as it is.
+effect fn decompose(points: List<u32>, start: usize, from: &mut usize) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
+  let mut i = start
+  while i < points.length() && points.get(i) < 192 { i = i + 1 }
+  if i == points.length() { from.* = start return move points }
+  from.* = 0
+  return run UnicodeNormalization.normalize(Slice.view<u32>(points.asSlice(), start, points.length() - start), Normalization.Nfd)
+}
+fn alphanumeric(c: u32) -> bool { return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) }
+/// Whether the CEs of a string split cleanly before `c` at a point where the text before is
+/// the same in both strings: no contraction, context, discontiguous mark or prefix mapping
+/// reaches across.
+fn startsClean(t: &Tailoring, c: u32) -> bool {
+  if t.contexts() > 0 { return false }
+  if c < 128 { return true }
+  if c == 183 || c == 903 { return false }
+  return UnicodeNormalization.combiningClass(c) == 0
+}
+/// The length of the common prefix of `a` and `b` that both can drop before collation: it
+/// ends after an ASCII letter or digit (not a digit with numeric) that starts no contraction
+/// nor follows the start of one, before a clean start in both strings.
+fn sharedPrefix(t: &Tailoring, a: &[u32], b: &[u32], numeric: bool) -> usize {
+  let mut p: usize = 0
+  while p < a.length && p < b.length && a[p] == b[p] { p = p + 1 }
+  while p > 0 {
+    let previous = a[p - 1]
+    let mut clean = alphanumeric(previous) && !(numeric && previous <= 57)
+    if clean && p < a.length && !startsClean(t, a[p]) { clean = false }
+    if clean && p < b.length && !startsClean(t, b[p]) { clean = false }
+    let mut q = p
+    while clean && q > 0 && q + 8 > p { if startsContraction(t, a[q - 1]) { clean = false } q = q - 1 }
+    if clean { return p }
+    p = p - 1
   }
-  return comparison
+  return 0
+}
+fn same(a: &[u32], b: &[u32]) -> bool {
+  if a.length != b.length { return false }
+  let mut i: usize = 0
+  while i < a.length { if a[i] != b[i] { return false } i = i + 1 }
+  return true
+}
+// ---------------------------------------------------------------------------
+// The fast primary pass
+
+const FAST_BAIL: i32 = 2
+const PRIMARY_END: u32 = 0
+const PRIMARY_BAIL: u32 = 4294967295
+/// A `latin` entry for a code point that starts contractions in Latin-1 text: see `pairs`.
+const PRIMARY_PAIR: u32 = 4294967294
+/// Primary `p` under the shifted option and the reordering, 0 for none.
+@inlineAlways
+fn primaryWeight(t: &Tailoring, p: u32, shifted: bool) -> u32 {
+  if p == 0 || (shifted && p < data.VARIABLE_LIMIT) { return 0 }
+  if t.reorders > 0 { return t.reorder(p) }
+  return p
+}
+// A wide entry: the code point plus one (0 for an empty slot), up to three primaries of
+// its CEs in isolation (weighted, zero after the last), WIDE_* flags with the length of its
+// NFD (bits 8 and 9) and which of its code points may start a contraction (bits 12 to 14),
+// then the first three code points of its NFD.
+const WIDE_SLOTS: u32 = 1024
+const WIDE_WORDS: usize = 8
+/// The fast pass does not cover the code point.
+const WIDE_BAIL: u32 = 1
+/// The NFD starts with a combining mark or one of `data.LATIN_JOINERS`.
+const WIDE_LEADS: u32 = 8
+/// The NFD ends with a combining mark.
+const WIDE_TRAILS: u32 = 16
+/// The NFD starts with a code point that continues some contraction.
+const WIDE_CONTINUES: u32 = 32
+/// A context mapping of the tailoring applies to the code point.
+const WIDE_TARGET: u32 = 64
+/// The NFD is longer than three code points.
+const WIDE_LONG: u32 = 128
+const WIDE_STARTERS: u32 = 28672
+/// `WideText.last` before the first code point, and for one whose NFD is not known.
+const NO_POINT: u32 = 4294967294
+const UNKNOWN_POINT: u32 = 4294967295
+/// Where the entry of `c` is in `options.wide`, filling it first if needed.
+effect fn wideEntry(options: &mut CollationOptions, c: u32) -> usize ! OutOfMemoryError ? &mut Allocator {
+  if options.wide.length() == 0 { run options.wide.appendRepeated(0, u32.toUsize(WIDE_SLOTS) * WIDE_WORDS) }
+  let slot = u32.toUsize(u32.bitAnd(c, WIDE_SLOTS - 1)) * WIDE_WORDS
+  if options.wide.get(slot) != c + 1 { run fillWide(&mut options, c, slot) }
+  return slot
+}
+fn latinJoiner(c: u32) -> bool {
+  let mut i: usize = 0
+  while i < data.LATIN_JOINERS.length { if data.LATIN_JOINERS[i] == c { return true } i = i + 1 }
+  return false
+}
+fn continues(c: u32) -> bool {
+  let mut lo: usize = 0 let mut hi = data.CONTINUATIONS.length
+  while lo < hi { let mid = lo + (hi - lo) / 2 if data.CONTINUATIONS[mid] < c { lo = mid + 1 } else { hi = mid } }
+  return lo < data.CONTINUATIONS.length && data.CONTINUATIONS[lo] == c
+}
+effect fn fillWide(options: &mut CollationOptions, c: u32, slot: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let single = [c]
+  let mut points = run UnicodeNormalization.normalize(Slice.view<u32>(&single, 0, 1), Normalization.Nfd)
+  let count = points.length()
+  let lead = points.get(0) let last = points.get(count - 1)
+  let mut info: u32 = 0
+  if UnicodeNormalization.combiningClass(lead) != 0 || latinJoiner(lead) { info = u32.bitOr(info, WIDE_LEADS) }
+  if UnicodeNormalization.combiningClass(last) != 0 { info = u32.bitOr(info, WIDE_TRAILS) }
+  if continues(lead) { info = u32.bitOr(info, WIDE_CONTINUES) }
+  let mut k: usize = 0
+  while k < count {
+    let p = points.get(k)
+    // A prefix mapping (l with middle dot) or a context mapping depends on the code point
+    // before.
+    if p >= 128 { let item = rootItem(p) if item != NONE && u32.bitAnd(itemFlags(item), 4) != 0 { info = u32.bitOr(info, WIDE_BAIL) } }
+    if options.targets.length() > 0 {
+      match options.targets.binarySearch(p) {
+        Option<usize>.Some { .. } => { if count == 1 { info = u32.bitOr(info, WIDE_TARGET) } else { info = u32.bitOr(info, WIDE_BAIL) } }
+        Option<usize>.None => ()
+      }
+    }
+    if options.numeric && digitValue(p) >= 0 { info = u32.bitOr(info, WIDE_BAIL) }
+    if startsContraction(&options.t, p) {
+      if k < 3 { info = u32.bitOr(info, u32.shiftLeft(1, usize.toU32(k) + 12)) } else { info = u32.bitOr(info, WIDE_BAIL) }
+    }
+    k = k + 1
+  }
+  if count > 3 { info = u32.bitOr(info, WIDE_LONG) }
+  if count > 3 && u32.bitAnd(info, WIDE_STARTERS) != 0 { info = u32.bitOr(info, WIDE_BAIL) }
+  let mut stored = count if stored > 3 { stored = 3 }
+  info = u32.bitOr(info, u32.shiftLeft(usize.toU32(stored), 8))
+  let mut primaries: [u32; 3] = [0; 3]
+  if u32.bitAnd(info, WIDE_BAIL) == 0 {
+    let mut ces = List<u32>.make()
+    run ces.reserveExact(count * 3 + 6)
+    run collect(&options.t, &mut points, 0, false, &mut ces)
+    let mut n: usize = 0
+    let mut i: usize = 0
+    while i + 2 < ces.length() {
+      let w = primaryWeight(&options.t, ces.get(i), options.ignorePunctuation)
+      if w != 0 { if n == 3 { info = u32.bitOr(info, WIDE_BAIL) break } primaries[n] = w n = n + 1 }
+      i = i + 3
+    }
+  }
+  options.wide.set(slot, c + 1)
+  options.wide.set(slot + 1, primaries[0]) options.wide.set(slot + 2, primaries[1]) options.wide.set(slot + 3, primaries[2])
+  options.wide.set(slot + 4, info)
+  k = 0
+  while k < 3 { let mut p: u32 = 0 if k < count { p = points.get(k) } options.wide.set(slot + 5 + k, p) k = k + 1 }
+}
+/// One string read for the fast pass: where the next code point is (and that code point,
+/// once looked at), the last two code points of the NFD before it (last nearest), and the
+/// primaries of the last one not returned yet, last first.
+struct WideText { value: ValueBits, index: usize, length: usize, ahead: u32, aheadEnd: usize, last: u32, last2: u32, queue: [u32; 2], queued: usize }
+impl WideText {
+  fn make(value: ValueBits) -> WideText {
+    return WideText { value: value, index: 0, length: Strings.length(value), ahead: 0, aheadEnd: 0, last: NO_POINT, last2: NO_POINT, queue: [0; 2], queued: 0 }
+  }
+  @inlineAlways
+  fn read(self: &mut Self) -> u32 {
+    if self.aheadEnd != 0 { self.index = self.aheadEnd self.aheadEnd = 0 return self.ahead }
+    return Strings.codePoint(self.value, &mut self.index)
+  }
+  /// The code point after the last one read; there is one.
+  @inlineAlways
+  fn peek(self: &mut Self) -> u32 {
+    if self.aheadEnd == 0 { let mut at = self.index self.ahead = Strings.codePoint(self.value, &mut at) self.aheadEnd = at }
+    return self.ahead
+  }
+}
+/// Whether a contraction that starts in the stored NFD `n` (entry flags `info`) may go on
+/// with `next`.
+fn joins(t: &Tailoring, info: u32, n: &[u32; 3], next: u32) -> bool {
+  let count = u32.toUsize(u32.bitAnd(u32.shiftRight(info, 8), 3))
+  let mut k: usize = 0
+  while k < count {
+    if u32.bitAnd(info, u32.shiftLeft(1, usize.toU32(k) + 12)) != 0 {
+      let mut key: [u32; 4] = [0; 4]
+      let mut m: usize = 0
+      while k + m < count { key[m] = n[k + m] m = m + 1 }
+      key[m] = next
+      if isPrefix(t, Slice.view<u32>(&key, 0, m + 1)) { return true }
+    }
+    k = k + 1
+  }
+  return false
+}
+/// The next nonzero primary of `text`, PRIMARY_END at the end, or PRIMARY_BAIL when the
+/// fast pass cannot tell: a code point it does not cover, or one whose CEs the next code
+/// point may change.
+effect fn nextWide(options: &mut CollationOptions, text: &mut WideText) -> u32 ! OutOfMemoryError ? &mut Allocator {
+  if text.queued > 0 { text.queued = text.queued - 1 return text.queue[text.queued] }
+  while text.index < text.length {
+    let c = text.read()
+    let previous = text.last
+    let previous2 = text.last2
+    if c < data.LATIN_LIMIT {
+      let at = u32.toUsize(c) * 2
+      let mut first = options.latin[at]
+      let mut second = options.latin[at + 1]
+      if first == PRIMARY_BAIL { return PRIMARY_BAIL }
+      text.last2 = previous if c >= 192 { text.last2 = UNKNOWN_POINT }
+      text.last = latinLast(c)
+      if first == PRIMARY_PAIR {
+        // As in nextLatin1, with a higher code point after `c` too.
+        let row = u32.toUsize(second)
+        let mut found = row + 1
+        if text.index < text.length {
+          let d = text.peek()
+          if d >= 256 {
+            // `pairs` only knows contractions that go on in Latin-1.
+            let f = run wideEntry(&mut options, d)
+            if u32.bitAnd(options.wide.get(f + 4), WIDE_LEADS) != 0 { return PRIMARY_BAIL }
+            let key = [c, options.wide.get(f + 5)]
+            if isPrefix(&options.t, Slice.view<u32>(&key, 0, 2)) { return PRIMARY_BAIL }
+          }
+          let mut k: usize = 0
+          while k < u32.toUsize(options.pairs.get(row)) {
+            if options.pairs.get(row + 3 + k * 3) == d {
+              found = row + 4 + k * 3 drop text.read()
+              text.last2 = text.last text.last = latinLast(d)
+              if d >= 192 { text.last2 = UNKNOWN_POINT }
+              break
+            }
+            k = k + 1
+          }
+        }
+        first = options.pairs.get(found) second = options.pairs.get(found + 1)
+        if first == 0 { first = second second = 0 }
+      }
+      if text.index < text.length {
+        let d = text.peek()
+        // The tables leave alone a code point that a contraction may join with one below
+        // LATIN_LIMIT; from there up only a mark or a joiner can continue one.
+        if d >= data.LATIN_LIMIT { let e = run wideEntry(&mut options, d) if u32.bitAnd(options.wide.get(e + 4), WIDE_LEADS) != 0 { return PRIMARY_BAIL } }
+      }
+      if first == 0 { continue }
+      if second != 0 { text.queue[0] = second text.queued = 1 }
+      return first
+    }
+    let e = run wideEntry(&mut options, c)
+    let info = options.wide.get(e + 4)
+    if u32.bitAnd(info, WIDE_BAIL) != 0 { return PRIMARY_BAIL }
+    let mut p0 = options.wide.get(e + 1) let mut p1 = options.wide.get(e + 2) let mut p2 = options.wide.get(e + 3)
+    let n = [options.wide.get(e + 5), options.wide.get(e + 6), options.wide.get(e + 7)]
+    let stored = u32.toUsize(u32.bitAnd(u32.shiftRight(info, 8), 3))
+    if u32.bitAnd(info, WIDE_LONG) != 0 { text.last2 = UNKNOWN_POINT text.last = UNKNOWN_POINT }
+    else if stored >= 2 { text.last2 = n[stored - 2] text.last = n[stored - 1] }
+    else { text.last2 = previous text.last = n[0] }
+    if u32.bitAnd(info, WIDE_TARGET) != 0 && previous != NO_POINT {
+      // A context mapping of the tailoring may apply after `previous` and `previous2` (the
+      // last code points of the NFD before), as in findContext.
+      if previous == UNKNOWN_POINT || previous2 == UNKNOWN_POINT { return PRIMARY_BAIL }
+      if text.index < text.length {
+        // Context keys of two code points are not looked up here.
+        let d = text.peek()
+        let mut next = d
+        if d >= 192 {
+          let f = run wideEntry(&mut options, d)
+          if u32.bitAnd(options.wide.get(f + 4), WIDE_LEADS) != 0 { return PRIMARY_BAIL }
+          next = options.wide.get(f + 5)
+        }
+        if contextKeyStarts(&options.t, c, next) { return PRIMARY_BAIL }
+      }
+      let key = [c]
+      let mut entry = NONE
+      if previous2 != NO_POINT {
+        let before = [previous, previous2]
+        entry = contextEntry(&options.t, Slice.view<u32>(&key, 0, 1), Slice.view<u32>(&before, 0, 2))
+      }
+      if entry == NONE {
+        let before = [previous]
+        entry = contextEntry(&options.t, Slice.view<u32>(&key, 0, 1), Slice.view<u32>(&before, 0, 1))
+      }
+      if entry != NONE {
+        let mut primaries: [u32; 3] = [0; 3]
+        if !contextPrimaries(&options.t, entry, options.ignorePunctuation, &mut primaries) { return PRIMARY_BAIL }
+        p0 = primaries[0] p1 = primaries[1] p2 = primaries[2]
+      }
+    }
+    if text.index < text.length && u32.bitAnd(info, WIDE_STARTERS + WIDE_TRAILS) != 0 {
+      let d = text.peek()
+      if d < 192 {
+        if u32.bitAnd(info, WIDE_STARTERS) != 0 && joins(&options.t, info, &n, d) { return PRIMARY_BAIL }
+      } else {
+        let f = run wideEntry(&mut options, d)
+        let next = options.wide.get(f + 4)
+        if u32.bitAnd(next, WIDE_LEADS) != 0 { return PRIMARY_BAIL }
+        if u32.bitAnd(next, WIDE_CONTINUES) != 0 && u32.bitAnd(info, WIDE_STARTERS) != 0 && joins(&options.t, info, &n, options.wide.get(f + 5)) { return PRIMARY_BAIL }
+      }
+    }
+    if p0 == 0 { p0 = p1 p1 = p2 p2 = 0 }
+    if p0 == 0 { p0 = p1 p1 = 0 }
+    if p0 == 0 { continue }
+    if p2 != 0 { text.queue[0] = p2 text.queue[1] = p1 text.queued = 2 }
+    else if p1 != 0 { text.queue[0] = p1 text.queued = 1 }
+    return p0
+  }
+  return PRIMARY_END
+}
+/// The last code point of the NFD of `c`, below LATIN_LIMIT, or UNKNOWN_POINT for one that
+/// decomposes.
+@inlineAlways
+fn latinLast(c: u32) -> u32 { if c < 192 { return c } return UNKNOWN_POINT }
+/// The weighted primaries of the CEs of tailored context entry `entry`; false when there
+/// are more than three.
+fn contextPrimaries(t: &Tailoring, entry: usize, shifted: bool, out: &mut [u32; 3]) -> bool {
+  let bytes = data.records()
+  let ces = entryCes(bytes, entry)
+  let count = u8.toUsize(bytes[ces])
+  let mut position = ces + 1
+  let mut n: usize = 0
+  let mut i: usize = 0
+  while i < count {
+    let flags = bytes[position]
+    let w = primaryWeight(t, read32(bytes, position + 1), shifted)
+    position = position + 5
+    if u8.bitAnd(flags, 1) != 0 { position = position + 4 }
+    if u8.bitAnd(flags, 2) != 0 { position = position + 2 }
+    if w != 0 { if n == 3 { return false } out[n] = w n = n + 1 }
+    i = i + 1
+  }
+  return true
+}
+/// The next nonzero primary of Latin-1 text `bytes` from `at`, from `table` (see
+/// `CollationOptions.latin`). Every Latin-1 code point is below LATIN_LIMIT, so nothing
+/// after one can change it.
+@inlineAlways
+fn nextLatin1(options: &CollationOptions, bytes: &[u8], at: &mut usize, pending: &mut u32) -> u32 {
+  if pending.* != 0 { let p = pending.* pending.* = 0 return p }
+  while at.* < bytes.length {
+    let slot = u8.toUsize(bytes[at.*]) * 2
+    at.* = at.* + 1
+    let mut first = options.latin[slot]
+    let mut second = options.latin[slot + 1]
+    if first == PRIMARY_PAIR {
+      // The longest match: a contraction with the next byte, else the code point alone.
+      let row = u32.toUsize(second)
+      let mut found = row + 1
+      if at.* < bytes.length {
+        let d = u8.toU32(bytes[at.*])
+        let mut k: usize = 0
+        while k < u32.toUsize(options.pairs.get(row)) {
+          if options.pairs.get(row + 3 + k * 3) == d { found = row + 4 + k * 3 at.* = at.* + 1 break }
+          k = k + 1
+        }
+      }
+      first = options.pairs.get(found) second = options.pairs.get(found + 1)
+      if first == 0 { first = second second = 0 }
+    }
+    if first != 0 { pending.* = second return first }
+  }
+  return PRIMARY_END
+}
+fn fastLatin1(options: &CollationOptions, a: &[u8], b: &[u8]) -> i32 {
+  let table = &options.latin
+  let mut i: usize = 0 let mut j: usize = 0
+  let mut x: u32 = 0 let mut y: u32 = 0
+  // Equal leading bytes give equal primaries, unless a contraction (whose first code point
+  // the table leaves to the full path) reaches across the end of them.
+  while i < a.length && i < b.length && a[i] == b[i] { i = i + 1 }
+  if options.latin1Bail {
+    let mut k = i
+    while k > 0 && k + 8 > i { if table[u8.toUsize(a[k - 1]) * 2] >= PRIMARY_PAIR { i = k - 1 } k = k - 1 }
+  }
+  j = i
+  while true {
+    let p = nextLatin1(options, a, &mut i, &mut x)
+    if p == PRIMARY_BAIL { return FAST_BAIL }
+    let q = nextLatin1(options, b, &mut j, &mut y)
+    if q == PRIMARY_BAIL { return FAST_BAIL }
+    if p != q { if p < q { return -1 } return 1 }
+    if p == PRIMARY_END { break }
+  }
+  // Equal primaries: only base sensitivity is done; otherwise compare every level with the
+  // CEs from the table, for strings short enough to keep them on the stack.
+  if options.sensitivity == 0 { return 0 }
+  if a.length > LATIN1_TIE_MAX || b.length > LATIN1_TIE_MAX { return FAST_BAIL }
+  let mut cesA: [u32; 192] = [0; 192] let mut cesB: [u32; 192] = [0; 192]
+  let n = latin1Ces(options, a, &mut cesA) let m = latin1Ces(options, b, &mut cesB)
+  if n == NONE || m == NONE { return FAST_BAIL }
+  let levels = levelsOf(options)
+  prepare(&options.t, &levels, Slice.viewMut<u32>(&mut cesA, 0, n))
+  prepare(&options.t, &levels, Slice.viewMut<u32>(&mut cesB, 0, m))
+  return compareCes(&levels, Slice.view<u32>(&cesA, 0, n), Slice.view<u32>(&cesB, 0, m))
+}
+const LATIN1_TIE_MAX: usize = 32
+/// Writes the raw CEs of Latin-1 `text` (no code point of it needs the full path) to `out`
+/// and returns how many words that is, or NONE when one starts a contraction.
+fn latin1Ces(options: &CollationOptions, text: &[u8], out: &mut [u32; 192]) -> usize {
+  let mut n: usize = 0
+  let mut i: usize = 0
+  while i < text.length {
+    if options.latin[u8.toUsize(text[i]) * 2] == PRIMARY_PAIR { return NONE }
+    let row = u8.toUsize(text[i]) * 6
+    let mut k: usize = 0
+    while k < 6 {
+      if options.latin1Ces[row + k] != 0 || options.latin1Ces[row + k + 1] != 0 || options.latin1Ces[row + k + 2] != 0 {
+        out[n] = options.latin1Ces[row + k] out[n + 1] = options.latin1Ces[row + k + 1] out[n + 2] = options.latin1Ces[row + k + 2]
+        n = n + 3
+      }
+      k = k + 3
+    }
+    i = i + 1
+  }
+  return n
+}
+/// Compares the primary level of two strings from the fast tables: -1, 0 or 1, or
+/// FAST_BAIL when a code point that decides it is not covered. A tie for strings with a code
+/// point from LATIN_LIMIT up also gives FAST_BAIL unless the sensitivity is base.
+effect fn fastPrimary(options: &mut CollationOptions, a: ValueBits, b: ValueBits) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  let flatA = Strings.flatView(a) let flatB = Strings.flatView(b)
+  if flatA.tag() == -7 && flatB.tag() == -7 && !stringWide(flatA) && !stringWide(flatB) {
+    // The caller keeps both strings alive through the call.
+    let anchor = ()
+    return fastLatin1(&options, unsafe Strings.flatLatin1(&anchor, flatA), unsafe Strings.flatLatin1(&anchor, flatB))
+  }
+  let mut x = WideText.make(a)
+  let mut y = WideText.make(b)
+  while true {
+    let p = run nextWide(&mut options, &mut x)
+    if p == PRIMARY_BAIL { return FAST_BAIL }
+    let q = run nextWide(&mut options, &mut y)
+    if q == PRIMARY_BAIL { return FAST_BAIL }
+    if p != q { if p < q { return -1 } return 1 }
+    if p == PRIMARY_END { break }
+  }
+  if options.sensitivity == 0 || Strings.equal(a, b) { return 0 }
+  return FAST_BAIL
+}
+
+/// Compares two JS strings under `options`: -1, 0 or 1.
+pub effect fn compare(a: ValueBits, b: ValueBits, options: &mut CollationOptions) -> i32
+  ! OutOfMemoryError ? &mut Allocator {
+  if !options.filled { run options.fillLatin1() }
+  if options.fast {
+    let primary = run fastPrimary(&mut options, a, b)
+    // Equal primaries decide only at sensitivity "base"; the other levels need the full path.
+    if primary != FAST_BAIL && (primary != 0 || options.sensitivity == 0) { return primary }
+  }
+  let t = &options.t
+  let first = run codePoints(a)
+  let second = run codePoints(b)
+  if same(first.asSlice(), second.asSlice()) { return 0 }
+  let mut skip: usize = 0
+  if u32.bitAnd(t.flags, 4) == 0 { skip = sharedPrefix(t, first.asSlice(), second.asSlice(), options.numeric) }
+  let mut leftStart: usize = 0 let mut rightStart: usize = 0
+  let mut left = run decompose(move first, skip, &mut leftStart)
+  let mut right = run decompose(move second, skip, &mut rightStart)
+  let levels = levelsOf(&options)
+  let mut x = List<u32>.make()
+  let mut y = List<u32>.make()
+  run x.reserveExact(left.length() * 3 + 6)
+  run y.reserveExact(right.length() * 3 + 6)
+  run collect(t, &mut left, leftStart, options.numeric, &mut x)
+  run collect(t, &mut right, rightStart, options.numeric, &mut y)
+  prepare(t, &levels, x.asMutSlice())
+  prepare(t, &levels, y.asMutSlice())
+  return compareCes(&levels, x.asSlice(), y.asSlice())
+}
+fn levelsOf(options: &CollationOptions) -> Levels {
+  let mut levels = Levels { strength: 3, caseLevel: false, caseFirst: 0, shifted: options.ignorePunctuation,
+    backwards: u32.bitAnd(options.t.flags, 4) != 0 }
+  if options.sensitivity == 0 { levels.strength = 1 }
+  else if options.sensitivity == 1 { levels.strength = 2 }
+  else if options.sensitivity == 2 { levels.strength = 1 levels.caseLevel = true }
+  if options.caseFirst == 0 { levels.caseFirst = 2 } else if options.caseFirst == 1 { levels.caseFirst = 1 }
+  return move levels
+}
+/// Compares two prepared CE lists level by level.
+fn compareCes(levels: &Levels, a: &[u32], b: &[u32]) -> i32 {
+  let mut result = compareLevel(a, b, 0)
+  if result != 0 { return result }
+  if levels.strength >= 2 {
+    if levels.backwards { result = compareBackwards(a, b) } else { result = compareLevel(a, b, 1) }
+    if result != 0 { return result }
+  }
+  if levels.caseLevel {
+    result = compareCase(levels, a, b)
+    if result != 0 || levels.strength == 1 { return result }
+  }
+  if levels.strength >= 3 { return compareTertiary(levels, a, b) }
+  return 0
 }

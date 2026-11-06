@@ -1,0 +1,105 @@
+//! Native consumer: actual allocations, reclamation, retained ledger identities,
+//! bounded overflow and recorder ownership. Run through silk test, never a mock.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.box { Box }
+import silk.mem.pointer { Pointer }
+import silk.testing.testing { Testing, AssertionError }
+import runtime_memory { RuntimeAllocator }
+import runtime_allocation_profile { Recording, AllocationRecord }
+import js_allocation_profile as profile
+
+// Null runtime intentionally means an observed native allocation without JS frames.
+test effect fn allocationProfileOwnsRealEventsAndLeavesLedgerBalanced() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run allocator.observe()
+  let started = run unsafe profile.start(&observer, Pointer.null(), 16, 1)
+  run Testing.expect(started, "first start creates allocation session")
+  let repeated = run unsafe profile.start(&observer, Pointer.null(), 16, 1)
+  run Testing.expect(!repeated, "duplicate start does not reset events")
+  let first = run Box<i64>.make(42) |> Effect.provideMut<Allocator>(&mut allocator)
+  let record = observer.lookupAllocation(Pointer.address(first.get()))
+  let id = match move record {
+    Option<AllocationRecord>.Some { value } => value.id
+    _ => 0
+  }
+  run Testing.expect(id != 0, "interior pointer resolves actual allocation identity")
+  drop first
+  let stopped = observer.stopProfile()
+  let recording = match move stopped {
+    Option<Recording>.Some { value } => move value
+    _ => Intrinsic.trap("active profile missing")
+  }
+  run Testing.expect(recording.events.length() == 2, "actual allocate/reclaim events")
+  let events = recording.events.asSlice()
+  run Testing.expect(!events[0].reclaimed && events[1].reclaimed, "allocation precedes reclamation")
+  run Testing.expect(events[0].allocation.id == id && events[1].allocation.id == id, "stable identity across reclamation")
+  run Testing.expect(events[0].allocation.requestedBytes == 8, "real payload bytes")
+  run Testing.expect(events[0].allocation.chargedBytes > 8, "native owner charge included")
+  run Testing.expect(events[0].trace.timestampNs > 0 && events[1].trace.timestampNs >= events[0].trace.timestampNs, "real monotonic event times")
+  run Testing.expect(events[0].trace.depth == 0, "native allocation does not fabricate a JS stack")
+  drop recording
+  run Testing.expect(observer.stats().allocationCount == 0 && observer.stats().usedBytes == 0, "profile storage does not leak ledger charges")
+  match observer.stopProfile() { Option<Recording>.None => () _ => { run Testing.expect(false, "stop is idempotent") } }
+  let resumed = run unsafe profile.start(&observer, Pointer.null(), 1, 1)
+  run Testing.expect(resumed, "stopped session can restart")
+  let second = run Box<i64>.make(7) |> Effect.provideMut<Allocator>(&mut allocator)
+  drop second
+  let limited = match observer.stopProfile() {
+    Option<Recording>.Some { value } => move value
+    _ => Intrinsic.trap("second active profile missing")
+  }
+  run Testing.expect(limited.events.length() == 1 && limited.dropped == 1, "bounded recorder reports lost event without fabrication")
+  drop limited
+  drop allocator
+  run Testing.expect(observer.stats().usedBytes == 0, "observer outlives allocator without borrowing provider")
+}
+
+test effect fn pooledAllocationProfilesTrackLiveBlocksAcrossReuse() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  allocator.enablePooling()
+  let observer = run allocator.observe()
+  let first = run Box<i64>.make(42) |> Effect.provideMut<Allocator>(&mut allocator)
+  let address = Pointer.address(first.get())
+  let before = match observer.lookupAllocation(address + 1) {
+    Option<AllocationRecord>.Some { value } => value
+    _ => Intrinsic.trap("pooled interior address must resolve before profiling")
+  }
+  run Testing.expect(before.requestedBytes == 8 && before.chargedBytes == 16,
+    "pooled record reports request and class charge, not arena backing")
+  let started = run unsafe profile.start(&observer, Pointer.null(), 16, 1)
+  run Testing.expect(started, "pooled profile starts after existing allocations")
+  drop first
+  let second = run Box<i64>.make(7) |> Effect.provideMut<Allocator>(&mut allocator)
+  let after = match observer.lookupAllocation(Pointer.address(second.get())) {
+    Option<AllocationRecord>.Some { value } => value
+    _ => Intrinsic.trap("reused pooled block must have live identity")
+  }
+  run Testing.expect(after.id != before.id, "each allocation lifetime receives a fresh identity")
+  let mut system = Allocator.systemAllocatorProvider()
+  let live = run observer.liveAllocations() |> Effect.provideMut<Allocator>(&mut system)
+  run Testing.expect(live.length() == 1 && live.asSlice()[0].id == after.id,
+    "idle owner-cache and shared blocks are absent from live snapshots")
+  drop live
+  drop second
+  run Testing.expect(match observer.lookupAllocation(after.address) {
+    Option<AllocationRecord>.None => true _ => false
+  }, "reclaimed pooled backing is not a live allocation")
+  let recording = match observer.stopProfile() {
+    Option<Recording>.Some { value } => move value
+    _ => Intrinsic.trap("pooled recording missing")
+  }
+  run Testing.expect(recording.events.length() == 2,
+    "pre-session allocations do not produce unmatched reclaim events")
+  let events = recording.events.asSlice()
+  run Testing.expect(events[0].allocation.id == after.id && !events[0].reclaimed
+    && events[1].allocation.id == after.id && events[1].reclaimed,
+    "pooled allocation and reclaim retain their lifetime identity")
+  drop recording
+  drop allocator
+  run Testing.expect(observer.stats().allocationCount == 0 && observer.stats().usedBytes == 0,
+    "pool metadata does not become a live block or ledger reference")
+}

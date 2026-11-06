@@ -87,6 +87,7 @@ def main():
     shutil.copytree(ROOT/'src',build/'src',dirs_exist_ok=True)
     (build/'src/js_intl_number_cases_generated.silk').write_text(generated(native_selected,not args.skip_faults))
     shutil.copyfile(ROOT/'silk.toml',build/'silk.toml')
+    shutil.copyfile(ROOT/'startup.order',build/'startup.order')
     (build/'oracle.c').write_text(c_source(selected))
     (build/'cases.json').write_text(json.dumps(native_selected,indent=2))
     support=[reference/name for name in ['quickjs.c','cutils.c','dtoa.c','libregexp.c','libunicode.c']]

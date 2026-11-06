@@ -1,11 +1,14 @@
 //! Native Promise storage, capabilities, resolving functions and jobs.
 //! quickjs.c:56405-56947,57571-57653. Inputs borrow; successful Values own.
-import js_realm { Realm, Arguments, lendRealm, lendArguments }
+import js_realm { Realm, Arguments, lendArguments }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.core.option { Option }
 import silk.mem.pointer { Pointer }
+import silk.num.usize
+import silk.mem.layout { Layout }
+import js_heap_snapshot_graph { Graph, Strength }
 import runtime_memory { AllocationObserver }
 import js_heap { HeapCell, HeapHeader, HeapKind, CellRef }
 import js_core_types { RuntimeState, ContextState, ObjectData, ObjectPayload, ObjectPayloadFamily,
@@ -31,6 +34,7 @@ import js_object_allocate as objects
 import js_proxy_core as core
 import js_exceptions { JsException }
 import js_promise_callbacks as callbacks
+import js_invariant { invariant }
 
 pub interface PromiseHooks {
   /// Both Values and opaque are borrowed. The callback may reenter the engine.
@@ -42,10 +46,10 @@ pub const FULFILLED: i32 = 1
 // NativeFunctionHooks supplies captured data as a borrowed writable native range.
 // Mutate the backing slot, never the shared FrameSlots descriptor itself.
 pub unsafe fn setCapture(captured: &FrameSlots, index: usize, value: ValueBits) -> () {
-  unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(captured.data), index), value)
+  let mut slots = captured.* unsafe slots.write(index, value)
 }
 pub const REJECTED: i32 = 2
-struct Data { state: i32, handled: bool, result: Value, reactions: HeapList }
+struct Data { state: i32, handled: bool, result: Value, reactions: HeapList, asyncToken: usize, resolveNotified: bool }
 struct Resolved { already: bool }
 /// The flag a promise's two resolving functions share. Each function holds a count
 /// on the cell, and dropping the last count frees it.
@@ -70,6 +74,35 @@ impl Drop for SharedResolved {
 struct Resolving { promise: Value, resolved: Option<SharedResolved> }
 /// A promise with its resolving functions. Each field owns its count, so dropping a
 /// capability releases all three; move a field out to keep it.
+
+pub unsafe effect fn snapshot(graph: &mut Graph, owner: usize, reference: *mut HeapHeader, resolving: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  let anchor = ()
+  if resolving {
+    let data = unsafe HeapCell.payload<Resolving, ()>(&anchor, reference)
+    run unsafe graph.value(owner, data.promise.view(), b"promise", 0, Strength.Strong, usize.MAX)
+    match &data.resolved { Option<SharedResolved>.Some { value } => { run unsafe graph.edge(owner, value.cell.header(), b"alreadyResolved", 0, Strength.Strong, usize.MAX) } _ => () }
+    return
+  }
+  let data = unsafe HeapCell.payload<Data, ()>(&anchor, reference)
+  run unsafe graph.value(owner, data.result.view(), b"result", 0, Strength.Strong, usize.MAX)
+  let mut cursor = data.reactions.first let mut index: usize = 0
+  while true {
+    let job = match Pointer.nonNullMut<HeapHeader>(cursor) { Option<*mut HeapHeader>.Some { value } => value _ => { break } }
+    run unsafe graph.edge(owner, job, b"reaction", index, Strength.Strong, usize.MAX)
+    let child = run unsafe graph.node(job)
+    let entry = unsafe HeapCell.payload<JobEntry, ()>(&anchor, job)
+    run unsafe graph.optional(child, entry.realm, b"realm", 0, Strength.Strong, usize.MAX)
+    run unsafe graph.value(child, entry.asyncContext, b"asyncContext", 0, Strength.Strong, usize.MAX)
+    run unsafe graph.value(child, entry.asyncResource, b"asyncResource", 0, Strength.Strong, usize.MAX)
+    graph.backing(child, entry.arguments.capacity() * Layout.of<ValueBits>().bytes)
+    let mut argument: usize = 0
+    while argument < entry.arguments.length() {
+      run unsafe graph.value(child, entry.arguments.get(argument), b"argument", argument, Strength.Strong, usize.MAX)
+      argument = argument + 1
+    }
+    cursor = unsafe HeapCell.nextLinked(job) index = index + 1
+  }
+}
 pub struct Capability { pub promise: Value, pub resolve: Value, pub reject: Value }
 impl Capability {
   pub fn make() -> Self {
@@ -77,7 +110,6 @@ impl Capability {
       reject: Value.immediate(ValueBits.Undefined) }
   }
 }
-fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
 pub unsafe fn argument(argv: &FrameSlots, index: usize) -> ValueBits {
   if index >= argv.length() { return ValueBits.Undefined } return unsafe argv.get(index)
 }
@@ -89,31 +121,37 @@ unsafe fn storage(object: *mut HeapHeader) -> ?*mut HeapHeader {
     _ => invariant()
   }
 }
-unsafe fn node(promise: ValueBits) -> ?*mut HeapHeader {
-  if !promise.isObject() { return Pointer.null<HeapHeader>() }
-  let object = core.reference(promise)
-  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+fn node<'a>(promise: ValueRef<'a>) -> ?*mut HeapHeader {
+  if !promise.view().isObject() { return Pointer.null<HeapHeader>() }
+  let anchor = () let data = ObjectRef.of(promise).data(&anchor)
   if data.classId() != classes.JS_CLASS_PROMISE { return Pointer.null<HeapHeader>() }
-  drop data return unsafe storage(object)
+  return match &data.payload {
+    ObjectPayload.Opaque { reference, .. } => reference
+    ObjectPayload.Empty => Pointer.null<HeapHeader>()
+    _ => invariant()
+  }
 }
-unsafe fn required(promise: ValueBits) -> *mut HeapHeader {
-  return match Pointer.nonNullMut<HeapHeader>(unsafe node(promise)) {
+fn required<'a>(promise: ValueRef<'a>) -> *mut HeapHeader {
+  return match Pointer.nonNullMut<HeapHeader>(node(promise)) {
     Option<*mut HeapHeader>.Some { value } => value _ => invariant()
   }
 }
-pub unsafe fn state(promise: ValueBits) -> i32 {
-  let reference = match Pointer.nonNullMut<HeapHeader>(unsafe node(promise)) {
-    Option<*mut HeapHeader>.Some { value } => value _ => { return -1 }
-  }
-  let anchor = () let data = unsafe HeapCell.payload<Data, ()>(&anchor, reference)
-  return data.state
+fn asyncToken<'a>(promise: ValueRef<'a>) -> usize {
+  return match Record.find(promise) { Option<Record<'a>>.Some { value } => value.asyncToken() _ => 0 }
 }
-pub unsafe fn result(promise: ValueBits) -> ValueBits {
-  let reference = match Pointer.nonNullMut<HeapHeader>(unsafe node(promise)) {
+unsafe fn resolvingPromise(resolve: ValueBits) -> ValueBits {
+  if !resolve.isObject() { return ValueBits.Undefined }
+  let anchor = ()
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(resolve))
+  if object.classId() != classes.JS_CLASS_PROMISE_RESOLVE_FUNCTION { return ValueBits.Undefined }
+  drop object
+  let reference = match Pointer.nonNullMut<HeapHeader>(unsafe storage(core.reference(resolve))) {
     Option<*mut HeapHeader>.Some { value } => value _ => { return ValueBits.Undefined }
   }
-  let anchor = () let data = unsafe HeapCell.payload<Data, ()>(&anchor, reference)
-  return data.result.dup().intoBits()
+  let data = unsafe HeapCell.payload<Resolving, ()>(&anchor, reference)
+  let promise = data.promise.view()
+  drop data
+  return promise
 }
 /// A lent view of a Promise object's settlement record, valid while the promise lives.
 struct Record<'a> { node: CellRef<Data> }
@@ -121,13 +159,13 @@ impl<'a> Copy for Record<'a> {}
 impl<'a> Record<'a> {
   /// The record `promise` owns, or none when it is not a Promise object.
   fn find(promise: ValueRef<'a>) -> Option<Record<'a>> {
-    return match Pointer.nonNullMut<HeapHeader>(unsafe node(promise.view())) {
+    return match Pointer.nonNullMut<HeapHeader>(node(promise)) {
       Option<*mut HeapHeader>.Some { value } => Option<Record<'a>>.Some { value: Record<'a> { node: unsafe CellRef<Data>.of(value) } }
       _ => Option<Record<'a>>.None
     }
   }
   /// The record `promise` owns; it must be a Promise object.
-  fn of(promise: ValueRef<'a>) -> Record<'a> { return Record<'a> { node: unsafe CellRef<Data>.of(unsafe required(promise.view())) } }
+  fn of(promise: ValueRef<'a>) -> Record<'a> { return Record<'a> { node: unsafe CellRef<Data>.of(required(promise)) } }
   fn state(self: Record<'a>) -> i32 { let anchor = () let data = self.node.get(&anchor) return data.state }
   fn handled(self: Record<'a>) -> bool { let anchor = () let data = self.node.get(&anchor) return data.handled }
   fn setHandled(self: Record<'a>) -> () { let mut anchor = () let data = self.node.getMut(&mut anchor) data.handled = true }
@@ -147,6 +185,13 @@ impl<'a> Record<'a> {
   }
   fn subscribe(self: Record<'a>, reaction: *mut HeapHeader) -> () {
     let mut anchor = () let data = self.node.getMut(&mut anchor) unsafe data.reactions.pushBack(reaction)
+  }
+  fn asyncToken(self: Record<'a>) -> usize { let anchor = () let data = self.node.get(&anchor) return data.asyncToken }
+  fn setAsyncToken(self: Record<'a>, token: usize) -> () { let mut anchor = () let data = self.node.getMut(&mut anchor) data.asyncToken = token }
+  /// Marks the resolve notification sent; true the first time.
+  fn claimResolveNotification(self: Record<'a>) -> bool {
+    let mut anchor = () let data = self.node.getMut(&mut anchor)
+    let first = !data.resolveNotified data.resolveNotified = true return first
   }
   fn takeReaction(self: Record<'a>) -> Option<*mut HeapHeader> {
     let mut anchor = () let data = self.node.getMut(&mut anchor) return unsafe data.reactions.popFront()
@@ -207,11 +252,12 @@ unsafe fn markList(list: &HeapList, tracer: &mut Tracer) -> () {
   while true {
     let reference = match Pointer.nonNullMut<HeapHeader>(cursor) { Option<*mut HeapHeader>.Some { value } => value _ => { break } }
     let anchor = () let data = unsafe HeapCell.payload<JobEntry, ()>(&anchor, reference)
+    unsafe tracer.value(data.asyncContext)
+    unsafe tracer.value(data.asyncResource)
     let mut index: usize = 0
     while index < data.arguments.length() { unsafe tracer.value(data.arguments.get(index)) index = index + 1 }
     drop data
-    let header = unsafe Pointer.borrow<(), HeapHeader>(&anchor, reference)
-    cursor = header.next
+    cursor = unsafe HeapCell.nextLinked(reference)
   }
 }
 pub unsafe fn mark(object: *mut HeapHeader, tracer: &mut Tracer) -> () {
@@ -225,7 +271,10 @@ pub unsafe fn finalize<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, object:
   objectData.payload = ObjectPayload.Empty drop objectData
   let data = unsafe HeapCell.payloadMut<Data, ()>(&mut anchor, reference)
   let resultValue = data.result.take()
-  let reactions = Intrinsic.replace(data.reactions, HeapList.make()) drop data
+  let reactions = Intrinsic.replace(data.reactions, HeapList.make())
+  let token = data.asyncToken
+  drop data
+  if token != 0 { unsafe hooks.asyncDestroy(rt, token) }
   unsafe freeList(&mut hooks, rt, move reactions)
   unsafe gc.release(&mut hooks, rt, resultValue.intoBits()) unsafe HeapCell.destroyEmptied<Data>(reference)
 }
@@ -249,12 +298,28 @@ effect fn track<'a, 'b, H: PromiseHooks>(hooks: &mut H, realm: Realm<'a>, promis
   let opaque = runtimeData.promiseRejectionTracker.opaque drop runtimeData
   run unsafe hooks.promiseRejection(realm, callback, promise, reason, handled, opaque)
 }
-effect fn enqueue<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>, method: u32, arguments: &[ValueBits]) -> bool ? &mut Allocator { let context = realm.context()
-  let outcome = run Effect.result(unsafe jobs.enqueueJob(context, callbacks.id(method), arguments))
+/// Marks a host-consumed Promise handled without scheduling a reaction.
+pub effect fn markHandled<'a, 'b, H: PromiseHooks>(hooks: &mut H, realm: Realm<'a>, promise: ValueRef<'b>) -> () ? &mut Allocator {
+  let record = Record.of(promise)
+  let notify = record.state() == REJECTED && !record.handled()
+  record.setHandled()
+  if notify { run track(&mut hooks, realm, promise, record.settled(), true) }
+}
+effect fn enqueue<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>, method: u32, arguments: &[ValueBits]) -> bool ? &mut Allocator {
+  let outcome = run Effect.result(unsafe jobs.prepareJob(realm.runtime(), callbacks.id(method), arguments))
   return match move outcome {
-    Result<(), OutOfMemoryError>.Success { .. } => true
-    Result<(), OutOfMemoryError>.Failure { error } => {
-      let pending = run Effect.catch<JsException>(ops.materialize(&mut hooks,realm, move error), core.exceptionValue)
+    Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => {
+      let token = asyncToken(unsafe lendBits(&arguments, arguments[0]))
+      let mut anchor = ()
+      let entry = unsafe HeapCell.payloadMut<JobEntry, ()>(&mut anchor, value)
+      entry.asyncToken = token
+      entry.asyncResource = unsafe arguments[0].retained()
+      drop entry
+      unsafe jobs.enqueuePreparedJob(realm.context(), value)
+      true
+    }
+    Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => {
+      let pending = run Effect.catch<JsException>(ops.materialize(&mut hooks, realm, move error), core.exceptionValue)
       return false
     }
   }
@@ -287,8 +352,8 @@ effect fn createResolvingOne<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyH
   let prototype = ctx.functionPrototype drop ctx
   let mut classId = classes.JS_CLASS_PROMISE_RESOLVE_FUNCTION let mut family = ObjectPayloadFamily.PromiseResolve
   if reject { classId = classes.JS_CLASS_PROMISE_REJECT_FUNCTION family = ObjectPayloadFamily.PromiseReject }
-  let allocated = run Effect.result(objects.withPrototypeClass(&mut hooks, memory, realm, unsafe lendBits(&prototype, prototype), classId))
-  let object = match move allocated { Result<ValueBits, OutOfMemoryError>.Success { value } => unsafe Value.adoptBits(value) Result<ValueBits, OutOfMemoryError>.Failure { error } => run ops.materialize(&mut hooks,realm, move error) }
+  let allocated = run Effect.result(objects.newWithPrototypeClass(&mut hooks, memory, realm, unsafe lendBits(&prototype, prototype), classId))
+  let object = match move allocated { Result<Value, OutOfMemoryError>.Success { value } => move value Result<Value, OutOfMemoryError>.Failure { error } => run ops.materialize(&mut hooks,realm, move error) }
   let allocatedData = run Effect.result(HeapCell.allocate(HeapKind.Auxiliary, Resolving { promise: promise.dup(), resolved: Option<SharedResolved>.some(resolved.clone()) }))
   let reference = match move allocatedData {
     Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value
@@ -317,6 +382,10 @@ pub effect fn resolvingCall<'a, H: HeapHooks + CoercionHooks + PromiseHooks>(hoo
   if !first { return ValueBits.Undefined }
   // The resolving function holds `promise` until it is finalized.
   let target = unsafe lendFor<'a>(promise)
+  let record = Record.of(target)
+  let notify = record.claimResolveNotification()
+  let token = record.asyncToken()
+  if notify { run unsafe runtime.emitAsyncLifecycle(&mut hooks, realm.context(), 3, token, 0, promise, ValueBits.Undefined) }
   let objectData = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
   let reject = objectData.classId() == classes.JS_CLASS_PROMISE_REJECT_FUNCTION drop objectData
   let resolution = argumentsArgs.get(0).view() let rt = realm.runtime()
@@ -352,12 +421,20 @@ pub effect fn constructor<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHook
 effect fn constructBody<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + CallHooks>(hooks: &mut H,
   memory: &AllocationObserver, realm: Realm<'a>, object: ValueRef<'b>, executor: ValueRef<'b>) -> () ! JsException ? &mut Allocator {
   let allocated = run Effect.result(HeapCell.allocate(HeapKind.Auxiliary, Data { state: PENDING, handled: false,
-    result: Value.immediate(ValueBits.Undefined), reactions: HeapList.make() }))
+    result: Value.immediate(ValueBits.Undefined), reactions: HeapList.make(), asyncToken: 0, resolveNotified: false }))
   let reference = match move allocated { Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => run ops.materialize(&mut hooks,realm, move error) }
   let mut anchor = () let data = ObjectRef.of(object).dataMut(&mut anchor)
   data.payload = ObjectPayload.Opaque { family: ObjectPayloadFamily.Promise, reference: reference } drop data
-  let capability = run createResolvingFunctions(&mut hooks, memory, realm, object)
   let rt = realm.runtime()
+  let token = unsafe runtime.allocateAsyncToken(rt)
+  let promiseData = unsafe HeapCell.payloadMut<Data, ()>(&mut anchor, reference)
+  promiseData.asyncToken = token
+  drop promiseData
+  let state = realm.runtimeState(&anchor)
+  let parent = state.asyncPromiseParent
+  drop state
+  run unsafe runtime.emitAsyncLifecycle(&mut hooks, realm.context(), 0, token, asyncToken(unsafe lendBits(&parent, parent)), object.view(), parent)
+  let capability = run createResolvingFunctions(&mut hooks, memory, realm, object)
   let returned = run Effect.catch<JsException>(call(&mut hooks, realm, executor, immediateRef(ValueBits.Undefined), &[capability.resolve.view(), capability.reject.view()]), exceptionValue)
   if returned.view().isException() {
     let error = realm.takeException()
@@ -404,10 +481,16 @@ effect fn allocateReaction<'a, 'b, H: CoercionHooks>(hooks: &mut H, realm: Realm
   if !hooks.isCallable(realm, rejectHandler) { rejectHandler = immediateRef(ValueBits.Undefined) }
   // Reserve the eventual job before publishing the subscription. Settlement only
   // selects its handler, fills its result, and transfers the existing queue node.
-  let allocated = run Effect.result(unsafe jobs.prepareJob(callbacks.id(callbacks.REACTION_JOB),
+  let allocated = run Effect.result(unsafe jobs.prepareJob(realm.runtime(), callbacks.id(callbacks.REACTION_JOB),
     &[resolve.view(), reject.view(), fulfillHandler.view(), rejectHandler.view(), ValueBits.Undefined]))
   return match move allocated {
-    Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => value
+    Result<*mut HeapHeader, OutOfMemoryError>.Success { value } => {
+      let resource = unsafe resolvingPromise(resolve.view())
+      let mut anchor = () let entry = unsafe HeapCell.payloadMut<JobEntry, ()>(&mut anchor, value)
+      entry.asyncToken = asyncToken(unsafe lendBits(&resource, resource))
+      entry.asyncResource = unsafe resource.retained()
+      value
+    }
     Result<*mut HeapHeader, OutOfMemoryError>.Failure { error } => run ops.materialize(&mut hooks,realm, move error)
   }
 }
@@ -415,6 +498,13 @@ pub effect fn performThen<'a, 'b, H: HeapHooks + CoercionHooks + PromiseHooks>(h
   promise: ValueRef<'b>, onFulfilled: ValueRef<'b>, onRejected: ValueRef<'b>, resolve: ValueRef<'b>, reject: ValueRef<'b>) -> () ! JsException ? &mut Allocator {
   let record = Record.of(promise)
   let reaction = run allocateReaction(&mut hooks, realm, onFulfilled, onRejected, resolve, reject)
+  let mut jobAnchor = ()
+  let job = unsafe HeapCell.payloadMut<JobEntry, ()>(&mut jobAnchor, reaction)
+  if !job.asyncResource.isObject() {
+    job.asyncToken = asyncToken(promise)
+    job.asyncResource = promise.dup().intoBits()
+  }
+  drop job
   let settled = record.state()
   if settled == PENDING { record.subscribe(reaction) }
   else {
@@ -429,7 +519,10 @@ pub effect fn then<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + Pro
   if stateOf(promise) < 0 { return run ops.error(&mut hooks,realm, b"not a Promise") }
   let rt = realm.runtime()
   let ctor = run constructors.speciesConstructor(&mut hooks, realm, promise, immediateRef(ValueBits.Undefined))
-  let capability = run newCapability(&mut hooks, memory, realm, ctor.borrow())
+  let previousParent = unsafe runtime.swapAsyncPromiseParent(rt, promise.view())
+  let allocated = run Effect.result(newCapability(&mut hooks, memory, realm, ctor.borrow()))
+  let restoredParent = unsafe runtime.swapAsyncPromiseParent(rt, previousParent)
+  let capability = match move allocated { Result<Capability, JsException>.Success { value } => move value Result<Capability, JsException>.Failure { error } => { fail move error } }
   drop ctor
   run performThen(&mut hooks, realm, promise, onFulfilled, onRejected, capability.resolve.borrow(), capability.reject.borrow())
   return move capability.promise

@@ -17,8 +17,8 @@ import runtime_memory { AllocationObserver }
 import js_vm_state { Machine }
 import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
-import js_owned_value { lendBits, immediateRef, lendFor }
-import js_core_types { RuntimeState, FieldCacheEntry, FIELD_PASS_THROUGH, fieldCacheIndex, ContextState, ObjectData, ObjectPayload, ShapeData, ShapeProperty,
+import js_owned_value { lendBits, immediateRef, lendFor, Value }
+import js_core_types { RuntimeState, FieldCacheEntry, FIELD_PASS_THROUGH, FIELD_PROTO_KEY, fieldCacheIndex, ContextState, ObjectData, ObjectPayload, ShapeData, ShapeProperty,
   PropertySlot, SlotBits, NativeErrorKind, JS_PROP_TMASK, JS_PROP_GETSET, JS_PROP_WRITABLE, JS_PROP_LENGTH, JS_PROP_THROW_STRICT, JS_PROP_C_W_E, JS_PROP_CONFIGURABLE }
 import js_gc { HeapHooks }
 import js_gc as gc
@@ -118,7 +118,7 @@ unsafe effect fn getField<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + C
           Option<usize>.Some { value: index } => {
             let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
             if (u8.toU32(shape.properties.get(index).flags) & JS_PROP_TMASK) != 0 { break }
-            return unsafe data.properties.get(index).valueBits().retained()
+            return unsafe data.slot(index).valueBits().retained()
           }
           Option<usize>.None => ()
         }
@@ -147,7 +147,7 @@ pub unsafe fn lengthOperand<H: HeapHooks>(hooks: &mut H, machine: &mut Machine) 
       let classId = receiver.classId()
       // An Array's length is always its first own property, a plain data value.
       if classId == classes.JS_CLASS_ARRAY {
-        let length = receiver.properties.get(0).valueBits()
+        let length = receiver.slot(0).valueBits()
         drop receiver
         unsafe machine.set(1, length)
         unsafe gc.releaseObjectHeader(&mut hooks, machine.runtime, node)
@@ -184,7 +184,7 @@ unsafe fn typedLength<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, node: 
       let index = u32.toUsize(cursor - 1)
       let flags = u8.toU32((unsafe shapes.unchecked<ShapeProperty>(&shape.properties, index)).flags)
       if (flags & JS_PROP_TMASK) != JS_PROP_GETSET { return false }
-      if !unsafe typedRead.isLengthGetter((unsafe shapes.unchecked<SlotBits>(&data.properties, index)).getter()) { return false }
+      if !unsafe typedRead.isLengthGetter((unsafe data.slotUnchecked(index)).getter()) { return false }
       break
     }
     match Pointer.nonNullMut<HeapHeader>(shape.prototype) {
@@ -193,7 +193,7 @@ unsafe fn typedLength<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, node: 
     }
   }
   let count = unsafe typedRead.count(node)
-  let length = if count <= 0x7fffffff { ValueBits.Int { value: u32.wrappingToI32(count) } } else { ValueBits.number(u32.toF64(count)) }
+  let length = if count <= 0x7fffffff { ValueBits.Int { value: u64.toI32(count) } } else { ValueBits.number(u64.toF64(count)) }
   unsafe machine.set(1, length)
   unsafe gc.releaseObjectHeader(&mut hooks, machine.runtime, node)
   return true
@@ -219,7 +219,7 @@ pub unsafe fn readField(object: *mut HeapHeader, atom: u32, target: *mut ValueBi
       let property = unsafe shapes.unchecked<ShapeProperty>(&shape.properties, index)
       if property.atom == atom {
         if (u8.toU32(property.flags) & JS_PROP_TMASK) != 0 { return false }
-        let found = (unsafe shapes.unchecked<SlotBits>(&data.properties, index)).valueBits()
+        let found = (unsafe data.slotUnchecked(index)).valueBits()
         unsafe Pointer.write<ValueBits>(target, unsafe found.retained())
         return true
       }
@@ -249,7 +249,7 @@ unsafe fn readFieldFast(object: *mut HeapHeader, atom: u32, target: *mut ValueBi
     let index = u32.toUsize(cursor - 1)
     let property = unsafe shapes.unchecked<ShapeProperty>(&shape.properties, index)
     if property.atom == atom && (u8.toU32(property.flags) & JS_PROP_TMASK) == 0 {
-      let found = (unsafe shapes.unchecked<SlotBits>(&data.properties, index)).valueBits()
+      let found = (unsafe data.slotUnchecked(index)).valueBits()
       unsafe Pointer.write<ValueBits>(target, unsafe found.retained())
       return true
     }
@@ -273,51 +273,77 @@ unsafe fn lend(target: *mut ValueBits) -> () { if !unsafe gc.releaseIfShared(uns
 /// runs nothing before it is done with the value can skip).
 @inlineAlways
 unsafe fn readFieldCachedAs(machine: &Machine, object: *mut HeapHeader, target: *mut ValueBits, retain: bool) -> bool {
+  return unsafe readFieldCachedAt(machine.runtime, machine.ip, object, target, retain)
+}
+/// readFieldCachedAs for the get_field whose atom operand is at ip, in runtime.
+@inlineAlways
+pub unsafe fn readFieldCachedAt(runtime: *mut HeapHeader, ip: *const u8, object: *mut HeapHeader, target: *mut ValueBits, retain: bool) -> bool {
   let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
   let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
-  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)
-  let site = Pointer.address<u8>(machine.ip)
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let site = Pointer.address<u8>(ip)
   let slot = fieldCacheIndex(site)
-  let entry = state.fieldCache[slot]
-  if entry.site == site && u64.shiftRight(entry.key, 16) == shape.version {
-    if entry.protoKey == 0 {
-      let found = (unsafe shapes.unchecked<SlotBits>(&data.properties, u64.toUsize(entry.key & 0xffff))).valueBits()
-      if retain { unsafe Pointer.write<ValueBits>(target, unsafe found.retained()) } else { unsafe Pointer.write<ValueBits>(target, found) }
-      return true
-    }
-    // The version fixes the prototype, which a prototype entry has.
-    let holder = unsafe HeapCell.payload<ObjectData, ()>(&anchor, unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(shape.prototype))
-    let holderShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, holder.shape)
+  let entry = &state.fieldCache[slot]
+  let key = entry.key
+  if entry.site == site && u64.shiftRight(key, 16) == shape.version {
+    let found = (unsafe data.slotUnchecked(u64.toUsize(key & 0xffff))).valueBits()
+    if retain { unsafe Pointer.write<ValueBits>(target, unsafe found.retained()) } else { unsafe Pointer.write<ValueBits>(target, found) }
+    return true
+  }
+  if entry.site == site && u64.shiftRight(key, 16) == u64.shiftRight(FIELD_PROTO_KEY, 16) | shape.version {
+    let protoKey = entry.protoKey
     // An exotic object (a Proxy) may share an ordinary object's shape.
-    if u64.shiftRight(entry.protoKey, 16) == holderShape.version && (!data.isExotic() || unsafe fastArrayObject(object)) {
-      let index = entry.protoKey & 0xffff
-      if index != FIELD_PASS_THROUGH {
-        let found = (unsafe shapes.unchecked<SlotBits>(&holder.properties, u64.toUsize(index))).valueBits()
+    if !data.isExotic() || unsafe fastArrayObject(object) {
+      let epoch = state.shapeEpoch
+      // The version fixes the prototype chain's objects, and an unchanged epoch
+      // their shapes: the property is still where the walk last found it. The
+      // epoch starts at 1, so an entry's 0 never matches before holder is set.
+      if entry.epoch == epoch {
+        let known = unsafe HeapCell.payload<ObjectData, ()>(&anchor, unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(entry.holder))
+        let found = (unsafe known.slotUnchecked(entry.holderIndex)).valueBits()
         if retain { unsafe Pointer.write<ValueBits>(target, unsafe found.retained()) } else { unsafe Pointer.write<ValueBits>(target, found) }
         return true
       }
-      if unsafe readDeepCached(entry.midKey, entry.farKey, holderShape.prototype, target, retain) { return true }
+      // The version fixes the prototype, which a prototype entry has.
+      let holderCell = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(shape.prototype)
+      let holder = unsafe HeapCell.payload<ObjectData, ()>(&anchor, holderCell)
+      let holderShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, holder.shape)
+      if u64.shiftRight(protoKey, 16) == holderShape.version {
+        let mut owner = shape.prototype
+        let mut ownerIndex = u64.toUsize(protoKey & 0xffff)
+        if protoKey & 0xffff == FIELD_PASS_THROUGH { owner = unsafe findDeepCached(entry.midKey, entry.farKey, holderShape.prototype, &mut ownerIndex) }
+        match Pointer.nonNullMut<HeapHeader>(owner) {
+          Option<*mut HeapHeader>.Some { value } => {
+            let known = unsafe HeapCell.payload<ObjectData, ()>(&anchor, value)
+            let found = (unsafe known.slotUnchecked(ownerIndex)).valueBits()
+            if retain { unsafe Pointer.write<ValueBits>(target, unsafe found.retained()) } else { unsafe Pointer.write<ValueBits>(target, found) }
+            unsafe refreshPrototypeEntry(runtime, slot, epoch, value, ownerIndex)
+            return true
+          }
+          Option<*mut HeapHeader>.None => ()
+        }
+      }
     }
   }
   drop state
-  let atom = unsafe fieldAtom(machine)
+  let atom = unsafe fieldAtomAt(ip)
   let cursor = unsafe shapes.unchecked<u32>(&shape.hashIndices, u32.toUsize(atom & shape.propertyHashMask))
   if cursor != 0 {
     let index = u32.toUsize(cursor - 1)
     let property = unsafe shapes.unchecked<ShapeProperty>(&shape.properties, index)
     if property.atom == atom && (u8.toU32(property.flags) & JS_PROP_TMASK) == 0 {
-      let found = (unsafe shapes.unchecked<SlotBits>(&data.properties, index)).valueBits()
+      let found = (unsafe data.slotUnchecked(index)).valueBits()
       if retain { unsafe Pointer.write<ValueBits>(target, unsafe found.retained()) } else { unsafe Pointer.write<ValueBits>(target, found) }
       if index < 0x10000 {
         let mut stateAnchor = ()
-        let cache = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, machine.runtime)
-        cache.fieldCache[slot] = FieldCacheEntry { site: site, key: u64.shiftLeft(shape.version, 16) | usize.toU64(index), protoKey: 0, midKey: 0, farKey: 0 }
+        let cache = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
+        cache.fieldCache[slot] = FieldCacheEntry { site: site, key: u64.shiftLeft(shape.version, 16) | usize.toU64(index), protoKey: 0, midKey: 0, farKey: 0, epoch: 0, holder: Pointer.null<HeapHeader>(), holderIndex: 0 }
       }
       return true
     }
   }
   drop shape drop data
-  if !unsafe readPrototypeField(site, slot, machine.runtime, object, atom, target, cursor) { return false }
+  if !unsafe readPrototypeField(site, slot, runtime, object, atom, target, cursor) { return false }
   if !retain { unsafe lend(target) }
   return true
 }
@@ -338,11 +364,11 @@ unsafe fn readPrototypeField(site: usize, slot: usize, runtime: *mut HeapHeader,
       // An own data property further down its bucket (Math.min): read it and
       // refill the site's entry, which then skips the chain walk.
       if (u8.toU32(property.flags) & JS_PROP_TMASK) != 0 || index >= 0x10000 { return unsafe readInherited(object, atom, target, first) }
-      let found = (unsafe shapes.unchecked<SlotBits>(&data.properties, index)).valueBits()
+      let found = (unsafe data.slotUnchecked(index)).valueBits()
       unsafe Pointer.write<ValueBits>(target, unsafe found.retained())
       let mut stateAnchor = ()
       let cache = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
-      cache.fieldCache[slot] = FieldCacheEntry { site: site, key: u64.shiftLeft(shape.version, 16) | usize.toU64(index), protoKey: 0, midKey: 0, farKey: 0 }
+      cache.fieldCache[slot] = FieldCacheEntry { site: site, key: u64.shiftLeft(shape.version, 16) | usize.toU64(index), protoKey: 0, midKey: 0, farKey: 0, epoch: 0, holder: Pointer.null<HeapHeader>(), holderIndex: 0 }
       return true
     }
     cursor = property.hashNext
@@ -357,19 +383,19 @@ unsafe fn readPrototypeField(site: usize, slot: usize, runtime: *mut HeapHeader,
     let property = unsafe shapes.unchecked<ShapeProperty>(&holderShape.properties, index)
     if property.atom == atom {
       if (u8.toU32(property.flags) & JS_PROP_TMASK) != 0 || index >= 0x10000 { return unsafe readInherited(object, atom, target, first) }
-      let found = (unsafe shapes.unchecked<SlotBits>(&holder.properties, index)).valueBits()
+      let found = (unsafe holder.slotUnchecked(index)).valueBits()
       unsafe Pointer.write<ValueBits>(target, unsafe found.retained())
       let mut stateAnchor = ()
       let cache = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
-      cache.fieldCache[slot] = FieldCacheEntry { site: site, key: u64.shiftLeft(shape.version, 16),
-        protoKey: u64.shiftLeft(holderShape.version, 16) | usize.toU64(index), midKey: 0, farKey: 0 }
+      cache.fieldCache[slot] = FieldCacheEntry { site: site, key: u64.shiftLeft(shape.version, 16) | FIELD_PROTO_KEY,
+        protoKey: u64.shiftLeft(holderShape.version, 16) | usize.toU64(index), midKey: 0, farKey: 0, epoch: 0, holder: Pointer.null<HeapHeader>(), holderIndex: 0 }
       return true
     }
     cursor = property.hashNext
   }
   // Neither has a record for atom: the walk goes on from the prototype's own
   // prototype, two more levels of which the site cache can name.
-  let key = u64.shiftLeft(shape.version, 16)
+  let key = u64.shiftLeft(shape.version, 16) | FIELD_PROTO_KEY
   let protoKey = u64.shiftLeft(holderShape.version, 16) | FIELD_PASS_THROUGH
   let middle = holderShape.prototype
   let exotic = !unsafe namedPlain(&holder) || (holder.isExotic() && AtomTable.isInteger(atom))
@@ -386,12 +412,12 @@ unsafe fn readPrototypeField(site: usize, slot: usize, runtime: *mut HeapHeader,
       let at = i64.toUsize(index)
       let property = unsafe shapes.unchecked<ShapeProperty>(&objectShape.properties, at)
       if (u8.toU32(property.flags) & JS_PROP_TMASK) != 0 || usize.toU64(at) >= FIELD_PASS_THROUGH { return unsafe readInherited(prototype, atom, target, 0) }
-      let found = (unsafe shapes.unchecked<SlotBits>(&object.properties, at)).valueBits()
+      let found = (unsafe object.slotUnchecked(at)).valueBits()
       unsafe Pointer.write<ValueBits>(target, unsafe found.retained())
       keys[level] = u64.shiftLeft(objectShape.version, 16) | usize.toU64(at)
       let mut stateAnchor = ()
       let cache = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
-      cache.fieldCache[slot] = FieldCacheEntry { site: site, key: key, protoKey: keys[0], midKey: keys[1], farKey: keys[2] }
+      cache.fieldCache[slot] = FieldCacheEntry { site: site, key: key, protoKey: keys[0], midKey: keys[1], farKey: keys[2], epoch: 0, holder: Pointer.null<HeapHeader>(), holderIndex: 0 }
       return true
     }
     if !unsafe namedPlain(&object) || (object.isExotic() && AtomTable.isInteger(atom)) || Pointer.isNull<HeapHeader>(objectShape.prototype) { return unsafe readInherited(prototype, atom, target, 0) }
@@ -426,27 +452,34 @@ unsafe fn recordIndex(shape: &ShapeData, atom: u32) -> i64 {
   }
   return -1
 }
+/// Records that a prototype entry's walk found its property in holder's slot
+/// index at epoch (FieldCacheEntry.epoch).
+@inlineAlways
+unsafe fn refreshPrototypeEntry(runtime: *mut HeapHeader, slot: usize, epoch: u64, holder: *mut HeapHeader, index: usize) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  let entry = &mut state.fieldCache[slot]
+  entry.epoch = epoch entry.holder = holder entry.holderIndex = index
+}
 /// readFieldCached's hit on an entry past the prototype: middle is the
-/// prototype's prototype, fixed by the prototype's matching version. Reads the
-/// property when midKey (and farKey, when midKey passes through) still match.
+/// prototype's prototype, fixed by the prototype's matching version. The object
+/// holding the property (its slot in index) when midKey (and farKey, when midKey
+/// passes through) still match; null otherwise.
 @inlineNever
-unsafe fn readDeepCached(midKey: u64, farKey: u64, middle: ?*mut HeapHeader, target: *mut ValueBits, retain: bool) -> bool {
+unsafe fn findDeepCached(midKey: u64, farKey: u64, middle: ?*mut HeapHeader, index: &mut usize) -> ?*mut HeapHeader {
   let anchor = ()
   let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(middle))
   let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, object.shape)
-  if u64.shiftRight(midKey, 16) != shape.version { return false }
-  let index = midKey & 0xffff
-  if index != FIELD_PASS_THROUGH {
-    let found = (unsafe shapes.unchecked<SlotBits>(&object.properties, u64.toUsize(index))).valueBits()
-    if retain { unsafe Pointer.write<ValueBits>(target, unsafe found.retained()) } else { unsafe Pointer.write<ValueBits>(target, found) }
-    return true
+  if u64.shiftRight(midKey, 16) != shape.version { return Pointer.null<HeapHeader>() }
+  if midKey & 0xffff != FIELD_PASS_THROUGH {
+    index.* = u64.toUsize(midKey & 0xffff)
+    return middle
   }
   let far = unsafe HeapCell.payload<ObjectData, ()>(&anchor, unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(shape.prototype))
   let farShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, far.shape)
-  if u64.shiftRight(farKey, 16) != farShape.version { return false }
-  let found = (unsafe shapes.unchecked<SlotBits>(&far.properties, u64.toUsize(farKey & 0xffff))).valueBits()
-  if retain { unsafe Pointer.write<ValueBits>(target, unsafe found.retained()) } else { unsafe Pointer.write<ValueBits>(target, found) }
-  return true
+  if u64.shiftRight(farKey, 16) != farShape.version { return Pointer.null<HeapHeader>() }
+  index.* = u64.toUsize(farKey & 0xffff)
+  return shape.prototype
 }
 /// readField for an object whose own bucket for atom starts at cursor and whose
 /// first record (if any) was already checked: walks the rest of that chain, then
@@ -467,7 +500,7 @@ unsafe fn readInherited(object: *mut HeapHeader, atom: u32, target: *mut ValueBi
     let property = unsafe shapes.unchecked<ShapeProperty>(&shape.properties, index)
     if property.atom == atom {
       if (u8.toU32(property.flags) & JS_PROP_TMASK) != 0 { return false }
-      let found = (unsafe shapes.unchecked<SlotBits>(&data.properties, index)).valueBits()
+      let found = (unsafe data.slotUnchecked(index)).valueBits()
       unsafe Pointer.write<ValueBits>(target, unsafe found.retained())
       return true
     }
@@ -515,7 +548,7 @@ pub unsafe fn lookupField(object: *mut HeapHeader, atom: u32, target: *mut Value
       let property = unsafe shapes.unchecked<ShapeProperty>(&shape.properties, index)
       if property.atom == atom {
         if (u8.toU32(property.flags) & JS_PROP_TMASK) != 0 { return false }
-        let found = (unsafe shapes.unchecked<SlotBits>(&data.properties, index)).valueBits()
+        let found = (unsafe data.slotUnchecked(index)).valueBits()
         if retain { unsafe Pointer.write<ValueBits>(target, unsafe found.retained()) } else { unsafe Pointer.write<ValueBits>(target, found) }
         return true
       }
@@ -536,6 +569,11 @@ pub unsafe fn lookupField(object: *mut HeapHeader, atom: u32, target: *mut Value
   }
   return false
 }
+unsafe fn fieldAtomAt(ip: *const u8) -> u32 {
+  let mut atom: u32 = 0 let mut k: usize = 4
+  while k > 0 { k = k - 1 atom = u32.shiftLeft(atom, 8) | u8.toU32(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(ip), k))) }
+  return atom
+}
 unsafe fn fieldAtom(machine: &Machine) -> u32 {
   return u16.toU32(unsafe machine.peekU16()) | u32.shiftLeft(u16.toU32(unsafe machine.peekU16At(2)), 16)
 }
@@ -551,8 +589,8 @@ pub unsafe fn pushCellField(machine: &mut Machine, cell: *mut ValueBits) -> bool
   let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)
   let site = Pointer.address<u8>(machine.ip)
   let entry = state.fieldCache[fieldCacheIndex(site)]
-  if entry.site != site || entry.protoKey != 0 || u64.shiftRight(entry.key, 16) != shape.version { return false }
-  let found = (unsafe shapes.unchecked<SlotBits>(&data.properties, u64.toUsize(entry.key & 0xffff))).valueBits()
+  if entry.site != site || u64.shiftRight(entry.key, 16) != shape.version { return false }
+  let found = (unsafe data.slotUnchecked(u64.toUsize(entry.key & 0xffff))).valueBits()
   drop state drop shape drop data
   unsafe machine.push(unsafe found.retained())
   unsafe machine.skip(5)
@@ -571,7 +609,7 @@ pub unsafe fn pushCellLength(machine: &mut Machine, cell: *mut ValueBits) -> boo
       let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
       if data.classId() != classes.JS_CLASS_ARRAY { return false }
       // An Array's length is always its first own property, a plain number.
-      let length = data.properties.get(0).valueBits()
+      let length = data.slot(0).valueBits()
       drop data
       unsafe machine.push(length)
     }
@@ -587,6 +625,10 @@ pub unsafe effect fn cellLengthStep<H: HeapHooks + OwnPropertyHooks + GetPropert
   hooks: &mut H, memory: &AllocationObserver, machine: &mut Machine, cell: *mut ValueBits) -> ()
   ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
   unsafe machine.pushCopy(cell)
+  if (unsafe machine.top(1)).tag() == 4 && run unsafe factories.lazyArgumentsRead(&mut hooks, memory, &mut machine, op.OP_get_length) {
+    unsafe machine.skip(1)
+    return
+  }
   if !unsafe lengthOperand(&mut hooks, &mut machine) { drop run unsafe step(&mut hooks, memory, &mut machine, op.OP_get_length) }
   unsafe machine.skip(1)
 }
@@ -613,6 +655,11 @@ pub unsafe effect fn cellElementStep<H: HeapHooks + OwnPropertyHooks + GetProper
   ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
   unsafe machine.pushCopy(array)
   unsafe machine.pushCopy(index)
+  // A lazy arguments copy (var a = arguments; a[i]) answers from the frame.
+  if (unsafe machine.top(2)).tag() == 4 && run unsafe factories.lazyArgumentsRead(&mut hooks, memory, &mut machine, op.OP_get_array_el) {
+    unsafe machine.skip(2)
+    return
+  }
   match Pointer.nonNullMut<HeapHeader>(unsafe readElementOperand(&mut machine)) {
     Option<*mut HeapHeader>.Some { value } => { unsafe gc.releaseObjectHeader(&mut hooks, machine.runtime, value) }
     Option<*mut HeapHeader>.None => { drop run unsafe step(&mut hooks, memory, &mut machine, op.OP_get_array_el) }
@@ -753,8 +800,11 @@ pub unsafe fn pushFieldOperand(machine: &mut Machine) -> bool {
   unsafe machine.advance(1)
   return true
 }
+/// It leaves ip and stackTop alone: on true the arm steps over the atom and
+/// the pushed value on its registers, since a paired update here would reload
+/// both words in one 16-byte load over the arm's two 8-byte stores.
 @inlineNever
-pub unsafe fn pushStringFieldOperand(machine: &mut Machine) -> bool {
+pub unsafe fn pushStringFieldOperand(machine: &Machine) -> bool {
   let receiver = unsafe machine.top(1)
   let atom = unsafe fieldAtom(&machine.*)
   // Numbers and booleans have no own properties: every name starts at their
@@ -778,10 +828,7 @@ pub unsafe fn pushStringFieldOperand(machine: &mut Machine) -> bool {
     Option<*mut HeapHeader>.Some { value } => value
     Option<*mut HeapHeader>.None => { return false }
   }
-  if !unsafe readFieldCached(&machine.*, start, machine.stackTop) { return false }
-  unsafe machine.skip(4)
-  unsafe machine.advance(1)
-  return true
+  return unsafe readFieldCached(&machine.*, start, machine.stackTop)
 }
 @inlineAlways
 unsafe fn denseRead(object: ValueBits, key: ValueBits) -> Option<ValueBits> {
@@ -817,7 +864,7 @@ unsafe fn otherElement(node: *mut HeapHeader, index: u32) -> Option<ValueBits> {
     return Option<ValueBits>.none()
   }
   drop data
-  return unsafe typedRead.quickRead(node, index)
+  return unsafe typedRead.quickRead(node, u32.toU64(index))
 }
 /// get_array_el fast path: an in-bounds Int index into a fast Array, or an own
 /// index data property otherwise (step's quickIndexRead), replaces both operands
@@ -961,7 +1008,7 @@ unsafe fn appendElementOperand<H: HeapHooks>(hooks: &mut H, machine: &mut Machin
     _ => { return false }
   }
   if at != count || at >= capacity { return false }
-  let length = match data.properties.get(0).valueBits() {
+  let length = match data.slot(0).valueBits() {
     ValueBits.Int { value: length } => length
     _ => { return false }
   }
@@ -973,7 +1020,7 @@ unsafe fn appendElementOperand<H: HeapHooks>(hooks: &mut H, machine: &mut Machin
   if newLength > i32.toUsize(length) && !writable { return false }
   let mut changed = () let target = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut changed, node)
   if newLength > i32.toUsize(length) {
-    target.properties.set(0, SlotBits.value(ValueBits.Int { value: usize.toI32(newLength) }))
+    target.setSlot(0, SlotBits.value(ValueBits.Int { value: usize.toI32(newLength) }))
   }
   match &mut target.payload {
     ObjectPayload.FastArray { array } => { array.values.push(unsafe machine.top(1)) }
@@ -993,14 +1040,14 @@ unsafe fn writeTypedOperand<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, 
     ValueBits.Int { value } => value
     _ => { return unsafe writeTypedNumberOperand(&mut hooks, &mut machine, node, index) }
   }
-  if !unsafe typedWrite.quickWriteInt(node, index, integer) { return false }
+  if !unsafe typedWrite.quickWriteInt(node, u32.toU64(index), integer) { return false }
   unsafe machine.discard(3)
   unsafe gc.releaseObjectHeader(&mut hooks, machine.runtime, node)
   return true
 }
 @inlineNever
 unsafe fn writeTypedNumberOperand<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, node: *mut HeapHeader, index: u32) -> bool {
-  if !unsafe typedWrite.quickWrite(node, index, unsafe machine.top(1)) { return false }
+  if !unsafe typedWrite.quickWrite(node, u32.toU64(index), unsafe machine.top(1)) { return false }
   unsafe machine.discard(3)
   unsafe gc.releaseObjectHeader(&mut hooks, machine.runtime, node)
   return true
@@ -1024,9 +1071,9 @@ unsafe effect fn writeField<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeade
   let shapeAnchor = () let shape = unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, data.shape)
   let flags = u8.toU32((unsafe shapes.unchecked<ShapeProperty>(&shape.properties, index)).flags) drop shape
   if (flags & (JS_PROP_TMASK | JS_PROP_WRITABLE | JS_PROP_LENGTH)) != JS_PROP_WRITABLE { return false }
-  let old = (unsafe shapes.unchecked<SlotBits>(&data.properties, index)).valueBits()
+  let old = (unsafe data.slotUnchecked(index)).valueBits()
   // An object has a slot for each record of its shape.
-  unsafe data.properties.setUnchecked(index, SlotBits.value(unsafe Pointer.read<ValueBits>(source))) drop data
+  unsafe data.setSlotUnchecked(index, SlotBits.value(unsafe Pointer.read<ValueBits>(source))) drop data
   // The last reference goes out of line by header, so this function keeps no
   // ValueBits in memory and needs no stack frame.
   if old.tag() >= 0 { return true }
@@ -1057,7 +1104,7 @@ pub unsafe fn writeOwnField(node: *mut HeapHeader, atom: u32, source: *mut Value
   drop shape
   if property.atom != atom { return false }
   if (u8.toU32(property.flags) & (JS_PROP_TMASK | JS_PROP_WRITABLE | JS_PROP_LENGTH)) != JS_PROP_WRITABLE { return false }
-  let old = (unsafe shapes.unchecked<SlotBits>(&data.properties, index)).valueBits()
+  let old = (unsafe data.slotUnchecked(index)).valueBits()
   if old.tag() < 0 {
     match ValueBits.heapReference(&old) {
       Option<*mut HeapHeader>.Some { value: reference } => {
@@ -1069,7 +1116,7 @@ pub unsafe fn writeOwnField(node: *mut HeapHeader, atom: u32, source: *mut Value
       Option<*mut HeapHeader>.None => ()
     }
   }
-  unsafe data.properties.setUnchecked(index, SlotBits.value(unsafe Pointer.read<ValueBits>(source)))
+  unsafe data.setSlotUnchecked(index, SlotBits.value(unsafe Pointer.read<ValueBits>(source)))
   return true
 }
 /// addField's verified-memo case in a frame of its own: a leaf with no spills
@@ -1090,7 +1137,7 @@ unsafe effect fn addFieldQuick<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHe
 @inlineNever
 unsafe effect fn growForVerifiedAdd(runtime: *mut HeapHeader, node: *mut HeapHeader, atom: u32) -> bool ? &mut Allocator {
   let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
-  if !unsafe addsInPlace(&data) || data.properties.length() < data.properties.capacity() { return false }
+  if !unsafe addsInPlace(&data) || data.slotCount() < data.slotCapacity() { return false }
   let index = unsafe shapes.verifiedAddIndex(runtime, data.shape, atom)
   if index == usize.MAX { return false }
   let stateAnchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&stateAnchor, runtime)
@@ -1119,7 +1166,7 @@ unsafe effect fn putArrayLength<H: HeapHooks>(hooks: &mut H, machine: &Machine, 
   let array = data.classId() == classes.JS_CLASS_ARRAY drop data
   if requested < 0 || !array { return false }
   if unsafe arrayStorage.truncatePlain(node, i32.toU32(requested)) { return true }
-  if !unsafe arraySupport.writableLength(object) { return false }
+  if !arraySupport.writableLength(unsafe lendFor(object)) { return false }
   // A refusal (allocation, or a non-configurable element that stops a sparse
   // array's truncation) repeats the store on the generic path, which reports it;
   // the repeat finds nothing more to delete.
@@ -1138,8 +1185,8 @@ unsafe fn putFieldFast<H: HeapHooks>(hooks: &mut H, machine: &Machine, object: V
   let shapeAnchor = () let shape = unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, data.shape)
   let flags = u8.toU32((unsafe shapes.unchecked<ShapeProperty>(&shape.properties, index)).flags) drop shape
   if (flags & (JS_PROP_TMASK | JS_PROP_WRITABLE | JS_PROP_LENGTH)) != JS_PROP_WRITABLE { return false }
-  let old = (unsafe shapes.unchecked<SlotBits>(&data.properties, index)).valueBits()
-  unsafe data.properties.setUnchecked(index, SlotBits.value(value)) drop data
+  let old = (unsafe data.slotUnchecked(index)).valueBits()
+  unsafe data.setSlotUnchecked(index, SlotBits.value(value)) drop data
   unsafe gc.release(&mut hooks, machine.runtime, old)
   return true
 }
@@ -1188,7 +1235,7 @@ unsafe effect fn putFieldAdd<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHead
     AddResult result => move result
     AddFailed { .. } => { return false }
   }
-  target.properties.set(added.index, SlotBits.value(value)) drop target
+  target.setSlot(added.index, SlotBits.value(value)) drop target
   // base is still alive here: retired (if it is) only below.
   if depth <= 3 { unsafe shapes.noteVerified(runtime, base, baseVersion, atom, u32.toU8(JS_PROP_C_W_E), depth, chain) }
   unsafe gc.retireShape(&mut hooks, runtime, added.retiredShape)
@@ -1237,7 +1284,7 @@ unsafe fn quickAddFill(runtime: *mut HeapHeader, site: usize, node: *mut HeapHea
   drop data
   if site != 0 {
     let mut cacheAnchor = () let cache = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut cacheAnchor, runtime)
-    cache.fieldCache[fieldCacheIndex(site)] = FieldCacheEntry { site: site, key: usize.toU64(index), protoKey: FIELD_ADD_ENTRY, midKey: 0, farKey: 0 }
+    cache.fieldCache[fieldCacheIndex(site)] = FieldCacheEntry { site: site, key: usize.toU64(index), protoKey: FIELD_ADD_ENTRY, midKey: 0, farKey: 0, epoch: 0, holder: Pointer.null<HeapHeader>(), holderIndex: 0 }
   }
   return true
 }
@@ -1309,7 +1356,7 @@ unsafe effect fn putArrayFast<H: HeapHooks>(hooks: &mut H, machine: &Machine, ob
   if at >= count {
     if at != count || !data.fastArray() { return false }
     // An Array's length is its first slot, always a data property.
-    let length = match data.properties.get(0).valueBits() {
+    let length = match data.slot(0).valueBits() {
       ValueBits.Int { value: length } => length
       _ => { return false }
     }
@@ -1321,7 +1368,7 @@ unsafe effect fn putArrayFast<H: HeapHooks>(hooks: &mut H, machine: &Machine, ob
     if newLength > i32.toUsize(length) && !writable { return false }
     let mut changed = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut changed, node)
     if newLength > i32.toUsize(length) {
-      data.properties.set(0, SlotBits.value(ValueBits.Int { value: usize.toI32(newLength) }))
+      data.setSlot(0, SlotBits.value(ValueBits.Int { value: usize.toI32(newLength) }))
     }
     match &mut data.payload {
       // A full array grows here too, as the source's add_fast_array_element does.
@@ -1407,7 +1454,7 @@ unsafe effect fn quickDelete<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHead
   let flags = u8.toU32((unsafe shapes.unchecked<ShapeProperty>(&records.properties, index)).flags)
   drop records
   if (flags & (JS_PROP_TMASK | JS_PROP_CONFIGURABLE)) != JS_PROP_CONFIGURABLE { return false }
-  let old = (unsafe shapes.unchecked<SlotBits>(&data.properties, index)).valueBits()
+  let old = (unsafe data.slotUnchecked(index)).valueBits()
   if unsafe shapes.deleteUnshared(runtime, &mut data, atom, index) { run unsafe shapes.compactAfterDelete(&mut data) }
   drop data
   unsafe gc.release(&mut hooks, runtime, old)
@@ -1523,7 +1570,7 @@ pub unsafe effect fn step<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + H
     }
     if !stored {
       unsafe machine.publishPc()
-      let result = run Effect.result(unsafe mutations.setPropertyValue(&mut hooks, unsafe lendRealm(&machine.context, machine.context), unsafe lendBits(&object, object), key, value, JS_PROP_THROW_STRICT))
+      let result = run Effect.result(mutations.setPropertyValue(&mut hooks, unsafe lendRealm(&machine.context, machine.context), unsafe lendBits(&object, object), unsafe Value.adoptBits(key), unsafe Value.adoptBits(value), JS_PROP_THROW_STRICT))
       failure = run unsafe failed(&mut hooks, machine.context, move result)
     }
     unsafe gc.release(&mut hooks, machine.runtime, object) unsafe machine.discard(3)

@@ -7,12 +7,14 @@ import silk.mem.pointer { Pointer }
 import silk.num.f64
 import silk.num.i64
 import silk.num.usize
+import silk.mem.layout { Layout }
+import js_heap_snapshot_graph { Graph, Strength }
 import silk.collections.list { List }
 import silk.core.ownership { Copy }
 import js_heap { HeapCell, HeapHeader, HeapKind }
 import js_value { ValueBits }
 import js_intl_realm as ops
-import js_realm { Realm, lendRealm, Arguments, lendArguments }
+import js_realm { Realm, Arguments }
 import js_owned_value { Value, ValueRef, lendBits, lendFor, immediateRef }
 import js_object_ref { ObjectRef }
 import js_core_types { ObjectData, ObjectPayload, ObjectPayloadFamily, FrameSlots, ValueSlots, NativeErrorKind }
@@ -36,11 +38,32 @@ import js_array_construction as arrays
 import js_iterator_intrinsics_support as support
 import js_exceptions { JsException }
 import runtime_memory { AllocationObserver }
+import js_invariant { present }
 
 struct Helper {
   object: Value, next: Value, function: Value, inner: Value, innerNext: Value,
   buffer: Option<ValueSlots>, buffered: usize, count: i64, kind: i32,
   executing: bool, done: bool, allowPartial: bool
+}
+
+pub unsafe effect fn snapshot(graph: &mut Graph, owner: usize, reference: *mut HeapHeader) -> () ! OutOfMemoryError ? &mut Allocator {
+  let anchor = () let data = unsafe HeapCell.payload<Helper, ()>(&anchor, reference)
+  run unsafe graph.value(owner, data.object.view(), b"iterator", 0, Strength.Strong, usize.MAX)
+  run unsafe graph.value(owner, data.next.view(), b"next", 0, Strength.Strong, usize.MAX)
+  run unsafe graph.value(owner, data.function.view(), b"function", 0, Strength.Strong, usize.MAX)
+  run unsafe graph.value(owner, data.inner.view(), b"inner", 0, Strength.Strong, usize.MAX)
+  run unsafe graph.value(owner, data.innerNext.view(), b"innerNext", 0, Strength.Strong, usize.MAX)
+  match &data.buffer {
+    Option<ValueSlots>.Some { value } => {
+      graph.backing(owner, value.length() * Layout.of<ValueBits>().bytes)
+      let mut index: usize = 0
+      while index < data.buffered {
+        run unsafe graph.value(owner, value.get(index), b"buffer", index, Strength.Strong, usize.MAX)
+        index = index + 1
+      }
+    }
+    _ => ()
+  }
 }
 unsafe fn storage(object: *mut HeapHeader) -> ?*mut HeapHeader {
   let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
@@ -48,9 +71,6 @@ unsafe fn storage(object: *mut HeapHeader) -> ?*mut HeapHeader {
     ObjectPayload.Opaque { family: ObjectPayloadFamily.IteratorHelper, reference } => reference
     _ => Pointer.null<HeapHeader>()
   }
-}
-unsafe fn node(pointer: ?*mut HeapHeader) -> *mut HeapHeader {
-  return unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(pointer)
 }
 /// The helper state an iterator helper object owns, lent for as long as the object.
 struct State<'a> { node: *mut HeapHeader }
@@ -125,7 +145,7 @@ effect fn createBody<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + G
       if !partial && !text(bytes.asSlice(), b"only-full") { return run ops.error(&mut h,realm, b"bad undersized option") }
     }
   } else if kind == 1 || kind == 9 {
-    let converted = run Effect.result(unsafe integers.toInt64SatF(&mut h, realm, &mut count, arg))
+    let converted = run Effect.result(integers.toInt64SatF(&mut h, realm, &mut count, unsafe lendFor(arg)))
     let flags = match move converted {
       Result<u8, OutOfMemoryError | StringLengthError | JsException>.Success { value } => value
       Result<u8, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => run ops.materialize(&mut h,realm, move error)
@@ -142,7 +162,7 @@ effect fn createBody<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + G
   let method = run owners.get(&mut h, realm, receiver, atoms.JS_ATOM_next)
   let object = run constructors.create(&mut h, m, realm, immediateRef(ValueBits.Undefined), classes.JS_CLASS_ITERATOR_HELPER)
   let allocated = run Effect.result(HeapCell.allocate(HeapKind.Auxiliary, Helper {
-    object: unsafe Value.retain(receiver.view()), next: move method, function: unsafe Value.retain(function),
+    object: receiver.dup(), next: move method, function: unsafe Value.retain(function),
     inner: Value.immediate(ValueBits.Undefined), innerNext: Value.immediate(ValueBits.Undefined),
     buffer: Option<ValueSlots>.none(), buffered: 0, count: count, kind: kind, executing: false, done: false, allowPartial: partial
   }))
@@ -230,14 +250,13 @@ effect fn step<'a, 's, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetProp
       let item = match move advanced {
         Result<Value, JsException>.Success { value } => move value
         Result<Value, JsException>.Failure { error } => {
-          let ignored = run Effect.result(owners.close(&mut h, realm, unsafe lendBits(&currentInner, currentInner), false))
+          // A throwing inner step closes only the underlying iterator.
           clearInner(&mut h, realm, state) run closeFailure(&mut h, realm, object) fail move error
         }
       }
       if !done { return NativeIteratorResult { value: item.intoBits(), done: 0 } }
       drop item
-      // Source intentionally ignores the close result here, retaining its pending exception.
-      let ignored = run Effect.result(owners.close(&mut h, realm, unsafe lendBits(&currentInner, currentInner), false))
+      // An exhausted inner iterator is dropped without being closed.
       clearInner(&mut h, realm, state)
       continue
     }
@@ -291,15 +310,15 @@ effect fn step<'a, 's, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetProp
     // arrays) costs ~0.6% on an iterator-helper loop through the drain queue.
     unsafe item.release(&mut h, realm.runtime())
     if kind == 7 { return NativeIteratorResult { value: mapped.intoBits(), done: 0 } }
-    let mut innerMethod = ValueBits.Undefined
+    let mut innerMethod = Value.immediate(ValueBits.Undefined)
     let flattened = run Effect.result(support.flattenable(&mut h, realm, mapped.borrow(), &mut innerMethod, false))
     unsafe mapped.release(&mut h, realm.runtime())
     let iterator = match move flattened {
-      Result<ValueBits, JsException>.Success { value } => value
-      Result<ValueBits, JsException>.Failure { error } => { run closeFailure(&mut h, realm, object) fail move error }
+      Result<Value, JsException>.Success { value } => move value
+      Result<Value, JsException>.Failure { error } => { run closeFailure(&mut h, realm, object) fail move error }
     }
     let flattenedState = state.data(&mut h)
-    flattenedState.inner = unsafe Value.adoptBits(iterator) flattenedState.innerNext = unsafe Value.adoptBits(innerMethod)
+    flattenedState.inner = move iterator flattenedState.innerNext = move innerMethod
   }
 }
 pub effect fn next<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(
@@ -335,14 +354,14 @@ pub effect fn next<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + Get
 }
 pub unsafe fn mark(object: *mut HeapHeader, tracer: &mut Tracer) -> () {
   let optional = unsafe storage(object) if Pointer.isNull<HeapHeader>(optional) { return }
-  let anchor = () let it = unsafe HeapCell.payload<Helper, ()>(&anchor, unsafe node(optional))
+  let anchor = () let it = unsafe HeapCell.payload<Helper, ()>(&anchor, present(optional))
   unsafe tracer.value(it.object.view()) unsafe tracer.value(it.next.view()) unsafe tracer.value(it.function.view())
   unsafe tracer.value(it.inner.view()) unsafe tracer.value(it.innerNext.view())
   match &it.buffer { Option<ValueSlots>.Some { value } => { let mut i: usize = 0 while i < it.buffered { unsafe tracer.value(value.get(i)) i = i + 1 } } _ => () }
 }
 pub unsafe fn finalize<H: HeapHooks>(h: &mut H, rt: *mut HeapHeader, object: *mut HeapHeader) -> () {
   let optional = unsafe storage(object) if Pointer.isNull<HeapHeader>(optional) { return }
-  let state = unsafe node(optional) let mut anchor = ()
+  let state = present(optional) let mut anchor = ()
   let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, object) data.payload = ObjectPayload.Empty drop data
   let it = unsafe HeapCell.payload<Helper, ()>(&anchor, state)
   match &it.buffer { Option<ValueSlots>.Some { value } => { let mut i = it.buffered while i > 0 { i = i - 1 unsafe gc.release(&mut h, rt, value.get(i)) } } _ => () }

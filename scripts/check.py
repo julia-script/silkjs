@@ -89,7 +89,10 @@ def main():
     for script, flags in UPSTREAM:
         ok &= step(f'upstream {script}', [str(binary), *flags, script], cwd=ROOT / 'tests/upstream')
     for script in sorted((ROOT / 'tests/silkjs').glob('*.js')):
-        ok &= step(f'silkjs {script.name}', [str(binary), script.name], cwd=ROOT / 'tests/silkjs')
+        # A first line `// flags: ...` passes those qjs arguments (e.g. --experimental for Intl).
+        first = script.read_text().split('\n', 1)[0]
+        flags = first.removeprefix('// flags:').split() if first.startswith('// flags:') else []
+        ok &= step(f'silkjs {script.name}', [str(binary), *flags, script.name], cwd=ROOT / 'tests/silkjs')
     if not args.skip_bench:
         ok &= step('benchmark outputs', [sys.executable, 'scripts/bench.py', '--binary', str(binary),
                                          '--skip-micro', '--runs', '1'])

@@ -1,8 +1,12 @@
 //! Stable-frame layout, initialization and teardown for JS_CallInternal.
 //! Native stack allocation itself stays in the interpreter entry function: a
 //! helper must never return alloca storage from its own native activation.
+import silk.core.ownership { Copy }
+import js_compiler_types { PendingFunction }
+import silk.mem.box { Box }
 import silk.num.u8
 import silk.mem.layout { Layout }
+import silk.mem.raw_buffer { RawBuffer }
 import silk.core.option { Option }
 import silk.mem.pointer { Pointer }
 import silk.num.u16
@@ -13,6 +17,8 @@ import js_core_types { NO_SP, FunctionBytecode, ObjectData, ObjectPayload, Frame
 import js_gc { HeapHooks, FrameCaptures }
 import js_gc as gc
 import js_vm_state { Machine, copyCell }
+import js_debugger as debugger
+import js_debugger_types { Activation as DebugActivation }
 
 pub const COPY_ARGUMENTS: u32 = 2
 pub struct Description {
@@ -70,6 +76,16 @@ pub unsafe fn describe(function: ValueBits, emptyValue: *mut ValueBits,
     copiedArguments: copied, values: values, allocationSlots: slots, bytes: slots * slotBytes }
 }
 fn trap() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+/// The bytecode cell behind a bytecode function object while it is still a
+/// stub (js_compiler_finish.defer), else null.
+pub unsafe fn pendingBytecode(function: ValueBits) -> ?*mut HeapHeader {
+  let object = match function { ValueBits.Object { reference } => reference _ => trap() }
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  let bytecode = match &data.payload { ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode _ => trap() }
+  drop data
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  return match &code.pending { Option<Box<PendingFunction>>.Some { .. } => bytecode _ => Pointer.null<HeapHeader>() }
+}
 
 /// Returns a borrowed pointer, never an ownership transfer.
 pub unsafe fn data(slots: &FrameSlots, empty: *mut ValueBits) -> *mut ValueBits {
@@ -90,7 +106,9 @@ pub unsafe fn enter(description: &Description, storage: *mut ValueBits,
   function: ValueBits, originalArguments: &FrameSlots, previous: ?*mut StackFrame, runtime: *mut HeapHeader,
   callerContext: *mut HeapHeader, receiver: ValueBits, newTarget: ValueBits, empty: *mut ValueBits) -> Entry {
   let views = unsafe prepare(description, storage, originalArguments, empty)
-  return Entry { frame: stackFrame(description, &views, function, previous),
+  let mut frame = stackFrame(description, &views, function, previous)
+  frame.thisValue = receiver frame.newTarget = newTarget
+  return Entry { frame: move frame,
     machine: calleeMachine(description, &views, runtime, callerContext, function,
       unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut StackFrame>(storage), Pointer.fromRef<FrameSlots>(originalArguments),
       originalArguments.length(), receiver, newTarget, Pointer.null<u8>()) }
@@ -153,6 +171,7 @@ unsafe fn prepare(description: &Description, storage: *mut ValueBits, originalAr
 @inlineAlways
 fn stackFrame(description: &Description, views: &Views, function: ValueBits, previous: ?*mut StackFrame) -> StackFrame {
   return StackFrame { previous: previous, asyncOwner: Pointer.null<HeapHeader>(), currentFunction: function,
+    debuggerId: 0, thisValue: ValueBits.Undefined, newTarget: ValueBits.Undefined,
     arguments: FrameSlots { data: views.arguments, count: views.count },
     locals: FrameSlots { data: views.locals, count: description.locals },
     stack: FrameSlots { data: views.stack, count: description.stack },
@@ -177,7 +196,9 @@ fn calleeMachine(description: &Description, views: &Views, runtime: *mut HeapHea
 pub unsafe fn machine(description: &Description, runtime: *mut HeapHeader, callerContext: *mut HeapHeader,
   frame: *mut StackFrame, originalArguments: &FrameSlots, receiver: ValueBits, newTarget: ValueBits,
   empty: *mut ValueBits, pc: usize, sp: usize) -> Machine {
-  let anchor = () let activation = unsafe Pointer.borrow<(), StackFrame>(&anchor, frame)
+  let mut anchor = () let activation = unsafe Pointer.borrowMut<(), StackFrame>(&mut anchor, frame)
+  activation.thisValue = receiver
+  activation.newTarget = newTarget
   let stackData = unsafe data(&activation.stack, empty)
   return Machine { context: description.realm, callerContext: callerContext, runtime: runtime,
     bytecode: description.bytecode, frame: frame,
@@ -211,10 +232,12 @@ unsafe fn releaseSlots<H: HeapHooks>(hooks: &mut H, copiedArguments: usize, loca
 /// instead of waiting for a cycle collection.
 @inlineNever
 unsafe fn releaseCapturingSlots<H: HeapHooks>(hooks: &mut H, copiedArguments: usize, locals: usize, activation: &Machine) -> () {
+  unsafe gc.dropFrameClosures(&mut hooks, activation.runtime, activation.frame)
   let mut captures = FrameCaptures.make()
   unsafe gc.detachFrameCaptures(&mut hooks, activation.runtime, activation.frame, &mut captures)
   unsafe releaseOwnSlots(&mut hooks, copiedArguments, locals, activation)
-  unsafe gc.releaseFrameCycles(&mut hooks, activation.runtime, &mut captures)
+  // Most frames' local closures already died in dropFrameClosures, leaving no cells.
+  if !captures.isEmpty() { unsafe gc.releaseFrameCycles(&mut hooks, activation.runtime, &mut captures) }
 }
 @inlineAlways
 unsafe fn releaseOwnSlots<H: HeapHooks>(hooks: &mut H, copiedArguments: usize, locals: usize, activation: &Machine) -> () {
@@ -250,6 +273,7 @@ pub struct InlineTail {
   /// The caller's operand cell holding the callee (the receiver for a method
   /// call), the first operand released when the call completes.
   pub first: *mut ValueBits,
+  pub observation: DebugActivation,
 }
 @inlineAlways
 fn slotsFor(bytes: usize) -> usize {
@@ -281,21 +305,40 @@ unsafe fn slotAt(base: *mut ValueBits, index: usize) -> *mut ValueBits {
 pub unsafe fn enterInline(runtime: *mut HeapHeader, function: ValueBits, arguments: FrameSlots, first: *mut ValueBits,
   caller: *mut Machine, callerContext: *mut HeapHeader, receiver: ValueBits, newTarget: ValueBits, construct: bool,
   copy: bool) -> Option<*mut Machine> {
+  let callee = unsafe calleeOf(function)
+  return unsafe enterDecoded(runtime, function, callee, arguments, first, caller, callerContext, receiver, newTarget, construct, copy)
+}
+/// A bytecode function's object and FunctionBytecode, read once per call
+/// (enterDecoded); its closure reference table is read only once a frame is entered.
+pub struct Callee { pub object: *mut HeapHeader, pub bytecode: *mut HeapHeader }
+impl Copy for Callee {}
+/// function's Callee; function must be a bytecode function.
+@inlineAlways
+pub unsafe fn calleeOf(function: ValueBits) -> Callee {
   let object = match function { ValueBits.Object { reference } => reference _ => trap() }
   let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  let bytecode = match &data.payload { ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode _ => trap() }
+  return Callee { object: object, bytecode: bytecode }
+}
+/// enterInline once the callee is decoded (calleeOf with the same caller).
+@inlineAlways
+pub unsafe fn enterDecoded(runtime: *mut HeapHeader, function: ValueBits, decoded: Callee, arguments: FrameSlots, first: *mut ValueBits,
+  caller: *mut Machine, callerContext: *mut HeapHeader, receiver: ValueBits, newTarget: ValueBits, construct: bool,
+  copy: bool) -> Option<*mut Machine> {
+  let anchor = ()
   // Empty tables point at the caller's machine: aligned, non-null, never read
   // and live for the whole call.
   let empty = unsafe Intrinsic.pointerReinterpret<*mut Machine, *mut ValueBits>(caller)
   let mut closureReferences = unsafe Intrinsic.pointerRequalify<*mut ?*mut HeapHeader, *const ?*mut HeapHeader>(unsafe Intrinsic.pointerReinterpret<*mut Machine, *mut ?*mut HeapHeader>(caller))
-  let mut bytecode = object
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, decoded.object)
   match &data.payload {
     ObjectPayload.BytecodeFunction { function: closure } => {
       if closure.varRefs.length() != 0 { closureReferences = Pointer.fromRef<?*mut HeapHeader>(&closure.varRefs.asSlice()[0]) }
-      bytecode = closure.bytecode
     }
     _ => trap()
   }
   drop data
+  let bytecode = decoded.bytecode
   let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
   let count = arguments.length()
   let declared = u16.toUsize(code.argumentCount)
@@ -352,6 +395,7 @@ pub unsafe fn enterInline(runtime: *mut HeapHeader, function: ValueBits, argumen
   let localView = locals
   let stackView = stack
   unsafe Pointer.put<StackFrame>(frame, StackFrame { previous: previous, asyncOwner: Pointer.null<HeapHeader>(), currentFunction: function,
+    debuggerId: 0, thisValue: receiver, newTarget: newTarget,
     arguments: FrameSlots { data: argumentData, count: argumentCount },
     locals: FrameSlots { data: locals, count: localCount },
     stack: FrameSlots { data: stack, count: stackCount },
@@ -360,8 +404,7 @@ pub unsafe fn enterInline(runtime: *mut HeapHeader, function: ValueBits, argumen
     stackPointer: NO_SP })
   let mut original = arguments
   if copy { original = FrameSlots { data: storage, count: count } }
-  unsafe Pointer.put<InlineTail>(tail, InlineTail { caller: caller, arguments: original, first: first })
-  let start = unsafe code.code.pointerAt(0)
+  let start = unsafe code.code.start()
   let mut ip = start
   // A method's `push_this put_locK` prologue runs here for an object receiver
   // (push_this needs no conversion then): one dispatch round less per call.
@@ -384,6 +427,25 @@ pub unsafe fn enterInline(runtime: *mut HeapHeader, function: ValueBits, argumen
   callee.ip = ip callee.stackTop = stackView
   callee.record = unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(unsafe Intrinsic.pointerReinterpret<*mut InlineTail, *mut u8>(tail)), boolToUsize(construct))
   drop callee
+  drop code
+  // Debugger activations are kept only while instructions are observed: an
+  // unobserved frame stores just tracked = false, and adoptFrames links it in
+  // when observation turns on.
+  let flagAnchor = () let observed = (unsafe HeapCell.payload<RuntimeState, ()>(&flagAnchor, runtime)).observeInstructions
+  if observed {
+    let calleeView = unsafe Pointer.borrow<(), Machine>(&anchor, machine)
+    let observation = unsafe debugger.enter(&calleeView)
+    drop calleeView
+    unsafe Pointer.put<InlineTail>(tail, InlineTail { caller: caller, arguments: original, first: first, observation: move observation })
+    let mut debugAnchor = () let debugTail = unsafe Pointer.borrowMut<(), InlineTail>(&mut debugAnchor, tail)
+    let active = Pointer.fromMutRef<DebugActivation>(&mut debugTail.observation)
+    drop debugTail
+    unsafe debugger.publish(runtime, active)
+  } else {
+    let mut debugAnchor = () let debugTail = unsafe Pointer.borrowMut<(), InlineTail>(&mut debugAnchor, tail)
+    debugTail.caller = caller debugTail.arguments = original debugTail.first = first
+    debugTail.observation.tracked = false
+  }
   return Option<*mut Machine>.some(machine)
 }
 @inlineAlways
@@ -406,6 +468,90 @@ pub fn forwarded(machine: &Machine) -> bool {
 pub unsafe fn markForwarded(machine: *mut Machine) -> () {
   let mut anchor = () let callee = unsafe Pointer.borrowMut<(), Machine>(&mut anchor, machine)
   callee.record = unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(callee.record)), 2)
+}
+/// Gives every live inline frame entered while instructions were not observed
+/// its debugger activation, linked in stack order with the activations already
+/// kept (base frames, frames entered while observed), so the debugger, coverage
+/// and profiler see the whole stack. Runs once after observation turns on
+/// (RuntimeState.adoptFrames), before the first observed instruction.
+pub unsafe fn adoptFrames(runtime: *mut HeapHeader) -> () {
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  if !state.adoptFrames || state.debugger.evaluating || state.debugger.callbackActive { return () }
+  state.adoptFrames = false
+  let mut start: usize = 0 let mut end: usize = 0
+  if let Option<Intrinsic.RawBuffer<ValueBits>>.Some { value } = &state.callFrames {
+    let count = RawBuffer.count<ValueBits>(&value)
+    if count != 0 {
+      start = Pointer.address<ValueBits>(Pointer.fromRef<ValueBits>(&(unsafe RawBuffer.view<ValueBits>(&value, 0, count))[0]))
+      end = start + count * Layout.of<ValueBits>().bytes
+    }
+  }
+  let mut frame = state.currentStackFrame
+  let mut kept = state.debugger.active
+  drop state
+  // Innermost first: child is the activation of the frame just inside this one,
+  // whose previous becomes this frame's activation.
+  let mut child: ?*mut DebugActivation = Pointer.null<DebugActivation>()
+  let mut innermost: ?*mut DebugActivation = Pointer.null<DebugActivation>()
+  while let Option<*mut StackFrame>.Some { value: current } = Pointer.nonNullMut<StackFrame>(frame) {
+    let address = Pointer.address<StackFrame>(current)
+    let mut own: ?*mut DebugActivation = Pointer.null<DebugActivation>()
+    let mut last: ?*mut DebugActivation = Pointer.null<DebugActivation>()
+    // Kept activations of this frame (a base frame can hold two) stay linked
+    // among themselves.
+    while let Option<*mut DebugActivation>.Some { value: active } = Pointer.nonNullMut<DebugActivation>(kept) {
+      let view = unsafe Pointer.borrow<(), DebugActivation>(&anchor, active)
+      if Pointer.address<StackFrame>(view.frame) != address { break }
+      if Pointer.isNull<DebugActivation>(own) { own = kept }
+      last = kept
+      kept = view.previous
+    }
+    if Pointer.isNull<DebugActivation>(own) && address >= start && address < end {
+      let machine = unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut Machine>(unsafe slotAt(unsafe Intrinsic.pointerReinterpret<*mut StackFrame, *mut ValueBits>(current), frameSlots()))
+      let tail = unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut InlineTail>(unsafe slotAt(unsafe Intrinsic.pointerReinterpret<*mut StackFrame, *mut ValueBits>(current), frameSlots() + machineSlots()))
+      let mut tailAnchor = () let record = unsafe Pointer.borrowMut<(), InlineTail>(&mut tailAnchor, tail)
+      if !record.observation.tracked {
+        let machineAnchor = () let view = unsafe Pointer.borrow<(), Machine>(&machineAnchor, machine)
+        record.observation = unsafe debugger.enter(&view)
+        record.observation.tracked = true
+        let suspended = !Pointer.isNull<DebugActivation>(child)
+        drop view
+        own = Pointer.fromMutRef<DebugActivation>(&mut record.observation)
+        last = own
+        // A frame below the innermost is parked in a call.
+        unsafe debugger.adopted(Pointer.fromMutRef<DebugActivation>(&mut record.observation), current, suspended)
+      }
+    }
+    if !Pointer.isNull<DebugActivation>(own) {
+      if let Option<*mut DebugActivation>.Some { value: inner } = Pointer.nonNullMut<DebugActivation>(child) {
+        let mut innerAnchor = () let link = unsafe Pointer.borrowMut<(), DebugActivation>(&mut innerAnchor, inner)
+        link.previous = own
+      } else { innermost = own }
+      child = last
+    }
+    let frameAnchor = () frame = (unsafe Pointer.borrow<(), StackFrame>(&frameAnchor, current)).previous
+  }
+  if let Option<*mut DebugActivation>.Some { value: outer } = Pointer.nonNullMut<DebugActivation>(child) {
+    let mut outerAnchor = () let link = unsafe Pointer.borrowMut<(), DebugActivation>(&mut outerAnchor, outer)
+    link.previous = kept
+  }
+  if Pointer.isNull<DebugActivation>(innermost) { return () }
+  // Depths count the activations below each one.
+  let mut total: usize = 0
+  let mut walk = innermost
+  while let Option<*mut DebugActivation>.Some { value } = Pointer.nonNullMut<DebugActivation>(walk) {
+    total = total + 1
+    walk = (unsafe Pointer.borrow<(), DebugActivation>(&anchor, value)).previous
+  }
+  walk = innermost
+  while let Option<*mut DebugActivation>.Some { value } = Pointer.nonNullMut<DebugActivation>(walk) {
+    total = total - 1
+    let mut depthAnchor = () let link = unsafe Pointer.borrowMut<(), DebugActivation>(&mut depthAnchor, value)
+    link.depth = total
+    walk = link.previous
+  }
+  let mut publishAnchor = () let published = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut publishAnchor, runtime)
+  published.debugger.active = innermost
 }
 /// The tail of the inline frame machine runs; record must be non-null.
 @inlineAlways
@@ -451,14 +597,28 @@ pub unsafe fn leaveInline<H: HeapHooks>(hooks: &mut H, machine: &Machine) -> Inl
   let top = unsafe Intrinsic.pointerReinterpret<*mut StackFrame, *mut ValueBits>(machine.frame)
   let anchor = () let tail = unsafe Pointer.borrow<(), InlineTail>(&anchor, unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut InlineTail>(unsafe slotAt(top, frameSlots() + machineSlots())))
   let exit = InlineExit { caller: tail.caller, first: tail.first }
+  unsafe debugger.leave(machine.runtime, &tail.observation)
   drop tail
   let frame = unsafe Pointer.borrow<(), StackFrame>(&anchor, machine.frame)
   let previous = frame.previous
-  let mut copied: usize = 0
-  if Pointer.address<ValueBits>(frame.arguments.data) == Pointer.address<ValueBits>(unsafe slotAt(top, recordSlots())) { copied = frame.arguments.count }
-  let locals = frame.locals.count let references = frame.varRefs.count
-  drop frame
-  unsafe releaseSlots(&mut hooks, copied, locals, references, machine)
+  let storage = unsafe slotAt(top, recordSlots())
+  if frame.varRefs.count != 0 {
+    let mut copied: usize = 0
+    if Pointer.address<ValueBits>(frame.arguments.data) == Pointer.address<ValueBits>(storage) { copied = frame.arguments.count }
+    let locals = frame.locals.count
+    drop frame
+    unsafe releaseCapturingSlots(&mut hooks, copied, locals, machine)
+  } else {
+    drop frame
+    // The record's storage holds any copied arguments, then the locals, then
+    // the operand stack, back to back: one pass up to the stack top releases all.
+    let end = Pointer.address<ValueBits>(machine.stackTop) let runtime = machine.runtime
+    let mut cell = storage
+    while Pointer.address<ValueBits>(cell) != end {
+      unsafe gc.release(&mut hooks, runtime, unsafe Pointer.read<ValueBits>(cell))
+      cell = unsafe slotAt(cell, 1)
+    }
+  }
   let mut stateAnchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, machine.runtime)
   state.currentStackFrame = previous
   state.callFramesTop = top

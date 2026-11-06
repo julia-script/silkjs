@@ -1,0 +1,421 @@
+//! CLDR time zone names, as ICU picks them: specific names such as `EST` and `Eastern Standard
+//! Time`, generic ones such as `ET` and `Eastern Time`, location names such as `Germany Time`, and
+//! the localized GMT format such as `GMT-5` or `UTC−05:00`.
+//!
+//! Each locale's names are compressed and hold only what differs from the CLDR parent locale.
+//! [`ZoneNames.load`] inflates the chain once, when a DateTimeFormat is made, and keeps only the
+//! names of its zone; [`ZoneNames.format`] then picks one for an instant.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.compress.inflate { DecodeError, Decoder, Format, Limits, Progress, Status }
+import silk.num.u8
+import silk.num.i32
+import silk.num.i64
+import silk.num.usize
+import silk.num.u32
+import intl_zone_name_data as data
+import intl_cldr_locale as cldr
+import temporal_timezone as tz
+
+const NONE: usize = 65535
+const MISSING: usize = 18446744073709551615
+/// ICU looks this far, in seconds, for daylight saving time around an instant.
+const DST_RANGE: i64 = 15897600
+
+/// The `timeZoneName` option kinds, in `js_intl_datetimeformat_options_tables.ZONE` order.
+pub const SHORT: usize = 0
+pub const LONG: usize = 1
+pub const SHORT_OFFSET: usize = 2
+pub const LONG_OFFSET: usize = 3
+pub const SHORT_GENERIC: usize = 4
+pub const LONG_GENERIC: usize = 5
+
+/// Name mask bits, as the generator writes them.
+const LONG_GENERIC_BIT: usize = 0
+const SHORT_GENERIC_BIT: usize = 3
+const CITY_BIT: usize = 6
+
+fn read16(bytes: &[u8], at: usize) -> usize { return u8.toUsize(bytes[at]) + u8.toUsize(bytes[at + 1]) * 256 }
+fn read24(bytes: &[u8], at: usize) -> usize { return read16(bytes, at) + u8.toUsize(bytes[at + 2]) * 65536 }
+fn read32(bytes: &[u8], at: usize) -> i64 {
+  let raw = usize.toI64(read16(bytes, at) + read16(bytes, at + 2) * 65536)
+  if raw >= 2147483648 { return raw - 4294967296 } return raw
+}
+fn has(mask: u8, bit: usize) -> bool { return u8.bitAnd(u8.shiftRight(mask, usize.toU8(bit)), 1) == 1 }
+/// The end of the NUL-terminated text at `at`.
+fn end(bytes: &[u8], at: usize) -> usize { let mut stop = at while bytes[stop] != 0 { stop = stop + 1 } return stop }
+fn view(bytes: &[u8], at: usize) -> &[u8] { return Slice.view<u8>(bytes, at, end(bytes, at) - at) }
+/// The `index`th NUL-terminated text from `at`.
+fn nth(bytes: &[u8], at: usize, index: usize) -> usize {
+  let mut position = at let mut n: usize = 0
+  while n < index { position = end(bytes, position) + 1 n = n + 1 }
+  return position
+}
+/// The offset of the name of `bit` among the names of `mask` that start at `at`, or MISSING.
+fn nameAt(bytes: &[u8], mask: u8, at: usize, bit: usize) -> usize {
+  if !has(mask, bit) { return MISSING }
+  let below = u8.bitAnd(mask, usize.toU8(usize.shiftLeft(1, bit) - 1))
+  return nth(bytes, at, names(below))
+}
+fn names(mask: u8) -> usize { return u32.toUsize(u8.countOnes(mask)) }
+
+/// The inflated records of a locale and its parents, nearest first. Per record, `sections`
+/// holds where its metazones, zones and countries start.
+struct Chain { bytes: List<u8>, sections: List<usize> }
+impl Chain {
+  /// Notes the sections of the record that starts at `start`.
+  effect fn index(self: &mut Self, start: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    let bytes = self.bytes.asSlice()
+    let metazones = start + 2
+    let mut at = metazones + 1 let mut n: usize = 0
+    while n < u8.toUsize(bytes[metazones]) { at = nth(bytes, at + 2, names(bytes[at + 1])) n = n + 1 }
+    let zones = at
+    at = zones + 2 n = 0
+    while n < read16(bytes, zones) { at = nth(bytes, at + 3, names(bytes[at + 2])) n = n + 1 }
+    run self.sections.append(metazones) run self.sections.append(zones) run self.sections.append(at)
+  }
+  /// Where the entry `key` of `kind` (0 metazone, 1 zone, 2 country) starts, at its mask (for a
+  /// country, at its name), or MISSING. An entry with nothing in it hides the parent's.
+  fn find(self: &Self, kind: usize, key: usize) -> usize {
+    let bytes = self.bytes.asSlice()
+    let mut record: usize = 0
+    while record * 3 < self.sections.length() {
+      let section = self.sections.get(record * 3 + kind)
+      let mut n: usize = 0
+      if kind == 0 {
+        let mut at = section + 1
+        while n < u8.toUsize(bytes[section]) {
+          let id = u8.toUsize(bytes[at])
+          if id == key { if bytes[at + 1] == 0 { return MISSING } return at + 1 }
+          if id > key { break }
+          at = nth(bytes, at + 2, names(bytes[at + 1])) n = n + 1
+        }
+      } else if kind == 1 {
+        let mut at = section + 2
+        while n < read16(bytes, section) {
+          let id = read16(bytes, at)
+          if id == key { if bytes[at + 2] == 0 { return MISSING } return at + 2 }
+          if id > key { break }
+          at = nth(bytes, at + 3, names(bytes[at + 2])) n = n + 1
+        }
+      } else {
+        let mut at = section + 1
+        while n < u8.toUsize(bytes[section]) {
+          let id = u8.toUsize(bytes[at])
+          if id == key { if bytes[at + 1] == 0 { return MISSING } return at + 1 }
+          if id > key { break }
+          at = end(bytes, at + 1) + 1 n = n + 1
+        }
+      }
+      record = record + 1
+    }
+    return MISSING
+  }
+  /// The name of `bit` of entry `key` of `kind`, or empty.
+  fn name(self: &Self, kind: usize, key: usize, bit: usize) -> &[u8] {
+    let at = self.find(kind, key)
+    if at == MISSING { return b"" }
+    let bytes = self.bytes.asSlice()
+    let found = nameAt(bytes, bytes[at], at + 1, bit)
+    if found == MISSING { return b"" }
+    return view(bytes, found)
+  }
+}
+
+/// Inflates the record at `offset` of `data.records()` onto `out`.
+effect fn inflate(decoder: &mut Decoder, offset: usize, out: &mut List<u8>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let records = data.records()
+  let rawLength = read24(records, offset) let packedLength = read16(records, offset + 3)
+  let limits = Limits { maxInputBytes: usize.toU64(packedLength), maxOutputBytes: usize.toU64(rawLength), maxMembers: 1, maxHeaderBytes: 0, maxMemoryBytes: 65536 }
+  match decoder.reset(Format.Raw, move limits) { Result<(), DecodeError>.Success { .. } => () Result<(), DecodeError>.Failure { .. } => { return false } }
+  let start = out.length()
+  run out.appendRepeated(0, rawLength)
+  let input = Slice.view<u8>(records, offset + 5, packedLength)
+  let output = Slice.viewMut<u8>(out.asMutSlice(), start, rawLength)
+  let stepped = decoder.step(input, move output, true)
+  return match move stepped {
+    Result<Progress, DecodeError>.Success { value } => value.status == Status.Finished && value.written == rawLength
+    Result<Progress, DecodeError>.Failure { error } => { drop error false }
+  }
+}
+
+/// Appends `pattern` with `{0}` replaced by `first` and `{1}` by `second`.
+effect fn substitute(out: &mut List<u8>, pattern: &[u8], first: &[u8], second: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at: usize = 0
+  while at < pattern.length {
+    if at + 2 < pattern.length && pattern[at] == 123 && pattern[at + 2] == 125 && (pattern[at + 1] == 48 || pattern[at + 1] == 49) {
+      if pattern[at + 1] == 48 { run out.appendSlice(first) } else { run out.appendSlice(second) }
+      at = at + 3
+    } else { run out.append(pattern[at]) at = at + 1 }
+  }
+}
+
+/// The names one DateTimeFormat needs for its zone.
+///
+/// `bytes` holds the zone's own names (a mask and names), its generic location name, the
+/// location for partial location names in country and city form, then per metazone use its UTC
+/// minutes range, its golden zone (a `temporal_timezone` id, or -1 when it is this zone), whether
+/// partial names use the country, and its names.
+pub struct ZoneNames { bytes: List<u8>, formats: usize, zone: i32, named: bool }
+impl ZoneNames {
+  /// Names for no zone, which format as GMT offsets.
+  pub fn make() -> ZoneNames { return ZoneNames { bytes: List<u8>.make(), formats: 0, zone: -1, named: false } }
+
+  /// The names of `timeZone` in `locale`, whose region (a region subtag or the likely one) picks
+  /// golden zones.
+  pub effect fn load(locale: &[u8], region: &[u8], timeZone: &[u8]) -> ZoneNames ! OutOfMemoryError ? &mut Allocator {
+    let mut result = ZoneNames.make()
+    let mut index = cldr.lookup(data.locales(), locale)
+    if index == cldr.NOT_FOUND { index = cldr.find(data.locales(), b"und") }
+    result.formats = read16(data.table(), index * 5 + 3)
+    let mut cid = NONE
+    let nameIndex = tz.ti_tz_name_index(timeZone)
+    if nameIndex >= 0 { cid = read16(data.nameZones(), i32.toUsize(nameIndex) * 2) }
+    else if zeroOffset(timeZone) { cid = data.GREENWICH }
+    if cid == NONE { return move result }
+    let limits = Limits { maxInputBytes: 0, maxOutputBytes: 0, maxMembers: 1, maxHeaderBytes: 0, maxMemoryBytes: 65536 }
+    let made = run Effect.result(Decoder.make(Format.Raw, move limits))
+    let mut decoder = match move made {
+      Result<Decoder, DecodeError | OutOfMemoryError>.Success { value } => move value
+      Result<Decoder, DecodeError | OutOfMemoryError>.Failure { error } => match move error {
+        DecodeError cause => { drop cause return move result }
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
+    let mut chain = Chain { bytes: List<u8>.make(), sections: List<usize>.make() }
+    let mut current = index
+    while current != NONE {
+      let start = chain.bytes.length()
+      if !(run inflate(&mut decoder, read24(data.table(), current * 5), &mut chain.bytes)) { return move result }
+      run chain.index(start)
+      current = read16(chain.bytes.asSlice(), start)
+    }
+    drop decoder
+    run result.collect(&chain, cid, region)
+    result.zone = tz.ti_tz_find_id(timeZone)
+    result.named = true
+    return move result
+  }
+
+  effect fn collect(self: &mut Self, chain: &Chain, cid: usize, region: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    let bytes = chain.bytes.asSlice()
+    let own = chain.find(1, cid)
+    if own == MISSING { run self.bytes.append(0) }
+    else {
+      // The zone's own names, without its city.
+      let mask = u8.toUsize(bytes[own]) % 64
+      run self.bytes.append(usize.toU8(mask))
+      let mut bit: usize = 0
+      while bit < 6 { let at = nameAt(bytes, bytes[own], own + 1, bit) if at != MISSING { run self.bytes.appendSlice(view(bytes, at)) run self.bytes.append(0) } bit = bit + 1 }
+    }
+    let zones = data.zones() let country = u8.toUsize(zones[cid * 4]) let primary = zones[cid * 4 + 1] % 2 == 1
+    let mut city = List<u8>.make()
+    let mut cityAt = MISSING if own != MISSING { cityAt = nameAt(bytes, bytes[own], own + 1, CITY_BIT) }
+    if cityAt != MISSING { run city.appendSlice(view(bytes, cityAt)) } else { run defaultCity(&mut city, cid) }
+    let mut countryName = List<u8>.make()
+    if country != 255 {
+      let found = chain.find(2, country)
+      if found != MISSING { run countryName.appendSlice(view(bytes, found)) } else { run countryName.appendSlice(Slice.view<u8>(data.countries(), country * 2, 2)) }
+    }
+    // The generic location name: the country for its primary zone, else the city.
+    if country != 255 {
+      let regionFormat = view(data.formats(), nth(data.formats(), self.formats, 2))
+      if primary { run substitute(&mut self.bytes, regionFormat, countryName.asSlice(), b"") }
+      else if city.length() > 0 { run substitute(&mut self.bytes, regionFormat, city.asSlice(), b"") }
+    }
+    run self.bytes.append(0)
+    run self.bytes.appendSlice(countryName.asSlice()) run self.bytes.append(0)
+    run self.bytes.appendSlice(city.asSlice()) run self.bytes.append(0)
+    let usage = read16(zones, cid * 4 + 2)
+    if usage == NONE { run self.bytes.append(0) return () }
+    let uses = data.usages() let count = u8.toUsize(uses[usage])
+    run self.bytes.append(usize.toU8(count))
+    let mut n: usize = 0
+    while n < count {
+      let at = usage + 1 + n * 9
+      let metazone = u8.toUsize(uses[at])
+      run self.bytes.appendSlice(Slice.view<u8>(uses, at + 1, 8))
+      let golden = goldenZone(metazone, region)
+      let mut goldenId = NONE
+      if golden != cid && golden != NONE { let found = tz.ti_tz_find_id(view(data.zoneNames(), nth(data.zoneNames(), 0, golden))) if found >= 0 { goldenId = i32.toUsize(found) } }
+      run self.bytes.append(usize.toU8(goldenId % 256)) run self.bytes.append(usize.toU8(goldenId / 256))
+      let mut flags: u8 = 0
+      if country != 255 && goldenZone(metazone, Slice.view<u8>(data.countries(), country * 2, 2)) == cid { flags = 1 }
+      run self.bytes.append(flags)
+      let entry = chain.find(0, metazone)
+      if entry == MISSING { run self.bytes.append(0) }
+      else {
+        run self.bytes.append(bytes[entry])
+        let mut bit: usize = 0
+        while bit < 6 { let found = nameAt(bytes, bytes[entry], entry + 1, bit) if found != MISSING { run self.bytes.appendSlice(view(bytes, found)) run self.bytes.append(0) } bit = bit + 1 }
+      }
+      n = n + 1
+    }
+  }
+
+  /// Appends the name of `kind` at UTC second `sec`, when the zone is `offset` seconds from UTC,
+  /// with ASCII digits; the caller maps them to its numbering system.
+  pub effect fn format(self: &Self, out: &mut List<u8>, kind: usize, sec: i64, offset: i32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let short = kind == SHORT || kind == SHORT_OFFSET || kind == SHORT_GENERIC
+    if self.named && kind != SHORT_OFFSET && kind != LONG_OFFSET {
+      let bytes = self.bytes.asSlice()
+      let daylight = tz.ti_tz_is_daylight_at_sec(self.zone, sec)
+      let use = self.use(floorDiv(sec, 60))
+      if kind == SHORT || kind == LONG {
+        let mut bit: usize = 1 if daylight { bit = 2 } if short { bit = bit + 3 }
+        let mut name = self.own(bit)
+        if name.length == 0 && use != MISSING { name = self.metazone(use, bit) }
+        if name.length > 0 { run out.appendSlice(name) return () }
+      } else {
+        let mut generic = LONG_GENERIC_BIT if short { generic = SHORT_GENERIC_BIT }
+        let own = self.own(generic)
+        if own.length > 0 { run out.appendSlice(own) return () }
+        if use != MISSING {
+          if !daylight && !tz.ti_tz_daylight_near(self.zone, sec, DST_RANGE) {
+            // A zone without daylight saving time around now takes its standard name, unless
+            // that is the generic name anyway.
+            let mut standard = self.own(generic + 1)
+            if standard.length == 0 { standard = self.metazone(use, generic + 1) }
+            if standard.length > 0 && !caseEqual(standard, self.metazone(use, generic)) { run out.appendSlice(standard) return () }
+          }
+          let name = self.metazone(use, generic)
+          if name.length > 0 {
+            let golden = read16(bytes, use + 8)
+            if golden != NONE && (tz.ti_tz_offset_at_sec(usize.toI32(golden), sec) != offset || tz.ti_tz_is_daylight_at_sec(usize.toI32(golden), sec) != daylight) {
+              // Another offset than the metazone's golden zone: name the place too.
+              let mut location = self.text(2) if bytes[use + 10] == 0 { location = self.text(3) }
+              let fallback = view(data.formats(), nth(data.formats(), self.formats, 3))
+              run substitute(&mut out, fallback, location, name) return ()
+            }
+            run out.appendSlice(name) return ()
+          }
+        }
+        let location = self.text(1)
+        if location.length > 0 { run out.appendSlice(location) return () }
+      }
+    }
+    run self.gmt(&mut out, offset, short)
+  }
+
+  /// The localized GMT format of `offset` seconds, such as `GMT-5` or, long, `GMT-05:00`.
+  effect fn gmt(self: &Self, out: &mut List<u8>, offset: i32, short: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+    let formats = data.formats()
+    let gmtFormat = view(formats, self.formats)
+    let hourFormat = view(formats, nth(formats, self.formats, 1))
+    let mut magnitude = offset if magnitude < 0 { magnitude = -magnitude }
+    let hours = magnitude / 3600 let minutes = magnitude / 60 % 60 let seconds = magnitude % 60
+    // The positive or negative half of the hour format, such as `+HH:mm`.
+    let mut split: usize = 0 while split < hourFormat.length && hourFormat[split] != 59 { split = split + 1 }
+    let mut pattern = Slice.view<u8>(hourFormat, 0, split)
+    if offset < 0 && split < hourFormat.length { pattern = Slice.view<u8>(hourFormat, split + 1, hourFormat.length - split - 1) }
+    // Short drops zero minutes: the pattern ends after its hours, as ICU truncates it.
+    let mut minuteAt: usize = 0 while minuteAt < pattern.length && pattern[minuteAt] != 109 { minuteAt = minuteAt + 1 }
+    let mut hourEnd: usize = 0 let mut scan: usize = 0
+    while scan < minuteAt { if pattern[scan] == 72 { hourEnd = scan + 1 } scan = scan + 1 }
+    let withMinutes = !short || minutes != 0 || seconds != 0
+    let mut body = List<u8>.make()
+    let mut at: usize = 0
+    while at < pattern.length {
+      if !withMinutes && at >= hourEnd { break }
+      let c = pattern[at]
+      if c == 72 {
+        while at < pattern.length && pattern[at] == 72 { at = at + 1 }
+        let mut width: usize = 2 if short { width = 1 }
+        run number(&mut body, hours, width)
+      } else if c == 109 {
+        while at < pattern.length && pattern[at] == 109 { at = at + 1 }
+        run number(&mut body, minutes, 2)
+        // ICU adds seconds after the minutes, with the separator its hours and minutes have.
+        if seconds != 0 { run body.appendSlice(Slice.view<u8>(pattern, hourEnd, minuteAt - hourEnd)) run number(&mut body, seconds, 2) }
+      } else { run body.append(c) at = at + 1 }
+    }
+    run substitute(&mut out, gmtFormat, body.asSlice(), b"")
+  }
+
+  /// The zone's own name of `bit`, or empty.
+  fn own(self: &Self, bit: usize) -> &[u8] {
+    let bytes = self.bytes.asSlice()
+    let at = nameAt(bytes, bytes[0], 1, bit)
+    if at == MISSING { return b"" }
+    return view(bytes, at)
+  }
+  /// Text `index` after the zone's own names: 1 the generic location, 2 the country, 3 the city.
+  fn text(self: &Self, index: usize) -> &[u8] {
+    let bytes = self.bytes.asSlice()
+    return view(bytes, nth(bytes, 1, names(bytes[0]) + index - 1))
+  }
+  /// Where the metazone use that holds UTC minute `minute` starts, or MISSING.
+  fn use(self: &Self, minute: i64) -> usize {
+    let bytes = self.bytes.asSlice()
+    let mut at = nth(bytes, 1, names(bytes[0]) + 3)
+    let count = u8.toUsize(bytes[at]) at = at + 1
+    let mut n: usize = 0
+    while n < count {
+      let from = read32(bytes, at) let before = read32(bytes, at + 4)
+      if minute >= from && minute < before { return at }
+      at = nth(bytes, at + 12, names(bytes[at + 11])) n = n + 1
+    }
+    return MISSING
+  }
+  /// The name of `bit` of the metazone use at `at`, or empty.
+  fn metazone(self: &Self, at: usize, bit: usize) -> &[u8] {
+    let bytes = self.bytes.asSlice()
+    let found = nameAt(bytes, bytes[at + 11], at + 12, bit)
+    if found == MISSING { return b"" }
+    return view(bytes, found)
+  }
+}
+
+/// Whether `timeZone` is the offset zone +00:00 or -00:00, which ICU names as Etc/GMT.
+fn zeroOffset(timeZone: &[u8]) -> bool {
+  return timeZone.length == 6 && (timeZone[0] == 43 || timeZone[0] == 45) && timeZone[1] == 48 && timeZone[2] == 48 && timeZone[3] == 58 && timeZone[4] == 48 && timeZone[5] == 48
+}
+/// The golden zone (a cid) of `metazone` for `region`, or for the world.
+fn goldenZone(metazone: usize, region: &[u8]) -> usize {
+  let goldens = data.goldens()
+  let at = read16(data.goldenTable(), metazone * 2)
+  let count = u8.toUsize(goldens[at])
+  if count == 0 { return NONE }
+  let mut n: usize = 1
+  while n < count {
+    let entry = at + 1 + n * 5
+    let mut length: usize = 3 if goldens[entry + 2] == 0 { length = 2 }
+    if length == region.length && goldens[entry] == region[0] && goldens[entry + 1] == region[1] && (length == 2 || goldens[entry + 2] == region[2]) { return read16(goldens, entry + 3) }
+    n = n + 1
+  }
+  return read16(goldens, at + 4)
+}
+
+/// ICU's exemplar city for a zone CLDR does not name: the last part of its ID, with spaces.
+effect fn defaultCity(out: &mut List<u8>, cid: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let names = data.zoneNames()
+  let name = view(names, nth(names, 0, cid))
+  if (name.length > 4 && name[0] == 69 && name[1] == 116 && name[2] == 99 && name[3] == 47) || (name.length > 8 && name[0] == 83 && name[1] == 121 && name[6] == 86 && name[7] == 47) { return () }
+  let mut slash = name.length
+  while slash > 0 && name[slash - 1] != 47 { slash = slash - 1 }
+  if slash == 0 || slash == name.length { return () }
+  let mut at = slash
+  while at < name.length { if name[at] == 95 { run out.append(32) } else { run out.append(name[at]) } at = at + 1 }
+}
+
+effect fn number(out: &mut List<u8>, value: i32, width: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if width >= 2 || value >= 10 { run out.append(i32.toU8(48 + value / 10 % 10)) }
+  run out.append(i32.toU8(48 + value % 10))
+}
+
+fn floorDiv(value: i64, by: i64) -> i64 { let q = value / by if value % by < 0 { return q - 1 } return q }
+
+fn caseEqual(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length { return false }
+  let mut at: usize = 0
+  while at < a.length {
+    let mut x = a[at] let mut y = b[at]
+    if x >= 65 && x <= 90 { x = x + 32 } if y >= 65 && y <= 90 { y = y + 32 }
+    if x != y { return false }
+    at = at + 1
+  }
+  return true
+}

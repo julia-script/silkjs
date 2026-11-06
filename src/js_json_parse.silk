@@ -14,12 +14,13 @@ import silk.num.u32
 import silk.num.usize
 import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
-import js_owned_value { ValueRef }
-import js_realm { Realm, lendRealm }
-import js_core_types { RuntimeState, ObjectData, PropertySlot, SlotBits, JS_PROP_C_W_E }
+import js_owned_value { ValueRef, lendBits }
+import js_object_ref { ObjectRef }
+import js_realm { Realm }
+import js_core_types { RuntimeState, SlotBits, JS_PROP_C_W_E, OwnedAtom }
 import js_gc { HeapHooks }
 import js_gc as gc
-import js_runtime { contextRuntime, checkStackOverflow }
+import js_runtime { checkStackOverflow }
 import native_stack { currentFrameAddress }
 import runtime_memory { AllocationObserver }
 import js_object_allocate as objects
@@ -35,7 +36,6 @@ import js_unit_strings as unitStrings
 import js_string_types { StringOwner, StringLengthError }
 import js_parser_diagnostics { DiagnosticMessage, SyntaxError }
 import js_parser_core { ParserStackOverflow }
-import js_parser_support { OwnedAtom }
 
 const NO_RECORD: usize = usize.MAX
 pub const JS_PARSE_JSON_EXT: i32 = 1
@@ -138,15 +138,15 @@ impl<'src> JsonParseRecords<'src> {
     }
     self.nodes = List<ParseRecord>.make()
   }
-  unsafe fn initialize(self: &mut Self, record: usize, value: ValueBits, kind: JsonRecordKind,
+  fn initialize<'v>(self: &mut Self, record: usize, value: ValueRef<'v>, kind: JsonRecordKind,
     start: usize, length: usize) -> () {
     if record == NO_RECORD { return () }
     let node = &mut self.nodes.asMutSlice()[record]
-    node.value = unsafe value.retained()
+    node.value = value.dup().intoBits()
     node.kind = kind
     node.span = JsonSourceSpan { start: start, length: length }
   }
-  unsafe effect fn add(self: &mut Self, parent: usize, atom: u32) -> usize
+  effect fn add(self: &mut Self, parent: usize, atom: u32) -> usize
     ! OutOfMemoryError ? &mut Allocator {
     if parent == NO_RECORD { return NO_RECORD }
     run self.nodes.reserve(1)
@@ -216,9 +216,11 @@ impl<'src> ParsedJson<'src> {
   }
 }
 
-struct JsonParser<'src> {
+// runtime caches realm.runtime(), so the parser reaches runtime state without
+// going through the context on every token.
+struct JsonParser<'src, 'r> {
   lexer: Lexer<'src>, token: Token, runtime: *mut HeapHeader,
-  context: *mut HeapHeader, filename: StringOwner, records: JsonParseRecords<'src>,
+  realm: Realm<'r>, filename: StringOwner, records: JsonParseRecords<'src>,
   // Set by advanceKey when the key token was read as an atom.
   key: OwnedAtom
 }
@@ -227,7 +229,11 @@ struct LexFailed { error: LexError | BigIntError | OutOfMemoryError | StringLeng
 effect fn lexFailed(error: LexError | BigIntError | OutOfMemoryError | StringLengthError) -> LexFailed {
   return LexFailed { error: move error }
 }
-impl<'src> JsonParser<'src> {
+impl<'src, 'r> JsonParser<'src, 'r> {
+  fn runtimeState<'b, A>(self: &Self, owner: &'b mut A) -> &'b mut RuntimeState {
+    return unsafe HeapCell.payloadMut<RuntimeState, A>(&mut owner, self.runtime)
+  }
+  fn stackOverflow(self: &Self) -> bool { return unsafe checkStackOverflow(self.runtime, currentFrameAddress(), 0, true) }
   effect fn diagnostic<T>(self: &mut Self, message: DiagnosticMessage, offset: usize) -> T
     ! SyntaxError | OutOfMemoryError | StringLengthError ? &mut Allocator {
     let location = self.lexer.location(offset)
@@ -242,9 +248,9 @@ impl<'src> JsonParser<'src> {
   // Punctuators are most tokens: they rewrite the current token in place, and only
   // a token with a payload pays for its drop. Everything else is out of line.
   @inlineAlways
-  unsafe effect fn advance(self: &mut Self) -> ()
+  effect fn advance(self: &mut Self) -> ()
     ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow ? &mut Allocator {
-    if unsafe checkStackOverflow(self.runtime, currentFrameAddress(), 0, true) { fail ParserStackOverflow {} }
+    if self.stackOverflow() { fail ParserStackOverflow {} }
     let punctuator = self.lexer.jsonPunctuator()
     if punctuator != 0 {
       let empty = match &self.token.payload { TokenPayload.Empty => true _ => false }
@@ -255,10 +261,10 @@ impl<'src> JsonParser<'src> {
       self.token.gotLineFeed = self.lexer.gotLineFeed
       return ()
     }
-    return run unsafe self.lexToken()
+    return run self.lexToken()
   }
   @inlineNever
-  unsafe effect fn lexToken(self: &mut Self) -> ()
+  effect fn lexToken(self: &mut Self) -> ()
     ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow ? &mut Allocator {
     let unit = self.lexer.jsonUnitString()
     if unit >= 0 {
@@ -271,7 +277,7 @@ impl<'src> JsonParser<'src> {
       return ()
     }
     let mut anchor = ()
-    let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, self.runtime)
+    let rt = self.runtimeState(&mut anchor)
     let result = run Intrinsic.catchFailure<LexError | BigIntError | OutOfMemoryError | StringLengthError>(
       self.lexer.next(&mut rt.atoms), lexFailed)
     drop rt
@@ -295,13 +301,13 @@ impl<'src> JsonParser<'src> {
   }
   // Advances to a token that is usually a property name. Interned plain keys
   // skip the token string; the atom waits in self.key for propertyName.
-  unsafe effect fn advanceKey(self: &mut Self) -> ()
+  effect fn advanceKey(self: &mut Self) -> ()
     ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow ? &mut Allocator {
     let mut anchor = ()
-    let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, self.runtime)
+    let rt = self.runtimeState(&mut anchor)
     let key = self.lexer.plainJsonKey(&rt.atoms)
     drop rt
-    if key.atom == 0 { return run unsafe self.advance() }
+    if key.atom == 0 { return run self.advance() }
     let empty = match &self.token.payload { TokenPayload.Empty => true _ => false }
     if !empty { self.token.payload = TokenPayload.Empty }
     self.token.kind = tok.TOK_STRING
@@ -310,7 +316,7 @@ impl<'src> JsonParser<'src> {
     self.token.gotLineFeed = false
     self.key = unsafe OwnedAtom.adopt(self.runtime, key.atom)
   }
-  unsafe effect fn expect(self: &mut Self, kind: i32) -> ()
+  effect fn expect(self: &mut Self, kind: i32) -> ()
     ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow ? &mut Allocator {
     if self.token.kind != kind {
       let mut message = DiagnosticMessage.make()
@@ -318,15 +324,15 @@ impl<'src> JsonParser<'src> {
       let offset = self.token.start
       return run self.diagnostic<()>(move message, offset)
     }
-    run unsafe self.advance()
+    run self.advance()
   }
-  unsafe effect fn propertyName(self: &mut Self) -> OwnedAtom
+  effect fn propertyName(self: &mut Self) -> OwnedAtom
     ! OutOfMemoryError | StringLengthError | SyntaxError ? &mut Allocator {
     if self.key.get() != 0 { return unsafe OwnedAtom.adopt(self.runtime, self.key.take()) }
     match &self.token.payload {
       TokenPayload.String { value, .. } => {
         let mut anchor = ()
-        let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, self.runtime)
+        let rt = self.runtimeState(&mut anchor)
         let atom = run rt.atoms.intern(value.get())
         return unsafe OwnedAtom.adopt(self.runtime, atom)
       }
@@ -347,14 +353,14 @@ struct FailedAdd { error: OutOfMemoryError }
 effect fn failedAdd(error: OutOfMemoryError) -> FailedAdd { return FailedAdd { error: move error } }
 // Only fresh ordinary objects: no accessor/proxy/prototype-setter dispatch.
 // Consumes incoming on every path. Duplicate definitions preserve slot order.
-unsafe effect fn defineProperty<H: HeapHooks>(s: &JsonParser, hooks: &mut H,
-  object: ValueBits, key: u32, incoming: ValueBits) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn defineProperty<'v, H: HeapHooks>(s: &JsonParser, hooks: &mut H,
+  object: ValueRef<'v>, key: u32, incoming: ValueBits) -> () ! OutOfMemoryError ? &mut Allocator {
   let mut anchor = ()
-  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, objectReference(object))
+  let data = ObjectRef.of(object).dataMut(&mut anchor)
   match unsafe shapes.lookup(data.shape, key) {
     Option<usize>.Some { value: index } => {
-      let old = data.properties.get(index).view(unsafe shapes.slotFlags(data.shape, index))
-      data.properties.set(index, SlotBits.value(incoming))
+      let old = data.slot(index).view(unsafe shapes.slotFlags(data.shape, index))
+      data.setSlot(index, SlotBits.value(incoming))
       drop data
       unsafe gc.releaseProperty(&mut hooks, s.runtime, old)
     }
@@ -363,7 +369,7 @@ unsafe effect fn defineProperty<H: HeapHooks>(s: &JsonParser, hooks: &mut H,
         unsafe shapes.addProperty(s.runtime, &mut data, key, u32.toU8(JS_PROP_C_W_E)), failedAdd)
       match move result {
         shapes.AddResult value => {
-          data.properties.set(value.index, SlotBits.value(incoming))
+          data.setSlot(value.index, SlotBits.value(incoming))
           drop data
           unsafe gc.releaseOptional(&mut hooks, s.runtime, value.retiredShape)
         }
@@ -379,12 +385,12 @@ struct FailedValue { error: OutOfMemoryError | StringLengthError | BigIntError |
 effect fn failedValue(error: OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow) -> FailedValue {
   return FailedValue { error: move error }
 }
-unsafe effect fn parseValue<H: HeapHooks>(s: &mut JsonParser, hooks: &mut H,
+effect fn parseValue<H: HeapHooks>(s: &mut JsonParser, hooks: &mut H,
   memory: &AllocationObserver, record: usize) -> ValueBits
   ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow ? &mut Allocator {
   let mut value = ValueBits.Undefined
   let result = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow>(
-    unsafe parseValueInto(&mut s, &mut hooks, memory, record, &mut value), failedValue)
+    parseValueInto(&mut s, &mut hooks, memory, record, &mut value), failedValue)
   match move result {
     FailedValue { error } => {
       unsafe gc.release(&mut hooks, s.runtime, value)
@@ -393,47 +399,47 @@ unsafe effect fn parseValue<H: HeapHooks>(s: &mut JsonParser, hooks: &mut H,
     _ => { return value }
   }
 }
-unsafe effect fn parseValueInto<H: HeapHooks>(s: &mut JsonParser, hooks: &mut H,
+effect fn parseValueInto<H: HeapHooks>(s: &mut JsonParser, hooks: &mut H,
   memory: &AllocationObserver, record: usize, value: &mut ValueBits) -> ()
   ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow ? &mut Allocator {
-  if unsafe checkStackOverflow(s.runtime, currentFrameAddress(), 0, true) { fail ParserStackOverflow {} }
+  if s.stackOverflow() { fail ParserStackOverflow {} }
   if s.token.kind == 123 {
-    run unsafe s.advanceKey()
-    value.* = run objects.object(&mut hooks, memory, unsafe lendRealm(&s.context, s.context))
-    unsafe s.records.initialize(record, value.*, JsonRecordKind.Object, 0, 0)
+    run s.advanceKey()
+    value.* = run objects.object(&mut hooks, memory, s.realm)
+    s.records.initialize(record, unsafe lendBits(&value, value.*), JsonRecordKind.Object, 0, 0)
     if s.token.kind != 125 {
       while true {
-        let name = run unsafe s.propertyName()
-        run unsafe s.advance()
-        run unsafe s.expect(58)
-        let child = run unsafe s.records.add(record, name.get())
-        let property = run unsafe parseValue(&mut s, &mut hooks, memory, child)
-        run unsafe defineProperty(&s.*, &mut hooks, value.*, name.get(), property)
+        let name = run s.propertyName()
+        run s.advance()
+        run s.expect(58)
+        let child = run s.records.add(record, name.get())
+        let property = run parseValue(&mut s, &mut hooks, memory, child)
+        run defineProperty(&s.*, &mut hooks, unsafe lendBits(&value, value.*), name.get(), property)
         if s.token.kind != 44 { break }
-        run unsafe s.advanceKey()
+        run s.advanceKey()
         if s.lexer.context.extendedJson && s.token.kind == 125 { break }
       }
     }
-    run unsafe s.expect(125)
+    run s.expect(125)
     return ()
   }
   if s.token.kind == 91 {
-    run unsafe s.advance()
-    value.* = run objects.array(&mut hooks, memory, unsafe lendRealm(&s.context, s.context))
-    unsafe s.records.initialize(record, value.*, JsonRecordKind.Array, 0, 0)
+    run s.advance()
+    value.* = run objects.array(&mut hooks, memory, s.realm)
+    s.records.initialize(record, unsafe lendBits(&value, value.*), JsonRecordKind.Array, 0, 0)
     if s.token.kind != 93 {
       while true {
-        let child = run unsafe s.records.add(record, 0)
-        let element = run unsafe parseValue(&mut s, &mut hooks, memory, child)
-        let accepted = run unsafe arrays.appendFastElement(&mut hooks, unsafe lendRealm(&s.context, s.context), objectReference(value.*), element)
+        let child = run s.records.add(record, 0)
+        let element = run parseValue(&mut s, &mut hooks, memory, child)
+        let accepted = run unsafe arrays.appendFastElement(&mut hooks, s.realm, objectReference(value.*), element)
         // The new private array has an unmodified writable length descriptor.
         if accepted != StorageOutcome.Accepted { return invalidObject() }
         if s.token.kind != 44 { break }
-        run unsafe s.advance()
+        run s.advance()
         if s.lexer.context.extendedJson && s.token.kind == 93 { break }
       }
     }
-    run unsafe s.expect(93)
+    run s.expect(93)
     return ()
   }
   let mut primitive = false
@@ -467,18 +473,18 @@ unsafe effect fn parseValueInto<H: HeapHooks>(s: &mut JsonParser, hooks: &mut H,
   // As in the pinned source, bare extended NaN/Infinity identifiers leave the
   // record Empty/Undefined. Signed numeric forms have ordinary primitive spans.
   if primitive {
-    unsafe s.records.initialize(record, value.*, JsonRecordKind.Primitive, s.token.start, s.lexer.offset - s.token.start)
+    s.records.initialize(record, unsafe lendBits(&value, value.*), JsonRecordKind.Primitive, s.token.start, s.lexer.offset - s.token.start)
   }
-  run unsafe s.advance()
+  run s.advance()
 }
 
-unsafe effect fn parseDocument<H: HeapHooks>(s: &mut JsonParser, hooks: &mut H,
+effect fn parseDocument<H: HeapHooks>(s: &mut JsonParser, hooks: &mut H,
   memory: &AllocationObserver, captureRecords: bool, value: &mut ValueBits) -> ()
   ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow ? &mut Allocator {
-  run unsafe s.advance()
+  run s.advance()
   let mut record = NO_RECORD
   if captureRecords { run s.records.nodes.append(ParseRecord.empty()) record = 0 }
-  value.* = run unsafe parseValue(&mut s, &mut hooks, memory, record)
+  value.* = run parseValue(&mut s, &mut hooks, memory, record)
   if s.token.kind != tok.TOK_EOF { return run s.syntax<()>(b"unexpected data at the end") }
 }
 
@@ -488,27 +494,24 @@ unsafe effect fn parseDocument<H: HeapHooks>(s: &mut JsonParser, hooks: &mut H,
 // No FunctionDef, bytecode compiler state, reviver, or intrinsic fallback is used.
 pub effect fn parse<'a, 'b, 'src, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,realm: Realm<'a>, source: &'src [u8], filename: ValueRef<'b>,
   extended: bool, captureRecords: bool) -> ParsedJson<'src>
-  ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow ? &mut Allocator { let context = realm.context()
-  let runtime = unsafe contextRuntime(context)
+  ! OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow ? &mut Allocator {
+  let runtime = realm.runtime()
   let mut s = JsonParser { lexer: Lexer.make(source, LexicalContext.jsonSource(extended)),
-    token: Token.empty(32, 0, 0), runtime: runtime, context: context,
+    token: Token.empty(32, 0, 0), runtime: runtime, realm: realm,
     filename: StringOwner.borrowed(filename.view()), records: JsonParseRecords.make(runtime, source),
     key: unsafe OwnedAtom.adopt(runtime, 0) }
-  unsafe HeapCell.retain(context)
   let mut value = ValueBits.Undefined
-  let result = run Effect.result(unsafe parseDocument(&mut s, &mut hooks, memory, captureRecords, &mut value))
+  let result = run Effect.result(parseDocument(&mut s, &mut hooks, memory, captureRecords, &mut value))
   match move result {
     Result<(), OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow>.Success { .. } => {
       let records = Intrinsic.replace(s.records, JsonParseRecords.make(runtime, source))
       let mut captured = Option<JsonParseRecords<'src>>.none()
       if captureRecords { captured = Option<JsonParseRecords<'src>>.some(move records) }
-      unsafe gc.releaseHeader(&mut hooks, runtime, context)
       return ParsedJson { runtime: runtime, rootValue: value, sourceRecords: move captured }
     }
     Result<(), OutOfMemoryError | StringLengthError | BigIntError | SyntaxError | ParserStackOverflow>.Failure { error } => {
       unsafe s.records.destroy(&mut hooks)
       unsafe gc.release(&mut hooks, runtime, value)
-      unsafe gc.releaseHeader(&mut hooks, runtime, context)
       fail move error
     }
   }

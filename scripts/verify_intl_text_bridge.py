@@ -49,6 +49,7 @@ def main():
     build=a.build_dir.resolve();build.mkdir(parents=True,exist_ok=True)
     shutil.copytree(ROOT/'src',build/'src',dirs_exist_ok=True)
     shutil.copyfile(ROOT/'silk.toml',build/'silk.toml')
+    shutil.copyfile(ROOT/'startup.order',build/'startup.order')
     (build/'src/js_intl_text_fixture_cases.silk').write_text(generated(selected,not a.skip_faults))
     oracle_source=c_source([(name,source) for name,source,_,_ in portable],[])
     foreign_setup=r'''

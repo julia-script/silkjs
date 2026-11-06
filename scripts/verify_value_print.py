@@ -191,6 +191,7 @@ def main():
     build=a.build_dir.resolve();build.mkdir(parents=True,exist_ok=True)
     shutil.copytree(ROOT/'src',build/'src',dirs_exist_ok=True)
     shutil.copyfile(ROOT/'silk.toml',build/'silk.toml')
+    shutil.copyfile(ROOT/'startup.order',build/'startup.order')
     (build/'src/js_value_print_cases_generated.silk').write_text(generated(rows,not a.skip_faults))
     (build/'oracle.c').write_text(oracle_source(rows))
     (build/'cases.json').write_text(json.dumps([r[0] for r in rows],indent=2))

@@ -256,6 +256,7 @@ def main():
         expected=process([str(tmp/'oracle')],args.timeout,owner='Pinned Intl text C execution')
         shutil.copytree(ROOT/'src',tmp/'src')
         shutil.copyfile(ROOT/'silk.toml',tmp/'silk.toml')
+        shutil.copyfile(ROOT/'startup.order',tmp/'startup.order')
         (tmp/'src/intl_text_probe.silk').write_text(native_source(values,units,pairs))
         process([executable_path(args.silk),'build','src/intl_text_probe.silk','-o',str(tmp/'native'),'--stdlib',str(args.stdlib.resolve()),'--optimization','speed','--debug','false'],args.timeout,owner='Native Intl text compilation',cwd=tmp)
         actual=process([str(tmp/'native')],args.timeout,owner='Native Intl text execution')

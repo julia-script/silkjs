@@ -1,0 +1,166 @@
+//! Opt-in bytecode coverage. Instruction counts and conditional edges are measured,
+//! never reconstructed from source text. The registry explicitly retains/releases
+//! each raw ValueBits bytecode edge independently of the compiling value's owner.
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_value { ValueBits }
+import js_core_types { FunctionBytecode, RuntimeState, ModuleDef, refreshObservation }
+import js_debugger_metadata { Location }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_opcode_data as op
+
+pub const NO_PC: usize = 18446744073709551615
+pub struct Counter {
+  pub location: Location, pub count: u64,
+  pub conditional: bool, pub nextPc: usize, pub targetPc: usize,
+  pub taken: u64, pub fallthrough: u64
+}
+impl Copy for Counter {}
+pub struct FunctionCounters {
+  pub bytecode: ValueBits, pub address: usize, pub scriptId: u64,
+  pub entryCount: u64, pub counters: List<Counter>
+}
+pub struct State {
+  pub enabled: bool, pub functions: List<FunctionCounters>, pub cached: usize, pub cachedAddress: usize
+}
+impl State {
+  pub fn make() -> Self { return Self { enabled: false, functions: List<FunctionCounters>.make(), cached: 0, cachedAddress: 0 } }
+}
+fn increment(value: u64) -> u64 { if value == 18446744073709551615 { return value } return value + 1 }
+fn indexOf(state: &State, address: usize) -> usize {
+  if state.cachedAddress == address { return state.cached }
+  let mut index: usize = 0
+  while index < state.functions.length() {
+    if state.functions.asSlice()[index].address == address { return index }
+    index = index + 1
+  }
+  return index
+}
+fn counterAt(counters: &List<Counter>, pc: usize) -> usize {
+  let mut low: usize = 0 let mut high = counters.length()
+  while low < high {
+    let middle = low + (high - low) / 2
+    if u32.toUsize(counters.get(middle).location.pc) < pc { low = middle + 1 } else { high = middle }
+  }
+  return low
+}
+/// Called once per compiled/restored tree, after metadata relocation. Duplicate roots
+/// are harmless. No bytecode pointer is retained until all fallible work succeeds.
+pub unsafe effect fn register(runtime: *mut HeapHeader, reference: *mut HeapHeader) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  if !state.coverage.enabled { return }
+  let address = Pointer.address<HeapHeader>(reference)
+  if indexOf(&state.coverage, address) < state.coverage.functions.length() { return }
+  drop state
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference)
+  // A pre-existing stripped tree has no trustworthy executable denominator.
+  // Do not turn absence of metadata into a synthetic fully covered function.
+  if !code.debuggerMetadata.enabled { return }
+  let scriptId = code.scriptId let children = code.constants.length()
+  let mut counters = List<Counter>.make()
+  run counters.reserveExact(code.debuggerMetadata.locations.length())
+  let mut index: usize = 0
+  while index < code.debuggerMetadata.locations.length() {
+    let location = code.debuggerMetadata.locations.get(index) let pc = u32.toUsize(location.pc)
+    let opcode = unsafe code.code.byte(pc)
+    let conditional = opcode == op.OP_if_false || opcode == op.OP_if_true || opcode == op.OP_if_false8 || opcode == op.OP_if_true8
+    let size = u8.toUsize(op.opcodeInfo(opcode, true).size)
+    let mut target = pc + size
+    if conditional {
+      let mut displacement: u32 = u8.toU32(unsafe code.code.byte(pc + 1))
+      let mut negative = displacement >= 128 let mut magnitude: usize = 256
+      if size == 5 {
+        displacement = displacement | u32.shiftLeft(u8.toU32(unsafe code.code.byte(pc + 2)), 8) | u32.shiftLeft(u8.toU32(unsafe code.code.byte(pc + 3)), 16) | u32.shiftLeft(u8.toU32(unsafe code.code.byte(pc + 4)), 24)
+        negative = displacement >= 2147483648 magnitude = 4294967296
+      }
+      if negative { target = pc + 1 - (magnitude - u32.toUsize(displacement)) }
+      else { target = pc + 1 + u32.toUsize(displacement) }
+    }
+    // A conditional whose destinations coincide has only one executable edge.
+    run counters.append(Counter { location: location, count: 0, conditional: conditional && target != pc + size,
+      nextPc: pc + size, targetPc: target, taken: 0, fallthrough: 0 })
+    index = index + 1
+  }
+  drop code
+  let writable = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  run writable.coverage.functions.reserve(1)
+  writable.coverage.cachedAddress = 0
+  let owned = unsafe (ValueBits.FunctionBytecode { reference: reference }).retained()
+  run writable.coverage.functions.append(FunctionCounters { bytecode: owned, address: address,
+    scriptId: scriptId, entryCount: 0, counters: move counters })
+  drop writable
+  index = 0
+  while index < children {
+    let parent = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference)
+    let child = parent.constants.get(index) drop parent
+    if let ValueBits.FunctionBytecode { reference: nested } = child { run unsafe register(runtime, nested) }
+    index = index + 1
+  }
+}
+/// Before instruction dispatch, with previousPc belonging to this same activation.
+/// Callers reset previousPc on entry/exception and never share it between frames.
+/// Disabled cost is one flag check; enabled recording does not allocate or call JS.
+pub unsafe fn record(runtime: *mut HeapHeader, reference: *mut HeapHeader, pc: usize, previousPc: usize) -> () {
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  if !state.coverage.enabled { return }
+  let address = Pointer.address<HeapHeader>(reference)
+  let index = indexOf(&state.coverage, address)
+  state.coverage.cached = index state.coverage.cachedAddress = address
+  if index == state.coverage.functions.length() { return }
+  let entries = state.coverage.functions.asMutSlice() let entry = &mut entries[index]
+  if pc == 0 { entry.entryCount = increment(entry.entryCount) }
+  let current = counterAt(&entry.counters, pc)
+  if current < entry.counters.length() {
+    let mut counter = entry.counters.get(current)
+    if u32.toUsize(counter.location.pc) == pc { counter.count = increment(counter.count) entry.counters.set(current, counter) }
+  }
+  if previousPc == NO_PC { return }
+  let previous = counterAt(&entry.counters, previousPc)
+  if previous < entry.counters.length() {
+    let mut counter = entry.counters.get(previous)
+    if u32.toUsize(counter.location.pc) == previousPc && counter.conditional {
+      if pc == counter.targetPc { counter.taken = increment(counter.taken) }
+      else if pc == counter.nextPc { counter.fallthrough = increment(counter.fallthrough) }
+      entry.counters.set(previous, counter)
+    }
+  }
+}
+pub unsafe effect fn registerCompiled(runtime: *mut HeapHeader, compiled: ValueBits) -> () ! OutOfMemoryError ? &mut Allocator {
+  if let ValueBits.FunctionBytecode { reference } = compiled { run unsafe register(runtime, reference) }
+  else if let ValueBits.Module { reference } = compiled {
+    let anchor = () let module = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, reference)
+    let function = module.functionObject drop module
+    run unsafe registerCompiled(runtime, function)
+  }
+}
+/// Native counter allocation cannot enter JS or trigger collection, so the GC list
+/// stays stable. Trees compiled without location metadata are deliberately excluded;
+/// enabling coverage affects future compilation, not previously discarded metadata.
+pub unsafe effect fn registerExisting(runtime: *mut HeapHeader) -> () ! OutOfMemoryError ? &mut Allocator {
+  let anchor = ()
+  let mut walk = unsafe gc.walkCells(runtime)
+  while let Option<*mut HeapHeader>.Some { value: reference } = Pointer.nonNullMut<HeapHeader>(unsafe gc.nextCell(&mut walk)) {
+    let header = unsafe Pointer.borrow<(), HeapHeader>(&anchor, reference)
+    let bytecode = header.kind == HeapKind.FunctionBytecode
+    drop header
+    if bytecode { run unsafe register(runtime, reference) }
+  }
+}
+/// Invoke before runtime destruction as well as explicit stop. Release outside the
+/// runtime payload borrow: bytecode finalizers can inspect the runtime themselves.
+pub unsafe fn stop<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader) -> () {
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.coverage.enabled = false state.coverage.cached = 0 state.coverage.cachedAddress = 0
+  refreshObservation(&mut state)
+  let entries = Intrinsic.replace(state.coverage.functions, List<FunctionCounters>.make()) drop state
+  let mut index: usize = 0
+  while index < entries.length() { unsafe gc.release(&mut hooks, runtime, entries.asSlice()[index].bytecode) index = index + 1 }
+}

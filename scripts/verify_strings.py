@@ -381,7 +381,7 @@ import silk.core.result { Result }
 import silk.core.option { Option }
 import silk.collections.list { List }
 import silk.collections.slice { Slice }
-import silk.io.writer_native { StdoutWriter }
+import silk.io.writer_native { StdoutWriter, StderrWriter }
 import silk.io.writer { Writer, WriterError }
 import silk.num.f64
 import silk.num.i32
@@ -716,10 +716,25 @@ effect fn probe()->() ! OutOfMemoryError | StringLengthError | EmbeddedNullError
     run Writer.writeAll(size.asSlice()) run Writer.writeAll(out.asSlice()) i=i+1
   }
 }
-pub effect fn main()->i32 ! OutOfMemoryError | StringLengthError | EmbeddedNullError | WriterError {
+effect fn execute()->i32 ! OutOfMemoryError | StringLengthError | EmbeddedNullError | WriterError {
   let mut allocator=Allocator.systemAllocatorProvider() let mut writer=StdoutWriter.make()
   run probe() |> Effect.provideMut<Allocator>(&mut allocator) |> Effect.provideMut<Writer>(&mut writer)
   return 0
+}
+effect fn stringLengthFailure(error: StringLengthError)->i32 ! WriterError {
+  drop error
+  let mut writer=StderrWriter.make()
+  run Writer.writeAll(b"Native string probe failed: StringLengthError\n") |> Effect.provideMut<Writer>(&mut writer)
+  return 1
+}
+effect fn embeddedNullFailure(error: EmbeddedNullError)->i32 ! WriterError {
+  drop error
+  let mut writer=StderrWriter.make()
+  run Writer.writeAll(b"Native string probe failed: EmbeddedNullError\n") |> Effect.provideMut<Writer>(&mut writer)
+  return 1
+}
+pub effect fn main()->i32 ! OutOfMemoryError | WriterError {
+  return run execute() |> Effect.catch<StringLengthError>(stringLengthFailure) |> Effect.catch<EmbeddedNullError>(embeddedNullFailure)
 }
 '''
 
@@ -1057,6 +1072,8 @@ def main():
     upstream = args.upstream.expanduser().resolve()
     pins = validate_pins(upstream)
     silk, cc = executable_path(args.silk), executable_path(args.cc)
+    sdk = toolchain.sdkroot()
+    cflags = ['-isysroot', sdk] if sdk else []
     stdlib = args.stdlib.expanduser().resolve() if args.stdlib else None
     cases = fixtures(args.seed, args.random_cases)
     data = u32(len(cases)) + b''.join(case.wire() for case in cases)
@@ -1065,7 +1082,7 @@ def main():
         temp = Path(directory).resolve()
         (temp / 'oracle.c').write_text(C_SOURCE)
         process([cc, '-O2', '-std=gnu11', '-fwrapv', '-funsigned-char',
-                 '-U__SIZEOF_INT128__', '-D_GNU_SOURCE',
+                 '-U__SIZEOF_INT128__', '-D_GNU_SOURCE', *cflags,
                  '-DCONFIG_VERSION="differential"', '-I', str(upstream), str(temp / 'oracle.c'),
                  *(str(upstream / name) for name in SUPPORT), '-lm', '-lpthread',
                  '-o', str(temp / 'oracle')], args.timeout, owner='C32 oracle compilation')
