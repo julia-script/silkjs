@@ -733,6 +733,11 @@ class Cldr:
                     cr = c.find('cr')
                     entry['types'][c.get('type')] = cr.text if cr is not None and cr.text else ''
             self.rules[locale] = entry
+        # CLDR's parentLocales for the collations component: Bokmål and Nynorsk files are
+        # empty and take the Norwegian tailoring.
+        for child, parent in COLLATION_PARENTS.items():
+            if not self.rules[child]['types']:
+                self.rules[child] = {'default': self.rules[parent]['default'], 'types': dict(self.rules[parent]['types'])}
 
     def rule_text(self, locale, ctype):
         entry = self.rules.get(locale)
@@ -873,7 +878,14 @@ def reorder_table(root, codes):
         g = groups[i]
         table.append((g[1], g[2], start - g[1]))
         start += g[2] - g[1]
-    return [x for x in table if x[2] != 0]
+    # Neighboring groups that move by the same amount make one range.
+    merged = []
+    for low, high, delta in sorted(x for x in table if x[2] != 0):
+        if merged and merged[-1][1] == low and merged[-1][2] == delta:
+            merged[-1] = (merged[-1][0], high, delta)
+        else:
+            merged.append((low, high, delta))
+    return merged
 
 
 class Collator:
@@ -1247,7 +1259,55 @@ def ce_bytes(ce):
     return out
 
 
-def encode_record(tailoring):
+LATIN_LIMIT = 0x180
+LATIN_BAIL = 0xFFFFFFFF
+
+
+COLLATION_PARENTS = {'nb': 'no', 'nn': 'no'}
+# Splits a context entry's code points from the reversed context before them.
+CONTEXT_SEPARATOR = 0x110000
+LATIN_JOINER_SET = set()
+# Code points after the first of any contraction of the root or a tailoring.
+CONTINUATION_SET = set()
+
+
+def latin_ces(collator):
+    """Per code point below LATIN_LIMIT: its CEs (raw, before reordering and shifting) when
+    it has at most two and no contraction, prefix or context can join it with a neighbor
+    below LATIN_LIMIT, else None. The fast paths need only these."""
+    t = collator.t
+    keys = [k for k in t.mappings if k[0] != 'ctx' and len(k) > 1]
+    keys += [k for k in collator.root.ces if len(k) > 1 and k[0] not in t.suppressed
+             and k[0] not in (0xFDD0, 0xFDD1) and k not in t.mappings]
+    # The second code point of a root prefix mapping (l|middle dot) depends on the first.
+    CONTINUATION_SET.update(c for k in list(t.mappings) + list(collator.root.ces) if k[0] != 'ctx' for c in k[1:])
+    CONTINUATION_SET.update(c for k in t.mappings if k[0] == 'ctx' for c in k[2][1:])
+    joined = {c for _, c in collator.root.prefix_ces}
+    out = []
+    for c in range(LATIN_LIMIT):
+        n = tuple(ord(x) for x in nfd(chr(c)))
+        if c in joined or any(len(k) > len(n) and k[:len(n)] == n and k[len(n)] < LATIN_LIMIT for k in keys):
+            out.append(None)
+            continue
+        # A code point from LATIN_LIMIT up that continues a contraction of a covered one is a
+        # combining mark or in LATIN_JOINERS; the wide-string fast path stops at either.
+        LATIN_JOINER_SET.update(k[len(n)] for k in keys if len(k) > len(n) and k[:len(n)] == n
+                                and not unicodedata.combining(chr(k[len(n)])))
+        ces = [tuple(ce) for ce in collator.ces(chr(c))]
+        out.append(tuple(ces) if len(ces) <= 2 else None)
+    return out
+
+
+def latin_bytes(entry):
+    """Two CEs as u32 primary, u32 secondary, u16 tertiary; a missing CE is all zero and a
+    code point the fast paths leave alone has LATIN_BAIL as its first primary."""
+    if entry is None:
+        entry = ((LATIN_BAIL, 0, 0),)
+    ces = list(entry) + [(0, 0, 0)] * (2 - len(entry))
+    return b''.join(le(p, 4) + le(s, 4) + le(t, 2) for p, s, t in ces)
+
+
+def encode_record(tailoring, root_latin, root):
     """One tailoring record; see the data file's comment on `records()` for the layout."""
     singles = []
     for key, ces in tailoring.mappings.items():
@@ -1278,7 +1338,7 @@ def encode_record(tailoring):
     contexts = []
     for key, ces in tailoring.mappings.items():
         if key[0] == 'ctx':
-            contexts.append((tuple(key[1] + key[2]), ces))
+            contexts.append((tuple(key[2]) + (CONTEXT_SEPARATOR,) + tuple(reversed(key[1])), ces))
         elif not (len(key) == 1 and key[0] in chained):
             entries.append((tuple(key), ces))
     entries.sort()
@@ -1331,7 +1391,7 @@ def encode_record(tailoring):
         head += le(start, 4) + le(limit, 4) + le(delta, 4)
     head += b''.join(le(c, 4) for c in suppressed)
     fields_at = len(head)
-    head += bytes(4 * 12)
+    head += bytes(4 * 14)
     parts = []
     def place(data):
         parts.append(data)
@@ -1346,9 +1406,19 @@ def encode_record(tailoring):
     page_table_at = place(page_table)
     pages_at = place(pages)
     values_at = place(values)
+    latin = latin_ces(Collator(root, tailoring))
+    bits = 0
+    latin_values = bytearray()
+    for c in range(LATIN_LIMIT):
+        if latin[c] != root_latin[c]:
+            bits |= 1 << c
+            latin_values += latin_bytes(latin[c])
+    latin_bits_at = place(bits.to_bytes(LATIN_LIMIT // 8, 'little'))
+    latin_values_at = place(bytes(latin_values))
     fields = [len(entries), len(contexts), len(chains), width, entry_index_at, entries_at,
-              context_index_at, contexts_at, chain_index_at, chains_at, page_table_at, values_at]
-    head[fields_at:fields_at + 48] = b''.join(le(v, 4) for v in fields)
+              context_index_at, contexts_at, chain_index_at, chains_at, page_table_at, values_at,
+              latin_bits_at, latin_values_at]
+    head[fields_at:fields_at + 4 * len(fields)] = b''.join(le(v, 4) for v in fields)
     # pages and values follow the page table directly.
     assert pages_at == page_table_at + len(page_table) and values_at == pages_at + len(pages)
     return bytes(head) + b''.join(parts)
@@ -1386,6 +1456,7 @@ def generate(common):
     emitter = Emitter(cldr)
     tables = emitter.root_tables()
     han = emitter.han_tables()
+    root_latin = latin_ces(Collator(root, cldr.build('root', 'standard')))
     records = bytearray()
     built = {}
     locale_rows = []
@@ -1398,7 +1469,7 @@ def generate(common):
             if ctype.startswith('private') or (locale, ctype) in SKIPPED_TYPES:
                 continue
             tailoring = cldr.build(locale, ctype)
-            data = encode_record(tailoring)
+            data = encode_record(tailoring, root_latin, root)
             if data not in built:
                 built[data] = len(records)
                 records += data
@@ -1408,7 +1479,10 @@ def generate(common):
         default = entry['default']
         locale_rows.append((locale, TYPE_IDS.index(default), types))
     locales = bytearray()
+    locale_index = bytearray()
+    assert [r[0] for r in locale_rows] == sorted(r[0] for r in locale_rows)
     for name, default, types in locale_rows:
+        locale_index += le(len(locales), 4)
         locales += bytes([len(name)]) + name.encode() + bytes([default, len(types)])
         for t, offset in types:
             locales += bytes([t]) + le(offset, 4)
@@ -1438,6 +1512,15 @@ def generate(common):
         f'pub const UNASSIGNED_PRIMARY: u32 = {UNASSIGNED_BASE}',
         f'pub const FFFD_PRIMARY: u32 = {FFFD_PRIMARY}',
         f'pub const FFFF_PRIMARY: u32 = {FFFF_PRIMARY}',
+        f'pub const LOCALE_COUNT: usize = {len(locale_rows)}',
+        f'pub const LATIN_LIMIT: u32 = {LATIN_LIMIT}',
+        f'pub const LATIN_BAIL: u32 = {LATIN_BAIL}',
+        f'pub const CONTEXT_SEPARATOR: u32 = {CONTEXT_SEPARATOR}',
+        '/// Code points from LATIN_LIMIT up, not combining marks, that continue a contraction',
+        '/// of a code point the Latin tables cover.',
+        '/// Every code point after the first of a contraction, sorted.',
+        'pub const CONTINUATIONS: [u32; %d] = [%s]' % (len(CONTINUATION_SET), ', '.join(str(c) for c in sorted(CONTINUATION_SET))),
+        'pub const LATIN_JOINERS: [u32; %d] = [%s]' % (len(LATIN_JOINER_SET), ', '.join(str(c) for c in sorted(LATIN_JOINER_SET))),
         f'pub const ITEM_COUNT: usize = {tables["item_count"]}',
         f'pub const CONTRACTION_COUNT: usize = {tables["contraction_count"]}',
         f'pub const PREFIX_COUNT: usize = {len(tables["prefix"]) // 10}',
@@ -1476,6 +1559,13 @@ def generate(common):
         "pub fn ascii() -> &'static [u8] {",
         '  return ' + literal(tables['ascii']),
         '}',
+        '/// Per code point below LATIN_LIMIT, its root CEs for the fast paths, 20 bytes: two CEs of',
+        '/// u32 primary, u32 secondary and u16 tertiary (all zero for a missing one), or LATIN_BAIL',
+        '/// as the first primary when the code point needs the full path (more than two CEs, or a',
+        '/// contraction or prefix mapping can join it with a neighbor).',
+        "pub fn latinRoot() -> &'static [u8] {",
+        '  return ' + literal(b''.join(latin_bytes(e) for e in root_latin)),
+        '}',
         '/// The Han blocks in root order: u32 first and last code point.',
         "pub fn hanBlocks() -> &'static [u8] {",
         '  return ' + literal(blocks),
@@ -1498,20 +1588,28 @@ def generate(common):
         "pub fn locales() -> &'static [u8] {",
         '  return ' + literal(locales),
         '}',
+        '/// The u32 offset of each `locales()` row, in byte order of the names.',
+        "pub fn localeIndex() -> &'static [u8] {",
+        '  return ' + literal(locale_index),
+        '}',
         '/// Tailoring records. A record: u8 flags (bits 0-1 caseFirst: 0 off, 1 lower, 2 upper; bit 2',
         '/// backwards secondary; bit 3 shifted), u8 reorder count, u16 suppressed count, the reorder',
         '/// ranges (u32 start, u32 limit, i32 delta of a primary), the u32 code points whose root',
-        '/// contractions are suppressed, then twelve u32 fields: entry, context and chain counts, the',
+        '/// contractions are suppressed, then fourteen u32 fields: entry, context and chain counts, the',
         '/// chain value width, and the offsets (from the record start) of the entry index, entries,',
-        '/// context index, contexts, chain index, chains, page table and member values. An index holds u32 offsets',
+        '/// context index, contexts, chain index, chains, page table, member values, Latin bits and',
+        '/// Latin values. An index holds u32 offsets',
         '/// relative to its list, sorted by code points. An entry: u8 length, u24 code points (a',
-        '/// context entry starts with the previous code point), u8 CE count and the CEs. A CE is a',
+        '/// context entry has its code points, CONTEXT_SEPARATOR, then the code points before them',
+        '/// that it needs, nearest first), u8 CE count and the CEs. A CE is a',
         '/// u8 flag byte, a u32 primary, then a u32 secondary if flag bit 0 is set and a u16',
         '/// tertiary if bit 1 is set; a missing one is the common weight. A chain: u32 first member,',
         '/// u8 level, u8 CE count and the CEs; member n of the',
         '/// chain adds n to the last CE at that level. The page table has 1024 u16 slots (0xffff for',
         '/// none) per 256 code points; then the pages (u32 rank, 32 bytes of member bits) and per',
-        '/// rank the member number in the value width.',
+        '/// rank the member number in the value width. The Latin bits mark the code points below',
+        '/// LATIN_LIMIT whose fast-path CEs differ from `latinRoot()`; their values follow in code',
+        '/// point order, 20 bytes each, in the same form.',
         "pub fn records() -> &'static [u8] {",
         '  return ' + literal(records),
         '}',
