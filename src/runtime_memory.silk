@@ -511,42 +511,95 @@ where &mut A provides &Allocator from &mut Allocator {
       let ledger = self.ledger
       let class = (requested - 1) / POOL_GRANULE
       match Pointer.nonNullMut<u8>(unsafe takeOwned(ledger, class)) {
-        Option<*mut u8>.Some { value: block } => { return unsafe adoptPooled(ledger, block, move layout) }
+        Option<*mut u8>.Some { value: block } => { return unsafe adoptPooled(ledger, block, move layout, false) }
         Option<*mut u8>.None => ()
       }
-      return run allocatePooledSlow<A>(&mut self, move layout, class)
+      return run allocatePooledSlow<A>(&mut self, move layout, class, false)
     }
-    return run allocateUnpooled<A>(&mut self, move layout)
+    return run allocateUnpooled<A>(&mut self, move layout, false)
+  }
+  // Pooled blocks are reused, so their zeros are written here; an unpooled block
+  // comes from the child's own zeroed storage, untouched pages and all.
+  effect fn allocateZeroed(self: &mut Self, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
+    let requested = layout.bytes
+    let requestedAlignment = layout.alignment
+    if self.pooling && requested != 0 && requested <= POOL_CLASSES * POOL_GRANULE && requestedAlignment != 0
+      && requestedAlignment <= POOL_GRANULE && usize.bitAnd(requestedAlignment, requestedAlignment - 1) == 0 {
+      let ledger = self.ledger
+      let class = (requested - 1) / POOL_GRANULE
+      match Pointer.nonNullMut<u8>(unsafe takeOwned(ledger, class)) {
+        Option<*mut u8>.Some { value: block } => { return unsafe adoptPooled(ledger, block, move layout, true) }
+        Option<*mut u8>.None => ()
+      }
+      return run allocatePooledSlow<A>(&mut self, move layout, class, true)
+    }
+    return run allocateUnpooled<A>(&mut self, move layout, true)
+  }
+  /// A block from the owner cache, the gate-free part of allocate's pooled path,
+  /// or null. It is released with releasePooled like any pooled block.
+  unsafe effect fn takeBlock(self: &mut Self, layout: Layout) -> ?*mut u8 {
+    let requested = layout.bytes
+    let alignment = layout.alignment
+    if !self.pooling || requested == 0 || requested > POOL_CLASSES * POOL_GRANULE || alignment == 0 || alignment > POOL_GRANULE
+      || usize.bitAnd(alignment, alignment - 1) != 0 { return Pointer.null<u8>() }
+    let block = unsafe takeOwned(self.ledger, (requested - 1) / POOL_GRANULE)
+    if let Option<*mut u8>.Some { value } = Pointer.nonNullMut<u8>(block) { unsafe recordPooled(self.ledger, value, requested) }
+    return block
+  }
+}
+
+// The child's allocate, or its allocateZeroed when zeroed.
+effect fn childAllocate<A>(child: &mut A, layout: Layout, zeroed: bool) -> Intrinsic.Allocation
+  ! OutOfMemoryError where &mut A provides &Allocator from &mut Allocator {
+  if zeroed { return run Allocator.allocateZeroed(move layout) |> Effect.provideMut<Allocator>(&mut child) }
+  return run Allocator.allocate(move layout) |> Effect.provideMut<Allocator>(&mut child)
+}
+
+/// Writes count zero bytes from at.
+pub unsafe fn zeroBytes(at: *mut u8, count: usize) -> () {
+  let bytes = unsafe Pointer.assumeManyMut<u8>(at)
+  let mut index: usize = 0
+  while index < count {
+    unsafe Pointer.write<u8>(unsafe Pointer.atMut<u8>(bytes, index), 0)
+    index = index + 1
   }
 }
 
 // The rest of a pooled allocation once the owned free list is empty, out of line
 // so the common free-list pop above needs no callee-saved registers or frame.
 @inlineNever
-effect fn allocatePooledSlow<A>(self: &mut RuntimeAllocator<A>, layout: Layout, class: usize) -> Intrinsic.Allocation
+effect fn allocatePooledSlow<A>(self: &mut RuntimeAllocator<A>, layout: Layout, class: usize, zeroed: bool) -> Intrinsic.Allocation
   ! OutOfMemoryError where &mut A provides &Allocator from &mut Allocator {
   let ledger = self.ledger
   if unsafe claimShared(ledger, class) {
     match Pointer.nonNullMut<u8>(unsafe takeOwned(ledger, class)) {
-      Option<*mut u8>.Some { value: block } => { return unsafe adoptPooled(ledger, block, move layout) }
+      Option<*mut u8>.Some { value: block } => { return unsafe adoptPooled(ledger, block, move layout, zeroed) }
       Option<*mut u8>.None => ()
     }
   }
-  return run refill<A>(&mut self, move layout, class)
+  return run refill<A>(&mut self, move layout, class, zeroed)
 }
 
+// Gives a block leaving the pool its allocation id and, while profiling, its sample:
+// every pooled block handed out, through allocate or takeBlock, carries a fresh record.
 @inlineAlways
-unsafe fn adoptPooled(ledger: LedgerPointers, block: *mut u8, layout: Layout) -> Intrinsic.Allocation {
+unsafe fn recordPooled(ledger: LedgerPointers, block: *mut u8, requestedBytes: usize) -> () {
   let mut anchor = ()
   let state = unsafe Pointer.borrowMut(&mut anchor, ledger.allocation)
   let record = AllocationRecord { id: state.nextAllocationId, address: Pointer.address(block),
-    requestedBytes: layout.bytes, chargedBytes: unsafe pooledBlockBytes(block) }
+    requestedBytes: requestedBytes, chargedBytes: unsafe pooledBlockBytes(block) }
   state.nextAllocationId = state.nextAllocationId + 1
   let profiling = state.profiling
   drop state
   let epoch = if profiling { unsafe profilePooledAllocation(ledger, record) } else { 0 }
   unsafe Pointer.write<PoolRecord>(unsafe pooledRecord(block),
-    PoolRecord { id: record.id, requestedBytes: layout.bytes, sampledEpoch: epoch })
+    PoolRecord { id: record.id, requestedBytes: requestedBytes, sampledEpoch: epoch })
+}
+
+@inlineAlways
+unsafe fn adoptPooled(ledger: LedgerPointers, block: *mut u8, layout: Layout, zeroed: bool) -> Intrinsic.Allocation {
+  if zeroed { unsafe zeroBytes(block, layout.bytes) }
+  unsafe recordPooled(ledger, block, layout.bytes)
   let reclaim: extern "C" fn(?*mut u8) -> () = silkRuntimeMemoryReclaimPooled
   return unsafe Intrinsic.allocationAdopt(block, move layout, reclaim, block)
 }
@@ -668,7 +721,7 @@ unsafe fn carveCount(start: ?*mut u8, left: usize, blockBytes: usize) -> usize {
 // Carves the next page of an empty class's arena into blocks (taking a new arena
 // when the current one is used up), then takes the first of them.
 @inlineNever
-effect fn refill<A>(self: &mut RuntimeAllocator<A>, layout: Layout, class: usize) -> Intrinsic.Allocation
+effect fn refill<A>(self: &mut RuntimeAllocator<A>, layout: Layout, class: usize, zeroed: bool) -> Intrinsic.Allocation
   ! OutOfMemoryError where &mut A provides &Allocator from &mut Allocator {
   let ledger = self.ledger
   let before = self.stats()
@@ -738,7 +791,7 @@ effect fn refill<A>(self: &mut RuntimeAllocator<A>, layout: Layout, class: usize
   }
   if unsafe claimShared(ledger, class) {
     match Pointer.nonNullMut<u8>(unsafe takeOwned(ledger, class)) {
-      Option<*mut u8>.Some { value: block } => { return unsafe adoptPooled(ledger, block, move layout) }
+      Option<*mut u8>.Some { value: block } => { return unsafe adoptPooled(ledger, block, move layout, zeroed) }
       Option<*mut u8>.None => ()
     }
   }
@@ -748,7 +801,7 @@ effect fn refill<A>(self: &mut RuntimeAllocator<A>, layout: Layout, class: usize
 
 // Every request the pool does not serve: a child allocation with its own header.
 @inlineNever
-effect fn allocateUnpooled<A>(self: &mut RuntimeAllocator<A>, layout: Layout) -> Intrinsic.Allocation
+effect fn allocateUnpooled<A>(self: &mut RuntimeAllocator<A>, layout: Layout, zeroed: bool) -> Intrinsic.Allocation
   ! OutOfMemoryError where &mut A provides &Allocator from &mut Allocator {
   let header = Layout.of<AllocationHeader>()
   // Layout literals can bypass Layout.make; reject invalid alignment before arithmetic.
@@ -776,8 +829,7 @@ effect fn allocateUnpooled<A>(self: &mut RuntimeAllocator<A>, layout: Layout) ->
   // The provider is exclusively borrowed. While the child runs, only reclaims can
   // change usage, and those only decrease it. No reservation or peak change is
   // needed: child failure leaves the ledger untouched, even across suspension.
-  let acquired = run Effect.result(Allocator.allocate(Layout { bytes: chargedBytes, alignment: alignment }))
-    |> Effect.provideMut<Allocator>(&mut self.child)
+  let acquired = run Effect.result(childAllocate<A>(&mut self.child, Layout { bytes: chargedBytes, alignment: alignment }, zeroed))
   let allocation = match move acquired {
     Result<Intrinsic.Allocation, OutOfMemoryError>.Success { value } => move value
     Result<Intrinsic.Allocation, OutOfMemoryError>.Failure { error } => {
