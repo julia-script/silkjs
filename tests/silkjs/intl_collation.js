@@ -61,3 +61,25 @@ assert(new Intl.Collator("de", { usage: 'search', sensitivity: 'base' }).compare
 assert(new Intl.Collator("sv", { usage: 'search', sensitivity: 'base' }).compare("ä", "æ"), 0, "sv search");
 assert('ä'.localeCompare('z', 'sv'), 1, 'localeCompare sv');
 assert('ä'.localeCompare('z', 'de'), -1, 'localeCompare de');
+// Strings past Latin-1 on the fast pass (Czech ch, Uzbek oʻ next to a euro sign), Norwegian
+// for nb and nn, Japanese contexts after voiced kana, keycap emoji, and one bound compare.
+assert(sorted("cs", {}, ["Chž", "chč", "ch€", "cič", "cž", "c€", "hč", "h€", "č€"]), ["c€", "cič", "cž", "č€", "h€", "hč", "ch€", "chč", "Chž"], "cs {} c€");
+assert(sorted("uz", {}, ["gʻ€", "g€", "h€", "o'€", "oʻ€", "o‘€", "o€", "z€"]), ["g€", "h€", "o€", "z€", "o'€", "oʻ€", "o‘€", "gʻ€"], "uz {} g€");
+assert(sorted("uz", {}, ["g", "gʻ", "h", "o", "o'", "oʻ", "o‘", "z"]), ["g", "h", "o", "z", "o'", "oʻ", "o‘", "gʻ"], "uz {} g");
+assert(sorted("nb", {}, ["a", "aa", "z", "Æ", "ä", "å", "ö", "ø"]), ["a", "z", "Æ", "ä", "ø", "ö", "å", "aa"], "nb {} a");
+assert(sorted("nn", {}, ["a", "aa", "z", "Æ", "å", "ø"]), ["a", "z", "Æ", "ø", "å", "aa"], "nn {} a");
+assert(sorted("ja", {}, ["かあ", "かー", "カア", "カイ", "カー", "ガア", "ガー", "キイ", "キー"]), ["かー", "カー", "かあ", "カア", "ガー", "ガア", "カイ", "キー", "キイ"], "ja {} カー");
+assert(sorted("ru", {}, ["Ёж", "еж", "ель", "жук", "иод", "йод", "яр", "ёж"]), ["еж", "ёж", "Ёж", "ель", "жук", "иод", "йод", "яр"], "ru {} еж");
+assert(sorted("el", {}, ["Αλφα", "άλφα", "αλφα", "βήτα", "ωμέγα"]), ["αλφα", "Αλφα", "άλφα", "βήτα", "ωμέγα"], "el {} αλφα");
+assert(sorted("zh", {}, ["上海", "中国", "中文", "人民", "大家", "日本"]), ["大家", "人民", "日本", "上海", "中国", "中文"], "zh {} 大家");
+assert(sorted("ko", {}, ["ㄱ", "가", "가나", "각", "까", "나"]), ["ㄱ", "가", "가나", "각", "까", "나"], "ko {} ㄱ");
+assert(sorted("en", {"sensitivity": "base"}, ["Resume", "resume", "resume€", "rèsumé€", "résumé"]), ["Resume", "resume", "résumé", "resume€", "rèsumé€"], "en {\"sensitivity\": \"base\"} résumé");
+assert(sorted("de", {}, ["ae", "az", "áb", "ä", "b", "ä"]), ["ä", "ä", "áb", "ae", "az", "b"], "de {} ä");
+assert(sorted("en", {"collation": "emoji"}, ["#", "#⃣", "#️⃣", "a", "😀"]), ["#", "😀", "#⃣", "#️⃣", "a"], "en {\"collation\": \"emoji\"} #");
+const bound = new Intl.Collator("en");
+assert(bound.compare === bound.compare, true, "compare is bound once");
+assert(["b", "a", "c"].sort(bound.compare), ["a", "b", "c"], "bound compare sorts");
+assert('ガー'.localeCompare('カー', 'ja', { sensitivity: 'base' }), 0, 'ja long vowel after voiced kana');
+let thrown = false;
+try { ["b", { toString() { throw new Error("boom"); } }].sort(bound.compare); } catch (e) { thrown = e.message === "boom"; }
+assert(thrown, true, 'sort with a Collator compare converts non-strings');
