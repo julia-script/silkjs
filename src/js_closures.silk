@@ -3,7 +3,7 @@
 //! closure/closure2 consume bytecode on every outcome; closure2 also consumes its
 //! freshly allocated, empty function. Classes must already be installed by the
 //! corresponding intrinsic (async classes are not registered by this module).
-import thin_list { ThinList, BoxList }
+import thin_list { ThinList, BoxList, BOX_HEADER }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.collections.list { List }
@@ -39,6 +39,7 @@ import js_exceptions { JsException }
 import js_string_types { StringLengthError }
 import js_bigint { BigIntError }
 import js_atom_data as atoms
+import js_atoms { AtomTable }
 import js_class_data as classes
 /// Failures caught without wrapping the success in a Result (see js_caught).
 struct FailedOom { error: OutOfMemoryError }
@@ -67,7 +68,7 @@ unsafe fn capture(bytecode: *mut HeapHeader, index: usize) -> ClosureVar {
   return b.closureVars.get(index)
 }
 unsafe effect fn fill<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, function: ValueRef<'b>, bytecode: *mut HeapHeader,
-  inherited: &[?*mut HeapHeader], frame: ?*mut StackFrame, isEval: bool) -> ()
+  inherited: &[?*mut HeapHeader], frame: ?*mut StackFrame, isEval: bool, room: ?*mut u8) -> ()
   ! OutOfMemoryError | JsException ? &mut Allocator { let context = realm.context()
   let rt = realm.runtime()
   let anchor = () let b = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
@@ -79,7 +80,12 @@ unsafe effect fn fill<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks>(h
   // grows, so the loop stores through this element pointer.
   let references = match &mut p.payload {
     ObjectPayload.BytecodeFunction { function: closure } => {
-      closure.varRefs = run BoxList<?*mut HeapHeader>.makeFilled(count, Pointer.null<HeapHeader>())
+      // room, when not null, is the function cell's own tail sized for count
+      // (closure, inlineReferenceCells): the table needs no allocation of its own.
+      match Pointer.nonNullMut<u8>(room) {
+        Option<*mut u8>.Some { value } => { closure.varRefs = unsafe BoxList<?*mut HeapHeader>.borrowingFilled(value, count, Pointer.null<HeapHeader>()) }
+        Option<*mut u8>.None => { closure.varRefs = run BoxList<?*mut HeapHeader>.makeFilled(count, Pointer.null<HeapHeader>()) }
+      }
       unsafe Pointer.assumeManyMut<?*mut HeapHeader>(unsafe closure.varRefs.elementsMut())
     }
     _ => trap()
@@ -133,7 +139,14 @@ unsafe effect fn fill<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks>(h
   }
 }
 pub unsafe effect fn closure2<'a, H: HeapHooks + OwnPropertyHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, function: ValueBits, bytecode: *mut HeapHeader,
-  inherited: &[?*mut HeapHeader], frame: ?*mut StackFrame, scope: ?*mut HeapHeader, isEval: bool) -> ValueBits ! JsException ? &mut Allocator {
+  inherited: &[?*mut HeapHeader], frame: ?*mut StackFrame, scope: ?*mut HeapHeader, isEval: bool, room: ?*mut u8) -> ValueBits ! JsException ? &mut Allocator {
+  return run unsafe closureWith(&mut hooks, realm, function, bytecode, inherited, frame, scope, isEval, room)
+}
+/// closure2, inlined into closure's common path: its nine arguments cost more
+/// to pass than most of its body.
+@inlineAlways
+unsafe effect fn closureWith<'a, H: HeapHooks + OwnPropertyHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, function: ValueBits, bytecode: *mut HeapHeader,
+  inherited: &[?*mut HeapHeader], frame: ?*mut StackFrame, scope: ?*mut HeapHeader, isEval: bool, room: ?*mut u8) -> ValueBits ! JsException ? &mut Allocator {
   let mut anchor = () let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node(function))
   match &p.payload { ObjectPayload.Empty => () _ => trap() }
   // The closure owns a reference to the scope current at its creation.
@@ -141,7 +154,7 @@ pub unsafe effect fn closure2<'a, H: HeapHooks + OwnPropertyHooks + CoercionHook
   p.payload = ObjectPayload.BytecodeFunction { function: BytecodeClosure {
     bytecode: bytecode, homeObject: Pointer.null<HeapHeader>(), varRefs: BoxList<?*mut HeapHeader>.make(), scope: scope
   } } drop p
-  let result = run Effect.result(unsafe fill(&mut hooks, realm, unsafe lendBits(&function, function), bytecode, inherited, frame, isEval))
+  let result = run Effect.result(unsafe fill(&mut hooks, realm, unsafe lendBits(&function, function), bytecode, inherited, frame, isEval, room))
   match move result {
     Result<(), OutOfMemoryError | JsException>.Success { .. } => { return function }
     Result<(), OutOfMemoryError | JsException>.Failure { error } => {
@@ -149,6 +162,15 @@ pub unsafe effect fn closure2<'a, H: HeapHooks + OwnPropertyHooks + CoercionHook
       unsafe gc.release(&mut hooks, realm.runtime(), function) fail JsException {}
     }
   }
+}
+/// The most closure references kept in the function cell's own tail.
+const INLINE_REFERENCES: usize = 7
+/// The 16-byte tail cells after a closure's property slots that hold its table
+/// of count references (BoxList header and elements), or 0 when it has none or
+/// too many to keep in the cell.
+fn inlineReferenceCells(count: usize) -> usize {
+  if count == 0 || count > INLINE_REFERENCES { return 0 }
+  return (BOX_HEADER + count * 8 + 15) / 16
 }
 fn classFor(kind: FunctionKind) -> u32 {
   return match kind {
@@ -190,11 +212,14 @@ effect fn lazy<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H, realm: Realm
 // transitions, and no empty shape revived only to be retired again. Returns
 // Undefined, having created nothing, when the chain isn't interned yet.
 unsafe effect fn shapedFunction<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H, memory: &AllocationObserver,
-  realm: Realm<'a>, classId: u32, hasPrototype: bool, name: u32, length: u16) -> ValueBits
+  realm: Realm<'a>, classId: u32, hasPrototype: bool, name: u32, length: u16, extra: usize) -> ValueBits
   ! OutOfMemoryError | JsException ? &mut Allocator { let context = realm.context()
   let rt = realm.runtime()
-  // Allocates (and may collect), so it runs before the shape walk.
-  let text = run functions.atomString(&mut hooks, realm, name)
+  // Allocates (and may collect), so it runs before the shape walk. A name that
+  // is not an integer atom is the atom's own string, read without the call.
+  let mut text = ValueBits.Undefined
+  if AtomTable.isInteger(name) { text = run functions.atomString(&mut hooks, realm, name) }
+  else { let atomAnchor = () let named = realm.runtimeState(&atomAnchor) text = named.atoms.storedValue(name, true) }
   let anchor = () let ctx = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
   let mut prototype: ?*mut HeapHeader = Pointer.null<HeapHeader>()
   match ctx.classPrototypes.get(u32.toUsize(classId)) { ValueBits.Object { reference } => { prototype = reference } _ => () }
@@ -226,8 +251,7 @@ unsafe effect fn shapedFunction<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H,
     }
   }
   unsafe shapes.take(rt, present(target))
-  let allocated = run Effect.result(unsafe objects.fromShape(&mut hooks, memory, realm, present(target), classId,
-    Option<ThinList<SlotBits>>.none()))
+  let allocated = run Effect.result(unsafe objects.functionFromShape(&mut hooks, memory, realm, present(target), classId, extra))
   let function = match move allocated {
     Result<ValueBits, OutOfMemoryError>.Success { value } => value
     Result<ValueBits, OutOfMemoryError>.Failure { error } => { unsafe gc.release(&mut hooks, rt, text) fail move error }
@@ -272,13 +296,15 @@ pub unsafe effect fn closure<'a, H: HeapHooks + OwnPropertyHooks + CoercionHooks
   let bytecode = match bytecodeValue { ValueBits.FunctionBytecode { reference } => reference _ => trap() }
   let anchor = () let b = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
   let kind = b.kind let hasPrototype = b.hasPrototype let length = b.definedArgumentCount
+  // fill builds a reference for each capture but the trailing scope captures.
+  let references = b.closureVars.length() - u16.toUsize(b.scopeCaptures)
   // An anonymous function takes inferredName (nonzero only when the OP_set_name
   // that would rename it right after creation was folded into this call).
   let mut name = b.name if name == 0 { name = inferredName } if name == 0 { name = atoms.JS_ATOM_empty_string } drop b
   let mut fresh = ValueBits.Undefined
   if kind != FunctionKind.Generator && kind != FunctionKind.AsyncGenerator {
     let shaped = run Intrinsic.catchFailure<OutOfMemoryError | JsException>(
-      unsafe shapedFunction(&mut hooks, memory, realm, classFor(kind), hasPrototype, name, length), failedConfigure)
+      unsafe shapedFunction(&mut hooks, memory, realm, classFor(kind), hasPrototype, name, length, inlineReferenceCells(references)), failedConfigure)
     match move shaped {
       ValueBits value => { fresh = value }
       FailedConfigure { error } => {
@@ -286,7 +312,11 @@ pub unsafe effect fn closure<'a, H: HeapHooks + OwnPropertyHooks + CoercionHooks
         unsafe gc.release(&mut hooks, realm.runtime(), bytecodeValue) fail JsException {}
       }
     }
-    if fresh.isObject() { return run unsafe closure2(&mut hooks, realm, fresh, bytecode, inherited, frame, scope, isEval) }
+    if fresh.isObject() {
+      let mut room = Pointer.null<u8>()
+      if inlineReferenceCells(references) != 0 { room = unsafe objects.functionTail(node(fresh)) }
+      return run unsafe closureWith(&mut hooks, realm, fresh, bytecode, inherited, frame, scope, isEval, room)
+    }
   }
   let allocated = run Intrinsic.catchFailure<OutOfMemoryError>(objects.withClass(&mut hooks, memory, realm, classFor(kind)), failedOom)
   fresh = match move allocated {
@@ -296,7 +326,7 @@ pub unsafe effect fn closure<'a, H: HeapHooks + OwnPropertyHooks + CoercionHooks
       unsafe gc.release(&mut hooks, realm.runtime(), bytecodeValue) fail JsException {}
     }
   }
-  let function = run unsafe closure2(&mut hooks, realm, fresh, bytecode, inherited, frame, scope, isEval)
+  let function = run unsafe closure2(&mut hooks, realm, fresh, bytecode, inherited, frame, scope, isEval, Pointer.null<u8>())
   let configured = run Intrinsic.catchFailure<OutOfMemoryError | JsException>(
     configure(&mut hooks, memory, realm, unsafe lendBits(&function, function), kind, hasPrototype, name, length), failedConfigure)
   match move configured {
