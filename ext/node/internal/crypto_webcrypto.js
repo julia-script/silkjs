@@ -5,9 +5,10 @@ const crypto = require('crypto');
 const codecs = require('internal/crypto_keys');
 const records = new WeakMap(), token = Symbol('CryptoKey');
 require('internal/host').types.isCryptoKey = value => records.has(value);
-// Node treats detached ArrayBuffers and typed arrays as empty. Reading a
-// detached DataView's byteLength still throws before this normalization.
-function binary(value, name) { if ((ArrayBuffer.isView(value) || value instanceof ArrayBuffer) && value.byteLength === 0) return Buffer.alloc(0); return c.binary(value, name); }
+// Node treats detached ArrayBuffers and typed arrays as empty, but rejects a
+// detached DataView: V8 still throws from its byteLength getter, which now
+// reports 0 under the current spec.
+function binary(value, name) { if (value instanceof DataView && value.buffer.detached) throw new TypeError('Cannot perform get DataView.prototype.byteLength on a detached ArrayBuffer'); if ((ArrayBuffer.isView(value) || value instanceof ArrayBuffer) && value.byteLength === 0) return Buffer.alloc(0); return c.binary(value, name); }
 function exception(name, message) { if (typeof DOMException === 'function') return new DOMException(message, name); const e = new Error(message); e.name = name; return e; }
 function fail(name, message) { throw exception(name, message); }
 function brand(receiver, expected, name) {
