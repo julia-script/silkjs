@@ -75,3 +75,35 @@ assert(new Intl.DateTimeFormat("zh", { ...{"hour": "numeric", "dayPeriod": "shor
 assert(new Intl.DateTimeFormat("ko", { ...{"hour": "numeric", "dayPeriod": "short"}, timeZone: 'UTC' }).format(new Date('2026-03-20T03:00Z')), "아침 3시", "ko 03:00 {\"hour\": \"numeric\", \"dayPeriod\": \"short\"}");
 assert(new Intl.DateTimeFormat("es-CO", { ...{"dayPeriod": "narrow"}, timeZone: 'UTC' }).format(new Date('2026-03-20T12:00Z')), "m.", "es-CO 12:00 {\"dayPeriod\": \"narrow\"}");
 assert(new Intl.DateTimeFormat("ja", { ...{"dayPeriod": "long"}, timeZone: 'UTC' }).format(new Date('2026-03-20T22:00Z')), "夜", "ja 22:00 {\"dayPeriod\": \"long\"}");
+
+// Time zone names from CLDR: specific, generic, location and localized GMT forms, as ICU picks
+// them. Expected values match Node 24.
+const zoneName = (locale, timeZone, kind, when) => new Intl.DateTimeFormat(locale, { timeZone, timeZoneName: kind }).formatToParts(new Date(when)).find((part) => part.type === "timeZoneName").value;
+assert(zoneName("en", "America/New_York", "short", "2024-01-15T12:00Z"), "EST", "en America/New_York short 2024-01-15T12:00Z");
+assert(zoneName("en", "America/New_York", "long", "2024-07-15T12:00Z"), "Eastern Daylight Time", "en America/New_York long 2024-07-15T12:00Z");
+assert(zoneName("en", "America/New_York", "shortGeneric", "2024-07-15T12:00Z"), "ET", "en America/New_York shortGeneric 2024-07-15T12:00Z");
+assert(zoneName("en-GB", "America/New_York", "shortGeneric", "2024-07-15T12:00Z"), "New York Time", "en-GB America/New_York shortGeneric 2024-07-15T12:00Z");
+assert(zoneName("en", "Europe/Berlin", "shortGeneric", "2024-01-15T12:00Z"), "Germany Time", "en Europe/Berlin shortGeneric 2024-01-15T12:00Z");
+assert(zoneName("de", "Europe/Berlin", "short", "2024-07-15T12:00Z"), "MESZ", "de Europe/Berlin short 2024-07-15T12:00Z");
+assert(zoneName("en", "America/Sao_Paulo", "longGeneric", "2024-01-15T12:00Z"), "Brasilia Standard Time", "en America/Sao_Paulo longGeneric 2024-01-15T12:00Z");
+assert(zoneName("en", "America/Phoenix", "longGeneric", "2024-07-15T12:00Z"), "Mountain Standard Time", "en America/Phoenix longGeneric 2024-07-15T12:00Z");
+assert(zoneName("en", "Asia/Kolkata", "shortOffset", "2024-01-15T12:00Z"), "GMT+5:30", "en Asia/Kolkata shortOffset 2024-01-15T12:00Z");
+assert(zoneName("sv", "America/New_York", "longOffset", "2024-01-15T12:00Z"), "GMT−05:00", "sv America/New_York longOffset 2024-01-15T12:00Z");
+assert(zoneName("fa", "Asia/Tehran", "shortOffset", "2024-01-15T12:00Z"), "‎+۳:۳۰ گرینویچ", "fa Asia/Tehran shortOffset 2024-01-15T12:00Z");
+assert(zoneName("fi", "Asia/Kathmandu", "longOffset", "2024-01-15T12:00Z"), "UTC+05.45", "fi Asia/Kathmandu longOffset 2024-01-15T12:00Z");
+assert(zoneName("he", "UTC", "shortOffset", "2024-01-15T12:00Z"), "GMT‎+0‎", "he UTC shortOffset 2024-01-15T12:00Z");
+assert(zoneName("fr", "UTC", "short", "2024-01-15T12:00Z"), "UTC", "fr UTC short 2024-01-15T12:00Z");
+assert(zoneName("en", "Europe/Dublin", "long", "2024-01-15T12:00Z"), "Greenwich Mean Time", "en Europe/Dublin long 2024-01-15T12:00Z");
+assert(zoneName("en", "Europe/Dublin", "long", "2024-07-15T12:00Z"), "Irish Standard Time", "en Europe/Dublin long 2024-07-15T12:00Z");
+assert(zoneName("en", "America/Chihuahua", "long", "2024-07-15T12:00Z"), "Central Standard Time", "en America/Chihuahua long 2024-07-15T12:00Z");
+assert(zoneName("pt-PT", "Africa/Algiers", "shortGeneric", "2024-07-15T12:00Z"), "CET (Argel)", "pt-PT Africa/Algiers shortGeneric 2024-07-15T12:00Z");
+assert(zoneName("en", "America/New_York", "long", "1960-07-01T12:00Z"), "GMT-04:00", "en America/New_York long 1960-07-01T12:00Z");
+assert(zoneName("ja", "America/Los_Angeles", "longGeneric", "2024-07-15T12:00Z"), "米国太平洋時間", "ja America/Los_Angeles longGeneric 2024-07-15T12:00Z");
+assert(zoneName("en", "+00:00", "long", "2024-07-15T12:00Z"), "Greenwich Mean Time", "en +00:00 long 2024-07-15T12:00Z");
+assert(zoneName("en", "Etc/GMT", "long", "2024-07-15T12:00Z"), "Coordinated Universal Time", "en Etc/GMT long 2024-07-15T12:00Z");
+assert(zoneName("en", "Etc/GMT+5", "long", "2024-07-15T12:00Z"), "GMT-05:00", "en Etc/GMT+5 long 2024-07-15T12:00Z");
+assert(zoneName("en", "America/Anguilla", "shortGeneric", "2024-07-15T12:00Z"), "AST", "en America/Anguilla shortGeneric 2024-07-15T12:00Z");
+assert(zoneName("en", "Antarctica/Troll", "longGeneric", "2024-07-15T12:00Z"), "Troll Station Time", "en Antarctica/Troll longGeneric 2024-07-15T12:00Z");
+assert(new Intl.DateTimeFormat("de", {"timeZone":"UTC","timeZoneName":"short"}).format(new Date("2024-07-15T12:00Z")), "15.7.2024, UTC", "de {\"timeZone\":\"UTC\",\"timeZoneName\":\"short\"}");
+assert(new Intl.DateTimeFormat("en", {"timeZone":"America/New_York","dateStyle":"full","timeStyle":"full"}).format(new Date("2024-07-15T12:00Z")), "Monday, July 15, 2024 at 8:00:00 AM Eastern Daylight Time", "en {\"timeZone\":\"America/New_York\",\"dateStyle\":\"full\",\"timeStyle\":\"full\"}");
+assert(new Intl.DateTimeFormat("en", {"timeZone":"America/New_York","hour":"numeric","timeZoneName":"shortGeneric"}).format(new Date("2024-07-15T12:00Z")), "8 AM ET", "en {\"timeZone\":\"America/New_York\",\"hour\":\"numeric\",\"timeZoneName\":\"shortGeneric\"}");
