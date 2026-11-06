@@ -1,4 +1,5 @@
-import silk.mem.allocator { Allocator, OutOfMemoryError, SystemAllocator }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import ext.diagnostics_fatal { RuntimeHeap }
 import silkjs.js_owned_value { Value, lendFor }
 import silkjs.js_realm { lendRealm }
 import silk.core.effect { Effect }
@@ -10,7 +11,9 @@ import silk.mem.pointer { Pointer }
 import silk.num.u32
 import silk.num.usize
 import silk.num.i64
-import silkjs.runtime_memory { RuntimeAllocator, AllocationObserver, AllocationFailureHandler }
+import silkjs.runtime_memory { RuntimeAllocator, AllocationObserver }
+import ext.diagnostics_fatal { ReportingAllocator }
+import ext.diagnostics_hub { Mailbox }
 import silkjs.js_atomics_native { WaiterDomain, SynchronizationError }
 import silkjs.js_runtime_registry { ClassIdAllocator }
 import silkjs.js_libc_process { Process }
@@ -61,7 +64,6 @@ import ext.sqlite_native
 import ext.napi_native
 import ext.profile_native
 import ext.inspector_native
-import ext.process_diagnostics as diagnostics
 import ext.intl_native
 import ext.wasm_native
 import ext.wasi_native
@@ -199,7 +201,7 @@ unsafe effect fn configure<'m>(engine: &mut Engine<'m, Services>, context: *mut 
   let bootstrap = run unsafe common.get(&mut engine, context, unsafe global(context), b"__silkRuntime")
   return bootstrap
 }
-unsafe effect fn execute<'m>(engine: &mut Engine<'m, Services>, context: *mut HeapHeader, arguments: &List<Bytes>, process: &Process, allocator: *mut RuntimeAllocator<SystemAllocator>) -> i32
+unsafe effect fn execute<'m>(engine: &mut Engine<'m, Services>, context: *mut HeapHeader, arguments: &List<Bytes>, process: &Process, allocator: *mut RuntimeHeap) -> i32
   ! OutOfMemoryError | JsException | StringLengthError | ModuleMetadataError ? &mut Allocator {
   let intrinsicMemory = engine.memory
   run errorIntrinsics.enableNodeStackFormatting(&mut engine, intrinsicMemory, unsafe lendRealm(&context, context))
@@ -208,14 +210,15 @@ unsafe effect fn execute<'m>(engine: &mut Engine<'m, Services>, context: *mut He
   let io = unsafe Intrinsic.pointerRequalify<?*mut fs_async.State, *mut fs_async.State>(engine.services.io)
   let workers = unsafe Intrinsic.pointerRequalify<?*mut worker_native.State, *mut worker_native.State>(engine.services.workers)
   run unsafe worker_native.attach(workers, unsafe fs_async.loopPointer(io))
-  engine.services.inspector = run inspector_native.create(unsafe worker_native.loopAnchor(workers))
+  let mailbox = match unsafe worker_native.mailbox(workers) { Option<Mailbox>.Some { value } => value _ => { Intrinsic.trap("worker diagnostics are not attached") } }
+  engine.services.inspector = run inspector_native.create(unsafe worker_native.loopAnchor(workers), mailbox)
   engine.services.network = run net_native.open(unsafe fs_async.loopPointer(io))
   engine.services.tls = run tls_native.open()
   engine.services.compression = run compression_native.open()
   engine.services.processes = run process_native.make(unsafe fs_async.loopPointer(io), workers)
   engine.services.http2 = run http2_native.open()
   engine.services.sqlite = run sqlite_native.open(allocator)
-  engine.services.napi = run napi_native.open(allocator)
+  engine.services.napi = run napi_native.open(allocator, unsafe Intrinsic.pointerReinterpret<*mut worker_native.State, *mut u8>(workers))
   engine.services.intl = run intl_native.open(process.namespace.clone())
   let wasm = run wasm_native.open(allocator)
   engine.services.wasm = wasm
@@ -223,7 +226,7 @@ unsafe effect fn execute<'m>(engine: &mut Engine<'m, Services>, context: *mut He
   engine.services.wasi = run wasi_native.open(allocator)
   engine.services.httpParser = run http_parser_native.open(allocator)
   engine.services.tracing = run trace_native.open(allocator)
-  engine.services.sea = run sea_native.open()
+  engine.services.sea = run sea_native.open(&unsafe worker_native.groupResources(workers))
   let bootstrap = run unsafe configure(&mut engine, context, arguments, process)
   let rt = unsafe runtime.contextRuntime(context)
   engine.services.normalize = run unsafe common.get(&mut engine, context, bootstrap, b"normalize")
@@ -256,7 +259,7 @@ unsafe effect fn execute<'m>(engine: &mut Engine<'m, Services>, context: *mut He
   unsafe gc.release(&mut engine, rt, value)
   return code
 }
-unsafe effect fn realm<'m>(engine: &mut Engine<'m, Services>, rt: *mut HeapHeader, arguments: &List<Bytes>, process: &Process, allocator: *mut RuntimeAllocator<SystemAllocator>) -> i32
+unsafe effect fn realm<'m>(engine: &mut Engine<'m, Services>, rt: *mut HeapHeader, arguments: &List<Bytes>, process: &Process, allocator: *mut RuntimeHeap) -> i32
   ! OutOfMemoryError | JsException ? &mut Allocator {
   let memory = engine.memory
   let context = run unsafe intrinsics.create(&mut engine, memory, rt)
@@ -266,7 +269,7 @@ unsafe effect fn realm<'m>(engine: &mut Engine<'m, Services>, rt: *mut HeapHeade
     Result<i32, OutOfMemoryError | JsException | StringLengthError | ModuleMetadataError>.Success { value } => { status = value }
     Result<i32, OutOfMemoryError | JsException | StringLengthError | ModuleMetadataError>.Failure { error } => {
       match move error {
-        OutOfMemoryError exhausted => { unsafe diagnostics.fatal(b"runtime execution", b"Native allocator exhausted") drop exhausted }
+        OutOfMemoryError exhausted => { unsafe worker_native.fatal(unsafe Intrinsic.pointerRequalify<?*mut worker_native.State, *mut worker_native.State>(engine.services.workers), b"runtime execution", b"Native allocator exhausted") drop exhausted }
         _ => ()
       }
       let exception = unsafe exceptions.take(rt)
@@ -408,17 +411,11 @@ unsafe effect fn realm<'m>(engine: &mut Engine<'m, Services>, rt: *mut HeapHeade
   unsafe gc.releaseHeader(&mut engine, rt, context)
   return status
 }
-unsafe extern "C" fn abort() -> ()
-export "C" fn silkRuntimeAllocationFailure(requested: usize) -> () {
-  unsafe diagnostics.fatal(b"native allocator", b"Native memory allocation failed")
-  unsafe abort()
-}
 unsafe effect fn runtimeBody(workers: *mut worker_native.State, arguments: &List<Bytes>, process: &Process) -> i32 ! OutOfMemoryError ? &mut Allocator {
   let mut services = Services.make() services.workers = workers
-  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
-  allocator.setFailureHandler(Option<AllocationFailureHandler>.some(silkRuntimeAllocationFailure))
+  let mut allocator = run RuntimeAllocator.make(unsafe worker_native.reportingAllocator(workers))
   let memory = run allocator.observe()
-  let allocatorPointer = Pointer.fromMutRef<RuntimeAllocator<SystemAllocator>>(&mut allocator)
+  let allocatorPointer = Pointer.fromMutRef<RuntimeHeap>(&mut allocator)
   let rt = run runtime.allocateRuntimeStorage(stack.currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut allocator)
   unsafe debugger.configureCompilation(rt, true)
   unsafe worker_native.configureRuntime(workers, rt)
@@ -452,13 +449,11 @@ unsafe effect fn runtimeBody(workers: *mut worker_native.State, arguments: &List
 }
 unsafe effect fn executeRuntime(workers: *mut worker_native.State, arguments: &List<Bytes>, process: &Process) -> i32 ! OutOfMemoryError ? &mut Allocator {
   let outcome = run Effect.result(unsafe runtimeBody(workers, arguments, process))
+  if let Result<i32, OutOfMemoryError>.Failure { .. } = &outcome { unsafe worker_native.fatal(workers, b"runtime initialization", b"Native allocator exhausted") }
   unsafe worker_native.close(workers)
   return match move outcome {
     Result<i32, OutOfMemoryError>.Success { value } => value
-    Result<i32, OutOfMemoryError>.Failure { error } => {
-      unsafe diagnostics.fatal(b"runtime initialization", b"Native allocator exhausted")
-      fail move error
-    }
+    Result<i32, OutOfMemoryError>.Failure { error } => { fail move error }
   }
 }
 pub effect fn executeProgram(arguments: &List<Bytes>) -> i32 ! OutOfMemoryError | SynchronizationError ? &mut Allocator {

@@ -1,6 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
 #include "inspector_transport.h"
-#include "process_diagnostics.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -561,45 +560,3 @@ int silk_inspector_disconnect(silk_inspector *s, uint64_t connection) {
     if (!connection) return EINVAL;
     return outgoing(s, SILK_INSPECTOR_CLOSE, connection, NULL, 0);
 }
-
-/* The shared diagnostics registry owns routing and wake-handle retirement.
- * A fixed byte envelope is alignment-independent and contains no pointers. */
-static uint32_t load32(const unsigned char *p) {
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-static void store32(unsigned char *p, uint32_t value) {
-    for (unsigned i = 0; i < 4; i++) p[i] = (unsigned char)(value >> (i * 8));
-}
-int silk_inspector_route_send(uint32_t target, uint32_t source, uint64_t session,
-                              uint32_t kind, const unsigned char *bytes, size_t length) {
-    if (!session || kind < SILK_INSPECTOR_OPEN || kind > SILK_INSPECTOR_ROUTE_RESPONSE ||
-        length > MESSAGE_LIMIT || (length && !bytes)) return EINVAL;
-    unsigned char envelope[16];
-    store32(envelope, source); store32(envelope + 4, kind);
-    store32(envelope + 8, (uint32_t)session); store32(envelope + 12, (uint32_t)(session >> 32));
-    return silk_diagnostics_post_parts(target, 1, envelope, sizeof(envelope), bytes, length);
-}
-int silk_inspector_route_pending(void) { return silk_diagnostics_message_pending(1); }
-unsigned char *silk_inspector_route_take(size_t *length) {
-    if (!length) return NULL;
-    for (;;) {
-        size_t total = 0;
-        unsigned char *p = silk_diagnostics_take(1, &total);
-        if (!p) { *length = 0; return NULL; }
-        if (total >= 16 && total <= MESSAGE_LIMIT + 16) {
-            uint32_t kind = load32(p + 4);
-            int has_session = load32(p + 8) || load32(p + 12);
-            int message = kind >= SILK_INSPECTOR_OPEN && kind <= SILK_INSPECTOR_ROUTE_RESPONSE && has_session;
-            int lifecycle = (kind == SILK_INSPECTOR_OWNER_ATTACHED || kind == SILK_INSPECTOR_OWNER_DETACHED) &&
-                            !has_session && total == 16 && load32(p) != 0 && load32(p) != UINT32_MAX;
-            if (message || lifecycle) { *length = total - 16; return p; }
-        }
-        silk_diagnostics_release(p);
-    }
-}
-uint32_t silk_inspector_route_source(const unsigned char *p) { return load32(p); }
-uint32_t silk_inspector_route_kind(const unsigned char *p) { return load32(p + 4); }
-uint64_t silk_inspector_route_session(const unsigned char *p) { return (uint64_t)load32(p + 8) | ((uint64_t)load32(p + 12) << 32); }
-const unsigned char *silk_inspector_route_data(const unsigned char *p) { return p + 16; }
-void silk_inspector_route_free(unsigned char *p) { silk_diagnostics_release(p); }
-int silk_inspector_route_wait(uint32_t timeout_ms) { return silk_diagnostics_wait(timeout_ms); }
