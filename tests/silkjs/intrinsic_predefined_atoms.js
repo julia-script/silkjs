@@ -8,7 +8,16 @@ out.push(Reflect.get.name, Promise.prototype.catch.name, Date.prototype.toISOStr
 out.push(Object.prototype.hasOwnProperty.call(Array.prototype, 'Symbol.iterator'));
 out.push(Object.getOwnPropertyDescriptor(globalThis, 'Infinity').writable);
 out.push(Object.getOwnPropertyDescriptor(Promise, Symbol.species).get.call(Promise) === Promise);
+const inherited = Object.create(Math);
+function readLate() { return inherited.__intrinsicProbe; }
+out.push(readLate() === undefined);
+Object.defineProperty(Math, '__intrinsicProbe', { value: 7, writable: true, configurable: true });
+out.push(readLate());
+Math.__intrinsicProbe = 9;
+out.push(readLate());
+delete Math.__intrinsicProbe;
+out.push(readLate() === undefined);
 const got = out.join('\n');
-const expected = 'true\nget [Symbol.species]\n[Symbol.match]\nget __proto__\nget\ncatch\ntoISOString\nfalse\nfalse\ntrue';
+const expected = 'true\nget [Symbol.species]\n[Symbol.match]\nget __proto__\nget\ncatch\ntoISOString\nfalse\nfalse\ntrue\ntrue\n7\n9\ntrue';
 if (got !== expected) throw new Error(got);
 console.log('PASS predefined intrinsic atoms');
