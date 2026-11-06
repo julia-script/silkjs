@@ -10,6 +10,7 @@
 //! an opcode would need its slow path the run just stops, and the caller makes
 //! the ordinary call as if nothing ran. A completed run replaces the call's
 //! operands with the result, as returning from the call would.
+import silk.core.ownership { Copy }
 import silk.core.option { Option }
 import silk.mem.pointer { Pointer }
 import silk.num.u8
@@ -19,13 +20,14 @@ import silk.num.i32
 import silk.num.usize
 import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
-import js_core_types { FunctionBytecode, FrameSlots, RuntimeState, ObjectData, ObjectPayload, StackFrame }
+import js_core_types { FunctionBytecode, FrameSlots, RuntimeState, ObjectData, ObjectPayload, StackFrame, SCOPE_OPERAND, scopeSlot }
 import js_gc { HeapHooks }
 import js_gc as gc
 import js_vm_state { Machine, cellAt, copyCell }
 import js_vm_operators as operators
 import js_vm_property_ops as properties
 import js_var_refs as cells
+import js_scopes as scopes
 import js_primitives as primitives
 import js_class_data as classes
 import js_opcode_data as op
@@ -89,14 +91,14 @@ pub unsafe fn attempt<H: HeapHooks>(hooks: &mut H, caller: *mut Machine, functio
   drop state
   if LEAF_DEPTH * LEAF_CELLS * 16 > room { return false }
   let mut nesting = Outer<H> { hooks: Pointer.fromMutRef<H>(&mut hooks), caller: caller, first: first }
-  return unsafe evaluate<Outer<H>>(&mut nesting, runtime, frame, unsafe references(function, top), code, argv.data, argv.count, receiver, top)
+  return unsafe evaluate<Outer<H>>(&mut nesting, runtime, frame, unsafe captures(function, top), code, argv.data, argv.count, receiver, top)
 }
 /// Runs the leaf code for function with count arguments at arguments and this
 /// receiver, on scratch cells from top. True once nesting completed the call
 /// with its result, borrowed from wherever the run read it; false when an opcode
 /// needs its slow path.
 @inlineNever
-unsafe fn evaluate<N: Nesting>(nesting: &mut N, runtime: *mut HeapHeader, frame: *mut StackFrame, refs: *const ?*mut HeapHeader,
+unsafe fn evaluate<N: Nesting>(nesting: &mut N, runtime: *mut HeapHeader, frame: *mut StackFrame, captured: Captures,
   code: *mut HeapHeader, arguments: *mut ValueBits, count: usize, receiver: *mut ValueBits, top: *mut ValueBits) -> bool {
   let anchor = () let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, code)
   let localCount = u16.toUsize(bytecode.variableCount)
@@ -109,7 +111,7 @@ unsafe fn evaluate<N: Nesting>(nesting: &mut N, runtime: *mut HeapHeader, frame:
   let stack = unsafe cellAt(top, localCount)
   // frame stays the caller's: no fast path reads or publishes a frame.
   let mut s = Machine { context: realm, callerContext: realm, runtime: runtime,
-    bytecode: code, frame: frame, code: ip, constants: constants, closureReferences: refs,
+    bytecode: code, frame: frame, code: ip, constants: constants, closureReferences: captured.references, scope: captured.scope,
     originalArguments: unsafe Intrinsic.pointerRequalify<?*mut FrameSlots, *const FrameSlots>(Pointer.null<FrameSlots>()), arguments: arguments, locals: top, stack: stack,
     thisValue: ValueBits.Undefined, newTarget: ValueBits.Undefined, argumentCount: count, ip: ip, stackTop: stack,
     record: Pointer.null<u8>() }
@@ -181,10 +183,8 @@ unsafe fn evaluate<N: Nesting>(nesting: &mut N, runtime: *mut HeapHeader, frame:
       216 => { let value = unsafe s.argument(3) unsafe s.push(value) } // OP_get_arg3
       // Closure cells and globals: an uninitialized binding throws, which a run leaves to the call.
       91 => { let index = u16.toUsize(unsafe s.readU16()) if !unsafe pushCell(&mut s, index) { return false } } // OP_get_var_ref
-      225 => { if !unsafe pushCell(&mut s, 0) { return false } } // OP_get_var_ref0
-      226 => { if !unsafe pushCell(&mut s, 1) { return false } } // OP_get_var_ref1
-      227 => { if !unsafe pushCell(&mut s, 2) { return false } } // OP_get_var_ref2
-      228 => { if !unsafe pushCell(&mut s, 3) { return false } } // OP_get_var_ref3
+      225 => { let slot = u16.toUsize(unsafe s.readU16()) if !unsafe pushScoped(&mut s, slot) { return false } } // OP_get_scope0
+      228 => { let slot = u16.toUsize(unsafe s.readU16()) if !unsafe pushScoped(&mut s, slot) { return false } } // OP_get_scope0_check
       100 => { let index = u16.toUsize(unsafe s.readU16()) if !unsafe pushCell(&mut s, index) { return false } } // OP_get_var_ref_check
       55 => { let index = u16.toUsize(unsafe s.readU16()) if !unsafe pushCell(&mut s, index) { return false } } // OP_get_var_undef
       56 => { let index = u16.toUsize(unsafe s.readU16()) if !unsafe pushCell(&mut s, index) { return false } } // OP_get_var
@@ -246,7 +246,7 @@ unsafe fn evaluate<N: Nesting>(nesting: &mut N, runtime: *mut HeapHeader, frame:
         // it when done, so neither crosses a 16-byte reload of 8-byte stores.
         let destination = unsafe cellAt(s.stackTop, usize.wrappingSubtract(0, argc + 2))
         if !unsafe isAccessor(inner) || !unsafe accessor(runtime, callee, inner, operands, destination, destination) {
-          if !unsafe nesting.call(runtime, frame, unsafe references(callee, s.stackTop), inner, operands, argc, destination, s.stackTop, destination) { return false }
+          if !unsafe nesting.call(runtime, frame, unsafe captures(callee, s.stackTop), inner, operands, argc, destination, s.stackTop, destination) { return false }
         }
         s.stackTop = unsafe cellAt(destination, 1)
       }
@@ -368,6 +368,10 @@ unsafe fn evaluate<N: Nesting>(nesting: &mut N, runtime: *mut HeapHeader, frame:
   }
   return false
 }
+/// What a closure captured: its capture table (or the aligned stand-in empty
+/// when it has none) and its scope, borrowed; one payload match for both.
+struct Captures { references: *const ?*mut HeapHeader, scope: ?*mut HeapHeader }
+impl Copy for Captures {}
 @inlineAlways
 unsafe fn isAccessor(code: *mut HeapHeader) -> bool {
   let anchor = () let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, code)
@@ -421,7 +425,7 @@ unsafe fn selectAccessor(runtime: *mut HeapHeader, function: ValueBits, ip: *con
   if !unsafe properties.readFieldCachedAt(runtime, unsafe codeAt(ip, 3), object, Pointer.fromMutRef<ValueBits>(&mut left), false) { return false }
   let index = u8.toUsize(unsafe codeByte(ip, 9)) | usize.shiftLeft(u8.toUsize(unsafe codeByte(ip, 10)), 8)
   let mut empty = ValueBits.Undefined
-  let refs = unsafe references(function, Pointer.fromMutRef<ValueBits>(&mut empty))
+  let refs = (unsafe captures(function, Pointer.fromMutRef<ValueBits>(&mut empty))).references
   let cell = match Pointer.nonNullMut<HeapHeader>(unsafe Pointer.read<?*mut HeapHeader>(unsafe Pointer.at<?*mut HeapHeader>(unsafe Pointer.assumeMany<?*mut HeapHeader>(refs), index))) {
     Option<*mut HeapHeader>.Some { value } => value
     Option<*mut HeapHeader>.None => invariant()
@@ -486,13 +490,14 @@ unsafe fn plainAccessor(runtime: *mut HeapHeader, ip: *const u8, object: *mut He
 /// function's capture table, or the aligned stand-in empty when it has none.
 /// Computed where the caller has just matched function's payload, so the two share it.
 @inlineAlways
-unsafe fn references(function: ValueBits, empty: *mut ValueBits) -> *const ?*mut HeapHeader {
+unsafe fn captures(function: ValueBits, empty: *mut ValueBits) -> Captures {
   let object = match function { ValueBits.Object { reference } => reference _ => invariant() }
   let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
   return match &data.payload {
     ObjectPayload.BytecodeFunction { function: closure } => {
-      if closure.varRefs.length() == 0 { return unsafe Intrinsic.pointerRequalify<*mut ?*mut HeapHeader, *const ?*mut HeapHeader>(unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut ?*mut HeapHeader>(empty)) }
-      Pointer.fromRef<?*mut HeapHeader>(&closure.varRefs.asSlice()[0])
+      let mut table = unsafe Intrinsic.pointerRequalify<*mut ?*mut HeapHeader, *const ?*mut HeapHeader>(unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut ?*mut HeapHeader>(empty))
+      if closure.varRefs.length() != 0 { table = Pointer.fromRef<?*mut HeapHeader>(&closure.varRefs.asSlice()[0]) }
+      Captures { references: table, scope: closure.scope }
     }
     _ => invariant()
   }
@@ -511,9 +516,21 @@ unsafe fn checkedLocal(s: &mut Machine) -> bool {
   match value { ValueBits.Uninitialized => { return false } _ => () }
   unsafe s.push(value) return true
 }
+/// A depth-0 scope slot's value, unless uninitialized.
+@inlineAlways
+unsafe fn pushScoped(s: &mut Machine, slot: usize) -> bool {
+  let value = unsafe Pointer.read<ValueBits>(unsafe scopeSlot(unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(s.scope), slot))
+  match value { ValueBits.Uninitialized => { return false } _ => () }
+  unsafe s.push(value) return true
+}
 /// A closure cell or global binding's value, unless uninitialized.
 @inlineAlways
 unsafe fn pushCell(s: &mut Machine, index: usize) -> bool {
+  if index >= u16.toUsize(SCOPE_OPERAND) {
+    let scoped = unsafe Pointer.read<ValueBits>(unsafe scopes.operandSlot(s.scope, usize.toU16(index)))
+    match scoped { ValueBits.Uninitialized => { return false } _ => () }
+    unsafe s.push(scoped) return true
+  }
   let reference = match Pointer.nonNullMut<HeapHeader>(unsafe s.closureReference(index)) {
     Option<*mut HeapHeader>.Some { value } => value
     Option<*mut HeapHeader>.None => invariant()
@@ -608,7 +625,7 @@ interface Nesting {
   /// next instruction may load it whole, which two 8-byte stores would stall.
   unsafe fn completeFrom(self: &mut Self, cell: *mut ValueBits) -> ()
   /// Runs a leaf the run calls, with its result written to result.
-  unsafe fn call(self: &mut Self, runtime: *mut HeapHeader, frame: *mut StackFrame, refs: *const ?*mut HeapHeader, code: *mut HeapHeader,
+  unsafe fn call(self: &mut Self, runtime: *mut HeapHeader, frame: *mut StackFrame, captured: Captures, code: *mut HeapHeader,
     arguments: *mut ValueBits, count: usize, receiver: *mut ValueBits, top: *mut ValueBits, result: *mut ValueBits) -> bool
 }
 struct Outer<H: HeapHooks> { hooks: *mut H, caller: *mut Machine, first: *mut ValueBits }
@@ -628,10 +645,10 @@ impl<H: HeapHooks> Nesting for Outer<H> {
     unsafe release(&mut hooks, self.caller, self.first)
     unsafe Pointer.write<ValueBits>(self.first, unsafe Pointer.read<ValueBits>(cell))
   }
-  unsafe fn call(self: &mut Self, runtime: *mut HeapHeader, frame: *mut StackFrame, refs: *const ?*mut HeapHeader, code: *mut HeapHeader,
+  unsafe fn call(self: &mut Self, runtime: *mut HeapHeader, frame: *mut StackFrame, captured: Captures, code: *mut HeapHeader,
     arguments: *mut ValueBits, count: usize, receiver: *mut ValueBits, top: *mut ValueBits, result: *mut ValueBits) -> bool {
     let mut nested = Inner { result: result }
-    return unsafe evaluate<Inner>(&mut nested, runtime, frame, refs, code, arguments, count, receiver, top)
+    return unsafe evaluate<Inner>(&mut nested, runtime, frame, captured, code, arguments, count, receiver, top)
   }
 }
 impl Nesting for Inner {
@@ -641,7 +658,7 @@ impl Nesting for Inner {
   unsafe fn complete(self: &mut Self, value: ValueBits) -> () { unsafe Pointer.write<ValueBits>(self.result, value) }
   @inlineAlways
   unsafe fn completeFrom(self: &mut Self, cell: *mut ValueBits) -> () { unsafe Pointer.write<ValueBits>(self.result, unsafe Pointer.read<ValueBits>(cell)) }
-  unsafe fn call(self: &mut Self, runtime: *mut HeapHeader, frame: *mut StackFrame, refs: *const ?*mut HeapHeader, code: *mut HeapHeader,
+  unsafe fn call(self: &mut Self, runtime: *mut HeapHeader, frame: *mut StackFrame, captured: Captures, code: *mut HeapHeader,
     arguments: *mut ValueBits, count: usize, receiver: *mut ValueBits, top: *mut ValueBits, result: *mut ValueBits) -> bool { return false }
 }
 /// Completes the call with value, an owned result: the caller's operands from

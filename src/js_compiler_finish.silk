@@ -5,6 +5,7 @@
 //! Input is complete parser IR: child constant indices designate reserved Undefined
 //! slots. When compiling a child directly, its ancestors' scope links must already
 //! be prepared (normal recursive entry performs that preparation before descent).
+import js_scopes as scopes
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
@@ -36,6 +37,8 @@ import js_debug_positions { SourcePositionCache, SourceLocation, definitionPc2Li
 import js_opcode_data as op
 import js_invariant { present }
 import silk.num.u32
+import js_compiler_scopes as scopePlans
+import js_compiler_scopes { ScopePlan }
 
 fn definition(v: CompilerVar, strip: bool) -> VarDef {
   let mut name = v.name if strip { name = 0 }
@@ -84,12 +87,20 @@ effect fn assemble<H: HeapHooks>(hooks: &mut H, tree: &mut FunctionTree, cell: F
     while index < capture.vars.length() { state.captureVar(&mut capture, usize.toI32(index), false) index = index + 1 }
   }
   drop capture
+  // Ancestors of a direct eval or with keep every capture on cells.
+  let finished = tree.get(cell)
+  let dynamic = scopePlans.dynamicScope(&finished.*) let parentCell = finished.parent drop finished
+  if dynamic { match parentCell { Option<FunctionId>.Some { value } => { let outer = tree.getMut(value) outer.subtreeDynamic = true } _ => () } }
   run variables.resolveVariables(&mut tree, cell)
   if deferrable(tree.get(cell), source) { return run defer(&mut tree, cell, source) }
+  let mut scopePlan = run scopePlans.plan(&mut tree, cell)
   run resolveLabels(&mut tree, cell, source)
+  if scopePlan.slots != 0 {
+    let own = tree.getMut(cell) scopePlans.specializeOwn(&mut own.*) run scopePlans.dropScopedLocals(&mut own.*, &mut scopePlan) drop own
+  }
   let fd = tree.getMut(cell)
   run debuggerDetails(&mut fd, source)
-  let header = run finalHeader(&mut fd)
+  let header = run finalHeader(&mut fd, &mut scopePlan)
   let runtime = fd.runtime let context = fd.context
   // Allocate BEFORE moving any JS edge. OOM leaves the complete fd destructible.
   let result = run HeapCell.allocate(HeapKind.FunctionBytecode, move header)
@@ -142,7 +153,7 @@ effect fn debuggerDetails(fd: &mut FunctionDef, source: &[u8]) -> () ! OutOfMemo
 
 /// The finished header for fd after label resolution; its lists stay in fd
 /// until transfer. Failure leaves fd intact and destructible.
-effect fn finalHeader(fd: &mut FunctionDef) -> FunctionBytecode ! OutOfMemoryError | BytecodeError ? &mut Allocator {
+effect fn finalHeader(fd: &mut FunctionDef, scopePlan: &mut ScopePlan) -> FunctionBytecode ! OutOfMemoryError | BytecodeError ? &mut Allocator {
   let facts = run analyze(fd.bytecode.asSlice())
   let stackSize = facts.stackSize
   let borrowsArguments = fd.functionKind == FunctionKind.Normal && fd.varRefCount == 0 && !facts.writesArguments
@@ -150,7 +161,8 @@ effect fn finalHeader(fd: &mut FunctionDef) -> FunctionBytecode ! OutOfMemoryErr
   // function() { target.apply(this, arguments) }: no formal can alias the
   // arguments object, so it is built only if the VM cannot apply in place.
   if fd.functionKind == FunctionKind.Normal && fd.args.length() == 0 && fd.hasSimpleParameterList && !fd.hasEvalCall
-    && fd.argumentsVarIndex >= 0 && fd.argumentsArgIndex < 0 && !fd.vars.get(i32.toUsize(fd.argumentsVarIndex)).isCaptured {
+    && fd.argumentsVarIndex >= 0 && fd.argumentsArgIndex < 0 && !fd.vars.get(i32.toUsize(fd.argumentsVarIndex)).isCaptured
+    && scopePlans.localSlot(&fd.*, fd.argumentsVarIndex, false) < 0 {
     // A captured copy (var a = arguments read by a closure) keeps the object.
     let alias = lazyArgumentsAlias(fd.bytecode.asSlice(), i32.toUsize(fd.argumentsVarIndex))
     let mut site = usize.MAX
@@ -160,7 +172,7 @@ effect fn finalHeader(fd: &mut FunctionDef) -> FunctionBytecode ! OutOfMemoryErr
     if site != usize.MAX { fd.bytecode.set(site, SPECIAL_LAZY_ARGUMENTS) }
   }
   let leaf = fd.functionKind == FunctionKind.Normal && !fd.isDerivedClassConstructor && !fd.hasEvalCall
-    && fd.varRefCount == 0 && fd.vars.length() + u16.toUsize(stackSize) <= LEAF_CELLS && leafCode(fd.bytecode.asSlice())
+    && fd.varRefCount == 0 && scopePlan.slots == 0 && fd.vars.length() + u16.toUsize(stackSize) <= LEAF_CELLS && leafCode(fd.bytecode.asSlice())
   let mut leafFlags: u8 = 0
   if leaf { leafFlags = LEAF_CREDITS if fd.vars.length() != 0 && leafPrefill(fd.bytecode.asSlice(), fd.vars.length()) { leafFlags = leafFlags | LEAF_PREFILL } }
   if leaf && leafAccessor(fd.bytecode.asSlice()) { leafFlags = leafFlags | LEAF_ACCESSOR }
@@ -193,9 +205,11 @@ effect fn finalHeader(fd: &mut FunctionDef) -> FunctionBytecode ! OutOfMemoryErr
     readOnlyBytecode: false, isDirectOrIndirectEval: fd.evalType == 2 || fd.evalType == 3,
     code: ByteStorage.Owned { bytes: List<u8>.make() }, name: 0,
     varDefs: move definitions, closureVars: List<ClosureVar>.make(),
-    argumentCount: usize.toU16(fd.args.length()), variableCount: usize.toU16(fd.vars.length()),
+    argumentCount: usize.toU16(fd.args.length()), variableCount: usize.toU16(fd.vars.length() - scopePlan.droppedLocals),
     definedArgumentCount: i32.toU16(fd.definedArgCount), stackSize: stackSize,
-    varRefCount: i32.toU16(fd.varRefCount), borrowsArguments: borrowsArguments, leaf: leafFlags, constructForm: constructForm(fd.bytecode.asSlice()), realm: fd.context,
+    varRefCount: i32.toU16(fd.varRefCount), scopeCaptures: 0, scopeSlots: scopePlan.slots, scopeVarSlots: scopePlan.varSlots,
+    frameCells: scopes.inlineFrameCells(usize.toU16(fd.vars.length() - scopePlan.droppedLocals), stackSize, i32.toU16(fd.varRefCount), scopePlan.slots),
+    scopeParameters: Intrinsic.replace(scopePlan.parameters, List<u32>.make()), scopeVariables: Intrinsic.replace(scopePlan.variables, List<u16>.make()), borrowsArguments: borrowsArguments, leaf: leafFlags, constructForm: constructForm(fd.bytecode.asSlice()), realm: fd.context,
     constants: List<ValueBits>.make(), debug: Option<FunctionDebugInfo>.none(), pending: Option<Box<PendingFunction>>.none()
   }
 }
@@ -257,18 +271,20 @@ fn deferrable(fd: &FunctionDef, source: &[u8]) -> bool {
   if fd.functionKind != FunctionKind.Normal || fd.isDerivedClassConstructor || fd.hasEvalCall || fd.isEval || fd.bytecodeError { return false }
   // The debugger reads every function's final code, scopes and locations.
   if fd.debuggerMetadata.enabled { return false }
-  if fd.functionType != ParseFunctionKind.Statement && fd.functionType != ParseFunctionKind.Var
-    && fd.functionType != ParseFunctionKind.Expression && fd.functionType != ParseFunctionKind.Arrow { return false }
-  match &fd.module { Option<CellRef<ModuleDef>>.Some { .. } => { return false } _ => () }
-  // Only functions that capture nothing from an enclosing function wait: an
-  // enclosing function's later passes may rewrite how its captured variables
-  // are reached, and a parked definition would miss that rewrite.
+  // Scope planning (js_compiler_scopes.plan) rewrites a function and its finished
+  // descendants while their owner assembles: a function that captures its
+  // parents' variables or has captured locals of its own compiles now.
   let mut i: usize = 0
   while i < fd.closureVars.length() {
     let kind = fd.closureVars.get(i).kind
     if kind == ClosureKind.Local || kind == ClosureKind.Argument || kind == ClosureKind.Reference { return false }
     i = i + 1
   }
+  i = 0 while i < fd.args.length() { if fd.args.get(i).isCaptured { return false } i = i + 1 }
+  i = 0 while i < fd.vars.length() { if fd.vars.get(i).isCaptured { return false } i = i + 1 }
+  if fd.functionType != ParseFunctionKind.Statement && fd.functionType != ParseFunctionKind.Var
+    && fd.functionType != ParseFunctionKind.Expression && fd.functionType != ParseFunctionKind.Arrow { return false }
+  match &fd.module { Option<CellRef<ModuleDef>>.Some { .. } => { return false } _ => () }
   return match &fd.source {
     Option<SourceText>.Some { value } => match &value {
       SourceText.Shared { text, start: _, length: _ } => Strings.length(text.get()) == source.length
@@ -332,7 +348,10 @@ effect fn defer(tree: &mut FunctionTree, cell: FunctionId, source: &[u8]) -> Val
     varDefs: List<VarDef>.make(), closureVars: List<ClosureVar>.make(),
     argumentCount: usize.toU16(def.args.length()), variableCount: usize.toU16(def.vars.length()),
     definedArgumentCount: i32.toU16(def.definedArgCount), stackSize: STUB_STACK,
-    varRefCount: i32.toU16(def.varRefCount), borrowsArguments: false, leaf: 0, constructForm: 0, realm: context,
+    varRefCount: i32.toU16(def.varRefCount), scopeCaptures: 0, scopeSlots: 0, scopeVarSlots: 0,
+    frameCells: scopes.inlineFrameCells(usize.toU16(def.vars.length()), STUB_STACK, i32.toU16(def.varRefCount), 0),
+    scopeParameters: List<u32>.make(), scopeVariables: List<u16>.make(),
+    borrowsArguments: false, leaf: 0, constructForm: 0, realm: context,
     constants: List<ValueBits>.make(), debug: Option<FunctionDebugInfo>.none(), pending: Option<Box<PendingFunction>>.none()
   })
   // No fallible operations after this point.
@@ -444,7 +463,9 @@ pub unsafe effect fn finish<H: HeapHooks>(hooks: &mut H, node: *mut HeapHeader) 
 effect fn complete(tree: &mut FunctionTree, cell: FunctionId, source: &[u8]) -> FunctionBytecode
   ! OutOfMemoryError | BytecodeError ? &mut Allocator {
   run resolveLabels(&mut tree, cell, source)
-  return run finalHeader(&mut tree.getMut(cell))
+  // deferrable keeps every function that owns or uses captured locals eager.
+  let mut plan = scopePlans.emptyPlan()
+  return run finalHeader(&mut tree.getMut(cell), &mut plan)
 }
 fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
 
