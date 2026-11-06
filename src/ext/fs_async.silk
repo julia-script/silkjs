@@ -73,7 +73,7 @@ unsafe extern "C" fn uv_metrics_idle_time(loop: *mut u8) -> u64
 
 // The reactor is the loop's only blocking wait. libuv runs as a guest: its backend descriptor is
 // registered in the reactor, and each turn runs libuv without blocking.
-pub struct State { loop: *mut u8, reactor: Reactor, pool: Pool, idle: u64, first: ?*mut Request, delivering: ?*mut Request, watches: ?*mut Watch, nextWatch: i32, closing: bool, polling: bool, descriptors: descriptors.State }
+pub struct State { loop: *mut u8, reactor: Reactor, pool: Pool, idle: u64, inflight: usize, first: ?*mut Request, delivering: ?*mut Request, watches: ?*mut Watch, nextWatch: i32, closing: bool, polling: bool, descriptors: descriptors.State }
 // A request is native memory that the loop owns. While it is queued or running, a worker reads
 // `call` and writes `result`; the loop reads them again only after the pool returns `job`.
 struct Request {
@@ -117,7 +117,7 @@ pub effect fn make() -> *mut State ! OutOfMemoryError ? &mut Allocator {
     Result<Pool, OutOfMemoryError>.Failure { error } => { let ignored = unsafe uv_loop_close(loop) unsafe free(loop) unsafe free(raw) fail move error }
   }
   let state = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut State>(raw)
-  unsafe Pointer.put<State>(state, State { loop: loop, reactor: move reactor, pool: move workers, idle: 0, first: Pointer.null<Request>(), delivering: Pointer.null<Request>(), watches: Pointer.null<Watch>(), nextWatch: 1, closing: false, polling: false, descriptors: descriptors.make() })
+  unsafe Pointer.put<State>(state, State { loop: loop, reactor: move reactor, pool: move workers, idle: 0, inflight: 0, first: Pointer.null<Request>(), delivering: Pointer.null<Request>(), watches: Pointer.null<Watch>(), nextWatch: 1, closing: false, polling: false, descriptors: descriptors.make() })
   return state
 }
 pub unsafe fn descriptorState(pointer: *mut State) -> *mut descriptors.State {
@@ -214,15 +214,43 @@ unsafe fn owner(job: *mut pool.Job) -> *mut Request {
   let anchor = () let entry = unsafe Pointer.borrow<(), pool.Job>(&anchor, job)
   return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Request>(unsafe nonnull(entry.data))
 }
-// Marks each request whose job a worker finished.
+// Runs on the loop thread when the pool hands a request's job back.
+export "C" fn finishRequest(data: ?*mut u8) -> () {
+  let request = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Request>(unsafe nonnull(data))
+  let mut anchor = () let entry = unsafe Pointer.borrowMut<(), Request>(&mut anchor, request)
+  entry.status = entry.result.code entry.done = true
+}
+// Hands each finished job back to its owner.
 unsafe fn collectFinished(pointer: *mut State) -> () {
-  let mut anchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer)
   while true {
+    let mut anchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer)
     let job = state.pool.takeDone()
     if Pointer.isNull<pool.Job>(job) { break }
-    let mut other = () let entry = unsafe Pointer.borrowMut<(), Request>(&mut other, unsafe owner(unsafe pool.nonnull(job)))
-    entry.status = entry.result.code entry.done = true
+    state.inflight = state.inflight - 1 drop state
+    let other = () let entry = unsafe Pointer.borrow<(), pool.Job>(&other, unsafe pool.nonnull(job))
+    let finish = entry.finish let data = entry.data drop entry
+    unsafe finish(data)
   }
+}
+/// Queues `job` on the loop's blocking threads. Its `finish` runs in a later poll, on this thread.
+/// Returns 0, or a negative code when no thread could start.
+pub unsafe effect fn queueWork(pointer: *mut State, job: *mut pool.Job) -> i32 {
+  let mut anchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer)
+  let submitted = run Effect.result(unsafe state.pool.submit(job))
+  match move submitted {
+    Result<(), OutOfMemoryError | SpawnError>.Success { .. } => { state.inflight = state.inflight + 1 return 0 }
+    Result<(), OutOfMemoryError | SpawnError>.Failure { .. } => { return -11 }
+  }
+}
+/// Waits up to 10 ms for blocking work, then runs `finish` for each finished job. Executors call it
+/// while they close, before the loop itself closes.
+pub unsafe effect fn waitWork(pointer: *mut State) -> () {
+  let mut events = [ReadyEvent.empty()]
+  let mut anchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer)
+  let waited = run Effect.result(state.reactor.wait(&mut events, Option<u64>.some(10000000)))
+  if let Result<usize, ReactorError>.Failure { .. } = move waited { Intrinsic.trap("the runtime reactor wait failed") }
+  drop state
+  unsafe collectFinished(pointer)
 }
 unsafe fn release<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pointer: *mut Request) -> () {
   let request = unsafe Pointer.take<Request>(pointer)
@@ -287,7 +315,7 @@ pub unsafe effect fn submit<'m, S: EngineServices>(engine: &mut Engine<'m, S>, c
   if closing { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Internal, b"filesystem executor is closed") }
   let raw = run allocate(Layout.of<Request>().bytes)
   let request = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Request>(raw)
-  unsafe Pointer.put<Request>(request, Request { next: Pointer.null<Request>(), job: pool.job(runRequest, raw), done: false, status: 0, requestKind: requestKind, tracking: unsafe descriptorState(pointer), descriptorSettled: false, callback: unsafe callback.retained(), args: [ValueBits.Undefined; 5], operation: List<u8>.make(), call: ops.call(0), result: ops.outcome(), offset: 0, bigint: false })
+  unsafe Pointer.put<Request>(request, Request { next: Pointer.null<Request>(), job: pool.job(runRequest, finishRequest, raw), done: false, status: 0, requestKind: requestKind, tracking: unsafe descriptorState(pointer), descriptorSettled: false, callback: unsafe callback.retained(), args: [ValueBits.Undefined; 5], operation: List<u8>.make(), call: ops.call(0), result: ops.outcome(), offset: 0, bigint: false })
   let mut mutable = () let entry = unsafe Pointer.borrowMut<(), Request>(&mut mutable, request)
   let prepared = run Effect.result(unsafe prepare(&mut engine, context, &mut entry, operation, args)) drop entry
   match move prepared { Result<(), OutOfMemoryError | JsException>.Success { .. } => () Result<(), OutOfMemoryError | JsException>.Failure { error } => { unsafe release(&mut engine, context, request) fail move error } }
@@ -299,15 +327,9 @@ pub unsafe effect fn submit<'m, S: EngineServices>(engine: &mut Engine<'m, S>, c
     static if Intrinsic.targetOperatingSystem() == "darwin" { entry2.status = -78 } else { entry2.status = -38 }
     entry2.done = true return ValueBits.Undefined
   }
-  let job = Pointer.fromMutRef<pool.Job>(&mut entry2.job) drop entry2
-  let submitted = run Effect.result(unsafe state2.pool.submit(job))
-  match move submitted {
-    Result<(), OutOfMemoryError | SpawnError>.Success { .. } => ()
-    Result<(), OutOfMemoryError | SpawnError>.Failure { .. } => {
-      let entry3 = unsafe Pointer.borrowMut<(), Request>(&mut entryAnchor, request)
-      entry3.status = -11 entry3.done = true
-    }
-  }
+  let job = Pointer.fromMutRef<pool.Job>(&mut entry2.job) drop entry2 drop state2
+  let status = run unsafe queueWork(pointer, job)
+  if status < 0 { let entry3 = unsafe Pointer.borrowMut<(), Request>(&mut entryAnchor, request) entry3.status = status entry3.done = true }
   return ValueBits.Undefined
 }
 unsafe fn allFinished(pointer: *mut State) -> bool {
@@ -364,7 +386,7 @@ unsafe effect fn deliver<'m, S: EngineServices>(engine: &mut Engine<'m, S>, cont
 }
 pub unsafe fn hasPending(pointer: *mut State) -> bool {
   let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer)
-  return !Pointer.isNull<Request>(state.first) || unsafe uv_loop_alive(state.loop) != 0
+  return !Pointer.isNull<Request>(state.first) || state.inflight > 0 || unsafe uv_loop_alive(state.loop) != 0
 }
 unsafe effect fn deliverCompleted<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pointer: *mut State, request: *mut Request) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
   let mut anchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer)
@@ -651,19 +673,14 @@ pub unsafe fn close<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: 
   while true {
     let job = cancelling.pool.takeQueued()
     if Pointer.isNull<pool.Job>(job) { break }
+    cancelling.inflight = cancelling.inflight - 1
+    // Other executors drain their own work before the loop closes, so a queued job is a request.
     let mut other = () let entry = unsafe Pointer.borrowMut<(), Request>(&mut other, unsafe owner(unsafe pool.nonnull(job)))
     static if Intrinsic.targetOperatingSystem() == "darwin" { entry.status = -89 } else { entry.status = -125 }
     entry.done = true
   }
   drop cancelling
-  while !unsafe allFinished(pointer) {
-    let mut events = [ReadyEvent.empty()]
-    let waiting = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer)
-    let waited = run Effect.result(waiting.reactor.wait(&mut events, Option<u64>.some(10000000)))
-    if let Result<usize, ReactorError>.Failure { .. } = move waited { Intrinsic.trap("the runtime reactor wait failed") }
-    drop waiting
-    unsafe collectFinished(pointer)
-  }
+  while !unsafe allFinished(pointer) { run unsafe waitWork(pointer) }
 
   while !Pointer.isNull<Watch>(watch) {
     let owner = unsafe nonnull(watch) let entry = unsafe Pointer.borrow<(), Watch>(&anchor, owner) watch = entry.next drop entry unsafe stopWatch(owner)
