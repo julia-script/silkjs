@@ -12,10 +12,11 @@ import silk.core.option { Option }
 import silk.num.u16
 import silk.num.u32
 import silk.num.usize
+import silk.num.i32
 import runtime_memory { AllocationObserver }
 import js_heap { HeapCell, HeapHeader, HeapKind }
 import js_value { ValueBits }
-import js_core_types { SCOPE_DEPTH_SHIFT, SCOPE_SLOT_MASK, ScopeData, scopeSlot, FunctionBytecode, FrameSlots, ClosureKind }
+import js_core_types { SCOPE_DEPTH_SHIFT, SCOPE_SLOT_MASK, ScopeData, scopeSlot, FunctionBytecode, FrameSlots, ClosureKind, ObjectData, ObjectPayload }
 import js_gc { HeapHooks }
 import js_gc as gc
 import js_runtime as runtimeApi
@@ -28,8 +29,22 @@ fn present(value: ?*mut HeapHeader) -> *mut HeapHeader {
 
 /// A spare scope of exactly slots slots, published with count 1, or null when
 /// none is parked. Never allocates. Its slots and parent are unset until beginScope.
+@inlineAlways
 pub unsafe fn takeScope(runtime: *mut HeapHeader, slots: usize) -> ?*mut HeapHeader {
-  return Pointer.null<HeapHeader>()
+  let spare = unsafe gc.takeSpareScope(runtime, slots)
+  let cell = match Pointer.nonNullMut<HeapHeader>(spare) {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => { return Pointer.null<HeapHeader>() }
+  }
+  // Same payload and tail (the bin is keyed by slot count): count and kind only.
+  let scope = unsafe HeapCell.reviveUninit<ScopeData>(HeapKind.Scope, cell)
+  let mut anchor = ()
+  let data = unsafe HeapCell.payloadMut<ScopeData, ()>(&mut anchor, scope)
+  data.parent = Pointer.null<HeapHeader>()
+  data.count = usize.toU32(slots)
+  drop data
+  unsafe gc.publishScope(runtime, scope)
+  return scope
 }
 
 /// A fresh scope of slots slots, published with count 1. May collect first, as
@@ -46,7 +61,7 @@ pub unsafe effect fn allocateScope<H: HeapHooks>(hooks: &mut H, memory: &Allocat
   drop data
   let mut index: usize = 0
   while index < slots { unsafe Pointer.write<ValueBits>(unsafe scopeSlot(scope, index), ValueBits.Undefined) index = index + 1 }
-  unsafe gc.publish(runtime, scope)
+  unsafe gc.publishScope(runtime, scope)
   return scope
 }
 
@@ -109,8 +124,60 @@ pub unsafe fn operandSlot(scope: ?*mut HeapHeader, operand: u16) -> *mut ValueBi
 }
 
 /// Drops one activation's reference to its own scope at frame exit.
+/// When the scope's only other owners are closures in its own slots that
+/// nothing else holds (count 1, created under this scope), the whole group is
+/// garbage: those slots are cleared and the closures released first, so the
+/// scope dies here instead of waiting for cycle collection.
+@inlineAlways
 pub unsafe fn releaseScope<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, scope: *mut HeapHeader) -> () {
+  let mut anchor = ()
+  let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, scope)
+  let references = header.referenceCount
+  drop header
+  if references > 1 { unsafe releaseOwnClosures(&mut hooks, runtime, scope, i32.toUsize(references - 1)) }
   unsafe gc.releaseObjectHeader(&mut hooks, runtime, scope)
+}
+/// releaseScope's fast free: owners is the scope's count besides the frame's.
+@inlineNever
+unsafe fn releaseOwnClosures<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, scope: *mut HeapHeader, owners: usize) -> () {
+  let anchor = ()
+  let count = u32.toUsize((unsafe HeapCell.payload<ScopeData, ()>(&anchor, scope)).count)
+  if owners > count { return () }
+  let mut own: usize = 0
+  let mut index: usize = 0
+  while index < count {
+    if unsafe ownClosure(scope, unsafe Pointer.read<ValueBits>(unsafe scopeSlot(scope, index))) { own = own + 1 }
+    index = index + 1
+  }
+  if own != owners { return () }
+  index = 0
+  while index < count {
+    let slot = unsafe scopeSlot(scope, index)
+    let value = unsafe Pointer.read<ValueBits>(slot)
+    if unsafe ownClosure(scope, value) {
+      unsafe Pointer.write<ValueBits>(slot, ValueBits.Undefined)
+      unsafe gc.release(&mut hooks, runtime, value)
+    }
+    index = index + 1
+  }
+}
+/// Whether value is a bytecode closure held only once (by the slot it was read
+/// from) whose scope is scope.
+@inlineAlways
+unsafe fn ownClosure(scope: *mut HeapHeader, value: ValueBits) -> bool {
+  let reference = match value { ValueBits.Object { reference } => reference _ => { return false } }
+  let mut anchor = ()
+  let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, reference)
+  if header.referenceCount != 1 { return false }
+  drop header
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+  return match &object.payload {
+    ObjectPayload.BytecodeFunction { function } => match Pointer.nonNullMut<HeapHeader>(function.scope) {
+      Option<*mut HeapHeader>.Some { value: owner } => Pointer.address<HeapHeader>(owner) == Pointer.address<HeapHeader>(scope)
+      Option<*mut HeapHeader>.None => false
+    }
+    _ => false
+  }
 }
 
 /// The name of the variable a SCOPE_OPERAND operand names in bytecode, for errors; 0 when stripped.
