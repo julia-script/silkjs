@@ -18,9 +18,11 @@ import silk.num.u32
 import silk.num.u16
 import js_atoms { AtomTable }
 import js_atom_data { JS_ATOM_length }
+import js_class_data { JS_CLASS_OBJECT }
 import js_heap { HeapCell, HeapHeader, HeapKind, CellRef }
 import js_value { ValueBits }
-import js_owned_value { Value }
+import js_owned_value { Value, ValueList }
+import js_bound_functions as bound
 import js_debugger_metadata { Metadata as DebuggerMetadata }
 import js_gc { HeapHooks, Tracer }
 import js_strings { Strings }
@@ -64,7 +66,7 @@ effect fn runtimeFixture() -> *mut HeapHeader ! OutOfMemoryError ? &mut Allocato
   let atoms = run AtomTable.make()
   let mut classes = List<ClassDef>.make()
   let mut index: u32 = 0
-  while index < 5 {
+  while index < 6 {
     let mut mark = Option<NativeFunctionId>.none()
     let mut finalizer = Option<NativeFunctionId>.none()
     if index >= 2 { mark = callback(index) finalizer = callback(index) }
@@ -166,6 +168,7 @@ impl HeapHooks for Hooks {
     descriptor: NativeFunctionId, tracer: &mut Tracer) -> () {
     let id = match descriptor { NativeFunctionId.Host { id } => id _ => failInvariant() }
     if id == 2 { check(unsafe gc.traceCorePayload(object, &mut tracer)) return () }
+    if id == 5 { unsafe bound.mark(object, &mut tracer) return () }
     let anchor = ()
     let reference = unsafe familyReference(object)
     if id == 3 {
@@ -197,6 +200,7 @@ impl HeapHooks for Hooks {
     self.freed[self.freedCount] = Pointer.address<HeapHeader>(object)
     self.freedCount = self.freedCount + 1
     if id == 2 { check(unsafe gc.finalizeCorePayload(&mut self, runtime, object)) return () }
+    if id == 5 { unsafe bound.finalize(&mut self, runtime, object) return () }
     let reference = unsafe familyReference(object)
     if id == 3 {
       let entry = unsafe HeapCell.payloadMut<WeakEntry, ()>(&mut anchor, reference)
@@ -1113,6 +1117,51 @@ test effect fn pendingExceptionReplacementFinalizesBeforeInstallAndTransfersOneO
     "replacement and final transfer reclaim each exception exactly once")
 }
 
+effect fn owningCyclePayload(object: *mut HeapHeader, target: *mut HeapHeader) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let record = run HeapCell.allocate<bound.BoundFunctionData>(HeapKind.Auxiliary, bound.BoundFunctionData {
+    target: unsafe Value.retain(ValueBits.Object { reference: target }),
+    boundThis: Value.immediate(ValueBits.Undefined), arguments: ValueList.make()
+  })
+  let mut anchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, object)
+  data.setClassId(5)
+  data.payload = ObjectPayload.Opaque { family: ObjectPayloadFamily.BoundFunction, reference: record }
+}
+
+effect fn owningCycles() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let runtime = run runtimeFixture()
+  let mut hooks = Hooks.make()
+  let mut mode: usize = 0
+  while mode < 2 {
+    let first = run objectFixture(runtime, 0)
+    let mut second = first
+    if mode == 1 { second = run objectFixture(runtime, 0) }
+    run owningCyclePayload(first, second)
+    if mode == 1 { run owningCyclePayload(second, first) }
+    unsafe gc.releaseHeader(&mut hooks, runtime, first)
+    if mode == 1 { unsafe gc.releaseHeader(&mut hooks, runtime, second) }
+    // A self-cycle drops its last count inside its own finalizer. With two
+    // objects, the later finalizer drops an already finalized zombie instead.
+    // Each object has its own shape, released before its payload is finalized.
+    run unsafe gc.collect(&mut hooks, runtime, false)
+    run Testing.expect(hooks.freedCount == 1 + mode * 2 && hooks.correctOrder,
+      "owning payloads release self-cycles and finalized peers exactly once")
+    mode = mode + 1
+  }
+  run unsafe gc.destroyRuntime(&mut hooks, runtime)
+}
+
+test effect fn owningValuesReleaseCyclesWithoutReadingDestroyedPayloads() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = run RuntimeAllocator<SystemAllocator>.make(Allocator.systemAllocatorProvider())
+  run owningCycles() |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(allocator.stats().usedBytes == 0 && allocator.stats().allocationCount == 0,
+    "pooled cycle cells, shapes and owning native payloads are all reclaimed")
+  let mut system = Allocator.systemAllocatorProvider()
+  run owningCycles() |> Effect.provideMut<Allocator>(&mut system)
+}
+
 struct ReleaseFailure {}
 effect fn failWhileOwning(value: Value) -> () ! ReleaseFailure {
   let held = move value
@@ -1251,4 +1300,38 @@ test effect fn frameExitFreesAScopeHeldOnlyByItsOwnClosures() -> ()
   run unsafe gc.collect(&mut hooks, runtime, false) |> Effect.provideMut<Allocator>(&mut allocator)
   run unsafe gc.destroyRuntime(&mut hooks, runtime) |> Effect.provideMut<Allocator>(&mut allocator)
   run Testing.expect(allocator.stats().allocationCount == 0, "scope and closures reclaim")
+}
+
+test effect fn immediateReleasePreservesFullDeferredQueueOrder() -> ()
+  ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = run RuntimeAllocator<SystemAllocator>.make(Allocator.systemAllocatorProvider())
+  let runtime = run runtimeFixture() |> Effect.provideMut<Allocator>(&mut allocator)
+  let baseline = allocator.stats().allocationCount
+  let mut hooks = Hooks.make()
+  let pending = run objectFixture(runtime, 0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let pendingAddress = Pointer.address<HeapHeader>(pending)
+  let pendingOwner = unsafe Value.adoptBits(ValueBits.Object { reference: pending })
+  drop pendingOwner
+  let mut index: usize = 1
+  while index < gc.ZERO_STACK {
+    let node = run objectFixture(runtime, 0) |> Effect.provideMut<Allocator>(&mut allocator)
+    let mut anchor = ()
+    let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+    // Plain objects fill the queue without taking entries in Hooks.freed.
+    data.setClassId(JS_CLASS_OBJECT)
+    drop data
+    let owner = unsafe Value.adoptBits(ValueBits.Object { reference: node })
+    drop owner
+    index = index + 1
+  }
+  run Testing.expect(hooks.freedCount == 0, "deferred drops do not run finalizers")
+  let fresh = run objectFixture(runtime, 0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let freshAddress = Pointer.address<HeapHeader>(fresh)
+  unsafe gc.releaseHeader(&mut hooks, runtime, fresh)
+  run Testing.expect(hooks.freedCount == 2 && hooks.freed[0] == pendingAddress && hooks.freed[1] == freshAddress,
+    "a last release behind a full deferred stack waits for its stacked predecessors")
+  run Testing.expect(hooks.correctOrder && allocator.stats().allocationCount == baseline,
+    "overflow drains each object and shape exactly once")
+  run unsafe gc.destroyRuntime(&mut hooks, runtime) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(allocator.stats().usedBytes == 0, "runtime storage is reclaimed")
 }
