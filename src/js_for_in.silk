@@ -9,12 +9,16 @@ import silk.mem.pointer { Pointer }
 import silk.core.result { Result }
 import silk.num.u8
 import silk.num.u32
+import silk.num.u64
 import silk.num.usize
+import silk.mem.layout { Layout }
+import js_heap_snapshot_graph { Graph, Strength }
+import js_string_types { AtomRegistry, AtomSlot }
 import runtime_memory { AllocationObserver }
 import js_heap { HeapCell, HeapHeader, HeapKind, CellRef }
 import silk.core.ownership { Copy }
 import js_core_types { ObjectData, ObjectPayload, ObjectPayloadFamily, ShapeData,
-  PropertyEnum, RuntimeState, NativeErrorKind, JS_PROP_ENUMERABLE }
+  PropertyEnum, RuntimeState, NativeErrorKind, JS_PROP_ENUMERABLE, OwnedAtom }
 import js_value { ValueBits }
 import js_intl_realm as ops
 import js_realm { Realm, lendRealm }
@@ -46,6 +50,31 @@ import js_exceptions { JsException }
 struct State {
   object: Value, index: usize, count: usize, inPrototypeChain: bool,
   isArray: bool, atoms: List<PropertyEnum>
+}
+
+// Observe both receiver ownership and interned property-name ownership.
+pub unsafe effect fn snapshot(graph: &mut Graph, owner: usize, reference: *mut HeapHeader) -> () ! OutOfMemoryError ? &mut Allocator {
+  let anchor = () let data = unsafe HeapCell.payload<State, ()>(&anchor, reference)
+  run unsafe graph.value(owner, data.object.view(), b"object", 0, Strength.Strong, usize.MAX)
+  graph.backing(owner, data.atoms.capacity() * Layout.of<PropertyEnum>().bytes)
+  if data.atoms.length() == 0 { return }
+  let rt = match Pointer.nonNullMut<HeapHeader>(graph.runtime) {
+    Option<*mut HeapHeader>.Some { value } => value
+    _ => { run graph.limit(owner, b"for-in atom edges require runtime registry") return }
+  }
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let registry = unsafe HeapCell.payload<AtomRegistry, ()>(&anchor, state.atoms.profileRegistry())
+  let mut index: usize = 0
+  while index < data.atoms.length() {
+    let atom = data.atoms.get(index).atom
+    if atom != 0 && (atom & ATOM_INTEGER_TAG) == 0 {
+      match registry.slots.get(u32.toUsize(atom)) {
+        AtomSlot.Occupied { reference: name } => { run unsafe graph.edge(owner, name, b"atom", index, Strength.Strong, usize.MAX) }
+        _ => ()
+      }
+    }
+    index = index + 1
+  }
 }
 pub struct Next { pub value: ValueBits, pub done: bool }
 fn trap() -> never { return Intrinsic.trap("QuickJS invariant violated") }
@@ -178,7 +207,7 @@ fn fastCount<'o>(object: ValueRef<'o>) -> Option<usize> {
   let count = match &data.payload {
     ObjectPayload.FastArray { array } => array.values.length()
     ObjectPayload.MappedArguments { arguments } => arguments.varRefs.length()
-    ObjectPayload.TypedArray { array } => u32.toUsize(array.count)
+    ObjectPayload.TypedArray { array } => u64.toUsize(array.count)
     ObjectPayload.Empty => 0
     _ => trap()
   }
@@ -319,6 +348,17 @@ effect fn candidate<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + Pr
   return Next { value: output, done: false }
 }
 effect fn exceptionValue(error: JsException) -> ValueBits { drop error return ValueBits.Exception }
+effect fn arrayIndexAtom<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>, index: usize) -> OwnedAtom
+  ! JsException ? &mut Allocator {
+  let mut anchor = ()
+  let runtimeState = realm.runtimeStateMut(&mut anchor)
+  let made = run Effect.result(runtimeState.atoms.internInt64(usize.toI64(index)))
+  drop runtimeState
+  return match move made {
+    Result<u32, OutOfMemoryError | StringLengthError>.Success { value } => unsafe OwnedAtom.adopt(realm.runtime(), value)
+    Result<u32, OutOfMemoryError | StringLengthError>.Failure { error } => run materialize(&mut hooks, realm, move error)
+  }
+}
 effect fn advance<'a, 'b, H: HeapHooks + OwnKeysHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks>(hooks: &mut H,
   memory: &AllocationObserver, realm: Realm<'a>, iterator: ValueRef<'b>) -> Next ! JsException ? &mut Allocator {
   let rt = realm.runtime() let snapshot = Snapshot.of(iterator)
@@ -349,12 +389,14 @@ effect fn advance<'a, 'b, H: HeapHooks + OwnKeysHooks + OwnPropertyHooks + Coerc
       let table = run ownNames(&mut hooks, realm, currentObject, JS_GPN_STRING_MASK | JS_GPN_SET_ENUM)
       installTable(realm, snapshot, move table, true)
     } else {
-      let mut entry = PropertyEnum { atom: 0, isEnumerable: false }
-      if state.isArray { entry = PropertyEnum { atom: usize.toU32(state.index) | ATOM_INTEGER_TAG, isEnumerable: true } }
-      else { entry = state.atoms.get(state.index) }
-      let inherited = state.inPrototypeChain && !state.isArray
+      let array = state.isArray
+      let index = state.index
+      let mut entry = PropertyEnum { atom: 0, isEnumerable: true }
+      if !array { entry = state.atoms.get(index) }
+      let inherited = state.inPrototypeChain && !array
       state.index = state.index + 1 drop state
-      let atom = realm.duplicateAtom(entry.atom)
+      // Array indices past u32 are interned on demand; listed names are duplicated.
+      let atom = if array { run arrayIndexAtom(&mut hooks, realm, index) } else { realm.duplicateAtom(entry.atom) }
       let value = run candidate(&mut hooks, realm, iterator, snapshot, atom.get(), entry.isEnumerable, inherited)
       drop atom
       if !value.done { return move value }

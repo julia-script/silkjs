@@ -9,7 +9,7 @@ import silk.num.i32
 import runtime_memory { AllocationObserver }
 import js_heap { HeapCell, HeapHeader, CellRef }
 import js_value { ValueBits }
-import js_owned_value { ValueRef, lendBits, immediateRef }
+import js_owned_value { Value, ValueRef, lendBits, immediateRef }
 import js_intl_realm as ops
 import js_realm { Realm, lendRealm }
 import js_core_types { ModuleDef, RuntimeState, ObjectData, ObjectPayload, FunctionBytecode, FunctionDebugInfo,
@@ -27,6 +27,7 @@ import js_coercion_host { CoercionHooks }
 import js_exceptions { JsException }
 import js_string_types { StringLengthError }
 import js_class_data as classes
+import native_stack as stack
 
 pub effect fn newNativeModule<'a>(realm: Realm<'a>, name: &[u8], initialize: NativeFunctionId) -> CellRef<ModuleDef>
   ! OutOfMemoryError | StringLengthError ? &mut Allocator {
@@ -115,14 +116,71 @@ pub fn getScriptOrModuleName<'a>(realm: Realm<'a>, levels: i32) -> u32 {
     let code = match &p.payload { ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode _ => { return 0 } } drop p
     let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, code)
     if !bytecode.isDirectOrIndirectEval {
-      let name = match &bytecode.debug { Option<FunctionDebugInfo>.Some { value } => value.filename _ => { return 0 } } drop bytecode
+      let name = match bytecode.hostModule {
+        ValueBits.Module { reference } => {
+          let module = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, reference)
+          module.name
+        }
+        _ => match &bytecode.debug { Option<FunctionDebugInfo>.Some { value } => value.filename _ => { return 0 } }
+      } drop bytecode
       let state = realm.runtimeState(&anchor)
       return state.atoms.duplicate(name)
     }
     frame = previous
   }
 }
-pub effect fn importMeta<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H, memory: &AllocationObserver,realm: Realm<'a>) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator { let context = realm.context()
+pub effect fn configureHostCallbacks<'r, 'v, H: HeapHooks + CoercionHooks>(hooks: &mut H,
+  realm: Realm<'r>, compiled: ValueRef<'v>, callback: ValueRef<'v>, owner: ValueRef<'v>) -> () ! JsException ? &mut Allocator {
+  let reference = match compiled.view() { ValueBits.FunctionBytecode { reference } => reference _ => { return () } }
+  let rt = realm.runtime()
+  if unsafe runtime.checkStackOverflow(rt, stack.currentFrameAddress(), 0, true) {
+    return run ops.throwError(&mut hooks, realm, NativeErrorKind.Internal, b"stack overflow")
+  }
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut anchor, reference)
+  let previous = Intrinsic.replace(data.hostImport, unsafe callback.view().retained())
+  let previousModule = Intrinsic.replace(data.hostModule, unsafe owner.view().retained())
+  let count = data.constants.length() drop data
+  unsafe gc.release(&mut hooks, rt, previous) unsafe gc.release(&mut hooks, rt, previousModule)
+  let mut index: usize = 0
+  while index < count {
+    let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference)
+    let child = code.constants.get(index) drop code
+    run configureHostCallbacks(&mut hooks, realm, unsafe lendBits(&compiled, child), callback, owner)
+    index = index + 1
+  }
+}
+// Host module identity is carried by the actual executing bytecode, not its
+// filename: separate VM compilations may intentionally share an identifier.
+pub fn currentBytecode<'r>(realm: Realm<'r>) -> ?*mut HeapHeader {
+  let anchor = () let rt = realm.runtimeState(&anchor)
+  let mut cursor = rt.currentStackFrame drop rt
+  while let Option<*mut StackFrame>.Some { value: frame } = Pointer.nonNullMut<StackFrame>(cursor) {
+    let current = unsafe Pointer.borrow<(), StackFrame>(&anchor, frame)
+    let function = current.currentFunction cursor = current.previous drop current
+    if let ValueBits.Object { reference } = function {
+      let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+      if let ObjectPayload.BytecodeFunction { function: closure } = &data.payload { return closure.bytecode }
+    }
+  }
+  return Pointer.null<HeapHeader>()
+}
+pub effect fn importMeta<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H, memory: &AllocationObserver,
+  realm: Realm<'a>) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  if let Option<*mut HeapHeader>.Some { value: code } = Pointer.nonNullMut<HeapHeader>(currentBytecode(realm)) {
+    let anchor = () let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, code)
+    let owner = bytecode.hostModule drop bytecode
+    if let ValueBits.Module { reference } = owner {
+      let module = unsafe CellRef<ModuleDef>.of(reference)
+      let data = module.get(&anchor)
+      let fresh = data.metaObject.tag() == ValueBits.Undefined.tag()
+      let callback = unsafe Value.retain(data.privateValue) drop data
+      let meta = unsafe Value.adoptBits(run getImportMeta(&mut hooks, memory, realm, module))
+      if fresh && callback.view().isObject() {
+        drop unsafe Value.adoptBits(run unsafe hooks.call(realm, callback.borrow(), immediateRef(ValueBits.Undefined), &[meta.view()]))
+      }
+      return meta.intoBits()
+    }
+  }
   let name = getScriptOrModuleName(realm, 0)
   if name == 0 { return run ops.throwError(&mut hooks,realm, NativeErrorKind.Type, b"import.meta not supported in this context") }
   let module = loader.findLoaded(realm, name)

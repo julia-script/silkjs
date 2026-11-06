@@ -32,6 +32,10 @@ import js_heap { HeapCell, HeapHeader, CellRef }
 import js_value { ValueBits }
 import js_owned_value { Value }
 import js_string_types { StringOwner, latin1Bytes, stringReference }
+import js_debugger_types { State as DebuggerState }
+import js_debugger_metadata { Metadata as DebuggerMetadata }
+import js_coverage { State as CoverageState }
+import js_cpu_profile { State as CpuProfileState }
 
 pub const JS_MODE_STRICT: u8 = 1
 pub const JS_MODE_ASYNC: u8 = 4
@@ -61,6 +65,8 @@ pub const JS_PROP_HAS_VALUE: u32 = 8192
 pub const JS_PROP_THROW: u32 = 16384
 pub const JS_PROP_THROW_STRICT: u32 = 32768
 pub const JS_PROP_NO_EXOTIC: u32 = 65536
+/// Transient exotic-definition hint; not a stored property attribute.
+pub const JS_PROP_GLOBAL_DECLARATION: u32 = 131072
 pub const JS_CALL_FLAG_CONSTRUCTOR: u32 = 1
 pub const JS_PROP_INITIAL_SIZE: usize = 4
 pub const JS_PROP_INITIAL_HASH_SIZE: usize = 8
@@ -473,7 +479,7 @@ impl Drop for OwnedAtom {
 }
 /// Runtime root payload (HeapKind.Auxiliary). Its AtomTable is a native owner.
 /// GC lists, context links, shape buckets and weak-list links are non-owning.
-/// currentException and queued JobEntry arguments are owned JS roots.
+/// currentException, asyncContext and queued JobEntry values are owned JS roots.
 pub struct RuntimeState {
   pub runtimeInfo: Option<ByteStorage>,
   pub atoms: AtomTable,
@@ -500,9 +506,21 @@ pub struct RuntimeState {
   pub stackTop: usize,
   pub stackLimit: usize,
   pub currentException: ValueBits,
+  pub asyncContext: ValueBits,
+  pub asyncHooksEnabled: bool,
+  pub asyncHookActive: bool,
+  pub asyncTokenNext: usize,
+  /// Borrowed during synchronous Promise capability construction; the caller
+  /// roots this value until swapAsyncPromiseParent restores its predecessor.
+  pub asyncPromiseParent: ValueBits,
   pub currentExceptionIsUncatchable: bool,
   pub inOutOfMemory: bool,
   pub currentStackFrame: ?*mut StackFrame,
+  pub debugger: DebuggerState,
+  pub coverage: CoverageState,
+  pub cpuProfile: CpuProfileState,
+  /// Monotonic compilation identity shared by all realms; zero means no script.
+  pub nextScriptId: u64,
   pub interrupt: HostHook,
   pub promiseRejectionTracker: HostHook,
   /// FIFO Auxiliary HeapCell<JobEntry> nodes; queue ownership is explicit JS roots.
@@ -617,25 +635,39 @@ pub struct ContextState {
   pub arrayPrototypeValues: ValueBits,
   pub throwTypeError: ValueBits,
   pub evalObject: ValueBits,
+  /// Null unless this embedding enables lazy Node-style Error stack headers.
+  pub nodeErrorStackGetter: ValueBits,
+  pub nodeErrorStackSetter: ValueBits,
+  pub nodeErrorConstructor: ValueBits,
+  pub nodeErrorFormatter: ValueBits,
   pub userValues: [ValueBits; 7],
   pub globalObject: ValueBits,
+  /// Original global binding record behind a host exotic global object.
+  pub globalObjectStorage: ValueBits,
+  /// Unresolved external bindings must not be promoted by writes to that record.
+  pub globalProxyBindings: ValueBits,
   pub globalVarObject: ValueBits,
   pub randomState: u64,
   pub interruptCounter: i32,
   pub loadedModules: ModuleList,
   pub regexpCompilerEnabled: bool,
   pub evalEnabled: bool,
+  /// Host policy for eval/Function; does not restrict explicit host compilation.
+  pub codeGenerationAllowed: bool,
+  /// Host-managed realms drain these jobs only at their own evaluation boundary.
+  pub privateJobQueue: bool,
   pub localeCallbacks: Option<LocaleCallbacks>,
   pub userOpaque: ?*mut u8
 }
 
 pub enum AutoInitKind { Prototype, ModuleNamespace, Property }
-/// Auto-init retains its Context realm. The opaque descriptor is either the source
-/// host pointer, a typed heap payload (module, for example), or a native table ID.
+/// Auto-init retains its Context realm. Initializer owns its callable; other
+/// opaque heap pointers (including module namespace payloads) remain borrowed.
 pub union AutoInitOpaque {
   Pointer { pub value: ?*mut u8 },
   Heap { pub reference: *mut HeapHeader },
-  Native { pub descriptor: NativeFunctionId }
+  Native { pub descriptor: NativeFunctionId },
+  Initializer { pub reference: *mut HeapHeader }
 }
 impl Copy for AutoInitOpaque {}
 /// One property's storage. Every variant is at most two words, so a slot is three:
@@ -653,7 +685,8 @@ pub union PropertySlot {
   /// AutoInitKind.Property over a NativeFunctionId.Builtin descriptor.
   LazyBuiltin { pub realm: *mut HeapHeader, pub family: BuiltinFamily, pub method: u32 },
   /// AutoInitKind.Property over a NativeFunctionId.Host descriptor.
-  LazyHost { pub realm: *mut HeapHeader, pub id: u32 }
+  LazyHost { pub realm: *mut HeapHeader, pub id: u32 },
+  LazyInitializer { pub realm: *mut HeapHeader, pub reference: *mut HeapHeader }
 }
 impl Copy for PropertySlot {}
 impl PropertySlot {
@@ -677,6 +710,7 @@ impl PropertySlot {
           NativeFunctionId.Builtin { family, method } => PropertySlot.LazyBuiltin { realm: realm, family: family, method: method }
           NativeFunctionId.Host { id } => PropertySlot.LazyHost { realm: realm, id: id }
         }
+        AutoInitOpaque.Initializer { reference } => PropertySlot.LazyInitializer { realm: realm, reference: reference }
         _ => Intrinsic.trap("lazy property without a native descriptor")
       }
     }
@@ -707,6 +741,7 @@ impl PropertySlot {
       PropertySlot.LazyNamespace { realm, .. } => realm
       PropertySlot.LazyBuiltin { realm, .. } => realm
       PropertySlot.LazyHost { realm, .. } => realm
+      PropertySlot.LazyInitializer { realm, .. } => realm
       _ => Pointer.null<HeapHeader>()
     }
   }
@@ -717,6 +752,7 @@ impl PropertySlot {
       PropertySlot.LazyNamespace { .. } => AutoInitKind.ModuleNamespace
       PropertySlot.LazyBuiltin { .. } => AutoInitKind.Property
       PropertySlot.LazyHost { .. } => AutoInitKind.Property
+      PropertySlot.LazyInitializer { .. } => AutoInitKind.Property
       _ => Intrinsic.trap("not a lazy property")
     }
   }
@@ -728,6 +764,7 @@ impl PropertySlot {
       PropertySlot.LazyNamespace { module, .. } => AutoInitOpaque.Heap { reference: module }
       PropertySlot.LazyBuiltin { family, method, .. } => AutoInitOpaque.Native { descriptor: NativeFunctionId.Builtin { family: family, method: method } }
       PropertySlot.LazyHost { id, .. } => AutoInitOpaque.Native { descriptor: NativeFunctionId.Host { id: id } }
+      PropertySlot.LazyInitializer { reference, .. } => AutoInitOpaque.Initializer { reference: reference }
       _ => Intrinsic.trap("not a lazy property")
     }
   }
@@ -738,8 +775,8 @@ impl PropertySlot {
 ///
 /// A data slot holds its ValueBits. An accessor holds its getter then its setter, and a
 /// VarRef its cell. A lazy slot holds its realm's address with the lazy kind in the low
-/// two bits (cells are at least 16-byte aligned), then the module, the builtin
-/// descriptor, the host id or zero.
+/// three bits (cells are at least 16-byte aligned), then the module, the builtin
+/// descriptor, the host id, the owned initializer or zero.
 pub struct SlotBits { first: u64, second: u64 }
 impl Copy for SlotBits {}
 struct SlotPointers { first: ?*mut HeapHeader, second: ?*mut HeapHeader }
@@ -751,7 +788,8 @@ const LAZY_PROTOTYPE: u64 = 0
 const LAZY_NAMESPACE: u64 = 1
 const LAZY_BUILTIN: u64 = 2
 const LAZY_HOST: u64 = 3
-const LAZY_MASK: u64 = 3
+const LAZY_INITIALIZER: u64 = 4
+const LAZY_MASK: u64 = 7
 @inlineAlways
 fn checkSlotLayout() -> () {
   if Layout.of<ValueBits>().bytes != 16 || Layout.of<ValueBits>().alignment > 8 || Layout.of<SlotPointers>().bytes != 16 || Layout.of<BuiltinWord>().bytes != 8 {
@@ -779,6 +817,7 @@ impl SlotBits {
         SlotBits.lazy(realm, LAZY_BUILTIN, unsafe Pointer.read<u64>(unsafe Intrinsic.pointerReinterpret<*const BuiltinWord, *const u64>(Pointer.fromRef<BuiltinWord>(&word))))
       }
       PropertySlot.LazyHost { realm, id } => SlotBits.lazy(realm, LAZY_HOST, u32.toU64(id))
+      PropertySlot.LazyInitializer { realm, reference } => SlotBits.lazy(realm, LAZY_INITIALIZER, addressWord(reference))
     }
   }
   @inlineAlways
@@ -804,7 +843,7 @@ impl SlotBits {
     if kind == JS_PROP_NORMAL { return PropertySlot.Value { value: self.valueBits() } }
     return self.viewOther(kind)
   }
-  /// The realm reference of a lazy (auto-init) slot: the only edge such a slot owns.
+  /// The realm reference of a lazy (auto-init) slot.
   @inlineAlways
   pub fn lazyRealmUnchecked(self: &Self) -> ?*mut HeapHeader {
     let untagged = SlotBits { first: u64.bitAnd(self.first, u64.bitNot(LAZY_MASK)), second: self.second }
@@ -822,6 +861,7 @@ impl SlotBits {
     if lazy == LAZY_PROTOTYPE { return PropertySlot.LazyPrototype { realm: realm } }
     if lazy == LAZY_NAMESPACE { return PropertySlot.LazyNamespace { realm: realm, module: unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(parts.second) } }
     if lazy == LAZY_HOST { return PropertySlot.LazyHost { realm: realm, id: u64.toU32(self.second) } }
+    if lazy == LAZY_INITIALIZER { return PropertySlot.LazyInitializer { realm: realm, reference: unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(parts.second) } }
     let word = unsafe Pointer.read<BuiltinWord>(unsafe Intrinsic.pointerReinterpret<*const u64, *const BuiltinWord>(Pointer.fromRef<u64>(&self.second)))
     return PropertySlot.LazyBuiltin { realm: realm, family: word.family, method: word.method }
   }
@@ -971,7 +1011,7 @@ pub struct MappedArgumentsData {
 pub struct TypedArrayCache {
   pub view: *mut HeapHeader,
   pub cachedData: ?*mut u8,
-  pub count: u32,
+  pub count: u64,
   /// Physical backing policy, refreshed when a native host publishes private bytes.
   pub shared: bool,
   /// Immutable view policy: auto-length tracking OR a non-shared resizable
@@ -1035,6 +1075,7 @@ pub union ObjectPayload {
   MappedArguments { pub arguments: MappedArgumentsData },
   TypedArray { pub array: TypedArrayCache },
   Boxed { pub value: ValueBits },
+  ErrorStack { pub value: ValueBits, pub cached: bool },
   RegExp { pub regexp: RegExpData },
   GlobalObject { pub global: GlobalObjectData },
   Opaque { pub family: ObjectPayloadFamily, pub reference: ?*mut HeapHeader }
@@ -1056,6 +1097,8 @@ fn objectFlag(flags: u8, bit: u8, value: bool) -> u8 {
 /// One object's data. The small fields share a word, as in the source's JSObject:
 /// the boolean properties as flag bits, a 16-bit class id and the weak count.
 pub struct ObjectData {
+  /// Actual allocation realm, independent of mutable prototype/constructor.
+  pub creationRealm: ?*mut HeapHeader,
   flags: u8,
   classBits: u16,
   /// Weak liveness count, NOT a second strong JS reference count.
@@ -1072,7 +1115,7 @@ impl ObjectData {
     let mut flags = OBJECT_EXTENSIBLE
     if exotic { flags = u8.bitOr(flags, OBJECT_EXOTIC) }
     if fastArray { flags = u8.bitOr(flags, OBJECT_FAST_ARRAY) }
-    return ObjectData { flags: flags, classBits: classBits(classId), weakRefCount: 0, shape: shape, properties: move properties, payload: move payload }
+    return ObjectData { creationRealm: Pointer.null<HeapHeader>(), flags: flags, classBits: classBits(classId), weakRefCount: 0, shape: shape, properties: move properties, payload: move payload }
   }
   /// The class id. Like the source, objects keep 16 bits of it.
   @inlineAlways
@@ -1168,6 +1211,15 @@ impl SourceText {
 }
 pub struct FunctionDebugInfo {
   pub filename: u32,
+  /// Optional call-expression coordinates; legacy PC coordinates stay unchanged.
+  pub callSitePcToLine: Option<ByteStorage>,
+  // Node VM presentation only; lexical maps and ordinary QuickJS stacks are unchanged.
+  pub nodeVm: bool,
+  // A sourceURL suppresses execution offsets, not declaration coordinates.
+  pub nodeSourceURL: bool,
+  pub lineOffset: i32,
+  pub columnOffset: i32,
+  pub sourceColumnOffset: i32,
   /// None is stripped/unavailable source, distinct from an available empty script.
   pub source: Option<SourceText>,
   pub pcToLine: ByteStorage
@@ -1176,6 +1228,16 @@ pub struct FunctionDebugInfo {
 /// lengths/counts; code may be borrowed ROM. realm, constants, atoms and closure
 /// names are explicit owned JS edges. Debug presence replaces source has_debug.
 pub struct FunctionBytecode {
+  /// Runtime-local compilation identity, shared by the entire compiled tree.
+  pub scriptId: u64,
+  pub scriptIsEval: bool,
+  /// Optional native debugger tables; deliberately absent from QuickJS serialization.
+  pub debuggerMetadata: DebuggerMetadata,
+  // Host import callback is a traced edge, never serialized into bytecode caches.
+  pub hostImport: ValueBits,
+  pub hostModule: ValueBits,
+  /// Node compilation source/origin, shared across a script tree; never serialized.
+  pub hostScriptMetadata: ValueBits,
   pub mode: u8,
   pub hasPrototype: bool,
   pub hasSimpleParameterList: bool,
@@ -1254,10 +1316,14 @@ pub const NO_SP: usize = 18446744073709551615
 /// after a call (NO_PC for native/no PC), not a pointer into growable bytecode.
 pub struct StackFrame {
   pub previous: ?*mut StackFrame,
+  pub debuggerId: u64,
   /// Explicit reverse link replaces source container_of(frame, AsyncFunctionState).
   /// Borrowed here; every attached async VarRef holds a separate explicit JS edge.
   pub asyncOwner: ?*mut HeapHeader,
   pub currentFunction: ValueBits,
+  /// Borrowed from the activation owner; snapshots retain these as JS edges.
+  pub thisValue: ValueBits,
+  pub newTarget: ValueBits,
   pub arguments: FrameSlots,
   pub locals: FrameSlots,
   pub stack: FrameSlots,
@@ -1308,6 +1374,11 @@ impl StableFrame {
     return move owner
   }
   pub fn get(self: &Self) -> &StackFrame { return &self.frame.get()[0] }
+  pub fn profileBytes(self: &Self) -> usize {
+    return Layout.of<StackFrame>().bytes
+      + (self.arguments.length() + self.locals.length() + self.stack.length()) * Layout.of<ValueBits>().bytes
+      + self.references.capacity() * Layout.of<?*mut HeapHeader>().bytes
+  }
   /// Requires no conflicting raw frame/slot accesses; do not replace/move published
   /// slots or the frame while attached references can observe them.
   pub unsafe fn getMut(self: &mut Self) -> &mut StackFrame { return &mut self.frame.getMut()[0] }
@@ -1371,6 +1442,8 @@ pub struct ModuleDef {
   pub initialize: Option<NativeFunctionId>,
   pub hasTopLevelAwait: bool,
   pub resolved: bool,
+  // Detached host modules own dependency and asynchronous-parent graph edges.
+  pub hostOwnedGraph: bool,
   pub functionCreated: bool,
   pub status: ModuleStatus,
   pub dfsIndex: i32,
@@ -1392,9 +1465,12 @@ pub struct ModuleDef {
 pub fn linkedModule(link: Option<CellRef<ModuleDef>>) -> CellRef<ModuleDef> {
   return match link { Option<CellRef<ModuleDef>>.Some { value } => value _ => Intrinsic.trap("QuickJS invariant violated") }
 }
-/// Prepared nodes own their arguments; enqueue adds an owned Context realm.
+/// Prepared nodes own their arguments and registration context; enqueue owns a realm.
 pub struct JobEntry {
   pub realm: ?*mut HeapHeader,
+  pub asyncContext: ValueBits,
+  pub asyncToken: usize,
+  pub asyncResource: ValueBits,
   pub function: NativeFunctionId,
   pub arguments: List<ValueBits>
 }

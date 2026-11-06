@@ -1,0 +1,78 @@
+//! Allocation stack attribution at the actual successful allocator request, not
+//! at a later polling point. Captured metadata is copied while frames are live.
+//! PCs are published VM frame PCs (call boundaries), unlike the CPU sampler's
+//! instruction-boundary top PC. Native frames have scriptId=0 and no invented PC.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.pointer { Pointer }
+import silk.num.i64
+import silk.num.usize
+import js_heap { HeapHeader, HeapCell }
+import js_core_types { RuntimeState, StackFrame, FunctionBytecode, FunctionDebugInfo, NO_PC }
+import js_value { ValueBits }
+import js_backtrace as backtrace
+import js_os_events_platform as clock
+import runtime_memory { AllocationObserver }
+import runtime_allocation_profile { Recording, Trace }
+import runtime_allocation_profile as records
+
+/// Owner-thread only; recorder storage is deliberately outside runtime accounting.
+/// Stop before destroying the runtime, because context is an unowned native pointer.
+pub unsafe effect fn start(observer: &AllocationObserver, runtime: ?*mut HeapHeader,
+  capacity: usize, intervalBytes: usize) -> bool ! OutOfMemoryError {
+  let mut system = Allocator.systemAllocatorProvider()
+  let callback: extern "C" fn(?*mut u8, *mut Trace) -> () = silkAllocationProfileCapture
+  let recording = run Recording.make(capacity, intervalBytes, callback,
+    unsafe Intrinsic.pointerReinterpret<?*mut HeapHeader, ?*mut u8>(runtime))
+    |> Effect.provideMut<Allocator>(&mut system)
+  return observer.startProfile(move recording)
+}
+
+export "C" fn silkAllocationProfileCapture(context: ?*mut u8, output: *mut Trace) -> () {
+  let runtime = unsafe Intrinsic.pointerReinterpret<?*mut u8, ?*mut HeapHeader>(context)
+  let mut result = records.emptyTrace()
+  result.timestampNs = i64.toU64(clock.nowNanoseconds())
+  if !Pointer.isNull(runtime) {
+    let anchor = ()
+    let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor,
+      unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(runtime))
+    let mut next = state.currentStackFrame
+    while !Pointer.isNull(next) && result.depth < result.frames.length {
+      let frame = unsafe Pointer.borrow(&anchor,
+        unsafe Intrinsic.pointerRequalify<?*mut StackFrame, *mut StackFrame>(next))
+      let mut entry = result.frames[result.depth]
+      entry.pc = usize.MAX
+      entry.function = match frame.currentFunction {
+        ValueBits.Object { reference } => Pointer.address(reference)
+        _ => 0
+      }
+      match unsafe backtrace.bytecode(frame.currentFunction) {
+        Option<*mut HeapHeader>.Some { value } => {
+          let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, value)
+          entry.scriptId = code.scriptId
+          let full = state.atoms.profileText(code.name, &mut entry.name)
+          entry.nameLength = if full < entry.name.length { full } else { entry.name.length }
+          entry.nameTruncated = full > entry.name.length
+          let pc = frame.currentPc
+          if pc != NO_PC {
+            entry.pc = pc
+            match &code.debug {
+              Option<FunctionDebugInfo>.Some { value: debug } => {
+                let location = unsafe backtrace.callLocation(&debug, usize.toU32(pc))
+                entry.line = location.line entry.column = location.column
+              }
+              _ => ()
+            }
+          }
+        }
+        _ => ()
+      }
+      result.frames[result.depth] = entry
+      result.depth = result.depth + 1
+      next = frame.previous
+    }
+    result.truncated = !Pointer.isNull(next)
+  }
+  unsafe Pointer.write(output, result)
+}

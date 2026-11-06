@@ -75,6 +75,7 @@ def main():
         if not is_portable and contract is None:raise SystemExit('Missing independent native expectation: '+name)
     build=a.build_dir.resolve();build.mkdir(parents=True,exist_ok=True)
     shutil.copytree(ROOT/'src',build/'src',dirs_exist_ok=True);shutil.copyfile(ROOT/'silk.toml',build/'silk.toml')
+    shutil.copyfile(ROOT/'startup.order',build/'startup.order')
     (build/'src/js_intl_auxiliary_fixture_cases.silk').write_text(generated(selected,not a.skip_faults))
     (build/'cases.json').write_text(json.dumps([{'name':n,'source':s,'independent':e,'portable':q} for n,s,e,q in selected],indent=2))
     (build/'oracle.c').write_text(c_source(portable))

@@ -1,6 +1,9 @@
 //! Native QuickJS 7d1c13c5d8f8c6b32893786ed35cdcebd88194d2 reader,
 //! quickjs.c:39191-40337. Wire version 5 is always little endian.
 //! Reader roots are explicit owners, including partial graphs and module roots.
+//! Extension tags 20/21/22 encode u64 buffer/view extents; legacy tags retain
+//! their canonical u32 LEB representation. Cache admission validates the whole
+//! graph before committing module roots, using the runtime's final opcode table.
 import js_realm { lendRealm, Realm }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
@@ -22,6 +25,7 @@ import js_engine_host { EngineServices }
 import js_heap { HeapHeader, HeapCell, HeapKind, CellRef }
 import js_value { ValueBits }
 import js_owned_value { Value, ValueList, ValueRef, lendBits, immediateRef }
+import js_debugger_metadata { Metadata as DebuggerMetadata }
 import js_exceptions { JsException }
 import js_coercion_host { CoercionHooks }
 import js_core_types { SourceText, RuntimeState, ContextState, ObjectData, ObjectPayload, NativeErrorKind, NativeFunctionId,
@@ -37,23 +41,29 @@ import js_object_allocate as objects
 import js_property_mutations as properties
 import js_boxing as boxing
 import js_buffer_storage as storage
+import js_binary_object_writer { SharedLease }
 import js_module_metadata as modules
 import js_opcode_data as op
 import js_atom_data as atoms
 import js_class_data as classes
 import native_stack { currentFrameAddress }
+import js_bytecode_validate as validation
 
 pub const BYTECODE: u32 = 1
 pub const ROM_DATA: u32 = 2
 pub const SAB: u32 = 4
 pub const REFERENCE: u32 = 8
+const CACHE_SCRIPT: u32 = 16
+const CACHE_MODULE: u32 = 32
 /// Borrowed relocation entry. The decoder clones the buffer's backing owner;
 /// address is the serialized identifier, not necessarily this buffer's address.
 pub struct SharedBacking { pub address: u64, pub buffer: ValueBits }
 impl Copy for SharedBacking {}
 struct Reader<'a> {
   data: *const u8, length: usize, position: usize, flags: u32, rom: bool,
-  trusted: bool, shared: &'a [SharedBacking], firstAtom: u32,
+  activeScriptId: u64,
+  activeScriptIsEval: bool,
+  trusted: bool, shared: &'a [SharedBacking], leases: &'a [SharedLease], firstAtom: u32,
   atoms: List<u32>, references: List<ValueBits>, roots: ValueList, modules: List<CellRef<ModuleDef>>
 }
 fn reference(value: ValueBits) -> *mut HeapHeader {
@@ -92,10 +102,13 @@ effect fn leb<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m
   let mut value:u32=0 let mut shift:u32=0
   while shift<35 {
     let b=run byte(&mut r,&mut engine,realm)
+    // The fifth byte has only four payload bits; reject before shifting.
+    if shift==28 && b>15 { return run error(&mut engine,realm,b"invalid binary object integer") }
+    if shift!=0 && b==0 { return run error(&mut engine,realm,b"noncanonical binary object integer") }
     value=value|u32.shiftLeft(u8.toU32(b&127),shift)
     if (b&128)==0 { return value } shift=shift+7
   }
-  return run error(&mut engine,realm,b"read after the end of the buffer")
+  return run error(&mut engine,realm,b"invalid binary object integer")
 }
 fn signed(value:u32)->i32 { if value>=0x80000000 { return -1-u32.toI32(value^0xffffffff) } return u32.toI32(value) }
 effect fn count<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>)
@@ -103,6 +116,12 @@ effect fn count<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<
   let n=run leb(&mut r,&mut engine,realm)
   if n>0x7fffffff { return run error(&mut engine,realm,b"invalid binary object length") }
   return u32.toUsize(n)
+}
+effect fn lebU16<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>)
+  -> u16 !JsException ?&mut Allocator {
+  let value=run leb(&mut r,&mut engine,realm)
+  if value>65535 { return run error(&mut engine,realm,b"invalid binary object uint16") }
+  return u32.toU16(value)
 }
 effect fn own<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>,value:ValueBits)
   -> ValueBits !OutOfMemoryError ?&mut Allocator {
@@ -177,15 +196,38 @@ effect fn readBigInt<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut En
   }
   return run bigint.compact(run BigInt.fromOwnedLimbs(move words))
 }
-effect fn readBuffer<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>,shared:bool)
+effect fn readBuffer<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>,shared:bool,wide:bool)
   ->ValueBits !OutOfMemoryError|JsException ?&mut Allocator {
-  let length=run leb(&mut r,&mut engine,realm) let maximum=run leb(&mut r,&mut engine,realm)
-  if maximum<length { return run typeError(&mut engine,realm,b"invalid array buffer") }
-  let mut max=Option<u64>.none() if maximum!=0xffffffff { max=Option<u64>.some(u32.toU64(maximum)) }
+  let mut length:u64=0 let mut maximum:u64=18446744073709551615
+  if wide { length=run fixed(&mut r,&mut engine,realm,8) maximum=run fixed(&mut r,&mut engine,realm,8) }
+  else {
+    length=u32.toU64(run leb(&mut r,&mut engine,realm))
+    let encoded=run leb(&mut r,&mut engine,realm)
+    if encoded!=0xffffffff { maximum=u32.toU64(encoded) }
+  }
+  if length>17179869184 || (maximum!=18446744073709551615 && (maximum<length || maximum>17179869184)) {
+    return run typeError(&mut engine,realm,b"invalid array buffer")
+  }
+  let mut max=Option<u64>.none() if maximum!=18446744073709551615 { max=Option<u64>.some(maximum) }
   let memory=engine.memory let mut value=ValueBits.Undefined
   if shared {
     if (r.flags&SAB)==0 { return run error(&mut engine,realm,b"invalid shared array buffer tag") }
     let address=run fixed(&mut r,&mut engine,realm,8) let mut i:usize=0
+    while i<r.leases.length {
+      let entry=&r.leases[i]
+      if entry.address==address && entry.lease.length()==length {
+        let clone=run storage.newSharedCloneFromLease(&mut engine,memory,realm,&entry.lease)
+        value=run own(&mut r,&mut engine,realm,clone)
+        let state=unsafe storage.snapshot(reference(value))
+        let mut expected:i64=-1 if maximum!=18446744073709551615 { expected=u64.toI64(maximum) }
+        if state.byteLength!=length || state.maxByteLength!=expected {
+          return run typeError(&mut engine,realm,b"invalid shared array buffer lease")
+        }
+        run addReference(&mut r,value) return value
+      }
+      i=i+1
+    }
+    i=0
     while i<r.shared.length {
       let entry=r.shared[i]
       if entry.address==address {
@@ -193,12 +235,12 @@ effect fn readBuffer<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut En
         let state=source.state() let mut expected:i64=-1
         // Preserve the pinned constructor's external growable-buffer rejection;
         // relocation changes pointer identity, not the source codec's policy.
-        if maximum!=0xffffffff && !Pointer.isNull<u8>(state.data) {
+        if maximum!=18446744073709551615 && !Pointer.isNull<u8>(state.data) {
           return run engine.throwError(realm,NativeErrorKind.Internal,
             b"resizable ArrayBuffers not supported for externally managed buffers")
         }
-        if maximum!=0xffffffff { expected=u32.toI64(maximum) }
-        let mut capacity=state.byteLength if state.maxByteLength>=0 { capacity=i64.toU32(state.maxByteLength) }
+        if maximum!=18446744073709551615 { expected=u64.toI64(maximum) }
+        let mut capacity=state.byteLength if state.maxByteLength>=0 { capacity=i64.toU64(state.maxByteLength) }
         if state.detached || state.maxByteLength!=expected || length>capacity {
           return run typeError(&mut engine,realm,b"invalid shared array buffer relocation")
         }
@@ -213,31 +255,34 @@ effect fn readBuffer<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut En
     if !canDuplicate { return run error(&mut engine,realm,b"shared array buffer duplication is unavailable") }
     // This reinterpretation is confined to the explicitly unsafe trusted API.
     let pointer=unsafe Pointer.read<?*mut u8>(unsafe Intrinsic.pointerReinterpret<*const u64,*const ?*mut u8>(Pointer.fromRef<u64>(&address)))
-    value=run unsafe storage.createExternal(&mut engine,memory,realm,ValueBits.Undefined,u32.toU64(length),move max,true,pointer,Option<NativeFunctionId>.none(),Pointer.null<u8>(),false)
+    value=run unsafe storage.createExternal(&mut engine,memory,realm,ValueBits.Undefined,length,move max,true,pointer,Option<NativeFunctionId>.none(),Pointer.null<u8>(),false)
   } else {
-    run need(&r.*,&mut engine,realm,u32.toUsize(length))
+    run need(&r.*,&mut engine,realm,u64.toUsize(length))
     let mut pointer=Pointer.null<u8>()
     if length!=0 { pointer=unsafe Intrinsic.pointerRequalify<*const u8,*mut u8>(at(&r.*,r.position)) }
-    value=run unsafe storage.createExternal(&mut engine,memory,realm,ValueBits.Undefined,u32.toU64(length),move max,false,pointer,Option<NativeFunctionId>.none(),Pointer.null<u8>(),true)
-    r.position=r.position+u32.toUsize(length)
+    value=run unsafe storage.createExternal(&mut engine,memory,realm,ValueBits.Undefined,length,move max,false,pointer,Option<NativeFunctionId>.none(),Pointer.null<u8>(),true)
+    r.position=r.position+u64.toUsize(length)
   }
   let result=run own(&mut r,&mut engine,realm,value) run addReference(&mut r,result) return result
 }
-effect fn readTypedArray<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>)
+effect fn readTypedArray<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>,wide:bool)
   ->ValueBits !OutOfMemoryError|JsException|StringLengthError|BigIntError ?&mut Allocator {
   let tag=u8.toU32(run byte(&mut r,&mut engine,realm))
   if tag>classes.JS_CLASS_FLOAT64_ARRAY-classes.JS_CLASS_UINT8C_ARRAY { return run typeError(&mut engine,realm,b"invalid typed array") }
-  let length=run leb(&mut r,&mut engine,realm) let offset=run leb(&mut r,&mut engine,realm)
+  let mut length:u64=0 let mut offset:u64=0
+  if wide { length=run fixed(&mut r,&mut engine,realm,8) offset=run fixed(&mut r,&mut engine,realm,8) }
+  else { length=u32.toU64(run leb(&mut r,&mut engine,realm)) offset=u32.toU64(run leb(&mut r,&mut engine,realm)) }
+  if length>17179869184 || offset>17179869184 { return run typeError(&mut engine,realm,b"invalid typed array extent") }
   let index=r.references.length() run addReference(&mut r,ValueBits.Undefined)
   let buffer=run readValue(&mut r,&mut engine,realm)
   let backing=run storage.requireBuffer(&mut engine,realm,unsafe lendBits(&buffer, buffer),-1)
   let state=backing.state() let class=classes.JS_CLASS_UINT8C_ARRAY+tag let shift=storage.sizeLog2(class)
-  let bytes=u64.shiftLeft(u32.toU64(length),u32.toU64(shift))
-  if (offset&(u32.shiftLeft(1,shift)-1))!=0 { return run engine.throwError(realm,NativeErrorKind.Range,b"invalid offset") }
-  if state.detached || u32.toU64(offset)+bytes>u32.toU64(state.byteLength) { return run engine.throwError(realm,NativeErrorKind.Range,b"invalid length") }
+  let bytes=u64.shiftLeft(length,u32.toU64(shift))
+  if (offset&(u64.shiftLeft(1,u32.toU64(shift))-1))!=0 { return run engine.throwError(realm,NativeErrorKind.Range,b"invalid offset") }
+  if state.detached || offset+bytes>state.byteLength { return run engine.throwError(realm,NativeErrorKind.Range,b"invalid length") }
   let memory=engine.memory let created=run objects.withClass(&mut engine,memory,realm,class)
   let value=run own(&mut r,&mut engine,realm,created)
-  run unsafe storage.initializeView(&mut engine,realm,reference(value),unsafe buffer.retained(),offset,u64.toU32(bytes),false)
+  run unsafe storage.initializeView(&mut engine,realm,reference(value),unsafe buffer.retained(),offset,bytes,false)
   if (r.flags&REFERENCE)!=0 { r.references.set(index,value) } return value
 }
 effect fn readValue<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>)
@@ -258,8 +303,8 @@ effect fn readValue<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Eng
     if tag==12 { return run readFunction(&mut r,&mut engine,realm) }
     return run readModule(&mut r,&mut engine,realm)
   }
-  if tag==14 { return run readTypedArray(&mut r,&mut engine,realm) }
-  if tag==15 || tag==16 { return run readBuffer(&mut r,&mut engine,realm,tag==16) }
+  if tag==14 || tag==22 { return run readTypedArray(&mut r,&mut engine,realm,tag==22) }
+  if tag==15 || tag==16 || tag==20 || tag==21 { return run readBuffer(&mut r,&mut engine,realm,tag==16 || tag==21,tag>=20) }
   if tag==19 {
     if (r.flags&REFERENCE)==0 { return run error(&mut engine,realm,b"object references are not allowed") }
     let index=u32.toUsize(run leb(&mut r,&mut engine,realm))
@@ -367,19 +412,31 @@ effect fn readCode<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engi
   b.code=move code
 }
 effect fn readFunction<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>)
-  ->ValueBits !OutOfMemoryError|JsException|StringLengthError|BigIntError ?&mut Allocator { let context = realm.context()
+  ->ValueBits !OutOfMemoryError|JsException|StringLengthError|BigIntError ?&mut Allocator { let context=realm.context()
+  // Recursive constants share a fresh compilation identity, never a filename identity.
+  let previousScriptId = r.activeScriptId
+  if previousScriptId == 0 { r.activeScriptId = unsafe runtime.allocateScriptId(realm.runtime()) }
   let flags=u64.toU16(run fixed(&mut r,&mut engine,realm,2))
+  if (flags&0xf000)!=0 { return run error(&mut engine,realm,b"invalid function flags") }
+  let previousScriptIsEval = r.activeScriptIsEval
+  if previousScriptId == 0 { r.activeScriptIsEval = (flags & 2048) != 0 }
   let mode=run byte(&mut r,&mut engine,realm) let name=run atom(&mut r,&mut engine,realm)
-  let argc=u32.toU16((run leb(&mut r,&mut engine,realm))&65535)
-  let varc=u32.toU16((run leb(&mut r,&mut engine,realm))&65535)
-  let defined=u32.toU16((run leb(&mut r,&mut engine,realm))&65535)
-  let stack=u32.toU16((run leb(&mut r,&mut engine,realm))&65535)
-  let refs=u32.toU16((run leb(&mut r,&mut engine,realm))&65535)
+  let argc=run lebU16(&mut r,&mut engine,realm)
+  let varc=run lebU16(&mut r,&mut engine,realm)
+  let defined=run lebU16(&mut r,&mut engine,realm)
+  let stack=run lebU16(&mut r,&mut engine,realm)
+  let refs=run lebU16(&mut r,&mut engine,realm)
   let closures=run count(&mut r,&mut engine,realm) let constants=run count(&mut r,&mut engine,realm)
   let codeLength=run count(&mut r,&mut engine,realm) let locals=run count(&mut r,&mut engine,realm)
   run need(&r.*,&mut engine,realm,closures+constants+codeLength+locals)
   let kind=match u16.shiftRight(flags,4)&3 { 0=>FunctionKind.Normal 1=>FunctionKind.Generator 2=>FunctionKind.Async _=>FunctionKind.AsyncGenerator }
   let function=run HeapCell.allocate<FunctionBytecode>(HeapKind.FunctionBytecode,FunctionBytecode {
+    scriptId:r.activeScriptId,
+    scriptIsEval:r.activeScriptIsEval,
+    debuggerMetadata:DebuggerMetadata.make(),
+    hostImport:ValueBits.Undefined,
+    hostModule:ValueBits.Undefined,
+    hostScriptMetadata:ValueBits.Undefined,
     mode:mode,hasPrototype:(flags&1)!=0,hasSimpleParameterList:(flags&2)!=0,
     isDerivedClassConstructor:(flags&4)!=0,needsHomeObject:(flags&8)!=0,kind:kind,
     newTargetAllowed:(flags&64)!=0,superCallAllowed:(flags&128)!=0,superAllowed:(flags&256)!=0,
@@ -398,7 +455,7 @@ effect fn readFunction<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut 
   let mut i:usize=0
   while i<locals {
     let varName=run atom(&mut r,&mut engine,realm) let next=run leb(&mut r,&mut engine,realm)
-    let refIndex=u32.toU16((run leb(&mut r,&mut engine,realm))&65535)
+    let refIndex=run lebU16(&mut r,&mut engine,realm)
     let bits=run byte(&mut r,&mut engine,realm) let varKind=run variableKind(&mut engine,realm,bits&15)
     let b=unsafe HeapCell.payloadMut<FunctionBytecode,()>(&mut anchor,function)
     run b.varDefs.append(VarDef { name:duplicateAtom(&mut engine,realm,varName),scopeNext:signed(u32.wrappingSubtract(next,1)),
@@ -407,8 +464,9 @@ effect fn readFunction<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut 
   }
   i=0
   while i<closures {
-    let varName=run atom(&mut r,&mut engine,realm) let index=u32.toU16((run leb(&mut r,&mut engine,realm))&65535)
+    let varName=run atom(&mut r,&mut engine,realm) let index=run lebU16(&mut r,&mut engine,realm)
     let bits=u64.toU16(run fixed(&mut r,&mut engine,realm,2))
+    if (bits&0xfe00)!=0 { return run error(&mut engine,realm,b"invalid closure flags") }
     let varKind=run variableKind(&mut engine,realm,u16.toU8(u16.shiftRight(bits,5)&15))
     let b=unsafe HeapCell.payloadMut<FunctionBytecode,()>(&mut anchor,function)
     run b.closureVars.append(ClosureVar { name:duplicateAtom(&mut engine,realm,varName),variableIndex:index,
@@ -420,6 +478,8 @@ effect fn readFunction<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut 
     let filename=run atom(&mut r,&mut engine,realm)
     let b=unsafe HeapCell.payloadMut<FunctionBytecode,()>(&mut anchor,function)
     b.debug=Option<FunctionDebugInfo>.some(FunctionDebugInfo { filename:duplicateAtom(&mut engine,realm,filename),
+      callSitePcToLine:Option<ByteStorage>.none(),
+      nodeVm:false,nodeSourceURL:false,lineOffset:0,columnOffset:0,sourceColumnOffset:0,
       source:Option<SourceText>.none(),pcToLine:ByteStorage.Owned { bytes:List<u8>.make() } }) drop b
     let lines=run count(&mut r,&mut engine,realm)
     let lineBytes=run copiedBytes(&mut r,&mut engine,realm,lines)
@@ -438,6 +498,8 @@ effect fn readFunction<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut 
     let b=unsafe HeapCell.payloadMut<FunctionBytecode,()>(&mut anchor,function)
     run b.constants.append(unsafe child.retained()) i=i+1
   }
+  r.activeScriptId = previousScriptId
+  r.activeScriptIsEval = previousScriptIsEval
   return value
 }
 effect fn readModule<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>)
@@ -520,13 +582,21 @@ fn unlinkFailedModule<'a>(realm: Realm<'a>,module:CellRef<ModuleDef>)->() { let 
 effect fn body<'a,'m,'r,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>)
   ->ValueBits !OutOfMemoryError|JsException|StringLengthError|BigIntError ?&mut Allocator {
   run header(&mut r,&mut engine,realm)
-  return unsafe (run readValue(&mut r,&mut engine,realm)).retained()
+  let value = run readValue(&mut r,&mut engine,realm)
+  // Validate before committing module roots; invalid nested modules roll back.
+  if (r.flags&CACHE_SCRIPT)!=0 { run validation.validate(&mut engine,realm,unsafe lendBits(&value,value)) }
+  if (r.flags&CACHE_MODULE)!=0 { run validation.validateModule(&mut engine,realm,unsafe lendBits(&value,value)) }
+  if (r.flags&(CACHE_SCRIPT|CACHE_MODULE))!=0 && r.position!=r.length {
+    return run error(&mut engine,realm,b"trailing cached bytecode")
+  }
+  return unsafe value.retained()
 }
 effect fn decode<'a, 'm,S:EngineServices>(engine:&mut Engine<'m,S>,realm: Realm<'a>,data:*const u8,
-  length:usize,flags:u32,trusted:bool,shared:&[SharedBacking])->ValueBits !JsException ?&mut Allocator {
+  length:usize,flags:u32,trusted:bool,shared:&[SharedBacking],leases:&[SharedLease])->ValueBits !JsException ?&mut Allocator {
   let mut first:u32=1 if (flags&BYTECODE)!=0 { first=atoms.JS_ATOM_END }
   let mut r=Reader { data:data,length:length,position:0,flags:flags,rom:(flags&ROM_DATA)!=0,
-    trusted:trusted,shared:shared,firstAtom:first,atoms:List<u32>.make(),references:List<ValueBits>.make(),
+    activeScriptId:0,activeScriptIsEval:false,
+    trusted:trusted,shared:shared,leases:leases,firstAtom:first,atoms:List<u32>.make(),references:List<ValueBits>.make(),
     roots:ValueList.make(),modules:List<CellRef<ModuleDef>>.make() }
   let decoded=run Effect.result(body(&mut r,&mut engine,realm))
   let failed=match &decoded { Result<ValueBits,OutOfMemoryError|JsException|StringLengthError|BigIntError>.Failure {..}=>true _=>false }
@@ -567,7 +637,7 @@ pub effect fn readObjectShared<'a, 'm,S:EngineServices>(engine:&mut Engine<'m,S>
   bytes:&[u8],flags:u32,shared:&[SharedBacking])->ValueBits !JsException ?&mut Allocator {
   if (flags&ROM_DATA)!=0 { return run error(&mut engine,realm,b"ROM data requires readObjectRom") }
   if bytes.length==0 { return run error(&mut engine,realm,b"read after the end of the buffer") }
-  return run decode(&mut engine,realm,Pointer.fromRef<u8>(&bytes[0]),bytes.length,flags,false,shared)
+  return run decode(&mut engine,realm,Pointer.fromRef<u8>(&bytes[0]),bytes.length,flags,false,shared,&[])
 }
 /// data must remain readable and immutable until all decoded bytecode and its
 /// closures are destroyed, including after this call returns. Relocation falls
@@ -575,7 +645,7 @@ pub effect fn readObjectShared<'a, 'm,S:EngineServices>(engine:&mut Engine<'m,S>
 /// Raw SAB pointers are not accepted by this API.
 pub effect fn readObjectRom<'a, 'm,S:EngineServices>(engine:&mut Engine<'m,S>,realm: Realm<'a>,
   data:*const u8,length:usize,flags:u32)->ValueBits !JsException ?&mut Allocator {
-  return run decode(&mut engine,realm,data,length,flags,false,&[])
+  return run decode(&mut engine,realm,data,length,flags,false,&[],&[])
 }
 /// Trusted embedding-only pointer wire API. In addition to the ROM lifetime
 /// contract when ROM_DATA is set, every SAB address must name a live, pinned
@@ -583,5 +653,16 @@ pub effect fn readObjectRom<'a, 'm,S:EngineServices>(engine:&mut Engine<'m,S>,re
 /// declared physical capacity. Never pass untrusted serialized bytes here.
 pub effect fn readObjectTrusted<'a, 'm,S:EngineServices>(engine:&mut Engine<'m,S>,realm: Realm<'a>,
   data:*const u8,length:usize,flags:u32)->ValueBits !JsException ?&mut Allocator {
-  return run decode(&mut engine,realm,data,length,flags,true,&[])
+  return run decode(&mut engine,realm,data,length,flags,true,&[],&[])
+}
+pub effect fn readObjectTrustedLeases<'a, 'm,S:EngineServices>(engine:&mut Engine<'m,S>,realm: Realm<'a>,
+  data:*const u8,length:usize,flags:u32,leases:&[SharedLease])->ValueBits !JsException ?&mut Allocator {
+  return run decode(&mut engine,realm,data,length,flags,true,&[],leases)
+}
+
+// Copies and validates untrusted cached code before committing decoder roots.
+pub effect fn readCachedBytecode<'a, 'm,S:EngineServices>(engine:&mut Engine<'m,S>,realm: Realm<'a>,
+  data:*const u8,length:usize,module:bool)->ValueBits !JsException ?&mut Allocator {
+  let kind = if module { CACHE_MODULE } else { CACHE_SCRIPT }
+  return run decode(&mut engine,realm,data,length,BYTECODE|kind,false,&[],&[])
 }

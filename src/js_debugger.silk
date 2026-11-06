@@ -1,0 +1,281 @@
+//! Optional instruction-boundary debugger. A pause parks dispatch on its native stack.
+//! All public handles are owner-thread only and expire when the pause generation ends.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.num.usize
+import silk.num.i32
+import js_heap { HeapCell, HeapHeader }
+import js_value { ValueBits }
+import js_realm { lendRealm }
+import js_core_types { RuntimeState, ContextState, StackFrame, FunctionBytecode }
+import js_debugger_types { Activation, Breakpoint }
+import js_debugger_types as types
+import js_debugger_metadata { Location }
+import js_vm_state { Machine }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_interrupt_host { InterruptHooks }
+import js_interrupts as interrupts
+import js_coercion_host { CoercionHooks }
+import js_error_host { ErrorHooks }
+import js_exceptions { JsException }
+import runtime_memory { AllocationObserver }
+import js_coverage as coverage
+import js_cpu_profile as cpuProfile
+
+pub struct Frame {
+  pub generation: u64, pub activationId: u64, pub depth: usize,
+  pub context: *mut HeapHeader, pub bytecode: *mut HeapHeader,
+  pub pc: usize, pub sp: usize, pub scope: i32
+}
+impl Copy for Frame {}
+pub unsafe fn configure(runtime: *mut HeapHeader, enabled: bool) -> () {
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.debugger.enabled = enabled
+  // Metadata can precede a late Session.connect. Existing native activations
+  // already have scalar PC/SP snapshots; assign identities lazily on attachment.
+  if enabled {
+    let mut current = state.debugger.active
+    while let Option<*mut Activation>.Some { value: pointer } = Pointer.nonNullMut<Activation>(current) {
+      let mut activationAnchor = () let active = unsafe Pointer.borrowMut<(), Activation>(&mut activationAnchor, pointer)
+      let mut frameAnchor = () let frame = unsafe Pointer.borrowMut<(), StackFrame>(&mut frameAnchor, active.frame)
+      if frame.debuggerId == 0 { frame.debuggerId = state.debugger.nextActivation state.debugger.nextActivation = state.debugger.nextActivation + 1 }
+      active.id = frame.debuggerId drop frame
+      let codeAnchor = () let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&codeAnchor, active.bytecode)
+      active.scope = code.debuggerMetadata.evalScopeAt(usize.toU32(active.pc))
+      current = active.previous
+    }
+  }
+  if !enabled {
+    state.debugger.paused = false state.debugger.pauseRequested = false state.debugger.mode = types.CONTINUE
+    state.debugger.entryBytecode = Pointer.null<HeapHeader>() state.debugger.entryScriptId = 0
+  }
+}
+pub unsafe fn configureCompilation(runtime: *mut HeapHeader, enabled: bool) -> () {
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.debugger.metadataEnabled = enabled
+}
+pub unsafe fn requestPause(runtime: *mut HeapHeader) -> () {
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.debugger.pauseRequested = true
+}
+/// Pauses at the first executable location inside the half-open raw UTF-8 source
+/// range of an explicitly designated bytecode entry. Embedding/bootstrap
+/// activations and generated wrapper locations cannot consume the request.
+/// The caller keeps bytecode rooted until that entry executes or is cancelled.
+pub unsafe fn requestPauseOnEntry(runtime: *mut HeapHeader, bytecode: *mut HeapHeader,
+  sourceStart: u32, sourceEnd: u32) -> () {
+  let mut anchor = () let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  let scriptId = code.scriptId drop code
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.debugger.entryBytecode = bytecode state.debugger.entryScriptId = scriptId
+  state.debugger.entrySourceStart = sourceStart state.debugger.entrySourceEnd = sourceEnd
+}
+pub unsafe fn resume(runtime: *mut HeapHeader, mode: u32) -> bool {
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  if !state.debugger.paused || mode > types.STEP_OUT { return false }
+  let active = match Pointer.nonNullMut<Activation>(state.debugger.active) { Option<*mut Activation>.Some { value } => value _ => { return false } }
+  let frameAnchor = () let view = unsafe Pointer.borrow<(), Activation>(&frameAnchor, active)
+  state.debugger.stepDepth = view.depth state.debugger.mode = mode state.debugger.paused = false
+  return true
+}
+pub unsafe fn exceptions(runtime: *mut HeapHeader, all: bool, uncaught: bool) -> () {
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.debugger.pauseOnExceptions = all state.debugger.pauseOnUncaught = uncaught
+}
+pub unsafe fn paused(runtime: *mut HeapHeader) -> bool {
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime) return state.debugger.paused
+}
+pub unsafe fn frame(runtime: *mut HeapHeader, index: usize) -> Option<Frame> {
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  if !state.debugger.paused { return Option<Frame>.none() }
+  let generation = state.debugger.generation let mut current = state.debugger.active drop state
+  let mut remaining = index
+  while let Option<*mut Activation>.Some { value: pointer } = Pointer.nonNullMut<Activation>(current) {
+    let active = unsafe Pointer.borrow<(), Activation>(&anchor, pointer)
+    if remaining == 0 { return Option<Frame>.some(Frame { generation: generation, activationId: active.id,
+      depth: active.depth, context: active.context, bytecode: active.bytecode, pc: active.pc, sp: active.sp, scope: active.scope }) }
+    remaining = remaining - 1 current = active.previous
+  }
+  return Option<Frame>.none()
+}
+/// Resolves only live handles of the current pause; the pointer must not escape JS reentry.
+pub unsafe fn resolve(runtime: *mut HeapHeader, handle: Frame) -> ?*mut StackFrame {
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  if !state.debugger.paused || handle.generation != state.debugger.generation { return Pointer.null<StackFrame>() }
+  let mut current = state.debugger.active drop state
+  while let Option<*mut Activation>.Some { value: pointer } = Pointer.nonNullMut<Activation>(current) {
+    let active = unsafe Pointer.borrow<(), Activation>(&anchor, pointer)
+    if active.id == handle.activationId { return active.frame }
+    current = active.previous
+  }
+  return Pointer.null<StackFrame>()
+}
+/// Bytecode must remain rooted by the caller while this breakpoint is installed.
+/// scriptId prevents an allocator-reused bytecode address from matching an old entry.
+pub unsafe effect fn addBreakpoint(runtime: *mut HeapHeader, bytecode: *mut HeapHeader, pc: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = () let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
+  if pc > 4294967295 { return false }
+  if let Option<Location>.None = code.debuggerMetadata.locationAt(usize.toU32(pc)) { return false }
+  let id = code.scriptId drop code
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  run state.debugger.breakpoints.append(Breakpoint { scriptId: id, bytecode: bytecode, pc: pc }) return true
+}
+pub unsafe fn clearBreakpoints(runtime: *mut HeapHeader) -> () {
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.debugger.breakpoints.clear()
+}
+pub unsafe fn enter(machine: &Machine) -> Activation {
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, machine.runtime)
+  let mut id: u64 = 0 let mut depth: usize = 0
+  let prior = state.debugger.active
+  let tracked = !state.debugger.evaluating && !state.debugger.callbackActive
+  if tracked {
+    let mut frameAnchor = () let frame = unsafe Pointer.borrowMut<(), StackFrame>(&mut frameAnchor, machine.frame)
+    if state.debugger.enabled && frame.debuggerId == 0 { frame.debuggerId = state.debugger.nextActivation state.debugger.nextActivation = state.debugger.nextActivation + 1 }
+    id = frame.debuggerId drop frame
+    if let Option<*mut Activation>.Some { value } = Pointer.nonNullMut<Activation>(prior) {
+      let outerAnchor = () let outer = unsafe Pointer.borrow<(), Activation>(&outerAnchor, value) depth = outer.depth + 1
+    }
+  }
+  return Activation { previous: prior, frame: machine.frame, bytecode: machine.bytecode, context: machine.context,
+    id: id, tracked: tracked, depth: depth, pc: machine.pc(), coveragePc: coverage.NO_PC, sp: machine.sp(), scope: -1 }
+}
+pub unsafe fn publish(runtime: *mut HeapHeader, activation: *mut Activation) -> () {
+  let mut anchor = () let active = unsafe Pointer.borrow<(), Activation>(&anchor, activation)
+  if !active.tracked { return } drop active
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime) state.debugger.active = activation
+}
+pub unsafe fn leave(runtime: *mut HeapHeader, activation: &Activation) -> () {
+  if !activation.tracked { return }
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.debugger.active = activation.previous
+  state.debugger.paused = false
+}
+unsafe effect fn notify<H: HeapHooks + InterruptHooks>(hooks: &mut H, runtime: *mut HeapHeader,
+  context: *mut HeapHeader, event: u32) -> () ? &mut Allocator {
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  let saved = unsafe state.currentException.retained()
+  let uncatchable = state.currentExceptionIsUncatchable
+  state.currentExceptionIsUncatchable = false state.debugger.callbackActive = true drop state
+  run hooks.debugger(unsafe lendRealm(&context, context), event)
+  let restored = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  restored.debugger.callbackActive = false
+  if restored.currentExceptionIsUncatchable {
+    drop restored unsafe gc.release(&mut hooks, runtime, saved)
+  } else {
+    let discarded = Intrinsic.replace(restored.currentException, saved)
+    restored.currentExceptionIsUncatchable = uncatchable drop restored unsafe gc.release(&mut hooks, runtime, discarded)
+  }
+}
+unsafe fn catchable(runtime: *mut HeapHeader) -> bool {
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let mut current = state.debugger.active drop state
+  while let Option<*mut Activation>.Some { value } = Pointer.nonNullMut<Activation>(current) {
+    let active = unsafe Pointer.borrow<(), Activation>(&anchor, value)
+    let frame = unsafe Pointer.borrow<(), StackFrame>(&anchor, active.frame)
+    let mut index = active.sp
+    while index != 0 {
+      index = index - 1
+      if let ValueBits.CatchOffset { offset } = unsafe frame.stack.get(index) {
+        if offset > 0 {
+          let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, active.bytecode)
+          if code.debuggerMetadata.catches(i32.toU32(offset)) { return true }
+        }
+      }
+    }
+    current = active.previous
+  }
+  return false
+}
+pub unsafe effect fn boundary<H: HeapHooks + CoercionHooks + ErrorHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, machine: &Machine, pc: usize, exception: bool) -> () ! JsException ? &mut Allocator {
+  if !exception { run unsafe cpuProfile.safepoint(machine.runtime, machine.bytecode, pc) }
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, machine.runtime)
+  if state.debugger.evaluating || state.debugger.callbackActive { return }
+  let enabled = state.debugger.enabled
+  let covering = state.coverage.enabled
+  let pointer = match Pointer.nonNullMut<Activation>(state.debugger.active) { Option<*mut Activation>.Some { value } => value _ => { return } }
+  if enabled {
+    if state.currentExceptionIsUncatchable { fail JsException {} }
+    if exception && state.debugger.exceptionNotified { return }
+    state.debugger.exceptionNotified = exception
+  }
+  drop state
+  let snapshot = unsafe Pointer.borrowMut<(), Activation>(&mut anchor, pointer)
+  snapshot.pc = pc snapshot.sp = machine.sp()
+  let previousPc = snapshot.coveragePc
+  if covering { snapshot.coveragePc = if exception { coverage.NO_PC } else { pc } }
+  drop snapshot
+  if covering && !exception { unsafe coverage.record(machine.runtime, machine.bytecode, pc, previousPc) }
+  if !enabled { return }
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, machine.bytecode)
+  let scope = code.debuggerMetadata.evalScopeAt(usize.toU32(pc))
+  let location = code.debuggerMetadata.locationAt(usize.toU32(pc))
+  let scriptId = code.scriptId drop code
+  let active = unsafe Pointer.borrowMut<(), Activation>(&mut anchor, pointer)
+  active.pc = pc active.sp = machine.sp() active.scope = scope let depth = active.depth drop active
+  // Publish legacy after-instruction PC only for existing stack presentation.
+  unsafe machine.publishPc()
+  run unsafe notify(&mut hooks, machine.runtime, machine.context, types.CONTROL)
+  let controlState = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)
+  if controlState.currentExceptionIsUncatchable { fail JsException {} }
+  if !controlState.debugger.enabled { return }
+  let mut stop = controlState.debugger.pauseRequested
+  let entryMatch = !exception && controlState.debugger.entryScriptId == scriptId &&
+    match Pointer.nonNullMut<HeapHeader>(controlState.debugger.entryBytecode) {
+      Option<*mut HeapHeader>.Some { value } => Pointer.address<HeapHeader>(value) == Pointer.address<HeapHeader>(machine.bytecode)
+      _ => false
+    }
+  let entryStop = entryMatch && match location {
+    Option<Location>.Some { value } => value.sourcePosition >= controlState.debugger.entrySourceStart &&
+      value.sourcePosition < controlState.debugger.entrySourceEnd
+    _ => false
+  }
+  stop = stop || entryStop
+  if exception {
+    stop = stop || controlState.debugger.pauseOnExceptions || (controlState.debugger.pauseOnUncaught && !unsafe catchable(machine.runtime))
+  } else {
+    if let Option<Location>.Some { value } = location {
+      stop = stop || value.debuggerStatement
+      // Exact breakpoints remain instruction-addressable. Source steps stop at
+      // compiler-authored statement/return entries, not operand loads or stores.
+      if value.statementStart && (controlState.debugger.mode == types.STEP_INTO ||
+        (controlState.debugger.mode == types.STEP_OVER && depth <= controlState.debugger.stepDepth) ||
+        (controlState.debugger.mode == types.STEP_OUT && depth < controlState.debugger.stepDepth)) { stop = true }
+    }
+    let mut index: usize = 0
+    while index < controlState.debugger.breakpoints.length() {
+      let breakpoint = controlState.debugger.breakpoints.asSlice()[index]
+      if breakpoint.scriptId == scriptId && Pointer.address<HeapHeader>(breakpoint.bytecode) == Pointer.address<HeapHeader>(machine.bytecode) && breakpoint.pc == pc { stop = true }
+      index = index + 1
+    }
+  }
+  drop controlState
+  if !stop { return }
+  let pausedState = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, machine.runtime)
+  if entryStop { pausedState.debugger.entryBytecode = Pointer.null<HeapHeader>() pausedState.debugger.entryScriptId = 0 }
+  pausedState.debugger.paused = true pausedState.debugger.pauseRequested = false pausedState.debugger.mode = types.CONTINUE
+  pausedState.debugger.generation = pausedState.debugger.generation + 1 drop pausedState
+  let event = if exception { types.EXCEPTION } else { types.PAUSED }
+  run unsafe notify(&mut hooks, machine.runtime, machine.context, event)
+  while unsafe paused(machine.runtime) {
+    // A parked iteration can sleep in the embedding pump. The ordinary 10,000
+    // branch throttle would turn a 10ms wait into a 100s cancellation delay.
+    let pausedContext = unsafe HeapCell.payloadMut<ContextState, ()>(&mut anchor, machine.context)
+    pausedContext.interruptCounter = 0 drop pausedContext
+    run interrupts.poll(&mut hooks, memory, unsafe lendRealm(&machine.context, machine.context))
+    run unsafe notify(&mut hooks, machine.runtime, machine.context, types.CONTROL)
+    let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)
+    if state.currentExceptionIsUncatchable { fail JsException {} }
+  }
+  // A paused wall-clock deadline/worker cancellation must not wait for 10,000
+  // further branch polls, especially when the next instruction returns.
+  let contextState = unsafe HeapCell.payloadMut<ContextState, ()>(&mut anchor, machine.context)
+  contextState.interruptCounter = 0 drop contextState
+  run interrupts.poll(&mut hooks, memory, unsafe lendRealm(&machine.context, machine.context))
+  let finalState = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)
+  if finalState.currentExceptionIsUncatchable { fail JsException {} }
+}
