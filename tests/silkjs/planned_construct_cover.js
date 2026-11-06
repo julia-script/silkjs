@@ -21,10 +21,14 @@ for (var round = 0; round < 3; round++) {
 // fewer and more arguments than the plan covers
 var few = new P({ z: 1 }); var many = new P(1, 2, { extra: 3 }, 4);
 out.push(few.a.z, few.b === undefined, many.a, many.b);
+// an uncovered store still starts Undefined in every reused cell
+var undef = 0;
+for (var u = 0; u < 60; u++) { var o = new P(u); if (o.b === undefined && o.a === u) undef++; }
+out.push(undef);
 var keep = [];
 for (var j = 0; j < 30; j++) { var shared = { s: j }; keep.push(new P(shared, shared)); }
 out.push(keep[29].a === keep[29].b, keep[29].a.s, Object.keys(keep[3]).join(''));
 const got = out.join('|');
-const expected = '0,v0,0,0,0,s0|true|b49|49|0,v0,0,0,0,s0|true|b49|49|0,v0,0,0,0,s0|true|b49|49|1|true|1|2|true|29|ab';
+const expected = '0,v0,0,0,0,s0|true|b49|49|0,v0,0,0,0,s0|true|b49|49|0,v0,0,0,0,s0|true|b49|49|1|true|1|2|60|true|29|ab';
 console.log(got === expected ? 'PASS planned construct cover' : 'FAIL ' + got);
 if (got !== expected) throw new Error('planned construct cover regressions');
