@@ -16,7 +16,6 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
-#include <uv.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 
@@ -55,7 +54,7 @@ struct silk_inspector {
     int running, listener, notify[2], stopped;
     _Atomic int pending;
     int stopping;
-    uv_async_t *wake;
+    void *wake;
     silk_inspector_packet *first, *last, *out_first, *out_last;
     size_t in_bytes, out_bytes, in_count, out_count;
     uint64_t next_connection;
@@ -111,7 +110,7 @@ static int incoming(silk_inspector *s, silk_inspector_packet *p, int reserved) {
     atomic_store_explicit(&s->pending, 1, memory_order_release);
     pthread_cond_broadcast(&s->changed);
     /* wake lifetime is owned by the isolate and extends beyond stop/join. */
-    if (s->wake) uv_async_send(s->wake);
+    if (s->wake) silk_runtime_wake(s->wake);
     pthread_mutex_unlock(&s->mutex);
     return 0;
 }
