@@ -46,6 +46,10 @@ import silkjs.utf8 { Utf8 }
 import ext.vm_interrupt
 import ext.vm_interrupt { Slot }
 import ext.process_diagnostics as diagnostics
+import ext.diagnostics_hub as hub
+import ext.diagnostics_hub { Mailbox }
+import ext.diagnostics_fatal as fatalReport
+import ext.diagnostics_fatal { ReportingAllocator }
 
 unsafe extern "C" fn uv_handle_size(kind: i32) -> usize
 @deferredCallbacks("callback")
@@ -64,7 +68,7 @@ unsafe extern "C" fn pthread_attr_destroy(attributes: *mut u8) -> i32
 unsafe extern "C" fn pthread_create(thread: *mut usize, attributes: ?*const u8, start: extern "C" fn(?*mut u8) -> ?*mut u8, argument: ?*mut u8) -> i32
 @foreign(noCapture: .("name"))
 unsafe extern "C" fn uv_thread_setname(name: *const u8) -> i32
-pub struct State { pub group: Group, pub id: u32, pub control: u32, pub metadata: List<u8>, wake: ?*mut u8, signalGuards: ?*mut SignalGuard, nextSignalGuard: u32 }
+pub struct State { pub group: Group, pub id: u32, pub control: u32, pub metadata: List<u8>, wake: ?*mut u8, signalGuards: ?*mut SignalGuard, nextSignalGuard: u32, diagnostics: Option<Mailbox> }
 pub struct Start { pub group: Group, pub id: u32, pub control: u32, pub metadata: List<u8>, name: [u8; 64] }
 struct SignalGuard { next: ?*mut SignalGuard, id: u32, watcher: Arc<vm_interrupt.Service>, slot: vm_interrupt.Slot }
 fn equal(a: &[u8], b: &[u8]) -> bool { if a.length != b.length { return false } let mut i: usize = 0 while i < a.length { if a[i] != b[i] { return false } i = i + 1 } return true }
@@ -82,7 +86,7 @@ pub effect fn mainState(process: &Process, domain: Domain) -> *mut State ! OutOf
 }
 pub effect fn makeState(group: Group, id: u32, control: u32, metadata: List<u8>) -> *mut State ! OutOfMemoryError {
   let pointer = run transport.allocate<State>(&group.resources)
-  unsafe Pointer.put<State>(pointer, State { group: move group, id: id, control: control, metadata: move metadata, wake: Pointer.null<u8>(), signalGuards: Pointer.null<SignalGuard>(), nextSignalGuard: 1 }) return pointer
+  unsafe Pointer.put<State>(pointer, State { group: move group, id: id, control: control, metadata: move metadata, wake: Pointer.null<u8>(), signalGuards: Pointer.null<SignalGuard>(), nextSignalGuard: 1, diagnostics: Option<Mailbox>.none() }) return pointer
 }
 /// The process resource accounting shared by every isolate of the group.
 pub unsafe fn groupResources(pointer: *mut State) -> resources.Resources {
@@ -109,9 +113,32 @@ pub unsafe effect fn attach(pointer: *mut State, loop: *mut u8) -> () ! OutOfMem
   if Pointer.isNull<u8>(wake) { fail OutOfMemoryError {} }
   if unsafe uv_async_init(loop, unsafe nonnull(wake), silkNodeWorkerWake) != 0 { unsafe resources.release(wake) fail OutOfMemoryError {} }
   state.wake = wake unsafe uv_unref(unsafe nonnull(wake))
-  if unsafe diagnostics.silk_diagnostics_attach(state.id, unsafe nonnull(wake)) != 0 { fail OutOfMemoryError {} }
   let guard = state.group.registry.get().lock() let mut threadAnchor = ()
   let entry = unsafe Pointer.borrowMut<(), Thread>(&mut threadAnchor, unsafe nonnull(unsafe transport.thread(guard.get(), state.id))) entry.wake = wake
+  drop entry drop guard
+  state.diagnostics = Option<Mailbox>.some(run hub.attach(&state.group, state.id))
+}
+/// The isolate's diagnostics mailbox, from attach until shutdown.
+pub unsafe fn mailbox(pointer: *mut State) -> Option<Mailbox> {
+  let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer)
+  return state.diagnostics
+}
+/// Writes the fatal report for this isolate when enabled; the caller terminates.
+pub unsafe fn fatal(pointer: *mut State, location: &[u8], message: &[u8]) -> () {
+  let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer)
+  unsafe fatalReport.report(&state.group.reports, state.id, location, message)
+}
+/// napi_fatal_error's report; `state` is the calling isolate's worker state.
+export "C" fn silkNodeFatalReport(state: *mut u8, location: *const u8, locationLength: usize, message: *const u8, messageLength: usize) -> () {
+  let anchor = ()
+  let where = unsafe Pointer.borrowMany<(), u8>(&anchor, unsafe Pointer.assumeMany<u8>(location), locationLength)
+  let what = unsafe Pointer.borrowMany<(), u8>(&anchor, unsafe Pointer.assumeMany<u8>(message), messageLength)
+  unsafe fatal(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut State>(state), where, what)
+}
+/// The allocator under this isolate's runtime heap.
+pub unsafe fn reportingAllocator(pointer: *mut State) -> ReportingAllocator {
+  let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer)
+  return ReportingAllocator.make(state.group.reports.clone(), state.id)
 }
 // Borrowed until shutdown; polling restores its reference flag before calling JS.
 pub unsafe fn loopAnchor(pointer: *mut State) -> *mut u8 {
@@ -212,7 +239,9 @@ unsafe fn updateRef(pointer: *mut State) -> () {
 }
 pub unsafe fn shutdown(pointer: *mut State) -> () {
   // Remove the mailbox before closing its wake handle or destroying any heap.
-  unsafe diagnostics.silk_diagnostics_detach()
+  let mut detachAnchor = () let attached = unsafe Pointer.borrowMut<(), State>(&mut detachAnchor, pointer)
+  let mailbox = Intrinsic.replace(attached.diagnostics, Option<Mailbox>.none()) drop attached
+  if let Option<Mailbox>.Some { value } = mailbox { unsafe hub.detach(value) }
   unsafe clearSignalGuards(pointer)
   let mut stateAnchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut stateAnchor, pointer)
   let mut guard = state.group.registry.get().lock() let mut anchor = ()
@@ -608,34 +637,30 @@ effect fn ownedReportString(value: ValueBits) -> Arc<List<u8>> ! OutOfMemoryErro
 unsafe effect fn reportSetting<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, field: u32, setting: bool, args: &owners.Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
   if field > 3 { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"Unknown shared report setting") }
   let value = args.values[1]
-  if field >= 2 {
-    let mut guard = state.group.registry.get().lock() let registry = guard.getMut()
-    if setting {
-      if field == 2 { registry.reportCompact = boolean(value) } else { registry.reportFatal = boolean(value) }
-      let empty: u8 = 0
-      unsafe diagnostics.silk_diagnostics_setting(field, Pointer.fromRef<u8>(&empty), 0, if boolean(value) { 1 } else { 0 })
-      return ValueBits.Undefined
-    }
-    if field == 2 { return ValueBits.Bool { value: registry.reportCompact } }
-    return ValueBits.Bool { value: registry.reportFatal }
+  let settings = &state.group.reports
+  if field == 3 {
+    if setting { settings.setFatal(boolean(value)) return ValueBits.Undefined }
+    return ValueBits.Bool { value: settings.fatal() }
+  }
+  if field == 2 {
+    let mut guard = settings.reports.get().lock() let reports = guard.getMut()
+    if setting { reports.compact = boolean(value) return ValueBits.Undefined }
+    return ValueBits.Bool { value: reports.compact }
   }
   if setting {
     if !value.isString() { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"Report path must be a string") }
     let mut allocator = state.group.resources.clone()
     let stored = run ownedReportString(value) |> Effect.provideMut<Allocator>(&mut allocator)
-    let mut guard = state.group.registry.get().lock() let registry = guard.getMut()
-    let path = stored.get().asSlice() let empty: u8 = 0
-    let bytes = if path.length == 0 { Pointer.fromRef<u8>(&empty) } else { Pointer.fromRef<u8>(&path[0]) }
-    unsafe diagnostics.silk_diagnostics_setting(field, bytes, path.length, 0)
-    drop path
-    if field == 0 { registry.reportDirectory = Option<Arc<List<u8>>>.some(move stored) }
-    else { registry.reportFilename = Option<Arc<List<u8>>>.some(move stored) }
+    let mut guard = settings.reports.get().lock() let reports = guard.getMut()
+    let previous = if field == 0 { Intrinsic.replace(reports.directory, Option<Arc<List<u8>>>.some(move stored)) } else { Intrinsic.replace(reports.filename, Option<Arc<List<u8>>>.some(move stored)) }
+    drop guard
+    drop previous
     return ValueBits.Undefined
   }
-  let guard = state.group.registry.get().lock()
+  let guard = settings.reports.get().lock()
   let mut stored = Option<Arc<List<u8>>>.none()
-  if field == 0 { stored = cloneReportString(&guard.get().reportDirectory) }
-  else { stored = cloneReportString(&guard.get().reportFilename) }
+  if field == 0 { stored = cloneReportString(&guard.get().directory) }
+  else { stored = cloneReportString(&guard.get().filename) }
   drop guard
   // Keep immutable path storage alive without allocating JS while locked.
   return match move stored {
@@ -866,7 +891,13 @@ unsafe effect fn invoke<'m, S: EngineServices>(engine: &mut Engine<'m, S>, conte
   if equal(op, b"startSigintWatch") { drop state return run unsafe startSignalGuard(&mut engine, context, pointer) }
   if equal(op, b"stopSigintWatch") { drop state return run unsafe stopSignalGuard(&mut engine, context, pointer, id) }
   if equal(op, b"reportGet") || equal(op, b"reportSet") { return run unsafe reportSetting(&mut engine, context, &state, id, equal(op, b"reportSet"), args) }
-  if equal(op, b"reportWorkers") { return run unsafe diagnostics.workers(&mut engine, context) }
+  if equal(op, b"reportWorkers") {
+    let attached = state.diagnostics drop state
+    return match attached {
+      Option<Mailbox>.Some { value } => run unsafe diagnostics.workers(&mut engine, context, value)
+      _ => run unsafe host.string(&mut engine, context, b"[]")
+    }
+  }
   if equal(op, b"envGet") || equal(op, b"envSet") || equal(op, b"envDelete") || equal(op, b"envKeys") { return run unsafe environment(&mut engine, context, &state, op, args, &mut scope) }
   if equal(op, b"envInit") { return run unsafe initializeEnvironment(&mut engine, context, &state, args, &mut scope) }
   if equal(op, b"broadcastPost") { return run unsafe broadcast(&mut engine, context, &state, args) }

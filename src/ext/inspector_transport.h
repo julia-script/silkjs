@@ -42,28 +42,4 @@ int silk_inspector_wait(silk_inspector *, int32_t timeout_ms);
  * Accepted output is asynchronous; closure may race delivery. */
 int silk_inspector_send(silk_inspector *, uint64_t connection, const unsigned char *, size_t length);
 int silk_inspector_disconnect(silk_inspector *, uint64_t connection);
-/* Cross-isolate sessions share the diagnostics/worker owner registry (channel
- * 1), not a second isolate registry. Main owner ID is 0. The sender supplies its
- * worker ID and an owner-local nonzero session ID; route replies to source.
- * OPEN=1/REQUEST=2/CLOSE=3 match network kinds; RESPONSE=4 is route-only. The
- * adapter authenticates its own owner ID, and retires sessions on worker exit.
- * Registry-generated OWNER_ATTACHED=5/OWNER_DETACHED=6 have source=worker ID,
- * session=0 and empty body. They are receive-only, not accepted by route_send.
- * route_take transfers a diagnostics-owned packet with a 16-byte native
- * envelope; length receives the BODY length. Accessors borrow until route_free.
- * No intermediate heap allocation or JS pointers cross the registry lock.
- * route_wait waits the shared diagnostics mailbox, not network packets. When
- * pumping both sources use a bounded wait (e.g. 10ms), never an indefinite wait
- * on just one queue. Registration must precede use, detach follows destruction.
- */
-int silk_inspector_route_send(uint32_t target, uint32_t source, uint64_t session,
-                              uint32_t kind, const unsigned char *bytes, size_t length);
-int silk_inspector_route_pending(void);
-unsigned char *silk_inspector_route_take(size_t *length);
-uint32_t silk_inspector_route_source(const unsigned char *packet);
-uint32_t silk_inspector_route_kind(const unsigned char *packet);
-uint64_t silk_inspector_route_session(const unsigned char *packet);
-const unsigned char *silk_inspector_route_data(const unsigned char *packet);
-void silk_inspector_route_free(unsigned char *packet);
-int silk_inspector_route_wait(uint32_t timeout_ms);
 #endif

@@ -1,4 +1,5 @@
-//! Owner-thread collection; the C mailbox transports only copied UTF-8, never Values.
+//! Owner-thread report collection. The diagnostics mailbox carries only copied
+//! UTF-8, never Values.
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silkjs.js_owned_value { Value }
 import silkjs.js_realm { lendRealm }
@@ -6,6 +7,11 @@ import silk.mem.pointer { Pointer }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.core.option { Option }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.num.i32
+import silk.num.u32
+import silk.num.usize
 import silkjs.js_engine { Engine }
 import silkjs.js_engine_host { EngineServices }
 import silkjs.js_heap { HeapCell, HeapHeader }
@@ -16,47 +22,79 @@ import silkjs.js_string_types { StringLengthError }
 import silkjs.js_backtrace as backtrace
 import silkjs.js_buffer_storage as buffers
 import silkjs.js_runtime as runtime
+import silkjs.js_os_workers_resources { KindAllocator }
 import libs.core.owners as owners
 import libs.core.owners { Scope }
 import silkjs.js_std_support as text
 import libs.core.host as host
+import ext.diagnostics_hub as hub
+import ext.diagnostics_hub { Mailbox }
+import ext.fs_async as loops
+import ext.fs_async { LoopHandle }
+import ext.report_json as json
 
-pub unsafe extern "C" fn silk_diagnostics_attach(id: u32, wake: *mut u8) -> i32
-pub unsafe extern "C" fn silk_diagnostics_detach() -> ()
-pub unsafe extern "C" fn silk_diagnostics_owner_id() -> u32
-@foreign(noCapture: .("count"))
-pub unsafe extern "C" fn silk_diagnostics_owner_ids(count: *mut usize) -> ?*mut u32
-pub unsafe extern "C" fn silk_diagnostics_inspector_wait_set(enabled: i32) -> ()
-pub unsafe extern "C" fn silk_diagnostics_inspector_wait_get() -> i32
-pub unsafe extern "C" fn silk_diagnostics_pending() -> u64
-@foreign(noCapture: .("stack"))
-unsafe extern "C" fn silk_diagnostics_publish(generation: u64, loop: *mut u8, stack: *const u8, length: usize, heap: usize, external: usize) -> ()
-unsafe extern "C" fn silk_diagnostics_failed(generation: u64, reason: i32) -> ()
-@foreign(noCapture: .("length"))
-unsafe extern "C" fn silk_diagnostics_workers(length: *mut usize) -> ?*mut u8
-unsafe extern "C" fn silk_diagnostics_release(bytes: *mut u8) -> ()
-@foreign(noCapture: .("value"))
-pub unsafe extern "C" fn silk_diagnostics_setting(field: u32, value: *const u8, length: usize, enabled: i32) -> ()
-@foreign(noCapture: .("location", "message"))
-pub unsafe extern "C" fn silk_diagnostics_fatal(location: *const u8, locationLength: usize, message: *const u8, messageLength: usize) -> ()
+const ENOMEM: i32 = 12
 
-unsafe effect fn capture<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, loop: *mut u8, generation: u64, scope: &mut Scope) -> () ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+effect fn report(out: &mut List<u8>, id: u32, stack: &[u8], heap: usize, external: usize, handles: &List<LoopHandle>) -> () ! OutOfMemoryError ? &mut Allocator {
+  run json.raw(&mut out, b"{\"header\":{\"threadId\":") run json.number(&mut out, u32.toU64(id))
+  run json.raw(&mut out, b",\"event\":\"Worker diagnostic snapshot\",\"trigger\":\"GetReport\"},\"javascriptStack\":{\"message\":\"JavaScript Callstack\",\"stack\":[")
+  let mut start: usize = 0
+  let mut first = true
+  let mut i: usize = 0
+  while i <= stack.length {
+    if i != stack.length && stack[i] != 10 { i = i + 1 continue }
+    let end = i
+    while start < end && (stack[start] == 32 || stack[start] == 9) { start = start + 1 }
+    if end > start {
+      if !first { run out.append(44) }
+      run json.quoted(&mut out, Slice.view<u8>(stack, start, end - start))
+      first = false
+    }
+    start = i + 1
+    i = i + 1
+  }
+  run json.raw(&mut out, b"],\"errorProperties\":{}},\"javascriptHeap\":{\"totalMemory\":") run json.number(&mut out, usize.toU64(heap))
+  run json.raw(&mut out, b",\"usedMemory\":") run json.number(&mut out, usize.toU64(heap))
+  run json.raw(&mut out, b",\"externalMemory\":") run json.number(&mut out, usize.toU64(external))
+  run json.raw(&mut out, b",\"arrayBuffers\":") run json.number(&mut out, usize.toU64(external))
+  run json.raw(&mut out, b"},\"libuv\":[")
+  let mut index: usize = 0
+  while index < handles.length() {
+    let handle = handles.get(index)
+    if index != 0 { run out.append(44) }
+    run json.raw(&mut out, b"{\"type\":") run json.quoted(&mut out, loops.handleTypeName(handle.kind))
+    run json.raw(&mut out, b",\"is_active\":") run json.boolean(&mut out, handle.active)
+    run json.raw(&mut out, b",\"is_referenced\":") run json.boolean(&mut out, handle.referenced)
+    run json.raw(&mut out, b",\"is_closing\":") run json.boolean(&mut out, handle.closing)
+    run json.raw(&mut out, b",\"address\":\"0x") run json.hex(&mut out, usize.toU64(handle.address)) run out.append(34)
+    if handle.fd >= 0 { run json.raw(&mut out, b",\"fd\":") run json.number(&mut out, i32.toU64(handle.fd)) }
+    run out.append(125)
+    index = index + 1
+  }
+  run json.raw(&mut out, b"],\"silkjs\":{\"snapshotStatus\":\"available\",\"heapAccounting\":\"live allocator charges, not V8 arenas\"}}")
+}
+
+unsafe effect fn capture<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, loop: *mut u8, mailbox: Mailbox, generation: u64, scope: &mut Scope) -> () ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
   let rt = unsafe runtime.contextRuntime(context)
   // Read the accounting before allocating report formatting scratch storage.
   let charged = engine.memory.stats().usedBytes
   let backing = run unsafe buffers.backingUsage(rt)
   scope.values[0] = run unsafe backtrace.format(rt, Option<ValueBits>.none(), 0, 0, 0)
   let encoded = run unsafe host.text(&mut engine, context, scope.values[0])
-  let text = encoded.asSlice()
-  let empty: u8 = 0
-  let data = if text.length == 0 { Pointer.fromRef<u8>(&empty) } else { Pointer.fromRef<u8>(&text[0]) }
-  unsafe silk_diagnostics_publish(generation, loop, data, text.length, charged - backing.nativeBytes, backing.bytes)
+  let handles = run unsafe loops.handles(loop)
+  // Other isolates read and free the report, so it lives in the group's resources.
+  let anchor = ()
+  let group = unsafe mailbox.group(&anchor)
+  let mut shared = KindAllocator { owner: group.resources.clone(), kind: 0 }
+  let mut out = List<u8>.make()
+  run report(&mut out, unsafe mailbox.id(), encoded.asSlice(), charged - backing.nativeBytes, backing.bytes, &handles) |> Effect.provideMut<Allocator>(&mut shared)
+  unsafe hub.publish(mailbox, generation, move out, 0)
 }
 /// Call at EngineServices.debugger CONTROL/interrupt and before/after blocking
-/// event-loop polling. The no-request path is one TLS read and atomic load.
+/// event-loop polling. The no-request path is one atomic load.
 /// Errors belong to the request, never the interrupted JavaScript execution.
-pub unsafe effect fn pumpSnapshot<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, loop: *mut u8) -> () ? &mut Allocator {
-  let generation = unsafe silk_diagnostics_pending()
+pub unsafe effect fn pumpSnapshot<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, loop: *mut u8, mailbox: Mailbox) -> () ? &mut Allocator {
+  let generation = unsafe hub.pending(mailbox)
   if generation == 0 { return }
   let rt = unsafe runtime.contextRuntime(context)
   let mut anchor = ()
@@ -66,7 +104,7 @@ pub unsafe effect fn pumpSnapshot<'m, S: EngineServices>(engine: &mut Engine<'m,
   state.currentExceptionIsUncatchable = false
   drop state
   let mut scope = Scope.make()
-  let result = run Effect.result(unsafe capture(&mut engine, context, loop, generation, &mut scope))
+  let result = run Effect.result(unsafe capture(&mut engine, context, loop, mailbox, generation, &mut scope))
   unsafe owners.cleanup(&mut engine, context, move scope)
   let restored = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
   let discarded = Intrinsic.replace(restored.currentException, saved)
@@ -75,26 +113,14 @@ pub unsafe effect fn pumpSnapshot<'m, S: EngineServices>(engine: &mut Engine<'m,
   unsafe owners.release(&mut engine, context, discarded)
   match move result {
     Result<(), OutOfMemoryError | StringLengthError | JsException>.Success { .. } => ()
-    Result<(), OutOfMemoryError | StringLengthError | JsException>.Failure { .. } => { unsafe silk_diagnostics_failed(generation, 12) }
+    Result<(), OutOfMemoryError | StringLengthError | JsException>.Failure { .. } => { unsafe hub.failed(mailbox, generation, ENOMEM) }
   }
 }
-/// Synchronous request returns JSON copied from native packets. JS parses this
-/// in the requesting isolate; a native OOM is propagated, not an empty workers list.
-pub unsafe effect fn workers<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
-  let mut length: usize = 0
-  let raw = unsafe silk_diagnostics_workers(Pointer.fromMutRef<usize>(&mut length))
-  let pointer = match Pointer.nonNullMut<u8>(raw) { Option<*mut u8>.Some { value } => value _ => { fail OutOfMemoryError {} } }
-  let result = run Effect.result(text.stringPointer(&mut engine, unsafe lendRealm(&context, context), pointer, length))
-  unsafe silk_diagnostics_release(pointer)
-  return match move result {
-    Result<Value, JsException>.Success { value } => value.intoBits()
-    Result<Value, JsException>.Failure { error } => { fail move error }
-  }
-}
-/// Does not allocate or terminate; the caller retains ownership of fatal exit.
-pub unsafe fn fatal(location: &[u8], message: &[u8]) -> () {
-  let empty: u8 = 0
-  let source = if location.length == 0 { Pointer.fromRef<u8>(&empty) } else { Pointer.fromRef<u8>(&location[0]) }
-  let messageBytes = if message.length == 0 { Pointer.fromRef<u8>(&empty) } else { Pointer.fromRef<u8>(&message[0]) }
-  unsafe silk_diagnostics_fatal(source, location.length, messageBytes, message.length)
+/// Synchronous request; returns JSON copied from other isolates' reports. JS
+/// parses this in the requesting isolate; a native OOM is propagated, not an
+/// empty workers list.
+pub unsafe effect fn workers<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, mailbox: Mailbox) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let reports = run hub.workers(mailbox)
+  let value = run text.string(&mut engine, unsafe lendRealm(&context, context), reports.asSlice())
+  return value.intoBits()
 }

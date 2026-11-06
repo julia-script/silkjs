@@ -736,9 +736,14 @@ Throwaway filesystem and close-delivery probes exercise these boundaries.
 The permanent socket fixture awaits both peers explicitly; client close does
 not guarantee that the accepted server socket has already closed.
 
-Report directory, filename, compact mode, and fatal-report enablement live in
-the process-scoped worker registry. Immutable UTF-8 path storage is retained
-under the mutex and decoded after unlocking; no JavaScript allocation occurs
+Report directory, filename and compact mode live in the worker group's report
+settings (`src/ext/diagnostics_fatal.silk`) behind their own mutex, and
+fatal-report enablement is an atomic beside them, so the fatal path reads them
+with one `tryLock` and never waits. Out-of-memory in an isolate's runtime heap
+reaches the report through `ReportingAllocator`, the heap's child allocator,
+which carries the settings and isolate ID; `napi_fatal_error` reaches it
+through a per-thread context that `napi_native` sets. Immutable UTF-8 path
+storage is retained under the mutex and decoded after unlocking; no JavaScript allocation occurs
 while the registry is locked. Lone surrogates normalize to replacement
 characters, and native path settings truncate at the first NUL. Signal and
 uncaught-exception settings remain isolate-local with Node's worker option
@@ -1049,8 +1054,11 @@ version: `tr46` 7.0.0 contains Unicode 18, not the required Unicode 17.
 `src/ext/inspector_transport.c` supplies a bounded, byte-only HTTP/WebSocket
 transport on a private I/O thread. JavaScript values never cross that thread;
 the isolate consumes owned packets and sends owned response bytes. The wake
-handle must outlive server stop/join. `process_diagnostics.c` supplies the
-shared isolate-addressed native mailbox used by inspector and profile requests.
+handle must outlive server stop/join. `src/ext/diagnostics_hub.silk` supplies
+the isolate-addressed native mailbox used by inspector and profile requests. It
+lives in the worker registry, so its lock and the group's `changed` condition
+guard every queue; packets and published reports are allocated from the
+group's resources because another isolate frees them.
 
 Worker registration in that mailbox precedes JavaScript bootstrap readiness.
 Inspector polling leaves incoming packets transport-owned until the isolate
