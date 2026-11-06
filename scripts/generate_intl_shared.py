@@ -17,13 +17,11 @@ def generate(reference):
     out = ['// Generated from pinned QuickJS intl.c; LICENSE.quickjs.',
            '// Source SHA-256: ' + hashlib.sha256(source).hexdigest(),
            'pub const NS_UNKNOWN: i32 = -1', f'pub const NS_COUNT: i32 = {len(names)}',
-           f'pub const intl_all_numbering_systems_count: i32 = {len(names)}',
-           'pub const intl_supported_collations_count: i32 = 3']
+           f'pub const intl_all_numbering_systems_count: i32 = {len(names)}']
     out += [f'pub const NS_{name.upper()}: i32 = {i}' for i, name in enumerate(names)]
     out += ["pub fn intl_all_numbering_systems(index: i32) -> string<'static> {", '  return match index {']
     out += [f'    {i} => "{name}"' for i, name in enumerate(names)]
-    out += ['    _ => ""', '  }', '}', "pub fn intl_supported_collations(index: i32) -> string<'static> {",
-            '  return match index { 0 => "emoji" 1 => "eor" 2 => "phonebk" _ => "" }', '}',
+    out += ['    _ => ""', '  }', '}',
             'pub fn nf_digit_base(index: i32) -> u32 {', '  return match index {']
     out += [f'    {i} => {bases[name.upper()]}' for i, name in enumerate(names) if name.upper() in bases]
     out += ['    _ => 0', '  }', '}', 'pub fn hanidec_cps(index: i32) -> u32 {', '  return match index {']
