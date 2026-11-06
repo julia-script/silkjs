@@ -30,4 +30,17 @@ out.push([n, j, w, leaf].join(" "));
 const got = out.join("\n");
 const expected = "LEgf?_& true false\nleGF!.|^ false true\nlEgF!.|& false true\nLEgf?_& true false\nleGF!.|^ false true\nLEgf?_& true false\nlegf!._^ false false\nLEgf?_& true false\nleGF!.|^ false true\nlEgF!._& false true\n500 7 5 1n1n0y0y";
 if (got !== expected) throw new Error("got:\n" + got);
+// Equality operators share the fused branch, including string and object
+// operands that the arm releases itself.
+const o = {}, eqs = [[1, 1], [1, 2], ["ab", "a" + "b"], ["x", "y"], [o, o], [o, {}], [null, undefined], [0, "0"], [NaN, NaN]];
+const eqOut = [];
+for (const [a, b] of eqs) {
+  let r = "";
+  if (a === b) r += "S"; else r += "s";
+  if (a !== b) r += "N"; else r += "n";
+  if (a == b) r += "L"; else r += "l";
+  if (a != b) r += "M"; else r += "m";
+  eqOut.push(r);
+}
+if (eqOut.join(" ") !== "SnLm sNlM SnLm sNlM SnLm sNlM sNLm sNLm sNlM") throw new Error("eq: " + eqOut.join(" "));
 print("ok");
