@@ -191,7 +191,11 @@ NAPI_EXTERN void napi_module_register(napi_module *m){registration=m;}
 /* A V8 registration is detected, never invoked or forwarded to another runtime. */
 __attribute__((visibility("default"))) void node_module_register(void *module){(void)module;legacy_registration=1;}
 const char *silk_napi_load_error(void){return load_error;}
-napi_env silk_napi_open(void *host,silk_napi_bridge bridge,size_t value_size){if(!bridge||!value_size)return NULL;napi_env e=calloc(1,sizeof(*e));if(!e)return NULL;e->host=host;e->bridge=bridge;e->value_size=value_size;e->owner=uv_thread_self();if(silk_napi_async_init(e)!=0){free(e);return NULL;}return e;}
+napi_env silk_napi_open(void *host,silk_napi_bridge bridge,size_t value_size){if(!bridge||!value_size)return NULL;napi_env e=calloc(1,sizeof(*e));if(!e)return NULL;e->host=host;e->bridge=bridge;e->value_size=value_size;e->owner=uv_thread_self();return e;}
+/* The asynchronous half of the environment lives in napi_async.silk. */
+void *silk_napi_async_state(napi_env e){return e?e->async:NULL;}
+void silk_napi_set_async_state(napi_env e,void *state){e->async=state;}
+int silk_napi_closing(napi_env e){return e?e->closing:1;}
 int silk_napi_load(napi_env e,const char *filename,int flags,napi_value module,napi_value *out) {
   if (!e||!filename||!module||!out||!silk_napi_on_owner(e)) return napi_invalid_arg;
   load_error[0]=0;
