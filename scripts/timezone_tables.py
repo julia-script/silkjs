@@ -1,5 +1,5 @@
-"""The checked-in time zone tables, read back from src/temporal_timezone_data.silk and
-src/data/timezones.bin, and written as a QuickJS `temporal/tzdata_generated.c`.
+"""The checked-in time zone tables, read back from src/temporal_timezone_data.silk, and written
+as a QuickJS `temporal/tzdata_generated.c`.
 
 The C oracles compile QuickJS's pinned timezone.c against this file, so the C and native kernels
 run on the same IANA data (scripts/generate_timezones.py writes the Silk side).
@@ -13,11 +13,16 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def tables(root=ROOT):
     source = (root / 'src/temporal_timezone_data.silk').read_text()
-    blob = (root / 'src/data/timezones.bin').read_bytes()
+
+    def decode(body):
+        return bytes(int(escape, 16) if escape else ord(char) for escape, char in re.findall(r'\\x([0-9a-f]{2})|(.)', body))
 
     def literal(function, name):
-        body = re.search(r'pub fn ' + function + r'\(.*?let ' + name + r' = b"(.*?)"', source, re.S).group(1)
-        return bytes(int(byte, 16) for byte in re.findall(r'\\x([0-9a-f]{2})', body))
+        return decode(re.search(r'pub fn ' + function + r'\(.*?let ' + name + r' = b"(.*?)"', source, re.S).group(1))
+
+    blob = decode(re.search(r'fn transitions\(\).*?return b"(.*?)"', source, re.S).group(1))
+    size = int(re.search(r'Transition starts \(i(\d+)', source)[1]) // 8
+    sentinel = -(1 << (8 * size - 1))
 
     def strings(function):
         offsets, data = literal(function, 'offsets'), literal(function, 'data')
@@ -35,9 +40,11 @@ def tables(root=ROOT):
     for count, base in zip(counts, bases):
         rows = []
         for index in range(base, base + count):
-            start = struct.unpack_from('<q', blob, index * 8)[0]
-            slot = struct.unpack_from('<H', blob, total * 8 + index * 2)[0]
-            rows.append((start, struct.unpack_from('<l', blob, total * 10 + slot * 4)[0]))
+            start = int.from_bytes(blob[index * size:(index + 1) * size], 'little', signed=True)
+            if start == sentinel:
+                start = -(1 << 63)
+            slot = struct.unpack_from('<H', blob, total * size + index * 2)[0]
+            rows.append((start, struct.unpack_from('<l', blob, total * (size + 2) + slot * 4)[0]))
         transitions.append(rows)
     aliases = list(zip(strings('tzAliasName'), ints('tzAliasCanonicalId')))
     regions = list(zip(strings('tzRegionName'), strings('tzRegionZones')))

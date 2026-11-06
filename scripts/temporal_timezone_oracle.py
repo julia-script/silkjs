@@ -114,8 +114,6 @@ def main():
         (temp / 'src').mkdir()
         for module in ('temporal_timezone.silk', 'temporal_timezone_data.silk'):
             shutil.copyfile(ROOT / 'src' / module, temp / 'src' / module)
-        (temp / 'src/data').mkdir()
-        shutil.copyfile(ROOT / 'src/data/timezones.bin', temp / 'src/data/timezones.bin')
         version = tomllib.loads((ROOT / 'silk.toml').read_text())['package']['silk-version']
         (temp / 'silk.toml').write_text(f'[package]\nname="temporal-timezone-oracle"\nversion="0.0.0"\nsilk-version="{version}"\n')
         command = [executable_path(args.silk), 'run', '--quiet', '--release']

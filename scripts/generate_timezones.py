@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile IANA time zone data into src/temporal_timezone_data.silk and src/data/timezones.bin.
+"""Compile IANA time zone data into src/temporal_timezone_data.silk.
 
 The input is the unpacked `tzdata` Python wheel (its `tzdata/` directory), which ships the IANA
 database as compiled TZif files with `zoneinfo/tzdata.zi` naming every zone and link. Each zone
@@ -24,6 +24,17 @@ RENAMED = {'Etc/UTC': 'UTC', 'Etc/GMT': 'GMT'}
 
 def literal(data):
     return 'b"' + ''.join(f'\\x{byte:02x}' for byte in data) + '"'
+
+
+def compact(data):
+    """A byte literal that keeps ASCII letters and digits as they are, to shrink the source."""
+    return 'b"' + ''.join(chr(byte) if chr(byte).isascii() and chr(byte).isalnum() else f'\\x{byte:02x}' for byte in data) + '"'
+
+
+# Transition starts are 40-bit signed seconds; the smallest value stands for INT64_MIN, the
+# sentinel before a zone's first transition.
+START_BYTES = 5
+START_SENTINEL = -(1 << (8 * START_BYTES - 1))
 
 
 def tzif(data):
@@ -156,7 +167,7 @@ def generate(package):
         raise ValueError('time zone data outgrew 16-bit indices')
     for table in tables:
         for at, _ in table:
-            blob += struct.pack('<q', at)
+            blob += (START_SENTINEL if at == INT64_MIN else at).to_bytes(START_BYTES, 'little', signed=True)
     for table in tables:
         for _, offset in table:
             blob += struct.pack('<H', offsetIndex[offset])
@@ -169,12 +180,13 @@ def generate(package):
            f'// Every UTC offset change through {LAST_YEAR}; the last offset holds after it.',
            '// IANA time zone data is in the public domain.',
            '//! Tables read by `temporal_timezone` and `js_intl_locale_info`.',
-           'import silk.build.source { Source }', 'import silk.collections.slice { Slice }', 'import silk.num.u8', 'import silk.num.i32', 'import silk.num.i64', '']
+           'import silk.collections.slice { Slice }', 'import silk.num.u8', 'import silk.num.i32', 'import silk.num.i64', '']
     for name, count in [('zone', len(zones)), ('alias', len(aliases)), ('name', len(names)), ('region', len(regions))]:
         out.append(f'pub const ti_tz_{name}_count: i32 = {count}')
     out += [f'const TRANSITION_COUNT: usize = {total}', f'const OFFSET_COUNT: usize = {len(offsetList)}', '',
-            '/// Transition starts (i64), then their offset indices (u16), then the offsets (i32), little-endian.',
-            "fn transitions() -> &'static [u8] { return Source.read(\"src/data/timezones.bin\") }",
+            f'/// Transition starts (i{8 * START_BYTES}, {START_SENTINEL} for the first), then their offset indices',
+            '/// (u16), then the offsets (i32), little-endian.',
+            "fn transitions() -> &'static [u8] {", '  return ' + compact(blob), '}',
             'fn read16(data: &[u8], at: usize) -> usize {',
             '  return u8.toUsize(data[at]) + u8.toUsize(data[at + 1]) * 256', '}',
             'fn readSigned(data: &[u8], at: usize, size: usize) -> i64 {',
@@ -199,12 +211,13 @@ def generate(package):
     ints('tzTransitionCount', [len(table) for table in tables])
     ints('transitionBase', starts)
     out += ['pub fn tzTransitionStart(id: i32, index: i32) -> i64 {',
-            '  return readSigned(transitions(), i32.toUsize(transitionBase(id) + index) * 8, 8)', '}',
+            f'  let start = readSigned(transitions(), i32.toUsize(transitionBase(id) + index) * {START_BYTES}, {START_BYTES})',
+            f'  if start == {START_SENTINEL} {{ return -9223372036854775807 - 1 }}', '  return start', '}',
             'pub fn tzTransitionOffset(id: i32, index: i32) -> i32 {',
             '  let data = transitions()',
-            '  let slot = read16(data, TRANSITION_COUNT * 8 + i32.toUsize(transitionBase(id) + index) * 2)',
-            '  return i64.toI32(readSigned(data, TRANSITION_COUNT * 10 + slot * 4, 4))', '}', '']
-    return '\n'.join(out), bytes(blob)
+            '  let slot = read16(data, TRANSITION_COUNT * ' + str(START_BYTES) + ' + i32.toUsize(transitionBase(id) + index) * 2)',
+            '  return i64.toI32(readSigned(data, TRANSITION_COUNT * ' + str(START_BYTES + 2) + ' + slot * 4, 4))', '}', '']
+    return '\n'.join(out)
 
 
 if __name__ == '__main__':
@@ -212,7 +225,4 @@ if __name__ == '__main__':
     parser.add_argument('package', type=Path, help='the tzdata wheel package directory')
     root = Path(__file__).resolve().parents[1]
     args = parser.parse_args()
-    source, blob = generate(args.package)
-    (root / 'src/data').mkdir(exist_ok=True)
-    (root / 'src/data/timezones.bin').write_bytes(blob)
-    (root / 'src/temporal_timezone_data.silk').write_text(source)
+    (root / 'src/temporal_timezone_data.silk').write_text(generate(args.package))
