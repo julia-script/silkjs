@@ -36,7 +36,7 @@ def main():
     native.mkdir(parents=True, exist_ok=True)
     for package, archive in [
         ('libuv', 'libuv.a'), ('libssl', 'libssl.a'), ('libcrypto', 'libcrypto.a'),
-        ('libcares', 'libcares.a'), ('libbrotlienc', 'libbrotlienc.a'),
+        ('libbrotlienc', 'libbrotlienc.a'),
         ('libbrotlidec', 'libbrotlidec.a'), ('libbrotlicommon', 'libbrotlicommon.a'),
         ('libzstd', 'libzstd.a'), ('libnghttp2', 'libnghttp2.a'),
     ]:

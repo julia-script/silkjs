@@ -1,18 +1,25 @@
-//! NSS lookup uses libuv; record queries use independent c-ares channels.
-//! The shared loop invokes only native completion callbacks. poll owns all JS
-//! calls; retained callback roots are released after delivery or during close.
+//! dns.lookup and dns.lookupService run getaddrinfo and getnameinfo on the runtime's blocking
+//! threads. Resolver queries drive a `silk.net.dns.query.Exchange` on the runtime loop: each server
+//! gets a nonblocking UDP socket in the runtime reactor, and a TCP try runs on a blocking thread.
+//! poll owns all JS calls; retained callback roots are released after delivery or during close.
 import ext.system_errors as systemErrors
 import silk.mem.allocator { Allocator, OutOfMemoryError }
-import silkjs.js_owned_value { Value, lendFor }
+import silkjs.js_owned_value { lendFor }
 import silkjs.js_realm { lendRealm }
 import silk.mem.pointer { Pointer }
 import silk.mem.layout { Layout }
+import silk.collections.bytes { Bytes }
 import silk.collections.list { List }
+import silk.collections.slice { Slice }
 import silk.core.effect { Effect }
+import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.num.i32
+import silk.num.i64
 import silk.num.f64
+import silk.num.u16
 import silk.num.u32
+import silk.num.u64
 import silk.num.u8
 import silk.num.usize
 import silkjs.js_engine { Engine }
@@ -22,174 +29,573 @@ import silkjs.js_value { ValueBits }
 import silkjs.js_core_types { NativeErrorKind }
 import silkjs.js_exceptions { JsException }
 import silkjs.js_coercion_host { CoercionHooks }
+import silkjs.js_libc_platform as platform
 import libs.core.owners { Scope }
 import libs.core.owners as owners
 import silkjs.js_std_support as host
 import silkjs.js_promise as promise
 import silkjs.js_buffer_storage as buffers
-import ext.uv_fs as uv
 import ext.dns_abi as abi
 import ext.uv_net as net
 import ext.fs_native { equal }
 import ext.resource_snapshot as resources
+import ext.fs_async as fs_async
+import ext.blocking_pool as pool
+import silk.io.byte_duplex { ByteDuplex, ByteIoError, ReadTransfer }
+import silk.net.address { AddressError, Endpoint, IpAddress, Ipv4Address, Ipv6Address, Port }
+import silk.net.datagram_native { DatagramError, Family, NativeUdpSocket, Received, Sent }
+import silk.net.socket_native { ConnectOptions, Connection, NativeSocketError, connectResolvedOwned }
+import silk.net.dns.config { ResolverConfig }
+import silk.net.dns.message { CLASS_IN, MessageError, Name, Question, RCODE_FORMAT_ERROR, RCODE_NAME_ERROR, RCODE_NOT_IMPLEMENTED, RCODE_REFUSED, RCODE_SERVER_FAILURE }
+import silk.net.dns.query { Exchange, QueryError, Reply, Step, Transport }
+import silk.platform.native.clock { NativeClock }
+import silk.system.filesystem { FileError, FileSystem }
+import silk.system.filesystem_native { OsFileSystem }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.system.random { Random }
+import silk.system.random_native { OsRandom }
+import silk.system.system_clock { Instant, SystemClock }
+
 unsafe extern "C" fn calloc(count: usize, size: usize) -> ?*mut u8
 unsafe extern "C" fn free(pointer: ?*mut u8) -> ()
 @foreign(noCapture: .("dest", "source"))
 unsafe extern "C" fn memcpy(dest: *mut u8, source: *const u8, count: usize) -> *mut u8
-unsafe extern "C" fn strlen(text: *const u8) -> usize
-pub struct State { loop: *mut u8, timer: *mut u8, timerClosed: bool, first: ?*mut Request, channels: ?*mut Channel, nextId: i32, closing: bool, polling: bool }
-struct Channel { next: ?*mut Channel, native: *mut u8, id: i32 }
-struct Request { next: ?*mut Request, native: ?*mut u8, callback: ValueBits, kind: i32, status: i32, done: bool, addresses: ?*mut abi.AddrInfo, data: ?*mut u8, length: usize, serviceName: ?*mut u8 }
+@foreign(noCapture: ("node", "serviceText", "hints", "result"))
+unsafe extern "C" fn getaddrinfo(node: ?*const u8, serviceText: ?*const u8, hints: *const abi.AddrInfo, result: *mut ?*mut abi.AddrInfo) -> i32
+unsafe extern "C" fn freeaddrinfo(result: *mut abi.AddrInfo) -> ()
+@foreign(noCapture: .("address", "host", "serviceText"))
+unsafe extern "C" fn getnameinfo(address: *const u8, length: u32, host: *mut u8, hostLength: u32, serviceText: *mut u8, serviceLength: u32, flags: i32) -> i32
+
+// c-ares status codes, which the JavaScript side names.
+const ENODATA: i32 = 1
+const EFORMERR: i32 = 2
+const ESERVFAIL: i32 = 3
+const ENOTFOUND: i32 = 4
+const ENOTIMP: i32 = 5
+const EREFUSED: i32 = 6
+const EBADNAME: i32 = 8
+const EBADRESP: i32 = 10
+const ECONNREFUSED: i32 = 11
+const ETIMEOUT: i32 = 12
+const ENOMEM: i32 = 15
+const EDESTRUCTION: i32 = 16
+const ECANCELLED: i32 = 24
+const ENOSERVER: i32 = 26
+
+const LOOKUP: i32 = 0
+const SERVICE: i32 = 1
+const QUERY: i32 = 2
+
+pub struct State { io: *mut fs_async.State, first: ?*mut Request, resolvers: ?*mut Resolver, nextId: i32, closing: bool, polling: bool, held: bool }
+// The configuration of one `dns.Resolver`. Local addresses are bound before each server socket connects.
+struct Resolver { next: ?*mut Resolver, id: i32, config: ResolverConfig, local4: Option<Endpoint>, local6: Option<Endpoint>, rotation: usize }
+// A TCP try. A blocking thread owns it from submit until the pool returns `job`.
+struct TcpTry { job: pool.Job, endpoint: Endpoint, packet: List<u8>, seconds: i64, nanoseconds: i64, reply: List<u8>, ok: bool, finished: bool }
+// A lookup or a query. A blocking thread owns `job`, `name`, `address`, `addresses`, `host` and
+// `service` while the lookup runs; the loop reads them again after the pool returns `job`.
+struct Request {
+  next: ?*mut Request, callback: ValueBits, kind: i32, status: i32, done: bool,
+  job: pool.Job, running: bool, name: List<u8>, family: i32, flags: i32, address: [u64; 16], addressLength: u32,
+  addresses: ?*mut abi.AddrInfo, host: [u8; 1025], serviceName: [u8; 32],
+  resolver: i32, exchange: Option<Exchange>, sockets: List<NativeUdpSocket>, owners: List<usize>, local4: Option<Endpoint>, local6: Option<Endpoint>,
+  pendingTcp: Option<usize>, tcp: ?*mut TcpTry, tcpServer: usize, reply: List<u8>, cancelled: bool
+}
 unsafe fn nonnull<T>(p: ?*mut T) -> *mut T { return unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(p) }
+unsafe fn raw<T>(p: *mut T) -> *mut u8 { return unsafe Intrinsic.pointerReinterpret<*mut T, *mut u8>(p) }
 effect fn allocate(size: usize) -> *mut u8 ! OutOfMemoryError { let p = unsafe calloc(1, size) if Pointer.isNull<u8>(p) { fail OutOfMemoryError {} } return unsafe nonnull(p) }
+
 pub unsafe effect fn appendResources<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State,array:ValueBits,index:&mut u32)->() !JsException ?&mut Allocator {
   let anchor=() let owner=unsafe Pointer.borrow<(),State>(&anchor,state) let mut cursor=owner.first drop owner
   while !Pointer.isNull<Request>(cursor) {
     let p=unsafe nonnull(cursor) let request=unsafe Pointer.borrow<(),Request>(&anchor,p)
-    cursor=request.next let kind=request.kind let native=request.native drop request
+    cursor=request.next let kind=request.kind drop request
     let mut name:&[u8]=b"GetAddrInfoReqWrap" let mut typeName:&[u8]=b"getaddrinfo"
-    let mut address=unsafe Intrinsic.pointerReinterpret<*mut Request,*mut u8>(p)
-    if !Pointer.isNull<u8>(native) { address=unsafe nonnull(native) }
-    if kind==1 { name=b"GetNameInfoReqWrap" typeName=b"getnameinfo" }
-    if kind==2 { name=b"" typeName=b"cares_query" }
-    run unsafe resources.appendRequest(&mut engine,context,array,&mut index,address,typeName,name)
+    if kind==SERVICE { name=b"GetNameInfoReqWrap" typeName=b"getnameinfo" }
+    if kind==QUERY { name=b"" typeName=b"cares_query" }
+    run unsafe resources.appendRequest(&mut engine,context,array,&mut index,unsafe raw(p),typeName,name)
   }
 }
-unsafe fn owner(native: *mut u8) -> *mut Request { return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Request>(unsafe nonnull(unsafe uv.uv_req_get_data(native))) }
-export "C" fn lookupDone(native: *mut u8, status: i32, addresses: ?*mut abi.AddrInfo) -> () { let mut a = () let r = unsafe Pointer.borrowMut<(), Request>(&mut a, unsafe owner(native)) r.status = status r.addresses = addresses r.done = true }
-unsafe fn copy(source: *const u8, size: usize) -> ?*mut u8 { let p = unsafe calloc(1, size + 1) if !Pointer.isNull<u8>(p) { let ignored = unsafe memcpy(unsafe nonnull(p), source, size) } return p }
-export "C" fn serviceDone(native: *mut u8, status: i32, hostname: ?*const u8, serviceName: ?*const u8) -> () {
-  let mut a = () let r = unsafe Pointer.borrowMut<(), Request>(&mut a, unsafe owner(native)) r.status = status
-  if status == 0 {
-    let h = unsafe Intrinsic.pointerRequalify<?*const u8, *const u8>(hostname) let s = unsafe Intrinsic.pointerRequalify<?*const u8, *const u8>(serviceName)
-    r.data = unsafe copy(h, unsafe strlen(h)) r.serviceName = unsafe copy(s, unsafe strlen(s))
-    if Pointer.isNull<u8>(r.data) || Pointer.isNull<u8>(r.serviceName) { r.status = -12 }
-  }
-  r.done = true
+
+pub effect fn make(io: *mut fs_async.State) -> *mut State ! OutOfMemoryError {
+  let p = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut State>(run allocate(Layout.of<State>().bytes))
+  unsafe Pointer.put<State>(p, State { io: io, first: Pointer.null<Request>(), resolvers: Pointer.null<Resolver>(), nextId: 1, closing: false, polling: false, held: false })
+  return p
 }
-export "C" fn queryDone(data: *mut u8, status: i32, timeouts: i32, packet: ?*mut u8, length: i32) -> () {
-  let p = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Request>(data) let mut a = () let r = unsafe Pointer.borrowMut<(), Request>(&mut a, p)
-  r.status = status
-  if status == 0 && length > 0 { r.length = i32.toUsize(length) r.data = unsafe copy(unsafe nonnull(packet), r.length) if Pointer.isNull<u8>(r.data) { r.status = 15 } }
-  r.done = true
-}
-export "C" fn tick(timer: *mut u8) -> () {
-  let p = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut State>(unsafe nonnull(unsafe net.uv_handle_get_data(timer))) let a = () let state = unsafe Pointer.borrow<(), State>(&a, p) let mut channel = state.channels drop state
-  while !Pointer.isNull<Channel>(channel) {
-    let c = unsafe Pointer.borrow<(), Channel>(&a, unsafe nonnull(channel)) let native = c.native channel = c.next drop c
-    let mut sockets: [i32; 16] = [-1; 16] let bits = unsafe abi.ares_getsock(native, Pointer.fromMutRef<i32>(&mut sockets[0]), 16)
-    let mut fds: [abi.PollFd; 16] = [abi.PollFd { fd: -1, events: 0, revents: 0 }; 16]
-    let mut i: usize = 0 let mut mask: u32 = 1
-    while i < 16 { fds[i].fd = sockets[i] if (i32.toU32(bits) & mask) != 0 { fds[i].events = 1 } if (i32.toU32(bits) & u32.shiftLeft(mask, 16)) != 0 { fds[i].events = fds[i].events | 4 } mask = u32.shiftLeft(mask, 1) i = i + 1 }
-    let ready = unsafe abi.systemPoll(Pointer.fromMutRef<abi.PollFd>(&mut fds[0]), 16, 0)
-    if ready > 0 { i = 0 while i < 16 { let mut rd: i32 = -1 let mut wr: i32 = -1 if (fds[i].revents & 25) != 0 { rd = fds[i].fd } if (fds[i].revents & 28) != 0 { wr = fds[i].fd } if rd != -1 || wr != -1 { unsafe abi.ares_process_fd(native, rd, wr) } i = i + 1 } }
-    unsafe abi.ares_process_fd(native, -1, -1)
+
+// getaddrinfo and getnameinfo report EAI_* codes; Node reports libuv's UV_EAI_* values.
+fn translate(code: i32) -> i32 {
+  // Pairs of (EAI_* value, UV_EAI_* value); EAI_SYSTEM reports errno instead.
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    if code == 11 { return 0 - unsafe platform.errno() }
+    let table: [i32; 26] = [1, -3000, 2, -3001, 3, -3002, 4, -3004, 5, -3005, 6, -3006, 7, -3007, 8, -3008, 9, -3010, 10, -3011, 12, -3013, 13, -3014, 14, -3009]
+    return lookupCode(&table, code)
+  } else {
+    if code == -11 { return 0 - unsafe platform.errno() }
+    let table: [i32; 26] = [-1, -3002, -2, -3008, -3, -3001, -4, -3004, -5, -3007, -6, -3005, -7, -3011, -8, -3010, -9, -3000, -10, -3006, -12, -3009, -101, -3003, 0, -3004]
+    return lookupCode(&table, code)
   }
 }
-export "C" fn timerClosed(timer: *mut u8) -> () { let p = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut State>(unsafe nonnull(unsafe net.uv_handle_get_data(timer))) let mut a = () let s = unsafe Pointer.borrowMut<(), State>(&mut a, p) s.timerClosed = true }
-pub effect fn make(loop: *mut u8) -> *mut State ! OutOfMemoryError {
-  if unsafe abi.ares_library_init(0) != 0 { fail OutOfMemoryError {} }
-  let allocated = run Effect.result(allocate(Layout.of<State>().bytes))
-  let raw = match move allocated { Result<*mut u8, OutOfMemoryError>.Success { value } => value Result<*mut u8, OutOfMemoryError>.Failure { error } => { unsafe abi.ares_library_cleanup() fail move error } }
-  let p = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut State>(raw)
-  let allocatedTimer = run Effect.result(allocate(unsafe net.uv_handle_size(13)))
-  let timer = match move allocatedTimer { Result<*mut u8, OutOfMemoryError>.Success { value } => value Result<*mut u8, OutOfMemoryError>.Failure { error } => { unsafe free(raw) unsafe abi.ares_library_cleanup() fail move error } }
-  if unsafe abi.uv_timer_init(loop, timer) != 0 { unsafe free(timer) unsafe free(raw) unsafe abi.ares_library_cleanup() fail OutOfMemoryError {} }
-  unsafe Pointer.put<State>(p, State { loop: loop, timer: timer, timerClosed: false, first: Pointer.null<Request>(), channels: Pointer.null<Channel>(), nextId: 1, closing: false, polling: false }) unsafe net.uv_handle_set_data(timer, raw) return p
+fn lookupCode(table: &[i32; 26], code: i32) -> i32 {
+  let mut i: usize = 0 while i < 26 { if table[i] == code { return table[i + 1] } i = i + 2 }
+  return -3004
 }
-unsafe fn channel(pointer: *mut State, id: i32) -> ?*mut u8 { let a = () let s = unsafe Pointer.borrow<(), State>(&a, pointer) let mut p = s.channels drop s while !Pointer.isNull<Channel>(p) { let c = unsafe Pointer.borrow<(), Channel>(&a, unsafe nonnull(p)) if c.id == id { return c.native } p = c.next } return Pointer.null<u8>() }
-unsafe fn destroyChannel(pointer: *mut State, id: i32) -> () {
+// Runs on a blocking thread.
+export "C" fn silkDnsLookup(data: ?*mut u8) -> () {
+  let mut anchor = () let r = unsafe Pointer.borrowMut<(), Request>(&mut anchor, unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Request>(unsafe nonnull(data)))
+  if r.kind == LOOKUP {
+    let hints = abi.AddrInfo { flags: r.flags, family: r.family, socktype: 1, protocol: 0, addrlen: 0, address: Pointer.null<u8>(), canonname: Pointer.null<u8>(), next: Pointer.null<abi.AddrInfo>() }
+    let mut result = Pointer.null<abi.AddrInfo>()
+    let code = unsafe getaddrinfo(host.pointer(&r.name), Pointer.null<u8>(), Pointer.fromRef<abi.AddrInfo>(&hints), Pointer.fromMutRef<?*mut abi.AddrInfo>(&mut result))
+    if code != 0 { r.status = translate(code) } else { r.addresses = result }
+  } else {
+    let address = unsafe Intrinsic.pointerReinterpret<*const u64, *const u8>(Pointer.fromRef<u64>(&r.address[0]))
+    let code = unsafe getnameinfo(address, r.addressLength, Pointer.fromMutRef<u8>(&mut r.host[0]), 1025, Pointer.fromMutRef<u8>(&mut r.serviceName[0]), 32, 0)
+    if code != 0 { r.status = translate(code) }
+  }
+}
+export "C" fn silkDnsLookupDone(data: ?*mut u8) -> () {
+  let mut anchor = () let r = unsafe Pointer.borrowMut<(), Request>(&mut anchor, unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Request>(unsafe nonnull(data)))
+  r.running = false r.done = true
+}
+
+// Runs a TCP try on a blocking thread, until the deadline of the try.
+export "C" fn silkDnsTcp(data: ?*mut u8) -> () {
+  let mut anchor = () let t = unsafe Pointer.borrowMut<(), TcpTry>(&mut anchor, unsafe Intrinsic.pointerReinterpret<*mut u8, *mut TcpTry>(unsafe nonnull(data)))
+  let mut allocator = Allocator.systemAllocatorProvider() let mut clock = OsMonotonicClock.make()
+  let result = run Effect.result(tcpRoundTrip(&mut t.*)) |> Effect.provideMut<Allocator>(&mut allocator) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  t.ok = match move result { Result<(), NativeSocketError | ByteIoError | OutOfMemoryError>.Success { .. } => true _ => false }
+}
+export "C" fn silkDnsTcpDone(data: ?*mut u8) -> () {
+  let mut anchor = () let t = unsafe Pointer.borrowMut<(), TcpTry>(&mut anchor, unsafe Intrinsic.pointerReinterpret<*mut u8, *mut TcpTry>(unsafe nonnull(data)))
+  t.finished = true
+}
+effect fn tcpRoundTrip(t: &mut TcpTry) -> () ! NativeSocketError | ByteIoError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock {
+  let targets = [t.endpoint]
+  let mut connection = run connectResolvedOwned(&targets, ConnectOptions.defaults(), Option<Instant>.some(SystemClock.make(t.seconds, t.nanoseconds)))
+  let packet = t.packet.asSlice() let mut written: usize = 0
+  while written < packet.length {
+    written = written + run ByteDuplex.writeSome(Slice.view<u8>(packet, written, packet.length - written), Option<Instant>.some(SystemClock.make(t.seconds, t.nanoseconds))) |> Effect.provideMut<ByteDuplex>(&mut connection)
+  }
+  let mut prefix = run Bytes.zeroed(2)
+  run readExactly(&mut connection, &mut prefix, t.seconds, t.nanoseconds)
+  let length = u8.toUsize(Bytes.asSlice(&prefix)[0]) * 256 + u8.toUsize(Bytes.asSlice(&prefix)[1])
+  let mut message = run Bytes.zeroed(length)
+  run readExactly(&mut connection, &mut message, t.seconds, t.nanoseconds)
+  run t.reply.appendSlice(Bytes.asSlice(&message))
+  run Connection.close(&mut connection)
+}
+effect fn readExactly(connection: &mut Connection, output: &mut Bytes, seconds: i64, nanoseconds: i64) -> () ! ByteIoError | NativeSocketError ? &mut MonotonicClock {
+  let mut filled: usize = 0 let total = Bytes.length(&output.*)
+  while filled < total {
+    let transfer = run ByteDuplex.readSome(Slice.viewMut<u8>(Bytes.asMutSlice(&mut output.*), filled, total - filled), Option<Instant>.some(SystemClock.make(seconds, nanoseconds))) |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+    match move transfer { ReadTransfer.Data { count } => { filled = filled + count } ReadTransfer.End => { fail NativeSocketError.Closed } }
+  }
+}
+
+unsafe fn resolverFor(pointer: *mut State, id: i32) -> ?*mut Resolver {
+  let a = () let s = unsafe Pointer.borrow<(), State>(&a, pointer) let mut p = s.resolvers drop s
+  while !Pointer.isNull<Resolver>(p) { let c = unsafe Pointer.borrow<(), Resolver>(&a, unsafe nonnull(p)) if c.id == id { return p } p = c.next }
+  return Pointer.null<Resolver>()
+}
+unsafe fn destroyResolver(pointer: *mut State, id: i32) -> () {
   let mut anchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer)
-  let mut link = Pointer.fromMutRef<?*mut Channel>(&mut state.channels) drop state
-  while !Pointer.isNull<Channel>(unsafe Pointer.read<?*mut Channel>(link)) {
-    let node = unsafe nonnull(unsafe Pointer.read<?*mut Channel>(link)) let entry = unsafe Pointer.borrowMut<(), Channel>(&mut anchor, node)
+  let mut link = Pointer.fromMutRef<?*mut Resolver>(&mut state.resolvers) drop state
+  while !Pointer.isNull<Resolver>(unsafe Pointer.read<?*mut Resolver>(link)) {
+    let node = unsafe nonnull(unsafe Pointer.read<?*mut Resolver>(link)) let entry = unsafe Pointer.borrowMut<(), Resolver>(&mut anchor, node)
     if entry.id == id {
-      let native = entry.native unsafe Pointer.put<?*mut Channel>(link, entry.next) drop entry
-      unsafe abi.ares_destroy(native) unsafe free(unsafe Intrinsic.pointerReinterpret<*mut Channel, *mut u8>(node)) return ()
+      unsafe Pointer.put<?*mut Resolver>(link, entry.next) drop entry
+      let resolver = unsafe Pointer.take<Resolver>(node) drop resolver unsafe free(unsafe raw(node)) return ()
     }
-    link = Pointer.fromMutRef<?*mut Channel>(&mut entry.next) drop entry
+    link = Pointer.fromMutRef<?*mut Resolver>(&mut entry.next) drop entry
   }
 }
 fn number(value: ValueBits) -> i32 { if value.isNumber() { return f64.toI32(value.numericValue()) } return 0 }
-unsafe effect fn invoke<'m, S: EngineServices>(engine: &mut Engine<'m,S>, context: *mut HeapHeader, pointer: *mut State, op: &[u8], args: &Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
-  let mut a = () let state = unsafe Pointer.borrowMut<(), State>(&mut a, pointer) let loop = state.loop let timer = state.timer let closing = state.closing drop state
-  if closing { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Internal, b"DNS executor is closed") }
-  if equal(op, b"dnsDestroy") { unsafe destroyChannel(pointer, number(args.values[0])) return ValueBits.Undefined }
-  if equal(op, b"dnsCreate") {
-    let options = abi.Options {
-      flags: 0, timeout: number(args.values[0]), tries: number(args.values[1]), ndots: 0, udpPort: 0, tcpPort: 0,
-      sendBuffer: 0, receiveBuffer: 0, servers: Pointer.null<u8>(), nservers: 0, domains: Pointer.null<u8>(), ndomains: 0,
-      lookups: Pointer.null<u8>(), socketCallback: Pointer.null<u8>(), socketData: Pointer.null<u8>(), sortlist: Pointer.null<u8>(),
-      nsort: 0, ednspsz: 0, resolvconf: Pointer.null<u8>(), hosts: Pointer.null<u8>(), udpQueries: 0, maxTimeout: 0,
-      cacheTtl: 0, evsys: 0, retryChance: 0, retryDelay: 0
+
+// The system configuration from /etc/resolv.conf, as c-ares reads it.
+effect fn systemConfig() -> ResolverConfig ! OutOfMemoryError ? &mut Allocator {
+  let mut files = run OsFileSystem.make("/")
+  let loaded = run Effect.result(ResolverConfig.load()) |> Effect.provideMut<FileSystem>(&mut files)
+  return match move loaded {
+    Result<ResolverConfig, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<ResolverConfig, FileError | OutOfMemoryError>.Failure { error } => match move error { OutOfMemoryError {} => { fail OutOfMemoryError {} } _ => run ResolverConfig.parse(b"") }
+  }
+}
+
+// Formats servers as c-ares' ares_get_servers_csv does: `a.b.c.d:port` and `[v6]:port`.
+effect fn serversText(config: &ResolverConfig) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<u8>.make() let servers = List<Endpoint>.asSlice(&config.servers) let mut i: usize = 0
+  while i < servers.length {
+    if i > 0 { run out.append(44) }
+    let address = Endpoint.address(&servers[i]) let mut text: [u8; 64] = [0; 64]
+    let written = match IpAddress.formatInto(&address, &mut text) { Result<usize, AddressError>.Success { value } => value Result<usize, AddressError>.Failure { .. } => 0 }
+    let v6 = !IpAddress.isV4(&address)
+    if v6 { run out.append(91) }
+    run out.appendSlice(Slice.view<u8>(&text, 0, written))
+    if v6 { run out.append(93) }
+    run out.append(58) run appendDecimal(&mut out, u16.toU32(Port.value(&Endpoint.port(&servers[i]))))
+    i = i + 1
+  }
+  return move out
+}
+effect fn appendDecimal(out: &mut List<u8>, value: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut digits: [u8; 10] = [0; 10] let mut count: usize = 0 let mut rest = value
+  while true { digits[count] = u32.toU8(rest % 10) + 48 count = count + 1 rest = rest / 10 if rest == 0 { break } }
+  while count > 0 { count = count - 1 run out.append(digits[count]) }
+}
+fn parseAddress(text: &[u8]) -> Option<IpAddress> {
+  if let Result<Ipv4Address, AddressError>.Success { value } = Ipv4Address.parseBytes(text) { return Option<IpAddress>.some(IpAddress.V4 { value: value }) }
+  if let Result<Ipv6Address, AddressError>.Success { value } = Ipv6Address.parseBytes(text) { return Option<IpAddress>.some(IpAddress.V6 { value: value }) }
+  return Option<IpAddress>.none()
+}
+// Parses one `addr`, `addr:port`, `[v6]` or `[v6]:port` entry, as the JavaScript side writes them.
+fn parseServer(entry: &[u8]) -> Option<Endpoint> {
+  let mut host = entry let mut port: u32 = 53
+  if entry.length > 0 && entry[0] == 91 {
+    let mut close: usize = 1 while close < entry.length && entry[close] != 93 { close = close + 1 }
+    if close == entry.length { return Option<Endpoint>.none() }
+    host = Slice.view<u8>(entry, 1, close - 1)
+    if close + 1 < entry.length {
+      if entry[close + 1] != 58 { return Option<Endpoint>.none() }
+      port = 0 let mut i = close + 2 if i == entry.length { return Option<Endpoint>.none() }
+      while i < entry.length { if entry[i] < 48 || entry[i] > 57 || port > 65535 { return Option<Endpoint>.none() } port = port * 10 + u8.toU32(entry[i] - 48) i = i + 1 }
     }
-    let mut mask: i32 = 4 if options.timeout >= 0 { mask = mask | 8192 }
-    let mut native = Pointer.null<u8>() let status = unsafe abi.ares_init_options(Pointer.fromMutRef<?*mut u8>(&mut native), Pointer.fromRef<abi.Options>(&options), mask)
-    if status != 0 { return ValueBits.Int { value: -status } }
-    let allocated = run Effect.result(allocate(Layout.of<Channel>().bytes))
-    let raw = match move allocated { Result<*mut u8, OutOfMemoryError>.Success { value } => value Result<*mut u8, OutOfMemoryError>.Failure { error } => { unsafe abi.ares_destroy(unsafe nonnull(native)) fail move error } }
-    let c = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Channel>(raw) let s = unsafe Pointer.borrowMut<(), State>(&mut a, pointer) let id = s.nextId s.nextId = id + 1
-    unsafe Pointer.put<Channel>(c, Channel { next: s.channels, native: unsafe nonnull(native), id: id }) s.channels = c return ValueBits.Int { value: id }
+  } else {
+    let mut colon: usize = 0 let mut colons: usize = 0 let mut i: usize = 0
+    while i < entry.length { if entry[i] == 58 { colon = i colons = colons + 1 } i = i + 1 }
+    if colons == 1 {
+      host = Slice.view<u8>(entry, 0, colon) port = 0 let mut j = colon + 1 if j == entry.length { return Option<Endpoint>.none() }
+      while j < entry.length { if entry[j] < 48 || entry[j] > 57 || port > 65535 { return Option<Endpoint>.none() } port = port * 10 + u8.toU32(entry[j] - 48) j = j + 1 }
+    }
+  }
+  if port > 65535 { return Option<Endpoint>.none() }
+  return match parseAddress(host) { Option<IpAddress>.Some { value } => Option<Endpoint>.some(Endpoint.make(value, Port.fromU16(u32.toU16(port)))) Option<IpAddress>.None => Option<Endpoint>.none() }
+}
+
+unsafe effect fn invoke<'m, S: EngineServices>(engine: &mut Engine<'m,S>, context: *mut HeapHeader, pointer: *mut State, op: &[u8], args: &Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut a = () let state = unsafe Pointer.borrowMut<(), State>(&mut a, pointer) let closing = state.closing let io = state.io drop state
+  if closing { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Internal, b"DNS executor is closed") }
+  if equal(op, b"dnsDestroy") { unsafe destroyResolver(pointer, number(args.values[0])) return ValueBits.Undefined }
+  if equal(op, b"dnsCreate") {
+    let mut config = run systemConfig()
+    let timeout = number(args.values[0]) if timeout > 0 { config.timeout = i32.toU64(timeout) * 1000000 }
+    let tries = number(args.values[1]) if tries > 0 { config.attempts = i32.toUsize(tries) }
+    let node = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Resolver>(run allocate(Layout.of<Resolver>().bytes))
+    let s = unsafe Pointer.borrowMut<(), State>(&mut a, pointer) let id = s.nextId s.nextId = id + 1
+    unsafe Pointer.put<Resolver>(node, Resolver { next: s.resolvers, id: id, config: move config, local4: Option<Endpoint>.none(), local6: Option<Endpoint>.none(), rotation: 0 }) s.resolvers = node
+    return ValueBits.Int { value: id }
   }
   if equal(op, b"dnsServers") || equal(op, b"dnsSetServers") || equal(op, b"dnsCancel") || equal(op, b"dnsLocal") {
-    let raw = unsafe channel(pointer, number(args.values[0])) if Pointer.isNull<u8>(raw) { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Invalid DNS resolver") } let native = unsafe nonnull(raw)
-    if equal(op, b"dnsCancel") { unsafe abi.ares_cancel(native) return ValueBits.Undefined }
-    if equal(op, b"dnsServers") { let servers = unsafe abi.ares_get_servers_csv(native) if Pointer.isNull<u8>(servers) { fail OutOfMemoryError {} } let result = run Effect.result(host.cstring(&mut engine, unsafe lendRealm(&context, context), unsafe nonnull(servers))) unsafe abi.ares_free_string(servers) return match move result { Result<Value, JsException>.Success { value } => value.intoBits() Result<Value, JsException>.Failure { error } => { fail move error } } }
-    let text = run host.ctext(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(args.values[1]))
-    if equal(op, b"dnsSetServers") { return ValueBits.Int { value: unsafe abi.ares_set_servers_ports_csv(native, host.pointer(&text)) } }
-    let mut ipv4: u32 = 0 let mut ipv6: [u8; 16] = [0; 16]
-    let code4 = unsafe abi.uv_inet_pton(2, host.pointer(&text), unsafe Intrinsic.pointerReinterpret<*mut u32, *mut u8>(Pointer.fromMutRef<u32>(&mut ipv4)))
-    if code4 < 0 { return ValueBits.Int { value: code4 } }
-    let text6 = run host.ctext(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(args.values[2])) let code6 = unsafe abi.uv_inet_pton(abi.inet6(), host.pointer(&text6), Pointer.fromMutRef<u8>(&mut ipv6[0]))
-    if code6 < 0 { return ValueBits.Int { value: code6 } }
-    // c-ares takes the IPv4 address in host byte order.
-    let bytes = unsafe Intrinsic.pointerReinterpret<*const u32, *const u8>(Pointer.fromRef<u32>(&ipv4)) let many = unsafe Pointer.assumeMany<u8>(bytes)
-    let mut hostip: u32 = 0 let mut i: usize = 0 while i < 4 { hostip = u32.shiftLeft(hostip, 8) | u8.toU32(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(many, i))) i = i + 1 }
-    unsafe abi.ares_set_local_ip4(native, hostip) unsafe abi.ares_set_local_ip6(native, Pointer.fromRef<u8>(&ipv6[0])) return ValueBits.Int { value: 0 }
-  }
-  let mut kind: i32 = 0 if equal(op, b"dnsLookupService") { kind = 1 } else if equal(op, b"dnsQuery") { kind = 2 } else if !equal(op, b"dnsLookup") { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Unknown DNS operation") }
-  let mut nameIndex: usize = 0 let mut callbackIndex: usize = 3 if kind == 1 { callbackIndex = 2 } if kind == 2 { nameIndex = 1 }
-  let name = run host.ctext(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(args.values[nameIndex]))
-  let mut queryChannel = Pointer.null<u8>() if kind == 2 { queryChannel = unsafe channel(pointer, number(args.values[0])) if Pointer.isNull<u8>(queryChannel) { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Invalid DNS resolver") } }
-  let raw = run allocate(Layout.of<Request>().bytes) let r = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Request>(raw)
-  let mut native = Pointer.null<u8>()
-  if kind != 2 { let mut reqKind: i32 = 8 if kind == 1 { reqKind = 9 } let allocated = run Effect.result(allocate(unsafe uv.uv_req_size(reqKind))) native = match move allocated { Result<*mut u8, OutOfMemoryError>.Success { value } => value Result<*mut u8, OutOfMemoryError>.Failure { error } => { unsafe free(raw) fail move error } } }
-  unsafe Pointer.put<Request>(r, Request { next: Pointer.null<Request>(), native: native, callback: unsafe args.values[callbackIndex].retained(), kind: kind, status: 0, done: false, addresses: Pointer.null<abi.AddrInfo>(), data: Pointer.null<u8>(), length: 0, serviceName: Pointer.null<u8>() })
-  let s = unsafe Pointer.borrowMut<(), State>(&mut a, pointer) let mut b = () let request = unsafe Pointer.borrowMut<(), Request>(&mut b, r) request.next = s.first s.first = r drop s drop request
-  let mut status: i32 = 0
-  if kind == 2 { unsafe abi.ares_query(unsafe nonnull(queryChannel), host.pointer(&name), 1, number(args.values[2]), queryDone, raw) let ignored = unsafe abi.uv_timer_start(timer, tick, 0, 10) }
-  else {
-    unsafe uv.uv_req_set_data(unsafe nonnull(native), raw)
-    if kind == 0 {
-      let mut family = number(args.values[1]) if family == 4 { family = 2 } else if family == 6 { family = abi.inet6() }
-      let hints = abi.AddrInfo { flags: number(args.values[2]), family: family, socktype: 1, protocol: 0, addrlen: 0, address: Pointer.null<u8>(), canonname: Pointer.null<u8>(), next: Pointer.null<abi.AddrInfo>() }
-      status = unsafe abi.uv_getaddrinfo(loop, unsafe nonnull(native), lookupDone, host.pointer(&name), Pointer.null<u8>(), Pointer.fromRef<abi.AddrInfo>(&hints))
-    } else {
-      let mut address: [u64; 16] = [0; 16] let addr = unsafe Intrinsic.pointerReinterpret<*mut u64, *mut u8>(Pointer.fromMutRef<u64>(&mut address[0]))
-      status = unsafe net.uv_ip4_addr(host.pointer(&name), number(args.values[1]), addr) if status < 0 { status = unsafe net.uv_ip6_addr(host.pointer(&name), number(args.values[1]), addr) }
-      if status == 0 { status = unsafe abi.uv_getnameinfo(loop, unsafe nonnull(native), serviceDone, addr, 0) }
+    let found = unsafe resolverFor(pointer, number(args.values[0])) if Pointer.isNull<Resolver>(found) { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Invalid DNS resolver") }
+    let node = unsafe nonnull(found) let id = number(args.values[0])
+    if equal(op, b"dnsCancel") { unsafe cancel(pointer, id, ECANCELLED) return ValueBits.Undefined }
+    let mut resolverAnchor = () let resolver = unsafe Pointer.borrowMut<(), Resolver>(&mut resolverAnchor, node)
+    if equal(op, b"dnsServers") { let text = run serversText(&resolver.config) drop resolver return (run host.string(&mut engine, unsafe lendRealm(&context, context), text.asSlice())).intoBits() }
+    drop resolver
+    let text = run host.text(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(args.values[1]))
+    if equal(op, b"dnsSetServers") {
+      let mut servers = List<Endpoint>.make() let source = text.asSlice() let mut start: usize = 0
+      while start < source.length {
+        let mut end = start while end < source.length && source[end] != 44 { end = end + 1 }
+        match parseServer(Slice.view<u8>(source, start, end - start)) { Option<Endpoint>.Some { value } => { run servers.append(value) } Option<Endpoint>.None => { return ValueBits.Int { value: EBADSTR() } } }
+        start = end + 1
+      }
+      let updated = unsafe Pointer.borrowMut<(), Resolver>(&mut resolverAnchor, node) updated.config.servers = move servers updated.rotation = 0
+      return ValueBits.Int { value: 0 }
     }
-    if status < 0 { let entry = unsafe Pointer.borrowMut<(), Request>(&mut a, r) entry.status = status entry.done = true }
+    let text6 = run host.text(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(args.values[2]))
+    let four = match parseAddress(text.asSlice()) { Option<IpAddress>.Some { value } => value Option<IpAddress>.None => { return ValueBits.Int { value: -22 } } }
+    let six = match parseAddress(text6.asSlice()) { Option<IpAddress>.Some { value } => value Option<IpAddress>.None => { return ValueBits.Int { value: -22 } } }
+    let updated = unsafe Pointer.borrowMut<(), Resolver>(&mut resolverAnchor, node)
+    updated.local4 = if isUnspecified(&four) { Option<Endpoint>.none() } else { Option<Endpoint>.some(Endpoint.make(four, Port.fromU16(0))) }
+    updated.local6 = if isUnspecified(&six) { Option<Endpoint>.none() } else { Option<Endpoint>.some(Endpoint.make(six, Port.fromU16(0))) }
+    return ValueBits.Int { value: 0 }
   }
+  let mut kind: i32 = LOOKUP if equal(op, b"dnsLookupService") { kind = SERVICE } else if equal(op, b"dnsQuery") { kind = QUERY } else if !equal(op, b"dnsLookup") { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Unknown DNS operation") }
+  let mut nameIndex: usize = 0 let mut callbackIndex: usize = 3 if kind == SERVICE { callbackIndex = 2 } if kind == QUERY { nameIndex = 1 }
+  let name = run host.ctext(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(args.values[nameIndex]))
+  let mut resolver = Pointer.null<Resolver>()
+  if kind == QUERY { resolver = unsafe resolverFor(pointer, number(args.values[0])) if Pointer.isNull<Resolver>(resolver) { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Invalid DNS resolver") } }
+  let r = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Request>(run allocate(Layout.of<Request>().bytes))
+  unsafe Pointer.put<Request>(r, Request {
+    next: Pointer.null<Request>(), callback: unsafe args.values[callbackIndex].retained(), kind: kind, status: 0, done: false,
+    job: pool.job(silkDnsLookup, silkDnsLookupDone, unsafe raw(r)), running: false, name: move name, family: 0, flags: 0, address: [0; 16], addressLength: 0,
+    addresses: Pointer.null<abi.AddrInfo>(), host: [0; 1025], serviceName: [0; 32],
+    resolver: 0, exchange: Option<Exchange>.none(), sockets: List<NativeUdpSocket>.make(), owners: List<usize>.make(), local4: Option<Endpoint>.none(), local6: Option<Endpoint>.none(),
+    pendingTcp: Option<usize>.none(), tcp: Pointer.null<TcpTry>(), tcpServer: 0, reply: List<u8>.make(), cancelled: false
+  })
+  let s = unsafe Pointer.borrowMut<(), State>(&mut a, pointer) let mut b = () let request = unsafe Pointer.borrowMut<(), Request>(&mut b, r) request.next = s.first s.first = r drop s
+  if kind == QUERY {
+    request.resolver = number(args.values[0]) drop request
+    run unsafe startQuery(pointer, r, unsafe nonnull(resolver), u32.toU16(i32.toU32(number(args.values[2]))))
+    // The loop may be about to block with nothing of ours registered yet, so ask for a pass now:
+    // it sends the first datagram, or delivers a query that failed before it started.
+    let c = () let state = unsafe Pointer.borrow<(), State>(&c, pointer) let io = state.io drop state
+    unsafe fs_async.wakeAt(io, 1)
+    return ValueBits.Undefined
+  }
+  if kind == LOOKUP {
+    let family = number(args.values[1]) request.family = if family == 4 { 2 } else if family == 6 { abi.inet6() } else { 0 }
+    request.flags = number(args.values[2])
+  } else {
+    let mut status = unsafe net.uv_ip4_addr(host.pointer(&request.name), number(args.values[1]), unsafe Intrinsic.pointerReinterpret<*mut u64, *mut u8>(Pointer.fromMutRef<u64>(&mut request.address[0])))
+    request.addressLength = 16
+    if status < 0 { status = unsafe net.uv_ip6_addr(host.pointer(&request.name), number(args.values[1]), unsafe Intrinsic.pointerReinterpret<*mut u64, *mut u8>(Pointer.fromMutRef<u64>(&mut request.address[0]))) request.addressLength = 28 }
+    if status < 0 { request.status = status request.done = true return ValueBits.Undefined }
+  }
+  request.running = true drop request
+  let queued = run unsafe fs_async.queueWork(io, Pointer.fromMutRef<pool.Job>(&mut (unsafe Pointer.borrowMut<(), Request>(&mut b, r)).job))
+  if queued != 0 { let failed = unsafe Pointer.borrowMut<(), Request>(&mut b, r) failed.running = false failed.status = queued failed.done = true }
   return ValueBits.Undefined
 }
-unsafe effect fn dispatchBody<'m,S:EngineServices>(engine:&mut Engine<'m,S>, context:*mut HeapHeader, state:*mut State, operation:ValueBits, args:ValueBits, scope:&mut Scope)->ValueBits ! OutOfMemoryError|JsException ?&mut Allocator {
+fn EBADSTR() -> i32 { return 17 }
+fn isUnspecified(address: &IpAddress) -> bool {
+  match &address.* {
+    IpAddress.V4 { value } => { let o = Ipv4Address.octets(&value) return o[0] == 0 && o[1] == 0 && o[2] == 0 && o[3] == 0 }
+    IpAddress.V6 { value } => { let o = Ipv6Address.octets(&value) let mut i: usize = 0 while i < 16 { if o[i] != 0 { return false } i = i + 1 } return true }
+  }
+}
+
+effect fn now() -> Instant { return run NativeClock.now(true) }
+fn nanosecondsOf(instant: &Instant) -> u64 { return i64.toU64(SystemClock.seconds(instant)) * 1000000000 + i64.toU64(SystemClock.nanoseconds(instant)) }
+
+unsafe effect fn startQuery(pointer: *mut State, r: *mut Request, node: *mut Resolver, kind: u16) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = () let resolver = unsafe Pointer.borrowMut<(), Resolver>(&mut anchor, node)
+  let mut b = () let request = unsafe Pointer.borrowMut<(), Request>(&mut b, r)
+  request.local4 = resolver.local4 request.local6 = resolver.local6
+  let text = request.name.asSlice() let length = if text.length > 0 { text.length - 1 } else { 0 }
+  let name = match Name.parseBytes(Slice.view<u8>(text, 0, length)) { Result<Name, MessageError>.Success { value } => value Result<Name, MessageError>.Failure { .. } => { request.status = EBADNAME request.done = true return () } }
+  let servers = List<Endpoint>.length(&resolver.config.servers)
+  if servers == 0 { request.status = ENOSERVER request.done = true return () }
+  let first = resolver.rotation % servers
+  if resolver.config.rotate { resolver.rotation = resolver.rotation + 1 }
+  let mut random = OsRandom.make()
+  let id = run Random.nextU64() |> Effect.provideMut<Random>(&mut random)
+  let made = run Effect.result(Exchange.make(&resolver.config, Question { name: name, kind: kind, class: CLASS_IN }, u64.toU16(id % 65536), first))
+  match move made {
+    Result<Exchange, MessageError | OutOfMemoryError>.Success { value } => { request.exchange = Option<Exchange>.some(move value) }
+    Result<Exchange, MessageError | OutOfMemoryError>.Failure { error } => match move error {
+      OutOfMemoryError {} => { fail OutOfMemoryError {} }
+      MessageError failure => { drop failure request.status = EBADNAME request.done = true return () }
+    }
+  }
+  drop request drop resolver
+  unsafe hold(pointer)
+}
+
+// Keeps the loop alive while a query waits on its sockets or deadline.
+unsafe fn hold(pointer: *mut State) -> () {
+  let mut a = () let s = unsafe Pointer.borrowMut<(), State>(&mut a, pointer)
+  if !s.held { s.held = true unsafe fs_async.hold(s.io) }
+}
+unsafe fn updateHold(pointer: *mut State) -> () {
+  let a = () let s = unsafe Pointer.borrow<(), State>(&a, pointer) let mut p = s.first let held = s.held let io = s.io drop s
+  let mut active = false
+  while !Pointer.isNull<Request>(p) { let r = unsafe Pointer.borrow<(), Request>(&a, unsafe nonnull(p)) if r.kind == QUERY && !r.done { active = true } p = r.next }
+  if active == held { return () }
+  let mut b = () let s2 = unsafe Pointer.borrowMut<(), State>(&mut b, pointer) s2.held = active drop s2
+  if active { unsafe fs_async.hold(io) } else { unsafe fs_async.unhold(io) }
+}
+
+// Closes the sockets of a finished query and leaves the reactor.
+unsafe fn closeSockets(io: *mut fs_async.State, request: &mut Request) -> () {
+  let sockets = request.sockets.asSlice() let mut i: usize = 0
+  while i < sockets.length { unsafe fs_async.forgetDescriptor(io, NativeUdpSocket.rawDescriptor(&sockets[i])) i = i + 1 }
+  request.sockets = List<NativeUdpSocket>.make() request.owners = List<usize>.make()
+}
+unsafe fn settle(io: *mut fs_async.State, request: &mut Request, status: i32) -> () {
+  unsafe closeSockets(io, &mut request.*) request.exchange = Option<Exchange>.none() request.status = status
+  // A TCP try that still runs keeps the request until the pool returns it.
+  if Pointer.isNull<TcpTry>(request.tcp) { request.done = true }
+}
+unsafe fn cancel(pointer: *mut State, resolver: i32, status: i32) -> () {
+  let a = () let s = unsafe Pointer.borrow<(), State>(&a, pointer) let mut p = s.first let io = s.io drop s
+  while !Pointer.isNull<Request>(p) {
+    let mut b = () let r = unsafe Pointer.borrowMut<(), Request>(&mut b, unsafe nonnull(p)) p = r.next
+    if r.kind == QUERY && !r.done && !r.cancelled && (resolver == 0 || r.resolver == resolver) { r.cancelled = true unsafe settle(io, &mut r.*, status) }
+  }
+}
+
+fn statusOf(error: QueryError) -> i32 {
+  return match error {
+    QueryError.NoServers => ENOSERVER
+    QueryError.Timeout => ETIMEOUT
+    QueryError.Unreachable { .. } => ECONNREFUSED
+    QueryError.BadResponse { .. } => EBADRESP
+    QueryError.Rejected { responseCode, .. } => {
+      if responseCode == RCODE_FORMAT_ERROR { EFORMERR } else if responseCode == RCODE_SERVER_FAILURE { ESERVFAIL } else if responseCode == RCODE_NOT_IMPLEMENTED { ENOTIMP } else if responseCode == RCODE_REFUSED { EREFUSED } else { ESERVFAIL }
+    }
+  }
+}
+
+// Opens, binds and connects the UDP socket for `server`, and adds it to the reactor.
+unsafe effect fn serverSocket(io: *mut fs_async.State, request: &mut Request, server: usize, endpoint: Endpoint) -> usize ! DatagramError | OutOfMemoryError ? &mut Allocator {
+  let owners = request.owners.asSlice() let mut index: usize = 0
+  while index < owners.length && owners[index] != server { index = index + 1 }
+  if index < owners.length { return index }
+  let v4 = IpAddress.isV4(&Endpoint.address(&endpoint))
+  let mut socket = run NativeUdpSocket.open(if v4 { Family.V4 } else { Family.V6 })
+  let local = if v4 { request.local4 } else { request.local6 }
+  if let Option<Endpoint>.Some { value } = local { run socket.bind(value) }
+  run socket.connect(endpoint)
+  if !unsafe fs_async.watchDescriptor(io, NativeUdpSocket.rawDescriptor(&socket)) { Intrinsic.trap("a DNS socket cannot join the runtime reactor") }
+  run request.sockets.append(move socket) run request.owners.append(server)
+  return index
+}
+
+// Gives each waiting datagram to the exchange.
+unsafe effect fn receiveAll(request: &mut Request, buffer: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  let count = request.sockets.length() let mut index: usize = 0
+  while index < count {
+    let server = request.owners.asSlice()[index]
+    while true {
+      let socket = &mut request.sockets.asMutSlice()[index]
+      let received = run Effect.result(NativeUdpSocket.receive(&mut socket.*, Bytes.asMutSlice(&mut buffer.*)))
+      let size = match move received {
+        Result<Received, DatagramError>.Success { value } => match move value { Received.Datagram { count: found, .. } => found Received.WouldBlock => { break } }
+        Result<Received, DatagramError>.Failure { error } => {
+          // A refusal or other socket error means this server is out for the current try.
+          drop error
+          match &mut request.exchange { Option<Exchange>.Some { value: exchange } => Exchange.transportFailed(&mut exchange, server, Transport.Udp) Option<Exchange>.None => {} }
+          break
+        }
+      }
+      match &mut request.exchange {
+        Option<Exchange>.Some { value: exchange } => { let receipt = run Exchange.receive(&mut exchange, server, Transport.Udp, Slice.view<u8>(Bytes.asSlice(&buffer.*), 0, size)) drop receipt }
+        Option<Exchange>.None => { return () }
+      }
+    }
+    index = index + 1
+  }
+}
+
+// Advances one query as far as it goes without waiting. Returns the deadline it waits for, or 0.
+unsafe effect fn advance(pointer: *mut State, r: *mut Request, buffer: &mut Bytes) -> u64 ! OutOfMemoryError ? &mut Allocator {
+  let a = () let s = unsafe Pointer.borrow<(), State>(&a, pointer) let io = s.io drop s
+  let mut b = () let request = unsafe Pointer.borrowMut<(), Request>(&mut b, r)
+  if request.kind != QUERY || request.done { return 0 }
+  run unsafe collectTcp(&mut request.*)
+  if request.done || !Option<Exchange>.isSome(&request.exchange) { return 0 }
+  run unsafe receiveAll(&mut request.*, &mut buffer.*)
+  while true {
+    let current = run now()
+    let step = match &mut request.exchange { Option<Exchange>.Some { value } => Exchange.poll(&mut value, &current) Option<Exchange>.None => { return 0 } }
+    match move step {
+      Step.Done => { run unsafe finishQuery(io, &mut request.*) return 0 }
+      Step.Send { server, endpoint, transport } => {
+        if transport == Transport.Tcp { request.pendingTcp = Option<usize>.some(server) }
+        else {
+          let sent = run unsafe sendUdp(io, &mut request.*, server, endpoint)
+          if !sent { match &mut request.exchange { Option<Exchange>.Some { value } => { Exchange.transportFailed(&mut value, server, Transport.Udp) } Option<Exchange>.None => { return 0 } } }
+        }
+      }
+      Step.Wait { until } => {
+        let pending = Intrinsic.replace(request.pendingTcp, Option<usize>.none())
+        if let Option<usize>.Some { value: server } = pending {
+          if Pointer.isNull<TcpTry>(request.tcp) {
+            let started = run Effect.result(unsafe startTcp(io, &mut request.*, server, &until))
+            if let Result<(), OutOfMemoryError>.Failure { .. } = move started {
+              match &mut request.exchange { Option<Exchange>.Some { value } => { Exchange.transportFailed(&mut value, server, Transport.Tcp) } Option<Exchange>.None => { return 0 } }
+              continue
+            }
+          }
+        }
+        return nanosecondsOf(&until)
+      }
+    }
+  }
+  return 0
+}
+unsafe effect fn sendUdp(io: *mut fs_async.State, request: &mut Request, server: usize, endpoint: Endpoint) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let opened = run Effect.result(unsafe serverSocket(io, &mut request.*, server, endpoint))
+  let index = match move opened {
+    Result<usize, DatagramError | OutOfMemoryError>.Success { value } => value
+    Result<usize, DatagramError | OutOfMemoryError>.Failure { error } => match move error { OutOfMemoryError {} => { fail OutOfMemoryError {} } DatagramError failure => { drop failure return false } }
+  }
+  let packet = match &request.exchange { Option<Exchange>.Some { value } => Exchange.packet(&value, Transport.Udp) Option<Exchange>.None => { return false } }
+  let socket = &mut request.sockets.asMutSlice()[index]
+  let sent = run Effect.result(NativeUdpSocket.send(&mut socket.*, packet))
+  return match move sent {
+    Result<Sent, DatagramError>.Success { value } => match move value { Sent.Count { .. } => true Sent.WouldBlock => false }
+    Result<Sent, DatagramError>.Failure { error } => { drop error false }
+  }
+}
+// Turns the result of a finished exchange into a c-ares status and packet, as ares_query reports them.
+unsafe effect fn finishQuery(io: *mut fs_async.State, request: &mut Request) -> () ! OutOfMemoryError ? &mut Allocator {
+  let finished = Intrinsic.replace(request.exchange, Option<Exchange>.none())
+  let exchange = match move finished { Option<Exchange>.Some { value } => move value Option<Exchange>.None => { return () } }
+  match Exchange.finish(move exchange) {
+    Result<Reply, QueryError>.Success { value } => {
+      let code = value.message.header.responseCode
+      let mut status: i32 = 0
+      if code == RCODE_NAME_ERROR { status = ENOTFOUND } else if code != 0 { status = ESERVFAIL } else if value.message.answers.length() == 0 { status = ENODATA }
+      if status == 0 { run request.reply.appendSlice(Bytes.asSlice(&value.bytes)) }
+      unsafe settle(io, &mut request.*, status)
+    }
+    Result<Reply, QueryError>.Failure { error } => { unsafe settle(io, &mut request.*, statusOf(error)) }
+  }
+}
+unsafe effect fn startTcp(io: *mut fs_async.State, request: &mut Request, server: usize, until: &Instant) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut packet = List<u8>.make() let mut endpoint = Option<Endpoint>.none()
+  match &request.exchange {
+    Option<Exchange>.Some { value } => { run packet.appendSlice(Exchange.packet(&value, Transport.Tcp)) endpoint = Option<Endpoint>.some(Exchange.endpoint(&value, server)) }
+    Option<Exchange>.None => { return () }
+  }
+  let target = match endpoint { Option<Endpoint>.Some { value } => value Option<Endpoint>.None => { return () } }
+  let node = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut TcpTry>(run allocate(Layout.of<TcpTry>().bytes))
+  unsafe Pointer.put<TcpTry>(node, TcpTry { job: pool.job(silkDnsTcp, silkDnsTcpDone, unsafe raw(node)), endpoint: target, packet: move packet, seconds: SystemClock.seconds(until), nanoseconds: SystemClock.nanoseconds(until), reply: List<u8>.make(), ok: false, finished: false })
+  let mut b = () let t = unsafe Pointer.borrowMut<(), TcpTry>(&mut b, node)
+  let job = Pointer.fromMutRef<pool.Job>(&mut t.job) drop t
+  let queuedTcp = run unsafe fs_async.queueWork(io, job)
+  if queuedTcp != 0 { let failed = unsafe Pointer.take<TcpTry>(node) drop failed unsafe free(unsafe raw(node)) fail OutOfMemoryError {} }
+  request.tcp = node request.tcpServer = server
+}
+// Hands a finished TCP try to its exchange. A try that still runs is left alone.
+unsafe effect fn collectTcp(request: &mut Request) -> () ! OutOfMemoryError ? &mut Allocator {
+  if Pointer.isNull<TcpTry>(request.tcp) { return () }
+  let node = unsafe nonnull(request.tcp)
+  let a = () let t = unsafe Pointer.borrow<(), TcpTry>(&a, node) let finished = t.finished drop t
+  if !finished { return () }
+  let tried = unsafe Pointer.take<TcpTry>(node) unsafe free(unsafe raw(node)) request.tcp = Pointer.null<TcpTry>()
+  if request.cancelled || !Option<Exchange>.isSome(&request.exchange) { request.done = true return () }
+  match &mut request.exchange {
+    Option<Exchange>.Some { value } => {
+      if tried.ok { let receipt = run Exchange.receive(&mut value, request.tcpServer, Transport.Tcp, tried.reply.asSlice()) drop receipt }
+      else { Exchange.transportFailed(&mut value, request.tcpServer, Transport.Tcp) }
+    }
+    Option<Exchange>.None => ()
+  }
+}
+
+unsafe effect fn invokeBody<'m,S:EngineServices>(engine:&mut Engine<'m,S>, context:*mut HeapHeader, state:*mut State, operation:ValueBits, args:ValueBits, scope:&mut Scope)->ValueBits ! OutOfMemoryError|JsException ?&mut Allocator {
   let text = run host.text(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(operation)) let mut i: u32 = 0 while i < 4 { scope.values[u32.toUsize(i)] = run unsafe owners.getIndex(&mut engine, context, args, i) i = i + 1 } return run unsafe invoke(&mut engine, context, state, text.asSlice(), &scope.*)
 }
 pub unsafe effect fn dispatch<'m,S:EngineServices>(engine:&mut Engine<'m,S>, context:*mut HeapHeader, state:*mut State, operation:ValueBits, args:ValueBits)->ValueBits ! OutOfMemoryError|JsException ?&mut Allocator {
-  let mut scope = Scope.make() let result = run Effect.result(unsafe dispatchBody(&mut engine, context, state, operation, args, &mut scope)) unsafe owners.cleanup(&mut engine, context, move scope)
+  let mut scope = Scope.make() let result = run Effect.result(unsafe invokeBody(&mut engine, context, state, operation, args, &mut scope)) unsafe owners.cleanup(&mut engine, context, move scope)
   return match move result { Result<ValueBits, OutOfMemoryError|JsException>.Success { value } => value Result<ValueBits, OutOfMemoryError|JsException>.Failure { error } => { fail move error } }
 }
-unsafe fn takeDone(pointer:*mut State)->?*mut Request { let mut a = () let s = unsafe Pointer.borrowMut<(), State>(&mut a, pointer) let mut link = Pointer.fromMutRef<?*mut Request>(&mut s.first) drop s while !Pointer.isNull<Request>(unsafe Pointer.read<?*mut Request>(link)) { let p = unsafe nonnull(unsafe Pointer.read<?*mut Request>(link)) let r = unsafe Pointer.borrowMut<(), Request>(&mut a,p) if r.done { unsafe Pointer.put<?*mut Request>(link,r.next) return p } link = Pointer.fromMutRef<?*mut Request>(&mut r.next) } return Pointer.null<Request>() }
-unsafe fn release<'m,S:EngineServices>(engine:&mut Engine<'m,S>, context:*mut HeapHeader, p:*mut Request)->() { let r = unsafe Pointer.take<Request>(p) unsafe owners.release(&mut engine, context, r.callback) if !Pointer.isNull<abi.AddrInfo>(r.addresses) { unsafe abi.uv_freeaddrinfo(r.addresses) } unsafe free(r.native) unsafe free(r.data) unsafe free(r.serviceName) unsafe free(unsafe Intrinsic.pointerReinterpret<*mut Request,*mut u8>(p)) }
+unsafe fn takeDone(pointer:*mut State)->?*mut Request {
+  let mut a = () let s = unsafe Pointer.borrowMut<(), State>(&mut a, pointer) let mut link = Pointer.fromMutRef<?*mut Request>(&mut s.first) drop s
+  while !Pointer.isNull<Request>(unsafe Pointer.read<?*mut Request>(link)) {
+    let p = unsafe nonnull(unsafe Pointer.read<?*mut Request>(link)) let r = unsafe Pointer.borrowMut<(), Request>(&mut a,p)
+    if r.done { unsafe Pointer.put<?*mut Request>(link,r.next) return p }
+    link = Pointer.fromMutRef<?*mut Request>(&mut r.next)
+  }
+  return Pointer.null<Request>()
+}
+unsafe fn release<'m,S:EngineServices>(engine:&mut Engine<'m,S>, context:*mut HeapHeader, p:*mut Request)->() {
+  let r = unsafe Pointer.take<Request>(p) unsafe owners.release(&mut engine, context, r.callback)
+  if !Pointer.isNull<abi.AddrInfo>(r.addresses) { unsafe freeaddrinfo(unsafe nonnull(r.addresses)) }
+  drop r unsafe free(unsafe raw(p))
+}
 unsafe effect fn appendCString(out:&mut List<u8>, p:*const u8)->() ! OutOfMemoryError ?&mut Allocator { let bytes = unsafe Pointer.assumeMany<u8>(p) let mut i:usize = 0 while true { let byte = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(bytes,i)) if byte == 0 { break } run out.append(byte) i = i + 1 } }
 unsafe effect fn payload<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,p:*mut Request)->ValueBits ! OutOfMemoryError|JsException ?&mut Allocator {
   let a = () let r = unsafe Pointer.borrow<(),Request>(&a,p) if r.status != 0 { return ValueBits.Undefined } let mut out = List<u8>.make()
-  if r.kind == 2 { let memory = engine.memory return run unsafe buffers.newArrayBufferCopy(&mut engine, memory, unsafe lendRealm(&context, context), r.data, usize.toU64(r.length)) }
-  if r.kind == 0 { let mut node = r.addresses while !Pointer.isNull<abi.AddrInfo>(node) { let addr = unsafe Pointer.borrow<(),abi.AddrInfo>(&a,unsafe nonnull(node)) let mut text:[u8;256] = [0;256] let mut status:i32 = -1 let mut family:u8 = 0
+  if r.kind == QUERY { let memory = engine.memory let data = Pointer.fromRef<u8>(&r.reply.asSlice()[0]) return run unsafe buffers.newArrayBufferCopy(&mut engine, memory, unsafe lendRealm(&context, context), data, usize.toU64(r.reply.length())) }
+  if r.kind == LOOKUP { let mut node = r.addresses while !Pointer.isNull<abi.AddrInfo>(node) { let addr = unsafe Pointer.borrow<(),abi.AddrInfo>(&a,unsafe nonnull(node)) let mut text:[u8;256] = [0;256] let mut status:i32 = -1 let mut family:u8 = 0
     if !Pointer.isNull<u8>(addr.address) { if addr.family == 2 { status = unsafe net.uv_ip4_name(unsafe nonnull(addr.address),Pointer.fromMutRef<u8>(&mut text[0]),256) family = 52 } else if addr.family == abi.inet6() { status = unsafe net.uv_ip6_name(unsafe nonnull(addr.address),Pointer.fromMutRef<u8>(&mut text[0]),256) family = 54 } }
     if status == 0 { run out.append(family) run out.append(32) run unsafe appendCString(&mut out,Pointer.fromRef<u8>(&text[0])) run out.append(10) } node = addr.next
-  } } else if r.kind == 1 { run unsafe appendCString(&mut out,unsafe nonnull(r.data)) run out.append(10) run unsafe appendCString(&mut out,unsafe nonnull(r.serviceName)) }
+  } } else { run unsafe appendCString(&mut out,Pointer.fromRef<u8>(&r.host[0])) run out.append(10) run unsafe appendCString(&mut out,Pointer.fromRef<u8>(&r.serviceName[0])) }
   return (run host.string(&mut engine,unsafe lendRealm(&context, context),out.asSlice())).intoBits()
 }
 unsafe effect fn deliver<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,p:*mut Request)->() ! OutOfMemoryError|JsException ?&mut Allocator {
@@ -203,20 +609,57 @@ unsafe effect fn deliveryBody<'m,S:EngineServices>(engine:&mut Engine<'m,S>,cont
   let result = run promise.call(&mut engine,unsafe lendRealm(&context, context),unsafe lendFor(callback),unsafe lendFor(ValueBits.Undefined),&[ValueBits.Int { value:status },scope.values[0],scope.values[1]]) unsafe owners.release(&mut engine,context,result.intoBits())
 }
 pub unsafe fn hasPending(pointer:*mut State)->bool { let a = () let s = unsafe Pointer.borrow<(),State>(&a,pointer) return !Pointer.isNull<Request>(s.first) }
+// Advances every query, then tells the loop the earliest deadline among them.
+unsafe effect fn advanceAll(pointer:*mut State) -> () ! OutOfMemoryError ?&mut Allocator {
+  let a = () let s = unsafe Pointer.borrow<(),State>(&a,pointer) let mut p = s.first let io = s.io drop s
+  let mut buffer = run Bytes.zeroed(65535) let mut due: u64 = 0
+  while !Pointer.isNull<Request>(p) {
+    let r = unsafe nonnull(p) let entry = unsafe Pointer.borrow<(),Request>(&a,r) p = entry.next drop entry
+    let deadline = run unsafe advance(pointer, r, &mut buffer)
+    if deadline != 0 && (due == 0 || deadline < due) { due = deadline }
+  }
+  if due != 0 { unsafe fs_async.wakeAt(io, due) }
+  unsafe updateHold(pointer)
+}
 pub unsafe effect fn poll<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,pointer:*mut State)->bool ! OutOfMemoryError|JsException ?&mut Allocator {
-  let mut a = () let s = unsafe Pointer.borrowMut<(),State>(&mut a,pointer) if s.polling || s.closing { return false } s.polling = true let timer = s.timer drop s
-  let result = run Effect.result(unsafe drain(&mut engine,context,pointer))
-  let s2 = unsafe Pointer.borrowMut<(),State>(&mut a,pointer) s2.polling = false let mut p = s2.first let mut pendingQuery = false drop s2
-  while !Pointer.isNull<Request>(p) { let r = unsafe Pointer.borrow<(),Request>(&a,unsafe nonnull(p)) if r.kind == 2 && !r.done { pendingQuery = true } p = r.next }
-  if !pendingQuery { let ignored = unsafe abi.uv_timer_stop(timer) }
+  let mut a = () let s = unsafe Pointer.borrowMut<(),State>(&mut a,pointer) if s.polling || s.closing { return false } s.polling = true drop s
+  let advanced = run Effect.result(unsafe advanceAll(pointer))
+  let result = match move advanced { Result<(), OutOfMemoryError>.Success { .. } => run Effect.result(unsafe drain(&mut engine,context,pointer)) Result<(), OutOfMemoryError>.Failure { error } => Result<bool,OutOfMemoryError|JsException>.Failure { error: move error } }
+  let s2 = unsafe Pointer.borrowMut<(),State>(&mut a,pointer) s2.polling = false drop s2
   return match move result { Result<bool,OutOfMemoryError|JsException>.Success { value } => value Result<bool,OutOfMemoryError|JsException>.Failure { error } => { fail move error } }
 }
-unsafe effect fn drain<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,pointer:*mut State)->bool ! OutOfMemoryError|JsException ?&mut Allocator { let mut ran = false while true { let p = unsafe takeDone(pointer) if Pointer.isNull<Request>(p) { break } let r = unsafe nonnull(p) let result = run Effect.result(unsafe deliver(&mut engine,context,r)) unsafe release(&mut engine,context,r) match move result { Result<(),OutOfMemoryError|JsException>.Success { .. } => () Result<(),OutOfMemoryError|JsException>.Failure { error } => { fail move error } } ran = true } return ran }
+unsafe effect fn drain<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,pointer:*mut State)->bool ! OutOfMemoryError|JsException ?&mut Allocator {
+  let mut ran = false
+  while true {
+    let p = unsafe takeDone(pointer) if Pointer.isNull<Request>(p) { break } let r = unsafe nonnull(p)
+    let result = run Effect.result(unsafe deliver(&mut engine,context,r)) unsafe release(&mut engine,context,r)
+    match move result { Result<(),OutOfMemoryError|JsException>.Success { .. } => () Result<(),OutOfMemoryError|JsException>.Failure { error } => { fail move error } }
+    ran = true
+  }
+  unsafe updateHold(pointer)
+  return ran
+}
+// Ends every query with EDESTRUCTION, waits for lookups and TCP tries the blocking threads still
+// run, and frees every request without calling JavaScript.
 pub unsafe fn close<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,pointer:*mut State)->() {
-  let mut a = () let s = unsafe Pointer.borrowMut<(),State>(&mut a,pointer) s.closing = true let loop = s.loop let timer = s.timer let mut c = s.channels let mut p = s.first drop s
-  while !Pointer.isNull<Channel>(c) { let raw = unsafe nonnull(c) let entry = unsafe Pointer.take<Channel>(raw) c = entry.next unsafe abi.ares_destroy(entry.native) unsafe free(unsafe Intrinsic.pointerReinterpret<*mut Channel,*mut u8>(raw)) }
-  while !Pointer.isNull<Request>(p) { let r = unsafe Pointer.borrow<(),Request>(&a,unsafe nonnull(p)) if !r.done && !Pointer.isNull<u8>(r.native) { let ignored = unsafe abi.uv_cancel(unsafe nonnull(r.native)) } p = r.next }
-  let ignored = unsafe abi.uv_timer_stop(timer) unsafe net.uv_close(timer,timerClosed)
-  while true { while true { let ready = unsafe takeDone(pointer) if Pointer.isNull<Request>(ready) { break } unsafe release(&mut engine,context,unsafe nonnull(ready)) } let s2 = unsafe Pointer.borrow<(),State>(&a,pointer) let done = s2.timerClosed && Pointer.isNull<Request>(s2.first) drop s2 if done { break } let ignoredRun = unsafe uv.uv_run(loop,1) }
-  unsafe free(timer) unsafe free(unsafe Intrinsic.pointerReinterpret<*mut State,*mut u8>(pointer)) unsafe abi.ares_library_cleanup()
+  let mut a = () let s = unsafe Pointer.borrowMut<(),State>(&mut a,pointer) s.closing = true let io = s.io drop s
+  unsafe cancel(pointer, 0, EDESTRUCTION)
+  while true {
+    let s2 = unsafe Pointer.borrow<(),State>(&a,pointer) let mut p = s2.first drop s2 let mut busy = false
+    while !Pointer.isNull<Request>(p) {
+      let mut b = () let r = unsafe Pointer.borrowMut<(),Request>(&mut b,unsafe nonnull(p)) p = r.next
+      if !Pointer.isNull<TcpTry>(r.tcp) {
+        let t = unsafe Pointer.borrow<(),TcpTry>(&a,unsafe nonnull(r.tcp)) let finished = t.finished drop t
+        if finished { let tried = unsafe Pointer.take<TcpTry>(unsafe nonnull(r.tcp)) drop tried unsafe free(unsafe raw(unsafe nonnull(r.tcp))) r.tcp = Pointer.null<TcpTry>() r.done = true } else { busy = true }
+      }
+      if r.running { busy = true }
+    }
+    if !busy { break }
+    run unsafe fs_async.waitWork(io)
+  }
+  while true { let ready = unsafe takeDone(pointer) if Pointer.isNull<Request>(ready) { break } unsafe release(&mut engine,context,unsafe nonnull(ready)) }
+  let s3 = unsafe Pointer.borrowMut<(),State>(&mut a,pointer) let held = s3.held s3.held = false let mut resolver = s3.resolvers drop s3
+  if held { unsafe fs_async.unhold(io) }
+  while !Pointer.isNull<Resolver>(resolver) { let node = unsafe nonnull(resolver) let entry = unsafe Pointer.take<Resolver>(node) resolver = entry.next drop entry unsafe free(unsafe raw(node)) }
+  unsafe free(unsafe raw(pointer))
 }

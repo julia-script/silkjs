@@ -135,7 +135,7 @@ class Resolver {
   }
 }
 function resolverState(resolver) { const entry = state.get(resolver); if (!entry) { const e = new TypeError('Value of this must be of type Resolver'); e.code = 'ERR_INVALID_THIS'; throw e; } return entry; }
-function query(resolver, hostname, rrtype, options, cb, display = hostname, syscall = 'query' + rrtype) {
+function query(resolver, hostname, rrtype, options, cb, display = hostname, syscall = 'query' + rrtype[0] + rrtype.slice(1).toLowerCase()) {
   string(hostname, 'hostname'); callback(cb); object(options, 'options');
   if (options.ttl !== undefined && typeof options.ttl !== 'boolean') throw invalid('options.ttl', 'a boolean');
   const ttl = options.ttl === true;
