@@ -15,15 +15,26 @@ import silk.num.i64
 import silk.num.u8
 import silk.num.u16
 import silk.num.u32
+import silk.num.u64
 import silk.num.usize
-import byte_buffer { readU16 }
+import silk.simd.u8x16
+import silk.simd.u16x8
+import silk.simd.mask16
+import silk.simd.mask8
+import silk.simd.i64x2
+import byte_buffer { readU16, readU32 }
 import regexp_opcodes
-import regexp_types { RegExpMatch, Captures, RegExpTimeout, FLAG_UNICODE, FLAG_UNICODE_SETS }
+import regexp_types { RegExpMatch, Captures, INLINE_CAPTURES, RegExpTimeout, FLAG_UNICODE, FLAG_UNICODE_SETS, FLAG_HINT, HINT_LENGTH, HINT_LITERAL, HINT_REQUIRED, HINT_ANCHORED, HINT_FIRST_SET, HINT_SET_LENGTH, HINT_RUN_BYTES, HINT_RUN_UNITS,
+  REOP_CLASS, REOP_CLASS_I, CLASS_BITS_LENGTH, REOP_STAR, REOP_PLUS }
 import unicode_case { UnicodeCase }
 
 const STATE_SPLIT: i64 = 0
 const STATE_LOOKAHEAD: i64 = 1
 const STATE_NEGATIVE_LOOKAHEAD: i64 = 2
+// A greedy one-character loop's pending exits (greedyLoop): the frame's pc word
+// holds the exit pc in its low 32 bits and the lowest position in the high ones;
+// its position word is the next position to resume at, counting down.
+const STATE_STAR: i64 = 3
 const INTERRUPT_COUNTER_INIT: u32 = 10000
 // Undo-log words kept on the native stack before the log moves to the heap.
 const UNDO_INLINE: usize = 256
@@ -34,6 +45,17 @@ interface Units {
   fn holdsWords(self: &Self) -> bool
   // `position` is below the input length; every caller checks it first.
   fn codeUnitAt(self: &Self, position: usize) -> u32
+  // The first position from `from` below `length` holding `unit`, or `length`.
+  fn findUnit(self: &Self, unit: u32, from: usize, length: usize) -> usize
+  // The first position from `from` below `length` holding a, b or c (each at
+  // most 255) or a unit above 255, or `length`.
+  fn findAny(self: &Self, a: u32, b: u32, c: u32, from: usize, length: usize) -> usize
+  // Whether the count units from at equal the count bytes at bytes (the caller
+  // keeps at + count within the input).
+  fn equalsBytes(self: &Self, at: usize, bytes: [*]const u8, count: usize) -> bool
+  // Whether the count units from at equal the count two-byte units (low byte
+  // first) at bytes, under equalsBytes's bounds.
+  fn equalsUnits(self: &Self, at: usize, bytes: [*]const u8, count: usize) -> bool
 }
 
 struct Narrow { bytes: ?[*]const u8 }
@@ -46,6 +68,90 @@ impl Units for Narrow {
   fn codeUnitAt(self: &Self, position: usize) -> u32 {
     unsafe { return u8.toU32(Pointer.read<u8>(Pointer.at<u8>(Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(self.bytes), position))) }
   }
+  // Sixteen bytes a step: one compare and mask per vector.
+  @inlineAlways
+  fn findUnit(self: &Self, unit: u32, from: usize, length: usize) -> usize {
+    if unit > 255 { return length }
+    let base = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(self.bytes)
+    let pattern = u8x16.splat(u32.toU8(unit))
+    let mut at = from
+    while at < length && length - at >= 16 {
+      let hits = mask16.toBits(u8x16.lanesEqual(unsafe u8x16.loadUnchecked(unsafe Pointer.assumeMany<u8>(unsafe Pointer.at<u8>(base, at))), pattern))
+      if hits != 0 { return at + u32.toUsize(u64.trailingZeros(hits)) }
+      at = at + 16
+    }
+    // The last block overlaps the one before: the vector ending at length, with
+    // the lanes before at masked off.
+    if at < length && length >= 16 {
+      let block = length - 16
+      let hits = u64.shiftRight(mask16.toBits(u8x16.lanesEqual(unsafe u8x16.loadUnchecked(unsafe Pointer.assumeMany<u8>(unsafe Pointer.at<u8>(base, block))), pattern)), usize.toU64(at - block))
+      if hits != 0 { return at + u32.toUsize(u64.trailingZeros(hits)) }
+      return length
+    }
+    while at < length && u8.toU32(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(base, at))) != unit { at = at + 1 }
+    return at
+  }
+  fn equalsBytes(self: &Self, at: usize, bytes: [*]const u8, count: usize) -> bool {
+    let base = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(self.bytes)
+    let mut k: usize = 0
+    while count - k >= 8 {
+      let left = unsafe Pointer.readUnaligned<u64>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u64>(unsafe Pointer.at<u8>(base, usize.wrappingAdd(at, k))))
+      let right = unsafe Pointer.readUnaligned<u64>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u64>(unsafe Pointer.at<u8>(bytes, k)))
+      if left != right { return false }
+      k = k + 8
+    }
+    if count - k >= 4 {
+      let left = unsafe Pointer.readUnaligned<u32>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u32>(unsafe Pointer.at<u8>(base, usize.wrappingAdd(at, k))))
+      let right = unsafe Pointer.readUnaligned<u32>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u32>(unsafe Pointer.at<u8>(bytes, k)))
+      if left != right { return false }
+      k = k + 4
+    }
+    while k < count {
+      if unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(base, usize.wrappingAdd(at, k))) != unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(bytes, k)) { return false }
+      k = k + 1
+    }
+    return true
+  }
+  // The run holds a unit above 255 (see HINT_RUN_UNITS), so it compares unit by unit.
+  fn equalsUnits(self: &Self, at: usize, bytes: [*]const u8, count: usize) -> bool {
+    let mut k: usize = 0
+    while k < count {
+      let low = u8.toU32(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(bytes, k + k)))
+      let high = u8.toU32(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(bytes, k + k + 1)))
+      if self.codeUnitAt(usize.wrappingAdd(at, k)) != low + high * 256 { return false }
+      k = k + 1
+    }
+    return true
+  }
+  fn findAny(self: &Self, a: u32, b: u32, c: u32, from: usize, length: usize) -> usize {
+    let base = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(self.bytes)
+    let first = u8x16.splat(u32.toU8(a))
+    let second = u8x16.splat(u32.toU8(b))
+    let third = u8x16.splat(u32.toU8(c))
+    let mut at = from
+    while at < length && length - at >= 16 {
+      let block = unsafe u8x16.loadUnchecked(unsafe Pointer.assumeMany<u8>(unsafe Pointer.at<u8>(base, at)))
+      let hits = u64.bitOr(u64.bitOr(mask16.toBits(u8x16.lanesEqual(block, first)), mask16.toBits(u8x16.lanesEqual(block, second))),
+        mask16.toBits(u8x16.lanesEqual(block, third)))
+      if hits != 0 { return at + u32.toUsize(u64.trailingZeros(hits)) }
+      at = at + 16
+    }
+    // The overlapping last block, as findUnit.
+    if at < length && length >= 16 {
+      let block = length - 16
+      let tail = unsafe u8x16.loadUnchecked(unsafe Pointer.assumeMany<u8>(unsafe Pointer.at<u8>(base, block)))
+      let hits = u64.shiftRight(u64.bitOr(u64.bitOr(mask16.toBits(u8x16.lanesEqual(tail, first)), mask16.toBits(u8x16.lanesEqual(tail, second))),
+        mask16.toBits(u8x16.lanesEqual(tail, third))), usize.toU64(at - block))
+      if hits != 0 { return at + u32.toUsize(u64.trailingZeros(hits)) }
+      return length
+    }
+    while at < length {
+      let code = u8.toU32(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(base, at)))
+      if code == a || code == b || code == c { return at }
+      at = at + 1
+    }
+    return at
+  }
 }
 
 impl Units for Wide {
@@ -54,6 +160,68 @@ impl Units for Wide {
   @inlineAlways
   fn codeUnitAt(self: &Self, position: usize) -> u32 {
     unsafe { return u16.toU32(Pointer.read<u16>(Pointer.at<u16>(Intrinsic.pointerRequalify<?[*]const u16, [*]const u16>(self.words), position))) }
+  }
+  // Eight units a step, as Narrow.findUnit.
+  @inlineAlways
+  fn findUnit(self: &Self, unit: u32, from: usize, length: usize) -> usize {
+    if unit > 0xffff { return length }
+    let base = unsafe Intrinsic.pointerRequalify<?[*]const u16, [*]const u16>(self.words)
+    let pattern = u16x8.splat(u32.toU16(unit))
+    let mut at = from
+    while at < length && length - at >= 8 {
+      let hits = mask8.toBits(u16x8.lanesEqual(unsafe u16x8.loadUnchecked(unsafe Pointer.assumeMany<u16>(unsafe Pointer.at<u16>(base, at))), pattern))
+      if hits != 0 { return at + u32.toUsize(u64.trailingZeros(hits)) }
+      at = at + 8
+    }
+    while at < length && self.codeUnitAt(at) != unit { at = at + 1 }
+    return at
+  }
+  fn equalsBytes(self: &Self, at: usize, bytes: [*]const u8, count: usize) -> bool {
+    let mut k: usize = 0
+    while k < count {
+      if self.codeUnitAt(usize.wrappingAdd(at, k)) != u8.toU32(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(bytes, k))) { return false }
+      k = k + 1
+    }
+    return true
+  }
+  // Four units a step as one 64-bit word, then units.
+  fn equalsUnits(self: &Self, at: usize, bytes: [*]const u8, count: usize) -> bool {
+    let base = unsafe Intrinsic.pointerReinterpret<[*]const u16, [*]const u8>(unsafe Intrinsic.pointerRequalify<?[*]const u16, [*]const u16>(self.words))
+    let from = usize.wrappingAdd(at, at)
+    let total = count + count
+    let mut k: usize = 0
+    while total - k >= 8 {
+      let left = unsafe Pointer.readUnaligned<u64>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u64>(unsafe Pointer.at<u8>(base, usize.wrappingAdd(from, k))))
+      let right = unsafe Pointer.readUnaligned<u64>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u64>(unsafe Pointer.at<u8>(bytes, k)))
+      if left != right { return false }
+      k = k + 8
+    }
+    while k < total {
+      if unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(base, usize.wrappingAdd(from, k))) != unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(bytes, k)) { return false }
+      k = k + 1
+    }
+    return true
+  }
+  fn findAny(self: &Self, a: u32, b: u32, c: u32, from: usize, length: usize) -> usize {
+    let base = unsafe Intrinsic.pointerRequalify<?[*]const u16, [*]const u16>(self.words)
+    let first = u16x8.splat(u32.toU16(a))
+    let second = u16x8.splat(u32.toU16(b))
+    let third = u16x8.splat(u32.toU16(c))
+    let latin = u16x8.splat(255)
+    let mut at = from
+    while at < length && length - at >= 8 {
+      let block = unsafe u16x8.loadUnchecked(unsafe Pointer.assumeMany<u16>(unsafe Pointer.at<u16>(base, at)))
+      let hits = u64.bitOr(u64.bitOr(mask8.toBits(u16x8.lanesEqual(block, first)), mask8.toBits(u16x8.lanesEqual(block, second))),
+        u64.bitOr(mask8.toBits(u16x8.lanesEqual(block, third)), mask8.toBits(u16x8.lanesGreater(block, latin))))
+      if hits != 0 { return at + u32.toUsize(u64.trailingZeros(hits)) }
+      at = at + 8
+    }
+    while at < length {
+      let code = self.codeUnitAt(at)
+      if code == a || code == b || code == c || code > 255 { return at }
+      at = at + 1
+    }
+    return at
   }
 }
 
@@ -117,10 +285,14 @@ fn slots(words: ?*mut i64) -> [*]mut i64 {
 struct Storage {
   inlineWords: ?*mut i64,
   heap: List<i64>,
-  inlineValues: [i64; 32],
+  inlineValues: ?*mut i64,
   spill: List<i64>
 }
 
+@inlineAlways
+fn registerStore(values: ?*mut i64, index: usize, value: i64) -> () {
+  unsafe { Pointer.write<i64>(Pointer.atMut<i64>(slots(values), index), value) }
+}
 @inlineAlways
 fn registerAt(values: ?*mut i64, index: usize) -> i64 {
   unsafe { return Pointer.read<i64>(Pointer.atMut<i64>(slots(values), index)) }
@@ -155,6 +327,14 @@ effect fn growUndo(storage: ?*mut Storage, capacity: usize) -> Grown
   }
 }
 
+// A register file of more than 32 registers, all unset, in storage's spill list.
+@inlineNever
+effect fn spillRegisters(storage: &mut Storage, registerCount: usize) -> ?*mut i64 ! OutOfMemoryError ? &mut Allocator {
+  run List<i64>.reserveExact(&mut storage.spill, registerCount)
+  run List<i64>.appendRepeated(&mut storage.spill, -1, registerCount)
+  return Pointer.fromMutRef<i64>(&mut List<i64>.asMutSlice(&mut storage.spill)[0])
+}
+
 struct Frame {
   pc: usize,
   position: usize,
@@ -180,12 +360,25 @@ struct Machine {
 
 impl Machine {
   // `storage` must outlive the machine and stay in place.
+  @inlineAlways
   effect fn make(storage: &mut Storage, registerCount: usize) -> Self ! OutOfMemoryError ? &mut Allocator {
-    let mut values = Pointer.fromMutRef<i64>(&mut storage.inlineValues[0])
-    if registerCount > 32 {
-      run List<i64>.reserveExact(&mut storage.spill, registerCount)
-      run List<i64>.appendRepeated(&mut storage.spill, -1, registerCount)
-      values = Pointer.fromMutRef<i64>(&mut List<i64>.asMutSlice(&mut storage.spill)[0])
+    let mut values = storage.inlineValues
+    if registerCount <= 32 {
+      // Only the live registers start unset: filling all 32 cost every exec. The
+      // first eight (of the 32 inline) are four vector stores, so the common
+      // small program does not call memset.
+      let unset = i64x2.splat(-1)
+      let base = slots(values)
+      unsafe {
+        i64x2.storeUnchecked(base, unset)
+        i64x2.storeUnchecked(Pointer.assumeManyMut<i64>(Pointer.atMut<i64>(base, 2)), unset)
+        i64x2.storeUnchecked(Pointer.assumeManyMut<i64>(Pointer.atMut<i64>(base, 4)), unset)
+        i64x2.storeUnchecked(Pointer.assumeManyMut<i64>(Pointer.atMut<i64>(base, 6)), unset)
+      }
+      let mut index: usize = 8
+      while index < registerCount { registerStore(values, index, -1) index = index + 1 }
+    } else {
+      values = run spillRegisters(&mut storage, registerCount)
     }
     return Machine { values: values, words: storage.inlineWords, capacity: UNDO_INLINE, length: 0, base: 0, storage: Pointer.fromMutRef<Storage>(&mut storage) }
   }
@@ -229,6 +422,10 @@ impl Machine {
   @inlineAlways
   effect fn save(self: &mut Self, index: usize, value: i64, check: bool) -> ()
     ! OutOfMemoryError ? &mut Allocator {
+    // Writing the value a register already holds changes nothing to undo (a
+    // reset of captures that are still unset, mostly).
+    let previous = Machine.register(&self, index)
+    if previous == value { return () }
     let mut saved = false
     if check {
       let mut cursor = self.length
@@ -241,7 +438,6 @@ impl Machine {
       }
     }
     if !saved {
-      let previous = Machine.register(&self, index)
       let at = run Machine.reserve(&mut self, 2)
       Machine.setWord(&mut self, at, usize.wrappingToI64(index))
       Machine.setWord(&mut self, usize.wrappingAdd(at, 1), previous)
@@ -292,6 +488,17 @@ impl Machine {
   fn backtrack(self: &mut Self) -> Resume {
     while self.base != 0 {
       Machine.undo(&mut self)
+      let top = self.base
+      if usize.bitAnd(i64.wrappingToUsize(Machine.word(&self, usize.wrappingSubtract(top, 1))), 3) == 3 {
+        // STATE_STAR: resume at the exit one position lower, keeping the frame
+        // while lower positions remain.
+        let packed = i64.wrappingToUsize(Machine.word(&self, usize.wrappingSubtract(top, 3)))
+        let position = i64.wrappingToUsize(Machine.word(&self, usize.wrappingSubtract(top, 2)))
+        if position > usize.shiftRight(packed, 32) {
+          Machine.setWord(&mut self, usize.wrappingSubtract(top, 2), usize.wrappingToI64(position - 1))
+        } else { let finished = Machine.popFrame(&mut self) }
+        return Resume { exists: true, pc: usize.bitAnd(packed, 0xffffffff), position: position }
+      }
       let frame = Machine.popFrame(&mut self)
       if frame.kind != STATE_LOOKAHEAD {
         return Resume { exists: true, pc: frame.pc, position: frame.position }
@@ -370,6 +577,17 @@ fn rangeContains(bytecode: &[u8], offset: usize, count: usize, code: u32, wide: 
   let table = unsafe Pointer.at<u8>(unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(bytecode)), offset)
   let many = unsafe Pointer.assumeMany<u8>(table)
   if !wide && code >= 0xffff && unsafe rangeU16(many, (count - 1) * 4 + 2) == 0xffff { return true }
+  // A Latin-1 unit is decided by the table's first few ranges (they are sorted),
+  // so a forward scan beats the binary search's longer steps.
+  if !wide && code < 256 {
+    let mut i: usize = 0
+    while i < count {
+      if code < u16.toU32(unsafe rangeU16(many, i * 4)) { return false }
+      if code <= u16.toU32(unsafe rangeU16(many, i * 4 + 2)) { return true }
+      i = i + 1
+    }
+    return false
+  }
   let mut low: usize = 0
   let mut high = count
   while low < high {
@@ -423,8 +641,16 @@ struct Advance {
 @inlineAlways
 fn consume<U: Units>(input: &ExecInput<U>, position: usize, fold: bool) -> Character {
   let character = stepForward(input, position, input.length)
-  if fold { return Character { code: UnicodeCase.canonicalize(character.code, input.unicode), position: character.position } }
+  if fold { return Character { code: foldCode(character.code, input.unicode), position: character.position } }
   return move character
+}
+/// UnicodeCase.canonicalize with its ASCII case inline.
+@inlineAlways
+fn foldCode(c: u32, unicode: bool) -> u32 {
+  if c >= 128 { return UnicodeCase.canonicalize(c, unicode) }
+  if unicode { if c >= 0x41 && c <= 0x5a { return c + 0x20 } }
+  else if c >= 0x61 && c <= 0x7a { return c - 0x20 }
+  return c
 }
 
 @inlineAlways
@@ -440,6 +666,18 @@ fn classRange<U: Units>(bytecode: &[u8], pc: usize, count: usize, input: &ExecIn
   if position >= input.length { return Advance { position: position, failed: true } }
   let character = consume(input, position, fold)
   return Advance { position: character.position, failed: !rangeContains(bytecode, pc, count, character.code, wide) }
+}
+
+/// Whether the REOP_CLASS(_I) class whose count-range table is at table holds
+/// code: by its bitmap for a Latin-1 unit (already folded for REOP_CLASS_I),
+/// else by the table, folding first when fold.
+@inlineAlways
+fn classHas(bytecode: &[u8], ops: [*]const u8, table: usize, count: usize, code: u32, fold: bool, unicode: bool) -> bool {
+  if code <= 255 {
+    return (u32.shiftRight(u8.toU32(unsafe op8(ops, table + count * 4 + u32.toUsize(u32.shiftRight(code, 3)))), code & 7) & 1) != 0
+  }
+  if fold { return rangeContains(bytecode, table, count, foldCode(code, unicode), false) }
+  return rangeContains(bytecode, table, count, code, false)
 }
 
 @inlineAlways
@@ -488,8 +726,8 @@ fn backReference<U: Units>(bytecode: &[u8], candidates: usize, count: usize, reg
           second = b.code
         }
         if ignoreCase {
-          first = UnicodeCase.canonicalize(first, input.unicode)
-          second = UnicodeCase.canonicalize(second, input.unicode)
+          first = foldCode(first, input.unicode)
+          second = foldCode(second, input.unicode)
         }
         if first != second { return Advance { position: position, failed: true } }
       }
@@ -537,21 +775,74 @@ impl RegExpExecutor {
   pub effect fn execute8<'env>(bytecode: &[u8], input: &[u8], start: usize,
     mut interrupted: for<use 'call> mut fn<'env>() -> once Effect<'call & 'env; bool ? &mut Allocator>) -> RegExpMatch
     ! OutOfMemoryError | RegExpTimeout ? &mut Allocator {
-    let flags = u16.toU32(readU16(bytecode, regexp_opcodes.RE_HEADER_FLAGS))
-    let view = ExecInput<Narrow> { units: Narrow { bytes: Pointer.fromSlice<u8>(input) },
-      unicode: (flags & (FLAG_UNICODE | FLAG_UNICODE_SETS)) != 0, length: input.length }
-    return run execute(bytecode, &view, start, move interrupted)
+    let mut captures = Captures.empty()
+    let matched = run RegExpExecutor.match8(bytecode, input, start, move interrupted, &mut captures)
+    if !matched { return RegExpMatch { matched: false, captures: Captures.empty() } }
+    return RegExpMatch { matched: true, captures: move captures }
   }
 
   /// Executes against UTF-16; captures always count code units, including in u/v modes.
   pub effect fn execute16<'env>(bytecode: &[u8], input: &[u16], start: usize,
     mut interrupted: for<use 'call> mut fn<'env>() -> once Effect<'call & 'env; bool ? &mut Allocator>) -> RegExpMatch
     ! OutOfMemoryError | RegExpTimeout ? &mut Allocator {
+    let mut captures = Captures.empty()
+    let matched = run RegExpExecutor.match16(bytecode, input, start, move interrupted, &mut captures)
+    if !matched { return RegExpMatch { matched: false, captures: Captures.empty() } }
+    return RegExpMatch { matched: true, captures: move captures }
+  }
+
+  /// execute8 that writes a match's offsets into out (left as it was without a
+  /// match) and returns whether there was one, so no match record is copied.
+  @inlineAlways
+  pub effect fn match8<'env>(bytecode: &[u8], input: &[u8], start: usize,
+    mut interrupted: for<use 'call> mut fn<'env>() -> once Effect<'call & 'env; bool ? &mut Allocator>, out: &mut Captures) -> bool
+    ! OutOfMemoryError | RegExpTimeout ? &mut Allocator {
+    let flags = u16.toU32(readU16(bytecode, regexp_opcodes.RE_HEADER_FLAGS))
+    let view = ExecInput<Narrow> { units: Narrow { bytes: Pointer.fromSlice<u8>(input) },
+      unicode: (flags & (FLAG_UNICODE | FLAG_UNICODE_SETS)) != 0, length: input.length }
+    return run execute(bytecode, &view, start, move interrupted, &mut out)
+  }
+
+  /// The unit count of a program whose whole match is one run of Latin-1 units
+  /// (HINT_LITERAL with HINT_RUN_BYTES), else 0. findLiteral8 then finds its
+  /// matches in Latin-1 input without the matcher.
+  pub fn literalCount(bytecode: &[u8]) -> usize {
+    let at = literalHint(bytecode)
+    if at == 0 { return 0 }
+    return u16.toUsize(readU16(bytecode, at + 4)) & 255
+  }
+
+  /// The first position at or after start where a literalCount program matches
+  /// Latin-1 input, or -1.
+  pub fn findLiteral8(bytecode: &[u8], input: &[u8], start: usize) -> i64 {
+    let hint = literalHint(bytecode)
+    if hint == 0 { Intrinsic.trap("findLiteral8 needs a literal program") }
+    let packed = u16.toUsize(readU16(bytecode, hint + 4))
+    let count = packed & 255
+    let view = ExecInput<Narrow> { units: Narrow { bytes: Pointer.fromSlice<u8>(input) }, unicode: false, length: input.length }
+    return literalSearch(opcodes(bytecode), u16.toUsize(readU16(bytecode, hint + 2)), count, packed / 256, hint - count, false, &view, start)
+  }
+
+  /// execute16 in match8's form.
+  @inlineAlways
+  pub effect fn match16<'env>(bytecode: &[u8], input: &[u16], start: usize,
+    mut interrupted: for<use 'call> mut fn<'env>() -> once Effect<'call & 'env; bool ? &mut Allocator>, out: &mut Captures) -> bool
+    ! OutOfMemoryError | RegExpTimeout ? &mut Allocator {
     let flags = u16.toU32(readU16(bytecode, regexp_opcodes.RE_HEADER_FLAGS))
     let view = ExecInput<Wide> { units: Wide { words: Pointer.fromSlice<u16>(input) },
       unicode: (flags & (FLAG_UNICODE | FLAG_UNICODE_SETS)) != 0, length: input.length }
-    return run execute(bytecode, &view, start, move interrupted)
+    return run execute(bytecode, &view, start, move interrupted, &mut out)
   }
+}
+
+/// The trailer offset of a literalCount program's hint, else 0.
+fn literalHint(bytecode: &[u8]) -> usize {
+  if bytecode.length <= regexp_opcodes.RE_HEADER_LEN { return 0 }
+  if (u16.toU32(readU16(bytecode, regexp_opcodes.RE_HEADER_FLAGS)) & FLAG_HINT) == 0 { return 0 }
+  let hint = regexp_opcodes.RE_HEADER_LEN + u32.toUsize(readU32(bytecode, regexp_opcodes.RE_HEADER_BYTECODE_LEN)) - HINT_LENGTH
+  let kindByte = bytecode[hint + 1]
+  if u8.bitAnd(kindByte, 31) != HINT_LITERAL || u8.bitAnd(kindByte, HINT_RUN_BYTES) == 0 { return 0 }
+  return hint
 }
 
 /// The first position from position on where the step at first (opcode op, a
@@ -563,9 +854,7 @@ fn skipAhead<U: Units>(bytecode: &[u8], first: usize, op: u8, input: &ExecInput<
   let mut at = position
   if op == regexp_opcodes.REOP_line_start { return input.length }
   if op == regexp_opcodes.REOP_char {
-    let unit = u16.toU32(unsafe rangeU16(ops, first + 1))
-    while at < input.length && unitAt(input, at) != unit { at = usize.wrappingAdd(at, 1) }
-    return at
+    return input.units.findUnit(u16.toU32(unsafe rangeU16(ops, first + 1)), at, input.length)
   }
   if op == regexp_opcodes.REOP_space {
     while at < input.length && !UnicodeCase.isSpace(unitAt(input, at)) { at = usize.wrappingAdd(at, 1) }
@@ -581,56 +870,269 @@ fn skipAhead<U: Units>(bytecode: &[u8], first: usize, op: u8, input: &ExecInput<
     return at
   }
   let count = u16.toUsize(unsafe rangeU16(ops, first + 1))
+  if op == REOP_CLASS || op == REOP_CLASS_I {
+    let fold = op == REOP_CLASS_I
+    while at < input.length && !classHas(bytecode, ops, first + 3, count, unitAt(input, at), fold, input.unicode) { at = usize.wrappingAdd(at, 1) }
+    return at
+  }
+  if op == regexp_opcodes.REOP_range {
+    let bits = latinClass(ops, first + 3, count)
+    while at < input.length && !inClass(&bits, bytecode, first + 3, count, input, at) { at = usize.wrappingAdd(at, 1) }
+    return at
+  }
   let wide = op == regexp_opcodes.REOP_range32 || op == regexp_opcodes.REOP_range32_i
   let ignoreCase = op == regexp_opcodes.REOP_range_i || op == regexp_opcodes.REOP_range32_i
   while at < input.length && classRange(bytecode, first + 3, count, input, at, wide, ignoreCase).failed { at = usize.wrappingAdd(at, 1) }
   return at
 }
 
+/// The Latin-1 members of the count-range REOP_range table at table, one bit
+/// per code unit.
+@inlineAlways
+fn latinClass(ops: [*]const u8, table: usize, count: usize) -> [u64; 4] {
+  let mut bits: [u64; 4] = [0; 4]
+  let mut i: usize = 0
+  while i < count {
+    let low = u16.toUsize(unsafe rangeU16(ops, table + i * 4))
+    if low > 255 { break }
+    let mut high = u16.toUsize(unsafe rangeU16(ops, table + i * 4 + 2))
+    if high > 255 { high = 255 }
+    // Bits from..to of a word are 2^(to+1) - 2^from (mod 2^64); rotating 1
+    // never traps, unlike a shift, so the mask needs no range checks.
+    let mut word = low / 64
+    let last = high / 64
+    while word <= last {
+      let mut from: usize = 0
+      if word == low / 64 { from = low & 63 }
+      let mut to: usize = 63
+      if word == last { to = high & 63 }
+      let top = u64.rotateLeft(1, usize.toU64(to))
+      bits[word] = u64.bitOr(bits[word], u64.wrappingAdd(u64.wrappingSubtract(top, u64.rotateLeft(1, usize.toU64(from))), top))
+      word = word + 1
+    }
+    i = i + 1
+  }
+  return bits
+}
+@inlineAlways
+fn inClass<U: Units>(bits: &[u64; 4], bytecode: &[u8], table: usize, count: usize, input: &ExecInput<U>, position: usize) -> bool {
+  let code = unitAt(input, position)
+  if code <= 255 { return u64.bitAnd(u64.shiftRight(bits[u32.toUsize(code / 64)], u32.toU64(code & 63)), 1) != 0 }
+  return rangeContains(bytecode, table, count, code, false)
+}
+
+/// The first position from position on whose unit is above 255 or in the
+/// compiler's first-unit bitmap at setAt (HINT_FIRST_SET), or the input's end.
+@inlineNever
+fn skipToSet<U: Units>(ops: [*]const u8, setAt: usize, input: &ExecInput<U>, position: usize) -> usize {
+  let mut bits: [u64; 4] = [0; 4]
+  let mut word: usize = 0
+  while word < 4 {
+    bits[word] = unsafe Pointer.readUnaligned<u64>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u64>(unsafe Pointer.at<u8>(ops, setAt + word * 8)))
+    word = word + 1
+  }
+  // A set of at most three units (a letter's two cases, say) is searched for
+  // sixteen units at a time.
+  let members = u32.toUsize(u64.countOnes(bits[0])) + u32.toUsize(u64.countOnes(bits[1])) + u32.toUsize(u64.countOnes(bits[2])) + u32.toUsize(u64.countOnes(bits[3]))
+  if members >= 1 && members <= 3 {
+    let mut units: [u32; 3] = [0; 3]
+    let mut found: usize = 0
+    word = 0
+    while word < 4 {
+      let mut rest = bits[word]
+      while rest != 0 {
+        units[found] = usize.toU32(word * 64 + u32.toUsize(u64.trailingZeros(rest)))
+        found = found + 1
+        rest = u64.bitAnd(rest, u64.wrappingSubtract(rest, 1))
+      }
+      word = word + 1
+    }
+    if found < 2 { units[1] = units[0] }
+    if found < 3 { units[2] = units[0] }
+    return input.units.findAny(units[0], units[1], units[2], position, input.length)
+  }
+  let mut at = position
+  while at < input.length {
+    let code = unitAt(input, at)
+    if code > 255 || u64.bitAnd(u64.shiftRight(bits[u32.toUsize(code / 64)], u32.toU64(code & 63)), 1) != 0 { return at }
+    at = usize.wrappingAdd(at, 1)
+  }
+  return at
+}
+
+/// The position after matching the one-character step at at (see regexp_compile's
+/// starStep) as
+/// many times as it matches from position on.
+@inlineNever
+fn greedyRun<U: Units>(bytecode: &[u8], ops: [*]const u8, at: usize, input: &ExecInput<U>, position: usize) -> usize {
+  let opcode = unsafe op8(ops, at)
+  let mut end = position
+  if opcode == regexp_opcodes.REOP_char {
+    let unit = u16.toU32(unsafe rangeU16(ops, at + 1))
+    while end < input.length && unitAt(input, end) == unit { end = usize.wrappingAdd(end, 1) }
+  } else if opcode == regexp_opcodes.REOP_char_i {
+    let unit = u16.toU32(unsafe rangeU16(ops, at + 1))
+    while !literal(input, end, unit, true).failed { end = usize.wrappingAdd(end, 1) }
+  } else if opcode == regexp_opcodes.REOP_dot {
+    while end < input.length && !isLineTerminator(unitAt(input, end)) { end = usize.wrappingAdd(end, 1) }
+  } else if opcode == regexp_opcodes.REOP_any {
+    end = input.length
+  } else if opcode == regexp_opcodes.REOP_space {
+    while end < input.length && UnicodeCase.isSpace(unitAt(input, end)) { end = usize.wrappingAdd(end, 1) }
+  } else if opcode == regexp_opcodes.REOP_not_space {
+    while end < input.length && !UnicodeCase.isSpace(unitAt(input, end)) { end = usize.wrappingAdd(end, 1) }
+  } else if opcode == REOP_CLASS || opcode == REOP_CLASS_I {
+    let count = u16.toUsize(unsafe rangeU16(ops, at + 1))
+    let fold = opcode == REOP_CLASS_I
+    while end < input.length && classHas(bytecode, ops, at + 3, count, unitAt(input, end), fold, input.unicode) { end = usize.wrappingAdd(end, 1) }
+  } else if opcode == regexp_opcodes.REOP_range {
+    let count = u16.toUsize(unsafe rangeU16(ops, at + 1))
+    let bits = latinClass(ops, at + 3, count)
+    while end < input.length && inClass(&bits, bytecode, at + 3, count, input, end) { end = usize.wrappingAdd(end, 1) }
+  } else {
+    let count = u16.toUsize(unsafe rangeU16(ops, at + 1))
+    let wide = opcode == regexp_opcodes.REOP_range32 || opcode == regexp_opcodes.REOP_range32_i
+    let fold = opcode == regexp_opcodes.REOP_range_i || opcode == regexp_opcodes.REOP_range32_i
+    while !classRange(bytecode, at + 3, count, input, end, wide, fold).failed { end = usize.wrappingAdd(end, 1) }
+  }
+  return end
+}
+
+/// The first position at or after start where the count REOP_char steps from
+/// first match, or -1; every character is one unit.
+fn literalSearch<U: Units>(ops: [*]const u8, first: usize, count: usize, pivotAt: usize, runAt: usize, runUnits: bool,
+  input: &ExecInput<U>, start: usize) -> i64 {
+  if count > input.length { return -1 }
+  // Candidates start at or below last.
+  let last = input.length - count
+  if start > last { return -1 }
+  // One unit (a separator such as `=`): the scan alone. Positions stay below
+  // the input's length, so the wrapping adds never wrap.
+  if count == 1 {
+    let hit = input.units.findUnit(u16.toU32(unsafe rangeU16(ops, usize.wrappingAdd(first, 1))), start, input.length)
+    if hit >= input.length { return -1 }
+    return usize.toI64(hit)
+  }
+  // Over a long input the scan looks for the literal's least common unit (the
+  // compiler's pivot), so that a frequent first unit (a quote in JSON, say)
+  // stops it less often.
+  let mut pivot: usize = 0
+  if last - start >= 64 { pivot = pivotAt }
+  let unit = u16.toU32(unsafe rangeU16(ops, first + pivot * 3 + 1))
+  let mut at = start
+  while at <= last {
+    // Up to the input's end, so the vector scan covers the whole tail.
+    let hit = input.units.findUnit(unit, at + pivot, input.length)
+    if hit > last + pivot { return -1 }
+    at = hit - pivot
+    // The run's bytes (HINT_RUN_BYTES) compare a word at a time.
+    if runUnits {
+      if input.units.equalsUnits(at, unsafe Pointer.assumeMany<u8>(unsafe Pointer.at<u8>(ops, runAt)), count) { return usize.toI64(at) }
+    } else if runAt != usize.MAX {
+      if input.units.equalsBytes(at, unsafe Pointer.assumeMany<u8>(unsafe Pointer.at<u8>(ops, runAt)), count) { return usize.toI64(at) }
+    } else {
+      let mut k: usize = 0
+      while k < count && unitAt(input, usize.wrappingAdd(at, k)) == u16.toU32(unsafe rangeU16(ops, first + k * 3 + 1)) { k = k + 1 }
+      if k == count { return usize.toI64(at) }
+    }
+    at = usize.wrappingAdd(at, 1)
+  }
+  return -1
+}
+/// Whether a whole-pattern literal search found position (not -1), with its
+/// offsets in out.
+fn literalMatch(position: i64, count: usize, out: &mut Captures) -> bool {
+  if position < 0 { return false }
+  let slots = out.placeInline(2)
+  slots[0] = i64.toI32(position)
+  slots[1] = i64.toI32(position + usize.toI64(count))
+  return true
+}
+
 effect fn execute<U: Units, 'env>(bytecode: &[u8], input: &ExecInput<U>, start: usize,
-  mut interrupted: for<use 'call> mut fn<'env>() -> once Effect<'call & 'env; bool ? &mut Allocator>) -> RegExpMatch
+  mut interrupted: for<use 'call> mut fn<'env>() -> once Effect<'call & 'env; bool ? &mut Allocator>, out: &mut Captures) -> bool
   ! OutOfMemoryError | RegExpTimeout ? &mut Allocator {
   if bytecode.length <= regexp_opcodes.RE_HEADER_LEN { Intrinsic.trap("QuickJS invariant violated") }
   let ops = opcodes(bytecode)
-  let captureCount = u8.toUsize(unsafe op8(ops, regexp_opcodes.RE_HEADER_CAPTURE_COUNT))
-  let registerBase = captureCount * 2
-  let liveRegisters = registerBase + u8.toUsize(unsafe op8(ops, regexp_opcodes.RE_HEADER_REGISTER_COUNT))
-  let undo = unsafe Intrinsic.pointerRequalify<[*]mut i64, *mut i64>(unsafe Intrinsic.stackAllocate<i64>(UNDO_INLINE))
-  let mut storage = Storage { inlineWords: undo, heap: List<i64>.make(), inlineValues: [-1; 32], spill: List<i64>.make() }
-  let mut machine = run Machine.make(&mut storage, liveRegisters)
-  let mut pc = regexp_opcodes.RE_HEADER_LEN
-  let mut position = start
-  let mut interruptCounter = INTERRUPT_COUNTER_INIT
-  if input.units.holdsWords() && input.unicode && position > 0 && position < input.length {
-    if isLowSurrogate(unitAt(input, position)) && isHighSurrogate(unitAt(input, position - 1)) {
-      position = position - 1
+  // The compiler's search hint (regexp_types.FLAG_HINT).
+  let mut startPc = regexp_opcodes.RE_HEADER_LEN
+  // The first-unit bitmap's offset (HINT_FIRST_SET), when there is one.
+  let mut setAt = usize.MAX
+  let mut planFirst: usize = 0
+  let mut planOp: u8 = 0
+  if (u16.toU32(unsafe rangeU16(ops, regexp_opcodes.RE_HEADER_FLAGS)) & FLAG_HINT) != 0 {
+    let hint = regexp_opcodes.RE_HEADER_LEN + u32.toUsize(unsafe rangeU32(ops, regexp_opcodes.RE_HEADER_BYTECODE_LEN)) - HINT_LENGTH
+    let kindByte = unsafe op8(ops, hint + 1)
+    planFirst = u16.toUsize(unsafe rangeU16(ops, hint + 6))
+    planOp = unsafe op8(ops, hint + 8)
+    let kind = u8.bitAnd(kindByte, 31)
+    if u8.bitAnd(kindByte, HINT_FIRST_SET) != 0 { setAt = hint - HINT_SET_LENGTH }
+    if kind == HINT_ANCHORED {
+      // Only position 0 can match (a u/v-mode start inside a surrogate pair
+      // moves back to the pair, so that case takes the search). From 0 the
+      // search prefix would only retry later positions.
+      if start == 0 { startPc = regexp_opcodes.RE_HEADER_LEN + 11 }
+      else if !(input.units.holdsWords() && input.unicode) { return false }
+    } else if (kind == HINT_LITERAL || kind == HINT_REQUIRED) && !(input.units.holdsWords() && input.unicode) {
+      // A run of REOP_char steps, each one unit here.
+      let literalAt = u16.toUsize(unsafe rangeU16(ops, hint + 2))
+      // The count's high byte is the pivot (see regexp_types.FLAG_HINT).
+      let packed = u16.toUsize(unsafe rangeU16(ops, hint + 4))
+      let literalCount = packed & 255
+      // The run's bytes sit before the bitmap, or before the trailer without one.
+      let mut runAt = usize.MAX
+      let mut runWidth: usize = 0
+      if u8.bitAnd(kindByte, HINT_RUN_BYTES) != 0 { runWidth = 1 }
+      else if u8.bitAnd(kindByte, HINT_RUN_UNITS) != 0 { runWidth = 2 }
+      if runWidth != 0 {
+        runAt = hint - literalCount * runWidth
+        if setAt != usize.MAX { runAt = setAt - literalCount * runWidth }
+      }
+      let found = literalSearch(ops, literalAt, literalCount, packed / 256, runAt, runWidth == 2, input, start)
+      if found < 0 || kind == HINT_LITERAL { return literalMatch(found, literalCount, &mut out) }
     }
   }
+  let base = regexp_opcodes.RE_HEADER_LEN
+  let mut first = base + 13
+  let mut skipPc = usize.MAX
+  let mut skipOp: u8 = 0
   // A search (no sticky flag) starts with the compiler's `[\s\S]*?` prefix:
   // split_goto_first, any, goto, then save_start 0. When every character is
   // one unit and the pattern starts with a literal, a class or `^`, the
   // prefix's any (whose operand ends at skipPc) moves straight to the next
   // position where that first step can match: the pattern fails at every
-  // position in between.
-  let base = regexp_opcodes.RE_HEADER_LEN
-  let mut first = base + 13
-  let mut skipPc = usize.MAX
-  let mut skipOp: u8 = 0
-  if !(input.units.holdsWords() && input.unicode) && bytecode.length > first + 3 &&
-    unsafe op8(ops, base) == regexp_opcodes.REOP_split_goto_first && unsafe op8(ops, base + 5) == regexp_opcodes.REOP_any &&
-    unsafe op8(ops, base + 6) == regexp_opcodes.REOP_goto && unsafe op8(ops, base + 11) == regexp_opcodes.REOP_save_start {
-    // Zero-width steps (a group's start, \b, \B) leave the position where the
-    // first consuming step must match. The program ends in save_end and match,
-    // so the walk stays inside it.
-    skipOp = unsafe op8(ops, first)
-    while skipOp == regexp_opcodes.REOP_save_start || (skipOp >= regexp_opcodes.REOP_word_boundary && skipOp <= regexp_opcodes.REOP_not_word_boundary_i) {
-      if skipOp == regexp_opcodes.REOP_save_start { first = first + 2 } else { first = first + 1 }
-      skipOp = unsafe op8(ops, first)
-    }
-    if skipOp == regexp_opcodes.REOP_char || skipOp == regexp_opcodes.REOP_char_i || skipOp == regexp_opcodes.REOP_line_start ||
-      skipOp == regexp_opcodes.REOP_space || skipOp == regexp_opcodes.REOP_not_space ||
-      (skipOp >= regexp_opcodes.REOP_range && skipOp <= regexp_opcodes.REOP_range32_i) {
-      if bytecode.length > first + 3 { skipPc = base + 6 }
+  // position in between. The compiler found that step (regexp_types.FLAG_HINT's
+  // plan); without one, the compiler's set of first units serves, as skipOp 0.
+  if planFirst != 0 && !(input.units.holdsWords() && input.unicode) {
+    if planOp != 0 { first = planFirst skipOp = planOp skipPc = base + 6 }
+    else if setAt != usize.MAX { skipPc = base + 6 }
+  }
+  // The bitmap is cheaper to test than a class's ranges or \s; a literal's
+  // word-at-a-time search is cheaper still.
+  let viaSet = skipPc != usize.MAX && setAt != usize.MAX && skipOp != regexp_opcodes.REOP_char && skipOp != regexp_opcodes.REOP_line_start
+  let mut position = start
+  // A first step that is a character or class must match where the match
+  // starts, so the search can start at the first position where it can, and
+  // fails without running when there is none.
+  if skipPc != usize.MAX && skipOp != 0 && skipOp != regexp_opcodes.REOP_line_start {
+    if viaSet { position = skipToSet(ops, setAt, input, start) }
+    else { position = skipAhead(bytecode, first, skipOp, input, start) }
+    if position >= input.length { return false }
+  }
+  let captureCount = u8.toUsize(unsafe op8(ops, regexp_opcodes.RE_HEADER_CAPTURE_COUNT))
+  let registerBase = captureCount * 2
+  // Every character is one unit: greedy one-character loops run in place.
+  let oneUnit = !(input.units.holdsWords() && input.unicode)
+  let liveRegisters = registerBase + u8.toUsize(unsafe op8(ops, regexp_opcodes.RE_HEADER_REGISTER_COUNT))
+  let undo = unsafe Intrinsic.pointerRequalify<[*]mut i64, *mut i64>(unsafe Intrinsic.stackAllocate<i64>(UNDO_INLINE))
+  let registers = unsafe Intrinsic.pointerRequalify<[*]mut i64, *mut i64>(unsafe Intrinsic.stackAllocate<i64>(32))
+  let mut storage = Storage { inlineWords: undo, heap: List<i64>.make(), inlineValues: registers, spill: List<i64>.make() }
+  let mut machine = run Machine.make(&mut storage, liveRegisters)
+  let mut pc = startPc
+  let mut interruptCounter = INTERRUPT_COUNTER_INIT
+  if input.units.holdsWords() && input.unicode && position > 0 && position < input.length {
+    if isLowSurrogate(unitAt(input, position)) && isHighSurrogate(unitAt(input, position - 1)) {
+      position = position - 1
     }
   }
   while true {
@@ -643,13 +1145,26 @@ effect fn execute<U: Units, 'env>(bytecode: &[u8], input: &ExecInput<U>, start: 
     // needs no range check.
     match u8.bitAnd(opcode, 63) {
       16 => { // REOP_match
-        let mut captures = run Captures.unset(registerBase)
+        if registerBase <= INLINE_CAPTURES {
+          // Offsets fit in i32: inputs are shorter than 2^30 units.
+          let slots = out.placeInline(registerBase)
+          let mut slot: usize = 0
+          while slot < registerBase {
+            slots[slot] = u64.wrappingToI32(i64.wrappingToU64(Machine.register(&machine, slot)))
+            slot = slot + 1
+          }
+          return true
+        }
+        let mut spill = List<i32>.make()
+        run spill.reserveExact(registerBase)
         let mut index: usize = 0
         while index < registerBase {
-          captures.set(index, i64.toI32(Machine.register(&machine, index)))
+          run spill.append(u64.wrappingToI32(i64.wrappingToU64(Machine.register(&machine, index))))
           index = index + 1
         }
-        return RegExpMatch { matched: true, captures: move captures }
+        let previous = Intrinsic.replace(out.*, Captures.fromSpill(move spill))
+        drop previous
+        return true
       }
       17 => { // REOP_lookahead_match
         let frame = Machine.finishPositive(&mut machine)
@@ -688,13 +1203,34 @@ effect fn execute<U: Units, 'env>(bytecode: &[u8], input: &ExecInput<U>, start: 
         pc = usize.wrappingAdd(pc, 4) position = step.position failed = step.failed
       }
       14 => { // REOP_split_goto_first
-        let target = branch(pc + 4, unsafe rangeU32(ops, pc))
         run Machine.pushFrame(&mut machine, pc + 4, position, STATE_SPLIT)
-        pc = target
+        pc = branch(pc + 4, unsafe rangeU32(ops, pc))
       }
       15 => { // REOP_split_next_first
         pc = usize.wrappingAdd(pc, 4)
         run Machine.pushFrame(&mut machine, branch(pc, unsafe rangeU32(ops, pc - 4)), position, STATE_SPLIT)
+      }
+      49 => { // REOP_PLUS: the greedy x+ loop's back edge right after x
+        let target = branch(pc + 4, unsafe rangeU32(ops, pc))
+        if oneUnit {
+          let end = greedyRun(bytecode, ops, target, input, position)
+          if end > position { run Machine.pushFrame(&mut machine, usize.shiftLeft(position, 32) + pc + 4, end - 1, STATE_STAR) }
+          pc = pc + 4 position = end
+        } else {
+          run Machine.pushFrame(&mut machine, pc + 4, position, STATE_SPLIT)
+          pc = target
+        }
+      }
+      48 => { // REOP_STAR: a greedy x* loop, split, x, goto back
+        pc = usize.wrappingAdd(pc, 4)
+        let exit = branch(pc, unsafe rangeU32(ops, pc - 4))
+        if oneUnit {
+          let end = greedyRun(bytecode, ops, pc, input, position)
+          if end > position { run Machine.pushFrame(&mut machine, usize.shiftLeft(position, 32) + exit, end - 1, STATE_STAR) }
+          pc = exit position = end
+        } else {
+          run Machine.pushFrame(&mut machine, exit, position, STATE_SPLIT)
+        }
       }
       40 => { // REOP_lookahead
         pc = usize.wrappingAdd(pc, 4)
@@ -726,7 +1262,10 @@ effect fn execute<U: Units, 'env>(bytecode: &[u8], input: &ExecInput<U>, start: 
       }
       6 => { // REOP_any
         if position == input.length { failed = true }
-        else if pc == skipPc { position = skipAhead(bytecode, first, skipOp, input, usize.wrappingAdd(position, 1)) }
+        else if pc == skipPc {
+          if viaSet { position = skipToSet(ops, setAt, input, usize.wrappingAdd(position, 1)) }
+          else { position = skipAhead(bytecode, first, skipOp, input, usize.wrappingAdd(position, 1)) }
+        }
         else { position = stepForward(input, position, input.length).position }
       }
       7 => { // REOP_space
@@ -858,10 +1397,26 @@ effect fn execute<U: Units, 'env>(bytecode: &[u8], input: &ExecInput<U>, start: 
       // REOP_invalid and unknown bytes violate the compiler-bytecode precondition.
       0 => { Intrinsic.trap("QuickJS invariant violated") }
       45 => { Intrinsic.trap("QuickJS invariant violated") }
-      46 => { Intrinsic.trap("QuickJS invariant violated") }
-      47 => { Intrinsic.trap("QuickJS invariant violated") }
-      48 => { Intrinsic.trap("QuickJS invariant violated") }
-      49 => { Intrinsic.trap("QuickJS invariant violated") }
+      46 => { // REOP_CLASS
+        let count = u16.toUsize(unsafe rangeU16(ops, pc))
+        if position >= input.length { failed = true }
+        else {
+          let character = stepForward(input, position, input.length)
+          failed = !classHas(bytecode, ops, pc + 2, count, character.code, false, input.unicode)
+          position = character.position
+        }
+        pc = usize.wrappingAdd(pc, 2) + count * 4 + CLASS_BITS_LENGTH
+      }
+      47 => { // REOP_CLASS_I
+        let count = u16.toUsize(unsafe rangeU16(ops, pc))
+        if position >= input.length { failed = true }
+        else {
+          let character = stepForward(input, position, input.length)
+          failed = !classHas(bytecode, ops, pc + 2, count, character.code, true, input.unicode)
+          position = character.position
+        }
+        pc = usize.wrappingAdd(pc, 2) + count * 4 + CLASS_BITS_LENGTH
+      }
       50 => { Intrinsic.trap("QuickJS invariant violated") }
       51 => { Intrinsic.trap("QuickJS invariant violated") }
       52 => { Intrinsic.trap("QuickJS invariant violated") }
@@ -880,7 +1435,7 @@ effect fn execute<U: Units, 'env>(bytecode: &[u8], input: &ExecInput<U>, start: 
     }
     if failed {
       let resume = Machine.backtrack(&mut machine)
-      if !resume.exists { return RegExpMatch { matched: false, captures: Captures.empty() } }
+      if !resume.exists { return false }
       pc = resume.pc
       position = resume.position
       poll = true
@@ -893,5 +1448,5 @@ effect fn execute<U: Units, 'env>(bytecode: &[u8], input: &ExecInput<U>, start: 
       }
     }
   }
-  return RegExpMatch { matched: false, captures: Captures.empty() }
+  return false
 }

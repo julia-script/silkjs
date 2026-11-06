@@ -28,7 +28,7 @@ import silk.num.u32
 import silk.num.u64
 import silk.num.i32
 import silk.num.usize
-import js_core_types { GcPhase, HeapList, ObjectData, PropertySlot, SlotBits, RuntimeState, ShapeData, ShapeProperty, TransitionEntry, JS_PROP_INITIAL_SIZE, JS_PROP_INITIAL_HASH_SIZE }
+import js_core_types { GcPhase, HeapList, ObjectData, PropertySlot, SlotBits, RuntimeState, ShapeData, ShapeProperty, TransitionEntry, EmptyShapeEntry, CHAIN_UNVERIFIED, JS_PROP_C_W_E, JS_PROP_INITIAL_SIZE, JS_PROP_INITIAL_HASH_SIZE, JS_PROP_TMASK }
 import js_heap { HeapCell, HeapHeader, HeapKind }
 import js_value { ValueBits }
 
@@ -46,6 +46,8 @@ pub struct RetiredProperty {
 const SMALL_SHAPE: usize = 32
 /// ShapeData.memoSlot for a shape no transition memo slot names.
 pub const NO_MEMO_SLOT: u8 = 255
+/// ShapeData.plainVersion before any check: versions count up from zero, so none matches.
+const NO_PLAIN_VERSION: u64 = 0xffffffffffffffff
 /// How many zero-reference interned shapes the runtime keeps for reuse.
 const PARKED_SHAPES: usize = 256
 
@@ -167,6 +169,44 @@ pub unsafe fn park(runtime: *mut HeapHeader, shape: *mut HeapHeader) -> ?*mut He
   }
 }
 
+/// Whether park would keep shape (a small interned shape without deletions).
+@inlineAlways
+pub unsafe fn parkable(shape: *mut HeapHeader) -> bool {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ShapeData, ()>(&anchor, shape)
+  return data.isHashed && data.deletedPropertyCount == 0 && data.properties.length() < SMALL_SHAPE
+}
+/// The memoized target of an add of atom/flags to base, or null. No reference
+/// count changes.
+@inlineAlways
+pub unsafe fn memoTarget(runtime: *mut HeapHeader, base: *mut HeapHeader, atom: u32, flags: u8) -> ?*mut HeapHeader {
+  return unsafe memoTransition(runtime, base, atom, flags)
+}
+/// Adds a slot holding value to object (of shape old) and moves it to target, a
+/// memoized transition of old, when that needs no slot growth and no reference
+/// count reaches or leaves zero: old keeps another reference and target has one.
+/// Otherwise changes nothing and returns false.
+@inlineAlways
+pub unsafe fn swapAdd(object: &mut ObjectData, target: *mut HeapHeader, value: ValueBits) -> bool {
+  let old = object.shape
+  if object.properties.length() >= object.properties.capacity() { return false }
+  let mut anchor = ()
+  let oldHeader = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, old)
+  let oldCount = oldHeader.referenceCount
+  drop oldHeader
+  let targetHeader = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, target)
+  let targetCount = targetHeader.referenceCount
+  if oldCount <= 1 || targetCount == 0 { return false }
+  targetHeader.referenceCount = i32.wrappingAdd(targetCount, 1)
+  drop targetHeader
+  let decremented = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, old)
+  decremented.referenceCount = i32.wrappingSubtract(oldCount, 1)
+  drop decremented
+  // Checked above: the list has room.
+  unsafe object.properties.pushUnchecked(SlotBits.value(value))
+  object.shape = target
+  return true
+}
 /// Detaches the oldest parked shape, which the caller must destroy, or returns null.
 pub unsafe fn unpark(runtime: *mut HeapHeader) -> ?*mut HeapHeader {
   let mut anchor = ()
@@ -266,11 +306,23 @@ unsafe fn unlink(runtime: *mut HeapHeader, shape: *mut HeapHeader) -> () {
   // this retires the one memo entry that names it as target. Entries naming it
   // as base need nothing: they hit only at the base version they recorded, and
   // a shape changed in place or allocated at a freed address has a new one.
-  // (Scanning all 64 entries cost ~390 Ir, paid by every object that deletes.)
+  // (Scanning all 128 entries cost ~390 Ir, paid by every object that deletes.)
   let slot = (unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, shape)).memoSlot
   if slot != NO_MEMO_SLOT {
     let index = u8.toUsize(slot)
     if Pointer.address<HeapHeader>(present(state.transitions[index].target)) == Pointer.address<HeapHeader>(shape) { state.transitions[index].base = 0 }
+  }
+  // A shape leaving the table is no longer its prototype's interned empty
+  // shape: a prototype change or add made in place (prepareUpdate, the add
+  // below) would otherwise leave js_gc.cachedEmpty handing it out.
+  match Pointer.nonNullMut<HeapHeader>((unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, shape)).prototype) {
+    Option<*mut HeapHeader>.Some { value } => {
+      let empty = emptySlot(Pointer.address<HeapHeader>(value))
+      if Pointer.address<HeapHeader>(unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(state.emptyShapes[empty].empty)) == Pointer.address<HeapHeader>(shape) {
+        state.emptyShapes[empty] = EmptyShapeEntry { prototype: 0, empty: Pointer.null<HeapHeader>() }
+      }
+    }
+    Option<*mut HeapHeader>.None => ()
   }
   let mut detachedAnchor = ()
   let detached = unsafe HeapCell.payloadMut<ShapeData, ()>(&mut detachedAnchor, shape)
@@ -284,7 +336,7 @@ unsafe fn unlink(runtime: *mut HeapHeader, shape: *mut HeapHeader) -> () {
 /// around JSShape: a small shape's lookup reads one block instead of three. The
 /// prototype edge is not retained here.
 @inlineAlways
-unsafe effect fn allocateShape(hashSize: usize, capacity: usize, hash: u32, deletedPropertyCount: usize,
+unsafe effect fn allocateShape(runtime: *mut HeapHeader, hashSize: usize, capacity: usize, hash: u32, deletedPropertyCount: usize,
   prototype: ?*mut HeapHeader) -> *mut HeapHeader ! OutOfMemoryError ? &mut Allocator {
   let recordBytes = capacity * Layout.of<ShapeProperty>().bytes
   let shape = run HeapCell.allocateUninitWithTail<ShapeData>(HeapKind.Shape, recordBytes + hashSize * Layout.of<u32>().bytes)
@@ -296,8 +348,8 @@ unsafe effect fn allocateShape(hashSize: usize, capacity: usize, hash: u32, dele
   let mut anchor = ()
   let data = unsafe HeapCell.payloadMut<ShapeData, ()>(&mut anchor, shape)
   unsafe Pointer.put<ShapeData>(Pointer.fromMutRef<ShapeData>(&mut data), ShapeData {
-    isHashed: false, slotPlan: SLOTS_UNDECIDED, planCreated: 0, planOutgrown: 0, memoSlot: NO_MEMO_SLOT, hash: hash, propertyHashMask: usize.toU32(hashSize - 1), version: 0,
-    deletedPropertyCount: deletedPropertyCount, hashNext: Pointer.null<HeapHeader>(), prototype: prototype,
+    isHashed: false, slotPlan: SLOTS_UNDECIDED, planCreated: 0, planOutgrown: 0, memoSlot: NO_MEMO_SLOT, slotHint: 0, hash: hash, propertyHashMask: usize.toU32(hashSize - 1), version: 0, plainVersion: NO_PLAIN_VERSION,
+    deletedPropertyCount: deletedPropertyCount, hashNext: Pointer.null<HeapHeader>(), prototype: prototype, runtime: runtime,
     hashIndices: move indices, properties: move properties
   })
   return shape
@@ -319,7 +371,7 @@ pub unsafe fn renewVersion(runtime: *mut HeapHeader, shape: *mut HeapHeader) -> 
 pub unsafe effect fn createUnhashed(runtime: *mut HeapHeader, prototype: ?*mut HeapHeader,
   hashSize: usize, propertyCapacity: usize) -> *mut HeapHeader
   ! OutOfMemoryError ? &mut Allocator {
-  let shape = run unsafe allocateShape(hashSize, propertyCapacity, initialHash(prototype), 0, prototype)
+  let shape = run unsafe allocateShape(runtime, hashSize, propertyCapacity, initialHash(prototype), 0, prototype)
   unsafe renewVersion(runtime, shape)
   if !Pointer.isNull<HeapHeader>(prototype) { unsafe HeapCell.retain(present(prototype)) }
   let mut anchor = ()
@@ -378,7 +430,7 @@ pub unsafe effect fn clone(runtime: *mut HeapHeader, original: *mut HeapHeader) 
   ! OutOfMemoryError ? &mut Allocator {
   let anchor = ()
   let old = unsafe HeapCell.payload<ShapeData, ()>(&anchor, original)
-  let shape = run unsafe allocateShape(old.hashIndices.length(), old.properties.capacity(), old.hash,
+  let shape = run unsafe allocateShape(runtime, old.hashIndices.length(), old.properties.capacity(), old.hash,
     old.deletedPropertyCount, old.prototype)
   unsafe renewVersion(runtime, shape)
   let mut copyAnchor = ()
@@ -403,6 +455,11 @@ pub unsafe effect fn clone(runtime: *mut HeapHeader, original: *mut HeapHeader) 
 
 /// shape has zero references and is already detached from every GC list. The returned
 /// prototype is its former OWNED Object edge; the collector must release it separately.
+/// The RuntimeState.emptyShapes slot of the prototype at address.
+@inlineAlways
+pub fn emptySlot(address: usize) -> usize {
+  return u64.toUsize(u64.shiftRight(u64.wrappingMultiply(usize.toU64(address / 16), 0x9e3779b97f4a7c15), 60))
+}
 pub unsafe fn destroyDetached(runtime: *mut HeapHeader, shape: *mut HeapHeader) -> ?*mut HeapHeader {
   let shapeAnchor = ()
   let data = unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, shape)
@@ -413,6 +470,15 @@ pub unsafe fn destroyDetached(runtime: *mut HeapHeader, shape: *mut HeapHeader) 
   let contents = unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, shape)
   let mut anchor = ()
   let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  match Pointer.nonNullMut<HeapHeader>(prototype) {
+    Option<*mut HeapHeader>.Some { value } => {
+      let slot = emptySlot(Pointer.address<HeapHeader>(value))
+      if Pointer.address<HeapHeader>(unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(state.emptyShapes[slot].empty)) == Pointer.address<HeapHeader>(shape) {
+        state.emptyShapes[slot] = EmptyShapeEntry { prototype: 0, empty: Pointer.null<HeapHeader>() }
+      }
+    }
+    Option<*mut HeapHeader>.None => ()
+  }
   let mut i: usize = 0
   while i < contents.properties.length() {
     state.atoms.release(contents.properties.get(i).atom)
@@ -485,6 +551,28 @@ pub unsafe fn slotFlags(shape: *mut HeapHeader, index: usize) -> u8 {
 pub unsafe fn recordCount(shape: *mut HeapHeader) -> usize {
   let anchor = ()
   return (unsafe HeapCell.payload<ShapeData, ()>(&anchor, shape)).properties.length()
+}
+/// The slots of a shape whose records are all plain data, read as their values.
+@inlineAlways
+pub unsafe fn slotValues(properties: &ThinList<SlotBits>) -> &[ValueBits] {
+  let first = unsafe Intrinsic.pointerRequalify<?[*]const SlotBits, [*]const SlotBits>(Pointer.fromSlice<SlotBits>(properties.asSlice()))
+  return unsafe Pointer.borrowMany<ThinList<SlotBits>, ValueBits>(&properties.*, unsafe Intrinsic.pointerReinterpret<[*]const SlotBits, [*]const ValueBits>(first), properties.length())
+}
+/// Whether every record of shape is a plain data property, so each slot of an
+/// object of this shape holds a ValueBits. The answer is kept for the shape's
+/// current version.
+pub unsafe fn plainRecords(shape: *mut HeapHeader) -> bool {
+  let mut anchor = ()
+  let data = unsafe HeapCell.payloadMut<ShapeData, ()>(&mut anchor, shape)
+  if data.plainVersion == data.version { return true }
+  let count = data.properties.length()
+  let mut i: usize = 0
+  while i < count {
+    if (u8.toU32((unsafe data.properties.getUnchecked(i)).flags) & JS_PROP_TMASK) != 0 { return false }
+    i = i + 1
+  }
+  data.plainVersion = data.version
+  return true
 }
 /// slotFlags for an index the caller has checked against recordCount.
 @inlineAlways
@@ -600,6 +688,10 @@ pub const SPARE_SLOTS_PER_BIN: usize = 16
 /// cell's tail (js_object_allocate.fromShape), saving an allocation and a pointer
 /// chase; a list that outgrows them moves to its own storage.
 pub const INLINE_SLOTS: usize = 4
+/// Spare object cells js_gc keeps per tail size (RuntimeState.spareCells).
+pub const SPARE_OBJECT_CELLS: usize = 4096
+/// HeapHeader.mark of a spare object cell parked while still in gcObjects.
+pub const SPARE_CELL_LINKED: u8 = 2
 // Inline slots waste their tail when the object outgrows them. Each empty shape
 // samples its first SLOTS_SAMPLE inline objects: when at least half outgrow the
 // tail (objects built up property by property), later ones get separate slots.
@@ -739,17 +831,33 @@ pub unsafe fn flushSpareSlots(runtime: *mut HeapHeader) -> () {
   }
   state.spareValueCounts = [0; 8]
   // The spare object cells (js_gc) are the same kind of allocation cache.
-  let cells = state.spareCells.length()
-  let parkedCells = state.spareCells.asMutSlice()
-  at = 0
-  while at < cells {
-    let parked = Intrinsic.replace(parkedCells[at], Option<Intrinsic.RawBuffer<u8>>.none())
-    drop parked
-    at = at + 1
-  }
-  state.spareCellCount = 0
-  state.sparePairCellCount = 0
   drop state
+  // Spare object cells, one at a time: destroying one may not run under the borrow.
+  while true {
+    let mut cellAnchor = ()
+    let cells = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut cellAnchor, runtime)
+    let mut index: usize = 0
+    let mut bin: usize = 0
+    while bin < 4 && cells.spareCellCounts[bin] == 0 { bin = bin + 1 }
+    if bin == 4 { return () }
+    let count = cells.spareCellCounts[bin] - 1
+    cells.spareCellCounts[bin] = count
+    index = bin * SPARE_OBJECT_CELLS + count
+    let cell = cells.spareCells.asSlice()[index]
+    match Pointer.nonNullMut<HeapHeader>(cell) {
+      Option<*mut HeapHeader>.Some { value } => {
+        // A cell parked while linked (js_gc.MARK_LINKED) leaves gcObjects first.
+        let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, value)
+        let linked = header.mark == SPARE_CELL_LINKED
+        header.mark = 0
+        drop header
+        if linked { unsafe cells.gcObjects.remove(value) }
+        drop cells
+        unsafe HeapCell.destroyEmptied<ObjectData>(value)
+      }
+      Option<*mut HeapHeader>.None => { drop cells }
+    }
+  }
 }
 /// An empty slot list with exactly capacity, if one is parked.
 @inlineAlways
@@ -771,12 +879,11 @@ pub unsafe fn takeSpareSlots(runtime: *mut HeapHeader, capacity: usize) -> Optio
 unsafe fn memoTransition(runtime: *mut HeapHeader, base: *mut HeapHeader,
   atom: u32, flags: u8) -> ?*mut HeapHeader {
   let address = Pointer.address<HeapHeader>(base)
-  // Multiplicative mix: the old sum used only 6 address bits and 3 atom bits, so
-  // the few transitions of one hot constructor often evicted each other.
-  let key = usize.toU64(address / 16) ^ u64.shiftLeft(u32.toU64(atom), 24) ^ u32.toU64(u8.toU32(flags))
+  // Multiplicative mix (memoSet): the old sum used only 6 address bits and 3 atom
+  // bits, so the few transitions of one hot constructor often evicted each other.
   // Two-way sets: one hot constructor's few transitions used to collide in a
   // direct-mapped slot often enough to miss most lookups after a layout change.
-  let set = u64.toUsize(u64.shiftRight(u64.wrappingMultiply(key, 0x9e3779b97f4a7c15), 59)) * 2
+  let set = memoSet(base, atom, flags)
   // base is live (an object's shape or a memoized target), so its version reads safely.
   let baseAnchor = ()
   let baseVersion = (unsafe HeapCell.payload<ShapeData, ()>(&baseAnchor, base)).version
@@ -792,8 +899,110 @@ unsafe fn memoTransition(runtime: *mut HeapHeader, base: *mut HeapHeader,
   }
   drop state
   let found = unsafe findTransition(runtime, base, atom, flags)
-  if !Pointer.isNull<HeapHeader>(found) { unsafe remember(runtime, set, TransitionEntry { base: address, target: found, atom: atom, flags: flags, baseVersion: baseVersion }) }
+  if !Pointer.isNull<HeapHeader>(found) { unsafe remember(runtime, set, TransitionEntry { base: address, target: found, atom: atom, flags: flags, chainDepth: CHAIN_UNVERIFIED, baseVersion: baseVersion, chain: [0; 3] }) }
   return found
+}
+/// The memo set for an add of atom/flags to base.
+@inlineAlways
+fn memoSet(base: *mut HeapHeader, atom: u32, flags: u8) -> usize {
+  let key = usize.toU64(Pointer.address<HeapHeader>(base) / 16) ^ u64.shiftLeft(u32.toU64(atom), 24) ^ u32.toU64(u8.toU32(flags))
+  return u64.toUsize(u64.shiftRight(u64.wrappingMultiply(key, 0x9e3779b97f4a7c15), 58)) * 2
+}
+/// Whether the prototypes of a shape whose prototype is first still have the
+/// shape versions an entry recorded for its first depth links.
+@inlineAlways
+unsafe fn chainHolds(entry: &TransitionEntry, first: ?*mut HeapHeader) -> bool {
+  let depth = u8.toUsize(entry.chainDepth)
+  if depth > 3 { return false }
+  let anchor = ()
+  let mut current = first
+  let mut level: usize = 0
+  while level < depth {
+    let link = unsafe HeapCell.payload<ObjectData, ()>(&anchor, present(current))
+    let linkShape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, link.shape)
+    if linkShape.version != entry.chain[level] { return false }
+    current = linkShape.prototype
+    level = level + 1
+  }
+  return true
+}
+/// The memoized target of a plain (C_W_E) add of atom to base whose prototype
+/// walk an earlier add verified and whose prototypes' shapes have not changed
+/// since, or null. No reference count changes.
+@inlineAlways
+pub unsafe fn verifiedAdd(runtime: *mut HeapHeader, base: *mut HeapHeader, atom: u32) -> ?*mut HeapHeader {
+  let flags = u32.toU8(JS_PROP_C_W_E)
+  let set = memoSet(base, atom, flags)
+  let address = Pointer.address<HeapHeader>(base)
+  let anchor = ()
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, base)
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let mut way: usize = 0
+  while way < 2 {
+    let entry = &state.transitions[set + way]
+    if entry.base == address && entry.atom == atom && entry.flags == flags && entry.baseVersion == shape.version {
+      if unsafe chainHolds(entry, shape.prototype) { return entry.target }
+      return Pointer.null<HeapHeader>()
+    }
+    way = way + 1
+  }
+  return Pointer.null<HeapHeader>()
+}
+/// verifiedAdd's memo entry, by its index in RuntimeState.transitions, or
+/// usize.MAX: the put_field site cache keeps the index (js_vm_property_ops.siteAdd).
+pub unsafe fn verifiedAddIndex(runtime: *mut HeapHeader, base: *mut HeapHeader, atom: u32) -> usize {
+  let flags = u32.toU8(JS_PROP_C_W_E)
+  let set = memoSet(base, atom, flags)
+  let address = Pointer.address<HeapHeader>(base)
+  let anchor = ()
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, base)
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let mut way: usize = 0
+  while way < 2 {
+    let entry = &state.transitions[set + way]
+    if entry.base == address && entry.atom == atom && entry.flags == flags && entry.baseVersion == shape.version {
+      if unsafe chainHolds(entry, shape.prototype) { return set + way }
+      return usize.MAX
+    }
+    way = way + 1
+  }
+  return usize.MAX
+}
+/// verifiedAdd through the memo entry at index (verifiedAddIndex's answer for an
+/// earlier add at the same site): its target while that entry still is base's
+/// verified plain add of atom, else null. The entry is checked in full, so a
+/// stale index only misses.
+@inlineAlways
+pub unsafe fn verifiedAddAt(runtime: *mut HeapHeader, index: usize, base: *mut HeapHeader, atom: u32) -> ?*mut HeapHeader {
+  let anchor = ()
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, base)
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let entry = &state.transitions[index & 127]
+  // The base test also rejects an entry remember cleared (base 0) when its
+  // target was unlinked, which keeps its baseVersion.
+  if entry.baseVersion == shape.version && entry.base == Pointer.address<HeapHeader>(base) && entry.atom == atom
+    && entry.flags == u32.toU8(JS_PROP_C_W_E)
+    && unsafe chainHolds(entry, shape.prototype) { return entry.target }
+  return Pointer.null<HeapHeader>()
+}
+/// Records on base's memo entry for atom/flags (when there is one) that an add's
+/// prototype walk passed depth links of these shape versions.
+pub unsafe fn noteVerified(runtime: *mut HeapHeader, base: *mut HeapHeader, baseVersion: u64, atom: u32, flags: u8,
+  depth: usize, chain: [u64; 3]) -> () {
+  let set = memoSet(base, atom, flags)
+  let address = Pointer.address<HeapHeader>(base)
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  let mut way: usize = 0
+  while way < 2 {
+    let entry = state.transitions[set + way]
+    if entry.base == address && entry.atom == atom && entry.flags == flags && entry.baseVersion == baseVersion {
+      state.transitions[set + way].chainDepth = usize.toU8(depth)
+      state.transitions[set + way].chain = chain
+      return ()
+    }
+    way = way + 1
+  }
 }
 /// Records entry in set's first way, keeping each target named by one slot at
 /// most: the slot its memoSlot names is cleared first, and a live first entry
@@ -859,13 +1068,48 @@ pub unsafe fn transitionChain(runtime: *mut HeapHeader, base: *mut HeapHeader,
   }
   return shape
 }
+/// The most shapes one RuntimeState.constructPins entry holds.
+pub const PIN_SHAPES: usize = 8
+/// The interned chain an object built property by property from its prototype's
+/// empty shape takes to final: written to chain (empty shape first, final last)
+/// and counted, or 0 when final is not such a chain's end or the chain is longer
+/// than PIN_SHAPES. No reference count changes; the caller takes what it keeps.
+pub unsafe fn constructChain(runtime: *mut HeapHeader, final: *mut HeapHeader, chain: &mut [?*mut HeapHeader; 8]) -> usize {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ShapeData, ()>(&anchor, final)
+  let count = data.properties.length()
+  if !data.isHashed || data.deletedPropertyCount != 0 || count + 1 > PIN_SHAPES { return 0 }
+  let mut shape = unsafe findPrototype(runtime, data.prototype)
+  let mut i: usize = 0
+  while i < count {
+    if Pointer.isNull<HeapHeader>(shape) { return 0 }
+    chain[i] = shape
+    let property = data.properties.get(i)
+    shape = unsafe findTransition(runtime, present(shape), property.atom, property.flags)
+    i = i + 1
+  }
+  if Pointer.address<HeapHeader>(present(shape)) != Pointer.address<HeapHeader>(final) { return 0 }
+  chain[count] = shape
+  return count + 1
+}
 /// Takes an owned reference to an interned shape, such as a transitionTarget chain's
 /// end, reviving it when it is parked.
 pub unsafe fn take(runtime: *mut HeapHeader, shape: *mut HeapHeader) -> () { unsafe acquire(runtime, shape) }
+/// growForTransition for an add along a memoized transition to target, for a
+/// caller that then appends with swapAdd.
+pub unsafe effect fn growForAdd(runtime: *mut HeapHeader, object: &mut ObjectData, target: *mut HeapHeader) -> () ! OutOfMemoryError ? &mut Allocator {
+  let anchor = ()
+  let mut capacity = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, target)).properties.capacity()
+  let length = object.properties.length()
+  if capacity <= length { capacity = length + 1 }
+  let old = object.shape
+  run unsafe growForTransition(runtime, &mut object, old, capacity)
+}
 @inlineNever
 unsafe effect fn growForTransition(runtime: *mut HeapHeader, object: &mut ObjectData, old: *mut HeapHeader,
-  capacity: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  needed: usize) -> () ! OutOfMemoryError ? &mut Allocator {
   if object.properties.borrowsStorage() { unsafe noteOutgrown(runtime, old) }
+  let capacity = unsafe hintedCapacity(runtime, old, needed)
   match unsafe takeSpareSlots(runtime, capacity) {
     Option<ThinList<SlotBits>>.Some { value } => {
       // Swap in a parked list of the target capacity and park the outgrown one.
@@ -880,6 +1124,26 @@ unsafe effect fn growForTransition(runtime: *mut HeapHeader, object: &mut Object
       run object.properties.reserveExact(extra)
     }
   }
+}
+/// Objects built property by property from one prototype tend to reach the same
+/// size: growth goes straight to the largest capacity an earlier one grew to
+/// (ShapeData.slotHint on the prototype's empty shape), so each regrows once.
+const SLOT_HINT_LIMIT: usize = 16
+unsafe fn hintedCapacity(runtime: *mut HeapHeader, old: *mut HeapHeader, needed: usize) -> usize {
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ShapeData, ()>(&anchor, old)
+  let prototype = data.prototype
+  drop data
+  let root = unsafe findPrototype(runtime, prototype)
+  if Pointer.isNull<HeapHeader>(root) { return needed }
+  let mut rootAnchor = ()
+  let rootData = unsafe HeapCell.payloadMut<ShapeData, ()>(&mut rootAnchor, present(root))
+  let hint = u8.toUsize(rootData.slotHint)
+  if needed > hint {
+    if needed <= SLOT_HINT_LIMIT { rootData.slotHint = usize.toU8(needed) }
+    return needed
+  }
+  return hint
 }
 @inlineNever
 unsafe effect fn addUntransitioned(runtime: *mut HeapHeader, object: &mut ObjectData,
@@ -1119,6 +1383,47 @@ pub unsafe effect fn deleteProperty(runtime: *mut HeapHeader, object: &mut Objec
     Option<usize>.None => { return Option<RetiredProperty>.none() }
   }
   return Option<RetiredProperty>.some(run unsafe deleteAt(runtime, &mut object, atom, index))
+}
+/// deleteAt's in-place case, for a shape object owns alone (not hashed, so
+/// prepareUpdate would only renew its version): unlinks the record at index (a
+/// lookup of atom found it) and releases atom. The caller releases the slot's
+/// old value, read before, and runs compactAfterDelete when this returns true.
+@inlineAlways
+pub unsafe fn deleteUnshared(runtime: *mut HeapHeader, object: &mut ObjectData, atom: u32, index: usize) -> bool {
+  unsafe renewVersion(runtime, object.shape)
+  let mut anchor = ()
+  let shape = unsafe HeapCell.payloadMut<ShapeData, ()>(&mut anchor, object.shape)
+  let entry = unsafe unchecked<ShapeProperty>(&shape.properties, index)
+  let hashIndex = u32.toUsize(atom & shape.propertyHashMask)
+  let mut cursor = unsafe unchecked<u32>(&shape.hashIndices, hashIndex)
+  let mut previous: u32 = 0
+  while u32.toUsize(cursor - 1) != index {
+    previous = cursor
+    cursor = (unsafe unchecked<ShapeProperty>(&shape.properties, u32.toUsize(cursor - 1))).hashNext
+  }
+  if previous == 0 {
+    unsafe shape.hashIndices.setUnchecked(hashIndex, entry.hashNext)
+  } else {
+    let previousIndex = u32.toUsize(previous - 1)
+    let mut predecessor = unsafe unchecked<ShapeProperty>(&shape.properties, previousIndex)
+    predecessor.hashNext = entry.hashNext
+    unsafe shape.properties.setUnchecked(previousIndex, predecessor)
+  }
+  unsafe shape.properties.setUnchecked(index, ShapeProperty { hashNext: entry.hashNext, flags: 0, atom: 0 })
+  let deleted = shape.deletedPropertyCount + 1
+  shape.deletedPropertyCount = deleted
+  let shouldCompact = deleted >= 8 && deleted >= shape.properties.length() / 2
+  drop shape
+  unsafe object.properties.setUnchecked(index, SlotBits.value(ValueBits.Undefined))
+  let mut runtimeAnchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, runtime)
+  state.atoms.release(atom)
+  return shouldCompact
+}
+/// The optional compaction deleteAt ends with, out of line for deleteUnshared's callers.
+@inlineNever
+pub unsafe effect fn compactAfterDelete(object: &mut ObjectData) -> () ? &mut Allocator {
+  run Effect.catchAll(unsafe compact(&mut object), ignoreOptionalAllocation)
 }
 /// deleteProperty for the record index a lookup of atom on object's shape found.
 pub unsafe effect fn deleteAt(runtime: *mut HeapHeader, object: &mut ObjectData,
