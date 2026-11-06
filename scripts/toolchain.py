@@ -12,7 +12,20 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def release_version() -> str:
-    return tomllib.loads((ROOT / "upstream.toml").read_text())["silk-toolchain"]["version"]
+    return tomllib.loads((ROOT / "silk.toml").read_text())["package"]["silk-version"]
+
+
+def host_target() -> str:
+    """The LLVM triple `silk build` targets on this host (its build/llvm/<triple> directory)."""
+    machine = os.uname().machine
+    arch = {"arm64": "aarch64", "aarch64": "aarch64", "x86_64": "x86_64", "AMD64": "x86_64"}[machine]
+    if sys.platform == "darwin":
+        return f"{arch}-apple-darwin"
+    return f"{arch}-unknown-linux-gnu"
+
+
+def release_binary() -> Path:
+    return ROOT / "build/llvm" / host_target() / "release/silkjs"
 
 
 def compiler_path() -> Path:
