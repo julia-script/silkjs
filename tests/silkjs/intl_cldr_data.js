@@ -65,3 +65,13 @@ assert(new Intl.DateTimeFormat("ko-u-ca-dangi", { ...{"dateStyle": "medium"}, ti
 assert(new Intl.DateTimeFormat("en-u-ca-chinese", { ...{"era": "long", "year": "numeric", "month": "numeric", "day": "numeric"}, timeZone: 'UTC' }).format(day), "Mo2 2, 2026", "en-u-ca-chinese {\"era\": \"long\", \"year\": \"numeric\", \"month\": \"numeric\", \"day\": \"numeric\"}");
 assert(new Intl.DateTimeFormat("en-u-ca-buddhist", { ...{"year": "numeric"}, timeZone: 'UTC' }).format(day), "2569 BE", "en-u-ca-buddhist {\"year\": \"numeric\"}");
 assert(["th", "fa", "ps", "en", "ar-SA"].map((locale) => new Intl.DateTimeFormat(locale).resolvedOptions().calendar), ["buddhist", "persian", "persian", "gregory", "gregory"], 'default calendars');
+
+// Flexible day periods from CLDR rules and names. Expected values match Node 24.
+assert(new Intl.DateTimeFormat("en", { ...{"hour": "numeric", "dayPeriod": "long"}, timeZone: 'UTC' }).format(new Date('2026-03-20T03:00Z')), "3 in the morning", "en 03:00 {\"hour\": \"numeric\", \"dayPeriod\": \"long\"}");
+assert(new Intl.DateTimeFormat("en", { ...{"hour": "numeric", "dayPeriod": "short"}, timeZone: 'UTC' }).format(new Date('2026-03-20T12:30Z')), "12 noon", "en 12:30 {\"hour\": \"numeric\", \"dayPeriod\": \"short\"}");
+assert(new Intl.DateTimeFormat("en", { ...{"hour": "numeric", "minute": "numeric", "dayPeriod": "short"}, timeZone: 'UTC' }).format(new Date('2026-03-20T12:30Z')), "12:30 in the afternoon", "en 12:30 {\"hour\": \"numeric\", \"minute\": \"numeric\", \"dayPeriod\": \"short\"}");
+assert(new Intl.DateTimeFormat("zh-Hant", { ...{"timeStyle": "short"}, timeZone: 'UTC' }).format(new Date('2026-03-20T13:05Z')), "下午1:05", "zh-Hant 13:05 {\"timeStyle\": \"short\"}");
+assert(new Intl.DateTimeFormat("zh", { ...{"hour": "numeric", "dayPeriod": "short"}, timeZone: 'UTC' }).format(new Date('2026-03-20T06:00Z')), "6时", "zh 06:00 {\"hour\": \"numeric\", \"dayPeriod\": \"short\"}");
+assert(new Intl.DateTimeFormat("ko", { ...{"hour": "numeric", "dayPeriod": "short"}, timeZone: 'UTC' }).format(new Date('2026-03-20T03:00Z')), "아침 3시", "ko 03:00 {\"hour\": \"numeric\", \"dayPeriod\": \"short\"}");
+assert(new Intl.DateTimeFormat("es-CO", { ...{"dayPeriod": "narrow"}, timeZone: 'UTC' }).format(new Date('2026-03-20T12:00Z')), "m.", "es-CO 12:00 {\"dayPeriod\": \"narrow\"}");
+assert(new Intl.DateTimeFormat("ja", { ...{"dayPeriod": "long"}, timeZone: 'UTC' }).format(new Date('2026-03-20T22:00Z')), "夜", "ja 22:00 {\"dayPeriod\": \"long\"}");
