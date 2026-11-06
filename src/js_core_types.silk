@@ -28,7 +28,7 @@ import silk.num.u32
 import silk.num.u8
 import silk.num.u64
 import js_atoms { AtomTable }
-import js_heap { HeapCell, HeapHeader, CellRef }
+import js_heap { HeapCell, HeapHeader, CellLinks, CellRef }
 import js_value { ValueBits }
 import js_owned_value { Value }
 import js_string_types { StringOwner, latin1Bytes, stringReference }
@@ -80,6 +80,10 @@ pub const JS_INTL_CTOR_LISTFORMAT: usize = 3
 pub const JS_INTL_CTOR_LOCALE: usize = 4
 pub const JS_INTL_CTOR_DURATIONFORMAT: usize = 5
 pub const JS_INTL_FALLBACK_SYMBOL: usize = 6
+/// The Collator that String.prototype.localeCompare made last, reused while its locales match.
+pub const JS_INTL_COLLATOR_CACHE: usize = 7
+/// The number of ContextState.userValues slots.
+pub const USER_VALUE_COUNT: usize = 8
 
 pub enum NativeErrorKind {
   Eval, Range, Reference, Syntax, Type, Uri, Internal, Aggregate, Suppressed
@@ -358,8 +362,8 @@ impl FrameReferences {
   }
 }
 
-/// A non-owning intrusive list using HeapHeader.previous/next. A header can belong
-/// to only one such list at a time. Context/module secondary membership has separate
+/// A non-owning intrusive list through the CellLinks of linked cells (js_heap
+/// HeapCell.links). A cell can belong to only one such list at a time. Context/module secondary membership has separate
 /// links below. Dropping a list neither frees nor detaches its nodes.
 pub struct HeapList {
   pub first: ?*mut HeapHeader,
@@ -375,13 +379,13 @@ impl HeapList {
   pub unsafe fn pushBack(self: &mut Self, node: *mut HeapHeader) -> () {
     let previous = self.last
     let mut anchor = ()
-    let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, node)
+    let header = unsafe Pointer.borrowMut<(), CellLinks>(&mut anchor, unsafe HeapCell.links(node))
     header.previous = previous
     header.next = Pointer.null<HeapHeader>()
     drop header
     match Pointer.nonNullMut<HeapHeader>(previous) {
       Option<*mut HeapHeader>.Some { value } => {
-        let prior = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, value)
+        let prior = unsafe Pointer.borrowMut<(), CellLinks>(&mut anchor, unsafe HeapCell.links(value))
         prior.next = node
       }
       Option<*mut HeapHeader>.None => { self.first = node }
@@ -392,13 +396,13 @@ impl HeapList {
   pub unsafe fn pushFront(self: &mut Self, node: *mut HeapHeader) -> () {
     let next = self.first
     let mut anchor = ()
-    let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, node)
+    let header = unsafe Pointer.borrowMut<(), CellLinks>(&mut anchor, unsafe HeapCell.links(node))
     header.previous = Pointer.null<HeapHeader>()
     header.next = next
     drop header
     match Pointer.nonNullMut<HeapHeader>(next) {
       Option<*mut HeapHeader>.Some { value } => {
-        let following = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, value)
+        let following = unsafe Pointer.borrowMut<(), CellLinks>(&mut anchor, unsafe HeapCell.links(value))
         following.previous = node
       }
       Option<*mut HeapHeader>.None => { self.last = node }
@@ -410,7 +414,7 @@ impl HeapList {
   /// state, without changing its reference count or reclaiming its allocation.
   pub unsafe fn remove(self: &mut Self, node: *mut HeapHeader) -> () {
     let mut anchor = ()
-    let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, node)
+    let header = unsafe Pointer.borrowMut<(), CellLinks>(&mut anchor, unsafe HeapCell.links(node))
     let previous = header.previous
     let next = header.next
     header.previous = Pointer.null<HeapHeader>()
@@ -418,14 +422,14 @@ impl HeapList {
     drop header
     match Pointer.nonNullMut<HeapHeader>(previous) {
       Option<*mut HeapHeader>.Some { value } => {
-        let prior = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, value)
+        let prior = unsafe Pointer.borrowMut<(), CellLinks>(&mut anchor, unsafe HeapCell.links(value))
         prior.next = next
       }
       Option<*mut HeapHeader>.None => { self.first = next }
     }
     match Pointer.nonNullMut<HeapHeader>(next) {
       Option<*mut HeapHeader>.Some { value } => {
-        let following = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, value)
+        let following = unsafe Pointer.borrowMut<(), CellLinks>(&mut anchor, unsafe HeapCell.links(value))
         following.previous = previous
       }
       Option<*mut HeapHeader>.None => { self.last = previous }
@@ -513,9 +517,20 @@ pub struct RuntimeState {
   /// Runtime-local IDs shared by every realm's eight Temporal classes.
   pub temporalClassIds: [u32; 8],
   pub contexts: ContextList,
+  /// Published GC cells that keep CellLinks (shapes, contexts, modules, and cells
+  /// not in pooled blocks); pooled ones are bits in the arenas of gcArenas.
   pub gcObjects: HeapList,
+  /// Linked dead cells waiting for drainZero after the zero stack filled up.
   pub zeroReferenceObjects: HeapList,
+  /// Collector scratch: linked cells found unreachable, then their zombies.
   pub temporaryGcObjects: HeapList,
+  pub zombieGcObjects: HeapList,
+  /// The pool arenas holding this runtime's pooled GC cells (runtime_memory.addCell).
+  pub gcArenas: ?*mut u8,
+  /// Those of gcArenas with scratch bits set (runtime_memory.listPending).
+  pub gcPendingArenas: ?*mut u8,
+  /// Pooled dead cells waiting for drainZero, marked in their arenas' scratch bits.
+  pub zeroPending: usize,
   pub gcPhase: GcPhase,
   pub mallocGcThreshold: usize,
   /// Consecutive collections that freed little, 0 to 3; each widens the next
@@ -667,7 +682,7 @@ pub struct RuntimeState {
 pub struct FieldCacheEntry {
   pub site: usize,
   pub key: u64,
-  /// 0 for an own property. Otherwise the property is the prototype's (the
+  /// 0 for an own property. Otherwise (key then carries FIELD_PROTO_KEY) the property is the prototype's (the
   /// object's shape names it and has no record for the atom): its shape's
   /// version shifted left 16 bits plus its slot index there. The index
   /// FIELD_PASS_THROUGH marks a prototype without a record for the atom: the
@@ -705,6 +720,10 @@ impl Copy for RegExpStandardCache {}
 pub const EMPTY_REGEXP_STANDARD: RegExpStandardCache = RegExpStandardCache { receiverVersion: 0, protoVersion: 0, lastIndex: 0, exec: 0, flags: 0, global: 0, unicode: 0, replace: 0xffffffff }
 /// The slot index of a FieldCacheEntry key whose prototype has no record for the atom.
 pub const FIELD_PASS_THROUGH: u64 = 0xffff
+/// Set in the key of a prototype entry, so the own-entry test (key's version
+/// part equal to the shape's) fails for it without reading protoKey. Shape
+/// versions never reach bit 47.
+pub const FIELD_PROTO_KEY: u64 = 0x8000000000000000
 impl Copy for FieldCacheEntry {}
 /// The RuntimeState.fieldCache entry for the get_field site whose operand starts at site.
 @inlineAlways
@@ -887,7 +906,7 @@ pub struct ContextState {
   pub nodeErrorStackSetter: ValueBits,
   pub nodeErrorConstructor: ValueBits,
   pub nodeErrorFormatter: ValueBits,
-  pub userValues: [ValueBits; 7],
+  pub userValues: [ValueBits; USER_VALUE_COUNT],
   pub globalObject: ValueBits,
   /// Original global binding record behind a host exotic global object.
   pub globalObjectStorage: ValueBits,
@@ -1366,7 +1385,7 @@ pub struct ObjectData {
   pub weakRefCount: u32,
   pub shape: *mut HeapHeader,
   /// Two words instead of a List's five: the slots, their count and capacity.
-  pub properties: ThinList<SlotBits>,
+  slotList: ThinList<SlotBits>,
   pub payload: ObjectPayload
 }
 impl ObjectData {
@@ -1376,7 +1395,7 @@ impl ObjectData {
     let mut flags = OBJECT_EXTENSIBLE
     if exotic { flags = u8.bitOr(flags, OBJECT_EXOTIC) }
     if fastArray { flags = u8.bitOr(flags, OBJECT_FAST_ARRAY) }
-    return ObjectData { creationRealm: Pointer.null<HeapHeader>(), flags: flags, roles: 0, classBits: classBits(classId), weakRefCount: 0, shape: shape, properties: move properties, payload: move payload }
+    return ObjectData { creationRealm: Pointer.null<HeapHeader>(), flags: flags, roles: 0, classBits: classBits(classId), weakRefCount: 0, shape: shape, slotList: move properties, payload: move payload }
   }
   /// The class id. Like the source, objects keep 16 bits of it.
   @inlineAlways
@@ -1421,6 +1440,55 @@ impl ObjectData {
   pub fn isHtmlDda(self: &Self) -> bool { return u8.bitAnd(self.flags, OBJECT_HTML_DDA) != 0 }
   @inlineAlways
   pub fn setIsHtmlDda(self: &mut Self, value: bool) -> () { self.flags = objectFlag(self.flags, OBJECT_HTML_DDA, value) }
+
+  // The property slots. Only these methods see how they are stored.
+  @inlineAlways
+  pub fn slotCount(self: &Self) -> usize { return self.slotList.length() }
+  @inlineAlways
+  pub fn slotCapacity(self: &Self) -> usize { return self.slotList.capacity() }
+  /// The slot at index. Traps unless index is below slotCount.
+  @inlineAlways
+  pub fn slot(self: &Self, index: usize) -> SlotBits { return self.slotList.get(index) }
+  @inlineAlways
+  pub fn setSlot(self: &mut Self, index: usize, value: SlotBits) -> () { self.slotList.set(index, value) }
+  /// slot without the bounds check, for an index the shape keeps in range.
+  @inlineAlways
+  pub unsafe fn slotUnchecked(self: &Self, index: usize) -> SlotBits { return unsafe self.slotList.getUnchecked(index) }
+  @inlineAlways
+  pub unsafe fn setSlotUnchecked(self: &mut Self, index: usize, value: SlotBits) -> () { unsafe self.slotList.setUnchecked(index, value) }
+  /// Whether the slots live in the object's own cell.
+  @inlineAlways
+  pub fn slotsInCell(self: &Self) -> bool { return self.slotList.borrowsStorage() }
+  @inlineAlways
+  pub fn slotsOwned(self: &Self) -> bool { return self.slotList.ownsStorage() }
+  @inlineAlways
+  pub fn slotView(self: &Self) -> &[SlotBits] { return self.slotList.asSlice() }
+  @inlineAlways
+  pub fn truncateSlots(self: &mut Self, length: usize) -> () { self.slotList.truncate(length) }
+  @inlineAlways
+  pub unsafe fn pushSlotUnchecked(self: &mut Self, value: SlotBits) -> () { unsafe self.slotList.pushUnchecked(value) }
+  @inlineAlways
+  pub fn pushSlot(self: &mut Self, value: SlotBits) -> () { self.slotList.push(value) }
+  pub effect fn appendSlot(self: &mut Self, value: SlotBits) -> () ! OutOfMemoryError ? &mut Allocator { run self.slotList.append(value) }
+  pub effect fn reserveSlots(self: &mut Self, additional: usize) -> () ! OutOfMemoryError ? &mut Allocator { run self.slotList.reserveExact(additional) }
+  /// Moves the slots out, leaving none.
+  @inlineAlways
+  pub fn takeSlots(self: &mut Self) -> ThinList<SlotBits> {
+    let taken = unsafe Pointer.take<ThinList<SlotBits>>(Pointer.fromMutRef<ThinList<SlotBits>>(&mut self.slotList))
+    unsafe Pointer.put<ThinList<SlotBits>>(Pointer.fromMutRef<ThinList<SlotBits>>(&mut self.slotList), ThinList<SlotBits>.make())
+    return move taken
+  }
+  /// Replaces the slots (dropping the old ones) with slots.
+  @inlineAlways
+  pub fn setSlots(self: &mut Self, slots: ThinList<SlotBits>) -> () { self.slotList = move slots }
+  /// Stores slots over uninitialized slot storage, dropping nothing.
+  @inlineAlways
+  pub unsafe fn putSlots(self: &mut Self, slots: ThinList<SlotBits>) -> () {
+    unsafe Pointer.put<ThinList<SlotBits>>(Pointer.fromMutRef<ThinList<SlotBits>>(&mut self.slotList), move slots)
+  }
+  /// The slot list itself, for code that still works on a ThinList.
+  @inlineAlways
+  pub fn slotListMut(self: &mut Self) -> &mut ThinList<SlotBits> { return &mut self.slotList }
 }
 @inlineAlways
 fn classBits(classId: u32) -> u16 {
