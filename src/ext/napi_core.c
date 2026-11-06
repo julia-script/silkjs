@@ -1,7 +1,6 @@
 /* SilkJS Node-API environment, scoped handles and dynamic addon entry points.
  * SPDX-License-Identifier: MIT */
 #include "napi_bridge.h"
-#include "process_diagnostics.h"
 #include <dlfcn.h>
 #include <limits.h>
 #include <stdalign.h>
@@ -38,6 +37,10 @@ static void release_library(struct silk_napi_registration *library) {
 static _Thread_local napi_module *registration;
 static _Thread_local int legacy_registration;
 static _Thread_local char load_error[2048];
+/* The isolate whose report settings napi_fatal_error uses; set by napi_native. */
+static _Thread_local void *fatal_context;
+void silk_napi_fatal_context(void *context) { fatal_context = context; }
+void silkNodeFatalReport(void *context, const char *location, size_t location_length, const char *message, size_t message_length);
 static const char *const errors[] = { "", "Invalid argument", "An object was expected", "A string was expected", "A string or symbol was expected", "A function was expected", "A number was expected", "A boolean was expected", "An array was expected", "Unknown failure", "An exception is pending", "The async work item was cancelled", "napi_escape_handle already called", "Invalid handle scope usage", "Invalid callback scope usage", "Thread-safe function queue is full", "Thread-safe function is closing", "A bigint was expected", "A date was expected", "An arraybuffer was expected", "A detachable arraybuffer was expected", "Would deadlock", "No external buffers allowed", "Cannot run JavaScript" };
 static size_t stride(napi_env e) { size_t n = sizeof(struct napi_value__) + e->value_size; return (n + alignof(max_align_t)-1) & ~(alignof(max_align_t)-1); }
 int silk_napi_on_owner(napi_env e) { if (!e) return 0; uv_thread_t current=uv_thread_self(); return uv_thread_equal(&e->owner,&current); }
@@ -168,7 +171,7 @@ NAPI_EXTERN void napi_fatal_error(const char *location, size_t llen,
   if (!message) message = "";
   if (llen == NAPI_AUTO_LENGTH) llen = strlen(location);
   if (mlen == NAPI_AUTO_LENGTH) mlen = strlen(message);
-  silk_diagnostics_fatal(location, llen, message, mlen);
+  if (fatal_context) silkNodeFatalReport(fatal_context, location, llen, message, mlen);
   fputs("FATAL ERROR: ", stderr);
   fwrite(location, 1, llen, stderr); fputc(' ', stderr);
   fwrite(message, 1, mlen, stderr); fputc('\n', stderr);

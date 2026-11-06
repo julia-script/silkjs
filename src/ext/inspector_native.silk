@@ -9,6 +9,7 @@ import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.core.option { Option }
 import silk.collections.list { List }
+import silk.collections.slice { Slice }
 import silk.num.f64
 import silk.num.i32
 import silk.num.u32
@@ -31,7 +32,9 @@ import silkjs.js_debugger as debugger
 import silkjs.js_string_rope { RopeIterator }
 import ext.script_metadata as metadata
 import ext.inspector_transport as transport
-import ext.process_diagnostics as diagnostics
+import ext.diagnostics_hub as hub
+import ext.diagnostics_hub { Mailbox }
+import ext.inspector_route as route
 import ext.inspector_debugger as debug
 import ext.inspector_evaluate as evaluation
 import ext.inspector_values as values
@@ -44,25 +47,26 @@ struct Notification { kind:u32, payload:ValueBits }
 impl Copy for Notification {}
 pub struct State {
   server:*mut u8, callback:ValueBits, debug:debug.State,
-  pumping:bool, depth:usize, notifications:List<Notification>, consumed:usize, breakOnEntry:bool
+  pumping:bool, depth:usize, notifications:List<Notification>, consumed:usize, breakOnEntry:bool, mailbox:Mailbox
 }
 pub const BASE:u32=15000
 pub const COUNT:u32=32
 unsafe fn nn<T>(pointer:?*mut T)->*mut T { return unsafe Intrinsic.pointerRequalify<?*mut T,*mut T>(pointer) }
 unsafe fn raw<T>(pointer:*mut T)->*mut u8 { return unsafe Intrinsic.pointerReinterpret<*mut T,*mut u8>(pointer) }
-pub effect fn create(wake:?*mut u8)->*mut State !OutOfMemoryError {
+pub effect fn create(wake:?*mut u8,mailbox:Mailbox)->*mut State !OutOfMemoryError {
   let memory=unsafe calloc(1,Layout.of<State>().bytes)
   if Pointer.isNull<u8>(memory) { fail OutOfMemoryError {} }
   let server=unsafe transport.silk_inspector_create(wake)
   if Pointer.isNull<u8>(server) { unsafe free(memory) fail OutOfMemoryError {} }
   let state=unsafe Intrinsic.pointerReinterpret<*mut u8,*mut State>(unsafe nn(memory))
-  unsafe Pointer.put<State>(state,State { server:unsafe nn(server),callback:ValueBits.Undefined,debug:debug.create(),pumping:false,depth:0,notifications:List<Notification>.make(),consumed:0,breakOnEntry:false })
+  unsafe Pointer.put<State>(state,State { server:unsafe nn(server),callback:ValueBits.Undefined,debug:debug.create(),pumping:false,depth:0,notifications:List<Notification>.make(),consumed:0,breakOnEntry:false,mailbox:mailbox })
   return state
 }
 unsafe fn debugState(state:*mut State)->*mut debug.State {
   let mut a=() let s=unsafe Pointer.borrowMut<(),State>(&mut a,state) return Pointer.fromMutRef<debug.State>(&mut s.debug)
 }
 unsafe fn server(state:*mut State)->*mut u8 { let a=() let s=unsafe Pointer.borrow<(),State>(&a,state) return s.server }
+unsafe fn mailbox(state:*mut State)->Mailbox { let a=() let s=unsafe Pointer.borrow<(),State>(&a,state) return s.mailbox }
 pub unsafe fn dispose<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State)->() {
   unsafe transport.silk_inspector_stop(unsafe server(state))
   unsafe debug.dispose(&mut engine,context,unsafe debugState(state))
@@ -146,7 +150,7 @@ pub unsafe effect fn debuggerEvent<'m,S:EngineServices>(engine:&mut Engine<'m,S>
 }
 unsafe effect fn pumpBody<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State,waitMs:i32,parkedOnly:bool)->() !OutOfMemoryError|JsException ?&mut Allocator {
   let socket=unsafe server(state)
-  if waitMs>0 && unsafe transport.silk_inspector_pending(socket)==0 && unsafe transport.silk_inspector_route_pending()==0 {
+  if waitMs>0 && unsafe transport.silk_inspector_pending(socket)==0 && !unsafe route.pending(unsafe mailbox(state)) {
     let mut delay=if waitMs>10 { 10 } else { waitMs }
     let remaining=unsafe vm.remainingNanoseconds(unsafe runtime.contextRuntime(context))
     if remaining>=0 && remaining<10000000 { delay=0 }
@@ -154,7 +158,7 @@ unsafe effect fn pumpBody<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:
       let mut byte:u8=0
       let listening=unsafe transport.silk_inspector_url(socket,Pointer.fromMutRef<u8>(&mut byte),0)!=0
       if listening { let ignored=unsafe transport.silk_inspector_wait(socket,delay) }
-      else { let ignored=unsafe transport.silk_inspector_route_wait(i32.toU32(delay)) }
+      else { let _ignored=unsafe route.wait(unsafe mailbox(state),i32.toU32(delay)) }
     }
   }
   let mut processed:usize=0
@@ -174,12 +178,11 @@ unsafe effect fn pumpBody<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:
   }
   processed=0
   while processed<256 && (!parkedOnly || unsafe parkedGuest(context)) {
-    let mut length:usize=0 let pending=unsafe transport.silk_inspector_route_take(Pointer.fromMutRef<usize>(&mut length))
-    if Pointer.isNull<u8>(pending) { break }
-    let packet=unsafe nn(pending) let source=unsafe transport.silk_inspector_route_source(packet)
-    let kind=unsafe transport.silk_inspector_route_kind(packet) let session=unsafe transport.silk_inspector_route_session(packet)
-    let decoded=if length==0 { Result<Value,JsException>.Success { value:Value.immediate(ValueBits.Undefined) } } else { run Effect.result(text.stringPointer(&mut engine,unsafe lendRealm(&context, context),unsafe transport.silk_inspector_route_data(packet),length)) }
-    unsafe transport.silk_inspector_route_free(packet)
+    let packet=match unsafe route.take(unsafe mailbox(state)) { Option<route.Route>.Some { value }=>move value _=>{ break } }
+    let source=packet.source let kind=packet.kind let session=packet.session
+    let data=packet.data()
+    let decoded=if data.length==0 { Result<Value,JsException>.Success { value:Value.immediate(ValueBits.Undefined) } } else { run Effect.result(text.string(&mut engine,unsafe lendRealm(&context, context),data)) }
+    drop data drop packet
     let payload=match move decoded { Result<Value,JsException>.Success { value }=>value.intoBits() Result<Value,JsException>.Failure { error }=>{ fail move error } }
     run unsafe invoke(&mut engine,context,state,kind,session,payload,ValueBits.number(u32.toF64(source)))
     run unsafe drainNotifications(&mut engine,context,state) processed=processed+1
@@ -209,13 +212,14 @@ pub unsafe effect fn dispatch<'m,S:EngineServices>(engine:&mut Engine<'m,S>,cont
     } else { run unsafe markEntry(&mut engine,context,state,first) }
     return ValueBits.Undefined
   }
-  if operation==16 { return run unsafe ownerIds(&mut engine,context) }
+  if operation==16 { return run unsafe ownerIds(&mut engine,context,unsafe mailbox(state)) }
   if operation==17 {
-    if unsafe diagnostics.silk_diagnostics_owner_id()!=0 { return run engine.throwError(unsafe lendRealm(&context, context),NativeErrorKind.Type,b"Worker auto-attach policy belongs to the main isolate") }
-    unsafe diagnostics.silk_diagnostics_inspector_wait_set(if match first { ValueBits.Bool { value }=>value _=>false } { 1 } else { 0 })
+    let attached=unsafe mailbox(state)
+    if unsafe attached.id()!=0 { return run engine.throwError(unsafe lendRealm(&context, context),NativeErrorKind.Type,b"Worker auto-attach policy belongs to the main isolate") }
+    unsafe hub.setInspectorWait(unsafe mailbox(state),match first { ValueBits.Bool { value }=>value _=>false })
     return ValueBits.Undefined
   }
-  if operation==18 { return ValueBits.Bool { value:unsafe diagnostics.silk_diagnostics_inspector_wait_get()!=0 } }
+  if operation==18 { return ValueBits.Bool { value:unsafe hub.inspectorWait(unsafe mailbox(state)) } }
   if operation==9 {
     let requested=unsafe common.argument(argv,1) let mut limit:usize=4294967295
     if requested.isNumber() && requested.numericValue()>=0.0 && requested.numericValue()<4294967295.0 { limit=f64.toUsize(requested.numericValue()) }
@@ -248,15 +252,15 @@ pub unsafe effect fn dispatch<'m,S:EngineServices>(engine:&mut Engine<'m,S>,cont
     let session=if operation==5 { first } else { unsafe common.argument(argv,1) }
     let payload=unsafe common.argument(argv,if operation==5 { 1 } else { 3 })
     let mut bytes=run text.text(&mut engine,unsafe lendRealm(&context, context),unsafe lendFor(payload)) let length=bytes.length() run bytes.append(0)
-    let owner=unsafe diagnostics.silk_diagnostics_owner_id()
+    let attached=unsafe mailbox(state) let owner=unsafe attached.id()
     let source=unsafe common.argument(argv,2)
     let target=if operation==6 { first.numericValue() } else { if source.isNumber() { source.numericValue() } else { -1.0 } }
     let status=if target<0.0 { unsafe transport.silk_inspector_send(socket,f64.toU64(session.numericValue()),text.pointer(&bytes),length) }
-      else { unsafe transport.silk_inspector_route_send(f64.toU32(target),owner,f64.toU64(session.numericValue()),if operation==6 { f64.toU32(source.numericValue()) } else { 4 },text.pointer(&bytes),length) }
+      else { unsafe route.send(unsafe mailbox(state),f64.toU32(target),owner,f64.toU64(session.numericValue()),if operation==6 { f64.toU32(source.numericValue()) } else { route.ROUTE_RESPONSE },Slice.view<u8>(bytes.asSlice(),0,length)) }
     return ValueBits.Bool { value:status==0 }
   }
   if operation==7 { unsafe debugger.configure(unsafe runtime.contextRuntime(context),match first { ValueBits.Bool { value }=>value _=>false }) return ValueBits.Undefined }
-  if operation==10 { return ValueBits.number(u32.toF64(unsafe diagnostics.silk_diagnostics_owner_id())) }
+  if operation==10 { let attached=unsafe mailbox(state) return ValueBits.number(u32.toF64(unsafe attached.id())) }
   return run engine.throwError(unsafe lendRealm(&context, context),NativeErrorKind.Type,b"Unknown inspector native operation")
 }
 // Engine service callbacks cannot throw an effect. Promote a broken control
@@ -360,25 +364,19 @@ pub unsafe effect fn markEntry<'m,S:EngineServices>(engine:&mut Engine<'m,S>,con
     unsafe debugger.configure(rt,true) unsafe debugger.requestPauseOnEntry(rt,bytecode,sourceStart,sourceEnd)
   }
 }
-unsafe effect fn ownerIdsBody<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,ids:?*mut u32,count:usize,scope:&mut Scope)->ValueBits !OutOfMemoryError|JsException ?&mut Allocator {
+unsafe effect fn ownerIdsBody<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,ids:&List<u32>,scope:&mut Scope)->ValueBits !OutOfMemoryError|JsException ?&mut Allocator {
   let memory=engine.memory scope.values[0]=run unsafe common.array(&mut engine,memory,context)
-  if count!=0 {
-    let pointer=unsafe Pointer.assumeMany<u32>(unsafe nn(ids))
-    let mut i:usize=0
-    while i<count {
-      let id=unsafe Pointer.read<u32>(unsafe Pointer.at<u32>(pointer,i))
-      run unsafe common.defineIndex(&mut engine,context,scope.values[0],usize.toU32(i),ValueBits.number(u32.toF64(id)))
-      i=i+1
-    }
+  let mut i:usize=0
+  while i<ids.length() {
+    run unsafe common.defineIndex(&mut engine,context,scope.values[0],usize.toU32(i),ValueBits.number(u32.toF64(ids.get(i))))
+    i=i+1
   }
   return scope.take(0)
 }
-unsafe effect fn ownerIds<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader)->ValueBits !OutOfMemoryError|JsException ?&mut Allocator {
-  let mut count:usize=0 let ids=unsafe diagnostics.silk_diagnostics_owner_ids(Pointer.fromMutRef<usize>(&mut count))
-  if count!=0 && Pointer.isNull<u32>(ids) { fail OutOfMemoryError {} }
+unsafe effect fn ownerIds<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,mailbox:Mailbox)->ValueBits !OutOfMemoryError|JsException ?&mut Allocator {
+  let ids=run hub.ownerIds(mailbox)
   let mut scope=Scope.make()
-  let result=run Effect.result(unsafe ownerIdsBody(&mut engine,context,ids,count,&mut scope))
-  unsafe free(unsafe Intrinsic.pointerReinterpret<?*mut u32,?*mut u8>(ids))
+  let result=run Effect.result(unsafe ownerIdsBody(&mut engine,context,&ids,&mut scope))
   unsafe owners.cleanup(&mut engine,context,move scope)
   return match move result { Result<ValueBits,OutOfMemoryError|JsException>.Success { value }=>value Result<ValueBits,OutOfMemoryError|JsException>.Failure { error }=>{ fail move error } }
 }
