@@ -2,7 +2,6 @@
 
 const host = require('internal/host');
 const { Writable } = require('stream');
-const { Socket } = require('net');
 const { native, error: nativeError } = require('internal/net/transport');
 const { writeAll } = require('internal/tty/write');
 const fs = require('fs');
@@ -11,7 +10,7 @@ function socket(fd, reading) {
   const owned = native('duplicateFd', [fd]);
   if (owned < 0) throw nativeError(owned, 'dup');
   let stream;
-  try { stream = new Socket({ fd: owned, readable: reading, writable: !reading, manualStart: true }); }
+  try { stream = new (require('net').Socket)({ fd: owned, readable: reading, writable: !reading, manualStart: true }); }
   catch (error) { fs.closeSync(owned); throw error; }
   stream.fd = fd;
   stream._type = 'pipe';

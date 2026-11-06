@@ -1,6 +1,8 @@
 //! Node workers run independent engines on detached OS threads. Only native
 //! packets cross threads. libuv async handles wake the receiving runtime.
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silkjs.js_owned_value { lendFor }
+import silkjs.js_realm { lendRealm }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.core.option { Option }
@@ -15,7 +17,7 @@ import silk.num.f64
 import silkjs.js_engine { Engine }
 import silkjs.js_engine_host { EngineServices }
 import silkjs.js_heap { HeapHeader }
-import silkjs.js_value { Value }
+import silkjs.js_value { ValueBits }
 import silkjs.js_core_types { FrameSlots, NativeFunctionId, NativeErrorKind }
 import silkjs.js_exceptions { JsException }
 import silkjs.js_coercion_host { CoercionHooks }
@@ -27,9 +29,9 @@ import silkjs.js_os_workers_transport as shared
 import silkjs.js_buffer_storage as buffers
 import silkjs.js_class_data as classes
 import silkjs.js_object_allocate as objects
-import silkjs.js_collection_support as owners
-import silkjs.js_collection_support { Scope }
-import silkjs.js_intl_common as common
+import libs.core.owners as owners
+import libs.core.owners { Scope }
+import libs.core.common as common
 import silkjs.js_proxy_core as core
 import silkjs.js_runtime as runtime
 import libs.core.host as host
@@ -44,19 +46,29 @@ import silkjs.utf8 { Utf8 }
 import ext.vm_interrupt
 import ext.vm_interrupt { Slot }
 import ext.process_diagnostics as diagnostics
+import ext.diagnostics_hub as hub
+import ext.diagnostics_hub { Mailbox }
+import ext.diagnostics_fatal as fatalReport
+import ext.diagnostics_fatal { ReportingAllocator }
 
 unsafe extern "C" fn uv_handle_size(kind: i32) -> usize
-unsafe extern "C" fn uv_async_init(loop: *mut u8, handle: *mut u8, callback: extern "C" fn(*mut u8) -> ()) -> i32 with Intrinsic.foreign(deferredCallbacks: ("callback",))
-unsafe extern "C" fn uv_close(handle: *mut u8, callback: extern "C" fn(*mut u8) -> ()) -> () with Intrinsic.foreign(deferredCallbacks: ("callback",))
-unsafe extern "C" fn uv_ref(handle: *mut u8) -> () with Intrinsic.foreign(noCapture: ("handle",))
-unsafe extern "C" fn uv_unref(handle: *mut u8) -> () with Intrinsic.foreign(noCapture: ("handle",))
+@deferredCallbacks("callback")
+unsafe extern "C" fn uv_async_init(loop: *mut u8, handle: *mut u8, callback: extern "C" fn(*mut u8) -> ()) -> i32
+@deferredCallbacks("callback")
+unsafe extern "C" fn uv_close(handle: *mut u8, callback: extern "C" fn(*mut u8) -> ()) -> ()
+@foreign(noCapture: .("handle"))
+unsafe extern "C" fn uv_ref(handle: *mut u8) -> ()
+@foreign(noCapture: .("handle"))
+unsafe extern "C" fn uv_unref(handle: *mut u8) -> ()
 unsafe extern "C" fn pthread_attr_init(attributes: *mut u8) -> i32
 unsafe extern "C" fn pthread_attr_setstacksize(attributes: *mut u8, size: usize) -> i32
 unsafe extern "C" fn pthread_attr_setdetachstate(attributes: *mut u8, state: i32) -> i32
 unsafe extern "C" fn pthread_attr_destroy(attributes: *mut u8) -> i32
-unsafe extern "C" fn pthread_create(thread: *mut usize, attributes: ?*const u8, start: extern "C" fn(?*mut u8) -> ?*mut u8, argument: ?*mut u8) -> i32 with Intrinsic.foreign(threadCallbacks: ("start",))
-unsafe extern "C" fn uv_thread_setname(name: *const u8) -> i32 with Intrinsic.foreign(noCapture: ("name",))
-pub struct State { pub group: Group, pub id: u32, pub control: u32, pub metadata: List<u8>, wake: ?*mut u8, signalGuards: ?*mut SignalGuard, nextSignalGuard: u32 }
+@threadCallbacks("start")
+unsafe extern "C" fn pthread_create(thread: *mut usize, attributes: ?*const u8, start: extern "C" fn(?*mut u8) -> ?*mut u8, argument: ?*mut u8) -> i32
+@foreign(noCapture: .("name"))
+unsafe extern "C" fn uv_thread_setname(name: *const u8) -> i32
+pub struct State { pub group: Group, pub id: u32, pub control: u32, pub metadata: List<u8>, wake: ?*mut u8, signalGuards: ?*mut SignalGuard, nextSignalGuard: u32, diagnostics: Option<Mailbox> }
 pub struct Start { pub group: Group, pub id: u32, pub control: u32, pub metadata: List<u8>, name: [u8; 64] }
 struct SignalGuard { next: ?*mut SignalGuard, id: u32, watcher: Arc<vm_interrupt.Service>, slot: vm_interrupt.Slot }
 fn equal(a: &[u8], b: &[u8]) -> bool { if a.length != b.length { return false } let mut i: usize = 0 while i < a.length { if a[i] != b[i] { return false } i = i + 1 } return true }
@@ -74,7 +86,11 @@ pub effect fn mainState(process: &Process, domain: Domain) -> *mut State ! OutOf
 }
 pub effect fn makeState(group: Group, id: u32, control: u32, metadata: List<u8>) -> *mut State ! OutOfMemoryError {
   let pointer = run transport.allocate<State>(&group.resources)
-  unsafe Pointer.put<State>(pointer, State { group: move group, id: id, control: control, metadata: move metadata, wake: Pointer.null<u8>(), signalGuards: Pointer.null<SignalGuard>(), nextSignalGuard: 1 }) return pointer
+  unsafe Pointer.put<State>(pointer, State { group: move group, id: id, control: control, metadata: move metadata, wake: Pointer.null<u8>(), signalGuards: Pointer.null<SignalGuard>(), nextSignalGuard: 1, diagnostics: Option<Mailbox>.none() }) return pointer
+}
+/// The process resource accounting shared by every isolate of the group.
+pub unsafe fn groupResources(pointer: *mut State) -> resources.Resources {
+  let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer) return state.group.resources.clone()
 }
 pub unsafe fn domain(pointer: *mut State) -> Domain {
   let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer) let guard = state.group.registry.get().lock()
@@ -97,9 +113,32 @@ pub unsafe effect fn attach(pointer: *mut State, loop: *mut u8) -> () ! OutOfMem
   if Pointer.isNull<u8>(wake) { fail OutOfMemoryError {} }
   if unsafe uv_async_init(loop, unsafe nonnull(wake), silkNodeWorkerWake) != 0 { unsafe resources.release(wake) fail OutOfMemoryError {} }
   state.wake = wake unsafe uv_unref(unsafe nonnull(wake))
-  if unsafe diagnostics.silk_diagnostics_attach(state.id, unsafe nonnull(wake)) != 0 { fail OutOfMemoryError {} }
   let guard = state.group.registry.get().lock() let mut threadAnchor = ()
   let entry = unsafe Pointer.borrowMut<(), Thread>(&mut threadAnchor, unsafe nonnull(unsafe transport.thread(guard.get(), state.id))) entry.wake = wake
+  drop entry drop guard
+  state.diagnostics = Option<Mailbox>.some(run hub.attach(&state.group, state.id))
+}
+/// The isolate's diagnostics mailbox, from attach until shutdown.
+pub unsafe fn mailbox(pointer: *mut State) -> Option<Mailbox> {
+  let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer)
+  return state.diagnostics
+}
+/// Writes the fatal report for this isolate when enabled; the caller terminates.
+pub unsafe fn fatal(pointer: *mut State, location: &[u8], message: &[u8]) -> () {
+  let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer)
+  unsafe fatalReport.report(&state.group.reports, state.id, location, message)
+}
+/// napi_fatal_error's report; `state` is the calling isolate's worker state.
+export "C" fn silkNodeFatalReport(state: *mut u8, location: *const u8, locationLength: usize, message: *const u8, messageLength: usize) -> () {
+  let anchor = ()
+  let where = unsafe Pointer.borrowMany<(), u8>(&anchor, unsafe Pointer.assumeMany<u8>(location), locationLength)
+  let what = unsafe Pointer.borrowMany<(), u8>(&anchor, unsafe Pointer.assumeMany<u8>(message), messageLength)
+  unsafe fatal(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut State>(state), where, what)
+}
+/// The allocator under this isolate's runtime heap.
+pub unsafe fn reportingAllocator(pointer: *mut State) -> ReportingAllocator {
+  let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer)
+  return ReportingAllocator.make(state.group.reports.clone(), state.id)
 }
 // Borrowed until shutdown; polling restores its reference flag before calling JS.
 pub unsafe fn loopAnchor(pointer: *mut State) -> *mut u8 {
@@ -136,13 +175,13 @@ unsafe fn clearSignalGuards(pointer: *mut State) -> () {
 }
 // A REPL guard spans separate native calls around terminal raw-mode changes.
 // Unlike an ordinary VM slot, this registration must own stable native storage.
-unsafe effect fn startSignalGuard<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pointer: *mut State) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+unsafe effect fn startSignalGuard<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pointer: *mut State) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
   let acquired = run Effect.result(unsafe vmWatchdog(pointer))
   let watcher = match move acquired {
     Result<Arc<vm_interrupt.Service>, OutOfMemoryError | vm_interrupt.StartError>.Success { value } => move value
     Result<Arc<vm_interrupt.Service>, OutOfMemoryError | vm_interrupt.StartError>.Failure { error } => match move error {
       OutOfMemoryError {} => { fail OutOfMemoryError {} }
-      vm_interrupt.StartError { .. } => { return run unsafe engine.throwError(context, NativeErrorKind.Internal, b"ERR_CANNOT_WATCH_SIGINT: Cannot watch for SIGINT signals") }
+      vm_interrupt.StartError { .. } => { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Internal, b"ERR_CANNOT_WATCH_SIGINT: Cannot watch for SIGINT signals") }
     }
   }
   let mut anchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer)
@@ -156,12 +195,12 @@ unsafe effect fn startSignalGuard<'m, S: EngineServices>(engine: &mut Engine<'m,
   if status != 0 {
     let owned = unsafe Pointer.take<SignalGuard>(allocated) drop owned
     unsafe resources.release(unsafe transport.raw(allocated))
-    return run unsafe engine.throwError(context, NativeErrorKind.Internal, b"ERR_CANNOT_WATCH_SIGINT: Cannot watch for SIGINT signals")
+    return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Internal, b"ERR_CANNOT_WATCH_SIGINT: Cannot watch for SIGINT signals")
   }
   let changed = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer) changed.signalGuards = allocated
-  return Value.number(u32.toF64(id))
+  return ValueBits.number(u32.toF64(id))
 }
-unsafe effect fn stopSignalGuard<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pointer: *mut State, id: u32) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+unsafe effect fn stopSignalGuard<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pointer: *mut State, id: u32) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
   let mut anchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer)
   let mut link = Pointer.fromMutRef<?*mut SignalGuard>(&mut state.signalGuards) drop state
   while !Pointer.isNull<SignalGuard>(unsafe Pointer.read<?*mut SignalGuard>(link)) {
@@ -169,11 +208,11 @@ unsafe effect fn stopSignalGuard<'m, S: EngineServices>(engine: &mut Engine<'m, 
     let guard = unsafe Pointer.borrowMut<(), SignalGuard>(&mut anchor, current)
     if guard.id == id {
       unsafe Pointer.put<?*mut SignalGuard>(link, guard.next) drop guard
-      return Value.Bool { value: unsafe releaseSignalGuard(current) }
+      return ValueBits.Bool { value: unsafe releaseSignalGuard(current) }
     }
     link = Pointer.fromMutRef<?*mut SignalGuard>(&mut guard.next) drop guard
   }
-  return run unsafe core.error(&mut engine, context, b"Invalid SIGINT guard")
+  return run core.error(&mut engine, unsafe lendRealm(&context, context), b"Invalid SIGINT guard")
 }
 pub unsafe fn shouldInterrupt(optional: ?*mut State) -> bool {
   if Pointer.isNull<State>(optional) { return false }
@@ -200,7 +239,9 @@ unsafe fn updateRef(pointer: *mut State) -> () {
 }
 pub unsafe fn shutdown(pointer: *mut State) -> () {
   // Remove the mailbox before closing its wake handle or destroying any heap.
-  unsafe diagnostics.silk_diagnostics_detach()
+  let mut detachAnchor = () let attached = unsafe Pointer.borrowMut<(), State>(&mut detachAnchor, pointer)
+  let mailbox = Intrinsic.replace(attached.diagnostics, Option<Mailbox>.none()) drop attached
+  if let Option<Mailbox>.Some { value } = mailbox { unsafe hub.detach(value) }
   unsafe clearSignalGuards(pointer)
   let mut stateAnchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut stateAnchor, pointer)
   let mut guard = state.group.registry.get().lock() let mut anchor = ()
@@ -246,7 +287,7 @@ export "C" fn silkNodeWorkerEntry(raw: ?*mut u8) -> ?*mut u8 {
 // JavaScript name in metadata; only this bounded, NUL-terminated copy crosses
 // the thread-start boundary. Neither a heap allocation nor full-string encoding
 // is needed, including for arbitrarily long user names.
-fn nativeThreadName(value: Value) -> [u8; 64] {
+fn nativeThreadName(value: ValueBits) -> [u8; 64] {
   let mut name: [u8; 64] = [0; 64]
   let mut index: usize = 0 let mut written: usize = 0
   while index < Strings.length(value) && written < 63 {
@@ -295,27 +336,27 @@ unsafe effect fn spawn(state: &State, metadata: List<u8>, control: u32, stackSiz
   return id
 }
 
-fn number(value: Value) -> u32 { if !value.isNumber() { return 0 } let n = value.numericValue() if n < 0.0 || n > 4294967295.0 || f64.trunc(n) != n { return 0 } return f64.toU32(n) }
-fn boolean(value: Value) -> bool { return match value { Value.Bool { value: flag } => flag _ => false } }
-unsafe effect fn length<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, array: Value) -> u32 ! JsException ? &mut Allocator {
+fn number(value: ValueBits) -> u32 { if !value.isNumber() { return 0 } let n = value.numericValue() if n < 0.0 || n > 4294967295.0 || f64.trunc(n) != n { return 0 } return f64.toU32(n) }
+fn boolean(value: ValueBits) -> bool { return match value { ValueBits.Bool { value: flag } => flag _ => false } }
+unsafe effect fn length<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, array: ValueBits) -> u32 ! JsException ? &mut Allocator {
   let value = run unsafe common.get(&mut engine, context, array, b"length") let count = number(value) unsafe owners.release(&mut engine, context, value) return count
 }
-unsafe effect fn copyWire<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, value: Value, group: &Group) -> List<u8> ! OutOfMemoryError | JsException ? &mut Allocator {
+unsafe effect fn copyWire<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, value: ValueBits, group: &Group) -> List<u8> ! OutOfMemoryError | JsException ? &mut Allocator {
   let mut offset: u64 = 0 let mut count: u64 = 0 let mut object = value
   if !unsafe buffers.isBuffer(value) {
-    if !value.isObject() { return run unsafe core.error(&mut engine, context, b"worker wire must be an ArrayBuffer view") }
+    if !value.isObject() { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"worker wire must be an ArrayBuffer view") }
     let id = unsafe buffers.classId(value)
-    if id < classes.JS_CLASS_UINT8C_ARRAY || id > classes.JS_CLASS_DATAVIEW { return run unsafe core.error(&mut engine, context, b"worker wire must be an ArrayBuffer view") }
-    let view = unsafe buffers.view(core.reference(value)) object = Value.Object { reference: view.buffer } offset = view.offset count = view.byteLength
+    if id < classes.JS_CLASS_UINT8C_ARRAY || id > classes.JS_CLASS_DATAVIEW { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"worker wire must be an ArrayBuffer view") }
+    let view = unsafe buffers.view(core.reference(value)) object = ValueBits.Object { reference: view.buffer } offset = view.offset count = view.byteLength
   }
-  let backing = run unsafe buffers.getArrayBuffer(&mut engine, context, object)
+  let backing = run buffers.getArrayBuffer(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(object))
   if unsafe buffers.isBuffer(value) { count = backing.byteLength }
-  if offset > backing.byteLength || count > backing.byteLength - offset { return run unsafe core.error(&mut engine, context, b"worker wire view is out of bounds") }
+  if offset > backing.byteLength || count > backing.byteLength - offset { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"worker wire view is out of bounds") }
   let mut allocator = group.resources.clone() let mut bytes = List<u8>.make() let mut index: u64 = 0
   while index < count { run bytes.append(u64.toU8(unsafe buffers.loadScalar(backing, offset + index, 0))) |> Effect.provideMut<Allocator>(&mut allocator) index = index + 1 }
   return move bytes
 }
-unsafe effect fn collectValues<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, array: Value, values: &mut List<Value>) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+unsafe effect fn collectValues<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, array: ValueBits, values: &mut List<ValueBits>) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
   let count = run unsafe length(&mut engine, context, array) let mut index: u32 = 0
   while index < count {
     let value = run unsafe owners.getIndex(&mut engine, context, array, index)
@@ -329,13 +370,13 @@ unsafe effect fn sharedEntry<'m, S: EngineServices>(engine: &mut Engine<'m, S>, 
     return Shared.Native { lease: run unsafe buffers.leaseBacking(object) }
   }
   if unsafe buffers.hasBorrowedSharedBacking(object) {
-    return run unsafe core.error(&mut engine, context, b"SharedArrayBuffer backing has no independent owner")
+    return run core.error(&mut engine, unsafe lendRealm(&context, context), b"SharedArrayBuffer backing has no independent owner")
   }
   let backing = unsafe buffers.snapshot(object)
   unsafe shared.duplicateShared(backing.data)
   return Shared.Host { data: backing.data, length: backing.byteLength, capacity: backing.physicalCapacity }
 }
-unsafe effect fn preparePost<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, args: &owners.Scope, values: &mut List<Value>, sharedValues: &mut List<Value>) -> Message ! OutOfMemoryError | JsException ? &mut Allocator {
+unsafe effect fn preparePost<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, args: &owners.Scope, values: &mut List<ValueBits>, sharedValues: &mut List<ValueBits>) -> Message ! OutOfMemoryError | JsException ? &mut Allocator {
   let bytes = run unsafe copyWire(&mut engine, context, args.values[1], &state.group)
   run unsafe collectValues(&mut engine, context, args.values[2], &mut values)
   run unsafe collectValues(&mut engine, context, args.values[3], &mut sharedValues)
@@ -346,14 +387,14 @@ unsafe effect fn preparePost<'m, S: EngineServices>(engine: &mut Engine<'m, S>, 
   let mut at: usize = 0
   while at < values.length() {
     let value = values.get(at)
-    let object = run unsafe buffers.requireBuffer(&mut engine, context, value, 0)
-    if !unsafe buffers.canTransfer(object) { return run unsafe core.error(&mut engine, context, b"ArrayBuffer is detached or not transferable") }
-    let mut earlier: usize = 0 while earlier < at { if Pointer.address(core.reference(values.get(earlier))) == Pointer.address(object) { return run unsafe core.error(&mut engine, context, b"duplicate ArrayBuffer in transfer list") } earlier = earlier + 1 }
+    let object = (run buffers.requireBuffer(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(value), 0)).header()
+    if !unsafe buffers.canTransfer(object) { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"ArrayBuffer is detached or not transferable") }
+    let mut earlier: usize = 0 while earlier < at { if Pointer.address(core.reference(values.get(earlier))) == Pointer.address(object) { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"duplicate ArrayBuffer in transfer list") } earlier = earlier + 1 }
     at = at + 1
   }
   at = 0
   while at < sharedValues.length() {
-    let object = run unsafe buffers.requireBuffer(&mut engine, context, sharedValues.get(at), 1)
+    let object = (run buffers.requireBuffer(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(sharedValues.get(at)), 1)).header()
     let entry = run unsafe sharedEntry(&mut engine, context, object)
     run message.shared.append(move entry) |> Effect.provideMut<Allocator>(&mut allocator)
     at = at + 1
@@ -362,7 +403,7 @@ unsafe effect fn preparePost<'m, S: EngineServices>(engine: &mut Engine<'m, S>, 
   while at < values.length() { let lease = run unsafe buffers.prepareTransfer(core.reference(values.get(at))) run message.buffers.append(move lease) |> Effect.provideMut<Allocator>(&mut allocator) at = at + 1 }
   return move message
 }
-unsafe effect fn commitPost<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, id: u32, message: Message, values: &List<Value>) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+unsafe effect fn commitPost<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, id: u32, message: Message, values: &List<ValueBits>) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
   let pointer = run transport.allocate<Message>(&state.group.resources)
   let guard = state.group.registry.get().lock() let registry = guard.get()
   let sourcePointer = unsafe transport.endpoint(registry, id)
@@ -376,7 +417,7 @@ unsafe effect fn commitPost<'m, S: EngineServices>(engine: &mut Engine<'m, S>, c
     let mut earlier: usize = 0 while valid && earlier < index { if message.ports.get(earlier) == port { valid = false } earlier = earlier + 1 }
     index = index + 1
   }
-  if !valid { drop guard unsafe resources.release(unsafe transport.raw(pointer)) return run unsafe core.error(&mut engine, context, b"MessagePort is closed, transferred, or duplicated in transfer list") }
+  if !valid { drop guard unsafe resources.release(unsafe transport.raw(pointer)) return run core.error(&mut engine, unsafe lendRealm(&context, context), b"MessagePort is closed, transferred, or duplicated in transfer list") }
   index = 0 while index < values.length() { unsafe buffers.detach(&mut engine, unsafe runtime.contextRuntime(context), values.get(index)) index = index + 1 }
   let mut mutable = () index = 0
   while index < message.ports.length() { let entry = unsafe Pointer.borrowMut<(), Endpoint>(&mut mutable, unsafe nonnull(unsafe transport.endpoint(registry, message.ports.get(index)))) entry.owner = 4294967295 entry.started = false index = index + 1 }
@@ -389,77 +430,77 @@ unsafe effect fn commitPost<'m, S: EngineServices>(engine: &mut Engine<'m, S>, c
     while index < envelope.ports.length() { let port = unsafe transport.endpoint(registry, envelope.ports.get(index)) unsafe transport.closeEndpoint(registry, unsafe nonnull(port)) index = index + 1 }
     drop envelope unsafe transport.freeMessage(pointer)
   }
-  return Value.Undefined
+  return ValueBits.Undefined
 }
-unsafe effect fn post<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, args: &owners.Scope) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
-  let mut values = List<Value>.make() let mut sharedValues = List<Value>.make()
+unsafe effect fn post<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, args: &owners.Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut values = List<ValueBits>.make() let mut sharedValues = List<ValueBits>.make()
   let prepared = run Effect.result(unsafe preparePost(&mut engine, context, state, args, &mut values, &mut sharedValues))
-  let result = match move prepared { Result<Message, OutOfMemoryError | JsException>.Success { value } => run Effect.result(unsafe commitPost(&mut engine, context, state, number(args.values[0]), move value, &values)) Result<Message, OutOfMemoryError | JsException>.Failure { error } => Result<Value, OutOfMemoryError | JsException>.Failure { error: move error } }
+  let result = match move prepared { Result<Message, OutOfMemoryError | JsException>.Success { value } => run Effect.result(unsafe commitPost(&mut engine, context, state, number(args.values[0]), move value, &values)) Result<Message, OutOfMemoryError | JsException>.Failure { error } => Result<ValueBits, OutOfMemoryError | JsException>.Failure { error: move error } }
   let mut index: usize = 0 while index < values.length() { unsafe owners.release(&mut engine, context, values.get(index)) index = index + 1 }
   index = 0 while index < sharedValues.length() { unsafe owners.release(&mut engine, context, sharedValues.get(index)) index = index + 1 }
-  return match move result { Result<Value, OutOfMemoryError | JsException>.Success { value } => value Result<Value, OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
+  return match move result { Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
 }
 
-unsafe effect fn envelopeInto<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, message: &Message, scope: &mut owners.Scope) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
-  let memory = engine.memory scope.values[0] = run unsafe objects.object(&mut engine, memory, context)
+unsafe effect fn envelopeInto<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, message: &Message, scope: &mut owners.Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let memory = engine.memory scope.values[0] = run objects.object(&mut engine, memory, unsafe lendRealm(&context, context))
   let mut data: ?*const u8 = Pointer.null<u8>() if message.bytes.length() != 0 { data = Pointer.fromRef<u8>(&message.bytes.asSlice()[0]) }
-  let bytes = run unsafe buffers.newArrayBufferCopy(&mut engine, memory, context, data, usize.toU64(message.bytes.length()))
+  let bytes = run unsafe buffers.newArrayBufferCopy(&mut engine, memory, unsafe lendRealm(&context, context), data, usize.toU64(message.bytes.length()))
   run unsafe common.define(&mut engine, context, scope.values[0], b"bytes", bytes, 7)
   scope.values[1] = run unsafe common.array(&mut engine, memory, context)
   scope.values[2] = run unsafe common.array(&mut engine, memory, context)
   scope.values[3] = run unsafe common.array(&mut engine, memory, context)
   let mut index: usize = 0
   while index < message.buffers.length() {
-    let buffer = run unsafe buffers.newArrayBufferFromTransfer(&mut engine, memory, context, &message.buffers.asSlice()[index])
+    let buffer = run unsafe buffers.newArrayBufferFromTransfer(&mut engine, memory, unsafe lendRealm(&context, context), &message.buffers.asSlice()[index])
     run unsafe common.defineIndex(&mut engine, context, scope.values[1], usize.toU32(index), buffer) index = index + 1
   }
   index = 0 while index < message.shared.length() {
     let entry = &message.shared.asSlice()[index]
     let buffer = match &entry.* {
-      Shared.Native { lease } => run unsafe buffers.newSharedFromLease(&mut engine, memory, context, &lease)
+      Shared.Native { lease } => run buffers.newSharedFromLease(&mut engine, memory, unsafe lendRealm(&context, context), &lease)
       Shared.Host { data: sharedData, length, capacity } => {
-        let value = run unsafe buffers.newArrayBuffer(&mut engine, memory, context, sharedData, length, Option<NativeFunctionId>.none(), Pointer.null<u8>(), true)
+        let value = run unsafe buffers.newArrayBuffer(&mut engine, memory, unsafe lendRealm(&context, context), sharedData, length, Option<NativeFunctionId>.none(), Pointer.null<u8>(), true)
         if capacity != 0 { unsafe buffers.setSharedPhysicalCapacity(core.reference(value), capacity) }
         value
       }
     }
     run unsafe common.defineIndex(&mut engine, context, scope.values[2], usize.toU32(index), buffer) index = index + 1
   }
-  index = 0 while index < message.ports.length() { run unsafe common.defineIndex(&mut engine, context, scope.values[3], usize.toU32(index), Value.number(u32.toF64(message.ports.get(index)))) index = index + 1 }
+  index = 0 while index < message.ports.length() { run unsafe common.defineIndex(&mut engine, context, scope.values[3], usize.toU32(index), ValueBits.number(u32.toF64(message.ports.get(index)))) index = index + 1 }
   run unsafe common.define(&mut engine, context, scope.values[0], b"buffers", scope.take(1), 7)
   run unsafe common.define(&mut engine, context, scope.values[0], b"shared", scope.take(2), 7)
   run unsafe common.define(&mut engine, context, scope.values[0], b"ports", scope.take(3), 7)
   return scope.take(0)
 }
-unsafe effect fn receive<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, id: u32) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+unsafe effect fn receive<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, id: u32) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
   let guard = state.group.registry.get().lock() let registry = guard.get() let pointer = unsafe transport.endpoint(registry, id)
   let mut valid = !Pointer.isNull<Endpoint>(pointer) let anchor = ()
-  if !valid { return Value.Null }
-  if valid { let port = unsafe Pointer.borrow<(), Endpoint>(&anchor, unsafe nonnull(pointer)) valid = port.owner == state.id if valid && port.closed { return Value.Null } }
-  if !valid { drop guard return run unsafe core.error(&mut engine, context, b"MessagePort is closed or transferred") }
+  if !valid { return ValueBits.Null }
+  if valid { let port = unsafe Pointer.borrow<(), Endpoint>(&anchor, unsafe nonnull(pointer)) valid = port.owner == state.id if valid && port.closed { return ValueBits.Null } }
+  if !valid { drop guard return run core.error(&mut engine, unsafe lendRealm(&context, context), b"MessagePort is closed or transferred") }
   let optional = unsafe transport.dequeue(unsafe nonnull(pointer))
-  if Pointer.isNull<Message>(optional) { return Value.Null }
+  if Pointer.isNull<Message>(optional) { return ValueBits.Null }
   let messagePointer = unsafe nonnull(optional) let message = unsafe Pointer.borrow<(), Message>(&anchor, messagePointer)
   let mut mutable = () let mut index: usize = 0
   while index < message.ports.length() { let port = unsafe Pointer.borrowMut<(), Endpoint>(&mut mutable, unsafe nonnull(unsafe transport.endpoint(registry, message.ports.get(index)))) port.owner = state.id index = index + 1 }
   drop guard
   let mut scope = Scope.make() let result = run Effect.result(unsafe envelopeInto(&mut engine, context, &message, &mut scope))
-  let failed = match &result { Result<Value, OutOfMemoryError | JsException>.Failure { .. } => true _ => false }
+  let failed = match &result { Result<ValueBits, OutOfMemoryError | JsException>.Failure { .. } => true _ => false }
   if failed { let guard = state.group.registry.get().lock() index = 0 while index < message.ports.length() { unsafe transport.closeEndpoint(guard.get(), unsafe nonnull(unsafe transport.endpoint(guard.get(), message.ports.get(index)))) index = index + 1 } }
   drop message unsafe transport.freeMessage(messagePointer) unsafe owners.cleanup(&mut engine, context, move scope)
-  return match move result { Result<Value, OutOfMemoryError | JsException>.Success { value } => value Result<Value, OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
+  return match move result { Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
 }
-unsafe effect fn event<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, kind: &[u8], key: &[u8], id: u32) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
-  let memory = engine.memory let value = run unsafe objects.object(&mut engine, memory, context)
+unsafe effect fn event<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, kind: &[u8], key: &[u8], id: u32) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let memory = engine.memory let value = run objects.object(&mut engine, memory, unsafe lendRealm(&context, context))
   let built = run Effect.result(unsafe eventProperties(&mut engine, context, value, kind, key, id))
   match move built { Result<(), OutOfMemoryError | JsException>.Success { .. } => { return value } Result<(), OutOfMemoryError | JsException>.Failure { error } => { unsafe owners.release(&mut engine, context, value) fail move error } }
 }
-unsafe effect fn eventProperties<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, value: Value, kind: &[u8], key: &[u8], id: u32) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+unsafe effect fn eventProperties<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, value: ValueBits, kind: &[u8], key: &[u8], id: u32) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
   let name = run unsafe host.string(&mut engine, context, kind)
   run unsafe common.define(&mut engine, context, value, b"type", name, 7)
-  run unsafe common.define(&mut engine, context, value, key, Value.number(u32.toF64(id)), 7)
+  run unsafe common.define(&mut engine, context, value, key, ValueBits.number(u32.toF64(id)), 7)
 }
-unsafe effect fn pollInto<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, scope: &mut owners.Scope) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+unsafe effect fn pollInto<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, scope: &mut owners.Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
   let memory = engine.memory scope.values[0] = run unsafe common.array(&mut engine, memory, context) let mut index: u32 = 0
   while true {
     let guard = state.group.registry.get().lock() let registry = guard.get()
@@ -497,10 +538,10 @@ unsafe effect fn pollInto<'m, S: EngineServices>(engine: &mut Engine<'m, S>, con
     if kind == 5 { name = b"threadMessage" } else if kind == 6 { name = b"lock" key = b"request" }
     scope.values[1] = run unsafe event(&mut engine, context, name, key, id)
     if kind == 1 || kind == 5 { let envelope = run unsafe receive(&mut engine, context, state, id) run unsafe common.define(&mut engine, context, scope.values[1], b"envelope", envelope, 7) }
-    if kind == 6 { run unsafe common.define(&mut engine, context, scope.values[1], b"status", Value.Int { value: code }, 7) }
+    if kind == 6 { run unsafe common.define(&mut engine, context, scope.values[1], b"status", ValueBits.Int { value: code }, 7) }
     if kind == 4 {
-      run unsafe common.define(&mut engine, context, scope.values[1], b"code", Value.Int { value: code }, 7)
-      run unsafe common.define(&mut engine, context, scope.values[1], b"initFailed", Value.Bool { value: initFailed }, 7)
+      run unsafe common.define(&mut engine, context, scope.values[1], b"code", ValueBits.Int { value: code }, 7)
+      run unsafe common.define(&mut engine, context, scope.values[1], b"initFailed", ValueBits.Bool { value: initFailed }, 7)
     }
     run unsafe common.defineIndex(&mut engine, context, scope.values[0], index, scope.take(1)) index = index + 1
     if kind == 2 || kind == 4 {
@@ -514,7 +555,7 @@ unsafe effect fn pollInto<'m, S: EngineServices>(engine: &mut Engine<'m, S>, con
   }
   return scope.take(0)
 }
-unsafe effect fn channel<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+unsafe effect fn channel<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
   let first = run transport.allocate<Endpoint>(&state.group.resources)
   let allocated = run Effect.result(transport.allocate<Endpoint>(&state.group.resources))
   let second = match move allocated { Result<*mut Endpoint, OutOfMemoryError>.Success { value } => value Result<*mut Endpoint, OutOfMemoryError>.Failure { error } => { unsafe resources.release(unsafe transport.raw(first)) fail move error } }
@@ -526,17 +567,17 @@ unsafe effect fn channel<'m, S: EngineServices>(engine: &mut Engine<'m, S>, cont
   let built = run Effect.result(unsafe channelItems(&mut engine, context, result, a, b))
   match move built { Result<(), JsException>.Success { .. } => { return result } Result<(), JsException>.Failure { error } => { unsafe owners.release(&mut engine, context, result) fail move error } }
 }
-unsafe effect fn channelItems<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, result: Value, a: u32, b: u32) -> () ! JsException ? &mut Allocator {
-  run unsafe common.defineIndex(&mut engine, context, result, 0, Value.number(u32.toF64(a))) run unsafe common.defineIndex(&mut engine, context, result, 1, Value.number(u32.toF64(b)))
+unsafe effect fn channelItems<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, result: ValueBits, a: u32, b: u32) -> () ! JsException ? &mut Allocator {
+  run unsafe common.defineIndex(&mut engine, context, result, 0, ValueBits.number(u32.toF64(a))) run unsafe common.defineIndex(&mut engine, context, result, 1, ValueBits.number(u32.toF64(b)))
 }
 
 // A one-shot native channel routes directly to any live isolate in the group.
 // Its receiving endpoint is hidden from user ports, unreferenced, and retired
 // after the sender closes and the queued packet has been consumed.
-unsafe effect fn routeChannel<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, target: Value) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
-  if !target.isNumber() { return Value.Null }
+unsafe effect fn routeChannel<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, target: ValueBits) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  if !target.isNumber() { return ValueBits.Null }
   let numeric = target.numericValue()
-  if !f64.isFinite(numeric) || numeric < 0.0 || numeric > 4294967295.0 || f64.trunc(numeric) != numeric { return Value.Null }
+  if !f64.isFinite(numeric) || numeric < 0.0 || numeric > 4294967295.0 || f64.trunc(numeric) != numeric { return ValueBits.Null }
   let id = number(target)
   let first = run transport.allocate<Endpoint>(&state.group.resources)
   let allocated = run Effect.result(transport.allocate<Endpoint>(&state.group.resources))
@@ -544,24 +585,27 @@ unsafe effect fn routeChannel<'m, S: EngineServices>(engine: &mut Engine<'m, S>,
   let mut guard = state.group.registry.get().lock()
   let optional = unsafe transport.thread(guard.get(), id) let mut valid = !Pointer.isNull<Thread>(optional) let mut anchor = ()
   if valid { let target = unsafe Pointer.borrow<(), Thread>(&anchor, unsafe nonnull(optional)) valid = !target.stopped && !target.exited }
-  if !valid { drop guard unsafe resources.release(unsafe transport.raw(first)) unsafe resources.release(unsafe transport.raw(second)) return Value.Null }
+  if !valid { drop guard unsafe resources.release(unsafe transport.raw(first)) unsafe resources.release(unsafe transport.raw(second)) return ValueBits.Null }
   let registry = guard.getMut()
   let a = unsafe transport.newEndpoint(&mut registry, first, state.id, 0, List<u8>.make(), false)
   let b = unsafe transport.newEndpoint(&mut registry, second, id, a, List<u8>.make(), false)
   let source = unsafe Pointer.borrowMut<(), Endpoint>(&mut anchor, first) source.peer = b source.referenced = false source.routed = true drop source
   let destination = unsafe Pointer.borrowMut<(), Endpoint>(&mut anchor, second) destination.started = true destination.referenced = false destination.routed = true
-  return Value.number(u32.toF64(a))
+  return ValueBits.number(u32.toF64(a))
 }
 
-unsafe extern "C" fn getenv(name: *const u8) -> ?*mut u8 with Intrinsic.foreign(noCapture: ("name",))
-unsafe extern "C" fn setenv(name: *const u8, value: *const u8, overwrite: i32) -> i32 with Intrinsic.foreign(noCapture: ("name", "value"))
-unsafe extern "C" fn unsetenv(name: *const u8) -> i32 with Intrinsic.foreign(noCapture: ("name",))
+@foreign(noCapture: .("name"))
+unsafe extern "C" fn getenv(name: *const u8) -> ?*mut u8
+@foreign(noCapture: .("name", "value"))
+unsafe extern "C" fn setenv(name: *const u8, value: *const u8, overwrite: i32) -> i32
+@foreign(noCapture: .("name"))
+unsafe extern "C" fn unsetenv(name: *const u8) -> i32
 unsafe extern "C" fn _NSGetEnviron() -> *mut ?*mut ?*mut u8
 unsafe extern "C" static environ: ?*mut ?*mut u8
 fn cloneReportString(value: &Option<Arc<List<u8>>>) -> Option<Arc<List<u8>>> {
   return match &value.* { Option<Arc<List<u8>>>.Some { value: stored } => Option<Arc<List<u8>>>.some(stored.clone()) _ => Option<Arc<List<u8>>>.none() }
 }
-effect fn ownedReportString(value: Value) -> Arc<List<u8>> ! OutOfMemoryError ? &mut Allocator {
+effect fn ownedReportString(value: ValueBits) -> Arc<List<u8>> ! OutOfMemoryError ? &mut Allocator {
   let mut bytes = List<u8>.make() let mut iterator = RopeIterator.make(&value) let mut pending = iterator.next()
   // Node's process-wide report paths cross a UTF-8, NUL-terminated native API.
   while true {
@@ -590,37 +634,33 @@ effect fn ownedReportString(value: Value) -> Arc<List<u8>> ! OutOfMemoryError ? 
   }
   return run Arc<List<u8>>.make(move bytes)
 }
-unsafe effect fn reportSetting<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, field: u32, setting: bool, args: &owners.Scope) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
-  if field > 3 { return run unsafe core.error(&mut engine, context, b"Unknown shared report setting") }
+unsafe effect fn reportSetting<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, field: u32, setting: bool, args: &owners.Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  if field > 3 { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"Unknown shared report setting") }
   let value = args.values[1]
-  if field >= 2 {
-    let mut guard = state.group.registry.get().lock() let registry = guard.getMut()
-    if setting {
-      if field == 2 { registry.reportCompact = boolean(value) } else { registry.reportFatal = boolean(value) }
-      let empty: u8 = 0
-      unsafe diagnostics.silk_diagnostics_setting(field, Pointer.fromRef<u8>(&empty), 0, if boolean(value) { 1 } else { 0 })
-      return Value.Undefined
-    }
-    if field == 2 { return Value.Bool { value: registry.reportCompact } }
-    return Value.Bool { value: registry.reportFatal }
+  let settings = &state.group.reports
+  if field == 3 {
+    if setting { settings.setFatal(boolean(value)) return ValueBits.Undefined }
+    return ValueBits.Bool { value: settings.fatal() }
+  }
+  if field == 2 {
+    let mut guard = settings.reports.get().lock() let reports = guard.getMut()
+    if setting { reports.compact = boolean(value) return ValueBits.Undefined }
+    return ValueBits.Bool { value: reports.compact }
   }
   if setting {
-    if !value.isString() { return run unsafe core.error(&mut engine, context, b"Report path must be a string") }
+    if !value.isString() { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"Report path must be a string") }
     let mut allocator = state.group.resources.clone()
     let stored = run ownedReportString(value) |> Effect.provideMut<Allocator>(&mut allocator)
-    let mut guard = state.group.registry.get().lock() let registry = guard.getMut()
-    let path = stored.get().asSlice() let empty: u8 = 0
-    let bytes = if path.length == 0 { Pointer.fromRef<u8>(&empty) } else { Pointer.fromRef<u8>(&path[0]) }
-    unsafe diagnostics.silk_diagnostics_setting(field, bytes, path.length, 0)
-    drop path
-    if field == 0 { registry.reportDirectory = Option<Arc<List<u8>>>.some(move stored) }
-    else { registry.reportFilename = Option<Arc<List<u8>>>.some(move stored) }
-    return Value.Undefined
+    let mut guard = settings.reports.get().lock() let reports = guard.getMut()
+    let previous = if field == 0 { Intrinsic.replace(reports.directory, Option<Arc<List<u8>>>.some(move stored)) } else { Intrinsic.replace(reports.filename, Option<Arc<List<u8>>>.some(move stored)) }
+    drop guard
+    drop previous
+    return ValueBits.Undefined
   }
-  let guard = state.group.registry.get().lock()
+  let guard = settings.reports.get().lock()
   let mut stored = Option<Arc<List<u8>>>.none()
-  if field == 0 { stored = cloneReportString(&guard.get().reportDirectory) }
-  else { stored = cloneReportString(&guard.get().reportFilename) }
+  if field == 0 { stored = cloneReportString(&guard.get().directory) }
+  else { stored = cloneReportString(&guard.get().filename) }
   drop guard
   // Keep immutable path storage alive without allocating JS while locked.
   return match move stored {
@@ -629,7 +669,7 @@ unsafe effect fn reportSetting<'m, S: EngineServices>(engine: &mut Engine<'m, S>
   }
 }
 unsafe fn byte(pointer: *mut u8, index: usize) -> u8 { return unsafe Pointer.read<u8>(unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(pointer), index)) }
-unsafe effect fn environment<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, op: &[u8], args: &owners.Scope, scope: &mut owners.Scope) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+unsafe effect fn environment<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, op: &[u8], args: &owners.Scope, scope: &mut owners.Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
   let mut name = List<u8>.make() let mut value = List<u8>.make()
   if !equal(op, b"envKeys") { name = run unsafe host.text(&mut engine, context, args.values[0]) run name.append(0) }
   if equal(op, b"envSet") { value = run unsafe host.text(&mut engine, context, args.values[1]) run value.append(0) }
@@ -639,17 +679,17 @@ unsafe effect fn environment<'m, S: EngineServices>(engine: &mut Engine<'m, S>, 
   if !Pointer.isNull<Environment>(private) {
     drop guard return run unsafe privateEnvironment(&mut engine, context, state, unsafe nonnull(private), op, move name, move value, &mut scope)
   }
-  if equal(op, b"envSet") { let status = unsafe setenv(Pointer.fromRef(&name.asSlice()[0]), Pointer.fromRef(&value.asSlice()[0]), 1) drop guard if status != 0 { return run unsafe core.error(&mut engine, context, b"cannot set environment variable") } return Value.Undefined }
-  if equal(op, b"envDelete") { let status = unsafe unsetenv(Pointer.fromRef(&name.asSlice()[0])) drop guard if status != 0 { return run unsafe core.error(&mut engine, context, b"cannot delete environment variable") } return Value.Bool { value: true } }
+  if equal(op, b"envSet") { let status = unsafe setenv(Pointer.fromRef(&name.asSlice()[0]), Pointer.fromRef(&value.asSlice()[0]), 1) drop guard if status != 0 { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"cannot set environment variable") } return ValueBits.Undefined }
+  if equal(op, b"envDelete") { let status = unsafe unsetenv(Pointer.fromRef(&name.asSlice()[0])) drop guard if status != 0 { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"cannot delete environment variable") } return ValueBits.Bool { value: true } }
   if equal(op, b"envGet") {
-    let pointer = unsafe getenv(Pointer.fromRef(&name.asSlice()[0])) if Pointer.isNull<u8>(pointer) { return Value.Undefined }
+    let pointer = unsafe getenv(Pointer.fromRef(&name.asSlice()[0])) if Pointer.isNull<u8>(pointer) { return ValueBits.Undefined }
     let mut index: usize = 0 while unsafe byte(unsafe nonnull(pointer), index) != 0 { run value.append(unsafe byte(unsafe nonnull(pointer), index)) index = index + 1 } drop guard
     return run unsafe host.string(&mut engine, context, value.asSlice())
   }
   let mut names = List<List<u8>>.make()
   let mut entries = Pointer.null<?*mut u8>()
   static if Intrinsic.targetOperatingSystem() == "darwin" { entries = unsafe Pointer.read<?*mut ?*mut u8>(unsafe _NSGetEnviron()) }
-  else { entries = unsafe environ }
+  else { unsafe { entries = environ } }
   if !Pointer.isNull<?*mut u8>(entries) {
     let mut index: usize = 0
     while true {
@@ -664,11 +704,11 @@ unsafe effect fn environment<'m, S: EngineServices>(engine: &mut Engine<'m, S>, 
   let mut index: usize = 0 while index < names.length() { let name = run unsafe host.string(&mut engine, context, names.asSlice()[index].asSlice()) run unsafe common.defineIndex(&mut engine, context, scope.values[0], usize.toU32(index), name) index = index + 1 }
   return scope.take(0)
 }
-unsafe effect fn initializeEnvironment<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, args: &owners.Scope, scope: &mut owners.Scope) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
-  if state.id == 0 { return Value.Undefined }
+unsafe effect fn initializeEnvironment<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, args: &owners.Scope, scope: &mut owners.Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  if state.id == 0 { return ValueBits.Undefined }
   // spawn retained the immediate parent's environment identity before its
   // runtime could retire; SHARE_ENV keeps that owner rather than the main env.
-  if boolean(args.values[1]) { return Value.Undefined }
+  if boolean(args.values[1]) { return ValueBits.Undefined }
   let mut variables = List<Variable>.make() let mut allocator = state.group.resources.clone()
   let count = run unsafe length(&mut engine, context, args.values[0]) let mut index: u32 = 0
   while index < count {
@@ -686,9 +726,9 @@ unsafe effect fn initializeEnvironment<'m, S: EngineServices>(engine: &mut Engin
   let mut guard = state.group.registry.get().lock() let registry = guard.getMut()
   unsafe Pointer.put<Environment>(pointer, Environment { next: registry.environments, variables: move variables }) registry.environments = pointer
   let mut anchor = () let child = unsafe Pointer.borrowMut<(), Thread>(&mut anchor, unsafe nonnull(unsafe transport.thread(&registry.*, state.id))) child.environment = pointer
-  return Value.Undefined
+  return ValueBits.Undefined
 }
-unsafe effect fn privateEnvironment<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, pointer: *mut Environment, op: &[u8], name: List<u8>, value: List<u8>, scope: &mut owners.Scope) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+unsafe effect fn privateEnvironment<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, pointer: *mut Environment, op: &[u8], name: List<u8>, value: List<u8>, scope: &mut owners.Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
   let guard = state.group.registry.get().lock() let mut anchor = ()
   let environment = unsafe Pointer.borrowMut<(), Environment>(&mut anchor, pointer)
   let mut found = environment.variables.length() let mut index: usize = 0
@@ -697,14 +737,14 @@ unsafe effect fn privateEnvironment<'m, S: EngineServices>(engine: &mut Engine<'
     let variable = Variable { name: move name, value: move value, active: true }
     if found < environment.variables.length() { let entries = environment.variables.asMutSlice() entries[found] = move variable }
     else { let mut allocator = state.group.resources.clone() run environment.variables.append(move variable) |> Effect.provideMut<Allocator>(&mut allocator) }
-    return Value.Undefined
+    return ValueBits.Undefined
   }
   if equal(op, b"envDelete") {
     if found < environment.variables.length() { let entries = environment.variables.asMutSlice() entries[found].active = false entries[found].value = List<u8>.make() }
-    return Value.Bool { value: true }
+    return ValueBits.Bool { value: true }
   }
   if equal(op, b"envGet") {
-    if found == environment.variables.length() || !environment.variables.asSlice()[found].active { return Value.Undefined }
+    if found == environment.variables.length() || !environment.variables.asSlice()[found].active { return ValueBits.Undefined }
     let source = environment.variables.asSlice()[found].value.asSlice() let mut output = List<u8>.make() index = 0
     while index + 1 < source.length { run output.append(source[index]) index = index + 1 }
     drop environment drop guard return run unsafe host.string(&mut engine, context, output.asSlice())
@@ -719,9 +759,9 @@ unsafe effect fn privateEnvironment<'m, S: EngineServices>(engine: &mut Engine<'
   index = 0 while index < names.length() { let key = run unsafe host.string(&mut engine, context, names.asSlice()[index].asSlice()) run unsafe common.defineIndex(&mut engine, context, scope.values[0], usize.toU32(index), key) index = index + 1 }
   return scope.take(0)
 }
-unsafe effect fn broadcast<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, args: &owners.Scope) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+unsafe effect fn broadcast<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, args: &owners.Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
   let bytes = run unsafe copyWire(&mut engine, context, args.values[1], &state.group)
-  let mut values = List<Value>.make()
+  let mut values = List<ValueBits>.make()
   let collected = run Effect.result(unsafe collectValues(&mut engine, context, args.values[2], &mut values))
   let result = match move collected {
     Result<(), OutOfMemoryError | JsException>.Success { .. } => {
@@ -729,34 +769,34 @@ unsafe effect fn broadcast<'m, S: EngineServices>(engine: &mut Engine<'m, S>, co
       let copied = run Effect.result(unsafe collectValues(&mut engine, context, args.values[3], &mut values))
       match move copied {
         Result<(), OutOfMemoryError | JsException>.Success { .. } => run Effect.result(unsafe broadcastPrepared(&mut engine, context, state, number(args.values[0]), &bytes, &values, sharedCount))
-        Result<(), OutOfMemoryError | JsException>.Failure { error } => Result<Value, OutOfMemoryError | JsException>.Failure { error: move error }
+        Result<(), OutOfMemoryError | JsException>.Failure { error } => Result<ValueBits, OutOfMemoryError | JsException>.Failure { error: move error }
       }
     }
-    Result<(), OutOfMemoryError | JsException>.Failure { error } => Result<Value, OutOfMemoryError | JsException>.Failure { error: move error }
+    Result<(), OutOfMemoryError | JsException>.Failure { error } => Result<ValueBits, OutOfMemoryError | JsException>.Failure { error: move error }
   }
   let mut index: usize = 0 while index < values.length() { unsafe owners.release(&mut engine, context, values.get(index)) index = index + 1 }
-  return match move result { Result<Value, OutOfMemoryError | JsException>.Success { value } => value Result<Value, OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
+  return match move result { Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
 }
-unsafe effect fn broadcastPrepared<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, id: u32, bytes: &List<u8>, values: &List<Value>, sharedCount: usize) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+unsafe effect fn broadcastPrepared<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, id: u32, bytes: &List<u8>, values: &List<ValueBits>, sharedCount: usize) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
   let mut allocator = state.group.resources.clone() let mut sharedValues = List<Shared>.make() let mut index: usize = 0
   while index < sharedCount {
-    let object = run unsafe buffers.requireBuffer(&mut engine, context, values.get(index), 1)
+    let object = (run buffers.requireBuffer(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(values.get(index)), 1)).header()
     let entry = run unsafe sharedEntry(&mut engine, context, object)
     run sharedValues.append(move entry) |> Effect.provideMut<Allocator>(&mut allocator) index = index + 1
   }
   let mut copies = List<buffers.BufferTransfer>.make()
   while index < values.length() {
-    let object = run unsafe buffers.requireBuffer(&mut engine, context, values.get(index), 0)
-    if !unsafe buffers.canTransfer(object) { return run unsafe core.error(&mut engine, context, b"Invalid broadcast buffer snapshot") }
+    let object = (run buffers.requireBuffer(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(values.get(index)), 0)).header()
+    if !unsafe buffers.canTransfer(object) { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"Invalid broadcast buffer snapshot") }
     let copy = run unsafe buffers.prepareTransfer(object)
     run copies.append(move copy) |> Effect.provideMut<Allocator>(&mut allocator)
     index = index + 1
   }
   let guard = state.group.registry.get().lock() let registry = guard.get()
   let sourcePointer = unsafe transport.endpoint(registry, id) let anchor = ()
-  if Pointer.isNull<Endpoint>(sourcePointer) { drop guard return run unsafe core.error(&mut engine, context, b"BroadcastChannel is closed") }
+  if Pointer.isNull<Endpoint>(sourcePointer) { drop guard return run core.error(&mut engine, unsafe lendRealm(&context, context), b"BroadcastChannel is closed") }
   let source = unsafe Pointer.borrow<(), Endpoint>(&anchor, unsafe nonnull(sourcePointer))
-  if source.owner != state.id || source.closed || !source.broadcast { drop source drop guard return run unsafe core.error(&mut engine, context, b"BroadcastChannel is closed") }
+  if source.owner != state.id || source.closed || !source.broadcast { drop source drop guard return run core.error(&mut engine, unsafe lendRealm(&context, context), b"BroadcastChannel is closed") }
   let mut cursor = registry.endpoints
   while !Pointer.isNull<Endpoint>(cursor) {
     let destination = unsafe Pointer.borrow<(), Endpoint>(&anchor, unsafe nonnull(cursor)) let pointer = unsafe nonnull(cursor) cursor = destination.next
@@ -771,16 +811,16 @@ unsafe effect fn broadcastPrepared<'m, S: EngineServices>(engine: &mut Engine<'m
     }
     let packet = run transport.allocate<Message>(&state.group.resources) unsafe Pointer.put<Message>(packet, move message) drop destination unsafe transport.enqueue(registry, pointer, packet)
   }
-  return Value.Undefined
+  return ValueBits.Undefined
 }
-unsafe effect fn invoke<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pointer: *mut State, op: &[u8], args: &owners.Scope, scope: &mut owners.Scope) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+unsafe effect fn invoke<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pointer: *mut State, op: &[u8], args: &owners.Scope, scope: &mut owners.Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
   let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer)
   let memory = engine.memory let id = number(args.values[0])
   if equal(op, b"info") || equal(op, b"bootstrap") {
-    scope.values[0] = run unsafe objects.object(&mut engine, memory, context)
-    run unsafe common.define(&mut engine, context, scope.values[0], b"threadId", Value.number(u32.toF64(state.id)), 7)
-    run unsafe common.define(&mut engine, context, scope.values[0], b"isMainThread", Value.Bool { value: state.id == 0 }, 7)
-    run unsafe common.define(&mut engine, context, scope.values[0], b"controlPort", Value.number(u32.toF64(state.control)), 7)
+    scope.values[0] = run objects.object(&mut engine, memory, unsafe lendRealm(&context, context))
+    run unsafe common.define(&mut engine, context, scope.values[0], b"threadId", ValueBits.number(u32.toF64(state.id)), 7)
+    run unsafe common.define(&mut engine, context, scope.values[0], b"isMainThread", ValueBits.Bool { value: state.id == 0 }, 7)
+    run unsafe common.define(&mut engine, context, scope.values[0], b"controlPort", ValueBits.number(u32.toF64(state.control)), 7)
     let metadata = run unsafe host.string(&mut engine, context, state.metadata.asSlice())
     run unsafe common.define(&mut engine, context, scope.values[0], b"metadata", metadata, 7) return scope.take(0)
   }
@@ -812,26 +852,26 @@ unsafe effect fn invoke<'m, S: EngineServices>(engine: &mut Engine<'m, S>, conte
         endpoint.routed = false drop endpoint unsafe transport.closeEndpoint(registry, unsafe nonnull(optional))
       }
     }
-    return Value.Undefined
+    return ValueBits.Undefined
   }
   if equal(op, b"lockRequest") {
     let mut allocator = state.group.resources.clone()
     let name = run unsafe host.text(&mut engine, context, args.values[0]) |> Effect.provideMut<Allocator>(&mut allocator)
     let request = run unsafe locks.request(&state.group, state.id, move name, boolean(args.values[1]), boolean(args.values[2]), boolean(args.values[3]))
-    return Value.number(u32.toF64(request))
+    return ValueBits.number(u32.toF64(request))
   }
   if equal(op, b"lockQuery") { return run unsafe locks.query(&mut engine, context, &state.group, state.id, &mut scope) }
   if equal(op, b"lockRelease") {
     let mut guard = state.group.registry.get().lock()
     unsafe locks.release(guard.getMut(), state.id, id, false)
-    return Value.Undefined
+    return ValueBits.Undefined
   }
   if equal(op, b"lockStatus") {
     let guard = state.group.registry.get().lock()
     let optional = unsafe locks.lookup(guard.get(), state.id, id)
-    if Pointer.isNull<LockRequest>(optional) { return Value.Null }
+    if Pointer.isNull<LockRequest>(optional) { return ValueBits.Null }
     let request = unsafe Pointer.borrow<(), LockRequest>(&anchor, unsafe nonnull(optional))
-    return Value.number(u32.toF64(request.status))
+    return ValueBits.number(u32.toF64(request.status))
   }
   if equal(op, b"post") { return run unsafe post(&mut engine, context, &state, args) }
   if equal(op, b"receive") { return run unsafe receive(&mut engine, context, &state, id) }
@@ -839,19 +879,25 @@ unsafe effect fn invoke<'m, S: EngineServices>(engine: &mut Engine<'m, S>, conte
     // A cancellation wake can return an idle worker from uv_run before its
     // interpreter interrupt counter expires. Check at this event-loop boundary
     // so the worker cannot consume that one wake and block in uv_run again.
-    if state.id != 0 && unsafe shouldInterrupt(pointer) { return run unsafe errors.throwInterrupted(&mut engine, memory, context) }
+    if state.id != 0 && unsafe shouldInterrupt(pointer) { return run errors.throwInterrupted(&mut engine, memory, unsafe lendRealm(&context, context)) }
     return run unsafe pollInto(&mut engine, context, &state, &mut scope)
   }
   if equal(op, b"wake") {
     let guard = state.group.registry.get().lock()
     unsafe transport.wake(guard.get(), state.id)
-    return Value.Undefined
+    return ValueBits.Undefined
   }
-  if equal(op, b"hasPending") { return Value.Bool { value: unsafe hasPending(pointer) } }
+  if equal(op, b"hasPending") { return ValueBits.Bool { value: unsafe hasPending(pointer) } }
   if equal(op, b"startSigintWatch") { drop state return run unsafe startSignalGuard(&mut engine, context, pointer) }
   if equal(op, b"stopSigintWatch") { drop state return run unsafe stopSignalGuard(&mut engine, context, pointer, id) }
   if equal(op, b"reportGet") || equal(op, b"reportSet") { return run unsafe reportSetting(&mut engine, context, &state, id, equal(op, b"reportSet"), args) }
-  if equal(op, b"reportWorkers") { return run unsafe diagnostics.workers(&mut engine, context) }
+  if equal(op, b"reportWorkers") {
+    let attached = state.diagnostics drop state
+    return match attached {
+      Option<Mailbox>.Some { value } => run unsafe diagnostics.workers(&mut engine, context, value)
+      _ => run unsafe host.string(&mut engine, context, b"[]")
+    }
+  }
   if equal(op, b"envGet") || equal(op, b"envSet") || equal(op, b"envDelete") || equal(op, b"envKeys") { return run unsafe environment(&mut engine, context, &state, op, args, &mut scope) }
   if equal(op, b"envInit") { return run unsafe initializeEnvironment(&mut engine, context, &state, args, &mut scope) }
   if equal(op, b"broadcastPost") { return run unsafe broadcast(&mut engine, context, &state, args) }
@@ -861,77 +907,77 @@ unsafe effect fn invoke<'m, S: EngineServices>(engine: &mut Engine<'m, S>, conte
     let endpoint = run transport.allocate<Endpoint>(&state.group.resources)
     let mut guard = state.group.registry.get().lock()
     let id = unsafe transport.newEndpoint(guard.getMut(), endpoint, state.id, 0, move name, true)
-    return Value.number(u32.toF64(id))
+    return ValueBits.number(u32.toF64(id))
   }
   if equal(op, b"startWorker") {
     let mut allocator = state.group.resources.clone()
     let metadata = run unsafe host.text(&mut engine, context, args.values[0]) |> Effect.provideMut<Allocator>(&mut allocator)
-    if !args.values[2].isNumber() { return run unsafe core.error(&mut engine, context, b"invalid Worker stack limit") }
+    if !args.values[2].isNumber() { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"invalid Worker stack limit") }
     let stack = args.values[2].numericValue()
-    if !f64.isFinite(stack) || stack < 1.0 || stack > 9007199246286848.0 || f64.floor(stack) != stack { return run unsafe core.error(&mut engine, context, b"invalid Worker stack limit") }
-    if !args.values[3].isString() { return run unsafe core.error(&mut engine, context, b"invalid Worker thread name") }
-    return Value.number(u32.toF64(run unsafe spawn(&state, move metadata, number(args.values[1]), f64.toUsize(stack), nativeThreadName(args.values[3]))))
+    if !f64.isFinite(stack) || stack < 1.0 || stack > 9007199246286848.0 || f64.floor(stack) != stack { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"invalid Worker stack limit") }
+    if !args.values[3].isString() { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"invalid Worker thread name") }
+    return ValueBits.number(u32.toF64(run unsafe spawn(&state, move metadata, number(args.values[1]), f64.toUsize(stack), nativeThreadName(args.values[3]))))
   }
   let guard = state.group.registry.get().lock() let registry = guard.get() let mut mutable = ()
   if equal(op, b"workerStatus") {
     let optional = unsafe transport.thread(registry, id)
-    if Pointer.isNull<Thread>(optional) { return Value.Null }
+    if Pointer.isNull<Thread>(optional) { return ValueBits.Null }
     let child = unsafe Pointer.borrow<(), Thread>(&mutable, unsafe nonnull(optional))
-    if child.parent != state.id || child.id == state.id { drop child drop guard return run unsafe core.error(&mut engine, context, b"Worker belongs to another runtime") }
-    if child.exited { return Value.Int { value: child.exitCode } }
-    return Value.Undefined
+    if child.parent != state.id || child.id == state.id { drop child drop guard return run core.error(&mut engine, unsafe lendRealm(&context, context), b"Worker belongs to another runtime") }
+    if child.exited { return ValueBits.Int { value: child.exitCode } }
+    return ValueBits.Undefined
   }
   if equal(op, b"cpuUsage") {
     let optional = unsafe transport.thread(registry, id)
-    if Pointer.isNull<Thread>(optional) { return Value.Null }
+    if Pointer.isNull<Thread>(optional) { return ValueBits.Null }
     let child = unsafe Pointer.borrow<(), Thread>(&mutable, unsafe nonnull(optional))
-    if child.parent != state.id || child.id == state.id { drop child drop guard return run unsafe core.error(&mut engine, context, b"Worker belongs to another runtime") }
-    if !child.online || child.exited { return Value.Null }
+    if child.parent != state.id || child.id == state.id { drop child drop guard return run core.error(&mut engine, unsafe lendRealm(&context, context), b"Worker belongs to another runtime") }
+    if !child.online || child.exited { return ValueBits.Null }
     let usage = unsafe child.cpu.sample() drop child drop guard
-    if !usage.available { return run unsafe core.error(&mut engine, context, b"per-thread OS CPU counters are unavailable") }
-    scope.values[0] = run unsafe objects.object(&mut engine, memory, context)
-    run unsafe common.define(&mut engine, context, scope.values[0], b"user", Value.number(usage.user), 7)
-    run unsafe common.define(&mut engine, context, scope.values[0], b"system", Value.number(usage.system), 7)
+    if !usage.available { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"per-thread OS CPU counters are unavailable") }
+    scope.values[0] = run objects.object(&mut engine, memory, unsafe lendRealm(&context, context))
+    run unsafe common.define(&mut engine, context, scope.values[0], b"user", ValueBits.number(usage.user), 7)
+    run unsafe common.define(&mut engine, context, scope.values[0], b"system", ValueBits.number(usage.system), 7)
     return scope.take(0)
   }
   if equal(op, b"online") || equal(op, b"requestExit") {
     let entry = unsafe Pointer.borrowMut<(), Thread>(&mut mutable, unsafe nonnull(unsafe transport.thread(registry, state.id)))
-    if equal(op, b"online") { entry.online = true entry.onlinePending = state.id != 0 let parent = entry.parent drop entry unsafe transport.wake(registry, parent) return Value.Undefined }
-    if state.id == 0 { drop entry drop guard return run unsafe core.error(&mut engine, context, b"requestExit is only valid inside a worker") }
+    if equal(op, b"online") { entry.online = true entry.onlinePending = state.id != 0 let parent = entry.parent drop entry unsafe transport.wake(registry, parent) return ValueBits.Undefined }
+    if state.id == 0 { drop entry drop guard return run core.error(&mut engine, unsafe lendRealm(&context, context), b"requestExit is only valid inside a worker") }
     entry.exitCode = u32.toI32(id) entry.stopped = true entry.cancellation.cancel()
     drop entry drop guard
-    return run unsafe errors.throwInterrupted(&mut engine, memory, context)
+    return run errors.throwInterrupted(&mut engine, memory, unsafe lendRealm(&context, context))
   }
   if equal(op, b"terminate") || equal(op, b"workerRef") || equal(op, b"workerHasRef") {
     let optional = unsafe transport.thread(registry, id)
-    if Pointer.isNull<Thread>(optional) { drop guard return run unsafe core.error(&mut engine, context, b"unknown Worker") }
+    if Pointer.isNull<Thread>(optional) { drop guard return run core.error(&mut engine, unsafe lendRealm(&context, context), b"unknown Worker") }
     let child = unsafe Pointer.borrowMut<(), Thread>(&mut mutable, unsafe nonnull(optional))
-    if child.parent != state.id || child.id == state.id { drop child drop guard return run unsafe core.error(&mut engine, context, b"Worker belongs to another runtime") }
-    if equal(op, b"workerHasRef") { return Value.Bool { value: child.referenced } }
-    if equal(op, b"workerRef") { child.referenced = boolean(args.values[1]) return Value.Undefined }
-    if !child.exited { child.stopped = true child.exitCode = 1 child.cancellation.cancel() drop child unsafe transport.wake(registry, id) } return Value.Undefined
+    if child.parent != state.id || child.id == state.id { drop child drop guard return run core.error(&mut engine, unsafe lendRealm(&context, context), b"Worker belongs to another runtime") }
+    if equal(op, b"workerHasRef") { return ValueBits.Bool { value: child.referenced } }
+    if equal(op, b"workerRef") { child.referenced = boolean(args.values[1]) return ValueBits.Undefined }
+    if !child.exited { child.stopped = true child.exitCode = 1 child.cancellation.cancel() drop child unsafe transport.wake(registry, id) } return ValueBits.Undefined
   }
   let optional = unsafe transport.endpoint(registry, id)
   if Pointer.isNull<Endpoint>(optional) {
-    if equal(op, b"close") || equal(op, b"unsubscribe") { return Value.Undefined }
-    if equal(op, b"hasRef") { return Value.Bool { value: false } }
-    drop guard return run unsafe core.error(&mut engine, context, b"unknown worker operation or MessagePort")
+    if equal(op, b"close") || equal(op, b"unsubscribe") { return ValueBits.Undefined }
+    if equal(op, b"hasRef") { return ValueBits.Bool { value: false } }
+    drop guard return run core.error(&mut engine, unsafe lendRealm(&context, context), b"unknown worker operation or MessagePort")
   }
   let endpoint = unsafe Pointer.borrowMut<(), Endpoint>(&mut mutable, unsafe nonnull(optional))
-  if endpoint.owner != state.id { drop endpoint drop guard return run unsafe core.error(&mut engine, context, b"MessagePort belongs to another runtime") }
-  if equal(op, b"hasRef") { return Value.Bool { value: endpoint.referenced && !endpoint.closed } }
-  if equal(op, b"ref") { endpoint.referenced = boolean(args.values[1]) return Value.Undefined }
-  if equal(op, b"start") { endpoint.started = boolean(args.values[1]) return Value.Undefined }
-  if equal(op, b"close") || equal(op, b"unsubscribe") { drop endpoint unsafe transport.closeEndpoint(registry, unsafe nonnull(optional)) return Value.Undefined }
-  drop endpoint drop guard return run unsafe core.error(&mut engine, context, b"unknown worker operation")
+  if endpoint.owner != state.id { drop endpoint drop guard return run core.error(&mut engine, unsafe lendRealm(&context, context), b"MessagePort belongs to another runtime") }
+  if equal(op, b"hasRef") { return ValueBits.Bool { value: endpoint.referenced && !endpoint.closed } }
+  if equal(op, b"ref") { endpoint.referenced = boolean(args.values[1]) return ValueBits.Undefined }
+  if equal(op, b"start") { endpoint.started = boolean(args.values[1]) return ValueBits.Undefined }
+  if equal(op, b"close") || equal(op, b"unsubscribe") { drop endpoint unsafe transport.closeEndpoint(registry, unsafe nonnull(optional)) return ValueBits.Undefined }
+  drop endpoint drop guard return run core.error(&mut engine, unsafe lendRealm(&context, context), b"unknown worker operation")
 }
-pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pointer: *mut State, argc: i32, argv: &FrameSlots) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pointer: *mut State, argc: i32, argv: &FrameSlots) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
   let mut args = Scope.make() let mut scope = Scope.make()
   let result = run Effect.result(unsafe dispatchInto(&mut engine, context, pointer, argv, &mut args, &mut scope))
   unsafe owners.cleanup(&mut engine, context, move args) unsafe owners.cleanup(&mut engine, context, move scope) unsafe updateRef(pointer)
-  return match move result { Result<Value, OutOfMemoryError | JsException>.Success { value } => value Result<Value, OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
+  return match move result { Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
 }
-unsafe effect fn dispatchInto<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pointer: *mut State, argv: &FrameSlots, args: &mut owners.Scope, scope: &mut owners.Scope) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
+unsafe effect fn dispatchInto<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pointer: *mut State, argv: &FrameSlots, args: &mut owners.Scope, scope: &mut owners.Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
   let name = run unsafe host.text(&mut engine, context, unsafe common.argument(argv, 0))
   let array = unsafe common.argument(argv, 1) let mut index: u32 = 0
   let count: u32 = 5

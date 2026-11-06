@@ -32,7 +32,7 @@ def main():
         raise SystemExit('Install the Silk launcher and run silk use in this repository.')
     if platform.system() == 'Darwin' and shutil.which('brew'):
         paths = []
-        for package in ['icu4c@78', 'sqlite']:
+        for package in ['icu4c@78']:
             prefix = subprocess.check_output(['brew', '--prefix', package], text=True).strip()
             paths.append(str(Path(prefix) / 'lib/pkgconfig'))
         if environment.get('PKG_CONFIG_PATH'):
@@ -50,7 +50,7 @@ def main():
         ('libcares', 'libcares.a'), ('libbrotlienc', 'libbrotlienc.a'),
         ('libbrotlidec', 'libbrotlidec.a'), ('libbrotlicommon', 'libbrotlicommon.a'),
         ('libzstd', 'libzstd.a'), ('libnghttp2', 'libnghttp2.a'),
-        ('sqlite3', 'libsqlite3.a'), ('icu-i18n', 'libicui18n.a'),
+        ('icu-i18n', 'libicui18n.a'),
         ('icu-uc', 'libicuuc.a'), ('icu-uc', 'libicudata.a'),
     ]:
         libdir = Path(subprocess.check_output(['pkg-config', '--variable=libdir', package], env=environment, text=True).strip())

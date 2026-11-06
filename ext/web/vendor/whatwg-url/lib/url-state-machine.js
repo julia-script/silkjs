@@ -1,5 +1,7 @@
 "use strict";
-const tr46 = require("internal/web/vendor/tr46/index");
+// Loaded on first use: its mapping tables are large and most URLs are ASCII-only.
+let tr46Module;
+const tr46 = { toASCII: (...args) => (tr46Module ||= require("internal/web/vendor/tr46/index")).toASCII(...args) };
 
 const infra = require("internal/web/vendor/whatwg-url/lib/infra");
 const { utf8DecodeWithoutBOM } = require("internal/web/vendor/whatwg-url/lib/encoding");

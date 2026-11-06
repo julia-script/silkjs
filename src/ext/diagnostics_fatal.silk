@@ -1,0 +1,237 @@
+//! Shared report settings and the fatal error report.
+//!
+//! The fatal report uses only settings stored before the failure, stack
+//! storage and raw POSIX calls: no JS, no allocation, no other thread's heap.
+import silk.mem.allocator { Allocator, OutOfMemoryError, SystemAllocator }
+import silk.mem.layout { Layout }
+import silk.core.result { Result }
+import silk.concurrency.thread { Transferable }
+import silkjs.runtime_memory { RuntimeAllocator }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.collections.list { List }
+import silk.mem.pointer { Pointer }
+import silk.concurrency.atomic { Atomic, MemoryOrder }
+import silk.concurrency.sync { Arc, Mutex, MutexGuard }
+import silk.collections.slice { Slice }
+import silk.num.i32
+import silk.num.i64
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.num.isize
+import silkjs.js_libc_platform as platform
+import ext.report_json as json
+
+/// Report options set through process.report, shared by every isolate.
+pub struct Reports { pub directory: Option<Arc<List<u8>>>, pub filename: Option<Arc<List<u8>>>, pub compact: bool, sequence: u64 }
+// Read without the settings lock, so a fatal report never waits for it.
+struct Gate { enabled: u32, active: u32 }
+pub struct Settings { pub reports: Arc<Mutex<Reports>>, gate: Arc<Gate> }
+impl Settings {
+  pub effect fn make() -> Self ! OutOfMemoryError ? &mut Allocator {
+    let reports = run Mutex<Reports>.make(Reports { directory: Option<Arc<List<u8>>>.none(), filename: Option<Arc<List<u8>>>.none(), compact: false, sequence: 0 })
+    return Self { reports: run Arc<Mutex<Reports>>.make(move reports), gate: run Arc<Gate>.make(Gate { enabled: 0, active: 0 }) }
+  }
+  pub fn clone(self: &Self) -> Self { return Self { reports: self.reports.clone(), gate: self.gate.clone() } }
+  pub fn fatal(self: &Self) -> bool { return unsafe Atomic.load<u32>(Pointer.fromRef<u32>(&self.gate.get().enabled), MemoryOrder.Acquire) != 0 }
+  pub fn setFatal(self: &Self, enabled: bool) -> () {
+    unsafe Atomic.store<u32>(unsafe word(&self.gate.get().enabled), if enabled { 1 } else { 0 }, MemoryOrder.Release)
+  }
+}
+unsafe fn word(field: &u32) -> *mut u32 { return unsafe Intrinsic.pointerRequalify<*const u32, *mut u32>(Pointer.fromRef<u32>(field)) }
+
+@foreign(noCapture: .("path"))
+unsafe extern "C" fn open(path: *const u8, flags: i32, ...) -> i32
+unsafe extern "C" fn close(fd: i32) -> i32
+@foreign(noCapture: .("buffer"))
+unsafe extern "C" fn write(fd:i32,buffer:*const u8,count:usize)->isize
+unsafe extern "C" fn getpid()->i32
+@foreign(noCapture: .("usage"))
+unsafe extern "C" fn getrusage(who: i32, usage: *mut i64) -> i32
+
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  const PATH_MAX: usize = 1024
+  const OPEN_FLAGS: i32 = 0x1000601
+  // ru_maxrss is in bytes on Darwin.
+  const RSS_SCALE: u64 = 1
+} else {
+  const PATH_MAX: usize = 4096
+  // O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC
+  const OPEN_FLAGS: i32 = 0x80241
+  // ru_maxrss is in KiB on Linux.
+  const RSS_SCALE: u64 = 1024
+}
+const EINTR: i32 = 4
+const EIO: i32 = 5
+
+struct Sink { fd: i32, error: i32 }
+impl Sink {
+  unsafe fn bytes(self: &mut Self, bytes: &[u8]) -> () {
+    let mut at: usize = 0
+    while at < bytes.length {
+      let wrote = unsafe write(self.fd, Pointer.fromRef<u8>(&bytes[at]), bytes.length - at)
+      if wrote < 0 && unsafe platform.errno() == EINTR { continue }
+      if wrote <= 0 {
+        let code = unsafe platform.errno()
+        self.error = if code != 0 { code } else { EIO }
+        return ()
+      }
+      at = at + isize.toUsize(wrote)
+    }
+  }
+  unsafe fn number(self: &mut Self, value: u64) -> () {
+    let mut digits: [u8; 20] = [0; 20]
+    let used = json.decimal(value, &mut digits)
+    unsafe self.bytes(Slice.view<u8>(&digits, 20 - used, used))
+  }
+  unsafe fn seconds(self: &mut Self, seconds: i64, micros: i64) -> () {
+    unsafe self.number(i64.toU64(seconds)) unsafe self.bytes(b".")
+    let mut fraction: [u8; 6] = [0; 6]
+    let mut remaining = i64.toU64(micros)
+    let mut i: usize = 6
+    while i > 0 { i = i - 1 fraction[i] = u64.toU8(48 + remaining % 10) remaining = remaining / 10 }
+    unsafe self.bytes(&fraction)
+  }
+  unsafe fn quoted(self: &mut Self, text: &[u8]) -> () {
+    unsafe self.bytes(b"\"")
+    let mut i: usize = 0
+    while i < text.length {
+      let c = text[i]
+      if c == 34 || c == 92 { let escaped: [u8; 2] = [92, c] unsafe self.bytes(&escaped) }
+      else if c < 32 { let escaped: [u8; 6] = [92, 117, 48, 48, json.hexDigit(c / 16), json.hexDigit(c % 16)] unsafe self.bytes(&escaped) }
+      else { unsafe self.bytes(Slice.view<u8>(text, i, 1)) }
+      i = i + 1
+    }
+    unsafe self.bytes(b"\"")
+  }
+}
+unsafe fn stderr(text: &[u8]) -> () { let mut sink = Sink { fd: 2, error: 0 } unsafe sink.bytes(text) }
+
+struct Path { bytes: [u8; 4096], used: usize }
+impl Path {
+  fn append(self: &mut Self, text: &[u8]) -> () {
+    let mut i: usize = 0 while i < text.length { self.bytes[self.used] = text[i] self.used = self.used + 1 i = i + 1 }
+  }
+  fn number(self: &mut Self, value: u64) -> () {
+    let mut digits: [u8; 20] = [0; 20]
+    let used = json.decimal(value, &mut digits)
+    self.append(Slice.view<u8>(&digits, 20 - used, used))
+  }
+}
+fn equal(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut i: usize = 0 while i < left.length { if left[i] != right[i] { return false } i = i + 1 }
+  return true
+}
+fn text(value: &Option<Arc<List<u8>>>) -> &[u8] {
+  return match &value.* { Option<Arc<List<u8>>>.Some { value: stored } => stored.get().asSlice() _ => b"" }
+}
+
+/// Where the report goes: fd 1 or 2, or a file opened at `path`.
+union Target { Stream { fd: i32 }, File { fd: i32 }, Nowhere }
+
+// Called with the settings lock held. Builds the path in `path`.
+unsafe fn target(reports: &mut Reports, id: u32, path: &mut Path) -> Target {
+  let directory = text(&reports.directory)
+  let filename = text(&reports.filename)
+  if directory.length >= PATH_MAX || filename.length >= PATH_MAX { unsafe stderr(b"Cannot write fatal diagnostic report: configured path exceeds PATH_MAX\n") return Target.Nowhere }
+  if equal(filename, b"stdout") { return Target.Stream { fd: 1 } }
+  if equal(filename, b"stderr") { return Target.Stream { fd: 2 } }
+  let separator: usize = if directory.length != 0 { 1 } else { 0 }
+  let name: usize = if filename.length != 0 { filename.length + 1 } else { 128 }
+  let needed = directory.length + separator + name
+  if needed > PATH_MAX { unsafe stderr(b"Cannot write fatal diagnostic report: combined path exceeds PATH_MAX\n") return Target.Nowhere }
+  if directory.length != 0 { path.append(directory) path.append(b"/") }
+  if filename.length != 0 { path.append(filename) }
+  else {
+    reports.sequence = reports.sequence + 1
+    path.append(b"report.fatal.") path.number(i32.toU64(unsafe getpid())) path.append(b".")
+    path.number(u32.toU64(id)) path.append(b".") path.number(reports.sequence) path.append(b".json")
+  }
+  path.bytes[path.used] = 0
+  let fd = unsafe open(Pointer.fromRef<u8>(&path.bytes[0]), OPEN_FLAGS, 438)
+  if fd < 0 {
+    let code = unsafe platform.errno()
+    let mut sink = Sink { fd: 2, error: 0 }
+    unsafe sink.bytes(b"Failed to open fatal diagnostic report: ") unsafe sink.bytes(Slice.view<u8>(&path.bytes, 0, path.used))
+    unsafe sink.bytes(b" errno=") unsafe sink.number(i32.toU64(code)) unsafe sink.bytes(b"\n")
+    return Target.Nowhere
+  }
+  return Target.File { fd: fd }
+}
+
+/// Writes the fatal report for isolate `id` when fatal reports are enabled.
+/// Does not allocate or terminate; the caller owns the exit.
+pub unsafe fn report(settings: &Settings, id: u32, location: &[u8], message: &[u8]) -> () {
+  if !settings.fatal() { return () }
+  let active = unsafe word(&settings.gate.get().active)
+  if unsafe Atomic.swap<u32>(active, 1, MemoryOrder.Acquire) != 0 { return () }
+  let mut path = Path { bytes: [0; 4096], used: 0 }
+  let mut fd: i32 = 2
+  let mut file = false
+  let mut known = true
+  match settings.reports.get().tryLock() {
+    Option<MutexGuard<Reports>>.Some { value: guard } => {
+      let mut held = move guard
+      match unsafe target(held.getMut(), id, &mut path) {
+        Target.Stream { fd: stream } => { fd = stream }
+        Target.File { fd: opened } => { fd = opened file = true }
+        Target.Nowhere => { known = false }
+      }
+      drop held
+    }
+    _ => { unsafe stderr(b"Fatal diagnostic report configuration unavailable (concurrent update); writing to stderr\n") }
+  }
+  if known { unsafe body(fd, file, id, &path, location, message) }
+  unsafe Atomic.store<u32>(active, 0, MemoryOrder.Release)
+}
+unsafe fn body(fd: i32, file: bool, id: u32, path: &Path, location: &[u8], message: &[u8]) -> () {
+  let mut sink = Sink { fd: fd, error: 0 }
+  unsafe sink.bytes(b"{\"header\":{\"reportVersion\":5,\"event\":\"FatalError\",\"trigger\":\"FatalError\",\"processId\":") unsafe sink.number(i32.toU64(unsafe getpid()))
+  unsafe sink.bytes(b",\"threadId\":") unsafe sink.number(u32.toU64(id))
+  unsafe sink.bytes(b",\"filename\":") if path.used != 0 { unsafe sink.quoted(Slice.view<u8>(&path.bytes, 0, path.used)) } else { unsafe sink.bytes(b"null") }
+  unsafe sink.bytes(b"},\"silkjs\":{\"engine\":\"SilkJS\",\"fatalLocation\":") unsafe sink.quoted(location)
+  unsafe sink.bytes(b",\"fatalMessage\":") unsafe sink.quoted(message)
+  unsafe sink.bytes(b",\"unavailable\":{\"javascriptStack\":\"fatal path cannot safely inspect the JS heap\",\"javascriptHeap\":\"fatal path cannot safely inspect allocator state\",\"workers\":\"fatal path cannot wait for other isolates\",\"libuv\":\"fatal path cannot safely walk the event loop\",\"nativeStack\":\"allocation-free symbolization unavailable\"}}")
+  // struct rusage: ru_utime and ru_stime (timeval), then ru_maxrss; 144 bytes in all.
+  let mut usage: [i64; 18] = [0; 18]
+  if unsafe getrusage(0, Pointer.fromMutRef<i64>(&mut usage[0])) == 0 {
+    // tv_usec is 32 bits on Darwin; the low half of the word holds it on both systems.
+    unsafe sink.bytes(b",\"resourceUsage\":{\"userCpuSeconds\":") unsafe sink.seconds(usage[0], i64.bitAnd(usage[1], 0xffffffff))
+    unsafe sink.bytes(b",\"kernelCpuSeconds\":") unsafe sink.seconds(usage[2], i64.bitAnd(usage[3], 0xffffffff))
+    unsafe sink.bytes(b",\"maxRss\":") unsafe sink.number(i64.toU64(usage[4]) * RSS_SCALE)
+    unsafe sink.bytes(b"}")
+  } else { unsafe sink.bytes(b",\"resourceUsageUnavailable\":\"getrusage failed\"") }
+  unsafe sink.bytes(b"}\n")
+  if file && unsafe close(fd) != 0 { sink.error = unsafe platform.errno() }
+  if sink.error != 0 {
+    let mut out = Sink { fd: 2, error: 0 }
+    unsafe out.bytes(b"Failed to complete fatal diagnostic report: errno=") unsafe out.number(i32.toU64(sink.error)) unsafe out.bytes(b"\n")
+  }
+}
+
+unsafe extern "C" fn abort() -> ()
+
+/// The system allocator for an isolate's runtime heap. When the system is out
+/// of memory it writes the fatal report for isolate `id` and aborts.
+pub struct ReportingAllocator { child: SystemAllocator, settings: Settings, id: u32 }
+impl Transferable for ReportingAllocator {}
+impl ReportingAllocator {
+  pub fn make(settings: Settings, id: u32) -> Self { return Self { child: Allocator.systemAllocatorProvider(), settings: move settings, id: id } }
+}
+impl Allocator for ReportingAllocator {
+  effect fn allocate(self: &mut Self, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
+    let made = run Effect.result(Allocator.allocate(move layout)) |> Effect.provideMut<Allocator>(&mut self.child)
+    return match move made {
+      Result<Intrinsic.Allocation, OutOfMemoryError>.Success { value } => move value
+      Result<Intrinsic.Allocation, OutOfMemoryError>.Failure { error } => {
+        unsafe report(&self.settings, self.id, b"native allocator", b"Native memory allocation failed")
+        unsafe abort()
+        fail move error
+      }
+    }
+  }
+}
+pub type RuntimeHeap = RuntimeAllocator<ReportingAllocator>

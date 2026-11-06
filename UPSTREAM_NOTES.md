@@ -30,7 +30,7 @@ Filesystem requests, watchers, and crypto thread-pool work use the same native l
 
 ## 3. Canonical foreign-function declarations and callback contracts
 
-**Sources:** `src/ext/uv_fs.silk`, `src/ext/openssl.silk`, `src/ext/fs_async.silk`, `src/ext/sqlite_abi.silk`; engine libc declarations in `../silkjs/src`.
+**Sources:** `src/ext/uv_fs.silk`, `src/ext/openssl.silk`, `src/ext/fs_async.silk`, `sys` of silk-lang/nonstd `db/sqlite` (formerly `src/ext/sqlite_abi.silk`); engine libc declarations in `../silkjs/src`.
 
 Integration exposed duplicate declarations of the same C symbol with incompatible behavioral contracts, even when their ABI types matched. In particular, `free` declarations differed on `noCapture`, and libuv work/run declarations had been duplicated between filesystem and crypto adapters. Where declarations remain repeated, both ABI and behavioral contracts must agree. Deferred/thread callbacks must be distinguished from immediate callbacks, and nullable callback pointers are required by libuv's synchronous filesystem API.
 
@@ -120,7 +120,7 @@ Native-owned bytes can move between runtimes by retaining an allocation owner ra
 
 The shared llhttp adapter now exercises a read lease during synchronous reentry: its headers callback transfers and detaches the input ArrayBuffer, but parsing still delivers the complete `payload` body and message completion. The runtime and Node 24.22.2 returned identical results, including the detached source and captured async context. Ordinary input stays borrowed until transfer requires a snapshot; foreign/shared backing follows its explicit snapshot policy. `tests/compat.mjs` retains this boundary as `http-parser-detach-context`.
 
-SEA assets add an immutable mapped-file owner (`src/ext/sea_bridge.c`). The runtime and each raw ArrayBuffer retain independent mapping references; copied assets and Blob results are independent allocations. A real detach/collection failure exposed the engine's external-finalizer convention: a detached wrapper can invoke the callback again with null data. The SEA adapter now releases its mapping reference only for live data, preventing premature unmapping. Standalone source and bytecode-cache executables passed asset transfer and Blob ownership checks after every input source, asset, configuration, and preparation blob had been deleted. This callback convention is an embedding responsibility, not a stdlib feature request.
+SEA assets add an immutable mapped-file owner (`src/ext/sea_payload.silk`, `src/ext/sea_native.silk`). A read-only mapped file is a candidate for the Silk std filesystem. The runtime and each raw ArrayBuffer retain independent mapping references; copied assets and Blob results are independent allocations. A real detach/collection failure exposed the engine's external-finalizer convention: a detached wrapper can invoke the callback again with null data. The SEA adapter now releases its mapping reference only for live data, preventing premature unmapping. Standalone source and bytecode-cache executables passed asset transfer and Blob ownership checks after every input source, asset, configuration, and preparation blob had been deleted. This callback convention is an embedding responsibility, not a stdlib feature request.
 
 **Potential stdlib contribution:** reusable native allocation leases and explicit foreign-owner transfer policies, if existing ownership/reference-counting primitives do not already cover them. Preserve all-or-nothing preparation, source-thread destruction, and allocation lifetime independent of the allocating service. JavaScript detachment, structured-clone traversal, and SQLite callback policy stay outside the generic abstraction.
 
@@ -736,9 +736,14 @@ Throwaway filesystem and close-delivery probes exercise these boundaries.
 The permanent socket fixture awaits both peers explicitly; client close does
 not guarantee that the accepted server socket has already closed.
 
-Report directory, filename, compact mode, and fatal-report enablement live in
-the process-scoped worker registry. Immutable UTF-8 path storage is retained
-under the mutex and decoded after unlocking; no JavaScript allocation occurs
+Report directory, filename and compact mode live in the worker group's report
+settings (`src/ext/diagnostics_fatal.silk`) behind their own mutex, and
+fatal-report enablement is an atomic beside them, so the fatal path reads them
+with one `tryLock` and never waits. Out-of-memory in an isolate's runtime heap
+reaches the report through `ReportingAllocator`, the heap's child allocator,
+which carries the settings and isolate ID; `napi_fatal_error` reaches it
+through a per-thread context that `napi_native` sets. Immutable UTF-8 path
+storage is retained under the mutex and decoded after unlocking; no JavaScript allocation occurs
 while the registry is locked. Lone surrogates normalize to replacement
 characters, and native path settings truncate at the first NUL. Signal and
 uncaught-exception settings remain isolate-local with Node's worker option
@@ -1049,8 +1054,11 @@ version: `tr46` 7.0.0 contains Unicode 18, not the required Unicode 17.
 `src/ext/inspector_transport.c` supplies a bounded, byte-only HTTP/WebSocket
 transport on a private I/O thread. JavaScript values never cross that thread;
 the isolate consumes owned packets and sends owned response bytes. The wake
-handle must outlive server stop/join. `process_diagnostics.c` supplies the
-shared isolate-addressed native mailbox used by inspector and profile requests.
+handle must outlive server stop/join. `src/ext/diagnostics_hub.silk` supplies
+the isolate-addressed native mailbox used by inspector and profile requests. It
+lives in the worker registry, so its lock and the group's `changed` condition
+guard every queue; packets and published reports are allocated from the
+group's resources because another isolate frees them.
 
 Worker registration in that mailbox precedes JavaScript bootstrap readiness.
 Inspector polling leaves incoming packets transport-owned until the isolate

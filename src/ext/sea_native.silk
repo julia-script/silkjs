@@ -1,6 +1,9 @@
 //! Host 13000 is seaNative. External buffer finalizer 13001 releases opaque
 //! only for live data. State and raw buffers independently retain the mapping.
+//! ext.sea_payload locates and maps the payload.
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silkjs.js_owned_value { Value }
+import silkjs.js_realm { lendRealm }
 import silk.mem.pointer { Pointer }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
@@ -11,37 +14,71 @@ import silkjs.js_engine { Engine }
 import silkjs.js_engine_host { EngineServices }
 import silkjs.js_heap { HeapHeader }
 import silkjs.js_core_types { FrameSlots, NativeFunctionId, NativeErrorKind }
-import silkjs.js_value { Value }
+import silkjs.js_value { ValueBits }
 import silkjs.js_exceptions { JsException }
 import silkjs.js_coercion_host { CoercionHooks }
 import silkjs.js_buffer_storage as buffers
-import silkjs.js_intl_common as common
+import libs.core.common as common
 import silkjs.js_std_support as text
 import ext.script_cache
+import ext.worker_transport as transport
+import ext.sea_payload as seaPayload
+import ext.sea_payload { Payload }
+import silkjs.js_os_workers_resources as resources
+import silkjs.js_os_workers_resources { Resources }
+import silk.concurrency.atomic { Atomic, MemoryOrder }
+import silk.num.u8
+import silk.num.u64
 import silkjs.js_eval as evaluation
 
-// Opaque C allocation. Never inspect or allocate this layout from Silk.
-pub struct State { reserved: u8 }
-unsafe extern "C" fn silk_sea_open() -> ?*mut State
-unsafe extern "C" fn silk_sea_retain(owner: *mut State) -> ()
-unsafe extern "C" fn silk_sea_release(owner: ?*mut u8) -> ()
-unsafe extern "C" fn silk_sea_status(owner: *mut State) -> i32
-unsafe extern "C" fn silk_sea_length(owner: *mut State) -> usize
-unsafe extern "C" fn silk_sea_manifest_length(owner: *mut State) -> usize
-unsafe extern "C" fn silk_sea_range(owner: *mut State, offset: usize, length: usize) -> ?*mut u8
-unsafe fn raw(state: *mut State) -> *mut u8 { return unsafe Intrinsic.pointerReinterpret<*mut State, *mut u8>(state) }
-pub effect fn open() -> *mut State ! OutOfMemoryError {
-  let pointer = unsafe silk_sea_open()
-  if Pointer.isNull<State>(pointer) { fail OutOfMemoryError {} }
-  return unsafe Intrinsic.pointerRequalify<?*mut State, *mut State>(pointer)
+// One isolate's view of the SEA payload. The isolate and every ArrayBuffer that
+// exposes payload bytes each hold a reference; the last release unmaps.
+pub struct State {
+  references: u64,
+  resources: Resources,
+  payload: Payload,
 }
-pub unsafe fn close(state: *mut State) -> () { unsafe silk_sea_release(unsafe raw(state)) }
+unsafe fn raw(state: *mut State) -> *mut u8 { return unsafe Intrinsic.pointerReinterpret<*mut State, *mut u8>(state) }
+unsafe fn borrow<'a>(anchor: &'a (), state: *mut State) -> &'a State { return unsafe Pointer.borrow<(), State>(anchor, state) }
+pub effect fn open(resources: &Resources) -> *mut State ! OutOfMemoryError {
+  let state = run transport.allocate<State>(resources)
+  unsafe Pointer.put<State>(state, State { references: 1, resources: resources.clone(), payload: seaPayload.Payload { mapping: Pointer.null<u8>(), mappingSize: 0, offset: 0, length: 0, manifestLength: 0, status: 0 } })
+  unsafe load(state)
+  return state
+}
+unsafe fn retain(state: *mut State) -> () {
+  let mut anchor = () let entry = unsafe Pointer.borrowMut<(), State>(&mut anchor, state)
+  let _ignored = unsafe Atomic.fetchAdd<u64>(Pointer.fromMutRef<u64>(&mut entry.references), 1, MemoryOrder.Relaxed)
+}
+unsafe fn release(state: *mut State) -> () {
+  let mut anchor = () let entry = unsafe Pointer.borrowMut<(), State>(&mut anchor, state)
+  if unsafe Atomic.fetchSubtract<u64>(Pointer.fromMutRef<u64>(&mut entry.references), 1, MemoryOrder.AcquireRelease) != 1 { return () }
+  unsafe seaPayload.unmap(&entry.payload)
+  drop entry
+  let owned = unsafe Pointer.take<State>(state) drop owned
+  unsafe resources.release(unsafe raw(state))
+}
+pub unsafe fn close(state: *mut State) -> () { unsafe release(state) }
 pub unsafe fn freeBuffer(opaque: ?*mut u8, data: ?*mut u8) -> () {
   // External callbacks can run again with null data when a detached wrapper
   // dies. Its mapping reference was already released during detachment.
-  if !Pointer.isNull<u8>(data) { unsafe silk_sea_release(opaque) }
+  if Pointer.isNull<u8>(data) || Pointer.isNull<u8>(opaque) { return () }
+  unsafe release(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut State>(unsafe transport.nonnull(opaque)))
 }
-unsafe effect fn extent<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, value: Value) -> usize ! JsException ? &mut Allocator {
+unsafe fn range(state: *mut State, offset: usize, length: usize) -> ?*mut u8 {
+  let anchor = () let entry = unsafe borrow(&anchor, state)
+  let payload = &entry.payload
+  if payload.status != 1 || offset > payload.length || length > payload.length - offset { return Pointer.null<u8>() }
+  let base = unsafe Pointer.assumeManyMut<u8>(unsafe transport.nonnull(payload.mapping))
+  return unsafe Pointer.atMut<u8>(base, payload.offset + offset)
+}
+
+unsafe fn load(state: *mut State) -> () {
+  let payload = unsafe seaPayload.locate()
+  let mut anchor = () let entry = unsafe Pointer.borrowMut<(), State>(&mut anchor, state)
+  entry.payload = move payload
+}
+unsafe effect fn extent<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, value: ValueBits) -> usize ! JsException ? &mut Allocator {
   if value.isNumber() {
     let number = value.numericValue()
     if number >= 0.0 && number <= 9007199254740991.0 {
@@ -49,38 +86,43 @@ unsafe effect fn extent<'m, S: EngineServices>(engine: &mut Engine<'m, S>, conte
       if usize.toF64(result) == number { return result }
     }
   }
-  return run unsafe engine.throwError(context, NativeErrorKind.Range, b"Invalid SEA payload extent")
+  return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Range, b"Invalid SEA payload extent")
 }
 // 0=isSea, 1=manifest UTF8, 2=raw range(offset,length),
 // 3=execute embedded Silk bytecode(offset,length), 4=payload length.
-pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, argc: i32, argv: &FrameSlots) -> Value ! OutOfMemoryError | JsException ? &mut Allocator {
-  let status = unsafe silk_sea_status(state)
-  if status < 0 { return run unsafe engine.throwError(context, NativeErrorKind.Internal, b"ERR_INVALID_SEA_BLOB: cannot map embedded SEA payload") }
+pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, argc: i32, argv: &FrameSlots) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let anchor = ()
+  let entry = unsafe borrow(&anchor, state)
+  let status = entry.payload.status
+  let payloadLength = entry.payload.length
+  let manifestLength = entry.payload.manifestLength
+  drop entry
+  if status < 0 { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Internal, b"ERR_INVALID_SEA_BLOB: cannot map embedded SEA payload") }
   let operation = run unsafe extent(&mut engine, context, unsafe common.argument(argv, 0))
-  if operation == 0 { return Value.Bool { value: status == 1 } }
-  if status == 0 { return Value.Undefined }
-  if operation == 4 { return Value.Float64 { value: usize.toF64(unsafe silk_sea_length(state)) } }
+  if operation == 0 { return ValueBits.Bool { value: status == 1 } }
+  if status == 0 { return ValueBits.Undefined }
+  if operation == 4 { return ValueBits.Float64 { value: usize.toF64(payloadLength) } }
   if operation == 1 {
-    let length = unsafe silk_sea_manifest_length(state)
-    let pointer = unsafe silk_sea_range(state, 16, length)
-    return run unsafe text.stringPointer(&mut engine, context, unsafe Intrinsic.pointerRequalify<?*mut u8, *const u8>(pointer), length)
+    let length = manifestLength
+    let pointer = unsafe range(state, 16, length)
+    return (run text.stringPointer(&mut engine, unsafe lendRealm(&context, context), unsafe Intrinsic.pointerRequalify<?*mut u8, *const u8>(pointer), length)).intoBits()
   }
-  if operation != 2 && operation != 3 { return run unsafe engine.throwError(context, NativeErrorKind.Type, b"Unknown SEA native operation") }
+  if operation != 2 && operation != 3 { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Unknown SEA native operation") }
   let offset = run unsafe extent(&mut engine, context, unsafe common.argument(argv, 1))
   let length = run unsafe extent(&mut engine, context, unsafe common.argument(argv, 2))
-  let pointer = unsafe silk_sea_range(state, offset, length)
-  if Pointer.isNull<u8>(pointer) { return run unsafe engine.throwError(context, NativeErrorKind.Range, b"Invalid SEA payload range") }
+  let pointer = unsafe range(state, offset, length)
+  if Pointer.isNull<u8>(pointer) { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Range, b"Invalid SEA payload range") }
   let memory = engine.memory
   if operation == 3 {
     // The runtime envelope restores owned supplementary debug metadata as well
     // as engine bytecode; no executable closure borrows the SEA mapping.
     let compiled = run unsafe script_cache.read(&mut engine, context, unsafe Intrinsic.pointerRequalify<?*mut u8, *const u8>(pointer), length)
-    return run unsafe evaluation.evaluateFunction(&mut engine, memory, context, compiled)
+    return (run evaluation.evaluateFunction(&mut engine, memory, unsafe lendRealm(&context, context), unsafe Value.adoptBits(compiled))).intoBits()
   }
-  unsafe silk_sea_retain(state)
-  let outcome = run Effect.result(unsafe buffers.newArrayBuffer(&mut engine, memory, context, pointer, usize.toU64(length), Option<NativeFunctionId>.some(NativeFunctionId.Host { id: 13001 }), unsafe raw(state), false))
+  unsafe retain(state)
+  let outcome = run Effect.result(unsafe buffers.newArrayBuffer(&mut engine, memory, unsafe lendRealm(&context, context), pointer, usize.toU64(length), Option<NativeFunctionId>.some(NativeFunctionId.Host { id: 13001 }), unsafe raw(state), false))
   return match move outcome {
-    Result<Value, JsException>.Success { value } => value
-    Result<Value, JsException>.Failure { error } => { unsafe silk_sea_release(unsafe raw(state)) fail move error }
+    Result<ValueBits, JsException>.Success { value } => value
+    Result<ValueBits, JsException>.Failure { error } => { unsafe release(state) fail move error }
   }
 }

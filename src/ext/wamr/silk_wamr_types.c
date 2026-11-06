@@ -89,7 +89,7 @@ work_grow(TypeWork *work)
 }
 
 static const WASMType *
-group_member(const WASMModule *module, const WASMType *type, uint32 index)
+type_group_member(const WASMModule *module, const WASMType *type, uint32 index)
 {
     if (index >= type->rec_count)
         return NULL;
@@ -114,8 +114,8 @@ add_types(TypeWork *work, const WASMType *expected, const WASMType *actual)
         || expected->type_flag != actual->type_flag
         || expected->is_sub_final != actual->is_sub_final)
         return false;
-    expected = group_member(work->expected_module, expected, 0);
-    actual = group_member(work->actual_module, actual, 0);
+    expected = type_group_member(work->expected_module, expected, 0);
+    actual = type_group_member(work->actual_module, actual, 0);
     if (!expected || !actual)
         return false;
     bucket = pair_bucket(work, expected, actual);
@@ -265,9 +265,9 @@ group_equal(TypeWork *work, const WASMType *expected_group,
     if (expected_group->rec_count != actual_group->rec_count)
         return false;
     for (index = 0; index < expected_group->rec_count; index++) {
-        const WASMType *expected = group_member(work->expected_module,
+        const WASMType *expected = type_group_member(work->expected_module,
                                                expected_group, index);
-        const WASMType *actual = group_member(work->actual_module,
+        const WASMType *actual = type_group_member(work->actual_module,
                                              actual_group, index);
         if (!expected || !actual || expected->type_flag != actual->type_flag
             || expected->is_sub_final != actual->is_sub_final

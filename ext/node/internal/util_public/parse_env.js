@@ -1,7 +1,6 @@
 'use strict';
 
 const { validateString } = require('internal/util_public/support');
-const { TextEncoder, TextDecoder } = require('internal/web/encoding');
 const trim = value => value.replace(/^[ \t\n]+|[ \t\n]+$/g, '');
 // UTF-8 std::map ordering is Unicode scalar ordering, not UTF-16 ordering.
 function compareKeys(a, b) {
@@ -18,7 +17,7 @@ function parseEnv(content) {
   validateString(content, 'content');
   // Node's native parser receives a UTF-8 string (including replacement of
   // unpaired surrogates), and removes every CR, including those in quotes.
-  content = trim(new TextDecoder('utf-8', { ignoreBOM: true }).decode(new TextEncoder().encode(content)).replace(/\r/g, ''));
+  content = trim(content.toWellFormed().replace(/\r/g, ''));
   const store = new Map();
   while (content.length) {
     if (content[0] === '\n' || content[0] === '#') {
