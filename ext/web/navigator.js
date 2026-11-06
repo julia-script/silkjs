@@ -34,9 +34,8 @@ class Navigator {
   get hardwareConcurrency() { return this.#hardwareConcurrency ??= os.availableParallelism(); }
   get language() {
     this.#languages; // Brand check even though language itself is not cached.
-    // ICU's default locale comes from the operating system locale configuration.
-    // Keep this lazy so installation of the globals has no ordering dependency.
-    return require('internal/host').intlNative(4, []);
+    // The default locale comes from the operating system locale configuration.
+    return new Intl.DateTimeFormat().resolvedOptions().locale;
   }
   get languages() { return this.#languages ??= Object.freeze([this.language]); }
   get platform() { return this.#platform ??= navigatorPlatform(); }

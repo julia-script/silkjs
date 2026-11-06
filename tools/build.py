@@ -30,17 +30,6 @@ def main():
             raise SystemExit('Set SDKROOT to a macOS SDK supporting the pinned compiler\'s macOS 11 deployment target.')
     if not shutil.which('silk'):
         raise SystemExit('Install the Silk launcher and run silk use in this repository.')
-    if platform.system() == 'Darwin' and shutil.which('brew'):
-        paths = []
-        for package in ['icu4c@78']:
-            prefix = subprocess.check_output(['brew', '--prefix', package], text=True).strip()
-            paths.append(str(Path(prefix) / 'lib/pkgconfig'))
-        if environment.get('PKG_CONFIG_PATH'):
-            paths.append(environment['PKG_CONFIG_PATH'])
-        environment['PKG_CONFIG_PATH'] = os.pathsep.join(paths)
-    icu_version = subprocess.check_output(['pkg-config', '--modversion', 'icu-uc'], env=environment, text=True).strip()
-    if icu_version.split('.')[0] != '78':
-        raise SystemExit(f'The native Intl bindings require ICU 78; found {icu_version}.')
     generate(debug=not args.release, environment=environment)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     native = ROOT / 'build/native'
@@ -50,8 +39,6 @@ def main():
         ('libcares', 'libcares.a'), ('libbrotlienc', 'libbrotlienc.a'),
         ('libbrotlidec', 'libbrotlidec.a'), ('libbrotlicommon', 'libbrotlicommon.a'),
         ('libzstd', 'libzstd.a'), ('libnghttp2', 'libnghttp2.a'),
-        ('icu-i18n', 'libicui18n.a'),
-        ('icu-uc', 'libicuuc.a'), ('icu-uc', 'libicudata.a'),
     ]:
         libdir = Path(subprocess.check_output(['pkg-config', '--variable=libdir', package], env=environment, text=True).strip())
         source, destination = libdir / archive, native / archive

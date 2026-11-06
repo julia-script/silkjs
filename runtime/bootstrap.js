@@ -23,7 +23,6 @@ const stringLastIndexOf = Function.prototype.call.bind(String.prototype.lastInde
 const define = (name, factory) => {
   factories.set(name, factory);
   if (name === 'internal/error_stack' ||
-      name === 'internal/web/intl' || name.startsWith('internal/web/intl/') ||
       name === 'internal/web/wasm' || name.startsWith('internal/web/wasm/'))
     realmSources.set(name, factory);
 };
@@ -107,7 +106,6 @@ host.initializeRealmBuiltins = (handle, global, wasmCodeGeneration) => {
   const bridge = {
     captureCallSites: native.captureCallSites,
     errorStackState: host.errorStackState,
-    intlNative: native.vmIntlNative(handle),
     wasmNative: native.vmWasmNative(handle),
     wasmRealmState: host.wasmRealmState,
     wasmCodeGeneration,
@@ -130,7 +128,6 @@ host.initializeRealmBuiltins = (handle, global, wasmCodeGeneration) => {
     return module.exports;
   }
   load('internal/error_stack').install(global);
-  load('internal/web/intl').installIntl(global);
   Object.defineProperty(global, 'WebAssembly', {
     value: load('internal/web/wasm').WebAssembly, writable: true, configurable: true,
   });
@@ -467,7 +464,6 @@ host.stdout = process.stdout;
 host.stderr = process.stderr;
 const webGlobals = internalRequire('internal/web/index');
 webGlobals.install(globalThis);
-internalRequire('internal/web/intl').installIntl(globalThis);
 globalThis.console = internalRequire('console');
 // Register the trusted dispatcher before preloads or any other guest code can
 // connect to this isolate (including through a parent Worker inspector).

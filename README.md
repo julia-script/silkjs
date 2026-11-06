@@ -13,8 +13,8 @@ Requirements:
 - The Silk launcher; `silk.toml` pins the compiler version.
 - Python 3.12 or newer, Clang 22 or newer, CMake, `patch`, and `pkg-config`.
 - A macOS SDK supporting the compiler's macOS 11 deployment target. The build selects the installed macOS 15.5 SDK when `SDKROOT` is unset; otherwise set `SDKROOT` explicitly.
-- Development headers and static archives for libuv 1.50 or newer, OpenSSL 3.2 or newer, c-ares, Brotli, Zstandard, nghttp2, and **ICU 78**. They must be discoverable through `pkg-config`. The build adds Homebrew's `icu4c@78` package-config directory when available. SQLite needs nothing installed: the `db-sqlite` package from [silk-lang/nonstd](https://github.com/silk-lang/nonstd) compiles its pinned amalgamation into the executable.
-- On GNU/Linux, the executable links libc++, so build ICU with `CXXFLAGS=-stdlib=libc++ LDFLAGS=-stdlib=libc++`. Distribution packages are often too old: Ubuntu 24.04 has libuv 1.48, OpenSSL 3.0 and ICU 74.
+- Development headers and static archives for libuv 1.50 or newer, OpenSSL 3.2 or newer, c-ares, Brotli, Zstandard, and nghttp2. They must be discoverable through `pkg-config`. SQLite needs nothing installed: the `db-sqlite` package from [silk-lang/nonstd](https://github.com/silk-lang/nonstd) compiles its pinned amalgamation into the executable.
+- On GNU/Linux, distribution packages are often too old: Ubuntu 24.04 has libuv 1.48 and OpenSSL 3.0.
 - Network access on the first build to retrieve checksum-verified source dependencies.
 
 ```sh
@@ -40,7 +40,7 @@ The build prepares the exact SilkJS revision declared in `silk.toml`, verifies i
 ./build/silkjsruntime -i
 ```
 
-The implementation includes CommonJS and ESM package loading, TypeScript execution, filesystem and process APIs, streams, networking and TLS/HTTP2, crypto and WebCrypto, workers and cluster, SQLite, ICU-backed Intl, Web APIs, WebAssembly/WASI, Node-API addons, the test runner, REPL, inspector, and native profiling. Feature-specific fixtures in [`tests/`](tests/) exercise these contracts, including cross-process and cross-realm ownership and failure paths.
+The implementation includes CommonJS and ESM package loading, TypeScript execution, filesystem and process APIs, streams, networking and TLS/HTTP2, crypto and WebCrypto, workers and cluster, SQLite, Intl (SilkJS's ECMA-402 implementation in Silk, with its own CLDR-derived locale data; no ICU), Web APIs, WebAssembly/WASI, Node-API addons, the test runner, REPL, inspector, and native profiling. Feature-specific fixtures in [`tests/`](tests/) exercise these contracts, including cross-process and cross-realm ownership and failure paths.
 
 ## Compatibility boundaries
 
