@@ -30,7 +30,7 @@ Filesystem requests, watchers, and crypto thread-pool work use the same native l
 
 ## 3. Canonical foreign-function declarations and callback contracts
 
-**Sources:** `src/ext/uv_fs.silk`, `src/ext/openssl.silk`, `src/ext/fs_async.silk`, `src/ext/sqlite_abi.silk`; engine libc declarations in `../silkjs/src`.
+**Sources:** `src/ext/uv_fs.silk`, `src/ext/openssl.silk`, `src/ext/fs_async.silk`, `sys` of silk-lang/nonstd `db/sqlite` (formerly `src/ext/sqlite_abi.silk`); engine libc declarations in `../silkjs/src`.
 
 Integration exposed duplicate declarations of the same C symbol with incompatible behavioral contracts, even when their ABI types matched. In particular, `free` declarations differed on `noCapture`, and libuv work/run declarations had been duplicated between filesystem and crypto adapters. Where declarations remain repeated, both ABI and behavioral contracts must agree. Deferred/thread callbacks must be distinguished from immediate callbacks, and nullable callback pointers are required by libuv's synchronous filesystem API.
 
