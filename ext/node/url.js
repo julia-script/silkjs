@@ -1028,7 +1028,6 @@ module.exports = {
   // WHATWG API
   URL,
   URLSearchParams,
-  URLPattern: require('internal/web/urlpattern').URLPattern,
   domainToASCII,
   domainToUnicode,
 
@@ -1038,3 +1037,13 @@ module.exports = {
   fileURLToPathBuffer,
   urlToHttpOptions,
 };
+// urlpattern is loaded on first read; url is required during startup.
+Object.defineProperty(module.exports, 'URLPattern', {
+  get() {
+    const { URLPattern } = require('internal/web/urlpattern');
+    Object.defineProperty(module.exports, 'URLPattern', { value: URLPattern, writable: true, enumerable: true, configurable: true });
+    return URLPattern;
+  },
+  set(value) { Object.defineProperty(module.exports, 'URLPattern', { value, writable: true, enumerable: true, configurable: true }); },
+  enumerable: true, configurable: true,
+});

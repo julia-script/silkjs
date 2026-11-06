@@ -1,11 +1,13 @@
 'use strict';
 
-const { TextEncoder, TextDecoder } = require('internal/web/encoding');
-const { ReadableStream } = require('internal/web/streams');
+// Encoding and streams load on first use; URL (and so startup) requires this module.
+const TextDecoder = function(...args) { return new (require('internal/web/encoding').TextDecoder)(...args); };
+const ReadableStream = function(...args) { return new (require('internal/web/streams').ReadableStream)(...args); };
+let encoderInstance;
+const encoder = { encode: text => (encoderInstance ||= new (require('internal/web/encoding').TextEncoder)()).encode(text) };
 const blobs = new WeakMap();
 const files = new WeakMap();
 const objectURLs = new Map();
-const encoder = new TextEncoder();
 let objectURLSequence = 0;
 
 function string(value) {

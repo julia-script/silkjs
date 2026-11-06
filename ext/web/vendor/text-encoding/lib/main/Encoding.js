@@ -27,8 +27,24 @@ function registerEncoding(name, labels, decoder, encoder) {
  * @returns The found encoding.
  * @throws RangeError - When encoding was not found.
  */
+/** Map from a lower-cased label to the module that registers its encoding. */
+const lazyEncodings = new Map();
+/**
+ * Records which module registers each label, to load on first lookup.
+ *
+ * @param table - Object mapping each label to its module name.
+ */
+function registerLazyEncodings(table) {
+    for (const label of Object.keys(table)) {
+        lazyEncodings.set(label, table[label]);
+    }
+}
 function getEncoding(label) {
-    const encoding = encodings.get(label.trim().toLowerCase());
+    const key = label.trim().toLowerCase();
+    if (!encodings.has(key) && lazyEncodings.has(key)) {
+        require(lazyEncodings.get(key));
+    }
+    const encoding = encodings.get(key);
     if (encoding == null) {
         throw new RangeError(`Encoding not supported: ${label}`);
     }
@@ -84,4 +100,4 @@ class Encoding {
     }
 }
 
-Object.assign(exports, { registerEncoding, getEncoding, Encoding });
+Object.assign(exports, { registerEncoding, registerLazyEncodings, getEncoding, Encoding });

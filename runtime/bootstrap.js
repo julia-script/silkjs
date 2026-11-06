@@ -45,11 +45,11 @@ function internalRequire(request, parent = '') {
   if (stringEndsWith(request, '.js')) request = stringSlice(request, 0, -3);
   if (moduleHas(request)) return moduleGet(request).exports;
   let factory = factoryGet(request);
-  if (!factory) throw Object.assign(new Error('Unknown builtin: ' + request), { code: 'ERR_UNKNOWN_BUILTIN_MODULE' });
+  if (factory === undefined) throw Object.assign(new Error('Unknown builtin: ' + request), { code: 'ERR_UNKNOWN_BUILTIN_MODULE' });
   const module = { exports: {} }; moduleSet(request, module);
   try {
-    if (typeof factory === 'string') {
-      factory = native.compileFunction(factory, 'node:' + request);
+    if (typeof factory === 'number') {
+      factory = native.compileFunction(native.builtinSource(factory), 'node:' + request);
       factorySet(request, factory);
     }
     factory(module, module.exports, name => internalRequire(name, request));
@@ -57,7 +57,7 @@ function internalRequire(request, parent = '') {
   catch (error) { moduleDelete(request); throw error; }
   return module.exports;
 }
-/*__BUILTINS__*/
+for (let index = 0, count = native.builtinCount(); index < count; index++) define(native.builtinName(index), index);
 
 for (const name of ['dispose', 'asyncDispose']) {
   if (Symbol[name] === undefined) Object.defineProperty(Symbol, name, { value: Symbol.for('nodejs.' + name) });
@@ -119,8 +119,9 @@ host.initializeRealmBuiltins = (handle, global, wasmCodeGeneration) => {
     if (name === 'internal/host') return bridge;
     if (!realmSources.has(name)) return internalRequire(name);
     if (cache.has(name)) return cache.get(name).exports;
-    const source = realmSources.get(name);
-    if (typeof source !== 'string') throw new Error('Unknown realm builtin dependency: ' + name);
+    const index = realmSources.get(name);
+    if (typeof index !== 'number') throw new Error('Unknown realm builtin dependency: ' + name);
+    const source = native.builtinSource(index);
     const module = { exports: {} };
     cache.set(name, module);
     const script = native.vmCompile('(' + source + ')', 'node:' + name, handle);
@@ -464,20 +465,30 @@ workerThreads._install(process, workerBootstrap);
 if (workerThreads.isMainThread) internalRequire('internal/watch_mode/dependencies').initialize();
 host.stdout = process.stdout;
 host.stderr = process.stderr;
-Object.assign(globalThis, internalRequire('internal/web/index'));
+const webGlobals = internalRequire('internal/web/index');
+webGlobals.install(globalThis);
 internalRequire('internal/web/intl').installIntl(globalThis);
 globalThis.console = internalRequire('console');
 // Register the trusted dispatcher before preloads or any other guest code can
 // connect to this isolate (including through a parent Worker inspector).
 const inspectorBackend = internalRequire('internal/inspector');
-globalThis.crypto = internalRequire('crypto').webcrypto;
-const webCrypto = internalRequire('internal/crypto_webcrypto');
-for (const name of ['Crypto', 'SubtleCrypto', 'CryptoKey'])
-  Object.defineProperty(globalThis, name, { value: webCrypto[name], writable: true, configurable: true });
-const performanceHooks = internalRequire('perf_hooks');
-globalThis.performance = performanceHooks.performance;
-for (const name of ['Performance', 'PerformanceEntry', 'PerformanceMark', 'PerformanceMeasure', 'PerformanceObserver', 'PerformanceObserverEntryList', 'PerformanceResourceTiming'])
-  globalThis[name] = performanceHooks[name];
+webGlobals.defineLazy(globalThis, 'crypto', () => ({ crypto: internalRequire('crypto').webcrypto }));
+for (const name of ['Crypto', 'SubtleCrypto', 'CryptoKey']) {
+  Object.defineProperty(globalThis, name, {
+    get() {
+      const value = internalRequire('internal/crypto_webcrypto')[name];
+      Object.defineProperty(globalThis, name, { value, writable: true, configurable: true });
+      return value;
+    },
+    set(value) { Object.defineProperty(globalThis, name, { value, writable: true, configurable: true }); },
+    configurable: true,
+  });
+}
+{
+  const loadPerformance = () => internalRequire('perf_hooks');
+  for (const name of ['performance', 'Performance', 'PerformanceEntry', 'PerformanceMark', 'PerformanceMeasure', 'PerformanceObserver', 'PerformanceObserverEntryList', 'PerformanceResourceTiming'])
+    webGlobals.defineLazy(globalThis, name, loadPerformance);
+}
 host.path = internalRequire('path');
 const publicBuiltinNames = [...factories.keys()].filter(name => !name.startsWith('internal/'));
 const publicBuiltinHas = Set.prototype.has.bind(new Set(publicBuiltinNames));
