@@ -1,6 +1,7 @@
 // Exercise the same access sites across inline, grown, and separate slot storage.
 function check(ok, message) { if (!ok) throw new Error(message); }
 function Pair(a, b) { this.a = a; this.b = b; }
+function Shared(a, b) { this.a = a; this.b = a; this.c = b; }
 function read(o) { return o.a; }
 function write(o, v) { o.b = v; }
 function leaf() { return this.a; }
@@ -8,6 +9,8 @@ function fused(o, v) { o.a = v; return o.a; }
 var keep = [];
 for (var round = 0; round < 300; round++) {
   var small = new Pair({ n: round }, 's' + round);
+  var shared = new Shared(small);
+  check(shared.a === small && shared.b === small && shared.c === undefined, 'planned shared and absent arguments');
   var grown = new Pair({ n: round + 1 }, 'g' + round);
   for (var i = 0; i < 20; i++) grown['p' + i] = { n: i };
   for (var i = 0; i < 20; i++) delete grown['p' + i];
