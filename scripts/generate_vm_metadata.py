@@ -42,6 +42,11 @@ REPLACEMENTS = {
     'get_var_ref3': ('get_scope0_check', 3, 0, 1, 'u16'),
     'put_var_ref0': ('put_scope0_check', 3, 1, 0, 'u16'),
     'put_var_ref1': ('put_scope0_check_init', 3, 1, 0, 'u16'),
+    # `local.f = v;` with v a local or an argument: put_field into the local's
+    # object, the atom, the object's local, then the value's local or
+    # argument, both read in place.
+    'set_var_ref2': ('put_loc_field_loc8', 7, 0, 0, 'atom_u16'),
+    'set_var_ref3': ('put_loc_field_arg8', 7, 0, 0, 'atom_u16'),
 }
 
 
