@@ -1,0 +1,141 @@
+//! Native threads that run blocking work, such as file system calls, for one runtime loop.
+//!
+//! A job is a caller-owned [`Job`] header. The pool links jobs through the header, so queueing never allocates. A worker runs `job.work(job.data)` without the
+//! JS heap, moves the job to the done list, and wakes the loop's reactor when that list was empty.
+//! The loop takes finished jobs with [`Pool.takeDone`] after each reactor wait.
+//!
+//! The threads start with the first job, so a runtime that never blocks on native work starts none.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.ownership { Drop }
+import silk.collections.list { List }
+import silk.mem.pointer { Pointer }
+import silk.concurrency.sync { Arc, Condition, Mutex }
+import silk.concurrency.thread { Transferable }
+import silk.concurrency.thread_native { JoinHandle, NativeThread, SpawnError }
+import silk.io.reactor { ReactorError, Waker }
+import silk.num.usize
+
+/// The header of one job. `next` belongs to the pool while the job is queued, running or done.
+pub struct Job { next: ?*mut Job, work: extern "C" fn(?*mut u8) -> (), pub data: ?*mut u8 }
+
+pub fn job(work: extern "C" fn(?*mut u8) -> (), data: ?*mut u8) -> Job { return Job { next: Pointer.null<Job>(), work: work, data: data } }
+
+struct Chain { head: ?*mut Job, tail: ?*mut Job }
+struct Queue { work: Chain, done: Chain, stopping: bool }
+// The queue's job pointers are only read or written under its mutex, and a job belongs to
+// exactly one thread at a time: the submitter, one worker, or the loop after takeDone.
+impl Transferable for Queue {}
+struct Shared { queue: Mutex<Queue>, ready: Condition, waker: Waker }
+
+pub struct Pool { shared: Arc<Shared>, threads: List<JoinHandle<()>>, size: usize }
+
+// How many threads run blocking work, as libuv's default UV_THREADPOOL_SIZE.
+const THREADS: usize = 4
+
+pub unsafe fn nonnull(pointer: ?*mut Job) -> *mut Job { return unsafe Intrinsic.pointerRequalify<?*mut Job, *mut Job>(pointer) }
+fn empty() -> Chain { return Chain { head: Pointer.null<Job>(), tail: Pointer.null<Job>() } }
+unsafe fn push(chain: &mut Chain, job: *mut Job) -> () {
+  let mut anchor = () let entry = unsafe Pointer.borrowMut<(), Job>(&mut anchor, job)
+  entry.next = Pointer.null<Job>() drop entry
+  if Pointer.isNull<Job>(chain.tail) { chain.head = job } else {
+    let last = unsafe Pointer.borrowMut<(), Job>(&mut anchor, unsafe nonnull(chain.tail)) last.next = job drop last
+  }
+  chain.tail = job
+}
+unsafe fn pop(chain: &mut Chain) -> ?*mut Job {
+  let job = chain.head
+  if Pointer.isNull<Job>(job) { return job }
+  let anchor = () let entry = unsafe Pointer.borrow<(), Job>(&anchor, unsafe nonnull(job))
+  chain.head = entry.next drop entry
+  if Pointer.isNull<Job>(chain.head) { chain.tail = Pointer.null<Job>() }
+  return job
+}
+
+fn workerMain(shared: Arc<Shared>) -> () {
+  while true {
+    let mut job = Pointer.null<Job>()
+    let mut guard = shared.get().queue.lock()
+    while true {
+      if guard.get().stopping { return () }
+      job = unsafe pop(&mut guard.getMut().work)
+      if !Pointer.isNull<Job>(job) { break }
+      shared.get().ready.wait(&mut guard)
+    }
+    drop guard
+    let anchor = () let entry = unsafe Pointer.borrow<(), Job>(&anchor, unsafe nonnull(job))
+    let work = entry.work let data = entry.data drop entry
+    unsafe work(data)
+    let mut finished = shared.get().queue.lock()
+    let wake = Pointer.isNull<Job>(finished.get().done.head)
+    unsafe push(&mut finished.getMut().done, unsafe nonnull(job))
+    drop finished
+    if wake {
+      let woke = run Effect.result(shared.get().waker.wake())
+      if let Result<(), ReactorError>.Failure { .. } = move woke { Intrinsic.trap("a blocking worker cannot wake the runtime loop") }
+    }
+  }
+  return ()
+}
+
+impl Pool {
+  /// Makes a pool that wakes `waker` when a job finishes. It starts no thread.
+  pub effect fn make(waker: Waker) -> Pool ! OutOfMemoryError {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let queue = run Mutex<Queue>.make(Queue { work: empty(), done: empty(), stopping: false }) |> Effect.provideMut<Allocator>(&mut allocator)
+    let ready = run Condition.make() |> Effect.provideMut<Allocator>(&mut allocator)
+    let shared = run Arc<Shared>.make(Shared { queue: move queue, ready: move ready, waker: move waker }) |> Effect.provideMut<Allocator>(&mut allocator)
+    return Pool { shared: move shared, threads: List<JoinHandle<()>>.make(), size: THREADS }
+  }
+
+  /// Queues the job at `job`, which must stay valid until [`Pool.takeDone`] returns it.
+  pub unsafe effect fn submit(self: &mut Self, job: *mut Job) -> () ! OutOfMemoryError | SpawnError {
+    if self.threads.length() < self.size { run self.start() }
+    let mut guard = self.shared.get().queue.lock()
+    unsafe push(&mut guard.getMut().work, job)
+    drop guard
+    self.shared.get().ready.notifyOne()
+  }
+
+  effect fn start(self: &mut Self) -> () ! OutOfMemoryError | SpawnError {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    while self.threads.length() < self.size {
+      let shared = self.shared.clone()
+      let thread = run NativeThread.spawn(fn() -> () { return workerMain(move shared) }) |> Effect.provideMut<Allocator>(&mut allocator)
+      run self.threads.append(move thread) |> Effect.provideMut<Allocator>(&mut allocator)
+    }
+  }
+
+  /// Returns a finished job, or null when none is finished.
+  pub fn takeDone(self: &Self) -> ?*mut Job {
+    let mut guard = self.shared.get().queue.lock()
+    let job = unsafe pop(&mut guard.getMut().done)
+    drop guard
+    return job
+  }
+
+  /// Takes a job that no worker started, or null when none is queued. A caller that closes the
+  /// loop takes them to cancel them; the pool never runs a job it returned here.
+  pub fn takeQueued(self: &Self) -> ?*mut Job {
+    let mut guard = self.shared.get().queue.lock()
+    let job = unsafe pop(&mut guard.getMut().work)
+    drop guard
+    return job
+  }
+}
+
+impl Drop for Pool {
+  // Stops each worker after its current job and waits for it. Queued jobs stay queued.
+  fn drop(self: &mut Self) -> () {
+    let mut guard = self.shared.get().queue.lock()
+    let queue = guard.getMut() queue.stopping = true drop queue
+    drop guard
+    self.shared.get().ready.notifyAll()
+    while self.threads.length() > 0 {
+      let last = self.threads.length() - 1
+      let thread = self.threads.remove(last)
+      thread.join()
+    }
+  }
+}
