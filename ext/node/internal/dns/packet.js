@@ -69,6 +69,7 @@ function decode(data, requested, ttl) {
       else if (type === 'TXT') value = { entries: value, type };
       else value = Object.assign({ type }, value);
     } else if ((type === 'A' || type === 'AAAA') && !ttl) value = value.address;
+    else if (type === 'MX') value.type = 'MX'; // Node 24 tags MX records even outside ANY.
     result.push(value); at = end;
   }
   if (!result.length) { const e = new Error('No DNS records'); e.code = 'ENODATA'; throw e; }
