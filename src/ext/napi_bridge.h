@@ -36,7 +36,6 @@ struct napi_env__ {
   void *host;
   silk_napi_bridge bridge;
   size_t value_size;
-  uv_loop_t loop;
   uv_thread_t owner;
   napi_extended_error_info error;
   struct silk_napi_arena *arena;
@@ -63,11 +62,9 @@ napi_status silk_napi_call(napi_env, int, silk_napi_packet *);
 napi_status silk_napi_js(napi_env, const char *, size_t, const napi_value *, napi_value *);
 napi_value silk_napi_root(napi_env, napi_value);
 void silk_napi_release_root(napi_env, napi_value);
+/* Exported by napi_async.silk. */
 void silk_napi_async_close(napi_env);
 void silk_napi_async_dispose(napi_env);
-int silk_napi_async_init(napi_env);
-int silk_napi_poll(napi_env);
-int silk_napi_alive(napi_env);
 void silk_napi_enter_callback(napi_env, napi_handle_scope *);
 void silk_napi_leave_callback(napi_env, napi_handle_scope);
 void silk_napi_fatal_pending(napi_env);

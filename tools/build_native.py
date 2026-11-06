@@ -124,7 +124,7 @@ def build_napi(native, uv_include, environment, release):
     if platform.system() == 'Darwin':
         flags += ['-isysroot', environment['SDKROOT'], '-mmacosx-version-min=11.0']
     objects = []
-    for name in ('napi_core', 'napi_values', 'napi_async'):
+    for name in ('napi_core', 'napi_values'):
         destination = directory / (name + '.o')
         subprocess.run(compiler + flags + ['-c', str(ROOT / 'src/ext' / (name + '.c')),
                                           '-o', str(destination)], env=environment, check=True)
