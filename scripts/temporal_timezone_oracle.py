@@ -22,7 +22,7 @@ import shutil
 import struct
 import tempfile
 import tomllib
-from generate_temporal_timezone import generate
+import timezone_tables
 from verify_bytecode import executable_path, process, validate_pins
 import toolchain
 
@@ -97,15 +97,15 @@ def main():
     root = args.reference.resolve()
     pins = validate_pins(root)
     fixture = ROOT / 'tests/fixtures/temporal_timezone_oracle.c'
-    sources = [fixture, root / 'temporal/timezone.c', root / 'temporal/tzdata_generated.c']
-    generated = generate(root / 'temporal/tzdata_generated.c')
-    if generated != (ROOT / 'src/temporal_timezone_data.silk').read_text():
-        raise SystemExit('Checked-in timezone tables differ from complete pinned regeneration')
     cc = executable_path(args.cc)
     with tempfile.TemporaryDirectory(prefix='silk-timezone-oracle-') as directory:
         temp = Path(directory)
+        # The pinned C kernel runs on the checked-in IANA tables, not QuickJS's own.
+        tzdata = timezone_tables.write_c(temp / 'c')
+        includes = ['-I', str(temp / 'c'), '-I', str(root / 'temporal'), '-I', str(root)]
+        sources = [fixture, root / 'temporal/timezone.c', tzdata]
         executable = temp / 'oracle'
-        process([cc, '-O2', '-std=c11', '-D_DEFAULT_SOURCE', '-include', 'strings.h', '-I', str(root), *(str(s) for s in sources), '-o', str(executable)], 600, owner='Timezone C oracle compilation')
+        process([cc, '-O2', '-std=c11', '-D_DEFAULT_SOURCE', '-include', 'strings.h', *includes, *(str(s) for s in sources), '-o', str(executable)], 600, owner='Timezone C oracle compilation')
         source = process([str(executable)], 600, owner='Timezone independent C oracle').decode()
         if args.output:
             args.output.write_text(source)
@@ -114,6 +114,8 @@ def main():
         (temp / 'src').mkdir()
         for module in ('temporal_timezone.silk', 'temporal_timezone_data.silk'):
             shutil.copyfile(ROOT / 'src' / module, temp / 'src' / module)
+        (temp / 'src/data').mkdir()
+        shutil.copyfile(ROOT / 'src/data/timezones.bin', temp / 'src/data/timezones.bin')
         version = tomllib.loads((ROOT / 'silk.toml').read_text())['package']['silk-version']
         (temp / 'silk.toml').write_text(f'[package]\nname="temporal-timezone-oracle"\nversion="0.0.0"\nsilk-version="{version}"\n')
         command = [executable_path(args.silk), 'run', '--quiet', '--release']
@@ -131,12 +133,12 @@ def main():
         print(f'PASS timezone behavior: {instant} instant, {local} local/disambiguation, {day} start-of-day records; {names} name/alias probes, {equalities} equality probes; {instant*5+local*3+day+names*3+equalities} C-derived assertions; {pins} pinned sources; numeric SHA256={hashlib.sha256(numeric).hexdigest()}', flush=True)
         # C computes sizeof on the original string literals. Python does not
         # interpret octal escapes or supply the expected region-list contents.
-        original = (root / 'temporal/tzdata_generated.c').read_text()
+        original = tzdata.read_text()
         region_body = re.search(r'const TiTzRegion ti_tz_region_tab\[\] = \{(.*?)\n\};', original, re.S).group(1)
         literals = re.findall(r'\{\s*"[^"]+",\s*("[^"\n]*")\s*\}', region_body)
         table_source = C_TABLES.replace('REGION_LENGTHS', ','.join(f'sizeof({literal})-1' for literal in literals))
         (temp / 'tables.c').write_text(table_source)
-        process([cc, '-O2', '-std=c11', '-I', str(root), str(temp / 'tables.c'), '-o', str(temp / 'tables')], 600, owner='Timezone C table compilation')
+        process([cc, '-O2', '-std=c11', *includes, str(temp / 'tables.c'), '-o', str(temp / 'tables')], 600, owner='Timezone C table compilation')
         expected = process([str(temp / 'tables')], 600, owner='Timezone independent C tables')
         (temp / 'src/main.silk').write_text(SILK_TABLES)
         actual = process(command, 1800, owner='Native timezone logical tables', cwd=temp)
