@@ -7,6 +7,7 @@ import thin_list { ThinList }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.layout { Layout }
 import silk.core.option { Option }
+import silk.num.u8
 import silk.mem.pointer { Pointer }
 import silk.num.i32
 import silk.num.u32
@@ -103,7 +104,7 @@ unsafe effect fn initialize<'a>(realm: Realm<'a>, node: *mut HeapHeader,
   match unsafe shapes.takeSpareSlots(spareOwner, capacity) {
     Option<ThinList<SlotBits>>.Some { value } => {
       let mut slots = move value
-      while slots.length() < count { run slots.append(SlotBits.value(ValueBits.Undefined)) }
+      unsafe fillSlots(&mut slots, count, 0)
       object.setSlots(move slots)
     }
     Option<ThinList<SlotBits>>.None => { object.setSlots(run unsafe shapes.allocateSlots(shape)) }
@@ -214,11 +215,11 @@ unsafe effect fn prepareNode<H: HeapHooks>(hooks: &mut H, observer: &AllocationO
       }
       Option<*mut HeapHeader>.None => {
         let tail = unsafe shapes.planInline(shape, count)
-        if tail != 0 { return run unsafe inlineNode(&mut hooks, observer, runtime, tail, count, extra, plain, 0) }
+        if tail != 0 { return run unsafe inlineNode(&mut hooks, observer, runtime, tail, count, extra, plain, written) }
       }
     }
   }
-  return run unsafe separateNode(&mut hooks, observer, runtime, shape)
+  return run unsafe separateNode(&mut hooks, observer, runtime, shape, written)
 }
 /// Writes slots into the uninitialized node's properties.
 @inlineAlways
@@ -230,12 +231,12 @@ unsafe fn placeSlots(node: *mut HeapHeader, slots: ThinList<SlotBits>) -> *mut H
 }
 /// A plain node with slot storage of its own for shape.
 @inlineAlways
-unsafe effect fn separateNode<H: HeapHooks>(hooks: &mut H, observer: &AllocationObserver, runtime: *mut HeapHeader, shape: *mut HeapHeader) -> PreparedNode ! OutOfMemoryError ? &mut Allocator {
+unsafe effect fn separateNode<H: HeapHooks>(hooks: &mut H, observer: &AllocationObserver, runtime: *mut HeapHeader, shape: *mut HeapHeader, written: usize) -> PreparedNode ! OutOfMemoryError ? &mut Allocator {
   let collected = run unsafe runtimeApi.triggerGC(observer, &mut hooks, runtime, Layout.of<ObjectData>().bytes, false)
-  let prepared = run unsafe shapeSlots(runtime, shape)
+  let prepared = run unsafe shapeSlots(runtime, shape, written)
   match move prepared {
     PreparedSlots { slots } => {
-      // On failure the dropped slots are all Undefined.
+      // On failure the dropped slots release nothing: they hold plain bits.
       let node = run HeapCell.allocateUninit<ObjectData>(HeapKind.Object)
       return PreparedNode { node: node, slots: move slots }
     }
@@ -253,23 +254,43 @@ unsafe effect fn arrayLengthRetired<'a>(realm: Realm<'a>, node: *mut HeapHeader)
 }
 struct PreparedSlots { slots: ThinList<SlotBits> }
 /// Slot storage for a new object of shape: a parked list of the shape's capacity
-/// when one is spare, else a fresh one; every shape property starts Undefined.
+/// when one is spare, else a fresh one; every shape property past the first
+/// `written` (which the caller stores before anything reads them) starts Undefined.
 @inlineAlways
-unsafe effect fn shapeSlots(runtime: *mut HeapHeader, shape: *mut HeapHeader) -> PreparedSlots
+unsafe effect fn shapeSlots(runtime: *mut HeapHeader, shape: *mut HeapHeader, written: usize) -> PreparedSlots
   ! OutOfMemoryError ? &mut Allocator {
   let anchor = ()
   let data = unsafe HeapCell.payload<ShapeData, ()>(&anchor, shape)
-  let capacity = data.properties.capacity()
+  // An empty shape whose objects get separate slots starts them at the size its
+  // objects grew to (slotHint), so they do not regrow on the way there; and in
+  // a spare bin's size, so the list is recycled when the object dies.
+  let mut capacity = data.properties.capacity()
+  let hint = u8.toUsize(data.slotHint)
+  if capacity < hint { capacity = hint }
+  capacity = shapes.spareCapacity(capacity)
   let count = data.properties.length()
   drop data
   match unsafe shapes.takeSpareSlots(runtime, capacity) {
     Option<ThinList<SlotBits>>.Some { value } => {
       let mut slots = move value
-      while slots.length() < count { run slots.append(SlotBits.value(ValueBits.Undefined)) }
+      unsafe fillSlots(&mut slots, count, written)
       return PreparedSlots { slots: move slots }
     }
-    Option<ThinList<SlotBits>>.None => { return PreparedSlots { slots: run unsafe shapes.allocateSlots(shape) } }
+    Option<ThinList<SlotBits>>.None => {
+      let mut slots = ThinList<SlotBits>.make()
+      run slots.reserveExact(capacity)
+      unsafe fillSlots(&mut slots, count, written)
+      return PreparedSlots { slots: move slots }
+    }
   }
+}
+/// Grows slots (with room for count) to count: the first `written` are left for
+/// the caller to store, the rest Undefined.
+@inlineAlways
+unsafe fn fillSlots(slots: &mut ThinList<SlotBits>, count: usize, written: usize) -> () {
+  let mut kept = slots.length()
+  if kept < written { let had = kept if written < count { kept = written } else { kept = count } unsafe slots.extendFilled(kept - had) }
+  if kept < count { slots.pushRepeated(SlotBits.value(ValueBits.Undefined), count - kept) }
 }
 /// Frees a node that was never published, with its slots and shape.
 unsafe fn discardUnpublished<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node: *mut HeapHeader) -> () {
@@ -363,8 +384,7 @@ unsafe effect fn freshNodeWith<'a, H: HeapHooks>(hooks: &mut H, observer: &Alloc
 }
 /// ordinaryFromShape for an object born with a constructor's final shape, whose
 /// cell tail follows the slot plan of plan, the constructor's empty shape. The
-/// caller stores the first `written` slots before anything reads the object; an
-/// object whose slots are not in its cell has them all Undefined.
+/// caller stores the first `written` slots before anything reads the object.
 @inlineAlways
 pub unsafe effect fn ordinaryFromPlan<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>,
   ownedShape: *mut HeapHeader, plan: *mut HeapHeader, written: usize) -> ValueBits ! OutOfMemoryError ? &mut Allocator {
@@ -378,6 +398,12 @@ pub unsafe effect fn ordinaryFromPlan<'a, H: HeapHooks>(hooks: &mut H, memory: &
 pub unsafe effect fn ordinaryFromShape<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>,
   ownedShape: *mut HeapHeader) -> ValueBits ! OutOfMemoryError ? &mut Allocator {
   return run unsafe freshNode(&mut hooks, memory, realm, ownedShape, classes.JS_CLASS_OBJECT, false, false, 0, Pointer.null<HeapHeader>())
+}
+/// ordinaryFromShape for a caller that stores the first `written` slots before
+/// anything reads the object (a spread's clone stores them all).
+pub unsafe effect fn ordinaryFromShapeWritten<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>,
+  ownedShape: *mut HeapHeader, written: usize) -> ValueBits ! OutOfMemoryError ? &mut Allocator {
+  return run unsafe freshNodeWith(&mut hooks, memory, realm, ownedShape, classes.JS_CLASS_OBJECT, false, false, 0, Pointer.null<HeapHeader>(), false, written)
 }
 /// ordinaryFromShape for a RegExp (a RegExp literal's object): not exotic, not
 /// a fast array, so the class table lookup folds away as well.
