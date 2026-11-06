@@ -18,7 +18,7 @@ import js_vm_state { Machine }
 import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
 import js_owned_value { lendBits, immediateRef, lendFor, Value }
-import js_core_types { RuntimeState, FieldCacheEntry, FIELD_PASS_THROUGH, FIELD_PROTO_KEY, fieldCacheIndex, ContextState, ObjectData, ObjectPayload, ShapeData, ShapeProperty,
+import js_core_types { RuntimeState, FieldCacheEntry, TypedLengthEntry, FIELD_PASS_THROUGH, FIELD_PROTO_KEY, fieldCacheIndex, ContextState, ObjectData, ObjectPayload, ShapeData, ShapeProperty,
   PropertySlot, SlotBits, NativeErrorKind, JS_PROP_TMASK, JS_PROP_GETSET, JS_PROP_WRITABLE, JS_PROP_LENGTH, JS_PROP_THROW_STRICT, JS_PROP_C_W_E, JS_PROP_CONFIGURABLE }
 import js_gc { HeapHooks }
 import js_gc as gc
@@ -154,7 +154,7 @@ pub unsafe fn lengthOperand<H: HeapHooks>(hooks: &mut H, machine: &mut Machine) 
         return true
       }
       drop receiver
-      if classId >= classes.JS_CLASS_UINT8C_ARRAY && classId <= classes.JS_CLASS_FLOAT64_ARRAY { return unsafe typedLength(&mut hooks, &mut machine, node) }
+      if classId >= classes.JS_CLASS_UINT8C_ARRAY && classId <= classes.JS_CLASS_FLOAT64_ARRAY { return unsafe typedLength(&mut hooks, &mut machine, node, classId) }
     }
     _ => ()
   }
@@ -164,7 +164,35 @@ pub unsafe fn lengthOperand<H: HeapHooks>(hooks: &mut H, machine: &mut Machine) 
   }
 }
 @inlineAlways
-unsafe fn typedLength<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, node: *mut HeapHeader) -> bool {
+unsafe fn typedLength<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, node: *mut HeapHeader, classId: u32) -> bool {
+  let anchor = ()
+  let receiverData = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  let version = (unsafe HeapCell.payload<ShapeData, ()>(&anchor, receiverData.shape)).version
+  drop receiverData
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)
+  let entry = &state.typedLengthCache[u32.toUsize(classId - classes.JS_CLASS_UINT8C_ARRAY)]
+  // The version fixes the receiver's records and prototype chain, an unchanged
+  // epoch the chain's shapes: the accessor is still at holder's slot.
+  let hit = entry.version == version && entry.epoch == state.shapeEpoch && unsafe typedLengthHolds(entry)
+  drop state
+  if !hit && !unsafe typedLengthWalk(machine.runtime, node, classId, version) { return false }
+  let count = unsafe typedRead.count(node)
+  let length = if count <= 0x7fffffff { ValueBits.Int { value: u64.toI32(count) } } else { ValueBits.number(u64.toF64(count)) }
+  unsafe machine.set(1, length)
+  unsafe gc.releaseObjectHeader(&mut hooks, machine.runtime, node)
+  return true
+}
+@inlineAlways
+unsafe fn typedLengthHolds(entry: &TypedLengthEntry) -> bool {
+  let anchor = ()
+  let holder = unsafe HeapCell.payload<ObjectData, ()>(&anchor, unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(entry.holder))
+  return Pointer.address<HeapHeader>((unsafe holder.slotUnchecked(entry.index)).getter()) == Pointer.address<HeapHeader>(entry.getter)
+}
+/// Walks a typed array's prototype chain to the intrinsic length getter through
+/// ordinary objects with no own length, and on success records it in
+/// RuntimeState.typedLengthCache for receivers of version.
+@inlineNever
+unsafe fn typedLengthWalk(runtime: *mut HeapHeader, node: *mut HeapHeader, classId: u32, version: u64) -> bool {
   let anchor = ()
   let mut current = node let mut receiver = true
   while true {
@@ -184,19 +212,21 @@ unsafe fn typedLength<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, node: 
       let index = u32.toUsize(cursor - 1)
       let flags = u8.toU32((unsafe shapes.unchecked<ShapeProperty>(&shape.properties, index)).flags)
       if (flags & JS_PROP_TMASK) != JS_PROP_GETSET { return false }
-      if !unsafe typedRead.isLengthGetter((unsafe data.slotUnchecked(index)).getter()) { return false }
-      break
+      let getter = (unsafe data.slotUnchecked(index)).getter()
+      if !unsafe typedRead.isLengthGetter(getter) { return false }
+      drop shape drop data
+      let mut stateAnchor = ()
+      let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
+      let epoch = state.shapeEpoch
+      state.typedLengthCache[u32.toUsize(classId - classes.JS_CLASS_UINT8C_ARRAY)] = TypedLengthEntry { version: version, epoch: epoch, holder: current, index: index, getter: getter }
+      return true
     }
     match Pointer.nonNullMut<HeapHeader>(shape.prototype) {
       Option<*mut HeapHeader>.Some { value } => { current = value }
       Option<*mut HeapHeader>.None => { return false }
     }
   }
-  let count = unsafe typedRead.count(node)
-  let length = if count <= 0x7fffffff { ValueBits.Int { value: u64.toI32(count) } } else { ValueBits.number(u64.toF64(count)) }
-  unsafe machine.set(1, length)
-  unsafe gc.releaseObjectHeader(&mut hooks, machine.runtime, node)
-  return true
+  return false
 }
 /// get_field without effects: reads a data property found on the receiver or its
 /// prototype chain and consumes the atom operand. Returns none, with pc unchanged,
@@ -569,7 +599,45 @@ pub unsafe fn lookupField(object: *mut HeapHeader, atom: u32, target: *mut Value
   }
   return false
 }
-unsafe fn fieldAtomAt(ip: *const u8) -> u32 {
+/// The getter of the accessor property atom that a read of object finds first,
+/// when that getter is a bytecode or native function; null for anything else (a
+/// data property, a missing getter, a lazy slot, an exotic object on the way, no
+/// property). Walks at most GETTER_DEPTH objects.
+pub unsafe fn functionGetter(object: *mut HeapHeader, atom: u32) -> ?*mut HeapHeader {
+  let mut current = object
+  let mut depth: usize = 0
+  while depth < GETTER_DEPTH {
+    let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, current)
+    if data.isExotic() { return Pointer.null<HeapHeader>() }
+    match unsafe shapes.find(data.shape, atom) {
+      Option<FoundProperty>.Some { value: found } => {
+        return match data.slot(found.index).view(found.flags) {
+          PropertySlot.GetterSetter { getter, .. } => match Pointer.nonNullMut<HeapHeader>(getter) {
+            Option<*mut HeapHeader>.Some { value } => {
+              let function = unsafe HeapCell.payload<ObjectData, ()>(&anchor, value)
+              let id = function.classId()
+              if id == classes.JS_CLASS_BYTECODE_FUNCTION || id == classes.JS_CLASS_C_FUNCTION { value } else { Pointer.null<HeapHeader>() }
+            }
+            Option<*mut HeapHeader>.None => Pointer.null<HeapHeader>()
+          }
+          _ => Pointer.null<HeapHeader>()
+        }
+      }
+      Option<FoundProperty>.None => ()
+    }
+    let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+    match Pointer.nonNullMut<HeapHeader>(shape.prototype) {
+      Option<*mut HeapHeader>.Some { value } => { current = value }
+      Option<*mut HeapHeader>.None => { return Pointer.null<HeapHeader>() }
+    }
+    depth = depth + 1
+  }
+  return Pointer.null<HeapHeader>()
+}
+/// Objects functionGetter looks through: an own accessor, a class's, and one
+/// inherited a few levels down.
+const GETTER_DEPTH: usize = 4
+pub unsafe fn fieldAtomAt(ip: *const u8) -> u32 {
   let mut atom: u32 = 0 let mut k: usize = 4
   while k > 0 { k = k - 1 atom = u32.shiftLeft(atom, 8) | u8.toU32(unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(ip), k))) }
   return atom
@@ -672,24 +740,31 @@ pub unsafe effect fn cellElementStep<H: HeapHooks + OwnPropertyHooks + GetProper
   }
   unsafe machine.skip(2)
 }
-/// get_loc_field8 and get_arg_field8 past pushCellField: the get_loc or get_arg,
-/// then the get_field arm's paths, ending past the slot index.
-@inlineNever
-pub unsafe effect fn cellFieldStep<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + CoercionHooks + PropertyWriteHooks>(
-  hooks: &mut H, memory: &AllocationObserver, machine: &mut Machine, cell: *mut ValueBits) -> ()
-  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
-  // Prototype hits and uncached own fields, still without retaining the object.
+/// get_loc_field8 and get_arg_field8 after pushCellField missed: a prototype hit
+/// of the field cache, pushed without retaining the object. false consumes
+/// nothing; cellFieldStep then runs the pair.
+@inlineAlways
+pub unsafe fn cellFieldCached(machine: &mut Machine, cell: *mut ValueBits) -> bool {
   match unsafe Pointer.read<ValueBits>(cell) {
     ValueBits.Object { reference } => {
       unsafe machine.push(ValueBits.Undefined)
       if unsafe readFieldCached(&machine.*, reference, unsafe machine.topCell(1)) {
         unsafe machine.skip(5)
-        return
+        return true
       }
       drop unsafe machine.pop()
     }
     _ => {}
   }
+  return false
+}
+/// get_loc_field8 and get_arg_field8 past pushCellField and cellFieldCached: the
+/// get_loc or get_arg, then the get_field arm's paths, ending past the slot index.
+@inlineNever
+pub unsafe effect fn cellFieldStep<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + CoercionHooks + PropertyWriteHooks>(
+  hooks: &mut H, memory: &AllocationObserver, machine: &mut Machine, cell: *mut ValueBits) -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  // Uncached own fields, still without retaining the object.
   unsafe machine.pushCopy(cell)
   match Pointer.nonNullMut<HeapHeader>(unsafe readFieldOperand(&mut machine)) {
     Option<*mut HeapHeader>.Some { value } => { unsafe gc.releaseObjectHeader(&mut hooks, machine.runtime, value) }
