@@ -1,6 +1,7 @@
 """Inputs only; expected outcomes are always obtained from the pinned C engine."""
 import json
 import re
+import timezone_tables
 
 FIELDS = ['language', 'script', 'region', 'baseName', 'variants', 'calendar', 'collation',
           'hourCycle', 'numberingSystem', 'caseFirst', 'numeric', 'firstDayOfWeek']
@@ -105,9 +106,7 @@ def cases(reference):
             if table == 'script_dir_tab': tags = ['und-'+key for key in keys]
             else: tags = [key if '-' in key else 'und-'+key for key in keys]
         pools[table] = tags
-    zone_source=(reference/'temporal/tzdata_generated.c').read_text()
-    body=zone_source.split('ti_tz_region_tab[] = {',1)[1].split('\n};',1)[0]
-    pools['zones']=['und-'+key for key in re.findall(r'\{ "([^"]+)"',body)]
+    pools['zones']=['und-'+region for region,_ in timezone_tables.tables()[4]]
     for table, tags in pools.items():
         if not tags: raise ValueError('No table inputs discovered: '+table)
         for start in range(0,len(tags),32):

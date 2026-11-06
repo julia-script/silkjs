@@ -1,10 +1,11 @@
 //! Native run-test262.c:614-879 transport. Only owned UTF-8 and shared backing
 //! capabilities cross threads. The registry owner joins before destroying its
-//! cancellation scope; no process signal or pthread cancellation is installed.
+//! cancellation scope; no process signal or thread cancellation is installed.
 import silk.mem.allocator { Allocator, OutOfMemoryError }
-import silk.concurrency.atomic { Atomic, MemoryOrder }
+import silk.concurrency.sync { Arc, Condition, Mutex }
+import silk.concurrency.thread { Transferable, Concurrent }
+import silk.concurrency.thread_native { JoinHandle, NativeThread, SpawnError }
 import silk.core.effect { Effect }
-import silk.mem.layout { Layout }
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.mem.pointer { Pointer }
@@ -15,44 +16,20 @@ import silk.num.u32
 import js_atomics_native { Domain, CancellableDomain }
 import js_libc_process { Process }
 import js_std_native { File }
-import js_os_workers_resources { Resources }
-import js_os_workers_resources as resources
+import js_os_workers_resources { Resources, KindAllocator }
 import js_os_workers_transport as backing
 import js_buffer_storage { BufferLease }
 import js_os_events_platform as clock
 import test262_agent as agentRuntime
 
-extern "C" struct NativeMutex { words: [u64; 8] }
-extern "C" struct NativeCondition { words: [u64; 8] }
-extern "C" struct Timespec { seconds: i64, nanoseconds: i64 }
-unsafe extern "C" fn pthread_mutex_init(mutex: *mut NativeMutex, attributes: ?*const u8) -> i32
-unsafe extern "C" fn pthread_mutex_destroy(mutex: *mut NativeMutex) -> i32
-unsafe extern "C" fn pthread_mutex_lock(mutex: *mut NativeMutex) -> i32
-unsafe extern "C" fn pthread_mutex_unlock(mutex: *mut NativeMutex) -> i32
-unsafe extern "C" fn pthread_cond_init(condition: *mut NativeCondition, attributes: ?*const u8) -> i32
-unsafe extern "C" fn pthread_cond_destroy(condition: *mut NativeCondition) -> i32
-unsafe extern "C" fn pthread_cond_wait(condition: *mut NativeCondition, mutex: *mut NativeMutex) -> i32
-unsafe extern "C" fn pthread_cond_timedwait(condition: *mut NativeCondition, mutex: *mut NativeMutex, deadline: *const Timespec) -> i32
-unsafe extern "C" fn pthread_cond_broadcast(condition: *mut NativeCondition) -> i32
-unsafe extern "C" fn pthread_attr_init(attributes: *mut u8) -> i32
-unsafe extern "C" fn pthread_attr_setstacksize(attributes: *mut u8, size: usize) -> i32
-unsafe extern "C" fn pthread_attr_destroy(attributes: *mut u8) -> i32
-@threadCallbacks("start")
-unsafe extern "C" fn pthread_create(thread: *mut usize, attributes: ?*const u8,
-  start: extern "C" fn(?*mut u8) -> ?*mut u8, argument: ?*mut u8) -> i32
-unsafe extern "C" fn pthread_join(thread: usize, result: ?*mut ?*mut u8) -> i32
-@foreign(noCapture: ("result",))
-unsafe extern "C" fn darwinClock(id: u32, result: *mut Timespec) -> i32 as "clock_gettime"
-@foreign(noCapture: ("result",))
-unsafe extern "C" fn linuxClock(id: i32, result: *mut Timespec) -> i32 as "clock_gettime"
 
 pub struct NativeError { pub code: i32 }
 pub union BroadcastBacking {
-  Shared { pub data: ?*mut u8, pub length: u32, pub capacity: u32 },
+  Shared { pub data: ?*mut u8, pub length: u64, pub capacity: u64 },
   Leased { pub lease: BufferLease },
   // Exact external pointer; its JavaScript owner stays pinned in the sender's
   // main-runtime State until every native child has joined.
-  Borrowed { pub data: ?*mut u8, pub length: u32, pub capacity: u32 }
+  Borrowed { pub data: ?*mut u8, pub length: u64, pub capacity: u64 }
 }
 pub struct Broadcast { pub backing: BroadcastBacking, pub value: i32 }
 impl Broadcast {
@@ -76,81 +53,40 @@ impl Drop for Broadcast {
     match &self.backing { BroadcastBacking.Shared { data, .. } => { unsafe backing.freeShared(data) } _ => () }
   }
 }
-struct Report { next: ?*mut Report, bytes: List<u8> }
-pub struct Child { next: ?*mut Child, thread: usize, finished: bool, pending: bool, message: Option<Broadcast> }
-pub struct Group {
-  mutex: NativeMutex, condition: NativeCondition, stopping: u32,
-  cancellation: CancellableDomain, first: ?*mut Child, last: ?*mut Child,
-  reports: ?*mut Report, lastReport: ?*mut Report, done: i32, failures: usize,
-  pub output: ?*mut File
+/// One `$262.agent.start` thread. Children stay in their group's list until `shutdown`,
+/// so a child's index never changes.
+pub struct Child { thread: Option<JoinHandle<i32>>, finished: bool, pending: bool, message: Option<Broadcast> }
+/// Children, queued reports and the counters `$262.agent` reads; guarded by the group's lock.
+struct Lists { children: List<Child>, reports: List<List<u8>>, done: i32, failures: usize, stopping: bool }
+struct Group {
+  lists: Mutex<Lists>, changed: Condition,
+  cancellation: CancellableDomain, resources: Resources, output: ?*mut File
 }
-pub struct Start { pub group: *mut Group, pub child: *mut Child, pub source: List<u8>,
+// Broadcast backings, join handles and the output file are only touched under the lock
+// or by the main runtime, which joins every child before the last handle drops.
+impl Transferable for Group {}
+impl Concurrent for Group {}
+/// A handle to one test's agent group, shared by the main runtime and its children.
+pub struct AgentGroup { group: Arc<Group> }
+impl Transferable for AgentGroup {}
+pub struct Start { pub group: AgentGroup, pub child: usize, pub source: List<u8>,
   pub process: Process, pub experimental: bool }
+impl Transferable for Start {}
 fn invariant() -> never { return Intrinsic.trap("test262 native ownership invariant") }
-fn require(status: i32) -> () { if status != 0 { invariant() } }
-pub unsafe fn nonnull<T>(pointer: ?*mut T) -> *mut T { return unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(pointer) }
-unsafe effect fn allocate<T>(owner: &Resources, kind: u32) -> *mut T ! OutOfMemoryError {
-  let raw = resources.allocate(owner, Layout.of<T>().bytes, kind)
-  if Pointer.isNull<u8>(raw) { fail OutOfMemoryError {} }
-  return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut T>(unsafe nonnull(raw))
+/// The non-null pointer; traps on null.
+pub fn nonnull<T>(pointer: ?*mut T) -> *mut T {
+  return match Pointer.nonNullMut<T>(pointer) { Option<*mut T>.Some { value: found } => found _ => Intrinsic.trap("unexpected null pointer") }
 }
-unsafe fn free<T>(pointer: *mut T) -> () { unsafe resources.release(unsafe Intrinsic.pointerReinterpret<*mut T, *mut u8>(pointer)) }
-pub unsafe fn owner(group: *mut Group) -> Resources { return unsafe resources.owner(unsafe Intrinsic.pointerReinterpret<*mut Group, *mut u8>(group)) }
-unsafe fn mutex(group: *mut Group) -> *mut NativeMutex {
-  let mut anchor = () let state = unsafe Pointer.borrowMut<(), Group>(&mut anchor, group)
-  return Pointer.fromMutRef(&mut state.mutex)
-}
-unsafe fn condition(group: *mut Group) -> *mut NativeCondition {
-  let mut anchor = () let state = unsafe Pointer.borrowMut<(), Group>(&mut anchor, group)
-  return Pointer.fromMutRef(&mut state.condition)
-}
-unsafe fn lock(group: *mut Group) -> () { require(unsafe pthread_mutex_lock(unsafe mutex(group))) }
-unsafe fn unlock(group: *mut Group) -> () { require(unsafe pthread_mutex_unlock(unsafe mutex(group))) }
-unsafe fn wake(group: *mut Group) -> () { require(unsafe pthread_cond_broadcast(unsafe condition(group))) }
-pub unsafe fn domain(group: *mut Group) -> Domain {
-  let anchor = () let state = unsafe Pointer.borrow<(), Group>(&anchor, group) return state.cancellation.handle()
-}
-pub unsafe fn stopping(group: *mut Group) -> bool {
-  let mut anchor = () let state = unsafe Pointer.borrowMut<(), Group>(&mut anchor, group)
-  let pointer = Pointer.fromMutRef(&mut state.stopping) drop state
-  return unsafe Atomic.load<u32>(pointer, MemoryOrder.Acquire) != 0
-}
-pub effect fn create(parent: Domain, output: ?*mut File) -> *mut Group ! OutOfMemoryError | NativeError {
+pub effect fn create(parent: Domain, output: ?*mut File) -> AgentGroup ! OutOfMemoryError | NativeError {
   let resources = run Resources.make() let mut allocator = resources.clone()
   let cancellation = run CancellableDomain.make(parent) |> Effect.provideMut<Allocator>(&mut allocator)
-  let pointer = run unsafe allocate<Group>(&resources, 4)
-  unsafe Pointer.put<Group>(pointer, Group { mutex: NativeMutex { words: [0; 8] },
-    condition: NativeCondition { words: [0; 8] }, stopping: 0, cancellation: move cancellation,
-    first: Pointer.null<Child>(), last: Pointer.null<Child>(), reports: Pointer.null<Report>(),
-    lastReport: Pointer.null<Report>(), done: 0, failures: 0, output: output })
-  let status = unsafe pthread_mutex_init(unsafe mutex(pointer), Pointer.null<u8>())
-  if status != 0 { unsafe Pointer.dropInPlace<Group>(pointer) unsafe free(pointer) fail NativeError { code: status } }
-  let status2 = unsafe pthread_cond_init(unsafe condition(pointer), Pointer.null<u8>())
-  if status2 != 0 {
-    require(unsafe pthread_mutex_destroy(unsafe mutex(pointer)))
-    unsafe Pointer.dropInPlace<Group>(pointer) unsafe free(pointer) fail NativeError { code: status2 }
-  }
-  return pointer
-}
-pub unsafe fn asyncDone(group: *mut Group) -> i32 {
-  unsafe lock(group) let anchor = () let state = unsafe Pointer.borrow<(), Group>(&anchor, group)
-  let result = state.done drop state unsafe unlock(group) return result
-}
-pub unsafe fn resetDone(group: *mut Group) -> () {
-  unsafe lock(group) let mut anchor = () let state = unsafe Pointer.borrowMut<(), Group>(&mut anchor, group)
-  state.done = 0 drop state unsafe unlock(group)
-}
-pub unsafe fn completed(group: *mut Group, failed: bool) -> () {
-  unsafe lock(group) let mut anchor = () let state = unsafe Pointer.borrowMut<(), Group>(&mut anchor, group)
-  if failed { state.done = 2 } else { state.done = state.done + 1 } drop state unsafe unlock(group)
-}
-pub unsafe fn failures(group: *mut Group) -> usize {
-  unsafe lock(group) let anchor = () let state = unsafe Pointer.borrow<(), Group>(&anchor, group)
-  let result = state.failures drop state unsafe unlock(group) return result
-}
-pub unsafe fn failed(group: *mut Group) -> () {
-  unsafe lock(group) let mut anchor = () let state = unsafe Pointer.borrowMut<(), Group>(&mut anchor, group)
-  state.failures = state.failures + 1 drop state unsafe wake(group) unsafe unlock(group)
+  let lists = run Mutex<Lists>.make(Lists { children: List<Child>.make(), reports: List<List<u8>>.make(),
+    done: 0, failures: 0, stopping: false }) |> Effect.provideMut<Allocator>(&mut allocator)
+  let changed = run Condition.make() |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut groups = KindAllocator { owner: resources.clone(), kind: 4 }
+  let group = run Arc<Group>.make(Group { lists: move lists, changed: move changed,
+    cancellation: move cancellation, resources: move resources, output: output }) |> Effect.provideMut<Allocator>(&mut groups)
+  return AgentGroup { group: move group }
 }
 // strdup/strlen boundaries are intentional: agent source/report truncate at NUL,
 // unlike evalScript's explicit length and print's fwrite byte count.
@@ -160,143 +96,140 @@ pub effect fn copyCString(bytes: &[u8]) -> List<u8> ! OutOfMemoryError ? &mut Al
   run result.reserveExact(length) let mut index: usize = 0
   while index < length { run result.append(bytes[index]) index = index + 1 } return move result
 }
-pub unsafe effect fn report(group: *mut Group, bytes: &[u8]) -> () ! OutOfMemoryError {
-  let resources = unsafe owner(group) let mut allocator = resources.clone()
-  let text = run copyCString(bytes) |> Effect.provideMut<Allocator>(&mut allocator)
-  let pointer = run unsafe allocate<Report>(&resources, 3)
-  unsafe Pointer.put<Report>(pointer, Report { next: Pointer.null<Report>(), bytes: move text })
-  unsafe lock(group) let mut anchor = () let state = unsafe Pointer.borrowMut<(), Group>(&mut anchor, group)
-  let previous = state.lastReport state.lastReport = pointer
-  if Pointer.isNull<Report>(previous) { state.reports = pointer } drop state
-  if !Pointer.isNull<Report>(previous) { let last = unsafe Pointer.borrowMut<(), Report>(&mut anchor, unsafe nonnull(previous)) last.next = pointer }
-  unsafe unlock(group)
-}
-pub unsafe fn getReport(group: *mut Group) -> Option<List<u8>> {
-  unsafe lock(group) let mut anchor = () let state = unsafe Pointer.borrowMut<(), Group>(&mut anchor, group)
-  let pointer = state.reports
-  if Pointer.isNull<Report>(pointer) { drop state unsafe unlock(group) return Option<List<u8>>.none() }
-  let node = unsafe Pointer.take<Report>(unsafe nonnull(pointer)) state.reports = node.next
-  if Pointer.isNull<Report>(node.next) { state.lastReport = Pointer.null<Report>() }
-  drop state unsafe unlock(group) unsafe free(unsafe nonnull(pointer)) return Option<List<u8>>.some(move node.bytes)
-}
-pub unsafe effect fn start(group: *mut Group, process: &Process, experimental: bool, source: &[u8]) -> () ! OutOfMemoryError | NativeError {
-  let resources = unsafe owner(group) let mut allocator = resources.clone()
-  let bytes = run copyCString(source) |> Effect.provideMut<Allocator>(&mut allocator)
-  let child = run unsafe allocate<Child>(&resources, 5)
-  unsafe Pointer.put<Child>(child, Child { next: Pointer.null<Child>(), thread: 0, finished: false,
-    pending: false, message: Option<Broadcast>.none() })
-  let allocated = run Effect.result(unsafe allocate<Start>(&resources, 6))
-  let packet = match move allocated { Result<*mut Start, OutOfMemoryError>.Success { value } => value
-    Result<*mut Start, OutOfMemoryError>.Failure { error } => { unsafe free(child) fail move error } }
-  unsafe Pointer.put<Start>(packet, Start { group: group, child: child, source: move bytes,
-    process: process.clone(), experimental: experimental })
-  let mut attributes: [u64; 16] = [0; 16]
-  let attr = unsafe Intrinsic.pointerReinterpret<*mut u64, *mut u8>(Pointer.fromMutRef(&mut attributes[0]))
-  let initialized = unsafe pthread_attr_init(attr) let mut status = initialized let mut thread: usize = 0
-  // Native VM/compiler recursion needs the same native stack headroom as libc Workers.
-  if status == 0 { status = unsafe pthread_attr_setstacksize(attr, 8 * 1024 * 1024) }
-  unsafe lock(group)
-  if status == 0 && (unsafe stopping(group) || !resources.permit()) { status = 11 }
-  if status == 0 { status = unsafe pthread_create(Pointer.fromMutRef(&mut thread), attr, silkJsTest262AgentEntry,
-    unsafe Intrinsic.pointerReinterpret<*mut Start, *mut u8>(packet)) }
-  if initialized == 0 { let ignored = unsafe pthread_attr_destroy(attr) }
-  if status != 0 {
-    unsafe unlock(group) unsafe Pointer.dropInPlace<Start>(packet)
-    unsafe free(packet) unsafe free(child) fail NativeError { code: status }
+impl AgentGroup {
+  pub fn clone(self: &Self) -> AgentGroup { return AgentGroup { group: self.group.clone() } }
+  /// The native allocation and thread ledger every agent allocation counts against.
+  pub fn owner(self: &Self) -> Resources { return self.group.get().resources.clone() }
+  pub fn output(self: &Self) -> ?*mut File { return self.group.get().output }
+  pub fn domain(self: &Self) -> Domain { return self.group.get().cancellation.handle() }
+  pub fn stopping(self: &Self) -> bool { let guard = self.group.get().lists.lock() return guard.get().stopping }
+  pub fn asyncDone(self: &Self) -> i32 { let guard = self.group.get().lists.lock() return guard.get().done }
+  pub fn resetDone(self: &Self) -> () { let mut guard = self.group.get().lists.lock() let lists = guard.getMut() lists.done = 0 }
+  pub fn completed(self: &Self, failed: bool) -> () {
+    let mut guard = self.group.get().lists.lock() let lists = guard.getMut()
+    if failed { lists.done = 2 } else { lists.done = lists.done + 1 }
   }
-  resources.threadStarted()
-  let mut anchor = () let childState = unsafe Pointer.borrowMut<(), Child>(&mut anchor, child) childState.thread = thread drop childState
-  let state = unsafe Pointer.borrowMut<(), Group>(&mut anchor, group)
-  let previous = state.last state.last = child if Pointer.isNull<Child>(previous) { state.first = child } drop state
-  if !Pointer.isNull<Child>(previous) { let last = unsafe Pointer.borrowMut<(), Child>(&mut anchor, unsafe nonnull(previous)) last.next = child }
-  unsafe unlock(group)
+  pub fn failures(self: &Self) -> usize { let guard = self.group.get().lists.lock() return guard.get().failures }
+  pub fn failed(self: &Self) -> () {
+    let state = self.group.get()
+    let mut guard = state.lists.lock() let lists = guard.getMut() lists.failures = lists.failures + 1
+    state.changed.notifyAll()
+  }
+  pub effect fn report(self: &Self, bytes: &[u8]) -> () ! OutOfMemoryError {
+    let state = self.group.get() let mut allocator = state.resources.clone()
+    let text = run copyCString(bytes) |> Effect.provideMut<Allocator>(&mut allocator)
+    let mut messages = KindAllocator { owner: state.resources.clone(), kind: 3 }
+    let mut guard = state.lists.lock()
+    run guard.getMut().reports.append(move text) |> Effect.provideMut<Allocator>(&mut messages)
+  }
+  pub fn getReport(self: &Self) -> Option<List<u8>> {
+    let mut guard = self.group.get().lists.lock() let lists = guard.getMut()
+    if lists.reports.length() == 0 { return Option<List<u8>>.none() }
+    let report = lists.reports.remove(0)
+    if lists.reports.length() == 0 { lists.reports.clearAndFree() }
+    return Option<List<u8>>.some(move report)
+  }
+  pub effect fn start(self: &Self, process: &Process, experimental: bool, source: &[u8]) -> () ! OutOfMemoryError | NativeError {
+    let state = self.group.get() let resources = state.resources.clone() let mut allocator = resources.clone()
+    let bytes = run copyCString(source) |> Effect.provideMut<Allocator>(&mut allocator)
+    let mut nodes = KindAllocator { owner: resources.clone(), kind: 5 }
+    let mut guard = state.lists.lock()
+    if guard.get().stopping || !resources.permit() { fail NativeError { code: 11 } }
+    let index = guard.get().children.length()
+    run guard.getMut().children.append(Child { thread: Option<JoinHandle<i32>>.none(), finished: false,
+      pending: false, message: Option<Broadcast>.none() }) |> Effect.provideMut<Allocator>(&mut nodes)
+    let packet = Start { group: self.clone(), child: index, source: move bytes, process: process.clone(), experimental: experimental }
+    // Native VM/compiler recursion needs the stdlib thread's 8 MiB stack, as libc Workers do.
+    // The new thread waits for this lock before it touches its child record.
+    let spawned = run Effect.result(NativeThread.spawn(fn() -> i32 { return runAgent(move packet) }))
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    let thread = match move spawned {
+      Result<JoinHandle<i32>, OutOfMemoryError | SpawnError>.Success { value } => move value
+      Result<JoinHandle<i32>, OutOfMemoryError | SpawnError>.Failure { error } => {
+        let unused = guard.getMut().children.pop() drop unused
+        match move error { OutOfMemoryError allocation => { fail move allocation } SpawnError refused => { fail NativeError { code: refused.code } } }
+      }
+    }
+    resources.threadStarted()
+    let lists = guard.getMut() let children = lists.children.asMutSlice() children[index].thread = Option<JoinHandle<i32>>.some(move thread)
+  }
+  fn finish(self: &Self, child: usize) -> () {
+    let state = self.group.get() let mut guard = state.lists.lock()
+    let record = &mut guard.getMut().children.asMutSlice()[child]
+    record.finished = true record.pending = false
+    let message = Intrinsic.replace(record.message, Option<Broadcast>.none())
+    drop guard drop message state.changed.notifyAll()
+  }
+  // C waits forever for an already exited agent and leaks every overwritten SAB
+  // owner. Retire exited recipients and give every mailbox its own native owner.
+  pub fn broadcast(self: &Self, message: &Broadcast) -> usize {
+    let state = self.group.get() let mut guard = state.lists.lock()
+    if guard.get().stopping { return 0 }
+    let mut recipients: usize = 0
+    let children = guard.getMut().children.asMutSlice() let mut index: usize = 0
+    while index < children.length {
+      let child = &mut children[index]
+      if !child.finished {
+        child.message = Option<Broadcast>.some(message.clone()) child.pending = true
+        recipients = recipients + 1
+      }
+      index = index + 1
+    }
+    state.changed.notifyAll()
+    while !guard.get().stopping {
+      let mut pending = false let waiting = guard.get().children.asSlice() index = 0
+      while index < waiting.length { if waiting[index].pending && !waiting[index].finished { pending = true } index = index + 1 }
+      if !pending { break }
+      state.changed.wait(&mut guard)
+    }
+    return recipients
+  }
+  // Transfers the mailbox backing owner; acknowledgement precedes JS_Call exactly
+  // as in the source. Callback-created SABs acquire their own additional owner.
+  pub fn receive(self: &Self, child: usize) -> Option<Broadcast> {
+    let state = self.group.get() let mut guard = state.lists.lock()
+    while !guard.get().stopping {
+      let record = &mut guard.getMut().children.asMutSlice()[child]
+      if record.pending {
+        let message = Intrinsic.replace(record.message, Option<Broadcast>.none()) record.pending = false
+        state.changed.notifyAll() return move message
+      }
+      state.changed.wait(&mut guard)
+    }
+    return Option<Broadcast>.none()
+  }
+  pub fn sleep(self: &Self, milliseconds: u32) -> () {
+    // usleep receives uint32_t duration * 1000, including its modulo-2^32 product.
+    let micros = u32.wrappingMultiply(milliseconds, 1000)
+    let deadline = clock.nowNanoseconds() + u32.toI64(micros) * 1000
+    let state = self.group.get() let mut guard = state.lists.lock()
+    while !guard.get().stopping {
+      let remaining = deadline - clock.nowNanoseconds() if remaining <= 0 { break }
+      let _notified = state.changed.waitTimeout(&mut guard, i64.toU64(remaining))
+    }
+  }
+  /// Stops and joins every child, then drops queued reports. The main runtime calls it once.
+  pub fn shutdown(self: &Self) -> () {
+    let state = self.group.get()
+    let mut guard = state.lists.lock() let lists = guard.getMut() lists.stopping = true
+    let count = guard.get().children.length()
+    state.changed.notifyAll() drop guard
+    state.cancellation.cancel()
+    let mut index: usize = 0
+    while index < count {
+      let mut held = state.lists.lock()
+      let thread = Intrinsic.replace(held.getMut().children.asMutSlice()[index].thread, Option<JoinHandle<i32>>.none()) drop held
+      match move thread { Option<JoinHandle<i32>>.Some { value } => { let _code = value.join() } Option<JoinHandle<i32>>.None => () }
+      state.resources.threadFinished()
+      index = index + 1
+    }
+    let mut cleared = state.lists.lock() let emptied = cleared.getMut()
+    emptied.children.clearAndFree() emptied.reports.clearAndFree()
+  }
 }
-export "C" fn silkJsTest262AgentEntry(raw: ?*mut u8) -> ?*mut u8 {
-  let pointer = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Start>(unsafe nonnull(raw))
-  let packet = unsafe Pointer.take<Start>(pointer) unsafe free(pointer)
-  let group = packet.group let child = packet.child
+fn runAgent(packet: Start) -> i32 {
+  let group = packet.group.clone() let child = packet.child
   agentRuntime.runAgent(move packet)
-  unsafe finish(group, child)
-  return Pointer.null<u8>()
-}
-pub unsafe fn finish(group: *mut Group, child: *mut Child) -> () {
-  unsafe lock(group) let mut anchor = () let state = unsafe Pointer.borrowMut<(), Child>(&mut anchor, child)
-  state.finished = true state.pending = false
-  let message = Intrinsic.replace(state.message, Option<Broadcast>.none()) drop state
-  drop message unsafe wake(group) unsafe unlock(group)
-}
-// C waits forever for an already exited agent and leaks every overwritten SAB
-// owner. Retire exited recipients and give every mailbox its own native owner.
-pub unsafe fn broadcast(group: *mut Group, message: &Broadcast) -> usize {
-  unsafe lock(group)
-  if unsafe stopping(group) { unsafe unlock(group) return 0 }
-  let mut recipients: usize = 0
-  let mut anchor = () let state = unsafe Pointer.borrow<(), Group>(&anchor, group) let mut cursor = state.first drop state
-  while !Pointer.isNull<Child>(cursor) {
-    let child = unsafe Pointer.borrowMut<(), Child>(&mut anchor, unsafe nonnull(cursor)) cursor = child.next
-    if !child.finished {
-      child.message = Option<Broadcast>.some(message.clone()) child.pending = true
-      recipients = recipients + 1
-    }
-  }
-  unsafe wake(group)
-  while !unsafe stopping(group) {
-    let state2 = unsafe Pointer.borrow<(), Group>(&anchor, group) cursor = state2.first drop state2 let mut pending = false
-    while !Pointer.isNull<Child>(cursor) {
-      let child = unsafe Pointer.borrow<(), Child>(&anchor, unsafe nonnull(cursor)) cursor = child.next
-      if child.pending && !child.finished { pending = true }
-    }
-    if !pending { break }
-    require(unsafe pthread_cond_wait(unsafe condition(group), unsafe mutex(group)))
-  }
-  unsafe unlock(group) return recipients
-}
-// Transfers the mailbox backing owner; acknowledgement precedes JS_Call exactly
-// as in the source. Callback-created SABs acquire their own additional owner.
-pub unsafe fn receive(group: *mut Group, child: *mut Child) -> Option<Broadcast> {
-  unsafe lock(group) let mut anchor = ()
-  while !unsafe stopping(group) {
-    let state = unsafe Pointer.borrowMut<(), Child>(&mut anchor, child)
-    if state.pending {
-      let message = Intrinsic.replace(state.message, Option<Broadcast>.none()) state.pending = false
-      drop state unsafe wake(group) unsafe unlock(group) return move message
-    }
-    drop state require(unsafe pthread_cond_wait(unsafe condition(group), unsafe mutex(group)))
-  }
-  unsafe unlock(group) return Option<Broadcast>.none()
-}
-pub unsafe fn sleep(group: *mut Group, milliseconds: u32) -> () {
-  // usleep receives uint32_t duration * 1000, including its modulo-2^32 product.
-  let micros = u32.wrappingMultiply(milliseconds, 1000)
-  let deadline = clock.nowNanoseconds() + u32.toI64(micros) * 1000
-  unsafe lock(group)
-  while !unsafe stopping(group) {
-    let remaining = deadline - clock.nowNanoseconds() if remaining <= 0 { break }
-    let mut time = Timespec { seconds: 0, nanoseconds: 0 }
-    static if Intrinsic.targetOperatingSystem() == "darwin" { require(unsafe darwinClock(0, Pointer.fromMutRef(&mut time))) }
-    else { require(unsafe linuxClock(0, Pointer.fromMutRef(&mut time))) }
-    let nanos = time.nanoseconds + remaining time.seconds = time.seconds + nanos / 1000000000 time.nanoseconds = nanos % 1000000000
-    let status = unsafe pthread_cond_timedwait(unsafe condition(group), unsafe mutex(group), Pointer.fromRef(&time))
-    if status != 0 && status != 60 && status != 110 && status != 4 { invariant() }
-  }
-  unsafe unlock(group)
-}
-pub unsafe fn shutdown(group: *mut Group) -> () {
-  unsafe lock(group) let mut anchor = () let state = unsafe Pointer.borrowMut<(), Group>(&mut anchor, group)
-  let flag = Pointer.fromMutRef(&mut state.stopping) let mut cursor = state.first drop state
-  unsafe Atomic.store<u32>(flag, 1, MemoryOrder.Release)
-  unsafe wake(group) unsafe unlock(group)
-  let state2 = unsafe Pointer.borrow<(), Group>(&anchor, group) state2.cancellation.cancel() drop state2
-  let resources = unsafe owner(group)
-  while !Pointer.isNull<Child>(cursor) {
-    let pointer = unsafe nonnull(cursor) let child = unsafe Pointer.borrow<(), Child>(&anchor, pointer)
-    let thread = child.thread let next = child.next drop child
-    require(unsafe pthread_join(thread, Pointer.null<?*mut u8>())) resources.threadFinished()
-    unsafe Pointer.dropInPlace<Child>(pointer) unsafe free(pointer) cursor = next
-  }
-  let state3 = unsafe Pointer.borrowMut<(), Group>(&mut anchor, group)
-  state3.first = Pointer.null<Child>() state3.last = Pointer.null<Child>() drop state3
-  while true { let report = unsafe getReport(group) match move report { Option<List<u8>>.Some { value } => { drop value } Option<List<u8>>.None => { break } } }
-  require(unsafe pthread_cond_destroy(unsafe condition(group))) require(unsafe pthread_mutex_destroy(unsafe mutex(group)))
-  unsafe Pointer.dropInPlace<Group>(group) unsafe free(group)
+  group.finish(child)
+  return 0
 }

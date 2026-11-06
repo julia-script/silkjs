@@ -11,21 +11,31 @@ import silk.core.result { Result }
 import silk.core.option { Option }
 import silk.collections.list { List }
 import silk.mem.pointer { Pointer }
+import silk.mem.box { Box }
+import silk.collections.slice { Slice }
+import silk.num.u32
 import silk.num.u16
 import silk.num.i32
 import silk.num.usize
 import byte_buffer { ByteBuffer }
-import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_heap { HeapCell, HeapHeader, HeapKind, CellRef }
 import js_value { ValueBits }
 import js_gc { HeapHooks }
 import js_gc
-import js_core_types { FunctionBytecode, FunctionDebugInfo, FunctionKind, ByteStorage, SourceText, VarDef, ClosureVar, ClosureKind, RuntimeState }
-import js_compiler_types { FunctionDef, FunctionId, FunctionTree, linked, CompilerVar, CompilerError }
+import js_core_types { FunctionBytecode, FunctionDebugInfo, FunctionKind, ByteStorage, SourceText, VarDef, ClosureVar, ClosureKind, RuntimeState, ModuleDef }
+import thin_list { ThinList }
+import js_compiler_types { ScopeTable, FunctionDef, FunctionId, FunctionTree, linked, CompilerVar, CompilerError, CompilerErrorKind, PendingFunction, ParseFunctionKind }
 import js_compiler_state as state
 import js_compiler_variables as variables
 import js_compiler_labels { resolveLabels }
-import js_bytecode { analyze, constructForm, leafCode, leafPrefill, leafAccessor, LEAF_CELLS, LEAF_CREDITS, LEAF_PREFILL, LEAF_ACCESSOR, lazyArgumentsSite, SPECIAL_LAZY_ARGUMENTS, BytecodeError }
-import js_string_types { StringLengthError }
+import js_bytecode { analyze, constructForm, leafCode, leafPrefill, LEAF_CELLS, LEAF_CREDITS, LEAF_PREFILL, lazyArgumentsSite, lazyArgumentsAlias, SPECIAL_LAZY_ARGUMENTS, BytecodeError, leafAccessor, LEAF_ACCESSOR }
+import js_string_types { StringLengthError, StringOwner, latin1Bytes, stringReference }
+import js_strings { Strings }
+import js_debugger_metadata { Metadata as DebuggerMetadata, Scope }
+import js_debug_positions { SourcePositionCache, SourceLocation, definitionPc2Line }
+import js_opcode_data as op
+import js_invariant { present }
+import silk.num.u32
 
 fn definition(v: CompilerVar, strip: bool) -> VarDef {
   let mut name = v.name if strip { name = 0 }
@@ -42,10 +52,14 @@ effect fn assemble<H: HeapHooks>(hooks: &mut H, tree: &mut FunctionTree, cell: F
   ! OutOfMemoryError | StringLengthError | CompilerError | BytecodeError ? &mut Allocator {
   let mut anchor = ()
   let initial = tree.getMut(cell)
+  if initial.debuggerMetadata.enabled {
+    initial.debuggerMetadata.sourceLength = usize.toU32(source.length)
+  }
   variables.recomputeScopeLinks(&mut initial)
-  let eval = initial.hasEvalCall let global = initial.isEval
+  let eval = initial.hasEvalCall let global = initial.isEval let debug = initial.debuggerMetadata.enabled
   drop initial
   if eval { run variables.addEvalVariables(&mut tree, cell) }
+  else if debug { run variables.addDebuggerVariables(&mut tree, cell) }
   if global { run variables.addGlobalVariables(&mut tree, cell) }
   while true {
     let parent = tree.get(cell)
@@ -58,18 +72,91 @@ effect fn assemble<H: HeapHooks>(hooks: &mut H, tree: &mut FunctionTree, cell: F
     let parentWrite = tree.getMut(cell)
     parentWrite.constants.set(index, value)
   }
+  let capture = tree.getMut(cell)
+  if capture.debuggerMetadata.enabled {
+    if capture.args.length() + capture.vars.length() > 65535 {
+      let runtimeAnchor = () let rt = unsafe HeapCell.payload<RuntimeState, ()>(&runtimeAnchor, capture.runtime)
+      let error = run CompilerError.make(&rt.atoms, CompilerErrorKind.TooManyLocals, 0) fail move error
+    }
+    let mut index: usize = 0
+    while index < capture.args.length() { state.captureVar(&mut capture, usize.toI32(index), true) index = index + 1 }
+    index = 0
+    while index < capture.vars.length() { state.captureVar(&mut capture, usize.toI32(index), false) index = index + 1 }
+  }
+  drop capture
   run variables.resolveVariables(&mut tree, cell)
+  if deferrable(tree.get(cell), source) { return run defer(&mut tree, cell, source) }
   run resolveLabels(&mut tree, cell, source)
   let fd = tree.getMut(cell)
+  run debuggerDetails(&mut fd, source)
+  let header = run finalHeader(&mut fd)
+  let runtime = fd.runtime let context = fd.context
+  // Allocate BEFORE moving any JS edge. OOM leaves the complete fd destructible.
+  let result = run HeapCell.allocate(HeapKind.FunctionBytecode, move header)
+  transfer(&mut fd, result)
+  drop fd
+  unsafe HeapCell.retain(context)
+  unsafe js_gc.publish(runtime, result)
+  return ValueBits.FunctionBytecode { reference: result }
+}
+
+/// The debugger's scope, local and location tables for fd, before finalHeader.
+effect fn debuggerDetails(fd: &mut FunctionDef, source: &[u8]) -> () ! OutOfMemoryError | CompilerError | StringLengthError ? &mut Allocator {
+  if !fd.debuggerMetadata.enabled { return () }
+  if fd.args.length() + fd.vars.length() > 65535 {
+    let runtimeAnchor = () let rt = unsafe HeapCell.payload<RuntimeState, ()>(&runtimeAnchor, fd.runtime)
+    let error = run CompilerError.make(&rt.atoms, CompilerErrorKind.TooManyLocals, 0) fail move error
+  }
+  fd.debuggerMetadata.hasParameterExpressions = fd.hasParameterExpressions
+  let mut index: usize = 0
+  while index < fd.scopes.length() {
+    let scope = fd.scopes.get(index)
+    run fd.debuggerMetadata.scopes.append(Scope { parent: scope.parent, first: scope.first })
+    index = index + 1
+  }
+  index = 0
+  while index < fd.vars.length() {
+    state.captureVar(&mut fd, usize.toI32(index), false)
+    run fd.debuggerMetadata.localScopes.append(fd.vars.get(index).scopeLevel)
+    index = index + 1
+  }
+  // Reuse the parser-owned ECMAScript cache across the compilation tree.
+  // A fresh cache per function repeatedly scans overlapping source prefixes.
+  let mut fallbackCoordinates = SourcePositionCache.make()
+  let coordinatePointer = if Pointer.isNull<SourcePositionCache>(fd.sourceCache) {
+    Pointer.fromMutRef<SourcePositionCache>(&mut fallbackCoordinates)
+  } else {
+    present(fd.sourceCache)
+  }
+  let mut coordinateAnchor = ()
+  let coordinates = unsafe Pointer.borrowMut<(), SourcePositionCache>(&mut coordinateAnchor, coordinatePointer)
+  index = 0
+  while index < fd.debuggerMetadata.locations.length() {
+    let mut location = fd.debuggerMetadata.locations.get(index)
+    let point = coordinates.locateEcma(source, u32.toUsize(location.sourcePosition))
+    location.line = point.line location.column = point.column
+    fd.debuggerMetadata.locations.set(index, location)
+    index = index + 1
+  }
+}
+
+/// The finished header for fd after label resolution; its lists stay in fd
+/// until transfer. Failure leaves fd intact and destructible.
+effect fn finalHeader(fd: &mut FunctionDef) -> FunctionBytecode ! OutOfMemoryError | BytecodeError ? &mut Allocator {
   let facts = run analyze(fd.bytecode.asSlice())
   let stackSize = facts.stackSize
   let borrowsArguments = fd.functionKind == FunctionKind.Normal && fd.varRefCount == 0 && !facts.writesArguments
-  let strip = fd.stripDebug && !fd.hasEvalCall
+  let strip = fd.stripDebug && !fd.hasEvalCall && !fd.debuggerMetadata.enabled
   // function() { target.apply(this, arguments) }: no formal can alias the
   // arguments object, so it is built only if the VM cannot apply in place.
   if fd.functionKind == FunctionKind.Normal && fd.args.length() == 0 && fd.hasSimpleParameterList && !fd.hasEvalCall
     && fd.argumentsVarIndex >= 0 && fd.argumentsArgIndex < 0 && !fd.vars.get(i32.toUsize(fd.argumentsVarIndex)).isCaptured {
-    let site = lazyArgumentsSite(fd.bytecode.asSlice(), i32.toUsize(fd.argumentsVarIndex))
+    // A captured copy (var a = arguments read by a closure) keeps the object.
+    let alias = lazyArgumentsAlias(fd.bytecode.asSlice(), i32.toUsize(fd.argumentsVarIndex))
+    let mut site = usize.MAX
+    if alias == usize.MAX || (alias < fd.vars.length() && !fd.vars.get(alias).isCaptured) {
+      site = lazyArgumentsSite(fd.bytecode.asSlice(), i32.toUsize(fd.argumentsVarIndex))
+    }
     if site != usize.MAX { fd.bytecode.set(site, SPECIAL_LAZY_ARGUMENTS) }
   }
   let leaf = fd.functionKind == FunctionKind.Normal && !fd.isDerivedClassConstructor && !fd.hasEvalCall
@@ -91,9 +178,13 @@ effect fn assemble<H: HeapHooks>(hooks: &mut H, tree: &mut FunctionTree, cell: F
   run fd.pc2line.shrinkToFit()
   run fd.constants.shrinkToFit()
   run fd.closureVars.shrinkToFit()
-  let runtime = fd.runtime let context = fd.context
-  // Allocate BEFORE moving any JS edge. OOM leaves the complete fd destructible.
-  let result = run HeapCell.allocate(HeapKind.FunctionBytecode, FunctionBytecode {
+  return FunctionBytecode {
+    scriptId: fd.scriptId,
+    scriptIsEval: fd.scriptIsEval || fd.evalType == 2 || fd.evalType == 3,
+    debuggerMetadata: DebuggerMetadata.make(),
+    hostImport: ValueBits.Undefined,
+    hostModule: ValueBits.Undefined,
+    hostScriptMetadata: ValueBits.Undefined,
     mode: fd.jsMode, hasPrototype: fd.hasPrototype, hasSimpleParameterList: fd.hasSimpleParameterList,
     isDerivedClassConstructor: fd.isDerivedClassConstructor,
     needsHomeObject: fd.homeObjectVarIndex >= 0 || fd.needHomeObject, kind: fd.functionKind,
@@ -104,18 +195,25 @@ effect fn assemble<H: HeapHooks>(hooks: &mut H, tree: &mut FunctionTree, cell: F
     varDefs: move definitions, closureVars: List<ClosureVar>.make(),
     argumentCount: usize.toU16(fd.args.length()), variableCount: usize.toU16(fd.vars.length()),
     definedArgumentCount: i32.toU16(fd.definedArgCount), stackSize: stackSize,
-    varRefCount: i32.toU16(fd.varRefCount), borrowsArguments: borrowsArguments, leaf: leafFlags, constructForm: constructForm(fd.bytecode.asSlice()), realm: context,
-    constants: List<ValueBits>.make(), debug: Option<FunctionDebugInfo>.none()
-  })
-  // No fallible operations after this point. All native buffers move, never copy.
+    varRefCount: i32.toU16(fd.varRefCount), borrowsArguments: borrowsArguments, leaf: leafFlags, constructForm: constructForm(fd.bytecode.asSlice()), realm: fd.context,
+    constants: List<ValueBits>.make(), debug: Option<FunctionDebugInfo>.none(), pending: Option<Box<PendingFunction>>.none()
+  }
+}
+
+/// Moves fd's code, constants, names, closure table and debug data into the
+/// bytecode cell result, whose header finalHeader made. Never allocates; all
+/// native buffers move, never copy.
+fn transfer(fd: &mut FunctionDef, result: *mut HeapHeader) -> () {
+  let strip = fd.stripDebug && !fd.hasEvalCall && !fd.debuggerMetadata.enabled
   let mut resultAnchor = () let mut runtimeAnchor = ()
   let b = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut resultAnchor, result)
-  let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, runtime)
+  let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, fd.runtime)
   let code = Intrinsic.replace(fd.bytecode, ByteBuffer.make())
   b.code = ByteStorage.Owned { bytes: code.intoList() }
+  b.debuggerMetadata = Intrinsic.replace(fd.debuggerMetadata, DebuggerMetadata.make())
   b.name = fd.functionName fd.functionName = 0
   b.constants = Intrinsic.replace(fd.constants, List<ValueBits>.make())
-  i = 0
+  let mut i: usize = 0
   while i < fd.args.length() {
     let mut v = fd.args.get(i) if strip { rt.atoms.release(v.name) }
     v.name = 0 fd.args.set(i, v) i = i + 1
@@ -136,17 +234,210 @@ effect fn assemble<H: HeapHooks>(hooks: &mut H, tree: &mut FunctionTree, cell: F
   b.closureVars = Intrinsic.replace(fd.closureVars, List<ClosureVar>.make())
   if !fd.stripDebug {
     let lines = Intrinsic.replace(fd.pc2line, ByteBuffer.make())
+    let callLines = Intrinsic.replace(fd.callSitePc2line, ByteBuffer.make())
     let text = Intrinsic.replace(fd.source, Option<SourceText>.none())
     b.debug = Option<FunctionDebugInfo>.some(FunctionDebugInfo {
+      callSitePcToLine: Option<ByteStorage>.some(ByteStorage.Owned { bytes: callLines.intoList() }),
+      nodeVm: fd.nodeVmDiagnostics, nodeSourceURL: false, lineOffset: 0, columnOffset: 0, sourceColumnOffset: 0,
       filename: fd.filename, source: move text, pcToLine: ByteStorage.Owned { bytes: lines.intoList() }
     })
     fd.filename = 0
   }
-  drop rt drop b drop fd
+}
+
+/// Stub code: never run, since no call reaches a frame before finishing it.
+const STUB_STACK: u16 = 0xffff
+
+/// Whether fd, a nested function after variable resolution, may wait for its
+/// first call for the rest of its compile: a plain function or arrow (no eval,
+/// generator, async, class or method form) whose text is a span of this compile's
+/// shared input, so its line table can be built later from the same bytes.
+fn deferrable(fd: &FunctionDef, source: &[u8]) -> bool {
+  match fd.parent { Option<FunctionId>.Some { .. } => () _ => { return false } }
+  if fd.functionKind != FunctionKind.Normal || fd.isDerivedClassConstructor || fd.hasEvalCall || fd.isEval || fd.bytecodeError { return false }
+  // The debugger reads every function's final code, scopes and locations.
+  if fd.debuggerMetadata.enabled { return false }
+  if fd.functionType != ParseFunctionKind.Statement && fd.functionType != ParseFunctionKind.Var
+    && fd.functionType != ParseFunctionKind.Expression && fd.functionType != ParseFunctionKind.Arrow { return false }
+  match &fd.module { Option<CellRef<ModuleDef>>.Some { .. } => { return false } _ => () }
+  return match &fd.source {
+    Option<SourceText>.Some { value } => match &value {
+      SourceText.Shared { text, start: _, length: _ } => Strings.length(text.get()) == source.length
+      _ => false
+    }
+    _ => false
+  }
+}
+
+/// Publishes a stub FunctionBytecode for fd and keeps fd, unlinked, in the
+/// stub's PendingFunction: finish completes it on the first call. The stub has
+/// fd's final counts, closure table, constants and name; its code is a single
+/// invalid opcode and its stack size STUB_STACK. The vacated tree slot keeps
+/// fd's sibling and parent links, so createFunction's teardown unlinks it.
+effect fn defer(tree: &mut FunctionTree, cell: FunctionId, source: &[u8]) -> ValueBits
+  ! OutOfMemoryError ? &mut Allocator {
+  let fd = tree.getMut(cell)
+  let runtime = fd.runtime let context = fd.context
+  let start = u32.toUsize(fd.sourcePosition)
+  let mut at = SourceLocation { line: 0, column: 0 }
+  // Both coordinate systems: finish's encoders start from this function, not
+  // from the top of the source.
+  let mut ecma = SourceLocation { line: 0, column: 0 }
+  match Pointer.nonNullMut<SourcePositionCache>(fd.sourceCache) {
+    Option<*mut SourcePositionCache>.Some { value } => {
+      let mut cacheAnchor = ()
+      let cache = unsafe Pointer.borrowMut<(), SourcePositionCache>(&mut cacheAnchor, value)
+      at = cache.locate(source, start)
+      ecma = cache.locateEcma(source, start)
+    }
+    Option<*mut SourcePositionCache>.None => {
+      let mut local = SourcePositionCache.make() at = local.locate(source, start) ecma = local.locateEcma(source, start)
+    }
+  }
+  drop fd
+  let mut kept = FunctionTree.make()
+  run kept.reserveExact(1)
+  let keptCell = run unsafe kept.add(FunctionDef.make(context, runtime, 0))
+  let mut pending = run Box<PendingFunction>.make(PendingFunction { tree: move kept, cell: keptCell, start: start, line: at.line, column: at.column,
+    ecmaLine: ecma.line, ecmaColumn: ecma.column })
+  let def = tree.getMut(cell)
+  let mut table = List<u8>.make()
+  if !def.stripDebug { table = run definitionPc2Line(at) }
+  let mut code = List<u8>.make()
+  run code.reserveExact(1)
+  run code.append(op.OP_invalid)
+  let result = run HeapCell.allocate(HeapKind.FunctionBytecode, FunctionBytecode {
+    scriptId: def.scriptId,
+    scriptIsEval: def.scriptIsEval || def.evalType == 2 || def.evalType == 3,
+    debuggerMetadata: DebuggerMetadata.make(),
+    hostImport: ValueBits.Undefined,
+    hostModule: ValueBits.Undefined,
+    hostScriptMetadata: ValueBits.Undefined,
+    mode: def.jsMode, hasPrototype: def.hasPrototype, hasSimpleParameterList: def.hasSimpleParameterList,
+    isDerivedClassConstructor: def.isDerivedClassConstructor,
+    needsHomeObject: def.homeObjectVarIndex >= 0 || def.needHomeObject, kind: def.functionKind,
+    newTargetAllowed: def.newTargetAllowed, superCallAllowed: def.superCallAllowed,
+    superAllowed: def.superAllowed, argumentsAllowed: def.argumentsAllowed,
+    readOnlyBytecode: false, isDirectOrIndirectEval: def.evalType == 2 || def.evalType == 3,
+    code: ByteStorage.Owned { bytes: move code }, name: 0,
+    varDefs: List<VarDef>.make(), closureVars: List<ClosureVar>.make(),
+    argumentCount: usize.toU16(def.args.length()), variableCount: usize.toU16(def.vars.length()),
+    definedArgumentCount: i32.toU16(def.definedArgCount), stackSize: STUB_STACK,
+    varRefCount: i32.toU16(def.varRefCount), borrowsArguments: false, leaf: 0, constructForm: 0, realm: context,
+    constants: List<ValueBits>.make(), debug: Option<FunctionDebugInfo>.none(), pending: Option<Box<PendingFunction>>.none()
+  })
+  // No fallible operations after this point.
+  let mut resultAnchor = () let mut runtimeAnchor = ()
+  let b = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut resultAnchor, result)
+  let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, runtime)
+  b.name = def.functionName def.functionName = 0
+  b.constants = Intrinsic.replace(def.constants, List<ValueBits>.make())
+  b.closureVars = Intrinsic.replace(def.closureVars, List<ClosureVar>.make())
+  if !def.stripDebug {
+    let mut text = Option<SourceText>.none()
+    match &def.source {
+      Option<SourceText>.Some { value } => match &value {
+        SourceText.Shared { text: whole, start: from, length } => {
+          text = Option<SourceText>.some(SourceText.Shared { text: StringOwner.borrowed(whole.get()), start: from, length: length })
+        }
+        _ => ()
+      }
+      _ => ()
+    }
+    b.debug = Option<FunctionDebugInfo>.some(FunctionDebugInfo {
+      callSitePcToLine: Option<ByteStorage>.none(),
+      nodeVm: def.nodeVmDiagnostics, nodeSourceURL: false, lineOffset: 0, columnOffset: 0, sourceColumnOffset: 0,
+      filename: rt.atoms.duplicate(def.filename), source: move text, pcToLine: ByteStorage.Owned { bytes: move table }
+    })
+  }
+  drop rt
+  // fd moves into the pending tree; its old slot keeps only the links teardown follows.
+  let mut vacated = FunctionDef.make(context, runtime, 0)
+  vacated.parent = def.parent vacated.previousSibling = def.previousSibling vacated.nextSibling = def.nextSibling
+  let mut moved = Intrinsic.replace(def.*, move vacated)
+  drop def
+  moved.parent = Option<FunctionId>.none() moved.previousSibling = Option<FunctionId>.none()
+  moved.nextSibling = Option<FunctionId>.none() moved.firstChild = Option<FunctionId>.none() moved.lastChild = Option<FunctionId>.none()
+  moved.sourceCache = Pointer.null<SourcePositionCache>()
+  // Label resolution and the final header never read the variable resolution
+  // tables; free them now rather than for the whole time the stub waits.
+  moved.scopes = ScopeTable.make() moved.varIndex = ThinList<u32>.make()
+  moved.closureNames = ThinList<u32>.make() moved.closureSlots = ThinList<u32>.make()
+  let slot = pending.getMut()
+  let placeholder = Intrinsic.replace(slot[0].tree.getMut(keptCell).*, move moved)
+  drop placeholder drop slot
+  b.pending = Option<Box<PendingFunction>>.some(move pending)
+  drop b
   unsafe HeapCell.retain(context)
   unsafe js_gc.publish(runtime, result)
   return ValueBits.FunctionBytecode { reference: result }
 }
+
+/// Completes a stub from defer, if node is one: label resolution, the line
+/// table and the final code, written into node in place, so every closure of
+/// the function keeps working. On failure the stub stays pending and failure
+/// repeats on the next call.
+pub unsafe effect fn finish<H: HeapHooks>(hooks: &mut H, node: *mut HeapHeader) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = ()
+  let b = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut anchor, node)
+  let boxed = match move Intrinsic.replace(b.pending, Option<Box<PendingFunction>>.none()) {
+    Option<Box<PendingFunction>>.Some { value } => move value
+    Option<Box<PendingFunction>>.None => { return () }
+  }
+  let mut pending = boxed.into()
+  let cell = pending.cell
+  let fd = pending.tree.getMut(cell)
+  // The stub's edges go back to the definition for the rest of its compile.
+  fd.constants = Intrinsic.replace(b.constants, List<ValueBits>.make())
+  fd.closureVars = Intrinsic.replace(b.closureVars, List<ClosureVar>.make())
+  fd.functionName = b.name b.name = 0
+  drop b
+  let mut cache = SourcePositionCache.at(pending.start, pending.line, pending.column, pending.ecmaLine, pending.ecmaColumn)
+  fd.sourceCache = Pointer.fromMutRef<SourcePositionCache>(&mut cache)
+  let whole = match &fd.source {
+    Option<SourceText>.Some { value } => match &value { SourceText.Shared { text, .. } => text.get() _ => invariant() }
+    _ => invariant()
+  }
+  drop fd
+  let mut wholeAnchor = ()
+  let source = Slice.view<u8>(unsafe latin1Bytes(&wholeAnchor, stringReference(whole)), 0, Strings.length(whole))
+  let outcome = run Effect.result(complete(&mut pending.tree, cell, source))
+  let done = pending.tree.getMut(cell)
+  done.sourceCache = Pointer.null<SourcePositionCache>()
+  match move outcome {
+    Result<FunctionBytecode, OutOfMemoryError | BytecodeError>.Success { value: header } => {
+      let b = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut anchor, node)
+      let stub = Intrinsic.replace(b.*, move header)
+      // configureHostCallbacks may have given the stub its host values: they own references.
+      b.hostImport = stub.hostImport b.hostModule = stub.hostModule b.hostScriptMetadata = stub.hostScriptMetadata
+      drop b
+      let mut runtimeAnchor = ()
+      let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, done.runtime)
+      match &stub.debug { Option<FunctionDebugInfo>.Some { value } => { rt.atoms.release(value.filename) } _ => () }
+      drop rt
+      drop stub
+      transfer(&mut done, node)
+      drop done
+      state.destroyFunction(&mut hooks, &mut pending.tree, cell)
+    }
+    Result<FunctionBytecode, OutOfMemoryError | BytecodeError>.Failure { error } => {
+      drop error
+      let b = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut anchor, node)
+      b.constants = Intrinsic.replace(done.constants, List<ValueBits>.make())
+      b.closureVars = Intrinsic.replace(done.closureVars, List<ClosureVar>.make())
+      b.name = done.functionName done.functionName = 0
+      drop done
+      b.pending = Option<Box<PendingFunction>>.some(run Box<PendingFunction>.make(move pending))
+      fail OutOfMemoryError {}
+    }
+  }
+}
+effect fn complete(tree: &mut FunctionTree, cell: FunctionId, source: &[u8]) -> FunctionBytecode
+  ! OutOfMemoryError | BytecodeError ? &mut Allocator {
+  run resolveLabels(&mut tree, cell, source)
+  return run finalHeader(&mut tree.getMut(cell))
+}
+fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
 
 pub effect fn createFunction<H: HeapHooks>(hooks: &mut H, tree: &mut FunctionTree, cell: FunctionId, source: &[u8]) -> ValueBits
   ! OutOfMemoryError | StringLengthError | CompilerError | BytecodeError ? &mut Allocator {

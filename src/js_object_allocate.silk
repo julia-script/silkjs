@@ -5,12 +5,9 @@
 //! Class constructors must install their nonempty family payload before exposing it.
 import thin_list { ThinList }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
-import silk.core.effect { Effect }
 import silk.mem.layout { Layout }
-import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.mem.pointer { Pointer }
-import silk.core.result { Result }
 import silk.num.i32
 import silk.num.u32
 import silk.num.usize
@@ -18,8 +15,8 @@ import runtime_memory { AllocationObserver }
 import runtime_memory as memory
 import js_heap { HeapCell, HeapHeader, HeapKind }
 import js_value { ValueBits }
-import js_owned_value { Value, ValueRef, lendBits, immediateRef }
-import js_realm { Realm, lendRealm }
+import js_owned_value { Value, ValueRef, lendBits }
+import js_realm { Realm }
 import js_core_types { RuntimeState, ContextState, ObjectData, ObjectPayload, PropertySlot, SlotBits,
   ShapeData, FastArrayData, MappedArgumentsData, RegExpData, GlobalObjectData,
   JS_PROP_WRITABLE, JS_PROP_LENGTH, JS_PROP_INITIAL_SIZE, JS_PROP_INITIAL_HASH_SIZE, ExoticCallbacks }
@@ -29,11 +26,11 @@ import js_shapes as shapes
 import js_runtime as runtimeApi
 import js_class_data as classes
 import js_atom_data as atoms
+import js_caught { FailedOom, failedOom }
+import js_invariant { invariant, present }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
 
-fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
-fn present(value: ?*mut HeapHeader) -> *mut HeapHeader {
-  return unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(value)
-}
 fn prototypeObject(value: ValueBits) -> ?*mut HeapHeader {
   return match value { ValueBits.Object { reference } => reference _ => Pointer.null<HeapHeader>() }
 }
@@ -120,11 +117,11 @@ unsafe effect fn initialize<'a>(realm: Realm<'a>, node: *mut HeapHeader,
 /// Stores an Array's length 0, adding the length property unless the node already
 /// has the context's cached array shape. Returns the shape retired by that add.
 unsafe effect fn arrayLength<'a>(realm: Realm<'a>, node: *mut HeapHeader) -> ?*mut HeapHeader
-  ! OutOfMemoryError ? &mut Allocator { let context = realm.context()
+  ! OutOfMemoryError ? &mut Allocator {
   let mut anchor = ()
   let object = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
   let sourceAnchor = ()
-  let ctx = unsafe HeapCell.payload<ContextState, ()>(&sourceAnchor, context)
+  let ctx = realm.state(&sourceAnchor)
   let cached = ctx.arrayShape
   let runtime = ctx.runtime
   drop ctx
@@ -139,8 +136,6 @@ unsafe effect fn arrayLength<'a>(realm: Realm<'a>, node: *mut HeapHeader) -> ?*m
 
 // catchFailure handlers for the allocation hot path: Effect.result costs an
 // out-of-line Effect.map call, and a pointer success arm cannot be matched yet.
-struct FailedOom { error: OutOfMemoryError }
-effect fn failedOom(error: OutOfMemoryError) -> FailedOom { return FailedOom { error: move error } }
 struct AllocatedNode { node: *mut HeapHeader }
 /// An uninitialized node with its slot list; every shape property starts Undefined.
 struct PreparedNode { node: *mut HeapHeader, slots: ThinList<SlotBits> }
@@ -292,6 +287,13 @@ unsafe effect fn initializeRetired<'a>(realm: Realm<'a>, node: *mut HeapHeader,
 @inlineAlways
 unsafe effect fn freshNode<'a, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>, ownedShape: *mut HeapHeader, classId: u32,
   exotic: bool, fast: bool, extra: usize, plan: ?*mut HeapHeader) -> ValueBits ! OutOfMemoryError ? &mut Allocator {
+  return run unsafe freshNodeWith(&mut hooks, realm, ownedShape, classId, exotic, fast, extra, plan, false)
+}
+/// freshNode, where sized tells an Array whose shape already holds its length
+/// record (an exec result's) from one that still needs it added.
+@inlineAlways
+unsafe effect fn freshNodeWith<'a, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>, ownedShape: *mut HeapHeader, classId: u32,
+  exotic: bool, fast: bool, extra: usize, plan: ?*mut HeapHeader, sized: bool) -> ValueBits ! OutOfMemoryError ? &mut Allocator {
   let runtime = realm.runtime()
   let created = run Intrinsic.catchFailure<OutOfMemoryError>(unsafe prepareNode(runtime, ownedShape, extra, plan, classId == classes.JS_CLASS_OBJECT), failedOom)
   let fresh = match move created {
@@ -307,6 +309,7 @@ unsafe effect fn freshNode<'a, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>, ow
   // Every field is written in place before the node is read or published.
   let mut nodeAnchor = ()
   let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut nodeAnchor, fresh)
+  data.creationRealm = Pointer.null<HeapHeader>()
   data.setIsStandardArrayPrototype(false) data.setExtensible(true) data.setFreeMark(false) data.setIsExotic(exotic)
   data.setFastArray(fast) data.setIsConstructor(false) data.setHasImmutablePrototype(false)
   data.setIsHtmlDda(false) data.setClassId(classId) data.weakRefCount = 0 data.shape = ownedShape
@@ -327,10 +330,13 @@ unsafe effect fn freshNode<'a, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>, ow
     }
   }
   drop data
-  if classId == classes.JS_CLASS_ARRAY {
+  if classId == classes.JS_CLASS_ARRAY && !sized {
     let finished = run Intrinsic.catchFailure<OutOfMemoryError>(unsafe arrayLengthRetired(realm, fresh), failedOom)
     match move finished {
       Retired { shape: retired } => {
+        let mut creationAnchor = () let created = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut creationAnchor, fresh)
+        created.creationRealm = realm.context() drop created
+        unsafe HeapCell.retain(realm.context())
         unsafe gc.publish(runtime, fresh)
         unsafe gc.releaseOptional(&mut hooks, runtime, retired)
         return ValueBits.Object { reference: fresh }
@@ -341,7 +347,10 @@ unsafe effect fn freshNode<'a, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>, ow
       }
     }
   }
-  unsafe gc.publish(runtime, fresh)
+  let mut creationAnchor = () let freshData = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut creationAnchor, fresh)
+  freshData.creationRealm = realm.context() drop freshData
+  unsafe HeapCell.retain(realm.context())
+  unsafe gc.publishObject(runtime, fresh)
   return ValueBits.Object { reference: fresh }
 }
 /// ordinaryFromShape for an object born with a constructor's final shape, whose
@@ -362,6 +371,13 @@ pub unsafe effect fn ordinaryFromShape<'a, H: HeapHooks>(hooks: &mut H, memory: 
   let collected = run unsafe runtimeApi.triggerGC(memory, &mut hooks, realm.runtime(), Layout.of<ObjectData>().bytes, false)
   return run unsafe freshNode(&mut hooks, realm, ownedShape, classes.JS_CLASS_OBJECT, false, false, 0, Pointer.null<HeapHeader>())
 }
+/// ordinaryFromShape for a RegExp (a RegExp literal's object): not exotic, not
+/// a fast array, so the class table lookup folds away as well.
+pub unsafe effect fn regexpFromShape<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>,
+  ownedShape: *mut HeapHeader) -> ValueBits ! OutOfMemoryError ? &mut Allocator {
+  let collected = run unsafe runtimeApi.triggerGC(memory, &mut hooks, realm.runtime(), Layout.of<ObjectData>().bytes, false)
+  return run unsafe freshNode(&mut hooks, realm, ownedShape, classes.JS_CLASS_REGEXP, false, false, 0, Pointer.null<HeapHeader>())
+}
 /// Consumes ownedShape and supplied slots, including OOM. Native slot storage is
 /// transferred when supplied, avoiding a redundant copy; capacity still covers shape.
 /// No class finalizer runs for an allocation that was never published.
@@ -370,7 +386,7 @@ pub unsafe effect fn fromShape<'a, H: HeapHooks>(hooks: &mut H, memory: &Allocat
   let runtime = realm.runtime()
   let collected = run unsafe runtimeApi.triggerGC(memory, &mut hooks, runtime, Layout.of<ObjectData>().bytes, false)
   let anchor = ()
-  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let state = realm.runtimeState(&anchor)
   let mut exotic = match &state.classes.asSlice()[u32.toUsize(classId)].exotic {
     Option<ExoticCallbacks>.Some { .. } => true Option<ExoticCallbacks>.None => false
   }
@@ -401,6 +417,9 @@ pub unsafe effect fn fromShape<'a, H: HeapHooks>(hooks: &mut H, memory: &Allocat
   let initialized = run Intrinsic.catchFailure<OutOfMemoryError>(unsafe initializeRetired(realm, node, &mut properties), failedOom)
   match move initialized {
     Retired { shape: retired } => {
+      let mut creationAnchor = () let created = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut creationAnchor, node)
+      created.creationRealm = realm.context() drop created
+      unsafe HeapCell.retain(realm.context())
       unsafe gc.publish(runtime, node)
       unsafe gc.releaseOptional(&mut hooks, runtime, retired)
       return ValueBits.Object { reference: node }
@@ -433,9 +452,9 @@ pub effect fn withPrototypeClassCapacity<'a, 'b, H: HeapHooks>(hooks: &mut H, me
   return run unsafe fromShape(&mut hooks, memory, realm, shape, classId, Option<ThinList<SlotBits>>.none())
 }
 @inlineAlways
-pub effect fn withClass<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,realm: Realm<'a>, classId: u32) -> ValueBits ! OutOfMemoryError ? &mut Allocator { let context = realm.context()
+pub effect fn withClass<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,realm: Realm<'a>, classId: u32) -> ValueBits ! OutOfMemoryError ? &mut Allocator {
   let anchor = ()
-  let ctx = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  let ctx = realm.state(&anchor)
   let prototype = ctx.classPrototypes.get(u32.toUsize(classId))
   drop ctx
   return run withPrototypeClass(&mut hooks, memory, realm, unsafe lendBits(&prototype, prototype), classId)
@@ -455,6 +474,14 @@ pub effect fn newArray<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObser
 @inlineAlways
 pub effect fn newWithPrototype<'a, 'b, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, prototype: ValueRef<'b>) -> Value ! OutOfMemoryError ? &mut Allocator {
   return unsafe Value.adoptBits(run withPrototype(&mut hooks, memory, realm, prototype))
+}
+@inlineAlways
+pub effect fn newWithPrototypeClass<'a, 'b, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, prototype: ValueRef<'b>, classId: u32) -> Value ! OutOfMemoryError ? &mut Allocator {
+  return unsafe Value.adoptBits(run withPrototypeClass(&mut hooks, memory, realm, prototype, classId))
+}
+@inlineAlways
+pub effect fn newWithClass<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, classId: u32) -> Value ! OutOfMemoryError ? &mut Allocator {
+  return unsafe Value.adoptBits(run withClass(&mut hooks, memory, realm, classId))
 }
 pub effect fn object<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,realm: Realm<'a>) -> ValueBits ! OutOfMemoryError ? &mut Allocator {
   return run withClass(&mut hooks, memory, realm, classes.JS_CLASS_OBJECT)
@@ -497,6 +524,17 @@ pub unsafe effect fn literalArray<'a, H: HeapHooks>(hooks: &mut H, memory: &Allo
   }
   made.properties.set(0, SlotBits.value(ValueBits.Int { value: usize.toI32(count) }))
   return array
+}
+/// A RegExp exec result: an Array of ownedShape, whose records start with
+/// length, every slot Undefined, with room for count values in the cell's tail
+/// when count is at most LITERAL_TAIL_VALUES (its value list may be shorter
+/// otherwise). Consumes ownedShape.
+pub unsafe effect fn shapedArray<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>,
+  ownedShape: *mut HeapHeader, count: usize) -> ValueBits ! OutOfMemoryError ? &mut Allocator {
+  let collected = run unsafe runtimeApi.triggerGC(memory, &mut hooks, realm.runtime(), Layout.of<ObjectData>().bytes, false)
+  let mut extra: usize = 0
+  if count <= LITERAL_TAIL_VALUES { extra = count }
+  return run unsafe freshNodeWith(&mut hooks, realm, ownedShape, classes.JS_CLASS_ARRAY, true, true, extra, Pointer.null<HeapHeader>(), true)
 }
 /// The longest array whose values arrayWithCapacity keeps in the object's own cell.
 const LITERAL_TAIL_VALUES: usize = 16
@@ -549,9 +587,9 @@ unsafe effect fn reserveValues(runtime: *mut HeapHeader, node: *mut HeapHeader, 
   }
 }
 /// Requires the context's Array intrinsic cached shape to have been installed.
-pub effect fn array<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,realm: Realm<'a>) -> ValueBits ! OutOfMemoryError ? &mut Allocator { let context = realm.context()
+pub effect fn array<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,realm: Realm<'a>) -> ValueBits ! OutOfMemoryError ? &mut Allocator {
   let anchor = ()
-  let ctx = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
+  let ctx = realm.state(&anchor)
   let shape = present(ctx.arrayShape)
   drop ctx
   unsafe HeapCell.retain(shape)

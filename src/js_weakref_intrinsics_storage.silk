@@ -4,12 +4,12 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.mem.pointer { Pointer }
-import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_heap { CellRef, HeapCell, HeapHeader, HeapKind }
 import js_value { ValueBits }
 import js_owned_value { Value, ValueRef }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
-import js_realm { Realm, lendRealm }
+import js_realm { Realm }
 import js_core_types { ObjectData, ObjectPayload, ObjectPayloadFamily, WeakRefHeader, WeakRefKind, NativeFunctionId, BuiltinFamily }
 import js_gc { HeapHooks, Tracer }
 import js_gc as gc
@@ -18,10 +18,49 @@ import js_runtime_jobs as jobs
 import js_map_storage { nonnull }
 import js_proxy_core as core
 import js_class_data as classes
+import silk.num.usize
+import js_heap_snapshot_graph { Graph, Strength }
 
 struct WeakData { header: WeakRefHeader, target: ValueBits }
-struct RegistryData { header: WeakRefHeader, first: ?*mut HeapHeader, last: ?*mut HeapHeader, realm: *mut HeapHeader, callback: Value }
-struct Record { previous: ?*mut HeapHeader, next: ?*mut HeapHeader, target: ValueBits, held: Value, token: ValueBits }
+struct RegistryData { header: WeakRefHeader, first: Option<RecordRef>, last: Option<RecordRef>, realm: *mut HeapHeader, callback: Value }
+struct Record { previous: Option<RecordRef>, next: Option<RecordRef>, target: ValueBits, held: Value, token: ValueBits }
+/// A record on a registry's list. It is live until `remove` unlinks and frees it.
+struct RecordRef { cell: CellRef<Record> }
+impl Copy for RecordRef {}
+impl RecordRef {
+  fn next(self: RecordRef) -> Option<RecordRef> { let a = () return self.cell.get(&a).next }
+  fn setNext(self: RecordRef, next: Option<RecordRef>) -> () { let mut a = () let entry = self.cell.getMut(&mut a) entry.next = next }
+  fn setPrevious(self: RecordRef, previous: Option<RecordRef>) -> () { let mut a = () let entry = self.cell.getMut(&mut a) entry.previous = previous }
+}
+// The caller proves `node` is a live FinalizationRegistry record list.
+unsafe fn registryAt(node: *mut HeapHeader) -> CellRef<RegistryData> { return unsafe CellRef<RegistryData>.of(node) }
+
+/// Weak targets/tokens remain weak; held values, callback and realm stay strong.
+pub unsafe effect fn heapSnapshot(graph: &mut Graph, owner: usize, reference: *mut HeapHeader,
+  registry: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  let anchor = ()
+  if !registry {
+    let data = unsafe HeapCell.payload<WeakData, ()>(&anchor, reference)
+    run unsafe graph.value(owner, data.target, b"target", 0, Strength.Weak, usize.MAX)
+    return
+  }
+  let data = unsafe HeapCell.payload<RegistryData, ()>(&anchor, reference)
+  run unsafe graph.edge(owner, data.realm, b"realm", 0, Strength.Strong, usize.MAX)
+  run unsafe graph.value(owner, data.callback.view(), b"callback", 0, Strength.Strong, usize.MAX)
+  let mut cursor = data.first drop data
+  let mut index: usize = 0
+  while true {
+    let entry = match cursor { Option<RecordRef>.Some { value } => value _ => { break } }
+    let node = run unsafe graph.node(entry.cell.header())
+    run unsafe graph.edge(owner, entry.cell.header(), b"registration", index, Strength.Strong, usize.MAX)
+    let record = entry.cell.get(&anchor)
+    cursor = record.next
+    run unsafe graph.value(node, record.target, b"target", 0, Strength.Weak, usize.MAX)
+    run unsafe graph.value(node, record.token, b"token", 0, Strength.Weak, usize.MAX)
+    run unsafe graph.value(node, record.held.view(), b"held", 0, Strength.Strong, usize.MAX)
+    index = index + 1
+  }
+}
 pub const JOB: u32 = 3
 pub const WEAK_FINALIZER: u32 = 2
 pub const REGISTRY_FINALIZER: u32 = 4
@@ -47,56 +86,57 @@ pub unsafe fn state(value: ValueBits, registry: bool) -> ?*mut HeapHeader {
 /// Whether `value` can be a WeakRef target or an unregister token: an object or a non-registered symbol.
 pub fn isWeakTarget<'a>(value: ValueRef<'a>) -> bool { return unsafe gc.isWeakTarget(value.view()) }
 /// A lent view of a WeakRef's record, valid while the WeakRef object lives.
-pub struct Weak<'a> { node: *mut HeapHeader }
+pub struct Weak<'a> { node: CellRef<WeakData> }
 impl<'a> Copy for Weak<'a> {}
 impl<'a> Weak<'a> {
   /// The record `object` owns, or none when it is not a WeakRef.
   pub fn find(object: ValueRef<'a>) -> Option<Weak<'a>> {
     return match Pointer.nonNullMut<HeapHeader>(unsafe state(object.view(), false)) {
-      Option<*mut HeapHeader>.Some { value } => Option<Weak<'a>>.Some { value: Weak<'a> { node: value } }
+      Option<*mut HeapHeader>.Some { value } => Option<Weak<'a>>.Some { value: Weak<'a> { node: unsafe CellRef<WeakData>.of(value) } }
       _ => Option<Weak<'a>>.None
     }
   }
   /// A new owner of the target while it is alive, else undefined.
   pub fn deref(self: Weak<'a>) -> Value {
-    let a = () let data = unsafe HeapCell.payload<WeakData, ()>(&a, self.node) let target = data.target drop data
+    let a = () let data = self.node.get(&a) let target = data.target drop data
     if unsafe gc.isWeakLive(target) { return unsafe Value.retain(target) }
     return Value.immediate(ValueBits.Undefined)
   }
 }
 /// A lent view of a FinalizationRegistry's records, valid while the registry object lives.
-pub struct Registry<'a> { node: *mut HeapHeader }
+pub struct Registry<'a> { node: CellRef<RegistryData> }
 impl<'a> Copy for Registry<'a> {}
 impl<'a> Registry<'a> {
   /// The records `object` owns, or none when it is not a FinalizationRegistry.
   pub fn find(object: ValueRef<'a>) -> Option<Registry<'a>> {
     return match Pointer.nonNullMut<HeapHeader>(unsafe state(object.view(), true)) {
-      Option<*mut HeapHeader>.Some { value } => Option<Registry<'a>>.Some { value: Registry<'a> { node: value } }
+      Option<*mut HeapHeader>.Some { value } => Option<Registry<'a>>.Some { value: Registry<'a> { node: unsafe CellRef<RegistryData>.of(value) } }
       _ => Option<Registry<'a>>.None
     }
   }
   /// Adds a record. `target` must be a weak target and `token` one or undefined; the
   /// weak counts trap otherwise.
   pub effect fn register<'b>(self: Registry<'a>, target: ValueRef<'b>, held: ValueRef<'b>, token: ValueRef<'b>) -> () ! OutOfMemoryError ? &mut Allocator {
-    let record = run HeapCell.allocate(HeapKind.Auxiliary, Record { previous: Pointer.null<HeapHeader>(), next: Pointer.null<HeapHeader>(), target: ValueBits.Undefined, held: held.dup(), token: ValueBits.Undefined })
+    let cell = run HeapCell.allocate(HeapKind.Auxiliary, Record { previous: Option<RecordRef>.none(), next: Option<RecordRef>.none(), target: ValueBits.Undefined, held: held.dup(), token: ValueBits.Undefined })
+    let record = RecordRef { cell: unsafe CellRef<Record>.of(cell) }
     let ownedTarget = unsafe gc.retainWeak(target.view()) let ownedToken = unsafe gc.retainWeak(token.view())
-    let mut a = () let data = unsafe HeapCell.payloadMut<RegistryData, ()>(&mut a, self.node)
-    let previous = data.last data.last = record if Pointer.isNull<HeapHeader>(previous) { data.first = record } drop data
-    let entry = unsafe HeapCell.payloadMut<Record, ()>(&mut a, record)
+    let mut a = () let data = self.node.getMut(&mut a)
+    let previous = Intrinsic.replace(data.last, Option<RecordRef>.some(record))
+    if previous.isNone() { data.first = Option<RecordRef>.some(record) } drop data
+    let entry = record.cell.getMut(&mut a)
     entry.previous = previous entry.target = ownedTarget entry.token = ownedToken drop entry
-    if !Pointer.isNull<HeapHeader>(previous) { let p = unsafe HeapCell.payloadMut<Record, ()>(&mut a, unsafe nonnull(previous)) p.next = record }
+    if let Option<RecordRef>.Some { value: before } = previous { before.setNext(Option<RecordRef>.some(record)) }
   }
   /// Removes every record whose token is `token`; true when any was removed.
   pub fn unregister<'r, 'b, H: HeapHooks>(self: Registry<'a>, hooks: &mut H, realm: Realm<'r>, token: ValueRef<'b>) -> bool {
     let rt = realm.runtime()
-    let a = () let data = unsafe HeapCell.payload<RegistryData, ()>(&a, self.node) let mut cursor = data.first drop data
+    let a = () let mut cursor = self.node.get(&a).first
     let mut removed = false
-    while !Pointer.isNull<HeapHeader>(cursor) {
-    let record = unsafe nonnull(cursor) let entry = unsafe HeapCell.payload<Record, ()>(&a, record)
-    cursor = entry.next let stored = entry.token drop entry
-    if unsafe gc.isWeakLive(stored) && unsafe core.sameValue(stored, token.view()) { unsafe remove(&mut hooks, rt, self.node, record) removed = true }
-  }
-  return removed
+    while let Option<RecordRef>.Some { value: record } = cursor {
+      let entry = record.cell.get(&a) cursor = entry.next let stored = entry.token drop entry
+      if unsafe gc.isWeakLive(stored) && unsafe core.sameValue(stored, token.view()) { unsafe remove(&mut hooks, rt, self.node, record) removed = true }
+    }
+    return removed
   }
 }
 pub unsafe effect fn initialize<'a, 'b>(realm: Realm<'a>, object: ValueRef<'b>, input: ValueRef<'b>, registry: bool) -> () ! OutOfMemoryError ? &mut Allocator { let context = realm.context()
@@ -105,7 +145,7 @@ pub unsafe effect fn initialize<'a, 'b>(realm: Realm<'a>, object: ValueRef<'b>, 
   if registry {
     let node = run HeapCell.allocate(HeapKind.Auxiliary, RegistryData {
       header: WeakRefHeader { previous: Pointer.null<WeakRefHeader>(), next: Pointer.null<WeakRefHeader>(), kind: WeakRefKind.FinalizationRegistry, owner: owner },
-      first: Pointer.null<HeapHeader>(), last: Pointer.null<HeapHeader>(), realm: context, callback: input.dup() })
+      first: Option<RecordRef>.none(), last: Option<RecordRef>.none(), realm: context, callback: input.dup() })
     unsafe HeapCell.retain(context)
     let data = unsafe HeapCell.payloadMut<RegistryData, ()>(&mut a, node)
     let weak = Pointer.fromMutRef<WeakRefHeader>(&mut data.header) drop data
@@ -122,24 +162,25 @@ pub unsafe effect fn initialize<'a, 'b>(realm: Realm<'a>, object: ValueRef<'b>, 
     unsafe gc.publishWeak(rt, weak)
   }
 }
-unsafe fn remove<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, node: *mut HeapHeader, record: *mut HeapHeader) -> () {
-  let mut a = () let entry = unsafe HeapCell.payloadMut<Record, ()>(&mut a, record)
+// The caller proves `rt` owns the registry; `record` must be on `node`'s list.
+unsafe fn remove<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, node: CellRef<RegistryData>, record: RecordRef) -> () {
+  let mut a = () let entry = record.cell.getMut(&mut a)
   let previous = entry.previous let next = entry.next let target = entry.target let token = entry.token let held = entry.held.take() drop entry
-  let data = unsafe HeapCell.payloadMut<RegistryData, ()>(&mut a, node)
-  if Pointer.isNull<HeapHeader>(previous) { data.first = next }
-  if Pointer.isNull<HeapHeader>(next) { data.last = previous } drop data
-  if !Pointer.isNull<HeapHeader>(previous) { let p = unsafe HeapCell.payloadMut<Record, ()>(&mut a, unsafe nonnull(previous)) p.next = next }
-  if !Pointer.isNull<HeapHeader>(next) { let p = unsafe HeapCell.payloadMut<Record, ()>(&mut a, unsafe nonnull(next)) p.previous = previous }
+  let data = node.getMut(&mut a)
+  if previous.isNone() { data.first = next }
+  if next.isNone() { data.last = previous } drop data
+  if let Option<RecordRef>.Some { value: before } = previous { before.setNext(next) }
+  if let Option<RecordRef>.Some { value: after } = next { after.setPrevious(previous) }
   unsafe gc.releaseWeak(target) unsafe gc.releaseWeak(token)
-  unsafe HeapCell.destroyEmptied<Record>(record)
+  unsafe HeapCell.destroyEmptied<Record>(record.cell.header())
   unsafe held.release(&mut hooks, rt)
 }
 pub unsafe fn mark(object: *mut HeapHeader, tracer: &mut Tracer) -> () {
   let optional = unsafe storage(object) if Pointer.isNull<HeapHeader>(optional) { return }
-  let a = () let data = unsafe HeapCell.payload<RegistryData, ()>(&a, unsafe nonnull(optional))
+  let a = () let data = (unsafe registryAt(unsafe nonnull(optional))).get(&a)
   let mut cursor = data.first let callback = data.callback.view() let realm = data.realm drop data
-  while !Pointer.isNull<HeapHeader>(cursor) {
-    let entry = unsafe HeapCell.payload<Record, ()>(&a, unsafe nonnull(cursor))
+  while let Option<RecordRef>.Some { value: record } = cursor {
+    let entry = record.cell.get(&a)
     let held = entry.held.view() cursor = entry.next drop entry unsafe tracer.value(held)
   }
   unsafe tracer.value(callback) unsafe tracer.header(realm)
@@ -153,12 +194,11 @@ pub unsafe fn finalize<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, object:
     let weak = Pointer.fromMutRef<WeakRefHeader>(&mut data.header) drop data
     unsafe gc.releaseWeak(target) unsafe gc.unlinkWeak(rt, weak) unsafe HeapCell.destroy<WeakData>(node) return
   }
-  let data = unsafe HeapCell.payloadMut<RegistryData, ()>(&mut a, node)
+  let list = unsafe registryAt(node) let data = list.getMut(&mut a)
   let mut cursor = data.first let callback = data.callback.take() let realm = data.realm
   let weak = Pointer.fromMutRef<WeakRefHeader>(&mut data.header) drop data
-  while !Pointer.isNull<HeapHeader>(cursor) {
-    let record = unsafe nonnull(cursor) let entry = unsafe HeapCell.payload<Record, ()>(&a, record) cursor = entry.next drop entry
-    unsafe remove(&mut hooks, rt, node, record)
+  while let Option<RecordRef>.Some { value: record } = cursor {
+    cursor = record.next() unsafe remove(&mut hooks, rt, list, record)
   }
   unsafe callback.release(&mut hooks, rt) unsafe gc.releaseHeader(&mut hooks, rt, realm)
   unsafe gc.unlinkWeak(rt, weak) unsafe HeapCell.destroyEmptied<RegistryData>(node)
@@ -173,10 +213,10 @@ pub unsafe effect fn sweepWeak<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader,
     if unsafe gc.isWeakLive(target) { return }
     data.target = ValueBits.Undefined drop data unsafe gc.releaseWeak(target) return
   }
-  let data = unsafe HeapCell.payload<RegistryData, ()>(&a, node)
+  let list = unsafe registryAt(node) let data = list.get(&a)
   let mut cursor = data.first let callback = data.callback.view() let realm = data.realm drop data
-  while !Pointer.isNull<HeapHeader>(cursor) {
-    let record = unsafe nonnull(cursor) let entry = unsafe HeapCell.payloadMut<Record, ()>(&mut a, record)
+  while let Option<RecordRef>.Some { value: record } = cursor {
+    let entry = record.cell.getMut(&mut a)
     cursor = entry.next let token = entry.token
     let clearToken = !unsafe gc.isWeakLive(token)
     if clearToken { entry.token = ValueBits.Undefined }
@@ -187,7 +227,7 @@ pub unsafe effect fn sweepWeak<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader,
       // provider. Failure leaves the exception untouched, but still consumes entry.
       let enqueued = run Effect.result(unsafe jobs.enqueueJob(realm, jobId(), &[callback, held]))
       match move enqueued { Result<(), OutOfMemoryError>.Success { .. } => () Result<(), OutOfMemoryError>.Failure { error } => { drop error } }
-      unsafe remove(&mut hooks, rt, node, record)
+      unsafe remove(&mut hooks, rt, list, record)
     }
   }
 }

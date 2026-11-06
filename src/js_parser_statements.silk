@@ -3,13 +3,12 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.result { Result }
-import silk.mem.pointer { Pointer }
 import silk.num.i32
 import silk.num.u32
 import silk.num.usize
-import js_heap { HeapCell, HeapHeader }
-import js_core_types { RuntimeState, FunctionKind, VariableKind, JS_MODE_STRICT }
-import js_compiler_types { FunctionDef, FunctionId, FunctionTree, linked, BlockEnv, CompilerError, ParseFunctionKind, ParseExportKind, VariableDefinition }
+import js_heap { HeapCell }
+import js_core_types { RuntimeState, FunctionKind, VariableKind, OwnedAtom }
+import js_compiler_types { BlockEnv, CompilerError, ParseFunctionKind, ParseExportKind, VariableDefinition }
 import js_compiler_state as state
 import js_compiler_emit as emit
 import js_parser_core { Parser, ParserStackOverflow, PF_IN_ACCEPTED, PF_POSTFIX_CALL }
@@ -17,7 +16,6 @@ import js_parser_diagnostics { SyntaxError }
 import js_parser_host { ModuleAttributeHooks }
 import js_exceptions { JsException }
 import js_parser_support as e
-import js_parser_support { OwnedAtom }
 import js_parser_expressions as expressions
 import js_parser_functions as functions
 import js_parser_literals as literals
@@ -40,6 +38,16 @@ pub const DECL_MASK_FUNC_WITH_LABEL: i32 = 2
 pub const DECL_MASK_USING: i32 = 4
 pub const DECL_MASK_OTHER: i32 = 8
 pub const DECL_MASK_ALL: i32 = 15
+
+// A source statement owns one evaluation boundary, not every expression point.
+// FunctionDef keeps this local to the currently parsed function (including arrows).
+pub effect fn startStatement<'src>(s: &mut Parser<'src>, sourcePosition: u32) -> () ? &mut Allocator {
+  let fd = s.function()
+  if fd.debuggerMetadata.enabled {
+    run emit.emitSourcePosition(&mut fd, sourcePosition)
+    fd.pendingStatementStart = true
+  }
+}
 
 fn scope<'src>(s: &Parser<'src>) -> i32 {
   let fd = s.functionView()
@@ -253,17 +261,27 @@ pub effect fn parseBlock<'src, H: HeapHooks + ModuleAttributeHooks>(s: &mut Pars
 }
 effect fn addUsingMethodVar<'src>(s: &mut Parser<'src>, name: u32) -> i32
   ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  return run addUsingHiddenVar(&mut s, name, b"<dispose>", VariableKind.UsingMethod)
+}
+// A module-level `using` binding is a module variable so it can be exported;
+// its disposal reads this hidden local copy (and the method slot after it).
+fn moduleTopLevel<'src>(s: &Parser<'src>) -> bool {
+  let fd = s.functionView()
+  return fd.isEval && fd.evalType == 1 && fd.scopeLevel == fd.bodyScope
+}
+effect fn addUsingHiddenVar<'src>(s: &mut Parser<'src>, name: u32, prefix: &[u8], kind: VariableKind) -> i32
+  ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
   let mut runtimeAnchor = () let mut functionAnchor = ()
   let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, s.runtimeCell())
   let nameString = StringOwner.adopt(run rt.atoms.toValue(name, true))
   let mut builder = StringBuilder.make()
-  run builder.reserve(9 + Strings.length(nameString.get()), Strings.isWide(nameString.get()))
-  run builder.appendLatin1(b"<dispose>")
+  run builder.reserve(prefix.length + Strings.length(nameString.get()), Strings.isWide(nameString.get()))
+  run builder.appendLatin1(prefix)
   run builder.append(nameString.get())
   let mut text = StringOwner.adopt(run builder.finish())
   let hidden = unsafe OwnedAtom.adopt(s.runtimeCell(), run rt.atoms.internOwned(text.take()))
   let fd = s.function()
-  let index = run state.addScopeVar(&mut fd, &mut rt.atoms, hidden.get(), VariableKind.UsingMethod)
+  let index = run state.addScopeVar(&mut fd, &mut rt.atoms, hidden.get(), kind)
   let mut variable = fd.vars.get(i32.toUsize(index))
   variable.isLexical = true variable.isConst = true
   fd.vars.set(i32.toUsize(index), variable)
@@ -292,12 +310,17 @@ effect fn parseVariables<'src, H: HeapHooks + ModuleAttributeHooks>(s: &mut Pars
   while true {
     if s.token.kind == tok.TOK_IDENT {
       if e.tokenReserved(&s.*) { return run s.reserved<()>() }
-      let name = OwnedAtom.duplicateToken(&mut s)
+      let name = e.ownedToken(&mut s)
       if name.get() == atoms.JS_ATOM_let && (token == tok.TOK_LET || token == tok.TOK_CONST || token == tok.TOK_USING) {
         return run s.syntax<()>(b"'let' is not a valid lexical identifier")
       }
       run s.advance()
-      run e.defineVar(&mut s, name.get(), token)
+      let moduleUsing = token == tok.TOK_USING && moduleTopLevel(&s.*)
+      let mut resourceIndex: i32 = -1
+      if moduleUsing {
+        run e.defineVar(&mut s, name.get(), tok.TOK_CONST)
+        resourceIndex = run addUsingHiddenVar(&mut s, name.get(), b"<using>", VariableKind.Using)
+      } else { run e.defineVar(&mut s, name.get(), token) }
       let mut methodIndex: i32 = -1
       if token == tok.TOK_USING { methodIndex = run addUsingMethodVar(&mut s, name.get()) }
       if exported { let exportedIndex = run modules.addExport(&mut s, name.get(), name.get(), ExportKind.Local) }
@@ -324,6 +347,11 @@ effect fn parseVariables<'src, H: HeapHooks + ModuleAttributeHooks>(s: &mut Pars
             run e.emitU8(&mut s, asyncByte)
             run e.emitOp(&mut s, op.OP_put_loc)
             run e.emitU16(&mut s, i32.toU16(methodIndex))
+            if moduleUsing {
+              run e.emitOp(&mut s, op.OP_dup)
+              run e.emitOp(&mut s, op.OP_put_loc)
+              run e.emitU16(&mut s, i32.toU16(resourceIndex))
+            }
           }
           run e.emitSourcePosition(&mut s, usize.toU32(source))
           let mut opcode = op.OP_scope_put_var
@@ -422,6 +450,9 @@ effect fn moveLoopChunk<'src>(s: &mut Parser<'src>, start: usize, end: usize, fi
   if fd.bytecodeError { fail OutOfMemoryError {} }
   let offset = fd.bytecode.length() - start
   run fd.bytecode.appendSelf(start, end - start)
+  if fd.debuggerMetadata.enabled {
+    run fd.debuggerMetadata.moveRange(usize.toU32(start), usize.toU32(end), usize.toU32(offset))
+  }
   let mut position = start
   while position < end { fd.bytecode.set(position, op.OP_nop) position = position + 1 }
   fd.lastOpcodePosition = usize.toI32(fd.bytecode.length() - 5)
@@ -470,7 +501,7 @@ effect fn parseForInOf<'src, H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser
       let initialized = run expressions.parseDestructuring(&mut s, &mut hooks, memory, token, false, true, -1, false, false)
       hasDestructuring = true
     } else {
-      name = OwnedAtom.duplicateToken(&mut s)
+      name = e.ownedToken(&mut s)
       if name.get() == atoms.JS_ATOM_let && (token == tok.TOK_LET || token == tok.TOK_CONST || token == tok.TOK_USING) {
         return run s.syntax<()>(b"'let' is not a valid lexical identifier")
       }
@@ -514,6 +545,8 @@ effect fn parseForInOf<'src, H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser
     let source = s.token.start
     hasInitializer = true
     run s.advance()
+    let initializerPosition = usize.toU32(s.token.start)
+    run startStatement(&mut s, initializerPosition)
     run expressions.parseAssignment(&mut s, &mut hooks, memory, 0)
     run setObjectName(&mut s, name.get())
     run e.emitSourcePosition(&mut s, usize.toU32(source))
@@ -536,6 +569,8 @@ effect fn parseForInOf<'src, H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser
     }
   } else { return run s.syntax<()>(b"expected 'of' or 'in' in for control expression") }
   run s.advance()
+  let iterablePosition = usize.toU32(s.token.start)
+  run startStatement(&mut s, iterablePosition)
   if isForOf { run expressions.parseAssignment(&mut s, &mut hooks, memory, PF_IN_ACCEPTED) }
   else { run expressions.parseExpression(&mut s, &mut hooks, memory, PF_IN_ACCEPTED) }
   let level = scope(&s.*)
@@ -610,8 +645,8 @@ effect fn parseFor<'src, H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'sr
   run setEvalReturnUndefined(&mut s)
   let mut bits: u32 = 0 let mut asyncIteration = false let mut awaitUsing = false
   if s.token.kind == 40 {
-    let scan = run s.skipParens(false)
-    bits = scan.bits
+    if run s.classicForHead() { bits = SKIP_HAS_SEMI }
+    else { let scan = run s.skipParens(false) bits = scan.bits }
   } else if s.token.kind == tok.TOK_AWAIT {
     if !asynchronous(&s.*) { return run s.syntax<()>(b"for await is only valid in asynchronous functions") }
     asyncIteration = true
@@ -627,6 +662,8 @@ effect fn parseFor<'src, H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'sr
   let entry = run pushBreakEntry(&mut s, labelName, labelBreak, labelContinue, 0)
   let mut token = s.token.kind
   if token != 59 {
+    let forInitializerPosition = usize.toU32(s.token.start)
+    run startStatement(&mut s, forInitializerPosition)
     if run isLet(&mut s, DECL_MASK_OTHER) { token = tok.TOK_LET }
     if token == tok.TOK_AWAIT {
       if run checkAwaitUsing(&mut s) { token = tok.TOK_USING awaitUsing = true markAwait(&mut s) }
@@ -647,6 +684,8 @@ effect fn parseFor<'src, H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'sr
   if s.token.kind == 59 { labelTest = labelBody }
   else {
     run label(&mut s, labelTest)
+    let forTestPosition = usize.toU32(s.token.start)
+    run startStatement(&mut s, forTestPosition)
     run expressions.parseExpression(&mut s, &mut hooks, memory, PF_IN_ACCEPTED)
     run jump(&mut s, op.OP_if_false, labelBreak)
   }
@@ -661,6 +700,8 @@ effect fn parseFor<'src, H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'sr
     run jump(&mut s, op.OP_goto, labelBody)
     positionContinue = bytecodeLength(&s.*)
     run label(&mut s, labelContinue)
+    let forUpdatePosition = usize.toU32(s.token.start)
+    run startStatement(&mut s, forUpdatePosition)
     run expressions.parseExpression(&mut s, &mut hooks, memory, PF_IN_ACCEPTED)
     run e.emitOp(&mut s, op.OP_drop)
     if labelTest != labelBody { run jump(&mut s, op.OP_goto, labelTest) }
@@ -681,6 +722,8 @@ effect fn parseSwitch<'src, H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<
   ! OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException ? &mut Allocator {
   run s.advance()
   run setEvalReturnUndefined(&mut s)
+  let switchExpressionPosition = usize.toU32(s.token.start)
+  run startStatement(&mut s, switchExpressionPosition)
   run parseParenthesized(&mut s, &mut hooks, memory)
   let localScope = run e.pushScope(&mut s)
   let labelBreak = run e.newLabel(&mut s)
@@ -768,6 +811,9 @@ effect fn parseTry<'src, H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'sr
     run s.advance()
     let variableScope = run e.pushScope(&mut s)
     run label(&mut s, labelCatch)
+    let catchFunction = s.function()
+    if catchFunction.debuggerMetadata.enabled { run catchFunction.debuggerMetadata.catchTargets.append(i32.toU32(labelCatch)) }
+    drop catchFunction
     if s.token.kind == 123 { run e.emitOp(&mut s, op.OP_drop) }
     else {
       run s.expect(40)
@@ -775,7 +821,7 @@ effect fn parseTry<'src, H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'sr
         if s.token.kind != 91 && s.token.kind != 123 { return run s.syntax<()>(b"identifier expected") }
         let initialized = run expressions.parseDestructuring(&mut s, &mut hooks, memory, tok.TOK_LET, false, true, -1, true, false)
       } else {
-        let name = OwnedAtom.duplicateToken(&mut s)
+        let name = e.ownedToken(&mut s)
         run s.advance()
         run e.defineVar(&mut s, name.get(), tok.TOK_CATCH)
         run e.emitOp(&mut s, op.OP_scope_put_var)
@@ -837,9 +883,17 @@ effect fn parseTry<'src, H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'sr
 pub effect fn parseStatement<'src, H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'src>, hooks: &mut H, memory: &AllocationObserver,
   declarationMask: i32) -> ()
   ! OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException ? &mut Allocator {
+  run parseStatementBody(&mut s, &mut hooks, memory, declarationMask)
+  // A declaration without runtime initialization must not mark enclosing cleanup.
+  let fd = s.function()
+  fd.pendingStatementStart = false
+}
+effect fn parseStatementBody<'src, H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'src>, hooks: &mut H, memory: &AllocationObserver,
+  declarationMask: i32) -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException ? &mut Allocator {
   let mut name = unsafe OwnedAtom.adopt(s.runtimeCell(), 0)
   if isLabel(&s.*) {
-    name = OwnedAtom.duplicateToken(&mut s)
+    name = e.ownedToken(&mut s)
     let mut index = topBlock(&s.*)
     while index >= 0 {
       let block = blockAt(&s.*, index)
@@ -863,6 +917,13 @@ pub effect fn parseStatement<'src, H: HeapHooks + ModuleAttributeHooks>(s: &mut 
   }
   let mut token = s.token.kind
   if token == 123 { return run parseBlock(&mut s, &mut hooks, memory) }
+  let statementSource = usize.toU32(s.token.start)
+  let declaration = token == tok.TOK_FUNCTION
+    || (token == tok.TOK_IDENT && e.pseudoKeyword(&s.*, atoms.JS_ATOM_async) && s.peek(true) == tok.TOK_FUNCTION)
+  if !declaration && token != 59 && token != tok.TOK_IF && token != tok.TOK_WHILE
+    && token != tok.TOK_DO && token != tok.TOK_FOR && token != tok.TOK_SWITCH && token != tok.TOK_TRY {
+    run startStatement(&mut s, statementSource)
+  }
   if token == tok.TOK_RETURN {
     let anchor = () let fd = s.functionView()
     let isEval = fd.isEval let staticInitializer = fd.functionType == ParseFunctionKind.ClassStaticInit
@@ -911,6 +972,7 @@ pub effect fn parseStatement<'src, H: HeapHooks + ModuleAttributeHooks>(s: &mut 
     run s.advance()
     let localScope = run e.pushScope(&mut s)
     run setEvalReturnUndefined(&mut s)
+    run startStatement(&mut s, statementSource)
     run parseParenthesized(&mut s, &mut hooks, memory)
     let mut labelEnd = run e.emitGoto(&mut s, op.OP_if_false, -1)
     let mut mask: i32 = 0 if !e.strict(&s.*) { mask = DECL_MASK_FUNC }
@@ -935,6 +997,7 @@ pub effect fn parseStatement<'src, H: HeapHooks + ModuleAttributeHooks>(s: &mut 
     if token == tok.TOK_WHILE {
       run setEvalReturnUndefined(&mut s)
       run label(&mut s, labelContinue)
+      run startStatement(&mut s, statementSource)
       run parseParenthesized(&mut s, &mut hooks, memory)
       run jump(&mut s, op.OP_if_false, labelBreak)
       run parseStatement(&mut s, &mut hooks, memory, 0)
@@ -944,6 +1007,8 @@ pub effect fn parseStatement<'src, H: HeapHooks + ModuleAttributeHooks>(s: &mut 
       run setEvalReturnUndefined(&mut s)
       run parseStatement(&mut s, &mut hooks, memory, 0)
       run label(&mut s, labelContinue)
+      let doTestPosition = usize.toU32(s.token.start)
+      run startStatement(&mut s, doTestPosition)
       run s.expect(tok.TOK_WHILE)
       run parseParenthesized(&mut s, &mut hooks, memory)
       if s.token.kind == 59 { run s.advance() }
@@ -1006,7 +1071,25 @@ pub effect fn parseStatement<'src, H: HeapHooks + ModuleAttributeHooks>(s: &mut 
     if (declarationMask & DECL_MASK_OTHER) == 0 { return run s.syntax<()>(b"class declarations can't appear in single-statement context") }
     return run literals.parseClass(&mut s, &mut hooks, memory, false, ParseExportKind.None)
   }
-  if token == tok.TOK_DEBUGGER { run s.advance() return run s.semicolon() }
+  if token == tok.TOK_DEBUGGER {
+    let view = s.functionView()
+    let enabled = view.debuggerMetadata.enabled drop view
+    if enabled {
+      let sourcePosition = usize.toU32(s.token.start)
+      run e.emitSourcePosition(&mut s, sourcePosition)
+      run e.emitOp(&mut s, op.OP_nop)
+      let fd = s.function()
+      if !fd.bytecodeError {
+        let index = fd.debuggerMetadata.locations.length() - 1
+        let mut location = fd.debuggerMetadata.locations.get(index)
+        location.debuggerStatement = true fd.debuggerMetadata.locations.set(index, location)
+      }
+    }
+    run s.advance() return run s.semicolon()
+  }
+  if token == tok.TOK_EXPORT && !s.lexer.context.module {
+    return run s.moduleSyntax<()>(b"export declaration only valid in module code")
+  }
   if token == tok.TOK_ENUM || token == tok.TOK_EXPORT || token == tok.TOK_EXTENDS {
     let atom = e.tokenAtom(&s.*)
     return run s.syntaxAtom<()>(b"unsupported keyword: ", atom, b"")

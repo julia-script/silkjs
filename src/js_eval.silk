@@ -1,9 +1,10 @@
 //! JS_Eval*, direct/indirect eval and execution of owned compiled values.
 //! Source bytes need no terminator in Silk. The parser still observes embedded
 //! NUL and shebang semantics; filename is an ordinary borrowed UTF-8 name.
+import js_pointers as pointers
 import silk.num.u8
-import thin_list { ThinList, BoxList }
-import js_realm { Realm, Arguments, lendRealm }
+import thin_list { BoxList }
+import js_realm { Realm, Arguments }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
@@ -12,8 +13,8 @@ import silk.mem.pointer { Pointer }
 import silk.collections.list { List }
 import js_heap { HeapCell, HeapHeader, CellRef }
 import js_value { ValueBits }
-import js_owned_value { ValueRef, lendBits, immediateRef, lendFor }
-import js_core_types { RuntimeState, ContextState, ObjectData, ObjectPayload, StackFrame, FrameSlots, JS_MODE_BACKTRACE_BARRIER, NativeErrorKind, ModuleDef }
+import js_owned_value { Value, ValueRef, lendBits, lendFor }
+import js_core_types { ObjectData, ObjectPayload, StackFrame, FrameSlots, JS_MODE_BACKTRACE_BARRIER, NativeErrorKind, ModuleDef }
 import js_gc { HeapHooks }
 import js_gc as gc
 import js_runtime as runtime
@@ -39,8 +40,8 @@ import js_eval_compile as compile
 import js_eval_errors as errors
 import js_vm as vm
 import runtime_memory { AllocationObserver }
+import js_invariant { invariant }
 
-fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
 fn global<'a>(realm: Realm<'a>) -> ValueBits { let context = realm.context()
   let anchor = () let data = realm.state(&anchor) return data.globalObject
 }
@@ -73,11 +74,11 @@ pub unsafe effect fn execute<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyH
         Option<*mut StackFrame>.Some { value } => {
           let anchor = ()
           let inherited = unsafe Pointer.borrow<(), BoxList<?*mut HeapHeader>>(&anchor, unsafe captures(value))
-          function = run unsafe closures.closure(&mut hooks, memory, realm, compiled, inherited.asSlice(), value, true)
+          function = run unsafe closures.closure(&mut hooks, memory, realm, compiled, inherited.asSlice(), value, true, 0)
         }
         Option<*mut StackFrame>.None => {
           let empty: [?*mut HeapHeader; 0] = []
-          function = run unsafe closures.closure(&mut hooks, memory, realm, compiled, &empty, frame, true)
+          function = run unsafe closures.closure(&mut hooks, memory, realm, compiled, &empty, frame, true, 0)
         }
       }
       let mut empty = ValueBits.Undefined let argv = FrameSlots { data: Pointer.fromMutRef<ValueBits>(&mut empty), count: 0 }
@@ -86,9 +87,10 @@ pub unsafe effect fn execute<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyH
       return match move returned { Result<ValueBits, JsException>.Success { value } => value Result<ValueBits, JsException>.Failure { error } => { fail move error } }
     }
     ValueBits.Module { reference } => {
-      // The context's loaded-list reference remains after consuming this value.
-      unsafe gc.release(&mut hooks, rt, compiled)
+      // Detached embedding modules have no loaded-list root. Keep the consumed
+      // value alive until linking/evaluation has installed its promise callbacks.
       let evaluated = run Effect.result(executeModule(&mut hooks, memory, realm, unsafe CellRef<ModuleDef>.of(reference)))
+      unsafe gc.release(&mut hooks, rt, compiled)
       return match move evaluated {
         Result<ValueBits, OutOfMemoryError | StringLengthError | JsException>.Success { value } => value
         Result<ValueBits, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => run errors.materialize<ValueBits, H>(&mut hooks, realm, move error)
@@ -101,8 +103,9 @@ pub unsafe effect fn execute<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyH
   }
 }
 pub effect fn evaluateFunction<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks + PromiseHooks + ModuleHostHooks>(hooks: &mut H,
-  memory: &AllocationObserver, realm: Realm<'a>, compiled: ValueRef<'b>) -> ValueBits ! JsException ? &mut Allocator {
-  return run unsafe execute(&mut hooks, memory, realm, compiled.view(), unsafe lendFor(global(realm)), Pointer.null<StackFrame>())
+  memory: &AllocationObserver, realm: Realm<'a>, compiled: Value) -> Value ! JsException ? &mut Allocator {
+  // execute consumes the compiled function or module, as JS_EvalFunction does.
+  return unsafe Value.adoptBits(run unsafe execute(&mut hooks, memory, realm, compiled.intoBits(), unsafe lendFor(global(realm)), Pointer.null<StackFrame>()))
 }
 effect fn sourceBody<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks + PromiseHooks + ModuleHostHooks + ModuleAttributeHooks>(hooks: &mut H,
   memory: &AllocationObserver, realm: Realm<'a>, receiver: ValueRef<'b>, source: &[u8], sourceText: ValueBits, filename: &[u8],
@@ -117,27 +120,28 @@ pub effect fn evaluateSource<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyH
   memory: &AllocationObserver, realm: Realm<'a>, receiver: ValueRef<'b>, source: &[u8], sourceText: ValueBits, filename: &[u8],
   flags: i32, scope: i32) -> ValueBits ! JsException ? &mut Allocator { let context = realm.context()
   let enabledAnchor = () let contextState = realm.state(&enabledAnchor)
-  let enabled = contextState.evalEnabled drop contextState
+  let enabled = contextState.evalEnabled let allowed = contextState.codeGenerationAllowed drop contextState
+  if !allowed { return run hooks.throwError(realm, NativeErrorKind.Eval, b"Code generation from strings disallowed for this context") }
   if !enabled { return run hooks.throwError(realm, NativeErrorKind.Type, b"eval is not supported") }
   let rt = realm.runtime() let mut anchor = ()
   let state = realm.runtimeState(&anchor) let frame = state.currentStackFrame drop state
   let mut saved: u32 = 0
   let barrier = (flags & compile.FLAG_BACKTRACE_BARRIER) != 0 && !Pointer.isNull<StackFrame>(frame)
   if barrier {
-    let pointer = unsafe Intrinsic.pointerRequalify<?*mut StackFrame, *mut StackFrame>(frame)
+    let pointer = pointers.present(frame)
     let sf = unsafe Pointer.borrowMut<(), StackFrame>(&mut anchor, pointer)
     saved = sf.mode sf.mode = sf.mode | u8.toU32(JS_MODE_BACKTRACE_BARRIER)
   }
   let evaluated = run Effect.result(sourceBody(&mut hooks, memory, realm, receiver, source, sourceText, filename, flags, scope))
   if barrier {
-    let pointer = unsafe Intrinsic.pointerRequalify<?*mut StackFrame, *mut StackFrame>(frame)
+    let pointer = pointers.present(frame)
     let sf = unsafe Pointer.borrowMut<(), StackFrame>(&mut anchor, pointer) sf.mode = saved
   }
   return match move evaluated { Result<ValueBits, JsException>.Success { value } => value Result<ValueBits, JsException>.Failure { error } => { fail move error } }
 }
 pub effect fn evaluate<'a, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks + PromiseHooks + ModuleHostHooks + ModuleAttributeHooks>(hooks: &mut H,
-  memory: &AllocationObserver, realm: Realm<'a>, source: &[u8], filename: &[u8], flags: i32) -> ValueBits ! JsException ? &mut Allocator {
-  return run evaluateSource(&mut hooks, memory, realm, unsafe lendFor(global(realm)), source, ValueBits.Undefined, filename, flags, -1)
+  memory: &AllocationObserver, realm: Realm<'a>, source: &[u8], filename: &[u8], flags: i32) -> Value ! JsException ? &mut Allocator {
+  return unsafe Value.adoptBits(run evaluateSource(&mut hooks, memory, realm, unsafe lendFor(global(realm)), source, ValueBits.Undefined, filename, flags, -1))
 }
 pub effect fn evaluateObject<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks + PromiseHooks + ModuleHostHooks + ModuleAttributeHooks>(hooks: &mut H,
   memory: &AllocationObserver, realm: Realm<'a>, receiver: ValueRef<'b>, input: ValueRef<'b>,

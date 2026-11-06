@@ -1,0 +1,290 @@
+//! Abstract operand stacks for decoded bytecode. Internal VM markers are not JS
+//! values: track their provenance separately from ordinary stack height.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.num.i64
+import byte_buffer { readU16, readU32 }
+import js_opcode_data as op
+
+pub struct ValidationError { pub pc: usize }
+impl Copy for ValidationError {}
+pub effect fn require(ok: bool, pc: usize) -> () ! ValidationError {
+  if !ok { fail ValidationError { pc: pc } }
+}
+pub fn signed32(value: u32) -> i64 {
+  if value >= 0x80000000 { return u32.toI64(value) - 4294967296 }
+  return u32.toI64(value)
+}
+pub fn target(code: &[u8], pc: usize, format: u8) -> i64 {
+  let mut displacement: i64 = 0 let mut origin = pc + 1
+  if format == op.OP_FMT_label8 {
+    displacement = u8.toI64(code[origin])
+    if displacement >= 128 { displacement = displacement - 256 }
+  } else if format == op.OP_FMT_label16 {
+    displacement = u16.toI64(readU16(code, origin))
+    if displacement >= 32768 { displacement = displacement - 65536 }
+  } else {
+    if format == op.OP_FMT_atom_label_u8 { origin = pc + 5 }
+    displacement = signed32(readU32(code, origin))
+  }
+  return usize.toI64(origin) + displacement
+}
+pub fn branch(format: u8) -> bool {
+  return format == op.OP_FMT_label || format == op.OP_FMT_label8
+    || format == op.OP_FMT_label16 || format == op.OP_FMT_atom_label_u8
+}
+
+// Zero means an ordinary JS value. No value available to JavaScript can forge
+// CATCH, ITERATOR or RETURN. Enumeration objects also require producer evidence.
+const CATCH: u8 = 1
+const ITERATOR: u8 = 2
+const RETURN: u8 = 3
+const ENUMERATION: u8 = 4
+struct Marker { parent: usize, depth: usize, kind: u8, data: usize, handler: usize }
+impl Copy for Marker {}
+struct Stack { height: usize, marker: usize }
+impl Copy for Stack {}
+struct Graph {
+  markers: List<Marker>, buckets: List<usize>, states: List<Stack>,
+  seen: List<bool>, pending: List<usize>, maximum: usize
+}
+fn hash(marker: Marker) -> u64 {
+  let mut value = usize.toU64(marker.parent)
+  value = u64.wrappingMultiply(value ^ usize.toU64(marker.depth), 0x9e3779b97f4a7c15)
+  value = u64.wrappingMultiply(value ^ usize.toU64(marker.data), 0xbf58476d1ce4e5b9)
+  value = u64.wrappingMultiply(value ^ u8.toU64(marker.kind), 0x94d049bb133111eb)
+  return value ^ u64.shiftRight(value, 31)
+}
+fn equal(a: Marker, b: Marker) -> bool {
+  return a.parent == b.parent && a.depth == b.depth && a.kind == b.kind && a.data == b.data
+}
+impl Graph {
+  effect fn grow(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut size = self.buckets.length() * 2 if size == 0 { size = 32 }
+    let mut buckets = List<usize>.make() run buckets.reserveExact(size)
+    let mut i: usize = 0 while i < size { run buckets.append(0) i = i + 1 }
+    i = 1
+    while i < self.markers.length() {
+      let mut slot = u64.toUsize(hash(self.markers.get(i)) % usize.toU64(size))
+      while buckets.get(slot) != 0 { slot = (slot + 1) % size }
+      buckets.set(slot, i) i = i + 1
+    }
+    self.buckets = move buckets
+  }
+  effect fn push(self: &mut Self, stack: Stack, kind: u8, data: usize) -> Stack
+    ! OutOfMemoryError | ValidationError ? &mut Allocator {
+    let height = stack.height + 1 run require(height <= self.maximum, data)
+    if kind == 0 { return Stack { height: height, marker: stack.marker } }
+    if kind == CATCH {
+      let handler = self.states.get(data)
+      run require(handler.height == height && handler.marker == stack.marker, data)
+    } else if kind == ITERATOR {
+      run require(height >= 3, data)
+      if stack.marker != 0 { run require(self.markers.get(stack.marker).depth <= height - 3, data) }
+    }
+    if self.markers.length() * 2 >= self.buckets.length() { run self.grow() }
+    let mut handler = stack.marker
+    if handler != 0 {
+      let parent = self.markers.get(handler)
+      if parent.kind != CATCH && parent.kind != ITERATOR { handler = parent.handler }
+    }
+    let entry = Marker { parent: stack.marker, depth: height, kind: kind, data: data, handler: handler }
+    let mut slot = u64.toUsize(hash(entry) % usize.toU64(self.buckets.length()))
+    while self.buckets.get(slot) != 0 {
+      let index = self.buckets.get(slot)
+      if equal(entry, self.markers.get(index)) { return Stack { height: height, marker: index } }
+      slot = (slot + 1) % self.buckets.length()
+    }
+    let index = self.markers.length() run self.markers.append(entry) self.buckets.set(slot, index)
+    return Stack { height: height, marker: index }
+  }
+  fn top(self: &Self, stack: Stack) -> Marker {
+    if stack.marker != 0 {
+      let marker = self.markers.get(stack.marker)
+      if marker.depth == stack.height { return marker }
+    }
+    return Marker { parent: stack.marker, depth: stack.height, kind: 0, data: 0, handler: 0 }
+  }
+  fn pop(self: &Self, stack: Stack) -> Stack {
+    let marker = self.top(stack)
+    return Stack { height: stack.height - 1, marker: marker.parent }
+  }
+  effect fn ordinary(self: &Self, stack: Stack, count: usize, pc: usize) -> Stack ! ValidationError {
+    run require(stack.height >= count, pc)
+    let height = stack.height - count
+    if stack.marker != 0 { run require(self.markers.get(stack.marker).depth <= height, pc) }
+    return Stack { height: height, marker: stack.marker }
+  }
+  effect fn enqueue(self: &mut Self, pc: usize, stack: Stack) -> ()
+    ! OutOfMemoryError | ValidationError ? &mut Allocator {
+    run require(pc < self.states.length() && stack.height <= self.maximum, pc)
+    if self.seen.get(pc) {
+      let previous = self.states.get(pc)
+      run require(previous.height == stack.height && previous.marker == stack.marker, pc)
+    } else {
+      self.seen.set(pc, true) self.states.set(pc, stack) run self.pending.append(pc)
+    }
+  }
+}
+
+// All instruction boundaries and explicit targets must already be checked.
+// The sparse interned marker chain keeps storage linear in code size, not in
+// code-size times frame-size. Ordinary npop instructions are constant-time.
+pub effect fn validate(code: &[u8], maximum: u16) -> ()
+  ! OutOfMemoryError | ValidationError ? &mut Allocator {
+  let mut g = Graph { markers: List<Marker>.make(), buckets: List<usize>.make(),
+    states: List<Stack>.make(), seen: List<bool>.make(), pending: List<usize>.make(), maximum: u16.toUsize(maximum) }
+  run g.markers.append(Marker { parent: 0, depth: 0, kind: 0, data: 0, handler: 0 })
+  run g.states.reserveExact(code.length) run g.seen.reserveExact(code.length)
+  let mut i: usize = 0
+  while i < code.length {
+    run g.states.append(Stack { height: 0, marker: 0 }) run g.seen.append(false) i = i + 1
+  }
+  run g.enqueue(0, Stack { height: 0, marker: 0 })
+  while g.pending.length() != 0 {
+    let last = g.pending.length() - 1 let pc = g.pending.get(last) g.pending.truncate(last)
+    let opcode = code[pc] let info = op.opcodeInfo(opcode, true)
+    let next = pc + u8.toUsize(info.size) let initial = g.states.get(pc) let mut stack = initial
+    let mut pops = u8.toUsize(info.pops)
+    if info.format == op.OP_FMT_npop || info.format == op.OP_FMT_npop_u16 { pops = pops + u16.toUsize(readU16(code, pc + 1)) }
+    else if info.format == op.OP_FMT_npopx { pops = pops + u8.toUsize(opcode - op.OP_call0) }
+    run require(stack.height >= pops, pc)
+    if opcode == op.OP_catch {
+      let destination = i64.toUsize(target(code, pc, info.format))
+      // Offset zero denotes iterator cleanup to the interpreter, not a catch.
+      run require(destination != 0, pc)
+      let handler = run g.push(stack, 0, pc) run g.enqueue(destination, handler)
+      stack = run g.push(stack, CATCH, destination)
+    } else if opcode == op.OP_gosub {
+      let destination = i64.toUsize(target(code, pc, info.format))
+      run g.enqueue(next, stack)
+      let called = run g.push(stack, RETURN, destination) run g.enqueue(destination, called)
+      continue
+    } else if opcode == op.OP_ret {
+      let marker = g.top(stack) run require(marker.kind == RETURN, pc)
+      let entered = g.states.get(marker.data)
+      run require(entered.height == stack.height && entered.marker == stack.marker, pc)
+      continue
+    } else if opcode == op.OP_nip_catch {
+      stack = run g.ordinary(stack, 1, pc)
+      let mut found = stack.marker
+      if found != 0 {
+        let marker = g.markers.get(found)
+        if marker.kind != CATCH && marker.kind != ITERATOR { found = marker.handler }
+      }
+      run require(found != 0, pc)
+      let marker = g.markers.get(found)
+      stack = run g.push(Stack { height: marker.depth - 1, marker: marker.parent }, 0, pc)
+    } else if opcode == op.OP_drop {
+      stack = g.pop(stack)
+    } else if opcode == op.OP_nip || opcode == op.OP_nip1 {
+      let mut count: usize = 1 if opcode == op.OP_nip1 { count = 2 }
+      let mut values: [Marker; 2] = [Marker { parent: 0, depth: 0, kind: 0, data: 0, handler: 0 }; 2]
+      let mut j: usize = 0
+      while j < count {
+        let value = g.top(stack)
+        values[j] = value stack = g.pop(stack) j = j + 1
+      }
+      stack = g.pop(stack)
+      while j != 0 { j = j - 1 stack = run g.push(stack, values[j].kind, values[j].data) }
+    } else if opcode >= op.OP_dup && opcode <= op.OP_rot5l {
+      let count = u8.toUsize(info.pops)
+      let mut values: [Marker; 5] = [Marker { parent: 0, depth: 0, kind: 0, data: 0, handler: 0 }; 5]
+      let mut order: [usize; 6] = [0; 6]
+      let mut j = count
+      while j != 0 {
+        j = j - 1 values[j] = g.top(stack)
+        stack = g.pop(stack)
+      }
+      let pushed = u8.toUsize(info.pushes)
+      j = 0 while j < pushed { order[j] = j % count j = j + 1 }
+      if opcode == op.OP_dup1 { order[0] = 0 order[1] = 0 order[2] = 1 }
+      else if opcode >= op.OP_insert2 && opcode <= op.OP_insert4 {
+        order[0] = count - 1 j = 1
+        while j < pushed { order[j] = j - 1 j = j + 1 }
+      } else if opcode >= op.OP_perm3 && opcode <= op.OP_perm5 {
+        order[0] = count - 2 j = 1
+        while j < count - 1 { order[j] = j - 1 j = j + 1 }
+        order[count - 1] = count - 1
+      } else if opcode == op.OP_swap { order[0] = 1 order[1] = 0 }
+      else if opcode == op.OP_swap2 { order[0] = 2 order[1] = 3 order[2] = 0 order[3] = 1 }
+      else if opcode == op.OP_rot3r { order[0] = 2 order[1] = 0 order[2] = 1 }
+      else if opcode >= op.OP_rot3l && opcode <= op.OP_rot5l {
+        j = 0 while j + 1 < count { order[j] = j + 1 j = j + 1 } order[count - 1] = 0
+      }
+      j = 0 while j < pushed { let value = values[order[j]] stack = run g.push(stack, value.kind, value.data) j = j + 1 }
+    } else if opcode == op.OP_for_in_start {
+      stack = run g.ordinary(stack, 1, pc) stack = run g.push(stack, ENUMERATION, 0)
+    } else if opcode == op.OP_for_in_next {
+      run require(g.top(stack).kind == ENUMERATION, pc)
+      stack = run g.push(stack, 0, pc) stack = run g.push(stack, 0, pc)
+    } else if opcode == op.OP_for_of_start || opcode == op.OP_for_await_of_start {
+      let base = run g.ordinary(stack, 1, pc)
+      stack = run g.push(base, 0, pc) stack = run g.push(stack, 0, pc) stack = run g.push(stack, ITERATOR, 0)
+    } else if opcode == op.OP_for_of_next || opcode == op.OP_for_await_of_next {
+      let mut offset: usize = 0 if opcode == op.OP_for_of_next { offset = u8.toUsize(code[pc + 1]) }
+      let iteratorState = run g.ordinary(stack, offset, pc)
+      run require(iteratorState.height >= 3 && g.top(iteratorState).kind == ITERATOR, pc)
+      let base = run g.ordinary(g.pop(iteratorState), 2, pc)
+      if opcode == op.OP_for_await_of_next {
+        // The helper disables cleanup before calling next, including on failure.
+        let withoutMarker = g.pop(stack)
+        stack = run g.push(withoutMarker, 0, pc)
+      }
+      stack = run g.push(stack, 0, pc)
+      if opcode == op.OP_for_of_next { stack = run g.push(stack, 0, pc) }
+    } else if opcode == op.OP_iterator_close {
+      run require(g.top(stack).kind == ITERATOR, pc)
+      stack = run g.ordinary(g.pop(stack), 2, pc)
+    } else if opcode == op.OP_iterator_next || opcode == op.OP_iterator_call {
+      let iteratorState = run g.ordinary(stack, 1, pc)
+      // yield* disables automatic iterator cleanup by replacing its marker
+      // with undefined. These calls ignore that slot; their operands stay JS values.
+      let marker = g.top(iteratorState)
+      run require(iteratorState.height >= 3 && (marker.kind == 0 || marker.kind == ITERATOR), pc)
+      let base = run g.ordinary(g.pop(iteratorState), 2, pc)
+      if opcode == op.OP_iterator_call { stack = run g.push(stack, 0, pc) }
+    } else if opcode == op.OP_iterator_get_value_done {
+      stack = run g.ordinary(stack, 1, pc)
+      run require(stack.height >= 3, pc)
+      let top = g.top(stack) run require(top.kind == 0 || top.kind == ITERATOR, pc)
+      stack = g.pop(stack) let base = run g.ordinary(stack, 2, pc)
+      stack = run g.push(stack, ITERATOR, 0) stack = run g.push(stack, 0, pc) stack = run g.push(stack, 0, pc)
+    } else {
+      if opcode == op.OP_copy_data_properties {
+        let mask = code[pc + 1]
+        let a = u8.toUsize(mask & 3) + 1
+        let b = u8.toUsize((mask / 4) & 7) + 1
+        let c = u8.toUsize(mask / 32) + 1
+        let checkedA = run g.ordinary(stack, a, pc)
+        let checkedB = run g.ordinary(stack, b, pc)
+        let checkedC = run g.ordinary(stack, c, pc)
+      }
+      stack = run g.ordinary(stack, pops, pc)
+      let mut j: usize = 0 while j < u8.toUsize(info.pushes) { stack = run g.push(stack, 0, pc) j = j + 1 }
+    }
+    if opcode == op.OP_return || opcode == op.OP_return_undef || opcode == op.OP_return_async
+      || opcode == op.OP_throw || opcode == op.OP_throw_error || opcode == op.OP_tail_call || opcode == op.OP_tail_call_method { continue }
+    if opcode == op.OP_goto || opcode == op.OP_goto8 || opcode == op.OP_goto16 {
+      run g.enqueue(i64.toUsize(target(code, pc, info.format)), stack) continue
+    }
+    if opcode == op.OP_if_true || opcode == op.OP_if_false || opcode == op.OP_if_true8 || opcode == op.OP_if_false8 {
+      run g.enqueue(i64.toUsize(target(code, pc, info.format)), stack)
+    } else if opcode >= op.OP_with_get_var && opcode <= op.OP_with_get_ref {
+      let mut taken = stack
+      if opcode == op.OP_with_put_var { taken = run g.ordinary(taken, 1, pc) }
+      else {
+        taken = run g.push(taken, 0, pc)
+        if opcode == op.OP_with_make_ref || opcode == op.OP_with_get_ref { taken = run g.push(taken, 0, pc) }
+      }
+      run g.enqueue(i64.toUsize(target(code, pc, info.format)), taken)
+    }
+    run g.enqueue(next, stack)
+  }
+}

@@ -372,6 +372,7 @@ import silk.num.u32
 import js_heap { HeapKind }
 import js_value { ValueBits }
 import js_core_types { ModuleDef, ModuleStatus, RequestedModule, ExportEntry, ExportBinding, ImportEntry, StarExportEntry, FunctionBytecode, FunctionKind, ByteStorage, ClosureVar, VarDef, FunctionDebugInfo }
+import js_debugger_metadata { Metadata as DebuggerMetadata }
 effect fn prepareGlobal(cell:*mut HeapHeader)->i32 ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator { run unsafe variables.addGlobalVariables(cell) return 0 }
 effect fn missingExport(error:CompilerError)->i32 { if error.kind!=CompilerErrorKind.MissingExport { Intrinsic.trap("QuickJS invariant violated") } return -1 }
 effect fn makeModule()->*mut HeapHeader ! OutOfMemoryError ? &mut Allocator {
@@ -389,6 +390,7 @@ effect fn makeModule()->*mut HeapHeader ! OutOfMemoryError ? &mut Allocator {
 }
 fn makeSnapshot(context:*mut HeapHeader)->FunctionBytecode {
  return FunctionBytecode { mode:0,hasPrototype:false,hasSimpleParameterList:false,isDerivedClassConstructor:false,needsHomeObject:false,kind:FunctionKind.Normal,
+  debuggerMetadata:DebuggerMetadata.make(),
   newTargetAllowed:false,superCallAllowed:false,superAllowed:false,argumentsAllowed:false,readOnlyBytecode:false,isDirectOrIndirectEval:false,
   code:ByteStorage.Owned { bytes:List<u8>.make() },name:0,varDefs:List<VarDef>.make(),closureVars:List<ClosureVar>.make(),
   argumentCount:1,variableCount:4,definedArgumentCount:0,stackSize:0,varRefCount:0,realm:context,constants:List<ValueBits>.make(),debug:Option<FunctionDebugInfo>.none()
