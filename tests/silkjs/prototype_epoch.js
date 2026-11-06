@@ -35,7 +35,18 @@ Object.prototype.zz = 9; out.push(c.zz, arr[3].zz); delete Object.prototype.zz; 
 function E() {} E.prototype = { w: 1 }; var e = new E(); function rw(o) { return o.w }
 for (var i = 0; i < 20; i++) rw(e); Object.setPrototypeOf(E.prototype, { w2: 2 }); out.push(rw(e));
 Object.setPrototypeOf(e, { w: 'swapped' }); out.push(rw(e));
-var expected = '[200,"A","A",5,5,7,7,5,"g","g","z","g",350,100,null,8,10,false,3,300,400,9,9,null,1,"swapped"]';
+// Memoized adds (transitions) and recipe constructs: a setter appearing on the
+// chain after the memo was verified must run.
+var seenB = [];
+function mk(i) { var o = {}; o.a = i; o.bb = i * 2; return o }
+for (var i = 0; i < 50; i++) mk(i);
+Object.defineProperty(Object.prototype, 'bb', { set: function (v) { seenB.push(v) }, configurable: true });
+var mo = mk(5); out.push(mo.a, Object.prototype.hasOwnProperty.call(mo, 'bb'), seenB.join());
+delete Object.prototype.bb; mo = mk(6); out.push(mo.bb);
+function K(x, y) { this.x = x; this.y = y } K.prototype.f = 1; for (var i = 0; i < 50; i++) new K(i, i);
+var kz = 0; Object.defineProperty(K.prototype, 'y', { set: function (v) { kz += v }, configurable: true });
+var kk = new K(1, 7); out.push(kk.x, kk.y === undefined, kz);
+var expected = '[200,"A","A",5,5,7,7,5,"g","g","z","g",350,100,null,8,10,false,3,300,400,9,9,null,1,"swapped",5,false,"10",12,1,true,7]';
 var got = JSON.stringify(out);
 console.log(got == expected ? "PASS prototype epoch" : "FAIL prototype epoch " + got);
 if (got != expected) throw new Error("prototype epoch regressions");
