@@ -12,6 +12,7 @@ import js_value { ValueBits }
 import js_core_types { NO_SP, FunctionBytecode, ObjectData, ObjectPayload, FrameSlots, FrameReferences, StackFrame, RuntimeState }
 import js_gc { HeapHooks, FrameCaptures }
 import js_gc as gc
+import js_scopes as scopes
 import js_vm_state { Machine, copyCell }
 
 pub const COPY_ARGUMENTS: u32 = 2
@@ -78,6 +79,17 @@ fn trap() -> never { return Intrinsic.trap("QuickJS invariant violated") }
 @inlineAlways
 pub unsafe fn scopeSlotsOf(description: &Description) -> usize {
   let anchor = () let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, description.bytecode)
+  return u16.toUsize(code.scopeSlots)
+}
+
+/// FunctionBytecode.scopeSlots of function, a bytecode closure: nonzero when each
+/// activation owns a scope.
+pub unsafe fn scopeSlotsOfFunction(function: ValueBits) -> usize {
+  let object = match function { ValueBits.Object { reference } => reference _ => trap() }
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  let bytecode = match &data.payload { ObjectPayload.BytecodeFunction { function: closure } => closure.bytecode _ => trap() }
+  drop data
+  let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
   return u16.toUsize(code.scopeSlots)
 }
 
@@ -211,6 +223,20 @@ pub unsafe fn publish(runtime: *mut HeapHeader, frame: ?*mut StackFrame) -> () {
 pub unsafe fn release<H: HeapHooks>(hooks: &mut H, description: &Description, activation: &Machine) -> () {
   unsafe releaseSlots(&mut hooks, description.copiedArguments, description.locals, description.references, activation)
 }
+/// Drops the frame's reference to the scope its activation owns, after its slots
+/// (closures in them may hold the scope, and the fast free sees them gone).
+@inlineNever
+unsafe fn releaseOwnScope<H: HeapHooks>(hooks: &mut H, activation: &Machine) -> () {
+  let scope = match Pointer.nonNullMut<HeapHeader>(activation.scope) { Option<*mut HeapHeader>.Some { value } => value _ => trap() }
+  unsafe scopes.releaseScope(&mut hooks, activation.runtime, scope)
+}
+/// Begins scope, from takeScope or allocateScope, for one activation of bytecode
+/// whose closure captured parent (borrowed; the scope retains it).
+@inlineAlways
+pub unsafe fn beginOwnScope(scope: *mut HeapHeader, parent: ?*mut HeapHeader, bytecode: *mut HeapHeader, arguments: &FrameSlots) -> () {
+  match Pointer.nonNullMut<HeapHeader>(parent) { Option<*mut HeapHeader>.Some { value } => { unsafe HeapCell.retain(value) } _ => () }
+  unsafe scopes.beginScope(scope, parent, bytecode, arguments)
+}
 @inlineAlways
 unsafe fn releaseSlots<H: HeapHooks>(hooks: &mut H, copiedArguments: usize, locals: usize, references: usize, activation: &Machine) -> () {
   if references != 0 { unsafe releaseCapturingSlots(&mut hooks, copiedArguments, locals, activation) return () }
@@ -293,6 +319,16 @@ unsafe fn slotAt(base: *mut ValueBits, index: usize) -> *mut ValueBits {
 pub unsafe fn enterInline(runtime: *mut HeapHeader, function: ValueBits, arguments: FrameSlots, first: *mut ValueBits,
   caller: *mut Machine, callerContext: *mut HeapHeader, receiver: ValueBits, newTarget: ValueBits, construct: bool,
   copy: bool) -> Option<*mut Machine> {
+  return unsafe enterPrepared(runtime, function, arguments, first, caller, callerContext, receiver, newTarget, construct, copy,
+    Pointer.null<HeapHeader>())
+}
+/// enterInline for a scope function whose scope the caller allocated (see
+/// scopeSlotsOfFunction): prepared, owned, moves to the frame on Some and stays the
+/// caller's on None. A null prepared takes a spare scope, or returns None.
+@inlineAlways
+pub unsafe fn enterPrepared(runtime: *mut HeapHeader, function: ValueBits, arguments: FrameSlots, first: *mut ValueBits,
+  caller: *mut Machine, callerContext: *mut HeapHeader, receiver: ValueBits, newTarget: ValueBits, construct: bool,
+  copy: bool, prepared: ?*mut HeapHeader) -> Option<*mut Machine> {
   let object = match function { ValueBits.Object { reference } => reference _ => trap() }
   let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
   // Empty tables point at the caller's machine: aligned, non-null, never read
@@ -311,8 +347,6 @@ pub unsafe fn enterInline(runtime: *mut HeapHeader, function: ValueBits, argumen
   }
   drop data
   let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, bytecode)
-  // A scope function allocates its scope at entry: the effectful path does that.
-  if code.scopeSlots != 0 { return Option<*mut Machine>.none() }
   let count = arguments.length()
   let declared = u16.toUsize(code.argumentCount)
   let localCount = u16.toUsize(code.variableCount)
@@ -328,11 +362,27 @@ pub unsafe fn enterInline(runtime: *mut HeapHeader, function: ValueBits, argumen
   let top = unsafe Intrinsic.pointerRequalify<?*mut ValueBits, *mut ValueBits>(state.callFramesTop)
   let room = usize.wrappingSubtract(Pointer.address<ValueBits>(unsafe Intrinsic.pointerRequalify<?*mut ValueBits, *mut ValueBits>(state.callFramesEnd)), Pointer.address<ValueBits>(top))
   if slots > room / slot { return Option<*mut Machine>.none() }
-  state.callFramesTop = unsafe slotAt(top, slots)
-  let previous = state.currentStackFrame
-  let frame = unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut StackFrame>(top)
-  state.currentStackFrame = frame
   drop state
+  // A scope function owns a scope per activation: the prepared one, else a spare;
+  // with neither the caller allocates one and enters again (enterPrepared).
+  let scopeSlots = u16.toUsize(code.scopeSlots)
+  let mut running = scope
+  if scopeSlots != 0 {
+    let mut spare = prepared
+    if Pointer.isNull<HeapHeader>(spare) { spare = unsafe scopes.takeScope(runtime, scopeSlots) }
+    if Pointer.isNull<HeapHeader>(spare) { return Option<*mut Machine>.none() }
+    running = spare
+  }
+  let mut commitAnchor = () let commit = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut commitAnchor, runtime)
+  commit.callFramesTop = unsafe slotAt(top, slots)
+  let previous = commit.currentStackFrame
+  let frame = unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut StackFrame>(top)
+  commit.currentStackFrame = frame
+  drop commit
+  if scopeSlots != 0 {
+    let own = match Pointer.nonNullMut<HeapHeader>(running) { Option<*mut HeapHeader>.Some { value } => value _ => trap() }
+    unsafe beginOwnScope(own, scope, bytecode, &arguments)
+  }
   let machine = unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut Machine>(unsafe slotAt(top, frameSlots()))
   let tail = unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut InlineTail>(unsafe slotAt(top, frameSlots() + machineSlots()))
   let storage = unsafe slotAt(top, recordSlots())
@@ -384,10 +434,10 @@ pub unsafe fn enterInline(runtime: *mut HeapHeader, function: ValueBits, argumen
   // unwritten: an inline frame derives them from its tail (callerContextOf etc).
   let mut calleeAnchor = () let callee = unsafe Pointer.borrowMut<(), Machine>(&mut calleeAnchor, machine)
   callee.context = code.realm callee.runtime = runtime callee.bytecode = bytecode
-  callee.frame = frame callee.code = ip callee.constants = constants callee.closureReferences = closureReferences callee.scope = scope
+  callee.frame = frame callee.code = ip callee.constants = constants callee.closureReferences = closureReferences callee.scope = running
   callee.arguments = argumentData callee.locals = localView callee.stack = stackView callee.thisValue = receiver
   callee.ip = ip callee.stackTop = stackView
-  callee.record = unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(unsafe Intrinsic.pointerReinterpret<*mut InlineTail, *mut u8>(tail)), boolToUsize(construct))
+  callee.record = unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(unsafe Intrinsic.pointerReinterpret<*mut InlineTail, *mut u8>(tail)), boolToUsize(construct) + 4 * boolToUsize(scopeSlots != 0))
   drop callee
   return Option<*mut Machine>.some(machine)
 }
@@ -398,6 +448,12 @@ fn boolToUsize(value: bool) -> usize { if value { return 1 } return 0 }
 @inlineAlways
 pub fn constructing(machine: &Machine) -> bool {
   return (Pointer.address<u8>(machine.record) & 1) != 0
+}
+/// Whether machine's inline frame owns its scope (the function's scopeSlots != 0):
+/// bit 2 of its record, so frame exit needs no FunctionBytecode read.
+@inlineAlways
+fn ownsScope(machine: &Machine) -> bool {
+  return (Pointer.address<u8>(machine.record) & 4) != 0
 }
 /// Whether machine's construct frame runs a forwarded initializer (see
 /// markForwarded): bit 1 of its record.
@@ -464,6 +520,7 @@ pub unsafe fn leaveInline<H: HeapHooks>(hooks: &mut H, machine: &Machine) -> Inl
   let locals = frame.locals.count let references = frame.varRefs.count
   drop frame
   unsafe releaseSlots(&mut hooks, copied, locals, references, machine)
+  if ownsScope(machine) { unsafe releaseOwnScope(&mut hooks, machine) }
   let mut stateAnchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, machine.runtime)
   state.currentStackFrame = previous
   state.callFramesTop = top
