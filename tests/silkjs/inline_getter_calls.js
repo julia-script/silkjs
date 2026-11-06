@@ -43,8 +43,13 @@ for (var round = 0; round < 3; round++) {
   out.push(holder.self === holder);
   "abc".length;
   out.push(Object.getOwnPropertyDescriptor(Point.prototype, "sum").get.call({ x: 1, y: 1 }));
+  var m = new Map([[1, 2], [3, 4]]), ta = new Uint8Array(7), st = new Set([1]);
+  out.push(m.size, (function (q) { return q.size; })(m), ta.length, (function (q) { var z = q; return z.byteLength; })(ta), st.size);
+  try { out.push(Object.create(Map.prototype).size); } catch (e) { out.push(e instanceof TypeError); }
+  try { (function (q) { out.push(q.size); })(Object.create(Set.prototype)); } catch (e) { out.push(e instanceof TypeError); }
+  out.push(/ab+c/gi.flags, (function (r) { return r.source; })(/x+/));
 }
-var expected = [2, 4, 7, 5, 3, 6, 7, 5, 11, 30, 2, 4, "data", 21, "caught from getter", "caught2 from getter", 50, "1,2,3", undefined, true, 2];
+var expected = [2, 4, 7, 5, 3, 6, 7, 5, 11, 30, 2, 4, "data", 21, "caught from getter", "caught2 from getter", 50, "1,2,3", undefined, true, 2, 2, 2, 7, 7, 1, true, true, "gi", "x+"];
 var all = [];
 for (var k = 0; k < 3; k++) all = all.concat(expected);
 assert(out.length, all.length, "result count");
