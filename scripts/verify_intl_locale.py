@@ -18,10 +18,11 @@ import subprocess
 from intl_locale_cases import cases, utilities, FAULTS
 from verify_bytecode import executable_path, process, validate_pins
 import toolchain
+import timezone_tables
 
 ROOT = Path(__file__).resolve().parents[1]
 INTL = 'intl locale locale-data numberformat collator datetimeformat pluralrules listformat relativetimeformat displaynames segmenter durationformat'.split()
-TEMPORAL = 'temporal instant duration plaintime now plaindate plaindatetime plainyearmonth plainmonthday zoneddatetime calendar timezone tzdata_generated'.split()
+TEMPORAL = 'temporal instant duration plaintime now plaindate plaindatetime plainyearmonth plainmonthday zoneddatetime calendar timezone'.split()
 
 
 def literal(source):
@@ -131,7 +132,8 @@ def main():
     support=[reference/name for name in ['quickjs.c','cutils.c','dtoa.c','libregexp.c','libunicode.c']]
     support += [reference/'intl'/(name+'.c') for name in INTL]
     support += [reference/'temporal'/(name+'.c') for name in TEMPORAL]
-    command=[executable_path(args.cc),'-std=gnu11','-O2','-fwrapv','-funsigned-char','-U__SIZEOF_INT128__','-D_GNU_SOURCE','-D__SANITIZE_ADDRESS__','-DCONFIG_TEMPORAL_INTL','-DCONFIG_VERSION="2026-06-04"',*args.cflag,'-I',str(reference),str(build/'oracle.c'),*map(str,support),'-lm','-lpthread','-o',str(build/'oracle')]
+    support.append(timezone_tables.write_c(build/'tz'))
+    command=[executable_path(args.cc),'-std=gnu11','-O2','-fwrapv','-funsigned-char','-U__SIZEOF_INT128__','-D_GNU_SOURCE','-D__SANITIZE_ADDRESS__','-DCONFIG_TEMPORAL_INTL','-DCONFIG_VERSION="2026-06-04"',*args.cflag,'-I',str(reference),'-I',str(reference/'temporal'),str(build/'oracle.c'),*map(str,support),'-lm','-lpthread','-o',str(build/'oracle')]
     process(command,args.timeout,owner='Pinned full Intl C oracle compilation')
     expected=process([str(build/'oracle')],args.timeout,owner='Pinned Intl.Locale/common JS execution')
     (build/'expected.bin').write_bytes(expected)
