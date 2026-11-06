@@ -40,6 +40,8 @@ import ext.fs_native as fs
 import ext.fs_descriptors as descriptors
 import libs.core.common as common
 import ext.os_abi as osabi
+import silk.core.option { Option }
+import silk.io.reactor { Interest, ReadyEvent, Reactor, ReactorError }
 
 unsafe extern "C" fn calloc(count: usize, size: usize) -> ?*mut u8
 unsafe extern "C" fn free(pointer: ?*mut u8) -> ()
@@ -54,17 +56,18 @@ unsafe extern "C" fn uv_loop_alive(loop: *const u8) -> i32
 unsafe extern "C" fn uv_cancel(request: *mut u8) -> i32
 @foreign(noCapture: .("loop"))
 unsafe extern "C" fn uv_loop_configure(loop: *mut u8, option: i32, ...) -> i32
-unsafe extern "C" fn uv_timer_init(loop: *mut u8, timer: *mut u8) -> i32
-@deferredCallbacks("callback")
-unsafe extern "C" fn uv_timer_start(timer: *mut u8, callback: extern "C" fn(*mut u8) -> (), timeout: u64, repeat: u64) -> i32
-unsafe extern "C" fn uv_timer_stop(timer: *mut u8) -> i32
-// Ends a blocking run when the next JavaScript timer is due.
-export "C" fn deadlineReached(timer: *mut u8) -> () { return () }
-export "C" fn deadlineClosed(timer: *mut u8) -> () { return () }
+@foreign(noCapture: .("loop"))
+unsafe extern "C" fn uv_backend_fd(loop: *const u8) -> i32
+@foreign(noCapture: .("loop"))
+unsafe extern "C" fn uv_backend_timeout(loop: *const u8) -> i32
+// The token of libuv's backend descriptor in the runtime reactor.
+const LIBUV_TOKEN: u64 = 1
 @foreign(noCapture: .("loop"))
 unsafe extern "C" fn uv_metrics_idle_time(loop: *mut u8) -> u64
 
-pub struct State { loop: *mut u8, deadline: *mut u8, first: ?*mut Request, delivering: ?*mut Request, watches: ?*mut Watch, nextWatch: i32, closing: bool, polling: bool, descriptors: descriptors.State }
+// The reactor is the loop's only blocking wait. libuv runs as a guest: its backend descriptor is
+// registered in the reactor, and each turn runs libuv without blocking.
+pub struct State { loop: *mut u8, reactor: Reactor, first: ?*mut Request, delivering: ?*mut Request, watches: ?*mut Watch, nextWatch: i32, closing: bool, polling: bool, descriptors: descriptors.State }
 struct Request {
   next: ?*mut Request, native: *mut u8, done: bool, status: i32, requestKind: i32,
   tracking: *mut descriptors.State, descriptorSettled: bool,
@@ -81,7 +84,7 @@ fn equal(a: &[u8], b: &[u8]) -> bool {
   if a.length != b.length { return false }
   let mut i: usize = 0 while i < a.length { if a[i] != b[i] { return false } i = i + 1 } return true
 }
-pub effect fn make() -> *mut State ! OutOfMemoryError {
+pub effect fn make() -> *mut State ! OutOfMemoryError ? &mut Allocator {
   let loop = run allocate(unsafe uv_loop_size())
   if unsafe uv_loop_init(loop) != 0 { unsafe free(loop) fail OutOfMemoryError {} }
   if unsafe uv_loop_configure(loop, 1) != 0 {
@@ -93,14 +96,15 @@ pub effect fn make() -> *mut State ! OutOfMemoryError {
     Result<*mut u8, OutOfMemoryError>.Success { value } => value
     Result<*mut u8, OutOfMemoryError>.Failure { error } => { let ignored = unsafe uv_loop_close(loop) unsafe free(loop) fail move error }
   }
-  let timerAllocated = run Effect.result(allocate(unsafe uv_handle_size(13)))
-  let deadline = match move timerAllocated {
-    Result<*mut u8, OutOfMemoryError>.Success { value } => value
-    Result<*mut u8, OutOfMemoryError>.Failure { error } => { unsafe free(raw) let ignored = unsafe uv_loop_close(loop) unsafe free(loop) fail move error }
+  let made = run Effect.result(Reactor.make())
+  let mut reactor = match move made {
+    Result<Reactor, ReactorError | OutOfMemoryError>.Success { value } => move value
+    Result<Reactor, ReactorError | OutOfMemoryError>.Failure { .. } => Intrinsic.trap("the runtime reactor cannot be opened")
   }
-  if unsafe uv_timer_init(loop, deadline) != 0 { Intrinsic.trap("libuv deadline timer cannot be initialized") }
+  let registered = run Effect.result(reactor.register(unsafe uv_backend_fd(loop), LIBUV_TOKEN, Interest.readOnly()))
+  if let Result<(), ReactorError>.Failure { .. } = move registered { Intrinsic.trap("libuv's backend descriptor cannot join the runtime reactor") }
   let state = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut State>(raw)
-  unsafe Pointer.put<State>(state, State { loop: loop, deadline: deadline, first: Pointer.null<Request>(), delivering: Pointer.null<Request>(), watches: Pointer.null<Watch>(), nextWatch: 1, closing: false, polling: false, descriptors: descriptors.make() })
+  unsafe Pointer.put<State>(state, State { loop: loop, reactor: move reactor, first: Pointer.null<Request>(), delivering: Pointer.null<Request>(), watches: Pointer.null<Watch>(), nextWatch: 1, closing: false, polling: false, descriptors: descriptors.make() })
   return state
 }
 pub unsafe fn descriptorState(pointer: *mut State) -> *mut descriptors.State {
@@ -399,7 +403,7 @@ unsafe effect fn deliverCompleted<'m, S: EngineServices>(engine: &mut Engine<'m,
 // `timeout` is in milliseconds: 0 polls without waiting, a negative value waits while native work is
 // pending, and a positive value also waits for that long, for the next JavaScript timer.
 unsafe effect fn pollInner<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pointer: *mut State, timeout: i64, pollAnchor: *mut u8) -> bool ! OutOfMemoryError | JsException ? &mut Allocator {
-  let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer) let loop = state.loop let deadline = state.deadline drop state
+  let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer) let loop = state.loop drop state
   // Process already-completed submissions before any potentially blocking run.
   let mut ran = false
   let mut mode: i32 = 2
@@ -409,8 +413,7 @@ unsafe effect fn pollInner<'m, S: EngineServices>(engine: &mut Engine<'m, S>, co
     run unsafe deliverCompleted(&mut engine, context, pointer, unsafe nonnull(immediate))
     ran = true mode = 2
   }
-  let armed = mode == 1 && timeout > 0
-  if armed { let ignored = unsafe uv_timer_start(deadline, deadlineReached, i64.toU64(timeout), 0) }
+  if mode == 1 { run unsafe waitReady(pointer, loop, timeout) mode = 2 }
   // JS timers can keep the runtime alive while every libuv handle is unrefed.
   // UV_RUN_NOWAIT otherwise skips polling entirely. Borrow the existing wake
   // handle's reference only across native callbacks, never across JS delivery.
@@ -418,7 +421,6 @@ unsafe effect fn pollInner<'m, S: EngineServices>(engine: &mut Engine<'m, S>, co
   if borrowedRef { unsafe uv_ref(pollAnchor) }
   let ignored = unsafe uv.uv_run(loop, mode)
   if borrowedRef { unsafe uv_unref(pollAnchor) }
-  if armed { let stopped = unsafe uv_timer_stop(deadline) }
   while true {
     let entry = unsafe takeCompleted(pointer) if Pointer.isNull<Request>(entry) { break }
     run unsafe deliverCompleted(&mut engine, context, pointer, unsafe nonnull(entry))
@@ -426,6 +428,18 @@ unsafe effect fn pollInner<'m, S: EngineServices>(engine: &mut Engine<'m, S>, co
   }
   if run unsafe pollWatches(&mut engine, context, pointer) { ran = true }
   return ran
+}
+// Blocks in the reactor until a descriptor is ready, a waker fires, libuv's next timer is due, or
+// `timeout` milliseconds pass (a negative `timeout` waits without a JavaScript limit).
+unsafe effect fn waitReady(pointer: *mut State, loop: *mut u8, timeout: i64) -> () {
+  let guest = unsafe uv_backend_timeout(loop)
+  let mut limit = timeout
+  if guest >= 0 && (limit < 0 || i32.toI64(guest) < limit) { limit = i32.toI64(guest) }
+  let nanoseconds = if limit < 0 { Option<u64>.none() } else { Option<u64>.some(i64.toU64(limit) * 1000000) }
+  let mut events = [ReadyEvent.empty(), ReadyEvent.empty(), ReadyEvent.empty(), ReadyEvent.empty()]
+  let mut anchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer)
+  let waited = run Effect.result(state.reactor.wait(&mut events, nanoseconds))
+  if let Result<usize, ReactorError>.Failure { .. } = move waited { Intrinsic.trap("the runtime reactor wait failed") }
 }
 pub unsafe effect fn poll<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pointer: *mut State, timeout: i64, pollAnchor: *mut u8) -> bool ! OutOfMemoryError | JsException ? &mut Allocator {
   let mut anchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer)
@@ -658,8 +672,6 @@ pub unsafe fn close<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: 
   while !Pointer.isNull<Watch>(watch) {
     let owner = unsafe nonnull(watch) let entry = unsafe Pointer.borrow<(), Watch>(&anchor, owner) watch = entry.next drop entry unsafe stopWatch(owner)
   }
-  let deadlineAnchor = unsafe Pointer.borrow<(), State>(&anchor, pointer) let deadline = deadlineAnchor.deadline drop deadlineAnchor
-  unsafe uv_close(deadline, deadlineClosed)
   // Cancellation cannot interrupt a running syscall. Drain until every request
   // and handle has completed before freeing native memory or JS roots.
   let ignored = unsafe uv.uv_run(loop, 0)
@@ -668,7 +680,9 @@ pub unsafe fn close<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: 
   while !Pointer.isNull<Watch>(watch) {
     let owner = unsafe nonnull(watch) let entry = unsafe Pointer.borrow<(), Watch>(&anchor, owner) watch = entry.next drop entry unsafe releaseWatch(&mut engine, context, owner)
   }
+  // Dropping the reactor closes its kernel queue, which also forgets libuv's backend descriptor.
+  drop state2
   let status = unsafe uv_loop_close(loop)
   if status != 0 { Intrinsic.trap("filesystem loop still owns foreign handles at close") }
-  unsafe free(state2.deadline) unsafe free(loop) unsafe free(unsafe Intrinsic.pointerReinterpret<*mut State, *mut u8>(pointer))
+  unsafe free(loop) unsafe free(unsafe Intrinsic.pointerReinterpret<*mut State, *mut u8>(pointer))
 }
