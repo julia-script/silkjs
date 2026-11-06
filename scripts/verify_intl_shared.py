@@ -99,17 +99,14 @@ def table_probes(reference):
         helpers.append(f'effect fn table{number}(out:&mut ByteBuffer)->() !OutOfMemoryError ?&mut Allocator {{\n' + '\n'.join(lines) + '\n}')
         silk.append(f'run table{number}(&mut out.*)')
     # The C enum and direct arrays independently cover numbering identities,
-    # sparse zero digit bases, Han decimal digits and supported collations.
-    c += ['emit(NS_COUNT);emit(intl_all_numbering_systems_count);emit(intl_supported_collations_count);',
+    # sparse zero digit bases and Han decimal digits.
+    c += ['emit(NS_COUNT);emit(intl_all_numbering_systems_count);',
           'for(int i=0;i<NS_COUNT;i++){text(intl_all_numbering_systems[i]);emit(nf_digit_base[i]);}',
-          'for(int i=0;i<10;i++)emit(hanidec_cps[i]);',
-          'for(int i=0;i<intl_supported_collations_count;i++)text(intl_supported_collations[i]);']
+          'for(int i=0;i<10;i++)emit(hanidec_cps[i]);']
     silk += ['run out.writeU32(i32.toU32(numbering.NS_COUNT))',
              'run out.writeU32(i32.toU32(numbering.intl_all_numbering_systems_count))',
-             'run out.writeU32(i32.toU32(numbering.intl_supported_collations_count))',
              'let mut ns:i32=0 while ns<numbering.NS_COUNT { run text(&mut out.*,Option<string>.some(numbering.intl_all_numbering_systems(ns))) run out.writeU32(numbering.nf_digit_base(ns)) ns=ns+1 }',
-             'let mut d:i32=0 while d<10 { run out.writeU32(numbering.hanidec_cps(d)) d=d+1 }',
-             'let mut col:i32=0 while col<numbering.intl_supported_collations_count { run text(&mut out.*,Option<string>.some(numbering.intl_supported_collations(col))) col=col+1 }']
+             'let mut d:i32=0 while d<10 { run out.writeU32(numbering.hanidec_cps(d)) d=d+1 }']
     return c, silk, '\n'.join(helpers), [declaration.group(1) for declaration in declarations]
 
 

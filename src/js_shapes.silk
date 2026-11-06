@@ -205,6 +205,7 @@ pub unsafe fn swapAdd(object: &mut ObjectData, target: *mut HeapHeader, value: V
   // Checked above: the list has room.
   unsafe object.properties.pushUnchecked(SlotBits.value(value))
   object.shape = target
+  if object.isPrototype() { unsafe bumpEpoch(present((unsafe HeapCell.payload<ShapeData, ()>(&anchor, target)).runtime)) }
   return true
 }
 /// Detaches the oldest parked shape, which the caller must destroy, or returns null.
@@ -352,11 +353,34 @@ unsafe effect fn allocateShape(runtime: *mut HeapHeader, hashSize: usize, capaci
     deletedPropertyCount: deletedPropertyCount, hashNext: Pointer.null<HeapHeader>(), prototype: prototype, runtime: runtime,
     hashIndices: move indices, properties: move properties
   })
+  drop data
+  unsafe markPrototype(prototype)
   return shape
+}
+/// Marks prototype (a shape's new prototype edge) as a prototype object
+/// (ObjectData.isPrototype). Nothing cached a chain through it before, so the
+/// epoch stays.
+@inlineAlways
+pub unsafe fn markPrototype(prototype: ?*mut HeapHeader) -> () {
+  match Pointer.nonNullMut<HeapHeader>(prototype) {
+    Option<*mut HeapHeader>.Some { value } => {
+      let mut anchor = ()
+      let object = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, value)
+      if !object.isPrototype() { object.setIsPrototype(true) }
+    }
+    Option<*mut HeapHeader>.None => ()
+  }
+}
+/// An existing object just changed shape, or its shape's records: a
+/// prototype's change bumps the epoch.
+@inlineAlways
+pub unsafe fn noteShapeChange(runtime: *mut HeapHeader, object: &ObjectData) -> () {
+  if object.isPrototype() { unsafe bumpEpoch(runtime) }
 }
 
 /// Gives shape a version no shape has had, retiring get_field cache entries
-/// that name its old records. Call after any change to its records.
+/// that name its old records. Call after any change to its records; for an
+/// object's own shape, noteShapeChange too (the object may be a prototype).
 pub unsafe fn renewVersion(runtime: *mut HeapHeader, shape: *mut HeapHeader) -> () {
   let mut anchor = ()
   let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
@@ -366,6 +390,13 @@ pub unsafe fn renewVersion(runtime: *mut HeapHeader, shape: *mut HeapHeader) -> 
   let mut shapeAnchor = ()
   let data = unsafe HeapCell.payloadMut<ShapeData, ()>(&mut shapeAnchor, shape)
   data.version = version
+}
+/// Marks a change of an existing object's shape (see RuntimeState.shapeEpoch).
+@inlineAlways
+pub unsafe fn bumpEpoch(runtime: *mut HeapHeader) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.shapeEpoch = state.shapeEpoch + 1
 }
 
 pub unsafe effect fn createUnhashed(runtime: *mut HeapHeader, prototype: ?*mut HeapHeader,
@@ -611,10 +642,11 @@ pub unsafe effect fn prepareUpdate(runtime: *mut HeapHeader, object: &mut Object
   let hashed = data.isHashed
   drop data
   // Every caller changes the records next.
-  if !hashed { unsafe renewVersion(runtime, object.shape) return () }
+  if !hashed { unsafe renewVersion(runtime, object.shape) unsafe noteShapeChange(runtime, &object) return () }
   if unsafe referenceCount(object.shape) != 1 {
     let old = object.shape
     object.shape = run unsafe clone(runtime, old)
+    unsafe noteShapeChange(runtime, &object)
     let cannotBeZero = unsafe HeapCell.decrement(old)
   } else {
     unsafe unlink(runtime, object.shape)
@@ -623,6 +655,7 @@ pub unsafe effect fn prepareUpdate(runtime: *mut HeapHeader, object: &mut Object
     shape.isHashed = false
     drop shape
     unsafe renewVersion(runtime, object.shape)
+    unsafe noteShapeChange(runtime, &object)
   }
 }
 
@@ -899,7 +932,7 @@ unsafe fn memoTransition(runtime: *mut HeapHeader, base: *mut HeapHeader,
   }
   drop state
   let found = unsafe findTransition(runtime, base, atom, flags)
-  if !Pointer.isNull<HeapHeader>(found) { unsafe remember(runtime, set, TransitionEntry { base: address, target: found, atom: atom, flags: flags, chainDepth: CHAIN_UNVERIFIED, baseVersion: baseVersion, chain: [0; 3] }) }
+  if !Pointer.isNull<HeapHeader>(found) { unsafe remember(runtime, set, TransitionEntry { base: address, target: found, atom: atom, flags: flags, chainDepth: CHAIN_UNVERIFIED, baseVersion: baseVersion, chain: [0; 3], epoch: 0 }) }
   return found
 }
 /// The memo set for an add of atom/flags to base.
@@ -911,10 +944,13 @@ fn memoSet(base: *mut HeapHeader, atom: u32, flags: u8) -> usize {
 /// Whether the prototypes of a shape whose prototype is first still have the
 /// shape versions an entry recorded for its first depth links.
 @inlineAlways
-unsafe fn chainHolds(entry: &TransitionEntry, first: ?*mut HeapHeader) -> bool {
+unsafe fn chainHolds(runtime: *mut HeapHeader, index: usize, entry: &TransitionEntry, first: ?*mut HeapHeader) -> bool {
   let depth = u8.toUsize(entry.chainDepth)
   if depth > 3 { return false }
   let anchor = ()
+  let epoch = (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)).shapeEpoch
+  // No prototype changed since the chain last held (the epoch starts at 1).
+  if entry.epoch == epoch { return true }
   let mut current = first
   let mut level: usize = 0
   while level < depth {
@@ -924,6 +960,9 @@ unsafe fn chainHolds(entry: &TransitionEntry, first: ?*mut HeapHeader) -> bool {
     current = linkShape.prototype
     level = level + 1
   }
+  let mut stateAnchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
+  state.transitions[index].epoch = epoch
   return true
 }
 /// The memoized target of a plain (C_W_E) add of atom to base whose prototype
@@ -941,7 +980,7 @@ pub unsafe fn verifiedAdd(runtime: *mut HeapHeader, base: *mut HeapHeader, atom:
   while way < 2 {
     let entry = &state.transitions[set + way]
     if entry.base == address && entry.atom == atom && entry.flags == flags && entry.baseVersion == shape.version {
-      if unsafe chainHolds(entry, shape.prototype) { return entry.target }
+      if unsafe chainHolds(runtime, set + way, entry, shape.prototype) { return entry.target }
       return Pointer.null<HeapHeader>()
     }
     way = way + 1
@@ -961,7 +1000,7 @@ pub unsafe fn verifiedAddIndex(runtime: *mut HeapHeader, base: *mut HeapHeader, 
   while way < 2 {
     let entry = &state.transitions[set + way]
     if entry.base == address && entry.atom == atom && entry.flags == flags && entry.baseVersion == shape.version {
-      if unsafe chainHolds(entry, shape.prototype) { return set + way }
+      if unsafe chainHolds(runtime, set + way, entry, shape.prototype) { return set + way }
       return usize.MAX
     }
     way = way + 1
@@ -982,7 +1021,7 @@ pub unsafe fn verifiedAddAt(runtime: *mut HeapHeader, index: usize, base: *mut H
   // target was unlinked, which keeps its baseVersion.
   if entry.baseVersion == shape.version && entry.base == Pointer.address<HeapHeader>(base) && entry.atom == atom
     && entry.flags == u32.toU8(JS_PROP_C_W_E)
-    && unsafe chainHolds(entry, shape.prototype) { return entry.target }
+    && unsafe chainHolds(runtime, index & 127, entry, shape.prototype) { return entry.target }
   return Pointer.null<HeapHeader>()
 }
 /// Records on base's memo entry for atom/flags (when there is one) that an add's
@@ -999,6 +1038,9 @@ pub unsafe fn noteVerified(runtime: *mut HeapHeader, base: *mut HeapHeader, base
     if entry.base == address && entry.atom == atom && entry.flags == flags && entry.baseVersion == baseVersion {
       state.transitions[set + way].chainDepth = usize.toU8(depth)
       state.transitions[set + way].chain = chain
+      // The walk ran before this add's own work, so the epoch it held at is not
+      // known here: the next chainHolds checks the versions and records it.
+      state.transitions[set + way].epoch = 0
       return ()
     }
     way = way + 1
@@ -1048,6 +1090,7 @@ pub unsafe effect fn addProperty(runtime: *mut HeapHeader, object: &mut ObjectDa
   if object.properties.capacity() <= index { run unsafe growForTransition(runtime, &mut object, old, capacity) }
   run object.properties.append(SlotBits.value(ValueBits.Undefined))
   object.shape = present(transition)
+  unsafe noteShapeChange(runtime, &object)
   if unsafe trade(runtime, old, present(transition)) {
     return AddResult { index: index, retiredShape: Pointer.null<HeapHeader>() }
   }
@@ -1165,6 +1208,7 @@ unsafe effect fn addUntransitioned(runtime: *mut HeapHeader, object: &mut Object
     drop copy
     unsafe link(runtime, cloned)
     object.shape = cloned
+    unsafe noteShapeChange(runtime, &object)
     if unsafe referenceCount(old) == 1 { retired = old }
     else { let cannotBeZero = unsafe HeapCell.decrement(old) }
   }
@@ -1186,6 +1230,7 @@ unsafe effect fn addUntransitioned(runtime: *mut HeapHeader, object: &mut Object
   // These appends cannot allocate after reserveProperties; retain only after success.
   run object.properties.append(SlotBits.value(ValueBits.Undefined))
   let appended = run unsafe appendMetadata(runtime, object.shape, atom, flags)
+  unsafe noteShapeChange(runtime, &object)
   return AddResult { index: index, retiredShape: retired }
 }
 
@@ -1194,6 +1239,7 @@ unsafe effect fn addUntransitioned(runtime: *mut HeapHeader, object: &mut Object
 unsafe fn restore(runtime: *mut HeapHeader, object: &mut ObjectData, original: *mut HeapHeader) -> () {
   let copy = object.shape
   object.shape = original
+  unsafe noteShapeChange(runtime, &object)
   let mut anchor = ()
   let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
   unsafe state.gcObjects.remove(copy)
@@ -1212,6 +1258,7 @@ pub unsafe effect fn appendReservedProperty(runtime: *mut HeapHeader, object: &m
   let index = object.properties.length()
   run object.properties.append(SlotBits.from(incoming))
   let appended = run unsafe appendMetadata(runtime, object.shape, atom, flags)
+  unsafe noteShapeChange(runtime, &object)
   return index
 }
 
@@ -1314,6 +1361,8 @@ pub unsafe effect fn replacePrototype(runtime: *mut HeapHeader, object: &mut Obj
   let data = unsafe HeapCell.payloadMut<ShapeData, ()>(&mut anchor, object.shape)
   let old = data.prototype
   data.prototype = prototype
+  drop data
+  unsafe markPrototype(prototype)
   return old
 }
 
@@ -1391,6 +1440,7 @@ pub unsafe effect fn deleteProperty(runtime: *mut HeapHeader, object: &mut Objec
 @inlineAlways
 pub unsafe fn deleteUnshared(runtime: *mut HeapHeader, object: &mut ObjectData, atom: u32, index: usize) -> bool {
   unsafe renewVersion(runtime, object.shape)
+  unsafe noteShapeChange(runtime, &object)
   let mut anchor = ()
   let shape = unsafe HeapCell.payloadMut<ShapeData, ()>(&mut anchor, object.shape)
   let entry = unsafe unchecked<ShapeProperty>(&shape.properties, index)

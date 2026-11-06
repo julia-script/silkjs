@@ -315,8 +315,20 @@ impl FrameSlots {
   pub unsafe fn write(self: &mut Self, index: usize, value: ValueBits) -> () {
     unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(self.data), index), value)
   }
+  /// The slots from `start` on, sharing this range's storage; empty when `start`
+  /// is at or past the end.
+  pub fn after(self: &Self, start: usize) -> FrameSlots {
+    if start >= self.count { return emptyFrameSlots() }
+    return FrameSlots { data: unsafe Pointer.atMut<ValueBits>(unsafe Pointer.assumeManyMut<ValueBits>(self.data), start), count: self.count - start }
+  }
 }
 
+/// A read-only view of `values` as frame slots, for passing a borrowed argument
+/// list to a call. The view never outlives `values`, and nothing writes through it.
+pub fn borrowedFrameSlots(values: &[ValueBits]) -> FrameSlots {
+  if values.length == 0 { return emptyFrameSlots() }
+  return FrameSlots { data: unsafe Intrinsic.pointerRequalify<*const ValueBits, *mut ValueBits>(Pointer.fromRef<ValueBits>(&values[0])), count: values.length }
+}
 /// A zero-length placeholder range; its address is never dereferenced.
 pub fn emptyFrameSlots() -> FrameSlots {
   return FrameSlots { data: unsafe Intrinsic.pointerRequalify<?*mut ValueBits, *mut ValueBits>(Pointer.null<ValueBits>()), count: 0 }
@@ -533,6 +545,9 @@ pub struct RuntimeState {
   /// kept by js_debugger.refreshObservation: the one flag the dispatch loop tests
   /// before every instruction.
   pub observeInstructions: bool,
+  /// Set when observeInstructions turns on: inline frames entered before have
+  /// no debugger activation until js_vm_activation.adoptFrames links them in.
+  pub adoptFrames: bool,
   pub cpuProfile: CpuProfileState,
   /// Monotonic compilation identity shared by all realms; zero means no script.
   pub nextScriptId: u64,
@@ -573,6 +588,10 @@ pub struct RuntimeState {
   pub transitions: [TransitionEntry; 128],
   /// The next ShapeData.version; starts at 1 so no live shape has version 0.
   pub nextShapeVersion: u64,
+  /// Bumped whenever any shape gets a new version or any existing object changes
+  /// shape, so a cache that verified a prototype chain's versions at an epoch can
+  /// skip the walk while the epoch stays the same.
+  pub shapeEpoch: u64,
   /// The ShapeData.version of the last object spread source js_copy_data_properties
   /// found to be all plain enumerable data properties; versions are never reused.
   pub plainCloneVersion: u64,
@@ -657,6 +676,13 @@ pub struct FieldCacheEntry {
   /// FIELD_PASS_THROUGH marks a prototype without a record for the atom: the
   /// property is then further up, named by midKey and farKey the same way.
   pub protoKey: u64,
+  /// For a prototype entry: the RuntimeState.shapeEpoch at which its keys last
+  /// matched, with the object found to hold the property (holder, null when none
+  /// yet) and its slot there. While the epoch is current no prototype changed, so
+  /// an object of the key's version reads holder's slot without the walk.
+  pub epoch: u64,
+  pub holder: ?*mut HeapHeader,
+  pub holderIndex: usize,
   pub midKey: u64,
   pub farKey: u64
 }
@@ -725,6 +751,9 @@ pub struct ReceiverCacheEntry {
   pub depth: u8,
   pub sources: [u8; 8],
   pub chain: [u64; 3],
+  /// The RuntimeState.shapeEpoch at which chain last matched: while it is
+  /// current, no prototype can have changed, so the walk is skipped.
+  pub epoch: u64,
   /// A forwarded construct (js_constructor_ops.forwardedAtom) of the atom
   /// forward (0: none) found its target at slot holderIndex of a prototype of
   /// shape version holderVersion, and apply at slot applyIndex of the target's
@@ -747,7 +776,7 @@ pub fn blankForwardEntry() -> ForwardEntry {
 /// A ReceiverCacheEntry that matches no constructor.
 pub fn blankReceiverEntry() -> ReceiverCacheEntry {
   return ReceiverCacheEntry { function: 0, version: 0, index: 0, empty: Pointer.null<HeapHeader>(), final: Pointer.null<HeapHeader>(),
-    bytecode: 0, stores: 0, depth: 0, sources: [0; 8], chain: [0; 3], forward: blankForwardEntry() }
+    bytecode: 0, stores: 0, depth: 0, sources: [0; 8], chain: [0; 3], epoch: 0, forward: blankForwardEntry() }
 }
 /// One RuntimeState.emptyShapes entry: the empty shape (a weak reference, cleared
 /// when the shape is destroyed) of the object at
@@ -795,7 +824,10 @@ pub struct ConstructCacheEntry {
   pub baseVersion: u64,
   pub final: ?*mut HeapHeader,
   pub chain: [u64; 3],
-  pub depth: u8
+  pub depth: u8,
+  /// The RuntimeState.shapeEpoch at which chain last matched (0: never); while
+  /// it is current the walk is skipped.
+  pub epoch: u64
 }
 impl Copy for ConstructCacheEntry {}
 pub fn blankRecipe() -> ConstructRecipe {
@@ -803,7 +835,7 @@ pub fn blankRecipe() -> ConstructRecipe {
     constants: [ValueBits.Undefined; 8], roots: [0; 8], atoms: [0; 8] }
 }
 pub fn blankConstructEntry() -> ConstructCacheEntry {
-  return ConstructCacheEntry { code: 0, recipe: blankRecipe(), base: 0, baseVersion: 0, final: Pointer.null<HeapHeader>(), chain: [0; 3], depth: 0 }
+  return ConstructCacheEntry { code: 0, recipe: blankRecipe(), base: 0, baseVersion: 0, final: Pointer.null<HeapHeader>(), chain: [0; 3], depth: 0, epoch: 0 }
 }
 @inlineAlways
 pub fn literalCacheIndex(site: usize) -> usize { return (site ^ usize.shiftRight(site, 8)) & 255 }
@@ -819,7 +851,10 @@ pub struct TransitionEntry {
   /// along this entry without the walk.
   pub chainDepth: u8,
   pub baseVersion: u64,
-  pub chain: [u64; 3]
+  pub chain: [u64; 3],
+  /// The RuntimeState.shapeEpoch at which chain last held (0: not since it was
+  /// recorded): while it is current, no prototype changed and the walk is skipped.
+  pub epoch: u64
 }
 pub const CHAIN_UNVERIFIED: u8 = 255
 impl Copy for TransitionEntry {}
@@ -1313,6 +1348,9 @@ const OBJECT_FAST_ARRAY: u8 = 16
 const OBJECT_CONSTRUCTOR: u8 = 32
 const OBJECT_IMMUTABLE_PROTOTYPE: u8 = 64
 const OBJECT_HTML_DDA: u8 = 128
+/// ObjectData.roles: the object is (or was) the prototype of some shape, so a
+/// change to its shape bumps RuntimeState.shapeEpoch (js_shapes.noteShapeChange).
+const OBJECT_ROLE_PROTOTYPE: u8 = 1
 @inlineAlways
 fn objectFlag(flags: u8, bit: u8, value: bool) -> u8 {
   if value { return u8.bitOr(flags, bit) }
@@ -1324,6 +1362,8 @@ pub struct ObjectData {
   /// Actual allocation realm, independent of mutable prototype/constructor.
   pub creationRealm: ?*mut HeapHeader,
   flags: u8,
+  /// OBJECT_ROLE_* bits, in the byte the flags leave before classBits.
+  roles: u8,
   classBits: u16,
   /// Weak liveness count, NOT a second strong JS reference count.
   pub weakRefCount: u32,
@@ -1339,11 +1379,17 @@ impl ObjectData {
     let mut flags = OBJECT_EXTENSIBLE
     if exotic { flags = u8.bitOr(flags, OBJECT_EXOTIC) }
     if fastArray { flags = u8.bitOr(flags, OBJECT_FAST_ARRAY) }
-    return ObjectData { creationRealm: Pointer.null<HeapHeader>(), flags: flags, classBits: classBits(classId), weakRefCount: 0, shape: shape, properties: move properties, payload: move payload }
+    return ObjectData { creationRealm: Pointer.null<HeapHeader>(), flags: flags, roles: 0, classBits: classBits(classId), weakRefCount: 0, shape: shape, properties: move properties, payload: move payload }
   }
   /// The class id. Like the source, objects keep 16 bits of it.
   @inlineAlways
   pub fn classId(self: &Self) -> u32 { return u16.toU32(self.classBits) }
+  /// Whether the object has been some shape's prototype. Sticky: a set bit only
+  /// costs epoch bumps, a missing one would let stale chain caches hit.
+  @inlineAlways
+  pub fn isPrototype(self: &Self) -> bool { return u8.bitAnd(self.roles, OBJECT_ROLE_PROTOTYPE) != 0 }
+  @inlineAlways
+  pub fn setIsPrototype(self: &mut Self, value: bool) -> () { self.roles = objectFlag(self.roles, OBJECT_ROLE_PROTOTYPE, value) }
   @inlineAlways
   pub fn setClassId(self: &mut Self, classId: u32) -> () { self.classBits = classBits(classId) }
   @inlineAlways
@@ -1716,6 +1762,8 @@ pub struct JobEntry {
 
 /// Recomputes state.observeInstructions after any of its four flags changes.
 pub fn refreshObservation(state: &mut RuntimeState) -> () {
-  state.observeInstructions = state.debugger.enabled || state.coverage.enabled || state.cpuProfile.enabled ||
+  let observed = state.debugger.enabled || state.coverage.enabled || state.cpuProfile.enabled ||
     state.debugger.restricted
+  if observed && !state.observeInstructions { state.adoptFrames = true }
+  state.observeInstructions = observed
 }
