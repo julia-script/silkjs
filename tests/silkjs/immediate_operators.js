@@ -1,4 +1,4 @@
-// add_imm, sar_imm, shl_imm, and_imm, or_imm and lt_imm: an Int right operand
+// add_imm, sar_imm, and_imm and or_imm: an Int right operand
 // fused into the operator must keep every operator's semantics.
 function show(v) { return Object.is(v, -0) ? "-0" : typeof v === "bigint" ? v + "n" : String(v); }
 const values = [5, -7, 2147483647, -2147483648, 1.5, -0, NaN, "12", "a", null, undefined, true, {}, [3], { valueOf() { return 9; } }];
