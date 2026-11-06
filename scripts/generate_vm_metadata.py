@@ -2,7 +2,8 @@
 """Generate native Silk atoms and opcode metadata from the pinned QuickJS headers.
 
 Usage: python3 scripts/generate_vm_metadata.py /path/to/quickjs
-Short opcodes and parser-only temporary opcodes intentionally share numbers.
+Short opcodes and parser-only temporary opcodes intentionally share numbers, and
+so do the EXTENDED opcodes and the final-only opcodes that take their primary slots.
 """
 import argparse
 import ast
@@ -31,6 +32,28 @@ REPLACEMENTS = {
     'set_arg0': ('if_nullish8', 3, 1, 0, 'u16'),  # is_undefined_or_null, then if_true8
     'set_arg1': ('if_not_nullish8', 3, 1, 0, 'u16'),  # is_undefined_or_null, then if_false8
 }
+
+# Opcodes final bytecode writes behind the OP_extended prefix byte: the prefix,
+# the opcode's own (compiler) number, then its operands. They ran zero times in
+# all of Octane and bench/microbench.js, so their primary slots are free for
+# FINAL_ONLY opcodes (nop stays: tests write it into final bytecode). Each has format none or u8 (finalInfo reports it as one
+# opaque instruction) and neither branches nor is a leaf opcode.
+EXTENDED = [
+    'perm5', 'swap2', 'rot4l', 'rot5l', 'check_brand', 'add_brand', 'get_super',
+    'get_ref_value', 'put_ref_value', 'get_private_field', 'put_private_field',
+    'define_private_field', 'get_super_value', 'put_super_value', 'set_name_computed',
+    'set_proto', 'set_home_object', 'define_method_computed', 'for_await_of_next',
+    'private_in', 'using_dispose_init', 'using_dispose_merge', 'using_dispose_end',
+    'using_check',
+]
+
+# Final-only opcodes, in the primary slot of an EXTENDED opcode: (name, slot, size, pops, pushes, format).
+# Slots of EXTENDED opcodes not listed here are free (size 0; never valid final bytecode).
+FINAL_ONLY = [
+    ('extended', 'using_check', 2, 0, 0, 'none'),  # then an EXTENDED opcode's number and its operands (finalInfo)
+    # get_field2, written when one or two plain argument reads and call_method follow.
+    ('call_native_method', 'check_brand', 5, 1, 2, 'atom'),
+]
 
 
 def literal(data):
@@ -105,6 +128,19 @@ def main():
     if [entry[1] for entry in entries[temporary_start:temporary_end]] != [entry[1] for entry in temporary]:
         raise SystemExit('Temporary opcode block no longer follows nop')
     format_ids = {name: index for index, name in enumerate(formats)}
+    slots = {name: index for index, (_, name, *_rest) in enumerate(regular)}
+    for name in EXTENDED:
+        size, fmt = int(regular[slots[name]][2]), regular[slots[name]][5]
+        if slots[name] >= temporary_start or fmt not in ('none', 'u8') or size > 2:
+            raise SystemExit(f'{name} cannot be extended')
+    final = list(regular)
+    for name in EXTENDED:
+        final[slots[name]] = ('DEF', 'free', '0', '0', '0', 'none')
+    for name, slot, size, pops, pushes, fmt in FINAL_ONLY:
+        if slot not in EXTENDED or final[slots[slot]][1] != 'free':
+            raise SystemExit(f'{name} needs the free slot of an extended opcode')
+        final[slots[slot]] = ('DEF', name, str(size), str(pops), str(pushes), fmt)
+    compile_entries = regular[:temporary_start] + temporary
     lines = prelude(pin['revision'])
     lines += ['import silk.core.ownership { Copy }', '',
               'pub struct OpcodeInfo { pub size: u8, pub pops: u8, pub pushes: u8, pub format: u8 }',
@@ -113,22 +149,63 @@ def main():
     lines += ['']
     lines += [f'pub const OP_{entry[1]}: u8 = {index}' for index, entry in enumerate(regular)]
     lines += [f'pub const OP_{entry[1]}: u8 = {temporary_start + index}' for index, entry in enumerate(temporary)]
+    lines += [f'pub const OP_{name}: u8 = {slots[slot]}  // final bytecode only, in {slot}\'s slot'
+              for name, slot, *_rest in FINAL_ONLY]
+    # Final-bytecode overrides follow entries: one free entry, then FINAL_ONLY.
+    overrides = [('DEF', 'free', '0', '0', '0', 'none')] + [
+        ('DEF', name, str(size), str(pops), str(pushes), fmt) for name, _, size, pops, pushes, fmt in FINAL_ONLY]
+    final_slot = bytearray(temporary_start)
+    for name in EXTENDED:
+        final_slot[slots[name]] = 1
+    for index, (name, slot, *_rest) in enumerate(FINAL_ONLY):
+        final_slot[slots[slot]] = index + 2
+    extended = bytearray(256)
+    for name in EXTENDED:
+        extended[slots[name]] = 1
     lines += [f'pub const OP_COUNT: usize = {len(regular)}',
               f'pub const OP_TEMP_START: u8 = {temporary_start}',
               f'pub const OP_TEMP_END: u8 = {temporary_end}', '',
-              '// Parser metadata uses temporary opcodes; final bytecode uses short opcodes.',
+              '// Parser metadata uses temporary opcodes; final bytecode uses short opcodes',
+              '// and, in the slots of extended opcodes, the final-only opcodes.',
               'fn metadataIndex(opcode: u8, short: bool) -> usize {',
               '  let mut index = u8.toUsize(opcode)',
-              f'  if short && opcode >= OP_TEMP_START {{ index = index + {len(temporary)} }}',
+              '  if short {',
+              f'    if opcode >= OP_TEMP_START {{ index = index + {len(temporary)} }}',
+              '    else {',
+              f'      let slot = {literal(final_slot)}[index]',
+              f'      if slot != 0 {{ index = {len(entries) - 1} + u8.toUsize(slot) }}',
+              '    }',
+              '  }',
               '  return index', '}', '']
-    data = bytes(value for _, _, size, pops, pushes, fmt in entries
+    data = bytes(value for _, _, size, pops, pushes, fmt in entries + overrides
                  for value in (int(size), int(pops), int(pushes), format_ids[fmt]))
     lines += ['pub fn opcodeInfo(opcode: u8, short: bool) -> OpcodeInfo {',
               '  let index = metadataIndex(opcode, short) * 4',
               f'  let table = {literal(data)}',
               '  return OpcodeInfo { size: table[index], pops: table[index + 1], pushes: table[index + 2], format: table[index + 3] }',
+              '}', '',
+              '/// Whether final bytecode writes this (compiler) opcode behind OP_extended.',
+              'pub fn isExtended(opcode: u8) -> bool {',
+              f'  return {literal(extended)}[u8.toUsize(opcode)] != 0',
+              '}', '',
+              '/// The metadata of the final-bytecode instruction whose first two bytes are',
+              '/// first and second (second is 0 when first is the last byte). An extended',
+              '/// instruction reads as one opaque instruction: its size counts the prefix,',
+              '/// and its format is none even when its opcode takes a u8 operand. Size 0',
+              '/// marks an opcode that final bytecode never holds.',
+              'pub fn finalInfo(first: u8, second: u8) -> OpcodeInfo {',
+              '  if first != OP_extended { return opcodeInfo(first, true) }',
+              '  if !isExtended(second) { return OpcodeInfo { size: 0, pops: 0, pushes: 0, format: OP_FMT_none } }',
+              '  let info = opcodeInfo(second, false)',
+              '  return OpcodeInfo { size: info.size + 1, pops: info.pops, pushes: info.pushes, format: OP_FMT_none }',
+              '}', '',
+              '/// finalInfo of the instruction at pos of final bytecode code (pos < code.length).',
+              'pub fn finalInfoAt(code: &[u8], pos: usize) -> OpcodeInfo {',
+              '  let mut second: u8 = 0',
+              '  if pos + 1 < code.length { second = code[pos + 1] }',
+              '  return finalInfo(code[pos], second)',
               '}', '']
-    emit_names(lines, [entry[1].encode() for entry in entries], 'opcodeName', 'opcode: u8, short: bool', 'metadataIndex(opcode, short)')
+    emit_names(lines, [entry[1].encode() for entry in entries + overrides], 'opcodeName', 'opcode: u8, short: bool', 'metadataIndex(opcode, short)')
     (ROOT / 'src/js_opcode_data.silk').write_text('\n'.join(lines))
     print(f'Generated {len(atoms)} atoms, {len(regular)} VM opcodes, {len(temporary)} temporary opcodes, {len(formats)} formats')
 

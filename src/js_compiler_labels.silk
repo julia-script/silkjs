@@ -34,6 +34,8 @@ fn matchedLine(cc: &CodeContext, line: &mut i32) -> () {
 effect fn unchanged(fd: &mut FunctionDef, bytes: &[u8], out: &mut ByteBuffer, position: i32, length: i32, line: i32) -> ()
   ! OutOfMemoryError ? &mut Allocator {
   run addPosition(&mut fd, &out.*, line)
+  // Final bytecode writes a cold opcode after the OP_extended prefix byte.
+  if op.isExtended(bytes[i32.toUsize(position)]) { run out.append(op.OP_extended) }
   run out.appendSlice(Slice.view<u8>(bytes, i32.toUsize(position), i32.toUsize(length)))
   if bytes[i32.toUsize(position)] == op.OP_is_undefined_or_null { fd.nullishEnd = usize.toI32(out.length()) }
 }
@@ -152,6 +154,14 @@ effect fn resolveInstruction(fd: &mut FunctionDef, table: &mut AtomTable, bytes:
       run addPosition(&mut fd, &out.*, line.*)
       run out.append(i32.toU8(opcode(op.OP_push_const8) + opcode(code) - opcode(op.OP_push_const)))
       run out.append(i32.toU8(index)) return next
+    }
+  } else if code == op.OP_get_field2 {
+    let atom = readU32(bytes, pos + 1)
+    let collection = atom == atoms.JS_ATOM_get || atom == atoms.JS_ATOM_set || atom == atoms.JS_ATOM_has
+      || atom == atoms.JS_ATOM_delete || atom == atoms.JS_ATOM_add
+    if collection && plainMethodCall(bytes, next) {
+      run addPosition(&mut fd, &out.*, line.*)
+      run out.append(op.OP_call_native_method) run out.writeU32(readU32(bytes, pos + 1)) return next
     }
   } else if code == op.OP_get_field {
     let atom = readU32(bytes, pos + 1)
@@ -304,11 +314,13 @@ effect fn resolveInstruction(fd: &mut FunctionDef, table: &mut AtomTable, bytes:
 
 effect fn resolve(fd: &mut FunctionDef, table: &mut AtomTable, source: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
   if fd.bytecodeError { fail OutOfMemoryError {} }
-  // Every rewrite is nonexpanding. The entire initialization prelude is at most
-  // 43 bytes. Reserving before consuming any atom makes all subsequent emission
-  // and metadata appends allocation-free; an OOM leaves the old owning bytecode.
-  if fd.bytecode.length() > MAX_BYTECODE_CAPACITY - 43 { fail OutOfMemoryError {} }
-  let capacity = fd.bytecode.length() + 43
+  // Every rewrite but the OP_extended prefix is nonexpanding. The entire
+  // initialization prelude is at most 43 bytes. Reserving before consuming any
+  // atom makes all subsequent emission and metadata appends allocation-free; an
+  // OOM leaves the old owning bytecode.
+  let prefixes = extendedCount(fd.bytecode.asSlice())
+  if fd.bytecode.length() > MAX_BYTECODE_CAPACITY - 43 - prefixes { fail OutOfMemoryError {} }
+  let capacity = fd.bytecode.length() + 43 + prefixes
   let mut out = ByteBuffer.make()
   run out.reserveExact(capacity)
   let jumpCapacity = fd.jumpCapacity
@@ -339,6 +351,17 @@ effect fn resolve(fd: &mut FunctionDef, table: &mut AtomTable, source: &[u8]) ->
   run computePc2Line(&mut fd, source)
   fd.lineNumbers = ThinList<PcSourcePosition>.make()
 }
+/// How many instructions of compiler bytecode final bytecode writes behind the
+/// OP_extended prefix (an upper bound: dead code is counted too).
+fn extendedCount(bytes: &[u8]) -> usize {
+  let mut count: usize = 0 let mut position: usize = 0
+  while position < bytes.length {
+    let code = bytes[position]
+    if op.isExtended(code) { count = count + 1 }
+    position = position + u8.toUsize(op.opcodeInfo(code, false).size)
+  }
+  return count
+}
 effect fn failed(error: OutOfMemoryError) -> bool { drop error return false }
 effect fn resolveSuccess(fd: &mut FunctionDef, table: &mut AtomTable, source: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
   run resolve(&mut fd, &mut table, source) return true
@@ -352,6 +375,39 @@ pub effect fn resolveLabels(tree: &mut FunctionTree, cell: FunctionId, source: &
   let runtime = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, fd.runtime)
   let ok = run Effect.catchAll(resolveSuccess(&mut fd.*, &mut runtime.atoms, source), failed)
   if !ok { fd.bytecodeError = true fail OutOfMemoryError {} }
+}
+/// Whether one or two plain argument reads (get_loc of a local below 256,
+/// get_arg of one of the first four, push_i32 of a byte) then call_method of
+/// that many come next: the get_field2 of a Map or Set method name before them
+/// becomes call_native_method, whose VM arm answers Map, Set, WeakMap and
+/// WeakSet methods from the reads in place. A lone get_arg whose call is
+/// returned keeps get_field2, the shape js_bytecode.forwardingAccessor (and
+/// js_vm_leaf.accessor, which reads it on every leaf accessor run) looks for.
+fn plainMethodCall(bytes: &[u8], next: i32) -> bool {
+  let mut pos = i32.toUsize(next) let mut count: u16 = 0 let mut argument = false
+  while pos < bytes.length {
+    let code = bytes[pos]
+    if code == op.OP_line_num { pos = pos + 5 continue }
+    if code == op.OP_call_method {
+      if count == 0 || pos + 3 > bytes.length || readU16(bytes, pos + 1) != count { return false }
+      if count == 1 && argument {
+        let mut after = pos + 3
+        while after < bytes.length && bytes[after] == op.OP_line_num { after = after + 5 }
+        if after < bytes.length && bytes[after] == op.OP_return { return false }
+      }
+      return true
+    }
+    if count == 2 { return false }
+    if code == op.OP_get_loc && pos + 3 <= bytes.length && readU16(bytes, pos + 1) < 256 { pos = pos + 3 }
+    else if code == op.OP_get_arg && pos + 3 <= bytes.length && readU16(bytes, pos + 1) < 4 { pos = pos + 3 argument = true }
+    else if code == op.OP_push_i32 && pos + 5 <= bytes.length {
+      let value = signedWord(readU32(bytes, pos + 1))
+      if value < -128 || value > 127 { return false }
+      pos = pos + 5
+    } else { return false }
+    count = count + 1
+  }
+  return false
 }
 /// Whether a get_field of an atom other than length (which becomes get_length)
 /// comes next: a get_loc or get_arg before it then fuses into get_loc_field8 or
