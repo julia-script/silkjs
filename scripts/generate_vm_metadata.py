@@ -45,6 +45,12 @@ REPLACEMENTS = {
     # `local.f = v;` with v a local or an argument: put_field into the local's
     # object, the atom, the object's local, then the value's local or
     # argument, both read in place.
+    # Four hold a binary operator with an Int right operand: push_i16 (or a
+    # shorter push) of the immediate, then the operator.
+    'put_var_ref2': ('add_imm', 3, 1, 1, 'i16'),
+    'put_var_ref3': ('sar_imm', 3, 1, 1, 'i16'),
+    'set_var_ref0': ('and_imm', 3, 1, 1, 'i16'),
+    'set_var_ref1': ('or_imm', 3, 1, 1, 'i16'),
     'set_var_ref2': ('put_loc_field_loc8', 7, 0, 0, 'atom_u16'),
     'set_var_ref3': ('put_loc_field_arg8', 7, 0, 0, 'atom_u16'),
 }
