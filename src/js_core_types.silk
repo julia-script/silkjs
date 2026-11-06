@@ -1311,13 +1311,45 @@ pub struct MappedArgumentsData {
 pub struct TypedArrayCache {
   pub view: *mut HeapHeader,
   pub cachedData: ?*mut u8,
-  pub count: u64,
-  /// Physical backing policy, refreshed when a native host publishes private bytes.
-  pub shared: bool,
-  /// Immutable view policy: auto-length tracking OR a non-shared resizable
-  /// backing buffer. Source track_rab/max_byte_length/shared never change after
-  /// construction, so detach/resize only invalidate cachedData/count, not this bit.
-  pub requiresExtensible: bool
+  /// The element count (not byte length) in the low 62 bits, with shared and
+  /// requiresExtensible above it: three words keep ObjectPayload at four.
+  bits: u64
+}
+impl Copy for TypedArrayCache {}
+const TYPED_SHARED: u64 = 0x8000000000000000
+const TYPED_REQUIRES_EXTENSIBLE: u64 = 0x4000000000000000
+const TYPED_COUNT: u64 = 0x3fffffffffffffff
+impl TypedArrayCache {
+  /// shared: the physical backing policy, refreshed when a native host publishes
+  /// private bytes. requiresExtensible: the immutable view policy, auto-length
+  /// tracking OR a non-shared resizable backing buffer; source
+  /// track_rab/max_byte_length/shared never change after construction, so
+  /// detach/resize only invalidate cachedData/count, not this bit.
+  pub fn make(view: *mut HeapHeader, cachedData: ?*mut u8, count: u64, shared: bool, requiresExtensible: bool) -> TypedArrayCache {
+    if count > TYPED_COUNT { Intrinsic.trap("typed array element count exceeds 62 bits") }
+    let mut bits = count
+    if shared { bits = bits | TYPED_SHARED }
+    if requiresExtensible { bits = bits | TYPED_REQUIRES_EXTENSIBLE }
+    return TypedArrayCache { view: view, cachedData: cachedData, bits: bits }
+  }
+  @inlineAlways
+  pub fn count(self: &Self) -> u64 { return self.bits & TYPED_COUNT }
+  @inlineAlways
+  pub fn setCount(self: &mut Self, count: u64) -> () {
+    if count > TYPED_COUNT { Intrinsic.trap("typed array element count exceeds 62 bits") }
+    self.bits = (self.bits & ~TYPED_COUNT) | count
+  }
+  @inlineAlways
+  pub fn shared(self: &Self) -> bool { return (self.bits & TYPED_SHARED) != 0 }
+  @inlineAlways
+  pub fn setShared(self: &mut Self, value: bool) -> () {
+    if value { self.bits = self.bits | TYPED_SHARED } else { self.bits = self.bits & ~TYPED_SHARED }
+  }
+  @inlineAlways
+  pub fn requiresExtensible(self: &Self) -> bool { return (self.bits & TYPED_REQUIRES_EXTENSIBLE) != 0 }
+  pub fn setRequiresExtensible(self: &mut Self, value: bool) -> () {
+    if value { self.bits = self.bits | TYPED_REQUIRES_EXTENSIBLE } else { self.bits = self.bits & ~TYPED_REQUIRES_EXTENSIBLE }
+  }
 }
 /// Both strings are owned flat strings (null before initialization), kept as their
 /// cells so the payload stays two words; bytecode also contains regexp flags.
@@ -1391,7 +1423,12 @@ const OBJECT_IMMUTABLE_PROTOTYPE: u8 = 64
 const OBJECT_HTML_DDA: u8 = 128
 /// ObjectData.roles: the object is (or was) the prototype of some shape, so a
 /// change to its shape bumps RuntimeState.shapeEpoch (js_shapes.noteShapeChange).
-const OBJECT_ROLE_PROTOTYPE: u8 = 1
+const OBJECT_ROLE_PROTOTYPE: u8 = 128
+/// ObjectData.roles: the slots start right after the payload's tag word (see
+/// ObjectData.slotData), so their address is the object's, not slotData.
+const OBJECT_SLOTS_OVER_PAYLOAD: u8 = 64
+/// Bytes of ObjectPayload's tag word: an Empty payload's only meaningful bytes.
+pub const PAYLOAD_TAG_BYTES: usize = 8
 @inlineAlways
 fn objectFlag(flags: u8, bit: u8, value: bool) -> u8 {
   if value { return u8.bitOr(flags, bit) }
@@ -1401,17 +1438,20 @@ fn objectFlag(flags: u8, bit: u8, value: bool) -> u8 {
 /// the boolean properties as flag bits, a 16-bit class id and the weak count.
 pub struct ObjectData {
   flags: u8,
-  /// OBJECT_ROLE_* bits in bit 0, and the slot list's SlotParts.room in bits 1
-  /// to 6 (slotParts): the byte the flags leave before classBits.
+  /// The slot list's SlotParts.room in bits 0 to 5 (slotParts) and OBJECT_ROLE_*
+  /// bits above them: the byte the flags leave before classBits.
   roles: u8,
   classBits: u16,
   /// Weak liveness count, NOT a second strong JS reference count.
   pub weakRefCount: u32,
   pub shape: *mut HeapHeader,
+  pub payload: ObjectPayload,
   /// The slots: with their count and capacity in roles when they are in the
   /// object's cell, or in a block of their own with its header (SlotParts).
-  slotData: ?*mut SlotBits,
-  pub payload: ObjectPayload
+  /// Last, so that a plain object's slots can start right after its payload's
+  /// tag word and cover both (OBJECT_SLOTS_OVER_PAYLOAD): this word is then
+  /// slot bytes, never read or written as a pointer.
+  slotData: ?*mut SlotBits
 }
 impl ObjectData {
   /// A fresh extensible object of classId over shape; every other flag is clear.
@@ -1421,7 +1461,7 @@ impl ObjectData {
     if exotic { flags = u8.bitOr(flags, OBJECT_EXOTIC) }
     if fastArray { flags = u8.bitOr(flags, OBJECT_FAST_ARRAY) }
     let parts = properties.intoParts()
-    return ObjectData { flags: flags, roles: u8.shiftLeft(parts.room, 1), classBits: classBits(classId), weakRefCount: 0, shape: shape, slotData: parts.data, payload: move payload }
+    return ObjectData { flags: flags, roles: parts.room, classBits: classBits(classId), weakRefCount: 0, shape: shape, payload: move payload, slotData: parts.data }
   }
   /// The class id. Like the source, objects keep 16 bits of it.
   @inlineAlways
@@ -1470,12 +1510,39 @@ impl ObjectData {
   // The property slots. Only these methods see how they are stored.
   @inlineAlways
   fn slotParts(self: &Self) -> SlotParts<SlotBits> {
-    return SlotParts<SlotBits> { data: self.slotData, room: u8.bitAnd(u8.shiftRight(self.roles, 1), 63) }
+    let room = u8.bitAnd(self.roles, 63)
+    if u8.bitAnd(self.roles, OBJECT_SLOTS_OVER_PAYLOAD) != 0 {
+      // Taken (room 0): no slots, and slotData holds dead slot bytes.
+      if room == 0 { return SlotParts<SlotBits>.make() }
+      return SlotParts<SlotBits> { data: unsafe Intrinsic.pointerRequalify<*mut SlotBits, ?*mut SlotBits>(self.overPayload()), room: room }
+    }
+    return SlotParts<SlotBits> { data: self.slotData, room: room }
   }
+  /// Where slots over the payload start: right after its tag word.
+  @inlineAlways
+  pub fn overPayload(self: &Self) -> *mut SlotBits {
+    let payload = unsafe Intrinsic.pointerRequalify<*const u8, *mut u8>(unsafe Intrinsic.pointerReinterpret<*const ObjectPayload, *const u8>(Pointer.fromRef<ObjectPayload>(&self.payload)))
+    return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut SlotBits>(unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(payload), PAYLOAD_TAG_BYTES))
+  }
+  /// Whether the slots start over the payload (see slotData).
+  @inlineAlways
+  pub fn slotsOverPayload(self: &Self) -> bool { return u8.bitAnd(self.roles, OBJECT_SLOTS_OVER_PAYLOAD) != 0 && u8.bitAnd(self.roles, 63) != 0 }
   @inlineAlways
   fn storeSlotParts(self: &mut Self, parts: SlotParts<SlotBits>) -> () {
+    let kept = u8.bitAnd(self.roles, OBJECT_ROLE_PROTOTYPE)
+    let over = Pointer.address<SlotBits>(self.overPayload())
+    if parts.room != 0 && Pointer.address<SlotBits>(parts.data) == over {
+      self.roles = u8.bitOr(u8.bitOr(kept, OBJECT_SLOTS_OVER_PAYLOAD), parts.room)
+      return ()
+    }
+    // Emptying slots over the payload: slotData is slot bytes still in use by
+    // the taker (takeSlots), so leave it and keep the flag.
+    if Pointer.isNull<SlotBits>(parts.data) && u8.bitAnd(self.roles, OBJECT_SLOTS_OVER_PAYLOAD) != 0 {
+      self.roles = u8.bitOr(kept, OBJECT_SLOTS_OVER_PAYLOAD)
+      return ()
+    }
     self.slotData = parts.data
-    self.roles = u8.bitOr(u8.bitAnd(self.roles, OBJECT_ROLE_PROTOTYPE), u8.shiftLeft(parts.room, 1))
+    self.roles = u8.bitOr(kept, parts.room)
   }
   @inlineAlways
   pub fn slotCount(self: &Self) -> usize { return self.slotParts().length() }
