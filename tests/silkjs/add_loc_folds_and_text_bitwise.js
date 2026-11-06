@@ -26,6 +26,24 @@ check(captured(), 2, "captured");
 check(getterSum(), 4, "getter sum");
 check(calls, 2, "getter calls");
 
+// Element reads folded the same way: t[k] and t[i] into add_loc.
+function elementSums(t) { var s = 0; for (var i = 0; i < t.length; i++) { s += t[i]; s += t[0]; } return s; }
+function elementGetter() {
+  var s = 1;
+  var o = { get 0() { s = 100; return 1; } };
+  s += o[0];
+  return s;
+}
+function elementText() { var s = "a"; var t = ["b", 2]; var i = 1; s += t[0]; s += t[i]; return s; }
+function elementMissing() { var s = 1; var t = null; try { s += t[0]; } catch (e) { return s + ":" + e.name; } return "no throw"; }
+for (let k = 0; k < 200; k++) {
+  check(elementSums(new Int32Array([1, 2, 3])), 9, "typed sums");
+  check(elementSums([0.5, 1, 2]), 5, "array sums");
+  check(elementText(), "ab2", "element text");
+}
+check(elementGetter(), 2, "element getter");
+check(elementMissing(), "1:TypeError", "element missing");
+
 function bitwise(s, n) { return [s | 0, s & n, n ^ s, s | n, n | s, s << 1, s >> 1, s >>> 0]; }
 for (let k = 0; k < 200; k++) {
   check(JSON.stringify(bitwise("12345", 6)), JSON.stringify([12345, 0, 12351, 12351, 12351, 24690, 6172, 12345]), "int text");
