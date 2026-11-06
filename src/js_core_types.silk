@@ -16,7 +16,7 @@ import silk.mem.box { Box }
 import silk.mem.layout { Layout }
 import silk.collections.list { List }
 import silk.collections.slice { Slice }
-import thin_list { ThinList, BoxList }
+import thin_list { ThinList, BoxList, SlotList, SlotParts }
 import silk.core.option { Option }
 import silk.core.ownership { Copy, Drop }
 import silk.mem.pointer { Pointer }
@@ -586,7 +586,7 @@ pub struct RuntimeState {
   /// reuse by new objects so that a short-lived object skips one allocate/free
   /// pair. Each bin (js_shapes.spareSlotBin) occupies SPARE_SLOTS_PER_BIN entries;
   /// js_gc owns this cache.
-  pub spareSlots: List<ThinList<SlotBits>>,
+  pub spareSlots: List<SlotList<SlotBits>>,
   pub spareSlotCounts: [usize; 7],
   /// Emptied fast-array value lists of capacity 1 to SPARE_VALUE_CAPACITY, by capacity (js_shapes).
   pub spareValues: List<ThinList<ValueBits>>,
@@ -1401,24 +1401,27 @@ fn objectFlag(flags: u8, bit: u8, value: bool) -> u8 {
 /// the boolean properties as flag bits, a 16-bit class id and the weak count.
 pub struct ObjectData {
   flags: u8,
-  /// OBJECT_ROLE_* bits, in the byte the flags leave before classBits.
+  /// OBJECT_ROLE_* bits in bit 0, and the slot list's SlotParts.room in bits 1
+  /// to 6 (slotParts): the byte the flags leave before classBits.
   roles: u8,
   classBits: u16,
   /// Weak liveness count, NOT a second strong JS reference count.
   pub weakRefCount: u32,
   pub shape: *mut HeapHeader,
-  /// Two words instead of a List's five: the slots, their count and capacity.
-  slotList: ThinList<SlotBits>,
+  /// The slots: with their count and capacity in roles when they are in the
+  /// object's cell, or in a block of their own with its header (SlotParts).
+  slotData: ?*mut SlotBits,
   pub payload: ObjectPayload
 }
 impl ObjectData {
   /// A fresh extensible object of classId over shape; every other flag is clear.
-  pub fn make(classId: u32, shape: *mut HeapHeader, properties: ThinList<SlotBits>, payload: ObjectPayload,
+  pub fn make(classId: u32, shape: *mut HeapHeader, properties: SlotList<SlotBits>, payload: ObjectPayload,
     exotic: bool, fastArray: bool) -> ObjectData {
     let mut flags = OBJECT_EXTENSIBLE
     if exotic { flags = u8.bitOr(flags, OBJECT_EXOTIC) }
     if fastArray { flags = u8.bitOr(flags, OBJECT_FAST_ARRAY) }
-    return ObjectData { flags: flags, roles: 0, classBits: classBits(classId), weakRefCount: 0, shape: shape, slotList: move properties, payload: move payload }
+    let parts = properties.intoParts()
+    return ObjectData { flags: flags, roles: u8.shiftLeft(parts.room, 1), classBits: classBits(classId), weakRefCount: 0, shape: shape, slotData: parts.data, payload: move payload }
   }
   /// The class id. Like the source, objects keep 16 bits of it.
   @inlineAlways
@@ -1466,52 +1469,70 @@ impl ObjectData {
 
   // The property slots. Only these methods see how they are stored.
   @inlineAlways
-  pub fn slotCount(self: &Self) -> usize { return self.slotList.length() }
+  fn slotParts(self: &Self) -> SlotParts<SlotBits> {
+    return SlotParts<SlotBits> { data: self.slotData, room: u8.bitAnd(u8.shiftRight(self.roles, 1), 63) }
+  }
   @inlineAlways
-  pub fn slotCapacity(self: &Self) -> usize { return self.slotList.capacity() }
+  fn storeSlotParts(self: &mut Self, parts: SlotParts<SlotBits>) -> () {
+    self.slotData = parts.data
+    self.roles = u8.bitOr(u8.bitAnd(self.roles, OBJECT_ROLE_PROTOTYPE), u8.shiftLeft(parts.room, 1))
+  }
+  @inlineAlways
+  pub fn slotCount(self: &Self) -> usize { return self.slotParts().length() }
+  @inlineAlways
+  pub fn slotCapacity(self: &Self) -> usize { return self.slotParts().capacity() }
   /// The slot at index. Traps unless index is below slotCount.
   @inlineAlways
-  pub fn slot(self: &Self, index: usize) -> SlotBits { return self.slotList.get(index) }
+  pub fn slot(self: &Self, index: usize) -> SlotBits { return self.slotParts().get(index) }
   @inlineAlways
-  pub fn setSlot(self: &mut Self, index: usize, value: SlotBits) -> () { self.slotList.set(index, value) }
+  pub fn setSlot(self: &mut Self, index: usize, value: SlotBits) -> () { let mut parts = self.slotParts() parts.set(index, value) }
   /// slot without the bounds check, for an index the shape keeps in range.
   @inlineAlways
-  pub unsafe fn slotUnchecked(self: &Self, index: usize) -> SlotBits { return unsafe self.slotList.getUnchecked(index) }
+  pub unsafe fn slotUnchecked(self: &Self, index: usize) -> SlotBits { return unsafe self.slotParts().getUnchecked(index) }
   @inlineAlways
-  pub unsafe fn setSlotUnchecked(self: &mut Self, index: usize, value: SlotBits) -> () { unsafe self.slotList.setUnchecked(index, value) }
+  pub unsafe fn setSlotUnchecked(self: &mut Self, index: usize, value: SlotBits) -> () { let mut parts = self.slotParts() unsafe parts.setUnchecked(index, value) }
   /// Whether the slots live in the object's own cell.
   @inlineAlways
-  pub fn slotsInCell(self: &Self) -> bool { return self.slotList.borrowsStorage() }
+  pub fn slotsInCell(self: &Self) -> bool { return self.slotParts().borrowsStorage() }
   @inlineAlways
-  pub fn slotsOwned(self: &Self) -> bool { return self.slotList.ownsStorage() }
+  pub fn slotsOwned(self: &Self) -> bool { return self.slotParts().ownsStorage() }
   @inlineAlways
-  pub fn slotView(self: &Self) -> &[SlotBits] { return self.slotList.asSlice() }
+  pub fn slotView(self: &Self) -> &[SlotBits] { return unsafe SlotParts<SlotBits>.slice<Self>(self.slotParts(), self) }
   @inlineAlways
-  pub fn truncateSlots(self: &mut Self, length: usize) -> () { self.slotList.truncate(length) }
+  pub fn truncateSlots(self: &mut Self, length: usize) -> () { let mut parts = self.slotParts() parts.truncate(length) self.storeSlotParts(parts) }
   @inlineAlways
-  pub unsafe fn pushSlotUnchecked(self: &mut Self, value: SlotBits) -> () { unsafe self.slotList.pushUnchecked(value) }
+  pub unsafe fn pushSlotUnchecked(self: &mut Self, value: SlotBits) -> () { let mut parts = self.slotParts() unsafe parts.pushUnchecked(value) self.storeSlotParts(parts) }
   @inlineAlways
-  pub fn pushSlot(self: &mut Self, value: SlotBits) -> () { self.slotList.push(value) }
-  pub effect fn appendSlot(self: &mut Self, value: SlotBits) -> () ! OutOfMemoryError ? &mut Allocator { run self.slotList.append(value) }
-  pub effect fn reserveSlots(self: &mut Self, additional: usize) -> () ! OutOfMemoryError ? &mut Allocator { run self.slotList.reserveExact(additional) }
+  pub fn pushSlot(self: &mut Self, value: SlotBits) -> () { let mut parts = self.slotParts() parts.push(value) self.storeSlotParts(parts) }
+  pub effect fn appendSlot(self: &mut Self, value: SlotBits) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut parts = self.slotParts() run parts.append(value) self.storeSlotParts(parts)
+  }
+  pub effect fn reserveSlots(self: &mut Self, additional: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut parts = self.slotParts() run parts.reserveExact(additional) self.storeSlotParts(parts)
+  }
+  /// The first unused slot, for a caller that fills count of them and then calls
+  /// extendSlots(count). Traps when the list lacks room for count.
+  @inlineAlways
+  pub unsafe fn spareSlots(self: &mut Self, count: usize) -> [*]mut SlotBits { let mut parts = self.slotParts() return unsafe parts.spareFor(count) }
+  @inlineAlways
+  pub unsafe fn extendSlots(self: &mut Self, count: usize) -> () { let mut parts = self.slotParts() unsafe parts.extendFilled(count) self.storeSlotParts(parts) }
   /// Moves the slots out, leaving none.
   @inlineAlways
-  pub fn takeSlots(self: &mut Self) -> ThinList<SlotBits> {
-    let taken = unsafe Pointer.take<ThinList<SlotBits>>(Pointer.fromMutRef<ThinList<SlotBits>>(&mut self.slotList))
-    unsafe Pointer.put<ThinList<SlotBits>>(Pointer.fromMutRef<ThinList<SlotBits>>(&mut self.slotList), ThinList<SlotBits>.make())
-    return move taken
+  pub fn takeSlots(self: &mut Self) -> SlotList<SlotBits> {
+    let taken = self.slotParts()
+    self.storeSlotParts(SlotParts<SlotBits>.make())
+    return unsafe SlotList<SlotBits>.adopt(taken)
   }
   /// Replaces the slots (dropping the old ones) with slots.
   @inlineAlways
-  pub fn setSlots(self: &mut Self, slots: ThinList<SlotBits>) -> () { self.slotList = move slots }
+  pub fn setSlots(self: &mut Self, slots: SlotList<SlotBits>) -> () {
+    let mut old = self.slotParts()
+    self.storeSlotParts(slots.intoParts())
+    unsafe old.release()
+  }
   /// Stores slots over uninitialized slot storage, dropping nothing.
   @inlineAlways
-  pub unsafe fn putSlots(self: &mut Self, slots: ThinList<SlotBits>) -> () {
-    unsafe Pointer.put<ThinList<SlotBits>>(Pointer.fromMutRef<ThinList<SlotBits>>(&mut self.slotList), move slots)
-  }
-  /// The slot list itself, for code that still works on a ThinList.
-  @inlineAlways
-  pub fn slotListMut(self: &mut Self) -> &mut ThinList<SlotBits> { return &mut self.slotList }
+  pub unsafe fn putSlots(self: &mut Self, slots: SlotList<SlotBits>) -> () { self.storeSlotParts(slots.intoParts()) }
 }
 @inlineAlways
 fn classBits(classId: u32) -> u16 {
