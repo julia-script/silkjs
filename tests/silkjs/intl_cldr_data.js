@@ -46,3 +46,22 @@ const hour = (timeZone, date) => new Intl.DateTimeFormat('en-US', { timeZone, ho
 const summer = new Date(Date.UTC(2026, 6, 4, 12));
 assert([hour('America/Chicago', summer), hour('Australia/Sydney', summer), hour('Asia/Kathmandu', summer), hour('Pacific/Chatham', summer)], ['07', '22', '17', '00'], 'IANA offsets');
 assert(hour('America/Chicago', new Date(Date.UTC(2030, 0, 15, 0))), '18', 'rule-derived transitions');
+
+// Non-Gregorian calendars from CLDR: names, patterns, skeletons, numbering overrides and the
+// default calendar of each region. Expected values match Node 24.
+const day = new Date(Date.UTC(2026, 2, 20, 13, 5));
+assert(new Intl.DateTimeFormat("th", { ...{"dateStyle": "long"}, timeZone: 'UTC' }).format(day), "20 มีนาคม 2569", "th {\"dateStyle\": \"long\"}");
+assert(new Intl.DateTimeFormat("fa", { ...{"dateStyle": "long"}, timeZone: 'UTC' }).format(day), "۲۹ اسفند ۱۴۰۴", "fa {\"dateStyle\": \"long\"}");
+assert(new Intl.DateTimeFormat("en-u-ca-japanese", { ...{"dateStyle": "long"}, timeZone: 'UTC' }).format(day), "March 20, 8 Reiwa", "en-u-ca-japanese {\"dateStyle\": \"long\"}");
+assert(new Intl.DateTimeFormat("ja-u-ca-japanese", { ...{"dateStyle": "long"}, timeZone: 'UTC' }).format(day), "令和8年3月20日", "ja-u-ca-japanese {\"dateStyle\": \"long\"}");
+assert(new Intl.DateTimeFormat("he-u-ca-hebrew", { ...{"dateStyle": "long"}, timeZone: 'UTC' }).format(day), "ב׳ בניסן תשפ״ו", "he-u-ca-hebrew {\"dateStyle\": \"long\"}");
+assert(new Intl.DateTimeFormat("en-u-ca-hebrew", { ...{"year": "numeric", "month": "short", "day": "numeric"}, timeZone: 'UTC' }).format(day), "2 Nisan 5786", "en-u-ca-hebrew {\"year\": \"numeric\", \"month\": \"short\", \"day\": \"numeric\"}");
+assert(new Intl.DateTimeFormat("en-u-ca-islamic-civil", { ...{"dateStyle": "full"}, timeZone: 'UTC' }).format(day), "Friday, Shawwal 1, 1447 AH", "en-u-ca-islamic-civil {\"dateStyle\": \"full\"}");
+assert(new Intl.DateTimeFormat("en-u-ca-coptic", { ...{"dateStyle": "long"}, timeZone: 'UTC' }).format(day), "Baramhat 11, 1742 AM", "en-u-ca-coptic {\"dateStyle\": \"long\"}");
+assert(new Intl.DateTimeFormat("en-u-ca-roc", { ...{"year": "numeric", "month": "long"}, timeZone: 'UTC' }).format(day), "March 115 Minguo", "en-u-ca-roc {\"year\": \"numeric\", \"month\": \"long\"}");
+assert(new Intl.DateTimeFormat("en-u-ca-chinese", { ...{"dateStyle": "long"}, timeZone: 'UTC' }).format(day), "Second Month 2, 2026(bing-wu)", "en-u-ca-chinese {\"dateStyle\": \"long\"}");
+assert(new Intl.DateTimeFormat("zh-u-ca-chinese", { ...{"dateStyle": "long"}, timeZone: 'UTC' }).format(day), "2026丙午年二月初二", "zh-u-ca-chinese {\"dateStyle\": \"long\"}");
+assert(new Intl.DateTimeFormat("ko-u-ca-dangi", { ...{"dateStyle": "medium"}, timeZone: 'UTC' }).format(day), "43. 2. 2.", "ko-u-ca-dangi {\"dateStyle\": \"medium\"}");
+assert(new Intl.DateTimeFormat("en-u-ca-chinese", { ...{"era": "long", "year": "numeric", "month": "numeric", "day": "numeric"}, timeZone: 'UTC' }).format(day), "Mo2 2, 2026", "en-u-ca-chinese {\"era\": \"long\", \"year\": \"numeric\", \"month\": \"numeric\", \"day\": \"numeric\"}");
+assert(new Intl.DateTimeFormat("en-u-ca-buddhist", { ...{"year": "numeric"}, timeZone: 'UTC' }).format(day), "2569 BE", "en-u-ca-buddhist {\"year\": \"numeric\"}");
+assert(["th", "fa", "ps", "en", "ar-SA"].map((locale) => new Intl.DateTimeFormat(locale).resolvedOptions().calendar), ["buddhist", "persian", "persian", "gregory", "gregory"], 'default calendars');
