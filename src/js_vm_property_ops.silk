@@ -382,6 +382,61 @@ pub unsafe fn readFieldCachedAt(runtime: *mut HeapHeader, ip: *const u8, object:
   if !retain { unsafe lend(target) }
   return true
 }
+/// The inline field-cache key of the get_field, get_loc_field8 or
+/// get_arg_field8 whose atom operand is at ip (the FIELD_KEY_BYTES after it): an
+/// own data property's shape version shifted left 16 bits plus its slot index.
+/// Kept in the bytecode, a hit reads no cache line besides the code's own; the
+/// compiler (and the binary object reader) start it with no version (all ones).
+@inlineAlways
+unsafe fn fieldKeyAt(ip: *const u8) -> u64 {
+  return unsafe Pointer.readUnaligned<u64>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u64>(unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(ip), 4)))
+}
+/// The bytes from a field read's atom to its next operand or instruction.
+pub const FIELD_OPERAND_BYTES: usize = 12
+/// readFieldCachedAt for get_field and the fused field reads, by their inline key;
+/// a miss refills it (refillFieldKey) or takes the site cache.
+@inlineAlways
+pub unsafe fn readFieldKeyedAt(runtime: *mut HeapHeader, ip: *const u8, object: *mut HeapHeader, target: *mut ValueBits, retain: bool) -> bool {
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+  let key = unsafe fieldKeyAt(ip)
+  if u64.shiftRight(key, 16) == shape.version {
+    let found = (unsafe data.slotUnchecked(u64.toUsize(key & 0xffff))).valueBits()
+    if retain { unsafe Pointer.write<ValueBits>(target, unsafe found.retained()) } else { unsafe Pointer.write<ValueBits>(target, found) }
+    return true
+  }
+  drop shape drop data
+  return unsafe refillFieldKey(runtime, ip, object, target, retain)
+}
+/// readFieldKeyedAt's miss: an own data property found in its bucket becomes
+/// the site's inline key; anything else goes to the site cache (prototype hits).
+@inlineNever
+unsafe fn refillFieldKey(runtime: *mut HeapHeader, ip: *const u8, object: *mut HeapHeader, target: *mut ValueBits, retain: bool) -> bool {
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+  let atom = unsafe fieldAtomAt(ip)
+  let mut probe = unsafe shapes.unchecked<u32>(&shape.hashIndices, u32.toUsize(atom & shape.propertyHashMask))
+  while probe != 0 {
+    let index = u32.toUsize(probe - 1)
+    let property = unsafe shapes.unchecked<ShapeProperty>(&shape.properties, index)
+    if property.atom == atom {
+      if (u8.toU32(property.flags) & JS_PROP_TMASK) != 0 || index >= 0x10000 { break }
+      let found = (unsafe data.slotUnchecked(index)).valueBits()
+      if retain { unsafe Pointer.write<ValueBits>(target, unsafe found.retained()) } else { unsafe Pointer.write<ValueBits>(target, found) }
+      let key = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut align(1) u64>(unsafe Intrinsic.pointerRequalify<*const u8, *mut u8>(unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(ip), 4)))
+      unsafe Pointer.writeUnaligned<u64>(key, u64.shiftLeft(shape.version, 16) | usize.toU64(index))
+      return true
+    }
+    probe = property.hashNext
+  }
+  drop shape drop data
+  return unsafe readFieldCachedAt(runtime, ip, object, target, retain)
+}
+/// readFieldKeyedAt at machine's ip.
+@inlineAlways
+unsafe fn readFieldKeyed(machine: &Machine, object: *mut HeapHeader, target: *mut ValueBits, retain: bool) -> bool {
+  return unsafe readFieldKeyedAt(machine.runtime, machine.ip, object, target, retain)
+}
 /// readFieldCached's miss past the first own probe: a data property of the
 /// prototype of an ordinary object without an own record for atom refills the
 /// site's entry; anything else goes on as readInherited would.
@@ -659,14 +714,12 @@ pub unsafe fn pushCellField(machine: &mut Machine, cell: *mut ValueBits) -> bool
   let object = match unsafe Pointer.read<ValueBits>(cell) { ValueBits.Object { reference } => reference _ => { return false } }
   let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
   let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
-  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)
-  let site = Pointer.address<u8>(machine.ip)
-  let entry = state.fieldCache[fieldCacheIndex(site)]
-  if entry.site != site || u64.shiftRight(entry.key, 16) != shape.version { return false }
-  let found = (unsafe data.slotUnchecked(u64.toUsize(entry.key & 0xffff))).valueBits()
-  drop state drop shape drop data
+  let key = unsafe fieldKeyAt(machine.ip)
+  if u64.shiftRight(key, 16) != shape.version { return false }
+  let found = (unsafe data.slotUnchecked(u64.toUsize(key & 0xffff))).valueBits()
+  drop shape drop data
   unsafe machine.push(unsafe found.retained())
-  unsafe machine.skip(5)
+  unsafe machine.skip(FIELD_OPERAND_BYTES + 1)
   return true
 }
 /// get_loc_length8 and get_arg_length8 (ip at the slot index): a string's or an
@@ -753,8 +806,8 @@ pub unsafe fn cellFieldCached(machine: &mut Machine, cell: *mut ValueBits) -> bo
   match unsafe Pointer.read<ValueBits>(cell) {
     ValueBits.Object { reference } => {
       unsafe machine.push(ValueBits.Undefined)
-      if unsafe readFieldCached(&machine.*, reference, unsafe machine.topCell(1)) {
-        unsafe machine.skip(5)
+      if unsafe readFieldKeyed(&machine.*, reference, unsafe machine.topCell(1), true) {
+        unsafe machine.skip(FIELD_OPERAND_BYTES + 1)
         return true
       }
       drop unsafe machine.pop()
@@ -793,8 +846,8 @@ pub unsafe fn readFieldOperand(machine: &mut Machine) -> ?*mut HeapHeader {
     ValueBits.Object { reference } => reference
     _ => { return Pointer.null<HeapHeader>() }
   }
-  if !unsafe readFieldCached(&machine.*, object, unsafe machine.topCell(1)) { return Pointer.null<HeapHeader>() }
-  unsafe machine.skip(4)
+  if !unsafe readFieldKeyed(&machine.*, object, unsafe machine.topCell(1), true) { return Pointer.null<HeapHeader>() }
+  unsafe machine.skip(FIELD_OPERAND_BYTES)
   return object
 }
 /// readFieldOperand for js_vm_leaf, whose operands borrow: the value is left
@@ -807,8 +860,8 @@ pub unsafe fn peekFieldOperand(machine: &mut Machine) -> bool {
     _ => { return false }
   }
   let target = unsafe machine.topCell(1)
-  if !unsafe readFieldCachedAs(&machine.*, object, target, false) { return false }
-  unsafe machine.skip(4)
+  if !unsafe readFieldKeyed(&machine.*, object, target, false) { return false }
+  unsafe machine.skip(FIELD_OPERAND_BYTES)
   return true
 }
 /// readFieldOperand for a primitive string operand, out of line so the object
@@ -826,8 +879,8 @@ pub unsafe fn readStringFieldOperand(machine: &mut Machine) -> ?*mut HeapHeader 
     Option<*mut HeapHeader>.None => { return Pointer.null<HeapHeader>() }
   }
   // The site cache keys on the prototype's shape, as it would for an object.
-  if !unsafe readFieldCached(&machine.*, start, unsafe machine.topCell(1)) { return Pointer.null<HeapHeader>() }
-  unsafe machine.skip(4)
+  if !unsafe readFieldKeyed(&machine.*, start, unsafe machine.topCell(1), true) { return Pointer.null<HeapHeader>() }
+  unsafe machine.skip(FIELD_OPERAND_BYTES)
   return operand
 }
 /// Where a named get on a primitive string starts: String.prototype. length and
@@ -1669,6 +1722,7 @@ pub unsafe effect fn step<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + H
   if opcode == op.OP_get_field || opcode == op.OP_get_field2 || opcode == op.OP_get_length {
     let mut atom = atoms.JS_ATOM_length
     if opcode != op.OP_get_length { atom = unsafe machine.readU32() }
+    if opcode == op.OP_get_field { unsafe machine.skip(u8.toUsize(op.FIELD_KEY_BYTES)) }
     let value = run unsafe getField(&mut hooks, &mut machine, atom)
     if opcode == op.OP_get_field2 { unsafe machine.push(value) }
     else { unsafe gc.release(&mut hooks, machine.runtime, unsafe machine.top(1)) unsafe machine.set(1, value) }
