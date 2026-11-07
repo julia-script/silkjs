@@ -24,8 +24,9 @@ EXTENSIONS = [
     ('get_arg_el8', 3, 0, 1, 'u16'),  # get_arg array, get_loc8 index, then get_array_el
 ]
 
-# Final get_field, get_loc_field8 and get_arg_field8 keep an inline field-cache key
-# (shape version and slot) after their atom: js_vm_property_ops.readFieldInline.
+# Final get_field, get_loc_field8, get_arg_field8, put_field, put_loc_field_loc8 and
+# put_loc_field_arg8 keep an inline field-cache key after their atom
+# (js_vm_property_ops.fieldKeyAt).
 FIELD_KEY_BYTES = 8
 
 # Upstream final opcodes whose numbers silkjs reuses: name -> (name, size, pops, pushes, format).
@@ -150,14 +151,20 @@ def main():
               '  return index', '}', '']
     data = bytes(value for _, _, size, pops, pushes, fmt in entries
                  for value in (int(size), int(pops), int(pushes), format_ids[fmt]))
-    lines += ['/// Bytes of the inline field-cache key that final get_field, get_loc_field8 and',
-              '/// get_arg_field8 carry right after their atom (the parser view has none).',
+    lines += ['/// Bytes of the inline field-cache key that final get_field, get_loc_field8,',
+              '/// get_arg_field8, put_field, put_loc_field_loc8 and put_loc_field_arg8 carry',
+              '/// right after their atom (the parser view has none).',
               f'pub const FIELD_KEY_BYTES: u8 = {FIELD_KEY_BYTES}', '',
+              '/// The final opcodes that carry the inline field-cache key.',
+              'pub fn fieldKeyed(opcode: u8) -> bool {',
+              '  return opcode == OP_get_field || opcode == OP_get_loc_field8 || opcode == OP_get_arg_field8',
+              '    || opcode == OP_put_field || opcode == OP_put_loc_field_loc8 || opcode == OP_put_loc_field_arg8',
+              '}', '',
               'pub fn opcodeInfo(opcode: u8, short: bool) -> OpcodeInfo {',
               '  let index = metadataIndex(opcode, short) * 4',
               f'  let table = {literal(data)}',
               '  let mut size = table[index]',
-              '  if short && (opcode == OP_get_field || opcode == OP_get_loc_field8 || opcode == OP_get_arg_field8) { size = size + FIELD_KEY_BYTES }',
+              '  if short && fieldKeyed(opcode) { size = size + FIELD_KEY_BYTES }',
               '  return OpcodeInfo { size: size, pops: table[index + 1], pushes: table[index + 2], format: table[index + 3] }',
               '}', '']
     emit_names(lines, [entry[1].encode() for entry in entries], 'opcodeName', 'opcode: u8, short: bool', 'metadataIndex(opcode, short)')
