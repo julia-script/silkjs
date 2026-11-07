@@ -113,7 +113,12 @@ struct ArenaHeader {
   pendingNext: ?*mut u8,
   pendingListed: bool,
   cells: [u64; 16],
-  pending: [u64; 16]
+  pending: [u64; 16],
+  // sortIdleLists scratch: a bit per granule that starts an idle block, and the
+  // list of arenas with bits set. Clear outside a sort.
+  idleNext: ?*mut ArenaHeader,
+  idleListed: bool,
+  idle: [u64; 16]
 }
 
 @inlineAlways
@@ -161,6 +166,9 @@ struct Ledger {
   firstAllocation: ?*mut AllocationHeader,
   firstPooledArena: ?*mut ArenaHeader,
   nextAllocationId: u64,
+  // The allocation id at which the owner's idle lists are next put back in
+  // address order (see sortIdleLists).
+  nextSortId: u64,
   nextProfileEpoch: u64,
   // Only the allocation owner reads/writes this flag; reclaims use the gate.
   profiling: bool,
@@ -468,7 +476,7 @@ impl<A> RuntimeAllocator<A> {
       references: 1,
       gate: 0,
       stats: RuntimeMemoryStats { usedBytes: 0, peakBytes: 0, allocationCount: 0, limit: usize.MAX },
-      firstAllocation: Pointer.null<AllocationHeader>(), firstPooledArena: Pointer.null<ArenaHeader>(), nextAllocationId: 1,
+      firstAllocation: Pointer.null<AllocationHeader>(), firstPooledArena: Pointer.null<ArenaHeader>(), nextAllocationId: 1, nextSortId: FIRST_SORT_ID,
       nextProfileEpoch: 1, profiling: false, profile: Option<Recording>.none(),
       pool: Pool { enabled: false, heads: [Pointer.null<u8>(); 64], counts: [0; 64], arenas: Pointer.null<ArenaHeader>(), spare: Pointer.null<u8>(), spareCount: 0, spareRecords: Pointer.null<PoolRecord>(),
         fresh: [Pointer.null<u8>(); 64], freshBytes: [0; 64],
@@ -625,7 +633,9 @@ unsafe fn recordPooled(ledger: LedgerPointers, block: *mut u8, requestedBytes: u
   // A 64-bit count of allocations cannot wrap in practice; ids stay nonzero.
   state.nextAllocationId = u64.wrappingAdd(id, 1)
   let profiling = state.profiling
+  let sortDue = id >= state.nextSortId
   drop state
+  if sortDue { unsafe sortIdleLists(ledger, id) }
   if profiling { return unsafe recordProfiledPooled(ledger, block, requestedBytes, id) }
   unsafe Pointer.write<PoolRecord>(unsafe pooledRecord(block),
     PoolRecord { id: id, requestedBytes: requestedBytes, sampledEpoch: 0 })
@@ -700,7 +710,8 @@ effect fn takeArena<A>(self: &mut RuntimeAllocator<A>, class: usize, requestedBy
         Pointer.put<ArenaHeader>(owner, ArenaHeader { ledger: ledger.allocation, class: class, reciprocal: recordReciprocal(class),
           storage: Option<Intrinsic.RawBuffer<u8>>.none(), next: Pointer.null<ArenaHeader>(),
           nextLive: state.firstPooledArena, records: Intrinsic.pointerRequalify<?*mut PoolRecord, *mut PoolRecord>(spareRecords), carved: 0,
-          cellOwner: 0, cellNext: Pointer.null<u8>(), pendingNext: Pointer.null<u8>(), pendingListed: false, cells: [0; 16], pending: [0; 16] })
+          cellOwner: 0, cellNext: Pointer.null<u8>(), pendingNext: Pointer.null<u8>(), pendingListed: false, cells: [0; 16], pending: [0; 16],
+          idleNext: Pointer.null<ArenaHeader>(), idleListed: false, idle: [0; 16] })
         state.firstPooledArena = owner
         drop state
         unlockLedger(ledger)
@@ -742,7 +753,8 @@ effect fn takeArena<A>(self: &mut RuntimeAllocator<A>, class: usize, requestedBy
     Pointer.put<ArenaHeader>(owner, ArenaHeader { ledger: ledger.allocation, class: class, reciprocal: recordReciprocal(class),
       storage: Option<Intrinsic.RawBuffer<u8>>.some(move groupStorage), next: pool.arenas,
       nextLive: firstLive, records: records, carved: 0,
-      cellOwner: 0, cellNext: Pointer.null<u8>(), pendingNext: Pointer.null<u8>(), pendingListed: false, cells: [0; 16], pending: [0; 16] })
+      cellOwner: 0, cellNext: Pointer.null<u8>(), pendingNext: Pointer.null<u8>(), pendingListed: false, cells: [0; 16], pending: [0; 16],
+      idleNext: Pointer.null<ArenaHeader>(), idleListed: false, idle: [0; 16] })
     pool.arenas = Intrinsic.pointerRequalify<*mut ArenaHeader, ?*mut ArenaHeader>(owner)
     // A racing refill's leftover spares stay owned by its group, unused.
     pool.spare = Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(second)
@@ -1584,4 +1596,156 @@ pub unsafe fn releaseCellArenas(head: *mut ?*mut u8) -> () {
     header.pending = [0; 16]
     header.cells = [0; 16]
   }
+}
+
+@inlineAlways
+unsafe fn linkOf(block: *mut u8) -> ?*mut u8 { return unsafe Pointer.read<?*mut u8>(unsafe poolLink(block)) }
+@inlineAlways
+unsafe fn arenaIdleNext(arena: *mut ArenaHeader) -> ?*mut ArenaHeader {
+  let anchor = ()
+  return (unsafe Pointer.borrow<(), ArenaHeader>(&anchor, arena)).idleNext
+}
+@inlineAlways
+unsafe fn setArenaIdleNext(arena: *mut ArenaHeader, next: ?*mut ArenaHeader) -> () {
+  let mut anchor = ()
+  let header = unsafe Pointer.borrowMut<(), ArenaHeader>(&mut anchor, arena)
+  header.idleNext = next
+}
+@inlineAlways
+unsafe fn presentArena(arena: ?*mut ArenaHeader) -> *mut ArenaHeader {
+  return unsafe Intrinsic.pointerRequalify<?*mut ArenaHeader, *mut ArenaHeader>(arena)
+}
+
+// Merges two address-ordered arena lists linked through idleNext.
+unsafe fn mergeArenas(left: ?*mut ArenaHeader, right: ?*mut ArenaHeader) -> ?*mut ArenaHeader {
+  let mut a = left
+  let mut b = right
+  if Pointer.isNull<ArenaHeader>(a) { return b }
+  if Pointer.isNull<ArenaHeader>(b) { return a }
+  let mut head = a
+  let mut tail = unsafe presentArena(a)
+  if Pointer.address<ArenaHeader>(tail) < Pointer.address<ArenaHeader>(unsafe presentArena(b)) {
+    a = unsafe arenaIdleNext(tail)
+  } else {
+    head = b
+    tail = unsafe presentArena(b)
+    b = unsafe arenaIdleNext(tail)
+  }
+  while !Pointer.isNull<ArenaHeader>(a) && !Pointer.isNull<ArenaHeader>(b) {
+    let x = unsafe presentArena(a)
+    let y = unsafe presentArena(b)
+    if Pointer.address<ArenaHeader>(x) < Pointer.address<ArenaHeader>(y) {
+      unsafe setArenaIdleNext(tail, a) tail = x a = unsafe arenaIdleNext(x)
+    } else {
+      unsafe setArenaIdleNext(tail, b) tail = y b = unsafe arenaIdleNext(y)
+    }
+  }
+  if Pointer.isNull<ArenaHeader>(a) { unsafe setArenaIdleNext(tail, b) } else { unsafe setArenaIdleNext(tail, a) }
+  return head
+}
+
+// Puts an idle list in address order: each block sets its granule's bit in its
+// arena, the touched arenas (few) are merge-sorted, and the list is rebuilt by
+// scanning their bits. Skip words are rewritten to the block two ahead.
+unsafe fn sortByAddress(list: ?*mut u8) -> ?*mut u8 {
+  let mut touched = Pointer.null<ArenaHeader>()
+  let mut cursor = list
+  while !Pointer.isNull<u8>(cursor) {
+    let block = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(cursor)
+    cursor = unsafe linkOf(block)
+    let owner = unsafe arenaOf(block)
+    let granule = usize.bitAnd(Pointer.address<u8>(block), ARENA_BYTES - 1) / POOL_GRANULE
+    let mut anchor = ()
+    let header = unsafe Pointer.borrowMut<(), ArenaHeader>(&mut anchor, owner)
+    if !header.idleListed {
+      header.idleListed = true
+      header.idleNext = touched
+      touched = unsafe Intrinsic.pointerRequalify<*mut ArenaHeader, ?*mut ArenaHeader>(owner)
+    }
+    let word = granule / 64
+    header.idle[word] = u64.bitOr(header.idle[word], u64.shiftLeft(1, usize.toU64(granule % 64)))
+  }
+  let mut bins: [?*mut ArenaHeader; 40] = [Pointer.null<ArenaHeader>(); 40]
+  let mut walk = touched
+  while !Pointer.isNull<ArenaHeader>(walk) {
+    let arena = unsafe presentArena(walk)
+    walk = unsafe arenaIdleNext(arena)
+    unsafe setArenaIdleNext(arena, Pointer.null<ArenaHeader>())
+    let mut carry = unsafe Intrinsic.pointerRequalify<*mut ArenaHeader, ?*mut ArenaHeader>(arena)
+    let mut index: usize = 0
+    while index < 39 && !Pointer.isNull<ArenaHeader>(bins[index]) {
+      carry = unsafe mergeArenas(bins[index], carry)
+      bins[index] = Pointer.null<ArenaHeader>()
+      index = index + 1
+    }
+    bins[index] = unsafe mergeArenas(bins[index], carry)
+  }
+  let mut arenas = Pointer.null<ArenaHeader>()
+  let mut index: usize = 0
+  while index < 40 { arenas = unsafe mergeArenas(bins[index], arenas) index = index + 1 }
+  let mut head = Pointer.null<u8>()
+  let mut last = Pointer.null<u8>()
+  let mut beforeLast = Pointer.null<u8>()
+  while !Pointer.isNull<ArenaHeader>(arenas) {
+    let arena = unsafe presentArena(arenas)
+    let base = unsafe Pointer.assumeManyMut<u8>(unsafe Intrinsic.pointerReinterpret<*mut ArenaHeader, *mut u8>(arena))
+    let mut anchor = ()
+    let header = unsafe Pointer.borrowMut<(), ArenaHeader>(&mut anchor, arena)
+    arenas = header.idleNext
+    header.idleNext = Pointer.null<ArenaHeader>()
+    header.idleListed = false
+    let mut word: usize = 0
+    while word < 16 {
+      let mut bits = header.idle[word]
+      header.idle[word] = 0
+      while bits != 0 {
+        let granule = word * 64 + u32.toUsize(u64.trailingZeros(bits))
+        bits = u64.bitAnd(bits, bits - 1)
+        let block = unsafe Pointer.atMut<u8>(base, granule * POOL_GRANULE)
+        let linked = unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(block)
+        unsafe Pointer.write<?*mut u8>(unsafe poolLink(block), Pointer.null<u8>())
+        if Pointer.isNull<u8>(last) { head = linked }
+        else { unsafe Pointer.write<?*mut u8>(unsafe poolLink(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(last)), linked) }
+        if !Pointer.isNull<u8>(beforeLast) {
+          unsafe Pointer.write<?*mut u8>(unsafe poolSkip(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(beforeLast)), linked)
+        }
+        beforeLast = last
+        last = linked
+      }
+      word = word + 1
+    }
+  }
+  if !Pointer.isNull<u8>(beforeLast) { unsafe Pointer.write<?*mut u8>(unsafe poolSkip(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(beforeLast)), Pointer.null<u8>()) }
+  if !Pointer.isNull<u8>(last) { unsafe Pointer.write<?*mut u8>(unsafe poolSkip(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(last)), Pointer.null<u8>()) }
+  return head
+}
+
+// Freed blocks go to the front of their class's idle list, so after enough
+// churn the next allocations jump around every arena the class ever used, and a
+// program that keeps allocating short-lived objects runs with more and more
+// cache misses (EarleyBoyer's Boyer half lost ~20% over 60 iterations, at the
+// same instruction count). Every so many allocations the idle lists are sorted
+// back into address order. The interval is twice the idle count, so the sort's
+// cost per allocation stays flat however large the lists grow.
+const FIRST_SORT_ID: u64 = 65536
+const MIN_SORT_INTERVAL: u64 = 65536
+
+@inlineNever
+unsafe fn sortIdleLists(ledger: LedgerPointers, id: u64) -> () {
+  let mut poolAnchor = ()
+  let pool = unsafe Pointer.borrowMut<(), Pool>(&mut poolAnchor, unsafe poolOf(ledger))
+  let mut idle: usize = 0
+  let mut class: usize = 0
+  while class < POOL_CLASSES {
+    let count = pool.ownerCounts[class]
+    if count > 1 { pool.ownerHeads[class] = unsafe sortByAddress(pool.ownerHeads[class]) }
+    idle = idle + count
+    class = class + 1
+  }
+  drop pool
+  let mut interval = usize.toU64(idle) * 2
+  if interval < MIN_SORT_INTERVAL { interval = MIN_SORT_INTERVAL }
+  let mut anchor = ()
+  let state = unsafe Pointer.borrowMut(&mut anchor, ledger.allocation)
+  state.nextSortId = u64.wrappingAdd(id, interval)
 }
