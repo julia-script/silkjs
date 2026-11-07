@@ -52,20 +52,3 @@ python3 scripts/v8bench.py --instructions a b --only richards deltablue
 Scores are wall-clock based and noisy on shared hosts. A score gap that the instruction
 counts do not show usually comes from memory traffic, such as larger objects or more GC
 cycles.
-
-## Profile-guided build
-
-`scripts/pgo_build.py` builds the release CLI twice: once instrumented, which it runs on the
-V8 suite and `macro/`, and once with Clang optimizing by the profile from those runs. Clang
-then lays the hot interpreter paths out together and moves cold ones out of line, which
-roughly halves instruction-cache misses on large programs.
-
-```sh
-SILK_CLANG=/path/to/clang python3 scripts/pgo_build.py      # writes build/pgo/silkjs
-```
-
-On 2026-11-07 (Silk dev.55, 4-CPU Linux x86_64) it ran Octane PdfJS 12% faster than the plain
-release build, Typescript 2%, zlib and Mandreel 18%, EarleyBoyer 16%, with 47-51% fewer I1
-misses on PdfJS and Typescript; neither is a training input. Compare engines against the
-profile-guided binary when measuring against other engines' release builds; compare two
-plain release builds when A/B testing a change, since a new profile adds its own noise.
