@@ -9,7 +9,7 @@
 //! is a dead sentinel and MUST NOT be dereferenced (the native field is nonnullable).
 //! Native class callbacks own payload edges, never the structural shape/properties.
 
-import thin_list { ThinList }
+import thin_list { ThinList, BoxList }
 import runtime_memory as memory
 import silk.mem.box { Box }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
@@ -998,6 +998,16 @@ pub unsafe fn releasePins<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader)
     unsafe releaseOptional(&mut hooks, runtime, shape)
     slot = slot + 1
   }
+  // With the closure shapes gone, the spare closures die instead of parking again.
+  slot = 0
+  while slot < SPARE_CLOSURES {
+    let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+    let spare = state.spareClosures[slot]
+    state.spareClosures[slot] = Pointer.null<HeapHeader>()
+    drop state
+    unsafe releaseOptionalCell(&mut hooks, runtime, spare)
+    slot = slot + 1
+  }
 }
 /// Empties the object literal site cache, releasing its shapes.
 unsafe fn releaseLiterals<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader) -> () {
@@ -1234,7 +1244,9 @@ unsafe fn drainZeroFrom<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, f
     match Pointer.nonNullMut<HeapHeader>(stacked) {
       Option<*mut HeapHeader>.Some { value } => {
         require(unsafe count(value) == 0)
-        if unsafe kind(value) == HeapKind.Object { unsafe destroyObject(&mut hooks, runtime, value, true) }
+        if unsafe kind(value) == HeapKind.Object {
+          if !unsafe closureClass(value) || !unsafe parkClosure(&mut hooks, runtime, value) { unsafe destroyObject(&mut hooks, runtime, value, true) }
+        }
         else { unsafe destroyGc(&mut hooks, runtime, value) }
       }
       Option<*mut HeapHeader>.None => {
@@ -1253,6 +1265,90 @@ unsafe fn drainZeroFrom<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, f
     stacked = unsafe popZeroStack(runtime)
   }
   unsafe setPhase(runtime, GcPhase.None)
+}
+
+/// RuntimeState.spareClosures entries: SPARE_CLOSURE_WAYS per set, so a few
+/// closures of one recursive function, or of bytecodes in one set, park at once.
+pub const SPARE_CLOSURES: usize = 256
+pub const SPARE_CLOSURE_WAYS: usize = 4
+/// js_closures.INLINE_REFERENCES: the most references a closure keeps in its cell.
+const SPARE_INLINE_REFERENCES: usize = 7
+/// The first RuntimeState.spareClosures entry of the set for closures over bytecode.
+@inlineAlways
+pub fn spareClosureSet(bytecode: *mut HeapHeader) -> usize {
+  let mixed = u64.wrappingMultiply(usize.toU64(usize.shiftRight(Pointer.address<HeapHeader>(bytecode), 4)), 0x9E3779B97F4A7C15)
+  return u64.toUsize(u64.shiftRight(mixed, 58)) * SPARE_CLOSURE_WAYS
+}
+@inlineAlways
+unsafe fn closureClass(node: *mut HeapHeader) -> bool {
+  let anchor = ()
+  return (unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)).classId() == JS_CLASS_BYTECODE_FUNCTION
+}
+/// Keeps node, a bytecode closure whose count just reached zero on drainZero's
+/// stack, in RuntimeState.spareClosures (count 1, the table's) when it is still
+/// as js_closures.shapedFunction made it (the pinned closure shape, fresh flags,
+/// no home object) and its slot is free: the next closure of its bytecode then
+/// reuses the cell, shape, name and length (js_closures.takeSpare) instead of
+/// this free and a new allocation. Its scope and captured cells go now; its
+/// bytecode stays held. False leaves node to destroyObject.
+@inlineNever
+unsafe fn parkClosure<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node: *mut HeapHeader) -> bool {
+  let mut anchor = ()
+  let object = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+  let constructor = object.isConstructor()
+  if !object.pristineFunction(constructor) { return false }
+  let shape = object.shape
+  let bytecode = match &object.payload {
+    ObjectPayload.BytecodeFunction { function } => {
+      if !Pointer.isNull<HeapHeader>(function.homeObject) { return false }
+      // takeSpare refills a table of at most INLINE_REFERENCES in the cell's
+      // tail, which only a cell built with that room has (js_closures.closure):
+      // one made the slow way keeps its table out of the cell.
+      let references = function.varRefs.length()
+      if references != 0 && references <= SPARE_INLINE_REFERENCES && !function.varRefs.borrowsStorage() { return false }
+      function.bytecode
+    }
+    _ => { return false }
+  }
+  drop object
+  let mut pin: usize = 0
+  if constructor { pin = 1 }
+  let set = spareClosureSet(bytecode)
+  let mut stateAnchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut stateAnchor, runtime)
+  let mut slot = set
+  while slot < set + SPARE_CLOSURE_WAYS && !Pointer.isNull<HeapHeader>(state.spareClosures[slot]) { slot = slot + 1 }
+  if slot == set + SPARE_CLOSURE_WAYS { return false }
+  match Pointer.nonNullMut<HeapHeader>(state.closureShapes[pin]) {
+    Option<*mut HeapHeader>.Some { value } => { if Pointer.address<HeapHeader>(value) != Pointer.address<HeapHeader>(shape) { return false } }
+    Option<*mut HeapHeader>.None => { return false }
+  }
+  state.spareClosures[slot] = node
+  drop state
+  let mut headerAnchor = ()
+  let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut headerAnchor, node)
+  header.referenceCount = 1
+  header.mark = 0
+  drop header
+  let mut changedAnchor = ()
+  let changed = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut changedAnchor, node)
+  let mut scope: ?*mut HeapHeader = Pointer.null<HeapHeader>()
+  let mut references = BoxList<?*mut HeapHeader>.make()
+  match &mut changed.payload {
+    ObjectPayload.BytecodeFunction { function } => {
+      scope = function.scope function.scope = Pointer.null<HeapHeader>()
+      references = Intrinsic.replace(function.varRefs, BoxList<?*mut HeapHeader>.make())
+    }
+    _ => invariantFailure()
+  }
+  drop changed
+  let mut index: usize = 0
+  while index < references.length() {
+    unsafe releaseOptionalCell(&mut hooks, runtime, references.get(index))
+    index = index + 1
+  }
+  unsafe releaseOptionalCell(&mut hooks, runtime, scope)
+  return true
 }
 
 /// Runs source weak cleanup before cycle collection. This deliberately does not
