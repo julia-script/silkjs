@@ -16,7 +16,6 @@ import js_atom_data as atoms
 import js_bigint { BigIntError }
 import js_debug_positions { SourceLocation, SourcePositionCache }
 import js_string_types { StringOwner, StringLengthError }
-import js_value { ValueBits }
 import js_strings { StringBuilder }
 import js_tokens { Token, TokenPayload, LexError }
 import js_tokens as tok
@@ -175,14 +174,26 @@ pub struct Lexer<'src> {
   /// Set while the preparser skips a body: number tokens carry 0 and string
   /// tokens the empty string instead of their value, which a later full parse
   /// reads again.
-  pub skipValues: bool
+  pub skipValues: bool,
+  /// One reference to every atom this lexer interned for an identifier. Tokens
+  /// borrow their identifier atom from here, so they live as long as the lexer.
+  held: List<StringOwner>,
+  /// Identifiers seen so far, by spelling hash: a hit reuses the atom without
+  /// probing the atom table. Allocated on the first interned identifier.
+  names: List<NameSlot>
 }
+/// A spelling seen at source offset `start` with `length` bytes and ASCII hash
+/// `hash`, and its atom (held by the lexer, or a constant keyword atom).
+struct NameSlot { hash: u32, length: u32, start: u32, atom: u32 }
+impl Copy for NameSlot {}
+const NAME_SLOTS: usize = 256
 impl<'src> Lexer<'src> {
   pub fn make(source: &'src [u8], context: LexicalContext) -> Self {
     let mut offset: usize = 0
     if !context.json { offset = skipShebang(source, 0) }
     return Lexer { source: source, offset: offset, lastOffset: 0, gotLineFeed: false,
-      context: context, positions: SourcePositionCache.make(), sourceComments: SourceComments.make(), probe: false, skipValues: false }
+      context: context, positions: SourcePositionCache.make(), sourceComments: SourceComments.make(), probe: false, skipValues: false,
+      held: List<StringOwner>.make(), names: List<NameSlot>.make() }
   }
   pub fn sourceBytes(self: &Self) -> &'src [u8] { return self.source }
   pub fn location(self: &mut Self, offset: usize) -> SourceLocation {
@@ -481,11 +492,16 @@ impl<'src> Lexer<'src> {
       let spelling = Slice.view<u8>(self.source, start, p - start)
       // No decode needed means plain ASCII; identifiers never spell integer atoms.
       // Keywords are constant atoms: spelled out here, they skip the table probe.
-      if fast { atom = keywordAtom(spelling) }
-      if atom == 0 {
-        if self.probe { atom = table.lookupAsciiName(spelling) }
-        else if fast { atom = run table.internAsciiNameHashed(spelling, AtomTable.asciiHashFinish(hash)) }
-        else { atom = run table.internAsciiName(spelling) }
+      if fast && !self.probe { atom = run self.plainName(&mut table, start, p - start, AtomTable.asciiHashFinish(hash)) }
+      else {
+        if fast { atom = keywordAtom(spelling) }
+        if atom == 0 {
+          if self.probe { atom = table.lookupAsciiName(spelling) }
+          else {
+            atom = run table.internAsciiName(spelling)
+            run self.hold(&mut table, atom)
+          }
+        }
       }
     } else {
       let mut builder = StringBuilder.make()
@@ -503,11 +519,8 @@ impl<'src> Lexer<'src> {
         }
       }
       atom = run table.internOwned(run builder.finish())
+      run self.hold(&mut table, atom)
     }
-    // Identifier atoms cannot be integer atoms; the owner takes the atom's reference.
-    // A probe's borrowed atom (0 when it does not exist yet) is not owned.
-    let mut owner = StringOwner.adopt(ValueBits.Undefined)
-    if !self.probe || requiresDecode { owner = StringOwner.adopt(table.intoStringValue(atom)) }
     // Keyword classification as reparseIdentifier does it, decided before the
     // token exists so the token is built once in its final form.
     let mut kind = tok.TOK_IDENT
@@ -524,7 +537,52 @@ impl<'src> Lexer<'src> {
     }
     self.offset = p
     return Token { kind: kind, start: start, end: p, gotLineFeed: self.gotLineFeed,
-      payload: TokenPayload.Identifier { atom: atom, owner: move owner, hasEscape: hasEscape, isReserved: isReserved } }
+      payload: TokenPayload.Identifier { atom: atom, hasEscape: hasEscape, isReserved: isReserved } }
+  }
+  /// Keeps the reference to `atom` the caller owns until the lexer drops.
+  /// Identifier atoms are never integer atoms.
+  effect fn hold(self: &mut Self, table: &mut AtomTable, atom: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    if AtomTable.isConstant(atom) { return () }
+    let owner = StringOwner.adopt(table.intoStringValue(atom))
+    run self.held.append(move owner)
+  }
+  /// The atom of the plain ASCII identifier at source[start..start+length] with
+  /// finished hash `hash`, borrowed from this lexer.
+  @inlineAlways
+  effect fn plainName(self: &mut Self, table: &mut AtomTable, start: usize, length: usize, hash: u32) -> u32
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    if self.names.length() != 0 {
+      let index = u32.toUsize(hash ^ u32.shiftRight(hash, 8)) & (NAME_SLOTS - 1)
+      let slot = self.names.get(index)
+      if slot.hash == hash && u32.toUsize(slot.length) == length {
+        let seen = u32.toUsize(slot.start)
+        let mut i: usize = 0
+        while i < length && self.source[seen + i] == self.source[start + i] { i = i + 1 }
+        if i == length { return slot.atom }
+      }
+    }
+    return run self.plainNameMiss(&mut table, start, length, hash)
+  }
+  @inlineNever
+  effect fn plainNameMiss(self: &mut Self, table: &mut AtomTable, start: usize, length: usize, hash: u32) -> u32
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let spelling = Slice.view<u8>(self.source, start, length)
+    let mut atom = keywordAtom(spelling)
+    if atom == 0 {
+      atom = run table.internAsciiNameHashed(spelling, hash)
+      run self.hold(&mut table, atom)
+    }
+    if self.names.length() == 0 {
+      run self.names.reserveExact(NAME_SLOTS)
+      run self.names.appendRepeated(NameSlot { hash: 0, length: 0, start: 0, atom: 0 }, NAME_SLOTS)
+    }
+    // Offsets past u32 are not cached: the slot could not name them. Length 0
+    // marks an empty slot, since no identifier is empty.
+    if start <= 0xffffffff && length <= 0xffffffff {
+      let index = u32.toUsize(hash ^ u32.shiftRight(hash, 8)) & (NAME_SLOTS - 1)
+      self.names.set(index, NameSlot { hash: hash, length: usize.toU32(length), start: usize.toU32(start), atom: atom })
+    }
+    return atom
   }
   /// Byte-level lookahead support. plainSpace skips spaces, tabs and line breaks
   /// only; a comment or any other trivia stops it, and callers treat what follows
@@ -996,7 +1054,7 @@ pub fn reparseIdentifier(context: &LexicalContext, mut token: Token, forcedFunct
   }
   token.kind = tok.TOK_IDENT
   match &mut token.payload {
-    TokenPayload.Identifier { atom, owner: _, hasEscape, isReserved } => {
+    TokenPayload.Identifier { atom, hasEscape, isReserved } => {
       isReserved = false
       if atom <= atoms.JS_ATOM_LAST_KEYWORD || (context.strict && atom <= atoms.JS_ATOM_LAST_STRICT_KEYWORD)
         || (atom == atoms.JS_ATOM_yield && generator) || (atom == atoms.JS_ATOM_await && (context.module || asyncFunction)) {
