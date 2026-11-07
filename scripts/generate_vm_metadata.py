@@ -24,6 +24,10 @@ EXTENSIONS = [
     ('get_arg_el8', 3, 0, 1, 'u16'),  # get_arg array, get_loc8 index, then get_array_el
 ]
 
+# Final get_field, get_loc_field8 and get_arg_field8 keep an inline field-cache key
+# (shape version and slot) after their atom: js_vm_property_ops.readFieldInline.
+FIELD_KEY_BYTES = 8
+
 # Upstream final opcodes whose numbers silkjs reuses: name -> (name, size, pops, pushes, format).
 # set_arg0-3 are emitted as set_arg; the fused branches keep the test's byte
 # (is_undefined_or_null or is_null), a padding byte (the old if_*8 opcode), then
@@ -146,10 +150,15 @@ def main():
               '  return index', '}', '']
     data = bytes(value for _, _, size, pops, pushes, fmt in entries
                  for value in (int(size), int(pops), int(pushes), format_ids[fmt]))
-    lines += ['pub fn opcodeInfo(opcode: u8, short: bool) -> OpcodeInfo {',
+    lines += ['/// Bytes of the inline field-cache key that final get_field, get_loc_field8 and',
+              '/// get_arg_field8 carry right after their atom (the parser view has none).',
+              f'pub const FIELD_KEY_BYTES: u8 = {FIELD_KEY_BYTES}', '',
+              'pub fn opcodeInfo(opcode: u8, short: bool) -> OpcodeInfo {',
               '  let index = metadataIndex(opcode, short) * 4',
               f'  let table = {literal(data)}',
-              '  return OpcodeInfo { size: table[index], pops: table[index + 1], pushes: table[index + 2], format: table[index + 3] }',
+              '  let mut size = table[index]',
+              '  if short && (opcode == OP_get_field || opcode == OP_get_loc_field8 || opcode == OP_get_arg_field8) { size = size + FIELD_KEY_BYTES }',
+              '  return OpcodeInfo { size: size, pops: table[index + 1], pushes: table[index + 2], format: table[index + 3] }',
               '}', '']
     emit_names(lines, [entry[1].encode() for entry in entries], 'opcodeName', 'opcode: u8, short: bool', 'metadataIndex(opcode, short)')
     (ROOT / 'src/js_opcode_data.silk').write_text('\n'.join(lines))
