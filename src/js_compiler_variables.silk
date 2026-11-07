@@ -21,7 +21,7 @@ import js_atoms { AtomTable }
 import js_atom_data as atoms
 import js_opcode_data as op
 import js_core_types { RuntimeState, ExportBinding, FunctionBytecode, ClosureVar, ClosureKind, VariableKind, JS_MODE_STRICT, linkedModule }
-import js_compiler_types { FunctionDef, FunctionId, FunctionTree, linked, CompilerVar, GlobalVar, CompilerError, CompilerErrorKind, ARGUMENT_VAR_OFFSET, ARG_SCOPE_END }
+import js_compiler_types { FunctionDef, FunctionId, FunctionTree, linked, CompilerVar, StubName, GlobalVar, CompilerError, CompilerErrorKind, ARGUMENT_VAR_OFFSET, ARG_SCOPE_END }
 import js_compiler_state as state
 import js_compiler_emit as emit
 import js_compiler_code { CodeContext, matchCode, M2, opcode, skipDeadCode, getLabelPosition, signedWord, unsignedWord }
@@ -899,11 +899,96 @@ effect fn resolvePass(tree: &mut FunctionTree, cell: FunctionId, input: &mut Byt
 /// resolveVariables for a lazy stub (js_parser_functions.skipBody), which
 /// defers and whose code finishLazy never reads: the free-name reads only
 /// capture, so look each one up and keep no code.
+// Lazy children of one function mostly resolve the same free names. A name
+// none of them binds itself, resolved without object environment tests, ends
+// as one closure entry built only from what the parent and its ancestors hold,
+// so the parent keeps that entry for the next child (StubName).
+fn stubNameCandidate(fd: &FunctionDef, name: u32) -> bool {
+  if name == 0 || pseudo(name) || name == atoms.JS_ATOM_arguments || name == atoms.JS_ATOM__with_
+    || name == atoms.JS_ATOM__var_ || name == atoms.JS_ATOM__arg_var_ { return false }
+  if fd.isFuncExpr && name == fd.functionName { return false }
+  let vars = fd.vars.asSlice()
+  let mut i: usize = 0
+  while i < vars.length { if vars[i].name == name { return false } i = i + 1 }
+  return state.findArg(fd, name) < 0
+}
+fn stubSlot(name: u32, scope: i32, mask: usize) -> usize {
+  let key = name ^ u32.wrappingMultiply(i32.toU32(scope), 0x85EBCA6B)
+  return u32.toUsize(u32.shiftRight(u32.wrappingMultiply(key, 0x9E3779B1), 7)) & mask
+}
+fn findStubName(fd: &FunctionDef, name: u32, scope: i32) -> i32 {
+  let slots = fd.stubNames.asSlice()
+  if slots.length == 0 { return -1 }
+  let mask = slots.length - 1
+  let mut at = stubSlot(name, scope, mask)
+  while slots[at].closure.name != 0 {
+    if slots[at].closure.name == name && slots[at].scope == scope { return usize.toI32(at) }
+    at = (at + 1) & mask
+  }
+  return -1
+}
+fn placeStubName(fd: &mut FunctionDef, entry: StubName) -> () {
+  let mask = fd.stubNames.length() - 1
+  let mut at = stubSlot(entry.closure.name, entry.scope, mask)
+  while fd.stubNames.get(at).closure.name != 0 { at = (at + 1) & mask }
+  fd.stubNames.set(at, entry)
+}
+effect fn addStubName(fd: &mut FunctionDef, entry: StubName) -> () ! OutOfMemoryError ? &mut Allocator {
+  // At most half full.
+  if (fd.stubNameCount + 1) * 2 > fd.stubNames.length() {
+    let mut size = fd.stubNames.length() * 2
+    if size < 64 { size = 64 }
+    let old = Intrinsic.replace(fd.stubNames, ThinList<StubName>.make())
+    let empty = StubName { scope: 0, closure: ClosureVar { kind: ClosureKind.Local, isLexical: false, isConst: false, variableKind: VariableKind.Normal, variableIndex: 0, name: 0 } }
+    run fd.stubNames.appendRepeated(empty, size)
+    let entries = old.asSlice()
+    let mut i: usize = 0
+    while i < entries.length { if entries[i].closure.name != 0 { placeStubName(&mut fd, entries[i]) } i = i + 1 }
+  }
+  placeStubName(&mut fd, entry)
+  fd.stubNameCount = fd.stubNameCount + 1
+}
+effect fn resolveStubName(tree: &mut FunctionTree, cell: FunctionId, shortcut: bool, name: u32, scope: i32) -> ()
+  ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  let view = tree.get(cell)
+  let cacheable = shortcut && stubNameCandidate(&view.*, name)
+  let parent = view.parent let parentScope = view.parentScopeLevel
+  drop view
+  if cacheable {
+    let outer = linked(parent)
+    let owner = tree.getMut(outer)
+    let slot = findStubName(&owner.*, name, parentScope)
+    if slot >= 0 {
+      let v = owner.stubNames.get(i32.toUsize(slot)).closure
+      // The first child's lookup captured the variable and made every closure
+      // entry between it and the parent; only this child's own entry is new.
+      if v.kind == ClosureKind.Local || v.kind == ClosureKind.Argument {
+        state.captureVar(&mut owner, u16.toI32(v.variableIndex), v.kind == ClosureKind.Argument)
+      }
+      drop owner
+      let _index = run state.getClosureVar(&mut tree, cell, outer, v.kind, u16.toI32(v.variableIndex), name, v.isConst, v.isLexical, v.variableKind)
+      return
+    }
+    drop owner
+  }
+  let mut label: i32 = -1
+  let binding = run lookup(&mut tree, cell, name, scope, op.OP_scope_get_var, &mut label)
+  if !cacheable || binding.storage < 2 || label != -1 { return }
+  let own = tree.get(cell)
+  // Object environment tests emit code: their outcome is not the parent's alone.
+  if own.bytecode.length() != 0 { return }
+  let entry = StubName { scope: parentScope, closure: own.closureVars.get(i32.toUsize(binding.index)) }
+  drop own
+  let owner = tree.getMut(linked(parent))
+  run addStubName(&mut owner, entry)
+}
 effect fn resolveStub(tree: &mut FunctionTree, cell: FunctionId) -> ()
   ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
   let mut ra = ()
   let initial = tree.getMut(cell)
   let mut input = Intrinsic.replace(initial.bytecode, ByteBuffer.make())
+  let shortcut = initial.parent.isSome() && initial.parentScopeLevel >= 0 && !initial.hasParameterExpressions && !initial.hasWithVar
+    && !initial.isEval && initial.varObjectIndex < 0 && initial.argVarObjectIndex < 0 && !initial.debuggerMetadata.enabled
   drop initial
   let mut position: usize = 0
   let mut failure = Option<OutOfMemoryError | StringLengthError | CompilerError>.none()
@@ -911,10 +996,9 @@ effect fn resolveStub(tree: &mut FunctionTree, cell: FunctionId) -> ()
     let code = input.get(position)
     if code == op.OP_scope_get_var {
       let name = readU32(input.asSlice(), position + 1) let scope = u16.toI32(readU16(input.asSlice(), position + 5))
-      let mut label: i32 = -1
-      let found = run Effect.result(lookup(&mut tree, cell, name, scope, code, &mut label))
+      let found = run Effect.result(resolveStubName(&mut tree, cell, shortcut, name, scope))
       match move found {
-        Result<Binding, OutOfMemoryError | StringLengthError | CompilerError>.Failure { error } => { failure = Option<OutOfMemoryError | StringLengthError | CompilerError>.some(move error) break }
+        Result<(), OutOfMemoryError | StringLengthError | CompilerError>.Failure { error } => { failure = Option<OutOfMemoryError | StringLengthError | CompilerError>.some(move error) break }
         _ => ()
       }
     }
