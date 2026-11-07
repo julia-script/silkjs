@@ -6,10 +6,11 @@ import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.core.option { Option }
 import silk.num.i32
+import silk.num.u32
 import silk.num.usize
 import js_heap { HeapCell }
 import js_core_types { FunctionKind, RuntimeState, JS_MODE_STRICT, SourceText, OwnedAtom }
-import js_compiler_types { FunctionId, ParseFunctionKind, ParseExportKind, VariableDefinition, CompilerError, ARGUMENT_VAR_OFFSET }
+import js_compiler_types { LazyBody, LazyName, FunctionId, ParseFunctionKind, ParseExportKind, VariableDefinition, CompilerError, ARGUMENT_VAR_OFFSET }
 import js_compiler_state as state
 import js_parser_core { Parser, ParserStackOverflow, PF_IN_ACCEPTED }
 import js_parser_diagnostics { SyntaxError }
@@ -21,7 +22,7 @@ import js_tokens { LexError }
 import js_tokens as tok
 import js_atom_data as atoms
 import js_opcode_data as op
-import js_lexer { SKIP_HAS_ASSIGNMENT }
+import js_lexer { SKIP_HAS_ASSIGNMENT, LexerPosition }
 import js_gc { HeapHooks }
 import js_value { ValueBits }
 import runtime_memory { AllocationObserver }
@@ -31,6 +32,9 @@ import js_parser_literals as literals
 import js_parser_statements as statements
 import js_parser_modules as modules
 import js_parser_lvalues { setObjectName }
+import js_preparse as preparse
+import js_preparse { Preparse }
+import silk.collections.list { List }
 import js_module_metadata { ExportKind }
 
 fn directiveCanEnd(kind: i32) -> bool {
@@ -354,6 +358,9 @@ effect fn parseFunctionInner<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser
     borrowedName: u32, sourceStart: Option<usize>, exportKind: ParseExportKind) -> FunctionId
   ! OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException ? &mut Allocator {
   let parentCell = s.functionCell()
+  // finishLazy's own function: parsed in full, and its children may go lazy.
+  let finishing = s.lazyFinish s.lazyFinish = false
+  let mut entry = s.save()
   let mut kind = initialKind
   let expression = functionType != ParseFunctionKind.Statement && functionType != ParseFunctionKind.Var
   let mut name = support.ownedAtom(&mut s, borrowedName)
@@ -381,6 +388,9 @@ effect fn parseFunctionInner<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser
       if support.tokenReserved(&s.*) { return run s.reserved<FunctionId>() }
       let atom = support.tokenAtom(&s.*)
       name = support.ownedAtom(&mut s, atom)
+      // finishLazy reparses a declaration as an anonymous expression from its
+      // name, so the name resolves outside like every other free name.
+      if functionType != ParseFunctionKind.Expression { entry = s.save() }
       run s.advance()
     } else if functionType != ParseFunctionKind.Expression && exportKind != ParseExportKind.Default {
       return run s.syntax<FunctionId>(b"function name expected")
@@ -425,6 +435,7 @@ effect fn parseFunctionInner<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser
   let filename = outer.filename let cache = outer.sourceCache
   let inheritedNewTarget = outer.newTargetAllowed let inheritedSuperCall = outer.superCallAllowed
   let inheritedSuper = outer.superAllowed let inheritedArguments = outer.argumentsAllowed
+  let parentVerified = outer.lazyVerified
   drop outer
   let mut position: u32 = 0
   match &sourceStart {
@@ -453,6 +464,7 @@ effect fn parseFunctionInner<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser
     fd.superAllowed = fd.hasHomeObject fd.argumentsAllowed = true
   }
   fd.functionKind = kind fd.functionType = functionType
+  fd.lazyVerified = finishing || parentVerified
   drop fd
   if functionType == ParseFunctionKind.ClassConstructor || functionType == ParseFunctionKind.DerivedClassConstructor {
     run support.emitOp(&mut s, op.OP_check_ctor)
@@ -485,14 +497,24 @@ effect fn parseFunctionInner<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser
     }
   }
   if !expressionBody {
-    if functionType != ParseFunctionKind.ClassStaticInit { run s.expect(123) }
-    run parseDirectives(&mut s)
-    run checkNames(&mut s, functionName)
-    let block = run statements.pushBreakEntry(&mut s, 0, -1, -1, 0)
-    while s.token.kind != 125 {
-      run modules.parseSourceElement(&mut s, &mut hooks, memory)
+    let mut skipped = false
+    if !finishing && kind == FunctionKind.Normal && ordinary && s.token.kind == 123 && sourceStart.isSome()
+      && !(functionType != ParseFunctionKind.Expression && functionName == atoms.JS_ATOM_async)
+      && lazyCandidate(&s.*, parentCell, child) {
+      skipped = run skipBody(&mut s, child, entry)
     }
-    run statements.popBreakEntry(&mut s)
+    if skipped {
+      run checkNames(&mut s, functionName)
+    } else {
+      if functionType != ParseFunctionKind.ClassStaticInit { run s.expect(123) }
+      run parseDirectives(&mut s)
+      run checkNames(&mut s, functionName)
+      let block = run statements.pushBreakEntry(&mut s, 0, -1, -1, 0)
+      while s.token.kind != 125 {
+        run modules.parseSourceElement(&mut s, &mut hooks, memory)
+      }
+      run statements.popBreakEntry(&mut s)
+    }
     let end = s.lexer.offset
     let closingSource = usize.toU32(s.token.start)
     run copySource(&mut s, &sourceStart, end)
@@ -584,6 +606,145 @@ effect fn parseFunctionInner<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser
     }
   }
   return child
+}
+
+/// Whether child, whose parameters are parsed, may skip its body for a lazy
+/// compile: what js_compiler_finish.deferrable needs, plus an environment no
+/// later eval or with can change. That holds for children of an indirect eval
+/// root (names there resolve the same either way) and of a function finishLazy
+/// is parsing (its preparse saw no eval or with in it). A global script parses
+/// eagerly: it runs right after loading, so a lazy body only moves its compile
+/// to the first call (Octane's MandreelLatency lost ~10% that way) while the
+/// preparse adds ~0.5%. Code built and evaluated at run time is where skipping
+/// never-called bodies pays (Octane CodeLoad -13% instructions).
+fn lazyCandidate(s: &Parser, parentCell: FunctionId, child: FunctionId) -> bool {
+  let fd = s.functionAt(child)
+  if fd.stripSource || fd.debuggerMetadata.enabled || !fd.hasSimpleParameterList || fd.hasParameterExpressions
+    || fd.module.isSome() { return false }
+  drop fd
+  let parent = s.functionAt(parentCell)
+  let root = parent.parent.isNone() && parent.isEval && parent.evalType == 3 && parent.module.isNone()
+  if !root && !parent.lazyVerified { return false }
+  // A with block before the function may enclose it.
+  let mut i: usize = 0
+  while i < parent.vars.length() { if parent.vars.get(i).name == atoms.JS_ATOM__with_ { return false } i = i + 1 }
+  drop parent
+  return s.sharedSourceFits()
+}
+
+/// Preparses the body at `{`. On acceptance, leaves the parser at the closing
+/// `}` with child holding only synthetic reads of the body's free names, from
+/// which variable resolution makes the closure vars the full body would; on a
+/// bail, rewinds to the `{`.
+/// Sources shorter than this (in bytes) parse every body eagerly.
+const LAZY_MIN_SOURCE: usize = 65536
+
+effect fn skipBody(s: &mut Parser, child: FunctionId, entry: LexerPosition) -> bool
+  ! ParserStackOverflow | LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+  // Inside a function finishLazy parses, its preparse already went through
+  // this body: take its record instead of preparsing again.
+  let known = recordAt(&s.*, s.token.start)
+  if known >= 0 { run skipKnown(&mut s, child, entry, i32.toUsize(known)) return true }
+  // A small script compiles little: preparsing then reparsing the bodies it
+  // calls costs more than it saves.
+  if s.sourceBytes().length < LAZY_MIN_SOURCE { return false }
+  let saved = s.save()
+  let mut pre = Preparse.make()
+  s.lexer.skipValues = true
+  let outcome = run Effect.result(preparse.body(&mut s, &mut pre))
+  s.lexer.skipValues = false
+  let accepted = match move outcome {
+    Result<bool, ParserStackOverflow | LexError | BigIntError | OutOfMemoryError | StringLengthError>.Success { value } => value
+    Result<bool, ParserStackOverflow | LexError | BigIntError | OutOfMemoryError | StringLengthError>.Failure { error } => { drop error false }
+  }
+  if !accepted {
+    pre.release(&mut s)
+    run s.seek(saved)
+    return false
+  }
+  let level = scope(&s.*)
+  let mut free = List<LazyName>.make()
+  run free.reserveExact(pre.free.length())
+  let mut i: usize = 0
+  while i < pre.free.length() {
+    let name = pre.free.get(i)
+    run emitScopedName(&mut s, op.OP_scope_get_var, name.name, level)
+    run support.emitOp(&mut s, op.OP_drop)
+    let mut depth = name.depth if depth > 255 { depth = 255 }
+    run free.append(LazyName { name: name.name, depth: i32.toU8(depth) })
+    i = i + 1
+  }
+  let mut bodies = List<LazyBody>.make() let mut bodyFree = List<LazyName>.make()
+  run bodies.appendSlice(pre.bodies.asSlice())
+  run bodyFree.reserveExact(pre.bodyFree.length())
+  let rt = s.runtimeState()
+  i = 0
+  while i < pre.bodyFree.length() {
+    let name = pre.bodyFree.get(i)
+    run bodyFree.append(LazyName { name: rt.atoms.duplicate(name.name), depth: name.depth })
+    i = i + 1
+  }
+  drop rt
+  pre.release(&mut s)
+  let fd = s.functionAtMut(child)
+  fd.lazy = true fd.lazyFree = move free fd.lazyBodies = move bodies fd.lazyBodyFree = move bodyFree
+  fd.lazyEntry = entry.offset fd.lazyEntryLineFeed = entry.gotLineFeed
+  return true
+}
+
+/// The index in s.skips of the body whose `{` is at offset, or -1.
+fn recordAt(s: &Parser, offset: usize) -> i32 {
+  let mut low: usize = 0 let mut high = s.skips.length()
+  while low < high {
+    let middle = (low + high) / 2
+    let at = s.skips.get(middle).bodyStart
+    if at == offset { return usize.toI32(middle) }
+    if at < offset { low = middle + 1 } else { high = middle }
+  }
+  return -1
+}
+
+/// skipBody from a record: the free names it lists, then the closing `}`;
+/// child keeps the records of the bodies inside it.
+effect fn skipKnown(s: &mut Parser, child: FunctionId, entry: LexerPosition, index: usize) -> ()
+  ! ParserStackOverflow | LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let record = s.skips.get(index)
+  let level = scope(&s.*)
+  let mut free = List<LazyName>.make()
+  run free.reserveExact(u32.toUsize(record.freeCount))
+  let mut i = u32.toUsize(record.freeStart)
+  while i < u32.toUsize(record.freeStart + record.freeCount) {
+    let name = s.skipFree.get(i)
+    run emitScopedName(&mut s, op.OP_scope_get_var, name.name, level)
+    run support.emitOp(&mut s, op.OP_drop)
+    run free.append(name)
+    i = i + 1
+  }
+  // Records are in source order: the ones inside follow it.
+  let mut bodies = List<LazyBody>.make() let mut bodyFree = List<LazyName>.make()
+  let mut next = index + 1
+  while next < s.skips.length() && s.skips.get(next).bodyStart < record.end {
+    let mut inner = s.skips.get(next)
+    let from = u32.toUsize(inner.freeStart)
+    inner.freeStart = usize.toU32(bodyFree.length())
+    let mut j = from
+    while j < from + u32.toUsize(inner.freeCount) {
+      run bodyFree.append(s.skipFree.get(j))
+      j = j + 1
+    }
+    run bodies.append(inner)
+    next = next + 1
+  }
+  // The stub owns its own references to these names.
+  let rt = s.runtimeState()
+  i = 0
+  while i < bodyFree.length() { let name = bodyFree.get(i) drop rt.atoms.duplicate(name.name) i = i + 1 }
+  drop rt
+  let fd = s.functionAtMut(child)
+  fd.lazy = true fd.lazyFree = move free fd.lazyBodies = move bodies fd.lazyBodyFree = move bodyFree
+  fd.lazyEntry = entry.offset fd.lazyEntryLineFeed = entry.gotLineFeed
+  drop fd
+  run s.seek(LexerPosition { offset: record.end, gotLineFeed: record.endLineFeed })
 }
 
 pub effect fn parseFunction<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser, hooks: &mut H,
