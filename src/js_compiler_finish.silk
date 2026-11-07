@@ -11,7 +11,6 @@ import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.core.option { Option }
 import silk.collections.list { List }
-import silk.io.writer_native { StderrWriter }
 import silk.mem.pointer { Pointer }
 import silk.mem.box { Box }
 import silk.collections.slice { Slice }
@@ -52,7 +51,10 @@ fn keepClosureName(kind: ClosureKind) -> bool {
     || kind == ClosureKind.Global || kind == ClosureKind.ModuleDeclaration || kind == ClosureKind.ModuleImport
 }
 
-effect fn assemble<H: HeapHooks>(hooks: &mut H, tree: &mut FunctionTree, cell: FunctionId, source: &[u8]) -> ValueBits
+/// into: null to publish a new FunctionBytecode; otherwise a lazy stub that
+/// finishLazy compiles in place, whose old header lands in replaced.
+effect fn assemble<H: HeapHooks>(hooks: &mut H, tree: &mut FunctionTree, cell: FunctionId, source: &[u8],
+    into: ?*mut HeapHeader, replaced: &mut Option<FunctionBytecode>) -> ValueBits
   ! OutOfMemoryError | StringLengthError | CompilerError | BytecodeError ? &mut Allocator {
   let mut anchor = ()
   let initial = tree.getMut(cell)
@@ -61,17 +63,6 @@ effect fn assemble<H: HeapHooks>(hooks: &mut H, tree: &mut FunctionTree, cell: F
   }
   variables.recomputeScopeLinks(&mut initial)
   let eval = initial.hasEvalCall let global = initial.isEval let debug = initial.debuggerMetadata.enabled
-  if initial.preparsed {
-    let mut k: usize = 0
-    while k < initial.closureVars.length() {
-      let name = initial.closureVars.get(k).name
-      let mut found = false
-      let mut j: usize = 0
-      while j < initial.preparseFree.length() { if initial.preparseFree.get(j) == name { found = true } j = j + 1 }
-      if !found { StderrWriter.print("PREPARSE-MISSING atom {name} in function at {at}\n", &.{ name: name, at: initial.sourcePosition }) }
-      k = k + 1
-    }
-  }
   drop initial
   if eval { run variables.addEvalVariables(&mut tree, cell) }
   else if debug { run variables.addDebuggerVariables(&mut tree, cell) }
@@ -113,6 +104,19 @@ effect fn assemble<H: HeapHooks>(hooks: &mut H, tree: &mut FunctionTree, cell: F
   let fd = tree.getMut(cell)
   run debuggerDetails(&mut fd, source)
   let header = run finalHeader(&mut fd, &mut scopePlan)
+  match Pointer.nonNullMut<HeapHeader>(into) {
+    Option<*mut HeapHeader>.Some { value: node } => {
+      // No fallible operations from here: the stub becomes this function.
+      let b = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut anchor, node)
+      let stub = Intrinsic.replace(b.*, move header)
+      b.hostImport = stub.hostImport b.hostModule = stub.hostModule b.hostScriptMetadata = stub.hostScriptMetadata
+      drop b
+      transfer(&mut fd, node)
+      replaced.* = Option<FunctionBytecode>.some(move stub)
+      return ValueBits.FunctionBytecode { reference: node }
+    }
+    Option<*mut HeapHeader>.None => ()
+  }
   let runtime = fd.runtime let context = fd.context
   // Allocate BEFORE moving any JS edge. OOM leaves the complete fd destructible.
   let result = run HeapCell.allocate(HeapKind.FunctionBytecode, move header)
@@ -279,6 +283,13 @@ const STUB_STACK: u16 = 0xffff
 /// generator, async, class or method form) whose text is a span of this compile's
 /// shared input, so its line table can be built later from the same bytes.
 fn deferrable(fd: &FunctionDef, source: &[u8]) -> bool {
+  if fd.noDefer { return false }
+  let eager = deferrableEager(&fd.*, source)
+  // The parser checked the same conditions before skipping the body.
+  if fd.lazy && !eager { return Intrinsic.trap("lazy function cannot defer") }
+  return eager
+}
+fn deferrableEager(fd: &FunctionDef, source: &[u8]) -> bool {
   match fd.parent { Option<FunctionId>.Some { .. } => () _ => { return false } }
   if fd.functionKind != FunctionKind.Normal || fd.isDerivedClassConstructor || fd.hasEvalCall || fd.isEval || fd.bytecodeError { return false }
   // The debugger reads every function's final code, scopes and locations.
@@ -421,6 +432,12 @@ pub unsafe effect fn finish<H: HeapHooks>(hooks: &mut H, node: *mut HeapHeader) 
   }
   let mut pending = boxed.into()
   let cell = pending.cell
+  // A lazy stub needs a parse: finishLazy (js_compiler_lazy) completes it.
+  if pending.tree.get(cell).lazy {
+    let b = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut anchor, node)
+    b.pending = Option<Box<PendingFunction>>.some(run Box<PendingFunction>.make(move pending))
+    return ()
+  }
   let fd = pending.tree.getMut(cell)
   // The stub's edges go back to the definition for the rest of its compile.
   fd.constants = Intrinsic.replace(b.constants, List<ValueBits>.make())
@@ -488,13 +505,38 @@ fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
 
 pub effect fn createFunction<H: HeapHooks>(hooks: &mut H, tree: &mut FunctionTree, cell: FunctionId, source: &[u8]) -> ValueBits
   ! OutOfMemoryError | StringLengthError | CompilerError | BytecodeError ? &mut Allocator {
-  let outcome = run Effect.result(assemble(&mut hooks, &mut tree, cell, source))
+  let mut replaced = Option<FunctionBytecode>.none()
+  let outcome = run Effect.result(assemble(&mut hooks, &mut tree, cell, source, Pointer.null<HeapHeader>(), &mut replaced))
   // Shared teardown releases stripped atoms/source, remaining parser-only owners,
   // failed descendants, and any already assembled children in constant slots.
   // Successful transfer zeroes all edges now owned by the published bytecode.
   state.destroyFunction(&mut hooks, &mut tree, cell)
   return match move outcome {
     Result<ValueBits, OutOfMemoryError | StringLengthError | CompilerError | BytecodeError>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError | StringLengthError | CompilerError | BytecodeError>.Failure { error } => { fail move error }
+  }
+}
+
+/// Whether node is a lazy stub: its first call needs finishLazy, not finish.
+pub unsafe fn lazyStub(node: *mut HeapHeader) -> bool {
+  let anchor = () let b = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, node)
+  return match &b.pending {
+    Option<Box<PendingFunction>>.Some { value } => { let p = &value.get()[0] p.tree.get(p.cell).lazy }
+    _ => false
+  }
+}
+
+/// createFunction for finishLazy: compiles cell, never deferred, into the stub
+/// node in place. replaced receives the stub's old header (its host values
+/// already moved over); the caller settles its name, closure list and debug data.
+pub effect fn createInto<H: HeapHooks>(hooks: &mut H, tree: &mut FunctionTree, cell: FunctionId, source: &[u8],
+    node: *mut HeapHeader, replaced: &mut Option<FunctionBytecode>) -> ()
+  ! OutOfMemoryError | StringLengthError | CompilerError | BytecodeError ? &mut Allocator {
+  let fd = tree.getMut(cell) fd.noDefer = true drop fd
+  let outcome = run Effect.result(assemble(&mut hooks, &mut tree, cell, source, node, &mut replaced))
+  state.destroyFunction(&mut hooks, &mut tree, cell)
+  match move outcome {
+    Result<ValueBits, OutOfMemoryError | StringLengthError | CompilerError | BytecodeError>.Success { .. } => ()
     Result<ValueBits, OutOfMemoryError | StringLengthError | CompilerError | BytecodeError>.Failure { error } => { fail move error }
   }
 }
