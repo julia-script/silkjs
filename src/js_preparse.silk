@@ -1,0 +1,818 @@
+//! Accept-only preparser for lazy function bodies. Runs on the parser's own
+//! lexer from a function body's `{` and either bails (the caller rewinds and
+//! parses the body normally, so the full parser reports any error) or accepts:
+//! the body is valid JavaScript in the subset modelled here, every early error
+//! that subset can raise was checked, and `free` lists the names the body (or a
+//! function inside it) reads from outside it, each with the deepest function
+//! nesting at which it is used. Anything not modelled bails: there is no error
+//! path of its own, so acceptance must never be wider than the full parser.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.num.i32
+import silk.num.u32
+import silk.num.usize
+import silk.num.u8
+import silk.core.ownership { Copy }
+import js_heap { HeapHeader }
+import js_parser_core { Parser, ParserStackOverflow }
+import js_parser_support as support
+import js_tokens { TokenPayload, LexError }
+import js_tokens as tok
+import js_bigint { BigIntError }
+import js_string_types { StringLengthError }
+import js_strings { Strings }
+import js_atom_data as atoms
+import js_core_types { JS_MODE_STRICT }
+import js_regexp_compile { compileStringForRuntime }
+import regexp_types { RegExpSyntaxError, RegExpStackOverflow }
+import js_value { ValueBits }
+
+/// A name declared in a scope: a var-like binding (var, function, parameter),
+/// a lexical one (let, const), a var hoisting through a block, or a catch parameter.
+const VAR: u8 = 0
+const LEX: u8 = 1
+const THROUGH: u8 = 2
+const CATCH: u8 = 3
+
+const OTHER: i32 = 0
+const IDENT: i32 = 1
+const MEMBER: i32 = 2
+const UNARY: i32 = 3
+const BAIL: i32 = -1
+
+struct PScope { parent: i32, function: bool, first: i32 }
+impl Copy for PScope {}
+struct PDecl { name: u32, next: i32, kind: u8 }
+impl Copy for PDecl {}
+struct PRef { name: u32, scope: i32, depth: i32 }
+impl Copy for PRef {}
+struct PLabel { name: u32, loop: bool }
+impl Copy for PLabel {}
+
+/// A name the body reads from outside, and the deepest nesting of its uses
+/// (0: the lazy function itself).
+pub struct FreeName { pub name: u32, pub depth: i32 }
+impl Copy for FreeName {}
+
+pub struct Preparse {
+  scopes: List<PScope>, decls: List<PDecl>, refs: List<PRef>, labels: List<PLabel>,
+  /// Every atom held by decls, refs and labels: one reference each.
+  held: List<u32>,
+  scope: i32, depth: i32, labelBase: usize, loops: i32, breakables: i32,
+  strict: bool, lastIdent: u32,
+  pub maxDepth: i32, pub free: List<FreeName>
+}
+
+type E = ParserStackOverflow | LexError | BigIntError | OutOfMemoryError | StringLengthError
+
+impl Preparse {
+  pub fn make() -> Preparse {
+    return Preparse { scopes: List<PScope>.make(), decls: List<PDecl>.make(), refs: List<PRef>.make(), labels: List<PLabel>.make(),
+      held: List<u32>.make(), scope: -1, depth: 0, labelBase: 0, loops: 0, breakables: 0, strict: false, lastIdent: 0,
+      maxDepth: 0, free: List<FreeName>.make() }
+  }
+  /// Releases every atom this preparse holds, free names included.
+  pub fn release<'src>(self: &mut Self, s: &mut Parser<'src>) -> () {
+    let rt = s.runtimeState()
+    let mut i: usize = 0
+    while i < self.held.length() { rt.atoms.release(self.held.get(i)) i = i + 1 }
+    self.held.clear()
+    self.free.clear()
+  }
+  effect fn hold<'src>(self: &mut Self, atom: u32, s: &mut Parser<'src>) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    let rt = s.runtimeState()
+    let kept = rt.atoms.duplicate(atom)
+    run self.held.append(kept)
+    return kept
+  }
+  effect fn push(self: &mut Self, function: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.scopes.append(PScope { parent: self.scope, function: function, first: -1 })
+    self.scope = usize.toI32(self.scopes.length() - 1)
+  }
+  fn pop(self: &mut Self) -> () { self.scope = self.scopes.get(i32.toUsize(self.scope)).parent }
+  effect fn addHere(self: &mut Self, name: u32, kind: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+    let scope = self.scope
+    run self.add(scope, name, kind)
+  }
+  effect fn add(self: &mut Self, scope: i32, name: u32, kind: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut record = self.scopes.get(i32.toUsize(scope))
+    run self.decls.append(PDecl { name: name, next: record.first, kind: kind })
+    record.first = usize.toI32(self.decls.length() - 1)
+    self.scopes.set(i32.toUsize(scope), record)
+  }
+  /// The kind mask of `name`'s entries in scope: bit k set for kind k.
+  fn kinds(self: &Self, scope: i32, name: u32) -> u32 {
+    let mut mask: u32 = 0
+    let mut index = self.scopes.get(i32.toUsize(scope)).first
+    while index >= 0 {
+      let d = self.decls.get(i32.toUsize(index))
+      if d.name == name { mask = mask | u32.shiftLeft(1, u8.toU32(d.kind)) }
+      index = d.next
+    }
+    return mask
+  }
+  /// var/function: no lexical binding of the name in any scope it hoists through.
+  effect fn declareVar<'src>(self: &mut Self, atom: u32, s: &mut Parser<'src>) -> bool ! OutOfMemoryError ? &mut Allocator {
+    let name = run self.hold(atom, &mut s)
+    let mut scope = self.scope
+    while true {
+      let record = self.scopes.get(i32.toUsize(scope))
+      if (self.kinds(scope, name) & u32.shiftLeft(1, u8.toU32(LEX))) != 0 { return false }
+      if record.function { run self.add(scope, name, VAR) return true }
+      run self.add(scope, name, THROUGH)
+      scope = record.parent
+    }
+    return false
+  }
+  /// let/const: nothing else of the name in its scope.
+  effect fn declareLexical<'src>(self: &mut Self, atom: u32, s: &mut Parser<'src>, kind: u8) -> bool ! OutOfMemoryError ? &mut Allocator {
+    let name = run self.hold(atom, &mut s)
+    if self.kinds(self.scope, name) != 0 { return false }
+    if name == atoms.JS_ATOM_let { return false }
+    run self.addHere(name, kind)
+    return true
+  }
+  effect fn reference<'src>(self: &mut Self, atom: u32, s: &mut Parser<'src>) -> () ! OutOfMemoryError ? &mut Allocator {
+    let name = run self.hold(atom, &mut s)
+    run self.refs.append(PRef { name: name, scope: self.scope, depth: self.depth })
+  }
+  /// Resolves every reference: the ones that leave the body become `free`.
+  effect fn resolve(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut i: usize = 0
+    while i < self.refs.length() {
+      let r = self.refs.get(i)
+      let mut scope = r.scope
+      let mut found = false
+      while scope >= 0 && !found {
+        if (self.kinds(scope, r.name) & (u32.shiftLeft(1, u8.toU32(VAR)) | u32.shiftLeft(1, u8.toU32(LEX)) | u32.shiftLeft(1, u8.toU32(CATCH)))) != 0 { found = true }
+        scope = self.scopes.get(i32.toUsize(scope)).parent
+      }
+      if !found {
+        let mut j: usize = 0 let mut known = false
+        while j < self.free.length() && !known {
+          let f = self.free.get(j)
+          if f.name == r.name { known = true if r.depth > f.depth { self.free.set(j, FreeName { name: f.name, depth: r.depth }) } }
+          j = j + 1
+        }
+        if !known { run self.free.append(FreeName { name: r.name, depth: r.depth }) }
+      }
+      i = i + 1
+    }
+  }
+}
+
+effect fn adv<'src>(s: &mut Parser<'src>) -> () ! E ? &mut Allocator { run s.advance() }
+
+/// A plain identifier token usable as a binding or reference in this subset.
+fn plainIdentifier<'src>(s: &Parser<'src>, p: &Preparse) -> bool {
+  if s.token.kind != tok.TOK_IDENT { return false }
+  return match &s.token.payload {
+    TokenPayload.Identifier { atom, owner: _, hasEscape, isReserved } => {
+      if hasEscape || isReserved { return false }
+      if atom == atoms.JS_ATOM_eval || atom == atoms.JS_ATOM_async { return false }
+      if p.strict && atom == atoms.JS_ATOM_arguments { return false }
+      true
+    }
+    _ => false
+  }
+}
+/// A binding name: also never `arguments` or `eval` in strict code.
+fn bindingIdentifier<'src>(s: &Parser<'src>, p: &Preparse) -> bool {
+  if !plainIdentifier(&s.*, &p.*) { return false }
+  return !(p.strict && s.token.atom() == atoms.JS_ATOM_arguments)
+}
+fn identifierName(kind: i32) -> bool { return support.tokenIsIdent(kind) }
+fn semicolon<'src>(s: &Parser<'src>) -> i32 {
+  if s.token.kind == 59 { return 1 }
+  if s.token.kind == 125 || s.token.kind == tok.TOK_EOF || s.token.gotLineFeed { return 0 }
+  return -1
+}
+effect fn endStatement<'src>(s: &mut Parser<'src>) -> bool ! E ? &mut Allocator {
+  let at = semicolon(&s.*)
+  if at < 0 { return false }
+  if at == 1 { run adv(&mut s) }
+  return true
+}
+effect fn expect<'src>(s: &mut Parser<'src>, kind: i32) -> bool ! E ? &mut Allocator {
+  if s.token.kind != kind { return false }
+  run adv(&mut s)
+  return true
+}
+
+/// Preparses the body whose `{` is the current token, for the function being
+/// parsed (its parameters already declared in it). On true the current token is
+/// the closing `}`; on false the caller must seek back.
+pub effect fn body<'src>(s: &mut Parser<'src>, p: &mut Preparse) -> bool ! E ? &mut Allocator {
+  let fd = s.functionView()
+  p.strict = (fd.jsMode & JS_MODE_STRICT) != 0
+  let argumentsBinding = fd.hasArgumentsBinding
+  drop fd
+  run p.push(true)
+  let mut i: usize = 0
+  while i < s.functionView().args.length() {
+    let name = s.functionView().args.get(i).name
+    let kept = run p.hold(name, &mut s)
+    run p.addHere(kept, VAR)
+    i = i + 1
+  }
+  if argumentsBinding { run p.addHere(atoms.JS_ATOM_arguments, VAR) }
+  if s.token.kind != 123 { return false }
+  run adv(&mut s)
+  // A directive prologue may switch the body to strict mode: parse it fully.
+  if s.token.kind == tok.TOK_STRING { return false }
+  while s.token.kind != 125 {
+    if s.token.kind == tok.TOK_EOF { return false }
+    if !run statement(&mut s, &mut p, true) { return false }
+  }
+  run p.resolve()
+  return true
+}
+
+effect fn statement<'src>(s: &mut Parser<'src>, p: &mut Preparse, topLevel: bool) -> bool ! E ? &mut Allocator {
+  let kind = s.token.kind
+  if kind == 123 {
+    run p.push(false) run adv(&mut s)
+    while s.token.kind != 125 {
+      if s.token.kind == tok.TOK_EOF { return false }
+      if !run statement(&mut s, &mut p, true) { return false }
+    }
+    run adv(&mut s) p.pop() return true
+  }
+  if kind == tok.TOK_VAR {
+    run adv(&mut s)
+    if !run declarations(&mut s, &mut p, VAR, false, false) { return false }
+    return run endStatement(&mut s)
+  }
+  if kind == tok.TOK_LET || kind == tok.TOK_CONST {
+    if !topLevel { return false }
+    run adv(&mut s)
+    if !run declarations(&mut s, &mut p, LEX, kind == tok.TOK_CONST, false) { return false }
+    return run endStatement(&mut s)
+  }
+  if kind == 59 { run adv(&mut s) return true }
+  if kind == tok.TOK_IF {
+    run adv(&mut s)
+    if !run expect(&mut s, 40) { return false }
+    if (run expression(&mut s, &mut p, false)) < 0 { return false }
+    if !run expect(&mut s, 41) { return false }
+    if !run substatement(&mut s, &mut p) { return false }
+    if s.token.kind == tok.TOK_ELSE { run adv(&mut s) return run substatement(&mut s, &mut p) }
+    return true
+  }
+  if kind == tok.TOK_FOR { return run forStatement(&mut s, &mut p) }
+  if kind == tok.TOK_WHILE {
+    run adv(&mut s)
+    if !run expect(&mut s, 40) { return false }
+    if (run expression(&mut s, &mut p, false)) < 0 { return false }
+    if !run expect(&mut s, 41) { return false }
+    return run loopBody(&mut s, &mut p)
+  }
+  if kind == tok.TOK_DO {
+    run adv(&mut s)
+    if !run loopBody(&mut s, &mut p) { return false }
+    if !run expect(&mut s, tok.TOK_WHILE) { return false }
+    if !run expect(&mut s, 40) { return false }
+    if (run expression(&mut s, &mut p, false)) < 0 { return false }
+    if !run expect(&mut s, 41) { return false }
+    if s.token.kind == 59 { run adv(&mut s) }
+    return true
+  }
+  if kind == tok.TOK_CONTINUE || kind == tok.TOK_BREAK {
+    run adv(&mut s)
+    if s.token.kind == tok.TOK_IDENT && !s.token.gotLineFeed {
+      if !plainIdentifier(&s.*, &p.*) { return false }
+      let name = s.token.atom()
+      let mut i = p.labelBase let mut ok = false
+      while i < p.labels.length() {
+        let l = p.labels.get(i)
+        if l.name == name && (kind == tok.TOK_BREAK || l.loop) { ok = true }
+        i = i + 1
+      }
+      if !ok { return false }
+      run adv(&mut s)
+    } else {
+      if kind == tok.TOK_CONTINUE && p.loops == 0 { return false }
+      if kind == tok.TOK_BREAK && p.breakables == 0 { return false }
+    }
+    return run endStatement(&mut s)
+  }
+  if kind == tok.TOK_RETURN {
+    run adv(&mut s)
+    if semicolon(&s.*) < 0 { if (run expression(&mut s, &mut p, false)) < 0 { return false } }
+    return run endStatement(&mut s)
+  }
+  if kind == tok.TOK_THROW {
+    run adv(&mut s)
+    if s.token.gotLineFeed { return false }
+    if (run expression(&mut s, &mut p, false)) < 0 { return false }
+    return run endStatement(&mut s)
+  }
+  if kind == tok.TOK_SWITCH { return run switchStatement(&mut s, &mut p) }
+  if kind == tok.TOK_TRY { return run tryStatement(&mut s, &mut p) }
+  if kind == tok.TOK_FUNCTION {
+    // Function declarations outside a function's top level have Annex B forms.
+    if !topLevel || !p.scopes.get(i32.toUsize(p.scope)).function { return false }
+    run adv(&mut s)
+    if s.token.kind == 42 || !bindingIdentifier(&s.*, &p.*) { return false }
+    if !run p.declareVar(s.token.atom(), &mut s) { return false }
+    run adv(&mut s)
+    return run functionRest(&mut s, &mut p, -1)
+  }
+  if kind == tok.TOK_DEBUGGER { run adv(&mut s) return run endStatement(&mut s) }
+  if kind == tok.TOK_IDENT && s.peek(false) == 58 { return run labelled(&mut s, &mut p) }
+  if kind == tok.TOK_IDENT || kind == tok.TOK_THIS || kind == tok.TOK_NUMBER || kind == tok.TOK_STRING
+    || kind == 40 || kind == 91 || kind == 33 || kind == 126 || kind == 43 || kind == 45 || kind == tok.TOK_INC || kind == tok.TOK_DEC
+    || kind == tok.TOK_TYPEOF || kind == tok.TOK_VOID || kind == tok.TOK_DELETE || kind == tok.TOK_NEW
+    || kind == tok.TOK_NULL || kind == tok.TOK_TRUE || kind == tok.TOK_FALSE || kind == 47 || kind == tok.TOK_DIV_ASSIGN {
+    if (run expression(&mut s, &mut p, false)) < 0 { return false }
+    return run endStatement(&mut s)
+  }
+  return false
+}
+/// The body of if/else/loops/labels: no declarations of any kind.
+effect fn substatement<'src>(s: &mut Parser<'src>, p: &mut Preparse) -> bool ! E ? &mut Allocator {
+  let kind = s.token.kind
+  if kind == tok.TOK_FUNCTION || kind == tok.TOK_CLASS || kind == tok.TOK_LET || kind == tok.TOK_CONST { return false }
+  return run statement(&mut s, &mut p, false)
+}
+effect fn loopBody<'src>(s: &mut Parser<'src>, p: &mut Preparse) -> bool ! E ? &mut Allocator {
+  p.loops = p.loops + 1 p.breakables = p.breakables + 1
+  let ok = run substatement(&mut s, &mut p)
+  p.loops = p.loops - 1 p.breakables = p.breakables - 1
+  return ok
+}
+effect fn labelled<'src>(s: &mut Parser<'src>, p: &mut Preparse) -> bool ! E ? &mut Allocator {
+  let first = p.labels.length()
+  while s.token.kind == tok.TOK_IDENT && s.peek(false) == 58 {
+    if !plainIdentifier(&s.*, &p.*) { return false }
+    let name = run p.hold(s.token.atom(), &mut s)
+    let mut i = p.labelBase
+    while i < p.labels.length() { if p.labels.get(i).name == name { return false } i = i + 1 }
+    run p.labels.append(PLabel { name: name, loop: false })
+    run adv(&mut s) run adv(&mut s)
+  }
+  let kind = s.token.kind
+  if kind == tok.TOK_FOR || kind == tok.TOK_WHILE || kind == tok.TOK_DO {
+    let mut i = first
+    while i < p.labels.length() { let mut l = p.labels.get(i) l.loop = true p.labels.set(i, l) i = i + 1 }
+  }
+  p.breakables = p.breakables + 1
+  let ok = run substatement(&mut s, &mut p)
+  p.breakables = p.breakables - 1
+  p.labels.truncate(first)
+  return ok
+}
+/// Declarations after var/let/const. inFor: stop before `in`/`of` (and allow a
+/// const without initializer there; the caller checks).
+effect fn declarations<'src>(s: &mut Parser<'src>, p: &mut Preparse, kind: u8, constant: bool, noIn: bool) -> bool ! E ? &mut Allocator {
+  while true {
+    if !bindingIdentifier(&s.*, &p.*) { return false }
+    if kind == VAR { if !run p.declareVar(s.token.atom(), &mut s) { return false } }
+    else if !run p.declareLexical(s.token.atom(), &mut s, LEX) { return false }
+    run adv(&mut s)
+    if s.token.kind == 61 {
+      run adv(&mut s)
+      if (run assignment(&mut s, &mut p, noIn)) < 0 { return false }
+    } else if constant { return false }
+    if s.token.kind != 44 { return true }
+    run adv(&mut s)
+  }
+  return false
+}
+effect fn forStatement<'src>(s: &mut Parser<'src>, p: &mut Preparse) -> bool ! E ? &mut Allocator {
+  run adv(&mut s)
+  if !run expect(&mut s, 40) { return false }
+  run p.push(false)
+  let kind = s.token.kind
+  let mut iteration = false
+  if kind == tok.TOK_VAR || kind == tok.TOK_LET || kind == tok.TOK_CONST {
+    run adv(&mut s)
+    if !bindingIdentifier(&s.*, &p.*) { return false }
+    let next = s.peek(false)
+    if next == tok.TOK_IN || next == tok.TOK_OF {
+      if kind == tok.TOK_VAR { if !run p.declareVar(s.token.atom(), &mut s) { return false } }
+      else if !run p.declareLexical(s.token.atom(), &mut s, LEX) { return false }
+      run adv(&mut s)
+      iteration = true
+    } else {
+      let lexical = if kind == tok.TOK_VAR { VAR } else { LEX }
+      if !run declarations(&mut s, &mut p, lexical, kind == tok.TOK_CONST, true) { return false }
+      if !run expect(&mut s, 59) { return false }
+    }
+  } else if kind == 59 {
+    run adv(&mut s)
+  } else {
+    let target = run expression(&mut s, &mut p, true)
+    if target < 0 { return false }
+    if s.token.kind == tok.TOK_IN || s.token.kind == tok.TOK_OF {
+      if target != IDENT && target != MEMBER { return false }
+      if target == IDENT && p.strict && (p.lastIdent == atoms.JS_ATOM_arguments || p.lastIdent == atoms.JS_ATOM_eval) { return false }
+      iteration = true
+    } else if !run expect(&mut s, 59) { return false }
+  }
+  if iteration {
+    let of = s.token.kind == tok.TOK_OF
+    run adv(&mut s)
+    if of { if (run assignment(&mut s, &mut p, false)) < 0 { return false } }
+    else if (run expression(&mut s, &mut p, false)) < 0 { return false }
+  } else {
+    if s.token.kind != 59 { if (run expression(&mut s, &mut p, false)) < 0 { return false } }
+    if !run expect(&mut s, 59) { return false }
+    if s.token.kind != 41 { if (run expression(&mut s, &mut p, false)) < 0 { return false } }
+  }
+  if !run expect(&mut s, 41) { return false }
+  let ok = run loopBody(&mut s, &mut p)
+  p.pop()
+  return ok
+}
+effect fn switchStatement<'src>(s: &mut Parser<'src>, p: &mut Preparse) -> bool ! E ? &mut Allocator {
+  run adv(&mut s)
+  if !run expect(&mut s, 40) { return false }
+  if (run expression(&mut s, &mut p, false)) < 0 { return false }
+  if !run expect(&mut s, 41) { return false }
+  if !run expect(&mut s, 123) { return false }
+  run p.push(false)
+  p.breakables = p.breakables + 1
+  let mut defaults = 0
+  while s.token.kind != 125 {
+    if s.token.kind == tok.TOK_CASE {
+      run adv(&mut s)
+      if (run expression(&mut s, &mut p, false)) < 0 { return false }
+    } else if s.token.kind == tok.TOK_DEFAULT {
+      defaults = defaults + 1
+      if defaults > 1 { return false }
+      run adv(&mut s)
+    } else { return false }
+    if !run expect(&mut s, 58) { return false }
+    while s.token.kind != tok.TOK_CASE && s.token.kind != tok.TOK_DEFAULT && s.token.kind != 125 {
+      if s.token.kind == tok.TOK_EOF { return false }
+      if !run statement(&mut s, &mut p, true) { return false }
+    }
+  }
+  run adv(&mut s)
+  p.breakables = p.breakables - 1
+  p.pop()
+  return true
+}
+effect fn block<'src>(s: &mut Parser<'src>, p: &mut Preparse) -> bool ! E ? &mut Allocator {
+  if s.token.kind != 123 { return false }
+  return run statement(&mut s, &mut p, true)
+}
+effect fn tryStatement<'src>(s: &mut Parser<'src>, p: &mut Preparse) -> bool ! E ? &mut Allocator {
+  run adv(&mut s)
+  if !run block(&mut s, &mut p) { return false }
+  let mut handled = false
+  if s.token.kind == tok.TOK_CATCH {
+    handled = true
+    run adv(&mut s)
+    run p.push(false)
+    if s.token.kind == 40 {
+      run adv(&mut s)
+      if !bindingIdentifier(&s.*, &p.*) { return false }
+      let name = run p.hold(s.token.atom(), &mut s)
+      run p.addHere(name, CATCH)
+      run adv(&mut s)
+      if !run expect(&mut s, 41) { return false }
+    }
+    // The catch block shares the parameter's scope: `let e` there is an error.
+    if !run expect(&mut s, 123) { return false }
+    while s.token.kind != 125 {
+      if s.token.kind == tok.TOK_EOF { return false }
+      if !run statement(&mut s, &mut p, true) { return false }
+    }
+    run adv(&mut s)
+    p.pop()
+  }
+  if s.token.kind == tok.TOK_FINALLY {
+    handled = true
+    run adv(&mut s)
+    if !run block(&mut s, &mut p) { return false }
+  }
+  return handled
+}
+
+/// A function's parameters and body after its name. accessor: -1 for an
+/// ordinary function, else the exact parameter count (getter 0, setter 1).
+effect fn functionRest<'src>(s: &mut Parser<'src>, p: &mut Preparse, accessor: i32) -> bool ! E ? &mut Allocator {
+  if !run expect(&mut s, 40) { return false }
+  let outerLabels = p.labelBase let outerLoops = p.loops let outerBreakables = p.breakables
+  p.labelBase = p.labels.length() p.loops = 0 p.breakables = 0
+  p.depth = p.depth + 1
+  if p.depth > p.maxDepth { p.maxDepth = p.depth }
+  run p.push(true)
+  let mut count: i32 = 0
+  while s.token.kind != 41 {
+    if !bindingIdentifier(&s.*, &p.*) { return false }
+    let name = s.token.atom()
+    if p.strict && p.kinds(p.scope, name) != 0 { return false }
+    let kept = run p.hold(name, &mut s)
+    run p.addHere(kept, VAR)
+    count = count + 1
+    run adv(&mut s)
+    if s.token.kind == 44 { run adv(&mut s) if accessor >= 0 && s.token.kind == 41 { return false } }
+    else if s.token.kind != 41 { return false }
+  }
+  if accessor >= 0 && count != accessor { return false }
+  run adv(&mut s)
+  run p.addHere(atoms.JS_ATOM_arguments, VAR)
+  if !run expect(&mut s, 123) { return false }
+  if s.token.kind == tok.TOK_STRING { return false }
+  while s.token.kind != 125 {
+    if s.token.kind == tok.TOK_EOF { return false }
+    if !run statement(&mut s, &mut p, true) { return false }
+  }
+  run adv(&mut s)
+  p.pop()
+  p.depth = p.depth - 1
+  p.labels.truncate(p.labelBase)
+  p.labelBase = outerLabels p.loops = outerLoops p.breakables = outerBreakables
+  return true
+}
+
+effect fn expression<'src>(s: &mut Parser<'src>, p: &mut Preparse, noIn: bool) -> i32 ! E ? &mut Allocator {
+  let mut kind = run assignment(&mut s, &mut p, noIn)
+  while kind >= 0 && s.token.kind == 44 {
+    run adv(&mut s)
+    if (run assignment(&mut s, &mut p, noIn)) < 0 { return BAIL }
+    kind = OTHER
+  }
+  return kind
+}
+fn assignOperator(kind: i32) -> bool {
+  return kind == 61 || (kind >= tok.TOK_MUL_ASSIGN && kind <= tok.TOK_DOUBLE_QUESTION_MARK_ASSIGN)
+}
+effect fn assignment<'src>(s: &mut Parser<'src>, p: &mut Preparse, noIn: bool) -> i32 ! E ? &mut Allocator {
+  if s.token.kind == tok.TOK_YIELD || s.token.kind == tok.TOK_AWAIT { return BAIL }
+  let kind = run conditional(&mut s, &mut p, noIn)
+  if kind < 0 { return BAIL }
+  if assignOperator(s.token.kind) {
+    if kind != IDENT && kind != MEMBER { return BAIL }
+    if kind == IDENT && p.strict && (p.lastIdent == atoms.JS_ATOM_arguments || p.lastIdent == atoms.JS_ATOM_eval) { return BAIL }
+    run adv(&mut s)
+    if (run assignment(&mut s, &mut p, noIn)) < 0 { return BAIL }
+    return OTHER
+  }
+  return kind
+}
+effect fn conditional<'src>(s: &mut Parser<'src>, p: &mut Preparse, noIn: bool) -> i32 ! E ? &mut Allocator {
+  let kind = run binary(&mut s, &mut p, 1, noIn)
+  if kind < 0 { return BAIL }
+  if s.token.kind == 63 {
+    run adv(&mut s)
+    if (run assignment(&mut s, &mut p, false)) < 0 { return BAIL }
+    if !run expect(&mut s, 58) { return BAIL }
+    if (run assignment(&mut s, &mut p, noIn)) < 0 { return BAIL }
+    return OTHER
+  }
+  return kind
+}
+/// Binary operator precedence, or -1; `??` is not modelled (its mixing rules).
+fn precedence(kind: i32, noIn: bool) -> i32 {
+  if kind == tok.TOK_LOR { return 1 }
+  if kind == tok.TOK_LAND { return 2 }
+  if kind == 124 { return 3 }
+  if kind == 94 { return 4 }
+  if kind == 38 { return 5 }
+  if kind == tok.TOK_EQ || kind == tok.TOK_NEQ || kind == tok.TOK_STRICT_EQ || kind == tok.TOK_STRICT_NEQ { return 6 }
+  if kind == 60 || kind == 62 || kind == tok.TOK_LT || kind == tok.TOK_LTE || kind == tok.TOK_GT || kind == tok.TOK_GTE
+    || kind == tok.TOK_INSTANCEOF { return 7 }
+  if kind == tok.TOK_IN { if noIn { return -1 } return 7 }
+  if kind == tok.TOK_SHL || kind == tok.TOK_SAR || kind == tok.TOK_SHR { return 8 }
+  if kind == 43 || kind == 45 { return 9 }
+  if kind == 42 || kind == 47 || kind == 37 { return 10 }
+  if kind == tok.TOK_POW { return 11 }
+  return -1
+}
+effect fn binary<'src>(s: &mut Parser<'src>, p: &mut Preparse, minimum: i32, noIn: bool) -> i32 ! E ? &mut Allocator {
+  let mut kind = run unary(&mut s, &mut p)
+  if kind < 0 { return BAIL }
+  while true {
+    if s.token.kind == tok.TOK_DOUBLE_QUESTION_MARK { return BAIL }
+    let level = precedence(s.token.kind, noIn)
+    if level < 0 || level < minimum { return kind }
+    if level == 11 {
+      // A unary operator directly before ** is an early error.
+      if kind == UNARY { return BAIL }
+      run adv(&mut s)
+      if (run binary(&mut s, &mut p, 11, noIn)) < 0 { return BAIL }
+    } else {
+      run adv(&mut s)
+      if (run binary(&mut s, &mut p, level + 1, noIn)) < 0 { return BAIL }
+    }
+    kind = OTHER
+  }
+  return kind
+}
+effect fn unary<'src>(s: &mut Parser<'src>, p: &mut Preparse) -> i32 ! E ? &mut Allocator {
+  let kind = s.token.kind
+  if kind == 33 || kind == 126 || kind == 43 || kind == 45 || kind == tok.TOK_TYPEOF || kind == tok.TOK_VOID || kind == tok.TOK_DELETE {
+    run adv(&mut s)
+    let operand = run unary(&mut s, &mut p)
+    if operand < 0 { return BAIL }
+    if kind == tok.TOK_DELETE && p.strict && operand == IDENT { return BAIL }
+    return UNARY
+  }
+  if kind == tok.TOK_INC || kind == tok.TOK_DEC {
+    run adv(&mut s)
+    let operand = run unary(&mut s, &mut p)
+    if operand != IDENT && operand != MEMBER { return BAIL }
+    if operand == IDENT && p.strict && (p.lastIdent == atoms.JS_ATOM_arguments || p.lastIdent == atoms.JS_ATOM_eval) { return BAIL }
+    return OTHER
+  }
+  if kind == tok.TOK_AWAIT { return BAIL }
+  let operand = run leftHandSide(&mut s, &mut p)
+  if operand < 0 { return BAIL }
+  if (s.token.kind == tok.TOK_INC || s.token.kind == tok.TOK_DEC) && !s.token.gotLineFeed {
+    if operand != IDENT && operand != MEMBER { return BAIL }
+    if operand == IDENT && p.strict && (p.lastIdent == atoms.JS_ATOM_arguments || p.lastIdent == atoms.JS_ATOM_eval) { return BAIL }
+    run adv(&mut s)
+    return OTHER
+  }
+  return operand
+}
+/// Member accesses after a primary or `new` expression; calls too when calls.
+effect fn tails<'src>(s: &mut Parser<'src>, p: &mut Preparse, start: i32, calls: bool) -> i32 ! E ? &mut Allocator {
+  let mut kind = start
+  while true {
+    let next = s.token.kind
+    if next == 46 {
+      run adv(&mut s)
+      if !identifierName(s.token.kind) { return BAIL }
+      run adv(&mut s)
+      kind = MEMBER
+    } else if next == 91 {
+      run adv(&mut s)
+      if (run expression(&mut s, &mut p, false)) < 0 { return BAIL }
+      if !run expect(&mut s, 93) { return BAIL }
+      kind = MEMBER
+    } else if next == 40 && calls {
+      if !run arguments(&mut s, &mut p) { return BAIL }
+      kind = OTHER
+    } else if next == tok.TOK_TEMPLATE || next == tok.TOK_QUESTION_MARK_DOT {
+      return BAIL
+    } else { return kind }
+  }
+  return kind
+}
+effect fn leftHandSide<'src>(s: &mut Parser<'src>, p: &mut Preparse) -> i32 ! E ? &mut Allocator {
+  let mut kind = OTHER
+  if s.token.kind == tok.TOK_NEW { kind = run newExpression(&mut s, &mut p) }
+  else { kind = run primary(&mut s, &mut p) }
+  if kind < 0 { return BAIL }
+  return run tails(&mut s, &mut p, kind, true)
+}
+effect fn newExpression<'src>(s: &mut Parser<'src>, p: &mut Preparse) -> i32 ! E ? &mut Allocator {
+  run adv(&mut s)
+  if s.token.kind == 46 { return BAIL }
+  let mut kind = OTHER
+  if s.token.kind == tok.TOK_NEW { kind = run newExpression(&mut s, &mut p) }
+  else { kind = run primary(&mut s, &mut p) }
+  if kind < 0 { return BAIL }
+  if (run tails(&mut s, &mut p, kind, false)) < 0 { return BAIL }
+  if s.token.kind == 40 { if !run arguments(&mut s, &mut p) { return BAIL } }
+  return OTHER
+}
+effect fn arguments<'src>(s: &mut Parser<'src>, p: &mut Preparse) -> bool ! E ? &mut Allocator {
+  run adv(&mut s)
+  while s.token.kind != 41 {
+    if s.token.kind == tok.TOK_ELLIPSIS { return false }
+    if (run assignment(&mut s, &mut p, false)) < 0 { return false }
+    if s.token.kind == 44 { run adv(&mut s) }
+    else if s.token.kind != 41 { return false }
+  }
+  run adv(&mut s)
+  return true
+}
+unsafe effect fn compileCheck(body: ValueBits, flags: ValueBits, runtime: *mut HeapHeader) -> ValueBits
+  ! OutOfMemoryError | StringLengthError | RegExpSyntaxError | RegExpStackOverflow ? &mut Allocator {
+  return run unsafe compileStringForRuntime(body, flags, runtime)
+}
+effect fn primary<'src>(s: &mut Parser<'src>, p: &mut Preparse) -> i32 ! E ? &mut Allocator {
+  let kind = s.token.kind
+  if kind == tok.TOK_IDENT {
+    if !plainIdentifier(&s.*, &p.*) { return BAIL }
+    if s.peek(false) == tok.TOK_ARROW { return BAIL }
+    let name = s.token.atom()
+    run p.reference(name, &mut s)
+    p.lastIdent = name
+    run adv(&mut s)
+    return IDENT
+  }
+  if kind == tok.TOK_THIS || kind == tok.TOK_NULL || kind == tok.TOK_TRUE || kind == tok.TOK_FALSE
+    || kind == tok.TOK_NUMBER || kind == tok.TOK_STRING {
+    run adv(&mut s)
+    return OTHER
+  }
+  if kind == 47 || kind == tok.TOK_DIV_ASSIGN {
+    run s.rescanRegExp()
+    let body = match &s.token.payload { TokenPayload.RegExp { body, flags: _ } => body.get() _ => { return BAIL } }
+    let flags = match &s.token.payload { TokenPayload.RegExp { body: _, flags } => flags.get() _ => { return BAIL } }
+    // The same check the full parser makes; the compile cache keeps the result for it.
+    let outcome = run Effect.result(unsafe compileCheck(body, flags, s.runtimeCell()))
+    match move outcome {
+      Result<ValueBits, OutOfMemoryError | StringLengthError | RegExpSyntaxError | RegExpStackOverflow>.Success { value } => { Strings.release(value) }
+      Result<ValueBits, OutOfMemoryError | StringLengthError | RegExpSyntaxError | RegExpStackOverflow>.Failure { error } => { drop error return BAIL }
+    }
+    run adv(&mut s)
+    return OTHER
+  }
+  if kind == 40 {
+    run adv(&mut s)
+    if s.token.kind == 41 { return BAIL }
+    let inner = run expression(&mut s, &mut p, false)
+    if inner < 0 { return BAIL }
+    if !run expect(&mut s, 41) { return BAIL }
+    if s.token.kind == tok.TOK_ARROW { return BAIL }
+    if inner == IDENT || inner == MEMBER { return inner }
+    return OTHER
+  }
+  if kind == 91 {
+    run adv(&mut s)
+    while s.token.kind != 93 {
+      if s.token.kind == 44 { run adv(&mut s) }
+      else {
+        if s.token.kind == tok.TOK_ELLIPSIS { return BAIL }
+        if (run assignment(&mut s, &mut p, false)) < 0 { return BAIL }
+        if s.token.kind == 44 { run adv(&mut s) }
+        else if s.token.kind != 93 { return BAIL }
+      }
+    }
+    run adv(&mut s)
+    return OTHER
+  }
+  if kind == 123 { if !run objectLiteral(&mut s, &mut p) { return BAIL } return OTHER }
+  if kind == tok.TOK_FUNCTION {
+    run adv(&mut s)
+    if s.token.kind == 42 { return BAIL }
+    let mut named = false
+    if s.token.kind != 40 {
+      if !bindingIdentifier(&s.*, &p.*) { return BAIL }
+      run p.push(false)
+      let name = run p.hold(s.token.atom(), &mut s)
+      run p.addHere(name, LEX)
+      named = true
+      run adv(&mut s)
+    }
+    if !run functionRest(&mut s, &mut p, -1) { return BAIL }
+    if named { p.pop() }
+    return OTHER
+  }
+  return BAIL
+}
+/// The source text of the current token is `__proto__` or a string of it.
+fn protoKey<'src>(s: &Parser<'src>) -> bool {
+  let bytes = s.sourceBytes()
+  let start = s.token.start let end = s.token.end
+  let word = b"__proto__"
+  let mut from = start let mut to = end
+  if s.token.kind == tok.TOK_STRING { from = start + 1 to = end - 1 }
+  if to < from || to - from != word.length { return false }
+  let mut i: usize = 0
+  while i < word.length { if bytes[from + i] != word[i] { return false } i = i + 1 }
+  return true
+}
+effect fn objectLiteral<'src>(s: &mut Parser<'src>, p: &mut Preparse) -> bool ! E ? &mut Allocator {
+  run adv(&mut s)
+  let mut protos = 0
+  while s.token.kind != 125 {
+    let kind = s.token.kind
+    if kind == tok.TOK_ELLIPSIS || kind == 91 || kind == 42 { return false }
+    let accessorWord = kind == tok.TOK_IDENT && (s.token.atom() == atoms.JS_ATOM_get || s.token.atom() == atoms.JS_ATOM_set)
+    if accessorWord {
+      let next = s.peek(false)
+      if next != 44 && next != 58 && next != 40 && next != 125 && next != 61 {
+        let getter = s.token.atom() == atoms.JS_ATOM_get
+        run adv(&mut s)
+        if !(identifierName(s.token.kind) || s.token.kind == tok.TOK_STRING || s.token.kind == tok.TOK_NUMBER) { return false }
+        run adv(&mut s)
+        let count = if getter { 0 } else { 1 }
+        if !run functionRest(&mut s, &mut p, count) { return false }
+        if s.token.kind == 44 { run adv(&mut s) continue }
+        if s.token.kind != 125 { return false }
+        continue
+      }
+    }
+    if kind == tok.TOK_IDENT {
+      let next = s.peek(false)
+      if next == 44 || next == 125 {
+        // Shorthand: a reference.
+        if !plainIdentifier(&s.*, &p.*) { return false }
+        run p.reference(s.token.atom(), &mut s)
+        run adv(&mut s)
+        if s.token.kind == 44 { run adv(&mut s) }
+        continue
+      }
+    }
+    if !(identifierName(kind) || kind == tok.TOK_STRING || kind == tok.TOK_NUMBER) { return false }
+    if kind != tok.TOK_NUMBER && protoKey(&s.*) { protos = protos + 1 if protos > 1 { return false } }
+    run adv(&mut s)
+    if !run expect(&mut s, 58) { return false }
+    if (run assignment(&mut s, &mut p, false)) < 0 { return false }
+    if s.token.kind == 44 { run adv(&mut s) }
+    else if s.token.kind != 125 { return false }
+  }
+  run adv(&mut s)
+  return true
+}
