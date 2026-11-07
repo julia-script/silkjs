@@ -1,8 +1,10 @@
 // SilkJS regression test for lazy function parsing: bodies the preparser skips
 // and compiles on first call must keep closures, captures, hoisting, TDZ,
 // strictness, toString, names, stack lines and early errors. Expected values
-// come from the eager compiler (and match node).
+// come from the eager compiler (and match node). Lazy parsing only applies to
+// sources of 64 KiB or more, so the body runs through a padded indirect eval.
 var out = [];
+function body() {
 var g = 10;
 function add(a, b) { return a + b + g; }
 function outer(x) {
@@ -86,7 +88,9 @@ var escaped = ["({ \\u0067et foo() { return 0; } })", "({ g\\u0065t 'hi'() { ret
 for (var s of escaped) { try { Function(s); out.push('accepted'); } catch (e) { out.push(e.constructor.name); } }
 function lazyLater() { return [1, 2, 3].map(function (v) { return v * g; }).join('+'); }
 out.push(lazyLater());
+}
+(0, eval)('/*' + 'x'.repeat(70000) + '*/\n(' + body.toString() + ')()');
 const got = out.join('|');
-const expected = "13 24 3 120 40 add 1|10,15,52,52|1|1|2:1|undefined|undefined|3|7|function toS(a, b) { /* c */ return a; }|2|toS|7undefined|7|hundefined|ReferenceError|TypeError|arg|function|function|h|two|d|boom|string|11|3:at inner (lazy_parse.js:75:24)@75|4:at deepErr (lazy_parse.js:82:28)@82|SyntaxError|SyntaxError|SyntaxError|10+20+30";
+const expected = "13 24 3 120 40 add 1|10,15,52,52|1|1|2:1|undefined|undefined|3|7|function toS(a, b) { /* c */ return a; }|2|toS|7undefined|7|hundefined|ReferenceError|TypeError|arg|function|function|h|two|d|boom|string|11|6:at inner (<input>:72:24)@72|7:at deepErr (<input>:79:28)@79|SyntaxError|SyntaxError|SyntaxError|10+20+30";
 console.log(got === expected ? 'PASS lazy parse' : 'FAIL ' + got);
 if (got !== expected) throw new Error('lazy parse regressions');
