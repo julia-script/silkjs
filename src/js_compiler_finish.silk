@@ -92,8 +92,8 @@ effect fn assemble<H: HeapHooks>(hooks: &mut H, tree: &mut FunctionTree, cell: F
   let dynamic = scopePlans.dynamicScope(&finished.*) let parentCell = finished.parent drop finished
   if dynamic { match parentCell { Option<FunctionId>.Some { value } => { let outer = tree.getMut(value) outer.subtreeDynamic = true } _ => () } }
   run variables.resolveVariables(&mut tree, cell)
-  if deferrable(tree.get(cell), source) { return run defer(&mut tree, cell, source) }
   let mut scopePlan = run scopePlans.plan(&mut tree, cell)
+  if deferrable(tree.get(cell), source) { return run defer(&mut tree, cell, source, move scopePlan) }
   run resolveLabels(&mut tree, cell, source)
   if scopePlan.slots != 0 {
     let own = tree.getMut(cell) scopePlans.specializeOwn(&mut own.*) run scopePlans.dropScopedLocals(&mut own.*, &mut scopePlan) drop own
@@ -273,10 +273,8 @@ fn deferrable(fd: &FunctionDef, source: &[u8]) -> bool {
   if fd.debuggerMetadata.enabled { return false }
   // Scope planning (js_compiler_scopes.plan) rewrites a function and its
   // descendants while their owner assembles; a stub's pre-label code takes the
-  // same operand rewrite. A function with captured locals of its own plans its
-  // scope as it assembles, so it compiles now.
-  let mut i: usize = 0 while i < fd.args.length() { if fd.args.get(i).isCaptured { return false } i = i + 1 }
-  i = 0 while i < fd.vars.length() { if fd.vars.get(i).isCaptured { return false } i = i + 1 }
+  // same operand rewrite. A function's own plan runs before it defers, so its
+  // owner sees its scope, and finish applies the rest.
   if fd.functionType != ParseFunctionKind.Statement && fd.functionType != ParseFunctionKind.Var
     && fd.functionType != ParseFunctionKind.Expression && fd.functionType != ParseFunctionKind.Arrow { return false }
   match &fd.module { Option<CellRef<ModuleDef>>.Some { .. } => { return false } _ => () }
@@ -294,8 +292,9 @@ fn deferrable(fd: &FunctionDef, source: &[u8]) -> bool {
 /// fd's final counts, closure table, constants and name; its code is a single
 /// invalid opcode and its stack size STUB_STACK. The vacated tree slot keeps
 /// fd's sibling and parent links, so createFunction's teardown unlinks it.
-effect fn defer(tree: &mut FunctionTree, cell: FunctionId, source: &[u8]) -> ValueBits
+effect fn defer(tree: &mut FunctionTree, cell: FunctionId, source: &[u8], plan: ScopePlan) -> ValueBits
   ! OutOfMemoryError ? &mut Allocator {
+  let mut scopePlan = move plan
   let fd = tree.getMut(cell)
   let runtime = fd.runtime let context = fd.context
   let start = u32.toUsize(fd.sourcePosition)
@@ -319,7 +318,8 @@ effect fn defer(tree: &mut FunctionTree, cell: FunctionId, source: &[u8]) -> Val
   run kept.reserveExact(1)
   let keptCell = run unsafe kept.add(FunctionDef.make(context, runtime, 0))
   let mut pending = run Box<PendingFunction>.make(PendingFunction { tree: move kept, cell: keptCell, start: start, line: at.line, column: at.column,
-    ecmaLine: ecma.line, ecmaColumn: ecma.column })
+    ecmaLine: ecma.line, ecmaColumn: ecma.column, slots: scopePlan.slots, varSlots: scopePlan.varSlots,
+    parameters: Intrinsic.replace(scopePlan.parameters, List<u32>.make()), variables: Intrinsic.replace(scopePlan.variables, List<u16>.make()) })
   let def = tree.getMut(cell)
   let mut table = List<u8>.make()
   if !def.stripDebug { table = run definitionPc2Line(at) }
@@ -343,7 +343,7 @@ effect fn defer(tree: &mut FunctionTree, cell: FunctionId, source: &[u8]) -> Val
     varDefs: List<VarDef>.make(), closureVars: List<ClosureVar>.make(),
     argumentCount: usize.toU16(def.args.length()), variableCount: usize.toU16(def.vars.length()),
     definedArgumentCount: i32.toU16(def.definedArgCount), stackSize: STUB_STACK,
-    varRefCount: i32.toU16(def.varRefCount), scopeCaptures: 0, scopeSlots: 0, scopeVarSlots: 0,
+    varRefCount: i32.toU16(def.varRefCount), scopeCaptures: 0, scopeSlots: scopePlan.slots, scopeVarSlots: scopePlan.varSlots,
     frameCells: scopes.inlineFrameCells(usize.toU16(def.vars.length()), STUB_STACK, i32.toU16(def.varRefCount), 0),
     scopeParameters: List<u32>.make(), scopeVariables: List<u16>.make(),
     borrowsArguments: false, leaf: 0, constructForm: 0, realm: context,
@@ -424,7 +424,7 @@ pub unsafe effect fn finish<H: HeapHooks>(hooks: &mut H, node: *mut HeapHeader) 
   drop fd
   let mut wholeAnchor = ()
   let source = Slice.view<u8>(unsafe latin1Bytes(&wholeAnchor, stringReference(whole)), 0, Strings.length(whole))
-  let outcome = run Effect.result(complete(&mut pending.tree, cell, source))
+  let outcome = run Effect.result(complete(&mut pending, cell, source))
   let done = pending.tree.getMut(cell)
   done.sourceCache = Pointer.null<SourcePositionCache>()
   match move outcome {
@@ -457,15 +457,20 @@ pub unsafe effect fn finish<H: HeapHooks>(hooks: &mut H, node: *mut HeapHeader) 
     }
   }
 }
-effect fn complete(tree: &mut FunctionTree, cell: FunctionId, source: &[u8]) -> FunctionBytecode
+effect fn complete(pending: &mut PendingFunction, cell: FunctionId, source: &[u8]) -> FunctionBytecode
   ! OutOfMemoryError | BytecodeError ? &mut Allocator {
-  run resolveLabels(&mut tree, cell, source)
-  // Captures its owner's planning moved into a scope (js_compiler_scopes.visit)
-  // take the depth-0 forms now, as finished descendants got them then.
-  scopePlans.specializeOwn(&mut tree.getMut(cell))
-  // deferrable keeps every function that owns captured locals eager.
+  // A copy: a failed completion keeps the pending plan for the next call.
   let mut plan = scopePlans.emptyPlan()
-  return run finalHeader(&mut tree.getMut(cell), &mut plan)
+  plan.slots = pending.slots plan.varSlots = pending.varSlots
+  run plan.parameters.appendSlice(pending.parameters.asSlice())
+  run plan.variables.appendSlice(pending.variables.asSlice())
+  run resolveLabels(&mut pending.tree, cell, source)
+  // Captures its owner's planning moved into a scope (js_compiler_scopes.visit)
+  // take the depth-0 forms now, as finished descendants got them then; so do
+  // the function's own scope accesses.
+  scopePlans.specializeOwn(&mut pending.tree.getMut(cell))
+  if plan.slots != 0 { run scopePlans.dropScopedLocals(&mut pending.tree.getMut(cell), &mut plan) }
+  return run finalHeader(&mut pending.tree.getMut(cell), &mut plan)
 }
 fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
 
