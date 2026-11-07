@@ -6,10 +6,11 @@ import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.core.option { Option }
 import silk.num.i32
+import silk.num.u32
 import silk.num.usize
 import js_heap { HeapCell }
 import js_core_types { FunctionKind, RuntimeState, JS_MODE_STRICT, SourceText, OwnedAtom }
-import js_compiler_types { FunctionId, ParseFunctionKind, ParseExportKind, VariableDefinition, CompilerError, ARGUMENT_VAR_OFFSET }
+import js_compiler_types { LazyBody, LazyName, FunctionId, ParseFunctionKind, ParseExportKind, VariableDefinition, CompilerError, ARGUMENT_VAR_OFFSET }
 import js_compiler_state as state
 import js_parser_core { Parser, ParserStackOverflow, PF_IN_ACCEPTED }
 import js_parser_diagnostics { SyntaxError }
@@ -434,6 +435,7 @@ effect fn parseFunctionInner<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser
   let filename = outer.filename let cache = outer.sourceCache
   let inheritedNewTarget = outer.newTargetAllowed let inheritedSuperCall = outer.superCallAllowed
   let inheritedSuper = outer.superAllowed let inheritedArguments = outer.argumentsAllowed
+  let parentVerified = outer.lazyVerified
   drop outer
   let mut position: u32 = 0
   match &sourceStart {
@@ -462,7 +464,7 @@ effect fn parseFunctionInner<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser
     fd.superAllowed = fd.hasHomeObject fd.argumentsAllowed = true
   }
   fd.functionKind = kind fd.functionType = functionType
-  fd.lazyVerified = finishing
+  fd.lazyVerified = finishing || parentVerified
   drop fd
   if functionType == ParseFunctionKind.ClassConstructor || functionType == ParseFunctionKind.DerivedClassConstructor {
     run support.emitOp(&mut s, op.OP_check_ctor)
@@ -632,6 +634,10 @@ fn lazyCandidate(s: &Parser, parentCell: FunctionId, child: FunctionId) -> bool 
 /// bail, rewinds to the `{`.
 effect fn skipBody(s: &mut Parser, child: FunctionId, entry: LexerPosition) -> bool
   ! ParserStackOverflow | LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+  // Inside a function finishLazy parses, its preparse already went through
+  // this body: take its record instead of preparsing again.
+  let known = recordAt(&s.*, s.token.start)
+  if known >= 0 { run skipKnown(&mut s, child, entry, i32.toUsize(known)) return true }
   let saved = s.save()
   let mut pre = Preparse.make()
   let outcome = run Effect.result(preparse.body(&mut s, &mut pre))
@@ -645,23 +651,88 @@ effect fn skipBody(s: &mut Parser, child: FunctionId, entry: LexerPosition) -> b
     return false
   }
   let level = scope(&s.*)
-  let mut names = List<u32>.make() let mut depths = List<u8>.make()
-  run names.reserveExact(pre.free.length()) run depths.reserveExact(pre.free.length())
+  let mut free = List<LazyName>.make()
+  run free.reserveExact(pre.free.length())
   let mut i: usize = 0
   while i < pre.free.length() {
-    let free = pre.free.get(i)
-    run emitScopedName(&mut s, op.OP_scope_get_var, free.name, level)
+    let name = pre.free.get(i)
+    run emitScopedName(&mut s, op.OP_scope_get_var, name.name, level)
     run support.emitOp(&mut s, op.OP_drop)
-    run names.append(free.name)
-    let mut depth = free.depth if depth > 255 { depth = 255 }
-    run depths.append(i32.toU8(depth))
+    let mut depth = name.depth if depth > 255 { depth = 255 }
+    run free.append(LazyName { name: name.name, depth: i32.toU8(depth) })
     i = i + 1
   }
+  let mut bodies = List<LazyBody>.make() let mut bodyFree = List<LazyName>.make()
+  run bodies.appendSlice(pre.bodies.asSlice())
+  run bodyFree.reserveExact(pre.bodyFree.length())
+  let rt = s.runtimeState()
+  i = 0
+  while i < pre.bodyFree.length() {
+    let name = pre.bodyFree.get(i)
+    run bodyFree.append(LazyName { name: rt.atoms.duplicate(name.name), depth: name.depth })
+    i = i + 1
+  }
+  drop rt
   pre.release(&mut s)
   let fd = s.functionAtMut(child)
-  fd.lazy = true fd.lazyNames = move names fd.lazyDepths = move depths
+  fd.lazy = true fd.lazyFree = move free fd.lazyBodies = move bodies fd.lazyBodyFree = move bodyFree
   fd.lazyEntry = entry.offset fd.lazyEntryLineFeed = entry.gotLineFeed
   return true
+}
+
+/// The index in s.skips of the body whose `{` is at offset, or -1.
+fn recordAt(s: &Parser, offset: usize) -> i32 {
+  let mut low: usize = 0 let mut high = s.skips.length()
+  while low < high {
+    let middle = (low + high) / 2
+    let at = s.skips.get(middle).bodyStart
+    if at == offset { return usize.toI32(middle) }
+    if at < offset { low = middle + 1 } else { high = middle }
+  }
+  return -1
+}
+
+/// skipBody from a record: the free names it lists, then the closing `}`;
+/// child keeps the records of the bodies inside it.
+effect fn skipKnown(s: &mut Parser, child: FunctionId, entry: LexerPosition, index: usize) -> ()
+  ! ParserStackOverflow | LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let record = s.skips.get(index)
+  let level = scope(&s.*)
+  let mut free = List<LazyName>.make()
+  run free.reserveExact(u32.toUsize(record.freeCount))
+  let mut i = u32.toUsize(record.freeStart)
+  while i < u32.toUsize(record.freeStart + record.freeCount) {
+    let name = s.skipFree.get(i)
+    run emitScopedName(&mut s, op.OP_scope_get_var, name.name, level)
+    run support.emitOp(&mut s, op.OP_drop)
+    run free.append(name)
+    i = i + 1
+  }
+  // Records are in source order: the ones inside follow it.
+  let mut bodies = List<LazyBody>.make() let mut bodyFree = List<LazyName>.make()
+  let mut next = index + 1
+  while next < s.skips.length() && s.skips.get(next).bodyStart < record.end {
+    let mut inner = s.skips.get(next)
+    let from = u32.toUsize(inner.freeStart)
+    inner.freeStart = usize.toU32(bodyFree.length())
+    let mut j = from
+    while j < from + u32.toUsize(inner.freeCount) {
+      run bodyFree.append(s.skipFree.get(j))
+      j = j + 1
+    }
+    run bodies.append(inner)
+    next = next + 1
+  }
+  // The stub owns its own references to these names.
+  let rt = s.runtimeState()
+  i = 0
+  while i < bodyFree.length() { let name = bodyFree.get(i) drop rt.atoms.duplicate(name.name) i = i + 1 }
+  drop rt
+  let fd = s.functionAtMut(child)
+  fd.lazy = true fd.lazyFree = move free fd.lazyBodies = move bodies fd.lazyBodyFree = move bodyFree
+  fd.lazyEntry = entry.offset fd.lazyEntryLineFeed = entry.gotLineFeed
+  drop fd
+  run s.seek(LexerPosition { offset: record.end, gotLineFeed: record.endLineFeed })
 }
 
 pub effect fn parseFunction<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser, hooks: &mut H,

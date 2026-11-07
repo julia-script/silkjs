@@ -28,6 +28,9 @@ import js_core_types { JS_MODE_STRICT }
 import js_regexp_compile { compileStringForRuntime }
 import regexp_types { RegExpSyntaxError, RegExpStackOverflow }
 import js_value { ValueBits }
+import js_compiler_types { LazyBody, LazyName }
+import js_lexer { LexerPosition }
+import silk.num.u64
 
 /// A name declared in a scope: a var-like binding (var, function, parameter),
 /// a lexical one (let, const), a var hoisting through a block, or a catch parameter.
@@ -42,36 +45,94 @@ const MEMBER: i32 = 2
 const UNARY: i32 = 3
 const BAIL: i32 = -1
 
-struct PScope { parent: i32, function: bool, first: i32 }
+struct PScope { parent: i32, function: bool }
 impl Copy for PScope {}
-struct PDecl { name: u32, next: i32, kind: u8 }
-impl Copy for PDecl {}
 struct PRef { name: u32, scope: i32, depth: i32 }
 impl Copy for PRef {}
 struct PLabel { name: u32, loop: bool }
 impl Copy for PLabel {}
+/// A nested function being or done preparsing: its LazyBody, its function scope
+/// and the end of its scope range (scopes are numbered in source order, so a
+/// function's scopes are one range), its references (one range too) and depth.
+struct PNested { body: LazyBody, scope: i32, scopeEnd: i32, refStart: usize, refEnd: usize, depth: i32 }
+impl Copy for PNested {}
 
 /// A name the body reads from outside, and the deepest nesting of its uses
 /// (0: the lazy function itself).
 pub struct FreeName { pub name: u32, pub depth: i32 }
 impl Copy for FreeName {}
 
+/// Open addressing from a nonzero u64 key to a u32 value.
+struct KeyTable { keys: List<u64>, values: List<u32>, count: usize }
+impl KeyTable {
+  fn make() -> KeyTable { return KeyTable { keys: List<u64>.make(), values: List<u32>.make(), count: 0 } }
+  fn slot(self: &Self, key: u64) -> usize {
+    let mask = self.keys.length() - 1
+    let mut at = u64.toUsize(u64.shiftRight(u64.wrappingMultiply(key, 0x9e3779b97f4a7c15), 32)) & mask
+    while true {
+      let k = self.keys.get(at)
+      if k == key || k == 0 { return at }
+      at = (at + 1) & mask
+    }
+    return at
+  }
+  fn get(self: &Self, key: u64) -> u32 {
+    if self.count == 0 { return 0 }
+    let at = self.slot(key)
+    if self.keys.get(at) == 0 { return 0 }
+    return self.values.get(at)
+  }
+  effect fn grow(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut size: usize = 64
+    while size < (self.count + 1) * 2 { size = size * 2 }
+    if size <= self.keys.length() { return () }
+    let oldKeys = Intrinsic.replace(self.keys, List<u64>.make()) let oldValues = Intrinsic.replace(self.values, List<u32>.make())
+    run self.keys.appendRepeated(0, size) run self.values.appendRepeated(0, size)
+    let mut i: usize = 0
+    while i < oldKeys.length() {
+      let k = oldKeys.get(i)
+      if k != 0 { let at = self.slot(k) self.keys.set(at, k) self.values.set(at, oldValues.get(i)) }
+      i = i + 1
+    }
+  }
+  effect fn set(self: &mut Self, key: u64, value: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    if (self.count + 1) * 2 > self.keys.length() { run self.grow() }
+    let at = self.slot(key)
+    if self.keys.get(at) == 0 { self.keys.set(at, key) self.count = self.count + 1 }
+    self.values.set(at, value)
+  }
+  fn clear(self: &mut Self) -> () {
+    if self.count == 0 { return () }
+    let mut i: usize = 0
+    while i < self.keys.length() { self.keys.set(i, 0) i = i + 1 }
+    self.count = 0
+  }
+}
+fn key(scope: i32, name: u32) -> u64 { return u64.shiftLeft(i32.toU64(scope + 1), 32) | u32.toU64(name) }
+
 pub struct Preparse {
-  scopes: List<PScope>, decls: List<PDecl>, refs: List<PRef>, labels: List<PLabel>,
-  /// Every atom held by decls, refs and labels: one reference each.
+  scopes: List<PScope>, refs: List<PRef>, labels: List<PLabel>,
+  /// (scope, name) -> mask of declaration kinds.
+  declared: KeyTable,
+  /// Every atom held by refs, declarations and labels: one reference each.
   held: List<u32>,
   scope: i32, depth: i32, labelBase: usize, loops: i32, breakables: i32,
   strict: bool, lastIdent: u32,
-  pub maxDepth: i32, pub free: List<FreeName>
+  nested: List<PNested>,
+  pub maxDepth: i32, pub free: List<FreeName>,
+  /// After resolve: every nested function body, in source order, and their free
+  /// names (borrowed from held: duplicate to keep).
+  pub bodies: List<LazyBody>, pub bodyFree: List<LazyName>
 }
 
 type E = ParserStackOverflow | LexError | BigIntError | OutOfMemoryError | StringLengthError
 
 impl Preparse {
   pub fn make() -> Preparse {
-    return Preparse { scopes: List<PScope>.make(), decls: List<PDecl>.make(), refs: List<PRef>.make(), labels: List<PLabel>.make(),
-      held: List<u32>.make(), scope: -1, depth: 0, labelBase: 0, loops: 0, breakables: 0, strict: false, lastIdent: 0,
-      maxDepth: 0, free: List<FreeName>.make() }
+    return Preparse { scopes: List<PScope>.make(), refs: List<PRef>.make(), labels: List<PLabel>.make(),
+      declared: KeyTable.make(), held: List<u32>.make(), scope: -1, depth: 0, labelBase: 0, loops: 0, breakables: 0,
+      strict: false, lastIdent: 0, nested: List<PNested>.make(),
+      maxDepth: 0, free: List<FreeName>.make(), bodies: List<LazyBody>.make(), bodyFree: List<LazyName>.make() }
   }
   /// Releases every atom this preparse holds, free names included.
   pub fn release<'src>(self: &mut Self, s: &mut Parser<'src>) -> () {
@@ -79,7 +140,7 @@ impl Preparse {
     let mut i: usize = 0
     while i < self.held.length() { rt.atoms.release(self.held.get(i)) i = i + 1 }
     self.held.clear()
-    self.free.clear()
+    self.free.clear() self.bodyFree.clear()
   }
   effect fn hold<'src>(self: &mut Self, atom: u32, s: &mut Parser<'src>) -> u32 ! OutOfMemoryError ? &mut Allocator {
     let rt = s.runtimeState()
@@ -88,7 +149,7 @@ impl Preparse {
     return kept
   }
   effect fn push(self: &mut Self, function: bool) -> () ! OutOfMemoryError ? &mut Allocator {
-    run self.scopes.append(PScope { parent: self.scope, function: function, first: -1 })
+    run self.scopes.append(PScope { parent: self.scope, function: function })
     self.scope = usize.toI32(self.scopes.length() - 1)
   }
   fn pop(self: &mut Self) -> () { self.scope = self.scopes.get(i32.toUsize(self.scope)).parent }
@@ -97,22 +158,12 @@ impl Preparse {
     run self.add(scope, name, kind)
   }
   effect fn add(self: &mut Self, scope: i32, name: u32, kind: u8) -> () ! OutOfMemoryError ? &mut Allocator {
-    let mut record = self.scopes.get(i32.toUsize(scope))
-    run self.decls.append(PDecl { name: name, next: record.first, kind: kind })
-    record.first = usize.toI32(self.decls.length() - 1)
-    self.scopes.set(i32.toUsize(scope), record)
+    let k = key(scope, name)
+    let mask = self.declared.get(k) | u32.shiftLeft(1, u8.toU32(kind))
+    run self.declared.set(k, mask)
   }
   /// The kind mask of `name`'s entries in scope: bit k set for kind k.
-  fn kinds(self: &Self, scope: i32, name: u32) -> u32 {
-    let mut mask: u32 = 0
-    let mut index = self.scopes.get(i32.toUsize(scope)).first
-    while index >= 0 {
-      let d = self.decls.get(i32.toUsize(index))
-      if d.name == name { mask = mask | u32.shiftLeft(1, u8.toU32(d.kind)) }
-      index = d.next
-    }
-    return mask
-  }
+  fn kinds(self: &Self, scope: i32, name: u32) -> u32 { return self.declared.get(key(scope, name)) }
   /// var/function: no lexical binding of the name in any scope it hoists through.
   effect fn declareVar<'src>(self: &mut Self, atom: u32, s: &mut Parser<'src>) -> bool ! OutOfMemoryError ? &mut Allocator {
     let name = run self.hold(atom, &mut s)
@@ -138,27 +189,70 @@ impl Preparse {
     let name = run self.hold(atom, &mut s)
     run self.refs.append(PRef { name: name, scope: self.scope, depth: self.depth })
   }
-  /// Resolves every reference: the ones that leave the body become `free`.
+  /// A nested function's body starts (`{` is the current token, its function
+  /// scope the current scope): returns its index for endBody.
+  effect fn startBody(self: &mut Self, bodyStart: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+    run self.nested.append(PNested { body: LazyBody { bodyStart: bodyStart, end: 0, endLineFeed: false, freeStart: 0, freeCount: 0 },
+      scope: self.scope, scopeEnd: 0, refStart: self.refs.length(), refEnd: 0, depth: self.depth })
+    return self.nested.length() - 1
+  }
+  /// The nested body ends: `}` is the current token, its scopes not yet popped.
+  fn endBody(self: &mut Self, index: usize, end: LexerPosition) -> () {
+    let mut n = self.nested.get(index)
+    n.body.end = end.offset n.body.endLineFeed = end.gotLineFeed
+    n.scopeEnd = usize.toI32(self.scopes.length()) n.refEnd = self.refs.length()
+    self.nested.set(index, n)
+  }
+  /// Resolves every reference: the ones that leave the body become `free`, and
+  /// the ones that leave a nested body its free names.
   effect fn resolve(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    let bindings = u32.shiftLeft(1, u8.toU32(VAR)) | u32.shiftLeft(1, u8.toU32(LEX)) | u32.shiftLeft(1, u8.toU32(CATCH))
+    // Per reference, the scope that declares its name, or -1.
+    let mut resolved = List<i32>.make()
+    run resolved.reserveExact(self.refs.length())
+    let mut seen = KeyTable.make()
     let mut i: usize = 0
     while i < self.refs.length() {
       let r = self.refs.get(i)
       let mut scope = r.scope
-      let mut found = false
-      while scope >= 0 && !found {
-        if (self.kinds(scope, r.name) & (u32.shiftLeft(1, u8.toU32(VAR)) | u32.shiftLeft(1, u8.toU32(LEX)) | u32.shiftLeft(1, u8.toU32(CATCH)))) != 0 { found = true }
-        scope = self.scopes.get(i32.toUsize(scope)).parent
-      }
-      if !found {
-        let mut j: usize = 0 let mut known = false
-        while j < self.free.length() && !known {
-          let f = self.free.get(j)
-          if f.name == r.name { known = true if r.depth > f.depth { self.free.set(j, FreeName { name: f.name, depth: r.depth }) } }
-          j = j + 1
+      while scope >= 0 && (self.kinds(scope, r.name) & bindings) == 0 { scope = self.scopes.get(i32.toUsize(scope)).parent }
+      run resolved.append(scope)
+      if scope < 0 {
+        let k = key(-1, r.name)
+        let at = seen.get(k)
+        if at == 0 { run self.free.append(FreeName { name: r.name, depth: r.depth }) run seen.set(k, usize.toU32(self.free.length())) }
+        else {
+          let f = self.free.get(u32.toUsize(at) - 1)
+          if r.depth > f.depth { self.free.set(u32.toUsize(at) - 1, FreeName { name: f.name, depth: r.depth }) }
         }
-        if !known { run self.free.append(FreeName { name: r.name, depth: r.depth }) }
       }
       i = i + 1
+    }
+    let mut n: usize = 0
+    while n < self.nested.length() {
+      let mut record = self.nested.get(n)
+      record.body.freeStart = usize.toU32(self.bodyFree.length())
+      seen.clear()
+      let mut j = record.refStart
+      while j < record.refEnd {
+        let r = self.refs.get(j)
+        let at = resolved.get(j)
+        if at < record.scope || at >= record.scopeEnd {
+          let depth = r.depth - record.depth
+          let mut narrow: u8 = 255 if depth < 255 { narrow = i32.toU8(depth) }
+          let k = key(-1, r.name)
+          let index = seen.get(k)
+          if index == 0 { run self.bodyFree.append(LazyName { name: r.name, depth: narrow }) run seen.set(k, usize.toU32(self.bodyFree.length())) }
+          else {
+            let f = self.bodyFree.get(u32.toUsize(index) - 1)
+            if narrow > f.depth { self.bodyFree.set(u32.toUsize(index) - 1, LazyName { name: f.name, depth: narrow }) }
+          }
+        }
+        j = j + 1
+      }
+      record.body.freeCount = usize.toU32(self.bodyFree.length()) - record.body.freeStart
+      run self.bodies.append(record.body)
+      n = n + 1
     }
   }
 }
@@ -517,12 +611,15 @@ effect fn functionRest<'src>(s: &mut Parser<'src>, p: &mut Preparse, accessor: i
   if accessor >= 0 && count != accessor { return false }
   run adv(&mut s)
   run p.addHere(atoms.JS_ATOM_arguments, VAR)
-  if !run expect(&mut s, 123) { return false }
+  if s.token.kind != 123 { return false }
+  let record = run p.startBody(s.token.start)
+  run adv(&mut s)
   if s.token.kind == tok.TOK_STRING { return false }
   while s.token.kind != 125 {
     if s.token.kind == tok.TOK_EOF { return false }
     if !run statement(&mut s, &mut p, true) { return false }
   }
+  p.endBody(record, s.save())
   run adv(&mut s)
   p.pop()
   p.depth = p.depth - 1
