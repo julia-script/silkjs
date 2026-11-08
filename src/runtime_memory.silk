@@ -92,6 +92,9 @@ struct Pool {
   // them back out of the reported stats, and ownerPeak is the peak the gate-free
   // allocations reached.
   ownerActive: bool,
+  // The allocating thread's thread pointer (0 when the target has none): a generic
+  // reclaim running on it goes to the owner cache without the gate.
+  ownerThread: usize,
   ownerHeads: [?*mut u8; 64],
   ownerCounts: [usize; 64],
   ownerUsed: usize,
@@ -489,7 +492,7 @@ impl<A> RuntimeAllocator<A> {
       nextProfileEpoch: 1, profiling: false, profile: Option<Recording>.none(),
       pool: Pool { enabled: false, heads: [Pointer.null<u8>(); 64], counts: [0; 64], arenas: Pointer.null<ArenaHeader>(), spare: Pointer.null<u8>(), spareCount: 0, spareRecords: Pointer.null<PoolRecord>(),
         fresh: [Pointer.null<u8>(); 64], freshBytes: [0; 64],
-        ownerActive: false, ownerHeads: [Pointer.null<u8>(); 64], ownerCounts: [0; 64], ownerUsed: 0, ownerAllocations: 0, ownerPeak: 0 }
+        ownerActive: false, ownerThread: 0, ownerHeads: [Pointer.null<u8>(); 64], ownerCounts: [0; 64], ownerUsed: 0, ownerAllocations: 0, ownerPeak: 0 }
     })
     let mut anchor = ()
     let fresh = unsafe Pointer.borrowMut(&mut anchor, address)
@@ -533,6 +536,7 @@ impl<A> RuntimeAllocator<A> {
       let pool = Pointer.borrowMut<(), Pool>(&mut anchor, unsafe poolOf(ledger))
       pool.enabled = true
       pool.ownerActive = true
+      pool.ownerThread = unsafe threadPointer()
       drop pool
       unlockLedger(ledger)
     }
@@ -636,10 +640,32 @@ effect fn allocatePooledSlow<A>(self: &mut RuntimeAllocator<A>, layout: Layout, 
 // every pooled block handed out, through allocate or takeBlock, carries a fresh record.
 @inlineAlways
 unsafe fn recordPooled(ledger: LedgerPointers, block: *mut u8, requestedBytes: usize) -> () {
+  let id = unsafe nextPooledId(ledger)
+  if id == 0 { return unsafe recordPooledRare(ledger, block, requestedBytes) }
+  unsafe Pointer.write<PoolRecord>(unsafe pooledRecord(block),
+    PoolRecord { id: id, requestedBytes: requestedBytes, sampledEpoch: 0 })
+}
+
+// The next allocation id, or 0 when a sort is due or profiling is on: then the
+// out-of-line path takes the id itself.
+@inlineAlways
+unsafe fn nextPooledId(ledger: LedgerPointers) -> u64 {
   let mut anchor = ()
   let state = unsafe Pointer.borrowMut(&mut anchor, ledger.allocation)
   let id = state.nextAllocationId
+  if id >= state.nextSortId || state.profiling { return 0 }
   // A 64-bit count of allocations cannot wrap in practice; ids stay nonzero.
+  state.nextAllocationId = u64.wrappingAdd(id, 1)
+  return id
+}
+
+// recordPooled when a sort is due or profiling is on, out of line so the common
+// path keeps no frame.
+@inlineNever
+unsafe fn recordPooledRare(ledger: LedgerPointers, block: *mut u8, requestedBytes: usize) -> () {
+  let mut anchor = ()
+  let state = unsafe Pointer.borrowMut(&mut anchor, ledger.allocation)
+  let id = state.nextAllocationId
   state.nextAllocationId = u64.wrappingAdd(id, 1)
   let profiling = state.profiling
   let sortDue = id >= state.nextSortId
@@ -663,7 +689,19 @@ unsafe fn recordProfiledPooled(ledger: LedgerPointers, block: *mut u8, requested
 @inlineAlways
 unsafe fn adoptPooled(ledger: LedgerPointers, block: *mut u8, layout: Layout, zeroed: bool) -> Intrinsic.Allocation {
   if zeroed { unsafe zeroBytes(block, layout.bytes) }
-  unsafe recordPooled(ledger, block, layout.bytes)
+  let id = unsafe nextPooledId(ledger)
+  if id == 0 { return unsafe adoptPooledRare(ledger, block, move layout) }
+  unsafe Pointer.write<PoolRecord>(unsafe pooledRecord(block),
+    PoolRecord { id: id, requestedBytes: layout.bytes, sampledEpoch: 0 })
+  let reclaim: extern "C" fn(?*mut u8) -> () = silkRuntimeMemoryReclaimPooled
+  return unsafe Intrinsic.allocationAdopt(block, move layout, reclaim, block)
+}
+
+// adoptPooled when a sort is due or profiling is on, as a tail call so the common
+// path saves no registers.
+@inlineNever
+unsafe fn adoptPooledRare(ledger: LedgerPointers, block: *mut u8, layout: Layout) -> Intrinsic.Allocation {
+  unsafe recordPooledRare(ledger, block, layout.bytes)
   let reclaim: extern "C" fn(?*mut u8) -> () = silkRuntimeMemoryReclaimPooled
   return unsafe Intrinsic.allocationAdopt(block, move layout, reclaim, block)
 }
@@ -1264,8 +1302,39 @@ unsafe fn reclaimPooled(block: *mut u8) -> () {
   let ledger = unsafe pointersOf(arena.ledger)
   let class = arena.class
   drop arena
+  // On the allocating thread no allocation can run concurrently, so the block
+  // goes to the owner cache as releasePooled would put it there.
+  let current = unsafe threadPointer()
+  let mut poolAnchor = ()
+  let pool = unsafe Pointer.borrowMut<(), Pool>(&mut poolAnchor, unsafe poolOf(ledger))
+  if current != 0 && pool.ownerThread == current && pool.ownerActive {
+    drop pool
+    return unsafe cacheOwned(ledger, block, class)
+  }
+  drop pool
   if unsafe unchargePooled(ledger, block, class) { unsafe destroyLedger(ledger) }
   return ()
+}
+
+/// The current thread's thread pointer, distinct for each live thread, or 0 on
+/// targets where it is not read.
+@inlineAlways
+unsafe fn threadPointer() -> usize {
+  let unused: usize = 0
+  static if Intrinsic.targetOperatingSystem() == "linux" {
+    static if Intrinsic.targetArchitecture() == "x86_64" {
+      return unsafe Intrinsic.assembly<usize>("movq %fs:0, %rax", "={rax},0", "", "none", false, false, .(unused))
+    }
+    static if Intrinsic.targetArchitecture() == "aarch64" {
+      return unsafe Intrinsic.assembly<usize>("mrs x0, tpidr_el0", "={x0},0", "", "none", false, false, .(unused))
+    }
+  }
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    static if Intrinsic.targetArchitecture() == "aarch64" {
+      return unsafe Intrinsic.assembly<usize>("mrs x0, tpidrro_el0", "={x0},0", "", "none", false, false, .(unused))
+    }
+  }
+  return 0
 }
 
 export "C" fn silkRuntimeMemoryReclaim(context: ?*mut u8) -> () {
@@ -1332,6 +1401,16 @@ pub unsafe fn releasePooled(block: *mut u8) -> () {
     if unsafe unchargePooled(ledger, block, class) { unsafe destroyLedger(ledger) }
     return ()
   }
+  drop pool
+  return unsafe cacheOwned(ledger, block, class)
+}
+
+// Puts block in the owner cache. Only the allocating thread calls this, with the
+// owner cache active.
+@inlineAlways
+unsafe fn cacheOwned(ledger: LedgerPointers, block: *mut u8, class: usize) -> () {
+  let mut poolAnchor = ()
+  let pool = unsafe Pointer.borrowMut<(), Pool>(&mut poolAnchor, unsafe poolOf(ledger))
   // Unsampled blocks need no profile access or gate on the owning thread.
   let pointer = unsafe pooledRecord(block)
   let record = unsafe Pointer.read<PoolRecord>(pointer)
