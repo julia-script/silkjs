@@ -99,7 +99,12 @@ struct Pool {
   ownerCounts: [usize; 64],
   ownerUsed: usize,
   ownerAllocations: usize,
-  ownerPeak: usize
+  ownerPeak: usize,
+  // Owner-cached blocks past OWNER_LIST_CAP per class sit as arena bits instead
+  // (still owner-cached for the stats): a pairing heap of the arenas holding them,
+  // lowest address at the root, and how many blocks they hold.
+  spillHeaps: [?*mut ArenaHeader; 64],
+  spillCounts: [usize; 64]
 }
 
 // The first record of every arena. Every block in the arena belongs to ledger and
@@ -130,7 +135,14 @@ struct ArenaHeader {
   // list of arenas with bits set. Clear outside a sort.
   idleNext: ?*mut ArenaHeader,
   idleListed: bool,
-  idle: [u64; 16]
+  idle: [u64; 16],
+  // Owner-cache overflow (see cacheOwned): a bit per granule that starts an idle
+  // block kept here instead of on the owner list, and the class's list of arenas
+  // with such bits. Only the allocating thread touches these.
+  spillNext: ?*mut ArenaHeader,
+  spillChild: ?*mut ArenaHeader,
+  spillListed: bool,
+  spill: [u64; 16]
 }
 
 @inlineAlways
@@ -492,7 +504,8 @@ impl<A> RuntimeAllocator<A> {
       nextProfileEpoch: 1, profiling: false, profile: Option<Recording>.none(),
       pool: Pool { enabled: false, heads: [Pointer.null<u8>(); 64], counts: [0; 64], arenas: Pointer.null<ArenaHeader>(), spare: Pointer.null<u8>(), spareCount: 0, spareRecords: Pointer.null<PoolRecord>(),
         fresh: [Pointer.null<u8>(); 64], freshBytes: [0; 64],
-        ownerActive: false, ownerThread: 0, ownerHeads: [Pointer.null<u8>(); 64], ownerCounts: [0; 64], ownerUsed: 0, ownerAllocations: 0, ownerPeak: 0 }
+        ownerActive: false, ownerThread: 0, ownerHeads: [Pointer.null<u8>(); 64], ownerCounts: [0; 64], ownerUsed: 0, ownerAllocations: 0, ownerPeak: 0,
+        spillHeaps: [Pointer.null<ArenaHeader>(); 64], spillCounts: [0; 64] }
     })
     let mut anchor = ()
     let fresh = unsafe Pointer.borrowMut(&mut anchor, address)
@@ -627,6 +640,12 @@ pub unsafe fn zeroBytes(at: *mut u8, count: usize) -> () {
 effect fn allocatePooledSlow<A>(self: &mut RuntimeAllocator<A>, layout: Layout, class: usize, zeroed: bool) -> Intrinsic.Allocation
   ! OutOfMemoryError where &mut A provides &Allocator from &mut Allocator {
   let ledger = self.ledger
+  if unsafe refillSpilled(ledger, class) {
+    match Pointer.nonNullMut<u8>(unsafe takeOwned(ledger, class)) {
+      Option<*mut u8>.Some { value: block } => { return unsafe adoptPooled(ledger, block, move layout, zeroed) }
+      Option<*mut u8>.None => ()
+    }
+  }
   if unsafe claimShared(ledger, class) {
     match Pointer.nonNullMut<u8>(unsafe takeOwned(ledger, class)) {
       Option<*mut u8>.Some { value: block } => { return unsafe adoptPooled(ledger, block, move layout, zeroed) }
@@ -758,7 +777,8 @@ effect fn takeArena<A>(self: &mut RuntimeAllocator<A>, class: usize, requestedBy
           storage: Option<Intrinsic.RawBuffer<u8>>.none(), next: Pointer.null<ArenaHeader>(),
           nextLive: state.firstPooledArena, records: Intrinsic.pointerRequalify<?*mut PoolRecord, *mut PoolRecord>(spareRecords), carved: 0,
           cellOwner: 0, cellNext: Pointer.null<u8>(), pendingNext: Pointer.null<u8>(), pendingListed: false, cells: [0; 16], pending: [0; 16],
-          idleNext: Pointer.null<ArenaHeader>(), idleListed: false, idle: [0; 16] })
+          idleNext: Pointer.null<ArenaHeader>(), idleListed: false, idle: [0; 16],
+          spillNext: Pointer.null<ArenaHeader>(), spillChild: Pointer.null<ArenaHeader>(), spillListed: false, spill: [0; 16] })
         state.firstPooledArena = owner
         drop state
         unlockLedger(ledger)
@@ -804,7 +824,8 @@ effect fn takeArena<A>(self: &mut RuntimeAllocator<A>, class: usize, requestedBy
       storage: Option<Intrinsic.RawBuffer<u8>>.some(move groupStorage), next: pool.arenas,
       nextLive: firstLive, records: records, carved: 0,
       cellOwner: 0, cellNext: Pointer.null<u8>(), pendingNext: Pointer.null<u8>(), pendingListed: false, cells: [0; 16], pending: [0; 16],
-      idleNext: Pointer.null<ArenaHeader>(), idleListed: false, idle: [0; 16] })
+      idleNext: Pointer.null<ArenaHeader>(), idleListed: false, idle: [0; 16],
+          spillNext: Pointer.null<ArenaHeader>(), spillChild: Pointer.null<ArenaHeader>(), spillListed: false, spill: [0; 16] })
     pool.arenas = Intrinsic.pointerRequalify<*mut ArenaHeader, ?*mut ArenaHeader>(owner)
     // A racing refill's leftover spares stay owned by its group, unused.
     pool.spare = Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(second)
@@ -1134,6 +1155,8 @@ unsafe fn flushOwnerGated(ledger: LedgerPointers, reuse: bool) -> bool {
   let mut cached: usize = 0
   let mut class: usize = 0
   while class < POOL_CLASSES {
+    // Spilled blocks rejoin the owner list first, so they flush with it.
+    while pool.spillCounts[class] != 0 { unsafe unspillInto(&mut pool, class) }
     let count = pool.ownerCounts[class]
     if count != 0 && !reuse {
       pool.ownerHeads[class] = Pointer.null<u8>()
@@ -1421,6 +1444,7 @@ unsafe fn cacheOwned(ledger: LedgerPointers, block: *mut u8, class: usize) -> ()
   } else {
     unsafe Pointer.write<PoolRecord>(pointer, PoolRecord { id: 0, requestedBytes: 0, sampledEpoch: 0 })
   }
+  if pool.ownerCounts[class] >= OWNER_LIST_CAP { drop pool return unsafe spillOwned(ledger, block, class) }
   let head = pool.ownerHeads[class]
   let mut skip = Pointer.null<u8>()
   // The head was freed last, so its link is usually still cached.
@@ -1809,6 +1833,166 @@ unsafe fn sortByAddress(list: ?*mut u8) -> ?*mut u8 {
   if !Pointer.isNull<u8>(beforeLast) { unsafe Pointer.write<?*mut u8>(unsafe poolSkip(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(beforeLast)), Pointer.null<u8>()) }
   if !Pointer.isNull<u8>(last) { unsafe Pointer.write<?*mut u8>(unsafe poolSkip(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(last)), Pointer.null<u8>()) }
   return head
+}
+
+// Owner lists hold at most this many blocks per class; further frees set their
+// arena's spill bit instead. A free then touches only the arena header, and the
+// owner list stays short: the blocks reused soonest are the ones freed last, while
+// spilled ones come back an arena at a time, in address order. Without the cap a
+// program that frees a huge heap (Splay's tree) leaves millions of scattered blocks
+// on the lists, and every later sort walks them all.
+const OWNER_LIST_CAP: usize = 8192
+
+// cacheOwned past the cap: the block becomes a spill bit of its arena.
+@inlineNever
+unsafe fn spillOwned(ledger: LedgerPointers, block: *mut u8, class: usize) -> () {
+  let mut poolAnchor = ()
+  let pool = unsafe Pointer.borrowMut<(), Pool>(&mut poolAnchor, unsafe poolOf(ledger))
+  let owner = unsafe arenaOf(block)
+  let granule = usize.bitAnd(Pointer.address<u8>(block), ARENA_BYTES - 1) / POOL_GRANULE
+  let mut anchor = ()
+  let header = unsafe Pointer.borrowMut<(), ArenaHeader>(&mut anchor, owner)
+  let word = granule / 64
+  header.spill[word] = u64.bitOr(header.spill[word], u64.shiftLeft(1, usize.toU64(granule % 64)))
+  if !header.spillListed {
+    header.spillListed = true
+    drop header
+    pool.spillHeaps[class] = unsafe meldSpill(pool.spillHeaps[class], unsafe Intrinsic.pointerRequalify<*mut ArenaHeader, ?*mut ArenaHeader>(owner))
+  } else { drop header }
+  pool.spillCounts[class] = pool.spillCounts[class] + 1
+  unsafe Atomic.store<usize>(Pointer.fromMutRef<usize>(&mut pool.ownerUsed), usize.wrappingSubtract(pool.ownerUsed, classBytes(class)), MemoryOrder.Relaxed)
+  unsafe Atomic.store<usize>(Pointer.fromMutRef<usize>(&mut pool.ownerAllocations), usize.wrappingSubtract(pool.ownerAllocations, 1), MemoryOrder.Relaxed)
+}
+
+// Moves the lowest-addressed spill arena of class onto its (empty) owner list.
+// False when class has no spilled blocks.
+@inlineNever
+unsafe fn refillSpilled(ledger: LedgerPointers, class: usize) -> bool {
+  let mut poolAnchor = ()
+  let pool = unsafe Pointer.borrowMut<(), Pool>(&mut poolAnchor, unsafe poolOf(ledger))
+  if pool.spillCounts[class] == 0 { return false }
+  unsafe unspillInto(&mut pool, class)
+  return true
+}
+
+// Takes the lowest-addressed spill arena of class (sorting the arenas listed since
+// the last take into the ordered list first) and puts its spilled blocks, in
+// address order, in front of the owner list.
+unsafe fn unspillInto(pool: &mut Pool, class: usize) -> () {
+  let arena = unsafe presentArena(pool.spillHeaps[class])
+  pool.spillHeaps[class] = unsafe popSpill(arena)
+  let base = unsafe Pointer.assumeManyMut<u8>(unsafe Intrinsic.pointerReinterpret<*mut ArenaHeader, *mut u8>(arena))
+  let mut anchor = ()
+  let header = unsafe Pointer.borrowMut<(), ArenaHeader>(&mut anchor, arena)
+  header.spillListed = false
+  let mut head = Pointer.null<u8>()
+  let mut last = Pointer.null<u8>()
+  let mut beforeLast = Pointer.null<u8>()
+  let mut count: usize = 0
+  let mut word: usize = 0
+  while word < 16 {
+    let mut bits = header.spill[word]
+    header.spill[word] = 0
+    while bits != 0 {
+      let granule = word * 64 + u32.toUsize(u64.trailingZeros(bits))
+      bits = u64.bitAnd(bits, bits - 1)
+      let block = unsafe Pointer.atMut<u8>(base, granule * POOL_GRANULE)
+      let linked = unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(block)
+      if Pointer.isNull<u8>(last) { head = linked }
+      else { unsafe Pointer.write<?*mut u8>(unsafe poolLink(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(last)), linked) }
+      if !Pointer.isNull<u8>(beforeLast) {
+        unsafe Pointer.write<?*mut u8>(unsafe poolSkip(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(beforeLast)), linked)
+      }
+      beforeLast = last
+      last = linked
+      count = count + 1
+    }
+    word = word + 1
+  }
+  drop header
+  // The owner list follows the arena's blocks; skip words that cross over point at
+  // its first two blocks.
+  let rest = pool.ownerHeads[class]
+  let mut restSecond = Pointer.null<u8>()
+  match Pointer.nonNullMut<u8>(rest) { Option<*mut u8>.Some { value } => { restSecond = unsafe linkOf(value) } Option<*mut u8>.None => () }
+  if !Pointer.isNull<u8>(beforeLast) { unsafe Pointer.write<?*mut u8>(unsafe poolSkip(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(beforeLast)), rest) }
+  let tail = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(last)
+  unsafe Pointer.write<?*mut u8>(unsafe poolLink(tail), rest)
+  unsafe Pointer.write<?*mut u8>(unsafe poolSkip(tail), restSecond)
+  pool.ownerHeads[class] = head
+  pool.ownerCounts[class] = pool.ownerCounts[class] + count
+  pool.spillCounts[class] = pool.spillCounts[class] - count
+}
+
+// The spill heaps are pairing heaps ordered by arena address, linked through
+// spillChild (first child) and spillNext (next sibling).
+// Melds two heaps; either may be empty.
+unsafe fn meldSpill(left: ?*mut ArenaHeader, right: ?*mut ArenaHeader) -> ?*mut ArenaHeader {
+  if Pointer.isNull<ArenaHeader>(left) { return right }
+  if Pointer.isNull<ArenaHeader>(right) { return left }
+  let mut parent = unsafe presentArena(left)
+  let mut child = unsafe presentArena(right)
+  if Pointer.address<ArenaHeader>(child) < Pointer.address<ArenaHeader>(parent) {
+    let t = parent parent = child child = t
+  }
+  let mut anchor = ()
+  let p = unsafe Pointer.borrowMut<(), ArenaHeader>(&mut anchor, parent)
+  let first = p.spillChild
+  p.spillChild = unsafe Intrinsic.pointerRequalify<*mut ArenaHeader, ?*mut ArenaHeader>(child)
+  drop p
+  let mut childAnchor = ()
+  let c = unsafe Pointer.borrowMut<(), ArenaHeader>(&mut childAnchor, child)
+  c.spillNext = first
+  drop c
+  return unsafe Intrinsic.pointerRequalify<*mut ArenaHeader, ?*mut ArenaHeader>(parent)
+}
+// Removes root (the lowest arena) and returns the heap of the rest: children are
+// melded in pairs left to right, then the pairs right to left.
+unsafe fn popSpill(root: *mut ArenaHeader) -> ?*mut ArenaHeader {
+  let mut anchor = ()
+  let r = unsafe Pointer.borrowMut<(), ArenaHeader>(&mut anchor, root)
+  let mut walk = r.spillChild
+  r.spillChild = Pointer.null<ArenaHeader>()
+  r.spillNext = Pointer.null<ArenaHeader>()
+  drop r
+  // Pass 1: pair up siblings, building a reversed list of the pairs through spillNext.
+  let mut pairs = Pointer.null<ArenaHeader>()
+  while !Pointer.isNull<ArenaHeader>(walk) {
+    let a = unsafe presentArena(walk)
+    let mut aAnchor = ()
+    let an = unsafe Pointer.borrowMut<(), ArenaHeader>(&mut aAnchor, a)
+    let b = an.spillNext
+    an.spillNext = Pointer.null<ArenaHeader>()
+    drop an
+    let mut melded = unsafe Intrinsic.pointerRequalify<*mut ArenaHeader, ?*mut ArenaHeader>(a)
+    if !Pointer.isNull<ArenaHeader>(b) {
+      let bh = unsafe presentArena(b)
+      let mut bAnchor = ()
+      let bn = unsafe Pointer.borrowMut<(), ArenaHeader>(&mut bAnchor, bh)
+      walk = bn.spillNext
+      bn.spillNext = Pointer.null<ArenaHeader>()
+      drop bn
+      melded = unsafe meldSpill(melded, b)
+    } else { walk = Pointer.null<ArenaHeader>() }
+    let m = unsafe presentArena(melded)
+    let mut mAnchor = ()
+    let mn = unsafe Pointer.borrowMut<(), ArenaHeader>(&mut mAnchor, m)
+    mn.spillNext = pairs
+    drop mn
+    pairs = melded
+  }
+  // Pass 2: meld the pairs, last pair first.
+  let mut result = Pointer.null<ArenaHeader>()
+  while !Pointer.isNull<ArenaHeader>(pairs) {
+    let p = unsafe presentArena(pairs)
+    let mut pAnchor = ()
+    let pn = unsafe Pointer.borrowMut<(), ArenaHeader>(&mut pAnchor, p)
+    pairs = pn.spillNext
+    pn.spillNext = Pointer.null<ArenaHeader>()
+    drop pn
+    result = unsafe meldSpill(result, unsafe Intrinsic.pointerRequalify<*mut ArenaHeader, ?*mut ArenaHeader>(p))
+  }
+  return result
 }
 
 // Freed blocks go to the front of their class's idle list, so after enough
