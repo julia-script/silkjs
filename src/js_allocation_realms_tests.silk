@@ -1,0 +1,91 @@
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.mem.pointer { Pointer }
+import silk.testing.testing { AssertionError, Testing }
+import runtime_memory { RuntimeAllocator }
+import js_heap { HeapCell, HeapHeader }
+import js_core_types { ContextState, NativeFunctionId, WeakRefHeader }
+import js_gc { HeapHooks, Tracer }
+import js_gc as gc
+import js_runtime as runtime
+import js_object_allocate as objects
+import js_allocation_realms as allocationRealms
+import js_value { ValueBits }
+import js_owned_value { lendBits, immediateRef }
+import js_realm { lendRealm }
+import js_array_storage_test_support { trap, rc }
+
+// Only plain objects are made here: no class hook may run.
+struct Hooks {}
+impl HeapHooks for Hooks {
+  unsafe fn traceClass(self: &mut Self, runtime: *mut HeapHeader, object: *mut HeapHeader,
+    callback: NativeFunctionId, tracer: &mut Tracer) -> () { trap() }
+  unsafe fn finalizeClass(self: &mut Self, runtime: *mut HeapHeader, object: *mut HeapHeader,
+    callback: NativeFunctionId) -> () { trap() }
+  unsafe effect fn sweepWeak(self: &mut Self, runtime: *mut HeapHeader, node: *mut WeakRefHeader) -> () ? &mut Allocator { trap() }
+  unsafe fn destroyAuxiliary(self: &mut Self, runtime: *mut HeapHeader, node: *mut HeapHeader) -> () { trap() }
+}
+fn same(found: ?*mut HeapHeader, expected: *mut HeapHeader) -> bool {
+  return Pointer.address<HeapHeader>(found) == Pointer.address<HeapHeader>(expected)
+}
+
+// The case behind Node's cross-realm Error.captureStackTrace: the realm that
+// allocated an object, for null-prototype objects, objects whose prototype comes
+// from another realm, and after the embedder drops its context handle and a
+// collection runs.
+test effect fn recordingRealmsKeepAllocationRealmPastHandleAndCollections() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let rt = run runtime.allocateRuntimeStorage(0) |> Effect.provideMut<Allocator>(&mut memory)
+  let main = run unsafe runtime.allocateContextStorage(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let foreign = run unsafe runtime.allocateContextStorage(rt) |> Effect.provideMut<Allocator>(&mut memory)
+  let mainRealm = unsafe lendRealm(&main, main)
+  let foreignRealm = unsafe lendRealm(&foreign, foreign)
+  let mut hooks = Hooks {}
+  run Testing.expect(!allocationRealms.recording(mainRealm) && !allocationRealms.recording(foreignRealm), "no realm records by default")
+  allocationRealms.setRecording(foreignRealm, true)
+
+  let root = run objects.withPrototype(&mut hooks, &observer, mainRealm, immediateRef(ValueBits.Null)) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(Pointer.isNull<HeapHeader>(allocationRealms.allocationContext(mainRealm, root)), "a realm that does not record leaves no record")
+  let before = unsafe rc(foreign)
+  let bare = run objects.withPrototype(&mut hooks, &observer, foreignRealm, immediateRef(ValueBits.Null)) |> Effect.provideMut<Allocator>(&mut memory)
+  let adopted = run objects.withPrototype(&mut hooks, &observer, foreignRealm, unsafe lendBits(&root, root)) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(same(allocationRealms.allocationContext(mainRealm, bare), foreign), "a null-prototype object records its allocation realm")
+  run Testing.expect(same(allocationRealms.allocationContext(mainRealm, adopted), foreign), "another realm's prototype does not change the allocation realm")
+  run Testing.expect(unsafe rc(foreign) == before + 2 && unsafe allocationRealms.recordedCount(rt) == 2, "each record owns one realm reference")
+  run Testing.expect(Pointer.isNull<HeapHeader>(allocationRealms.allocationContext(mainRealm, ValueBits.Int { value: 1 })), "non-objects have no allocation realm")
+
+  // The embedder's handle goes; the records keep the realm through collections.
+  unsafe gc.releaseHeader(&mut hooks, rt, foreign)
+  run unsafe gc.collect(&mut hooks, rt, false) |> Effect.provideMut<Allocator>(&mut memory)
+  run unsafe gc.collect(&mut hooks, rt, false) |> Effect.provideMut<Allocator>(&mut memory)
+  let kept = allocationRealms.allocationContext(mainRealm, bare)
+  run Testing.expect(same(kept, foreign) && unsafe rc(foreign) == before + 1, "collections keep a recorded realm whose handle was released")
+  let anchor = ()
+  let state = unsafe HeapCell.payload<ContextState, ()>(&anchor, foreign)
+  run Testing.expect(Pointer.address<HeapHeader>(state.runtime) == Pointer.address<HeapHeader>(rt) && state.recordsAllocationRealm,
+    "the retained realm stays usable")
+  drop state
+
+  // A dying object drops its record and reference.
+  unsafe gc.release(&mut hooks, rt, adopted)
+  run Testing.expect(unsafe rc(foreign) == before && unsafe allocationRealms.recordedCount(rt) == 1, "destroying an object drops its record")
+
+  // A cycle through the record (realm global -> object -> realm) is collected.
+  let mut globalAnchor = ()
+  let global = unsafe HeapCell.payloadMut<ContextState, ()>(&mut globalAnchor, foreign)
+  global.globalObject = bare
+  drop global
+  run unsafe gc.collect(&mut hooks, rt, false) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(unsafe allocationRealms.recordedCount(rt) == 0, "an unreachable realm and its objects are collected together")
+
+  // Cells reused after a recorded object died start without a record.
+  allocationRealms.setRecording(mainRealm, false)
+  let fresh = run objects.withPrototype(&mut hooks, &observer, mainRealm, immediateRef(ValueBits.Null)) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(Pointer.isNull<HeapHeader>(allocationRealms.allocationContext(mainRealm, fresh)), "a reused cell carries no stale record")
+  unsafe gc.release(&mut hooks, rt, fresh)
+  unsafe gc.release(&mut hooks, rt, root)
+  unsafe gc.releaseHeader(&mut hooks, rt, main)
+  run unsafe gc.destroyRuntime(&mut hooks, rt) |> Effect.provideMut<Allocator>(&mut memory)
+  run Testing.expect(memory.stats().usedBytes == 0 && observer.stats().allocationCount == 0, "records and realms are fully reclaimed")
+}
