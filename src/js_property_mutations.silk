@@ -197,9 +197,10 @@ effect fn flags<'r, 'o>(rt: RuntimeRef<'r>, object: ObjectRef<'o>, index: usize,
 }
 /// Stores value at index and returns the slot it replaced, whose kind previousFlags
 /// names: callers may already have moved the shape flags to value's kind.
-fn put<'o>(object: ObjectRef<'o>, index: usize, value: PropertySlot, previousFlags: u32) -> PropertySlot {
+/// An accessor's box is made beforehand (SlotBits.from), so the store cannot fail.
+fn put<'o>(object: ObjectRef<'o>, index: usize, stored: SlotBits, previousFlags: u32) -> PropertySlot {
   let mut anchor = () let p = object.dataMut(&mut anchor)
-  let previous = p.slot(index).view(u32.toU8(previousFlags & JS_PROP_TMASK)) p.setSlot(index, SlotBits.from(value)) return previous
+  let previous = unsafe p.slot(index).retire(u32.toU8(previousFlags & JS_PROP_TMASK)) p.setSlot(index, stored) return previous
 }
 fn invalidate<'r, 'o>(rt: RuntimeRef<'r>, held: ObjectRef<'o>, atom: u32) -> () {
   let anchor = () let object = held.data(&anchor)
@@ -215,9 +216,17 @@ fn invalidate<'r, 'o>(rt: RuntimeRef<'r>, held: ObjectRef<'o>, atom: u32) -> () 
 effect fn add<'r, 'o, H: HeapHooks>(hooks: &mut H, rt: RuntimeRef<'r>, object: ObjectRef<'o>,
   atom: u32, propertyFlags: u32, incoming: PropertySlot) -> () ! OutOfMemoryError ? &mut Allocator {
   invalidate(rt, object, atom)
+  let stored = run SlotBits.from(incoming)
   let mut anchor = () let p = object.dataMut(&mut anchor)
-  let added = run unsafe shapes.addProperty(rt.raw(), &mut p, atom, u32.toU8(propertyFlags))
-  p.setSlot(added.index, SlotBits.from(incoming)) drop p
+  let made = run Effect.result(unsafe shapes.addProperty(rt.raw(), &mut p, atom, u32.toU8(propertyFlags)))
+  let added = match move made {
+    Result<shapes.AddResult, OutOfMemoryError>.Success { value } => move value
+    Result<shapes.AddResult, OutOfMemoryError>.Failure { error } => {
+      if (propertyFlags & JS_PROP_TMASK) == JS_PROP_GETSET { unsafe stored.discardBox() }
+      fail move error
+    }
+  }
+  p.setSlot(added.index, stored) drop p
   match Pointer.nonNullMut<HeapHeader>(added.retiredShape) {
     Option<*mut HeapHeader>.Some { value } => { unsafe gc.releaseHeader(&mut hooks, rt.raw(), value) }
     Option<*mut HeapHeader>.None => ()
@@ -226,6 +235,30 @@ effect fn add<'r, 'o, H: HeapHooks>(hooks: &mut H, rt: RuntimeRef<'r>, object: O
 fn globalPending<'o>(object: ObjectRef<'o>) -> *mut HeapHeader {
   let anchor = () let p = object.data(&anchor)
   return match &p.payload { ObjectPayload.GlobalObject { global } => reference(global.uninitializedVariables) _ => invariant() }
+}
+/// define's change of the data, VarRef or lazy property at index into an accessor,
+/// made once the accessor's box exists: flags (and a global's binding) switch to
+/// the accessor. false when the property moved away meanwhile (define retries);
+/// an accessor previous needs nothing.
+effect fn toAccessor<'r, 'o, H: HeapHooks>(hooks: &mut H, rt: RuntimeRef<'r>, held: ObjectRef<'o>, node: *mut HeapHeader,
+  atom: u32, previous: PropertySlot, index: &mut usize, current: &mut u32) -> bool ! OutOfMemoryError ? &mut Allocator {
+  match previous { PropertySlot.GetterSetter { .. } => { return true } _ => () }
+  let mut anchor = () let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+  run unsafe shapes.prepareUpdate(rt.raw(), &mut p) drop p
+  if classId(held) == classes.JS_CLASS_GLOBAL_OBJECT {
+    match previous { PropertySlot.VarRef { reference } => { run unsafe retireGlobal(&mut hooks, rt, node, atom, reference) } _ => () }
+    index.* = match own(held, atom) { Option<usize>.Some { value: foundIndex } => foundIndex Option<usize>.None => { return false } }
+    match previous {
+      PropertySlot.VarRef { reference: oldCell } => {
+        if !sameBinding(slot(held, index.*), oldCell) { return false }
+      }
+      _ => ()
+    }
+    current.* = storedFlags(held, index.*)
+  }
+  current.* = (current.* & (JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE)) | JS_PROP_GETSET
+  run flags(rt, held, index.*, current.*)
+  return true
 }
 unsafe effect fn retireGlobal<'r, H: HeapHooks>(hooks: &mut H, rt: RuntimeRef<'r>,
   node: *mut HeapHeader, atom: u32, cell: *mut HeapHeader) -> () ! OutOfMemoryError ? &mut Allocator {
@@ -331,7 +364,7 @@ unsafe effect fn create<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks 
           fill = !fast && index < oldLength && (propertyFlags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) == 0
           if index + 1 > oldLength {
             if (storedFlags(held, 0) & JS_PROP_WRITABLE) == 0 { return run readOnly(&mut hooks, realm, atoms.JS_ATOM_length, propertyFlags) }
-            let _previous = put(held, 0, PropertySlot.Value { value: ValueBits.number(u32.toF64(index + 1)) }, storedFlags(held, 0))
+            let _previous = put(held, 0, SlotBits.plain(PropertySlot.Value { value: ValueBits.number(u32.toF64(index + 1)) }), storedFlags(held, 0))
           }
         }
         Option<u32>.None => ()
@@ -422,29 +455,21 @@ unsafe effect fn define<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks 
                   }
                 }
               }
-              _ => {
-                let mut anchor = () let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
-                run unsafe shapes.prepareUpdate(rt.raw(), &mut p) drop p
-                if classId(held) == classes.JS_CLASS_GLOBAL_OBJECT {
-                  match previous { PropertySlot.VarRef { reference } => { run unsafe retireGlobal(&mut hooks, rt, node, atom, reference) } _ => () }
-                  index = match own(held, atom) { Option<usize>.Some { value: foundIndex } => foundIndex Option<usize>.None => { continue } }
-                  match previous {
-                    PropertySlot.VarRef { reference: oldCell } => {
-                      if !sameBinding(slot(held, index), oldCell) { continue }
-                    }
-                    _ => ()
-                  }
-                  current = storedFlags(held, index)
-                }
-                current = (current & (JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE)) | JS_PROP_GETSET
-                run flags(rt, held, index, current)
-              }
+              _ => ()
             }
             let mut get = oldGet let mut set = oldSet
             if (propertyFlags & JS_PROP_HAS_GET) != 0 { get = newGet }
             if (propertyFlags & JS_PROP_HAS_SET) != 0 { set = newSet }
+            // The new box comes first: from here on nothing may fail undone.
+            let stored = run SlotBits.from(PropertySlot.GetterSetter { getter: get, setter: set })
+            let reshaped = run Effect.result(toAccessor(&mut hooks, rt, held, node, atom, previous, &mut index, &mut current))
+            let proceed = match move reshaped {
+              Result<bool, OutOfMemoryError>.Success { value: go } => go
+              Result<bool, OutOfMemoryError>.Failure { error } => { unsafe stored.discardBox() fail move error }
+            }
+            if !proceed { unsafe stored.discardBox() continue }
             unsafe retainPointer(get) unsafe retainPointer(set)
-            let retired = put(held, index, PropertySlot.GetterSetter { getter: get, setter: set }, previous.kind())
+            let retired = put(held, index, stored, previous.kind())
             unsafe gc.releaseProperty(&mut hooks, rt.raw(), retired)
           } else {
             let mut active = previous
@@ -461,7 +486,7 @@ unsafe effect fn define<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks 
                   Result<(), OutOfMemoryError>.Failure { error } => { unsafe gc.releaseProperty(&mut hooks, rt.raw(), incoming) fail move error }
                   Result<(), OutOfMemoryError>.Success { .. } => ()
                 }
-                let retired = put(held, index, incoming, JS_PROP_GETSET) active = incoming current = nextFlags
+                let retired = put(held, index, SlotBits.plain(incoming), JS_PROP_GETSET) active = incoming current = nextFlags
                 unsafe gc.releaseProperty(&mut hooks, rt.raw(), retired)
                 index = match own(held, atom) { Option<usize>.Some { value: foundIndex } => foundIndex Option<usize>.None => { continue } }
                 active = slot(held, index) current = storedFlags(held, index)
@@ -497,7 +522,7 @@ unsafe effect fn define<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks 
                     current = current & ~(JS_PROP_TMASK | JS_PROP_WRITABLE) run flags(rt, held, index, current)
                     let bindingValue = unsafe varRefs.read(cell)
                     let incoming = unsafe bindingValue.retained()
-                    let retired = put(held, index, PropertySlot.Value { value: incoming }, JS_PROP_VARREF) unsafe gc.releaseProperty(&mut hooks, rt.raw(), retired)
+                    let retired = put(held, index, SlotBits.plain(PropertySlot.Value { value: incoming }), JS_PROP_VARREF) unsafe gc.releaseProperty(&mut hooks, rt.raw(), retired)
                   }
                 }
               }
@@ -517,7 +542,7 @@ unsafe effect fn define<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks 
                   }
                 }
                 if (propertyFlags & JS_PROP_HAS_VALUE) != 0 {
-                  let retired = put(held, index, PropertySlot.Value { value: unsafe value.retained() }, storedFlags(held, index)) unsafe gc.releaseProperty(&mut hooks, rt.raw(), retired)
+                  let retired = put(held, index, SlotBits.plain(PropertySlot.Value { value: unsafe value.retained() }), storedFlags(held, index)) unsafe gc.releaseProperty(&mut hooks, rt.raw(), retired)
                   index = match own(held, atom) { Option<usize>.Some { value: foundIndex } => foundIndex Option<usize>.None => { continue } }
                   if !match slot(held, index) { PropertySlot.Value { .. } => true _ => false } { continue }
                   current = storedFlags(held, index)
@@ -641,7 +666,7 @@ unsafe effect fn setStep<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks
         let index = found.index
         let current = u8.toU32(found.flags) let previous = slotAs(held, index, found.flags)
         if direct && (current & (JS_PROP_TMASK | JS_PROP_WRITABLE | JS_PROP_LENGTH)) == JS_PROP_WRITABLE {
-          let retired = put(held, index, PropertySlot.Value { value: takeIncoming(&mut incoming) }, current)
+          let retired = put(held, index, SlotBits.plain(PropertySlot.Value { value: takeIncoming(&mut incoming) }), current)
           unsafe gc.releaseProperty(&mut hooks, rt.raw(), retired)
           return SetStep.Done { accepted: true }
         }
@@ -667,7 +692,7 @@ unsafe effect fn setStep<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks
           PropertySlot.LazyInitializer { .. } => {
             if direct && (current & JS_PROP_WRITABLE) != 0 {
               run flags(rt, held, index, current & ~JS_PROP_TMASK)
-              let retired = put(held, index, PropertySlot.Value { value: takeIncoming(&mut incoming) }, current)
+              let retired = put(held, index, SlotBits.plain(PropertySlot.Value { value: takeIncoming(&mut incoming) }), current)
               unsafe gc.releaseProperty(&mut hooks, rt.raw(), retired)
               return SetStep.Done { accepted: true }
             }
