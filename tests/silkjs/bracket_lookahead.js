@@ -41,3 +41,20 @@ const got = got1 + ';' + r.join();
 const expected = '3,2x3y,re\\),0.5,))),12,2,2,),1000,0.5,2.5,object,SyntaxError,9,5;3,5,6,true,{"k":{"m":[1,{"n":"}]"}],"s":"}{"}},x,0.5/1/1.5,8,3,7+8,yes,0.5|0.5|=|a1,2b,2,3,22,2,é,3';
 console.log(got === expected ? 'PASS bracket lookahead' : 'FAIL ' + got);
 if (got !== expected) throw new Error('bracket lookahead regressions');
+// Object literals whose property values end in a function body: the scan may
+// stop at such a property only when no `=` precedes it and `,` or `}` follows.
+var t = [], fx = {}, d1, d2;
+({a: d1 = function(){ return 4 }, b: d2 = () => {}} = {b: 1}); t.push(d1(), d2);
+({a: function(){}.x, b: fx.y} = {a: 5, b: 6}); Function.prototype.x = undefined; t.push(fx.y);
+({p: function(){ return fx }
+  ().w} = {p: 7}); t.push(fx.w);
+delete Function.prototype.x;
+var lit = {m() { return 1 }, get g() { return 2 }, f: function () { return 3 }, n: 4}; t.push(lit.m() + lit.g + lit.f() + lit.n);
+var lit2 = {f: function () {}, x: 1} ; t.push(lit2.x);
+try { eval("({m(){}} = {})") } catch (e) { t.push(e.name) }
+try { eval("({a: function(){}} = {})") } catch (e) { t.push(e.name) }
+try { eval("({a: function(){}, b} = {})") } catch (e) { t.push(e.name) }
+const got2 = t.join();
+const expected2 = '4,1,6,7,10,1,SyntaxError,SyntaxError,SyntaxError';
+console.log(got2 === expected2 ? 'PASS bracket lookahead bodies' : 'FAIL ' + got2);
+if (got2 !== expected2) throw new Error('bracket lookahead body regressions');
