@@ -16,7 +16,10 @@ var layouts = [
   '//' + 'x'.repeat(40) + '\n\n//' + 'y'.repeat(29) + '\n',
   '// café 日本語 ' + 'z'.repeat(20) + '\n',
   '/* é\néé\n' + 'w'.repeat(33) + ' */\n',
-  '//' + 'v'.repeat(70) + '\r\n', '/*' + 'u'.repeat(90) + '\u00e9' + 't'.repeat(40) + '*/'
+  '//' + 'v'.repeat(70) + '\r\n', '/*' + 'u'.repeat(90) + '\u00e9' + 't'.repeat(40) + '*/',
+  // Runs past 64 bytes, with line feeds at the ends and the middle of a block.
+  '//' + 'p'.repeat(61) + '\n' + '//' + 'r'.repeat(29) + '\n//' + 's'.repeat(100) + '\n',
+  '\n'.repeat(64) + '/*' + 'o'.repeat(150) + '*/'
 ];
 var lead = ['', ' ', '        ', '/*' + 'q'.repeat(21) + '*/ ', '"éé"; '];
 var base = where('return new Error().stack');
