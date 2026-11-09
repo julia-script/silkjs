@@ -83,11 +83,14 @@ const RESTORE_STACK: usize = 1024
 struct RestoreStack { cells: [?*mut HeapHeader; 1024], depth: usize, overflowed: bool }
 /// Borrowed stack-local marking capability, valid only during its callback. It
 /// does not own/retain runtime and must not escape or be used after collection.
-pub struct Tracer { runtime: *mut HeapHeader, operation: MarkOperation, stack: *mut RestoreStack }
+/// young: a young collection, whose edges to old cells count for nothing (their
+/// counts are neither decremented nor restored).
+pub struct Tracer { runtime: *mut HeapHeader, operation: MarkOperation, stack: *mut RestoreStack, young: bool }
 impl Tracer {
   pub unsafe fn header(self: &mut Self, child: *mut HeapHeader) -> () {
     let mut anchor = ()
     let h = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, child)
+    if self.young && h.young == 0 { return () }
     if self.operation == MarkOperation.Decrement {
       require(h.referenceCount > 0)
       h.referenceCount = i32.wrappingSubtract(h.referenceCount, 1)
@@ -104,6 +107,7 @@ impl Tracer {
   unsafe fn edgeAs(self: &mut Self, child: *mut HeapHeader, operation: MarkOperation) -> () {
     let mut anchor = ()
     let h = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, child)
+    if self.young && h.young == 0 { return () }
     if operation == MarkOperation.Decrement {
       require(h.referenceCount > 0)
       h.referenceCount = i32.wrappingSubtract(h.referenceCount, 1)
@@ -258,9 +262,13 @@ unsafe fn setPhase(runtime: *mut HeapHeader, value: GcPhase) -> () {
 @inlineAlways
 unsafe fn join(runtime: *mut HeapHeader, node: *mut HeapHeader) -> () {
   let mut anchor = ()
+  let header = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, node)
+  header.young = 1
+  drop header
   let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
   if unsafe HeapCell.isPooledCell(node) {
-    unsafe memory.addCell(unsafe blockAt(node), Pointer.address<HeapHeader>(runtime), Pointer.fromMutRef<?*mut u8>(&mut state.gcArenas))
+    unsafe memory.addCell(unsafe blockAt(node), Pointer.address<HeapHeader>(runtime), Pointer.fromMutRef<?*mut u8>(&mut state.gcArenas),
+      Pointer.fromMutRef<?*mut u8>(&mut state.gcYoungArenas))
     return ()
   }
   unsafe state.gcObjects.pushBack(node)
@@ -1411,6 +1419,17 @@ pub unsafe fn inheritedOnly(bytecode: *mut HeapHeader) -> bool {
 /// walk found without outside counts; temporaryGcObjects takes linked ones.
 pub unsafe effect fn collect<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader,
   removeWeakObjects: bool) -> () ? &mut Allocator {
+  run unsafe collectCells(&mut hooks, runtime, removeWeakObjects, false)
+}
+/// collect over the young generation only: the cells published since the last
+/// collection. Edges from old cells are outside counts, so a young cell any old
+/// cell points at survives; garbage cycles through old cells wait for a full
+/// collection. Afterwards every survivor is old.
+pub unsafe effect fn collectYoung<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader) -> () ? &mut Allocator {
+  run unsafe collectCells(&mut hooks, runtime, true, true)
+}
+unsafe effect fn collectCells<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader,
+  removeWeakObjects: bool, young: bool) -> () ? &mut Allocator {
   require(unsafe phase(runtime) == GcPhase.None)
   unsafe releasePins(&mut hooks, runtime)
   unsafe releaseRetired(&mut hooks, runtime)
@@ -1422,7 +1441,7 @@ pub unsafe effect fn collect<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHead
   unsafe HeapHooks.gcLifecycle(&mut hooks, runtime, 0)
   if removeWeakObjects { run unsafe sweepWeak(&mut hooks, runtime) }
   let mut stack = RestoreStack { cells: [Pointer.null<HeapHeader>(); 1024], depth: 0, overflowed: false }
-  let mut tracer = Tracer { runtime: runtime, operation: MarkOperation.Decrement, stack: Pointer.fromMutRef<RestoreStack>(&mut stack) }
+  let mut tracer = Tracer { runtime: runtime, operation: MarkOperation.Decrement, stack: Pointer.fromMutRef<RestoreStack>(&mut stack), young: young }
   unsafe decrementPass(&mut hooks, runtime, &mut tracer)
   tracer.operation = MarkOperation.RestoreReachable
   unsafe restorePass(&mut hooks, runtime, &mut tracer)
@@ -1432,34 +1451,104 @@ pub unsafe effect fn collect<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHead
   unsafe removeCycles(&mut hooks, runtime)
   unsafe setPhase(runtime, GcPhase.None)
   unsafe destroyZombies(runtime)
+  unsafe promoteYoung(runtime, young)
   unsafe HeapHooks.gcLifecycle(&mut hooks, runtime, 1)
+}
+/// The first arena a pass over the members walks: all of them, or the young ones.
+@inlineAlways
+unsafe fn passArena(runtime: *mut HeapHeader, young: bool) -> ?*mut u8 {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  if young { return state.gcYoungArenas }
+  return state.gcArenas
+}
+@inlineAlways
+unsafe fn passWord(arena: *mut u8, word: usize, young: bool) -> u64 {
+  if young { return unsafe memory.youngWord(arena, word) }
+  return unsafe memory.cellWord(arena, word)
+}
+@inlineAlways
+unsafe fn passNext(arena: *mut u8, young: bool) -> ?*mut u8 {
+  if young { return unsafe memory.nextYoungArena(arena) }
+  return unsafe memory.nextCellArena(arena)
+}
+/// Marks a member the decrement pass traced (mark 1). A full collection also
+/// makes it old: its young flag is not read again before promoteYoung.
+@inlineAlways
+unsafe fn markMember(node: *mut HeapHeader, young: bool) -> () {
+  let mut anchor = ()
+  let h = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, node)
+  h.mark = 1
+  if !young { h.young = 0 }
+}
+/// Whether linked member node takes part in a pass.
+@inlineAlways
+unsafe fn inPass(node: *mut HeapHeader, young: bool) -> bool {
+  let anchor = ()
+  return !young || (unsafe Pointer.borrow<(), HeapHeader>(&anchor, node)).young != 0
+}
+/// Ends a collection: every surviving member becomes old. A full collection's
+/// decrement pass cleared the members' young flags already, so only the young
+/// bitmaps go; a young collection clears its survivors' flags here.
+@inlineNever
+unsafe fn promoteYoung(runtime: *mut HeapHeader, young: bool) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  let head = Pointer.fromMutRef<?*mut u8>(&mut state.gcYoungArenas)
+  drop state
+  while !Pointer.isNull<u8>(unsafe Pointer.read<?*mut u8>(head)) {
+    let arena = unsafe present(unsafe Pointer.read<?*mut u8>(head))
+    let mut word: usize = 0
+    while young && word < memory.CELL_WORDS {
+      let mut bits = unsafe memory.youngWord(arena, word)
+      while bits != 0 {
+        let node = unsafe cellIn(arena, word, u64.trailingZeros(bits))
+        bits = u64.bitAnd(bits, bits - 1)
+        let h = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, node)
+        h.young = 0
+      }
+      word = word + 1
+    }
+    unsafe memory.popYoungArena(head)
+  }
+  if !young { return () }
+  let mut linked = unsafe firstGc(runtime, 0)
+  while !Pointer.isNull<HeapHeader>(linked) {
+    let node = unsafe nonnull(linked)
+    linked = unsafe linkedNext(node)
+    let h = unsafe Pointer.borrowMut<(), HeapHeader>(&mut anchor, node)
+    h.young = 0
+  }
 }
 /// Pass 1: every member's children lose the counts it holds; members get mark 1.
 @inlineNever
 unsafe fn decrementPass<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, tracer: &mut Tracer) -> () {
-  let mut cursor = unsafe firstArena(runtime)
+  let young = tracer.young
+  let mut cursor = unsafe passArena(runtime, young)
   while !Pointer.isNull<u8>(cursor) {
     let arena = unsafe present(cursor)
     let mut word: usize = 0
     while word < memory.CELL_WORDS {
-      let mut bits = unsafe memory.cellWord(arena, word)
+      let mut bits = unsafe passWord(arena, word, young)
       while bits != 0 {
         let node = unsafe cellIn(arena, word, u64.trailingZeros(bits))
         bits = u64.bitAnd(bits, bits - 1)
         if bits != 0 { unsafe prefetchCell(unsafe cellIn(arena, word, u64.trailingZeros(bits))) }
         unsafe traceAs(&mut hooks, node, &mut tracer, MarkOperation.Decrement)
-        unsafe mark(node, 1)
+        unsafe markMember(node, young)
       }
       word = word + 1
     }
-    cursor = unsafe memory.nextCellArena(arena)
+    cursor = unsafe passNext(arena, young)
   }
   let mut linked = unsafe firstGc(runtime, 0)
   while !Pointer.isNull<HeapHeader>(linked) {
     let node = unsafe nonnull(linked)
     linked = unsafe linkedNext(node)
-    unsafe traceDecrement(&mut hooks, node, &mut tracer)
-    unsafe mark(node, 1)
+    if unsafe inPass(node, young) {
+      unsafe traceDecrement(&mut hooks, node, &mut tracer)
+      unsafe markMember(node, young)
+    }
   }
 }
 /// Restores the children of node, found reachable (mark 0), then of every cell
@@ -1487,12 +1576,13 @@ unsafe fn drainRestore<H: HeapHooks>(hooks: &mut H, tracer: &mut Tracer) -> () {
 /// get their scratch bit for the passes after this one.
 @inlineNever
 unsafe fn restorePass<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, tracer: &mut Tracer) -> () {
-  let mut cursor = unsafe firstArena(runtime)
+  let young = tracer.young
+  let mut cursor = unsafe passArena(runtime, young)
   while !Pointer.isNull<u8>(cursor) {
     let arena = unsafe present(cursor)
     let mut word: usize = 0
     while word < memory.CELL_WORDS {
-      let mut bits = unsafe memory.cellWord(arena, word)
+      let mut bits = unsafe passWord(arena, word, young)
       let mut uncounted: u64 = 0
       while bits != 0 {
         let bit = u64.trailingZeros(bits)
@@ -1510,7 +1600,7 @@ unsafe fn restorePass<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, tra
       }
       word = word + 1
     }
-    cursor = unsafe memory.nextCellArena(arena)
+    cursor = unsafe passNext(arena, young)
   }
   let mut linked = unsafe firstGc(runtime, 0)
   while !Pointer.isNull<HeapHeader>(linked) {
