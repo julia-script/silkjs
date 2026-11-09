@@ -59,7 +59,16 @@ pub struct SourcePositionCache {
   sharedEnd: usize,
   // shareCoordinates found, or was told, that the whole source is plain (see
   // js_core_types.SourceText): a parse through this cache passes that on.
-  pub plainText: bool
+  pub plainText: bool,
+  // The line index (shareCoordinates): when indexed, the two coordinate systems
+  // agree over source[base, sharedEnd), feeds holds the offset of each LF there
+  // and trails that of each UTF8 continuation byte, both in order, so locate
+  // there takes a search instead of a scan. The line is the coordinates at base
+  // (feedLine, feedColumn) plus the LFs before the offset; the column counts the
+  // bytes since the last of them, less the continuation bytes among them.
+  // feedHint is the count of LFs before the last offset located that way.
+  feeds: List<u32>, indexed: bool, feedHint: usize, feedLine: i32, feedColumn: i32,
+  trails: List<u32>
 }
 const CHECKPOINT_BYTES: usize = 256
 impl SourcePositionCache {
@@ -67,7 +76,9 @@ impl SourcePositionCache {
     return SourcePositionCache { cursor: 0, line: 0, column: 0, markCursor: 0, markLine: 0, markColumn: 0,
       ecmaCursor: 0, ecmaLine: 0, ecmaColumn: 0,
       checkpoints: List<SourceLocation>.make(), covered: 0,
-      ecmaCheckpoints: List<SourceLocation>.make(), ecmaCovered: 0, base: 0, sharedEnd: 0, plainText: false }
+      ecmaCheckpoints: List<SourceLocation>.make(), ecmaCovered: 0, base: 0, sharedEnd: 0, plainText: false,
+      feeds: List<u32>.make(), indexed: false, feedHint: 0, feedLine: 0, feedColumn: 0,
+      trails: List<u32>.make() }
   }
   /// A cache whose cursors already stand at offset, at (line, column) and
   /// (ecmaLine, ecmaColumn) in ECMAScript coordinates: later offsets are counted
@@ -76,7 +87,9 @@ impl SourcePositionCache {
     return SourcePositionCache { cursor: offset, line: line, column: column, markCursor: 0, markLine: 0, markColumn: 0,
       ecmaCursor: offset, ecmaLine: ecmaLine, ecmaColumn: ecmaColumn,
       checkpoints: List<SourceLocation>.make(), covered: 0,
-      ecmaCheckpoints: List<SourceLocation>.make(), ecmaCovered: 0, base: offset, sharedEnd: 0, plainText: false }
+      ecmaCheckpoints: List<SourceLocation>.make(), ecmaCovered: 0, base: offset, sharedEnd: 0, plainText: false,
+      feeds: List<u32>.make(), indexed: false, feedHint: 0, feedLine: 0, feedColumn: 0,
+      trails: List<u32>.make() }
   }
   /// Reserves checkpoints for a source of `length` bytes. Without it the cache works
   /// from its cursor and mark alone.
@@ -100,20 +113,66 @@ impl SourcePositionCache {
   /// and both coordinate systems agree at base, they agree throughout that span (LF is
   /// its only terminator and every byte one column), so locateEcma answers there with
   /// locate and the source is scanned once instead of twice. plain says the whole
-  /// source is already known to be plain (js_core_types.SourceText): no scan then.
-  pub fn shareCoordinates(self: &mut Self, source: &[u8], length: usize, plain: bool) -> () {
+  /// source is already known to be plain (js_core_types.SourceText). A span that is
+  /// gets a line index too (see feeds), found in that pass; a known-plain one does not.
+  pub effect fn shareCoordinates(self: &mut Self, source: &[u8], length: usize, plain: bool) -> ()
+    ! OutOfMemoryError ? &mut Allocator {
     if plain { self.plainText = true }
     if self.covered == 0 || self.ecmaCovered == 0 || self.cursor != self.base || self.ecmaCursor != self.base
       || self.line != self.ecmaLine || self.column != self.ecmaColumn { return () }
     if self.base > source.length || length > source.length - self.base { return () }
     let end = self.base + length
-    if plain || unsafe sameCoordinates(Pointer.fromSlice<u8>(source), self.base, end) {
+    let bytes = Pointer.fromSlice<u8>(source)
+    // Offsets in the index are u32, as source positions are.
+    let mut clean = self.base
+    // Known plain needs no pass; the index is only worth one where a pass runs anyway.
+    if !plain && end <= u32.toUsize(u32.MAX) { clean = run unsafe indexFeeds(bytes, self.base, end, &mut self.feeds, &mut self.trails) }
+    if clean == end {
+      self.indexed = true
+      self.feedLine = self.line
+      self.feedColumn = self.column
+      self.sharedEnd = end
+      if self.base == 0 && end == source.length { self.plainText = true }
+      return ()
+    }
+    self.feeds.clear()
+    self.trails.clear()
+    // The two systems agree over [base, clean).
+    if plain || unsafe sameCoordinates(bytes, clean, end) {
       self.sharedEnd = end
       if self.base == 0 && end == source.length { self.plainText = true }
     }
   }
+  // locate within an indexed span: the LFs before offset give its line, the last
+  // of them its column.
+  fn locateIndexed(self: &mut Self, offset: usize) -> SourceLocation {
+    let feeds = self.feeds.asSlice()
+    let count = feeds.length
+    let target = usize.toU32(offset)
+    let mut before = self.feedHint
+    // Most lookups land on the line of the one before.
+    if !((before == 0 || feeds[before - 1] < target) && (before == count || feeds[before] >= target)) {
+      let mut low: usize = 0
+      let mut high = count
+      while low < high {
+        let middle = low + (high - low) / 2
+        if feeds[middle] < target { low = middle + 1 } else { high = middle }
+      }
+      before = low
+    }
+    self.feedHint = before
+    let lineStart = if before == 0 { usize.toU32(self.base) } else { feeds[before - 1] + 1 }
+    let mut bytes = target - lineStart
+    if self.trails.length() != 0 { bytes = bytes - (rankBelow(self.trails.asSlice(), target) - rankBelow(self.trails.asSlice(), lineStart)) }
+    if before == 0 { return SourceLocation { line: self.feedLine, column: i32.wrappingAdd(self.feedColumn, u32.toI32(bytes)) } }
+    return SourceLocation { line: i32.wrappingAdd(self.feedLine, usize.toI32(before)), column: u32.toI32(bytes) }
+  }
   @inlineAlways
   pub fn locate(self: &mut Self, source: &[u8], offset: usize) -> SourceLocation {
+    if self.indexed && offset <= self.sharedEnd && offset >= self.base {
+      if offset > source.length { Intrinsic.trap("SourcePositionCache.locate: offset past source") }
+      return self.locateIndexed(offset)
+    }
     if self.covered != 0 { return self.locateFromCheckpoint(source, offset) }
     if offset >= self.cursor {
       // Checking the end once lets the scan read without per-byte index checks.
@@ -404,6 +463,82 @@ unsafe fn columnBefore(bytes: ?[*]const u8, offset: usize) -> i32 {
 @inlineAlways
 unsafe fn lanesAt(base: [*]const u8, index: usize) -> simd<u8, 16> {
   return unsafe Pointer.readUnaligned<simd<u8, 16>>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) simd<u8, 16>>(unsafe Pointer.at<u8>(base, index)))
+}
+// How many of the ascending values are below target.
+fn rankBelow(values: &[u32], target: u32) -> u32 {
+  let mut low: usize = 0
+  let mut high = values.length
+  while low < high {
+    let middle = low + (high - low) / 2
+    if values[middle] < target { low = middle + 1 } else { high = middle }
+  }
+  return usize.toU32(low)
+}
+// At most one continuation byte per this many source bytes is indexed; a span
+// with more (mostly non-Latin text) keeps scanning instead.
+const TRAIL_RATIO: usize = 16
+// Appends the offset of every LF in bytes [from, to) to feeds and of every UTF8
+// continuation byte to trails while the two coordinate systems agree over those
+// bytes (no CR, LS, PS or four-byte sequence; see sameCoordinates). Returns to when
+// they agree throughout, else an offset at or before the first byte where they may
+// not: they agree before it, and the lists are then partial.
+unsafe effect fn indexFeeds(bytes: ?[*]const u8, from: usize, to: usize, feeds: &mut List<u32>, trails: &mut List<u32>) -> usize
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut i = from
+  let base = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(bytes)
+  let returns = u8x16.splat(13)
+  let high = u8x16.splat(128)
+  let feed = u8x16.splat(10)
+  let limit = (to - from) / TRAIL_RATIO
+  while to - i >= 64 {
+    let a = unsafe lanesAt(base, i)
+    let b = unsafe lanesAt(base, i + 16)
+    let c = unsafe lanesAt(base, i + 32)
+    let d = unsafe lanesAt(base, i + 48)
+    let fewest = u8x16.minimum(u8x16.minimum(a ^ returns, b ^ returns), u8x16.minimum(c ^ returns, d ^ returns))
+    if mask16.any(u8x16.lanesEqual(fewest, u8x16.splat(0))) { return i }
+    if mask16.any(u8x16.lanesGreaterOrEqual((a | b) | (c | d), high)) {
+      // Non-ASCII: this block byte by byte.
+      let stop = i + 64
+      while i < stop {
+        let at = run unsafe indexByte(bytes, i, to, &mut feeds, &mut trails)
+        if !at || trails.length() > limit { return stop - 64 }
+        i = i + 1
+      }
+      continue
+    }
+    let mut found = mask16.toBits(u8x16.lanesEqual(a, feed)) | u64.shiftLeft(mask16.toBits(u8x16.lanesEqual(b, feed)), 16)
+      | u64.shiftLeft(mask16.toBits(u8x16.lanesEqual(c, feed)), 32) | u64.shiftLeft(mask16.toBits(u8x16.lanesEqual(d, feed)), 48)
+    while found != 0 {
+      run feeds.append(usize.toU32(i + u32.toUsize(u64.trailingZeros(found))))
+      found = u64.bitAnd(found, found - 1)
+    }
+    i = i + 64
+  }
+  let start = i
+  while i < to {
+    if !(run unsafe indexByte(bytes, i, to, &mut feeds, &mut trails)) || trails.length() > limit { return start }
+    i = i + 1
+  }
+  return to
+}
+// indexFeeds for the byte at i: false where the coordinate systems may part.
+@inlineAlways
+unsafe effect fn indexByte(bytes: ?[*]const u8, i: usize, to: usize, feeds: &mut List<u32>, trails: &mut List<u32>) -> bool
+  ! OutOfMemoryError ? &mut Allocator {
+  let c = unsafe byteAt(bytes, i)
+  if c < 128 {
+    if c == 13 { return false }
+    if c == 10 { run feeds.append(usize.toU32(i)) }
+    return true
+  }
+  if c >= 240 { return false }
+  if c == 226 && to - i >= 3 && unsafe byteAt(bytes, i + 1) == 128 {
+    let last = unsafe byteAt(bytes, i + 2)
+    if last == 168 || last == 169 { return false }
+  }
+  if c < 192 { run trails.append(usize.toU32(i)) }
+  return true
 }
 const CARRIAGE_RETURNS: u64 = 0x0d0d0d0d0d0d0d0d
 // Whether QuickJS and ECMAScript coordinates agree over bytes [from, to): no CR,
@@ -866,7 +1001,7 @@ pub effect fn encodePending(p: &PendingLines, text: &[u8], calls: bool) -> ByteB
   let first = u32.toUsize(p.functionSourcePosition) - p.base
   let mut cache = SourcePositionCache.at(first, p.start.line, p.start.column, p.ecmaStart.line, p.ecmaStart.column)
   run cache.prepareSpan(text.length - first)
-  cache.shareCoordinates(text, text.length - first, false)
+  run cache.shareCoordinates(text, text.length - first, false)
   let entries = if calls { p.calls.asSlice() } else { p.lines.asSlice() }
   let mut shifted = List<PcSourcePosition>.make()
   run shifted.reserveExact(entries.length)
