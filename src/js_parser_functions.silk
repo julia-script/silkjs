@@ -38,6 +38,9 @@ import js_preparse as preparse
 import js_preparse { Preparse }
 import silk.mem.box { Box }
 import js_preparse_tables { PreparseTables }
+import js_preparse_pool as pool
+import js_preparse_pool { PoolJob, SpanName }
+import silk.mem.pointer { Pointer }
 import silk.collections.list { List }
 import js_module_metadata { ExportKind }
 
@@ -501,6 +504,7 @@ effect fn parseFunctionInner<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser
     run support.emitOp(&mut s, op.OP_check_ctor)
   }
   if functionType == ParseFunctionKind.ClassConstructor { run literals.emitClassFieldInit(&mut s) }
+  let paramStart = s.token.start
   run parseParameters(&mut s, &mut hooks, memory, functionType)
   if kind == FunctionKind.Generator || kind == FunctionKind.AsyncGenerator {
     run support.emitOp(&mut s, op.OP_initial_yield)
@@ -547,7 +551,7 @@ effect fn parseFunctionInner<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser
       // Under a verified parent the child is verified too: it parses in full
       // with nothing to check afterwards.
       eager = invoked && !parentVerified
-      if !invoked { skipped = run skipBody(&mut s, child, entry) }
+      if !invoked { skipped = run skipBody(&mut s, child, entry, paramStart) }
     }
     if skipped {
       run checkNames(&mut s, functionName)
@@ -745,7 +749,7 @@ fn invokedShape(s: &Parser<'_>, sourceStart: &Option<usize>) -> bool {
 /// Sources shorter than this (in bytes) parse every body eagerly.
 const LAZY_MIN_SOURCE: usize = 2048
 
-effect fn skipBody(s: &mut Parser<'_>, child: FunctionId, entry: LexerPosition) -> bool
+effect fn skipBody(s: &mut Parser<'_>, child: FunctionId, entry: LexerPosition, paramStart: usize) -> bool
   ! ParserStackOverflow | LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
   // Inside a function finishLazy parses, its preparse already went through
   // this body: take its record instead of preparsing again.
@@ -754,6 +758,13 @@ effect fn skipBody(s: &mut Parser<'_>, child: FunctionId, entry: LexerPosition) 
   // A small script compiles little: preparsing then reparsing the bodies it
   // calls costs more than it saves.
   if s.sourceBytes().length < LAZY_MIN_SOURCE { return false }
+  // A helper thread may have preparsed it already (js_preparse_pool).
+  if !Pointer.isNull<u8>(s.pool) && (s.functionAt(child).jsMode & JS_MODE_STRICT) == 0 {
+    match pool.take(&s.*, paramStart) {
+      Option<PoolJob>.Some { value } => { run skipPooled(&mut s, child, entry, value) return true }
+      _ => ()
+    }
+  }
   let saved = s.save()
   // One preparse serves every body of the parse: only its tables' contents
   // change between bodies.
@@ -864,6 +875,53 @@ effect fn skipKnown(s: &mut Parser<'_>, child: FunctionId, entry: LexerPosition,
   holdFree(&mut s, &free)
   let fd = s.functionAtMut(child)
   fd.lazy = true fd.lazyFree = move free fd.lazyBodies = move bodies fd.lazyBodyFree = move bodyFree
+  fd.lazyLevel = level fd.lazyFreeHeld = true
+  fd.lazyEntry = entry.offset fd.lazyEntryLineFeed = entry.gotLineFeed
+  drop fd
+  recycleStubCode(&mut s, child)
+  run s.seek(LexerPosition { offset: record.end, gotLineFeed: record.endLineFeed })
+}
+
+/// skipBody from a helper's job: skipKnown over its records, whose names are
+/// source spans to intern here.
+effect fn skipPooled(s: &mut Parser<'_>, child: FunctionId, entry: LexerPosition, job: PoolJob) -> ()
+  ! ParserStackOverflow | LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let anchor = ()
+  let bodies = unsafe Pointer.borrowMany<(), LazyBody>(&anchor, unsafe Intrinsic.pointerRequalify<?[*]const LazyBody, [*]const LazyBody>(job.bodies), job.bodyCount)
+  let names = unsafe Pointer.borrowMany<(), SpanName>(&anchor, unsafe Intrinsic.pointerRequalify<?[*]const SpanName, [*]const SpanName>(job.names), job.nameCount)
+  let record = bodies[0]
+  let level = scope(&s.*)
+  let mut free = List<LazyName>.make()
+  run free.reserveExact(u32.toUsize(record.freeCount))
+  let mut i = u32.toUsize(record.freeStart)
+  while i < u32.toUsize(record.freeStart + record.freeCount) {
+    let name = names[i]
+    let atom = run s.spanAtom(u32.toUsize(name.start), u32.toUsize(name.length))
+    run free.append(LazyName { name: atom, depth: name.depth })
+    i = i + 1
+  }
+  let mut inner = List<LazyBody>.make() let mut bodyFree = List<LazyName>.make()
+  run inner.reserveExact(bodies.length - 1)
+  let mut next: usize = 1
+  while next < bodies.length {
+    let mut body = bodies[next]
+    let from = u32.toUsize(body.freeStart)
+    body.freeStart = usize.toU32(bodyFree.length())
+    let mut j = from
+    while j < from + u32.toUsize(body.freeCount) {
+      let name = names[j]
+      let atom = run s.spanAtom(u32.toUsize(name.start), u32.toUsize(name.length))
+      // The stub owns its own references to these names.
+      let rt = s.runtimeState()
+      run bodyFree.append(LazyName { name: rt.atoms.duplicate(atom), depth: name.depth })
+      j = j + 1
+    }
+    run inner.append(body)
+    next = next + 1
+  }
+  holdFree(&mut s, &free)
+  let fd = s.functionAtMut(child)
+  fd.lazy = true fd.lazyFree = move free fd.lazyBodies = move inner fd.lazyBodyFree = move bodyFree
   fd.lazyLevel = level fd.lazyFreeHeld = true
   fd.lazyEntry = entry.offset fd.lazyEntryLineFeed = entry.gotLineFeed
   drop fd
