@@ -204,7 +204,7 @@ pub effect fn emitBranch(fd: &mut FunctionDef, table: &mut AtomTable, bytes: &[u
     size = 1 emitted = i32.toU8(opcode(op.OP_if_false8) + opcode(code) - opcode(op.OP_if_false))
   } else if wordFits && code == op.OP_goto { size = 2 emitted = op.OP_goto16 }
   let nullish = fd.nullishEnd == usize.toI32(out.length()) && (code == op.OP_if_false || code == op.OP_if_true)
-  run fd.jumps.append(JumpSlot { opcode: opcode(emitted), size: size, position: at, label: label, nullish: nullish })
+  run fd.jumps.append(JumpSlot { opcode: opcode(emitted), size: size, position: at, label: label, nullish: nullish, removed: 0 })
   run out.append(emitted)
   if size == 1 { if forward { diff = 0 } run out.append(u32.toU8(unsignedWord(diff) & 255)) }
   else if size == 2 { if forward { diff = 0 } run out.writeU16(u32.toU16(unsignedWord(diff) & 65535)) }
@@ -221,19 +221,38 @@ pub effect fn emitWith(fd: &mut FunctionDef, bytes: &[u8], out: &mut ByteBuffer,
   let slot = fd.labels.get(i32.toUsize(label))
   run addPosition(&mut fd, &out.*, line)
   let at = usize.toI32(out.length()) + 5
-  run fd.jumps.append(JumpSlot { opcode: opcode(code), size: 4, position: at, label: label, nullish: false })
+  run fd.jumps.append(JumpSlot { opcode: opcode(code), size: 4, position: at, label: label, nullish: false, removed: 0 })
   run out.append(code) run out.writeU32(atom) run out.writeU32(unsignedWord(slot.address - at))
   if slot.address == -1 { run addRelocation(&mut fd, label, at, 4) }
   run out.append(bytes[pos + 9])
 }
+/// Bytes removed by the shrunk jumps among jumps[0, count) that sit before pc
+/// (in the code before shrinking): the removed total of the last such jump.
+fn removedBefore(fd: &FunctionDef, count: usize, pc: i32) -> i32 {
+  let mut low: usize = 0 let mut high = count
+  while low < high {
+    let middle = (low + high) / 2
+    if fd.jumps.get(middle).position < pc { low = middle + 1 } else { high = middle }
+  }
+  if low == 0 { return 0 }
+  return fd.jumps.get(low - 1).removed
+}
+/// Shortens each goto/if_false/if_true whose target fits a shorter operand,
+/// deciding in jump order as if the code moved after each shrink, then moves the
+/// code and every recorded pc once. Jumps are in code order, so the code an
+/// earlier shrink removed lies before the later jump: a forward distance does
+/// not change and a backward one loses what was removed between target and jump.
 pub fn shrinkJumps(fd: &mut FunctionDef, out: &mut ByteBuffer) -> () {
-  let mut changed = false let mut i: usize = 0
-  while i < fd.jumps.length() {
+  let count = fd.jumps.length()
+  let mut total: i32 = 0 let mut i: usize = 0
+  while i < count {
     let mut jump = fd.jumps.get(i) let code = i32.toU8(jump.opcode)
     if code == op.OP_goto16 || code == op.OP_if_false || code == op.OP_if_true || code == op.OP_goto {
       let mut delta: i32 = 3
       if code == op.OP_goto16 { delta = 1 }
-      let diff = fd.labels.get(i32.toUsize(jump.label)).address - jump.position
+      let address = fd.labels.get(i32.toUsize(jump.label)).address
+      let mut diff = address - jump.position
+      if address < jump.position { diff = diff + total - removedBefore(&fd.*, i, address) }
       let mut shrink = false
       if diff >= -128 && diff <= 127 + delta {
         jump.size = 1
@@ -245,48 +264,68 @@ pub fn shrinkJumps(fd: &mut FunctionDef, out: &mut ByteBuffer) -> () {
       }
       if shrink {
         out.set(i32.toUsize(jump.position - 1), i32.toU8(jump.opcode))
-        let mut at = i32.toUsize(jump.position + jump.size)
-        let removed = i32.toUsize(delta)
-        while at + removed < out.length() { let byte = out.get(at + removed) out.set(at, byte) at = at + 1 }
-        let shorterLength = out.length() - removed
-        out.truncate(shorterLength)
-        fd.jumps.set(i, jump) changed = true
-        let mut j: usize = 0
-        while j < fd.labels.length() {
-          let mut slot = fd.labels.get(j)
-          if slot.address > jump.position { slot.address = slot.address - delta fd.labels.set(j, slot) }
-          j = j + 1
-        }
-        j = i + 1
-        while j < fd.jumps.length() {
-          let mut later = fd.jumps.get(j)
-          if later.position > jump.position { later.position = later.position - delta fd.jumps.set(j, later) }
-          j = j + 1
-        }
-        j = 0
-        while j < fd.lineNumbers.length() {
-          let mut entry = fd.lineNumbers.get(j)
-          if entry.pc > i32.toU32(jump.position) { entry.pc = entry.pc - i32.toU32(delta) fd.lineNumbers.set(j, entry) }
-          j = j + 1
-        }
-        j = 0
-        while j < fd.callSiteSources.length() {
-          let mut entry = fd.callSiteSources.get(j)
-          if entry.pc > i32.toU32(jump.position) { entry.pc = entry.pc - i32.toU32(delta) fd.callSiteSources.set(j, entry) }
-          j = j + 1
-        }
-        fd.debuggerMetadata.shrink(i32.toU32(jump.position), i32.toU32(delta))
+        fd.debuggerMetadata.shrink(i32.toU32(jump.position - total), i32.toU32(delta))
+        total = total + delta
       }
+    }
+    jump.removed = total
+    fd.jumps.set(i, jump)
+    i = i + 1
+  }
+  if total == 0 { return () }
+  // Move the code once: each shrunk jump drops the tail of its old operand.
+  let mut write: usize = 0 let mut read: usize = 0 let mut before: i32 = 0
+  let bytes = out.asMutSlice()
+  i = 0
+  while i < count {
+    let jump = fd.jumps.get(i)
+    let delta = jump.removed - before
+    if delta != 0 {
+      let cut = i32.toUsize(jump.position + jump.size)
+      if write == read { write = cut read = cut }
+      else { while read < cut { bytes[write] = bytes[read] write = write + 1 read = read + 1 } }
+      read = read + i32.toUsize(delta)
+      before = jump.removed
     }
     i = i + 1
   }
-  if changed {
-    i = 0
-    while i < fd.jumps.length() {
-      let jump = fd.jumps.get(i)
-      patchDisplacement(&mut out, jump.position, jump.size, fd.labels.get(i32.toUsize(jump.label)).address - jump.position)
-      i = i + 1
-    }
+  while read < bytes.length { bytes[write] = bytes[read] write = write + 1 read = read + 1 }
+  out.truncate(write)
+  // Every pc after a shrunk jump moves back by what was removed before it.
+  let mut j: usize = 0
+  while j < fd.labels.length() {
+    let mut slot = fd.labels.get(j)
+    if slot.address >= 0 { slot.address = slot.address - removedBefore(&fd.*, count, slot.address) fd.labels.set(j, slot) }
+    j = j + 1
+  }
+  j = 0 let mut k: usize = 0
+  while j < fd.lineNumbers.length() {
+    let mut entry = fd.lineNumbers.get(j)
+    while k < count && u32.toI32(entry.pc) > fd.jumps.get(k).position { k = k + 1 }
+    if k > 0 { entry.pc = entry.pc - i32.toU32(fd.jumps.get(k - 1).removed) fd.lineNumbers.set(j, entry) }
+    j = j + 1
+  }
+  j = 0 k = 0
+  while j < fd.callSiteSources.length() {
+    let mut entry = fd.callSiteSources.get(j)
+    while k < count && u32.toI32(entry.pc) > fd.jumps.get(k).position { k = k + 1 }
+    if k > 0 { entry.pc = entry.pc - i32.toU32(fd.jumps.get(k - 1).removed) fd.callSiteSources.set(j, entry) }
+    j = j + 1
+  }
+  // A jump moves by what earlier jumps removed; then its displacement is final.
+  i = 0 before = 0
+  while i < count {
+    let mut jump = fd.jumps.get(i)
+    let removed = jump.removed
+    jump.position = jump.position - before jump.removed = 0
+    fd.jumps.set(i, jump) before = removed
+    i = i + 1
+  }
+  i = 0
+  while i < count {
+    let jump = fd.jumps.get(i)
+    patchDisplacement(&mut out, jump.position, jump.size, fd.labels.get(i32.toUsize(jump.label)).address - jump.position)
+    i = i + 1
   }
 }
 // Turns is_undefined_or_null, if_true8 d into if_nullish8, pad, d (and if_false8
