@@ -3,6 +3,7 @@
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
+import silk.collections.slice { Slice }
 import silk.num.i32
 import silk.num.u16
 import silk.num.u32
@@ -274,10 +275,73 @@ fn mayOpenArrowParameters(s: &Parser<'_>) -> bool {
   return next == 41 || next == tok.TOK_IDENT || next == tok.TOK_OF || next == 91 || next == 123 || next == 46
 }
 
+/// The error a literal held back because a pattern allows it: coverError's kinds.
+pub const COVER_EXPECT_BRACE: u8 = 1
+pub const COVER_DUPLICATE_PROTO: u8 = 2
+fn coverMessage(kind: u8) -> &'static [u8] {
+  if kind == COVER_DUPLICATE_PROTO { return b"duplicate __proto__ property name" }
+  return b"expecting '}'"
+}
+/// Where the code stood before a speculative literal, for rewinding it.
+struct CodeMark { length: usize, lastOpcode: i32, lastSource: u32, labels: usize, calls: usize }
+fn codeMark(s: &Parser<'_>) -> CodeMark {
+  let fd = s.functionView()
+  return CodeMark { length: fd.bytecode.length(), lastOpcode: fd.lastOpcodePosition, lastSource: fd.lastOpcodeSourcePosition,
+    labels: fd.labels.length(), calls: fd.callSiteSources.length() }
+}
+/// Drops the code a speculative literal emitted (its atom operands released).
+/// Functions it defined stay in the constant pool unreferenced.
+effect fn rewindCode(s: &mut Parser<'_>, mark: &CodeMark) -> () ! OutOfMemoryError ? &mut Allocator {
+  let cells = s.cells() let fd = move cells.function let rt = move cells.runtime
+  if fd.bytecodeError { fail OutOfMemoryError {} }
+  emit.freeBytecodeAtoms(&mut rt.atoms, Slice.view<u8>(fd.bytecode.asSlice(), mark.length, fd.bytecode.length() - mark.length), false)
+  fd.bytecode.truncate(mark.length)
+  fd.lastOpcodePosition = mark.lastOpcode fd.lastOpcodeSourcePosition = mark.lastSource
+  fd.labels.truncate(mark.labels) fd.callSiteSources.truncate(mark.calls)
+}
+/// The object or array literal at the current token, parsed as an expression
+/// before knowing whether it is an assignment pattern. When the conditional
+/// expression it starts is the literal alone and `=` follows, the code goes and
+/// the pattern is parsed from the literal again: returns true. Errors only a
+/// pattern allows (`{a = 1}`, a second __proto__) are held back meanwhile and
+/// reported when no `=` follows, or passed to an enclosing literal this one may
+/// be an element of.
+effect fn parseSpeculativeLiteral<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'_>, hooks: &mut H, memory: &AllocationObserver, flags: i32) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException ? &mut Allocator {
+  let saved = s.save() let start = s.token.start
+  let mark = codeMark(&s.*)
+  let mut outer = s.coverError let mut outerKind = s.coverErrorKind
+  s.coverError = 0 s.speculation = s.speculation + 1
+  run parseConditional(&mut s, &mut hooks, memory, flags)
+  s.speculation = s.speculation - 1
+  let whole = s.literalStart == start && s.literalNext == s.token.start
+  if whole && s.token.kind == 61 {
+    s.coverError = outer s.coverErrorKind = outerKind
+    run rewindCode(&mut s, &mark)
+    run s.seek(saved)
+    let look = run s.skipParens(false)
+    if look.kind == 61 {
+      let _initialized = run parseDestructuring(&mut s, &mut hooks, memory, 0, false, false, u32.toI32(look.bits & SKIP_HAS_ELLIPSIS), true, false)
+      return true
+    }
+    run parseConditional(&mut s, &mut hooks, memory, flags)
+    return false
+  }
+  if s.coverError != 0 {
+    if !(whole && s.speculation > 0) {
+      let offset = s.coverError - 1 let kind = s.coverErrorKind
+      return run s.syntaxAt<bool>(offset, coverMessage(kind))
+    }
+    if outer == 0 { outer = s.coverError outerKind = s.coverErrorKind }
+  }
+  s.coverError = outer s.coverErrorKind = outerKind
+  return false
+}
 pub effect fn parseAssignment<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'_>, hooks: &mut H, memory: &AllocationObserver, flags: i32) -> ()
   ! OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException ? &mut Allocator {
   run s.checkStack()
   if s.token.kind == tok.TOK_YIELD { return run parseYield(&mut s, &mut hooks, memory, flags) }
+  let mut speculative = false
   if s.token.kind == 40 && mayOpenArrowParameters(&s.*) && !s.notArrowHead() {
     let ahead = run s.bracketAhead(true)
     let mut arrow = ahead == 1
@@ -310,18 +374,25 @@ pub effect fn parseAssignment<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parse
     let _child = run parseFunction(&mut s, &mut hooks, memory, ParseFunctionKind.Arrow, FunctionKind.Normal, 0, Option<usize>.some(start), ParseExportKind.None)
     return ()
   } else if (s.token.kind == 123 && !run s.literalObjectStart()) || s.token.kind == 91 {
-    // Only a pattern needs the span's bits, which skipParens finds.
-    let ahead = run s.bracketAhead(false)
-    let mut look = SkipParensResult { kind: 0, bits: 0 }
-    if ahead != 0 { look = run s.skipParens(false) }
-    if look.kind == 61 {
-      let _initialized = run parseDestructuring(&mut s, &mut hooks, memory, 0, false, false, u32.toI32(look.bits & SKIP_HAS_ELLIPSIS), true, false)
-      return ()
+    let fd = s.functionView() let debug = fd.debuggerMetadata.enabled drop fd
+    // A literal is far more common than a pattern: parse it as one, and
+    // rewind if `=` follows it (parseSpeculativeLiteral).
+    speculative = !debug
+    if debug {
+      // Only a pattern needs the span's bits, which skipParens finds.
+      let ahead = run s.bracketAhead(false)
+      let mut look = SkipParensResult { kind: 0, bits: 0 }
+      if ahead != 0 { look = run s.skipParens(false) }
+      if look.kind == 61 {
+        let _initialized = run parseDestructuring(&mut s, &mut hooks, memory, 0, false, false, u32.toI32(look.bits & SKIP_HAS_ELLIPSIS), true, false)
+        return ()
+      }
     }
   }
   // Keep the identifier alive across token replacement and recursive parsing.
   let name0 = e.ownedToken(&mut s)
-  run parseConditional(&mut s, &mut hooks, memory, flags)
+  if speculative { if run parseSpeculativeLiteral(&mut s, &mut hooks, memory, flags) { return () } }
+  else { run parseConditional(&mut s, &mut hooks, memory, flags) }
   let operator = s.token.kind
   if operator == 61 || (operator >= tok.TOK_MUL_ASSIGN && operator <= tok.TOK_POW_ASSIGN) {
     let start = s.token.start
@@ -665,8 +736,12 @@ effect fn parsePostfixInline<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser
       let level = scope(&s.*)
       run variable(&mut s, name.get(), level)
     }
-  } else if token == 123 { run literal.parseObjectLiteral(&mut s, &mut hooks, memory) }
-  else if token == 91 { run literal.parseArrayLiteral(&mut s, &mut hooks, memory) }
+  } else if token == 123 || token == 91 {
+    let literalStart = s.token.start
+    if token == 123 { run literal.parseObjectLiteral(&mut s, &mut hooks, memory) }
+    else { run literal.parseArrayLiteral(&mut s, &mut hooks, memory) }
+    s.literalStart = literalStart s.literalNext = s.token.start
+  }
   else { return run parseKeywordPostfix(&mut s, &mut hooks, memory, flags) }
   return run parsePostfixTail(&mut s, &mut hooks, memory, flags, 0, acceptCall, calleePosition)
 }
