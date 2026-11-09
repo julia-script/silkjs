@@ -1,0 +1,183 @@
+//! Opt-in compiled-script cache shared by every runtime of one embedding.
+//!
+//! A global script compiled once is kept as serialized bytecode (the
+//! js_binary_object_writer wire, lazy functions finished) under its exact
+//! source, filename and compile flags. A later compile of the same script, in
+//! any realm or worker of the embedding, decodes that bytecode instead of
+//! parsing and compiling again. The key is the whole script text, so any change
+//! to the text misses.
+//!
+//! Off unless an embedder makes one with enabled(); the CLI turns it on only
+//! with --code-cache. Benchmarks never pass that flag.
+//!
+//! Entries are only ever appended and are never changed or removed while any
+//! clone of the cache lives, so a found entry's bytes stay readable after the
+//! lock is released. The lists are allocated from the system allocator, never
+//! from a runtime's, because they outlive the runtime that stored them.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.collections.list { List }
+import silk.concurrency.sync { Arc, Mutex }
+import silk.concurrency.thread { Transferable, Concurrent }
+import silk.mem.pointer { Pointer }
+import silk.core.ownership { Copy }
+import silk.num.u8
+import silk.num.u64
+import silk.num.i32
+import silk.num.usize
+import byte_buffer { readU64 }
+
+/// Stored bytecode stops being added past this many bytes in total.
+pub const DEFAULT_BUDGET: usize = 268435456
+/// Recently missed script hashes, direct-mapped: a script is stored only on
+/// its second compile, so a script loaded once never pays for serializing.
+const SEEN_SLOTS: usize = 4096
+
+struct Entry { hash: u64, flags: i32, source: List<u8>, filename: List<u8>, bytecode: List<u8> }
+struct Table { entries: List<Entry>, seen: List<u64>, bytes: usize, budget: usize, hits: u64, misses: u64 }
+impl Transferable for Table {}
+
+/// A found entry's bytecode: readable for as long as the cache it came from.
+pub struct Found { pub data: *const u8, pub length: usize }
+impl Copy for Found {}
+
+pub struct Counts { pub hits: u64, pub misses: u64 }
+impl Copy for Counts {}
+
+pub struct CodeCache { shared: Option<Arc<Mutex<Table>>> }
+impl Transferable for CodeCache {}
+impl Concurrent for CodeCache {}
+
+/// 64-bit multiply-xorshift hash over 8-byte words; only buckets candidates,
+/// every match is confirmed by comparing the whole key.
+fn hashKey(source: &[u8], filename: &[u8], flags: i32) -> u64 {
+  let mut h: u64 = u64.wrappingMultiply(usize.toU64(source.length) ^ 0x9e3779b97f4a7c15, 0xff51afd7ed558ccd)
+  h = h ^ u64.wrappingMultiply(i32.wrappingToU64(flags), 0xc4ceb9fe1a85ec53)
+  let mut index: usize = 0
+  while index + 8 <= source.length {
+    h = u64.wrappingMultiply(h ^ readU64(source, index), 0x9e3779b97f4a7c15)
+    h = h ^ u64.shiftRight(h, 29)
+    index = index + 8
+  }
+  while index < source.length {
+    h = u64.wrappingMultiply(h ^ u8.toU64(source[index]), 0x9e3779b97f4a7c15)
+    index = index + 1
+  }
+  index = 0
+  while index < filename.length {
+    h = u64.wrappingMultiply(h ^ u8.toU64(filename[index]), 0xff51afd7ed558ccd)
+    index = index + 1
+  }
+  return h ^ u64.shiftRight(h, 32)
+}
+
+impl CodeCache {
+  /// No cache: every compile runs in full.
+  pub fn disabled() -> Self { return Self { shared: Option<Arc<Mutex<Table>>>.none() } }
+  pub effect fn enabled(budget: usize) -> Self ! OutOfMemoryError {
+    let mut system = Allocator.systemAllocatorProvider()
+    let mut seen = List<u64>.make()
+    run seen.appendRepeated(0, SEEN_SLOTS) |> Effect.provideMut<Allocator>(&mut system)
+    let table = Table { entries: List<Entry>.make(), seen: move seen, bytes: 0, budget: budget, hits: 0, misses: 0 }
+    let lock = run Mutex<Table>.make(move table) |> Effect.provideMut<Allocator>(&mut system)
+    let shared = run Arc<Mutex<Table>>.make(move lock) |> Effect.provideMut<Allocator>(&mut system)
+    return Self { shared: Option<Arc<Mutex<Table>>>.some(move shared) }
+  }
+  pub fn clone(self: &Self) -> Self {
+    return match &self.shared {
+      Option<Arc<Mutex<Table>>>.Some { value } => Self { shared: Option<Arc<Mutex<Table>>>.some(value.clone()) }
+      _ => CodeCache.disabled()
+    }
+  }
+  pub fn isEnabled(self: &Self) -> bool { return self.shared.isSome() }
+
+  /// The bytecode stored for exactly this script, if any. A miss notes the
+  /// script, so that store keeps it the next time it is compiled.
+  pub fn find(self: &Self, source: &[u8], filename: &[u8], flags: i32) -> Option<Found> {
+    match &self.shared {
+      Option<Arc<Mutex<Table>>>.Some { value } => { return findIn(&value, hashKey(source, filename, flags), source, filename, flags) }
+      _ => { return Option<Found>.none() }
+    }
+  }
+}
+
+fn findIn(shared: &Arc<Mutex<Table>>, hash: u64, source: &[u8], filename: &[u8], flags: i32) -> Option<Found> {
+  let mut guard = shared.get().lock()
+  let table = guard.getMut()
+  let entries = table.entries.asSlice()
+  let mut index: usize = 0
+  while index < entries.length {
+    let entry = &entries[index]
+    if entry.hash == hash && entry.flags == flags && entry.source.asSlice() == source && entry.filename.asSlice() == filename {
+      table.hits = table.hits + 1
+      let bytes = entry.bytecode.asSlice()
+      return Option<Found>.some(Found { data: Pointer.fromRef<u8>(&bytes[0]), length: bytes.length })
+    }
+    index = index + 1
+  }
+  table.misses = table.misses + 1
+  // The second miss of a hash leaves it in place for store to see.
+  let slot = u64.toUsize(hash & usize.toU64(SEEN_SLOTS - 1))
+  if table.seen.get(slot) == hash { table.seen.set(slot, hash ^ 1) } else { table.seen.set(slot, hash) }
+  return Option<Found>.none()
+}
+
+impl CodeCache {
+  /// Whether a store of this script would be kept: its last find was its
+  /// second miss. Callers check this before serializing anything.
+  pub fn wants(self: &Self, source: &[u8], filename: &[u8], flags: i32) -> bool {
+    match &self.shared {
+      Option<Arc<Mutex<Table>>>.Some { value } => { return wanted(&value, hashKey(source, filename, flags)) }
+      _ => { return false }
+    }
+  }
+  /// Keeps bytecode for this script unless it is already stored (another
+  /// runtime may have compiled it meanwhile) or the budget is spent.
+  pub effect fn store(self: &Self, source: &[u8], filename: &[u8], flags: i32, bytecode: &[u8]) -> () ! OutOfMemoryError {
+    if bytecode.length == 0 { return () }
+    match &self.shared {
+      Option<Arc<Mutex<Table>>>.Some { value } => { run storeIn(&value, source, filename, flags, bytecode) }
+      _ => ()
+    }
+  }
+  /// Lookups so far, for tests and diagnostics.
+  pub fn counts(self: &Self) -> Counts {
+    match &self.shared {
+      Option<Arc<Mutex<Table>>>.Some { value } => {
+        let mut guard = value.get().lock()
+        let table = guard.getMut()
+        return Counts { hits: table.hits, misses: table.misses }
+      }
+      _ => { return Counts { hits: 0, misses: 0 } }
+    }
+  }
+}
+
+/// Whether the last find of hash was its second miss in a row.
+fn wanted(shared: &Arc<Mutex<Table>>, hash: u64) -> bool {
+  let mut guard = shared.get().lock()
+  let table = guard.getMut()
+  return table.seen.get(u64.toUsize(hash & usize.toU64(SEEN_SLOTS - 1))) == (hash ^ 1)
+}
+effect fn storeIn(shared: &Arc<Mutex<Table>>, source: &[u8], filename: &[u8], flags: i32, bytecode: &[u8]) -> () ! OutOfMemoryError {
+  let hash = hashKey(source, filename, flags)
+  if !wanted(shared, hash) { return () }
+  let mut system = Allocator.systemAllocatorProvider()
+  let mut entry = Entry { hash: hash, flags: flags, source: List<u8>.make(), filename: List<u8>.make(), bytecode: List<u8>.make() }
+  run entry.source.appendSlice(source) |> Effect.provideMut<Allocator>(&mut system)
+  run entry.filename.appendSlice(filename) |> Effect.provideMut<Allocator>(&mut system)
+  run entry.bytecode.appendSlice(bytecode) |> Effect.provideMut<Allocator>(&mut system)
+  let mut guard = shared.get().lock()
+  let table = guard.getMut()
+  if table.bytes + bytecode.length + source.length > table.budget { return () }
+  let entries = table.entries.asSlice()
+  let mut index: usize = 0
+  while index < entries.length {
+    let other = &entries[index]
+    if other.hash == hash && other.flags == flags && other.source.asSlice() == source && other.filename.asSlice() == filename { return () }
+    index = index + 1
+  }
+  table.bytes = table.bytes + bytecode.length + source.length
+  run table.entries.append(move entry) |> Effect.provideMut<Allocator>(&mut system)
+  }
