@@ -4,7 +4,11 @@
 //! Extension tags 20/21/22 encode u64 buffer/view extents; legacy tags retain
 //! their canonical u32 LEB representation. Cache admission validates the whole
 //! graph before committing module roots, using the runtime's final opcode table.
-import js_compiler_types { PendingFunction }
+import js_compiler_types { PendingFunction, LazyStub, LazyName, LazyBody, FunctionTree, FunctionId }
+import js_compiler_finish { STUB_CODE }
+import silk.collections.slice { Slice }
+import js_strings { Strings }
+import js_string_types { StringOwner }
 import silk.mem.box { Box }
 import js_scopes as scopes
 import js_realm { Realm }
@@ -61,6 +65,9 @@ pub const SAB: u32 = 4
 pub const REFERENCE: u32 = 8
 const CACHE_SCRIPT: u32 = 16
 const CACHE_MODULE: u32 = 32
+/// The code-cache wire (js_binary_object_writer.JS_WRITE_OBJ_LAZY): lazy stubs
+/// and shared source strings. Accepted only from trusted callers.
+pub const LAZY: u32 = 64
 /// Borrowed relocation entry. The decoder clones the buffer's backing owner;
 /// address is the serialized identifier, not necessarily this buffer's address.
 pub struct SharedBacking { pub address: u64, pub buffer: ValueBits }
@@ -70,7 +77,9 @@ struct Reader<'a> {
   activeScriptId: u64,
   activeScriptIsEval: bool,
   trusted: bool, shared: &'a [SharedBacking], leases: &'a [SharedLease], firstAtom: u32,
-  atoms: List<u32>, references: List<ValueBits>, roots: ValueList, modules: List<CellRef<ModuleDef>>
+  atoms: List<u32>, references: List<ValueBits>, roots: ValueList, modules: List<CellRef<ModuleDef>>,
+  /// LAZY: the shared source strings read so far (owned through roots).
+  sources: List<ValueBits>
 }
 fn reference(value: ValueBits) -> *mut HeapHeader {
   return match value { ValueBits.Object { reference } => reference
@@ -455,13 +464,101 @@ effect fn deriveCallFacts(function:CellRef<FunctionBytecode>)->() !OutOfMemoryEr
     b.leaf=leaf
   }
 }
+/// LAZY source text (js_binary_object_writer Writer.sourceText).
+effect fn sourceText<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>)
+  ->Option<SourceText> !OutOfMemoryError|JsException ?&mut Allocator {
+  let kind=run count(&mut r,&mut engine,realm)
+  if kind==0 { return Option<SourceText>.none() }
+  if kind==1 {
+    let length=run count(&mut r,&mut engine,realm) let bytes=run sliceBytes(&mut r,&mut engine,realm,length)
+    return Option<SourceText>.some(SourceText.Owned { bytes:move bytes })
+  }
+  let index=kind-2
+  if index>r.sources.length() { return run error(&mut engine,realm,b"invalid source text index") }
+  if index==r.sources.length() {
+    let length=run count(&mut r,&mut engine,realm) let bytes=run sliceBytes(&mut r,&mut engine,realm,length)
+    let text=run own(&mut r,&mut engine,realm,run Strings.adoptLatin1(move bytes))
+    run r.sources.append(text)
+  }
+  let whole=r.sources.get(index)
+  let start=run count(&mut r,&mut engine,realm) let length=run count(&mut r,&mut engine,realm)
+  let plain=(run byte(&mut r,&mut engine,realm))!=0
+  if start>Strings.length(whole) || length>Strings.length(whole)-start { return run error(&mut engine,realm,b"invalid source text span") }
+  return Option<SourceText>.some(SourceText.Shared { text:StringOwner.borrowed(whole),start:start,length:length,plain:plain })
+}
+/// length bytes copied in one step.
+effect fn sliceBytes<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>,length:usize)
+  ->List<u8> !OutOfMemoryError|JsException ?&mut Allocator {
+  run need(&r.*,&mut engine,realm,length)
+  let mut bytes=List<u8>.make() run bytes.reserveExact(length)
+  run bytes.appendSlice(Slice.view<u8>(r.data,r.position,length)) r.position=r.position+length
+  return move bytes
+}
+effect fn lazyNames<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>,owned:bool)
+  ->List<LazyName> !OutOfMemoryError|JsException ?&mut Allocator {
+  let n=run count(&mut r,&mut engine,realm) run need(&r.*,&mut engine,realm,n)
+  let mut names=List<LazyName>.make() run names.reserveExact(n)
+  let mut i:usize=0
+  while i<n {
+    let mut name=run atom(&mut r,&mut engine,realm)
+    // Free names alias the stub's closure vars, which hold them; bodyFree owns its own.
+    if owned { name=duplicateAtom(&mut engine,realm,name) }
+    let depth=run byte(&mut r,&mut engine,realm)
+    run names.append(LazyName { name:name,depth:depth }) i=i+1
+  }
+  return move names
+}
+/// A stub's PendingFunction and LazyStub (js_binary_object_writer.writeStubDefinition).
+effect fn stubDefinition<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>)
+  ->PendingFunction !OutOfMemoryError|JsException ?&mut Allocator {
+  let start=run count(&mut r,&mut engine,realm)
+  let line=signed(run leb(&mut r,&mut engine,realm)) let column=signed(run leb(&mut r,&mut engine,realm))
+  let ecmaLine=signed(run leb(&mut r,&mut engine,realm)) let ecmaColumn=signed(run leb(&mut r,&mut engine,realm))
+  let slots=run lebU16(&mut r,&mut engine,realm) let varSlots=run lebU16(&mut r,&mut engine,realm)
+  let parameterCount=run count(&mut r,&mut engine,realm) run need(&r.*,&mut engine,realm,parameterCount)
+  let mut parameters=List<u32>.make() run parameters.reserveExact(parameterCount)
+  let mut i:usize=0
+  while i<parameterCount { run parameters.append(run leb(&mut r,&mut engine,realm)) i=i+1 }
+  let variableCount=run count(&mut r,&mut engine,realm) run need(&r.*,&mut engine,realm,variableCount)
+  let mut variables=List<u16>.make() run variables.reserveExact(variableCount)
+  i=0
+  while i<variableCount { run variables.append(run lebU16(&mut r,&mut engine,realm)) i=i+1 }
+  let fileAtom=run atom(&mut r,&mut engine,realm) let filename=duplicateAtom(&mut engine,realm,fileAtom)
+  let bits=run byte(&mut r,&mut engine,realm)
+  let mode=run byte(&mut r,&mut engine,realm)
+  let sourcePosition=run leb(&mut r,&mut engine,realm)
+  let entry=run count(&mut r,&mut engine,realm)
+  let source=run sourceText(&mut r,&mut engine,realm)
+  let shared=match &source { Option<SourceText>.Some { value }=>match &value { SourceText.Shared { .. }=>true _=>false } _=>false }
+  let free=run lazyNames(&mut r,&mut engine,realm,false)
+  let bodyCount=run count(&mut r,&mut engine,realm) run need(&r.*,&mut engine,realm,bodyCount)
+  let mut bodies=List<LazyBody>.make() run bodies.reserveExact(bodyCount)
+  i=0
+  while i<bodyCount {
+    let bodyStart=run count(&mut r,&mut engine,realm) let end=run count(&mut r,&mut engine,realm)
+    let endLineFeed=(run byte(&mut r,&mut engine,realm))!=0
+    let freeStart=run leb(&mut r,&mut engine,realm) let freeCount=run leb(&mut r,&mut engine,realm)
+    run bodies.append(LazyBody { bodyStart:bodyStart,end:end,endLineFeed:endLineFeed,freeStart:freeStart,freeCount:freeCount }) i=i+1
+  }
+  let bodyFree=run lazyNames(&mut r,&mut engine,realm,true)
+  let mut stub=LazyStub { context:realm.context(),runtime:realm.runtime(),source:move source,filename:filename,
+    scriptId:r.activeScriptId,scriptIsEval:(bits&1)!=0,nodeVmDiagnostics:(bits&2)!=0,mode:mode,
+    sourcePosition:sourcePosition,entry:entry,entryLineFeed:(bits&4)!=0,
+    free:move free,bodies:move bodies,bodyFree:move bodyFree }
+  // finishLazy reparses from the whole script text.
+  if !shared { stub.release() return run error(&mut engine,realm,b"lazy stub without shared source") }
+  return PendingFunction { tree:FunctionTree.make(),cell:FunctionId.placeholder(),start:start,line:line,column:column,
+    ecmaLine:ecmaLine,ecmaColumn:ecmaColumn,slots:slots,varSlots:varSlots,parameters:move parameters,variables:move variables,
+    lazy:Option<LazyStub>.some(move stub) }
+}
 effect fn readFunction<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>)
   ->ValueBits !OutOfMemoryError|JsException|StringLengthError|BigIntError ?&mut Allocator { let context=realm.context()
   // Recursive constants share a fresh compilation identity, never a filename identity.
   let previousScriptId = r.activeScriptId
   if previousScriptId == 0 { r.activeScriptId = unsafe runtime.allocateScriptId(realm.runtime()) }
   let flags=u64.toU16(run fixed(&mut r,&mut engine,realm,2))
-  if (flags&0xe000)!=0 { return run error(&mut engine,realm,b"invalid function flags") }
+  if (flags&0xc000)!=0 || ((flags&8192)!=0 && (r.flags&LAZY)==0) { return run error(&mut engine,realm,b"invalid function flags") }
+  let stub=(flags&8192)!=0
   let previousScriptIsEval = r.activeScriptIsEval
   if previousScriptId == 0 { r.activeScriptIsEval = (flags & 2048) != 0 }
   let mode=run byte(&mut r,&mut engine,realm) let name=run atom(&mut r,&mut engine,realm)
@@ -537,7 +634,12 @@ effect fn readFunction<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut 
   while scoped<closures && compacted.closureVars.get(closures-1-scoped).kind==ClosureKind.Scope { scoped=scoped+1 }
   compacted.scopeCaptures=usize.toU16(scoped) drop compacted
   run readCode(&mut r,&mut engine,realm,code,codeLength)
-  if r.trusted { run deriveCallFacts(code) }
+  if stub {
+    // The stub's placeholder: one shared static invalid opcode, as js_compiler_finish.defer makes it.
+    let placeholder=code.getMut(&mut anchor)
+    placeholder.code=ByteStorage.Borrowed { data:Pointer.fromRef<u8>(&STUB_CODE[0]),length:1 }
+    placeholder.frameCells=scopes.inlineFrameCells(varc,stack,refs,0)
+  } else if r.trusted { run deriveCallFacts(code) }
   if (flags&1024)!=0 {
     let filename=run atom(&mut r,&mut engine,realm)
     let b=code.getMut(&mut anchor)
@@ -549,11 +651,17 @@ effect fn readFunction<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut 
     let lineBytes=run copiedBytes(&mut r,&mut engine,realm,lines)
     let linesDebug=code.getMut(&mut anchor)
     match &mut linesDebug.debug { Option<FunctionDebugInfo>.Some { value:debug }=>{ debug.pcToLine=ByteStorage.Owned { bytes:move lineBytes } } _=>() } drop linesDebug
-    let source=run count(&mut r,&mut engine,realm)
-    if source!=0 {
-      let sourceBytes=run copiedBytes(&mut r,&mut engine,realm,source)
+    if (r.flags&LAZY)!=0 {
+      let text=run sourceText(&mut r,&mut engine,realm)
       let b=code.getMut(&mut anchor)
-      match &mut b.debug { Option<FunctionDebugInfo>.Some { value:debug }=>{ debug.source=Option<SourceText>.some(SourceText.Owned { bytes:move sourceBytes }) } _=>() }
+      match &mut b.debug { Option<FunctionDebugInfo>.Some { value:debug }=>{ debug.source=move text } _=>() }
+    } else {
+      let source=run count(&mut r,&mut engine,realm)
+      if source!=0 {
+        let sourceBytes=run copiedBytes(&mut r,&mut engine,realm,source)
+        let b=code.getMut(&mut anchor)
+        match &mut b.debug { Option<FunctionDebugInfo>.Some { value:debug }=>{ debug.source=Option<SourceText>.some(SourceText.Owned { bytes:move sourceBytes }) } _=>() }
+      }
     }
   }
   i=0
@@ -561,6 +669,11 @@ effect fn readFunction<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut 
     let child=run readValue(&mut r,&mut engine,realm)
     let b=code.getMut(&mut anchor)
     run b.constants.append(unsafe child.retained()) i=i+1
+  }
+  if stub {
+    let pending=run stubDefinition(&mut r,&mut engine,realm)
+    let b=code.getMut(&mut anchor)
+    b.pending=Option<Box<PendingFunction>>.some(run Box<PendingFunction>.make(move pending))
   }
   r.activeScriptId = previousScriptId
   r.activeScriptIsEval = previousScriptIsEval
@@ -668,7 +781,8 @@ effect fn decodeBytes<'a,'b,'m,S:EngineServices>(engine:&mut Engine<'m,S>,realm:
   let mut r=Reader { data:bytes,length:length,position:0,flags:flags,rom:(flags&ROM_DATA)!=0,
     activeScriptId:0,activeScriptIsEval:false,
     trusted:trusted,shared:shared,leases:leases,firstAtom:first,atoms:List<u32>.make(),references:List<ValueBits>.make(),
-    roots:ValueList.make(),modules:List<CellRef<ModuleDef>>.make() }
+    roots:ValueList.make(),modules:List<CellRef<ModuleDef>>.make(),sources:List<ValueBits>.make() }
+  if (flags&LAZY)!=0 && !trusted { return run error(&mut engine,realm,b"lazy bytecode requires a trusted read") }
   let decoded=run Effect.result(body(&mut r,&mut engine,realm))
   let failed=match &decoded { Result<ValueBits,OutOfMemoryError|JsException|StringLengthError|BigIntError>.Failure {..}=>true _=>false }
   let rt=realm.runtime()

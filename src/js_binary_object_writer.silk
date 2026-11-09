@@ -37,6 +37,9 @@ import js_exceptions { JsException }
 import js_atoms { AtomTable }
 import js_string_types { StringOwner, StringLengthError, AtomKind }
 import js_strings { Strings }
+import js_string_types { latin1Bytes, stringReference }
+import js_compiler_types { PendingFunction, LazyStub, LazyName }
+import silk.collections.slice { Slice }
 import js_bigint { BigInt, ShortLimbs }
 import js_runtime as runtime
 import js_errors as errors
@@ -53,6 +56,10 @@ pub const JS_WRITE_OBJ_BYTECODE: u32 = 1
 pub const JS_WRITE_OBJ_BSWAP: u32 = 2
 pub const JS_WRITE_OBJ_SAB: u32 = 4
 pub const JS_WRITE_OBJ_REFERENCE: u32 = 8
+/// SilkJS code-cache wire (js_code_cache), never written for bjson or qjsc:
+/// lazy functions are written unfinished, as their stubs, and every function's
+/// source text names one copy of its script's text instead of carrying its own.
+pub const JS_WRITE_OBJ_LAZY: u32 = 64
 pub struct SharedEntry { pub address: *mut u8, pub buffer: ValueBits }
 impl Copy for SharedEntry {}
 pub struct SharedLease { pub address: u64, pub lease: buffers.BufferLease }
@@ -64,7 +71,9 @@ struct ObjectEntry { object: *mut HeapHeader, next: u32 }
 impl Copy for ObjectEntry {}
 struct Writer {
   bytes: List<u8>, shared: List<SharedEntry>, atomMap: List<u32>, atomList: List<u32>,
-  objects: List<ObjectEntry>, buckets: List<u32>, firstAtom: u32, flags: u32
+  objects: List<ObjectEntry>, buckets: List<u32>, firstAtom: u32, flags: u32,
+  /// JS_WRITE_OBJ_LAZY: the shared source strings written so far, by address.
+  sources: List<usize>
 }
 fn boolean(value: bool) -> u32 { if value { return 1 } return 0 }
 fn hash(object: *mut HeapHeader, size: usize) -> usize {
@@ -76,7 +85,7 @@ impl Writer {
     if (flags & JS_WRITE_OBJ_BYTECODE) != 0 { first = atoms.JS_ATOM_END }
     return Self { bytes: List<u8>.make(), shared: List<SharedEntry>.make(),
       atomMap: List<u32>.make(), atomList: List<u32>.make(), objects: List<ObjectEntry>.make(),
-      buckets: List<u32>.make(), firstAtom: first, flags: flags }
+      buckets: List<u32>.make(), firstAtom: first, flags: flags, sources: List<usize>.make() }
   }
   effect fn byte(self: &mut Self, value: u8) -> () ! OutOfMemoryError ? &mut Allocator {
     run self.bytes.append(value)
@@ -119,6 +128,33 @@ impl Writer {
     else {
       let mapped = run self.atomIndex(atom)
       run self.leb(u32.shiftLeft(mapped, 1))
+    }
+  }
+  /// JS_WRITE_OBJ_LAZY source text: 0 for none; 1 then the bytes of an owned
+  /// text; 2 + n for a span of shared string n, whose text follows its first use.
+  effect fn sourceText(self: &mut Self, text: &Option<SourceText>) -> () ! OutOfMemoryError ? &mut Allocator {
+    match &text.* {
+      Option<SourceText>.Some { value } => match &value {
+        SourceText.Shared { text: whole, start, length, plain } => {
+          let string = whole.get()
+          let address = Pointer.address<HeapHeader>(stringReference(string))
+          let mut index: usize = 0
+          while index < self.sources.length() && self.sources.get(index) != address { index = index + 1 }
+          run self.leb(usize.toU32(index + 2))
+          if index == self.sources.length() {
+            run self.sources.append(address)
+            let anchor = ()
+            let bytes = Slice.view<u8>(unsafe latin1Bytes(&anchor, stringReference(string)), 0, Strings.length(string))
+            run self.leb(usize.toU32(bytes.length))
+            run self.bytes.appendSlice(bytes)
+          }
+          run self.leb(usize.toU32(start)) run self.leb(usize.toU32(length)) run self.byte(u32.toU8(boolean(plain)))
+        }
+        SourceText.Owned { bytes } => {
+          run self.leb(1) run self.leb(usize.toU32(bytes.length())) run self.bytes.appendSlice(bytes.asSlice())
+        }
+      }
+      Option<SourceText>.None => { run self.leb(0) }
     }
   }
   fn findObject(self: &Self, object: *mut HeapHeader) -> u32 {
@@ -424,12 +460,16 @@ effect fn writeCode<'a, 'm, S: EngineServices>(state: &mut Writer, engine: &mut 
   }
 }
 unsafe effect fn writeFunction<'a, 'm, S: EngineServices>(state: &mut Writer, engine: &mut Engine<'m, S>,realm: Realm<'a>, reference: *mut HeapHeader) -> () ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
-  // A function whose compile waits for its first call is written finished.
-  if unsafe compilerFinish.lazyStub(reference) {
+  let lazy = (state.flags & JS_WRITE_OBJ_LAZY) != 0
+  // A function whose compile waits for its first call is written finished,
+  // except on the code-cache wire, which keeps it a stub.
+  let stub = unsafe compilerFinish.lazyStub(reference)
+  let keepStub = stub && lazy
+  if stub && !keepStub {
     let memory = engine.memory
     run unsafe compilerLazy.finishLazy(&mut engine, memory, reference)
   }
-  run unsafe compilerFinish.finish(&mut engine, reference)
+  if !keepStub { run unsafe compilerFinish.finish(&mut engine, reference) }
   let anchor = () let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference)
   run state.byte(12)
   let kind: u32 = match function.kind {
@@ -444,7 +484,8 @@ unsafe effect fn writeFunction<'a, 'm, S: EngineServices>(state: &mut Writer, en
     u32.shiftLeft(kind, 4) | u32.shiftLeft(boolean(function.newTargetAllowed), 6) |
     u32.shiftLeft(boolean(function.superCallAllowed), 7) | u32.shiftLeft(boolean(function.superAllowed), 8) |
     u32.shiftLeft(boolean(function.argumentsAllowed), 9) | u32.shiftLeft(boolean(debug), 10) |
-    u32.shiftLeft(boolean(function.isDirectOrIndirectEval), 11) | u32.shiftLeft(boolean(function.scopeSlots != 0), 12)
+    u32.shiftLeft(boolean(function.isDirectOrIndirectEval), 11) | u32.shiftLeft(boolean(function.scopeSlots != 0), 12) |
+    u32.shiftLeft(boolean(keepStub), 13)
   run state.word(flags, 2) run state.byte(function.mode) run state.atom(function.name)
   run state.leb(u16.toU32(function.argumentCount))
   run state.leb(u16.toU32(function.variableCount))
@@ -462,7 +503,8 @@ unsafe effect fn writeFunction<'a, 'm, S: EngineServices>(state: &mut Writer, en
   }
   run state.leb(usize.toU32(function.closureVars.length()))
   run state.leb(usize.toU32(function.constants.length()))
-  run state.leb(usize.toU32(function.code.length()))
+  // A stub's placeholder code is not written: the reader supplies its own.
+  if keepStub { run state.leb(0) } else { run state.leb(usize.toU32(function.code.length())) }
   run state.leb(usize.toU32(function.varDefs.length()))
   let mut i: usize = 0
   while i < function.varDefs.length() {
@@ -483,7 +525,7 @@ unsafe effect fn writeFunction<'a, 'm, S: EngineServices>(state: &mut Writer, en
       u32.shiftLeft(boolean(closure.isLexical), 4) | u32.shiftLeft(variableKind(closure.variableKind), 5), 2)
     i = i + 1
   }
-  run writeCode(&mut state, &mut engine, realm, &function.code)
+  if !keepStub { run writeCode(&mut state, &mut engine, realm, &function.code) }
   if let Option<FunctionDebugInfo>.Some { value: info } = &function.debug {
     run state.atom(info.filename)
     match &info.pendingLines {
@@ -499,15 +541,16 @@ unsafe effect fn writeFunction<'a, 'm, S: EngineServices>(state: &mut Writer, en
         run state.storage(&info.pcToLine)
       }
     }
-    match &info.source {
-      Option<SourceText>.Some { value: source } => {
-        let bytes = source.bytes()
-        run state.leb(usize.toU32(bytes.length))
-        run state.bytes.reserve(bytes.length)
-        let mut k: usize = 0
-        while k < bytes.length { run state.byte(bytes[k]) k = k + 1 }
+    if lazy { run state.sourceText(&info.source) }
+    else {
+      match &info.source {
+        Option<SourceText>.Some { value: source } => {
+          let bytes = source.bytes()
+          run state.leb(usize.toU32(bytes.length))
+          run state.bytes.appendSlice(bytes)
+        }
+        Option<SourceText>.None => { run state.leb(0) }
       }
-      Option<SourceText>.None => { run state.leb(0) }
     }
   }
   i = 0
@@ -515,6 +558,51 @@ unsafe effect fn writeFunction<'a, 'm, S: EngineServices>(state: &mut Writer, en
     run writeValue(&mut state, &mut engine, realm, unsafe lendBits(&function, function.constants.get(i)))
     i = i + 1
   }
+  if keepStub {
+    match &function.pending {
+      Option<Box<PendingFunction>>.Some { value } => { run writeStubDefinition(&mut state, &value.get()[0]) }
+      _ => ()
+    }
+  }
+}
+/// What finishLazy reads of a stub (PendingFunction and its LazyStub), after
+/// the stub's constants; js_binary_object_reader.readStubDefinition mirrors it.
+effect fn writeStubDefinition(state: &mut Writer, pending: &PendingFunction) -> () ! OutOfMemoryError ? &mut Allocator {
+  run state.leb(usize.toU32(pending.start))
+  run state.leb(i32.wrappingToU32(pending.line)) run state.leb(i32.wrappingToU32(pending.column))
+  run state.leb(i32.wrappingToU32(pending.ecmaLine)) run state.leb(i32.wrappingToU32(pending.ecmaColumn))
+  run state.leb(u16.toU32(pending.slots)) run state.leb(u16.toU32(pending.varSlots))
+  run state.leb(usize.toU32(pending.parameters.length()))
+  let mut i: usize = 0
+  while i < pending.parameters.length() { run state.leb(pending.parameters.get(i)) i = i + 1 }
+  run state.leb(usize.toU32(pending.variables.length()))
+  i = 0
+  while i < pending.variables.length() { run state.leb(u16.toU32(pending.variables.get(i))) i = i + 1 }
+  match &pending.lazy {
+    Option<LazyStub>.Some { value: stub } => {
+      run state.atom(stub.filename)
+      run state.byte(u32.toU8(boolean(stub.scriptIsEval) | u32.shiftLeft(boolean(stub.nodeVmDiagnostics), 1) | u32.shiftLeft(boolean(stub.entryLineFeed), 2)))
+      run state.byte(stub.mode)
+      run state.leb(stub.sourcePosition) run state.leb(usize.toU32(stub.entry))
+      run state.sourceText(&stub.source)
+      run writeNames(&mut state, &stub.free)
+      run state.leb(usize.toU32(stub.bodies.length()))
+      i = 0
+      while i < stub.bodies.length() {
+        let body = stub.bodies.get(i)
+        run state.leb(usize.toU32(body.bodyStart)) run state.leb(usize.toU32(body.end))
+        run state.byte(u32.toU8(boolean(body.endLineFeed))) run state.leb(body.freeStart) run state.leb(body.freeCount)
+        i = i + 1
+      }
+      run writeNames(&mut state, &stub.bodyFree)
+    }
+    _ => Intrinsic.trap("lazy stub without definition")
+  }
+}
+effect fn writeNames(state: &mut Writer, names: &List<LazyName>) -> () ! OutOfMemoryError ? &mut Allocator {
+  run state.leb(usize.toU32(names.length()))
+  let mut i: usize = 0
+  while i < names.length() { let name = names.get(i) run state.atom(name.name) run state.byte(name.depth) i = i + 1 }
 }
 unsafe effect fn writeModule<'a, 'm, S: EngineServices>(state: &mut Writer, engine: &mut Engine<'m, S>,realm: Realm<'a>, reference: *mut HeapHeader) -> () ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
   let anchor = () let module = (unsafe CellRef<ModuleDef>.of(reference)).get(&anchor)
@@ -625,19 +713,7 @@ effect fn finish<'a>(state: &mut Writer, realm: Realm<'a>) -> () ! OutOfMemoryEr
     run prefix.string(string.get())
     i = i + 1
   }
-  let offset = prefix.bytes.length()
-  let oldLength = state.bytes.length()
-  run state.bytes.reserve(offset)
-  i = 0
-  while i < offset { run state.byte(0) i = i + 1 }
-  i = oldLength
-  while i > 0 {
-    i = i - 1
-    let byte = state.bytes.get(i)
-    state.bytes.set(i + offset, byte)
-  }
-  i = 0
-  while i < offset { state.bytes.set(i, prefix.bytes.get(i)) i = i + 1 }
+  run state.bytes.insertSlice(0, prefix.bytes.asSlice())
 }
 effect fn perform<'a, 'b, 'm, S: EngineServices>(engine: &mut Engine<'m, S>, realm: Realm<'a>,
   value: ValueRef<'b>, flags: u32) -> WriteResult ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
