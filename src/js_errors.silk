@@ -8,12 +8,14 @@ import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.collections.slice { Slice }
 import silk.num.u32
+import silk.num.usize
 import js_heap { HeapCell, HeapHeader }
 import js_value { ValueBits }
 import js_owned_value { ValueRef, lendBits }
 import js_realm { Realm }
 import js_core_types { RuntimeState, ObjectData, ObjectPayload, PropertySlot, SlotBits, NativeErrorKind,
-  JS_PROP_WRITABLE, JS_PROP_CONFIGURABLE, JS_PROP_GETSET }
+  JS_PROP_WRITABLE, JS_PROP_CONFIGURABLE, JS_PROP_GETSET, JS_PROP_AUTOINIT }
+import silk.mem.pointer { Pointer }
 import js_gc { HeapHooks }
 import js_gc as gc
 import js_object_allocate as objects
@@ -124,6 +126,84 @@ unsafe effect fn defineFresh<'a, 'b, H: HeapHooks>(hooks: &mut H, memory: &Alloc
       fail JsException {}
     }
   }
+}
+
+// Defines an extensible ordinary Error's absent stack (as defineFresh would) over its captured frames,
+// formatted only when something observes the property (js_auto_init). False,
+// defining nothing, when there are no frames, too many, or Node stack hooks.
+unsafe effect fn defineLazyStack<'a, 'b, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
+  realm: Realm<'a>, object: ValueRef<'b>, flags: u32) -> bool ? &mut Allocator {
+  let rt = realm.runtime()
+  let anchor = ()
+  let ctx = realm.state(&anchor)
+  // A realm still being set up may have no Array shape for the capture yet.
+  let hooked = ctx.nodeErrorStackGetter.isObject() || Pointer.isNull<HeapHeader>(ctx.arrayShape) drop ctx
+  if hooked { return false }
+  let mut values: [ValueBits; 128] = [ValueBits.Undefined; 128]
+  let count = match unsafe trace.captureFrames(rt, flags, &mut values) {
+    Option<usize>.Some { value } => value
+    Option<usize>.None => { return false }
+  }
+  if count == 0 { return false }
+  let mut i: usize = 0
+  while i < count { values[2 * i] = unsafe values[2 * i].retained() i = i + 1 }
+  let made = run Effect.result(objects.arrayWithCapacity(&mut hooks, memory, realm, 2 * count))
+  let capture = match move made {
+    Result<ValueBits, OutOfMemoryError>.Success { value: ValueBits.Object { reference } } => {
+      let mut madeAnchor = ()
+      let filled = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut madeAnchor, reference)
+      match &mut filled.payload {
+        ObjectPayload.FastArray { array } => { unsafe array.values.pushCopies(Pointer.fromRef<ValueBits>(&values[0]), 2 * count) }
+        _ => invalidFreshObject()
+      }
+      filled.setSlot(0, SlotBits.value(ValueBits.Int { value: usize.toI32(2 * count) }))
+      reference
+    }
+    Result<ValueBits, OutOfMemoryError>.Success { .. } => invalidFreshObject()
+    Result<ValueBits, OutOfMemoryError>.Failure { .. } => {
+      i = 0
+      while i < count { unsafe gc.release(&mut hooks, rt, values[2 * i]) i = i + 1 }
+      return false
+    }
+  }
+  let node = match object.view() { ValueBits.Object { reference } => reference _ => invalidFreshObject() }
+  let mut objectAnchor = ()
+  let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut objectAnchor, node)
+  if !data.extensible() || data.classId() != classes.JS_CLASS_ERROR {
+    drop data
+    unsafe gc.releaseHeader(&mut hooks, rt, capture)
+    return false
+  }
+  let result = run Effect.result(unsafe shapes.addProperty(rt, &mut data, atoms.JS_ATOM_stack, u32.toU8(FLAGS | JS_PROP_AUTOINIT)))
+  match move result {
+    Result<AddResult, OutOfMemoryError>.Success { value: added } => {
+      unsafe HeapCell.retain(realm.context())
+      data.setSlot(added.index, SlotBits.plain(PropertySlot.LazyStack { realm: realm.context(), capture: capture }))
+      drop data
+      unsafe gc.releaseOptional(&mut hooks, rt, added.retiredShape)
+      return true
+    }
+    Result<AddResult, OutOfMemoryError>.Failure { .. } => {
+      drop data
+      unsafe gc.releaseHeader(&mut hooks, rt, capture)
+      return false
+    }
+  }
+}
+/// The stack string for frames defineLazyStack captured, or null when it could
+/// not be built (as an eager stack would have been).
+pub unsafe effect fn formatLazyStack<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,
+  realm: Realm<'a>, capture: *mut HeapHeader) -> ValueBits ? &mut Allocator {
+  let rt = realm.runtime()
+  let mut builder = StringBuilder.make()
+  let anchor = ()
+  let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, capture)
+  let appended = match &data.payload {
+    ObjectPayload.FastArray { array } => run Effect.result(unsafe trace.appendCaptured(rt, &mut builder, array.values.asSlice()))
+    _ => invalidFreshObject()
+  }
+  drop data
+  return run finishStack(&mut hooks, memory, realm, move builder, bufferStatus(move appended))
 }
 
 enum BufferStatus { Ready, AllocationFailure, TooLong }
@@ -259,6 +339,7 @@ effect fn freshBacktrace<'a, 'b, H: HeapHooks>(hooks: &mut H, memory: &Allocatio
     run nodeStackLazy(&mut hooks, memory, realm, object)
     return ()
   }
+  if run unsafe defineLazyStack(&mut hooks, memory, realm, object, 0) { return () }
   let mut builder = StringBuilder.make()
   let appended = run Effect.result(unsafe trace.appendFrames(rt, &mut builder, 0))
   let buffered = bufferStatus(move appended)
@@ -346,6 +427,9 @@ pub effect fn buildBacktrace<'a, 'b, H: HeapHooks + ErrorHooks>(hooks: &mut H,
     let attached = run unsafe defineAttached(&mut hooks, realm, object, atoms.JS_ATOM_stack, captured)
     if attached { run nodeStackLazy(&mut hooks, memory, realm, object) }
     return ()
+  }
+  if (flags & trace.LAZY_STACK) != 0 && filename.isNone() {
+    if run unsafe defineLazyStack(&mut hooks, memory, realm, object, flags) { return () }
   }
   let mut builder = StringBuilder.make()
   let prefix = run Effect.result(trace.appendOrigin(&mut builder, move filename, line, column))
