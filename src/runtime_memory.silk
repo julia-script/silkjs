@@ -104,7 +104,13 @@ struct Pool {
   // (still owner-cached for the stats): a pairing heap of the arenas holding them,
   // lowest address at the root, and how many blocks they hold.
   spillHeaps: [?*mut ArenaHeader; 64],
-  spillCounts: [usize; 64]
+  spillCounts: [usize; 64],
+  // The owner's large cache (see cacheLarge): unpooled blocks the allocating thread
+  // freed, kept with their backing for reuse by a request of the same bucket,
+  // linked through AllocationHeader.next. They are uncharged and off the ledger's
+  // list. Only the allocating thread touches these.
+  largeHeads: [?*mut AllocationHeader; 20],
+  largeCounts: [usize; 20]
 }
 
 // The first record of every arena. Every block in the arena belongs to ledger and
@@ -505,7 +511,8 @@ impl<A> RuntimeAllocator<A> {
       pool: Pool { enabled: false, heads: [Pointer.null<u8>(); 64], counts: [0; 64], arenas: Pointer.null<ArenaHeader>(), spare: Pointer.null<u8>(), spareCount: 0, spareRecords: Pointer.null<PoolRecord>(),
         fresh: [Pointer.null<u8>(); 64], freshBytes: [0; 64],
         ownerActive: false, ownerThread: 0, ownerHeads: [Pointer.null<u8>(); 64], ownerCounts: [0; 64], ownerUsed: 0, ownerAllocations: 0, ownerPeak: 0,
-        spillHeaps: [Pointer.null<ArenaHeader>(); 64], spillCounts: [0; 64] }
+        spillHeaps: [Pointer.null<ArenaHeader>(); 64], spillCounts: [0; 64],
+        largeHeads: [Pointer.null<AllocationHeader>(); 20], largeCounts: [0; 20] }
     })
     let mut anchor = ()
     let fresh = unsafe Pointer.borrowMut(&mut anchor, address)
@@ -959,7 +966,27 @@ effect fn allocateUnpooled<A>(self: &mut RuntimeAllocator<A>, layout: Layout, ze
   // The provider is exclusively borrowed. While the child runs, only reclaims can
   // change usage, and those only decrease it. No reservation or peak change is
   // needed: child failure leaves the ledger untouched, even across suspension.
-  let acquired = run Effect.result(childAllocate<A>(&mut self.child, Layout { bytes: chargedBytes, alignment: alignment }, zeroed))
+  // A request of a large bucket takes a cached block, or a backing the size of
+  // its bucket so the block can be cached when freed.
+  let mut backingBytes = chargedBytes
+  if self.pooling && layout.alignment <= POOL_GRANULE {
+    let bucket = largeBucket(payloadBytes)
+    if bucket < LARGE_BUCKETS {
+      backingBytes = unpooledOffset() + largeBucketBytes(bucket)
+      let mut poolAnchor = ()
+      let pool = unsafe Pointer.borrowMut<(), Pool>(&mut poolAnchor, unsafe poolOf(ledger))
+      if let Option<*mut AllocationHeader>.Some { value: cached } = Pointer.nonNullMut<AllocationHeader>(pool.largeHeads[bucket]) {
+        let headerAnchor = ()
+        let node = unsafe Pointer.borrow<(), AllocationHeader>(&headerAnchor, cached)
+        pool.largeHeads[bucket] = node.next
+        drop node
+        pool.largeCounts[bucket] = pool.largeCounts[bucket] - 1
+        drop pool
+        return unsafe adoptLarge(ledger, cached, move layout, offset, chargedBytes, zeroed)
+      }
+    }
+  }
+  let acquired = run Effect.result(childAllocate<A>(&mut self.child, Layout { bytes: backingBytes, alignment: alignment }, zeroed))
   let allocation = match move acquired {
     Result<Intrinsic.Allocation, OutOfMemoryError>.Success { value } => move value
     Result<Intrinsic.Allocation, OutOfMemoryError>.Failure { error } => {
@@ -969,7 +996,7 @@ effect fn allocateUnpooled<A>(self: &mut RuntimeAllocator<A>, layout: Layout, ze
       fail move error
     }
   }
-  let mut storage = unsafe RawBuffer.from<u8>(move allocation, chargedBytes)
+  let mut storage = unsafe RawBuffer.from<u8>(move allocation, backingBytes)
   let base = Slot.address(RawBuffer.slot<u8>(&mut storage, 0))
   let bytes = unsafe Pointer.assumeManyMut<u8>(base)
   let at = unsafe Pointer.atMut<u8>(bytes, offset)
@@ -1016,6 +1043,8 @@ effect fn allocateUnpooled<A>(self: &mut RuntimeAllocator<A>, layout: Layout, ze
 impl<A> Drop for RuntimeAllocator<A> {
   fn drop(self: &mut RuntimeAllocator<A>) -> () {
     let ledger = self.ledger
+    // Cached large blocks are no allocation's; free them outside the gate.
+    unsafe flushLarge(ledger)
     unsafe {
       lockLedger(ledger)
       // The provider keeps a reference, so the cache's cannot be the last. No
@@ -1360,6 +1389,121 @@ unsafe fn threadPointer() -> usize {
   return 0
 }
 
+// Large cache. Unpooled requests above the pool's limit and up to
+// LARGE_LIMIT bytes fall in LARGE_BUCKETS buckets, four per power of two; their
+// backing is sized to the bucket, so a block freed on the allocating thread can
+// serve any later request of its bucket without the child.
+const LARGE_BUCKETS: usize = 20
+const LARGE_LIMIT: usize = 32768
+// Blocks kept per bucket; the rest go back to the child.
+const LARGE_CACHE_CAP: usize = 16
+
+// The bucket of an unpooled request of bytes, or LARGE_BUCKETS when none.
+@inlineAlways
+fn largeBucket(bytes: usize) -> usize {
+  if bytes <= POOL_CLASSES * POOL_GRANULE || bytes > LARGE_LIMIT { return LARGE_BUCKETS }
+  let last = usize.toU64(bytes - 1)
+  // At least 10, since bytes - 1 >= 1024.
+  let exponent = 63 - u32.toUsize(u64.leadingZeros(last))
+  let quarter = usize.shiftRight(bytes - 1, exponent - 2)
+  return (exponent - 10) * 4 + quarter - 4
+}
+
+// The payload bytes every block of bucket can hold.
+@inlineAlways
+fn largeBucketBytes(bucket: usize) -> usize {
+  let exponent = bucket / 4 + 10
+  return usize.shiftLeft(usize.bitAnd(bucket, 3) + 5, exponent - 2)
+}
+
+// Keeps an uncharged unpooled block for reuse when the allocating thread frees
+// it and its backing is exactly a bucket's. The block's header stays in place,
+// still owning the backing.
+unsafe fn cacheLarge(ledger: LedgerPointers, address: *mut AllocationHeader) -> bool {
+  let current = unsafe threadPointer()
+  let mut poolAnchor = ()
+  let pool = unsafe Pointer.borrowMut<(), Pool>(&mut poolAnchor, unsafe poolOf(ledger))
+  if current == 0 || pool.ownerThread != current || !pool.ownerActive { return false }
+  let mut anchor = ()
+  let node = unsafe Pointer.borrowMut<(), AllocationHeader>(&mut anchor, address)
+  let backing = RawBuffer.count<u8>(&node.storage)
+  if backing <= unpooledOffset() { return false }
+  let bucket = largeBucket(backing - unpooledOffset())
+  if bucket >= LARGE_BUCKETS || largeBucketBytes(bucket) + unpooledOffset() != backing
+    || pool.largeCounts[bucket] >= LARGE_CACHE_CAP { return false }
+  node.next = pool.largeHeads[bucket]
+  drop node
+  pool.largeHeads[bucket] = unsafe Intrinsic.pointerRequalify<*mut AllocationHeader, ?*mut AllocationHeader>(address)
+  pool.largeCounts[bucket] = pool.largeCounts[bucket] + 1
+  return true
+}
+
+// Hands out cached large block header again for layout: the bookkeeping of
+// allocateUnpooled after the child, over the header's existing backing.
+unsafe fn adoptLarge(ledger: LedgerPointers, owner: *mut AllocationHeader, layout: Layout, offset: usize,
+  chargedBytes: usize, zeroed: bool) -> Intrinsic.Allocation {
+  let base = unsafe Intrinsic.pointerReinterpret<*mut AllocationHeader, *mut u8>(owner)
+  let at = unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(base), offset)
+  if zeroed { unsafe zeroBytes(at, chargedBytes - offset) }
+  let reclaim: extern "C" fn(?*mut u8) -> () = silkRuntimeMemoryReclaim
+  unsafe {
+    lockLedger(ledger)
+    let mut anchor = ()
+    let control = Pointer.borrowMut(&mut anchor, ledger.allocation)
+    let record = AllocationRecord { id: control.nextAllocationId, address: Pointer.address(at),
+      requestedBytes: layout.bytes, chargedBytes: chargedBytes }
+    control.nextAllocationId = control.nextAllocationId + 1
+    let mut epoch: u64 = 0
+    match &mut control.profile {
+      Option<Recording>.Some { value } => { if value.allocation(record) { epoch = value.epoch } }
+      _ => ()
+    }
+    let first = control.firstAllocation
+    control.firstAllocation = Intrinsic.pointerRequalify<*mut AllocationHeader, ?*mut AllocationHeader>(owner)
+    drop control
+    if !Pointer.isNull(first) {
+      let node = Pointer.borrowMut(&mut anchor, Intrinsic.pointerRequalify<?*mut AllocationHeader, *mut AllocationHeader>(first))
+      node.previous = owner
+    }
+    let header = Pointer.borrowMut<(), AllocationHeader>(&mut anchor, owner)
+    header.block = BlockHeader { ledger: ledger.allocation, chargedBytes: chargedBytes }
+    header.record = record
+    header.sampledEpoch = epoch
+    header.previous = Pointer.null<AllocationHeader>()
+    header.next = first
+    header.room = [0; 2]
+    drop header
+    if !retainGated(ledger) { Intrinsic.trap("allocation ledger reference count overflow") }
+    let mut state = Pointer.read<RuntimeMemoryStats>(ledger.stats)
+    state.usedBytes = state.usedBytes + chargedBytes
+    state.allocationCount = state.allocationCount + 1
+    let reported = usize.wrappingAdd(state.usedBytes, ownerTotals(ledger).used)
+    if state.peakBytes < reported { state.peakBytes = reported }
+    Pointer.write<RuntimeMemoryStats>(ledger.stats, state)
+    unlockLedger(ledger)
+    return Intrinsic.allocationAdopt(at, move layout, reclaim, base)
+  }
+}
+
+// Frees every cached large block. Allocating thread only, outside the gate.
+unsafe fn flushLarge(ledger: LedgerPointers) -> () {
+  let mut bucket: usize = 0
+  while bucket < LARGE_BUCKETS {
+    let mut poolAnchor = ()
+    let pool = unsafe Pointer.borrowMut<(), Pool>(&mut poolAnchor, unsafe poolOf(ledger))
+    let mut next = pool.largeHeads[bucket]
+    pool.largeHeads[bucket] = Pointer.null<AllocationHeader>()
+    pool.largeCounts[bucket] = 0
+    drop pool
+    while let Option<*mut AllocationHeader>.Some { value } = Pointer.nonNullMut<AllocationHeader>(next) {
+      let owner = unsafe Pointer.take<AllocationHeader>(value)
+      next = owner.next
+      drop owner
+    }
+    bucket = bucket + 1
+  }
+}
+
 export "C" fn silkRuntimeMemoryReclaim(context: ?*mut u8) -> () {
   let present = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(context)
   let address = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut AllocationHeader>(present)
@@ -1368,6 +1512,7 @@ export "C" fn silkRuntimeMemoryReclaim(context: ?*mut u8) -> () {
   let ledger = unsafe pointersOf(header.block.ledger)
   drop header
   let last = unsafe uncharge(ledger, address)
+  if !last && unsafe cacheLarge(ledger, address) { return () }
   // Move the complete header out before freeing the storage that contained it.
   // Free backing outside the gate, since the child may itself be a RuntimeAllocator.
   let owner = unsafe Pointer.take<AllocationHeader>(address)
