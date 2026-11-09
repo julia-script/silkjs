@@ -26,6 +26,9 @@ import js_debug_positions { SourceLocation, decodePc2Line, decodePc2LineRaw, FUN
 import js_invariant { present }
 
 pub const SKIP_FIRST_LEVEL: u32 = 1
+/// buildBacktrace's object is an ordinary Error without a stack whose frames
+/// may be captured now and formatted when its stack is first observed.
+pub const LAZY_STACK: u32 = 2
 
 /// Borrowed flat string, checking an own data slot and at most one prototype.
 /// An own accessor, varref, auto-init, rope or non-string blocks prototype lookup.
@@ -118,6 +121,8 @@ pub fn vmLocation(debug: &FunctionDebugInfo, position: SourceLocation) -> Source
   } else { position.column }
   return SourceLocation { line: i32.wrappingAdd(position.line, debug.lineOffset), column: column }
 }
+/// Spans longer than this stay pending through backtraces.
+const PENDING_ENCODE_MAX_SPAN: usize = 0x4000
 /// Encodes function's line tables if compile left them pending, so the lookups
 /// of a backtrace decode a table instead of rescanning the source each time.
 pub unsafe effect fn ensureLines(function: *mut HeapHeader) -> () ! OutOfMemoryError ? &mut Allocator {
@@ -128,6 +133,9 @@ pub unsafe effect fn ensureLines(function: *mut HeapHeader) -> () ! OutOfMemoryE
     Option<FunctionDebugInfo>.Some { value: info } => match &info.pendingLines {
       Option<Box<PendingLines>>.Some { value: pending } => match &info.source {
         Option<SourceText>.Some { value: source } => {
+          // A long span answers each frame by scanning (pendingLocation's
+          // checkpoints bound it): encoding would index the whole span first.
+          if source.bytes().length > PENDING_ENCODE_MAX_SPAN { return () }
           lines = run encodePending(&pending.get()[0], source.bytes(), false)
           calls = run encodePending(&pending.get()[0], source.bytes(), true)
         }
@@ -242,44 +250,100 @@ pub unsafe effect fn appendFrames(runtime: *mut HeapHeader, builder: &mut String
     if (frame.mode & u8.toU32(JS_MODE_BACKTRACE_BARRIER)) != 0 { break }
     pointer = frame.previous
     if skip { skip = false continue }
-    run builder.appendLatin1(b"    at ")
-    let mut named = false
-    match unsafe propertyString(frame.currentFunction, atoms.JS_ATOM_name) {
-      Option<ValueBits>.Some { value } => {
-        if Strings.length(value) != 0 && Strings.codeUnit(value, 0) != 0 {
-          run appendCString(&mut builder, value)
-          named = true
-        }
-      }
-      Option<ValueBits>.None => ()
+    let name = match unsafe propertyString(frame.currentFunction, atoms.JS_ATOM_name) {
+      Option<ValueBits>.Some { value } => value
+      Option<ValueBits>.None => ValueBits.Undefined
     }
-    if !named { run builder.appendLatin1(b"<anonymous>") }
-    match unsafe bytecode(frame.currentFunction) {
-      Option<*mut HeapHeader>.Some { value: function } => {
-        run unsafe ensureLines(function)
-        let mut pc = FUNCTION_DEFINITION_PC
-        if frame.currentPc != NO_PC { pc = u32.wrappingSubtract(usize.toU32(frame.currentPc), 1) }
-        let position = unsafe framePosition(function, pc)
-        let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, function)
-        match &code.debug {
-          Option<FunctionDebugInfo>.Some { value: debug } => {
-            run builder.appendLatin1(b" (")
-            if debug.nodeVm && debug.filename == atoms.JS_ATOM_empty_string { run builder.appendLatin1(b"<anonymous>") }
-            else { run unsafe appendAtom(&mut builder, runtime, debug.filename) }
-            if position.line != 0 {
-              run builder.appendUnit(58) run appendInteger(&mut builder, position.line)
-              if !debug.nodeVm || position.column != 0 {
-                run builder.appendUnit(58) run appendInteger(&mut builder, position.column)
-              }
+    run unsafe appendFrame(runtime, &mut builder, name, unsafe bytecode(frame.currentFunction), frame.currentPc)
+  }
+}
+/// One backtrace line: the function named name (a borrowed string, or not
+/// one for none) running code (none for a native function) at currentPc
+/// (NO_PC when it has none).
+unsafe effect fn appendFrame(runtime: *mut HeapHeader, builder: &mut StringBuilder, name: ValueBits,
+  function: Option<*mut HeapHeader>, currentPc: usize) -> () ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let anchor = ()
+  run builder.appendLatin1(b"    at ")
+  let mut named = false
+  if name.isString() {
+    if Strings.length(name) != 0 && Strings.codeUnit(name, 0) != 0 {
+      run appendCString(&mut builder, name)
+      named = true
+    }
+  }
+  if !named { run builder.appendLatin1(b"<anonymous>") }
+  match function {
+    Option<*mut HeapHeader>.Some { value: code } => {
+      run unsafe ensureLines(code)
+      let mut pc = FUNCTION_DEFINITION_PC
+      if currentPc != NO_PC { pc = u32.wrappingSubtract(usize.toU32(currentPc), 1) }
+      let position = unsafe framePosition(code, pc)
+      let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, code)
+      match &code.debug {
+        Option<FunctionDebugInfo>.Some { value: debug } => {
+          run builder.appendLatin1(b" (")
+          if debug.nodeVm && debug.filename == atoms.JS_ATOM_empty_string { run builder.appendLatin1(b"<anonymous>") }
+          else { run unsafe appendAtom(&mut builder, runtime, debug.filename) }
+          if position.line != 0 {
+            run builder.appendUnit(58) run appendInteger(&mut builder, position.line)
+            if !debug.nodeVm || position.column != 0 {
+              run builder.appendUnit(58) run appendInteger(&mut builder, position.column)
             }
-            run builder.appendUnit(41)
           }
-          Option<FunctionDebugInfo>.None => ()
+          run builder.appendUnit(41)
         }
+        Option<FunctionDebugInfo>.None => ()
       }
-      Option<*mut HeapHeader>.None => { run builder.appendLatin1(b" (native)") }
     }
-    run builder.appendUnit(10)
+    Option<*mut HeapHeader>.None => { run builder.appendLatin1(b" (native)") }
+  }
+  run builder.appendUnit(10)
+}
+/// Frames captureFrames keeps for a later appendCaptured; deeper stacks format at once.
+pub const MAX_CAPTURED_FRAMES: usize = 64
+/// The frames appendFrames(runtime, _, flags) would print, as borrowed
+/// (name, code, pc) triples in out: the name string (undefined for none), the
+/// FunctionBytecode (undefined for a native function) and an Int pc (-1 for
+/// none). None when there are more than MAX_CAPTURED_FRAMES of them. Keeping
+/// code rather than the function leaves closures and their scopes free to go.
+pub unsafe fn captureFrames(runtime: *mut HeapHeader, flags: u32, out: &mut [ValueBits; 192]) -> Option<usize> {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let mut pointer = state.currentStackFrame
+  drop state
+  let mut skip = (flags & SKIP_FIRST_LEVEL) != 0
+  let mut count: usize = 0
+  while !Pointer.isNull<StackFrame>(pointer) {
+    let frame = unsafe Pointer.borrow<(), StackFrame>(&anchor, present(pointer))
+    if (frame.mode & u8.toU32(JS_MODE_BACKTRACE_BARRIER)) != 0 { break }
+    pointer = frame.previous
+    if skip { skip = false continue }
+    if count == MAX_CAPTURED_FRAMES { return Option<usize>.none() }
+    out[3 * count] = match unsafe propertyString(frame.currentFunction, atoms.JS_ATOM_name) {
+      Option<ValueBits>.Some { value } => value
+      Option<ValueBits>.None => ValueBits.Undefined
+    }
+    out[3 * count + 1] = match unsafe bytecode(frame.currentFunction) {
+      Option<*mut HeapHeader>.Some { value } => ValueBits.FunctionBytecode { reference: value }
+      Option<*mut HeapHeader>.None => ValueBits.Undefined
+    }
+    out[3 * count + 2] = ValueBits.Int { value: if frame.currentPc == NO_PC { -1 } else { usize.toI32(frame.currentPc) } }
+    count = count + 1
+  }
+  return Option<usize>.some(count)
+}
+/// appendFrames for frames captureFrames recorded.
+pub unsafe effect fn appendCaptured(runtime: *mut HeapHeader, builder: &mut StringBuilder, values: &[ValueBits]) -> ()
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let mut i: usize = 0
+  while i + 2 < values.length {
+    let code = match values[i + 1] {
+      ValueBits.FunctionBytecode { reference } => Option<*mut HeapHeader>.some(reference)
+      _ => Option<*mut HeapHeader>.none()
+    }
+    let pc = match values[i + 2] { ValueBits.Int { value } => if value < 0 { NO_PC } else { i32.toUsize(value) } _ => NO_PC }
+    run unsafe appendFrame(runtime, &mut builder, values[i], code, pc)
+    i = i + 3
   }
 }
 
