@@ -47,6 +47,11 @@ import js_bigint { BigIntError }
 import js_string_types { StringLengthError }
 import js_preparse as preparse
 import js_preparse { Preparse }
+import js_compiler_lazy { DetachedHooks, compileDetached, ReparseError }
+import js_value { ValueBits }
+import js_gc
+import runtime_memory { AllocationObserver }
+import js_heap { HeapHeader }
 import js_os_events_platform { nowNanoseconds }
 import silk.num.i64
 
@@ -76,7 +81,8 @@ const W_MISSES: usize = 7
 const W_FAILED: usize = 8
 const W_WAITS: usize = 9
 const W_HELPER_JOBS: usize = 10
-const BATCH_WORDS: usize = 12
+const W_COMPILED: usize = 12
+const BATCH_WORDS: usize = 13
 // Pool words.
 const P_GENERATION: usize = 0
 const P_QUIT: usize = 1
@@ -251,10 +257,11 @@ fn poolWords(pool: *mut Pool) -> [*]mut u32 {
 
 effect fn helperRun(handle: PoolRef, index: usize) -> () ! OutOfMemoryError | StringLengthError ? &mut Allocator {
   let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
-  run helperLoop(handle, index) |> Effect.provideMut<Allocator>(&mut allocator)
+  let observer = run allocator.observe()
+  run helperLoop(handle, index, &observer) |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
-effect fn helperLoop(handle: PoolRef, index: usize) -> () ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+effect fn helperLoop(handle: PoolRef, index: usize, observer: &AllocationObserver) -> () ! OutOfMemoryError | StringLengthError ? &mut Allocator {
   let rt = run runtime.allocateRuntimeStorage(stack.currentFrameAddress())
   let context = run unsafe runtime.allocateContextStorage(rt)
   let mut cache = SourcePositionCache.make()
@@ -297,7 +304,7 @@ effect fn helperLoop(handle: PoolRef, index: usize) -> () ! OutOfMemoryError | S
     let batch = match Pointer.nonNull<Batch>(batchPointer) { Option<*const Batch>.Some { value } => value _ => { continue } }
     // The last batch's records are no longer read.
     results.clear()
-    let outcome = run Effect.result(processBatch(batch, index, &mut tree, root, &mut pre, &mut results))
+    let outcome = run Effect.result(processBatch(batch, index, &mut tree, root, &mut pre, &mut results, context, observer))
     match move outcome {
       Result<(), OutOfMemoryError | StringLengthError | ParserStackOverflow | LexError | BigIntError>.Success { .. } => ()
       Result<(), OutOfMemoryError | StringLengthError | ParserStackOverflow | LexError | BigIntError>.Failure { error } => { drop error }
@@ -310,7 +317,7 @@ effect fn helperLoop(handle: PoolRef, index: usize) -> () ! OutOfMemoryError | S
 }
 
 effect fn processBatch(batch: *const Batch, index: usize, tree: &mut FunctionTree, root: FunctionId,
-  pre: &mut Preparse, results: &mut List<JobOutput>) -> ()
+  pre: &mut Preparse, results: &mut List<JobOutput>, context: *mut HeapHeader, observer: &AllocationObserver) -> ()
   ! OutOfMemoryError | StringLengthError | ParserStackOverflow | LexError | BigIntError ? &mut Allocator {
   let anchor = ()
   let view = unsafe Pointer.borrow<(), Batch>(&anchor, batch)
@@ -320,6 +327,7 @@ effect fn processBatch(batch: *const Batch, index: usize, tree: &mut FunctionTre
   drop view
   if index == 0 { scan(source, jobs, words, capacity) }
   let mut parser = run unsafe Parser.make(source, &mut tree, root, false, true)
+  let mut accepted = List<usize>.make()
   while unsafe load(words, W_CANCEL) == 0 {
     let claimed = unsafe bump(words, W_CLAIM)
     let at = u32.toUsize(claimed)
@@ -348,6 +356,7 @@ effect fn processBatch(batch: *const Batch, index: usize, tree: &mut FunctionTre
             let mut done = job
             done.bodies = Pointer.fromSlice<LazyBody>(output.bodies.asSlice()) done.bodyCount = output.bodies.length()
             done.names = Pointer.fromSlice<SpanName>(output.names.asSlice()) done.nameCount = output.names.length()
+            if statsWanted() { writeNumber(b"job-at", usize.toU32(job.paramStart)) writeNumber(b"size", usize.toU32(output.bodies.get(0).end - job.bodyStart)) }
             run results.append(move output)
             unsafe Pointer.write<PoolJob>(unsafe Pointer.atMut<PoolJob>(jobs, at), done)
             finished = DONE
@@ -361,8 +370,59 @@ effect fn processBatch(batch: *const Batch, index: usize, tree: &mut FunctionTre
     pre.clearTables()
     unsafe tally(words, W_HELPER_JOBS)
     unsafe Atomic.store<u32>(stateWord, finished, MemoryOrder.Release)
+    if finished == DONE { run accepted.append(at) }
+  }
+  // Compiles come after every preparse job is taken, and stop when the batch ends.
+  if helperCompileWanted() {
+    let mut k: usize = 0
+    while k < accepted.length() && unsafe load(words, W_CANCEL) == 0 {
+      let compiled = unsafe Pointer.read<PoolJob>(unsafe Pointer.atMut<PoolJob>(jobs, accepted.get(k)))
+      let tried = run Effect.result(compileJob(compiled, source, context, observer))
+      match move tried { Result<bool, OutOfMemoryError | StringLengthError>.Success { value } => { if value { unsafe tally(words, W_COMPILED) } } Result<bool, OutOfMemoryError | StringLengthError>.Failure { error } => { drop error } }
+      k = k + 1
+    }
   }
   parser.keepNames()
+}
+
+fn helperCompileWanted() -> bool {
+  let name = b"SILKJS_HELPER_COMPILE\0"
+  return !Pointer.isNullMany<u8>(unsafe poolGetenv(Pointer.fromRef<u8>(&name[0])))
+}
+
+/// Experiment: compiles a finished job's function on this helper and throws
+/// the result away. Whether it compiled.
+effect fn compileJob(job: PoolJob, source: &[u8], context: *mut HeapHeader, observer: &AllocationObserver) -> bool
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  // The token before the parameter list: the name, or `function`.
+  let mut at = job.paramStart
+  while at > 0 && (source[at - 1] == 32 || source[at - 1] == 9 || source[at - 1] == 10 || source[at - 1] == 13) { at = at - 1 }
+  let end = at
+  while at > 0 && identifierByte(source[at - 1]) { at = at - 1 }
+  if at == end { return false }
+  let anchor = ()
+  let names = unsafe Pointer.borrowMany<(), SpanName>(&anchor, unsafe Intrinsic.pointerRequalify<?[*]const SpanName, [*]const SpanName>(job.names), job.nameCount)
+  let mut ra = ()
+  let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ra, unsafe runtime.contextRuntime(context))
+  let mut free = List<u32>.make()
+  let mut i: usize = 0
+  while i < names.length {
+    let span = names[i]
+    let atom = run rt.atoms.internUtf8(Slice.view<u8>(source, u32.toUsize(span.start), u32.toUsize(span.length)))
+    run free.append(atom)
+    i = i + 1
+  }
+  drop rt
+  let mut hooks = DetachedHooks { unused: 0 }
+  let outcome = run Effect.result(unsafe compileDetached(&mut hooks, observer, context, source, at, usize.toU32(at), &free))
+  let rt2 = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ra, unsafe runtime.contextRuntime(context))
+  i = 0
+  while i < free.length() { rt2.atoms.release(free.get(i)) i = i + 1 }
+  drop rt2
+  return match move outcome {
+    Result<ValueBits, ReparseError>.Success { value } => { unsafe js_gc.release(&mut hooks, unsafe runtime.contextRuntime(context), value) true }
+    Result<ValueBits, ReparseError>.Failure { error } => { drop error false }
+  }
 }
 
 /// The length of the plain ASCII identifier at start, or 0.
@@ -449,7 +509,11 @@ fn statsWanted() -> bool {
 @foreign(noCapture: .("text"))
 unsafe extern "C" fn poolWrite(fd: i32, text: *const u8, length: usize) -> isize as "write"
 
-fn writeNumber(label: &[u8], value: u32) -> () {
+pub fn writeBytes(bytes: &[u8]) -> () {
+  let _w = unsafe poolWrite(2, Pointer.fromRef<u8>(&bytes[0]), bytes.length)
+  let _n = unsafe poolWrite(2, Pointer.fromRef<u8>(&b"\n"[0]), 1)
+}
+pub fn writeNumber(label: &[u8], value: u32) -> () {
   let mut text: [u8; 64] = [0; 64]
   let mut n: usize = 0
   while n < label.length && n < 40 { text[n] = label[n] n = n + 1 }
@@ -480,6 +544,7 @@ pub fn finish(s: &mut Parser<'_>) -> () {
   if statsWanted() {
     writeNumber(b"preparse-pool jobs", unsafe load(words, W_PUBLISHED))
     writeNumber(b"helper", unsafe load(words, W_HELPER_JOBS))
+    writeNumber(b"compiled", unsafe load(words, W_COMPILED))
     writeNumber(b"hits", unsafe load(words, W_HITS))
     writeNumber(b"steals", unsafe load(words, W_STEALS))
     writeNumber(b"failed", unsafe load(words, W_FAILED))
