@@ -110,9 +110,11 @@ pub struct PoolJob {
 impl Copy for PoolJob {}
 
 /// A body the parser skipped by the scanner's end before its records were
-/// ready: job is its index, level and entry what skipBody records on the stub.
-/// name is the function's, for checkNames after a full parse.
-pub struct Deferred { pub child: FunctionId, pub job: usize, pub level: u16, pub entry: LexerPosition, pub name: u32 }
+/// ready: job is its index (none in a local batch), bodyStart and end its `{`
+/// and scanned `}`, level and entry what skipBody records on the stub. name is
+/// the function's, for checkNames after a full parse.
+pub struct Deferred { pub child: FunctionId, pub job: usize, pub bodyStart: usize, pub end: usize,
+  pub level: u16, pub entry: LexerPosition, pub name: u32 }
 impl Copy for Deferred {}
 
 struct Batch {
@@ -122,6 +124,10 @@ struct Batch {
   // The parsing thread's own: the stubs joinDeferred completes, and whether
   // helpers see the batch.
   deferred: List<Deferred>, pooled: bool,
+  // No helpers: skipBody scans each body it skips itself (bodyEnd), and the
+  // join preparses them all on this thread, which keeps the parser's code and
+  // the preparser's apart in the instruction cache.
+  local: bool,
   storage: Intrinsic.RawBuffer<Batch>
 }
 
@@ -434,11 +440,9 @@ pub effect fn begin<'src>(s: &mut Parser<'src>, source: &'src [u8]) -> () ! OutO
   let skips = root.isEval && root.evalType == 3 && root.module.isNone()
   drop root
   if !skips { return () }
-  // Without helpers skipBody preparses each body as it comes: the scan and
-  // the join cost more than batching the preparses saves on one thread.
-  let pool = match Pointer.nonNullMut<Pool>(ensurePool(&mut s)) { Option<*mut Pool>.Some { value } => value _ => { return () } }
+  let pool = match Pointer.nonNullMut<Pool>(ensurePool(&mut s)) { Option<*mut Pool>.Some { value } => value _ => { return run beginLocal(&mut s, source) } }
   let poolWordsBase = poolWords(pool)
-  if unsafe load(poolWordsBase, P_ALIVE) == 0 { return () }
+  if unsafe load(poolWordsBase, P_ALIVE) == 0 { return run beginLocal(&mut s, source) }
   let capacity = source.length / 12 + 1
   let mut jobList = List<PoolJob>.make()
   run scan(source, &mut jobList, capacity)
@@ -459,7 +463,7 @@ pub effect fn begin<'src>(s: &mut Parser<'src>, source: &'src [u8]) -> () ! OutO
   let sourceBase = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(source))
   unsafe Pointer.put<Batch>(batch, Batch { source: sourceBase, length: source.length, capacity: capacity,
     jobs: jobs, states: states, words: words, jobList: move jobList, stateList: move stateList, wordList: move wordList,
-    deferred: move deferred, pooled: false, storage: move storage })
+    deferred: move deferred, pooled: false, local: false, storage: move storage })
   s.pool = unsafe Intrinsic.pointerReinterpret<*mut Batch, *mut u8>(batch)
   let mut batchAnchor = ()
   let view = unsafe Pointer.borrowMut<(), Batch>(&mut batchAnchor, batch)
@@ -470,6 +474,31 @@ pub effect fn begin<'src>(s: &mut Parser<'src>, source: &'src [u8]) -> () ! OutO
   unsafe Atomic.store<u32>(unsafe word(poolWordsBase, P_OPEN), 1, MemoryOrder.SequentiallyConsistent)
   unsafe tally(poolWordsBase, P_GENERATION)
   unsafe Atomic.notifyAll(unsafe word(poolWordsBase, P_GENERATION))
+}
+
+/// begin without helpers: a batch with no jobs, for skipBody to defer into.
+effect fn beginLocal<'src>(s: &mut Parser<'src>, source: &'src [u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut wordList = List<u32>.make()
+  run wordList.appendRepeated(0, BATCH_WORDS)
+  let words = mutBase<u32>(&mut wordList)
+  let mut jobList = List<PoolJob>.make() let mut stateList = List<u32>.make()
+  let jobs = mutBase<PoolJob>(&mut jobList) let states = mutBase<u32>(&mut stateList)
+  let allocation = run Allocator.allocate(Layout.of<Batch>())
+  let mut storage = unsafe RawBuffer.from<Batch>(move allocation, 1)
+  let batch = Slot.address(RawBuffer.slot<Batch>(&mut storage, 0))
+  let sourceBase = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(source))
+  unsafe Pointer.put<Batch>(batch, Batch { source: sourceBase, length: source.length, capacity: 0,
+    jobs: jobs, states: states, words: words, jobList: move jobList, stateList: move stateList, wordList: move wordList,
+    deferred: List<Deferred>.make(), pooled: false, local: true, storage: move storage })
+  s.pool = unsafe Intrinsic.pointerReinterpret<*mut Batch, *mut u8>(batch)
+}
+
+/// Whether the batch is a local one (begin found no helpers).
+pub fn local(s: &Parser<'_>) -> bool {
+  let batch = match Pointer.nonNullMut<Batch>(batchOf(s)) { Option<*mut Batch>.Some { value } => value _ => { return false } }
+  let anchor = ()
+  let view = unsafe Pointer.borrow<(), Batch>(&anchor, batch)
+  return view.local
 }
 
 fn statsWanted() -> bool {
@@ -812,6 +841,69 @@ fn nextMark(source: &[u8], p: usize) -> usize {
     at = at + 1
   }
   return at
+}
+
+/// nextMark without `function`: the first quote, backtick, `/`, `{` or `}`
+/// from p on, or the source's end.
+@inlineAlways
+fn nextBrace(source: &[u8], p: usize) -> usize {
+  let base = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(source))
+  let quote = u8x16.splat(34) let apostrophe = u8x16.splat(39) let backtick = u8x16.splat(96)
+  let slash = u8x16.splat(47) let open = u8x16.splat(123) let close = u8x16.splat(125)
+  let mut at = p
+  while source.length - at >= 16 {
+    let block = unsafe u8x16.loadUnchecked(unsafe Pointer.assumeMany<u8>(unsafe Pointer.at<u8>(base, at)))
+    let hits = mask16.toBits(u8x16.lanesEqual(block, quote)) | mask16.toBits(u8x16.lanesEqual(block, apostrophe))
+      | mask16.toBits(u8x16.lanesEqual(block, backtick)) | mask16.toBits(u8x16.lanesEqual(block, slash))
+      | mask16.toBits(u8x16.lanesEqual(block, open)) | mask16.toBits(u8x16.lanesEqual(block, close))
+    if hits != 0 { return at + u32.toUsize(u64.trailingZeros(hits)) }
+    at = at + 16
+  }
+  while at < source.length {
+    let c = source[at]
+    if c == 34 || c == 39 || c == 96 || c == 47 || c == 123 || c == 125 { return at }
+    at = at + 1
+  }
+  return at
+}
+
+/// The offset of the `}` closing the `{` at open, by scan's rules, or 0 when
+/// the source ends first or the nesting is too deep. A wrong guess costs a
+/// parse without batching (js_eval_compile.parse).
+pub fn bodyEnd(source: &[u8], open: usize) -> usize {
+  // Bit d of templates: depth d is a template substitution.
+  let mut templates: [u64; 16] = [0; 16]
+  let mut depth: usize = 1
+  let mut p = open + 1
+  while true {
+    p = nextBrace(source, p)
+    if p >= source.length { return 0 }
+    let c = source[p]
+    if c == 123 { if depth >= 1024 { return 0 } templates[depth / 64] = templates[depth / 64] & ~u64.shiftLeft(1, usize.toU64(depth % 64)) depth = depth + 1 p = p + 1 continue }
+    if c == 125 {
+      depth = depth - 1
+      if depth == 0 { return p }
+      if (u64.shiftRight(templates[depth / 64], usize.toU64(depth % 64)) & 1) == 0 { p = p + 1 continue }
+      let q = templateStep(source, p + 1)
+      if q >= 2 && q <= source.length && source[q - 1] == 123 && source[q - 2] == 36 { depth = depth + 1 }
+      p = q continue
+    }
+    if c == 47 {
+      if p + 1 < source.length && (source[p + 1] == 47 || source[p + 1] == 42) { p = trivia(source, p) continue }
+      if regexAt(source, p) { p = regexEnd(source, p) } else { p = p + 1 }
+      continue
+    }
+    if c == 96 {
+      let q = templateStep(source, p + 1)
+      if q >= 2 && q <= source.length && source[q - 1] == 123 && source[q - 2] == 36 {
+        if depth >= 1024 { return 0 }
+        templates[depth / 64] = templates[depth / 64] | u64.shiftLeft(1, usize.toU64(depth % 64)) depth = depth + 1
+      }
+      p = q continue
+    }
+    p = stringEnd(source, p)
+  }
+  return 0
 }
 
 /// Whether a `/` at p starts a regular expression, from the token before it:
