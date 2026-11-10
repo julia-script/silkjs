@@ -1372,16 +1372,11 @@ another thread's heap, or invoke user code.
 
 ## Immutable dependency preparation
 
-`tools/prepare_silkjs.py` prepares the published engine revision declared in
-`silk.toml`, verifies its archive SHA-256, extracts into an owned staging
-directory, and checks an existing prepared tree against the pinned contents.
-The published configuration cannot silently fall back to a sibling checkout.
-License files are retained unchanged.
-
-The actual public archive passed fresh and cached preparation. Isolated
-consumers also proved rejection of modified prepared sources, an incorrect
-archive checksum, and a sibling dependency path combined with the published
-pin. The runtime subsequently built from that prepared dependency.
+The engine was first consumed as a published revision of julia-script/silkjs,
+downloaded and checked against a pinned archive SHA-256 by
+`tools/prepare_silkjs.py`. Since the runtime moved into silk-lang/lib-silkjs
+as `modules/runtime`, it builds the sibling `modules/engine` as a path
+dependency, and `tools/prepare_silkjs.py` only checks that path.
 
 Reusable Silk stdlib candidates are checksum-verified downloads, safe archive
 extraction, canonical path handling, and atomic directory publication.

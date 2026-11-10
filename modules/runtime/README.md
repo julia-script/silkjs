@@ -1,6 +1,6 @@
 # silkjsruntime
 
-A Node-compatible JavaScript runtime written in [Silk](https://github.com/silk-lang/silk), using [SilkJS](https://github.com/julia-script/silkjs), the native Silk port of QuickJS, instead of V8.
+A Node-compatible JavaScript runtime written in [Silk](https://github.com/silk-lang/silk), using [SilkJS](../engine), the native Silk port of QuickJS, instead of V8.
 
 Node 24 is the compatibility reference. [Deno](https://github.com/denoland/deno) is an organizational reference for the core/extension split—not a runtime dependency or a source of Deno-specific APIs. JavaScript executes in SilkJS; there is no Node or V8 execution fallback.
 
@@ -18,8 +18,8 @@ Requirements:
 - Network access on the first build to retrieve checksum-verified source dependencies.
 
 ```sh
-git clone https://github.com/julia-script/silkjsruntime.git
-cd silkjsruntime
+git clone https://github.com/silk-lang/lib-silkjs.git
+cd lib-silkjs/modules/runtime
 silk use
 python3 tools/build.py
 ./build/silkjsruntime -p 'process.versions'
@@ -27,7 +27,7 @@ python3 tools/build.py
 
 Use `SILK_CLANG` to select a particular Clang executable. `python3 tools/build.py --release` builds with speed optimization; `--output PATH` selects the output executable.
 
-The build prepares the exact SilkJS revision declared in `silk.toml`, verifies its archive checksum, and rejects modifications to an already prepared dependency tree. It also prepares the pinned WAMR/uvwasi dependencies, embeds the JavaScript extensions, and links the native executable. An installed Node executable is not required to build or run it.
+The engine is this repository's [`modules/engine`](../engine), a path dependency in `silk.toml`, so engine and runtime changes land together. The build also prepares the pinned WAMR/uvwasi dependencies, embeds the JavaScript extensions, and links the native executable. An installed Node executable is not required to build or run it.
 
 ## Run
 
@@ -66,7 +66,7 @@ This is a Node compatibility implementation, not an official Node distribution o
 | [`tools/`](tools/) | Dependency preparation, native builds, embedding, executable tooling |
 | [`tests/`](tests/) | Differential and real-runtime consumers |
 
-Required SilkJS changes are published in [ac06e80](https://github.com/julia-script/silkjs/commit/ac06e80a0345a7d4ff2e9d254c3b7b119725b2b6). The revision and archive checksum are pinned in [`silk.toml`](silk.toml), rather than maintaining a second engine implementation.
+The engine lives beside the runtime in [`modules/engine`](../engine); the runtime does not maintain a second engine implementation.
 
 ## Verification
 
