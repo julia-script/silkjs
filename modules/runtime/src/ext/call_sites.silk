@@ -1,0 +1,168 @@
+//! Node util.getCallSites policy over owned, engine-neutral execution snapshots.
+//! Host ID19: captureCallSites(frameCount, skipThroughFunction). Public JS does
+//! argument validation; no coercion or JavaScript runs during frame capture.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silkjs.js_owned_value { lendFor }
+import silkjs.js_realm { lendRealm }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.collections.list { List }
+import silk.mem.pointer { Pointer }
+import silk.num.f64
+import silk.num.i32
+import silk.num.u32
+import silk.num.usize
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_heap { HeapCell, HeapHeader }
+import silkjs.js_value { ValueBits }
+import silkjs.js_core_types { ContextState, ObjectData, ObjectPayload, FrameSlots, NativeErrorKind, JS_PROP_CONFIGURABLE, JS_PROP_THROW }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_coercion_host { CoercionHooks }
+import silkjs.js_string_types { StringLengthError }
+import silkjs.js_bigint { BigIntError }
+import silkjs.js_stack_frames { FrameSnapshot }
+import silkjs.js_stack_frames as frames
+import silkjs.js_runtime as runtime
+import silkjs.js_object_allocate as objects
+import libs.core.common as common
+import libs.core.owners as owners
+import silkjs.js_proxy_core as errors
+import silkjs.js_constructor_ops as constructors
+import silkjs.js_node_stack as nodeStack
+import silkjs.js_class_data as classes
+import silkjs.js_atom_data as atoms
+import silkjs.js_property_mutations as mutations
+fn coordinate(value: i32) -> ValueBits {
+  let bits = if value < 0 { i32.toU32(-1 - value) ^ 0xffffffff } else { i32.toU32(value) }
+  return ValueBits.number(u32.toF64(bits))
+}
+
+unsafe effect fn fields<'m, S: EngineServices>(engine: &mut Engine<'m, S>,
+  context: *mut HeapHeader, record: ValueBits, frame: &FrameSnapshot) -> ()
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let name = if frame.isScript { run unsafe common.stringValue(&mut engine, context, "") }
+    else { unsafe frame.functionName.get().retained() }
+  run unsafe common.define(&mut engine, context, record, b"functionName", name, 7)
+  let id = run frames.scriptIdString(frame.scriptId)
+  run unsafe common.define(&mut engine, context, record, b"scriptId", id, 7)
+  let scriptName = if frame.isEval { run unsafe common.stringValue(&mut engine, context, "") }
+    else { unsafe frame.scriptName.get().retained() }
+  run unsafe common.define(&mut engine, context, record, b"scriptName", scriptName, 7)
+  run unsafe common.define(&mut engine, context, record, b"lineNumber", coordinate(frame.callLineNumber), 7)
+  run unsafe common.define(&mut engine, context, record, b"columnNumber", coordinate(frame.callColumnNumber), 7)
+  run unsafe common.define(&mut engine, context, record, b"column", coordinate(frame.callColumnNumber), 7)
+}
+unsafe effect fn records<'m, S: EngineServices>(engine: &mut Engine<'m, S>,
+  context: *mut HeapHeader, array: ValueBits, snapshots: &[FrameSnapshot]) -> ()
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let memory = engine.memory
+  let mut index: usize = 0
+  while index < snapshots.length {
+    let record = run objects.withPrototype(&mut engine, memory, unsafe lendRealm(&context, context), unsafe lendFor(ValueBits.Null))
+    let filled = run Effect.result(unsafe fields(&mut engine, context, record, &snapshots[index]))
+    match move filled {
+      Result<(), OutOfMemoryError | StringLengthError | JsException>.Success { .. } => ()
+      Result<(), OutOfMemoryError | StringLengthError | JsException>.Failure { error } => {
+        unsafe owners.release(&mut engine, context, record)
+        fail move error
+      }
+    }
+    // defineIndex consumes the record on success and failure.
+    run unsafe common.defineIndex(&mut engine, context, array, usize.toU32(index), record)
+    index = index + 1
+  }
+}
+pub unsafe effect fn capture<'m, S: EngineServices>(engine: &mut Engine<'m, S>,
+  context: *mut HeapHeader, argv: &FrameSlots) -> ValueBits
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let count = unsafe common.argument(argv, 0)
+  let skip = unsafe common.argument(argv, 1)
+  if !count.isNumber() { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"callsite count must be an integer") }
+  let number = count.numericValue()
+  if number == -2.0 || number == -3.0 {
+    let object = match skip { ValueBits.Object { reference } => reference _ => { return ValueBits.Undefined } }
+    let anchor = ()
+    if number == -3.0 {
+      let kind = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+      if kind.classId() != classes.JS_CLASS_ERROR { return ValueBits.Bool { value: false } }
+    }
+    let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+    let realm = match Pointer.nonNullMut<HeapHeader>(data.creationRealm) {
+      Option<*mut HeapHeader>.Some { value } => value
+      _ => { return ValueBits.Undefined }
+    }
+    drop data
+    let state = unsafe HeapCell.payload<ContextState, ()>(&anchor, realm)
+    if number == -2.0 { return unsafe state.nodeErrorFormatter.retained() }
+    let getter = state.nodeErrorStackGetter
+    let setter = state.nodeErrorStackSetter
+    drop state
+    let defined = run Effect.result(mutations.definePropertyGetSet(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(skip),
+      atoms.JS_ATOM_stack, unsafe lendFor(getter), unsafe lendFor(setter), JS_PROP_CONFIGURABLE | JS_PROP_THROW))
+    match move defined {
+      Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { .. } => ()
+      Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } =>
+        { return run errors.materialize(&mut engine, unsafe lendRealm(&context, context), move error) }
+    }
+    let mut mutable = ()
+    let changed = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut mutable, object)
+    let previous = Intrinsic.replace(changed.payload,
+      ObjectPayload.ErrorStack { value: unsafe (unsafe common.argument(argv, 2)).retained(), cached: false })
+    drop changed
+    match move previous {
+      ObjectPayload.ErrorStack { value, .. } => unsafe owners.release(&mut engine, context, value)
+      ObjectPayload.Empty => ()
+      _ => Intrinsic.trap("Error stack payload invariant")
+    }
+    return ValueBits.Bool { value: true }
+  }
+  if number == 0.0 || number == -1.0 {
+    let realm = run unsafe constructors.getFunctionRealm(&mut engine, unsafe lendRealm(&context, context), skip)
+    if number == 0.0 {
+      let formatter = unsafe common.argument(argv, 2)
+      let mut anchor = ()
+      let state = unsafe HeapCell.payloadMut<ContextState, ()>(&mut anchor, realm)
+      let previousConstructor = state.nodeErrorConstructor
+      let previousFormatter = state.nodeErrorFormatter
+      state.nodeErrorConstructor = unsafe skip.retained()
+      state.nodeErrorFormatter = unsafe formatter.retained()
+      drop state
+      unsafe owners.release(&mut engine, context, previousConstructor)
+      unsafe owners.release(&mut engine, context, previousFormatter)
+      return ValueBits.Undefined
+    }
+    let limit = match unsafe nodeStack.limit(realm) {
+      Option<usize>.Some { value } => value
+      Option<usize>.None => { return ValueBits.Undefined }
+    }
+    let memory = engine.memory
+    let captured = run Effect.result(unsafe nodeStack.capture(&mut engine, memory, realm,
+      limit, unsafe common.argument(argv, 2), false))
+    return match move captured {
+      Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => value
+      Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error } => run errors.materialize(&mut engine, unsafe lendRealm(&context, context), move error)
+    }
+  }
+  if !(number >= 1.0 && number <= 200.0) { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Range, b"invalid callsite count") }
+  let integer = f64.toI32(number)
+  if i32.toF64(integer) != number { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Range, b"invalid callsite count") }
+  let limit = i32.toUsize(integer)
+  if !skip.isObject() { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"callsite skip function required") }
+  let captured = run Effect.result(unsafe frames.capture(unsafe runtime.contextRuntime(context), limit, skip, false))
+  let snapshots = match move captured {
+    Result<List<FrameSnapshot>, OutOfMemoryError | StringLengthError>.Success { value } => move value
+    Result<List<FrameSnapshot>, OutOfMemoryError | StringLengthError>.Failure { error } => { return run errors.materialize(&mut engine, unsafe lendRealm(&context, context), move error) }
+  }
+  let memory = engine.memory
+  let array = run objects.array(&mut engine, memory, unsafe lendRealm(&context, context))
+  let filled = run Effect.result(unsafe records(&mut engine, context, array, snapshots.asSlice()))
+  match move filled {
+    Result<(), OutOfMemoryError | StringLengthError | JsException>.Success { .. } => { return array }
+    Result<(), OutOfMemoryError | StringLengthError | JsException>.Failure { error } => {
+      unsafe owners.release(&mut engine, context, array)
+      return run errors.materialize(&mut engine, unsafe lendRealm(&context, context), move error)
+    }
+  }
+}

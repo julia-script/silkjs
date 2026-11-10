@@ -1,0 +1,1125 @@
+//! The Node-API environment: handles and handle scopes, references, native callbacks and
+//! finalizers, the last-error record, and addon loading.
+//!
+//! A `napi_env` is an [`Env`] and a `napi_value` is a [`Handle`] that owns one `ValueBits`. Handles
+//! live in arenas that handle scopes unwind; rooted handles are allocated one by one. Only the
+//! environment's owner thread uses any of it. Every engine operation goes through the bridge that
+//! `napi_native` installs, so this module never touches the JavaScript heap itself.
+//!
+//! Addon code is shared by the whole process. The library registry and the per-thread fatal
+//! report contexts live behind process words, since `napi_module_register` and
+//! `napi_fatal_error` take no environment.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.mem.pointer { Pointer }
+import silk.core.ownership { Copy }
+import silk.mem.layout { Layout }
+import silk.concurrency.sync { Mutex, MutexGuard }
+import silk.concurrency.atomic { CompareExchange }
+import silk.collections.slice { Slice }
+import silk.concurrency.thread { Transferable }
+import silk.concurrency.atomic { Atomic, MemoryOrder }
+import silk.num.u8
+import silk.num.u32
+import silk.num.i32
+import silk.num.isize
+import silk.num.u64
+import silk.num.i64
+import silk.num.usize
+import silkjs.js_value { ValueBits }
+
+pub const OK: i32 = 0
+pub const INVALID_ARG: i32 = 1
+pub const OBJECT_EXPECTED: i32 = 2
+pub const STRING_EXPECTED: i32 = 3
+pub const NAME_EXPECTED: i32 = 4
+pub const FUNCTION_EXPECTED: i32 = 5
+pub const NUMBER_EXPECTED: i32 = 6
+pub const BOOLEAN_EXPECTED: i32 = 7
+pub const ARRAY_EXPECTED: i32 = 8
+pub const GENERIC_FAILURE: i32 = 9
+pub const PENDING_EXCEPTION: i32 = 10
+pub const ESCAPE_CALLED_TWICE: i32 = 12
+pub const HANDLE_SCOPE_MISMATCH: i32 = 13
+pub const BIGINT_EXPECTED: i32 = 17
+pub const DATE_EXPECTED: i32 = 18
+pub const ARRAYBUFFER_EXPECTED: i32 = 19
+
+pub const TYPE_UNDEFINED: i32 = 0
+pub const TYPE_STRING: i32 = 4
+pub const TYPE_SYMBOL: i32 = 5
+pub const TYPE_OBJECT: i32 = 6
+pub const TYPE_FUNCTION: i32 = 7
+pub const TYPE_EXTERNAL: i32 = 8
+
+/// The bridge operations that `napi_native` implements.
+pub const RELEASE: i32 = 1
+pub const DUPLICATE: i32 = 2
+pub const UNDEFINED: i32 = 3
+pub const NULL: i32 = 4
+pub const BOOLEAN: i32 = 5
+pub const NUMBER: i32 = 6
+pub const STRING: i32 = 7
+pub const READ_STRING: i32 = 8
+pub const TYPEOF: i32 = 9
+pub const READ_NUMBER: i32 = 10
+pub const JS: i32 = 11
+pub const PENDING: i32 = 12
+pub const CLEAR_EXCEPTION: i32 = 13
+pub const THROW: i32 = 14
+pub const BUFFER: i32 = 15
+pub const BUFFER_INFO: i32 = 16
+pub const EXTERNAL_BUFFER: i32 = 17
+pub const DETACH: i32 = 18
+pub const WEAK: i32 = 19
+pub const WEAK_GET: i32 = 20
+pub const WEAK_RELEASE: i32 = 21
+pub const EXTERNAL_MEMORY: i32 = 22
+
+pub const NAPI_VERSION: i32 = 10
+const ARENA_SLOTS: usize = 256
+const MODULE_VERSION: i32 = 1
+const AUTO_LENGTH: usize = 18446744073709551615
+
+/// One bridge call. Handles are borrowed for the call; `result` receives a new value.
+pub extern "C" struct Packet { pub values: [?*mut u8; 8], pub argv: ?*const ?*mut u8, pub argc: usize, pub data: ?*mut u8, pub extra: ?*mut u8, pub size: usize, pub offset: usize, pub number: f64, pub integer: u64, pub flags: i32, pub result: ?*mut u8 }
+pub type Bridge = extern "C" fn(?*mut u8, i32, *mut Packet) -> i32
+pub fn packet() -> Packet {
+  return Packet { values: [Pointer.null<u8>(), Pointer.null<u8>(), Pointer.null<u8>(), Pointer.null<u8>(), Pointer.null<u8>(), Pointer.null<u8>(), Pointer.null<u8>(), Pointer.null<u8>()], argv: Pointer.null<?*mut u8>(), argc: 0, data: Pointer.null<u8>(), extra: Pointer.null<u8>(), size: 0, offset: 0, number: 0.0, integer: 0, flags: 0, result: Pointer.null<u8>() }
+}
+
+pub type Finalize = ?extern "C" fn(?*mut u8, ?*mut u8, ?*mut u8) -> ()
+type Callback = extern "C" fn(?*mut u8, ?*mut u8) -> ?*mut u8
+type Init = extern "C" fn(?*mut u8, ?*mut u8) -> ?*mut u8
+type Version = extern "C" fn() -> i32
+/// Writes a fatal report for `context`: location, then message, each as pointer and length.
+pub type FatalReport = extern "C" fn(*mut u8, *const u8, usize, *const u8, usize) -> ()
+
+pub extern "C" struct ErrorInfo { message: ?*const u8, reserved: ?*mut u8, engineCode: u32, code: i32 }
+pub extern "C" struct NodeVersion { major: u32, minor: u32, patch: u32, release: *const u8 }
+pub extern "C" struct Module { version: i32, flags: u32, filename: ?*const u8, register: ?extern "C" fn(?*mut u8, ?*mut u8) -> ?*mut u8, name: ?*const u8, private: ?*mut u8, reserved: [?*mut u8; 4] }
+impl Copy for Packet {}
+impl Copy for Module {}
+
+struct Handle { env: *mut Env, value: ValueBits }
+struct Arena { previous: ?*mut Arena, used: usize, slots: *mut Handle }
+struct Scope { env: *mut Env, previous: ?*mut Scope, arena: ?*mut Arena, used: usize, escapable: bool, escaped: bool, escape: ?*mut u8 }
+struct Reference { env: *mut Env, next: ?*mut Reference, count: u32, strong: ?*mut u8, weak: ?*mut u8 }
+struct Native { next: ?*mut Native, env: *mut Env, callback: Callback, data: ?*mut u8 }
+struct CallbackInfo { env: *mut Env, native: *mut Native, receiver: ?*mut u8, target: ?*mut u8, argc: usize, argv: ?*const ?*mut u8 }
+struct Finalizer { next: ?*mut Finalizer, pendingNext: ?*mut Finalizer, env: *mut Env, data: ?*mut u8, hint: ?*mut u8, callback: Finalize, active: bool }
+struct LibraryUse { next: ?*mut LibraryUse, library: *mut Library }
+
+/// One `napi_env`.
+struct Env {
+  host: ?*mut u8, bridge: Bridge, owner: usize, error: ErrorInfo, version: NodeVersion,
+  arena: ?*mut Arena, scope: ?*mut Scope, refs: ?*mut Reference, natives: ?*mut Native,
+  libraries: ?*mut LibraryUse, finalizers: ?*mut Finalizer, pending: ?*mut Finalizer, async: ?*mut u8,
+  instanceData: ?*mut u8, instanceFinalize: Finalize, instanceHint: ?*mut u8, external: i64,
+  filename: ?*mut u8, loadError: ?*mut u8, apiVersion: i32, closing: bool
+}
+
+// Process-wide state.
+struct Library { next: ?*mut Library, handle: *mut u8, init: Init, references: usize }
+struct Libraries { first: ?*mut Library }
+impl Transferable for Libraries {}
+struct FatalContext { next: ?*mut FatalContext, thread: usize, context: *mut u8, report: FatalReport }
+struct Contexts { first: ?*mut FatalContext }
+impl Transferable for Contexts {}
+struct Global { libraries: Mutex<Libraries>, contexts: Mutex<Contexts> }
+
+unsafe extern "C" fn calloc(count: usize, size: usize) -> ?*mut u8
+unsafe extern "C" fn free(data: ?*mut u8) -> ()
+unsafe extern "C" fn abort() -> ()
+unsafe extern "C" fn strlen(text: *const u8) -> usize
+unsafe extern "C" fn pthread_self() -> usize
+unsafe extern "C" fn pthread_equal(a: usize, b: usize) -> i32
+unsafe extern "C" fn dlopen(path: *const u8, flags: i32) -> ?*mut u8
+unsafe extern "C" fn dlsym(handle: *mut u8, name: *const u8) -> ?*mut u8
+unsafe extern "C" fn dlclose(handle: *mut u8) -> i32
+unsafe extern "C" fn dlerror() -> ?*const u8
+@foreign(noCapture: .("buffer"))
+unsafe extern "C" fn write(fd: i32, buffer: *const u8, count: usize) -> isize
+
+fn nil() -> ?*mut u8 { return Pointer.null<u8>() }
+pub unsafe fn nn<T>(p: ?*mut T) -> *mut T { return unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(p) }
+pub unsafe fn raw<T>(p: *mut T) -> *mut u8 { return unsafe Intrinsic.pointerReinterpret<*mut T, *mut u8>(p) }
+pub unsafe fn cast<T>(p: ?*mut u8) -> *mut T { return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut T>(unsafe nn(p)) }
+pub fn text(name: &'static [u8]) -> *const u8 { return Pointer.fromRef<u8>(&name[0]) }
+pub unsafe fn allocate<T>() -> ?*mut T {
+  let p = unsafe calloc(1, Layout.of<T>().bytes)
+  if Pointer.isNull<u8>(p) { return Pointer.null<T>() }
+  return unsafe cast<T>(p)
+}
+pub unsafe fn store<T>(out: ?*mut T, value: T) -> () { unsafe Pointer.put<T>(unsafe nn(out), move value) }
+fn same(a: ?*mut u8, b: ?*mut u8) -> bool { return Pointer.address(a) == Pointer.address(b) }
+unsafe fn envOf(env: ?*mut u8) -> *mut Env { return unsafe cast<Env>(env) }
+/// The bits of a native code address, for comparing or storing it as data.
+pub unsafe fn bits<F: Copy>(f: F) -> usize { return unsafe Pointer.read<usize>(unsafe Intrinsic.pointerReinterpret<*const F, *const usize>(Pointer.fromRef<F>(&f))) }
+unsafe fn function<F: Copy>(address: *mut u8) -> F { let word = Pointer.address(address) return unsafe Pointer.read<F>(unsafe Intrinsic.pointerReinterpret<*const usize, *const F>(Pointer.fromRef<usize>(&word))) }
+
+fn globalWord() -> *mut u64 { return Intrinsic.processWord() }
+fn registrationWord() -> *mut u64 { return Intrinsic.processWord() }
+fn legacyWord() -> *mut u64 { return Intrinsic.processWord() }
+/// The process registry, made by the first caller. It is never freed.
+unsafe fn global() -> *mut Global {
+  let word = globalWord()
+  let current = unsafe Atomic.load<u64>(word, MemoryOrder.Acquire)
+  if current != 0 { return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Global>(unsafe nn(unsafe addressPointer(current))) }
+  let mut system = Allocator.systemAllocatorProvider()
+  let libraries = run Effect.result(Mutex<Libraries>.make(Libraries { first: Pointer.null<Library>() })) |> Effect.provideMut<Allocator>(&mut system)
+  let contexts = run Effect.result(Mutex<Contexts>.make(Contexts { first: Pointer.null<FatalContext>() })) |> Effect.provideMut<Allocator>(&mut system)
+  let made = unsafe allocate<Global>()
+  if Pointer.isNull<Global>(made) { Intrinsic.trap("the Node-API registry cannot be allocated") }
+  let first = match move libraries { Result<Mutex<Libraries>, OutOfMemoryError>.Success { value } => move value _ => Intrinsic.trap("the Node-API registry cannot be allocated") }
+  let second = match move contexts { Result<Mutex<Contexts>, OutOfMemoryError>.Success { value } => move value _ => Intrinsic.trap("the Node-API registry cannot be allocated") }
+  unsafe Pointer.put<Global>(unsafe nn(made), Global { libraries: move first, contexts: move second })
+  let address = usize.toU64(Pointer.address(made))
+  let raced = unsafe Atomic.compareExchange<u64>(word, 0, address, MemoryOrder.AcquireRelease, MemoryOrder.Acquire)
+  match move raced {
+    CompareExchange<u64>.Exchanged => { return unsafe nn(made) }
+    CompareExchange<u64>.Observed { value } => {
+      let lost = unsafe Pointer.take<Global>(unsafe nn(made)) drop lost unsafe free(unsafe raw(unsafe nn(made)))
+      return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Global>(unsafe nn(unsafe addressPointer(value)))
+    }
+  }
+}
+/// The same address as a mutable byte pointer, for bridge fields that C declares mutable.
+pub unsafe fn writable<T>(pointer: ?*const T) -> ?*mut u8 { return unsafe Pointer.read<?*mut u8>(unsafe Intrinsic.pointerReinterpret<*const ?*const T, *const ?*mut u8>(Pointer.fromRef<?*const T>(&pointer))) }
+unsafe fn addressPointer(address: u64) -> ?*mut u8 {
+  let word = u64.toUsize(address)
+  return unsafe Pointer.read<?*mut u8>(unsafe Intrinsic.pointerReinterpret<*const usize, *const ?*mut u8>(Pointer.fromRef<usize>(&word)))
+}
+
+// Owner checks and the last-error record.
+
+pub unsafe fn onOwner(env: ?*mut u8) -> bool {
+  if Pointer.isNull<u8>(env) { return false }
+  let a = () let e = unsafe Pointer.borrow<(), Env>(&a, unsafe envOf(env))
+  return unsafe pthread_equal(e.owner, unsafe pthread_self()) != 0
+}
+fn message(code: i32) -> &'static [u8] {
+  return match code {
+    0 => b"\0" 1 => b"Invalid argument\0" 2 => b"An object was expected\0" 3 => b"A string was expected\0"
+    4 => b"A string or symbol was expected\0" 5 => b"A function was expected\0" 6 => b"A number was expected\0"
+    7 => b"A boolean was expected\0" 8 => b"An array was expected\0" 9 => b"Unknown failure\0"
+    10 => b"An exception is pending\0" 11 => b"The async work item was cancelled\0" 12 => b"napi_escape_handle already called\0"
+    13 => b"Invalid handle scope usage\0" 14 => b"Invalid callback scope usage\0" 15 => b"Thread-safe function queue is full\0"
+    16 => b"Thread-safe function is closing\0" 17 => b"A bigint was expected\0" 18 => b"A date was expected\0"
+    19 => b"An arraybuffer was expected\0" 20 => b"A detachable arraybuffer was expected\0" 21 => b"Would deadlock\0"
+    22 => b"No external buffers allowed\0" 23 => b"Cannot run JavaScript\0"
+    _ => b"Unknown failure\0"
+  }
+}
+/// Records `code` as the environment's last error and returns it.
+pub unsafe fn status(env: ?*mut u8, code: i32) -> i32 {
+  if unsafe onOwner(env) {
+    let mut a = () let e = unsafe Pointer.borrowMut<(), Env>(&mut a, unsafe envOf(env))
+    e.error = ErrorInfo { message: Pointer.fromRef<u8>(&message(code)[0]), reserved: nil(), engineCode: 0, code: code }
+  }
+  return code
+}
+/// Runs a bridge operation for the owner thread.
+pub unsafe fn call(env: ?*mut u8, operation: i32, packet: &mut Packet) -> i32 {
+  if !unsafe onOwner(env) { return INVALID_ARG }
+  return unsafe status(env, unsafe bridgeRaw(env, operation, move packet))
+}
+unsafe fn bridgeRaw(env: ?*mut u8, operation: i32, packet: &mut Packet) -> i32 {
+  let a = () let e = unsafe Pointer.borrow<(), Env>(&a, unsafe envOf(env)) let host = e.host let bridge = e.bridge drop e
+  return unsafe bridge(host, operation, Pointer.fromMutRef<Packet>(move packet))
+}
+/// Fails with `napi_pending_exception` while JavaScript has thrown, as calls that run JavaScript must.
+pub unsafe fn check(env: ?*mut u8) -> i32 {
+  if !unsafe onOwner(env) { return INVALID_ARG }
+  let mut p = packet()
+  let code = unsafe bridgeRaw(env, PENDING, &mut p)
+  if code != 0 { return unsafe status(env, code) }
+  if p.flags != 0 { return unsafe status(env, PENDING_EXCEPTION) }
+  return unsafe status(env, OK)
+}
+pub unsafe fn closing(env: ?*mut u8) -> bool {
+  if Pointer.isNull<u8>(env) { return true }
+  let a = () let e = unsafe Pointer.borrow<(), Env>(&a, unsafe envOf(env)) return e.closing
+}
+pub unsafe fn apiVersion(env: ?*mut u8) -> i32 { let a = () let e = unsafe Pointer.borrow<(), Env>(&a, unsafe envOf(env)) return e.apiVersion }
+pub unsafe fn asyncState(env: ?*mut u8) -> ?*mut u8 {
+  if Pointer.isNull<u8>(env) { return nil() }
+  let a = () let e = unsafe Pointer.borrow<(), Env>(&a, unsafe envOf(env)) return e.async
+}
+pub unsafe fn setAsyncState(env: *mut u8, state: ?*mut u8) -> () { let mut a = () let e = unsafe Pointer.borrowMut<(), Env>(&mut a, unsafe envOf(env)) e.async = state }
+
+// Handles.
+
+/// The value a handle owns.
+pub unsafe fn payload(handle: *mut u8) -> *mut ValueBits {
+  let mut a = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut a, unsafe cast<Handle>(handle))
+  return Pointer.fromMutRef<ValueBits>(&mut h.value)
+}
+/// Whether `handle` is a live handle of `env`.
+pub unsafe fn belongs(env: ?*mut u8, handle: ?*mut u8) -> bool {
+  if Pointer.isNull<u8>(handle) { return false }
+  let a = () let h = unsafe Pointer.borrow<(), Handle>(&a, unsafe cast<Handle>(handle)) return same(unsafe raw(h.env), env)
+}
+unsafe fn initialize(env: ?*mut u8, slot: *mut Handle) -> () {
+  unsafe Pointer.put<Handle>(slot, Handle { env: unsafe envOf(env), value: ValueBits.Undefined })
+}
+/// A new handle in the current scope, holding undefined.
+pub unsafe fn slot(env: ?*mut u8) -> ?*mut u8 {
+  if !unsafe onOwner(env) { return nil() }
+  let mut a = () let e = unsafe Pointer.borrowMut<(), Env>(&mut a, unsafe envOf(env))
+  let mut full = Pointer.isNull<Arena>(e.arena)
+  if !full { let b = () let current = unsafe Pointer.borrow<(), Arena>(&b, unsafe nn(e.arena)) full = current.used == ARENA_SLOTS }
+  if full {
+    let arena = unsafe allocate<Arena>()
+    let slots = unsafe calloc(ARENA_SLOTS, Layout.of<Handle>().bytes)
+    if Pointer.isNull<Arena>(arena) || Pointer.isNull<u8>(slots) { unsafe free(unsafe Intrinsic.pointerReinterpret<?*mut Arena, ?*mut u8>(arena)) unsafe free(slots) return nil() }
+    unsafe Pointer.put<Arena>(unsafe nn(arena), Arena { previous: e.arena, used: 0, slots: unsafe cast<Handle>(slots) })
+    e.arena = arena
+  }
+  let mut b = () let current = unsafe Pointer.borrowMut<(), Arena>(&mut b, unsafe nn(e.arena))
+  let many = unsafe Pointer.assumeManyMut<Handle>(current.slots)
+  let handle = unsafe Pointer.atMut<Handle>(many, current.used)
+  current.used = current.used + 1
+  drop current drop e
+  unsafe initialize(env, handle)
+  return unsafe raw(handle)
+}
+/// A handle outside every scope, holding a duplicate of `value` or undefined. Release it with [`releaseRoot`].
+pub unsafe fn root(env: ?*mut u8, value: ?*mut u8) -> ?*mut u8 {
+  if Pointer.isNull<u8>(env) || (!Pointer.isNull<u8>(value) && !unsafe belongs(env, value)) { return nil() }
+  let handle = unsafe allocate<Handle>()
+  if Pointer.isNull<Handle>(handle) { return nil() }
+  unsafe initialize(env, unsafe nn(handle))
+  if Pointer.isNull<u8>(value) { return unsafe raw(unsafe nn(handle)) }
+  let mut p = packet() p.values[0] = value p.result = unsafe raw(unsafe nn(handle))
+  if unsafe call(env, DUPLICATE, &mut p) != OK { unsafe free(unsafe raw(unsafe nn(handle))) return nil() }
+  return unsafe raw(unsafe nn(handle))
+}
+pub unsafe fn releaseRoot(env: ?*mut u8, value: ?*mut u8) -> () {
+  if Pointer.isNull<u8>(value) { return () }
+  let mut p = packet() p.values[0] = value
+  let released = unsafe call(env, RELEASE, &mut p)
+  unsafe free(value)
+}
+/// Calls the JavaScript dispatcher operation `operation` (a C string) with `argc` handles.
+pub unsafe fn js(env: ?*mut u8, operation: *const u8, argc: usize, argv: ?*const ?*mut u8, result: ?*mut ?*mut u8) -> i32 {
+  let code = unsafe check(env)
+  if code != OK { return code }
+  if argc != 0 && Intrinsic.pointerIsNull<?*const ?*mut u8>(argv) { return unsafe status(env, INVALID_ARG) }
+  let mut i: usize = 0
+  while i < argc {
+    let many = unsafe Pointer.assumeMany<?*mut u8>(unsafe Intrinsic.pointerRequalify<?*const ?*mut u8, *const ?*mut u8>(argv))
+    if !unsafe belongs(env, unsafe Pointer.read<?*mut u8>(unsafe Pointer.at<?*mut u8>(many, i))) { return unsafe status(env, INVALID_ARG) }
+    i = i + 1
+  }
+  let r = unsafe slot(env)
+  if Pointer.isNull<u8>(r) { return unsafe status(env, GENERIC_FAILURE) }
+  let mut p = packet()
+  p.data = unsafe writable<u8>(operation) p.argc = argc p.argv = argv p.result = r
+  let called = unsafe call(env, JS, &mut p)
+  if called == OK && !Pointer.isNull<?*mut u8>(result) { unsafe store<?*mut u8>(result, r) }
+  return called
+}
+/// Runs a dispatcher operation that only reads metadata or allocates plain values. Node allows these
+/// while an exception is pending; that exception survives the call.
+pub unsafe fn pureJs(env: ?*mut u8, operation: *const u8, argc: usize, argv: ?*const ?*mut u8, result: ?*mut ?*mut u8) -> i32 {
+  if !unsafe onOwner(env) { return INVALID_ARG }
+  let mut pending = false
+  let mut code = unsafe napi_is_exception_pending(env, Pointer.fromMutRef<bool>(&mut pending))
+  if code != OK { return code }
+  let mut saved = nil()
+  if pending { code = unsafe napi_get_and_clear_last_exception(env, Pointer.fromMutRef<?*mut u8>(&mut saved)) if code != OK { return code } }
+  let mut ignored = nil()
+  let out = if Pointer.isNull<?*mut u8>(result) { Pointer.fromMutRef<?*mut u8>(&mut ignored) } else { unsafe nn(result) }
+  let ran = unsafe js(env, operation, argc, argv, out)
+  if pending {
+    let mut p = packet() p.values[0] = saved
+    let restored = unsafe call(env, THROW, &mut p)
+    if restored != OK { return restored }
+  }
+  return unsafe status(env, ran)
+}
+/// `napi_typeof`, with externals told apart from objects.
+pub unsafe fn typeOf(env: ?*mut u8, value: ?*mut u8, result: *mut i32) -> i32 {
+  if !unsafe onOwner(env) { return INVALID_ARG }
+  if !unsafe belongs(env, value) { return unsafe status(env, INVALID_ARG) }
+  let mut p = packet() p.values[0] = value
+  let code = unsafe call(env, TYPEOF, &mut p)
+  if code != OK { return code }
+  let mut kind = p.flags
+  if kind == TYPE_OBJECT {
+    let argument = value let mut flag = nil()
+    let ran = unsafe pureJs(env, text(b"externalType\0"), 1, Pointer.fromRef<?*mut u8>(&argument), Pointer.fromMutRef<?*mut u8>(&mut flag))
+    if ran != OK { return ran }
+    let mut q = packet() q.values[0] = flag
+    let read = unsafe call(env, READ_NUMBER, &mut q)
+    if read != OK { return read }
+    if q.number != 0.0 { kind = TYPE_EXTERNAL }
+  }
+  unsafe Pointer.put<i32>(result, kind)
+  return OK
+}
+/// A new handle with a primitive made by `operation` from `p`.
+pub unsafe fn primitive(env: ?*mut u8, operation: i32, p: &mut Packet, result: ?*mut ?*mut u8) -> i32 {
+  if !unsafe onOwner(env) { return INVALID_ARG }
+  if Pointer.isNull<?*mut u8>(result) { return unsafe status(env, INVALID_ARG) }
+  p.result = unsafe slot(env)
+  if Pointer.isNull<u8>(p.result) { return unsafe status(env, GENERIC_FAILURE) }
+  let code = unsafe call(env, operation, &mut p)
+  if code != OK { return code }
+  unsafe store<?*mut u8>(result, p.result)
+  return OK
+}
+pub unsafe fn number(env: ?*mut u8, value: f64, result: ?*mut ?*mut u8) -> i32 { let mut p = packet() p.number = value return unsafe primitive(env, NUMBER, &mut p, result) }
+/// A string from `length` units at `data`, or up to a NUL when `length` is `NAPI_AUTO_LENGTH`.
+/// `encoding` is 0 for UTF-8, 1 for Latin-1 and 2 for UTF-16.
+pub unsafe fn string(env: ?*mut u8, data: ?*const u8, length: usize, encoding: i32, result: ?*mut ?*mut u8) -> i32 {
+  if !unsafe onOwner(env) { return INVALID_ARG }
+  if Intrinsic.pointerIsNull<?*const u8>(data) && length != 0 { return unsafe status(env, INVALID_ARG) }
+  let mut count = length
+  if length == AUTO_LENGTH {
+    count = 0
+    let start = unsafe Intrinsic.pointerRequalify<?*const u8, *const u8>(data)
+    if encoding == 2 {
+      let units = unsafe Pointer.assumeMany<u16>(unsafe Intrinsic.pointerReinterpret<*const u8, *const u16>(start))
+      while unsafe Pointer.read<u16>(unsafe Pointer.at<u16>(units, count)) != 0 { count = count + 1 }
+    } else { count = unsafe strlen(start) }
+  }
+  let mut p = packet() p.data = unsafe writable<u8>(data) p.size = count p.flags = encoding
+  return unsafe primitive(env, STRING, &mut p, result)
+}
+
+// Exceptions.
+
+pub export "C" fn napi_is_exception_pending(env: ?*mut u8, result: ?*mut bool) -> i32 {
+  if Pointer.isNull<bool>(result) { return unsafe status(env, INVALID_ARG) }
+  let mut p = packet()
+  let code = unsafe call(env, PENDING, &mut p)
+  if code == OK { unsafe store<bool>(result, p.flags != 0) }
+  return code
+}
+pub export "C" fn napi_get_and_clear_last_exception(env: ?*mut u8, result: ?*mut ?*mut u8) -> i32 {
+  if Pointer.isNull<u8>(env) || Pointer.isNull<?*mut u8>(result) { return unsafe status(env, INVALID_ARG) }
+  let v = unsafe slot(env)
+  if Pointer.isNull<u8>(v) { return unsafe status(env, GENERIC_FAILURE) }
+  let mut p = packet() p.result = v
+  let code = unsafe call(env, CLEAR_EXCEPTION, &mut p)
+  if code == OK { unsafe store<?*mut u8>(result, v) }
+  return code
+}
+pub export "C" fn napi_throw(env: ?*mut u8, error: ?*mut u8) -> i32 {
+  let code = unsafe check(env)
+  if code != OK { return code }
+  if !unsafe belongs(env, error) { return unsafe status(env, INVALID_ARG) }
+  let mut p = packet() p.values[0] = error
+  return unsafe call(env, THROW, &mut p)
+}
+pub export "C" fn napi_get_last_error_info(env: ?*mut u8, result: ?*mut *const ErrorInfo) -> i32 {
+  if Pointer.isNull<*const ErrorInfo>(result) || !unsafe onOwner(env) { return INVALID_ARG }
+  let mut a = () let e = unsafe Pointer.borrowMut<(), Env>(&mut a, unsafe envOf(env))
+  unsafe store<*const ErrorInfo>(result, Pointer.fromRef<ErrorInfo>(&e.error))
+  return OK
+}
+
+// Handle scopes.
+
+pub export "C" fn napi_open_handle_scope(env: ?*mut u8, result: ?*mut ?*mut u8) -> i32 {
+  if Pointer.isNull<?*mut u8>(result) || !unsafe onOwner(env) { return INVALID_ARG }
+  let scope = unsafe allocate<Scope>()
+  if Pointer.isNull<Scope>(scope) { return unsafe status(env, GENERIC_FAILURE) }
+  let mut a = () let e = unsafe Pointer.borrowMut<(), Env>(&mut a, unsafe envOf(env))
+  let mut used: usize = 0
+  if !Pointer.isNull<Arena>(e.arena) { let b = () let arena = unsafe Pointer.borrow<(), Arena>(&b, unsafe nn(e.arena)) used = arena.used }
+  unsafe Pointer.put<Scope>(unsafe nn(scope), Scope { env: unsafe envOf(env), previous: e.scope, arena: e.arena, used: used, escapable: false, escaped: false, escape: nil() })
+  e.scope = scope drop e
+  unsafe store<?*mut u8>(result, unsafe raw(unsafe nn(scope)))
+  return unsafe status(env, OK)
+}
+/// Releases every handle made after the checkpoint `(mark, used)`, freeing arenas past it.
+unsafe fn unwind(env: ?*mut u8, mark: ?*mut Arena, used: usize) -> () {
+  while true {
+    let mut a = () let e = unsafe Pointer.borrowMut<(), Env>(&mut a, unsafe envOf(env))
+    let current = e.arena drop e
+    if Pointer.isNull<Arena>(current) { return () }
+    let atMark = Pointer.address(current) == Pointer.address(mark)
+    let end = if atMark { used } else { 0 }
+    while true {
+      let mut b = () let arena = unsafe Pointer.borrowMut<(), Arena>(&mut b, unsafe nn(current))
+      if arena.used <= end { break }
+      arena.used = arena.used - 1
+      let many = unsafe Pointer.assumeManyMut<Handle>(arena.slots)
+      let handle = unsafe raw(unsafe Pointer.atMut<Handle>(many, arena.used)) drop arena
+      let mut p = packet() p.values[0] = handle
+      let released = unsafe bridgeRaw(env, RELEASE, &mut p)
+    }
+    if atMark { return () }
+    let b = () let arena = unsafe Pointer.borrow<(), Arena>(&b, unsafe nn(current)) let previous = arena.previous let slots = arena.slots drop arena
+    let e2 = unsafe Pointer.borrowMut<(), Env>(&mut a, unsafe envOf(env)) e2.arena = previous drop e2
+    unsafe free(unsafe raw(slots)) unsafe free(unsafe raw(unsafe nn(current)))
+  }
+}
+pub export "C" fn napi_close_handle_scope(env: ?*mut u8, scope: ?*mut u8) -> i32 {
+  if Pointer.isNull<u8>(scope) || !unsafe onOwner(env) { return INVALID_ARG }
+  let mut a = () let e = unsafe Pointer.borrowMut<(), Env>(&mut a, unsafe envOf(env))
+  let current = unsafe Intrinsic.pointerReinterpret<?*mut Scope, ?*mut u8>(e.scope)
+  if !same(current, scope) { return unsafe status(env, HANDLE_SCOPE_MISMATCH) }
+  let entry = unsafe Pointer.take<Scope>(unsafe cast<Scope>(scope))
+  if entry.escapable { unsafe Pointer.put<Scope>(unsafe cast<Scope>(scope), move entry) return unsafe status(env, HANDLE_SCOPE_MISMATCH) }
+  e.scope = entry.previous drop e
+  unsafe free(scope)
+  unsafe unwind(env, entry.arena, entry.used)
+  return unsafe status(env, OK)
+}
+pub export "C" fn napi_open_escapable_handle_scope(env: ?*mut u8, result: ?*mut ?*mut u8) -> i32 {
+  if Pointer.isNull<u8>(env) || Pointer.isNull<?*mut u8>(result) { return INVALID_ARG }
+  // The escape slot belongs to the parent, so take it before the child's checkpoint.
+  let escape = unsafe slot(env)
+  if Pointer.isNull<u8>(escape) { return unsafe status(env, GENERIC_FAILURE) }
+  let mut scope = nil()
+  let code = unsafe napi_open_handle_scope(env, Pointer.fromMutRef<?*mut u8>(&mut scope))
+  if code != OK { return code }
+  let mut a = () let s = unsafe Pointer.borrowMut<(), Scope>(&mut a, unsafe cast<Scope>(scope))
+  s.escapable = true s.escape = escape drop s
+  unsafe store<?*mut u8>(result, scope)
+  return OK
+}
+unsafe fn currentEscapable(env: ?*mut u8, scope: ?*mut u8) -> bool {
+  if Pointer.isNull<u8>(env) || Pointer.isNull<u8>(scope) { return false }
+  let a = () let e = unsafe Pointer.borrow<(), Env>(&a, unsafe envOf(env))
+  if !same(unsafe Intrinsic.pointerReinterpret<?*mut Scope, ?*mut u8>(e.scope), scope) { return false }
+  let s = unsafe Pointer.borrow<(), Scope>(&a, unsafe cast<Scope>(scope)) return s.escapable
+}
+pub export "C" fn napi_close_escapable_handle_scope(env: ?*mut u8, scope: ?*mut u8) -> i32 {
+  if !unsafe currentEscapable(env, scope) { return unsafe status(env, HANDLE_SCOPE_MISMATCH) }
+  let mut a = () let s = unsafe Pointer.borrowMut<(), Scope>(&mut a, unsafe cast<Scope>(scope)) s.escapable = false drop s
+  return unsafe napi_close_handle_scope(env, scope)
+}
+pub export "C" fn napi_escape_handle(env: ?*mut u8, scope: ?*mut u8, value: ?*mut u8, result: ?*mut ?*mut u8) -> i32 {
+  if Pointer.isNull<u8>(scope) || Pointer.isNull<?*mut u8>(result) || !unsafe belongs(env, value) { return unsafe status(env, INVALID_ARG) }
+  if !unsafe currentEscapable(env, scope) { return unsafe status(env, HANDLE_SCOPE_MISMATCH) }
+  let mut a = () let s = unsafe Pointer.borrowMut<(), Scope>(&mut a, unsafe cast<Scope>(scope))
+  if s.escaped { return unsafe status(env, ESCAPE_CALLED_TWICE) }
+  let escape = s.escape drop s
+  let mut p = packet() p.values[0] = value p.result = escape
+  let code = unsafe call(env, DUPLICATE, &mut p)
+  if code == OK {
+    let s2 = unsafe Pointer.borrowMut<(), Scope>(&mut a, unsafe cast<Scope>(scope)) s2.escaped = true drop s2
+    unsafe store<?*mut u8>(result, escape)
+  }
+  return code
+}
+/// Opens the scope a native callback runs in. A failure here is fatal, as in Node.
+pub unsafe fn enterCallback(env: *mut u8) -> *mut u8 {
+  let mut scope = nil()
+  if unsafe napi_open_handle_scope(unsafe raw(env), Pointer.fromMutRef<?*mut u8>(&mut scope)) != OK { unsafe fatal(b"SilkJS", b"Cannot open native callback scope") }
+  return unsafe nn(scope)
+}
+pub unsafe fn leaveCallback(env: *mut u8, scope: *mut u8) -> () {
+  if unsafe napi_close_handle_scope(unsafe raw(env), unsafe raw(scope)) != OK { unsafe fatal(b"SilkJS", b"Native addon left handle scopes open") }
+}
+
+// References.
+
+unsafe fn referenceOf(env: ?*mut u8, ref: ?*mut u8) -> bool {
+  if Pointer.isNull<u8>(ref) || !unsafe onOwner(env) { return false }
+  let a = () let r = unsafe Pointer.borrow<(), Reference>(&a, unsafe cast<Reference>(ref)) return same(unsafe raw(r.env), env)
+}
+unsafe fn releaseWeak(env: ?*mut u8, weak: ?*mut u8) -> () {
+  if Pointer.isNull<u8>(weak) { return () }
+  let mut p = packet() p.values[0] = weak
+  let released = unsafe call(env, WEAK_RELEASE, &mut p)
+  unsafe free(weak)
+}
+pub export "C" fn napi_create_reference(env: ?*mut u8, value: ?*mut u8, count: u32, result: ?*mut ?*mut u8) -> i32 {
+  if !unsafe onOwner(env) { return INVALID_ARG }
+  if !unsafe belongs(env, value) || Pointer.isNull<?*mut u8>(result) { return unsafe status(env, INVALID_ARG) }
+  let mut kind: i32 = 0
+  let typed = unsafe typeOf(env, value, Pointer.fromMutRef<i32>(&mut kind))
+  if typed != OK { return typed }
+  let weakable = kind == TYPE_OBJECT || kind == TYPE_FUNCTION || kind == TYPE_SYMBOL || kind == TYPE_EXTERNAL
+  if !weakable && unsafe apiVersion(env) < 10 { return unsafe status(env, INVALID_ARG) }
+  let ref = unsafe allocate<Reference>()
+  if Pointer.isNull<Reference>(ref) { return unsafe status(env, GENERIC_FAILURE) }
+  let mut weak = nil()
+  if weakable {
+    weak = unsafe root(env, nil())
+    if Pointer.isNull<u8>(weak) { unsafe free(unsafe raw(unsafe nn(ref))) return unsafe status(env, GENERIC_FAILURE) }
+    let mut p = packet() p.values[0] = value p.result = weak
+    let made = unsafe call(env, WEAK, &mut p)
+    if made != OK { unsafe free(weak) unsafe free(unsafe raw(unsafe nn(ref))) return made }
+  }
+  let mut strong = nil()
+  if count != 0 {
+    strong = unsafe root(env, value)
+    if Pointer.isNull<u8>(strong) { unsafe releaseWeak(env, weak) unsafe free(unsafe raw(unsafe nn(ref))) return unsafe status(env, GENERIC_FAILURE) }
+  }
+  let mut a = () let e = unsafe Pointer.borrowMut<(), Env>(&mut a, unsafe envOf(env))
+  unsafe Pointer.put<Reference>(unsafe nn(ref), Reference { env: unsafe envOf(env), next: e.refs, count: count, strong: strong, weak: weak })
+  e.refs = ref drop e
+  unsafe store<?*mut u8>(result, unsafe raw(unsafe nn(ref)))
+  return unsafe status(env, OK)
+}
+pub export "C" fn napi_delete_reference(env: ?*mut u8, ref: ?*mut u8) -> i32 {
+  if !unsafe referenceOf(env, ref) { return INVALID_ARG }
+  let target = unsafe cast<Reference>(ref)
+  let mut a = () let e = unsafe Pointer.borrowMut<(), Env>(&mut a, unsafe envOf(env))
+  let b = () let r = unsafe Pointer.borrow<(), Reference>(&b, target) let next = r.next drop r
+  if Pointer.address(e.refs) == Pointer.address(target) { e.refs = next drop e } else {
+    let mut p = e.refs drop e
+    let mut found = false
+    while !Pointer.isNull<Reference>(p) {
+      let mut c = () let entry = unsafe Pointer.borrowMut<(), Reference>(&mut c, unsafe nn(p))
+      if Pointer.address(entry.next) == Pointer.address(target) { entry.next = next found = true break }
+      p = entry.next
+    }
+    if !found { return unsafe status(env, INVALID_ARG) }
+  }
+  let entry = unsafe Pointer.take<Reference>(target)
+  unsafe free(ref)
+  unsafe releaseRoot(env, entry.strong)
+  unsafe releaseWeak(env, entry.weak)
+  return unsafe status(env, OK)
+}
+pub export "C" fn napi_get_reference_value(env: ?*mut u8, ref: ?*mut u8, result: ?*mut ?*mut u8) -> i32 {
+  if !unsafe referenceOf(env, ref) || Pointer.isNull<?*mut u8>(result) { return INVALID_ARG }
+  let a = () let r = unsafe Pointer.borrow<(), Reference>(&a, unsafe cast<Reference>(ref)) let strong = r.strong let weak = r.weak drop r
+  if Pointer.isNull<u8>(strong) && Pointer.isNull<u8>(weak) { unsafe store<?*mut u8>(result, nil()) return unsafe status(env, OK) }
+  let value = unsafe slot(env)
+  if Pointer.isNull<u8>(value) { return unsafe status(env, GENERIC_FAILURE) }
+  let mut p = packet() p.result = value
+  let mut operation = WEAK_GET
+  if Pointer.isNull<u8>(strong) { p.values[0] = weak } else { p.values[0] = strong operation = DUPLICATE }
+  let code = unsafe call(env, operation, &mut p)
+  if code == OK { unsafe store<?*mut u8>(result, if p.flags != 0 { nil() } else { value }) }
+  return code
+}
+pub export "C" fn napi_reference_ref(env: ?*mut u8, ref: ?*mut u8, result: ?*mut u32) -> i32 {
+  if !unsafe referenceOf(env, ref) { return INVALID_ARG }
+  let mut a = () let r = unsafe Pointer.borrow<(), Reference>(&a, unsafe cast<Reference>(ref)) let count = r.count drop r
+  if count == u32.MAX { return INVALID_ARG }
+  if count == 0 {
+    let mut value = nil()
+    let code = unsafe napi_get_reference_value(env, ref, Pointer.fromMutRef<?*mut u8>(&mut value))
+    if code != OK { return code }
+    if Pointer.isNull<u8>(value) { if !Pointer.isNull<u32>(result) { unsafe store<u32>(result, 0) } return unsafe status(env, OK) }
+    let strong = unsafe root(env, value)
+    if Pointer.isNull<u8>(strong) { return unsafe status(env, GENERIC_FAILURE) }
+    let r2 = unsafe Pointer.borrowMut<(), Reference>(&mut a, unsafe cast<Reference>(ref)) r2.strong = strong drop r2
+  }
+  let r3 = unsafe Pointer.borrowMut<(), Reference>(&mut a, unsafe cast<Reference>(ref)) r3.count = r3.count + 1 let after = r3.count drop r3
+  if !Pointer.isNull<u32>(result) { unsafe store<u32>(result, after) }
+  return unsafe status(env, OK)
+}
+pub export "C" fn napi_reference_unref(env: ?*mut u8, ref: ?*mut u8, result: ?*mut u32) -> i32 {
+  if !unsafe referenceOf(env, ref) { return INVALID_ARG }
+  let mut a = () let r = unsafe Pointer.borrowMut<(), Reference>(&mut a, unsafe cast<Reference>(ref))
+  if r.count == 0 { return unsafe status(env, GENERIC_FAILURE) }
+  r.count = r.count - 1
+  let after = r.count let strong = r.strong
+  if after == 0 { r.strong = nil() }
+  drop r
+  if after == 0 { unsafe releaseRoot(env, strong) }
+  if !Pointer.isNull<u32>(result) { unsafe store<u32>(result, after) }
+  return unsafe status(env, OK)
+}
+
+// Native functions.
+
+@deferredCallbacks("callback")
+pub unsafe export "C" fn napi_create_function(env: ?*mut u8, name: ?*const u8, length: usize, callback: ?extern "C" fn(?*mut u8, ?*mut u8) -> ?*mut u8, data: ?*mut u8, result: ?*mut ?*mut u8) -> i32 {
+  let mut code = unsafe check(env)
+  if code != OK { return code }
+  if Intrinsic.pointerIsNull<?extern "C" fn(?*mut u8, ?*mut u8) -> ?*mut u8>(callback) || Pointer.isNull<?*mut u8>(result) { return unsafe status(env, INVALID_ARG) }
+  let native = unsafe allocate<Native>()
+  if Pointer.isNull<Native>(native) { return unsafe status(env, GENERIC_FAILURE) }
+  let mut a = () let e = unsafe Pointer.borrowMut<(), Env>(&mut a, unsafe envOf(env))
+  unsafe Pointer.put<Native>(unsafe nn(native), Native { next: e.natives, env: unsafe envOf(env), callback: unsafe Intrinsic.pointerRequalify<?extern "C" fn(?*mut u8, ?*mut u8) -> ?*mut u8, Callback>(callback), data: data })
+  e.natives = native drop e
+  let mut args = [nil(), nil()]
+  let empty = b"\0"
+  if Intrinsic.pointerIsNull<?*const u8>(name) { code = unsafe string(env, Pointer.fromRef<u8>(&empty[0]), 0, 0, Pointer.fromMutRef<?*mut u8>(&mut args[0])) }
+  else { code = unsafe string(env, name, length, 0, Pointer.fromMutRef<?*mut u8>(&mut args[0])) }
+  if code == OK { code = unsafe number(env, usize.toF64(Pointer.address(native)), Pointer.fromMutRef<?*mut u8>(&mut args[1])) }
+  if code == OK { code = unsafe js(env, text(b"makeFunction\0"), 2, Pointer.fromRef<?*mut u8>(&args[0]), result) }
+  return code
+}
+pub unsafe fn callbackEnv(id: usize) -> ?*mut u8 {
+  if id == 0 { return nil() }
+  let a = () let n = unsafe Pointer.borrow<(), Native>(&a, unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Native>(unsafe nn(unsafe addressPointer(usize.toU64(id))))) return unsafe raw(n.env)
+}
+/// Runs the native function `id`. Returns a rooted result, or null.
+pub unsafe fn invoke(env: *mut u8, id: usize, receiver: *mut u8, target: ?*mut u8, argc: usize, argv: ?*const ?*mut u8) -> ?*mut u8 {
+  let native = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Native>(unsafe nn(unsafe addressPointer(usize.toU64(id))))
+  let a = () let n = unsafe Pointer.borrow<(), Native>(&a, native)
+  if !same(unsafe raw(n.env), unsafe raw(env)) || !unsafe onOwner(unsafe raw(env)) { return nil() }
+  let callback = n.callback drop n
+  let scope = unsafe enterCallback(env)
+  let mut info = CallbackInfo { env: unsafe envOf(unsafe raw(env)), native: native, receiver: unsafe raw(receiver), target: target, argc: argc, argv: argv }
+  let result = unsafe callback(unsafe raw(env), unsafe raw(Pointer.fromMutRef<CallbackInfo>(&mut info)))
+  let owned = unsafe root(unsafe raw(env), result)
+  unsafe leaveCallback(env, scope)
+  return owned
+}
+unsafe fn infoOf(env: ?*mut u8, info: ?*mut u8) -> bool {
+  if Pointer.isNull<u8>(info) || !unsafe onOwner(env) { return false }
+  let a = () let i = unsafe Pointer.borrow<(), CallbackInfo>(&a, unsafe cast<CallbackInfo>(info)) return same(unsafe raw(i.env), env)
+}
+pub export "C" fn napi_get_cb_info(env: ?*mut u8, info: ?*mut u8, argc: ?*mut usize, argv: ?*mut ?*mut u8, receiver: ?*mut ?*mut u8, data: ?*mut ?*mut u8) -> i32 {
+  if !unsafe infoOf(env, info) || (Pointer.isNull<usize>(argc) && !Pointer.isNull<?*mut u8>(argv)) { return unsafe status(env, INVALID_ARG) }
+  let a = () let i = unsafe Pointer.borrow<(), CallbackInfo>(&a, unsafe cast<CallbackInfo>(info))
+  let count = i.argc let given = i.argv let self = i.receiver let native = i.native drop i
+  if !Pointer.isNull<usize>(argc) {
+    let capacity = unsafe Pointer.read<usize>(unsafe nn(argc))
+    if !Pointer.isNull<?*mut u8>(argv) {
+      let out = unsafe Pointer.assumeManyMut<?*mut u8>(unsafe nn(argv))
+      let mut k: usize = 0
+      while k < capacity {
+        if k < count {
+          let source = unsafe Pointer.assumeMany<?*mut u8>(unsafe Intrinsic.pointerRequalify<?*const ?*mut u8, *const ?*mut u8>(given))
+          unsafe Pointer.put<?*mut u8>(unsafe Pointer.atMut<?*mut u8>(out, k), unsafe Pointer.read<?*mut u8>(unsafe Pointer.at<?*mut u8>(source, k)))
+        } else {
+          let mut p = packet()
+          let mut filler = nil()
+          let code = unsafe primitive(env, UNDEFINED, &mut p, Pointer.fromMutRef<?*mut u8>(&mut filler))
+          if code != OK { return code }
+          unsafe Pointer.put<?*mut u8>(unsafe Pointer.atMut<?*mut u8>(out, k), filler)
+        }
+        k = k + 1
+      }
+    }
+    unsafe store<usize>(argc, count)
+  }
+  if !Pointer.isNull<?*mut u8>(receiver) { unsafe store<?*mut u8>(receiver, self) }
+  if !Pointer.isNull<?*mut u8>(data) { let n = unsafe Pointer.borrow<(), Native>(&a, native) unsafe store<?*mut u8>(data, n.data) }
+  return unsafe status(env, OK)
+}
+pub export "C" fn napi_get_new_target(env: ?*mut u8, info: ?*mut u8, result: ?*mut ?*mut u8) -> i32 {
+  if !unsafe infoOf(env, info) || Pointer.isNull<?*mut u8>(result) { return unsafe status(env, INVALID_ARG) }
+  let a = () let i = unsafe Pointer.borrow<(), CallbackInfo>(&a, unsafe cast<CallbackInfo>(info))
+  unsafe store<?*mut u8>(result, i.target)
+  return unsafe status(env, OK)
+}
+
+// Finalizers.
+
+/// Registers a native finalizer; its address is the id that JavaScript records carry.
+pub unsafe fn finalizer(env: ?*mut u8, data: ?*mut u8, callback: Finalize, hint: ?*mut u8) -> usize {
+  let f = unsafe allocate<Finalizer>()
+  if Pointer.isNull<Finalizer>(f) { return 0 }
+  let mut a = () let e = unsafe Pointer.borrowMut<(), Env>(&mut a, unsafe envOf(env))
+  unsafe Pointer.put<Finalizer>(unsafe nn(f), Finalizer { next: e.finalizers, pendingNext: e.pending, env: unsafe envOf(env), data: data, hint: hint, callback: callback, active: true })
+  e.finalizers = f e.pending = f
+  return Pointer.address(f)
+}
+unsafe fn finalizerAt(id: usize) -> *mut Finalizer { return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Finalizer>(unsafe nn(unsafe addressPointer(usize.toU64(id)))) }
+pub unsafe fn finalizerEnv(id: usize) -> ?*mut u8 {
+  if id == 0 { return nil() }
+  let a = () let f = unsafe Pointer.borrow<(), Finalizer>(&a, unsafe finalizerAt(id)) return unsafe raw(f.env)
+}
+pub unsafe fn finalizerData(env: ?*mut u8, id: usize) -> ?*mut u8 {
+  if id == 0 { return nil() }
+  let a = () let f = unsafe Pointer.borrow<(), Finalizer>(&a, unsafe finalizerAt(id))
+  if !same(unsafe raw(f.env), env) { return nil() }
+  return f.data
+}
+pub unsafe fn cancelFinalizer(env: ?*mut u8, id: usize) -> () {
+  if id == 0 { return () }
+  let mut a = () let f = unsafe Pointer.borrowMut<(), Finalizer>(&mut a, unsafe finalizerAt(id))
+  if same(unsafe raw(f.env), env) { f.active = false }
+}
+pub unsafe fn finalize(env: *mut u8, id: usize) -> () {
+  if id == 0 { return () }
+  let mut a = () let f = unsafe Pointer.borrowMut<(), Finalizer>(&mut a, unsafe finalizerAt(id))
+  if !same(unsafe raw(f.env), unsafe raw(env)) || !f.active { return () }
+  f.active = false
+  let callback = f.callback let data = f.data let hint = f.hint drop f
+  if Intrinsic.pointerIsNull<Finalize>(callback) { return () }
+  let present = unsafe Intrinsic.pointerRequalify<Finalize, extern "C" fn(?*mut u8, ?*mut u8, ?*mut u8) -> ()>(callback)
+  let scope = unsafe enterCallback(env)
+  unsafe present(unsafe raw(env), data, hint)
+  unsafe leaveCallback(env, scope)
+}
+unsafe fn drainFinalizers(env: *mut u8) -> () {
+  while true {
+    let mut a = () let e = unsafe Pointer.borrowMut<(), Env>(&mut a, unsafe envOf(unsafe raw(env)))
+    let f = e.pending
+    if Pointer.isNull<Finalizer>(f) { return () }
+    let b = () let entry = unsafe Pointer.borrow<(), Finalizer>(&b, unsafe nn(f)) e.pending = entry.pendingNext drop entry drop e
+    unsafe finalize(env, Pointer.address(f))
+  }
+}
+
+// Fatal errors.
+
+/// Sets the report context `napi_fatal_error` uses on the calling thread, or clears it.
+pub unsafe fn setFatalContext(context: ?*mut u8, report: FatalReport) -> () {
+  let g = unsafe global()
+  let a = () let state = unsafe Pointer.borrow<(), Global>(&a, g)
+  let thread = unsafe pthread_self()
+  let mut guard = state.contexts.lock()
+  let contexts = guard.getMut()
+  let mut p = contexts.first
+  let mut previous = Pointer.null<FatalContext>()
+  let mut b = ()
+  while !Pointer.isNull<FatalContext>(p) {
+    let entry = unsafe Pointer.borrowMut<(), FatalContext>(&mut b, unsafe nn(p))
+    if unsafe pthread_equal(entry.thread, thread) != 0 {
+      if !Pointer.isNull<u8>(context) { entry.context = unsafe nn(context) entry.report = report return () }
+      let next = entry.next drop entry
+      if Pointer.isNull<FatalContext>(previous) { contexts.first = next } else { let before = unsafe Pointer.borrowMut<(), FatalContext>(&mut b, unsafe nn(previous)) before.next = next drop before }
+      unsafe free(unsafe raw(unsafe nn(p)))
+      return ()
+    }
+    previous = p
+    p = entry.next
+  }
+  if Pointer.isNull<u8>(context) { return () }
+  let added = unsafe allocate<FatalContext>()
+  if Pointer.isNull<FatalContext>(added) { return () }
+  unsafe Pointer.put<FatalContext>(unsafe nn(added), FatalContext { next: contexts.first, thread: thread, context: unsafe nn(context), report: report })
+  contexts.first = added
+}
+unsafe fn fatalContext() -> ?*mut FatalContext {
+  let word = unsafe Atomic.load<u64>(globalWord(), MemoryOrder.Acquire)
+  if word == 0 { return Pointer.null<FatalContext>() }
+  let g = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Global>(unsafe nn(unsafe addressPointer(word)))
+  let a = () let state = unsafe Pointer.borrow<(), Global>(&a, g)
+  // A fatal error can happen while the registry is locked; then no report is written.
+  let held = state.contexts.tryLock()
+  let mut guard = match move held { Option<MutexGuard<Contexts>>.Some { value } => move value Option<MutexGuard<Contexts>>.None => { return Pointer.null<FatalContext>() } }
+  let thread = unsafe pthread_self()
+  let mut p = guard.get().first
+  while !Pointer.isNull<FatalContext>(p) {
+    let entry = unsafe Pointer.borrow<(), FatalContext>(&a, unsafe nn(p))
+    if unsafe pthread_equal(entry.thread, thread) != 0 { return p }
+    p = entry.next
+  }
+  return Pointer.null<FatalContext>()
+}
+unsafe fn writeAll(bytes: &[u8]) -> () {
+  let mut done: usize = 0
+  while done < bytes.length {
+    let wrote = unsafe write(2, Pointer.fromRef<u8>(&bytes[done]), bytes.length - done)
+    if wrote <= 0 { return () }
+    done = done + isize.toUsize(wrote)
+  }
+}
+fn start(bytes: &[u8]) -> *const u8 { if bytes.length == 0 { return text(b"\0") } return Pointer.fromRef<u8>(&bytes[0]) }
+unsafe fn fatal(location: &[u8], what: &[u8]) -> () {
+  let context = unsafe fatalContext()
+  // The entry stays valid: its thread is the one failing, and only that thread removes it.
+  if !Pointer.isNull<FatalContext>(context) {
+    let a = () let entry = unsafe Pointer.borrow<(), FatalContext>(&a, unsafe nn(context))
+    let report = entry.report
+    unsafe report(entry.context, start(location), location.length, start(what), what.length)
+  }
+  unsafe writeAll(b"FATAL ERROR: ") unsafe writeAll(location) unsafe writeAll(b" ") unsafe writeAll(what) unsafe writeAll(b"\n")
+  unsafe abort()
+  Intrinsic.trap("abort returned")
+}
+unsafe fn bytesAt<'a>(anchor: &'a (), data: ?*const u8, length: usize) -> &'a [u8] {
+  if Intrinsic.pointerIsNull<?*const u8>(data) { return b"" }
+  let start = unsafe Intrinsic.pointerRequalify<?*const u8, *const u8>(data)
+  let count = if length == AUTO_LENGTH { unsafe strlen(start) } else { length }
+  return unsafe Pointer.borrowMany<(), u8>(anchor, unsafe Pointer.assumeMany<u8>(start), count)
+}
+pub export "C" fn napi_fatal_error(location: ?*const u8, locationLength: usize, message: ?*const u8, messageLength: usize) -> () {
+  let a = ()
+  unsafe fatal(unsafe bytesAt(&a, location, locationLength), unsafe bytesAt(&a, message, messageLength))
+}
+/// Hands a pending exception to the owner isolate's fatal-exception dispatcher.
+pub unsafe fn fatalPending(env: *mut u8) -> () {
+  let mut pending = false
+  let checked = unsafe napi_is_exception_pending(unsafe raw(env), Pointer.fromMutRef<bool>(&mut pending))
+  if !pending { return () }
+  let mut error = nil()
+  let cleared = unsafe napi_get_and_clear_last_exception(unsafe raw(env), Pointer.fromMutRef<?*mut u8>(&mut error))
+  // The dispatcher reports and terminates; worker termination stays an uncatchable engine
+  // exception, not exit(1).
+  let argument = error
+  let handled = unsafe js(unsafe raw(env), text(b"fatalException\0"), 1, Pointer.fromRef<?*mut u8>(&argument), Pointer.null<?*mut u8>())
+}
+
+// Versions and instance data.
+
+pub export "C" fn napi_get_version(env: ?*mut u8, result: ?*mut u32) -> i32 {
+  if Pointer.isNull<u8>(env) || Pointer.isNull<u32>(result) { return INVALID_ARG }
+  unsafe store<u32>(result, 10)
+  return unsafe status(env, OK)
+}
+pub export "C" fn napi_get_node_version(env: ?*mut u8, result: ?*mut *const NodeVersion) -> i32 {
+  if Pointer.isNull<u8>(env) || Pointer.isNull<*const NodeVersion>(result) { return INVALID_ARG }
+  let a = () let e = unsafe Pointer.borrow<(), Env>(&a, unsafe envOf(env))
+  unsafe store<*const NodeVersion>(result, Pointer.fromRef<NodeVersion>(&e.version))
+  return unsafe status(env, OK)
+}
+pub export "C" fn node_api_get_module_file_name(env: ?*mut u8, result: ?*mut ?*const u8) -> i32 {
+  if Pointer.isNull<u8>(env) || Pointer.isNull<?*const u8>(result) { return INVALID_ARG }
+  let a = () let e = unsafe Pointer.borrow<(), Env>(&a, unsafe envOf(env))
+  unsafe store<?*const u8>(result, unsafe Intrinsic.pointerRequalify<?*mut u8, ?*const u8>(e.filename))
+  return unsafe status(env, OK)
+}
+@deferredCallbacks("finalize")
+pub unsafe export "C" fn napi_set_instance_data(env: ?*mut u8, data: ?*mut u8, finalize: Finalize, hint: ?*mut u8) -> i32 {
+  if !unsafe onOwner(env) { return INVALID_ARG }
+  let mut a = () let e = unsafe Pointer.borrowMut<(), Env>(&mut a, unsafe envOf(env))
+  e.instanceData = data e.instanceFinalize = finalize e.instanceHint = hint drop e
+  return unsafe status(env, OK)
+}
+pub export "C" fn napi_get_instance_data(env: ?*mut u8, result: ?*mut ?*mut u8) -> i32 {
+  if Pointer.isNull<?*mut u8>(result) || !unsafe onOwner(env) { return INVALID_ARG }
+  let a = () let e = unsafe Pointer.borrow<(), Env>(&a, unsafe envOf(env))
+  unsafe store<?*mut u8>(result, e.instanceData)
+  return unsafe status(env, OK)
+}
+unsafe fn accountExternal(env: ?*mut u8, delta: i64) -> i32 {
+  let mut p = packet()
+  if delta < 0 { p.integer = i64.toU64(-(delta + 1)) + 1 p.flags = 1 } else { p.integer = i64.toU64(delta) }
+  return unsafe call(env, EXTERNAL_MEMORY, &mut p)
+}
+pub export "C" fn napi_adjust_external_memory(env: ?*mut u8, delta: i64, result: ?*mut i64) -> i32 {
+  if Pointer.isNull<i64>(result) || !unsafe onOwner(env) { return INVALID_ARG }
+  let mut a = () let e = unsafe Pointer.borrow<(), Env>(&a, unsafe envOf(env)) let before = e.external drop e
+  if (delta > 0 && before > i64.MAX - delta) || (delta < 0 && before < i64.MIN - delta) { return unsafe status(env, INVALID_ARG) }
+  let code = unsafe accountExternal(env, delta)
+  if code != OK { return code }
+  let e2 = unsafe Pointer.borrowMut<(), Env>(&mut a, unsafe envOf(env)) e2.external = before + delta drop e2
+  unsafe store<i64>(result, before + delta)
+  return unsafe status(env, OK)
+}
+
+// Addon loading.
+
+/// Records the module an addon registers from its static constructor. Loads are serialized by the
+/// library registry lock, so one word holds the registration of the load in progress.
+pub export "C" fn napi_module_register(module: ?*mut Module) -> () {
+  unsafe Atomic.store<u64>(registrationWord(), usize.toU64(Pointer.address(module)), MemoryOrder.Release)
+}
+/// A V8 registration is detected, never invoked or forwarded to another runtime.
+pub export "C" fn node_module_register(module: ?*mut u8) -> () {
+  unsafe Atomic.store<u64>(legacyWord(), 1, MemoryOrder.Release)
+}
+unsafe fn setLoadError(env: ?*mut u8, parts: &[&[u8]]) -> () {
+  let mut total: usize = 1
+  let mut i: usize = 0 while i < parts.length { total = total + parts[i].length i = i + 1 }
+  let buffer = unsafe calloc(total, 1)
+  if Pointer.isNull<u8>(buffer) { return () }
+  let many = unsafe Pointer.assumeManyMut<u8>(unsafe nn(buffer))
+  let mut at: usize = 0
+  i = 0
+  while i < parts.length {
+    let part = parts[i] let mut k: usize = 0
+    while k < part.length { unsafe Pointer.put<u8>(unsafe Pointer.atMut<u8>(many, at), part[k]) at = at + 1 k = k + 1 }
+    i = i + 1
+  }
+  let mut a = () let e = unsafe Pointer.borrowMut<(), Env>(&mut a, unsafe envOf(env))
+  unsafe free(e.loadError) e.loadError = buffer
+}
+/// The reason the last load of `env` failed, or null.
+pub unsafe fn loadError(env: *mut u8) -> ?*const u8 {
+  let a = () let e = unsafe Pointer.borrow<(), Env>(&a, unsafe envOf(unsafe raw(env)))
+  return unsafe Intrinsic.pointerRequalify<?*mut u8, ?*const u8>(e.loadError)
+}
+fn decimal(value: i32, out: &mut [u8; 12]) -> usize {
+  let mut n = i32.toI64(value) let negative = n < 0 if negative { n = -n }
+  let mut digits: [u8; 12] = [0; 12] let mut count: usize = 0
+  while true { digits[count] = i64.toU8(48 + n % 10) count = count + 1 n = n / 10 if n == 0 { break } }
+  let mut at: usize = 0
+  if negative { out[0] = 45 at = 1 }
+  while count > 0 { count = count - 1 out[at] = digits[count] at = at + 1 }
+  return at
+}
+unsafe fn releaseLibrary(library: *mut Library) -> () {
+  let g = unsafe global()
+  let a = () let state = unsafe Pointer.borrow<(), Global>(&a, g)
+  let mut guard = state.libraries.lock()
+  let libraries = guard.getMut()
+  let mut b = () let entry = unsafe Pointer.borrowMut<(), Library>(&mut b, library)
+  entry.references = entry.references - 1
+  let handle = entry.handle let last = entry.references == 0 let next = entry.next drop entry
+  if last {
+    if Pointer.address(libraries.first) == Pointer.address(library) { libraries.first = next } else {
+      let mut p = libraries.first
+      while !Pointer.isNull<Library>(p) {
+        let other = unsafe Pointer.borrowMut<(), Library>(&mut b, unsafe nn(p))
+        if Pointer.address(other.next) == Pointer.address(library) { other.next = next break }
+        p = other.next
+      }
+    }
+    unsafe free(unsafe raw(library))
+  }
+  let closed = unsafe dlclose(handle)
+}
+/// Loads the addon at `filename` into `env` and runs its registration with `module.exports`.
+/// Returns a rooted result in `result`, or a status and [`loadError`].
+pub unsafe fn load(env: *mut u8, filename: *const u8, flags: i32, module: *mut u8, result: *mut ?*mut u8) -> i32 {
+  let e0 = unsafe raw(env)
+  if !unsafe onOwner(e0) { return INVALID_ARG }
+  let mut a0 = () let e1 = unsafe Pointer.borrowMut<(), Env>(&mut a0, unsafe envOf(e0)) unsafe free(e1.loadError) e1.loadError = nil() drop e1
+  let mut exports = nil()
+  let mut url = nil()
+  let empty = b"exports\0"
+  let mut key = nil()
+  let mut code = unsafe string(e0, Pointer.fromRef<u8>(&empty[0]), 7, 0, Pointer.fromMutRef<?*mut u8>(&mut key))
+  if code == OK { let args: [?*mut u8; 2] = [unsafe raw(module), key] code = unsafe js(e0, text(b"get\0"), 2, Pointer.fromRef<?*mut u8>(&args[0]), Pointer.fromMutRef<?*mut u8>(&mut exports)) }
+  if code == OK { let argument: ?*mut u8 = unsafe raw(module) code = unsafe js(e0, text(b"moduleFilename\0"), 1, Pointer.fromRef<?*mut u8>(&argument), Pointer.fromMutRef<?*mut u8>(&mut url)) }
+  if code != OK { return code }
+  let mut q = packet() q.values[0] = url q.flags = 0
+  code = unsafe call(e0, READ_STRING, &mut q)
+  if code != OK { return code }
+  let length = q.offset
+  let path = unsafe calloc(length + 1, 1)
+  if Pointer.isNull<u8>(path) { return GENERIC_FAILURE }
+  let mut r = packet() r.values[0] = url r.data = path r.size = length + 1 r.flags = 0
+  code = unsafe call(e0, READ_STRING, &mut r)
+  if code != OK { unsafe free(path) return code }
+  let anchor = ()
+  let name = unsafe bytesAt(&anchor, unsafe Intrinsic.pointerRequalify<*const u8, ?*const u8>(filename), AUTO_LENGTH)
+  let g = unsafe global()
+  let ga = () let state = unsafe Pointer.borrow<(), Global>(&ga, g)
+  let mut guard = state.libraries.lock()
+  let savedRegistration = unsafe Atomic.swap<u64>(registrationWord(), 0, MemoryOrder.AcquireRelease)
+  let savedLegacy = unsafe Atomic.swap<u64>(legacyWord(), 0, MemoryOrder.AcquireRelease)
+  let cleared = unsafe dlerror()
+  let opened = unsafe dlopen(filename, flags)
+  let registered = unsafe Atomic.swap<u64>(registrationWord(), savedRegistration, MemoryOrder.AcquireRelease)
+  let legacy = unsafe Atomic.swap<u64>(legacyWord(), savedLegacy, MemoryOrder.AcquireRelease) != 0
+  if Pointer.isNull<u8>(opened) {
+    let reason = unsafe dlerror()
+    if Intrinsic.pointerIsNull<?*const u8>(reason) { unsafe setLoadError(e0, &[b"Cannot open native addon"]) }
+    else { let b = () unsafe setLoadError(e0, &[unsafe bytesAt(&b, reason, AUTO_LENGTH)]) }
+    drop guard unsafe free(path)
+    return GENERIC_FAILURE
+  }
+  let library = unsafe nn(opened)
+  let libraries = guard.getMut()
+  let mut shared = libraries.first
+  let mut la = ()
+  while !Pointer.isNull<Library>(shared) {
+    let entry = unsafe Pointer.borrow<(), Library>(&la, unsafe nn(shared))
+    if Pointer.address(entry.handle) == Pointer.address(library) { break }
+    shared = entry.next
+  }
+  let symbol = unsafe dlsym(library, text(b"napi_register_module_v1\0"))
+  let versionSymbol = unsafe dlsym(library, text(b"node_api_module_get_api_version_v1\0"))
+  let mut init = Intrinsic.pointerNullFunction<?extern "C" fn(?*mut u8, ?*mut u8) -> ?*mut u8>()
+  if !Pointer.isNull<u8>(symbol) { init = unsafe function<?extern "C" fn(?*mut u8, ?*mut u8) -> ?*mut u8>(unsafe nn(symbol)) }
+  else if !Pointer.isNull<Library>(shared) { let entry = unsafe Pointer.borrow<(), Library>(&la, unsafe nn(shared)) init = entry.init }
+  let registration = unsafe addressPointer(registered)
+  let mut registeredInit = Intrinsic.pointerNullFunction<?extern "C" fn(?*mut u8, ?*mut u8) -> ?*mut u8>()
+  let mut registeredVersion: i32 = 0
+  if !Pointer.isNull<u8>(registration) { let m = unsafe Pointer.read<Module>(unsafe cast<Module>(registration)) registeredInit = m.register registeredVersion = m.version }
+  let mut failed = false
+  if legacy || (Intrinsic.pointerIsNull<?extern "C" fn(?*mut u8, ?*mut u8) -> ?*mut u8>(init) && Intrinsic.pointerIsNull<?extern "C" fn(?*mut u8, ?*mut u8) -> ?*mut u8>(registeredInit)) {
+    unsafe setLoadError(e0, &[name, b": V8/Node module ABI addons are not supported; a Node-API registration is required"]) failed = true
+  }
+  let mut api: i32 = 8
+  if !failed && !Pointer.isNull<u8>(versionSymbol) { let version = unsafe function<Version>(unsafe nn(versionSymbol)) api = unsafe version() }
+  if !failed && (api < 1 || api > NAPI_VERSION) {
+    let mut digits: [u8; 12] = [0; 12] let count = decimal(api, &mut digits)
+    unsafe setLoadError(e0, &[name, b": addon requires Node-API version ", Slice.view<u8>(&digits, 0, count), b"; SilkJS supports 10"]) failed = true
+  }
+  if !failed && Intrinsic.pointerIsNull<?extern "C" fn(?*mut u8, ?*mut u8) -> ?*mut u8>(init) {
+    if registeredVersion != MODULE_VERSION {
+      let mut digits: [u8; 12] = [0; 12] let count = decimal(registeredVersion, &mut digits)
+      unsafe setLoadError(e0, &[name, b": incompatible legacy Node-API registration version ", Slice.view<u8>(&digits, 0, count)]) failed = true
+    } else { init = registeredInit }
+  }
+  let use = unsafe allocate<LibraryUse>()
+  if !failed && Pointer.isNull<LibraryUse>(use) { unsafe setLoadError(e0, &[b"Out of memory loading addon"]) failed = true }
+  if !failed && Pointer.isNull<Library>(shared) {
+    shared = unsafe allocate<Library>()
+    if Pointer.isNull<Library>(shared) { unsafe setLoadError(e0, &[b"Out of memory loading addon"]) failed = true }
+    else { unsafe Pointer.put<Library>(unsafe nn(shared), Library { next: libraries.first, handle: library, init: unsafe Intrinsic.pointerRequalify<?extern "C" fn(?*mut u8, ?*mut u8) -> ?*mut u8, Init>(init), references: 0 }) libraries.first = shared }
+  }
+  if failed {
+    unsafe free(unsafe Intrinsic.pointerReinterpret<?*mut LibraryUse, ?*mut u8>(use))
+    let closed = unsafe dlclose(library)
+    drop libraries drop guard unsafe free(path)
+    return GENERIC_FAILURE
+  }
+  let mut sa = () let entry = unsafe Pointer.borrowMut<(), Library>(&mut sa, unsafe nn(shared)) entry.references = entry.references + 1 drop entry
+  drop libraries drop guard
+  let mut a = () let e = unsafe Pointer.borrowMut<(), Env>(&mut a, unsafe envOf(e0))
+  unsafe Pointer.put<LibraryUse>(unsafe nn(use), LibraryUse { next: e.libraries, library: unsafe nn(shared) })
+  e.libraries = use
+  unsafe free(e.filename) e.filename = path e.apiVersion = api drop e
+  let start = unsafe Intrinsic.pointerRequalify<?extern "C" fn(?*mut u8, ?*mut u8) -> ?*mut u8, Init>(init)
+  let scope = unsafe enterCallback(env)
+  let returned = unsafe start(e0, exports)
+  let mut pending = false
+  let checked = unsafe napi_is_exception_pending(e0, Pointer.fromMutRef<bool>(&mut pending))
+  let mut owned = nil()
+  if !pending { owned = unsafe root(e0, if Pointer.isNull<u8>(returned) { exports } else { returned }) }
+  unsafe Pointer.put<?*mut u8>(result, owned)
+  unsafe leaveCallback(env, scope)
+  if pending { return PENDING_EXCEPTION }
+  if Pointer.isNull<u8>(owned) { return GENERIC_FAILURE }
+  return OK
+}
+
+// Lifecycle.
+
+/// A new environment whose engine operations go through `bridge(host, ...)`.
+pub unsafe fn open(host: *mut u8, bridge: Bridge) -> ?*mut u8 {
+  let env = unsafe allocate<Env>()
+  if Pointer.isNull<Env>(env) { return nil() }
+  unsafe Pointer.put<Env>(unsafe nn(env), Env {
+    host: host, bridge: bridge, owner: unsafe pthread_self(), error: ErrorInfo { message: Pointer.fromRef<u8>(&message(0)[0]), reserved: nil(), engineCode: 0, code: 0 },
+    version: NodeVersion { major: 24, minor: 22, patch: 2, release: text(b"SilkJS\0") },
+    arena: Pointer.null<Arena>(), scope: Pointer.null<Scope>(), refs: Pointer.null<Reference>(), natives: Pointer.null<Native>(),
+    libraries: Pointer.null<LibraryUse>(), finalizers: Pointer.null<Finalizer>(), pending: Pointer.null<Finalizer>(), async: nil(),
+    instanceData: nil(), instanceFinalize: Intrinsic.pointerNullFunction<Finalize>(), instanceHint: nil(), external: 0,
+    filename: nil(), loadError: nil(), apiVersion: 0, closing: false
+  })
+  return unsafe raw(unsafe nn(env))
+}
+/// Runs cleanup and finalizers and releases every handle, while the JavaScript heap still lives.
+pub unsafe fn close(env: *mut u8, closeAsync: extern "C" fn(*mut u8) -> (), disposeAsync: extern "C" fn(*mut u8) -> ()) -> () {
+  let e0 = unsafe raw(env)
+  let mut a = () let e = unsafe Pointer.borrowMut<(), Env>(&mut a, unsafe envOf(e0))
+  if e.closing { return () }
+  e.closing = true drop e
+  unsafe closeAsync(env)
+  unsafe drainFinalizers(env)
+  let e2 = unsafe Pointer.borrow<(), Env>(&a, unsafe envOf(e0))
+  let finalizeInstance = e2.instanceFinalize let data = e2.instanceData let hint = e2.instanceHint let external = e2.external drop e2
+  if !Intrinsic.pointerIsNull<Finalize>(finalizeInstance) {
+    let present = unsafe Intrinsic.pointerRequalify<Finalize, extern "C" fn(?*mut u8, ?*mut u8, ?*mut u8) -> ()>(finalizeInstance)
+    let scope = unsafe enterCallback(env)
+    unsafe present(e0, data, hint)
+    unsafe leaveCallback(env, scope)
+  }
+  unsafe drainFinalizers(env)
+  unsafe disposeAsync(env)
+  let accounted = unsafe accountExternal(e0, -external)
+  let e3 = unsafe Pointer.borrowMut<(), Env>(&mut a, unsafe envOf(e0)) e3.external = 0 drop e3
+  while true {
+    let e4 = unsafe Pointer.borrow<(), Env>(&a, unsafe envOf(e0)) let ref = e4.refs drop e4
+    if Pointer.isNull<Reference>(ref) { break }
+    let deleted = unsafe napi_delete_reference(e0, unsafe raw(unsafe nn(ref)))
+  }
+  while true {
+    let e5 = unsafe Pointer.borrowMut<(), Env>(&mut a, unsafe envOf(e0)) let scope = e5.scope
+    if Pointer.isNull<Scope>(scope) { break }
+    let b = () let s = unsafe Pointer.borrow<(), Scope>(&b, unsafe nn(scope)) e5.scope = s.previous drop s drop e5
+    let entry = unsafe Pointer.take<Scope>(unsafe nn(scope)) drop entry unsafe free(unsafe raw(unsafe nn(scope)))
+  }
+  unsafe unwind(e0, Pointer.null<Arena>(), 0)
+}
+/// Frees the environment once the JavaScript heap is gone: native functions and external buffers may
+/// refer to these records until the last heap finalizer runs.
+pub unsafe fn dispose(env: *mut u8) -> () {
+  let owned = unsafe Pointer.take<Env>(unsafe envOf(unsafe raw(env)))
+  let mut f = owned.finalizers
+  while !Pointer.isNull<Finalizer>(f) { let entry = unsafe Pointer.take<Finalizer>(unsafe nn(f)) unsafe free(unsafe raw(unsafe nn(f))) f = entry.next }
+  let mut n = owned.natives
+  while !Pointer.isNull<Native>(n) { let entry = unsafe Pointer.take<Native>(unsafe nn(n)) unsafe free(unsafe raw(unsafe nn(n))) n = entry.next }
+  let mut l = owned.libraries
+  while !Pointer.isNull<LibraryUse>(l) { let entry = unsafe Pointer.take<LibraryUse>(unsafe nn(l)) unsafe free(unsafe raw(unsafe nn(l))) unsafe releaseLibrary(entry.library) l = entry.next }
+  unsafe free(owned.filename) unsafe free(owned.loadError)
+  drop owned
+  unsafe free(env)
+}

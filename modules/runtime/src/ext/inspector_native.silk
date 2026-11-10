@@ -1,0 +1,382 @@
+//! Owner-thread inspector bridge. Only transport bytes cross threads; JS callbacks,
+//! evaluations and retained values stay on the isolate. Never borrow Services at reentry.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silkjs.js_owned_value { Value,  lendFor }
+import silkjs.js_realm { lendRealm }
+import silk.mem.pointer { Pointer }
+import silk.mem.layout { Layout }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.num.f64
+import silk.num.i32
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_heap { HeapCell, HeapHeader }
+import silkjs.js_core_types { FrameSlots, NativeErrorKind, RuntimeState, ObjectData, ObjectPayload, ModuleDef, FunctionBytecode, FunctionDebugInfo }
+import silkjs.js_value { ValueBits }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_coercion_host { CoercionHooks }
+import libs.core.owners { Scope }
+import libs.core.owners as owners
+import libs.core.common as common
+import silkjs.js_std_support as text
+import silkjs.js_promise as promises
+import silkjs.js_runtime as runtime
+import silkjs.js_debugger as debugger
+import silkjs.js_string_rope { RopeIterator }
+import ext.script_metadata as metadata
+import ext.inspector_transport as transport
+import ext.diagnostics_hub as hub
+import ext.diagnostics_hub { Mailbox }
+import ext.inspector_route as route
+import ext.inspector_debugger as debug
+import ext.inspector_evaluate as evaluation
+import ext.inspector_values as values
+import ext.vm_native as vm
+
+unsafe extern "C" fn calloc(count:usize,size:usize)->?*mut u8
+unsafe extern "C" fn free(pointer:?*mut u8)->()
+import silk.core.ownership { Copy }
+struct Notification { kind:u32, payload:ValueBits }
+impl Copy for Notification {}
+pub struct State {
+  server:*mut u8, callback:ValueBits, debug:debug.State,
+  pumping:bool, depth:usize, notifications:List<Notification>, consumed:usize, breakOnEntry:bool, mailbox:Mailbox
+}
+pub const BASE:u32=15000
+pub const COUNT:u32=32
+unsafe fn nn<T>(pointer:?*mut T)->*mut T { return unsafe Intrinsic.pointerRequalify<?*mut T,*mut T>(pointer) }
+unsafe fn raw<T>(pointer:*mut T)->*mut u8 { return unsafe Intrinsic.pointerReinterpret<*mut T,*mut u8>(pointer) }
+pub effect fn create(wake:?*mut u8,mailbox:Mailbox)->*mut State !OutOfMemoryError {
+  let memory=unsafe calloc(1,Layout.of<State>().bytes)
+  if Pointer.isNull<u8>(memory) { fail OutOfMemoryError {} }
+  let server=unsafe transport.silk_inspector_create(wake)
+  if Pointer.isNull<u8>(server) { unsafe free(memory) fail OutOfMemoryError {} }
+  let state=unsafe Intrinsic.pointerReinterpret<*mut u8,*mut State>(unsafe nn(memory))
+  unsafe Pointer.put<State>(state,State { server:unsafe nn(server),callback:ValueBits.Undefined,debug:debug.create(),pumping:false,depth:0,notifications:List<Notification>.make(),consumed:0,breakOnEntry:false,mailbox:mailbox })
+  return state
+}
+unsafe fn debugState(state:*mut State)->*mut debug.State {
+  let mut a=() let s=unsafe Pointer.borrowMut<(),State>(&mut a,state) return Pointer.fromMutRef<debug.State>(&mut s.debug)
+}
+unsafe fn server(state:*mut State)->*mut u8 { let a=() let s=unsafe Pointer.borrow<(),State>(&a,state) return s.server }
+unsafe fn mailbox(state:*mut State)->Mailbox { let a=() let s=unsafe Pointer.borrow<(),State>(&a,state) return s.mailbox }
+pub unsafe fn dispose<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State)->() {
+  unsafe transport.silk_inspector_stop(unsafe server(state))
+  unsafe debug.dispose(&mut engine,context,unsafe debugState(state))
+  let owned=unsafe Pointer.take<State>(state)
+  unsafe transport.silk_inspector_destroy(owned.server)
+  unsafe owners.release(&mut engine,context,owned.callback)
+  let mut i=owned.consumed while i<owned.notifications.length() { unsafe owners.release(&mut engine,context,owned.notifications.get(i).payload) i=i+1 }
+  drop owned unsafe free(unsafe raw(state))
+}
+// Consumes payload on both exits. Callback itself is retained across replacement
+// or disconnection by JS. Notification queues own values, never borrowed handles.
+unsafe effect fn invoke<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State,kind:u32,connection:u64,payload:ValueBits,source:ValueBits)->() !OutOfMemoryError|JsException ?&mut Allocator {
+  let mut a=() let s=unsafe Pointer.borrowMut<(),State>(&mut a,state)
+  let callback=unsafe s.callback.retained() s.depth=s.depth+1 drop s
+  let args=[ValueBits.number(u32.toF64(kind)),ValueBits.number(u64.toF64(connection)),payload,source]
+  let rt=unsafe runtime.contextRuntime(context)
+  let debugState=unsafe HeapCell.payloadMut<RuntimeState,()>(&mut a,rt)
+  let savedCallback=debugState.debugger.callbackActive
+  debugState.debugger.callbackActive=true drop debugState
+  let called=if callback.isObject() { run Effect.result(promises.call(&mut engine,unsafe lendRealm(&context, context),unsafe lendFor(callback),unsafe lendFor(ValueBits.Undefined),&args)) } else { Result<Value,JsException>.Success { value:Value.immediate(ValueBits.Undefined) } }
+  let afterCall=unsafe HeapCell.payloadMut<RuntimeState,()>(&mut a,rt)
+  afterCall.debugger.callbackActive=savedCallback drop afterCall
+  unsafe owners.release(&mut engine,context,callback) unsafe owners.release(&mut engine,context,payload)
+  let restored=unsafe Pointer.borrowMut<(),State>(&mut a,state) restored.depth=restored.depth-1 drop restored
+  match move called { Result<Value,JsException>.Success { value }=>{ unsafe owners.release(&mut engine,context,value.intoBits()) } Result<Value,JsException>.Failure { error }=>{ fail move error } }
+}
+// Only a genuinely parked guest may reenter transport dispatch. Evaluation of
+// paused frames/restricted previews still excludes arbitrary nested requests.
+unsafe fn parkedGuest(context:*mut HeapHeader)->bool {
+  let anchor=() let state=unsafe HeapCell.payload<RuntimeState,()>(&anchor,unsafe runtime.contextRuntime(context))
+  return state.debugger.paused && !state.debugger.evaluating && !state.debugger.restricted
+}
+unsafe effect fn drainNotifications<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State)->() !OutOfMemoryError|JsException ?&mut Allocator {
+  let mut a=()
+  while true {
+    let s=unsafe Pointer.borrowMut<(),State>(&mut a,state)
+    if s.depth!=0 && !unsafe parkedGuest(context) { return }
+    if s.consumed==s.notifications.length() { s.notifications.clear() s.consumed=0 return }
+    let item=s.notifications.get(s.consumed) s.consumed=s.consumed+1 drop s
+    run unsafe invoke(&mut engine,context,state,item.kind,0,item.payload,ValueBits.Int { value:-1 })
+  }
+}
+// Takes ownership of payload. Queue append cannot strand a retained value on OOM.
+unsafe effect fn notify<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State,kind:u32,payload:ValueBits)->() !OutOfMemoryError|JsException ?&mut Allocator {
+  let mut a=() let s=unsafe Pointer.borrowMut<(),State>(&mut a,state)
+  let queued=run Effect.result(s.notifications.append(Notification { kind:kind,payload:payload })) drop s
+  match move queued { Result<(),OutOfMemoryError>.Success { .. }=>() Result<(),OutOfMemoryError>.Failure { error }=>{ unsafe owners.release(&mut engine,context,payload) fail move error } }
+  run unsafe drainNotifications(&mut engine,context,state)
+}
+pub unsafe effect fn compiledSource<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State,compiled:ValueBits)->() !OutOfMemoryError|JsException ?&mut Allocator {
+  unsafe debug.deferSource(compiled,false)
+  if !unsafe debug.enabled(unsafe debugState(state)) { return }
+  let mut sourceContext=context
+  if let Option<*mut HeapHeader>.Some { value:reference }=Pointer.nonNullMut<HeapHeader>(unsafe entryBytecode(compiled)) {
+    let anchor=() let code=unsafe HeapCell.payload<FunctionBytecode,()>(&anchor,reference)
+    sourceContext=code.realm
+  }
+  let payload=run unsafe debug.compiledSource(&mut engine,sourceContext,unsafe debugState(state),compiled)
+  run unsafe notify(&mut engine,context,state,11,payload)
+}
+unsafe effect fn pausedPayload<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State,event:u32,scope:&mut Scope)->ValueBits !OutOfMemoryError|JsException ?&mut Allocator {
+  scope.values[0]=run unsafe values.record(&mut engine,context)
+  scope.values[1]=run unsafe debug.pausedFrames(&mut engine,context,unsafe debugState(state))
+  run unsafe values.field(&mut engine,context,scope.values[0],b"frames",scope.take(1))
+  scope.values[1]=(run text.string(&mut engine,unsafe lendRealm(&context, context),if event==2 { b"exception" } else { b"other" })).intoBits()
+  run unsafe values.field(&mut engine,context,scope.values[0],b"reason",scope.take(1))
+  if event==2 {
+    let a=() let rt=unsafe HeapCell.payload<RuntimeState,()>(&a,unsafe runtime.contextRuntime(context)) scope.values[1]=unsafe rt.currentException.retained() drop rt
+    run unsafe values.field(&mut engine,context,scope.values[0],b"exception",scope.take(1))
+  }
+  return scope.take(0)
+}
+pub unsafe effect fn debuggerEvent<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State,event:u32)->() !OutOfMemoryError|JsException ?&mut Allocator {
+  if event!=0 {
+    let mut scope=Scope.make() let result=run Effect.result(unsafe pausedPayload(&mut engine,context,state,event,&mut scope)) unsafe owners.cleanup(&mut engine,context,move scope)
+    let payload=match move result { Result<ValueBits,OutOfMemoryError|JsException>.Success { value }=>value Result<ValueBits,OutOfMemoryError|JsException>.Failure { error }=>{ fail move error } }
+    run unsafe notify(&mut engine,context,state,10,payload)
+  }
+  let wait=if unsafe debugger.paused(unsafe runtime.contextRuntime(context)) { 10 } else { 0 }
+  run unsafe pump(&mut engine,context,state,wait)
+}
+unsafe effect fn pumpBody<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State,waitMs:i32,parkedOnly:bool)->() !OutOfMemoryError|JsException ?&mut Allocator {
+  let socket=unsafe server(state)
+  if waitMs>0 && unsafe transport.silk_inspector_pending(socket)==0 && !unsafe route.pending(unsafe mailbox(state)) {
+    let mut delay=if waitMs>10 { 10 } else { waitMs }
+    let remaining=unsafe vm.remainingNanoseconds(unsafe runtime.contextRuntime(context))
+    if remaining>=0 && remaining<10000000 { delay=0 }
+    if delay>0 {
+      let mut byte:u8=0
+      let listening=unsafe transport.silk_inspector_url(socket,Pointer.fromMutRef<u8>(&mut byte),0)!=0
+      if listening { let ignored=unsafe transport.silk_inspector_wait(socket,delay) }
+      else { let _ignored=unsafe route.wait(unsafe mailbox(state),i32.toU32(delay)) }
+    }
+  }
+  let mut processed:usize=0
+  while processed<256 && (!parkedOnly || unsafe parkedGuest(context)) {
+    let pending=unsafe transport.silk_inspector_take(socket)
+    if Pointer.isNull<u8>(pending) { break }
+    let packet=unsafe nn(pending)
+    let kind=unsafe transport.silk_inspector_packet_kind(packet)
+    let connection=unsafe transport.silk_inspector_packet_connection(packet)
+    let length=unsafe transport.silk_inspector_packet_length(packet)
+    let bytes=unsafe transport.silk_inspector_packet_data(packet)
+    let decoded=if length==0 { Result<Value,JsException>.Success { value:Value.immediate(ValueBits.Undefined) } } else { run Effect.result(text.stringPointer(&mut engine,unsafe lendRealm(&context, context),unsafe Intrinsic.pointerRequalify<?*const u8,*const u8>(bytes),length)) }
+    unsafe transport.silk_inspector_packet_free(packet)
+    let payload=match move decoded { Result<Value,JsException>.Success { value }=>value.intoBits() Result<Value,JsException>.Failure { error }=>{ fail move error } }
+    run unsafe invoke(&mut engine,context,state,kind,connection,payload,ValueBits.Int { value:-1 })
+    run unsafe drainNotifications(&mut engine,context,state) processed=processed+1
+  }
+  processed=0
+  while processed<256 && (!parkedOnly || unsafe parkedGuest(context)) {
+    let packet=match unsafe route.take(unsafe mailbox(state)) { Option<route.Route>.Some { value }=>move value _=>{ break } }
+    let source=packet.source let kind=packet.kind let session=packet.session
+    let data=packet.data()
+    let decoded=if data.length==0 { Result<Value,JsException>.Success { value:Value.immediate(ValueBits.Undefined) } } else { run Effect.result(text.string(&mut engine,unsafe lendRealm(&context, context),data)) }
+    drop data drop packet
+    let payload=match move decoded { Result<Value,JsException>.Success { value }=>value.intoBits() Result<Value,JsException>.Failure { error }=>{ fail move error } }
+    run unsafe invoke(&mut engine,context,state,kind,session,payload,ValueBits.number(u32.toF64(source)))
+    run unsafe drainNotifications(&mut engine,context,state) processed=processed+1
+  }
+}
+pub unsafe effect fn pump<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State,waitMs:i32)->() !OutOfMemoryError|JsException ?&mut Allocator {
+  let policyAnchor=() let policyState=unsafe HeapCell.payload<RuntimeState,()>(&policyAnchor,unsafe runtime.contextRuntime(context))
+  if policyState.debugger.evaluating || policyState.debugger.restricted { return }
+  drop policyState
+  let mut a=() let s=unsafe Pointer.borrowMut<(),State>(&mut a,state)
+  // Owners are routable before bootstrap installs the JS dispatcher. Leave
+  // their OPEN packets in the transport until the worker is ready to attach.
+  if !s.callback.isObject() || (s.pumping && !unsafe parkedGuest(context)) { return }
+  let wasPumping=s.pumping s.pumping=true drop s
+  let outcome=run Effect.result(unsafe pumpBody(&mut engine,context,state,waitMs,wasPumping))
+  let restored=unsafe Pointer.borrowMut<(),State>(&mut a,state) restored.pumping=wasPumping drop restored
+  match move outcome { Result<(),OutOfMemoryError|JsException>.Success { .. }=>() Result<(),OutOfMemoryError|JsException>.Failure { error }=>{ fail move error } }
+}
+pub unsafe effect fn dispatch<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State,operation:u32,argc:i32,argv:&FrameSlots)->ValueBits !OutOfMemoryError|JsException ?&mut Allocator {
+  let first=unsafe common.argument(argv,0)
+  if operation>=20 && operation<32 { return run unsafe debug.dispatch(&mut engine,context,unsafe debugState(state),operation,argc,argv) }
+  if operation==8 || operation==12 || operation==13 { return run unsafe evaluation.dispatch(&mut engine,context,operation,argv) }
+  if operation==14 { return run unsafe evaluation.contextToken(&mut engine,context,first) }
+  if operation==15 {
+    if let ValueBits.Bool { value }=first {
+      let mut a=() let s=unsafe Pointer.borrowMut<(),State>(&mut a,state) s.breakOnEntry=value
+    } else { run unsafe markEntry(&mut engine,context,state,first) }
+    return ValueBits.Undefined
+  }
+  if operation==16 { return run unsafe ownerIds(&mut engine,context,unsafe mailbox(state)) }
+  if operation==17 {
+    let attached=unsafe mailbox(state)
+    if unsafe attached.id()!=0 { return run engine.throwError(unsafe lendRealm(&context, context),NativeErrorKind.Type,b"Worker auto-attach policy belongs to the main isolate") }
+    unsafe hub.setInspectorWait(unsafe mailbox(state),match first { ValueBits.Bool { value }=>value _=>false })
+    return ValueBits.Undefined
+  }
+  if operation==18 { return ValueBits.Bool { value:unsafe hub.inspectorWait(unsafe mailbox(state)) } }
+  if operation==9 {
+    let requested=unsafe common.argument(argv,1) let mut limit:usize=4294967295
+    if requested.isNumber() && requested.numericValue()>=0.0 && requested.numericValue()<4294967295.0 { limit=f64.toUsize(requested.numericValue()) }
+    return run unsafe values.inspect(&mut engine,context,first,limit)
+  }
+  if operation==0 {
+    if !first.isObject() { return run engine.throwError(unsafe lendRealm(&context, context),NativeErrorKind.Type,b"Inspector dispatcher must be callable") }
+    let mut a=() let s=unsafe Pointer.borrowMut<(),State>(&mut a,state) let old=Intrinsic.replace(s.callback,unsafe first.retained()) drop s
+    unsafe owners.release(&mut engine,context,old) return ValueBits.Undefined
+  }
+  let socket=unsafe server(state)
+  if operation==1 {
+    let host=run text.text(&mut engine,unsafe lendRealm(&context, context),unsafe lendFor(first)) let portValue=unsafe common.argument(argv,1)
+    if host.length()==0 || !portValue.isNumber() || portValue.numericValue()<0.0 || portValue.numericValue()>65535.0 { return run engine.throwError(unsafe lendRealm(&context, context),NativeErrorKind.Range,b"Invalid inspector host or port") }
+    let port=f64.toU16(portValue.numericValue())
+    return ValueBits.Bool { value:unsafe transport.silk_inspector_start(socket,text.pointer(&host),host.length(),port)==0 }
+  }
+  if operation==2 { unsafe transport.silk_inspector_stop(socket) return ValueBits.Undefined }
+  if operation==3 {
+    let mut buffer:[u8;1024]=[0;1024] let length=unsafe transport.silk_inspector_url(socket,Pointer.fromMutRef<u8>(&mut buffer[0]),1024)
+    if length==0 { return ValueBits.Undefined }
+    if length>=1024 { return run engine.throwError(unsafe lendRealm(&context, context),NativeErrorKind.Range,b"Inspector URL exceeds transport bound") }
+    return (run text.stringPointer(&mut engine,unsafe lendRealm(&context, context),Pointer.fromRef<u8>(&buffer[0]),length)).intoBits()
+  }
+  if operation==4 {
+    let wait=if first.isNumber() { f64.toI32(first.numericValue()) } else { 0 }
+    run unsafe pump(&mut engine,context,state,wait) return ValueBits.Undefined
+  }
+  if operation==5 || operation==6 {
+    let session=if operation==5 { first } else { unsafe common.argument(argv,1) }
+    let payload=unsafe common.argument(argv,if operation==5 { 1 } else { 3 })
+    let mut bytes=run text.text(&mut engine,unsafe lendRealm(&context, context),unsafe lendFor(payload)) let length=bytes.length() run bytes.append(0)
+    let attached=unsafe mailbox(state) let owner=unsafe attached.id()
+    let source=unsafe common.argument(argv,2)
+    let target=if operation==6 { first.numericValue() } else { if source.isNumber() { source.numericValue() } else { -1.0 } }
+    let status=if target<0.0 { unsafe transport.silk_inspector_send(socket,f64.toU64(session.numericValue()),text.pointer(&bytes),length) }
+      else { unsafe route.send(unsafe mailbox(state),f64.toU32(target),owner,f64.toU64(session.numericValue()),if operation==6 { f64.toU32(source.numericValue()) } else { route.ROUTE_RESPONSE },Slice.view<u8>(bytes.asSlice(),0,length)) }
+    return ValueBits.Bool { value:status==0 }
+  }
+  if operation==7 { unsafe debugger.configure(unsafe runtime.contextRuntime(context),match first { ValueBits.Bool { value }=>value _=>false }) return ValueBits.Undefined }
+  if operation==10 { let attached=unsafe mailbox(state) return ValueBits.number(u32.toF64(unsafe attached.id())) }
+  return run engine.throwError(unsafe lendRealm(&context, context),NativeErrorKind.Type,b"Unknown inspector native operation")
+}
+// Engine service callbacks cannot throw an effect. Promote a broken control
+// callback to an uncatchable engine exception, retaining the actual exception;
+// debugger.notify then preserves it instead of restoring the parked exception.
+unsafe effect fn callbackFailure<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,error:OutOfMemoryError|JsException)->() ?&mut Allocator {
+  let rt=unsafe runtime.contextRuntime(context)
+  let a=() let current=unsafe HeapCell.payload<RuntimeState,()>(&a,rt)
+  let terminated=current.currentExceptionIsUncatchable drop current
+  if terminated { drop error return }
+  match move error {
+    OutOfMemoryError allocation=>{
+      drop allocation
+      let raised=run Effect.result(engine.throwError(unsafe lendRealm(&context, context),NativeErrorKind.Internal,b"Inspector control allocation failed"))
+      drop raised
+    }
+    JsException signal=>{ drop signal }
+  }
+  let mut anchor=() let state=unsafe HeapCell.payloadMut<RuntimeState,()>(&mut anchor,rt)
+  state.currentExceptionIsUncatchable=true
+}
+pub unsafe effect fn debuggerCallback<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State,event:u32)->() ?&mut Allocator {
+  let result=run Effect.result(unsafe debuggerEvent(&mut engine,context,state,event))
+  if let Result<(),OutOfMemoryError|JsException>.Failure { error }=move result { run unsafe callbackFailure(&mut engine,context,move error) }
+}
+pub unsafe effect fn pumpCallback<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State,waitMs:i32)->() ?&mut Allocator {
+  let result=run Effect.result(unsafe pump(&mut engine,context,state,waitMs))
+  if let Result<(),OutOfMemoryError|JsException>.Failure { error }=move result { run unsafe callbackFailure(&mut engine,context,move error) }
+}
+pub unsafe effect fn compiledSourceCallback<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State,compiled:ValueBits)->() ?&mut Allocator {
+  let result=run Effect.result(unsafe compiledSource(&mut engine,context,state,compiled))
+  if let Result<(),OutOfMemoryError|JsException>.Failure { error }=move result { run unsafe callbackFailure(&mut engine,context,move error) }
+}
+unsafe fn entryBytecode(compiled:ValueBits)->?*mut HeapHeader {
+  match compiled {
+    ValueBits.FunctionBytecode { reference }=>{ return reference }
+    ValueBits.Object { reference }=>{
+      let a=() let object=unsafe HeapCell.payload<ObjectData,()>(&a,reference)
+      if let ObjectPayload.BytecodeFunction { function }=&object.payload { return function.bytecode }
+    }
+    ValueBits.Module { reference }=>{
+      let a=() let module=unsafe HeapCell.payload<ModuleDef,()>(&a,reference)
+      let function=module.functionObject drop module return unsafe entryBytecode(function)
+    }
+    _=>()
+  }
+  return Pointer.null<HeapHeader>()
+}
+// Count compiler UTF-8 bytes without allocating a copy of the retained source.
+// A surrogate pair is four bytes; lone surrogates remain three, as in toUtf8.
+fn entrySourceLength(source:ValueBits)->u32 {
+  let mut iterator=RopeIterator.make(&source)
+  let mut pending=iterator.next() let mut length:u32=0
+  while let Option<u16>.Some { value:unit }=pending {
+    pending=iterator.next()
+    if unit<0x80 { length=length+1 }
+    else if unit<0x800 { length=length+2 }
+    else {
+      let mut paired=false
+      if unit>=0xd800 && unit<=0xdbff {
+        if let Option<u16>.Some { value:low }=pending {
+          if low>=0xdc00 && low<=0xdfff { paired=true pending=iterator.next() }
+        }
+      }
+      let width:u32=if paired { 4 } else { 3 }
+      length=length+width
+    }
+  }
+  return length
+}
+// Called only at an embedding-designated user entry, after metadata/cache
+// restoration and before execution. No filename is trusted as a discriminator.
+pub unsafe effect fn markEntry<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,state:*mut State,compiled:ValueBits)->() !JsException ?&mut Allocator {
+  let mut a=() let s=unsafe Pointer.borrowMut<(),State>(&mut a,state)
+  if !s.breakOnEntry { return } drop s
+  let pointer=unsafe entryBytecode(compiled)
+  if let Option<*mut HeapHeader>.Some { value:bytecode }=Pointer.nonNullMut<HeapHeader>(pointer) {
+    let code=unsafe HeapCell.payload<FunctionBytecode,()>(&a,bytecode)
+    let mut sourceStart:u32=0
+    // Host wrappers have an ASCII, single-line prefix. This is not the user's
+    // signed VM columnOffset, which must remain untouched in reported frames.
+    if let Option<FunctionDebugInfo>.Some { value:info }=&code.debug {
+      if info.sourceColumnOffset>0 { sourceStart=i32.toU32(info.sourceColumnOffset) }
+    }
+    drop code
+    let record=unsafe metadata.get(compiled)
+    let fetched=run Effect.result(unsafe common.get(&mut engine,context,record,b"source"))
+    unsafe owners.release(&mut engine,context,record)
+    let source=match move fetched {
+      Result<ValueBits,JsException>.Success { value }=>value
+      Result<ValueBits,JsException>.Failure { error }=>{ fail move error }
+    }
+    if !source.isString() {
+      unsafe owners.release(&mut engine,context,source)
+      return run engine.throwError(unsafe lendRealm(&context, context),NativeErrorKind.Type,b"Entry script source is not available")
+    }
+    let sourceEnd=sourceStart+entrySourceLength(source)
+    unsafe owners.release(&mut engine,context,source)
+    let updated=unsafe Pointer.borrowMut<(),State>(&mut a,state) updated.breakOnEntry=false drop updated
+    let rt=unsafe runtime.contextRuntime(context)
+    unsafe debugger.configure(rt,true) unsafe debugger.requestPauseOnEntry(rt,bytecode,sourceStart,sourceEnd)
+  }
+}
+unsafe effect fn ownerIdsBody<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,ids:&List<u32>,scope:&mut Scope)->ValueBits !OutOfMemoryError|JsException ?&mut Allocator {
+  let memory=engine.memory scope.values[0]=run unsafe common.array(&mut engine,memory,context)
+  let mut i:usize=0
+  while i<ids.length() {
+    run unsafe common.defineIndex(&mut engine,context,scope.values[0],usize.toU32(i),ValueBits.number(u32.toF64(ids.get(i))))
+    i=i+1
+  }
+  return scope.take(0)
+}
+unsafe effect fn ownerIds<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,mailbox:Mailbox)->ValueBits !OutOfMemoryError|JsException ?&mut Allocator {
+  let ids=run hub.ownerIds(mailbox)
+  let mut scope=Scope.make()
+  let result=run Effect.result(unsafe ownerIdsBody(&mut engine,context,&ids,&mut scope))
+  unsafe owners.cleanup(&mut engine,context,move scope)
+  return match move result { Result<ValueBits,OutOfMemoryError|JsException>.Success { value }=>value Result<ValueBits,OutOfMemoryError|JsException>.Failure { error }=>{ fail move error } }
+}

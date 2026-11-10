@@ -1,0 +1,452 @@
+//! Owner-thread debugger primitives. Wire policy and breakpoint identities live in JS.
+//! Registry entries own bytecode references; frame handles expire with their pause.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silkjs.js_owned_value { lendFor }
+import silkjs.js_realm { lendRealm }
+import silk.mem.pointer { Pointer }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.effect { Effect }
+import silk.core.ownership { Copy }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.num.i32
+import silk.num.f64
+import silkjs.dtoa { Dtoa }
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_heap { HeapCell, HeapHeader, HeapKind }
+import silkjs.js_core_types { RuntimeState, ContextState, FunctionBytecode, FunctionDebugInfo, ModuleDef, FrameSlots, StackFrame, NativeErrorKind }
+import silkjs.js_value { ValueBits }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_coercion_host { CoercionHooks }
+import silkjs.js_strings { Strings }
+import libs.core.owners { Scope }
+import libs.core.owners as owners
+import libs.core.common as common
+import silkjs.js_std_support as text
+import silkjs.js_object_allocate as objects
+import silkjs.js_runtime as runtime
+import silkjs.js_gc as gc
+import silkjs.js_backtrace as backtrace
+import silkjs.js_debugger as debugger
+import silkjs.js_debugger { Frame }
+import silkjs.js_debugger_metadata { Location }
+import silkjs.js_debugger_scopes as scopes
+import silkjs.js_debugger_scopes { Binding }
+import ext.inspector_evaluate as evaluation
+import silkjs.js_string_types { StringLengthError }
+import silkjs.js_proxy_core as errors
+import ext.script_metadata as metadata
+
+struct Function { reference: *mut HeapHeader, script: u64, firstLocation: usize, locations: usize }
+impl Copy for Function {}
+struct SavedFrame { id: u64, frame: Frame }
+impl Copy for SavedFrame {}
+pub struct State {
+  functions: List<Function>, scripts: List<*mut HeapHeader>, frames: List<SavedFrame>,
+  nextFrame: u64, nextLocation: usize, enabled: bool
+}
+pub fn create() -> State {
+  return State { functions: List<Function>.make(), scripts: List<*mut HeapHeader>.make(),
+    frames: List<SavedFrame>.make(), nextFrame: 1, nextLocation: 0, enabled: false }
+}
+pub unsafe fn dispose<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State) -> () {
+  let rt = unsafe runtime.contextRuntime(context)
+  unsafe debugger.clearBreakpoints(rt) unsafe debugger.exceptions(rt, false, false)
+  let resumed = unsafe debugger.resume(rt, 0)
+  let mut runtimeAnchor = () let runtimeState = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, rt)
+  runtimeState.debugger.pauseRequested = false runtimeState.debugger.mode = 0 drop runtimeState
+  let mut anchor = () let data = unsafe Pointer.borrowMut<(), State>(&mut anchor, state)
+  let functions = Intrinsic.replace(data.functions, List<Function>.make())
+  data.scripts.clear() data.frames.clear() data.enabled = false drop data
+  let mut i: usize = 0
+  while i < functions.length() {
+    unsafe owners.release(&mut engine, context, ValueBits.FunctionBytecode { reference: functions.get(i).reference }) i = i + 1
+  }
+}
+pub unsafe fn enabled(state: *mut State) -> bool {
+  let anchor = () let data = unsafe Pointer.borrow<(), State>(&anchor, state) return data.enabled
+}
+fn identity(value: ValueBits) -> u64 {
+  if !value.isString() || Strings.length(value) == 0 { return 0 }
+  let mut result: u64 = 0 let mut i: usize = 0
+  while i < Strings.length(value) {
+    let unit = Strings.codeUnit(value, i)
+    if unit < 48 || unit > 57 { return 0 }
+    let digit = u16.toU64(unit - 48)
+    if result > (18446744073709551615 - digit) / 10 { return 0 }
+    result = result * 10 + digit i = i + 1
+  }
+  return result
+}
+unsafe effect fn idString<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, id: u64) -> ValueBits ! JsException ? &mut Allocator {
+  let mut bytes: [u8; 20] = [0; 20] let length = Dtoa.u64toa(&mut bytes, id)
+  return (run text.string(&mut engine, unsafe lendRealm(&context, context), Slice.view<u8>(&bytes, 0, length))).intoBits()
+}
+unsafe effect fn object<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader) -> ValueBits ! OutOfMemoryError ? &mut Allocator {
+  let memory = engine.memory return run objects.withPrototype(&mut engine, memory, unsafe lendRealm(&context, context), unsafe lendFor(ValueBits.Null))
+}
+unsafe effect fn atom<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, name: u32) -> ValueBits ! JsException ? &mut Allocator {
+  let anchor = () let rt = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, unsafe runtime.contextRuntime(context))
+  if name == 0 { return rt.atoms.emptyString() }
+  let result = run Effect.result(rt.atoms.toValue(name, true)) drop rt
+  return match move result {
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error } => run errors.materialize(&mut engine, unsafe lendRealm(&context, context), move error)
+  }
+}
+unsafe fn functionAt(state: *mut State, index: usize) -> Function {
+  let anchor = () let data = unsafe Pointer.borrow<(), State>(&anchor, state) return data.functions.get(index)
+}
+unsafe fn scriptAt(state: *mut State, index: usize) -> *mut HeapHeader {
+  let anchor = () let data = unsafe Pointer.borrow<(), State>(&anchor, state) return data.scripts.get(index)
+}
+unsafe fn scriptCount(state: *mut State) -> usize {
+  let anchor = () let data = unsafe Pointer.borrow<(), State>(&anchor, state) return data.scripts.length()
+}
+unsafe fn script(state: *mut State, id: u64) -> Option<*mut HeapHeader> {
+  let anchor = () let data = unsafe Pointer.borrow<(), State>(&anchor, state)
+  let mut i: usize = 0
+  while i < data.scripts.length() {
+    let reference = data.scripts.get(i) let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference)
+    if code.scriptId == id { return Option<*mut HeapHeader>.some(reference) } i = i + 1
+  }
+  return Option<*mut HeapHeader>.none()
+}
+unsafe effect fn register(state: *mut State, reference: *mut HeapHeader) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = () let data = unsafe Pointer.borrowMut<(), State>(&mut anchor, state)
+  let mut i: usize = 0
+  while i < data.functions.length() {
+    if Pointer.address(data.functions.get(i).reference) == Pointer.address(reference) { return () } i = i + 1
+  }
+  let codeAnchor = () let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&codeAnchor, reference)
+  let id = code.scriptId let realm = code.realm let deferred = code.debuggerMetadata.sourceDeferred
+  let locations = code.debuggerMetadata.locations.length() drop code
+  if id == 0 || deferred { return () }
+  let mut known = false i = 0
+  // One inventory entry per bound source/realm, but retain every cloned function.
+  while i < data.scripts.length() {
+    let prior = unsafe HeapCell.payload<FunctionBytecode, ()>(&codeAnchor, data.scripts.get(i))
+    if prior.scriptId == id && Pointer.address(prior.realm) == Pointer.address(realm) { known = true break }
+    i = i + 1
+  }
+  run data.functions.reserve(1)
+  if !known { run data.scripts.append(reference) }
+  run data.functions.append(Function { reference: reference, script: id, firstLocation: data.nextLocation, locations: locations })
+  data.nextLocation = data.nextLocation + locations drop data
+  unsafe HeapCell.retain(reference)
+}
+unsafe effect fn discover(context: *mut HeapHeader, state: *mut State) -> () ! OutOfMemoryError ? &mut Allocator {
+  // Native-only allocation during the inventory walk: no JS allocation or GC reentry.
+  let anchor = ()
+  let mut walk = unsafe gc.walkCells(unsafe runtime.contextRuntime(context))
+  while let Option<*mut HeapHeader>.Some { value: reference } = Pointer.nonNullMut<HeapHeader>(unsafe gc.nextCell(&mut walk)) {
+    let header = unsafe Pointer.borrow<(), HeapHeader>(&anchor, reference)
+    let bytecode = header.kind == HeapKind.FunctionBytecode drop header
+    if bytecode { run unsafe register(state, reference) }
+  }
+}
+unsafe fn compiledReference(compiled: ValueBits) -> Option<*mut HeapHeader> {
+  if let ValueBits.FunctionBytecode { reference } = compiled { return Option<*mut HeapHeader>.some(reference) }
+  if let ValueBits.Module { reference } = compiled {
+    let anchor = () let module = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, reference)
+    let function = module.functionObject drop module return unsafe compiledReference(function)
+  }
+  return unsafe backtrace.bytecode(compiled)
+}
+// Binding eligibility belongs to the bytecode, not to a debugger session. This
+// survives disable/enable without owning unbound scripts or retaining dead realms.
+pub unsafe fn deferSource(compiled: ValueBits, deferred: bool) -> () {
+  let reference = match unsafe compiledReference(compiled) { Option<*mut HeapHeader>.Some { value } => value _ => { return } }
+  let mut anchor = () let code = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut anchor, reference)
+  if code.debuggerMetadata.sourceDeferred == deferred { return }
+  code.debuggerMetadata.sourceDeferred = deferred
+  let count = code.constants.length() drop code
+  let mut i: usize = 0
+  while i < count {
+    let parent = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference)
+    let child = parent.constants.get(i) drop parent
+    if let ValueBits.FunctionBytecode { .. } = child { unsafe deferSource(child, deferred) }
+    i = i + 1
+  }
+}
+unsafe effect fn registerTree(state: *mut State, compiled: ValueBits) -> () ! OutOfMemoryError ? &mut Allocator {
+  let reference = match unsafe compiledReference(compiled) { Option<*mut HeapHeader>.Some { value } => value _ => { return () } }
+  let anchor = () let data = unsafe Pointer.borrow<(), State>(&anchor, state) let mut i = data.functions.length() drop data
+  run unsafe register(state, reference)
+  while true {
+    let data = unsafe Pointer.borrow<(), State>(&anchor, state) let length = data.functions.length() drop data
+    if i >= length { break }
+    let entry = unsafe functionAt(state, i) let reference = entry.reference
+    let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference) let count = code.constants.length() drop code
+    let mut child: usize = 0
+    while child < count {
+      let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference) let value = code.constants.get(child) drop code
+      if let ValueBits.FunctionBytecode { reference: nested } = value { run unsafe register(state, nested) }
+      child = child + 1
+    }
+    i = i + 1
+  }
+}
+unsafe fn coordinates(reference: *mut HeapHeader, location: Location) -> Location {
+  let mut result = location let anchor = () let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference)
+  if let Option<FunctionDebugInfo>.Some { value: debug } = &code.debug {
+    if result.line == 0 { result.column = i32.wrappingSubtract(result.column, debug.sourceColumnOffset) }
+    if !debug.nodeSourceURL {
+      if result.line == 0 { result.column = i32.wrappingAdd(result.column, debug.columnOffset) }
+      result.line = i32.wrappingAdd(result.line, debug.lineOffset)
+    }
+  }
+  return result
+}
+unsafe effect fn source<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, reference: *mut HeapHeader, scope: &mut Scope) -> ValueBits ! JsException ? &mut Allocator {
+  scope.values[6] = unsafe metadata.get(ValueBits.FunctionBytecode { reference: reference })
+  if scope.values[6].isObject() {
+    let result = run unsafe common.get(&mut engine, context, scope.values[6], b"source")
+    if result.isString() { return result }
+    unsafe owners.release(&mut engine, context, result)
+  }
+  return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Script source is not available")
+}
+unsafe effect fn locationObject<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, reference: *mut HeapHeader, location: Location, token: usize, scope: &mut Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  scope.values[3] = run unsafe object(&mut engine, context)
+  let out = scope.values[3] let point = unsafe coordinates(reference, location)
+  let anchor = () let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference) let id = code.scriptId drop code
+  let idValue = run unsafe idString(&mut engine, context, id)
+  run unsafe common.define(&mut engine, context, out, b"scriptId", idValue, 7)
+  run unsafe common.define(&mut engine, context, out, b"lineNumber", ValueBits.Int { value: point.line }, 7)
+  run unsafe common.define(&mut engine, context, out, b"columnNumber", ValueBits.Int { value: point.column }, 7)
+  run unsafe common.define(&mut engine, context, out, b"pc", ValueBits.Float64 { value: usize.toF64(token) }, 7)
+  return scope.take(3)
+}
+unsafe effect fn scriptInfo<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, reference: *mut HeapHeader, scope: &mut Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  scope.values[1] = run unsafe object(&mut engine, context) let out = scope.values[1]
+  let anchor = () let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference)
+  let id = code.scriptId let mut filename: u32 = 0 let mut line: i32 = 0 let mut column: i32 = 0
+  let contextToken = usize.toU64(Pointer.address<HeapHeader>(code.realm))
+  if let Option<FunctionDebugInfo>.Some { value: debug } = &code.debug {
+    filename = debug.filename
+    if !debug.nodeSourceURL { line = debug.lineOffset column = debug.columnOffset }
+  }
+  drop code
+  let scriptId = run unsafe idString(&mut engine, context, id)
+  run unsafe common.define(&mut engine, context, out, b"scriptId", scriptId, 7)
+  scope.values[6] = unsafe metadata.get(ValueBits.FunctionBytecode { reference: reference })
+  scope.values[5] = if scope.values[6].isObject() { run unsafe common.get(&mut engine, context, scope.values[6], b"sourceURL") } else { ValueBits.Undefined }
+  if !scope.values[5].isString() {
+    unsafe owners.release(&mut engine, context, scope.take(5)) scope.values[5] = run unsafe atom(&mut engine, context, filename)
+  }
+  run unsafe common.define(&mut engine, context, out, b"url", scope.take(5), 7)
+  run unsafe common.define(&mut engine, context, out, b"startLine", ValueBits.Int { value: line }, 7)
+  run unsafe common.define(&mut engine, context, out, b"startColumn", ValueBits.Int { value: column }, 7)
+  if scope.values[6].isObject() { scope.values[5] = run unsafe common.get(&mut engine, context, scope.values[6], b"source") }
+  if scope.values[5].isString() {
+    let value = scope.values[5] let mut i: usize = 0
+    while i < Strings.length(value) {
+      let unit = Strings.codeUnit(value, i)
+      if unit == 13 || unit == 10 || unit == 8232 || unit == 8233 {
+        line = i32.wrappingAdd(line, 1) column = 0
+        if unit == 13 && i + 1 < Strings.length(value) && Strings.codeUnit(value, i + 1) == 10 { i = i + 1 }
+      } else { column = i32.wrappingAdd(column, 1) }
+      i = i + 1
+    }
+    run unsafe common.define(&mut engine, context, out, b"length", ValueBits.Float64 { value: usize.toF64(Strings.length(value)) }, 7)
+  }
+  run unsafe common.define(&mut engine, context, out, b"endLine", ValueBits.Int { value: line }, 7)
+  run unsafe common.define(&mut engine, context, out, b"endColumn", ValueBits.Int { value: column }, 7)
+  let token = run unsafe idString(&mut engine, context, contextToken)
+  run unsafe common.define(&mut engine, context, out, b"contextToken", token, 7)
+  unsafe owners.release(&mut engine, context, scope.take(5)) unsafe owners.release(&mut engine, context, scope.take(6))
+  return scope.take(1)
+}
+unsafe effect fn scriptList<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, first: usize, scope: &mut Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let memory = engine.memory scope.values[0] = run unsafe common.array(&mut engine, memory, context)
+  let count = unsafe scriptCount(state) let mut i = first
+  while i < count {
+    let value = run unsafe scriptInfo(&mut engine, context, unsafe scriptAt(state, i), &mut scope)
+    run unsafe common.defineIndex(&mut engine, context, scope.values[0], usize.toU32(i - first), value) i = i + 1
+  }
+  return scope.take(0)
+}
+unsafe effect fn publication<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, compiled: ValueBits, scope: &mut Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let memory = engine.memory scope.values[0] = run unsafe common.array(&mut engine, memory, context)
+  if let Option<*mut HeapHeader>.Some { value: reference } = unsafe compiledReference(compiled) {
+    let value = run unsafe scriptInfo(&mut engine, context, reference, &mut scope)
+    run unsafe common.defineIndex(&mut engine, context, scope.values[0], 0, value)
+  }
+  return scope.take(0)
+}
+pub unsafe effect fn compiledSource<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, compiled: ValueBits) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  if !unsafe enabled(state) {
+    let memory = engine.memory return run unsafe common.array(&mut engine, memory, context)
+  }
+  run unsafe registerTree(state, compiled)
+  // Inventory deduplication must not suppress a new binding/execution event.
+  let mut scope = Scope.make() let result = run Effect.result(unsafe publication(&mut engine, context, compiled, &mut scope))
+  unsafe owners.cleanup(&mut engine, context, move scope)
+  return match move result { Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
+}
+unsafe fn savedFrame(context: *mut HeapHeader, state: *mut State, id: u64) -> Option<Frame> {
+  let anchor = () let data = unsafe Pointer.borrow<(), State>(&anchor, state) let mut i: usize = 0
+  while i < data.frames.length() {
+    let saved = data.frames.get(i)
+    if saved.id == id {
+      drop data
+      if !Pointer.isNull<StackFrame>(unsafe debugger.resolve(unsafe runtime.contextRuntime(context), saved.frame)) { return Option<Frame>.some(saved.frame) }
+      return Option<Frame>.none()
+    }
+    i = i + 1
+  }
+  return Option<Frame>.none()
+}
+unsafe effect fn framesBody<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, scope: &mut Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context) let memory = engine.memory
+  scope.values[0] = run unsafe common.array(&mut engine, memory, context)
+  if !unsafe enabled(state) { return scope.take(0) }
+  let mut anchor = () let data = unsafe Pointer.borrowMut<(), State>(&mut anchor, state) data.frames.clear() drop data
+  let mut i: usize = 0
+  while let Option<Frame>.Some { value: frame } = unsafe debugger.frame(rt, i) {
+    run unsafe register(state, frame.bytecode)
+    let data = unsafe Pointer.borrowMut<(), State>(&mut anchor, state) let id = data.nextFrame
+    if id == 18446744073709551615 { drop data return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Internal, b"Debugger frame identity exhausted") }
+    run data.frames.append(SavedFrame { id: id, frame: frame }) data.nextFrame = id + 1 drop data
+    scope.values[1] = run unsafe object(&mut engine, context) let out = scope.values[1]
+    let frameId = run unsafe idString(&mut engine, context, id)
+    run unsafe common.define(&mut engine, context, out, b"callFrameId", frameId, 7)
+    let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, frame.bytecode) let name = code.name
+    let mut point = Location { pc: 0, sourcePosition: 0, line: 0, column: 0, scope: 0, debuggerStatement: false, statementStart: false }
+    let mut j: usize = 0
+    while j < code.debuggerMetadata.locations.length() {
+      let candidate = code.debuggerMetadata.locations.get(j) if u32.toUsize(candidate.pc) > frame.pc { break } point = candidate j = j + 1
+    }
+    drop code
+    let functionName = run unsafe atom(&mut engine, context, name)
+    run unsafe common.define(&mut engine, context, out, b"functionName", functionName, 7)
+    let location = run unsafe locationObject(&mut engine, context, frame.bytecode, point, 0, &mut scope)
+    run unsafe common.define(&mut engine, context, out, b"location", location, 7)
+    if let Option<Binding>.Some { value: binding } = unsafe scopes.binding(rt, frame, 0) {
+      let receiver = if binding.uninitialized { ValueBits.Undefined } else { binding.value }
+      run unsafe common.define(&mut engine, context, out, b"this", receiver, 7)
+    }
+    let realm = unsafe HeapCell.payload<ContextState, ()>(&anchor, frame.context)
+    let global = unsafe realm.globalObject.retained() drop realm
+    run unsafe common.define(&mut engine, context, out, b"global", global, 7)
+    let token = run unsafe idString(&mut engine, context, usize.toU64(Pointer.address<HeapHeader>(frame.context)))
+    run unsafe common.define(&mut engine, context, out, b"contextToken", token, 7)
+    run unsafe common.defineIndex(&mut engine, context, scope.values[0], usize.toU32(i), scope.take(1)) i = i + 1
+  }
+  return scope.take(0)
+}
+pub unsafe effect fn pausedFrames<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut scope = Scope.make() let result = run Effect.result(unsafe framesBody(&mut engine, context, state, &mut scope))
+  unsafe owners.cleanup(&mut engine, context, move scope)
+  return match move result { Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
+}
+unsafe effect fn bindings<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, frame: Frame, scope: &mut Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context) let memory = engine.memory scope.values[0] = run unsafe common.array(&mut engine, memory, context)
+  let count = unsafe scopes.bindingCount(rt, frame) let mut i: usize = 0
+  while i < count {
+    let binding = match unsafe scopes.binding(rt, frame, i) { Option<Binding>.Some { value } => move value _ => { break } }
+    let mut local = binding.kind == scopes.ARGUMENT || binding.scope <= 0
+    if binding.kind == scopes.LOCAL && binding.scope > 0 {
+      let anchor = () let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, frame.bytecode)
+      local = code.debuggerMetadata.scopes.get(i32.toUsize(binding.scope)).parent <= 0
+    }
+    if binding.kind == scopes.CLOSURE { local = false }
+    scope.values[2] = binding.value scope.values[1] = run unsafe object(&mut engine, context) let out = scope.values[1]
+    let name = run unsafe atom(&mut engine, context, binding.name)
+    run unsafe common.define(&mut engine, context, out, b"name", name, 7)
+    let value = scope.take(2)
+    if binding.uninitialized { unsafe owners.release(&mut engine, context, value) }
+    else { run unsafe common.define(&mut engine, context, out, b"value", value, 7) }
+    run unsafe common.define(&mut engine, context, out, b"kind", ValueBits.Float64 { value: u32.toF64(binding.kind) }, 7)
+    run unsafe common.define(&mut engine, context, out, b"scope", ValueBits.Int { value: binding.scope }, 7)
+    run unsafe common.define(&mut engine, context, out, b"depth", ValueBits.Float64 { value: u32.toF64(binding.depth) }, 7)
+    run unsafe common.define(&mut engine, context, out, b"isLocal", ValueBits.Bool { value: local }, 7)
+    run unsafe common.define(&mut engine, context, out, b"isConst", ValueBits.Bool { value: binding.isConst }, 7)
+    run unsafe common.define(&mut engine, context, out, b"isLexical", ValueBits.Bool { value: binding.isLexical }, 7)
+    run unsafe common.define(&mut engine, context, out, b"isUninitialized", ValueBits.Bool { value: binding.uninitialized }, 7)
+    run unsafe common.defineIndex(&mut engine, context, scope.values[0], usize.toU32(i), scope.take(1)) i = i + 1
+  }
+  return scope.take(0)
+}
+unsafe effect fn dispatchBody<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, operation: u32, argc: i32, argv: &FrameSlots, scope: &mut Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context) let first = unsafe text.argument(argv, argc, 0)
+  if operation == 20 || operation == 21 {
+    if operation == 20 {
+      let active = match first { ValueBits.Bool { value } => value _ => false }
+      if !active { unsafe dispose(&mut engine, context, state) }
+      else {
+        let mut anchor = () let data = unsafe Pointer.borrowMut<(), State>(&mut anchor, state)
+        data.enabled = true
+      }
+    }
+    if unsafe enabled(state) { run unsafe discover(context, state) }
+    return run unsafe scriptList(&mut engine, context, state, 0, &mut scope)
+  }
+  if operation == 22 || operation == 23 || operation == 24 {
+    let id = identity(first)
+    let reference = match unsafe script(state, id) { Option<*mut HeapHeader>.Some { value } => value _ => { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"No script with given id") } }
+    if operation == 22 { return run unsafe source(&mut engine, context, reference, &mut scope) }
+    let tokenValue = unsafe text.argument(argv, argc, 1)
+    if operation == 24 && (!tokenValue.isNumber() || tokenValue.numericValue() < 0.0 || tokenValue.numericValue() > 9007199254740991.0) { return ValueBits.Bool { value: false } }
+    let token = if operation == 24 { f64.toUsize(tokenValue.numericValue()) } else { 0 }
+    if operation == 24 && usize.toF64(token) != tokenValue.numericValue() { return ValueBits.Bool { value: false } }
+    let anchor = () let data = unsafe Pointer.borrow<(), State>(&anchor, state) let count = data.functions.length() drop data
+    if operation == 23 { let memory = engine.memory scope.values[0] = run unsafe common.array(&mut engine, memory, context) }
+    let mut i: usize = 0 let mut output: u32 = 0
+    while i < count {
+      let entry = unsafe functionAt(state, i)
+      if entry.script == id {
+        if operation == 24 && token >= entry.firstLocation && token - entry.firstLocation < entry.locations {
+          let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, entry.reference)
+          let point = code.debuggerMetadata.locations.get(token - entry.firstLocation) drop code
+          return ValueBits.Bool { value: run unsafe debugger.addBreakpoint(rt, entry.reference, u32.toUsize(point.pc)) }
+        }
+        if operation == 23 {
+          let mut j: usize = 0
+          while j < entry.locations {
+            let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, entry.reference) let point = code.debuggerMetadata.locations.get(j) drop code
+            let value = run unsafe locationObject(&mut engine, context, entry.reference, point, entry.firstLocation + j, &mut scope)
+            run unsafe common.defineIndex(&mut engine, context, scope.values[0], output, value) output = output + 1 j = j + 1
+          }
+        }
+      }
+      i = i + 1
+    }
+    if operation == 24 { return ValueBits.Bool { value: false } } return scope.take(0)
+  }
+  if operation == 25 { unsafe debugger.clearBreakpoints(rt) return ValueBits.Undefined }
+  if operation == 26 { unsafe debugger.requestPause(rt) return ValueBits.Undefined }
+  if operation == 27 {
+    if !first.isNumber() || first.numericValue() < 0.0 || first.numericValue() > 3.0 { return ValueBits.Bool { value: false } }
+    let mode = f64.toU32(first.numericValue())
+    if u32.toF64(mode) != first.numericValue() { return ValueBits.Bool { value: false } }
+    return ValueBits.Bool { value: unsafe debugger.resume(rt, mode) }
+  }
+  if operation == 28 {
+    let second = unsafe text.argument(argv, argc, 1)
+    unsafe debugger.exceptions(rt, match first { ValueBits.Bool { value } => value _ => false }, match second { ValueBits.Bool { value } => value _ => false }) return ValueBits.Undefined
+  }
+  if operation == 29 || operation == 30 {
+    let frame = match unsafe savedFrame(context, state, identity(first)) { Option<Frame>.Some { value } => value _ => { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Could not find call frame with given id") } }
+    if operation == 30 { return run unsafe bindings(&mut engine, context, frame, &mut scope) }
+    // No registry/services borrow survives evaluation: compilation and pause hooks may reenter.
+    return run unsafe evaluation.evaluateFrame(&mut engine, context, frame, argv)
+  }
+  if operation == 31 { return ValueBits.Bool { value: unsafe debugger.paused(rt) } }
+  return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Unsupported inspector debugger operation")
+}
+// Arguments start at slot zero (the host dispatch has already consumed the op).
+// 20 enable,21 scripts,22 source,23 locations,24 add,25 clear,26 pause,27 resume,
+// 28 exceptions,29 evaluateFrame,30 frameBindings,31 paused.
+pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, operation: u32, argc: i32, argv: &FrameSlots) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut scope = Scope.make() let result = run Effect.result(unsafe dispatchBody(&mut engine, context, state, operation, argc, argv, &mut scope))
+  unsafe owners.cleanup(&mut engine, context, move scope)
+  return match move result { Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
+}

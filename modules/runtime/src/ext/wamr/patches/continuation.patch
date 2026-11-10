@@ -1,0 +1,1204 @@
+SilkJS retained classic-interpreter invocations.
+Base: WAMR 25bd7eb63e828e4bd242cc9b38d260b4b31c6605 (2.4.5).
+Apply with -p1 together with SilkJS resource ownership and proposal patches.
+Original upstream files retain Apache-2.0 WITH LLVM-exception provenance.
+
+--- a/core/iwasm/common/wasm_exec_env.h
++++ b/core/iwasm/common/wasm_exec_env.h
+@@ -161,6 +161,8 @@
+ #if WASM_ENABLE_MEMORY_PROFILING != 0
+     uint32 max_wasm_stack_used;
+ #endif
++
++    struct WASMInterpInvocation *silk_invocation;
+ 
+     /* The WASM stack size */
+     uint32 wasm_stack_size;
+--- a/core/iwasm/interpreter/wasm_interp.h
++++ b/core/iwasm/interpreter/wasm_interp.h
+@@ -62,6 +62,12 @@
+     WASMBranchBlock *csp_boundary;
+     WASMBranchBlock *csp;
+ 
++    /* Classic continuation frames carry their instance, not a C-stack owner. */
++    struct WASMModuleInstance *module_inst;
++    uintptr_t aux_stack_boundary;
++    uintptr_t aux_stack_bottom;
++    uint32 retained_cell_num;
++
+     /**
+      * Frame data, the layout is:
+      *  lp: parameters and local variables
+--- a/core/iwasm/interpreter/wasm_interp_classic.c
++++ b/core/iwasm/interpreter/wasm_interp_classic.c
+@@ -27,6 +27,7 @@
+ #if WASM_ENABLE_FAST_JIT != 0
+ #include "../fast-jit/jit_compiler.h"
+ #endif
++#include "wasm_continuation_internal.h"
+ 
+ typedef int32 CellType_I32;
+ typedef int64 CellType_I64;
+@@ -370,11 +371,11 @@
+     uint32 all_cell_num;
+ 
+     if (!cur_func) {
+-        /* it's a glue frame created in wasm_interp_call_wasm,
+-           no GC object will be traversed */
+-        return (uint8 *)frame->lp;
++        return (uint8 *)frame->csp_boundary;
+     }
+     else if (!frame->ip) {
++        if (frame->retained_cell_num)
++            return (uint8 *)(frame->lp + frame->retained_cell_num);
+         /* it's a native method frame created in
+            wasm_interp_call_func_native */
+         all_cell_num =
+@@ -637,6 +638,7 @@
+         frame->sp = frame_sp;   \
+         frame->ip = frame_ip;   \
+         frame->csp = frame_csp; \
++        SILK_SYNC_METERING();   \
+     } while (0)
+ 
+ #define UPDATE_ALL_FROM_FRAME() \
+@@ -774,6 +776,7 @@
+         frame_sp = frame->sp;           \
+         frame_csp = frame->csp;         \
+         RECOVER_FRAME_REF();            \
++        SILK_RECOVER_MODULE();          \
+     } while (0)
+ 
+ #if WASM_ENABLE_LABELS_AS_VALUES != 0
+@@ -1168,6 +1171,19 @@
+ 
+     if (frame) {
+         frame->prev_frame = prev_frame;
++        frame->module_inst = (WASMModuleInstance *)exec_env->module_inst;
++        frame->aux_stack_boundary = exec_env->aux_stack_boundary;
++        frame->aux_stack_bottom = exec_env->aux_stack_bottom;
++        frame->retained_cell_num = 0;
++        frame->csp_boundary = NULL;
++        if (exec_env->silk_invocation) {
++            WASMInterpInvocation *inv = exec_env->silk_invocation;
++            wasm_silk_instance_retain(frame->module_inst);
++            if (inv->dispatch_owner) {
++                wasm_silk_instance_release(inv->dispatch_owner);
++                inv->dispatch_owner = NULL;
++            }
++        }
+ #if WASM_ENABLE_PERF_PROFILING != 0
+         frame->time_started = os_time_thread_cputime_us();
+ #endif
+@@ -1195,6 +1211,8 @@
+             prev_frame->function->children_exec_time += time_elapsed;
+     }
+ #endif
++    if (exec_env->silk_invocation)
++        wasm_silk_instance_release(frame->module_inst);
+     wasm_exec_env_free_wasm_frame(exec_env, frame);
+ }
+ 
+@@ -1534,16 +1552,10 @@
+ #endif /* end of WASM_ENABLE_LABELS_AS_VALUES */
+ 
+ static inline uint8 *
+-get_global_addr(uint8 *global_data, WASMGlobalInstance *global)
++get_global_addr(WASMModuleInstance *module, WASMGlobalInstance *global)
+ {
+-#if WASM_ENABLE_MULTI_MODULE == 0
+-    return global_data + global->data_offset;
+-#else
+-    return global->import_global_inst
+-               ? global->import_module_inst->global_data
+-                     + global->import_global_inst->data_offset
+-               : global_data + global->data_offset;
+-#endif
++    return wasm_silk_global_addr(module,
++                                 (uint32)(global - module->e->globals));
+ }
+ 
+ #if WASM_ENABLE_INSTRUCTION_METERING != 0
+@@ -1578,7 +1590,6 @@
+ #endif
+     WASMFuncType **wasm_types = (WASMFuncType **)module->module->types;
+     WASMGlobalInstance *globals = module->e->globals, *global;
+-    uint8 *global_data = module->global_data;
+     uint8 opcode_IMPDEP = WASM_OP_IMPDEP;
+     WASMInterpFrame *frame = NULL;
+     /* Points to this special opcode so as to jump to the
+@@ -1601,6 +1612,7 @@
+     uint32 local_idx, local_offset, global_idx;
+     uint8 local_type, *global_addr;
+     uint32 cache_index, type_index, param_cell_num, cell_num;
++    WASMModuleInstance *silk_call_module = NULL;
+ 
+ #if WASM_ENABLE_INSTRUCTION_METERING != 0
+     int instructions_left = -1;
+@@ -1670,6 +1682,18 @@
+     DEFINE_GOTO_TABLE(const void *, handle_table);
+ #undef HANDLE_OPCODE
+ #endif
++
++    if (exec_env->silk_invocation && exec_env->silk_invocation->resuming) {
++        exec_env->silk_invocation->resuming = false;
++        frame = wasm_exec_env_get_cur_frame(exec_env);
++        if (!frame->function)
++            return;
++        RECOVER_CONTEXT(frame);
++#if WASM_ENABLE_EXCE_HANDLING != 0
++        if (exec_env->silk_exception)
++            goto silk_throw_pending;
++#endif
++    }
+ 
+ #if WASM_ENABLE_LABELS_AS_VALUES == 0
+     while (frame_ip < frame_ip_end) {
+@@ -2348,6 +2372,7 @@
+                 WASMFuncType *cur_type, *cur_func_type;
+                 WASMTableInstance *tbl_inst;
+                 uint32 tbl_idx;
++                WASMModuleInstance *function_owner = module;
+ 
+ #if WASM_ENABLE_TAIL_CALL != 0
+                 opcode = *(frame_ip - 1);
+@@ -2401,6 +2426,7 @@
+                     goto got_exception;
+                 }
+                 fidx = wasm_func_obj_get_func_idx_bound(func_obj);
++                function_owner = wasm_func_obj_get_owner(func_obj);
+ #endif
+                 /* clang-format on */
+ 
+@@ -2409,13 +2435,13 @@
+                  * another module. In that case, we don't validate
+                  * the elem value while loading
+                  */
+-                if (fidx >= module->e->function_count) {
++                if (!function_owner || fidx >= function_owner->e->function_count) {
+                     wasm_set_exception(module, "unknown function");
+                     goto got_exception;
+                 }
+ 
+-                /* always call module own functions */
+-                cur_func = module->e->functions + fidx;
++                cur_func = function_owner->e->functions + fidx;
++                silk_call_module = function_owner;
+ 
+                 if (cur_func->is_import_func)
+                     cur_func_type = cur_func->u.func_import->func_type;
+@@ -2429,7 +2455,9 @@
+                     goto got_exception;
+                 }
+ #else
+-                if (!wasm_func_type_is_super_of(cur_type, cur_func_type)) {
++                if (!wasm_silk_func_type_matches(module->module, cur_type,
++                                                 function_owner->module,
++                                                 cur_func_type)) {
+                     wasm_set_exception(module, "indirect call type mismatch");
+                     goto got_exception;
+                 }
+@@ -2642,7 +2670,13 @@
+                 }
+ 
+                 fidx = wasm_func_obj_get_func_idx_bound(func_obj);
+-                cur_func = module->e->functions + fidx;
++                silk_call_module = wasm_func_obj_get_owner(func_obj);
++                if (!silk_call_module
++                    || fidx >= silk_call_module->e->function_count) {
++                    wasm_set_exception(module, "unknown function");
++                    goto got_exception;
++                }
++                cur_func = silk_call_module->e->functions + fidx;
+                 goto call_func_from_interp;
+             }
+ 
+@@ -2659,7 +2693,13 @@
+                 }
+ 
+                 fidx = wasm_func_obj_get_func_idx_bound(func_obj);
+-                cur_func = module->e->functions + fidx;
++                silk_call_module = wasm_func_obj_get_owner(func_obj);
++                if (!silk_call_module
++                    || fidx >= silk_call_module->e->function_count) {
++                    wasm_set_exception(module, "unknown function");
++                    goto got_exception;
++                }
++                cur_func = silk_call_module->e->functions + fidx;
+                 goto call_func_from_return_call;
+             }
+ 
+@@ -4290,7 +4330,7 @@
+                 read_leb_uint32(frame_ip, frame_ip_end, global_idx);
+                 bh_assert(global_idx < module->e->global_count);
+                 global = globals + global_idx;
+-                global_addr = get_global_addr(global_data, global);
++                global_addr = get_global_addr(module, global);
+                 /* clang-format off */
+ #if WASM_ENABLE_GC == 0
+                 PUSH_I32(*(uint32 *)global_addr);
+@@ -4314,7 +4354,7 @@
+                 read_leb_uint32(frame_ip, frame_ip_end, global_idx);
+                 bh_assert(global_idx < module->e->global_count);
+                 global = globals + global_idx;
+-                global_addr = get_global_addr(global_data, global);
++                global_addr = get_global_addr(module, global);
+                 PUSH_I64(GET_I64_FROM_ADDR((uint32 *)global_addr));
+                 HANDLE_OP_END();
+             }
+@@ -4324,7 +4364,7 @@
+                 read_leb_uint32(frame_ip, frame_ip_end, global_idx);
+                 bh_assert(global_idx < module->e->global_count);
+                 global = globals + global_idx;
+-                global_addr = get_global_addr(global_data, global);
++                global_addr = get_global_addr(module, global);
+                 /* clang-format off */
+ #if WASM_ENABLE_GC == 0
+                 *(int32 *)global_addr = POP_I32();
+@@ -4345,7 +4385,7 @@
+                 read_leb_uint32(frame_ip, frame_ip_end, global_idx);
+                 bh_assert(global_idx < module->e->global_count);
+                 global = globals + global_idx;
+-                global_addr = get_global_addr(global_data, global);
++                global_addr = get_global_addr(module, global);
+ #if WASM_ENABLE_MEMORY64 != 0
+                 if (is_memory64) {
+                     aux_stack_top = *(uint64 *)(frame_sp - 2);
+@@ -4392,7 +4432,7 @@
+                 read_leb_uint32(frame_ip, frame_ip_end, global_idx);
+                 bh_assert(global_idx < module->e->global_count);
+                 global = globals + global_idx;
+-                global_addr = get_global_addr(global_data, global);
++                global_addr = get_global_addr(module, global);
+                 PUT_I64_TO_ADDR((uint32 *)global_addr, POP_I64());
+                 HANDLE_OP_END();
+             }
+@@ -6604,8 +6644,13 @@
+         if (cur_func->param_cell_num > 0) {
+             word_copy(frame->lp, frame_sp, cur_func->param_cell_num);
+         }
++        if (exec_env->silk_invocation) {
++            WASMInterpInvocation *inv = exec_env->silk_invocation;
++            inv->dispatch_owner = silk_call_module ? silk_call_module : module;
++            wasm_silk_instance_retain(inv->dispatch_owner);
++        }
++        wasm_exec_env_set_cur_frame(exec_env, prev_frame);
+         FREE_FRAME(exec_env, frame);
+-        wasm_exec_env_set_cur_frame(exec_env, prev_frame);
+         is_return_call = true;
+         goto call_func_from_entry;
+     }
+@@ -6627,6 +6672,45 @@
+ 
+     call_func_from_entry:
+     {
++        if (silk_call_module && silk_call_module != module) {
++            SILK_RELOAD_MODULE(silk_call_module);
++            exec_env->aux_stack_bottom = module->module->aux_stack_bottom;
++            exec_env->aux_stack_boundary = exec_env->aux_stack_bottom
++                                          - module->module->aux_stack_size;
++        }
++        silk_call_module = NULL;
++#if WASM_ENABLE_MULTI_MODULE != 0
++        if (exec_env->silk_invocation) {
++            /* Resolve the callee once. The retained native frame, not a table
++               lookup or recursive C activation, is resumed after a yield. */
++            while (cur_func->is_import_func && cur_func->import_func_inst) {
++                WASMModuleInstance *owner = cur_func->import_module_inst;
++                cur_func = cur_func->import_func_inst;
++                SILK_RELOAD_MODULE(owner);
++                exec_env->aux_stack_bottom = owner->module->aux_stack_bottom;
++                exec_env->aux_stack_boundary = exec_env->aux_stack_bottom
++                                              - owner->module->aux_stack_size;
++            }
++        }
++#endif
++        if (exec_env->silk_invocation && cur_func->is_import_func) {
++            silk_invocation_call_native(exec_env, cur_func, prev_frame);
++            module = (WASMModuleInstance *)exec_env->module_inst;
++            if (exec_env->silk_invocation->status == WASM_INVOCATION_SUSPENDED
++                || wasm_copy_exception(module, NULL))
++                return;
++            frame = wasm_exec_env_get_cur_frame(exec_env);
++            if (!frame->function)
++                return;
++            RECOVER_CONTEXT(frame);
++            /* A synchronous import can grow memory or reenter this store. */
++            SILK_RELOAD_MODULE(frame->module_inst);
++#if WASM_ENABLE_EXCE_HANDLING != 0
++            if (exec_env->silk_exception)
++                goto silk_throw_pending;
++#endif
++            HANDLE_OP_END();
++        }
+         if (cur_func->is_import_func) {
+ #if WASM_ENABLE_MULTI_MODULE != 0
+             if (cur_func->import_func_inst) {
+@@ -6647,47 +6731,6 @@
+                     UPDATE_ALL_FROM_FRAME();
+                 }
+ 
+-#if WASM_ENABLE_EXCE_HANDLING != 0
+-                char uncaught_exception[128] = { 0 };
+-                bool has_exception =
+-                    wasm_copy_exception(module, uncaught_exception);
+-                if (has_exception
+-                    && strstr(uncaught_exception, "uncaught wasm exception")) {
+-                    uint32 import_exception;
+-                    /* initialize imported exception index to be invalid */
+-                    SET_INVALID_TAGINDEX(import_exception);
+-
+-                    /* pull external exception */
+-                    uint32 ext_exception = POP_I32();
+-
+-                    /* external function came back with an exception or trap */
+-                    /* lookup exception in import tags */
+-                    WASMTagInstance *tag = module->e->tags;
+-                    for (uint32 t = 0; t < module->module->import_tag_count;
+-                         tag++, t++) {
+-
+-                        /* compare the module and the external index with the
+-                         * import tag data */
+-                        if ((cur_func->u.func_import->import_module
+-                             == tag->u.tag_import->import_module)
+-                            && (ext_exception
+-                                == tag->u.tag_import
+-                                       ->import_tag_index_linked)) {
+-                            /* set the import_exception to the import tag */
+-                            import_exception = t;
+-                            break;
+-                        }
+-                    }
+-                    /*
+-                     * exchange the thrown exception (index valid in submodule)
+-                     * with the imported exception index (valid in this module)
+-                     * if the module did not import the exception,
+-                     * that results in a "INVALID_TAGINDEX", that triggers
+-                     * an CATCH_ALL block, if there is one.
+-                     */
+-                    PUSH_I32(import_exception);
+-                }
+-#endif /* end of WASM_ENABLE_EXCE_HANDLING != 0 */
+             }
+             else
+ #endif /* end of WASM_ENABLE_MULTI_MODULE != 0 */
+@@ -6718,37 +6761,12 @@
+             if (memory)
+                 linear_mem_size = GET_LINEAR_MEMORY_SIZE(memory);
+ #endif
+-            if (wasm_copy_exception(module, NULL)) {
+ #if WASM_ENABLE_EXCE_HANDLING != 0
+-                /* the caller raised an exception */
+-                char uncaught_exception[128] = { 0 };
+-                bool has_exception =
+-                    wasm_copy_exception(module, uncaught_exception);
+-
+-                /* libc_builtin signaled a "exception thrown by stdc++" trap */
+-                if (has_exception
+-                    && strstr(uncaught_exception,
+-                              "exception thrown by stdc++")) {
+-                    wasm_set_exception(module, NULL);
+-
+-                    /* setup internal c++ rethrow */
+-                    exception_tag_index = 0;
+-                    goto find_a_catch_handler;
+-                }
+-
+-                /* when throw hits the end of a function it signals with a
+-                 * "uncaught wasm exception" trap */
+-                if (has_exception
+-                    && strstr(uncaught_exception, "uncaught wasm exception")) {
+-                    wasm_set_exception(module, NULL);
+-                    exception_tag_index = POP_I32();
+-
+-                    /* rethrow the exception into that frame */
+-                    goto find_a_catch_handler;
+-                }
+-#endif /* WASM_ENABLE_EXCE_HANDLING != 0 */
++            if (exec_env->silk_exception)
++                goto silk_throw_pending;
++#endif
++            if (wasm_copy_exception(module, NULL))
+                 goto got_exception;
+-            }
+         }
+         else {
+             WASMFunction *cur_wasm_func = cur_func->u.func;
+@@ -6844,21 +6862,23 @@
+ 
+     return_func:
+     {
+-        FREE_FRAME(exec_env, frame);
++        WASMInterpFrame *completed = frame;
+         wasm_exec_env_set_cur_frame(exec_env, prev_frame);
+ 
+         if (!prev_frame->ip) {
+-            /* Called from native. */
++            wasm_exec_env_set_module_inst(
++                exec_env, (WASMModuleInstanceCommon *)prev_frame->module_inst);
++            exec_env->aux_stack_boundary = prev_frame->aux_stack_boundary;
++            exec_env->aux_stack_bottom = prev_frame->aux_stack_bottom;
++            FREE_FRAME(exec_env, completed);
+             return;
+         }
+ 
+         RECOVER_CONTEXT(prev_frame);
++        FREE_FRAME(exec_env, completed);
+ #if WASM_ENABLE_EXCE_HANDLING != 0
+-        if (wasm_get_exception(module)) {
+-            wasm_set_exception(module, NULL);
+-            exception_tag_index = POP_I32();
+-            goto find_a_catch_handler;
+-        }
++        if (exec_env->silk_exception)
++            goto silk_throw_pending;
+ #endif
+         HANDLE_OP_END();
+     }
+@@ -6904,13 +6924,35 @@
+     WASMObjectRef gc_obj;
+     int i;
+ 
++#if WASM_ENABLE_EXCE_HANDLING != 0
++    gc_obj = exec_env->silk_exception;
++    if (mem_allocator_contains_gc_object(heap, gc_obj)
++        && wasm_obj_is_created_from_heap(gc_obj)
++        && mem_allocator_add_root((mem_allocator_t)heap, gc_obj))
++        return false;
++#endif
+     frame = wasm_exec_env_get_cur_frame(exec_env);
+     for (; frame; frame = frame->prev_frame) {
++#if WASM_ENABLE_EXCE_HANDLING != 0
++        if (frame->function && !frame->function->is_import_func) {
++            WASMBranchBlock *block;
++            for (block = frame->csp_bottom; block < frame->csp; block++) {
++                gc_obj = block->silk_caught_exception;
++                if (mem_allocator_contains_gc_object(heap, gc_obj)
++                    && wasm_obj_is_created_from_heap(gc_obj)
++                    && mem_allocator_add_root((mem_allocator_t)heap, gc_obj))
++                    return false;
++            }
++        }
++#endif
+         uint8 *frame_ref = get_frame_ref(frame);
++        if (!frame_ref)
++            continue;
+         for (i = 0; i < frame->sp - frame->lp; i++) {
+             if (frame_ref[i]) {
+                 gc_obj = GET_REF_FROM_ADDR(frame->lp + i);
+-                if (wasm_obj_is_created_from_heap(gc_obj)) {
++                if (mem_allocator_contains_gc_object(heap, gc_obj)
++                    && wasm_obj_is_created_from_heap(gc_obj)) {
+                     if (mem_allocator_add_root((mem_allocator_t)heap, gc_obj)) {
+                         return false;
+                     }
+@@ -6922,7 +6964,7 @@
+             }
+         }
+     }
+-    return true;
++    return silk_invocation_gc_roots(heap);
+ }
+ #endif
+ 
+@@ -7555,3 +7597,5 @@
+         FREE_FRAME(exec_env, frame);
+     }
+ }
++
++#include "wasm_continuation.inc"
+--- /dev/null
++++ b/core/iwasm/interpreter/wasm_continuation.h
+@@ -0,0 +1,71 @@
++/* SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception */
++#ifndef WASM_CONTINUATION_H
++#define WASM_CONTINUATION_H
++
++#include "wasm_interp.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct WASMInterpInvocation WASMInterpInvocation;
++typedef enum WASMInterpInvocationStatus {
++    WASM_INVOCATION_NEW = 0,
++    WASM_INVOCATION_RUNNING = 1,
++    WASM_INVOCATION_SUSPENDED = 2,
++    WASM_INVOCATION_COMPLETED = 3,
++    WASM_INVOCATION_THREW = 4,
++    WASM_INVOCATION_CANCELLED = 5
++} WASMInterpInvocationStatus;
++
++/* 0: results written, 1: yielded, 2: exception written. Exception is a
++ * GC-managed Wasm exnref, never a raw engine pointer. Argument and result
++ * storage belongs to the invocation and survives a yield. */
++typedef int (*WASMInterpHostCall)(
++    void *context, struct WASMExecEnv *env,
++    struct WASMFunctionInstance *function, const uint32 *arguments,
++    uint32 argument_cells, uint32 *results, uint32 result_cells,
++    void **exception);
++typedef void (*WASMInterpRootVisitor)(void *reference, void *context);
++
++/* Invocation lifetime is confined to its creating runtime thread. The host
++ * owns the instance's imported JS roots until free. Each invocation has an
++ * independent exec env; synchronous reentry must create another invocation.
++ * Start/resume select this env as the shared-heap collector context. Before
++ * returning to JS, and before free, the adapter must restore its stable store
++ * reference exec env as collector context. */
++WASMInterpInvocation *wasm_interp_invocation_create(
++    struct WASMModuleInstance *module, struct WASMFunctionInstance *function,
++    uint32 stack_size, WASMInterpHostCall host, void *context,
++    bool allow_suspend);
++WASMInterpInvocationStatus wasm_interp_invocation_start(
++    WASMInterpInvocation *invocation, const uint32 *arguments, uint32 cells);
++WASMInterpInvocationStatus wasm_interp_invocation_resume(
++    WASMInterpInvocation *invocation, const uint32 *results, uint32 cells,
++    void *exception);
++WASMInterpInvocationStatus wasm_interp_invocation_status(
++    const WASMInterpInvocation *invocation);
++const uint32 *wasm_interp_invocation_results(
++    const WASMInterpInvocation *invocation, uint32 *cells);
++void *wasm_interp_invocation_exception(const WASMInterpInvocation *invocation);
++const char *wasm_interp_invocation_trap(const WASMInterpInvocation *invocation);
++struct WASMExecEnv *wasm_interp_invocation_exec_env(
++    WASMInterpInvocation *invocation);
++void wasm_interp_invocation_visit_roots(WASMInterpInvocation *invocation,
++                                       WASMInterpRootVisitor visit,
++                                       void *context);
++/* Invalid on a RUNNING invocation. SUSPENDED invocations are cancelled. */
++void wasm_interp_invocation_free(WASMInterpInvocation *invocation);
++
++/* JS boundary guard: the adapter restores the previous value after a
++ * synchronous host call. A false guard requires the adapter to return a real
++ * SuspendError exnref (status 2), rather than status 1. */
++bool wasm_interp_invocation_suspension_allowed(struct WASMExecEnv *env);
++bool wasm_interp_invocation_set_suspend_allowed(struct WASMExecEnv *env,
++                                                bool allowed);
++void *wasm_interp_invocation_take_exception(struct WASMExecEnv *env);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+--- /dev/null
++++ b/core/iwasm/interpreter/wasm_continuation_internal.h
+@@ -0,0 +1,95 @@
++/* SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception */
++#ifndef WASM_CONTINUATION_INTERNAL_H
++#define WASM_CONTINUATION_INTERNAL_H
++#include "wasm_continuation.h"
++
++struct WASMInterpInvocation {
++    WASMInterpInvocation *next;
++    WASMExecEnv *env;
++    WASMModuleInstance *module;
++    WASMModuleInstance *dispatch_owner;
++    WASMFunctionInstance *function;
++    WASMInterpFrame *entry;
++    WASMInterpFrame *pending;
++    WASMInterpHostCall host;
++    void *context;
++    void *exception;
++    uint32 *results;
++    WASMInterpInvocationStatus status;
++    bool allow_suspend;
++    bool boundary_allows_suspend;
++    bool resuming;
++    char trap[128];
++};
++
++static os_thread_local_attribute WASMInterpInvocation *silk_invocations;
++static void silk_invocation_call_native(WASMExecEnv *, WASMFunctionInstance *,
++                                        WASMInterpFrame *);
++static bool silk_invocation_gc_roots(void *heap);
++
++
++#if !defined(OS_ENABLE_HW_BOUND_CHECK) \
++    || WASM_CPU_SUPPORTS_UNALIGNED_ADDR_ACCESS == 0 \
++    || WASM_ENABLE_BULK_MEMORY != 0
++#define SILK_RELOAD_MEMORY_SIZE() \
++    linear_mem_size = memory ? GET_LINEAR_MEMORY_SIZE(memory) : 0
++#else
++#define SILK_RELOAD_MEMORY_SIZE() (void)0
++#endif
++#if WASM_ENABLE_MEMORY64 != 0
++#define SILK_RELOAD_MEMORY_WIDTH() \
++    is_memory64 = memory ? memory->is_memory64 : false
++#else
++#define SILK_RELOAD_MEMORY_WIDTH() (void)0
++#endif
++#if WASM_ENABLE_MULTI_MEMORY != 0
++#define SILK_RELOAD_MEMORY_INDEX() memidx_cached = (uint32)-1
++#else
++#define SILK_RELOAD_MEMORY_INDEX() (void)0
++#endif
++#if (!defined(OS_ENABLE_HW_BOUND_CHECK) \
++     || WASM_CPU_SUPPORTS_UNALIGNED_ADDR_ACCESS == 0) \
++    && WASM_CONFIGURABLE_BOUNDS_CHECKS != 0
++#define SILK_RELOAD_BOUNDS() \
++    disable_bounds_checks = !wasm_runtime_is_bounds_checks_enabled( \
++        (WASMModuleInstanceCommon *)module)
++#else
++#define SILK_RELOAD_BOUNDS() (void)0
++#endif
++#if defined(os_writegsbase)
++#define SILK_RELOAD_SEGMENT() \
++    do { if (memory) os_writegsbase(memory->memory_data); } while (0)
++#else
++#define SILK_RELOAD_SEGMENT() (void)0
++#endif
++
++#if WASM_ENABLE_INSTRUCTION_METERING != 0
++#define SILK_SYNC_METERING() \
++    exec_env->instructions_to_execute = instructions_left
++#else
++#define SILK_SYNC_METERING() (void)0
++#endif
++
++#define SILK_RELOAD_MODULE(owner) \
++    do { \
++        module = (owner); \
++        wasm_exec_env_set_module_inst(exec_env, \
++            (WASMModuleInstanceCommon *)module); \
++        wasm_types = (WASMFuncType **)module->module->types; \
++        globals = module->e->globals; \
++        memory = wasm_get_default_memory(module); \
++        SILK_RELOAD_MEMORY_SIZE(); \
++        SILK_RELOAD_MEMORY_WIDTH(); \
++        SILK_RELOAD_MEMORY_INDEX(); \
++        SILK_RELOAD_BOUNDS(); \
++        SILK_RELOAD_SEGMENT(); \
++    } while (0)
++#define SILK_RECOVER_MODULE() \
++    do { \
++        if (frame->module_inst != module) { \
++            SILK_RELOAD_MODULE(frame->module_inst); \
++        } \
++        exec_env->aux_stack_boundary = frame->aux_stack_boundary; \
++        exec_env->aux_stack_bottom = frame->aux_stack_bottom; \
++    } while (0)
++#endif
+--- /dev/null
++++ b/core/iwasm/interpreter/wasm_continuation.inc
+@@ -0,0 +1,457 @@
++/* SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception */
++
++static WASMFuncType *
++silk_invocation_type(WASMFunctionInstance *function)
++{
++    return function->is_import_func ? function->u.func_import->func_type
++                                    : function->u.func->func_type;
++}
++
++static void
++silk_invocation_ref_flags(uint8 *flags, const uint8 *types, uint32 count)
++{
++#if WASM_ENABLE_GC != 0
++    uint32 i, j, cells;
++    for (i = 0; i < count; i++) {
++        cells = wasm_value_type_cell_num(types[i]);
++        for (j = 0; j < cells; j++)
++            *flags++ = wasm_is_type_reftype(types[i])
++                       && !wasm_is_reftype_i31ref(types[i]);
++    }
++#else
++    (void)flags;
++    (void)types;
++    (void)count;
++#endif
++}
++
++static void
++silk_invocation_finish_native(WASMInterpInvocation *inv, const uint32 *results,
++                              void *exception)
++{
++    WASMInterpFrame *native = inv->pending;
++    WASMInterpFrame *caller = native->prev_frame;
++    WASMFunctionInstance *function = native->function;
++    WASMFuncType *type = silk_invocation_type(function);
++    if (exception) {
++        inv->exception = exception;
++#if WASM_ENABLE_EXCE_HANDLING != 0
++        inv->env->silk_exception = exception;
++#endif
++    }
++    else {
++        if (function->ret_cell_num)
++            word_copy(caller->sp, results, function->ret_cell_num);
++#if WASM_ENABLE_GC != 0
++        if (caller->csp_boundary)
++            silk_invocation_ref_flags((uint8 *)caller->csp_boundary
++                                          + (caller->sp - caller->lp),
++                                      type->types + type->param_count,
++                                      type->result_count);
++#endif
++        caller->sp += function->ret_cell_num;
++    }
++    inv->pending = NULL;
++    wasm_exec_env_set_cur_frame(inv->env, caller);
++    wasm_exec_env_set_module_inst(inv->env,
++        (WASMModuleInstanceCommon *)caller->module_inst);
++    inv->env->aux_stack_boundary = caller->aux_stack_boundary;
++    inv->env->aux_stack_bottom = caller->aux_stack_bottom;
++    FREE_FRAME(inv->env, native);
++}
++
++static void
++silk_invocation_call_native(WASMExecEnv *env, WASMFunctionInstance *function,
++                            WASMInterpFrame *caller)
++{
++    WASMInterpInvocation *inv = env->silk_invocation;
++    WASMFuncType *type = silk_invocation_type(function);
++    uint32 cells = function->param_cell_num + function->ret_cell_num;
++    WASMInterpFrame *native;
++    uint32 *results;
++    int status;
++    if (cells < 2)
++        cells = 2;
++    native = ALLOC_FRAME(env, wasm_interp_interp_frame_size(cells), caller);
++    if (!native)
++        return;
++    native->function = function;
++    native->ip = NULL;
++    native->retained_cell_num = cells;
++    native->sp = native->lp + cells;
++    results = native->lp + function->param_cell_num;
++    memset(results, 0, (cells - function->param_cell_num) * sizeof(uint32));
++#if WASM_ENABLE_GC != 0
++    memset(native->sp, 0, cells);
++    silk_invocation_ref_flags((uint8 *)native->sp, type->types,
++                              type->param_count + type->result_count);
++#endif
++    wasm_exec_env_set_cur_frame(env, native);
++    inv->pending = native;
++    inv->exception = NULL;
++    status = inv->host(inv->context, env, function, native->lp,
++                       function->param_cell_num, results,
++                       function->ret_cell_num, &inv->exception);
++#if WASM_ENABLE_GC != 0 && WASM_ENABLE_THREAD_MGR == 0
++    /* Nested host reentry may have selected a different collector context. */
++    mem_allocator_enable_gc_reclaim(
++        wasm_runtime_get_gc_heap_handle(env->module_inst), env);
++#endif
++    if (status == 1) {
++        if (!wasm_interp_invocation_suspension_allowed(env)) {
++            wasm_set_exception((WASMModuleInstance *)env->module_inst,
++                               "host yielded across a synchronous JS boundary");
++            return;
++        }
++        inv->status = WASM_INVOCATION_SUSPENDED;
++        return;
++    }
++    if (status != 0 && status != 2) {
++        wasm_set_exception((WASMModuleInstance *)env->module_inst,
++                           "invalid continuation host callback status");
++        return;
++    }
++    if (status == 2 && !inv->exception) {
++        wasm_set_exception((WASMModuleInstance *)env->module_inst,
++                           "host raised without an exception reference");
++        return;
++    }
++    silk_invocation_finish_native(inv, results,
++                                  status == 2 ? inv->exception : NULL);
++}
++
++static void
++silk_invocation_release_frames(WASMInterpInvocation *inv)
++{
++    WASMInterpFrame *frame = wasm_exec_env_get_cur_frame(inv->env);
++    while (frame) {
++        WASMInterpFrame *previous = frame->prev_frame;
++        wasm_exec_env_set_cur_frame(inv->env, previous);
++        wasm_exec_env_set_module_inst(inv->env,
++            (WASMModuleInstanceCommon *)inv->module);
++        FREE_FRAME(inv->env, frame);
++        frame = previous;
++    }
++    wasm_exec_env_set_cur_frame(inv->env, NULL);
++    inv->entry = inv->pending = NULL;
++    if (inv->dispatch_owner) {
++        wasm_silk_instance_release(inv->dispatch_owner);
++        inv->dispatch_owner = NULL;
++    }
++}
++
++static WASMInterpInvocationStatus
++silk_invocation_run(WASMInterpInvocation *inv)
++{
++    WASMExecEnv *env = inv->env;
++    WASMModuleInstance *module = (WASMModuleInstance *)env->module_inst;
++    char previous_exception[128] = { 0 };
++    WASMModuleInstance *exception_owner = module;
++    bool had_exception = wasm_copy_exception(module, previous_exception);
++    wasm_set_exception(module, NULL);
++    wasm_exec_env_set_thread_info(env);
++#if WASM_ENABLE_GC != 0 && WASM_ENABLE_THREAD_MGR == 0
++    mem_allocator_enable_gc_reclaim(
++        wasm_runtime_get_gc_heap_handle(env->module_inst), env);
++#endif
++    inv->status = WASM_INVOCATION_RUNNING;
++    wasm_interp_call_func_bytecode(module, env, inv->function, inv->entry);
++    module = (WASMModuleInstance *)env->module_inst;
++    if (wasm_copy_exception(module, inv->trap)) {
++        inv->status = WASM_INVOCATION_THREW;
++        wasm_set_exception(module, NULL);
++    }
++#if WASM_ENABLE_EXCE_HANDLING != 0
++    else if (env->silk_exception) {
++        inv->exception = env->silk_exception;
++        inv->status = WASM_INVOCATION_THREW;
++    }
++#endif
++    else if (inv->status != WASM_INVOCATION_SUSPENDED) {
++        if (inv->function->ret_cell_num)
++            word_copy(inv->results, inv->entry->lp,
++                      inv->function->ret_cell_num);
++        inv->exception = NULL;
++        inv->status = WASM_INVOCATION_COMPLETED;
++    }
++    if (inv->status != WASM_INVOCATION_SUSPENDED)
++        silk_invocation_release_frames(inv);
++    if (had_exception)
++        wasm_set_exception(exception_owner, previous_exception);
++    return inv->status;
++}
++
++WASMInterpInvocation *
++wasm_interp_invocation_create(WASMModuleInstance *module,
++                              WASMFunctionInstance *function,
++                              uint32 stack_size, WASMInterpHostCall host,
++                              void *context, bool allow_suspend)
++{
++    WASMInterpInvocation *inv;
++    WASMExecEnv *env;
++    if (!module || !function || !host || !stack_size)
++        return NULL;
++    inv = wasm_runtime_malloc(sizeof(*inv)
++                              + function->ret_cell_num * sizeof(uint32));
++    if (!inv)
++        return NULL;
++    memset(inv, 0, sizeof(*inv)
++                   + function->ret_cell_num * sizeof(uint32));
++    env = wasm_exec_env_create_internal((WASMModuleInstanceCommon *)module,
++                                        stack_size);
++    if (!env) {
++        wasm_runtime_free(inv);
++        return NULL;
++    }
++    inv->env = env;
++    inv->module = module;
++    inv->function = function;
++    inv->host = host;
++    inv->context = context;
++    inv->results = (uint32 *)(inv + 1);
++    inv->allow_suspend = allow_suspend;
++    inv->boundary_allows_suspend = true;
++    env->silk_invocation = inv;
++    env->aux_stack_bottom = module->module->aux_stack_bottom;
++    env->aux_stack_boundary = env->aux_stack_bottom - module->module->aux_stack_size;
++    wasm_silk_instance_retain(module);
++    inv->next = silk_invocations;
++    silk_invocations = inv;
++    return inv;
++}
++
++WASMInterpInvocationStatus
++wasm_interp_invocation_start(WASMInterpInvocation *inv,
++                             const uint32 *arguments, uint32 cells)
++{
++    WASMInterpFrame *entry, *out;
++    uint32 result_cells;
++    if (inv->status != WASM_INVOCATION_NEW)
++        return inv->status;
++    if (cells != inv->function->param_cell_num || (cells && !arguments)) {
++        snprintf(inv->trap, sizeof(inv->trap), "invalid invocation arguments");
++        inv->status = WASM_INVOCATION_THREW;
++        return inv->status;
++    }
++    result_cells = inv->function->ret_cell_num;
++    if (result_cells < 2)
++        result_cells = 2;
++    entry = ALLOC_FRAME(inv->env, wasm_interp_interp_frame_size(result_cells),
++                        NULL);
++    if (!entry) {
++        wasm_copy_exception(inv->module, inv->trap);
++        wasm_set_exception(inv->module, NULL);
++        inv->status = WASM_INVOCATION_THREW;
++        return inv->status;
++    }
++    entry->function = NULL;
++    entry->ip = NULL;
++    entry->sp = entry->sp_bottom = entry->lp;
++    entry->sp_boundary = entry->lp + result_cells;
++    entry->csp = entry->csp_bottom = entry->csp_boundary =
++        (WASMBranchBlock *)entry->sp_boundary;
++    memset(entry->lp, 0, result_cells * sizeof(uint32));
++#if WASM_ENABLE_GC != 0
++    memset(entry->csp_boundary, 0, result_cells);
++#endif
++    inv->entry = entry;
++    wasm_exec_env_set_cur_frame(inv->env, entry);
++    out = wasm_exec_env_wasm_stack_top(inv->env);
++    if ((uint8 *)(out->lp + cells) > inv->env->wasm_stack.top_boundary) {
++        snprintf(inv->trap, sizeof(inv->trap), "wasm operand stack overflow");
++        inv->status = WASM_INVOCATION_THREW;
++        silk_invocation_release_frames(inv);
++        return inv->status;
++    }
++    if (cells)
++        word_copy(out->lp, arguments, cells);
++    return silk_invocation_run(inv);
++}
++
++WASMInterpInvocationStatus
++wasm_interp_invocation_resume(WASMInterpInvocation *inv, const uint32 *results,
++                              uint32 cells, void *exception)
++{
++    if (inv->status != WASM_INVOCATION_SUSPENDED)
++        return inv->status;
++    if (!exception && (cells != inv->pending->function->ret_cell_num
++                       || (cells && !results))) {
++        snprintf(inv->trap, sizeof(inv->trap), "invalid invocation results");
++        inv->status = WASM_INVOCATION_THREW;
++        silk_invocation_release_frames(inv);
++        return inv->status;
++    }
++    silk_invocation_finish_native(inv, results, exception);
++    inv->resuming = true;
++    return silk_invocation_run(inv);
++}
++
++WASMInterpInvocationStatus
++wasm_interp_invocation_status(const WASMInterpInvocation *inv)
++{
++    return inv->status;
++}
++
++const uint32 *
++wasm_interp_invocation_results(const WASMInterpInvocation *inv, uint32 *cells)
++{
++    *cells = inv->status == WASM_INVOCATION_COMPLETED
++                 ? inv->function->ret_cell_num : 0;
++    return inv->status == WASM_INVOCATION_COMPLETED ? inv->results : NULL;
++}
++
++void *
++wasm_interp_invocation_exception(const WASMInterpInvocation *inv)
++{
++    return inv->exception;
++}
++
++const char *
++wasm_interp_invocation_trap(const WASMInterpInvocation *inv)
++{
++    return inv->trap[0] ? inv->trap : NULL;
++}
++
++WASMExecEnv *
++wasm_interp_invocation_exec_env(WASMInterpInvocation *inv)
++{
++    return inv->env;
++}
++
++bool
++wasm_interp_invocation_suspension_allowed(WASMExecEnv *env)
++{
++    WASMInterpInvocation *inv = env->silk_invocation;
++    return inv && inv->allow_suspend && inv->boundary_allows_suspend;
++}
++
++bool
++wasm_interp_invocation_set_suspend_allowed(WASMExecEnv *env, bool allowed)
++{
++    WASMInterpInvocation *inv = env->silk_invocation;
++    bool previous = inv && inv->boundary_allows_suspend;
++    if (inv)
++        inv->boundary_allows_suspend = allowed;
++    return previous;
++}
++
++void *
++wasm_interp_invocation_take_exception(WASMExecEnv *env)
++{
++    WASMInterpInvocation *inv = env->silk_invocation;
++    void *exception = inv ? inv->exception : NULL;
++    if (inv)
++        inv->exception = NULL;
++    return exception;
++}
++
++void
++wasm_interp_invocation_visit_roots(WASMInterpInvocation *inv,
++                                  WASMInterpRootVisitor visit, void *context)
++{
++#if WASM_ENABLE_GC != 0
++    WASMInterpFrame *frame;
++    WASMFuncType *type;
++    WASMLocalObjectRef *local;
++    uint32 i, offset;
++    for (local = inv->env->cur_local_object_ref; local; local = local->prev)
++        if (local->val)
++            visit(local->val, context);
++    if (inv->exception)
++        visit(inv->exception, context);
++#if WASM_ENABLE_EXCE_HANDLING != 0
++    if (inv->env->silk_exception && inv->env->silk_exception != inv->exception)
++        visit(inv->env->silk_exception, context);
++#endif
++    for (frame = wasm_exec_env_get_cur_frame(inv->env); frame;
++         frame = frame->prev_frame) {
++        uint8 *flags = get_frame_ref(frame);
++        if (!flags)
++            continue;
++        for (i = 0; i < (uint32)(frame->sp - frame->lp); i++) {
++            if (flags[i]) {
++                visit(GET_REF_FROM_ADDR(frame->lp + i), context);
++                i += sizeof(uintptr_t) / sizeof(uint32) - 1;
++            }
++        }
++#if WASM_ENABLE_EXCE_HANDLING != 0
++        if (frame->function && !frame->function->is_import_func) {
++            WASMBranchBlock *block;
++            for (block = frame->csp_bottom; block < frame->csp; block++)
++                if (block->silk_caught_exception)
++                    visit(block->silk_caught_exception, context);
++        }
++#endif
++    }
++    if (inv->status == WASM_INVOCATION_COMPLETED) {
++        type = silk_invocation_type(inv->function);
++        offset = 0;
++        for (i = 0; i < type->result_count; i++) {
++            uint8 value_type = type->types[type->param_count + i];
++            if (wasm_is_type_reftype(value_type)
++                && !wasm_is_reftype_i31ref(value_type))
++                visit(GET_REF_FROM_ADDR(inv->results + offset), context);
++            offset += wasm_value_type_cell_num(value_type);
++        }
++    }
++#else
++    (void)inv;
++    (void)visit;
++    (void)context;
++#endif
++}
++
++#if WASM_ENABLE_GC != 0
++typedef struct SilkInvocationRootContext {
++    void *heap;
++    bool ok;
++} SilkInvocationRootContext;
++
++static void
++silk_invocation_mark_root(void *reference, void *context)
++{
++    SilkInvocationRootContext *roots = context;
++    if (roots->ok && mem_allocator_contains_gc_object(roots->heap, reference)
++        && wasm_obj_is_created_from_heap(reference)
++        && mem_allocator_add_root(roots->heap, reference))
++        roots->ok = false;
++}
++#endif
++
++static bool
++silk_invocation_gc_roots(void *heap)
++{
++#if WASM_ENABLE_GC != 0
++    WASMInterpInvocation *inv;
++    SilkInvocationRootContext roots = { heap, true };
++    for (inv = silk_invocations; inv && roots.ok; inv = inv->next)
++        wasm_interp_invocation_visit_roots(inv, silk_invocation_mark_root, &roots);
++    return roots.ok;
++#else
++    (void)heap;
++    return true;
++#endif
++}
++
++void
++wasm_interp_invocation_free(WASMInterpInvocation *inv)
++{
++    WASMInterpInvocation **link;
++    if (!inv)
++        return;
++    bh_assert(inv->status != WASM_INVOCATION_RUNNING);
++    if (inv->status == WASM_INVOCATION_RUNNING)
++        return;
++    for (link = &silk_invocations; *link && *link != inv;
++         link = &(*link)->next) {}
++    bh_assert(*link == inv);
++    if (*link != inv)
++        return;
++    *link = inv->next;
++    inv->status = WASM_INVOCATION_CANCELLED;
++    silk_invocation_release_frames(inv);
++    inv->env->silk_invocation = NULL;
++    wasm_exec_env_destroy_internal(inv->env);
++    wasm_silk_instance_release(inv->module);
++    wasm_runtime_free(inv);
++}
+--- a/core/shared/mem-alloc/mem_alloc.h
++++ b/core/shared/mem-alloc/mem_alloc.h
+@@ -74,6 +74,9 @@
+ mem_allocator_add_root(mem_allocator_t allocator, WASMObjectRef obj);
+ 
+ bool
++mem_allocator_contains_gc_object(mem_allocator_t allocator, WASMObjectRef obj);
++
++bool
+ mem_allocator_set_gc_finalizer(mem_allocator_t allocator, void *obj,
+                                gc_finalizer_t cb, void *data);
+ 
+--- a/core/shared/mem-alloc/mem_alloc.c
++++ b/core/shared/mem-alloc/mem_alloc.c
+@@ -92,6 +92,12 @@
+ {
+     return gc_add_root((gc_handle_t)allocator, (gc_object_t)obj);
+ }
++
++bool
++mem_allocator_contains_gc_object(mem_allocator_t allocator, WASMObjectRef obj)
++{
++    return gc_contains_object((gc_handle_t)allocator, (gc_object_t)obj);
++}
+ #endif
+ 
+ int
+--- a/core/shared/mem-alloc/ems/ems_gc.h
++++ b/core/shared/mem-alloc/ems/ems_gc.h
+@@ -256,6 +256,9 @@
+  */
+ int
+ gc_add_root(void *heap, gc_object_t obj);
++
++bool
++gc_contains_object(void *heap, gc_object_t obj);
+ 
+ int
+ gci_gc_heap(void *heap);
+--- a/core/shared/mem-alloc/ems/ems_gc.c
++++ b/core/shared/mem-alloc/ems/ems_gc.c
+@@ -191,6 +191,21 @@
+     mark_node->set[mark_node->idx++] = obj;
+     hmu_mark_wo(hmu);
+     return GC_SUCCESS;
++}
++
++bool
++gc_contains_object(void *heap_p, gc_object_t obj)
++{
++    gc_heap_t *heap = (gc_heap_t *)heap_p;
++    uintptr_t address = (uintptr_t)obj;
++    uintptr_t base;
++    if (!obj || !gci_is_heap_valid(heap))
++        return false;
++    base = (uintptr_t)heap->base_addr;
++    /* Check the address before inspecting an object header: a reference can
++       belong to another instance's heap, or be an immediate i31 value. */
++    return address >= base + sizeof(hmu_t)
++           && address < base + heap->current_size;
+ }
+ 
+ /* Check ems_gc.h for description*/

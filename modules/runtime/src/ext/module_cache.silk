@@ -1,0 +1,149 @@
+//! Module-loader cache bridge. Callbacks exchange owned bytes, never closures.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silkjs.js_owned_value { lendFor }
+import silkjs.js_realm { lendRealm }
+import silk.mem.pointer { Pointer }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.num.usize
+import silk.num.u64
+import silkjs.js_engine { Engine }
+import silkjs.js_heap { CellRef, HeapCell, HeapHeader }
+import silkjs.js_value { ValueBits }
+import silkjs.js_string_types { StringLengthError }
+import silkjs.js_proxy_core as core
+import silkjs.js_eval as evaluation
+import silkjs.js_eval_compile as flags
+import silkjs.js_module_loader as loader
+import silkjs.js_core_types { ModuleDef, RuntimeState }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_exceptions as exceptions
+import silkjs.js_runtime as runtime
+import silkjs.js_gc as gc
+import silkjs.js_promise as promises
+import silkjs.js_buffer_storage as buffers
+import libs.core.owners { Scope }
+import libs.core.owners as owners
+import libs.core.common as common
+import silkjs.js_module_native as modules
+import libs.core.host as host
+import ext.script_cache as cache
+import ext.script_metadata as metadata
+import ext.inspector_native as inspector_native
+fn eligible(filename: &[u8], kind: i32) -> bool {
+  if kind != 1 { return true }
+  if filename.length >= 5 && filename[0] == 110 && filename[1] == 111 && filename[2] == 100 && filename[3] == 101 && filename[4] == 58 { return false }
+  if filename.length >= 5 && filename[0] == 115 && filename[1] == 105 && filename[2] == 108 && filename[3] == 107 && filename[4] == 58 { return false }
+  return true
+}
+
+unsafe effect fn discard<'m>(engine: &mut Engine<'m, host.Services>, context: *mut HeapHeader) -> () ! JsException ? &mut Allocator {
+  let rt = unsafe runtime.contextRuntime(context)
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let interrupted = state.currentExceptionIsUncatchable drop state
+  if interrupted { fail JsException {} }
+  if unsafe exceptions.has(rt) { unsafe gc.release(&mut engine, rt, unsafe exceptions.take(rt)) }
+}
+unsafe effect fn restoreBody<'m>(engine: &mut Engine<'m, host.Services>, context: *mut HeapHeader,
+  source: &[u8], filename: &[u8], kind: i32, prefix: i32, scope: &mut Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  scope.values[0] = run unsafe host.string(&mut engine, context, source)
+  scope.values[1] = run unsafe host.string(&mut engine, context, filename)
+  let callback = engine.services.cacheRead
+  scope.values[2] = (run promises.call(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(callback), unsafe lendFor(ValueBits.Undefined),
+    &[scope.values[0], scope.values[1], ValueBits.Int { value: kind }])).intoBits()
+  if !scope.values[2].isObject() { return ValueBits.Undefined }
+  let input = (run buffers.requireBuffer(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(scope.values[2]), 0)).header()
+  if !unsafe buffers.canLeaseReadBacking(input) { return ValueBits.Undefined }
+  let backing = unsafe buffers.snapshot(input)
+  if kind == 1 {
+    scope.values[3] = run unsafe cache.readModule(&mut engine, context, unsafe buffers.dataAt(backing.data, 0), u64.toUsize(backing.byteLength))
+  } else {
+    scope.values[3] = run unsafe cache.read(&mut engine, context, unsafe buffers.dataAt(backing.data, 0), u64.toUsize(backing.byteLength))
+  }
+  let compiled = scope.values[3]
+  let code = unsafe cache.moduleCode(compiled)
+  run unsafe cache.configureVm(&mut engine, context, code, 0, 0, prefix, scope.values[1])
+  if let ValueBits.Module { reference } = compiled {
+    let rt = unsafe runtime.contextRuntime(context)
+    let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+    let interned = run Effect.result(state.atoms.intern(scope.values[1])) drop state
+    let name = match move interned {
+      Result<u32, OutOfMemoryError | StringLengthError>.Success { value } => value
+      Result<u32, OutOfMemoryError | StringLengthError>.Failure { error } => run core.materialize(&mut engine, unsafe lendRealm(&context, context), move error)
+    }
+    let module = unsafe HeapCell.payloadMut<ModuleDef, ()>(&mut anchor, reference)
+    let previous = Intrinsic.replace(module.name, name) drop module
+    let runtimeState = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+    runtimeState.atoms.release(previous) drop runtimeState
+    run modules.configureHostCallbacks(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(code), unsafe lendFor(ValueBits.Undefined), unsafe lendFor(compiled))
+    scope.values[4] = unsafe metadata.get(compiled)
+    let callback = engine.services.registerSource
+    if callback.isObject() {
+      scope.values[5] = run unsafe common.get(&mut engine, context, scope.values[4], b"source")
+      scope.values[6] = (run promises.call(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(callback), unsafe lendFor(ValueBits.Undefined),
+        &[scope.values[1], scope.values[5], scope.values[4]])).intoBits()
+      if scope.values[6].isString() { run unsafe cache.configureVm(&mut engine, context, code, 0, 0, 0, scope.values[6]) }
+    }
+  }
+  return scope.take(3)
+}
+pub unsafe effect fn restore<'m>(engine: &mut Engine<'m, host.Services>, context: *mut HeapHeader,
+  source: &[u8], filename: &[u8], kind: i32, prefix: i32) -> ValueBits ! JsException ? &mut Allocator {
+  if !engine.services.cacheRead.isObject() || !eligible(filename, kind) { return ValueBits.Undefined }
+  let mut scope = Scope.make()
+  let outcome = run Effect.result(unsafe restoreBody(&mut engine, context, source, filename, kind, prefix, &mut scope))
+  // Decoder failure must remove its context-list root before trying source.
+  if let ValueBits.Module { reference } = scope.values[3] { unsafe gc.detachModule(&mut engine, unsafe runtime.contextRuntime(context), reference) }
+  unsafe owners.cleanup(&mut engine, context, move scope)
+  return match move outcome {
+    Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError | JsException>.Failure { .. } => { run unsafe discard(&mut engine, context) ValueBits.Undefined }
+  }
+}
+unsafe effect fn saveBody<'m>(engine: &mut Engine<'m, host.Services>, context: *mut HeapHeader,
+  source: &[u8], filename: &[u8], kind: i32, compiled: ValueBits, scope: &mut Scope) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  let bytes = if kind == 1 { run unsafe cache.writeModule(&mut engine, context, compiled) }
+    else { run unsafe cache.write(&mut engine, context, compiled) }
+  let memory = engine.memory
+  scope.values[0] = run unsafe host.string(&mut engine, context, source)
+  scope.values[1] = run unsafe host.string(&mut engine, context, filename)
+  scope.values[2] = run unsafe buffers.newArrayBufferCopy(&mut engine, memory, unsafe lendRealm(&context, context), Pointer.fromRef<u8>(&bytes.asSlice()[0]), usize.toU64(bytes.length()))
+  let callback = engine.services.cacheWrite
+  scope.values[3] = (run promises.call(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(callback), unsafe lendFor(ValueBits.Undefined),
+    &[scope.values[0], scope.values[1], ValueBits.Int { value: kind }, scope.values[2]])).intoBits()
+}
+pub unsafe effect fn save<'m>(engine: &mut Engine<'m, host.Services>, context: *mut HeapHeader,
+  source: &[u8], filename: &[u8], kind: i32, compiled: ValueBits) -> () ! JsException ? &mut Allocator {
+  if !engine.services.cacheWrite.isObject() || !eligible(filename, kind) { return () }
+  let mut scope = Scope.make()
+  let outcome = run Effect.result(unsafe saveBody(&mut engine, context, source, filename, kind, compiled, &mut scope))
+  unsafe owners.cleanup(&mut engine, context, move scope)
+  if let Result<(), OutOfMemoryError | JsException>.Failure { .. } = move outcome { run unsafe discard(&mut engine, context) }
+}
+
+pub unsafe effect fn compileModule<'m>(engine: &mut Engine<'m, host.Services>, context: *mut HeapHeader,
+  source: &[u8], filename: &[u8]) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let cached = run unsafe restore(&mut engine, context, source, filename, 1, 0)
+  if let ValueBits.Module { reference } = cached {
+    let resolved = run Effect.result(loader.resolveModule(&mut engine, unsafe lendRealm(&context, context), unsafe CellRef<ModuleDef>.of(reference)))
+    if let Result<(), OutOfMemoryError | StringLengthError | JsException>.Failure { error } = move resolved {
+      unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), cached)
+      return run core.materialize(&mut engine, unsafe lendRealm(&context, context), move error)
+    }
+    if let Option<*mut inspector_native.State>.Some { value: inspector } = Pointer.nonNullMut<inspector_native.State>(engine.services.inspector) {
+      let published = run Effect.result(unsafe inspector_native.compiledSource(&mut engine, context, inspector, cached))
+      if let Result<(), OutOfMemoryError | JsException>.Failure { error } = move published {
+        unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), cached) fail move error
+      }
+    }
+    return cached
+  }
+  let memory = engine.memory
+  let compiled = (run evaluation.evaluate(&mut engine, memory, unsafe lendRealm(&context, context), source, filename, flags.TYPE_MODULE | flags.FLAG_COMPILE_ONLY)).intoBits()
+  let saved = run Effect.result(unsafe save(&mut engine, context, source, filename, 1, compiled))
+  if let Result<(), JsException>.Failure { error } = move saved {
+    unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), compiled) fail move error
+  }
+  return compiled
+}

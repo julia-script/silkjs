@@ -1,0 +1,414 @@
+//! Process-wide diagnostics mailbox shared by every isolate of a worker group.
+//!
+//! Each isolate attaches one `Owner` while its event loop runs. Other isolates
+//! post copied byte packets to it on a channel (1 = inspector routing, 2 and 3 =
+//! profiling) and request report snapshots, which the owner publishes at its
+//! next safe point. Packets and reports are native bytes only; no JS value
+//! crosses this mailbox. The group's registry lock guards every list here, and
+//! `Group.changed` is the condition that waiters sleep on.
+//!
+//! `Owner.requested` and `Owner.channels` are also read without the lock, so
+//! the no-request paths cost one atomic load.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.collections.list { List }
+import silk.mem.pointer { Pointer }
+import silk.concurrency.atomic { Atomic, MemoryOrder }
+import silk.num.u32
+import silk.num.u64
+import silkjs.js_os_workers_resources as resources
+import silkjs.js_os_workers_resources { KindAllocator }
+import silkjs.js_os_events_platform as clock
+import ext.worker_transport { Group, Registry }
+import ext.worker_transport as transport
+import ext.report_json as json
+import silk.core.ownership { Copy }
+import silk.num.i64
+
+pub const INSPECTOR_CHANNEL: u32 = 1
+const OWNER_ATTACHED: u32 = 5
+const OWNER_DETACHED: u32 = 6
+const EINVAL: i32 = 22
+const ENOMEM: i32 = 12
+const ESRCH: i32 = 3
+const EIO: i32 = 5
+
+pub struct Packet { next: ?*mut Packet, channel: u32, bytes: List<u8> }
+
+pub struct Owner {
+  next: ?*mut Owner,
+  // The attaching isolate's group; valid until detach, read only by that isolate.
+  group: *const Group,
+  id: u32,
+  // The owner's link plus one per in-flight report request that reads it.
+  references: usize,
+  // Report generation other isolates asked for; written under the lock, read atomically.
+  requested: u64,
+  completed: u64,
+  // Owner-thread only: the last generation this owner answered.
+  serviced: u64,
+  exited: bool,
+  failure: i32,
+  inspectorWaitAtStart: bool,
+  report: List<u8>,
+  first: ?*mut Packet,
+  last: ?*mut Packet,
+  departure: ?*mut Packet,
+  // Bit n is set while a packet on channel n is queued; read atomically.
+  channels: u32,
+}
+
+/// The calling isolate's handle on the hub, from `attach` until `detach`.
+pub struct Mailbox { owner: *mut Owner }
+impl Copy for Mailbox {}
+impl Mailbox {
+  pub unsafe fn id(self: Self) -> u32 { let anchor = () let owner = unsafe Pointer.borrow<(), Owner>(&anchor, self.owner) return owner.id }
+  /// The worker group the isolate attached with.
+  pub unsafe fn group<'a>(self: Self, anchor: &'a ()) -> &'a Group {
+    let owner = unsafe Pointer.borrow<(), Owner>(anchor, self.owner) let group = owner.group drop owner
+    return unsafe Pointer.borrow<(), Group>(anchor, group)
+  }
+}
+
+/// Lives in the worker registry, under its lock.
+pub struct Hub { owners: ?*mut Owner, inspectorWaitForNewWorkers: bool }
+impl Hub {
+  pub fn make() -> Self { return Self { owners: Pointer.null<Owner>(), inspectorWaitForNewWorkers: false } }
+}
+
+unsafe fn nonnull<T>(pointer: ?*mut T) -> *mut T { return unsafe transport.nonnull(pointer) }
+unsafe fn ownerMut<'a>(anchor: &'a mut (), pointer: *mut Owner) -> &'a mut Owner { return unsafe Pointer.borrowMut<(), Owner>(move anchor, pointer) }
+
+effect fn packet(group: &Group, channel: u32, prefix: &[u8], bytes: &[u8]) -> *mut Packet ! OutOfMemoryError {
+  let mut allocator = KindAllocator { owner: group.resources.clone(), kind: 0 }
+  let mut copy = List<u8>.make()
+  let filled = run Effect.result(copyInto(&mut copy, prefix, bytes)) |> Effect.provideMut<Allocator>(&mut allocator)
+  if let Result<(), OutOfMemoryError>.Failure { error } = move filled { fail move error }
+  let pointer = run transport.allocate<Packet>(&group.resources)
+  unsafe Pointer.put<Packet>(pointer, Packet { next: Pointer.null<Packet>(), channel: channel, bytes: move copy })
+  return pointer
+}
+effect fn copyInto(out: &mut List<u8>, prefix: &[u8], bytes: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  run out.reserve(prefix.length + bytes.length)
+  let mut i: usize = 0 while i < prefix.length { run out.append(prefix[i]) i = i + 1 }
+  i = 0 while i < bytes.length { run out.append(bytes[i]) i = i + 1 }
+}
+unsafe fn freePacket(pointer: ?*mut Packet) -> () {
+  if Pointer.isNull<Packet>(pointer) { return () }
+  let owned = unsafe Pointer.take<Packet>(unsafe nonnull(pointer)) drop owned
+  unsafe resources.release(unsafe transport.raw(unsafe nonnull(pointer)))
+}
+effect fn lifecycle(group: &Group, id: u32, kind: u32) -> *mut Packet ! OutOfMemoryError {
+  let mut envelope: [u8; 16] = [0; 16]
+  store32(&mut envelope, 0, id) store32(&mut envelope, 4, kind)
+  return run packet(group, INSPECTOR_CHANNEL, &envelope, b"")
+}
+pub fn store32(bytes: &mut [u8; 16], at: usize, value: u32) -> () {
+  let mut i: usize = 0
+  let mut shift: u32 = 0
+  while i < 4 { bytes[at + i] = u32.wrappingToU8(u32.shiftRight(value, shift)) i = i + 1 shift = shift + 8 }
+}
+
+// Queues under the lock and wakes the owner's loop and any waiter.
+unsafe fn enqueue(group: &Group, registry: &Registry, pointer: *mut Owner, message: *mut Packet) -> () {
+  let mut anchor = () let owner = unsafe ownerMut(&mut anchor, pointer)
+  if Pointer.isNull<Packet>(owner.last) { owner.first = message }
+  else { let mut lastAnchor = () let last = unsafe Pointer.borrowMut<(), Packet>(&mut lastAnchor, unsafe nonnull(owner.last)) last.next = message }
+  owner.last = message
+  let packetAnchor = () let queued = unsafe Pointer.borrow<(), Packet>(&packetAnchor, message)
+  let channel = queued.channel
+  let _previous = unsafe Atomic.fetchBitOr<u32>(Pointer.fromMutRef<u32>(&mut owner.channels), u32.shiftLeft(1, channel), MemoryOrder.Release)
+  let id = owner.id drop owner
+  unsafe transport.wake(registry, id)
+  group.changed.get().notifyAll()
+}
+unsafe fn find(registry: &Registry, id: u32) -> ?*mut Owner {
+  let anchor = () let mut cursor = registry.diagnostics.owners
+  while !Pointer.isNull<Owner>(cursor) {
+    let entry = unsafe Pointer.borrow<(), Owner>(&anchor, unsafe nonnull(cursor))
+    if entry.id == id { return cursor }
+    cursor = entry.next
+  }
+  return Pointer.null<Owner>()
+}
+unsafe fn releaseOwner(pointer: *mut Owner) -> () {
+  let mut anchor = () let owner = unsafe ownerMut(&mut anchor, pointer)
+  owner.references = owner.references - 1
+  if owner.references != 0 { return () }
+  let mut cursor = owner.first
+  let departure = owner.departure
+  drop owner
+  while !Pointer.isNull<Packet>(cursor) {
+    let entry = unsafe Pointer.borrow<(), Packet>(&anchor, unsafe nonnull(cursor))
+    let next = entry.next
+    unsafe freePacket(cursor) cursor = next
+  }
+  unsafe freePacket(departure)
+  let owned = unsafe Pointer.take<Owner>(pointer) drop owned
+  unsafe resources.release(unsafe transport.raw(pointer))
+}
+
+/// Registers the calling isolate. Workers announce themselves to the main
+/// isolate's inspector channel, and announce their exit at detach.
+/// `group` must outlive the mailbox.
+pub effect fn attach(group: &Group, id: u32) -> Mailbox ! OutOfMemoryError {
+  let mut arrival = Pointer.null<Packet>()
+  let mut departure = Pointer.null<Packet>()
+  if id != 0 {
+    arrival = run lifecycle(group, id, OWNER_ATTACHED)
+    let made = run Effect.result(lifecycle(group, id, OWNER_DETACHED))
+    match move made {
+      Result<*mut Packet, OutOfMemoryError>.Success { value } => { departure = value }
+      Result<*mut Packet, OutOfMemoryError>.Failure { error } => { unsafe freePacket(arrival) fail move error }
+    }
+  }
+  let made = run Effect.result(transport.allocate<Owner>(&group.resources))
+  let pointer = match move made {
+    Result<*mut Owner, OutOfMemoryError>.Success { value } => value
+    Result<*mut Owner, OutOfMemoryError>.Failure { error } => { unsafe freePacket(arrival) unsafe freePacket(departure) fail move error }
+  }
+  let report = List<u8>.make()
+  let mut guard = group.registry.get().lock() let registry = guard.getMut()
+  unsafe Pointer.put<Owner>(pointer, Owner { next: registry.diagnostics.owners, group: Pointer.fromRef<Group>(group), id: id, references: 1, requested: 0, completed: 0, serviced: 0, exited: false, failure: 0, inspectorWaitAtStart: id != 0 && registry.diagnostics.inspectorWaitForNewWorkers, report: move report, first: Pointer.null<Packet>(), last: Pointer.null<Packet>(), departure: departure, channels: 0 })
+  registry.diagnostics.owners = pointer
+  if !Pointer.isNull<Packet>(arrival) {
+    let main = unsafe find(&registry.*, 0)
+    if Pointer.isNull<Owner>(main) { unsafe freePacket(arrival) } else { unsafe enqueue(group, &registry.*, unsafe nonnull(main), unsafe nonnull(arrival)) }
+  }
+  return Mailbox { owner: pointer }
+}
+
+/// Unregisters the owner; queued packets are discarded once no request reads it.
+pub unsafe fn detach(mailbox: Mailbox) -> () {
+  let pointer = mailbox.owner
+  let groupAnchor = () let group = unsafe mailbox.group(&groupAnchor)
+  let mut guard = group.registry.get().lock() let registry = guard.getMut()
+  let mut link = Pointer.fromMutRef<?*mut Owner>(&mut registry.diagnostics.owners)
+  let mut anchor = ()
+  while !Pointer.isNull<Owner>(unsafe Pointer.read<?*mut Owner>(link)) {
+    let current = unsafe nonnull(unsafe Pointer.read<?*mut Owner>(link))
+    let entry = unsafe ownerMut(&mut anchor, current)
+    if Pointer.address<Owner>(current) == Pointer.address<Owner>(pointer) { unsafe Pointer.write<?*mut Owner>(link, entry.next) break }
+    link = Pointer.fromMutRef<?*mut Owner>(&mut entry.next)
+  }
+  let owner = unsafe ownerMut(&mut anchor, pointer)
+  let departure = Intrinsic.replace(owner.departure, Pointer.null<Packet>())
+  owner.exited = true
+  drop owner
+  if !Pointer.isNull<Packet>(departure) {
+    let main = unsafe find(&registry.*, 0)
+    if Pointer.isNull<Owner>(main) { unsafe freePacket(departure) } else { unsafe enqueue(group, &registry.*, unsafe nonnull(main), unsafe nonnull(departure)) }
+  }
+  group.changed.get().notifyAll()
+  unsafe releaseOwner(pointer)
+}
+
+/// Worker IDs (never 0) of every attached isolate.
+pub effect fn ownerIds(mailbox: Mailbox) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
+  let groupAnchor = () let group = unsafe mailbox.group(&groupAnchor)
+  let guard = group.registry.get().lock()
+  let anchor = () let mut cursor = guard.get().diagnostics.owners
+  let mut ids = List<u32>.make()
+  while !Pointer.isNull<Owner>(cursor) {
+    let entry = unsafe Pointer.borrow<(), Owner>(&anchor, unsafe nonnull(cursor))
+    if entry.id != 0 { run ids.append(entry.id) }
+    cursor = entry.next
+  }
+  return move ids
+}
+
+/// Only the main isolate sets the auto-attach policy; workers keep the value
+/// they saw when they attached.
+pub unsafe fn setInspectorWait(mailbox: Mailbox, enabled: bool) -> () {
+  let pointer = mailbox.owner
+  let groupAnchor = () let group = unsafe mailbox.group(&groupAnchor)
+  let mut guard = group.registry.get().lock() let registry = guard.getMut()
+  registry.diagnostics.inspectorWaitForNewWorkers = enabled
+  let mut anchor = () let owner = unsafe ownerMut(&mut anchor, pointer)
+  owner.inspectorWaitAtStart = enabled
+}
+pub unsafe fn inspectorWait(mailbox: Mailbox) -> bool {
+  let anchor = () let owner = unsafe Pointer.borrow<(), Owner>(&anchor, mailbox.owner)
+  return owner.inspectorWaitAtStart
+}
+
+/// The report generation to answer, or 0. One atomic load when idle.
+pub unsafe fn pending(mailbox: Mailbox) -> u64 {
+  let mut anchor = () let owner = unsafe ownerMut(&mut anchor, mailbox.owner)
+  let generation = unsafe Atomic.load<u64>(Pointer.fromRef<u64>(&owner.requested), MemoryOrder.Acquire)
+  return if generation != owner.serviced { generation } else { 0 }
+}
+pub unsafe fn messagePending(mailbox: Mailbox, channel: u32) -> bool {
+  if channel >= 32 { return false }
+  let mut anchor = () let owner = unsafe ownerMut(&mut anchor, mailbox.owner)
+  let channels = unsafe Atomic.load<u32>(Pointer.fromRef<u32>(&owner.channels), MemoryOrder.Acquire)
+  return u32.bitAnd(channels, u32.shiftLeft(1, channel)) != 0
+}
+
+/// Answers request `generation` with `report` (JSON), or with a failure code.
+/// Other isolates read and free `report`, so it must come from the group's resources.
+pub unsafe fn publish(mailbox: Mailbox, generation: u64, report: List<u8>, failure: i32) -> () {
+  let pointer = mailbox.owner
+  let groupAnchor = () let group = unsafe mailbox.group(&groupAnchor)
+  let mut guard = group.registry.get().lock()
+  let mut anchor = () let owner = unsafe ownerMut(&mut anchor, pointer)
+  if generation == unsafe Atomic.load<u64>(Pointer.fromRef<u64>(&owner.requested), MemoryOrder.Relaxed) {
+    owner.report = move report
+    owner.failure = failure owner.completed = generation owner.serviced = generation
+    drop owner
+    group.changed.get().notifyAll()
+  }
+  drop guard
+}
+pub unsafe fn failed(mailbox: Mailbox, generation: u64, reason: i32) -> () {
+  unsafe publish(mailbox, generation, List<u8>.make(), if reason != 0 { reason } else { EIO })
+}
+
+/// Copies `prefix` then `bytes` into one packet for owner `target`. Returns 0,
+/// EINVAL, ENOMEM, or ESRCH when no such owner is attached.
+pub unsafe fn post(mailbox: Mailbox, target: u32, channel: u32, prefix: &[u8], bytes: &[u8]) -> i32 {
+  if channel >= 32 { return EINVAL }
+  let groupAnchor = () let group = unsafe mailbox.group(&groupAnchor)
+  let made = run Effect.result(packet(group, channel, prefix, bytes))
+  let message = match move made { Result<*mut Packet, OutOfMemoryError>.Success { value } => value _ => { return ENOMEM } }
+  let mut guard = group.registry.get().lock() let registry = guard.getMut()
+  let owner = unsafe find(&registry.*, target)
+  if Pointer.isNull<Owner>(owner) { drop guard unsafe freePacket(message) return ESRCH }
+  unsafe enqueue(group, &registry.*, unsafe nonnull(owner), message)
+  return 0
+}
+
+/// Removes the oldest packet on `channel`, if any.
+pub unsafe fn take(mailbox: Mailbox, channel: u32) -> Option<List<u8>> {
+  if !unsafe messagePending(mailbox, channel) { return Option<List<u8>>.none() }
+  let pointer = mailbox.owner
+  let groupAnchor = () let group = unsafe mailbox.group(&groupAnchor)
+  let mut guard = group.registry.get().lock()
+  let mut anchor = () let owner = unsafe ownerMut(&mut anchor, pointer)
+  let mut prior = Pointer.null<Packet>()
+  let mut cursor = owner.first
+  let mut packetAnchor = ()
+  while !Pointer.isNull<Packet>(cursor) {
+    let entry = unsafe Pointer.borrow<(), Packet>(&packetAnchor, unsafe nonnull(cursor))
+    if entry.channel == channel { break }
+    prior = cursor cursor = entry.next
+  }
+  if Pointer.isNull<Packet>(cursor) { return Option<List<u8>>.none() }
+  let found = unsafe nonnull(cursor)
+  let taken = unsafe Pointer.borrow<(), Packet>(&packetAnchor, found)
+  let next = taken.next
+  if Pointer.isNull<Packet>(prior) { owner.first = next }
+  else { let previous = unsafe Pointer.borrowMut<(), Packet>(&mut packetAnchor, unsafe nonnull(prior)) previous.next = next }
+  if Pointer.address<Packet>(owner.last) == Pointer.address<Packet>(cursor) { owner.last = prior }
+  let mut remaining = owner.first
+  let mut more = false
+  while !Pointer.isNull<Packet>(remaining) {
+    let entry = unsafe Pointer.borrow<(), Packet>(&packetAnchor, unsafe nonnull(remaining))
+    if entry.channel == channel { more = true break }
+    remaining = entry.next
+  }
+  if !more { let _previous = unsafe Atomic.fetchBitAnd<u32>(Pointer.fromMutRef<u32>(&mut owner.channels), u32.bitNot(u32.shiftLeft(1, channel)), MemoryOrder.Release) }
+  drop owner
+  drop guard
+  let owned = unsafe Pointer.take<Packet>(found)
+  unsafe resources.release(unsafe transport.raw(found))
+  return Option<List<u8>>.some(move owned.bytes)
+}
+
+/// Waits up to `timeoutMs` for a packet or a report request. True when one is ready.
+pub unsafe fn wait(mailbox: Mailbox, timeoutMs: u32) -> bool {
+  let pointer = mailbox.owner
+  let groupAnchor = () let group = unsafe mailbox.group(&groupAnchor)
+  let deadline = clock.nowNanoseconds() + u32.toI64(timeoutMs) * 1000000
+  let mut guard = group.registry.get().lock()
+  while true {
+    let mut anchor = () let owner = unsafe ownerMut(&mut anchor, pointer)
+    let ready = unsafe Atomic.load<u32>(Pointer.fromRef<u32>(&owner.channels), MemoryOrder.Acquire) != 0 || unsafe Atomic.load<u64>(Pointer.fromRef<u64>(&owner.requested), MemoryOrder.Acquire) != owner.serviced
+    drop owner
+    if ready { return true }
+    let now = clock.nowNanoseconds()
+    if now >= deadline { return false }
+    let _notified = group.changed.get().waitTimeout(&mut guard, i64.toU64(deadline - now))
+  }
+  return false
+}
+
+/// Asks every other worker for a report and waits up to one second for the
+/// answers. The result is a JSON array with one entry per worker.
+pub effect fn workers(mailbox: Mailbox) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let current = mailbox.owner
+  let groupAnchor = () let group = unsafe mailbox.group(&groupAnchor)
+  let mut requests = List<Request>.make()
+  let mut guard = group.registry.get().lock()
+  let mut anchor = ()
+  let mut count: usize = 0
+  let mut cursor = guard.get().diagnostics.owners
+  while !Pointer.isNull<Owner>(cursor) {
+    let owner = unsafe Pointer.borrow<(), Owner>(&anchor, unsafe nonnull(cursor))
+    if Pointer.address<Owner>(cursor) != Pointer.address<Owner>(current) && owner.id != 0 { count = count + 1 }
+    cursor = owner.next
+  }
+  // Reserve before taking any reference, so the appends below cannot fail.
+  run requests.reserve(count)
+  cursor = guard.get().diagnostics.owners
+  while !Pointer.isNull<Owner>(cursor) {
+    let pointer = unsafe nonnull(cursor)
+    let owner = unsafe ownerMut(&mut anchor, pointer)
+    cursor = owner.next
+    if Pointer.address<Owner>(pointer) != Pointer.address<Owner>(current) && owner.id != 0 {
+      let mut generation = unsafe Atomic.load<u64>(Pointer.fromRef<u64>(&owner.requested), MemoryOrder.Relaxed)
+      if generation == owner.completed { generation = generation + 1 unsafe Atomic.store<u64>(Pointer.fromMutRef<u64>(&mut owner.requested), generation, MemoryOrder.Release) }
+      owner.references = owner.references + 1
+      let id = owner.id drop owner
+      run requests.append(Request { owner: pointer, generation: generation })
+      unsafe transport.wake(guard.get(), id)
+    }
+  }
+  if count != 0 { group.changed.get().notifyAll() }
+  let deadline = clock.nowNanoseconds() + 1000000000
+  while true {
+    let mut waiting = false
+    let mut index: usize = 0
+    while index < requests.length() {
+      let request = requests.get(index)
+      let owner = unsafe Pointer.borrow<(), Owner>(&anchor, request.owner)
+      if !owner.exited && owner.completed < request.generation { waiting = true break }
+      index = index + 1
+    }
+    let now = clock.nowNanoseconds()
+    if !waiting || now >= deadline { break }
+    let _notified = group.changed.get().waitTimeout(&mut guard, i64.toU64(deadline - now))
+  }
+  let mut out = List<u8>.make()
+  let written = run Effect.result(unsafe writeWorkers(&mut out, &requests))
+  let mut index: usize = 0
+  while index < requests.length() { unsafe releaseOwner(requests.get(index).owner) index = index + 1 }
+  drop guard
+  if let Result<(), OutOfMemoryError>.Failure { error } = move written { fail move error }
+  return move out
+}
+struct Request { owner: *mut Owner, generation: u64 }
+impl Copy for Request {}
+unsafe effect fn writeWorkers(out: &mut List<u8>, requests: &List<Request>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let anchor = ()
+  run out.append(91)
+  let mut index: usize = 0
+  while index < requests.length() {
+    let request = requests.get(index)
+    let owner = unsafe Pointer.borrow<(), Owner>(&anchor, request.owner)
+    if index != 0 { run out.append(44) }
+    if owner.completed >= request.generation && owner.failure == 0 && owner.report.length() != 0 {
+      run json.raw(&mut out, owner.report.asSlice())
+    } else {
+      run json.raw(&mut out, b"{\"header\":{\"threadId\":") run json.number(&mut out, u32.toU64(owner.id))
+      run json.raw(&mut out, b"},\"silkjs\":{\"snapshotStatus\":\"unavailable\",\"reason\":")
+      let reason: &[u8] = if owner.exited { b"worker exited during collection" } else if owner.completed < request.generation { b"owner thread did not reach a safe point within 1000ms" } else { b"owner snapshot allocation failed" }
+      run json.quoted(&mut out, reason)
+      run json.raw(&mut out, b"}}")
+    }
+    index = index + 1
+  }
+  run out.append(93)
+}
