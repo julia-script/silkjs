@@ -1,0 +1,271 @@
+'use strict';
+
+// Encoding and streams load on first use; URL (and so startup) requires this module.
+const TextDecoder = function(...args) { return new (require('internal/web/encoding').TextDecoder)(...args); };
+const ReadableStream = function(...args) { return new (require('internal/web/streams').ReadableStream)(...args); };
+let encoderInstance;
+const encoder = { encode: text => (encoderInstance ||= new (require('internal/web/encoding').TextEncoder)()).encode(text) };
+const blobs = new WeakMap();
+const files = new WeakMap();
+const objectURLs = new Map();
+let objectURLSequence = 0;
+
+function string(value) {
+  if (typeof value === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
+  return String(value);
+}
+function scalarString(value) {
+  const text = string(value);
+  return text.toWellFormed ? text.toWellFormed() : new TextDecoder().decode(encoder.encode(text));
+}
+function optionsObject(options) {
+  if (options == null) return {};
+  if (typeof options !== 'object' && typeof options !== 'function') throw new TypeError('Options must be an object');
+  return options;
+}
+function normalizeType(value = '') {
+  const type = string(value);
+  return /[^\x20-\x7e]/.test(type) ? '' : type.toLowerCase();
+}
+function state(blob) {
+  const value = blobs.get(blob);
+  if (!value) throw new TypeError('Value of this must be of type Blob');
+  return value;
+}
+function integer(value) {
+  const number = +value;
+  return Number.isNaN(number) ? 0 : Math.trunc(number);
+}
+// Only active readers own descriptors. The immutable backing descriptor is safe
+// to share between slices and workers; it never contains a native pointer.
+const fileReaders = new FinalizationRegistry(fd => {
+  try { require('fs').closeSync(fd); } catch (_) {}
+});
+class BlobReader {
+  constructor(record) { this.parts = record.parts; this.index = 0; this.offset = 0; this.fd = -1; }
+  close() {
+    if (this.fd !== -1) {
+      const fd = this.fd;
+      this.fd = -1;
+      fileReaders.unregister(this);
+      require('fs').closeSync(fd);
+    }
+  }
+  read(target) {
+    let written = 0;
+    try {
+      while (this.index < this.parts.length) {
+        const part = this.parts[this.index];
+        const count = Math.min(part.byteLength - this.offset, target.byteLength - written);
+        if (part.file) {
+          const fs = require('fs');
+          if (this.fd === -1) {
+            const fd = fs.openSync(part.file.path, 'r');
+            try { fileReaders.register(this, fd, this); this.fd = fd; }
+            catch (error) { fs.closeSync(fd); throw error; }
+          }
+          const stat = fs.fstatSync(this.fd, { bigint: true });
+          if (Number(stat.size) !== part.file.size ||
+              stat.mtimeNs % 1000000000n !== part.file.mtimeNs % 1000000000n) throw new Error('File changed');
+          let read = 0;
+          while (read < count) {
+            const n = fs.readSync(this.fd, target, written + read, count - read, part.offset + this.offset + read);
+            if (n === 0) throw new Error('Unexpected end of file');
+            read += n;
+          }
+        } else if (count) {
+          target.set(part.subarray(this.offset, this.offset + count), written);
+        }
+        written += count;
+        this.offset += count;
+        if (this.offset === part.byteLength) { this.close(); this.index++; this.offset = 0; }
+        if (written === target.byteLength && this.index < this.parts.length && this.parts[this.index].byteLength) break;
+      }
+      return written;
+    } catch (_) {
+      try { this.close(); } catch (_) {}
+      const { DOMException } = require('internal/path_events/event_target');
+      throw new DOMException('The blob could not be read', 'NotReadableError');
+    }
+  }
+}
+function copyBytes(record) {
+  const result = new Uint8Array(record.size);
+  const reader = new BlobReader(record);
+  try { reader.read(result); }
+  finally { reader.close(); }
+  return result;
+}
+
+class Blob {
+  constructor(blobParts = [], options = {}) {
+    if (blobParts == null || typeof blobParts === 'string' || typeof blobParts[Symbol.iterator] !== 'function') {
+      throw new TypeError('blobParts must be an iterable sequence');
+    }
+    // Web IDL converts the sequence before the options dictionary.
+    const values = Array.from(blobParts, part => {
+      if (blobs.has(part)) return { blob: state(part) };
+      if (part instanceof ArrayBuffer || (typeof SharedArrayBuffer === 'function' && part instanceof SharedArrayBuffer)) {
+        return { bytes: new Uint8Array(new Uint8Array(part)) };
+      }
+      if (ArrayBuffer.isView(part)) return { bytes: new Uint8Array(new Uint8Array(part.buffer, part.byteOffset, part.byteLength)) };
+      return { text: scalarString(part) };
+    });
+    options = optionsObject(options);
+    const endings = options.endings === undefined ? 'transparent' : string(options.endings);
+    if (endings !== 'transparent' && endings !== 'native') throw new TypeError('Invalid endings value');
+    const type = normalizeType(options.type);
+    const parts = [];
+    let size = 0;
+    for (const value of values) {
+      if (value.blob) {
+        parts.push(...value.blob.parts);
+        size += value.blob.size;
+        continue;
+      }
+      let bytes = value.bytes;
+      if (!bytes) {
+        let text = value.text;
+        if (endings === 'native') {
+          const newline = typeof process !== 'undefined' && process.platform === 'win32' ? '\r\n' : '\n';
+          text = text.replace(/\r\n|\r|\n/g, newline);
+        }
+        bytes = encoder.encode(text);
+      }
+      if (bytes.byteLength) parts.push(bytes);
+      size += bytes.byteLength;
+    }
+    blobs.set(this, { parts, size, type });
+  }
+  get size() { return state(this).size; }
+  get type() { return state(this).type; }
+  slice(start = 0, end = undefined, contentType = '') {
+    const source = state(this);
+    start = integer(start);
+    end = end === undefined ? source.size : integer(end);
+    const first = start < 0 ? Math.max(source.size + start, 0) : Math.min(start, source.size);
+    const last = end < 0 ? Math.max(source.size + end, 0) : Math.min(end, source.size);
+    const size = Math.max(last - first, 0);
+    const parts = [];
+    let offset = 0;
+    for (const part of source.parts) {
+      const next = offset + part.byteLength;
+      if (next > first && offset < last) {
+        const begin = Math.max(first - offset, 0);
+        const end = Math.min(last - offset, part.byteLength);
+        parts.push(part.file ? { file: part.file, offset: part.offset + begin, byteLength: end - begin } : part.subarray(begin, end));
+      }
+      offset = next;
+      if (offset >= last) break;
+    }
+    const result = new Blob();
+    blobs.set(result, { parts, size, type: normalizeType(contentType) });
+    return result;
+  }
+  async arrayBuffer() { return copyBytes(state(this)).buffer; }
+  async bytes() { return copyBytes(state(this)); }
+  async text() {
+    return new TextDecoder().decode(copyBytes(state(this)));
+  }
+  stream() {
+    const source = state(this);
+    const reader = new BlobReader(source);
+    let remaining = source.size;
+    return new ReadableStream({
+      type: 'bytes',
+      pull(controller) {
+        const request = controller.byobRequest;
+        if (remaining === 0) {
+          reader.read(new Uint8Array(0));
+          reader.close();
+          controller.close();
+          if (request) request.respond(0);
+          return;
+        }
+        const target = request
+          ? new Uint8Array(request.view.buffer, request.view.byteOffset, request.view.byteLength)
+          : new Uint8Array(Math.min(65536, remaining));
+        const written = reader.read(target);
+        remaining -= written;
+        if (request) request.respond(written);
+        else controller.enqueue(target);
+        if (remaining === 0) { reader.close(); controller.close(); }
+      },
+      cancel() { reader.close(); },
+    });
+  }
+}
+
+class File extends Blob {
+  constructor(fileBits, fileName, options = {}) {
+    if (arguments.length < 2) throw new TypeError('File requires two arguments');
+    const name = scalarString(fileName);
+    options = optionsObject(options);
+    super(fileBits, options);
+    const lastModified = options.lastModified === undefined ? Date.now() : integer(options.lastModified);
+    // Web IDL signed long long conversion.
+    const finite = Number.isFinite(lastModified) ? lastModified : 0;
+    const wrapped = ((finite % 18446744073709551616) + 18446744073709551616) % 18446744073709551616;
+    files.set(this, { name, lastModified: finite >= -9223372036854775808 && finite < 9223372036854775808 ? finite : wrapped >= 9223372036854775808 ? wrapped - 18446744073709551616 : wrapped });
+  }
+  get name() {
+    const file = files.get(this);
+    if (!file) throw new TypeError('Invalid File receiver');
+    return file.name;
+  }
+  get lastModified() {
+    const file = files.get(this);
+    if (!file) throw new TypeError('Invalid File receiver');
+    return file.lastModified;
+  }
+}
+for (const Constructor of [Blob, File]) {
+  Object.defineProperty(Constructor.prototype, Symbol.toStringTag, { value: Constructor.name, configurable: true });
+  for (const key of Object.getOwnPropertyNames(Constructor.prototype)) {
+    if (key !== 'constructor') Object.defineProperty(Constructor.prototype, key, { enumerable: true });
+  }
+}
+function createObjectURL(blob) {
+  state(blob);
+  const id = 'blob:nodedata:' + Date.now().toString(16) + '-' + (++objectURLSequence).toString(16) + '-' + Math.random().toString(16).slice(2);
+  objectURLs.set(id, blob);
+  return id;
+}
+function revokeObjectURL(url) { objectURLs.delete(string(url)); }
+function resolveObjectURL(url) { return objectURLs.get(string(url)); }
+module.exports = { Blob, File, createObjectURL, revokeObjectURL, resolveObjectURL };
+// Memory snapshots and lazy file descriptors for the structured-clone codec.
+// No filesystem read or descriptor ownership crosses the clone boundary.
+Object.defineProperty(module.exports, '_cloneData', { value(value) {
+  const record = blobs.get(value);
+  if (!record) return undefined;
+  if (record.uncloneable) {
+    const error = new TypeError('Invalid state: File-backed Blobs are not cloneable');
+    error.code = 'ERR_INVALID_STATE';
+    throw error;
+  }
+  const file = files.get(value);
+  const metadata = { type: record.type, name: file?.name, lastModified: file?.lastModified };
+  if (record.parts.some(part => part.file)) {
+    return { ...metadata, parts: record.parts.map(part => part.file
+      ? { file: { ...part.file }, offset: part.offset, byteLength: part.byteLength }
+      : { bytes: new Uint8Array(part) }) };
+  }
+  return { ...metadata, bytes: copyBytes(record) };
+} });
+Object.defineProperty(module.exports, '_fromFile', { value(path, stat, type) {
+  const result = new Blob();
+  const size = Number(stat.size);
+  const file = { path, size, mtimeNs: stat.mtimeNs };
+  blobs.set(result, { parts: [{ file, offset: 0, byteLength: size }], size, type, uncloneable: true });
+  return result;
+} });
+Object.defineProperty(module.exports, '_fromCloneData', { value(data) {
+  const result = data.name === undefined ? new Blob() : new File([], data.name, { lastModified: data.lastModified });
+  const parts = data.parts.map(part => part.file
+    ? { file: { ...part.file }, offset: part.offset, byteLength: part.byteLength }
+    : new Uint8Array(part.bytes));
+  const size = parts.reduce((sum, part) => sum + part.byteLength, 0);
+  blobs.set(result, { parts, size, type: data.type });
+  return result;
+} });

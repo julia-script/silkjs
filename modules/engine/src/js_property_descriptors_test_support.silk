@@ -1,0 +1,310 @@
+//! Stored native embedding for descriptor regressions and the separate C oracle.
+//! Ordinary enumeration uses the production full-descriptor operation. Exotic
+//! callbacks read owned registered storage; typed callbacks read actual cache bytes.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.pointer { Pointer }
+import silk.core.result { Result }
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import runtime_memory { AllocationObserver }
+import js_heap { HeapCell, HeapHeader, HeapKind }
+import js_core_types { RuntimeState, ObjectData, ObjectPayload, ShapeData, PropertySlot, SlotBits,
+  PropertyDescriptor, PropertyEnum, NativeFunctionId, NativeErrorKind, WeakRefHeader,
+  TypedArrayCache }
+import js_gc { HeapHooks, Tracer }
+import js_gc as gc
+import js_runtime as runtime
+import js_shapes as shapes
+import js_object_allocate as objects
+import js_class_data as classes
+import js_value { ValueBits }
+import js_realm { Realm }
+import js_owned_value { Value, ValueRef, immediateRef }
+import js_object_ref { ObjectRef }
+import js_bigint_coercions as bigint
+import js_strings { Strings }
+import js_string_types { StringLengthError, StringOwner }
+import js_property_host { OwnPropertyHooks, OwnPropertyResult, OwnKeysHooks }
+import js_property_descriptors as descriptors
+import js_property_names_test_support as stored
+import js_property_names_test_support { StoredProperties, Hooks as StoredHooks }
+import js_array_storage_test_support { reference, trap }
+import js_errors as errors
+import js_exceptions { JsException }
+import js_exceptions as exceptions
+
+pub const LAZY_TABLE: u32 = 9101
+pub struct ByteView { pub bytes: List<u8> }
+pub struct Hooks<'a> {
+  pub memory: &'a AllocationObserver,
+  pub stored: StoredHooks,
+  pub autoCalls: usize, pub exoticCalls: usize, pub existenceCalls: usize,
+  pub typedReads: usize, pub relocate: bool, pub failAuto: bool, pub failExotic: bool,
+  pub finalizedPending: usize, pub finalizedOldPending: bool
+}
+impl<'a> Hooks<'a> {
+  pub fn make(memory: &'a AllocationObserver) -> Self {
+    return Self { memory: memory, stored: StoredHooks.make(), autoCalls: 0,
+      exoticCalls: 0, existenceCalls: 0, typedReads: 0, relocate: false,
+      failAuto: false, failExotic: false, finalizedPending: 0, finalizedOldPending: false }
+  }
+}
+impl<'a> HeapHooks for Hooks<'a> {
+  unsafe fn traceClass(self: &mut Self, rt: *mut HeapHeader, object: *mut HeapHeader,
+    callback: NativeFunctionId, tracer: &mut Tracer) -> () {
+    let anchor = ()
+    let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+    let typed = match &p.payload { ObjectPayload.TypedArray { .. } => true _ => false }
+    drop p
+    // ByteView has no GC edges; its backing bytes are owned by the view finalizer.
+    if !typed { unsafe HeapHooks.traceClass(&mut self.stored, rt, object, callback, &mut tracer) }
+  }
+  unsafe fn finalizeClass(self: &mut Self, rt: *mut HeapHeader, object: *mut HeapHeader,
+    callback: NativeFunctionId) -> () {
+    if unsafe exceptions.has(rt) { self.finalizedPending = self.finalizedPending + 1 }
+    let mut anchor = ()
+    let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+    if match state.currentException {
+      ValueBits.Object { reference: pending } => Pointer.address<HeapHeader>(pending) == Pointer.address<HeapHeader>(object)
+      _ => false
+    } { self.finalizedOldPending = true }
+    drop state
+    let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, object)
+    let mut view = Pointer.null<HeapHeader>()
+    match &p.payload { ObjectPayload.TypedArray { array } => { view = array.view } _ => () }
+    if !Pointer.isNull<HeapHeader>(view) { p.payload = ObjectPayload.Empty }
+    drop p
+    match Pointer.nonNullMut<HeapHeader>(view) {
+      Option<*mut HeapHeader>.Some { value } => { unsafe HeapCell.destroy<ByteView>(value) }
+      Option<*mut HeapHeader>.None => { unsafe HeapHooks.finalizeClass(&mut self.stored, rt, object, callback) }
+    }
+  }
+  unsafe effect fn sweepWeak(self: &mut Self, rt: *mut HeapHeader, node: *mut WeakRefHeader) -> () ? &mut Allocator { trap() }
+  unsafe fn destroyAuxiliary(self: &mut Self, rt: *mut HeapHeader, node: *mut HeapHeader) -> () { trap() }
+}
+unsafe effect fn tdzMessage(rt: *mut HeapHeader, atom: u32) -> List<u8>
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let anchor = () let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let name = StringOwner.adopt(run state.atoms.toValue(atom, true))
+  drop state
+  let mut bytes = run Strings.toUtf8(name.get(), false)
+  let suffix = b" is not initialized"
+  run bytes.appendSlice(suffix)
+  return move bytes
+}
+impl<'a> OwnPropertyHooks for Hooks<'a> {
+  effect fn throwNotObject<'r>(self: &mut Self, realm: Realm<'r>) -> never
+    ! JsException ? &mut Allocator {
+    let memory = self.memory
+    return run errors.throwNotAnObject(&mut self, memory, realm)
+  }
+  effect fn throwUninitialized<'r>(self: &mut Self, realm: Realm<'r>, atom: u32) -> never
+    ! JsException ? &mut Allocator {
+    let memory = self.memory
+    let message = run Effect.result(unsafe tdzMessage(realm.runtime(), atom))
+    match move message {
+      Result<List<u8>, OutOfMemoryError | StringLengthError>.Success { value } => {
+        return run errors.throwError(&mut self, memory, realm, NativeErrorKind.Reference, value.asSlice())
+      }
+      Result<List<u8>, OutOfMemoryError | StringLengthError>.Failure { .. } => {
+        return run errors.throwOutOfMemory(&mut self, memory, realm)
+      }
+    }
+  }
+  effect fn instantiateAutoInit<'r, 'v>(self: &mut Self, realm: Realm<'r>,
+    object: ValueRef<'v>, atom: u32) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+    let rt = realm.runtime()
+    let mut anchor = ()
+    let p = ObjectRef.of(object).dataMut(&mut anchor)
+    let index = match unsafe shapes.lookup(p.shape, atom) { Option<usize>.Some { value } => value _ => trap() }
+    let old = p.slot(index).view(unsafe shapes.slotFlags(p.shape, index))
+    match old {
+      PropertySlot.LazyHost { id, .. } => {
+        if id != LAZY_TABLE { trap() }
+      }
+      _ => trap()
+    }
+    let shapeAnchor = ()
+    let shape = unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, p.shape)
+    let flags = shape.properties.get(index).flags & 7
+    drop shape
+    run unsafe shapes.updateFlags(rt, &mut p, index, flags)
+    p.setSlot(index, SlotBits.value(ValueBits.Undefined))
+    drop p
+    unsafe gc.releaseProperty(&mut self, rt, old)
+    self.autoCalls = self.autoCalls + 1
+    if self.failAuto {
+      let memory = self.memory
+      return run errors.throwError(&mut self, memory, realm, NativeErrorKind.Type, b"initializer failed")
+    }
+    let text = run Effect.result(Strings.fromLatin1(b"lazy"))
+    let owned = match move text {
+      Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => value
+      Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { .. } => {
+        let memory = self.memory
+        return run errors.throwOutOfMemory(&mut self, memory, realm)
+      }
+    }
+    let target = ObjectRef.of(object).dataMut(&mut anchor)
+    target.setSlot(index, SlotBits.value(owned))
+    drop target
+    if self.relocate {
+      // Force growth after publication. The lookup must discard its old slot and
+      // re-read the current attributes, not return the pre-instantiation flags.
+      let mut i: u32 = 0
+      while i < 24 {
+        run unsafe stored.add(&mut self, rt, object.view(), 0x80000000 | i, 7, PropertySlot.Value { value: ValueBits.Undefined })
+        i = i + 1
+      }
+      let current = ObjectRef.of(object).dataMut(&mut anchor)
+      let at = match unsafe shapes.lookup(current.shape, atom) { Option<usize>.Some { value } => value _ => trap() }
+      run unsafe shapes.updateFlags(rt, &mut current, at, 1)
+      drop current
+    }
+    run unsafe gc.collect(&mut self, rt, true)
+  }
+  effect fn readTypedIndex<'r, 'v>(self: &mut Self, realm: Realm<'r>,
+    object: ValueRef<'v>, index: u64) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+    self.typedReads = self.typedReads + 1
+    let anchor = () let p = ObjectRef.of(object).data(&anchor)
+    let classId = p.classId()
+    let mut bits: u64 = 0
+    match &p.payload {
+      ObjectPayload.TypedArray { array } => {
+        if index >= array.count || Pointer.isNull<u8>(array.cachedData) { trap() }
+        let pointer = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(array.cachedData)
+        let bytes = unsafe Pointer.assumeMany<u8>(pointer)
+        if classId == classes.JS_CLASS_UINT8_ARRAY {
+          let at = unsafe Pointer.at<u8>(bytes, u64.toUsize(index))
+          return ValueBits.Int { value: u8.toI32(unsafe Pointer.read<u8>(at)) }
+        }
+        if classId != classes.JS_CLASS_BIG_INT64_ARRAY && classId != classes.JS_CLASS_BIG_UINT64_ARRAY { trap() }
+        let mut offset = u64.toUsize(index) * 8
+        let mut shift: u32 = 0
+        while shift < 64 {
+          let byte = unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(bytes, offset))
+          bits = bits | u64.shiftLeft(u8.toU64(byte), u32.toU64(shift))
+          offset = offset + 1 shift = shift + 8
+        }
+      }
+      _ => trap()
+    }
+    drop p
+    let mut signed: i64 = 0
+    if (bits & 0x8000000000000000) != 0 { signed = -1 - u64.toI64(bits ^ 0xffffffffffffffff) }
+    else { signed = u64.toI64(bits) }
+    let mut allocated = Result<ValueBits, OutOfMemoryError>.Success { value: ValueBits.Undefined }
+    if classId == classes.JS_CLASS_BIG_UINT64_ARRAY { allocated = run Effect.result(bigint.newBigUint64(bits)) }
+    else { allocated = run Effect.result(bigint.newBigInt64(signed)) }
+    return match move allocated {
+      Result<ValueBits, OutOfMemoryError>.Success { value } => value
+      Result<ValueBits, OutOfMemoryError>.Failure { .. } => {
+        let memory = self.memory
+        return run errors.throwOutOfMemory(&mut self, memory, realm)
+      }
+    }
+  }
+  effect fn getExoticOwnProperty<'r, 'v>(self: &mut Self, realm: Realm<'r>,
+    table: NativeFunctionId, object: ValueRef<'v>, atom: u32, requested: bool) -> OwnPropertyResult
+    ! OutOfMemoryError | JsException ? &mut Allocator {
+    if !match table { NativeFunctionId.Host { id } => id == stored.TABLE_ID _ => false } { trap() }
+    self.exoticCalls = self.exoticCalls + 1
+    if !requested { self.existenceCalls = self.existenceCalls + 1 }
+    let rt = realm.runtime()
+    run unsafe gc.collect(&mut self, rt, true)
+    if self.failExotic {
+      let memory = self.memory
+      return run errors.throwError(&mut self, memory, realm, NativeErrorKind.Type, b"exotic failed")
+    }
+    let anchor = ()
+    let data = unsafe HeapCell.payload<StoredProperties, ()>(&anchor, unsafe stored.storage(object.view()))
+    let mut i: usize = 0
+    while i < data.entries.length() {
+      let entry = data.entries.get(i)
+      if entry.atom == atom {
+        if !entry.present { return OwnPropertyResult.Absent }
+        if !requested { return OwnPropertyResult.Exists }
+        return OwnPropertyResult.Descriptor { descriptor: PropertyDescriptor {
+          flags: entry.flags, value: unsafe Value.retain(entry.value), getter: unsafe Value.retain(entry.getter), setter: unsafe Value.retain(entry.setter)
+        } }
+      }
+      i = i + 1
+    }
+    return OwnPropertyResult.Absent
+  }
+}
+impl<'a> OwnKeysHooks for Hooks<'a> {
+  effect fn getOwnKeys<'r, 'v>(self: &mut Self, realm: Realm<'r>,
+    table: NativeFunctionId, object: ValueRef<'v>) -> List<PropertyEnum>
+    ! OutOfMemoryError | JsException ? &mut Allocator {
+    return run OwnKeysHooks.getOwnKeys(&mut self.stored, realm, table, object)
+  }
+  effect fn getOwnProperty<'r, 'v>(self: &mut Self, realm: Realm<'r>,
+    object: ValueRef<'v>, atom: u32) -> Option<PropertyDescriptor>
+    ! OutOfMemoryError | JsException ? &mut Allocator {
+    return run descriptors.getOwnProperty(&mut self, realm, object, atom)
+  }
+}
+pub effect fn autoProperty<'a, 'b, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>,
+  object: ValueRef<'b>, atom: u32) -> () ! OutOfMemoryError ? &mut Allocator { let context = realm.context()
+  let rt = realm.runtime()
+  unsafe HeapCell.retain(context)
+  let added = run Effect.result(unsafe stored.add(&mut hooks, rt, object.view(), atom, 51,
+    PropertySlot.LazyHost { realm: context, id: LAZY_TABLE }))
+  match move added {
+    Result<(), OutOfMemoryError>.Success { .. } => ()
+    Result<(), OutOfMemoryError>.Failure { error } => { unsafe gc.releaseHeader(&mut hooks, rt, context) fail move error }
+  }
+}
+pub effect fn typed<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>) -> ValueBits
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut bytes = List<u8>.make()
+  run bytes.append(19) run bytes.append(203) run bytes.append(7)
+  return run typedStorage(&mut hooks, memory, realm, classes.JS_CLASS_UINT8_ARRAY, move bytes, 3)
+}
+pub effect fn typedBigInt<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>) -> ValueBits
+  ! OutOfMemoryError ? &mut Allocator {
+  // A real little-endian unsigned-64 cache element, 2^64 - 1, does not fit a
+  // short (signed 64-bit) BigInt, so reading it allocates.
+  let raw = b"\xff\xff\xff\xff\xff\xff\xff\xff"
+  let mut bytes = List<u8>.make() run bytes.appendSlice(raw)
+  return run typedStorage(&mut hooks, memory, realm, classes.JS_CLASS_BIG_UINT64_ARRAY, move bytes, 1)
+}
+effect fn typedStorage<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,realm: Realm<'a>, classId: u32, bytes: List<u8>, count: u32) -> ValueBits
+  ! OutOfMemoryError ? &mut Allocator {
+  let view = run HeapCell.allocate(HeapKind.Auxiliary, ByteView { bytes: move bytes })
+  let allocated = run Effect.result(objects.withPrototypeClass(&mut hooks, memory, realm, immediateRef(ValueBits.Null), classId))
+  let object = match move allocated {
+    Result<ValueBits, OutOfMemoryError>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError>.Failure { error } => { unsafe HeapCell.destroy<ByteView>(view) fail move error }
+  }
+  let mut anchor = () let backing = unsafe HeapCell.payloadMut<ByteView, ()>(&mut anchor, view)
+  let pointer = Pointer.fromMutRef<u8>(&mut backing.bytes.asMutSlice()[0])
+  drop backing
+  let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, reference(object))
+  p.payload = ObjectPayload.TypedArray { array: TypedArrayCache { view: view, shared: false, cachedData: pointer, count: u32.toU64(count), requiresExtensible: false } }
+  return object
+}
+
+pub fn descriptor(result: Option<PropertyDescriptor>) -> PropertyDescriptor {
+  return match move result { Option<PropertyDescriptor>.Some { value } => move value _ => trap() }
+}
+pub fn errorKind<'a, 'b>(realm: Realm<'a>, error: ValueRef<'b>) -> u32 { let _context = realm.context()
+  if !error.view().isObject() { return 99 }
+  let anchor = ()
+  let p = ObjectRef.of(error).data(&anchor)
+  if p.classId() != classes.JS_CLASS_ERROR { return 99 }
+  let sh = unsafe HeapCell.payload<ShapeData, ()>(&anchor, p.shape)
+  let ctx = realm.state(&anchor)
+  let mut i: u32 = 0
+  while i < 9 {
+    let proto = ctx.nativeErrorPrototypes[u32.toUsize(i)].view()
+    if proto.isObject() && Pointer.address<HeapHeader>(reference(proto)) == Pointer.address<HeapHeader>(sh.prototype) { return i }
+    i = i + 1
+  }
+  return 99
+}

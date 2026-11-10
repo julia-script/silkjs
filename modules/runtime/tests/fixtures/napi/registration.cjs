@@ -1,0 +1,18 @@
+'use strict';
+const assert = require('node:assert/strict');
+const path = require('node:path');
+const legacy = path.resolve(process.argv[2]);
+const unsupported = path.resolve(process.argv[3]);
+const v8 = path.resolve(process.argv[4]);
+const first = require(legacy);
+assert.equal(first.registration, 'legacy-napi');
+delete require.cache[legacy];
+const second = require(legacy);
+assert.equal(second.registration, 'legacy-napi');
+assert.notEqual(first, second);
+const manual = { exports: {} };
+assert.equal(process.dlopen(manual, legacy), undefined);
+assert.equal(manual.exports.registration, 'legacy-napi');
+assert.throws(() => require(unsupported), { code: 'ERR_DLOPEN_FAILED' });
+assert.throws(() => require(v8), { code: 'ERR_DLOPEN_FAILED' });
+console.log('native addon legacy registration/reload/rejection: ok');

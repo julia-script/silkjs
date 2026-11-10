@@ -1,0 +1,49 @@
+/*
+ * Copyright (C) 2021 Klaus Reimer <k@ailis.de>
+ * See LICENSE.md for licensing information.
+ */
+const { AbstractEncoder } = require("internal/web/vendor/text-encoding/lib/main/AbstractEncoder");
+const { END_OF_BUFFER } = require("internal/web/vendor/text-encoding/lib/main/ByteBuffer");
+const { FINISHED } = require("internal/web/vendor/text-encoding/lib/main/constants");
+const { inRange, isASCII } = require("internal/web/vendor/text-encoding/lib/main/util");
+/**
+ * Encoder for utf-8 encoding.
+ */
+class UTF8Encoder extends AbstractEncoder {
+    /** @inheritdoc */
+    encode(buffer) {
+        const codePoint = buffer.read();
+        if (codePoint === END_OF_BUFFER) {
+            return FINISHED;
+        }
+        if (isASCII(codePoint)) {
+            return codePoint;
+        }
+        let count;
+        let offset;
+        if (inRange(codePoint, 0x0080, 0x07FF)) {
+            count = 1;
+            offset = 0xC0;
+        }
+        else if (inRange(codePoint, 0x0800, 0xFFFF)) {
+            count = 2;
+            offset = 0xE0;
+        }
+        else if (inRange(codePoint, 0x10000, 0x10FFFF)) {
+            count = 3;
+            offset = 0xF0;
+        }
+        else {
+            return this.fail(codePoint);
+        }
+        const bytes = [(codePoint >> (6 * count)) + offset];
+        while (count > 0) {
+            const temp = codePoint >> (6 * (count - 1));
+            bytes.push(0x80 | (temp & 0x3F));
+            count -= 1;
+        }
+        return bytes;
+    }
+}
+
+Object.assign(exports, { UTF8Encoder });

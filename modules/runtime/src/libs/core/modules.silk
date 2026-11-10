@@ -1,0 +1,118 @@
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silkjs.js_owned_value { Value, lendFor, immediateRef }
+import silkjs.js_realm { lendRealm }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.pointer { Pointer }
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_heap { CellRef, HeapCell, HeapHeader }
+import silkjs.js_core_types { ModuleDef, NativeErrorKind }
+import silkjs.js_coercion_host { CoercionHooks }
+import silkjs.js_value { ValueBits }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_string_types { StringLengthError }
+import libs.core.owners { Scope }
+import libs.core.owners as owners
+import silkjs.js_std_support as text
+import libs.core.common as common
+import silkjs.js_proxy_core as core
+import silkjs.js_module_loader as loader
+import silkjs.js_module_namespace as namespaces
+import silkjs.js_eval as evaluation
+import silkjs.js_promise as promise
+import silkjs.js_gc as gc
+import silkjs.js_runtime as runtime
+import silkjs.js_exceptions as exceptions
+import silkjs.js_errors as errors
+
+// The bootstrap resolves its native imports before the public loader is installed.
+// Once installed, check both sides of normalization: hooks must not redirect a
+// public request to an already-registered native module and bypass loadModule.
+pub unsafe effect fn assertPublicImport<'m, S: EngineServices>(engine: &mut Engine<'m,S>,
+  context: *mut HeapHeader, name: &[u8]) -> () ! JsException ? &mut Allocator {
+  let privateNames = [b"silk:host/std", b"silk:host/os", b"silk:host", b"silk:std", b"silk:os"]
+  let mut at: usize = 0
+  while at < privateNames.length {
+    let candidate = privateNames[at]
+    if name.length == candidate.length {
+      let mut index: usize = 0
+      while index < name.length && name[index] == candidate[index] { index = index + 1 }
+      if index == name.length {
+        return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Private runtime modules cannot be imported")
+      }
+    }
+    at = at + 1
+  }
+}
+
+pub unsafe effect fn setMeta<'m, S: EngineServices>(engine: &mut Engine<'m,S>, context: *mut HeapHeader,
+  module: *mut HeapHeader, callback: ValueBits, name: &[u8]) -> () ! JsException ? &mut Allocator {
+  let input = run text.string(&mut engine, unsafe lendRealm(&context, context), name)
+  let called = run Effect.result(promise.call(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(callback), unsafe lendFor(ValueBits.Undefined), &[input.view()]))
+  let rt = unsafe runtime.contextRuntime(context)
+  unsafe gc.release(&mut engine, rt, input.intoBits())
+  let meta = match move called { Result<Value, JsException>.Success { value } => value.intoBits() Result<Value, JsException>.Failure { error } => { fail move error } }
+  let mut anchor = ()
+  let data = unsafe HeapCell.payloadMut<ModuleDef, ()>(&mut anchor, module)
+  let previous = Intrinsic.replace(data.metaObject, unsafe Value.adoptBits(meta)) drop data
+  unsafe gc.release(&mut engine, rt, previous.intoBits())
+}
+unsafe effect fn asyncGraph(module: *mut HeapHeader) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut visited = List<*mut HeapHeader>.make()
+  run visited.append(module)
+  let mut at: usize = 0
+  while at < visited.length() {
+    let anchor = () let data = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, visited.asSlice()[at])
+    if data.hasTopLevelAwait { return true }
+    let mut request: usize = 0
+    while request < data.requestedModules.length() {
+      let target = data.requestedModules.asSlice()[request].module
+      match target {
+        Option<CellRef<ModuleDef>>.Some { value: link } => { let value = link.header()
+          let mut found = false let mut index: usize = 0
+          while index < visited.length() { if Pointer.address<HeapHeader>(visited.asSlice()[index]) == Pointer.address<HeapHeader>(value) { found = true break } index = index + 1 }
+          if !found { run visited.append(value) }
+        }
+        Option<CellRef<ModuleDef>>.None => ()
+      }
+      request = request + 1
+    }
+    at = at + 1
+  }
+  return false
+}
+unsafe effect fn requireBody<'m, S: EngineServices>(engine: &mut Engine<'m,S>, context: *mut HeapHeader,
+  filename: &[u8], scope: &mut Scope) -> ValueBits ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let module = run unsafe loader.resolveImported(&mut engine, unsafe lendRealm(&context, context), b"", filename, immediateRef(ValueBits.Undefined))
+  run loader.resolveModule(&mut engine, unsafe lendRealm(&context, context), module)
+  let memory = engine.memory let rt = unsafe runtime.contextRuntime(context)
+  if run unsafe asyncGraph(module.header()) {
+    scope.values[0] = run errors.newError(&mut engine, memory, unsafe lendRealm(&context, context))
+    scope.values[1] = (run text.string(&mut engine, unsafe lendRealm(&context, context), b"ERR_REQUIRE_ASYNC_MODULE")).intoBits()
+    run unsafe common.define(&mut engine, context, scope.values[0], b"code", scope.take(1), 7)
+    scope.values[1] = (run text.string(&mut engine, unsafe lendRealm(&context, context), b"require() cannot be used on an ESM graph with top-level await. Use import() instead.")).intoBits()
+    run unsafe common.define(&mut engine, context, scope.values[0], b"message", scope.take(1), 7)
+    return run unsafe exceptions.throwValue<ValueBits, Engine<'m,S>>(&mut engine, rt, scope.take(0))
+  }
+  let compiled = unsafe (ValueBits.Module { reference: module.header() }).retained()
+  scope.values[0] = (run evaluation.evaluateFunction(&mut engine, memory, unsafe lendRealm(&context, context), unsafe Value.adoptBits(compiled))).intoBits()
+  run promise.markHandled(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(scope.values[0]))
+  if promise.stateOf(unsafe lendFor(scope.values[0])) == promise.REJECTED {
+    let reason = promise.resultOf(unsafe lendFor(scope.values[0])).intoBits()
+    return run unsafe exceptions.throwValue<ValueBits, Engine<'m,S>>(&mut engine, rt, reason)
+  }
+  return (run namespaces.getNamespace(&mut engine, memory, unsafe lendRealm(&context, context), module)).intoBits()
+}
+pub unsafe effect fn requireModule<'m, S: EngineServices>(engine: &mut Engine<'m,S>, context: *mut HeapHeader, filename: &[u8]) -> ValueBits
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut scope = Scope.make()
+  let result = run Effect.result(unsafe requireBody(&mut engine, context, filename, &mut scope))
+  unsafe owners.cleanup(&mut engine, context, move scope)
+  return match move result {
+    Result<ValueBits, OutOfMemoryError | StringLengthError | JsException>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => run core.materialize(&mut engine, unsafe lendRealm(&context, context), move error)
+  }
+}

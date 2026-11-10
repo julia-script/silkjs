@@ -1,0 +1,13 @@
+/*
+ * Copyright (C) 2021 Klaus Reimer <k@ailis.de>
+ * See LICENSE.md for licensing information.
+ */
+const windows1258 = require("internal/web/vendor/text-encoding/data/windows-1258.cp");
+const { SingleByteDecoder } = require("internal/web/vendor/text-encoding/lib/main/decoders/SingleByteDecoder");
+const { SingleByteEncoder } = require("internal/web/vendor/text-encoding/lib/main/encoders/SingleByteEncoder");
+const { registerEncoding } = require("internal/web/vendor/text-encoding/lib/main/Encoding");
+registerEncoding("windows-1258", [
+    "cp1258",
+    "windows-1258",
+    "x-cp1258"
+], SingleByteDecoder.forCodePoints(windows1258), SingleByteEncoder.forCodePoints(windows1258));

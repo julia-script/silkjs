@@ -1,0 +1,165 @@
+//! Final literal and stack permutations, quickjs.c:18185-18469.
+import js_realm { lendRealm }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.num.u8
+import silk.num.i32
+import silk.num.u16
+import silk.num.u32
+import js_heap { HeapCell, HeapHeader }
+import js_core_types { RuntimeState, NativeErrorKind }
+import js_value { ValueBits }
+import js_atoms { AtomTable }
+import js_vm_state { Machine }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_coercion_host { CoercionHooks }
+import js_string_types { StringLengthError }
+import js_exceptions { JsException }
+import js_opcode_data as op
+import js_atom_data as atoms
+/// Failures caught without wrapping the success in a Result (see js_caught).
+struct FailedOomLength { error: OutOfMemoryError | StringLengthError }
+effect fn failedOomLength(error: OutOfMemoryError | StringLengthError) -> FailedOomLength { return FailedOomLength { error: move error } }
+
+unsafe effect fn atomRaw(runtime: *mut HeapHeader, atom: u32, string: bool) -> ValueBits
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let anchor = ()
+  let rt = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  return run rt.atoms.toValue(atom, string)
+}
+effect fn exceptionValue(error: JsException) -> ValueBits { drop error return ValueBits.Exception }
+unsafe effect fn allocationValue<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader) -> ValueBits
+  ! JsException ? &mut Allocator { return run hooks.throwOutOfMemory(unsafe lendRealm(&context, context)) }
+unsafe effect fn lengthValue<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader) -> ValueBits
+  ! JsException ? &mut Allocator { return run hooks.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Internal, b"string too long") }
+
+// These source instructions intentionally push Exception without branching to
+// the exception handler. Preserve the pending exception and continue dispatch.
+pub unsafe effect fn atomValue<H: CoercionHooks>(hooks: &mut H, machine: &Machine,
+  atom: u32, string: bool) -> ValueBits ? &mut Allocator {
+  if !AtomTable.isInteger(atom) {
+    let anchor = () let rt = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)
+    return rt.atoms.storedValue(atom, string)
+  }
+  let result = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError>(unsafe atomRaw(machine.runtime, atom, string), failedOomLength)
+  return match move result {
+    ValueBits value => value
+    FailedOomLength { error } => match move error {
+      OutOfMemoryError _allocation => run Effect.catch<JsException>(unsafe allocationValue(&mut hooks, machine.context), exceptionValue)
+      StringLengthError _length => run Effect.catch<JsException>(unsafe lengthValue(&mut hooks, machine.context), exceptionValue)
+    }
+  }
+}
+
+/// push_atom_value fast path, inlined into the dispatch match: a non-integer
+/// atom's interned string, retained. false consumes nothing, leaving it to step.
+@inlineAlways
+pub unsafe fn pushAtomString(machine: &mut Machine) -> bool {
+  let atom = u16.toU32(unsafe machine.peekU16()) | u32.shiftLeft(u16.toU32(unsafe machine.peekU16At(2)), 16)
+  if AtomTable.isInteger(atom) { return false }
+  let anchor = () let rt = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)
+  let value = rt.atoms.storedAtomValue(atom) drop rt
+  unsafe machine.skip(4)
+  unsafe machine.push(value)
+  return true
+}
+/// push_empty_string, inlined into the dispatch match: the interned "", retained.
+@inlineAlways
+pub unsafe fn pushEmptyString(machine: &mut Machine) -> () {
+  let anchor = () let rt = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)
+  let value = rt.atoms.storedValue(atoms.JS_ATOM_empty_string, true) drop rt
+  unsafe machine.push(value)
+}
+// The family fallback: rare on hot paths, so its call sites are laid out cold.
+@cold
+pub unsafe effect fn step<H: HeapHooks + CoercionHooks>(hooks: &mut H, machine: &mut Machine, opcode: u8) -> bool
+  ? &mut Allocator {
+  if opcode >= op.OP_push_minus1 && opcode <= op.OP_push_7 {
+    unsafe machine.push(ValueBits.Int { value: u8.toI32(opcode) - u8.toI32(op.OP_push_0) }) return true
+  }
+  if opcode == op.OP_push_i32 { let n = unsafe machine.readI32() unsafe machine.push(ValueBits.Int { value: n }) return true }
+  if opcode == op.OP_push_bigint_i32 { let n = unsafe machine.readI32() unsafe machine.push(ValueBits.ShortBigInt { value: i32.toI64(n) }) return true }
+  if opcode == op.OP_push_i8 { let n = unsafe machine.readI8() unsafe machine.push(ValueBits.Int { value: n }) return true }
+  if opcode == op.OP_push_i16 { let n = unsafe machine.readI16() unsafe machine.push(ValueBits.Int { value: n }) return true }
+  if opcode == op.OP_push_const || opcode == op.OP_push_const8 {
+    let mut index: usize = 0
+    if opcode == op.OP_push_const { index = u32.toUsize(unsafe machine.readU32()) }
+    else { index = u8.toUsize(unsafe machine.readU8()) }
+    let value = unsafe machine.constant(index)
+    unsafe machine.push(unsafe value.retained()) return true
+  }
+  if opcode == op.OP_push_atom_value || opcode == op.OP_push_empty_string {
+    let mut atom = atoms.JS_ATOM_empty_string
+    if opcode == op.OP_push_atom_value { atom = unsafe machine.readU32() }
+    let value = run unsafe atomValue(&mut hooks, &machine.*, atom, opcode == op.OP_push_empty_string)
+    unsafe machine.push(value) return true
+  }
+  if opcode == op.OP_undefined { unsafe machine.push(ValueBits.Undefined) return true }
+  if opcode == op.OP_null { unsafe machine.push(ValueBits.Null) return true }
+  if opcode == op.OP_push_false || opcode == op.OP_push_true {
+    unsafe machine.push(ValueBits.Bool { value: opcode == op.OP_push_true }) return true
+  }
+  if opcode < op.OP_drop || opcode > op.OP_rot5l { return false }
+  if opcode == op.OP_drop {
+    unsafe gc.release(&mut hooks, machine.runtime, unsafe machine.top(1))
+    unsafe machine.discard(1) return true
+  }
+  if opcode == op.OP_nip || opcode == op.OP_nip1 {
+    let mut depth: usize = 2 if opcode == op.OP_nip1 { depth = 3 }
+    unsafe gc.release(&mut hooks, machine.runtime, unsafe machine.top(depth))
+    while depth > 1 { unsafe machine.set(depth, unsafe machine.top(depth - 1)) depth = depth - 1 }
+    unsafe machine.discard(1) return true
+  }
+  if opcode == op.OP_dup || opcode == op.OP_dup2 || opcode == op.OP_dup3 {
+    let mut count: usize = 1
+    if opcode == op.OP_dup2 { count = 2 } else if opcode == op.OP_dup3 { count = 3 }
+    let mut index: usize = 0
+    while index < count { let value = unsafe machine.top(count) unsafe machine.push(unsafe value.retained()) index = index + 1 }
+    return true
+  }
+  if opcode == op.OP_dup1 {
+    let top = unsafe machine.top(1) let below = unsafe machine.top(2)
+    unsafe machine.set(1, unsafe below.retained()) unsafe machine.push(top) return true
+  }
+  if opcode >= op.OP_insert2 && opcode <= op.OP_insert4 {
+    unsafe insertTop(&mut machine, u8.toUsize(opcode - op.OP_insert2) + 2) return true
+  }
+  if opcode >= op.OP_perm3 && opcode <= op.OP_perm5 {
+    let count = u8.toUsize(opcode - op.OP_perm3) + 3
+    let value = unsafe machine.top(2)
+    let mut depth: usize = 2
+    while depth < count { unsafe machine.set(depth, unsafe machine.top(depth + 1)) depth = depth + 1 }
+    unsafe machine.set(count, value) return true
+  }
+  if opcode == op.OP_swap {
+    let value = unsafe machine.top(1)
+    unsafe machine.set(1, unsafe machine.top(2)) unsafe machine.set(2, value) return true
+  }
+  if opcode == op.OP_swap2 {
+    let a = unsafe machine.top(4) let b = unsafe machine.top(3)
+    unsafe machine.set(4, unsafe machine.top(2)) unsafe machine.set(3, unsafe machine.top(1))
+    unsafe machine.set(2, a) unsafe machine.set(1, b) return true
+  }
+  if opcode == op.OP_rot3r {
+    let value = unsafe machine.top(1)
+    unsafe machine.set(1, unsafe machine.top(2)) unsafe machine.set(2, unsafe machine.top(3))
+    unsafe machine.set(3, value) return true
+  }
+  let mut depth: usize = 3
+  if opcode == op.OP_rot4l { depth = 4 } else if opcode == op.OP_rot5l { depth = 5 }
+  let value = unsafe machine.top(depth)
+  while depth > 1 { unsafe machine.set(depth, unsafe machine.top(depth - 1)) depth = depth - 1 }
+  unsafe machine.set(1, value) return true
+}
+/// insert2..insert4: copies the top operand below the count operands under it,
+/// with one more reference. Only the operand stack changes, so dispatch runs it
+/// inline on its register copy of the machine.
+@inlineAlways
+pub unsafe fn insertTop(machine: &mut Machine, count: usize) -> () {
+  let value = unsafe machine.top(1)
+  unsafe machine.push(value)
+  let mut depth: usize = 2
+  while depth <= count { unsafe machine.set(depth, unsafe machine.top(depth + 1)) depth = depth + 1 }
+  unsafe machine.set(count + 1, unsafe value.retained())
+}

@@ -1,0 +1,972 @@
+//! Node workers run independent engines on detached OS threads. Only native
+//! packets cross threads. libuv async handles wake the receiving runtime.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silkjs.js_owned_value { lendFor }
+import silkjs.js_realm { lendRealm }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.collections.list { List }
+import silk.concurrency.sync { Arc }
+import silk.mem.pointer { Pointer }
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.num.f64
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_heap { HeapHeader }
+import silkjs.js_value { ValueBits }
+import silkjs.js_core_types { FrameSlots, NativeFunctionId, NativeErrorKind }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_coercion_host { CoercionHooks }
+import silkjs.js_errors as errors
+import silkjs.js_atomics_native { Domain, CancellableDomain }
+import silkjs.js_libc_process { Process }
+import silkjs.js_os_workers_resources as resources
+import silkjs.js_os_workers_transport as shared
+import silkjs.js_buffer_storage as buffers
+import silkjs.js_class_data as classes
+import silkjs.js_object_allocate as objects
+import libs.core.owners as owners
+import libs.core.owners { Scope }
+import libs.core.common as common
+import silkjs.js_proxy_core as core
+import silkjs.js_runtime as runtime
+import libs.core.host as host
+import runtime.worker as worker
+import ext.worker_transport { Group, Registry, Thread, Endpoint, Message, Shared, Environment, Variable, LockRequest }
+import ext.worker_transport as transport
+import ext.worker_locks as locks
+import ext.worker_resource_controls { Cpu }
+import silkjs.js_strings { Strings }
+import silkjs.js_string_rope { RopeIterator }
+import silkjs.utf8 { Utf8 }
+import ext.vm_interrupt
+import ext.vm_interrupt { Slot }
+import ext.process_diagnostics as diagnostics
+import ext.diagnostics_hub as hub
+import ext.diagnostics_hub { Mailbox }
+import ext.diagnostics_fatal as fatalReport
+import ext.diagnostics_fatal { ReportingAllocator }
+import ext.fs_async as fs_async
+import silk.io.reactor { Waker }
+
+unsafe extern "C" fn pthread_attr_init(attributes: *mut u8) -> i32
+unsafe extern "C" fn pthread_attr_setstacksize(attributes: *mut u8, size: usize) -> i32
+unsafe extern "C" fn pthread_attr_setdetachstate(attributes: *mut u8, state: i32) -> i32
+unsafe extern "C" fn pthread_attr_destroy(attributes: *mut u8) -> i32
+@threadCallbacks("start")
+unsafe extern "C" fn pthread_create(thread: *mut usize, attributes: ?*const u8, start: extern "C" fn(?*mut u8) -> ?*mut u8, argument: ?*mut u8) -> i32
+@foreign(noCapture: .("name"))
+unsafe extern "C" fn uv_thread_setname(name: *const u8) -> i32
+pub struct State { pub group: Group, pub id: u32, pub control: u32, pub metadata: List<u8>, io: ?*mut fs_async.State, held: bool, signalGuards: ?*mut SignalGuard, nextSignalGuard: u32, diagnostics: Option<Mailbox> }
+pub struct Start { pub group: Group, pub id: u32, pub control: u32, pub metadata: List<u8>, name: [u8; 64] }
+struct SignalGuard { next: ?*mut SignalGuard, id: u32, watcher: Arc<vm_interrupt.Service>, slot: vm_interrupt.Slot }
+fn equal(a: &[u8], b: &[u8]) -> bool { if a.length != b.length { return false } let mut i: usize = 0 while i < a.length { if a[i] != b[i] { return false } i = i + 1 } return true }
+unsafe fn nonnull<T>(pointer: ?*mut T) -> *mut T { return unsafe transport.nonnull(pointer) }
+pub effect fn mainState(process: &Process, domain: Domain) -> *mut State ! OutOfMemoryError {
+  let group = run Group.make(process, domain)
+  let mut allocator = group.resources.clone()
+  let cancellation = run CancellableDomain.make(domain) |> Effect.provideMut<Allocator>(&mut allocator)
+  let thread = run transport.allocate<Thread>(&group.resources)
+  unsafe Pointer.put<Thread>(thread, Thread { next: Pointer.null<Thread>(), id: 0, parent: 0, wake: Option<Waker>.none(), cancellation: move cancellation, stopped: false, exitCode: 0, exited: false, online: true, onlinePending: false, exitPending: false, referenced: false, environment: Pointer.null<Environment>(), cpu: Cpu.empty(), stackSize: 0 })
+  let mut guard = group.registry.get().lock() let registry = guard.getMut() registry.threads = thread drop registry drop guard
+  return run makeState(move group, 0, 0, List<u8>.make())
+}
+pub effect fn makeState(group: Group, id: u32, control: u32, metadata: List<u8>) -> *mut State ! OutOfMemoryError {
+  let pointer = run transport.allocate<State>(&group.resources)
+  unsafe Pointer.put<State>(pointer, State { group: move group, id: id, control: control, metadata: move metadata, io: Pointer.null<fs_async.State>(), held: false, signalGuards: Pointer.null<SignalGuard>(), nextSignalGuard: 1, diagnostics: Option<Mailbox>.none() }) return pointer
+}
+/// The process resource accounting shared by every isolate of the group.
+pub unsafe fn groupResources(pointer: *mut State) -> resources.Resources {
+  let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer) return state.group.resources.clone()
+}
+pub unsafe fn domain(pointer: *mut State) -> Domain {
+  let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer) let guard = state.group.registry.get().lock()
+  let entry = unsafe Pointer.borrow<(), Thread>(&anchor, unsafe nonnull(unsafe transport.thread(guard.get(), state.id))) return entry.cancellation.handle()
+}
+// Called immediately after runtime storage is allocated, before realm/bootstrap.
+// The native thread reserves an additional 8 MiB for runtime/bootstrap frames,
+// exception reporting and teardown beyond this JavaScript stack boundary.
+pub unsafe fn configureRuntime(pointer: *mut State, rt: *mut HeapHeader) -> () {
+  let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer)
+  if state.id == 0 { return () }
+  let guard = state.group.registry.get().lock()
+  let entry = unsafe Pointer.borrow<(), Thread>(&anchor, unsafe nonnull(unsafe transport.thread(guard.get(), state.id)))
+  let size = entry.stackSize drop entry drop guard
+  unsafe runtime.setMaxStackSize(rt, size)
+}
+/// Connects the isolate to its runtime loop: messages and thread events for it wake `io`.
+pub unsafe effect fn attach(pointer: *mut State, io: *mut fs_async.State) -> () ! OutOfMemoryError {
+  let mut anchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer)
+  state.io = io
+  let guard = state.group.registry.get().lock() let mut threadAnchor = ()
+  let entry = unsafe Pointer.borrowMut<(), Thread>(&mut threadAnchor, unsafe nonnull(unsafe transport.thread(guard.get(), state.id))) entry.wake = Option<Waker>.some(unsafe fs_async.waker(io))
+  drop entry drop guard
+  state.diagnostics = Option<Mailbox>.some(run hub.attach(&state.group, state.id))
+}
+/// The isolate's diagnostics mailbox, from attach until shutdown.
+pub unsafe fn mailbox(pointer: *mut State) -> Option<Mailbox> {
+  let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer)
+  return state.diagnostics
+}
+/// Writes the fatal report for this isolate when enabled; the caller terminates.
+pub unsafe fn fatal(pointer: *mut State, location: &[u8], message: &[u8]) -> () {
+  let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer)
+  unsafe fatalReport.report(&state.group.reports, state.id, location, message)
+}
+/// napi_fatal_error's report; `state` is the calling isolate's worker state.
+pub export "C" fn silkNodeFatalReport(state: *mut u8, location: *const u8, locationLength: usize, message: *const u8, messageLength: usize) -> () {
+  let anchor = ()
+  let where = unsafe Pointer.borrowMany<(), u8>(&anchor, unsafe Pointer.assumeMany<u8>(location), locationLength)
+  let what = unsafe Pointer.borrowMany<(), u8>(&anchor, unsafe Pointer.assumeMany<u8>(message), messageLength)
+  unsafe fatal(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut State>(state), where, what)
+}
+/// The allocator under this isolate's runtime heap.
+pub unsafe fn reportingAllocator(pointer: *mut State) -> ReportingAllocator {
+  let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer)
+  return ReportingAllocator.make(state.group.reports.clone(), state.id)
+}
+pub unsafe effect fn vmWatchdog(pointer: *mut State) -> Arc<vm_interrupt.Service> ! OutOfMemoryError | vm_interrupt.StartError {
+  let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer)
+  let mut guard = state.group.registry.get().lock() let registry = guard.getMut()
+  if let Option<Arc<vm_interrupt.Service>>.Some { value } = &registry.vmWatchdog { return value.clone() }
+  let watcher = run vm_interrupt.make()
+  let mut allocator = state.group.resources.clone()
+  let owner = run Arc<vm_interrupt.Service>.make(move watcher) |> Effect.provideMut<Allocator>(&mut allocator)
+  registry.vmWatchdog = Option<Arc<vm_interrupt.Service>>.some(owner.clone())
+  return move owner
+}
+unsafe fn releaseSignalGuard(pointer: *mut SignalGuard) -> bool {
+  let mut anchor = () let guard = unsafe Pointer.borrowMut<(), SignalGuard>(&mut anchor, pointer)
+  unsafe vm_interrupt.unregister(guard.watcher.get(), Pointer.fromMutRef<vm_interrupt.Slot>(&mut guard.slot))
+  let pending = vm_interrupt.interrupted(&guard.slot) drop guard
+  let owned = unsafe Pointer.take<SignalGuard>(pointer) drop owned
+  unsafe resources.release(unsafe transport.raw(pointer))
+  return pending
+}
+unsafe fn clearSignalGuards(pointer: *mut State) -> () {
+  let mut anchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer)
+  let mut cursor = state.signalGuards state.signalGuards = Pointer.null<SignalGuard>() drop state
+  while !Pointer.isNull<SignalGuard>(cursor) {
+    let guard = unsafe Pointer.borrow<(), SignalGuard>(&anchor, unsafe nonnull(cursor))
+    let next = guard.next drop guard
+    let _ignored = unsafe releaseSignalGuard(unsafe nonnull(cursor)) cursor = next
+  }
+}
+// A REPL guard spans separate native calls around terminal raw-mode changes.
+// Unlike an ordinary VM slot, this registration must own stable native storage.
+unsafe effect fn startSignalGuard<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pointer: *mut State) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let acquired = run Effect.result(unsafe vmWatchdog(pointer))
+  let watcher = match move acquired {
+    Result<Arc<vm_interrupt.Service>, OutOfMemoryError | vm_interrupt.StartError>.Success { value } => move value
+    Result<Arc<vm_interrupt.Service>, OutOfMemoryError | vm_interrupt.StartError>.Failure { error } => match move error {
+      OutOfMemoryError {} => { fail OutOfMemoryError {} }
+      vm_interrupt.StartError { .. } => { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Internal, b"ERR_CANNOT_WATCH_SIGINT: Cannot watch for SIGINT signals") }
+    }
+  }
+  let mut anchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer)
+  let allocated = run transport.allocate<SignalGuard>(&state.group.resources)
+  let id = state.nextSignalGuard state.nextSignalGuard = u32.wrappingAdd(id, 1)
+  let next = state.signalGuards drop state
+  unsafe Pointer.put<SignalGuard>(allocated, SignalGuard { next: next, id: id, watcher: move watcher, slot: Slot.make() })
+  let guard = unsafe Pointer.borrowMut<(), SignalGuard>(&mut anchor, allocated)
+  let status = unsafe vm_interrupt.register(guard.watcher.get(), Pointer.fromMutRef<vm_interrupt.Slot>(&mut guard.slot))
+  drop guard
+  if status != 0 {
+    let owned = unsafe Pointer.take<SignalGuard>(allocated) drop owned
+    unsafe resources.release(unsafe transport.raw(allocated))
+    return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Internal, b"ERR_CANNOT_WATCH_SIGINT: Cannot watch for SIGINT signals")
+  }
+  let changed = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer) changed.signalGuards = allocated
+  return ValueBits.number(u32.toF64(id))
+}
+unsafe effect fn stopSignalGuard<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pointer: *mut State, id: u32) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut anchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer)
+  let mut link = Pointer.fromMutRef<?*mut SignalGuard>(&mut state.signalGuards) drop state
+  while !Pointer.isNull<SignalGuard>(unsafe Pointer.read<?*mut SignalGuard>(link)) {
+    let current = unsafe nonnull(unsafe Pointer.read<?*mut SignalGuard>(link))
+    let guard = unsafe Pointer.borrowMut<(), SignalGuard>(&mut anchor, current)
+    if guard.id == id {
+      unsafe Pointer.put<?*mut SignalGuard>(link, guard.next) drop guard
+      return ValueBits.Bool { value: unsafe releaseSignalGuard(current) }
+    }
+    link = Pointer.fromMutRef<?*mut SignalGuard>(&mut guard.next) drop guard
+  }
+  return run core.error(&mut engine, unsafe lendRealm(&context, context), b"Invalid SIGINT guard")
+}
+pub unsafe fn shouldInterrupt(optional: ?*mut State) -> bool {
+  if Pointer.isNull<State>(optional) { return false }
+  let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, unsafe nonnull(optional)) let guard = state.group.registry.get().lock()
+  let entry = unsafe Pointer.borrow<(), Thread>(&anchor, unsafe nonnull(unsafe transport.thread(guard.get(), state.id))) return entry.stopped
+}
+pub unsafe fn exitCode(pointer: *mut State, fallback: i32) -> i32 {
+  let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer) let guard = state.group.registry.get().lock()
+  let entry = unsafe Pointer.borrow<(), Thread>(&anchor, unsafe nonnull(unsafe transport.thread(guard.get(), state.id))) if entry.stopped { return entry.exitCode } return fallback
+}
+unsafe fn pending(registry: &Registry, id: u32) -> bool {
+  let anchor = () let mut cursor = registry.endpoints
+  while !Pointer.isNull<Endpoint>(cursor) { let entry = unsafe Pointer.borrow<(), Endpoint>(&anchor, unsafe nonnull(cursor)) if entry.owner == id && !entry.closed && entry.referenced { return true } cursor = entry.next }
+  let mut threads = registry.threads
+  while !Pointer.isNull<Thread>(threads) { let entry = unsafe Pointer.borrow<(), Thread>(&anchor, unsafe nonnull(threads)) if entry.id != id && entry.parent == id && entry.referenced && (!entry.exited || entry.exitPending) { return true } threads = entry.next }
+  return false
+}
+pub unsafe fn hasPending(pointer: *mut State) -> bool { let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer) let guard = state.group.registry.get().lock() return unsafe pending(guard.get(), state.id) }
+unsafe fn updateRef(pointer: *mut State) -> () {
+  let mut anchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut anchor, pointer) if Pointer.isNull<fs_async.State>(state.io) { return () }
+  let mut guard = state.group.registry.get().lock()
+  unsafe transport.reapAbandoned(guard.getMut())
+  let wanted = unsafe pending(guard.get(), state.id) drop guard
+  // While a message port or a child thread is referenced, the loop stays alive waiting for its wake.
+  if wanted && !state.held { unsafe fs_async.hold(unsafe nonnull(state.io)) state.held = true }
+  else if !wanted && state.held { unsafe fs_async.unhold(unsafe nonnull(state.io)) state.held = false }
+}
+pub unsafe fn shutdown(pointer: *mut State) -> () {
+  // Remove the mailbox before closing its wake handle or destroying any heap.
+  let mut detachAnchor = () let attached = unsafe Pointer.borrowMut<(), State>(&mut detachAnchor, pointer)
+  let mailbox = Intrinsic.replace(attached.diagnostics, Option<Mailbox>.none()) drop attached
+  if let Option<Mailbox>.Some { value } = mailbox { unsafe hub.detach(value) }
+  unsafe clearSignalGuards(pointer)
+  let mut stateAnchor = () let state = unsafe Pointer.borrowMut<(), State>(&mut stateAnchor, pointer)
+  let mut guard = state.group.registry.get().lock() let mut anchor = ()
+  let entry = unsafe Pointer.borrowMut<(), Thread>(&mut anchor, unsafe nonnull(unsafe transport.thread(guard.get(), state.id))) entry.wake = Option<Waker>.none() drop entry
+  unsafe locks.release(guard.getMut(), state.id, 0, true)
+  let mut cursor = guard.get().endpoints
+  while !Pointer.isNull<Endpoint>(cursor) { let endpoint = unsafe Pointer.borrow<(), Endpoint>(&anchor, unsafe nonnull(cursor)) let next = endpoint.next let owned = endpoint.owner == state.id let id = endpoint.id drop endpoint if owned { unsafe transport.closeEndpoint(guard.get(), unsafe nonnull(cursor)) unsafe transport.retireEndpoint(guard.getMut(), id) } cursor = next }
+  unsafe transport.reapAbandoned(guard.getMut())
+  let mut threads = guard.get().threads
+  while !Pointer.isNull<Thread>(threads) { let child = unsafe Pointer.borrowMut<(), Thread>(&mut anchor, unsafe nonnull(threads)) threads = child.next if child.id != state.id && child.parent == state.id && !child.exited { child.stopped = true child.exitCode = 1 child.cancellation.cancel() let id = child.id drop child unsafe transport.wake(guard.get(), id) } }
+  drop guard
+  if state.held { unsafe fs_async.unhold(unsafe nonnull(state.io)) state.held = false }
+  state.io = Pointer.null<fs_async.State>()
+}
+pub unsafe fn close(pointer: *mut State) -> () {
+  unsafe shutdown(pointer)
+  let state = unsafe Pointer.take<State>(pointer) drop state
+  unsafe resources.release(unsafe transport.raw(pointer))
+}
+pub unsafe fn finished(group: &Group, id: u32, code: i32) -> () {
+  let mut guard = group.registry.get().lock() let mut anchor = () let entry = unsafe Pointer.borrowMut<(), Thread>(&mut anchor, unsafe nonnull(unsafe transport.thread(guard.get(), id)))
+  unsafe entry.cpu.release()
+  entry.exited = true entry.exitPending = true entry.exitCode = code let parent = entry.parent drop entry
+  let parentPointer = unsafe transport.thread(guard.get(), parent) let mut abandoned = Pointer.isNull<Thread>(parentPointer)
+  if !abandoned { let owner = unsafe Pointer.borrow<(), Thread>(&anchor, unsafe nonnull(parentPointer)) abandoned = owner.exited }
+  if abandoned { unsafe transport.retireThread(guard.getMut(), id) } else { unsafe transport.wake(guard.get(), parent) }
+}
+export "C" fn silkNodeWorkerEntry(raw: ?*mut u8) -> ?*mut u8 {
+  let pointer = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Start>(unsafe nonnull(raw))
+  let packet = unsafe Pointer.take<Start>(pointer) unsafe resources.release(raw)
+  let _ignored = unsafe uv_thread_setname(Pointer.fromRef<u8>(&packet.name[0]))
+  let group = packet.group.clone() let id = packet.id
+  let cpu = unsafe Cpu.current()
+  let guard = group.registry.get().lock() let mut anchor = ()
+  let entry = unsafe Pointer.borrowMut<(), Thread>(&mut anchor, unsafe nonnull(unsafe transport.thread(guard.get(), id)))
+  entry.cpu = cpu drop entry drop guard
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let outcome = run Effect.result(worker.executeThread(move packet)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let code = match move outcome { Result<i32, OutOfMemoryError>.Success { value } => value _ => 1 }
+  unsafe finished(&group, id, code) group.resources.threadFinished() return Pointer.null<u8>()
+}
+// libuv truncates native names to the platform's byte limit. Preserve the full
+// JavaScript name in metadata; only this bounded, NUL-terminated copy crosses
+// the thread-start boundary. Neither a heap allocation nor full-string encoding
+// is needed, including for arbitrarily long user names.
+fn nativeThreadName(value: ValueBits) -> [u8; 64] {
+  let mut name: [u8; 64] = [0; 64]
+  let mut index: usize = 0 let mut written: usize = 0
+  while index < Strings.length(value) && written < 63 {
+    let mut point = Strings.codePoint(value, &mut index)
+    if point == 0 { break }
+    if point >= 0xd800 && point <= 0xdfff { point = 0xfffd }
+    let mut encoded: [u8; 6] = [0; 6]
+    let count = Utf8.encode(point, &mut encoded)
+    let mut i: usize = 0
+    while i < count && written < 63 {
+      name[written] = encoded[i] written = written + 1 i = i + 1
+    }
+  }
+  return name
+}
+unsafe effect fn spawn(state: &State, metadata: List<u8>, control: u32, stackSize: usize, name: [u8; 64]) -> u32 ! OutOfMemoryError {
+  let mut allocator = state.group.resources.clone()
+  let cancellation = run CancellableDomain.make(state.group.waiters.handle()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let packet = run transport.allocate<Start>(&state.group.resources)
+  let allocated = run Effect.result(transport.allocate<Thread>(&state.group.resources))
+  let node = match move allocated { Result<*mut Thread, OutOfMemoryError>.Success { value } => value Result<*mut Thread, OutOfMemoryError>.Failure { error } => { unsafe resources.release(unsafe transport.raw(packet)) fail move error } }
+  let mut guard = state.group.registry.get().lock() let registry = guard.getMut()
+  let controlPointer = unsafe transport.endpoint(&registry.*, control)
+  if Pointer.isNull<Endpoint>(controlPointer) { unsafe resources.release(unsafe transport.raw(packet)) unsafe resources.release(unsafe transport.raw(node)) fail OutOfMemoryError {} }
+  let mut anchor = () let endpoint = unsafe Pointer.borrowMut<(), Endpoint>(&mut anchor, unsafe nonnull(controlPointer))
+  if endpoint.owner != state.id || endpoint.closed { drop endpoint unsafe resources.release(unsafe transport.raw(packet)) unsafe resources.release(unsafe transport.raw(node)) fail OutOfMemoryError {} }
+  let id = registry.nextId registry.nextId = id + 1 endpoint.owner = id endpoint.started = false drop endpoint
+  let parent = unsafe Pointer.borrow<(), Thread>(&anchor, unsafe nonnull(unsafe transport.thread(&registry.*, state.id))) let environment = parent.environment drop parent
+  unsafe Pointer.put<Thread>(node, Thread { next: registry.threads, id: id, parent: state.id, wake: Option<Waker>.none(), cancellation: move cancellation, stopped: false, exitCode: 0, exited: false, online: false, onlinePending: false, exitPending: false, referenced: true, environment: environment, cpu: Cpu.empty(), stackSize: stackSize }) registry.threads = node drop guard
+  unsafe Pointer.put<Start>(packet, Start { group: state.group.clone(), id: id, control: control, metadata: move metadata, name: move name })
+  let mut attributes: [u64; 16] = [0; 16] let attr = unsafe Intrinsic.pointerReinterpret<*mut u64, *mut u8>(Pointer.fromMutRef<u64>(&mut attributes[0]))
+  let initialized = unsafe pthread_attr_init(attr) let mut status = initialized let mut thread: usize = 0
+  // Round up to a 64 KiB boundary (covers supported target page sizes), leaving
+  // the engine guard well above the OS guard page even on error/cleanup paths.
+  let nativeStack = (stackSize + 8 * 1024 * 1024 + 65535) / 65536 * 65536
+  if status == 0 { status = unsafe pthread_attr_setstacksize(attr, nativeStack) }
+  let mut detached: i32 = 1 static if Intrinsic.targetOperatingSystem() == "darwin" { detached = 2 }
+  if status == 0 { status = unsafe pthread_attr_setdetachstate(attr, detached) }
+  if status == 0 { state.group.resources.threadStarted() status = unsafe pthread_create(Pointer.fromMutRef<usize>(&mut thread), attr, silkNodeWorkerEntry, unsafe transport.raw(packet)) if status != 0 { state.group.resources.threadFinished() } }
+  if initialized == 0 { let _ignored = unsafe pthread_attr_destroy(attr) }
+  if status != 0 {
+    let owned = unsafe Pointer.take<Start>(packet) drop owned unsafe resources.release(unsafe transport.raw(packet))
+    let guard = state.group.registry.get().lock() unsafe transport.closeEndpoint(guard.get(), unsafe nonnull(unsafe transport.endpoint(guard.get(), control))) drop guard
+    unsafe finished(&state.group, id, 1) fail OutOfMemoryError {}
+  }
+  return id
+}
+
+fn number(value: ValueBits) -> u32 { if !value.isNumber() { return 0 } let n = value.numericValue() if n < 0.0 || n > 4294967295.0 || f64.trunc(n) != n { return 0 } return f64.toU32(n) }
+fn boolean(value: ValueBits) -> bool { return match value { ValueBits.Bool { value: flag } => flag _ => false } }
+unsafe effect fn length<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, array: ValueBits) -> u32 ! JsException ? &mut Allocator {
+  let value = run unsafe common.get(&mut engine, context, array, b"length") let count = number(value) unsafe owners.release(&mut engine, context, value) return count
+}
+unsafe effect fn copyWire<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, value: ValueBits, group: &Group) -> List<u8> ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut offset: u64 = 0 let mut count: u64 = 0 let mut object = value
+  if !unsafe buffers.isBuffer(value) {
+    if !value.isObject() { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"worker wire must be an ArrayBuffer view") }
+    let id = unsafe buffers.classId(value)
+    if id < classes.JS_CLASS_UINT8C_ARRAY || id > classes.JS_CLASS_DATAVIEW { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"worker wire must be an ArrayBuffer view") }
+    let view = unsafe buffers.view(core.reference(value)) object = ValueBits.Object { reference: view.buffer } offset = view.offset count = view.byteLength
+  }
+  let backing = run buffers.getArrayBuffer(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(object))
+  if unsafe buffers.isBuffer(value) { count = backing.byteLength }
+  if offset > backing.byteLength || count > backing.byteLength - offset { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"worker wire view is out of bounds") }
+  let mut allocator = group.resources.clone() let mut bytes = List<u8>.make() let mut index: u64 = 0
+  while index < count { run bytes.append(u64.toU8(unsafe buffers.loadScalar(backing, offset + index, 0))) |> Effect.provideMut<Allocator>(&mut allocator) index = index + 1 }
+  return move bytes
+}
+unsafe effect fn collectValues<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, array: ValueBits, values: &mut List<ValueBits>) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  let count = run unsafe length(&mut engine, context, array) let mut index: u32 = 0
+  while index < count {
+    let value = run unsafe owners.getIndex(&mut engine, context, array, index)
+    let added = run Effect.result(values.append(value))
+    match move added { Result<(), OutOfMemoryError>.Failure { error } => { unsafe owners.release(&mut engine, context, value) fail move error } _ => () }
+    index = index + 1
+  }
+}
+unsafe effect fn sharedEntry<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, object: *mut HeapHeader) -> Shared ! OutOfMemoryError | JsException ? &mut Allocator {
+  if unsafe buffers.hasNativeSharedBacking(object) {
+    return Shared.Native { lease: run unsafe buffers.leaseBacking(object) }
+  }
+  if unsafe buffers.hasBorrowedSharedBacking(object) {
+    return run core.error(&mut engine, unsafe lendRealm(&context, context), b"SharedArrayBuffer backing has no independent owner")
+  }
+  let backing = unsafe buffers.snapshot(object)
+  unsafe shared.duplicateShared(backing.data)
+  return Shared.Host { data: backing.data, length: backing.byteLength, capacity: backing.physicalCapacity }
+}
+unsafe effect fn preparePost<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, args: &owners.Scope, values: &mut List<ValueBits>, sharedValues: &mut List<ValueBits>) -> Message ! OutOfMemoryError | JsException ? &mut Allocator {
+  let bytes = run unsafe copyWire(&mut engine, context, args.values[1], &state.group)
+  run unsafe collectValues(&mut engine, context, args.values[2], &mut values)
+  run unsafe collectValues(&mut engine, context, args.values[3], &mut sharedValues)
+  let mut allocator = state.group.resources.clone()
+  let mut message = Message { next: Pointer.null<Message>(), bytes: move bytes, buffers: List<buffers.BufferTransfer>.make(), shared: List<Shared>.make(), ports: List<u32>.make() }
+  let count = run unsafe length(&mut engine, context, args.values[4]) let mut index: u32 = 0
+  while index < count { let value = run unsafe owners.getIndex(&mut engine, context, args.values[4], index) let id = number(value) unsafe owners.release(&mut engine, context, value) run message.ports.append(id) |> Effect.provideMut<Allocator>(&mut allocator) index = index + 1 }
+  let mut at: usize = 0
+  while at < values.length() {
+    let value = values.get(at)
+    let object = (run buffers.requireBuffer(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(value), 0)).header()
+    if !unsafe buffers.canTransfer(object) { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"ArrayBuffer is detached or not transferable") }
+    let mut earlier: usize = 0 while earlier < at { if Pointer.address(core.reference(values.get(earlier))) == Pointer.address(object) { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"duplicate ArrayBuffer in transfer list") } earlier = earlier + 1 }
+    at = at + 1
+  }
+  at = 0
+  while at < sharedValues.length() {
+    let object = (run buffers.requireBuffer(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(sharedValues.get(at)), 1)).header()
+    let entry = run unsafe sharedEntry(&mut engine, context, object)
+    run message.shared.append(move entry) |> Effect.provideMut<Allocator>(&mut allocator)
+    at = at + 1
+  }
+  at = 0
+  while at < values.length() { let lease = run unsafe buffers.prepareTransfer(core.reference(values.get(at))) run message.buffers.append(move lease) |> Effect.provideMut<Allocator>(&mut allocator) at = at + 1 }
+  return move message
+}
+unsafe effect fn commitPost<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, id: u32, message: Message, values: &List<ValueBits>) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let pointer = run transport.allocate<Message>(&state.group.resources)
+  let guard = state.group.registry.get().lock() let registry = guard.get()
+  let sourcePointer = unsafe transport.endpoint(registry, id)
+  let mut valid = !Pointer.isNull<Endpoint>(sourcePointer) let anchor = () let mut destination = Pointer.null<Endpoint>()
+  if valid { let source = unsafe Pointer.borrow<(), Endpoint>(&anchor, unsafe nonnull(sourcePointer)) valid = source.owner == state.id && !source.closed destination = unsafe transport.endpoint(registry, source.peer) }
+  let mut index: usize = 0
+  while valid && index < message.ports.length() {
+    let port = message.ports.get(index) let endpoint = unsafe transport.endpoint(registry, port)
+    valid = port != id && !Pointer.isNull<Endpoint>(endpoint)
+    if valid { let entry = unsafe Pointer.borrow<(), Endpoint>(&anchor, unsafe nonnull(endpoint)) valid = entry.owner == state.id && !entry.closed && !entry.broadcast }
+    let mut earlier: usize = 0 while valid && earlier < index { if message.ports.get(earlier) == port { valid = false } earlier = earlier + 1 }
+    index = index + 1
+  }
+  if !valid { drop guard unsafe resources.release(unsafe transport.raw(pointer)) return run core.error(&mut engine, unsafe lendRealm(&context, context), b"MessagePort is closed, transferred, or duplicated in transfer list") }
+  index = 0 while index < values.length() { unsafe buffers.detach(&mut engine, unsafe runtime.contextRuntime(context), values.get(index)) index = index + 1 }
+  let mut mutable = () index = 0
+  while index < message.ports.length() { let entry = unsafe Pointer.borrowMut<(), Endpoint>(&mut mutable, unsafe nonnull(unsafe transport.endpoint(registry, message.ports.get(index)))) entry.owner = 4294967295 entry.started = false index = index + 1 }
+  unsafe Pointer.put<Message>(pointer, move message)
+  let mut deliver = !Pointer.isNull<Endpoint>(destination)
+  if deliver { let target = unsafe Pointer.borrow<(), Endpoint>(&anchor, unsafe nonnull(destination)) deliver = !target.closed }
+  if deliver { unsafe transport.enqueue(registry, unsafe nonnull(destination), pointer) }
+  else {
+    let envelope = unsafe Pointer.borrow<(), Message>(&anchor, pointer) index = 0
+    while index < envelope.ports.length() { let port = unsafe transport.endpoint(registry, envelope.ports.get(index)) unsafe transport.closeEndpoint(registry, unsafe nonnull(port)) index = index + 1 }
+    drop envelope unsafe transport.freeMessage(pointer)
+  }
+  return ValueBits.Undefined
+}
+unsafe effect fn post<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, args: &owners.Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut values = List<ValueBits>.make() let mut sharedValues = List<ValueBits>.make()
+  let prepared = run Effect.result(unsafe preparePost(&mut engine, context, state, args, &mut values, &mut sharedValues))
+  let result = match move prepared { Result<Message, OutOfMemoryError | JsException>.Success { value } => run Effect.result(unsafe commitPost(&mut engine, context, state, number(args.values[0]), move value, &values)) Result<Message, OutOfMemoryError | JsException>.Failure { error } => Result<ValueBits, OutOfMemoryError | JsException>.Failure { error: move error } }
+  let mut index: usize = 0 while index < values.length() { unsafe owners.release(&mut engine, context, values.get(index)) index = index + 1 }
+  index = 0 while index < sharedValues.length() { unsafe owners.release(&mut engine, context, sharedValues.get(index)) index = index + 1 }
+  return match move result { Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
+}
+
+unsafe effect fn envelopeInto<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, message: &Message, scope: &mut owners.Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let memory = engine.memory scope.values[0] = run objects.object(&mut engine, memory, unsafe lendRealm(&context, context))
+  let mut data: ?*const u8 = Pointer.null<u8>() if message.bytes.length() != 0 { data = Pointer.fromRef<u8>(&message.bytes.asSlice()[0]) }
+  let bytes = run unsafe buffers.newArrayBufferCopy(&mut engine, memory, unsafe lendRealm(&context, context), data, usize.toU64(message.bytes.length()))
+  run unsafe common.define(&mut engine, context, scope.values[0], b"bytes", bytes, 7)
+  scope.values[1] = run unsafe common.array(&mut engine, memory, context)
+  scope.values[2] = run unsafe common.array(&mut engine, memory, context)
+  scope.values[3] = run unsafe common.array(&mut engine, memory, context)
+  let mut index: usize = 0
+  while index < message.buffers.length() {
+    let buffer = run unsafe buffers.newArrayBufferFromTransfer(&mut engine, memory, unsafe lendRealm(&context, context), &message.buffers.asSlice()[index])
+    run unsafe common.defineIndex(&mut engine, context, scope.values[1], usize.toU32(index), buffer) index = index + 1
+  }
+  index = 0 while index < message.shared.length() {
+    let entry = &message.shared.asSlice()[index]
+    let buffer = match &entry.* {
+      Shared.Native { lease } => run buffers.newSharedFromLease(&mut engine, memory, unsafe lendRealm(&context, context), &lease)
+      Shared.Host { data: sharedData, length, capacity } => {
+        let value = run unsafe buffers.newArrayBuffer(&mut engine, memory, unsafe lendRealm(&context, context), sharedData, length, Option<NativeFunctionId>.none(), Pointer.null<u8>(), true)
+        if capacity != 0 { unsafe buffers.setSharedPhysicalCapacity(core.reference(value), capacity) }
+        value
+      }
+    }
+    run unsafe common.defineIndex(&mut engine, context, scope.values[2], usize.toU32(index), buffer) index = index + 1
+  }
+  index = 0 while index < message.ports.length() { run unsafe common.defineIndex(&mut engine, context, scope.values[3], usize.toU32(index), ValueBits.number(u32.toF64(message.ports.get(index)))) index = index + 1 }
+  run unsafe common.define(&mut engine, context, scope.values[0], b"buffers", scope.take(1), 7)
+  run unsafe common.define(&mut engine, context, scope.values[0], b"shared", scope.take(2), 7)
+  run unsafe common.define(&mut engine, context, scope.values[0], b"ports", scope.take(3), 7)
+  return scope.take(0)
+}
+unsafe effect fn receive<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, id: u32) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let guard = state.group.registry.get().lock() let registry = guard.get() let pointer = unsafe transport.endpoint(registry, id)
+  let mut valid = !Pointer.isNull<Endpoint>(pointer) let anchor = ()
+  if !valid { return ValueBits.Null }
+  if valid { let port = unsafe Pointer.borrow<(), Endpoint>(&anchor, unsafe nonnull(pointer)) valid = port.owner == state.id if valid && port.closed { return ValueBits.Null } }
+  if !valid { drop guard return run core.error(&mut engine, unsafe lendRealm(&context, context), b"MessagePort is closed or transferred") }
+  let optional = unsafe transport.dequeue(unsafe nonnull(pointer))
+  if Pointer.isNull<Message>(optional) { return ValueBits.Null }
+  let messagePointer = unsafe nonnull(optional) let message = unsafe Pointer.borrow<(), Message>(&anchor, messagePointer)
+  let mut mutable = () let mut index: usize = 0
+  while index < message.ports.length() { let port = unsafe Pointer.borrowMut<(), Endpoint>(&mut mutable, unsafe nonnull(unsafe transport.endpoint(registry, message.ports.get(index)))) port.owner = state.id index = index + 1 }
+  drop guard
+  let mut scope = Scope.make() let result = run Effect.result(unsafe envelopeInto(&mut engine, context, &message, &mut scope))
+  let failed = match &result { Result<ValueBits, OutOfMemoryError | JsException>.Failure { .. } => true _ => false }
+  if failed { let guard = state.group.registry.get().lock() index = 0 while index < message.ports.length() { unsafe transport.closeEndpoint(guard.get(), unsafe nonnull(unsafe transport.endpoint(guard.get(), message.ports.get(index)))) index = index + 1 } }
+  drop message unsafe transport.freeMessage(messagePointer) unsafe owners.cleanup(&mut engine, context, move scope)
+  return match move result { Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
+}
+unsafe effect fn event<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, kind: &[u8], key: &[u8], id: u32) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let memory = engine.memory let value = run objects.object(&mut engine, memory, unsafe lendRealm(&context, context))
+  let built = run Effect.result(unsafe eventProperties(&mut engine, context, value, kind, key, id))
+  match move built { Result<(), OutOfMemoryError | JsException>.Success { .. } => { return value } Result<(), OutOfMemoryError | JsException>.Failure { error } => { unsafe owners.release(&mut engine, context, value) fail move error } }
+}
+unsafe effect fn eventProperties<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, value: ValueBits, kind: &[u8], key: &[u8], id: u32) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  let name = run unsafe host.string(&mut engine, context, kind)
+  run unsafe common.define(&mut engine, context, value, b"type", name, 7)
+  run unsafe common.define(&mut engine, context, value, key, ValueBits.number(u32.toF64(id)), 7)
+}
+unsafe effect fn pollInto<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, scope: &mut owners.Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let memory = engine.memory scope.values[0] = run unsafe common.array(&mut engine, memory, context) let mut index: u32 = 0
+  while true {
+    let guard = state.group.registry.get().lock() let registry = guard.get()
+    let mut cursor = registry.endpoints let mut kind: u32 = 0 let mut id: u32 = 0 let mut code: i32 = 0 let mut initFailed = false let mut anchor = ()
+    let mut online = registry.threads
+    while !Pointer.isNull<Thread>(online) {
+      let child = unsafe Pointer.borrowMut<(), Thread>(&mut anchor, unsafe nonnull(online)) online = child.next
+      if child.id != state.id && child.parent == state.id && child.onlinePending { child.onlinePending = false kind = 3 id = child.id break }
+    }
+    while kind == 0 && !Pointer.isNull<Endpoint>(cursor) {
+      let port = unsafe Pointer.borrowMut<(), Endpoint>(&mut anchor, unsafe nonnull(cursor)) cursor = port.next
+      if port.owner == state.id {
+        if !port.closed && port.started && !Pointer.isNull<Message>(port.first) { kind = 1 if port.routed { kind = 5 } id = port.id break }
+        if port.closePending && Pointer.isNull<Message>(port.first) { port.closePending = false port.closed = true port.started = false kind = 2 id = port.id break }
+      }
+    }
+    if kind == 0 {
+      let mut requests = registry.locks
+      while !Pointer.isNull<LockRequest>(requests) {
+        let request = unsafe Pointer.borrowMut<(), LockRequest>(&mut anchor, unsafe nonnull(requests)) requests = request.next
+        if request.owner == state.id && request.notify { request.notify = false kind = 6 id = request.id code = u32.toI32(request.status) break }
+      }
+    }
+    if kind == 0 {
+      let mut threads = registry.threads
+      while !Pointer.isNull<Thread>(threads) { let child = unsafe Pointer.borrowMut<(), Thread>(&mut anchor, unsafe nonnull(threads)) threads = child.next
+        if child.id != state.id && child.parent == state.id {
+          if child.exitPending { child.exitPending = false kind = 4 id = child.id code = child.exitCode initFailed = code != 0 && !child.online && !child.stopped break }
+        }
+      }
+    }
+    drop guard if kind == 0 { break }
+    let mut name: &[u8] = b"message" let mut key: &[u8] = b"port"
+    if kind == 2 { name = b"close" } else if kind == 3 { name = b"online" key = b"worker" } else if kind == 4 { name = b"exit" key = b"worker" }
+    if kind == 5 { name = b"threadMessage" } else if kind == 6 { name = b"lock" key = b"request" }
+    scope.values[1] = run unsafe event(&mut engine, context, name, key, id)
+    if kind == 1 || kind == 5 { let envelope = run unsafe receive(&mut engine, context, state, id) run unsafe common.define(&mut engine, context, scope.values[1], b"envelope", envelope, 7) }
+    if kind == 6 { run unsafe common.define(&mut engine, context, scope.values[1], b"status", ValueBits.Int { value: code }, 7) }
+    if kind == 4 {
+      run unsafe common.define(&mut engine, context, scope.values[1], b"code", ValueBits.Int { value: code }, 7)
+      run unsafe common.define(&mut engine, context, scope.values[1], b"initFailed", ValueBits.Bool { value: initFailed }, 7)
+    }
+    run unsafe common.defineIndex(&mut engine, context, scope.values[0], index, scope.take(1)) index = index + 1
+    if kind == 2 || kind == 4 {
+      let mut guard = state.group.registry.get().lock()
+      if kind == 2 { unsafe transport.retireEndpoint(guard.getMut(), id) }
+      else { unsafe transport.retireThread(guard.getMut(), id) }
+    }
+    // One event per call prevents user callbacks from invalidating an envelope
+    // eagerly dequeued for a later callback in the same batch.
+    break
+  }
+  return scope.take(0)
+}
+unsafe effect fn channel<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let first = run transport.allocate<Endpoint>(&state.group.resources)
+  let allocated = run Effect.result(transport.allocate<Endpoint>(&state.group.resources))
+  let second = match move allocated { Result<*mut Endpoint, OutOfMemoryError>.Success { value } => value Result<*mut Endpoint, OutOfMemoryError>.Failure { error } => { unsafe resources.release(unsafe transport.raw(first)) fail move error } }
+  let mut guard = state.group.registry.get().lock() let registry = guard.getMut()
+  let a = unsafe transport.newEndpoint(&mut registry, first, state.id, 0, List<u8>.make(), false)
+  let b = unsafe transport.newEndpoint(&mut registry, second, state.id, a, List<u8>.make(), false)
+  let mut anchor = () let port = unsafe Pointer.borrowMut<(), Endpoint>(&mut anchor, first) port.peer = b drop port drop guard
+  let memory = engine.memory let result = run unsafe common.array(&mut engine, memory, context)
+  let built = run Effect.result(unsafe channelItems(&mut engine, context, result, a, b))
+  match move built { Result<(), JsException>.Success { .. } => { return result } Result<(), JsException>.Failure { error } => { unsafe owners.release(&mut engine, context, result) fail move error } }
+}
+unsafe effect fn channelItems<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, result: ValueBits, a: u32, b: u32) -> () ! JsException ? &mut Allocator {
+  run unsafe common.defineIndex(&mut engine, context, result, 0, ValueBits.number(u32.toF64(a))) run unsafe common.defineIndex(&mut engine, context, result, 1, ValueBits.number(u32.toF64(b)))
+}
+
+// A one-shot native channel routes directly to any live isolate in the group.
+// Its receiving endpoint is hidden from user ports, unreferenced, and retired
+// after the sender closes and the queued packet has been consumed.
+unsafe effect fn routeChannel<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, target: ValueBits) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  if !target.isNumber() { return ValueBits.Null }
+  let numeric = target.numericValue()
+  if !f64.isFinite(numeric) || numeric < 0.0 || numeric > 4294967295.0 || f64.trunc(numeric) != numeric { return ValueBits.Null }
+  let id = number(target)
+  let first = run transport.allocate<Endpoint>(&state.group.resources)
+  let allocated = run Effect.result(transport.allocate<Endpoint>(&state.group.resources))
+  let second = match move allocated { Result<*mut Endpoint, OutOfMemoryError>.Success { value } => value Result<*mut Endpoint, OutOfMemoryError>.Failure { error } => { unsafe resources.release(unsafe transport.raw(first)) fail move error } }
+  let mut guard = state.group.registry.get().lock()
+  let optional = unsafe transport.thread(guard.get(), id) let mut valid = !Pointer.isNull<Thread>(optional) let mut anchor = ()
+  if valid { let target = unsafe Pointer.borrow<(), Thread>(&anchor, unsafe nonnull(optional)) valid = !target.stopped && !target.exited }
+  if !valid { drop guard unsafe resources.release(unsafe transport.raw(first)) unsafe resources.release(unsafe transport.raw(second)) return ValueBits.Null }
+  let registry = guard.getMut()
+  let a = unsafe transport.newEndpoint(&mut registry, first, state.id, 0, List<u8>.make(), false)
+  let b = unsafe transport.newEndpoint(&mut registry, second, id, a, List<u8>.make(), false)
+  let source = unsafe Pointer.borrowMut<(), Endpoint>(&mut anchor, first) source.peer = b source.referenced = false source.routed = true drop source
+  let destination = unsafe Pointer.borrowMut<(), Endpoint>(&mut anchor, second) destination.started = true destination.referenced = false destination.routed = true
+  return ValueBits.number(u32.toF64(a))
+}
+
+@foreign(noCapture: .("name"))
+unsafe extern "C" fn getenv(name: *const u8) -> ?*mut u8
+@foreign(noCapture: .("name", "value"))
+unsafe extern "C" fn setenv(name: *const u8, value: *const u8, overwrite: i32) -> i32
+@foreign(noCapture: .("name"))
+unsafe extern "C" fn unsetenv(name: *const u8) -> i32
+unsafe extern "C" fn _NSGetEnviron() -> *mut ?*mut ?*mut u8
+unsafe extern "C" static environ: ?*mut ?*mut u8
+fn cloneReportString(value: &Option<Arc<List<u8>>>) -> Option<Arc<List<u8>>> {
+  return match &value.* { Option<Arc<List<u8>>>.Some { value: stored } => Option<Arc<List<u8>>>.some(stored.clone()) _ => Option<Arc<List<u8>>>.none() }
+}
+effect fn ownedReportString(value: ValueBits) -> Arc<List<u8>> ! OutOfMemoryError ? &mut Allocator {
+  let mut bytes = List<u8>.make() let mut iterator = RopeIterator.make(&value) let mut pending = iterator.next()
+  // Node's process-wide report paths cross a UTF-8, NUL-terminated native API.
+  while true {
+    match move pending {
+      Option<u16>.None => { break }
+      Option<u16>.Some { value: unit } => {
+        let mut point = u16.toU32(unit)
+        if point == 0 { break }
+        pending = iterator.next()
+        if point >= 0xd800 && point <= 0xdbff {
+          match &pending {
+            Option<u16>.Some { value: low } => {
+              if low >= 0xdc00 && low <= 0xdfff {
+                point = 65536 + (point - 0xd800) * 1024 + u16.toU32(low) - 0xdc00
+                pending = iterator.next()
+              }
+            }
+            _ => ()
+          }
+        }
+        if point >= 0xd800 && point <= 0xdfff { point = 0xfffd }
+        let mut encoded: [u8; 6] = [0; 6] let count = Utf8.encode(point, &mut encoded) let mut index: usize = 0
+        while index < count { run bytes.append(encoded[index]) index = index + 1 }
+      }
+    }
+  }
+  return run Arc<List<u8>>.make(move bytes)
+}
+unsafe effect fn reportSetting<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, field: u32, setting: bool, args: &owners.Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  if field > 3 { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"Unknown shared report setting") }
+  let value = args.values[1]
+  let settings = &state.group.reports
+  if field == 3 {
+    if setting { settings.setFatal(boolean(value)) return ValueBits.Undefined }
+    return ValueBits.Bool { value: settings.fatal() }
+  }
+  if field == 2 {
+    let mut guard = settings.reports.get().lock() let reports = guard.getMut()
+    if setting { reports.compact = boolean(value) return ValueBits.Undefined }
+    return ValueBits.Bool { value: reports.compact }
+  }
+  if setting {
+    if !value.isString() { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"Report path must be a string") }
+    let mut allocator = state.group.resources.clone()
+    let stored = run ownedReportString(value) |> Effect.provideMut<Allocator>(&mut allocator)
+    let mut guard = settings.reports.get().lock() let reports = guard.getMut()
+    let previous = if field == 0 { Intrinsic.replace(reports.directory, Option<Arc<List<u8>>>.some(move stored)) } else { Intrinsic.replace(reports.filename, Option<Arc<List<u8>>>.some(move stored)) }
+    drop guard
+    drop previous
+    return ValueBits.Undefined
+  }
+  let guard = settings.reports.get().lock()
+  let mut stored = Option<Arc<List<u8>>>.none()
+  if field == 0 { stored = cloneReportString(&guard.get().directory) }
+  else { stored = cloneReportString(&guard.get().filename) }
+  drop guard
+  // Keep immutable path storage alive without allocating JS while locked.
+  return match move stored {
+    Option<Arc<List<u8>>>.Some { value: storedPath } => run unsafe host.string(&mut engine, context, storedPath.get().asSlice())
+    _ => run unsafe host.string(&mut engine, context, b"")
+  }
+}
+unsafe fn byte(pointer: *mut u8, index: usize) -> u8 { return unsafe Pointer.read<u8>(unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(pointer), index)) }
+unsafe effect fn environment<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, op: &[u8], args: &owners.Scope, scope: &mut owners.Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut name = List<u8>.make() let mut value = List<u8>.make()
+  if !equal(op, b"envKeys") { name = run unsafe host.text(&mut engine, context, args.values[0]) run name.append(0) }
+  if equal(op, b"envSet") { value = run unsafe host.text(&mut engine, context, args.values[1]) run value.append(0) }
+  let guard = state.group.registry.get().lock()
+  let anchor = () let thread = unsafe Pointer.borrow<(), Thread>(&anchor, unsafe nonnull(unsafe transport.thread(guard.get(), state.id)))
+  let private = thread.environment drop thread
+  if !Pointer.isNull<Environment>(private) {
+    drop guard return run unsafe privateEnvironment(&mut engine, context, state, unsafe nonnull(private), op, move name, move value, &mut scope)
+  }
+  if equal(op, b"envSet") { let status = unsafe setenv(Pointer.fromRef(&name.asSlice()[0]), Pointer.fromRef(&value.asSlice()[0]), 1) drop guard if status != 0 { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"cannot set environment variable") } return ValueBits.Undefined }
+  if equal(op, b"envDelete") { let status = unsafe unsetenv(Pointer.fromRef(&name.asSlice()[0])) drop guard if status != 0 { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"cannot delete environment variable") } return ValueBits.Bool { value: true } }
+  if equal(op, b"envGet") {
+    let pointer = unsafe getenv(Pointer.fromRef(&name.asSlice()[0])) if Pointer.isNull<u8>(pointer) { return ValueBits.Undefined }
+    let mut index: usize = 0 while unsafe byte(unsafe nonnull(pointer), index) != 0 { run value.append(unsafe byte(unsafe nonnull(pointer), index)) index = index + 1 } drop guard
+    return run unsafe host.string(&mut engine, context, value.asSlice())
+  }
+  let mut names = List<List<u8>>.make()
+  let mut entries = Pointer.null<?*mut u8>()
+  static if Intrinsic.targetOperatingSystem() == "darwin" { entries = unsafe Pointer.read<?*mut ?*mut u8>(unsafe _NSGetEnviron()) }
+  else { unsafe { entries = environ } }
+  if !Pointer.isNull<?*mut u8>(entries) {
+    let mut index: usize = 0
+    while true {
+      let pointer = unsafe Pointer.read<?*mut u8>(unsafe Pointer.atMut<?*mut u8>(unsafe Pointer.assumeManyMut<?*mut u8>(unsafe nonnull(entries)), index))
+      if Pointer.isNull<u8>(pointer) { break }
+      let mut key = List<u8>.make() let mut at: usize = 0
+      while unsafe byte(unsafe nonnull(pointer), at) != 0 && unsafe byte(unsafe nonnull(pointer), at) != 61 { run key.append(unsafe byte(unsafe nonnull(pointer), at)) at = at + 1 }
+      run names.append(move key) index = index + 1
+    }
+  }
+  drop guard let memory = engine.memory scope.values[0] = run unsafe common.array(&mut engine, memory, context)
+  let mut index: usize = 0 while index < names.length() { let name = run unsafe host.string(&mut engine, context, names.asSlice()[index].asSlice()) run unsafe common.defineIndex(&mut engine, context, scope.values[0], usize.toU32(index), name) index = index + 1 }
+  return scope.take(0)
+}
+unsafe effect fn initializeEnvironment<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, args: &owners.Scope, scope: &mut owners.Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  if state.id == 0 { return ValueBits.Undefined }
+  // spawn retained the immediate parent's environment identity before its
+  // runtime could retire; SHARE_ENV keeps that owner rather than the main env.
+  if boolean(args.values[1]) { return ValueBits.Undefined }
+  let mut variables = List<Variable>.make() let mut allocator = state.group.resources.clone()
+  let count = run unsafe length(&mut engine, context, args.values[0]) let mut index: u32 = 0
+  while index < count {
+    scope.values[0] = run unsafe owners.getIndex(&mut engine, context, args.values[0], index)
+    scope.values[1] = run unsafe owners.getIndex(&mut engine, context, scope.values[0], 0)
+    scope.values[2] = run unsafe owners.getIndex(&mut engine, context, scope.values[0], 1)
+    let mut name = run unsafe host.text(&mut engine, context, scope.values[1]) |> Effect.provideMut<Allocator>(&mut allocator)
+    let mut value = run unsafe host.text(&mut engine, context, scope.values[2]) |> Effect.provideMut<Allocator>(&mut allocator)
+    run name.append(0) |> Effect.provideMut<Allocator>(&mut allocator) run value.append(0) |> Effect.provideMut<Allocator>(&mut allocator)
+    run variables.append(Variable { name: move name, value: move value, active: true }) |> Effect.provideMut<Allocator>(&mut allocator)
+    unsafe owners.release(&mut engine, context, scope.take(0)) unsafe owners.release(&mut engine, context, scope.take(1)) unsafe owners.release(&mut engine, context, scope.take(2))
+    index = index + 1
+  }
+  let pointer = run transport.allocate<Environment>(&state.group.resources)
+  let mut guard = state.group.registry.get().lock() let registry = guard.getMut()
+  unsafe Pointer.put<Environment>(pointer, Environment { next: registry.environments, variables: move variables }) registry.environments = pointer
+  let mut anchor = () let child = unsafe Pointer.borrowMut<(), Thread>(&mut anchor, unsafe nonnull(unsafe transport.thread(&registry.*, state.id))) child.environment = pointer
+  return ValueBits.Undefined
+}
+unsafe effect fn privateEnvironment<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, pointer: *mut Environment, op: &[u8], name: List<u8>, value: List<u8>, scope: &mut owners.Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let guard = state.group.registry.get().lock() let mut anchor = ()
+  let environment = unsafe Pointer.borrowMut<(), Environment>(&mut anchor, pointer)
+  let mut found = environment.variables.length() let mut index: usize = 0
+  while index < environment.variables.length() { if equal(environment.variables.asSlice()[index].name.asSlice(), name.asSlice()) { found = index break } index = index + 1 }
+  if equal(op, b"envSet") {
+    let variable = Variable { name: move name, value: move value, active: true }
+    if found < environment.variables.length() { let entries = environment.variables.asMutSlice() entries[found] = move variable }
+    else { let mut allocator = state.group.resources.clone() run environment.variables.append(move variable) |> Effect.provideMut<Allocator>(&mut allocator) }
+    return ValueBits.Undefined
+  }
+  if equal(op, b"envDelete") {
+    if found < environment.variables.length() { let entries = environment.variables.asMutSlice() entries[found].active = false entries[found].value = List<u8>.make() }
+    return ValueBits.Bool { value: true }
+  }
+  if equal(op, b"envGet") {
+    if found == environment.variables.length() || !environment.variables.asSlice()[found].active { return ValueBits.Undefined }
+    let source = environment.variables.asSlice()[found].value.asSlice() let mut output = List<u8>.make() index = 0
+    while index + 1 < source.length { run output.append(source[index]) index = index + 1 }
+    drop environment drop guard return run unsafe host.string(&mut engine, context, output.asSlice())
+  }
+  let mut names = List<List<u8>>.make() index = 0
+  while index < environment.variables.length() {
+    let variable = &environment.variables.asSlice()[index]
+    if variable.active { let mut key = List<u8>.make() let mut at: usize = 0 while at + 1 < variable.name.length() { run key.append(variable.name.get(at)) at = at + 1 } run names.append(move key) }
+    index = index + 1
+  }
+  drop environment drop guard let memory = engine.memory scope.values[0] = run unsafe common.array(&mut engine, memory, context)
+  index = 0 while index < names.length() { let key = run unsafe host.string(&mut engine, context, names.asSlice()[index].asSlice()) run unsafe common.defineIndex(&mut engine, context, scope.values[0], usize.toU32(index), key) index = index + 1 }
+  return scope.take(0)
+}
+unsafe effect fn broadcast<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, args: &owners.Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let bytes = run unsafe copyWire(&mut engine, context, args.values[1], &state.group)
+  let mut values = List<ValueBits>.make()
+  let collected = run Effect.result(unsafe collectValues(&mut engine, context, args.values[2], &mut values))
+  let result = match move collected {
+    Result<(), OutOfMemoryError | JsException>.Success { .. } => {
+      let sharedCount = values.length()
+      let copied = run Effect.result(unsafe collectValues(&mut engine, context, args.values[3], &mut values))
+      match move copied {
+        Result<(), OutOfMemoryError | JsException>.Success { .. } => run Effect.result(unsafe broadcastPrepared(&mut engine, context, state, number(args.values[0]), &bytes, &values, sharedCount))
+        Result<(), OutOfMemoryError | JsException>.Failure { error } => Result<ValueBits, OutOfMemoryError | JsException>.Failure { error: move error }
+      }
+    }
+    Result<(), OutOfMemoryError | JsException>.Failure { error } => Result<ValueBits, OutOfMemoryError | JsException>.Failure { error: move error }
+  }
+  let mut index: usize = 0 while index < values.length() { unsafe owners.release(&mut engine, context, values.get(index)) index = index + 1 }
+  return match move result { Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
+}
+unsafe effect fn broadcastPrepared<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: &State, id: u32, bytes: &List<u8>, values: &List<ValueBits>, sharedCount: usize) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut allocator = state.group.resources.clone() let mut sharedValues = List<Shared>.make() let mut index: usize = 0
+  while index < sharedCount {
+    let object = (run buffers.requireBuffer(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(values.get(index)), 1)).header()
+    let entry = run unsafe sharedEntry(&mut engine, context, object)
+    run sharedValues.append(move entry) |> Effect.provideMut<Allocator>(&mut allocator) index = index + 1
+  }
+  let mut copies = List<buffers.BufferTransfer>.make()
+  while index < values.length() {
+    let object = (run buffers.requireBuffer(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(values.get(index)), 0)).header()
+    if !unsafe buffers.canTransfer(object) { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"Invalid broadcast buffer snapshot") }
+    let copy = run unsafe buffers.prepareTransfer(object)
+    run copies.append(move copy) |> Effect.provideMut<Allocator>(&mut allocator)
+    index = index + 1
+  }
+  let guard = state.group.registry.get().lock() let registry = guard.get()
+  let sourcePointer = unsafe transport.endpoint(registry, id) let anchor = ()
+  if Pointer.isNull<Endpoint>(sourcePointer) { drop guard return run core.error(&mut engine, unsafe lendRealm(&context, context), b"BroadcastChannel is closed") }
+  let source = unsafe Pointer.borrow<(), Endpoint>(&anchor, unsafe nonnull(sourcePointer))
+  if source.owner != state.id || source.closed || !source.broadcast { drop source drop guard return run core.error(&mut engine, unsafe lendRealm(&context, context), b"BroadcastChannel is closed") }
+  let mut cursor = registry.endpoints
+  while !Pointer.isNull<Endpoint>(cursor) {
+    let destination = unsafe Pointer.borrow<(), Endpoint>(&anchor, unsafe nonnull(cursor)) let pointer = unsafe nonnull(cursor) cursor = destination.next
+    if destination.id == id || !destination.broadcast || destination.closed || !equal(source.name.asSlice(), destination.name.asSlice()) { continue }
+    let mut message = Message { next: Pointer.null<Message>(), bytes: List<u8>.make(), buffers: List<buffers.BufferTransfer>.make(), shared: List<Shared>.make(), ports: List<u32>.make() }
+    index = 0 while index < bytes.length() { run message.bytes.append(bytes.get(index)) |> Effect.provideMut<Allocator>(&mut allocator) index = index + 1 }
+    index = 0 while index < sharedValues.length() { let item = &sharedValues.asSlice()[index] run message.shared.append(item.clone()) |> Effect.provideMut<Allocator>(&mut allocator) index = index + 1 }
+    index = 0 while index < copies.length() {
+      let copy = run buffers.copyTransfer(&copies.asSlice()[index]) |> Effect.provideMut<Allocator>(&mut allocator)
+      run message.buffers.append(move copy) |> Effect.provideMut<Allocator>(&mut allocator)
+      index = index + 1
+    }
+    let packet = run transport.allocate<Message>(&state.group.resources) unsafe Pointer.put<Message>(packet, move message) drop destination unsafe transport.enqueue(registry, pointer, packet)
+  }
+  return ValueBits.Undefined
+}
+unsafe effect fn invoke<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pointer: *mut State, op: &[u8], args: &owners.Scope, scope: &mut owners.Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let anchor = () let state = unsafe Pointer.borrow<(), State>(&anchor, pointer)
+  let memory = engine.memory let id = number(args.values[0])
+  if equal(op, b"info") || equal(op, b"bootstrap") {
+    scope.values[0] = run objects.object(&mut engine, memory, unsafe lendRealm(&context, context))
+    run unsafe common.define(&mut engine, context, scope.values[0], b"threadId", ValueBits.number(u32.toF64(state.id)), 7)
+    run unsafe common.define(&mut engine, context, scope.values[0], b"isMainThread", ValueBits.Bool { value: state.id == 0 }, 7)
+    run unsafe common.define(&mut engine, context, scope.values[0], b"controlPort", ValueBits.number(u32.toF64(state.control)), 7)
+    let metadata = run unsafe host.string(&mut engine, context, state.metadata.asSlice())
+    run unsafe common.define(&mut engine, context, scope.values[0], b"metadata", metadata, 7) return scope.take(0)
+  }
+  if equal(op, b"channel") { return run unsafe channel(&mut engine, context, &state) }
+  if equal(op, b"activeResources") {
+    let guard = state.group.registry.get().lock() let mut cursor = guard.get().endpoints let mut count: u32 = 0
+    while !Pointer.isNull<Endpoint>(cursor) {
+      let endpoint = unsafe Pointer.borrow<(), Endpoint>(&anchor, unsafe nonnull(cursor)) cursor = endpoint.next
+      if endpoint.owner == state.id && (!endpoint.closed || endpoint.closePending) && endpoint.referenced { count = count + 1 }
+    }
+    drop guard
+    scope.values[0] = run unsafe common.array(&mut engine, memory, context)
+    let mut index: u32 = 0
+    while index < count {
+      let name = run unsafe host.string(&mut engine, context, b"MessagePort")
+      run unsafe common.defineIndex(&mut engine, context, scope.values[0], index, name) index = index + 1
+    }
+    return scope.take(0)
+  }
+  if equal(op, b"routeChannel") { return run unsafe routeChannel(&mut engine, context, &state, args.values[0]) }
+  if equal(op, b"routeDetach") {
+    let guard = state.group.registry.get().lock() let registry = guard.get()
+    let optional = unsafe transport.endpoint(registry, id) let mut mutable = ()
+    if !Pointer.isNull<Endpoint>(optional) {
+      let endpoint = unsafe Pointer.borrowMut<(), Endpoint>(&mut mutable, unsafe nonnull(optional))
+      if endpoint.owner == state.id {
+        // A timeout ends acknowledgement waiting, not message delivery. Keep a
+        // queued packet owned by the target until its normal receive or exit.
+        endpoint.routed = false drop endpoint unsafe transport.closeEndpoint(registry, unsafe nonnull(optional))
+      }
+    }
+    return ValueBits.Undefined
+  }
+  if equal(op, b"lockRequest") {
+    let mut allocator = state.group.resources.clone()
+    let name = run unsafe host.text(&mut engine, context, args.values[0]) |> Effect.provideMut<Allocator>(&mut allocator)
+    let request = run unsafe locks.request(&state.group, state.id, move name, boolean(args.values[1]), boolean(args.values[2]), boolean(args.values[3]))
+    return ValueBits.number(u32.toF64(request))
+  }
+  if equal(op, b"lockQuery") { return run unsafe locks.query(&mut engine, context, &state.group, state.id, &mut scope) }
+  if equal(op, b"lockRelease") {
+    let mut guard = state.group.registry.get().lock()
+    unsafe locks.release(guard.getMut(), state.id, id, false)
+    return ValueBits.Undefined
+  }
+  if equal(op, b"lockStatus") {
+    let guard = state.group.registry.get().lock()
+    let optional = unsafe locks.lookup(guard.get(), state.id, id)
+    if Pointer.isNull<LockRequest>(optional) { return ValueBits.Null }
+    let request = unsafe Pointer.borrow<(), LockRequest>(&anchor, unsafe nonnull(optional))
+    return ValueBits.number(u32.toF64(request.status))
+  }
+  if equal(op, b"post") { return run unsafe post(&mut engine, context, &state, args) }
+  if equal(op, b"receive") { return run unsafe receive(&mut engine, context, &state, id) }
+  if equal(op, b"poll") {
+    // A cancellation wake can return an idle worker from uv_run before its
+    // interpreter interrupt counter expires. Check at this event-loop boundary
+    // so the worker cannot consume that one wake and block in uv_run again.
+    if state.id != 0 && unsafe shouldInterrupt(pointer) { return run errors.throwInterrupted(&mut engine, memory, unsafe lendRealm(&context, context)) }
+    return run unsafe pollInto(&mut engine, context, &state, &mut scope)
+  }
+  if equal(op, b"wake") {
+    let guard = state.group.registry.get().lock()
+    unsafe transport.wake(guard.get(), state.id)
+    return ValueBits.Undefined
+  }
+  if equal(op, b"hasPending") { return ValueBits.Bool { value: unsafe hasPending(pointer) } }
+  if equal(op, b"startSigintWatch") { drop state return run unsafe startSignalGuard(&mut engine, context, pointer) }
+  if equal(op, b"stopSigintWatch") { drop state return run unsafe stopSignalGuard(&mut engine, context, pointer, id) }
+  if equal(op, b"reportGet") || equal(op, b"reportSet") { return run unsafe reportSetting(&mut engine, context, &state, id, equal(op, b"reportSet"), args) }
+  if equal(op, b"reportWorkers") {
+    let attached = state.diagnostics drop state
+    return match attached {
+      Option<Mailbox>.Some { value } => run unsafe diagnostics.workers(&mut engine, context, value)
+      _ => run unsafe host.string(&mut engine, context, b"[]")
+    }
+  }
+  if equal(op, b"envGet") || equal(op, b"envSet") || equal(op, b"envDelete") || equal(op, b"envKeys") { return run unsafe environment(&mut engine, context, &state, op, args, &mut scope) }
+  if equal(op, b"envInit") { return run unsafe initializeEnvironment(&mut engine, context, &state, args, &mut scope) }
+  if equal(op, b"broadcastPost") { return run unsafe broadcast(&mut engine, context, &state, args) }
+  if equal(op, b"subscribe") {
+    let mut allocator = state.group.resources.clone()
+    let name = run unsafe host.text(&mut engine, context, args.values[0]) |> Effect.provideMut<Allocator>(&mut allocator)
+    let endpoint = run transport.allocate<Endpoint>(&state.group.resources)
+    let mut guard = state.group.registry.get().lock()
+    let id = unsafe transport.newEndpoint(guard.getMut(), endpoint, state.id, 0, move name, true)
+    return ValueBits.number(u32.toF64(id))
+  }
+  if equal(op, b"startWorker") {
+    let mut allocator = state.group.resources.clone()
+    let metadata = run unsafe host.text(&mut engine, context, args.values[0]) |> Effect.provideMut<Allocator>(&mut allocator)
+    if !args.values[2].isNumber() { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"invalid Worker stack limit") }
+    let stack = args.values[2].numericValue()
+    if !f64.isFinite(stack) || stack < 1.0 || stack > 9007199246286848.0 || f64.floor(stack) != stack { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"invalid Worker stack limit") }
+    if !args.values[3].isString() { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"invalid Worker thread name") }
+    return ValueBits.number(u32.toF64(run unsafe spawn(&state, move metadata, number(args.values[1]), f64.toUsize(stack), nativeThreadName(args.values[3]))))
+  }
+  let guard = state.group.registry.get().lock() let registry = guard.get() let mut mutable = ()
+  if equal(op, b"workerStatus") {
+    let optional = unsafe transport.thread(registry, id)
+    if Pointer.isNull<Thread>(optional) { return ValueBits.Null }
+    let child = unsafe Pointer.borrow<(), Thread>(&mutable, unsafe nonnull(optional))
+    if child.parent != state.id || child.id == state.id { drop child drop guard return run core.error(&mut engine, unsafe lendRealm(&context, context), b"Worker belongs to another runtime") }
+    if child.exited { return ValueBits.Int { value: child.exitCode } }
+    return ValueBits.Undefined
+  }
+  if equal(op, b"cpuUsage") {
+    let optional = unsafe transport.thread(registry, id)
+    if Pointer.isNull<Thread>(optional) { return ValueBits.Null }
+    let child = unsafe Pointer.borrow<(), Thread>(&mutable, unsafe nonnull(optional))
+    if child.parent != state.id || child.id == state.id { drop child drop guard return run core.error(&mut engine, unsafe lendRealm(&context, context), b"Worker belongs to another runtime") }
+    if !child.online || child.exited { return ValueBits.Null }
+    let usage = unsafe child.cpu.sample() drop child drop guard
+    if !usage.available { return run core.error(&mut engine, unsafe lendRealm(&context, context), b"per-thread OS CPU counters are unavailable") }
+    scope.values[0] = run objects.object(&mut engine, memory, unsafe lendRealm(&context, context))
+    run unsafe common.define(&mut engine, context, scope.values[0], b"user", ValueBits.number(usage.user), 7)
+    run unsafe common.define(&mut engine, context, scope.values[0], b"system", ValueBits.number(usage.system), 7)
+    return scope.take(0)
+  }
+  if equal(op, b"online") || equal(op, b"requestExit") {
+    let entry = unsafe Pointer.borrowMut<(), Thread>(&mut mutable, unsafe nonnull(unsafe transport.thread(registry, state.id)))
+    if equal(op, b"online") { entry.online = true entry.onlinePending = state.id != 0 let parent = entry.parent drop entry unsafe transport.wake(registry, parent) return ValueBits.Undefined }
+    if state.id == 0 { drop entry drop guard return run core.error(&mut engine, unsafe lendRealm(&context, context), b"requestExit is only valid inside a worker") }
+    entry.exitCode = u32.toI32(id) entry.stopped = true entry.cancellation.cancel()
+    drop entry drop guard
+    return run errors.throwInterrupted(&mut engine, memory, unsafe lendRealm(&context, context))
+  }
+  if equal(op, b"terminate") || equal(op, b"workerRef") || equal(op, b"workerHasRef") {
+    let optional = unsafe transport.thread(registry, id)
+    if Pointer.isNull<Thread>(optional) { drop guard return run core.error(&mut engine, unsafe lendRealm(&context, context), b"unknown Worker") }
+    let child = unsafe Pointer.borrowMut<(), Thread>(&mut mutable, unsafe nonnull(optional))
+    if child.parent != state.id || child.id == state.id { drop child drop guard return run core.error(&mut engine, unsafe lendRealm(&context, context), b"Worker belongs to another runtime") }
+    if equal(op, b"workerHasRef") { return ValueBits.Bool { value: child.referenced } }
+    if equal(op, b"workerRef") { child.referenced = boolean(args.values[1]) return ValueBits.Undefined }
+    if !child.exited { child.stopped = true child.exitCode = 1 child.cancellation.cancel() drop child unsafe transport.wake(registry, id) } return ValueBits.Undefined
+  }
+  let optional = unsafe transport.endpoint(registry, id)
+  if Pointer.isNull<Endpoint>(optional) {
+    if equal(op, b"close") || equal(op, b"unsubscribe") { return ValueBits.Undefined }
+    if equal(op, b"hasRef") { return ValueBits.Bool { value: false } }
+    drop guard return run core.error(&mut engine, unsafe lendRealm(&context, context), b"unknown worker operation or MessagePort")
+  }
+  let endpoint = unsafe Pointer.borrowMut<(), Endpoint>(&mut mutable, unsafe nonnull(optional))
+  if endpoint.owner != state.id { drop endpoint drop guard return run core.error(&mut engine, unsafe lendRealm(&context, context), b"MessagePort belongs to another runtime") }
+  if equal(op, b"hasRef") { return ValueBits.Bool { value: endpoint.referenced && !endpoint.closed } }
+  if equal(op, b"ref") { endpoint.referenced = boolean(args.values[1]) return ValueBits.Undefined }
+  if equal(op, b"start") { endpoint.started = boolean(args.values[1]) return ValueBits.Undefined }
+  if equal(op, b"close") || equal(op, b"unsubscribe") { drop endpoint unsafe transport.closeEndpoint(registry, unsafe nonnull(optional)) return ValueBits.Undefined }
+  drop endpoint drop guard return run core.error(&mut engine, unsafe lendRealm(&context, context), b"unknown worker operation")
+}
+pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pointer: *mut State, argc: i32, argv: &FrameSlots) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut args = Scope.make() let mut scope = Scope.make()
+  let result = run Effect.result(unsafe dispatchInto(&mut engine, context, pointer, argv, &mut args, &mut scope))
+  unsafe owners.cleanup(&mut engine, context, move args) unsafe owners.cleanup(&mut engine, context, move scope) unsafe updateRef(pointer)
+  return match move result { Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
+}
+unsafe effect fn dispatchInto<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pointer: *mut State, argv: &FrameSlots, args: &mut owners.Scope, scope: &mut owners.Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let name = run unsafe host.text(&mut engine, context, unsafe common.argument(argv, 0))
+  let array = unsafe common.argument(argv, 1) let mut index: u32 = 0
+  let count: u32 = 5
+  while index < count { args.values[u32.toUsize(index)] = run unsafe owners.getIndex(&mut engine, context, array, index) index = index + 1 }
+  return run unsafe invoke(&mut engine, context, pointer, name.asSlice(), &args, &mut scope)
+}
