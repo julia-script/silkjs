@@ -24,8 +24,20 @@ def host_target() -> str:
     return f"{arch}-unknown-linux-gnu"
 
 
+def silk_output() -> Path:
+    """Where `silk build` writes: the output-dir of the workspace that lists this package
+    (the repository root's silk.toml), or this package's own build/ directory."""
+    workspace = ROOT.parents[1] / "silk.toml"
+    if workspace.is_file():
+        table = tomllib.loads(workspace.read_text()).get("workspace", {})
+        members = {(workspace.parent / member).resolve() for member in table.get("members", [])}
+        if ROOT.resolve() in members:
+            return workspace.parent / table.get("output-dir", "build")
+    return ROOT / "build"
+
+
 def release_binary() -> Path:
-    return ROOT / "build/llvm" / host_target() / "release/silkjs"
+    return silk_output() / "llvm" / host_target() / "release/silkjs"
 
 
 def compiler_path() -> Path:

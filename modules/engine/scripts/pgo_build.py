@@ -27,8 +27,9 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 import v8bench  # noqa: E402
+import toolchain  # noqa: E402
 
-RELEASE = os.path.join(ROOT, "build", "llvm", "x86_64-unknown-linux-gnu", "release", "silkjs")
+RELEASE = str(toolchain.silk_output() / "llvm" / "x86_64-unknown-linux-gnu" / "release" / "silkjs")
 
 
 def wrapper(path, clang, flags):
