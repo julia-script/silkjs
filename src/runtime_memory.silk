@@ -67,6 +67,8 @@ const ARENA_RECORDS: usize = ARENA_BYTES / POOL_GRANULE
 // Side metadata preserves headerless payloads and the owner's gate-free cache.
 // It occupies the untouched tail of the arena group, outside live-block charges;
 // only records for carved blocks are initialized. id == 0 means genuinely idle.
+// Records are kept only once something asks for them (keepRecords, startProfile):
+// until then no pooled allocation or free touches them, so their pages stay unused.
 struct PoolRecord { id: u64, requestedBytes: usize, sampledEpoch: u64 }
 impl Copy for PoolRecord {}
 // refill carves this many bytes of an arena at a time: one page.
@@ -171,6 +173,38 @@ unsafe fn pooledRecord(block: *mut u8) -> *mut PoolRecord {
     usize.shiftRight(usize.wrappingMultiply(granule, arena.reciprocal), RECIPROCAL_SHIFT))
 }
 
+// Whether pooled blocks carry records. Owner thread, or under the gate.
+@inlineAlways
+unsafe fn keepsRecords(ledger: LedgerPointers) -> bool {
+  let anchor = ()
+  let state = unsafe Pointer.borrow(&anchor, ledger.allocation)
+  return state.records
+}
+
+// Turns records on, clearing every carved block's record first: blocks carved
+// while records were off never had theirs written. Under the gate.
+@inlineNever
+unsafe fn startRecords(ledger: LedgerPointers) -> () {
+  let mut anchor = ()
+  let state = unsafe Pointer.borrowMut(&mut anchor, ledger.allocation)
+  if state.records { return () }
+  state.records = true
+  let mut nextArena = state.firstPooledArena
+  drop state
+  while !Pointer.isNull(nextArena) {
+    let pointer = unsafe Intrinsic.pointerRequalify<?*mut ArenaHeader, *mut ArenaHeader>(nextArena)
+    let arenaAnchor = ()
+    let arena = unsafe Pointer.borrow(&arenaAnchor, pointer)
+    let records = unsafe Pointer.assumeManyMut<PoolRecord>(arena.records)
+    let mut slot: usize = 0
+    while slot < arena.carved {
+      unsafe Pointer.write<PoolRecord>(unsafe Pointer.atMut<PoolRecord>(records, slot), PoolRecord { id: 0, requestedBytes: 0, sampledEpoch: 0 })
+      slot = slot + 1
+    }
+    nextArena = arena.nextLive
+  }
+}
+
 // ceil(2^RECIPROCAL_SHIFT / (class + 1)). For every granule offset below
 // ARENA_RECORDS and every class, (granule * reciprocal) >> RECIPROCAL_SHIFT equals
 // granule / (class + 1): the rounding error stays below 2^RECIPROCAL_SHIFT / granule.
@@ -207,6 +241,10 @@ struct Ledger {
   nextProfileEpoch: u64,
   // Only the allocation owner reads/writes this flag; reclaims use the gate.
   profiling: bool,
+  // Pooled blocks carry PoolRecords (ids for snapshots and lookups, samples for
+  // profiles). Set once by keepRecords or startProfile and never cleared; the
+  // owner writes it under the gate, and reclaims read it under the gate.
+  records: bool,
   profile: Option<Recording>,
   pool: Pool
 }
@@ -326,8 +364,19 @@ impl AllocationObserver {
     state.nextProfileEpoch = state.nextProfileEpoch + 1
     state.profile = Option<Recording>.some(move owned)
     state.profiling = true
-    drop state unsafe unlockLedger(ledger)
+    drop state
+    unsafe startRecords(ledger)
+    unsafe unlockLedger(ledger)
     return true
+  }
+  /// Starts keeping a record for each pooled block, so liveAllocations and
+  /// lookupAllocation see pooled blocks allocated from now on. Blocks already live
+  /// stay unrecorded. Owner thread only; repeated calls change nothing.
+  pub fn keepRecords(self: &Self) -> () {
+    let ledger = self.ledger
+    unsafe lockLedger(ledger)
+    unsafe startRecords(ledger)
+    unsafe unlockLedger(ledger)
   }
   pub fn stopProfile(self: &Self) -> Option<Recording> {
     let ledger = self.ledger
@@ -512,7 +561,7 @@ impl<A> RuntimeAllocator<A> {
       gate: 0,
       stats: RuntimeMemoryStats { usedBytes: 0, peakBytes: 0, allocationCount: 0, limit: usize.MAX },
       firstAllocation: Pointer.null<AllocationHeader>(), firstPooledArena: Pointer.null<ArenaHeader>(), nextAllocationId: 1, nextSortId: FIRST_SORT_ID,
-      nextProfileEpoch: 1, profiling: false, profile: Option<Recording>.none(),
+      nextProfileEpoch: 1, profiling: false, records: false, profile: Option<Recording>.none(),
       pool: Pool { enabled: false, heads: [Pointer.null<u8>(); 64], counts: [0; 64], arenas: Pointer.null<ArenaHeader>(), spare: Pointer.null<u8>(), spareCount: 0, spareRecords: Pointer.null<PoolRecord>(),
         fresh: [Pointer.null<u8>(); 64], freshBytes: [0; 64],
         ownerActive: false, ownerThread: 0, ownerHeads: [Pointer.null<u8>(); 64], ownerCounts: [0; 64], ownerUsed: 0, ownerAllocations: 0, ownerPeak: 0,
@@ -673,18 +722,16 @@ effect fn allocatePooledSlow<A>(self: &mut RuntimeAllocator<A>, layout: Layout, 
 unsafe fn recordPooled(ledger: LedgerPointers, block: *mut u8, requestedBytes: usize) -> () {
   let id = unsafe nextPooledId(ledger)
   if id == 0 { return unsafe recordPooledRare(ledger, block, requestedBytes) }
-  unsafe Pointer.write<PoolRecord>(unsafe pooledRecord(block),
-    PoolRecord { id: id, requestedBytes: requestedBytes, sampledEpoch: 0 })
 }
 
-// The next allocation id, or 0 when a sort is due or profiling is on: then the
-// out-of-line path takes the id itself.
+// The next allocation id, or 0 when a sort is due or records are kept: then the
+// out-of-line path takes the id itself (and writes the record).
 @inlineAlways
 unsafe fn nextPooledId(ledger: LedgerPointers) -> u64 {
   let mut anchor = ()
   let state = unsafe Pointer.borrowMut(&mut anchor, ledger.allocation)
   let id = state.nextAllocationId
-  if id >= state.nextSortId || state.profiling { return 0 }
+  if id >= state.nextSortId || state.records { return 0 }
   // A 64-bit count of allocations cannot wrap in practice; ids stay nonzero.
   state.nextAllocationId = u64.wrappingAdd(id, 1)
   return id
@@ -699,10 +746,12 @@ unsafe fn recordPooledRare(ledger: LedgerPointers, block: *mut u8, requestedByte
   let id = state.nextAllocationId
   state.nextAllocationId = u64.wrappingAdd(id, 1)
   let profiling = state.profiling
+  let records = state.records
   let sortDue = id >= state.nextSortId
   drop state
   if sortDue { unsafe sortIdleLists(ledger, id) }
   if profiling { return unsafe recordProfiledPooled(ledger, block, requestedBytes, id) }
+  if !records { return () }
   unsafe Pointer.write<PoolRecord>(unsafe pooledRecord(block),
     PoolRecord { id: id, requestedBytes: requestedBytes, sampledEpoch: 0 })
 }
@@ -722,8 +771,6 @@ unsafe fn adoptPooled(ledger: LedgerPointers, block: *mut u8, layout: Layout, ze
   if zeroed { unsafe zeroBytes(block, layout.bytes) }
   let id = unsafe nextPooledId(ledger)
   if id == 0 { return unsafe adoptPooledRare(ledger, block, move layout) }
-  unsafe Pointer.write<PoolRecord>(unsafe pooledRecord(block),
-    PoolRecord { id: id, requestedBytes: layout.bytes, sampledEpoch: 0 })
   let reclaim: extern "C" fn(?*mut u8) -> () = silkRuntimeMemoryReclaimPooled
   return unsafe Intrinsic.allocationAdopt(block, move layout, reclaim, block)
 }
@@ -903,6 +950,7 @@ effect fn refill<A>(self: &mut RuntimeAllocator<A>, layout: Layout, class: usize
     }
   }
   let blocks = unsafe Pointer.assumeManyMut<u8>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(start))
+  let records = unsafe keepsRecords(ledger)
   // Link the blocks among themselves first, outside the gate.
   let mut head = Pointer.null<u8>()
   let mut index = count
@@ -910,8 +958,8 @@ effect fn refill<A>(self: &mut RuntimeAllocator<A>, layout: Layout, class: usize
     index = index - 1
     let block = unsafe Pointer.atMut<u8>(blocks, usize.wrappingMultiply(index, blockBytes))
     unsafe Pointer.write<?*mut u8>(unsafe poolLink(block), head)
-    unsafe Pointer.write<PoolRecord>(unsafe pooledRecord(block),
-      PoolRecord { id: 0, requestedBytes: 0, sampledEpoch: 0 })
+    if records { unsafe Pointer.write<PoolRecord>(unsafe pooledRecord(block),
+      PoolRecord { id: 0, requestedBytes: 0, sampledEpoch: 0 }) }
     head = unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(block)
   }
   unsafe {
@@ -1310,6 +1358,7 @@ unsafe fn uncharge(ledger: LedgerPointers, address: *mut AllocationHeader) -> bo
 
 // Called under the ledger gate, including cross-thread reclaims.
 unsafe fn reclaimPoolRecord(ledger: LedgerPointers, block: *mut u8, class: usize) -> () {
+  if !unsafe keepsRecords(ledger) { return () }
   let pointer = unsafe pooledRecord(block)
   let record = unsafe Pointer.read<PoolRecord>(pointer)
   if record.sampledEpoch != 0 {
@@ -1584,15 +1633,18 @@ pub unsafe fn releasePooled(block: *mut u8) -> () {
 unsafe fn cacheOwned(ledger: LedgerPointers, block: *mut u8, class: usize) -> () {
   let mut poolAnchor = ()
   let pool = unsafe Pointer.borrowMut<(), Pool>(&mut poolAnchor, unsafe poolOf(ledger))
-  // Unsampled blocks need no profile access or gate on the owning thread.
-  let pointer = unsafe pooledRecord(block)
-  let record = unsafe Pointer.read<PoolRecord>(pointer)
-  if record.sampledEpoch != 0 {
-    unsafe lockLedger(ledger)
-    unsafe reclaimPoolRecord(ledger, block, class)
-    unsafe unlockLedger(ledger)
-  } else {
-    unsafe Pointer.write<PoolRecord>(pointer, PoolRecord { id: 0, requestedBytes: 0, sampledEpoch: 0 })
+  // Unsampled blocks need no profile access or gate on the owning thread, and
+  // without records there is nothing to clear.
+  if unsafe keepsRecords(ledger) {
+    let pointer = unsafe pooledRecord(block)
+    let record = unsafe Pointer.read<PoolRecord>(pointer)
+    if record.sampledEpoch != 0 {
+      unsafe lockLedger(ledger)
+      unsafe reclaimPoolRecord(ledger, block, class)
+      unsafe unlockLedger(ledger)
+    } else {
+      unsafe Pointer.write<PoolRecord>(pointer, PoolRecord { id: 0, requestedBytes: 0, sampledEpoch: 0 })
+    }
   }
   if pool.ownerCounts[class] >= OWNER_LIST_CAP { drop pool return unsafe spillOwned(ledger, block, class) }
   let head = pool.ownerHeads[class]
