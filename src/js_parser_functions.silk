@@ -40,7 +40,8 @@ import js_preparse { Preparse }
 import silk.mem.box { Box }
 import js_preparse_tables { PreparseTables }
 import js_preparse_pool as pool
-import js_preparse_pool { PoolJob, SpanName }
+import js_preparse_pool { PoolJob, SpanName, Deferred }
+import silk.num.i64
 import silk.mem.pointer { Pointer }
 import silk.collections.list { List }
 import js_module_metadata { ExportKind }
@@ -552,7 +553,7 @@ effect fn parseFunctionInner<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser
       // Under a verified parent the child is verified too: it parses in full
       // with nothing to check afterwards.
       eager = invoked && !parentVerified
-      if !invoked { skipped = run skipBody(&mut s, child, entry, paramStart) }
+      if !invoked { skipped = run skipBody(&mut s, child, entry, paramStart, functionName) }
     }
     if skipped {
       run checkNames(&mut s, functionName)
@@ -561,6 +562,7 @@ effect fn parseFunctionInner<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser
       // parsing it again on the call. Its children may go lazy as finishLazy's
       // would, unless the body turns out to hold a direct eval or a with.
       let outerDynamic = s.dynamicScopeSeen
+      let deferredMark = pool.deferredCount(&s.*)
       if eager {
         s.dynamicScopeSeen = false
         let verified = s.functionAtMut(child) verified.lazyVerified = true drop verified
@@ -578,6 +580,7 @@ effect fn parseFunctionInner<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser
         s.dynamicScopeSeen = outerDynamic || dynamic
         if dynamic {
           // Its lazy children assumed static scopes: start over the usual way.
+          pool.truncateDeferred(&mut s, deferredMark)
           s.destroyFunction(&mut hooks, child)
           s.enterFunction(parentCell)
           run s.seek(start)
@@ -750,7 +753,7 @@ fn invokedShape(s: &Parser<'_>, sourceStart: &Option<usize>) -> bool {
 /// Sources shorter than this (in bytes) parse every body eagerly.
 const LAZY_MIN_SOURCE: usize = 2048
 
-effect fn skipBody(s: &mut Parser<'_>, child: FunctionId, entry: LexerPosition, paramStart: usize) -> bool
+effect fn skipBody(s: &mut Parser<'_>, child: FunctionId, entry: LexerPosition, paramStart: usize, name: u32) -> bool
   ! ParserStackOverflow | LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
   // Inside a function finishLazy parses, its preparse already went through
   // this body: take its record instead of preparsing again.
@@ -759,13 +762,53 @@ effect fn skipBody(s: &mut Parser<'_>, child: FunctionId, entry: LexerPosition, 
   // A small script compiles little: preparsing then reparsing the bodies it
   // calls costs more than it saves.
   if s.sourceBytes().length < LAZY_MIN_SOURCE { return false }
-  // A helper thread may have preparsed it already (js_preparse_pool).
+  // The scanner found this body (js_preparse_pool): take a helper's records
+  // when they are ready, else skip to the scanned `}` and complete the stub
+  // after the parse (joinDeferred).
   if !Pointer.isNull<u8>(s.pool) && (s.functionAt(child).jsMode & JS_MODE_STRICT) == 0 {
-    match pool.take(&s.*, paramStart) {
-      Option<PoolJob>.Some { value } => { run skipPooled(&mut s, child, entry, value) return true }
-      _ => ()
+    let found = pool.lookup(&s.*, paramStart)
+    if found >= 0 {
+      let index = i64.toUsize(found)
+      let current = pool.jobState(&s.*, index)
+      if current == pool.DONE {
+        pool.countHit(&s.*)
+        let level = scope(&s.*) let job = pool.job(&s.*, index)
+        drop run skipPooled(&mut s, child, entry, level, job, true)
+        return true
+      }
+      // A helper's preparse bailed: so would this one.
+      if current == pool.FAILED { return false }
+      let job = pool.job(&s.*, index)
+      let saved = s.save()
+      let level = scope(&s.*)
+      let lineFeed = lineFeedBefore(s.sourceBytes(), job.end)
+      run s.seek(LexerPosition { offset: job.end, gotLineFeed: lineFeed })
+      if s.token.kind == 125 && s.token.start == job.end {
+        run pool.defer(&mut s, Deferred { child: child, job: index, level: level, entry: entry, name: name })
+        return true
+      }
+      run s.seek(saved)
     }
   }
+  let level = scope(&s.*)
+  return run preparseFill(&mut s, child, entry, level)
+}
+
+/// Whether a line feed sits among the spaces before offset.
+fn lineFeedBefore(bytes: &[u8], offset: usize) -> bool {
+  let mut at = offset
+  while at > 0 && whitespace(bytes[at - 1]) {
+    if bytes[at - 1] == 10 || bytes[at - 1] == 13 { return true }
+    at = at - 1
+  }
+  return false
+}
+
+/// skipBody's own preparse of the body at `{`, for child (the function being
+/// parsed): on acceptance child becomes the stub at level and the parser is at
+/// the closing `}`; on a bail the parser is back at the `{`.
+effect fn preparseFill(s: &mut Parser<'_>, child: FunctionId, entry: LexerPosition, level: u16) -> bool
+  ! ParserStackOverflow | LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
   let saved = s.save()
   // One preparse serves every body of the parse: only its tables' contents
   // change between bodies.
@@ -792,7 +835,6 @@ effect fn skipBody(s: &mut Parser<'_>, child: FunctionId, entry: LexerPosition, 
     run s.seek(saved)
     return false
   }
-  let level = scope(&s.*)
   let mut free = BoxList<LazyName>.make()
   run free.reserveExact(pre.free.length())
   let mut i: usize = 0
@@ -885,13 +927,15 @@ effect fn skipKnown(s: &mut Parser<'_>, child: FunctionId, entry: LexerPosition,
 
 /// skipBody from a helper's job: skipKnown over its records, whose names are
 /// source spans to intern here.
-effect fn skipPooled(s: &mut Parser<'_>, child: FunctionId, entry: LexerPosition, job: PoolJob) -> ()
+/// Without seek (at the join) the records must end where the parser skipped
+/// to (job.end): false when they do not.
+effect fn skipPooled(s: &mut Parser<'_>, child: FunctionId, entry: LexerPosition, level: u16, job: PoolJob, seek: bool) -> bool
   ! ParserStackOverflow | LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
   let anchor = ()
   let bodies = unsafe Pointer.borrowMany<(), LazyBody>(&anchor, unsafe Intrinsic.pointerRequalify<?[*]const LazyBody, [*]const LazyBody>(job.bodies), job.bodyCount)
   let names = unsafe Pointer.borrowMany<(), SpanName>(&anchor, unsafe Intrinsic.pointerRequalify<?[*]const SpanName, [*]const SpanName>(job.names), job.nameCount)
   let record = bodies[0]
-  let level = scope(&s.*)
+  if !seek && record.end != job.end { return false }
   let mut free = BoxList<LazyName>.make()
   run free.reserveExact(u32.toUsize(record.freeCount))
   let mut i = u32.toUsize(record.freeStart)
@@ -927,7 +971,80 @@ effect fn skipPooled(s: &mut Parser<'_>, child: FunctionId, entry: LexerPosition
   fd.lazyEntry = entry.offset fd.lazyEntryLineFeed = entry.gotLineFeed
   drop fd
   recycleStubCode(&mut s, child)
-  run s.seek(LexerPosition { offset: record.end, gotLineFeed: record.endLineFeed })
+  if seek { run s.seek(LexerPosition { offset: record.end, gotLineFeed: record.endLineFeed }) }
+  return true
+}
+
+/// Completes the stubs skipBody left for after the parse (js_preparse_pool's
+/// Deferred): helpers' records when they finished, else this thread's own
+/// preparse, or (when that bails) the body parsed in full. Returns true when a
+/// scanned end turns out wrong: the parse then went past the wrong bytes and
+/// must start over without the scanner.
+pub effect fn joinDeferred<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'_>, hooks: &mut H, memory: &AllocationObserver) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException ? &mut Allocator {
+  let count = pool.deferredCount(&s.*)
+  if count == 0 { return false }
+  let root = s.functionCell()
+  // Helpers start no job the parse did not leave.
+  let jobs = pool.jobCount(&s.*)
+  let mut wanted = List<bool>.make()
+  run wanted.appendRepeated(false, jobs)
+  let mut i: usize = 0
+  while i < count { wanted.set(pool.deferredAt(&s.*, i).job, true) i = i + 1 }
+  i = 0
+  while i < jobs { if !wanted.get(i) { pool.cancelJob(&s.*, i) } i = i + 1 }
+  // The ones nobody started, here and from the last (helpers go from the
+  // first); then the ones a helper had started.
+  let mut started = List<usize>.make()
+  i = count
+  while i > 0 {
+    i = i - 1
+    let deferred = pool.deferredAt(&s.*, i)
+    if pool.claim(&s.*, deferred.job) {
+      let complete = run completeHere(&mut s, &mut hooks, memory, deferred)
+      pool.release(&s.*, deferred.job)
+      if !complete { s.enterFunction(root) return true }
+    } else { run started.append(i) }
+  }
+  i = 0
+  while i < started.length() {
+    let deferred = pool.deferredAt(&s.*, started.get(i))
+    let mut complete = false
+    if pool.settled(&s.*, deferred.job) == pool.DONE {
+      pool.countHit(&s.*)
+      let job = pool.job(&s.*, deferred.job)
+      complete = run skipPooled(&mut s, deferred.child, deferred.entry, deferred.level, job, false)
+    } else {
+      complete = run completeHere(&mut s, &mut hooks, memory, deferred)
+    }
+    if !complete { s.enterFunction(root) return true }
+    i = i + 1
+  }
+  s.enterFunction(root)
+  return false
+}
+
+/// joinDeferred on this thread: preparse the body, or parse it in full. False
+/// when its `}` is not the scanned one.
+effect fn completeHere<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'_>, hooks: &mut H, memory: &AllocationObserver, deferred: Deferred) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException ? &mut Allocator {
+  let job = pool.job(&s.*, deferred.job)
+  s.enterFunction(deferred.child)
+  run s.seek(LexerPosition { offset: job.bodyStart, gotLineFeed: false })
+  if run preparseFill(&mut s, deferred.child, deferred.entry, deferred.level) { return s.token.start == job.end }
+  // Its children parse in full too: skipping them now would leave stubs after the join.
+  let fd = s.functionAtMut(deferred.child) fd.lazyVerified = false drop fd
+  run s.expect(123)
+  run parseDirectives(&mut s)
+  run checkNames(&mut s, deferred.name)
+  let _block = run statements.pushBreakEntry(&mut s, 0, -1, -1, 0)
+  while s.token.kind != 125 {
+    run modules.parseSourceElement(&mut s, &mut hooks, memory)
+  }
+  run statements.popBreakEntry(&mut s)
+  if s.token.start != job.end { return false }
+  if support.isLiveCode(&s.*) { run statements.emitReturn(&mut s, false) }
+  return true
 }
 
 pub effect fn parseFunction<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'_>, hooks: &mut H,
