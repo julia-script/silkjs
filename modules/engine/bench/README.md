@@ -12,12 +12,14 @@ performance regressions.
 
 ```sh
 silk build --release
-python3 scripts/bench.py --label baseline                 # record bench/results/baseline.json
-python3 scripts/bench.py --compare bench/results/baseline.json   # exit 1 on >10% regression
-python3 scripts/bench.py --skip-micro --runs 3            # quick macro-only check
-python3 scripts/bench.py --only fib loops                 # selected macro workloads
-python3 scripts/bench.py --reference path/to/c/qjs        # also measure C QuickJS
+silk task bench --label baseline                 # record bench/results/baseline.json
+silk task bench --compare bench/results/baseline.json   # exit 1 on >10% regression
+silk task bench --skip-micro --runs 3            # quick macro-only check
+silk task bench fib loops                        # selected macro workloads
+silk task bench --reference path/to/c/qjs        # also measure C QuickJS
 ```
+
+`silk task bench` runs `scripts/bench.py`, which can also be run directly for its other options.
 
 Results are only comparable on the same host with the machine otherwise idle. Compare `min_s`
 for macro workloads; medians on shared cloud hosts vary by 10-30%.
@@ -61,7 +63,7 @@ then lays the hot interpreter paths out together and moves cold ones out of line
 roughly halves instruction-cache misses on large programs.
 
 ```sh
-SILK_CLANG=/path/to/clang python3 scripts/pgo_build.py      # writes build/pgo/silkjs
+SILK_CLANG=/path/to/clang silk task pgo      # writes build/pgo/silkjs
 ```
 
 On 2026-11-07 (Silk dev.55, 4-CPU Linux x86_64) it ran Octane PdfJS 12% faster than the plain

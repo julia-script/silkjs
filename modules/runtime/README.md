@@ -21,11 +21,11 @@ Requirements:
 git clone https://github.com/silk-lang/lib-silkjs.git
 cd lib-silkjs/modules/runtime
 silk use
-python3 tools/build.py
+silk task build
 ./build/silkjsruntime -p 'process.versions'
 ```
 
-Use `SILK_CLANG` to select a particular Clang executable. `python3 tools/build.py --release` builds with speed optimization; `--output PATH` selects the output executable.
+Use `SILK_CLANG` to select a particular Clang executable. `silk task build --release` builds with speed optimization; `--output PATH` selects the output executable. `silk task` lists the other tasks (`embed`, `compat`, `sea`); they run the Python tools in [`tools/`](tools/), which can still be run directly.
 
 The engine is this repository's [`modules/engine`](../engine), a path dependency in `silk.toml`, so engine and runtime changes land together. The build also prepares the pinned WAMR/uvwasi dependencies, embeds the JavaScript extensions, and links the native executable. An installed Node executable is not required to build or run it.
 
@@ -75,7 +75,7 @@ The published-source build passed **72/72 differential cases against Node 24.22.
 Use a Node 24 executable as the reference/client for the differential suite:
 
 ```sh
-node tests/compat.mjs
+silk task compat          # or: node tests/compat.mjs
 ```
 
 `SILKJS_RUNTIME` selects the runtime executable and `NODE_REFERENCE` selects a different Node reference executable. An optional positional regular expression selects cases. Node is a test oracle or debugger client here, not a production execution backend.
