@@ -20,7 +20,7 @@ import silkjs.dtoa { Dtoa }
 import silkjs.js_engine { Engine }
 import silkjs.js_engine_host { EngineServices }
 import silkjs.js_heap { HeapCell, HeapHeader, HeapKind }
-import silkjs.js_core_types { RuntimeState, ContextState, FunctionBytecode, FunctionDebugInfo, ModuleDef, FrameSlots, StackFrame, NativeErrorKind }
+import silkjs.js_core_types { RuntimeState, ContextState, FunctionBytecode, FunctionDebugInfo, ModuleDef, FrameSlots, StackFrame, NativeErrorKind, debuggerOf }
 import silkjs.js_value { ValueBits }
 import silkjs.js_exceptions { JsException }
 import silkjs.js_coercion_host { CoercionHooks }
@@ -35,7 +35,8 @@ import silkjs.js_gc as gc
 import silkjs.js_backtrace as backtrace
 import silkjs.js_debugger as debugger
 import silkjs.js_debugger { Frame }
-import silkjs.js_debugger_metadata { Location }
+import silkjs.js_debugger_metadata { Metadata as DebuggerMetadata, Location }
+import silkjs.thin_list { ThinBox }
 import silkjs.js_debugger_scopes as scopes
 import silkjs.js_debugger_scopes { Binding }
 import ext.inspector_evaluate as evaluation
@@ -58,7 +59,7 @@ pub fn create() -> State {
 pub unsafe fn dispose<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State) -> () {
   let rt = unsafe runtime.contextRuntime(context)
   unsafe debugger.clearBreakpoints(rt) unsafe debugger.exceptions(rt, false, false)
-  let resumed = unsafe debugger.resume(rt, 0)
+  let _resumed = unsafe debugger.resume(rt, 0)
   let mut runtimeAnchor = () let runtimeState = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, rt)
   runtimeState.debugger.pauseRequested = false runtimeState.debugger.mode = 0 drop runtimeState
   let mut anchor = () let data = unsafe Pointer.borrowMut<(), State>(&mut anchor, state)
@@ -125,8 +126,9 @@ unsafe effect fn register(state: *mut State, reference: *mut HeapHeader) -> () !
     if Pointer.address(data.functions.get(i).reference) == Pointer.address(reference) { return () } i = i + 1
   }
   let codeAnchor = () let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&codeAnchor, reference)
-  let id = code.scriptId let realm = code.realm let deferred = code.debuggerMetadata.sourceDeferred
-  let locations = code.debuggerMetadata.locations.length() drop code
+  let empty = DebuggerMetadata.make() let metadata = debuggerOf(&code, &empty)
+  let id = code.scriptId let realm = code.realm let deferred = metadata.sourceDeferred
+  let locations = metadata.locations.length() drop metadata drop code
   if id == 0 || deferred { return () }
   let mut known = false i = 0
   // One inventory entry per bound source/realm, but retain every cloned function.
@@ -155,23 +157,29 @@ unsafe fn compiledReference(compiled: ValueBits) -> Option<*mut HeapHeader> {
   if let ValueBits.FunctionBytecode { reference } = compiled { return Option<*mut HeapHeader>.some(reference) }
   if let ValueBits.Module { reference } = compiled {
     let anchor = () let module = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, reference)
-    let function = module.functionObject drop module return unsafe compiledReference(function)
+    let function = module.functionObject.view() drop module return unsafe compiledReference(function)
   }
   return unsafe backtrace.bytecode(compiled)
 }
 // Binding eligibility belongs to the bytecode, not to a debugger session. This
 // survives disable/enable without owning unbound scripts or retaining dead realms.
-pub unsafe fn deferSource(compiled: ValueBits, deferred: bool) -> () {
+pub unsafe effect fn deferSource(compiled: ValueBits, deferred: bool) -> () ! OutOfMemoryError ? &mut Allocator {
   let reference = match unsafe compiledReference(compiled) { Option<*mut HeapHeader>.Some { value } => value _ => { return } }
   let mut anchor = () let code = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut anchor, reference)
-  if code.debuggerMetadata.sourceDeferred == deferred { return }
-  code.debuggerMetadata.sourceDeferred = deferred
+  // Code compiled without debugger metadata has none to defer until it is deferred.
+  if code.debugger.isNone() {
+    if !deferred { return }
+    code.debugger = run ThinBox<DebuggerMetadata>.make(DebuggerMetadata.make())
+  }
+  let metadata = code.debugger.getMut()
+  if metadata.sourceDeferred == deferred { return }
+  metadata.sourceDeferred = deferred drop metadata
   let count = code.constants.length() drop code
   let mut i: usize = 0
   while i < count {
     let parent = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference)
     let child = parent.constants.get(i) drop parent
-    if let ValueBits.FunctionBytecode { .. } = child { unsafe deferSource(child, deferred) }
+    if let ValueBits.FunctionBytecode { .. } = child { run unsafe deferSource(child, deferred) }
     i = i + 1
   }
 }
@@ -320,21 +328,23 @@ unsafe effect fn framesBody<'m, S: EngineServices>(engine: &mut Engine<'m, S>, c
     run unsafe common.define(&mut engine, context, out, b"callFrameId", frameId, 7)
     let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, frame.bytecode) let name = code.name
     let mut point = Location { pc: 0, sourcePosition: 0, line: 0, column: 0, scope: 0, debuggerStatement: false, statementStart: false }
+    let empty = DebuggerMetadata.make() let metadata = debuggerOf(&code, &empty)
     let mut j: usize = 0
-    while j < code.debuggerMetadata.locations.length() {
-      let candidate = code.debuggerMetadata.locations.get(j) if u32.toUsize(candidate.pc) > frame.pc { break } point = candidate j = j + 1
+    while j < metadata.locations.length() {
+      let candidate = metadata.locations.get(j) if u32.toUsize(candidate.pc) > frame.pc { break } point = candidate j = j + 1
     }
-    drop code
+    drop metadata drop code
     let functionName = run unsafe atom(&mut engine, context, name)
     run unsafe common.define(&mut engine, context, out, b"functionName", functionName, 7)
     let location = run unsafe locationObject(&mut engine, context, frame.bytecode, point, 0, &mut scope)
     run unsafe common.define(&mut engine, context, out, b"location", location, 7)
-    if let Option<Binding>.Some { value: binding } = unsafe scopes.binding(rt, frame, 0) {
-      let receiver = if binding.uninitialized { ValueBits.Undefined } else { binding.value }
+    if let Option<Binding>.Some { value: found } = move unsafe scopes.binding(rt, frame, 0) {
+      let mut binding = move found
+      let receiver = if binding.uninitialized { ValueBits.Undefined } else { binding.value.take().intoBits() }
       run unsafe common.define(&mut engine, context, out, b"this", receiver, 7)
     }
     let realm = unsafe HeapCell.payload<ContextState, ()>(&anchor, frame.context)
-    let global = unsafe realm.globalObject.retained() drop realm
+    let global = realm.globalObject.dup().intoBits() drop realm
     run unsafe common.define(&mut engine, context, out, b"global", global, 7)
     let token = run unsafe idString(&mut engine, context, usize.toU64(Pointer.address<HeapHeader>(frame.context)))
     run unsafe common.define(&mut engine, context, out, b"contextToken", token, 7)
@@ -351,14 +361,15 @@ unsafe effect fn bindings<'m, S: EngineServices>(engine: &mut Engine<'m, S>, con
   let rt = unsafe runtime.contextRuntime(context) let memory = engine.memory scope.values[0] = run unsafe common.array(&mut engine, memory, context)
   let count = unsafe scopes.bindingCount(rt, frame) let mut i: usize = 0
   while i < count {
-    let binding = match unsafe scopes.binding(rt, frame, i) { Option<Binding>.Some { value } => move value _ => { break } }
+    let mut binding = match move unsafe scopes.binding(rt, frame, i) { Option<Binding>.Some { value } => move value _ => { break } }
     let mut local = binding.kind == scopes.ARGUMENT || binding.scope <= 0
     if binding.kind == scopes.LOCAL && binding.scope > 0 {
       let anchor = () let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, frame.bytecode)
-      local = code.debuggerMetadata.scopes.get(i32.toUsize(binding.scope)).parent <= 0
+      let empty = DebuggerMetadata.make()
+      local = debuggerOf(&code, &empty).scopes.get(i32.toUsize(binding.scope)).parent <= 0
     }
     if binding.kind == scopes.CLOSURE { local = false }
-    scope.values[2] = binding.value scope.values[1] = run unsafe object(&mut engine, context) let out = scope.values[1]
+    scope.values[2] = binding.value.take().intoBits() scope.values[1] = run unsafe object(&mut engine, context) let out = scope.values[1]
     let name = run unsafe atom(&mut engine, context, binding.name)
     run unsafe common.define(&mut engine, context, out, b"name", name, 7)
     let value = scope.take(2)
@@ -405,13 +416,15 @@ unsafe effect fn dispatchBody<'m, S: EngineServices>(engine: &mut Engine<'m, S>,
       if entry.script == id {
         if operation == 24 && token >= entry.firstLocation && token - entry.firstLocation < entry.locations {
           let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, entry.reference)
-          let point = code.debuggerMetadata.locations.get(token - entry.firstLocation) drop code
+          let empty = DebuggerMetadata.make()
+          let point = debuggerOf(&code, &empty).locations.get(token - entry.firstLocation) drop code
           return ValueBits.Bool { value: run unsafe debugger.addBreakpoint(rt, entry.reference, u32.toUsize(point.pc)) }
         }
         if operation == 23 {
           let mut j: usize = 0
           while j < entry.locations {
-            let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, entry.reference) let point = code.debuggerMetadata.locations.get(j) drop code
+            let empty = DebuggerMetadata.make()
+            let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, entry.reference) let point = debuggerOf(&code, &empty).locations.get(j) drop code
             let value = run unsafe locationObject(&mut engine, context, entry.reference, point, entry.firstLocation + j, &mut scope)
             run unsafe common.defineIndex(&mut engine, context, scope.values[0], output, value) output = output + 1 j = j + 1
           }
