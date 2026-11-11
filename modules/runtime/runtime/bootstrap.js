@@ -521,7 +521,7 @@ Object.assign(process, {
   setUncaughtExceptionCaptureCallback: internalRequire('internal/startup_controls').setUncaughtExceptionCaptureCallback,
   hasUncaughtExceptionCaptureCallback: internalRequire('internal/startup_controls').hasUncaughtExceptionCaptureCallback,
   exit(code) { if (code !== undefined) process.exitCode = code; if (!process._exiting) { process._exiting = true; process.emit('exit', Number(process.exitCode) || 0); } if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushAtExit(); rawStd.exit(Number(process.exitCode) || 0); },
-  kill(pid, signal = 'SIGTERM') { const number = typeof signal === 'string' ? rawOS[signal] : signal; if (number === undefined) throw Object.assign(new TypeError('Unknown signal: ' + signal), { code: 'ERR_UNKNOWN_SIGNAL' }); const code = rawOS.kill(pid, number); if (code < 0) throw systemError(code, 'kill'); return true; }
+  kill(pid, signal = 'SIGTERM') { const number = typeof signal === 'string' ? rawOS[signal] : signal; if (number === undefined) throw Object.assign(new TypeError('Unknown signal: ' + signal), { code: 'ERR_UNKNOWN_SIGNAL' }); const code = rawOS.kill(pid, number); if (code < 0) { const name = errnoNames.get(Math.abs(code)) || 'UNKNOWN'; throw Object.assign(new Error('kill ' + name), { errno: -Math.abs(code), code: name, syscall: 'kill' }); } return true; }
 });
 Object.defineProperty(process, 'config', { writable: false });
 Object.defineProperty(process, 'allowedNodeEnvironmentFlags', {

@@ -11,7 +11,7 @@ const host = require('internal/host');
 const fs = require('fs');
 const path = require('path');
 const { Buffer } = require('buffer');
-const { codedError } = require('internal/errors');
+const { codedError } = require('internal/loader/errors');
 
 const compileCacheStatus = Object.freeze(Object.assign(Object.create(null), {
   FAILED: 0, ENABLED: 1, ALREADY_ENABLED: 2, DISABLED: 3,

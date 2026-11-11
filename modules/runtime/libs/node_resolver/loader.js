@@ -60,7 +60,10 @@ function createLoader(host, builtins) {
 
   // Node's own errors: their stack and toString read "Name [CODE]: message". A missing
   // CommonJS module is a plain Error with a code, as in Node.
-  const { codedError, invalidArgType, invalidArgValue } = require('internal/errors');
+  const { codedError } = require('./errors');
+  const { codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE } } = require('internal/validators');
+  const invalidArgType = (name, expected, value) => new ERR_INVALID_ARG_TYPE(name, expected, value);
+  const invalidArgValue = (name, value, reason) => new ERR_INVALID_ARG_VALUE(name, value, reason);
   function error(code, message, properties) {
     if (code === 'MODULE_NOT_FOUND') return Object.assign(new Error(message), { code }, properties);
     const type = code === 'ERR_INVALID_ARG_TYPE' || code === 'ERR_INVALID_ARG_VALUE' || code === 'ERR_MISSING_ARGS' ||
