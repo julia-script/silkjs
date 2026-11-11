@@ -812,7 +812,9 @@ Server.prototype.close = function(cb) {
   this._removeAbort?.();
   this._detachTransport();
   // Like Node: sockets sent to child processes count until every child reports them closed.
-  if (this._usingWorkers) {
+  // A child that already exited has left _workers; with none left there is nothing to wait
+  // for (Node would wait forever when every child exits before close()).
+  if (this._usingWorkers && this._workers.length) {
     let left = this._workers.length;
     const onWorkerClose = () => {
       if (--left !== 0) return;
@@ -856,7 +858,7 @@ Server.prototype[EventEmitter.captureRejectionSymbol] = function(err, event, soc
 Server.prototype.getConnections = function(cb) {
   validateFunction(cb, 'cb');
   const end = (err, connections) => process.nextTick(cb, err, connections);
-  if (!this._usingWorkers) { end(null, this._connections); return this; }
+  if (!this._usingWorkers || !this._workers.length) { end(null, this._connections); return this; }
   // Like Node: the server's own connections plus each child's count.
   let left = this._workers.length;
   let total = this._connections;
