@@ -941,8 +941,8 @@ function createLoader(host, builtins) {
     return makeRequire(filename, parent === undefined ? cache[filename] : parent, allowAsync);
   }
 
-  function runMain(filename, inputTypeSet = false) {
-    const resolved = resolveMain(filename);
+  // resolved, when given, is resolveMain(filename) as the caller just got it.
+  function runMain(filename, inputTypeSet = false, resolved = resolveMain(filename)) {
     if (hooks.active() || resolved.format === undefined || resolved.format.endsWith('-typescript')) {
       const loaded = loadSource(resolved, undefined, hooks.hasAsync(), 'require');
       resolved.format = loaded.format;
