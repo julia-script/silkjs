@@ -1,4 +1,4 @@
-// Adapted from Node.js v24.11.0 for Silk QuickJS.
+// Adapted from Node.js v24.22.1 for Silk QuickJS.
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -192,8 +192,8 @@ Duplex.fromWeb = function(pair, options) {
     options);
 };
 
-Duplex.toWeb = function(duplex) {
-  return lazyWebStreams().newReadableWritablePairFromDuplex(duplex);
+Duplex.toWeb = function(duplex, options) {
+  return lazyWebStreams().newReadableWritablePairFromDuplex(duplex, options);
 };
 
 let duplexify;

@@ -40,7 +40,7 @@ const {
   AbortError, codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_STREAM_PREMATURE_CLOSE },
   kEmptyObject, normalizeEncoding, validateBoolean, validateObject,
 } = require('internal/streams/support');
-const finished = require('internal/streams/end-of-stream');
+const { eos: finished } = require('internal/streams/end-of-stream');
 const encoder = new TextEncoder();
 const zlibFailures = new Set(['Z_ERRNO', 'Z_STREAM_ERROR', 'Z_DATA_ERROR', 'Z_MEM_ERROR',
   'Z_BUF_ERROR', 'Z_VERSION_ERROR', 'Z_NEED_DICT']);

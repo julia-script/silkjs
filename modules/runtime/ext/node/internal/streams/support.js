@@ -85,6 +85,14 @@ function once(callback, { preserveReturnValue = false } = shared.kEmptyObject) {
     return result;
   };
 }
+function assignFunctionName(name, fn) {
+  if (typeof name === 'symbol') {
+    const description = name.description;
+    name = description === undefined ? '' : `[${description}]`;
+  }
+  Object.defineProperty(fn, 'name', { __proto__: null, value: name, configurable: true });
+  return fn;
+}
 function normalizeEncoding(encoding) {
   if (!encoding) return 'utf8';
   switch (String(encoding).toLowerCase()) {
@@ -103,6 +111,7 @@ module.exports = {
   codes,
   aggregateTwoErrors,
   once,
+  assignFunctionName,
   normalizeEncoding,
   promisify: { custom: Symbol.for('nodejs.util.promisify.custom') },
 };
