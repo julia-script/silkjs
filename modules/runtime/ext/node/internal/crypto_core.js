@@ -67,6 +67,7 @@ const codes = {
     else received = inspect(value);
     return error('ERR_OUT_OF_RANGE', `${replace ? name : `The value of "${name}" is out of range.`} It must be ${range}. Received ${received}`, RangeError);
   },
+  ERR_MISSING_PASSPHRASE: (message = 'Passphrase required for encrypted key') => error('ERR_MISSING_PASSPHRASE', message, TypeError),
   ERR_MISSING_OPTION: option => error('ERR_MISSING_OPTION', `${option} is required`, TypeError),
   ERR_INCOMPATIBLE_OPTION_PAIR: (a, b) => error('ERR_INCOMPATIBLE_OPTION_PAIR', `Option "${a}" cannot be used in combination with option "${b}"`, TypeError),
   ERR_INVALID_THIS: type => error('ERR_INVALID_THIS', `Value of "this" must be of type ${type}`, TypeError),

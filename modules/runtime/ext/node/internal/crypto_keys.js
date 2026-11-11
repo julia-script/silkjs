@@ -53,7 +53,7 @@ function exportJwk(key, encoded, publicEncoded) {
   if (id === rsaOid) { const parts = root(payload); const names = privateKey ? ['n', 'e', 'd', 'p', 'q', 'dp', 'dq', 'qi'] : ['n', 'e']; const result = { kty: 'RSA' }; names.forEach((name, i) => { result[name] = b64(unsigned(parts[i + (privateKey ? 1 : 0)])); }); return result; }
   if (id === ecOid) {
     const named = algorithm[1] && algorithm[1].data.toString('hex'), crv = Object.keys(curves).find(k => curves[k].oid === named);
-    if (!crv) throw error('ERR_CRYPTO_JWK_UNSUPPORTED_CURVE', 'Unsupported JWK curve');
+    if (!crv) throw error('ERR_CRYPTO_JWK_UNSUPPORTED_CURVE', `Unsupported JWK EC curve: ${real ? c.keyObjectDetails(key).namedCurve : named}.`);
     let pub = payload, d;
     if (privateKey) { const parts = root(payload); d = parts[1].data; const publicPart = parts.find(p => p.tag === 161); if (publicPart) pub = parse(publicPart.data).data.subarray(1); else { let result; if (publicEncoded) result = exportJwk({ type: 'public' }, publicEncoded); else { const publicKey = require('crypto').createPublicKey(key); try { result = exportJwk(publicKey); } finally { require('internal/crypto_core').release(publicKey); } } result.d = b64(d); return result; } }
     const size = curves[crv].size; if (pub[0] !== 4 || pub.length !== size * 2 + 1) fail();
@@ -61,7 +61,7 @@ function exportJwk(key, encoded, publicEncoded) {
   }
   const crv = Object.keys(okp).find(k => okp[k] === id);
   if (crv) { let x = payload, d; if (privateKey) { d = parse(payload).data; if (publicEncoded) x = decode(exportJwk({ type: 'public' }, publicEncoded).x); else { const publicKey = require('crypto').createPublicKey(key); try { x = decode(exportJwk(publicKey).x); } finally { require('internal/crypto_core').release(publicKey); } } } const result = { crv, x: b64(x), kty: 'OKP' }; if (privateKey) result.d = b64(d); return result; }
-  throw error('ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE', 'Unsupported JWK key type');
+  throw error('ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE', 'Unsupported JWK Key Type.');
 }
 function signature(data, size, toDer) { data = bytes(data); if (toDer) { if (data.length !== size * 2) throw error('ERR_CRYPTO_INVALID_SIGNATURE', 'Invalid P1363 signature length'); return sequence(integer(data.subarray(0, size)), integer(data.subarray(size))); } const parts = root(data); if (parts.length !== 2) fail(); const result = Buffer.alloc(size * 2); parts.forEach((part, i) => { const b = unsigned(part); if (b.length > size) fail(); result.set(b, (i + 1) * size - b.length); }); return result; }
 module.exports = { importJwk, encodeJwk, exportJwk, signature };

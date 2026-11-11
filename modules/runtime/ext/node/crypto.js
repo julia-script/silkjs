@@ -1,3 +1,28 @@
+// crypto adapted from Node.js v24.22.1 lib/crypto.js and lib/internal/crypto (keys.js,
+// sig.js, diffiehellman.js, keygen.js, cipher.js, hash.js): the same argument handling,
+// validation and error shapes, with the checks of src/crypto/*.cc, on the runtime's
+// native OpenSSL host (src/ext/crypto_native.silk).
+// Copyright Joyent, Inc. and other Node contributors.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the
+// following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+// USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 'use strict';
 const c = require('internal/crypto_core');
 const { Buffer, call, submit, packed, bytes, binary, integer, callback, error, invalid, output, attach, handle, release, name } = c;
@@ -678,9 +703,12 @@ class PrivateKeyObject extends AsymmetricKeyObject {
   }
 }
 const encodingNames = { pkcs1: 'pkcs1', pkcs8: 'pkcs8', spki: 'spki', sec1: 'sec1' };
+// GetPrivateKeyEncodingFromJs: the cipher must be known (Cipher::FromNameForKeyEncoding).
+function checkKeyCipher(cipher) { if (cipher != null && cipherDetails(cipher) === undefined) throw codes.ERR_CRYPTO_UNKNOWN_CIPHER(); }
 function exportAsymmetric(key, options) {
   const isPrivate = keySlotsOf(key).type === 'private', keyType = asymmetricKeyTypeOf(key);
   const { format, type, cipher, passphrase } = isPrivate ? parsePrivateKeyEncoding(options, keyType) : parsePublicKeyEncoding(options, keyType);
+  checkKeyCipher(cipher);
   const structure = type === 'spki' ? 'SubjectPublicKeyInfo' : type === 'pkcs8' ? 'PrivateKeyInfo' : 'type-specific';
   const traditional = format === 'pem' && cipher != null && (type === 'pkcs1' || type === 'sec1') ? 1 : 0;
   const result = call('keyExport', [handle(key), format.toUpperCase(), structure, isPrivate ? 1 : 0, cipher == null ? '' : cipher, packed(passphrase === undefined ? Buffer.alloc(0) : passphrase), traditional]);
@@ -791,13 +819,26 @@ function newKeyObject(type, value) {
 function keyFromPrepared(prepared, type) {
   if (prepared.keyObject !== undefined) {
     const object = prepared.keyObject;
-    if (type === 'public' && keySlotsOf(object).type === 'private') return importDer(exportAsymmetric(object, { format: 'der', type: 'pkcs8' }), 'public');
+    if (type === 'public' && keySlotsOf(object).type === 'private') return newKeyObject('public', call('keyPublic', [handle(object)]));
     return object;
   }
   if (prepared.format === 'jwk') return require('internal/crypto_keys').importJwk(prepared.data, type);
   if (prepared.raw !== undefined) return c.providerRawImport(prepared.raw, type);
-  const { data, format, passphrase } = prepared;
-  return newKeyObject(type, call('keyImport', [packed(bytes(data)), format.toUpperCase(), type === 'private' ? 1 : 0, packed(passphrase === undefined ? Buffer.alloc(0) : passphrase), passphrase === undefined ? 0 : 1]));
+  const { format, passphrase } = prepared, data = bytes(prepared.data);
+  const [structure, keyType] = keyStructure(format, prepared.type, data);
+  let id;
+  try { id = call('keyImport', [packed(data), format.toUpperCase(), type === 'private' ? 1 : 0, packed(passphrase === undefined ? Buffer.alloc(0) : passphrase), passphrase === undefined ? 0 : 1, structure, keyType]); }
+  catch (e) { if (e.code === 'ERR_MISSING_PASSPHRASE') throw codes.ERR_MISSING_PASSPHRASE(); throw e; }
+  return newKeyObject(type, id);
+}
+// Node parses each named encoding with its own reader (d2i_RSAPublicKey,
+// d2i_PUBKEY, d2i_ECPrivateKey, PEM labels), so other structures are refused.
+const kDerStructures = { pkcs1: ['type-specific', 'RSA'], spki: ['SubjectPublicKeyInfo', ''], sec1: ['type-specific', 'EC'] };
+const kPemStructures = { 'RSA PUBLIC KEY': ['type-specific', 'RSA'], 'PUBLIC KEY': ['SubjectPublicKeyInfo', ''] };
+function keyStructure(format, type, data) {
+  if (format === 'der') return kDerStructures[type] ?? ['', ''];
+  const label = /-----BEGIN ([A-Z0-9 ]+)-----/.exec(data.toString('latin1'));
+  return (label && kPemStructures[label[1]]) ?? ['', ''];
 }
 function importDer(data, type) { return newKeyObject(type, call('keyImport', [packed(data), 'DER', type === 'private' ? 1 : 0, packed(Buffer.alloc(0)), 0])); }
 // lib/internal/crypto/keys.js prepareSecretKey: the secret's bytes.
@@ -817,17 +858,20 @@ function createPrivateKey(key) { return keyFromPrepared(prepareAsymmetricKey(key
 // Key input for operations: a KeyObject (owned when it was created here) of a public or private key.
 // `before` runs between input validation and key import, like the JS checks
 // Node performs before handing the key data to C++.
-function preparedKeyObject(key, ctx, name, before) {
+// `anyType` imports key data as public or private whatever the context, like
+// GetPublicOrPrivateKeyFromJs in the RSA cipher operations.
+function preparedKeyObject(key, ctx, name, before, anyType = false) {
   const prepared = prepareAsymmetricKey(key, ctx, name);
   if (before !== undefined) before();
   if (prepared.keyObject !== undefined) return { key: prepared.keyObject, owned: false };
-  const type = ctx === kConsumePrivate ? 'private' : undefined;
-  if (type === 'private') return { key: keyFromPrepared(prepared, 'private'), owned: true };
+  if (ctx === kConsumePrivate && !anyType) return { key: keyFromPrepared(prepared, 'private'), owned: true };
+  if (anyType) { try { return { key: keyFromPrepared(prepared, 'private'), owned: true }; } catch (e) { try { return { key: keyFromPrepared(prepared, 'public'), owned: true }; } catch { throw e; } } }
   try { return { key: keyFromPrepared(prepared, 'public'), owned: true }; } catch (e) { try { return { key: keyFromPrepared(prepared, 'private'), owned: true }; } catch { throw e; } }
 }
 // lib/internal/crypto/keygen.js createJob, with the checks of the C++ key
 // generation configs (crypto_rsa.cc, crypto_dsa.cc, crypto_ec.cc, crypto_dh.cc).
 const kNamedKeyPairs = { __proto__: null, ed25519: 'ED25519', ed448: 'ED448', x25519: 'X25519', x448: 'X448', 'ml-kem-512': 'ML-KEM-512', 'ml-kem-768': 'ML-KEM-768', 'ml-kem-1024': 'ML-KEM-1024', 'ml-dsa-44': 'ML-DSA-44', 'ml-dsa-65': 'ML-DSA-65', 'ml-dsa-87': 'ML-DSA-87' };
+for (const hash of ['SHA2', 'SHAKE']) for (const size of ['128', '192', '256']) for (const kind of ['s', 'f']) { const name = `SLH-DSA-${hash}-${size}${kind}`; kNamedKeyPairs[name.toLowerCase()] = name; }
 const kNistCurves = ['B-163', 'B-233', 'B-283', 'B-409', 'B-571', 'K-163', 'K-233', 'K-283', 'K-409', 'K-571', 'P-192', 'P-224', 'P-256', 'P-384', 'P-521'];
 function keygenEncoding(type, options) {
   const { publicKeyEncoding, privateKeyEncoding } = options ?? {};
@@ -838,7 +882,7 @@ function keygenEncoding(type, options) {
   }
   if (privateKeyEncoding != null) {
     if (typeof privateKeyEncoding !== 'object') throw codes.ERR_INVALID_ARG_VALUE('options.privateKeyEncoding', privateKeyEncoding);
-    parsePrivateKeyEncoding(privateKeyEncoding, type, 'options.privateKeyEncoding'); result.privateKeyEncoding = privateKeyEncoding;
+    checkKeyCipher(parsePrivateKeyEncoding(privateKeyEncoding, type, 'options.privateKeyEncoding').cipher); result.privateKeyEncoding = privateKeyEncoding;
   }
   return result;
 }
@@ -869,7 +913,9 @@ function keygenArgs(type, options) {
         validate.string(mgf1Hash, 'options.mgf1Hash');
         if (mgf1HashAlgorithm && mgf1Hash !== mgf1HashAlgorithm) throw codes.ERR_INVALID_ARG_VALUE('options.mgf1Hash', mgf1Hash);
       }
-      return ['RSA-PSS', modulusLength, '', packed(exponent), keygenDigest(hashAlgorithm || hash, 'Invalid digest'), keygenDigest(mgf1HashAlgorithm || mgf1Hash, 'Invalid MGF1 digest'), saltLength ?? -1];
+      // RFC 8017 9.1: without an MGF1 digest, MGF1 uses the message digest (ncrypto RSA-PSS keygen).
+      const digest = keygenDigest(hashAlgorithm || hash, 'Invalid digest'), mgf1 = keygenDigest(mgf1HashAlgorithm || mgf1Hash, 'Invalid MGF1 digest');
+      return ['RSA-PSS', modulusLength, '', packed(exponent), digest, mgf1 || digest, saltLength ?? (digest ? digestSize(digest) : -1)];
     }
     case 'dsa': {
       validate.object(options, 'options');
@@ -880,12 +926,14 @@ function keygenArgs(type, options) {
     }
     case 'ec': {
       validate.object(options, 'options');
-      const { namedCurve } = options; let { paramEncoding } = options;
+      const { namedCurve, paramEncoding } = options;
       validate.string(namedCurve, 'options.namedCurve');
-      if (paramEncoding == null || paramEncoding === 'named') paramEncoding = '';
-      else if (paramEncoding !== 'explicit') throw codes.ERR_INVALID_ARG_VALUE('options.paramEncoding', paramEncoding);
+      let explicit = false;
+      if (paramEncoding == null || paramEncoding === 'named') explicit = false;
+      else if (paramEncoding === 'explicit') explicit = true;
+      else throw codes.ERR_INVALID_ARG_VALUE('options.paramEncoding', paramEncoding);
       if (!kNistCurves.includes(namedCurve) && !names('curves').includes(namedCurve)) throw codes.ERR_CRYPTO_INVALID_CURVE();
-      return ['EC', 0, namedCurve, packed(Buffer.alloc(0)), '', '', -1, 0, paramEncoding];
+      return ['EC', -1, namedCurve, packed(Buffer.alloc(0)), '', '', -1, explicit ? 3 : 0];
     }
     case 'dh': {
       validate.object(options, 'options');
@@ -911,7 +959,7 @@ function keygenArgs(type, options) {
     }
     default:
       if (kNamedKeyPairs[type] === undefined) throw codes.ERR_INVALID_ARG_VALUE('type', type, 'must be a supported key type');
-      return [kNamedKeyPairs[type], 0, '', packed(Buffer.alloc(0)), '', '', -1];
+      return [kNamedKeyPairs[type], -1, '', packed(Buffer.alloc(0)), '', '', -1];
   }
 }
 function keypair(id, encoding) { const privateKey = newKeyObject('private', id); let publicKey; try { publicKey = createPublicKey(privateKey); const result = { publicKey: encoding.publicKeyEncoding ? publicKey.export(encoding.publicKeyEncoding) : publicKey, privateKey: encoding.privateKeyEncoding ? privateKey.export(encoding.privateKeyEncoding) : privateKey }; if (encoding.publicKeyEncoding) release(publicKey); if (encoding.privateKeyEncoding) release(privateKey); return result; } catch (e) { release(privateKey); if (publicKey) release(publicKey); throw e; } }
@@ -928,6 +976,7 @@ function generateKeyPair(type, options, cb) {
   const job = keygenJob(type, options);
   submit('keyGenerate', job.args, (e, pair) => e ? cb(e) : cb(null, pair.publicKey, pair.privateKey), id => keypair(id, job.encoding));
 }
+Object.defineProperty(generateKeyPair, require('internal/util_promisify').customPromisifyArgs, { value: ['publicKey', 'privateKey'], enumerable: false });
 function secretKeygenLength(type, options) {
   validate.string(type, 'type'); validate.object(options, 'options');
   const { length } = options;
@@ -1086,9 +1135,8 @@ Object.setPrototypeOf(Verify, Writable);
 Verify.prototype._write = Sign.prototype._write;
 Verify.prototype.update = Sign.prototype.update;
 Verify.prototype.verify = function verify(key, signature, sigEncoding) {
-  let options; const info = preparedKeyObject(key, kConsumePublic, 'key', () => { options = signatureOptions(key); });
+  let options; const info = preparedKeyObject(key, kConsumePublic, 'key', () => { options = signatureOptions(key); signature = validate.bufferSource(signature, 'signature', sigEncoding); });
   try {
-    signature = validate.bufferSource(signature, 'signature', sigEncoding);
     if (oneShotKeyType(info.key)) throw codes.ERR_CRYPTO_UNSUPPORTED_OPERATION_DEFAULT();
     const { algorithm, data } = finishSignState(this);
     const der = signatureFromP1363(signature, info.key, options);
@@ -1120,16 +1168,22 @@ function diffieHellman(options, cb) {
 // lib/internal/crypto/cipher.js rsaFunctionFor.
 function rsaFunctionFor(operation, defaultPadding, keyType) {
   return function(options, buffer) {
-    const info = preparedKeyObject(options, keyType === 'private' ? kConsumePrivate : kConsumePublic, 'key');
-    try {
-      const padding = options.padding || defaultPadding;
-      const { oaepHash, encoding } = options;
-      let { oaepLabel } = options;
+    let padding, oaepHash, mgf1Hash, oaepLabel;
+    const info = preparedKeyObject(options, keyType === 'private' ? kConsumePrivate : kConsumePublic, 'key', () => {
+      padding = options.padding || defaultPadding;
+      const { encoding } = options; ({ oaepHash, mgf1Hash, oaepLabel } = options);
       if (oaepHash !== undefined) validate.string(oaepHash, 'key.oaepHash');
+      if (mgf1Hash !== undefined) validate.string(mgf1Hash, 'key.mgf1Hash');
       if (oaepLabel !== undefined) oaepLabel = validate.bufferSource(oaepLabel, 'key.oaepLabel', encoding);
       buffer = validate.bufferSource(buffer, 'buffer', encoding);
+    }, true);
+    try {
+      // PublicKeyCipher::Cipher looks the OAEP digest up after parsing the key.
+      if (oaepHash !== undefined && digestSize(oaepHash) === undefined) throw error('ERR_OSSL_EVP_INVALID_DIGEST', 'Invalid digest used');
+      if (oaepLabel !== undefined && oaepLabel.byteLength > 0x7fffffff) throw codes.ERR_OUT_OF_RANGE_MESSAGE('oaepLabel is too big');
+      if (mgf1Hash !== undefined && digestSize(mgf1Hash) === undefined) throw error('ERR_OSSL_EVP_INVALID_DIGEST', 'Invalid digest used');
       const legacy = operation === 'privateEncrypt' || operation === 'publicDecrypt';
-      return Buffer.from(call(operation, [handle(info.key), packed(buffer), padding, legacy ? '' : oaepHash ?? 'sha1', legacy || oaepLabel === undefined ? undefined : packed(oaepLabel)]));
+      return Buffer.from(call(operation, [handle(info.key), packed(buffer), padding, legacy ? '' : oaepHash ?? 'sha1', legacy || oaepLabel === undefined ? undefined : packed(oaepLabel), legacy ? '' : mgf1Hash ?? '']));
     } finally { if (info.owned) release(info.key); }
   };
 }
@@ -1310,6 +1364,7 @@ c.keyObjectType = key => keySlotsOf(key).type;
 c.keyObjectEquals = keyObjectEquals;
 c.keyObjectSecret = key => Buffer.from(keySlotsOf(key).secret);
 c.keyObjectAsymmetricType = key => asymmetricKeyTypeOf(key);
+c.keyObjectDetails = key => asymmetricKeyDetailsOf(key);
 c.keyObjectDer = key => exportAsymmetric(key, { format: 'der', type: keySlotsOf(key).type === 'private' ? 'pkcs8' : 'spki' });
 c.keygenArgs = keygenArgs;
 c.serializeKeyObject = key => {

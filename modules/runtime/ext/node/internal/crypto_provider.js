@@ -154,6 +154,7 @@ const rawAlgorithms = {
   'ml-kem-512': 'ML-KEM-512', 'ml-kem-768': 'ML-KEM-768', 'ml-kem-1024': 'ML-KEM-1024',
   'ml-dsa-44': 'ML-DSA-44', 'ml-dsa-65': 'ML-DSA-65', 'ml-dsa-87': 'ML-DSA-87',
 };
+for (const hash of ['SHA2', 'SHAKE']) for (const size of ['128', '192', '256']) for (const kind of ['s', 'f']) { const name = `SLH-DSA-${hash}-${size}${kind}`; rawAlgorithms[name.toLowerCase()] = name; }
 function rawFormat(format) { return format === 'raw-public' ? 0 : format === 'raw-private' ? 1 : 2; }
 function rawCompatibility(algorithm, format) {
   if (!Object.prototype.hasOwnProperty.call(rawAlgorithms, algorithm)) {
