@@ -17,7 +17,7 @@ const {
   StringPrototypeIndexOf,
   StringPrototypeSlice,
   StringPrototypeStartsWith,
-} = require('internal/debugger/support').primordials;
+} = require('internal/per_context/primordials');
 
 const { spawn } = require('child_process');
 const net = require('net');
@@ -32,7 +32,7 @@ const {
 const {
   ERR_DEBUGGER_ERROR,
   ERR_DEBUGGER_STARTUP_ERROR,
-} = require('internal/debugger/support').codes;
+} = require('internal/errors').codes;
 const {
     kInvalidCommandLineArgument,
   } = require('internal/debugger/support').exitCodes;

@@ -18,7 +18,7 @@ const {
   RegExpPrototypeSymbolSplit,
   StringPrototypeEndsWith,
   StringPrototypeSplit,
-} = require('internal/debugger/support').primordials;
+} = require('internal/per_context/primordials');
 
 const { EventEmitter } = require('events');
 const util = require('util');

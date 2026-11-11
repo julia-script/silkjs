@@ -88,7 +88,7 @@ const {
   kSubstringSearch,
 } = require('internal/readline/utils');
 let emitKeypressEvents;
-const createLineIterator = require('internal/readline/iterator');
+let kFirstEventParam;
 const {
   clearScreenDown,
   cursorTo,
@@ -96,7 +96,7 @@ const {
 } = require('internal/readline/callbacks');
 
 const { StringDecoder } = require('string_decoder');
-const { ReplHistory } = require('internal/readline/history');
+const { ReplHistory } = require('internal/repl/history');
 
 const kMaxUndoRedoStackSize = 2048;
 const kMincrlfDelay = 100;
@@ -340,7 +340,6 @@ function InterfaceConstructor(input, output, completer, terminal) {
   } else {
     function onSelfCloseWithTerminal() {
       input.removeListener('keypress', onkeypress);
-      releaseKeypress?.();
       input.removeListener('error', onerror);
       input.removeListener('end', ontermend);
       if (output !== null && output !== undefined) {
@@ -349,7 +348,7 @@ function InterfaceConstructor(input, output, completer, terminal) {
     }
 
     emitKeypressEvents ??= require('internal/readline/emitKeypressEvents');
-    const releaseKeypress = emitKeypressEvents(input, this);
+    emitKeypressEvents(input, this);
 
     // `input` usually refers to stdin
     input.on('keypress', onkeypress);
@@ -435,6 +434,10 @@ class Interface extends InterfaceConstructor {
 
   setupHistoryManager(options) {
     this.historyManager = new ReplHistory(this, options);
+
+    if (options.onHistoryFileLoaded) {
+      this.historyManager.initialize(options.onHistoryFileLoaded);
+    }
 
     ObjectDefineProperties(this, kHistoryAccessorDescriptors);
   }
@@ -1615,7 +1618,15 @@ class Interface extends InterfaceConstructor {
    * @returns {AsyncIterableIterator<string>}
    */
   [SymbolAsyncIterator]() {
-    this[kLineObjectStream] ??= createLineIterator(this);
+    if (this[kLineObjectStream] === undefined) {
+      kFirstEventParam ??= require('internal/path_events/symbols').kFirstEventParam;
+      this[kLineObjectStream] = EventEmitter.on(
+        this, 'line', {
+          close: ['close'],
+          highWaterMark: 1024,
+          [kFirstEventParam]: true,
+        });
+    }
     return this[kLineObjectStream];
   }
 }

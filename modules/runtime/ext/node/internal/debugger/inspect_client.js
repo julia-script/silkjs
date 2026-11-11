@@ -12,11 +12,11 @@ const {
   ObjectKeys,
   ObjectValues,
   Promise,
-} = require('internal/debugger/support').primordials;
+} = require('internal/per_context/primordials');
 
 const Buffer = require('buffer').Buffer;
 const crypto = require('crypto');
-const { ERR_DEBUGGER_ERROR } = require('internal/debugger/support').codes;
+const { ERR_DEBUGGER_ERROR } = require('internal/errors').codes;
 const { EventEmitter, once } = require('events');
 const http = require('http');
 const { URL } = require('url');

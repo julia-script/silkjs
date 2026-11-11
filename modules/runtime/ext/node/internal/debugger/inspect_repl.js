@@ -47,9 +47,9 @@ const {
   StringPrototypeStartsWith,
   StringPrototypeToUpperCase,
   StringPrototypeTrim,
-} = require('internal/debugger/support').primordials;
+} = require('internal/per_context/primordials');
 
-const { ERR_DEBUGGER_ERROR } = require('internal/debugger/support').codes;
+const { ERR_DEBUGGER_ERROR } = require('internal/errors').codes;
 
 const { validateString, validateNumber } = require('internal/validators');
 

@@ -25,7 +25,7 @@ const {
   StringPrototypeStartsWith,
   StringPrototypeTrim,
   Symbol,
-} = require('internal/debugger/support').primordials;
+} = require('internal/per_context/primordials');
 
 const { clearTimeout, setTimeout } = require('timers');
 const { SideEffectFreeRegExpPrototypeSymbolReplace } = require('internal/debugger/support');
@@ -38,7 +38,7 @@ const {
   waitForDebugger,
 } = require('internal/debugger/inspect_helpers');
 
-const { ERR_DEBUGGER_STARTUP_ERROR } = require('internal/debugger/support').codes;
+const { ERR_DEBUGGER_STARTUP_ERROR } = require('internal/errors').codes;
 const {
     kGenericUserError,
     kNoFailure,

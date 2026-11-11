@@ -24,15 +24,16 @@
 
 'use strict';
 
-const { codes: { ERR_INVALID_ARG_TYPE } } = require('internal/path_events/support');
-const { codes: { ERR_INVALID_ARG_VALUE, ERR_MISSING_ARGS, ERR_OUT_OF_RANGE } } = require('internal/streams/support');
+const {
+  codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_MISSING_ARGS, ERR_OUT_OF_RANGE, ERR_UNKNOWN_SIGNAL },
+} = require('internal/errors');
 
 function codedError(Base, code, message) {
   const error = new Base(message);
   error.code = code;
   return error;
 }
-function unknownSignal(signal) { return codedError(TypeError, 'ERR_UNKNOWN_SIGNAL', `Unknown signal: ${signal}`); }
+function unknownSignal(signal) { return new ERR_UNKNOWN_SIGNAL(signal); }
 
 function validateString(value, name) {
   if (typeof value !== 'string') throw new ERR_INVALID_ARG_TYPE(name, 'string', value);
