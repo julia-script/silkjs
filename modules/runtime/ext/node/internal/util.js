@@ -344,6 +344,9 @@ function deprecateInstantiation(target, code, ...args) {
   return ReflectConstruct(target, args);
 }
 
+// Node builds this from internalBinding('string_decoder').encodings.
+const encodingsMap = { __proto__: null, ascii: 0, utf8: 1, base64: 2, utf16le: 3, latin1: 4, hex: 5, buffer: 6, base64url: 7 };
+
 // The system error tables live in internal/util_public/system here.
 function getSystemErrorName(err) {
   return require('internal/util_public/system').getSystemErrorName(err);
@@ -355,6 +358,7 @@ module.exports = {
   customPromisifyArgs: kCustomPromisifyArgsSymbol,
   deprecate,
   deprecateInstantiation,
+  encodingsMap,
   getDeprecationWarningEmitter,
   getSystemErrorName,
   isError,
