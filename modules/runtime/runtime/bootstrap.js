@@ -484,15 +484,15 @@ function output(fd) {
   } };
 }
 host.stdout = output(1); host.stderr = output(2);
-// Text written to a descriptor synchronously, with no stream (internal/stdio
-// direct). False when nothing could be written; a failure after a partial
-// write drops the rest, as a stream write that console ignores would.
+// Text written to a descriptor now, with no stream (internal/stdio direct):
+// true when all of it was written, false when none of it was, and the bytes
+// left over when a write stopped part way (a full nonblocking pipe, or an error).
 host.writeText = (fd, text) => {
   const bytes = Buffer.from(text);
   let offset = 0;
   while (offset < bytes.length) {
     const count = rawOS.write(fd, bytes.buffer, bytes.byteOffset + offset, bytes.length - offset);
-    if (count <= 0) return offset !== 0;
+    if (count <= 0) return offset === 0 ? false : bytes.subarray(offset);
     offset += count;
   }
   return true;
@@ -1349,8 +1349,9 @@ Environment:
 }
 function referencedWork() {
   if (native.hasPendingIO()) return true;
-  for (const timer of timers.values()) if (timer[kRefed] && !timer._destroyed) return true;
-  for (const timer of immediates.values()) if (timer[kRefed] && !timer._destroyed) return true;
+  // Most I/O-bound turns have no timers: skip creating the iterators.
+  if (timers.size !== 0) for (const timer of timers.values()) if (timer[kRefed] && !timer._destroyed) return true;
+  if (immediates.size !== 0) for (const timer of immediates.values()) if (timer[kRefed] && !timer._destroyed) return true;
   return false;
 }
 function fireTimeout(timer, start) {
@@ -1402,7 +1403,7 @@ function pollTimeout(pendingPromise) {
   const referenced = referencedWork();
   if (!referenced && pendingPromise === undefined) return 0;
   let due = Infinity;
-  for (const timer of timers.values()) if (!timer._destroyed && timer[kDue] < due) due = timer[kDue];
+  if (timers.size !== 0) for (const timer of timers.values()) if (!timer._destroyed && timer[kDue] < due) due = timer[kDue];
   // A hook may await an unreferenced timer or an externally settled promise.
   // Keep nested waits interruptible without emitting main-loop lifecycle events.
   if (!referenced && due === Infinity) return 1;
@@ -1414,7 +1415,7 @@ function loopTurn(pendingPromise) {
   const now = native.now();
   // Only the due timers are ordered; most turns have none.
   let due;
-  for (const timer of timers.values()) if (!timer._destroyed && timer[kDue] <= now) (due ||= []).push(timer);
+  if (timers.size !== 0) for (const timer of timers.values()) if (!timer._destroyed && timer[kDue] <= now) (due ||= []).push(timer);
   if (due !== undefined) {
     if (due.length > 1) due.sort((a, b) => a[kDue] - b[kDue] || a[kTimerId] - b[kTimerId]);
     for (const timer of due) if (!timer._destroyed && timer[kDue] <= now && timers.has(timer[kTimerId])) fireTimeout(timer, now);
@@ -1422,7 +1423,7 @@ function loopTurn(pendingPromise) {
   native.pollIO(pollTimeout(pendingPromise));
   pollWorkers();
   checkpoint();
-  for (const listener of loopListeners) listener();
+  if (loopListeners.size !== 0) for (const listener of loopListeners) listener();
   if (immediates.size !== 0) {
     for (const immediate of [...immediates.values()]) {
       if (!immediate._destroyed) fireImmediate(immediate);
