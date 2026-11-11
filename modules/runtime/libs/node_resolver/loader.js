@@ -3,7 +3,6 @@
 const { analyzeExports } = require('./cjs_exports');
 const { createHooks } = require('./hooks');
 const own = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
-const includesBuiltin = Function.prototype.call.bind(Array.prototype.includes);
 const builtinPrefix = Function.prototype.call.bind(String.prototype.startsWith);
 const builtinSlice = Function.prototype.call.bind(String.prototype.slice);
 
@@ -20,7 +19,12 @@ function createLoader(host, builtins) {
   const path = host.path;
   // Node's internalModuleStat probes metadata without public fs permissions.
   // Keep this capability private; source and package JSON reads remain checked.
-  const moduleStat = host.moduleStat || (filename => host.stat(filename, true));
+  // It answers null for a path that is not there.
+  const stat = host.moduleStat;
+  // Package files already read, by directory. As in Node, one is read once.
+  const packages = new Map();
+  // The source format() read to tell a module from a script, for the load that follows.
+  let probed = null;
   const cache = Object.create(null);
   const extensions = Object.create(null);
   let main;
@@ -45,9 +49,13 @@ function createLoader(host, builtins) {
     return result;
   }
 
-  function text(filename) {
-    const bytes = host.readFile(filename);
-    return typeof bytes === 'string' ? bytes : host.Buffer.from(bytes).toString('utf8');
+  const text = host.readText;
+
+  function probedText(filename) {
+    if (probed === null || probed.filename !== filename) return text(filename);
+    const source = probed.source;
+    probed = null;
+    return source;
   }
 
   function cleanSource(source) {
@@ -57,14 +65,6 @@ function createLoader(host, builtins) {
       source = newline < 0 ? '' : '\n' + source.slice(newline + 1);
     }
     return source;
-  }
-
-  function stat(filename) {
-    try { return moduleStat(filename); }
-    catch (cause) {
-      if (cause.code === 'ENOENT' || cause.code === 'ENOTDIR') return null;
-      throw cause;
-    }
   }
 
   function isFile(filename) {
@@ -112,7 +112,9 @@ function createLoader(host, builtins) {
   function readPackage(directory) {
     const filename = path.join(directory, 'package.json');
     if (typeof host.checkModuleRead === 'function') host.checkModuleRead(filename);
-    if (!isFile(filename)) return null;
+    const known = packages.get(directory);
+    if (known !== undefined) return known;
+    if (!isFile(filename)) { packages.set(directory, null); return null; }
     let data;
     try { data = JSON.parse(text(filename).replace(/^\uFEFF/, '')); }
     catch (cause) {
@@ -120,7 +122,9 @@ function createLoader(host, builtins) {
       throw error('ERR_INVALID_PACKAGE_CONFIG', `Invalid package config ${filename}: ${cause.message}`, { path: filename, cause });
     }
     if (data === null || typeof data !== 'object' || Array.isArray(data)) data = {};
-    return { directory, filename, data };
+    const pkg = { directory, filename, data };
+    packages.set(directory, pkg);
+    return pkg;
   }
 
   function packageScope(filename) {
@@ -150,12 +154,12 @@ function createLoader(host, builtins) {
   function builtinName(specifier) {
     if (builtinPrefix(specifier, 'node:')) {
       const name = builtinSlice(specifier, 5);
-      if (!includesBuiltin(builtins.names(), name) && !includesBuiltin(builtins.names(), specifier)) {
+      if (!builtins.listed(name) && !builtins.listed(specifier)) {
         throw error('ERR_UNKNOWN_BUILTIN_MODULE', `No such built-in module: ${specifier}`);
       }
       return name;
     }
-    return includesBuiltin(builtins.names(), specifier) && builtins.has(specifier) ? specifier : null;
+    return builtins.listed(specifier) && builtins.has(specifier) ? specifier : null;
   }
 
   function loadBuiltin(filename) {
@@ -184,7 +188,11 @@ function createLoader(host, builtins) {
     const pkg = ext === '.js' || mode === 'import' ? packageScope(disk) : null;
     if (pkg && pkg.data.type === 'module') return 'module';
     // Embedders may provide Node's syntax detection for ambiguous .js files.
-    if ((!pkg || pkg.data.type !== 'commonjs') && typeof host.detectModuleSyntax === 'function' && host.detectModuleSyntax(cleanSource(text(disk)), disk)) return 'module';
+    if ((!pkg || pkg.data.type !== 'commonjs') && typeof host.detectModuleSyntax === 'function') {
+      const source = text(disk);
+      if (host.detectModuleSyntax(cleanSource(source), disk)) return 'module';
+      probed = { filename: disk, source };
+    }
     return 'commonjs';
   }
 
@@ -789,6 +797,7 @@ function createLoader(host, builtins) {
     return result.format === 'builtin' && !request.startsWith('node:') ? result.filename.slice(5) : result.filename;
   };
   Module._load = (request, parent, isMain) => {
+    probed = null;
     const allowAsync = !!parent && moduleAsyncModes.get(parent) === true;
     return loadResolved(resolve(request, parent, 'require', undefined, undefined, !!isMain, allowAsync), parent, !!isMain, allowAsync);
   };
@@ -815,8 +824,8 @@ function createLoader(host, builtins) {
     if (typeof filename !== 'string' || (!filename.startsWith('file:') && !path.isAbsolute(filename))) throw error('ERR_INVALID_ARG_VALUE', 'The argument must be a file URL or absolute path');
     return requireFor(filename, undefined, false);
   };
-  Module.isBuiltin = name => typeof name === 'string' && (includesBuiltin(builtins.names(), name) ||
-    (builtinPrefix(name, 'node:') && includesBuiltin(builtins.names(), builtinSlice(name, 5))));
+  Module.isBuiltin = name => typeof name === 'string' && (builtins.listed(name) ||
+    (builtinPrefix(name, 'node:') && builtins.listed(builtinSlice(name, 5))));
   Object.defineProperty(Module, 'builtinModules', { enumerable: true, get: () => builtins.names() });
   Module.runMain = () => runMain(process.argv[1]);
   function makeModule(filename, parent) {
@@ -825,7 +834,7 @@ function createLoader(host, builtins) {
     return module;
   }
 
-  extensions['.js'] = (module, filename) => module._compile(text(filename), filename);
+  extensions['.js'] = (module, filename) => module._compile(probedText(filename), filename);
   for (const extension of ['.ts', '.mts', '.cts']) {
     extensions[extension] = (module, filename) => {
       const source = text(filename);
@@ -913,6 +922,7 @@ function createLoader(host, builtins) {
 
   function makeRequire(filename, parent, allowAsync = false) {
     function require(specifier) {
+      probed = null;
       // Unlike the node: form, ordinary builtin names can be overridden through
       // require.cache, matching Node's documented builtin cache behavior.
       const resolved = resolve(specifier, parent || filename, 'require', undefined, undefined, false, allowAsync);
