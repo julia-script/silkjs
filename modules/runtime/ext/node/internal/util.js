@@ -498,13 +498,10 @@ module.exports = {
   lazyDOMException,
   lazyDOMExceptionClass,
   normalizeEncoding,
-<<<<<<< HEAD
+  once,
   SideEffectFreeRegExpPrototypeExec,
   SideEffectFreeRegExpPrototypeSymbolReplace,
   SideEffectFreeRegExpPrototypeSymbolSplit,
-=======
-  once,
->>>>>>> origin/main
   promisify,
   removeColors,
   setOwnProperty,
