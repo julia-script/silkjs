@@ -39,9 +39,9 @@ async function postMessageToThread(destination, value, transferList, timeout) {
       channel.port1.once('close', () => reject(failure('FAILED')));
       channel.port1.unref();
       if (timeout !== undefined && Number.isFinite(timeout)) {
-        const deadline = performance.now() + timeout;
+        const deadline = require('perf_hooks').performance.now() + timeout;
         const expire = () => {
-          const remaining = deadline - performance.now();
+          const remaining = deadline - require('perf_hooks').performance.now();
           if (remaining <= 0) { reject(failure('TIMEOUT')); return; }
           timer = setTimeout(expire, Math.min(remaining, 2147483647));
           timer.unref();

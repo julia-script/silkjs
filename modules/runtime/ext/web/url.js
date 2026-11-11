@@ -46,7 +46,7 @@ function fileURLToPath(value, options) {
   if (windows ? /%(?:2f|5c)/i.test(path) : /%2f/i.test(path)) {
     throw failure('ERR_INVALID_FILE_URL_PATH', 'File URL path must not include encoded ' + (windows ? '\\ or /' : '/') + ' characters');
   }
-  if (!windows && url.hostname !== '') throw failure('ERR_INVALID_FILE_URL_HOST', 'File URL host must be "localhost" or empty');
+  if (!windows && url.hostname !== '') throw failure('ERR_INVALID_FILE_URL_HOST', 'File URL host must be "localhost" or empty on ' + process.platform);
   path = decodeURIComponent(path);
   if (!windows) return path;
   path = path.replace(/\//g, '\\');
@@ -57,7 +57,7 @@ function fileURLToPath(value, options) {
 function fileURLToPathBuffer(value, options) {
   const url = fileURL(value);
   const windows = windowsOption(options);
-  if (!windows && url.hostname !== '') throw failure('ERR_INVALID_FILE_URL_HOST', 'File URL host must be "localhost" or empty');
+  if (!windows && url.hostname !== '') throw failure('ERR_INVALID_FILE_URL_HOST', 'File URL host must be "localhost" or empty on ' + process.platform);
   const { Buffer } = require('buffer');
   let path = url.pathname;
   if (windows) {
