@@ -1,7 +1,8 @@
 'use strict';
 
 // The parts of Node.js lib/internal/async_hooks.js that the ported modules use.
-const { executionAsyncId } = require('async_hooks');
+const asyncHooks = require('async_hooks');
+const { executionAsyncId } = asyncHooks;
 
 const symbols = {
   async_id_symbol: Symbol('asyncId'),
@@ -20,4 +21,7 @@ function getOrSetAsyncId(object) {
   return object[symbols.async_id_symbol] = executionAsyncId();
 }
 
-module.exports = { symbols, defaultTriggerAsyncIdScope, getOrSetAsyncId, executionAsyncId };
+// Whether any hook is enabled, with or without callbacks, as Node's enabledHooksExist.
+function enabledHooksExist() { return asyncHooks._hooksActive(); }
+
+module.exports = { symbols, defaultTriggerAsyncIdScope, getOrSetAsyncId, executionAsyncId, enabledHooksExist };

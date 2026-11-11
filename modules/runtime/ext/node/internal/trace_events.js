@@ -14,6 +14,9 @@ let nextId = 1;
 const stringify = JSON.stringify;
 // Modules that switch a fast path on and off with a category group: [group, callback, state].
 const watchers = [];
+// getCategoryEnabledBuffer: one byte per category group, kept current by sync().
+const enabledBuffers = new Map();
+let stateUpdateHandler;
 function native(operation, value, timestamp) {
   const errno = host.traceNative(operation, value, timestamp);
   if (errno) throw Object.assign(new Error(`Trace file ${operation} failed (errno ${errno})`), { code: 'ERR_TRACE_EVENTS_WRITE', errno: -errno });
@@ -25,7 +28,9 @@ function enabled(group) {
 }
 function ensureOpen() {
   if (opened) return;
-  const path = filePattern.replace(/\$\{(pid|rotation)\}/g, (_, key) => key === 'pid' ? String(process.pid) : '1');
+  const path = require('path').resolve(filePattern.replace(/\$\{(pid|rotation)\}/g, (_, key) => key === 'pid' ? String(process.pid) : '1'));
+  // The trace file is written natively, so the permission model checks it here.
+  if (host.builtinLoaded('internal/permission')) require('internal/permission').check('fs.write', path);
   native('open', path);
   opened = true;
   writeMetadata();
@@ -65,6 +70,8 @@ function sync() {
   if (enabled('node.diagnostics_channel')) require('diagnostics_channel');
   const track = enabled('node,node.async_hooks');
   native('gc', enabled('v8,gc'));
+  for (const [group, buffer] of enabledBuffers) buffer[0] = enabled(group) ? 1 : 0;
+  if (typeof stateUpdateHandler === 'function') stateUpdateHandler(track);
   for (const watcher of watchers) {
     const on = enabled(watcher[0]);
     if (on !== watcher[2]) { watcher[2] = on; watcher[1](on); }
@@ -141,6 +148,22 @@ function watch(group, callback) {
   watchers.push([group, callback, on]);
   if (on) callback(true);
 }
+// As Node's binding: a Uint8Array whose byte is nonzero while the category group is enabled.
+function getCategoryEnabledBuffer(group) {
+  group = `${group}`;
+  let buffer = enabledBuffers.get(group);
+  if (buffer === undefined) { buffer = new Uint8Array(1); buffer[0] = enabled(group) ? 1 : 0; enabledBuffers.set(group, buffer); }
+  return buffer;
+}
+// Called with whether node.async_hooks tracing is on, each time the enabled categories change.
+function setTraceCategoryStateUpdateHandler(handler) { stateUpdateHandler = handler; }
+// Node's CategorySet: a set of categories that is enabled or disabled as a whole.
+class CategorySet {
+  #categories; #enabled = false;
+  constructor(categories) { this.#categories = new Set(categories); }
+  enable() { if (!this.#enabled) { add(this.#categories); this.#enabled = true; } }
+  disable() { if (this.#enabled) { remove(this.#categories); this.#enabled = false; } }
+}
 // internalBinding('trace_events').trace: the phase is a character code, and data, when
 // given, is the event's args.data.
 function trace(phase, category, name, id, data) {
@@ -148,4 +171,5 @@ function trace(phase, category, name, id, data) {
   emit(category, `${name}`, String.fromCharCode(phase), data === undefined ? {} : { data }, id);
 }
 function flush() { if (opened) native('flush'); }
-module.exports = { available, enabled, isTraceCategoryEnabled: enabled, watch, trace, processTitleChanged, add, remove, getEnabledCategories, initialize, emit, begin, end, performanceEntry, diagnostic, flush };
+module.exports = { available, enabled, isTraceCategoryEnabled: enabled, watch, trace, processTitleChanged,
+  getCategoryEnabledBuffer, setTraceCategoryStateUpdateHandler, CategorySet, add, remove, getEnabledCategories, initialize, emit, begin, end, performanceEntry, diagnostic, flush };

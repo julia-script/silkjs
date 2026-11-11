@@ -410,4 +410,6 @@ Object.defineProperties(module.exports, {
   _nativeEvent: { value: nativeEvent },
   _nativeDestroy: { value: nativeDestroy },
   _drainDestroy: { value: drainDestroy },
+  // Node's async_wrap.queueDestroyAsyncId: a destroy event for an id with no resource.
+  _queueDestroyId: { value: id => { if (hooks.size !== 0) pendingDestroy.push({ id, destroyed: true }); } },
 });

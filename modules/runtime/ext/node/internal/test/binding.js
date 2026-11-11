@@ -15,9 +15,13 @@ process.emitWarning(
 
 const kBindings = {
   __proto__: null,
+  async_wrap: 'internal/async_wrap_binding',
   buffer: 'internal/buffer_binding',
+  constants: 'internal/constants_binding',
   crypto: 'internal/crypto/binding',
   http2: 'internal/http2/binding',
+  performance: 'internal/performance_binding',
+  trace_events: 'internal/trace_events_binding',
   util: 'internal/util/binding',
 };
 

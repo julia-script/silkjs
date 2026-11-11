@@ -95,6 +95,10 @@ function validateArray(value, name, minLength = 0) {
   if (!Array.isArray(value)) throw new ERR_INVALID_ARG_TYPE(name, 'Array', value);
   if (value.length < minLength) throw new ERR_INVALID_ARG_VALUE(name, value, `must have a length of at least ${minLength}`);
 }
+function validateStringArray(value, name) {
+  validateArray(value, name);
+  for (let i = 0; i < value.length; ++i) validateString(value[i], `${name}[${i}]`);
+}
 function validateOneOf(value, name, oneOf) {
   if (!oneOf.includes(value)) {
     const allowed = oneOf.map(v => typeof v === 'string' ? `'${v}'` : String(v)).join(', ');
@@ -200,7 +204,7 @@ function checkRangesOrGetDefault(number, name, lower, upper, def) {
 // Node wraps its validators in hideStackFrames(), whose callers inside other
 // hidden frames use fn.withoutStackTrace.
 for (const fn of [validateString, validateBoolean, validateFunction, validateNumber, validateInteger, validateInt32,
-  validateUint32, validateObject, validateArray, validateOneOf, validateAbortSignal, validateBuffer]) {
+  validateUint32, validateObject, validateArray, validateStringArray, validateOneOf, validateAbortSignal, validateBuffer]) {
   fn.withoutStackTrace = fn;
 }
 
@@ -210,7 +214,7 @@ module.exports = {
   kValidateObjectAllowNullable, kValidateObjectAllowArray, kValidateObjectAllowFunction,
   kValidateObjectAllowObjects, kValidateObjectAllowObjectsAndNull,
   validateString, validateBoolean, validateFunction, validateNumber, validateInteger, validateInt32,
-  validateUint32, validateObject, validateArray, validateOneOf, validateAbortSignal,
+  validateUint32, validateObject, validateArray, validateStringArray, validateOneOf, validateAbortSignal,
   isUint32, parseFileMode, validateBuffer, validateLinkHeaderValue,
   convertToValidSignal, signalName, toPathIfFileURL, validatePath, getValidatedPath, validatePort,
   validateFiniteNumber, checkRangesOrGetDefault,

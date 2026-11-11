@@ -5,6 +5,7 @@ const { EventEmitter } = require('events');
 const { Buffer } = require('buffer');
 const diagnostics = require('internal/host').diagnostics;
 const traceEvents = require('internal/trace_events');
+const { symbols: { async_id_symbol } } = require('internal/async_hooks');
 // node.net.native trace events: a connect request begins with the native connect and ends with its result.
 const kNetTraceCategory = 'node,node.net,node.net.native';
 const { Transport, error: nativeError, native } = require('internal/net/transport');
@@ -110,6 +111,7 @@ function Socket(options) {
   this.timeout = 0;
   this._generation = 0;
   this._connectTraceId = undefined;
+  this[async_id_symbol] = -1;
   this._connectTimer = null;
   this._attemptNext = null;
   this._noDelay = options.noDelay;
@@ -157,6 +159,7 @@ Object.setPrototypeOf(Socket, Duplex);
 Socket.prototype._attachTransport = function(transport) {
   this._transport = transport;
   transport.owner = this;
+  this[async_id_symbol] = transport.getAsyncId();
   transport.onEvent = (...args) => this._onNative(...args);
   if (this._unrefed) transport.unref();
 };

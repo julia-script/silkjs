@@ -7,4 +7,6 @@ module.exports = {
   observing(type) { return false; },
   // Reports an entry; start is a host.now() time.
   emit(name, type, start, duration, detail) {},
+  // Observers per Node entry type (gc, http, http2, net, dns), as Node's observerCounts.
+  observerCounts: new Uint32Array(5),
 };
