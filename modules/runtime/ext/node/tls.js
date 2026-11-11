@@ -18,6 +18,7 @@ const { ConnResetException } = require('internal/errors');
 const { checkServerIdentity } = require('internal/tls/identity');
 const { TLSTransport } = require('internal/tls/transport');
 const { kTLSServer } = require('internal/tls/server');
+const { kReinitializeHandle } = require('internal/net');
 
 const kConnectOptions = Symbol('connect-options');
 const kErrorEmitted = Symbol('error-emitted');
@@ -92,7 +93,18 @@ function TLSSocket(socket, opts) {
 Object.setPrototypeOf(TLSSocket.prototype, net.Socket.prototype);
 Object.setPrototypeOf(TLSSocket, net.Socket);
 
-TLSSocket.prototype._init = function(socket) {
+// Node's _wrapHandle and reinitializeHandle: a TLS socket can be moved onto a new
+// carrier, given a handle or a fresh unconnected one, keeping its servername and session.
+TLSSocket.prototype[kReinitializeHandle] = function reinitializeHandle(handle) {
+  const id = this._tls?.id;
+  const servername = id ? native('servername', id) : null;
+  const session = id ? this.getSession() : null;
+  this._init(null, handle, true);
+  if (this._tlsOptions.enableTrace) this.enableTrace();
+  if (session) this.setSession(session);
+  if (servername) this.setServername(servername);
+};
+TLSSocket.prototype._init = function(socket, handle, reinitializing = false) {
   const options = this._tlsOptions;
   this.server = options.server;
   this._requestCert = !!options.requestCert || !options.isServer;
@@ -100,8 +112,10 @@ TLSSocket.prototype._init = function(socket) {
   this._secureContext = options.secureContext || options.credentials || tlsExports.createSecureContext(options);
   if (!(this._secureContext instanceof SecureContext) || !this._secureContext.context)
     throw new codes.ERR_TLS_INVALID_CONTEXT('context');
-  this._parent = socket || new net.Socket({ allowHalfOpen: true });
+  this._parent = socket || new net.Socket(handle ? { handle, allowHalfOpen: true } : { allowHalfOpen: true });
   this._tls = new TLSTransport(this, this._parent, this._secureContext, options, !socket);
+  // As net's reinitializeHandle: the old handle closes before the new one takes over.
+  if (reinitializing) this._handle?.close();
   this._attachTransport(this._tls);
   if (this._requestCert || this._rejectUnauthorized) native('verifyMode', this._tls.id, this._requestCert, this._rejectUnauthorized);
   if (options.isServer && options.ALPNCallback) {
@@ -109,7 +123,7 @@ TLSSocket.prototype._init = function(socket) {
     this[kALPNCallback] = options.ALPNCallback;
   }
   const keylog = tlsOptions.getOptionValue('--tls-keylog');
-  if (keylog) {
+  if (keylog && !reinitializing) {
     if (warnOnTlsKeylog) {
       warnOnTlsKeylog = false;
       process.emitWarning('Using --tls-keylog makes TLS connections insecure by writing secret key material to file ' + keylog);
@@ -135,7 +149,7 @@ TLSSocket.prototype._init = function(socket) {
     socket.once('connect', () => { this.connecting = false; this.emit('connect'); });
   }
   if (socket) socket.on('error', err => this._emitTLSError(err));
-  else this.connecting = true;
+  else if (!reinitializing) this.connecting = true;
 };
 TLSSocket.prototype.connect = function(...args) {
   const [options, cb] = net._normalizeArgs(args);
