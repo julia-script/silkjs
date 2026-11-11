@@ -5,6 +5,8 @@ const { EventTarget, DOMException } = require('internal/path_events/event_target
 const { MessageEvent } = require('internal/web/websocket/events');
 const clone = require('internal/worker/clone');
 const ports = require('internal/worker/ports');
+const { codes: { ERR_MISSING_ARGS } } = require('internal/validators');
+const inspectCustom = Symbol.for('nodejs.util.inspect.custom');
 const channels = new WeakMap();
 function state(channel) {
   const data = channels.get(channel);
@@ -14,7 +16,7 @@ function state(channel) {
 class BroadcastChannel extends EventTarget {
   constructor(name) {
     super();
-    if (arguments.length === 0) throw clone.codedError('ERR_MISSING_ARGS', 'The name argument must be specified');
+    if (arguments.length === 0) throw new ERR_MISSING_ARGS('name');
     if (typeof name === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
     name = String(name);
     const endpoint = host.workerNative('subscribe', [name]);
@@ -28,7 +30,7 @@ class BroadcastChannel extends EventTarget {
   }
   get name() { return state(this).name; }
   postMessage(value) {
-    if (arguments.length === 0) throw clone.codedError('ERR_MISSING_ARGS', 'The value argument must be specified');
+    if (arguments.length === 0) throw new ERR_MISSING_ARGS('message');
     const data = state(this);
     if (data.closed) throw new DOMException('BroadcastChannel is closed.', 'InvalidStateError');
     const prepared = clone.prepare(value);
@@ -52,6 +54,16 @@ for (const type of ['message', 'messageerror']) Object.defineProperty(BroadcastC
     if (data.handlers[type]) this.removeEventListener(type, data.handlers[type]);
     data.handlers[type] = typeof listener === 'function' ? listener : null;
     if (data.handlers[type]) this.addEventListener(type, listener);
+  },
+});
+Object.defineProperty(BroadcastChannel.prototype, inspectCustom, {
+  enumerable: false, writable: true, configurable: true,
+  value: function inspect(depth, options) {
+    const data = channels.get(this);
+    if (!data) throw clone.codedError('ERR_INVALID_THIS', 'Value of "this" must be of type BroadcastChannel');
+    if (depth < 0) return 'BroadcastChannel';
+    const opts = { ...options, depth: options.depth == null ? null : options.depth - 1 };
+    return `BroadcastChannel ${require('util').inspect({ name: data.name, active: !data.closed }, opts)}`;
   },
 });
 Object.defineProperty(BroadcastChannel.prototype, Symbol.toStringTag, { value: 'BroadcastChannel', configurable: true });
