@@ -9,7 +9,7 @@ const bundled = require('internal/tls/roots');
 const tlsOptions = require('internal/tls/options');
 const errors = require('internal/tls/errors');
 const {
-  coded, invalidArgType, invalidArgValue, decorate,
+  codes, coded, invalidArgType, invalidArgValue, decorate,
   validateString, validateObject, validateArray, validateBuffer, validateInt32, validateInteger,
 } = errors;
 
@@ -168,6 +168,13 @@ class NativeSecureContext {
   setMinProto(version) { native('versions', this.#id, version, this._maxProto || TLS1_3_VERSION); this._minProto = version; }
   setMaxProto(version) { native('versions', this.#id, this._minProto, version); this._maxProto = version; }
   getMinProto() { return this._minProto; }
+  // The linked OpenSSL is built without zlib, brotli and zstd (OPENSSL_NO_COMP_ALG),
+  // which Node reports the same way.
+  setCertificateCompression(packed) {
+    if (this._maxProto !== 0 && this._maxProto < TLS1_3_VERSION)
+      throw error('ERR_INVALID_ARG_VALUE', 'certificateCompression requires a TLS protocol range that includes TLSv1.3', TypeError);
+    throw error('ERR_CRYPTO_UNSUPPORTED_OPERATION', 'Certificate compression is not supported by this OpenSSL build');
+  }
   getMaxProto() { return this._maxProto || TLS1_3_VERSION; }
   setOptions(options) { native('options', this.#id, options >>> 0); }
   setCipherSuites(suites) { native('suites', this.#id, suites); }
@@ -227,13 +234,13 @@ function toV(which, v, def) {
   if (v === 'TLSv1.1') return TLS1_1_VERSION;
   if (v === 'TLSv1.2') return TLS1_2_VERSION;
   if (v === 'TLSv1.3') return TLS1_3_VERSION;
-  throw error('ERR_TLS_INVALID_PROTOCOL_VERSION', `${JSON.stringify(v)} is not a valid ${which} TLS protocol version`, TypeError);
+  throw new codes.ERR_TLS_INVALID_PROTOCOL_VERSION(v, which);
 }
 function SecureContext(secureProtocol, secureOptions, minVersion, maxVersion) {
   if (!(this instanceof SecureContext)) return new SecureContext(secureProtocol, secureOptions, minVersion, maxVersion);
   if (secureProtocol) {
-    if (minVersion != null) throw error('ERR_TLS_PROTOCOL_VERSION_CONFLICT', `TLS protocol version ${JSON.stringify(minVersion)} conflicts with secureProtocol ${JSON.stringify(secureProtocol)}`, TypeError);
-    if (maxVersion != null) throw error('ERR_TLS_PROTOCOL_VERSION_CONFLICT', `TLS protocol version ${JSON.stringify(maxVersion)} conflicts with secureProtocol ${JSON.stringify(secureProtocol)}`, TypeError);
+    if (minVersion != null) throw new codes.ERR_TLS_PROTOCOL_VERSION_CONFLICT(minVersion, secureProtocol);
+    if (maxVersion != null) throw new codes.ERR_TLS_PROTOCOL_VERSION_CONFLICT(maxVersion, secureProtocol);
   }
   const tls = require('tls');
   this.context = new NativeSecureContext();
@@ -284,11 +291,16 @@ function configSecureContext(context, options = {}, name = 'options') {
   if (certificateCompression != null) {
     validateArray(certificateCompression, `${name}.certificateCompression`);
     if (certificateCompression.length > 3) throw invalidArgValue(`${name}.certificateCompression`, certificateCompression, 'can specify at most 3 algorithms');
-    certificateCompression.forEach((algorithm, i) => {
-      if (algorithm !== 'zlib' && algorithm !== 'brotli' && algorithm !== 'zstd')
-        throw invalidArgValue(`${name}.certificateCompression[${i}]`, algorithm, "must be 'zlib', 'brotli', or 'zstd'");
-    });
-    if (certificateCompression.length > 0) throw error('ERR_TLS_CERT_COMPRESSION_UNSUPPORTED', 'Certificate compression is not supported by this TLS implementation');
+    if (certificateCompression.length > 0) {
+      let packed = certificateCompression.length;
+      certificateCompression.forEach((algorithm, i) => {
+        const id = { zlib: 1, brotli: 2, zstd: 3 }[algorithm];
+        if (typeof algorithm !== 'string' || id === undefined)
+          throw invalidArgValue(`${name}.certificateCompression[${i}]`, algorithm, "must be 'zlib', 'brotli', or 'zstd'");
+        packed |= id << (8 * (i + 1));
+      });
+      context.setCertificateCompression(packed);
+    }
   }
   if (sigalgs !== undefined && sigalgs !== null) {
     validateString(sigalgs, `${name}.sigalgs`);
@@ -299,7 +311,7 @@ function configSecureContext(context, options = {}, name = 'options') {
     if (privateKeyEngine === undefined || privateKeyEngine === null) throw invalidArgValue(`${name}.privateKeyEngine`, privateKeyEngine);
     if (key) throw invalidArgValue(`${name}.privateKeyIdentifier`, privateKeyIdentifier);
     if (typeof privateKeyIdentifier === 'string' && typeof privateKeyEngine === 'string')
-      throw error('ERR_CRYPTO_CUSTOM_ENGINE_NOT_SUPPORTED', 'Custom engines not supported by this OpenSSL');
+      throw new codes.ERR_CRYPTO_CUSTOM_ENGINE_NOT_SUPPORTED();
     if (typeof privateKeyIdentifier !== 'string') throw invalidArgType(`${name}.privateKeyIdentifier`, ['string', 'null', 'undefined'], privateKeyIdentifier);
     throw invalidArgType(`${name}.privateKeyEngine`, ['string', 'null', 'undefined'], privateKeyEngine);
   }
@@ -323,7 +335,7 @@ function configSecureContext(context, options = {}, name = 'options') {
       context.loadPKCS12(raw, pass !== undefined && pass !== null ? pass : undefined);
     }
   }
-  if (typeof clientCertEngine === 'string') throw error('ERR_CRYPTO_CUSTOM_ENGINE_NOT_SUPPORTED', 'Custom engines not supported by this OpenSSL');
+  if (typeof clientCertEngine === 'string') throw new codes.ERR_CRYPTO_CUSTOM_ENGINE_NOT_SUPPORTED();
   if (clientCertEngine !== undefined && clientCertEngine !== null)
     throw invalidArgType(`${name}.clientCertEngine`, ['string', 'null', 'undefined'], clientCertEngine);
   if (ticketKeys !== undefined && ticketKeys !== null) {

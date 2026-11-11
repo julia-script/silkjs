@@ -1,6 +1,7 @@
 'use strict';
 const { Buffer } = require('buffer');
-const { native, error, NativeSecureContext } = require('internal/tls/context');
+const { native, NativeSecureContext } = require('internal/tls/context');
+const { codes } = require('internal/errors');
 
 // OpenSSL failures become TLS errors; anything else, such as an exception thrown
 // by a 'secure' or 'data' listener, propagates as it does from Node's callbacks.
@@ -81,13 +82,13 @@ class TLSTransport {
     if (servername) this.socket.servername = servername;
     let once = false;
     const done = (err, context) => {
-      if (once) { this.socket.destroy(error('ERR_MULTIPLE_CALLBACK', 'Callback called multiple times')); return; }
+      if (once) { this.socket.destroy(new codes.ERR_MULTIPLE_CALLBACK()); return; }
       once = true;
       // Resume outside the OpenSSL operation, including for synchronous callbacks.
       process.nextTick(() => {
         if (this.closing) return;
         if (err) { this.socket.destroy(err); return; }
-        if (!this.id) { this.socket.destroy(error('ERR_SOCKET_CLOSED', 'Socket is closed')); return; }
+        if (!this.id) { this.socket.destroy(new codes.ERR_SOCKET_CLOSED()); return; }
         if (context) context = context.context || context;
         if (context !== null && typeof context === 'object' && !(context instanceof NativeSecureContext)) {
           this.fail(new TypeError('Invalid SNI context')); return;

@@ -6,14 +6,15 @@ const net = require('net');
 const EE = require('events');
 const { Buffer } = require('buffer');
 const {
-  native, bytes, error, SecureContext, createSecureContext, ticketKeysBuffer, bundledRootCertificates,
+  native, bytes, SecureContext, createSecureContext, ticketKeysBuffer, bundledRootCertificates,
   getCACertificates, setDefaultCACertificates,
 } = require('internal/tls/context');
 const tlsOptions = require('internal/tls/options');
 const {
-  invalidArgType, invalidArgValue, outOfRange, validateString, validateFunction, validateBoolean, validateObject,
+  codes, invalidArgType, invalidArgValue, outOfRange, validateString, validateFunction, validateBoolean, validateObject,
   validateNumber, validateInt32, validateUint32, validateBuffer,
 } = require('internal/tls/errors');
+const { ConnResetException } = require('internal/errors');
 const { checkServerIdentity } = require('internal/tls/identity');
 const { TLSTransport } = require('internal/tls/transport');
 const { kTLSServer } = require('internal/tls/server');
@@ -41,7 +42,6 @@ const verifyCodes = {
   21: 'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 22: 'CERT_CHAIN_TOO_LONG', 23: 'CERT_REVOKED', 24: 'INVALID_CA',
   25: 'PATH_LENGTH_EXCEEDED', 26: 'INVALID_PURPOSE', 27: 'CERT_UNTRUSTED', 28: 'CERT_REJECTED', 62: 'HOSTNAME_MISMATCH',
 };
-function connResetException(message) { return Object.assign(new Error(message), { code: 'ECONNRESET' }); }
 
 let ipServernameWarned = false, tlsTracingWarned = false, warnOnTlsKeylog = true, warnOnTlsKeylogError = true;
 
@@ -99,7 +99,7 @@ TLSSocket.prototype._init = function(socket) {
   this._rejectUnauthorized = !!options.rejectUnauthorized;
   this._secureContext = options.secureContext || options.credentials || tlsExports.createSecureContext(options);
   if (!(this._secureContext instanceof SecureContext) || !this._secureContext.context)
-    throw error('ERR_TLS_INVALID_CONTEXT', 'context must be a SecureContext', TypeError);
+    throw new codes.ERR_TLS_INVALID_CONTEXT('context');
   this._parent = socket || new net.Socket({ allowHalfOpen: true });
   this._tls = new TLSTransport(this, this._parent, this._secureContext, options, !socket);
   this._attachTransport(this._tls);
@@ -138,7 +138,6 @@ TLSSocket.prototype._init = function(socket) {
 };
 TLSSocket.prototype.connect = function(...args) {
   const [options, cb] = net._normalizeArgs(args);
-  if (this._tls.started || this._parent.connecting) throw error('ERR_SOCKET_CONNECTING', 'Socket is already connecting');
   if (cb) this.once('connect', cb);
   this.connecting = true;
   try { this._parent.connect({ ...options, allowHalfOpen: true }); } catch (err) { this.destroy(); throw err; }
@@ -151,7 +150,7 @@ TLSSocket.prototype._start = function() {
   this._tls.initiate();
 };
 TLSSocket.prototype.disableRenegotiation = function() { this[kDisableRenegotiation] = true; };
-TLSSocket.prototype._handleTimeout = function() { this._emitTLSError(error('ERR_TLS_HANDSHAKE_TIMEOUT', 'TLS handshake timeout')); };
+TLSSocket.prototype._handleTimeout = function() { this._emitTLSError(new codes.ERR_TLS_HANDSHAKE_TIMEOUT()); };
 TLSSocket.prototype._emitTLSError = function(err) { const e = this._tlsError(err); if (e) this.emit('error', e); };
 TLSSocket.prototype._tlsError = function(err) { this.emit('_tlsError', err); return this._controlReleased ? err : null; };
 TLSSocket.prototype._releaseControl = function() {
@@ -188,7 +187,7 @@ TLSSocket.prototype._callALPNCallback = function(protocolsBuffer) {
     const selected = this[kALPNCallback]({ servername, protocols });
     if (selected === undefined) return undefined;
     if (!protocols.includes(selected))
-      throw error('ERR_TLS_ALPN_CALLBACK_INVALID_RESULT', `ALPN callback returned a value (${selected}) that did not match any of the client's offered protocols (${protocols.join(', ')})`, TypeError);
+      throw new codes.ERR_TLS_ALPN_CALLBACK_INVALID_RESULT(selected, protocols);
     return selected;
   } catch (err) {
     this.destroy(err);
@@ -203,10 +202,10 @@ TLSSocket.prototype._onHandshakeStart = function(now) {
   if ((now - lastHandshakeTime) >= tlsExports.CLIENT_RENEG_WINDOW * 1000) this.handshakes = 1;
   else this.handshakes++;
   if (this.handshakes > tlsExports.CLIENT_RENEG_LIMIT) {
-    this._emitTLSError(error('ERR_TLS_SESSION_ATTACK', 'TLS session renegotiation attack detected'));
+    this._emitTLSError(new codes.ERR_TLS_SESSION_ATTACK());
     return;
   }
-  if (this[kDisableRenegotiation]) this._emitTLSError(error('ERR_TLS_RENEGOTIATION_DISABLED', 'TLS session renegotiation disabled for this socket'));
+  if (this[kDisableRenegotiation]) this._emitTLSError(new codes.ERR_TLS_RENEGOTIATION_DISABLED());
 };
 TLSSocket.prototype._finishInit = function() {
   if (!this._tls?.id) return;
@@ -243,7 +242,7 @@ TLSSocket.prototype.exportKeyingMaterial = function(length, label, context) {
   validateUint32(length, 'length', true);
   validateString(label, 'label');
   if (context !== undefined) validateBuffer(context, 'context');
-  if (!this._secureEstablished) throw error('ERR_TLS_INVALID_STATE', 'TLS socket connection must be securely established');
+  if (!this._secureEstablished) throw new codes.ERR_TLS_INVALID_STATE();
   return Buffer.from(native('export', this._tls.id, length, label, context === undefined ? undefined : bytes(context), context !== undefined));
 };
 TLSSocket.prototype.setMaxSendFragment = function(size) {
@@ -253,7 +252,7 @@ TLSSocket.prototype.setMaxSendFragment = function(size) {
 };
 TLSSocket.prototype.setServername = function(name) {
   validateString(name, 'name');
-  if (this._tlsOptions.isServer) throw error('ERR_TLS_SNI_FROM_SERVER', 'Cannot issue SNI from a TLS server-side socket');
+  if (this._tlsOptions.isServer) throw new codes.ERR_TLS_SNI_FROM_SERVER();
   if (this._tls?.id) native('setServername', this._tls.id, name);
 };
 TLSSocket.prototype.setSession = function(session) {
@@ -389,7 +388,7 @@ function onSocketClose(err) {
   if (err) return;
   if (!this._controlReleased && !this[kErrorEmitted]) {
     this[kErrorEmitted] = true;
-    this._tlsOptions.server.emit('tlsClientError', connResetException('socket hang up'), this);
+    this._tlsOptions.server.emit('tlsClientError', new ConnResetException('socket hang up'), this);
   }
 }
 function tlsConnectionListener(rawSocket) {
@@ -416,7 +415,7 @@ function initServer(server, options) {
   server.rejectUnauthorized = options.rejectUnauthorized !== false;
   server.ALPNCallback = options.ALPNCallback;
   if (server.ALPNCallback && options.ALPNProtocols)
-    throw error('ERR_TLS_ALPN_CALLBACK_WITH_PROTOCOLS', 'The ALPNCallback and ALPNProtocols TLS options are mutually exclusive', TypeError);
+    throw new codes.ERR_TLS_ALPN_CALLBACK_WITH_PROTOCOLS();
   if (options.sessionTimeout) server.sessionTimeout = options.sessionTimeout;
   if (options.ticketKeys) server.ticketKeys = options.ticketKeys;
   if (options.ALPNProtocols) tlsExports.convertALPNProtocols(options.ALPNProtocols, server);
@@ -487,7 +486,7 @@ Server.prototype.setTicketKeys = function(keys) {
   this._sharedCreds.context.setTicketKeys(keys);
 };
 Server.prototype.addContext = function(servername, context) {
-  if (!servername) throw error('ERR_TLS_REQUIRED_SERVER_NAME', '"servername" is required parameter for Server.addContext');
+  if (!servername) throw new codes.ERR_TLS_REQUIRED_SERVER_NAME();
   const re = new RegExp(`^${servername.replace(/([.^$+?\-\\[\]{}])/g, '\\$1').replaceAll('*', '[^.]*')}$`, 'i');
   const secureContext = context instanceof SecureContext ? context : tlsExports.createSecureContext(context);
   this._contexts.push([re, secureContext.context]);
@@ -515,7 +514,7 @@ function onConnectSecure() {
   const options = this[kConnectOptions];
   const ekeyinfo = this.getEphemeralKeyInfo();
   if (ekeyinfo.type === 'DH' && ekeyinfo.size < options.minDHSize) {
-    const err = error('ERR_TLS_DH_PARAM_SIZE', `DH parameter size ${ekeyinfo.size} is less than ${options.minDHSize}`);
+    const err = new codes.ERR_TLS_DH_PARAM_SIZE(ekeyinfo.size);
     this.emit('error', err);
     this.destroy();
     return;
@@ -542,7 +541,7 @@ function onConnectEnd() {
   if (!this._hadError) {
     const options = this[kConnectOptions];
     this._hadError = true;
-    const err = connResetException('Client network socket disconnected before secure TLS connection was established');
+    const err = new ConnResetException('Client network socket disconnected before secure TLS connection was established');
     err.path = options.path; err.host = options.host; err.port = options.port; err.localAddress = options.localAddress;
     this.destroy(err);
   }

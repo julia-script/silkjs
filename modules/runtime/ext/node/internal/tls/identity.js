@@ -61,12 +61,7 @@ function canonicalizeIP(ip) {
   if (best.base !== -1 && best.base + best.len === 8) out += ':';
   return out;
 }
-class ERR_TLS_CERT_ALTNAME_FORMAT extends SyntaxError {
-  constructor() { super('Invalid subject alternative name string'); this.code = 'ERR_TLS_CERT_ALTNAME_FORMAT'; }
-}
-class ERR_TLS_CERT_ALTNAME_INVALID extends Error {
-  constructor(reason, host, cert) { super('Hostname/IP does not match certificate\'s altnames: ' + reason); this.code = 'ERR_TLS_CERT_ALTNAME_INVALID'; this.reason = reason; this.host = host; this.cert = cert; }
-}
+const { codes: { ERR_TLS_CERT_ALTNAME_FORMAT, ERR_TLS_CERT_ALTNAME_INVALID } } = require('internal/errors');
 function unfqdn(host) {
   return host.replace(/[.]$/, '');
 }
