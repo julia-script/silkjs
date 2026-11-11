@@ -35,6 +35,10 @@ function createLoader(host, builtins) {
   let regularFile = null;
   // Parent filenames as given to resolve, resolved.
   const parentNames = new Map();
+  // What a require of a relative or bare specifier found, by the specifier and its
+  // directory or lookup paths, as with Node's Module._pathCache: a module found once is
+  // not looked for again. Callers get a copy.
+  const foundPaths = new Map();
   // The source format() read to tell a module from a script, for the load that follows.
   let probed = null;
   const cache = Object.create(null);
@@ -478,11 +482,16 @@ function createLoader(host, builtins) {
           catch (_) { throw error('ERR_INVALID_MODULE_SPECIFIER', `Invalid percent encoding in '${specifier}'`); }
         }
         const bases = options && Array.isArray(options.paths) ? options.paths : [path.dirname(parent)];
+        const key = cacheable(mode, options, isMain) ? specifier + '\0' + bases[0] : null;
+        if (key !== null) {
+          const known = foundPaths.get(key);
+          if (known !== undefined) return { ...known };
+        }
         for (const base of bases) {
           const candidate = path.resolve(base, requested);
           if (mode === 'import') return strictFile(candidate, specifier, parent, mode, suffix, isMain);
           const found = legacyFile(candidate, true, /[\\/]$/.test(specifier) || specifier === '.' || specifier === '..');
-          if (found) return descriptor(found, mode, undefined, isMain);
+          if (found) return remember(key, descriptor(found, mode, undefined, isMain));
         }
         throw missing(specifier, parent, mode);
       }
@@ -504,26 +513,47 @@ function createLoader(host, builtins) {
         search = mode === 'require' && parentModule && Array.isArray(parentModule.paths) ? parentModule.paths : modulePaths(path.dirname(parent));
         if (mode === 'require') search = search.concat(globalPaths);
       }
-      for (const directory of search) {
-        if (!isDirectory(directory)) continue;
-        const root = path.join(directory, parsed.name);
-        const pkg = readPackage(root);
-        if (pkg && pkg.data.exports !== undefined && pkg.data.exports !== null) return packageMap(pkg, pkg.data.exports, parsed.subpath, false, parent, mode, seen, isMain);
-        const candidate = parsed.subpath === '.' ? root : path.join(root, parsed.subpath.slice(2));
-        if (mode === 'import' && parsed.subpath !== '.') {
-          if (isDirectory(root)) return strictFile(candidate, specifier, parent, mode, undefined, isMain);
-          continue;
-        }
-        if (mode === 'import' && pkg && typeof pkg.data.main === 'string') {
-          const exact = path.resolve(root, pkg.data.main);
-          if (isFile(exact)) return descriptor(exact, mode, undefined, isMain);
-        }
-        const found = legacyFile(candidate, true, /[\\/]$/.test(specifier));
-        if (found) return descriptor(found, mode, undefined, isMain);
-        if (mode === 'import' && isDirectory(root)) throw missing(specifier, parent, mode);
+      const key = cacheable(mode, options, isMain) ? specifier + '\0' + search.join('\0') : null;
+      if (key !== null) {
+        const known = foundPaths.get(key);
+        if (known !== undefined) return { ...known };
       }
-      throw missing(specifier, parent, mode);
+      return remember(key, findPackage(search, parsed, specifier, parent, mode, seen, isMain));
     } finally { seen.delete(recursion); }
+  }
+
+  // Whether resolveInternal may keep what it finds in foundPaths: a plain require, as
+  // hooks can answer differently each time and a main module's symlinks may be kept.
+  function cacheable(mode, options, isMain) {
+    return mode === 'require' && !isMain && !(options && options.paths !== undefined) && !hooks.active();
+  }
+
+  function remember(key, result) {
+    if (key === null) return result;
+    foundPaths.set(key, result);
+    return { ...result };
+  }
+
+  function findPackage(search, parsed, specifier, parent, mode, seen, isMain) {
+    for (const directory of search) {
+      if (!isDirectory(directory)) continue;
+      const root = path.join(directory, parsed.name);
+      const pkg = readPackage(root);
+      if (pkg && pkg.data.exports !== undefined && pkg.data.exports !== null) return packageMap(pkg, pkg.data.exports, parsed.subpath, false, parent, mode, seen, isMain);
+      const candidate = parsed.subpath === '.' ? root : path.join(root, parsed.subpath.slice(2));
+      if (mode === 'import' && parsed.subpath !== '.') {
+        if (isDirectory(root)) return strictFile(candidate, specifier, parent, mode, undefined, isMain);
+        continue;
+      }
+      if (mode === 'import' && pkg && typeof pkg.data.main === 'string') {
+        const exact = path.resolve(root, pkg.data.main);
+        if (isFile(exact)) return descriptor(exact, mode, undefined, isMain);
+      }
+      const found = legacyFile(candidate, true, /[\\/]$/.test(specifier));
+      if (found) return descriptor(found, mode, undefined, isMain);
+      if (mode === 'import' && isDirectory(root)) throw missing(specifier, parent, mode);
+    }
+    throw missing(specifier, parent, mode);
   }
 
   function conditions(mode) {
@@ -1050,7 +1080,7 @@ function createLoader(host, builtins) {
     const modules = new Set(Object.keys(cache)), directories = new Set(packages.keys());
     const resolved = new Set(resolutions.keys()), previous = main;
     const scoped = new Set(scopes.keys()), looked = new Set(lookupPaths.keys()), reals = new Set(realPaths.keys());
-    const parents = new Set(parentNames.keys());
+    const parents = new Set(parentNames.keys()), founds = new Set(foundPaths.keys());
     try { runMain(filename); }
     finally {
       for (const key of Object.keys(cache)) if (!modules.has(key)) delete cache[key];
@@ -1059,6 +1089,7 @@ function createLoader(host, builtins) {
       for (const key of [...lookupPaths.keys()]) if (!looked.has(key)) lookupPaths.delete(key);
       for (const key of [...realPaths.keys()]) if (!reals.has(key)) realPaths.delete(key);
       for (const key of [...parentNames.keys()]) if (!parents.has(key)) parentNames.delete(key);
+      for (const key of [...foundPaths.keys()]) if (!founds.has(key)) foundPaths.delete(key);
       for (const key of [...resolutions.keys()]) if (!resolved.has(key)) resolutions.delete(key);
       main = previous;
       probed = null;
