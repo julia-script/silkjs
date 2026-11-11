@@ -1260,6 +1260,9 @@ function loop() {
   if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushCompileCache();
   return Number(process.exitCode) || 0;
 }
+const imageModules = ['fs', 'fs/promises', 'internal/fs_streams', 'internal/fs_utf8_stream', 'path', 'os',
+  'events', 'stream', 'stream/promises', 'string_decoder', 'util', 'assert', 'console', 'net', 'tty',
+  'internal/tty/write', 'url', 'internal/web/url', 'internal/web/encoding', 'internal/abort_controller'];
 globalThis.__silkRuntime = {
   normalize(name, parent, attributes) { return loader.resolve(name, parent, 'import', attributes).filename; },
   load(name, attributes) { return loader.loadESM(name, attributes).source; },
@@ -1290,6 +1293,9 @@ globalThis.__silkRuntime = {
   run: () => invoke(run, undefined, []), loop, onRejection,
   // Ends the build of a heap image. Each variable listed here is read again by hydrate.
   seal() {
+    // Built-ins most programs load run here, so that a start from the image finds
+    // them loaded. None of them keeps anything of the process when it loads.
+    for (const name of imageModules) internalRequire(name);
     const hydrated = new Set(['HOME', 'NODE_PATH', 'NODE_CHANNEL_FD', 'NODE_UNIQUE_ID', 'WATCH_REPORT_DEPENDENCIES']);
     const missed = [...environmentRead].filter(key => typeof key === 'string' && !hydrated.has(key));
     if (missed.length) throw new Error('The bootstrap read environment variables that a start from a heap image does not read again: ' + missed.join(' '));
