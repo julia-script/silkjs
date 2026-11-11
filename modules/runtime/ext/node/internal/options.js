@@ -3,7 +3,6 @@
 const host = require('internal/host');
 const reportOptions = require('internal/process_report');
 const startupControls = require('internal/startup_controls');
-const permission = require('internal/permission');
 
 // Inspector enable flags accept an optional address only with "="; unlike
 // ordinary booleans that suffix must survive normalization.
@@ -51,46 +50,6 @@ function applyInspectorOption(arg) {
     }
   }
   return true;
-}
-
-// Values describe whether a supported environment option consumes an argument.
-const environmentOptions = new Map([
-  ...reportOptions.optionEntries,
-  ...startupControls.optionEntries,
-  ...permission.optionEntries,
-  ...[...inspectorEnableOptions, '--no-inspect', '--no-inspect-brk', '--no-inspect-wait',
-    '--experimental-inspector-network-resource', '--no-experimental-inspector-network-resource'].map(name => [name, false]),
-  ['--inspect-port', true], ['--debug-port', true],
-  ...['--watch', '--no-watch', '--watch-preserve-output', '--no-watch-preserve-output'].map(name => [name, false]),
-  ...['--watch-path', '--watch-kill-signal'].map(name => [name, true]),
-  ...['--experimental-test-coverage', '--no-experimental-test-coverage'].map(name => [name, false]),
-  ...['--test-coverage-include', '--test-coverage-exclude', '--test-coverage-lines',
-    '--test-coverage-branches', '--test-coverage-functions'].map(name => [name, true]),
-  ...['--insecure-http-parser', '--no-insecure-http-parser', '--async-context-frame',
-    '--no-async-context-frame', '--expose-gc', '--no-expose-gc',
-    '--trace-events-enabled', '--test-only', '--experimental-eventsource',
-    '--no-experimental-eventsource', '--experimental-webstorage',
-    '--no-experimental-webstorage', '--experimental-stream-iter',
-    '--no-experimental-stream-iter', '--preserve-symlinks', '--no-preserve-symlinks',
-    '--preserve-symlinks-main', '--no-preserve-symlinks-main',
-    '--experimental-vm-modules', '--no-experimental-vm-modules',
-    '--enable-source-maps', '--no-enable-source-maps',
-    '--trace-sigint', '--no-trace-sigint',
-    '--strip-types', '--no-strip-types', '--experimental-strip-types', '--no-experimental-strip-types',
-    '--experimental-transform-types', '--no-experimental-transform-types'].map(name => [name, false]),
-  ...['--trace-event-categories', '--trace-event-file-pattern', '--input-type',
-    '--test-isolation', '--test-name-pattern', '--test-skip-pattern', '--test-shard',
-    '--test-reporter', '--test-reporter-destination', '--localstorage-file',
-    '-r', '--require', '--import', '-C', '--conditions'].map(name => [name, true]),
-]);
-
-function normalizeOption(arg) {
-  const separator = arg.indexOf('=');
-  const name = (separator < 0 ? arg : arg.slice(0, separator)).replace(/_/g, '-');
-  // Node-owned booleans ignore an attached value. V8-style GC flags reject it.
-  if (separator < 0 || (name.startsWith('--') && workerOptions.get(name) === false &&
-      !inspectorEnableOptions.has(name) && !/^--(?:no-)?expose-gc$/.test(name))) return name;
-  return name + arg.slice(separator);
 }
 
 const table = require('internal/options_table');
@@ -224,89 +183,63 @@ function validateEnvironment(args, errors) {
   return 0;
 }
 
-const workerOptions = new Map([
-  ...environmentOptions,
-  ...['-i', '--interactive', '--test', '-c', '--check', '--no-print',
-    '--test-update-snapshots', '--no-test-update-snapshots',
-    '--experimental-test-module-mocks', '--no-experimental-test-module-mocks'].map(name => [name, false]),
-  ...['-e', '--eval', '-p', '--print', '--test-concurrency', '--test-timeout',
-    '--env-file', '--env-file-if-exists'].map(name => [name, true]),
-]);
 function processOption(name) {
   return /^--(?:no-)?(?:expose-gc|trace-sigint)$/.test(name) || /^--trace-event(?:s-enabled|-categories|-file-pattern)$/.test(name) || reportOptions.processWideOption(name);
 }
-function validateWorker(args, explicit) {
-  for (let index = 0; index < args.length; index++) {
-    const arg = normalizeOption(args[index]), separator = arg.indexOf('=');
-    const name = separator < 0 ? arg : arg.slice(0, separator);
-    if (!workerOptions.has(name) || (separator >= 0 && name[1] !== '-') || (explicit && processOption(name))) {
-      if (!explicit) continue;
-      throw new Error('Unsupported Worker execArgv option: ' + arg);
-    }
-    if (inspectorEnableOptions.has(name)) {
-      if (separator >= 0) inspectorAddress(arg.slice(separator + 1));
-      continue;
-    }
-    if (!workerOptions.get(name)) {
-      if (separator >= 0) throw new Error('invalid value for ' + name);
-      continue;
-    }
-    if ((name === '-p' || name === '--print') && separator < 0 &&
-        (args[index + 1] === undefined || args[index + 1].startsWith('-'))) continue;
-    const value = separator < 0 ? args[++index] : arg.slice(separator + 1);
-    if (value === undefined || (separator < 0 && isInspectorValueOption(name) && value.startsWith('-')) ||
-        ((['--localstorage-file', '-r', '--require', '--import', '-C', '--conditions',
-      '--env-file', '--env-file-if-exists', '--watch-path', '--watch-kill-signal'].includes(name) || reportOptions.isValueOption(name) || permission.isValueOption(name)) && value === '')) throw new Error(name + ' requires an argument');
+// The flags of an explicit Worker execArgv that a Worker cannot take, as Node's
+// per-isolate parser sees them: unknown or V8 options and process-wide ones.
+// Throws a parse error.
+function invalidWorkerArguments(args) {
+  const parsed = parseArguments(args, false);
+  if (parsed.error !== undefined) throw new Error(parsed.error);
+  const invalid = [];
+  for (const entry of parsed.entries) {
+    if (entry.implied) continue;
+    if (entry.type === undefined || entry.type === 'V8Option' || table.options.get(entry.name)[3]) { invalid.push(entry.raw); continue; }
+    const { name, value } = entry;
     if (name === '--input-type' && !['commonjs', 'module', 'commonjs-typescript', 'module-typescript'].includes(value))
       throw new Error('--input-type must be "module", "commonjs", "module-typescript" or "commonjs-typescript"');
     if (name === '--test-isolation' && !['process', 'none'].includes(value))
       throw new Error('--test-isolation must be "process" or "none"');
-    if (isInspectorValueOption(name)) inspectorAddress(value);
-    const error = startupControls.valueError(name, value);
+    if (entry.type === 'HostPort') inspectorAddress(value);
+    const error = typeof value === 'string' ? startupControls.valueError(name, value) : undefined;
     if (error) throw new Error(error);
   }
+  return invalid;
 }
 
+// The form an option takes as one argument: a boolean as --name or --no-name,
+// a value as --name=value, a V8 flag as written with `-` for `_`.
+function optionFlag({ name, type, value, negated, raw }) {
+  if (type === 'Boolean') return negated ? '--no-' + name.slice(2) : name;
+  if (type === undefined || type === 'V8Option') return raw.replace(/^--[^=]*/, text => text.replace(/_/g, '-'));
+  return name + '=' + value;
+}
+
+// The --env-file and --env-file-if-exists files, in order.
 function environmentFiles(args) {
   const files = [];
-  for (let index = 0; index < args.length; index++) {
-    const arg = normalizeOption(args[index]);
-    if (arg === '--' || arg === '-' || !arg.startsWith('-')) break;
-    const separator = arg.indexOf('=');
-    const name = separator < 0 ? arg : arg.slice(0, separator);
-    if (name === '--env-file' || name === '--env-file-if-exists') {
-      const path = separator < 0 ? args[++index] : arg.slice(separator + 1);
-      if (path !== undefined) files.push({ path, optional: name === '--env-file-if-exists' });
-    } else if (separator < 0 && (workerOptions.get(name) || name === '-pe' || name === '--experimental-sea-config' || name === '--run')) {
-      if ((name === '-p' || name === '--print' || name === '--run') &&
-          (args[index + 1] === undefined || args[index + 1].startsWith('-'))) continue;
-      index++;
-    }
+  for (const { name, value } of parseArguments(args, false).entries) {
+    if (name === '--env-file' || name === '--env-file-if-exists') files.push({ path: value, optional: name === '--env-file-if-exists' });
   }
   return files;
 }
 
+const loaderWorkerExcluded = new Set(['--inspect', '--inspect-brk', '--inspect-wait', '--inspect-port',
+  '--require', '--import', '--input-type', '--watch', '--watch-path', '--watch-preserve-output',
+  '--watch-kill-signal', '--experimental-test-coverage']);
+// The runtime options of the internal module hooks worker: runtime policy, not
+// entry-point execution or preloads that would register another hooks worker.
+// Module mocking is CLI-only, but remains runtime policy in hook workers.
 function loaderWorkerArguments(args) {
   const result = [];
-  for (let index = 0; index < args.length; index++) {
-    const arg = normalizeOption(args[index]), separator = arg.indexOf('=');
-    const name = separator < 0 ? arg : arg.slice(0, separator);
-    const optionalPrint = (name === '-p' || name === '--print') &&
-      (args[index + 1] === undefined || args[index + 1].startsWith('-'));
-    const value = separator < 0 && workerOptions.get(name) && !optionalPrint ? args[++index] : undefined;
-    // The internal worker gets runtime policy, not entry-point execution or
-    // preloads that would recursively register another hook worker.
-    // Module mocking is CLI-only, but remains runtime policy in hook workers.
-    const moduleMocks = name === '--experimental-test-module-mocks' || name === '--no-experimental-test-module-mocks';
-    if ((!environmentOptions.has(name) && !moduleMocks) || processOption(name) ||
-        inspectorEnableOptions.has(name) || isInspectorValueOption(name) ||
-        ['--no-inspect', '--no-inspect-brk', '--no-inspect-wait'].includes(name) ||
-        ['-r', '--require', '--import', '--input-type', '--watch', '--no-watch', '--watch-path',
-          '--watch-preserve-output', '--no-watch-preserve-output', '--watch-kill-signal',
-          '--experimental-test-coverage', '--no-experimental-test-coverage'].includes(name) ||
-        name.startsWith('--test-coverage-')) continue;
-    result.push(arg);
-    if (value !== undefined) result.push(value);
+  for (const entry of parseArguments(args, false).entries) {
+    const { name } = entry;
+    if (entry.implied || entry.type === undefined) continue;
+    const flag = optionFlag(entry);
+    if ((!table.options.get(name)[1] && name !== '--experimental-test-module-mocks') || processOption(flag.split('=', 1)[0]) ||
+        loaderWorkerExcluded.has(name) || name.startsWith('--test-coverage-')) continue;
+    result.push(flag);
   }
   return result;
 }
@@ -382,4 +315,4 @@ function buildAllowedFlags() {
   return Object.freeze(new NodeEnvironmentFlagsSet());
 }
 
-module.exports = { parseArguments, normalizeOption, parseEnvironment, validateEnvironment, validateWorker, processOption, getOptionValue, environmentFiles, loaderWorkerArguments, buildAllowedFlags, applyInspectorOption, isInspectorValueOption };
+module.exports = { parseArguments, optionFlag, parseEnvironment, validateEnvironment, invalidWorkerArguments, processOption, getOptionValue, environmentFiles, loaderWorkerArguments, buildAllowedFlags, applyInspectorOption, isInspectorValueOption };

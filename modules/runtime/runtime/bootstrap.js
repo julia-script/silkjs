@@ -857,13 +857,7 @@ function runPreloads(entry, loadImports = true) {
   }
   return pending.then(entry);
 }
-// The form runtimeFlag takes for a parsed option: a boolean as --name or
-// --no-name, a value as --name=value, a V8 flag as written with `-` for `_`.
-function optionFlag({ name, type, value, negated, raw }) {
-  if (type === 'Boolean') return negated ? '--no-' + name.slice(2) : name;
-  if (type === undefined || type === 'V8Option') return raw.replace(/^--[^=]*/, text => text.replace(/_/g, '-'));
-  return name + '=' + value;
-}
+const optionFlag = entry => internalRequire('internal/options').optionFlag(entry);
 function runtimeFlag(arg) {
   try {
     if (internalRequire('internal/permission').applyOption(arg) ||
