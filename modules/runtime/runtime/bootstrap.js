@@ -71,6 +71,8 @@ for (const name of ['dispose', 'asyncDispose']) {
 }
 const host = { ...native, rawOS, rawStd };
 host.builtinLoaded = moduleHas;
+// Whether a built-in id (public or internal) exists, loaded or not: Node's BuiltinModule.exists.
+host.builtinExists = Map.prototype.has.bind(factories);
 // Source maps are off until something loads the module to switch them on, so
 // registering a source before that only matters when coverage wants every map.
 host.registerSource = (filename, source, metadata) => {
@@ -999,7 +1001,8 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
   }
   internalRequire('internal/permission').initialize({ entrypoints });
   internalRequire('internal/startup_controls').initialize();
-  const heapProfileProblem = internalRequire('internal/heap_prof').start();
+  // Only a heap-prof option loads internal/heap_prof, and without one there is nothing to start.
+  const heapProfileProblem = moduleHas('internal/heap_prof') ? internalRequire('internal/heap_prof').start() : undefined;
   if (heapProfileProblem) return cliError(heapProfileProblem);
   if (host.enableSourceMaps || moduleHas('internal/source_maps')) process.setSourceMapsEnabled(!!host.enableSourceMaps);
   host.typeScriptMode = host.transformTypes ? 'transform' : host.stripTypes === false ? false : 'strip';
