@@ -1,7 +1,7 @@
 set -x
 cd /tmp
 gcc -O2 -shared -fPIC -o sampler.so $GITHUB_WORKSPACE/bench-x86/sampler.c -lrt
-sed 's/var N=4/var N=10/' fx-typescript.js > fx10.js
+sed 's/var N=4/var N=40/' fx-typescript.js > fx10.js
 for b in /tmp/bin/silkjs-*dbg*; do
   [ -f "$b" ] || continue
   LD_PRELOAD=./sampler.so SAMPLES_OUT=/tmp/art/$(basename $b).samples $b fx10.js > /dev/null
