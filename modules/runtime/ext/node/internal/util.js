@@ -25,7 +25,9 @@
 'use strict';
 
 const {
+  ArrayFrom,
   ArrayPrototypePush,
+  ArrayPrototypeSort,
   Error,
   ErrorCaptureStackTrace,
   FunctionPrototypeSymbolHasInstance,
@@ -40,6 +42,7 @@ const {
   Promise,
   ReflectApply,
   ReflectConstruct,
+  SafeMap,
   SafeSet,
   SymbolPrototypeGetDescription,
   StringPrototypeReplace,
@@ -397,6 +400,20 @@ function once(callback, { preserveReturnValue = false } = kEmptyObject) {
 }
 
 
+function filterDuplicateStrings(items, low) {
+  const map = new SafeMap();
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    const key = StringPrototypeToLowerCase(item);
+    if (low) {
+      map.set(key, key);
+    } else {
+      map.set(key, item);
+    }
+  }
+  return ArrayPrototypeSort(ArrayFrom(map.values()));
+}
+
 module.exports = {
   assertCrypto,
   assignFunctionName,
@@ -405,6 +422,7 @@ module.exports = {
   deprecate,
   deprecateInstantiation,
   emitExperimentalWarning,
+  filterDuplicateStrings,
   encodingsMap,
   getDeprecationWarningEmitter,
   getLazy,
