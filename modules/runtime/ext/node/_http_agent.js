@@ -88,12 +88,17 @@ function freeSocketErrorListener(err) {
 // in the TCP buffer and be silently consumed as the response for the
 // *next* request that reuses the socket (response-queue poisoning).
 // See: https://hackerone.com/reports/3582376
-// The runtime's sockets have no stream handle to read from directly, so the guard is a
-// 'data' listener that holds the socket while it is free.
+// The runtime's sockets read through stream consumers instead of handle.onread, so the
+// guard is a consumer that sits on top while the socket is free, as Node swaps onread.
 const kFreeSocketReadGuard = Symbol('kFreeSocketReadGuard');
-function freeSocketOnReadGuard() {
-  debug('READ on FREE socket - destroying poisoned socket');
-  this.destroy();
+function freeSocketReadGuard(socket) {
+  return {
+    read(status, payload) {
+      if (status >= 0 && !payload?.byteLength) return;
+      debug('READ on FREE socket - destroying poisoned socket');
+      socket.destroy();
+    },
+  };
 }
 
 function installFreeSocketDataGuard(socket) {
@@ -112,9 +117,11 @@ function installFreeSocketDataGuard(socket) {
     return;
   }
 
-  if (!socket[kFreeSocketReadGuard]) {
-    socket[kFreeSocketReadGuard] = true;
-    socket.on('data', freeSocketOnReadGuard);
+  const transport = socket._transport;
+  if (transport && !socket[kFreeSocketReadGuard]) {
+    const guard = socket[kFreeSocketReadGuard] = freeSocketReadGuard(socket);
+    (socket._streamConsumers ||= []).push(guard);
+    if (transport.readStart() < 0) socket.destroy();
   }
 }
 
@@ -134,10 +141,14 @@ function removeFreeSocketDataGuard(socket) {
     socket[kFreeSocketDataGuard] = null;
   }
 
-  if (socket[kFreeSocketReadGuard]) {
-    socket[kFreeSocketReadGuard] = false;
-    socket.removeListener('data', freeSocketOnReadGuard);
+  const guard = socket[kFreeSocketReadGuard];
+  if (guard) {
+    socket[kFreeSocketReadGuard] = null;
+    const consumers = socket._streamConsumers;
+    const at = consumers.indexOf(guard);
+    if (at !== -1) consumers.splice(at, 1);
   }
+}
 }
 
 function Agent(options) {
