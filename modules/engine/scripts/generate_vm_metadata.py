@@ -95,6 +95,9 @@ REPLACEMENTS = {
     'put_arg1': ('sub_top_arg8', 2, 1, 1, 'u8'),
     'put_arg2': ('mul_top_arg8', 2, 1, 1, 'u8'),
     'put_arg3': ('get_arg_el_arg8', 3, 0, 1, 'u16'),
+    # for await keeps its loop's throw handler (AsyncIteratorClose, which awaits
+    # return()): the iterator marker is that catch offset; 0 for yield*, which has none.
+    'for_await_of_start': ('for_await_of_start', 5, 1, 3, 'label'),
 }
 
 
@@ -181,6 +184,9 @@ def main():
     lines += [f'pub const OP_COUNT: usize = {len(regular)}',
               f'pub const OP_TEMP_START: u8 = {temporary_start}',
               f'pub const OP_TEMP_END: u8 = {temporary_end}', '',
+              '/// OP_apply magic bit: the operand is the spread iterable itself (`f(...x)`),',
+              '/// not the argument array; bit 0 is the construct flag.',
+              'pub const APPLY_ITERABLE: u16 = 4', '',
               '// Parser metadata uses temporary opcodes; final bytecode uses short opcodes.',
               'fn metadataIndex(opcode: u8, short: bool) -> usize {',
               '  let mut index = u8.toUsize(opcode)',

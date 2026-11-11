@@ -71,6 +71,8 @@ for (const name of ['dispose', 'asyncDispose']) {
 }
 const host = { ...native, rawOS, rawStd };
 host.builtinLoaded = moduleHas;
+// Whether a built-in id (public or internal) exists, loaded or not: Node's BuiltinModule.exists.
+host.builtinExists = Map.prototype.has.bind(factories);
 // Source maps are off until something loads the module to switch them on, so
 // registering a source before that only matters when coverage wants every map.
 host.registerSource = (filename, source, metadata) => {
@@ -256,6 +258,23 @@ const completionsPending = () => completions.length !== completionHead;
 // Compound native operations finish through promises, but their public
 // callbacks are I/O completions, not microtasks. Dispatch them outside drainJobs.
 host.enqueueIOCompletion = callback => completions.push(callback);
+// Built-in modules publish to diagnostics channels through these, so a process that never
+// loads diagnostics_channel pays one property read per publish site. No channel can have a
+// subscriber before diagnostics_channel loads (it sets host.diagnosticsChannel): subscribing
+// needs its exports, and the node.diagnostics_channel trace category loads it when enabled.
+host.diagnostics = {
+  publish(name, message) {
+    const dc = host.diagnosticsChannel;
+    if (dc !== undefined && dc.hasSubscribers(name)) dc.channel(name).publish(message);
+  },
+  // The tracing channel for name, or undefined when nothing observes any of its events.
+  tracing(name) {
+    const dc = host.diagnosticsChannel;
+    if (dc === undefined) return undefined;
+    const channels = dc.tracingChannel(name);
+    return channels.hasSubscribers ? channels : undefined;
+  },
+};
 host.nextTick = (callback, ...args) => {
   if (typeof callback !== 'function') throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('callback', 'function', callback);
   ticks.push(callback, args, resource('TickObject'));
@@ -277,9 +296,23 @@ function checkCallback(callback) {
 function invoke(callback, receiver, args) {
   try { return Reflect.apply(callback, receiver, args); }
   catch (error) {
-    if (process.domain && internalRequire('domain')._handleException(error)) return;
-    internalRequire('internal/startup_controls').handleUncaught(error, 'uncaughtException');
+    try {
+      if (process.domain && internalRequire('domain')._handleException(error)) return;
+      internalRequire('internal/startup_controls').handleUncaught(error, 'uncaughtException');
+    } catch (next) {
+      if (next === error || !workerThreads.isMainThread) throw next;
+      exceptionInFatalHandler(next);
+    }
   }
+}
+// A domain error handler or uncaughtException listener that throws ends the process
+// with Node's kExceptionInFatalExceptionHandler status, without 'exit' listeners.
+function exceptionInFatalHandler(error) {
+  host.abortOnUncaughtException?.(error);
+  let text;
+  try { text = internalRequire('util').inspect(error); } catch { text = String(error); }
+  try { internalRequire('fs').writeSync(2, text + '\n'); } catch {}
+  rawStd.exit(7);
 }
 const rejections = new Map();
 const reportedRejections = new WeakMap();
@@ -526,7 +559,7 @@ Object.defineProperty(process, Symbol.toStringTag, { enumerable: false, writable
 defineGlobalAccessor('process', process);
 let startTime = native.runtimeStartTime;
 const performanceMilestones = {
-  nodeStart: 0, environment: native.environmentTime - startTime,
+  nodeStart: 0, v8Start: native.engineStartTime - startTime, environment: native.environmentTime - startTime,
   bootstrapComplete: -1, loopStart: -1, loopExit: -1,
 };
 let initialNativeIdleTime = 0;
@@ -579,6 +612,14 @@ function buildConfig() {
     },
   });
 }
+// What process.exit ends with; replaceable, as in Node. --trace-exit reports the stack
+// above it and --heap-prof writes its profile here, as Node's reallyExit binding does.
+function reallyExit(code) {
+  if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushAtExit();
+  internalRequire('internal/startup_controls').traceExit(code, 0, reallyExit);
+  if (moduleHas('internal/heap_prof')) internalRequire('internal/heap_prof').finish();
+  rawStd.exit(code);
+}
 Object.assign(process, {
   argv: native.argv.slice(), argv0: native.argv[0], execArgv: [], execPath: native.osNative('execPath', []),
   version: 'v' + nodeVersion, versions: componentVersions(), config: buildConfig(),
@@ -603,10 +644,11 @@ Object.assign(process, {
   exit(code) {
     if (code !== undefined) process.exitCode = code;
     if (!process._exiting) { process._exiting = true; process.emit('exit', Number(process.exitCode) || 0); }
+    inspectorBackend._atExit();
     process.reallyExit(Number(process.exitCode) || 0);
   },
   // What process.exit ends with; replaceable, as in Node.
-  reallyExit(code) { if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushAtExit(); rawStd.exit(code); },
+  reallyExit,
   kill(pid, signal) {
     if (pid != (pid | 0)) throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('pid', 'number', pid);
     let number = signal;
@@ -863,6 +905,8 @@ function runtimeFlag(arg) {
   try {
     if (internalRequire('internal/permission').applyOption(arg) ||
         internalRequire('internal/startup_controls').applyOption(arg) ||
+        internalRequire('internal/tls/options').applyOption(arg) ||
+        internalRequire('internal/heap_prof').applyOption(arg) ||
         internalRequire('internal/options').applyInspectorOption(arg)) return true;
   }
   catch (error) { cliError(error.message); return true; }
@@ -889,6 +933,11 @@ function runtimeFlag(arg) {
   if (arg === '--expose-gc' || arg === '--no-expose-gc') {
     host.exposeGC = arg === '--expose-gc'; return true;
   }
+  // Node's flag exposes Node's own lib/internal modules and bindings. This
+  // runtime has none of those, so the flag is accepted and exposes nothing:
+  // require('internal/...') stays MODULE_NOT_FOUND.
+  if (arg === '--expose-internals' || arg === '--expose_internals') return true;
+  if (arg === '--disable-sigusr1') { host.disableSigusr1 = true; return true; }
   if (arg === '--test-update-snapshots' || arg === '--no-test-update-snapshots') {
     host.testUpdateSnapshots = arg === '--test-update-snapshots'; return true;
   }
@@ -952,6 +1001,9 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
   }
   internalRequire('internal/permission').initialize({ entrypoints });
   internalRequire('internal/startup_controls').initialize();
+  // Only a heap-prof option loads internal/heap_prof, and without one there is nothing to start.
+  const heapProfileProblem = moduleHas('internal/heap_prof') ? internalRequire('internal/heap_prof').start() : undefined;
+  if (heapProfileProblem) return cliError(heapProfileProblem);
   if (host.enableSourceMaps || moduleHas('internal/source_maps')) process.setSourceMapsEnabled(!!host.enableSourceMaps);
   host.typeScriptMode = host.transformTypes ? 'transform' : host.stripTypes === false ? false : 'strip';
   host.initialExecArgv = process.execArgv.slice();
@@ -976,6 +1028,7 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
     process.debugPort = options?.port ?? 9229;
     process._breakFirstLine = !!options?.breakFirst;
     if (options?.enabled) inspectorBackend._start(options.port, options.host, options.wait, options.breakFirst);
+    if (workerThreads.isMainThread) inspectorBackend._installProcess(process, options?.host, !host.disableSigusr1);
     if (!workerThreads.isMainThread) inspectorBackend._waitForWorker();
   }
 }
@@ -1008,7 +1061,7 @@ function runWorker() {
     if (arg === '--input-type') { inputType = runtimeArgs[++index]; continue; }
     if (arg.startsWith('--input-type=')) { inputType = arg.slice(13); continue; }
     if (arg === '--env-file' || arg === '--env-file-if-exists') { index++; continue; }
-    if (['--localstorage-file', '-r', '--require', '--import', '-C', '--conditions'].includes(arg) || internalRequire('internal/process_report').isValueOption(arg) || internalRequire('internal/startup_controls').isValueOption(arg) || internalRequire('internal/permission').isValueOption(arg) || internalRequire('internal/options').isInspectorValueOption(arg)) {
+    if (['--localstorage-file', '-r', '--require', '--import', '-C', '--conditions'].includes(arg) || internalRequire('internal/process_report').isValueOption(arg) || internalRequire('internal/startup_controls').isValueOption(arg) || internalRequire('internal/heap_prof').isValueOption(arg) || internalRequire('internal/permission').isValueOption(arg) || internalRequire('internal/options').isInspectorValueOption(arg)) {
       runtimeFlag((arg === '-r' ? '--require' : arg === '-C' ? '--conditions' : arg) + '=' + runtimeArgs[++index]); continue;
     }
     runtimeFlag(arg);
@@ -1138,21 +1191,26 @@ function run() {
     }
     if (['--localstorage-file=', '--require=', '--import=', '--conditions=', '--experimental-loader=', '--loader='].includes(arg) ||
         (arg.endsWith('=') && (internalRequire('internal/process_report').isValueOption(arg.slice(0, -1)) ||
-          internalRequire('internal/permission').isValueOption(arg.slice(0, -1))))) return cliError(arg + ' requires an argument');
+          internalRequire('internal/startup_controls').isValueOption(arg.slice(0, -1)) ||
+          internalRequire('internal/heap_prof').isValueOption(arg.slice(0, -1)) ||
+          internalRequire('internal/permission').isValueOption(arg.slice(0, -1)) ||
+          internalRequire('internal/tls/options').isValueOption(arg.slice(0, -1))))) return cliError(arg + ' requires an argument');
     if (runtimeFlag(arg)) { record(arg); continue; }
     if (arg === '--trace-event-categories' || arg === '--trace-event-file-pattern' || arg === '--localstorage-file' ||
         arg === '-r' || arg === '--require' || arg === '--import' || arg === '-C' || arg === '--conditions' ||
         arg === '--experimental-loader' || arg === '--loader' ||
         internalRequire('internal/process_report').isValueOption(arg) ||
         internalRequire('internal/startup_controls').isValueOption(arg) ||
+        internalRequire('internal/heap_prof').isValueOption(arg) ||
         internalRequire('internal/permission').isValueOption(arg) ||
+        internalRequire('internal/tls/options').isValueOption(arg) ||
         internalRequire('internal/options').isInspectorValueOption(arg) ||
         arg === '--experimental-sea-config' || arg.startsWith('--experimental-sea-config=')) {
       const separator = arg.indexOf('=');
       const name = arg === '-r' ? '--require' : arg === '-C' ? '--conditions' : separator < 0 ? arg : arg.slice(0, separator);
       const value = separator < 0 ? args[++index] : arg.slice(separator + 1);
       if (value === undefined || (separator < 0 && internalRequire('internal/options').isInspectorValueOption(name) && value.startsWith('-')) ||
-          ((['--localstorage-file', '--require', '--import', '--conditions', '--experimental-loader', '--loader'].includes(name) || internalRequire('internal/process_report').isValueOption(name) || internalRequire('internal/startup_controls').isValueOption(name) || internalRequire('internal/permission').isValueOption(name)) &&
+          ((['--localstorage-file', '--require', '--import', '--conditions', '--experimental-loader', '--loader'].includes(name) || internalRequire('internal/process_report').isValueOption(name) || internalRequire('internal/startup_controls').isValueOption(name) || internalRequire('internal/heap_prof').isValueOption(name) || internalRequire('internal/permission').isValueOption(name)) &&
           (value === '' || (separator < 0 && value.startsWith('-'))))) return cliError(name + ' requires an argument');
       record(arg, ...(separator < 0 ? [value] : []));
       if (name === '--experimental-sea-config') { sea.prepare(value); return; }
@@ -1290,6 +1348,8 @@ Environment:
 `);
       return;
     }
+    if (/^--debug(?:-brk)?(?:=|$)/.test(arg))
+      return cliError('`node --debug` and `node --debug-brk` are invalid. Please use `node --inspect` and `node --inspect-brk` instead.');
     if (arg !== '-' && arg.startsWith('-')) return cliError('bad option: ' + arg);
     break;
   }
@@ -1297,6 +1357,8 @@ Environment:
     const separator = native.argv.indexOf('--', 1);
     return internalRequire('internal/main/run').runPackageScript(runName, separator < 0 ? [] : native.argv.slice(separator + 1));
   }
+  const tlsConflict = internalRequire('internal/tls/options').validate();
+  if (tlsConflict) return cliError(tlsConflict);
   if (watchMode && expression !== undefined) return cliError('either --watch or --eval can be used, not both');
   if (watchMode && check) return cliError('either --watch or --check can be used, not both');
   if (watchMode && interactive) return cliError('either --watch or --interactive can be used, not both');
@@ -1304,6 +1366,11 @@ Environment:
   process._print_eval = print;
   filename = args[index];
   process.argv = [process.execPath, ...args.slice(index)];
+  // `node inspect ...`: the debugger client (lib/internal/main/inspect.js).
+  if (filename === 'inspect' && expression === undefined && !testMode && !check && !watchMode && !interactive) {
+    installRuntimeOptions(environment.concat(process.execArgv));
+    return runPreloads(() => internalRequire('internal/debugger/inspect').start());
+  }
   if (check && expression !== undefined) return cliError('either --check or --eval can be used, not both');
   if (check && testMode) return cliError('either --test or --check can be used, not both');
   if (testMode && (expression !== undefined || interactive || inputTypeSet))
@@ -1501,6 +1568,8 @@ function loop() {
   performanceMilestones.loopExit = native.now() - startTime;
   process._exiting = true; const status = Number(process.exitCode) || 0;
   process.emit('exit', status);
+  inspectorBackend._atExit();
+  if (moduleHas('internal/heap_prof')) internalRequire('internal/heap_prof').finish();
   if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushAtExit();
   return Number(process.exitCode) || 0;
 }
@@ -1574,12 +1643,16 @@ globalThis.__silkRuntime = {
     // Whoever kept a noting proxy reaches the environment through it unnoted.
     for (const trap of Object.keys(notes)) delete notes[trap];
     host.env = startupEnvironmentValues; process.env = liveEnvironment;
+    // The warm main script and its dependency are cycles the loader no longer holds;
+    // left in the image, every start would find them (the inspector lists their scripts).
+    rawStd.gc();
   },
   // Starts a process from a heap image: everything the bootstrap took from the
   // process that built the image is taken again from this one.
-  hydrate(argv, runtimeStartTime, environmentTime) {
+  hydrate(argv, runtimeStartTime, environmentTime, engineStartTime) {
     native.argv = argv;
     startTime = runtimeStartTime;
+    performanceMilestones.v8Start = engineStartTime - startTime;
     performanceMilestones.environment = environmentTime - startTime;
     host.performanceStartTime = startTime;
     host.performanceTimeOrigin = Date.now() - (native.now() - startTime);

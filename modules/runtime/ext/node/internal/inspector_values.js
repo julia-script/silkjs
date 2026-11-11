@@ -7,6 +7,126 @@ const own = Function.prototype.call.bind(Object.prototype.hasOwnProperty);
 function protocolError(code, message) { return Object.assign(new Error(message), { protocolCode: code }); }
 function unsupported(method) { throw protocolError(-32601, `'${method}' wasn't found`); }
 function inspect(value, limit) { return limit === undefined ? native(9, value) : native(9, value, limit); }
+// V8 RemoteObject className/description/subtype (src/inspector/value-mirror.cc),
+// computed only through brand checks, own data descriptors and built-in getters
+// so describing a value never runs user code.
+const uncurry = Function.prototype.bind.bind(Function.prototype.call);
+const functionSource = uncurry(Function.prototype.toString);
+const dateText = uncurry(Date.prototype.toString);
+const getter = (target, name) => uncurry(Object.getOwnPropertyDescriptor(target, name).get);
+const regexpSource = getter(RegExp.prototype, 'source'), regexpFlags = getter(RegExp.prototype, 'flags');
+const mapSize = getter(Map.prototype, 'size'), setSize = getter(Set.prototype, 'size');
+const typedLength = getter(Object.getPrototypeOf(Uint8Array.prototype), 'length');
+const bufferLength = getter(ArrayBuffer.prototype, 'byteLength');
+const sharedLength = typeof SharedArrayBuffer === 'function' ? getter(SharedArrayBuffer.prototype, 'byteLength') : null;
+const viewLength = getter(DataView.prototype, 'byteLength');
+const mapEntries = uncurry(Map.prototype.entries), setValues = uncurry(Set.prototype.values);
+const mapNext = uncurry(Object.getPrototypeOf(new Map().entries()).next), setNext = uncurry(Object.getPrototypeOf(new Set().values()).next);
+// The first limit entries through the built-in iterators (never Symbol.iterator).
+function collectionEntries(value, map, limit) {
+  const iterator = map ? mapEntries(value) : setValues(value), next = map ? mapNext : setNext, items = [];
+  for (let step = next(iterator); !step.done && items.length < limit; step = next(iterator)) items.push(step.value);
+  return items;
+}
+let types;
+function brands() { return types ||= require('util').types; }
+function ownData(target, name) {
+  const descriptor = Reflect.getOwnPropertyDescriptor(target, name);
+  return descriptor && own(descriptor, 'value') ? descriptor.value : undefined;
+}
+function className(value, info = inspect(value, 0)) {
+  if (info.subtype === 'proxy') {
+    const details = host.getProxyDetails(value);
+    return details === null || details[0] === null || (typeof details[0] !== 'object' && typeof details[0] !== 'function') ? 'Object' : className(details[0]);
+  }
+  let prototype = info.prototype, seen = 0;
+  while (prototype !== null && prototype !== undefined && seen++ < 64) {
+    const next = inspect(prototype, 0);
+    if (next.subtype === 'proxy') break;
+    const constructor = ownData(prototype, 'constructor');
+    if (typeof constructor === 'function') {
+      const name = ownData(constructor, 'name');
+      if (typeof name === 'string' && name) return name;
+    }
+    prototype = next.prototype;
+  }
+  return typeof value === 'function' ? 'Function' : 'Object';
+}
+function subtypeOf(value, info) {
+  if (info.subtype) return info.subtype;
+  if (typeof value !== 'object' || value === null) return undefined;
+  const is = brands();
+  if (is.isWeakMap(value)) return 'weakmap';
+  if (is.isWeakSet(value)) return 'weakset';
+  if (is.isDataView(value)) return 'dataview';
+  if (is.isSharedArrayBuffer(value)) return 'arraybuffer';
+  if (is.isGeneratorObject(value)) return 'generator';
+  if (is.isMapIterator(value) || is.isSetIterator(value)) return 'iterator';
+  if (typeof WeakRef === 'function' && is.isWeakRef?.(value)) return 'weakref';
+  return undefined;
+}
+function errorDescription(value, name) {
+  const descriptor = Reflect.getOwnPropertyDescriptor(value, 'stack');
+  let stack = descriptor && own(descriptor, 'value') ? descriptor.value : undefined;
+  if (descriptor && typeof descriptor.get === 'function' && /\[native code\]\s*\}$/.test(functionSource(descriptor.get))) {
+    try { stack = Reflect.apply(descriptor.get, value, []); } catch { stack = undefined; }
+  }
+  if (typeof stack === 'string' && stack) return stack;
+  const message = ownData(value, 'message');
+  return typeof message === 'string' && message ? `${name}: ${message}` : name;
+}
+function lengthOf(value) {
+  const length = ownData(value, 'length');
+  return typeof length === 'number' ? length : 0;
+}
+function describe(value, info = inspect(value, 0)) {
+  const subtype = subtypeOf(value, info);
+  const name = className(value, info);
+  let description = name;
+  try {
+    if (subtype === 'proxy') description = `Proxy(${name})`;
+    else if (typeof value === 'function') description = functionSource(value);
+    else if (subtype === 'array') description = `Array(${lengthOf(value)})`;
+    else if (subtype === 'typedarray') description = `${name}(${typedLength(value)})`;
+    else if (subtype === 'arraybuffer') description = `${name}(${brands().isSharedArrayBuffer(value) ? sharedLength(value) : bufferLength(value)})`;
+    else if (subtype === 'dataview') description = `${name}(${viewLength(value)})`;
+    else if (subtype === 'map') description = `${name}(${mapSize(value)})`;
+    else if (subtype === 'set') description = `${name}(${setSize(value)})`;
+    else if (subtype === 'date') description = dateText(value);
+    else if (subtype === 'regexp') description = `/${regexpSource(value)}/${regexpFlags(value)}`;
+    else if (subtype === 'error') description = errorDescription(value, name);
+  } catch { description = name; }
+  return { type: typeof value === 'function' ? 'function' : 'object', subtype, className: name, description };
+}
+// Integer-indexed keys first, ascending, then the rest in creation order (V8 order).
+function ordered(properties = []) {
+  const indexed = [], named = [];
+  for (const property of properties) {
+    const name = property.name;
+    if (typeof name === 'string' && /^(?:0|[1-9]\d*)$/.test(name) && Number(name) < 4294967295) indexed.push(property);
+    else named.push(property);
+  }
+  indexed.sort((a, b) => a.name - b.name);
+  return indexed.concat(named);
+}
+function abbreviate(text, max = 100) {
+  if (text.length <= max) return text;
+  const half = (max - 1) >> 1;
+  return text.slice(0, half) + '…' + text.slice(text.length - (max - 1 - half));
+}
+function previewValue(value) {
+  if (value === null) return { type: 'object', subtype: 'null', value: 'null' };
+  switch (typeof value) {
+    case 'string': return { type: 'string', value: abbreviate(value) };
+    case 'number': return { type: 'number', value: Object.is(value, -0) ? '-0' : String(value) };
+    case 'bigint': return { type: 'bigint', value: `${value}n` };
+    case 'boolean': case 'undefined': return { type: typeof value, value: String(value) };
+    case 'symbol': return { type: 'symbol', value: inspect(value).description };
+    case 'function': return { type: 'function', value: '' };
+  }
+  const described = describe(value);
+  return { type: 'object', value: abbreviate(described.description, 100), ...(described.subtype ? { subtype: described.subtype } : {}) };
+}
 function primitive(value, description) {
   const type = typeof value;
   if (value === null) return { type: 'object', subtype: 'null', value: null };
@@ -46,32 +166,27 @@ function byValue(value, seen = new Set(), depth = 0) {
   seen.delete(value);
   return result;
 }
-// V8's descriptions for arrays and errors. Only own data properties are read, so
-// no getter or proxy trap runs (proxies have their own subtype).
-function describe(value, info) {
-  if (info.subtype === 'array') return `Array(${value.length})`;
-  if (info.subtype === 'error') {
-    const stack = Object.getOwnPropertyDescriptor(value, 'stack');
-    if (stack && typeof stack.value === 'string') return stack.value;
-  }
-  return info.description;
-}
 class RemoteValues {
   constructor(prefix) { this.prefix = prefix; this.next = 1; this.entries = new Map(); }
   remote(value, group = '', returnByValue = false, generatePreview = false, context) {
-    const info = inspect(value, generatePreview ? 64 : 0);
+    const info = inspect(value, generatePreview ? 128 : 0);
     const simple = primitive(value, info.description);
     if (simple && typeof value !== 'symbol') return simple;
-    const result = simple || { type: info.type || typeof value, description: describe(value, info) || (typeof value === 'function' ? 'function' : 'Object') };
-    if (info.subtype) result.subtype = info.subtype;
-    if (info.className) result.className = info.className;
+    let result = simple;
+    if (!result) {
+      const described = describe(value, info);
+      result = { type: described.type };
+      if (described.subtype) result.subtype = described.subtype;
+      result.className = described.className;
+      result.description = described.description;
+    }
     if (returnByValue) result.value = byValue(value);
     else {
       const objectId = `${this.prefix}:${this.next++}`;
       this.entries.set(objectId, { value, group, context });
       result.objectId = objectId;
     }
-    if (generatePreview && typeof value !== 'symbol') result.preview = preview(info);
+    if (generatePreview && typeof value === 'object') result.preview = preview(value, info);
     return result;
   }
   scope(frameId, scope, depth, context) {
@@ -120,7 +235,7 @@ class RemoteValues {
     while (value !== null && value !== undefined && !visited.has(value)) {
       visited.add(value);
       const info = inspect(value);
-      for (const property of info.properties || []) {
+      for (const property of ordered(info.properties)) {
         const name = property.name;
         if (names.has(name)) continue;
         names.add(name);
@@ -152,16 +267,59 @@ class RemoteValues {
     return { result, internalProperties };
   }
 }
-function preview(info) {
+function previewProperties(value, info, limit) {
   const properties = [];
   let overflow = false;
-  for (const property of info.properties || []) {
-    if (!property.enumerable || typeof property.name !== 'string') continue;
-    if (properties.length === 5) { overflow = true; break; }
-    const value = own(property, 'value') ? inspect(property.value) : { type: 'accessor', description: '(...)' };
-    properties.push({ name: property.name, type: value.type, ...(value.subtype ? { subtype: value.subtype } : {}), value: own(property, 'value') ? format(property.value, 0, new Set(), { remaining: 160 }) : '(...)' });
+  const list = ordered(info.properties);
+  if (info.subtype === 'error') for (const name of ['stack', 'message']) {
+    if (properties.some(property => property.name === name)) continue;
+    let text;
+    if (name === 'stack') { const description = describe(value, info).description; text = description; }
+    else text = ownData(value, 'message');
+    if (typeof text === 'string') properties.push({ name, ...previewValue(text) });
   }
-  return { type: info.type, ...(info.subtype ? { subtype: info.subtype } : {}), description: info.description, overflow, properties };
+  for (const property of list) {
+    if (!property.enumerable || typeof property.name !== 'string') continue;
+    if (info.subtype === 'array' && property.name === 'length') continue;
+    if (properties.length >= limit) { overflow = true; break; }
+    if (property.unavailable) { properties.push({ name: property.name, type: 'undefined', value: 'undefined' }); continue; }
+    if (!own(property, 'value')) { properties.push({ name: property.name, type: 'accessor' }); continue; }
+    properties.push({ name: property.name, ...previewValue(property.value) });
+  }
+  return { properties, overflow: overflow || !!info.overflow };
+}
+function entryPreview(value) {
+  if ((typeof value !== 'object' && typeof value !== 'function') || value === null) {
+    const shown = previewValue(value);
+    return { type: shown.type, ...(shown.subtype ? { subtype: shown.subtype } : {}), description: shown.value, overflow: false, properties: [] };
+  }
+  return preview(value, inspect(value, 64), 5, false);
+}
+function preview(value, info, limit, withEntries = true) {
+  const described = describe(value, info);
+  const subtype = described.subtype;
+  if (limit === undefined) limit = subtype === 'array' || subtype === 'typedarray' ? 100 : 5;
+  const result = { type: described.type, ...(subtype ? { subtype } : {}), description: abbreviate(described.description, 100), overflow: false, properties: [] };
+  if (typeof value === 'function' || subtype === 'proxy') return result;
+  const shown = previewProperties(value, info, limit);
+  result.properties = shown.properties; result.overflow = shown.overflow;
+  if (subtype === 'map' || subtype === 'set') {
+    result.properties.unshift({ name: 'size', type: 'number', value: String(subtype === 'map' ? mapSize(value) : setSize(value)) });
+    if (withEntries) {
+      const entries = [];
+      const size = subtype === 'map' ? mapSize(value) : setSize(value);
+      if (size > 5) result.overflow = true;
+      for (const item of collectionEntries(value, subtype === 'map', 5)) {
+        entries.push(subtype === 'map' ? { key: entryPreview(item[0]), value: entryPreview(item[1]) } : { value: entryPreview(item) });
+      }
+      result.entries = entries;
+    }
+  } else if (subtype === 'promise') {
+    const details = host.getPromiseDetails(value);
+    result.properties.unshift({ name: '[[PromiseState]]', type: 'string', value: ['pending', 'fulfilled', 'rejected'][details[0]] },
+      ...(details[0] === 0 ? [] : [{ name: '[[PromiseResult]]', ...previewValue(details[1]) }]));
+  }
+  return result;
 }
 function format(value, depth = 2, seen = new Set(), budget = { remaining: 1000 }) {
   if (budget.remaining <= 0) return '…';

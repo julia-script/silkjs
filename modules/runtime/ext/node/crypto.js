@@ -27,7 +27,7 @@
 const c = require('internal/crypto_core');
 const { Buffer, call, submit, packed, bytes, binary, integer, callback, error, invalid, output, attach, handle, release, name } = c;
 const { Transform, Writable } = require('stream');
-const constants = Object.freeze({ RSA_PKCS1_PADDING: 1, RSA_NO_PADDING: 3, RSA_PKCS1_OAEP_PADDING: 4, RSA_X931_PADDING: 5, RSA_PKCS1_PSS_PADDING: 6, RSA_PSS_SALTLEN_DIGEST: -1, RSA_PSS_SALTLEN_MAX_SIGN: -2, RSA_PSS_SALTLEN_AUTO: -2, POINT_CONVERSION_COMPRESSED: 2, POINT_CONVERSION_UNCOMPRESSED: 4, POINT_CONVERSION_HYBRID: 6, DH_CHECK_P_NOT_PRIME: 1, DH_CHECK_P_NOT_SAFE_PRIME: 2, DH_UNABLE_TO_CHECK_GENERATOR: 4, DH_NOT_SUITABLE_GENERATOR: 8, ENGINE_METHOD_RSA: 1, ENGINE_METHOD_DSA: 2, ENGINE_METHOD_DH: 4, ENGINE_METHOD_RAND: 8, ENGINE_METHOD_CIPHERS: 64, ENGINE_METHOD_DIGESTS: 128, ENGINE_METHOD_PKEY_METHS: 512, ENGINE_METHOD_PKEY_ASN1_METHS: 1024, ENGINE_METHOD_EC: 2048, ENGINE_METHOD_ALL: 65535, ENGINE_METHOD_NONE: 0 });
+const constants = Object.freeze({ RSA_PKCS1_PADDING: 1, RSA_NO_PADDING: 3, RSA_PKCS1_OAEP_PADDING: 4, RSA_X931_PADDING: 5, RSA_PKCS1_PSS_PADDING: 6, RSA_PSS_SALTLEN_DIGEST: -1, RSA_PSS_SALTLEN_MAX_SIGN: -2, RSA_PSS_SALTLEN_AUTO: -2, POINT_CONVERSION_COMPRESSED: 2, POINT_CONVERSION_UNCOMPRESSED: 4, POINT_CONVERSION_HYBRID: 6, DH_CHECK_P_NOT_PRIME: 1, DH_CHECK_P_NOT_SAFE_PRIME: 2, DH_UNABLE_TO_CHECK_GENERATOR: 4, DH_NOT_SUITABLE_GENERATOR: 8, ENGINE_METHOD_RSA: 1, ENGINE_METHOD_DSA: 2, ENGINE_METHOD_DH: 4, ENGINE_METHOD_RAND: 8, ENGINE_METHOD_CIPHERS: 64, ENGINE_METHOD_DIGESTS: 128, ENGINE_METHOD_PKEY_METHS: 512, ENGINE_METHOD_PKEY_ASN1_METHS: 1024, ENGINE_METHOD_EC: 2048, ENGINE_METHOD_ALL: 65535, ENGINE_METHOD_NONE: 0, defaultCoreCipherList: require('internal/tls/options').DEFAULT_CIPHER_LIST, defaultCipherList: require('internal/tls/options').getOptionValue('--tls-cipher-list') });
 const { codes, validate, isAnyArrayBuffer, normalize } = c;
 // lib/internal/crypto/random.js
 const kMaxPossibleLength = Math.min(require('buffer').kMaxLength, 2 ** 31 - 1);
@@ -976,7 +976,7 @@ function generateKeyPair(type, options, cb) {
   const job = keygenJob(type, options);
   submit('keyGenerate', job.args, (e, pair) => e ? cb(e) : cb(null, pair.publicKey, pair.privateKey), id => keypair(id, job.encoding));
 }
-Object.defineProperty(generateKeyPair, require('internal/util_promisify').customPromisifyArgs, { value: ['publicKey', 'privateKey'], enumerable: false });
+Object.defineProperty(generateKeyPair, require('internal/util').customPromisifyArgs, { value: ['publicKey', 'privateKey'], enumerable: false });
 function secretKeygenLength(type, options) {
   validate.string(type, 'type'); validate.object(options, 'options');
   const { length } = options;

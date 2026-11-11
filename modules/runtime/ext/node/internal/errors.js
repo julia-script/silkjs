@@ -146,7 +146,7 @@ let util;
 
 let internalUtil = null;
 function lazyInternalUtil() {
-  internalUtil ??= require('util');
+  internalUtil ??= require('internal/util');
   return internalUtil;
 }
 
@@ -157,7 +157,7 @@ function setOwnProperty(object, key, value) {
 
 let internalUtilInspect = null;
 function lazyInternalUtilInspect() {
-  internalUtilInspect ??= { inspect: require('internal/util_inspect').inspect, format: require('util').format };
+  internalUtilInspect ??= require('internal/util/inspect');
   return internalUtilInspect;
 }
 
