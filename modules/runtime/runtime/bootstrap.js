@@ -1036,6 +1036,12 @@ function runtimeFlag(arg) {
   if (arg === '--experimental-test-module-mocks' || arg === '--no-experimental-test-module-mocks') {
     host.experimentalTestModuleMocks = arg === '--experimental-test-module-mocks'; return true;
   }
+  if (arg === '--experimental-storage-inspection' || arg === '--no-experimental-storage-inspection') {
+    host.experimentalStorageInspection = arg === '--experimental-storage-inspection'; return true;
+  }
+  if (arg === '--experimental-network-inspection' || arg === '--no-experimental-network-inspection') {
+    host.experimentalNetworkInspection = arg === '--experimental-network-inspection'; return true;
+  }
   if (arg === '--experimental-inspector-network-resource' || arg === '--no-experimental-inspector-network-resource') {
     host.experimentalInspectorNetworkResource = arg === '--experimental-inspector-network-resource'; return true;
   }
@@ -1077,7 +1083,7 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
     delete globalThis.WebSocket;
     delete globalThis.CloseEvent;
   }
-  if (host.experimentalWebStorage) internalRequire('internal/web/storage').install(globalThis, { localStorageFile: host.localStorageFile });
+  if (host.experimentalWebStorage) internalRequire('internal/web/storage').install(globalThis, { localStorageFile: host.localStorageFile, inspect: !!host.experimentalStorageInspection });
   if (host.experimentalStreamIter) { internalRequire('fs/promises'); internalRequire('internal/fs_iter').install(); }
   if (workerThreads.isMainThread) internalRequire('internal/trace_events').initialize(host.traceOptions);
   if (workerThreads.isMainThread && host.traceSigint) internalRequire('util').setTraceSigInt(true);
