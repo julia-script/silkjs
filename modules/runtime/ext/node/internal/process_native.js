@@ -22,18 +22,17 @@
 'use strict';
 const host = require('internal/host');
 const native = (operation, args = []) => host.osNative(operation, args);
-function invalid(name, expected) {
-  return Object.assign(new TypeError(`The "${name}" argument must be of type ${expected}`), { code: 'ERR_INVALID_ARG_TYPE' });
-}
+const { codes: { ERR_INVALID_ARG_TYPE } } = require('internal/path_events/support');
+const invalid = (name, expected, value) => new ERR_INVALID_ARG_TYPE(name, expected, value);
 function uint32(value, name) {
-  if (typeof value !== 'number') throw invalid(name, 'number');
+  if (typeof value !== 'number') throw invalid(name, 'number', value);
   if (!Number.isInteger(value) || value < 0 || value > 0xffffffff)
     throw Object.assign(new RangeError(`The value of "${name}" is out of range. It must be >= 0 and <= 4294967295. Received ${value}`), { code: 'ERR_OUT_OF_RANGE' });
   return value;
 }
 function validateId(value, name) {
   if (typeof value === 'number') return uint32(value, name);
-  if (typeof value !== 'string') throw invalid(name, 'number or string');
+  if (typeof value !== 'string') throw invalid(name, ['number', 'string'], value);
   return value;
 }
 function unknown(value, group) {
@@ -50,8 +49,8 @@ function usage(operation, previous) {
     for (const key of ['user', 'system']) {
       const value = previous[key];
       if (typeof value !== 'number' || !(value >= 0 && value <= Number.MAX_SAFE_INTEGER)) {
-        if (key === 'user' && (typeof previous !== 'object' || Array.isArray(previous))) throw invalid('prevValue', 'Object');
-        if (typeof value !== 'number') throw invalid(`prevValue.${key}`, 'number');
+        if (key === 'user' && (typeof previous !== 'object' || Array.isArray(previous))) throw invalid('prevValue', 'object', previous);
+        if (typeof value !== 'number') throw invalid(`prevValue.${key}`, 'number', value);
         throw Object.assign(new RangeError(`The property 'prevValue.${key}' must be a non-negative number not exceeding Number.MAX_SAFE_INTEGER. Received ${value}`), { code: 'ERR_INVALID_ARG_VALUE' });
       }
     }
@@ -82,7 +81,7 @@ function install(process) {
     } }[operation];
   }
   process.setgroups = function setgroups(groups) {
-    if (!Array.isArray(groups)) throw invalid('groups', 'Array');
+    if (!Array.isArray(groups)) throw invalid('groups', 'Array', groups);
     for (let i = 0; i < groups.length; i++) validateId(groups[i], `groups[${i}]`);
     const ids = [];
     for (let i = 0; i < groups.length; i++) ids.push(resolve(groups[i], true));
