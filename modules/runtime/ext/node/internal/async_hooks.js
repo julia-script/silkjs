@@ -9,6 +9,8 @@ const symbols = {
   async_id_symbol: Symbol('asyncId'),
   trigger_async_id_symbol: Symbol('triggerAsyncId'),
   owner_symbol: Symbol('owner_symbol'),
+  // Where a resource keeps its AsyncLocalStorage stores with --no-async-context-frame.
+  async_local_storage_context_symbol: Symbol('kAsyncLocalStorageContext'),
 };
 
 function newAsyncId() { return _newAsyncId(); }
