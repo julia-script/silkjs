@@ -276,11 +276,11 @@ class StreamHandle {
           // Reads the transport queued before a readStop wait while the stream is stopped
           // (a paused HTTP parser sees no data, as with libuv). The payload is only lent for
           // the event, so a held read keeps a copy.
-          if (!this._transport.reading || this._pendingReads.length) {
+          if (!this.reading || this._pendingReads.length) {
             this._pendingReads.push([payload ? payload.slice(0) : payload, status, true]);
             return;
           }
-          this._consumed(status, payload);
+          this._readForConsumer(status, payload);
           return;
         }
         if (status < 0) {
@@ -329,7 +329,7 @@ class StreamHandle {
   }
   // A read for the stream's consumer, which hands read errors and the end of the stream
   // back to onread (returns false).
-  _consumed(status, payload) {
+  _readForConsumer(status, payload) {
     const consumer = this._consumers?.[this._consumers.length - 1];
     if (consumer && consumer.read(status, payload) !== false) return;
     if (status < 0) {
@@ -346,13 +346,13 @@ class StreamHandle {
     this._pendingReads = [];
     for (let i = 0; i < pending.length; i++) {
       // A read stopped again: the rest waits, after anything it held back.
-      if (this._pendingReads.length || !this._transport?.reading) {
-        if (!this._transport || this._transport.closed) return;
+      // So does one that came while the stream was stopped (net clears handle.reading).
+      if (this._pendingReads.length || (pending[i][2] && !this.reading)) {
         this._pendingReads.push(...pending.slice(i));
         return;
       }
       const [payload, nread, consumed] = pending[i];
-      if (consumed) this._consumed(nread, payload);
+      if (consumed) this._readForConsumer(nread, payload);
       else this._deliver(payload, nread);
     }
   }
