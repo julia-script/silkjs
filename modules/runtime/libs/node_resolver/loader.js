@@ -5,6 +5,7 @@ const { createHooks } = require('./hooks');
 const own = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
 const builtinPrefix = Function.prototype.call.bind(String.prototype.startsWith);
 const builtinSlice = Function.prototype.call.bind(String.prototype.slice);
+const kModuleParent = Symbol('kModuleParent');
 
 // Embedding contract: compileFunction evaluates the complete wrapper expression;
 // evaluateModule(source, filename, isEntry) runs a real native ESM graph; the
@@ -296,7 +297,7 @@ function createLoader(host, builtins) {
     while (current && !visited.has(current)) {
       visited.add(current);
       stack.push(current.filename);
-      current = current.parent;
+      current = current[kModuleParent];
     }
     if (!stack.length && parent) stack.push(parent);
     return error('MODULE_NOT_FOUND', `Cannot find module '${specifier}'` + (stack.length ? '\nRequire stack:\n- ' + stack.join('\n- ') : ''), { requireStack: stack });
@@ -884,7 +885,7 @@ function createLoader(host, builtins) {
       this.filename = null;
       this.path = path.dirname(id);
       this.exports = {};
-      this.parent = parent;
+      this[kModuleParent] = parent;
       this.children = [];
       this.paths = modulePaths(this.path);
       this.loaded = false;
@@ -1000,7 +1001,24 @@ function createLoader(host, builtins) {
   Module.isBuiltin = name => typeof name === 'string' && (builtins.listed(name) ||
     (builtinPrefix(name, 'node:') && builtins.listed(builtinSlice(name, 5))));
   Object.defineProperty(Module, 'builtinModules', { enumerable: true, get: () => builtins.names() });
-  Module.runMain = () => runMain(process.argv[1]);
+  Module.runMain = (main = process.argv[1]) => runMain(main);
+  const defaultRunMain = Module.runMain;
+  // module.parent reads the module that first required this one; Node deprecates it
+  // (DEP0144, a warning only with --pending-deprecation).
+  {
+    const message = 'module.parent is deprecated due to accuracy issues. Please use require.main to find program entry point instead.';
+    let warned = false;
+    const warn = () => {
+      if (warned || !host.pendingDeprecation) return;
+      warned = true;
+      process.emitWarning(message, 'DeprecationWarning', 'DEP0144');
+    };
+    Object.defineProperty(Module.prototype, 'parent', {
+      configurable: true, enumerable: false,
+      get() { warn(); return this[kModuleParent]; },
+      set(value) { warn(); this[kModuleParent] = value; },
+    });
+  }
   function makeModule(filename, parent) {
     const module = new Module(filename, parent || null);
     module.filename = filename;
@@ -1115,7 +1133,7 @@ function createLoader(host, builtins) {
   function requireStack(parent) {
     const stack = [];
     const visited = new Set();
-    for (let current = parent; current && !visited.has(current); current = current.parent) {
+    for (let current = parent; current && !visited.has(current); current = current[kModuleParent]) {
       visited.add(current);
       if (current.filename) stack.push(current.filename);
     }
@@ -1174,12 +1192,12 @@ function createLoader(host, builtins) {
   }
 
   function requireNamespace(module, filename) {
-    if (!requireModuleEnabled()) throw requireESMError(filename, module.parent);
+    if (!requireModuleEnabled()) throw requireESMError(filename, module[kModuleParent]);
     let namespace;
     try { namespace = host.requireModule(filename); }
     catch (cause) {
-      if (cause !== null && typeof cause === 'object' && cause.code === 'ERR_REQUIRE_ASYNC_MODULE') throw asyncModuleError(filename, module.parent);
-      if (cause !== null && typeof cause === 'object' && cause.code === 'ERR_REQUIRE_CYCLE_MODULE') throw cycleError(filename, module.parent);
+      if (cause !== null && typeof cause === 'object' && cause.code === 'ERR_REQUIRE_ASYNC_MODULE') throw asyncModuleError(filename, module[kModuleParent]);
+      if (cause !== null && typeof cause === 'object' && cause.code === 'ERR_REQUIRE_CYCLE_MODULE') throw cycleError(filename, module[kModuleParent]);
       throw decorateModuleError(cause, filename);
     }
     if (own(namespace, 'module.exports')) module.exports = namespace['module.exports'];
@@ -1427,7 +1445,7 @@ function createLoader(host, builtins) {
     return { source, format: resolved.format, filename: resolved.filename };
   }
 
-  return { decorateModuleError, resolveImport, requireFor, runMain, warmMain, resolve, resolveMain, loadESM, cleanSource, prepareSource, bridge, Module, mockModule };
+  return { decorateModuleError, resolveImport, requireFor, runMain, defaultRunMain, warmMain, resolve, resolveMain, loadESM, cleanSource, prepareSource, bridge, Module, mockModule };
 }
 
 module.exports = { createLoader };

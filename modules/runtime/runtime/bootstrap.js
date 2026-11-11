@@ -1262,6 +1262,13 @@ Environment:
   }
   const path = host.path.resolve(filename);
   process.argv[1] = path;
+  // A preload may replace Module.runMain (test-module-run-main-monkey-patch); Node then
+  // hands it the entry path instead of running its own loader.
+  if (loader.Module.runMain !== loader.defaultRunMain) {
+    mainModuleName = path;
+    armInspectorEntry();
+    return afterMain(loader.Module.runMain(path));
+  }
   // Only a preload can register a hook or a mock that resolves it differently.
   const resolved = early !== undefined && !requirePreloads.length && !importPreloads.length ? early : loader.resolveMain(path);
   mainModuleName = resolved.filename;
