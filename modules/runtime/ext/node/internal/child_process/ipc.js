@@ -11,6 +11,7 @@ function setupChannel(target, fd, mode = 'json', onClose) {
   let input = Buffer.alloc(0), receivedFD = -1, queue = [], bytes = 0, pendingHandle = null;
   let closing = false, closed = false, explicitRef = null;
   const socketLists = new Map();
+  const sentSocketLists = new Map();
   const codec = mode === 'advanced' ? require('internal/serialization/v8') : null;
   const channel = new EventEmitter();
   const id = native('ipcOpen', [fd, (events) => {
@@ -149,6 +150,15 @@ function setupChannel(target, fd, mode = 'json', onClose) {
             socket.once('error', error => target.emit('error', error));
             socket.bind({ fd: passed, exclusive: true }, () => deliver(value.msg, socket));
           }
+        } else if (value.type === 'net.Native') {
+          // Node hands over the raw handle; here, a transport opened on the descriptor.
+          const { Transport, native: netNative } = require('internal/net/transport');
+          const kind = netNative('guessHandleType', [passed]);
+          if (kind !== 1 && kind !== 2) { native('closeFd', [passed]); target.emit('error', failure('ERR_INVALID_HANDLE_TYPE', 'Unsupported IPC handle net.Native')); return; }
+          const transport = new Transport(kind, null, () => {});
+          const status = transport.call('open', passed);
+          if (status < 0) { transport.close(); native('closeFd', [passed]); target.emit('error', failure('ERR_INVALID_HANDLE_TYPE', 'Cannot open IPC handle')); return; }
+          deliver(value.msg, transport);
         } else { native('closeFd', [passed]); target.emit('error', failure('ERR_INVALID_HANDLE_TYPE', `Unsupported IPC handle ${value.type}`)); }
         return;
       }
@@ -221,12 +231,27 @@ function setupChannel(target, fd, mode = 'json', onClose) {
     }
     if (!handle) return submit(value, -1, callback);
     const net = require('net'); let type, handleFD;
+    const { Transport } = require('internal/net/transport');
     if (handle instanceof net.Socket) { type = 'net.Socket'; handleFD = handle._transport?.call('fileno'); }
     else if (handle instanceof net.Server) { type = 'net.Server'; handleFD = handle._transport?.call('fileno'); }
+    // A raw TCP or pipe handle (such as server._handle), Node's 'net.Native'.
+    else if (handle instanceof Transport && (handle.kind === 1 || handle.kind === 2)) { type = 'net.Native'; handleFD = handle.closed ? -1 : handle.call('fileno'); }
     else if (handle instanceof require('dgram').Socket) { type = 'dgram.Socket'; handleFD = host.net('fileno', [handle._id]); }
     else throw codedError(TypeError, 'ERR_INVALID_HANDLE_TYPE', 'This handle type cannot be sent');
     if (!Number.isInteger(handleFD) || handleFD < 0) throw failure('ERR_INVALID_HANDLE_TYPE', 'Handle is closed');
     const envelope = { cmd: 'NODE_HANDLE', type, msg: value };
+    // Like Node's handleConversion['net.Socket'].send: a server's socket carries its server's
+    // key, and the first one sent to this child joins the server's worker list.
+    if (type === 'net.Socket' && handle.server && handle.server._connectionKey !== undefined) {
+      const key = envelope.key = handle.server._connectionKey;
+      let list = sentSocketLists.get(key);
+      if (!list) {
+        list = new (require('internal/child_process/socket_list').SocketListSend)(target, key);
+        sentSocketLists.set(key, list);
+        handle.server._setupWorker(list);
+      }
+      if (!options.keepOpen) handle.server._detachSocket(handle);
+    }
     if (type === 'dgram.Socket') envelope.dgramType = handle.type || (handle._family === 6 ? 'udp6' : 'udp4');
     const buffer = encode(envelope);
     // Hold an independent descriptor until ACK, including time spent behind backpressure.
@@ -237,6 +262,8 @@ function setupChannel(target, fd, mode = 'json', onClose) {
     queue.push({ buffer, offset: 0, fd: handleFD, callback, transfer }); bytes += buffer.length;
     flush(); refState(); return bytes < 131072;
   };
+  // Node's internal _send for its own NODE_ messages, queued in order with user messages.
+  target._send = function _send(value) { return submit(value, -1); };
   target.disconnect = function disconnect() {
     if (!target.connected) { target.emit('error', failure('ERR_IPC_DISCONNECTED', 'IPC channel is already disconnected')); return; }
     target.connected = false; closing = true; flush();
