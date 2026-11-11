@@ -325,10 +325,17 @@ class AsyncLocalStorage {
       try { return apply(callback, null, args); }
       finally { this.enterWith(prior); }
     }
-    const previous = captureContext();
+    // Node's legacy run restores only this storage's slot, so another storage's
+    // enterWith inside callback stays in force after it.
+    const oldStore = captureContext()?.stores?.[this.kResourceStore];
     this.enterWith(store);
     try { return apply(callback, null, args); }
-    finally { host.setAsyncContext(previous); }
+    finally {
+      const context = captureContext();
+      const stores = legacyStores(context?.stores);
+      stores[this.kResourceStore] = oldStore;
+      host.setAsyncContext({ stores, id: context?.id, trigger: context?.trigger, resource: context?.resource });
+    }
   }
   exit(callback, ...args) {
     checkFunction(callback, 'callback');
