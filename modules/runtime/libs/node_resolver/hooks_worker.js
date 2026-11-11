@@ -21,7 +21,7 @@ function start(bridge, threads) {
         const resolved = await bridge.resolveHookAsync(args.specifier, { parentURL: args.parentURL,
           conditions: bridge.importConditions(), importAttributes: {} });
         const namespace = await import(resolved.url);
-        await bridge.addAsyncHooks(namespace, args.data);
+        await bridge.addAsyncHooks(namespace, args.data, resolved.url);
       } else if (method === 'resolve') value = await bridge.resolveHookAsync(args.input, args.context);
       else if (method === 'load') value = await bridge.loadHookAsync(args.input, args.context);
       else throw new Error('Unknown loader hook request: ' + method);
