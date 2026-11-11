@@ -281,6 +281,8 @@ function getOptionValue(name) {
     case '--inspect-port': return { host: host.inspectorOptions?.host ?? '127.0.0.1', port: host.inspectorOptions?.port ?? 9229 };
     case '--localstorage-file': return host.localStorageFile;
     case '--experimental-print-required-tla': return !!host.printRequiredTLA;
+    case '--insecure-http-parser': return !!host.insecureHTTPParser;
+    case '--max-http-header-size': return host.maxHTTPHeaderSize ?? 16 * 1024;
     case '--experimental-import-text': return !!host.importText;
     default: return startupControls.getOptionValue(name) ?? require('internal/tls/options').getOptionValue(name);
   }

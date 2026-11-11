@@ -1,5 +1,5 @@
 // Adapted from Node.js v24.22.1 lib/internal/util.js: the helpers that
-// util.inspect, assert and util use. Bindings are replaced by the runtime's
+// util.inspect, assert, util and http use. Bindings are replaced by the runtime's
 // util/types predicates.
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -355,6 +355,15 @@ function getSystemErrorName(err) {
   return require('internal/util_public/system').getSystemErrorName(err);
 }
 
+// Node's assertCrypto. This module loads during bootstrap, before process.versions
+// exists, so the check reads it when called.
+function assertCrypto() {
+  if (!process.versions.openssl) {
+    const { ERR_NO_CRYPTO } = require('internal/errors').codes;
+    throw new ERR_NO_CRYPTO();
+  }
+}
+
 const experimentalWarnings = new SafeSet();
 function emitExperimentalWarning(feature, messagePrefix, code, ctor) {
   if (experimentalWarnings.has(feature)) return;
@@ -365,6 +374,31 @@ function emitExperimentalWarning(feature, messagePrefix, code, ctor) {
   }
   process.emitWarning(msg, 'ExperimentalWarning', code, ctor);
 }
+
+function getLazy(initializer) {
+  let value;
+  let initialized = false;
+  return function() {
+    if (initialized === false) {
+      value = initializer();
+      initialized = true;
+    }
+    return value;
+  };
+}
+
+function once(callback, { preserveReturnValue = false } = kEmptyObject) {
+  let called = false;
+  let returnValue;
+  return function(...args) {
+    if (called) return returnValue;
+    called = true;
+    const result = ReflectApply(callback, this, args);
+    returnValue = preserveReturnValue ? result : undefined;
+    return result;
+  };
+}
+
 
 function filterDuplicateStrings(items, low) {
   const map = new SafeMap();
@@ -381,6 +415,7 @@ function filterDuplicateStrings(items, low) {
 }
 
 module.exports = {
+  assertCrypto,
   assignFunctionName,
   customInspectSymbol: SymbolFor('nodejs.util.inspect.custom'),
   customPromisifyArgs: kCustomPromisifyArgsSymbol,
@@ -390,6 +425,7 @@ module.exports = {
   filterDuplicateStrings,
   encodingsMap,
   getDeprecationWarningEmitter,
+  getLazy,
   getSystemErrorName,
   isError,
   join,
@@ -398,6 +434,7 @@ module.exports = {
   lazyDOMException,
   lazyDOMExceptionClass,
   normalizeEncoding,
+  once,
   promisify,
   removeColors,
   setOwnProperty,

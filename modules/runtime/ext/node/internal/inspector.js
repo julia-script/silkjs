@@ -108,6 +108,7 @@ function runtime(session, method, params) {
       protocolParams(params, 'prototypeObjectId', 'string');
       return { objects: session.values.remote(host.queryObjects(session.values.lookup(params.prototypeObjectId)), params.objectGroup) };
     }
+    case 'Runtime.globalLexicalScopeNames': return { names: native(11, contextFor(params).handle) };
     case 'Runtime.getIsolateId': return { id: `silk:${native(10)}` };
     case 'Runtime.runIfWaitingForDebugger': waiting = false; return {};
     default: unsupported(method);
