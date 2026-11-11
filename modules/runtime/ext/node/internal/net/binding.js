@@ -272,9 +272,17 @@ class StreamHandle {
           return;
         }
         // An http parser that consumed this stream (parser.consume) reads its bytes instead.
-        const consumer = this._consumers?.[this._consumers.length - 1];
-        // A consumer hands read errors and the end of the stream back (returns false).
-        if (consumer && consumer.read(status, payload) !== false) return;
+        if (this._consumers?.length) {
+          // Reads the transport queued before a readStop wait while the stream is stopped
+          // (a paused HTTP parser sees no data, as with libuv). The payload is only lent for
+          // the event, so a held read keeps a copy.
+          if (!this._transport.reading || this._pendingReads.length) {
+            this._pendingReads.push([payload ? payload.slice(0) : payload, status, true]);
+            return;
+          }
+          this._consumed(status, payload);
+          return;
+        }
         if (status < 0) {
           this.reading = false;
           this._deliver(null, status);
@@ -319,6 +327,18 @@ class StreamHandle {
     if (callback) { this._closeReported = true; callback.call(this); }
     else if (owner && !owner.destroyed && typeof owner.destroy === 'function') owner.destroy();
   }
+  // A read for the stream's consumer, which hands read errors and the end of the stream
+  // back to onread (returns false).
+  _consumed(status, payload) {
+    const consumer = this._consumers?.[this._consumers.length - 1];
+    if (consumer && consumer.read(status, payload) !== false) return;
+    if (status < 0) {
+      this.reading = false;
+      this._deliver(null, status);
+      return;
+    }
+    if (payload?.byteLength) this._deliver(payload, 0);
+  }
   // Hands nread and the bytes to onread like LibuvStreamWrap::OnUvRead.
   _flushPending() {
     this._flushScheduled = false;
@@ -326,9 +346,14 @@ class StreamHandle {
     this._pendingReads = [];
     for (let i = 0; i < pending.length; i++) {
       // A read stopped again: the rest waits, after anything it held back.
-      if (this._pendingReads.length) { this._pendingReads.push(...pending.slice(i)); return; }
-      const [payload, nread] = pending[i];
-      this._deliver(payload, nread);
+      if (this._pendingReads.length || !this._transport?.reading) {
+        if (!this._transport || this._transport.closed) return;
+        this._pendingReads.push(...pending.slice(i));
+        return;
+      }
+      const [payload, nread, consumed] = pending[i];
+      if (consumed) this._consumed(nread, payload);
+      else this._deliver(payload, nread);
     }
   }
   _deliver(payload, nread) {
