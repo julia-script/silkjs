@@ -1,5 +1,6 @@
 'use strict';
 const net = require('net');
+const diagnostics = require('internal/host').diagnostics;
 const { setInterval, clearInterval } = require('timers');
 const { OutgoingMessage, validateHeaderName, validateHeaderValue } = require('_http_outgoing');
 const { IncomingMessage } = require('_http_incoming');
@@ -13,6 +14,7 @@ class ServerResponse extends OutgoingMessage {
     this._hasBody = req.method !== 'HEAD'; this._rejectBody = !!options.rejectNonStandardBodyWrites;
     this.shouldKeepAlive = req._keepAlive !== false;
     this.useChunkedEncodingByDefault = req.httpVersionMinor !== 0;
+    diagnostics.publish('http.server.response.created', { request: req, response: this });
   }
   assignSocket(socket) { this.socket = socket; this.emit('socket', socket); this._flushOutput(); }
   detachSocket(socket) { if (this.socket === socket) this.socket = null; }
@@ -41,11 +43,8 @@ class ServerResponse extends OutgoingMessage {
   }
 }
 
-function Server(options, requestListener) {
-  if (!(this instanceof Server)) return new Server(options, requestListener);
-  if (typeof options === 'function') { requestListener = options; options = {}; }
-  options = options || {};
-  net.Server.call(this, { ...options, allowHalfOpen: true });
+// The HTTP/1 fields of a server; http2's allowHTTP1 servers store them too.
+function storeHTTPOptions(options) {
   this.httpAllowHalfOpen = false; this.timeout = 0;
   this.requestTimeout = options.requestTimeout === undefined ? 300000 : options.requestTimeout;
   this.headersTimeout = options.headersTimeout === undefined ? Math.min(60000, this.requestTimeout || 60000) : options.headersTimeout;
@@ -67,6 +66,24 @@ function Server(options, requestListener) {
   this._IncomingMessage = options.IncomingMessage || IncomingMessage;
   this._ServerResponse = options.ServerResponse || ServerResponse;
   this._httpSockets = new Map(); this._httpClosing = false;
+}
+// Starts the per-server deadline check for header and request timeouts.
+function setupConnectionsTracking() {
+  if (this._checkTimer || !(this.headersTimeout > 0 || this.requestTimeout > 0) || !(this.connectionsCheckingInterval > 0)) return;
+  this._checkTimer = setInterval(() => Server.prototype._checkConnections.call(this), this.connectionsCheckingInterval);
+  this._checkTimer.unref();
+}
+function httpServerPreClose(server) {
+  server._httpClosing = true; Server.prototype.closeIdleConnections.call(server);
+  if (server._checkTimer) { clearInterval(server._checkTimer); server._checkTimer = null; }
+}
+
+function Server(options, requestListener) {
+  if (!(this instanceof Server)) return new Server(options, requestListener);
+  if (typeof options === 'function') { requestListener = options; options = {}; }
+  options = options || {};
+  net.Server.call(this, { ...options, allowHalfOpen: true });
+  storeHTTPOptions.call(this, options);
   if (requestListener) this.on('request', requestListener);
   this.on('connection', socket => this._connection(socket));
 }
@@ -74,8 +91,7 @@ Object.setPrototypeOf(Server.prototype, net.Server.prototype);
 Object.setPrototypeOf(Server, net.Server);
 Server.prototype.setTimeout = function setTimeout(msecs, callback) { this.timeout = msecs; if (callback) this.on('timeout', callback); return this; };
 Server.prototype.close = function close(callback) {
-  this._httpClosing = true; this.closeIdleConnections();
-  if (this._checkTimer) { clearInterval(this._checkTimer); this._checkTimer = null; }
+  httpServerPreClose(this);
   return net.Server.prototype.close.call(this, callback);
 };
 Server.prototype._checkConnections = function _checkConnections() {
@@ -90,10 +106,7 @@ Server.prototype.closeIdleConnections = function closeIdleConnections() { for (c
 Server.prototype._connection = function _connection(socket) {
   const state = { responses: [], requests: new Set(), current: null, count: 0, upgraded: false, ended: false, failed: false, headerStart: 0, requestStart: 0, expire: null };
   this._httpSockets.set(socket, state);
-  if (!this._checkTimer && (this.headersTimeout > 0 || this.requestTimeout > 0) && this.connectionsCheckingInterval > 0) {
-    this._checkTimer = setInterval(() => this._checkConnections(), this.connectionsCheckingInterval);
-    this._checkTimer.unref();
-  }
+  setupConnectionsTracking.call(this);
   socket.setNoDelay(true); socket.setTimeout(this.timeout);
   const clearTimers = () => { state.headerStart = state.requestStart = 0; };
   const clientError = err => {
@@ -129,6 +142,7 @@ Server.prototype._connection = function _connection(socket) {
       if (this.maxRequestsPerSocket > 0 && state.count >= this.maxRequestsPerSocket) res.shouldKeepAlive = false;
       res.on('error', err => socket.destroy(err));
       res.on('finish', () => {
+        diagnostics.publish('http.server.response.finish', { request: req, response: res, socket, server: this });
         if (!req.complete || !req.readableEnded) req._dump();
         if (state.responses[0] === res) state.responses.shift();
         res.detachSocket(socket);
@@ -139,6 +153,7 @@ Server.prototype._connection = function _connection(socket) {
         else if (req.complete) socket.setTimeout(this.keepAliveTimeout ? this.keepAliveTimeout + this.keepAliveTimeoutBuffer : 0);
         if (state.outputPaused && state.responses.length < 2 && !parser.stopped) { state.outputPaused = false; parser.resume(); socket.resume(); }
       });
+      diagnostics.publish('http.server.request.start', { request: req, response: res, socket, server: this });
       if (this.requireHostHeader && req.httpVersionMinor === 1 && !req.headers.host) { res.statusCode = 400; res.shouldKeepAlive = false; res.end(); }
       else if (this.maxRequestsPerSocket > 0 && state.count > this.maxRequestsPerSocket) { this.emit('dropRequest', req, socket); res.statusCode = 503; res.end(); }
       else if (req.headers.expect !== undefined) {
@@ -191,4 +206,4 @@ Server.prototype._connection = function _connection(socket) {
   armHeaders();
 };
 function createServer(options, requestListener) { return new Server(options, requestListener); }
-module.exports = { Server, ServerResponse, STATUS_CODES, createServer };
+module.exports = { Server, ServerResponse, STATUS_CODES, createServer, httpServerPreClose, setupConnectionsTracking, storeHTTPOptions };

@@ -1,77 +1,270 @@
 'use strict';
-const { Readable, Writable } = require('stream');
-const c = require('internal/fs_core');
+// fs.ReadStream and fs.WriteStream, ported from Node's lib/internal/fs/streams.js (v24):
+// function constructors that also work without new, options.fs overrides, FileHandle
+// descriptors, and the deprecated open() hook that old subclasses override.
+const { Readable, Writable, finished } = require('stream');
+const { errorOrDestroy } = require('internal/streams/destroy');
 const fs = require('fs');
-function initialize(stream, path, options, reading) {
-  stream.path = path === undefined ? undefined : c.path(path);
-  stream.fd = options.fd === undefined ? null : c.fd(options.fd);
-  stream.flags = options.flags === undefined ? reading ? 'r' : 'w' : options.flags;
-  stream.mode = c.mode(options.mode);
-  stream.autoClose = options.autoClose !== false;
-  stream.pending = stream.fd === null;
-  stream._fs = options.fs || fs;
-  stream._position = options.start === undefined ? null : c.integer(options.start, 'start');
-  stream._inflight = 0;
-  stream._afterIO = null;
-  stream._flush = !!options.flush;
-  if (reading) { stream.end = options.end === undefined ? Infinity : c.integer(options.end, 'end'); if (stream._position !== null && stream._position > stream.end) throw c.range('start'); stream.bytesRead = 0; }
-  else stream.bytesWritten = 0;
+const c = require('internal/fs_core');
+const v = require('internal/validators');
+const { Buffer } = require('buffer');
+const { validateBoolean, validateFunction, validateInteger } = v;
+const { codes: { ERR_FEATURE_UNAVAILABLE_ON_PLATFORM, ERR_INCOMPATIBLE_OPTION_PAIR, ERR_INVALID_ARG_TYPE, ERR_INVALID_THIS, ERR_METHOD_NOT_IMPLEMENTED, ERR_MISSING_OPTION, ERR_OUT_OF_RANGE, ERR_STREAM_DESTROYED, ERR_SYSTEM_ERROR } } = require('internal/errors');
+const kIoDone = Symbol('kIoDone');
+const kIsPerformingIO = Symbol('kIsPerformingIO');
+const kFs = Symbol('kFs');
+const kHandle = Symbol('kHandle');
+const notImplemented = method => new ERR_METHOD_NOT_IMPLEMENTED(method);
+const destroyed = method => new ERR_STREAM_DESTROYED(method);
+const systemFailure = message => new ERR_SYSTEM_ERROR(message);
+function validateThisInternalField(object, key, name) {
+  if (typeof object !== 'object' || object === null || !(key in object)) throw new ERR_INVALID_THIS(name);
 }
-function construct(callback) {
-  if (this.fd !== null) { this.pending = false; callback(); return; }
-  this._fs.open(this.path, this.flags, this.mode, (err, fd) => { this.pending = false; if (err) { callback(err); return; } this.fd = fd; this.emit('open', fd); this.emit('ready'); callback(); });
-}
-function finishIO(stream) { stream._inflight--; if (stream._inflight === 0 && stream._afterIO) { const fn = stream._afterIO; stream._afterIO = null; fn(); } }
-function destroy(err, callback) {
-  const close = () => {
-    if (this.fd === null || !this.autoClose) { callback(err); return; }
-    const fd = this.fd; this.fd = null;
-    const release = flushError => this._fs.close(fd, closeError => callback(err || flushError || closeError));
-    if (this._flush && this instanceof WriteStream) this._fs.fsync(fd, release); else release(null);
-  };
-  if (this._inflight) this._afterIO = close; else close();
-}
-class ReadStream extends Readable {
-  constructor(path, options) { options = c.options(options); super(Object.assign({ highWaterMark: 65536, autoDestroy: true }, options)); initialize(this, path, options, true); }
-  _construct(callback) { construct.call(this, callback); }
-  _read(size) {
-    const position = this._position;
-    const current = position === null ? this.bytesRead : position;
-    const length = Math.min(size, this.end - current + 1);
-    if (length <= 0) { this.push(null); return; }
-    const buffer = c.Buffer.allocUnsafe(length); this._inflight++;
-    this._fs.read(this.fd, buffer, 0, length, position, (err, count) => {
-      finishIO(this); if (this.destroyed) return;
-      if (err) { this.destroy(err); return; }
-      if (count === 0) { this.push(null); return; }
-      this.bytesRead += count; if (this._position !== null) this._position += count;
-      this.push(count === length ? buffer : buffer.subarray(0, count));
+
+function _construct(callback) {
+  const stream = this;
+  if (typeof stream.fd === 'number') { callback(); return; }
+  if (stream.open !== openWriteFs && stream.open !== openReadFs) {
+    // Backwards compat for monkey patching open().
+    const orgEmit = stream.emit;
+    stream.emit = function(...args) {
+      if (args[0] === 'open') { this.emit = orgEmit; callback(); Reflect.apply(orgEmit, this, args); }
+      else if (args[0] === 'error') { this.emit = orgEmit; callback(args[1]); }
+      else Reflect.apply(orgEmit, this, args);
+    };
+    stream.open();
+  } else {
+    stream[kFs].open(stream.path, stream.flags, stream.mode, (er, fd) => {
+      if (er) callback(er);
+      else { stream.fd = fd; callback(); stream.emit('open', stream.fd); stream.emit('ready'); }
     });
   }
-  _destroy(err, callback) { destroy.call(this, err, callback); }
-  close(callback) { if (callback) this.once('close', callback); this.autoClose = true; this.destroy(); }
 }
-class WriteStream extends Writable {
-  constructor(path, options) { options = c.options(options); super(Object.assign({ autoDestroy: true }, options)); initialize(this, path, options, false); }
-  _construct(callback) { construct.call(this, callback); }
-  _write(chunk, encoding, callback) {
-    const buffer = typeof chunk === 'string' ? c.Buffer.from(chunk, encoding) : chunk; let offset = 0;
-    const write = () => {
-      if (offset === buffer.length) { callback(); return; }
-      this._inflight++;
-      this._fs.write(this.fd, buffer, offset, buffer.length - offset, this._position, (err, count) => {
-        finishIO(this);
-        if (err) { callback(err); return; }
-        if (count === 0) { callback(c.error('EIO', 'write', this.path)); return; }
-        offset += count; this.bytesWritten += count; if (this._position !== null) this._position += count;
-        if (this.destroyed) { callback(c.error('EBADF', 'write', this.path)); return; }
-        write();
-      });
-    };
-    write();
+const FileHandleOperations = handle => ({
+  open: () => { throw notImplemented('open()'); },
+  close: (fd, cb) => { handle[c.kUnref](); handle.close().then(() => cb(), cb); },
+  fsync: (fd, cb) => { handle.sync().then(() => cb(), cb); },
+  read: (fd, buf, offset, length, pos, cb) => { handle.read(buf, offset, length, pos).then(r => cb(null, r.bytesRead, r.buffer), err => cb(err, 0, buf)); },
+  write: (fd, buf, offset, length, pos, cb) => { handle.write(buf, offset, length, pos).then(r => cb(null, r.bytesWritten, r.buffer), err => cb(err, 0, buf)); },
+  writev: (fd, buffers, pos, cb) => { handle.writev(buffers, pos).then(r => cb(null, r.bytesWritten, r.buffers), err => cb(err, 0, buffers)); },
+});
+function close(stream, err, cb) {
+  if (!stream.fd) cb(err);
+  else if (stream.flush) stream[kFs].fsync(stream.fd, flushErr => { _close(stream, err || flushErr, cb); });
+  else _close(stream, err, cb);
+}
+function _close(stream, err, cb) {
+  stream[kFs].close(stream.fd, er => { cb(er || err); });
+  stream.fd = null;
+}
+function importFd(stream, options) {
+  if (typeof options.fd === 'number') { stream[kFs] = options.fs || fs; return options.fd; }
+  if (typeof options.fd === 'object' && options.fd !== null && typeof options.fd[c.kRef] === 'function') {
+    if (options.fs) throw notImplemented('FileHandle with fs');
+    stream[kHandle] = options.fd;
+    stream[kFs] = FileHandleOperations(stream[kHandle]);
+    stream[kHandle][c.kRef]();
+    options.fd.on('close', stream.close.bind(stream));
+    return options.fd.fd;
   }
-  _destroy(err, callback) { destroy.call(this, err, callback); }
-  close(callback) { if (callback) this.once('close', callback); this.autoClose = true; if (this.writableFinished) this.destroy(); else { this.once('finish', () => this.destroy()); this.end(); } }
-  destroySoon() { this.end(); }
+  throw new ERR_INVALID_ARG_TYPE('options.fd', ['number', 'FileHandle'], options.fd);
 }
+function importWindowsHandle(options) {
+  if (options.windowsHandle == null) throw new ERR_MISSING_OPTION('options.windowsHandle');
+  throw new ERR_FEATURE_UNAVAILABLE_ON_PLATFORM('windowsHandle');
+}
+const incompatible = (a, b) => new ERR_INCOMPATIBLE_OPTION_PAIR(a, b);
+function validatePath(path) {
+  if (typeof path !== 'string' && !(path instanceof Uint8Array)) throw new ERR_INVALID_ARG_TYPE('path', ['string', 'Buffer', 'URL'], path);
+  c.path(path);
+}
+
+// Node's getOptions keeps an options object as given and copyObject copies it with for...in,
+// so inherited options apply.
+function streamOptions(options) { const checked = c.options(options); return options !== null && typeof options === 'object' ? options : checked; }
+function copyObject(source) { const target = {}; for (const key in source) target[key] = source[key]; return target; }
+function ReadStream(path, options) {
+  if (!(this instanceof ReadStream)) return new ReadStream(path, options);
+  options = copyObject(streamOptions(options));
+  if (options.highWaterMark === undefined) options.highWaterMark = 64 * 1024;
+  if (options.autoDestroy === undefined) options.autoDestroy = false;
+  if (options.fd != null && options.windowsHandle != null) throw incompatible('windowsHandle', 'fd');
+  else if (options.windowsHandle != null) importWindowsHandle(options);
+  else if (options.fd == null) {
+    this.fd = null;
+    this[kFs] = options.fs || fs;
+    validateFunction(this[kFs].open, 'options.fs.open');
+    this.path = c.toPathIfFileURL(path);
+    this.flags = options.flags === undefined ? 'r' : options.flags;
+    this.mode = options.mode === undefined ? 0o666 : options.mode;
+    validatePath(this.path);
+  } else this.fd = c.fd(importFd(this, options));
+  options.autoDestroy = options.autoClose === undefined ? true : options.autoClose;
+  validateFunction(this[kFs].read, 'options.fs.read');
+  if (options.autoDestroy) validateFunction(this[kFs].close, 'options.fs.close');
+  this.start = options.start;
+  this.end = options.end;
+  this.pos = undefined;
+  this.bytesRead = 0;
+  this[kIsPerformingIO] = false;
+  if (this.start !== undefined) { validateInteger(this.start, 'start', 0); this.pos = this.start; }
+  if (this.end === undefined) this.end = Infinity;
+  else if (this.end !== Infinity) {
+    validateInteger(this.end, 'end', 0);
+    if (this.start !== undefined && this.start > this.end) throw new ERR_OUT_OF_RANGE('start', `<= "end" (here: ${this.end})`, this.start);
+  }
+  Reflect.apply(Readable, this, [options]);
+}
+Object.setPrototypeOf(ReadStream.prototype, Readable.prototype);
+Object.setPrototypeOf(ReadStream, Readable);
+Object.defineProperty(ReadStream.prototype, 'autoClose', {
+  get() { validateThisInternalField(this, kFs, 'ReadStream'); return this._readableState.autoDestroy; },
+  set(value) { validateThisInternalField(this, kFs, 'ReadStream'); this._readableState.autoDestroy = value; },
+});
+const deprecate = require('util').deprecate;
+const openReadFs = deprecate(function() {}, 'ReadStream.prototype.open() is deprecated', 'DEP0135');
+ReadStream.prototype.open = openReadFs;
+ReadStream.prototype._construct = _construct;
+ReadStream.prototype._read = function(n) {
+  n = this.pos !== undefined ? Math.min(this.end - this.pos + 1, n) : Math.min(this.end - this.bytesRead + 1, n);
+  if (n <= 0) { this.push(null); return; }
+  const buf = Buffer.allocUnsafeSlow(n);
+  this[kIsPerformingIO] = true;
+  this[kFs].read(this.fd, buf, 0, n, this.pos, (er, bytesRead, buf) => {
+    this[kIsPerformingIO] = false;
+    // Tell ._destroy() that it's safe to close the fd now.
+    if (this.destroyed) { this.emit(kIoDone, er); return; }
+    if (er) errorOrDestroy(this, er);
+    else if (bytesRead > 0) {
+      if (this.pos !== undefined) this.pos += bytesRead;
+      this.bytesRead += bytesRead;
+      if (bytesRead !== buf.length) {
+        // Slow path. Shrink to fit.
+        const dst = Buffer.allocUnsafeSlow(bytesRead);
+        buf.copy(dst, 0, 0, bytesRead);
+        buf = dst;
+      }
+      this.push(buf);
+    } else this.push(null);
+  });
+};
+ReadStream.prototype._destroy = function(err, cb) {
+  if (this[kIsPerformingIO]) this.once(kIoDone, er => close(this, err || er, cb));
+  else close(this, err, cb);
+};
+ReadStream.prototype.close = function(cb) {
+  if (typeof cb === 'function') finished(this, cb);
+  this.destroy();
+};
+Object.defineProperty(ReadStream.prototype, 'pending', { get() { return this.fd === null; }, configurable: true });
+
+function WriteStream(path, options) {
+  if (!(this instanceof WriteStream)) return new WriteStream(path, options);
+  options = copyObject(streamOptions(options));
+  options.decodeStrings = true;
+  if (options.fd != null && options.windowsHandle != null) throw incompatible('windowsHandle', 'fd');
+  else if (options.windowsHandle != null) importWindowsHandle(options);
+  else if (options.fd == null) {
+    this.fd = null;
+    this[kFs] = options.fs || fs;
+    validateFunction(this[kFs].open, 'options.fs.open');
+    this.path = c.toPathIfFileURL(path);
+    this.flags = options.flags === undefined ? 'w' : options.flags;
+    this.mode = options.mode === undefined ? 0o666 : options.mode;
+    validatePath(this.path);
+  } else this.fd = c.fd(importFd(this, options));
+  options.autoDestroy = options.autoClose === undefined ? true : options.autoClose;
+  if (!this[kFs].write && !this[kFs].writev) throw new ERR_INVALID_ARG_TYPE('options.fs.write', 'function', this[kFs].write);
+  if (this[kFs].write) validateFunction(this[kFs].write, 'options.fs.write');
+  if (this[kFs].writev) validateFunction(this[kFs].writev, 'options.fs.writev');
+  if (options.autoDestroy) validateFunction(this[kFs].close, 'options.fs.close');
+  this.flush = options.flush;
+  if (this.flush == null) this.flush = false;
+  else { validateBoolean(this.flush, 'options.flush'); validateFunction(this[kFs].fsync, 'options.fs.fsync'); }
+  // It's enough to override either, in which case only one will be used.
+  if (!this[kFs].write) this._write = null;
+  if (!this[kFs].writev) this._writev = null;
+  this.start = options.start;
+  this.pos = undefined;
+  this.bytesWritten = 0;
+  this[kIsPerformingIO] = false;
+  if (this.start !== undefined) { validateInteger(this.start, 'start', 0); this.pos = this.start; }
+  Reflect.apply(Writable, this, [options]);
+  if (options.encoding) this.setDefaultEncoding(options.encoding);
+}
+Object.setPrototypeOf(WriteStream.prototype, Writable.prototype);
+Object.setPrototypeOf(WriteStream, Writable);
+Object.defineProperty(WriteStream.prototype, 'autoClose', {
+  get() { validateThisInternalField(this, kFs, 'WriteStream'); return this._writableState.autoDestroy; },
+  set(value) { validateThisInternalField(this, kFs, 'WriteStream'); this._writableState.autoDestroy = value; },
+});
+const openWriteFs = deprecate(function() {}, 'WriteStream.prototype.open() is deprecated', 'DEP0135');
+WriteStream.prototype.open = openWriteFs;
+WriteStream.prototype._construct = _construct;
+function writeAll(data, size, pos, cb, retries = 0) {
+  this[kFs].write(this.fd, data, 0, size, pos, (er, bytesWritten, buffer) => {
+    if (er?.code === 'EAGAIN') { er = null; bytesWritten = 0; }
+    if (this.destroyed || er) return cb(er || destroyed('write'));
+    this.bytesWritten += bytesWritten;
+    retries = bytesWritten ? 0 : retries + 1;
+    size -= bytesWritten;
+    pos += bytesWritten;
+    // Try writing non-zero number of bytes up to 5 times.
+    if (retries > 5) cb(systemFailure('write failed'));
+    else if (size) writeAll.call(this, buffer.slice(bytesWritten), size, pos, cb, retries);
+    else cb();
+  });
+}
+function writevAll(chunks, size, pos, cb, retries = 0) {
+  this[kFs].writev(this.fd, chunks, this.pos, (er, bytesWritten, buffers) => {
+    if (er?.code === 'EAGAIN') { er = null; bytesWritten = 0; }
+    if (this.destroyed || er) return cb(er || destroyed('writev'));
+    this.bytesWritten += bytesWritten;
+    retries = bytesWritten ? 0 : retries + 1;
+    size -= bytesWritten;
+    pos += bytesWritten;
+    if (retries > 5) cb(systemFailure('writev failed'));
+    else if (size) writevAll.call(this, [Buffer.concat(buffers).slice(bytesWritten)], size, pos, cb, retries);
+    else cb();
+  });
+}
+WriteStream.prototype._write = function(data, encoding, cb) {
+  this[kIsPerformingIO] = true;
+  writeAll.call(this, data, data.length, this.pos, er => {
+    this[kIsPerformingIO] = false;
+    if (this.destroyed) { cb(er); return this.emit(kIoDone, er); }
+    cb(er);
+  });
+  if (this.pos !== undefined) this.pos += data.length;
+};
+WriteStream.prototype._writev = function(data, cb) {
+  const len = data.length;
+  const chunks = new Array(len);
+  let size = 0;
+  for (let i = 0; i < len; i++) { const chunk = data[i].chunk; chunks[i] = chunk; size += chunk.length; }
+  this[kIsPerformingIO] = true;
+  writevAll.call(this, chunks, size, this.pos, er => {
+    this[kIsPerformingIO] = false;
+    if (this.destroyed) { cb(er); return this.emit(kIoDone, er); }
+    cb(er);
+  });
+  if (this.pos !== undefined) this.pos += size;
+};
+WriteStream.prototype._destroy = function(err, cb) {
+  if (this[kIsPerformingIO]) this.once(kIoDone, er => close(this, err || er, cb));
+  else close(this, err, cb);
+};
+WriteStream.prototype.close = function(cb) {
+  if (cb) {
+    if (this.closed) { process.nextTick(cb); return; }
+    this.on('close', cb);
+  }
+  // If we are not autoClosing, we should call destroy on 'finish'.
+  if (!this.autoClose) this.on('finish', this.destroy);
+  // We use end() instead of destroy() because of https://github.com/nodejs/node/issues/2006
+  this.end();
+};
+// There is no shutdown() for files.
+WriteStream.prototype.destroySoon = WriteStream.prototype.end;
+Object.defineProperty(WriteStream.prototype, 'pending', { get() { return this.fd === null; }, configurable: true });
 module.exports = { ReadStream, WriteStream };

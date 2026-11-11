@@ -20,8 +20,8 @@ function native(op, args) {
   try { return host.net(op, args); }
   catch (e) { resource.emitDestroy(); throw e; }
 }
-const { codes: { ERR_INVALID_ARG_VALUE }, validateArray, validateFunction, validateInt32, validateNumber, validateString, validateUint32 } = require('internal/validators');
-const { codes: { ERR_INVALID_IP_ADDRESS }, makeError, validatePort } = require('internal/net/errors');
+const { codedError, codes: { ERR_INVALID_ARG_VALUE }, validateArray, validateFunction, validateInt32, validateNumber, validatePort, validateString, validateUint32 } = require('internal/validators');
+const { codes: { ERR_DNS_SET_SERVERS_FAILED, ERR_INVALID_IP_ADDRESS } } = require('internal/errors');
 function validateStringWithoutNullBytes(value, name) {
   validateString(value, name);
   if (value.includes('\0')) throw new ERR_INVALID_ARG_VALUE(name, value, 'must be a string without null bytes');
@@ -116,13 +116,13 @@ class ChannelWrap {
   }
   setLocalAddress(first, second) {
     const firstFamily = isIP(first);
-    if (!firstFamily) throw makeError(TypeError, 'ERR_INVALID_ARG_VALUE', `Invalid IP address.`);
+    if (!firstFamily) throw codedError(TypeError, 'ERR_INVALID_ARG_VALUE', 'Invalid IP address.');
     let ipv4 = firstFamily === 4 ? first : '0.0.0.0';
     let ipv6 = firstFamily === 6 ? first : '::';
     if (second !== undefined) {
       const secondFamily = isIP(second);
-      if (!secondFamily) throw makeError(TypeError, 'ERR_INVALID_ARG_VALUE', `Invalid IP address.`);
-      if (secondFamily === firstFamily) throw makeError(TypeError, 'ERR_INVALID_ARG_VALUE', `Cannot specify two IPv${firstFamily} addresses.`);
+      if (!secondFamily) throw codedError(TypeError, 'ERR_INVALID_ARG_VALUE', 'Invalid IP address.');
+      if (secondFamily === firstFamily) throw codedError(TypeError, 'ERR_INVALID_ARG_VALUE', `Cannot specify two IPv${firstFamily} addresses.`);
       if (secondFamily === 4) ipv4 = second; else ipv6 = second;
     }
     const status = native('dnsLocal', [this.id, ipv4, ipv6]); if (status) throw error('EINVAL', 'setLocalAddress', undefined, status);
@@ -182,7 +182,7 @@ class Resolver {
     if (errorNumber !== 0) {
       // Reset the servers to the old servers, because the resolver probably unset them.
       this._handle.setServers(orig);
-      throw makeError(Error, 'ERR_DNS_SET_SERVERS_FAILED', `c-ares failed to set servers: "${strerror(errorNumber)}" [${servers}]`);
+      throw new ERR_DNS_SET_SERVERS_FAILED(strerror(errorNumber), servers);
     }
   }
   setLocalAddress(ipv4, ipv6) {
@@ -253,7 +253,9 @@ for (const method of publicMethods) {
 }
 const promises = Object.assign({ Resolver: PromiseResolver, lookup: lookupPromise, lookupService: lookupServicePromise, setDefaultResultOrder, getDefaultResultOrder, getServers: api.getServers, setServers: api.setServers }, constants, errors);
 for (const method of publicMethods) promises[method] = (...args) => promisifyCall(Resolver.prototype[method], defaultInstance(), args);
-const custom = Symbol.for('nodejs.util.promisify.custom');
-lookup[custom] = lookupPromise; lookupService[custom] = lookupServicePromise;
+// Like Node, util.promisify resolves these with an object of their named callback values.
+const { customPromisifyArgs } = require('internal/util_promisify');
+Object.defineProperty(lookup, customPromisifyArgs, { value: ['address', 'family'], enumerable: false });
+Object.defineProperty(lookupService, customPromisifyArgs, { value: ['hostname', 'service'], enumerable: false });
 api.promises = promises;
 module.exports = api;

@@ -1,8 +1,6 @@
 'use strict';
 
-// Node.js main (ce7aaf1c) lib/internal/assert.js, unchanged.
-// Copyright Node.js contributors. All rights reserved. MIT license (see
-// vendor/node-api/LICENSE).
+// Node.js v24.22.1 lib/internal/assert.js.
 
 let error;
 function lazyError() {
