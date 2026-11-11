@@ -514,7 +514,7 @@ Object.assign(process, {
   emitWarning: internalRequire('internal/startup_controls').emitWarning,
   setUncaughtExceptionCaptureCallback: internalRequire('internal/startup_controls').setUncaughtExceptionCaptureCallback,
   hasUncaughtExceptionCaptureCallback: internalRequire('internal/startup_controls').hasUncaughtExceptionCaptureCallback,
-  exit(code) { if (code !== undefined) process.exitCode = code; if (!process._exiting) { process._exiting = true; process.emit('exit', Number(process.exitCode) || 0); } internalRequire('internal/compile_cache').flushCompileCache(); rawStd.exit(Number(process.exitCode) || 0); },
+  exit(code) { if (code !== undefined) process.exitCode = code; if (!process._exiting) { process._exiting = true; process.emit('exit', Number(process.exitCode) || 0); } inspectorBackend._atExit(); internalRequire('internal/compile_cache').flushCompileCache(); rawStd.exit(Number(process.exitCode) || 0); },
   kill(pid, signal = 'SIGTERM') { const number = typeof signal === 'string' ? rawOS[signal] : signal; if (number === undefined) throw Object.assign(new TypeError('Unknown signal: ' + signal), { code: 'ERR_UNKNOWN_SIGNAL' }); const code = rawOS.kill(pid, number); if (code < 0) { const name = errnoNames.get(Math.abs(code)) || 'UNKNOWN'; throw Object.assign(new Error('kill ' + name), { errno: -Math.abs(code), code: name, syscall: 'kill' }); } return true; }
 });
 Object.defineProperty(process, 'config', { writable: false });
@@ -752,6 +752,11 @@ function runtimeFlag(arg) {
   if (arg === '--expose-gc' || arg === '--no-expose-gc') {
     host.exposeGC = arg === '--expose-gc'; return true;
   }
+  // Node's flag exposes Node's own lib/internal modules and bindings. This
+  // runtime has none of those, so the flag is accepted and exposes nothing:
+  // require('internal/...') stays MODULE_NOT_FOUND.
+  if (arg === '--expose-internals' || arg === '--expose_internals') return true;
+  if (arg === '--disable-sigusr1') { host.disableSigusr1 = true; return true; }
   if (arg === '--test-update-snapshots' || arg === '--no-test-update-snapshots') {
     host.testUpdateSnapshots = arg === '--test-update-snapshots'; return true;
   }
@@ -818,6 +823,7 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
     process.debugPort = options?.port ?? 9229;
     process._breakFirstLine = !!options?.breakFirst;
     if (options?.enabled) inspectorBackend._start(options.port, options.host, options.wait, options.breakFirst);
+    if (workerThreads.isMainThread) inspectorBackend._installProcess(process, options?.host, !host.disableSigusr1);
     if (!workerThreads.isMainThread) inspectorBackend._waitForWorker();
   }
 }
@@ -1153,6 +1159,8 @@ Environment:
 `);
       return;
     }
+    if (/^--debug(?:-brk)?(?:=|$)/.test(arg))
+      return cliError('`node --debug` and `node --debug-brk` are invalid. Please use `node --inspect` and `node --inspect-brk` instead.');
     if (arg !== '-' && arg.startsWith('-')) return cliError('bad option: ' + arg);
     break;
   }
@@ -1167,6 +1175,11 @@ Environment:
   process._print_eval = print;
   filename = args[index];
   process.argv = [process.execPath, ...args.slice(index)];
+  // `node inspect ...`: the debugger client (lib/internal/main/inspect.js).
+  if (filename === 'inspect' && expression === undefined && !testMode && !check && !watchMode && !interactive) {
+    installRuntimeOptions(environment.concat(process.execArgv));
+    return runPreloads(() => internalRequire('internal/debugger/inspect').start());
+  }
   if (check && expression !== undefined) return cliError('either --check or --eval can be used, not both');
   if (check && testMode) return cliError('either --test or --check can be used, not both');
   if (testMode && (expression !== undefined || interactive || inputTypeSet))
@@ -1334,6 +1347,7 @@ function loop() {
   performanceMilestones.loopExit = native.now() - startTime;
   process._exiting = true; const status = Number(process.exitCode) || 0;
   process.emit('exit', status);
+  inspectorBackend._atExit();
   if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushCompileCache();
   return Number(process.exitCode) || 0;
 }

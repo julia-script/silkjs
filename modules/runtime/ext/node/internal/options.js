@@ -67,7 +67,7 @@ const environmentOptions = new Map([
   ...['--test-coverage-include', '--test-coverage-exclude', '--test-coverage-lines',
     '--test-coverage-branches', '--test-coverage-functions'].map(name => [name, true]),
   ...['--insecure-http-parser', '--no-insecure-http-parser', '--async-context-frame',
-    '--no-async-context-frame', '--expose-gc', '--no-expose-gc',
+    '--no-async-context-frame', '--expose-gc', '--no-expose-gc', '--disable-sigusr1',
     '--trace-events-enabled', '--test-only', '--experimental-eventsource',
     '--no-experimental-eventsource', '--experimental-webstorage',
     '--no-experimental-webstorage', '--experimental-stream-iter',
@@ -173,6 +173,21 @@ const workerOptions = new Map([
   ...['-e', '--eval', '-p', '--print', '--test-concurrency', '--test-timeout',
     '--env-file', '--env-file-if-exists'].map(name => [name, true]),
 ]);
+// Node's options parser types (src/node_options.h OptionType) and the option
+// table node inspect walks to find the child script (lib/internal/options.js).
+const optionTypes = { kNoOp: 0, kV8Option: 1, kBoolean: 2, kInteger: 3, kUInteger: 4, kString: 5, kHostPort: 6, kStringList: 7 };
+function getCLIOptionsInfo() {
+  const options = new Map();
+  for (const [name, value] of workerOptions) {
+    if (!name.startsWith('--') || name.startsWith('--no-')) continue;
+    options.set(name, { type: value ? optionTypes.kString : optionTypes.kBoolean });
+  }
+  const aliases = new Map([
+    ['-e', ['--eval']], ['-p', ['--print']], ['-pe', ['--print', '--eval']], ['-r', ['--require']],
+    ['-C', ['--conditions']], ['-i', ['--interactive']], ['-c', ['--check']], ['--debug-port', ['--inspect-port']],
+  ]);
+  return { options, aliases };
+}
 function processOption(name) {
   return /^--(?:no-)?(?:expose-gc|trace-sigint)$/.test(name) || /^--trace-event(?:s-enabled|-categories|-file-pattern)$/.test(name) || reportOptions.processWideOption(name);
 }
@@ -300,4 +315,4 @@ function buildAllowedFlags() {
   return Object.freeze(new NodeEnvironmentFlagsSet());
 }
 
-module.exports = { normalizeOption, parseEnvironment, validateEnvironment, validateWorker, processOption, getOptionValue, environmentFiles, loaderWorkerArguments, buildAllowedFlags, applyInspectorOption, isInspectorValueOption };
+module.exports = { optionTypes, getCLIOptionsInfo, normalizeOption, parseEnvironment, validateEnvironment, validateWorker, processOption, getOptionValue, environmentFiles, loaderWorkerArguments, buildAllowedFlags, applyInspectorOption, isInspectorValueOption };

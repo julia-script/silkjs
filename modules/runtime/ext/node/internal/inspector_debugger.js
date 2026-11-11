@@ -8,12 +8,12 @@ const pendingScripts = new Map();
 const hashes = new Map();
 const scriptURLs = new Map();
 const enabled = new Set();
-const methods = new Set(['Debugger.getScriptSource', 'Debugger.getPossibleBreakpoints', 'Debugger.setBreakpoint', 'Debugger.setBreakpointByUrl', 'Debugger.removeBreakpoint', 'Debugger.setBreakpointsActive', 'Debugger.setSkipAllPauses', 'Debugger.setPauseOnExceptions', 'Debugger.pause', 'Debugger.resume', 'Debugger.stepInto', 'Debugger.stepOver', 'Debugger.stepOut', 'Debugger.evaluateOnCallFrame']);
+const methods = new Set(['Debugger.getScriptSource', 'Debugger.getPossibleBreakpoints', 'Debugger.setBreakpoint', 'Debugger.setBreakpointByUrl', 'Debugger.removeBreakpoint', 'Debugger.setBreakpointsActive', 'Debugger.setSkipAllPauses', 'Debugger.setPauseOnExceptions', 'Debugger.pause', 'Debugger.resume', 'Debugger.stepInto', 'Debugger.stepOver', 'Debugger.stepOut', 'Debugger.evaluateOnCallFrame', 'Debugger.setAsyncCallStackDepth', 'Debugger.setBlackboxPatterns']);
 let nextBreakpoint = 1;
 let startupArmed = false;
 let activePause;
 function state(session) {
-  if (!session.debugger) session.debugger = { breakpoints: new Map(), active: true, skip: false, exceptions: 'none' };
+  if (!session.debugger) session.debugger = { breakpoints: new Map(), active: true, skip: false, exceptions: 'none', blackbox: [], asyncDepth: 0 };
   return session.debugger;
 }
 function rebuild() {
@@ -71,8 +71,15 @@ function resolve(breakpoint, script) {
     }
     if (location.lineNumber === best.lineNumber && location.columnNumber === best.columnNumber) resolved.push(location);
   }
-  // A source coordinate can have distinct native PCs in several realm clones.
-  return resolved.filter(location => !breakpoint.locations.some(old => old.scriptId === location.scriptId && old.pc === location.pc));
+  // A source coordinate can have distinct native PCs in several realm clones,
+  // and several executable points inside one function: like V8, break once per
+  // function, at its first point for the position.
+  const functions = new Set();
+  return resolved.filter(location => {
+    if (functions.has(location.function)) return false;
+    functions.add(location.function);
+    return !breakpoint.locations.some(old => old.scriptId === location.scriptId && old.pc === location.pc);
+  });
 }
 function scriptParsed(script) {
   if (enabled.size === 0) return;
@@ -132,6 +139,12 @@ function paused(payload) {
       hits.push(id);
     }
     if (conditional && hits.length === 0 && payload.reason !== 'exception') continue;
+    // Blackboxed scripts are stepped through and their debugger statements ignored;
+    // an explicit breakpoint there still stops.
+    if (hits.length === 0 && payload.reason !== 'exception' && source.length && data.blackbox.length) {
+      const url = scriptURLs.get(source[0].location.scriptId) ?? '';
+      if (data.blackbox.some(pattern => pattern.test(url))) continue;
+    }
     delivered = true;
     session.emit('Debugger.paused', { callFrames: frames(session, source), reason: payload.reason || 'other', hitBreakpoints: hits });
     if (!native(31)) break;
@@ -211,6 +224,16 @@ function dispatch(session, method, params) {
       if (!['none', 'all', 'uncaught'].includes(params.state)) throw protocolError(-32602, 'Invalid parameters');
       data.exceptions = params.state; exceptionMode(); return {};
     case 'Debugger.pause': native(26); return {};
+    case 'Debugger.setAsyncCallStackDepth':
+      if (!Number.isInteger(params.maxDepth)) throw protocolError(-32602, 'Invalid parameters: maxDepth');
+      // Recorded only: paused frames carry no asyncStackTrace yet.
+      data.asyncDepth = Math.max(0, params.maxDepth); return {};
+    case 'Debugger.setBlackboxPatterns': {
+      if (!Array.isArray(params.patterns) || params.patterns.some(pattern => typeof pattern !== 'string')) throw protocolError(-32602, 'Invalid parameters: patterns');
+      try { data.blackbox = params.patterns.map(pattern => new RegExp(pattern)); }
+      catch { throw protocolError(-32000, 'Invalid regular expression'); }
+      return {};
+    }
     case 'Debugger.resume': case 'Debugger.stepInto': case 'Debugger.stepOver': case 'Debugger.stepOut': {
       if (params.breakOnAsyncCall || params.skipList || params.terminateOnResume) unsupported(method);
       const mode = { 'Debugger.resume': 0, 'Debugger.stepInto': 1, 'Debugger.stepOver': 2, 'Debugger.stepOut': 3 }[method];
