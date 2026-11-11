@@ -3,6 +3,7 @@
 const { Duplex } = require('stream');
 const { EventEmitter } = require('events');
 const { Buffer } = require('buffer');
+const diagnostics = require('internal/host').diagnostics;
 const { Transport, error: nativeError, native } = require('internal/net/transport');
 
 let defaultAutoSelectFamily = true;
@@ -344,6 +345,7 @@ Socket.prototype._connectionFailed = function(err) {
 };
 Socket.prototype.connect = function(...args) {
   const [options, cb] = Array.isArray(args[0]) && args[0][normalizedArgs] ? args[0] : normalizeArgs(args);
+  diagnostics.publish('net.client.socket', { socket: this });
   if (cb !== null) this.once('connect', cb);
   if (options.port === undefined && options.path == null) throw new ERR_MISSING_ARGS(['options', 'port', 'path']);
   if (this.connecting || this._connected) // Node reuses the handle here; a connected transport here cannot be redirected yet.
@@ -627,6 +629,7 @@ Server.prototype._acceptSocket = function(socket) {
   if (this._options.keepAlive !== undefined) socket.setKeepAlive(this._options.keepAlive, this._options.keepAliveInitialDelay || 0);
   if (this.pauseOnConnect) socket.pause();
   this.emit('connection', socket);
+  diagnostics.publish('net.server.socket', { socket });
   if (!this.pauseOnConnect && !socket.destroyed) socket._read();
 };
 Server.prototype.listen = function(...args) {
@@ -653,8 +656,11 @@ Server.prototype.listen = function(...args) {
   }
   const fd = typeof options.fd === 'number' && options.fd >= 0 ? options.fd : undefined;
   const path = fd === undefined && options.port === undefined ? options.path : undefined;
+  const listenTracing = diagnostics.tracing('net.server.listen');
+  listenTracing?.asyncStart.publish({ server: this, options });
   this._starting = true;
   const failed = err => {
+    listenTracing?.error.publish({ server: this, error: err });
     this._starting = false;
     this._removeAbort?.();
     this._detachTransport();
@@ -711,6 +717,7 @@ Server.prototype.listen = function(...args) {
         : `-1:${fd === undefined ? address : null}:-1`;
       this._starting = false;
       this._listening = true;
+      listenTracing?.asyncEnd.publish({ server: this });
       process.nextTick(() => { if (this._listening && generation === this._generation) this.emit('listening'); });
     } catch (err) { failed(err); }
   };
