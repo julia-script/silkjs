@@ -417,15 +417,15 @@ function output(fd) {
   } };
 }
 host.stdout = output(1); host.stderr = output(2);
-// Text written to a descriptor synchronously, with no stream (internal/stdio
-// direct). False when nothing could be written; a failure after a partial
-// write drops the rest, as a stream write that console ignores would.
+// Text written to a descriptor now, with no stream (internal/stdio direct):
+// true when all of it was written, false when none of it was, and the bytes
+// left over when a write stopped part way (a full nonblocking pipe, or an error).
 host.writeText = (fd, text) => {
   const bytes = Buffer.from(text);
   let offset = 0;
   while (offset < bytes.length) {
     const count = rawOS.write(fd, bytes.buffer, bytes.byteOffset + offset, bytes.length - offset);
-    if (count <= 0) return offset !== 0;
+    if (count <= 0) return offset === 0 ? false : bytes.subarray(offset);
     offset += count;
   }
   return true;
