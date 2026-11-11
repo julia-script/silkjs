@@ -154,6 +154,7 @@ const rawAlgorithms = {
   'ml-kem-512': 'ML-KEM-512', 'ml-kem-768': 'ML-KEM-768', 'ml-kem-1024': 'ML-KEM-1024',
   'ml-dsa-44': 'ML-DSA-44', 'ml-dsa-65': 'ML-DSA-65', 'ml-dsa-87': 'ML-DSA-87',
 };
+for (const hash of ['SHA2', 'SHAKE']) for (const size of ['128', '192', '256']) for (const kind of ['s', 'f']) { const name = `SLH-DSA-${hash}-${size}${kind}`; rawAlgorithms[name.toLowerCase()] = name; }
 function rawFormat(format) { return format === 'raw-public' ? 0 : format === 'raw-private' ? 1 : 2; }
 function rawCompatibility(algorithm, format) {
   if (!Object.prototype.hasOwnProperty.call(rawAlgorithms, algorithm)) {
@@ -183,11 +184,12 @@ c.providerRawImport = function providerRawImport(options, type) {
 };
 c.providerRawExport = function providerRawExport(key, options) {
   const format = rawFormat(options.format);
-  if (key.type === 'private' && options.passphrase !== undefined) throw error('ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS', 'Raw format does not support encryption');
-  if (key.type === 'private' ? format === 0 : key.type !== 'public' || format !== 0) {
+  const keyType = c.keyObjectType(key);
+  if (keyType === 'private' && options.passphrase !== undefined) throw error('ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS', 'Raw format does not support encryption');
+  if (keyType === 'private' ? format === 0 : keyType !== 'public' || format !== 0) {
     throw error('ERR_INVALID_ARG_VALUE', 'Raw format is incompatible with the key object type', TypeError);
   }
-  const algorithm = key.asymmetricKeyType;
+  const algorithm = c.keyObjectAsymmetricType(key);
   let form = 4;
   if (algorithm === 'ec' && format === 0) {
     const type = options.type === undefined ? 'uncompressed' : options.type;
