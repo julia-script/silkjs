@@ -28,6 +28,7 @@ EXTENSIONS = [
 # put_loc_field_arg8 keep an inline field-cache key after their atom
 # (js_vm_property_ops.fieldKeyAt).
 FIELD_KEY_BYTES = 8
+METHOD_KEY_BYTES = 24
 FIELD_KEYED = ['get_field', 'get_loc_field8', 'get_arg_field8', 'put_field', 'put_loc_field_loc8', 'put_loc_field_arg8']
 
 # Upstream final opcodes whose numbers silkjs reuses: name -> (name, size, pops, pushes, format).
@@ -199,7 +200,9 @@ def main():
     for opcode in range(256):
         index = opcode + len(temporary) if opcode >= temporary_start else opcode
         size, pops, pushes, fmt = data[index * 4:index * 4 + 4]
-        short_data.extend((size + FIELD_KEY_BYTES if opcode in keyed else size, pops, pushes, fmt))
+        if opcode in keyed: size += FIELD_KEY_BYTES
+        if opcode == regular_ids['get_field2']: size += METHOD_KEY_BYTES
+        short_data.extend((size, pops, pushes, fmt))
     lines += ['/// Bytes of the inline field-cache key that final get_field, get_loc_field8,',
               '/// get_arg_field8, put_field, put_loc_field_loc8 and put_loc_field_arg8 carry',
               '/// right after their atom (the parser view has none).',
@@ -209,24 +212,34 @@ def main():
               '  return opcode == OP_get_field || opcode == OP_get_loc_field8 || opcode == OP_get_arg_field8',
               '    || opcode == OP_put_field || opcode == OP_put_loc_field_loc8 || opcode == OP_put_loc_field_arg8',
               '}', '',
+              '/// Bytes of the inline method cache that a final get_field2 carries right after',
+              '/// its atom: the field key, then for a prototype hit the holder and the shape',
+              '/// epoch it was found at (js_vm_property_ops.readMethodKeyedAt).',
+              f'pub const METHOD_KEY_BYTES: u8 = {METHOD_KEY_BYTES}', '',
+              '/// Bytes of inline cache a final opcode carries after its atom (0: none).',
+              'pub fn inlineKeyBytes(opcode: u8) -> u8 {',
+              '  if fieldKeyed(opcode) { return FIELD_KEY_BYTES }',
+              '  if opcode == OP_get_field2 { return METHOD_KEY_BYTES }',
+              '  return 0',
+              '}', '',
               '/// The opcode metadata table: 4 bytes per opcode (size, pops, pushes, format),',
               '/// the parser view for every byte, then the final (short) view of the temporary',
               f'/// opcodes OP_TEMP_START.. at index opcode + {len(temporary)}. opcodeInfo reads the final',
               '/// view from SHORT_OPCODES, which js_opcode_data_tests checks against it.',
               f'const OPCODES: &[u8] = {literal(data)}',
               "/// The final view of every byte, in OPCODES's layout: OPCODES's final entry with",
-              '/// the inline field-cache key added to the size of fieldKeyed opcodes.',
+              '/// its inline cache bytes (inlineKeyBytes) added to the size.',
               f'const SHORT_OPCODES: &[u8] = {literal(short_data)}', '',
               'pub fn opcodeInfo(opcode: u8, short: bool) -> OpcodeInfo {',
               '  let index = u8.toUsize(opcode) * 4',
               '  let table = if short { SHORT_OPCODES } else { OPCODES }',
               '  return OpcodeInfo { size: table[index], pops: table[index + 1], pushes: table[index + 2], format: table[index + 3] }',
               '}',
-              '/// opcodeInfo as metadataIndex and fieldKeyed define it, from OPCODES alone.',
+              '/// opcodeInfo as metadataIndex and inlineKeyBytes define it, from OPCODES alone.',
               'pub fn referenceOpcodeInfo(opcode: u8, short: bool) -> OpcodeInfo {',
               '  let index = metadataIndex(opcode, short) * 4',
               '  let mut size = OPCODES[index]',
-              '  if short && fieldKeyed(opcode) { size = size + FIELD_KEY_BYTES }',
+              '  if short { size = size + inlineKeyBytes(opcode) }',
               '  return OpcodeInfo { size: size, pops: OPCODES[index + 1], pushes: OPCODES[index + 2], format: OPCODES[index + 3] }',
               '}', '']
     emit_names(lines, [entry[1].encode() for entry in entries], 'opcodeName', 'opcode: u8, short: bool', 'metadataIndex(opcode, short)')
