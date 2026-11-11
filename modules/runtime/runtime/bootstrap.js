@@ -124,6 +124,9 @@ host.initializeRealmBuiltins = (handle, global, wasmCodeGeneration) => {
   const cache = new Map();
   const bridge = {
     captureCallSites: native.captureCallSites,
+    // Throws value again and keeps the throw site its first throw recorded, as
+    // V8's TryCatch::ReThrow does for Node's own catch and rethrow paths.
+    rethrow(value) { native.captureCallSites(-5, value); },
     errorStackState: host.errorStackState,
     builtinLoaded: moduleHas,
     wasmNative: native.vmWasmNative(handle),

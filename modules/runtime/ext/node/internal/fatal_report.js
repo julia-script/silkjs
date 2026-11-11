@@ -28,7 +28,7 @@ function fileLine(name, line) {
   if (!require('path').isAbsolute(path)) return undefined;
   let source;
   try { source = require('fs').readFileSync(path, 'utf8'); } catch { return undefined; }
-  return source.split(/\r\n|[\n\r  ]/)[line - 1];
+  return source.split(/\r\n|[\n\r\u2028\u2029]/)[line - 1];
 }
 // GetErrorSource: "<script>:<line>\n<source line>\n<caret>\n".
 function arrow(error, fromPromise) {
