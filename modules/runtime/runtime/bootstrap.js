@@ -69,6 +69,8 @@ for (const name of ['dispose', 'asyncDispose']) {
 }
 const host = { ...native, rawOS, rawStd };
 host.builtinLoaded = moduleHas;
+// Whether a built-in id (public or internal) exists, loaded or not: Node's BuiltinModule.exists.
+host.builtinExists = Map.prototype.has.bind(factories);
 // Source maps are off until something loads the module to switch them on, so
 // registering a source before that only matters when coverage wants every map.
 host.registerSource = (filename, source, metadata) => {
@@ -512,6 +514,8 @@ const ProcessConstructor = { process: function () {} }.process;
 Object.setPrototypeOf(ProcessConstructor.prototype, EventEmitter.prototype);
 const process = Object.create(ProcessConstructor.prototype);
 EventEmitter.call(process);
+// As Node's bootstrap/node.js: Object.prototype.toString reports [object process].
+Object.defineProperty(process, Symbol.toStringTag, { value: 'process', writable: true, enumerable: false, configurable: false });
 defineGlobalAccessor('process', process);
 let startTime = native.runtimeStartTime;
 const performanceMilestones = {

@@ -976,7 +976,7 @@ function generateKeyPair(type, options, cb) {
   const job = keygenJob(type, options);
   submit('keyGenerate', job.args, (e, pair) => e ? cb(e) : cb(null, pair.publicKey, pair.privateKey), id => keypair(id, job.encoding));
 }
-Object.defineProperty(generateKeyPair, require('internal/util_promisify').customPromisifyArgs, { value: ['publicKey', 'privateKey'], enumerable: false });
+Object.defineProperty(generateKeyPair, require('internal/util').customPromisifyArgs, { value: ['publicKey', 'privateKey'], enumerable: false });
 function secretKeygenLength(type, options) {
   validate.string(type, 'type'); validate.object(options, 'options');
   const { length } = options;

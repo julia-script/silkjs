@@ -146,13 +146,13 @@ let util;
 
 let internalUtil = null;
 function lazyInternalUtil() {
-  internalUtil ??= require('util');
+  internalUtil ??= require('internal/util');
   return internalUtil;
 }
 
 let internalUtilInspect = null;
 function lazyInternalUtilInspect() {
-  internalUtilInspect ??= { inspect: require('internal/util_inspect').inspect, format: require('util').format };
+  internalUtilInspect ??= require('internal/util/inspect');
   return internalUtilInspect;
 }
 
