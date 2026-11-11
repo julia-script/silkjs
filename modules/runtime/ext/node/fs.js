@@ -10,7 +10,7 @@ const { bufferCodec } = c.host;
 const fs = module.exports;
 const kMaxUserId = 2 ** 32 - 1;
 const kIoMaxLength = 2 ** 31 - 1;
-const { kCustomPromisifyArgsSymbol: customPromisifyArgs } = require('internal/promisify_args');
+const { setCustomPromisifyArgs } = require('internal/promisify_args');
 const customPromisified = Symbol.for('nodejs.util.promisify.custom');
 const isFd = value => value === (value | 0);
 const stats = (value, bigint) => value === undefined ? undefined : makeStats(value, !!bigint);
@@ -131,7 +131,7 @@ fs.read = function read(fd, buffer, offsetOrOptions, length, position, callback)
   c.validateOffsetLengthRead(offset, length, buffer.byteLength);
   c.submit('read', [fd, buffer, offset, length, position], (err, bytesRead) => callback(err || null, bytesRead || 0, buffer), callback);
 };
-Object.defineProperty(fs.read, customPromisifyArgs, { value: ['bytesRead', 'buffer'], enumerable: false });
+setCustomPromisifyArgs(fs.read, ['bytesRead', 'buffer']);
 fs.readSync = function readSync(fd, buffer, offsetOrOptions, length, position) {
   fd = c.fd(fd);
   c.bytes(buffer);
@@ -164,7 +164,7 @@ fs.readv = function readv(fd, buffers, position, callback) {
   if (typeof position !== 'number') position = null;
   c.submit('readv', [fd, buffers, position], (err, read) => callback(err || null, read || 0, buffers), callback);
 };
-Object.defineProperty(fs.readv, customPromisifyArgs, { value: ['bytesRead', 'buffers'], enumerable: false });
+setCustomPromisifyArgs(fs.readv, ['bytesRead', 'buffers']);
 fs.readvSync = function readvSync(fd, buffers, position) {
   fd = c.fd(fd); c.bufferArray(buffers);
   if (typeof position !== 'number') position = null;
@@ -196,7 +196,7 @@ fs.write = function write(fd, buffer, offsetOrOptions, length, position, callbac
   const bytes = Buffer.from(string, length || 'utf8');
   c.submit('write', [fd, bytes, 0, bytes.byteLength, typeof offset === 'number' ? offset : null], (err, written) => callback(err || null, written || 0, string), callback);
 };
-Object.defineProperty(fs.write, customPromisifyArgs, { value: ['bytesWritten', 'buffer'], enumerable: false });
+setCustomPromisifyArgs(fs.write, ['bytesWritten', 'buffer']);
 function validateEncoding(data, encoding) {
   const normalized = Buffer.isEncoding(encoding) ? String(encoding).toLowerCase() : encoding;
   if (normalized === 'hex' && data.length % 2 !== 0) throw ERR_INVALID_ARG_VALUE('encoding', encoding, `is invalid for data of length ${data.length}`);
@@ -236,7 +236,7 @@ fs.writev = function writev(fd, buffers, position, callback) {
   if (typeof position !== 'number') position = null;
   c.submit('writev', [fd, buffers, position], (err, written) => callback(err || null, written || 0, buffers), callback);
 };
-Object.defineProperty(fs.writev, customPromisifyArgs, { value: ['bytesWritten', 'buffer'], enumerable: false });
+setCustomPromisifyArgs(fs.writev, ['bytesWritten', 'buffer']);
 fs.writevSync = function writevSync(fd, buffers, position) {
   fd = c.fd(fd); c.bufferArray(buffers);
   if (buffers.length === 0) return 0;
