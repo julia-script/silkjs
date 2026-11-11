@@ -19,9 +19,14 @@ function error(status, syscall, address, port) {
 // Socket owns stream state; this adapter owns a native handle and request lifetime.
 // An adopted handle (accepted TCP/pipe, or a future TLS/stdio adapter) has the
 // same read/write/shutdown/close contract as a newly allocated connection.
+// Every open transport, for process._getActiveHandles(). Node lists the owner of each
+// referenced handle that is not closing.
+const live = new Set();
+
 class Transport {
-  constructor(kind, onEvent, id, fd) {
+  constructor(kind, owner, onEvent, id, fd) {
     this.kind = kind;
+    this.owner = owner;
     this.onEvent = onEvent;
     this.closed = false;
     this.closing = false;
@@ -46,6 +51,7 @@ class Transport {
         throw error(status, 'socket');
       }
     }
+    live.add(this);
   }
   call(operation, ...args) { return host.net(operation, [this.id, ...args]); }
   dispatch(type, status, payload, extra) {
@@ -53,13 +59,14 @@ class Transport {
       const request = this.requests.get(payload);
       if (!request) return;
       this.requests.delete(payload);
-      // Node's afterShutdown ignores the status: a peer that already left is not an error.
+      // Like Node's afterShutdown, a finished shutdown request reports no error.
       request.callback(type === 4 && status < 0 ? error(status, 'write') : null);
       return;
     }
     if (type === 1 && status < 0) this.reading = false;
     if (type === 6) {
       this.closed = true;
+      live.delete(this);
       this.reading = false;
       try {
         const cancelled = Object.assign(new Error('Cannot call write after a stream was destroyed'), { code: 'ERR_STREAM_DESTROYED' });
@@ -144,4 +151,11 @@ class Transport {
   hasRef() { return !this.closed && !!this.call('hasRef'); }
 }
 
-module.exports = { Transport, error, native: (operation, args) => host.net(operation, args) };
+function activeOwners() {
+  const owners = [];
+  for (const transport of live)
+    if (!transport.closing && transport.hasRef()) owners.push(transport.owner);
+  return owners;
+}
+
+module.exports = { Transport, activeOwners, error, native: (operation, args) => host.net(operation, args) };
