@@ -41,39 +41,53 @@ class ServerResponse extends OutgoingMessage {
   }
 }
 
+// The HTTP/1 fields of a server; http2's allowHTTP1 servers store them too.
+function storeHTTPOptions(options) {
+  this.httpAllowHalfOpen = false; this.timeout = 0;
+  this.requestTimeout = options.requestTimeout === undefined ? 300000 : options.requestTimeout;
+  this.headersTimeout = options.headersTimeout === undefined ? Math.min(60000, this.requestTimeout || 60000) : options.headersTimeout;
+  if (this.requestTimeout > 0 && this.headersTimeout > this.requestTimeout) throw error('ERR_OUT_OF_RANGE', 'headersTimeout must not exceed requestTimeout');
+  // Like Node, header and request deadlines are checked for every connection at this
+  // interval rather than with timers per request.
+  this.connectionsCheckingInterval = options.connectionsCheckingInterval === undefined ? 30000 : options.connectionsCheckingInterval;
+  this._checkTimer = null;
+  this.keepAliveTimeout = options.keepAliveTimeout === undefined ? 5000 : options.keepAliveTimeout;
+  this.keepAliveTimeoutBuffer = options.keepAliveTimeoutBuffer === undefined ? 1000 : options.keepAliveTimeoutBuffer;
+  this.maxHeadersCount = null; this.maxRequestsPerSocket = 0;
+  this.maxHeaderSize = options.maxHeaderSize || 16384;
+  setParserOptions(this, options);
+  this.requireHostHeader = options.requireHostHeader !== false;
+  this.joinDuplicateHeaders = !!options.joinDuplicateHeaders;
+  this.rejectNonStandardBodyWrites = !!options.rejectNonStandardBodyWrites;
+  this.shouldUpgradeCallback = options.shouldUpgradeCallback || (() => this.listenerCount('upgrade') > 0);
+  this._responseOptions = { highWaterMark: options.highWaterMark, uniqueHeaders: options.uniqueHeaders, rejectNonStandardBodyWrites: this.rejectNonStandardBodyWrites };
+  this._IncomingMessage = options.IncomingMessage || IncomingMessage;
+  this._ServerResponse = options.ServerResponse || ServerResponse;
+  this._httpSockets = new Map(); this._httpClosing = false;
+}
+// Starts the per-server deadline check for header and request timeouts.
+function setupConnectionsTracking() {
+  if (this._checkTimer || !(this.headersTimeout > 0 || this.requestTimeout > 0) || !(this.connectionsCheckingInterval > 0)) return;
+  this._checkTimer = setInterval(() => Server.prototype._checkConnections.call(this), this.connectionsCheckingInterval);
+  this._checkTimer.unref();
+}
+function httpServerPreClose(server) {
+  server._httpClosing = true; Server.prototype.closeIdleConnections.call(server);
+  if (server._checkTimer) { clearInterval(server._checkTimer); server._checkTimer = null; }
+}
+
 class Server extends net.Server {
   constructor(options, requestListener) {
     if (typeof options === 'function') { requestListener = options; options = {}; }
     options = options || {};
     super({ ...options, allowHalfOpen: true });
-    this.httpAllowHalfOpen = false; this.timeout = 0;
-    this.requestTimeout = options.requestTimeout === undefined ? 300000 : options.requestTimeout;
-    this.headersTimeout = options.headersTimeout === undefined ? Math.min(60000, this.requestTimeout || 60000) : options.headersTimeout;
-    if (this.requestTimeout > 0 && this.headersTimeout > this.requestTimeout) throw error('ERR_OUT_OF_RANGE', 'headersTimeout must not exceed requestTimeout');
-    // Like Node, header and request deadlines are checked for every connection at this
-    // interval rather than with timers per request.
-    this.connectionsCheckingInterval = options.connectionsCheckingInterval === undefined ? 30000 : options.connectionsCheckingInterval;
-    this._checkTimer = null;
-    this.keepAliveTimeout = options.keepAliveTimeout === undefined ? 5000 : options.keepAliveTimeout;
-    this.keepAliveTimeoutBuffer = options.keepAliveTimeoutBuffer === undefined ? 1000 : options.keepAliveTimeoutBuffer;
-    this.maxHeadersCount = null; this.maxRequestsPerSocket = 0;
-    this.maxHeaderSize = options.maxHeaderSize || 16384;
-    setParserOptions(this, options);
-    this.requireHostHeader = options.requireHostHeader !== false;
-    this.joinDuplicateHeaders = !!options.joinDuplicateHeaders;
-    this.rejectNonStandardBodyWrites = !!options.rejectNonStandardBodyWrites;
-    this.shouldUpgradeCallback = options.shouldUpgradeCallback || (() => this.listenerCount('upgrade') > 0);
-    this._responseOptions = { highWaterMark: options.highWaterMark, uniqueHeaders: options.uniqueHeaders, rejectNonStandardBodyWrites: this.rejectNonStandardBodyWrites };
-    this._IncomingMessage = options.IncomingMessage || IncomingMessage;
-    this._ServerResponse = options.ServerResponse || ServerResponse;
-    this._httpSockets = new Map(); this._httpClosing = false;
+    storeHTTPOptions.call(this, options);
     if (requestListener) this.on('request', requestListener);
     this.on('connection', socket => this._connection(socket));
   }
   setTimeout(msecs, callback) { this.timeout = msecs; if (callback) this.on('timeout', callback); return this; }
   close(callback) {
-    this._httpClosing = true; this.closeIdleConnections();
-    if (this._checkTimer) { clearInterval(this._checkTimer); this._checkTimer = null; }
+    httpServerPreClose(this);
     return super.close(callback);
   }
   _checkConnections() {
@@ -88,10 +102,7 @@ class Server extends net.Server {
   _connection(socket) {
     const state = { responses: [], requests: new Set(), current: null, count: 0, upgraded: false, ended: false, failed: false, headerStart: 0, requestStart: 0, expire: null };
     this._httpSockets.set(socket, state);
-    if (!this._checkTimer && (this.headersTimeout > 0 || this.requestTimeout > 0) && this.connectionsCheckingInterval > 0) {
-      this._checkTimer = setInterval(() => this._checkConnections(), this.connectionsCheckingInterval);
-      this._checkTimer.unref();
-    }
+    setupConnectionsTracking.call(this);
     socket.setNoDelay(true); socket.setTimeout(this.timeout);
     const clearTimers = () => { state.headerStart = state.requestStart = 0; };
     const clientError = err => {
@@ -190,4 +201,4 @@ class Server extends net.Server {
   }
 }
 function createServer(options, requestListener) { return new Server(options, requestListener); }
-module.exports = { Server, ServerResponse, STATUS_CODES, createServer };
+module.exports = { Server, ServerResponse, STATUS_CODES, createServer, httpServerPreClose, setupConnectionsTracking, storeHTTPOptions };

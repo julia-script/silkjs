@@ -1,0 +1,35 @@
+'use strict';
+// The primordials the ported Node.js http2 modules use, captured at load time
+// under Node's naming scheme (lib/internal/per_context/primordials.js).
+const uncurryThis = (fn) => Function.prototype.call.bind(fn);
+module.exports = {
+  ArrayFrom: Array.from,
+  ArrayIsArray: Array.isArray,
+  Boolean,
+  Error,
+  MathMax: Math.max,
+  MathMin: Math.min,
+  Number,
+  NumberIsNaN: Number.isNaN,
+  ObjectAssign: Object.assign,
+  ObjectDefineProperty: Object.defineProperty,
+  ObjectEntries: Object.entries,
+  ObjectHasOwn: Object.hasOwn,
+  ObjectKeys: Object.keys,
+  Promise,
+  Proxy,
+  ReflectApply: Reflect.apply,
+  ReflectGet: Reflect.get,
+  ReflectGetPrototypeOf: Reflect.getPrototypeOf,
+  ReflectSet: Reflect.set,
+  SafeMap: Map,
+  SafeSet: Set,
+  String,
+  StringFromCharCode: String.fromCharCode,
+  StringPrototypeCharCodeAt: uncurryThis(String.prototype.charCodeAt),
+  Symbol,
+  SymbolAsyncDispose: Symbol.asyncDispose,
+  SymbolDispose: Symbol.dispose,
+  Uint32Array,
+  Uint8Array,
+};
