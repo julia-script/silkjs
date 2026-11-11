@@ -399,7 +399,9 @@ function checkpoint() {
 host.checkpoint = checkpoint;
 // Node's lib/timers.js and lib/internal/timers.js run the timers; the loop
 // drives them through internal/timers_binding as Node's Environment does.
-host.invokeTimer = (scope, callback, receiver, args) => invokeScoped(scope, invokeReporting, callback, receiver, args);
+// Named, as Node's timer frames are: the REPL trims an error's frames below the
+// last one without a function name.
+host.invokeTimer = function invokeTimer(scope, callback, receiver, args) { return invokeScoped(scope, invokeReporting, callback, receiver, args); };
 const timerAPI = internalRequire('timers');
 {
   const { processImmediate, processTimers } = internalRequire('internal/timers').getTimerCallbacks(checkpoint);
@@ -666,7 +668,7 @@ for (const name of ['Event', 'CustomEvent', 'EventTarget', 'AbortController', 'A
 const asyncFS = internalRequire('internal/fs_async')(native);
 host.submitIO = (operation, args, callback, requestKind) => {
   const scope = resource(requestKind === 1 ? 'FSREQPROMISE' : requestKind === 2 ? 'FILEHANDLECLOSEREQ' : 'FSREQCALLBACK');
-  try { return asyncFS.submitIO(operation, args, (...values) => invokeResource(scope, callback, undefined, values), requestKind); }
+  try { return asyncFS.submitIO(operation, args, function oncomplete(...values) { return invokeResource(scope, callback, undefined, values); }, requestKind); }
   catch (error) { scope.emitDestroy(); throw error; }
 };
 host.watch = (filename, options, callback) => {
