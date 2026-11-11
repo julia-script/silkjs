@@ -204,11 +204,6 @@ function inspected(s, event, params) {
   const { storageId } = require('internal/inspector_dom_storage');
   require('inspector').DOMStorage[event]({ ...params, storageId: storageId(s.isLocalStorage) });
 }
-function entries(storage) {
-  const s = state(storage);
-  try { return statement(s, 'entries', 'SELECT key, value FROM nodejs_webstorage').all().map(row => [text(row.key), text(row.value)]); }
-  catch (cause) { sqliteError(cause); }
-}
 function create(path, isLocalStorage, inspect) {
   const target = Object.create(Storage.prototype);
   const s = { path, db: undefined, statements: new Map(), symbols: new Map(), isLocalStorage, inspected: inspect };
@@ -246,8 +241,6 @@ function create(path, isLocalStorage, inspect) {
   return result;
 }
 
-// The storages a realm has made, for the inspector to read.
-const created = { localStorage: undefined, sessionStorage: undefined };
 function install(global, { localStorageFile, inspect = false } = {}) {
   let warned = false;
   function warn() {
@@ -271,7 +264,6 @@ function install(global, { localStorageFile, inspect = false } = {}) {
             if (path.includes('\0')) throw error('ERR_INVALID_ARG_VALUE', 'The argument \'path\' must be a string, Uint8Array, or URL without null bytes.', TypeError);
           }
           value = create(path, name === 'localStorage', inspect);
-          created[name] = value;
           initialized = true;
         }
         return value;
@@ -281,4 +273,4 @@ function install(global, { localStorageFile, inspect = false } = {}) {
     Object.defineProperty(global, name, { ...Object.getOwnPropertyDescriptor(descriptor, name), configurable: true, enumerable: true });
   }
 }
-module.exports = { install, created, entries };
+module.exports = { install };

@@ -58,7 +58,7 @@ struct silk_inspector {
     silk_inspector_packet *first, *last, *out_first, *out_last;
     size_t in_bytes, out_bytes, in_count, out_count;
     uint64_t next_connection;
-    char uuid[37], url[320], authority[280];
+    char uuid[37], url[320], authority[280], browser[64];
     uint16_t port;
     client clients[MAX_CLIENTS];
 };
@@ -239,9 +239,10 @@ static int token(const char *value, const char *expected) {
     }
     return 0;
 }
-/* Only localhost or IP literals can pass Host. There is deliberately no DNS
- * resolution of an attacker-controlled Host or Origin. */
-static int safe_authority(const char *authority, uint16_t port) {
+/* Like Node's IsAllowedHost: only localhost or IP literals can pass Host, with
+ * any port. There is deliberately no DNS resolution of an attacker-controlled
+ * Host or Origin. */
+static int safe_authority(const char *authority) {
     char host[256]; const char *end, *port_text = NULL; size_t length;
     if (*authority == '[') {
         end = strchr(authority + 1, ']'); if (!end) return 0;
@@ -257,20 +258,20 @@ static int safe_authority(const char *authority, uint16_t port) {
         if (strcasecmp(host, "localhost") && inet_pton(AF_INET, host, &address) != 1) return 0;
         if (end) port_text = end + 1;
     }
-    if (!port_text) return port == 80;
+    if (!port_text) return 1;
     if (!*port_text) return 0;
     unsigned value = 0;
     for (; *port_text; port_text++) { if (*port_text < '0' || *port_text > '9') return 0; value = value * 10 + (unsigned)(*port_text-'0'); if (value > 65535) return 0; }
-    return value == port;
+    return 1;
 }
-static int safe_origin(const char *origin, const char *host, uint16_t port) {
+static int safe_origin(const char *origin, const char *host) {
     if (!origin) return 1;
     if (!strcmp(origin, "devtools://devtools") || !strcmp(origin, "chrome-devtools://devtools")) return 1;
     const char *authority;
     if (!strncmp(origin, "http://", 7)) authority = origin + 7;
     else if (!strncmp(origin, "https://", 8)) authority = origin + 8;
     else return 0;
-    return !strcasecmp(authority, host) && safe_authority(authority, port);
+    return !strcasecmp(authority, host) && safe_authority(authority);
 }
 static void http_reply(client *c, unsigned status, const char *reason, const char *body) {
     char header[256];
@@ -322,15 +323,22 @@ static void http_input(silk_inspector *s, client *c) {
         cursor = next + 2;
     }
     if (invalid || !host) { http_reply(c, 400, "Bad Request", "{}"); return; }
-    if (!safe_authority(host, s->port) || !safe_origin(origin, host, s->port)) { http_reply(c, 403, "Forbidden", "{}"); return; }
+    if (!safe_authority(host) || !safe_origin(origin, host)) { http_reply(c, 403, "Forbidden", "{}"); return; }
+    /* As Node's inspector_socket_server.cc: the listing names the endpoint by the
+     * Host the client used, and anything else that is not a WebSocket upgrade of
+     * the target path gets Node's plain-text refusal. */
     if (!strcmp(path, "/json") || !strcmp(path, "/json/list")) {
-        char body[1400];
-        snprintf(body, sizeof(body), "[{\"description\":\"Silk JavaScript runtime\",\"devtoolsFrontendUrl\":\"devtools://devtools/bundled/js_app.html?experiments=true&v8only=true&ws=%s/%s\",\"id\":\"%s\",\"title\":\"Silk\",\"type\":\"node\",\"url\":\"\",\"webSocketDebuggerUrl\":\"%s\"}]", s->authority, s->uuid, s->uuid, s->url);
+        char body[1600];
+        snprintf(body, sizeof(body), "[ {\n  \"description\": \"node.js instance\",\n  \"devtoolsFrontendUrl\": \"devtools://devtools/bundled/js_app.html?experiments=true&v8only=true&ws=%s/%s\",\n  \"devtoolsFrontendUrlCompat\": \"devtools://devtools/bundled/inspector.html?experiments=true&v8only=true&ws=%s/%s\",\n  \"faviconUrl\": \"https://nodejs.org/static/images/favicons/favicon.ico\",\n  \"id\": \"%s\",\n  \"title\": \"node[%d]\",\n  \"type\": \"node\",\n  \"url\": \"\",\n  \"webSocketDebuggerUrl\": \"ws://%s/%s\"\n} ]\n\n", host, s->uuid, host, s->uuid, s->uuid, (int)getpid(), host, s->uuid);
         http_reply(c, 200, "OK", body); return;
     }
-    if (!strcmp(path, "/json/version")) { http_reply(c, 200, "OK", "{\"Browser\":\"Silk\",\"Protocol-Version\":\"1.3\"}"); return; }
-    if (path[0] != '/' || strcmp(path + 1, s->uuid)) { http_reply(c, 404, "Not Found", "{}"); return; }
-    if (!upgrade || strcasecmp(upgrade, "websocket") || !connection || !token(connection, "upgrade") || !key || !valid_key(key) || !ws_version || strcmp(ws_version, "13")) { http_reply(c, 400, "Bad Request", "{}"); return; }
+    if (!strcmp(path, "/json/version")) {
+        char body[160];
+        snprintf(body, sizeof(body), "{\"Browser\":\"%s\",\"Protocol-Version\":\"1.1\"}", s->browser);
+        http_reply(c, 200, "OK", body); return;
+    }
+    if (!strncmp(path, "/json/activate/", 15) && !strcmp(path + 15, s->uuid)) { http_reply(c, 200, "OK", "Target activated"); return; }
+    if (path[0] != '/' || strcmp(path + 1, s->uuid) || !upgrade || strcasecmp(upgrade, "websocket") || !connection || !token(connection, "upgrade") || !key || !valid_key(key) || !ws_version || strcmp(ws_version, "13")) { http_reply(c, 400, "Bad Request", "WebSockets request was expected\r\n"); return; }
     unsigned char digest[EVP_MAX_MD_SIZE], accept[64]; unsigned digest_length = 0;
     size_t key_length = strlen(key);
     char challenge[KEY_LIMIT + 36]; memcpy(challenge, key, key_length); memcpy(challenge + key_length, "258EAFA5-E914-47DA-95CA-C5AB0DC85B11", 36);
@@ -447,8 +455,13 @@ silk_inspector *silk_inspector_create(void *wake) {
     atomic_init(&s->pending, 0);
     return s;
 }
-int silk_inspector_start(silk_inspector *s, const unsigned char *host, size_t length, uint16_t port) {
+int silk_inspector_start(silk_inspector *s, const unsigned char *host, size_t length, uint16_t port, const unsigned char *browser, size_t browser_length) {
     if (!s || length >= 256 || (length && !host)) return EINVAL;
+    /* The /json/version Browser: printable ASCII without quotes or backslashes. */
+    if (browser_length >= sizeof(s->browser) || (browser_length && !browser)) return EINVAL;
+    for (size_t i = 0; i < browser_length; i++) if (browser[i] < 32 || browser[i] > 126 || browser[i] == '"' || browser[i] == '\\') return EINVAL;
+    if (browser_length) memcpy(s->browser, browser, browser_length);
+    s->browser[browser_length] = 0;
     if (s->running) return EALREADY;
     char address[256]; if (length) memcpy(address, host, length); address[length] = 0;
     if (length && memchr(host, 0, length)) return EINVAL;

@@ -2,19 +2,21 @@
 
 const { EventEmitter } = require('events');
 const backend = require('internal/inspector');
-const { error, invalid } = backend;
-const { validateObject } = require('internal/validators');
+const { validateFunction, validateObject, validateString } = require('internal/validators');
+const {
+  ERR_INSPECTOR_ALREADY_CONNECTED, ERR_INSPECTOR_CLOSED, ERR_INSPECTOR_COMMAND, ERR_INSPECTOR_NOT_CONNECTED, ERR_INSPECTOR_NOT_WORKER,
+} = require('internal/errors').codes;
 class Session extends EventEmitter {
   #connection = null;
   #nextId = 1;
   #callbacks = new Map();
   connect() {
-    if (this.#connection) throw error('ERR_INSPECTOR_ALREADY_CONNECTED', 'The inspector session is already connected');
+    if (this.#connection) throw new ERR_INSPECTOR_ALREADY_CONNECTED('The inspector session');
     this.#connection = backend.connect(message => this.#onMessage(message));
   }
   connectToMainThread() {
-    if (require('internal/host').inspectorNative(10) === 0) throw error('ERR_INSPECTOR_NOT_WORKER', 'Current thread is not a worker');
-    if (this.#connection) throw error('ERR_INSPECTOR_ALREADY_CONNECTED', 'The inspector session is already connected');
+    if (require('internal/host').inspectorNative(10) === 0) throw new ERR_INSPECTOR_NOT_WORKER();
+    if (this.#connection) throw new ERR_INSPECTOR_ALREADY_CONNECTED('The inspector session');
     this.#connection = backend.connect(message => this.#onMessage(message), true);
   }
   #onMessage(message) {
@@ -24,7 +26,7 @@ class Session extends EventEmitter {
         const callback = this.#callbacks.get(parsed.id);
         this.#callbacks.delete(parsed.id);
         if (callback) {
-          if (parsed.error) callback(error('ERR_INSPECTOR_COMMAND', `Inspector error ${parsed.error.code}: ${parsed.error.message}`));
+          if (parsed.error) callback(new ERR_INSPECTOR_COMMAND(parsed.error.code, parsed.error.message));
           else callback(null, parsed.result);
         }
       } else {
@@ -34,11 +36,11 @@ class Session extends EventEmitter {
     } catch (cause) { process.emitWarning(cause); }
   }
   post(method, params, callback) {
-    if (typeof method !== 'string') throw invalid('method', 'string');
+    validateString(method, 'method');
     if (!callback && typeof params === 'function') { callback = params; params = null; }
-    if (params && (typeof params !== 'object' || Array.isArray(params))) throw invalid('params', 'object');
-    if (callback && typeof callback !== 'function') throw invalid('callback', 'function');
-    if (!this.#connection) throw error('ERR_INSPECTOR_NOT_CONNECTED', 'Session is not connected');
+    if (params) validateObject(params, 'params');
+    if (callback) validateFunction(callback, 'callback');
+    if (!this.#connection) throw new ERR_INSPECTOR_NOT_CONNECTED();
     const id = this.#nextId++;
     const message = { id, method };
     if (params) message.params = params;
@@ -52,7 +54,7 @@ class Session extends EventEmitter {
     const connection = this.#connection;
     this.#connection = null;
     connection.disconnect();
-    for (const callback of this.#callbacks.values()) process.nextTick(callback, error('ERR_INSPECTOR_CLOSED', 'Session was closed'));
+    for (const callback of this.#callbacks.values()) process.nextTick(callback, new ERR_INSPECTOR_CLOSED());
     this.#callbacks.clear();
     this.#nextId = 1;
   }
@@ -68,4 +70,3 @@ for (const name of ['requestWillBeSent', 'responseReceived', 'loadingFinished', 
 const DOMStorage = {};
 for (const name of ['domStorageItemAdded', 'domStorageItemRemoved', 'domStorageItemUpdated', 'domStorageItemsCleared', 'registerStorage']) DOMStorage[name] = event(`DOMStorage.${name}`);
 module.exports = { open: backend.open, close: backend.close, url: backend.url, waitForDebugger: backend.waitForDebugger, console: backend.console, Session, Network, NetworkResources: { put: backend.putNetworkResource }, DOMStorage };
-Object.defineProperty(module.exports, '_start', { value: backend._start });

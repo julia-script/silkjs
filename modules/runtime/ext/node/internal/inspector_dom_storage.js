@@ -1,9 +1,8 @@
 'use strict';
 
-// Node's DOMStorage and Storage domains (--experimental-storage-inspection):
-// a session reads the realm's localStorage and sessionStorage, and Node's
-// registerStorage pseudo-event supplies the items of a storage the realm has
-// not made.
+// Node's DOMStorage and Storage domains (--experimental-storage-inspection).
+// As DOMStorageAgent in Node, the items a session reads are the ones the
+// storage events reported (and registerStorage, a pseudo-event, replaced).
 const host = require('internal/host');
 const { protocolError, unsupported } = require('internal/inspector_values');
 
@@ -18,20 +17,32 @@ function storageKey() {
 }
 function storageId(isLocalStorage) { return { securityOrigin: '', isLocalStorage, storageKey: storageKey() }; }
 
-function register(params) {
+function mapFor(params) {
+  const id = params.storageId;
+  const local = id !== null && typeof id === 'object' ? id.isLocalStorage : params.isLocalStorage;
+  return local ? registered.local : registered.session;
+}
+// Every DOMStorage event updates the agent's copy, enabled or not.
+function observe(method, params) {
   if (params === null || typeof params !== 'object') return;
-  const map = params.isLocalStorage ? registered.local : registered.session;
-  map.clear();
-  const items = params.storageMap;
-  if (items !== null && typeof items === 'object') for (const key of Object.keys(items)) map.set(`${key}`, `${items[key]}`);
+  switch (method) {
+    case 'DOMStorage.registerStorage': {
+      const map = mapFor(params);
+      map.clear();
+      const items = params.storageMap;
+      if (items !== null && typeof items === 'object') for (const key of Object.keys(items)) map.set(`${key}`, `${items[key]}`);
+      break;
+    }
+    case 'DOMStorage.domStorageItemAdded':
+    case 'DOMStorage.domStorageItemUpdated': mapFor(params).set(`${params.key}`, `${params.newValue}`); break;
+    case 'DOMStorage.domStorageItemRemoved': mapFor(params).delete(`${params.key}`); break;
+    case 'DOMStorage.domStorageItemsCleared': mapFor(params).clear(); break;
+  }
 }
 
 function items(params) {
   const id = params && params.storageId;
   if (id === null || typeof id !== 'object' || typeof id.isLocalStorage !== 'boolean') throw protocolError(-32602, 'Invalid parameters');
-  const storage = require('internal/web/storage');
-  const made = storage.created[id.isLocalStorage ? 'localStorage' : 'sessionStorage'];
-  if (made !== undefined) return { entries: storage.entries(made) };
   return { entries: [...(id.isLocalStorage ? registered.local : registered.session)] };
 }
 
@@ -46,4 +57,4 @@ function dispatch(session, method, params) {
   }
 }
 
-module.exports = { dispatch, register, storageId };
+module.exports = { dispatch, observe, storageId };

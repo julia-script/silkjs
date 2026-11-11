@@ -10,6 +10,11 @@ const tokens = new Map();
 const listeners = new Set();
 const contextListeners = new Set();
 let nextId = 2;
+// Node names the main context after the process title (argv0 at start) and pid, a worker's after its thread id.
+function mainName() {
+  const { isMainThread, threadId } = require('worker_threads');
+  return isMainThread ? `${process.argv0}[${process.pid}]` : `Worker[${threadId}]`;
+}
 const main = { id: 1, name: 'main', origin: '', uniqueId: `silk:${owner}:main`, handle: undefined, token: String(native(14)) };
 function register(sandbox, handle, options = {}) {
   const existing = bySandbox.get(sandbox);
@@ -48,6 +53,6 @@ function resolve(id, uniqueId) {
   }
 }
 function description(context) {
-  return { id: context.id, name: context.name, origin: context.origin, uniqueId: context.uniqueId, auxData: { isDefault: context.id === 1 } };
+  return { id: context.id, name: context === main ? mainName() : context.name, origin: context.origin, uniqueId: context.uniqueId, auxData: { isDefault: context.id === 1 } };
 }
 module.exports = { register, get, list, resolve, fromToken, description, subscribe: (listener, first = false) => (first ? contextListeners : listeners).add(listener) };

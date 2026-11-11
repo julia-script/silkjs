@@ -97,7 +97,7 @@ function collect(categories) {
   const own = [...categories].map(categoryPattern);
   const sink = {
     events: [
-      { pid: process.pid, tid: process.pid, ts: 0, ph: 'M', cat: '__metadata', name: 'process_name', args: { name: process.title } },
+      { pid: process.pid, tid: process.pid, ts: 0, ph: 'M', cat: '__metadata', name: 'process_name', args: { name: process.argv0 } },
       { pid: process.pid, tid: process.pid, ts: 0, ph: 'M', cat: '__metadata', name: 'thread_name', args: { name: 'JavaScriptMainThread' } },
     ],
     matches(group) { return group.split(',').some(category => own.some(pattern => pattern.test(category))); },
