@@ -19,6 +19,8 @@ const kBindings = {
   buffer: () => require('internal/buffer_binding'),
   crypto: () => require('internal/crypto/binding'),
   http2: () => require('internal/http2/binding'),
+  // node_http_parser.cc: HTTPParser, ConnectionsList, methods, allMethods.
+  http_parser: () => require('internal/http/native-parser'),
   util: () => require('internal/util/binding'),
   uv: () => {
     // Node's uv binding: every UV_ code from the system error map, errname and the map.
