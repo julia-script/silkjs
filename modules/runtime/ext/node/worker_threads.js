@@ -4,6 +4,7 @@ const host = require('internal/host');
 const EventEmitter = require('events');
 const { _createResource: createResource } = require('async_hooks');
 const { Buffer } = require('buffer');
+const diagnostics = require('internal/host').diagnostics;
 // A main thread that never starts a worker needs none of these; each loads on first use.
 const lazy = name => { let loaded; return () => loaded ??= require(name); };
 const clone = lazy('internal/worker/clone');
@@ -243,16 +244,19 @@ class Worker extends EventEmitter {
     super();
     const config = workerOptions(filename, options);
     const list = clone().transferList(config.options.transferList);
-    const userChannel = new (ports().MessageChannel)();
-    const controlChannel = new (ports().MessageChannel)();
-    const state = { id: null, online: false, exited: false, exitCode: undefined, user: userChannel.port1,
-      control: controlChannel.port1, resource: null, refed: true, handleGone: false,
+    const state = { id: null, online: false, exited: false, exitCode: undefined, user: null,
+      control: null, resource: null, refed: true, handleGone: false,
       stdout: readableFrom(), stderr: readableFrom(), stdin: null,
       callbacks: new Map(), termination: null, resolveTermination: null, metadata: config.metadata };
     workerStates.set(this, state);
     // Like Node's, the async resource of a worker is its native handle: hasRef() reports
-    // the ref state while the thread runs and undefined once the handle is gone.
+    // the ref state while the thread runs and undefined once the handle is gone. Node
+    // creates it before the worker's ports, so async hooks see WORKER first.
     state.resource = createResource('WORKER', new WorkerHandle(state));
+    const userChannel = new (ports().MessageChannel)();
+    const controlChannel = new (ports().MessageChannel)();
+    state.user = userChannel.port1;
+    state.control = controlChannel.port1;
     state.stdin = config.metadata.stdin ? writableTo(state.control, 0, state.callbacks) : null;
     this.on('newListener', type => { if (type === 'message') state.user.ref(); });
     this.on('removeListener', type => { if (type === 'message' && this.listenerCount('message') === 0) state.user.unref(); });
@@ -277,6 +281,7 @@ class Worker extends EventEmitter {
     if (!config.metadata.stdout) state.stdout.pipe(process.stdout, { end: false });
     if (!config.metadata.stderr) state.stderr.pipe(process.stderr, { end: false });
     process.nextTick(() => process.emit('worker', this));
+    diagnostics.publish('worker_threads', { worker: this });
   }
   get threadId() { const state = workerState(this); return state.exited ? -1 : state.id; }
   get threadName() { const state = workerState(this); return state.exited ? null : state.metadata.name; }
@@ -481,7 +486,9 @@ function install(proc = process, metadata = bootstrap()) {
     if (!Number.isInteger(code)) throw clone().codedError('ERR_INVALID_ARG_TYPE', 'The code argument must be an integer');
     proc.exitCode = code;
     if (!exitRequested) { exitRequested = true; proc._exiting = true; proc.emit('exit', code); }
-    if (host.builtinLoaded('internal/compile_cache')) require('internal/compile_cache').flushCompileCache();
+    if (host.builtinLoaded('internal/compile_cache')) require('internal/compile_cache').flushAtExit();
+    require('internal/startup_controls').traceExit(code, info.threadId);
+    if (host.builtinLoaded('internal/heap_prof')) require('internal/heap_prof').finish();
     host.workerNative('requestExit', [code]);
   };
   host.workerNative('online', []);

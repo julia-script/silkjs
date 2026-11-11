@@ -92,7 +92,13 @@ function install(global) {
     const name = frame.functionName;
     const place = location(frame);
     if (frame.isConstructor) return 'new ' + (name || '<anonymous>') + ' (' + place + ')';
-    if (!name) return place;
+    if (!name) {
+      // V8's AppendMethodCall for an unnamed function called on an object.
+      if (frame.isToplevel !== false || frame.receiver === global) return place;
+      const type = typeName(frame);
+      const method = methodName(frame);
+      return (type ? type + '.' : '') + (method || '<anonymous>') + ' (' + place + ')';
+    }
     if (name.startsWith('get ') || name.startsWith('set ')) return name + ' (' + place + ')';
     const type = typeName(frame);
     const method = methodName(frame);

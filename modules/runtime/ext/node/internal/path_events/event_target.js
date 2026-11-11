@@ -6,7 +6,13 @@ const kEvents = Symbol('events');
 const kResistStopPropagation = Symbol('resistStopPropagation');
 const eventState = new WeakMap();
 const targets = new WeakSet();
-const signalState = new WeakMap();
+// AbortSignal state lives under a symbol on the signal, as Node keeps kAborted and kReason, so
+// the brand check also passes for a Proxy of a signal.
+const kSignalState = Symbol('kSignalState');
+const signalState = {
+  get(value) { return (typeof value === 'object' && value !== null) || typeof value === 'function' ? value[kSignalState] : undefined; },
+  has(value) { return signalState.get(value) !== undefined; },
+};
 const controllerState = new WeakMap();
 const signalToken = {};
 
@@ -344,11 +350,11 @@ class AbortSignal extends EventTarget {
     super();
     // Signals warn about no listener count (Node: kMaxEventTargetListeners = 0).
     this[require('events').kMaxEventTargetListeners] = 0;
-    signalState.set(this, {
+    Object.defineProperty(this, kSignalState, { value: {
       aborted: false, reason: undefined, onabort: null, handler: null,
       dependents: new Set(), sources: new Set(), composite: false, timeout: false,
       reference: new WeakRef(this),
-    });
+    }, writable: true });
   }
   get aborted() { return signalData(this).aborted; }
   get reason() { return signalData(this).reason; }

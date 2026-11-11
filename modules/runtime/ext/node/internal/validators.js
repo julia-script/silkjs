@@ -163,6 +163,19 @@ function getValidatedPath(value, name = 'path') {
   return path;
 }
 
+const octalReg = /^[0-7]+$/;
+const modeDesc = 'must be a 32-bit unsigned integer or an octal string';
+// Values that become a mode_t: valid numbers and octal strings.
+function parseFileMode(value, name, def) {
+  value ??= def;
+  if (typeof value === 'string') {
+    if (octalReg.exec(value) === null) throw new ERR_INVALID_ARG_VALUE(name, value, modeDesc);
+    value = Number.parseInt(value, 8);
+  }
+  validateUint32(value, name);
+  // Coerce -0 to +0.
+  return value + 0;
+}
 // Node's validateFiniteNumber and checkRangesOrGetDefault (used by zlib).
 function validateFiniteNumber(number, name) {
   // Common case
@@ -194,7 +207,7 @@ module.exports = {
   kValidateObjectAllowObjects, kValidateObjectAllowObjectsAndNull,
   validateString, validateBoolean, validateFunction, validateNumber, validateInteger, validateInt32,
   validateUint32, validateObject, validateArray, validateOneOf, validateAbortSignal,
-  isUint32, validateBuffer, validateLinkHeaderValue,
+  isUint32, parseFileMode, validateBuffer, validateLinkHeaderValue,
   convertToValidSignal, signalName, toPathIfFileURL, validatePath, getValidatedPath, validatePort,
   validateFiniteNumber, checkRangesOrGetDefault,
 };
