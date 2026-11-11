@@ -114,12 +114,28 @@ fs.rmSync = function rmSync(path, options) {
 fs.readFileSync = function readFileSync(path, options) {
   const o = opts(options, { encoding: null, flag: 'r' }); if (o.encoding != null) c.encoding(o.encoding); c.aborted(o.signal);
   path = target(path); const owned = typeof path !== 'number'; const fd = owned ? fs.openSync(path, o.flag) : path;
-  try {
-    const chunks = []; let total = 0;
-    for (;;) { c.aborted(o.signal); const buffer = Buffer.allocUnsafe(65536); const count = fs.readSync(fd, buffer, 0, buffer.length, null); if (count === 0) break; chunks.push(count === buffer.length ? buffer : buffer.subarray(0, count)); total += count; }
-    const result = Buffer.concat(chunks, total); return o.encoding == null ? result : result.toString(o.encoding);
-  } finally { if (owned) fs.closeSync(fd); }
+  try { return readAll(c.fd(fd), o.signal, o.encoding); }
+  finally { if (owned) fs.closeSync(fd); }
 };
+// Most files fit in this buffer, read into until a read returns 0 and then decoded or
+// copied at the size read. A reader takes it, so a nested read gets its own.
+let readBuffer = null;
+function readAll(fd, signal, encoding) {
+  const buffer = readBuffer || Buffer.allocUnsafeSlow(65536); readBuffer = null;
+  try {
+    let chunks = null, held = 0, total = 0;
+    for (;;) {
+      c.aborted(signal);
+      if (held === buffer.length) { (chunks ??= []).push(Buffer.from(buffer)); held = 0; }
+      const count = c.fail(os.read(fd, buffer.buffer, buffer.byteOffset + held, buffer.length - held), 'read');
+      if (count === 0) break;
+      held += count; total += count;
+    }
+    if (chunks === null) return encoding == null ? Buffer.from(buffer.subarray(0, held)) : buffer.toString(encoding, 0, held);
+    if (held !== 0) chunks.push(Buffer.from(buffer.subarray(0, held)));
+    const result = Buffer.concat(chunks, total); return encoding == null ? result : result.toString(encoding);
+  } finally { readBuffer = buffer; }
+}
 function writeFile(path, data, options, append) {
   const o = opts(options, { encoding: 'utf8', mode: 0o666, flag: append ? 'a' : 'w', flush: false }); c.encoding(o.encoding); c.aborted(o.signal);
   data = typeof data === 'string' ? Buffer.from(data, o.encoding) : c.bytes(data); path = target(path);
