@@ -5,7 +5,7 @@ const ids = new WeakMap();
 const finalizers = new FinalizationRegistry(id => host.crypto('release', [id]));
 function error(code, message, Type = Error) { const e = new Type(message); e.code = code; return e; }
 function invalid(name, type) { return error('ERR_INVALID_ARG_TYPE', `The "${name}" argument must be ${type}`, TypeError); }
-function integer(n, name, min = 0, max = 0x7fffffff) { if (typeof n !== 'number') throw invalid(name, 'a number'); if (!Number.isSafeInteger(n) || n < min || n > max) throw error('ERR_OUT_OF_RANGE', `${name} is out of range`, RangeError); return n; }
+function integer(n, name, min = 0, max = 0x7fffffff) { require('internal/validators').validateInteger(n, name, min, max); return n; }
 function callback(cb) { if (typeof cb !== 'function') throw invalid('callback', 'a function'); return cb; }
 function bytes(value, encoding, name = 'data') {
   if (typeof value === 'string') return Buffer.from(value, encoding);
@@ -50,7 +50,16 @@ function submit(op, args, cb, convert = x => x) {
 function output(value, encoding) { const b = Buffer.from(value); return encoding && encoding !== 'buffer' ? b.toString(encoding) : b; }
 function attach(object, id) { try { ids.set(object, id); finalizers.register(object, id, object); } catch (e) { call('release', [id]); throw e; } return object; }
 function handle(object) { const id = ids.get(object); if (id === undefined) throw error('ERR_CRYPTO_INVALID_STATE', 'Crypto object has been finalized'); return id; }
-function release(object) { const id = ids.get(object); if (id !== undefined) { ids.delete(object); finalizers.unregister(object); call('release', [id]); } }
+// `object` uses the native object of `owner`, which stays alive while it does.
+const owners = new WeakMap();
+function share(object, owner) { const id = handle(owner); ids.set(object, id); owners.set(object, owner); return object; }
+function release(object) {
+  const id = ids.get(object);
+  if (id === undefined) return;
+  ids.delete(object);
+  if (owners.has(object)) { owners.delete(object); return; }
+  finalizers.unregister(object); call('release', [id]);
+}
 function name(value, field = 'algorithm') { if (typeof value !== 'string') throw invalid(field, 'a string'); if (value.includes('\0')) throw error('ERR_INVALID_ARG_VALUE', `${field} must not contain null bytes`, TypeError); return value; }
 // Node's argument errors and validators (lib/internal/errors.js, lib/internal/validators.js),
 // with the same codes, classes and messages, since callers and tests match on them.
@@ -145,4 +154,4 @@ const validate = {
     return value;
   },
 };
-module.exports = { Buffer, error, invalid, integer, callback, bytes, binary, packed, normalize, call, submit, output, attach, handle, release, name, codes, validate, isAnyArrayBuffer, byteLength };
+module.exports = { Buffer, error, invalid, integer, callback, bytes, binary, packed, normalize, call, submit, output, attach, share, handle, release, name, codes, validate, isAnyArrayBuffer, byteLength };

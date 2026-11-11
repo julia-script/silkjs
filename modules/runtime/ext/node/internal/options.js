@@ -3,8 +3,6 @@
 const host = require('internal/host');
 const reportOptions = require('internal/process_report');
 const startupControls = require('internal/startup_controls');
-const permission = require('internal/permission');
-const tlsOptions = require('internal/tls/options');
 
 // Inspector enable flags accept an optional address only with "="; unlike
 // ordinary booleans that suffix must survive normalization.
@@ -54,49 +52,97 @@ function applyInspectorOption(arg) {
   return true;
 }
 
-// Values describe whether a supported environment option consumes an argument.
-const environmentOptions = new Map([
-  ...reportOptions.optionEntries,
-  ...startupControls.optionEntries,
-  ...require('internal/heap_prof').optionEntries,
-  ...permission.optionEntries,
-  ...tlsOptions.optionEntries,
-  ...[...inspectorEnableOptions, '--no-inspect', '--no-inspect-brk', '--no-inspect-wait',
-    '--experimental-inspector-network-resource', '--no-experimental-inspector-network-resource',
-    '--experimental-network-inspection', '--no-experimental-network-inspection'].map(name => [name, false]),
-  ['--inspect-port', true], ['--debug-port', true],
-  ...['--watch', '--no-watch', '--watch-preserve-output', '--no-watch-preserve-output'].map(name => [name, false]),
-  ...['--watch-path', '--watch-kill-signal'].map(name => [name, true]),
-  ...['--experimental-test-coverage', '--no-experimental-test-coverage'].map(name => [name, false]),
-  ...['--test-coverage-include', '--test-coverage-exclude', '--test-coverage-lines',
-    '--test-coverage-branches', '--test-coverage-functions'].map(name => [name, true]),
-  ...['--insecure-http-parser', '--no-insecure-http-parser', '--async-context-frame',
-    '--no-async-context-frame', '--expose-gc', '--no-expose-gc', '--disable-sigusr1',
-    '--trace-events-enabled', '--test-only', '--experimental-eventsource',
-    '--no-experimental-eventsource', '--experimental-webstorage',
-    '--no-experimental-webstorage', '--experimental-stream-iter',
-    '--no-experimental-stream-iter', '--preserve-symlinks', '--no-preserve-symlinks',
-    '--preserve-symlinks-main', '--no-preserve-symlinks-main',
-    '--experimental-vm-modules', '--no-experimental-vm-modules',
-    '--experimental-require-module', '--no-experimental-require-module',
-    '--experimental-import-meta-resolve', '--experimental-print-required-tla',
-    '--enable-source-maps', '--no-enable-source-maps',
-    '--trace-sigint', '--no-trace-sigint',
-    '--strip-types', '--no-strip-types', '--experimental-strip-types', '--no-experimental-strip-types',
-    '--experimental-transform-types', '--no-experimental-transform-types'].map(name => [name, false]),
-  ...['--trace-event-categories', '--trace-event-file-pattern', '--input-type',
-    '--test-isolation', '--test-name-pattern', '--test-skip-pattern', '--test-shard',
-    '--test-reporter', '--test-reporter-destination', '--localstorage-file',
-    '-r', '--require', '--import', '-C', '--conditions', '--experimental-loader', '--loader'].map(name => [name, true]),
-]);
-
-function normalizeOption(arg) {
-  const separator = arg.indexOf('=');
-  const name = (separator < 0 ? arg : arg.slice(0, separator)).replace(/_/g, '-');
-  // Node-owned booleans ignore an attached value. V8-style GC flags reject it.
-  if (separator < 0 || (name.startsWith('--') && workerOptions.get(name) === false &&
-      !inspectorEnableOptions.has(name) && !/^--(?:no-)?expose-gc$/.test(name))) return name;
-  return name + arg.slice(separator);
+const table = require('internal/options_table');
+function impliedBy(name) {
+  const implied = [];
+  for (const [from, to] of table.implications) if (from === name && to.startsWith('--')) implied.push(to);
+  return implied;
+}
+// Node's OptionsParser::Parse (src/node_options-inl.h) over the option table of
+// the reference release. Each entry is { name, type, value, negated, raw }, with
+// name canonical (aliases expanded, `_` read as `-`, `--no-` removed), type from
+// the table (undefined for an option Node passes to V8 unknown), raw the
+// argument as written and implied set for an option another one implies.
+// execArgv holds the arguments taken from args as written, without `--`, and
+// index is where the script and its arguments start.
+function parseArguments(args, inEnvironment) {
+  const entries = [], execArgv = [], synthetic = [];
+  let index = 0, error;
+  const empty = () => synthetic.length === 0 && index >= args.length;
+  const first = () => synthetic.length !== 0 ? synthetic[0] : args[index];
+  const pop = () => {
+    if (synthetic.length !== 0) return synthetic.shift();
+    const arg = args[index++];
+    if (arg !== '--') execArgv.push(arg);
+    return arg;
+  };
+  while (!empty() && error === undefined) {
+    const next = first();
+    if (next.length <= 1 || next[0] !== '-') break;
+    const arg = pop();
+    if (arg === '--') {
+      if (inEnvironment) error = '-- is not allowed in NODE_OPTIONS';
+      break;
+    }
+    // Only options with two dashes take --name=value.
+    const equals = arg[1] === '-' ? arg.indexOf('=') : -1;
+    let name = equals < 0 ? arg : arg.slice(0, equals);
+    const originalName = equals < 0 ? name : name + '=';
+    name = name.slice(0, 2) + name.slice(2).replace(/_/g, '-');
+    let negated = false;
+    if (name.startsWith('--no-')) {
+      name = '--' + name.slice(5);
+      negated = true;
+    }
+    for (;;) {
+      let expansion = table.aliases.get(name);
+      if (expansion === undefined && equals >= 0) expansion = table.aliases.get(name + '=');
+      if (expansion === undefined && !empty() && first() !== '' && first()[0] !== '-') expansion = table.aliases.get(name + ' <arg>');
+      if (expansion === undefined) break;
+      const previous = name;
+      name = expansion[0];
+      synthetic.unshift(...expansion.slice(1));
+      if (name === previous) break;
+    }
+    const info = table.options.get(name);
+    if ((info === undefined || !info[1]) && inEnvironment) {
+      error = `${originalName} is not allowed in NODE_OPTIONS`;
+      break;
+    }
+    if (!negated) for (const implied of impliedBy(name)) {
+      const target = table.options.get(implied);
+      if (target) entries.push({ name: implied, type: target[0], value: true, negated: false, raw: implied, implied: true });
+    }
+    if (info === undefined) {
+      entries.push({ name, type: undefined, value: undefined, negated, raw: arg });
+      continue;
+    }
+    const type = info[0];
+    // Some V8 options can be negated: V8 validates them.
+    if (negated && type !== 'Boolean' && type !== 'V8Option') {
+      error = `${arg} is an invalid negation because it is not a boolean option`;
+      break;
+    }
+    let value;
+    if (type !== 'Boolean' && type !== 'NoOp' && type !== 'V8Option') {
+      // --run alone lists the package scripts: it does not take a later flag.
+      const optional = name === '--run';
+      value = '';
+      if (equals >= 0) {
+        value = arg.slice(equals + 1);
+        if (value === '' && !optional) { error = `${originalName} requires an argument`; break; }
+      } else if (empty() || (optional && first()[0] === '-')) {
+        if (!optional) { error = `${originalName} requires an argument`; break; }
+      } else {
+        value = pop();
+        if (value !== '' && value[0] === '-') { error = `${originalName} requires an argument`; break; }
+        // \- escapes a leading dash.
+        if (value[0] === '\\' && value[1] === '-') value = value.slice(1);
+      }
+    }
+    entries.push({ name, type, value: type === 'Boolean' ? !negated : value, negated, raw: arg });
+  }
+  return { entries, execArgv, index, error };
 }
 
 function report(error, errors) {
@@ -128,147 +174,89 @@ function parseEnvironment(value, errors) {
   return result;
 }
 
+// NODE_OPTIONS as parsed: the number of leading arguments that are options.
 function validateEnvironment(args, errors) {
   if (errors?.length) return 0;
-  for (let index = 0; index < args.length; index++) {
-    const start = index;
-    const arg = normalizeOption(args[index]), separator = arg.indexOf('=');
-    if (arg.length <= 1 || arg[0] !== '-') return start;
-    const name = separator < 0 ? arg : arg.slice(0, separator);
-    if (!environmentOptions.has(name) || (separator >= 0 && name[1] !== '-')) {
-      report(new Error((name[1] !== '-' ? arg : args[index].includes('=') ? name + '=' : name) + ' is not allowed in NODE_OPTIONS'), errors);
-      return start;
-    }
-    if (inspectorEnableOptions.has(name)) {
-      if (separator >= 0) {
-        try { inspectorAddress(arg.slice(separator + 1)); }
-        catch (error) { report(error, errors); return start; }
-      }
-      continue;
-    }
-    if (!environmentOptions.get(name)) {
-      if (separator >= 0) {
-        report(new Error('invalid value for ' + name), errors);
-        return start;
-      }
-    } else {
-      const value = separator < 0 ? args[++index] : arg.slice(separator + 1);
-      if (value === undefined || ((['--localstorage-file', '-r', '--require', '--import', '-C', '--conditions', '--watch-path', '--watch-kill-signal'].includes(name) || reportOptions.isValueOption(name) || permission.isValueOption(name)) && value === '') || (separator < 0 && value.startsWith('-'))) {
-        report(new Error(name + ' requires an argument'), errors);
-        return start;
-      } else if (name === '--input-type' && !['commonjs', 'module', 'commonjs-typescript', 'module-typescript'].includes(value)) {
-        report(new Error('--input-type must be "module", "commonjs", "module-typescript" or "commonjs-typescript"'), errors);
-        return start;
-      }
-      if (isInspectorValueOption(name)) {
-        try { inspectorAddress(value); }
-        catch (error) { report(error, errors); return start; }
-      }
-      const error = startupControls.valueError(name, value);
-      if (error) { report(new Error(error), errors); return start; }
-    }
-  }
-  return args.length;
+  const parsed = parseArguments(args, true);
+  if (parsed.error === undefined) return parsed.index;
+  report(new Error(parsed.error), errors);
+  return 0;
 }
 
-const workerOptions = new Map([
-  ...environmentOptions,
-  ...['-i', '--interactive', '--test', '-c', '--check', '--no-print',
-    '--test-update-snapshots', '--no-test-update-snapshots',
-    '--experimental-test-module-mocks', '--no-experimental-test-module-mocks'].map(name => [name, false]),
-  ...['-e', '--eval', '-p', '--print', '--test-concurrency', '--test-timeout',
-    '--env-file', '--env-file-if-exists'].map(name => [name, true]),
-]);
-// Node's options parser types (src/node_options.h OptionType) and the option
-// table node inspect walks to find the child script (lib/internal/options.js).
+// Node's options parser types (src/node_options.h OptionType) and its option table,
+// as internal/options getCLIOptionsInfo gives them (node inspect walks it).
 const optionTypes = { kNoOp: 0, kV8Option: 1, kBoolean: 2, kInteger: 3, kUInteger: 4, kString: 5, kHostPort: 6, kStringList: 7 };
+const envVarSettings = { kAllowedInEnvvar: 0, kDisallowedInEnvvar: 1 };
 function getCLIOptionsInfo() {
   const options = new Map();
-  for (const [name, value] of workerOptions) {
-    if (!name.startsWith('--') || name.startsWith('--no-')) continue;
-    options.set(name, { type: value ? optionTypes.kString : optionTypes.kBoolean });
+  for (const [name, [type, allowedInEnvironment, defaultIsTrue]] of table.options) {
+    options.set(name, {
+      type: optionTypes['k' + type],
+      envVarSettings: allowedInEnvironment ? envVarSettings.kAllowedInEnvvar : envVarSettings.kDisallowedInEnvvar,
+      defaultIsTrue,
+    });
   }
-  const aliases = new Map([
-    ['-e', ['--eval']], ['-p', ['--print']], ['-pe', ['--print', '--eval']], ['-r', ['--require']],
-    ['-C', ['--conditions']], ['-i', ['--interactive']], ['-c', ['--check']], ['--debug-port', ['--inspect-port']],
-  ]);
-  return { options, aliases };
+  return { options, aliases: new Map(table.aliases) };
 }
 function processOption(name) {
   return /^--(?:no-)?(?:expose-gc|trace-sigint)$/.test(name) || /^--trace-event(?:s-enabled|-categories|-file-pattern)$/.test(name) || reportOptions.processWideOption(name);
 }
-function validateWorker(args, explicit) {
-  for (let index = 0; index < args.length; index++) {
-    const arg = normalizeOption(args[index]), separator = arg.indexOf('=');
-    const name = separator < 0 ? arg : arg.slice(0, separator);
-    if (!workerOptions.has(name) || (separator >= 0 && name[1] !== '-') || (explicit && processOption(name))) {
-      if (!explicit) continue;
-      throw new Error('Unsupported Worker execArgv option: ' + arg);
-    }
-    if (inspectorEnableOptions.has(name)) {
-      if (separator >= 0) inspectorAddress(arg.slice(separator + 1));
-      continue;
-    }
-    if (!workerOptions.get(name)) {
-      if (separator >= 0) throw new Error('invalid value for ' + name);
-      continue;
-    }
-    if ((name === '-p' || name === '--print') && separator < 0 &&
-        (args[index + 1] === undefined || args[index + 1].startsWith('-'))) continue;
-    const value = separator < 0 ? args[++index] : arg.slice(separator + 1);
-    if (value === undefined || (separator < 0 && isInspectorValueOption(name) && value.startsWith('-')) ||
-        ((['--localstorage-file', '-r', '--require', '--import', '-C', '--conditions',
-      '--env-file', '--env-file-if-exists', '--watch-path', '--watch-kill-signal'].includes(name) || reportOptions.isValueOption(name) || permission.isValueOption(name)) && value === '')) throw new Error(name + ' requires an argument');
+// The flags of an explicit Worker execArgv that a Worker cannot take, as Node's
+// per-isolate parser sees them: unknown or V8 options and process-wide ones.
+// Throws a parse error.
+function invalidWorkerArguments(args) {
+  const parsed = parseArguments(args, false);
+  if (parsed.error !== undefined) throw new Error(parsed.error);
+  const invalid = [];
+  for (const entry of parsed.entries) {
+    if (entry.implied) continue;
+    if (entry.type === undefined || entry.type === 'V8Option' || table.options.get(entry.name)[3]) { invalid.push(entry.raw); continue; }
+    const { name, value } = entry;
     if (name === '--input-type' && !['commonjs', 'module', 'commonjs-typescript', 'module-typescript'].includes(value))
       throw new Error('--input-type must be "module", "commonjs", "module-typescript" or "commonjs-typescript"');
     if (name === '--test-isolation' && !['process', 'none'].includes(value))
       throw new Error('--test-isolation must be "process" or "none"');
-    if (isInspectorValueOption(name)) inspectorAddress(value);
-    const error = startupControls.valueError(name, value);
+    if (entry.type === 'HostPort') inspectorAddress(value);
+    const error = typeof value === 'string' ? startupControls.valueError(name, value) : undefined;
     if (error) throw new Error(error);
   }
+  return invalid;
 }
 
+// The form an option takes as one argument: a boolean as --name or --no-name,
+// a value as --name=value, a V8 flag as written with `-` for `_`.
+function optionFlag({ name, type, value, negated, raw }) {
+  if (type === 'Boolean') return negated ? '--no-' + name.slice(2) : name;
+  if (type === undefined || type === 'V8Option') return raw.replace(/^--[^=]*/, text => text.replace(/_/g, '-'));
+  return name + '=' + value;
+}
+
+// The --env-file and --env-file-if-exists files, in order.
 function environmentFiles(args) {
   const files = [];
-  for (let index = 0; index < args.length; index++) {
-    const arg = normalizeOption(args[index]);
-    if (arg === '--' || arg === '-' || !arg.startsWith('-')) break;
-    const separator = arg.indexOf('=');
-    const name = separator < 0 ? arg : arg.slice(0, separator);
-    if (name === '--env-file' || name === '--env-file-if-exists') {
-      const path = separator < 0 ? args[++index] : arg.slice(separator + 1);
-      if (path !== undefined) files.push({ path, optional: name === '--env-file-if-exists' });
-    } else if (separator < 0 && (workerOptions.get(name) || name === '-pe' || name === '--experimental-sea-config' || name === '--run')) {
-      if ((name === '-p' || name === '--print' || name === '--run') &&
-          (args[index + 1] === undefined || args[index + 1].startsWith('-'))) continue;
-      index++;
-    }
+  for (const { name, value } of parseArguments(args, false).entries) {
+    if (name === '--env-file' || name === '--env-file-if-exists') files.push({ path: value, optional: name === '--env-file-if-exists' });
   }
   return files;
 }
 
+const loaderWorkerExcluded = new Set(['--inspect', '--inspect-brk', '--inspect-wait', '--inspect-port',
+  '--require', '--import', '--input-type', '--watch', '--watch-path', '--watch-preserve-output',
+  '--watch-kill-signal', '--experimental-test-coverage']);
+// The runtime options of the internal module hooks worker: runtime policy, not
+// entry-point execution or preloads that would register another hooks worker.
+// Module mocking is CLI-only, but remains runtime policy in hook workers.
 function loaderWorkerArguments(args) {
   const result = [];
-  for (let index = 0; index < args.length; index++) {
-    const arg = normalizeOption(args[index]), separator = arg.indexOf('=');
-    const name = separator < 0 ? arg : arg.slice(0, separator);
-    const optionalPrint = (name === '-p' || name === '--print') &&
-      (args[index + 1] === undefined || args[index + 1].startsWith('-'));
-    const value = separator < 0 && workerOptions.get(name) && !optionalPrint ? args[++index] : undefined;
-    // The internal worker gets runtime policy, not entry-point execution or
-    // preloads that would recursively register another hook worker.
-    // Module mocking is CLI-only, but remains runtime policy in hook workers.
-    const moduleMocks = name === '--experimental-test-module-mocks' || name === '--no-experimental-test-module-mocks';
-    if ((!environmentOptions.has(name) && !moduleMocks) || processOption(name) ||
-        inspectorEnableOptions.has(name) || isInspectorValueOption(name) ||
-        ['--no-inspect', '--no-inspect-brk', '--no-inspect-wait'].includes(name) ||
-        ['-r', '--require', '--import', '--input-type', '--watch', '--no-watch', '--watch-path',
-          '--watch-preserve-output', '--no-watch-preserve-output', '--watch-kill-signal',
-          '--experimental-test-coverage', '--no-experimental-test-coverage'].includes(name) ||
-        name.startsWith('--test-coverage-')) continue;
-    result.push(arg);
-    if (value !== undefined) result.push(value);
+  for (const entry of parseArguments(args, false).entries) {
+    const { name } = entry;
+    if (entry.implied || entry.type === undefined) continue;
+    const flag = optionFlag(entry);
+    // Process-wide options already hold for every thread, and a Worker may not be given them.
+    const [, allowedInEnvironment, , perProcess] = table.options.get(name);
+    if ((!allowedInEnvironment && name !== '--experimental-test-module-mocks') || perProcess || processOption(flag.split('=', 1)[0]) ||
+        loaderWorkerExcluded.has(name) || name.startsWith('--test-coverage-')) continue;
+    result.push(flag);
   }
   return result;
 }
@@ -292,13 +280,33 @@ function getOptionValue(name) {
     case '--inspect-port': return { host: host.inspectorOptions?.host ?? '127.0.0.1', port: host.inspectorOptions?.port ?? 9229 };
     case '--localstorage-file': return host.localStorageFile;
     case '--experimental-print-required-tla': return !!host.printRequiredTLA;
-    default: return startupControls.getOptionValue(name) ?? tlsOptions.getOptionValue(name);
+    default: return startupControls.getOptionValue(name) ?? require('internal/tls/options').getOptionValue(name);
   }
 }
 
+// Node's process.allowedNodeEnvironmentFlags (lib/internal/process/per_thread.js).
 function buildAllowedFlags() {
-  // V8 accepts --no-expose-gc but only advertises its positive flag.
-  const array = [...environmentOptions.keys()].filter(name => name !== '--no-expose-gc');
+  const array = [];
+  for (const [name, [type, allowed]] of table.options) {
+    // Bracketed names are internal parser targets for aliases, not flags.
+    if (!allowed || name[0] === '[') continue;
+    array.push(name);
+    if (type === 'Boolean') array.push('--no-' + name.slice(2));
+  }
+  const accepted = to => {
+    if (!to.startsWith('-') || to === '--') return true;
+    const expansion = table.aliases.get(to);
+    if (expansion) return (expansion[0] === to ? expansion.slice(1) : expansion).every(accepted);
+    return table.options.get(to)?.[1] === true;
+  };
+  for (const [from, expansion] of table.aliases) {
+    if (!expansion.every(accepted)) continue;
+    let canonical = from;
+    if (canonical.endsWith('=')) canonical = canonical.slice(0, -1);
+    if (canonical.endsWith(' <arg>')) canonical = canonical.slice(0, -6);
+    array.push(canonical);
+  }
+  // has() takes a flag with or without its dashes, `_` for `-` and an =value.
   const names = new Set(array);
   const undashed = new Set(array.map(name => name.replace(/^-+/, '')));
   // Keep the actual Set storage empty, as Node does: even borrowed intrinsic
@@ -326,4 +334,4 @@ function buildAllowedFlags() {
   return Object.freeze(new NodeEnvironmentFlagsSet());
 }
 
-module.exports = { optionTypes, getCLIOptionsInfo, normalizeOption, parseEnvironment, validateEnvironment, validateWorker, processOption, getOptionValue, environmentFiles, loaderWorkerArguments, buildAllowedFlags, applyInspectorOption, isInspectorValueOption };
+module.exports = { optionTypes, envVarSettings, getCLIOptionsInfo, parseArguments, optionFlag, parseEnvironment, validateEnvironment, invalidWorkerArguments, processOption, getOptionValue, environmentFiles, loaderWorkerArguments, buildAllowedFlags, applyInspectorOption, isInspectorValueOption };

@@ -12,9 +12,6 @@ const booleanOptions = new Map([
 ]);
 const valueOptions = new Set(['--disable-warning', '--redirect-warnings', '--unhandled-rejections', '--stack-trace-limit']);
 const rejectionModes = new Set(['throw', 'strict', 'warn', 'warn-with-error-code', 'none']);
-const optionEntries = [];
-for (const name of booleanOptions.keys()) optionEntries.push([name, false], ['--no-' + name.slice(2), false]);
-for (const name of valueOptions) optionEntries.push([name, true]);
 const state = { warnings: true, deprecation: true, unhandledRejections: 'throw' };
 const disabledWarnings = new Set();
 let traceHelperShown = false;
@@ -159,8 +156,7 @@ function handleUncaught(error, origin) {
 }
 
 module.exports = {
-  optionEntries, valueError, applyOption, initialize, emitWarning, handleUncaught, traceExit,
-  isValueOption: name => valueOptions.has(name),
+  valueError, applyOption, initialize, emitWarning, handleUncaught, traceExit,
   setUncaughtExceptionCaptureCallback, hasUncaughtExceptionCaptureCallback: () => captureCallback !== null,
   getOptionValue(name) {
     if (name === '--unhandled-rejections') return state.unhandledRejections;
