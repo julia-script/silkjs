@@ -22,7 +22,7 @@ const {
   Uint8Array,
 } = require('internal/per_context/primordials');
 
-const { TextEncoder } = require('internal/web/encoding');
+const { TextEncoder } = require('internal/encoding');
 
 const {
   ReadableStream,

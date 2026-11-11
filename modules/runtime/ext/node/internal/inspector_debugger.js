@@ -157,10 +157,19 @@ function paused(payload) {
     }
     delivered = true;
     const reason = stepped && hits.length === 0 && payload.reason !== 'exception' ? 'step' : payload.reason || 'other';
-    session.emit('Debugger.paused', { callFrames: frames(session, source), reason, hitBreakpoints: hits });
+    const asyncStackTrace = data.asyncDepth > 0 ? asyncTasks().asyncStackTrace(data.asyncDepth) : undefined;
+    session.emit('Debugger.paused', { callFrames: frames(session, source), reason, hitBreakpoints: hits, ...(asyncStackTrace && { asyncStackTrace }) });
     if (!native(31)) break;
   }
   if (!delivered && !startup && native(31)) { native(27, 0); activePause = undefined; }
+}
+// V8 records async tasks for the deepest stack any enabled session asked for.
+let asyncModule;
+function asyncTasks() { return asyncModule ??= require('internal/inspector_async'); }
+function asyncDepth() {
+  let depth = 0;
+  for (const session of enabled) depth = Math.max(depth, state(session).asyncDepth);
+  asyncTasks().setDepth(depth);
 }
 function resumed() {
   activePause = undefined;
@@ -169,7 +178,9 @@ function resumed() {
 function close(session) {
   if (!enabled.delete(session)) return;
   session.values.releaseGroup('backtrace');
+  const recorded = session.debugger.asyncDepth > 0;
   session.debugger = undefined;
+  if (recorded) asyncDepth();
   rebuild();
   exceptionMode();
   if (enabled.size === 0 && !startupArmed) {
@@ -252,8 +263,7 @@ function dispatch(session, method, params) {
     case 'Debugger.pause': native(26); return {};
     case 'Debugger.setAsyncCallStackDepth':
       if (!Number.isInteger(params.maxDepth)) throw protocolError(-32602, 'Invalid parameters: maxDepth');
-      // Recorded only: paused frames carry no asyncStackTrace yet.
-      data.asyncDepth = Math.max(0, params.maxDepth); return {};
+      data.asyncDepth = Math.max(0, params.maxDepth); asyncDepth(); return {};
     case 'Debugger.setBlackboxPatterns': {
       if (!Array.isArray(params.patterns) || params.patterns.some(pattern => typeof pattern !== 'string')) throw protocolError(-32602, 'Invalid parameters: patterns');
       try { data.blackbox = params.patterns.map(pattern => new RegExp(pattern)); }
@@ -286,4 +296,4 @@ contexts.subscribe(context => {
   pendingScripts.delete(context.token);
   for (const script of pending) scriptParsed(script);
 });
-module.exports = { dispatch, close, paused, scriptParsed, armStartup };
+module.exports = { dispatch, close, paused, scriptParsed, armStartup, resourceURL };
