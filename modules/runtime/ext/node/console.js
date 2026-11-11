@@ -27,7 +27,11 @@ function direct(console, fd, name, args) {
   let text = plainText(args);
   if (text === undefined) return false;
   if (console._groupIndent !== '') text = console._groupIndent + text.replace(/\n/g, '\n' + console._groupIndent);
-  return require('internal/stdio').direct(fd, text + '\n');
+  const written = require('internal/stdio').direct(fd, text + '\n');
+  if (typeof written === 'boolean') return written;
+  // A pipe took part of the line: the rest follows it through the stream.
+  console._send(console[name], written);
+  return true;
 }
 function writeStdout(console, args) {
   if (!direct(console, 1, '_stdout', args)) console._write(console._stdout, formatWithOptions(console._options(console._stdout), ...args));
@@ -80,7 +84,9 @@ class Console {
     return Object.assign({ colors: this._colorMode === 'auto' ? !!stream.isTTY && (typeof stream.getColorDepth !== 'function' || stream.getColorDepth() > 1) : this._colorMode }, supplied);
   }
   _write(stream, text) {
-    text = this._groupIndent + text.replace(/\n/g, '\n' + this._groupIndent) + '\n';
+    this._send(stream, this._groupIndent + text.replace(/\n/g, '\n' + this._groupIndent) + '\n');
+  }
+  _send(stream, text) {
     if (!this._ignoreErrors) { stream.write(text); return; }
     let onError;
     if (typeof stream.once === 'function' && typeof stream.removeListener === 'function') {
