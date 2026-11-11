@@ -450,11 +450,18 @@ function deprecate(fn, msg, code, { modifyPrototype } = {}) {
 }
 
 
+const debugWarned = new Set();
 function debuglog(section, callback) {
   section = String(section).toUpperCase();
   let enabled;
   // NODE_DEBUG is read on first use, not when a module asks for its logger.
-  const initialize = () => { enabled = String(host.env.NODE_DEBUG || '').split(/[\s,]+/).filter(Boolean).some(pattern => new RegExp('^' + pattern.replace(/[|\\{}()[\]^$+?.]/g, '\\$&').replace(/\*/g, '.*') + '$', 'i').test(section)); };
+  const initialize = () => { enabled = String(host.env.NODE_DEBUG || '').split(/[\s,]+/).filter(Boolean).some(pattern => new RegExp('^' + pattern.replace(/[|\\{}()[\]^$+?.]/g, '\\$&').replace(/\*/g, '.*') + '$', 'i').test(section));
+    // Like Node's debuglogImpl, the first enabled logger of http or http2 warns once.
+    if (enabled && (section === 'HTTP' || section === 'HTTP2') && !debugWarned.has(section)) {
+      debugWarned.add(section);
+      process.emitWarning(`Setting the NODE_DEBUG environment variable to '${section.toLowerCase()}' can expose sensitive data (such as passwords, tokens and authentication headers) in the resulting log.`);
+    }
+  };
   const write = (...args) => { if (enabled) host.stderr.write(section + ' ' + (globalThis.process ? process.pid : 0) + ': ' + format(...args) + '\n'); };
   Object.defineProperty(write, 'enabled', { enumerable: true, configurable: true, get: () => enabled });
   const quiet = function debug() {};
