@@ -902,6 +902,7 @@ function runtimeFlag(arg) {
   try {
     if (internalRequire('internal/permission').applyOption(arg) ||
         internalRequire('internal/startup_controls').applyOption(arg) ||
+        internalRequire('internal/tls/options').applyOption(arg) ||
         internalRequire('internal/heap_prof').applyOption(arg) ||
         internalRequire('internal/options').applyInspectorOption(arg)) return true;
   }
@@ -1182,7 +1183,8 @@ function run() {
         (arg.endsWith('=') && (internalRequire('internal/process_report').isValueOption(arg.slice(0, -1)) ||
           internalRequire('internal/startup_controls').isValueOption(arg.slice(0, -1)) ||
           internalRequire('internal/heap_prof').isValueOption(arg.slice(0, -1)) ||
-          internalRequire('internal/permission').isValueOption(arg.slice(0, -1))))) return cliError(arg + ' requires an argument');
+          internalRequire('internal/permission').isValueOption(arg.slice(0, -1)) ||
+          internalRequire('internal/tls/options').isValueOption(arg.slice(0, -1))))) return cliError(arg + ' requires an argument');
     if (runtimeFlag(arg)) { record(arg); continue; }
     if (arg === '--trace-event-categories' || arg === '--trace-event-file-pattern' || arg === '--localstorage-file' ||
         arg === '-r' || arg === '--require' || arg === '--import' || arg === '-C' || arg === '--conditions' ||
@@ -1191,6 +1193,7 @@ function run() {
         internalRequire('internal/startup_controls').isValueOption(arg) ||
         internalRequire('internal/heap_prof').isValueOption(arg) ||
         internalRequire('internal/permission').isValueOption(arg) ||
+        internalRequire('internal/tls/options').isValueOption(arg) ||
         internalRequire('internal/options').isInspectorValueOption(arg) ||
         arg === '--experimental-sea-config' || arg.startsWith('--experimental-sea-config=')) {
       const separator = arg.indexOf('=');
@@ -1342,6 +1345,8 @@ Environment:
     const separator = native.argv.indexOf('--', 1);
     return internalRequire('internal/main/run').runPackageScript(runName, separator < 0 ? [] : native.argv.slice(separator + 1));
   }
+  const tlsConflict = internalRequire('internal/tls/options').validate();
+  if (tlsConflict) return cliError(tlsConflict);
   if (watchMode && expression !== undefined) return cliError('either --watch or --eval can be used, not both');
   if (watchMode && check) return cliError('either --watch or --check can be used, not both');
   if (watchMode && interactive) return cliError('either --watch or --interactive can be used, not both');

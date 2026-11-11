@@ -14,7 +14,9 @@ class Server extends http.Server {
     // listener itself remains the inherited net.Server, including its accounting.
     this.removeAllListeners('connection');
     initialize(this, options);
-    this.on('secureConnection', socket => this._connection(socket));
+    // Node's HTTP parser consumes the TLS handle directly, so a socket paused by
+    // pauseOnConnect still reads; here the parser reads through 'data'.
+    this.on('secureConnection', socket => { this._connection(socket); socket.resume(); });
     this.on('tlsClientError', (err, socket) => { if (!this.emit('clientError', err, socket)) socket.destroy(); });
   }
   setSecureContext(options) { setSecureContext(this, options); }
