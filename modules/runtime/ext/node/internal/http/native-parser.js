@@ -158,12 +158,15 @@ class HTTPParser {
   }
   execute(buffer) {
     const state = live(this);
-    if (state.executing) throw error('ERR_INVALID_STATE', 'HTTP parser is already executing');
     if (!isArrayBufferView(buffer)) throw error('ERR_INVALID_ARG_TYPE', 'buffer must be an ArrayBuffer view');
+    // Like Node, a callback may execute the parser again (a socket that pushes its next data
+    // synchronously from 'information'); the outer execute then goes on with its own input.
+    const executing = state.executing;
+    const remaining = state.remaining;
     state.remaining = 0;
     state.executing = true;
     try { return normalize(state, native(3, state.id, buffer)); }
-    finally { state.executing = false; state.remaining = 0; }
+    finally { state.executing = executing; state.remaining = executing ? remaining : 0; }
   }
   finish() {
     const state = live(this);
