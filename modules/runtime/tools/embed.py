@@ -61,7 +61,7 @@ def generate(debug=True, environment=None):
     factories = []
     for name, path in sources():
         names.append(name)
-        factories.append('(function(module, exports, require) {\n' + path.read_text() + '\n})')
+        factories.append('(function(module, exports, require, process) {\n' + path.read_text() + '\n})')
     source = (ROOT / 'runtime/bootstrap.js').read_text()
     # The bootstrap is a function like every built-in, so its bytecode ships in the
     # same cache: one past the last built-in index. Only its two host imports need a
