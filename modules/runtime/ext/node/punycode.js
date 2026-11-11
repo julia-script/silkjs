@@ -1,6 +1,18 @@
 // Vendored punycode.js 2.3.1 (MIT); license: ext/web/vendor/punycode-LICENSE.
 'use strict';
 
+// Node's lib/punycode.js warns outside node_modules before the vendored code.
+const { isInsideNodeModules } = require('internal/inside_node_modules');
+
+if (!isInsideNodeModules()) {
+	process.emitWarning(
+		'The `punycode` module is deprecated. Please use a userland ' +
+		'alternative instead.',
+		'DeprecationWarning',
+		'DEP0040',
+	);
+}
+
 /** Highest positive signed 32-bit float value */
 const maxInt = 2147483647; // aka. 0x7FFFFFFF or 2^31-1
 

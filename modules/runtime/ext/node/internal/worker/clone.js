@@ -331,10 +331,18 @@ function decode(envelope, realm) {
   catch (error) { for (const port of deserializer.ports) portHooks.close(port); throw error; }
 }
 function structuredClone(value, options) {
-  if (arguments.length === 0) throw codedError('ERR_MISSING_ARGS', 'The value argument must be specified');
-  if (options != null && !object(options)) throw codedError('ERR_INVALID_ARG_TYPE', 'The options argument must be an object');
+  // Node checks its arguments in C++ with WebIDL's converter messages.
+  if (arguments.length === 0) throw codedError('ERR_MISSING_ARGS', 'The "value" argument must be specified');
+  const prefix = "Failed to execute 'structuredClone'";
+  if (options != null && !object(options)) {
+    throw codedError('ERR_INVALID_ARG_TYPE', `${prefix}: Options cannot be converted to a dictionary`);
+  }
+  const transfer = options?.transfer;
+  if (transfer !== undefined && (!object(transfer) || typeof transfer[Symbol.iterator] !== 'function')) {
+    throw codedError('ERR_INVALID_ARG_TYPE', `${prefix}: transfer in Options cannot be converted to sequence.`);
+  }
   let prepared;
-  try { prepared = prepare(value, options?.transfer); }
+  try { prepared = prepare(value, transfer); }
   catch (error) {
     if (error?.code === 'ERR_INVALID_TRANSFER_OBJECT' || error?.code === 'ERR_MISSING_TRANSFERABLE_IN_TRANSFER_LIST')
       throw cloneError(error.message);
