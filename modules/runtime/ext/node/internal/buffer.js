@@ -30,7 +30,9 @@ const {
     ERR_INVALID_ARG_TYPE,
     ERR_OUT_OF_RANGE,
   },
-  validateNumber,
+} = require('internal/errors');
+const { validateNumber } = require('internal/validators');
+const {
   asciiSlice,
   base64Slice,
   base64urlSlice,

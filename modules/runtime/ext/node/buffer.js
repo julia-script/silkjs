@@ -54,6 +54,8 @@ const {
   base64urlWrite,
   hexWrite,
   ucs2Write,
+} = require('internal/buffer_binding');
+const {
   codes: {
     ERR_BUFFER_OUT_OF_BOUNDS,
     ERR_INVALID_ARG_TYPE,
@@ -64,21 +66,25 @@ const {
     ERR_UNKNOWN_ENCODING,
   },
   genericNodeError,
-  normalizeEncoding,
+} = require('internal/errors');
+const {
+  customInspectSymbol,
   encodingsMap,
+  normalizeEncoding,
+} = require('internal/util');
+const {
   validateArray,
   validateBuffer,
   validateInteger,
   validateNumber,
   validateString,
-} = require('internal/buffer_binding');
+} = require('internal/validators');
 const {
   isAnyArrayBuffer,
   isArrayBufferView,
   isUint8Array,
   isTypedArray,
 } = require('util/types');
-const customInspectSymbol = Symbol.for('nodejs.util.inspect.custom');
 const validateOffset = (value, name, min = 0, max = kMaxLength) =>
   validateInteger(value, name, min, max);
 

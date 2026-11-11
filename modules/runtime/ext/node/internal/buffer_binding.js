@@ -27,14 +27,12 @@
 // encode/decode go through the runtime's native Buffer codec (host 18); the
 // rest is plain byte work on Uint8Array views.
 //
-// The error codes and validators below are the subset of Node's
-// internal/errors and internal/validators that Buffer needs, with Node's
-// messages. They are kept here until those shared modules land.
 
 const host = require('internal/host');
 const { bufferCodec } = host;
 const types = require('util/types');
-const { ERR_INVALID_ARG_TYPE } = require('internal/path_events/support').codes;
+const { codes: { ERR_BUFFER_OUT_OF_BOUNDS } } = require('internal/errors');
+const { encodingsMap, normalizeEncoding } = require('internal/util');
 
 // Node's limits on 64-bit hosts. A Buffer longer than the engine can back
 // (16 GiB) fails with the engine's ArrayBuffer RangeError. kStringMaxLength is
@@ -43,173 +41,19 @@ const { ERR_INVALID_ARG_TYPE } = require('internal/path_events/support').codes;
 const kMaxLength = 2 ** 53 - 1;
 const kStringMaxLength = 0x1fffffe8;
 
-let inspect;
-function lazyInspect(value) {
-  inspect ??= require('internal/util_inspect').inspect;
-  return inspect(value);
-}
-function makeError(Base, code, message) {
-  const error = new Base(message);
-  Object.defineProperty(error, 'code', { value: code, enumerable: true, writable: true, configurable: true });
+// node_buffer.cc's own THROW_ERR_OUT_OF_RANGE, which takes the whole message.
+function cxxOutOfRange(message) {
+  const error = new RangeError(message);
+  Object.defineProperty(error, 'code', { value: 'ERR_OUT_OF_RANGE', enumerable: true, writable: true, configurable: true });
   return error;
 }
-function addNumericalSeparator(val) {
-  let res = '';
-  let i = val.length;
-  const start = val[0] === '-' ? 1 : 0;
-  for (; i >= start + 4; i -= 3) res = `_${val.slice(i - 3, i)}${res}`;
-  return `${val.slice(0, i)}${res}`;
-}
-class ERR_OUT_OF_RANGE extends RangeError {
-  constructor(str, range, input, replaceDefaultBoolean = false) {
-    let msg = replaceDefaultBoolean ? str : `The value of "${str}" is out of range.`;
-    let received;
-    if (Number.isInteger(input) && Math.abs(input) > 2 ** 32) {
-      received = addNumericalSeparator(String(input));
-    } else if (typeof input === 'bigint') {
-      received = String(input);
-      if (input > 2n ** 32n || input < -(2n ** 32n)) received = addNumericalSeparator(received);
-      received += 'n';
-    } else {
-      received = lazyInspect(input);
-    }
-    super(`${msg} It must be ${range}. Received ${received}`);
-    this.code = 'ERR_OUT_OF_RANGE';
-  }
-}
-class ERR_BUFFER_OUT_OF_BOUNDS extends RangeError {
-  constructor(name = undefined) {
-    super(name ? `"${name}" is outside of buffer bounds` : 'Attempt to access memory outside buffer bounds');
-    this.code = 'ERR_BUFFER_OUT_OF_BOUNDS';
-  }
-}
-function invalidArgValueMessage(name, value, reason = 'is invalid') {
-  let inspected = lazyInspect(value);
-  if (inspected.length > 128) inspected = `${inspected.slice(0, 128)}...`;
-  return `The ${name.includes('.') ? 'property' : 'argument'} '${name}' ${reason}. Received ${inspected}`;
-}
-class ERR_INVALID_ARG_VALUE extends TypeError {
-  constructor(name, value, reason) {
-    super(invalidArgValueMessage(name, value, reason));
-    this.code = 'ERR_INVALID_ARG_VALUE';
-  }
-}
-class ERR_INVALID_BUFFER_SIZE extends RangeError {
-  constructor(size) {
-    super(`Buffer size must be a multiple of ${size}`);
-    this.code = 'ERR_INVALID_BUFFER_SIZE';
-  }
-}
-class ERR_MISSING_ARGS extends TypeError {
-  constructor(...args) {
-    let msg = 'The ';
-    const wrap = (a) => `"${a}"`;
-    args = args.map((a) => (Array.isArray(a) ? a.map(wrap).join(' or ') : wrap(a)));
-    switch (args.length) {
-      case 1: msg += `${args[0]} argument`; break;
-      case 2: msg += `${args[0]} and ${args[1]} arguments`; break;
-      default: msg += `${args.slice(0, -1).join(', ')}, and ${args[args.length - 1]} arguments`; break;
-    }
-    super(`${msg} must be specified`);
-    this.code = 'ERR_MISSING_ARGS';
-  }
-}
-class ERR_UNKNOWN_ENCODING extends TypeError {
-  constructor(encoding) {
-    super(require('util').format('Unknown encoding: %s', encoding));
-    this.code = 'ERR_UNKNOWN_ENCODING';
-  }
-}
+// ERR_STRING_TOO_LONG is raised by node_buffer.cc itself (node_errors.h).
 class ERR_STRING_TOO_LONG extends Error {
   constructor() {
     super(`Cannot create a string longer than 0x${kStringMaxLength.toString(16)} characters`);
     this.code = 'ERR_STRING_TOO_LONG';
   }
 }
-for (const E of [ERR_OUT_OF_RANGE, ERR_BUFFER_OUT_OF_BOUNDS, ERR_INVALID_ARG_VALUE, ERR_INVALID_BUFFER_SIZE,
-  ERR_MISSING_ARGS, ERR_UNKNOWN_ENCODING, ERR_STRING_TOO_LONG]) {
-  // Instances report the base class name, as Node's errors do.
-  Object.defineProperty(E.prototype, 'name', {
-    value: Object.getPrototypeOf(E.prototype).constructor.name, writable: true, configurable: true,
-  });
-}
-
-function validateNumber(value, name, min = undefined, max) {
-  if (typeof value !== 'number') throw new ERR_INVALID_ARG_TYPE(name, 'number', value);
-  if ((min != null && value < min) || (max != null && value > max) ||
-      ((min != null || max != null) && Number.isNaN(value))) {
-    throw new ERR_OUT_OF_RANGE(
-      name,
-      `${min != null ? `>= ${min}` : ''}${min != null && max != null ? ' && ' : ''}${max != null ? `<= ${max}` : ''}`,
-      value);
-  }
-}
-function validateInteger(value, name, min = Number.MIN_SAFE_INTEGER, max = Number.MAX_SAFE_INTEGER) {
-  if (typeof value !== 'number') throw new ERR_INVALID_ARG_TYPE(name, 'number', value);
-  if (!Number.isInteger(value)) throw new ERR_OUT_OF_RANGE(name, 'an integer', value);
-  if (value < min || value > max) throw new ERR_OUT_OF_RANGE(name, `>= ${min} && <= ${max}`, value);
-}
-function validateArray(value, name) {
-  if (!Array.isArray(value)) throw new ERR_INVALID_ARG_TYPE(name, 'Array', value);
-}
-function validateString(value, name) {
-  if (typeof value !== 'string') throw new ERR_INVALID_ARG_TYPE(name, 'string', value);
-}
-function validateBuffer(buffer, name = 'buffer') {
-  if (!ArrayBuffer.isView(buffer)) throw new ERR_INVALID_ARG_TYPE(name, ['Buffer', 'TypedArray', 'DataView'], buffer);
-}
-
-// Node's internal/util normalizeEncoding.
-function normalizeEncoding(enc) {
-  if (enc == null || enc === 'utf8' || enc === 'utf-8') return 'utf8';
-  return slowCases(enc);
-}
-function slowCases(enc) {
-  switch (enc.length) {
-    case 4:
-      if (enc === 'UTF8') return 'utf8';
-      if (enc === 'ucs2' || enc === 'UCS2') return 'utf16le';
-      enc = `${enc}`.toLowerCase();
-      if (enc === 'utf8') return 'utf8';
-      if (enc === 'ucs2') return 'utf16le';
-      break;
-    case 3:
-      if (enc === 'hex' || enc === 'HEX' || `${enc}`.toLowerCase() === 'hex') return 'hex';
-      break;
-    case 5:
-      if (enc === 'ascii') return 'ascii';
-      if (enc === 'ucs-2') return 'utf16le';
-      if (enc === 'UTF-8') return 'utf8';
-      if (enc === 'ASCII') return 'ascii';
-      if (enc === 'UCS-2') return 'utf16le';
-      enc = `${enc}`.toLowerCase();
-      if (enc === 'utf-8') return 'utf8';
-      if (enc === 'ascii') return 'ascii';
-      if (enc === 'ucs-2') return 'utf16le';
-      break;
-    case 6:
-      if (enc === 'base64') return 'base64';
-      if (enc === 'latin1' || enc === 'binary') return 'latin1';
-      if (enc === 'BASE64') return 'base64';
-      if (enc === 'LATIN1' || enc === 'BINARY') return 'latin1';
-      enc = `${enc}`.toLowerCase();
-      if (enc === 'base64') return 'base64';
-      if (enc === 'latin1' || enc === 'binary') return 'latin1';
-      break;
-    case 7:
-      if (enc === 'utf16le' || enc === 'UTF16LE' || `${enc}`.toLowerCase() === 'utf16le') return 'utf16le';
-      break;
-    case 8:
-      if (enc === 'utf-16le' || enc === 'UTF-16LE' || `${enc}`.toLowerCase() === 'utf-16le') return 'utf16le';
-      break;
-    case 9:
-      if (enc === 'base64url' || enc === 'BASE64URL' || `${enc}`.toLowerCase() === 'base64url') return 'base64url';
-      break;
-    default:
-      if (enc === '') return 'utf8';
-  }
-}
-const encodingsMap = { __proto__: null, ascii: 0, utf8: 1, base64: 2, utf16le: 3, latin1: 4, hex: 5, buffer: 6, base64url: 7 };
 
 function bufferError() {
   const error = new TypeError('argument must be a buffer');
@@ -458,8 +302,8 @@ function compareOffset(source, target, targetStart, sourceStart, targetEnd, sour
   sourceStart = arrayIndex(sourceStart, 0);
   targetEnd = arrayIndex(targetEnd, t.byteLength);
   sourceEnd = arrayIndex(sourceEnd, s.byteLength);
-  if (sourceStart > s.byteLength) throw makeError(RangeError, 'ERR_OUT_OF_RANGE', 'The value of "sourceStart" is out of range.');
-  if (targetStart > t.byteLength) throw makeError(RangeError, 'ERR_OUT_OF_RANGE', 'The value of "targetStart" is out of range.');
+  if (sourceStart > s.byteLength) throw cxxOutOfRange('The value of "sourceStart" is out of range.');
+  if (targetStart > t.byteLength) throw cxxOutOfRange('The value of "targetStart" is out of range.');
   const count = Math.min(sourceEnd - sourceStart, targetEnd - targetStart, s.byteLength - sourceStart, t.byteLength - targetStart);
   const val = count > 0 ? compareBytes(s, sourceStart, t, targetStart, count) : 0;
   return normalizeCompareVal(val, sourceEnd - sourceStart, targetEnd - targetStart);
@@ -643,24 +487,7 @@ const untransferable = new WeakSet();
 module.exports = {
   kMaxLength,
   kStringMaxLength,
-  codes: {
-    ERR_BUFFER_OUT_OF_BOUNDS,
-    ERR_INVALID_ARG_TYPE,
-    ERR_INVALID_ARG_VALUE,
-    ERR_INVALID_BUFFER_SIZE,
-    ERR_MISSING_ARGS,
-    ERR_OUT_OF_RANGE,
-    ERR_STRING_TOO_LONG,
-    ERR_UNKNOWN_ENCODING,
-  },
-  genericNodeError: (message, properties) => Object.assign(new Error(message), properties),
-  validateArray,
-  validateBuffer,
-  validateInteger,
-  validateNumber,
-  validateString,
-  normalizeEncoding,
-  encodingsMap,
+  ERR_STRING_TOO_LONG,
   asciiSlice,
   base64Slice,
   base64urlSlice,

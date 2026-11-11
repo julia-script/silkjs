@@ -88,6 +88,8 @@ class FileHandle extends EventEmitter {
   }
 }
 if (Symbol.asyncDispose) FileHandle.prototype[Symbol.asyncDispose] = FileHandle.prototype.close;
+// http2 respondWithFD() accepts a FileHandle as well as a descriptor.
+c.FileHandle = FileHandle;
 promises.open = async function open(path, flags = 'r', mode) { return new FileHandle(await invoke('open', [path, flags, mode])); };
 // FileHandle overloads remain owned by the handle; a borrowed numeric descriptor
 // is not accepted by fs/promises readFile/writeFile in place of a path.

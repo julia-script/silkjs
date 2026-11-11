@@ -24,15 +24,10 @@
 
 const { Buffer } = require('buffer');
 const {
-  codes: { ERR_INVALID_ARG_TYPE, ERR_UNKNOWN_ENCODING },
-  normalizeEncoding,
-} = require('internal/buffer_binding');
+  codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_THIS, ERR_UNKNOWN_ENCODING },
+} = require('internal/errors');
+const { normalizeEncoding } = require('internal/util');
 const state = new WeakMap();
-function invalidThis() {
-  const error = new TypeError('Value of "this" must be of type StringDecoder');
-  error.code = 'ERR_INVALID_THIS';
-  return error;
-}
 function StringDecoder(encoding) {
   this.encoding = normalizeEncoding(encoding);
   if (this.encoding === undefined) throw new ERR_UNKNOWN_ENCODING(encoding);
@@ -40,7 +35,7 @@ function StringDecoder(encoding) {
 }
 function getState(self) {
   const s = state.get(self);
-  if (!s) throw invalidThis();
+  if (!s) throw new ERR_INVALID_THIS('StringDecoder');
   return s;
 }
 function utf8Tail(bytes) {

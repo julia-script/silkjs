@@ -113,7 +113,7 @@ function query(worker, message) {
     if (handles.get(key) !== entry) return;
     try {
       const kind = options.fd === undefined ? (options.path === undefined ? 1 : 2) : native('guessHandleType', [options.fd]);
-      server._transport = new Transport(kind, () => {});
+      server._transport = new Transport(kind, server, () => {});
       let status = options.fd === undefined ? server._transport.call('bind', address, options.port || 0, options.ipv6Only ? 1 : 0) :
         server._transport.call('open', options.fd);
       if (status < 0) { failed(nativeError(status, 'bind', address, options.port)); return; }

@@ -69,6 +69,8 @@ for (const name of ['dispose', 'asyncDispose']) {
 }
 const host = { ...native, rawOS, rawStd };
 host.builtinLoaded = moduleHas;
+// Whether a built-in id (public or internal) exists, loaded or not: Node's BuiltinModule.exists.
+host.builtinExists = Map.prototype.has.bind(factories);
 // Source maps are off until something loads the module to switch them on, so
 // registering a source before that only matters when coverage wants every map.
 host.registerSource = (filename, source, metadata) => {
@@ -153,17 +155,21 @@ host.initializeRealmBuiltins = (handle, global, wasmCodeGeneration) => {
     value: load('internal/web/wasm').WebAssembly, writable: true, configurable: true,
   });
 };
-const errnoNames = new Map();
+const errnoNames = new Map(), errnoMessages = new Map();
 {
   // QuickJS's std.Error exposes only a subset of POSIX errno constants.
   // Reuse the complete platform libuv table also used by node:util.
   const errors = native.utilErrorMap();
-  for (let index = 0; index < errors.length; index += 3)
+  for (let index = 0; index < errors.length; index += 3) {
     errnoNames.set(-errors[index], errors[index + 1]);
+    errnoMessages.set(-errors[index], errors[index + 2]);
+  }
 }
 function systemError(errno, syscall, path, dest) {
   const number = Math.abs(errno), code = errnoNames.get(number) || 'UNKNOWN';
-  const error = new Error(code + ': ' + rawStd.strerror(number) + ', ' + syscall + (path === undefined ? '' : " '" + path + "'"));
+  const message = errnoMessages.get(number) || rawStd.strerror(number);
+  const error = new Error(code + ': ' + message + ', ' + syscall + (path === undefined ? '' : " '" + path + "'") +
+    (dest === undefined ? '' : " -> '" + dest + "'"));
   Object.assign(error, { errno: -number, code, syscall });
   if (path !== undefined) error.path = path;
   if (dest !== undefined) error.dest = dest;
@@ -241,7 +247,7 @@ const completionsPending = () => completions.length !== completionHead;
 // callbacks are I/O completions, not microtasks. Dispatch them outside drainJobs.
 host.enqueueIOCompletion = callback => completions.push(callback);
 host.nextTick = (callback, ...args) => {
-  if (typeof callback !== 'function') throw Object.assign(new TypeError('The callback argument must be a function'), { code: 'ERR_INVALID_ARG_TYPE' });
+  if (typeof callback !== 'function') throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('callback', 'function', callback);
   ticks.push(callback, args, resource('TickObject'));
 };
 host.queueMicrotask = callback => {
@@ -255,7 +261,9 @@ let nextTimer = 1;
 const timers = new Map();
 const immediates = new Map();
 const executingTimers = [];
-function checkCallback(callback) { if (typeof callback !== 'function') throw Object.assign(new TypeError('The callback argument must be a function'), { code: 'ERR_INVALID_ARG_TYPE' }); }
+function checkCallback(callback) {
+  if (typeof callback !== 'function') throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('callback', 'function', callback);
+}
 function invoke(callback, receiver, args) {
   try { return Reflect.apply(callback, receiver, args); }
   catch (error) {
@@ -401,7 +409,7 @@ function clearImmediate(immediate) {
   immediate[kTimerResource].emitDestroy();
 }
 function validateCallback(callback) {
-  if (typeof callback !== 'function') throw new (internalRequire('internal/path_events/support').codes.ERR_INVALID_ARG_TYPE)('callback', 'function', callback);
+  if (typeof callback !== 'function') throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('callback', 'function', callback);
 }
 const timerAPI = {
   setTimeout(callback, after, ...args) { validateCallback(callback); return new Timeout(callback, after, args.length ? args : undefined, false); },
@@ -506,6 +514,8 @@ const ProcessConstructor = { process: function () {} }.process;
 Object.setPrototypeOf(ProcessConstructor.prototype, EventEmitter.prototype);
 const process = Object.create(ProcessConstructor.prototype);
 EventEmitter.call(process);
+// As Node's bootstrap/node.js: Object.prototype.toString reports [object process].
+Object.defineProperty(process, Symbol.toStringTag, { value: 'process', writable: true, enumerable: false, configurable: false });
 defineGlobalAccessor('process', process);
 let startTime = native.runtimeStartTime;
 const performanceMilestones = {
@@ -571,9 +581,15 @@ Object.assign(process, {
     sourceUrl: `https://nodejs.org/download/release/v${nodeVersion}/node-v${nodeVersion}.tar.gz`,
     headersUrl: `https://nodejs.org/download/release/v${nodeVersion}/node-v${nodeVersion}-headers.tar.gz`,
   }, stdout: host.stdout, stderr: host.stderr,
-  cwd: host.cwd, chdir(path) { const code = rawOS.chdir(path); if (code < 0) throw systemError(code, 'chdir', path); },
+  cwd: host.cwd,
+  chdir(directory) {
+    internalRequire('internal/validators').validateString(directory, 'directory');
+    const code = rawOS.chdir(directory);
+    // Node reports the directory it was in as the path and the target as dest.
+    if (code < 0) throw systemError(code, 'chdir', host.cwd(), directory);
+  },
   nextTick: host.nextTick, uptime: () => (native.now() - startTime) / 1000,
-  hrtime(previous) { const nanoseconds = native.nowNanoseconds(); const value = [Number(nanoseconds / 1000000000n), Number(nanoseconds % 1000000000n)]; if (previous !== undefined) { if (!Array.isArray(previous)) throw Object.assign(new TypeError('The time argument must be an Array'), { code: 'ERR_INVALID_ARG_TYPE' }); if (previous.length !== 2) throw Object.assign(new RangeError('The time argument must contain two entries'), { code: 'ERR_OUT_OF_RANGE' }); value[0] -= previous[0]; value[1] -= previous[1]; if (value[1] < 0) { value[0]--; value[1] += 1000000000; } } return value; },
+  hrtime(previous) { const nanoseconds = native.nowNanoseconds(); const value = [Number(nanoseconds / 1000000000n), Number(nanoseconds % 1000000000n)]; if (previous !== undefined) { if (!Array.isArray(previous)) throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('time', 'Array', previous); if (previous.length !== 2) throw new (internalRequire('internal/errors').codes.ERR_OUT_OF_RANGE)('time', 2, previous.length); value[0] -= previous[0]; value[1] -= previous[1]; if (value[1] < 0) { value[0]--; value[1] += 1000000000; } } return value; },
   emitWarning: internalRequire('internal/startup_controls').emitWarning,
   setUncaughtExceptionCaptureCallback: internalRequire('internal/startup_controls').setUncaughtExceptionCaptureCallback,
   hasUncaughtExceptionCaptureCallback: internalRequire('internal/startup_controls').hasUncaughtExceptionCaptureCallback,
@@ -585,18 +601,15 @@ Object.assign(process, {
   // What process.exit ends with; replaceable, as in Node.
   reallyExit(code) { internalRequire('internal/compile_cache').flushCompileCache(); rawStd.exit(code); },
   kill(pid, signal) {
-    if (pid != (pid | 0)) throw new (internalRequire('internal/path_events/support').codes.ERR_INVALID_ARG_TYPE)('pid', 'number', pid);
+    if (pid != (pid | 0)) throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('pid', 'number', pid);
     let number = signal;
     if (signal !== (signal | 0)) {
       signal ||= 'SIGTERM';
       number = internalRequire('os').constants.signals[signal];
-      if (number === undefined) throw Object.assign(new TypeError('Unknown signal: ' + signal), { code: 'ERR_UNKNOWN_SIGNAL' });
+      if (number === undefined) throw new (internalRequire('internal/errors').codes.ERR_UNKNOWN_SIGNAL)(signal);
     }
     const code = rawOS.kill(pid, number);
-    if (code < 0) {
-      const name = errnoNames.get(Math.abs(code)) || 'UNKNOWN';
-      throw Object.assign(new Error('kill ' + name), { errno: -Math.abs(code), code: name, syscall: 'kill' });
-    }
+    if (code < 0) throw new (internalRequire('internal/errors').ErrnoException)(-Math.abs(code), 'kill');
     return true;
   },
   // Formats like console.log and writes to fd 2 at once: no streams, ticks or console.
@@ -611,7 +624,7 @@ Object.assign(process, {
       if (code !== null && code !== undefined) {
         let value = code;
         if (typeof code === 'string' && code !== '' && Number.isInteger(+code)) value = +code;
-        internalRequire('internal/path_events/support').validateInteger(value, 'code');
+        internalRequire('internal/validators').validateInteger(value, 'code');
       }
       exitCode = code;
     },
@@ -797,6 +810,13 @@ const loader = internalRequire('internal/loader/loader').createLoader(host, publ
 host.loader = loader;
 host.vmCreateDefaultImporter = filename =>
   native.compileFunction('(specifier, attributes) => import(specifier, { with: attributes })', filename);
+let builtinRequire;
+process.getBuiltinModule = function getBuiltinModule(id) {
+  internalRequire('internal/validators').validateString(id, 'id');
+  if (!loader.Module.isBuiltin(id)) return undefined;
+  builtinRequire ||= loader.requireFor('/[builtin]', undefined, false);
+  return builtinRequire(id);
+};
 process.loadEnvFile = function loadEnvFile(path = undefined) { return internalRequire('internal/dotenv').loadEnvFile(path); };
 if (workerThreads.isMainThread && process.env.NODE_UNIQUE_ID !== undefined) internalRequire('cluster');
 Object.defineProperty(globalThis, '__silkModuleBridge', { value: loader.bridge });
@@ -815,6 +835,10 @@ function evaluateMain(source, name) {
 const requirePreloads = [], importPreloads = [];
 function runPreloads(entry, loadImports = true) {
   loader.Module._preloadModules(requirePreloads);
+  if (host.frozenIntrinsics) {
+    process.emitWarning('Frozen intristics is an experimental feature and might change at any time', 'ExperimentalWarning');
+    internalRequire('internal/freeze_intrinsics')();
+  }
   if (!loadImports || !importPreloads.length) return entry();
   const name = host.path.join(host.cwd(), '[preload]');
   let pending = Promise.resolve();
@@ -862,6 +886,14 @@ function runtimeFlag(arg) {
   if (arg === '--experimental-eventsource' || arg === '--no-experimental-eventsource') {
     host.experimentalEventSource = arg === '--experimental-eventsource'; return true;
   }
+  if (arg === '--experimental-websocket' || arg === '--no-experimental-websocket') {
+    host.experimentalWebSocket = arg === '--experimental-websocket'; return true;
+  }
+  if (arg === '--frozen-intrinsics') { host.frozenIntrinsics = true; return true; }
+  // V8's flag to run without a JIT: this engine is an interpreter, so it always holds.
+  if (arg === '--jitless') return true;
+  // Buffer.allocUnsafe memory is always zeroed here, which is what this flag asks for.
+  if (arg === '--zero-fill-buffers') { host.zeroFillBuffers = true; return true; }
   if (arg === '--experimental-webstorage' || arg === '--no-experimental-webstorage') {
     host.experimentalWebStorage = arg === '--experimental-webstorage'; return true;
   }
@@ -908,6 +940,10 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
   if (host.experimentalEventSource) Object.defineProperty(globalThis, 'EventSource', {
     value: internalRequire('internal/web/eventsource').EventSource, writable: true, configurable: true,
   });
+  if (host.experimentalWebSocket === false) {
+    delete globalThis.WebSocket;
+    delete globalThis.CloseEvent;
+  }
   if (host.experimentalWebStorage) internalRequire('internal/web/storage').install(globalThis, { localStorageFile: host.localStorageFile });
   if (workerThreads.isMainThread) internalRequire('internal/trace_events').initialize(host.traceOptions);
   if (workerThreads.isMainThread && host.traceSigint) internalRequire('util').setTraceSigInt(true);

@@ -1,0 +1,220 @@
+// Node.js v24.22.1 lib/internal/assert/myers_diff.js.
+// Copyright Joyent, Inc. and other Node contributors.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the
+// following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+// USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+'use strict';
+
+const {
+  ArrayPrototypePush,
+  Int32Array,
+  StringPrototypeEndsWith,
+} = require('internal/per_context/primordials');
+
+const {
+  codes: {
+    ERR_OUT_OF_RANGE,
+  },
+} = require('internal/errors');
+
+// Loaded on first use, as internal/util/colors refreshes from the process's
+// stderr and environment when it loads, and this module loads into the
+// runtime's heap image.
+let colors;
+function lazyColors() {
+  colors ??= require('internal/util/colors');
+  return colors;
+}
+
+const kNopLinesToCollapse = 5;
+const kOperations = {
+  DELETE: -1,
+  NOP: 0,
+  INSERT: 1,
+};
+
+function areLinesEqual(actual, expected, checkCommaDisparity) {
+  if (actual === expected) {
+    return true;
+  }
+  if (checkCommaDisparity) {
+    return (actual + ',') === expected || actual === (expected + ',');
+  }
+  return false;
+}
+
+function myersDiff(actual, expected, checkCommaDisparity = false) {
+  const actualLength = actual.length;
+  const expectedLength = expected.length;
+  const max = actualLength + expectedLength;
+
+  if (max > 2 ** 31 - 1) {
+    throw new ERR_OUT_OF_RANGE(
+      'myersDiff input size',
+      '< 2^31',
+      max,
+    );
+  }
+
+  const v = new Int32Array(2 * max + 1);
+  const trace = [];
+
+  for (let diffLevel = 0; diffLevel <= max; diffLevel++) {
+    ArrayPrototypePush(trace, new Int32Array(v)); // Clone the current state of `v`
+
+    for (let diagonalIndex = -diffLevel; diagonalIndex <= diffLevel; diagonalIndex += 2) {
+      const offset = diagonalIndex + max;
+      const previousOffset = v[offset - 1];
+      const nextOffset = v[offset + 1];
+      let x = diagonalIndex === -diffLevel || (diagonalIndex !== diffLevel && previousOffset < nextOffset) ?
+        nextOffset :
+        previousOffset + 1;
+      let y = x - diagonalIndex;
+
+      while (
+        x < actualLength &&
+        y < expectedLength &&
+        areLinesEqual(actual[x], expected[y], checkCommaDisparity)
+      ) {
+        x++;
+        y++;
+      }
+
+      v[offset] = x;
+
+      if (x >= actualLength && y >= expectedLength) {
+        return backtrack(trace, actual, expected, checkCommaDisparity);
+      }
+    }
+  }
+}
+
+function backtrack(trace, actual, expected, checkCommaDisparity) {
+  const actualLength = actual.length;
+  const expectedLength = expected.length;
+  const max = actualLength + expectedLength;
+
+  let x = actualLength;
+  let y = expectedLength;
+  const result = [];
+
+  for (let diffLevel = trace.length - 1; diffLevel >= 0; diffLevel--) {
+    const v = trace[diffLevel];
+    const diagonalIndex = x - y;
+    const offset = diagonalIndex + max;
+
+    let prevDiagonalIndex;
+    if (
+      diagonalIndex === -diffLevel ||
+      (diagonalIndex !== diffLevel && v[offset - 1] < v[offset + 1])
+    ) {
+      prevDiagonalIndex = diagonalIndex + 1;
+    } else {
+      prevDiagonalIndex = diagonalIndex - 1;
+    }
+
+    const prevX = v[prevDiagonalIndex + max];
+    const prevY = prevX - prevDiagonalIndex;
+
+    while (x > prevX && y > prevY) {
+      const actualItem = actual[x - 1];
+      const value = checkCommaDisparity && !StringPrototypeEndsWith(actualItem, ',') ? expected[y - 1] : actualItem;
+      ArrayPrototypePush(result, [ kOperations.NOP, value ]);
+      x--;
+      y--;
+    }
+
+    if (diffLevel > 0) {
+      if (x > prevX) {
+        ArrayPrototypePush(result, [ kOperations.INSERT, actual[--x] ]);
+      } else {
+        ArrayPrototypePush(result, [ kOperations.DELETE, expected[--y] ]);
+      }
+    }
+  }
+
+  return result;
+}
+
+function printSimpleMyersDiff(diff) {
+  let message = '';
+
+  for (let diffIdx = diff.length - 1; diffIdx >= 0; diffIdx--) {
+    const { 0: operation, 1: value } = diff[diffIdx];
+    let color = lazyColors().white;
+
+    if (operation === kOperations.INSERT) {
+      color = lazyColors().green;
+    } else if (operation === kOperations.DELETE) {
+      color = lazyColors().red;
+    }
+
+    message += `${color}${value}${lazyColors().white}`;
+  }
+
+  return `\n${message}`;
+}
+
+function printMyersDiff(diff, operator) {
+  let message = '';
+  let skipped = false;
+  let nopCount = 0;
+
+  for (let diffIdx = diff.length - 1; diffIdx >= 0; diffIdx--) {
+    const { 0: operation, 1: value } = diff[diffIdx];
+    const previousOperation = diffIdx < diff.length - 1 ? diff[diffIdx + 1][0] : null;
+
+    // Avoid grouping if only one line would have been grouped otherwise
+    if (previousOperation === kOperations.NOP && operation !== previousOperation) {
+      if (nopCount === kNopLinesToCollapse + 1) {
+        message += `${lazyColors().white}  ${diff[diffIdx + 1][1]}\n`;
+      } else if (nopCount === kNopLinesToCollapse + 2) {
+        message += `${lazyColors().white}  ${diff[diffIdx + 2][1]}\n`;
+        message += `${lazyColors().white}  ${diff[diffIdx + 1][1]}\n`;
+      } else if (nopCount >= kNopLinesToCollapse + 3) {
+        message += `${lazyColors().blue}...${lazyColors().white}\n`;
+        message += `${lazyColors().white}  ${diff[diffIdx + 1][1]}\n`;
+        skipped = true;
+      }
+      nopCount = 0;
+    }
+
+    if (operation === kOperations.INSERT) {
+      if (operator === 'partialDeepStrictEqual') {
+        message += `${lazyColors().gray}${lazyColors().hasColors ? ' ' : '+'} ${value}${lazyColors().white}\n`;
+      } else {
+        message += `${lazyColors().green}+${lazyColors().white} ${value}\n`;
+      }
+    } else if (operation === kOperations.DELETE) {
+      message += `${lazyColors().red}-${lazyColors().white} ${value}\n`;
+    } else if (operation === kOperations.NOP) {
+      if (nopCount < kNopLinesToCollapse) {
+        message += `${lazyColors().white}  ${value}\n`;
+      }
+      nopCount++;
+    }
+  }
+
+  message = message.trimEnd();
+
+  return { message: `\n${message}`, skipped };
+}
+
+module.exports = { myersDiff, printMyersDiff, printSimpleMyersDiff };
