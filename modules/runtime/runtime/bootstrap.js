@@ -1201,8 +1201,9 @@ Environment:
 }
 function referencedWork() {
   if (native.hasPendingIO()) return true;
-  for (const timer of timers.values()) if (timer._refed && !timer._destroyed) return true;
-  for (const timer of immediates.values()) if (timer._refed && !timer._destroyed) return true;
+  // Most I/O-bound turns have no timers: skip creating the iterators.
+  if (timers.size !== 0) for (const timer of timers.values()) if (timer._refed && !timer._destroyed) return true;
+  if (immediates.size !== 0) for (const timer of immediates.values()) if (timer._refed && !timer._destroyed) return true;
   return false;
 }
 function fireTimer(timer, collection) {
@@ -1239,7 +1240,7 @@ function pollTimeout(pendingPromise) {
   const referenced = referencedWork();
   if (!referenced && pendingPromise === undefined) return 0;
   let due = Infinity;
-  for (const timer of timers.values()) if (!timer._destroyed && timer._due < due) due = timer._due;
+  if (timers.size !== 0) for (const timer of timers.values()) if (!timer._destroyed && timer._due < due) due = timer._due;
   // A hook may await an unreferenced timer or an externally settled promise.
   // Keep nested waits interruptible without emitting main-loop lifecycle events.
   if (!referenced && due === Infinity) return 1;
@@ -1251,7 +1252,7 @@ function loopTurn(pendingPromise) {
   const now = native.now();
   // Only the due timers are ordered; most turns have none.
   let due;
-  for (const timer of timers.values()) if (!timer._destroyed && timer._due <= now) (due ||= []).push(timer);
+  if (timers.size !== 0) for (const timer of timers.values()) if (!timer._destroyed && timer._due <= now) (due ||= []).push(timer);
   if (due !== undefined) {
     if (due.length > 1) due.sort((a, b) => a._due - b._due || a._id - b._id);
     for (const timer of due) if (!timer._destroyed && timer._due <= now) fireTimer(timer, timers);
@@ -1259,7 +1260,7 @@ function loopTurn(pendingPromise) {
   native.pollIO(pollTimeout(pendingPromise));
   pollWorkers();
   checkpoint();
-  for (const listener of loopListeners) listener();
+  if (loopListeners.size !== 0) for (const listener of loopListeners) listener();
   if (immediates.size !== 0) {
     for (const timer of [...immediates.values()]) {
       if (!timer._destroyed) fireTimer(timer, immediates);
