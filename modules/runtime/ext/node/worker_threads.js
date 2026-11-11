@@ -483,7 +483,7 @@ function install(proc = process, metadata = bootstrap()) {
     if (!Number.isInteger(code)) throw clone().codedError('ERR_INVALID_ARG_TYPE', 'The code argument must be an integer');
     proc.exitCode = code;
     if (!exitRequested) { exitRequested = true; proc._exiting = true; proc.emit('exit', code); }
-    if (host.builtinLoaded('internal/compile_cache')) require('internal/compile_cache').flushCompileCache();
+    if (host.builtinLoaded('internal/compile_cache')) require('internal/compile_cache').flushAtExit();
     require('internal/startup_controls').traceExit(code, info.threadId);
     if (host.builtinLoaded('internal/heap_prof')) require('internal/heap_prof').finish();
     host.workerNative('requestExit', [code]);

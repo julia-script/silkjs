@@ -73,7 +73,7 @@ function compare(actual, expected, strict = true, skipPrototype = false, partial
         }
         if (!match(0)) return false;
       } else {
-        for (const predicate of ['isPromise', 'isWeakMap', 'isWeakSet', 'isModuleNamespaceObject']) if (types[predicate](a) || types[predicate](b)) return false;
+        for (const predicate of ['isPromise', 'isWeakMap', 'isWeakSet']) if (types[predicate](a) || types[predicate](b)) return false;
       }
       const ak = enumerable(a, strict), bk = enumerable(b, strict);
       if (!partial && ak.length !== bk.length) return false;
