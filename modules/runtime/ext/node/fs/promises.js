@@ -129,6 +129,8 @@ class FileHandle extends EventEmitter {
     }
   }
 }
+// http2 respondWithFD() accepts a FileHandle as well as a descriptor.
+c.FileHandle = FileHandle;
 require('internal/fs_iter').register(FileHandle, { kFd, kLocked, kRef, kUnref, kClosePromise, kCloseSync, invalidState });
 
 async function fsCall(fn, handle, ...args) {
