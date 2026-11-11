@@ -1209,6 +1209,12 @@ function createLoader(host, builtins) {
     return cause;
   }
 
+  // Node's ModuleJob.run: an import() or main entry whose evaluation threw a
+  // ReferenceError for a CommonJS name gets the ES module scope hint.
+  function moduleEvaluationError(key, cause) {
+    decorateModuleError(cause, keyName(key));
+  }
+
   function requireModuleEnabled() {
     return typeof host.requireModule === 'function' && !host.requireModuleDisabled;
   }
@@ -1294,7 +1300,13 @@ function createLoader(host, builtins) {
       }
       if (typeof host.evaluateModule !== 'function') throw error('ERR_METHOD_NOT_IMPLEMENTED', 'evaluateModule');
       const loaded = loadESM(resolved.filename);
-      return host.evaluateModule(loaded.source, loaded.filename, true);
+      let result;
+      try { result = host.evaluateModule(loaded.source, loaded.filename, true); }
+      catch (cause) { throw decorateModuleError(cause, resolved.filename); }
+      if (result !== null && typeof result === 'object' && typeof result.then === 'function') {
+        return result.then(undefined, (cause) => { throw decorateModuleError(cause, resolved.filename); });
+      }
+      return result;
     }
     return loadResolved(resolved, null, true, hooks.hasAsync());
   }
@@ -1606,7 +1618,7 @@ function createLoader(host, builtins) {
     return { source, format: resolved.format, filename: resolved.filename };
   }
 
-  return { decorateModuleError, resolveImport, importKey, moduleSource, requireFor, runMain, defaultRunMain, warmMain, resolve, resolveMain, loadESM, cleanSource, prepareSource, bridge, Module, mockModule };
+  return { decorateModuleError, moduleEvaluationError, resolveImport, importKey, moduleSource, requireFor, runMain, defaultRunMain, warmMain, resolve, resolveMain, loadESM, cleanSource, prepareSource, bridge, Module, mockModule };
 }
 
 module.exports = { createLoader };
