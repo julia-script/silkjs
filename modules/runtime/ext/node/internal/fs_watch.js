@@ -4,6 +4,7 @@
 // watcher keeps one native watcher per directory and symbolic link, as Node does there.
 const c = require('internal/fs_core');
 const v = require('internal/validators');
+const { AbortError, codes: { ERR_FS_WATCH_QUEUE_OVERFLOW, ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE } } = require('internal/errors');
 const { EventEmitter } = require('events');
 const { basename, join, relative, resolve, sep } = require('path');
 const kFSWatchStart = Symbol('kFSWatchStart');
@@ -11,11 +12,11 @@ const kFSWatchStart = Symbol('kFSWatchStart');
 function isRegExp(value) { return Object.prototype.toString.call(value) === '[object RegExp]'; }
 function validateIgnoreOptionElement(value, name) {
   if (typeof value === 'string') {
-    if (value.length === 0) throw v.ERR_INVALID_ARG_VALUE(name, value, 'must be a non-empty string');
+    if (value.length === 0) throw new ERR_INVALID_ARG_VALUE(name, value, 'must be a non-empty string');
     return;
   }
   if (isRegExp(value) || typeof value === 'function') return;
-  throw v.ERR_INVALID_ARG_TYPE(name, ['string', 'RegExp', 'Function'], value);
+  throw new ERR_INVALID_ARG_TYPE(name, ['string', 'RegExp', 'Function'], value);
 }
 function validateIgnoreOption(value, name) {
   if (value == null) return;
@@ -89,7 +90,7 @@ class RecursiveFSWatcher extends EventEmitter {
     if (signal != null) v.validateAbortSignal(signal, 'options.signal');
     if (throwIfNoEntry != null) v.validateBoolean(throwIfNoEntry, 'options.throwIfNoEntry');
     else throwIfNoEntry = true;
-    if (encoding != null && typeof encoding !== 'string') throw v.ERR_INVALID_ARG_VALUE('options.encoding', encoding);
+    if (encoding != null && typeof encoding !== 'string') throw new ERR_INVALID_ARG_VALUE('options.encoding', encoding);
     validateIgnoreOption(ignore, 'options.ignore');
     this.#ignoreMatcher = createIgnoreMatcher(ignore);
     this.#options = { persistent, recursive, signal, encoding, throwIfNoEntry };
@@ -200,7 +201,7 @@ class RecursiveFSWatcher extends EventEmitter {
   [Symbol.asyncIterator]() {
     const { signal } = this.#options;
     const executor = signal == null ? resolve => { this.once('change', (eventType, filename) => resolve({ value: { eventType, filename } })); } : (resolve, reject) => {
-      const onAbort = () => { this.close(); reject(v.abortError(signal)); };
+      const onAbort = () => { this.close(); reject(new AbortError(undefined, { cause: signal?.reason })); };
       if (signal.aborted) return onAbort();
       signal.addEventListener('abort', onAbort, { once: true });
       this.once('change', (eventType, filename) => { signal.removeEventListener('abort', onAbort); resolve({ value: { eventType, filename } }); });
@@ -241,7 +242,7 @@ function watch(filename, options, listener) {
 }
 
 function queueOverflow(maxQueue) {
-  return v.makeError(Error, 'ERR_FS_WATCH_QUEUE_OVERFLOW', `fs.watch() queued more than ${maxQueue} events`);
+  return new ERR_FS_WATCH_QUEUE_OVERFLOW(maxQueue);
 }
 async function* nativeWatch(filename, options = {}) {
   const path = c.path(filename);
@@ -253,8 +254,8 @@ async function* nativeWatch(filename, options = {}) {
   v.validateOneOf(overflow, 'options.overflow', ['ignore', 'error']);
   v.validateAbortSignal(signal, 'options.signal');
   validateIgnoreOption(ignore, 'options.ignore');
-  if (encoding && !Buffer.isEncoding(encoding)) throw v.ERR_INVALID_ARG_VALUE('encoding', encoding, 'is invalid encoding');
-  if (signal && signal.aborted) throw v.abortError(signal);
+  if (encoding && !Buffer.isEncoding(encoding)) throw new ERR_INVALID_ARG_VALUE('encoding', encoding, 'is invalid encoding');
+  if (signal && signal.aborted) throw new AbortError(undefined, { cause: signal?.reason });
   const ignoreMatcher = createIgnoreMatcher(ignore);
   let { promise, resolve: wake } = Promise.withResolvers();
   const queue = [];
@@ -283,7 +284,7 @@ async function* nativeWatch(filename, options = {}) {
       }
       ({ promise, resolve: wake } = Promise.withResolvers());
     }
-    if (signal && signal.aborted) throw v.abortError(signal);
+    if (signal && signal.aborted) throw new AbortError(undefined, { cause: signal?.reason });
   } finally {
     if (handle) handle.close();
     if (signal) signal.removeEventListener('abort', oncancel);

@@ -34,7 +34,7 @@ function pair(result, syscall, path) {
   return result[0];
 }
 const v = require('internal/validators');
-const { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_OUT_OF_RANGE } = v;
+const { AbortError, codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_INVALID_FILE_URL_HOST, ERR_INVALID_FILE_URL_PATH, ERR_INVALID_URL_SCHEME, ERR_OUT_OF_RANGE } } = require('internal/errors');
 // Legacy helpers for callers that state the expectation in words.
 function invalid(name, expected) { const e = new TypeError(`The "${name}" argument must be ${expected}`); e.code = 'ERR_INVALID_ARG_TYPE'; return e; }
 function range(name) { const e = new RangeError(`The value of "${name}" is out of range`); e.code = 'ERR_OUT_OF_RANGE'; return e; }
@@ -42,38 +42,38 @@ function integer(value, name, min = 0, max = Number.MAX_SAFE_INTEGER) { v.valida
 // Node's getValidatedPath: a string, a Uint8Array or a file: URL, without null bytes.
 function toPathIfFileURL(value) {
   if (value == null || typeof value !== 'object' || value.href === undefined || value.protocol === undefined) return value;
-  if (value.protocol !== 'file:') { const e = v.makeError(TypeError, 'ERR_INVALID_URL_SCHEME', 'The URL must be of scheme file'); throw e; }
-  if (value.hostname !== '' && value.hostname !== 'localhost') throw v.makeError(TypeError, 'ERR_INVALID_FILE_URL_HOST', `File URL host must be "localhost" or empty on ${process.platform}`);
+  if (value.protocol !== 'file:') { throw new ERR_INVALID_URL_SCHEME('file'); }
+  if (value.hostname !== '' && value.hostname !== 'localhost') throw new ERR_INVALID_FILE_URL_HOST(process.platform);
   const pathname = value.pathname;
   for (let n = 0; n < pathname.length; n++) {
-    if (pathname[n] === '%') { const third = pathname.codePointAt(n + 2) | 0x20; if (pathname[n + 1] === '2' && third === 102) throw v.makeError(TypeError, 'ERR_INVALID_FILE_URL_PATH', 'File URL path must not include encoded / characters'); }
+    if (pathname[n] === '%') { const third = pathname.codePointAt(n + 2) | 0x20; if (pathname[n + 1] === '2' && third === 102) throw new ERR_INVALID_FILE_URL_PATH('must not include encoded / characters'); }
   }
   return decodeURIComponent(pathname);
 }
 function path(value, name = 'path') {
   value = toPathIfFileURL(value);
   if (typeof value === 'string') {
-    if (value.includes('\0')) throw ERR_INVALID_ARG_VALUE(name, value, 'must be a string, Uint8Array, or URL without null bytes');
+    if (value.includes('\0')) throw new ERR_INVALID_ARG_VALUE(name, value, 'must be a string, Uint8Array, or URL without null bytes');
     return value;
   }
   if (value instanceof Uint8Array) {
-    if (value.includes(0)) throw ERR_INVALID_ARG_VALUE(name, value, 'must be a string, Uint8Array, or URL without null bytes');
+    if (value.includes(0)) throw new ERR_INVALID_ARG_VALUE(name, value, 'must be a string, Uint8Array, or URL without null bytes');
     return Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString();
   }
-  throw ERR_INVALID_ARG_TYPE(name, ['string', 'Buffer', 'URL'], value);
+  throw new ERR_INVALID_ARG_TYPE(name, ['string', 'Buffer', 'URL'], value);
 }
 function fd(value, name = 'fd') { if (Object.is(value, -0)) return 0; v.validateInt32(value, name, 0); return value; }
 // Node's getOptions.
 function options(value, defaults) {
   if (value === undefined || value === null || typeof value === 'function') return Object.assign({}, defaults);
   if (typeof value === 'string') { if (value !== 'buffer') assertEncoding(value); return Object.assign({}, defaults, { encoding: value }); }
-  if (typeof value !== 'object') throw ERR_INVALID_ARG_TYPE('options', ['string', 'Object'], value);
+  if (typeof value !== 'object') throw new ERR_INVALID_ARG_TYPE('options', ['string', 'Object'], value);
   const result = Object.assign({}, defaults, value);
   if (result.encoding !== 'buffer') assertEncoding(result.encoding);
   if (result.signal !== undefined) v.validateAbortSignal(result.signal, 'options.signal');
   return result;
 }
-function assertEncoding(value) { if (value && !Buffer.isEncoding(value)) throw ERR_INVALID_ARG_VALUE('encoding', value, 'is invalid encoding'); }
+function assertEncoding(value) { if (value && !Buffer.isEncoding(value)) throw new ERR_INVALID_ARG_VALUE('encoding', value, 'is invalid encoding'); }
 function mode(value, fallback, name = 'mode') { return v.parseFileMode(value, name, fallback); }
 function flags(value, name = 'flags') {
   if (typeof value === 'number') { v.validateInt32(value, name); return value + 0; }
@@ -95,7 +95,7 @@ function flags(value, name = 'flags') {
     case 'ax+': case 'xa+': return c.O_APPEND | c.O_CREAT | c.O_RDWR | c.O_EXCL;
     case 'as+': case 'sa+': return c.O_APPEND | c.O_CREAT | c.O_RDWR | syncFlag();
   }
-  throw ERR_INVALID_ARG_VALUE('flags', value);
+  throw new ERR_INVALID_ARG_VALUE('flags', value);
 }
 function syncFlag() { if (constants.O_SYNC === undefined) throw error('ENOSYS', 'open'); return constants.O_SYNC; }
 // Private native extension: fsSync(name, positionalArgs) returns a Node result
@@ -144,7 +144,7 @@ function time(value, name = 'time') {
   if (typeof value === 'string' && +value == value) return +value;
   if (Number.isFinite(value)) return value < 0 ? Date.now() / 1000 : value;
   if (value instanceof Date) return value.getTime() / 1000;
-  throw ERR_INVALID_ARG_TYPE(name, ['Date', 'Time in seconds'], value);
+  throw new ERR_INVALID_ARG_TYPE(name, ['Date', 'Time in seconds'], value);
 }
 function bytes(value, name = 'buffer') { v.validateBuffer(value, name); return value; }
 // Node's validatePosition; null, undefined and -1 mean the current position.
@@ -153,28 +153,28 @@ function position(value, name = 'position', length = 0) {
   if (typeof value === 'number') { v.validateInteger(value, name, -1); return value === -1 ? null : value; }
   if (typeof value === 'bigint') {
     const max = 2n ** 63n - 1n - BigInt(length);
-    if (!(value >= -1n && value <= max)) throw ERR_OUT_OF_RANGE(name, `>= -1 && <= ${max}`, value);
+    if (!(value >= -1n && value <= max)) throw new ERR_OUT_OF_RANGE(name, `>= -1 && <= ${max}`, value);
     return value === -1n ? null : value;
   }
-  throw ERR_INVALID_ARG_TYPE(name, ['integer', 'bigint'], value);
+  throw new ERR_INVALID_ARG_TYPE(name, ['integer', 'bigint'], value);
 }
 function validateOffsetLengthRead(offset, length, bufferLength) {
-  if (offset < 0) throw ERR_OUT_OF_RANGE('offset', '>= 0', offset);
-  if (length < 0) throw ERR_OUT_OF_RANGE('length', '>= 0', length);
-  if (offset + length > bufferLength) throw ERR_OUT_OF_RANGE('length', `<= ${bufferLength - offset}`, length);
+  if (offset < 0) throw new ERR_OUT_OF_RANGE('offset', '>= 0', offset);
+  if (length < 0) throw new ERR_OUT_OF_RANGE('length', '>= 0', length);
+  if (offset + length > bufferLength) throw new ERR_OUT_OF_RANGE('length', `<= ${bufferLength - offset}`, length);
 }
 function validateOffsetLengthWrite(offset, length, byteLength) {
-  if (offset > byteLength) throw ERR_OUT_OF_RANGE('offset', `<= ${byteLength}`, offset);
-  if (length > byteLength - offset) throw ERR_OUT_OF_RANGE('length', `<= ${byteLength - offset}`, length);
-  if (length < 0) throw ERR_OUT_OF_RANGE('length', '>= 0', length);
+  if (offset > byteLength) throw new ERR_OUT_OF_RANGE('offset', `<= ${byteLength}`, offset);
+  if (length > byteLength - offset) throw new ERR_OUT_OF_RANGE('length', `<= ${byteLength - offset}`, length);
+  if (length < 0) throw new ERR_OUT_OF_RANGE('length', '>= 0', length);
   v.validateInt32(length, 'length', 0);
 }
 function validateStringAfterArrayBufferView(value, name) {
-  if (typeof value !== 'string') throw ERR_INVALID_ARG_TYPE(name, ['string', 'Buffer', 'TypedArray', 'DataView'], value);
+  if (typeof value !== 'string') throw new ERR_INVALID_ARG_TYPE(name, ['string', 'Buffer', 'TypedArray', 'DataView'], value);
 }
 function bufferArray(buffers, name = 'buffers') {
-  if (!Array.isArray(buffers)) throw ERR_INVALID_ARG_TYPE(name, 'ArrayBufferView[]', buffers);
-  for (let i = 0; i < buffers.length; i++) if (!ArrayBuffer.isView(buffers[i])) throw ERR_INVALID_ARG_TYPE(name, 'ArrayBufferView[]', buffers);
+  if (!Array.isArray(buffers)) throw new ERR_INVALID_ARG_TYPE(name, 'ArrayBufferView[]', buffers);
+  for (let i = 0; i < buffers.length; i++) if (!ArrayBuffer.isView(buffers[i])) throw new ERR_INVALID_ARG_TYPE(name, 'ArrayBufferView[]', buffers);
   return buffers;
 }
 function encoding(value, fallback = 'utf8', bufferAllowed = false) {
@@ -184,7 +184,7 @@ function encoding(value, fallback = 'utf8', bufferAllowed = false) {
   return value;
 }
 function encoded(value, enc) { return enc === 'buffer' ? Buffer.from(value) : enc === 'utf8' || enc === 'utf-8' ? value : Buffer.from(value).toString(enc); }
-function aborted(signal) { if (signal && signal.aborted) throw v.abortError(signal); }
+function aborted(signal) { if (signal && signal.aborted) throw new AbortError(undefined, { cause: signal?.reason }); }
 // Node's Stats and BigIntStats (lib/internal/fs/utils.js): function constructors taking the
 // fields in order, with atime, mtime, ctime and birthtime as Dates made when first read.
 const S_IFMT = 0o170000;

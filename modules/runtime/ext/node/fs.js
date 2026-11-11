@@ -5,7 +5,8 @@ const c = require('internal/fs_core');
 const p = require('path');
 const { Buffer, os, constants, Dirent, makeStats, makeStatFs } = c;
 const v = c.v;
-const { ERR_INVALID_ARG_VALUE, validateBoolean, validateFunction, validateInteger, validateObject, validateOneOf, validateString, kValidateObjectAllowNullable } = v;
+const { AbortError, codes: { ERR_FS_EISDIR, ERR_FS_FILE_TOO_LARGE, ERR_INVALID_ARG_VALUE } } = require('internal/errors');
+const { validateBoolean, validateFunction, validateInteger, validateObject, validateOneOf, validateString, kValidateObjectAllowNullable } = v;
 const { bufferCodec } = c.host;
 const fs = module.exports;
 const kMaxUserId = 2 ** 32 - 1;
@@ -26,7 +27,7 @@ for (const name of ['F_OK', 'R_OK', 'W_OK', 'X_OK']) {
 }
 function makeCallback(cb) { validateFunction(cb, 'cb'); return cb; }
 function checkAborted(signal, callback) {
-  if (signal && signal.aborted) { callback(v.abortError(signal)); return true; }
+  if (signal && signal.aborted) { callback(new AbortError(undefined, { cause: signal?.reason })); return true; }
   return false;
 }
 function aggregateTwoErrors(inner, outer) {
@@ -127,7 +128,7 @@ fs.read = function read(fd, buffer, offsetOrOptions, length, position, callback)
   length |= 0;
   position = c.position(position, 'position', length);
   if (length === 0) { process.nextTick(function tick() { callback(null, 0, buffer); }); return; }
-  if (buffer.byteLength === 0) throw ERR_INVALID_ARG_VALUE('buffer', buffer, 'is empty and cannot be written');
+  if (buffer.byteLength === 0) throw new ERR_INVALID_ARG_VALUE('buffer', buffer, 'is empty and cannot be written');
   c.validateOffsetLengthRead(offset, length, buffer.byteLength);
   c.submit('read', [fd, buffer, offset, length, position], (err, bytesRead) => callback(err || null, bytesRead || 0, buffer), callback);
 };
@@ -144,7 +145,7 @@ fs.readSync = function readSync(fd, buffer, offsetOrOptions, length, position) {
   length |= 0;
   position = c.position(position, 'position', length);
   if (length === 0) return 0;
-  if (buffer.byteLength === 0) throw ERR_INVALID_ARG_VALUE('buffer', buffer, 'is empty and cannot be written');
+  if (buffer.byteLength === 0) throw new ERR_INVALID_ARG_VALUE('buffer', buffer, 'is empty and cannot be written');
   c.validateOffsetLengthRead(offset, length, buffer.byteLength);
   return transfer('read', fd, buffer, offset, length, position);
 };
@@ -199,7 +200,7 @@ fs.write = function write(fd, buffer, offsetOrOptions, length, position, callbac
 Object.defineProperty(fs.write, customPromisifyArgs, { value: ['bytesWritten', 'buffer'], enumerable: false });
 function validateEncoding(data, encoding) {
   const normalized = Buffer.isEncoding(encoding) ? String(encoding).toLowerCase() : encoding;
-  if (normalized === 'hex' && data.length % 2 !== 0) throw ERR_INVALID_ARG_VALUE('encoding', encoding, `is invalid for data of length ${data.length}`);
+  if (normalized === 'hex' && data.length % 2 !== 0) throw new ERR_INVALID_ARG_VALUE('encoding', encoding, `is invalid for data of length ${data.length}`);
 }
 fs.writeSync = function writeSync(fd, buffer, offsetOrOptions, length, position) {
   fd = c.fd(fd);
@@ -290,7 +291,7 @@ function validateRmdirOptions(options, defaults = defaultRmdirOptions) {
   v.validateUint32(options.maxRetries, 'options.maxRetries');
   return options;
 }
-function isDirectoryError(path) { return v.systemError('ERR_FS_EISDIR', { code: 'EISDIR', message: 'is a directory', path, syscall: 'rm', errno: 21 }); }
+function isDirectoryError(path) { return new ERR_FS_EISDIR({ code: 'EISDIR', message: 'is a directory', path, syscall: 'rm', errno: 21 }); }
 function validateRmOptionsSync(path, options, expectDir) {
   options = validateRmdirOptions(options, defaultRmOptions);
   validateBoolean(options.force, 'options.force');
@@ -568,7 +569,7 @@ function readAll(fd, signal, encoding) {
     const result = Buffer.concat(chunks, total); return encoding == null ? result : result.toString(encoding);
   } finally { readBuffer = buffer; }
 }
-function fileTooLarge(size) { return v.makeError(RangeError, 'ERR_FS_FILE_TOO_LARGE', `File size (${size}) is greater than 2 GiB`); }
+function fileTooLarge(size) { return new ERR_FS_FILE_TOO_LARGE(size); }
 fs.readFileSync = function readFileSync(path, options) {
   const o = c.options(options, { flag: 'r' }); c.aborted(o.signal);
   const isUserFd = isFd(path);
@@ -620,7 +621,7 @@ fs.writeFile = function writeFile(path, data, options, callback) {
 };
 function writeAll(fd, isUserFd, buffer, offset, length, signal, flush, callback) {
   const finish = error => { if (isUserFd) callback(error); else fs.close(fd, err => callback(aggregateTwoErrors(err, error))); };
-  if (signal?.aborted) { finish(v.abortError(signal)); return; }
+  if (signal?.aborted) { finish(new AbortError(undefined, { cause: signal?.reason })); return; }
   fs.write(fd, buffer, offset, length, null, (writeErr, written) => {
     if (writeErr) finish(writeErr);
     else if (written === length) {

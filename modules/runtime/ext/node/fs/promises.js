@@ -8,7 +8,8 @@ const p = require('path');
 const { EventEmitter } = require('events');
 const { Buffer } = require('buffer');
 const v = c.v;
-const { ERR_INVALID_ARG_VALUE, ERR_OUT_OF_RANGE, validateAbortSignal, validateBoolean, validateInteger, validateObject, validateOneOf, kValidateObjectAllowNullable } = v;
+const { AbortError, codes: { ERR_FS_EISDIR, ERR_FS_FILE_TOO_LARGE, ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_INVALID_STATE, ERR_METHOD_NOT_IMPLEMENTED, ERR_OUT_OF_RANGE } } = require('internal/errors');
+const { validateAbortSignal, validateBoolean, validateInteger, validateObject, validateOneOf, kValidateObjectAllowNullable } = v;
 const { constants, kRef, kUnref, makeStats, makeStatFs, Dirent } = c;
 const promises = module.exports;
 const kMaxUserId = 2 ** 32 - 1;
@@ -24,7 +25,7 @@ const kCloseReject = Symbol('kCloseReject');
 const kCloseReason = Symbol('kCloseReason');
 const kCloseSync = Symbol('kCloseSync');
 const kLocked = Symbol('kLocked');
-const invalidState = (message, Base = Error) => v.makeError(Base, 'ERR_INVALID_STATE', `Invalid state: ${message}`);
+const invalidState = (message, Base = Error) => new (Base === Error ? ERR_INVALID_STATE : ERR_INVALID_STATE[Base.name])(message);
 
 // One native request with Promise ownership (requestKind 1), or 2 for a FileHandle close.
 function binding(operation, args, requestKind = 1) {
@@ -38,7 +39,7 @@ function aggregateTwoErrors(inner, outer) {
   }
   return inner || outer;
 }
-function checkAborted(signal) { if (signal?.aborted) throw v.abortError(signal); }
+function checkAborted(signal) { if (signal?.aborted) throw new AbortError(undefined, { cause: signal?.reason }); }
 
 class FileHandle extends EventEmitter {
   #brandCheck = undefined;
@@ -131,7 +132,7 @@ class FileHandle extends EventEmitter {
 require('internal/fs_iter').register(FileHandle, { kFd, kLocked, kRef, kUnref, kClosePromise, kCloseSync, invalidState });
 
 async function fsCall(fn, handle, ...args) {
-  if (!FileHandle.isFileHandle(handle)) throw v.ERR_INVALID_ARG_TYPE('handle', 'FileHandle', handle);
+  if (!FileHandle.isFileHandle(handle)) throw new ERR_INVALID_ARG_TYPE('handle', 'FileHandle', handle);
   if (handle.fd === -1) {
     const err = new Error(handle[kCloseReason] ?? 'file closed');
     err.code = 'EBADF'; err.syscall = fn.name;
@@ -176,14 +177,14 @@ async function writeFileHandle(filehandle, data, signal, encoding) {
 }
 function validateReadFileBufferOptions(options) {
   const { buffer } = options;
-  if (buffer !== undefined && typeof buffer !== 'function' && !ArrayBuffer.isView(buffer)) throw v.ERR_INVALID_ARG_TYPE('options.buffer', ['Buffer', 'TypedArray', 'DataView', 'Function'], buffer);
+  if (buffer !== undefined && typeof buffer !== 'function' && !ArrayBuffer.isView(buffer)) throw new ERR_INVALID_ARG_TYPE('options.buffer', ['Buffer', 'TypedArray', 'DataView', 'Function'], buffer);
 }
 function getReadFileBuffer(options, size) {
   let { buffer } = options;
   if (typeof buffer === 'function') { buffer = options.buffer(size); v.validateBuffer(buffer, 'options.buffer()'); }
   if (buffer === undefined) return undefined;
   if (!Buffer.isBuffer(buffer)) buffer = Buffer.from(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-  if (size > buffer.byteLength) throw ERR_INVALID_ARG_VALUE(typeof options.buffer === 'function' ? 'options.buffer().byteLength' : 'options.buffer.byteLength', buffer.byteLength, `is smaller than the file size of ${size} bytes`);
+  if (size > buffer.byteLength) throw new ERR_INVALID_ARG_VALUE(typeof options.buffer === 'function' ? 'options.buffer().byteLength' : 'options.buffer.byteLength', buffer.byteLength, `is smaller than the file size of ${size} bytes`);
   return buffer;
 }
 async function readFileHandleWithUserBuffer(filehandle, options, size) {
@@ -202,7 +203,7 @@ async function readFileHandleWithUserBuffer(filehandle, options, size) {
     checkAborted(signal);
     const extraBuffer = Buffer.allocUnsafeSlow(1);
     const bytesRead = (await binding('read', [filehandle.fd, extraBuffer, 0, 1, null])) ?? 0;
-    if (bytesRead !== 0) throw ERR_INVALID_ARG_VALUE(byteLengthName, buffer.byteLength, 'is too small to contain the entire file');
+    if (bytesRead !== 0) throw new ERR_INVALID_ARG_VALUE(byteLengthName, buffer.byteLength, 'is too small to contain the entire file');
   }
   return encoding ? buffer.toString(encoding) : buffer.subarray(0, totalRead);
 }
@@ -215,7 +216,7 @@ async function readFileHandle(filehandle, options) {
   let size = 0; let length = 0;
   if ((statFields.mode & 0o170000) === 0o100000) { size = statFields.size; length = encoding ? Math.min(size, kReadFileBufferLength) : size; }
   if (length === 0) length = kReadFileUnknownBufferLength;
-  if (size > kIoMaxLength) throw v.makeError(RangeError, 'ERR_FS_FILE_TOO_LARGE', `File size (${size}) is greater than 2 GiB`);
+  if (size > kIoMaxLength) throw new ERR_FS_FILE_TOO_LARGE(size);
   if (options.buffer !== undefined) return readFileHandleWithUserBuffer(filehandle, options, size);
   let totalRead = 0; const noSize = size === 0;
   let buffer = Buffer.allocUnsafeSlow(length);
@@ -280,7 +281,7 @@ async function read(handle, bufferOrParams, offset, length, position) {
   length |= 0;
   position = c.position(position, 'position', length);
   if (length === 0) return { __proto__: null, bytesRead: length, buffer };
-  if (buffer.byteLength === 0) throw ERR_INVALID_ARG_VALUE('buffer', buffer, 'is empty and cannot be written');
+  if (buffer.byteLength === 0) throw new ERR_INVALID_ARG_VALUE('buffer', buffer, 'is empty and cannot be written');
   c.validateOffsetLengthRead(offset, length, buffer.byteLength);
   const bytesRead = (await binding('read', [handle.fd, buffer, offset, length, position])) || 0;
   return { __proto__: null, bytesRead, buffer };
@@ -293,7 +294,7 @@ async function readv(handle, buffers, position) {
 }
 function validateEncoding(data, encoding) {
   const normalized = Buffer.isEncoding(encoding) ? String(encoding).toLowerCase() : encoding;
-  if (normalized === 'hex' && data.length % 2 !== 0) throw ERR_INVALID_ARG_VALUE('encoding', encoding, `is invalid for data of length ${data.length}`);
+  if (normalized === 'hex' && data.length % 2 !== 0) throw new ERR_INVALID_ARG_VALUE('encoding', encoding, `is invalid for data of length ${data.length}`);
 }
 async function write(handle, buffer, offsetOrOptions, length, position) {
   if (buffer?.byteLength === 0) return { __proto__: null, bytesWritten: 0, buffer };
@@ -347,7 +348,7 @@ async function rm(path, options) {
   validateBoolean(options.force, 'options.force');
   let info;
   try { info = await lstat(path); } catch (err) { if (options.force && err.code === 'ENOENT') return; throw err; }
-  if (info.isDirectory() && !options.recursive) throw v.systemError('ERR_FS_EISDIR', { code: 'EISDIR', message: 'is a directory', path, syscall: 'rm', errno: 21 });
+  if (info.isDirectory() && !options.recursive) throw new ERR_FS_EISDIR({ code: 'EISDIR', message: 'is a directory', path, syscall: 'rm', errno: 21 });
   return binding('rm', [path, options]);
 }
 let recursiveRmdirWarned;
@@ -408,7 +409,7 @@ async function unlink(path) { return binding('unlink', [c.path(path)]); }
 async function fchmod(handle, mode) { mode = c.mode(mode, undefined); return binding('fchmod', [handle.fd, mode]); }
 async function chmod(path, mode) { path = c.path(path); mode = c.mode(mode, undefined); return binding('chmod', [path, mode]); }
 async function lchmod(path, mode) {
-  if (constants.O_SYMLINK === undefined) throw v.makeError(Error, 'ERR_METHOD_NOT_IMPLEMENTED', 'The lchmod() method is not implemented');
+  if (constants.O_SYMLINK === undefined) throw new ERR_METHOD_NOT_IMPLEMENTED('lchmod()');
   const fd = await open(path, constants.O_WRONLY | constants.O_SYMLINK);
   return handleFdClose(fchmod(fd, mode), fd.close);
 }

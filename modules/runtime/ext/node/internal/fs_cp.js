@@ -6,6 +6,8 @@ const fs = require('fs');
 const { dirname, isAbsolute, join, parse, resolve, sep } = require('path');
 const v = require('internal/validators');
 const { validateBoolean, validateFunction, validateObject } = v;
+const { codes } = require('internal/errors');
+const { ERR_INCOMPATIBLE_OPTION_PAIR, ERR_INVALID_RETURN_VALUE } = codes;
 const EEXIST = 17; const EISDIR = 21; const EINVAL = 22; const ENOTDIR = 20;
 
 const defaultCpOptions = { dereference: false, errorOnExist: false, filter: undefined, force: true, preserveTimestamps: false, recursive: false, verbatimSymlinks: false };
@@ -22,13 +24,13 @@ function validateCpOptions(options) {
   if (options.mode == null) options.mode = 0;
   else v.validateInteger(options.mode, 'mode', 0, 7);
   if (options.dereference === true && options.verbatimSymlinks === true) {
-    throw v.makeError(TypeError, 'ERR_INCOMPATIBLE_OPTION_PAIR', 'Option "dereference" cannot be used in combination with option "verbatimSymlinks"');
+    throw new ERR_INCOMPATIBLE_OPTION_PAIR('dereference', 'verbatimSymlinks');
   }
   if (options.filter !== undefined) validateFunction(options.filter, 'options.filter');
   return options;
 }
 
-const fail = (key, message, path, errno, code) => v.systemError(key, { message, path, syscall: 'cp', errno, code });
+const fail = (key, message, path, errno, code) => new codes[key]({ message, path, syscall: 'cp', errno, code });
 const ENOENT = error => { if (error.code === 'ENOENT') return null; throw error; };
 
 // Each step is [operation name, ...arguments]; 'filter' runs the user's filter.
@@ -43,7 +45,7 @@ function* checkPaths(src, dest, opts, sync) {
   if (opts.filter) {
     const accepted = yield ['filter', opts.filter, src, dest];
     if (sync && accepted && typeof accepted.then === 'function') {
-      throw v.makeError(TypeError, 'ERR_INVALID_RETURN_VALUE', `Expected boolean to be returned from the "filter" function but got ${v.determineSpecificType(accepted)}.`);
+      throw new ERR_INVALID_RETURN_VALUE('boolean', 'filter', accepted);
     }
     if (!accepted) return { skipped: true };
   }

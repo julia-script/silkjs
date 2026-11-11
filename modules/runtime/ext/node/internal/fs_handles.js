@@ -3,9 +3,8 @@ const c = require('internal/fs_core');
 const { EventEmitter } = require('events');
 const { join } = require('path');
 const v = require('internal/validators');
+const { codes: { ERR_DIR_CLOSED, ERR_DIR_CONCURRENT_OPERATION, ERR_INVALID_THIS, ERR_MISSING_ARGS } } = require('internal/errors');
 const { promisify } = require('util');
-const ERR_DIR_CLOSED = () => v.makeError(Error, 'ERR_DIR_CLOSED', 'Directory handle was closed');
-const ERR_DIR_CONCURRENT_OPERATION = () => v.makeError(Error, 'ERR_DIR_CONCURRENT_OPERATION', 'Cannot do synchronous work on directory handle with concurrent asynchronous operations');
 // A directory handle over entries already listed: read() hands out up to bufferSize Dirents,
 // then null; with a request it completes on a later tick, as a libuv read does.
 class DirHandle {
@@ -30,7 +29,7 @@ class Dir {
   #operationQueue = null;
   #handlerQueue = [];
   constructor(handle, path, options) {
-    if (handle == null) throw v.ERR_MISSING_ARGS('handle');
+    if (handle == null) throw new ERR_MISSING_ARGS('handle');
     this.#handle = handle;
     this.#path = path;
     this.#options = { bufferSize: 32, ...c.options(options, { encoding: 'utf8' }) };
@@ -39,7 +38,7 @@ class Dir {
     this.#closePromisified = promisify(this.close).bind(this);
   }
   get path() {
-    if (!(#path in this)) throw v.makeError(TypeError, 'ERR_INVALID_THIS', 'Value of "this" must be of type Dir');
+    if (!(#path in this)) throw new ERR_INVALID_THIS('Dir');
     return this.#path;
   }
   #processHandlerQueue() {
@@ -53,7 +52,7 @@ class Dir {
   }
   read(callback) { return arguments.length === 0 ? this.#readPromisified() : this.#readImpl(true, callback); }
   #readImpl(maybeSync, callback) {
-    if (this.#closed === true) throw ERR_DIR_CLOSED();
+    if (this.#closed === true) throw new ERR_DIR_CLOSED();
     if (callback === undefined) return this.#readPromisified();
     v.validateFunction(callback, 'callback');
     if (this.#operationQueue !== null) { this.#operationQueue.push(() => { this.#readImpl(maybeSync, callback); }); return; }
@@ -83,8 +82,8 @@ class Dir {
     this.#handlerQueue.push({ handle: openDirHandle(path, this.#options.encoding), path });
   }
   readSync() {
-    if (this.#closed === true) throw ERR_DIR_CLOSED();
-    if (this.#operationQueue !== null) throw ERR_DIR_CONCURRENT_OPERATION();
+    if (this.#closed === true) throw new ERR_DIR_CLOSED();
+    if (this.#operationQueue !== null) throw new ERR_DIR_CONCURRENT_OPERATION();
     if (!this.#processHandlerQueue()) {
       const result = this.#handle.read(this.#options.encoding, this.#options.bufferSize);
       if (result === null) return result;
@@ -96,19 +95,19 @@ class Dir {
   }
   close(callback) {
     if (callback === undefined) {
-      if (this.#closed === true) return Promise.reject(ERR_DIR_CLOSED());
+      if (this.#closed === true) return Promise.reject(new ERR_DIR_CLOSED());
       return this.#closePromisified();
     }
     v.validateFunction(callback, 'callback');
-    if (this.#closed === true) { process.nextTick(callback, ERR_DIR_CLOSED()); return; }
+    if (this.#closed === true) { process.nextTick(callback, new ERR_DIR_CLOSED()); return; }
     if (this.#operationQueue !== null) { this.#operationQueue.push(() => { this.close(callback); }); return; }
     while (this.#handlerQueue.length > 0) this.#handlerQueue.shift().handle.close();
     this.#closed = true;
     this.#handle.close({ oncomplete: callback });
   }
   closeSync() {
-    if (this.#closed === true) throw ERR_DIR_CLOSED();
-    if (this.#operationQueue !== null) throw ERR_DIR_CONCURRENT_OPERATION();
+    if (this.#closed === true) throw new ERR_DIR_CLOSED();
+    if (this.#operationQueue !== null) throw new ERR_DIR_CONCURRENT_OPERATION();
     while (this.#handlerQueue.length > 0) this.#handlerQueue.shift().handle.close();
     this.#closed = true;
     this.#handle.close();

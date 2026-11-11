@@ -5,7 +5,8 @@ const { Buffer } = require('buffer');
 const fs = require('fs');
 const c = require('internal/fs_core');
 const v = require('internal/validators');
-const { validateAbortSignal, validateBoolean, validateInteger, validateObject, ERR_OUT_OF_RANGE } = v;
+const { validateAbortSignal, validateBoolean, validateInteger, validateObject } = v;
+const { codes: { ERR_OPERATION_FAILED, ERR_OUT_OF_RANGE } } = require('internal/errors');
 const kNullPrototo = { __proto__: null };
 const kDefaultChunkSize = 131072;
 const kNone = -1;
@@ -16,7 +17,7 @@ const position = pos => pos >= 0 ? pos : null;
 function installOn(FileHandle, { kFd, kLocked, kRef, kUnref, kClosePromise, kCloseSync, invalidState }) {
   const { pull: newStreamsPull, pullSync: newStreamsPullSync } = require('internal/streams/iter/pull');
   const { parsePullArgs, toUint8Array, convertChunks } = require('internal/streams/iter/utils');
-  const operationFailed = message => v.makeError(Error, 'ERR_OPERATION_FAILED', `Operation failed: ${message}`);
+  const operationFailed = message => new ERR_OPERATION_FAILED(message);
   function checkUsable(handle) {
     if (handle[kFd] === kNone) throw invalidState('The FileHandle is closed');
     if (handle[kClosePromise]) throw invalidState('The FileHandle is closing');
@@ -174,7 +175,7 @@ function installOn(FileHandle, { kFd, kLocked, kRef, kUnref, kClosePromise, kClo
         const signal = signalOf(options);
         if (signal?.aborted) return Promise.reject(signal.reason);
         chunk = toUint8Array(chunk);
-        if (bytesRemaining >= 0 && chunk.byteLength > bytesRemaining) return Promise.reject(ERR_OUT_OF_RANGE('write', `<= ${bytesRemaining} bytes`, chunk.byteLength));
+        if (bytesRemaining >= 0 && chunk.byteLength > bytesRemaining) return Promise.reject(new ERR_OUT_OF_RANGE('write', `<= ${bytesRemaining} bytes`, chunk.byteLength));
         if (bytesRemaining > 0) bytesRemaining -= chunk.byteLength;
         const at = pos;
         if (pos >= 0) pos += chunk.byteLength;
@@ -188,7 +189,7 @@ function installOn(FileHandle, { kFd, kLocked, kRef, kUnref, kClosePromise, kClo
         chunks = convertChunks(chunks);
         let totalSize = 0;
         for (let i = 0; i < chunks.length; i++) totalSize += chunks[i].byteLength;
-        if (bytesRemaining >= 0 && totalSize > bytesRemaining) return Promise.reject(ERR_OUT_OF_RANGE('writev', `<= ${bytesRemaining} bytes`, totalSize));
+        if (bytesRemaining >= 0 && totalSize > bytesRemaining) return Promise.reject(new ERR_OUT_OF_RANGE('writev', `<= ${bytesRemaining} bytes`, totalSize));
         if (bytesRemaining > 0) bytesRemaining -= totalSize;
         const at = pos;
         if (pos >= 0) pos += totalSize;

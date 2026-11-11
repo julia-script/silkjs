@@ -8,16 +8,17 @@ const fs = require('fs');
 const c = require('internal/fs_core');
 const v = require('internal/validators');
 const { Buffer } = require('buffer');
-const { validateBoolean, validateFunction, validateInteger, ERR_INVALID_ARG_TYPE, ERR_OUT_OF_RANGE } = v;
+const { validateBoolean, validateFunction, validateInteger } = v;
+const { codes: { ERR_FEATURE_UNAVAILABLE_ON_PLATFORM, ERR_INCOMPATIBLE_OPTION_PAIR, ERR_INVALID_ARG_TYPE, ERR_INVALID_THIS, ERR_METHOD_NOT_IMPLEMENTED, ERR_MISSING_OPTION, ERR_OUT_OF_RANGE, ERR_STREAM_DESTROYED, ERR_SYSTEM_ERROR } } = require('internal/errors');
 const kIoDone = Symbol('kIoDone');
 const kIsPerformingIO = Symbol('kIsPerformingIO');
 const kFs = Symbol('kFs');
 const kHandle = Symbol('kHandle');
-const notImplemented = method => v.makeError(Error, 'ERR_METHOD_NOT_IMPLEMENTED', `The ${method} method is not implemented`);
-const destroyed = method => v.makeError(Error, 'ERR_STREAM_DESTROYED', `Cannot call ${method} after a stream was destroyed`);
-const systemFailure = message => v.makeError(Error, 'ERR_SYSTEM_ERROR', `A system error occurred: ${message}`);
+const notImplemented = method => new ERR_METHOD_NOT_IMPLEMENTED(method);
+const destroyed = method => new ERR_STREAM_DESTROYED(method);
+const systemFailure = message => new ERR_SYSTEM_ERROR(message);
 function validateThisInternalField(object, key, name) {
-  if (typeof object !== 'object' || object === null || !(key in object)) throw v.makeError(TypeError, 'ERR_INVALID_THIS', `Value of "this" must be of type ${name}`);
+  if (typeof object !== 'object' || object === null || !(key in object)) throw new ERR_INVALID_THIS(name);
 }
 
 function _construct(callback) {
@@ -66,15 +67,15 @@ function importFd(stream, options) {
     options.fd.on('close', stream.close.bind(stream));
     return options.fd.fd;
   }
-  throw ERR_INVALID_ARG_TYPE('options.fd', ['number', 'FileHandle'], options.fd);
+  throw new ERR_INVALID_ARG_TYPE('options.fd', ['number', 'FileHandle'], options.fd);
 }
 function importWindowsHandle(options) {
-  if (options.windowsHandle == null) throw v.makeError(TypeError, 'ERR_MISSING_OPTION', 'options.windowsHandle is required');
-  throw v.makeError(TypeError, 'ERR_FEATURE_UNAVAILABLE_ON_PLATFORM', 'The feature windowsHandle is unavailable on the current platform, which is being used to run Node.js');
+  if (options.windowsHandle == null) throw new ERR_MISSING_OPTION('options.windowsHandle');
+  throw new ERR_FEATURE_UNAVAILABLE_ON_PLATFORM('windowsHandle');
 }
-const incompatible = (a, b) => v.makeError(TypeError, 'ERR_INCOMPATIBLE_OPTION_PAIR', `Option "${a}" cannot be used in combination with option "${b}"`);
+const incompatible = (a, b) => new ERR_INCOMPATIBLE_OPTION_PAIR(a, b);
 function validatePath(path) {
-  if (typeof path !== 'string' && !(path instanceof Uint8Array)) throw ERR_INVALID_ARG_TYPE('path', ['string', 'Buffer', 'URL'], path);
+  if (typeof path !== 'string' && !(path instanceof Uint8Array)) throw new ERR_INVALID_ARG_TYPE('path', ['string', 'Buffer', 'URL'], path);
   c.path(path);
 }
 
@@ -110,7 +111,7 @@ function ReadStream(path, options) {
   if (this.end === undefined) this.end = Infinity;
   else if (this.end !== Infinity) {
     validateInteger(this.end, 'end', 0);
-    if (this.start !== undefined && this.start > this.end) throw ERR_OUT_OF_RANGE('start', `<= "end" (here: ${this.end})`, this.start);
+    if (this.start !== undefined && this.start > this.end) throw new ERR_OUT_OF_RANGE('start', `<= "end" (here: ${this.end})`, this.start);
   }
   Reflect.apply(Readable, this, [options]);
 }
@@ -173,7 +174,7 @@ function WriteStream(path, options) {
     validatePath(this.path);
   } else this.fd = c.fd(importFd(this, options));
   options.autoDestroy = options.autoClose === undefined ? true : options.autoClose;
-  if (!this[kFs].write && !this[kFs].writev) throw ERR_INVALID_ARG_TYPE('options.fs.write', 'function', this[kFs].write);
+  if (!this[kFs].write && !this[kFs].writev) throw new ERR_INVALID_ARG_TYPE('options.fs.write', 'function', this[kFs].write);
   if (this[kFs].write) validateFunction(this[kFs].write, 'options.fs.write');
   if (this[kFs].writev) validateFunction(this[kFs].writev, 'options.fs.writev');
   if (options.autoDestroy) validateFunction(this[kFs].close, 'options.fs.close');

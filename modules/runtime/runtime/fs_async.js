@@ -202,7 +202,7 @@ module.exports = function createAsyncFS(native) {
         return withFD(requestKind, filename, o.flag, 0o666, async fd => {
           // As Node: a regular file over 2 GiB fails before any read.
           const info = await stat(requestKind, 'fstat', fd);
-          if ((info.mode & 0o170000) === 0o100000 && info.size > 2 ** 31 - 1) throw c().v.makeError(RangeError, 'ERR_FS_FILE_TOO_LARGE', `File size (${info.size}) is greater than 2 GiB`);
+          if ((info.mode & 0o170000) === 0o100000 && info.size > 2 ** 31 - 1) throw new (require('internal/errors').codes.ERR_FS_FILE_TOO_LARGE)(info.size);
           const chunks = []; let total = 0;
           for (;;) {
             c().aborted(o.signal);
