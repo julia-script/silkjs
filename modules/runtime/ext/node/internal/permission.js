@@ -242,6 +242,16 @@ function checkFile(op, args) {
     default: check('fs.read', path);
   }
 }
+// Node's fs bindings check before they queue a request, so a callback API throws the denial.
+// fs.symlink is the exception: Node passes its denial to the callback.
+// Only when enforcing without audit: the native gate checks again, and audit would publish twice.
+// A null-prototype table: user code cannot change what it answers.
+const callbackChecked = { __proto__: null };
+for (const op of ['access', 'stat', 'lstat', 'open', 'readdir', 'scandir', 'readlink', 'realpath', 'copyFile',
+  'rename', 'link', 'mkdir', 'mkdtemp', 'unlink', 'rmdir', 'chmod', 'lchmod', 'chown', 'lchown', 'truncate', 'utimes', 'lutimes']) callbackChecked[op] = true;
+function checkCallbackFile(op, args) {
+  if (initialized && state.enforce && !state.audit && callbackChecked[op] === true) checkFile(op, args);
+}
 function checkNative(id, op, args, third) {
   if (id === 2000 || id === 2001) return checkFile(op, args);
   if (id === 2002) return check('fs.read', op);
@@ -347,5 +357,5 @@ function initialize(options = {}) {
   }
   initialized = true;
 }
-module.exports = { optionEntries, isValueOption, applyOption, initialize, check, allows, canRead, checkFile, checkNative,
+module.exports = { optionEntries, isValueOption, applyOption, initialize, check, allows, canRead, checkFile, checkCallbackFile, checkNative,
   enabled: () => initialized && (state.enforce || state.audit) };
