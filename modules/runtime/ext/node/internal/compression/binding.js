@@ -14,6 +14,8 @@ function codecError(status, kind) {
   let code = codes[status], message;
   if (status === -3000) {
     return error('ERR_TRAILING_JUNK_AFTER_STREAM_END', 'Trailing junk found after the end of the compressed stream', TypeError);
+  } else if (status === -3002) {
+    return error('ERR_ZLIB_INITIALIZATION_FAILED', 'Initialization failed');
   } else if (status === -3001) {
     code = 'Z_NEED_DICT'; message = 'Bad dictionary'; status = 2;
   } else if (status <= -2000) {
