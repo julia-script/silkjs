@@ -1188,8 +1188,18 @@ function createLoader(host, builtins) {
     } else module.exports = namespace;
   }
 
+  // The module.require tracing channel, once diagnostics_channel is loaded: no channel
+  // has a subscriber before that.
+  let requireTracing;
   function makeRequire(filename, parent, allowAsync = false) {
     function require(specifier) {
+      const dc = host.diagnosticsChannel;
+      if (dc !== undefined && (requireTracing ??= dc.tracingChannel('module.require')).hasSubscribers) {
+        return requireTracing.traceSync(load, { __proto__: null, parentFilename: (parent || cache[filename])?.filename, id: specifier }, undefined, specifier);
+      }
+      return load(specifier);
+    }
+    function load(specifier) {
       probed = null;
       // Unlike the node: form, ordinary builtin names can be overridden through
       // require.cache, matching Node's documented builtin cache behavior.

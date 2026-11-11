@@ -1,0 +1,146 @@
+//! Known local functions at compile time (see KnownCall). A variable v of a
+//! function F that code only ever calls (`v(...)`, a plain call: no other read,
+//! no reference, no write but `v = function (...) {...}` in F itself) holds a
+//! function expression E nothing can observe as an object. E then needs no
+//! closure: v holds E's FunctionBytecode, and a call runs E under the caller's
+//! scope at the level E was created at, which every call site of v sits under.
+//!
+//! The variable resolution pass records each access's use (noteUse). Once F's
+//! scopes are planned, mark sets KNOWN_CALL on each such E that its own compile
+//! left KNOWN_CANDIDATE (candidate): a plain function expression with no
+//! arguments, eval, self name or home object, whose every child is known (no
+//! closure inside the known region ever moves a scope to the heap). The root
+//! compile then drops any known function whose references are not all global
+//! cells (validate), which only then are final.
+import silk.num.i32
+import silk.num.u8
+import silk.num.u16
+import silk.num.usize
+import js_heap { HeapCell, HeapHeader, CellRef }
+import js_value { ValueBits }
+import js_core_types { FunctionBytecode, FunctionKind, ClosureKind, RuntimeState, KNOWN_NONE, KNOWN_CANDIDATE, KNOWN_CALL }
+import js_compiler_types { FunctionDef, FunctionId, FunctionTree, ParseFunctionKind, linked }
+import js_compiler_scopes as scopePlans
+
+/// CompilerVar.knownUse bits: a plain call's callee read, any other access, a
+/// store of a function expression of the owner itself (CompilerVar.knownChild).
+pub const USE_CALL: u8 = 1
+pub const USE_OTHER: u8 = 2
+pub const USE_WRITE: u8 = 4
+
+/// Records use (with child, the constant a USE_WRITE stores) of the variable
+/// an access in cell resolved to: storage 0 a local of cell, 2 closure var
+/// index of cell (followed to the local it captures); arguments and globals
+/// are never known.
+pub fn noteUse(tree: &mut FunctionTree, cell: FunctionId, storage: i32, index: i32, use: u8, child: i32) -> () {
+  if storage == 0 { mark(&mut tree, cell, index, use, child) return () }
+  if storage != 2 { return () }
+  // A store from another function stores a function expression of its own.
+  let mut kind = use
+  if kind == USE_WRITE { kind = USE_OTHER }
+  noteClosure(&mut tree, cell, index, kind)
+}
+/// noteUse for closure var index of cell.
+pub fn noteClosure(tree: &mut FunctionTree, cell: FunctionId, index: i32, use: u8) -> () {
+  let mut current = cell let mut at = index
+  while true {
+    let fd = tree.get(current)
+    if at < 0 || i32.toUsize(at) >= fd.closureVars.length() { return () }
+    let cv = fd.closureVars.get(i32.toUsize(at))
+    let parent = fd.parent
+    drop fd
+    if parent.isNone() { return () }
+    let outer = linked(parent)
+    if cv.kind == ClosureKind.Local { mark(&mut tree, outer, u16.toI32(cv.variableIndex), use, -1) return () }
+    if cv.kind != ClosureKind.Reference { return () }
+    current = outer at = u16.toI32(cv.variableIndex)
+  }
+}
+/// noteUse for local index of cell.
+pub fn noteLocal(tree: &mut FunctionTree, cell: FunctionId, index: i32, use: u8) -> () { mark(&mut tree, cell, index, use, -1) }
+fn mark(tree: &mut FunctionTree, cell: FunctionId, index: i32, use: u8, child: i32) -> () {
+  let fd = tree.getMut(cell)
+  if index < 0 || i32.toUsize(index) >= fd.vars.length() { return () }
+  let mut v = fd.vars.get(i32.toUsize(index))
+  if use == USE_WRITE {
+    if v.knownChild >= 0 && v.knownChild != child { v.knownUse = v.knownUse | USE_OTHER }
+    v.knownChild = child
+  }
+  v.knownUse = v.knownUse | use
+  fd.vars.set(i32.toUsize(index), v)
+}
+
+/// Whether fd, a finished function, may be known for its parent to decide:
+/// KNOWN_CANDIDATE for its FunctionBytecode. constants are its children.
+pub fn candidate(fd: &FunctionDef) -> bool {
+  if fd.parent.isNone() || fd.functionKind != FunctionKind.Normal || fd.functionType != ParseFunctionKind.Expression { return false }
+  if fd.isEval || fd.module.isSome() || fd.lazy || fd.debuggerMetadata.enabled || scopePlans.dynamicScope(&fd.*) { return false }
+  if fd.argumentsVarIndex >= 0 || fd.functionVarIndex >= 0 || fd.thisActiveFunctionVarIndex >= 0 || fd.homeObjectVarIndex >= 0 || fd.needHomeObject { return false }
+  if fd.hasParameterExpressions || !fd.hasSimpleParameterList || fd.isDerivedClassConstructor { return false }
+  let mut index: usize = 0
+  while index < fd.constants.length() {
+    match fd.constants.get(index) {
+      ValueBits.FunctionBytecode { reference } => { if state(reference) != KNOWN_CALL { return false } }
+      _ => ()
+    }
+    index = index + 1
+  }
+  return true
+}
+fn state(reference: *mut HeapHeader) -> u8 {
+  let anchor = () let code = unsafe CellRef<FunctionBytecode>.of(reference)
+  return code.get(&anchor).known.state
+}
+
+/// After cell's scope plan: makes known each candidate child its call-only
+/// variables hold, named after the variable.
+pub fn markChildren(tree: &mut FunctionTree, cell: FunctionId) -> () {
+  let fd = tree.getMut(cell)
+  let mut runtimeAnchor = ()
+  let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, fd.runtime)
+  if fd.parent.isNone() || fd.isEval || fd.module.isSome() || fd.debuggerMetadata.enabled || scopePlans.dynamicScope(&fd.*) { return () }
+  let mut index: usize = 0
+  while index < fd.vars.length() {
+    let v = fd.vars.get(index)
+    index = index + 1
+    if v.knownUse != (USE_CALL | USE_WRITE) || v.knownChild < 0 || v.isReferenced { continue }
+    if i32.toUsize(v.knownChild) >= fd.constants.length() { continue }
+    let reference = match fd.constants.get(i32.toUsize(v.knownChild)) { ValueBits.FunctionBytecode { reference } => reference _ => { continue } }
+    let mut anchor = () let code = unsafe CellRef<FunctionBytecode>.of(reference)
+    let b = code.getMut(&mut anchor)
+    if b.known.state != KNOWN_CANDIDATE { continue }
+    b.known.state = KNOWN_CALL
+    b.leaf = 0
+    if b.name == 0 { b.name = rt.atoms.duplicate(v.name) }
+  }
+}
+
+/// At the root's compile: drops KNOWN_CALL from every function under code
+/// whose references are not all global cells (only those a known function's
+/// creation can cache), and from every function with such a child.
+pub fn validate(code: *mut HeapHeader) -> bool {
+  let mut anchor = () let cell = unsafe CellRef<FunctionBytecode>.of(code)
+  let count = cell.get(&anchor).constants.length()
+  let mut children = true
+  let mut index: usize = 0
+  while index < count {
+    let constant = cell.get(&anchor).constants.get(index)
+    match constant {
+      ValueBits.FunctionBytecode { reference } => { if !validate(reference) { children = false } }
+      _ => ()
+    }
+    index = index + 1
+  }
+  let b = cell.getMut(&mut anchor)
+  if b.known.state == KNOWN_NONE { return false }
+  if b.known.state == KNOWN_CANDIDATE { b.known.state = KNOWN_NONE return false }
+  let references = b.closureVars.length() - u16.toUsize(b.scopeCaptures)
+  let mut ok = children
+  let mut at: usize = 0
+  while at < references && ok {
+    if b.closureVars.get(at).kind != ClosureKind.GlobalReference { ok = false }
+    at = at + 1
+  }
+  if !ok { b.known.state = KNOWN_NONE }
+  return ok
+}

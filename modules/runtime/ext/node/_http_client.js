@@ -6,6 +6,7 @@ const { OutgoingMessage } = require('_http_outgoing');
 const { IncomingMessage } = require('_http_incoming');
 const { Agent } = require('_http_agent');
 const { Parser, token, error, setParserOptions } = require('internal/http/parser');
+const diagnostics = require('internal/host').diagnostics;
 
 class ClientRequest extends OutgoingMessage {
   constructor(input, options, callback) {
@@ -64,6 +65,13 @@ class ClientRequest extends OutgoingMessage {
       try { const socket = (options.createConnection || net.createConnection)({ ...this._options, path: options.socketPath }, done); if (socket) done(null, socket); }
       catch (err) { process.nextTick(() => this.destroy(err)); }
     }
+    diagnostics.publish('http.client.request.created', { request: this });
+  }
+  end(chunk, encoding, callback) {
+    const first = !this.finished;
+    super.end(chunk, encoding, callback);
+    if (first && this.finished) diagnostics.publish('http.client.request.start', { request: this });
+    return this;
   }
   _implicitHeader() { this._storeHeader(this.method + ' ' + this.path + ' HTTP/1.1\r\n'); }
   onSocket(socket) {
@@ -87,6 +95,7 @@ class ClientRequest extends OutgoingMessage {
           const keepAlive = /(?:^|,)\s*timeout\s*=\s*(\d+)/i.exec(String(current.headers['keep-alive'] || ''));
           socket._httpKeepAliveTimeout = keepAlive ? Math.max(0, Number(keepAlive[1]) * 1000 - (this.agent?.agentKeepAliveTimeoutBuffer || 0)) : undefined;
           current.once('end', () => { this._responseEnded = true; this._maybeRelease(); });
+          diagnostics.publish('http.client.response.finish', { request: this, response: current });
           if (!this.emit('response', current)) current._dump();
           return { skipBody: this.method === 'HEAD' };
         },
@@ -140,6 +149,7 @@ class ClientRequest extends OutgoingMessage {
     process.nextTick(() => this._emitClose());
   }
   _destroy(err, callback) {
+    if (err) diagnostics.publish('http.client.request.error', { request: this, error: err });
     if (this.agent && this._agentKey && typeof this.agent._remove === 'function') this.agent._remove(this.agent.requests, this._agentKey, this);
     if (this.res && !this.res.complete) this.res._abort();
     if (this._parser) this._parser.stopped = true;

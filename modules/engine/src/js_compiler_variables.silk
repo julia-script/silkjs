@@ -28,6 +28,7 @@ import js_core_types { RuntimeState, ExportBinding, FunctionBytecode, ClosureVar
 import js_compiler_types { FunctionDef, FunctionId, FunctionTree, linked, CompilerVar, StubName, GlobalVar, CompilerError, CompilerErrorKind, ARGUMENT_VAR_OFFSET, ARG_SCOPE_END }
 import js_compiler_state as state
 import js_compiler_emit as emit
+import js_compiler_known as known
 import js_compiler_code { CodeContext, matchCode, M2, opcode, skipDeadCode, getLabelPosition, signedWord, unsignedWord }
 import js_string_types { StringLengthError }
 import js_debug_positions { PcSourcePosition }
@@ -491,10 +492,14 @@ effect fn optimizeReference(fd: &mut FunctionDef, input: &mut ByteBuffer, label:
   while p < labelPosition + 2 { input.set(p, op.OP_nop) p = p + 1 }
   return result
 }
-effect fn resolveScope(tree: &mut FunctionTree, cell: FunctionId, input: &mut ByteBuffer, memo: &mut BindingMemo, name: u32, scope: i32, code: u8, label: i32, next: i32) -> i32
+effect fn resolveScope(tree: &mut FunctionTree, cell: FunctionId, input: &mut ByteBuffer, memo: &mut BindingMemo, name: u32, scope: i32, code: u8, label: i32, next: i32,
+  use: u8, child: i32) -> i32
   ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
   let mut done: i32 = -1
   let binding = run memoLookup(&mut tree, cell, &mut memo, name, scope, code, &mut done)
+  // An object environment test in front makes the access no plain one.
+  if done >= 0 { known.noteUse(&mut tree, cell, binding.storage, binding.index, known.USE_OTHER, -1) }
+  else { known.noteUse(&mut tree, cell, binding.storage, binding.index, use, child) }
   let mut _anchor = () let mut ra = ()
   let fd = tree.getMut(cell)
   let rt = fd.runtimeStateMut(&mut ra)
@@ -808,6 +813,10 @@ effect fn resolvePass(tree: &mut FunctionTree, cell: FunctionId, input: &mut Byt
   drop runtime drop initial
   let mut line: i32 = 0 let mut cc = CodeContext.make()
   let mut memo = BindingMemo { keys: List<u64>.make(), bindings: List<Binding>.make(), count: 0 }
+  // js_compiler_known: where the last `fclosure [set_name] [dup]` ends, so a
+  // store right there writes that function expression; and the next callee read.
+  let mut closureChild: i32 = -1 let mut closureEnd: usize = usize.MAX let mut closureDup = false
+  let mut calleeIndex: usize = 0
   while position.* < input.length() {
     let p = position.* let code = input.get(p)
     // Calls with recorded source positions and debugger locations are mapped
@@ -823,6 +832,7 @@ effect fn resolvePass(tree: &mut FunctionTree, cell: FunctionId, input: &mut Byt
       while q < stop {
         let c = bytes[q] let cls = emit.passClass(c)
         if (cls & emit.PASS_SPECIAL) != 0 { break }
+        if c == op.OP_fclosure { closureChild = u32.toI32(readU32(bytes, q + 1)) closureEnd = q + 5 closureDup = false }
         if (cls & emit.PASS_ATOM) != 0 { atomsSeen = true }
         else if c == op.OP_line_num {
           line = signedWord(readU32(bytes, q + 1)) fd.lineNumberCapacity = fd.lineNumberCapacity + 1
@@ -870,16 +880,30 @@ effect fn resolvePass(tree: &mut FunctionTree, cell: FunctionId, input: &mut Byt
       }
       callIndex = callIndex + 1
     }
+    if code == op.OP_fclosure { closureChild = u32.toI32(readU32(input.asSlice(), p + 1)) closureEnd = p + 5 closureDup = false }
+    else if code == op.OP_set_name && p == closureEnd { closureEnd = p + 5 }
+    else if code == op.OP_dup && p == closureEnd && !closureDup { closureEnd = p + 1 closureDup = true }
     if code == op.OP_scope_get_var_checkthis || code == op.OP_scope_get_var_undef || code == op.OP_scope_get_var
       || code == op.OP_scope_put_var || code == op.OP_scope_delete_var || code == op.OP_scope_get_ref || code == op.OP_scope_put_var_init || code == op.OP_scope_make_ref {
       let name = readU32(input.asSlice(), p + 1) let mut label: i32 = -1 let mut scopeOffset: usize = 5
+      // How this access uses its variable, for js_compiler_known.
+      let mut use = known.USE_OTHER let mut child: i32 = -1
+      if code == op.OP_scope_get_var {
+        let reads = tree.get(cell)
+        while calleeIndex < reads.calleeReads.length() && u32.toUsize(reads.calleeReads.get(calleeIndex)) < p { calleeIndex = calleeIndex + 1 }
+        if calleeIndex < reads.calleeReads.length() && u32.toUsize(reads.calleeReads.get(calleeIndex)) == p { use = known.USE_CALL }
+        drop reads
+      } else if (code == op.OP_scope_put_var || code == op.OP_scope_put_var_init) && p == closureEnd && closureChild >= 0
+        && (!closureDup || (p + 7 < input.length() && input.get(p + 7) == op.OP_drop)) {
+        use = known.USE_WRITE child = closureChild
+      }
       if code == op.OP_scope_make_ref {
         label = u32.toI32(readU32(input.asSlice(), p + 5)) scopeOffset = 9
         let owner = tree.getMut(cell)
         let _count = emit.updateLabel(&mut owner, label, -1)
       }
       let scope = u16.toI32(readU16(input.asSlice(), p + scopeOffset))
-      next = i32.toUsize(run resolveScope(&mut tree, cell, &mut input, &mut memo, name, scope, code, label, usize.toI32(next)))
+      next = i32.toUsize(run resolveScope(&mut tree, cell, &mut input, &mut memo, name, scope, code, label, usize.toI32(next), use, child))
       // Resolved: the operand's reference goes now instead of in a cleanup walk.
       let owner = tree.getMut(cell)
       let mut ownerAnchor = ()
@@ -946,7 +970,7 @@ effect fn resolvePass(tree: &mut FunctionTree, cell: FunctionId, input: &mut Byt
         copy = false
       } else if code == op.OP_set_name {
         if readU32(input.asSlice(), p + 1) == 0 { copy = false }
-      } else if code == op.OP_if_false || code == op.OP_if_true || code == op.OP_catch { fd.jumpCapacity = fd.jumpCapacity + 1 }
+      } else if code == op.OP_if_false || code == op.OP_if_true || code == op.OP_catch || code == op.OP_for_await_of_start { fd.jumpCapacity = fd.jumpCapacity + 1 }
       else if code == op.OP_dup {
         if !debug && matchCode(&mut cc, input.asSlice(), usize.toI32(next), &[M2(op.OP_if_false, op.OP_if_true), opcode(op.OP_drop), -1]) {
           let first = cc.label let mut target = first let branch = cc.opcode let after = cc.position let branchLine = cc.lineNumber
@@ -1063,6 +1087,9 @@ effect fn resolveStubName(tree: &mut FunctionTree, cell: FunctionId, shortcut: b
         state.captureVar(&mut owner, u16.toI32(v.variableIndex), v.kind == ClosureKind.Argument)
       }
       drop owner
+      // A lazy body's use of a name is no known callee read (js_compiler_known).
+      if v.kind == ClosureKind.Local { known.noteLocal(&mut tree, outer, u16.toI32(v.variableIndex), known.USE_OTHER) }
+      else if v.kind == ClosureKind.Reference { known.noteClosure(&mut tree, outer, u16.toI32(v.variableIndex), known.USE_OTHER) }
       let _index = run state.getClosureVar(&mut tree, cell, outer, v.kind, u16.toI32(v.variableIndex), name, v.isConst, v.isLexical, v.variableKind)
       return
     }
@@ -1070,6 +1097,7 @@ effect fn resolveStubName(tree: &mut FunctionTree, cell: FunctionId, shortcut: b
   }
   let mut label: i32 = -1
   let binding = run lookup(&mut tree, cell, name, scope, op.OP_scope_get_var, &mut label)
+  known.noteUse(&mut tree, cell, binding.storage, binding.index, known.USE_OTHER, -1)
   if !cacheable || binding.storage < 2 || label != -1 { return }
   let own = tree.get(cell)
   // Object environment tests emit code: their outcome is not the parent's alone.
