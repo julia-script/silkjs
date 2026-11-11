@@ -196,18 +196,15 @@ function install(global) {
     state.formatting = true;
     try {
       const override = overrideStackTrace.get(error);
-      if (override !== undefined) {
-        overrideStackTrace.delete(error);
-        return override(error, callSites(frames));
-      }
+      if (override !== undefined) overrideStackTrace.delete(error);
       let owner = Error;
-      let prepare = owner.prepareStackTrace;
-      if (typeof prepare !== 'function' && rootError !== Error) {
+      let prepare = override ?? owner.prepareStackTrace;
+      if (override === undefined && typeof prepare !== 'function' && rootError !== Error) {
         owner = rootError;
         prepare = owner.prepareStackTrace;
       }
-      if (typeof prepare !== 'function' || prepare === state.defaultPrepare) return defaultFormat(error, frames);
-      return Reflect.apply(prepare, owner, [error, callSites(frames)]);
+      if (override === undefined && (typeof prepare !== 'function' || prepare === state.defaultPrepare)) return defaultFormat(error, frames);
+      return Reflect.apply(prepare, override === undefined ? owner : undefined, [error, callSites(frames)]);
     } finally { state.formatting = false; }
   }
   function getStack() {
@@ -250,4 +247,8 @@ function install(global) {
   host.captureCallSites(0, Error, format);
 }
 
-module.exports = { install };
+module.exports = {
+  install,
+  get overrideStackTrace() { return host.errorStackState.overrideStackTrace; },
+  get ErrorPrepareStackTrace() { return host.errorStackState.defaultPrepare; },
+};

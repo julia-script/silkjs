@@ -42,7 +42,14 @@ const {
 const { isError } = require('internal/util');
 
 const { inspect } = require('internal/util/inspect');
-const colors = require('internal/util/colors');
+// Loaded on first use, as internal/util/colors refreshes from the process's
+// stderr and environment when it loads, and this module loads into the
+// runtime's heap image.
+let colors;
+function lazyColors() {
+  colors ??= require('internal/util/colors');
+  return colors;
+}
 const { validateObject } = require('internal/validators');
 const { isErrorStackTraceLimitWritable } = require('internal/errors');
 const { myersDiff, printMyersDiff, printSimpleMyersDiff } = require('internal/assert/myers_diff');
@@ -131,7 +138,7 @@ function checkOperator(actual, expected, operator) {
 }
 
 function getColoredMyersDiff(actual, expected) {
-  const header = `${colors.green}actual${colors.white} ${colors.red}expected${colors.white}`;
+  const header = `${lazyColors().green}actual${lazyColors().white} ${lazyColors().red}expected${lazyColors().white}`;
   const skipped = false;
 
   const diff = myersDiff(StringPrototypeSplit(actual, ''), StringPrototypeSplit(expected, ''));
@@ -147,7 +154,7 @@ function getColoredMyersDiff(actual, expected) {
 function getStackedDiff(actual, expected) {
   const isStringComparison = typeof actual === 'string' && typeof expected === 'string';
 
-  let message = `\n${colors.green}+${colors.white} ${actual}\n${colors.red}- ${colors.white}${expected}`;
+  let message = `\n${lazyColors().green}+${lazyColors().white} ${actual}\n${lazyColors().red}- ${lazyColors().white}${expected}`;
   const stringsLen = actual.length + expected.length;
   const maxTerminalLength = process.stderr.isTTY ? process.stderr.columns : 80;
   const showIndicator = isStringComparison && (stringsLen <= maxTerminalLength);
@@ -189,7 +196,7 @@ function getSimpleDiff(originalActual, actual, originalExpected, expected) {
 
   const isStringComparison = typeof originalActual === 'string' && typeof originalExpected === 'string';
   // colored myers diff
-  if (isStringComparison && colors.hasColors) {
+  if (isStringComparison && lazyColors().hasColors) {
     return getColoredMyersDiff(actual, expected);
   }
 
@@ -214,7 +221,7 @@ function createErrDiff(actual, expected, operator, customMessage, diffType = 'si
   const inspectedSplitActual = StringPrototypeSplit(inspectedActual, '\n');
   const inspectedSplitExpected = StringPrototypeSplit(inspectedExpected, '\n');
   const showSimpleDiff = isSimpleDiff(actual, inspectedSplitActual, expected, inspectedSplitExpected);
-  let header = `${colors.green}+ actual${colors.white} ${colors.red}- expected${colors.white}`;
+  let header = `${lazyColors().green}+ actual${lazyColors().white} ${lazyColors().red}- expected${lazyColors().white}`;
 
   if (showSimpleDiff) {
     const simpleDiff = getSimpleDiff(actual, inspectedSplitActual[0], expected, inspectedSplitExpected[0]);
@@ -243,7 +250,7 @@ function createErrDiff(actual, expected, operator, customMessage, diffType = 'si
     message = myersDiffMessage.message;
 
     if (operator === 'partialDeepStrictEqual') {
-      header = `${colors.gray}${colors.hasColors ? '' : '+ '}actual${colors.white} ${colors.red}- expected${colors.white}`;
+      header = `${lazyColors().gray}${lazyColors().hasColors ? '' : '+ '}actual${lazyColors().white} ${lazyColors().red}- expected${lazyColors().white}`;
     }
 
     if (myersDiffMessage.skipped) {
@@ -297,7 +304,7 @@ class AssertionError extends Error {
     } else {
       // Reset colors on each call to make sure we handle dynamically set environment
       // variables correct.
-      colors.refresh();
+      lazyColors().refresh();
       // Prevent the error stack from being visible by duplicating the error
       // in a very close way to the original in case both sides are actually
       // instances of Error.
@@ -328,7 +335,7 @@ class AssertionError extends Error {
 
         // Only remove lines in case it makes sense to collapse those.
         if (res.length > 50 && diff !== 'full') {
-          res[46] = `${colors.blue}...${colors.white}`;
+          res[46] = `${lazyColors().blue}...${lazyColors().white}`;
           while (res.length > 47) {
             ArrayPrototypePop(res);
           }

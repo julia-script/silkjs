@@ -23,13 +23,9 @@
 const host = require('internal/host');
 const { Buffer } = require('buffer');
 const darwin = host.platform === 'darwin';
-function invalid(name, type) {
-  return Object.assign(new TypeError(`The "${name}" argument must be of type ${type}`), { code: 'ERR_INVALID_ARG_TYPE' });
-}
+const { validateInteger } = require('internal/path_events/support');
 function integer(value, name, min = -2147483648, max = 2147483647) {
-  if (typeof value !== 'number') throw invalid(name, 'number');
-  if (!Number.isInteger(value) || value < min || value > max)
-    throw Object.assign(new RangeError(`The value of "${name}" is out of range. It must be >= ${min} and <= ${max}. Received ${value}`), { code: 'ERR_OUT_OF_RANGE' });
+  validateInteger(value, name, min, max);
   return value;
 }
 function native(op, args = []) {

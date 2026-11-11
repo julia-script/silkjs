@@ -34,7 +34,14 @@ const {
   },
 } = require('internal/errors');
 
-const colors = require('internal/util/colors');
+// Loaded on first use, as internal/util/colors refreshes from the process's
+// stderr and environment when it loads, and this module loads into the
+// runtime's heap image.
+let colors;
+function lazyColors() {
+  colors ??= require('internal/util/colors');
+  return colors;
+}
 
 const kNopLinesToCollapse = 5;
 const kOperations = {
@@ -151,15 +158,15 @@ function printSimpleMyersDiff(diff) {
 
   for (let diffIdx = diff.length - 1; diffIdx >= 0; diffIdx--) {
     const { 0: operation, 1: value } = diff[diffIdx];
-    let color = colors.white;
+    let color = lazyColors().white;
 
     if (operation === kOperations.INSERT) {
-      color = colors.green;
+      color = lazyColors().green;
     } else if (operation === kOperations.DELETE) {
-      color = colors.red;
+      color = lazyColors().red;
     }
 
-    message += `${color}${value}${colors.white}`;
+    message += `${color}${value}${lazyColors().white}`;
   }
 
   return `\n${message}`;
@@ -177,13 +184,13 @@ function printMyersDiff(diff, operator) {
     // Avoid grouping if only one line would have been grouped otherwise
     if (previousOperation === kOperations.NOP && operation !== previousOperation) {
       if (nopCount === kNopLinesToCollapse + 1) {
-        message += `${colors.white}  ${diff[diffIdx + 1][1]}\n`;
+        message += `${lazyColors().white}  ${diff[diffIdx + 1][1]}\n`;
       } else if (nopCount === kNopLinesToCollapse + 2) {
-        message += `${colors.white}  ${diff[diffIdx + 2][1]}\n`;
-        message += `${colors.white}  ${diff[diffIdx + 1][1]}\n`;
+        message += `${lazyColors().white}  ${diff[diffIdx + 2][1]}\n`;
+        message += `${lazyColors().white}  ${diff[diffIdx + 1][1]}\n`;
       } else if (nopCount >= kNopLinesToCollapse + 3) {
-        message += `${colors.blue}...${colors.white}\n`;
-        message += `${colors.white}  ${diff[diffIdx + 1][1]}\n`;
+        message += `${lazyColors().blue}...${lazyColors().white}\n`;
+        message += `${lazyColors().white}  ${diff[diffIdx + 1][1]}\n`;
         skipped = true;
       }
       nopCount = 0;
@@ -191,15 +198,15 @@ function printMyersDiff(diff, operator) {
 
     if (operation === kOperations.INSERT) {
       if (operator === 'partialDeepStrictEqual') {
-        message += `${colors.gray}${colors.hasColors ? ' ' : '+'} ${value}${colors.white}\n`;
+        message += `${lazyColors().gray}${lazyColors().hasColors ? ' ' : '+'} ${value}${lazyColors().white}\n`;
       } else {
-        message += `${colors.green}+${colors.white} ${value}\n`;
+        message += `${lazyColors().green}+${lazyColors().white} ${value}\n`;
       }
     } else if (operation === kOperations.DELETE) {
-      message += `${colors.red}-${colors.white} ${value}\n`;
+      message += `${lazyColors().red}-${lazyColors().white} ${value}\n`;
     } else if (operation === kOperations.NOP) {
       if (nopCount < kNopLinesToCollapse) {
-        message += `${colors.white}  ${value}\n`;
+        message += `${lazyColors().white}  ${value}\n`;
       }
       nopCount++;
     }

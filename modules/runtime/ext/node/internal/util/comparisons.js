@@ -170,15 +170,18 @@ function isURL(value) {
 }
 
 // Node reads CryptoKey and KeyObject internals from its key handles; here the
-// runtime's crypto module owns the key records, so equality goes through
-// KeyObject.prototype.equals (KeyObject.from unwraps a CryptoKey's record).
-let KeyObject;
-function lazyKeyObject() {
-  KeyObject ??= require('crypto').KeyObject;
-  return KeyObject;
-}
+// runtime's crypto modules own the key records, so equality compares those
+// records directly, never the user-replaceable KeyObject.prototype.equals.
+let cryptoCore;
+let cryptoWebcrypto;
 function keyObjectEquals(a, b) {
-  return FunctionPrototypeCall(lazyKeyObject().prototype.equals, a, b);
+  cryptoCore ??= require('internal/crypto_core');
+  return cryptoCore.keyObjectEquals(a, b);
+}
+// The KeyObject record behind a CryptoKey.
+function cryptoKeyObject(key) {
+  cryptoWebcrypto ??= require('internal/crypto_webcrypto');
+  return cryptoWebcrypto.unwrap(key);
 }
 // CryptoKey usages are a set (Node compares the usages bit mask).
 function sameUsages(a, b) {
@@ -466,7 +469,7 @@ function objectComparisonStart(val1, val2, mode, memos) {
       return false;
     }
   } else if (isKeyObject(val1)) {
-    // A KeyObject's equals compares the key type and material.
+    // Compares the key type and material.
     if (!isKeyObject(val2) || !keyObjectEquals(val1, val2)) {
       return false;
     }
@@ -476,7 +479,7 @@ function objectComparisonStart(val1, val2, mode, memos) {
       val1.extractable !== val2.extractable ||
       !innerDeepEqual(val1.algorithm, val2.algorithm, mode, memos) ||
       !sameUsages(val1.usages, val2.usages) ||
-      !keyObjectEquals(lazyKeyObject().from(val1), lazyKeyObject().from(val2))
+      !keyObjectEquals(cryptoKeyObject(val1), cryptoKeyObject(val2))
     ) {
       return false;
     }
