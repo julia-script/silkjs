@@ -286,4 +286,4 @@ contexts.subscribe(context => {
   pendingScripts.delete(context.token);
   for (const script of pending) scriptParsed(script);
 });
-module.exports = { dispatch, close, paused, scriptParsed, armStartup };
+module.exports = { dispatch, close, paused, scriptParsed, armStartup, resourceURL };

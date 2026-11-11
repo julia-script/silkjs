@@ -11,6 +11,8 @@ let hook;
 let asyncEnabled = false;
 let initialized = false;
 let nextId = 1;
+// In-memory collectors (the inspector's NodeTracing domain), each with its own categories.
+const sinks = new Set();
 const stringify = JSON.stringify;
 // Modules that switch a fast path on and off with a category group: [group, callback, state].
 const watchers = [];
@@ -60,12 +62,18 @@ function emit(category, name, phase, args = {}, id, timestamp, duration) {
     if (id !== undefined) event.id = `0x${id.toString(16)}`;
     if (phase === 'i') event.s = 't';
     if (duration !== undefined) event.dur = duration;
-    const json = stringify(event);
-    native('record', json.slice(0, -1), timestamp);
+    if (sinks.size) {
+      const ts = timestamp === undefined ? Number(process.hrtime.bigint() / 1000n) : Math.trunc(timestamp);
+      for (const sink of sinks) if (sink.matches(category)) sink.events.push({ pid: process.pid, tid: process.pid, ts, ...event });
+    }
+    if (opened) native('record', stringify(event).slice(0, -1), timestamp);
   } finally { writing = false; }
 }
+function categoryPattern(category) {
+  return new RegExp(`^${category.split('*').map(part => part.replace(/[\\^$+?.()|[\]{}]/g, '\\$&')).join('.*')}$`);
+}
 function sync() {
-  patterns = [...counts.keys()].map(category => new RegExp(`^${category.split('*').map(part => part.replace(/[\\^$+?.()|[\]{}]/g, '\\$&')).join('.*')}$`));
+  patterns = [...counts.keys()].map(categoryPattern);
   // Every publish is traced under this category, built-in publishers included.
   if (enabled('node.diagnostics_channel')) require('diagnostics_channel');
   const track = enabled('node,node.async_hooks');
@@ -100,8 +108,8 @@ function sync() {
     resources.clear();
   }
 }
-function add(categories) {
-  ensureOpen();
+function add(categories, file = true) {
+  if (file) ensureOpen();
   for (const category of categories) counts.set(category, (counts.get(category) || 0) + 1);
   sync();
 }
@@ -112,7 +120,27 @@ function remove(categories) {
     else if (count !== undefined) counts.set(category, count - 1);
   }
   sync();
-  native('flush');
+  if (opened) native('flush');
+}
+// Collects the events of `categories` in memory until finish(), which returns
+// them after Node's two metadata events, as Node's inspector trace writer does.
+function collect(categories) {
+  const own = [...categories].map(categoryPattern);
+  const sink = {
+    events: [
+      { pid: process.pid, tid: process.pid, ts: 0, ph: 'M', cat: '__metadata', name: 'process_name', args: { name: processName() } },
+      { pid: process.pid, tid: process.pid, ts: 0, ph: 'M', cat: '__metadata', name: 'thread_name', args: { name: 'JavaScriptMainThread' } },
+    ],
+    matches(group) { return group.split(',').some(category => own.some(pattern => pattern.test(category))); },
+    finish() {
+      if (!sinks.delete(sink)) return sink.events;
+      remove(categories);
+      return sink.events;
+    },
+  };
+  sinks.add(sink);
+  add(categories, false);
+  return sink;
 }
 function getEnabledCategories() { return [...counts.keys()].sort().join(',') || undefined; }
 function initialize(options = {}) {
@@ -172,4 +200,4 @@ function trace(phase, category, name, id, data) {
 }
 function flush() { if (opened) native('flush'); }
 module.exports = { available, enabled, isTraceCategoryEnabled: enabled, watch, trace, processTitleChanged,
-  getCategoryEnabledBuffer, setTraceCategoryStateUpdateHandler, CategorySet, add, remove, getEnabledCategories, initialize, emit, begin, end, performanceEntry, diagnostic, flush };
+  getCategoryEnabledBuffer, setTraceCategoryStateUpdateHandler, CategorySet, add, remove, collect, getEnabledCategories, initialize, emit, begin, end, performanceEntry, diagnostic, flush };

@@ -1036,6 +1036,12 @@ function runtimeFlag(arg) {
   if (arg === '--experimental-test-module-mocks' || arg === '--no-experimental-test-module-mocks') {
     host.experimentalTestModuleMocks = arg === '--experimental-test-module-mocks'; return true;
   }
+  if (arg === '--experimental-storage-inspection' || arg === '--no-experimental-storage-inspection') {
+    host.experimentalStorageInspection = arg === '--experimental-storage-inspection'; return true;
+  }
+  if (arg === '--experimental-network-inspection' || arg === '--no-experimental-network-inspection') {
+    host.experimentalNetworkInspection = arg === '--experimental-network-inspection'; return true;
+  }
   if (arg === '--experimental-inspector-network-resource' || arg === '--no-experimental-inspector-network-resource') {
     host.experimentalInspectorNetworkResource = arg === '--experimental-inspector-network-resource'; return true;
   }
@@ -1077,7 +1083,7 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
     delete globalThis.WebSocket;
     delete globalThis.CloseEvent;
   }
-  if (host.experimentalWebStorage) internalRequire('internal/web/storage').install(globalThis, { localStorageFile: host.localStorageFile });
+  if (host.experimentalWebStorage) internalRequire('internal/web/storage').install(globalThis, { localStorageFile: host.localStorageFile, inspect: !!host.experimentalStorageInspection });
   if (host.experimentalStreamIter) { internalRequire('fs/promises'); internalRequire('internal/fs_iter').install(); }
   if (workerThreads.isMainThread) internalRequire('internal/trace_events').initialize(host.traceOptions);
   if (workerThreads.isMainThread && host.traceSigint) internalRequire('util').setTraceSigInt(true);
@@ -1392,7 +1398,9 @@ function run() {
   if (testMode) {
     return internalRequire('internal/main/test_runner').runTestRunner(testOptions, args.slice(index), reporterNames, destinations);
   }
-  if (expression === undefined && filename === undefined && (interactive || process.stdin.isTTY)) {
+  // As node.cc, ask whether descriptor 0 is a terminal without making process.stdin:
+  // that stream would make the descriptor nonblocking before a piped script is read.
+  if (expression === undefined && filename === undefined && (interactive || internalRequire('tty').isatty(0))) {
     if (inputTypeSet) {
       console.error('Cannot specify --input-type for REPL');
       process.exitCode = 9;

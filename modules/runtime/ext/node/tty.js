@@ -9,12 +9,20 @@ const fs = require('fs');
 function isatty(fd) {
   return Number.isInteger(fd) && fd >= 0 && fd <= 0x7fffffff && native('guessHandleType', [fd]) === 5;
 }
+// uv_tty_init's failure as Node's TTY binding reports it in its ctx object.
+function initFailure(status) {
+  const uv = require('internal/uv_binding');
+  const { ERR_TTY_INIT_FAILED } = require('internal/errors').codes;
+  return new ERR_TTY_INIT_FAILED({ errno: status, code: uv.errname(status), message: uv.getErrorMessage(status), syscall: 'uv_tty_init' });
+}
 function initialize(stream, fd, options) {
-  if (!Number.isInteger(fd) || fd < 0 || fd > 0x7fffffff)
-    throw Object.assign(new RangeError(`"fd" must be a non-negative integer: ${fd}`), { code: 'ERR_INVALID_FD' });
+  if (fd >> 0 !== fd || fd < 0) throw new (require('internal/errors').codes.ERR_INVALID_FD)(fd);
+  // As uv_tty_init: a descriptor that is a regular file or nothing it can tell is EINVAL.
+  const kind = native('guessHandleType', [fd]);
+  if (kind < 0 || kind === 6) throw initFailure(require('internal/uv_binding').UV_EINVAL);
   Socket.call(stream, { readableHighWaterMark: 0, ...options, fd: undefined });
   const owned = native('duplicateFd', [fd]);
-  if (owned < 0) throw Object.assign(nativeError(owned, 'uv_tty_init'), { code: 'ERR_TTY_INIT_FAILED' });
+  if (owned < 0) throw initFailure(owned);
   let transport;
   try { transport = new Transport(5, stream, (...args) => stream._onNative(...args), undefined, owned); }
   catch (cause) {
