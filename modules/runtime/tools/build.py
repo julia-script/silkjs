@@ -3,6 +3,7 @@
 from pathlib import Path
 import argparse
 import filecmp
+import json
 import os
 import platform
 import shutil
@@ -54,6 +55,30 @@ def main():
     if args.release:
         command += ['--optimization', 'speed']
     subprocess.run(command, cwd=ROOT, env=environment, check=True)
+    embed_builtin_cache(args.output.resolve(), native, environment)
+
+
+def embed_builtin_cache(output, native, environment):
+    """Link again with the built-ins' bytecode, which the first link's executable writes.
+
+    Without it the runtime still works: built-ins compile from source at startup. That is
+    what a build for another machine gets, since its executable cannot run here.
+    """
+    record = ROOT / 'build/link-command.json'
+    cache = ROOT / 'build/builtin-cache/builtins.bin'
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(cache, 'wb') as destination:
+            subprocess.run([str(output), '--silk-write-builtin-cache'], stdout=destination, env=environment, check=True)
+    except (OSError, subprocess.CalledProcessError) as error:
+        print(f'Built-in bytecode not embedded ({error}); built-ins will compile at startup')
+        return
+    build_native.build_builtin_cache(native, environment, cache)
+    link = json.loads(record.read_text())
+    arguments = link['arguments']
+    arguments[arguments.index('-o') + 1] = str(output)
+    subprocess.run([link['compiler'], *arguments], cwd=link['directory'], env=environment, check=True)
+    print(f'Embedded {cache.stat().st_size} bytes of built-in bytecode')
 
 
 if __name__ == '__main__':
