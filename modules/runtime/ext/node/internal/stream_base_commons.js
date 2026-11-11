@@ -36,7 +36,7 @@ const {
   kLastWriteErr,
   streamBaseState,
 } = require('internal/net/binding').stream_wrap;
-const { UV_EOF } = require('internal/net/binding').uv;
+const { UV_EOF } = require('internal/uv_binding');
 const {
   ErrnoException,
 } = require('internal/errors');
