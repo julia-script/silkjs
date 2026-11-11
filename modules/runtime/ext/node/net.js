@@ -8,17 +8,24 @@ const { Transport, error: nativeError, native } = require('internal/net/transpor
 let defaultAutoSelectFamily = true;
 let defaultAutoSelectFamilyAttemptTimeout = 250;
 
-const { codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_OUT_OF_RANGE }, validateBoolean, validateFunction, validateInt32, validateNumber, validateString } = require('internal/validators');
-const { codes: { ERR_INVALID_ADDRESS_FAMILY, ERR_INVALID_IP_ADDRESS, ERR_IP_BLOCKED, ERR_MISSING_ARGS }, makeError, ExceptionWithHostPort, validatePort } = require('internal/net/errors');
+const { codedError, validateAbortSignal, validateBoolean, validateFunction, validateInt32, validateNumber, validatePort, validateString } = require('internal/validators');
+const {
+  AbortError, ExceptionWithHostPort,
+  codes: {
+    ERR_INVALID_ADDRESS_FAMILY, ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_INVALID_HANDLE_TYPE, ERR_INVALID_IP_ADDRESS,
+    ERR_IP_BLOCKED, ERR_MISSING_ARGS, ERR_OUT_OF_RANGE, ERR_SERVER_ALREADY_LISTEN, ERR_SERVER_NOT_RUNNING, ERR_SOCKET_CLOSED,
+    ERR_SOCKET_CLOSED_BEFORE_CONNECTION,
+  },
+} = require('internal/errors');
+const UV_ETIMEDOUT = -require('os').constants.errno.ETIMEDOUT;
 
-function fail(code, message, Type = Error) { return makeError(Type, code, message); }
 function integer(value, name, min, max) {
   if (!Number.isInteger(value) || value < min || value > max)
-    throw fail('ERR_OUT_OF_RANGE', `The value of "${name}" is out of range. It must be >= ${min} and <= ${max}. Received ${value}`, RangeError);
+    throw new ERR_OUT_OF_RANGE(name, `>= ${min} and <= ${max}`, value);
   return value;
 }
 function callback(value) {
-  if (value !== undefined && typeof value !== 'function') throw fail('ERR_INVALID_ARG_TYPE', 'Callback must be a function', TypeError);
+  if (value !== undefined) validateFunction(value, 'callback');
 }
 // Like Node's regular expressions: the input is converted to a string, and an IPv6 address may
 // carry a zone ID such as `%eth0`.
@@ -57,15 +64,11 @@ function blockList(options) {
   return options.blockList;
 }
 function abortError(signal) {
-  const err = fail('ABORT_ERR', 'The operation was aborted');
-  err.name = 'AbortError';
-  err.cause = signal.reason;
-  return err;
+  return new AbortError(undefined, { cause: signal.reason });
 }
 function attachAbort(target, signal, abort) {
   if (signal === undefined) return;
-  if (signal === null || typeof signal.addEventListener !== 'function' || typeof signal.aborted !== 'boolean')
-    throw fail('ERR_INVALID_ARG_TYPE', 'The "signal" argument must be an AbortSignal', TypeError);
+  validateAbortSignal(signal, 'options.signal');
   target._removeAbort?.();
   const listener = () => abort(abortError(signal));
   target._removeAbort = () => { signal.removeEventListener('abort', listener); target._removeAbort = null; };
@@ -119,7 +122,7 @@ function Socket(options) {
     validateInt32(options.fd, 'fd', 0);
     const kind = native('guessHandleType', [options.fd]);
     if (kind !== 1 && kind !== 2) throw nativeError(kind < 0 ? kind : -22, 'open');
-    const transport = new Transport(kind, (...args) => this._onNative(...args));
+    const transport = new Transport(kind, this, (...args) => this._onNative(...args));
     const status = transport.call('open', options.fd);
     if (status < 0) { transport.close(); throw nativeError(status, 'open'); }
     this._attachTransport(transport);
@@ -187,7 +190,7 @@ Socket.prototype._onNative = function(type, status, payload) {
     if (status < 0) {
       // Like Node's createConnectionError: a given local address and port are in the message.
       const local = this._connectLocal;
-      const err = ExceptionWithHostPort(status, 'connect', this._connectAddress, this._connectPort, local && `${local.address}:${local.port}`);
+      const err = new ExceptionWithHostPort(status, 'connect', this._connectAddress, this._connectPort, local && `${local.address}:${local.port}`);
       if (local) { err.localAddress = local.address; err.localPort = local.port; }
       this._connectionFailed(err);
       return;
@@ -238,7 +241,7 @@ Socket.prototype._deliverOnread = function() {
   while (this._onreadPending?.length && !this._readPaused && !this.destroyed) {
     const destination = typeof this._onread.buffer === 'function' ? this._onread.buffer() : this._onread.buffer;
     if (!(destination instanceof Uint8Array) || destination.byteLength === 0) {
-      this.destroy(fail('ERR_INVALID_ARG_VALUE', 'onread.buffer must provide a nonempty Uint8Array')); return;
+      this.destroy(new ERR_INVALID_ARG_VALUE('options.onread.buffer', destination, 'must provide a nonempty Uint8Array')); return;
     }
     const chunk = this._onreadPending;
     const count = Math.min(destination.byteLength, chunk.length);
@@ -283,7 +286,7 @@ Socket.prototype._send = function(chunks, cb, vector) {
     this._pendingWrite.chunks = chunks;
     return;
   }
-  if (!this._connected || !this._transport) { cb(fail('ERR_SOCKET_CLOSED', 'Socket is closed')); return; }
+  if (!this._connected || !this._transport) { cb(new ERR_SOCKET_CLOSED()); return; }
   if (vector) for (const entry of chunks) this._bytesWritten += entry.chunk.length;
   else this._bytesWritten += chunks.length;
   this._refreshTimeout();
@@ -318,7 +321,7 @@ Socket.prototype._destroy = function(err, cb) {
   const pending = this._pendingWrite;
   this._pendingWrite = null;
   // Like Node, a write waiting for the connect fails once the socket closes.
-  if (pending?.callback) process.nextTick(pending.callback, fail('ERR_SOCKET_CLOSED_BEFORE_CONNECTION', 'Socket closed before the connection was established'));
+  if (pending?.callback) process.nextTick(pending.callback, new ERR_SOCKET_CLOSED_BEFORE_CONNECTION());
   else if (pending) pending();
   const done = () => {
     cb(err);
@@ -343,8 +346,9 @@ Socket.prototype.connect = function(...args) {
   const [options, cb] = Array.isArray(args[0]) && args[0][normalizedArgs] ? args[0] : normalizeArgs(args);
   if (cb !== null) this.once('connect', cb);
   if (options.port === undefined && options.path == null) throw new ERR_MISSING_ARGS(['options', 'port', 'path']);
-  if (this.connecting || this._connected) throw fail('ERR_SOCKET_IS_CONNECTED', 'Socket is already connected');
-  if (this._transport?.closing) throw fail('ERR_SOCKET_CLOSED', 'Socket is still closing');
+  if (this.connecting || this._connected) // Node reuses the handle here; a connected transport here cannot be redirected yet.
+    throw codedError(Error, 'ERR_SOCKET_IS_CONNECTED', 'Socket is already connected');
+  if (this._transport?.closing) throw new ERR_SOCKET_CLOSED();
   let port;
   let attemptTimeout = defaultAutoSelectFamilyAttemptTimeout;
   if (options.path) validateString(options.path, 'options.path');
@@ -387,7 +391,7 @@ Socket.prototype.connect = function(...args) {
     this._connectAddress = address;
     this._connectLocal = options.localAddress && options.localPort ? { address: options.localAddress, port: options.localPort } : undefined;
     try {
-      this._attachTransport(new Transport(options.path ? 2 : 1, (...event) => this._onNative(...event)));
+      this._attachTransport(new Transport(options.path ? 2 : 1, this, (...event) => this._onNative(...event)));
       if (options.localAddress !== undefined || options.localPort !== undefined) {
         const local = options.localAddress || (family === 6 ? '::' : '0.0.0.0');
         const status = this._transport.call('bind', local, Number(options.localPort || 0), 0);
@@ -401,7 +405,7 @@ Socket.prototype.connect = function(...args) {
         // Like Node's internalConnect, a TCP connect that fails at once names the local address,
         // which is empty when the socket has none.
         const local = options.path ? undefined : this.address();
-        this._connectionFailed(ExceptionWithHostPort(status, 'connect', address, port, local && `${local.address}:${local.port}`));
+        this._connectionFailed(new ExceptionWithHostPort(status, 'connect', address, port, local && `${local.address}:${local.port}`));
       }
     } catch (err) { this.destroy(err); }
   };
@@ -477,10 +481,7 @@ Socket.prototype.connect = function(...args) {
             this._connectTimer = setTimeout(() => {
               this._connectTimer = null;
               this.emit('connectionAttemptTimeout', record.address, port, record.family);
-              const timeout = fail('ETIMEDOUT', `connect ETIMEDOUT ${record.address}:${port}`);
-              timeout.syscall = 'connect';
-              timeout.address = record.address;
-              timeout.port = port;
+              const timeout = new ExceptionWithHostPort(UV_ETIMEDOUT, 'connect', record.address, port);
               this._connectionFailed(timeout);
             }, attemptTimeout);
             if (this._unrefed) this._connectTimer.unref?.();
@@ -534,7 +535,7 @@ Socket.prototype.destroySoon = function() {
   return this;
 };
 Socket.prototype.resetAndDestroy = function() {
-  if (this._transport && this._transport.kind !== 1) throw fail('ERR_INVALID_HANDLE_TYPE', 'This handle type cannot be reset');
+  if (this._transport && this._transport.kind !== 1) throw new ERR_INVALID_HANDLE_TYPE();
   if (this.connecting) { this.once('connect', () => this.resetAndDestroy()); return this; }
   this._reset = true;
   return this.destroy();
@@ -600,7 +601,7 @@ Server.prototype._onNative = function(type, status, id) {
   if (type !== 2) return;
   if (status < 0) { this.emit('error', nativeError(status, 'accept')); return; }
   const socket = new Socket({ ...this._options, allowHalfOpen: this.allowHalfOpen, signal: undefined });
-  try { socket._attachTransport(new Transport(this._transport.kind, (...args) => socket._onNative(...args), id)); }
+  try { socket._attachTransport(new Transport(this._transport.kind, socket, (...args) => socket._onNative(...args), id)); }
   catch (err) { this.emit('error', err); return; }
   socket._connected = true;
   socket._cacheAddresses();
@@ -630,7 +631,7 @@ Server.prototype._acceptSocket = function(socket) {
 };
 Server.prototype.listen = function(...args) {
   const [normalized, cb] = normalizeArgs(args);
-  if (this._transport) throw fail('ERR_SERVER_ALREADY_LISTEN', 'Listen method has been called more than once without closing');
+  if (this._transport) throw new ERR_SERVER_ALREADY_LISTEN();
   if (cb !== null) this.once('listening', cb);
   const backlogFromArgs = toNumber(args.length > 1 && args[1]) || toNumber(args.length > 2 && args[2]);
   const options = normalized._handle || normalized.handle || normalized;
@@ -672,7 +673,7 @@ Server.prototype.listen = function(...args) {
         kind = native('guessHandleType', [fd]);
         if (kind !== 1 && kind !== 2) { failed(nativeError(kind < 0 ? kind : -22, 'open')); return; }
       }
-      this._transport = new Transport(kind, (...event) => this._onNative(...event));
+      this._transport = new Transport(kind, this, (...event) => this._onNative(...event));
       if (this._unrefed) this._transport.unref();
       let status;
       if (fd !== undefined) status = this._transport.call('open', fd);
@@ -682,7 +683,7 @@ Server.prototype.listen = function(...args) {
         if (status < 0 && !options.host && address === '::') {
           this._transport.onEvent = () => {};
           this._transport.close();
-          this._transport = new Transport(1, (...event) => this._onNative(...event));
+          this._transport = new Transport(1, this, (...event) => this._onNative(...event));
           if (this._unrefed) this._transport.unref();
           address = '0.0.0.0';
           status = this._transport.call('bind', address, port, 0);
@@ -698,7 +699,7 @@ Server.prototype.listen = function(...args) {
       if (status < 0 && kind === 1 && fd === undefined && !options.host && address === '::') {
         this._transport.onEvent = () => {};
         this._transport.close();
-        this._transport = new Transport(1, (...event) => this._onNative(...event));
+        this._transport = new Transport(1, this, (...event) => this._onNative(...event));
         if (this._unrefed) this._transport.unref();
         address = '0.0.0.0';
         status = this._transport.call('bind', address, port, 0);
@@ -738,7 +739,7 @@ Server.prototype._emitCloseIfDrained = function() {
 // server was not listening, with ERR_SERVER_NOT_RUNNING for the callback.
 Server.prototype.close = function(cb) {
   if (typeof cb === 'function') {
-    if (!this._transport) this.once('close', function close() { cb(fail('ERR_SERVER_NOT_RUNNING', 'Server is not running')); });
+    if (!this._transport) this.once('close', function close() { cb(new ERR_SERVER_NOT_RUNNING()); });
     else this.once('close', cb);
   }
   ++this._generation;
@@ -756,7 +757,7 @@ Server.prototype[EventEmitter.captureRejectionSymbol] = function(err, event, soc
   if (event === 'connection') sock.destroy(err);
   else this.emit('error', err);
 };
-Server.prototype.getConnections = function(cb) { callback(cb); if (!cb) throw fail('ERR_INVALID_ARG_TYPE', 'Callback must be a function', TypeError); process.nextTick(cb, null, this._connections); return this; };
+Server.prototype.getConnections = function(cb) { validateFunction(cb, 'cb'); process.nextTick(cb, null, this._connections); return this; };
 Server.prototype.ref = function() { this._unrefed = false; this._transport?.ref(); return this; };
 Server.prototype.unref = function() { this._unrefed = true; this._transport?.unref(); return this; };
 Object.defineProperty(Server.prototype, 'listening', { get() { return this._listening; } });
@@ -767,7 +768,7 @@ function createConnection(...args) { const [options] = normalizeArgs(args); retu
 function createServer(options, listener) { return new Server(options, listener); }
 function getDefaultAutoSelectFamily() { return defaultAutoSelectFamily; }
 function setDefaultAutoSelectFamily(value) {
-  if (typeof value !== 'boolean') throw fail('ERR_INVALID_ARG_TYPE', 'The "value" argument must be a boolean', TypeError);
+  validateBoolean(value, 'value');
   defaultAutoSelectFamily = value;
 }
 function getDefaultAutoSelectFamilyAttemptTimeout() { return defaultAutoSelectFamilyAttemptTimeout; }
