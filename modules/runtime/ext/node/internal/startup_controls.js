@@ -64,12 +64,12 @@ function abortOnUncaughtException(error) {
   host.osNative('abort', []);
 }
 // process.exit with --trace-exit names the exit code and prints the current stack, as Node does.
-function traceExit(code, threadId) {
+function traceExit(code, threadId, below = traceExit) {
   if (!state.traceExit) return;
   const holder = {};
   const limit = Error.stackTraceLimit;
   Error.stackTraceLimit = state.stackTraceLimit ?? 10;
-  Error.captureStackTrace(holder, traceExit);
+  Error.captureStackTrace(holder, below);
   Error.stackTraceLimit = limit;
   const frames = String(holder.stack);
   const newline = frames.indexOf('\n');
