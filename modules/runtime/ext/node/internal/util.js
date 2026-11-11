@@ -414,8 +414,19 @@ function filterDuplicateStrings(items, low) {
   return ArrayPrototypeSort(ArrayFrom(map.values()));
 }
 
+let validateUint32;
+function sleep(msec) {
+  // Lazy-load to avoid a circular dependency.
+  if (validateUint32 === undefined)
+    ({ validateUint32 } = require('internal/validators'));
+
+  validateUint32(msec, 'msec');
+  require('internal/util/binding').sleep(msec);
+}
+
 module.exports = {
   assertCrypto,
+  sleep,
   assignFunctionName,
   customInspectSymbol: SymbolFor('nodejs.util.inspect.custom'),
   customPromisifyArgs: kCustomPromisifyArgsSymbol,
