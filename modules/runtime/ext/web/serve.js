@@ -7,7 +7,7 @@
 
 const host = require('internal/host');
 const { AsyncResource } = require('async_hooks');
-const { Response, responseState, serverRequest } = require('internal/web/fetch/message');
+const { Response, readResponse, responseState, serverRequest } = require('internal/web/fetch/message');
 const { headerList } = require('internal/web/fetch/headers');
 const { URL } = require('internal/web/url');
 const { _memoryBytes: memoryBytes } = require('internal/web/blob');
@@ -18,7 +18,7 @@ const READ = 1, ACCEPTED = 2, SHUT = 5, CLOSED = 6, HTTP_REQUEST = 9;
 const KEEP_ALIVE = 1, HAS_BODY = 2;
 // Response flags.
 const CLOSE = 1, NO_BODY = 2, STREAM = 4, HAS_LENGTH = 8, HAS_DATE = 16;
-const httpRespond = host.httpRespond, httpChunk = host.httpChunk;
+const httpRespond = host.httpRespond, httpChunk = host.httpChunk, httpRespondText = host.httpRespondText;
 // A streamed response waits for the socket above this many unsent bytes.
 const STREAM_HIGH_WATER = 1 << 20;
 const hooksActive = require('async_hooks')._hooksActive;
@@ -55,6 +55,8 @@ class Connection {
     // finished: the last response went out and the write side is shut; the peer closes next.
     this.streaming = false; this.ended = false; this.finished = false; this.closing = false; this.closed = false;
     const connection = this;
+    // Events come from the loop's poll, which drains microtasks after the whole batch, so a
+    // callback does not drain them itself.
     // The handler runs in the server's async scope. With no async hooks to tell, entering that
     // scope is one context switch, or none from the loop's own.
     this.callback = (type, status, payload, extra) => {
@@ -62,11 +64,10 @@ class Connection {
       else {
         const scope = server._scope, previous = host.getAsyncContext();
         if (previous !== scope) host.setAsyncContext(scope);
-        try { connectionEvent.call(connection, type, status, payload, extra); }
+        try { if (type === HTTP_REQUEST) request(connection, status, payload, extra); else connectionEvent.call(connection, type, status, payload, extra); }
         catch (error) { host.invokeResource(server._resource, rethrow, undefined, [error], false); }
         finally { if (previous !== scope) host.setAsyncContext(previous); }
       }
-      host.checkpoint();
     };
   }
   close() {
@@ -127,6 +128,16 @@ function send(connection, requestFlags, head, response) {
   const server = connection.server;
   server._pending--;
   if (connection.closed || connection.closing || connection.finished) return;
+  // The common case: a kept-alive GET answered with text and no headers of its own.
+  const fast = readResponse(response);
+  if (fast !== undefined && fast.fields === null && (requestFlags & KEEP_ALIVE) !== 0 && !head && !server._stopping) {
+    const payload = fast.body;
+    if (payload !== null && payload.text !== null && payload.current === null && payload.encoded === null) {
+      payload.used = true;
+      if (httpRespondText(connection.id, fast.status, fast.statusText, fast.contentType, payload.text) < 0) connection.close();
+      return;
+    }
+  }
   if (!(response instanceof Response)) response = server._failure(new TypeError(`Expected a Response object, but received '${response}'`));
   let record;
   try { record = responseState(response); }

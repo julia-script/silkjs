@@ -24,7 +24,10 @@ const kBindings = {
   http_parser: 'internal/http/native-parser',
   performance: 'internal/performance_binding',
   trace_events: 'internal/trace_events_binding',
+  // inspector_agent.cc: registerAsyncHook and the asyncTask* calls.
+  inspector: 'internal/inspector_async',
   timers: 'internal/timers_binding',
+  tls_wrap: 'internal/tls/binding',
   util: 'internal/util/binding',
   uv: 'internal/uv_binding',
 };

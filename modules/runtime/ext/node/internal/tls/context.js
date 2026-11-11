@@ -375,7 +375,17 @@ function alpn(value) {
   if (out.ALPNProtocols === undefined) throw invalidArgType('ALPNProtocols', ['Array', 'Buffer', 'TypedArray', 'DataView'], value);
   return out.ALPNProtocols;
 }
+// SecureContext::AddBlockedSPKIForTesting and ClearBlockedSPKIsForTesting: digests the
+// native certificate check treats as blocked, on top of Node's built-in list.
+function addBlockedSPKIForTesting(hash) {
+  if (!ArrayBuffer.isView(hash)) throw coded(TypeError, 'ERR_INVALID_ARG_TYPE', 'SPKI hash must be a buffer');
+  if (hash.byteLength !== 32) throw coded(RangeError, 'ERR_OUT_OF_RANGE', 'SPKI hash must be 32 bytes');
+  native('blockSPKI', 0, hash);
+}
+function clearBlockedSPKIsForTesting() { native('clearBlockedSPKIs'); }
+
 module.exports = {
+  addBlockedSPKIForTesting, clearBlockedSPKIsForTesting,
   SecureContext, createSecureContext, configSecureContext, NativeSecureContext, ticketKeysBuffer, native, bytes, alpn, error,
   bundledRootCertificates: bundled, getCACertificates, setDefaultCACertificates,
 };
