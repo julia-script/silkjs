@@ -58,7 +58,8 @@ function metadata(script) {
   return { ...properties, hash, executionContextId: context.id };
 }
 function matches(breakpoint, script) {
-  return breakpoint.scriptId !== undefined ? breakpoint.scriptId === script.scriptId : breakpoint.url !== undefined ? breakpoint.url === script.url : breakpoint.regex ? breakpoint.regex.test(script.url) : breakpoint.scriptHash === (script.hash || metadata(script)?.hash);
+  const url = resourceURL(script.url);
+  return breakpoint.scriptId !== undefined ? breakpoint.scriptId === script.scriptId : breakpoint.url !== undefined ? breakpoint.url === url : breakpoint.regex ? breakpoint.regex.test(url) : breakpoint.scriptHash === (script.hash || metadata(script)?.hash);
 }
 function resolve(breakpoint, script) {
   const locations = native(23, script.scriptId);
