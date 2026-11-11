@@ -920,6 +920,18 @@ function runtimeFlag(arg) {
     }
     host.disableProto = mode; return true;
   }
+  // Which certificates tls trusts by default (internal/tls/context reads host.caStore).
+  if (arg === '--use-openssl-ca' || arg === '--use-bundled-ca') {
+    const store = arg === '--use-openssl-ca' ? 'openssl' : 'bundled';
+    if (host.caStore !== undefined && host.caStore !== store)
+      return cliError('either --use-openssl-ca or --use-bundled-ca can be used, not both');
+    host.caStore = store; return true;
+  }
+  if (arg === '--no-use-openssl-ca' || arg === '--no-use-bundled-ca') {
+    if (host.caStore === (arg === '--no-use-openssl-ca' ? 'openssl' : 'bundled')) host.caStore = undefined;
+    return true;
+  }
+  if (arg === '--use-system-ca' || arg === '--no-use-system-ca') { host.useSystemCA = arg === '--use-system-ca'; return true; }
   // V8's flag to run without a JIT: this engine is an interpreter, so it always holds.
   if (arg === '--jitless') return true;
   // Buffer.allocUnsafe memory is always zeroed here, which is what this flag asks for.

@@ -30,11 +30,33 @@ if (process.env.NODE_EXTRA_CA_CERTS) {
   } catch (err) { process.emitWarning('Ignoring extra certs from ' + process.env.NODE_EXTRA_CA_CERTS + ': ' + err.message); }
 }
 Object.freeze(extra);
-let defaults = Object.freeze([...roots, ...extra]);
+// The system store is OpenSSL's default certificate file: SSL_CERT_FILE, or where the
+// common distributions keep the bundle. Read only when something asks for it.
+const systemFiles = ['/etc/ssl/certs/ca-certificates.crt', '/etc/pki/tls/certs/ca-bundle.crt',
+  '/etc/ssl/ca-bundle.pem', '/etc/pki/tls/cacert.pem', '/etc/ssl/cert.pem'];
+let system;
+function systemCertificates() {
+  if (system) return system;
+  const fs = require('fs'), found = [];
+  for (const file of process.env.SSL_CERT_FILE ? [process.env.SSL_CERT_FILE] : systemFiles) {
+    let pem;
+    try { pem = fs.readFileSync(file, 'latin1'); } catch { continue; }
+    found.push(...(pem.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g) || []));
+    break;
+  }
+  return system = Object.freeze(found);
+}
+// --use-openssl-ca trusts the system store instead of the bundled one, --use-system-ca as well as it.
+let defaults;
+function defaultCertificates() {
+  return defaults ??= Object.freeze(host.caStore === 'openssl' ? [...systemCertificates(), ...extra] :
+    host.useSystemCA ? [...roots, ...systemCertificates(), ...extra] : [...roots, ...extra]);
+}
 function getCACertificates(type = 'default') {
-  if (type === 'default') return defaults;
+  if (type === 'default') return defaultCertificates();
   if (type === 'bundled') return roots;
   if (type === 'extra') return extra;
+  if (type === 'system') return systemCertificates();
   throw error('ERR_INVALID_ARG_VALUE', 'Unknown or unavailable CA certificate source: ' + type);
 }
 function list(value) { return Array.isArray(value) ? value : [value]; }
@@ -99,7 +121,7 @@ SecureContext.prototype._configure = function(options) {
       if (size && size < 2048) process.emitWarning('DH parameter is less than 2048 bits', 'SecurityWarning');
     }
   }
-  const cas = options.ca === undefined ? defaults : list(options.ca);
+  const cas = options.ca === undefined ? defaultCertificates() : list(options.ca);
   for (const ca of cas) native('ca', this._id, bytes(ca, 'ca'));
   if (options.allowPartialTrustChain) native('trustFlags', this._id, 0x80000);
   if (options.crl != null) for (const crl of list(options.crl)) {
