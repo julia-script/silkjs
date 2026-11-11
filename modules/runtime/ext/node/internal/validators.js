@@ -1,3 +1,27 @@
+// Argument validators adapted from Node.js v24.22.1 lib/internal/validators.js and
+// lib/internal/errors.js. Messages and codes match Node's, so tests and callers that
+// compare them see the same text.
+// Copyright Joyent, Inc. and other Node contributors.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the
+// following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+// USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 'use strict';
 // Node's argument errors and validators (lib/internal/errors.js, lib/internal/validators.js),
 // with the same codes, classes and messages, for modules that validate as Node does.
@@ -233,7 +257,54 @@ function abortError(signal) {
   return error;
 }
 
+function codedError(Base, code, message) {
+  const error = new Base(message);
+  error.code = code;
+  return error;
+}
+function unknownSignal(signal) { return codedError(TypeError, 'ERR_UNKNOWN_SIGNAL', `Unknown signal: ${signal}`); }
+
+let signals;
+const signalTable = () => signals ??= require('os').constants.signals;
+let signalNames;
+function signalName(number) {
+  if (!signalNames) {
+    signalNames = new Map();
+    const table = signalTable();
+    for (const key of Object.keys(table)) if (!signalNames.has(table[key])) signalNames.set(table[key], key);
+  }
+  return signalNames.get(number);
+}
+// Node's convertToValidSignal: a known signal number or a case-insensitive known name.
+function convertToValidSignal(signal) {
+  if (typeof signal === 'number' && signalName(signal) !== undefined) return signal;
+  if (typeof signal === 'string') {
+    const number = signalTable()[signal.toUpperCase()];
+    if (number) return number;
+  }
+  throw unknownSignal(signal);
+}
+function isUint8Array(value) { return value instanceof Uint8Array; }
+function toPathIfFileURL(value) {
+  if (value == null || typeof value !== 'object' || value.href === undefined || value.protocol === undefined) return value;
+  return require('url').fileURLToPath(value);
+}
+function validatePath(path, name = 'path') {
+  if (typeof path !== 'string' && !isUint8Array(path)) throw new ERR_INVALID_ARG_TYPE(name, ['string', 'Buffer', 'URL'], path);
+  if (typeof path === 'string' ? path.includes('\u0000') : path.includes(0)) {
+    throw new ERR_INVALID_ARG_VALUE(name, path, 'must be a string, Uint8Array, or URL without null bytes');
+  }
+}
+function getValidatedPath(value, name = 'path') {
+  const path = toPathIfFileURL(value);
+  validatePath(path, name);
+  return path;
+}
+
 module.exports = {
+  // The builders return the error, so `new codes.ERR_X(...)` works as well as `ERR_X(...)`.
+  codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_MISSING_ARGS, ERR_OUT_OF_RANGE },
+  codedError, unknownSignal, convertToValidSignal, signalName, toPathIfFileURL, validatePath, getValidatedPath,
   makeError, SystemError, systemError, determineSpecificType, addNumericalSeparator,
   ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_OUT_OF_RANGE, ERR_MISSING_ARGS,
   validateInteger, validateInt32, validateUint32, validateNumber, validateString, validateBoolean, validateFunction,
