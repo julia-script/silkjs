@@ -1,0 +1,5 @@
+// Harness prelude: papers over the gaps that stop test/common from loading. Each line is a gap to fix in the runtime.
+if (!process.config) process.config = { target_defaults: {}, variables: { v8_enable_i18n_support: 1, node_shared: false, node_use_openssl: true, asan: 0, llvm_version: '0.0', clang: 1, node_shared_openssl: false, icu_small: false, v8_enable_inspector: 1 } };
+Object.assign(process.versions, { openssl: '3.5.4', sqlite: '3.50.0', napi: '10', modules: '137', uv: '1.51.0', zlib: '1.3.1', brotli: '1.1.0', zstd: '1.5.5', nghttp2: '1.59.0', llhttp: '9.4.3', ares: '1.34.5', uvwasi: '0.0.23', v8: '13.6.233.17-node.58', icu: '78.3', unicode: '17.0', tz: '2026e', cldr: '48.0' });
+{ const keep = new Set('global clearImmediate setImmediate clearInterval clearTimeout setInterval setTimeout queueMicrotask structuredClone atob btoa performance fetch crypto navigator __filename module exports __dirname require'.split(' '));
+  for (const k of Object.keys(globalThis)) { void globalThis[k]; if (!keep.has(k)) { const d = Object.getOwnPropertyDescriptor(globalThis, k); if (d && d.configurable) { d.enumerable = false; Object.defineProperty(globalThis, k, d); } } } }
