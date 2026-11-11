@@ -466,7 +466,9 @@ Object.assign(process, {
   emitWarning: internalRequire('internal/startup_controls').emitWarning,
   setUncaughtExceptionCaptureCallback: internalRequire('internal/startup_controls').setUncaughtExceptionCaptureCallback,
   hasUncaughtExceptionCaptureCallback: internalRequire('internal/startup_controls').hasUncaughtExceptionCaptureCallback,
-  exit(code) { if (code !== undefined) process.exitCode = code; if (!process._exiting) { process._exiting = true; process.emit('exit', Number(process.exitCode) || 0); } internalRequire('internal/compile_cache').flushCompileCache(); rawStd.exit(Number(process.exitCode) || 0); },
+  exit(code) { if (code !== undefined) process.exitCode = code; if (!process._exiting) { process._exiting = true; process.emit('exit', Number(process.exitCode) || 0); } process.reallyExit(Number(process.exitCode) || 0); },
+  reallyExit(code) { internalRequire('internal/compile_cache').flushCompileCache(); rawStd.exit(Number(code) | 0); },
+  _fatalException: internalRequire('internal/startup_controls').fatalException,
   kill(pid, signal = 'SIGTERM') { const number = typeof signal === 'string' ? rawOS[signal] : signal; if (number === undefined) throw Object.assign(new TypeError('Unknown signal: ' + signal), { code: 'ERR_UNKNOWN_SIGNAL' }); const code = rawOS.kill(pid, number); if (code < 0) throw systemError(code, 'kill'); return true; }
 });
 Object.defineProperty(process, 'allowedNodeEnvironmentFlags', {
@@ -1266,6 +1268,8 @@ function loopTurn(pendingPromise) {
     }
   }
 }
+// An exception in a 'beforeExit' or 'exit' listener is uncaught like any other.
+function emitProcessEvent(name) { process.emit(name, Number(process.exitCode) || 0); }
 function loop() {
   performanceMilestones.loopStart = native.now() - startTime;
   initialNativeIdleTime = native.loopIdleTime();
@@ -1274,15 +1278,15 @@ function loop() {
     pollWorkers();
     if (workerThreads._exitRequested) break;
     if (!referencedWork()) {
-      process.emit('beforeExit', Number(process.exitCode) || 0);
+      invoke(emitProcessEvent, undefined, ['beforeExit']);
       checkpoint();
       if (!referencedWork()) break;
     }
     loopTurn();
   }
   performanceMilestones.loopExit = native.now() - startTime;
-  process._exiting = true; const status = Number(process.exitCode) || 0;
-  process.emit('exit', status);
+  process._exiting = true;
+  invoke(emitProcessEvent, undefined, ['exit']);
   if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushCompileCache();
   return Number(process.exitCode) || 0;
 }

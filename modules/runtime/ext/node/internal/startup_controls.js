@@ -116,17 +116,78 @@ function setUncaughtExceptionCaptureCallback(callback) {
   if (captureCallback !== null) throw Object.assign(new Error('`process.setupUncaughtExceptionCapture()` was called while a capture callback was already active'), { code: 'ERR_UNCAUGHT_EXCEPTION_CAPTURE_ALREADY_SET' });
   captureCallback = callback;
 }
-function handleUncaught(error, origin) {
-  process.emit('uncaughtExceptionMonitor', error, origin);
-  if (captureCallback !== null) { captureCallback(error); return; }
-  if (!process.emit('uncaughtException', error, origin)) {
-    require('internal/process_report').onUncaughtException(error);
-    throw error;
+// process._fatalException: false when nothing handled the error, after the
+// 'exit' event ran with code 1 (lib/internal/process/execution.js).
+function fatalException(error, fromPromise) {
+  const type = fromPromise ? 'unhandledRejection' : 'uncaughtException';
+  process.emit('uncaughtExceptionMonitor', error, type);
+  if (captureCallback !== null) {
+    captureCallback(error);
+  } else if (!process.emit('uncaughtException', error, type)) {
+    try {
+      if (!process._exiting) {
+        process._exiting = true;
+        process.exitCode = 1;
+        process.emit('exit', 1);
+      }
+    } catch {
+      // Nothing to be done about it at this point.
+    }
+    return false;
   }
+  return true;
+}
+// Exit codes Node's TriggerUncaughtException uses.
+const kGenericUserError = 1;
+const kInvalidFatalExceptionMonkeyPatching = 6;
+const kExceptionInFatalExceptionHandler = 7;
+function terminate(code) {
+  if (host.builtinLoaded('internal/compile_cache')) require('internal/compile_cache').flushCompileCache();
+  host.rawStd.exit(code);
+}
+// TriggerUncaughtException: an error nothing caught reaches process._fatalException;
+// when that leaves it unhandled, it is reported and the process exits. Returns
+// only when a handler took it. A worker reports its error to the parent instead,
+// so there the error is thrown on after the 'exit' event.
+function handleUncaught(error, origin) {
+  const fromPromise = origin === 'unhandledRejection';
+  const fatal = process._fatalException;
+  const mainThread = require('worker_threads').isMainThread;
+  if (typeof fatal !== 'function') {
+    if (!mainThread) throw error;
+    reportFatal(error, fromPromise);
+    terminate(kInvalidFatalExceptionMonkeyPatching);
+  }
+  let handled;
+  try {
+    handled = Reflect.apply(fatal, process, [error, fromPromise]);
+  } catch (thrown) {
+    if (!mainThread) throw thrown;
+    reportFatal(thrown, false);
+    terminate(kExceptionInFatalExceptionHandler);
+  }
+  if (handled) return;
+  require('internal/process_report').onUncaughtException(error);
+  if (!mainThread) throw error;
+  reportFatal(error, fromPromise);
+  const code = process.exitCode;
+  terminate(code === undefined ? kGenericUserError : Number(code) | 0);
+}
+let printedError = false;
+function reportFatal(error, fromPromise) {
+  if (printedError) return;
+  printedError = true;
+  let text;
+  try { text = require('internal/fatal_report').format(error, fromPromise); }
+  catch { text = '\n' + safeString(error) + '\n'; }
+  host.writeText(2, text);
+}
+function safeString(value) {
+  try { return String(value); } catch { return '<toString() threw exception>'; }
 }
 
 module.exports = {
-  optionEntries, valueError, applyOption, initialize, emitWarning, handleUncaught,
+  optionEntries, valueError, applyOption, initialize, emitWarning, handleUncaught, fatalException, reportFatal,
   isValueOption: name => valueOptions.has(name),
   setUncaughtExceptionCaptureCallback, hasUncaughtExceptionCaptureCallback: () => captureCallback !== null,
   getOptionValue(name) {
