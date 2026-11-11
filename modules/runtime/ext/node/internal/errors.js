@@ -64,7 +64,7 @@ const {
 
 // internal/error_stack owns these two: its stack header names the code of a
 // NodeError, and it formats an error found in overrideStackTrace with that callback.
-const { kIsNodeError, overrideStackTrace } = require('internal/host').errorStackState;
+const { kIsNodeError, overrides: overrideStackTrace } = require('internal/host').errorStackState;
 
 const isWindows = require('internal/host').platform === 'win32';
 

@@ -11,11 +11,12 @@ function install(global) {
   const WeakMap = global.WeakMap;
   const state = host.errorStackState || (host.errorStackState = {
     records: new WeakMap(), captured: new WeakMap(), rootError: Error, formatting: false,
-    // internal/errors: NodeErrors answer true to kIsNodeError, and an error in
-    // overrideStackTrace is formatted once by its callback (Node's hooks of the same names).
-    kIsNodeError: Symbol('kIsNodeError'), overrideStackTrace: new WeakMap(),
+    // Node's overrideStackTrace: a one-shot formatter for one error, ahead of Error.prepareStackTrace.
+    overrides: new WeakMap(),
+    // internal/errors: NodeErrors answer true to kIsNodeError (Node's symbol of the same name).
+    kIsNodeError: Symbol('kIsNodeError'),
   });
-  const { records, captured, rootError, kIsNodeError, overrideStackTrace } = state;
+  const { records, captured, rootError, kIsNodeError } = state;
   const define = Object.defineProperty;
   function record(site) {
     const value = records.get(site);
@@ -195,8 +196,8 @@ function install(global) {
     if (state.formatting) return defaultFormat(error, frames);
     state.formatting = true;
     try {
-      const override = overrideStackTrace.get(error);
-      if (override !== undefined) overrideStackTrace.delete(error);
+      const override = state.overrides.get(error);
+      if (override !== undefined) state.overrides.delete(error);
       let owner = Error;
       let prepare = override ?? owner.prepareStackTrace;
       if (override === undefined && typeof prepare !== 'function' && rootError !== Error) {
@@ -249,6 +250,6 @@ function install(global) {
 
 module.exports = {
   install,
-  get overrideStackTrace() { return host.errorStackState.overrideStackTrace; },
+  get overrideStackTrace() { return host.errorStackState.overrides; },
   get ErrorPrepareStackTrace() { return host.errorStackState.defaultPrepare; },
 };

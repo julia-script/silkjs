@@ -26,6 +26,8 @@
 
 const {
   ArrayPrototypePush,
+  Error,
+  ErrorCaptureStackTrace,
   FunctionPrototypeSymbolHasInstance,
   ObjectDefineProperties,
   ObjectDefineProperty,
@@ -289,6 +291,36 @@ function setOwnProperty(obj, key, value) {
   return value;
 }
 
+// Node takes DOMException from internalBinding('messaging'); here the
+// runtime's event_target module defines it.
+let _DOMException;
+let isErrorStackTraceLimitWritable;
+const lazyDOMExceptionClass = () => {
+  _DOMException ??= require('internal/path_events/event_target').DOMException;
+  return _DOMException;
+};
+
+const lazyDOMException = (message, name) => {
+  _DOMException ??= require('internal/path_events/event_target').DOMException;
+  // Lazy-load to avoid a circular dependency.
+  isErrorStackTraceLimitWritable ??= require('internal/errors').isErrorStackTraceLimitWritable;
+  if (isErrorStackTraceLimitWritable()) {
+    const limit = Error.stackTraceLimit;
+    Error.stackTraceLimit = 0;
+    const ex = new _DOMException(message, name);
+    Error.stackTraceLimit = limit;
+    ErrorCaptureStackTrace(ex, lazyDOMException);
+    return ex;
+  }
+  return new _DOMException(message, name);
+
+};
+
+const kEnumerableProperty = ObjectFreeze({
+  __proto__: null,
+  enumerable: true,
+});
+
 const kEmptyObject = ObjectFreeze({ __proto__: null });
 
 // The system error tables live in internal/util_public/system here.
@@ -305,6 +337,9 @@ module.exports = {
   isError,
   join,
   kEmptyObject,
+  kEnumerableProperty,
+  lazyDOMException,
+  lazyDOMExceptionClass,
   normalizeEncoding,
   promisify,
   removeColors,
