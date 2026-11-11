@@ -22,6 +22,7 @@ function navigatorPlatform() {
 class Navigator {
   #hardwareConcurrency;
   #languages;
+  #locks;
   #platform;
   #userAgent;
   constructor() {
@@ -38,10 +39,11 @@ class Navigator {
     return new Intl.DateTimeFormat().resolvedOptions().locale;
   }
   get languages() { return this.#languages ??= Object.freeze([this.language]); }
+  get locks() { return this.#locks ??= require('internal/worker/locks').locks; }
   get platform() { return this.#platform ??= navigatorPlatform(); }
   get userAgent() { return this.#userAgent ??= `Node.js/${process.versions.node.split('.')[0]}`; }
 }
-for (const key of ['hardwareConcurrency', 'language', 'languages', 'platform', 'userAgent']) {
+for (const key of ['hardwareConcurrency', 'language', 'languages', 'platform', 'userAgent', 'locks']) {
   Object.defineProperty(Navigator.prototype, key, { enumerable: true });
 }
 Object.defineProperty(Navigator.prototype, Symbol.toStringTag, { value: 'Navigator', configurable: true });

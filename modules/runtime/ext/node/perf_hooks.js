@@ -14,7 +14,10 @@ const enqueueObserver = Symbol('enqueue');
 const deliverObserver = Symbol('deliver');
 const reservedMarks = new Set(['nodeStart', 'v8Start', 'environment', 'loopStart', 'loopExit', 'bootstrapComplete']);
 const supportedTypes = Object.freeze([...new Set(['function', 'mark', 'measure', 'resource', ...(host.performanceObserverTypes || [])])].sort());
-const previousPerformance = globalThis.performance;
+// Only an installed instance counts: reading the lazy global would load this module
+// again while it loads, and settle globalThis.performance to undefined.
+const previousDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'performance');
+const previousPerformance = previousDescriptor && 'value' in previousDescriptor ? previousDescriptor.value : undefined;
 let startTime = host.performanceStartTime ?? (host.now() - (previousPerformance?.now() ?? process.uptime() * 1000));
 let timeOrigin = host.performanceTimeOrigin ?? previousPerformance?.timeOrigin ?? (Date.now() - (host.now() - startTime));
 // A process started from a heap image has its own start.

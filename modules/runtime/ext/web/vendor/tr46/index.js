@@ -1,6 +1,6 @@
 "use strict";
 
-const punycode = require("punycode");
+const punycode = require("internal/deps/punycode");
 const regexes = require("internal/web/vendor/tr46/lib/regexes");
 const mappingTable = require("internal/web/vendor/tr46/lib/mappingTable");
 const { STATUS_MAPPING } = require("internal/web/vendor/tr46/lib/statusMapping");
