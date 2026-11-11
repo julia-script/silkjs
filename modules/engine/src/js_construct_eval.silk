@@ -30,6 +30,9 @@ import js_class_data as classes
 import js_gc { HeapHooks }
 import js_gc as gc
 import js_object_allocate as objects
+import js_opcode_data as op
+import js_bytecode as bytecodes
+import js_var_refs as varRefs
 import js_realm { Realm }
 import runtime_memory { AllocationObserver }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
@@ -374,6 +377,16 @@ fn analyze(bytes: &[u8], pool: &FunctionBytecode, recipe: &mut ConstructRecipe) 
         index = index + 1
       }
       pc = join
+    } else if opcode == op.OP_check_ctor {
+      // new.target is always defined in a construct.
+      pc = pc + 1
+    } else if opcode == op.OP_get_var_ref_check {
+      // The field initializer call: guarded by fieldsReference instead.
+      if !bytecodes.fieldsInit(bytes, pc) || recipe.fieldsReference != 255 { return false }
+      let index = u8.toU32(bytes[pc + 1]) | u32.shiftLeft(u8.toU32(bytes[pc + 2]), 8)
+      if index >= 255 { return false }
+      recipe.fieldsReference = u32.toU8(index)
+      pc = pc + bytecodes.FIELDS_INIT_SIZE
     } else {
       pc = straight(bytes, pc, &mut recipe, &mut constants, &mut symbols, receiver, undefined, &pool)
       if pc == usize.MAX { return false }
@@ -382,14 +395,35 @@ fn analyze(bytes: &[u8], pool: &FunctionBytecode, recipe: &mut ConstructRecipe) 
   return false
 }
 
+/// Whether recipe applies to closure, the function object running its body:
+/// a class constructor's field initializer reference must hold undefined.
+@inlineAlways
+unsafe fn fieldsAbsent(recipe: &ConstructRecipe, closure: *mut HeapHeader) -> bool {
+  if recipe.fieldsReference == 255 { return true }
+  return unsafe fieldsUndefined(closure, u8.toUsize(recipe.fieldsReference))
+}
+@inlineNever
+unsafe fn fieldsUndefined(closure: *mut HeapHeader, index: usize) -> bool {
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, closure)
+  return match &object.payload {
+    ObjectPayload.BytecodeFunction { function } => {
+      if index >= function.varRefs.length() { return false }
+      return match Pointer.nonNullMut<HeapHeader>(function.varRefs.asSlice()[index]) {
+        Option<*mut HeapHeader>.Some { value } => match unsafe varRefs.read(value) { ValueBits.Undefined => true _ => false }
+        Option<*mut HeapHeader>.None => false
+      }
+    }
+    _ => false
+  }
+}
 /// Runs function's body (a base-class bytecode constructor of form
 /// CONSTRUCT_EVAL) on receiver, a new ordinary object, with arguments argv.
 /// True when its stores were made; false, with nothing changed, when the body
-/// or the object is not covered. On success the run is noted as owner's
+/// or the object is not covered. With note, on success the run is noted as owner's
 /// construct plan (owner is the constructor new ran: function itself, or the
 /// wrapper that forwarded to it), which planned then follows.
 pub unsafe fn construct<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, owner: *mut HeapHeader, function: ValueBits, receiver: ValueBits,
-  argv: &FrameSlots) -> bool {
+  argv: &FrameSlots, note: bool) -> bool {
   let node = match receiver { ValueBits.Object { reference } => reference _ => { return false } }
   let callee = match function { ValueBits.Object { reference } => reference _ => { return false } }
   let mut anchor = ()
@@ -414,11 +448,11 @@ pub unsafe fn construct<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, o
     if !analyze(unsafe code.code.asSlice(), &code, &mut entry.recipe) { entry.recipe.stores = 0 }
     drop entry drop state drop code
     match Pointer.nonNullMut<HeapHeader>(old) { Option<*mut HeapHeader>.Some { value } => { unsafe gc.releaseHeader(&mut hooks, runtime, value) } Option<*mut HeapHeader>.None => () }
-    return unsafe construct(&mut hooks, runtime, owner, function, receiver, argv)
+    return unsafe construct(&mut hooks, runtime, owner, function, receiver, argv, note)
   }
   drop code
   let stores = u8.toUsize(entry.recipe.stores)
-  if stores == 0 { return false }
+  if stores == 0 || !unsafe fieldsAbsent(&entry.recipe, callee) { return false }
   let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
   if data.classId() != classes.JS_CLASS_OBJECT || data.isExotic() || !data.extensible() || data.isStandardArrayPrototype() { return false }
   if data.slotCount() != 0 || data.slotCapacity() < stores { return false }
@@ -467,15 +501,15 @@ pub unsafe fn construct<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, o
   unsafe install(node, base, reached, &roots, &values, stores)
   // Shapes are freed only by the collector's release path, never by JS.
   unsafe releaseOptional(&mut hooks, runtime, old)
-  unsafe gc.notePlan(&mut hooks, runtime, owner, base, reached, Pointer.address<HeapHeader>(bytecode), stores, [0; 8])
+  if note { unsafe gc.notePlan(&mut hooks, runtime, owner, base, reached, Pointer.address<HeapHeader>(bytecode), stores, [0; 8]) }
   return true
 }
 /// construct, after growing receiver's slots when they are what declined it: a
 /// receiver whose slot plan gave it a smaller tail than the body's stores would
 /// otherwise never take this path, so no construct plan would ever be noted.
 pub unsafe effect fn constructGrowing<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, owner: *mut HeapHeader, function: ValueBits,
-  receiver: ValueBits, argv: &FrameSlots) -> bool ? &mut Allocator {
-  if unsafe construct(&mut hooks, runtime, owner, function, receiver, argv) { return true }
+  receiver: ValueBits, argv: &FrameSlots, note: bool) -> bool ? &mut Allocator {
+  if unsafe construct(&mut hooks, runtime, owner, function, receiver, argv, note) { return true }
   let stores = unsafe cachedStores(runtime, function)
   let node = match receiver { ValueBits.Object { reference } => reference _ => { return false } }
   let mut anchor = ()
@@ -484,7 +518,7 @@ pub unsafe effect fn constructGrowing<H: HeapHooks>(hooks: &mut H, runtime: *mut
   let grown = run Effect.result(unsafe shapes.reserveSlots(runtime, &mut data, stores))
   drop data
   return match move grown {
-    Result<(), OutOfMemoryError>.Success { .. } => unsafe construct(&mut hooks, runtime, owner, function, receiver, argv)
+    Result<(), OutOfMemoryError>.Success { .. } => unsafe construct(&mut hooks, runtime, owner, function, receiver, argv, note)
     Result<(), OutOfMemoryError>.Failure { error } => { drop error false }
   }
 }
@@ -566,6 +600,9 @@ pub unsafe effect fn planned<'a, H: HeapHooks>(hooks: &mut H, memory: &Allocatio
     unsafe gc.releaseHeader(&mut hooks, runtime, final)
     return ValueBits.Uninitialized
   }
+  // No fieldsAbsent test: a plan is noted only after construct passed it for
+  // this bytecode, and whether a class has instance fields is fixed by its
+  // source (the initializer reference is stored before the class can be named).
   // The recipe is selfFree, so the receiver is never a store value here.
   let mut values = FrameSlots { data: unsafe Intrinsic.pointerRequalify<[*]mut ValueBits, *mut ValueBits>(unsafe Intrinsic.stackAllocate<ValueBits>(NODES_MAX)), count: NODES_MAX }
   unsafe evaluate(&entry.recipe, ValueBits.Undefined, argv, &mut values)
