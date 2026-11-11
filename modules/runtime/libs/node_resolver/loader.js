@@ -945,9 +945,28 @@ function createLoader(host, builtins) {
     host.loadAddon(filename, module);
   };
 
+  // As in Bun, the entry points of an installed `ws` package give the runtime's own
+  // implementation (internal/ws), whose frames are read and written natively.
+  const substituteEntry = /[\\/]node_modules[\\/]ws[\\/](?:index\.js|wrapper\.mjs)$/;
+  function substituteExports(filename) {
+    return substituteEntry.test(filesystemName(filename)) ? builtins.get('internal/ws') : undefined;
+  }
+
   function loadResolved(resolved, parent, isMain, allowAsync = false) {
     const mock = moduleMocks.size === 0 ? undefined : moduleMocks.get(asURL(resolved.filename));
     if (mock) return mockCommonJS(mock, filesystemName(resolved.filename), parent);
+    const substitute = substituteExports(resolved.filename);
+    if (substitute !== undefined) {
+      const filename = filesystemName(resolved.filename);
+      if (!own(cache, filename)) {
+        const module = makeModule(filename, parent);
+        module.exports = substitute;
+        module.loaded = true;
+        cache[filename] = module;
+      }
+      addChild(parent, cache[filename]);
+      return cache[filename].exports;
+    }
     if (resolved.format === 'builtin' && !hooks.active(allowAsync)) return loadBuiltin(resolved.filename);
     const filename = filesystemName(resolved.filename);
     if (host.reportDependency && path.isAbsolute(filename)) host.reportDependency(filename);
@@ -1182,7 +1201,12 @@ function createLoader(host, builtins) {
 
   function finishESM(resolved, loaded, attributes) {
     let source;
-    if (resolved.format === 'module') source = cleanSource(loaded.source);
+    const substitute = substituteExports(resolved.filename);
+    if (substitute !== undefined) {
+      resolutions.set(resolved.filename, { filename: resolved.filename, format: 'commonjs' });
+      source = bridgeSource(resolved.filename, Object.keys(substitute), true);
+    }
+    else if (resolved.format === 'module') source = cleanSource(loaded.source);
     else if (resolved.format === 'builtin') {
       pendingLoads.set(resolved.filename, loaded);
       source = bridgeSource(resolved.filename, Object.keys(loadBuiltin(resolved.filename)), false);
