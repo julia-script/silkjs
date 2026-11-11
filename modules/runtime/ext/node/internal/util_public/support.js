@@ -1,7 +1,7 @@
 'use strict';
 
 const shared = require('internal/path_events/support');
-const { inspect } = require('internal/util_inspect');
+const { inspect } = require('internal/util/inspect');
 const { ERR_INVALID_ARG_TYPE } = shared.codes;
 class ERR_INVALID_ARG_VALUE extends TypeError {
   constructor(name, value, reason = 'is invalid') {

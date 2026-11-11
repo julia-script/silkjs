@@ -54,6 +54,26 @@ function install(global) {
     }
     return line === sourceLine ? offset + sourceColumn - 1 : null;
   }
+  // Node's internalBinding('errors').getErrorSourcePositions: where the top
+  // frame of a capture whose stack is not formatted yet sits in its script's
+  // source, as { sourceLine, scriptResourceName, lineNumber, startColumn }
+  // with a 0-based column. Undefined when there is no such frame or source.
+  function isLineBreak(code) { return code === 10 || code === 13 || code === 0x2028 || code === 0x2029; }
+  if (!state.getErrorSourcePositions) state.getErrorSourcePositions = (error) => {
+    const entry = captured.get(error);
+    if (!entry || entry.ready || !entry.raw || entry.raw.length === 0) return undefined;
+    const frame = fromNative(entry.raw[0]);
+    if (frame.scriptId === '0') return undefined;
+    const offset = position(frame);
+    if (offset === null || offset < 0) return undefined;
+    const source = scriptMetadata(frame).source;
+    let start = offset;
+    while (start > 0 && !isLineBreak(source.charCodeAt(start - 1))) start--;
+    let end = offset;
+    while (end < source.length && !isLineBreak(source.charCodeAt(end))) end++;
+    return { sourceLine: source.slice(start, end), scriptResourceName: frame.scriptName,
+      lineNumber: frame.lineNumber, startColumn: offset - start };
+  };
   function location(frame) {
     if (frame.isNative) return 'native';
     let filename = frame.scriptName || '<anonymous>';

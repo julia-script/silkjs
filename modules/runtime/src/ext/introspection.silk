@@ -1,6 +1,7 @@
 //! Node introspection reads engine class IDs and internal slots, never user properties.
 //! Host IDs are 1000 + operation. Predicate names are installed on host.types;
-//! getPromiseDetails and getProxyDetails are installed directly on host.
+//! getPromiseDetails, getProxyDetails, getConstructorName and previewEntries
+//! are installed directly on host.
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silkjs.js_owned_value { Value, lendFor }
 import silkjs.js_realm { lendRealm }
@@ -21,6 +22,10 @@ import silkjs.js_object_allocate as objects
 import silkjs.js_array_intrinsics_support as arrays
 import libs.core.owners as owners
 import silkjs.js_buffer_storage as buffers
+import silkjs.js_map_iterators as mapIterators
+import silkjs.js_map_storage as mapStorage
+import silk.mem.pointer { Pointer }
+import silk.num.u32
 import silkjs.js_runtime as runtime
 import libs.core.common as common
 
@@ -43,7 +48,9 @@ pub const GET_PROXY_DETAILS: u32 = 15
 pub const SERIALIZATION_INFO: u32 = 16
 pub const ARRAY_BUFFER_VIEW_FLAGS: u32 = 17
 pub const PREDICATE_COUNT: u32 = 14
-pub const OPERATION_COUNT: u32 = 18
+pub const GET_CONSTRUCTOR_NAME: u32 = 18
+pub const PREVIEW_ENTRIES: u32 = 19
+pub const OPERATION_COUNT: u32 = 20
 
 // Allocation-free name table indexed by the operation (not the host function ID).
 pub fn name(operation: u32) -> &'static [u8] {
@@ -66,6 +73,8 @@ pub fn name(operation: u32) -> &'static [u8] {
     15 => b"getProxyDetails"
     16 => b"serializationInfo"
     17 => b"getArrayBufferViewFlags"
+    18 => b"getConstructorName"
+    19 => b"previewEntries"
     _ => Intrinsic.trap("unknown introspection operation")
   }
 }
@@ -171,6 +180,18 @@ pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>,
     if !backing.shared && backing.maxByteLength >= 0 { flags = flags + 2 }
     return ValueBits.Int { value: flags }
   }
+  if operation == GET_CONSTRUCTOR_NAME {
+    // v8::Object::GetConstructorName: what the engine knows of the object's
+    // class, independent of its prototype chain.
+    if !value.isObject() {
+      return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"object required")
+    }
+    let realm = unsafe lendRealm(&context, context)
+    let anchor = () let state = realm.runtimeState(&anchor)
+    let atom = state.classes.asSlice()[u32.toUsize(id)].classNameAtom drop state
+    return run proxy.atomValue(&mut engine, unsafe lendRealm(&context, context), atom)
+  }
+  if operation == PREVIEW_ENTRIES { return run unsafe previewEntries(&mut engine, context, value, id) }
   if operation == GET_PROMISE_DETAILS {
     if id != classes.JS_CLASS_PROMISE { return ValueBits.Undefined }
     let state = promises.stateOf(unsafe lendFor(value))
@@ -182,6 +203,93 @@ pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>,
   let target = proxy.targetOf(unsafe lendFor(value)).dup().intoBits()
   let handler = proxy.handlerOf(unsafe lendFor(value)).dup().intoBits()
   return run unsafe pair(&mut engine, context, target, handler)
+}
+
+// Entry selectors for previewEntries: an entry's key, its stored value, or nothing.
+const SELECT_NONE: u32 = 0
+const SELECT_KEY: u32 = 1
+const SELECT_VALUE: u32 = 2
+fn selected(select: u32, key: ValueBits, value: ValueBits) -> ValueBits {
+  if select == SELECT_VALUE { return value }
+  return key
+}
+
+// Node's util previewEntries: [entries, isKeyValue] for a WeakMap (key, value,
+// key, value...), a WeakSet, or the entries a Map or Set iterator has not
+// produced yet, read in place: no iterator moves, no user code runs, and weak
+// entries are not promoted beyond the returned array. Undefined otherwise.
+unsafe effect fn previewEntries<'m, S: EngineServices>(engine: &mut Engine<'m, S>,
+  context: *mut HeapHeader, value: ValueBits, id: u32) -> ValueBits
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut node: ?*mut HeapHeader = Pointer.null<HeapHeader>()
+  let mut start: usize = 0
+  let mut first = SELECT_KEY
+  let mut second = SELECT_NONE
+  let mut keyValue = false
+  if id == classes.JS_CLASS_WEAKMAP {
+    node = unsafe mapStorage.state(value, 2)
+    second = SELECT_VALUE
+    keyValue = true
+  } else if id == classes.JS_CLASS_WEAKSET {
+    node = unsafe mapStorage.state(value, 3)
+  } else {
+    let mut collection = ValueBits.Undefined
+    let mut kind: u32 = 0
+    if !unsafe mapIterators.position(value, &mut collection, &mut kind, &mut start) { return ValueBits.Undefined }
+    let mut magic: u32 = 0
+    if id == classes.JS_CLASS_SET_ITERATOR { magic = 1 }
+    // A Set stores no values: its value and entry iterators repeat the key.
+    let mut stored = SELECT_KEY
+    if magic == 0 { stored = SELECT_VALUE }
+    if kind == 1 { first = stored }
+    if kind == 2 { second = stored keyValue = true }
+    // An exhausted iterator no longer holds its collection.
+    if collection.isObject() { node = unsafe mapStorage.state(collection, magic) }
+  }
+  let mut width: i64 = 1
+  if second != SELECT_NONE { width = 2 }
+  let mut count: i64 = 0
+  if !Pointer.isNull<HeapHeader>(node) {
+    let state = unsafe mapStorage.nonnull(node)
+    let limit = unsafe mapStorage.entryLimit(state)
+    let mut index = start
+    while index < limit {
+      if !unsafe mapStorage.entryEmpty(state, index) { count = count + width }
+      index = index + 1
+    }
+  }
+  let memory = engine.memory
+  let array = run objects.array(&mut engine, memory, unsafe lendRealm(&context, context))
+  let reserved = run Effect.result(arrays.reserve(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(array), count))
+  match move reserved {
+    Result<(), OutOfMemoryError>.Success { .. } => ()
+    Result<(), OutOfMemoryError>.Failure { error } => {
+      unsafe owners.release(&mut engine, context, array)
+      fail move error
+    }
+  }
+  // Reserving may collect garbage, which can empty weak entries (never
+  // compact them), so the walk stops at the reserved count.
+  let mut appended: i64 = 0
+  if !Pointer.isNull<HeapHeader>(node) {
+    let state = unsafe mapStorage.nonnull(node)
+    let limit = unsafe mapStorage.entryLimit(state)
+    let mut index = start
+    while index < limit && appended + width <= count {
+      if !unsafe mapStorage.entryEmpty(state, index) {
+        let key = unsafe mapStorage.entryKey(state, index)
+        let stored = unsafe mapStorage.entryValue(state, index)
+        run arrays.appendReserved(unsafe lendFor(array), unsafe Value.retain(selected(first, key, stored)))
+        if second != SELECT_NONE {
+          run arrays.appendReserved(unsafe lendFor(array), unsafe Value.retain(selected(second, key, stored)))
+        }
+        appended = appended + width
+      }
+      index = index + 1
+    }
+  }
+  arrays.publishLength(unsafe lendFor(array), appended)
+  return run unsafe pair(&mut engine, context, array, ValueBits.Bool { value: keyValue })
 }
 
 /// QuickJS uses individually owned allocations, not a reserved V8 heap arena.

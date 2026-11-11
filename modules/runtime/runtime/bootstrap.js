@@ -69,6 +69,8 @@ for (const name of ['dispose', 'asyncDispose']) {
 }
 const host = { ...native, rawOS, rawStd };
 host.builtinLoaded = moduleHas;
+// Whether a built-in id (public or internal) exists, loaded or not: Node's BuiltinModule.exists.
+host.builtinExists = Map.prototype.has.bind(factories);
 // Source maps are off until something loads the module to switch them on, so
 // registering a source before that only matters when coverage wants every map.
 host.registerSource = (filename, source, metadata) => {
