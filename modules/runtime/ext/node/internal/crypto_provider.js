@@ -183,11 +183,12 @@ c.providerRawImport = function providerRawImport(options, type) {
 };
 c.providerRawExport = function providerRawExport(key, options) {
   const format = rawFormat(options.format);
-  if (key.type === 'private' && options.passphrase !== undefined) throw error('ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS', 'Raw format does not support encryption');
-  if (key.type === 'private' ? format === 0 : key.type !== 'public' || format !== 0) {
+  const keyType = c.keyObjectType(key);
+  if (keyType === 'private' && options.passphrase !== undefined) throw error('ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS', 'Raw format does not support encryption');
+  if (keyType === 'private' ? format === 0 : keyType !== 'public' || format !== 0) {
     throw error('ERR_INVALID_ARG_VALUE', 'Raw format is incompatible with the key object type', TypeError);
   }
-  const algorithm = key.asymmetricKeyType;
+  const algorithm = c.keyObjectAsymmetricType(key);
   let form = 4;
   if (algorithm === 'ec' && format === 0) {
     const type = options.type === undefined ? 'uncompressed' : options.type;

@@ -3,173 +3,828 @@ const c = require('internal/crypto_core');
 const { Buffer, call, submit, packed, bytes, binary, integer, callback, error, invalid, output, attach, handle, release, name } = c;
 const { Transform, Writable } = require('stream');
 const constants = Object.freeze({ RSA_PKCS1_PADDING: 1, RSA_NO_PADDING: 3, RSA_PKCS1_OAEP_PADDING: 4, RSA_X931_PADDING: 5, RSA_PKCS1_PSS_PADDING: 6, RSA_PSS_SALTLEN_DIGEST: -1, RSA_PSS_SALTLEN_MAX_SIGN: -2, RSA_PSS_SALTLEN_AUTO: -2, POINT_CONVERSION_COMPRESSED: 2, POINT_CONVERSION_UNCOMPRESSED: 4, POINT_CONVERSION_HYBRID: 6, DH_CHECK_P_NOT_PRIME: 1, DH_CHECK_P_NOT_SAFE_PRIME: 2, DH_UNABLE_TO_CHECK_GENERATOR: 4, DH_NOT_SUITABLE_GENERATOR: 8, ENGINE_METHOD_RSA: 1, ENGINE_METHOD_DSA: 2, ENGINE_METHOD_DH: 4, ENGINE_METHOD_RAND: 8, ENGINE_METHOD_CIPHERS: 64, ENGINE_METHOD_DIGESTS: 128, ENGINE_METHOD_PKEY_METHS: 512, ENGINE_METHOD_PKEY_ASN1_METHS: 1024, ENGINE_METHOD_EC: 2048, ENGINE_METHOD_ALL: 65535, ENGINE_METHOD_NONE: 0 });
-function randomBytes(size, cb) { integer(size, 'size'); if (cb !== undefined) { submit('random', [size], cb, Buffer.from); return; } return Buffer.from(call('random', [size])); }
-function randomFillSync(buffer, offset = 0, size) { const b = binary(buffer); const unit = buffer.BYTES_PER_ELEMENT || 1; integer(offset, 'offset', 0, Math.floor(b.length / unit)); if (size === undefined) size = Math.floor(b.length / unit) - offset; integer(size, 'size', 0, Math.floor(b.length / unit) - offset); b.set(randomBytes(size * unit), offset * unit); return buffer; }
-function randomFill(buffer, offset, size, cb) { if (typeof offset === 'function') { cb = offset; offset = 0; size = undefined; } else if (typeof size === 'function') { cb = size; size = undefined; } callback(cb); const b = binary(buffer); const unit = buffer.BYTES_PER_ELEMENT || 1; if (offset === undefined) offset = 0; integer(offset, 'offset', 0, Math.floor(b.length / unit)); if (size === undefined) size = Math.floor(b.length / unit) - offset; integer(size, 'size', 0, Math.floor(b.length / unit) - offset); randomBytes(size * unit, (e, data) => { if (e) return cb(e); try { binary(buffer).set(data, offset * unit); } catch (failure) { cb(failure); return; } cb(null, buffer); }); }
+const { codes, validate, isAnyArrayBuffer, normalize } = c;
+// lib/internal/crypto/random.js
+const kMaxPossibleLength = Math.min(require('buffer').kMaxLength, 2 ** 31 - 1);
+function assertOffset(offset, elementSize, length) {
+  validate.number(offset, 'offset'); offset *= elementSize;
+  const maxLength = Math.min(length, kMaxPossibleLength);
+  if (Number.isNaN(offset) || offset > maxLength || offset < 0) throw codes.ERR_OUT_OF_RANGE('offset', `>= 0 && <= ${maxLength}`, offset);
+  return offset >>> 0;
+}
+function assertSize(size, elementSize, offset, length) {
+  validate.number(size, 'size'); size *= elementSize;
+  if (Number.isNaN(size) || size > kMaxPossibleLength || size < 0) throw codes.ERR_OUT_OF_RANGE('size', `>= 0 && <= ${kMaxPossibleLength}`, size);
+  if (size + offset > length) throw codes.ERR_OUT_OF_RANGE('size + offset', `<= ${length}`, size + offset);
+  return size >>> 0;
+}
+function randomView(buf) { return isAnyArrayBuffer(buf) ? new Uint8Array(buf) : new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength); }
+function randomBytes(size, cb) {
+  size = assertSize(size, 1, 0, Infinity);
+  if (cb !== undefined) validate.function(cb, 'callback');
+  if (cb === undefined) return Buffer.from(call('random', [size]));
+  submit('random', [size], cb, Buffer.from);
+}
+function randomBuffer(buf) {
+  if (!isAnyArrayBuffer(buf) && !ArrayBuffer.isView(buf)) throw codes.ERR_INVALID_ARG_TYPE('buf', ['ArrayBuffer', 'ArrayBufferView'], buf);
+}
+function randomFillSync(buf, offset = 0, size) {
+  randomBuffer(buf); const elementSize = buf.BYTES_PER_ELEMENT || 1;
+  offset = assertOffset(offset, elementSize, buf.byteLength);
+  size = size === undefined ? buf.byteLength - offset : assertSize(size, elementSize, offset, buf.byteLength);
+  if (size !== 0) randomView(buf).set(new Uint8Array(call('random', [size])), offset);
+  return buf;
+}
+function randomFill(buf, offset, size, cb) {
+  randomBuffer(buf); const elementSize = buf.BYTES_PER_ELEMENT || 1;
+  if (typeof offset === 'function') { cb = offset; offset = 0; size = buf.length; }
+  else if (typeof size === 'function') { cb = size; size = (buf.length ?? buf.byteLength) - offset; }
+  else validate.function(cb, 'callback');
+  offset = assertOffset(offset, elementSize, buf.byteLength);
+  size = size === undefined ? buf.byteLength - offset : assertSize(size, elementSize, offset, buf.byteLength);
+  if (size === 0) { cb(null, buf); return; }
+  submit('random', [size], (e, data) => { if (e) return cb(e); randomView(buf).set(new Uint8Array(data), offset); cb(null, buf); });
+}
+const RAND_MAX = 0xFFFF_FFFF_FFFF;
+const randomCache = Buffer.alloc(6 * 1024); let randomCacheOffset = randomCache.length, asyncCacheFillInProgress = false; const asyncCachePendingTasks = [];
 function randomInt(min, max, cb) {
-  if (typeof max === 'function') { cb = max; max = min; min = 0; } else if (max === undefined) { max = min; min = 0; }
-  integer(min, 'min', Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER); integer(max, 'max', Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER);
-  const range = max - min; if (range <= 0 || range >= 0x1000000000000) throw error('ERR_OUT_OF_RANGE', 'max - min must be positive and less than 2**48', RangeError);
-  const limit = 0x1000000000000 - 0x1000000000000 % range;
-  function sample(b) { let n = 0; for (const byte of b) n = n * 256 + byte; return n < limit ? n % range + min : undefined; }
-  if (cb !== undefined) { callback(cb); const next = () => randomBytes(6, (e, b) => { if (e) return cb(e); const n = sample(b); if (n === undefined) next(); else cb(null, n); }); next(); return; }
-  for (;;) { const n = sample(randomBytes(6)); if (n !== undefined) return n; }
+  const minNotSpecified = typeof max === 'undefined' || typeof max === 'function';
+  if (minNotSpecified) { cb = max; max = min; min = 0; }
+  const isSync = typeof cb === 'undefined';
+  if (!isSync) validate.function(cb, 'callback');
+  if (!Number.isSafeInteger(min)) throw codes.ERR_INVALID_ARG_TYPE('min', 'a safe integer', min);
+  if (!Number.isSafeInteger(max)) throw codes.ERR_INVALID_ARG_TYPE('max', 'a safe integer', max);
+  if (max <= min) throw codes.ERR_OUT_OF_RANGE('max', `greater than the value of "min" (${min})`, max);
+  const range = max - min;
+  if (!(range <= RAND_MAX)) throw codes.ERR_OUT_OF_RANGE(`max${minNotSpecified ? '' : ' - min'}`, `<= ${RAND_MAX}`, range);
+  const randLimit = RAND_MAX - (RAND_MAX % range);
+  while (isSync || randomCacheOffset < randomCache.length) {
+    if (randomCacheOffset === randomCache.length) { randomFillSync(randomCache); randomCacheOffset = 0; }
+    const x = randomCache.readUIntBE(randomCacheOffset, 6); randomCacheOffset += 6;
+    if (x < randLimit) { const n = (x % range) + min; if (isSync) return n; process.nextTick(cb, undefined, n); return; }
+  }
+  asyncCachePendingTasks.push({ min, max, cb });
+  if (asyncCacheFillInProgress) return;
+  asyncCacheFillInProgress = true;
+  randomFill(randomCache, (err) => {
+    asyncCacheFillInProgress = false;
+    const errorReceiver = err && asyncCachePendingTasks.shift();
+    if (!err) randomCacheOffset = 0;
+    for (const task of asyncCachePendingTasks.splice(0)) randomInt(task.min, task.max, task.cb);
+    if (errorReceiver) errorReceiver.cb(err);
+  });
 }
-function randomUUID(options) { if (options !== undefined && (options === null || typeof options !== 'object')) throw invalid('options', 'an object'); if (options && options.disableEntropyCache !== undefined && typeof options.disableEntropyCache !== 'boolean') throw invalid('options.disableEntropyCache', 'a boolean'); const b = randomBytes(16); b[6] = b[6] & 15 | 64; b[8] = b[8] & 63 | 128; const h = b.toString('hex'); return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`; }
+function uuid(buf, version, variant, offset = 0) {
+  const h = i => (buf[offset + i] < 16 ? '0' : '') + buf[offset + i].toString(16);
+  const v = (i, bits, mask) => { const byte = (buf[offset + i] & mask) | bits; return (byte < 16 ? '0' : '') + byte.toString(16); };
+  return h(0) + h(1) + h(2) + h(3) + '-' + h(4) + h(5) + '-' + v(6, version, 0x0f) + h(7) + '-' + v(8, variant, 0x3f) + h(9) + '-' + h(10) + h(11) + h(12) + h(13) + h(14) + h(15);
+}
+const kBatchSize = 128; let uuidData, uuidBatch = 0;
+function uuidOptions(options) {
+  if (options !== undefined) validate.object(options, 'options');
+  const { disableEntropyCache = false } = options || {};
+  validate.boolean(disableEntropyCache, 'options.disableEntropyCache');
+  return disableEntropyCache;
+}
+function uuidBytes(unbuffered) {
+  if (unbuffered) return [randomFillSync(Buffer.alloc(16)), 0];
+  uuidData ??= Buffer.alloc(16 * kBatchSize);
+  if (uuidBatch === 0) randomFillSync(uuidData);
+  uuidBatch = (uuidBatch + 1) % kBatchSize;
+  return [uuidData, uuidBatch * 16];
+}
+function randomUUID(options) { const [buf, offset] = uuidBytes(uuidOptions(options)); return uuid(buf, 0x40, 0x80, offset); }
 function randomUUIDv7(options) {
-  if (options !== undefined && (options === null || typeof options !== 'object' || Array.isArray(options))) throw invalid('options', 'an object');
-  if (options && options.disableEntropyCache !== undefined && typeof options.disableEntropyCache !== 'boolean') throw invalid('options.disableEntropyCache', 'a boolean');
-  const b = randomBytes(16), now = Date.now(), high = now / 0x100000000;
-  b[0] = high >>> 8; b[1] = high; b[2] = now >>> 24; b[3] = now >>> 16; b[4] = now >>> 8; b[5] = now;
-  b[6] = b[6] & 15 | 112; b[8] = b[8] & 63 | 128;
-  const h = b.toString('hex'); return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+  const [buf, offset] = uuidBytes(uuidOptions(options));
+  const now = Date.now(), msb = now / 2 ** 32;
+  buf[offset] = msb >>> 8; buf[offset + 1] = msb; buf[offset + 2] = now >>> 24; buf[offset + 3] = now >>> 16; buf[offset + 4] = now >>> 8; buf[offset + 5] = now;
+  return uuid(buf, 0x70, 0x80, offset);
 }
-function optionsObject(value) { if (value === null || typeof value !== 'object' || Array.isArray(value)) throw invalid('options', 'an object'); return value; }
-function unsignedBytes(value, field) {
-  if (typeof value !== 'bigint') return binary(value, field);
-  if (value < 0n) throw error('ERR_OUT_OF_RANGE', `${field} must be nonnegative`, RangeError);
-  let hex = value.toString(16); if (hex.length % 2) hex = '0' + hex; return Buffer.from(hex, 'hex');
+function unsignedBigIntToBuffer(bigint, name) {
+  if (bigint < 0) throw codes.ERR_OUT_OF_RANGE(name, '>= 0', bigint);
+  const hex = bigint.toString(16); return Buffer.from(hex.padStart(hex.length + (hex.length % 2), '0'), 'hex');
 }
 function unsignedValue(value) { const hex = Buffer.from(value).toString('hex'); return hex ? BigInt('0x' + hex) : 0n; }
-function checkPrimeArgs(candidate, options = {}) { candidate = unsignedBytes(candidate, 'candidate'); optionsObject(options); return [packed(candidate), integer(options.checks === undefined ? 0 : options.checks, 'options.checks')]; }
-function checkPrimeSync(candidate, options) { return !!call('checkPrime', checkPrimeArgs(candidate, options)); }
-function checkPrime(candidate, options, cb) { if (typeof options === 'function') { cb = options; options = undefined; } const args = checkPrimeArgs(candidate, options); callback(cb); submit('checkPrime', args, cb, value => !!value); }
-function primeArgs(size, options = {}) {
-  integer(size, 'size', 1); optionsObject(options);
-  const safe = options.safe === undefined ? false : options.safe, bigint = options.bigint === undefined ? false : options.bigint;
-  if (typeof safe !== 'boolean') throw invalid('options.safe', 'a boolean');
-  if (typeof bigint !== 'boolean') throw invalid('options.bigint', 'a boolean');
-  const add = options.add === undefined ? undefined : unsignedBytes(options.add, 'options.add'), rem = options.rem === undefined ? undefined : unsignedBytes(options.rem, 'options.rem');
+const bigIntOrBufferTypes = ['ArrayBuffer', 'TypedArray', 'Buffer', 'DataView', 'bigint'];
+function bigIntOrBuffer(value, name) {
+  if (typeof value === 'bigint') return unsignedBigIntToBuffer(value, name);
+  if (!isAnyArrayBuffer(value) && !ArrayBuffer.isView(value)) throw codes.ERR_INVALID_ARG_TYPE(name, bigIntOrBufferTypes, value);
+  return value;
+}
+// Node converts the candidate to a BIGNUM before it queues the job, so an oversized one
+// fails synchronously: BN_bin2bn refuses more than INT_MAX / (4 * BN_BITS2) words.
+const kMaxBignumBytes = Math.floor(0x7fffffff / 256) * 8;
+function checkPrimeArgs(candidate, options) {
+  validate.object(options, 'options');
+  const { checks = 0 } = options;
+  validate.int32(checks, 'options.checks', 0);
+  if (bytes(candidate).byteLength > kMaxBignumBytes) throw normalize(new Error('error:01800072:bignum routines::bignum too long'));
+  return [packed(candidate), checks];
+}
+function checkPrimeSync(candidate, options = {}) { candidate = bigIntOrBuffer(candidate, 'candidate'); return !!call('checkPrime', checkPrimeArgs(candidate, options)); }
+function checkPrime(candidate, options = {}, cb) {
+  candidate = bigIntOrBuffer(candidate, 'candidate');
+  if (typeof options === 'function') { cb = options; options = {}; }
+  validate.function(cb, 'callback');
+  submit('checkPrime', checkPrimeArgs(candidate, options), cb, value => !!value);
+}
+function primeArgs(size, options) {
+  validate.object(options, 'options');
+  const { safe = false, bigint = false } = options; let { add, rem } = options;
+  validate.boolean(safe, 'options.safe'); validate.boolean(bigint, 'options.bigint');
+  if (add !== undefined) add = bigIntOrBuffer(add, 'options.add');
+  if (rem !== undefined) rem = bigIntOrBuffer(rem, 'options.rem');
   if (add !== undefined) {
-    const a = unsignedValue(add);
+    const a = unsignedValue(randomView(add));
     if (a.toString(2).length > size) throw error('ERR_OUT_OF_RANGE', 'invalid options.add', RangeError);
-    if (rem !== undefined && a <= unsignedValue(rem)) throw error('ERR_OUT_OF_RANGE', 'invalid options.rem', RangeError);
+    if (rem !== undefined && a <= unsignedValue(randomView(rem))) throw error('ERR_OUT_OF_RANGE', 'invalid options.rem', RangeError);
   }
   return { args: [size, safe ? 1 : 0, add === undefined ? undefined : packed(add), rem === undefined ? undefined : packed(rem)], bigint };
 }
-function generatePrimeSync(size, options) { const job = primeArgs(size, options); const value = call('generatePrime', job.args); return job.bigint ? unsignedValue(value) : value; }
-function generatePrime(size, options, cb) { if (typeof options === 'function') { cb = options; options = undefined; } integer(size, 'size', 1); callback(cb); const job = primeArgs(size, options); submit('generatePrime', job.args, cb, value => job.bigint ? unsignedValue(value) : value); }
+function generatePrimeSync(size, options = {}) { validate.int32(size, 'size', 1); const job = primeArgs(size, options); const value = call('generatePrime', job.args); return job.bigint ? unsignedValue(value) : value; }
+function generatePrime(size, options, cb) {
+  validate.int32(size, 'size', 1);
+  if (typeof options === 'function') { cb = options; options = {}; }
+  validate.function(cb, 'callback');
+  const job = primeArgs(size, options);
+  submit('generatePrime', job.args, (e, value) => e ? cb(e) : cb(undefined, value), value => job.bigint ? unsignedValue(value) : value);
+}
 function getCipherInfo(nameOrNid, options) {
-  if (typeof nameOrNid === 'number') integer(nameOrNid, 'nameOrNid', -2147483648);
-  else name(nameOrNid, 'nameOrNid');
-  if (options !== undefined) optionsObject(options);
-  const keyLength = options && options.keyLength, ivLength = options && options.ivLength;
-  if (keyLength !== undefined) integer(keyLength, 'options.keyLength', -2147483648);
-  if (ivLength !== undefined) integer(ivLength, 'options.ivLength', -2147483648);
+  if (typeof nameOrNid !== 'string' && typeof nameOrNid !== 'number') throw codes.ERR_INVALID_ARG_TYPE('nameOrNid', ['string', 'number'], nameOrNid);
+  if (typeof nameOrNid === 'number') validate.int32(nameOrNid, 'nameOrNid');
+  let keyLength, ivLength;
+  if (options !== undefined) {
+    validate.object(options, 'options'); ({ keyLength, ivLength } = options);
+    if (keyLength !== undefined) { validate.int32(keyLength, 'options.keyLength'); keyLength += 0; }
+    if (ivLength !== undefined) { validate.int32(ivLength, 'options.ivLength'); ivLength += 0; }
+  }
+  const info = cipherDetails(nameOrNid, keyLength, ivLength);
+  if (info === undefined) return undefined;
+  const result = { name: info.name.toLowerCase(), keyLength: info.keyLength };
+  const modeName = cipherModes[info.mode];
+  if (modeName !== undefined) result.mode = modeName;
+  if (info.nid !== 0) result.nid = info.nid;
+  if (info.mode !== 0) result.blockSize = info.blockSize;
+  if (info.ivLength !== 0) result.ivLength = info.ivLength;
+  return result;
+}
+const cipherModes = { 0: 'stream', 1: 'ecb', 2: 'cbc', 3: 'cfb', 4: 'ofb', 5: 'ctr', 6: 'gcm', 7: 'ccm', 65537: 'xts', 65538: 'wrap', 65539: 'ocb', 65540: 'siv', 65541: 'gcm-siv' };
+function cipherDetails(nameOrNid, keyLength, ivLength) {
   const value = call('cipherInfo', [nameOrNid, keyLength === undefined ? 0 : keyLength, ivLength === undefined ? 0 : ivLength, typeof nameOrNid === 'number' ? 1 : 0, keyLength === undefined ? 0 : 1, ivLength === undefined ? 0 : 1]);
   if (value === undefined) return undefined;
-  const b = Buffer.from(value), mode = b.readInt32LE(0);
-  const result = { name: b.subarray(20).toString().toLowerCase(), keyLength: b.readInt32LE(12) };
-  const modeName = ({ 0: 'stream', 1: 'ecb', 2: 'cbc', 3: 'cfb', 4: 'ofb', 5: 'ctr', 6: 'gcm', 7: 'ccm', 65537: 'xts', 65538: 'wrap', 65539: 'ocb', 65540: 'siv' })[mode];
-  if (modeName !== undefined) result.mode = modeName;
-  const nid = b.readInt32LE(4); if (nid !== 0) result.nid = nid;
-  if (mode !== 0) result.blockSize = b.readInt32LE(8);
-  const iv = b.readInt32LE(16); if (iv !== 0) result.ivLength = iv;
-  return result;
+  const b = Buffer.from(value);
+  return { mode: b.readInt32LE(0), nid: b.readInt32LE(4), blockSize: b.readInt32LE(8), keyLength: b.readInt32LE(12), ivLength: b.readInt32LE(16), name: b.subarray(20).toString() };
 }
 // No secure heap is configured by this runtime. These are Node's disabled-heap
 // configuration values; used is queried from OpenSSL rather than estimated.
 function secureHeapUsed() { const total = 0, used = call('secureHeapUsed', []); return { total, used, utilization: used / total, min: 2 }; }
 function setEngine(id, flags) { name(id, 'id'); if (flags && typeof flags !== 'number') throw invalid('flags', 'a number'); flags = flags >>> 0; if (!call('setEngine', [id, flags || 65535])) throw error('ERR_CRYPTO_ENGINE_UNKNOWN', `Engine "${id}" was not found`); }
 function timingSafeEqual(a, b) { a = binary(a); b = binary(b); if (a.length !== b.length) throw error('ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH', 'Input buffers must have the same byte length', RangeError); return !!call('equal', [packed(a), packed(b)]); }
-class Hash extends Transform {
-  constructor(algorithm, options = {}, existing) {
-    super(options); this._algorithm = name(algorithm); this._xof = /^shake(?:128|256)$/i.test(algorithm);
-    this._length = options.outputLength === undefined ? -1 : integer(options.outputLength, 'outputLength');
-    if (!this._xof && this._length !== -1) { if (this._length !== call('hashSize', [algorithm])) throw error('ERR_OSSL_EVP_NOT_XOF_OR_INVALID_LENGTH', 'Invalid digest output length'); this._length = -1; }
-    if (this._xof && this._length === -1) this._length = /128$/.test(algorithm) ? 16 : 32;
-    attach(this, existing === undefined ? call('hashCreate', [algorithm]) : existing); this._finalized = false;
-  }
-  update(data, encoding) { if (this._finalized) throw error('ERR_CRYPTO_HASH_FINALIZED', 'Digest already called'); call('hashUpdate', [handle(this), packed(bytes(data, encoding))]); return this; }
-  digest(encoding) { if (this._finalized) throw error('ERR_CRYPTO_HASH_FINALIZED', 'Digest already called'); this._finalized = true; try { return output(call('hashFinal', [handle(this), this._length]), encoding); } finally { release(this); } }
-  copy(options = {}) {
-    if (this._finalized) throw error('ERR_CRYPTO_HASH_FINALIZED', 'Digest already called');
-    const normalized = { ...options, outputLength: options.outputLength === undefined && this._xof ? this._length : options.outputLength };
-    if (normalized.outputLength !== undefined) { integer(normalized.outputLength, 'outputLength'); if (!this._xof && normalized.outputLength !== call('hashSize', [this._algorithm])) throw error('ERR_OSSL_EVP_NOT_XOF_OR_INVALID_LENGTH', 'Invalid digest output length'); }
-    const id = call('hashCopy', [handle(this)]);
-    try { return new Hash(this._algorithm, normalized, id); } catch (e) { call('release', [id]); throw e; }
-  }
-  _transform(chunk, encoding, cb) { try { this.update(chunk, encoding); cb(); } catch (e) { cb(e); } }
-  _flush(cb) { try { this.push(this.digest()); cb(); } catch (e) { cb(e); } }
-  _destroy(e, cb) { release(this); cb(e); }
+// lib/internal/crypto/hash.js
+const LazyTransform = require('internal/streams/lazy_transform');
+const kState = Symbol('kState'), kFinalized = Symbol('kFinalized');
+const { emitWarning } = process;
+let shakeWarned = false;
+function warnShake(algorithm) {
+  if (shakeWarned || !require('internal/options').getOptionValue('--pending-deprecation')) return;
+  const normalized = algorithm.toLowerCase().replace('-', '');
+  if (normalized !== 'shake128' && normalized !== 'shake256') return;
+  shakeWarned = true; emitWarning('Creating SHAKE128/256 digests without an explicit options.outputLength is deprecated.', 'DeprecationWarning', 'DEP0198');
 }
-class Hmac extends Transform {
-  constructor(algorithm, key, options = {}) { super(options); if (key instanceof KeyObject) { if (key.type !== 'secret') throw error('ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE', 'HMAC requires a secret key'); key = key.export(); } attach(this, call('hmacCreate', [name(algorithm), packed(bytes(key, options.encoding))])); this._finalized = false; }
-  update(data, encoding) { if (this._finalized) throw error('ERR_CRYPTO_HASH_FINALIZED', 'Digest already called'); call('hmacUpdate', [handle(this), packed(bytes(data, encoding))]); return this; }
-  digest(encoding) { if (this._finalized) return output(new ArrayBuffer(0), encoding); this._finalized = true; try { return output(call('hmacFinal', [handle(this)]), encoding); } finally { release(this); } }
-  _transform(chunk, encoding, cb) { try { this.update(chunk, encoding); cb(); } catch (e) { cb(e); } }
-  _flush(cb) { try { this.push(this.digest()); cb(); } catch (e) { cb(e); } }
-  _destroy(e, cb) { release(this); cb(e); }
+function digestSize(algorithm) { try { return call('hashSize', [algorithm]); } catch { return undefined; } }
+// The native digest has no output length: XOF lengths are applied when the digest is read.
+function hashState(algorithm, xofLen, existing) {
+  const size = digestSize(algorithm), xof = /^shake-?(?:128|256)$/i.test(algorithm);
+  if (xofLen !== undefined && !xof && xofLen !== size) throw error('ERR_OSSL_EVP_NOT_XOF_OR_INVALID_LENGTH', 'Invalid XOF digest length');
+  return { algorithm, length: xof ? xofLen ?? (/128$/.test(algorithm) ? 16 : 32) : -1, [kFinalized]: false, existing };
 }
+function Hash(algorithm, options) {
+  if (!new.target) return new Hash(algorithm, options);
+  const isCopy = algorithm instanceof Hash;
+  if (!isCopy) validate.string(algorithm, 'algorithm');
+  let xofLen = typeof options === 'object' && options !== null ? options.outputLength : undefined;
+  if (xofLen !== undefined) { validate.uint32(xofLen, 'options.outputLength'); xofLen += 0; }
+  const source = isCopy ? algorithm[kState] : undefined, name = isCopy ? source.algorithm : algorithm;
+  if (!isCopy && digestSize(name) === undefined) throw new Error('Digest method not supported');
+  const state = hashState(name, xofLen);
+  let id;
+  try { id = isCopy ? call('hashCopy', [handle(algorithm)]) : call('hashCreate', [algorithm]); }
+  catch (e) { if (!isCopy && e.code === 'ERR_OSSL_CRYPTO_OPERATION_FAILED' && digestSize(algorithm) === undefined) throw new Error('Digest method not supported'); throw e; }
+  attach(this, id); this[kState] = state;
+  if (!isCopy && xofLen === undefined) warnShake(algorithm);
+  LazyTransform.call(this, options);
+}
+Object.setPrototypeOf(Hash.prototype, LazyTransform.prototype);
+Object.setPrototypeOf(Hash, LazyTransform);
+function hashData(data, encoding) {
+  if (typeof data === 'string') { validate.encoding(data, encoding); return Buffer.from(data, encoding); }
+  if (!ArrayBuffer.isView(data)) throw codes.ERR_INVALID_ARG_TYPE('data', ['string', 'Buffer', 'TypedArray', 'DataView'], data);
+  return data;
+}
+// Like Node's native handles, the first digest is kept: _flush() reads it without finalizing.
+const kDigest = Symbol('kDigest');
+function hashDigest(object, op, args, outputEncoding) {
+  let result = object[kDigest];
+  if (result === undefined) { result = object[kDigest] = Buffer.from(call(op, args())); release(object); }
+  // Explicit conversion of truthy values for backward compatibility.
+  outputEncoding = outputEncoding && `${outputEncoding}`;
+  return outputEncoding && outputEncoding !== 'buffer' ? result.toString(outputEncoding) : Buffer.from(result);
+}
+Hash.prototype.copy = function copy(options) { if (this[kState][kFinalized]) throw codes.ERR_CRYPTO_HASH_FINALIZED(); return new Hash(this, options); };
+Hash.prototype._transform = function _transform(chunk, encoding, cb) { call('hashUpdate', [handle(this), packed(typeof chunk === 'string' ? Buffer.from(chunk, encoding) : chunk)]); cb(); };
+Hash.prototype._flush = function _flush(cb) { this.push(hashDigest(this, 'hashFinal', () => [handle(this), this[kState].length])); cb(); };
+Hash.prototype.update = function update(data, encoding) {
+  if (this[kState][kFinalized]) throw codes.ERR_CRYPTO_HASH_FINALIZED();
+  call('hashUpdate', [handle(this), packed(hashData(data, encoding))]); return this;
+};
+Hash.prototype.digest = function digest(outputEncoding) {
+  const state = this[kState]; if (state[kFinalized]) throw codes.ERR_CRYPTO_HASH_FINALIZED();
+  const result = hashDigest(this, 'hashFinal', () => [handle(this), state.length], outputEncoding); state[kFinalized] = true; return result;
+};
+Hash.prototype._destroy = function _destroy(e, cb) { release(this); cb(e); };
+function Hmac(hmac, key, options) {
+  if (!(this instanceof Hmac)) return new Hmac(hmac, key, options);
+  validate.string(hmac, 'hmac');
+  const encoding = options && options.encoding;
+  if (encoding !== undefined && options !== null && typeof options === 'object') validate.string(encoding, 'options.encoding');
+  key = prepareSecretKey(key, encoding);
+  if (digestSize(hmac) === undefined) throw codes.ERR_CRYPTO_INVALID_DIGEST(hmac);
+  let id; try { id = call('hmacCreate', [hmac, packed(key)]); } catch (e) { if (e.library !== undefined) throw e; throw codes.ERR_CRYPTO_OPERATION_FAILED('Failed to initialize HMAC'); }
+  attach(this, id); this[kState] = { [kFinalized]: false };
+  LazyTransform.call(this, options);
+}
+Object.setPrototypeOf(Hmac.prototype, LazyTransform.prototype);
+Object.setPrototypeOf(Hmac, LazyTransform);
+Hmac.prototype.update = function update(data, encoding) {
+  if (this[kState][kFinalized]) throw codes.ERR_CRYPTO_HASH_FINALIZED();
+  call('hmacUpdate', [handle(this), packed(hashData(data, encoding))]); return this;
+};
+Hmac.prototype.digest = function digest(outputEncoding) {
+  const state = this[kState];
+  if (state[kFinalized]) { const buf = Buffer.from(''); return outputEncoding && outputEncoding !== 'buffer' ? buf.toString(outputEncoding) : buf; }
+  const result = hashDigest(this, 'hmacFinal', () => [handle(this)], outputEncoding); state[kFinalized] = true; return result;
+};
+Hmac.prototype._transform = function _transform(chunk, encoding, cb) { call('hmacUpdate', [handle(this), packed(typeof chunk === 'string' ? Buffer.from(chunk, encoding) : chunk)]); cb(); };
+Hmac.prototype._flush = function _flush(cb) { this.push(hashDigest(this, 'hmacFinal', () => [handle(this)])); this[kState][kFinalized] = true; cb(); };
+Hmac.prototype._destroy = Hash.prototype._destroy;
 function createHash(algorithm, options) { return new Hash(algorithm, options); }
-function createHmac(algorithm, key, options) { return new Hmac(algorithm, key, options); }
-function hash(algorithm, data, encoding = 'hex') { return createHash(algorithm).update(data).digest(encoding); }
-class Cipheriv extends Transform {
-  constructor(algorithm, key, iv, options = {}, decrypt = false) {
-    super(options); name(algorithm); if (key instanceof KeyObject) { if (key.type !== 'secret') throw error('ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE', 'Cipher requires a secret key'); key = key.export(); }
-    this._decrypt = decrypt; this._aead = /-(gcm|ccm|ocb)$|^chacha20-poly1305$/i.test(algorithm); this._ccm = /-ccm$/i.test(algorithm); this._tagLength = options.authTagLength === undefined ? 16 : integer(options.authTagLength, 'authTagLength', 1, 16);
-    if (this._ccm && options.authTagLength === undefined) throw error('ERR_CRYPTO_INVALID_AUTH_TAG', 'authTagLength is required for CCM');
-    if (/-gcm$/i.test(algorithm) && ![4, 8, 12, 13, 14, 15, 16].includes(this._tagLength)) throw error('ERR_CRYPTO_INVALID_AUTH_TAG', 'Invalid GCM authentication tag length');
-    if (this._ccm && ![4, 6, 8, 10, 12, 14, 16].includes(this._tagLength)) throw error('ERR_CRYPTO_INVALID_AUTH_TAG', 'Invalid CCM authentication tag length');
-    this._tagSpecified = options.authTagLength !== undefined; this._finished = false; this._tag = undefined; this._decoder = undefined; this._outputEncoding = undefined;
-    attach(this, call('cipherCreate', [algorithm, packed(bytes(key, options.encoding)), packed(iv === null ? Buffer.alloc(0) : bytes(iv, options.encoding)), decrypt ? 0 : 1, this._tagLength, /^(?:chacha20-poly1305)$|-(?:gcm|ccm|ocb)$/i.test(algorithm) ? 1 : 0]));
+function createHmac(hmac, key, options) { return new Hmac(hmac, key, options); }
+function hash(algorithm, input, options) {
+  validate.string(algorithm, 'algorithm');
+  if (typeof input !== 'string' && !ArrayBuffer.isView(input)) throw codes.ERR_INVALID_ARG_TYPE('input', ['Buffer', 'TypedArray', 'DataView', 'string'], input);
+  let outputEncoding, outputLength;
+  if (typeof options === 'string') outputEncoding = options;
+  else if (options !== undefined) { validate.object(options, 'options'); outputLength = options.outputLength; outputEncoding = options.outputEncoding; }
+  outputEncoding ??= 'hex';
+  let normalized = outputEncoding;
+  if (normalized !== 'hex') {
+    validate.string(outputEncoding, 'outputEncoding');
+    normalized = outputEncoding.toLowerCase() === 'buffer' ? 'buffer' : Buffer.isEncoding(outputEncoding) ? outputEncoding : undefined;
+    if (normalized === undefined) throw codes.ERR_INVALID_ARG_VALUE('outputEncoding', outputEncoding);
   }
-  _encode(data, encoding, final) { if (!encoding || encoding === 'buffer') { if (this._decoder) throw error('ERR_INVALID_ARG_VALUE', 'Cannot change cipher output encoding'); return Buffer.from(data); } if (this._outputEncoding && this._outputEncoding !== encoding) throw error('ERR_INVALID_ARG_VALUE', 'Cannot change cipher output encoding'); this._outputEncoding = encoding; if (!this._decoder) { const { StringDecoder } = require('string_decoder'); this._decoder = new StringDecoder(encoding); } return final ? this._decoder.end(Buffer.from(data)) : this._decoder.write(Buffer.from(data)); }
-  update(data, inputEncoding, outputEncoding) { if (this._finished) throw error('ERR_CRYPTO_INVALID_STATE', 'Cipher is finalized'); return this._encode(call('cipherUpdate', [handle(this), packed(bytes(data, inputEncoding))]), outputEncoding, false); }
-  final(encoding) { if (this._finished) throw error('ERR_CRYPTO_INVALID_STATE', 'Cipher is finalized'); this._finished = true; try { const result = call('cipherFinal', [handle(this)]); if (this._aead && !this._decrypt) this._tag = Buffer.from(call('cipherGetTag', [handle(this), this._tagLength])); return this._encode(result, encoding, true); } finally { release(this); } }
-  setAutoPadding(value = true) { if (typeof value !== 'boolean') throw invalid('autoPadding', 'a boolean'); call('cipherPadding', [handle(this), value ? 1 : 0]); return this; }
-  setAAD(data, options = {}) { if (!this._aead || this._finished) throw error('ERR_CRYPTO_INVALID_STATE', 'Invalid state for setAAD'); let length = -1; if (this._ccm) length = integer(options.plaintextLength, 'plaintextLength'); call('cipherAAD', [handle(this), packed(binary(data)), length]); return this; }
-  setAuthTag(tag, encoding) { if (!this._decrypt || !this._aead || this._finished || this._tag) throw error('ERR_CRYPTO_INVALID_STATE', 'Invalid state for setAuthTag'); tag = bytes(tag, encoding); if (this._tagSpecified && tag.length !== this._tagLength) throw error('ERR_CRYPTO_INVALID_AUTH_TAG', 'Invalid authentication tag length'); if (!this._tagSpecified && ![4, 8, 12, 13, 14, 15, 16].includes(tag.length)) throw error('ERR_CRYPTO_INVALID_AUTH_TAG', 'Invalid authentication tag length'); call('cipherTag', [handle(this), packed(tag)]); this._tag = Buffer.from(tag); return this; }
-  getAuthTag() { if (this._decrypt || !this._tag || !this._finished) throw error('ERR_CRYPTO_INVALID_STATE', 'Invalid state for getAuthTag'); return Buffer.from(this._tag); }
-  _transform(chunk, encoding, cb) { try { this.push(this.update(chunk, encoding)); cb(); } catch (e) { cb(e); } }
-  _flush(cb) { try { this.push(this.final()); cb(); } catch (e) { cb(e); } }
-  _destroy(e, cb) { release(this); cb(e); }
+  if (outputLength !== undefined) { validate.uint32(outputLength, 'outputLength'); outputLength += 0; }
+  const size = digestSize(algorithm), xof = /^shake-?(?:128|256)$/i.test(algorithm);
+  if (size === undefined) throw new Error(`Digest method ${algorithm} is not supported`);
+  if (!xof && outputLength !== undefined && outputLength !== size) throw new Error(`Output length ${outputLength} is invalid for ${algorithm}, which does not support XOF`);
+  if (xof && outputLength === 0) return normalized === 'buffer' ? Buffer.alloc(0) : '';
+  const digest = new Hash(algorithm, outputLength === undefined ? undefined : { outputLength });
+  return digest.update(input, typeof input === 'string' ? 'utf8' : undefined).digest(normalized);
 }
-class Decipheriv extends Cipheriv { constructor(algorithm, key, iv, options) { super(algorithm, key, iv, options, true); } }
-function createCipheriv(algorithm, key, iv, options) { return new Cipheriv(algorithm, key, iv, options); }
-function createDecipheriv(algorithm, key, iv, options) { return new Decipheriv(algorithm, key, iv, options); }
-function pbkdf2Args(password, salt, iterations, keylen, digest) { return [packed(password), packed(salt), integer(iterations, 'iterations', 1), integer(keylen, 'keylen'), name(digest, 'digest')]; }
-function pbkdf2Sync(password, salt, iterations, keylen, digest) { return Buffer.from(call('pbkdf2', pbkdf2Args(password, salt, iterations, keylen, digest))); }
-function pbkdf2(password, salt, iterations, keylen, digest, cb) { callback(cb); submit('pbkdf2', pbkdf2Args(password, salt, iterations, keylen, digest), cb, Buffer.from); }
-function scryptArgs(password, salt, keylen, options = {}) { if (options === null || typeof options !== 'object') throw invalid('options', 'an object'); for (const [a, b] of [['N', 'cost'], ['r', 'blockSize'], ['p', 'parallelization']]) if (options[a] !== undefined && options[b] !== undefined) throw error('ERR_CRYPTO_SCRYPT_INVALID_PARAMETER', `Cannot specify both ${a} and ${b}`); const N = options.N ?? options.cost ?? 16384, r = options.r ?? options.blockSize ?? 8, p = options.p ?? options.parallelization ?? 1, maxmem = options.maxmem ?? 32 * 1024 * 1024; integer(N, 'N', 2, Number.MAX_SAFE_INTEGER); if (!Number.isInteger(Math.log2(N))) throw error('ERR_CRYPTO_INVALID_SCRYPT_PARAMS', 'N must be a power of two'); return [packed(password), packed(salt), integer(keylen, 'keylen'), N, integer(r, 'r', 1), integer(p, 'p', 1), integer(maxmem, 'maxmem', 1, Number.MAX_SAFE_INTEGER)]; }
-function scryptSync(password, salt, keylen, options) { return Buffer.from(call('scrypt', scryptArgs(password, salt, keylen, options))); }
-function scrypt(password, salt, keylen, options, cb) { if (typeof options === 'function') { cb = options; options = undefined; } callback(cb); submit('scrypt', scryptArgs(password, salt, keylen, options), cb, Buffer.from); }
-function hkdfArgs(digest, ikm, salt, info, keylen) { if (ikm instanceof KeyObject) ikm = ikm.export(); const args = [name(digest, 'digest'), packed(ikm), packed(salt), packed(info), integer(keylen, 'keylen')]; if (args[3].byteLength > 1024) throw error('ERR_OUT_OF_RANGE', 'info must not exceed 1024 bytes', RangeError); return args; }
-function hkdfSync(digest, ikm, salt, info, keylen) { return call('hkdf', hkdfArgs(digest, ikm, salt, info, keylen)); }
-function hkdf(digest, ikm, salt, info, keylen, cb) { callback(cb); submit('hkdf', hkdfArgs(digest, ikm, salt, info, keylen), cb); }
-const keyToken = Symbol('KeyObject'); const secrets = new WeakMap(), keyObjects = new WeakSet();
-require('internal/host').types.isKeyObject = value => keyObjects.has(value);
+// lib/internal/crypto/cipher.js, with the checks and auth tag states of Node's CipherBase (src/crypto/crypto_cipher.cc).
+const { StringDecoder } = require('string_decoder');
+const kCipher = Symbol('kCipher');
+const kNoAuthTagLength = -1, kAuthTagUnknown = 0, kAuthTagComputed = 1, kAuthTagSetByUser = 2;
+function getStringOption(options, key) { let value; if (options && (value = options[key]) != null) validate.string(value, `options.${key}`); return value; }
+function getUIntOption(options, key) { let value; if (options && (value = options[key]) != null) { if (value >>> 0 !== value) throw codes.ERR_INVALID_ARG_VALUE(`options.${key}`, value); return value + 0; } return -1; }
+function getDecoder(decoder, encoding) {
+  const normalized = Buffer.isEncoding(encoding) ? new StringDecoder(encoding).encoding : undefined;
+  decoder ||= new StringDecoder(encoding);
+  if (decoder.encoding !== normalized) {
+    if (normalized === undefined) throw codes.ERR_UNKNOWN_ENCODING(encoding);
+    throw codes.ERR_INVALID_ARG_VALUE('outputEncoding', encoding, `cannot be changed from '${decoder.encoding}'`);
+  }
+  return decoder;
+}
+// Node's CipherBase::kMaxSivAADComponents: OpenSSL's SIV takes at most 126 AAD components.
+const kMaxSivAADComponents = 126;
+const validGcmTag = n => n === 4 || n === 8 || (n >= 12 && n <= 16);
+// A failed native step reports OpenSSL's error when there is one, else Node's message.
+function cipherFailure(e, message) { if (e.code === 'ERR_OSSL_CRYPTO_OPERATION_FAILED' && e.library === undefined) return new Error(message); return e; }
+function initCipher(object, cipher, key, iv, authTagLength, ctsMode, xtsStandard, encrypt) {
+  const info = cipherDetails(cipher);
+  if (info === undefined) throw codes.ERR_CRYPTO_UNKNOWN_CIPHER();
+  const mode = info.mode, lower = cipher.toLowerCase();
+  const chacha = info.name.toLowerCase() === 'chacha20-poly1305', siv = mode === 65540, gcmSiv = mode === 65541;
+  const gcm = mode === 6, ccm = mode === 7, ocb = mode === 65539, wrap = mode === 65538, xts = mode === 65537;
+  const cts = /-cts$/.test(lower), aead = gcm || ccm || ocb || chacha || siv || gcmSiv;
+  const ivBytes = iv === null ? Buffer.alloc(0) : bytes(iv), hasIv = ivBytes.length > 0, expected = info.ivLength;
+  if (!hasIv && expected !== 0) throw codes.ERR_CRYPTO_INVALID_IV();
+  if (!aead && hasIv && ivBytes.length !== expected) throw codes.ERR_CRYPTO_INVALID_IV();
+  if (chacha && ivBytes.length > 12) throw codes.ERR_CRYPTO_INVALID_IV();
+  if (siv && hasIv) throw codes.ERR_CRYPTO_INVALID_IV();
+  if (gcmSiv && (!hasIv || ivBytes.length !== expected)) throw codes.ERR_CRYPTO_INVALID_IV();
+  if (ctsMode !== undefined && !cts) throw error('ERR_CRYPTO_UNSUPPORTED_OPERATION', `${cipher} does not support the ctsMode option`);
+  if (xtsStandard !== undefined && !(xts && /^sm4-/.test(lower))) throw error('ERR_CRYPTO_UNSUPPORTED_OPERATION', `${cipher} does not support the xtsStandard option`);
+  const state = { encrypt, gcm, ccm, chacha, siv: siv || gcmSiv, sivMode: siv, sivAadComponents: 0, aead, oneShot: (ccm && !encrypt) || siv || gcmSiv || cts || xts || wrap, hasOneShotUpdate: false, pendingAuthFailed: false, authTagLength: kNoAuthTagLength, authTagState: kAuthTagUnknown, tag: undefined, maxMessage: 0x7fffffff, blockSize: Math.max(info.blockSize, 1), open: false };
+  if (aead) {
+    if (!siv && !gcmSiv) {
+      const n = ivBytes.length;
+      if (ccm ? n < 7 || n > 13 : ocb ? n < 1 || n > 15 : chacha ? n < 1 || n > 12 : n < 1) throw codes.ERR_CRYPTO_INVALID_IV();
+    }
+    if (ccm) { if (ivBytes.length === 12) state.maxMessage = 16777215; if (ivBytes.length === 13) state.maxMessage = 65535; }
+    let length = authTagLength;
+    if (length === kNoAuthTagLength) {
+      if (siv || gcmSiv || chacha) length = 16;
+      else if (!gcm) throw codes.ERR_CRYPTO_INVALID_AUTH_TAG(`authTagLength required for ${cipher}`);
+    } else if (siv || gcmSiv ? length !== 16 : gcm ? !validGcmTag(length) : ccm ? length < 4 || length > 16 || length % 2 : length < 1 || length > 16) {
+      throw codes.ERR_CRYPTO_INVALID_AUTH_TAG(`Invalid authentication tag length: ${length}`);
+    }
+    state.authTagLength = length;
+  }
+  let id;
+  try { id = call('cipherCreate', [cipher, packed(key), packed(ivBytes), encrypt ? 1 : 0, state.authTagLength === kNoAuthTagLength ? 16 : state.authTagLength, aead ? 1 : 0, ctsMode ?? '', xtsStandard ?? '']); }
+  catch (e) { if (e.code === 'ERR_CRYPTO_INVALID_KEYLEN') throw codes.ERR_CRYPTO_INVALID_KEYLEN(); throw cipherFailure(e, 'Failed to initialize cipher'); }
+  attach(object, id); state.open = true; object[kCipher] = state;
+}
+function createCipherBase(cipher, credential, options, isEncrypt, iv) {
+  let authTagLength = -1, ctsMode, xtsStandard;
+  if (options != null) {
+    authTagLength = getUIntOption(options, 'authTagLength');
+    ctsMode = getStringOption(options, 'ctsMode') ?? undefined;
+    xtsStandard = getStringOption(options, 'xtsStandard') ?? undefined;
+    if (ctsMode !== undefined) validate.oneOf(ctsMode, 'options.ctsMode', ['CS1', 'CS2', 'CS3']);
+    if (xtsStandard !== undefined) validate.oneOf(xtsStandard, 'options.xtsStandard', ['GB', 'IEEE']);
+  }
+  initCipher(this, cipher, credential, iv, authTagLength, ctsMode, xtsStandard, isEncrypt);
+  this._decoder = null;
+  LazyTransform.call(this, options);
+}
+function createCipherWithIV(cipher, key, options, isEncrypt, iv) {
+  validate.string(cipher, 'cipher');
+  const encoding = getStringOption(options, 'encoding');
+  key = bytes(prepareSecretKey(key, encoding));
+  iv = iv === null ? null : validate.bufferSource(iv, 'iv');
+  createCipherBase.call(this, cipher, key, options, isEncrypt, iv);
+}
+function cipherUpdate(object, data) {
+  const state = object[kCipher];
+  if (!state.open) throw new Error('Trying to add data in unsupported state');
+  if (state.ccm && data.byteLength > state.maxMessage) throw error('ERR_CRYPTO_INVALID_MESSAGELEN', 'Invalid message length', RangeError);
+  if ((state.oneShot && state.hasOneShotUpdate) || data.byteLength + state.blockSize > 0x7fffffff) throw new Error('Trying to add data in unsupported state');
+  // Node pops OpenSSL's errors before reporting a failed update.
+  let result;
+  try { result = Buffer.from(call('cipherUpdate', [handle(object), packed(data)])); }
+  catch {
+    if (!state.encrypt && (state.ccm || state.siv)) { state.hasOneShotUpdate = true; state.pendingAuthFailed = true; return Buffer.alloc(0); }
+    throw new Error('Trying to add data in unsupported state');
+  }
+  if (state.oneShot) state.hasOneShotUpdate = true;
+  return result;
+}
+function cipherFinal(object) {
+  const state = object[kCipher];
+  if (!state.open) throw error('ERR_CRYPTO_INVALID_STATE', 'Invalid state');
+  const message = state.aead ? 'Unsupported state or unable to authenticate data' : 'Unsupported state';
+  state.open = false;
+  try {
+    if (state.oneShot && !state.hasOneShotUpdate && !state.ccm) throw new Error(message);
+    if (!state.encrypt && state.ccm) {
+      if (!(state.authTagState === kAuthTagSetByUser && state.hasOneShotUpdate && !state.pendingAuthFailed)) throw new Error(message);
+      return Buffer.alloc(0);
+    }
+    if (state.pendingAuthFailed) throw new Error(message);
+    let result;
+    try { result = Buffer.from(call('cipherFinal', [handle(object)])); } catch (e) { throw cipherFailure(e, message); }
+    if (state.encrypt && state.aead) {
+      if (state.authTagLength === kNoAuthTagLength) state.authTagLength = 16;
+      state.tag = Buffer.from(call('cipherGetTag', [handle(object), state.authTagLength])); state.authTagState = kAuthTagComputed;
+    }
+    return result;
+  } finally { release(object); }
+}
+function cipherData(data, inputEncoding) {
+  if (typeof data === 'string') { validate.encoding(data, inputEncoding); return Buffer.from(data, inputEncoding); }
+  if (!ArrayBuffer.isView(data)) throw codes.ERR_INVALID_ARG_TYPE('data', ['string', 'Buffer', 'TypedArray', 'DataView'], data);
+  return data;
+}
+const cipherPrototype = {
+  _transform(chunk, encoding, cb) { this.push(cipherUpdate(this, typeof chunk === 'string' ? Buffer.from(chunk, encoding) : chunk)); cb(); },
+  _flush(cb) { try { this.push(cipherFinal(this)); } catch (e) { cb(e); return; } cb(); },
+  update(data, inputEncoding, outputEncoding) {
+    const ret = cipherUpdate(this, cipherData(data, inputEncoding));
+    if (outputEncoding && outputEncoding !== 'buffer') { this._decoder = getDecoder(this._decoder, outputEncoding); return this._decoder.write(ret); }
+    return ret;
+  },
+  final(outputEncoding) {
+    const ret = cipherFinal(this);
+    if (outputEncoding && outputEncoding !== 'buffer') { this._decoder = getDecoder(this._decoder, outputEncoding); return this._decoder.end(ret); }
+    return ret;
+  },
+  setAutoPadding(ap) {
+    if (!this[kCipher].open) throw codes.ERR_CRYPTO_INVALID_STATE('setAutoPadding');
+    try { call('cipherPadding', [handle(this), ap ? 1 : 0]); } catch { throw codes.ERR_CRYPTO_INVALID_STATE('setAutoPadding'); }
+    return this;
+  },
+  setAAD(aadbuf, options) {
+    const encoding = getStringOption(options, 'encoding'), plaintextLength = getUIntOption(options, 'plaintextLength');
+    aadbuf = validate.bufferSource(aadbuf, 'aadbuf', encoding);
+    const state = this[kCipher];
+    if (!state.open || !state.aead || (state.siv && state.hasOneShotUpdate) || (state.sivMode && state.sivAadComponents >= kMaxSivAADComponents)) throw codes.ERR_CRYPTO_INVALID_STATE('setAAD');
+    if (state.ccm) {
+      if (plaintextLength < 0) throw error('ERR_MISSING_ARGS', 'options.plaintextLength required for CCM mode with AAD', TypeError);
+      if (plaintextLength > state.maxMessage) throw error('ERR_CRYPTO_INVALID_MESSAGELEN', 'Invalid message length', RangeError);
+    }
+    try { call('cipherAAD', [handle(this), packed(aadbuf), state.ccm ? plaintextLength : -1]); } catch { throw codes.ERR_CRYPTO_INVALID_STATE('setAAD'); }
+    if (state.sivMode) state.sivAadComponents++;
+    return this;
+  },
+};
+function getAuthTag() {
+  const state = this[kCipher];
+  if (state.open || !state.encrypt || state.authTagLength === kNoAuthTagLength || state.authTagState !== kAuthTagComputed) throw codes.ERR_CRYPTO_INVALID_STATE('getAuthTag');
+  return Buffer.from(state.tag);
+}
+let gcmTagWarned = false;
+function setAuthTag(tagbuf, encoding) {
+  tagbuf = validate.bufferSource(tagbuf, 'buffer', encoding);
+  const state = this[kCipher];
+  if (!state.open || !state.aead || state.encrypt || state.authTagState !== kAuthTagUnknown || (state.siv && state.hasOneShotUpdate)) throw codes.ERR_CRYPTO_INVALID_STATE('setAuthTag');
+  const length = tagbuf.byteLength;
+  const valid = state.gcm ? (state.authTagLength === kNoAuthTagLength || state.authTagLength === length) && validGcmTag(length) : state.authTagLength === length;
+  if (!valid) throw codes.ERR_CRYPTO_INVALID_AUTH_TAG(`Invalid authentication tag length: ${length}`);
+  if (state.gcm && state.authTagLength === kNoAuthTagLength && length !== 16 && !gcmTagWarned) {
+    gcmTagWarned = true;
+    process.emitWarning('Using AES-GCM authentication tags of less than 128 bits without specifying the authTagLength option when initializing decryption is deprecated.', 'DeprecationWarning', 'DEP0182');
+  }
+  state.authTagLength = length;
+  try { call('cipherTag', [handle(this), packed(tagbuf)]); } catch { throw codes.ERR_CRYPTO_INVALID_STATE('setAuthTag'); }
+  state.authTagState = kAuthTagSetByUser;
+  return this;
+}
+function Cipheriv(cipher, key, iv, options) {
+  if (!(this instanceof Cipheriv)) return new Cipheriv(cipher, key, iv, options);
+  createCipherWithIV.call(this, cipher, key, options, true, iv);
+}
+function Decipheriv(cipher, key, iv, options) {
+  if (!(this instanceof Decipheriv)) return new Decipheriv(cipher, key, iv, options);
+  createCipherWithIV.call(this, cipher, key, options, false, iv);
+}
+for (const constructor of [Cipheriv, Decipheriv]) {
+  Object.setPrototypeOf(constructor.prototype, LazyTransform.prototype); Object.setPrototypeOf(constructor, LazyTransform);
+  Object.assign(constructor.prototype, cipherPrototype);
+  if (constructor === Cipheriv) constructor.prototype.getAuthTag = getAuthTag; else constructor.prototype.setAuthTag = setAuthTag;
+  constructor.prototype._destroy = function _destroy(e, cb) { release(this); cb(e); };
+}
+function createCipheriv(cipher, key, iv, options) { return new Cipheriv(cipher, key, iv, options); }
+function createDecipheriv(cipher, key, iv, options) { return new Decipheriv(cipher, key, iv, options); }
+// lib/internal/crypto/pbkdf2.js, scrypt.js and hkdf.js; the job checks of src/crypto/crypto_{pbkdf2,scrypt,hkdf}.cc.
+function knownDigest(name) { if (digestSize(name) === undefined) throw codes.ERR_CRYPTO_INVALID_DIGEST(name); }
+function pbkdf2Check(password, salt, iterations, keylen, digest) {
+  validate.string(digest, 'digest');
+  password = validate.bufferSource(password, 'password'); salt = validate.bufferSource(salt, 'salt');
+  validate.int32(iterations, 'iterations', 1); validate.int32(keylen, 'keylen', 0); keylen += 0;
+  knownDigest(digest);
+  return [packed(password), packed(salt), iterations, keylen, digest];
+}
+function pbkdf2(password, salt, iterations, keylen, digest, cb) {
+  if (typeof digest === 'function') { cb = digest; digest = undefined; }
+  const args = pbkdf2Check(password, salt, iterations, keylen, digest);
+  validate.function(cb, 'callback');
+  submit('pbkdf2', args, cb, Buffer.from);
+}
+function pbkdf2Sync(password, salt, iterations, keylen, digest) { return Buffer.from(call('pbkdf2', pbkdf2Check(password, salt, iterations, keylen, digest))); }
+const scryptDefaults = { N: 16384, r: 8, p: 1, maxmem: 32 << 20 };
+// OpenSSL's scrypt parameter checks (providers/implementations/kdfs/scrypt.c), which Node runs first.
+function scryptParamsError(N, r, p, maxmem) {
+  const memory = () => error('ERR_CRYPTO_INVALID_SCRYPT_PARAMS', 'Invalid scrypt params: error:030000AC:digital envelope routines::memory limit exceeded', RangeError);
+  if (r > 0xffffffff || p > 0xffffffff) return error('ERR_CRYPTO_INVALID_SCRYPT_PARAMS', 'Invalid scrypt params: error:03000085:digital envelope routines::parameter too large', RangeError);
+  if (maxmem === 0) maxmem = scryptDefaults.maxmem;
+  if (r === 0 || p === 0 || N < 2 || (N & (N - 1)) !== 0) return codes.ERR_CRYPTO_INVALID_SCRYPT_PARAMS();
+  const n = BigInt(N), rr = BigInt(r), pp = BigInt(p), max64 = (1n << 64n) - 1n;
+  if (pp > BigInt((1 << 30) - 1) / rr) return memory();
+  if (16n * rr <= 63n && n >= 1n << (16n * rr)) return memory();
+  const Blen = pp * 128n * rr;
+  if (Blen > 0x7fffffffn) return memory();
+  if (n + 2n > (max64 / 128n) / rr) return memory();
+  const Vlen = 32n * rr * (n + 2n) * 4n;
+  if (Blen > max64 - Vlen || Blen + Vlen > BigInt(maxmem)) return memory();
+  return undefined;
+}
+function scryptCheck(password, salt, keylen, options) {
+  password = validate.bufferSource(password, 'password'); salt = validate.bufferSource(salt, 'salt');
+  validate.int32(keylen, 'keylen', 0); keylen += 0;
+  let { N, r, p, maxmem } = scryptDefaults;
+  if (options && options !== scryptDefaults) {
+    const hasN = options.N !== undefined;
+    if (hasN) { N = options.N; validate.uint32(N, 'N'); }
+    if (options.cost !== undefined) { if (hasN) throw codes.ERR_INCOMPATIBLE_OPTION_PAIR('N', 'cost'); N = options.cost; validate.uint32(N, 'cost'); }
+    const hasR = options.r !== undefined;
+    if (hasR) { r = options.r; validate.uint32(r, 'r'); }
+    if (options.blockSize !== undefined) { if (hasR) throw codes.ERR_INCOMPATIBLE_OPTION_PAIR('r', 'blockSize'); r = options.blockSize; validate.uint32(r, 'blockSize'); }
+    const hasP = options.p !== undefined;
+    if (hasP) { p = options.p; validate.uint32(p, 'p'); }
+    if (options.parallelization !== undefined) { if (hasP) throw codes.ERR_INCOMPATIBLE_OPTION_PAIR('p', 'parallelization'); p = options.parallelization; validate.uint32(p, 'parallelization'); }
+    if (options.maxmem !== undefined) { maxmem = options.maxmem; validate.integer(maxmem, 'maxmem', 0); }
+    if (N === 0) N = scryptDefaults.N; if (r === 0) r = scryptDefaults.r; if (p === 0) p = scryptDefaults.p; if (maxmem === 0) maxmem = scryptDefaults.maxmem;
+  }
+  const failure = scryptParamsError(N, r, p, maxmem);
+  if (failure) throw failure;
+  return [packed(password), packed(salt), keylen, N, r, p, maxmem];
+}
+function scrypt(password, salt, keylen, options, cb = scryptDefaults) {
+  if (cb === scryptDefaults) { cb = options; options = scryptDefaults; }
+  const args = scryptCheck(password, salt, keylen, options);
+  validate.function(cb, 'callback');
+  submit('scrypt', args, cb, Buffer.from);
+}
+function scryptSync(password, salt, keylen, options = scryptDefaults) { return Buffer.from(call('scrypt', scryptCheck(password, salt, keylen, options))); }
+function byteSource(value, name) {
+  if (typeof value === 'string') value = Buffer.from(value);
+  if (isAnyArrayBuffer(value) || ArrayBuffer.isView(value)) return value;
+  throw codes.ERR_INVALID_ARG_TYPE(name, ['string', 'ArrayBuffer', 'TypedArray', 'DataView', 'Buffer'], value);
+}
+function hkdfCheck(hash, key, salt, info, length) {
+  validate.string(hash, 'digest');
+  if (isKeyObject(key)) key = prepareSecretKey(key);
+  else if (!isAnyArrayBuffer(key)) {
+    if (typeof key === 'string') key = Buffer.from(key);
+    if (!ArrayBuffer.isView(key)) throw codes.ERR_INVALID_ARG_TYPE('ikm', ['string', 'SecretKeyObject', 'ArrayBuffer', 'TypedArray', 'DataView', 'Buffer'], key);
+  }
+  salt = byteSource(salt, 'salt'); info = byteSource(info, 'info');
+  validate.integer(length, 'length', 0, require('buffer').kMaxLength); length += 0;
+  const infoLength = c.byteLength(info);
+  if (infoLength > 1024) throw codes.ERR_OUT_OF_RANGE('info', 'must not contain more than 1024 bytes', infoLength);
+  const size = digestSize(hash);
+  if (size === undefined) throw codes.ERR_CRYPTO_INVALID_DIGEST(hash);
+  if (length > 255 * size) throw codes.ERR_CRYPTO_INVALID_KEYLEN();
+  return [hash, packed(key), packed(salt), packed(info), length];
+}
+function hkdfSync(hash, key, salt, info, length) { return call('hkdf', hkdfCheck(hash, key, salt, info, length)); }
+function hkdf(hash, key, salt, info, length, cb) { const args = hkdfCheck(hash, key, salt, info, length); validate.function(cb, 'callback'); submit('hkdf', args, cb); }
+// lib/internal/crypto/keys.js. Each KeyObject's slots live in a WeakMap, so keys carry no own
+// properties. A KeyObjectHandle is internal: like Node, user code cannot construct a KeyObject.
+const keySlots = new WeakMap();
+const kCreatePrivate = 0, kCreatePublic = 1, kConsumePrivate = 2, kConsumePublic = 3;
+class KeyObjectHandle { constructor(value) { this.value = value; } }
+let dep0203Warned = false, dep0204Warned = false;
+function emitDEP0203() { if (dep0203Warned) return; dep0203Warned = true; process.emitWarning('Passing a CryptoKey to node:crypto functions is deprecated.', 'DeprecationWarning', 'DEP0203'); }
+function isKeyObject(key) { return key !== null && typeof key === 'object' && keySlots.has(key); }
+require('internal/host').types.isKeyObject = isKeyObject;
+function keySlotsOf(key, expected = 'KeyObject') { const slots = key !== null && typeof key === 'object' ? keySlots.get(key) : undefined; if (slots === undefined) throw codes.ERR_INVALID_THIS(expected); return slots; }
+function isCryptoKey(value) { return require('internal/host').types.isCryptoKey(value); }
+function cryptoKeyObject(value) { return require('internal/crypto_webcrypto').unwrap(value); }
 class KeyObject {
-  constructor(token, type, value) { if (token !== keyToken) throw error('ERR_ILLEGAL_CONSTRUCTOR', 'Illegal constructor', TypeError); Object.defineProperty(this, 'type', { value: type, enumerable: true }); if (type === 'secret') secrets.set(this, Buffer.from(value)); else attach(this, value); keyObjects.add(this); }
-  get symmetricKeySize() { return this.type === 'secret' ? secrets.get(this).length : undefined; }
-  get asymmetricKeyType() { if (this.type === 'secret') return undefined; const type = call('keyType', [handle(this)]).toLowerCase(); return ({ 'rsa-pss': 'rsa-pss', 'dhx': 'dh' })[type] || type; }
-  get asymmetricKeyDetails() { if (this.type === 'secret') return undefined; const type = this.asymmetricKeyType; if (type === 'rsa' || type === 'rsa-pss') return { modulusLength: call('keyBits', [handle(this)]) }; if (type === 'ec') { const jwk = this.export({ format: 'jwk' }); return { namedCurve: ({ 'P-256': 'prime256v1', 'P-384': 'secp384r1', 'P-521': 'secp521r1' })[jwk.crv] || jwk.crv }; } return {}; }
-  export(options = {}) {
-    if (this.type === 'secret') { if (options.format === 'jwk') return { kty: 'oct', k: secrets.get(this).toString('base64url') }; if (options.format !== undefined && options.format !== 'buffer') throw error('ERR_INVALID_ARG_VALUE', 'Invalid secret key export format'); return Buffer.from(secrets.get(this)); }
-    if (['raw-public', 'raw-private', 'raw-seed'].includes(options.format)) return c.providerRawExport(this, options);
-    if (options.format === 'jwk') return require('internal/crypto_keys').exportJwk(this);
-    const format = options.format || 'pem'; if (!['pem', 'der'].includes(format)) throw error('ERR_INVALID_ARG_VALUE', 'Invalid key format');
-    const type = options.type || (this.type === 'private' ? 'pkcs8' : 'spki'); const structure = ({ pkcs8: 'PrivateKeyInfo', spki: 'SubjectPublicKeyInfo', pkcs1: 'type-specific', sec1: 'type-specific' })[type];
-    if (!structure || this.type === 'public' && !['spki', 'pkcs1'].includes(type)) throw error('ERR_INVALID_ARG_VALUE', 'Invalid key encoding type');
-    if (options.cipher !== undefined && (this.type !== 'private' || options.passphrase === undefined)) throw error('ERR_INVALID_ARG_VALUE', 'Encrypted export requires a private key and passphrase');
-    const result = call('keyExport', [handle(this), format.toUpperCase(), structure, this.type === 'private' ? 1 : 0, options.cipher === undefined ? '' : name(options.cipher, 'cipher'), packed(options.passphrase === undefined ? Buffer.alloc(0) : options.passphrase)]); return format === 'pem' ? Buffer.from(result).toString() : Buffer.from(result);
+  constructor(type, handle) {
+    if (type !== 'secret' && type !== 'public' && type !== 'private') throw codes.ERR_INVALID_ARG_VALUE('type', type);
+    if (typeof handle !== 'object' || !(handle instanceof KeyObjectHandle)) throw codes.ERR_INVALID_ARG_TYPE('handle', 'object', handle);
+    const slots = { type, secret: undefined, asymmetricKeyType: undefined, details: undefined };
+    if (type === 'secret') slots.secret = Buffer.from(handle.value); else attach(this, handle.value);
+    keySlots.set(this, slots);
   }
-  equals(other) { if (!(other instanceof KeyObject)) throw invalid('otherKeyObject', 'a KeyObject'); if (this.type !== other.type) return false; const opts = this.type === 'secret' ? {} : { format: 'der', type: this.type === 'private' ? 'pkcs8' : 'spki' }; const a = this.export(opts), b = other.export(opts); return a.length === b.length && timingSafeEqual(a, b); }
-  toCryptoKey(algorithm, extractable, keyUsages) { if (!keyObjects.has(this)) throw error('ERR_INVALID_THIS', 'Value of "this" must be of type KeyObject', TypeError); return require('internal/crypto_webcrypto').toCryptoKey(this, algorithm, extractable, keyUsages); }
-  static from(key) { const obj = require('internal/crypto_webcrypto').unwrap(key); if (!obj) throw invalid('key', 'a CryptoKey'); return obj; }
+  get type() { return keySlotsOf(this).type; }
+  toCryptoKey(algorithm, extractable, keyUsages) { keySlotsOf(this); return require('internal/crypto_webcrypto').toCryptoKey(this, algorithm, extractable, keyUsages); }
+  static from(key) {
+    if (!isCryptoKey(key)) throw codes.ERR_INVALID_ARG_TYPE('key', 'CryptoKey', key);
+    if (!key.extractable && !dep0204Warned) { dep0204Warned = true; process.emitWarning('Passing a non-extractable CryptoKey to KeyObject.from() is deprecated.', 'DeprecationWarning', 'DEP0204'); }
+    return cryptoKeyObject(key);
+  }
+  equals(otherKeyObject) {
+    if (!isKeyObject(otherKeyObject)) throw codes.ERR_INVALID_ARG_TYPE('otherKeyObject', 'KeyObject', otherKeyObject);
+    return keyObjectEquals(this, otherKeyObject);
+  }
 }
-function createSecretKey(key, encoding) { return new KeyObject(keyToken, 'secret', bytes(key, encoding)); }
-function importKey(key, type) {
-  if (key instanceof KeyObject) { if (type === 'public' && key.type === 'private') return importKey({ key: key.export({ format: 'der', type: 'pkcs8' }), format: 'der' }, 'public'); if (key.type !== type) throw error('ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE', `Expected ${type} key`); return key; }
-  const options = typeof key === 'object' && key !== null && !ArrayBuffer.isView(key) && !(key instanceof ArrayBuffer) ? key : { key };
-  if (options.key instanceof KeyObject) return importKey(options.key, type);
-  if (['raw-public', 'raw-private', 'raw-seed'].includes(options.format)) return c.providerRawImport(options, type);
-  if (options.format === 'jwk') return require('internal/crypto_keys').importJwk(options.key, type);
-  const format = options.format || 'pem'; if (!['pem', 'der'].includes(format)) throw error('ERR_INVALID_ARG_VALUE', 'Invalid key format');
-  return new KeyObject(keyToken, type, call('keyImport', [packed(bytes(options.key, options.encoding)), format.toUpperCase(), type === 'private' ? 1 : 0, packed(options.passphrase === undefined ? Buffer.alloc(0) : options.passphrase)]));
+function keyObjectEquals(left, right) {
+  const a = keySlotsOf(left), b = keySlotsOf(right);
+  if (a.type !== b.type) return false;
+  if (a.type === 'secret') return a.secret.length === b.secret.length && timingSafeEqual(a.secret, b.secret);
+  const options = { format: 'der', type: a.type === 'private' ? 'pkcs8' : 'spki' };
+  const x = exportAsymmetric(left, options), y = exportAsymmetric(right, options);
+  return x.length === y.length && timingSafeEqual(x, y);
 }
-function createPrivateKey(key) { return importKey(key, 'private'); }
-function createPublicKey(key) { if (key instanceof KeyObject && key.type === 'private') return importKey({ key: key.export({ format: 'der', type: 'pkcs8' }), format: 'der' }, 'public'); return importKey(key, 'public'); }
+Object.defineProperty(KeyObject.prototype, Symbol.toStringTag, { __proto__: null, configurable: true, value: 'KeyObject' });
+class SecretKeyObject extends KeyObject {
+  constructor(handle) { super('secret', handle); }
+  get symmetricKeySize() { const slots = keySlotsOf(this, 'SecretKeyObject'); if (slots.type !== 'secret') throw codes.ERR_INVALID_THIS('SecretKeyObject'); return slots.secret.length; }
+  export(options) {
+    const slots = keySlotsOf(this, 'SecretKeyObject');
+    if (options !== undefined) {
+      validate.object(options, 'options');
+      validate.oneOf(options.format, 'options.format', [undefined, 'buffer', 'jwk']);
+      if (options.format === 'jwk') return { kty: 'oct', k: slots.secret.toString('base64url') };
+    }
+    return Buffer.from(slots.secret);
+  }
+}
+function asymmetricKeyTypeOf(key) {
+  const slots = keySlotsOf(key, 'AsymmetricKeyObject');
+  if (slots.type === 'secret') throw codes.ERR_INVALID_THIS('AsymmetricKeyObject');
+  if (slots.asymmetricKeyType === undefined) { const type = call('keyType', [handle(key)]).toLowerCase(); slots.asymmetricKeyType = ({ dhx: 'dh' })[type] || type; }
+  return slots.asymmetricKeyType;
+}
+function keyParam(key, name, kind) { try { return call('keyParam', [handle(key), name, kind]); } catch { return undefined; } }
+function asymmetricKeyDetailsOf(key) {
+  const slots = keySlotsOf(key, 'AsymmetricKeyObject'), type = asymmetricKeyTypeOf(key);
+  if (slots.details === undefined) {
+    let details = {};
+    if (type === 'rsa' || type === 'rsa-pss') {
+      details = { modulusLength: call('keyBits', [handle(key)]), publicExponent: unsignedBig(Buffer.from(keyParam(key, 'e', 0) ?? [])) };
+      if (type === 'rsa-pss') {
+        // OpenSSL leaves out restriction fields that hold the RFC 8017 defaults
+        // (SHA-1, MGF1 with SHA-1, salt 20); an unrestricted key has none.
+        const digest = keyParam(key, 'digest', 1), mgf1 = keyParam(key, 'mgf1-digest', 1), saltLength = keyParam(key, 'saltlen', 2);
+        if (digest !== undefined || mgf1 !== undefined || saltLength !== undefined) {
+          details.hashAlgorithm = digest === undefined ? 'sha1' : digestLongName(Buffer.from(digest).toString());
+          details.mgf1HashAlgorithm = mgf1 === undefined ? 'sha1' : digestLongName(Buffer.from(mgf1).toString());
+          details.saltLength = saltLength ?? 20;
+        }
+      }
+    } else if (type === 'dsa') {
+      details = { modulusLength: call('keyBits', [handle(key)]), divisorLength: call('keyQBits', [handle(key), 'q']) };
+    } else if (type === 'ec') {
+      const group = keyParam(key, 'group', 1);
+      details = { namedCurve: group === undefined ? undefined : Buffer.from(group).toString() };
+    }
+    slots.details = details;
+  }
+  return slots.details;
+}
+// Node reports OBJ_nid2ln names ("sha256"); providers report "SHA2-256" style names.
+function digestLongName(name) { return ({ 'SHA1': 'sha1', 'SHA2-224': 'sha224', 'SHA2-256': 'sha256', 'SHA2-384': 'sha384', 'SHA2-512': 'sha512', 'SHA2-512/224': 'sha512-224', 'SHA2-512/256': 'sha512-256', 'SHA3-224': 'sha3-224', 'SHA3-256': 'sha3-256', 'SHA3-384': 'sha3-384', 'SHA3-512': 'sha3-512', 'MD5': 'md5' })[name.toUpperCase()] ?? name.toLowerCase(); }
+class AsymmetricKeyObject extends KeyObject {
+  get asymmetricKeyType() { return asymmetricKeyTypeOf(this); }
+  get asymmetricKeyDetails() { return { ...asymmetricKeyDetailsOf(this) }; }
+}
+class PublicKeyObject extends AsymmetricKeyObject {
+  constructor(handle) { super('public', handle); }
+  export(options) {
+    keySlotsOf(this, 'PublicKeyObject');
+    switch (options?.format) {
+      case 'jwk': return require('internal/crypto_keys').exportJwk(this);
+      case 'raw-public': return c.providerRawExport(this, options);
+      default: return exportAsymmetric(this, options);
+    }
+  }
+}
+class PrivateKeyObject extends AsymmetricKeyObject {
+  constructor(handle) { super('private', handle); }
+  export(options) {
+    keySlotsOf(this, 'PrivateKeyObject');
+    if (options?.passphrase !== undefined && options.format !== 'pem' && options.format !== 'der') throw codes.ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS(options.format, 'does not support encryption');
+    switch (options?.format) {
+      case 'jwk': return require('internal/crypto_keys').exportJwk(this);
+      case 'raw-private': case 'raw-seed': return c.providerRawExport(this, options);
+      default: return exportAsymmetric(this, options);
+    }
+  }
+}
+const encodingNames = { pkcs1: 'pkcs1', pkcs8: 'pkcs8', spki: 'spki', sec1: 'sec1' };
+function exportAsymmetric(key, options) {
+  const isPrivate = keySlotsOf(key).type === 'private', keyType = asymmetricKeyTypeOf(key);
+  const { format, type, cipher, passphrase } = isPrivate ? parsePrivateKeyEncoding(options, keyType) : parsePublicKeyEncoding(options, keyType);
+  const structure = type === 'spki' ? 'SubjectPublicKeyInfo' : type === 'pkcs8' ? 'PrivateKeyInfo' : 'type-specific';
+  const traditional = format === 'pem' && cipher != null && (type === 'pkcs1' || type === 'sec1') ? 1 : 0;
+  const result = call('keyExport', [handle(key), format.toUpperCase(), structure, isPrivate ? 1 : 0, cipher == null ? '' : cipher, packed(passphrase === undefined ? Buffer.alloc(0) : passphrase), traditional]);
+  return format === 'pem' ? Buffer.from(result).toString() : Buffer.from(result);
+}
+function option(name, prefix) { return prefix === undefined ? `options.${name}` : `${prefix}.${name}`; }
+function parseKeyFormat(formatStr, defaultFormat, objName) {
+  if (formatStr === undefined && defaultFormat !== undefined) return defaultFormat;
+  if (['pem', 'der', 'jwk', 'raw-public', 'raw-private', 'raw-seed'].includes(formatStr)) return formatStr;
+  throw codes.ERR_INVALID_ARG_VALUE(option('format', objName), formatStr);
+}
+function parseKeyType(typeStr, required, keyType, isPublic, objName) {
+  if (typeStr === undefined && !required) return undefined;
+  if (typeStr === 'pkcs1') { if (keyType !== undefined && keyType !== 'rsa') throw codes.ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS(typeStr, 'can only be used for RSA keys'); return 'pkcs1'; }
+  if (typeStr === 'spki' && isPublic !== false) return 'spki';
+  if (typeStr === 'pkcs8' && isPublic !== true) return 'pkcs8';
+  if (typeStr === 'sec1' && isPublic !== true) { if (keyType !== undefined && keyType !== 'ec') throw codes.ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS(typeStr, 'can only be used for EC keys'); return 'sec1'; }
+  throw codes.ERR_INVALID_ARG_VALUE(option('type', objName), typeStr);
+}
+function parseKeyFormatAndType(enc, keyType, isPublic, objName) {
+  const { format: formatStr, type: typeStr } = enc;
+  const isInput = keyType === undefined;
+  const format = parseKeyFormat(formatStr, isInput ? 'pem' : undefined, objName);
+  if (format === 'raw-public') {
+    if (isPublic === false) throw codes.ERR_INVALID_ARG_VALUE(option('format', objName), 'raw-public');
+    if (typeStr !== undefined && typeStr !== 'uncompressed' && typeStr !== 'compressed') throw codes.ERR_INVALID_ARG_VALUE(option('type', objName), typeStr);
+    return { format, type: typeStr ?? 'uncompressed' };
+  }
+  if (format === 'raw-private' || format === 'raw-seed') {
+    if (isPublic === true) throw codes.ERR_INVALID_ARG_VALUE(option('format', objName), format);
+    if (typeStr !== undefined) throw codes.ERR_INVALID_ARG_VALUE(option('type', objName), typeStr);
+    return { format };
+  }
+  const isRequired = (!isInput || format === 'der') && format !== 'jwk';
+  return { format, type: parseKeyType(typeStr, isRequired, keyType, isPublic, objName) };
+}
+function isStringOrBuffer(value) { return typeof value === 'string' || ArrayBuffer.isView(value) || isAnyArrayBuffer(value); }
+function encodeKeyString(value, encoding) { return Buffer.from(value, encoding === 'buffer' ? 'utf8' : encoding); }
+function parseKeyEncoding(enc, keyType, isPublic, objName) {
+  validate.object(enc, 'options');
+  const isInput = keyType === undefined;
+  const { format, type } = parseKeyFormatAndType(enc, keyType, isPublic, objName);
+  let cipher, passphrase, encoding;
+  if (isPublic !== true) {
+    ({ cipher, passphrase, encoding } = enc);
+    if (format === 'raw-private' || format === 'raw-seed') {
+      if (cipher != null || passphrase !== undefined) throw codes.ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS('raw format', 'does not support encryption');
+      return { format, type };
+    }
+    if (!isInput) {
+      if (cipher != null) {
+        if (typeof cipher !== 'string') throw codes.ERR_INVALID_ARG_VALUE(option('cipher', objName), cipher);
+        if (format === 'der' && (type === 'pkcs1' || type === 'sec1')) throw codes.ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS(encodingNames[type], 'does not support encryption');
+      } else if (passphrase !== undefined) {
+        throw codes.ERR_INVALID_ARG_VALUE(option('cipher', objName), cipher, 'is required when a passphrase is specified');
+      }
+    }
+    if ((isInput && passphrase !== undefined && !isStringOrBuffer(passphrase)) || (!isInput && cipher != null && !isStringOrBuffer(passphrase)))
+      throw codes.ERR_INVALID_ARG_VALUE(option('passphrase', objName), passphrase);
+  }
+  if (typeof passphrase === 'string') passphrase = encodeKeyString(passphrase, encoding);
+  return { format, type, cipher, passphrase };
+}
+function parsePublicKeyEncoding(enc, keyType, objName) { return parseKeyEncoding(enc, keyType, keyType ? true : undefined, objName); }
+function parsePrivateKeyEncoding(enc, keyType, objName) { return parseKeyEncoding(enc, keyType, false, objName); }
+function keyTypes(allowKeyObject, allowURL = false) { return ['ArrayBuffer', 'Buffer', 'TypedArray', 'DataView', 'string', ...(allowKeyObject ? ['KeyObject', 'CryptoKey'] : []), ...(allowURL ? ['URL'] : [])]; }
+function validateAsymmetricKeyType(type, ctx, key) {
+  if (ctx === kCreatePrivate) throw codes.ERR_INVALID_ARG_TYPE('key', keyTypes(false, true), key);
+  if (type !== 'private') {
+    if (ctx === kConsumePrivate || ctx === kCreatePublic) throw codes.ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE(type, 'private');
+    if (type !== 'public') throw codes.ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE(type, 'private or public');
+  }
+}
+function prepareAsymmetricKey(key, ctx, name = 'key') {
+  if (typeof key === 'string') return { format: 'pem', data: encodeKeyString(key) };
+  if (ArrayBuffer.isView(key)) return { format: 'pem', data: key };
+  const isPrivateKeyInput = ctx === kConsumePrivate || ctx === kCreatePrivate;
+  if (isKeyObject(key)) { validateAsymmetricKeyType(keySlotsOf(key).type, ctx, key); return { keyObject: key }; }
+  if (isCryptoKey(key)) { emitDEP0203(); const object = cryptoKeyObject(key); validateAsymmetricKeyType(keySlotsOf(object).type, ctx, key); return { keyObject: object }; }
+  if (isAnyArrayBuffer(key)) return { format: 'pem', data: key };
+  if (typeof key === 'object' && key !== null) return prepareAsymmetricKeyOptions(key, ctx, name, isPrivateKeyInput);
+  throw codes.ERR_INVALID_ARG_TYPE(name, keyTypes(ctx !== kCreatePrivate, isPrivateKeyInput), key);
+}
+function prepareAsymmetricKeyOptions(key, ctx, name, isPrivateKeyInput) {
+  const { key: data, encoding, format } = key;
+  let isData = typeof data === 'string' || ArrayBuffer.isView(data);
+  if (!isData && isKeyObject(data)) { validateAsymmetricKeyType(keySlotsOf(data).type, ctx, data); return { keyObject: data }; }
+  if (!isData && isCryptoKey(data)) { emitDEP0203(); const object = cryptoKeyObject(data); validateAsymmetricKeyType(keySlotsOf(object).type, ctx, data); return { keyObject: object }; }
+  isData ||= isAnyArrayBuffer(data);
+  if (format === 'jwk') { validate.object(data, `${name}.key`); return { data, format: 'jwk' }; }
+  if (format === 'raw-public' || format === 'raw-private' || format === 'raw-seed') {
+    if (isPrivateKeyInput && format === 'raw-public') throw codes.ERR_INVALID_ARG_VALUE(`${name}.format`, format);
+    if (!isData || typeof data === 'string') throw codes.ERR_INVALID_ARG_TYPE(`${name}.key`, ['ArrayBuffer', 'Buffer', 'TypedArray', 'DataView'], data);
+    validate.string(key.asymmetricKeyType, `${name}.asymmetricKeyType`);
+    if (key.asymmetricKeyType === 'ec') validate.string(key.namedCurve, `${name}.namedCurve`);
+    return { data, format, raw: key };
+  }
+  if (!isData) throw codes.ERR_INVALID_ARG_TYPE(`${name}.key`, keyTypes(ctx !== kCreatePrivate, isPrivateKeyInput), data);
+  const keyData = typeof data === 'string' ? encodeKeyString(data, encoding) : data;
+  const parsed = parseKeyEncoding(key, undefined, isPrivateKeyInput ? false : undefined, name);
+  return { data: keyData, format: parsed.format, type: parsed.type, passphrase: parsed.passphrase };
+}
+function newKeyObject(type, value) {
+  const handle = new KeyObjectHandle(value);
+  return type === 'secret' ? new SecretKeyObject(handle) : type === 'public' ? new PublicKeyObject(handle) : new PrivateKeyObject(handle);
+}
+// Turns prepared key input into a KeyObject of the given type.
+function keyFromPrepared(prepared, type) {
+  if (prepared.keyObject !== undefined) {
+    const object = prepared.keyObject;
+    if (type === 'public' && keySlotsOf(object).type === 'private') return importDer(exportAsymmetric(object, { format: 'der', type: 'pkcs8' }), 'public');
+    return object;
+  }
+  if (prepared.format === 'jwk') return require('internal/crypto_keys').importJwk(prepared.data, type);
+  if (prepared.raw !== undefined) return c.providerRawImport(prepared.raw, type);
+  const { data, format, passphrase } = prepared;
+  return newKeyObject(type, call('keyImport', [packed(bytes(data)), format.toUpperCase(), type === 'private' ? 1 : 0, packed(passphrase === undefined ? Buffer.alloc(0) : passphrase), passphrase === undefined ? 0 : 1]));
+}
+function importDer(data, type) { return newKeyObject(type, call('keyImport', [packed(data), 'DER', type === 'private' ? 1 : 0, packed(Buffer.alloc(0)), 0])); }
+// lib/internal/crypto/keys.js prepareSecretKey: the secret's bytes.
+function prepareSecretKey(key, encoding, bufferOnly = false) {
+  if (!bufferOnly) {
+    let object = isKeyObject(key) ? key : undefined;
+    if (object === undefined && isCryptoKey(key)) { emitDEP0203(); object = cryptoKeyObject(key); }
+    if (object !== undefined) { const slots = keySlotsOf(object); if (slots.type !== 'secret') throw codes.ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE(slots.type, 'secret'); return slots.secret; }
+  }
+  if (typeof key !== 'string' && !ArrayBuffer.isView(key) && !isAnyArrayBuffer(key))
+    throw codes.ERR_INVALID_ARG_TYPE('key', ['ArrayBuffer', 'Buffer', 'TypedArray', 'DataView', ...(bufferOnly ? [] : ['string', 'KeyObject', 'CryptoKey'])], key);
+  return validate.bufferSource(key, 'key', encoding);
+}
+function createSecretKey(key, encoding) { key = prepareSecretKey(key, encoding, true); return newKeyObject('secret', bytes(key)); }
+function createPublicKey(key) { return keyFromPrepared(prepareAsymmetricKey(key, kCreatePublic), 'public'); }
+function createPrivateKey(key) { return keyFromPrepared(prepareAsymmetricKey(key, kCreatePrivate), 'private'); }
+// Key input for operations: a KeyObject (owned when it was created here) of a public or private key.
+// `before` runs between input validation and key import, like the JS checks
+// Node performs before handing the key data to C++.
+function preparedKeyObject(key, ctx, name, before) {
+  const prepared = prepareAsymmetricKey(key, ctx, name);
+  if (before !== undefined) before();
+  if (prepared.keyObject !== undefined) return { key: prepared.keyObject, owned: false };
+  const type = ctx === kConsumePrivate ? 'private' : undefined;
+  if (type === 'private') return { key: keyFromPrepared(prepared, 'private'), owned: true };
+  try { return { key: keyFromPrepared(prepared, 'public'), owned: true }; } catch (e) { try { return { key: keyFromPrepared(prepared, 'private'), owned: true }; } catch { throw e; } }
+}
 function keygenArgs(type, options = {}) {
   name(type, 'type');
   const native = ({ rsa: 'RSA', 'rsa-pss': 'RSA-PSS', dsa: 'DSA', ec: 'EC', ed25519: 'ED25519', ed448: 'ED448', x25519: 'X25519', x448: 'X448', dh: 'DH', 'ml-kem-512': 'ML-KEM-512', 'ml-kem-768': 'ML-KEM-768', 'ml-kem-1024': 'ML-KEM-1024', 'ml-dsa-44': 'ML-DSA-44', 'ml-dsa-65': 'ML-DSA-65', 'ml-dsa-87': 'ML-DSA-87' })[type];
@@ -186,93 +841,391 @@ function keygenArgs(type, options = {}) {
   if (/^rsa/.test(type)) { const e = integer(options.publicExponent ?? 65537, 'publicExponent', 3, 0xffffffff); if (!(e & 1)) throw error('ERR_OUT_OF_RANGE', 'publicExponent must be odd'); exponent = Buffer.alloc(4); exponent.writeUInt32BE(e); }
   return [native, bits, group, packed(exponent), options.hashAlgorithm === undefined ? '' : name(options.hashAlgorithm), options.mgf1HashAlgorithm === undefined ? '' : name(options.mgf1HashAlgorithm), options.saltLength === undefined ? -1 : integer(options.saltLength, 'saltLength')];
 }
-function keypair(id, options) { const privateKey = new KeyObject(keyToken, 'private', id); let publicKey; try { publicKey = createPublicKey(privateKey); const result = { publicKey: options.publicKeyEncoding ? publicKey.export(options.publicKeyEncoding) : publicKey, privateKey: options.privateKeyEncoding ? privateKey.export(options.privateKeyEncoding) : privateKey }; if (options.publicKeyEncoding) release(publicKey); if (options.privateKeyEncoding) release(privateKey); return result; } catch (e) { release(privateKey); if (publicKey) release(publicKey); throw e; } }
+function keypair(id, options) { const privateKey = newKeyObject('private', id); let publicKey; try { publicKey = createPublicKey(privateKey); const result = { publicKey: options.publicKeyEncoding ? publicKey.export(options.publicKeyEncoding) : publicKey, privateKey: options.privateKeyEncoding ? privateKey.export(options.privateKeyEncoding) : privateKey }; if (options.publicKeyEncoding) release(publicKey); if (options.privateKeyEncoding) release(privateKey); return result; } catch (e) { release(privateKey); if (publicKey) release(publicKey); throw e; } }
 function generateKeyPairSync(type, options = {}) { return keypair(call('keyGenerate', keygenArgs(type, options)), options); }
 function generateKeyPair(type, options, cb) { if (typeof options === 'function') { cb = options; options = {}; } options = options || {}; callback(cb); submit('keyGenerate', keygenArgs(type, options), (e, pair) => e ? cb(e) : cb(null, pair.publicKey, pair.privateKey), id => keypair(id, options)); }
 function generateKeySync(type, options) { if (type !== 'hmac' && type !== 'aes') throw error('ERR_INVALID_ARG_VALUE', 'type must be hmac or aes'); const length = integer(options && options.length, 'length', 8); if (type === 'aes' && ![128, 192, 256].includes(length)) throw error('ERR_INVALID_ARG_VALUE', 'AES length must be 128, 192, or 256'); return createSecretKey(randomBytes(Math.floor(length / 8))); }
 function generateKey(type, options, cb) { callback(cb); if (type !== 'hmac' && type !== 'aes') throw error('ERR_INVALID_ARG_VALUE', 'type must be hmac or aes'); const length = integer(options && options.length, 'length', 8); if (type === 'aes' && ![128, 192, 256].includes(length)) throw error('ERR_INVALID_ARG_VALUE', 'AES length must be 128, 192, or 256'); randomBytes(Math.floor(length / 8), (e, b) => e ? cb(e) : cb(null, createSecretKey(b))); }
-function signingKey(value, privateOnly) { const options = value && typeof value === 'object' && !(value instanceof KeyObject) && !ArrayBuffer.isView(value) && !(value instanceof ArrayBuffer) && 'key' in value ? value : { key: value }; const owned = !(options.key instanceof KeyObject); let key = options.key; if (owned) { if (privateOnly) key = createPrivateKey(options); else { try { key = createPublicKey(options); } catch (_) { key = createPrivateKey(options); } } } if (!(key instanceof KeyObject) || key.type === 'secret' || privateOnly && key.type !== 'private') throw error('ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE', 'Invalid signing key'); return { key, options, owned }; }
-function signatureArgs(algorithm, data, info, signature) { if (algorithm !== null && algorithm !== undefined) name(algorithm); const o = info.options; return [handle(info.key), algorithm || '', packed(data), signature === undefined ? undefined : packed(signature), o.padding === undefined ? 0 : integer(o.padding, 'padding', 1, 6), o.saltLength === undefined ? -2147483648 : integer(o.saltLength, 'saltLength', -2)]; }
-function signatureConvert(signature, key, options, toDer) {
-  if (options.dsaEncoding === undefined || options.dsaEncoding === 'der') return signature;
-  if (options.dsaEncoding !== 'ieee-p1363') throw error('ERR_INVALID_ARG_VALUE', 'Invalid dsaEncoding');
-  const type = key.asymmetricKeyType; if (type !== 'ec' && type !== 'dsa') return signature;
-  const bits = type === 'dsa' ? call('keyQBits', [handle(key), 'q']) : call('keyBits', [handle(key)]);
-  return require('internal/crypto_keys').signature(signature, Math.ceil(bits / 8), toDer);
+// lib/internal/crypto/sig.js, with the checks of src/crypto/crypto_sig.cc.
+const kSigOptionsDefault = {};
+function signatureKeyOptions(value) { return value !== null && typeof value === 'object' && !isKeyObject(value) && !isCryptoKey(value) && !ArrayBuffer.isView(value) && !isAnyArrayBuffer(value) ? value : kSigOptionsDefault; }
+function getIntOption(name, options) {
+  const value = options[name];
+  if (value !== undefined) { if (value === value >> 0) return value; throw codes.ERR_INVALID_ARG_VALUE(`options.${name}`, value); }
+  return undefined;
 }
+function getSaltLength(options) {
+  let saltLength = getIntOption('saltLength', options);
+  if (options.padding === constants.RSA_PKCS1_PSS_PADDING && saltLength === undefined) saltLength = constants.RSA_PSS_SALTLEN_MAX_SIGN;
+  return saltLength;
+}
+function getDSASignatureEncoding(options) {
+  if (typeof options === 'object') {
+    const { dsaEncoding = 'der' } = options;
+    if (dsaEncoding === 'der' || dsaEncoding === 'ieee-p1363') return dsaEncoding;
+    throw codes.ERR_INVALID_ARG_VALUE('options.dsaEncoding', dsaEncoding);
+  }
+  return 'der';
+}
+function getContext(options) {
+  if (options?.context === undefined) return undefined;
+  if (!ArrayBuffer.isView(options.context)) throw codes.ERR_INVALID_ARG_TYPE('options.context', ['Buffer', 'TypedArray', 'DataView'], options.context);
+  return options.context;
+}
+function signatureOptions(key) {
+  const options = signatureKeyOptions(key);
+  return { padding: getIntOption('padding', options), saltLength: getSaltLength(options), dsaEncoding: getDSASignatureEncoding(key), context: getContext(options) };
+}
+function signatureArgs(algorithm, data, key, options, signature) {
+  if (options.context !== undefined && options.context.byteLength > 255) throw codes.ERR_OUT_OF_RANGE_MESSAGE('context string must be at most 255 bytes');
+  // Streams follow Node_SignFinal: RSA options apply only to RSA keys.
+  const rsa = !options.stream || /^rsa/.test(asymmetricKeyTypeOf(key));
+  return [handle(key), algorithm ?? '', packed(data), signature === undefined ? undefined : packed(signature), rsa ? options.padding ?? 0 : 0, rsa ? options.saltLength ?? -2147483648 : -2147483648, options.context === undefined ? undefined : packed(options.context), options.stream ? 1 : 0];
+}
+function dsaSize(key) {
+  const type = asymmetricKeyTypeOf(key); if (type !== 'ec' && type !== 'dsa') return 0;
+  return Math.ceil((type === 'dsa' ? call('keyQBits', [handle(key), 'q']) : call('keyBits', [handle(key)])) / 8);
+}
+function signatureToP1363(signature, key, options) {
+  if (options.dsaEncoding !== 'ieee-p1363') return signature;
+  const size = dsaSize(key); return size ? require('internal/crypto_keys').signature(signature, size, false) : signature;
+}
+function signatureFromP1363(signature, key, options) {
+  if (options.dsaEncoding !== 'ieee-p1363') return signature;
+  const size = dsaSize(key); if (!size) return signature;
+  // A P1363 signature of the wrong length cannot verify; Node's ConvertSignatureToDER fails it the same way.
+  if (signature.byteLength !== size * 2) return undefined;
+  return require('internal/crypto_keys').signature(signature, size, true);
+}
+function signFailure(e) { if (e.library !== undefined || e.code !== 'ERR_OSSL_CRYPTO_OPERATION_FAILED' && e.code !== 'ERR_CRYPTO_OPERATION_FAILED') return e; return codes.ERR_CRYPTO_OPERATION_FAILED('EVP_SignInit_ex failed'); }
 function sign(algorithm, data, key, cb) {
-  if (cb !== undefined) callback(cb);
-  const info = signingKey(key, true); let submitted = false;
+  if (algorithm != null) validate.string(algorithm, 'algorithm');
+  if (cb !== undefined) validate.function(cb, 'callback');
+  data = validate.bufferSource(data, 'data');
+  if (!key) throw codes.ERR_CRYPTO_SIGN_KEY_REQUIRED();
+  const options = signatureOptions(key);
+  const info = preparedKeyObject(key, kConsumePrivate, 'key');
+  let submitted = false;
   try {
-    const args = signatureArgs(algorithm, data, info);
+    if (algorithm != null && digestSize(algorithm) === undefined) throw codes.ERR_CRYPTO_INVALID_DIGEST(algorithm);
+    const args = signatureArgs(algorithm, data, info.key, options);
     if (cb !== undefined) {
       submit('sign', args, (e, result) => {
         let converted;
-        try { if (!e) converted = signatureConvert(Buffer.from(result), info.key, info.options, false); } catch (failure) { e = failure; }
+        try { if (!e) converted = signatureToP1363(Buffer.from(result), info.key, options); } catch (failure) { e = failure; }
         finally { if (info.owned) release(info.key); }
-        cb(e, converted);
+        if (e) cb(signFailure(e)); else cb(null, converted);
       });
       submitted = true; return;
     }
-    return signatureConvert(Buffer.from(call('sign', args)), info.key, info.options, false);
+    let result; try { result = call('sign', args); } catch (e) { throw signFailure(e); }
+    return signatureToP1363(Buffer.from(result), info.key, options);
   } finally { if (!submitted && info.owned) release(info.key); }
 }
 function verify(algorithm, data, key, signature, cb) {
-  if (cb !== undefined) callback(cb);
-  const info = signingKey(key, false); let submitted = false;
+  if (algorithm != null) validate.string(algorithm, 'algorithm');
+  if (cb !== undefined) validate.function(cb, 'callback');
+  data = validate.bufferSource(data, 'data');
+  const options = signatureOptions(key);
+  signature = validate.bufferSource(signature, 'signature');
+  const info = preparedKeyObject(key, kConsumePublic, 'key');
+  let submitted = false;
   try {
-    const sig = signatureConvert(bytes(signature), info.key, info.options, true), args = signatureArgs(algorithm, data, info, sig);
-    if (cb !== undefined) { submit('verify', args, (e, result) => { if (info.owned) release(info.key); cb(e, e ? undefined : !!result); }); submitted = true; return; }
-    return !!call('verify', args);
+    if (algorithm != null && digestSize(algorithm) === undefined) throw codes.ERR_CRYPTO_INVALID_DIGEST(algorithm);
+    const der = signatureFromP1363(signature, info.key, options);
+    if (der === undefined) { if (cb !== undefined) { process.nextTick(cb, null, false); return; } return false; }
+    const args = signatureArgs(algorithm, data, info.key, options, der);
+    if (cb !== undefined) { submit('verify', args, (e, result) => { if (info.owned) release(info.key); cb(e ? signFailure(e) : null, e ? undefined : !!result); }); submitted = true; return; }
+    try { return !!call('verify', args); } catch (e) { throw signFailure(e); }
   } finally { if (!submitted && info.owned) release(info.key); }
 }
-class Sign extends Writable { constructor(algorithm, options) { super(options); this._algorithm = name(algorithm); this._chunks = []; this._done = false; } update(data, encoding) { if (this._done) throw error('ERR_CRYPTO_INVALID_STATE', 'Signing context already finalized'); this._chunks.push(Buffer.from(bytes(data, encoding))); return this; } _write(chunk, encoding, cb) { try { this.update(chunk, encoding); cb(); } catch (e) { cb(e); } } sign(key, encoding) { if (this._done) throw error('ERR_CRYPTO_INVALID_STATE', 'Signing context already finalized'); this._done = true; const data = Buffer.concat(this._chunks); this._chunks = []; return output(sign(this._algorithm, data, key), encoding); } }
-class Verify extends Sign { verify(key, signature, encoding) { if (this._done) throw error('ERR_CRYPTO_INVALID_STATE', 'Verification context already finalized'); this._done = true; const data = Buffer.concat(this._chunks); this._chunks = []; return verify(this._algorithm, data, key, bytes(signature, encoding)); } }
+const kSignState = Symbol('kSignState');
+function signUpdate(data, encoding) {
+  if (typeof data === 'string') validate.encoding(data, encoding);
+  else if (!ArrayBuffer.isView(data)) throw codes.ERR_INVALID_ARG_TYPE('data', ['string', 'Buffer', 'TypedArray', 'DataView'], data);
+  const state = this[kSignState];
+  if (state.done) throw codes.ERR_CRYPTO_INVALID_STATE_MESSAGE('Not initialised');
+  state.chunks.push(typeof data === 'string' ? Buffer.from(data, encoding) : Buffer.from(data.buffer, data.byteOffset, data.byteLength).slice());
+  return this;
+}
+function Sign(algorithm, options) {
+  if (!(this instanceof Sign)) return new Sign(algorithm, options);
+  validate.string(algorithm, 'algorithm');
+  if (digestSize(algorithm) === undefined) throw codes.ERR_CRYPTO_INVALID_DIGEST_DEFAULT();
+  this[kSignState] = { algorithm, chunks: [], done: false };
+  Reflect.apply(Writable, this, [options]);
+}
+Object.setPrototypeOf(Sign.prototype, Writable.prototype);
+Object.setPrototypeOf(Sign, Writable);
+Sign.prototype._write = function _write(chunk, encoding, callback) { this.update(chunk, encoding); callback(); };
+Sign.prototype.update = signUpdate;
+function finishSignState(object) {
+  const state = object[kSignState];
+  if (state.done) throw codes.ERR_CRYPTO_INVALID_STATE_MESSAGE('Not initialised');
+  state.done = true; const data = Buffer.concat(state.chunks); state.chunks = [];
+  return { algorithm: state.algorithm, data };
+}
+function oneShotKeyType(key) { const type = asymmetricKeyTypeOf(key); return type === 'ed25519' || type === 'ed448' || type.startsWith('ml-dsa') || type.startsWith('slh-dsa'); }
+Sign.prototype.sign = function sign(privateKey, encoding) {
+  if (!privateKey) throw codes.ERR_CRYPTO_SIGN_KEY_REQUIRED();
+  let options; const info = preparedKeyObject(privateKey, kConsumePrivate, 'privateKey', () => { options = signatureOptions(privateKey); });
+  try {
+    if (oneShotKeyType(info.key)) throw codes.ERR_CRYPTO_UNSUPPORTED_OPERATION_DEFAULT();
+    const { algorithm, data } = finishSignState(this);
+    let result; try { result = call('sign', signatureArgs(algorithm, data, info.key, { ...options, context: undefined, stream: true })); } catch (e) { throw signFailure(e); }
+    result = signatureToP1363(Buffer.from(result), info.key, options);
+    return encoding && encoding !== 'buffer' ? result.toString(encoding) : result;
+  } finally { if (info.owned) release(info.key); }
+};
+function Verify(algorithm, options) {
+  if (!(this instanceof Verify)) return new Verify(algorithm, options);
+  validate.string(algorithm, 'algorithm');
+  if (digestSize(algorithm) === undefined) throw codes.ERR_CRYPTO_INVALID_DIGEST_DEFAULT();
+  this[kSignState] = { algorithm, chunks: [], done: false };
+  Reflect.apply(Writable, this, [options]);
+}
+Object.setPrototypeOf(Verify.prototype, Writable.prototype);
+Object.setPrototypeOf(Verify, Writable);
+Verify.prototype._write = Sign.prototype._write;
+Verify.prototype.update = Sign.prototype.update;
+Verify.prototype.verify = function verify(key, signature, sigEncoding) {
+  let options; const info = preparedKeyObject(key, kConsumePublic, 'key', () => { options = signatureOptions(key); });
+  try {
+    signature = validate.bufferSource(signature, 'signature', sigEncoding);
+    if (oneShotKeyType(info.key)) throw codes.ERR_CRYPTO_UNSUPPORTED_OPERATION_DEFAULT();
+    const { algorithm, data } = finishSignState(this);
+    const der = signatureFromP1363(signature, info.key, options);
+    if (der === undefined) return false;
+    try { return !!call('verify', signatureArgs(algorithm, data, info.key, { ...options, context: undefined, stream: true }, der)); } catch (e) { throw signFailure(e); }
+  } finally { if (info.owned) release(info.key); }
+};
 function createSign(algorithm, options) { return new Sign(algorithm, options); }
 function createVerify(algorithm, options) { return new Verify(algorithm, options); }
-function diffieHellman(options, cb) { if (!options || !(options.privateKey instanceof KeyObject) || options.privateKey.type !== 'private' || !(options.publicKey instanceof KeyObject) || options.publicKey.type !== 'public') throw error('ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE', 'Expected privateKey and publicKey KeyObjects'); const args = [handle(options.privateKey), handle(options.publicKey)]; if (cb !== undefined) { submit('derive', args, cb, Buffer.from); return; } return Buffer.from(call('derive', args)); }
-function rsa(operation, key, buffer) { const legacy = operation === 'privateEncrypt' || operation === 'publicDecrypt'; const info = signingKey(key, operation === 'decrypt' || operation === 'privateEncrypt'); try { const o = info.options; return Buffer.from(call(operation, [handle(info.key), packed(buffer), o.padding ?? (legacy ? constants.RSA_PKCS1_PADDING : constants.RSA_PKCS1_OAEP_PADDING), legacy ? '' : o.oaepHash === undefined ? 'sha1' : name(o.oaepHash, 'oaepHash'), legacy || o.oaepLabel === undefined ? undefined : packed(o.oaepLabel)])); } finally { if (info.owned) release(info.key); } }
-function publicEncrypt(key, buffer) { return rsa('encrypt', key, buffer); }
-function privateDecrypt(key, buffer) { return rsa('decrypt', key, buffer); }
-function privateEncrypt(key, buffer) { return rsa('privateEncrypt', key, buffer); }
-function publicDecrypt(key, buffer) { return rsa('publicDecrypt', key, buffer); }
-function pointForm(format) { if (format === undefined || format === 'uncompressed') return 4; if (format === 'compressed') return 2; if (format === 'hybrid') return 6; throw error('ERR_CRYPTO_ECDH_INVALID_FORMAT', 'Invalid ECDH point format'); }
-class ECDH { constructor(curve) { attach(this, call('ecCreate', [name(curve, 'curve')])); this._curve = curve; } generateKeys(encoding, format) { call('ecGenerate', [handle(this)]); return this.getPublicKey(encoding, format); } getPublicKey(encoding, format) { return output(call('ecPublic', [handle(this), pointForm(format)]), encoding); } getPrivateKey(encoding) { return output(call('ecPrivate', [handle(this)]), encoding); } setPrivateKey(key, encoding) { call('ecSetPrivate', [handle(this), packed(bytes(key, encoding))]); return this; } setPublicKey(key, encoding) { call('ecSetPublic', [handle(this), packed(bytes(key, encoding))]); return this; } computeSecret(key, inputEncoding, outputEncoding) { return output(call('ecSecret', [handle(this), packed(bytes(key, inputEncoding))]), outputEncoding); } static convertKey(key, curve, inputEncoding, outputEncoding, format) { const ecdh = new ECDH(curve); try { ecdh.setPublicKey(key, inputEncoding); return ecdh.getPublicKey(outputEncoding, format); } finally { release(ecdh); } } }
-function createECDH(curve) { return new ECDH(curve); }
-class DiffieHellman { constructor(sizeOrPrime, primeEncoding, generator, generatorEncoding) { let args; if (typeof sizeOrPrime === 'number') { if (typeof primeEncoding === 'number') generator = primeEncoding; args = [integer(sizeOrPrime, 'size', 2), integer(generator === undefined ? 2 : generator, 'generator', 2), '']; } else { if (typeof primeEncoding !== 'string') { generatorEncoding = generator; generator = primeEncoding; primeEncoding = undefined; } if (generator === undefined) generator = 2; if (typeof generator === 'number') { const n = integer(generator, 'generator', 2, 0xffffffff); generator = Buffer.alloc(4); generator.writeUInt32BE(n); } args = [packed(bytes(sizeOrPrime, primeEncoding)), packed(bytes(generator, generatorEncoding)), '']; } attach(this, call('dhCreate', args)); } generateKeys(encoding) { call('dhGenerate', [handle(this)]); return this.getPublicKey(encoding); } getPrime(encoding) { return output(call('dhPrime', [handle(this)]), encoding); } getGenerator(encoding) { return output(call('dhGenerator', [handle(this)]), encoding); } getPublicKey(encoding) { return output(call('dhPublic', [handle(this)]), encoding); } getPrivateKey(encoding) { return output(call('dhPrivate', [handle(this)]), encoding); } setPublicKey(key, encoding) { call('dhSetPublic', [handle(this), packed(bytes(key, encoding))]); return this; } setPrivateKey(key, encoding) { call('dhSetPrivate', [handle(this), packed(bytes(key, encoding))]); return this; } computeSecret(key, inputEncoding, outputEncoding) { return output(call('dhSecret', [handle(this), packed(bytes(key, inputEncoding))]), outputEncoding); } get verifyError() { return call('dhCheck', [handle(this)]); } }
-class DiffieHellmanGroup extends DiffieHellman {
-  constructor(group) {
-    const object = Object.create(new.target.prototype), legacy = { modp1: 768, modp2: 1024, modp5: 1536 };
-    const map = { modp14: 'modp_2048', modp15: 'modp_3072', modp16: 'modp_4096', modp17: 'modp_6144', modp18: 'modp_8192' };
-    name(group, 'name'); if (!map[group] && !legacy[group]) throw error('ERR_CRYPTO_UNKNOWN_DH_GROUP', 'Unknown DH group');
-    attach(object, call('dhCreate', legacy[group] ? [0, packed(Buffer.from([2])), '', legacy[group]] : [0, 0, map[group]])); return object;
+const dhEnabledKeyTypes = new Set(['dh', 'ec', 'x448', 'x25519']);
+function diffieHellman(options, cb) {
+  validate.object(options, 'options');
+  if (cb !== undefined) validate.function(cb, 'callback');
+  const { privateKey, publicKey } = options;
+  if (privateKey === undefined) throw codes.ERR_INVALID_ARG_VALUE('options.privateKey', privateKey);
+  if (publicKey === undefined) throw codes.ERR_INVALID_ARG_VALUE('options.publicKey', publicKey);
+  if (isKeyObject(privateKey) && keySlotsOf(privateKey).type === 'private' && isKeyObject(publicKey) && keySlotsOf(publicKey).type !== 'secret') {
+    const privateType = asymmetricKeyTypeOf(privateKey), publicType = asymmetricKeyTypeOf(publicKey);
+    if (privateType !== publicType || !dhEnabledKeyTypes.has(privateType)) throw codes.ERR_CRYPTO_INCOMPATIBLE_KEY('key types for Diffie-Hellman', `${privateType} and ${publicType}`);
   }
+  const pub = preparedKeyObject(publicKey, kConsumePublic, 'options.publicKey');
+  let priv;
+  try { priv = preparedKeyObject(privateKey, kConsumePrivate, 'options.privateKey'); } catch (e) { if (pub.owned) release(pub.key); throw e; }
+  const args = [handle(priv.key), handle(pub.key)];
+  const done = () => { if (pub.owned) release(pub.key); if (priv.owned) release(priv.key); };
+  if (cb !== undefined) { submit('derive', args, (e, secret) => { done(); cb(e, secret); }, Buffer.from); return; }
+  try { return Buffer.from(call('derive', args)); } finally { done(); }
 }
-function createDiffieHellman(...args) { return new DiffieHellman(...args); }
+// lib/internal/crypto/cipher.js rsaFunctionFor.
+function rsaFunctionFor(operation, defaultPadding, keyType) {
+  return function(options, buffer) {
+    const info = preparedKeyObject(options, keyType === 'private' ? kConsumePrivate : kConsumePublic, 'key');
+    try {
+      const padding = options.padding || defaultPadding;
+      const { oaepHash, encoding } = options;
+      let { oaepLabel } = options;
+      if (oaepHash !== undefined) validate.string(oaepHash, 'key.oaepHash');
+      if (oaepLabel !== undefined) oaepLabel = validate.bufferSource(oaepLabel, 'key.oaepLabel', encoding);
+      buffer = validate.bufferSource(buffer, 'buffer', encoding);
+      const legacy = operation === 'privateEncrypt' || operation === 'publicDecrypt';
+      return Buffer.from(call(operation, [handle(info.key), packed(buffer), padding, legacy ? '' : oaepHash ?? 'sha1', legacy || oaepLabel === undefined ? undefined : packed(oaepLabel)]));
+    } finally { if (info.owned) release(info.key); }
+  };
+}
+const publicEncrypt = rsaFunctionFor('encrypt', constants.RSA_PKCS1_OAEP_PADDING, 'public');
+const publicDecrypt = rsaFunctionFor('publicDecrypt', constants.RSA_PKCS1_PADDING, 'public');
+const privateEncrypt = rsaFunctionFor('privateEncrypt', constants.RSA_PKCS1_PADDING, 'private');
+const privateDecrypt = rsaFunctionFor('decrypt', constants.RSA_PKCS1_OAEP_PADDING, 'private');
+// lib/internal/crypto/diffiehellman.js, with the checks of src/crypto/crypto_dh.cc and crypto_ec.cc.
+// Node raises these OpenSSL errors itself (ERR_put_error) before it calls into OpenSSL.
+const dhBadGenerator = () => normalize(new Error('error:02800065:Diffie-Hellman routines::bad generator'));
+const kDhKind = Symbol('kDhKind');
+function unsignedBig(buffer) { let n = 0n; for (const b of buffer) n = (n << 8n) | BigInt(b); return n; }
+function bitLength(n) { return n === 0n ? 0 : n.toString(2).length; }
+function encodeDh(buffer, encoding) { buffer = Buffer.from(buffer); return encoding && encoding !== 'buffer' ? buffer.toString(encoding) : buffer; }
+function dhCreate(object, args) {
+  try { attach(object, call('dhCreate', args)); }
+  catch (e) { if (e.library !== undefined) throw e; throw codes.ERR_INVALID_ARG_VALUE_MESSAGE('Invalid DH parameters'); }
+}
+function dhVerifyError(object) {
+  let result; try { result = call('dhCheck', [handle(object)]); } catch { throw codes.ERR_CRYPTO_OPERATION_FAILED('Checking DH parameters failed'); }
+  Object.defineProperty(object, 'verifyError', { __proto__: null, enumerable: true, value: result, writable: false });
+}
+function DiffieHellman(sizeOrKey, keyEncoding, generator, genEncoding) {
+  if (!(this instanceof DiffieHellman)) return new DiffieHellman(sizeOrKey, keyEncoding, generator, genEncoding);
+  if (typeof sizeOrKey !== 'number' && typeof sizeOrKey !== 'string' && !ArrayBuffer.isView(sizeOrKey) && !isAnyArrayBuffer(sizeOrKey))
+    throw codes.ERR_INVALID_ARG_TYPE('sizeOrKey', ['number', 'string', 'ArrayBuffer', 'Buffer', 'TypedArray', 'DataView'], sizeOrKey);
+  if (typeof sizeOrKey === 'number') { validate.int32(sizeOrKey, 'sizeOrKey'); sizeOrKey += 0; }
+  if (keyEncoding && !Buffer.isEncoding(keyEncoding) && keyEncoding !== 'buffer') { genEncoding = generator; generator = keyEncoding; keyEncoding = false; }
+  if (typeof sizeOrKey !== 'number') sizeOrKey = toBuf(sizeOrKey, keyEncoding);
+  if (!generator) generator = 2;
+  else if (typeof generator === 'number') validate.int32(generator, 'generator');
+  else if (typeof generator === 'string') generator = toBuf(generator, genEncoding);
+  else if (!ArrayBuffer.isView(generator) && !isAnyArrayBuffer(generator))
+    throw codes.ERR_INVALID_ARG_TYPE('generator', ['number', 'string', 'ArrayBuffer', 'Buffer', 'TypedArray', 'DataView'], generator);
+  this[kDhKind] = 'dh';
+  if (typeof sizeOrKey === 'number') {
+    if (sizeOrKey < 2) throw normalize(new Error('error:02800067:Diffie-Hellman routines::modulus too small'));
+    if (typeof generator !== 'number') throw codes.ERR_INVALID_ARG_TYPE_MESSAGE('Second argument must be an int32');
+    if (generator < 2) throw dhBadGenerator();
+    dhCreate(this, [sizeOrKey, generator, '']);
+  } else {
+    const prime = bytes(sizeOrKey);
+    if (prime.byteLength > 0x7fffffff) throw codes.ERR_OUT_OF_RANGE_MESSAGE('prime is too big');
+    let g;
+    if (typeof generator === 'number') { if (generator < 2) throw dhBadGenerator(); g = Buffer.alloc(4); g.writeUInt32BE(generator); }
+    else { g = bytes(generator); if (g.byteLength > 0x7fffffff) throw codes.ERR_OUT_OF_RANGE_MESSAGE('generator is too big'); }
+    const p = unsignedBig(prime), gn = unsignedBig(g);
+    if (gn < 2n) throw dhBadGenerator();
+    if (bitLength(p) >= 512 && gn >= p) throw dhBadGenerator();
+    dhCreate(this, [packed(prime), packed(g), '']);
+  }
+  dhVerifyError(this);
+}
+function DiffieHellmanGroup(name) {
+  if (!(this instanceof DiffieHellmanGroup)) return new DiffieHellmanGroup(name);
+  if (typeof name !== 'string') throw codes.ERR_INVALID_ARG_TYPE_MESSAGE('Group name must be a string');
+  const legacy = { modp1: 768, modp2: 1024, modp5: 1536 }, map = { modp14: 'modp_2048', modp15: 'modp_3072', modp16: 'modp_4096', modp17: 'modp_6144', modp18: 'modp_8192' };
+  if (!Object.hasOwn(map, name) && !Object.hasOwn(legacy, name)) throw codes.ERR_CRYPTO_UNKNOWN_DH_GROUP();
+  this[kDhKind] = 'dh';
+  attach(this, call('dhCreate', legacy[name] ? [0, packed(Buffer.from([2])), '', legacy[name]] : [0, 0, map[name]]));
+  dhVerifyError(this);
+}
+function toBuf(value, encoding) { if (typeof value === 'string') { if (encoding === 'buffer') encoding = 'utf8'; return Buffer.from(value, encoding); } return value; }
+function dhGenerateKeys(encoding) {
+  try { call('dhGenerate', [handle(this)]); } catch { throw codes.ERR_CRYPTO_OPERATION_FAILED('Key generation failed'); }
+  return encodeDh(call('dhPublic', [handle(this)]), encoding);
+}
+function dhComputeSecret(key, inEnc, outEnc) {
+  key = validate.bufferSource(key, 'key', inEnc);
+  if (this[kDhKind] === 'ecdh') {
+    let secret;
+    try { secret = call('ecSecret', [handle(this), packed(key)]); }
+    catch (e) {
+      throw e.code === 'ERR_CRYPTO_INVALID_KEYPAIR' ? codes.ERR_CRYPTO_INVALID_KEYPAIR() : codes.ERR_CRYPTO_ECDH_INVALID_PUBLIC_KEY();
+    }
+    return encodeDh(secret, outEnc);
+  }
+  if (key.byteLength > 0x7fffffff) throw codes.ERR_OUT_OF_RANGE_MESSAGE('secret is too big');
+  const value = unsignedBig(bytes(key)), prime = unsignedBig(Buffer.from(call('dhPrime', [handle(this)])));
+  if (value <= 1n) throw codes.ERR_CRYPTO_INVALID_KEYLEN('Supplied key is too small');
+  if (value >= prime - 1n) throw codes.ERR_CRYPTO_INVALID_KEYLEN('Supplied key is too large');
+  let secret;
+  try { secret = call('dhSecret', [handle(this), packed(key)]); }
+  catch (e) { if (e.library !== undefined && e.library !== 'Diffie-Hellman routines') throw codes.ERR_CRYPTO_OPERATION_FAILED('Failed to compute shared secret'); throw codes.ERR_CRYPTO_INVALID_KEYTYPE('Supplied key is invalid'); }
+  return encodeDh(secret, outEnc);
+}
+function dhGetPrime(encoding) { return encodeDh(call('dhPrime', [handle(this)]), encoding); }
+function dhGetGenerator(encoding) { return encodeDh(call('dhGenerator', [handle(this)]), encoding); }
+function dhGetPublicKey(encoding) {
+  let key; try { key = call('dhPublic', [handle(this)]); } catch { throw codes.ERR_CRYPTO_INVALID_STATE_MESSAGE('No public key - did you forget to generate one?'); }
+  return encodeDh(key, encoding);
+}
+function dhGetPrivateKey(encoding) {
+  let key; try { key = call('dhPrivate', [handle(this)]); } catch { throw codes.ERR_CRYPTO_INVALID_STATE_MESSAGE('No private key - did you forget to generate one?'); }
+  return encodeDh(key, encoding);
+}
+for (const target of [DiffieHellman.prototype, DiffieHellmanGroup.prototype]) Object.assign(target, { generateKeys: dhGenerateKeys, computeSecret: dhComputeSecret, getPrime: dhGetPrime, getGenerator: dhGetGenerator, getPublicKey: dhGetPublicKey, getPrivateKey: dhGetPrivateKey });
+function dhSetKey(object, op, key, encoding, message) {
+  key = validate.bufferSource(key, 'key', encoding);
+  if (key.byteLength > 0x7fffffff) throw codes.ERR_OUT_OF_RANGE_MESSAGE('buf is too big');
+  try { call(op, [handle(object), packed(key)]); } catch { throw codes.ERR_INVALID_ARG_VALUE_MESSAGE(message); }
+  return object;
+}
+DiffieHellman.prototype.setPublicKey = function setPublicKey(key, encoding) {
+  if (this[kDhKind] === 'ecdh') {
+    key = validate.bufferSource(key, 'key', encoding);
+    try { call('ecSetPublic', [handle(this), packed(key)]); } catch { throw codes.ERR_CRYPTO_OPERATION_FAILED('Failed to convert Buffer to EC_POINT'); }
+    return this;
+  }
+  return dhSetKey(this, 'dhSetPublic', key, encoding, 'Invalid public key');
+};
+DiffieHellman.prototype.setPrivateKey = function setPrivateKey(key, encoding) {
+  if (this[kDhKind] === 'ecdh') {
+    key = validate.bufferSource(key, 'key', encoding);
+    try { call('ecSetPrivate', [handle(this), packed(key)]); } catch { throw codes.ERR_CRYPTO_INVALID_KEYTYPE('Private key is not valid for specified curve.'); }
+    return this;
+  }
+  return dhSetKey(this, 'dhSetPrivate', key, encoding, 'Invalid private key');
+};
+function ECDH(curve) {
+  if (!(this instanceof ECDH)) return new ECDH(curve);
+  validate.string(curve, 'curve');
+  this[kDhKind] = 'ecdh';
+  try { attach(this, call('ecCreate', [curve])); } catch { throw codes.ERR_CRYPTO_INVALID_CURVE(); }
+}
+ECDH.prototype.computeSecret = DiffieHellman.prototype.computeSecret;
+ECDH.prototype.setPrivateKey = DiffieHellman.prototype.setPrivateKey;
+ECDH.prototype.setPublicKey = require('util').deprecate(DiffieHellman.prototype.setPublicKey, 'ecdh.setPublicKey() is deprecated.', 'DEP0031');
+ECDH.prototype.getPrivateKey = function getPrivateKey(encoding) {
+  let key; try { key = call('ecPrivate', [handle(this)]); } catch { throw codes.ERR_CRYPTO_OPERATION_FAILED('Failed to get ECDH private key'); }
+  return encodeDh(key, encoding);
+};
+ECDH.prototype.generateKeys = function generateKeys(encoding, format) {
+  try { call('ecGenerate', [handle(this)]); } catch { throw codes.ERR_CRYPTO_OPERATION_FAILED('Failed to generate key'); }
+  return this.getPublicKey(encoding, format);
+};
+ECDH.prototype.getPublicKey = function getPublicKey(encoding, format) {
+  const f = getFormat(format);
+  let key; try { key = call('ecPublic', [handle(this), f]); } catch { throw codes.ERR_CRYPTO_OPERATION_FAILED('Failed to get ECDH public key'); }
+  return encodeDh(key, encoding);
+};
+ECDH.convertKey = function convertKey(key, curve, inEnc, outEnc, format) {
+  validate.string(curve, 'curve');
+  key = validate.bufferSource(key, 'key', inEnc);
+  const f = getFormat(format);
+  let id; try { id = call('ecCreate', [curve]); } catch { throw codes.ERR_CRYPTO_INVALID_CURVE(); }
+  const object = {}; attach(object, id);
+  try {
+    try { call('ecSetPublic', [handle(object), packed(key)]); } catch { throw codes.ERR_CRYPTO_OPERATION_FAILED('Failed to convert Buffer to EC_POINT'); }
+    return encodeDh(call('ecPublic', [handle(object), f]), outEnc);
+  } finally { release(object); }
+};
+function getFormat(format) {
+  if (format) {
+    if (format === 'compressed') return 2;
+    if (format === 'hybrid') return 6;
+    if (format !== 'uncompressed') throw codes.ERR_CRYPTO_ECDH_INVALID_FORMAT(format);
+  }
+  return 4;
+}
+function createECDH(curve) { return new ECDH(curve); }
+function createDiffieHellman(sizeOrKey, keyEncoding, generator, genEncoding) { return new DiffieHellman(sizeOrKey, keyEncoding, generator, genEncoding); }
 function getDiffieHellman(group) { return new DiffieHellmanGroup(group); }
-module.exports = { constants, randomBytes, randomFill, randomFillSync, randomInt, randomUUID, timingSafeEqual, Hash, Hmac, createHash, createHmac, hash, Cipheriv, Decipheriv, createCipheriv, createDecipheriv, pbkdf2, pbkdf2Sync, scrypt, scryptSync, hkdf, hkdfSync, KeyObject, createSecretKey, createPrivateKey, createPublicKey, generateKey, generateKeySync, generateKeyPair, generateKeyPairSync, sign, verify, Sign, Verify, createSign, createVerify, diffieHellman, publicEncrypt, privateDecrypt, ECDH, createECDH, DiffieHellman, DiffieHellmanGroup, createDiffieHellman, getDiffieHellman, createDiffieHellmanGroup: getDiffieHellman };
+module.exports = { constants, randomBytes, randomFill, randomFillSync, randomInt, randomUUID, timingSafeEqual, Hash: require('util').deprecate(Hash, 'crypto.Hash constructor is deprecated.', 'DEP0179'), Hmac: require('util').deprecate(Hmac, 'crypto.Hmac constructor is deprecated.', 'DEP0181'), createHash, createHmac, hash, Cipheriv, Decipheriv, createCipheriv, createDecipheriv, pbkdf2, pbkdf2Sync, scrypt, scryptSync, hkdf, hkdfSync, KeyObject, createSecretKey, createPrivateKey, createPublicKey, generateKey, generateKeySync, generateKeyPair, generateKeyPairSync, sign, verify, Sign, Verify, createSign, createVerify, diffieHellman, publicEncrypt, privateDecrypt, ECDH, createECDH, DiffieHellman, DiffieHellmanGroup, createDiffieHellman, getDiffieHellman, createDiffieHellmanGroup: getDiffieHellman };
 Object.defineProperty(module.exports, 'webcrypto', { enumerable: true, get() { return require('internal/crypto_webcrypto').webcrypto; } });
 Object.defineProperty(module.exports, 'subtle', { enumerable: true, get() { return module.exports.webcrypto.subtle; } });
 module.exports.getRandomValues = value => module.exports.webcrypto.getRandomValues(value);
-function names(operation) { return [...new Set(call(operation, []).split('\n').filter(Boolean))].sort(); }
+// Node's filterDuplicateStrings: one entry per lowercased name, the last spelling seen wins.
+function names(operation) { const map = new Map(); for (const item of call(operation, []).split('\n')) if (item) map.set(item.toLowerCase(), item); return [...map.values()].sort(); }
 module.exports.getHashes = () => names('hashes');
 module.exports.getCiphers = () => names('ciphers');
 module.exports.getCurves = () => names('curves');
 module.exports.getFips = () => call('getFips', []);
 module.exports.setFips = enabled => call('setFips', [enabled ? 1 : 0]);
-c.keyFromHandle = (type, id) => new KeyObject(keyToken, type, id);
+c.keyFromHandle = (type, id) => newKeyObject(type, id);
+// Internal reads that bypass the public, user-replaceable KeyObject accessors.
+c.keyObjectType = key => keySlotsOf(key).type;
+c.keyObjectEquals = keyObjectEquals;
+c.keyObjectSecret = key => Buffer.from(keySlotsOf(key).secret);
+c.keyObjectAsymmetricType = key => asymmetricKeyTypeOf(key);
+c.keyObjectDer = key => exportAsymmetric(key, { format: 'der', type: keySlotsOf(key).type === 'private' ? 'pkcs8' : 'spki' });
 c.keygenArgs = keygenArgs;
 c.serializeKeyObject = key => {
-  if (!keyObjects.has(key)) return undefined;
-  const type = key.type;
-  const data = type === 'secret' ? secrets.get(key) :
+  if (!isKeyObject(key)) return undefined;
+  const type = keySlotsOf(key).type;
+  const data = type === 'secret' ? keySlotsOf(key).secret :
     call('keyExport', [handle(key), 'DER', type === 'private' ? 'PrivateKeyInfo' : 'SubjectPublicKeyInfo', type === 'private' ? 1 : 0, '', packed(Buffer.alloc(0))]);
   return { type, data };
 };
 c.deserializeKeyObject = value => {
   if (value.type === 'secret') return createSecretKey(value.data);
   if (value.type !== 'private' && value.type !== 'public') throw error('ERR_INVALID_ARG_VALUE', 'Invalid cloned key type', TypeError);
-  return importKey({ key: value.data, format: 'der', type: value.type === 'private' ? 'pkcs8' : 'spki' }, value.type);
+  return importDer(Buffer.from(value.data), value.type);
 };
 Object.assign(module.exports, { randomUUIDv7, checkPrime, checkPrimeSync, generatePrime, generatePrimeSync, getCipherInfo, privateEncrypt, publicDecrypt, secureHeapUsed, setEngine });
 for (const key of ['rng', 'prng', 'pseudoRandomBytes']) {
