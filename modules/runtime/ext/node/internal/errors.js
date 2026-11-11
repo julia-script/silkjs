@@ -1,11 +1,10 @@
-// Copyright Joyent, Inc. and other Node contributors. MIT license (see vendor/node-api/LICENSE).
-// Adapted from Node.js v24.22.1 lib/internal/errors.js: primordials replaced by plain calls,
-// internalBinding lookups replaced by the runtime's builtins.
-/* eslint node-core/documented-errors: "error" */
-/* eslint node-core/alphabetize-errors: ["error", {checkErrorDeclarations: true}] */
-/* eslint node-core/prefer-util-format-errors: "error" */
-
 'use strict';
+
+// Node.js v24.22.1 lib/internal/errors.js. Changes: stack formatting is
+// internal/error_stack's, the uv error map comes from util.getSystemErrorMap(),
+// fatal-exception printing is the runtime's, and internal assertions are local.
+// Copyright Node.js contributors. All rights reserved. MIT license (see
+// vendor/node-api/LICENSE).
 
 // The whole point behind this internal module is to allow Node.js to no
 // longer be forced to treat every error message change as a semver-major
@@ -13,11 +12,63 @@
 // value statically and permanently identifies the error. While the error
 // message may change, the code should not.
 
-const kIsNodeError = Symbol('kIsNodeError');
+const {
+  AggregateError,
+  ArrayIsArray,
+  ArrayPrototypeFilter,
+  ArrayPrototypeIncludes,
+  ArrayPrototypeIndexOf,
+  ArrayPrototypeJoin,
+  ArrayPrototypeMap,
+  ArrayPrototypePush,
+  ArrayPrototypeSlice,
+  ArrayPrototypeSplice,
+  ArrayPrototypeUnshift,
+  Error,
+  ErrorCaptureStackTrace,
+  ErrorPrototypeToString,
+  JSONStringify,
+  MapPrototypeGet,
+  MathAbs,
+  MathMax,
+  Number,
+  NumberIsInteger,
+  ObjectAssign,
+  ObjectDefineProperties,
+  ObjectDefineProperty,
+  ObjectGetOwnPropertyDescriptor,
+  ObjectIsExtensible,
+  ObjectKeys,
+  ObjectPrototypeHasOwnProperty,
+  RangeError,
+  ReflectApply,
+  RegExpPrototypeExec,
+  SafeArrayIterator,
+  SafeMap,
+  SafeWeakMap,
+  String,
+  StringPrototypeEndsWith,
+  StringPrototypeIncludes,
+  StringPrototypeIndexOf,
+  StringPrototypeRepeat,
+  StringPrototypeSlice,
+  StringPrototypeSplit,
+  StringPrototypeStartsWith,
+  StringPrototypeToLowerCase,
+  Symbol,
+  SymbolFor,
+  SyntaxError,
+  TypeError,
+  URIError,
+} = require('internal/per_context/primordials');
 
-const isWindows = process.platform === 'win32';
+// internal/error_stack owns these two: its stack header names the code of a
+// NodeError, and it formats an error found in overrideStackTrace with that callback.
+const { kIsNodeError, overrides: overrideStackTrace } = require('internal/host').errorStackState;
 
-const messages = new Map();
+const isWindows = require('internal/host').platform === 'win32';
+
+const messages = new SafeMap();
 const codes = {};
 
 const classRegExp = /^[A-Z][a-zA-Z0-9]*$/;
@@ -36,93 +87,11 @@ const kTypes = [
   'symbol',
 ];
 
-const MainContextError = Error;
-const overrideStackTrace = new WeakMap();
-let internalPrepareStackTrace = defaultPrepareStackTrace;
-
-/**
- * The default implementation of `Error.prepareStackTrace` with simple
- * concatenation of stack frames.
- * Read more about `Error.prepareStackTrace` at https://v8.dev/docs/stack-trace-api#customizing-stack-traces.
- * @returns {string}
- */
-function defaultPrepareStackTrace(error, trace) {
-  // Normal error formatting:
-  //
-  // Error: Message
-  //     at function (file)
-  //     at file
-  let errorString;
-  if (kIsNodeError in error) {
-    errorString = `${error.name} [${error.code}]: ${error.message}`;
-  } else {
-    errorString = error.toString();
-  }
-  if (trace.length === 0) {
-    return errorString;
-  }
-  return `${errorString}\n    at ${trace.join('\n    at ')}`;
-}
-
-function setInternalPrepareStackTrace(callback) {
-  internalPrepareStackTrace = callback;
-}
-
-/**
- * Every realm has its own prepareStackTraceCallback. When `error.stack` is
- * accessed, if the error is created in a shadow realm, the shadow realm's
- * prepareStackTraceCallback is invoked. Otherwise, the principal realm's
- * prepareStackTraceCallback is invoked. Note that accessing `error.stack`
- * of error objects created in a VM Context will always invoke the
- * prepareStackTraceCallback of the principal realm.
- * @param {object} globalThis The global object of the realm that the error was
- *   created in. When the error object is created in a VM Context, this is the
- *   global object of that VM Context.
- * @param {object} error The error object.
- * @param {CallSite[]} trace An array of CallSite objects, read more at https://v8.dev/docs/stack-trace-api#customizing-stack-traces.
- * @returns {string}
- */
-function prepareStackTraceCallback(globalThis, error, trace) {
-  // API for node internals to override error stack formatting
-  // without interfering with userland code.
-  if (overrideStackTrace.has(error)) {
-    const f = overrideStackTrace.get(error);
-    overrideStackTrace.delete(error);
-    return f(error, trace);
-  }
-
-  // Polyfill of V8's Error.prepareStackTrace API.
-  // https://crbug.com/v8/7848
-  // `globalThis` is the global that contains the constructor which
-  // created `error`.
-  if (typeof globalThis.Error?.prepareStackTrace === 'function') {
-    return globalThis.Error.prepareStackTrace(error, trace);
-  }
-  // We still have legacy usage that depends on the main context's `Error`
-  // being used, even when the error is from a different context.
-  // TODO(devsnek): evaluate if this can be eventually deprecated/removed.
-  if (typeof MainContextError.prepareStackTrace === 'function') {
-    return MainContextError.prepareStackTrace(error, trace);
-  }
-
-  // If the Error.prepareStackTrace was not a function, fallback to the
-  // internal implementation.
-  return internalPrepareStackTrace(error, trace);
-}
-
-/**
- * The default Error.prepareStackTrace implementation.
- * @returns {string}
- */
-function ErrorPrepareStackTrace(error, trace) {
-  return internalPrepareStackTrace(error, trace);
-}
-
 const aggregateTwoErrors = (innerError, outerError) => {
   if (innerError && outerError && innerError !== outerError) {
-    if (Array.isArray(outerError.errors)) {
+    if (ArrayIsArray(outerError.errors)) {
       // If `outerError` is already an `AggregateError`.
-      outerError.errors.push(innerError);
+      ArrayPrototypePush(outerError.errors, innerError);
       return outerError;
     }
     let err;
@@ -130,15 +99,15 @@ const aggregateTwoErrors = (innerError, outerError) => {
       const limit = Error.stackTraceLimit;
       Error.stackTraceLimit = 0;
       // eslint-disable-next-line no-restricted-syntax
-      err = new AggregateError(([
+      err = new AggregateError(new SafeArrayIterator([
         outerError,
         innerError,
       ]), outerError.message);
       Error.stackTraceLimit = limit;
-      Error.captureStackTrace(err, aggregateTwoErrors);
+      ErrorCaptureStackTrace(err, aggregateTwoErrors);
     } else {
       // eslint-disable-next-line no-restricted-syntax
-      err = new AggregateError(([
+      err = new AggregateError(new SafeArrayIterator([
         outerError,
         innerError,
       ]), outerError.message);
@@ -151,7 +120,7 @@ const aggregateTwoErrors = (innerError, outerError) => {
 
 class NodeAggregateError extends AggregateError {
   constructor(errors, message) {
-    super((errors), message);
+    super(new SafeArrayIterator(errors), message);
     this.code = errors[0]?.code;
   }
 
@@ -164,24 +133,27 @@ class NodeAggregateError extends AggregateError {
   }
 }
 
-const assert = require('internal/assert');
+function assert(value, message) {
+  if (!value) {
+    const error = new Error(message || 'This is caused by either a bug in Node.js or incorrect usage of Node.js internals.');
+    error.code = 'ERR_INTERNAL_ASSERTION';
+    throw error;
+  }
+}
 
 // Lazily loaded
 let util;
 
-let internalUtilInspect = null;
-function lazyInternalUtilInspect() {
-  if (!internalUtilInspect) {
-    const util = require('util');
-    internalUtilInspect = { inspect: util.inspect, format: util.format, inspectDefaultOptions: util.inspect.defaultOptions };
-  }
-  return internalUtilInspect;
+let internalUtil = null;
+function lazyInternalUtil() {
+  internalUtil ??= require('util');
+  return internalUtil;
 }
 
-let utilColors;
-function lazyUtilColors() {
-  utilColors ??= { shouldColorize: (stream) => !!stream?.isTTY && !process.env.NO_COLOR };
-  return utilColors;
+let internalUtilInspect = null;
+function lazyInternalUtilInspect() {
+  internalUtilInspect ??= { inspect: require('internal/util_inspect').inspect, format: require('util').format };
+  return internalUtilInspect;
 }
 
 let buffer;
@@ -193,12 +165,12 @@ function lazyBuffer() {
 function isErrorStackTraceLimitWritable() {
   // Do no touch Error.stackTraceLimit as V8 would attempt to install
   // it again during deserialization.
-  const desc = Object.getOwnPropertyDescriptor(Error, 'stackTraceLimit');
+  const desc = ObjectGetOwnPropertyDescriptor(Error, 'stackTraceLimit');
   if (desc === undefined) {
-    return Object.isExtensible(Error);
+    return ObjectIsExtensible(Error);
   }
 
-  return desc.hasOwnProperty('writable') ?
+  return ObjectPrototypeHasOwnProperty(desc, 'writable') ?
     desc.writable :
     desc.set !== undefined;
 }
@@ -235,7 +207,7 @@ class SystemError extends Error {
 
     this.code = key;
 
-    Object.defineProperties(this, {
+    ObjectDefineProperties(this, {
       [kIsNodeError]: {
         __proto__: null,
         value: true,
@@ -294,7 +266,7 @@ class SystemError extends Error {
       // always be of type string. We should probably just remove the
       // `.toString()` and `Buffer.from()` operations and set the value on the
       // context as the user did.
-      Object.defineProperty(this, 'path', {
+      ObjectDefineProperty(this, 'path', {
         __proto__: null,
         get() {
           return context.path != null ?
@@ -310,7 +282,7 @@ class SystemError extends Error {
     }
 
     if (context.dest !== undefined) {
-      Object.defineProperty(this, 'dest', {
+      ObjectDefineProperty(this, 'dest', {
         __proto__: null,
         get() {
           return context.dest != null ?
@@ -330,7 +302,7 @@ class SystemError extends Error {
     return `${this.name} [${this.code}]: ${this.message}`;
   }
 
-  [Symbol.for('nodejs.util.inspect.custom')](recurseTimes, ctx) {
+  [SymbolFor('nodejs.util.inspect.custom')](recurseTimes, ctx) {
     return lazyInternalUtilInspect().inspect(this, {
       ...ctx,
       getters: true,
@@ -414,7 +386,7 @@ function makeNodeErrorWithCode(Base, key) {
 
         constructor(...args) {
           super();
-          Object.defineProperty(this, 'message', {
+          ObjectDefineProperty(this, 'message', {
             __proto__: null,
             value: getMessage(key, args, this),
             enumerable: false,
@@ -451,8 +423,8 @@ function makeNodeErrorWithCode(Base, key) {
               `match the required ones (${expectedLength}).`,
           );
 
-          args.unshift(msg);
-          super(Reflect.apply(lazyInternalUtilInspect().format, null, args));
+          ArrayPrototypeUnshift(args, msg);
+          super(ReflectApply(lazyInternalUtilInspect().format, null, args));
         }
 
         // This is a workaround for wpt tests that expect that the error
@@ -483,9 +455,9 @@ function makeNodeErrorWithCode(Base, key) {
 function hideStackFrames(fn) {
   function wrappedFn(...args) {
     try {
-      return Reflect.apply(fn, this, args);
+      return ReflectApply(fn, this, args);
     } catch (error) {
-      Error.stackTraceLimit && Error.captureStackTrace(error, wrappedFn);
+      Error.stackTraceLimit && ErrorCaptureStackTrace(error, wrappedFn);
       throw error;
     }
   }
@@ -531,7 +503,7 @@ function E(sym, val, def, ...otherClasses) {
 function getExpectedArgumentLength(msg) {
   let expectedLength = 0;
   const regex = /%[dfijoOs]/g;
-  while (regex.exec(msg) !== null) expectedLength++;
+  while (RegExpPrototypeExec(regex, msg) !== null) expectedLength++;
   return expectedLength;
 }
 
@@ -544,7 +516,7 @@ function getMessage(key, args, self) {
       `Code: ${key}; The provided arguments length (${args.length}) does not ` +
         `match the required ones (${msg.length}).`,
     );
-    return Reflect.apply(msg, self, args);
+    return ReflectApply(msg, self, args);
   }
 
   const expectedLength = getExpectedArgumentLength(msg);
@@ -556,18 +528,17 @@ function getMessage(key, args, self) {
   if (args.length === 0)
     return msg;
 
-  args.unshift(msg);
-  return Reflect.apply(lazyInternalUtilInspect().format, null, args);
+  ArrayPrototypeUnshift(args, msg);
+  return ReflectApply(lazyInternalUtilInspect().format, null, args);
 }
 
 let uvBinding;
 
 function lazyUv() {
-  if (!uvBinding) {
-    const system = require('internal/util_public/system');
-    const map = new Map();
-    for (const [errno, entry] of system.getSystemErrorMap()) map.set(entry[0], entry);
-    uvBinding = { errmap: map, getErrorMap: () => map, errname: (errno) => system.getSystemErrorName(errno) };
+  if (uvBinding === undefined) {
+    const map = require('util').getSystemErrorMap();
+    uvBinding = { getErrorMap: () => map };
+    for (const { 0: errno, 1: { 0: name } } of map) uvBinding[`UV_${name}`] = errno;
   }
   return uvBinding;
 }
@@ -577,7 +548,7 @@ const uvUnmappedError = ['UNKNOWN', 'unknown error'];
 function uvErrmapGet(name) {
   uvBinding = lazyUv();
   uvBinding.errmap ??= uvBinding.getErrorMap();
-  return uvBinding.errmap.get(name);
+  return MapPrototypeGet(uvBinding.errmap, name);
 }
 
 /**
@@ -607,7 +578,7 @@ class UVException extends Error {
 
     super(message);
 
-    for (const prop of Object.keys(ctx)) {
+    for (const prop of ObjectKeys(ctx)) {
       if (prop === 'message' || prop === 'path' || prop === 'dest') {
         continue;
       }
@@ -765,7 +736,7 @@ class DNSException extends Error {
       if (code === lazyUv().UV_EAI_NODATA || code === lazyUv().UV_EAI_NONAME) {
         code = 'ENOTFOUND'; // Fabricated error name.
       } else {
-        code = require('internal/util_public/system').getSystemErrorName(code);
+        code = lazyInternalUtil().getSystemErrorName(code);
       }
     }
     super(`${syscall} ${code}${hostname ? ` ${hostname}` : ''}`);
@@ -824,68 +795,13 @@ function addNumericalSeparator(val) {
   let i = val.length;
   const start = val[0] === '-' ? 1 : 0;
   for (; i >= start + 4; i -= 3) {
-    res = `_${val.slice(i - 3, i)}${res}`;
+    res = `_${StringPrototypeSlice(val, i - 3, i)}${res}`;
   }
-  return `${val.slice(0, i)}${res}`;
+  return `${StringPrototypeSlice(val, 0, i)}${res}`;
 }
 
-// Used to enhance the stack that will be picked up by the inspector
-const kEnhanceStackBeforeInspector = Symbol('kEnhanceStackBeforeInspector');
-
-// These are supposed to be called only on fatal exceptions before
-// the process exits.
-const fatalExceptionStackEnhancers = {
-  beforeInspector(error) {
-    if (typeof error[kEnhanceStackBeforeInspector] !== 'function') {
-      return error.stack;
-    }
-
-    try {
-      // Set the error.stack here so it gets picked up by the
-      // inspector.
-      error.stack = error[kEnhanceStackBeforeInspector]();
-    } catch {
-      // We are just enhancing the error. If it fails, ignore it.
-    }
-    return error.stack;
-  },
-  afterInspector(error) {
-    const originalStack = error.stack;
-    let useColors = true;
-    // Some consoles do not convert ANSI escape sequences to colors,
-    // rather display them directly to the stdout. On those consoles,
-    // libuv emulates colors by intercepting stdout stream and calling
-    // corresponding Windows API functions for setting console colors.
-    // However, fatal error are handled differently and we cannot easily
-    // highlight them. On Windows, detecting whether a console supports
-    // ANSI escape sequences is not reliable.
-    if (isWindows) {
-      const ver = require('os').release().split('.', 3).map(Number);
-      if (ver[0] !== 10 || ver[2] < 14393) {
-        useColors = false;
-      }
-    }
-    const {
-      inspect,
-      inspectDefaultOptions: {
-        colors: defaultColors,
-      },
-    } = lazyInternalUtilInspect();
-    const colors = useColors && (lazyUtilColors().shouldColorize(process.stderr) || defaultColors);
-    try {
-      return inspect(error, {
-        colors,
-        customInspect: false,
-        depth: Math.max(inspect.defaultOptions.depth, 5),
-      });
-    } catch {
-      return originalStack;
-    }
-  },
-};
-
-const arrow_message_private_symbol = Symbol('node:arrowMessage');
 // Ensures the printed error line is from user code.
+const arrow_message_private_symbol = Symbol('arrowMessage');
 function setArrowMessage(err, arrowMessage) {
   err[arrow_message_private_symbol] = arrowMessage;
 }
@@ -895,11 +811,14 @@ function hideInternalStackFrames(error) {
   overrideStackTrace.set(error, (error, stackFrames) => {
     let frames = stackFrames;
     if (typeof stackFrames === 'object') {
-      frames = stackFrames.filter((frm) => !(frm.getFileName() || '').startsWith('node:internal'),
+      frames = ArrayPrototypeFilter(
+        stackFrames,
+        (frm) => !StringPrototypeStartsWith(frm.getFileName() || '',
+                                            'node:internal'),
       );
     }
-    frames.unshift(error);
-    return frames.join('\n    at ');
+    ArrayPrototypeUnshift(frames, error);
+    return ArrayPrototypeJoin(frames, '\n    at ');
   });
 }
 
@@ -926,7 +845,7 @@ class AbortError extends Error {
 const genericNodeError = hideStackFrames(function genericNodeError(message, errorProperties) {
   // eslint-disable-next-line no-restricted-syntax
   const err = new Error(message);
-  Object.assign(err, errorProperties);
+  ObjectAssign(err, errorProperties);
   return err;
 });
 
@@ -975,15 +894,15 @@ function determineSpecificType(value) {
       return `${lazyInternalUtilInspect().inspect(value, { depth: -1 })}`;
     }
     case 'string':
-      value.length > 28 && (value = `${value.slice(0, 25)}...`);
-      if (value.indexOf("'") === -1) {
+      value.length > 28 && (value = `${StringPrototypeSlice(value, 0, 25)}...`);
+      if (StringPrototypeIndexOf(value, "'") === -1) {
         return `type string ('${value}')`;
       }
-      return `type string (${JSON.stringify(value)})`;
+      return `type string (${JSONStringify(value)})`;
     default:
       value = lazyInternalUtilInspect().inspect(value, { colors: false });
       if (value.length > 28) {
-        value = `${value.slice(0, 25)}...`;
+        value = `${StringPrototypeSlice(value, 0, 25)}...`;
       }
 
       return `type ${type} (${value})`;
@@ -998,6 +917,21 @@ function determineSpecificType(value) {
  * @param {string} [type] The list type to be inserted before the last element.
  * @returns {string}
  */
+// internal/modules/helpers in Node; the runtime's loader keeps the parent on each module.
+function getRequireStack(parent) {
+  const requireStack = [];
+  for (let cursor = parent; cursor; cursor = cursor.parent) {
+    ArrayPrototypePush(requireStack, cursor.filename || cursor.id);
+  }
+  return requireStack;
+}
+function urlToFilename(url) {
+  if (url && StringPrototypeStartsWith(url, 'file://')) {
+    return require('url').fileURLToPath(url);
+  }
+  return url;
+}
+
 function formatList(array, type = 'and') {
   switch (array.length) {
     case 0: return '';
@@ -1005,7 +939,7 @@ function formatList(array, type = 'and') {
     case 2: return `${array[0]} ${type} ${array[1]}`;
     case 3: return `${array[0]}, ${array[1]}, ${type} ${array[2]}`;
     default:
-      return `${array.slice(0, -1).join(', ')}, ${type} ${array[array.length - 1]}`;
+      return `${ArrayPrototypeJoin(ArrayPrototypeSlice(array, 0, -1), ', ')}, ${type} ${array[array.length - 1]}`;
   }
 }
 
@@ -1021,7 +955,6 @@ module.exports = {
   E,
   ErrnoException,
   ExceptionWithHostPort,
-  fatalExceptionStackEnhancers,
   formatList,
   genericNodeError,
   getMessage,
@@ -1030,13 +963,8 @@ module.exports = {
   inspectWithNoCustomRetry,
   isErrorStackTraceLimitWritable,
   isStackOverflowError,
-  kEnhanceStackBeforeInspector,
   kIsNodeError,
-  defaultPrepareStackTrace,
-  setInternalPrepareStackTrace,
   overrideStackTrace,
-  prepareStackTraceCallback,
-  ErrorPrepareStackTrace,
   setArrowMessage,
   SystemError,
   uvErrmapGet,
@@ -1133,7 +1061,7 @@ E('ERR_CRYPTO_SIGN_KEY_REQUIRED', 'No key provided to sign', Error);
 E('ERR_DEBUGGER_ERROR', '%s', Error);
 E('ERR_DEBUGGER_STARTUP_ERROR', function(message, details = undefined) {
   if (details !== undefined) {
-    Object.assign(this, details);
+    ObjectAssign(this, details);
   }
   return message;
 }, Error);
@@ -1341,16 +1269,16 @@ E('ERR_INVALID_ADDRESS_FAMILY', function(addressType, host, port) {
 E('ERR_INVALID_ARG_TYPE',
   (name, expected, actual) => {
     assert(typeof name === 'string', "'name' must be a string");
-    if (!Array.isArray(expected)) {
+    if (!ArrayIsArray(expected)) {
       expected = [expected];
     }
 
     let msg = 'The ';
-    if (name.endsWith(' argument')) {
+    if (StringPrototypeEndsWith(name, ' argument')) {
       // For cases like 'first argument'
       msg += `${name} `;
     } else {
-      const type = name.includes('.') ? 'property' : 'argument';
+      const type = StringPrototypeIncludes(name, '.') ? 'property' : 'argument';
       msg += `"${name}" ${type} `;
     }
     msg += 'must be ';
@@ -1362,24 +1290,24 @@ E('ERR_INVALID_ARG_TYPE',
     for (const value of expected) {
       assert(typeof value === 'string',
              'All expected entries have to be of type string');
-      if (kTypes.includes(value)) {
-        types.push(value.toLowerCase());
-      } else if (classRegExp.exec(value) !== null) {
-        instances.push(value);
+      if (ArrayPrototypeIncludes(kTypes, value)) {
+        ArrayPrototypePush(types, StringPrototypeToLowerCase(value));
+      } else if (RegExpPrototypeExec(classRegExp, value) !== null) {
+        ArrayPrototypePush(instances, value);
       } else {
         assert(value !== 'object',
                'The value "object" should be written as "Object"');
-        other.push(value);
+        ArrayPrototypePush(other, value);
       }
     }
 
     // Special handle `object` in case other instances are allowed to outline
     // the differences between each other.
     if (instances.length > 0) {
-      const pos = types.indexOf('object');
+      const pos = ArrayPrototypeIndexOf(types, 'object');
       if (pos !== -1) {
-        types.splice(pos, 1);
-        instances.push('Object');
+        ArrayPrototypeSplice(types, pos, 1);
+        ArrayPrototypePush(instances, 'Object');
       }
     }
 
@@ -1399,7 +1327,7 @@ E('ERR_INVALID_ARG_TYPE',
       if (other.length > 1) {
         msg += `one of ${formatList(other, 'or')}`;
       } else {
-        if (other[0].toLowerCase() !== other[0])
+        if (StringPrototypeToLowerCase(other[0]) !== other[0])
           msg += 'an ';
         msg += `${other[0]}`;
       }
@@ -1412,9 +1340,9 @@ E('ERR_INVALID_ARG_TYPE',
 E('ERR_INVALID_ARG_VALUE', (name, value, reason = 'is invalid') => {
   let inspected = lazyInternalUtilInspect().inspect(value);
   if (inspected.length > 128) {
-    inspected = `${inspected.slice(0, 128)}...`;
+    inspected = `${StringPrototypeSlice(inspected, 0, 128)}...`;
   }
-  const type = name.includes('.') ? 'property' : 'argument';
+  const type = StringPrototypeIncludes(name, '.') ? 'property' : 'argument';
   return `The ${type} '${name}' ${reason}. Received ${inspected}`;
 }, TypeError, RangeError, HideStackFramesError);
 E('ERR_INVALID_ASYNC_ID', 'Invalid %s value: %s', RangeError);
@@ -1459,16 +1387,16 @@ E('ERR_INVALID_PACKAGE_CONFIG', (path, base, message) => {
 E('ERR_INVALID_PACKAGE_TARGET',
   (pkgPath, key, target, isImport = false, base = undefined) => {
     const relError = typeof target === 'string' && !isImport &&
-      target.length && !target.startsWith('./');
+      target.length && !StringPrototypeStartsWith(target, './');
     if (key === '.') {
       assert(isImport === false);
-      return `Invalid "exports" main target ${JSON.stringify(target)} defined ` +
+      return `Invalid "exports" main target ${JSONStringify(target)} defined ` +
         `in the package config ${pkgPath}package.json${base ?
           ` imported from ${base}` : ''}${relError ?
           '; targets must start with "./"' : ''}`;
     }
     return `Invalid "${isImport ? 'imports' : 'exports'}" target ${
-      JSON.stringify(target)} defined for '${key}' in the package config ${
+      JSONStringify(target)} defined for '${key}' in the package config ${
       pkgPath}package.json${base ? ` imported from ${base}` : ''}${relError ?
       '; targets must start with "./"' : ''}`;
   }, Error);
@@ -1543,8 +1471,10 @@ E('ERR_MISSING_ARGS',
     let msg = 'The ';
     const len = args.length;
     const wrap = (a) => `"${a}"`;
-    args = args.map((a) => (Array.isArray(a) ?
-        a.map(wrap).join(' or ') :
+    args = ArrayPrototypeMap(
+      args,
+      (a) => (ArrayIsArray(a) ?
+        ArrayPrototypeJoin(ArrayPrototypeMap(a, wrap), ' or ') :
         wrap(a)),
     );
     msg += `${formatList(args)} argument${len > 1 ? 's' : ''}`;
@@ -1554,7 +1484,7 @@ E('ERR_MISSING_OPTION', '%s is required', TypeError);
 E('ERR_MODULE_LINK_MISMATCH', '%s', TypeError);
 E('ERR_MODULE_NOT_FOUND', function(path, base, exactUrl) {
   if (exactUrl) {
-    Object.defineProperty(this, 'url', { __proto__: null, configurable: true, enumerable: true, writable: true, value: `${exactUrl}` });
+    lazyInternalUtil().setOwnProperty(this, 'url', `${exactUrl}`);
   }
   return `Cannot find ${
     exactUrl ? 'module' : 'package'} '${path}' imported from ${base}`;
@@ -1587,7 +1517,7 @@ E('ERR_OUT_OF_RANGE',
     let msg = replaceDefaultBoolean ? str :
       `The value of "${str}" is out of range.`;
     let received;
-    if (Number.isInteger(input) && Math.abs(input) > 2 ** 32) {
+    if (NumberIsInteger(input) && MathAbs(input) > 2 ** 32) {
       received = addNumericalSeparator(String(input));
     } else if (typeof input === 'bigint') {
       received = String(input);
@@ -1627,7 +1557,7 @@ E('ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL', "Unexpected argument '%s'. This " +
 E('ERR_PARSE_ARGS_UNKNOWN_OPTION', (option, allowPositionals) => {
   const suggestDashDash = allowPositionals ? '. To specify a positional ' +
     "argument starting with a '-', place it at the end of the command after " +
-    `'--', as in '-- ${JSON.stringify(option)}` : '';
+    `'--', as in '-- ${JSONStringify(option)}` : '';
   return `Unknown option '${option}'${suggestDashDash}`;
 }, TypeError);
 E('ERR_PERFORMANCE_INVALID_TIMESTAMP',
@@ -1652,13 +1582,13 @@ E('ERR_REQUIRE_ASYNC_MODULE', function(filename, parent, locations) {
     message += `\nRequired module: ${filename}`;
   }
   if (parent) {
-    const requireStack = [];
-    for (let cursor = parent; cursor?.filename; cursor = cursor.parent) requireStack.push(cursor.filename);
+    
+    const requireStack = getRequireStack(parent);
     if (requireStack.length > 0) {
       message += '\nRequire stack:\n- ' +
-                requireStack.join('\n- ');
+                ArrayPrototypeJoin(requireStack, '\n- ');
     }
-    Object.defineProperty(this, 'requireStack', {
+    ObjectDefineProperty(this, 'requireStack', {
       __proto__: null,
       enumerable: false,
       configurable: true,
@@ -1667,11 +1597,11 @@ E('ERR_REQUIRE_ASYNC_MODULE', function(filename, parent, locations) {
     });
   }
   if (locations && locations.length > 0) {
-    const urlToFilename = (url) => (String(url).startsWith('file:') ? require('url').fileURLToPath(url) : url);
-    const frames = locations.map(({ url, line, column, sourceLine }) =>
-      `${urlToFilename(url)}:${line}\n\n${sourceLine}\n${' '.repeat(column - 1)}^\n`);
-    setArrowMessage(this, frames.join('\n'));
-    Object.defineProperty(this, 'topLevelAwaitLocations', {
+    
+    const frames = ArrayPrototypeMap(locations, ({ url, line, column, sourceLine }) =>
+      `${urlToFilename(url)}:${line}\n\n${sourceLine}\n${StringPrototypeRepeat(' ', column - 1)}^\n`);
+    setArrowMessage(this, ArrayPrototypeJoin(frames, '\n'));
+    ObjectDefineProperty(this, 'topLevelAwaitLocations', {
       __proto__: null,
       enumerable: false,
       configurable: true,
@@ -1688,7 +1618,7 @@ E('ERR_REQUIRE_ESM',
     let msg = `require() of ES Module ${filename}${parentPath ? ` from ${
       parentPath}` : ''} not supported.`;
     if (!packageJsonPath) {
-      if (filename.endsWith('.mjs'))
+      if (StringPrototypeEndsWith(filename, '.mjs'))
         msg += `\nInstead change the require of ${filename} to a dynamic ` +
             'import() which is available in all CommonJS modules.';
       return msg;
@@ -1859,7 +1789,7 @@ E('ERR_UNKNOWN_MODULE_FORMAT', 'Unknown module format: %s for URL %s',
   RangeError);
 E('ERR_UNKNOWN_SIGNAL', 'Unknown signal: %s', TypeError, HideStackFramesError);
 E('ERR_UNSUPPORTED_DIR_IMPORT', function(path, base, exactUrl) {
-  Object.defineProperty(this, 'url', { __proto__: null, configurable: true, enumerable: true, writable: true, value: exactUrl });
+  lazyInternalUtil().setOwnProperty(this, 'url', exactUrl);
   return `Directory import '${path}' is not supported ` +
     `resolving ES modules imported from ${base}`;
 }, Error);
@@ -1912,7 +1842,7 @@ E('ERR_WORKER_HANDLE_NOT_TRANSFERABLE',
   'pending writes', Error);
 E('ERR_WORKER_INIT_FAILED', 'Worker initialization failure: %s', Error);
 E('ERR_WORKER_INVALID_EXEC_ARGV', (errors, msg = 'invalid execArgv flags') =>
-  `Initiated Worker with ${msg}: ${errors.join(', ')}`,
+  `Initiated Worker with ${msg}: ${ArrayPrototypeJoin(errors, ', ')}`,
   Error);
 E('ERR_WORKER_MESSAGING_ERRORED', 'The destination thread threw an error while processing the message', Error);
 E('ERR_WORKER_MESSAGING_FAILED', 'Cannot find the destination thread or listener', Error);
@@ -1924,10 +1854,10 @@ E('ERR_WORKER_OUT_OF_MEMORY',
 E('ERR_WORKER_PATH', (filename) =>
   'The worker script or module filename must be an absolute path or a ' +
   'relative path starting with \'./\' or \'../\'.' +
-  (filename.startsWith('file://') ?
+  (StringPrototypeStartsWith(filename, 'file://') ?
     ' Wrap file:// URLs with `new URL`.' : ''
   ) +
-  (filename.startsWith('data:text/javascript') ?
+  (StringPrototypeStartsWith(filename, 'data:text/javascript') ?
     ' Wrap data: URLs with `new URL`.' : ''
   ) +
   ` Received "${filename}"`,

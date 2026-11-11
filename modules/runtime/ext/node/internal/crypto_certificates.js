@@ -27,7 +27,7 @@ function check(cert, op, value, name, options) {
 function checkKey(cert, op, key, type) {
   state(cert);
   if (!(key instanceof require('crypto').KeyObject)) throw c.invalid('pkey', 'a KeyObject');
-  if (key.type !== type) throw c.error('ERR_INVALID_ARG_VALUE', 'Invalid pkey', TypeError);
+  if (c.keyObjectType(key) !== type) throw c.error('ERR_INVALID_ARG_VALUE', 'Invalid pkey', TypeError);
   return !!call(cert, op, c.handle(key));
 }
 // Decode only inspection data already accepted by OpenSSL. Signature, identity and
