@@ -27,6 +27,9 @@ function createLoader(host, builtins) {
   // get a copy). Permissions are fixed once a program runs, so the walks give the same
   // answer every time.
   const scopes = new Map(), lookupPaths = new Map();
+  // Real paths already found. As with Node's realpathCache, a symlink changed while the
+  // program runs is not seen again.
+  const realPaths = new Map();
   // The source format() read to tell a module from a script, for the load that follows.
   let probed = null;
   const cache = Object.create(null);
@@ -131,6 +134,19 @@ function createLoader(host, builtins) {
     return pkg;
   }
 
+  // The real path of an absolute filename: its directory's, found once, joined to its own
+  // name unless it is itself a symlink. One lstat for a file whose directory is known.
+  function realPath(filename) {
+    let real = realPaths.get(filename);
+    if (real !== undefined) return real;
+    const directory = path.dirname(filename);
+    if (directory === filename || !path.isAbsolute(filename)) real = host.realpath(filename);
+    else if ((host.stat(filename, false).mode & 0o170000) === 0o120000) real = host.realpath(filename);
+    else real = path.join(realPath(directory), path.basename(filename));
+    realPaths.set(filename, real);
+    return real;
+  }
+
   function packageScope(filename) {
     const start = path.dirname(filesystemName(filename));
     let scope = scopes.get(start);
@@ -221,7 +237,7 @@ function createLoader(host, builtins) {
 
   function descriptor(filename, mode, suffix, isMain) {
     const preserve = isMain ? host.preserveSymlinksMain : host.preserveSymlinks;
-    const canonical = preserve ? path.resolve(filename) : host.realpath(filename);
+    const canonical = preserve ? path.resolve(filename) : realPath(filename);
     const identity = suffix && mode === 'import' ? fileURL(canonical) + suffix : canonical;
     let kind;
     try { kind = format(identity, mode, mode === 'require' && !isMain && !hooks.active()); }
@@ -744,7 +760,7 @@ function createLoader(host, builtins) {
     let filename = fileURLToPath(target);
     if (!isDirectory(filename)) {
       if (!isFile(filename)) throw missing(specifier, parentURL.href, 'import');
-      if (!host.preserveSymlinks) filename = host.realpath(filename);
+      if (!host.preserveSymlinks) filename = realPath(filename);
     }
     // An unsupported directory import retains its original URL and trailing
     // slash. A slash makes the directory itself the first package scope.
@@ -1013,13 +1029,14 @@ function createLoader(host, builtins) {
   function warmMain(filename) {
     const modules = new Set(Object.keys(cache)), directories = new Set(packages.keys());
     const resolved = new Set(resolutions.keys()), previous = main;
-    const scoped = new Set(scopes.keys()), looked = new Set(lookupPaths.keys());
+    const scoped = new Set(scopes.keys()), looked = new Set(lookupPaths.keys()), reals = new Set(realPaths.keys());
     try { runMain(filename); }
     finally {
       for (const key of Object.keys(cache)) if (!modules.has(key)) delete cache[key];
       for (const key of [...packages.keys()]) if (!directories.has(key)) packages.delete(key);
       for (const key of [...scopes.keys()]) if (!scoped.has(key)) scopes.delete(key);
       for (const key of [...lookupPaths.keys()]) if (!looked.has(key)) lookupPaths.delete(key);
+      for (const key of [...realPaths.keys()]) if (!reals.has(key)) realPaths.delete(key);
       for (const key of [...resolutions.keys()]) if (!resolved.has(key)) resolutions.delete(key);
       main = previous;
       probed = null;
