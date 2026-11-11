@@ -204,7 +204,7 @@ fn descriptorOf(socket: &Socket) -> i32 {
 }
 
 // Queued events hold the loop (`queueHeld`), as libuv's pending requests did. `slots` maps reactor tokens to handles; a free slot is null and listed in `free`.
-pub struct State { io: *mut fs_async.State, dns: *mut dns.State, handles: ?*mut Handle, slots: List<?*mut Handle>, free: List<usize>, first: ?*mut Event, last: ?*mut Event, next: i32, scratch: *mut u8, closing: bool, oom: bool, polling: bool, collecting: bool, queueHeld: bool, dirty: ?*mut Handle }
+pub struct State { io: *mut fs_async.State, dns: *mut dns.State, handles: ?*mut Handle, slots: List<?*mut Handle>, free: List<usize>, first: ?*mut Event, last: ?*mut Event, next: i32, scratch: *mut u8, closing: bool, oom: bool, polling: bool, collecting: bool, queueHeld: bool, dirty: ?*mut Handle, texts: [ValueBits; 64] }
 // `watched` is the descriptor in the reactor, or -1. `path` is the socket path of a pipe: its own
 // path when `pathIsLocal`, else its peer's. `terminal` is the mode that a terminal had before its
 // first mode change. `local`, `flags`, `noDelay` and `keepAlive` wait for the socket that a
@@ -216,13 +216,13 @@ struct Handle {
   firstWrite: ?*mut Write, lastWrite: ?*mut Write, shutdownToken: i32, shutdownPending: bool, writeShut: bool,
   local: Option<Endpoint>, flags: i32, noDelay: bool, keepAlive: bool, keepAliveDelay: u32,
   path: List<u8>, pathIsLocal: bool, chmodFlags: i32, terminal: Option<TerminalMode>, closeEvent: *mut Event,
-  peer: ?*mut Peer, exchange: ?*mut Exchange
+  peer: ?*mut Peer, exchange: ?*mut Exchange, dirty: bool, nextDirty: ?*mut Handle
 }
 // A WebSocket connection whose frames this module reads and writes (see the WebSocket section).
-// `output` holds frames not yet given to the socket. A handle with output is `dirty`, on the
-// state's list that the end of a poll writes, so that the frames that one poll's callbacks send
-// go out in one system call per socket.
-struct Peer { session: Session, output: Bytes, text: Bytes, dirty: bool, nextDirty: ?*mut Handle, failed: bool }
+// `output` holds frames not yet given to the socket. A handle with output (a peer's frames or an
+// HTTP exchange's responses) is `dirty`, on the state's list that the end of a poll writes, so
+// that what one poll's callbacks send goes out in one system call per socket.
+struct Peer { session: Session, output: Bytes, text: Bytes, failed: bool }
 // A write that waits for room. `data` holds a copy of the bytes, and `offset` counts those sent.
 struct Write { next: ?*mut Write, token: i32, data: ?*mut u8, length: usize, offset: usize, target: Option<Endpoint> }
 // An event for JavaScript. `token` is the request token, or the child id of an accept.
@@ -243,7 +243,7 @@ pub effect fn open(io: *mut fs_async.State) -> *mut State ! OutOfMemoryError {
   let scratch = match move scratched { Result<*mut u8, OutOfMemoryError>.Success { value } => value Result<*mut u8, OutOfMemoryError>.Failure { error } => { unsafe free(unsafe bytes(p)) fail move error } }
   let initialized = run Effect.result(dns.make(io))
   let resolver = match move initialized { Result<*mut dns.State, OutOfMemoryError>.Success { value } => value Result<*mut dns.State, OutOfMemoryError>.Failure { error } => { unsafe free(scratch) unsafe free(unsafe bytes(p)) fail move error } }
-  unsafe Pointer.put<State>(p, State { io: io, dns: resolver, handles: Pointer.null<Handle>(), slots: List<?*mut Handle>.make(), free: List<usize>.make(), first: Pointer.null<Event>(), last: Pointer.null<Event>(), next: 1, scratch: scratch, closing: false, oom: false, polling: false, collecting: false, queueHeld: false, dirty: Pointer.null<Handle>() })
+  unsafe Pointer.put<State>(p, State { io: io, dns: resolver, handles: Pointer.null<Handle>(), slots: List<?*mut Handle>.make(), free: List<usize>.make(), first: Pointer.null<Event>(), last: Pointer.null<Event>(), next: 1, scratch: scratch, closing: false, oom: false, polling: false, collecting: false, queueHeld: false, dirty: Pointer.null<Handle>(), texts: [ValueBits.Undefined; 64] })
   return p
 }
 
@@ -308,7 +308,7 @@ unsafe effect fn create(state: *mut State, kind: i32, callback: ValueBits, socke
     firstWrite: Pointer.null<Write>(), lastWrite: Pointer.null<Write>(), shutdownToken: 0, shutdownPending: false, writeShut: false,
     local: Option<Endpoint>.none(), flags: 0, noDelay: false, keepAlive: false, keepAliveDelay: 0,
     path: List<u8>.make(), pathIsLocal: false, chmodFlags: 0, terminal: Option<TerminalMode>.none(), closeEvent: closeEvent,
-    peer: Pointer.null<Peer>(), exchange: Pointer.null<Exchange>()
+    peer: Pointer.null<Peer>(), exchange: Pointer.null<Exchange>(), dirty: false, nextDirty: Pointer.null<Handle>()
   })
   unsafe Pointer.put<Event>(closeEvent, event(handle, CLOSED, 0, 0))
   let s2 = unsafe Pointer.borrowMut<(), State>(&mut anchor, state) s2.handles = handle s2.slots.set(slot, handle)
@@ -373,7 +373,7 @@ unsafe fn releaseHandle<'m, S: EngineServices>(engine: &mut Engine<'m, S>, conte
   let s = unsafe Pointer.borrowMut<(), State>(&mut anchor, state) let io = s.io s.slots.set(slot, Pointer.null<Handle>()) let mut link = Pointer.fromMutRef<?*mut Handle>(&mut s.handles) drop s
   if holding { unsafe fs_async.unhold(io) }
   while !Pointer.isNull<Handle>(unsafe Pointer.read<?*mut Handle>(link)) { let p = unsafe nn(unsafe Pointer.read<?*mut Handle>(link)) let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, p) if h.id == id { unsafe Pointer.put<?*mut Handle>(link, h.next) drop h break } link = Pointer.fromMutRef<?*mut Handle>(&mut h.next) drop h }
-  unsafe forgetPeer(state, handle) unsafe forgetExchange(handle)
+  unsafe unlinkDirty(state, handle) unsafe forgetPeer(state, handle) unsafe forgetExchange(handle)
   let h = unsafe Pointer.take<Handle>(handle) unsafe owners.release(&mut engine, context, h.callback) let writes = h.firstWrite drop h
   unsafe freeWrites(writes) unsafe free(unsafe bytes(handle))
   return slot
@@ -649,27 +649,29 @@ unsafe effect fn collect(state: *mut State) -> () ! OutOfMemoryError ? &mut Allo
 unsafe fn sliceAt(data: &[u8], index: usize) -> *const u8 { return unsafe Pointer.at<u8>(unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(data)), index) }
 unsafe fn peerOf(handle: *mut Handle) -> ?*mut Peer { let a = () let h = unsafe Pointer.borrow<(), Handle>(&a, handle) return h.peer }
 unsafe fn markDirty(handle: *mut Handle) -> () {
-  let found = unsafe peerOf(handle) if Pointer.isNull<Peer>(found) { return () }
-  let mut anchor = () let peer = unsafe Pointer.borrowMut<(), Peer>(&mut anchor, unsafe nn(found))
-  if peer.dirty { return () }
-  let state = unsafe stateOf(handle)
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  if h.dirty { return () }
+  let state = h.state
   let mut stateAnchor = () let s = unsafe Pointer.borrowMut<(), State>(&mut stateAnchor, state)
-  peer.dirty = true peer.nextDirty = s.dirty s.dirty = handle
+  h.dirty = true h.nextDirty = s.dirty s.dirty = handle
 }
-// Takes a handle off the dirty list and frees its peer, for a handle that is being freed.
-unsafe fn forgetPeer(state: *mut State, handle: *mut Handle) -> () {
-  let found = unsafe peerOf(handle) if Pointer.isNull<Peer>(found) { return () }
-  let mut anchor = () let s = unsafe Pointer.borrowMut<(), State>(&mut anchor, state)
+// Takes a handle that is being freed off the dirty list.
+unsafe fn unlinkDirty(state: *mut State, handle: *mut Handle) -> () {
+  let mut anchor = () let own = unsafe Pointer.borrow<(), Handle>(&anchor, handle) let dirty = own.dirty let id = own.id drop own
+  if !dirty { return () }
+  let s = unsafe Pointer.borrowMut<(), State>(&mut anchor, state)
   let mut link = Pointer.fromMutRef<?*mut Handle>(&mut s.dirty) drop s
-  let idAnchor = () let own = unsafe Pointer.borrow<(), Handle>(&idAnchor, handle) let id = own.id drop own
   while !Pointer.isNull<Handle>(unsafe Pointer.read<?*mut Handle>(link)) {
     let current = unsafe nn(unsafe Pointer.read<?*mut Handle>(link))
-    let other = unsafe Pointer.borrow<(), Handle>(&idAnchor, current) let same = other.id == id drop other
-    let p = unsafe nn(unsafe peerOf(current))
-    let entry = unsafe Pointer.borrowMut<(), Peer>(&mut anchor, p)
-    if same { unsafe Pointer.put<?*mut Handle>(link, entry.nextDirty) drop entry break }
+    let entry = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, current)
+    if entry.id == id { unsafe Pointer.put<?*mut Handle>(link, entry.nextDirty) entry.dirty = false drop entry return () }
     link = Pointer.fromMutRef<?*mut Handle>(&mut entry.nextDirty) drop entry
   }
+}
+// Frees the peer of a handle that is being freed.
+unsafe fn forgetPeer(state: *mut State, handle: *mut Handle) -> () {
+  let found = unsafe peerOf(handle) if Pointer.isNull<Peer>(found) { return () }
+  let mut anchor = ()
   let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle) h.peer = Pointer.null<Peer>() drop h
   let owned = unsafe Pointer.take<Peer>(unsafe nn(found)) drop owned
   unsafe free(unsafe bytes(unsafe nn(found)))
@@ -712,18 +714,28 @@ unsafe effect fn flushPeer(handle: *mut Handle, token: i32) -> i32 ! OutOfMemory
   return 0
 }
 // Writes the output of every dirty peer. A peer whose write fails gets a WS_WRITE_FAILED event.
+// An HTTP exchange's write failure ends its reading, which closes the connection in JavaScript.
 unsafe effect fn flushDirty(state: *mut State) -> () ! OutOfMemoryError ? &mut Allocator {
   let mut anchor = ()
   while true {
     let s = unsafe Pointer.borrowMut<(), State>(&mut anchor, state) let first = s.dirty
     if Pointer.isNull<Handle>(first) { return () }
     let handle = unsafe nn(first)
-    let p = unsafe nn(unsafe peerOf(handle))
-    let mut peerAnchor = () let peer = unsafe Pointer.borrowMut<(), Peer>(&mut peerAnchor, p)
-    s.dirty = peer.nextDirty peer.nextDirty = Pointer.null<Handle>() peer.dirty = false drop peer drop s
-    let code = run unsafe flushPeer(handle, 0)
-    if code < 0 && code != EPIPE() { unsafe notify(handle, WS_WRITE_FAILED, code, 0) }
+    let mut handleAnchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut handleAnchor, handle)
+    s.dirty = h.nextDirty h.nextDirty = Pointer.null<Handle>() h.dirty = false drop h drop s
+    if !Pointer.isNull<Peer>(unsafe peerOf(handle)) {
+      let code = run unsafe flushPeer(handle, 0)
+      if code < 0 && code != EPIPE() { unsafe notify(handle, WS_WRITE_FAILED, code, 0) }
+    } else {
+      let code = run unsafe flushExchange(handle)
+      if code < 0 && code != EPIPE() { let mut stopAnchor = () let stopped = unsafe Pointer.borrowMut<(), Handle>(&mut stopAnchor, handle) stopped.reading = false drop stopped unsafe refresh(handle) unsafe notify(handle, READ, code, 0) }
+    }
   }
+}
+// Writes whatever a handle's peer or HTTP exchange holds back, ahead of a shutdown or close.
+unsafe effect fn flushOutput(handle: *mut Handle) -> () ! OutOfMemoryError ? &mut Allocator {
+  if !Pointer.isNull<Peer>(unsafe peerOf(handle)) { let _flushed = run unsafe flushPeer(handle, 0) return () }
+  let _written = run unsafe flushExchange(handle)
 }
 // Writes now when no poll is delivering events; during one, the end of the poll writes.
 unsafe effect fn sendSoon(handle: *mut Handle) -> () ! OutOfMemoryError ? &mut Allocator {
@@ -908,7 +920,7 @@ const PHASE_STOPPED: i32 = 3
 const MAX_BODY: u64 = 134217728
 // `record` holds the strings of the request being read, each as a 4-byte little-endian length and
 // its bytes; `body` its payload so far.
-struct Exchange { parser: RequestParser, phase: i32, remaining: u64, decoder: Option<Decoder>, record: Bytes, body: Bytes, flags: i32, out: Bytes, scratch: Bytes }
+struct Exchange { parser: RequestParser, phase: i32, remaining: u64, decoder: Option<Decoder>, record: Bytes, body: Bytes, flags: i32, out: Bytes, scratch: Bytes, pending: Bytes }
 
 fn httpValueLimits() -> ValueLimits {
   return ValueLimits { maxMethodBytes: 64, maxTargetBytes: 16384, maxNameBytes: 256, maxValueBytes: 16384, maxFields: 256, maxFieldBytes: 65536, maxOwnedBytes: 81920 }
@@ -964,11 +976,39 @@ unsafe effect fn writeNow(handle: *mut Handle, data: &[u8]) -> i32 ! OutOfMemory
   run unsafe queueWrite(handle, Slice.view<u8>(data, sent, data.length - sent), 0)
   return 0
 }
+// Writes what an exchange holds back: 1 when the socket took it all, 0 when the rest waits in the
+// write queue, or a status.
+unsafe effect fn flushExchange(handle: *mut Handle) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  let found = unsafe exchangeOf(handle) if Pointer.isNull<Exchange>(found) { return 1 }
+  let mut anchor = () let ex = unsafe Pointer.borrowMut<(), Exchange>(&mut anchor, unsafe nn(found))
+  if ex.pending.length() == 0 { return 1 }
+  let status = run unsafe writeNow(handle, ex.pending.asSlice())
+  ex.pending.clear()
+  return status
+}
+// Writes HTTP output in order. During a poll it waits for the end of the poll, which writes the
+// responses of a batch of requests with one system call per socket, and keeps the JavaScript for
+// the whole batch away from system calls.
+unsafe effect fn httpWrite(handle: *mut Handle, data: &[u8]) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  if data.length == 0 { return 1 }
+  let mut anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, handle)
+  if h.closing || h.writeShut || h.shutdownPending { return EPIPE() }
+  let state = h.state drop h
+  let s = unsafe Pointer.borrow<(), State>(&anchor, state) let polling = s.polling drop s
+  let found = unsafe exchangeOf(handle)
+  if Pointer.isNull<Exchange>(found) { return run unsafe writeNow(handle, data) }
+  let mut exAnchor = () let ex = unsafe Pointer.borrowMut<(), Exchange>(&mut exAnchor, unsafe nn(found))
+  if polling { run ex.pending.append(data) drop ex unsafe markDirty(handle) return 1 }
+  drop ex
+  let flushed = run unsafe flushExchange(handle)
+  if flushed < 0 { return flushed }
+  return run unsafe writeNow(handle, data)
+}
 // Answers a request that cannot be read, and reads no more from the connection.
 unsafe effect fn httpReject(handle: *mut Handle, exchange: *mut Exchange, code: i32) -> () ! OutOfMemoryError ? &mut Allocator {
   let mut anchor = () let ex = unsafe Pointer.borrowMut<(), Exchange>(&mut anchor, exchange) ex.phase = PHASE_STOPPED drop ex
   let text: &[u8] = if code == 413 { b"HTTP/1.1 413 Payload Too Large\r\nconnection: close\r\ncontent-length: 0\r\n\r\n" } else if code == 431 { b"HTTP/1.1 431 Request Header Fields Too Large\r\nconnection: close\r\ncontent-length: 0\r\n\r\n" } else { b"HTTP/1.1 400 Bad Request\r\nconnection: close\r\ncontent-length: 0\r\n\r\n" }
-  let _written = run unsafe writeNow(handle, text)
+  let _written = run unsafe httpWrite(handle, text)
   let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle) h.reading = false drop h
   unsafe notify(handle, READ, END, 0)
 }
@@ -1060,7 +1100,7 @@ unsafe effect fn httpBegin(handle: *mut Handle, exchange: *mut Exchange) -> i32 
   if facts.framingKind == 1 { ex.phase = PHASE_FIXED ex.remaining = facts.fixed run ex.body.reserve(u64.toUsize(facts.fixed)) }
   else { ex.phase = PHASE_CHUNKED ex.decoder = Intrinsic.replace(facts.decoder, Option<Decoder>.none()) }
   drop ex
-  if facts.expectContinue { let _continued = run unsafe writeNow(handle, b"HTTP/1.1 100 Continue\r\n\r\n") }
+  if facts.expectContinue { let _continued = run unsafe httpWrite(handle, b"HTTP/1.1 100 Continue\r\n\r\n") }
   return 0
 }
 // Reads the requests in `input` and queues their events.
@@ -1139,7 +1179,34 @@ unsafe fn recordText(data: *mut u8, offset: usize) -> usize {
   return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
 }
 // The payload and extra of an HTTP_REQUEST event (see the section above).
-unsafe effect fn httpRequestValues<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, data: *mut u8, length: usize, flags: i32, scope: &mut Scope) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+// A string for request bytes. Requests on kept-alive connections repeat most of their method,
+// target, field names and values, so short ASCII texts come from a small cache of strings.
+unsafe effect fn requestText<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, view: &[u8]) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let cacheable = view.length != 0 && view.length <= 64
+  let mut hash: u32 = 2166136261
+  if cacheable {
+    let mut i: usize = 0
+    while i < view.length { hash = u32.wrappingMultiply(hash ^ u8.toU32(view[i]), 16777619) i = i + 1 }
+    let mut anchor = () let s = unsafe Pointer.borrow<(), State>(&anchor, state)
+    let cached = s.texts[u32.toUsize(hash & 63)] drop s
+    if cached.isString() && Strings.isFlatAscii(cached) {
+      let textAnchor = ()
+      if eq(unsafe Strings.flatLatin1(&textAnchor, cached), view) { return unsafe cached.retained() }
+    }
+  }
+  let made = run Effect.result(Strings.fromLatin1(view))
+  let value = match move made {
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error } => run core.materialize(&mut engine, unsafe lendRealm(&context, context), move error)
+  }
+  if cacheable && Strings.isFlatAscii(value) {
+    let mut anchor = () let s = unsafe Pointer.borrowMut<(), State>(&mut anchor, state)
+    let slot = u32.toUsize(hash & 63) let old = s.texts[slot] s.texts[slot] = unsafe value.retained() drop s
+    unsafe owners.release(&mut engine, context, old)
+  }
+  return value
+}
+unsafe effect fn httpRequestValues<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, data: *mut u8, length: usize, flags: i32, scope: &mut Scope) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
   let recordLength = unsafe recordText(data, 0)
   let memory = engine.memory
   scope.values[1] = run unsafe common.array(&mut engine, memory, context)
@@ -1149,11 +1216,7 @@ unsafe effect fn httpRequestValues<'m, S: EngineServices>(engine: &mut Engine<'m
     let size = unsafe recordText(data, offset)
     let anchor = ()
     let view = if size != 0 { unsafe Pointer.borrowMany<(), u8>(&anchor, unsafe Pointer.assumeMany<u8>(unsafe Pointer.atMut<u8>(base, offset + 4)), size) } else { b"" }
-    let made = run Effect.result(Strings.fromLatin1(view))
-    let value = match move made {
-      Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => value
-      Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error } => run core.materialize(&mut engine, unsafe lendRealm(&context, context), move error)
-    }
+    let value = run unsafe requestText(&mut engine, context, state, view)
     run unsafe common.defineIndex(&mut engine, context, scope.values[1], index, value)
     index = index + 1 offset = offset + 4 + size
   }
@@ -1292,7 +1355,36 @@ pub unsafe effect fn httpRespond<'m, S: EngineServices>(engine: &mut Engine<'m, 
   if (flags & HTTP_CLOSE) != 0 { run body.out.append(b"connection: close\r\n") }
   run body.out.append(b"\r\n")
   if (flags & HTTP_NO_BODY) == 0 && !bodyless && body.scratch.length() != 0 { run body.out.append(body.scratch.asSlice()) }
-  let status = run unsafe writeNow(handle, body.out.asSlice()) drop body
+  let status = run unsafe httpWrite(handle, body.out.asSlice()) drop body
+  return ValueBits.Int { value: status }
+}
+// httpRespondText(id, status, statusText, contentType, text): writes a kept-alive response with a
+// text body and at most a content-type field, the common case that needs no field list.
+pub unsafe effect fn httpRespondText<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, argc: i32, argv: &FrameSlots) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let found = unsafe lookup(state, number(unsafe common.argument(argv, 0)))
+  if Pointer.isNull<Handle>(found) { return ValueBits.Int { value: EBADF() } }
+  let handle = unsafe nn(found)
+  let exchangeFound = unsafe exchangeOf(handle)
+  if Pointer.isNull<Exchange>(exchangeFound) { return ValueBits.Int { value: EBADF() } }
+  let exchange = unsafe nn(exchangeFound)
+  let code = number(unsafe common.argument(argv, 1))
+  let mut anchor = () let ex = unsafe Pointer.borrowMut<(), Exchange>(&mut anchor, exchange)
+  ex.out.clear() ex.scratch.clear()
+  run ex.out.append(b"HTTP/1.1 ")
+  run appendDecimal(&mut ex.out, i32.toU64(code))
+  run ex.out.append(b" ")
+  let reason = unsafe common.argument(argv, 2)
+  if reason.isString() && Strings.length(reason) != 0 { run appendLatin1(&mut ex.out, reason) } else { run ex.out.append(reasonPhrase(code)) }
+  run ex.out.append(b"\r\n")
+  let kind = unsafe common.argument(argv, 3)
+  if kind.isString() { run ex.out.append(b"content-type: ") run appendLatin1(&mut ex.out, kind) run ex.out.append(b"\r\n") }
+  let text = unsafe common.argument(argv, 4)
+  if text.isString() { run appendUtf8(&mut ex.scratch, text) }
+  let bodyless = code < 200 || code == 204 || code == 304
+  if !bodyless { run ex.out.append(b"content-length: ") run appendDecimal(&mut ex.out, usize.toU64(ex.scratch.length())) run ex.out.append(b"\r\n") }
+  run ex.out.append(b"date: ") run appendDate(&mut ex.out) run ex.out.append(b"\r\n\r\n")
+  if !bodyless && ex.scratch.length() != 0 { run ex.out.append(ex.scratch.asSlice()) }
+  let status = run unsafe httpWrite(handle, ex.out.asSlice()) drop ex
   return ValueBits.Int { value: status }
 }
 // httpChunk(id, body, start, length): writes one chunk of a streamed response, or with an empty
@@ -1311,13 +1403,15 @@ pub unsafe effect fn httpChunk<'m, S: EngineServices>(engine: &mut Engine<'m, S>
   let size = ex.scratch.length()
   if size == 0 { run ex.out.append(b"0\r\n\r\n") }
   else { run appendHex(&mut ex.out, usize.toU64(size)) run ex.out.append(b"\r\n") run ex.out.append(ex.scratch.asSlice()) run ex.out.append(b"\r\n") }
-  let status = run unsafe writeNow(handle, ex.out.asSlice()) drop ex
+  let status = run unsafe httpWrite(handle, ex.out.asSlice()) drop ex
   return ValueBits.Int { value: status }
 }
 // Bytes that wait for room in the socket, for a streamed response's backpressure.
 unsafe fn pendingBytes(handle: *mut Handle) -> f64 {
   let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, handle)
   let mut total: usize = 0 let mut p = h.firstWrite drop h
+  let found = unsafe exchangeOf(handle)
+  if !Pointer.isNull<Exchange>(found) { let ex = unsafe Pointer.borrow<(), Exchange>(&anchor, unsafe nn(found)) total = ex.pending.length() drop ex }
   while !Pointer.isNull<Write>(p) { let w = unsafe Pointer.borrow<(), Write>(&anchor, unsafe nn(p)) total = total + w.length - w.offset p = w.next }
   return usize.toF64(total)
 }
@@ -1731,7 +1825,7 @@ unsafe effect fn operation<'m, S: EngineServices>(engine: &mut Engine<'m, S>, co
   if eq(op, b"callback") { let h2 = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle) let old = h2.callback h2.callback = unsafe args.values[1].retained() drop h2 unsafe owners.release(&mut engine, context, old) return ValueBits.Int { value: 0 } }
   if eq(op, b"close") || eq(op, b"reset") {
     // A peer's last frames, such as its Close, go out if the socket has room.
-    if eq(op, b"close") && !closing && !Pointer.isNull<Peer>(unsafe peerOf(handle)) { let _flushed = run unsafe flushPeer(handle, 0) }
+    if eq(op, b"close") && !closing { run unsafe flushOutput(handle) }
     unsafe stop(handle, eq(op, b"reset")) return ValueBits.Int { value: 0 }
   }
   if eq(op, b"wsAdopt") {
@@ -1748,7 +1842,7 @@ unsafe effect fn operation<'m, S: EngineServices>(engine: &mut Engine<'m, S>, co
     }
     let raw = run allocate(Layout.of<Peer>().bytes)
     let peer = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Peer>(raw)
-    unsafe Pointer.put<Peer>(peer, Peer { session: move session, output: Bytes.make(), text: Bytes.make(), dirty: false, nextDirty: Pointer.null<Handle>(), failed: false })
+    unsafe Pointer.put<Peer>(peer, Peer { session: move session, output: Bytes.make(), text: Bytes.make(), failed: false })
     let entry = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle) entry.peer = peer drop entry
     // The handshake response, which must reach the socket before the first frame.
     if args.values[5].isString() {
@@ -1765,7 +1859,7 @@ unsafe effect fn operation<'m, S: EngineServices>(engine: &mut Engine<'m, S>, co
     let parser = match move made { Result.Success { value } => move value Result.Failure { .. } => { return ValueBits.Int { value: EINVAL() } } }
     let raw = run allocate(Layout.of<Exchange>().bytes)
     let exchange = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Exchange>(raw)
-    unsafe Pointer.put<Exchange>(exchange, Exchange { parser: move parser, phase: PHASE_HEAD, remaining: 0, decoder: Option<Decoder>.none(), record: Bytes.make(), body: Bytes.make(), flags: 0, out: Bytes.make(), scratch: Bytes.make() })
+    unsafe Pointer.put<Exchange>(exchange, Exchange { parser: move parser, phase: PHASE_HEAD, remaining: 0, decoder: Option<Decoder>.none(), record: Bytes.make(), body: Bytes.make(), flags: 0, out: Bytes.make(), scratch: Bytes.make(), pending: Bytes.make() })
     let entry = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle) entry.exchange = exchange entry.reading = true drop entry
     unsafe refresh(handle)
     return ValueBits.Int { value: 0 }
@@ -1905,7 +1999,7 @@ unsafe effect fn operation<'m, S: EngineServices>(engine: &mut Engine<'m, S>, co
     if entry.writeShut || entry.shutdownPending { return ValueBits.Int { value: ENOTCONN() } }
     match &entry.socket { Socket.Stream { .. } => {} Socket.Raw { .. } => {} _ => { return ValueBits.Int { value: ENOTCONN() } } }
     drop entry
-    if !Pointer.isNull<Peer>(unsafe peerOf(handle)) { let _flushed = run unsafe flushPeer(handle, 0) }
+    run unsafe flushOutput(handle)
     let again = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
     again.shutdownToken = number(args.values[1]) again.shutdownPending = true
     let idle = Pointer.isNull<Write>(again.firstWrite) && !again.connecting drop again
@@ -1983,7 +2077,7 @@ unsafe effect fn deliver<'m, S: EngineServices>(engine: &mut Engine<'m, S>, cont
   if kind == WS_FRAME {
     let memory = engine.memory scope.values[1] = run unsafe buffers.newArrayBufferCopy(&mut engine, memory, unsafe lendRealm(&context, context), data, usize.toU64(length))
   }
-  if kind == HTTP_REQUEST { scope.values[1] = ValueBits.Undefined run unsafe httpRequestValues(&mut engine, context, unsafe nn(data), length, code, &mut scope) }
+  if kind == HTTP_REQUEST { scope.values[1] = ValueBits.Undefined run unsafe httpRequestValues(&mut engine, context, unsafe stateOf(handle), unsafe nn(data), length, code, &mut scope) }
   if kind == READ && code >= 0 {
     let memory = engine.memory scope.values[1] = run unsafe buffers.newArrayBufferCopy(&mut engine, memory, unsafe lendRealm(&context, context), data, usize.toU64(length))
     match from { Option<Endpoint>.Some { value } => { scope.values[2] = run unsafe endpointValue(&mut engine, context, value) } Option<Endpoint>.None => {} }
@@ -2054,7 +2148,9 @@ pub unsafe fn close<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: 
     if kind == CLOSED { let _slot = unsafe releaseHandle(&mut engine, context, state, handle) }
     unsafe freeEvent(event)
   }
-  let owned = unsafe Pointer.take<State>(state) unsafe free(owned.scratch) drop owned
+  let owned = unsafe Pointer.take<State>(state) unsafe free(owned.scratch)
+  let mut t: usize = 0 while t < 64 { unsafe owners.release(&mut engine, context, owned.texts[t]) t = t + 1 }
+  drop owned
   unsafe free(unsafe bytes(state))
 }
 
