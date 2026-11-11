@@ -54,7 +54,9 @@ function internalRequire(request, parent = '') {
       factory = native.compileBuiltin(factory, 'node:' + request);
       factorySet(request, factory);
     }
-    factory(module, module.exports, name => internalRequire(name, request));
+    // Like Node's builtin wrapper, process is a parameter, so user code that
+    // shadows or replaces the global process cannot change what built-ins see.
+    factory(module, module.exports, name => internalRequire(name, request), process);
   }
   catch (error) { moduleDelete(request); throw error; }
   return module.exports;
@@ -95,6 +97,11 @@ host.processFeatures = {
   get typescript() { return host.typeScriptMode; }
 };
 define('internal/host', module => { module.exports = host; });
+// Like Node's, process is an instance of a constructor named process whose
+// prototype inherits from EventEmitter.prototype once events has loaded below.
+// It exists before any built-in runs, since every one of them takes it.
+const ProcessConstructor = { process: function () {} }.process;
+const process = Object.create(ProcessConstructor.prototype);
 internalRequire('internal/error_stack').install(globalThis);
 let warnedTransformTypes = false;
 host.stripTypeScriptModuleTypes = (source, filename, sourceURL = filename) => {
@@ -145,7 +152,7 @@ host.initializeRealmBuiltins = (handle, global, wasmCodeGeneration) => {
     cache.set(name, module);
     const script = native.vmCompile('(' + source + ')', 'node:' + name, handle);
     const factory = native.vmRun(script, 0, false);
-    factory(module, module.exports, load);
+    factory(module, module.exports, load, process);
     return module.exports;
   }
   load('internal/error_stack').install(global);
@@ -329,6 +336,7 @@ const kTimerId = Symbol('timerId'), kDue = Symbol('due'), kRefed = Symbol('refed
 const TIMEOUT_MAX = 2147483647;
 let warnedNegativeNumber = false, warnedNotNumber = false;
 function timeoutDuration(after) {
+  if (after === undefined) return 1;
   after *= 1;
   if (!(after >= 1 && after <= TIMEOUT_MAX)) {
     if (after > TIMEOUT_MAX) {
@@ -498,13 +506,10 @@ host.writeText = (fd, text) => {
   return true;
 };
 host.writeStartupDiagnostic = host.stderr.write;
-globalThis.process = { platform: host.platform, env: host.env, nextTick: host.nextTick, emitWarning: value => host.stderr.write(String(value) + '\n') };
+Object.assign(process, { platform: host.platform, env: host.env, nextTick: host.nextTick, emitWarning: value => host.stderr.write(String(value) + '\n') });
+globalThis.process = process;
 const EventEmitter = internalRequire('events');
-// Like Node's, process is an instance of a constructor named process whose
-// prototype inherits from EventEmitter.prototype.
-const ProcessConstructor = { process: function () {} }.process;
 Object.setPrototypeOf(ProcessConstructor.prototype, EventEmitter.prototype);
-const process = Object.create(ProcessConstructor.prototype);
 EventEmitter.call(process);
 defineGlobalAccessor('process', process);
 let startTime = native.runtimeStartTime;

@@ -117,6 +117,8 @@ function inspect(value, options, depth, color) {
         prefix = style(RegExp.prototype.toString.call(v), 'regexp');
       } else if (types.isNativeError(v) || v instanceof Error) {
         prefix = typeof v.stack === 'string' ? v.stack : '[' + Error.prototype.toString.call(v) + ']';
+        // Like Node, an error whose stack has no frames prints in brackets.
+        if (typeof v.stack === 'string' && !v.stack.includes('\n    at')) prefix = '[' + v.stack + ']';
         skip.add('name'); skip.add('message'); skip.add('stack');
         for (const key of ['cause', 'errors']) if (Object.prototype.hasOwnProperty.call(v, key)) entries.push(property(v, key, next, level, false));
         skip.add('cause'); skip.add('errors');
