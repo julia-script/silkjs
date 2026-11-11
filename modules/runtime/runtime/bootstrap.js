@@ -1530,6 +1530,9 @@ globalThis.__silkRuntime = {
     // Whoever kept a noting proxy reaches the environment through it unnoted.
     for (const trap of Object.keys(notes)) delete notes[trap];
     host.env = startupEnvironmentValues; process.env = liveEnvironment;
+    // The warm main script and its dependency are cycles the loader no longer holds;
+    // left in the image, every start would find them (the inspector lists their scripts).
+    rawStd.gc();
   },
   // Starts a process from a heap image: everything the bootstrap took from the
   // process that built the image is taken again from this one.

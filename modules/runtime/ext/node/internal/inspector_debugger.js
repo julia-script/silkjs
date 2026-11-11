@@ -34,7 +34,12 @@ function locationsOnly(locations) {
   for (const location of locations) unique.set(`${location.scriptId}:${location.lineNumber}:${location.columnNumber}`, locationOnly(location));
   return [...unique.values()];
 }
+// Node's resourceNameToUrl: a script named by an absolute path is reported as a file URL.
+function resourceURL(name) {
+  return typeof name === 'string' && name.startsWith('/') ? require('url').pathToFileURL(name).href : name;
+}
 function metadata(script) {
+  script.url = resourceURL(script.url);
   scriptURLs.set(script.scriptId, script.url);
   const context = contexts.fromToken(script.contextToken);
   if (!context) {
@@ -118,8 +123,12 @@ function frames(session, source) {
     return { callFrameId: frame.callFrameId, functionName: frame.functionName, location: locationOnly(frame.location), url: scriptURLs.get(frame.location.scriptId) ?? '', scopeChain, this: session.values.remote(frame.this, 'backtrace', false, false, context) };
   });
 }
+// V8 reports a pause that ends a step (and hits no breakpoint) with reason 'step'.
+let stepping = false;
 function paused(payload) {
   const source = payload.frames || [];
+  const stepped = stepping;
+  stepping = false;
   activePause = payload;
   const startup = startupArmed;
   startupArmed = false;
@@ -146,7 +155,8 @@ function paused(payload) {
       if (data.blackbox.some(pattern => pattern.test(url))) continue;
     }
     delivered = true;
-    session.emit('Debugger.paused', { callFrames: frames(session, source), reason: payload.reason || 'other', hitBreakpoints: hits });
+    const reason = stepped && hits.length === 0 && payload.reason !== 'exception' ? 'step' : payload.reason || 'other';
+    session.emit('Debugger.paused', { callFrames: frames(session, source), reason, hitBreakpoints: hits });
     if (!native(31)) break;
   }
   if (!delivered && !startup && native(31)) { native(27, 0); activePause = undefined; }
@@ -206,8 +216,23 @@ function dispatch(session, method, params) {
           try { breakpoint.regex = new RegExp(params.urlRegex); } catch { throw protocolError(-32602, 'Invalid regular expression'); }
         }
       }
+      // V8 names a URL breakpoint by its target and a script breakpoint by its
+      // resolved location; a second one with the same name is refused.
+      const exists = () => protocolError(-32000, 'Breakpoint at specified location already exists.');
+      if (method === 'Debugger.setBreakpointByUrl') {
+        for (const other of data.breakpoints.values()) {
+          if (other.scriptId === undefined && other.lineNumber === breakpoint.lineNumber && other.columnNumber === breakpoint.columnNumber &&
+            other.url === breakpoint.url && other.scriptHash === breakpoint.scriptHash && other.regex?.source === breakpoint.regex?.source) throw exists();
+        }
+      }
       for (const script of native(21)) if (matches(breakpoint, script)) breakpoint.locations.push(...resolve(breakpoint, script));
       if (method === 'Debugger.setBreakpoint' && !breakpoint.locations.length) throw protocolError(-32000, 'Could not resolve breakpoint');
+      if (method === 'Debugger.setBreakpoint') {
+        const [first] = breakpoint.locations;
+        for (const other of data.breakpoints.values()) {
+          if (other.scriptId !== undefined && other.locations.some(location => location.scriptId === first.scriptId && location.lineNumber === first.lineNumber && location.columnNumber === first.columnNumber)) throw exists();
+        }
+      }
       const id = `${session.id}:${nextBreakpoint++}`;
       data.breakpoints.set(id, breakpoint);
       if (data.active) for (const location of breakpoint.locations) native(24, location.scriptId, location.pc);
@@ -238,6 +263,7 @@ function dispatch(session, method, params) {
       if (params.breakOnAsyncCall || params.skipList || params.terminateOnResume) unsupported(method);
       const mode = { 'Debugger.resume': 0, 'Debugger.stepInto': 1, 'Debugger.stepOver': 2, 'Debugger.stepOut': 3 }[method];
       if (!native(27, mode)) throw protocolError(-32000, 'Can only perform operation while paused.');
+      stepping = mode !== 0;
       resumed(); return {};
     }
     case 'Debugger.evaluateOnCallFrame':

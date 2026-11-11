@@ -25,9 +25,8 @@ const {
   setInterval: pSetInterval,
   setTimeout: pSetTimeout,
 } = require('timers/promises');
-const {
-  AbortController,
-} = require('internal/abort_controller');
+// This runtime's internal/abort_controller holds transfer helpers only.
+const { AbortController } = globalThis;
 
 const {
   ERR_DEBUGGER_ERROR,
