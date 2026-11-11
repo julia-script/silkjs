@@ -1,9 +1,33 @@
 'use strict';
 
 const host = require('internal/host');
-const { formatWithOptions, inspect, stripVTControlCharacters } = require('util');
 const types = require('util/types');
+// The formatter loads with the first value that needs it: text alone does not.
+let util;
+const formatWithOptions = (...args) => (util ||= require('util')).formatWithOptions(...args);
+const inspect = (...args) => (util ||= require('util')).inspect(...args);
+const stripVTControlCharacters = text => (util ||= require('util')).stripVTControlCharacters(text);
+// The process console while its streams are the untouched process streams
+// (internal/stdio direct): _stdout and _stderr are then still its lazy accessors.
+let processConsole;
+const untouched = { _stdout: false, _stderr: false };
+// What formatWithOptions makes of args when every one is a string and the first
+// holds no format specifier: the strings joined by spaces. Undefined otherwise.
+function plainText(args) {
+  if (args.length === 1) return typeof args[0] === 'string' ? args[0] : undefined;
+  if (args.length === 0 || typeof args[0] !== 'string' || args[0].includes('%')) return undefined;
+  for (let i = 1; i < args.length; i++) if (typeof args[i] !== 'string') return undefined;
+  return args.join(' ');
+}
 const inspectorConsole = require('internal/inspector_console');
+// Text for an untouched process stream goes straight to its descriptor.
+function direct(console, fd, name, args) {
+  if (console !== processConsole || !untouched[name]) return false;
+  let text = plainText(args);
+  if (text === undefined) return false;
+  if (console._groupIndent !== '') text = console._groupIndent + text.replace(/\n/g, '\n' + console._groupIndent);
+  return require('internal/stdio').direct(fd, text + '\n');
+}
 function invalid(name, expected) { const error = new TypeError('The "' + name + '" argument must be ' + expected); error.code = 'ERR_INVALID_ARG_TYPE'; return error; }
 function warning(message) {
   if (globalThis.process && typeof process.emitWarning === 'function') process.emitWarning(message);
@@ -66,10 +90,10 @@ class Console {
       if (onError) stream.removeListener('error', onError);
     }
   }
-  log(...args) { this._write(this._stdout, formatWithOptions(this._options(this._stdout), ...args)); }
+  log(...args) { if (!direct(this, 1, '_stdout', args)) this._write(this._stdout, formatWithOptions(this._options(this._stdout), ...args)); }
   info(...args) { this.log(...args); }
   debug(...args) { this.log(...args); }
-  warn(...args) { this._write(this._stderr, formatWithOptions(this._options(this._stderr), ...args)); }
+  warn(...args) { if (!direct(this, 2, '_stderr', args)) this._write(this._stderr, formatWithOptions(this._options(this._stderr), ...args)); }
   error(...args) { this.warn(...args); }
   dir(object, options) { this._write(this._stdout, inspect(object, Object.assign({}, this._options(this._stdout), { customInspect: false }, options))); }
   dirxml(...args) { this.log(...args); }
@@ -144,6 +168,18 @@ class Console {
     this._write(this._stdout, output.join('\n'));
   }
 }
-const instance = new Console({ stdout: host.stdout, stderr: host.stderr });
+// The process console takes its streams on first use: until then process.stdout
+// and process.stderr need not exist, and text prints without them.
+const unopened = { write() {} };
+const instance = new Console({ stdout: unopened, stderr: unopened });
+for (const [name, stream] of [['_stdout', 'stdout'], ['_stderr', 'stderr']]) {
+  const settle = value => {
+    untouched[name] = false;
+    Object.defineProperty(instance, name, { value, writable: true, configurable: true });
+  };
+  untouched[name] = true;
+  Object.defineProperty(instance, name, { configurable: true, get() { settle(host[stream]); return this[name]; }, set: settle });
+}
+processConsole = instance;
 instance.Console = Console;
 module.exports = instance;
