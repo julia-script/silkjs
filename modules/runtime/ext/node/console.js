@@ -36,6 +36,13 @@ const inspect = (...args) => (util ||= require('util')).inspect(...args);
 let width;
 const getStringWidth = text => (width ||= require('internal/readline/width')).getStringWidth(text);
 const inspectorConsole = require('internal/inspector_console');
+// node.console trace events, as Node's console and internal/util/debuglog emit them.
+const kTraceBegin = 98, kTraceEnd = 101, kTraceInstant = 110, kTraceCount = 67;
+let traceEvents;
+function traceConsole(phase, name, data) {
+  traceEvents ||= require('internal/trace_events');
+  traceEvents.trace(phase, 'node,node.console', name, 0, data);
+}
 
 const { codes: { ERR_CONSOLE_WRITABLE_STREAM, ERR_INCOMPATIBLE_OPTION_PAIR }, isStackOverflowError } = require('internal/errors');
 
@@ -378,15 +385,19 @@ const consoleMethods = {
       return;
     }
     this._times.set(label, host.now());
+    traceConsole(kTraceBegin, `time::${label}`);
   },
   timeEnd(label = 'default') {
     label = `${label}`;
+    const found = this._times.has(label);
     timeLogImpl(this, this._times, 'console.timeEnd()', label);
     this._times.delete(label);
+    if (found) traceConsole(kTraceEnd, `time::${label}`);
   },
   timeLog(label = 'default', ...data) {
     label = `${label}`;
     timeLogImpl(this, this._times, 'console.timeLog()', label, data);
+    if (this._times.has(label)) traceConsole(kTraceInstant, `time::${label}`);
   },
   trace: function trace(...args) {
     const err = { name: 'Trace', message: this[kFormatForStderr](args) };
@@ -420,6 +431,7 @@ const consoleMethods = {
     if (count === undefined) count = 1;
     else count++;
     counts.set(label, count);
+    traceConsole(kTraceCount, `count::${label}`, count);
     this.log(`${label}: ${count}`);
   },
   // https://console.spec.whatwg.org/#countreset
@@ -430,6 +442,7 @@ const consoleMethods = {
       return;
     }
     counts.delete(`${label}`);
+    traceConsole(kTraceCount, `count::${label}`, 0);
   },
   group(...data) {
     if (data.length > 0) Reflect.apply(this.log, this, data);

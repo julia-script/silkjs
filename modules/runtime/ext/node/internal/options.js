@@ -281,6 +281,7 @@ function getOptionValue(name) {
     case '--experimental-print-required-tla': return !!host.printRequiredTLA;
     case '--insecure-http-parser': return !!host.insecureHTTPParser;
     case '--max-http-header-size': return host.maxHTTPHeaderSize ?? 16 * 1024;
+    case '--experimental-import-text': return !!host.importText;
     default: return startupControls.getOptionValue(name) ?? require('internal/tls/options').getOptionValue(name);
   }
 }

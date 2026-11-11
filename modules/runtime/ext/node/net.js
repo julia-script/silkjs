@@ -4,6 +4,9 @@ const { Duplex } = require('stream');
 const { EventEmitter } = require('events');
 const { Buffer } = require('buffer');
 const diagnostics = require('internal/host').diagnostics;
+const traceEvents = require('internal/trace_events');
+// node.net.native trace events: a connect request begins with the native connect and ends with its result.
+const kNetTraceCategory = 'node,node.net,node.net.native';
 const { Transport, error: nativeError, native } = require('internal/net/transport');
 
 let defaultAutoSelectFamily = true;
@@ -106,6 +109,7 @@ function Socket(options) {
   this._timeout = null;
   this.timeout = 0;
   this._generation = 0;
+  this._connectTraceId = undefined;
   this._connectTimer = null;
   this._attemptNext = null;
   this._noDelay = options.noDelay;
@@ -176,6 +180,12 @@ Socket.prototype._unrefTimer = function() {
     if (socket._timeout) socket._timeout.refresh();
   }
 };
+Socket.prototype._traceConnectEnd = function() {
+  const id = this._connectTraceId;
+  if (id === undefined) return;
+  this._connectTraceId = undefined;
+  traceEvents.end(kNetTraceCategory, 'connect', id);
+};
 Socket.prototype._onNative = function(type, status, payload) {
   if (type === 6) {
     this._connected = false;
@@ -194,6 +204,7 @@ Socket.prototype._onNative = function(type, status, payload) {
     return;
   }
   if (type === 3) {
+    this._traceConnectEnd();
     if (status < 0) {
       // Like Node's createConnectionError: a given local address and port are in the message.
       const local = this._connectLocal;
@@ -343,6 +354,7 @@ Socket.prototype._final = function(cb) {
   submitted = true;
 };
 Socket.prototype._destroy = function(err, cb) {
+  this._traceConnectEnd();
   ++this._generation;
   this._hadError ||= !!err;
   this.connecting = false;
@@ -443,8 +455,10 @@ Socket.prototype.connect = function(...args) {
       if (!options.path) this.emit('connectionAttempt', address, port, family);
       if (this.destroyed) return;
       if (!options.path && this.blockList?.check(address, `ipv${family}`)) { this._connectionFailed(new ERR_IP_BLOCKED(address)); return; }
+      this._connectTraceId = traceEvents.begin(kNetTraceCategory, 'connect');
       const status = this._transport.call('connect', address, port || 0);
       if (status < 0) {
+        this._traceConnectEnd();
         // Like Node's internalConnect, a TCP connect that fails at once names the local address,
         // which is empty when the socket has none.
         const local = options.path ? undefined : this.address();

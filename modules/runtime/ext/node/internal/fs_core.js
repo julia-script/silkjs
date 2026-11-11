@@ -2,13 +2,16 @@
 const host = require('internal/host');
 const { Buffer } = require('buffer');
 const trace = require('internal/trace_events');
-const os = host.rawOS;
+// fs's view of the os functions. Lookups fall through to host.rawOS, so they see the
+// permission model's wrappers; sync tracing shadows a few with own properties while on.
+const rawOS = host.rawOS;
+const os = Object.create(rawOS);
 const std = host.rawStd;
 // fs.constants as Node builds it (src/node_constants.cc): the names Node exports, in its order,
 // with values from the platform and libuv's own UV_* definitions.
 const constants = (() => {
   const uv = { UV_FS_SYMLINK_DIR: 1, UV_FS_SYMLINK_JUNCTION: 2, UV_DIRENT_UNKNOWN: 0, UV_DIRENT_FILE: 1, UV_DIRENT_DIR: 2, UV_DIRENT_LINK: 3, UV_DIRENT_FIFO: 4, UV_DIRENT_SOCKET: 5, UV_DIRENT_CHAR: 6, UV_DIRENT_BLOCK: 7, UV_FS_O_FILEMAP: 0, UV_FS_O_TEMPORARY: 0, UV_FS_O_SHORT_LIVED: 0, UV_FS_O_SEQUENTIAL: 0, UV_FS_O_RANDOM: 0 };
-  const source = Object.assign({}, os, host.fsConstants, uv);
+  const source = Object.assign({}, rawOS, host.fsConstants, uv);
   const names = ['UV_FS_SYMLINK_DIR', 'UV_FS_SYMLINK_JUNCTION', 'O_RDONLY', 'O_WRONLY', 'O_RDWR', 'UV_DIRENT_UNKNOWN', 'UV_DIRENT_FILE', 'UV_DIRENT_DIR', 'UV_DIRENT_LINK', 'UV_DIRENT_FIFO', 'UV_DIRENT_SOCKET', 'UV_DIRENT_CHAR', 'UV_DIRENT_BLOCK', 'S_IFMT', 'S_IFREG', 'S_IFDIR', 'S_IFCHR', 'S_IFBLK', 'S_IFIFO', 'S_IFLNK', 'S_IFSOCK', 'O_CREAT', 'O_EXCL', 'UV_FS_O_FILEMAP', 'UV_FS_O_TEMPORARY', 'UV_FS_O_SHORT_LIVED', 'UV_FS_O_SEQUENTIAL', 'UV_FS_O_RANDOM', 'O_NOCTTY', 'O_TRUNC', 'O_APPEND', 'O_DIRECTORY', 'O_NOATIME', 'O_NOFOLLOW', 'O_SYNC', 'O_DSYNC', 'O_SYMLINK', 'O_DIRECT', 'O_NONBLOCK', 'S_IRWXU', 'S_IRUSR', 'S_IWUSR', 'S_IXUSR', 'S_IRWXG', 'S_IRGRP', 'S_IWGRP', 'S_IXGRP', 'S_IRWXO', 'S_IROTH', 'S_IWOTH', 'S_IXOTH', 'F_OK', 'R_OK', 'W_OK', 'X_OK', 'UV_FS_COPYFILE_EXCL', 'COPYFILE_EXCL', 'UV_FS_COPYFILE_FICLONE', 'COPYFILE_FICLONE', 'UV_FS_COPYFILE_FICLONE_FORCE', 'COPYFILE_FICLONE_FORCE'];
   const result = Object.create(null);
   for (const name of names) if (typeof source[name] === 'number') result[name] = source[name];
@@ -104,13 +107,30 @@ function syncFlag() { if (constants.O_SYNC === undefined) throw error('ENOSYS', 
 // pread/pwrite receive [fd, ArrayBuffer, absoluteByteOffset, length, position]
 // and preserve the descriptor's current offset. Metadata includes blksize,
 // birthtimeMs and, for bigint requests, exact integer fields and *timeNs.
+const kSyncCategory = 'node,node.fs,node.fs.sync';
+// Node names a sync trace event after its binding call: copyFile is copyfile, scandir readdir.
+const syncNames = { __proto__: null, copyFile: 'copyfile', scandir: 'readdir' };
+function traced(operation, call, self, args) {
+  const name = `fs.sync.${syncNames[operation] ?? operation}`;
+  trace.emit(kSyncCategory, name, 'B');
+  try { return Reflect.apply(call, self, args); }
+  finally { trace.emit(kSyncCategory, name, 'E'); }
+}
 function native(operation, args) {
   if (typeof host.fsSync !== 'function') throw error('ENOSYS', operation, typeof args[0] === 'string' ? args[0] : undefined);
-  if (!trace.enabled('node,node.fs,node.fs.sync')) return host.fsSync(operation, args);
-  trace.emit('node,node.fs,node.fs.sync', `fs.sync.${operation}`, 'B');
-  try { return host.fsSync(operation, args); }
-  finally { trace.emit('node,node.fs,node.fs.sync', `fs.sync.${operation}`, 'E'); }
+  if (!syncTracing) return host.fsSync(operation, args);
+  return traced(operation, host.fsSync, host, [operation, args]);
 }
+// The sync calls fs makes on os directly, traced only while the category is on.
+const tracedOS = ['mkdir', 'read', 'readlink', 'realpath', 'rename', 'symlink', 'utimes', 'write'];
+let syncTracing = false;
+trace.watch(kSyncCategory, on => {
+  syncTracing = on;
+  for (const name of tracedOS) {
+    if (on) os[name] = function (...args) { return traced(name, rawOS[name], rawOS, args); };
+    else delete os[name];
+  }
+});
 function callback(value) { v.validateFunction(value, 'cb'); return value; }
 // Native ownership kinds: callback, Promise, and FileHandle-close respectively.
 const promiseCallbacks = new WeakMap();
@@ -127,6 +147,7 @@ function submit(operation, args, cb, owner = cb) {
   callback(cb);
   if (typeof host.submitIO !== 'function') throw error('ENOSYS', operation);
   const requestKind = promiseCallbacks.get(owner) || 0;
+  if (requestKind === 0 && host.builtinLoaded('internal/permission')) require('internal/permission').checkCallbackFile(operation, args);
   if (!trace.enabled('node,node.fs,node.fs.async')) { host.submitIO(operation, args, cb, requestKind); return; }
   const id = trace.begin('node,node.fs,node.fs.async', operation);
   try {
