@@ -446,6 +446,7 @@ host.writeStartupDiagnostic = host.stderr.write;
 globalThis.process = { platform: host.platform, env: host.env, nextTick: host.nextTick, emitWarning: value => host.stderr.write(String(value) + '\n') };
 const EventEmitter = internalRequire('events');
 const process = new EventEmitter();
+Object.defineProperty(process, Symbol.toStringTag, { enumerable: false, writable: true, configurable: false, value: 'process' });
 defineGlobalAccessor('process', process);
 let startTime = native.runtimeStartTime;
 const performanceMilestones = {
@@ -495,7 +496,7 @@ function buildConfig() {
       cflags: [], default_configuration: native.debugBuild ? 'Debug' : 'Release', defines: [], include_dirs: [], libraries: [],
     },
     variables: {
-      asan: 0, ubsan: 0, napi_build_version: '10', node_builtin_shareable_builtins: [], node_shared: false,
+      asan: 0, ubsan: 0, napi_build_version: '10', node_builtin_shareable_builtins: [], node_module_version: 137, node_shared: false,
       node_shared_openssl: false, node_shared_sqlite: false, node_shared_zstd: false, node_use_amaro: true,
       node_use_openssl: true, node_without_node_options: false, node_quic: false, shlib_suffix: host.platform === 'darwin' ? 'dylib' : 'so',
       single_executable_application: true, icu_small: false, v8_enable_i18n_support: 1, v8_enable_inspector: 1,
@@ -1358,7 +1359,7 @@ const imageModules = ['fs', 'fs/promises', 'internal/fs_streams', 'internal/fs_u
   'events', 'stream', 'stream/promises', 'string_decoder', 'util', 'assert', 'console', 'net', 'tty',
   'internal/tty/write', 'url', 'internal/web/url', 'internal/web/encoding', 'internal/abort_controller'];
 globalThis.__silkRuntime = {
-  normalize(name, parent, attributes) { return loader.resolve(name, parent, 'import', attributes).filename; },
+  normalize(name, parent, attributes) { return loader.resolveImport(name, parent, attributes).filename; },
   load(name, attributes) { return loader.loadESM(name, attributes).source; },
   registerSource(filename, source, metadata) {
     host.registerSource(filename, source, { ...metadata, owner: metadata });

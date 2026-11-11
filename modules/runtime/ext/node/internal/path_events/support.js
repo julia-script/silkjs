@@ -22,6 +22,7 @@
 
 'use strict';
 
+const kIsNodeError = require('internal/host').kIsNodeError;
 function specificType(value) {
   if (value === null) return 'null';
   if (value === undefined) return 'undefined';
@@ -68,14 +69,18 @@ class ERR_INVALID_ARG_TYPE extends TypeError {
       `${other[0].toLowerCase() !== other[0] ? 'an ' : ''}${other[0]}`);
     const argument = name.endsWith(' argument') ? name : `"${name}" ${name.includes('.') ? 'property' : 'argument'}`;
     super(`The ${argument} must be ${descriptions.join(' or ')}. Received ${specificType(value)}`);
+    Object.defineProperty(this, kIsNodeError, { value: true });
     this.code = 'ERR_INVALID_ARG_TYPE';
   }
+  toString() { return `${this.name} [${this.code}]: ${this.message}`; }
 }
 class ERR_UNHANDLED_ERROR extends Error {
   constructor(value) {
     super(value === undefined ? 'Unhandled error.' : `Unhandled error. (${value})`);
+    Object.defineProperty(this, kIsNodeError, { value: true });
     this.code = 'ERR_UNHANDLED_ERROR';
   }
+  toString() { return `${this.name} [${this.code}]: ${this.message}`; }
 }
 class AbortError extends Error {
   constructor(message = 'The operation was aborted', options) {
@@ -136,5 +141,5 @@ module.exports = {
   validateNumber, validateInteger, validateAbortSignal,
   kEmptyObject: Object.freeze(Object.create(null)),
   isWindows: require('internal/host').platform === 'win32',
-  getLazy, spliceOne,
+  getLazy, spliceOne, specificType,
 };

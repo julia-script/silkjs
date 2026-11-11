@@ -60,41 +60,11 @@ function createLoader(host, builtins) {
 
   // Node's own errors: their stack and toString read "Name [CODE]: message". A missing
   // CommonJS module is a plain Error with a code, as in Node.
+  const { codedError, invalidArgType, invalidArgValue } = require('internal/errors');
   function error(code, message, properties) {
-    const result = code === 'ERR_INVALID_ARG_TYPE' || code === 'ERR_INVALID_ARG_VALUE' || code === 'ERR_MISSING_ARGS' ? new TypeError(message) : new Error(message);
-    if (code !== 'MODULE_NOT_FOUND') {
-      Object.defineProperty(result, host.kIsNodeError, { value: true });
-      Object.defineProperty(result, 'toString', { value: nodeErrorString, writable: true, configurable: true });
-    }
-    result.code = code;
-    if (properties) Object.assign(result, properties);
-    return result;
-  }
-  function nodeErrorString() { return `${this.name} [${this.code}]: ${this.message}`; }
-
-  // How Node's ERR_INVALID_ARG_TYPE and ERR_INVALID_ARG_VALUE show the value they got.
-  function received(value) {
-    if (value == null) return String(value);
-    if (typeof value === 'function') return `function ${value.name}`;
-    if (typeof value === 'object') {
-      if (value.constructor && value.constructor.name) return `an instance of ${value.constructor.name}`;
-      return builtins.get('util').inspect(value, { depth: -1 });
-    }
-    let shown = typeof value === 'bigint' ? `${value}n` : typeof value === 'symbol' ? String(value) : value;
-    if (typeof value === 'number' && value === 0 && 1 / value < 0) shown = '-0';
-    if (typeof value === 'string') {
-      if (value.length > 28) value = value.slice(0, 25) + '...';
-      shown = value.includes("'") ? JSON.stringify(value) : `'${value}'`;
-    }
-    return `type ${typeof value} (${shown})`;
-  }
-  function invalidArgType(name, expected, value) {
-    return error('ERR_INVALID_ARG_TYPE', `The "${name}" ${name.includes('.') ? 'property' : 'argument'} must be of type ${expected}. Received ${received(value)}`);
-  }
-  function invalidArgValue(name, value, reason = 'is invalid') {
-    let inspected = builtins.get('util').inspect(value);
-    if (inspected.length > 128) inspected = inspected.slice(0, 128) + '...';
-    return error('ERR_INVALID_ARG_VALUE', `The ${name.includes('.') ? 'property' : 'argument'} '${name}' ${reason}. Received ${inspected}`);
+    if (code === 'MODULE_NOT_FOUND') return Object.assign(new Error(message), { code }, properties);
+    const type = code === 'ERR_INVALID_ARG_TYPE' || code === 'ERR_INVALID_ARG_VALUE' || code === 'ERR_MISSING_ARGS';
+    return codedError(type ? TypeError : Error, code, message, properties);
   }
   // A package's directory as Node's package errors name it.
   const packagePath = pkg => pkg.directory.endsWith(path.sep) ? pkg.directory : pkg.directory + path.sep;
@@ -618,7 +588,7 @@ function createLoader(host, builtins) {
   function defaultResolve(specifier, context) {
     if (context.conditions !== undefined && !Array.isArray(context.conditions)) throw error('ERR_INVALID_ARG_VALUE', 'The property "context.conditions" must be an array');
     const mode = context.conditions && context.conditions.includes('require') ? 'require' : 'import';
-    if (specifier.startsWith('data:')) return { url: specifier, format: dataSource(specifier).format };
+    if (specifier.startsWith('data:')) return { url: specifier, format: dataFormat(specifier) };
     const builtin = builtinName(specifier);
     if (builtin !== null) return { url: 'node:' + builtin, format: 'builtin' };
     if (context.parentURL && !context.parentURL.startsWith('file:') && !/^[A-Za-z][A-Za-z\d+.-]*:/.test(specifier) && !path.isAbsolute(specifier)) {
@@ -739,23 +709,33 @@ function createLoader(host, builtins) {
     return resolve(path.resolve(host.cwd(), filename), undefined, 'require', undefined, undefined, true, hooks.hasAsync());
   }
 
+  // A data: URL's format by its MIME type, as Node reads it: an unknown type has no format,
+  // which the load step reports once the import attributes have been checked.
+  function dataFormat(url) {
+    const match = /^data:([^/]+\/[^;,]+)(?:[^,]*?)(;base64)?,/.exec(url);
+    if (!match) return null;
+    const mime = match[1];
+    return mime === 'text/javascript' || mime === 'application/javascript' ? 'module'
+      : mime === 'application/json' ? 'json' : null;
+  }
   function dataSource(url) {
-    const match = /^data:([^,]*),(.*)$/s.exec(url);
-    if (!match) throw error('ERR_INVALID_URL', `Invalid URL: ${url}`);
-    const mime = match[1].split(';')[0];
-    let kind;
-    if (mime === 'text/javascript' || mime === 'application/javascript') kind = 'module';
-    else if (mime === 'application/json') kind = 'json';
-    else throw error('ERR_UNKNOWN_MODULE_FORMAT', `Unknown module format: ${mime}`);
-    return { format: kind, source: /;base64$/i.test(match[1])
-      ? host.Buffer.from(match[2], 'base64').toString('utf8') : decodeURIComponent(match[2]) };
+    const match = /^data:([^/]+\/[^;,]+)(?:[^,]*?)(;base64)?,([\s\S]*)$/.exec(url);
+    if (!match) throw error('ERR_INVALID_URL', `Invalid URL: ${url}`, { input: url });
+    return { format: dataFormat(url), source: match[2]
+      ? host.Buffer.from(match[3], 'base64').toString('utf8') : decodeURIComponent(match[3]) };
+  }
+  function unknownFormat(format, url) {
+    return error('ERR_UNKNOWN_MODULE_FORMAT', `Unknown module format: ${format} for URL ${url}`);
   }
 
   function defaultLoad(url, context) {
     const data = url.startsWith('data:') ? dataSource(url) : undefined;
     let kind = context.format || (data ? data.format : format(url, context.conditions && context.conditions.includes('require') ? 'require' : 'import'));
     if (!context.conditions || !context.conditions.includes('require')) validateAttributes(kind, url, context.importAttributes || {});
-    if (data) return { ...data, format: kind };
+    if (data) {
+      if (!kind) throw unknownFormat(dataMime(url), url);
+      return { ...data, format: kind };
+    }
     if (kind === 'builtin' || kind === 'addon') return { format: kind, source: null };
     // Node's async default loader leaves CJS execution to the legacy loader.
     // A hook that supplies source opts hook-thread CJS into hook-aware requires.
@@ -1041,7 +1021,7 @@ function createLoader(host, builtins) {
     if (host.reportDependency && path.isAbsolute(filename)) host.reportDependency(filename);
     if (own(cache, filename)) {
       if ((resolved.format === 'module' || detectedModules.has(cache[filename])) && !cache[filename].loaded) {
-        throw error('ERR_REQUIRE_CYCLE_MODULE', `Cannot require() ES Module ${filename} in a cycle`);
+        throw cycleError(filename, parent);
       }
       addChild(parent, cache[filename]);
       return cache[filename].exports;
@@ -1098,6 +1078,33 @@ function createLoader(host, builtins) {
     }
   }
 
+  // The files that required one another down to parent, nearest first (Node's requireStack).
+  function requireStack(parent) {
+    const stack = [];
+    const visited = new Set();
+    for (let current = parent; current && !visited.has(current); current = current.parent) {
+      visited.add(current);
+      if (current.filename) stack.push(current.filename);
+    }
+    return stack;
+  }
+
+  function cycleError(filename, parent) {
+    const from = parent && parent.filename ? ` (from ${parent.filename})` : '';
+    return error('ERR_REQUIRE_CYCLE_MODULE', `Cannot require() ES Module ${filesystemName(filename)} in a cycle.${from}`);
+  }
+
+  function asyncModuleError(filename, parent) {
+    const stack = requireStack(parent);
+    let message = 'require() cannot be used on an ESM graph with top-level await. Use import() instead.';
+    if (!host.printRequiredTLA) message += ' To see where the top-level await comes from, use --experimental-print-required-tla.';
+    message += `\nRequired module: ${filesystemName(filename)}`;
+    if (stack.length) message += '\nRequire stack:\n- ' + stack.join('\n- ');
+    const result = error('ERR_REQUIRE_ASYNC_MODULE', message);
+    Object.defineProperty(result, 'requireStack', { value: stack, writable: true, configurable: true });
+    return result;
+  }
+
   // Node's hint for a CommonJS global used in an ES module.
   function decorateModuleError(cause, filename) {
     if (cause === null || typeof cause !== 'object' || cause.name !== 'ReferenceError') return cause;
@@ -1137,7 +1144,11 @@ function createLoader(host, builtins) {
     if (!requireModuleEnabled()) throw requireESMError(filename, module.parent);
     let namespace;
     try { namespace = host.requireModule(filename); }
-    catch (cause) { throw decorateModuleError(cause, filename); }
+    catch (cause) {
+      if (cause !== null && typeof cause === 'object' && cause.code === 'ERR_REQUIRE_ASYNC_MODULE') throw asyncModuleError(filename, module.parent);
+      if (cause !== null && typeof cause === 'object' && cause.code === 'ERR_REQUIRE_CYCLE_MODULE') throw cycleError(filename, module.parent);
+      throw decorateModuleError(cause, filename);
+    }
     if (own(namespace, 'module.exports')) module.exports = namespace['module.exports'];
     else if (own(namespace, 'default') && !own(namespace, '__esModule')) {
       // As in Node, a facade module re-exports the namespace with __esModule added, so
@@ -1284,7 +1295,7 @@ function createLoader(host, builtins) {
     const mock = mockInstances.get(filename);
     if (mock) return mockESM(filename, mock);
     const resolved = resolutions.get(filename) || { filename,
-      format: filename.startsWith('data:') ? dataSource(filename).format : format(filename, 'import') };
+      format: filename.startsWith('data:') ? dataFormat(filename) : format(filename, 'import') };
     attributes = resolved.importAttributes || attributes || {};
     const loaded = pendingLoads.get(filename) || loadSource(resolved, attributes);
     pendingLoads.delete(filename);
@@ -1292,17 +1303,32 @@ function createLoader(host, builtins) {
     return finishESM(resolved, loaded, attributes);
   }
 
+  // Node's validateAttributes: the "type" each format needs, none for code formats, and
+  // nothing checked for a format Node does not know.
+  const implicitType = { builtin: true, commonjs: true, module: true, wasm: true, 'commonjs-typescript': true, 'module-typescript': true };
   function validateAttributes(kind, url, attributes) {
     for (let i12 = 0, a12 = Object.keys(attributes); i12 < a12.length; i12++) { const key = a12[i12];
-      if (key !== 'type') throw error('ERR_IMPORT_ATTRIBUTE_UNSUPPORTED', `Import attribute "${key}" with value "${attributes[key]}" is not supported`);
+      if (key !== 'type') throw error('ERR_IMPORT_ATTRIBUTE_UNSUPPORTED', `Import attribute "${key}" with value "${attributes[key]}" is not supported in ${url}`);
     }
-    if (kind === 'json') {
-      if (!own(attributes, 'type')) throw error('ERR_IMPORT_ATTRIBUTE_MISSING', `Module "${url}" needs an import attribute of "type: json"`);
-      if (attributes.type !== 'json') throw error('ERR_IMPORT_ATTRIBUTE_UNSUPPORTED', `Import attribute "type" with value "${attributes.type}" is not supported`);
-    } else if (own(attributes, 'type')) {
-      if (attributes.type === 'json') throw error('ERR_IMPORT_ATTRIBUTE_TYPE_INCOMPATIBLE', `Module "${url}" is not of type "json"`);
-      throw error('ERR_IMPORT_ATTRIBUTE_UNSUPPORTED', `Import attribute "type" with value "${attributes.type}" is not supported`);
-    }
+    const expected = kind === 'json' ? 'json' : kind === 'text' ? 'text' : own(implicitType, kind) ? null : undefined;
+    if (expected === undefined) return;
+    if (expected === null ? attributes.type === undefined : attributes.type === expected) return;
+    if (expected !== null && !own(attributes, 'type')) throw error('ERR_IMPORT_ATTRIBUTE_MISSING', `Module "${url}" needs an import attribute of "type: ${expected}"`);
+    const type = attributes.type;
+    if (typeof type !== 'string') throw invalidArgType('importAttributes.type', 'string', type);
+    if (type === 'json' || (type === 'text' && host.importText)) throw error('ERR_IMPORT_ATTRIBUTE_TYPE_INCOMPATIBLE', `Module "${url}" is not of type "${type}"`);
+    throw error('ERR_IMPORT_ATTRIBUTE_UNSUPPORTED', `Import attribute "type" with value "${type}" is not supported in ${url}`);
+  }
+  function dataMime(url) {
+    const match = /^data:([^/]+\/[^;,]+)/.exec(url);
+    return match ? match[1] : url.slice(5, url.indexOf(','));
+  }
+  // An import request's attributes against what its module turned out to be: each request
+  // is checked, also for a module an earlier request loaded.
+  function resolveImport(specifier, parent, attributes) {
+    const resolved = resolve(specifier, parent, 'import', attributes);
+    if (resolved.format && !hooks.active()) validateAttributes(resolved.format, asURL(resolved.filename), attributes || {});
+    return resolved;
   }
 
   function finishESM(resolved, loaded, attributes) {
@@ -1326,7 +1352,7 @@ function createLoader(host, builtins) {
     return { source, format: resolved.format, filename: resolved.filename };
   }
 
-  return { decorateModuleError, requireFor, runMain, warmMain, resolve, resolveMain, loadESM, cleanSource, prepareSource, bridge, Module, mockModule };
+  return { decorateModuleError, resolveImport, requireFor, runMain, warmMain, resolve, resolveMain, loadESM, cleanSource, prepareSource, bridge, Module, mockModule };
 }
 
 module.exports = { createLoader };
