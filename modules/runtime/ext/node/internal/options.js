@@ -93,6 +93,99 @@ function normalizeOption(arg) {
   return name + arg.slice(separator);
 }
 
+const table = require('internal/options_table');
+function impliedBy(name) {
+  const implied = [];
+  for (const [from, to] of table.implications) if (from === name && to.startsWith('--')) implied.push(to);
+  return implied;
+}
+// Node's OptionsParser::Parse (src/node_options-inl.h) over the option table of
+// the reference release. Each entry is { name, type, value, negated, raw }, with
+// name canonical (aliases expanded, `_` read as `-`, `--no-` removed), type from
+// the table (undefined for an option Node passes to V8 unknown), raw the
+// argument as written and implied set for an option another one implies.
+// execArgv holds the arguments taken from args as written, without `--`, and
+// index is where the script and its arguments start.
+function parseArguments(args, inEnvironment) {
+  const entries = [], execArgv = [], synthetic = [];
+  let index = 0, error;
+  const empty = () => synthetic.length === 0 && index >= args.length;
+  const first = () => synthetic.length !== 0 ? synthetic[0] : args[index];
+  const pop = () => {
+    if (synthetic.length !== 0) return synthetic.shift();
+    const arg = args[index++];
+    if (arg !== '--') execArgv.push(arg);
+    return arg;
+  };
+  while (!empty() && error === undefined) {
+    const next = first();
+    if (next.length <= 1 || next[0] !== '-') break;
+    const arg = pop();
+    if (arg === '--') {
+      if (inEnvironment) error = '-- is not allowed in NODE_OPTIONS';
+      break;
+    }
+    // Only options with two dashes take --name=value.
+    const equals = arg[1] === '-' ? arg.indexOf('=') : -1;
+    let name = equals < 0 ? arg : arg.slice(0, equals);
+    const originalName = equals < 0 ? name : name + '=';
+    name = name.slice(0, 2) + name.slice(2).replace(/_/g, '-');
+    let negated = false;
+    if (name.startsWith('--no-')) {
+      name = '--' + name.slice(5);
+      negated = true;
+    }
+    for (;;) {
+      let expansion = table.aliases.get(name);
+      if (expansion === undefined && equals >= 0) expansion = table.aliases.get(name + '=');
+      if (expansion === undefined && !empty() && first() !== '' && first()[0] !== '-') expansion = table.aliases.get(name + ' <arg>');
+      if (expansion === undefined) break;
+      const previous = name;
+      name = expansion[0];
+      synthetic.unshift(...expansion.slice(1));
+      if (name === previous) break;
+    }
+    const info = table.options.get(name);
+    if ((info === undefined || !info[1]) && inEnvironment) {
+      error = `${originalName} is not allowed in NODE_OPTIONS`;
+      break;
+    }
+    if (!negated) for (const implied of impliedBy(name)) {
+      const target = table.options.get(implied);
+      if (target) entries.push({ name: implied, type: target[0], value: true, negated: false, raw: implied, implied: true });
+    }
+    if (info === undefined) {
+      entries.push({ name, type: undefined, value: undefined, negated, raw: arg });
+      continue;
+    }
+    const type = info[0];
+    // Some V8 options can be negated: V8 validates them.
+    if (negated && type !== 'Boolean' && type !== 'V8Option') {
+      error = `${arg} is an invalid negation because it is not a boolean option`;
+      break;
+    }
+    let value;
+    if (type !== 'Boolean' && type !== 'NoOp' && type !== 'V8Option') {
+      // --run alone lists the package scripts: it does not take a later flag.
+      const optional = name === '--run';
+      value = '';
+      if (equals >= 0) {
+        value = arg.slice(equals + 1);
+        if (value === '' && !optional) { error = `${originalName} requires an argument`; break; }
+      } else if (empty() || (optional && first()[0] === '-')) {
+        if (!optional) { error = `${originalName} requires an argument`; break; }
+      } else {
+        value = pop();
+        if (value !== '' && value[0] === '-') { error = `${originalName} requires an argument`; break; }
+        // \- escapes a leading dash.
+        if (value[0] === '\\' && value[1] === '-') value = value.slice(1);
+      }
+    }
+    entries.push({ name, type, value: type === 'Boolean' ? !negated : value, negated, raw: arg });
+  }
+  return { entries, execArgv, index, error };
+}
+
 function report(error, errors) {
   if (errors) errors.push(error);
   else throw error;
@@ -122,47 +215,13 @@ function parseEnvironment(value, errors) {
   return result;
 }
 
+// NODE_OPTIONS as parsed: the number of leading arguments that are options.
 function validateEnvironment(args, errors) {
   if (errors?.length) return 0;
-  for (let index = 0; index < args.length; index++) {
-    const start = index;
-    const arg = normalizeOption(args[index]), separator = arg.indexOf('=');
-    if (arg.length <= 1 || arg[0] !== '-') return start;
-    const name = separator < 0 ? arg : arg.slice(0, separator);
-    if (!environmentOptions.has(name) || (separator >= 0 && name[1] !== '-')) {
-      report(new Error((name[1] !== '-' ? arg : args[index].includes('=') ? name + '=' : name) + ' is not allowed in NODE_OPTIONS'), errors);
-      return start;
-    }
-    if (inspectorEnableOptions.has(name)) {
-      if (separator >= 0) {
-        try { inspectorAddress(arg.slice(separator + 1)); }
-        catch (error) { report(error, errors); return start; }
-      }
-      continue;
-    }
-    if (!environmentOptions.get(name)) {
-      if (separator >= 0) {
-        report(new Error('invalid value for ' + name), errors);
-        return start;
-      }
-    } else {
-      const value = separator < 0 ? args[++index] : arg.slice(separator + 1);
-      if (value === undefined || ((['--localstorage-file', '-r', '--require', '--import', '-C', '--conditions', '--watch-path', '--watch-kill-signal'].includes(name) || reportOptions.isValueOption(name) || permission.isValueOption(name)) && value === '') || (separator < 0 && value.startsWith('-'))) {
-        report(new Error(name + ' requires an argument'), errors);
-        return start;
-      } else if (name === '--input-type' && !['commonjs', 'module', 'commonjs-typescript', 'module-typescript'].includes(value)) {
-        report(new Error('--input-type must be "module", "commonjs", "module-typescript" or "commonjs-typescript"'), errors);
-        return start;
-      }
-      if (isInspectorValueOption(name)) {
-        try { inspectorAddress(value); }
-        catch (error) { report(error, errors); return start; }
-      }
-      const error = startupControls.valueError(name, value);
-      if (error) { report(new Error(error), errors); return start; }
-    }
-  }
-  return args.length;
+  const parsed = parseArguments(args, true);
+  if (parsed.error === undefined) return parsed.index;
+  report(new Error(parsed.error), errors);
+  return 0;
 }
 
 const workerOptions = new Map([
@@ -273,9 +332,29 @@ function getOptionValue(name) {
   }
 }
 
+// Node's process.allowedNodeEnvironmentFlags (lib/internal/process/per_thread.js).
 function buildAllowedFlags() {
-  // V8 accepts --no-expose-gc but only advertises its positive flag.
-  const array = [...environmentOptions.keys()].filter(name => name !== '--no-expose-gc');
+  const array = [];
+  for (const [name, [type, allowed]] of table.options) {
+    // Bracketed names are internal parser targets for aliases, not flags.
+    if (!allowed || name[0] === '[') continue;
+    array.push(name);
+    if (type === 'Boolean') array.push('--no-' + name.slice(2));
+  }
+  const accepted = to => {
+    if (!to.startsWith('-') || to === '--') return true;
+    const expansion = table.aliases.get(to);
+    if (expansion) return (expansion[0] === to ? expansion.slice(1) : expansion).every(accepted);
+    return table.options.get(to)?.[1] === true;
+  };
+  for (const [from, expansion] of table.aliases) {
+    if (!expansion.every(accepted)) continue;
+    let canonical = from;
+    if (canonical.endsWith('=')) canonical = canonical.slice(0, -1);
+    if (canonical.endsWith(' <arg>')) canonical = canonical.slice(0, -6);
+    array.push(canonical);
+  }
+  // has() takes a flag with or without its dashes, `_` for `-` and an =value.
   const names = new Set(array);
   const undashed = new Set(array.map(name => name.replace(/^-+/, '')));
   // Keep the actual Set storage empty, as Node does: even borrowed intrinsic
@@ -303,4 +382,4 @@ function buildAllowedFlags() {
   return Object.freeze(new NodeEnvironmentFlagsSet());
 }
 
-module.exports = { normalizeOption, parseEnvironment, validateEnvironment, validateWorker, processOption, getOptionValue, environmentFiles, loaderWorkerArguments, buildAllowedFlags, applyInspectorOption, isInspectorValueOption };
+module.exports = { parseArguments, normalizeOption, parseEnvironment, validateEnvironment, validateWorker, processOption, getOptionValue, environmentFiles, loaderWorkerArguments, buildAllowedFlags, applyInspectorOption, isInspectorValueOption };
