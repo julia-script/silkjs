@@ -12,6 +12,7 @@ const observers = new Set();
 const pending = new Set();
 const enqueueObserver = Symbol('enqueue');
 const deliverObserver = Symbol('deliver');
+const observesType = Symbol('observesType');
 const reservedMarks = new Set(['nodeStart', 'v8Start', 'environment', 'loopStart', 'loopExit', 'bootstrapComplete']);
 const supportedTypes = Object.freeze([...new Set(['function', 'mark', 'measure', 'resource', ...(host.performanceObserverTypes || [])])].sort());
 const previousPerformance = globalThis.performance;
@@ -200,6 +201,7 @@ class PerformanceObserver {
     this.#records.push(entry); pending.add(this); scheduleDelivery();
   }
   [deliverObserver]() { this.#callback(new PerformanceObserverEntryList(token, this.takeRecords()), this); }
+  static [observesType](observer, type) { return observer.#types.has(type); }
 }
 function getMark(value) {
   if (value === undefined) return undefined;
@@ -327,14 +329,20 @@ for (const Constructor of [Performance, PerformanceEntry, PerformanceMark, Perfo
   PerformanceObserver, PerformanceObserverEntryList, PerformanceNodeTiming]) {
   Object.defineProperty(Constructor.prototype, Symbol.toStringTag, { value: Constructor.name, configurable: true });
 }
-if (typeof host.performanceSetObserverCallback === 'function') host.performanceSetObserverCallback((name, type, start, duration, detail) => {
+// A Node entry (http, dns, net, ...) made by a builtin module or by the host.
+function enqueueNodeEntry(name, type, start, duration, detail) {
   if (!supportedTypes.includes(type)) return;
   const entry = new PerformanceNodeEntry(token, name, type, start, duration, detail);
   if (detail && typeof detail === 'object') for (const key of Object.keys(detail)) {
     if (!(key in entry)) Object.defineProperty(entry, key, { enumerable: true, configurable: true, get: () => detail[key] });
   }
   enqueue(entry);
-});
+}
+if (typeof host.performanceSetObserverCallback === 'function') host.performanceSetObserverCallback(enqueueNodeEntry);
+function hasObserver(type) {
+  for (const observer of observers) if (PerformanceObserver[observesType](observer, type)) return true;
+  return false;
+}
 const constants = Object.freeze({
   NODE_PERFORMANCE_GC_MAJOR: 4, NODE_PERFORMANCE_GC_MINOR: 1, NODE_PERFORMANCE_GC_INCREMENTAL: 8, NODE_PERFORMANCE_GC_WEAKCB: 16,
   NODE_PERFORMANCE_GC_FLAGS_NO: 0, NODE_PERFORMANCE_GC_FLAGS_CONSTRUCT_RETAINED: 2, NODE_PERFORMANCE_GC_FLAGS_FORCED: 4,
@@ -344,3 +352,9 @@ const constants = Object.freeze({
 module.exports = { Performance, PerformanceEntry, PerformanceMark, PerformanceMeasure, PerformanceObserver, PerformanceObserverEntryList,
   PerformanceResourceTiming, monitorEventLoopDelay, createHistogram, createSlidingWindowHistogram, importHistogram,
   eventLoopUtilization, timerify, performance, constants };
+// Hooks for internal/perf/observe (builtin modules that report Node entries).
+Object.defineProperties(module.exports, {
+  _hasObserver: { value: hasObserver },
+  _enqueueNodeEntry: { value: enqueueNodeEntry },
+  _now: { value: now },
+});

@@ -168,7 +168,7 @@ Socket.prototype._onNative = function(type, status, payload) {
       this._refreshTimeout();
     }
     const consumer = this._streamConsumers?.[this._streamConsumers.length - 1];
-    if (consumer) { consumer.read(status, payload); return; }
+    if (consumer && consumer.read(status, payload) !== false) return;
     if (status === -4095) {
       this._readEOF = true;
       // Match Node's onStreamRead: read(0) schedules end for an empty,
@@ -274,7 +274,9 @@ Socket.prototype._connectionFailed = function(err) {
   else this.destroy(err);
 };
 Socket.prototype.connect = function(...args) {
-  const [options, cb] = normalizeArgs(args);
+  let [options, cb] = normalizeArgs(args);
+  // Like Node, an empty or null path means a TCP connection (http's Agent passes path: null).
+  if (!options.path && options.path !== undefined) { options = { ...options }; delete options.path; }
   if (this.connecting || this._connected) throw fail('ERR_SOCKET_IS_CONNECTED', 'Socket is already connected');
   if (this._transport?.closing) throw fail('ERR_SOCKET_CLOSED', 'Socket is still closing');
   if (options.path === undefined && options.port === undefined) throw fail('ERR_MISSING_ARGS', 'The "options" or "port" or "path" argument must be specified');
