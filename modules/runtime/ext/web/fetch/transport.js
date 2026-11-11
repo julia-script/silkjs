@@ -196,7 +196,7 @@ function dispatch(record, timing, dispatcher) {
         cancel(reason) { cancelled = true; streamDone = true; removeAbort(); stop(reason); },
       });
       const responseURL = new URL(record.url); responseURL.hash = '';
-      const result = makeResponse({ status: response.statusCode, statusText: response.statusMessage, headers: immutable(responseHeaders), body: stream ? { stream, source: null, length: null, type: null, used: false } : null, type: 'basic', url: responseURL.href, redirected: false, immutable: true });
+      const result = makeResponse({ status: response.statusCode, statusText: response.statusMessage, headers: immutable(responseHeaders), body: stream ? require('internal/web/fetch/body').streamBody(stream) : null, type: 'basic', url: responseURL.href, redirected: false, immutable: true });
       const completion = new Promise(done => {
         source.once('end', () => done(true));
         source.once('error', () => done(false));
