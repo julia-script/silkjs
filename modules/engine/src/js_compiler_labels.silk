@@ -67,7 +67,7 @@ effect fn resolveInstruction(fd: &mut FunctionDef, table: &mut AtomTable, bytes:
   let code = bytes[pos]
   let length = u8.toI32(op.opcodeInfo(code, false).size)
   let mut next = position + length
-  if code == op.OP_line_num { line.* = signedWord(readU32(bytes, pos + 1)) return next }
+  if code == op.OP_line_num { line.* = signedWord(readU32(bytes, pos + 1)) fd.lineEnd = next return next }
   if code == op.OP_label { resolveLabel(&mut fd, &mut out, signedWord(readU32(bytes, pos + 1))) return next }
   // Debug compilation preserves instruction/lexical boundaries. Ordinary
   // compilation keeps the existing peepholes and QuickJS byte-for-byte output.
@@ -278,6 +278,11 @@ effect fn resolveInstruction(fd: &mut FunctionDef, table: &mut AtomTable, bytes:
     if index < 256 {
       // `heap[(x + k) >> s]`: the prefix goes first, then every instruction
       // as it would be without it (the read below, add_imm, sar_imm, get_array_el).
+      // `a[i] = v;` on slots and small constants: the store prefix.
+      if index < 128 && index != fd.argumentsVarIndex {
+        let stored = run slotStore(&mut fd, &mut out, &mut cc, bytes, &mut line, code, index, next)
+        if stored >= 0 { return stored }
+      }
       // A loop's last test, with its step: the slot compare prefix.
       if index != fd.argumentsVarIndex {
         let compared = run slotCompare(&mut fd, &mut out, &mut cc, bytes, &mut line, code, index, next)
@@ -407,6 +412,10 @@ effect fn resolveInstruction(fd: &mut FunctionDef, table: &mut AtomTable, bytes:
     if code == op.OP_get_arg && index < 256 && argumentElementRead(&mut cc, bytes, next) {
       matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
       run out.append(op.OP_get_arg_el_arg8) run out.append(i32.toU8(index)) run out.append(i32.toU8(cc.index)) return cc.position
+    }
+    if code == op.OP_get_arg && index < 4 {
+      let stored = run slotStore(&mut fd, &mut out, &mut cc, bytes, &mut line, code, index, next)
+      if stored >= 0 { return stored }
     }
     if code == op.OP_get_arg && index < 256 {
       let compared = run slotCompare(&mut fd, &mut out, &mut cc, bytes, &mut line, code, index, next)
@@ -755,6 +764,12 @@ effect fn slotCompare(fd: &mut FunctionDef, out: &mut ByteBuffer, cc: &mut CodeC
   if !matchCode(&mut cc, bytes, end, &[opcode(op.OP_if_true), -1]) { return -1 }
   let top = fd.labels.get(i32.toUsize(cc.label)).address
   if top < 0 || top - usize.toI32(out.length()) - 1 < -112 { return -1 }
+  // The prefix, the covered instructions and the short branch.
+  let mut size: i32 = 8 + readSize(code, index)
+  if step >= 0 { size = 11 }
+  if (mode & 12) == 12 { size = size + 3 } else if (mode & 8) != 0 { size = size + 2 if right >= 0 && right <= 1 { size = size - 1 } }
+  else { size = size + readSize(rightCode, right) }
+  if !prefixRoom(&fd.*, next - 3, cc.position, size) { return -1 }
   let prefix = out.length()
   let immediate = right
   run out.append(op.OP_fuse_prefix) run out.writeU32(0)
@@ -772,6 +787,76 @@ effect fn slotCompare(fd: &mut FunctionDef, out: &mut ByteBuffer, cc: &mut CodeC
   let covered = out.length() - start
   out.set(prefix + 3, u32.toU8(unsignedWord(right) & 255)) out.set(prefix + 4, 0x88)
   fd.loopCompareEnd = usize.toI32(out.length()) fd.loopCompareSpan = usize.toI32(covered) + 4
+  line.* = seen
+  return end
+}
+/// Whether final bytes fit in the pre-label code from start to end, counting
+/// a line number right before start: short forward branches are sized from
+/// pre-label distances, so a fusion prefix may not make the code longer.
+fn prefixRoom(fd: &FunctionDef, start: i32, end: i32, final: i32) -> bool {
+  let mut room = end - start
+  if fd.lineEnd == start { room = room + 5 }
+  return final <= room
+}
+/// The final size of the read of a local or an argument.
+fn readSize(code: u8, index: i32) -> i32 {
+  if index < 4 { return 1 }
+  if code == op.OP_get_arg { return 3 }
+  return 2
+}
+/// `a[i] = v;` after the read of a (a local below 128 or one of the first four
+/// arguments): an index that is a local below 128 or a constant 0 to 127, a
+/// value that is a local below 64, one of the first four arguments or a
+/// constant 0 to 63, then put_array_el. Writes the fusion prefix (0x89 in its
+/// last operand byte, plus 1 for an argument array and 2 for an argument
+/// value; the layout is in js_vm's arm) and the four instructions in fixed
+/// forms. Returns the position after them, or -1.
+effect fn slotStore(fd: &mut FunctionDef, out: &mut ByteBuffer, cc: &mut CodeContext, bytes: &[u8], line: &mut i32,
+  code: u8, index: i32, next: i32) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  let mut seen = line.*
+  let mut key: i32 = 0 let mut keyLocal = false
+  if matchCode(&mut cc, bytes, next, &[opcode(op.OP_get_loc), -1, -1]) {
+    key = cc.index keyLocal = true
+    if key >= 128 || key == fd.argumentsVarIndex { return -1 }
+  } else if matchCode(&mut cc, bytes, next, &[opcode(op.OP_push_i32), -1]) {
+    key = cc.label
+    if key < 0 || key > 127 { return -1 }
+  } else { return -1 }
+  let mut at = cc.position matchedLine(&cc, &mut seen)
+  let mut value: i32 = 0 let mut kind: i32 = 0
+  if matchCode(&mut cc, bytes, at, &[opcode(op.OP_get_loc), -1, -1]) {
+    value = cc.index
+    if value >= 64 || value == fd.argumentsVarIndex { return -1 }
+  } else if matchCode(&mut cc, bytes, at, &[opcode(op.OP_get_arg), -1, -1]) {
+    value = cc.index kind = 1
+    if value >= 4 { return -1 }
+  } else if matchCode(&mut cc, bytes, at, &[opcode(op.OP_push_i32), -1]) {
+    value = cc.label kind = 2
+    if value < 0 || value > 63 { return -1 }
+  } else { return -1 }
+  at = cc.position matchedLine(&cc, &mut seen)
+  if !matchCode(&mut cc, bytes, at, &[opcode(op.OP_put_array_el), -1]) { return -1 }
+  matchedLine(&cc, &mut seen)
+  let end = cc.position
+  // Fixed forms: every shape has one byte count, so the VM moves on by a
+  // constant (a count read from the prefix would put a load between each
+  // store's ip and the next one's).
+  let mut shape: i32 = 0 if code == op.OP_get_arg { shape = 1 }
+  if kind == 1 { shape = shape + 2 }
+  let mut covered: i32 = 7 if code == op.OP_get_arg { covered = covered - 1 }
+  if kind == 1 { covered = covered - 1 }
+  if !prefixRoom(&fd.*, next - 3, end, 5 + covered) { return -1 }
+  let mut first = index if code == op.OP_get_arg { first = first + 128 }
+  let mut second = key if keyLocal { second = second + 128 }
+  run out.append(op.OP_fuse_prefix) run out.append(i32.toU8(first)) run out.append(i32.toU8(second))
+  run out.append(i32.toU8(value + kind * 64)) run out.append(i32.toU8(0x89 + shape))
+  run addPosition(&mut fd, &out.*, line.*)
+  if code == op.OP_get_arg { run putShortCode(&mut out, code, index) } else { run out.append(op.OP_get_loc8) run out.append(i32.toU8(index)) }
+  if keyLocal { run out.append(op.OP_get_loc8) run out.append(i32.toU8(key)) } else { run out.append(op.OP_push_i8) run out.append(i32.toU8(key)) }
+  if kind == 0 { run out.append(op.OP_get_loc8) run out.append(i32.toU8(value)) }
+  else if kind == 1 { run putShortCode(&mut out, op.OP_get_arg, value) }
+  else { run out.append(op.OP_push_i8) run out.append(i32.toU8(value)) }
+  run out.append(op.OP_put_array_el)
   line.* = seen
   return end
 }

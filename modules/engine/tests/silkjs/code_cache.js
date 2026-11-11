@@ -35,10 +35,11 @@ var lib = (function () {
       default: return 0;
     }
   }
-  // The prefixes of a comparison before a branch and of a loop's last test
-  // name their operands again; a decoded copy is checked against them.
+  // The prefixes of a comparison before a branch, of a loop's last test and
+  // of a store on slots name their operands again; a decoded copy is checked against them.
   function loops(n, m) {
-    var c = 0, i, j = n;
+    var c = 0, i, j = n, t = [0, 0];
+    t[1] = m; t[0] = 5; t[c] = t;
     for (i = 0; i < n; i++) c += i;
     while (j-- > 0) c++;
     for (i = 0; i < 300; i++) if (i < m) c++;
