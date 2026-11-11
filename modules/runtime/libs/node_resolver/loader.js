@@ -23,6 +23,10 @@ function createLoader(host, builtins) {
   const stat = host.moduleStat;
   // Package files already read, by directory. As in Node, one is read once.
   const packages = new Map();
+  // The package scope of a directory, and the node_modules lookup paths of one (callers
+  // get a copy). Permissions are fixed once a program runs, so the walks give the same
+  // answer every time.
+  const scopes = new Map(), lookupPaths = new Map();
   // The source format() read to tell a module from a script, for the load that follows.
   let probed = null;
   const cache = Object.create(null);
@@ -128,7 +132,13 @@ function createLoader(host, builtins) {
   }
 
   function packageScope(filename) {
-    let directory = path.dirname(filesystemName(filename));
+    const start = path.dirname(filesystemName(filename));
+    let scope = scopes.get(start);
+    if (scope === undefined) scopes.set(start, scope = findScope(start));
+    return scope;
+  }
+
+  function findScope(directory) {
     for (;;) {
       if (path.basename(directory) === 'node_modules') return null;
       if (typeof host.canReadModulePath === 'function' && !host.canReadModulePath(directory)) return null;
@@ -141,14 +151,19 @@ function createLoader(host, builtins) {
   }
 
   function modulePaths(directory) {
-    const result = [];
     directory = path.resolve(directory);
-    for (;;) {
-      if (path.basename(directory) !== 'node_modules') result.push(path.join(directory, 'node_modules'));
-      const next = path.dirname(directory);
-      if (next === directory) return result;
-      directory = next;
+    let result = lookupPaths.get(directory);
+    if (result === undefined) {
+      result = [];
+      for (let current = directory; ;) {
+        if (path.basename(current) !== 'node_modules') result.push(path.join(current, 'node_modules'));
+        const next = path.dirname(current);
+        if (next === current) break;
+        current = next;
+      }
+      lookupPaths.set(directory, result);
     }
+    return result.slice();
   }
 
   function builtinName(specifier) {
@@ -976,10 +991,13 @@ function createLoader(host, builtins) {
   function warmMain(filename) {
     const modules = new Set(Object.keys(cache)), directories = new Set(packages.keys());
     const resolved = new Set(resolutions.keys()), previous = main;
+    const scoped = new Set(scopes.keys()), looked = new Set(lookupPaths.keys());
     try { runMain(filename); }
     finally {
       for (const key of Object.keys(cache)) if (!modules.has(key)) delete cache[key];
       for (const key of [...packages.keys()]) if (!directories.has(key)) packages.delete(key);
+      for (const key of [...scopes.keys()]) if (!scoped.has(key)) scopes.delete(key);
+      for (const key of [...lookupPaths.keys()]) if (!looked.has(key)) lookupPaths.delete(key);
       for (const key of [...resolutions.keys()]) if (!resolved.has(key)) resolutions.delete(key);
       main = previous;
       probed = null;

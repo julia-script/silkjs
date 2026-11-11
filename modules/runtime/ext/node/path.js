@@ -30,6 +30,7 @@ const {
   ArrayPrototypePush,
   ArrayPrototypeSlice,
   FunctionPrototypeBind,
+  RegExpPrototypeExec,
   StringPrototypeCharCodeAt,
   StringPrototypeIncludes,
   StringPrototypeIndexOf,
@@ -91,8 +92,21 @@ function isWindowsDeviceRoot(code) {
          (code >= CHAR_LOWERCASE_A && code <= CHAR_LOWERCASE_Z);
 }
 
+// A POSIX path with no empty or .. segment normalizes to itself with its . segments
+// dropped, less one leading and one trailing separator. Most paths a program passes
+// are like that (a resolved './x' among them), and this is much cheaper than the walk
+// below.
+const unnormalizedPosix = /\/\/|(?:^|\/)\.\.(?:\/|$)/;
+const dotSegments = /(?:^|\/)\.(?=\/|$)/g;
+
 // Resolves . and .. elements in a path with directory names
 function normalizeString(path, allowAboveRoot, separator, isPathSeparator) {
+  if (isPathSeparator === isPosixPathSeparator && !RegExpPrototypeExec(unnormalizedPosix, path)) {
+    path = StringPrototypeReplace(path, dotSegments, '');
+    const start = StringPrototypeCharCodeAt(path, 0) === CHAR_FORWARD_SLASH ? 1 : 0;
+    const end = path.length > start && StringPrototypeCharCodeAt(path, path.length - 1) === CHAR_FORWARD_SLASH ? path.length - 1 : path.length;
+    return start === 0 && end === path.length ? path : StringPrototypeSlice(path, start, end);
+  }
   let res = '';
   let lastSegmentLength = 0;
   let lastSlash = -1;
@@ -1257,7 +1271,7 @@ const posix = {
 
     for (let i = args.length - 1; i >= 0 && !resolvedAbsolute; i--) {
       const path = args[i];
-      validateString(path, `paths[${i}]`);
+      if (typeof path !== 'string') validateString(path, `paths[${i}]`);
 
       // Skip empty entries
       if (path.length === 0) {
@@ -1443,21 +1457,12 @@ const posix = {
     if (path.length === 0)
       return '.';
     const hasRoot = StringPrototypeCharCodeAt(path, 0) === CHAR_FORWARD_SLASH;
-    let end = -1;
-    let matchedSlash = true;
-    for (let i = path.length - 1; i >= 1; --i) {
-      if (StringPrototypeCharCodeAt(path, i) === CHAR_FORWARD_SLASH) {
-        if (!matchedSlash) {
-          end = i;
-          break;
-        }
-      } else {
-        // We saw the first non-path separator
-        matchedSlash = false;
-      }
-    }
+    // The last separator before the last segment, trailing separators aside.
+    let last = path.length - 1;
+    while (last >= 1 && StringPrototypeCharCodeAt(path, last) === CHAR_FORWARD_SLASH) last--;
+    const end = last < 1 ? -1 : StringPrototypeLastIndexOf(path, '/', last);
 
-    if (end === -1)
+    if (end < 1)
       return hasRoot ? '/' : '.';
     if (hasRoot && end === 1)
       return '//';
@@ -1470,8 +1475,14 @@ const posix = {
    * @returns {string}
    */
   basename(path, suffix) {
-    if (suffix !== undefined)
-      validateString(suffix, 'suffix');
+    if (suffix === undefined) {
+      validateString(path, 'path');
+      let end = path.length;
+      while (end > 0 && StringPrototypeCharCodeAt(path, end - 1) === CHAR_FORWARD_SLASH) end--;
+      if (end === 0) return '';
+      return StringPrototypeSlice(path, StringPrototypeLastIndexOf(path, '/', end - 1) + 1, end);
+    }
+    validateString(suffix, 'suffix');
     validateString(path, 'path');
 
     let start = 0;

@@ -277,6 +277,7 @@ function wrapHostIO() {
     const fn = std[name];
     if (typeof fn !== 'function') continue;
     std[name] = function(...args) {
+      if (!initialized || (!state.enforce && !state.audit)) return apply(fn, undefined, args);
       const path = args[0], mode = args[1];
       if (name !== 'open' || indexOf(mode, 'r') !== -1 || indexOf(mode, '+') !== -1) check('fs.read', path);
       if (name === 'open' && (indexOf(mode, 'w') !== -1 || indexOf(mode, 'a') !== -1 || indexOf(mode, '+') !== -1)) check('fs.write', path);

@@ -27,6 +27,7 @@ module.exports = {
   PromiseResolve: Promise.resolve.bind(Promise),
   ReflectApply: Reflect.apply,
   ReflectOwnKeys: Reflect.ownKeys,
+  RegExpPrototypeExec: uncurryThis(RegExp.prototype.exec),
   String: String,
   StringPrototypeCharCodeAt: uncurryThis(String.prototype.charCodeAt),
   StringPrototypeIncludes: uncurryThis(String.prototype.includes),
