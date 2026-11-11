@@ -43,6 +43,9 @@ function resetMessage(state) {
 // eof, url or status text, fields]); trailers arrive with message complete (kind 9).
 function event(parser, state, kind, value, remaining) {
   state.remaining = remaining;
+  // Like Node, a parser removed from its socket (freeParser) runs no more callbacks for
+  // the rest of the input it is executing.
+  if (state.beingFreed) return 0;
   switch (kind) {
     case 0:
       resetMessage(state);
@@ -93,7 +96,7 @@ function resetAsync(state, owner, id) {
 }
 class HTTPParser {
   constructor() {
-    const state = { id: 0, type: HTTPParser.REQUEST, resource: null, connections: null, messageStart: 0, provider: 0, frame: undefined, consuming: null,
+    const state = { id: 0, type: HTTPParser.REQUEST, resource: null, connections: null, messageStart: 0, beingFreed: false, provider: 0, frame: undefined, consuming: null,
       currentRead: null, executing: false, pauseRequested: false, remaining: 0, remainder: null, maxHeaderPairs: undefined };
     resetMessage(state);
     state.callback = (kind, value, remaining) => event(this, state, kind, value, remaining);
@@ -110,6 +113,7 @@ class HTTPParser {
       throw error('ERR_OUT_OF_RANGE', 'maxHeaderSize must be a nonnegative safe integer');
     this.remove();
     this.free();
+    state.beingFreed = false;
     state.type = type;
     state.remaining = 0;
     state.remainder = null;
@@ -207,6 +211,7 @@ class HTTPParser {
   remove() {
     this.unconsume();
     const state = stateOf(this);
+    state.beingFreed = true;
     if (state.connections) { state.connections._remove(this); state.connections = null; }
   }
   free() {

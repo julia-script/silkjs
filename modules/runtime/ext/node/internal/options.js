@@ -60,7 +60,7 @@ const environmentOptions = new Map([
   ...permission.optionEntries,
   ...[...inspectorEnableOptions, '--no-inspect', '--no-inspect-brk', '--no-inspect-wait',
     '--experimental-inspector-network-resource', '--no-experimental-inspector-network-resource'].map(name => [name, false]),
-  ['--inspect-port', true], ['--debug-port', true],
+  ['--inspect-port', true], ['--debug-port', true], ['--max-http-header-size', true],
   ...['--watch', '--no-watch', '--watch-preserve-output', '--no-watch-preserve-output'].map(name => [name, false]),
   ...['--watch-path', '--watch-kill-signal'].map(name => [name, true]),
   ...['--experimental-test-coverage', '--no-experimental-test-coverage'].map(name => [name, false]),
@@ -266,6 +266,8 @@ function getOptionValue(name) {
     case '--inspect-wait': return !!host.inspectorOptions?.wait;
     case '--inspect-port': return { host: host.inspectorOptions?.host ?? '127.0.0.1', port: host.inspectorOptions?.port ?? 9229 };
     case '--localstorage-file': return host.localStorageFile;
+    case '--insecure-http-parser': return !!host.insecureHTTPParser;
+    case '--max-http-header-size': return host.maxHTTPHeaderSize ?? 16 * 1024;
     default: return startupControls.getOptionValue(name);
   }
 }

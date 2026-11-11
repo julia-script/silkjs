@@ -183,6 +183,7 @@ class TLSTransport {
     return this.carrier.remoteAddress ? { address: this.carrier.remoteAddress, port: this.carrier.remotePort, family: this.carrier.remoteFamily } : undefined;
   }
   call(op, ...args) { return this.carrier._transport?.call(op, ...args) ?? 0; }
+  getAsyncId() { return this.carrier._handle?.getAsyncId?.() ?? -1; }
   ref() { this.carrier.ref?.(); }
   unref() { this.carrier.unref?.(); }
   hasRef() { return this.carrier._transport?.hasRef() ?? true; }

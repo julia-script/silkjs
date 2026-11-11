@@ -125,6 +125,12 @@ Socket.prototype._refreshTimeout = function() {
   }, this.timeout);
   this._timeout.unref?.();
 };
+// Node's name for refreshing the idle timeout of a socket and the sockets it wraps.
+Socket.prototype._unrefTimer = function() {
+  for (let socket = this; socket; socket = socket._parent) {
+    if (socket._timeout) socket._timeout.refresh();
+  }
+};
 Socket.prototype._onNative = function(type, status, payload) {
   if (type === 6) {
     this._connected = false;
