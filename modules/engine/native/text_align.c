@@ -2,8 +2,11 @@
  * lists it before js_vm.execute), so the interpreter loop that follows
  * always starts on a 64-byte boundary. Its alignment moved with every
  * change to the code before it, and swung Crypto by about 15% at equal
- * instruction counts. Never called; retained against section GC. */
-#if defined(__APPLE__)
+ * instruction counts. Never called; retained against section GC.
+ * WebAssembly code has no addresses to align, so that target gets nothing. */
+#if defined(__wasm__)
+typedef int silkjs_text_align_unused;
+#elif defined(__APPLE__)
 __asm__(".section __TEXT,__text,regular,pure_instructions\n"
         ".p2align 6\n"
         ".globl _silkjs_text_align\n"

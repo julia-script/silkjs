@@ -57,7 +57,7 @@ cycles.
 
 ## WebAssembly builds
 
-`wasm/` builds silkjs (64-bit WebAssembly through the Silk LLVM backend) and QuickJS (wasi-sdk)
+`wasm/` builds silkjs (32-bit WebAssembly through the Silk LLVM backend) and QuickJS (wasi-sdk)
 as WASI commands for wasmtime, as comparison columns for the tables above. See
 [`wasm/README.md`](wasm/README.md).
 
