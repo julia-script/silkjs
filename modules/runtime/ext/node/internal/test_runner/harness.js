@@ -21,6 +21,29 @@ function invalid(message) { return Object.assign(new TypeError(message), { code:
 function unsupported(name) { throw Object.assign(new Error(`${name} is not supported by the Silk test runner`), { code: 'ERR_NOT_SUPPORTED' }); }
 function deferred() { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; }
 const TIMEOUT_MAX = 2 ** 31 - 1;
+function invalidValue(name, value, reason) {
+  const kind = name.includes('.') || name.includes('[') ? 'property' : 'argument';
+  return Object.assign(new TypeError(`The ${kind} '${name}' ${reason}. Received ${require('util').inspect(value)}`), { code: 'ERR_INVALID_ARG_VALUE' });
+}
+const kEmptyTags = Object.freeze([]);
+let warnedTags = false;
+function tagFilter(value, name) {
+  validateString(value, name);
+  if (value.length === 0) throw invalidValue(name, value, 'must not be empty');
+  return value.toLowerCase();
+}
+// Tags are lowercased and deduplicated in declaration order.
+function canonicalTags(tags, name) {
+  if (!Array.isArray(tags)) throw new ERR_INVALID_ARG_TYPE(name, 'Array', tags);
+  if (tags.length === 0) return kEmptyTags;
+  if (!warnedTags) { warnedTags = true; process.emitWarning('Test tags is an experimental feature and might change at any time', 'ExperimentalWarning'); }
+  const result = [];
+  for (let i = 0; i < tags.length; i++) {
+    const tag = tagFilter(tags[i], `${name}[${i}]`);
+    if (!result.includes(tag)) result.push(tag);
+  }
+  return Object.freeze(result);
+}
 function validateConcurrency(value, name) {
   if (value == null || typeof value === 'boolean') return;
   if (typeof value !== 'number') throw new ERR_INVALID_ARG_TYPE(name, ['boolean', 'number'], value);
@@ -42,8 +65,48 @@ function parse(args) {
   validateConcurrency(options.concurrency, 'options.concurrency');
   validateAbortSignal(options.signal, 'options.signal');
   for (const key of ['only', 'skip', 'todo']) if (options[key] !== undefined && typeof options[key] !== 'boolean' && (key === 'only' || typeof options[key] !== 'string')) throw invalid(`${key} has an invalid type`);
-  for (const key of ['tags', 'expectFailure']) if (options[key] !== undefined) unsupported(`test option ${key}`);
-  return { name, options, fn: fn || function() {} };
+  const tags = options.tags === undefined ? kEmptyTags : canonicalTags(options.tags, 'options.tags');
+  return { name, options, fn: fn || function() {}, tags };
+}
+function parseExpectFailure(value) {
+  if (value === undefined || value === false) return false;
+  if (typeof value === 'string') return { label: value, match: undefined };
+  if (typeof value === 'function' || value instanceof RegExp) return { label: undefined, match: value };
+  if (value === null || typeof value !== 'object') return { label: undefined, match: undefined };
+  const keys = Object.keys(value);
+  if (keys.length === 0) throw invalidValue('options.expectFailure', value, 'must not be an empty object');
+  if (keys.every(key => key === 'match' || key === 'label')) return { label: value.label, match: value.match };
+  return { label: undefined, match: value };
+}
+// An expected failure passes when the test fails (with a matching error, when given)
+// and fails when the test passes.
+function settleExpectedFailure(node) {
+  const expectation = node.expectFailure;
+  if (!node.error) {
+    node.error = failure('test was expected to fail but passed', 'expectedFailure');
+    return;
+  }
+  if (expectation.match !== undefined) {
+    const error = node.error;
+    const actual = error?.code === 'ERR_TEST_FAILURE' && error.failureType === 'testCodeFailure' && error.cause ? error.cause : error;
+    try { assert.throws(() => { throw actual; }, expectation.match); }
+    catch (mismatch) {
+      node.error = failure('The test failed, but the error did not match the expected validation', 'testCodeFailure', mismatch);
+      return;
+    }
+  }
+  node.error = undefined;
+}
+function createRandomSeed() { return Math.floor(Math.random() * 0x1_0000_0000); }
+// Mulberry32, as Node's test runner uses for --test-randomize.
+function seededGenerator(seed) {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6D2B79F5) | 0;
+    let value = Math.imul(state ^ state >>> 15, 1 | state);
+    value ^= value + Math.imul(value ^ value >>> 7, 61 | value);
+    return ((value ^ value >>> 14) >>> 0) / 4_294_967_296;
+  };
 }
 function stringPattern(text) {
   const match = /^\/(.*)\/([a-z]*)$/s.exec(text);
@@ -63,6 +126,7 @@ function settledCount(node) {
   return count;
 }
 function visibleChildren(node) { return node.children.filter(child => !child.filtered && (!child.nameFiltered || child.error)); }
+const taggedEvents = new Set(['test:enqueue', 'test:dequeue', 'test:start', 'test:pass', 'test:fail', 'test:complete']);
 class TestsStream extends Readable {
   constructor() { super({ objectMode: true, read() {} }); }
   publish(type, data) { this.emit(type, data); this.push({ type, data }); }
@@ -112,6 +176,7 @@ class TestContext {
   get error() { return this._node.error ?? null; }
   get passed() { return this._node.passed === true; }
   get attempt() { return 0; }
+  get tags() { return this._node.tags; }
   get workerId() { return Number(process.env.NODE_TEST_WORKER_ID) || undefined; }
   get assert() {
     if (!this._assert) {
@@ -131,7 +196,9 @@ class TestContext {
   _count() { this._node.plan?.count(); }
   test(...args) {
     this._count();
-    const node = this._node.harness.add('test', parse(args), this._node);
+    const spec = parse(args);
+    spec.loc = callerLocation();
+    const node = this._node.harness.add('test', spec, this._node);
     return this._node.type === 'suite' ? Promise.resolve() : node.done.promise;
   }
   before(fn, options) { this._hook('before', fn, options); }
@@ -182,11 +249,15 @@ class TestNode {
     this.controller = new AbortController(); this.done = deferred(); this.cancelled = deferred(); this.state = 'pending';
     this.skip = spec.options.skip === '' ? true : spec.options.skip;
     this.todo = spec.options.todo === '' ? true : spec.options.todo; this.only = !!spec.options.only;
+    this.expectFailure = parseExpectFailure(spec.options.expectFailure) || parent?.expectFailure || false;
     this.runOnly = parent?.runOnly ?? !!harness.options.only;
     this.nesting = parent ? parent.nesting + 1 : -1;
     this.fullName = parent?.parent ? `${parent.fullName} > ${this.name}` : this.name;
     this.filterName = parent?.parent ? `${parent.filterName} ${this.name}` : this.name;
-    this.file = parent && parent.type !== 'root' ? parent.file : harness.file; this.ctx = new TestContext(this); this.active = 0;
+    const own = spec.tags || kEmptyTags;
+    const inherited = parent?.tags || kEmptyTags;
+    this.tags = inherited.length === 0 ? own : own.length === 0 ? inherited : Object.freeze([...new Set([...inherited, ...own])]);
+    this.file = parent && parent.type !== 'root' ? parent.file : harness.file; this.loc = spec.loc; this.ctx = new TestContext(this); this.active = 0;
   }
   cancel(error) {
     if (this.state === 'done') return;
@@ -199,6 +270,8 @@ class Harness {
   constructor(options = {}) {
     this.options = options; this.stream = new TestsStream(); this.file = options.file;
     this.names = pattern(options.testNamePatterns); this.skips = pattern(options.testSkipPatterns);
+    this.randomSeed = options.randomSeed ?? (options.randomize ? createRandomSeed() : undefined);
+    this.tagFilters = options.testTagFilters == null ? [] : [options.testTagFilters].flat().map((value, i) => tagFilter(value, `options.testTagFilters[${i}]`));
     this.root = new TestNode(this, 'root', { name: '<root>', options, fn() {} }, null);
     this.root.state = 'collecting'; this.started = false; this.finished = false;
     this.counts = { tests: 0, suites: 0, passed: 0, failed: 0, cancelled: 0, skipped: 0, todo: 0, topLevel: 0 };
@@ -216,8 +289,12 @@ class Harness {
   }
   emit(type, node, extra = {}) {
     if (this.finished) return;
-    this.stream.publish(type, { name: node.name, nesting: node.nesting, file: node.file,
-      testId: node.id, parentId: node.parent?.id, ...extra });
+    const data = { name: node.name, nesting: node.nesting, file: node.file, testId: node.id, parentId: node.parent?.id, ...extra };
+    if (taggedEvents.has(type)) {
+      if (node.loc) { data.line = node.loc.line; data.column = node.loc.column; data.file = node.loc.file; }
+      data.tags = [...node.tags];
+    }
+    this.stream.publish(type, data);
   }
   enqueue(node) {
     if (!node.parent || node.enqueued || node.nameFiltered) return;
@@ -228,7 +305,8 @@ class Harness {
   add(type, spec, parent = this.root) {
     const node = new TestNode(this, type, spec, parent);
     parent.children.push(node);
-    node.nameFiltered = (this.names.length > 0 && !testMatches(this.names, node)) || testMatches(this.skips, node);
+    node.nameFiltered = (this.names.length > 0 && !testMatches(this.names, node)) || testMatches(this.skips, node) ||
+      (this.tagFilters.length > 0 && !this.tagFilters.every(tag => node.tags.includes(tag)));
     if (!node.nameFiltered) {
       for (let ancestor = parent; ancestor.parent; ancestor = ancestor.parent) ancestor.nameFiltered = false;
       this.enqueue(node);
@@ -246,21 +324,42 @@ class Harness {
         node.build = Promise.resolve(result).catch(error => { node.error = failure(String(error?.message ?? error), 'testCodeFailure', error); });
       } catch (error) { node.error = failure(String(error?.message ?? error), 'testCodeFailure', error); node.build = Promise.resolve(); }
     }
-    if (parent.state === 'running') this.pump(parent);
+    // Under randomize, siblings declared in the same turn all take part in the first draw.
+    if (parent.state === 'running') {
+      if (this.randomSeed === undefined) this.pump(parent);
+      else queueMicrotask(() => { if (parent.state === 'running') this.pump(parent); });
+    }
     return node;
   }
   pump(parent) {
     let owner = parent;
-    while (owner.parent && owner.options.concurrency === undefined) owner = owner.parent;
+    while (owner.parent && owner.options.concurrency == null) owner = owner.parent;
     const configured = owner.options.concurrency ?? this.options.concurrency ?? 1;
     const limit = configured === true ? Infinity : configured === false ? 1 : configured;
-    for (const child of parent.children) {
+    for (;;) {
       if (parent.active >= limit) break;
-      if (child.scheduled) continue;
+      const child = this.nextChild(parent);
+      if (!child) break;
       child.scheduled = true; parent.active++;
       this.execute(child).catch(error => { child.error ||= failure(String(error?.message ?? error), 'testCodeFailure', error); if (child.state !== 'done') this.finish(child, now()); }).finally(() => { parent.active--; if (parent.state === 'running') this.pump(parent); });
       this.flush(this.root);
     }
+  }
+  // Children start in declaration order or, with randomize, in seeded random order. A
+  // started child moves up to the end of the started prefix, so reports follow start order.
+  nextChild(parent) {
+    const started = parent.startedCount ??= 0;
+    const pending = parent.children.length - started;
+    if (pending <= 0) return undefined;
+    let index = started;
+    if (this.randomSeed !== undefined && pending > 1) {
+      parent.random ??= seededGenerator(this.randomSeed);
+      index = started + Math.floor(parent.random() * pending);
+    }
+    const [child] = parent.children.splice(index, 1);
+    parent.children.splice(started, 0, child);
+    parent.startedCount = started + 1;
+    return child;
   }
   async invoke(fn, node, options = {}) {
     let timer;
@@ -398,6 +497,7 @@ class Harness {
   }
   finish(node, start) {
     node.state = 'done';
+    if (node.expectFailure && node.type !== 'suite' && !node.skip && !node.todo && !node.filtered) settleExpectedFailure(node);
     node.passed = !node.error;
     node.controller.abort();
     if (node.filtered) { this.flush(this.root); node.done.resolve(); return; }
@@ -414,7 +514,8 @@ class Harness {
     if (node.error && !node.todo && !node.skip && this.options.setExitCode !== false) process.exitCode = 1;
     node.reportData = { testNumber: visibleChildren(node.parent).indexOf(node) + 1,
       details: { duration_ms: now() - start, type: node.type, ...(node.error ? { error: node.error } : {}) },
-      ...(node.skip ? { skip: node.skip } : node.todo ? { todo: node.todo } : {}) };
+      ...(node.skip ? { skip: node.skip } : node.todo ? { todo: node.todo } :
+        node.expectFailure ? { expectFailure: node.expectFailure.label ?? true } : {}) };
     this.emit('test:complete', node, { ...node.reportData, details: { ...node.reportData.details, passed: !node.error || !!node.skip } });
     this.flush(this.root);
     node.done.resolve();
@@ -524,7 +625,8 @@ function getHarness() {
     }
     const cli = host.testCoverageOptions || {};
     defaultHarness = createHarness({ waitForIdle: true, file: process.argv[1], collectCoverage, only: cli.only,
-      timeout: cli.timeout, testNamePatterns: cli.testNamePatterns, testSkipPatterns: cli.testSkipPatterns });
+      timeout: cli.timeout, testNamePatterns: cli.testNamePatterns, testSkipPatterns: cli.testSkipPatterns, testTagFilters: cli.testTagFilters,
+      randomize: cli.randomize, randomSeed: cli.randomSeed });
     if (process.env.NODE_TEST_CONTEXT === 'child-v8' && typeof process.send === 'function') reportToParent(defaultHarness.stream);
     else {
       const { tap } = require('test/reporters');
@@ -548,10 +650,20 @@ function configure(options = {}) {
   defaultHarness = createHarness(options);
   return defaultHarness;
 }
+// Where user code declared a test: the first frame outside the built-ins.
+function callerLocation() {
+  for (const site of require('util').getCallSites(16)) {
+    const file = site.scriptName;
+    if (file && !file.startsWith('node:')) return { line: site.lineNumber, column: site.column, file: file.startsWith('file://') ? require('url').fileURLToPath(file) : file };
+  }
+  return undefined;
+}
 function define(type, args) {
   const harness = getHarness();
   const parent = context.getStore() || harness.root;
-  const node = harness.add(type, parse(args), parent);
+  const spec = parse(args);
+  spec.loc = callerLocation();
+  const node = harness.add(type, spec, parent);
   return parent.type === 'suite' ? Promise.resolve() : node.done.promise;
 }
 function test(...args) { return define('test', args); }
@@ -560,7 +672,7 @@ for (const fn of [test, suite]) for (const modifier of ['skip', 'todo', 'only'])
   const spec = parse(args); spec.options = { ...spec.options, [modifier]: true };
   return define(fn === test ? 'test' : 'suite', [spec.name, spec.options, spec.fn]);
 };
-const exportsObject = { test, suite, createHarness, configure, getTestContext: () => context.getStore()?.ctx,
+const exportsObject = { tagFilter, seededGenerator, createRandomSeed, test, suite, createHarness, configure, getTestContext: () => context.getStore()?.ctx,
   withHarness: (harness, fn) => context.run(harness.root, fn), failure, unsupported, TestsStream,
   registerAssertion(name, fn) { validateString(name, 'name'); validateFunction(fn, 'fn'); assertions.set(name, fn); } };
 for (const type of ['before', 'after', 'beforeEach', 'afterEach']) exportsObject[type] = (fn, options) => {

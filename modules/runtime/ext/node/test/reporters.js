@@ -2,7 +2,8 @@
 
 const { Transform } = require('stream');
 function text(value) { return String(value ?? '').replace(/[\r\n]/g, ' '); }
-function directive(data) { return data.skip ? ` # SKIP${data.skip === true ? '' : ' ' + text(data.skip)}` : data.todo ? ` # TODO${data.todo === true ? '' : ' ' + text(data.todo)}` : ''; }
+function directive(data) { return data.skip ? ` # SKIP${data.skip === true ? '' : ' ' + text(data.skip)}` : data.todo ? ` # TODO${data.todo === true ? '' : ' ' + text(data.todo)}` :
+  data.expectFailure !== undefined ? ` # EXPECTED FAILURE${typeof data.expectFailure === 'string' ? ' ' + text(data.expectFailure) : ''}` : ''; }
 function detail(error) { return error?.cause?.stack || error?.stack || String(error); }
 function xml(value) { return String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[c]); }
 function coverageText(summary) {
@@ -12,13 +13,25 @@ function coverageText(summary) {
   rows.push(`all files | ${totals.coveredLinePercent.toFixed(2)} | ${totals.coveredBranchPercent.toFixed(2)} | ${totals.coveredFunctionPercent.toFixed(2)}`, 'end of coverage report');
   return rows.map(row => `# ${row}\n`).join('');
 }
+// Node's TAP escaping for test names and directive reasons.
+function tapEscape(input) {
+  return String(input).replaceAll('\b', '\\b').replaceAll('\f', '\\f').replaceAll('\t', '\\t').replaceAll('\n', '\\n')
+    .replaceAll('\r', '\\r').replaceAll('\v', '\\v').replaceAll('\\', '\\\\').replaceAll('#', '\\#');
+}
+function tapDirective({ name, skip, todo, expectFailure }) {
+  let line = name ? ` ${tapEscape(`- ${name}`)}` : '';
+  if (skip !== undefined) line += ` # SKIP${typeof skip === 'string' && skip.length ? ` ${tapEscape(skip)}` : ''}`;
+  else if (todo !== undefined) line += ` # TODO${typeof todo === 'string' && todo.length ? ` ${tapEscape(todo)}` : ''}`;
+  else if (expectFailure !== undefined) line += ` # EXPECTED FAILURE${typeof expectFailure === 'string' ? ` ${tapEscape(expectFailure)}` : ''}`;
+  return line;
+}
 async function* tap(source) {
   yield 'TAP version 13\n';
   for await (const { type, data } of source) {
     const indent = '    '.repeat(Math.max(0, data.nesting || 0));
     if (type === 'test:start') yield `${indent}# Subtest: ${text(data.name)}\n`;
     else if (type === 'test:pass' || type === 'test:fail') {
-      yield `${indent}${type === 'test:pass' ? 'ok' : 'not ok'} ${data.testNumber} - ${text(data.name).replace(/#/g, '\\#')}${directive(data)}\n`;
+      yield `${indent}${type === 'test:pass' ? 'ok' : 'not ok'} ${data.testNumber}${tapDirective(data)}\n`;
       yield `${indent}  ---\n${indent}  duration_ms: ${data.details?.duration_ms ?? 0}\n`;
       if (data.details?.error) {
         const error = data.details.error;

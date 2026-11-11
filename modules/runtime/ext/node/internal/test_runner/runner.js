@@ -1,6 +1,7 @@
 'use strict';
 
-const { createHarness, withHarness, TestsStream, failure, unsupported } = require('internal/test_runner/harness');
+const { createHarness, withHarness, TestsStream, failure, unsupported, seededGenerator, createRandomSeed } = require('internal/test_runner/harness');
+const { validateBoolean } = require('internal/path_events/support');
 const path = require('path');
 const fs = require('fs');
 const host = require('internal/host');
@@ -8,7 +9,7 @@ const nativeSetImmediate = globalThis.setImmediate;
 const nativeSetTimeout = globalThis.setTimeout;
 const nativeClearTimeout = globalThis.clearTimeout;
 const now = Date.now.bind(Date);
-const supported = new Set(['files', 'cwd', 'concurrency', 'timeout', 'signal', 'isolation', 'setup', 'only', 'testNamePatterns', 'testSkipPatterns', 'shard', 'execArgv', 'argv', 'env', 'coverage', 'coverageIncludeGlobs', 'coverageExcludeGlobs', 'lineCoverage', 'branchCoverage', 'functionCoverage']);
+const supported = new Set(['randomize', 'randomSeed', 'testTagFilters', 'files', 'cwd', 'concurrency', 'timeout', 'signal', 'isolation', 'setup', 'only', 'testNamePatterns', 'testSkipPatterns', 'shard', 'execArgv', 'argv', 'env', 'coverage', 'coverageIncludeGlobs', 'coverageExcludeGlobs', 'lineCoverage', 'branchCoverage', 'functionCoverage']);
 function invalid(message) { return Object.assign(new TypeError(message), { code: 'ERR_INVALID_ARG_VALUE' }); }
 function discover(directory, files = [], inTest = false) {
   for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
@@ -43,28 +44,48 @@ function validate(options) {
     if (patterns.some(value => typeof value !== 'string' && !(value instanceof RegExp))) throw invalid(`${key} must contain strings or regular expressions`);
     serializablePatterns(patterns).forEach(value => new RegExp(value.source, value.flags));
   }
+  if (options.testTagFilters !== undefined) {
+    const { tagFilter } = require('internal/test_runner/harness');
+    [options.testTagFilters].flat().forEach((value, i) => tagFilter(value, `options.testTagFilters[${i}]`));
+  }
   if (options.shard !== undefined) {
     const { index, total } = options.shard;
     if (!Number.isInteger(index) || !Number.isInteger(total) || index < 1 || index > total) throw invalid('shard requires 1 <= index <= total');
   }
 }
+function validateRandom(options) {
+  if (options.randomize != null) validateBoolean(options.randomize, 'options.randomize');
+  if (options.randomSeed != null) {
+    const seed = options.randomSeed;
+    if (typeof seed !== 'number') throw new (require('internal/path_events/support').codes.ERR_INVALID_ARG_TYPE)('options.randomSeed', 'number', seed);
+    if (!Number.isInteger(seed) || seed < 0 || seed > 0xFFFF_FFFF)
+      throw Object.assign(new RangeError(`The value of "options.randomSeed" is out of range. It must be >= 0 && <= 4294967295. Received ${seed}`), { code: 'ERR_OUT_OF_RANGE' });
+  }
+  const randomize = options.randomSeed != null || options.randomize === true;
+  return randomize ? options.randomSeed ?? createRandomSeed() : undefined;
+}
 function run(options = {}) {
   validate(options);
+  const randomSeed = validateRandom(options);
+  options = { ...options, randomize: randomSeed !== undefined, randomSeed };
   const stream = new TestsStream();
   nativeSetImmediate(async () => {
     try {
       const cwd = path.resolve(options.cwd || process.cwd());
       let files = options.files ? options.files.map(file => path.resolve(cwd, file)) : discover(cwd);
+      // File-level results are named as the caller gave the path, or relative to cwd.
+      const names = new Map(files.map((file, index) => [file, options.files ? options.files[index] : path.relative(cwd, file)]));
       if (options.shard) files = files.filter((_, index) => index % options.shard.total === options.shard.index - 1);
       await options.setup?.(stream);
       if (options.isolation === 'none') await runLocal(files, options, stream, cwd);
-      else await runProcesses(files, options, stream, cwd);
+      else await runProcesses(files, options, stream, cwd, names);
     } catch (error) { stream.destroy(error); }
   });
   return stream;
 }
 async function runLocal(files, options, stream, cwd) {
   const harness = createHarness({ ...options, setExitCode: false });
+  if (options.randomSeed !== undefined) harness.root.ctx.diagnostic(`Randomized test order seed: ${options.randomSeed}`);
   let summary;
   harness.stream.on('data', event => {
     if (event.type === 'test:summary') summary = event.data;
@@ -112,6 +133,8 @@ function childFlags(options) {
     for (const { source, flags: reFlags } of serializablePatterns(options[key]) || [])
       flags.push(`${name}=${reFlags || source.startsWith('/') ? `/${source}/${reFlags}` : source}`);
   }
+  if (options.randomSeed !== undefined) flags.push('--test-randomize', `--test-random-seed=${options.randomSeed}`);
+  for (const tag of [options.testTagFilters ?? []].flat()) flags.push(`--experimental-test-tag-filter=${tag}`);
   if (options.coverage) {
     flags.push('--experimental-test-coverage');
     for (const glob of [options.coverageIncludeGlobs ?? []].flat()) flags.push(`--test-coverage-include=${glob}`);
@@ -131,7 +154,7 @@ function inheritedExecArgv() {
   }
   return result;
 }
-async function runProcesses(files, options, stream, cwd) {
+async function runProcesses(files, options, stream, cwd, names) {
   const { spawn } = require('child_process');
   const start = now();
   const counts = { tests: 0, suites: 0, passed: 0, failed: 0, cancelled: 0, skipped: 0, todo: 0, topLevel: 0 };
@@ -162,7 +185,7 @@ async function runProcesses(files, options, stream, cwd) {
       }
       if (error || (!summary && events.length === 0)) {
         const failed = !!error;
-        const data = { name: files[flushed], file: files[flushed], nesting: 0, testId: eventId++, testNumber: ++sequence,
+        const data = { name: names.get(files[flushed]) ?? files[flushed], nesting: 0, line: 1, column: 1, file: files[flushed], testId: eventId++, testNumber: ++sequence,
           details: { type: 'test', duration_ms: now() - start, ...(error ? { error } : {}) } };
         stream.publish('test:start', data); stream.publish('test:complete', data); stream.publish(failed ? 'test:fail' : 'test:pass', data);
         counts.tests++; counts.topLevel++;
@@ -230,11 +253,17 @@ async function runProcesses(files, options, stream, cwd) {
     if (onAbort) options.signal?.removeEventListener('abort', onAbort);
     completed.set(index, { events, summary, error, ids }); flush();
   }
+  if (options.randomSeed !== undefined) {
+    const random = seededGenerator(options.randomSeed), pending = [...files];
+    files = [];
+    while (pending.length) files.push(pending.splice(pending.length > 1 ? Math.floor(random() * pending.length) : 0, 1)[0]);
+  }
   const concurrency = options.concurrency === false ? 1 : options.concurrency === true || options.concurrency === undefined ? Math.max(1, (require('os').availableParallelism?.() || 2) - 1) : options.concurrency;
   await Promise.all(Array.from({ length: Math.min(files.length, concurrency) }, async () => {
     while (next < files.length) { const index = next++; await execute(index); }
   }));
   stream.publish('test:plan', { nesting: 0, count: sequence });
+  if (options.randomSeed !== undefined) stream.publish('test:diagnostic', { nesting: 0, message: `Randomized test order seed: ${options.randomSeed}`, level: 'info' });
   if (options.coverage) {
     const coverage = require('internal/test_runner/coverage');
     if (!coverage.publish(stream, coverage.merge(coverages, options, cwd))) successful = false;
