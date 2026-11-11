@@ -77,6 +77,16 @@ function start(port) {
   host.workerNative('start', [value.id, true]);
   retain(port);
 }
+// Node's removeListener hook: with no message listener left the port stops delivering
+// (messages wait in the queue for the next listener) and drops its ref.
+function idle(port) {
+  const value = state(port);
+  if (value.id !== null && value.started) {
+    value.started = false;
+    host.workerNative('start', [value.id, false]);
+  }
+  ref(port, false);
+}
 function close(port, callback) {
   const value = state(port);
   if (callback !== undefined) {
@@ -126,7 +136,7 @@ class PortEventTarget extends EventTarget {
   }
   removeEventListener(type, listener, options) {
     super.removeEventListener(type, listener, options);
-    if (type === 'message' && !state(this).emitter.listenerCount(type) && !this[kEvents].get(type)?.size) ref(this, false);
+    if (type === 'message' && !state(this).emitter.listenerCount(type) && !this[kEvents].get(type)?.size) idle(this);
     retain(this);
   }
   emit(type, data) {
@@ -159,7 +169,7 @@ class PortEventTarget extends EventTarget {
         break;
       }
     }
-    if (type === 'message' && !value.emitter.listenerCount(type) && !this[kEvents].get('message')?.size) ref(this, false);
+    if (type === 'message' && !value.emitter.listenerCount(type) && !this[kEvents].get('message')?.size) idle(this);
     retain(this);
     return this;
   }
@@ -168,7 +178,7 @@ class PortEventTarget extends EventTarget {
     const value = state(this);
     if (arguments.length) value.emitter.removeAllListeners(type);
     else value.emitter.removeAllListeners();
-    if (!value.emitter.listenerCount('message') && !this[kEvents].get('message')?.size) ref(this, false);
+    if (!value.emitter.listenerCount('message') && !this[kEvents].get('message')?.size) idle(this);
     retain(this);
     return this;
   }
@@ -208,7 +218,7 @@ for (const type of ['message', 'messageerror']) {
       if (value.handlers[type]) {
         this.addEventListener(type, callback);
         if (type === 'message') { start(this); ref(this, true); }
-      } else if (type === 'message' && !value.emitter.listenerCount(type) && !this[kEvents].get(type)?.size) ref(this, false);
+      } else if (type === 'message' && !value.emitter.listenerCount(type) && !this[kEvents].get(type)?.size) idle(this);
       retain(this);
     },
   });
