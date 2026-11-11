@@ -137,6 +137,17 @@ let autoSelectFamilyAttemptTimeoutDefault;"""),
          "// silkjs: cares_wrap's convertIpv6StringToBuffer, over the BlockList parser.\n"
          "const convertIpv6StringToBuffer = (ip) => require('internal/socketaddress').parseAddress(ip, 6);\n"),
         ("const { queueMicrotask } = require('internal/process/task_queues');\n", ""),
+        # silkjs: a child that exits leaves _workers (the _setupWorker exit hook); with
+        # none left there is no child to ask, so close() and getConnections() go on with
+        # the server's own connections (Node waits forever when every child exits first).
+        ("""  if (!this._usingWorkers) {
+    end(null, this._connections);""",
+         """  if (!this._usingWorkers || this._workers.length === 0) {
+    end(null, this._connections);"""),
+        ("""  if (this._usingWorkers) {
+    let left = this._workers.length;""",
+         """  if (this._usingWorkers && this._workers.length !== 0) {
+    let left = this._workers.length;"""),
         ("""const {
   guessHandleType,
   isWindows,

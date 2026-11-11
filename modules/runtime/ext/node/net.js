@@ -2845,7 +2845,7 @@ Server.prototype.getConnections = function(cb) {
                                connections);
   }
 
-  if (!this._usingWorkers) {
+  if (!this._usingWorkers || this._workers.length === 0) {
     end(null, this._connections);
     return this;
   }
@@ -2889,7 +2889,7 @@ Server.prototype.close = function(cb) {
     this._handle = null;
   }
 
-  if (this._usingWorkers) {
+  if (this._usingWorkers && this._workers.length !== 0) {
     let left = this._workers.length;
     const onWorkerClose = () => {
       if (--left !== 0) return;
