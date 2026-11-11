@@ -27,6 +27,11 @@ import js_exceptions { JsException, exceptionValue }
 import js_atom_data as atoms
 import js_class_data as classes
 import js_invariant { invariant }
+import js_strings { Strings }
+import silk.collections.list { List }
+import js_backtrace as backtrace
+import dtoa { Dtoa }
+import silk.collections.slice { Slice }
 
 fn reference(input: ValueBits) -> *mut HeapHeader {
   return match input { ValueBits.Object { reference } => reference _ => invariant() }
@@ -63,20 +68,119 @@ pub fn peek(runtime: *mut HeapHeader, object: ValueBits, name: ValueBits) -> Val
     _ => ValueBits.Uninitialized
   }
 }
+// What a private field access was doing, for V8's message when it fails.
+const FIELD_READ: u32 = 0
+const FIELD_WRITE: u32 = 1
+const FIELD_DEFINE: u32 = 2
 effect fn fieldAtom<'a, 'b, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
-  object: ValueRef<'b>, name: ValueRef<'b>) -> u32 ! JsException ? &mut Allocator {
-  if !object.view().isObject() { return run ops.throwError(&mut hooks,realm, NativeErrorKind.Type, b"not an object") }
+  object: ValueRef<'b>, name: ValueRef<'b>, access: u32) -> u32 ! JsException ? &mut Allocator {
   if !match name.view() { ValueBits.Symbol { .. } => true _ => false } {
     return run ops.throwError(&mut hooks,realm, NativeErrorKind.Type, b"not a symbol")
   }
-  return symbolAtom(realm, name.view())
+  let atom = symbolAtom(realm, name.view())
+  if !object.view().isObject() {
+    let nullish = match object.view() { ValueBits.Undefined => true ValueBits.Null => true _ => false }
+    if nullish && access != FIELD_DEFINE {
+      let mut message = DiagnosticMessage.make()
+      message.append(if access == FIELD_READ { b"Cannot read properties of " } else { b"Cannot set properties of " })
+      message.append(match object.view() { ValueBits.Null => b"null" _ => b"undefined" })
+      message.append(if access == FIELD_READ { b" (reading '" } else { b" (setting '" })
+      let anchor = () let state = realm.runtimeState(&anchor)
+      message.appendAtom(&state.atoms, atom) drop state
+      message.append(b"')")
+      return run ops.throwError(&mut hooks,realm, NativeErrorKind.Type, message.bytes())
+    }
+    return run fieldError(&mut hooks, realm, atom, access)
+  }
+  return atom
+}
+/// Appends value as V8's messages show a primitive operand: a string's text, an
+/// integer, true/false/undefined/null. False for anything else.
+effect fn appendOperand(message: &mut DiagnosticMessage, value: ValueBits) -> bool ! OutOfMemoryError ? &mut Allocator {
+  match value {
+    ValueBits.Undefined => { message.append(b"undefined") return true }
+    ValueBits.Null => { message.append(b"null") return true }
+    ValueBits.Bool { value: flag } => { message.append(if flag { b"true" } else { b"false" }) return true }
+    ValueBits.Int { value: number } => {
+      let mut digits: [u8; 12] = [0; 12]
+      let length = Dtoa.i32toa(&mut digits, number)
+      message.append(Slice.view<u8>(&digits, 0, length)) return true
+    }
+    ValueBits.String { .. } => {
+      let bytes = run Strings.toUtf8(value, false)
+      message.append(bytes.asSlice()) return true
+    }
+    _ => { return false }
+  }
+}
+/// V8's TypeError for `key in value` when value is not an object.
+pub effect fn throwInOperand<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
+  key: ValueBits, value: ValueBits, privateName: u32) -> never ! JsException ? &mut Allocator {
+  let mut message = DiagnosticMessage.make()
+  let built = run Effect.result(buildInOperand(&mut message, realm, key, value, privateName))
+  return match move built {
+    Result<bool, OutOfMemoryError>.Success { value: shown } => {
+      if shown { run ops.throwError(&mut hooks,realm, NativeErrorKind.Type, message.bytes()) }
+      else { run ops.throwError(&mut hooks,realm, NativeErrorKind.Type, b"Cannot use 'in' operator to search for a key in a non-object") }
+    }
+    Result<bool, OutOfMemoryError>.Failure { .. } => run hooks.throwOutOfMemory(realm)
+  }
+}
+effect fn buildInOperand<'a>(message: &mut DiagnosticMessage, realm: Realm<'a>, key: ValueBits, value: ValueBits, privateName: u32) -> bool
+  ! OutOfMemoryError ? &mut Allocator {
+  message.append(b"Cannot use 'in' operator to search for '")
+  if privateName != 0 {
+    let anchor = () let state = realm.runtimeState(&anchor)
+    message.appendAtom(&state.atoms, privateName) drop state
+  } else if !run appendOperand(&mut message, key) { return false }
+  message.append(b"' in ")
+  return run appendOperand(&mut message, value)
+}
+// V8's message when a private method's receiver lacks the class brand: the
+// class is the home object (static methods) or its constructor.
+pub effect fn throwBrand<'a, 'b, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
+  function: ValueRef<'b>) -> never ! JsException ? &mut Allocator {
+  let mut message = DiagnosticMessage.make()
+  let mut owner = ValueBits.Undefined
+  if function.view().isObject() {
+    let anchor = () let data = ObjectRef.of(function).data(&anchor)
+    match &data.payload {
+      ObjectPayload.BytecodeFunction { function: closure } => match Pointer.nonNullMut<HeapHeader>(closure.homeObject) {
+        Option<*mut HeapHeader>.Some { value } => { owner = ValueBits.Object { reference: value } }
+        Option<*mut HeapHeader>.None => ()
+      }
+      _ => ()
+    }
+  }
+  let mut owningClass = owner
+  let isStatic = owner.isObject() && hooks.isCallable(realm, unsafe lendBits(&function, owner))
+  if !isStatic {
+    owningClass = match unsafe backtrace.ownObject(owner, atoms.JS_ATOM_constructor) { Option<ValueBits>.Some { value } => value _ => ValueBits.Undefined }
+  }
+  message.append(if isStatic { b"Receiver must be class " } else { b"Receiver must be an instance of class " })
+  let mut named = false
+  match unsafe backtrace.propertyString(owningClass, atoms.JS_ATOM_name) {
+    Option<ValueBits>.Some { value: name } => {
+      let encoded = run Effect.result(Strings.toUtf8(name, false))
+      match move encoded {
+        Result<List<u8>, OutOfMemoryError>.Success { value: bytes } => {
+          if bytes.length() != 0 { message.append(bytes.asSlice()) named = true }
+        }
+        Result<List<u8>, OutOfMemoryError>.Failure { .. } => { return run hooks.throwOutOfMemory(realm) }
+      }
+    }
+    Option<ValueBits>.None => ()
+  }
+  if !named { message.append(b"anonymous") }
+  return run ops.throwError(&mut hooks,realm, NativeErrorKind.Type, message.bytes())
 }
 effect fn fieldError<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
-  atom: u32, duplicate: bool) -> never ! JsException ? &mut Allocator {
-  let mut message = DiagnosticMessage.make() message.append(b"private class field '")
+  atom: u32, access: u32) -> never ! JsException ? &mut Allocator {
+  let mut message = DiagnosticMessage.make()
+  message.append(if access == FIELD_READ { b"Cannot read private member " } else if access == FIELD_WRITE { b"Cannot write private member " } else { b"Cannot initialize " })
   let anchor = () let state = realm.runtimeState(&anchor)
   message.appendAtom(&state.atoms, atom) drop state
-  if duplicate { message.append(b"' already exists") } else { message.append(b"' does not exist") }
+  message.append(if access == FIELD_READ { b" from an object whose class did not declare it" } else if access == FIELD_WRITE { b" to an object whose class did not declare it" } else { b" twice on the same object" })
   return run ops.throwError(&mut hooks,realm, NativeErrorKind.Type, message.bytes())
 }
 effect fn materialize<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
@@ -107,9 +211,9 @@ unsafe effect fn insert<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader,
 }
 unsafe effect fn defineChecked<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
   object: ValueRef<'b>, name: ValueRef<'b>, value: ValueBits) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
-  let atom = run fieldAtom(&mut hooks, realm, object, name)
+  let atom = run fieldAtom(&mut hooks, realm, object, name, FIELD_DEFINE)
   match own(object, atom) {
-    Option<usize>.Some { .. } => { return run fieldError(&mut hooks, realm, atom, true) }
+    Option<usize>.Some { .. } => { return run fieldError(&mut hooks, realm, atom, FIELD_DEFINE) }
     Option<usize>.None => ()
   }
   run unsafe insert(&mut hooks, realm.runtime(), object.view(), atom, value)
@@ -124,20 +228,20 @@ pub unsafe effect fn definePrivateField<'a, 'b, H: HeapHooks + CoercionHooks>(ho
 }
 pub effect fn getPrivateField<'a, 'b, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
   object: ValueRef<'b>, name: ValueRef<'b>) -> ValueBits ! JsException ? &mut Allocator {
-  let atom = run fieldAtom(&mut hooks, realm, object, name)
+  let atom = run fieldAtom(&mut hooks, realm, object, name, FIELD_READ)
   let index = match own(object, atom) {
     Option<usize>.Some { value } => value
-    Option<usize>.None => { return run fieldError(&mut hooks, realm, atom, false) }
+    Option<usize>.None => { return run fieldError(&mut hooks, realm, atom, FIELD_READ) }
   }
   let value = run stored(&mut hooks, realm, object, index)
   return value.dup().intoBits()
 }
 unsafe effect fn setChecked<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
   object: ValueRef<'b>, name: ValueRef<'b>, value: ValueBits) -> () ! JsException ? &mut Allocator {
-  let atom = run fieldAtom(&mut hooks, realm, object, name)
+  let atom = run fieldAtom(&mut hooks, realm, object, name, FIELD_WRITE)
   let index = match own(object, atom) {
     Option<usize>.Some { value: found } => found
-    Option<usize>.None => { return run fieldError(&mut hooks, realm, atom, false) }
+    Option<usize>.None => { return run fieldError(&mut hooks, realm, atom, FIELD_WRITE) }
   }
   let previousRef = run stored(&mut hooks, realm, object, index)
   let previous = previousRef.view()
@@ -235,7 +339,15 @@ pub effect fn checkBrand<'a, 'b, H: CoercionHooks>(hooks: &mut H, realm: Realm<'
 }
 pub effect fn privateIn<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
   object: ValueRef<'b>, nameOrFunction: ValueRef<'b>) -> bool ! JsException ? &mut Allocator {
-  if !object.view().isObject() { return run ops.throwError(&mut hooks,realm, NativeErrorKind.Type, b"invalid 'in' operand") }
+  if !object.view().isObject() {
+    let mut privateName: u32 = 0
+    match nameOrFunction.view() {
+      ValueBits.Symbol { .. } => { privateName = symbolAtom(realm, nameOrFunction.view()) }
+      _ => ()
+    }
+    let shown = match unsafe backtrace.propertyString(nameOrFunction.view(), atoms.JS_ATOM_name) { Option<ValueBits>.Some { value } => value _ => ValueBits.Undefined }
+    return run throwInOperand(&mut hooks, realm, shown, object.view(), privateName)
+  }
   if nameOrFunction.view().isObject() { return run checkBrand(&mut hooks, realm, object, nameOrFunction) }
   let converted = run Effect.result(coercions.ownedAtom(&mut hooks, realm, nameOrFunction))
   let atom = match move converted {
