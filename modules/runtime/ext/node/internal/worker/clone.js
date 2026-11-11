@@ -7,6 +7,7 @@ const isKeyObject = types.isKeyObject;
 const { Serializer, Deserializer } = require('internal/serialization/v8');
 const { DOMException, isDOMException } = require('internal/path_events/event_target');
 const abort = require('internal/abort_controller');
+const jsTransferable = require('internal/worker/js_transferable');
 const untransferable = new WeakSet();
 const uncloneable = new WeakSet();
 const arrayBufferLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get;
@@ -26,6 +27,10 @@ function isMarkedAsUntransferable(value) { return object(value) && untransferabl
 function markAsUncloneable(value) {
   if (object(value) && !types.isArrayBuffer(value) && !types.isSharedArrayBuffer(value) && !ArrayBuffer.isView(value)) uncloneable.add(value);
 }
+function isJSTransferable(value) {
+  return (jsTransferable.getTransferMode(value) & jsTransferable.kTransferable) !== 0 &&
+    typeof value[jsTransferable.kTransfer] === 'function';
+}
 function installPortHooks(hooks) { portHooks = hooks; }
 function transferList(value) {
   if (value === undefined) return [];
@@ -35,8 +40,9 @@ function transferList(value) {
 }
 
 class CloneSerializer extends Serializer {
-  constructor(ports, shared, buffers, signals) {
+  constructor(ports, shared, buffers, signals, transferred) {
     super();
+    this.transferred = transferred;
     this.ports = ports;
     this.shared = shared;
     this.sharedIds = new Map();
@@ -70,6 +76,9 @@ class CloneSerializer extends Serializer {
     }
   }
   _isHostObject(value) {
+    if (this.transferred.has(value)) return true;
+    if (jsTransferable.getTransferMode(value) !== undefined)
+      throw cloneError('Object that needs transfer was found in message but not listed in transferList');
     if (isDOMException(value)) return true;
     if (abort.isTransferable(value)) return true;
     if (isCryptoKey(value) || isKeyObject(value) || host.types.isX509Certificate?.(value)) return true;
@@ -95,6 +104,15 @@ class CloneSerializer extends Serializer {
     return id;
   }
   _writeHostObject(value) {
+    if (this.transferred.has(value)) {
+      // A JS transferable (for example a web stream) describes itself when
+      // the serializer reaches it, outer objects before the ones they hold.
+      const transferred = value[jsTransferable.kTransfer]();
+      this.writeUint32(11);
+      this.writeValue(transferred.deserializeInfo);
+      this.writeValue(transferred.data);
+      return;
+    }
     if (abort.isTransferable(value)) {
       if (!this.signals.has(value)) throw cloneError('Object that needs transfer was found in message but not listed in transferList');
       this.writeUint32(9);
@@ -189,6 +207,11 @@ class CloneDeserializer extends Deserializer {
       if (this.realm) throw codedError('ERR_MESSAGE_TARGET_CONTEXT_UNAVAILABLE', 'A native object cannot be received in the target context', Error);
       return abort.createTransferredSignal();
     }
+    if (tag === 11) {
+      const object = jsTransferable.createDeserializedObject(this.readValue());
+      object[jsTransferable.kDeserialize](this.readValue());
+      return object;
+    }
     if (tag === 10) {
       const name = this.readValue();
       const exception = new DOMException(this.readValue(), name);
@@ -242,6 +265,7 @@ function prepare(value, list, source) {
   const shared = [];
   const seen = new Set();
   const signals = new Map();
+  const transferred = new Map();
   for (const item of transferList(list)) {
     if (seen.has(item)) throw cloneError('Transfer list contains a duplicate object.');
     seen.add(item);
@@ -258,15 +282,35 @@ function prepare(value, list, source) {
       ids.push(id);
     } else if (abort.isTransferable(item)) {
       signals.set(item, undefined);
+    } else if (isJSTransferable(item)) {
+      transferred.set(item, undefined);
     } else throw codedError('ERR_INVALID_TRANSFER_OBJECT', 'Found invalid object in transferList');
   }
   try {
+    // JS transferables name the extra objects (MessagePorts) that move with
+    // them, then describe themselves for the receiving side.
+    // The extra objects may be JS transferables themselves (a TransformStream
+    // moves its readable and writable sides); those join the queue.
+    const pending = Array.from(transferred.keys());
+    for (let index = 0; index < pending.length; index++) {
+      const item = pending[index];
+      const extra = typeof item[jsTransferable.kTransferList] === 'function' ? item[jsTransferable.kTransferList]() : [];
+      for (const other of extra || []) {
+        if (portHooks?.isPort(other)) {
+          ports.push(other);
+          ids.push(portHooks.id(other));
+        } else if (isJSTransferable(other) && !transferred.has(other)) {
+          transferred.set(other, undefined);
+          pending.push(other);
+        } else throw codedError('ERR_INVALID_TRANSFER_OBJECT', 'Found invalid object in transferList');
+      }
+    }
     for (const signal of signals.keys()) {
       const record = abort.prepareTransfer(signal);
       signals.set(signal, record);
       if (record.port) { ports.push(record.port); ids.push(portHooks.id(record.port)); }
     }
-    const serializer = new CloneSerializer(ports, shared, buffers, signals);
+    const serializer = new CloneSerializer(ports, shared, buffers, signals, transferred);
     buffers.forEach((buffer, index) => serializer.transferArrayBuffer(index, buffer));
     serializer.writeHeader();
     serializer.writeValue(value);
@@ -332,9 +376,30 @@ function decode(envelope, realm) {
 }
 function structuredClone(value, options) {
   if (arguments.length === 0) throw codedError('ERR_MISSING_ARGS', 'The value argument must be specified');
-  if (options != null && !object(options)) throw codedError('ERR_INVALID_ARG_TYPE', 'The options argument must be an object');
+  // Web IDL StructuredSerializeOptions, as in Node's js_transferable.
+  const prefix = "Failed to execute 'structuredClone'";
+  if (options != null && !object(options))
+    throw codedError('ERR_INVALID_ARG_TYPE', `${prefix}: Options cannot be converted to a dictionary`);
+  const transfer = options == null ? undefined : options.transfer;
+  let list = [];
+  if (transfer !== undefined) {
+    const sequenceError = () => codedError('ERR_INVALID_ARG_TYPE', `${prefix}: transfer in Options cannot be converted to sequence.`);
+    if (!object(transfer)) throw sequenceError();
+    const method = transfer[Symbol.iterator];
+    if (typeof method !== 'function') throw sequenceError();
+    const iterator = Reflect.apply(method, transfer, []);
+    if (!object(iterator)) throw sequenceError();
+    const next = iterator.next;
+    if (typeof next !== 'function') throw sequenceError();
+    while (true) {
+      const step = Reflect.apply(next, iterator, []);
+      if (!object(step)) throw sequenceError();
+      if (step.done) break;
+      list.push(step.value);
+    }
+  }
   let prepared;
-  try { prepared = prepare(value, options?.transfer); }
+  try { prepared = prepare(value, list); }
   catch (error) {
     if (error?.code === 'ERR_INVALID_TRANSFER_OBJECT' || error?.code === 'ERR_MISSING_TRANSFERABLE_IN_TRANSFER_LIST')
       throw cloneError(error.message);
