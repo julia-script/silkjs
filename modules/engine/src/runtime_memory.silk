@@ -378,6 +378,60 @@ impl AllocationObserver {
     unsafe startRecords(ledger)
     unsafe unlockLedger(ledger)
   }
+  /// Gives each live pooled block at addresses that has no record (it was
+  /// allocated before records were kept) a fresh allocation id, as if it were
+  /// allocated now, and keeps records from now on: a heap snapshot then names
+  /// every object by allocation id without records costing every allocation
+  /// before the first snapshot. Blocks that have a record, and addresses outside
+  /// this ledger's pooled arenas, are left alone. Owner thread only; each address
+  /// must be the start of a live block or outside the pool.
+  pub effect fn recordLive(self: &Self, addresses: &[usize]) -> () ! OutOfMemoryError ? &mut Allocator {
+    let ledger = self.ledger
+    let anchor = ()
+    // Pooled arena starts, hashed: only the owner adds or drops arenas.
+    let mut count: usize = 0
+    let mut next = (unsafe Pointer.borrow(&anchor, ledger.allocation)).firstPooledArena
+    while !Pointer.isNull(next) { count = count + 1 next = (unsafe Pointer.borrow(&anchor, unsafe Intrinsic.pointerRequalify<?*mut ArenaHeader, *mut ArenaHeader>(next))).nextLive }
+    let size = count * 2 + 1
+    let mut arenas = List<?*mut ArenaHeader>.make()
+    run arenas.reserveExact(size)
+    let mut i: usize = 0
+    while i < size { run arenas.append(Pointer.null<ArenaHeader>()) i = i + 1 }
+    next = (unsafe Pointer.borrow(&anchor, ledger.allocation)).firstPooledArena
+    while !Pointer.isNull(next) {
+      let base = Pointer.address(unsafe Intrinsic.pointerRequalify<?*mut ArenaHeader, *mut ArenaHeader>(next))
+      let mut slot = (base / ARENA_BYTES) % size
+      while !Pointer.isNull(arenas.get(slot)) { slot = (slot + 1) % size }
+      arenas.set(slot, next)
+      next = (unsafe Pointer.borrow(&anchor, unsafe Intrinsic.pointerRequalify<?*mut ArenaHeader, *mut ArenaHeader>(next))).nextLive
+    }
+    unsafe lockLedger(ledger)
+    unsafe startRecords(ledger)
+    i = 0
+    while i < addresses.length {
+      let address = addresses[i]
+      let base = address - usize.bitAnd(address, ARENA_BYTES - 1)
+      let mut slot = (base / ARENA_BYTES) % size
+      while !Pointer.isNull(arenas.get(slot)) && Pointer.address(unsafe Intrinsic.pointerRequalify<?*mut ArenaHeader, *mut ArenaHeader>(arenas.get(slot))) != base { slot = (slot + 1) % size }
+      if !Pointer.isNull(arenas.get(slot)) && address >= base + firstPoolOffset() {
+        let arena = unsafe Pointer.borrow(&anchor, unsafe Intrinsic.pointerRequalify<?*mut ArenaHeader, *mut ArenaHeader>(arenas.get(slot)))
+        let index = (address - base - firstPoolOffset()) / classBytes(arena.class)
+        if index < arena.carved {
+          let record = unsafe Pointer.atMut<PoolRecord>(unsafe Pointer.assumeManyMut<PoolRecord>(arena.records), index)
+          if (unsafe Pointer.read<PoolRecord>(record)).id == 0 {
+            let mut stateAnchor = ()
+            let state = unsafe Pointer.borrowMut(&mut stateAnchor, ledger.allocation)
+            let id = state.nextAllocationId
+            state.nextAllocationId = u64.wrappingAdd(id, 1)
+            drop state
+            unsafe Pointer.write<PoolRecord>(record, PoolRecord { id: id, requestedBytes: classBytes(arena.class), sampledEpoch: 0 })
+          }
+        }
+      }
+      i = i + 1
+    }
+    unsafe unlockLedger(ledger)
+  }
   pub fn stopProfile(self: &Self) -> Option<Recording> {
     let ledger = self.ledger
     unsafe lockLedger(ledger)
@@ -578,6 +632,29 @@ impl<A> RuntimeAllocator<A> {
     }
     return RuntimeAllocator<A> { child: move ownedChild, ledger: ledger, pooling: false, failureHandler: Option<AllocationFailureHandler>.none() }
   }
+
+  /// The control ledger's address, for an embedding that saves the whole heap and
+  /// maps it back at the same addresses in a later process (see adopt).
+  pub fn ledgerPointer(self: &Self) -> *mut u8 { return unsafe Intrinsic.pointerReinterpret<*mut Ledger, *mut u8>(self.ledger.allocation) }
+
+  /// The provider of a heap that was saved with its ledger and mapped back at the
+  /// same addresses. ledger is what ledgerPointer returned when the heap was
+  /// saved; the saved provider and its observers are the only owners counted in
+  /// it, and this provider takes the saved provider's place. The calling thread
+  /// becomes the allocating thread. New backing comes from child.
+  pub unsafe fn adopt(child: A, ledger: *mut u8) -> RuntimeAllocator<A> {
+    let pointers = unsafe pointersOf(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Ledger>(ledger))
+    let mut anchor = ()
+    let pool = unsafe Pointer.borrowMut<(), Pool>(&mut anchor, unsafe poolOf(pointers))
+    pool.ownerThread = unsafe threadPointer()
+    let pooling = pool.enabled
+    drop pool
+    return RuntimeAllocator<A> { child: move child, ledger: pointers, pooling: pooling, failureHandler: Option<AllocationFailureHandler>.none() }
+  }
+
+  /// The observer an adopted heap's saved provider had taken: it takes the place
+  /// of that observer, so no reference is added.
+  pub unsafe fn adoptedObserver(self: &Self) -> AllocationObserver { return AllocationObserver { ledger: self.ledger } }
 
   pub fn setFailureHandler(self: &mut Self, handler: Option<AllocationFailureHandler>) -> () {
     self.failureHandler = move handler
@@ -1132,6 +1209,32 @@ unsafe fn unlockLedger(ledger: LedgerPointers) -> () {
   return ()
 }
 
+/// The CPU's free-running tick counter, for timing a few hundred instructions
+/// where a clock call would cost more than what it measures; 0 on targets
+/// without one (elapsed ticks are then always 0).
+@inlineAlways
+pub unsafe fn ticks() -> usize {
+  let unused: usize = 0
+  static if Intrinsic.targetArchitecture() == "x86_64" {
+    return unsafe Intrinsic.assembly<usize>("rdtsc\nshlq $$32, %rdx\norq %rdx, %rax", "={rax},0", "rdx,flags", "none", true, false, .(unused))
+  }
+  static if Intrinsic.targetArchitecture() == "aarch64" {
+    return unsafe Intrinsic.assembly<usize>("mrs x0, cntvct_el0", "={x0},0", "", "none", true, false, .(unused))
+  }
+  return unused
+}
+/// About how many ticks() pass in a microsecond: the counter's own frequency on
+/// aarch64, a typical time stamp counter rate on x86_64 (it is not cheap to
+/// ask there, and callers only tell fast from slow by a wide margin).
+@inlineAlways
+pub unsafe fn ticksPerMicrosecond() -> usize {
+  let unused: usize = 0
+  static if Intrinsic.targetArchitecture() == "aarch64" {
+    return (unsafe Intrinsic.assembly<usize>("mrs x0, cntfrq_el0", "={x0},0", "", "none", true, false, .(unused))) / 1000000
+  }
+  static if Intrinsic.targetArchitecture() == "x86_64" { return 2500 }
+  return unused
+}
 /// Asks the CPU to start loading the cache line at address; never faults and
 /// changes no state the program can see. A no-op on targets without the hint.
 @inlineAlways
@@ -1618,34 +1721,47 @@ pub unsafe fn releasePooled(block: *mut u8) -> () {
   drop arena
   let mut poolAnchor = ()
   let pool = unsafe Pointer.borrowMut<(), Pool>(&mut poolAnchor, unsafe poolOf(ledger))
-  if !pool.ownerActive {
-    drop pool
-    if unsafe unchargePooled(ledger, block, class) { unsafe destroyLedger(ledger) }
-    return ()
-  }
+  if !pool.ownerActive { drop pool return unsafe releaseOrphaned(ledger, block, class) }
   drop pool
   return unsafe cacheOwned(ledger, block, class)
+}
+// releasePooled once the owner cache is gone: the block is uncharged, and the
+// ledger goes with its last block. Out of line, so the usual release keeps no
+// frame.
+@inlineNever
+unsafe fn releaseOrphaned(ledger: LedgerPointers, block: *mut u8, class: usize) -> () {
+  if unsafe unchargePooled(ledger, block, class) { unsafe destroyLedger(ledger) }
 }
 
 // Puts block in the owner cache. Only the allocating thread calls this, with the
 // owner cache active.
 @inlineAlways
 unsafe fn cacheOwned(ledger: LedgerPointers, block: *mut u8, class: usize) -> () {
+  // Without records there is nothing to clear, and the push is a leaf.
+  if unsafe keepsRecords(ledger) { return unsafe cacheRecorded(ledger, block, class) }
+  return unsafe pushOwned(ledger, block, class)
+}
+// cacheOwned on a ledger that keeps records: block's record is cleared first.
+// Unsampled blocks need no profile access or gate on the owning thread. Out of
+// line, so a release without records keeps no frame.
+@inlineNever
+unsafe fn cacheRecorded(ledger: LedgerPointers, block: *mut u8, class: usize) -> () {
+  let pointer = unsafe pooledRecord(block)
+  let record = unsafe Pointer.read<PoolRecord>(pointer)
+  if record.sampledEpoch != 0 {
+    unsafe lockLedger(ledger)
+    unsafe reclaimPoolRecord(ledger, block, class)
+    unsafe unlockLedger(ledger)
+  } else {
+    unsafe Pointer.write<PoolRecord>(pointer, PoolRecord { id: 0, requestedBytes: 0, sampledEpoch: 0 })
+  }
+  return unsafe pushOwned(ledger, block, class)
+}
+// Links block at the head of its class in the owner cache.
+@inlineAlways
+unsafe fn pushOwned(ledger: LedgerPointers, block: *mut u8, class: usize) -> () {
   let mut poolAnchor = ()
   let pool = unsafe Pointer.borrowMut<(), Pool>(&mut poolAnchor, unsafe poolOf(ledger))
-  // Unsampled blocks need no profile access or gate on the owning thread, and
-  // without records there is nothing to clear.
-  if unsafe keepsRecords(ledger) {
-    let pointer = unsafe pooledRecord(block)
-    let record = unsafe Pointer.read<PoolRecord>(pointer)
-    if record.sampledEpoch != 0 {
-      unsafe lockLedger(ledger)
-      unsafe reclaimPoolRecord(ledger, block, class)
-      unsafe unlockLedger(ledger)
-    } else {
-      unsafe Pointer.write<PoolRecord>(pointer, PoolRecord { id: 0, requestedBytes: 0, sampledEpoch: 0 })
-    }
-  }
   if pool.ownerCounts[class] >= OWNER_LIST_CAP { drop pool return unsafe spillOwned(ledger, block, class) }
   let head = pool.ownerHeads[class]
   let mut skip = Pointer.null<u8>()

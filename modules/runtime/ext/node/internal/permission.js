@@ -203,6 +203,8 @@ function dropScope(scope, reference) {
   } else if (own(names, scope)) state[scope] = false;
 }
 function checkFile(op, args) {
+  // Every case below checks only with the Permission Model or its audit on.
+  if (!initialized || (!state.enforce && !state.audit)) return;
   const path = args[0];
   switch (op) {
     case 'close': case 'read': case 'pread': case 'readv': case 'write': case 'pwrite': case 'writev': case 'fstat': case 'futimes': case 'ftruncate': return;
@@ -277,6 +279,7 @@ function wrapHostIO() {
     const fn = std[name];
     if (typeof fn !== 'function') continue;
     std[name] = function(...args) {
+      if (!initialized || (!state.enforce && !state.audit)) return apply(fn, undefined, args);
       const path = args[0], mode = args[1];
       if (name !== 'open' || indexOf(mode, 'r') !== -1 || indexOf(mode, '+') !== -1) check('fs.read', path);
       if (name === 'open' && (indexOf(mode, 'w') !== -1 || indexOf(mode, 'a') !== -1 || indexOf(mode, '+') !== -1)) check('fs.write', path);
@@ -329,8 +332,12 @@ function initialize(options = {}) {
     }
     define(process, 'permission', { value: { has, drop }, enumerable: true, writable: false, configurable: false });
   }
-  wrapHostIO();
-  host.installPermissionGuard(checkNative);
+  // Without --permission or --permission-audit every check passes, so host IO and native
+  // calls skip the guard entirely instead of calling into JavaScript for each one.
+  if (state.enforce || state.audit) {
+    wrapHostIO();
+    host.installPermissionGuard(checkNative);
+  }
   initialized = true;
 }
 module.exports = { optionEntries, isValueOption, applyOption, initialize, check, canRead, checkFile, checkNative,

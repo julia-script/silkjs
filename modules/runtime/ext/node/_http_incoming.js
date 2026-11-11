@@ -2,10 +2,27 @@
 const { Readable } = require('stream');
 const { error } = require('internal/http/parser');
 const single = new Set(['age', 'authorization', 'content-length', 'content-type', 'etag', 'expires', 'from', 'host', 'if-modified-since', 'if-unmodified-since', 'last-modified', 'location', 'max-forwards', 'proxy-authorization', 'referer', 'retry-after', 'server', 'user-agent']);
+// Field names repeat across requests; lower-casing each one costs more than a lookup.
+const lowered = new Map();
+function lowerName(name) {
+  let lower = lowered.get(name);
+  if (lower === undefined) {
+    lower = name.toLowerCase();
+    if (lowered.size >= 512) lowered.clear();
+    lowered.set(name, lower);
+  }
+  return lower;
+}
+const hasOwn = Object.prototype.hasOwnProperty;
 function collect(raw, distinct, join, result = {}, length = raw.length) {
   for (let i = 0; i < length; i += 2) {
-    const key = raw[i].toLowerCase(), value = raw[i + 1];
-    if (!Object.prototype.hasOwnProperty.call(result, key)) Object.defineProperty(result, key, { value: distinct || key === 'set-cookie' ? [value] : value, writable: true, enumerable: true, configurable: true });
+    const key = lowerName(raw[i]), value = raw[i + 1];
+    if (!hasOwn.call(result, key)) {
+      const first = distinct || key === 'set-cookie' ? [value] : value;
+      // A plain store would hit the __proto__ setter.
+      if (key === '__proto__') Object.defineProperty(result, key, { value: first, writable: true, enumerable: true, configurable: true });
+      else result[key] = first;
+    }
     else if (distinct || key === 'set-cookie') result[key].push(value);
     else if (!single.has(key) || join) result[key] += (key === 'cookie' ? '; ' : ', ') + value;
   }

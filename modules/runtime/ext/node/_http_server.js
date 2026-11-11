@@ -1,6 +1,6 @@
 'use strict';
 const net = require('net');
-const { setTimeout, clearTimeout } = require('timers');
+const { setInterval, clearInterval } = require('timers');
 const { OutgoingMessage, validateHeaderName, validateHeaderValue } = require('_http_outgoing');
 const { IncomingMessage } = require('_http_incoming');
 const { Parser, error, invalidValue, hasToken, setParserOptions } = require('internal/http/parser');
@@ -50,6 +50,10 @@ class Server extends net.Server {
     this.requestTimeout = options.requestTimeout === undefined ? 300000 : options.requestTimeout;
     this.headersTimeout = options.headersTimeout === undefined ? Math.min(60000, this.requestTimeout || 60000) : options.headersTimeout;
     if (this.requestTimeout > 0 && this.headersTimeout > this.requestTimeout) throw error('ERR_OUT_OF_RANGE', 'headersTimeout must not exceed requestTimeout');
+    // Like Node, header and request deadlines are checked for every connection at this
+    // interval rather than with timers per request.
+    this.connectionsCheckingInterval = options.connectionsCheckingInterval === undefined ? 30000 : options.connectionsCheckingInterval;
+    this._checkTimer = null;
     this.keepAliveTimeout = options.keepAliveTimeout === undefined ? 5000 : options.keepAliveTimeout;
     this.keepAliveTimeoutBuffer = options.keepAliveTimeoutBuffer === undefined ? 1000 : options.keepAliveTimeoutBuffer;
     this.maxHeadersCount = null; this.maxRequestsPerSocket = 0;
@@ -67,14 +71,29 @@ class Server extends net.Server {
     this.on('connection', socket => this._connection(socket));
   }
   setTimeout(msecs, callback) { this.timeout = msecs; if (callback) this.on('timeout', callback); return this; }
-  close(callback) { this._httpClosing = true; this.closeIdleConnections(); return super.close(callback); }
+  close(callback) {
+    this._httpClosing = true; this.closeIdleConnections();
+    if (this._checkTimer) { clearInterval(this._checkTimer); this._checkTimer = null; }
+    return super.close(callback);
+  }
+  _checkConnections() {
+    const now = Date.now();
+    for (const state of this._httpSockets.values()) {
+      if ((state.headerStart && this.headersTimeout > 0 && now - state.headerStart >= this.headersTimeout) ||
+          (state.requestStart && this.requestTimeout > 0 && now - state.requestStart >= this.requestTimeout)) state.expire();
+    }
+  }
   closeAllConnections() { for (const [socket] of this._httpSockets) socket.destroy(); }
   closeIdleConnections() { for (const [socket, state] of this._httpSockets) if (!state.responses.length && !state.current) socket.destroy(); }
   _connection(socket) {
-    const state = { responses: [], requests: new Set(), current: null, count: 0, upgraded: false, ended: false, failed: false, headerTimer: null, requestTimer: null };
+    const state = { responses: [], requests: new Set(), current: null, count: 0, upgraded: false, ended: false, failed: false, headerStart: 0, requestStart: 0, expire: null };
     this._httpSockets.set(socket, state);
+    if (!this._checkTimer && (this.headersTimeout > 0 || this.requestTimeout > 0) && this.connectionsCheckingInterval > 0) {
+      this._checkTimer = setInterval(() => this._checkConnections(), this.connectionsCheckingInterval);
+      this._checkTimer.unref();
+    }
     socket.setNoDelay(true); socket.setTimeout(this.timeout);
-    const clearTimers = () => { clearTimeout(state.headerTimer); clearTimeout(state.requestTimer); state.headerTimer = state.requestTimer = null; };
+    const clearTimers = () => { state.headerStart = state.requestStart = 0; };
     const clientError = err => {
       if (state.failed || state.upgraded) return;
       state.failed = true; clearTimers(); parser.stopped = true;
@@ -86,12 +105,14 @@ class Server extends net.Server {
         } else socket.destroy();
       }
     };
-    const armHeaders = () => { if (this.headersTimeout > 0 && !state.headerTimer) { state.headerTimer = setTimeout(() => clientError(error('ERR_HTTP_REQUEST_TIMEOUT', 'Request timeout')), this.headersTimeout); state.headerTimer.unref?.(); } };
+    state.expire = () => clientError(error('ERR_HTTP_REQUEST_TIMEOUT', 'Request timeout'));
+    const armHeaders = () => { if (this.headersTimeout > 0 && !state.headerStart) state.headerStart = Date.now(); };
+    const armRequest = () => { if (this.requestTimeout > 0 && !state.requestStart) state.requestStart = Date.now(); };
     const parser = new Parser('request', {
       canResume: () => !state.outputPaused,
       headers: info => {
-        clearTimeout(state.headerTimer); state.headerTimer = null;
-        if (this.requestTimeout > 0 && !state.requestTimer) { state.requestTimer = setTimeout(() => clientError(error('ERR_HTTP_REQUEST_TIMEOUT', 'Request timeout')), this.requestTimeout); state.requestTimer.unref?.(); }
+        state.headerStart = 0;
+        armRequest();
         socket.setTimeout(this.timeout);
         const req = new this._IncomingMessage(socket); Object.assign(req, info);
         req.joinDuplicateHeaders = this.joinDuplicateHeaders; req._keepAlive = info.keepAlive; req._parser = parser;
@@ -101,6 +122,7 @@ class Server extends net.Server {
         if (info.upgrade) return { upgrade: true };
         const res = new this._ServerResponse(req, this._responseOptions);
         req.res = res; res._active = state.responses.length === 0;
+        res._keepAliveTimeout = this.keepAliveTimeout; res._maxRequestsPerSocket = this.maxRequestsPerSocket;
         state.responses.push(res); res.assignSocket(socket);
         if (this.maxRequestsPerSocket > 0 && state.count >= this.maxRequestsPerSocket) res.shouldKeepAlive = false;
         res.on('error', err => socket.destroy(err));
@@ -149,7 +171,7 @@ class Server extends net.Server {
     const onData = data => {
       state.lastPacket = data;
       if (parser.state === 'headers') armHeaders();
-      if (this.requestTimeout > 0 && !state.requestTimer) { state.requestTimer = setTimeout(() => clientError(error('ERR_HTTP_REQUEST_TIMEOUT', 'Request timeout')), this.requestTimeout); state.requestTimer.unref?.(); }
+      armRequest();
       parser.feed(data);
       if (parser.state === 'headers' && parser.messageStarted) armHeaders();
     };
@@ -161,8 +183,9 @@ class Server extends net.Server {
       for (const req of state.requests) req._abort();
       for (const res of state.responses) if (!res._closed) res.destroy();
     };
-    const detach = () => { socket.removeListener('data', onData); socket.removeListener('end', onEnd); socket.removeListener('error', onError); socket.removeListener('timeout', onTimeout); socket.removeListener('close', onClose); };
-    socket.on('data', onData); socket.on('end', onEnd); socket.on('error', onError); socket.on('timeout', onTimeout); socket.on('close', onClose);
+    const onDrain = () => { if (state.responses.length) state.responses[0]._onSocketDrain(); };
+    const detach = () => { socket.removeListener('drain', onDrain); socket.removeListener('data', onData); socket.removeListener('end', onEnd); socket.removeListener('error', onError); socket.removeListener('timeout', onTimeout); socket.removeListener('close', onClose); };
+    socket.on('data', onData); socket.on('end', onEnd); socket.on('error', onError); socket.on('timeout', onTimeout); socket.on('close', onClose); socket.on('drain', onDrain);
     armHeaders();
   }
 }

@@ -29,6 +29,8 @@ import js_string_types { FlatString, AtomKind, latin1Bytes }
 import js_atoms { AtomTable }
 import js_exceptions { JsException }
 import byte_buffer { readU16, readU32 }
+import silk.num.i8
+import js_compiler_code { slotCompareShape }
 import js_opcode_data as op
 import js_atom_data as atoms
 import js_bytecode { SPECIAL_LAZY_ARGUMENTS, lazyArgumentsSite }
@@ -57,6 +59,170 @@ fn constantIndex(code: &[u8], pc: usize) -> usize {
 fn pushConstant(opcode: u8) -> bool { return opcode == op.OP_push_const || opcode == op.OP_push_const8 }
 fn classOpcode(opcode: u8) -> bool { return opcode == op.OP_define_class || opcode == op.OP_define_class_computed }
 
+/// Whether the fusion prefix at pc is followed by exactly the instructions its
+/// operand describes (js_compiler_labels emits both). The VM answers them from
+/// the operand alone, so bytes that disagree would give it an atom number, a
+/// constant or a byte count nothing else has checked.
+fn fusionPrefix(code: &[u8], pc: usize) -> bool {
+  let next = pc + 5
+  if next >= code.length { return false }
+  if code[next] == op.OP_dup {
+    // A `switch` case on a string: dup, push_atom_value of the operand's atom
+    // (which the reader relocates with the push's), strict_eq, then a branch,
+    // which the VM reads within eight bytes of the push.
+    return pc + 14 <= code.length && code[next + 1] == op.OP_push_atom_value
+      && readU32(code, next + 2) == readU32(code, pc + 1) && code[next + 6] == op.OP_strict_eq
+  }
+  if code[pc + 4] >= 0x90 { return loopComparePrefix(code, pc) }
+  if code[pc + 4] > 0x8c { return false }
+  if code[pc + 4] >= 0x89 { return storePrefix(code, pc) }
+  // A loop test's prefix whose back edge came out long: the VM passes over it.
+  if code[pc + 4] >= 0x88 { return true }
+  if code[pc + 4] >= 0x80 { return comparePrefix(code, pc) }
+  // `heap[(x + k) >> s]`: a local read, add_imm k and/or sar_imm s, get_array_el,
+  // spanning the operand's byte count.
+  let mut at = next + 1
+  let mut shift = code[pc + 1]
+  let mut span = u8.toUsize(code[pc + 4])
+  if code[pc + 4] >= 0x40 {
+    // The same with heap a captured variable or a global read first (get_scope0,
+    // the get_var_ref it stayed, which the VM then runs as it is, or get_var)
+    // and x a local or an argument, which bit 7 of the shift byte tells.
+    if next + 5 > code.length || (code[next] != op.OP_get_scope0 && code[next] != op.OP_get_var_ref && code[next] != op.OP_get_var) { return false }
+    let read = code[next + 3]
+    let argument = shift >= 0x80
+    shift = shift & 0x7f span = span & 0x1f
+    if (code[pc + 4] & 0x20) != 0 { return false }
+    if argument {
+      if read == op.OP_get_arg { if code[next + 5] != 0 { return false } at = next + 6 }
+      else if read >= op.OP_get_arg0 && read <= op.OP_get_arg3 { at = next + 4 }
+      else { return false }
+    } else if read == op.OP_get_loc8 { at = next + 5 }
+    else if read >= op.OP_get_loc0 && read <= op.OP_get_loc3 { at = next + 4 }
+    else { return false }
+  }
+  else if code[next] == op.OP_get_loc8 { at = next + 2 }
+  else if code[next] < op.OP_get_loc0 || code[next] > op.OP_get_loc3 { return false }
+  if at + 3 <= code.length && code[at] == op.OP_add_imm {
+    if readU16(code, at + 1) != readU16(code, pc + 2) { return false }
+    at = at + 3
+  } else if readU16(code, pc + 2) != 0 { return false }
+  if at + 3 <= code.length && code[at] == op.OP_sar_imm {
+    if readU16(code, at + 1) != u8.toU16(shift) || shift > 31 { return false }
+    at = at + 3
+  } else if shift != 0 { return false }
+  // An instruction follows the read: the VM looks at its opcode.
+  return at + 1 < code.length && code[at] == op.OP_get_array_el
+    && at + 1 - next == span && at + 1 - next >= 5
+}
+/// The size of the read of local (or argument) index at position, 0 when the
+/// instruction there is another one.
+fn slotRead(code: &[u8], at: usize, argument: bool, index: u8) -> usize {
+  if at + 3 > code.length { return 0 }
+  let opcode = code[at]
+  if argument {
+    if index < 4 && opcode == op.OP_get_arg0 + index { return 1 }
+    if opcode == op.OP_get_arg && readU16(code, at + 1) == u8.toU16(index) { return 3 }
+    return 0
+  }
+  if index < 4 && opcode == op.OP_get_loc0 + index { return 1 }
+  if opcode == op.OP_get_loc8 && code[at + 1] == index { return 2 }
+  return 0
+}
+/// The prefix of a comparison before a forward branch (js_vm_operators.
+/// fusedCompare): the two reads its operand names, the comparison its bits
+/// describe, spanning its byte count, and two more bytes the VM reads.
+fn comparePrefix(code: &[u8], pc: usize) -> bool {
+  let flags = code[pc + 3]
+  let span = u8.toUsize(code[pc + 4] & 7)
+  let mut at = pc + 5
+  let left = slotRead(code, at, (flags & 16) != 0, code[pc + 1])
+  if left == 0 { return false }
+  at = at + left
+  if (flags & 64) != 0 {
+    if at + 2 > code.length || code[at] != op.OP_push_i8 || code[at + 1] != code[pc + 2] { return false }
+    at = at + 2
+  } else {
+    let right = slotRead(code, at, (flags & 32) != 0, code[pc + 2])
+    if right == 0 { return false }
+    at = at + right
+  }
+  if at + 3 > code.length { return false }
+  let mut holds: u8 = 0
+  if code[at] == op.OP_lt { holds = 1 } else if code[at] == op.OP_lte { holds = 3 }
+  else if code[at] == op.OP_gt { holds = 4 } else if code[at] == op.OP_gte { holds = 6 }
+  return holds != 0 && (flags & 15) == holds && at + 1 - (pc + 5) == span
+}
+/// The prefix of `a[i] = v` (js_compiler_labels.slotStore): the reads its
+/// operand names, in the fixed forms of its shape, then put_array_el and one
+/// more instruction.
+fn storePrefix(code: &[u8], pc: usize) -> bool {
+  let first = code[pc + 1] let second = code[pc + 2] let third = code[pc + 3]
+  let shape = code[pc + 4] - 0x89
+  let kind = u8.shiftRight(third, 6)
+  let value = third & 0x3f
+  // The shape names the argument operands; the forms are fixed.
+  if ((first & 0x80) != 0) != ((shape & 1) != 0) || (kind == 1) != ((shape & 2) != 0) || kind == 3 { return false }
+  let mut at = pc + 5
+  if at + 8 > code.length { return false }
+  if (first & 0x80) != 0 {
+    if (first & 0x7f) >= 4 || code[at] != op.OP_get_arg0 + (first & 0x7f) { return false }
+    at = at + 1
+  } else {
+    if code[at] != op.OP_get_loc8 || code[at + 1] != first { return false }
+    at = at + 2
+  }
+  if (second & 0x80) != 0 { if code[at] != op.OP_get_loc8 || code[at + 1] != (second & 0x7f) { return false } }
+  else if code[at] != op.OP_push_i8 || code[at + 1] != second { return false }
+  at = at + 2
+  if kind == 0 { if code[at] != op.OP_get_loc8 || code[at + 1] != value { return false } at = at + 2 }
+  else if kind == 1 { if value >= 4 || code[at] != op.OP_get_arg0 + value { return false } at = at + 1 }
+  else { if code[at] != op.OP_push_i8 || code[at + 1] != value { return false } at = at + 2 }
+  return code[at] == op.OP_put_array_el
+}
+/// The prefix of a loop's last test (js_vm_operators.fusedSlotCompare): a
+/// shape the VM has, the read or step of its left slot, its right operand,
+/// its relation, and the if_true8 whose target its last byte repeats.
+fn loopComparePrefix(code: &[u8], pc: usize) -> bool {
+  let mode = code[pc + 1]
+  if !slotCompareShape(u8.toI32(mode)) { return false }
+  let mut at = pc + 5
+  let step = u8.shiftRight(mode, 4) & 3
+  if step != 0 {
+    if at + 3 > code.length { return false }
+    let mut stepping = op.OP_step_loc8 if (mode & 64) != 0 { stepping = op.OP_step_arg8 }
+    // step_loc8's mode: 1 pushes the new value, 2 steps down.
+    let mut wanted: u8 = 0 if step == 2 { wanted = 2 }
+    if (mode & 128) == 0 { wanted = wanted + 1 }
+    if code[at] != stepping || code[at + 1] != code[pc + 2] || code[at + 2] != wanted { return false }
+    at = at + 3
+  } else {
+    let left = slotRead(code, at, (mode & 64) != 0, code[pc + 2])
+    if left == 0 { return false }
+    at = at + left
+  }
+  let kind = u8.shiftRight(mode, 2) & 3
+  let b = code[pc + 3]
+  if at + 3 > code.length { return false }
+  if kind == 3 {
+    if code[at] != op.OP_push_i16 || u8.toUsize(b) != at - pc { return false }
+    at = at + 3
+  } else if kind == 2 {
+    if b < 2 && code[at] == op.OP_push_0 + b { at = at + 1 }
+    else if code[at] == op.OP_push_i8 && code[at + 1] == b { at = at + 2 }
+    else { return false }
+  } else {
+    let right = slotRead(code, at, kind == 1, b)
+    if right == 0 { return false }
+    at = at + right
+  }
+  if at + 3 > code.length || code[at] != op.OP_lt + (mode & 3) || code[at + 1] != op.OP_if_true8 { return false }
+  // Both ways back land on the same byte: the branch's from its displacement
+  // byte, the prefix's from its operands.
+  let branch = usize.toI64(at + 2) + i32.toI64(i8.toI32(u8.wrappingToI8(code[at + 2])))
+  let own = usize.toI64(pc + 1) + i32.toI64(i8.toI32(u8.wrappingToI8(code[pc + 4])))
+  return branch == own && own >= 0
+}
 // previous[pc] is predecessor PC + 1 at instruction boundaries, zero inside an
 // operand. Decode every byte, including unreachable instructions and operands.
 effect fn decode(code: &[u8], limits: FrameLimits) -> List<usize>
@@ -79,6 +245,17 @@ effect fn decode(code: &[u8], limits: FrameLimits) -> List<usize>
       if opcode == op.OP_put_loc_field_loc8 { run require(u8.toUsize(code[pc + 6 + u8.toUsize(op.FIELD_KEY_BYTES)]) < limits.locals, pc) }
       else { run require(u8.toUsize(code[pc + 6 + u8.toUsize(op.FIELD_KEY_BYTES)]) < limits.arguments, pc) }
     }
+    else if opcode == op.OP_step_loc8 || opcode == op.OP_get_loc_el_arg8 {
+      index = u8.toUsize(code[pc + 1]) bound = limits.locals
+      if opcode == op.OP_step_loc8 { run require(code[pc + 2] <= 3, pc) }
+      else { run require(u8.toUsize(code[pc + 2]) < limits.arguments, pc) }
+    }
+    else if opcode == op.OP_step_arg8 || opcode == op.OP_get_arg_el_arg8 {
+      index = u8.toUsize(code[pc + 1]) bound = limits.arguments
+      if opcode == op.OP_step_arg8 { run require(code[pc + 2] <= 3, pc) }
+      else { run require(u8.toUsize(code[pc + 2]) < limits.arguments, pc) }
+    }
+    else if opcode >= op.OP_add_top_arg8 && opcode <= op.OP_mul_top_arg8 { index = u8.toUsize(code[pc + 1]) bound = limits.arguments }
     else if opcode == op.OP_get_arg_field8 { index = u8.toUsize(code[pc + 5 + u8.toUsize(op.FIELD_KEY_BYTES)]) bound = limits.arguments }
     else if format == op.OP_FMT_loc { index = u16.toUsize(readU16(code, pc + 1)) bound = limits.locals }
     else if format == op.OP_FMT_loc8 { index = u8.toUsize(code[pc + 1]) bound = limits.locals }
@@ -97,6 +274,7 @@ effect fn decode(code: &[u8], limits: FrameLimits) -> List<usize>
       run require(u16.toUsize(readU16(code, pc + 1)) + 1 < limits.locals, pc)
     }
     if opcode == op.OP_special_object { run require(code[pc + 1] <= SPECIAL_LAZY_ARGUMENTS, pc) }
+    if opcode == op.OP_fuse_prefix { run require(fusionPrefix(code, pc), pc) }
     if opcode == op.OP_apply { run require(readU16(code, pc + 1) <= 1, pc) }
     if opcode == op.OP_throw_error { run require(code[pc + 5] <= 5, pc) }
     if opcode >= op.OP_with_get_var && opcode <= op.OP_with_get_ref { run require(code[pc + 9] <= 1, pc) }
@@ -444,8 +622,8 @@ unsafe effect fn tree(compiled: ValueBits, table: &AtomTable, moduleRoot: ?*mut 
         match &object.payload {
           ObjectPayload.Empty => ()
           ObjectPayload.FastArray { array } => {
-            i = 0 while i < array.values.length() {
-              run pending.append(Work { value: array.values.get(i), parent: Pointer.null<HeapHeader>(), functionAllowed: false }) i = i + 1
+            i = 0 while i < array.values().length() {
+              run pending.append(Work { value: array.values().get(i), parent: Pointer.null<HeapHeader>(), functionAllowed: false }) i = i + 1
             }
           }
           _ => { fail ValidationError { pc: 0 } }

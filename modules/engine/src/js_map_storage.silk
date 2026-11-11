@@ -29,6 +29,7 @@ import js_primitives { EqualityMode }
 import js_primitives as primitives
 import js_bigint { BigInt, ShortLimbs }
 import js_strings { Strings }
+import js_string_types { FlatString, stringReference }
 import js_coercion_host { CoercionHooks }
 import js_constructor_ops as constructors
 import js_proxy_core as core
@@ -240,19 +241,26 @@ pub unsafe fn entryValue(node: *mut HeapHeader, index: usize) -> ValueBits { let
 fn emptyKey(key: ValueBits) -> bool { return match key { ValueBits.Uninitialized => true _ => false } }
 fn hash32(value: u32) -> u32 { return u32.wrappingMultiply(value, 0x61c88647) }
 fn hash64(value: u64) -> u32 { return u64.toU32(u64.shiftRight(u64.wrappingMultiply(value, 0x61c8864680b583eb), 32)) }
+fn hashObject(object: *mut HeapHeader) -> u32 { return hash64(usize.toU64(Pointer.address<HeapHeader>(object)) ^ 0xffffffffffffffff) }
 fn bucket(hash: u32, bits: u32) -> usize { return u32.toUsize(u32.shiftRight(hash, 32 - bits)) }
+// An Int key hashes inline; every other kind goes out of line.
+@inlineAlways
 unsafe fn hash(key: ValueBits) -> u32 {
   // normalize leaves no Float equal to an Int, so the two hash apart.
   if let ValueBits.Int { value: integer } = key { return hash32(i32.wrappingToU32(integer)) }
+  return unsafe hashOther(key)
+}
+@inlineNever
+unsafe fn hashOther(key: ValueBits) -> u32 {
   if key.isNumber() {
     let mut number = key.numericValue()
     if f64.isNaN(number) { number = f64.fromBits(0x7ff8000000000000) }
     return hash64(f64.toBits(number) ^ 8)
   }
-  if key.isString() { return hash32(Strings.foldUnits(key, 0) ^ 0xfffffff9) }
+  if key.isString() { return unsafe stringHash(key) }
   match key {
     ValueBits.Bool { value: boolean } => { if boolean { return hash32(0) } return hash32(1) }
-    ValueBits.Object { reference } => { return hash64(usize.toU64(Pointer.address<HeapHeader>(reference)) ^ 0xffffffffffffffff) }
+    ValueBits.Object { reference } => { return hashObject(reference) }
     ValueBits.Symbol { reference } => { return hash64(usize.toU64(Pointer.address<HeapHeader>(reference)) ^ 0xfffffffffffffff8) }
     ValueBits.ShortBigInt { value: integer } => {
       // The same limb fold as a heap BigInt, over the canonical short limbs.
@@ -270,11 +278,47 @@ unsafe fn hash(key: ValueBits) -> u32 {
     _ => { return 0 }
   }
 }
-/// SameValueZero, answering two Ints without the general comparison.
+// A string key's hash: a fold of its units. A compact string that is not an
+// atom never changes and leaves FlatString.hash unused (zero), so its hash is
+// kept there after the first fold: a key built once and then looked up, or
+// reused from the runtime's number strings, is folded once.
+@inlineNever
+unsafe fn stringHash(key: ValueBits) -> u32 {
+  if key.tag() == -7 {
+    let mut token = ()
+    let flat = unsafe HeapCell.shortPayloadMut<FlatString, ()>(&mut token, stringReference(key))
+    if flat.compact && flat.atom == 0 && Pointer.isNull<HeapHeader>(flat.registry) {
+      if flat.hash != 0 { return flat.hash }
+      drop flat
+      let folded = hash32(Strings.foldUnits(key, 0) ^ 0xfffffff9)
+      let mut again = ()
+      let unhashed = unsafe HeapCell.shortPayloadMut<FlatString, ()>(&mut again, stringReference(key))
+      // A zero hash is simply folded again next time.
+      unhashed.hash = folded
+      return folded
+    }
+  }
+  return hash32(Strings.foldUnits(key, 0) ^ 0xfffffff9)
+}
+/// The hash stringHash left in a compact string that is not an atom, or 0 for
+/// every other key and for a string not folded yet.
+@inlineAlways
+unsafe fn keptStringHash(key: ValueBits) -> u32 {
+  if key.tag() != -7 { return 0 }
+  let token = ()
+  let flat = unsafe HeapCell.shortPayload<FlatString, ()>(&token, stringReference(key))
+  if flat.compact && flat.atom == 0 && Pointer.isNull<HeapHeader>(flat.registry) { return flat.hash }
+  return 0
+}
+/// SameValueZero, answering two Ints, or one string object met again, without
+/// the general comparison.
 @inlineAlways
 unsafe fn sameKey(stored: ValueBits, key: ValueBits) -> bool {
   if let ValueBits.Int { value: left } = stored {
     if let ValueBits.Int { value: right } = key { return left == right }
+  }
+  if let ValueBits.String { reference: left } = stored {
+    if let ValueBits.String { reference: right } = key { if Pointer.address<HeapHeader>(left) == Pointer.address<HeapHeader>(right) { return true } }
   }
   return unsafe primitives.equal(stored, key, EqualityMode.SameValueZero)
 }
@@ -290,10 +334,61 @@ unsafe fn findHashed(node: *mut HeapHeader, key: ValueBits, h: u32) -> u32 {
   }
   return NO_ENTRY
 }
+/// findHashed for an Int key: SameValueZero is equality of the two Ints (an
+/// empty slot and a normalized Float are never an Int) and a weak table holds
+/// no Int, so the walk is two compares an entry, with no call.
+@inlineAlways
+unsafe fn findInt(node: *mut HeapHeader, integer: i32, h: u32) -> u32 {
+  let a = () let s = unsafe HeapCell.payload<State, ()>(&a, node)
+  let entries = s.entries.asSlice()
+  let mut cursor = s.buckets.asSlice()[bucket(h, s.bits)]
+  while cursor != NO_ENTRY {
+    let e = &entries[u32.toUsize(cursor)]
+    if e.keyHash == h { if let ValueBits.Int { value: stored } = e.key { if stored == integer { return cursor } } }
+    cursor = e.chain
+  }
+  return NO_ENTRY
+}
+/// findHashed for an Object key: SameValueZero is identity. A weak table may
+/// still hold a dead key whose address a new object took, so a match there
+/// must also be live.
+@inlineAlways
+unsafe fn findObject(node: *mut HeapHeader, object: *mut HeapHeader, h: u32) -> u32 {
+  let a = () let s = unsafe HeapCell.payload<State, ()>(&a, node)
+  let weak = s.weak
+  let entries = s.entries.asSlice()
+  let mut cursor = s.buckets.asSlice()[bucket(h, s.bits)]
+  while cursor != NO_ENTRY {
+    let e = &entries[u32.toUsize(cursor)]
+    if e.keyHash == h {
+      if let ValueBits.Object { reference: stored } = e.key {
+        if Pointer.address<HeapHeader>(stored) == Pointer.address<HeapHeader>(object) && (!weak || unsafe gc.isWeakLive(e.key)) { return cursor }
+      }
+    }
+    cursor = e.chain
+  }
+  return NO_ENTRY
+}
+/// The entry of a normalized key, or NO_ENTRY, and the key's hash in keyHash.
+@inlineAlways
+unsafe fn locate(node: *mut HeapHeader, key: ValueBits, keyHash: &mut u32) -> u32 {
+  if let ValueBits.Int { value: integer } = key {
+    let h = hash32(i32.wrappingToU32(integer)) keyHash.* = h
+    return unsafe findInt(node, integer, h)
+  }
+  if let ValueBits.Object { reference } = key {
+    let h = hashObject(reference) keyHash.* = h
+    return unsafe findObject(node, reference, h)
+  }
+  let mut h = unsafe keptStringHash(key)
+  if h == 0 { h = unsafe hashOther(key) }
+  keyHash.* = h
+  return unsafe findHashed(node, key, h)
+}
 @inlineAlways
 unsafe fn find(node: *mut HeapHeader, input: ValueBits) -> u32 {
-  let key = normalize(input)
-  return unsafe findHashed(node, key, unsafe hash(key))
+  let mut keyHash: u32 = 0
+  return unsafe locate(node, normalize(input), &mut keyHash)
 }
 pub unsafe fn has(node: *mut HeapHeader, key: ValueBits) -> bool { return unsafe find(node, key) != NO_ENTRY }
 pub unsafe fn get(node: *mut HeapHeader, key: ValueBits) -> ValueBits {
@@ -347,6 +442,14 @@ unsafe effect fn rehash(node: *mut HeapHeader, bits: u32) -> () ! OutOfMemoryErr
   let sparse = b.cursors == 0 && u32.toUsize(b.count) * 2 < b.entries.length() drop b
   if sparse { unsafe compact(node) }
 }
+/// Whether put of a key the table does not hold may allocate (the entry list is
+/// full, or the insertion makes the table grow) or throw (a weak table rejects
+/// every key but objects and unregistered symbols; object says the key is an
+/// object). When false, put neither allocates nor fails.
+pub unsafe fn putMayFail(node: *mut HeapHeader, object: bool) -> bool {
+  let a = () let s = unsafe HeapCell.payload<State, ()>(&a, node)
+  return (s.weak && !object) || s.entries.length() == s.entries.capacity() || u32.toUsize(s.count) + 1 >= s.buckets.length()
+}
 pub unsafe effect fn put<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
   node: *mut HeapHeader, input: ValueBits, value: ValueBits) -> () ! JsException ? &mut Allocator {
   let key = normalize(input) let mut a = () let initial = unsafe HeapCell.payload<State, ()>(&a, node) let weak = initial.weak drop initial
@@ -374,9 +477,9 @@ pub unsafe effect fn put<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H, realm:
   // Live entries decide growth, as for a linked table. Erased slots only
   // cost walking past, so once they are most of the list (and no cursor holds
   // a position) they are compacted out in place, allocating nothing.
-  let grow = u32.toUsize(s.count) >= s.buckets.length() * 2 && s.bits < 30
+  let grow = u32.toUsize(s.count) >= s.buckets.length() && s.bits < 30
   let bits = s.bits + 1
-  if !grow && position + 1 >= s.buckets.length() * 2 && u32.toUsize(s.count) * 2 < position + 1 && s.cursors == 0 { drop s unsafe compact(node) } else { drop s }
+  if !grow && position + 1 >= s.buckets.length() && u32.toUsize(s.count) * 2 < position + 1 && s.cursors == 0 { drop s unsafe compact(node) } else { drop s }
   if weak { drop unsafe gc.retainWeak(key) } else { drop unsafe key.retained() }
   drop unsafe value.retained()
   if grow {
@@ -390,6 +493,33 @@ pub unsafe effect fn put<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H, realm:
       }
     }
   }
+}
+/// put when putMayFail is false for this key: the entry list has room and the
+/// table does not grow, so nothing allocates or fails, and no realm is needed.
+pub unsafe fn putWithin<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node: *mut HeapHeader, input: ValueBits, value: ValueBits) -> () {
+  let key = normalize(input)
+  let mut keyHash: u32 = 0
+  let found = unsafe locate(node, key, &mut keyHash)
+  let mut a = ()
+  if found != NO_ENTRY {
+    let owned = unsafe value.retained()
+    let s = unsafe HeapCell.payloadMut<State, ()>(&mut a, node)
+    let slot = &mut s.entries.asMutSlice()[u32.toUsize(found)]
+    let old = slot.value slot.value = owned drop s
+    unsafe gc.release(&mut hooks, runtime, old) return
+  }
+  let s = unsafe HeapCell.payloadMut<State, ()>(&mut a, node)
+  let weak = s.weak
+  let index = bucket(keyHash, s.bits)
+  let position = s.entries.length()
+  let entry = Entry { key: key, value: value, keyHash: keyHash, chain: s.buckets.asSlice()[index] }
+  if !s.entries.appendWithinCapacity(entry) { invariant() }
+  let heads = s.buckets.asMutSlice() heads[index] = usize.toU32(position)
+  s.count = s.count + 1
+  // As put compacts: erased slots are most of the list and no cursor is in it.
+  if position + 1 >= s.buckets.length() && u32.toUsize(s.count) * 2 < position + 1 && s.cursors == 0 { drop s unsafe compact(node) } else { drop s }
+  if weak { drop unsafe gc.retainWeak(key) } else { drop unsafe key.retained() }
+  drop unsafe value.retained()
 }
 /// Unlinks entry index from its bucket chain.
 unsafe fn unhash(node: *mut HeapHeader, index: u32) -> () {
@@ -464,8 +594,10 @@ pub effect fn make<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H, memory: &All
   return run create(&mut hooks, memory, realm, immediateRef(ValueBits.Undefined), magic)
 }
 unsafe effect fn initialize(object: ValueBits, magic: u32) -> *mut HeapHeader ! OutOfMemoryError ? &mut Allocator {
-  let table = run buckets(1)
-  return run HeapCell.allocate(HeapKind.Auxiliary, State { entries: List<Entry>.make(), buckets: move table, bits: 1, count: 0, cursors: 0, weak: magic >= 2,
+  // Four buckets and growth at one live entry per bucket: a lookup's chain holds
+  // one entry on average.
+  let table = run buckets(2)
+  return run HeapCell.allocate(HeapKind.Auxiliary, State { entries: List<Entry>.make(), buckets: move table, bits: 2, count: 0, cursors: 0, weak: magic >= 2,
     weakHeader: WeakRefHeader { previous: Pointer.null<WeakRefHeader>(), next: Pointer.null<WeakRefHeader>(), kind: WeakRefKind.Map, owner: core.reference(object) } })
 }
 unsafe fn objectState(object: *mut HeapHeader) -> ?*mut HeapHeader {

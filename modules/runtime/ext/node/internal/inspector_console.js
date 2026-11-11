@@ -11,7 +11,6 @@ function call(type, args, receiver, method) {
   } finally { callDepth--; }
 }
 function create(publish) {
-  const output = globalThis.console;
   const console = Object.create(null);
   const counts = new Map(), timers = new Map();
   let forwarding = 0;
@@ -45,6 +44,8 @@ function create(publish) {
     console[name] = (...args) => {
       emitConsole(name, args);
       forwarding++;
+      // The built-in console, loaded on the first forwarded call.
+      const output = require('console');
       try { return Reflect.apply(output[name], output, args); }
       finally { forwarding--; }
     };

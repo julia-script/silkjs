@@ -22,91 +22,47 @@ function live(parser) {
   if (!state.id) throw error('ERR_INVALID_STATE', 'HTTP parser is closed');
   return state;
 }
-function callback(parser, state, index, ...args) {
+const invoke = asyncHooks._invoke;
+const call0 = (fn, self) => fn.call(self);
+const call1 = (fn, self, a) => fn.call(self, a);
+const call2 = (fn, self, a) => fn.call(self, a[0], a[1]);
+const callHead = (fn, self, a) => fn.call(self, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);
+// Parser callbacks run in the parser's async scope, with fixed arguments.
+function callback(parser, state, index, call, value) {
   const fn = parser[index];
   if (typeof fn !== 'function') return undefined;
-  return state.resource ? state.resource.runInAsyncScope(fn, parser, ...args) : Reflect.apply(fn, parser, args);
+  return state.resource ? invoke(state.resource, call, fn, parser, value) : call(fn, parser, value);
 }
 function resetMessage(state) {
-  state.headers = [];
-  state.field = '';
-  state.value = '';
-  state.inField = false;
-  state.url = '';
-  state.status = '';
-  state.flushed = false;
-  state.headerPairs = 0;
-  state.maxPairs = undefined;
   state.headersComplete = false;
   state.upgrade = false;
   state.eof = false;
 }
-function flush(parser, state) {
-  if (!state.headers.length && !state.url) return;
-  const headers = state.headers, url = state.url;
-  state.headers = [];
-  state.url = '';
-  state.flushed = true;
-  callback(parser, state, HTTPParser.kOnHeaders, headers, url);
-}
+// The native side gathers the url and fields of a head and calls once at headers
+// complete (kind 7, value [major, minor, method, statusCode, upgrade, keepAlive,
+// eof, url or status text, fields]); trailers arrive with message complete (kind 9).
 function event(parser, state, kind, value, remaining) {
   state.remaining = remaining;
   switch (kind) {
     case 0:
       resetMessage(state);
-      callback(parser, state, HTTPParser.kOnMessageBegin);
-      break;
-    case 1: state.url += value; break;
-    case 2: state.status += value; break;
-    case 3:
-      if (!state.inField) {
-        state.inField = true;
-        state.headerPairs += 2;
-        if (state.type === HTTPParser.REQUEST) {
-          if (state.maxPairs === undefined) {
-            const maximum = parser.maxHeaderPairs;
-            state.maxPairs = typeof maximum === 'number' && maximum > 0 ? maximum : 0;
-          }
-          if (state.maxPairs > 0 && state.headerPairs > state.maxPairs) {
-            native(9, state.id, 1);
-            return 24;
-          }
-        }
-        if (state.headers.length >= 62) flush(parser, state);
-      }
-      state.field += value;
-      break;
-    case 4: state.value += value; break;
-    case 6:
-      state.headers.push(state.field, state.value);
-      state.field = state.value = '';
-      state.inField = false;
+      callback(parser, state, HTTPParser.kOnMessageBegin, call0);
       break;
     case 7: {
-      const [major, minor, method, statusCode, upgrade, keepAlive, eof] = value;
-      let headers = state.headers;
-      let url = state.type === HTTPParser.REQUEST ? state.url : undefined;
-      if (state.flushed) { flush(parser, state); headers = url = undefined; }
-      state.headers = [];
-      state.url = '';
-      state.headerPairs = 0;
-      state.maxPairs = undefined;
+      const request = state.type === HTTPParser.REQUEST;
       state.headersComplete = true;
-      state.upgrade = upgrade;
-      state.eof = eof;
-      const result = callback(parser, state, HTTPParser.kOnHeadersComplete,
-        major, minor, headers, state.type === HTTPParser.REQUEST ? method : undefined,
-        url, state.type === HTTPParser.RESPONSE ? statusCode : undefined,
-        state.type === HTTPParser.RESPONSE ? state.status : undefined,
-        upgrade, keepAlive);
+      state.upgrade = value[4];
+      state.eof = value[6];
+      const result = callback(parser, state, HTTPParser.kOnHeadersComplete, callHead,
+        [value[0], value[1], value[8], request ? value[2] : undefined, request ? value[7] : undefined,
+          request ? undefined : value[3], request ? undefined : value[7], value[4], value[5]]);
       return state.pauseRequested && !result ? 21 : result | 0;
     }
-    case 8: callback(parser, state, HTTPParser.kOnBody, Buffer.from(value)); break;
+    case 8: callback(parser, state, HTTPParser.kOnBody, call1, Buffer.from(value)); break;
     case 9:
-      if (state.headers.length) flush(parser, state);
-      state.headerPairs = 0;
+      if (value !== undefined) callback(parser, state, HTTPParser.kOnHeaders, call2, [value, '']);
       state.headersComplete = false;
-      callback(parser, state, HTTPParser.kOnMessageComplete);
+      callback(parser, state, HTTPParser.kOnMessageComplete, call0);
       break;
   }
   return state.pauseRequested && (kind === 0 || kind === 8 || kind === 9) ? 21 : 0;
@@ -136,7 +92,7 @@ function resetAsync(state, owner, id) {
 class HTTPParser {
   constructor() {
     const state = { id: 0, type: HTTPParser.REQUEST, resource: null, provider: 0, frame: undefined, consuming: null,
-      currentRead: null, executing: false, pauseRequested: false, remaining: 0, remainder: null };
+      currentRead: null, executing: false, pauseRequested: false, remaining: 0, remainder: null, maxHeaderPairs: undefined };
     resetMessage(state);
     state.callback = (kind, value, remaining) => event(this, state, kind, value, remaining);
     state.id = native(0, new WeakRef(state.callback));
@@ -160,6 +116,12 @@ class HTTPParser {
     native(2, state.id, type, maxHeaderSize || 16384, lenientFlags >>> 0);
     state.provider = type === HTTPParser.REQUEST ? HTTPINCOMINGMESSAGE : HTTPCLIENTREQUEST;
     resetAsync(state, resource || this);
+  }
+  get maxHeaderPairs() { return states.get(this)?.maxHeaderPairs; }
+  set maxHeaderPairs(value) {
+    const state = stateOf(this);
+    state.maxHeaderPairs = value;
+    if (state.id) native(11, state.id, typeof value === 'number' && value > 0 ? value : 0);
   }
   getAsyncId() { return stateOf(this).resource?.asyncId() ?? -1; }
   getProviderType() { const state = stateOf(this); return state.id ? state.provider : 0; }
@@ -210,11 +172,11 @@ class HTTPParser {
       throw error('ERR_INVALID_ARG_TYPE', 'stream must be a native socket handle');
     this.unconsume();
     const consumer = { parser: this, read: (status, payload) => {
-      if (status < 0) { callback(this, state, HTTPParser.kOnExecute, status); return; }
+      if (status < 0) { callback(this, state, HTTPParser.kOnExecute, call1, status); return; }
       if (!payload?.byteLength) return;
       const buffer = Buffer.from(payload);
       state.currentRead = buffer;
-      try { callback(this, state, HTTPParser.kOnExecute, this.execute(buffer)); }
+      try { callback(this, state, HTTPParser.kOnExecute, call1, this.execute(buffer)); }
       finally { state.currentRead = null; }
     } };
     (socket._streamConsumers ||= []).push(consumer);

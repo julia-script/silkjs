@@ -7,13 +7,17 @@ import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.num.f64
 import silk.num.i32
+import silk.num.i16
+import silk.num.u16
 import silk.num.usize
 import silk.num.i64
 import silk.num.u8
 import silk.num.u32
+import silk.num.u64
+import silk.num.i8
 import silk.mem.pointer { Pointer }
 import js_heap { HeapCell, HeapHeader }
-import js_core_types { ObjectData, RuntimeState }
+import js_core_types { ObjectData, RuntimeState, scopeSlot }
 import js_value { ValueBits, fitsShortBigInt }
 import js_owned_value { lendBits }
 import js_vm_state { Machine, cellAt }
@@ -220,6 +224,143 @@ pub unsafe fn floatOperands(machine: &Machine, x: &mut f64, y: &mut f64) -> bool
 pub unsafe fn finishBinary(machine: &mut Machine, result: ValueBits) -> () {
   unsafe machine.set(2, result) unsafe machine.discard(1)
 }
+/// The payload word of a cell: its second word (the first is the tag, as
+/// pushCopy's word pair assumes).
+@inlineAlways
+unsafe fn payloadWord(cell: *mut ValueBits) -> *mut u64 {
+  return unsafe Pointer.atMut<u64>(unsafe Pointer.assumeManyMut<u64>(unsafe Intrinsic.pointerReinterpret<*mut ValueBits, *mut u64>(cell)), 1)
+}
+/// Replaces two Int operands with an Int: the left cell keeps its tag, so the
+/// payload alone is written. The whole word, as readers load it: a 4-byte
+/// store under their 8-byte load would not forward (Crypto ran 19% slower).
+@inlineAlways
+pub unsafe fn finishInt(machine: &mut Machine, value: i32) -> () {
+  unsafe Pointer.write<u64>(unsafe payloadWord(unsafe cellAt(machine.stackTop, usize.wrappingSubtract(0, 2))), u32.toU64(bits(value)))
+  unsafe machine.discard(1)
+}
+/// The top operand, an Int, becomes another Int: the payload word alone is written.
+@inlineAlways
+pub unsafe fn replaceInt(machine: &Machine, value: i32) -> () {
+  unsafe Pointer.write<u64>(unsafe payloadWord(unsafe cellAt(machine.stackTop, usize.wrappingSubtract(0, 1))), u32.toU64(bits(value)))
+}
+/// x + y, x - y and x * y on two Int operands, finished in place: the exact
+/// result in 64 bits, an Int when it fits (one range test, no overflow idiom)
+/// and the exact double otherwise.
+@inlineAlways
+pub unsafe fn finishIntSum(machine: &mut Machine, x: i32, y: i32) -> () {
+  let wide = i32.toI64(x) + i32.toI64(y)
+  if wide >= -2147483648 && wide <= 2147483647 { unsafe finishInt(&mut machine, i64.wrappingToI32(wide)) }
+  else { unsafe finishBinary(&mut machine, ValueBits.Float64 { value: i64.toF64(wide) }) }
+}
+@inlineAlways
+pub unsafe fn finishIntDifference(machine: &mut Machine, x: i32, y: i32) -> () {
+  let wide = i32.toI64(x) - i32.toI64(y)
+  if wide >= -2147483648 && wide <= 2147483647 { unsafe finishInt(&mut machine, i64.wrappingToI32(wide)) }
+  else { unsafe finishBinary(&mut machine, ValueBits.Float64 { value: i64.toF64(wide) }) }
+}
+/// x + k on a top operand that is an Int, in place.
+@inlineAlways
+pub unsafe fn replaceIntSum(machine: &Machine, x: i32, k: i32) -> () {
+  let wide = i32.toI64(x) + i32.toI64(k)
+  if wide >= -2147483648 && wide <= 2147483647 { unsafe replaceInt(&machine, i64.wrappingToI32(wide)) }
+  else { unsafe machine.set(1, ValueBits.Float64 { value: i64.toF64(wide) }) }
+}
+/// A zero product may be -0 (a negative operand), so only a nonzero product
+/// that fits takes the Int path; intProduct answers the rest.
+@inlineAlways
+pub unsafe fn finishIntProduct(machine: &mut Machine, x: i32, y: i32) -> () {
+  let wide = i32.toI64(x) * i32.toI64(y)
+  if wide != 0 && wide >= -2147483648 && wide <= 2147483647 { unsafe finishInt(&mut machine, i64.wrappingToI32(wide)) }
+  else { unsafe finishBinary(&mut machine, intProduct(x, y)) }
+}
+/// step_loc8 and step_arg8 on a number: the slot at cell steps by one (down
+/// when mode has 2) and its new value (mode has 1) or its old one is pushed.
+/// An Int slot keeps its tag, so its payload word alone is written. False
+/// (another tag, or a step out of the Int range) changes nothing.
+@inlineAlways
+pub unsafe fn stepCell(machine: &mut Machine, cell: *mut ValueBits, mode: u8) -> bool {
+  let delta = 1 - u8.toI32(mode & 2)
+  match unsafe Pointer.read<ValueBits>(cell) {
+    ValueBits.Int { value } => {
+      // The one Int the step cannot leave an Int: the maximum going up, the
+      // minimum (its bits one more) going down.
+      if bits(value) == 0x7fffffff + u8.toU32(mode / 2) { return false }
+      let next = i32.wrappingAdd(value, delta)
+      unsafe Pointer.write<u64>(unsafe payloadWord(cell), u32.toU64(bits(next)))
+      let mut pushed = value if (mode & 1) != 0 { pushed = next }
+      unsafe machine.push(ValueBits.Int { value: pushed })
+      return true
+    }
+    _ => {
+      if !unsafe floatStep(cell, machine.stackTop, delta, (mode & 1) != 0) { return false }
+      machine.stackTop = unsafe cellAt(machine.stackTop, 1)
+      return true
+    }
+  }
+}
+/// stepCell on a Float64 slot, out of line so the Int path stays in registers.
+@inlineNever
+unsafe fn floatStep(cell: *mut ValueBits, out: *mut ValueBits, delta: i32, prefix: bool) -> bool {
+  match unsafe Pointer.read<ValueBits>(cell) {
+    ValueBits.Float64 { value } => {
+      let next = steppedFloat(value + i32.toF64(delta))
+      if prefix { unsafe Pointer.write<ValueBits>(out, next) } else { unsafe Pointer.write<ValueBits>(out, ValueBits.Float64 { value: value }) }
+      unsafe Pointer.write<ValueBits>(cell, next)
+      return true
+    }
+    _ => { return false }
+  }
+}
+/// The operator a step mode stands for: post_inc, inc, post_dec or dec.
+pub fn stepOpcode(mode: u8) -> u8 {
+  if mode == 0 { return op.OP_post_inc }
+  if mode == 1 { return op.OP_inc }
+  if mode == 2 { return op.OP_post_dec }
+  return op.OP_dec
+}
+/// cellArithmetic's result for two Ints when it is no Int (it left the range,
+/// or is a zero product that may be -0): stored out of line.
+@cold
+unsafe fn storeWide(out: *mut ValueBits, value: ValueBits) -> () { unsafe Pointer.write<ValueBits>(out, value) }
+@inlineAlways
+fn floatArithmetic(a: f64, b: f64, opcode: u8) -> ValueBits {
+  if opcode == op.OP_mul { return ValueBits.Float64 { value: a * b } }
+  if opcode == op.OP_sub { return ValueBits.Float64 { value: a - b } }
+  return ValueBits.Float64 { value: a + b }
+}
+/// add, sub or mul (opcode, a constant at each call) of two cells read in
+/// place, for the local-operand opcodes (add_loc_loc8 to mul_top_loc8): two
+/// numbers write the result to out, which may be left; false writes nothing.
+@inlineAlways
+pub unsafe fn cellArithmetic(left: *mut ValueBits, right: *mut ValueBits, out: *mut ValueBits, opcode: u8) -> bool {
+  match unsafe Pointer.read<ValueBits>(left) {
+    ValueBits.Int { value: x } => match unsafe Pointer.read<ValueBits>(right) {
+      ValueBits.Int { value: y } => {
+        // The Int result is written on its own branch: as one selected value
+        // it would wait for the double's conversion on every pass.
+        if opcode == op.OP_mul {
+          let product = i32.toI64(x) * i32.toI64(y)
+          if product != 0 && product >= -2147483648 && product <= 2147483647 { unsafe Pointer.write<ValueBits>(out, ValueBits.Int { value: i64.wrappingToI32(product) }) }
+          else { unsafe storeWide(out, intProduct(x, y)) }
+          return true
+        }
+        let mut wide = i32.toI64(x) + i32.toI64(y)
+        if opcode == op.OP_sub { wide = i32.toI64(x) - i32.toI64(y) }
+        if wide >= -2147483648 && wide <= 2147483647 { unsafe Pointer.write<ValueBits>(out, ValueBits.Int { value: i64.wrappingToI32(wide) }) }
+        else { unsafe storeWide(out, ValueBits.Float64 { value: i64.toF64(wide) }) }
+        return true
+      }
+      ValueBits.Float64 { value: b } => { unsafe Pointer.write<ValueBits>(out, floatArithmetic(i32.toF64(x), b, opcode)) return true }
+      _ => { return false }
+    }
+    ValueBits.Float64 { value: a } => match unsafe Pointer.read<ValueBits>(right) {
+      ValueBits.Float64 { value: b } => { unsafe Pointer.write<ValueBits>(out, floatArithmetic(a, b, opcode)) return true }
+      ValueBits.Int { value: y } => { unsafe Pointer.write<ValueBits>(out, floatArithmetic(a, i32.toF64(y), opcode)) return true }
+      _ => { return false }
+    }
+    _ => { return false }
+  }
+}
 /// A comparison followed by a forward if_false8/if_true8: pops the operands
 /// (the caller releases any it owns) and takes the branch here, skipping the
 /// Bool and a dispatch. False
@@ -234,6 +375,79 @@ pub unsafe fn fusedBranch(machine: &mut Machine, answer: bool) -> bool {
   unsafe machine.discard(2)
   unsafe machine.skip(2)
   if answer == (next == op.OP_if_true8) { unsafe machine.jump(displacement, 1) }
+  return true
+}
+/// fusedBranch that also takes a loop's back edge: a taken backward branch
+/// counts down the interrupt poll (counter, see interrupts.dueAt) and leaves
+/// the pass where the poll is due to the branch opcode, which handles it.
+@inlineAlways
+pub unsafe fn fusedLoopBranch(machine: &mut Machine, counter: *mut i32, answer: bool) -> bool {
+  let next = unsafe machine.peekU8(0)
+  if next != op.OP_if_false8 && next != op.OP_if_true8 { return false }
+  let displacement = unsafe machine.peekI8At(1)
+  let taken = answer == (next == op.OP_if_true8)
+  if displacement < 0 && taken {
+    let left = unsafe Pointer.read<i32>(counter)
+    if left <= 1 { return false }
+    unsafe Pointer.write<i32>(counter, left - 1)
+  }
+  unsafe machine.discard(2)
+  unsafe machine.skip(2)
+  if taken { unsafe machine.jump(displacement, 1) }
+  return true
+}
+/// A Float64 product followed by add or sub whose left operand (below the
+/// product's two) is a Float64, as in `c + a * b` and `c - a * b`: the sum
+/// replaces all three operands here, skipping the product's push and a
+/// dispatch. False leaves everything to the ordinary path.
+@inlineAlways
+pub unsafe fn fusedProduct(machine: &mut Machine, product: f64) -> bool {
+  let next = unsafe machine.peekU8(0)
+  if next != op.OP_add && next != op.OP_sub { return false }
+  let left = match unsafe machine.top(3) { ValueBits.Float64 { value } => value _ => { return false } }
+  let mut result = left + product
+  if next == op.OP_sub { result = left - product }
+  unsafe machine.set(3, ValueBits.Float64 { value: result })
+  unsafe machine.discard(2)
+  unsafe machine.skip(1)
+  return true
+}
+/// A field read about to push value when the next instruction is mul, add or
+/// sub and both value and the operand under it are Float64, as in `a * o.f`
+/// and `a - o.f`: the result replaces that operand here, with no push and no
+/// dispatch, and a product goes on to a following add or sub as fusedProduct
+/// does. The caller has stepped past the read. False leaves the push and the
+/// operator to the ordinary path. (The same in get_loc8 cost more
+/// instructions than the dispatches it saved.)
+@inlineAlways
+pub unsafe fn fusedOperand(machine: &mut Machine, value: ValueBits) -> bool {
+  let right = match value { ValueBits.Float64 { value: b } => b _ => { return false } }
+  let next = unsafe machine.peekU8(0)
+  if next != op.OP_mul && next != op.OP_add && next != op.OP_sub { return false }
+  let left = match unsafe machine.top(1) { ValueBits.Float64 { value: a } => a _ => { return false } }
+  unsafe machine.skip(1)
+  if next == op.OP_mul {
+    let product = left * right
+    let after = unsafe machine.peekU8(0)
+    if after == op.OP_add || after == op.OP_sub {
+      match unsafe machine.top(2) {
+        ValueBits.Float64 { value: base } => {
+          let mut sum = base + product
+          if after == op.OP_sub { sum = base - product }
+          unsafe machine.set(2, ValueBits.Float64 { value: sum })
+          unsafe machine.discard(1)
+          unsafe machine.skip(1)
+          return true
+        }
+        _ => ()
+      }
+    }
+    unsafe machine.set(1, ValueBits.Float64 { value: product })
+    return true
+  }
+  let mut result = left + right
+  if next == op.OP_sub { result = left - right }
+  unsafe machine.set(1, ValueBits.Float64 { value: result })
   return true
 }
 /// x + y and x - y on Ints: an overflow-checked i32 operation, and the exact
@@ -260,8 +474,269 @@ pub fn intProduct(x: i32, y: i32) -> ValueBits {
   if (x == 0 || y == 0) && (x < 0 || y < 0) { return ValueBits.Float64 { value: f64.fromBits(0x8000000000000000) } }
   return intNumber(i32.toI64(x) * i32.toI64(y))
 }
-pub fn intShiftLeft(x: i32, y: i32) -> ValueBits { return ValueBits.Int { value: signed(u32.shiftLeft(bits(x), bits(y) & 31)) } }
-pub fn intShiftRight(x: i32, y: i32) -> ValueBits { return ValueBits.Int { value: i32.shiftRight(x, u32.toI32(bits(y) & 31)) } }
+@inlineAlways
+pub fn intShiftLeft(x: i32, y: i32) -> i32 { return signed(u32.shiftLeft(bits(x), bits(y) & 31)) }
+@inlineAlways
+pub fn intShiftRight(x: i32, y: i32) -> i32 { return i32.shiftRight(x, u32.toI32(bits(y) & 31)) }
+/// x >>> y on Ints: an Int while the unsigned result fits one.
+@inlineAlways
+pub fn intUnsignedShiftRight(x: i32, y: i32) -> ValueBits {
+  let shifted = u32.shiftRight(bits(x), bits(y) & 31)
+  if shifted <= 2147483647 { return ValueBits.Int { value: signed(shifted) } }
+  return ValueBits.Float64 { value: u32.toF64(shifted) }
+}
+/// The fusion prefix before a string case (ip at its operand, the covered atom; then the covered `dup,
+/// push_atom_value, strict_eq` and a forward if_true8 or if_false8): a `switch`
+/// case on a flat string. The bytes to move ip by: to the branch's target or
+/// past it, with the stack as it was (nothing is pushed or retained), or past
+/// the operand alone, which leaves the four instructions to run. The caller
+/// moves ip once (see fusedAddressElement).
+@inlineAlways
+pub unsafe fn fusedCaseAtom(machine: &Machine, word: u64) -> usize {
+  // The branch and its displacement, loaded before any exit like word (see
+  // fusedAddressElement); the covered instructions span thirteen bytes.
+  let tail = unsafe machine.peekU64At(5)
+  let value = unsafe machine.top(1)
+  if value.tag() != -7 { return 4 }
+  let branch = u64.wrappingToU8(u64.shiftRight(tail, 48))
+  if branch != op.OP_if_false8 && branch != op.OP_if_true8 { return 4 }
+  let displacement = i8.toI32(u8.wrappingToI8(u64.wrappingToU8(u64.shiftRight(tail, 56))))
+  if displacement < 0 { return 4 }
+  let anchor = () let rt = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)
+  let literal = rt.atoms.borrowedString(u64.wrappingToU32(word)) drop rt
+  if literal.tag() != -7 { return 4 }
+  let same = sameString(value, literal) || (!Strings.knownDistinct(value, literal) && unsafe sameText(value, literal))
+  // A taken branch lands displacement bytes past its displacement byte.
+  if same == (branch == op.OP_if_true8) { return 12 + i32.toUsize(displacement) }
+  return 13
+}
+/// The fusion prefix before a loop's test on a local or an argument, the last
+/// thing before its short if_true8 back edge (ip at its operands in word: the
+/// mode, the left slot, the right slot or immediate, and a last byte; then the
+/// covered read or step_loc8 / step_arg8 of the left slot, the read or push of
+/// the right operand, and lt, lte, gt or gte). Mode: bits 0-1 the relation
+/// (lt, lte, gt, gte), bits 2-3 the right operand (0 a local, 1 an argument,
+/// 2 an Int immediate, 3 the covered push_i16's, found that many bytes past
+/// the operands), bits 4-5 the step of the left slot (1 up, 2 down), bit 6 the
+/// left slot is an argument, bit 7 the value compared is the one before the
+/// step. The last byte is the distance back from the operands to the loop's
+/// top, 0x90 and up (fuseBackEdges); 0x88 until then, and for good when the
+/// branch came out long: such a prefix does nothing. Below 0x88 the prefix is
+/// fusedCompare's. Numbers answer 0 or 1 here, and the step is stored; 2
+/// touches nothing and leaves the covered instructions to run. Each shape the
+/// compiler emits (js_compiler_code.slotCompareShape) has its own copy,
+/// decoded ahead of time.
+@inlineAlways
+pub unsafe fn fusedSlotCompare(machine: &Machine, word: u64) -> u32 {
+  match u64.wrappingToU32(word) & 0xfc {
+    0 => { return unsafe slotCompareAs(machine, word, 0) }
+    4 => { return unsafe slotCompareAs(machine, word, 4) }
+    8 => { return unsafe slotCompareAs(machine, word, 8) }
+    64 => { return unsafe slotCompareAs(machine, word, 64) }
+    68 => { return unsafe slotCompareAs(machine, word, 68) }
+    72 => { return unsafe slotCompareAs(machine, word, 72) }
+    16 => { return unsafe slotCompareAs(machine, word, 16) }
+    20 => { return unsafe slotCompareAs(machine, word, 20) }
+    24 => { return unsafe slotCompareAs(machine, word, 24) }
+    32 => { return unsafe slotCompareAs(machine, word, 32) }
+    36 => { return unsafe slotCompareAs(machine, word, 36) }
+    40 => { return unsafe slotCompareAs(machine, word, 40) }
+    12 => { return unsafe slotCompareAs(machine, word, 12) }
+    28 => { return unsafe slotCompareAs(machine, word, 28) }
+    44 => { return unsafe slotCompareAs(machine, word, 44) }
+    76 => { return unsafe slotCompareAs(machine, word, 76) }
+    168 => { return unsafe slotCompareAs(machine, word, 168) }
+    232 => { return unsafe slotCompareAs(machine, word, 232) }
+    _ => { return 2 }
+  }
+}
+/// The byte count from the prefix's operands (at ip) to the end of the
+/// instructions it covers, for the back edge form that does not carry it.
+@inlineNever
+pub unsafe fn slotCompareEnd(first: u8, second: u8) -> usize {
+  return 4 + u8.toUsize(op.opcodeInfo(first, true).size) + u8.toUsize(op.opcodeInfo(second, true).size) + 1
+}
+/// fusedSlotCompare for one shape: mode's bits 2-7, a constant at each call.
+@inlineAlways
+unsafe fn slotCompareAs(machine: &Machine, word: u64, mode: u32) -> u32 {
+  let a = u64.toUsize(u64.shiftRight(word, 8) & 0xff)
+  let b = u64.toUsize(u64.shiftRight(word, 16) & 0xff)
+  let mut left = unsafe machine.localCell(a)
+  if (mode & 64) != 0 { left = unsafe machine.argumentCell(a) }
+  // The right cell is only read when the operand is a slot; the float path
+  // takes cells, never the machine, so the register machine stays in registers.
+  let kind = u32.shiftRight(mode, 2) & 3
+  let mut right = left
+  if kind == 0 { right = unsafe machine.localCell(b) }
+  if kind == 1 { right = unsafe machine.argumentCell(b) }
+  let before = match unsafe Pointer.read<ValueBits>(left) { ValueBits.Int { value } => value _ => { return unsafe floatSlotCompare(left, right, word) } }
+  let step = u32.shiftRight(mode, 4) & 3
+  // The one Int the step cannot leave an Int (see stepCell).
+  if step != 0 && bits(before) == 0x7fffffff + (step - 1) { return 2 }
+  let mut y = i32.toI64(i8.toI32(u8.wrappingToI8(usize.toU8(b))))
+  // A wider immediate is read from the covered push_i16, b bytes on.
+  if kind == 3 { y = i32.toI64(i16.toI32(u16.wrappingToI16(unsafe machine.peekU16At(b)))) }
+  else if kind != 2 {
+    match unsafe Pointer.read<ValueBits>(right) {
+      ValueBits.Int { value } => { y = i32.toI64(value) }
+      ValueBits.Float64 { value: _ } => { return unsafe mixedSlotCompare(left, right, word) }
+      _ => { return 2 }
+    }
+  }
+  let mut x = before
+  if step != 0 {
+    let after = i32.wrappingAdd(before, 3 - 2 * u32.toI32(step))
+    unsafe Pointer.write<u64>(unsafe payloadWord(left), u32.toU64(bits(after)))
+    if (mode & 128) == 0 { x = after }
+  }
+  // lte is lt against one more; gt and gte are lte and lt, negated.
+  let relation = u64.wrappingToU32(word)
+  let negated = u32.shiftRight(relation, 1) & 1
+  let more = (relation ^ negated) & 1
+  let mut answer: u32 = 0
+  if i32.toI64(x) < y + u32.toI64(more) { answer = 1 }
+  return answer ^ negated
+}
+/// slotCompareAs with an Int left slot (not at the step's limit) against a
+/// Float64 slot: a loop bound that went through a division or a
+/// multiplication. A bound that is an Int in value becomes one in its slot
+/// (never a negative zero), so the next pass compares Ints.
+@inlineNever
+unsafe fn mixedSlotCompare(left: *mut ValueBits, right: *mut ValueBits, word: u64) -> u32 {
+  let mode = u64.wrappingToU32(word) & 0xff
+  let step = u32.shiftRight(mode, 4) & 3
+  let before = match unsafe Pointer.read<ValueBits>(left) { ValueBits.Int { value } => value _ => { return 2 } }
+  let bound = match unsafe Pointer.read<ValueBits>(right) { ValueBits.Float64 { value } => value _ => { return 2 } }
+  if bound != 0.0 {
+    match steppedFloat(bound) {
+      ValueBits.Int { value } => { unsafe Pointer.write<ValueBits>(right, ValueBits.Int { value: value }) }
+      _ => {}
+    }
+  }
+  let mut x = before
+  if step != 0 {
+    let after = i32.wrappingAdd(before, 3 - 2 * u32.toI32(step))
+    unsafe Pointer.write<u64>(unsafe payloadWord(left), u32.toU64(bits(after)))
+    if (mode & 128) == 0 { x = after }
+  }
+  return floatRelation(i32.toF64(x), bound, mode)
+}
+/// The relation in mode's low two bits (lt, lte, gt, gte) on doubles, 0 or 1.
+@inlineAlways
+fn floatRelation(x: f64, y: f64, mode: u32) -> u32 {
+  let mut left = x let mut right = y
+  // gt and gte are lt and lte with the operands exchanged.
+  if (mode & 2) != 0 { left = y right = x }
+  if (mode & 1) != 0 { if left <= right { return 1 } return 0 }
+  if left < right { return 1 }
+  return 0
+}
+/// A stepped Float64 as the value to store: an Int when it is one (a counter
+/// that started from a double bound steps on the Int paths from then on; a
+/// step never yields a negative zero).
+@inlineAlways
+pub fn steppedFloat(value: f64) -> ValueBits {
+  if value >= -2147483648.0 && value <= 2147483647.0 {
+    let whole = f64.toI32(value)
+    if i32.toF64(whole) == value { return ValueBits.Int { value: whole } }
+  }
+  return ValueBits.Float64 { value: value }
+}
+/// fusedSlotCompare when the left slot is no Int: a Float64 answers here, out
+/// of line; anything else is 2.
+@inlineNever
+unsafe fn floatSlotCompare(left: *mut ValueBits, right: *mut ValueBits, word: u64) -> u32 {
+  let mode = u64.wrappingToU32(word) & 0xff
+  let b = u64.toUsize(u64.shiftRight(word, 16) & 0xff)
+  let step = u32.shiftRight(mode, 4) & 3
+  let before = match unsafe Pointer.read<ValueBits>(left) { ValueBits.Float64 { value } => value _ => { return 2 } }
+  let mut y = i32.toF64(i8.toI32(u8.wrappingToI8(usize.toU8(b))))
+  if (u32.shiftRight(mode, 2) & 3) == 3 { return 2 }
+  if (u32.shiftRight(mode, 2) & 3) != 2 {
+    match unsafe Pointer.read<ValueBits>(right) {
+      ValueBits.Int { value } => { y = i32.toF64(value) }
+      ValueBits.Float64 { value } => { y = value }
+      _ => { return 2 }
+    }
+  }
+  let mut x = before
+  if step != 0 {
+    let after = before + i32.toF64(3 - 2 * u32.toI32(step))
+    unsafe Pointer.write<ValueBits>(left, steppedFloat(after))
+    if (mode & 128) == 0 { x = after }
+  }
+  return floatRelation(x, y, mode)
+}
+/// The fusion prefix before a comparison and its branch (ip at its operand: the
+/// left index; the right index or i8; then bits 0 to 2 whether the comparison
+/// holds when left is below, equal to or above right (bit 3, unordered, is 0), 4 a left
+/// argument, 5 a right argument, 6 a right i8; then 128 plus the bytes the two
+/// reads and the comparison take, after which comes the branch when it came
+/// out as a forward if_false8 or if_true8): `i < n` as a loop or `if` test on
+/// locals, arguments and a small constant. Two numbers compare in place, with
+/// nothing pushed. The bytes to move ip by, as fusedCaseAtom gives them. One
+/// straight path: choosing among fixed layouts by a second jump table cost
+/// more time than the dispatches the prefix saves.
+@inlineAlways
+pub unsafe fn fusedCompare(machine: &Machine, word: u64) -> usize {
+  let span = u64.toUsize(u64.shiftRight(word, 24) & 7)
+  let pair = unsafe machine.peekU16At(4 + span)
+  // if_true8 is if_false8 plus one; a backward branch polls interrupts.
+  if (pair & 0x80fe) != u8.toU16(op.OP_if_false8) { return 4 }
+  let rightByte = u64.wrappingToU8(u64.shiftRight(word, 8))
+  let mut right = ValueBits.Int { value: i8.toI32(u8.wrappingToI8(rightByte)) }
+  if (word & 0x400000) == 0 {
+    let cells = if (word & 0x200000) != 0 { machine.arguments } else { machine.locals }
+    right = unsafe Pointer.read<ValueBits>(unsafe cellAt(cells, u8.toUsize(rightByte)))
+  }
+  let cells = if (word & 0x100000) != 0 { machine.arguments } else { machine.locals }
+  let left = unsafe Pointer.read<ValueBits>(unsafe cellAt(cells, u64.toUsize(word & 0xff)))
+  // Two Ints first, on one straight path; a Float64 on either side after it.
+  let mut order: u64 = 16
+  let mut whole = false
+  match left {
+    ValueBits.Int { value: x } => match right {
+      ValueBits.Int { value: y } => { whole = true if x >= y { order = 17 } if x > y { order = 18 } }
+      _ => {}
+    }
+    _ => {}
+  }
+  if !whole {
+    let a = match left { ValueBits.Float64 { value } => value ValueBits.Int { value } => i32.toF64(value) _ => { return 4 } }
+    let b = match right { ValueBits.Float64 { value } => value ValueBits.Int { value } => i32.toF64(value) _ => { return 4 } }
+    order = floatOrder(a, b)
+  }
+  // A taken branch lands displacement bytes past its displacement byte.
+  // if_true8 is odd: taken when the comparison holds; if_false8 when not.
+  if ((u64.shiftRight(word, order) ^ u16.toU64(pair)) & 1) == 0 { return span + 5 + u16.toUsize(u16.shiftRight(pair, 8)) }
+  return span + 6
+}
+/// The bit of fusedCompare's operand that answers a against b.
+@inlineAlways
+fn floatOrder(a: f64, b: f64) -> u64 {
+  if a < b { return 16 }
+  if a == b { return 17 }
+  if a > b { return 18 }
+  return 19
+}
+/// Whether both operands are strings, for the strict equality arms.
+@inlineAlways
+pub unsafe fn textOperands(machine: &Machine) -> bool {
+  return (unsafe machine.top(2)).isString() && (unsafe machine.top(1)).isString()
+}
+/// Whether the top operand is an Int and `or_imm 0` comes next: the coercion
+/// leaves the Int as it is, so the caller skips its three bytes.
+@inlineAlways
+pub unsafe fn intCoercionNext(machine: &Machine) -> bool {
+  if unsafe machine.peekU8(0) != op.OP_or_imm || unsafe machine.peekU16At(1) != 0 { return false }
+  return match unsafe machine.top(1) { ValueBits.Int { .. } => true _ => false }
+}
+/// Whether `or_imm 0` comes next: `(x + y) | 0` of two Ints is their wrapped
+/// sum, so add and sub answer it as an Int and skip the coercion's three bytes.
+@inlineAlways
+pub unsafe fn intCoercionAhead(machine: &Machine) -> bool {
+  return unsafe machine.peekU8(0) == op.OP_or_imm && unsafe machine.peekU16At(1) == 0
+}
 /// neg on a Float64, or on an Int whose negation is an Int (not 0, which gives
 /// -0, nor the minimum); false leaves the operand to step.
 @inlineAlways
@@ -298,12 +773,12 @@ pub unsafe fn stepTop(machine: &mut Machine, delta: i32, postfix: bool) -> bool 
 }
 /// Float64 counters (the microbench driver's n is one): writes cell + delta to
 /// out and returns true, or returns false for any other tag. Float64 stays
-/// Float64, as floatResult in js_unary_operators does not compact.
+/// Float64 unless the step lands on an Int (steppedFloat).
 @inlineNever
 unsafe fn floatBump(cell: *mut ValueBits, out: *mut ValueBits, delta: i32) -> bool {
   match unsafe Pointer.read<ValueBits>(cell) {
     ValueBits.Float64 { value } => {
-      unsafe Pointer.write<ValueBits>(out, ValueBits.Float64 { value: value + i32.toF64(delta) })
+      unsafe Pointer.write<ValueBits>(out, steppedFloat(value + i32.toF64(delta)))
       return true
     }
     _ => { return false }
@@ -383,7 +858,7 @@ fn sameString(a: ValueBits, b: ValueBits) -> bool {
 @inlineAlways
 unsafe fn storedLocal(machine: &Machine) -> i64 {
   let next = unsafe machine.peekU8(0)
-  if next >= op.OP_put_loc0 && next <= op.OP_set_loc3 { return u8.toI64(u8.bitAnd(next - op.OP_put_loc0, 3)) }
+  if next >= op.OP_put_loc0 && next <= op.OP_put_loc3 { return u8.toI64(next - op.OP_put_loc0) }
   if next == op.OP_put_loc8 || next == op.OP_set_loc8 { return u8.toI64(unsafe machine.peekU8(1)) }
   if next == op.OP_put_loc || next == op.OP_set_loc || next == op.OP_put_loc_check || next == op.OP_set_loc_check { return u8.toI64(unsafe machine.peekU8(1)) + 256 * u8.toI64(unsafe machine.peekU8(2)) }
   return -1
@@ -395,14 +870,23 @@ unsafe fn storedSlotHolds(machine: &Machine, value: ValueBits) -> bool {
   let index = unsafe storedLocal(&machine)
   if index >= 0 { return sameString(unsafe machine.local(i64.toUsize(index)), value) }
   let next = unsafe machine.peekU8(0)
-  if next >= op.OP_put_arg0 && next <= op.OP_put_arg3 {
-    return sameString(unsafe machine.argument(u8.toUsize(u8.bitAnd(next - op.OP_put_arg0, 3))), value)
-  }
   if next == op.OP_put_arg || next == op.OP_set_arg {
     let slot = u8.toUsize(unsafe machine.peekU8(1)) + 256 * u8.toUsize(unsafe machine.peekU8(2))
     return sameString(unsafe machine.argument(slot), value)
   }
+  // A captured variable of the running scope: `s += piece` in the function
+  // that declares s for its closures.
+  if next == op.OP_put_scope0 || next == op.OP_set_scope0 || next == op.OP_put_scope0_check {
+    return sameString(unsafe scopedValue(&machine, 1), value)
+  }
   return false
+}
+/// The running scope's slot named by the u16 at offset bytes past ip.
+@inlineAlways
+unsafe fn scopedValue(machine: &Machine, offset: usize) -> ValueBits {
+  let slot = u8.toUsize(unsafe machine.peekU8(offset)) + 256 * u8.toUsize(unsafe machine.peekU8(offset + 1))
+  let scope = unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(machine.scope)
+  return unsafe Pointer.read<ValueBits>(unsafe scopeSlot(scope, slot))
 }
 /// addText's `left + right + atom` for the push_atom_value and add after this add.
 @inlineNever
@@ -458,6 +942,42 @@ unsafe fn textNumber(runtime: *mut HeapHeader, text: ValueBits) -> ValueBits {
   if old.isString() { releaseString(old) }
   return number
 }
+/// OP_add's `s = s + piece` or `s += piece` of a short flat Latin-1 piece
+/// into the buffer of the flat string s that only the stored local or scope
+/// slot and the operand stack hold, the store included (see addStored): the
+/// append made once per character while a string is built. It never allocates,
+/// so it has none of addTextEntry's frame. False leaves everything untouched.
+@inlineNever
+pub unsafe fn addStoredShort(machine: &mut Machine) -> bool {
+  let right = unsafe machine.top(1)
+  let left = unsafe machine.top(2)
+  if right.tag() != -7 || left.tag() != -7 { return false }
+  let next = unsafe machine.peekU8(0)
+  let mut width: usize = 1
+  let mut slot = ValueBits.Undefined
+  if next >= op.OP_put_loc0 && next <= op.OP_put_loc3 { slot = unsafe machine.local(u8.toUsize(next - op.OP_put_loc0)) }
+  else if next == op.OP_put_loc8 { slot = unsafe machine.local(u8.toUsize(unsafe machine.peekU8(1))) width = 2 }
+  else if next == op.OP_put_scope0 { slot = unsafe scopedValue(&machine, 1) width = 3 }
+  else { return false }
+  if !sameString(slot, left) { return false }
+  // One unit first (a scanner's `text += String.fromCharCode(code)`), then any short piece.
+  if !Strings.appendUnitLatin1(left, right) && !unsafe appendStoredPiece(left, right) { return false }
+  // The operand's reference goes with the store; the slot keeps its own.
+  Strings.dropHolder(left)
+  unsafe machine.discard(2)
+  unsafe machine.skip(width)
+  // The piece usually has another holder (a cached unit string, a variable):
+  // its last reference goes to a tail call, so this path keeps no frame.
+  if Strings.heldOnce(right) { return unsafe releasedPiece(right) }
+  Strings.dropHolder(right)
+  return true
+}
+/// addStoredShort's piece of more than one unit (Strings.appendShortLatin1).
+@inlineNever
+unsafe fn appendStoredPiece(left: ValueBits, right: ValueBits) -> bool { return Strings.appendShortLatin1(left, right, 2) }
+/// Frees addStoredShort's piece, whose last reference the operand stack held.
+@inlineNever
+unsafe fn releasedPiece(piece: ValueBits) -> bool { releaseString(piece) return true }
 /// OP_add's own entry to addText, when either operand is a string.
 @inlineNever
 pub unsafe effect fn addTextEntry(machine: &mut Machine) -> bool ! OutOfMemoryError | StringLengthError ? &mut Allocator {
@@ -487,7 +1007,8 @@ unsafe effect fn addStored(machine: &mut Machine, left: ValueBits, right: ValueB
   let mut slot = ValueBits.Undefined
   if next >= op.OP_put_loc0 && next <= op.OP_put_loc3 { slot = unsafe machine.local(u8.toUsize(next - op.OP_put_loc0)) }
   else if next == op.OP_put_loc8 { slot = unsafe machine.local(u8.toUsize(unsafe machine.peekU8(1))) width = 2 }
-  else if next >= op.OP_put_arg0 && next <= op.OP_put_arg3 { slot = unsafe machine.argument(u8.toUsize(next - op.OP_put_arg0)) }
+  else if next == op.OP_put_arg { slot = unsafe machine.argument(u8.toUsize(unsafe machine.peekU8(1)) + 256 * u8.toUsize(unsafe machine.peekU8(2))) width = 3 }
+  else if next == op.OP_put_scope0 { slot = unsafe scopedValue(&machine, 1) width = 3 }
   else { return false }
   if sameString(slot, right) {
     if !Strings.prependIntoRoom(right, left, 2) { return false }
@@ -495,7 +1016,7 @@ unsafe effect fn addStored(machine: &mut Machine, left: ValueBits, right: ValueB
     // The operand's reference goes with the store; the slot keeps its own.
     Strings.dropHolder(right)
   } else if sameString(slot, left) {
-    if !run Strings.appendShortLatin1(left, right, 2) { return false }
+    if !Strings.appendShortLatin1(left, right, 2) { return false }
     releaseString(right)
     Strings.dropHolder(left)
   } else { return false }
@@ -503,25 +1024,44 @@ unsafe effect fn addStored(machine: &mut Machine, left: ValueBits, right: ValueB
   unsafe machine.skip(width)
   return true
 }
-/// addTextEntry's `n + ''`: below 256 the runtime's cached decimal string,
-/// otherwise a new flat string. False, with the operands untouched, when the
-/// allocation fails, so the generic path runs and reports it.
-@inlineNever
-unsafe effect fn intPlusEmpty(machine: &mut Machine, integer: i32, empty: ValueBits) -> bool ? &mut Allocator {
-  let mut text = ValueBits.Undefined
+// The decimal text of integer for `n + ''`: below 256 the runtime's cached
+// string, otherwise a new flat string. Undefined when the allocation fails.
+@inlineAlways
+unsafe effect fn integerText(machine: &Machine, integer: i32) -> ValueBits ? &mut Allocator {
   if integer >= 0 && integer < 256 {
     match move run Effect.result(unitStrings.decimal(unsafe lendRealm(&machine.context, machine.context), i32.toU32(integer))) {
-      Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => { text = value }
-      Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error } => { drop error return false }
-    }
-  } else {
-    match move run Effect.result(Strings.fromInteger(integer)) {
-      Result<ValueBits, OutOfMemoryError>.Success { value } => { text = value }
-      Result<ValueBits, OutOfMemoryError>.Failure { error } => { drop error return false }
+      Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => { return value }
+      Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error } => { drop error return ValueBits.Undefined }
     }
   }
+  match move run Effect.result(Strings.fromInteger(integer)) {
+    Result<ValueBits, OutOfMemoryError>.Success { value } => { return value }
+    Result<ValueBits, OutOfMemoryError>.Failure { error } => { drop error return ValueBits.Undefined }
+  }
+}
+/// addTextEntry's `n + ''`: the number's text (see integerText). False, with
+/// the operands untouched, when the allocation fails, so the generic path runs
+/// and reports it.
+@inlineNever
+unsafe effect fn intPlusEmpty(machine: &mut Machine, integer: i32, empty: ValueBits) -> bool ? &mut Allocator {
+  let text = run unsafe integerText(&machine, integer)
+  match text { ValueBits.Undefined => { return false } _ => () }
   releaseString(empty)
   unsafe machine.set(2, text) unsafe machine.discard(1)
+  return true
+}
+/// Whether the top of the stack is an Int.
+@inlineAlways
+pub unsafe fn intTop(machine: &Machine) -> bool { return match unsafe machine.top(1) { ValueBits.Int { .. } => true _ => false } }
+/// push_empty_string directly before add, with an Int on top: its text
+/// replaces it, so "" is never pushed and the caller steps over the add.
+/// False, with the Int untouched, when the allocation fails.
+@inlineNever
+pub unsafe effect fn intTextTop(machine: &Machine) -> bool ? &mut Allocator {
+  let integer = match unsafe machine.top(1) { ValueBits.Int { value } => value _ => { return false } }
+  let text = run unsafe integerText(&machine, integer)
+  match text { ValueBits.Undefined => { return false } _ => () }
+  unsafe machine.set(1, text)
   return true
 }
 /// OP_add with a string operand and a string or number partner, without the
@@ -540,7 +1080,7 @@ unsafe effect fn addText(machine: &mut Machine) -> bool ! OutOfMemoryError | Str
   if left.isString() && right.isString() {
     if unsafe storedSlotHolds(&machine, left) {
       // The common short Latin-1 piece onto a buffer with room: no reference juggling.
-      if run Strings.appendShortLatin1(left, right, 2) {
+      if Strings.appendShortLatin1(left, right, 2) {
         releaseString(right)
         unsafe machine.discard(1)
         return true
@@ -690,6 +1230,7 @@ pub unsafe fn sameText(a: ValueBits, b: ValueBits) -> bool {
 /// to step); two objects, two symbols or two booleans compare as strict.
 @inlineAlways
 pub unsafe fn looseIdentity(a: ValueBits, b: ValueBits) -> i32 {
+  if a.isString() && b.isString() { return flag(sameString(a, b) || (!knownDistinct(a, b) && unsafe sameText(a, b))) }
   let leftNullish = nullish(a) let rightNullish = nullish(b)
   if leftNullish && rightNullish { return 1 }
   if leftNullish { if unsafe htmlDda(b) { return -1 } return 0 }
@@ -700,7 +1241,6 @@ pub unsafe fn looseIdentity(a: ValueBits, b: ValueBits) -> i32 {
     ValueBits.Bool { value: x } => { return match b { ValueBits.Bool { value: y } => flag(x == y) _ => -1 } }
     _ => ()
   }
-  if a.isString() && b.isString() { return flag(sameString(a, b) || unsafe sameText(a, b)) }
   return -1
 }
 @inlineAlways
@@ -942,7 +1482,7 @@ pub unsafe fn addLocalNumbers(machine: &mut Machine) -> bool {
 @inlineNever
 pub unsafe effect fn appendLocal(local: ValueBits, stackTop: *mut ValueBits) -> bool ! OutOfMemoryError ? &mut Allocator {
   let input = unsafe Pointer.read<ValueBits>(unsafe cellAt(stackTop, usize.wrappingSubtract(0, 1)))
-  if !run Strings.appendShortLatin1(local, input, 1) { return false }
+  if !Strings.appendShortLatin1(local, input, 1) { return false }
   releaseString(input)
   return true
 }
@@ -966,7 +1506,7 @@ pub unsafe effect fn addLocal<H: HeapHooks>(hooks: &mut H, machine: &mut Machine
   let local = unsafe machine.local(index) let input = unsafe machine.top(1)
   // The arm already took number pairs, so `s += piece` comes first: a short
   // Latin-1 piece onto a buffer with room, written in place.
-  if run Strings.appendShortLatin1(local, input, 1) {
+  if Strings.appendShortLatin1(local, input, 1) {
     unsafe machine.skip(1) unsafe machine.discard(1)
     releaseString(input)
     return true

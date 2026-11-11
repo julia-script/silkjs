@@ -412,7 +412,19 @@ registerWasmRealm(globalThis, {
   suspending(value) { return suspension.get(value); },
   jsTag() { return records.get(JSTag).handle; },
 });
-const JSTag = wrap('tag', native('tag', ['externref']), { parameters: ['externref'] });
+// JSTag's native tag is made when first asked for: loading this module opens no store.
+const JSTag = Object.create(Tag.prototype);
+const jsTagState = { kind: 'tag', type: { parameters: ['externref'] }, exports: undefined };
+Object.defineProperty(jsTagState, 'handle', {
+  configurable: true,
+  get() {
+    const handle = native('tag', ['externref']);
+    Object.defineProperty(jsTagState, 'handle', { value: handle });
+    wrappers.set(handle, new WeakRef(JSTag));
+    return handle;
+  },
+});
+records.set(JSTag, jsTagState);
 const WebAssembly = {};
 const definitions = {
   compile, validate, instantiate, Module, Instance, Table, Memory, Global, Tag, JSTag,

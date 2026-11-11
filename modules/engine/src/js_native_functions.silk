@@ -45,7 +45,6 @@ import js_exceptions { JsException }
 import js_atom_data as atoms
 import js_class_data as classes
 import js_collection_intrinsics as collections
-import js_map_storage as mapStorage
 import js_number_intrinsics as numberIntrinsics
 import js_string_intrinsics_metadata as stringIds
 import js_string_intrinsics_basic as stringBasic
@@ -535,6 +534,23 @@ fn quickMath(method: u32, argv: FrameSlots) -> ValueBits {
   }
   return ValueBits.Uninitialized
 }
+// parseInt(n) of a number with no radix: an Int reads back as itself, and a
+// double whose decimal text has no exponent (1e-6 <= |n| < 1e21) parses as its
+// integer part, sign kept (parseInt(-0.5) is -0). Anything else returns
+// Uninitialized and takes the full native call.
+@inlineNever
+fn quickParseInt(argv: FrameSlots) -> ValueBits {
+  if argv.length() != 1 { return ValueBits.Uninitialized }
+  match unsafe argv.get(0) {
+    ValueBits.Int { value } => { return ValueBits.Int { value: value } }
+    ValueBits.Float64 { value } => {
+      let size = f64.fromBits(f64.toBits(value) & 0x7fffffffffffffff)
+      if size >= 1e-6 && size < 1e21 { return ValueBits.number(f64.trunc(value)) }
+    }
+    _ => ()
+  }
+  return ValueBits.Uninitialized
+}
 /// What quick and quickWrite read of a native function: read once per call.
 pub struct QuickTarget { pub id: NativeFunctionId, pub protocol: NativeCallProtocol, pub realm: ?*mut HeapHeader }
 impl Copy for QuickTarget {}
@@ -577,6 +593,7 @@ pub fn quick<'a, 'b, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>, target: &Qui
       return collections.quickRead(&mut hooks, realm, family, method, receiver, argv)
     }
     if family == BuiltinFamily.Math && !isData { return quickMath(method, argv) }
+    if family == BuiltinFamily.Number && method == numberIntrinsics.PARSE_INT { return quickParseInt(argv) }
   }
   return ValueBits.Uninitialized
 }
@@ -662,10 +679,11 @@ pub const OBJECT_METHOD_NONE: u8 = 0
 pub const OBJECT_METHOD_PUSH: u8 = 1
 pub const OBJECT_METHOD_FROM_CHAR_CODE: u8 = 2
 pub const OBJECT_METHOD_POP: u8 = 3
-/// A Map, Set, WeakMap or WeakSet method: quickCollection decides.
+/// A Map, Set, WeakMap or WeakSet method: the VM's collectionInline decides.
 pub const OBJECT_METHOD_COLLECTION: u8 = 4
 /// A Math method: mathCall answers it through quickMath when its arguments are numbers.
 pub const OBJECT_METHOD_MATH: u8 = 5
+pub const OBJECT_METHOD_CLOCK: u8 = 6
 /// Which of Array.prototype.push and String.fromCharCode function is, if either.
 @inlineAlways
 pub unsafe fn objectMethod(function: ValueBits) -> u8 {
@@ -680,6 +698,7 @@ pub unsafe fn objectMethod(function: ValueBits) -> u8 {
         else if family == BuiltinFamily.Map || family == BuiltinFamily.Set || family == BuiltinFamily.WeakMap || family == BuiltinFamily.WeakSet { OBJECT_METHOD_COLLECTION }
         else if family == BuiltinFamily.String && method == stringIds.FROM_CHAR_CODE && native.protocol != NativeCallProtocol.Data { OBJECT_METHOD_FROM_CHAR_CODE }
         else if family == BuiltinFamily.Math && native.protocol != NativeCallProtocol.Data { OBJECT_METHOD_MATH }
+        else if family == BuiltinFamily.Date && method == DATE_NOW && native.protocol != NativeCallProtocol.Data { OBJECT_METHOD_CLOCK }
         else { OBJECT_METHOD_NONE }
       }
       _ => OBJECT_METHOD_NONE
@@ -703,40 +722,27 @@ pub unsafe fn mathCall(function: ValueBits, argv: FrameSlots) -> ValueBits {
   if !found { return ValueBits.Uninitialized }
   return quickMath(method, argv)
 }
-/// get, has and delete (one argument) or set and add (two) of a Map, Set,
-/// WeakMap or WeakSet called as a method (objectMethod's COLLECTION): the
-/// answers quick and quickWrite give, without their dispatch. none declines.
-pub unsafe effect fn quickCollection<H: HeapHooks + CoercionHooks>(hooks: &mut H, function: ValueBits, receiver: ValueBits,
-  argv: &FrameSlots) -> Option<ValueBits> ! JsException ? &mut Allocator {
-  let target = match unsafe quickTarget(function) { Option<QuickTarget>.Some { value } => value Option<QuickTarget>.None => { return Option<ValueBits>.none() } }
-  let home = match Pointer.nonNullMut<HeapHeader>(target.realm) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return Option<ValueBits>.none() } }
-  let mut family = BuiltinFamily.Map let mut method: u32 = 0
-  match target.id { NativeFunctionId.Builtin { family: builtin, method: id } => { family = builtin method = id } _ => { return Option<ValueBits>.none() } }
-  // The storage calls directly: quickRead and quickMethod would find the
-  // receiver's state and decode the method again.
-  let kind = collections.magic(family)
-  let node = match Pointer.nonNullMut<HeapHeader>(unsafe mapStorage.state(receiver, kind)) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return Option<ValueBits>.none() } }
-  let count = argv.length()
-  let key = unsafe argv.get(0)
-  if method == collections.SET {
-    // set(key, value) on a Map or WeakMap, add(value) on a Set or WeakSet.
-    let isSet = (kind & 1) != 0
-    if target.protocol != NativeCallProtocol.GenericMagic || (isSet && count != 1) || (!isSet && count != 2) { return Option<ValueBits>.none() }
-    // Weak collections take object keys only: any other throws in the full call.
-    if kind >= 2 && !key.isObject() { return Option<ValueBits>.none() }
-    let mut stored = ValueBits.Undefined
-    if !isSet { stored = unsafe argv.get(1) }
-    run unsafe mapStorage.put(&mut hooks, unsafe lendRealm(&home, home), node, key, stored)
-    return Option<ValueBits>.some(unsafe receiver.retained())
+/// What a function objectMethod classified OBJECT_METHOD_COLLECTION calls:
+/// the collection kind (collections.magic), the method id, whether its protocol
+/// is GenericMagic (as set and add are), and its realm. found is false for any
+/// other function.
+pub struct CollectionMethod { pub found: bool, pub generic: bool, pub kind: u32, pub method: u32, pub realm: ?*mut HeapHeader }
+@inlineAlways
+pub unsafe fn collectionMethod(function: ValueBits) -> CollectionMethod {
+  let mut answer = CollectionMethod { found: false, generic: false, kind: 0, method: 0, realm: Pointer.null<HeapHeader>() }
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference(function))
+  match &data.payload {
+    ObjectPayload.NativeFunction { function: native } => {
+      if let NativeFunctionId.Builtin { family, method } = native.function {
+        let mut kind: u32 = 4
+        if family == BuiltinFamily.Map { kind = 0 } else if family == BuiltinFamily.Set { kind = 1 }
+        else if family == BuiltinFamily.WeakMap { kind = 2 } else if family == BuiltinFamily.WeakSet { kind = 3 }
+        answer = CollectionMethod { found: kind != 4, generic: native.protocol == NativeCallProtocol.GenericMagic, kind: kind, method: method, realm: native.realm() }
+      }
+    }
+    _ => ()
   }
-  if count != 1 { return Option<ValueBits>.none() }
-  if method == collections.GET { return Option<ValueBits>.some(unsafe mapStorage.get(node, key)) }
-  if method == collections.HAS { return Option<ValueBits>.some(ValueBits.Bool { value: unsafe mapStorage.has(node, key) }) }
-  if method == collections.DELETE {
-    let runtime = (unsafe lendRealm(&home, home)).runtime()
-    return Option<ValueBits>.some(ValueBits.Bool { value: unsafe mapStorage.erase(&mut hooks, runtime, node, key) })
-  }
-  return Option<ValueBits>.none()
+  return move answer
 }
 /// String.fromCharCode(value) for an Int value whose code unit is cached as a
 /// one-unit string (js_unit_strings): that string, retained; else Uninitialized
@@ -763,6 +769,32 @@ pub unsafe fn isCharCodeAt(function: ValueBits) -> bool {
       _ => false
     }
     _ => false
+  }
+}
+/// unitMethod's answers: the intrinsic String.prototype.charCodeAt and
+/// String.fromCharCode, the two calls a scanner or a string builder makes per
+/// character.
+pub const UNIT_METHOD_NONE: u8 = 0
+pub const UNIT_METHOD_CHAR_CODE_AT: u8 = 1
+pub const UNIT_METHOD_FROM_CHAR_CODE: u8 = 2
+/// Which of the two per-character String intrinsics function is, in one pass
+/// over its payload (isCharCodeAt and objectMethod each walk it again).
+@inlineAlways
+pub unsafe fn unitMethod(function: ValueBits) -> u8 {
+  let object = match function { ValueBits.Object { reference } => reference _ => { return UNIT_METHOD_NONE } }
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  if data.classId() != classes.JS_CLASS_C_FUNCTION { return UNIT_METHOD_NONE }
+  return match &data.payload {
+    ObjectPayload.NativeFunction { function: native } => match native.function {
+      NativeFunctionId.Builtin { family, method } => {
+        if family != BuiltinFamily.String || native.protocol == NativeCallProtocol.Data { UNIT_METHOD_NONE }
+        else if method == stringIds.CHAR_CODE_AT { UNIT_METHOD_CHAR_CODE_AT }
+        else if method == stringIds.FROM_CHAR_CODE { UNIT_METHOD_FROM_CHAR_CODE }
+        else { UNIT_METHOD_NONE }
+      }
+      _ => UNIT_METHOD_NONE
+    }
+    _ => UNIT_METHOD_NONE
   }
 }
 /// Whether function is an intrinsic Number.prototype method, which quickWrite
@@ -881,6 +913,48 @@ pub effect fn stringOfInteger(target: &QuickTarget, argv: &FrameSlots) -> Option
     _ => { return Option<ValueBits>.none() }
   }
   return run integerText(target.realm, number)
+}
+/// Whether function is the intrinsic String constructor, called as a function;
+/// realm then takes its realm (null for none).
+@inlineAlways
+unsafe fn stringConstructorRealm(function: ValueBits, realm: &mut ?*mut HeapHeader) -> bool {
+  let object = match function { ValueBits.Object { reference } => reference _ => { return false } }
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  if data.classId() != classes.JS_CLASS_C_FUNCTION { return false }
+  match &data.payload {
+    ObjectPayload.NativeFunction { function: native } => {
+      if native.protocol != NativeCallProtocol.ConstructorOrFunction { return false }
+      match native.function {
+        NativeFunctionId.Builtin { family, method } => {
+          if family != BuiltinFamily.String || method != stringIds.CONSTRUCTOR { return false }
+        }
+        _ => { return false }
+      }
+      realm.* = native.realm()
+    }
+    _ => { return false }
+  }
+  return true
+}
+/// stringOfInteger for a call site that has only the callee: `String(n)` on an
+/// Int n when function is the intrinsic String constructor. None declines.
+@inlineAlways
+pub unsafe effect fn stringCallOfInteger(function: ValueBits, number: i32) -> Option<ValueBits> ? &mut Allocator {
+  let mut realm = Pointer.null<HeapHeader>()
+  if !unsafe stringConstructorRealm(function, &mut realm) { return Option<ValueBits>.none() }
+  return run integerText(realm, number)
+}
+/// stringCallOfInteger when the runtime already holds the text
+/// (unitStrings.cachedInteger): it allocates nothing, so the caller need not
+/// publish its pc. Uninitialized declines.
+@inlineAlways
+pub unsafe fn stringCallCached(function: ValueBits, number: i32) -> ValueBits {
+  let mut realm = Pointer.null<HeapHeader>()
+  if !unsafe stringConstructorRealm(function, &mut realm) { return ValueBits.Uninitialized }
+  if let Option<*mut HeapHeader>.Some { value } = Pointer.nonNullMut<HeapHeader>(realm) {
+    return unitStrings.cachedInteger(unsafe lendRealm(&value, value), number)
+  }
+  return ValueBits.Uninitialized
 }
 /// `n.toString()` on an Int n when function is the intrinsic
 /// Number.prototype.toString: the VM answers get_field2 + call_method 0 with

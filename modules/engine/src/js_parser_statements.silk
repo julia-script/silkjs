@@ -5,6 +5,7 @@ import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.collections.list { List }
 import silk.num.i32
+import silk.num.u8
 import silk.num.u32
 import silk.num.usize
 import js_heap { HeapCell }
@@ -431,6 +432,54 @@ fn bytecodeLength<'src>(s: &Parser<'src>) -> usize {
   let fd = s.functionView()
   return fd.bytecode.length()
 }
+/// Whether the loop test in [start, end) is short straight-line code (reads,
+/// steps of a variable, compares): such a test is repeated at the bottom of
+/// its loop, so a pass ends in one conditional branch back to the body
+/// instead of a jump to the test and a branch out of it. The debugger's
+/// statement table keeps the single test.
+fn repeatableTest<'src>(s: &Parser<'src>, start: usize, end: usize) -> bool {
+  let fd = s.functionView()
+  if fd.bytecodeError || fd.debuggerMetadata.enabled || end <= start || end - start > 48 { return false }
+  let mut position = start
+  while position < end {
+    let code = fd.bytecode.get(position)
+    if !(code == op.OP_scope_get_var || code == op.OP_scope_put_var || code == op.OP_get_field || code == op.OP_push_i32
+      || code == op.OP_dup || code == op.OP_inc || code == op.OP_dec || code == op.OP_post_inc || code == op.OP_post_dec
+      || code == op.OP_lt || code == op.OP_lte || code == op.OP_gt || code == op.OP_gte
+      || code == op.OP_eq || code == op.OP_neq || code == op.OP_strict_eq || code == op.OP_strict_neq
+      || code == op.OP_get_array_el || code == op.OP_undefined || code == op.OP_null || code == op.OP_lnot
+      || code == op.OP_line_num) { return false }
+    position = position + u8.toUsize(op.opcodeInfo(code, false).size)
+  }
+  return position == end
+}
+/// Appends the repeatableTest in [start, end) again, each atom operand
+/// retained once more, under the source position the test started with.
+effect fn repeatTest<'src>(s: &mut Parser<'src>, start: usize, end: usize, sourceBefore: u32, sourceAfter: u32) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let cells = s.cells() let fd = move cells.function
+  let rt = move cells.runtime
+  if fd.bytecodeError { fail OutOfMemoryError {} }
+  run emit.emitSourcePosition(&mut fd, sourceBefore)
+  let offset = fd.bytecode.length() - start
+  run fd.bytecode.appendSelf(start, end - start)
+  let mut position = start
+  while position < end {
+    let code = fd.bytecode.get(position)
+    if code == op.OP_scope_get_var || code == op.OP_scope_put_var || code == op.OP_get_field {
+      let name = u8.toU32(fd.bytecode.get(position + 1)) | u32.shiftLeft(u8.toU32(fd.bytecode.get(position + 2)), 8)
+        | u32.shiftLeft(u8.toU32(fd.bytecode.get(position + 3)), 16) | u32.shiftLeft(u8.toU32(fd.bytecode.get(position + 4)), 24)
+      let _retained = rt.atoms.duplicate(name)
+    }
+    fd.lastOpcodePosition = usize.toI32(position + offset)
+    position = position + u8.toUsize(op.opcodeInfo(code, false).size)
+  }
+  fd.lastOpcodeSourcePosition = sourceAfter
+}
+fn sourcePosition<'src>(s: &Parser<'src>) -> u32 {
+  let fd = s.functionView()
+  return fd.lastOpcodeSourcePosition
+}
 // Both enumeration and ordinary for loops move an already-emitted chunk ending
 // in a five-byte goto. Relocate its labels, retaining exactly one owned atom edge.
 effect fn moveLoopChunk<'src>(s: &mut Parser<'src>, start: usize, end: usize, firstLabel: i32) -> ()
@@ -664,14 +713,18 @@ effect fn parseFor<'src, H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'sr
   run s.expect(59)
   let mut labelTest = run e.newLabel(&mut s)
   let labelBody = run e.newLabel(&mut s)
+  let mut testStart: usize = 0 let mut testEnd: usize = 0 let mut sourceBefore: u32 = 0 let mut sourceAfter: u32 = 0
   if s.token.kind == 59 { labelTest = labelBody }
   else {
     run label(&mut s, labelTest)
     let forTestPosition = usize.toU32(s.token.start)
     run startStatement(&mut s, forTestPosition)
+    testStart = bytecodeLength(&s.*) sourceBefore = sourcePosition(&s.*)
     run expressions.parseExpression(&mut s, &mut hooks, memory, PF_IN_ACCEPTED)
+    testEnd = bytecodeLength(&s.*) sourceAfter = sourcePosition(&s.*)
     run jump(&mut s, op.OP_if_false, labelBreak)
   }
+  let repeated = repeatableTest(&s.*, testStart, testEnd)
   run s.expect(59)
   let mut positionContinue: usize = 0
   if s.token.kind == 41 {
@@ -687,7 +740,7 @@ effect fn parseFor<'src, H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'sr
     run startStatement(&mut s, forUpdatePosition)
     run expressions.parseExpression(&mut s, &mut hooks, memory, PF_IN_ACCEPTED)
     run e.emitOp(&mut s, op.OP_drop)
-    if labelTest != labelBody { run jump(&mut s, op.OP_goto, labelTest) }
+    if labelTest != labelBody && !repeated { run jump(&mut s, op.OP_goto, labelTest) }
   }
   run s.expect(41)
   let positionBody = bytecodeLength(&s.*)
@@ -696,7 +749,11 @@ effect fn parseFor<'src, H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'sr
   let bodyLevel = scope(&s.*)
   run closeScopes(&mut s, bodyLevel, blockScope)
   if labelTest != labelBody && labelContinue != labelTest { run moveLoopChunk(&mut s, positionContinue, positionBody, labelContinue) }
-  else { run jump(&mut s, op.OP_goto, labelContinue) }
+  else if !repeated { run jump(&mut s, op.OP_goto, labelContinue) }
+  if repeated {
+    run repeatTest(&mut s, testStart, testEnd, sourceBefore, sourceAfter)
+    run jump(&mut s, op.OP_if_true, labelBody)
+  }
   run label(&mut s, labelBreak)
   run popBreakEntry(&mut s)
   run e.popScope(&mut s)
@@ -1055,10 +1112,20 @@ effect fn parseWhileStatement<'src, H: HeapHooks + ModuleAttributeHooks>(s: &mut
     run setEvalReturnUndefined(&mut s)
     run label(&mut s, labelContinue)
     run startStatement(&mut s, statementSource)
+    let testStart = bytecodeLength(&s.*) let sourceBefore = sourcePosition(&s.*)
     run parseParenthesized(&mut s, &mut hooks, memory)
+    let testEnd = bytecodeLength(&s.*) let sourceAfter = sourcePosition(&s.*)
     run jump(&mut s, op.OP_if_false, labelBreak)
-    run parseStatement(&mut s, &mut hooks, memory, 0)
-    run jump(&mut s, op.OP_goto, labelContinue)
+    if repeatableTest(&s.*, testStart, testEnd) {
+      labelBody = run e.newLabel(&mut s)
+      run label(&mut s, labelBody)
+      run parseStatement(&mut s, &mut hooks, memory, 0)
+      run repeatTest(&mut s, testStart, testEnd, sourceBefore, sourceAfter)
+      run jump(&mut s, op.OP_if_true, labelBody)
+    } else {
+      run parseStatement(&mut s, &mut hooks, memory, 0)
+      run jump(&mut s, op.OP_goto, labelContinue)
+    }
   } else {
     run label(&mut s, labelBody)
     run setEvalReturnUndefined(&mut s)

@@ -2,6 +2,7 @@
 
 const host = require('internal/host');
 const { AsyncResource } = require('async_hooks');
+const { Buffer } = require('buffer');
 
 function error(status, syscall, address, port) {
   const info = host.net('error', [status]);
@@ -85,7 +86,11 @@ class Transport {
     const token = ++this.sequence;
     this.requests.set(token, { callback, chunk });
     const status = this.call('write', chunk.buffer, chunk.byteOffset, chunk.byteLength, token);
-    if (status < 0) {
+    // 1: the kernel took every byte now. Node completes such a write synchronously too.
+    if (status === 1) {
+      this.requests.delete(token);
+      callback(null);
+    } else if (status < 0) {
       this.requests.delete(token);
       callback(error(status, 'write'));
     }
@@ -94,6 +99,16 @@ class Transport {
     let pending = chunks.length;
     let failure = null;
     if (pending === 0) return callback(null);
+    if (pending === 1) return this.write(chunks[0].chunk, callback);
+    // Small corked writes (a frame header and its payload) go out as one copy and one system call.
+    let total = 0;
+    for (let i = 0; i < pending && total <= 65536; i++) total += chunks[i].chunk.byteLength;
+    if (total <= 65536) {
+      const joined = Buffer.allocUnsafe(total);
+      let offset = 0;
+      for (let i = 0; i < pending; i++) { joined.set(chunks[i].chunk, offset); offset += chunks[i].chunk.byteLength; }
+      return this.write(joined, callback);
+    }
     const done = err => {
       failure ||= err;
       if (--pending === 0) callback(failure);

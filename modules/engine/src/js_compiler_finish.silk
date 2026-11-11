@@ -11,6 +11,7 @@ import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.core.option { Option }
 import silk.mem.pointer { Pointer }
+import silk.core.ownership { Copy }
 import silk.collections.slice { Slice }
 import silk.num.u32
 import silk.num.u16
@@ -25,7 +26,7 @@ import js_core_types { HostEdges, LineTables }
 import js_core_types { FunctionBytecode, FunctionDebugInfo, FunctionKind, ByteStorage, SourceText, VarDef, ClosureVar, ClosureKind, RuntimeState, ModuleDef }
 import thin_list { ThinList, BoxList, ThinBox, PairList, BOX_HEADER }
 import silk.mem.layout { Layout }
-import js_compiler_types { ScopeTable, FunctionDef, FunctionId, FunctionTree, CompilerVar, CompilerError, CompilerErrorKind, PendingFunction, ParseFunctionKind, LazyStub, LazyName, LazyBody, StubName, markFreeDepths }
+import js_compiler_types { ScopeTable, FunctionDef, FunctionId, FunctionTree, CompilerVar, CompilerError, CompilerErrorKind, PendingFunction, DeferredBody, ParseFunctionKind, LazyStub, LazyName, LazyBody, StubName, markFreeDepths }
 import js_compiler_state as state
 import js_compiler_variables as variables
 import js_compiler_labels { resolveLabels }
@@ -297,6 +298,56 @@ fn transfer(fd: &mut FunctionDef, result: *mut HeapHeader) -> () {
   }
 }
 
+/// What a host set on a stub's debug info (configureVm script name, node:vm
+/// coordinates): fixed when the stub was published, it outlives the compile.
+pub struct HostDebug { pub filename: u32, pub nodeVm: bool, pub nodeSourceURL: bool, pub lineOffset: i32, pub columnOffset: i32, pub sourceColumnOffset: i32 }
+impl Copy for HostDebug {}
+/// Moves the host's settings from the replaced stub to the finished code: the
+/// stub ends up with the compile's file name, which its owner releases. Some
+/// when the stub had settings of its own, for the code's new descendants.
+pub fn keepHostDebug(code: &mut FunctionBytecode, stub: &mut FunctionBytecode) -> Option<HostDebug> {
+  if let Option<FunctionDebugInfo>.Some { value: debug } = &mut code.debug {
+    if let Option<FunctionDebugInfo>.Some { value: old } = &mut stub.debug {
+      if old.filename == debug.filename && old.nodeVm == debug.nodeVm && !old.nodeSourceURL && old.lineOffset == 0
+        && old.columnOffset == 0 && old.sourceColumnOffset == 0 { return Option<HostDebug>.none() }
+      let name = old.filename old.filename = debug.filename debug.filename = name
+      debug.nodeVm = old.nodeVm debug.nodeSourceURL = old.nodeSourceURL
+      debug.lineOffset = old.lineOffset debug.columnOffset = old.columnOffset debug.sourceColumnOffset = old.sourceColumnOffset
+      return Option<HostDebug>.some(HostDebug { filename: name, nodeVm: old.nodeVm, nodeSourceURL: old.nodeSourceURL,
+        lineOffset: old.lineOffset, columnOffset: old.columnOffset, sourceColumnOffset: old.sourceColumnOffset })
+    }
+  }
+  return Option<HostDebug>.none()
+}
+/// Gives node's function constants (and theirs) host's settings, lazy stubs' names included.
+pub unsafe fn spreadHostDebug(rt: &mut RuntimeState, node: *mut HeapHeader, host: HostDebug) -> () {
+  let mut anchor = ()
+  let top = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, node)
+  let count = top.constants.length() drop top
+  let mut i: usize = 0
+  while i < count {
+    let parent = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, node)
+    let child = parent.constants.get(i) drop parent
+    if let ValueBits.FunctionBytecode { reference } = child {
+      let code = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut anchor, reference)
+      if let Option<FunctionDebugInfo>.Some { value: debug } = &mut code.debug {
+        if debug.filename != host.filename { let previous = debug.filename debug.filename = rt.atoms.duplicate(host.filename) rt.atoms.release(previous) }
+        debug.nodeVm = host.nodeVm debug.nodeSourceURL = host.nodeSourceURL
+        debug.lineOffset = host.lineOffset debug.columnOffset = host.columnOffset debug.sourceColumnOffset = host.sourceColumnOffset
+      }
+      if code.pending.isSome() {
+        let pending = code.pending.getMut()
+        if let Option<LazyStub>.Some { value: stub } = &mut pending.lazy {
+          if stub.filename != host.filename { let previous = stub.filename stub.filename = rt.atoms.duplicate(host.filename) rt.atoms.release(previous) }
+        }
+        drop pending
+      }
+      drop code
+      unsafe spreadHostDebug(&mut rt, reference, host)
+    }
+    i = i + 1
+  }
+}
 /// Stub code: never run, since no call reaches a frame before finishing it.
 pub const STUB_STACK: u16 = 0xffff
 /// Every stub's placeholder code (OP_invalid), borrowed rather than allocated.
@@ -368,10 +419,10 @@ effect fn defer(tree: &mut FunctionTree, cell: FunctionId, source: &[u8], plan: 
   // A lazy stub keeps only a LazyStub; its definition stays for createFunction's teardown.
   if !lazy { let mut one = FunctionTree.make() run one.reserveExact(1) kept = run ThinBox<FunctionTree>.make(move one) }
   // cell stands in until fd moves in below.
-  let mut pending = run ThinBox<PendingFunction>.make(PendingFunction { tree: move kept, cell: cell, start: usize.toU32(start), line: at.line, column: at.column,
+  let pendingValue = PendingFunction { tree: move kept, cell: cell, start: usize.toU32(start), line: at.line, column: at.column,
     ecmaLine: ecma.line, ecmaColumn: ecma.column, slots: scopePlan.slots, varSlots: scopePlan.varSlots,
     parameters: Intrinsic.replace(scopePlan.parameters, BoxList<u32>.make()), variables: Intrinsic.replace(scopePlan.variables, BoxList<u16>.make()),
-    lazy: Option<LazyStub>.none() })
+    lazy: Option<LazyStub>.none(), deferred: Option<DeferredBody>.none() }
   let def = tree.getMut(cell)
   // A stripped lazy stub has no debug source to reparse from: it keeps its own.
   let mut ownSource = ThinBox<Option<SourceText>>.none()
@@ -379,11 +430,13 @@ effect fn defer(tree: &mut FunctionTree, cell: FunctionId, source: &[u8], plan: 
   // The placeholder is one shared static OP_invalid: it never runs, transfer
   // replaces it, and borrowed storage frees nothing.
   let code = ByteStorage.Borrowed { data: Pointer.fromRef<u8>(&STUB_CODE[0]), length: 1 }
-  // The closure vars live in the record's own tail: borrowed storage the record frees
-  // with itself, and any later growth moves them out.
+  // The pending block and the closure vars live in the record's own tail: borrowed
+  // storage the record frees with itself. Taking the pending block, or growing
+  // the closure vars after finish, moves them out.
   let captures = def.closureVars.length()
-  let mut tail: usize = 0
-  if captures != 0 { tail = BOX_HEADER + captures * Layout.of<ClosureVar>().bytes }
+  let pendingBytes = ThinBox<PendingFunction>.borrowedBytes()
+  let mut tail = pendingBytes
+  if captures != 0 { tail = tail + BOX_HEADER + captures * Layout.of<ClosureVar>().bytes }
   let result = run HeapCell.allocateWithTail(HeapKind.FunctionBytecode, FunctionBytecode {
     scriptId: def.scriptId,
     scriptIsEval: def.scriptIsEval || def.evalType == 2 || def.evalType == 3,
@@ -411,8 +464,11 @@ effect fn defer(tree: &mut FunctionTree, cell: FunctionId, source: &[u8], plan: 
   let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, runtime)
   b.name = def.functionName def.functionName = 0
   b.constants = Intrinsic.replace(def.constants, BoxList<ValueBits>.make())
+  let tailAddress = unsafe HeapCell.tailAddress<FunctionBytecode>(result)
+  let mut pending = unsafe ThinBox<PendingFunction>.borrowingIn(tailAddress, move pendingValue)
   if captures != 0 {
-    b.closureVars = unsafe BoxList<ClosureVar>.borrowingCopy(unsafe HeapCell.tailAddress<FunctionBytecode>(result), def.closureVars.asSlice())
+    let vars = unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(tailAddress), pendingBytes)
+    b.closureVars = unsafe BoxList<ClosureVar>.borrowingCopy(vars, def.closureVars.asSlice())
     def.closureVars = BoxList<ClosureVar>.make()
   }
   if !def.stripDebug {
@@ -484,8 +540,9 @@ pub unsafe effect fn finish<H: HeapHooks>(hooks: &mut H, node: *mut HeapHeader) 
   let code = unsafe CellRef<FunctionBytecode>.of(node)
   let mut anchor = ()
   let b = code.getMut(&mut anchor)
-  // A lazy stub needs a parse: finishLazy (js_compiler_lazy) completes it.
-  if b.pending.isNone() || b.pending.get().lazy.isSome() { return () }
+  // A lazy stub needs a parse: finishLazy (js_compiler_lazy) completes it. A
+  // deferred body needs the reader: EvalHooks.finishDeferred.
+  if b.pending.isNone() || b.pending.get().lazy.isSome() || b.pending.get().deferred.isSome() { return () }
   let mut pending = match b.pending.take() {
     Option<PendingFunction>.Some { value } => move value
     Option<PendingFunction>.None => { return () }
@@ -524,12 +581,16 @@ pub unsafe effect fn finish<H: HeapHooks>(hooks: &mut H, node: *mut HeapHeader) 
       // Scope planning may have moved some of the stub's captures into its owner's scope.
       b.scopeCaptures = stub.scopeCaptures
       drop b
+      transfer(&mut done, node)
+      // transfer gave the code its debug info: the host's settings on the stub win.
+      let after = code.getMut(&mut anchor)
+      let kept = keepHostDebug(&mut after, &mut stub) drop kept
+      drop after
       let mut runtimeAnchor = ()
       let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, done.runtime)
       match &stub.debug { Option<FunctionDebugInfo>.Some { value } => { rt.atoms.release(value.filename) } _ => () }
       drop rt
       drop stub
-      transfer(&mut done, node)
       drop done
       state.destroyFunction(&mut hooks, &mut pending.tree.getMut(), cell)
     }
@@ -574,6 +635,13 @@ pub effect fn createFunction<H: HeapHooks>(hooks: &mut H, tree: &mut FunctionTre
     Result<ValueBits, OutOfMemoryError | StringLengthError | CompilerError | BytecodeError>.Success { value } => value
     Result<ValueBits, OutOfMemoryError | StringLengthError | CompilerError | BytecodeError>.Failure { error } => { fail move error }
   }
+}
+
+/// Whether node's body is still in code-cache bytes: its first call needs
+/// EvalHooks.finishDeferred, not finish.
+pub unsafe fn deferredStub(node: *mut HeapHeader) -> bool {
+  let anchor = () let b = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, node)
+  return b.pending.isSome() && b.pending.get().deferred.isSome()
 }
 
 /// Whether node is a lazy stub: its first call needs finishLazy, not finish.

@@ -38,6 +38,9 @@ import silkjs.js_os_events_platform as clock
 import silkjs.js_os_workers as sharedWorkers
 import silkjs.js_os_workers_transport as workerTransport
 import ext.introspection
+import ext.builtin_cache
+import silkjs.js_binary_object_reader as binaryReader
+import silkjs.js_binary_object_writer as binaryWriter
 import runtime.embedded
 import silkjs.js_primitives as primitives
 import silkjs.js_bigint_coercions as bigints
@@ -250,6 +253,18 @@ unsafe effect fn pumpControl<'m>(engine: &mut Engine<'m, Services>, context: *mu
   if let Option<*mut inspector_native.State>.Some { value: inspector } = Pointer.nonNullMut<inspector_native.State>(engine.services.inspector) {
     run unsafe inspector_native.pumpCallback(&mut engine, context, inspector, 0)
   }
+}
+// A wait in milliseconds, as nanoseconds: negative (-1) waits with no limit.
+unsafe effect fn waitNanoseconds<'m>(engine: &mut Engine<'m, Services>, context: *mut HeapHeader, value: ValueBits) -> i64 ! JsException ? &mut Allocator {
+  let milliseconds = match value {
+    ValueBits.Int { value: number } => i32.toF64(number)
+    ValueBits.Float64 { value: number } => number
+    _ => { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"native wait argument required") }
+  }
+  if f64.isNaN(milliseconds) || milliseconds < 0.0 { return -1 }
+  // A day is longer than any JavaScript timer may wait at once.
+  if milliseconds > 2147483647.0 { return 2147483647 * 1000000 }
+  return f64.toI64(f64.ceil(milliseconds * 1000000.0))
 }
 unsafe effect fn integer<'m>(engine: &mut Engine<'m, Services>, context: *mut HeapHeader, value: ValueBits) -> i32 ! JsException ? &mut Allocator {
   match value {
@@ -610,10 +625,11 @@ impl EngineServices for Services {
         let napiRan = unsafe napi_native.poll(&mut engine, context, napi)
         if unsafe exceptions.has(unsafe runtime.contextRuntime(context)) { fail JsException {} }
         let napiAlive = unsafe napi_native.alive(napi)
-        let timeout = run unsafe integer(&mut engine, context, unsafe common.argument(argv, 0))
+        // Milliseconds, fractions included, so that a wait ends when the next timer is due.
+        let timeout = run unsafe waitNanoseconds(&mut engine, context, unsafe common.argument(argv, 0))
         run unsafe pumpControl(&mut engine, context)
         if unsafe exceptions.has(unsafe runtime.contextRuntime(context)) { fail JsException {} }
-        let ran = run unsafe fs_async.poll(&mut engine, context, io, if !wasmReady && !napiRan { i32.toI64(timeout) } else { 0 })
+        let ran = run unsafe fs_async.poll(&mut engine, context, io, if !wasmReady && !napiRan { timeout } else { 0 })
         run unsafe pumpControl(&mut engine, context)
         if unsafe exceptions.has(unsafe runtime.contextRuntime(context)) { fail JsException {} }
         let crypto = unsafe cryptoState(&engine)
@@ -641,6 +657,10 @@ impl EngineServices for Services {
     if id == 2400 {
       let network = unsafe networkState(&engine)
       return run unsafe net_native.dispatch(&mut engine, context, network, argc, argv)
+    }
+    if id == 2401 {
+      let network = unsafe networkState(&engine)
+      return run unsafe net_native.wsSend(&mut engine, context, network, argc, argv)
     }
     if id == 2500 {
       let tls = unsafe tlsState(&engine)
@@ -742,6 +762,46 @@ impl EngineServices for Services {
       if promise.stateOf(unsafe lendFor(value)) < 0 { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Expected a Promise") }
       run promise.markHandled(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(value))
       return ValueBits.Undefined
+    }
+    if id == 32 {
+      // A built-in module's factory, or the bootstrap function: decoded from the
+      // linked bytecode, or without one compiled straight from the embedded source,
+      // bodies on first call.
+      let index = run unsafe integer(&mut engine, context, unsafe common.argument(argv, 0))
+      if index < 0 || i32.toUsize(index) >= builtin_cache.entries() { return ValueBits.Undefined }
+      let memory = engine.memory
+      if let Option<builtin_cache.Entry>.Some { value: cached } = builtin_cache.entry(i32.toUsize(index)) {
+        let compiled = run binaryReader.readObjectTrusted(&mut engine, unsafe lendRealm(&context, context), cached.data, cached.length,
+          binaryReader.BYTECODE | binaryReader.LAZY | binaryReader.DEFER)
+        return (run evaluation.evaluateFunction(&mut engine, memory, unsafe lendRealm(&context, context), unsafe Value.adoptBits(compiled))).intoBits()
+      }
+      let filename = run unsafe text(&mut engine, context, unsafe common.argument(argv, 1))
+      return (run evaluation.evaluate(&mut engine, memory, unsafe lendRealm(&context, context), builtin_cache.source(i32.toUsize(index)),
+        filename.asSlice(), flags.TYPE_GLOBAL | flags.FLAG_HOST_LIBRARY | flags.FLAG_LAZY_BODIES)).intoBits()
+    }
+    if id == 33 {
+      // tools/build.py: every built-in's factory and the bootstrap as bytecode, written to standard output.
+      let memory = engine.memory
+      let mut sizes = List<usize>.make() let mut payload = List<u8>.make()
+      let mut index: usize = 0
+      while index < builtin_cache.entries() {
+        let mut filename = List<u8>.make()
+        if index == embedded.builtinCount() { run filename.appendSlice(b"silk:bootstrap") }
+        else { run filename.appendSlice(b"node:") run filename.appendSlice(embedded.builtinName(index)) }
+        let compiled = run evaluation.evaluate(&mut engine, memory, unsafe lendRealm(&context, context), builtin_cache.source(index),
+          filename.asSlice(), flags.TYPE_GLOBAL | flags.FLAG_COMPILE_ONLY | flags.FLAG_HOST_LIBRARY)
+        let written = run Effect.result(binaryWriter.writeObject(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(compiled.view()),
+          binaryWriter.JS_WRITE_OBJ_BYTECODE | binaryWriter.JS_WRITE_OBJ_LAZY | binaryWriter.JS_WRITE_OBJ_DEFER))
+        unsafe gc.release(&mut engine, rt, compiled.intoBits())
+        let bytes = match move written {
+          Result<List<u8>, JsException>.Success { value } => move value
+          Result<List<u8>, JsException>.Failure { error } => { fail move error }
+        }
+        run sizes.append(bytes.length()) run payload.appendSlice(bytes.asSlice())
+        index = index + 1
+      }
+      let file = run builtin_cache.assemble(&sizes, &payload)
+      return ValueBits.Bool { value: platform.writeAll(1, file.asSlice()) }
     }
     let source = run unsafe text(&mut engine, context, unsafe common.argument(argv, 0))
     if id == 5 {

@@ -26,6 +26,8 @@ const define = (name, factory) => {
       name === 'internal/web/wasm' || name.startsWith('internal/web/wasm/'))
     realmSources.set(name, factory);
 };
+// process.moduleLoadList: every built-in module this realm has run, in load order.
+const moduleLoadList = [];
 function internalRequire(request, parent = '') {
   if (stringStartsWith(request, 'node:')) request = stringSlice(request, 5);
   if (stringStartsWith(request, '.')) {
@@ -46,9 +48,10 @@ function internalRequire(request, parent = '') {
   let factory = factoryGet(request);
   if (factory === undefined) throw Object.assign(new Error('Unknown builtin: ' + request), { code: 'ERR_UNKNOWN_BUILTIN_MODULE' });
   const module = { exports: {} }; moduleSet(request, module);
+  moduleLoadList.push('NativeModule ' + request);
   try {
     if (typeof factory === 'number') {
-      factory = native.compileFunction(native.builtinSource(factory), 'node:' + request);
+      factory = native.compileBuiltin(factory, 'node:' + request);
       factorySet(request, factory);
     }
     factory(module, module.exports, name => internalRequire(name, request));
@@ -57,11 +60,26 @@ function internalRequire(request, parent = '') {
   return module.exports;
 }
 for (let index = 0, count = native.builtinCount(); index < count; index++) define(native.builtinName(index), index);
+// tools/build.py runs the freshly linked executable once this way to get the
+// built-ins' bytecode, which it then links in. Nothing else of the runtime is up yet.
+if (native.argv.length === 2 && native.argv[1] === '--silk-write-builtin-cache') rawStd.exit(native.writeBuiltinCache() ? 0 : 1);
 
 for (const name of ['dispose', 'asyncDispose']) {
   if (Symbol[name] === undefined) Object.defineProperty(Symbol, name, { value: Symbol.for('nodejs.' + name) });
 }
 const host = { ...native, rawOS, rawStd };
+host.builtinLoaded = moduleHas;
+// Source maps are off until something loads the module to switch them on, so
+// registering a source before that only matters when coverage wants every map.
+host.registerSource = (filename, source, metadata) => {
+  if (!moduleHas('internal/source_maps') && !host.env.NODE_V8_COVERAGE) return undefined;
+  return internalRequire('internal/source_maps').registerSource(filename, source, metadata);
+};
+// pathToFileURL(path).href for the plain absolute paths that need no escaping.
+const plainPath = /^\/[A-Za-z0-9\/._~+@=,-]*$/;
+const dotSegment = /\/\.\.?(?:\/|$)/;
+const fileHref = path => host.platform !== 'win32' && plainPath.test(path) && !dotSegment.test(path)
+  ? 'file://' + path : internalRequire('url').pathToFileURL(path).href;
 const inspectorNativeOperations = Array.from({ length: 32 }, (_, index) => native['inspectorNative' + index]);
 host.inspectorNative = (operation, ...args) => inspectorNativeOperations[operation](...args);
 host.inspectorEntry = wrapper => host.inspectorNative(15, wrapper);
@@ -100,12 +118,14 @@ host.rebindRealmBuiltins = (previous, global) => {
   wasmCallbacks.delete(previous);
   wasmCallbacks.set(global, callbacks);
 };
-native.wasmNative('register', global => wasmCallbacks.get(global));
+const wasmResolver = global => wasmCallbacks.get(global);
+native.wasmNative('register', wasmResolver);
 host.initializeRealmBuiltins = (handle, global, wasmCodeGeneration) => {
   const cache = new Map();
   const bridge = {
     captureCallSites: native.captureCallSites,
     errorStackState: host.errorStackState,
+    builtinLoaded: moduleHas,
     wasmNative: native.vmWasmNative(handle),
     wasmRealmState: host.wasmRealmState,
     wasmCodeGeneration,
@@ -160,27 +180,68 @@ function statResult(result, syscall, path) {
 host.stat = (path, follow = true) =>
   statResult((follow ? rawOS.stat : rawOS.lstat)(path), follow ? 'stat' : 'lstat', path);
 // Node's resolver may probe existence without granting access to file contents.
-const moduleStat = osNamespace.stat;
-host.moduleStat = path => statResult(moduleStat(path), 'stat', path);
-host.env = new Proxy(Object.assign(Object.create(null), rawStd.getenviron()), {
-  set(target, key, value) { if (typeof key === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string'); value = String(value); rawStd.setenv(key, value); target[key] = value; return true; },
-  deleteProperty(target, key) { rawStd.unsetenv(key); return delete target[key]; }
-});
+const moduleStat = osNamespace.stat, moduleLstat = osNamespace.lstat;
+// A path's file type bits, or 0 for a path that is not there: the resolver asks
+// about many of those.
+host.moduleType = (path, follow) => {
+  const result = (follow ? moduleStat : moduleLstat)(path);
+  if (result[1] === 0) return result[0].mode & 0o170000;
+  const code = errnoNames.get(Math.abs(result[1]));
+  if (code === 'ENOENT' || code === 'ENOTDIR') return 0;
+  throw systemError(result[1], follow ? 'stat' : 'lstat', path);
+};
+// Built-ins read the environment where it lives: nothing of it is kept here.
+const environmentHandler = {
+  get(target, key) { return typeof key === 'string' ? rawStd.getenv(key) : undefined; },
+  has(target, key) { return typeof key === 'string' && rawStd.getenv(key) !== undefined; },
+  ownKeys() { return Object.keys(rawStd.getenviron()); },
+  getOwnPropertyDescriptor(target, key) {
+    const value = typeof key === 'string' ? rawStd.getenv(key) : undefined;
+    if (value !== undefined) return { value, writable: true, enumerable: true, configurable: true };
+  },
+  set(target, key, value) { if (typeof key === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string'); rawStd.setenv(key, String(value)); return true; },
+  deleteProperty(target, key) { if (typeof key === 'string') rawStd.unsetenv(key); return true; },
+};
+// A heap image is this bootstrap's result, saved at build time and started from
+// by later processes (src/ext/heap_image.silk). Whatever the bootstrap takes from
+// its process must be taken again by hydrate, below. While an image is built, the
+// environment variables the bootstrap reads are noted, and seal refuses an image
+// whose bootstrap read one that hydrate does not know.
+const environmentRead = native.heapImage ? new Set() : undefined;
+const notes = {
+  get(target, key) { environmentRead.add(key); return target[key]; },
+  has(target, key) { environmentRead.add(key); return key in target; },
+  getOwnPropertyDescriptor(target, key) { environmentRead.add(key); return Reflect.getOwnPropertyDescriptor(target, key); },
+  ownKeys(target) { environmentRead.add('*'); return Reflect.ownKeys(target); },
+};
+const noted = environment => new Proxy(environment, notes);
+const startupEnvironmentValues = new Proxy(Object.create(null), environmentHandler);
+host.env = environmentRead ? noted(startupEnvironmentValues) : startupEnvironmentValues;
+// Built-ins that keep something of the process at load time refresh it here.
+const hydrations = [];
+host.onHydrate = refresh => { hydrations.push(refresh); };
 const asyncHooks = internalRequire('async_hooks');
 function resource(type, owner) { return asyncHooks._createResource(type, owner); }
+const invokeScoped = asyncHooks._invoke;
 function invokeResource(scope, callback, receiver, args, destroy = true) {
-  try { return scope.runInAsyncScope(invoke, undefined, callback, receiver, args); }
+  try { return invokeScoped(scope, invoke, callback, receiver, args); }
   finally { if (destroy) scope.emitDestroy(); }
 }
 host.invokeResource = invokeResource;
+// Queues drain from a head index: Array.prototype.shift moves every element.
+// ticks holds flat (callback, args, scope) triples.
 const ticks = [];
+let tickHead = 0;
 const completions = [];
+let completionHead = 0;
+const ticksPending = () => ticks.length !== tickHead;
+const completionsPending = () => completions.length !== completionHead;
 // Compound native operations finish through promises, but their public
 // callbacks are I/O completions, not microtasks. Dispatch them outside drainJobs.
 host.enqueueIOCompletion = callback => completions.push(callback);
 host.nextTick = (callback, ...args) => {
   if (typeof callback !== 'function') throw Object.assign(new TypeError('The callback argument must be a function'), { code: 'ERR_INVALID_ARG_TYPE' });
-  ticks.push([callback, args, resource('TickObject')]);
+  ticks.push(callback, args, resource('TickObject'));
 };
 host.queueMicrotask = callback => {
   checkCallback(callback);
@@ -222,14 +283,20 @@ function onRejection(promise, reason, handled) {
 function checkpoint() {
   do {
     while (true) {
-      while (ticks.length) {
-        const [callback, args, scope] = ticks.shift();
+      while (tickHead !== ticks.length) {
+        const at = tickHead;
+        const callback = ticks[at], args = ticks[at + 1], scope = ticks[at + 2];
+        ticks[at] = ticks[at + 1] = ticks[at + 2] = undefined;
+        tickHead = at + 3;
         invokeResource(scope, callback, undefined, args);
       }
+      ticks.length = tickHead = 0;
       native.drainJobs();
-      if (ticks.length) continue;
-      if (!completions.length) break;
-      completions.shift()();
+      if (ticksPending()) continue;
+      if (!completionsPending()) { completions.length = completionHead = 0; break; }
+      const completion = completions[completionHead];
+      completions[completionHead++] = undefined;
+      completion();
     }
     while (rejections.size) {
       const pending = [...rejections];
@@ -248,8 +315,8 @@ function checkpoint() {
     asyncHooks._drainDestroy();
     // Listeners and destroy hooks may themselves queue promises or next ticks.
     // These must settle before testing loop liveness or emitting beforeExit.
-    if (!ticks.length) native.drainJobs();
-  } while (ticks.length || rejections.size || completions.length);
+    if (!ticksPending()) native.drainJobs();
+  } while (ticksPending() || rejections.size || completionsPending());
 }
 host.checkpoint = checkpoint;
 class Timeout {
@@ -302,20 +369,37 @@ globalThis.Buffer = Buffer;
 globalThis.global = globalThis;
 globalThis.atob = internalRequire('buffer').atob;
 globalThis.btoa = internalRequire('buffer').btoa;
-host.readFile = path => {
-  const options = {}, file = rawStd.open(path, 'rb', options);
-  if (!file) throw systemError(options.errno || 2, 'open', path);
-  const chunks = []; let size = 0;
+// Most files fit in one read into this buffer, which is then copied or decoded at
+// the size read; larger files collect copies of it.
+let readBuffer;
+// Plain descriptor calls: open, reads until one returns 0, close.
+function readInto(path, finish) {
+  const fd = rawOS.open(path, rawOS.O_RDONLY);
+  if (fd < 0) throw systemError(-fd, 'open', path);
+  if (readBuffer === undefined) readBuffer = new Uint8Array(65536);
+  // held bytes of readBuffer are read; a full buffer is copied out to chunks.
+  let chunks = null, size = 0, held = 0;
   try {
     while (true) {
-      const chunk = new Uint8Array(65536), count = file.read(chunk.buffer, 0, chunk.length);
-      if (count < 0 || file.error()) throw systemError(file.error() || 5, 'read', path);
+      if (held === readBuffer.length) { (chunks ??= []).push(readBuffer.slice()); held = 0; }
+      const count = rawOS.read(fd, readBuffer.buffer, held, readBuffer.length - held);
+      if (count < 0) {
+        if (count === -4) continue; // EINTR
+        throw systemError(-count, 'read', path);
+      }
       if (count === 0) break;
-      chunks.push(chunk.subarray(0, count)); size += count;
+      held += count;
+      size += count;
     }
-  } finally { file.close(); }
-  return Buffer.concat(chunks, size);
-};
+  } finally { rawOS.close(fd); }
+  if (chunks === null) return finish(Buffer.from(readBuffer.buffer, 0, held));
+  if (held !== 0) chunks.push(readBuffer.slice(0, held));
+  return finish(Buffer.concat(chunks, size));
+}
+const copyBytes = bytes => bytes.buffer === readBuffer.buffer ? Buffer.from(bytes) : bytes;
+const decodeBytes = bytes => bytes.toString('utf8');
+host.readFile = path => readInto(path, copyBytes);
+host.readText = path => readInto(path, decodeBytes);
 function output(fd) {
   return { fd, isTTY: !!rawOS.isatty(fd), writable: true, write(chunk, encoding, callback) {
     if (typeof encoding === 'function') { callback = encoding; encoding = undefined; }
@@ -333,12 +417,25 @@ function output(fd) {
   } };
 }
 host.stdout = output(1); host.stderr = output(2);
+// Text written to a descriptor synchronously, with no stream (internal/stdio
+// direct). False when nothing could be written; a failure after a partial
+// write drops the rest, as a stream write that console ignores would.
+host.writeText = (fd, text) => {
+  const bytes = Buffer.from(text);
+  let offset = 0;
+  while (offset < bytes.length) {
+    const count = rawOS.write(fd, bytes.buffer, bytes.byteOffset + offset, bytes.length - offset);
+    if (count <= 0) return offset !== 0;
+    offset += count;
+  }
+  return true;
+};
 host.writeStartupDiagnostic = host.stderr.write;
 globalThis.process = { platform: host.platform, env: host.env, nextTick: host.nextTick, emitWarning: value => host.stderr.write(String(value) + '\n') };
 const EventEmitter = internalRequire('events');
 const process = new EventEmitter();
 globalThis.process = process;
-const startTime = native.runtimeStartTime;
+let startTime = native.runtimeStartTime;
 const performanceMilestones = {
   nodeStart: 0, environment: native.environmentTime - startTime,
   bootstrapComplete: -1, loopStart: -1, loopExit: -1,
@@ -420,6 +517,7 @@ process.setSourceMapsEnabled = function setSourceMapsEnabled(enabled) {
     nodeModules: enabled, generatedCode: enabled,
   });
 };
+process.moduleLoadList = moduleLoadList;
 define('process', module => { module.exports = process; });
 internalRequire('internal/napi').install(host, process);
 const eventGlobals = internalRequire('internal/path_events/event_target');
@@ -459,12 +557,19 @@ if (workerThreads.isMainThread) {
   internalRequire('internal/stdio').install(process);
 }
 workerThreads._install(process, workerBootstrap);
+const liveEnvironment = process.env;
+if (environmentRead) process.env = noted(liveEnvironment);
 if (workerThreads.isMainThread) internalRequire('internal/watch_mode/dependencies').initialize();
-host.stdout = process.stdout;
-host.stderr = process.stderr;
+// The standard streams and console are built on first use: a script that
+// prints nothing loads neither the stream stack nor the formatter.
+for (const name of ['stdout', 'stderr']) Object.defineProperty(host, name, {
+  enumerable: true, configurable: true,
+  get: () => process[name],
+  set(value) { Object.defineProperty(host, name, { value, writable: true, enumerable: true, configurable: true }); },
+});
 const webGlobals = internalRequire('internal/web/index');
 webGlobals.install(globalThis);
-globalThis.console = internalRequire('console');
+webGlobals.defineLazy(globalThis, 'console', () => ({ console: internalRequire('console') }));
 // Register the trusted dispatcher before preloads or any other guest code can
 // connect to this isolate (including through a parent Worker inspector).
 const inspectorBackend = internalRequire('internal/inspector');
@@ -497,6 +602,15 @@ function publicBuiltin(name) {
 const publicBuiltins = {
   has: publicBuiltin,
   get: name => internalRequire(name),
+  // Whether names() lists name, without building the list.
+  listed(name) {
+    if (typeof name !== 'string') return false;
+    if (stringStartsWith(name, 'node:')) {
+      const bare = stringSlice(name, 5);
+      return prefixOnlyBuiltinHas(bare) && publicBuiltin(bare);
+    }
+    return !prefixOnlyBuiltinHas(name) && publicBuiltin(name);
+  },
   names() {
     const names = [];
     for (let index = 0; index < publicBuiltinNames.length; index++) {
@@ -532,8 +646,7 @@ const loader = internalRequire('internal/loader/loader').createLoader(host, publ
 host.loader = loader;
 host.vmCreateDefaultImporter = filename =>
   native.compileFunction('(specifier, attributes) => import(specifier, { with: attributes })', filename);
-const dotenv = internalRequire('internal/dotenv');
-process.loadEnvFile = dotenv.loadEnvFile;
+process.loadEnvFile = function loadEnvFile(path = undefined) { return internalRequire('internal/dotenv').loadEnvFile(path); };
 if (workerThreads.isMainThread && process.env.NODE_UNIQUE_ID !== undefined) internalRequire('cluster');
 Object.defineProperty(globalThis, '__silkModuleBridge', { value: loader.bridge });
 let mainModuleName;
@@ -636,7 +749,7 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
   }
   internalRequire('internal/permission').initialize({ entrypoints });
   internalRequire('internal/startup_controls').initialize();
-  process.setSourceMapsEnabled(!!host.enableSourceMaps);
+  if (host.enableSourceMaps || moduleHas('internal/source_maps')) process.setSourceMapsEnabled(!!host.enableSourceMaps);
   host.typeScriptMode = host.transformTypes ? 'transform' : host.stripTypes === false ? false : 'strip';
   host.initialExecArgv = process.execArgv.slice();
   host.workerRuntimeArgs = args.slice();
@@ -647,7 +760,7 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
   if (host.experimentalWebStorage) internalRequire('internal/web/storage').install(globalThis, { localStorageFile: host.localStorageFile });
   if (workerThreads.isMainThread) internalRequire('internal/trace_events').initialize(host.traceOptions);
   if (workerThreads.isMainThread && host.traceSigint) internalRequire('util').setTraceSigInt(true);
-  internalRequire('internal/compile_cache').initialize();
+  if (process.env.NODE_COMPILE_CACHE) internalRequire('internal/compile_cache').initialize();
   // Watch supervisors forward these options to their child, which owns the
   // inspector endpoint; opening here would steal that child's port.
   if (preloadEntrypoints) {
@@ -762,26 +875,33 @@ function cliError(message) {
   host.writeStartupDiagnostic(process.execPath + ': ' + message + '\n');
   return process.exit(9);
 }
-function loadRuntimeEnvironment(args) {
+function loadRuntimeEnvironment(args, beforeLoading) {
   const files = internalRequire('internal/options').environmentFiles(args);
   if (!files.length) return;
-  const { loaded, errors } = dotenv.loadEnvironmentFiles(files);
+  if (beforeLoading) beforeLoading();
+  const { loaded, errors } = internalRequire('internal/dotenv').loadEnvironmentFiles(files);
   if (errors.length) return cliError(errors.join('\n' + process.execPath + ': '));
   if (loaded) loader.Module._initPaths();
 }
 function run() {
   if (workerBootstrap) return runWorker();
-  const sea = internalRequire('internal/sea');
-  if (sea.isSea()) return sea.runMain(native.argv.slice(1), runtimeFlag, installRuntimeOptions, runPreloads, loadRuntimeEnvironment);
-  const startupEnvironment = { ...process.env };
-  loadRuntimeEnvironment(native.argv.slice(1));
-  const options = internalRequire('internal/options');
-  let environment;
-  try {
-    environment = options.parseEnvironment(process.env.NODE_OPTIONS || '');
-    environment.length = options.validateEnvironment(environment);
-  } catch (error) {
-    return cliError(error.message);
+  if (native.seaNative(0)) return internalRequire('internal/sea').runMain(native.argv.slice(1), runtimeFlag, installRuntimeOptions, runPreloads, loadRuntimeEnvironment);
+  // The environment as the process got it, before any environment file: only a
+  // watch supervisor needs it, so it is copied only when a file is about to load.
+  let startupEnvironment;
+  // A script path first means no flags, so no environment file to look for:
+  // the option tables load only for flags or NODE_OPTIONS.
+  const flags = native.argv.length < 2 || native.argv[1].charCodeAt(0) === 45;
+  if (flags) loadRuntimeEnvironment(native.argv.slice(1), () => { startupEnvironment = { ...process.env }; });
+  let environment = [];
+  if (process.env.NODE_OPTIONS) {
+    const options = internalRequire('internal/options');
+    try {
+      environment = options.parseEnvironment(process.env.NODE_OPTIONS);
+      environment.length = options.validateEnvironment(environment);
+    } catch (error) {
+      return cliError(error.message);
+    }
   }
   const args = environment.concat(native.argv.slice(1)); let expression, print = false, inputType = 'commonjs';
   let filename, index = 0, interactive = false, testMode = false, inputTypeSet = false, check = false;
@@ -796,6 +916,8 @@ function run() {
   const testOptions = {}, reporterNames = [], destinations = [];
   const afterMain = result => interactive ? result && typeof result.then === 'function' ? result.then(startRepl) : startRepl() : result;
   for (; index < args.length; index++) {
+    // Every option starts with a dash: anything else is the script.
+    if (args[index].charCodeAt(0) !== 45) break;
     const arg = internalRequire('internal/options').normalizeOption(args[index]);
     if (arg === '--') { index++; break; }
     if (arg === '--watch' || arg === '--no-watch') { watchMode = arg === '--watch'; record(arg); continue; }
@@ -842,12 +964,12 @@ function run() {
         internalRequire('internal/process_report').isValueOption(arg) ||
         internalRequire('internal/startup_controls').isValueOption(arg) ||
         internalRequire('internal/permission').isValueOption(arg) ||
-        options.isInspectorValueOption(arg) ||
+        internalRequire('internal/options').isInspectorValueOption(arg) ||
         arg === '--experimental-sea-config' || arg.startsWith('--experimental-sea-config=')) {
       const separator = arg.indexOf('=');
       const name = arg === '-r' ? '--require' : arg === '-C' ? '--conditions' : separator < 0 ? arg : arg.slice(0, separator);
       const value = separator < 0 ? args[++index] : arg.slice(separator + 1);
-      if (value === undefined || (separator < 0 && options.isInspectorValueOption(name) && value.startsWith('-')) ||
+      if (value === undefined || (separator < 0 && internalRequire('internal/options').isInspectorValueOption(name) && value.startsWith('-')) ||
           ((['--localstorage-file', '--require', '--import', '--conditions'].includes(name) || internalRequire('internal/process_report').isValueOption(name) || internalRequire('internal/startup_controls').isValueOption(name) || internalRequire('internal/permission').isValueOption(name)) &&
           (value === '' || (separator < 0 && value.startsWith('-'))))) return cliError(name + ' requires an argument');
       record(arg, ...(separator < 0 ? [value] : []));
@@ -1002,15 +1124,19 @@ Environment:
   if (expression === undefined && filename !== undefined && filename !== '-' && !testMode)
     process.argv[1] = host.path.resolve(filename);
   const entrypoints = [];
-  if (!watchMode && !testMode && expression === undefined && filename !== undefined && filename !== '-')
-    entrypoints.push(loader.resolveMain(host.path.resolve(filename)).filename);
+  // The main script as resolved before any preload ran.
+  let early;
+  if (!watchMode && !testMode && expression === undefined && filename !== undefined && filename !== '-') {
+    early = loader.resolveMain(host.path.resolve(filename));
+    entrypoints.push(early.filename);
+  }
   installRuntimeOptions(environment.concat(process.execArgv), entrypoints, !watchMode);
   if (watchMode) {
     const supervisor = internalRequire('internal/watch_mode/watch_mode');
     return supervisor.start({
       args: supervisor.withoutWatchOptions(process.execArgv).concat(process.argv.length > 1 ? ['--', ...process.argv.slice(1)] : []),
       paths: watchPaths, preserveOutput: watchPreserveOutput, killSignal: watchKillSignal,
-      envFiles: options.environmentFiles(native.argv.slice(1)), env: startupEnvironment,
+      envFiles: internalRequire('internal/options').environmentFiles(native.argv.slice(1)), env: startupEnvironment ?? { ...process.env },
     });
   }
   host.testCoverageOptions = testOptions;
@@ -1066,10 +1192,11 @@ Environment:
   }
   const path = host.path.resolve(filename);
   process.argv[1] = path;
-  const resolved = loader.resolveMain(path);
+  // Only a preload can register a hook or a mock that resolves it differently.
+  const resolved = early !== undefined && !requirePreloads.length && !importPreloads.length ? early : loader.resolveMain(path);
   mainModuleName = resolved.filename;
   armInspectorEntry();
-  return afterMain(loader.runMain(path, inputTypeSet));
+  return afterMain(loader.runMain(path, inputTypeSet, resolved));
   });
 }
 function referencedWork() {
@@ -1107,7 +1234,7 @@ function pollWorkers() {
 // Milliseconds the native poll may wait: 0 when JavaScript work is ready, the
 // delay to the next timer, or -1 to wait for native completions alone.
 function pollTimeout(pendingPromise) {
-  if (ticks.length || immediates.size) return 0;
+  if (ticksPending() || immediates.size) return 0;
   if (pendingPromise !== undefined && native.promiseState(pendingPromise) !== 0) return 0;
   const referenced = referencedWork();
   if (!referenced && pendingPromise === undefined) return 0;
@@ -1117,19 +1244,26 @@ function pollTimeout(pendingPromise) {
   // Keep nested waits interruptible without emitting main-loop lifecycle events.
   if (!referenced && due === Infinity) return 1;
   if (due === Infinity) return native.hasPendingIO() ? -1 : 0;
-  return Math.max(0, Math.ceil(due - native.now()));
+  // To the fraction of a millisecond: rounding up would wait up to one more.
+  return Math.max(0, due - native.now());
 }
 function loopTurn(pendingPromise) {
   const now = native.now();
-  for (const timer of [...timers.values()].sort((a, b) => a._due - b._due || a._id - b._id)) {
-    if (!timer._destroyed && timer._due <= now) fireTimer(timer, timers);
+  // Only the due timers are ordered; most turns have none.
+  let due;
+  for (const timer of timers.values()) if (!timer._destroyed && timer._due <= now) (due ||= []).push(timer);
+  if (due !== undefined) {
+    if (due.length > 1) due.sort((a, b) => a._due - b._due || a._id - b._id);
+    for (const timer of due) if (!timer._destroyed && timer._due <= now) fireTimer(timer, timers);
   }
   native.pollIO(pollTimeout(pendingPromise));
   pollWorkers();
   checkpoint();
   for (const listener of loopListeners) listener();
-  for (const timer of [...immediates.values()]) {
-    if (!timer._destroyed) fireTimer(timer, immediates);
+  if (immediates.size !== 0) {
+    for (const timer of [...immediates.values()]) {
+      if (!timer._destroyed) fireTimer(timer, immediates);
+    }
   }
 }
 function loop() {
@@ -1149,21 +1283,23 @@ function loop() {
   performanceMilestones.loopExit = native.now() - startTime;
   process._exiting = true; const status = Number(process.exitCode) || 0;
   process.emit('exit', status);
-  internalRequire('internal/compile_cache').flushCompileCache();
+  if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushCompileCache();
   return Number(process.exitCode) || 0;
 }
+const imageModules = ['fs', 'fs/promises', 'internal/fs_streams', 'internal/fs_utf8_stream', 'path', 'os',
+  'events', 'stream', 'stream/promises', 'string_decoder', 'util', 'assert', 'console', 'net', 'tty',
+  'internal/tty/write', 'url', 'internal/web/url', 'internal/web/encoding', 'internal/abort_controller'];
 globalThis.__silkRuntime = {
   normalize(name, parent, attributes) { return loader.resolve(name, parent, 'import', attributes).filename; },
   load(name, attributes) { return loader.loadESM(name, attributes).source; },
   registerSource(filename, source, metadata) {
-    internalRequire('internal/source_maps').registerSource(filename, source, { ...metadata, owner: metadata });
+    host.registerSource(filename, source, { ...metadata, owner: metadata });
     if (!metadata.generated && typeof filename === 'string') {
-      return /^[A-Za-z][A-Za-z\d+.-]*:/.test(filename) ? filename : internalRequire('url').pathToFileURL(filename).href;
+      return /^[A-Za-z][A-Za-z\d+.-]*:/.test(filename) ? filename : fileHref(filename);
     }
   },
   importMeta(name) {
-    const { pathToFileURL, fileURLToPath } = internalRequire('url');
-    const asURL = value => /^[A-Za-z][A-Za-z\d+.-]*:/.test(value) ? value : pathToFileURL(value).href;
+    const asURL = value => /^[A-Za-z][A-Za-z\d+.-]*:/.test(value) ? value : fileHref(value);
     const url = asURL(name);
     const meta = {
       url,
@@ -1171,7 +1307,7 @@ globalThis.__silkRuntime = {
       resolve(specifier) { return asURL(loader.resolve(specifier, name, 'import').filename); }
     };
     if (url.startsWith('file:')) {
-      meta.filename = fileURLToPath(url);
+      meta.filename = url === 'file://' + name ? name : internalRequire('url').fileURLToPath(url);
       meta.dirname = host.path.dirname(meta.filename);
     }
     return meta;
@@ -1180,6 +1316,54 @@ globalThis.__silkRuntime = {
   asyncDestroy: asyncHooks._nativeDestroy,
   drainDestroy: asyncHooks._drainDestroy,
   workerError: workerThreads._reportError,
-  run: () => invoke(run, undefined, []), loop, onRejection
+  run: () => invoke(run, undefined, []), loop, onRejection,
+  // Ends the build of a heap image. Each variable listed here is read again by hydrate.
+  seal() {
+    // Built-ins most programs load run here, so that a start from the image finds
+    // them loaded. None of them keeps anything of the process when it loads.
+    for (const name of imageModules) internalRequire(name);
+    // And they find the way to a main script warm (loader.warmMain).
+    const fs = internalRequire('fs'), directory = fs.mkdtempSync('/tmp/silkjs-image-');
+    try {
+      fs.writeFileSync(directory + '/main.js', "require('./dependency.js');\n");
+      fs.writeFileSync(directory + '/dependency.js', 'module.exports = 1;\n');
+      loader.warmMain(directory + '/main.js');
+    } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+    // And a first console.log of text, here written to /dev/null.
+    const saved = rawOS.dup(1), sink = rawOS.open('/dev/null', rawOS.O_WRONLY);
+    try {
+      if (saved < 0 || sink < 0) throw new Error('No /dev/null to warm console.log against');
+      rawOS.dup2(sink, 1);
+      globalThis.console.log('silkjs heap image');
+    } finally {
+      if (saved >= 0) { rawOS.dup2(saved, 1); rawOS.close(saved); }
+      if (sink >= 0) rawOS.close(sink);
+    }
+    // Read again by hydrate, or (NODE_V8_COVERAGE) read again on every use.
+    const hydrated = new Set(['HOME', 'NODE_PATH', 'NODE_CHANNEL_FD', 'NODE_UNIQUE_ID', 'WATCH_REPORT_DEPENDENCIES', 'NODE_V8_COVERAGE']);
+    const missed = [...environmentRead].filter(key => typeof key === 'string' && !hydrated.has(key));
+    if (missed.length) throw new Error('The bootstrap read environment variables that a start from a heap image does not read again: ' + missed.join(' '));
+    // Whoever kept a noting proxy reaches the environment through it unnoted.
+    for (const trap of Object.keys(notes)) delete notes[trap];
+    host.env = startupEnvironmentValues; process.env = liveEnvironment;
+  },
+  // Starts a process from a heap image: everything the bootstrap took from the
+  // process that built the image is taken again from this one.
+  hydrate(argv, runtimeStartTime, environmentTime) {
+    native.argv = argv;
+    startTime = runtimeStartTime;
+    performanceMilestones.environment = environmentTime - startTime;
+    host.performanceStartTime = startTime;
+    host.performanceTimeOrigin = Date.now() - (native.now() - startTime);
+    process.argv = argv.slice(); process.argv0 = argv[0];
+    process.execPath = native.osNative('execPath', []); process.pid = rawOS.getpid();
+    native.wasmNative('register', wasmResolver);
+    loader.Module._initPaths();
+    internalRequire('internal/child_process/ipc').installChild(process);
+    internalRequire('internal/watch_mode/dependencies').initialize();
+    if (process.env.NODE_UNIQUE_ID !== undefined) internalRequire('cluster');
+    for (const refresh of hydrations) refresh();
+    performanceMilestones.bootstrapComplete = native.now() - startTime;
+  }
 };
 performanceMilestones.bootstrapComplete = native.now() - startTime;

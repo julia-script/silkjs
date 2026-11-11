@@ -30,6 +30,8 @@ function followSignal(signal) {
   }
   return controller.signal;
 }
+function signalGetter() { return this.followed ??= followSignal(this.signalSource); }
+function lazySignal(record) { Object.defineProperty(record, 'signal', { get: signalGetter, enumerable: true, configurable: true }); }
 class Request {
   constructor(input, init = {}) {
     if (!arguments.length) throw new TypeError('Request requires an argument');
@@ -57,9 +59,14 @@ class Request {
       referrerPolicy: init.referrerPolicy === undefined ? original?.referrerPolicy || '' : choice(init.referrerPolicy, ['', 'no-referrer', 'no-referrer-when-downgrade', 'same-origin', 'origin', 'strict-origin', 'origin-when-cross-origin', 'strict-origin-when-cross-origin', 'unsafe-url'], 'referrerPolicy'),
       integrity: init.integrity === undefined ? original?.integrity || '' : scalar(init.integrity),
       keepalive: init.keepalive === undefined ? original?.keepalive || false : Boolean(init.keepalive),
-      signal: followSignal(init.signal === undefined ? original?.signal : init.signal),
+      // An AbortController per request costs more than the rest of the request: the
+      // request's signal follows its source from the first time someone reads it.
+      signalSource: init.signal === undefined ? original?.signal : init.signal,
+      followed: null,
       body: null,
     };
+    lazySignal(record);
+    if (record.signalSource != null && !(record.signalSource instanceof AbortSignal)) throw new TypeError('signal must be an AbortSignal');
     if (record.mode === 'navigate') throw new TypeError('Request constructor: invalid request mode navigate');
     if (record.mode === 'no-cors' && !['GET', 'HEAD', 'POST'].includes(method)) throw new TypeError('Method is unsupported in no-cors mode');
     if (record.cache === 'only-if-cached' && record.mode !== 'same-origin') throw new TypeError('only-if-cached requires same-origin mode');
@@ -76,11 +83,11 @@ class Request {
     if ((suppliedBody || original?.body) && (method === 'GET' || method === 'HEAD')) throw new TypeError('Request with GET/HEAD method cannot have body');
     if (suppliedBody) {
       record.body = body.extract(init.body, record.keepalive);
-      if (!record.body.source && init.duplex === undefined) throw new TypeError('RequestInit: duplex option is required when sending a body');
-      if (!record.body.source && !['same-origin', 'cors'].includes(record.mode)) throw new TypeError('Streaming request requires cors or same-origin mode');
+      if (record.body.streaming && init.duplex === undefined) throw new TypeError('RequestInit: duplex option is required when sending a body');
+      if (record.body.streaming && !['same-origin', 'cors'].includes(record.mode)) throw new TypeError('Streaming request requires cors or same-origin mode');
     } else if (original?.body) {
-      if (!original.body.source && record.keepalive) throw new TypeError('keepalive cannot be used with a streaming body');
-      if (!original.body.source && !['same-origin', 'cors'].includes(record.mode)) throw new TypeError('Streaming request requires cors or same-origin mode');
+      if (original.body.streaming && record.keepalive) throw new TypeError('keepalive cannot be used with a streaming body');
+      if (original.body.streaming && !['same-origin', 'cors'].includes(record.mode)) throw new TypeError('Streaming request requires cors or same-origin mode');
       record.body = body.transfer(original.body);
     }
     if (record.body?.type && !record.headers.has('content-type')) record.headers.set('content-type', record.body.type);
@@ -90,7 +97,9 @@ class Request {
     const record = requestState(this);
     const result = Object.create(Request.prototype);
     requests.add(result);
-    body.states.set(result, { ...record, headers: new Headers(record.headers), signal: followSignal(record.signal), body: body.clone(record.body) });
+    const copy = { ...record, headers: new Headers(record.headers), body: body.clone(record.body) };
+    copy.signalSource = record.signal; copy.followed = null; lazySignal(copy);
+    body.states.set(result, copy);
     return result;
   }
   get method() { return requestState(this).method; }

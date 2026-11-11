@@ -3,9 +3,11 @@
 from pathlib import Path
 import argparse
 import filecmp
+import json
 import os
 import platform
 import shutil
+import struct
 import subprocess
 import tomllib
 from embed import ROOT, generate
@@ -54,6 +56,78 @@ def main():
     if args.release:
         command += ['--optimization', 'speed']
     subprocess.run(command, cwd=ROOT, env=environment, check=True)
+    embed_builtin_cache(args.output.resolve(), native, environment)
+    embed_heap_image(args.output.resolve())
+
+
+def embed_builtin_cache(output, native, environment):
+    """Link again with the built-ins' bytecode, which the first link's executable writes.
+
+    Without it the runtime still works: built-ins compile from source at startup. That is
+    what a build for another machine gets, since its executable cannot run here.
+    """
+    record = ROOT / 'build/link-command.json'
+    cache = ROOT / 'build/builtin-cache/builtins.bin'
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(cache, 'wb') as destination:
+            subprocess.run([str(output), '--silk-write-builtin-cache'], stdout=destination, env=environment, check=True)
+    except (OSError, subprocess.CalledProcessError) as error:
+        print(f'Built-in bytecode not embedded ({error}); built-ins will compile at startup')
+        return
+    build_native.build_builtin_cache(native, environment, cache)
+    link = json.loads(record.read_text())
+    arguments = link['arguments']
+    arguments[arguments.index('-o') + 1] = str(output)
+    arguments += startup_order(arguments)
+    subprocess.run([link['compiler'], *arguments], cwd=link['directory'], env=environment, check=True)
+    print(f'Embedded {cache.stat().st_size} bytes of built-in bytecode')
+
+
+def startup_order(arguments):
+    """Linker flags that place the functions a start runs next to each other.
+
+    A start runs under 3 MB of a 27 MB text section. Left where the compiler put them,
+    its functions touch several times as many pages as they fill, and each page is a
+    fault. tools/startup-order.txt lists them (tools/startup_order.py writes it); a name
+    that no longer exists is skipped. Only lld takes the list.
+    """
+    order = ROOT / 'tools/startup-order.txt'
+    if platform.system() != 'Linux' or not any(a.startswith('--ld-path=') and 'lld' in a for a in arguments):
+        return []
+    return ['-Wl,--symbol-ordering-file=' + str(order), '-Wl,--no-warn-symbol-ordering']
+
+
+HEAP_IMAGE_MAGIC = int.from_bytes(b'SILKIMG1', 'little')
+
+
+def embed_heap_image(output):
+    """Append the bootstrapped runtime's heap to the executable (src/ext/heap_image.silk).
+
+    The executable writes the image itself, with no environment, so the image depends on
+    the executable alone; with address randomization off where the host allows it, so
+    that the bytes no start reads are the same in every build too. Without an image the
+    runtime still works: each start runs the bootstrap. That is what an executable that
+    cannot run here gets. Stripping the executable afterwards removes the image.
+    """
+    if platform.system() != 'Linux':
+        return
+    image = ROOT / 'build/heap-image.bin'
+    command = [str(output), '--silk-write-heap-image', str(image)]
+    fixed = ['setarch', platform.machine(), '-R', *command]
+    try:
+        if not shutil.which('setarch') or subprocess.run(fixed, env={}, cwd='/').returncode != 0:
+            subprocess.run(command, env={}, cwd='/', check=True)
+    except OSError as error:
+        print(f'Heap image not embedded ({error}); every start will run the bootstrap')
+        return
+    data = image.read_bytes()
+    with open(output, 'ab') as executable:
+        executable.write(bytes(-executable.tell() % 4096))
+        offset = executable.tell()
+        executable.write(data)
+        executable.write(struct.pack('<QQQQ', offset, len(data), 0, HEAP_IMAGE_MAGIC))
+    print(f'Embedded a heap image of {len(data)} bytes')
 
 
 if __name__ == '__main__':

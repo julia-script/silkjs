@@ -114,6 +114,26 @@ def build_util(native, uv_include, environment, release):
     subprocess.run(shlex.split(environment.get('AR', 'ar')) + ['rcs', str(archive), *objects],
                    env=environment, check=True)
 
+def build_builtin_cache(native, environment, cache=None):
+    """Archive the built-ins' bytecode (the file cache), or an empty cache without one."""
+    directory = ROOT / 'build/builtin-cache'
+    directory.mkdir(parents=True, exist_ok=True)
+    # #embed needs a C23 compiler: the Clang the Silk build itself requires.
+    compiler = [environment.get('SILK_CLANG', 'clang')]
+    flags = ['-std=c23', '-fPIC', '-O2']
+    if cache is not None:
+        flags.append('-DSILK_BUILTIN_CACHE_FILE="' + str(cache) + '"')
+    if platform.system() == 'Darwin':
+        flags += ['-isysroot', environment['SDKROOT'], '-mmacosx-version-min=11.0']
+    destination = directory / 'builtin_cache.o'
+    subprocess.run(compiler + flags + ['-c', str(ROOT / 'src/ext/builtin_cache.c'), '-o', str(destination)],
+                   env=environment, check=True)
+    archive = native / 'libsilk_builtin_cache.a'
+    archive.unlink(missing_ok=True)
+    subprocess.run(shlex.split(environment.get('AR', 'ar')) + ['rcs', str(archive), str(destination)],
+                   env=environment, check=True)
+
+
 def build(native, environment, release=False):
     wamr = ROOT / 'build/wamr'
     cmake_build(ROOT / 'src/ext/wamr', wamr, 'silk_wamr', {
@@ -131,3 +151,4 @@ def build(native, environment, release=False):
     shutil.copyfile(wasi / 'libuvwasi.a', native / 'libuvwasi.a')
     build_http_parser(native, environment, release)
     build_util(native, uv_include, environment, release)
+    build_builtin_cache(native, environment)

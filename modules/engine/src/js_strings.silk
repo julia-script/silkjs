@@ -491,6 +491,30 @@ impl Strings {
     let start = formatInteger(&mut digits, integer)
     return run Strings.joinLatin1(Slice.view(&digits, start, 11 - start), Slice.view(&digits, 0, 0))
   }
+  /// fromInteger into text itself, when text is a string nothing else can see
+  /// and its cell fits: one reference, compact Latin-1, no atom, and as long as
+  /// the decimal text of integer. false changes nothing.
+  pub fn rewriteInteger(text: ValueBits, integer: i32) -> bool {
+    if text.tag() != -7 { return false }
+    let reference = stringReference(text)
+    let anchor = ()
+    let header = unsafe Pointer.borrow<(), HeapHeader>(&anchor, reference)
+    let unique = header.referenceCount == 1
+    drop header
+    if !unique { return false }
+    let mut digits: [u8; 11] = [0; 11]
+    let start = formatInteger(&mut digits, integer)
+    let mut token = ()
+    let target = unsafe HeapCell.shortPayloadMut<FlatString, ()>(&mut token, reference)
+    if !target.compact || target.wide || target.atom != 0 || !Pointer.isNull(target.registry) || target.weakRefCount != 0
+      || target.kind != AtomKind.String || target.length() != 11 - start { return false }
+    // The hash kept for a Map key (js_map_storage.stringHash) was the old text's.
+    target.hash = 0
+    let bytes = unsafe Pointer.assumeManyMut<u8>(target.tailAddress())
+    let mut at = start
+    while at < 11 { unsafe Pointer.write<u8>(unsafe Pointer.atMut<u8>(bytes, at - start), digits[at]) at = at + 1 }
+    return true
+  }
   /// concatIntegerOwned for already formatted Latin-1 number text (a float's
   /// digits): one allocation, no temporary number string.
   pub effect fn concatTextOwned(text: ValueBits, number: &[u8], numberFirst: bool) -> Option<ValueBits>
@@ -551,6 +575,8 @@ impl Strings {
     let bytes = unsafe Pointer.assumeMany<u8>(data)
     let anchor = ()
     let input = unsafe Pointer.borrowMany<(), u8>(&anchor, bytes, length)
+    // ASCII text (most C strings handed to the engine) is its own Latin-1.
+    if length != 0 && length <= STRING_LENGTH_MAX && isAscii(input) { return run Strings.joinLatin1(input, Slice.view(input, 0, 0)) }
     let mut builder = StringBuilder.make()
     // One reservation up front: units never outnumber bytes, and any byte from
     // 0xc4 up decodes to a unit above 255 or to U+FFFD, so the width is known
@@ -687,8 +713,23 @@ impl Strings {
         && !Pointer.isNull<HeapHeader>(a.registry) && Pointer.address<HeapHeader>(a.registry) == Pointer.address<HeapHeader>(b.registry) { return false }
       if !a.wide && !b.wide {
         let x = unsafe latin1Bytes(&left, stringReference(left)) let y = unsafe latin1Bytes(&right, stringReference(right))
+        // Both hold length bytes, so the raw reads stay in bounds.
+        let length = a.length()
+        let px = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(x))
+        let py = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(y))
         let mut i: usize = 0
-        while i < a.length() { if x[i] != y[i] { return false } i = i + 1 }
+        if length >= 8 {
+          // Whole words, then the last eight bytes again in place of a tail loop.
+          while i + 8 < length {
+            if unsafe wordAt(px, i) != unsafe wordAt(py, i) { return false }
+            i = i + 8
+          }
+          return unsafe wordAt(px, length - 8) == unsafe wordAt(py, length - 8)
+        }
+        while i < length {
+          if unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(px, i)) != unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(py, i)) { return false }
+          i = i + 1
+        }
         return true
       }
     }
@@ -875,11 +916,12 @@ impl Strings {
   }
   /// The common `s += piece` of a short flat Latin-1 piece onto a uniquely held,
   /// growable flat Latin-1 s with room: every check in one place, no growth.
-  /// False leaves both untouched for appendInPlace.
+  /// False leaves both untouched for appendInPlace. It never allocates: the
+  /// room was checked, so the appends stay within the buffer's capacity.
   /// holders is how many references the caller accounts for (1 for the local
   /// alone, 2 when the operand stack still holds s too).
   @inlineAlways
-  pub effect fn appendShortLatin1(target: ValueBits, piece: ValueBits, holders: i32) -> bool ! OutOfMemoryError ? &mut Allocator {
+  pub fn appendShortLatin1(target: ValueBits, piece: ValueBits, holders: i32) -> bool {
     if target.tag() != -7 || piece.tag() != -7 { return false }
     let reference = stringReference(target)
     let anchor = ()
@@ -903,14 +945,45 @@ impl Strings {
     if additional <= 4 {
       data.latin1.set(last, bytes[0])
       let mut i: usize = 1
-      while i < additional { run data.latin1.append(bytes[i]) i = i + 1 }
-      run data.latin1.append(0)
+      while i < additional { drop data.latin1.appendWithinCapacity(bytes[i]) i = i + 1 }
+      drop data.latin1.appendWithinCapacity(0)
     } else {
       // bytes ends with the piece's own terminator: one copy brings both.
       data.latin1.truncate(last)
-      run data.latin1.appendBytes(bytes)
+      drop data.latin1.appendSliceWithinCapacity(bytes)
     }
     data.setLength(length + additional)
+    return true
+  }
+  /// appendShortLatin1 for a piece of one Latin-1 unit onto a target that a
+  /// slot and the operand stack hold (two holders): the append a scanner makes
+  /// per character, with one check of each kind. The caller knows both are
+  /// flat strings. False leaves both untouched for appendShortLatin1.
+  @inlineAlways
+  pub fn appendUnitLatin1(target: ValueBits, piece: ValueBits) -> bool {
+    let reference = stringReference(target)
+    let anchor = ()
+    let header = unsafe Pointer.borrow<(), HeapHeader>(&anchor, reference)
+    let shared = header.referenceCount != 2
+    drop header
+    if shared { return false }
+    let source = unsafe HeapCell.shortPayload<FlatString, ValueBits>(&piece, stringReference(piece))
+    let single = !source.wide && source.length() == 1
+    drop source
+    if !single { return false }
+    let mut token = ()
+    let data = unsafe HeapCell.shortPayloadMut<FlatString, ()>(&mut token, reference)
+    if data.compact || data.wide || !Pointer.isNull(data.registry) { return false }
+    // latin1 holds the front gap, the text and the terminator.
+    let used = data.latin1.length()
+    let length = data.length()
+    if used == 0 || used >= data.latin1.capacity() || length >= STRING_LENGTH_MAX { return false }
+    let bytes = unsafe latin1Bytes(&piece, stringReference(piece))
+    let unit = bytes[0]
+    // A new terminator after the old one, which the unit then replaces.
+    drop data.latin1.appendWithinCapacity(0)
+    data.latin1.set(used - 1, unit)
+    data.setLength(length + 1)
     return true
   }
   /// appendInPlace for a target that one more holder references, which the
@@ -1307,31 +1380,54 @@ impl Strings {
     return Option<ValueBits>.some(ValueBits.String { reference: cell })
   }
   // A new flat Latin-1 string holding first then second: one exact buffer, one cell.
+  // A short one in a ready pooled block is filled here, with no frame; every
+  // other case is joinLatin1General's. Never inlined: it is a call from the
+  // dispatch loop's arms, whose registers a copy of it there would take.
+  @inlineNever
   pub effect fn joinLatin1(first: &[u8], second: &[u8]) -> ValueBits ! OutOfMemoryError ? &mut Allocator {
+    let length = first.length + second.length
+    if length <= INLINE_LATIN1_MAX {
+      let omitted = compactOmittedBytes()
+      if let Option<*mut HeapHeader>.Some { value: cell } = Pointer.nonNullMut<HeapHeader>(run HeapCell.takeShortCompactWithTail<FlatString>(HeapKind.String, omitted, first, second, 1)) {
+        unsafe Strings.initCompactLatin1(cell, omitted, length)
+        return ValueBits.String { reference: cell }
+      }
+    }
+    return run Strings.joinLatin1General(first, second)
+  }
+  // The FlatString fields of a compact Latin-1 string of length whose cell and
+  // tail were just allocated with omitted.
+  @inlineAlways
+  unsafe fn initCompactLatin1(cell: *mut HeapHeader, omitted: usize, length: usize) -> () {
+    let tail = unsafe HeapCell.shortCompactTailAddress<FlatString>(cell, omitted)
+    let mut token = ()
+    let created = unsafe HeapCell.shortPayloadMut<FlatString, ()>(&mut token, cell)
+    // The Lists must be exactly the omitted end of the payload.
+    if Pointer.address<List<u8>>(Pointer.fromMutRef<List<u8>>(&mut created.latin1)) != Pointer.address<u8>(tail) {
+      Intrinsic.trap("FlatString Lists are not at the end of the payload")
+    }
+    created.compact = true
+    created.setLength(length)
+    created.registry = Pointer.null<HeapHeader>()
+    created.atom = 0
+    created.hash = 0
+    created.next = 0
+    created.weakRefCount = 0
+    created.wide = false
+    created.kind = AtomKind.String
+    created.hasDescription = true
+  }
+  // joinLatin1 without a ready pooled block, or past INLINE_LATIN1_MAX (the
+  // bytes then live in a List).
+  @inlineNever
+  effect fn joinLatin1General(first: &[u8], second: &[u8]) -> ValueBits ! OutOfMemoryError ? &mut Allocator {
     let length = first.length + second.length
     if length <= INLINE_LATIN1_MAX {
       // Short strings keep their bytes and NUL in the cell itself, in place of
       // the payload's two Lists: one allocation, 112 bytes smaller.
       let omitted = compactOmittedBytes()
       let cell = run HeapCell.allocateShortCompactWithTail<FlatString>(HeapKind.String, omitted, first, second, 1)
-      let tail = unsafe HeapCell.shortCompactTailAddress<FlatString>(cell, omitted)
-      let mut token = ()
-      let created = unsafe HeapCell.shortPayloadMut<FlatString, ()>(&mut token, cell)
-      // The Lists must be exactly the omitted end of the payload.
-      if Pointer.address<List<u8>>(Pointer.fromMutRef<List<u8>>(&mut created.latin1)) != Pointer.address<u8>(tail) {
-        Intrinsic.trap("FlatString Lists are not at the end of the payload")
-      }
-      created.compact = true
-      created.setLength(length)
-      created.registry = Pointer.null<HeapHeader>()
-      created.atom = 0
-      created.hash = 0
-      created.next = 0
-      created.weakRefCount = 0
-      created.wide = false
-      created.kind = AtomKind.String
-      created.hasDescription = true
-      drop created
+      unsafe Strings.initCompactLatin1(cell, omitted, length)
       return ValueBits.String { reference: cell }
     }
     let mut bytes = List<u8>.make()
@@ -1664,3 +1760,8 @@ impl Drop for RopeBuckets {
   }
 }
 const FIBONACCI: [usize; 44] = [1,2,3,5,8,13,21,34,55,89,144,233,377,610,987,1597,2584,4181,6765,10946,17711,28657,46368,75025,121393,196418,317811,514229,832040,1346269,2178309,3524578,5702887,9227465,14930352,24157817,39088169,63245986,102334155,165580141,267914296,433494437,701408733,1134903170]
+/// The eight bytes at bytes + index as one word; the caller keeps them in bounds.
+@inlineAlways
+unsafe fn wordAt(bytes: [*]const u8, index: usize) -> u64 {
+  return unsafe Pointer.readUnaligned<u64>(unsafe Intrinsic.pointerReinterpret<*const u8, *const align(1) u64>(unsafe Pointer.at<u8>(bytes, index)))
+}

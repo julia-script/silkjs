@@ -113,9 +113,9 @@ function deprecate(fn, message, code) {
 }
 function debuglog(section, callback) {
   section = String(section).toUpperCase();
-  const patterns = String(host.env.NODE_DEBUG || '').split(/[\s,]+/).filter(Boolean);
   let enabled;
-  const initialize = () => { enabled = patterns.some(pattern => new RegExp('^' + pattern.replace(/[|\\{}()[\]^$+?.]/g, '\\$&').replace(/\*/g, '.*') + '$', 'i').test(section)); };
+  // NODE_DEBUG is read on first use, not when a module asks for its logger.
+  const initialize = () => { enabled = String(host.env.NODE_DEBUG || '').split(/[\s,]+/).filter(Boolean).some(pattern => new RegExp('^' + pattern.replace(/[|\\{}()[\]^$+?.]/g, '\\$&').replace(/\*/g, '.*') + '$', 'i').test(section)); };
   const write = (...args) => { if (enabled) host.stderr.write(section + ' ' + (globalThis.process ? process.pid : 0) + ': ' + format(...args) + '\n'); };
   Object.defineProperty(write, 'enabled', { enumerable: true, configurable: true, get: () => enabled });
   let initialized = false;
@@ -226,16 +226,23 @@ module.exports = {
   format, formatWithOptions, inspect, types, promisify, callbackify, inherits, deprecate, debuglog, debug: debuglog,
   isDeepStrictEqual, stripVTControlCharacters, toUSVString, styleText,
   markPromiseAsHandled, getCallSites, setTraceSigInt,
-  ...require('internal/abort_controller').util,
-  ...require('internal/util_public/parse_args'),
-  ...require('internal/util_public/parse_env'),
-  ...require('internal/util_public/mime'),
-  ...require('internal/util_public/diff'),
-  ...require('internal/util_public/system'),
-  debounce: require('internal/util_public/debounce'),
-  throttle: require('internal/util_public/throttle'),
-  TextEncoder: require('internal/web/encoding').TextEncoder,
-  TextDecoder: require('internal/web/encoding').TextDecoder,
+  // Placeholders keep the key order; the loop below turns each into a load-on-first-read property.
+  transferableAbortController: undefined,
+  transferableAbortSignal: undefined,
+  aborted: undefined,
+  parseArgs: undefined,
+  parseEnv: undefined,
+  MIMEParams: undefined,
+  MIMEType: undefined,
+  diff: undefined,
+  getSystemErrorMap: undefined,
+  getSystemErrorName: undefined,
+  getSystemErrorMessage: undefined,
+  convertProcessSignalToExitCode: undefined,
+  debounce: undefined,
+  throttle: undefined,
+  TextEncoder: undefined,
+  TextDecoder: undefined,
   isArray: Array.isArray, isBoolean: value => typeof value === 'boolean', isNull: value => value === null,
   isNullOrUndefined: value => value == null, isNumber: value => typeof value === 'number', isString: value => typeof value === 'string',
   isSymbol: value => typeof value === 'symbol', isUndefined: value => value === undefined, isRegExp: types.isRegExp,
@@ -245,3 +252,30 @@ module.exports = {
   _extend: (target, source) => source && typeof source === 'object' ? Object.assign(target, source) : target,
   log: (...args) => { const date = new Date(); const stamp = date.getDate() + ' ' + ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][date.getMonth()] + ' ' + [date.getHours(), date.getMinutes(), date.getSeconds()].map(n => String(n).padStart(2, '0')).join(':'); host.stdout.write(stamp + ' - ' + format(...args) + '\n'); },
 };
+// The formatter is on every console.log path; argument parsing, MIME types,
+// diffing and the text codecs are not, so each loads when it is first read.
+for (const [name, load] of [
+  ['transferableAbortController', () => require('internal/abort_controller').util.transferableAbortController],
+  ['transferableAbortSignal', () => require('internal/abort_controller').util.transferableAbortSignal],
+  ['aborted', () => require('internal/abort_controller').util.aborted],
+  ['parseArgs', () => require('internal/util_public/parse_args').parseArgs],
+  ['parseEnv', () => require('internal/util_public/parse_env').parseEnv],
+  ['MIMEParams', () => require('internal/util_public/mime').MIMEParams],
+  ['MIMEType', () => require('internal/util_public/mime').MIMEType],
+  ['diff', () => require('internal/util_public/diff').diff],
+  ['getSystemErrorMap', () => require('internal/util_public/system').getSystemErrorMap],
+  ['getSystemErrorName', () => require('internal/util_public/system').getSystemErrorName],
+  ['getSystemErrorMessage', () => require('internal/util_public/system').getSystemErrorMessage],
+  ['convertProcessSignalToExitCode', () => require('internal/util_public/system').convertProcessSignalToExitCode],
+  ['debounce', () => require('internal/util_public/debounce')],
+  ['throttle', () => require('internal/util_public/throttle')],
+  ['TextEncoder', () => require('internal/web/encoding').TextEncoder],
+  ['TextDecoder', () => require('internal/web/encoding').TextDecoder],
+]) {
+  const settle = value => Object.defineProperty(module.exports, name, { value, writable: true, enumerable: true, configurable: true });
+  Object.defineProperty(module.exports, name, {
+    enumerable: true, configurable: true,
+    get() { const value = load(); settle(value); return value; },
+    set(value) { settle(value); },
+  });
+}

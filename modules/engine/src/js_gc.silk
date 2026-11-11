@@ -1267,12 +1267,41 @@ pub unsafe fn drainZero<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader) -
 unsafe fn drainZeroFrom<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, first: ?*mut HeapHeader) -> () {
   unsafe setPhase(runtime, GcPhase.Decrement)
   let mut stacked = first
+  // Dead objects destroyed so far. A drain that reaches RELEASE_DEFER_AFTER
+  // times its last RELEASE_PROBE objects: slow ones are stalling on cells that
+  // left the cache, and the rest of the drain defers its releases
+  // (drainDeferred); garbage still in cache (most of it) drains as it is.
+  // A cold drain also has the next RELEASE_COLD_DRAINS long drains defer from
+  // RELEASE_COLD_AFTER objects on, unprobed: a program dropping cold structures
+  // keeps dropping them, and the probed objects are the ones that stall.
+  let mut drained: usize = 0
+  let mut probeStart: usize = 0
+  let stateAnchor = ()
+  let credit = (unsafe HeapCell.payload<RuntimeState, ()>(&stateAnchor, runtime)).coldDrains
+  let mut deferAt = RELEASE_DEFER_AFTER
+  if credit != 0 { deferAt = RELEASE_COLD_AFTER }
   while true {
     match Pointer.nonNullMut<HeapHeader>(stacked) {
       Option<*mut HeapHeader>.Some { value } => {
         require(unsafe count(value) == 0)
         if unsafe kind(value) == HeapKind.Object {
-          if !unsafe closureClass(value) || !unsafe parkClosure(&mut hooks, runtime, value) { unsafe destroyObject(&mut hooks, runtime, value, true) }
+          if !unsafe closureClass(value) || !unsafe parkClosure(&mut hooks, runtime, value) {
+            unsafe destroyObject(&mut hooks, runtime, value, true, false, Pointer.null<ReleaseRing>())
+            drained = drained + 1
+            if drained == deferAt {
+              if credit != 0 {
+                unsafe setColdDrains(runtime, credit - 1)
+                unsafe drainDeferred(&mut hooks, runtime)
+              } else {
+                let elapsed = usize.wrappingSubtract(unsafe memory.ticks(), probeStart)
+                if elapsed * 1000 > unsafe memory.ticksPerMicrosecond() * RELEASE_COLD_NANOSECONDS {
+                  unsafe setColdDrains(runtime, RELEASE_COLD_DRAINS)
+                  unsafe drainDeferred(&mut hooks, runtime)
+                }
+              }
+            }
+            else if drained == RELEASE_DEFER_AFTER - RELEASE_PROBE { probeStart = unsafe memory.ticks() }
+          }
         }
         else { unsafe destroyGc(&mut hooks, runtime, value) }
       }
@@ -1292,6 +1321,37 @@ unsafe fn drainZeroFrom<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, f
     stacked = unsafe popZeroStack(runtime)
   }
   unsafe setPhase(runtime, GcPhase.None)
+}
+unsafe fn setColdDrains(runtime: *mut HeapHeader, drains: u8) -> () {
+  let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  state.coldDrains = drains
+}
+/// drainZeroFrom's loop over the zero stack for a long drain, with the dying
+/// objects' releases deferred through a ReleaseRing. Out of line, so the short
+/// drains that are most of them (a temporary and its children) keep their lean
+/// loop. Returns with the ring empty: when the stack and the ring are both
+/// empty, or when the ring shows a chain (see RELEASE_WIDE), where deferring
+/// only costs; drainZeroFrom then goes on undeferred.
+@inlineNever
+unsafe fn drainDeferred<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader) -> () {
+  let mut ring = ReleaseRing { cells: [ValueBits.Undefined; RELEASE_RING], at: 0 }
+  while true {
+    match Pointer.nonNullMut<HeapHeader>(unsafe popZeroStack(runtime)) {
+      Option<*mut HeapHeader>.Some { value } => {
+        require(unsafe count(value) == 0)
+        if unsafe kind(value) == HeapKind.Object {
+          if !unsafe closureClass(value) || !unsafe parkClosure(&mut hooks, runtime, value) {
+            unsafe destroyObject(&mut hooks, runtime, value, true, true, Pointer.fromMutRef<ReleaseRing>(&mut ring))
+          }
+        }
+        else { unsafe destroyGc(&mut hooks, runtime, value) }
+      }
+      Option<*mut HeapHeader>.None => {
+        if unsafe flushRing(&mut hooks, runtime, &mut ring) < RELEASE_WIDE { return () }
+      }
+    }
+  }
 }
 
 /// RuntimeState.spareClosures entries: SPARE_CLOSURE_WAYS per set, so a few
@@ -1871,10 +1931,10 @@ unsafe fn traceAs<H: HeapHooks>(hooks: &mut H, node: *mut HeapHeader, tracer: &m
   if classId == JS_CLASS_ARRAY {
     match &object.payload {
       ObjectPayload.FastArray { array } => {
-        let elementCount = array.values.length()
+        let elementCount = array.values().length()
         let mut element: usize = 0
         while element < elementCount {
-          unsafe tracer.valueAs(unsafe js_shapes.unchecked<ValueBits>(&array.values, element), operation)
+          unsafe tracer.valueAs(unsafe js_shapes.unchecked<ValueBits>(array.values(), element), operation)
           element = element + 1
         }
         return ()
@@ -2079,8 +2139,8 @@ pub unsafe fn traceCorePayload(object: *mut HeapHeader, tracer: &mut Tracer) -> 
     }
     ObjectPayload.FastArray { array } => {
       let mut index: usize = 0
-      while index < array.values.length() {
-        unsafe tracer.value(array.values.get(index))
+      while index < array.values().length() {
+        unsafe tracer.value(array.values().get(index))
         index = index + 1
       }
     }
@@ -2149,12 +2209,12 @@ pub unsafe fn finalizeCorePayload<H: HeapHooks>(hooks: &mut H, runtime: *mut Hea
     ObjectPayload.FastArray { array } => {
       let mut index: usize = 0
       // A number-only array has nothing to release.
-      if !ValueBits.anyHeap(array.values.asSlice()) { index = array.values.length() }
-      while index < array.values.length() {
-        unsafe release(&mut hooks, runtime, array.values.get(index))
+      if !ValueBits.anyHeap(array.values().asSlice()) { index = array.values().length() }
+      while index < array.values().length() {
+        unsafe release(&mut hooks, runtime, array.values().get(index))
         index = index + 1
       }
-      unsafe js_shapes.parkValues(runtime, move array.values)
+      unsafe js_shapes.parkValues(runtime, array.intoValues())
     }
     ObjectPayload.MappedArguments { arguments } => {
       let mut index: usize = 0
@@ -2346,7 +2406,7 @@ pub unsafe fn takeSpareCell(runtime: *mut HeapHeader, capacity: usize, small: bo
 unsafe fn valuesInTail(node: *mut HeapHeader) -> bool {
   let anchor = ()
   let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
-  return match &object.payload { ObjectPayload.FastArray { array } => array.values.borrowsStorage() _ => false }
+  return match &object.payload { ObjectPayload.FastArray { array } => array.values().borrowsStorage() _ => false }
 }
 /// destroyObject's class finalizer call, for classes other than JS_CLASS_OBJECT.
 // Out of line: plain objects, the bulk of what dies, never come here, and the
@@ -2385,22 +2445,97 @@ unsafe fn finishFastArray<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader,
   drop data
   match move payload {
     ObjectPayload.FastArray { array } => {
-      let mut count = array.values.length()
+      let mut count = array.values().length()
       // Number-only arrays (a literal of numbers) have nothing to release.
       // Long ones scan without the per-block exit, about half the cost per value.
-      if count >= 64 { if !ValueBits.anyHeap(array.values.asSlice()) { count = 0 } }
-      else if count > 2 && !ValueBits.anyHeapEarly(array.values.asSlice()) { count = 0 }
+      // A plain array is known to hold none, without a scan.
+      if array.isPlain() { count = 0 }
+      else if count >= 64 { if !ValueBits.anyHeap(array.values().asSlice()) { count = 0 } }
+      else if count > 2 && !ValueBits.anyHeapEarly(array.values().asSlice()) { count = 0 }
       let mut index: usize = 0
       while index < count {
-        let value = array.values.get(index)
+        let value = array.values().get(index)
         if linked { unsafe releaseDraining(&mut hooks, runtime, value) } else { unsafe release(&mut hooks, runtime, value) }
         index = index + 1
       }
-      unsafe js_shapes.parkValues(runtime, move array.values)
+      unsafe js_shapes.parkValues(runtime, array.intoValues())
     }
     _ => invariantFailure()
   }
   return true
+}
+/// Entries in a ReleaseRing: how many releases a deferred one waits.
+const RELEASE_RING: usize = 16
+/// The dead objects one drainZero frees before it may defer its releases: short
+/// drains (a temporary and its children, still in cache) stay undeferred.
+const RELEASE_DEFER_AFTER: usize = 16
+/// The last objects before RELEASE_DEFER_AFTER, which drainZero times.
+const RELEASE_PROBE: usize = 8
+/// The time RELEASE_PROBE objects take when their cells have left the cache
+/// (about 100 ns each on Splay's dead trees) is several times what they take
+/// in cache (about 15 ns each); slower than this defers.
+const RELEASE_COLD_NANOSECONDS: usize = 300
+/// Long drains that defer early after one measured cold, before the next probe.
+const RELEASE_COLD_DRAINS: u8 = 64
+/// The dead objects such a drain frees first: a temporary and its children
+/// stay undeferred even then.
+const RELEASE_COLD_AFTER: usize = 2
+/// The fewest waiting values, when the zero stack runs empty, of a drain wide
+/// enough to keep deferring.
+const RELEASE_WIDE: usize = 3
+/// drainZero's delayed releases. A long drain frees cells that left the cache
+/// long ago (a dropped tree), and each release's first read of its child's
+/// header would stall on that miss. Deferred, the child's lines are requested
+/// at once and its count is read RELEASE_RING releases later, so the misses of
+/// that many children overlap. Each heap value in cells owns the reference it
+/// will release; the other entries are Undefined. at is the oldest entry.
+struct ReleaseRing { cells: [ValueBits; RELEASE_RING], at: usize }
+/// releaseDraining through the ring: value's cell lines start loading now, and
+/// the oldest waiting value is released in its place.
+@inlineAlways
+unsafe fn deferRelease<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, waiting: ?*mut ReleaseRing, value: ValueBits) -> () {
+  if value.tag() >= 0 { return () }
+  match ValueBits.heapReference(&value) {
+    Option<*mut HeapHeader>.Some { value: reference } => {
+      unsafe prefetchCell(reference)
+      // An array literal's values follow its slots, in the cell's later lines.
+      if value.isObject() {
+        let address = Pointer.address<HeapHeader>(reference)
+        unsafe memory.prefetch(address + 128)
+        unsafe memory.prefetch(address + 192)
+        unsafe memory.prefetch(address + 256)
+      }
+    }
+    Option<*mut HeapHeader>.None => ()
+  }
+  let mut ringAnchor = ()
+  let ring = unsafe Pointer.borrowMut<(), ReleaseRing>(&mut ringAnchor, unsafe Intrinsic.pointerRequalify<?*mut ReleaseRing, *mut ReleaseRing>(waiting))
+  let at = ring.at
+  let due = ring.cells[at]
+  ring.cells[at] = value
+  ring.at = (at + 1) & (RELEASE_RING - 1)
+  drop ring
+  unsafe releaseDraining(&mut hooks, runtime, due)
+}
+/// Releases every waiting value of ring, oldest first, leaving it empty, and
+/// returns how many there were. The releases may stack more dead objects,
+/// whose children may use ring again.
+@inlineNever
+unsafe fn flushRing<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, ring: &mut ReleaseRing) -> usize {
+  let mut left = RELEASE_RING
+  let mut at = ring.at
+  let mut found: usize = 0
+  while left != 0 {
+    let due = ring.cells[at]
+    if due.tag() < 0 {
+      ring.cells[at] = ValueBits.Undefined
+      found = found + 1
+      unsafe releaseDraining(&mut hooks, runtime, due)
+    }
+    at = (at + 1) & (RELEASE_RING - 1)
+    left = left - 1
+  }
+  return found
 }
 /// release during drainZero (phase Decrement): an object's last reference,
 /// with the object still in gcObjects (mark 0), pushes it on the zero stack
@@ -2441,14 +2576,17 @@ unsafe fn releaseRecordedRealm<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHe
 /// destroyObject for a node in a GC list (cycle removal), out of line.
 @inlineNever
 unsafe fn destroyUnlinked<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node: *mut HeapHeader) -> () {
-  unsafe destroyObject(&mut hooks, runtime, node, false)
+  unsafe destroyObject(&mut hooks, runtime, node, false, false, Pointer.null<ReleaseRing>())
 }
+/// deferred (drainDeferred only): the children wait in ring before they are
+/// released; ring is null otherwise.
 /// linked: node comes from drainZero's stack (phase Decrement), so its dying
 /// children go straight onto the zero stack; otherwise it is cycle garbage.
 // Inlined: drainZero's loop runs it for nearly every dying object, and the
 // call's frame setup and spills were ~15% of its instructions.
 @inlineAlways
-unsafe fn destroyObject<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node: *mut HeapHeader, linked: bool) -> () {
+unsafe fn destroyObject<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node: *mut HeapHeader, linked: bool,
+  deferred: bool, ring: ?*mut ReleaseRing) -> () {
   let mut anchor = ()
   let object = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
   require(!object.freeMark())
@@ -2483,7 +2621,8 @@ unsafe fn destroyObject<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, n
       Option<*mut HeapHeader>.Some { value } => { unsafe memory.prefetch(Pointer.address<HeapHeader>(value)) }
       Option<*mut HeapHeader>.None => ()
     }
-    if linked { unsafe releaseDraining(&mut hooks, runtime, car) unsafe releaseDraining(&mut hooks, runtime, cdr) }
+    if deferred { unsafe deferRelease(&mut hooks, runtime, ring, car) unsafe deferRelease(&mut hooks, runtime, ring, cdr) }
+    else if linked { unsafe releaseDraining(&mut hooks, runtime, car) unsafe releaseDraining(&mut hooks, runtime, cdr) }
     else { unsafe release(&mut hooks, runtime, car) unsafe release(&mut hooks, runtime, cdr) }
     index = 2
   } else if plain {
@@ -2501,7 +2640,8 @@ unsafe fn destroyObject<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, n
     drop values
     while index < slotCount {
       let slot = unsafe properties.getUnchecked(index)
-      if linked { unsafe releaseDraining(&mut hooks, runtime, slot.valueBits()) }
+      if deferred { unsafe deferRelease(&mut hooks, runtime, ring, slot.valueBits()) }
+      else if linked { unsafe releaseDraining(&mut hooks, runtime, slot.valueBits()) }
       else { unsafe release(&mut hooks, runtime, slot.valueBits()) }
       index = index + 1
     }
@@ -2515,7 +2655,8 @@ unsafe fn destroyObject<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, n
     if kind == 0 {
       // From drainZero (phase Decrement), a child object's last reference
       // goes straight onto the zero stack.
-      if linked { unsafe releaseDraining(&mut hooks, runtime, slot.valueBits()) }
+      if deferred { unsafe deferRelease(&mut hooks, runtime, ring, slot.valueBits()) }
+      else if linked { unsafe releaseDraining(&mut hooks, runtime, slot.valueBits()) }
       else { unsafe release(&mut hooks, runtime, slot.valueBits()) }
     }
     // A lazy slot (a function's prototype, most often) owns only its realm,
@@ -3093,7 +3234,7 @@ pub const FINAL_SIZE: u8 = 0x3f
 pub const FINAL_ATOM: u8 = 0x40
 pub const FINAL_OBJECT: u8 = 0x80
 pub fn finalShape(code: u8) -> u8 {
-  let table = b"\x01\x05\x05\x05\x45\x45\x01\x01\x01\x01\x01\x81\x02\x03\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x03\x03\x03\x03\x03\x03\x03\x01\x01\x01\x01\x01\x01\x01\x01\x01\x46\x05\x03\x01\x01\x01\x03\x03\x03\x03\x01\x01\x4d\x45\x4d\x01\x01\x01\x01\x01\x01\x01\x01\x01\x45\x45\x01\x01\x01\x01\x01\x02\x46\x02\x46\x46\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x05\x05\x05\x05\x05\x01\x01\x01\x01\x4a\x4a\x4a\x4a\x4a\x47\x47\x47\x45\x01\x01\x01\x01\x02\x01\x01\x01\x01\x01\x02\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x02\x02\x02\x01\x01\x01\x01\x45\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x05\x01\x03\x03\x01\x01\x02\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x02\x03\x02\x02\x01\x02\x02\x02\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x4f\x4f\x01\x02\x02\x02\x03\x01\x01\x01\x01\x01\x01\x01\x01\x4e\x4e\x02\x02\x03\x03"
+  let table = b"\x01\x05\x05\x05\x45\x45\x01\x01\x01\x01\x01\x81\x02\x03\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x03\x03\x03\x03\x03\x03\x03\x01\x01\x01\x01\x01\x01\x01\x01\x01\x46\x05\x03\x01\x01\x01\x03\x03\x03\x03\x01\x01\x4d\x45\x4d\x01\x01\x01\x01\x01\x01\x01\x01\x01\x45\x45\x01\x01\x01\x01\x01\x02\x46\x02\x46\x46\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x05\x05\x05\x05\x05\x01\x01\x01\x01\x4a\x4a\x4a\x4a\x4a\x47\x47\x47\x45\x01\x01\x01\x01\x02\x01\x01\x01\x01\x01\x02\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x02\x02\x02\x01\x01\x01\x01\x45\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x05\x01\x03\x03\x01\x01\x02\x01\x05\x01\x01\x03\x03\x03\x02\x02\x02\x02\x03\x02\x02\x01\x02\x02\x02\x01\x01\x01\x01\x01\x01\x01\x01\x03\x03\x03\x03\x01\x01\x01\x01\x02\x02\x02\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x4f\x4f\x01\x02\x02\x02\x03\x01\x01\x01\x01\x01\x01\x01\x01\x4e\x4e\x02\x02\x03\x03"
   return table[u8.toUsize(code)]
 }
 unsafe fn destroyBytecode<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node: *mut HeapHeader) -> () {
@@ -3125,7 +3266,8 @@ unsafe fn destroyBytecode<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader,
       let mut kept = move value
       match &mut kept.lazy {
         Option<LazyStub>.Some { value: stub } => { unsafe stub.release(runtime) }
-        _ => { let cell = kept.cell compilerState.destroyFunction(&mut hooks, &mut kept.tree.getMut(), cell) }
+        // A deferred body owns nothing: its bytes and atoms are the runtime's.
+        _ => { if kept.deferred.isNone() { let cell = kept.cell compilerState.destroyFunction(&mut hooks, &mut kept.tree.getMut(), cell) } }
       }
     }
     Option<PendingFunction>.None => ()
@@ -3606,6 +3748,23 @@ pub unsafe effect fn destroyRuntime<H: HeapHooks>(hooks: &mut H, runtime: *mut H
     unsafe release(&mut hooks, runtime, cached)
     unit = unit + 1
   }
+  // Deferred code-cache reads: their source strings and atom references.
+  unit = 0
+  while true {
+    let cache = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+    if unit >= cache.deferredTexts.length() { break }
+    let text = cache.deferredTexts.get(unit)
+    cache.deferredTexts.set(unit, ValueBits.Undefined)
+    drop cache
+    unsafe release(&mut hooks, runtime, text)
+    unit = unit + 1
+  }
+  let deferredState = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+  unit = 0
+  while unit < deferredState.deferredAtoms.length() { deferredState.atoms.release(deferredState.deferredAtoms.get(unit)) unit = unit + 1 }
+  deferredState.deferredAtoms.clear()
+  deferredState.deferredSources.clear()
+  drop deferredState
   // The kept identifier cache's atom references (js_parser_core.keepNames).
   let names = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
   let nameAtoms = Intrinsic.replace(names.lexerNameAtoms, List<StringOwner>.make())

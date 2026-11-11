@@ -55,6 +55,12 @@ Scores are wall-clock based and noisy on shared hosts. A score gap that the inst
 counts do not show usually comes from memory traffic, such as larger objects or more GC
 cycles.
 
+## WebAssembly builds
+
+`wasm/` builds silkjs (32-bit WebAssembly through the Silk LLVM backend) and QuickJS (wasi-sdk)
+as WASI commands for wasmtime, as comparison columns for the tables above. See
+[`wasm/README.md`](wasm/README.md).
+
 ## Profile-guided build
 
 `scripts/pgo_build.py` builds the release CLI twice: once instrumented, which it runs on the

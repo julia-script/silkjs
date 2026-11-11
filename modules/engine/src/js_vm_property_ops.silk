@@ -38,6 +38,7 @@ import js_bigint { BigIntError }
 import js_exceptions { JsException }
 import js_opcode_data as op
 import js_vm_factories as factories
+import js_vm_operators as operators
 import js_atom_data as atoms
 import js_atoms { AtomTable, ATOM_INTEGER_TAG, UNKNOWN_STRING_ATOM }
 import js_strings { Strings }
@@ -694,6 +695,40 @@ pub unsafe fn functionGetter(object: *mut HeapHeader, atom: u32) -> ?*mut HeapHe
   }
   return Pointer.null<HeapHeader>()
 }
+/// The setter of the accessor property atom that a write to object finds first,
+/// when that setter is a bytecode function; null for anything else (a data
+/// property anywhere on the way, a missing or native setter, a lazy slot, an
+/// exotic object, no property). Walks at most GETTER_DEPTH objects.
+pub unsafe fn functionSetter(object: *mut HeapHeader, atom: u32) -> ?*mut HeapHeader {
+  let mut current = object
+  let mut depth: usize = 0
+  while depth < GETTER_DEPTH {
+    let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, current)
+    if data.isExotic() { return Pointer.null<HeapHeader>() }
+    match unsafe shapes.find(data.shape, atom) {
+      Option<FoundProperty>.Some { value: found } => {
+        return match data.slot(found.index).view(found.flags) {
+          PropertySlot.GetterSetter { setter, .. } => match Pointer.nonNullMut<HeapHeader>(setter) {
+            Option<*mut HeapHeader>.Some { value } => {
+              let function = unsafe HeapCell.payload<ObjectData, ()>(&anchor, value)
+              if function.classId() == classes.JS_CLASS_BYTECODE_FUNCTION { value } else { Pointer.null<HeapHeader>() }
+            }
+            Option<*mut HeapHeader>.None => Pointer.null<HeapHeader>()
+          }
+          _ => Pointer.null<HeapHeader>()
+        }
+      }
+      Option<FoundProperty>.None => ()
+    }
+    let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+    match Pointer.nonNullMut<HeapHeader>(shape.prototype) {
+      Option<*mut HeapHeader>.Some { value } => { current = value }
+      Option<*mut HeapHeader>.None => { return Pointer.null<HeapHeader>() }
+    }
+    depth = depth + 1
+  }
+  return Pointer.null<HeapHeader>()
+}
 /// Objects functionGetter looks through: an own accessor, a class's, and one
 /// inherited a few levels down.
 const GETTER_DEPTH: usize = 4
@@ -710,17 +745,52 @@ unsafe fn fieldAtom(machine: &Machine) -> u32 {
 /// the field without pushing (so retaining and releasing) the object, which the
 /// slot keeps alive. false consumes nothing; cellFieldStep then runs the pair.
 @inlineAlways
-pub unsafe fn pushCellField(machine: &mut Machine, cell: *mut ValueBits) -> bool {
+pub unsafe fn pushCellField(machine: &mut Machine, cell: *mut ValueBits, chain: bool) -> bool {
   let object = match unsafe Pointer.read<ValueBits>(cell) { ValueBits.Object { reference } => reference _ => { return false } }
   let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
   let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
   let key = unsafe fieldKeyAt(machine.ip)
   if u64.shiftRight(key, 16) != shape.version { return false }
-  let found = (unsafe data.slotUnchecked(u64.toUsize(key & 0xffff))).valueBits()
+  let mut found = (unsafe data.slotUnchecked(u64.toUsize(key & 0xffff))).valueBits()
   drop shape drop data
-  unsafe machine.push(unsafe found.retained())
   unsafe machine.skip(FIELD_OPERAND_BYTES + 1)
+  if chain {
+    found = unsafe chainFields(&mut machine, found)
+    if unsafe operators.fusedOperand(&mut machine, found) { return true }
+  }
+  unsafe machine.push(unsafe found.retained())
   return true
+}
+/// `a.b.c`: while the next instruction is a get_field whose inline key holds
+/// the field as an own slot of found's object, reads it here and skips that
+/// instruction. found is borrowed from the slot it was read from, and so is
+/// the result: no value in between is pushed, retained or released, and no
+/// dispatch runs. Stops (with ip at the get_field) at anything else.
+/// Pushes a value borrowed from a variable's slot, or, when get_field
+/// instructions follow (`Namespace.Enum.Member` off a captured variable), the
+/// end of that chain read borrowed (chainFields): the variable's object is
+/// then never pushed, retained or released. The slot keeps it alive meanwhile.
+/// Callers skip this while instructions are observed one by one. (Settling a
+/// following Int comparison here as well ran slower.)
+@inlineAlways
+pub unsafe fn pushChained(machine: &mut Machine, value: ValueBits) -> () {
+  let found = unsafe chainFields(&mut machine, value)
+  unsafe machine.push(unsafe found.retained())
+}
+@inlineAlways
+unsafe fn chainFields(machine: &mut Machine, first: ValueBits) -> ValueBits {
+  let mut found = first
+  while unsafe machine.peekU8(0) == op.OP_get_field {
+    let object = match found { ValueBits.Object { reference } => reference _ => { break } }
+    let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+    let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+    let key = unsafe fieldKeyAt(unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(machine.ip), 1))
+    if u64.shiftRight(key, 16) != shape.version { break }
+    found = (unsafe data.slotUnchecked(u64.toUsize(key & 0xffff))).valueBits()
+    drop shape drop data
+    unsafe machine.skip(FIELD_OPERAND_BYTES + 1)
+  }
+  return found
 }
 /// get_loc_length8 and get_arg_length8 (ip at the slot index): a string's or an
 /// Array's length, pushed without pushing (so retaining and releasing) the
@@ -824,7 +894,7 @@ pub unsafe effect fn cellFieldStep<H: HeapHooks + OwnPropertyHooks + GetProperty
   ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
   // Uncached own fields, still without retaining the object.
   unsafe machine.pushCopy(cell)
-  match Pointer.nonNullMut<HeapHeader>(unsafe readFieldOperand(&mut machine)) {
+  match Pointer.nonNullMut<HeapHeader>(unsafe readFieldOperand(&mut machine, false)) {
     Option<*mut HeapHeader>.Some { value } => { unsafe gc.releaseObjectHeader(&mut hooks, machine.runtime, value) }
     Option<*mut HeapHeader>.None => {
       match Pointer.nonNullMut<HeapHeader>(unsafe readStringFieldOperand(&mut machine)) {
@@ -841,10 +911,26 @@ pub unsafe effect fn cellFieldStep<H: HeapHooks + OwnPropertyHooks + GetProperty
 /// Object operands only, so execute can run it on its register machine: nothing
 /// here takes the machine's address. Strings go to readStringFieldOperand.
 @inlineAlways
-pub unsafe fn readFieldOperand(machine: &mut Machine) -> ?*mut HeapHeader {
+pub unsafe fn readFieldOperand(machine: &mut Machine, chain: bool) -> ?*mut HeapHeader {
   let object = match unsafe machine.top(1) {
     ValueBits.Object { reference } => reference
     _ => { return Pointer.null<HeapHeader>() }
+  }
+  if chain {
+    // The inline key's own-slot hit, with any get_field chain after it read
+    // borrowed (chainFields); object keeps every value on the way alive until
+    // the caller releases it.
+    let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+    let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+    let key = unsafe fieldKeyAt(machine.ip)
+    if u64.shiftRight(key, 16) == shape.version {
+      let first = (unsafe data.slotUnchecked(u64.toUsize(key & 0xffff))).valueBits()
+      drop shape drop data
+      unsafe machine.skip(FIELD_OPERAND_BYTES)
+      let found = unsafe chainFields(&mut machine, first)
+      unsafe machine.set(1, unsafe found.retained())
+      return object
+    }
   }
   if !unsafe readFieldKeyed(&machine.*, object, unsafe machine.topCell(1), true) { return Pointer.null<HeapHeader>() }
   unsafe machine.skip(FIELD_OPERAND_BYTES)
@@ -975,36 +1061,136 @@ unsafe fn denseRead(object: ValueBits, key: ValueBits) -> Option<ValueBits> {
   let index = match key { ValueBits.Int { value } => value _ => { return Option<ValueBits>.none() } }
   if index < 0 { return Option<ValueBits>.none() }
   let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
-  if data.classId() != classes.JS_CLASS_ARRAY { drop data return unsafe otherElement(node, i32.toU32(index)) }
+  if data.classId() != classes.JS_CLASS_ARRAY {
+    drop data
+    // Typed arrays first, in line: compiled C (mandreel, zlib, gbemu) reads its
+    // heap through them, one element per few instructions.
+    let typed = unsafe typedRead.quickRead(node, u32.toU64(i32.toU32(index)))
+    if typed.isSome() { return typed }
+    return unsafe otherElement(node, i32.toU32(index))
+  }
   match &data.payload {
     ObjectPayload.FastArray { array } => {
-      if i32.toUsize(index) < array.values.length() {
-        return Option<ValueBits>.some(unsafe array.values.get(i32.toUsize(index)).retained())
+      if i32.toUsize(index) < array.values().length() {
+        return Option<ValueBits>.some(unsafe array.values().get(i32.toUsize(index)).retained())
       }
     }
     _ => ()
   }
   return Option<ValueBits>.none()
 }
-/// denseRead for anything but an Array: an unmapped (or formal-less sloppy)
-/// arguments object while it keeps its fast elements, else a typed array.
+/// denseRead for anything but an Array or an element quickRead serves: an
+/// unmapped (or formal-less sloppy) arguments object while it keeps its fast
+/// elements.
 @inlineNever
 unsafe fn otherElement(node: *mut HeapHeader, index: u32) -> Option<ValueBits> {
-  // Typed arrays first: compiled C (mandreel, gbemu) reads its heap through them.
-  let typed = unsafe typedRead.quickRead(node, u32.toU64(index))
-  if typed.isSome() { return typed }
   let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
   if data.classId() == classes.JS_CLASS_ARGUMENTS {
     match &data.payload {
       ObjectPayload.FastArray { array } => {
-        if u32.toUsize(index) < array.values.length() {
-          return Option<ValueBits>.some(unsafe array.values.get(u32.toUsize(index)).retained())
+        if u32.toUsize(index) < array.values().length() {
+          return Option<ValueBits>.some(unsafe array.values().get(u32.toUsize(index)).retained())
         }
       }
       _ => ()
     }
   }
   return Option<ValueBits>.none()
+}
+/// The fusion prefix before a heap read (ip at its operands: the shift count, the add_imm constant, the
+/// covered byte count; then the covered get_loc8 or get_loc0-3, add_imm and/or
+/// sar_imm, get_array_el): `heap[(x + k) >> s]` with an Int x whose sum stays an
+/// Int and an element denseRead serves replaces the object operand with the
+/// element and returns the object, whose operand reference the caller
+/// releases; advance then reaches past the covered instructions, and past an
+/// `or_imm 0` that follows an Int element (compiled C's int coercion). Null
+/// touches nothing. The ip itself is left to the caller, which moves it once
+/// by advance: an arm that leaves with different ips on different paths while
+/// still reading operands costs every dispatch a register copy.
+@inlineAlways
+pub unsafe fn fusedAddressElement(machine: &mut Machine, word: u64, advance: &mut usize) -> ?*mut HeapHeader {
+  // word: the four operand bytes and the covered local read, which the arm
+  // loads at once before any exit (the prefix and what it covers span at least
+  // nine bytes). Operand loads spread between the exits kept the ip in two
+  // registers, in every arm.
+  let read = u64.wrappingToU8(u64.shiftRight(word, 32))
+  // get_loc0-3 name their local in the opcode (201 to 204).
+  let mut slot = (u8.toUsize(read) + 55) & 3
+  if read == op.OP_get_loc8 { slot = u64.toUsize(u64.shiftRight(word, 40) & 0xff) }
+  let x = match unsafe machine.local(slot) { ValueBits.Int { value } => value _ => { return Pointer.null<HeapHeader>() } }
+  let k = u16.toI32(u64.wrappingToU16(u64.shiftRight(word, 8)) ^ 0x8000) - 0x8000
+  let sum = i32.wrappingAdd(x, k)
+  if ((x ^ sum) & (k ^ sum)) < 0 { return Pointer.null<HeapHeader>() }
+  let object = unsafe machine.top(1)
+  let node = match object { ValueBits.Object { reference } => reference _ => { return Pointer.null<HeapHeader>() } }
+  let shift = u8.toI32(u64.wrappingToU8(word)) & 31
+  let at = i32.shiftRight(sum, shift)
+  let end = 4 + u64.toUsize(u64.shiftRight(word, 24) & 0xff)
+  // An integer view (compiled C's heap) first: its element is an Int, so the
+  // `| 0` that follows is known to keep it.
+  if at >= 0 {
+    let element = unsafe typedRead.quickInt(node, u32.toU64(i32.toU32(at)))
+    if element != typedRead.NO_INT {
+      let coerced = unsafe machine.peekU8(end) == op.OP_or_imm && unsafe machine.peekU16At(end + 1) == 0
+      advance.* = if coerced { end + 3 } else { end }
+      unsafe machine.set(1, ValueBits.Int { value: i64.wrappingToI32(element) })
+      return node
+    }
+  }
+  match unsafe denseRead(object, ValueBits.Int { value: at }) {
+    Option<ValueBits>.Some { value } => {
+      let coerced = match value { ValueBits.Int { .. } => unsafe machine.peekU8(end) == op.OP_or_imm && unsafe machine.peekU16At(end + 1) == 0 _ => false }
+      advance.* = if coerced { end + 3 } else { end }
+      unsafe machine.set(1, value)
+      return node
+    }
+    Option<ValueBits>.None => { return Pointer.null<HeapHeader>() }
+  }
+}
+/// The fusion prefix before a heap read whose array is a captured variable of
+/// the running scope or a global (ip at its operands: the shift count with bit
+/// 7 set when x is an argument, the add_imm constant, the covered byte count
+/// with bit 6 set; then the covered get_scope0 or get_var, the read of the
+/// local or argument x, add_imm and/or sar_imm, get_array_el):
+/// `heap[(x + k) >> s]` pushes the element denseRead serves of object, the
+/// object the first covered instruction would push, read where it is held, so
+/// nothing is retained or released. tail holds the eight bytes after the
+/// operands. advance then reaches past the covered instructions, and past an
+/// `or_imm 0` after an Int element. It is left alone, with nothing pushed,
+/// when x is not an Int or the sum leaves the Int range.
+@inlineAlways
+pub unsafe fn fusedHeldElement(machine: &mut Machine, object: *mut HeapHeader, word: u64, tail: u64, advance: &mut usize) -> () {
+  let read = u64.wrappingToU8(u64.shiftRight(tail, 24))
+  // get_loc0-3 and get_arg0-3 name their slot in the opcode (201 to 204, 213 to 216).
+  let mut slot = (u8.toUsize(read) + 3) & 3
+  if read == op.OP_get_loc8 || read == op.OP_get_arg { slot = u64.toUsize(u64.shiftRight(tail, 32) & 0xff) }
+  let source = if (word & 0x80) != 0 { unsafe machine.argument(slot) } else { unsafe machine.local(slot) }
+  let x = match source { ValueBits.Int { value } => value _ => { return () } }
+  let k = u16.toI32(u64.wrappingToU16(u64.shiftRight(word, 8)) ^ 0x8000) - 0x8000
+  let sum = i32.wrappingAdd(x, k)
+  if ((x ^ sum) & (k ^ sum)) < 0 { return () }
+  let shift = u8.toI32(u64.wrappingToU8(word)) & 31
+  let at = i32.shiftRight(sum, shift)
+  let end = 4 + u64.toUsize(u64.shiftRight(word, 24) & 0x1f)
+  // An integer view (compiled C's heap) first: its element is an Int, so the
+  // `| 0` that follows is known to keep it.
+  if at >= 0 {
+    let element = unsafe typedRead.quickInt(object, u32.toU64(i32.toU32(at)))
+    if element != typedRead.NO_INT {
+      let coerced = unsafe machine.peekU8(end) == op.OP_or_imm && unsafe machine.peekU16At(end + 1) == 0
+      advance.* = if coerced { end + 3 } else { end }
+      unsafe machine.push(ValueBits.Int { value: i64.wrappingToI32(element) })
+      return ()
+    }
+  }
+  match unsafe denseRead(ValueBits.Object { reference: object }, ValueBits.Int { value: at }) {
+    Option<ValueBits>.Some { value } => {
+      let coerced = match value { ValueBits.Int { .. } => unsafe machine.peekU8(end) == op.OP_or_imm && unsafe machine.peekU16At(end + 1) == 0 _ => false }
+      advance.* = if coerced { end + 3 } else { end }
+      unsafe machine.push(value)
+    }
+    Option<ValueBits>.None => {}
+  }
 }
 /// get_array_el fast path: an in-bounds Int index into a fast Array, or an own
 /// index data property otherwise (step's quickIndexRead), replaces both operands
@@ -1059,6 +1245,16 @@ pub unsafe fn readStringElementOperand<H: HeapHooks>(hooks: &mut H, machine: &mu
   let index = getters.indexString(key)
   let mut value = ValueBits.Undefined
   if index < 0 {
+    if key.tag() == -8 {
+      match unsafe quickSymbolRead(machine.runtime, object, key) {
+        Option<ValueBits>.Some { value: found } => { value = found }
+        Option<ValueBits>.None => { return Pointer.null<HeapHeader>() }
+      }
+      unsafe machine.set(2, value)
+      unsafe machine.discard(1)
+      unsafe gc.release(&mut hooks, machine.runtime, key)
+      return node
+    }
     if key.tag() != -7 { return Pointer.null<HeapHeader>() }
     match unsafe namedStringRead(machine.runtime, node, key) {
       Option<ValueBits>.Some { value: found } => { value = found }
@@ -1093,6 +1289,74 @@ pub unsafe fn pushElementOperand(machine: &mut Machine) -> bool {
     Option<ValueBits>.None => { return false }
   }
 }
+/// put_array_el on the register machine, before execute publishes ip and top
+/// (the round trip through the frame delays the next dispatch): an Int into a
+/// typed array element, or any value over an existing element of a fast Array
+/// or one past its end with room, under an Int index. Consumes all three operands; false leaves
+/// them to writeElementOperand.
+@inlineAlways
+pub unsafe fn storeElementOperand<H: HeapHooks>(hooks: &mut H, machine: &mut Machine) -> bool {
+  let object = unsafe machine.top(3)
+  let node = match object { ValueBits.Object { reference } => reference _ => { return false } }
+  let index = match unsafe machine.top(2) { ValueBits.Int { value } => value _ => { return false } }
+  if index < 0 { return false }
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+  if data.classId() != classes.JS_CLASS_ARRAY {
+    drop data
+    let integer = match unsafe machine.top(1) { ValueBits.Int { value } => value _ => { return false } }
+    if !unsafe typedWrite.quickWriteInt(node, u32.toU64(i32.toU32(index)), integer) { return false }
+    unsafe machine.discard(3)
+    unsafe gc.releaseObjectHeader(&mut hooks, machine.runtime, node)
+    return true
+  }
+  let at = i32.toUsize(index)
+  let mut old = ValueBits.Undefined
+  match &mut data.payload {
+    ObjectPayload.FastArray { array } => {
+      // One past the end with room appends here too.
+      if at >= array.values().length() { drop data return unsafe appendElementOperand(&mut hooks, &mut machine, node, at) }
+      old = array.values().get(at) let stored = unsafe machine.top(1) array.store(at, stored)
+    }
+    _ => { return false }
+  }
+  drop data
+  unsafe machine.discard(3)
+  unsafe gc.release(&mut hooks, machine.runtime, old)
+  unsafe gc.releaseObjectHeader(&mut hooks, machine.runtime, node)
+  return true
+}
+/// `a[i] = v` under its fusion prefix (js_compiler_labels.slotStore), from the
+/// slots themselves: an Int into a typed array element, or any value over an
+/// existing element of a fast Array or one past its end where it has room,
+/// at index (not negative). Nothing is
+/// pushed and the array is not retained. False changes nothing.
+@inlineAlways
+pub unsafe fn storeElementAt<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node: *mut HeapHeader, index: i32, value: ValueBits) -> bool {
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+  if data.classId() != classes.JS_CLASS_ARRAY {
+    drop data
+    let integer = match value { ValueBits.Int { value: whole } => whole _ => { return false } }
+    return unsafe typedWrite.quickWriteInt(node, u32.toU64(i32.toU32(index)), integer)
+  }
+  let at = i32.toUsize(index)
+  let mut old = ValueBits.Undefined
+  match &mut data.payload {
+    ObjectPayload.FastArray { array } => {
+      if at >= array.values().length() {
+        // One past the end with room: an append, as put_array_el makes it.
+        drop data
+        if !unsafe appendElementAt(node, at, value) { return false }
+        drop unsafe value.retained()
+        return true
+      }
+      old = array.values().get(at) array.store(at, unsafe value.retained())
+    }
+    _ => { return false }
+  }
+  drop data
+  unsafe gc.release(&mut hooks, runtime, old)
+  return true
+}
 /// put_array_el fast path: overwrites an existing element of a fast Array under an
 /// in-bounds Int index and consumes all three operands. False leaves them to step.
 @inlineAlways
@@ -1107,13 +1371,13 @@ pub unsafe fn writeElementOperand<H: HeapHooks>(hooks: &mut H, machine: &mut Mac
   let mut old = ValueBits.Undefined
   match &mut data.payload {
     ObjectPayload.FastArray { array } => {
-      if at >= array.values.length() {
+      if at >= array.values().length() {
         drop data
         if unsafe appendElementOperand(&mut hooks, &mut machine, node, at) { return true }
         // Past the end with a gap (a descending fill): an own index property, as step's putIndexFast.
         return unsafe writeIndexedOperand(&mut hooks, &mut machine)
       }
-      old = array.values.get(at) array.values.set(at, unsafe machine.top(1))
+      old = array.values().get(at) let stored = unsafe machine.top(1) array.store(at, stored)
     }
     _ => { drop data return unsafe writeIndexedOperand(&mut hooks, &mut machine) }
   }
@@ -1180,13 +1444,23 @@ unsafe effect fn addElementQuick(runtime: *mut HeapHeader, node: *mut HeapHeader
 }
 /// writeElementOperand one past the end of a fast Array with room for it, as
 /// putArrayFast appends (a[a.length] = x); anything else is left for step.
-@inlineNever
+@inlineAlways
 unsafe fn appendElementOperand<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, node: *mut HeapHeader, at: usize) -> bool {
+  if !unsafe appendElementAt(node, at, unsafe machine.top(1)) { return false }
+  unsafe machine.discard(3)
+  unsafe gc.releaseObjectHeader(&mut hooks, machine.runtime, node)
+  return true
+}
+/// Appends value (whose reference moves in) at index at of the fast Array
+/// node when at is its count and it has room. It takes no machine: the
+/// register machine's fields stay out of memory across the call.
+@inlineNever
+unsafe fn appendElementAt(node: *mut HeapHeader, at: usize, value: ValueBits) -> bool {
   let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
   if !data.fastArray() { return false }
   let mut count: usize = 0 let mut capacity: usize = 0
   match &data.payload {
-    ObjectPayload.FastArray { array } => { count = array.values.length() capacity = array.values.capacity() }
+    ObjectPayload.FastArray { array } => { count = array.values().length() capacity = array.values().capacity() }
     _ => { return false }
   }
   if at != count || at >= capacity { return false }
@@ -1205,18 +1479,16 @@ unsafe fn appendElementOperand<H: HeapHooks>(hooks: &mut H, machine: &mut Machin
     target.setSlot(0, SlotBits.value(ValueBits.Int { value: usize.toI32(newLength) }))
   }
   match &mut target.payload {
-    ObjectPayload.FastArray { array } => { array.values.push(unsafe machine.top(1)) }
+    ObjectPayload.FastArray { array } => { array.push(value) }
     _ => trap()
   }
   drop target
-  unsafe machine.discard(3)
-  unsafe gc.releaseObjectHeader(&mut hooks, machine.runtime, node)
   return true
 }
 // A Number stored into a typed array element: the value needs no release.
-@inlineNever
-/// Int values convert inline, so this path makes no calls; other values go to
-/// writeTypedNumberOperand.
+/// Int values convert inline in the put_array_el arm, so this path makes no
+/// calls; other values go to writeTypedNumberOperand.
+@inlineAlways
 unsafe fn writeTypedOperand<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, node: *mut HeapHeader, index: u32) -> bool {
   let integer = match unsafe machine.top(1) {
     ValueBits.Int { value } => value
@@ -1259,7 +1531,7 @@ unsafe effect fn writeField<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeade
   drop shape
   let old = (unsafe data.slotUnchecked(index)).valueBits()
   // An object has a slot for each record of its shape.
-  unsafe data.setSlotUnchecked(index, SlotBits.value(unsafe Pointer.read<ValueBits>(source))) drop data
+  unsafe data.setSlotUnchecked(index, unsafe SlotBits.valueAt(unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(source))) drop data
   // The last reference goes out of line by header, so this function keeps no
   // ValueBits in memory and needs no stack frame.
   if old.tag() >= 0 { return true }
@@ -1323,7 +1595,7 @@ unsafe fn storeOwnSlot(data: &mut ObjectData, index: usize, source: *mut ValueBi
       Option<*mut HeapHeader>.None => ()
     }
   }
-  unsafe data.setSlotUnchecked(index, SlotBits.value(unsafe Pointer.read<ValueBits>(source)))
+  unsafe data.setSlotUnchecked(index, unsafe SlotBits.valueAt(unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(source)))
   return true
 }
 /// addField's verified-memo case in a frame of its own: a leaf with no spills
@@ -1377,6 +1649,7 @@ unsafe effect fn putArrayLength<H: HeapHooks>(hooks: &mut H, machine: &Machine, 
   if requested < 0 || !array { return false }
   if unsafe arrayStorage.truncatePlain(node, i32.toU32(requested)) { return true }
   if !arraySupport.writableLength(unsafe lendFor(object)) { return false }
+  if unsafe arrayStorage.dropAbsentLast(node, i32.toU32(requested)) { return true }
   // A refusal (allocation, or a non-configurable element that stops a sparse
   // array's truncation) repeats the store on the generic path, which reports it;
   // the repeat finds nothing more to delete.
@@ -1562,6 +1835,12 @@ pub unsafe effect fn storeCellsField<H: HeapHooks>(hooks: &mut H, runtime: *mut 
 pub unsafe effect fn cellsPutStep<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + CoercionHooks + PropertyWriteHooks>(
   hooks: &mut H, memory: &AllocationObserver, machine: &mut Machine, cell: *mut ValueBits, source: *mut ValueBits) -> ()
   ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  // arr.length = n: the truncation itself, with nothing pushed.
+  if unsafe fieldAtom(&machine.*) == atoms.JS_ATOM_length
+    && run unsafe putArrayLength(&mut hooks, &machine.*, unsafe Pointer.read<ValueBits>(cell), atoms.JS_ATOM_length, unsafe Pointer.read<ValueBits>(source)) {
+    unsafe machine.skip(FIELD_OPERAND_BYTES + 2)
+    return ()
+  }
   unsafe machine.pushCopy(cell)
   unsafe machine.pushCopy(source)
   drop run unsafe step(&mut hooks, memory, &mut machine, op.OP_put_field)
@@ -1587,6 +1866,25 @@ unsafe fn quickIndexRead(runtime: *mut HeapHeader, object: ValueBits, key: Value
   if index < 0 { return Option<ValueBits>.none() }
   return unsafe getters.quickGet(runtime, node, i32.toU32(index) | ATOM_INTEGER_TAG)
 }
+// A Symbol key (Node's state[kState]) on an object: an own or inherited plain value
+// found without callbacks, else None for the full path. The key stays the caller's.
+unsafe fn quickSymbolRead(runtime: *mut HeapHeader, object: ValueBits, key: ValueBits) -> Option<ValueBits> {
+  let node = match object { ValueBits.Object { reference } => reference _ => { return Option<ValueBits>.none() } }
+  if !match key { ValueBits.Symbol { .. } => true _ => false } { return Option<ValueBits>.none() }
+  let anchor = () let atom = (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)).atoms.borrowedSymbolAtom(key)
+  return unsafe getters.quickGet(runtime, node, atom)
+}
+// putIndexFast for a Symbol key. Takes ownership of value only when true; the key
+// stays the caller's.
+unsafe fn putSymbolFast<H: HeapHooks>(hooks: &mut H, machine: &Machine, object: ValueBits, key: ValueBits, value: ValueBits) -> bool {
+  let node = match object { ValueBits.Object { reference } => reference _ => { return false } }
+  if !match key { ValueBits.Symbol { .. } => true _ => false } { return false }
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  let ordinary = !data.isExotic() || data.classId() == classes.JS_CLASS_ARRAY drop data
+  if !ordinary { return false }
+  let atom = (unsafe HeapCell.payload<RuntimeState, ()>(&anchor, machine.runtime)).atoms.borrowedSymbolAtom(key)
+  return unsafe putFieldFast(&mut hooks, &machine, object, atom, value)
+}
 // Overwrites an existing own writable data property under a non-negative Int key
 // on an ordinary object or an Array. Takes ownership of value only when true.
 unsafe fn putIndexFast<H: HeapHooks>(hooks: &mut H, machine: &Machine, object: ValueBits, key: ValueBits, value: ValueBits) -> bool {
@@ -1608,7 +1906,7 @@ unsafe effect fn putArrayFast<H: HeapHooks>(hooks: &mut H, machine: &Machine, ob
   if data.classId() != classes.JS_CLASS_ARRAY { return false }
   let mut count: usize = 0 let mut capacity: usize = 0
   match &data.payload {
-    ObjectPayload.FastArray { array } => { count = array.values.length() capacity = array.values.capacity() }
+    ObjectPayload.FastArray { array } => { count = array.values().length() capacity = array.values().capacity() }
     _ => { return false }
   }
   if at >= count {
@@ -1630,7 +1928,7 @@ unsafe effect fn putArrayFast<H: HeapHooks>(hooks: &mut H, machine: &Machine, ob
     }
     match &mut data.payload {
       // A full array grows here too, as the source's add_fast_array_element does.
-      ObjectPayload.FastArray { array } => { run array.values.append(value) }
+      ObjectPayload.FastArray { array } => { array.noteStored(&value) run (unsafe array.plainMut()).append(value) }
       _ => trap()
     }
     return true
@@ -1640,7 +1938,7 @@ unsafe effect fn putArrayFast<H: HeapHooks>(hooks: &mut H, machine: &Machine, ob
   let mut old = ValueBits.Undefined
   match &mut target.payload {
     ObjectPayload.FastArray { array } => {
-      old = array.values.get(at) array.values.set(at, value)
+      old = array.values().get(at) array.store(at, value)
     }
     _ => trap()
   }
@@ -1777,8 +2075,13 @@ pub unsafe effect fn step<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + H
     let mut value = ValueBits.Undefined
     let mut found = unsafe denseRead(object, key)
     if found.isNone() { found = unsafe quickIndexRead(machine.runtime, object, key) }
+    if found.isNone() { found = unsafe quickSymbolRead(machine.runtime, object, key) }
     match move found {
-      Option<ValueBits>.Some { value: element } => { value = element }
+      Option<ValueBits>.Some { value: element } => {
+        value = element
+        // get_array_el and get_array_el2 drop the key operand; only a Symbol holds a reference.
+        if opcode != op.OP_get_array_el3 { unsafe gc.release(&mut hooks, machine.runtime, key) }
+      }
       Option<ValueBits>.None => {
         if opcode == op.OP_get_array_el3 {
           if !key.isString() && !match key { ValueBits.Int { .. } => true ValueBits.Symbol { .. } => true _ => false } {
@@ -1820,6 +2123,7 @@ pub unsafe effect fn step<H: HeapHooks + OwnPropertyHooks + GetPropertyHooks + H
     let mut failure = false
     let mut stored = run unsafe putArrayFast(&mut hooks, &machine.*, object, key, value)
     if !stored { stored = unsafe putIndexFast(&mut hooks, &machine.*, object, key, value) }
+    if !stored && unsafe putSymbolFast(&mut hooks, &machine.*, object, key, value) { stored = true unsafe gc.release(&mut hooks, machine.runtime, key) }
     if !stored {
       // obj[i] = v adding a non-negative Int key to an ordinary object: the
       // put_field add with the integer atom, which needs no interning.

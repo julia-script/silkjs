@@ -25,6 +25,7 @@ import silk.mem.raw_buffer { RawBuffer }
 import silk.mem.slot { Slot }
 import silk.num.usize
 import silk.num.u16
+import silk.concurrency.atomic { Atomic, MemoryOrder }
 import silk.num.u32
 import silk.num.u8
 import silk.num.u64
@@ -529,6 +530,17 @@ impl Drop for OwnedAtom {
 /// Runtime root payload (HeapKind.Auxiliary). Its AtomTable is a native owner.
 /// GC lists, context links, shape buckets and weak-list links are non-owning.
 /// currentException, asyncContext and queued JobEntry values are owned JS roots.
+/// What a deferred function body needs of the read that left it behind: the
+/// bytes, which the caller keeps readable for the runtime's lifetime, and the
+/// read's atom table and shared source strings, as ranges of
+/// RuntimeState.deferredAtoms and deferredTexts.
+pub struct DeferredSource { pub data: *const u8, pub length: usize, pub flags: u32, pub firstAtom: u32,
+  pub atomStart: u32, pub atomCount: u32, pub textStart: u32, pub textCount: u32,
+  /// Where the bytes list their atom strings' starts; the strings follow. An
+  /// atom is interned on its first use, and its deferredAtoms entry is 0 until then.
+  pub atomTable: u32 }
+impl Copy for DeferredSource {}
+
 pub struct RuntimeState {
   pub runtimeInfo: Option<ByteStorage>,
   pub atoms: AtomTable,
@@ -557,6 +569,10 @@ pub struct RuntimeState {
   pub gcYoungArenas: ?*mut u8,
   /// Pooled dead cells waiting for drainZero, marked in their arenas' scratch bits.
   pub zeroPending: usize,
+  /// Drains still to defer their releases early (js_gc.drainZeroFrom): set when a
+  /// drain measures its dead cells as out of cache, counted down by each drain
+  /// that defers on that word, so a warm heap is found again by a fresh probe.
+  pub coldDrains: u8,
   pub gcPhase: GcPhase,
   pub mallocGcThreshold: usize,
   /// Consecutive collections that freed little, 0 to 3; each widens the next
@@ -694,6 +710,13 @@ pub struct RuntimeState {
   /// Re-parsing the same source compiles each literal again, and the bytecode
   /// depends only on the pattern and flags text.
   pub regexpPrograms: List<ValueBits>,
+  /// Trusted code-cache reads that left function bodies in their bytes
+  /// (js_binary_object_reader DEFER), kept until the runtime is freed.
+  pub deferredSources: List<DeferredSource>,
+  /// Their atom tables and source strings, back to back; one reference to each
+  /// is owned here.
+  pub deferredAtoms: List<u32>,
+  pub deferredTexts: List<ValueBits>,
   /// The identifier cache of the last finished parse (js_lexer.Lexer names and
   /// held) and the atom references that keep its slots' atoms alive. The next
   /// parse starts from it: a lazy compile reads names its source's earlier
@@ -994,6 +1017,13 @@ pub struct ContextState {
   pub mappedArgumentsShape: ?*mut HeapHeader,
   pub regexpShape: ?*mut HeapHeader,
   pub regexpResultShape: ?*mut HeapHeader,
+  /// Where RegExp.prototype holds exec as a data slot (regexpExecSlot), for a
+  /// RegExp literal the VM answers without creating it: valid while
+  /// regexpShape's version is regexpExecShape and its prototype's shape version
+  /// regexpExecProto (0: nothing remembered; no shape has version 0).
+  pub regexpExecShape: u64,
+  pub regexpExecProto: u64,
+  pub regexpExecSlot: usize,
   pub classPrototypes: List<ValueBits>,
   pub functionPrototype: Value,
   pub functionConstructor: Value,
@@ -1159,7 +1189,20 @@ impl PropertySlot {
 /// descriptor, the host id, the owned initializer or zero.
 pub struct SlotBits { first: u64, second: u64 }
 impl Copy for SlotBits {}
-struct SlotPointers { first: ?*mut HeapHeader, second: ?*mut HeapHeader }
+// Each pointer takes one 64-bit slot word: a 32-bit target pads it with a zero high half.
+static if Intrinsic.targetPointerBits() == 32 {
+  struct SlotPointers { first: ?*mut HeapHeader, firstHigh: u32, second: ?*mut HeapHeader, secondHigh: u32 }
+  @inlineAlways
+  fn onePointer(first: ?*mut HeapHeader) -> SlotPointers {
+    return SlotPointers { first: first, firstHigh: 0, second: Pointer.null<HeapHeader>(), secondHigh: 0 }
+  }
+} else {
+  struct SlotPointers { first: ?*mut HeapHeader, second: ?*mut HeapHeader }
+  @inlineAlways
+  fn onePointer(first: ?*mut HeapHeader) -> SlotPointers {
+    return SlotPointers { first: first, second: Pointer.null<HeapHeader>() }
+  }
+}
 impl Copy for SlotPointers {}
 /// An accessor slot's getter and setter (null when absent), in a cell of its own
 /// so that every slot kind fits one word of the slot.
@@ -1188,6 +1231,21 @@ fn slotWords(pointers: SlotPointers) -> SlotBits {
 @inlineAlways
 fn addressWord(pointer: ?*mut HeapHeader) -> u64 { return usize.toU64(Pointer.address<HeapHeader>(pointer)) }
 impl SlotBits {
+  /// The value slot for the value in the cell at source, read one word at a time.
+  /// The cell is usually an operand the previous instruction pushed with two word
+  /// stores. Clang joins two plain word loads into one 16-byte load, which the
+  /// processor cannot forward from two 8-byte stores still in its store buffer: it
+  /// waits about a dozen cycles for both to retire (8% of Richards in put_field).
+  /// An atomic load is the same instruction and is never joined.
+  @inlineAlways
+  pub unsafe fn valueAt(source: *const ValueBits) -> SlotBits {
+    checkSlotLayout()
+    let words = unsafe Pointer.assumeMany<u64>(unsafe Intrinsic.pointerReinterpret<*const ValueBits, *const u64>(source))
+    return SlotBits {
+      first: unsafe Atomic.load<u64>(unsafe Pointer.at<u64>(words, 0), MemoryOrder.Relaxed),
+      second: unsafe Atomic.load<u64>(unsafe Pointer.at<u64>(words, 1), MemoryOrder.Relaxed)
+    }
+  }
   /// The slot holding slot, taking its references. An accessor gets a new box.
   @inlineAlways
   pub effect fn from(slot: PropertySlot) -> SlotBits ! OutOfMemoryError ? &mut Allocator {
@@ -1199,7 +1257,7 @@ impl SlotBits {
   @inlineNever
   effect fn accessor(getter: ?*mut HeapHeader, setter: ?*mut HeapHeader) -> SlotBits ! OutOfMemoryError ? &mut Allocator {
     let cell = run HeapCell.allocate<AccessorBox>(HeapKind.Auxiliary, AccessorBox { getter: getter, setter: setter })
-    return slotWords(SlotPointers { first: unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cell), second: Pointer.null<HeapHeader>() })
+    return slotWords(onePointer(unsafe Intrinsic.pointerRequalify<*mut HeapHeader, ?*mut HeapHeader>(cell)))
   }
   /// from for any slot but an accessor (traps on one), which needs no allocation.
   @inlineAlways
@@ -1207,7 +1265,7 @@ impl SlotBits {
     return match slot {
       PropertySlot.Value { value } => SlotBits.value(value)
       PropertySlot.GetterSetter { .. } => Intrinsic.trap("an accessor slot needs its box")
-      PropertySlot.VarRef { reference } => slotWords(SlotPointers { first: reference, second: Pointer.null<HeapHeader>() })
+      PropertySlot.VarRef { reference } => slotWords(onePointer(reference))
       PropertySlot.LazyPrototype { realm } => SlotBits.lazy(realm, LAZY_PROTOTYPE, 0)
       PropertySlot.LazyNamespace { realm, module } => SlotBits.lazy(realm, LAZY_NAMESPACE, addressWord(module))
       PropertySlot.LazyBuiltin { realm, family, method } => {
@@ -1439,9 +1497,80 @@ impl NativeFunctionData {
     unsafe { return Pointer.fromSlice<ValueBits>(HeapCell.payload<NativeCapturedValues, Self>(self, cell).values.asSlice()) }
   }
 }
+/// A fast array's elements. plain says that no element is a heap value, so the
+/// elements own nothing: a copy of them is a block copy and a dying array
+/// releases none. It is only ever set where that is proven and every way to
+/// write an element clears it, except the unsafe plainMut for stores that are
+/// known to keep it true.
 pub struct FastArrayData {
   /// Native capacity is the source size; length is the initialized element count.
-  pub values: ThinList<ValueBits>
+  items: ThinList<ValueBits>,
+  plain: bool
+}
+/// A build with this on checks FastArrayData.plain against the elements where
+/// the flag is relied on, and traps on a mismatch. Off in every shipped build.
+pub const CHECK_PLAIN_ARRAYS: bool = false
+impl FastArrayData {
+  /// The payload over values, which may hold anything.
+  @inlineAlways
+  pub fn of(values: ThinList<ValueBits>) -> FastArrayData { return FastArrayData { items: move values, plain: false } }
+  /// The payload of an array with no elements yet.
+  @inlineAlways
+  pub fn empty() -> FastArrayData { return FastArrayData { items: ThinList<ValueBits>.make(), plain: true } }
+  /// The payload over values that hold no heap value.
+  @inlineAlways
+  pub unsafe fn ofPlain(values: ThinList<ValueBits>) -> FastArrayData { return FastArrayData { items: move values, plain: true } }
+  @inlineAlways
+  pub fn values(self: &Self) -> &ThinList<ValueBits> { return &self.items }
+  /// The elements, to change in any way: plain is cleared.
+  @inlineAlways
+  pub fn valuesMut(self: &mut Self) -> &mut ThinList<ValueBits> { self.plain = false return &mut self.items }
+  /// The elements, for a change that stores no heap value (or that calls
+  /// noteStored for each value it stores): plain is kept.
+  @inlineAlways
+  pub unsafe fn plainMut(self: &mut Self) -> &mut ThinList<ValueBits> { return &mut self.items }
+  /// Takes the elements out, leaving an empty list.
+  @inlineAlways
+  pub fn take(self: &mut Self) -> ThinList<ValueBits> { self.plain = true return Intrinsic.replace(self.items, ThinList<ValueBits>.make()) }
+  /// Replaces the elements with values, which may hold anything, and returns the old ones.
+  @inlineAlways
+  pub fn replace(self: &mut Self, values: ThinList<ValueBits>) -> ThinList<ValueBits> { self.plain = false return Intrinsic.replace(self.items, move values) }
+  /// Writes values over elements that were never initialized or were already moved out.
+  @inlineAlways
+  pub unsafe fn put(self: &mut Self, values: ThinList<ValueBits>) -> () {
+    unsafe Pointer.put<ThinList<ValueBits>>(Pointer.fromMutRef<ThinList<ValueBits>>(&mut self.items), move values)
+    self.plain = false
+  }
+  /// The elements of a payload that is going away.
+  @inlineAlways
+  pub fn intoValues(self: Self) -> ThinList<ValueBits> { return move self.items }
+  /// Whether no element is a heap value. False says nothing.
+  @inlineAlways
+  pub fn isPlain(self: &Self) -> bool {
+    if CHECK_PLAIN_ARRAYS && self.plain && ValueBits.anyHeap(self.items.asSlice()) { Intrinsic.trap("a plain fast array holds a heap value") }
+    return self.plain
+  }
+  /// Records that value was (or is about to be) stored through plainMut.
+  @inlineAlways
+  pub fn noteStored(self: &mut Self, value: &ValueBits) -> () {
+    match ValueBits.heapReference(value) { Option<*mut HeapHeader>.Some { .. } => { self.plain = false } Option<*mut HeapHeader>.None => () }
+  }
+  /// Stores value at index. The caller owns the count of the value it overwrites.
+  @inlineAlways
+  pub fn store(self: &mut Self, index: usize, value: ValueBits) -> () { self.noteStored(&value) self.items.set(index, value) }
+  /// Pushes value into spare capacity.
+  @inlineAlways
+  pub fn push(self: &mut Self, value: ValueBits) -> () { self.noteStored(&value) self.items.push(value) }
+  /// Stores undefined at index.
+  @inlineAlways
+  pub fn clear(self: &mut Self, index: usize) -> () { self.items.set(index, ValueBits.Undefined) }
+  @inlineAlways
+  pub fn truncate(self: &mut Self, length: usize) -> () { self.items.truncate(length) }
+  @inlineAlways
+  pub fn moveWithin(self: &mut Self, from: usize, to: usize, count: usize) -> () { self.items.moveWithin(from, to, count) }
+  /// Records the outcome of a scan: the elements hold no heap value.
+  @inlineAlways
+  pub unsafe fn setPlain(self: &mut Self, plain: bool) -> () { self.plain = plain }
 }
 pub struct MappedArgumentsData {
   pub varRefs: ThinList<*mut HeapHeader>
@@ -1949,9 +2078,9 @@ pub struct VarRef {
   pub state: VarRefState
 }
 /// StackFrame.currentPc of a frame with no bytecode position.
-pub const NO_PC: usize = 18446744073709551615
+pub const NO_PC: usize = usize.MAX
 /// StackFrame.stackPointer of a running frame.
-pub const NO_SP: usize = 18446744073709551615
+pub const NO_SP: usize = usize.MAX
 /// A published frame MUST stay at its original address, as must argument/local/
 /// operand slot allocations. Stack-local frames can be borrowed for a synchronous
 /// call; resumable activations use StableFrame. currentPc is the bytecode offset
