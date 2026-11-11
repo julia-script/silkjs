@@ -345,8 +345,9 @@ function evaluatePreview(expression, sandbox, timeout = 333) {
 }
 function releasePreview(token) { previews.delete(token); }
 function broadcast(method, params) {
-  // Node's agents check an event only where a session can receive it.
-  if (sessions.size === 0) return;
+  // Node's agents check an event only where a session has its domain enabled.
+  const isNetwork = method.startsWith('Network.');
+  if (![...sessions.values()].some(session => isNetwork ? session.networkEnabled : method.startsWith('DOMStorage.') ? session.domStorageEnabled : true)) return;
   const items = require('internal/inspector_events').validate(method, params);
   if (method.startsWith('DOMStorage.')) {
     const domStorage = require('internal/inspector_dom_storage');
@@ -357,9 +358,13 @@ function broadcast(method, params) {
     }
     return;
   }
-  if (method.startsWith('Network.')) {
-    // As NetworkAgent: a request names the user code that started it.
-    if (method === 'Network.requestWillBeSent' && params.initiator === undefined) params = { ...params, initiator: { type: 'script', stack: callerStack(broadcast) } };
+  if (isNetwork) {
+    // As NetworkAgent: a request names the user code that started it, and says
+    // whether it has a body.
+    if (method === 'Network.requestWillBeSent') {
+      params = { ...params, request: { ...params.request, hasPostData: params.request.hasPostData === true } };
+      if (params.initiator === undefined) params.initiator = { type: 'script', stack: callerStack(broadcast) };
+    }
     for (const session of sessions.values()) if (session.networkEnabled) {
       const event = network.observe(session, method, params);
       if (event !== undefined) session.emit(method, event);
