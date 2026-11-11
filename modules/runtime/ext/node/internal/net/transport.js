@@ -2,7 +2,7 @@
 
 const { ArrayPrototypeConcat } = require('internal/per_context/primordials');
 const host = require('internal/host');
-const { AsyncResource } = require('async_hooks');
+const { AsyncResource, asyncWrapProviders } = require('async_hooks');
 const { Buffer } = require('buffer');
 
 function error(status, syscall, address, port) {
@@ -34,7 +34,8 @@ class Transport {
     this.reading = false;
     this.requests = new Map();
     this.sequence = 0;
-    this.resource = new AsyncResource(kind === 5 ? 'TTYWRAP' : kind === 2 ? 'PIPEWRAP' : 'TCPWRAP');
+    this.provider = kind === 5 ? 'TTYWRAP' : kind === 2 ? 'PIPEWRAP' : 'TCPWRAP';
+    this.resource = new AsyncResource(this.provider);
     const callback = (type, status, payload, extra) => {
       host.invokeResource(this.resource, this.dispatch, this, [type, status, payload, extra], false);
       host.checkpoint();
@@ -59,6 +60,13 @@ class Transport {
   // A stream handle that an HTTP parser can consume directly (Node's StreamBase).
   get isStreamBase() { return true; }
   getAsyncId() { return this.resource.asyncId(); }
+  getProviderType() { return asyncWrapProviders[this.provider]; }
+  // As Node's AsyncWrap::AsyncReset when an agent reuses a socket: the old id is destroyed
+  // and the handle continues under a new one.
+  asyncReset() {
+    this.resource.emitDestroy();
+    this.resource = new AsyncResource(this.provider);
+  }
   dispatch(type, status, payload, extra) {
     if (type === 4 || type === 5) {
       const request = this.requests.get(payload);

@@ -2,7 +2,8 @@
 
 // The parts of Node.js v24 lib/internal/async_hooks.js that the ported modules use.
 // Async ids come from the runtime's async_hooks.
-const { _newAsyncId, executionAsyncId } = require('async_hooks');
+const asyncHooks = require('async_hooks');
+const { _newAsyncId, executionAsyncId } = asyncHooks;
 
 const symbols = {
   async_id_symbol: Symbol('asyncId'),
@@ -23,4 +24,7 @@ function getOrSetAsyncId(object) {
   return object[symbols.async_id_symbol] = executionAsyncId();
 }
 
-module.exports = { symbols, newAsyncId, defaultTriggerAsyncIdScope, getOrSetAsyncId, executionAsyncId };
+// Whether any hook is enabled, with or without callbacks, as Node's enabledHooksExist.
+function enabledHooksExist() { return asyncHooks._hooksActive(); }
+
+module.exports = { symbols, newAsyncId, defaultTriggerAsyncIdScope, getOrSetAsyncId, executionAsyncId, enabledHooksExist };
