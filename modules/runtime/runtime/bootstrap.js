@@ -68,6 +68,9 @@ for (const name of ['dispose', 'asyncDispose']) {
   if (Symbol[name] === undefined) Object.defineProperty(Symbol, name, { value: Symbol.for('nodejs.' + name) });
 }
 const host = { ...native, rawOS, rawStd };
+// Throws value again and keeps the throw site its first throw recorded, as
+// V8's TryCatch::ReThrow does for Node's own catch and rethrow paths.
+host.rethrow = value => { native.captureCallSites(-5, value); };
 host.builtinLoaded = moduleHas;
 // Source maps are off until something loads the module to switch them on, so
 // registering a source before that only matters when coverage wants every map.
@@ -125,9 +128,6 @@ host.initializeRealmBuiltins = (handle, global, wasmCodeGeneration) => {
   const cache = new Map();
   const bridge = {
     captureCallSites: native.captureCallSites,
-    // Throws value again and keeps the throw site its first throw recorded, as
-    // V8's TryCatch::ReThrow does for Node's own catch and rethrow paths.
-    rethrow(value) { native.captureCallSites(-5, value); },
     errorStackState: host.errorStackState,
     builtinLoaded: moduleHas,
     wasmNative: native.vmWasmNative(handle),
