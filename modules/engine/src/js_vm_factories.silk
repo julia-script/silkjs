@@ -14,7 +14,7 @@ import silk.num.u32
 import silk.num.usize
 import runtime_memory { AllocationObserver }
 import js_heap { HeapCell, HeapHeader }
-import js_core_types { FrameSlots, StackFrame, FunctionBytecode, ContextState, ObjectData, ObjectPayload, JS_MODE_STRICT }
+import js_core_types { FrameSlots, StackFrame, FunctionBytecode, ContextState, ObjectData, ObjectPayload, JS_MODE_STRICT, KNOWN_CALL }
 import js_value { ValueBits }
 import js_owned_value { lendBits, immediateRef }
 import js_vm_state { Machine, cellAt }
@@ -45,6 +45,7 @@ struct FailedOomJs { error: OutOfMemoryError | JsException }
 effect fn failedOomJs(error: OutOfMemoryError | JsException) -> FailedOomJs { return FailedOomJs { error: move error } }
 
 fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+fn present(value: ?*mut HeapHeader) -> *mut HeapHeader { return match Pointer.nonNullMut<HeapHeader>(value) { Option<*mut HeapHeader>.Some { value: cell } => cell _ => invariant() } }
 unsafe fn home(machine: &Machine) -> ValueBits {
   let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, core.reference(unsafe machine.currentFunction()))
   match &object.payload {
@@ -87,6 +88,15 @@ pub unsafe effect fn pushClosure<H: HeapHooks + CoercionHooks + OwnPropertyHooks
   if opcode == op.OP_fclosure { index = u32.toUsize(unsafe machine.readU32()) }
   else { index = u8.toUsize(unsafe machine.readU8()) }
   let bytecode = unsafe machine.constant(index)
+  if unsafe knownCode(bytecode) {
+    match move run Effect.result(unsafe pushKnown(&mut hooks, &mut machine, bytecode)) {
+      Result<(), OutOfMemoryError>.Success { .. } => { return () }
+      Result<(), OutOfMemoryError>.Failure { error } => {
+        let _pending = run Effect.catch<JsException>(core.materialize(&mut hooks, unsafe lendRealm(&machine.context, machine.context), move error), core.exceptionValue)
+        unsafe machine.push(ValueBits.Exception) fail JsException {}
+      }
+    }
+  }
   // `var f = function () {}`: the OP_set_name that follows names the new
   // function, which then is still anonymous; create it with that name instead.
   let mut inferredName: u32 = 0
@@ -122,6 +132,68 @@ pub unsafe effect fn pushClosure<H: HeapHooks + CoercionHooks + OwnPropertyHooks
     Result<ValueBits, JsException>.Failure { error } => { unsafe machine.push(ValueBits.Exception) fail move error }
   }
 }
+/// Whether bytecode, an fclosure constant, is a known local function
+/// (KnownCall): its creation pushes the bytecode itself (pushKnown).
+@inlineAlways
+unsafe fn knownCode(bytecode: ValueBits) -> bool {
+  let reference = match bytecode { ValueBits.FunctionBytecode { reference } => reference _ => { return false } }
+  let anchor = () return (unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference)).known.state == KNOWN_CALL
+}
+/// OP_fclosure of a known local function: pushes its FunctionBytecode value,
+/// retained, and leaves the running scope where it is (no closure captures it).
+/// Records the running scope's level, where every call finds the scope again,
+/// and on the first creation the global cells its references take from the
+/// creating function's (the same cells on every later creation).
+@inlineNever
+unsafe effect fn pushKnown<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, bytecode: ValueBits) -> () ! OutOfMemoryError ? &mut Allocator {
+  let reference = match bytecode { ValueBits.FunctionBytecode { reference } => reference _ => invariant() }
+  // The name the OP_set_name would give is already the bytecode's.
+  if unsafe machine.peekU8(0) == op.OP_set_name { unsafe machine.skip(5) }
+  let level = unsafe scopes.levelOf(machine.scope)
+  let mut anchor = ()
+  let code = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut anchor, reference)
+  code.known.envLevel = level
+  let references = code.closureVars.length() - u16.toUsize(code.scopeCaptures)
+  let filled = code.known.refs.length()
+  drop code
+  if references != 0 {
+    let captures = unsafe machine.inheritedList()
+    let inheritedAnchor = () let inherited = unsafe Pointer.borrow<(), BoxList<?*mut HeapHeader>>(&inheritedAnchor, captures)
+    if filled == 0 || !unsafe sameCells(reference, inherited, references) {
+      // A creation over other cells (a global the program deleted and defined
+      // again) moves every value of the function to the current ones.
+      let mut cells = BoxList<?*mut HeapHeader>.make()
+      run cells.reserveExact(references)
+      let mut at: usize = 0
+      while at < references {
+        let view = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference)
+        let definition = view.closureVars.get(at) drop view
+        let cell = inherited.get(u16.toUsize(definition.variableIndex))
+        match Pointer.nonNullMut<HeapHeader>(cell) { Option<*mut HeapHeader>.Some { value } => { unsafe HeapCell.retain(value) } _ => () }
+        run cells.append(cell)
+        at = at + 1
+      }
+      let target = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut anchor, reference)
+      let old = Intrinsic.replace(target.known.refs, move cells)
+      drop target
+      let mut index: usize = 0
+      while index < old.length() { unsafe gc.releaseOptional(&mut hooks, machine.runtime, old.get(index)) index = index + 1 }
+    }
+  }
+  unsafe machine.push(unsafe bytecode.retained())
+}
+/// Whether code's KnownCall.refs are the cells inherited gives its first count references.
+unsafe fn sameCells(code: *mut HeapHeader, inherited: &BoxList<?*mut HeapHeader>, count: usize) -> bool {
+  let anchor = () let view = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, code)
+  if view.known.refs.length() != count { return false }
+  let mut at: usize = 0
+  while at < count {
+    let cell = inherited.get(u16.toUsize(view.closureVars.get(at).variableIndex))
+    if Pointer.address<HeapHeader>(present(cell)) != Pointer.address<HeapHeader>(present(view.known.refs.get(at))) { return false }
+    at = at + 1
+  }
+  return true
+}
 unsafe effect fn allocate<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks>(hooks: &mut H,
   memory: &AllocationObserver, machine: &mut Machine, opcode: u8) -> ValueBits
   ! OutOfMemoryError | JsException ? &mut Allocator {
@@ -131,6 +203,10 @@ unsafe effect fn allocate<H: HeapHooks + CoercionHooks + OwnPropertyHooks + Prop
     if opcode == op.OP_fclosure { index = u32.toUsize(unsafe machine.readU32()) }
     else { index = u8.toUsize(unsafe machine.readU8()) }
     let bytecode = unsafe machine.constant(index)
+    if unsafe knownCode(bytecode) {
+      run unsafe pushKnown(&mut hooks, &mut machine, bytecode)
+      return unsafe machine.pop()
+    }
     let captures = unsafe machine.inheritedList()
     let anchor = () let inherited = unsafe Pointer.borrow<(), BoxList<?*mut HeapHeader>>(&anchor, captures)
     // `var f = function () {}`: the OP_set_name that follows names the new

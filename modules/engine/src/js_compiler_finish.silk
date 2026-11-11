@@ -22,6 +22,7 @@ import js_heap { HeapCell, HeapHeader, HeapKind, CellRef }
 import js_value { ValueBits }
 import js_gc { HeapHooks }
 import js_gc
+import js_core_types { KnownCall, KNOWN_CALL, KNOWN_CANDIDATE }
 import js_core_types { HostEdges, LineTables }
 import js_core_types { FunctionBytecode, FunctionDebugInfo, FunctionKind, ByteStorage, SourceText, VarDef, ClosureVar, ClosureKind, RuntimeState, ModuleDef }
 import thin_list { ThinList, BoxList, ThinBox, PairList, BOX_HEADER }
@@ -38,6 +39,7 @@ import js_debug_positions { SourcePositionCache, SourceLocation, PendingLines }
 import js_invariant { present }
 import silk.num.u32
 import js_compiler_scopes as scopePlans
+import js_compiler_known as known
 import js_compiler_scopes { ScopePlan }
 
 fn definition(v: CompilerVar, strip: bool) -> VarDef {
@@ -100,23 +102,37 @@ effect fn assemble<H: HeapHooks>(hooks: &mut H, tree: &mut FunctionTree, cell: F
   if dynamic { match parentCell { Option<FunctionId>.Some { value } => { let outer = tree.getMut(value) outer.subtreeDynamic = true } _ => () } }
   run variables.resolveVariables(&mut tree, cell)
   let mut scopePlan = run scopePlans.plan(&mut tree, cell)
-  if deferrable(tree.get(cell), source) { return run defer(&mut tree, cell, source, move scopePlan) }
+  // Known local functions (js_compiler_known): the children this function's
+  // call-only variables hold, then whether its parent may make it one.
+  known.markChildren(&mut tree, cell)
+  let isCandidate = known.candidate(tree.get(cell))
+  let isRoot = tree.get(cell).parent.isNone()
+  if deferrable(tree.get(cell), source) {
+    let deferred = run defer(&mut tree, cell, source, move scopePlan)
+    if isCandidate { setCandidate(deferred) }
+    return deferred
+  }
   run resolveLabels(&mut tree, cell, source)
   if scopePlan.slots != 0 {
     let own = tree.getMut(cell) scopePlans.specializeOwn(&mut own.*) run scopePlans.dropScopedLocals(&mut own.*, &mut scopePlan) drop own
   }
   let fd = tree.getMut(cell)
   run debuggerDetails(&mut fd, source)
-  let header = run finalHeader(&mut fd, &mut scopePlan)
+  let mut header = run finalHeader(&mut fd, &mut scopePlan)
+  if isCandidate { header.known.state = KNOWN_CANDIDATE }
   match Pointer.nonNullMut<HeapHeader>(into) {
     Option<*mut HeapHeader>.Some { value: node } => {
       // No fallible operations from here: the stub becomes this function.
       let b = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut anchor, node)
       let mut stub = Intrinsic.replace(b.*, move header)
       b.host = Intrinsic.replace(stub.host, ThinBox<HostEdges>.none())
+      b.known = Intrinsic.replace(stub.known, KnownCall.none())
+      if b.known.state == KNOWN_CALL { b.leaf = 0 }
       drop b
       transfer(&mut fd, node)
       replaced.* = Option<FunctionBytecode>.some(move stub)
+      // A lazy reparse compiles node as the top of its own tree.
+      let _valid = known.validate(node)
       return ValueBits.FunctionBytecode { reference: node }
     }
     Option<*mut HeapHeader>.None => ()
@@ -128,7 +144,13 @@ effect fn assemble<H: HeapHooks>(hooks: &mut H, tree: &mut FunctionTree, cell: F
   drop fd
   unsafe HeapCell.retain(context)
   unsafe js_gc.publish(runtime, result)
+  if isRoot { let _valid = known.validate(result) }
   return ValueBits.FunctionBytecode { reference: result }
+}
+fn setCandidate(value: ValueBits) -> () {
+  let reference = match value { ValueBits.FunctionBytecode { reference } => reference _ => { return () } }
+  let mut anchor = () let b = unsafe HeapCell.payloadMut<FunctionBytecode, ()>(&mut anchor, reference)
+  b.known.state = KNOWN_CANDIDATE
 }
 
 /// The debugger's scope, local and location tables for fd, before finalHeader.
@@ -249,7 +271,7 @@ effect fn finalHeader(fd: &mut FunctionDef, scopePlan: &mut ScopePlan) -> Functi
     definedArgumentCount: i32.toU16(fd.definedArgCount), stackSize: stackSize,
     varRefCount: i32.toU16(fd.varRefCount), scopeCaptures: 0, scopeSlots: scopePlan.slots, scopeVarSlots: scopePlan.varSlots,
     frameCells: scopes.inlineFrameCells(usize.toU16(fd.vars.length() - scopePlan.droppedLocals), stackSize, i32.toU16(fd.varRefCount), scopePlan.slots),
-    scopeParameters: Intrinsic.replace(scopePlan.parameters, BoxList<u32>.make()), scopeVariables: Intrinsic.replace(scopePlan.variables, BoxList<u16>.make()), borrowsArguments: borrowsArguments, leaf: leafFlags, constructForm: constructForm(fd.bytecode.asSlice()), realm: fd.context,
+    scopeParameters: Intrinsic.replace(scopePlan.parameters, BoxList<u32>.make()), scopeVariables: Intrinsic.replace(scopePlan.variables, BoxList<u16>.make()), borrowsArguments: borrowsArguments, leaf: leafFlags, constructForm: constructForm(fd.bytecode.asSlice()), realm: fd.context, known: KnownCall.none(),
     constants: BoxList<ValueBits>.make(), debug: Option<FunctionDebugInfo>.none(), pending: ThinBox<PendingFunction>.none()
   }
 }
@@ -455,7 +477,7 @@ effect fn defer(tree: &mut FunctionTree, cell: FunctionId, source: &[u8], plan: 
     varRefCount: i32.toU16(def.varRefCount), scopeCaptures: 0, scopeSlots: scopePlan.slots, scopeVarSlots: scopePlan.varSlots,
     frameCells: scopes.inlineFrameCells(usize.toU16(def.vars.length()), STUB_STACK, i32.toU16(def.varRefCount), 0),
     scopeParameters: BoxList<u32>.make(), scopeVariables: BoxList<u16>.make(),
-    borrowsArguments: false, leaf: 0, constructForm: 0, realm: context,
+    borrowsArguments: false, leaf: 0, constructForm: 0, realm: context, known: KnownCall.none(),
     constants: BoxList<ValueBits>.make(), debug: Option<FunctionDebugInfo>.none(), pending: ThinBox<PendingFunction>.none()
   }, &[], &[], tail)
   // No fallible operations after this point.
@@ -580,6 +602,9 @@ pub unsafe effect fn finish<H: HeapHooks>(hooks: &mut H, node: *mut HeapHeader) 
       b.host = Intrinsic.replace(stub.host, ThinBox<HostEdges>.none())
       // Scope planning may have moved some of the stub's captures into its owner's scope.
       b.scopeCaptures = stub.scopeCaptures
+      // A known local function stays one: values of it already exist.
+      b.known = Intrinsic.replace(stub.known, KnownCall.none())
+      if b.known.state == KNOWN_CALL { b.leaf = 0 }
       drop b
       transfer(&mut done, node)
       // transfer gave the code its debug info: the host's settings on the stub win.
