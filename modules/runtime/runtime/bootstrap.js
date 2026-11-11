@@ -6,6 +6,10 @@ const rawOS = { ...osNamespace };
 
 const native = globalThis.__silkNative;
 delete globalThis.__silkNative;
+// Every exit path ends here. Node's exit handler stops and joins every worker
+// before exit(): libc exit handlers (OpenSSL's cleanup among them) must not tear
+// down shared native state while a worker thread still runs.
+rawStd.exit = code => { native.workerNative('stopThreads', []); stdNamespace.exit(code); };
 const factories = new Map();
 const modules = new Map();
 const realmSources = new Map();
@@ -1027,6 +1031,7 @@ function runtimeFlag(arg) {
   if (arg === '--experimental-import-meta-resolve') { host.importMetaResolveParent = true; return true; }
   if (arg === '--experimental-print-required-tla') { host.printRequiredTLA = true; return true; }
   if (arg === '--experimental-import-text') { host.importText = true; return true; }
+  if (arg.startsWith('--experimental-package-map=')) { host.packageMap = arg.slice(27); return true; }
   if (arg.startsWith('--experimental-loader=') || arg.startsWith('--loader=')) {
     loaderPreloads.push(arg.slice(arg.indexOf('=') + 1)); return true;
   }
@@ -1035,6 +1040,12 @@ function runtimeFlag(arg) {
   }
   if (arg === '--experimental-test-module-mocks' || arg === '--no-experimental-test-module-mocks') {
     host.experimentalTestModuleMocks = arg === '--experimental-test-module-mocks'; return true;
+  }
+  if (arg === '--experimental-storage-inspection' || arg === '--no-experimental-storage-inspection') {
+    host.experimentalStorageInspection = arg === '--experimental-storage-inspection'; return true;
+  }
+  if (arg === '--experimental-network-inspection' || arg === '--no-experimental-network-inspection') {
+    host.experimentalNetworkInspection = arg === '--experimental-network-inspection'; return true;
   }
   if (arg === '--experimental-inspector-network-resource' || arg === '--no-experimental-inspector-network-resource') {
     host.experimentalInspectorNetworkResource = arg === '--experimental-inspector-network-resource'; return true;
@@ -1077,7 +1088,7 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
     delete globalThis.WebSocket;
     delete globalThis.CloseEvent;
   }
-  if (host.experimentalWebStorage) internalRequire('internal/web/storage').install(globalThis, { localStorageFile: host.localStorageFile });
+  if (host.experimentalWebStorage) internalRequire('internal/web/storage').install(globalThis, { localStorageFile: host.localStorageFile, inspect: !!host.experimentalStorageInspection });
   if (host.experimentalStreamIter) { internalRequire('fs/promises'); internalRequire('internal/fs_iter').install(); }
   if (workerThreads.isMainThread) internalRequire('internal/trace_events').initialize(host.traceOptions);
   if (workerThreads.isMainThread && host.traceSigint) internalRequire('util').setTraceSigInt(true);
@@ -1392,7 +1403,9 @@ function run() {
   if (testMode) {
     return internalRequire('internal/main/test_runner').runTestRunner(testOptions, args.slice(index), reporterNames, destinations);
   }
-  if (expression === undefined && filename === undefined && (interactive || process.stdin.isTTY)) {
+  // As node.cc, ask whether descriptor 0 is a terminal without making process.stdin:
+  // that stream would make the descriptor nonblocking before a piped script is read.
+  if (expression === undefined && filename === undefined && (interactive || internalRequire('tty').isatty(0))) {
     if (inputTypeSet) {
       console.error('Cannot specify --input-type for REPL');
       process.exitCode = 9;
@@ -1413,9 +1426,7 @@ function run() {
     installCommonJSInputGlobals(name, '[eval]');
     armInspectorEntry();
     // As in Node, the script is named [eval] while module.filename is under the cwd.
-    const result = native.compileFunction(code, '[eval]', undefined, undefined, undefined, true);
-    if (print) console.log(result);
-    return afterMain(result);
+    return afterMain(internalRequire('internal/process/execution').evalScript('[eval]', code, print));
   }
   if (filename === undefined || filename === '-') {
     let source = rawStd.in.readAsString();
@@ -1428,9 +1439,7 @@ function run() {
     }
     installCommonJSInputGlobals(name, '[stdin]');
     armInspectorEntry();
-    const result = native.compileFunction(source, '[stdin]', undefined, undefined, undefined, true);
-    if (print) console.log(result);
-    return afterMain(result);
+    return afterMain(internalRequire('internal/process/execution').evalScript('[stdin]', source, print));
   }
   const path = host.path.resolve(filename);
   process.argv[1] = path;
@@ -1557,10 +1566,13 @@ function loop() {
 }
 const imageModules = ['fs', 'fs/promises', 'internal/fs_streams', 'internal/fs_utf8_stream', 'path', 'os',
   'events', 'stream', 'stream/promises', 'string_decoder', 'util', 'assert', 'console', 'net', 'tty',
-  'internal/tty/write', 'url', 'internal/web/url', 'internal/web/encoding', 'internal/abort_controller'];
+  'internal/tty/write', 'url', 'internal/web/url', 'internal/web/encoding', 'internal/abort_controller',
+  'internal/process/execution'];
 globalThis.__silkRuntime = {
-  normalize(name, parent, attributes) { return loader.resolveImport(name, parent, attributes).filename; },
+  normalize(name, parent, attributes) { return loader.importKey(name, parent, attributes); },
   load(name, attributes) { return loader.loadESM(name, attributes).source; },
+  moduleSource(name, parent, attributes) { return loader.moduleSource(name, parent, attributes); },
+  moduleError(name, error) { loader.moduleEvaluationError(name, error); },
   registerSource(filename, source, metadata) {
     host.registerSource(filename, source, { ...metadata, owner: metadata });
     if (!metadata.generated && typeof filename === 'string') {

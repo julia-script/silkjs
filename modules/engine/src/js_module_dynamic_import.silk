@@ -32,7 +32,7 @@ import js_promise { PromiseHooks, Capability }
 import js_promise as promises
 import js_exceptions { JsException }
 import js_strings { Strings }
-import js_string_types { StringLengthError }
+import js_string_types { StringLengthError, StringOwner }
 import js_bigint { BigIntError }
 import js_coercions as coercions
 import js_property_names { OwnKeysError }
@@ -90,7 +90,7 @@ effect fn prepare<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + OwnK
   memory: &AllocationObserver, realm: Realm<'a>, specifier: ValueRef<'b>, options: ValueRef<'b>, output: &mut Preparation, hostImport: ValueRef<'b>) -> ()
   ! OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | JsException ? &mut Allocator {
   output.specifier = run coercions.toString(&mut hooks, realm, specifier)
-  if options.view().tag() == ValueBits.Undefined.tag() { return () }
+  if options.view().tag() == ValueBits.Undefined.tag() || options.view().tag() == ValueBits.Uninitialized.tag() { return () }
   if !options.view().isObject() { return run ops.throwError(&mut hooks,realm, NativeErrorKind.Type, b"options must be an object") }
   output.sourceAttributes = run getPropertyOwned(&mut hooks, realm, options, atoms.JS_ATOM_with)
   if output.sourceAttributes.view().tag() == ValueBits.Undefined.tag() { return () }
@@ -148,12 +148,14 @@ pub effect fn dynamicImport<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHo
     Result<Capability, JsException>.Success { value } => move value
     Result<Capability, JsException>.Failure { error } => { unsafe freePreparation(rt, move prepared) fail move error }
   }
+  // import.source(x) passes Uninitialized as its options (SPECIAL_SOURCE_PHASE).
+  let sourcePhase = options.view().tag() == ValueBits.Uninitialized.tag()
   let converted = run Effect.result(prepare(&mut hooks, memory, realm, specifier, options, &mut prepared, hostImport.borrow()))
   let mut failed = false
   match move converted {
     Result<(), OutOfMemoryError | StringLengthError | BigIntError | OwnKeysError | JsException>.Success { .. } => {
       let queued = run Effect.result(unsafe jobs.enqueueJob(context, callbacks.id(callbacks.DYNAMIC_IMPORT_JOB),
-        &[capability.resolve.view(), capability.reject.view(), prepared.basename.view(), prepared.specifier.view(), prepared.attributes.view(), hostImport.view()]))
+        &[capability.resolve.view(), capability.reject.view(), prepared.basename.view(), prepared.specifier.view(), prepared.attributes.view(), hostImport.view(), ValueBits.Bool { value: sourcePhase }]))
       match move queued {
         Result<(), OutOfMemoryError>.Success { .. } => ()
         Result<(), OutOfMemoryError>.Failure { error } => {
@@ -229,6 +231,22 @@ pub effect fn load<'a, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetProp
 }
 effect fn jobBody<'a, 's, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + HasPropertyHooks + OwnKeysHooks + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks + PromiseHooks + ModuleHostHooks>(hooks: &mut H,
   memory: &AllocationObserver, realm: Realm<'a>, argv: Arguments<'s>) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  let sourcePhase = argv.length() > 6 && match argv.get(6).view() { ValueBits.Bool { value } => value _ => false }
+  if sourcePhase {
+    if !argv.get(2).view().isString() { return run ops.throwError(&mut hooks,realm, NativeErrorKind.Type, b"no function filename for import.source()") }
+    let base = run Strings.toUtf8(argv.get(2).view(), false) let name = run Strings.toUtf8(argv.get(3).view(), false)
+    let object = run Effect.result(unsafe loader.sourceObject(&mut hooks, realm, base.asSlice(), name.asSlice(), argv.get(4)))
+    match move object {
+      Result<Value, OutOfMemoryError | StringLengthError | JsException>.Success { value } => {
+        drop run Effect.catch<JsException>(promises.call(&mut hooks, realm, argv.get(0), immediateRef(ValueBits.Undefined), &[value.view()]), promises.exceptionValue)
+      }
+      Result<Value, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => {
+        let _marker = run Effect.catch<JsException>(errors.materialize<ValueBits, H>(&mut hooks, realm, move error), errors.exceptionValue)
+        run rejectPending(&mut hooks, realm, argv.get(1))
+      }
+    }
+    return ()
+  }
   if argv.length() > 5 && argv.get(5).view().isObject() {
     let result = run promises.call(&mut hooks, realm, argv.get(5), immediateRef(ValueBits.Undefined), &[argv.get(3).view(), argv.get(4).view()])
     drop run promises.call(&mut hooks, realm, argv.get(0), immediateRef(ValueBits.Undefined), &[result.view()])
@@ -250,8 +268,26 @@ pub effect fn dispatchJob<'a, 's, H: HeapHooks + CoercionHooks + OwnPropertyHook
   }
   return ValueBits.Undefined
 }
-pub effect fn dispatchData<'a, H: HeapHooks + CoercionHooks + CallHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, method: u32, argvArgs: Arguments<'a>, capturedArgs: Arguments<'a>) -> ValueBits ! JsException ? &mut Allocator {
+// HostLoadImportedModule's embedder report: the import() root whose evaluation
+// threw, by name, and the error, which the host may decorate before rejection.
+effect fn reportEvaluationError<'a, H: CoercionHooks + ModuleHostHooks>(hooks: &mut H, realm: Realm<'a>, module: CellRef<ModuleDef>, error: ValueRef<'a>) -> ()
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let anchor = () let data = module.get(&anchor) let atom = data.name drop data
+  let rt = realm.runtimeState(&anchor)
+  let text = StringOwner.adopt(run rt.atoms.toValue(atom, true)) drop rt
+  let name = run Strings.toUtf8(text.get(), false)
+  run hooks.moduleEvaluationFailed(realm, name.asSlice(), error)
+}
+pub effect fn dispatchData<'a, H: HeapHooks + CoercionHooks + CallHooks + ModuleHostHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, method: u32, argvArgs: Arguments<'a>, capturedArgs: Arguments<'a>) -> ValueBits ! JsException ? &mut Allocator {
   if method == callbacks.LOAD_REJECTED {
+    if let ValueBits.Module { reference } = capturedArgs.get(2).view() {
+      // A failing report leaves the error as it is.
+      let reported = run Effect.result(reportEvaluationError(&mut hooks, realm, unsafe CellRef<ModuleDef>.of(reference), argvArgs.get(0)))
+      if let Result<(), OutOfMemoryError | StringLengthError | JsException>.Failure { error } = move reported {
+        let _marker = run Effect.catch<JsException>(errors.materialize<ValueBits, H>(&mut hooks, realm, move error), errors.exceptionValue)
+        let pending = realm.takeException() drop pending
+      }
+    }
     drop run Effect.catch<JsException>(promises.call(&mut hooks, realm, capturedArgs.get(1), immediateRef(ValueBits.Undefined), &[argvArgs.get(0).view()]), promises.exceptionValue)
     return ValueBits.Undefined
   }

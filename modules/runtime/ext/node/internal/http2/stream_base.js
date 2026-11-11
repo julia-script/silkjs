@@ -1,7 +1,6 @@
 'use strict';
-// The StreamBase pieces of Node.js v24 lib/internal/stream_base_commons.js and
-// lib/internal/timers.js that the http2 modules use, over the handles in
-// internal/http2/binding. Copyright Joyent, Inc. and other Node contributors.
+// The StreamBase pieces of Node.js v24 lib/internal/stream_base_commons.js that
+// the http2 modules use, over the handles in internal/http2/binding. Copyright Joyent, Inc. and other Node contributors.
 // MIT license (see THIRD_PARTY_NOTICES).
 //
 // Node's handles read from the shared streamBaseState array; these handles pass
@@ -9,9 +8,10 @@
 // of buffers.
 const { Buffer } = require('buffer');
 const { clearTimeout, setTimeout } = require('timers');
+const { getTimerDuration, kTimeout } = require('internal/timers');
 const { UV_EOF } = require('internal/http2/binding');
-const { ErrnoException, codes: { ERR_OUT_OF_RANGE } } = require('internal/errors');
-const { validateFunction, validateNumber } = require('internal/validators');
+const { ErrnoException } = require('internal/errors');
+const { validateFunction } = require('internal/validators');
 
 const kMaybeDestroy = Symbol('kMaybeDestroy');
 const kUpdateTimer = Symbol('kUpdateTimer');
@@ -19,25 +19,8 @@ const kAfterAsyncWrite = Symbol('kAfterAsyncWrite');
 const kHandle = Symbol('kHandle');
 const kBoundSession = Symbol('kBoundSession');
 const kSession = Symbol('kSession');
-const kTimeout = Symbol('timeout');
 const owner_symbol = Symbol('owner_symbol');
 const async_id_symbol = Symbol('asyncId');
-
-const TIMEOUT_MAX = 2 ** 31 - 1;
-
-function getTimerDuration(msecs, name) {
-  validateNumber(msecs, name);
-  if (msecs < 0 || !Number.isFinite(msecs)) {
-    throw new ERR_OUT_OF_RANGE(name, 'a non-negative finite number', msecs);
-  }
-  if (msecs > TIMEOUT_MAX) {
-    process.emitWarning(`${msecs} does not fit into a 32-bit signed integer.` +
-                        `\nTimer duration was truncated to ${TIMEOUT_MAX}.`,
-                        'TimeoutOverflowWarning');
-    return TIMEOUT_MAX;
-  }
-  return msecs;
-}
 
 function onWriteComplete(status) {
   const stream = this.handle[owner_symbol];

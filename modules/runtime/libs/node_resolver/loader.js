@@ -262,6 +262,7 @@ function createLoader(host, builtins) {
     if (ext === '.node') return 'addon';
     if (ext === '.mjs') return 'module';
     if (ext === '.cjs') return 'commonjs';
+    if (ext === '.wasm' && mode === 'import') return 'wasm';
     if (host.typeScriptMode && (ext === '.ts' || ext === '.mts' || ext === '.cts')) {
       if (ext === '.mts') return 'module-typescript';
       if (ext === '.cts') return 'commonjs-typescript';
@@ -567,6 +568,15 @@ function createLoader(host, builtins) {
       }
       if (mode === 'import' && /^[A-Za-z][A-Za-z\d+.-]*:/.test(specifier)) throw error('ERR_UNSUPPORTED_ESM_URL_SCHEME', { protocol: /^[^:]*:/.exec(specifier)[0] }, ['file', 'data', 'node']);
       const parsed = packageName(specifier, parent);
+      // --experimental-package-map: the map alone decides where a bare specifier's
+      // package is (Node's packageResolve and tryPackageMapResolveCJS).
+      if (host.packageMap && path.isAbsolute(parent)) {
+        const mapped = require('internal/modules/package_map').packageMapResolve(specifier, parent);
+        if (mapped === undefined) throw missing(specifier, parent, mode, undefined, parsed.name);
+        const found = packageAt(mapped.packagePath, { name: parsed.name, subpath: mapped.subpath }, specifier, parent, mode, seen, isMain);
+        if (found === undefined) throw missing(specifier, parent, mode, undefined, parsed.name);
+        return found;
+      }
       const scope = packageScope(parent);
       if (scope && scope.data.name === parsed.name && scope.data.exports !== undefined && scope.data.exports !== null) {
         return packageMap(scope, scope.data.exports, parsed.subpath, false, parent, mode, seen, isMain);
@@ -607,23 +617,30 @@ function createLoader(host, builtins) {
   function findPackage(search, parsed, specifier, parent, mode, seen, isMain) {
     for (let i8 = 0, a8 = search; i8 < a8.length; i8++) { const directory = a8[i8];
       if (!isDirectory(directory)) continue;
-      const root = path.join(directory, parsed.name);
-      const pkg = readPackage(root);
-      if (pkg && pkg.data.exports !== undefined && pkg.data.exports !== null) return packageMap(pkg, pkg.data.exports, parsed.subpath, false, parent, mode, seen, isMain);
-      const candidate = parsed.subpath === '.' ? root : path.join(root, parsed.subpath.slice(2));
-      if (mode === 'import' && parsed.subpath !== '.') {
-        if (isDirectory(root)) return strictFile(candidate, specifier, parent, mode, undefined, isMain);
-        continue;
-      }
-      if (mode === 'import' && pkg && typeof pkg.data.main === 'string') {
-        const exact = path.resolve(root, pkg.data.main);
-        if (isFile(exact)) return descriptor(exact, mode, undefined, isMain);
-      }
-      const found = legacyFile(candidate, true, /[\\/]$/.test(specifier));
-      if (found) return descriptor(found, mode, undefined, isMain);
-      if (mode === 'import' && isDirectory(root)) throw missing(specifier, parent, mode, undefined, root + path.sep);
+      const found = packageAt(path.join(directory, parsed.name), parsed, specifier, parent, mode, seen, isMain);
+      if (found !== undefined) return found;
     }
     throw missing(specifier, parent, mode, undefined, parsed.name);
+  }
+
+  // The module that parsed.subpath names in the package at root, or undefined when
+  // root holds no such package.
+  function packageAt(root, parsed, specifier, parent, mode, seen, isMain) {
+    const pkg = readPackage(root);
+    if (pkg && pkg.data.exports !== undefined && pkg.data.exports !== null) return packageMap(pkg, pkg.data.exports, parsed.subpath, false, parent, mode, seen, isMain);
+    const candidate = parsed.subpath === '.' ? root : path.join(root, parsed.subpath.slice(2));
+    if (mode === 'import' && parsed.subpath !== '.') {
+      if (isDirectory(root)) return strictFile(candidate, specifier, parent, mode, undefined, isMain);
+      return undefined;
+    }
+    if (mode === 'import' && pkg && typeof pkg.data.main === 'string') {
+      const exact = path.resolve(root, pkg.data.main);
+      if (isFile(exact)) return descriptor(exact, mode, undefined, isMain);
+    }
+    const found = legacyFile(candidate, true, /[\\/]$/.test(specifier));
+    if (found) return descriptor(found, mode, undefined, isMain);
+    if (mode === 'import' && isDirectory(root)) throw missing(specifier, parent, mode, undefined, root + path.sep);
+    return undefined;
   }
 
   function conditions(mode) {
@@ -662,11 +679,25 @@ function createLoader(host, builtins) {
     } finally { activeConditions = previous; }
   }
 
+  // The module map holds one module per URL and import "type", as in Node's load cache:
+  // `import './x.json' with { type: 'json' }` and a plain import of the same URL are two
+  // modules. The engine keys modules by the name normalize returns, so a typed request
+  // gets the type after U+FFFF, a noncharacter that URLs percent-encode and paths
+  // do not hold (the engine ends a module name at a NUL).
+  function moduleKey(name, attributes) {
+    const type = attributes && attributes.type;
+    return typeof type === 'string' && type !== '' ? `${name}\uFFFF${type}` : name;
+  }
+  function keyName(key) {
+    const end = key.indexOf('\uFFFF');
+    return end === -1 ? key : key.slice(0, end);
+  }
+
   function rememberResolution(result, mode, attributes) {
     const resolved = { filename: identity(result.url, mode), url: result.url, format: result.format,
       importAttributes: result.importAttributes === undefined ? attributes : result.importAttributes };
-    resolutions.set(resolved.filename, resolved);
-    resolutions.set(result.url, resolved);
+    resolutions.set(moduleKey(resolved.filename, resolved.importAttributes), resolved);
+    resolutions.set(moduleKey(result.url, resolved.importAttributes), resolved);
     return resolved;
   }
 
@@ -680,7 +711,7 @@ function createLoader(host, builtins) {
     const parentFilename = parent && typeof parent === 'object' ? parent.filename : parent;
     const parentURL = parentFilename ? asURL(parentFilename) : undefined;
     return mockResolution(rememberResolution(hooks.run('resolve', specifier, {
-      parentURL, conditions: conditions(mode), importAttributes: attributes || {},
+      parentURL, conditions: conditions(mode), importAttributes: { ...attributes },
       resolveOptions: options, isMain: !!isMain,
     }, allowAsync), mode, attributes), mode);
   }
@@ -803,6 +834,7 @@ function createLoader(host, builtins) {
     // A hook that supplies source opts hook-thread CJS into hook-aware requires.
     if (kind === 'commonjs' && hooks.inWorker()) return { format: kind, source: null };
     if (!url.startsWith('file:')) throw error('ERR_UNSUPPORTED_ESM_URL_SCHEME', { protocol: /^[^:]*:/.exec(url)?.[0] ?? '' }, ['file', 'data', 'node']);
+    if (kind === 'wasm') return { format: kind, source: builtins.get('fs').readFileSync(filesystemName(url)) };
     const source = text(filesystemName(url));
     if (kind === undefined && host.typeScriptMode && path.extname(filesystemName(url)) === '.ts') {
       const prepared = prepareSource(source, url, 'typescript');
@@ -838,7 +870,7 @@ function createLoader(host, builtins) {
       const url = resolved.url || asURL(resolved.filename);
       const loaded = hooks.run('load', url, { format: resolved.format,
         importAttributes: attributes || resolved.importAttributes || {}, conditions: conditions(mode) }, allowAsync);
-      let source = loaded.source == null ? loaded.source : sourceText(loaded.source);
+      let source = loaded.source == null || loaded.format === 'wasm' ? loaded.source : sourceText(loaded.source);
       const legacyCommonJS = source == null && loaded.format === 'commonjs';
       if (source == null && loaded.format !== 'builtin' && loaded.format !== 'addon') {
         if (loaded.format === 'commonjs' && url.startsWith('file:')) source = text(filesystemName(url));
@@ -1180,7 +1212,7 @@ function createLoader(host, builtins) {
   // Node's hint for a CommonJS global used in an ES module.
   function decorateModuleError(cause, filename) {
     if (cause === null || typeof cause !== 'object' || cause.name !== 'ReferenceError') return cause;
-    const match = /^'?(require|module|exports|__filename|__dirname)'? is not defined$/.exec(cause.message);
+    const match = /^(require|module|exports|__filename|__dirname) is not defined$/.exec(cause.message);
     if (!match) return cause;
     let message = `${match[1]} is not defined in ES module scope`;
     if (match[1] === 'require') message += ', you can use import instead';
@@ -1191,6 +1223,12 @@ function createLoader(host, builtins) {
     }
     cause.message = message;
     return cause;
+  }
+
+  // Node's ModuleJob.run: an import() or main entry whose evaluation threw a
+  // ReferenceError for a CommonJS name gets the ES module scope hint.
+  function moduleEvaluationError(key, cause) {
+    decorateModuleError(cause, keyName(key));
   }
 
   function requireModuleEnabled() {
@@ -1278,7 +1316,13 @@ function createLoader(host, builtins) {
       }
       if (typeof host.evaluateModule !== 'function') throw error('ERR_METHOD_NOT_IMPLEMENTED', 'evaluateModule');
       const loaded = loadESM(resolved.filename);
-      return host.evaluateModule(loaded.source, loaded.filename, true);
+      let result;
+      try { result = host.evaluateModule(loaded.source, loaded.filename, true); }
+      catch (cause) { throw decorateModuleError(cause, resolved.filename); }
+      if (result !== null && typeof result === 'object' && typeof result.then === 'function') {
+        return result.then(undefined, (cause) => { throw decorateModuleError(cause, resolved.filename); });
+      }
+      return result;
     }
     return loadResolved(resolved, null, true, hooks.hasAsync());
   }
@@ -1311,6 +1355,7 @@ function createLoader(host, builtins) {
   Module.syncBuiltinESMExports = () => { for (const update of builtinUpdates.values()) update(); };
 
   const bridge = Object.freeze({
+    instantiateWasm,
     mockExports(filename) {
       const mock = mockInstances.get(filename);
       if (!mock) throw error('ERR_INVALID_STATE', 'Module mock no longer exists');
@@ -1324,19 +1369,117 @@ function createLoader(host, builtins) {
     resolveHookAsync: (specifier, context) => hooks.asyncRun('resolve', specifier, context),
     loadHookAsync: (url, context) => hooks.asyncRun('load', url, context),
     register(filename, update) { builtinUpdates.set(filename, update); },
-    get(filename) {
-      const resolved = resolutions.get(filename) || (isBuiltinFile(filename)
+    get(key) {
+      const filename = keyName(key);
+      const resolved = resolutions.get(key) || (isBuiltinFile(filename)
         ? { filename, format: 'builtin' } : { filename, format: format(filename, 'require') });
+      if (key !== resolved.filename && pendingLoads.has(key)) {
+        pendingLoads.set(resolved.filename, pendingLoads.get(key));
+        pendingLoads.delete(key);
+      }
       // As in Node, an imported JSON file shares require.cache only when its URL has no
       // query or hash: each of those is a module of its own.
       if (resolved.format === 'json' && /^file:[^?#]*[?#]/.test(resolved.filename)) {
-        const loaded = pendingLoads.get(filename) || loadSource(resolved, undefined, hooks.hasAsync(), 'import');
-        pendingLoads.delete(filename);
+        const loaded = pendingLoads.get(resolved.filename) || loadSource(resolved, undefined, hooks.hasAsync(), 'import');
+        pendingLoads.delete(resolved.filename);
         return JSON.parse(String(loaded.source).replace(/^\uFEFF/, ''));
       }
       return loadResolved(resolved, null, false, hooks.hasAsync());
     },
   });
+
+  // Node's wasm translator (esm/translators.js): a WebAssembly module as an ES module
+  // whose imports are the module's import module names and whose exports are the
+  // instance's exports, instantiated when the module evaluates.
+  const wasmModules = new Map();
+  // [[Instance]] of each evaluated Wasm module, by its namespace: a Wasm module that
+  // imports a global from another Wasm module gets the WebAssembly.Global itself.
+  const wasmInstances = new WeakMap();
+  // One WebAssembly.Module per URL, the evaluation phase's and the source phase's.
+  const wasmCompiled = new Map();
+  function compileWasm(filename, bytes) {
+    const cached = wasmCompiled.get(filename);
+    if (cached) return cached;
+    const url = asURL(filename);
+    if (bytes == null || (typeof bytes !== 'object')) throw error('ERR_INVALID_RETURN_PROPERTY_VALUE', 'a string, an ArrayBuffer, or a TypedArray', 'load', 'source', bytes);
+    let compiled;
+    try { compiled = new globalThis.WebAssembly.Module(bytes, { builtins: ['js-string'], importedStringConstants: 'wasm:js/string-constants' }); }
+    catch (cause) {
+      if (cause && typeof cause === 'object') cause.message = (url.startsWith('file:') ? filesystemName(url) : url) + ': ' + cause.message;
+      throw cause;
+    }
+    wasmCompiled.set(filename, compiled);
+    return compiled;
+  }
+  // GetModuleSource for `import source x from specifier` and import.source(): a
+  // Wasm module's WebAssembly.Module, which is neither instantiated nor evaluated.
+  // Other modules have no source object (Node's ERR_SOURCE_PHASE_NOT_DEFINED).
+  function moduleSource(specifier, parent, attributes) {
+    const resolved = resolveImport(specifier, parent, attributes);
+    const cached = wasmCompiled.get(resolved.filename);
+    if (cached) return cached;
+    if (resolved.format === undefined || resolved.format === 'wasm') {
+      const key = moduleKey(resolved.filename, resolved.importAttributes || attributes);
+      const loaded = loadSource(resolutions.get(key) || resolved, attributes);
+      if (loaded.format === 'wasm') return compileWasm(resolved.filename, loaded.source);
+    }
+    const url = asURL(resolved.filename);
+    const cause = new SyntaxError(`Source phase import object is not defined for module '${url}'`);
+    cause.code = 'ERR_SOURCE_PHASE_NOT_DEFINED';
+    throw cause;
+  }
+  function wasmSource(filename, bytes) {
+    const url = asURL(filename);
+    const { WebAssembly } = globalThis;
+    const compiled = compileWasm(filename, bytes);
+    const imports = new Set();
+    const globalImports = [];
+    for (const entry of WebAssembly.Module.imports(compiled)) {
+      if (entry.kind === 'global') globalImports.push(entry);
+      if (entry.module.startsWith('wasm-js:')) throw new WebAssembly.LinkError(`Invalid Wasm import "${entry.module}" in ${url}`);
+      if (entry.name.startsWith('wasm:') || entry.name.startsWith('wasm-js:')) throw new WebAssembly.LinkError(`Invalid Wasm import name "${entry.name}" in ${url}`);
+      imports.add(entry.module);
+    }
+    const exports = [];
+    const globalExports = new Set();
+    for (const entry of WebAssembly.Module.exports(compiled)) {
+      if (entry.kind === 'global') globalExports.add(entry.name);
+      if (entry.name.startsWith('wasm:') || entry.name.startsWith('wasm-js:')) throw new WebAssembly.LinkError(`Invalid Wasm export name "${entry.name}" in ${url}`);
+      exports.push(entry.name);
+    }
+    wasmModules.set(filename, { compiled, globalImports, globalExports, exports });
+    const names = [...imports];
+    let source = names.map((name, index) => `import * as $import_${index} from ${JSON.stringify(name)};\n`).join('');
+    source += `import * as $self from ${JSON.stringify(url)};\n`;
+    source += exports.map((name, index) => `let $export_${index};\nexport { $export_${index} as ${JSON.stringify(name)} };\n`).join('');
+    source += `const $values = globalThis.__silkModuleBridge.instantiateWasm(${JSON.stringify(filename)}, $self, {${
+      names.map((name, index) => `${JSON.stringify(name)}: $import_${index}`).join(', ')}});\n`;
+    source += exports.map((_, index) => `if (${index} in $values) $export_${index} = $values[${index}];\n`).join('');
+    return source;
+  }
+  function instantiateWasm(filename, namespace, imports) {
+    const record = wasmModules.get(filename);
+    require('internal/util').emitExperimentalWarning('Importing WebAssembly module instances');
+    for (const name of Object.keys(imports)) {
+      const instance = wasmInstances.get(imports[name]);
+      if (!instance) continue;
+      const wrapped = Object.assign({ __proto__: null }, imports[name]);
+      for (const entry of record.globalImports) if (entry.module === name) wrapped[entry.name] = instance[entry.name];
+      imports[name] = wrapped;
+    }
+    const { exports } = new globalThis.WebAssembly.Instance(record.compiled, imports);
+    wasmInstances.set(namespace, exports);
+    const values = {};
+    record.exports.forEach((name, index) => {
+      let value = exports[name];
+      if (record.globalExports.has(name)) {
+        // A v128 global has no JS value (GetGlobalValue throws): its binding stays unset.
+        try { value = value.value; } catch { return; }
+      }
+      values[index] = value;
+    });
+    return values;
+  }
 
   function bridgeSource(filename, names, cjs) {
     let source = 'const value = globalThis.__silkModuleBridge.get(' + JSON.stringify(filename) + ');\nexport default value;\n';
@@ -1371,11 +1514,12 @@ function createLoader(host, builtins) {
     return Array.from(names);
   }
 
-  function loadESM(filename, attributes) {
+  function loadESM(key, attributes) {
+    const filename = keyName(key);
     if (host.reportDependency && (filename.startsWith('file:') || path.isAbsolute(filename))) host.reportDependency(filename);
     const mock = mockInstances.get(filename);
     if (mock) return mockESM(filename, mock);
-    let resolved = resolutions.get(filename);
+    let resolved = resolutions.get(key);
     if (!resolved) {
       let detected;
       if (filename.startsWith('data:')) detected = dataFormat(filename);
@@ -1388,10 +1532,10 @@ function createLoader(host, builtins) {
     }
     attributes = resolved.importAttributes || attributes || {};
     if (host.importText && attributes.type === 'text') resolved = { ...resolved, format: 'text' };
-    const loaded = pendingLoads.get(filename) || loadSource(resolved, attributes);
-    pendingLoads.delete(filename);
+    const loaded = pendingLoads.get(key) || loadSource(resolved, attributes);
+    pendingLoads.delete(key);
     resolved.format = loaded.format;
-    return finishESM(resolved, loaded, attributes);
+    return finishESM(resolved, loaded, attributes, key);
   }
 
   // Node's validateAttributes: the "type" each format needs, none for code formats, and
@@ -1459,8 +1603,13 @@ function createLoader(host, builtins) {
     if (resolved.format && !hooks.active()) validateAttributes(resolved.format, asURL(resolved.filename), attributes || {});
     return resolved;
   }
+  // The engine's module name for an import request.
+  function importKey(specifier, parent, attributes) {
+    const resolved = resolveImport(specifier, parent, attributes);
+    return moduleKey(resolved.filename, resolved.importAttributes || attributes);
+  }
 
-  function finishESM(resolved, loaded, attributes) {
+  function finishESM(resolved, loaded, attributes, key = resolved.filename) {
     let source;
     const substitute = substituteExports(resolved.filename);
     if (substitute !== undefined) {
@@ -1473,18 +1622,19 @@ function createLoader(host, builtins) {
       source = bridgeSource(resolved.filename, Object.keys(loadBuiltin(resolved.filename)), false);
     }
     else if (resolved.format === 'json' || resolved.format === 'commonjs') {
-      pendingLoads.set(resolved.filename, loaded);
-      resolutions.set(resolved.filename, resolved);
-      source = bridgeSource(resolved.filename, resolved.format === 'commonjs' ? commonJSNames(resolved.filename, new Set(), loaded.source) : [], resolved.format === 'commonjs');
+      pendingLoads.set(key, loaded);
+      resolutions.set(key, resolved);
+      source = bridgeSource(key, resolved.format === 'commonjs' ? commonJSNames(resolved.filename, new Set(), loaded.source) : [], resolved.format === 'commonjs');
     }
     else if (resolved.format === 'addon') throw error('ERR_UNKNOWN_FILE_EXTENSION', path.extname(resolved.filename), resolved.filename);
+    else if (resolved.format === 'wasm') source = wasmSource(resolved.filename, loaded.source);
     // Node's text translator: the source, without a byte order mark, as the default export.
     else if (resolved.format === 'text') source = `export default ${JSON.stringify(sourceText(loaded.source).replace(/^\uFEFF/, ''))};`;
     else throw unknownFormat(resolved.format, path.isAbsolute(resolved.filename) ? fileURL(resolved.filename) : resolved.filename);
     return { source, format: resolved.format, filename: resolved.filename };
   }
 
-  return { decorateModuleError, resolveImport, requireFor, runMain, defaultRunMain, warmMain, resolve, resolveMain, loadESM, cleanSource, prepareSource, bridge, Module, mockModule };
+  return { decorateModuleError, moduleEvaluationError, resolveImport, importKey, moduleSource, requireFor, runMain, defaultRunMain, warmMain, resolve, resolveMain, loadESM, cleanSource, prepareSource, bridge, Module, mockModule };
 }
 
 module.exports = { createLoader };

@@ -165,8 +165,12 @@ def discovery(endpoint):
         assert entries[0]["webSocketDebuggerUrl"] == endpoint.geturl(), entries
         assert entries[0]["id"] == endpoint.path[1:]
         assert entries[0]["type"] == "node"
+    # Node names the endpoint by the Host the client sent.
+    status, body = http(endpoint, "/json", host=f"127.0.0.2:{endpoint.port + 1}")
+    assert status == 200 and json.loads(body)[0]["webSocketDebuggerUrl"] == f"ws://127.0.0.2:{endpoint.port + 1}{endpoint.path}", body
     status, body = http(endpoint, "/json/version")
-    assert status == 200 and json.loads(body)["Protocol-Version"] == "1.3"
+    version = json.loads(body)
+    assert status == 200 and version["Protocol-Version"] == "1.1" and version["Browser"].startswith("node.js/v"), body
 
 
 def protocol_rejections(endpoint):
@@ -205,7 +209,8 @@ def main():
     discovery(endpoint)
     assert http(endpoint, "/json", host=f"rebind.attacker.invalid:{endpoint.port}")[0] == 403
     assert http(endpoint, "/json", origin="https://attacker.invalid")[0] == 403
-    assert http(endpoint, "/not-the-endpoint")[0] == 404
+    status, body = http(endpoint, "/not-the-endpoint")
+    assert status == 400 and b"WebSockets request was expected" in body, (status, body)
     protocol_rejections(endpoint)
     ws = WebSocket(endpoint)
     try:
