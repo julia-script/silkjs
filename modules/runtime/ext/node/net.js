@@ -5,6 +5,7 @@ const { EventEmitter } = require('events');
 const { Buffer } = require('buffer');
 const diagnostics = require('internal/host').diagnostics;
 const traceEvents = require('internal/trace_events');
+const { reuseOrCreateUnrefTimeout } = require('internal/timers');
 // node.net.native trace events: a connect request begins with the native connect and ends with its result.
 const kNetTraceCategory = 'node,node.net,node.net.native';
 const { Transport, error: nativeError, native } = require('internal/net/transport');
@@ -165,14 +166,17 @@ Socket.prototype._cacheAddresses = function() {
   this._localAddress = this._transport.address(false);
   this._remoteAddress = this._transport.address(true);
 };
+function onSocketTimeout(socket) {
+  if (!socket.destroyed) socket.emit('timeout');
+}
+// As Node's setStreamTimeout and _unrefTimer: an internal timer that never keeps
+// the loop alive. A cleared or fired Timeout stays in _timeout and is armed again
+// (reuseOrCreateUnrefTimeout), as on a keep-alive connection.
 Socket.prototype._refreshTimeout = function() {
   if (!this.timeout || this.destroyed) return;
-  if (this._timeout) { this._timeout.refresh(); return; }
-  this._timeout = setTimeout(() => {
-    this._timeout = null;
-    if (!this.destroyed) this.emit('timeout');
-  }, this.timeout);
-  this._timeout.unref?.();
+  const timer = this._timeout;
+  if (timer !== null && !timer._destroyed) { timer.refresh(); return; }
+  this._timeout = reuseOrCreateUnrefTimeout(timer, onSocketTimeout, this.timeout, this);
 };
 // Node's name for refreshing the idle timeout of a socket and the sockets it wraps.
 Socket.prototype._unrefTimer = function() {
@@ -557,7 +561,6 @@ Socket.prototype.setTimeout = function(milliseconds, cb) {
   if (milliseconds < 0 || !Number.isFinite(milliseconds)) throw new ERR_OUT_OF_RANGE('msecs', 'a non-negative finite number', milliseconds);
   if (cb !== undefined) validateFunction(cb, 'callback');
   clearTimeout(this._timeout);
-  this._timeout = null;
   this.timeout = milliseconds;
   if (cb) { if (milliseconds === 0) this.removeListener('timeout', cb); else this.once('timeout', cb); }
   this._refreshTimeout();
