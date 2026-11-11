@@ -142,17 +142,7 @@ const startupSnapshot = {
   addDeserializeCallback: snapshotCallback,
   setDeserializeMainFunction: snapshotCallback,
 };
-const promiseHooks = {
-  createHook(callbacks) { return require('async_hooks')._createPromiseHook(callbacks); },
-  onInit(callback) { return promiseHook('init', callback); },
-  onBefore(callback) { return promiseHook('before', callback); },
-  onAfter(callback) { return promiseHook('after', callback); },
-  onSettled(callback) { return promiseHook('settled', callback); },
-};
-function promiseHook(name, callback) {
-  if (typeof callback !== 'function') throw error('ERR_INVALID_ARG_TYPE', `The "${name}" argument must be a function`, TypeError);
-  return promiseHooks.createHook({ [name]: callback });
-}
+const promiseHooks = require('internal/promise_hooks');
 
 module.exports = {
   cachedDataVersionTag, getHeapSnapshot, getHeapStatistics, getHeapSpaceStatistics,
