@@ -120,6 +120,24 @@ function getValidatedPath(value, name = 'path') {
   return path;
 }
 
+// Node's validateFiniteNumber and checkRangesOrGetDefault (used by zlib).
+function validateFiniteNumber(number, name) {
+  // Common case
+  if (number === undefined) return false;
+  if (Number.isFinite(number)) return true; // Is a valid number
+  if (Number.isNaN(number)) return false;
+  validateNumber(number, name);
+  // Infinite numbers
+  throw new ERR_OUT_OF_RANGE(name, 'a finite number', number);
+}
+function checkRangesOrGetDefault(number, name, lower, upper, def) {
+  if (!validateFiniteNumber(number, name)) return def;
+  if (number < lower || number > upper) {
+    throw new ERR_OUT_OF_RANGE(name, `>= ${lower} and <= ${upper}`, number);
+  }
+  return number;
+}
+
 module.exports = {
   codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_MISSING_ARGS, ERR_OUT_OF_RANGE },
   codedError, unknownSignal,
@@ -127,4 +145,5 @@ module.exports = {
   validateString, validateBoolean, validateFunction, validateNumber, validateInteger, validateInt32,
   validateUint32, validateObject, validateArray, validateOneOf, validateAbortSignal,
   convertToValidSignal, signalName, toPathIfFileURL, validatePath, getValidatedPath,
+  validateFiniteNumber, checkRangesOrGetDefault,
 };

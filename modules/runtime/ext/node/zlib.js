@@ -30,74 +30,23 @@ const { isArrayBufferView, isAnyArrayBuffer, isUint8Array } = require('util/type
 const binding = require('internal/compression/handle');
 const { crc32: crc32Native } = binding;
 const { Buffer, kMaxLength } = require('buffer');
-const { codes: { ERR_INVALID_ARG_TYPE, ERR_OUT_OF_RANGE } } = require('internal/streams/support');
+const {
+  codes: {
+    ERR_BROTLI_INVALID_PARAM, ERR_BUFFER_TOO_LARGE, ERR_INVALID_ARG_TYPE, ERR_OUT_OF_RANGE,
+    ERR_TRAILING_JUNK_AFTER_STREAM_END, ERR_ZSTD_INVALID_PARAM,
+  },
+  genericNodeError,
+} = require('internal/errors');
+const {
+  validateFunction, validateFiniteNumber, checkRangesOrGetDefault, validateNumber,
+  validateBoolean, validateUint32,
+} = require('internal/validators');
+const assert = require('internal/assert');
 
-const ArrayBuffer = globalThis.ArrayBuffer;
-const MathMax = Math.max;
-const NumberIsNaN = Number.isNaN;
-const NumberIsFinite = Number.isFinite;
-const ObjectDefineProperties = Object.defineProperties;
-const ObjectDefineProperty = Object.defineProperty;
-const ObjectEntries = Object.entries;
-const ObjectFreeze = Object.freeze;
-const ObjectKeys = Object.keys;
-const ObjectSetPrototypeOf = Object.setPrototypeOf;
-const Uint32Array = globalThis.Uint32Array;
-const Uint8Array = globalThis.Uint8Array;
-
-function nodeError(Base, code, message) {
-  const error = new Base(message);
-  error.code = code;
-  return error;
-}
-function ERR_BROTLI_INVALID_PARAM(key) {
-  return nodeError(RangeError, 'ERR_BROTLI_INVALID_PARAM', `${key} is not a valid Brotli parameter`);
-}
-function ERR_ZSTD_INVALID_PARAM(key) {
-  return nodeError(RangeError, 'ERR_ZSTD_INVALID_PARAM', `${key} is not a valid zstd parameter`);
-}
-function ERR_BUFFER_TOO_LARGE(maxLength) {
-  return nodeError(RangeError, 'ERR_BUFFER_TOO_LARGE', `Cannot create a Buffer larger than ${maxLength} bytes`);
-}
-function ERR_TRAILING_JUNK_AFTER_STREAM_END() {
-  return nodeError(TypeError, 'ERR_TRAILING_JUNK_AFTER_STREAM_END',
-                   'Trailing junk found after the end of the compressed stream');
-}
-function genericNodeError(message, properties) {
-  return Object.assign(new Error(message), properties);
-}
-
-// internal/validators
-function validateNumber(value, name) {
-  if (typeof value !== 'number') throw new ERR_INVALID_ARG_TYPE(name, 'number', value);
-}
-function validateFiniteNumber(number, name) {
-  // Common case
-  if (number === undefined) return false;
-  if (NumberIsFinite(number)) return true; // Is a valid number
-  if (NumberIsNaN(number)) return false;
-  validateNumber(number, name);
-  // Infinite numbers
-  throw new ERR_OUT_OF_RANGE(name, 'a finite number', number);
-}
-function checkRangesOrGetDefault(number, name, lower, upper, def) {
-  if (!validateFiniteNumber(number, name)) return def;
-  if (number < lower || number > upper) {
-    throw new ERR_OUT_OF_RANGE(name, `>= ${lower} and <= ${upper}`, number);
-  }
-  return number;
-}
-function validateBoolean(value, name) {
-  if (typeof value !== 'boolean') throw new ERR_INVALID_ARG_TYPE(name, 'boolean', value);
-}
-function validateFunction(value, name) {
-  if (typeof value !== 'function') throw new ERR_INVALID_ARG_TYPE(name, 'Function', value);
-}
-function validateUint32(value, name) {
-  if (typeof value !== 'number') throw new ERR_INVALID_ARG_TYPE(name, 'number', value);
-  if (!Number.isInteger(value)) throw new ERR_OUT_OF_RANGE(name, 'an integer', value);
-  if (value < 0 || value > 4294967295) throw new ERR_OUT_OF_RANGE(name, '>= 0 && <= 4294967295', value);
-}
+const {
+  ArrayBuffer, MathMax, NumberIsNaN, ObjectDefineProperties, ObjectDefineProperty,
+  ObjectEntries, ObjectFreeze, ObjectKeys, ObjectSetPrototypeOf, Uint32Array, Uint8Array,
+} = require('internal/per_context/primordials');
 
 // internal/util
 function assignFunctionName(name, fn) {
@@ -112,9 +61,6 @@ function deprecateInstantiation(target, code, ...args) {
                         'DeprecationWarning', code, target);
   }
   return Reflect.construct(target, args);
-}
-function assert(value, message) {
-  if (!value) throw nodeError(Error, 'ERR_INTERNAL_ASSERTION', message || 'Assertion failed');
 }
 
 const owner_symbol = Symbol('owner_symbol');
