@@ -1,43 +1,27 @@
-// Copyright Joyent, Inc. and other Node contributors.
-//
-// Permission is hereby granted, free of charge, to any person obtaining a
-// copy of this software and associated documentation files (the
-// "Software"), to deal in the Software without restriction, including
-// without limitation the rights to use, copy, modify, merge, publish,
-// distribute, sublicense, and/or sell copies of the Software, and to permit
-// persons to whom the Software is furnished to do so, subject to the
-// following conditions:
-//
-// The above copyright notice and this permission notice shall be included
-// in all copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
-// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
-// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
-// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
-// USE OR OTHER DEALINGS IN THE SOFTWARE.
-// Adapted from Node.js 24 lib/internal/repl/await.js.
+// Adapted from Node.js v24.22.1 lib/internal/repl/await.js for Silk.
 'use strict';
-const uncurry = (fn) => Function.prototype.call.bind(fn);
-const ArrayPrototypeForEach = uncurry(Array.prototype.forEach);
-const ArrayPrototypeIncludes = uncurry(Array.prototype.includes);
-const ArrayPrototypeJoin = uncurry(Array.prototype.join);
-const ArrayPrototypePop = uncurry(Array.prototype.pop);
-const ArrayPrototypePush = uncurry(Array.prototype.push);
-const FunctionPrototype = Function.prototype;
-const ObjectKeys = Object.keys;
-const RegExpPrototypeSymbolReplace = uncurry(RegExp.prototype[Symbol.replace]);
-const StringPrototypeEndsWith = uncurry(String.prototype.endsWith);
-const StringPrototypeIncludes = uncurry(String.prototype.includes);
-const StringPrototypeIndexOf = uncurry(String.prototype.indexOf);
-const StringPrototypeRepeat = uncurry(String.prototype.repeat);
-const StringPrototypeSplit = uncurry(String.prototype.split);
-const StringPrototypeStartsWith = uncurry(String.prototype.startsWith);
-const parser = require('internal/repl/acorn').Parser;
-const walk = require('internal/repl/walk');
-const { Recoverable } = require('internal/repl/syntax');
+
+const {
+  ArrayPrototypeForEach,
+  ArrayPrototypeIncludes,
+  ArrayPrototypeJoin,
+  ArrayPrototypePop,
+  ArrayPrototypePush,
+  FunctionPrototype,
+  ObjectKeys,
+  RegExpPrototypeSymbolReplace,
+  StringPrototypeEndsWith,
+  StringPrototypeIncludes,
+  StringPrototypeIndexOf,
+  StringPrototypeRepeat,
+  StringPrototypeSplit,
+  StringPrototypeStartsWith,
+  SyntaxError,
+} = require('internal/per_context/primordials');
+
+const parser = require('internal/deps/acorn/acorn/dist/acorn').Parser;
+const walk = require('internal/deps/acorn/acorn-walk/dist/walk');
+const { Recoverable } = require('internal/repl');
 
 function isTopLevelDeclaration(state) {
   return state.ancestors[state.ancestors.length - 2] === state.body;
@@ -112,19 +96,12 @@ const visitorsWithoutAncestors = {
         ['let', []],
       ];
       function registerVariableDeclarationIdentifiers(node) {
-        if (node === null) return;
         switch (node.type) {
           case 'Identifier':
             ArrayPrototypePush(
               variableIdentifiersToHoist[variableKind === 'var' ? 0 : 1][1],
               node.name,
             );
-            break;
-          case 'AssignmentPattern':
-            registerVariableDeclarationIdentifiers(node.left);
-            break;
-          case 'RestElement':
-            registerVariableDeclarationIdentifiers(node.argument);
             break;
           case 'ObjectPattern':
             ArrayPrototypeForEach(node.properties, (property) => {

@@ -65,6 +65,11 @@ const {
 // internal/error_stack owns these two: its stack header names the code of a
 // NodeError, and it formats an error found in overrideStackTrace with that callback.
 const { kIsNodeError, overrides: overrideStackTrace } = require('internal/host').errorStackState;
+// Node's ErrorPrepareStackTrace: the default V8-style formatter, for callers (the REPL)
+// that format frames themselves when no Error.prepareStackTrace is set.
+function ErrorPrepareStackTrace(error, trace) {
+  return require('internal/host').errorStackState.defaultPrepare(error, trace);
+}
 
 const isWindows = require('internal/host').platform === 'win32';
 
@@ -801,7 +806,7 @@ function addNumericalSeparator(val) {
 }
 
 // Ensures the printed error line is from user code.
-const arrow_message_private_symbol = Symbol('arrowMessage');
+const { privateSymbols: { arrow_message_private_symbol } } = require('internal/util/binding');
 function setArrowMessage(err, arrowMessage) {
   err[arrow_message_private_symbol] = arrowMessage;
 }
@@ -955,6 +960,7 @@ module.exports = {
   determineSpecificType,
   E,
   ErrnoException,
+  ErrorPrepareStackTrace,
   ExceptionWithHostPort,
   formatList,
   genericNodeError,

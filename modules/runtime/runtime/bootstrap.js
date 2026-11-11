@@ -93,7 +93,8 @@ const dotSegment = /\/\.\.?(?:\/|$)/;
 const fileHref = path => host.platform !== 'win32' && plainPath.test(path) && !dotSegment.test(path)
   ? 'file://' + path : internalRequire('url').pathToFileURL(path).href;
 const inspectorNativeOperations = Array.from({ length: 32 }, (_, index) => native['inspectorNative' + index]);
-host.inspectorNative = (operation, ...args) => inspectorNativeOperations[operation](...args);
+const reflectApply = Reflect.apply;
+host.inspectorNative = (operation, ...args) => reflectApply(inspectorNativeOperations[operation], undefined, args);
 host.inspectorEntry = wrapper => host.inspectorNative(15, wrapper);
 host.typeScriptMode = 'strip';
 host.testCoverageStart = () => native.testCoverageNative(0);
@@ -374,9 +375,11 @@ function checkpoint() {
       completion();
     }
     while (rejections.size) {
-      const pending = [...rejections];
-      for (const [promise, info] of pending) {
+      const pending = Array.from(rejections.keys());
+      for (let index = 0; index < pending.length; index++) {
+        const promise = pending[index];
         if (!rejections.has(promise)) continue;
+        const info = rejections.get(promise);
         const { context } = info;
         rejections.delete(promise);
         reportedRejections.set(promise, info);
@@ -396,7 +399,9 @@ function checkpoint() {
 host.checkpoint = checkpoint;
 // Node's lib/timers.js and lib/internal/timers.js run the timers; the loop
 // drives them through internal/timers_binding as Node's Environment does.
-host.invokeTimer = (scope, callback, receiver, args) => invokeScoped(scope, invokeReporting, callback, receiver, args);
+// Named, as Node's timer frames are: the REPL trims an error's frames below the
+// last one without a function name.
+host.invokeTimer = function invokeTimer(scope, callback, receiver, args) { return invokeScoped(scope, invokeReporting, callback, receiver, args); };
 const timerAPI = internalRequire('timers');
 {
   const { processImmediate, processTimers } = internalRequire('internal/timers').getTimerCallbacks(checkpoint);
@@ -663,7 +668,7 @@ for (const name of ['Event', 'CustomEvent', 'EventTarget', 'AbortController', 'A
 const asyncFS = internalRequire('internal/fs_async')(native);
 host.submitIO = (operation, args, callback, requestKind) => {
   const scope = resource(requestKind === 1 ? 'FSREQPROMISE' : requestKind === 2 ? 'FILEHANDLECLOSEREQ' : 'FSREQCALLBACK');
-  try { return asyncFS.submitIO(operation, args, (...values) => invokeResource(scope, callback, undefined, values), requestKind); }
+  try { return asyncFS.submitIO(operation, args, function oncomplete(...values) { return invokeResource(scope, callback, undefined, values); }, requestKind); }
   catch (error) { scope.emitDestroy(); throw error; }
 };
 host.watch = (filename, options, callback) => {
@@ -729,7 +734,8 @@ for (const name of ['Crypto', 'SubtleCrypto', 'CryptoKey']) {
     webGlobals.defineLazy(globalThis, name, loadPerformance, name === 'performance');
 }
 host.path = internalRequire('path');
-const publicBuiltinNames = [...factories.keys()].filter(name => !name.startsWith('internal/'));
+// Sorted, as Node lists builtinModules.
+const publicBuiltinNames = [...factories.keys()].filter(name => !name.startsWith('internal/')).sort();
 const publicBuiltinHas = Set.prototype.has.bind(new Set(publicBuiltinNames));
 const prefixOnlyBuiltinHas = Set.prototype.has.bind(new Set(['test', 'test/reporters', 'sqlite', 'sea']));
 const defineBuiltinName = Object.defineProperty;
@@ -759,13 +765,16 @@ const publicBuiltins = {
     }
     return !prefixOnlyBuiltinHas(name) && publicBuiltin(name);
   },
+  // The modules with a bare name first, then the node:-only ones, as Node lists them.
   names() {
     const names = [];
-    for (let index = 0; index < publicBuiltinNames.length; index++) {
-      const name = publicBuiltinNames[index];
-      if (publicBuiltin(name)) defineBuiltinName(names, names.length, {
-        value: prefixOnlyBuiltinHas(name) ? 'node:' + name : name, enumerable: true, writable: true, configurable: true,
-      });
+    for (let pass = 0; pass < 2; pass++) {
+      for (let index = 0; index < publicBuiltinNames.length; index++) {
+        const name = publicBuiltinNames[index];
+        if (publicBuiltin(name) && prefixOnlyBuiltinHas(name) === (pass === 1)) defineBuiltinName(names, names.length, {
+          value: pass === 1 ? 'node:' + name : name, enumerable: true, writable: true, configurable: true,
+        });
+      }
     }
     return names;
   }
@@ -859,6 +868,9 @@ function runtimeFlag(arg) {
   }
   if (arg === '--trace-sigint' || arg === '--no-trace-sigint') {
     host.traceSigint = arg === '--trace-sigint'; return true;
+  }
+  if (arg === '--experimental-repl-await' || arg === '--no-experimental-repl-await') {
+    host.replAwait = arg === '--experimental-repl-await'; return true;
   }
   if ((arg.startsWith('--report-') || arg.startsWith('--no-report-') || arg === '--experimental-report') &&
       internalRequire('internal/process_report').applyOption(arg)) return true;
@@ -1338,7 +1350,7 @@ function run() {
   if (expression !== undefined) {
     const name = host.path.join(host.cwd(), '[eval]');
     expression = prepareInput(expression, name, inputType, inputTypeSet);
-    internalRequire('internal/loader/builtin_globals')(globalThis, '<eval>');
+    internalRequire('internal/modules/helpers').addBuiltinLibsToObject(globalThis, '<eval>');
     const code = !inputType.startsWith('module') && /\bcrypto\b/.test(expression) ?
       (print ? 'let crypto=require("node:crypto");{' + expression + '}' : '(crypto=>{{' + expression + '}})(require("node:crypto"))') : expression;
     if (inputType.startsWith('module') || (!inputTypeSet && native.detectModuleSyntax(code))) {
