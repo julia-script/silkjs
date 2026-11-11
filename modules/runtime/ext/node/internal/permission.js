@@ -70,8 +70,9 @@ function applyOption(arg) {
   state[flags[positive]] = positive === name;
   return true;
 }
-function invalid(name) {
-  const error = new TypeErrorClass('The "' + name + '" argument must be a string' + (name === 'reference' ? ' or Buffer' : ''));
+// Node words these as for a string only, although a reference may also be a Buffer.
+function invalid(name, value) {
+  const error = new TypeErrorClass('The "' + name + '" argument must be of type string. Received ' + require('internal/errors').determineSpecificType(value));
   error.code = 'ERR_INVALID_ARG_TYPE';
   return error;
 }
@@ -92,7 +93,7 @@ function normalize(path, base) {
 }
 function filePath(value) {
   if (isBuffer(value)) value = bufferText(value);
-  if (typeof value !== 'string') throw invalid('reference');
+  if (typeof value !== 'string') throw invalid('reference', value);
   if (indexOf(value, '\0') !== -1) {
     const error = new TypeErrorClass('Path must not contain null bytes'); error.code = 'ERR_INVALID_ARG_VALUE'; throw error;
   }
@@ -139,8 +140,8 @@ function granted(scope, resource) {
   return own(names, scope) && state[scope] === true;
 }
 function has(scope, reference) {
-  if (typeof scope !== 'string') throw invalid('scope');
-  if (reference != null && typeof reference !== 'string' && !isBuffer(reference)) throw invalid('reference');
+  if (typeof scope !== 'string') throw invalid('scope', scope);
+  if (reference != null && typeof reference !== 'string' && !isBuffer(reference)) throw invalid('reference', reference);
   if (reference === null) reference = 'null';
   if (isBuffer(reference)) reference = bufferText(reference);
   if (reference === '') return false;
@@ -181,8 +182,8 @@ function publish(scope, resource, dropped) {
   finally { publishing = false; }
 }
 function drop(scope, reference) {
-  if (typeof scope !== 'string') throw invalid('scope');
-  if (reference != null && typeof reference !== 'string' && !isBuffer(reference)) throw invalid('reference');
+  if (typeof scope !== 'string') throw invalid('scope', scope);
+  if (reference != null && typeof reference !== 'string' && !isBuffer(reference)) throw invalid('reference', reference);
   if (reference === null) reference = 'null';
   if (isBuffer(reference)) reference = bufferText(reference);
   if (scope === 'fs') {
@@ -328,7 +329,7 @@ function initialize(options = {}) {
     channels = create(null);
     for (const name of ['fs', 'child', 'worker', 'addon', 'wasi', 'inspector', 'openssl-store']) {
       const target = channel('node:permission-model:' + name);
-      channels[name] = { publish: target.publish.bind(target) };
+      channels[name] = { publish(message) { target.publish(message); } };
     }
     define(process, 'permission', { value: { has, drop }, enumerable: true, writable: false, configurable: false });
   }

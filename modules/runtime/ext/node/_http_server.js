@@ -5,6 +5,7 @@ const { OutgoingMessage, validateHeaderName, validateHeaderValue } = require('_h
 const { IncomingMessage } = require('_http_incoming');
 const { Parser, error, invalidValue, hasToken, setParserOptions } = require('internal/http/parser');
 const { STATUS_CODES } = require('internal/http/constants');
+const diagnostics = require('internal/dc');
 
 class ServerResponse extends OutgoingMessage {
   constructor(req, options = {}) {
@@ -13,6 +14,7 @@ class ServerResponse extends OutgoingMessage {
     this._hasBody = req.method !== 'HEAD'; this._rejectBody = !!options.rejectNonStandardBodyWrites;
     this.shouldKeepAlive = req._keepAlive !== false;
     this.useChunkedEncodingByDefault = req.httpVersionMinor !== 0;
+    diagnostics.publish('http.server.response.created', { request: req, response: this });
   }
   assignSocket(socket) { this.socket = socket; this.emit('socket', socket); this._flushOutput(); }
   detachSocket(socket) { if (this.socket === socket) this.socket = null; }
@@ -127,6 +129,7 @@ class Server extends net.Server {
         if (this.maxRequestsPerSocket > 0 && state.count >= this.maxRequestsPerSocket) res.shouldKeepAlive = false;
         res.on('error', err => socket.destroy(err));
         res.on('finish', () => {
+          diagnostics.publish('http.server.response.finish', { request: req, response: res, socket, server: this });
           if (!req.complete || !req.readableEnded) req._dump();
           if (state.responses[0] === res) state.responses.shift();
           res.detachSocket(socket);
@@ -137,6 +140,7 @@ class Server extends net.Server {
           else if (req.complete) socket.setTimeout(this.keepAliveTimeout ? this.keepAliveTimeout + this.keepAliveTimeoutBuffer : 0);
           if (state.outputPaused && state.responses.length < 2 && !parser.stopped) { state.outputPaused = false; parser.resume(); socket.resume(); }
         });
+        diagnostics.publish('http.server.request.start', { request: req, response: res, socket, server: this });
         if (this.requireHostHeader && req.httpVersionMinor === 1 && !req.headers.host) { res.statusCode = 400; res.shouldKeepAlive = false; res.end(); }
         else if (this.maxRequestsPerSocket > 0 && state.count > this.maxRequestsPerSocket) { this.emit('dropRequest', req, socket); res.statusCode = 503; res.end(); }
         else if (req.headers.expect !== undefined) {

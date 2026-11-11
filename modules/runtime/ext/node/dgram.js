@@ -7,6 +7,7 @@ const host = require('internal/host');
 const { EventEmitter } = require('events');
 const { Buffer } = require('buffer');
 const { AsyncResource } = require('async_hooks');
+const diagnostics = require('internal/dc');
 const dns = require('dns');
 
 function error(code, message, Type = Error) {
@@ -105,6 +106,7 @@ class Socket extends EventEmitter {
       signal.addEventListener('abort', abort, { once: true });
       if (signal.aborted) this._later(abort);
     }
+    diagnostics.publish('udp.socket', { socket: this });
   }
 
   _later(fn, ...args) {

@@ -3,6 +3,7 @@ const host = require('internal/host');
 const { EventEmitter } = require('events');
 const { AsyncResource } = require('async_hooks');
 const { Buffer } = require('buffer');
+const diagnostics = require('internal/dc');
 const { Socket } = require('net');
 const { signalNumber, signalName } = require('internal/process_signals');
 const { setupChannel } = require('internal/child_process/ipc');
@@ -99,6 +100,7 @@ class ChildProcess extends EventEmitter {
     this.stdin = null; this.stdout = null; this.stderr = null; this.stdio = [];
     this._id = 0; this._exited = false; this._closed = false; this._pendingClose = 0;
     this._resource = new AsyncResource('PROCESSWRAP');
+    diagnostics.publish('child_process', { process: this });
   }
   _close() {
     if (!this._exited || this._pendingClose || this._closed) return;
@@ -136,12 +138,15 @@ class ChildProcess extends EventEmitter {
 function spawn(file, args, options) {
   const normalized = normalize(file, args, options);
   const child = new ChildProcess(); child.spawnfile = normalized.file; child.spawnargs = normalized.argv;
+  const tracing = diagnostics.tracing('child_process.spawn');
+  tracing?.start.publish({ process: child, options: { ...normalized.options, file: normalized.file, args: normalized.argv } });
   const result = native('spawn', [...normalized.nativeArgs, (code, signal) => {
     host.invokeResource(child._resource, child._exit, child, [code, signal], false);
     host.checkpoint();
   }]);
   if (typeof result === 'number') {
     const error = spawnError(result, normalized);
+    tracing?.error.publish({ process: child, error });
     process.nextTick(() => { child._exited = true; child.exitCode = result; child.emit('error', error); child._close(); });
     return child;
   }
@@ -157,6 +162,7 @@ function spawn(file, args, options) {
     child.stdio.push(stream);
   }
   [child.stdin, child.stdout, child.stderr] = child.stdio;
+  tracing?.end.publish({ process: child });
   if (normalized.ipc >= 0) {
     child._pendingClose++;
     setupChannel(child, result[normalized.ipc + 2], normalized.serialization, () => { child._pendingClose--; child._close(); });

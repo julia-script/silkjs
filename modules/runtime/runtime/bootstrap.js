@@ -437,7 +437,7 @@ const process = new EventEmitter();
 globalThis.process = process;
 let startTime = native.runtimeStartTime;
 const performanceMilestones = {
-  nodeStart: 0, environment: native.environmentTime - startTime,
+  nodeStart: 0, v8Start: native.engineStartTime - startTime, environment: native.environmentTime - startTime,
   bootstrapComplete: -1, loopStart: -1, loopExit: -1,
 };
 let initialNativeIdleTime = 0;
@@ -1349,9 +1349,10 @@ globalThis.__silkRuntime = {
   },
   // Starts a process from a heap image: everything the bootstrap took from the
   // process that built the image is taken again from this one.
-  hydrate(argv, runtimeStartTime, environmentTime) {
+  hydrate(argv, runtimeStartTime, environmentTime, engineStartTime) {
     native.argv = argv;
     startTime = runtimeStartTime;
+    performanceMilestones.v8Start = engineStartTime - startTime;
     performanceMilestones.environment = environmentTime - startTime;
     host.performanceStartTime = startTime;
     host.performanceTimeOrigin = Date.now() - (native.now() - startTime);

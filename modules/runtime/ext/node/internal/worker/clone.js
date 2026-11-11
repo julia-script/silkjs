@@ -71,6 +71,7 @@ class CloneSerializer extends Serializer {
   }
   _isHostObject(value) {
     if (isDOMException(value)) return true;
+    if (host.types.isSlidingWindowHistogram?.(value)) throw cloneError();
     if (abort.isTransferable(value)) return true;
     if (isCryptoKey(value) || isKeyObject(value) || host.types.isX509Certificate?.(value)) return true;
     if (host.types.isStorage?.(value) || host.types.isEventSource?.(value)) return true;

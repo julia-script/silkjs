@@ -4,6 +4,7 @@ const host = require('internal/host');
 const EventEmitter = require('events');
 const { AsyncResource } = require('async_hooks');
 const { Buffer } = require('buffer');
+const diagnostics = require('internal/dc');
 // A main thread that never starts a worker needs none of these; each loads on first use.
 const lazy = name => { let loaded; return () => loaded ??= require(name); };
 const clone = lazy('internal/worker/clone');
@@ -255,6 +256,8 @@ class Worker extends EventEmitter {
     }
     if (!config.metadata.stdout) state.stdout.pipe(process.stdout, { end: false });
     if (!config.metadata.stderr) state.stderr.pipe(process.stderr, { end: false });
+    process.nextTick(() => process.emit('worker', this));
+    diagnostics.publish('worker_threads', { worker: this });
   }
   get threadId() { const state = workerState(this); return state.exited ? -1 : state.id; }
   get threadName() { const state = workerState(this); return state.exited ? null : state.metadata.name; }

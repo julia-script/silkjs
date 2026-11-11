@@ -17,8 +17,7 @@ function object(value, name) {
     throw error('ERR_INVALID_ARG_TYPE', `The "${name}" argument must be an object`, TypeError);
 }
 function string(value, name) {
-  if (typeof value !== 'string')
-    throw error('ERR_INVALID_ARG_TYPE', `The "${name}" argument must be a string`, TypeError);
+  if (typeof value !== 'string') throw require('internal/errors').codes.ERR_INVALID_ARG_TYPE(name, 'string', value);
 }
 function snapshotOptions(options = {}) {
   object(options, 'options');
@@ -120,7 +119,7 @@ function setHeapSnapshotNearHeapLimit(limit) {
 }
 function isStringOneByteRepresentation(content) {
   string(content, 'content');
-  unsupported('isStringOneByteRepresentation', 'V8 string storage is not used; character ranges cannot determine native string representation');
+  return host.isOneByteString(content);
 }
 function takeCoverage() {
   unsupported('takeCoverage', 'NODE_V8_COVERAGE collection is not implemented; native test coverage is a separate facility');

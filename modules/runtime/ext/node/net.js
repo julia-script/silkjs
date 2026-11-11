@@ -3,6 +3,7 @@
 const { Duplex } = require('stream');
 const { EventEmitter } = require('events');
 const { Buffer } = require('buffer');
+const diagnostics = require('internal/dc');
 const { Transport, error: nativeError, native } = require('internal/net/transport');
 
 let defaultAutoSelectFamily = true;
@@ -275,6 +276,7 @@ Socket.prototype._connectionFailed = function(err) {
 };
 Socket.prototype.connect = function(...args) {
   const [options, cb] = normalizeArgs(args);
+  diagnostics.publish('net.client.socket', { socket: this });
   if (this.connecting || this._connected) throw fail('ERR_SOCKET_IS_CONNECTED', 'Socket is already connected');
   if (this._transport?.closing) throw fail('ERR_SOCKET_CLOSED', 'Socket is still closing');
   if (options.path === undefined && options.port === undefined) throw fail('ERR_MISSING_ARGS', 'The "options" or "port" or "path" argument must be specified');
@@ -509,6 +511,7 @@ Server.prototype._acceptSocket = function(socket) {
   if (this._options.keepAlive !== undefined) socket.setKeepAlive(this._options.keepAlive, this._options.keepAliveInitialDelay || 0);
   if (this.pauseOnConnect) socket.pause();
   this.emit('connection', socket);
+  diagnostics.publish('net.server.socket', { socket });
   if (!this.pauseOnConnect && !socket.destroyed) socket._read();
 };
 Server.prototype.listen = function(...args) {
@@ -527,11 +530,14 @@ Server.prototype.listen = function(...args) {
   const port = options.path === undefined && options.fd === undefined ? portNumber(options.port) : 0;
   if (options.path !== undefined && typeof options.path !== 'string') throw fail('ERR_INVALID_ARG_TYPE', 'The "path" argument must be a string', TypeError);
   if (options.fd !== undefined) integer(options.fd, 'fd', 0, 0x7fffffff);
+  const listenTracing = diagnostics.tracing('net.server.listen');
+  listenTracing?.asyncStart.publish({ server: this, options });
   if (cb) this.once('listening', cb);
   this._starting = true;
   const generation = ++this._generation;
   attachAbort(this, options.signal, () => this.close());
   const failed = err => {
+    listenTracing?.error.publish({ server: this, error: err });
     this._starting = false;
     this._removeAbort?.();
     const transport = this._transport;
@@ -586,6 +592,7 @@ Server.prototype.listen = function(...args) {
       if (status < 0) { failed(nativeError(status, 'listen', address, port)); return; }
       this._starting = false;
       this._listening = true;
+      listenTracing?.asyncEnd.publish({ server: this });
       process.nextTick(() => { if (this._listening && generation === this._generation) this.emit('listening'); });
     } catch (err) { failed(err); }
   };

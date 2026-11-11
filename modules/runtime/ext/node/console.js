@@ -1,6 +1,7 @@
 'use strict';
 
 const host = require('internal/host');
+const diagnostics = require('internal/dc');
 const types = require('util/types');
 // The formatter loads with the first value that needs it: text alone does not.
 let util;
@@ -27,6 +28,12 @@ function direct(console, fd, name, args) {
   if (text === undefined) return false;
   if (console._groupIndent !== '') text = console._groupIndent + text.replace(/\n/g, '\n' + console._groupIndent);
   return require('internal/stdio').direct(fd, text + '\n');
+}
+function writeStdout(console, args) {
+  if (!direct(console, 1, '_stdout', args)) console._write(console._stdout, formatWithOptions(console._options(console._stdout), ...args));
+}
+function writeStderr(console, args) {
+  if (!direct(console, 2, '_stderr', args)) console._write(console._stderr, formatWithOptions(console._options(console._stderr), ...args));
 }
 function invalid(name, expected) { const error = new TypeError('The "' + name + '" argument must be ' + expected); error.code = 'ERR_INVALID_ARG_TYPE'; return error; }
 function warning(message) {
@@ -90,11 +97,12 @@ class Console {
       if (onError) stream.removeListener('error', onError);
     }
   }
-  log(...args) { if (!direct(this, 1, '_stdout', args)) this._write(this._stdout, formatWithOptions(this._options(this._stdout), ...args)); }
-  info(...args) { this.log(...args); }
-  debug(...args) { this.log(...args); }
-  warn(...args) { if (!direct(this, 2, '_stderr', args)) this._write(this._stderr, formatWithOptions(this._options(this._stderr), ...args)); }
-  error(...args) { this.warn(...args); }
+  // Subscribers see the arguments before formatting and may change them.
+  log(...args) { diagnostics.publish('console.log', args); writeStdout(this, args); }
+  info(...args) { diagnostics.publish('console.info', args); writeStdout(this, args); }
+  debug(...args) { diagnostics.publish('console.debug', args); writeStdout(this, args); }
+  warn(...args) { diagnostics.publish('console.warn', args); writeStderr(this, args); }
+  error(...args) { diagnostics.publish('console.error', args); writeStderr(this, args); }
   dir(object, options) { this._write(this._stdout, inspect(object, Object.assign({}, this._options(this._stdout), { customInspect: false }, options))); }
   dirxml(...args) { this.log(...args); }
   assert(value, ...args) { if (!value) this.warn(args.length ? 'Assertion failed: ' + formatWithOptions(this._options(this._stderr), ...args) : 'Assertion failed'); }
