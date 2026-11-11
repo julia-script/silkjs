@@ -51,13 +51,15 @@ function usage(operation, previous) {
       if (typeof value !== 'number' || !(value >= 0 && value <= Number.MAX_SAFE_INTEGER)) {
         if (key === 'user' && (typeof previous !== 'object' || Array.isArray(previous))) throw invalid('prevValue', 'object', previous);
         if (typeof value !== 'number') throw invalid(`prevValue.${key}`, 'number', value);
-        throw Object.assign(new RangeError(`The property 'prevValue.${key}' must be a non-negative number not exceeding Number.MAX_SAFE_INTEGER. Received ${value}`), { code: 'ERR_INVALID_ARG_VALUE' });
+        throw Object.assign(new RangeError(`The property 'prevValue.${key}' is invalid. Received ${value}`), { code: 'ERR_INVALID_ARG_VALUE' });
       }
     }
   }
   const result = native(operation);
   return { user: result[0] - (previous ? previous.user : 0), system: result[1] - (previous ? previous.system : 0) };
 }
+const requestKinds = { FSReqCallback: class FSReqCallback {}, FSReqPromise: class FSReqPromise {} };
+
 function install(process) {
   // Do not replace bootstrap's EventEmitter, scheduling, hrtime, stdio, argv,
   // environment, exit machinery or runtime version metadata.
@@ -92,8 +94,9 @@ function install(process) {
     validateId(extraGroup, 'extraGroup');
     // Looking up a name first also detects a nonexistent user on systems where
     // initgroups itself would otherwise succeed with only the extra group.
-    const uid = resolve(user, false);
+    // Node looks the group up before passing a user name to initgroups.
     const gid = resolve(extraGroup, true);
+    const uid = resolve(user, false);
     try { native('initgroups', [uid, gid]); }
     catch (error) {
       if (error.syscall === 'uv_os_get_passwd2' && (error.code === 'ENOENT' || error.code === 'ESRCH')) throw unknown(user, false);
@@ -144,6 +147,16 @@ function install(process) {
     if (typeof fn === 'function') call(fn, value);
   };
   process.getActiveResourcesInfo = function getActiveResourcesInfo() { return host.activeResources(); };
+  process._getActiveHandles = function _getActiveHandles() {
+    return require('internal/net/transport').activeOwners();
+  };
+  process._getActiveRequests = function _getActiveRequests() {
+    // The native requests stay native; each pending one is listed by its kind.
+    const requests = [];
+    for (const name of host.activeResources())
+      if (name === 'FSReqCallback' || name === 'FSReqPromise') requests.push(new requestKinds[name]());
+    return requests;
+  };
   Object.defineProperty(process, 'finalization', {
     configurable: true, enumerable: true,
     get() {

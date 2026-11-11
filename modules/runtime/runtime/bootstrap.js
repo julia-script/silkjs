@@ -153,17 +153,21 @@ host.initializeRealmBuiltins = (handle, global, wasmCodeGeneration) => {
     value: load('internal/web/wasm').WebAssembly, writable: true, configurable: true,
   });
 };
-const errnoNames = new Map();
+const errnoNames = new Map(), errnoMessages = new Map();
 {
   // QuickJS's std.Error exposes only a subset of POSIX errno constants.
   // Reuse the complete platform libuv table also used by node:util.
   const errors = native.utilErrorMap();
-  for (let index = 0; index < errors.length; index += 3)
+  for (let index = 0; index < errors.length; index += 3) {
     errnoNames.set(-errors[index], errors[index + 1]);
+    errnoMessages.set(-errors[index], errors[index + 2]);
+  }
 }
 function systemError(errno, syscall, path, dest) {
   const number = Math.abs(errno), code = errnoNames.get(number) || 'UNKNOWN';
-  const error = new Error(code + ': ' + rawStd.strerror(number) + ', ' + syscall + (path === undefined ? '' : " '" + path + "'"));
+  const message = errnoMessages.get(number) || rawStd.strerror(number);
+  const error = new Error(code + ': ' + message + ', ' + syscall + (path === undefined ? '' : " '" + path + "'") +
+    (dest === undefined ? '' : " -> '" + dest + "'"));
   Object.assign(error, { errno: -number, code, syscall });
   if (path !== undefined) error.path = path;
   if (dest !== undefined) error.dest = dest;
@@ -571,7 +575,13 @@ Object.assign(process, {
     sourceUrl: `https://nodejs.org/download/release/v${nodeVersion}/node-v${nodeVersion}.tar.gz`,
     headersUrl: `https://nodejs.org/download/release/v${nodeVersion}/node-v${nodeVersion}-headers.tar.gz`,
   }, stdout: host.stdout, stderr: host.stderr,
-  cwd: host.cwd, chdir(path) { const code = rawOS.chdir(path); if (code < 0) throw systemError(code, 'chdir', path); },
+  cwd: host.cwd,
+  chdir(directory) {
+    internalRequire('internal/validators').validateString(directory, 'directory');
+    const code = rawOS.chdir(directory);
+    // Node reports the directory it was in as the path and the target as dest.
+    if (code < 0) throw systemError(code, 'chdir', host.cwd(), directory);
+  },
   nextTick: host.nextTick, uptime: () => (native.now() - startTime) / 1000,
   hrtime(previous) { const nanoseconds = native.nowNanoseconds(); const value = [Number(nanoseconds / 1000000000n), Number(nanoseconds % 1000000000n)]; if (previous !== undefined) { if (!Array.isArray(previous)) throw Object.assign(new TypeError('The time argument must be an Array'), { code: 'ERR_INVALID_ARG_TYPE' }); if (previous.length !== 2) throw Object.assign(new RangeError('The time argument must contain two entries'), { code: 'ERR_OUT_OF_RANGE' }); value[0] -= previous[0]; value[1] -= previous[1]; if (value[1] < 0) { value[0]--; value[1] += 1000000000; } } return value; },
   emitWarning: internalRequire('internal/startup_controls').emitWarning,
@@ -797,6 +807,13 @@ const loader = internalRequire('internal/loader/loader').createLoader(host, publ
 host.loader = loader;
 host.vmCreateDefaultImporter = filename =>
   native.compileFunction('(specifier, attributes) => import(specifier, { with: attributes })', filename);
+let builtinRequire;
+process.getBuiltinModule = function getBuiltinModule(id) {
+  internalRequire('internal/validators').validateString(id, 'id');
+  if (!loader.Module.isBuiltin(id)) return undefined;
+  builtinRequire ||= loader.requireFor('/[builtin]', undefined, false);
+  return builtinRequire(id);
+};
 process.loadEnvFile = function loadEnvFile(path = undefined) { return internalRequire('internal/dotenv').loadEnvFile(path); };
 if (workerThreads.isMainThread && process.env.NODE_UNIQUE_ID !== undefined) internalRequire('cluster');
 Object.defineProperty(globalThis, '__silkModuleBridge', { value: loader.bridge });
