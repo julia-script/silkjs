@@ -12,7 +12,7 @@ import silk.num.i64
 import silk.num.u32
 import silk.num.u64
 import js_heap { HeapCell, HeapHeader }
-import js_value { ValueBits }
+import js_value { ValueBits, fitsShortBigInt }
 import js_owned_value { Value }
 import js_bigint { BigInt, BigIntView, BigIntError, Bitwise, ShortLimbs, Int128 }
 import js_bigint_coercions as bigint
@@ -51,18 +51,63 @@ fn bits(value: i32) -> u32 {
 // The high limb pair of a 128-bit sign extension of value.
 fn extension(value: i64) -> u64 { if value < 0 { return 0xffffffffffffffff } return 0 }
 // A BigInt that fits 128 bits as two's complement words; false when it is wider.
+@inlineAlways
 unsafe fn wide128(value: ValueBits, out: &mut Int128) -> bool {
   match value {
     ValueBits.ShortBigInt { value: x } => { out.* = Int128 { low: i64.wrappingToU64(x), high: extension(x) } return true }
     ValueBits.BigInt { reference } => {
       let anchor = () let big = unsafe HeapCell.shortPayload<BigInt, ()>(&anchor, reference)
-      if big.length() > 4 { return false }
-      out.* = big.low128() return true
+      return big.small128(&mut out)
     }
     _ => { return false }
   }
 }
+// A BigInt that fits 64 bits as two's complement; false when it is wider.
+@inlineAlways
+unsafe fn wide64(value: ValueBits, out: &mut i64) -> bool {
+  let mut wide = Int128 { low: 0, high: 0 }
+  if !unsafe wide128(value, &mut wide) { return false }
+  let low = u64.wrappingToI64(wide.low)
+  if wide.high != extension(low) { return false }
+  out.* = low
+  return true
+}
+// x * y in 128-bit two's complement (always exact).
+@inlineAlways
+fn product128(x: i64, y: i64) -> Int128 {
+  return Int128 { low: i64.wrappingToU64(i64.wrappingMultiply(x, y)), high: i64.wrappingToU64(i64.multiplyHigh(x, y)) }
+}
+// -value in 128-bit two's complement (wraps only for -2^127).
+@inlineAlways
+fn negate128(value: Int128) -> Int128 {
+  let low = u64.wrappingAdd(value.low ^ 0xffffffffffffffff, 1)
+  let mut high = value.high ^ 0xffffffffffffffff
+  if low == 0 { high = u64.wrappingAdd(high, 1) }
+  return Int128 { low: low, high: high }
+}
+// Whether value is in the ShortBigInt range (so it must not live in a heap cell).
+@inlineAlways
+fn short128(value: Int128) -> bool {
+  let low = u64.wrappingToI64(value.low)
+  return value.high == extension(low) && fitsShortBigInt(low)
+}
+// left + right, left - right or left * right on machine words when the
+// operands and the result fit 128 bits (products: operands of 64 bits); false
+// leaves out unspecified and the limb kernels take over.
+@inlineAlways
+unsafe fn wordArithmetic(left: ValueBits, right: ValueBits, subtract: bool, multiply: bool, out: &mut Int128) -> bool {
+  if multiply {
+    let mut x: i64 = 0 let mut y: i64 = 0
+    if !unsafe wide64(left, &mut x) || !unsafe wide64(right, &mut y) { return false }
+    out.* = product128(x, y)
+    return true
+  }
+  let mut a = Int128 { low: 0, high: 0 } let mut b = Int128 { low: 0, high: 0 }
+  if !unsafe wide128(left, &mut a) || !unsafe wide128(right, &mut b) { return false }
+  return sum128(a, b, subtract, &mut out)
+}
 // a + b (or a - b) in 128-bit two's complement; false when the result needs more bits.
+@inlineAlways
 fn sum128(a: Int128, b: Int128, subtract: bool, out: &mut Int128) -> bool {
   let mut low: u64 = 0 let mut high: u64 = 0
   if subtract {
@@ -104,6 +149,14 @@ unsafe effect fn view<'a>(anchor: &'a (), storage: &'a ShortLimbs, value: ValueB
 pub unsafe effect fn smallBigArithmetic(left: ValueBits, right: ValueBits, subtract: bool, multiply: bool) -> ValueBits
   ! OutOfMemoryError ? &mut Allocator {
   if !left.isBigInt() || !right.isBigInt() { return ValueBits.Undefined }
+  let mut wide = Int128 { low: 0, high: 0 }
+  if unsafe wordArithmetic(left, right, subtract, multiply, &mut wide) { return run bigint.compact128(wide) }
+  return run unsafe limbArithmetic(left, right, subtract, multiply)
+}
+// smallBigArithmetic past the machine-word results: the limb kernels in stack scratch.
+@inlineNever
+unsafe effect fn limbArithmetic(left: ValueBits, right: ValueBits, subtract: bool, multiply: bool) -> ValueBits
+  ! OutOfMemoryError ? &mut Allocator {
   let anchor = ()
   let leftStorage = shortLimbs(left)
   let rightStorage = shortLimbs(right)
@@ -125,6 +178,21 @@ pub unsafe fn smallBigInPlace(left: ValueBits, right: ValueBits, subtract: bool,
   let unique = header.referenceCount == holders
   drop header
   if !unique { return ValueBits.Undefined }
+  // Operands and a result of machine words: no limb loop and no scratch.
+  let mut wide = Int128 { low: 0, high: 0 }
+  if unsafe wordArithmetic(left, right, subtract, multiply, &mut wide) {
+    if short128(wide) { return ValueBits.Undefined }
+    let mut token = ()
+    let target = unsafe HeapCell.shortPayloadMut<BigInt, ()>(&mut token, reference)
+    if target.store128(wide) { return left }
+    return ValueBits.Undefined
+  }
+  return unsafe limbsInPlace(reference, left, right, subtract, multiply)
+}
+// smallBigInPlace past the machine-word results, for a uniquely held left.
+@inlineNever
+unsafe fn limbsInPlace(reference: *mut HeapHeader, left: ValueBits, right: ValueBits, subtract: bool, multiply: bool) -> ValueBits {
+  let anchor = ()
   // x += y with a short y: the carry rarely runs past y's limbs.
   if !multiply {
     if let ValueBits.ShortBigInt { value } = right {
@@ -164,6 +232,28 @@ pub unsafe fn multiplyAccumulateInPlace(sum: ValueBits, left: ValueBits, right: 
   let unique = header.referenceCount == holders
   drop header
   if !unique { return ValueBits.Undefined }
+  // Factors of one machine word each and a 128-bit sum: no limb loop and no scratch.
+  let mut x: i64 = 0 let mut y: i64 = 0
+  if unsafe wide64(left, &mut x) && unsafe wide64(right, &mut y) {
+    let mut total = Int128 { low: 0, high: 0 }
+    let mut product = product128(x, y)
+    // |x * y| <= 2^126, so the negation is exact.
+    if subtract { product = negate128(product) }
+    let mut token = ()
+    let target = unsafe HeapCell.shortPayloadMut<BigInt, ()>(&mut token, reference)
+    let mut held = Int128 { low: 0, high: 0 }
+    if target.small128(&mut held) && sum128(held, product, false, &mut total) {
+      if short128(total) { return ValueBits.Undefined }
+      if target.store128(total) { return sum }
+      return ValueBits.Undefined
+    }
+  }
+  return unsafe limbsAccumulateInPlace(reference, sum, left, right, subtract)
+}
+// multiplyAccumulateInPlace past the machine-word results, for a uniquely held sum.
+@inlineNever
+unsafe fn limbsAccumulateInPlace(reference: *mut HeapHeader, sum: ValueBits, left: ValueBits, right: ValueBits, subtract: bool) -> ValueBits {
+  let anchor = ()
   let leftStorage = shortLimbs(left)
   let rightStorage = shortLimbs(right)
   let a = unsafe smallLimbs(&anchor, &leftStorage, left)
