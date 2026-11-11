@@ -59,6 +59,16 @@ REPLACEMENTS = {
     'set_var_ref1': ('or_imm', 3, 1, 1, 'i16'),
     'set_var_ref2': ('put_loc_field_loc8', 7, 0, 0, 'atom_u16'),
     'set_var_ref3': ('put_loc_field_arg8', 7, 0, 0, 'atom_u16'),
+    # push_2 to push_7 are emitted as push_i8; their numbers hold add, sub and
+    # mul with local operands read in place: both operands (get_loc8 a,
+    # get_loc8 b, then the operator), or the right one alone (get_loc8 b, then
+    # the operator on the top value).
+    'push_2': ('add_loc_loc8', 3, 0, 1, 'u16'),
+    'push_3': ('sub_loc_loc8', 3, 0, 1, 'u16'),
+    'push_4': ('mul_loc_loc8', 3, 0, 1, 'u16'),
+    'push_5': ('add_top_loc8', 2, 1, 1, 'loc8'),
+    'push_6': ('sub_top_loc8', 2, 1, 1, 'loc8'),
+    'push_7': ('mul_top_loc8', 2, 1, 1, 'loc8'),
 }
 
 
