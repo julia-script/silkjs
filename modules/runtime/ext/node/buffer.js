@@ -98,62 +98,50 @@ const {
   utf8Write,
 } = require('internal/buffer');
 
-const ArrayBufferIsView = ArrayBuffer.isView;
-const ArrayIsArray = Array.isArray;
-const MathMin = Math.min;
-const MathTrunc = Math.trunc;
-const NumberIsInteger = Number.isInteger;
-const NumberIsNaN = Number.isNaN;
-const NumberMAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
-const NumberMIN_SAFE_INTEGER = Number.MIN_SAFE_INTEGER;
-const ObjectDefineProperties = Object.defineProperties;
-const ObjectDefineProperty = Object.defineProperty;
-const ObjectSetPrototypeOf = Object.setPrototypeOf;
-const SymbolSpecies = Symbol.species;
-const SymbolToPrimitive = Symbol.toPrimitive;
-const Uint8ArrayPrototype = Uint8Array.prototype;
-const uncurry = (fn) => Function.prototype.call.bind(fn);
-const TypedArrayPrototype = Object.getPrototypeOf(Uint8ArrayPrototype);
-const typedArrayGetter = (name) => uncurry(Object.getOwnPropertyDescriptor(TypedArrayPrototype, name).get);
-const TypedArrayPrototypeFill = uncurry(TypedArrayPrototype.fill);
-const TypedArrayPrototypeGetBuffer = typedArrayGetter('buffer');
-const TypedArrayPrototypeGetByteLength = typedArrayGetter('byteLength');
-const TypedArrayPrototypeGetByteOffset = typedArrayGetter('byteOffset');
-const TypedArrayPrototypeGetLength = typedArrayGetter('length');
-const TypedArrayPrototypeSet = uncurry(TypedArrayPrototype.set);
-const TypedArrayPrototypeSubarray = uncurry(TypedArrayPrototype.subarray);
-const ObjectPrototypeHasOwnProperty = uncurry(Object.prototype.hasOwnProperty);
-const ArrayPrototypeForEach = uncurry(Array.prototype.forEach);
-const StringPrototypeCharCodeAt = uncurry(String.prototype.charCodeAt);
-const StringPrototypeSlice = uncurry(String.prototype.slice);
-const StringPrototypeToLowerCase = uncurry(String.prototype.toLowerCase);
-const StringPrototypeTrim = uncurry(String.prototype.trim);
-const RegExpPrototypeSymbolReplace = uncurry(RegExp.prototype[Symbol.replace]);
+const {
+  ArrayBufferIsView,
+  ArrayIsArray,
+  ArrayPrototypeForEach,
+  MathMin,
+  MathTrunc,
+  NumberIsInteger,
+  NumberIsNaN,
+  NumberMAX_SAFE_INTEGER,
+  NumberMIN_SAFE_INTEGER,
+  ObjectDefineProperties,
+  ObjectDefineProperty,
+  ObjectPrototypeHasOwnProperty,
+  ObjectSetPrototypeOf,
+  RegExpPrototypeSymbolReplace,
+  StringPrototypeCharCodeAt,
+  StringPrototypeSlice,
+  StringPrototypeToLowerCase,
+  StringPrototypeTrim,
+  SymbolSpecies,
+  SymbolToPrimitive,
+  Uint8ArrayPrototype,
+  TypedArrayPrototype,
+  TypedArrayPrototypeFill,
+  TypedArrayPrototypeGetBuffer,
+  TypedArrayPrototypeGetByteLength,
+  TypedArrayPrototypeGetByteOffset,
+  TypedArrayPrototypeGetLength,
+  TypedArrayPrototypeSet,
+  TypedArrayPrototypeSubarray,
+} = require('internal/per_context/primordials');
 
 // getOwnNonIndexProperties from internalBinding('util').
-const ALL_PROPERTIES = 0;
-const ONLY_ENUMERABLE = 2;
-function getOwnNonIndexProperties(object, filter) {
-  const keys = [];
-  for (const key of Reflect.ownKeys(object)) {
-    if (typeof key === 'string' && key !== '' && String(key >>> 0) === key && (key >>> 0) !== 0xffffffff) continue;
-    if (filter === ONLY_ENUMERABLE && !Object.prototype.propertyIsEnumerable.call(object, key)) continue;
-    keys.push(key);
-  }
-  return keys;
-}
-// isInsideNodeModules from internalBinding('util'): whether the first call
-// site outside the runtime's own code is in a node_modules directory.
-function isInsideNodeModules() {
-  const caller = host.captureCallSites(1, Buffer)[0];
-  return caller !== undefined && /[\\/]node_modules[\\/]/.test(caller.scriptName);
-}
-function utilInspect(value, options) {
-  return require('internal/util_inspect').inspect(value, options);
-}
-function lazyDOMException(message, name) {
-  const { DOMException } = require('internal/path_events/event_target');
-  return new DOMException(message, name);
+const {
+  ALL_PROPERTIES,
+  ONLY_ENUMERABLE,
+  getOwnNonIndexProperties,
+} = require('internal/util/binding');
+const { isInsideNodeModules } = require('internal/inside_node_modules');
+const { lazyDOMException } = require('internal/util');
+let utilInspect;
+function lazyUtilInspect(value, options) {
+  utilInspect ??= require('internal/util/inspect').inspect;
+  return utilInspect(value, options);
 }
 
 FastBuffer.prototype.constructor = Buffer;
@@ -204,7 +192,7 @@ const bufferWarning = 'Buffer() is deprecated due to security and usability ' +
 function showFlaggedDeprecation() {
   if (bufferWarningAlreadyEmitted ||
       ++nodeModulesCheckCounter > 10000 ||
-      (!host.pendingDeprecation && isInsideNodeModules())) {
+      (!host.pendingDeprecation && isInsideNodeModules(100, true))) {
     // We don't emit a warning, because we either:
     // - Already did so, or
     // - Already checked too many times whether a call is coming
@@ -980,7 +968,7 @@ Buffer.prototype[customInspectSymbol] = function inspect(recurseTimes, ctx) {
         str += ', ';
       // '[Object: null prototype] {'.length === 26
       // This is guarded with a test.
-      str += StringPrototypeSlice(utilInspect(obj, {
+      str += StringPrototypeSlice(lazyUtilInspect(obj, {
         ...ctx,
         breakLength: Infinity,
         compact: true,
