@@ -35,8 +35,9 @@ function fromToken(token) {
 }
 function list() {
   const result = [main];
-  for (const [id, reference] of contexts) {
-    const sandbox = reference.deref();
+  // Entries are read by index: user code may have replaced the array iterator.
+  for (const entry of contexts) {
+    const id = entry[0], sandbox = entry[1].deref();
     if (sandbox) result.push(bySandbox.get(sandbox));
     else contexts.delete(id);
   }

@@ -107,7 +107,7 @@ function drainDestroy() {
   if (pendingDestroy.length === 0) return;
   const pending = pendingDestroy;
   pendingDestroy = [];
-  for (const state of pending) emit('destroy', [state.id], state.promise);
+  for (let index = 0; index < pending.length; index++) emit('destroy', [pending[index].id], pending[index].promise);
 }
 
 class AsyncHook {

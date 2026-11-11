@@ -31,8 +31,13 @@ const { validateArray, validateInteger, validateObject, validateOneOf } = requir
 const { channel } = require('diagnostics_channel');
 // The formatter loads with the first value that needs it: text alone does not.
 let util;
-const formatWithOptions = (...args) => (util ||= require('util')).formatWithOptions(...args);
-const inspect = (...args) => (util ||= require('util')).inspect(...args);
+// Calls take their arguments with Reflect.apply, not spread: user code may have
+// replaced the array iterator.
+const ReflectApply = Reflect.apply;
+const arrayConcat = Array.prototype.concat;
+const ArrayPrototypeConcat = (array, items) => ReflectApply(arrayConcat, array, [items]);
+const formatWithOptions = (...args) => ReflectApply((util ||= require('util')).formatWithOptions, undefined, args);
+const inspect = (...args) => ReflectApply((util ||= require('util')).inspect, undefined, args);
 let width;
 const getStringWidth = text => (width ||= require('internal/readline/width')).getStringWidth(text);
 const inspectorConsole = require('internal/inspector_console');
@@ -239,14 +244,15 @@ Object.defineProperties(Console.prototype, {
     ...consolePropAttributes,
     value(args) {
       if (args.length === 1 && typeof args[0] === 'string') return args[0];
-      return formatWithOptions(this[kGetInspectOptions](this._stdout), ...args);
+      // Not spread: user code may have replaced the array iterator.
+      return ReflectApply(formatWithOptions, undefined, ArrayPrototypeConcat([this[kGetInspectOptions](this._stdout)], args));
     },
   },
   [kFormatForStderr]: {
     ...consolePropAttributes,
     value(args) {
       if (args.length === 1 && typeof args[0] === 'string') return args[0];
-      return formatWithOptions(this[kGetInspectOptions](this._stderr), ...args);
+      return ReflectApply(formatWithOptions, undefined, ArrayPrototypeConcat([this[kGetInspectOptions](this._stderr)], args));
     },
   },
 });

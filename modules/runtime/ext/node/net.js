@@ -127,7 +127,7 @@ function Socket(options) {
     validateInt32(options.fd, 'fd', 0);
     const kind = native('guessHandleType', [options.fd]);
     if (kind !== 1 && kind !== 2) throw nativeError(kind < 0 ? kind : -22, 'open');
-    const transport = new Transport(kind, this, (...args) => this._onNative(...args));
+    const transport = new Transport(kind, this, (type, status, payload, extra) => this._onNative(type, status, payload, extra));
     const status = transport.call('open', options.fd);
     if (status < 0) { transport.close(); throw nativeError(status, 'open'); }
     this._attachTransport(transport);
@@ -157,7 +157,7 @@ Object.setPrototypeOf(Socket, Duplex);
 Socket.prototype._attachTransport = function(transport) {
   this._transport = transport;
   transport.owner = this;
-  transport.onEvent = (...args) => this._onNative(...args);
+  transport.onEvent = (type, status, payload, extra) => this._onNative(type, status, payload, extra);
   if (this._unrefed) transport.unref();
 };
 Socket.prototype._cacheAddresses = function() {
@@ -660,7 +660,7 @@ Server.prototype._onNative = function(type, status, id) {
   if (type !== 2) return;
   if (status < 0) { this.emit('error', nativeError(status, 'accept')); return; }
   const socket = new Socket({ ...this._options, allowHalfOpen: this.allowHalfOpen, signal: undefined });
-  try { socket._attachTransport(new Transport(this._transport.kind, socket, (...args) => socket._onNative(...args), id)); }
+  try { socket._attachTransport(new Transport(this._transport.kind, socket, (type, status, payload, extra) => socket._onNative(type, status, payload, extra), id)); }
   catch (err) { this.emit('error', err); return; }
   socket._connected = true;
   socket._cacheAddresses();

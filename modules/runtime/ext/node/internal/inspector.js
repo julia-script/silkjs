@@ -31,8 +31,11 @@ function evaluation(session, result, params) {
     if (params.awaitPromise) return Promise.resolve(result.value).then(value => ({ result: session.values.remote(value, params.objectGroup, !!params.returnByValue, !!params.generatePreview, params._context) }), value => evaluation(session, { status: 'exception', value }, { ...params, awaitPromise: false }));
     return { result: session.values.remote(result.value, params.objectGroup, !!params.returnByValue, !!params.generatePreview, params._context) };
   }
-  const exception = result.status === 'sideEffect' ? new EvalError('Possible side-effect in debug-evaluate') : result.status === 'terminated' || result.status === 'timeout' ? new Error('Execution was terminated') : result.value;
-  const remote = session.values.remote(exception, params.objectGroup);
+  // V8 answers a terminated evaluation with an error response, not an exception.
+  if (result.status === 'terminated' || result.status === 'timeout') throw protocolError(-32000, 'Execution was terminated');
+  const exception = result.status === 'sideEffect' ? new EvalError('Possible side-effect in debug-evaluate') : result.value;
+  // The exception belongs to the context that threw it, as the value of a success would.
+  const remote = session.values.remote(exception, params.objectGroup, false, !!params.generatePreview, params._context);
   return { result: remote, exceptionDetails: { exceptionId: nextException++, text: 'Uncaught', lineNumber: 0, columnNumber: 0, exception: remote } };
 }
 function validateEvaluation(params, method) {

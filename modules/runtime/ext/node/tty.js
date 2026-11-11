@@ -16,7 +16,7 @@ function initialize(stream, fd, options) {
   const owned = native('duplicateFd', [fd]);
   if (owned < 0) throw Object.assign(nativeError(owned, 'uv_tty_init'), { code: 'ERR_TTY_INIT_FAILED' });
   let transport;
-  try { transport = new Transport(5, stream, (...args) => stream._onNative(...args), undefined, owned); }
+  try { transport = new Transport(5, stream, (type, status, payload, extra) => stream._onNative(type, status, payload, extra), undefined, owned); }
   catch (cause) {
     fs.closeSync(owned);
     throw Object.assign(new Error(`TTY initialization failed: ${cause.message}`), { code: 'ERR_TTY_INIT_FAILED', cause });

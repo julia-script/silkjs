@@ -144,12 +144,12 @@ process.setUncaughtExceptionCaptureCallback = function() {
 // their original behavior until domains are explicitly enabled.
 EventEmitter.usingDomains = true;
 const eventInit = EventEmitter.init;
-EventEmitter.init = function(options) {
+EventEmitter.init = function init(options) {
   property(this, 'domain', exports.active && !(this instanceof Domain) ? exports.active : null);
   return eventInit.call(this, options);
 };
 const eventEmit = EventEmitter.prototype.emit;
-EventEmitter.prototype.emit = function(type, ...args) {
+EventEmitter.prototype.emit = function emit(type, ...args) {
   const domain = this.domain;
   if ((type === 'error' && this.listenerCount(type)) || !domain || this === process)
     return Reflect.apply(eventEmit, this, arguments);

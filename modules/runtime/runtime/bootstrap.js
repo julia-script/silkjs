@@ -368,9 +368,11 @@ function checkpoint() {
       completion();
     }
     while (rejections.size) {
-      const pending = [...rejections];
-      for (const [promise, info] of pending) {
+      const pending = Array.from(rejections.keys());
+      for (let index = 0; index < pending.length; index++) {
+        const promise = pending[index];
         if (!rejections.has(promise)) continue;
+        const info = rejections.get(promise);
         const { context } = info;
         rejections.delete(promise);
         reportedRejections.set(promise, info);
@@ -1527,15 +1529,20 @@ function loopTurn(pendingPromise) {
   if (timers.size !== 0) for (const timer of timers.values()) if (!timer._destroyed && timer[kDue] <= now) (due ||= []).push(timer);
   if (due !== undefined) {
     if (due.length > 1) due.sort((a, b) => a[kDue] - b[kDue] || a[kTimerId] - b[kTimerId]);
-    for (const timer of due) if (!timer._destroyed && timer[kDue] <= now && timers.has(timer[kTimerId])) fireTimeout(timer, now);
+    // Index loops over arrays here: user code may replace Array.prototype[Symbol.iterator].
+    for (let index = 0; index < due.length; index++) {
+      const timer = due[index];
+      if (!timer._destroyed && timer[kDue] <= now && timers.has(timer[kTimerId])) fireTimeout(timer, now);
+    }
   }
   native.pollIO(pollTimeout(pendingPromise));
   pollWorkers();
   checkpoint();
   if (loopListeners.size !== 0) for (const listener of loopListeners) listener();
   if (immediates.size !== 0) {
-    for (const immediate of [...immediates.values()]) {
-      if (!immediate._destroyed) fireImmediate(immediate);
+    const pending = Array.from(immediates.values());
+    for (let index = 0; index < pending.length; index++) {
+      if (!pending[index]._destroyed) fireImmediate(pending[index]);
     }
   }
 }

@@ -101,10 +101,11 @@ function sliceRange(view, start, end) {
   return [s, e];
 }
 
-// Slices.
+// Slices. Results are read by index, not destructured: user code may have
+// replaced Array.prototype[Symbol.iterator].
 function codecSlice(operation, view, start, end) {
   const source = viewBytes(view);
-  const [s, e] = sliceRange(source, start, end);
+  const range = sliceRange(source, start, end), s = range[0], e = range[1];
   if (s === e) return '';
   const units = operation === 4 ? (e - s) >>> 1 : e - s;
   if (operation !== 3 && units > kStringMaxLength) throw new ERR_STRING_TOO_LONG();
@@ -127,7 +128,7 @@ const hexTable = [];
 for (let i = 0; i < 256; i++) hexTable.push(hexDigits[i >>> 4] + hexDigits[i & 15]);
 function hexSlice(view, start, end) {
   const source = viewBytes(view);
-  const [s, e] = sliceRange(source, start, end);
+  const range = sliceRange(source, start, end), s = range[0], e = range[1];
   if ((e - s) * 2 > kStringMaxLength) throw new ERR_STRING_TOO_LONG();
   let result = '';
   for (let i = s; i < e; i++) result += hexTable[source[i]];
@@ -150,7 +151,7 @@ function base64Encode(source, s, e, url) {
 }
 function base64SliceWith(view, start, end, url) {
   const source = viewBytes(view);
-  const [s, e] = sliceRange(source, start, end);
+  const range = sliceRange(source, start, end), s = range[0], e = range[1];
   if (Math.ceil((e - s) / 3) * 4 > kStringMaxLength) throw new ERR_STRING_TOO_LONG();
   return base64Encode(source, s, e, url);
 }
@@ -211,7 +212,7 @@ function stringWriteArgs(view, string, offset, length) {
 }
 function stringWrite(kind) {
   return function(view, string, offset, length) {
-    const [target, start, max] = stringWriteArgs(view, string, offset, length);
+    const args = stringWriteArgs(view, string, offset, length), target = args[0], start = args[1], max = args[2];
     if (max === 0) return 0;
     if (kind === 'hex') return hexDecode(string, target, start, max);
     if (kind === 'base64') return base64Decode(string, target, start, max);

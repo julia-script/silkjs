@@ -99,7 +99,7 @@ function onmessage(message, handle) {
     handle._transport = null; handle._listening = false;
     server._transport = transport;
     if (server.domain) require('domain')._associateResource(transport.resource, server.domain);
-    transport.onEvent = (...args) => server._onNative(...args);
+    transport.onEvent = (type, status, payload, extra) => server._onNative(type, status, payload, extra);
     const close = transport.close.bind(transport);
     let released = false;
     transport.close = (...args) => {

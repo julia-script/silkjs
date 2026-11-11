@@ -200,7 +200,9 @@ function install(global) {
     if (raw === undefined) return undefined;
     const frames = [];
     for (let index = 0; index < raw.length; index++) frames[index] = fromNative(raw[index]);
-    for (const frame of frames) {
+    // Index loops: user code may have replaced Array.prototype[Symbol.iterator].
+    for (let index = 0; index < frames.length; index++) {
+      const frame = frames[index];
       if (frame.isNative || !(frame.lineNumber > 0) || !frame.scriptName) continue;
       if (typeof error === 'object' && error !== null) origins.set(error, frame);
       break;
