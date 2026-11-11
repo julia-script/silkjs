@@ -49,7 +49,8 @@ COMMON = [
     ("internalBinding('pipe_wrap')", "require('internal/net/binding').pipe_wrap"),
     ("internalBinding('stream_wrap')", "require('internal/net/binding').stream_wrap"),
     ("internalBinding('tty_wrap')", "require('internal/net/binding').tty_wrap"),
-    ("internalBinding('uv')", "require('internal/net/binding').uv"),
+    ("internalBinding('uv')", "require('internal/uv_binding')"),
+    ("internalBinding('js_stream')", "require('internal/net/binding').js_stream"),
     ("require('internal/util/debuglog').debuglog", "require('util').debuglog"),
     ("require('internal/events/abort_listener')", "require('events')"),
     ("require('internal/util/types')", "require('util').types"),
@@ -240,6 +241,8 @@ def main():
         'lib/internal/cluster/utils.js': 'internal/cluster/utils.js',
         'lib/internal/cluster/worker.js': 'internal/cluster/worker.js',
         'lib/internal/linkedlist.js': 'internal/linkedlist.js',
+        'lib/internal/js_stream_socket.js': 'internal/js_stream_socket.js',
+        'lib/_stream_wrap.js': '_stream_wrap.js',
     }
     for rel, dest in targets.items():
         path = os.path.join(out, dest)
