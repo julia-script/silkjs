@@ -365,22 +365,24 @@ function readInto(path, finish) {
   const fd = rawOS.open(path, rawOS.O_RDONLY);
   if (fd < 0) throw systemError(-fd, 'open', path);
   if (readBuffer === undefined) readBuffer = new Uint8Array(65536);
+  // held bytes of readBuffer are read; a full buffer is copied out to chunks.
   let chunks = null, size = 0, held = 0;
   try {
     while (true) {
-      if (held !== 0) { chunks = [readBuffer.slice(0, held)]; held = 0; }
-      const count = rawOS.read(fd, readBuffer.buffer, 0, readBuffer.length);
+      if (held === readBuffer.length) { (chunks ??= []).push(readBuffer.slice()); held = 0; }
+      const count = rawOS.read(fd, readBuffer.buffer, held, readBuffer.length - held);
       if (count < 0) {
         if (count === -4) continue; // EINTR
         throw systemError(-count, 'read', path);
       }
       if (count === 0) break;
-      if (chunks !== null) chunks.push(readBuffer.slice(0, count));
-      else held = count;
+      held += count;
       size += count;
     }
   } finally { rawOS.close(fd); }
-  return finish(chunks === null ? Buffer.from(readBuffer.buffer, 0, held) : Buffer.concat(chunks, size));
+  if (chunks === null) return finish(Buffer.from(readBuffer.buffer, 0, held));
+  if (held !== 0) chunks.push(readBuffer.slice(0, held));
+  return finish(Buffer.concat(chunks, size));
 }
 const copyBytes = bytes => bytes.buffer === readBuffer.buffer ? Buffer.from(bytes) : bytes;
 const decodeBytes = bytes => bytes.toString('utf8');
