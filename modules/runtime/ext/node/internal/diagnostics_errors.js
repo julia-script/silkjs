@@ -1,7 +1,8 @@
 'use strict';
 
-// Node-format error messages for the codes that builtin modules raise. Messages follow
+// Node-format errors for diagnostics_channel, perf_hooks, permission and v8. Messages follow
 // lib/internal/errors.js of Node 24 word for word, because tests and user code match them.
+// Private to these modules until the shared port of Node's internal/errors lands.
 
 const kTypes = ['string', 'function', 'number', 'object', 'Function', 'Object', 'boolean', 'bigint', 'symbol'];
 const classRegExp = /^[A-Z][a-zA-Z0-9]*$/;
@@ -151,23 +152,4 @@ const codes = {
   ERR_ILLEGAL_CONSTRUCTOR: () => make(TypeError, 'ERR_ILLEGAL_CONSTRUCTOR', 'Illegal constructor'),
 };
 
-function validateFunction(value, name) {
-  if (typeof value !== 'function') throw codes.ERR_INVALID_ARG_TYPE(name, 'Function', value);
-}
-function validateString(value, name) {
-  if (typeof value !== 'string') throw codes.ERR_INVALID_ARG_TYPE(name, 'string', value);
-}
-function validateObject(value, name, { allowArray = false, allowFunction = false, nullable = false } = {}) {
-  if ((!nullable && value === null) || (!allowArray && Array.isArray(value)) ||
-      (typeof value !== 'object' && (!allowFunction || typeof value !== 'function'))) {
-    throw codes.ERR_INVALID_ARG_TYPE(name, 'Object', value);
-  }
-}
-function validateBoolean(value, name) {
-  if (typeof value !== 'boolean') throw codes.ERR_INVALID_ARG_TYPE(name, 'boolean', value);
-}
-
-module.exports = {
-  codes, determineSpecificType, formatList,
-  validateFunction, validateString, validateObject, validateBoolean,
-};
+module.exports = { codes, determineSpecificType, formatList };

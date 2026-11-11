@@ -17,7 +17,7 @@ function object(value, name) {
     throw error('ERR_INVALID_ARG_TYPE', `The "${name}" argument must be an object`, TypeError);
 }
 function string(value, name) {
-  if (typeof value !== 'string') throw require('internal/errors').codes.ERR_INVALID_ARG_TYPE(name, 'string', value);
+  if (typeof value !== 'string') throw require('internal/diagnostics_errors').codes.ERR_INVALID_ARG_TYPE(name, 'string', value);
 }
 function snapshotOptions(options = {}) {
   object(options, 'options');

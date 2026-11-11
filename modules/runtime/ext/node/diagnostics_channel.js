@@ -5,7 +5,8 @@
 // object to ActiveChannel, so publishing to an unobserved channel is one empty call.
 
 const trace = require('internal/trace_events');
-const { codes: { ERR_INVALID_ARG_TYPE }, validateFunction } = require('internal/errors');
+const { codes: { ERR_INVALID_ARG_TYPE } } = require('internal/diagnostics_errors');
+const { validateFunction } = require('internal/validators');
 
 function triggerUncaught(error) { process.nextTick(() => { throw error; }); }
 
