@@ -596,8 +596,8 @@ for (const [name, load] of [
   ['convertProcessSignalToExitCode', () => require('internal/util_public/system').convertProcessSignalToExitCode],
   ['debounce', () => require('internal/util_public/debounce')],
   ['throttle', () => require('internal/util_public/throttle')],
-  ['TextEncoder', () => require('internal/web/encoding').TextEncoder],
-  ['TextDecoder', () => require('internal/web/encoding').TextDecoder],
+  ['TextEncoder', () => require('internal/encoding').TextEncoder],
+  ['TextDecoder', () => require('internal/encoding').TextDecoder],
 ]) {
   const settle = value => Object.defineProperty(module.exports, name, { value, writable: true, enumerable: true, configurable: true });
   Object.defineProperty(module.exports, name, {

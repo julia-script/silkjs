@@ -2,7 +2,7 @@
 
 const { Blob, File } = require('internal/web/blob');
 const { Buffer } = require('buffer');
-const { TextDecoder } = require('internal/web/encoding');
+const { TextDecoder } = require('internal/encoding');
 const { scalar, token } = require('internal/web/fetch/headers');
 const states = new WeakMap();
 function entries(form) {

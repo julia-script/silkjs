@@ -7,7 +7,7 @@
 // WebSocket, the legacy text codecs and the other web modules a script may never
 // touch. The first read or write turns it into a plain data property.
 const groups = [
-  ['internal/web/encoding', ['TextEncoder', 'TextDecoder']],
+  ['internal/encoding', ['TextEncoder', 'TextDecoder']],
   ['internal/web/streams', ['ByteLengthQueuingStrategy', 'CountQueuingStrategy', 'ReadableByteStreamController',
     'ReadableStream', 'ReadableStreamBYOBReader', 'ReadableStreamBYOBRequest', 'ReadableStreamDefaultController',
     'ReadableStreamDefaultReader', 'TransformStream', 'TransformStreamDefaultController', 'WritableStream',
@@ -45,7 +45,7 @@ function defineLazy(target, name, load, enumerable) {
 
 // Modules every process has loaded anyway (the heap image holds them): their
 // interfaces are plain data properties from the start, as Node's are.
-const eagerGroups = new Set(['internal/web/encoding', 'internal/web/url']);
+const eagerGroups = new Set(['internal/encoding', 'internal/web/url']);
 
 function install(target) {
   for (const [id, names] of groups) {

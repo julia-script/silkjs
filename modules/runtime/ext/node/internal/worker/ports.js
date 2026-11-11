@@ -36,7 +36,7 @@ function retain(port) {
   const value = state(port);
   if (value.id === null) return;
   const listening = value.realm ? value.realm.hasListener(port) :
-    value.emitter.listenerCount('message') > 0 || !!port[kEvents].get('message')?.size;
+    value.emitter.listenerCount('message') > 0 || !!port[kEvents]?.get('message')?.size;
   if (value.refed || value.started && listening) retained.set(value.id, port);
   else retained.delete(value.id);
 }
@@ -53,7 +53,7 @@ function emit(port, type, data, ports) {
     const event = type === 'message' || type === 'messageerror' ? new MessageEvent(type, { data, ports }) : new CustomEvent(type, { detail: data });
     if (type === 'message' && data === undefined) Object.defineProperty(event, 'data', { value: undefined, enumerable: true });
     port.dispatchEvent(event);
-    if (type === 'message' && !value.emitter.listenerCount(type) && !port[kEvents].get(type)?.size) ref(port, false);
+    if (type === 'message' && !value.emitter.listenerCount(type) && !port[kEvents]?.get(type)?.size) ref(port, false);
     retain(port);
   }, port);
 }
@@ -131,16 +131,16 @@ class PortEventTarget extends EventTarget {
   addEventListener(type, listener, options) {
     super.addEventListener(type, listener, options);
     // Node's kNewListener: a message listener, of either kind, starts and refs the port.
-    if (type === 'message' && this[kEvents].get(type)?.size) { start(this); ref(this, true); }
+    if (type === 'message' && this[kEvents]?.get(type)?.size) { start(this); ref(this, true); }
     retain(this);
   }
   removeEventListener(type, listener, options) {
     super.removeEventListener(type, listener, options);
-    if (type === 'message' && !state(this).emitter.listenerCount(type) && !this[kEvents].get(type)?.size) idle(this);
+    if (type === 'message' && !state(this).emitter.listenerCount(type) && !this[kEvents]?.get(type)?.size) idle(this);
     retain(this);
   }
   emit(type, data) {
-    const handled = state(this).emitter.listenerCount(type) > 0 || !!this[kEvents].get(type)?.size;
+    const handled = state(this).emitter.listenerCount(type) > 0 || !!this[kEvents]?.get(type)?.size;
     emit(this, type, data);
     return handled;
   }
@@ -169,7 +169,7 @@ class PortEventTarget extends EventTarget {
         break;
       }
     }
-    if (type === 'message' && !value.emitter.listenerCount(type) && !this[kEvents].get('message')?.size) idle(this);
+    if (type === 'message' && !value.emitter.listenerCount(type) && !this[kEvents]?.get('message')?.size) idle(this);
     retain(this);
     return this;
   }
@@ -178,7 +178,7 @@ class PortEventTarget extends EventTarget {
     const value = state(this);
     if (arguments.length) value.emitter.removeAllListeners(type);
     else value.emitter.removeAllListeners();
-    if (!value.emitter.listenerCount('message') && !this[kEvents].get('message')?.size) idle(this);
+    if (!value.emitter.listenerCount('message') && !this[kEvents]?.get('message')?.size) idle(this);
     retain(this);
     return this;
   }
@@ -218,7 +218,7 @@ for (const type of ['message', 'messageerror']) {
       if (value.handlers[type]) {
         this.addEventListener(type, callback);
         if (type === 'message') { start(this); ref(this, true); }
-      } else if (type === 'message' && !value.emitter.listenerCount(type) && !this[kEvents].get(type)?.size) idle(this);
+      } else if (type === 'message' && !value.emitter.listenerCount(type) && !this[kEvents]?.get(type)?.size) idle(this);
       retain(this);
     },
   });

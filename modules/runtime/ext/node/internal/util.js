@@ -94,6 +94,43 @@ function getDeprecationWarningEmitter(
   };
 }
 
+function isPendingDeprecation() {
+  const { getOptionValue } = require('internal/options');
+  return getOptionValue('--pending-deprecation') &&
+    !getOptionValue('--no-deprecation');
+}
+
+function deprecateProperty(key, msg, code, isPendingDeprecation) {
+  const emitDeprecationWarning = getDeprecationWarningEmitter(
+    code, msg, undefined, false, isPendingDeprecation,
+  );
+  return (options) => {
+    if (key in options) {
+      emitDeprecationWarning();
+    }
+  };
+}
+
+// Internal deprecator for pending --pending-deprecation. This can be invoked
+// at snapshot building time as the warning permission is only queried at
+// run time.
+function pendingDeprecate(fn, msg, code) {
+  const emitDeprecationWarning = getDeprecationWarningEmitter(
+    code, msg, deprecated, false, isPendingDeprecation,
+  );
+  function deprecated(...args) {
+    emitDeprecationWarning();
+    return ReflectApply(fn, this, args);
+  }
+
+  ObjectDefineProperty(deprecated, 'length', {
+    __proto__: null,
+    ...ObjectGetOwnPropertyDescriptor(fn, 'length'),
+  });
+
+  return deprecated;
+}
+
 // Mark that a method should not be used.
 // Returns a modified function which warns once by default.
 // If --no-deprecation is set, then it is a no-op.
@@ -414,6 +451,35 @@ function filterDuplicateStrings(items, low) {
   return ArrayPrototypeSort(ArrayFrom(map.values()));
 }
 
+function getConstructorOf(obj) {
+  while (obj) {
+    const descriptor = ObjectGetOwnPropertyDescriptor(obj, 'constructor');
+    if (descriptor !== undefined &&
+        typeof descriptor.value === 'function' &&
+        descriptor.value.name !== '') {
+      return descriptor.value;
+    }
+
+    obj = ObjectGetPrototypeOf(obj);
+  }
+
+  return null;
+}
+
+let validateUint32;
+let sleepCell;
+
+// Node's binding sleeps the thread (uv_sleep); Atomics.wait on a cell nobody notifies does the same.
+function sleep(msec) {
+  // Lazy-load to avoid a circular dependency.
+  if (validateUint32 === undefined)
+    ({ validateUint32 } = require('internal/validators'));
+
+  validateUint32(msec, 'msec');
+  sleepCell ??= new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(sleepCell, 0, 0, msec);
+}
+
 module.exports = {
   assertCrypto,
   assignFunctionName,
@@ -421,13 +487,16 @@ module.exports = {
   customPromisifyArgs: kCustomPromisifyArgsSymbol,
   deprecate,
   deprecateInstantiation,
+  deprecateProperty,
   emitExperimentalWarning,
   filterDuplicateStrings,
   encodingsMap,
+  getConstructorOf,
   getDeprecationWarningEmitter,
   getLazy,
   getSystemErrorName,
   isError,
+  isPendingDeprecation,
   join,
   kEmptyObject,
   kEnumerableProperty,
@@ -435,7 +504,9 @@ module.exports = {
   lazyDOMExceptionClass,
   normalizeEncoding,
   once,
+  pendingDeprecate,
   promisify,
   removeColors,
   setOwnProperty,
+  sleep,
 };
