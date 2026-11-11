@@ -152,9 +152,21 @@ const LinkError = makeError('LinkError');
 const RuntimeError = makeError('RuntimeError');
 const SuspendError = makeError('SuspendError');
 
-class Module {
+// %AbstractModuleSource% (source phase imports): the abstract superclass of
+// module source objects, whose @@toStringTag getter names the source's class.
+class AbstractModuleSource {
+  constructor() { throw new TypeError('Abstract class AbstractModuleSource not directly constructable'); }
+  get [Symbol.toStringTag]() {
+    const state = object(this) ? records.get(this) : undefined;
+    return state !== undefined && state.kind === 'module' ? 'WebAssembly.Module' : undefined;
+  }
+}
+class Module extends AbstractModuleSource {
   constructor(source, options = undefined) {
-    remember(this, 'module', compileHandle(source, options));
+    // AbstractModuleSource cannot be constructed: Module makes its own instance.
+    const self = Object.create(new.target.prototype);
+    remember(self, 'module', compileHandle(source, options));
+    return self;
   }
   static imports(module) {
     return native('moduleImports', brand(module, 'module').handle).map(({ module, name, kind }) => ({ module, name, kind }));
