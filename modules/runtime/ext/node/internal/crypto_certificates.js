@@ -64,10 +64,16 @@ function stringValue(part) {
   if (part.tag === 28) { let out = ''; for (let i = 0; i < part.data.length; i += 4) out += String.fromCodePoint(part.data.readUInt32BE(i)); return out; }
   return part.data.toString(part.tag === 20 ? 'latin1' : 'utf8');
 }
+// The universal tags with a tag2nbyte width in OpenSSL's a_strex.c.
+const kUtf8Convertible = new Set([12, 18, 19, 20, 22, 23, 24, 26, 28, 30]);
 function nameObject(part) {
   const result = Object.create(null);
   for (const rdn of children(part.data)) for (const attr of children(rdn.data)) {
-    const pair = children(attr.data), key = oidName(oid(pair[0].data), true), value = stringValue(pair[1]);
+    const pair = children(attr.data);
+    // ASN1_STRING_to_UTF8 only converts the string and time types; Node
+    // leaves out the entries it cannot convert.
+    if (!kUtf8Convertible.has(pair[1].tag)) continue;
+    const key = oidName(oid(pair[0].data), true), value = stringValue(pair[1]);
     if (result[key] === undefined) result[key] = value;
     else if (Array.isArray(result[key])) result[key].push(value);
     else result[key] = [result[key], value];
@@ -108,14 +114,6 @@ function dateValue(text) {
   date.setUTCHours(Number(fields[3]), Number(fields[4]), Number(fields[5]), 0);
   return date;
 }
-function rsaPublic(bitString) {
-  // i2d_RSA_PUBKEY uses rsaEncryption even for an RSA-PSS certificate key.
-  const algorithm = Buffer.from('300d06092a864886f70d0101010500', 'hex');
-  let size = algorithm.length + bitString.length; const length = [];
-  if (size < 128) length.push(size);
-  else { while (size) { length.unshift(size & 255); size = Math.floor(size / 256); } length.unshift(128 | length.length); }
-  return Buffer.concat([Buffer.from([48, ...length]), algorithm, bitString]);
-}
 function legacy(cert, seen) {
   if (seen.has(cert)) return seen.get(cert);
   const parts = parsed(cert), key = cert.publicKey;
@@ -138,7 +136,7 @@ function legacy(cert, seen) {
     result.modulus = modulus.toString('hex').toUpperCase();
     let exponent = 0n; for (const byte of integers[1].data) exponent = exponent * 256n + BigInt(byte);
     result.exponent = '0x' + (exponent > 0xffffffffffffffffn ? 0xffffffffffffffffn : exponent).toString(16);
-    result.pubkey = rsaPublic(spki[1].raw); result.bits = c.call('keyBits', [c.handle(key)]);
+    result.pubkey = Buffer.from(c.call('rsaPubkey', [c.handle(key)])); result.bits = c.call('keyBits', [c.handle(key)]);
   } else if (algorithmId === '1.2.840.10045.2.1') {
     result.pubkey = Buffer.from(call(cert, 'x509ECPublic')); result.bits = c.call('keyBits', [c.handle(key)]);
     result.asn1Curve = call(cert, 'x509ECCurve', 0);
@@ -172,8 +170,8 @@ class X509Certificate {
   get raw() { return cached(this, 'raw', () => Buffer.from(call(this, 'x509Raw'))); }
   get publicKey() { return cached(this, 'publicKey', () => c.keyFromHandle('public', call(this, 'x509PublicKey'))); }
   get ca() { return cached(this, 'ca', () => !!call(this, 'x509CA')); }
-  toString() { return cached(this, 'pem', () => call(this, 'x509PEM')); }
-  toJSON() { return this.toString(); }
+  toString() { return pem(this); }
+  toJSON() { return pem(this); }
   checkHost(name, options) { return check(this, 'x509Host', name, 'name', options); }
   checkEmail(email, options) { return check(this, 'x509Email', email, 'email', options); }
   checkIP(ip, options) { return check(this, 'x509IP', ip, 'ip', options); }
@@ -183,10 +181,14 @@ class X509Certificate {
   toLegacyObject() { state(this); return legacy(this, new Map()); }
   [Symbol.for('nodejs.util.inspect.custom')](depth, options) {
     if (depth < 0) return this;
-    const value = {}; for (const name of ['subject', 'subjectAltName', 'issuer', 'infoAccess', 'validFrom', 'validTo', 'validFromDate', 'validToDate', 'fingerprint', 'fingerprint256', 'fingerprint512', 'keyUsage', 'serialNumber', 'signatureAlgorithm', 'signatureAlgorithmOid']) value[name] = this[name];
+    // Node reads the native slots, never the patchable prototype getters.
+    const value = {}; for (const [name, get] of kInspectGetters) value[name] = get.call(this);
     return 'X509Certificate ' + require('util').inspect(value, { ...options, depth: options.depth == null ? null : options.depth - 1 });
   }
 }
+const kInspectGetters = ['subject', 'subjectAltName', 'issuer', 'infoAccess', 'validFrom', 'validTo', 'validFromDate', 'validToDate', 'fingerprint', 'fingerprint256', 'fingerprint512', 'keyUsage', 'serialNumber', 'signatureAlgorithm', 'signatureAlgorithmOid']
+  .map(name => [name, Object.getOwnPropertyDescriptor(X509Certificate.prototype, name).get]);
+function pem(cert) { return cached(cert, 'pem', () => call(cert, 'x509PEM')); }
 function fingerprint(cert, digest) { return cached(cert, digest, () => { const value = Buffer.from(call(cert, 'x509Fingerprint', digest)); return Array.from(value, byte => byte.toString(16).padStart(2, '0').toUpperCase()).join(':'); }); }
 function Certificate() { if (!(this instanceof Certificate)) return new Certificate(); }
 function verifySpkac(spkac, encoding) { return !!c.call('spkacVerify', [c.packed(c.bytes(spkac, encoding, 'spkac'))]); }
@@ -198,7 +200,19 @@ function parsePKCS12(bundle, options = {}) {
   const data = c.binary(bundle, 'bundle'); object(options, 'options');
   const pass = options.passphrase === undefined ? undefined : c.bytes(options.passphrase, 'utf8', 'options.passphrase');
   if (pass && pass.includes(0)) throw c.error('ERR_INVALID_ARG_VALUE', 'options.passphrase must not contain null bytes', TypeError);
-  const frame = Buffer.from(c.call('pkcs12Parse', [c.packed(data), pass === undefined ? undefined : c.packed(pass)]));
+  let raw;
+  try {
+    raw = c.call('pkcs12Parse', [c.packed(data), pass === undefined ? undefined : c.packed(pass)]);
+  } catch (error) {
+    // Node maps OpenSSL 3's missing legacy algorithms (RC2-40, RC4) to an
+    // actionable error, as the TLS pfx path does.
+    if (error.code === 'ERR_OSSL_EVP_UNSUPPORTED') {
+      throw c.error('ERR_CRYPTO_UNSUPPORTED_OPERATION', 'Unsupported PKCS#12 algorithm. The bundle may use legacy algorithms, which OpenSSL 3 only offers through its legacy provider');
+    }
+    throw error;
+  }
+  if (raw === undefined || raw.byteLength === 0) throw c.codes.ERR_CRYPTO_OPERATION_FAILED('The input is not a valid PKCS#12 structure');
+  const frame = Buffer.from(raw);
   let offset = 0, privateKey = null, certificate = null; const additionalCertificates = [];
   function field() { const length = frame.readUInt32BE(offset); offset += 4; const value = frame.subarray(offset, offset + length); offset += length; return value; }
   try {
@@ -221,4 +235,5 @@ function _x509FromChain(chain) {
 }
 function _cloneData(value) { return states.has(value) ? call(value, 'x509Raw') : undefined; }
 function _fromCloneData(value) { return new X509Certificate(new Uint8Array(value)); }
-module.exports = { Certificate, X509Certificate, parsePKCS12, _x509FromChain, _cloneData, _fromCloneData };
+function isX509Certificate(value) { return states.has(value); }
+module.exports = { Certificate, X509Certificate, isX509Certificate, parsePKCS12, _x509FromChain, _cloneData, _fromCloneData };

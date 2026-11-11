@@ -73,6 +73,7 @@ import js_constructor_ops as constructors
 import js_prototypes as prototypes
 import js_function_invoke as invoke
 import js_parser_diagnostics { DiagnosticMessage }
+import js_call_printer as callPrinter
 import js_opcode_data as op
 import js_atom_data as atoms
 import js_class_data as classes
@@ -108,6 +109,23 @@ unsafe fn classCallback(runtime: *mut HeapHeader, id: u32) -> Option<NativeFunct
     Option<NativeFunctionId>.Some { value } => Option<NativeFunctionId>.some(value)
     Option<NativeFunctionId>.None => Option<NativeFunctionId>.none()
   }
+}
+/// V8's TypeError for calling function, which is not callable: the callee as
+/// the caller's source spells it, or the value when there is no source.
+@cold
+unsafe effect fn throwNotCallable<H: CoercionHooks>(hooks: &mut H, context: *mut HeapHeader, function: ValueBits) -> never
+  ! JsException ? &mut Allocator {
+  let mut message = DiagnosticMessage.make()
+  if !unsafe callPrinter.appendCallee(unsafe runtime.contextRuntime(context), &mut message) {
+    message.append(match function {
+      ValueBits.Undefined => b"undefined"
+      ValueBits.Null => b"null"
+      ValueBits.Bool { value } => if value { b"true" } else { b"false" }
+      _ => if function.isNumber() { b"number" } else if function.isString() { b"string" } else if function.isObject() { b"object" } else { b"value" }
+    })
+  }
+  message.append(b" is not a function")
+  return run core.error(&mut hooks, unsafe lendRealm(&context, context), message.bytes())
 }
 unsafe effect fn callClass<H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + NativeFunctionHooks>(hooks: &mut H,
   memory: &AllocationObserver, context: *mut HeapHeader, function: ValueBits, receiver: ValueBits, argv: &FrameSlots, flags: u32) -> ValueBits
@@ -164,7 +182,7 @@ unsafe effect fn callClassSlow<H: HeapHooks + CoercionHooks + OwnPropertyHooks +
   let rt = unsafe runtime.contextRuntime(context)
   let id = match move unsafe classCallback(rt, class) {
     Option<NativeFunctionId>.Some { value } => value
-    Option<NativeFunctionId>.None => { return run core.error(&mut hooks, unsafe lendRealm(&context, context), b"not a function") }
+    Option<NativeFunctionId>.None => { return run unsafe throwNotCallable(&mut hooks, context, function) }
   }
   let invoked = run Effect.result(hooks.nativeFlags(id, unsafe lendRealm(&context, context), unsafe lendBits(&function, function), unsafe lendBits(&receiver, receiver), usize.toI32(argv.length()), unsafe lendArguments(argv), u32.toI32(flags)))
   return match move invoked {
@@ -220,13 +238,13 @@ pub unsafe effect fn callInternal<H: HeapHooks + CoercionHooks + OwnPropertyHook
   + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
   memory: &AllocationObserver, context: *mut HeapHeader, function: ValueBits, receiver: ValueBits, newTarget: ValueBits,
   argv: &FrameSlots, flags: u32) -> ValueBits ! JsException ? &mut Allocator {
-  run unsafe restricted.call(unsafe lendRealm(&context, context), function)
+  run unsafe restricted.call(unsafe lendRealm(&context, context), function, receiver)
   // Raw stack storage: the entry's frame slots are all Borrowed, so it needs no drop glue.
   // Allocated first, at a fixed size, so it is a frame slot rather than part of
   // the dynamic allocation below.
   let entrySlot = unsafe Intrinsic.pointerRequalify<[*]mut Entry, *mut Entry>(unsafe Intrinsic.stackAllocate<Entry>(1))
   if interrupts.due(unsafe lendRealm(&context, context)) { run interrupts.handle(&mut hooks, memory, unsafe lendRealm(&context, context)) }
-  if !function.isObject() { return run core.error(&mut hooks, unsafe lendRealm(&context, context), b"not a function") }
+  if !function.isObject() { return run unsafe throwNotCallable(&mut hooks, context, function) }
   if unsafe classId(function) != classes.JS_CLASS_BYTECODE_FUNCTION {
     return run unsafe callClass(&mut hooks, memory, context, function, receiver, argv, flags)
   }
@@ -378,9 +396,8 @@ pub unsafe effect fn constructInternal<H: HeapHooks + CoercionHooks + OwnPropert
   + PropertyWriteHooks + PrototypeHooks + InterruptHooks + NativeFunctionHooks + CallHooks + ErrorHooks + EvalHooks>(hooks: &mut H,
   memory: &AllocationObserver, context: *mut HeapHeader, function: ValueBits, newTarget: ValueBits, argv: &FrameSlots, flags: u32) -> ValueBits
   ! JsException ? &mut Allocator {
-  run unsafe restricted.call(unsafe lendRealm(&context, context), function)
+  run unsafe restricted.call(unsafe lendRealm(&context, context), function, ValueBits.Undefined)
   run interrupts.poll(&mut hooks, memory, unsafe lendRealm(&context, context))
-  if !function.isObject() { return run core.error(&mut hooks, unsafe lendRealm(&context, context), b"not a function") }
   if !boxing.isConstructor(unsafe lendBits(&function, function)) { return run core.throwNotConstructor(&mut hooks, unsafe lendRealm(&context, context), unsafe lendBits(&function, function)) }
   let constructorFlags = flags | JS_CALL_FLAG_CONSTRUCTOR
   if unsafe classId(function) != classes.JS_CLASS_BYTECODE_FUNCTION {
@@ -475,6 +492,11 @@ unsafe effect fn unwind<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPro
           }
         } else {
           let pending = unsafe exceptions.take(machine.runtime)
+          let mut entered = ()
+          let handler = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut entered, machine.runtime)
+          handler.handlerCode = Pointer.address<HeapHeader>(machine.bytecode)
+          handler.handlerPc = i32.toU32(offset)
+          drop handler
           unsafe machine.push(pending) unsafe machine.setPc(i32.toUsize(offset)) return true
         }
       }
@@ -609,7 +631,20 @@ unsafe effect fn execute<H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPr
       unsafe activation.adoptFrames(base.runtime)
       result = run unsafe executeObserved(&mut hooks, memory, &mut base, &mut handoff)
     }
-    else { result = run unsafe executePlain(&mut hooks, memory, &mut base, &mut handoff) }
+    else {
+      // Counted so interrupt polls keep handing plain runs off once observation
+      // turns on (js_interrupts.handle).
+      let mut countAnchor = ()
+      let counting = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut countAnchor, base.runtime)
+      counting.plainRuns = counting.plainRuns + 1 drop counting
+      let outcome = run Effect.result(unsafe executePlain(&mut hooks, memory, &mut base, &mut handoff))
+      let counted = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut countAnchor, base.runtime)
+      counted.plainRuns = counted.plainRuns - 1 drop counted
+      result = match move outcome {
+        Result<ValueBits, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { value } => value
+        Result<ValueBits, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => { fail move error }
+      }
+    }
     if !handoff { return result }
   }
   return ValueBits.Undefined
@@ -3301,7 +3336,7 @@ unsafe effect fn instruction<H: HeapHooks + CoercionHooks + OwnPropertyHooks + G
   }
   if opcode == op.OP_check_ctor || opcode == op.OP_init_ctor {
     if opcode == op.OP_init_ctor { unsafe machine.publishPc() }
-    if core.undefined(unsafe activation.newTargetOf(&machine)) { return run core.error(&mut hooks, unsafe lendRealm(&machine.context, machine.context), b"class constructors must be invoked with 'new'") }
+    if core.undefined(unsafe activation.newTargetOf(&machine)) { return run core.throwClassCall(&mut hooks, unsafe lendRealm(&machine.context, machine.context), unsafe lendBits(&machine, unsafe machine.currentFunction())) }
     if opcode == op.OP_init_ctor {
       let fetched = run Effect.result(prototypes.getPrototype(&mut hooks, unsafe lendRealm(&machine.context, machine.context), unsafe lendBits(&machine, unsafe machine.currentFunction())))
       let prototype = match move fetched {

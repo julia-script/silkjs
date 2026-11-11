@@ -48,20 +48,7 @@ const {
   ObjectEntries, ObjectFreeze, ObjectKeys, ObjectSetPrototypeOf, Uint32Array, Uint8Array,
 } = require('internal/per_context/primordials');
 
-// internal/util
-function assignFunctionName(name, fn) {
-  ObjectDefineProperty(fn, 'name', { __proto__: null, configurable: true, value: name });
-  return fn;
-}
-const emittedDeprecations = new Set();
-function deprecateInstantiation(target, code, ...args) {
-  if (!emittedDeprecations.has(code) && !process.noDeprecation) {
-    emittedDeprecations.add(code);
-    process.emitWarning(`Instantiating ${target.name} without the 'new' keyword has been deprecated.`,
-                        'DeprecationWarning', code, target);
-  }
-  return Reflect.construct(target, args);
-}
+const { assignFunctionName, deprecateInstantiation } = require('internal/util');
 
 const owner_symbol = Symbol('owner_symbol');
 

@@ -4,6 +4,9 @@ const { Duplex } = require('stream');
 const { EventEmitter } = require('events');
 const { Buffer } = require('buffer');
 const diagnostics = require('internal/host').diagnostics;
+const traceEvents = require('internal/trace_events');
+// node.net.native trace events: a connect request begins with the native connect and ends with its result.
+const kNetTraceCategory = 'node,node.net,node.net.native';
 const { Transport, error: nativeError, native } = require('internal/net/transport');
 
 let defaultAutoSelectFamily = true;
@@ -106,6 +109,7 @@ function Socket(options) {
   this._timeout = null;
   this.timeout = 0;
   this._generation = 0;
+  this._connectTraceId = undefined;
   this._connectTimer = null;
   this._attemptNext = null;
   this._noDelay = options.noDelay;
@@ -170,6 +174,18 @@ Socket.prototype._refreshTimeout = function() {
   }, this.timeout);
   this._timeout.unref?.();
 };
+// Node's name for refreshing the idle timeout of a socket and the sockets it wraps.
+Socket.prototype._unrefTimer = function() {
+  for (let socket = this; socket; socket = socket._parent) {
+    if (socket._timeout) socket._timeout.refresh();
+  }
+};
+Socket.prototype._traceConnectEnd = function() {
+  const id = this._connectTraceId;
+  if (id === undefined) return;
+  this._connectTraceId = undefined;
+  traceEvents.end(kNetTraceCategory, 'connect', id);
+};
 Socket.prototype._onNative = function(type, status, payload) {
   if (type === 6) {
     this._connected = false;
@@ -188,6 +204,7 @@ Socket.prototype._onNative = function(type, status, payload) {
     return;
   }
   if (type === 3) {
+    this._traceConnectEnd();
     if (status < 0) {
       // Like Node's createConnectionError: a given local address and port are in the message.
       const local = this._connectLocal;
@@ -219,25 +236,52 @@ Socket.prototype._onNative = function(type, status, payload) {
       this._bytesRead += payload.byteLength;
       this._refreshTimeout();
     }
-    const consumer = this._streamConsumers?.[this._streamConsumers.length - 1];
-    if (consumer) { consumer.read(status, payload); return; }
-    if (status === -4095) {
-      this._readEOF = true;
-      // Match Node's onStreamRead: read(0) schedules end for an empty,
-      // unconsumed socket without consuming any buffered application data.
-      if (!this._onreadPending) this._pushEOF();
-      return;
-    }
-    if (status < 0) { this.destroy(nativeError(status, 'read')); return; }
-    if (!payload || !payload.byteLength) return;
-    const chunk = Buffer.from(payload);
-    if (this._onread && typeof this._onread.callback === 'function') {
-      if (this._onreadPending) (this._onreadQueue ||= []).push(chunk);
-      else this._onreadPending = chunk;
-      this._deliverOnread();
-    } else if (!this.push(chunk) && this._transport) this._transport.readStop();
+    this._onRead(status, payload);
   }
 };
+Socket.prototype._onRead = function(status, payload) {
+  const consumer = this._streamConsumers?.[this._streamConsumers.length - 1];
+  // Reads the native side queued before a readStop are held while the socket is
+  // paused, so a consumer (an HTTP parser) sees no data after pause, as with libuv.
+  // The payload is only lent for the event, so a held read keeps a copy. _read
+  // replays them in order.
+  if (this._consumerQueue || (consumer && this._readPaused)) {
+    (this._consumerQueue ||= []).push(status, payload ? payload.slice(0) : payload);
+    return;
+  }
+  if (consumer && consumer.read(status, payload) !== false) return;
+  if (status === -4095) {
+    this._readEOF = true;
+    // Match Node's onStreamRead: read(0) schedules end for an empty,
+    // unconsumed socket without consuming any buffered application data.
+    if (!this._onreadPending) this._pushEOF();
+    return;
+  }
+  if (status < 0) { this.destroy(nativeError(status, 'read')); return; }
+  if (!payload || !payload.byteLength) return;
+  const chunk = Buffer.from(payload);
+  if (this._onread && typeof this._onread.callback === 'function') {
+    if (this._onreadPending) (this._onreadQueue ||= []).push(chunk);
+    else this._onreadPending = chunk;
+    this._deliverOnread();
+  } else if (!this.push(chunk) && this._transport) this._transport.readStop();
+};
+function replayConsumerReads(socket) {
+  socket._consumerReplay = null;
+  const queue = socket._consumerQueue;
+  if (!queue || socket._readPaused || socket.destroyed) return;
+  socket._consumerQueue = null;
+  for (let i = 0; i < queue.length; i += 2) {
+    socket._onRead(queue[i], queue[i + 1]);
+    if (socket.destroyed) return;
+    if (socket._readPaused || socket._consumerQueue) {
+      const rest = queue.slice(i + 2);
+      if (socket._consumerQueue) rest.push(...socket._consumerQueue);
+      socket._consumerQueue = rest.length ? rest : null;
+      return;
+    }
+  }
+}
 Socket.prototype._deliverOnread = function() {
   while (this._onreadPending?.length && !this._readPaused && !this.destroyed) {
     const destination = typeof this._onread.buffer === 'function' ? this._onread.buffer() : this._onread.buffer;
@@ -265,6 +309,9 @@ Socket.prototype._read = function() {
     this._deliverOnread();
     if (this._readPaused || this.destroyed) return;
   }
+  // Held reads come back on a later turn of the loop, as libuv delivers reads after
+  // readStart, never inside resume().
+  if (this._consumerQueue && !this._consumerReplay) this._consumerReplay = setImmediate(replayConsumerReads, this);
   if (this._readEOF) return;
   const status = this._transport.readStart();
   if (status < 0) this.destroy(nativeError(status, 'read'));
@@ -307,6 +354,7 @@ Socket.prototype._final = function(cb) {
   submitted = true;
 };
 Socket.prototype._destroy = function(err, cb) {
+  this._traceConnectEnd();
   ++this._generation;
   this._hadError ||= !!err;
   this.connecting = false;
@@ -325,6 +373,11 @@ Socket.prototype._destroy = function(err, cb) {
   if (pending?.callback) process.nextTick(pending.callback, new ERR_SOCKET_CLOSED_BEFORE_CONNECTION());
   else if (pending) pending();
   const done = () => {
+    // Like Node's _destroy, the server counts the connection closed without a listener.
+    if (this._server) {
+      this._server._connections--;
+      this._server._emitCloseIfDrained?.();
+    }
     cb(err);
     process.nextTick(() => this.emit('close', this._hadError));
   };
@@ -402,8 +455,10 @@ Socket.prototype.connect = function(...args) {
       if (!options.path) this.emit('connectionAttempt', address, port, family);
       if (this.destroyed) return;
       if (!options.path && this.blockList?.check(address, `ipv${family}`)) { this._connectionFailed(new ERR_IP_BLOCKED(address)); return; }
+      this._connectTraceId = traceEvents.begin(kNetTraceCategory, 'connect');
       const status = this._transport.call('connect', address, port || 0);
       if (status < 0) {
+        this._traceConnectEnd();
         // Like Node's internalConnect, a TCP connect that fails at once names the local address,
         // which is empty when the socket has none.
         const local = options.path ? undefined : this.address();
@@ -587,6 +642,8 @@ function Server(options, listener) {
   this._options = options;
   this._transport = null;
   this._connections = 0;
+  this._usingWorkers = false;
+  this._workers = [];
   this._listening = false;
   this._starting = false;
   this._closing = false;
@@ -624,7 +681,6 @@ Server.prototype._acceptSocket = function(socket) {
   ++this._connections;
   socket.server = this;
   socket._server = this;
-  socket.once('close', () => { --this._connections; this._emitCloseIfDrained(); });
   if (this._options.noDelay !== undefined) socket.setNoDelay(this._options.noDelay);
   if (this._options.keepAlive !== undefined) socket.setKeepAlive(this._options.keepAlive, this._options.keepAliveInitialDelay || 0);
   if (this.pauseOnConnect) socket.pause();
@@ -755,16 +811,65 @@ Server.prototype.close = function(cb) {
   this._closing = true;
   this._removeAbort?.();
   this._detachTransport();
-  this._emitCloseIfDrained();
+  // Like Node: sockets sent to child processes count until every child reports them closed.
+  // A child that already exited has left _workers; with none left there is nothing to wait
+  // for (Node would wait forever when every child exits before close()).
+  if (this._usingWorkers && this._workers.length) {
+    let left = this._workers.length;
+    const onWorkerClose = () => {
+      if (--left !== 0) return;
+      this._connections = 0;
+      this._emitCloseIfDrained();
+    };
+    this._connections++;
+    for (let n = 0; n < this._workers.length; n++) this._workers[n].close(onWorkerClose);
+  } else this._emitCloseIfDrained();
   return this;
 };
+// Node's child_process send of a server socket without keepOpen: the socket stops counting
+// as one of this server's connections (its child's list counts it now).
+const detachedSockets = new WeakSet();
+Server.prototype._detachSocket = function(socket) {
+  if (detachedSockets.has(socket)) return;
+  detachedSockets.add(socket);
+  this._connections--;
+  // _destroy counts a socket closed only for the server it still belongs to.
+  socket._server = null;
+};
+// Node's hook for child_process: a list of the sockets this server sent to one child.
+Server.prototype._setupWorker = function(socketList) {
+  this._usingWorkers = true;
+  this._workers.push(socketList);
+  socketList.once('exit', socketList => {
+    const index = this._workers.indexOf(socketList);
+    this._workers.splice(index, 1);
+  });
+};
+// Node's server._handle: the listening handle while the server has one, null otherwise.
+Object.defineProperty(Server.prototype, '_handle', {
+  get() { return this._transport; }, set(value) { this._transport = value; }, configurable: true,
+});
 Server.prototype.address = function() { return this._listening ? this._transport.address() : null; };
 // Like Node: with captureRejections, a rejected 'connection' listener destroys that socket.
 Server.prototype[EventEmitter.captureRejectionSymbol] = function(err, event, sock) {
   if (event === 'connection') sock.destroy(err);
   else this.emit('error', err);
 };
-Server.prototype.getConnections = function(cb) { validateFunction(cb, 'cb'); process.nextTick(cb, null, this._connections); return this; };
+Server.prototype.getConnections = function(cb) {
+  validateFunction(cb, 'cb');
+  const end = (err, connections) => process.nextTick(cb, err, connections);
+  if (!this._usingWorkers || !this._workers.length) { end(null, this._connections); return this; }
+  // Like Node: the server's own connections plus each child's count.
+  let left = this._workers.length;
+  let total = this._connections;
+  const oncount = (err, count) => {
+    if (err) { left = -1; return end(err); }
+    total += count;
+    if (--left === 0) return end(null, total);
+  };
+  for (let n = 0; n < this._workers.length; n++) this._workers[n].getConnections(oncount);
+  return this;
+};
 Server.prototype.ref = function() { this._unrefed = false; this._transport?.ref(); return this; };
 Server.prototype.unref = function() { this._unrefed = true; this._transport?.unref(); return this; };
 Object.defineProperty(Server.prototype, 'listening', { get() { return this._listening; } });

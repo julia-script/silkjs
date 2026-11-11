@@ -90,10 +90,29 @@ function runtime(session, method, params) {
       protocolParams(params, 'prototypeObjectId', 'string');
       return { objects: session.values.remote(host.queryObjects(session.values.lookup(params.prototypeObjectId)), params.objectGroup) };
     }
+    case 'Runtime.globalLexicalScopeNames': return { names: native(11, contextFor(params).handle) };
     case 'Runtime.getIsolateId': return { id: `silk:${native(10)}` };
     case 'Runtime.runIfWaitingForDebugger': waiting = false; return {};
     default: unsupported(method);
   }
+}
+// Node's own domain (src/inspector/node_protocol.pdl): startup-wait notification.
+function nodeRuntime(session, method, params) {
+  switch (method) {
+    case 'NodeRuntime.enable':
+      session.nodeRuntime = true;
+      if (waiting) session.emit('NodeRuntime.waitingForDebugger', {});
+      return {};
+    case 'NodeRuntime.disable': session.nodeRuntime = false; return {};
+    case 'NodeRuntime.notifyWhenWaitingForDisconnect':
+      if (typeof params.enabled !== 'boolean') throw protocolError(-32602, 'Invalid parameters');
+      session.notifyDisconnect = params.enabled;
+      return {};
+    default: unsupported(method);
+  }
+}
+function announceWaiting() {
+  for (const session of sessions.values()) if (session.nodeRuntime) session.emit('NodeRuntime.waitingForDebugger', {});
 }
 function dispatch(session, method, params) {
   if (method.startsWith('Runtime.')) return runtime(session, method, params);
@@ -101,7 +120,8 @@ function dispatch(session, method, params) {
   if (method.startsWith('Profiler.') || method.startsWith('HeapProfiler.')) return profiles.dispatch(session, method, params);
   if (method.startsWith('Network.') || method.startsWith('IO.')) return network.dispatch(session, method, params);
   if (method.startsWith('NodeWorker.')) return workers.dispatch(session, method, params);
-  if (method === 'Schema.getDomains') return { domains: ['Runtime', 'Debugger', 'Profiler', 'HeapProfiler', 'Network', 'IO', 'NodeWorker', 'Schema'].map(name => ({ name, version: '1.3' })) };
+  if (method.startsWith('NodeRuntime.')) return nodeRuntime(session, method, params);
+  if (method === 'Schema.getDomains') return { domains: ['Runtime', 'Debugger', 'Profiler', 'HeapProfiler', 'Network', 'IO', 'NodeWorker', 'NodeRuntime', 'Schema'].map(name => ({ name, version: '1.3' })) };
   unsupported(method);
 }
 function createSession(key, send) {
@@ -125,6 +145,7 @@ function closeSession(key) {
   session.contexts.clear();
   session.values.clear();
   if (sessions.size === 0) native(7, false);
+  if (exitRetained && ![...sessions.values()].some(other => other.notifyDisconnect)) { exitRetained = false; contextsDestroyed(); }
 }
 function command(session, message) {
   let request;
@@ -186,6 +207,7 @@ function onNative(kind, connection, payload, source) {
     check();
     if (sessions.has(key)) closeSession(key);
     createSession(key, message => native(5, connection, JSON.stringify(message), source));
+    if (source === -1) host.writeStartupDiagnostic('Debugger attached.\n');
     if (source >= 0 && payload === '{"inspectorWorker":true}') {
       const info = host.workerNative('info', []);
       const metadata = JSON.parse(info.metadata);
@@ -197,6 +219,23 @@ function onNative(kind, connection, payload, source) {
   } else if (kind === 3) closeSession(key);
 }
 function url() { return native(3); }
+// WebSocket sessions of this thread's own server; they keep the process alive at exit.
+const remoteSessions = () => { for (const key of sessions.keys()) if (key.startsWith('-1:')) return true; return false; };
+// A session that asked for NodeRuntime.waitingForDisconnect keeps the main
+// context alive at exit until the last such session leaves.
+let exitRetained = false;
+function contextsDestroyed() {
+  for (const session of [...sessions.values()]) if (session.runtime) for (const context of session.contexts.values())
+    session.emit('Runtime.executionContextDestroyed', { executionContextId: context.id, executionContextUniqueId: context.uniqueId });
+}
+// Node's Agent::WaitForDisconnect, run after the 'exit' event while the inspector is active.
+function atExit() {
+  if (native(10) !== 0 || (!url() && sessions.size === 0)) return;
+  if (remoteSessions()) host.writeStartupDiagnostic('Waiting for the debugger to disconnect...\n');
+  for (const session of [...sessions.values()]) if (session.notifyDisconnect) { session.emit('NodeRuntime.waitingForDisconnect', {}); exitRetained = true; }
+  if (!exitRetained) contextsDestroyed();
+  while (url() && remoteSessions()) native(4, 10);
+}
 function close() {
   native(2);
   for (const key of sessions.keys()) if (!key.startsWith('local:') && key.startsWith('-1:')) closeSession(key);
@@ -220,11 +259,13 @@ function open(port = 9229, hostname = '127.0.0.1', wait = false) {
 function waitForDebugger() {
   if (!url()) throw error('ERR_INSPECTOR_NOT_ACTIVE', 'Inspector is not active');
   waiting = true;
+  announceWaiting();
   while (waiting && url()) native(4, 10);
 }
 function waitWorker() {
   workerWaitConsumed = true;
   waiting = true;
+  announceWaiting();
   // Publish readiness only after the wait state is set: a queued resume must
   // not be overwritten when bootstrap enters its worker wait.
   native(0, onNative);
@@ -247,6 +288,16 @@ function start(port, hostname, wait, breakFirst) {
     }
     if (wait || breakFirst) waitForDebugger();
   } else if (wait || breakFirst || native(18)) waitWorker();
+}
+// process._debugEnd closes the server; SIGUSR1 (what process._debugProcess
+// sends) opens it on process.debugPort, as Node does unless --disable-sigusr1.
+function installProcess(process, hostname, activateOnSignal) {
+  process._debugEnd = () => close();
+  process._debugProcess = pid => { process.kill(pid, 'SIGUSR1'); };
+  if (!activateOnSignal) return;
+  host.processNative('signalStart', [host.platform === 'darwin' ? 30 : 10, () => {
+    if (!url()) start(process.debugPort, hostname, false, false);
+  }]);
 }
 function armStartup() {
   // A CLI bind failure (or a listener closed during startup wait) must not
@@ -296,4 +347,4 @@ if (native(10) === 0) {
   // Native state does not come with a heap image: a start from one registers again.
   host.onHydrate(() => { native(0, onNative); });
 }
-module.exports = { connect, open, close, url, waitForDebugger, _start: start, _waitForWorker: waitForWorkerStart, _armStartup: armStartup, evaluatePreview, releasePreview, broadcast, error, invalid, console: consoleBridge.console, emitConsole: consoleBridge.emitConsole, putNetworkResource: network.put };
+module.exports = { connect, open, close, url, waitForDebugger, _start: start, _atExit: atExit, _installProcess: installProcess, _waitForWorker: waitForWorkerStart, _armStartup: armStartup, evaluatePreview, releasePreview, broadcast, error, invalid, console: consoleBridge.console, emitConsole: consoleBridge.emitConsole, putNetworkResource: network.put };

@@ -1,6 +1,6 @@
-'use strict';
+// Node.js v24.22.1 lib/internal/assert.js (MIT, Copyright Node.js contributors).
 
-// Node.js v24.22.1 lib/internal/assert.js.
+'use strict';
 
 let error;
 function lazyError() {
