@@ -17,6 +17,7 @@
 //  11 ALTSVC (a: origin length)  12 ORIGIN entry  13 ORIGIN end
 //  14 invalid frame (a: library code)                    15 library error (a: code)
 const host = require('internal/host');
+const perfEntries = require('internal/perf_observers');
 const { Buffer } = require('buffer');
 const { AsyncResource } = require('async_hooks');
 const constants = require('internal/http2/constants');
@@ -83,6 +84,8 @@ const kSessionHasAltsvcListeners = 3;
 // IDX_SETTINGS_* order and the nghttp2 identifiers they hold.
 const settingIds = [1, 2, 4, 5, 3, 6, 8];
 const IDX_SETTINGS_COUNT = 7;
+// HTTP2_SETTINGS order in node_http2.h, which packed settings follow.
+const packOrder = [0, 1, 4, 2, 3, 5, 6];
 const MAX_ADDITIONAL_SETTINGS = 10;
 const defaultSettings = [4096, 1, 65535, 16384, 0xffffffff, 65535, 0];
 
@@ -103,6 +106,13 @@ let callbacks;
 function setCallbackFunctions(error, priority, settings, ping, headers, frameError,
                               goawayData, altsvc, origin, streamTrailers, streamClose) {
   callbacks = { error, priority, settings, ping, headers, frameError, goawayData, altsvc, origin, streamTrailers, streamClose };
+}
+
+// Buffer::Copy: a buffer with its own memory.
+function copy(view) {
+  const out = Buffer.allocUnsafeSlow(view.length);
+  out.set(view);
+  return out;
 }
 
 function bytes(value) {
@@ -173,7 +183,7 @@ function packHeaders(list) {
 function settingsEntries() {
   const flags = settingsBuffer[IDX_SETTINGS_COUNT];
   const entries = [];
-  for (let i = 0; i < IDX_SETTINGS_COUNT; i++) {
+  for (const i of packOrder) {
     if (flags & (1 << i)) entries.push([settingIds[i], settingsBuffer[i]]);
   }
   const extra = settingsBuffer[IDX_SETTINGS_COUNT + 1];
@@ -250,8 +260,10 @@ class Http2Ping {
     this.session.scope(() => { call('ping', this.session.id, data); });
   }
   done(ack, payload) {
-    const duration = Number(hrtimeNs() - this.start) / 1e6;
-    makeCallback(this.resource, this.callback, this, [ack, duration, payload === undefined ? undefined : Buffer.from(payload)]);
+    const rtt = hrtimeNs() - this.start;
+    const duration = Number(rtt) / 1e6;
+    if (ack) this.session.stats.pingRTT = Number(rtt);
+    makeCallback(this.resource, this.callback, this, [ack, duration, payload === undefined ? undefined : copy(payload)]);
     this.resource.emitDestroy();
   }
 }
@@ -286,6 +298,8 @@ class Http2Stream {
     this.session = session;
     this.streamId = id;
     this.resource = new AsyncResource('HTTP2STREAM');
+    // Http2Stream statistics: hrtime values in ns, start also as a host.now() time.
+    this.stats = { start: hrtimeNs(), startTime: host.now(), firstHeader: 0n, firstByte: 0n, firstByteSent: 0n, sentBytes: 0, receivedBytes: 0 };
     this.destroyed = false;
     this.closed = false;
     this.writable = true;
@@ -300,6 +314,29 @@ class Http2Stream {
     this.onread = undefined;
     if (options & STREAM_OPTION_EMPTY_PAYLOAD) this.writable = false;
     session.streams.set(id, this);
+    const stats = session.stats;
+    stats.streamCount++;
+    if (session.streams.size > stats.maxConcurrentStreams) stats.maxConcurrentStreams = session.streams.size;
+  }
+  emitStatistics() {
+    const session = this.session;
+    const stats = this.stats;
+    const end = hrtimeNs();
+    session.stats.streamAverageDuration = Number(end - stats.start) / session.stats.streamCount / 1e6;
+    if (!perfEntries.observing('http2')) return;
+    const since = (value) => Number(value - stats.start) / 1e6;
+    const detail = {
+      bytesRead: stats.receivedBytes,
+      bytesWritten: stats.sentBytes,
+      id: this.streamId,
+      timeToFirstByte: since(stats.firstByte),
+      timeToFirstByteSent: since(stats.firstByteSent),
+      timeToFirstHeader: since(stats.firstHeader),
+    };
+    const duration = Number(end - stats.start) / 1e6;
+    setImmediate(() => {
+      if (perfEntries.observing('http2')) perfEntries.emit('Http2Stream', 'http2', stats.startTime, duration, detail);
+    });
   }
   id() { return this.streamId; }
   getAsyncId() { return this.resource.asyncId(); }
@@ -339,7 +376,7 @@ class Http2Stream {
       }
       for (let i = 0; i <= last; i++) {
         if (!buffers[i].length) continue;
-        this.queue.push(i === last ? req : null);
+        this.queue.push({ req: i === last ? req : null, length: buffers[i].length });
         if (session.alive()) call('write', session.id, this.streamId, buffers[i]);
       }
     });
@@ -426,11 +463,12 @@ class Http2Stream {
     const session = this.session;
     if (session.pendingRstStreams.includes(this.streamId)) this.flushRstStream();
     if (session.streams.get(this.streamId) === this) session.streams.delete(this.streamId);
+    this.emitStatistics();
     setImmediate(() => {
       // Writes still queued when the stream goes away never complete.
       const queue = this.queue;
       this.queue = [];
-      for (const req of queue) if (req) session.completeWrite(req, UV_ECANCELED);
+      for (const { req } of queue) if (req) session.completeWrite(req, UV_ECANCELED);
       this.resource.emitDestroy();
     });
   }
@@ -498,6 +536,16 @@ class Http2Session {
     this.id = call('create', type === NGHTTP2_SESSION_SERVER ? 1 : 0, packOptions(type));
     if (this.id < 0) throw Object.assign(new Error(nghttp2ErrorString(this.id)), { code: 'ERR_HTTP2_ERROR', errno: this.id });
     this.released = false;
+    // Settings as JS sees them: nghttp2 applies a whole received chunk before the
+    // records are dispatched, so each SETTINGS frame and ACK is applied here in turn.
+    this.localMirror = new Array(IDX_SETTINGS_COUNT);
+    this.remoteMirror = new Array(IDX_SETTINGS_COUNT);
+    for (let i = 0; i < IDX_SETTINGS_COUNT; i++) {
+      this.localMirror[i] = call('localSetting', this.id, settingIds[i]);
+      this.remoteMirror[i] = call('remoteSetting', this.id, settingIds[i]);
+    }
+    this.remoteSettingsSeen = false;
+    this.stats = { start: host.now(), bytesWritten: 0, bytesRead: 0, framesReceived: 0, framesSent: 0, maxConcurrentStreams: 0, pingRTT: 0, streamAverageDuration: 0, streamCount: 0 };
     this.streams = new Map();
     this.localCustomSettings = [];
     // FetchAllowedRemoteCustomSettings: ids the peer may set, without values yet.
@@ -565,6 +613,7 @@ class Http2Session {
   }
   onStreamRead(buffer) {
     if (buffer.length === 0 || !this.alive() || this.destroyed) return;
+    this.stats.bytesRead += buffer.length;
     this.scope(() => this.consumeData(buffer));
     this.maybeStopReading();
   }
@@ -624,13 +673,18 @@ class Http2Session {
         if (block === undefined) this.headers.set(id, block = { names: [], sensitive: [] });
         const name = payload.toString('latin1', 0, a);
         block.names.push(name, payload.toString('latin1', a, payload.length));
+        const target = this.streams.get(id);
+        if (target !== undefined && target.stats.firstHeader === 0n) target.stats.firstHeader = hrtimeNs();
         if (flags & NGHTTP2_NV_FLAG_NO_INDEX) block.sensitive.push(name);
         return;
       }
-      case 2: return this.onFrame(id, flags, a, b, payload);
+      case 2:
+        this.stats.framesReceived++;
+        return this.onFrame(id, flags, a, b, payload);
       case 3: return this.onData(id, payload);
       case 4: return this.onStreamClose(id, a >>> 0);
       case 5: {
+        this.stats.framesSent++;
         if (a === FRAME_GOAWAY && !this.closing && !this.destroyed && !this.gracefulClose && !this.goawayInitiated) {
           this.internalGoawaySent = true;
         }
@@ -639,7 +693,9 @@ class Http2Session {
       case 6: {
         const stream = this.streams.get(id);
         if (stream === undefined || stream.queue.length === 0) return;
-        const req = stream.queue.shift();
+        const { req, length } = stream.queue.shift();
+        if (stream.stats.firstByteSent === 0n) stream.stats.firstByteSent = hrtimeNs();
+        stream.stats.sentBytes += length;
         if (req) this.outgoing.push(req);
         return;
       }
@@ -651,7 +707,7 @@ class Http2Session {
         return;
       }
       case 8: {
-        makeCallback(this.resource, callbacks.goawayData, this, [a >>> 0, id, payload.length ? Buffer.from(payload) : undefined]);
+        makeCallback(this.resource, callbacks.goawayData, this, [a >>> 0, id, payload.length ? copy(payload) : undefined]);
         return;
       }
       case 9: return this.onFrameNotSent(id, a, b);
@@ -717,7 +773,7 @@ class Http2Session {
           return;
         }
         if (!(this.fields[kBitfield] & (1 << kSessionHasPingListeners))) return;
-        makeCallback(this.resource, callbacks.ping, this, [Buffer.from(payload)]);
+        makeCallback(this.resource, callbacks.ping, this, [copy(payload)]);
       }
     }
   }
@@ -740,9 +796,19 @@ class Http2Session {
   onSettings(flags, payload) {
     if (!(flags & FLAG_ACK)) {
       this.fields[kBitfield] &= ~(1 << kSessionRemoteSettingsIsUpToDate);
+      // nghttp2 lifts its initial limit of 100 streams when the first SETTINGS
+      // frame does not set one.
+      if (!this.remoteSettingsSeen) {
+        this.remoteSettingsSeen = true;
+        this.remoteMirror[settingIds.indexOf(3)] = 0xffffffff;
+      }
       for (let at = 0; at + 8 <= payload.length; at += 8) {
         const settingId = payload.readInt32LE(at);
-        if (settingIds.includes(settingId)) continue;
+        const index = settingIds.indexOf(settingId);
+        if (index !== -1) {
+          this.remoteMirror[index] = payload.readUInt32LE(at + 4);
+          continue;
+        }
         for (const entry of this.remoteCustomSettings) {
           if (entry.id === settingId) { entry.value = payload.readUInt32LE(at + 4); entry.set = true; break; }
         }
@@ -753,6 +819,10 @@ class Http2Session {
     }
     const settings = this.outstandingSettings.shift();
     if (settings !== undefined) {
+      for (const [id, value] of settings.entries) {
+        const index = settingIds.indexOf(id);
+        if (index !== -1) this.localMirror[index] = value;
+      }
       settings.done(true);
       return;
     }
@@ -762,6 +832,8 @@ class Http2Session {
     const stream = this.streams.get(id);
     if (stream === undefined || stream.destroyed || payload.length === 0) return;
     // Each chunk is its own buffer, so later reads cannot overwrite it.
+    stream.stats.receivedBytes += payload.length;
+    if (stream.stats.firstByte === 0n) stream.stats.firstByte = hrtimeNs();
     makeCallback(stream.resource, stream.onread, stream, [payload.length, Buffer.from(payload)]);
     if (stream.destroyed || !this.alive()) return;
     if (stream.reading) call('consume', this.id, id, payload.length);
@@ -811,8 +883,8 @@ class Http2Session {
       return 0;
     }
     this.chunksSent++;
+    for (const chunk of chunks) this.stats.bytesWritten += chunk.length;
     this.writeInProgress = true;
-    const data = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks);
     let finished = false;
     let async = false;
     const done = (error) => {
@@ -820,9 +892,14 @@ class Http2Session {
       finished = true;
       if (async) fromLoop(() => this.onStreamAfterWrite(error ? -1 : 0));
     };
-    // A write the socket buffers without backpressure completes now, like a
-    // libuv write that finished synchronously.
-    const flushed = socket.write(data, done);
+    // Like Node's writev of the outgoing buffers: one chunk per nghttp2 output,
+    // corked together. A write the socket buffers without backpressure completes
+    // now, like a libuv write that finished synchronously.
+    const corked = chunks.length > 1 && typeof socket.cork === 'function';
+    if (corked) socket.cork();
+    let flushed = true;
+    for (let i = 0; i < chunks.length; i++) flushed = socket.write(chunks[i], i === chunks.length - 1 ? done : undefined);
+    if (corked) socket.uncork();
     if (this.alive()) call('socketMemory', this.id, socket.writableLength || 0);
     if (flushed || finished) {
       finished = true;
@@ -918,6 +995,7 @@ class Http2Session {
     const pings = this.pings;
     this.pings = [];
     for (const ping of pings) setImmediate(() => ping.done(false));
+    this.emitStatistics();
   }
   // The ondone callback, after which nothing reaches the native session again.
   finishDone() {
@@ -927,6 +1005,25 @@ class Http2Session {
       this.socket.resume();
     }
     this.release();
+  }
+  emitStatistics() {
+    if (!perfEntries.observing('http2')) return;
+    const stats = this.stats;
+    const detail = {
+      bytesWritten: stats.bytesWritten,
+      bytesRead: stats.bytesRead,
+      framesReceived: stats.framesReceived,
+      framesSent: stats.framesSent,
+      maxConcurrentStreams: stats.maxConcurrentStreams,
+      pingRTT: stats.pingRTT,
+      streamAverageDuration: stats.streamAverageDuration,
+      streamCount: stats.streamCount,
+      type: this.type === NGHTTP2_SESSION_SERVER ? 'server' : 'client',
+    };
+    const duration = host.now() - stats.start;
+    setImmediate(() => {
+      if (perfEntries.observing('http2')) perfEntries.emit('Http2Session', 'http2', stats.start, duration, detail);
+    });
   }
   release() {
     if (this.released) return;
@@ -1021,9 +1118,8 @@ class Http2Session {
   }
   // Http2Settings::Update for the local or remote settings.
   refreshSettings(remote) {
-    for (let i = 0; i < IDX_SETTINGS_COUNT; i++) {
-      settingsBuffer[i] = call(remote ? 'remoteSetting' : 'localSetting', this.id, settingIds[i]);
-    }
+    const mirror = remote ? this.remoteMirror : this.localMirror;
+    for (let i = 0; i < IDX_SETTINGS_COUNT; i++) settingsBuffer[i] = mirror[i];
     const custom = remote ? this.remoteCustomSettings : this.localCustomSettings;
     let count = 0;
     for (const entry of custom) {

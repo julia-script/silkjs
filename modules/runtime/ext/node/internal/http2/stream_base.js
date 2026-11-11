@@ -80,6 +80,11 @@ function toBuffer(chunk, encoding) {
 }
 
 function writevGeneric(self, data, cb) {
+  // Like Node, a list of buffers is turned into the chunks in place.
+  if (data.allBuffers) {
+    for (let i = 0; i < data.length; i++) data[i] = data[i].chunk;
+    return dispatchWrite(self[kHandle], data, cb);
+  }
   const buffers = new Array(data.length);
   for (let i = 0; i < data.length; i++) buffers[i] = toBuffer(data[i].chunk, data[i].encoding);
   return dispatchWrite(self[kHandle], buffers, cb);

@@ -12,8 +12,9 @@ const observers = new Set();
 const pending = new Set();
 const enqueueObserver = Symbol('enqueue');
 const deliverObserver = Symbol('deliver');
+const observesType = Symbol('observesType');
 const reservedMarks = new Set(['nodeStart', 'v8Start', 'environment', 'loopStart', 'loopExit', 'bootstrapComplete']);
-const supportedTypes = Object.freeze([...new Set(['function', 'mark', 'measure', 'resource', ...(host.performanceObserverTypes || [])])].sort());
+const supportedTypes = Object.freeze([...new Set(['function', 'http2', 'mark', 'measure', 'resource', ...(host.performanceObserverTypes || [])])].sort());
 const previousPerformance = globalThis.performance;
 let startTime = host.performanceStartTime ?? (host.now() - (previousPerformance?.now() ?? process.uptime() * 1000));
 let timeOrigin = host.performanceTimeOrigin ?? previousPerformance?.timeOrigin ?? (Date.now() - (host.now() - startTime));
@@ -194,6 +195,7 @@ class PerformanceObserver {
   }
   disconnect() { observers.delete(this); pending.delete(this); this.#records = []; this.#types.clear(); this.#mode = undefined; }
   takeRecords() { const records = this.#records; this.#records = []; return records; }
+  [observesType](type) { return this.#types.has(type); }
   static get supportedEntryTypes() { return supportedTypes; }
   [enqueueObserver](entry) {
     if (!this.#types.has(entry.entryType)) return;
@@ -327,14 +329,21 @@ for (const Constructor of [Performance, PerformanceEntry, PerformanceMark, Perfo
   PerformanceObserver, PerformanceObserverEntryList, PerformanceNodeTiming]) {
   Object.defineProperty(Constructor.prototype, Symbol.toStringTag, { value: Constructor.name, configurable: true });
 }
-if (typeof host.performanceSetObserverCallback === 'function') host.performanceSetObserverCallback((name, type, start, duration, detail) => {
+function emitNodeEntry(name, type, start, duration, detail) {
   if (!supportedTypes.includes(type)) return;
   const entry = new PerformanceNodeEntry(token, name, type, start, duration, detail);
   if (detail && typeof detail === 'object') for (const key of Object.keys(detail)) {
     if (!(key in entry)) Object.defineProperty(entry, key, { enumerable: true, configurable: true, get: () => detail[key] });
   }
   enqueue(entry);
-});
+}
+if (typeof host.performanceSetObserverCallback === 'function') host.performanceSetObserverCallback(emitNodeEntry);
+const internalEntries = require('internal/perf_observers');
+internalEntries.observing = (type) => {
+  for (const observer of observers) if (observer[observesType](type)) return true;
+  return false;
+};
+internalEntries.emit = (name, type, start, duration, detail) => emitNodeEntry(name, type, start - startTime, duration, detail);
 const constants = Object.freeze({
   NODE_PERFORMANCE_GC_MAJOR: 4, NODE_PERFORMANCE_GC_MINOR: 1, NODE_PERFORMANCE_GC_INCREMENTAL: 8, NODE_PERFORMANCE_GC_WEAKCB: 16,
   NODE_PERFORMANCE_GC_FLAGS_NO: 0, NODE_PERFORMANCE_GC_FLAGS_CONSTRUCT_RETAINED: 2, NODE_PERFORMANCE_GC_FLAGS_FORCED: 4,

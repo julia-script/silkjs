@@ -2791,13 +2791,14 @@ function startFilePipe(self, fd, offset, length) {
     const size = remaining < 0 ? 65536 : MathMin(65536, remaining);
     if (size === 0) return end();
     const buffer = Buffer.allocUnsafe(size);
-    fs.read(fd, buffer, 0, size, position, (err, bytesRead) => {
+    // An offset of -1 reads from the current position, as for a pipe.
+    fs.read(fd, buffer, 0, size, position < 0 ? null : position, (err, bytesRead) => {
       if (err) {
         self.close(NGHTTP2_INTERNAL_ERROR);
         return unpipe();
       }
       if (bytesRead === 0) return end();
-      position += bytesRead;
+      if (position >= 0) position += bytesRead;
       if (remaining > 0) remaining -= bytesRead;
       const req = {
         handle,
