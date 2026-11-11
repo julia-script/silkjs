@@ -271,3 +271,14 @@ Object.defineProperty(module.exports, '_fromCloneData', { value(data) {
   blobs.set(result, { parts, size, type: data.type });
   return result;
 } });
+// The bytes of a Blob held in memory, without a copy when it has one part; undefined for a
+// Blob read from a file. Callers must not change them.
+Object.defineProperty(module.exports, '_memoryBytes', { value(value) {
+  const record = blobs.get(value);
+  if (!record) return undefined;
+  const parts = record.parts;
+  if (parts.length === 0) return new Uint8Array(0);
+  if (parts.length === 1) return parts[0].file ? undefined : parts[0];
+  if (parts.some(part => part.file)) return undefined;
+  return copyBytes(record);
+} });

@@ -1,11 +1,15 @@
 'use strict';
 
+const { Buffer } = require('buffer');
 const { URL } = require('internal/web/url');
 const { AbortController, AbortSignal } = require('internal/path_events/event_target');
-const { Headers, immutable, scalar, byteString, token } = require('internal/web/fetch/headers');
+const { Headers, immutable, parsedHeaders, scalar, byteString, token } = require('internal/web/fetch/headers');
 const body = require('internal/web/fetch/body');
-const requests = new WeakSet();
-const responses = new WeakSet();
+const { textBody } = body;
+// Requests and Responses keep their records in a private field; the module reads them through
+// these, set by each class's static block. `internal` makes an instance around a given record.
+const internal = Symbol('internal');
+let readRequest, readResponse;
 const nullBodyStatus = new Set([101, 204, 205, 304]);
 const redirectStatus = new Set([301, 302, 303, 307, 308]);
 const normalizedMethods = new Set(['DELETE', 'GET', 'HEAD', 'OPTIONS', 'POST', 'PUT']);
@@ -14,8 +18,8 @@ function dictionary(value) {
   if (typeof value !== 'object' && typeof value !== 'function') throw new TypeError('Options must be an object');
   return value;
 }
-function requestState(value) { if (!requests.has(value)) throw new TypeError('Illegal Request invocation'); return body.state(value); }
-function responseState(value) { if (!responses.has(value)) throw new TypeError('Illegal Response invocation'); return body.state(value); }
+function requestState(value) { const record = readRequest(value); if (record === undefined) throw new TypeError('Illegal Request invocation'); return record; }
+function responseState(value) { const record = readResponse(value); if (record === undefined) throw new TypeError('Illegal Response invocation'); return record; }
 function choice(value, allowed, name) {
   value = scalar(value);
   if (!allowed.includes(value)) throw new TypeError('Invalid ' + name + ': ' + value);
@@ -30,13 +34,25 @@ function followSignal(signal) {
   }
   return controller.signal;
 }
+// A plain copy of a request record's fields; server request records keep some on their prototype.
+function copyRequestRecord(record) {
+  return {
+    url: record.url, method: record.method, dispatcher: record.dispatcher, headers: record.headers,
+    mode: record.mode, credentials: record.credentials, cache: record.cache, redirect: record.redirect,
+    referrer: record.referrer, referrerPolicy: record.referrerPolicy, integrity: record.integrity, keepalive: record.keepalive,
+    signalSource: record.signalSource, followed: record.followed, signal: record.signal, body: record.body,
+  };
+}
 function signalGetter() { return this.followed ??= followSignal(this.signalSource); }
 function lazySignal(record) { Object.defineProperty(record, 'signal', { get: signalGetter, enumerable: true, configurable: true }); }
 class Request {
+  #state;
+  static { readRequest = value => typeof value === 'object' && value !== null && #state in value ? value.#state : undefined; }
   constructor(input, init = {}) {
+    if (input === internal) { this.#state = init; return; }
     if (!arguments.length) throw new TypeError('Request requires an argument');
     init = dictionary(init);
-    const original = requests.has(input) ? requestState(input) : null;
+    const original = readRequest(input) ?? null;
     let url;
     try { url = new URL(original ? original.url : scalar(input)); }
     catch (cause) { throw new TypeError('Failed to parse URL from ' + String(input), { cause }); }
@@ -91,16 +107,15 @@ class Request {
       record.body = body.transfer(original.body);
     }
     if (record.body?.type && !record.headers.has('content-type')) record.headers.set('content-type', record.body.type);
-    requests.add(this); body.states.set(this, record);
+    this.#state = record;
   }
   clone() {
     const record = requestState(this);
-    const result = Object.create(Request.prototype);
-    requests.add(result);
-    const copy = { ...record, headers: new Headers(record.headers), body: body.clone(record.body) };
-    copy.signalSource = record.signal; copy.followed = null; lazySignal(copy);
-    body.states.set(result, copy);
-    return result;
+    const copy = copyRequestRecord(record);
+    copy.headers = new Headers(record.headers); copy.body = body.clone(record.body);
+    copy.signalSource = record.signal; copy.followed = null;
+    lazySignal(copy);
+    return new Request(internal, copy);
   }
   get method() { return requestState(this).method; }
   get url() { return requestState(this).url; }
@@ -119,25 +134,59 @@ class Request {
   get signal() { return requestState(this).signal; }
   get duplex() { requestState(this); return 'half'; }
 }
+// A Response made with no headers gets its Headers object only when something asks for it: until
+// then `fields` is null and `contentType` holds the one field the body gave it.
+class ResponseRecord {
+  constructor(status, statusText, fields, payload) {
+    this.status = status; this.statusText = statusText; this.fields = fields; this.body = payload;
+  }
+  get headers() {
+    let headers = this.fields;
+    if (headers === null) {
+      headers = this.fields = new Headers();
+      if (this.contentType !== null) headers.set('content-type', this.contentType);
+    }
+    return headers;
+  }
+  set headers(value) { this.fields = value; }
+}
+// What most responses share; a response that differs gets its own field.
+Object.assign(ResponseRecord.prototype, { contentType: null, type: 'default', url: '', redirected: false, immutable: false });
+
 class Response {
-  constructor(value = null, init = {}) {
-    init = dictionary(init);
-    const number = init.status === undefined ? 200 : +init.status;
-    const status = Number.isFinite(number) ? ((Math.trunc(number) % 65536) + 65536) % 65536 : 0;
-    if (status < 200 || status > 599) throw new RangeError('Response status must be in the range 200 to 599');
-    const statusText = init.statusText === undefined ? '' : byteString(init.statusText);
-    if (/[^\t\x20-\x7e\x80-\xff]/.test(statusText)) throw new TypeError('Invalid statusText');
-    const headers = new Headers(init.headers);
-    const payload = body.extract(value);
+  #state;
+  static { readResponse = value => typeof value === 'object' && value !== null && #state in value ? value.#state : undefined; }
+  constructor(value = null, init = undefined) {
+    if (value === internal) { this.#state = init; return; }
+    let status = 200, statusText = '', headers = null;
+    if (init !== undefined) {
+      init = dictionary(init);
+      if (init.status !== undefined) {
+        const number = +init.status;
+        status = Number.isFinite(number) ? ((Math.trunc(number) % 65536) + 65536) % 65536 : 0;
+        if (status < 200 || status > 599) throw new RangeError('Response status must be in the range 200 to 599');
+      }
+      if (init.statusText !== undefined) {
+        statusText = byteString(init.statusText);
+        if (/[^\t\x20-\x7e\x80-\xff]/.test(statusText)) throw new TypeError('Invalid statusText');
+      }
+      if (init.headers !== undefined) headers = new Headers(init.headers);
+    }
+    const payload = typeof value === 'string' ? textBody(value) : body.extract(value);
     if (payload && nullBodyStatus.has(status)) throw new TypeError('Invalid response status code for a body: ' + status);
-    if (payload?.type && !headers.has('content-type')) headers.set('content-type', payload.type);
-    responses.add(this);
-    body.states.set(this, { status, statusText, headers, body: payload, type: 'default', url: '', redirected: false, immutable: false });
+    const record = new ResponseRecord(status, statusText, headers, payload);
+    if (payload?.type) {
+      if (headers === null) record.contentType = payload.type;
+      else if (!headers.has('content-type')) headers.set('content-type', payload.type);
+    }
+    this.#state = record;
   }
   clone() {
     const record = responseState(this), headers = new Headers(record.headers);
     if (record.immutable) immutable(headers);
-    return makeResponse({ ...record, headers, body: body.clone(record.body) });
+    const copy = new ResponseRecord(record.status, record.statusText, headers, body.clone(record.body));
+    copy.type = record.type; copy.url = record.url; copy.redirected = record.redirected; copy.immutable = record.immutable;
+    return makeResponse(copy);
   }
   get type() { return responseState(this).type; }
   get url() { return responseState(this).url; }
@@ -168,9 +217,38 @@ class Response {
     return new Response(text, { ...init, headers });
   }
 }
-function makeResponse(record) {
-  const result = Object.create(Response.prototype);
-  responses.add(result); body.states.set(result, record); return result;
+function makeResponse(record) { return new Response(internal, record); }
+// The record of a request that the native server parsed: `fields` is [method, target, host, name,
+// value, ...]. Its URL and Headers are made when first read, and the fields every such request
+// shares live on the prototype.
+class ServerRequestRecord {
+  constructor(fields, authority, payload) {
+    this.fields = fields; this.authority = authority; this.href = null; this.parsed = null; this.followed = null; this.body = payload;
+  }
+  get method() { return this.fields[0]; }
+  get url() {
+    let href = this.href;
+    if (href === null) {
+      const target = this.fields[1];
+      href = this.href = target.charCodeAt(0) === 47 ? 'http://' + (this.fields[2] || this.authority) + target : target;
+    }
+    return href;
+  }
+  set url(value) { this.href = value; }
+  get headers() { return this.parsed ??= parsedHeaders(this.fields, 3); }
+  set headers(value) { this.parsed = value; }
+  get signal() { return this.followed ??= followSignal(undefined); }
 }
+Object.assign(ServerRequestRecord.prototype, {
+  dispatcher: undefined, mode: 'cors', credentials: 'same-origin', cache: 'default', redirect: 'follow',
+  referrer: 'about:client', referrerPolicy: '', integrity: '', keepalive: false, signalSource: undefined,
+});
+// A Request for the server: `fields` as above, `authority` the host for a request without one, and
+// `bytes` the body or undefined.
+function serverRequest(fields, authority, bytes) {
+  const payload = bytes === undefined ? null : body.bytesBody(Buffer.from(bytes));
+  return new Request(internal, new ServerRequestRecord(fields, authority, payload));
+}
+body.readStates(value => readRequest(value) ?? readResponse(value));
 body.installBody(Request.prototype); body.installBody(Response.prototype);
-module.exports = { Request, Response, requestState, responseState, makeResponse, nullBodyStatus, redirectStatus };
+module.exports = { Request, Response, copyRequestRecord, requestState, responseState, makeResponse, serverRequest, nullBodyStatus, redirectStatus };

@@ -824,12 +824,16 @@ function publicBuiltin(name) {
   return publicBuiltinHas(name) &&
     ((name !== 'stream/iter' && name !== 'zlib/iter') || host.experimentalStreamIter === true);
 }
+// Modules of this runtime, which only their silk: names load.
+const runtimeModules = { __proto__: null, 'silk:serve': 'internal/web/serve' };
 const publicBuiltins = {
-  has: publicBuiltin,
-  get: name => internalRequire(name),
+  has: name => runtimeModules[name] !== undefined || publicBuiltin(name),
+  get: name => internalRequire(runtimeModules[name] ?? name),
+  runtime: name => typeof name === 'string' && runtimeModules[name] !== undefined,
   // Whether names() lists name, without building the list.
   listed(name) {
     if (typeof name !== 'string') return false;
+    if (runtimeModules[name] !== undefined) return true;
     if (stringStartsWith(name, 'node:')) {
       const bare = stringSlice(name, 5);
       return prefixOnlyBuiltinHas(bare) && publicBuiltin(bare);
