@@ -291,5 +291,9 @@ contexts.subscribe(context => {
 }, true);
 // Worker owners are announced before bootstrap has installed permissions and
 // startup options. Keep incoming routes queued until _start/_waitForWorker.
-if (native(10) === 0) native(0, onNative);
+if (native(10) === 0) {
+  native(0, onNative);
+  // Native state does not come with a heap image: a start from one registers again.
+  host.onHydrate(() => { native(0, onNative); });
+}
 module.exports = { connect, open, close, url, waitForDebugger, _start: start, _waitForWorker: waitForWorkerStart, _armStartup: armStartup, evaluatePreview, releasePreview, broadcast, error, invalid, console: consoleBridge.console, emitConsole: consoleBridge.emitConsole, putNetworkResource: network.put };

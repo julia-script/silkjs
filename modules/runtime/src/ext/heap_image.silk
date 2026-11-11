@@ -1,0 +1,149 @@
+//! The heap of a bootstrapped runtime, saved at build time and mapped at start.
+//!
+//! While an image is being built, the runtime heap's backing comes from one
+//! region at a fixed address, handed out in order and never reused. The region's
+//! bytes are the image: tools/build.py appends them to the executable, followed
+//! by a trailer that says where they are. A process maps them back at the same
+//! address, private and copy on write, so every pointer inside the image is
+//! valid again, and skips the bootstrap that produced them.
+//!
+//! This relies on the executable being linked at a fixed address: pointers from
+//! the image into its code and constants are stored as they were. The image is
+//! therefore only ever read from the executable it was built with. Linux only.
+import silk.mem.layout { Layout }
+import silk.mem.pointer { Pointer }
+import silk.core.ownership { Copy }
+import silk.num.usize
+import silk.num.u64
+import silk.num.i32
+import silk.num.i64
+import silk.num.isize
+
+const BASE: usize = 0x1000000000
+const RESERVED: usize = 0x40000000
+// "SILKIMG1", in the image's first word and the trailer's last.
+const MAGIC: u64 = 0x31474d494b4c4953
+const PAGE: usize = 4096
+/// The embedding's roots start here in the image; the rest of the first page is theirs.
+const ROOTS: usize = 64
+pub const ROOTS_CAPACITY: usize = PAGE - ROOTS
+
+struct Header { magic: u64, end: usize }
+impl Copy for Header {}
+/// The last 32 bytes of an executable that carries an image.
+struct Trailer { offset: u64, length: u64, reserved: u64, magic: u64 }
+impl Copy for Trailer {}
+
+unsafe fn header(base: *mut u8) -> *mut Header { return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Header>(base) }
+unsafe fn at(base: *mut u8, offset: usize) -> *mut u8 { return unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(base), offset) }
+
+/// Where the embedding keeps its roots: ROOTS_CAPACITY bytes it lays out itself.
+pub unsafe fn roots(base: *mut u8) -> *mut u8 { return unsafe at(base, ROOTS) }
+
+export "C" fn silkHeapImageRelease(memory: ?*mut u8) -> () {}
+
+/// The next bytes of the region being built. They are zero and are never handed out again.
+pub unsafe fn allocate(base: *mut u8, layout: Layout) -> Intrinsic.Allocation {
+  let mut state = unsafe Pointer.read<Header>(unsafe header(base))
+  let mut alignment = layout.alignment if alignment < 16 { alignment = 16 }
+  let start = usize.bitAnd(state.end + alignment - 1, usize.bitNot(alignment - 1))
+  let end = start + layout.bytes
+  if end > BASE + RESERVED { Intrinsic.trap("heap image region is full") }
+  state.end = end
+  unsafe Pointer.write<Header>(unsafe header(base), state)
+  let reclaim: extern "C" fn(?*mut u8) -> () = silkHeapImageRelease
+  let block = unsafe at(base, start - BASE)
+  return unsafe Intrinsic.allocationAdopt(block, move layout, reclaim, block)
+}
+
+static if Intrinsic.targetOperatingSystem() == "linux" {
+  unsafe extern "C" fn mapAt(address: ?*mut u8, length: usize, protection: i32, flags: i32, fd: i32, offset: i64) -> ?*mut u8 as "mmap"
+  unsafe extern "C" fn munmap(address: *mut u8, length: usize) -> i32
+  @foreign(noCapture: .("path"))
+  unsafe extern "C" fn open(path: *const u8, flags: i32, ...) -> i32
+  unsafe extern "C" fn close(fd: i32) -> i32
+  @foreign(noCapture: .("buffer"))
+  unsafe extern "C" fn write(fd:i32,buffer:*const u8,count:usize)->isize
+  @foreign(noCapture: .("buffer"))
+  unsafe extern "C" fn pread(fd: i32, buffer: *mut u8, count: usize, offset: i64) -> isize
+  unsafe extern "C" fn lseek(fd: i32, offset: i64, whence: i32) -> i64
+
+  // PROT_READ | PROT_WRITE
+  const READ_WRITE: i32 = 3
+  // MAP_PRIVATE | MAP_FIXED_NOREPLACE, with MAP_ANONYMOUS | MAP_NORESERVE for a new region.
+  const MAP_IMAGE: i32 = 0x100002
+  const MAP_NEW: i32 = 0x104022
+  // O_RDONLY | O_CLOEXEC, and O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC.
+  const OPEN_READ: i32 = 0x80000
+  const OPEN_WRITE: i32 = 0x80241
+
+  // The region's address as a pointer: no pointer exists to derive it from.
+  fn baseAddress() -> ?*mut u8 {
+    let mut word: usize = BASE
+    return unsafe Pointer.read<?*mut u8>(unsafe Intrinsic.pointerReinterpret<*mut usize, *mut ?*mut u8>(Pointer.fromMutRef<usize>(&mut word)))
+  }
+
+  /// Reserves the empty region of an image to build. Null when the address is taken.
+  pub unsafe fn begin() -> ?*mut u8 {
+    let mapped = unsafe mapAt(baseAddress(), RESERVED, READ_WRITE, MAP_NEW, -1, 0)
+    if Pointer.address<u8>(mapped) != BASE { return Pointer.null<u8>() }
+    let base = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(mapped)
+    unsafe Pointer.write<Header>(unsafe header(base), Header { magic: MAGIC, end: BASE + PAGE })
+    return base
+  }
+
+  /// Writes the region to the file at path. False when the path is too long or the
+  /// file could not be written whole.
+  pub unsafe fn save(base: *mut u8, path: &[u8]) -> bool {
+    let mut name: [u8; 4096] = [0; 4096]
+    if path.length >= 4096 { return false }
+    let mut index: usize = 0
+    while index < path.length { name[index] = path[index] index = index + 1 }
+    let state = unsafe Pointer.read<Header>(unsafe header(base))
+    let length = usize.bitAnd(state.end - BASE + PAGE - 1, usize.bitNot(PAGE - 1))
+    let fd = unsafe open(Pointer.fromRef<u8>(&name[0]), OPEN_WRITE, 420)
+    if fd < 0 { return false }
+    let mut done: usize = 0
+    while done < length {
+      let wrote = unsafe write(fd, unsafe at(base, done), length - done)
+      if wrote <= 0 { let _closed = unsafe close(fd) return false }
+      done = done + isize.toUsize(wrote)
+    }
+    return unsafe close(fd) == 0
+  }
+
+  /// Maps the image this executable carries where it was built. Null when it
+  /// carries none or the image cannot be mapped there.
+  pub unsafe fn load() -> ?*mut u8 {
+    let fd = unsafe open(Pointer.fromRef<u8>(&b"/proc/self/exe\0"[0]), OPEN_READ)
+    if fd < 0 { return Pointer.null<u8>() }
+    let base = unsafe loadFrom(fd)
+    let _closed = unsafe close(fd)
+    return base
+  }
+  unsafe fn loadFrom(fd: i32) -> ?*mut u8 {
+    let size = unsafe lseek(fd, 0, 2)
+    if size < 32 { return Pointer.null<u8>() }
+    let mut trailer = Trailer { offset: 0, length: 0, reserved: 0, magic: 0 }
+    let pointer = unsafe Intrinsic.pointerReinterpret<*mut Trailer, *mut u8>(Pointer.fromMutRef<Trailer>(&mut trailer))
+    if unsafe pread(fd, pointer, 32, size - 32) != 32 { return Pointer.null<u8>() }
+    let end = i64.toU64(size) - 32
+    if trailer.magic != MAGIC || trailer.length < usize.toU64(PAGE) || trailer.length > usize.toU64(RESERVED)
+      || trailer.offset > end || trailer.length > end - trailer.offset
+      || trailer.offset % usize.toU64(PAGE) != 0 || trailer.length % usize.toU64(PAGE) != 0 { return Pointer.null<u8>() }
+    let length = u64.toUsize(trailer.length)
+    let mapped = unsafe mapAt(baseAddress(), length, READ_WRITE, MAP_IMAGE, fd, u64.toI64(trailer.offset))
+    if Pointer.address<u8>(mapped) != BASE { return Pointer.null<u8>() }
+    let base = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(mapped)
+    let state = unsafe Pointer.read<Header>(unsafe header(base))
+    if state.magic != MAGIC || state.end < BASE + PAGE || state.end > BASE + length {
+      let _unmapped = unsafe munmap(base, length)
+      return Pointer.null<u8>()
+    }
+    return base
+  }
+} else {
+  pub unsafe fn begin() -> ?*mut u8 { return Pointer.null<u8>() }
+  pub unsafe fn save(base: *mut u8, path: &[u8]) -> bool { return false }
+  pub unsafe fn load() -> ?*mut u8 { return Pointer.null<u8>() }
+}
