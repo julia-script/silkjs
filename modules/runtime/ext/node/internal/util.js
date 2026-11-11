@@ -467,21 +467,18 @@ function getConstructorOf(obj) {
 }
 
 let validateUint32;
-let sleepCell;
-
-// Node's binding sleeps the thread (uv_sleep); Atomics.wait on a cell nobody notifies does the same.
 function sleep(msec) {
   // Lazy-load to avoid a circular dependency.
   if (validateUint32 === undefined)
     ({ validateUint32 } = require('internal/validators'));
 
   validateUint32(msec, 'msec');
-  sleepCell ??= new Int32Array(new SharedArrayBuffer(4));
-  Atomics.wait(sleepCell, 0, 0, msec);
+  require('internal/util/binding').sleep(msec);
 }
 
 module.exports = {
   assertCrypto,
+  sleep,
   assignFunctionName,
   customInspectSymbol: SymbolFor('nodejs.util.inspect.custom'),
   customPromisifyArgs: kCustomPromisifyArgsSymbol,
@@ -508,5 +505,4 @@ module.exports = {
   promisify,
   removeColors,
   setOwnProperty,
-  sleep,
 };

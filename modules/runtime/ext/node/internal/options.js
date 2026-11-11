@@ -273,6 +273,8 @@ function getOptionValue(name) {
     case '--frozen-intrinsics': return !!host.frozenIntrinsics;
     case '--zero-fill-buffers': return !!host.zeroFillBuffers;
     case '--experimental-inspector-network-resource': return !!host.experimentalInspectorNetworkResource;
+    case '--experimental-network-inspection': return !!host.experimentalNetworkInspection;
+    case '--experimental-storage-inspection': return !!host.experimentalStorageInspection;
     case '--inspect': return !!host.inspectorOptions?.enabled;
     case '--inspect-brk': return !!host.inspectorOptions?.breakFirst;
     case '--inspect-wait': return !!host.inspectorOptions?.wait;
