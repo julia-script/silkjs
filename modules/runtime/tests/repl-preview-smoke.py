@@ -140,7 +140,8 @@ def exercise(use_global):
         assert b'Uncaught Error: domain-check' in error, repr(error)
         execute("setTimeout(()=>{throw new Error('async'+'-domain')},1000)")
         preview('30+12', '42')
-        asynchronous = receive(lambda data: b'Uncaught Error: async-domain' in data)
+        asynchronous = receive(lambda data: b'Uncaught Error: async-domain' in data
+                               and b'> ' in data.split(b'Uncaught Error: async-domain', 1)[1])
         # The domain handler clears the line and redraws the prompt, as Node's does.
         assert b'\x1b[1G\x1b[0J' in asynchronous, repr(asynchronous)
         # Let the domain handler redraw before cancelling the preserved input.
