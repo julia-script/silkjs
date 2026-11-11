@@ -1,0 +1,321 @@
+//! The callee text of V8's "x is not a function" and "x is not a constructor"
+//! (V8's CallPrinter): recovered from the caller's source at the failed call, so
+//! compiling keeps nothing extra for it. Only failure paths run this.
+import silk.core.option { Option }
+import silk.mem.pointer { Pointer }
+import silk.collections.slice { Slice }
+import silk.num.u8
+import silk.num.u32
+import silk.num.i32
+import silk.num.usize
+import js_heap { HeapCell, HeapHeader }
+import js_core_types { NO_PC, RuntimeState, StackFrame, FunctionBytecode, FunctionDebugInfo, SourceText }
+import js_parser_diagnostics { DiagnosticMessage }
+import js_backtrace as backtrace
+import js_invariant { present }
+
+fn identByte(c: u8) -> bool {
+  return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95 || c == 36 || c >= 128
+}
+fn space(c: u8) -> bool { return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12 }
+fn quote(c: u8) -> bool { return c == 39 || c == 34 || c == 96 }
+
+/// The offset in input of a legacy line table location: lines split at LF,
+/// columns count code points, both from 1.
+fn offsetOf(input: &[u8], line: i32, column: i32) -> Option<usize> {
+  let mut at: i32 = 1
+  let mut i: usize = 0
+  while at < line {
+    if i >= input.length { return Option<usize>.none() }
+    if input[i] == 10 { at = at + 1 }
+    i = i + 1
+  }
+  let mut counted: i32 = 1
+  while counted < column {
+    if i >= input.length || input[i] == 10 { return Option<usize>.none() }
+    i = i + 1
+    while i < input.length && input[i] >= 128 && input[i] < 192 { i = i + 1 }
+    counted = counted + 1
+  }
+  return Option<usize>.some(i)
+}
+/// end moved back over spaces and block comments, not below floor.
+fn skipBack(input: &[u8], floor: usize, end: usize) -> usize {
+  let mut e = end
+  while e > floor {
+    let c = input[e - 1]
+    if space(c) { e = e - 1 continue }
+    if c == 47 && e - floor >= 4 && input[e - 2] == 42 {
+      let mut j = e - 2
+      while j >= floor + 2 && !(input[j - 2] == 47 && input[j - 1] == 42) { j = j - 1 }
+      if j < floor + 2 { return e }
+      e = j - 2
+      continue
+    }
+    break
+  }
+  return e
+}
+/// The opening quote of the string or template whose closing quote is at close.
+fn quoteStart(input: &[u8], floor: usize, close: usize) -> Option<usize> {
+  let c = input[close]
+  let mut j = close
+  while j > floor {
+    j = j - 1
+    if input[j] == c && (j == floor || input[j - 1] != 92) { return Option<usize>.some(j) }
+  }
+  return Option<usize>.none()
+}
+/// The offset of the open bracket matching the close bracket at end - 1.
+fn openingOf(input: &[u8], floor: usize, end: usize, open: u8, close: u8) -> Option<usize> {
+  let mut depth: usize = 0
+  let mut i = end
+  while i > floor {
+    i = i - 1
+    let c = input[i]
+    if quote(c) {
+      match quoteStart(input, floor, i) {
+        Option<usize>.Some { value } => { i = value continue }
+        Option<usize>.None => { return Option<usize>.none() }
+      }
+    }
+    if c == close { depth = depth + 1 }
+    else if c == open {
+      depth = depth - 1
+      if depth == 0 { return Option<usize>.some(i) }
+    }
+  }
+  return Option<usize>.none()
+}
+/// The offset of the close bracket matching the open bracket at start, or end.
+fn closingOf(input: &[u8], start: usize, end: usize, open: u8, close: u8) -> usize {
+  let mut depth: usize = 0
+  let mut i = start
+  while i < end {
+    let c = input[i]
+    if quote(c) {
+      let mut j = i + 1
+      while j < end && !(input[j] == c && input[j - 1] != 92) { j = j + 1 }
+      i = j + 1
+      continue
+    }
+    if c == open { depth = depth + 1 }
+    else if c == close {
+      depth = depth - 1
+      if depth == 0 { return i }
+    }
+    i = i + 1
+  }
+  return end
+}
+/// Before is the end of what precedes a bracket group: whether that group
+/// continues an expression (a call or a member) rather than starting one.
+fn continues(input: &[u8], floor: usize, before: usize) -> bool {
+  if before == floor { return false }
+  let c = input[before - 1]
+  if c == 93 || c == 41 || quote(c) { return true }
+  if !identByte(c) { return false }
+  // A keyword before a bracket starts the expression after it.
+  let mut start = before
+  while start > floor && identByte(input[start - 1]) { start = start - 1 }
+  let word = Slice.view<u8>(input, start, before - start)
+  return !(same(word, b"return") || same(word, b"typeof") || same(word, b"void") || same(word, b"new")
+    || same(word, b"in") || same(word, b"of") || same(word, b"delete") || same(word, b"await")
+    || same(word, b"yield") || same(word, b"case") || same(word, b"throw") || same(word, b"else") || same(word, b"do"))
+}
+fn same(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length { return false }
+  let mut i: usize = 0
+  while i < a.length { if a[i] != b[i] { return false } i = i + 1 }
+  return true
+}
+/// The start of the member and call chain that ends at end.
+fn chainStart(input: &[u8], floor: usize, end: usize) -> usize {
+  let mut e = skipBack(input, floor, end)
+  while e > floor {
+    let c = input[e - 1]
+    let mut start = e
+    if identByte(c) {
+      while start > floor && identByte(input[start - 1]) { start = start - 1 }
+      if input[start] >= 48 && input[start] <= 57 { return start }
+      let before = skipBack(input, floor, start)
+      if before > floor && input[before - 1] == 46 {
+        // "." or "?." continue the chain; "..." does not.
+        if before - floor >= 2 && input[before - 2] == 46 { return start }
+        let mut dot = before - 1
+        if dot > floor && input[dot - 1] == 63 { dot = dot - 1 }
+        e = skipBack(input, floor, dot)
+        continue
+      }
+      return start
+    }
+    if c == 93 || c == 41 {
+      let open: u8 = if c == 93 { 91 } else { 40 }
+      match openingOf(input, floor, e, open, c) {
+        Option<usize>.Some { value } => {
+          let mut before = skipBack(input, floor, value)
+          // a?.[k] and a?.(x)
+          if before - floor >= 2 && input[before - 1] == 46 && input[before - 2] == 63 { before = skipBack(input, floor, before - 2) }
+          if continues(input, floor, before) { e = before continue }
+          return value
+        }
+        Option<usize>.None => { return e }
+      }
+    }
+    if quote(c) {
+      return match quoteStart(input, floor, e - 1) {
+        Option<usize>.Some { value } => value
+        Option<usize>.None => e
+      }
+    }
+    return e
+  }
+  return e
+}
+/// Whether the text from start to end opens with word.
+fn opensWith(input: &[u8], start: usize, end: usize, word: &[u8]) -> bool {
+  if end - start < word.length { return false }
+  if !same(Slice.view<u8>(input, start, word.length), word) { return false }
+  return end - start == word.length || !identByte(input[start + word.length])
+}
+fn trimStart(input: &[u8], start: usize, end: usize) -> usize {
+  let mut i = start
+  while i < end && space(input[i]) { i = i + 1 }
+  return i
+}
+fn trimEnd(input: &[u8], start: usize, end: usize) -> usize {
+  let mut e = end
+  while e > start && space(input[e - 1]) { e = e - 1 }
+  return e
+}
+/// V8's CallPrinter text for the expression from start to end.
+fn render(input: &[u8], start: usize, end: usize, out: &mut DiagnosticMessage, depth: usize) -> () {
+  let mut i = start
+  let mut primary = true
+  while i < end {
+    let c = input[i]
+    if space(c) { i = i + 1 continue }
+    if c == 47 && i + 1 < end && input[i + 1] == 42 {
+      i = i + 2
+      while i + 1 < end && !(input[i] == 42 && input[i + 1] == 47) { i = i + 1 }
+      i = i + 2
+      continue
+    }
+    if c == 47 && i + 1 < end && input[i + 1] == 47 {
+      while i < end && input[i] != 10 { i = i + 1 }
+      continue
+    }
+    if identByte(c) {
+      let begin = i
+      while i < end && identByte(input[i]) { i = i + 1 }
+      let word = Slice.view<u8>(input, begin, i - begin)
+      if primary && (same(word, b"function") || same(word, b"class") || same(word, b"async")) {
+        out.append(b"(intermediate value)")
+        return ()
+      }
+      out.append(word)
+      primary = false
+      continue
+    }
+    if c == 63 && i + 1 < end && input[i + 1] == 46 {
+      out.append(b"?.")
+      i = i + 2
+      // a?.[k] and a?.(x) print as a[k] and a(...).
+      let next = trimStart(input, i, end)
+      if next < end && (input[next] == 91 || input[next] == 40) { out.length = out.length - 2 }
+      continue
+    }
+    if c == 46 { out.append(b".") i = i + 1 continue }
+    if c == 44 { out.append(b" , ") i = i + 1 continue }
+    if c == 91 {
+      let close = closingOf(input, i, end, 91, 93)
+      let innerStart = trimStart(input, i + 1, close)
+      let innerEnd = trimEnd(input, innerStart, close)
+      if primary {
+        out.append(b"(intermediate value)")
+      } else if innerEnd - innerStart >= 2 && (input[innerStart] == 39 || input[innerStart] == 34) && input[innerEnd - 1] == input[innerStart] {
+        out.append(b".") out.append(Slice.view<u8>(input, innerStart + 1, innerEnd - innerStart - 2))
+      } else {
+        out.append(b"[") if depth < 4 { render(input, innerStart, innerEnd, &mut out, depth + 1) } out.append(b"]")
+      }
+      i = close + 1
+      primary = false
+      continue
+    }
+    if c == 40 {
+      let close = closingOf(input, i, end, 40, 41)
+      if primary {
+        let innerStart = trimStart(input, i + 1, close)
+        let innerEnd = trimEnd(input, innerStart, close)
+        if innerStart < innerEnd && (input[innerStart] == 123 || opensWith(input, innerStart, innerEnd, b"function")
+          || opensWith(input, innerStart, innerEnd, b"class") || opensWith(input, innerStart, innerEnd, b"async")) {
+          out.append(b"(intermediate value)")
+        } else {
+          out.append(b"(") if depth < 4 { render(input, innerStart, innerEnd, &mut out, depth + 1) } out.append(b")")
+        }
+      } else { out.append(b"(...)") }
+      i = close + 1
+      primary = false
+      continue
+    }
+    if quote(c) {
+      let mut j = i + 1
+      while j < end && !(input[j] == c && input[j - 1] != 92) { j = j + 1 }
+      out.append(b"\"") out.append(Slice.view<u8>(input, i + 1, j - i - 1)) out.append(b"\"")
+      i = j + 1
+      primary = false
+      continue
+    }
+    if c == 123 {
+      out.append(b"(intermediate value)")
+      i = closingOf(input, i, end, 123, 125) + 1
+      primary = false
+      continue
+    }
+    out.appendCharacter(u8.toI32(c))
+    i = i + 1
+  }
+}
+
+/// Appends the text of the callee of the call the innermost frame is making,
+/// which is failing now. False, appending nothing, when that frame is not a
+/// bytecode frame at a call with its whole script's source.
+pub unsafe fn appendCallee(runtime: *mut HeapHeader, out: &mut DiagnosticMessage) -> bool {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, runtime)
+  let pointer = state.currentStackFrame
+  drop state
+  if Pointer.isNull<StackFrame>(pointer) { return false }
+  let frame = unsafe Pointer.borrow<(), StackFrame>(&anchor, present(pointer))
+  if frame.currentPc == NO_PC || frame.currentPc == 0 { return false }
+  let pc = u32.wrappingSubtract(usize.toU32(frame.currentPc), 1)
+  let code = match unsafe backtrace.bytecode(frame.currentFunction) {
+    Option<*mut HeapHeader>.Some { value } => value
+    Option<*mut HeapHeader>.None => { return false }
+  }
+  let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, code)
+  return match &function.debug {
+    Option<FunctionDebugInfo>.Some { value: debug } => {
+      let location = unsafe backtrace.lineLocation(&debug, pc)
+      if location.line <= 0 { return false }
+      match &debug.source {
+        Option<SourceText>.Some { value: source } => match source.input() {
+          Option<&[u8]>.Some { value: input } => match offsetOf(input, location.line, location.column) {
+            Option<usize>.Some { value: at } => {
+              let floor = source.offset()
+              if at < floor || at > input.length { return false }
+              let start = chainStart(input, floor, at)
+              let before = out.length
+              render(input, start, skipBack(input, start, at), &mut out, 0)
+              out.length > before
+            }
+            Option<usize>.None => false
+          }
+          Option<&[u8]>.None => false
+        }
+        Option<SourceText>.None => false
+      }
+    }
+    Option<FunctionDebugInfo>.None => false
+  }
+}
