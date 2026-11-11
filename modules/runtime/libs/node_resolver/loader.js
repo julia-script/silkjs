@@ -652,13 +652,14 @@ function createLoader(host, builtins) {
   // The module map holds one module per URL and import "type", as in Node's load cache:
   // `import './x.json' with { type: 'json' }` and a plain import of the same URL are two
   // modules. The engine keys modules by the name normalize returns, so a typed request
-  // gets the type after a NUL, which no path or URL contains.
+  // gets the type after U+FFFF, a noncharacter that URLs percent-encode and paths
+  // do not hold (the engine ends a module name at a NUL).
   function moduleKey(name, attributes) {
     const type = attributes && attributes.type;
-    return typeof type === 'string' && type !== '' ? `${name}\0${type}` : name;
+    return typeof type === 'string' && type !== '' ? `${name}\uFFFF${type}` : name;
   }
   function keyName(key) {
-    const end = key.indexOf('\0');
+    const end = key.indexOf('\uFFFF');
     return end === -1 ? key : key.slice(0, end);
   }
 
@@ -680,7 +681,7 @@ function createLoader(host, builtins) {
     const parentFilename = parent && typeof parent === 'object' ? parent.filename : parent;
     const parentURL = parentFilename ? asURL(parentFilename) : undefined;
     return mockResolution(rememberResolution(hooks.run('resolve', specifier, {
-      parentURL, conditions: conditions(mode), importAttributes: attributes || {},
+      parentURL, conditions: conditions(mode), importAttributes: { ...attributes },
       resolveOptions: options, isMain: !!isMain,
     }, allowAsync), mode, attributes), mode);
   }
@@ -1352,16 +1353,43 @@ function createLoader(host, builtins) {
   // [[Instance]] of each evaluated Wasm module, by its namespace: a Wasm module that
   // imports a global from another Wasm module gets the WebAssembly.Global itself.
   const wasmInstances = new WeakMap();
-  function wasmSource(filename, bytes) {
+  // One WebAssembly.Module per URL, the evaluation phase's and the source phase's.
+  const wasmCompiled = new Map();
+  function compileWasm(filename, bytes) {
+    const cached = wasmCompiled.get(filename);
+    if (cached) return cached;
     const url = asURL(filename);
-    const { WebAssembly } = globalThis;
     if (bytes == null || (typeof bytes !== 'object')) throw error('ERR_INVALID_RETURN_PROPERTY_VALUE', 'a string, an ArrayBuffer, or a TypedArray', 'load', 'source', bytes);
     let compiled;
-    try { compiled = new WebAssembly.Module(bytes, { builtins: ['js-string'], importedStringConstants: 'wasm:js/string-constants' }); }
+    try { compiled = new globalThis.WebAssembly.Module(bytes, { builtins: ['js-string'], importedStringConstants: 'wasm:js/string-constants' }); }
     catch (cause) {
       if (cause && typeof cause === 'object') cause.message = (url.startsWith('file:') ? filesystemName(url) : url) + ': ' + cause.message;
       throw cause;
     }
+    wasmCompiled.set(filename, compiled);
+    return compiled;
+  }
+  // GetModuleSource for `import source x from specifier` and import.source(): a
+  // Wasm module's WebAssembly.Module, which is neither instantiated nor evaluated.
+  // Other modules have no source object (Node's ERR_SOURCE_PHASE_NOT_DEFINED).
+  function moduleSource(specifier, parent, attributes) {
+    const resolved = resolveImport(specifier, parent, attributes);
+    const cached = wasmCompiled.get(resolved.filename);
+    if (cached) return cached;
+    if (resolved.format === undefined || resolved.format === 'wasm') {
+      const key = moduleKey(resolved.filename, resolved.importAttributes || attributes);
+      const loaded = loadSource(resolutions.get(key) || resolved, attributes);
+      if (loaded.format === 'wasm') return compileWasm(resolved.filename, loaded.source);
+    }
+    const url = asURL(resolved.filename);
+    const cause = new SyntaxError(`Source phase import object is not defined for module '${url}'`);
+    cause.code = 'ERR_SOURCE_PHASE_NOT_DEFINED';
+    throw cause;
+  }
+  function wasmSource(filename, bytes) {
+    const url = asURL(filename);
+    const { WebAssembly } = globalThis;
+    const compiled = compileWasm(filename, bytes);
     const imports = new Set();
     const globalImports = [];
     for (const entry of WebAssembly.Module.imports(compiled)) {
@@ -1564,7 +1592,7 @@ function createLoader(host, builtins) {
     return { source, format: resolved.format, filename: resolved.filename };
   }
 
-  return { decorateModuleError, resolveImport, importKey, requireFor, runMain, defaultRunMain, warmMain, resolve, resolveMain, loadESM, cleanSource, prepareSource, bridge, Module, mockModule };
+  return { decorateModuleError, resolveImport, importKey, moduleSource, requireFor, runMain, defaultRunMain, warmMain, resolve, resolveMain, loadESM, cleanSource, prepareSource, bridge, Module, mockModule };
 }
 
 module.exports = { createLoader };

@@ -1539,6 +1539,7 @@ const imageModules = ['fs', 'fs/promises', 'internal/fs_streams', 'internal/fs_u
 globalThis.__silkRuntime = {
   normalize(name, parent, attributes) { return loader.importKey(name, parent, attributes); },
   load(name, attributes) { return loader.loadESM(name, attributes).source; },
+  moduleSource(name, parent, attributes) { return loader.moduleSource(name, parent, attributes); },
   registerSource(filename, source, metadata) {
     host.registerSource(filename, source, { ...metadata, owner: metadata });
     if (!metadata.generated && typeof filename === 'string') {
