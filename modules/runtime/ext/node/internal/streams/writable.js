@@ -1,4 +1,4 @@
-// Adapted from Node.js v24.11.0 for Silk QuickJS.
+// Adapted from Node.js v24.22.1 for Silk QuickJS.
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -47,8 +47,7 @@ const EE = require('events');
 const Stream = require('internal/streams/legacy').Stream;
 const { Buffer } = require('buffer');
 const destroyImpl = require('internal/streams/destroy');
-const eos = require('internal/streams/end-of-stream');
-
+const { eos } = require('internal/streams/end-of-stream');
 const {
   addAbortSignal,
 } = require('internal/streams/add-abort-signal');
@@ -85,6 +84,8 @@ const {
   kConstructed,
   kOnConstructed,
 } = require('internal/streams/utils');
+
+const { assignFunctionName } = require('internal/util');
 
 const { errorOrDestroy } = destroyImpl;
 
@@ -348,7 +349,7 @@ function WritableState(options, stream, isDuplex) {
   this.corked = 0;
 
   // The callback that's passed to _write(chunk, cb).
-  this.onwrite = onwrite.bind(undefined, stream);
+  this.onwrite = (er) => onwrite(stream, er);
 
   // The amount that is being written when _write is called.
   this.writelen = 0;
@@ -436,12 +437,12 @@ function Writable(options) {
 
 ObjectDefineProperty(Writable, SymbolHasInstance, {
   __proto__: null,
-  value: function(object) {
-    if (FunctionPrototypeSymbolHasInstance(this, object)) return true;
+  value: assignFunctionName(SymbolHasInstance, function(instance) {
+    if (FunctionPrototypeSymbolHasInstance(this, instance)) return true;
     if (this !== Writable) return false;
 
-    return object && object._writableState instanceof WritableState;
-  },
+    return instance && instance._writableState instanceof WritableState;
+  }),
 });
 
 // Otherwise people can pipe Writable streams, which is just wrong.
@@ -468,6 +469,9 @@ function _write(stream, chunk, encoding, cb) {
     }
 
     if (typeof chunk === 'string') {
+      if (encoding === 'buffer') {
+        throw new ERR_UNKNOWN_ENCODING(encoding);
+      }
       if ((state[kState] & kDecodeStrings) !== 0) {
         chunk = Buffer.from(chunk, encoding);
         encoding = 'buffer';
@@ -784,7 +788,7 @@ function clearBuffer(stream, state) {
 
     if (i === buffered.length) {
       resetBuffer(state);
-    } else if (i > 256) {
+    } else if (i > 256 && i * 2 >= buffered.length) {
       buffered.splice(0, i);
       state.bufferedIndex = 0;
     } else {
@@ -1136,7 +1140,7 @@ let webStreamsAdapters;
 // Lazy to avoid circular references
 function lazyWebStreams() {
   if (webStreamsAdapters === undefined)
-    webStreamsAdapters = require('internal/streams/web-adapters');
+    webStreamsAdapters = require('internal/webstreams/adapters');
   return webStreamsAdapters;
 }
 

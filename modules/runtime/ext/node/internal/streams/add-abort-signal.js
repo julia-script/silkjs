@@ -1,4 +1,4 @@
-// Adapted from Node.js v24.11.0 for Silk QuickJS.
+// Adapted from Node.js v24.22.1 for Silk QuickJS.
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -39,7 +39,7 @@ const {
   kControllerErrorFunction,
 } = require('internal/streams/utils');
 
-const eos = require('internal/streams/end-of-stream');
+const { eos } = require('internal/streams/end-of-stream');
 let addAbortListener;
 
 // This method is inlined here for readable-stream
