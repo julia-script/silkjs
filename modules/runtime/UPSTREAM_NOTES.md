@@ -1039,21 +1039,21 @@ runtime policy. Callback arenas must survive reentry without borrowing a
 movable host value; finalizers must run before unloading native code and must
 not call JavaScript after isolate shutdown.
 
-## Unicode-versioned IDNA tables
+## Native WHATWG URL parser
 
-The URL implementation now uses the Unicode 17 data from `tr46` 6.0.0,
-matching the pinned Node 24 binary. Its algorithm, status map, and license
-are byte-identical to the previous 5.1.1 inputs; only generated mapping and
-validation tables changed. Exact source commit and npm integrity are recorded
-in `ext/web/vendor/provenance.json`.
+`URL` and `URLSearchParams` (`ext/web/url.js`) are thin wrappers over the Silk
+standard library's `silk.url` (WHATWG URL Standard) and `silk.text.idna`
+(UTS #46), reached through `src/ext/url_native.silk`. The vendored whatwg-url,
+tr46, and webidl-conversions packages are gone. Each URL keeps its ASCII href
+and the component offsets the native writes into a shared `Uint32Array`, so the
+getters are string slices; setters reparse the href natively and apply the
+setter. Form encoding and decoding call the natives only for text that needs
+escaping.
 
-Differential URL/encoding and IDNA boundary consumers passed for newly
-assigned U+11DB0/U+1E6C0 hosts, an adjacent unassigned character, fullwidth
-mapping, joiners, and leading combining characters. For a future stdlib
-Unicode/IDNA API, versioned generated data and scalar-validity boundaries are
-reusable; Node URL diagnostics and domainToASCII/domainToUnicode coercion
-policy are not. Do not update tables independently of the target Unicode
-version: `tr46` 7.0.0 contains Unicode 18, not the required Unicode 17.
+The IDNA data is Unicode 18.0.0, which the pinned web-platform-tests data
+(`silk/integration/url-conformance`) requires. The pinned Node 24 binary uses
+Unicode 17, so hosts made of characters first assigned in Unicode 18 parse here
+and fail in that Node.
 
 ## Owner-thread diagnostic transport
 
