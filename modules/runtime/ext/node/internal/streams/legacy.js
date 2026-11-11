@@ -1,4 +1,4 @@
-// Adapted from Node.js v24.11.0 for Silk QuickJS.
+// Adapted from Node.js v24.22.1 for Silk QuickJS.
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -81,7 +81,8 @@ Stream.prototype.pipe = function(dest, options) {
   // Don't leave dangling pipes when there are errors.
   function onerror(er) {
     cleanup();
-    if (EE.listenerCount(this, 'error') === 0) {
+    // If we removed the last error handler, trigger an unhandled error event.
+    if (this.listenerCount?.('error') === 0) {
       this.emit('error', er);
     }
   }
