@@ -57,6 +57,18 @@ REPLACEMENTS = {
     'put_var_ref3': ('sar_imm', 3, 1, 1, 'i16'),
     'set_var_ref0': ('and_imm', 3, 1, 1, 'i16'),
     'set_var_ref1': ('or_imm', 3, 1, 1, 'i16'),
+    # push_minus1 is emitted as push_i8; its number holds the fusion prefix. A
+    # prefix pushes and pops nothing: the instructions it covers follow it
+    # unchanged, and it either answers all of them at once and skips them or
+    # does nothing and lets them run. Its four operand bytes depend on what it
+    # covers, which the first covered opcode tells:
+    # - a local read, add_imm, sar_imm or not, get_array_el
+    #   (`heap[(x + k) >> s]`): the shift count, the add_imm constant and the
+    #   covered byte count;
+    # - dup, push_atom_value, strict_eq and a forward if_true8 or if_false8 (a
+    #   `switch` case on a string): the atom (the covered push_atom_value owns
+    #   the reference).
+    'push_minus1': ('fuse_prefix', 5, 0, 0, 'u32'),
     'set_var_ref2': ('put_loc_field_loc8', 7, 0, 0, 'atom_u16'),
     'set_var_ref3': ('put_loc_field_arg8', 7, 0, 0, 'atom_u16'),
     # push_2 to push_7 are emitted as push_i8; their numbers hold add, sub and
