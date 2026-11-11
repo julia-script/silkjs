@@ -221,7 +221,7 @@ Socket.prototype._onNative = function(type, status, payload) {
       this._readEOF = true;
       // Match Node's onStreamRead: read(0) schedules end for an empty,
       // unconsumed socket without consuming any buffered application data.
-      if (!this._onreadPending) { this.push(null); this.read(0); }
+      if (!this._onreadPending) this._pushEOF();
       return;
     }
     if (status < 0) { this.destroy(nativeError(status, 'read')); return; }
@@ -246,7 +246,14 @@ Socket.prototype._deliverOnread = function() {
     this._onreadPending = count < chunk.length ? chunk.subarray(count) : this._onreadQueue?.shift() || null;
     if (this._onread.callback.call(this, count, destination) === false) this.pause();
   }
-  if (this._readEOF && !this._onreadPending && !this.destroyed) { this.push(null); this.read(0); }
+  if (this._readEOF && !this._onreadPending && !this.destroyed) this._pushEOF();
+};
+Socket.prototype._pushEOF = function() {
+  // Like libuv under Node, an onread socket is asked for a buffer for the read that sees EOF too.
+  if (!this._eofPushed && typeof this._onread?.callback === 'function' && typeof this._onread.buffer === 'function') this._onread.buffer();
+  this._eofPushed = true;
+  this.push(null);
+  this.read(0);
 };
 Socket.prototype._read = function() {
   if (!this._connected || this.destroyed || this._readPaused || this.readableEnded) return;
@@ -289,7 +296,11 @@ Socket.prototype._writev = function(chunks, cb) { this._send(chunks, cb, true); 
 Socket.prototype._final = function(cb) {
   if (this.connecting) { this._pendingWrite = () => this._final(cb); return; }
   if (!this._transport || !this._connected) { cb(); return; }
-  this._transport.shutdown(cb);
+  // Like Node: a shutdown that fails at submission reports it, but the status of a submitted
+  // shutdown is not reported (afterShutdown); a peer that reset the connection fails the reads.
+  let submitted = false;
+  this._transport.shutdown(err => { if (submitted) cb(); else cb(err); });
+  submitted = true;
 };
 Socket.prototype._destroy = function(err, cb) {
   ++this._generation;
@@ -739,6 +750,11 @@ Server.prototype.close = function(cb) {
   return this;
 };
 Server.prototype.address = function() { return this._listening ? this._transport.address() : null; };
+// Like Node: with captureRejections, a rejected 'connection' listener destroys that socket.
+Server.prototype[EventEmitter.captureRejectionSymbol] = function(err, event, sock) {
+  if (event === 'connection') sock.destroy(err);
+  else this.emit('error', err);
+};
 Server.prototype.getConnections = function(cb) { callback(cb); if (!cb) throw fail('ERR_INVALID_ARG_TYPE', 'Callback must be a function', TypeError); process.nextTick(cb, null, this._connections); return this; };
 Server.prototype.ref = function() { this._unrefed = false; this._transport?.ref(); return this; };
 Server.prototype.unref = function() { this._unrefed = true; this._transport?.unref(); return this; };
