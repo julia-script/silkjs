@@ -91,9 +91,12 @@ host.processFeatures = {
   debug: native.debugBuild, uv: true, ipv6: true, inspector: true,
   openssl_is_boringssl: false, quic: false,
   tls: true, tls_alpn: true, tls_sni: true, tls_ocsp: false,
-  cached_builtins: false, require_module: true,
+  cached_builtins: false,
+  get require_module() { return !host.requireModuleDisabled; },
   get typescript() { return host.typeScriptMode; }
 };
+// Node's kFirstModuleParent: the module that first required a module, for require stacks.
+host.kFirstModuleParent = Symbol('kFirstModuleParent');
 define('internal/host', module => { module.exports = host; });
 internalRequire('internal/error_stack').install(globalThis);
 let warnedTransformTypes = false;
@@ -103,8 +106,10 @@ host.stripTypeScriptModuleTypes = (source, filename, sourceURL = filename) => {
     warnedTransformTypes = true;
     process.emitWarning('Transform Types is an experimental feature and might change at any time', 'ExperimentalWarning');
   }
-  return internalRequire('internal/typescript').stripTypeScriptModuleTypes(
-    source, filename, transform ? 'transform' : 'strip-only', transform, sourceURL);
+  // --experimental-transform-types implies --enable-source-maps unless it is turned off.
+  const mode = transform ? 'transform' : 'strip-only', sourceMap = transform && host.enableSourceMaps !== false;
+  const strip = () => internalRequire('internal/typescript').stripTypeScriptModuleTypes(source, filename, mode, sourceMap, sourceURL);
+  return moduleHas('internal/compile_cache') ? internalRequire('internal/compile_cache').transpile(source, filename, mode, sourceMap, strip) : strip();
 };
 // These ephemeron registries share brands without rooting other realms. Only
 // internal factories receive the bridge; no registry is a VM global.
@@ -524,6 +529,7 @@ const ProcessConstructor = { process: function () {} }.process;
 Object.setPrototypeOf(ProcessConstructor.prototype, EventEmitter.prototype);
 const process = Object.create(ProcessConstructor.prototype);
 EventEmitter.call(process);
+Object.defineProperty(process, Symbol.toStringTag, { enumerable: false, writable: true, configurable: false, value: 'process' });
 defineGlobalAccessor('process', process);
 let startTime = native.runtimeStartTime;
 const performanceMilestones = {
@@ -573,7 +579,7 @@ function buildConfig() {
       cflags: [], default_configuration: native.debugBuild ? 'Debug' : 'Release', defines: [], include_dirs: [], libraries: [],
     },
     variables: {
-      asan: 0, ubsan: 0, napi_build_version: '10', node_builtin_shareable_builtins: [], node_shared: false,
+      asan: 0, ubsan: 0, napi_build_version: '10', node_builtin_shareable_builtins: [], node_module_version: 137, node_shared: false,
       node_shared_openssl: false, node_shared_sqlite: false, node_shared_zstd: false, node_use_amaro: true,
       node_use_openssl: true, node_without_node_options: false, node_quic: false, shlib_suffix: host.platform === 'darwin' ? 'dylib' : 'so',
       single_executable_application: true, icu_small: false, v8_enable_i18n_support: 1, v8_enable_inspector: 1,
@@ -607,7 +613,7 @@ Object.assign(process, {
     process.reallyExit(Number(process.exitCode) || 0);
   },
   // What process.exit ends with; replaceable, as in Node.
-  reallyExit(code) { internalRequire('internal/compile_cache').flushCompileCache(); rawStd.exit(code); },
+  reallyExit(code) { if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushAtExit(); rawStd.exit(code); },
   kill(pid, signal) {
     if (pid != (pid | 0)) throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('pid', 'number', pid);
     let number = signal;
@@ -840,10 +846,15 @@ function evaluateMain(source, name) {
   armInspectorEntry();
   return native.evaluateModule(source, name, true);
 }
-const requirePreloads = [], importPreloads = [];
+const requirePreloads = [], importPreloads = [], loaderPreloads = [];
 function runPreloads(entry, loadImports = true) {
   // Before any preload: Node applies it when the context is made.
   if (host.disableProto !== undefined) disableProto(globalThis);
+  // --experimental-loader: each one is module.register(specifier, cwd) before any preload.
+  if (loadImports && loaderPreloads.length) {
+    const base = internalRequire('url').pathToFileURL(host.cwd() + host.path.sep).href;
+    for (const specifier of loaderPreloads) loader.Module.register(specifier, base);
+  }
   loader.Module._preloadModules(requirePreloads);
   if (host.frozenIntrinsics) {
     process.emitWarning('Frozen intristics is an experimental feature and might change at any time', 'ExperimentalWarning');
@@ -919,6 +930,15 @@ function runtimeFlag(arg) {
   if (arg === '--experimental-stream-iter' || arg === '--no-experimental-stream-iter') {
     host.experimentalStreamIter = arg === '--experimental-stream-iter'; return true;
   }
+  if (arg === '--experimental-require-module' || arg === '--no-experimental-require-module' ||
+      arg === '--require-module' || arg === '--no-require-module') {
+    host.requireModuleDisabled = arg.startsWith('--no-'); return true;
+  }
+  if (arg === '--experimental-import-meta-resolve') { host.importMetaResolveParent = true; return true; }
+  if (arg === '--experimental-print-required-tla') { host.printRequiredTLA = true; return true; }
+  if (arg.startsWith('--experimental-loader=') || arg.startsWith('--loader=')) {
+    loaderPreloads.push(arg.slice(arg.indexOf('=') + 1)); return true;
+  }
   if (arg === '--experimental-vm-modules' || arg === '--no-experimental-vm-modules') {
     host.experimentalVmModules = arg === '--experimental-vm-modules'; return true;
   }
@@ -964,6 +984,7 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
     delete globalThis.CloseEvent;
   }
   if (host.experimentalWebStorage) internalRequire('internal/web/storage').install(globalThis, { localStorageFile: host.localStorageFile });
+  if (host.experimentalStreamIter) { internalRequire('fs/promises'); internalRequire('internal/fs_iter').install(); }
   if (workerThreads.isMainThread) internalRequire('internal/trace_events').initialize(host.traceOptions);
   if (workerThreads.isMainThread && host.traceSigint) internalRequire('util').setTraceSigInt(true);
   if (process.env.NODE_COMPILE_CACHE) internalRequire('internal/compile_cache').initialize();
@@ -1304,6 +1325,13 @@ function run() {
   }
   const path = host.path.resolve(filename);
   process.argv[1] = path;
+  // A preload may replace Module.runMain (test-module-run-main-monkey-patch); Node then
+  // hands it the entry path instead of running its own loader.
+  if (loader.Module.runMain !== loader.defaultRunMain) {
+    mainModuleName = path;
+    armInspectorEntry();
+    return afterMain(loader.Module.runMain(path));
+  }
   // Only a preload can register a hook or a mock that resolves it differently.
   const resolved = early !== undefined && !requirePreloads.length && !importPreloads.length ? early : loader.resolveMain(path);
   mainModuleName = resolved.filename;
@@ -1411,14 +1439,14 @@ function loop() {
   performanceMilestones.loopExit = native.now() - startTime;
   process._exiting = true; const status = Number(process.exitCode) || 0;
   process.emit('exit', status);
-  if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushCompileCache();
+  if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushAtExit();
   return Number(process.exitCode) || 0;
 }
 const imageModules = ['fs', 'fs/promises', 'internal/fs_streams', 'internal/fs_utf8_stream', 'path', 'os',
   'events', 'stream', 'stream/promises', 'string_decoder', 'util', 'assert', 'console', 'net', 'tty',
   'internal/tty/write', 'url', 'internal/web/url', 'internal/web/encoding', 'internal/abort_controller'];
 globalThis.__silkRuntime = {
-  normalize(name, parent, attributes) { return loader.resolve(name, parent, 'import', attributes).filename; },
+  normalize(name, parent, attributes) { return loader.resolveImport(name, parent, attributes).filename; },
   load(name, attributes) { return loader.loadESM(name, attributes).source; },
   registerSource(filename, source, metadata) {
     host.registerSource(filename, source, { ...metadata, owner: metadata });
@@ -1429,15 +1457,25 @@ globalThis.__silkRuntime = {
   importMeta(name) {
     const asURL = value => /^[A-Za-z][A-Za-z\d+.-]*:/.test(value) ? value : fileHref(value);
     const url = asURL(name);
-    const meta = {
-      url,
-      main: mainModuleName !== undefined && url === asURL(mainModuleName),
-      resolve(specifier) { return asURL(loader.resolve(specifier, name, 'import').filename); }
-    };
+    // As in Node: a null prototype, keys in this order, filename and dirname for file: only.
+    const meta = { __proto__: null };
     if (url.startsWith('file:')) {
-      meta.filename = url === 'file://' + name ? name : internalRequire('url').fileURLToPath(url);
-      meta.dirname = host.path.dirname(meta.filename);
+      const filename = url === 'file://' + name ? name : internalRequire('url').fileURLToPath(url);
+      meta.dirname = host.path.dirname(filename);
+      meta.filename = filename;
     }
+    meta.main = mainModuleName !== undefined && url === asURL(mainModuleName);
+    meta.resolve = function resolve(specifier, parent) {
+      // Only --experimental-import-meta-resolve gives the second argument meaning.
+      const from = host.importMetaResolveParent && parent !== undefined ? String(parent) : name;
+      // As in Node, a file that is missing (or a directory) still resolves to its URL.
+      try { return asURL(loader.resolve(specifier, from, 'import').filename); }
+      catch (error) {
+        if ((error?.code === 'ERR_MODULE_NOT_FOUND' || error?.code === 'ERR_UNSUPPORTED_DIR_IMPORT') && error.url) return error.url;
+        throw error;
+      }
+    };
+    meta.url = url;
     return meta;
   },
   asyncEvent: asyncHooks._nativeEvent,

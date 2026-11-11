@@ -9,8 +9,8 @@ const kHandle = Symbol('kHandle');
 const kClone = Symbol('kClone');
 const kDeserialize = Symbol('kDeserialize');
 
-const { codes: { ERR_INVALID_ARG_VALUE }, validateObject, validateString, validateInteger } = require('internal/validators');
-const { makeError, validatePort } = require('internal/net/errors');
+const { codedError, codes: { ERR_INVALID_ARG_VALUE }, validateObject, validatePort, validateString, validateInteger } = require('internal/validators');
+
 
 // --- inet_pton / inet_ntop ---------------------------------------------------
 
@@ -80,7 +80,7 @@ function formatAddress(handle) {
 
 function createHandle(address, port, family, flowlabel) {
   const bytes = parseAddress(address, family);
-  if (bytes === null) throw makeError(Error, 'ERR_INVALID_ADDRESS', 'Invalid socket address');
+  if (bytes === null) throw codedError(Error, 'ERR_INVALID_ADDRESS', 'Invalid socket address');
   return { family, bytes, port, flowlabel: family === 6 ? flowlabel : 0 }; // IPv4 has no flow label.
 }
 

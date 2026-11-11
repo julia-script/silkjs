@@ -160,6 +160,10 @@ function check(scope, resource = '') {
   if (granted(scope, resource)) return;
   violation(scope, resource);
 }
+// Whether the permission model lets the runtime itself use `resource` (no events).
+function allows(scope, resource) {
+  return !initialized || !state.enforce || granted(scope, resource);
+}
 function canRead(resource) {
   return !initialized || (!state.enforce && !state.audit) || has('fs.read', resource);
 }
@@ -336,5 +340,5 @@ function initialize(options = {}) {
   }
   initialized = true;
 }
-module.exports = { applyOption, initialize, check, canRead, checkFile, checkNative,
+module.exports = { applyOption, initialize, check, allows, canRead, checkFile, checkNative,
   enabled: () => initialized && (state.enforce || state.audit) };
