@@ -23,5 +23,7 @@ function getOrSetAsyncId(object) {
 
 // Whether any hook is enabled, with or without callbacks, as Node's enabledHooksExist.
 function enabledHooksExist() { return asyncHooks._hooksActive(); }
+// A fresh async id from the runtime's counter, as Node's newAsyncId.
+function newAsyncId() { return asyncHooks._newAsyncId(); }
 
-module.exports = { symbols, defaultTriggerAsyncIdScope, getOrSetAsyncId, executionAsyncId, enabledHooksExist };
+module.exports = { symbols, defaultTriggerAsyncIdScope, getOrSetAsyncId, executionAsyncId, enabledHooksExist, newAsyncId };
