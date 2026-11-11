@@ -8,7 +8,7 @@ const { Transport, error: nativeError, native } = require('internal/net/transpor
 let defaultAutoSelectFamily = true;
 let defaultAutoSelectFamilyAttemptTimeout = 250;
 
-const { codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_INVALID_IP_ADDRESS, ERR_IP_BLOCKED, ERR_MISSING_ARGS, ERR_OUT_OF_RANGE }, makeError,
+const { codes: { ERR_INVALID_ADDRESS_FAMILY, ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_INVALID_IP_ADDRESS, ERR_IP_BLOCKED, ERR_MISSING_ARGS, ERR_OUT_OF_RANGE }, makeError,
   validateBoolean, validateFunction, validateInt32, validateNumber, validatePort, validateString } = require('internal/errors');
 
 function fail(code, message, Type = Error) { return makeError(Type, code, message); }
@@ -121,8 +121,22 @@ function Socket(options) {
   }
   if (this._transport && !options.manualStart) process.nextTick(() => { if (!this.destroyed && options.readable !== false) this._read(); });
   attachAbort(this, options.signal, err => this.destroy(err));
+  this.on('end', onReadableStreamEnd);
 }
 Object.setPrototypeOf(Socket.prototype, Duplex.prototype);
+// Like Node: without allowHalfOpen, a write after the peer's FIN and our own end fails with EPIPE.
+function onReadableStreamEnd() {
+  if (!this.allowHalfOpen) this.write = writeAfterFIN;
+}
+function writeAfterFIN(chunk, encoding, cb) {
+  if (!this.writableEnded) return Duplex.prototype.write.call(this, chunk, encoding, cb);
+  if (typeof encoding === 'function') { cb = encoding; encoding = null; }
+  const err = new Error('This socket has been ended by the other party');
+  err.code = 'EPIPE';
+  if (typeof cb === 'function') process.nextTick(cb, err);
+  this.destroy(err);
+  return false;
+}
 Object.setPrototypeOf(Socket, Duplex);
 
 Socket.prototype._attachTransport = function(transport) {
@@ -242,7 +256,11 @@ Socket.prototype.resume = function() {
   return result;
 };
 Socket.prototype._send = function(chunks, cb, vector) {
-  if (this.connecting) { this._pendingWrite = () => this._send(chunks, cb, vector); return; }
+  if (this.connecting) {
+    this._pendingWrite = () => this._send(chunks, cb, vector);
+    this._pendingWrite.callback = cb;
+    return;
+  }
   if (!this._connected || !this._transport) { cb(fail('ERR_SOCKET_CLOSED', 'Socket is closed')); return; }
   if (vector) for (const entry of chunks) this._bytesWritten += entry.chunk.length;
   else this._bytesWritten += chunks.length;
@@ -273,7 +291,9 @@ Socket.prototype._destroy = function(err, cb) {
   this._removeAbort?.();
   const pending = this._pendingWrite;
   this._pendingWrite = null;
-  if (pending) pending();
+  // Like Node, a write waiting for the connect fails once the socket closes.
+  if (pending?.callback) process.nextTick(pending.callback, fail('ERR_SOCKET_CLOSED_BEFORE_CONNECTION', 'Socket closed before the connection was established'));
+  else if (pending) pending();
   const done = () => {
     cb(err);
     process.nextTick(() => this.emit('close', this._hadError));
@@ -363,15 +383,25 @@ Socket.prototype.connect = function(...args) {
       const lookup = options.lookup || require('dns').lookup;
       const family = socketToDnsFamily(options.family);
       const auto = (options.autoSelectFamily ?? defaultAutoSelectFamily) && family !== 4 && family !== 6 && !options.localAddress;
-      lookup(host, { family, hints: options.hints || 0, all: auto }, (err, address, resolvedFamily) => {
+      // Like Node, without a family or hints the lookup asks only for configured address families.
+      const hints = options.hints || (family !== 4 && family !== 6 ? require('dns').ADDRCONFIG : 0);
+      lookup(host, { family, hints, all: auto }, (err, address, resolvedFamily) => {
         if (this.destroyed || generation !== this._generation) return;
         if (err) { this.emit('lookup', err, undefined, undefined, host); this.destroy(err); return; }
-        const records = auto ? address : [{ address, family: resolvedFamily }];
-        if (!Array.isArray(records) || records.length === 0 || records.some(record => !record || !isIP(record.address))) {
-          this.destroy(fail('ERR_INVALID_IP_ADDRESS', 'Lookup did not return a valid IP address', TypeError)); return;
+        const answers = auto ? address : [{ address, family: resolvedFamily }];
+        if (!Array.isArray(answers) || answers.length === 0 || !answers[0]) {
+          this.destroy(new ERR_INVALID_IP_ADDRESS(auto ? undefined : address)); return;
         }
-        for (const record of records) this.emit('lookup', null, record.address, record.family, host);
+        for (const record of answers) this.emit('lookup', null, record?.address, record?.family, host);
         if (this.destroyed) return;
+        // Node keeps the IPv4 and IPv6 answers, and fails on the first answer when none is valid.
+        const records = answers.filter(record => record && isIP(record.address) && (record.family === 4 || record.family === 6));
+        if (records.length === 0) {
+          const first = answers[0];
+          this.destroy(!isIP(first.address) ? new ERR_INVALID_IP_ADDRESS(first.address)
+            : new ERR_INVALID_ADDRESS_FAMILY(first.family, options.host, options.port));
+          return;
+        }
         if (!auto || records.length === 1) { start(records[0].address, records[0].family); return; }
         const firstFamily = records[0].family;
         const primary = records.filter(record => record.family === firstFamily);
@@ -655,13 +685,13 @@ Server.prototype._emitCloseIfDrained = function() {
   this._closing = false;
   process.nextTick(() => this.emit('close'));
 };
+// Like Node: a callback that is not a function is ignored, and 'close' is emitted even when the
+// server was not listening, with ERR_SERVER_NOT_RUNNING for the callback.
 Server.prototype.close = function(cb) {
-  callback(cb);
-  if (!this._listening && !this._starting && !this._closing) {
-    if (cb) process.nextTick(cb, fail('ERR_SERVER_NOT_RUNNING', 'Server is not running'));
-    return this;
+  if (typeof cb === 'function') {
+    if (!this._transport) this.once('close', function close() { cb(fail('ERR_SERVER_NOT_RUNNING', 'Server is not running')); });
+    else this.once('close', cb);
   }
-  if (cb) this.once('close', cb);
   ++this._generation;
   this._starting = false;
   this._listening = false;

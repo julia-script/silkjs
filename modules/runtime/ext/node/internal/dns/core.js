@@ -21,7 +21,7 @@ function native(op, args) {
   catch (e) { resource.emitDestroy(); throw e; }
 }
 const { codes: { ERR_INVALID_ARG_VALUE, ERR_INVALID_IP_ADDRESS }, makeError, validateArray, validateFunction, validateInt32,
-  validatePort, validateString, validateUint32 } = require('internal/errors');
+  validateNumber, validatePort, validateString, validateUint32 } = require('internal/errors');
 function validateStringWithoutNullBytes(value, name) {
   validateString(value, name);
   if (value.includes('\0')) throw new ERR_INVALID_ARG_VALUE(name, value, 'must be a string without null bytes');
@@ -56,8 +56,12 @@ function lookup(hostname, options, cb) {
   let family = options.family === undefined ? 0 : options.family;
   if (family === 'IPv4') family = 4; if (family === 'IPv6') family = 6;
   if (![0, 4, 6].includes(family)) throw valueError('options.family', family);
-  const hints = options.hints === undefined ? 0 : integer(options.hints, 'options.hints', 0, 0xffffffff);
-  if (hints & ~(constants.ADDRCONFIG | constants.ALL | constants.V4MAPPED)) throw valueError('options.hints', hints);
+  let hints = 0;
+  if (options.hints != null) {
+    validateNumber(options.hints, 'options.hints');
+    hints = options.hints >>> 0;
+    if (hints & ~(constants.ADDRCONFIG | constants.ALL | constants.V4MAPPED)) throw new ERR_INVALID_ARG_VALUE('hints', hints);
+  }
   if (options.all !== undefined && typeof options.all !== 'boolean') throw invalid('options.all', 'a boolean');
   if (options.verbatim !== undefined && typeof options.verbatim !== 'boolean') throw invalid('options.verbatim', 'a boolean');
   const resultOrder = options.order !== undefined ? order(options.order) : options.verbatim !== undefined ? options.verbatim ? 'verbatim' : 'ipv4first' : defaultOrder;

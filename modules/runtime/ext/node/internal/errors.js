@@ -131,6 +131,12 @@ const codes = {
   ERR_SOCKET_DGRAM_IS_CONNECTED: function() { return makeError(Error, 'ERR_SOCKET_DGRAM_IS_CONNECTED', 'Already connected'); },
   ERR_SOCKET_DGRAM_NOT_CONNECTED: function() { return makeError(Error, 'ERR_SOCKET_DGRAM_NOT_CONNECTED', 'Not connected'); },
   ERR_SOCKET_DGRAM_NOT_RUNNING: function() { return makeError(Error, 'ERR_SOCKET_DGRAM_NOT_RUNNING', 'Not running'); },
+  ERR_INVALID_ADDRESS_FAMILY: function(addressType, host, port) {
+    const err = makeError(RangeError, 'ERR_INVALID_ADDRESS_FAMILY', `Invalid address family: ${addressType} ${host}:${port}`);
+    err.host = host;
+    err.port = port;
+    return err;
+  },
   ERR_INVALID_IP_ADDRESS: function(address) {
     return makeError(TypeError, 'ERR_INVALID_IP_ADDRESS', `Invalid IP address: ${address}`);
   },
