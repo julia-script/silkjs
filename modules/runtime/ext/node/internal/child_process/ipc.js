@@ -11,6 +11,7 @@ function setupChannel(target, fd, mode = 'json', onClose) {
   let input = Buffer.alloc(0), receivedFD = -1, queue = [], bytes = 0, pendingHandle = null;
   let closing = false, closed = false, explicitRef = null;
   const socketLists = new Map();
+  const sentSocketLists = new Map();
   const codec = mode === 'advanced' ? require('internal/serialization/v8') : null;
   const channel = new EventEmitter();
   const id = native('ipcOpen', [fd, (events) => {
@@ -253,6 +254,20 @@ function setupChannel(target, fd, mode = 'json', onClose) {
     else throw codedError(TypeError, 'ERR_INVALID_HANDLE_TYPE', 'This handle type cannot be sent');
     if (!Number.isInteger(handleFD) || handleFD < 0) throw failure('ERR_INVALID_HANDLE_TYPE', 'Handle is closed');
     const envelope = { cmd: 'NODE_HANDLE', type, msg: value };
+    // Like Node's handleConversion['net.Socket'].send: a server's socket carries its server's
+    // key, and the first one sent to this child joins the server's worker list.
+    if (type === 'net.Socket' && handle.server && handle.server._connectionKey !== undefined) {
+      const key = envelope.key = handle.server._connectionKey;
+      let list = sentSocketLists.get(key);
+      if (!list) {
+        list = new (require('internal/child_process/socket_list').SocketListSend)(target, key);
+        sentSocketLists.set(key, list);
+        handle.server._setupWorker(list);
+      }
+      // Node: "Act like socket is detached". The socket no longer counts toward its server,
+      // and its later destroy (after the ACK below) must not count it off again.
+      if (!options.keepOpen) { handle.server._connections--; handle._server = null; }
+    }
     if (type === 'dgram.Socket') envelope.dgramType = handle.type || (handle._family === 6 ? 'udp6' : 'udp4');
     if (type === 'dgram.Native') envelope.dgramType = handle.family === 6 ? 'udp6' : 'udp4';
     const buffer = encode(envelope);
@@ -264,6 +279,8 @@ function setupChannel(target, fd, mode = 'json', onClose) {
     queue.push({ buffer, offset: 0, fd: handleFD, callback, transfer }); bytes += buffer.length;
     flush(); refState(); return bytes < 131072;
   };
+  // Node's internal _send for its own NODE_ messages, queued in order with user messages.
+  target._send = function _send(value) { return submit(value, -1); };
   target.disconnect = function disconnect() {
     if (!target.connected) { target.emit('error', failure('ERR_IPC_DISCONNECTED', 'IPC channel is already disconnected')); return; }
     target.connected = false; closing = true; flush();

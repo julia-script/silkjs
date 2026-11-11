@@ -6,7 +6,6 @@
 
 const host = require('internal/host');
 const valueOptions = new Set(['--heap-prof-name', '--heap-prof-dir', '--heap-prof-interval']);
-const optionEntries = [['--heap-prof', false], ['--no-heap-prof', false], ...[...valueOptions].map(name => [name, true])];
 const state = { enabled: false, name: undefined, dir: undefined, interval: undefined };
 let active = false;
 let sequence = 0;
@@ -76,7 +75,6 @@ function finish() {
 }
 
 module.exports = {
-  optionEntries, applyOption, start, finish,
-  isValueOption: name => valueOptions.has(name),
+  applyOption, start, finish,
   active: () => active,
 };

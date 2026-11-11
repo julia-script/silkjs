@@ -28,6 +28,10 @@ const {
   codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_MISSING_ARGS, ERR_OUT_OF_RANGE, ERR_SOCKET_BAD_PORT, ERR_UNKNOWN_SIGNAL },
 } = require('internal/errors');
 
+function isInt32(value) {
+  return value === (value | 0);
+}
+
 function codedError(Base, code, message) {
   const error = new Base(message);
   error.code = code;
@@ -210,7 +214,7 @@ for (const fn of [validateString, validateBoolean, validateFunction, validateNum
 
 module.exports = {
   codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_MISSING_ARGS, ERR_OUT_OF_RANGE },
-  codedError, unknownSignal,
+  codedError, unknownSignal, isInt32,
   kValidateObjectAllowNullable, kValidateObjectAllowArray, kValidateObjectAllowFunction,
   kValidateObjectAllowObjects, kValidateObjectAllowObjectsAndNull,
   validateString, validateBoolean, validateFunction, validateNumber, validateInteger, validateInt32,
