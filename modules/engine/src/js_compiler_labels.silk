@@ -22,8 +22,8 @@ import js_debug_positions { PcSourcePosition }
 import js_debugger_metadata { Location }
 import js_compiler_state { computePc2Line }
 import js_compiler_emit { updateLabel, MAX_BYTECODE_CAPACITY }
-import js_compiler_code { CodeContext, matchCode, opcode, M2, M3, M4, signedWord, unsignedWord, skipDeadCode }
-import js_compiler_label_support { addPosition, pushShortInt, putShortCode, initializeLocals, resolveLabel, emitBranch, emitWith, shrinkJumps, fuseNullishBranches }
+import js_compiler_code { CodeContext, matchCode, opcode, M2, M3, M4, signedWord, unsignedWord, skipDeadCode, slotCompareShape }
+import js_compiler_label_support { addPosition, pushShortInt, putShortCode, initializeLocals, resolveLabel, emitBranch, emitWith, shrinkJumps, fuseNullishBranches, fuseBackEdges }
 import js_opcode_data as op
 
 fn matchedLine(cc: &CodeContext, line: &mut i32) -> () {
@@ -284,6 +284,10 @@ effect fn resolveInstruction(fd: &mut FunctionDef, table: &mut AtomTable, bytes:
         run out.append(op.OP_fuse_prefix) run out.writeU32(unsignedWord(address + read * 16777216))
         run addPosition(&mut fd, &out.*, line.*) run putShortCode(&mut out, code, index) return next
       }
+      if index != fd.argumentsVarIndex {
+        let compared = run slotCompare(&mut fd, &mut out, &mut cc, bytes, &mut line, code, index, next)
+        if compared >= 0 { return compared }
+      }
       if matchCode(&mut cc, bytes, next, &[M2(op.OP_post_dec, op.OP_post_inc), opcode(op.OP_put_loc), index, opcode(op.OP_drop), -1])
         || matchCode(&mut cc, bytes, next, &[M2(op.OP_dec, op.OP_inc), opcode(op.OP_dup), opcode(op.OP_put_loc), index, opcode(op.OP_drop), -1]) {
         matchedLine(&cc, &mut line) run addPosition(&mut fd, &out.*, line.*)
@@ -402,6 +406,8 @@ effect fn resolveInstruction(fd: &mut FunctionDef, table: &mut AtomTable, bytes:
       run out.append(op.OP_get_arg_el_arg8) run out.append(i32.toU8(index)) run out.append(i32.toU8(cc.index)) return cc.position
     }
     if code == op.OP_get_arg && index < 256 {
+      let compared = run slotCompare(&mut fd, &mut out, &mut cc, bytes, &mut line, code, index, next)
+      if compared >= 0 { return compared }
       // `n--;` and `++n;` as statements: the argument steps in place and the
       // pushed value is dropped.
       if matchCode(&mut cc, bytes, next, &[M2(op.OP_post_dec, op.OP_post_inc), opcode(op.OP_put_arg), index, opcode(op.OP_drop), -1])
@@ -587,6 +593,7 @@ effect fn resolve(fd: &mut FunctionDef, table: &mut AtomTable, source: &[u8]) ->
   }
   shrinkJumps(&mut fd, &mut out)
   fuseNullishBranches(&fd, &mut out)
+  fuseBackEdges(&fd, &mut out)
   // Surviving atom operands transfer without retain/release; removed ones were
   // released at their source rewrite. Publish before debug encoding can fail.
   fd.bytecode = move out fd.useShortOpcodes = true
@@ -685,6 +692,76 @@ fn localArithmetic(code: u8, both: bool) -> u8 {
   if code == op.OP_add { if both { return op.OP_add_loc_loc8 } return op.OP_add_top_loc8 }
   if code == op.OP_sub { if both { return op.OP_sub_loc_loc8 } return op.OP_sub_top_loc8 }
   if both { return op.OP_mul_loc_loc8 } return op.OP_mul_top_loc8
+}
+/// `a < b`, `--a > 0`, `a++ <= b` and the like with a the local or argument
+/// (below 256) that code, a get_loc or get_arg, reads, and b a local, an
+/// argument or a small Int: emits the fusion prefix
+/// (js_vm_operators.fusedSlotCompare), then the instructions as they would be
+/// without it: the read or step of a, b, the relation. The position after
+/// them, or -1 when no such comparison comes next (nothing is emitted).
+effect fn slotCompare(fd: &mut FunctionDef, out: &mut ByteBuffer, cc: &mut CodeContext, bytes: &[u8], line: &mut i32,
+  code: u8, index: i32, next: i32) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  let argument = code == op.OP_get_arg
+  let mut store = op.OP_put_loc if argument { store = op.OP_put_arg }
+  let mut mode: i32 = 0 if argument { mode = 64 }
+  let mut step: i32 = -1
+  let mut seen = line.*
+  let mut at = next
+  // A step statement and then the slot read again (a loop's update before
+  // its repeated test) is the pre-step form with the value used.
+  if matchCode(&mut cc, bytes, next, &[M2(op.OP_post_dec, op.OP_post_inc), opcode(store), index, opcode(op.OP_drop), opcode(code), index, -1]) {
+    step = 3 if cc.opcode == opcode(op.OP_post_inc) { step = 1 }
+  } else if matchCode(&mut cc, bytes, next, &[M2(op.OP_dec, op.OP_inc), opcode(op.OP_dup), opcode(store), index, opcode(op.OP_drop), opcode(code), index, -1]) {
+    step = 3 if cc.opcode == opcode(op.OP_inc) { step = 1 }
+  } else if matchCode(&mut cc, bytes, next, &[M2(op.OP_dec, op.OP_inc), opcode(op.OP_dup), opcode(store), index, -1]) {
+    step = 3 if cc.opcode == opcode(op.OP_inc) { step = 1 }
+  } else if matchCode(&mut cc, bytes, next, &[M2(op.OP_post_dec, op.OP_post_inc), opcode(store), index, -1]) {
+    step = 2 if cc.opcode == opcode(op.OP_post_inc) { step = 0 }
+  }
+  if step >= 0 {
+    // step is step_loc8's mode: 1 pushes the new value, 2 steps down.
+    at = cc.position matchedLine(&cc, &mut seen)
+    if (step & 2) != 0 { mode = mode | 32 } else { mode = mode | 16 }
+    if (step & 1) == 0 { mode = mode | 128 }
+  }
+  let mut right: i32 = 0
+  let mut rightCode = op.OP_push_i32
+  if matchCode(&mut cc, bytes, at, &[M2(op.OP_get_loc, op.OP_get_arg), -1, -1]) {
+    right = cc.index rightCode = i32.toU8(cc.opcode)
+    if right >= 256 || (rightCode == op.OP_get_loc && right == fd.argumentsVarIndex) { return -1 }
+    // A stepped slot compared with itself reads the stepped value.
+    if step >= 0 && rightCode == code && right == index { return -1 }
+    if rightCode == op.OP_get_arg { mode = mode | 4 }
+  } else if matchCode(&mut cc, bytes, at, &[opcode(op.OP_push_i32), -1]) {
+    right = cc.label mode = mode | 8
+    if right < -32768 || right > 32767 { return -1 }
+    if right < -128 || right > 127 { mode = mode | 12 }
+  } else { return -1 }
+  at = cc.position matchedLine(&cc, &mut seen)
+  if !matchCode(&mut cc, bytes, at, &[M4(op.OP_lt, op.OP_lte, op.OP_gt, op.OP_gte), -1]) { return -1 }
+  matchedLine(&cc, &mut seen)
+  mode = mode | (cc.opcode - opcode(op.OP_lt))
+  if !slotCompareShape(mode) { return -1 }
+  let end = cc.position
+  let prefix = out.length()
+  let immediate = right
+  run out.append(op.OP_fuse_prefix) run out.writeU32(0)
+  run addPosition(&mut fd, &out.*, line.*)
+  let start = out.length()
+  if step >= 0 {
+    let mut stepping = op.OP_step_loc8 if argument { stepping = op.OP_step_arg8 }
+    run out.append(stepping) run out.append(i32.toU8(index)) run out.append(i32.toU8(step))
+  } else { run putShortCode(&mut out, code, index) }
+  // A push_i16's immediate is read in place: the prefix holds its offset.
+  if (mode & 12) == 12 { right = usize.toI32(out.length() - prefix) run pushShortInt(&mut out, immediate) }
+  else if rightCode == op.OP_push_i32 { run pushShortInt(&mut out, right) } else { run putShortCode(&mut out, rightCode, right) }
+  run out.append(i32.toU8(opcode(op.OP_lt) + (mode & 3)))
+  out.set(prefix + 1, i32.toU8(mode)) out.set(prefix + 2, i32.toU8(index))
+  let covered = out.length() - start
+  out.set(prefix + 3, u32.toU8(unsignedWord(right) & 255)) out.set(prefix + 4, usize.toU8(0x80 + covered))
+  fd.compareEnd = usize.toI32(out.length()) fd.compareSpan = usize.toI32(covered) + 4
+  line.* = seen
+  return end
 }
 /// add, sub or mul with the right operand an argument.
 fn argumentArithmetic(code: u8) -> u8 {
