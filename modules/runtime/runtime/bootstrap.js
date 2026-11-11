@@ -728,7 +728,7 @@ webGlobals.defineLazy(globalThis, 'crypto', () => ({ crypto: internalRequire('cr
 for (const name of ['Crypto', 'SubtleCrypto', 'CryptoKey']) {
   Object.defineProperty(globalThis, name, {
     get() {
-      const value = internalRequire('internal/crypto_webcrypto')[name];
+      const value = internalRequire('internal/crypto/webcrypto')[name];
       Object.defineProperty(globalThis, name, { value, writable: true, configurable: true });
       return value;
     },

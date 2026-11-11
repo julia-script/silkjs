@@ -122,7 +122,7 @@ class CloneSerializer extends Serializer {
     }
     if (isCryptoKey(value)) {
       this.writeUint32(5);
-      this.writeValue(require('internal/crypto_webcrypto').serializeKey(value));
+      this.writeValue(require('internal/crypto/keys').serializeKey(value));
       return;
     }
     if (isKeyObject(value)) {
@@ -223,7 +223,7 @@ class CloneDeserializer extends Deserializer {
       return host.wasmNative('cloneModule', bytes.buffer, bytes.byteOffset, bytes.byteLength);
     }
     if (tag === 4) return host.wasmNative('cloneMemoryFrom', this.readValue());
-    if (tag === 5) return require('internal/crypto_webcrypto').deserializeKey(this.readValue());
+    if (tag === 5) return require('internal/crypto/keys').deserializeKey(this.readValue());
     if (tag === 6) {
       require('crypto');
       return require('internal/crypto_core').deserializeKeyObject(this.readValue());

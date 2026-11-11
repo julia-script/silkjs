@@ -32,10 +32,15 @@ function string(item) {
   return item.data.toString(item.tag === 20 ? 'latin1' : 'utf8');
 }
 const names = { '2.5.4.3': 'CN', '2.5.4.6': 'C', '2.5.4.7': 'L', '2.5.4.8': 'ST', '2.5.4.10': 'O', '2.5.4.11': 'OU', '2.5.4.5': 'serialNumber', '1.2.840.113549.1.9.1': 'emailAddress', '0.9.2342.19200300.100.1.25': 'DC' };
+const kUtf8Convertible = new Set([12, 18, 19, 20, 22, 23, 24, 26, 28, 30]);
 function distinguishedName(item) {
   const result = Object.create(null);
   for (const rdn of children(item)) for (const pair of children(rdn)) {
-    const [type, value] = children(pair); const key = names[oid(type)] || oid(type), text = string(value);
+    const [type, value] = children(pair);
+    // ASN1_STRING_to_UTF8 only converts the string and time types (the
+    // tag2nbyte table in OpenSSL's a_strex.c); Node leaves out the others.
+    if (!kUtf8Convertible.has(value.tag)) continue;
+    const key = names[oid(type)] || oid(type), text = string(value);
     if (result[key] === undefined) result[key] = text;
     else if (Array.isArray(result[key])) result[key].push(text);
     else result[key] = [result[key], text];

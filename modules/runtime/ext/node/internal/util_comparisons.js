@@ -26,6 +26,21 @@ function compare(actual, expected, strict = true, skipPrototype = false, partial
       if (types.isKeyObject(a) || types.isKeyObject(b)) {
         // Like Node: compare the hidden key material, never the patchable equals().
         if (!types.isKeyObject(a) || !types.isKeyObject(b) || !require('internal/crypto_core').keyObjectEquals(a, b)) return false;
+      } else if (types.isCryptoKey?.(a) || types.isCryptoKey?.(b)) {
+        // Node's comparisons.js: CryptoKeys compare by their internal slots.
+        if (!types.isCryptoKey(a) || !types.isCryptoKey(b)) return false;
+        const keys = require('internal/crypto/keys');
+        const secondaryA = keys.getCryptoKeySecondaryHandle(a), secondaryB = keys.getCryptoKeySecondaryHandle(b);
+        const seedA = keys.getCryptoKeySeedData(a), seedB = keys.getCryptoKeySeedData(b);
+        if (keys.getCryptoKeyType(a) !== keys.getCryptoKeyType(b) ||
+          keys.getCryptoKeyExtractable(a) !== keys.getCryptoKeyExtractable(b) ||
+          !equal(keys.getCryptoKeyAlgorithm(a), keys.getCryptoKeyAlgorithm(b)) ||
+          keys.getCryptoKeyUsagesMask(a) !== keys.getCryptoKeyUsagesMask(b) ||
+          !keys.getCryptoKeyHandle(a).equals(keys.getCryptoKeyHandle(b)) ||
+          (secondaryA === undefined) !== (secondaryB === undefined) ||
+          (secondaryA !== undefined && !secondaryA.equals(secondaryB)) ||
+          (seedA === undefined) !== (seedB === undefined) ||
+          (seedA !== undefined && !equal(seedA, seedB))) return false;
       } else if (types.isDate(a)) {
         const av = Date.prototype.getTime.call(a), bv = Date.prototype.getTime.call(b);
         if (!(av === bv || Number.isNaN(av) && Number.isNaN(bv))) return false;
