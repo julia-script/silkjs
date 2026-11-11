@@ -1260,11 +1260,13 @@ function run() {
     const separator = native.argv.indexOf('--', 1);
     return internalRequire('internal/main/run').runPackageScript(runName, separator < 0 ? [] : native.argv.slice(separator + 1));
   }
-  // Only a TLS flag loads internal/tls/options, so a plain start skips the check.
-  const tlsErrors = moduleHas('internal/tls/options') ? internalRequire('internal/tls/options').validate() : [];
+  // http loads internal/tls/options into the heap image, so being loaded says nothing:
+  // given() is whether this process had a TLS or OpenSSL option.
+  const tlsOptions = moduleHas('internal/tls/options') && internalRequire('internal/tls/options').given();
+  const tlsErrors = tlsOptions ? internalRequire('internal/tls/options').validate() : [];
   if (tlsErrors.length) return cliError(tlsErrors);
   // Only an OpenSSL option or OPENSSL_CONF initializes OpenSSL at startup.
-  const opensslError = moduleHas('internal/tls/options') || process.env.OPENSSL_CONF ? internalRequire('internal/tls/options').processOpenSSLOptions() : undefined;
+  const opensslError = tlsOptions || process.env.OPENSSL_CONF ? internalRequire('internal/tls/options').processOpenSSLOptions() : undefined;
   if (opensslError !== undefined) {
     host.writeStartupDiagnostic(process.execPath + ': ' + opensslError + '\n');
     return process.exit(1);

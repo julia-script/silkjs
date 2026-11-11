@@ -82,4 +82,6 @@ function getOptionValue(name) {
   if (booleans.includes(name)) return !!state.get(name);
   return undefined;
 }
-module.exports = { applyOption, validate, processOpenSSLOptions, getOptionValue, DEFAULT_CIPHER_LIST };
+// Whether the command line or NODE_OPTIONS gave any TLS or OpenSSL option.
+function given() { return state.size > 0; }
+module.exports = { applyOption, given, validate, processOpenSSLOptions, getOptionValue, DEFAULT_CIPHER_LIST };
