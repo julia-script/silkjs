@@ -35,6 +35,7 @@ import js_core_types { SourceText, ObjectData, ObjectPayload, PropertySlot, Shap
 import js_coercion_host { CoercionHooks }
 import js_exceptions { JsException }
 import js_atoms { AtomTable }
+import js_bytecode { callFacts }
 import js_string_types { StringOwner, StringLengthError, AtomKind }
 import js_strings { Strings }
 import js_string_types { latin1Bytes, stringReference }
@@ -427,12 +428,21 @@ fn closureKind(kind: ClosureKind) -> u32 {
     ClosureKind.Scope => 512
   }
 }
-effect fn writeCode<'a, 'm, S: EngineServices>(state: &mut Writer, engine: &mut Engine<'m, S>,realm: Realm<'a>, code: &ByteStorage) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+/// Writes code with its atom operands as wire indices. With patches (the
+/// JS_WRITE_OBJ_DEFER layout) the list of operands a reader must replace
+/// follows the code, so it copies the code and visits only those: a count,
+/// then for each the distance from the one before, doubled, plus one when the
+/// operand owns no reference (the fusion prefix of a string `switch` case,
+/// which repeats the atom of the push_atom_value it covers). Atoms every
+/// runtime numbers alike need no entry.
+effect fn writeCode<'a, 'm, S: EngineServices>(state: &mut Writer, engine: &mut Engine<'m, S>,realm: Realm<'a>, code: &ByteStorage, patches: bool) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
   // Native final bytecode is already LE. Stream it once, replacing atom operands
   // without making the pinned implementation's avoidable temporary code copy.
   let bytes = unsafe code.asSlice()
   let mut position: usize = 0
   run state.bytes.reserve(bytes.length)
+  let mut operands = List<u32>.make()
+  let mut last: usize = 0
   while position < bytes.length {
     let opcode = bytes[position]
     if opcode == 0 || u8.toUsize(opcode) >= op.OP_COUNT {
@@ -445,6 +455,21 @@ effect fn writeCode<'a, 'm, S: EngineServices>(state: &mut Writer, engine: &mut 
     }
     run state.byte(opcode)
     let mut offset: usize = 1
+    if patches && opcode == op.OP_fuse_prefix && bytes.length - position >= 11 && bytes[position + 5] == op.OP_dup
+      && bytes[position + 6] == op.OP_push_atom_value {
+      let mut atom: u32 = 0 let mut j: u32 = 0
+      while j < 4 {
+        atom = atom | u32.shiftLeft(u8.toU32(bytes[position + 1 + u32.toUsize(j)]), j * 8)
+        j = j + 1
+      }
+      let mapped = run state.atomIndex(atom)
+      run state.word(mapped, 4)
+      if !AtomTable.isConstant(atom) {
+        run operands.append(usize.toU32(position + 1 - last) * 2 + 1)
+        last = position + 1
+      }
+      offset = 5
+    }
     if info.format == op.OP_FMT_atom || info.format == op.OP_FMT_atom_u8 ||
       info.format == op.OP_FMT_atom_u16 || info.format == op.OP_FMT_atom_label_u8 ||
       info.format == op.OP_FMT_atom_label_u16 {
@@ -456,6 +481,10 @@ effect fn writeCode<'a, 'm, S: EngineServices>(state: &mut Writer, engine: &mut 
       }
       let mapped = run state.atomIndex(atom)
       run state.word(mapped, 4)
+      if patches && !AtomTable.isConstant(atom) {
+        run operands.append(usize.toU32(position + 1 - last) * 2)
+        last = position + 1
+      }
       offset = 5
       // The inline field-cache key names this runtime's shapes: write none.
       if op.fieldKeyed(opcode) {
@@ -465,6 +494,11 @@ effect fn writeCode<'a, 'm, S: EngineServices>(state: &mut Writer, engine: &mut 
     }
     while offset < size { run state.byte(bytes[position + offset]) offset = offset + 1 }
     position = position + size
+  }
+  if patches {
+    run state.leb(usize.toU32(operands.length()))
+    let mut i: usize = 0
+    while i < operands.length() { run state.leb(operands.get(i)) i = i + 1 }
   }
 }
 unsafe effect fn writeFunction<'a, 'm, S: EngineServices>(state: &mut Writer, engine: &mut Engine<'m, S>,realm: Realm<'a>, reference: *mut HeapHeader) -> () ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
@@ -565,7 +599,13 @@ unsafe effect fn writeFunction<'a, 'm, S: EngineServices>(state: &mut Writer, en
         u32.shiftLeft(boolean(variable.hasScope), 7)))
       i = i + 1
     }
-    if !keepStub { run writeCode(&mut state, &mut engine, realm, &function.code) }
+    if !keepStub {
+      // The call facts a reader would otherwise derive from the code.
+      let facts = run callFacts(unsafe function.code.asSlice(), function.kind == FunctionKind.Normal, function.isDerivedClassConstructor,
+        function.varRefCount, function.scopeSlots, function.variableCount, function.stackSize)
+      run state.byte(u32.toU8(boolean(facts.borrowsArguments))) run state.byte(facts.constructForm) run state.byte(facts.leaf)
+      run writeCode(&mut state, &mut engine, realm, &function.code, true)
+    }
     i = 0
     while i < function.constants.length() {
       run writeValue(&mut state, &mut engine, realm, unsafe lendBits(&function, function.constants.get(i)))
@@ -595,7 +635,7 @@ unsafe effect fn writeFunction<'a, 'm, S: EngineServices>(state: &mut Writer, en
         u32.shiftLeft(boolean(closure.isLexical), 4) | u32.shiftLeft(variableKind(closure.variableKind), 5), 2)
       i = i + 1
     }
-    if !keepStub { run writeCode(&mut state, &mut engine, realm, &function.code) }
+    if !keepStub { run writeCode(&mut state, &mut engine, realm, &function.code, false) }
     if let Option<FunctionDebugInfo>.Some { value: info } = &function.debug {
       run state.atom(info.filename)
       if info.pendingLines.isSome() {
@@ -776,10 +816,28 @@ effect fn finish<'a>(state: &mut Writer, realm: Realm<'a>) -> () ! OutOfMemoryEr
   run prefix.byte(7) run prefix.leb(usize.toU32(state.atomList.length()))
   let anchor = () let rt = realm.runtimeState(&anchor)
   let mut i: usize = 0
-  while i < state.atomList.length() {
-    let string = StringOwner.adopt(run rt.atoms.toValue(state.atomList.get(i), true))
-    run prefix.string(string.get())
-    i = i + 1
+  if (state.flags & JS_WRITE_OBJ_DEFER) != 0 {
+    // A reader interns an atom on its first use: the length of the strings,
+    // then where each one starts among them, then the strings.
+    let mut strings = Writer.make(0)
+    let mut starts = List<u32>.make()
+    while i < state.atomList.length() {
+      let string = StringOwner.adopt(run rt.atoms.toValue(state.atomList.get(i), true))
+      run starts.append(usize.toU32(strings.bytes.length()))
+      run strings.string(string.get())
+      i = i + 1
+    }
+    if strings.bytes.length() >= 4294967296 { return run Allocator.outOfMemory() }
+    run prefix.word(usize.toU32(strings.bytes.length()), 4)
+    i = 0
+    while i < starts.length() { run prefix.word(starts.get(i), 4) i = i + 1 }
+    run prefix.bytes.appendSlice(strings.bytes.asSlice())
+  } else {
+    while i < state.atomList.length() {
+      let string = StringOwner.adopt(run rt.atoms.toValue(state.atomList.get(i), true))
+      run prefix.string(string.get())
+      i = i + 1
+    }
   }
   run state.bytes.insertSlice(0, prefix.bytes.asSlice())
 }
