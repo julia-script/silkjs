@@ -1031,6 +1031,7 @@ function runtimeFlag(arg) {
   if (arg === '--experimental-import-meta-resolve') { host.importMetaResolveParent = true; return true; }
   if (arg === '--experimental-print-required-tla') { host.printRequiredTLA = true; return true; }
   if (arg === '--experimental-import-text') { host.importText = true; return true; }
+  if (arg.startsWith('--experimental-package-map=')) { host.packageMap = arg.slice(27); return true; }
   if (arg.startsWith('--experimental-loader=') || arg.startsWith('--loader=')) {
     loaderPreloads.push(arg.slice(arg.indexOf('=') + 1)); return true;
   }
@@ -1571,6 +1572,7 @@ globalThis.__silkRuntime = {
   normalize(name, parent, attributes) { return loader.importKey(name, parent, attributes); },
   load(name, attributes) { return loader.loadESM(name, attributes).source; },
   moduleSource(name, parent, attributes) { return loader.moduleSource(name, parent, attributes); },
+  moduleError(name, error) { loader.moduleEvaluationError(name, error); },
   registerSource(filename, source, metadata) {
     host.registerSource(filename, source, { ...metadata, owner: metadata });
     if (!metadata.generated && typeof filename === 'string') {
