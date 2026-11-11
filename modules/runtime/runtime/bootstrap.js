@@ -9,6 +9,7 @@ delete globalThis.__silkNative;
 const factories = new Map();
 const modules = new Map();
 const realmSources = new Map();
+const factoryHas = Map.prototype.has.bind(factories);
 const factoryGet = Map.prototype.get.bind(factories);
 const factorySet = Map.prototype.set.bind(factories);
 const moduleGet = Map.prototype.get.bind(modules);
@@ -85,7 +86,8 @@ const dotSegment = /\/\.\.?(?:\/|$)/;
 const fileHref = path => host.platform !== 'win32' && plainPath.test(path) && !dotSegment.test(path)
   ? 'file://' + path : internalRequire('url').pathToFileURL(path).href;
 const inspectorNativeOperations = Array.from({ length: 32 }, (_, index) => native['inspectorNative' + index]);
-host.inspectorNative = (operation, ...args) => inspectorNativeOperations[operation](...args);
+const reflectApply = Reflect.apply;
+host.inspectorNative = (operation, ...args) => reflectApply(inspectorNativeOperations[operation], undefined, args);
 host.inspectorEntry = wrapper => host.inspectorNative(15, wrapper);
 host.typeScriptMode = 'strip';
 host.testCoverageStart = () => native.testCoverageNative(0);
@@ -816,11 +818,13 @@ for (const name of ['Crypto', 'SubtleCrypto', 'CryptoKey']) {
     webGlobals.defineLazy(globalThis, name, loadPerformance, name === 'performance');
 }
 host.path = internalRequire('path');
-const publicBuiltinNames = [...factories.keys()].filter(name => !name.startsWith('internal/'));
+// Sorted, as Node lists builtinModules.
+const publicBuiltinNames = [...factories.keys()].filter(name => !name.startsWith('internal/')).sort();
 const publicBuiltinHas = Set.prototype.has.bind(new Set(publicBuiltinNames));
 const prefixOnlyBuiltinHas = Set.prototype.has.bind(new Set(['test', 'test/reporters', 'sqlite', 'sea']));
 const defineBuiltinName = Object.defineProperty;
 function publicBuiltin(name) {
+  if (host.exposeInternals === true && stringStartsWith(name, 'internal/') && factoryHas(name)) return true;
   return publicBuiltinHas(name) &&
     ((name !== 'stream/iter' && name !== 'zlib/iter') || host.experimentalStreamIter === true);
 }
@@ -836,13 +840,16 @@ const publicBuiltins = {
     }
     return !prefixOnlyBuiltinHas(name) && publicBuiltin(name);
   },
+  // The modules with a bare name first, then the node:-only ones, as Node lists them.
   names() {
     const names = [];
-    for (let index = 0; index < publicBuiltinNames.length; index++) {
-      const name = publicBuiltinNames[index];
-      if (publicBuiltin(name)) defineBuiltinName(names, names.length, {
-        value: prefixOnlyBuiltinHas(name) ? 'node:' + name : name, enumerable: true, writable: true, configurable: true,
-      });
+    for (let pass = 0; pass < 2; pass++) {
+      for (let index = 0; index < publicBuiltinNames.length; index++) {
+        const name = publicBuiltinNames[index];
+        if (publicBuiltin(name) && prefixOnlyBuiltinHas(name) === (pass === 1)) defineBuiltinName(names, names.length, {
+          value: pass === 1 ? 'node:' + name : name, enumerable: true, writable: true, configurable: true,
+        });
+      }
     }
     return names;
   }
@@ -932,6 +939,9 @@ function runtimeFlag(arg) {
   if (arg === '--trace-sigint' || arg === '--no-trace-sigint') {
     host.traceSigint = arg === '--trace-sigint'; return true;
   }
+  if (arg === '--experimental-repl-await' || arg === '--no-experimental-repl-await') {
+    host.replAwait = arg === '--experimental-repl-await'; return true;
+  }
   if ((arg.startsWith('--report-') || arg.startsWith('--no-report-') || arg === '--experimental-report') &&
       internalRequire('internal/process_report').applyOption(arg)) return true;
   if (['--strip-types', '--experimental-strip-types', '--no-strip-types', '--no-experimental-strip-types'].includes(arg)) {
@@ -949,10 +959,9 @@ function runtimeFlag(arg) {
   if (arg === '--expose-gc' || arg === '--no-expose-gc') {
     host.exposeGC = arg === '--expose-gc'; return true;
   }
-  // Node's flag exposes Node's own lib/internal modules and bindings. This
-  // runtime has none of those, so the flag is accepted and exposes nothing:
-  // require('internal/...') stays MODULE_NOT_FOUND.
-  if (arg === '--expose-internals') return true;
+  // Node's flag lets user code require the internal/ modules, which here are
+  // the runtime's own (many are Node's, ported at Node's paths).
+  if (arg === '--expose-internals') { host.exposeInternals = true; return true; }
   if (arg === '--disable-sigusr1') { host.disableSigusr1 = true; return true; }
   if (arg === '--test-update-snapshots' || arg === '--no-test-update-snapshots') {
     host.testUpdateSnapshots = arg === '--test-update-snapshots'; return true;
@@ -1383,7 +1392,7 @@ function run() {
   if (expression !== undefined) {
     const name = host.path.join(host.cwd(), '[eval]');
     expression = prepareInput(expression, name, inputType, inputTypeSet);
-    internalRequire('internal/loader/builtin_globals')(globalThis, '<eval>');
+    internalRequire('internal/modules/helpers').addBuiltinLibsToObject(globalThis, '<eval>');
     const code = !inputType.startsWith('module') && /\bcrypto\b/.test(expression) ?
       (print ? 'let crypto=require("node:crypto");{' + expression + '}' : '(crypto=>{{' + expression + '}})(require("node:crypto"))') : expression;
     if (inputType.startsWith('module') || (!inputTypeSet && native.detectModuleSyntax(code))) {

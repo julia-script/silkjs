@@ -47,7 +47,9 @@ function emit(name, args, promise = false) {
   emitting = true;
   syncNativeHooks();
   try {
-    for (const hook of listeners) {
+    // An index loop: user code may have replaced Array.prototype[Symbol.iterator].
+    for (let i = 0; i < listeners.length; i++) {
+      const hook = listeners[i];
       if (promise && !hook.trackPromises) continue;
       const callback = hook.callbacks[name];
       if (callback !== undefined) apply(callback, hook, args);

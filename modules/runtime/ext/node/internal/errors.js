@@ -801,7 +801,7 @@ function addNumericalSeparator(val) {
 }
 
 // Ensures the printed error line is from user code.
-const arrow_message_private_symbol = Symbol('arrowMessage');
+const { privateSymbols: { arrow_message_private_symbol } } = require('internal/util/binding');
 function setArrowMessage(err, arrowMessage) {
   err[arrow_message_private_symbol] = arrowMessage;
 }

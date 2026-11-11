@@ -280,6 +280,10 @@ function getOptionValue(name) {
     case '--localstorage-file': return host.localStorageFile;
     case '--experimental-print-required-tla': return !!host.printRequiredTLA;
     case '--experimental-import-text': return !!host.importText;
+    case '--strip-types': return !!host.typeScriptMode;
+    case '--experimental-repl-await': return host.replAwait !== false;
+    // Addons load through require only; import() of a .node file is unsupported.
+    case '--experimental-addon-modules': return false;
     default: return startupControls.getOptionValue(name) ?? require('internal/tls/options').getOptionValue(name);
   }
 }

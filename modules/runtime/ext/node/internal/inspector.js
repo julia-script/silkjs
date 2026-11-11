@@ -4,17 +4,15 @@ const host = require('internal/host');
 const native = host.inspectorNative;
 const permission = require('internal/permission');
 const contexts = require('internal/inspector_contexts');
-const { RemoteValues, inspect, format, protocolError, unsupported } = require('internal/inspector_values');
+const { RemoteValues, inspect, protocolError, unsupported } = require('internal/inspector_values');
 const debuggerAgent = require('internal/inspector_debugger');
 const profiles = require('internal/inspector_profiles');
 const network = require('internal/inspector_network');
 const sessions = new Map();
 const routed = new Map();
 const workers = require('internal/inspector_workers').create(connectRemote);
-const previews = new Map();
 let nextSession = 1;
 let nextException = 1;
-let nextPreview = 1;
 let waiting = false;
 let workerWaitConsumed = false;
 function error(code, message, Type = Error) { return Object.assign(new Type(message), { code }); }
@@ -305,20 +303,6 @@ function armStartup() {
   if (native(10) === 0 && !url()) return;
   debuggerAgent.armStartup();
 }
-function evaluatePreview(expression, sandbox, timeout = 333) {
-  if (typeof expression !== 'string') return null;
-  const context = contexts.get(sandbox);
-  if (!context) return null;
-  let token;
-  try {
-    const result = native(12, expression, context.handle, true, timeout);
-    if (result.status !== 'success') return null;
-    token = nextPreview++;
-    previews.set(token, result.value);
-    return { token, text: format(result.value) };
-  } catch { if (token !== undefined) previews.delete(token); return null; }
-}
-function releasePreview(token) { previews.delete(token); }
 function broadcast(method, params) {
   for (const session of sessions.values()) {
     if (method.startsWith('Network.') && !session.networkEnabled) continue;
@@ -347,4 +331,4 @@ if (native(10) === 0) {
   // Native state does not come with a heap image: a start from one registers again.
   host.onHydrate(() => { native(0, onNative); });
 }
-module.exports = { connect, open, close, url, waitForDebugger, _start: start, _atExit: atExit, _installProcess: installProcess, _waitForWorker: waitForWorkerStart, _armStartup: armStartup, evaluatePreview, releasePreview, broadcast, error, invalid, console: consoleBridge.console, emitConsole: consoleBridge.emitConsole, putNetworkResource: network.put };
+module.exports = { connect, open, close, url, waitForDebugger, _start: start, _atExit: atExit, _installProcess: installProcess, _waitForWorker: waitForWorkerStart, _armStartup: armStartup, broadcast, error, invalid, console: consoleBridge.console, emitConsole: consoleBridge.emitConsole, putNetworkResource: network.put };

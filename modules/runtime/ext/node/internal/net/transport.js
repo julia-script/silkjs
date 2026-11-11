@@ -1,5 +1,6 @@
 'use strict';
 
+const { ArrayPrototypeConcat } = require('internal/per_context/primordials');
 const host = require('internal/host');
 const { AsyncResource } = require('async_hooks');
 const { Buffer } = require('buffer');
@@ -53,7 +54,8 @@ class Transport {
     }
     live.add(this);
   }
-  call(operation, ...args) { return host.net(operation, [this.id, ...args]); }
+  // concat, not spread: user code may have replaced Array.prototype[Symbol.iterator].
+  call(operation, ...args) { return host.net(operation, ArrayPrototypeConcat([this.id], args)); }
   dispatch(type, status, payload, extra) {
     if (type === 4 || type === 5) {
       const request = this.requests.get(payload);
