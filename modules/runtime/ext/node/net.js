@@ -156,8 +156,10 @@ let cluster;
 let dns;
 let BlockList;
 let SocketAddress;
-let autoSelectFamilyDefault = getOptionValue('--network-family-autoselection');
-let autoSelectFamilyAttemptTimeoutDefault = getOptionValue('--network-family-autoselection-attempt-timeout');
+// silkjs: read on first use. A heap image holds this module loaded before the
+// process's options are parsed.
+let autoSelectFamilyDefault;
+let autoSelectFamilyAttemptTimeoutDefault;
 
 const { clearTimeout, setTimeout } = require('timers');
 const { kTimeout } = require('internal/timers');
@@ -258,6 +260,7 @@ function connect(...args) {
 }
 
 function getDefaultAutoSelectFamily() {
+  autoSelectFamilyDefault ??= getOptionValue('--network-family-autoselection');
   return autoSelectFamilyDefault;
 }
 
@@ -267,6 +270,7 @@ function setDefaultAutoSelectFamily(value) {
 }
 
 function getDefaultAutoSelectFamilyAttemptTimeout() {
+  autoSelectFamilyAttemptTimeoutDefault ??= getOptionValue('--network-family-autoselection-attempt-timeout');
   return autoSelectFamilyAttemptTimeoutDefault;
 }
 
@@ -1755,7 +1759,7 @@ function lookupAndConnect(self, options) {
   if (autoSelectFamily != null) {
     validateBoolean(autoSelectFamily, 'options.autoSelectFamily');
   } else {
-    autoSelectFamily = autoSelectFamilyDefault;
+    autoSelectFamily = getDefaultAutoSelectFamily();
   }
 
   if (autoSelectFamilyAttemptTimeout != null) {
@@ -1765,7 +1769,7 @@ function lookupAndConnect(self, options) {
       autoSelectFamilyAttemptTimeout = 10;
     }
   } else {
-    autoSelectFamilyAttemptTimeout = autoSelectFamilyAttemptTimeoutDefault;
+    autoSelectFamilyAttemptTimeout = getDefaultAutoSelectFamilyAttemptTimeout();
   }
 
   // If host is an IP, skip performing a lookup

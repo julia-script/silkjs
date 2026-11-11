@@ -120,6 +120,26 @@ function getInspectPort(inspectPort) {
         ("const {\n  UVException,\n} = require('internal/errors');\n", ""),
     ],
     'lib/net.js': [
+        ("""let autoSelectFamilyDefault = getOptionValue('--network-family-autoselection');
+let autoSelectFamilyAttemptTimeoutDefault = getOptionValue('--network-family-autoselection-attempt-timeout');""",
+         """// silkjs: read on first use. A heap image holds this module loaded before the
+// process's options are parsed.
+let autoSelectFamilyDefault;
+let autoSelectFamilyAttemptTimeoutDefault;"""),
+        ("""function getDefaultAutoSelectFamily() {
+  return autoSelectFamilyDefault;""",
+         """function getDefaultAutoSelectFamily() {
+  autoSelectFamilyDefault ??= getOptionValue('--network-family-autoselection');
+  return autoSelectFamilyDefault;"""),
+        ("""function getDefaultAutoSelectFamilyAttemptTimeout() {
+  return autoSelectFamilyAttemptTimeoutDefault;""",
+         """function getDefaultAutoSelectFamilyAttemptTimeout() {
+  autoSelectFamilyAttemptTimeoutDefault ??= getOptionValue('--network-family-autoselection-attempt-timeout');
+  return autoSelectFamilyAttemptTimeoutDefault;"""),
+        ("    autoSelectFamily = autoSelectFamilyDefault;",
+         "    autoSelectFamily = getDefaultAutoSelectFamily();"),
+        ("    autoSelectFamilyAttemptTimeout = autoSelectFamilyAttemptTimeoutDefault;",
+         "    autoSelectFamilyAttemptTimeout = getDefaultAutoSelectFamilyAttemptTimeout();"),
         ("const { convertIpv6StringToBuffer } = internalBinding('cares_wrap');\n",
          "// silkjs: cares_wrap's convertIpv6StringToBuffer, over the BlockList parser.\n"
          "const convertIpv6StringToBuffer = (ip) => require('internal/socketaddress').parseAddress(ip, 6);\n"),
