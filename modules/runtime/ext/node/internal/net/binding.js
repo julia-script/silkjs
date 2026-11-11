@@ -137,15 +137,14 @@ class StreamHandle {
   }
   get _externalStream() { return this._transport; }
   getAsyncId() { return this._transport?.resource?.asyncId() ?? -1; }
-  getProviderType() { return 0; }
+  getProviderType() { return this._transport?.getProviderType?.() ?? 0; }
   // AsyncWrap::AsyncReset: the handle's callbacks run in a new async resource, reported to
   // async_hooks with `resource` as its resource object (the http agent's ReusedHandle).
   asyncReset(resource) {
     const transport = this._transport;
     if (!transport?.resource) return;
-    const type = transport.kind === 5 ? 'TTYWRAP' : transport.kind === 2 ? 'PIPEWRAP' : 'TCPWRAP';
     transport.resource.emitDestroy();
-    transport.resource = require('async_hooks')._createResource(type, resource);
+    transport.resource = require('async_hooks')._createResource(transport.provider ?? 'TCPWRAP', resource);
   }
   // HandleWrap
   close(callback) {
@@ -618,6 +617,7 @@ class JSStream extends StreamHandle {
     this._resource = require('async_hooks')._createResource('JSSTREAM', this);
   }
   getAsyncId() { return this._resource.asyncId(); }
+  getProviderType() { return require('async_hooks').asyncWrapProviders.JSSTREAM; }
   asyncReset(resource) {
     this._resource.emitDestroy();
     this._resource = require('async_hooks')._createResource('JSSTREAM', resource);
