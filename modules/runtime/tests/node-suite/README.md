@@ -18,7 +18,7 @@ Run (`NODE_SRC` defaults to `~/setup/node-src`; unset `NODE_OPTIONS` first):
 
 ```sh
 python3 run.py /opt/node24/bin/node node-parallel.json parallel 4      # reference, once
-PRE="-r $PWD/shim.js" python3 run.py ../../build/silkjsruntime rt-parallel.json parallel 4 [regex]
+python3 run.py ../../build/silkjsruntime rt-parallel.json parallel 4 [regex]
 python3 report.py node-parallel.json rt-parallel.json fails.json        # per-module table
 python3 sig.py node-parallel.json rt-parallel.json 80                   # failures grouped by first error
 ```
@@ -27,6 +27,6 @@ python3 sig.py node-parallel.json rt-parallel.json 80                   # failur
 run a subset (for example `'^test-fs-'`). Each test gets the `// Flags:` its header lists, its own
 process group and a 60 s timeout.
 
-`shim.js` papers over the runtime gaps that stop `test/common` from loading at all
-(`process.config`, `process.versions` entries, enumerable web globals). Each line is a gap to fix in
-the runtime; delete the line once the runtime has it.
+`PRE` (split on spaces) is passed to the runtime before each test's flags, for example
+`PRE="-r $PWD/prelude.js"` to try a prelude. `test/common` loads without one: the runtime has
+`process.config`, `process.versions` and Node's global property layout.
