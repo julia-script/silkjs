@@ -92,10 +92,11 @@ if (Symbol.asyncDispose) {
 function startCpuProfile(state, retain) { return request(state, 0, retain).then(() => new CPUProfileHandle(state, retain)); }
 function startHeapProfile(state, retain) { return request(state, 2, retain).then(() => new HeapProfileHandle(state, retain)); }
 function getHeapSnapshot(state, options = {}, retain) {
-  if (options === null || typeof options !== 'object' || Array.isArray(options)) throw codedError('ERR_INVALID_ARG_TYPE', 'The options argument must be an object');
+  const { validateObject, validateBoolean } = require('internal/validators');
+  validateObject(options, 'options');
   const { exposeInternals = false, exposeNumericValues = false } = options;
   for (const [name, value] of [['exposeInternals', exposeInternals], ['exposeNumericValues', exposeNumericValues]]) {
-    if (typeof value !== 'boolean') throw codedError('ERR_INVALID_ARG_TYPE', `The options.${name} property must be a boolean`);
+    validateBoolean(value, `options.${name}`);
   }
   if (exposeNumericValues) throw codedError('ERR_NOT_SUPPORTED', 'Numeric-value heap snapshot exposure is not supported by this runtime', Error);
   return request(state, 4, retain).then(snapshot => {
