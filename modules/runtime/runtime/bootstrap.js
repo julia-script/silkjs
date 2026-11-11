@@ -813,14 +813,19 @@ function run() {
   // The environment as the process got it, before any environment file: only a
   // watch supervisor needs it, so it is copied only when a file is about to load.
   let startupEnvironment;
-  loadRuntimeEnvironment(native.argv.slice(1), () => { startupEnvironment = { ...process.env }; });
-  const options = internalRequire('internal/options');
-  let environment;
-  try {
-    environment = options.parseEnvironment(process.env.NODE_OPTIONS || '');
-    environment.length = options.validateEnvironment(environment);
-  } catch (error) {
-    return cliError(error.message);
+  // A script path first means no flags, so no environment file to look for:
+  // the option tables load only for flags or NODE_OPTIONS.
+  const flags = native.argv.length < 2 || native.argv[1].charCodeAt(0) === 45;
+  if (flags) loadRuntimeEnvironment(native.argv.slice(1), () => { startupEnvironment = { ...process.env }; });
+  let environment = [];
+  if (process.env.NODE_OPTIONS) {
+    const options = internalRequire('internal/options');
+    try {
+      environment = options.parseEnvironment(process.env.NODE_OPTIONS);
+      environment.length = options.validateEnvironment(environment);
+    } catch (error) {
+      return cliError(error.message);
+    }
   }
   const args = environment.concat(native.argv.slice(1)); let expression, print = false, inputType = 'commonjs';
   let filename, index = 0, interactive = false, testMode = false, inputTypeSet = false, check = false;
@@ -835,6 +840,8 @@ function run() {
   const testOptions = {}, reporterNames = [], destinations = [];
   const afterMain = result => interactive ? result && typeof result.then === 'function' ? result.then(startRepl) : startRepl() : result;
   for (; index < args.length; index++) {
+    // Every option starts with a dash: anything else is the script.
+    if (args[index].charCodeAt(0) !== 45) break;
     const arg = internalRequire('internal/options').normalizeOption(args[index]);
     if (arg === '--') { index++; break; }
     if (arg === '--watch' || arg === '--no-watch') { watchMode = arg === '--watch'; record(arg); continue; }
@@ -881,12 +888,12 @@ function run() {
         internalRequire('internal/process_report').isValueOption(arg) ||
         internalRequire('internal/startup_controls').isValueOption(arg) ||
         internalRequire('internal/permission').isValueOption(arg) ||
-        options.isInspectorValueOption(arg) ||
+        internalRequire('internal/options').isInspectorValueOption(arg) ||
         arg === '--experimental-sea-config' || arg.startsWith('--experimental-sea-config=')) {
       const separator = arg.indexOf('=');
       const name = arg === '-r' ? '--require' : arg === '-C' ? '--conditions' : separator < 0 ? arg : arg.slice(0, separator);
       const value = separator < 0 ? args[++index] : arg.slice(separator + 1);
-      if (value === undefined || (separator < 0 && options.isInspectorValueOption(name) && value.startsWith('-')) ||
+      if (value === undefined || (separator < 0 && internalRequire('internal/options').isInspectorValueOption(name) && value.startsWith('-')) ||
           ((['--localstorage-file', '--require', '--import', '--conditions'].includes(name) || internalRequire('internal/process_report').isValueOption(name) || internalRequire('internal/startup_controls').isValueOption(name) || internalRequire('internal/permission').isValueOption(name)) &&
           (value === '' || (separator < 0 && value.startsWith('-'))))) return cliError(name + ' requires an argument');
       record(arg, ...(separator < 0 ? [value] : []));
@@ -1041,15 +1048,19 @@ Environment:
   if (expression === undefined && filename !== undefined && filename !== '-' && !testMode)
     process.argv[1] = host.path.resolve(filename);
   const entrypoints = [];
-  if (!watchMode && !testMode && expression === undefined && filename !== undefined && filename !== '-')
-    entrypoints.push(loader.resolveMain(host.path.resolve(filename)).filename);
+  // The main script as resolved before any preload ran.
+  let early;
+  if (!watchMode && !testMode && expression === undefined && filename !== undefined && filename !== '-') {
+    early = loader.resolveMain(host.path.resolve(filename));
+    entrypoints.push(early.filename);
+  }
   installRuntimeOptions(environment.concat(process.execArgv), entrypoints, !watchMode);
   if (watchMode) {
     const supervisor = internalRequire('internal/watch_mode/watch_mode');
     return supervisor.start({
       args: supervisor.withoutWatchOptions(process.execArgv).concat(process.argv.length > 1 ? ['--', ...process.argv.slice(1)] : []),
       paths: watchPaths, preserveOutput: watchPreserveOutput, killSignal: watchKillSignal,
-      envFiles: options.environmentFiles(native.argv.slice(1)), env: startupEnvironment ?? { ...process.env },
+      envFiles: internalRequire('internal/options').environmentFiles(native.argv.slice(1)), env: startupEnvironment ?? { ...process.env },
     });
   }
   host.testCoverageOptions = testOptions;
@@ -1105,10 +1116,11 @@ Environment:
   }
   const path = host.path.resolve(filename);
   process.argv[1] = path;
-  const resolved = loader.resolveMain(path);
+  // Only a preload can register a hook or a mock that resolves it differently.
+  const resolved = early !== undefined && !requirePreloads.length && !importPreloads.length ? early : loader.resolveMain(path);
   mainModuleName = resolved.filename;
   armInspectorEntry();
-  return afterMain(loader.runMain(path, inputTypeSet));
+  return afterMain(loader.runMain(path, inputTypeSet, resolved));
   });
 }
 function referencedWork() {
