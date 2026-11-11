@@ -5,6 +5,7 @@ const { EventEmitter } = require('events');
 const { AsyncResource } = require('async_hooks');
 const native = (op, args) => host.processNative(op, args);
 const failure = (code, message) => Object.assign(new Error(message), { code });
+const { codes: { ERR_INVALID_ARG_TYPE, ERR_MISSING_ARGS }, codedError, validateObject } = require('internal/validators');
 function setupChannel(target, fd, mode = 'json', onClose) {
   const resource = new AsyncResource('PIPEWRAP');
   let input = Buffer.alloc(0), receivedFD = -1, queue = [], bytes = 0, pendingHandle = null;
@@ -26,6 +27,11 @@ function setupChannel(target, fd, mode = 'json', onClose) {
   channel.ref = () => { explicitRef = true; refState(); };
   channel.unref = () => { explicitRef = false; refState(); };
   target.channel = channel;
+  Object.defineProperty(target, '_channel', {
+    configurable: true, enumerable: false,
+    get: require('util').deprecate(() => target.channel, '_channel is deprecated. Use ChildProcess.channel instead.', 'DEP0129'),
+    set: require('util').deprecate(value => { target.channel = value; }, '_channel is deprecated. Use ChildProcess.channel instead.', 'DEP0129'),
+  });
   target.connected = true;
   const changed = name => { if (name === 'message' || name === 'disconnect') process.nextTick(refState); };
   target.on('newListener', changed);
@@ -195,19 +201,30 @@ function setupChannel(target, fd, mode = 'json', onClose) {
   target.send = function send(value, handle, options, callback) {
     if (typeof handle === 'function') { callback = handle; handle = undefined; options = undefined; }
     else if (typeof options === 'function') { callback = options; options = undefined; }
-    options ||= {};
-    if (callback !== undefined && typeof callback !== 'function') throw new TypeError('callback must be a function');
-    if (value === undefined || typeof value === 'function' || typeof value === 'symbol' || typeof value === 'bigint') throw failure('ERR_INVALID_ARG_TYPE', 'message must be a string, object, number or boolean');
+    else if (options !== undefined) validateObject(options, 'options');
+    options = { swallowErrors: false, ...options };
     if (!target.connected) {
       const error = failure('ERR_IPC_CHANNEL_CLOSED', 'Channel closed');
-      process.nextTick(() => { if (callback) callback(error); else target.emit('error', error); }); return false;
+      process.nextTick(() => { if (typeof callback === 'function') callback(error); else target.emit('error', error); }); return false;
+    }
+    if (value === undefined) throw new ERR_MISSING_ARGS('message');
+    if (typeof value !== 'string' && typeof value !== 'object' && typeof value !== 'number' && typeof value !== 'boolean')
+      throw new ERR_INVALID_ARG_TYPE('message', ['string', 'object', 'number', 'boolean'], value);
+    // Like Node, messages sent while a handle waits for its ACK queue behind it; the
+    // first of them reports true, later ones false.
+    if (!handle && (pendingHandle || queue.some(item => item.transfer))) {
+      submit(value, -1, callback);
+      let waiting = 0, behind = false;
+      for (const item of queue) { if (item.transfer) { behind = true; waiting = 0; } else if (behind && !item.control) waiting++; }
+      if (pendingHandle && !queue.some(item => item.transfer)) waiting = queue.filter(item => !item.control).length;
+      return waiting === 1;
     }
     if (!handle) return submit(value, -1, callback);
     const net = require('net'); let type, handleFD;
     if (handle instanceof net.Socket) { type = 'net.Socket'; handleFD = handle._transport?.call('fileno'); }
     else if (handle instanceof net.Server) { type = 'net.Server'; handleFD = handle._transport?.call('fileno'); }
     else if (handle instanceof require('dgram').Socket) { type = 'dgram.Socket'; handleFD = host.net('fileno', [handle._id]); }
-    else throw failure('ERR_INVALID_HANDLE_TYPE', 'This handle type cannot be sent');
+    else throw codedError(TypeError, 'ERR_INVALID_HANDLE_TYPE', 'This handle type cannot be sent');
     if (!Number.isInteger(handleFD) || handleFD < 0) throw failure('ERR_INVALID_HANDLE_TYPE', 'Handle is closed');
     const envelope = { cmd: 'NODE_HANDLE', type, msg: value };
     if (type === 'dgram.Socket') envelope.dgramType = handle.type || (handle._family === 6 ? 'udp6' : 'udp4');
