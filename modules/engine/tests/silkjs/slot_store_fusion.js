@@ -68,7 +68,30 @@ function reach() {
   return sum;
 }
 r.push(reach());
+// Stores one past the end append; anything further, or a refused add, takes the plain path.
+function appends() {
+  var out = [], a = [], i, o;
+  for (i = 0; i < 40; i++) a[i] = i;
+  out.push(a.length + ":" + a[39]);
+  var b = [];
+  for (i = 0; i < 20; i++) { o = { id: i }; b[i] = o; }
+  o = null;
+  out.push(b.length + ":" + b[7].id + ":" + b.slice(18).map(function (x) { return x.id; }).join());
+  var gap = [1]; i = 3; gap[i] = 9;
+  out.push(gap.length + ":" + (1 in gap) + ":" + gap[3]);
+  var closed = Object.preventExtensions([1, 2]); i = 2; closed[i] = 3;
+  out.push(closed.length);
+  var frozen = Object.freeze([1, 2]); i = 2; frozen[i] = 3; i = 0; frozen[i] = 8;
+  out.push(frozen.join());
+  var fixed = [1, 2]; Object.defineProperty(fixed, "length", { writable: false }); i = 2; fixed[i] = 3;
+  out.push(fixed.length);
+  var strict = (function () { "use strict"; var f = Object.freeze([1]), k = 1; try { f[k] = 2; return "no"; } catch (e) { return e.constructor.name; } })();
+  out.push(strict);
+  var t = new Uint8Array(2); i = 2; t[i] = 5; out.push(t.length + ":" + t.join());
+  return out.join("|");
+}
+r.push(appends());
 const got = r.join(";");
-const expected = "[\"x\",7,\"arg\",{\"k\":1},\"arg\",2][0,1,2,64,-1,1.5]{\"k\":1};[\"zero\",2.5,\"text\",3,null,2]|6|neg|frac|str|{\"0\":2.5,\"5\":4}|[1,2]|5,2,300|44,2|5,2.5|TypeError,TypeError;[\"zero\",7,\"text\",3,null,2]|6|neg|frac|str|{\"0\":7,\"5\":4}|[1,2]|5,7,300|44,7|5,7|TypeError,TypeError;set 0=v,set 1=5,setter v,setter 6,proto v,proto 2|vg|3v8|3;0,100,200,300,400|449|449|[1,2,{\"id\":449}];[\"v\",5,\"changed\",0][\"changed\"]1;[\"w\",3]w;10,32,54;3500";
+const expected = "[\"x\",7,\"arg\",{\"k\":1},\"arg\",2][0,1,2,64,-1,1.5]{\"k\":1};[\"zero\",2.5,\"text\",3,null,2]|6|neg|frac|str|{\"0\":2.5,\"5\":4}|[1,2]|5,2,300|44,2|5,2.5|TypeError,TypeError;[\"zero\",7,\"text\",3,null,2]|6|neg|frac|str|{\"0\":7,\"5\":4}|[1,2]|5,7,300|44,7|5,7|TypeError,TypeError;set 0=v,set 1=5,setter v,setter 6,proto v,proto 2|vg|3v8|3;0,100,200,300,400|449|449|[1,2,{\"id\":449}];[\"v\",5,\"changed\",0][\"changed\"]1;[\"w\",3]w;10,32,54;3500;40:39|20:7:18,19|4:false:9|2|1,2|2|TypeError|2:0,0";
 console.log(got === expected ? 'PASS slot store fusion' : 'FAIL ' + got);
 if (got !== expected) throw new Error('slot store fusion regressions');
