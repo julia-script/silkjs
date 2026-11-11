@@ -89,6 +89,7 @@ host.testCoverageTake = () => native.testCoverageNative(1);
 host.testCoverageStop = () => native.testCoverageNative(2);
 host.processFeatures = {
   debug: native.debugBuild, uv: true, ipv6: true, inspector: true,
+  openssl_is_boringssl: false, quic: false,
   tls: true, tls_alpn: true, tls_sni: true, tls_ocsp: false,
   cached_builtins: false,
   get require_module() { return !host.requireModuleDisabled; },
@@ -368,7 +369,15 @@ for (const name of ['setTimeout', 'setImmediate']) {
 }
 const Buffer = internalRequire('buffer').Buffer;
 host.Buffer = Buffer;
-globalThis.Buffer = Buffer;
+// process and Buffer are accessors on Node's global object (the hook for an
+// ESM deprecation path); assigning replaces the value the getter returns.
+function defineGlobalAccessor(name, initial) {
+  let current = initial;
+  Object.defineProperty(globalThis, name, {
+    get() { return current; }, set(value) { current = value; }, enumerable: false, configurable: true,
+  });
+}
+defineGlobalAccessor('Buffer', Buffer);
 globalThis.global = globalThis;
 globalThis.atob = internalRequire('buffer').atob;
 globalThis.btoa = internalRequire('buffer').btoa;
@@ -420,15 +429,15 @@ function output(fd) {
   } };
 }
 host.stdout = output(1); host.stderr = output(2);
-// Text written to a descriptor synchronously, with no stream (internal/stdio
-// direct). False when nothing could be written; a failure after a partial
-// write drops the rest, as a stream write that console ignores would.
+// Text written to a descriptor now, with no stream (internal/stdio direct):
+// true when all of it was written, false when none of it was, and the bytes
+// left over when a write stopped part way (a full nonblocking pipe, or an error).
 host.writeText = (fd, text) => {
   const bytes = Buffer.from(text);
   let offset = 0;
   while (offset < bytes.length) {
     const count = rawOS.write(fd, bytes.buffer, bytes.byteOffset + offset, bytes.length - offset);
-    if (count <= 0) return offset !== 0;
+    if (count <= 0) return offset === 0 ? false : bytes.subarray(offset);
     offset += count;
   }
   return true;
@@ -437,7 +446,7 @@ host.writeStartupDiagnostic = host.stderr.write;
 globalThis.process = { platform: host.platform, env: host.env, nextTick: host.nextTick, emitWarning: value => host.stderr.write(String(value) + '\n') };
 const EventEmitter = internalRequire('events');
 const process = new EventEmitter();
-globalThis.process = process;
+defineGlobalAccessor('process', process);
 let startTime = native.runtimeStartTime;
 const performanceMilestones = {
   nodeStart: 0, environment: native.environmentTime - startTime,
@@ -458,11 +467,50 @@ host.performanceAddLoopListener = callback => {
   loopListeners.add(callback);
   return () => loopListeners.delete(callback);
 };
+// The Node release whose API this runtime implements.
+const nodeVersion = '24.22.1';
+// Versions of what this binary runs and links, as Node reports its own: node
+// first, the rest by name. The libraries answer for themselves; the bundled
+// JavaScript and vendored C sources carry the version of their pinned copy.
+function componentVersions() {
+  const [uv, openssl, zlib, brotli, zstd, nghttp2, sqlite] = native.osNative('componentVersions', []);
+  const versions = {
+    node: nodeVersion, acorn: '8.18.0', amaro: '1.1.11',
+    brotli: `${brotli >>> 24}.${(brotli >>> 12) & 0xfff}.${brotli & 0xfff}`,
+    llhttp: '9.4.3', napi: '10', nghttp2, openssl, quickjs: '2026-06-04', silkjsruntime: '0.1.0', sqlite,
+    uv, uvwasi: '0.0.23', zlib, zstd,
+  };
+  if (zlib === undefined) delete versions.zlib;
+  return versions;
+}
+// process.config describes the build the way Node's config.gypi does, for the
+// variables code inspects to learn what the binary supports. Frozen like Node's.
+function buildConfig() {
+  const freeze = value => {
+    if (value !== null && typeof value === 'object') { for (const key of Object.keys(value)) freeze(value[key]); Object.freeze(value); }
+    return value;
+  };
+  return freeze({
+    target_defaults: {
+      cflags: [], default_configuration: native.debugBuild ? 'Debug' : 'Release', defines: [], include_dirs: [], libraries: [],
+    },
+    variables: {
+      asan: 0, ubsan: 0, napi_build_version: '10', node_builtin_shareable_builtins: [], node_shared: false,
+      node_shared_openssl: false, node_shared_sqlite: false, node_shared_zstd: false, node_use_amaro: true,
+      node_use_openssl: true, node_without_node_options: false, node_quic: false, shlib_suffix: host.platform === 'darwin' ? 'dylib' : 'so',
+      single_executable_application: true, icu_small: false, v8_enable_i18n_support: 1, v8_enable_inspector: 1,
+    },
+  });
+}
 Object.assign(process, {
   argv: native.argv.slice(), argv0: native.argv[0], execArgv: [], execPath: native.osNative('execPath', []),
-  version: 'v24.0.0', versions: { node: '24.0.0', silkjsruntime: '0.1.0', quickjs: '2026-06-04', amaro: '1.1.11' },
+  version: 'v' + nodeVersion, versions: componentVersions(), config: buildConfig(),
   platform: host.platform, arch: host.arch, env: host.env, pid: rawOS.getpid(),
-  release: { name: 'silkjsruntime' }, stdout: host.stdout, stderr: host.stderr,
+  release: {
+    name: 'node', lts: 'Krypton',
+    sourceUrl: `https://nodejs.org/download/release/v${nodeVersion}/node-v${nodeVersion}.tar.gz`,
+    headersUrl: `https://nodejs.org/download/release/v${nodeVersion}/node-v${nodeVersion}-headers.tar.gz`,
+  }, stdout: host.stdout, stderr: host.stderr,
   cwd: host.cwd, chdir(path) { const code = rawOS.chdir(path); if (code < 0) throw systemError(code, 'chdir', path); },
   nextTick: host.nextTick, uptime: () => (native.now() - startTime) / 1000,
   hrtime(previous) { const nanoseconds = native.nowNanoseconds(); const value = [Number(nanoseconds / 1000000000n), Number(nanoseconds % 1000000000n)]; if (previous !== undefined) { if (!Array.isArray(previous)) throw Object.assign(new TypeError('The time argument must be an Array'), { code: 'ERR_INVALID_ARG_TYPE' }); if (previous.length !== 2) throw Object.assign(new RangeError('The time argument must contain two entries'), { code: 'ERR_OUT_OF_RANGE' }); value[0] -= previous[0]; value[1] -= previous[1]; if (value[1] < 0) { value[0]--; value[1] += 1000000000; } } return value; },
@@ -472,6 +520,7 @@ Object.assign(process, {
   exit(code) { if (code !== undefined) process.exitCode = code; if (!process._exiting) { process._exiting = true; process.emit('exit', Number(process.exitCode) || 0); } internalRequire('internal/compile_cache').flushCompileCache(); rawStd.exit(Number(process.exitCode) || 0); },
   kill(pid, signal = 'SIGTERM') { const number = typeof signal === 'string' ? rawOS[signal] : signal; if (number === undefined) throw Object.assign(new TypeError('Unknown signal: ' + signal), { code: 'ERR_UNKNOWN_SIGNAL' }); const code = rawOS.kill(pid, number); if (code < 0) throw systemError(code, 'kill'); return true; }
 });
+Object.defineProperty(process, 'config', { writable: false });
 Object.defineProperty(process, 'allowedNodeEnvironmentFlags', {
   configurable: true, enumerable: true,
   get() {
@@ -524,7 +573,8 @@ process.moduleLoadList = moduleLoadList;
 define('process', module => { module.exports = process; });
 internalRequire('internal/napi').install(host, process);
 const eventGlobals = internalRequire('internal/path_events/event_target');
-for (const name of ['Event', 'CustomEvent', 'EventTarget', 'AbortController', 'AbortSignal', 'DOMException']) globalThis[name] = eventGlobals[name];
+for (const name of ['Event', 'CustomEvent', 'EventTarget', 'AbortController', 'AbortSignal', 'DOMException'])
+  Object.defineProperty(globalThis, name, { value: eventGlobals[name], writable: true, enumerable: false, configurable: true });
 const asyncFS = internalRequire('internal/fs_async')(native);
 host.submitIO = (operation, args, callback, requestKind) => {
   const scope = resource(requestKind === 1 ? 'FSREQPROMISE' : requestKind === 2 ? 'FILEHANDLECLOSEREQ' : 'FSREQCALLBACK');
@@ -572,11 +622,11 @@ for (const name of ['stdout', 'stderr']) Object.defineProperty(host, name, {
 });
 const webGlobals = internalRequire('internal/web/index');
 webGlobals.install(globalThis);
-webGlobals.defineLazy(globalThis, 'console', () => ({ console: internalRequire('console') }));
+webGlobals.defineLazy(globalThis, 'console', () => ({ console: internalRequire('console') }), false);
 // Register the trusted dispatcher before preloads or any other guest code can
 // connect to this isolate (including through a parent Worker inspector).
 const inspectorBackend = internalRequire('internal/inspector');
-webGlobals.defineLazy(globalThis, 'crypto', () => ({ crypto: internalRequire('crypto').webcrypto }));
+webGlobals.defineLazy(globalThis, 'crypto', () => ({ crypto: internalRequire('crypto').webcrypto }), true);
 for (const name of ['Crypto', 'SubtleCrypto', 'CryptoKey']) {
   Object.defineProperty(globalThis, name, {
     get() {
@@ -591,7 +641,7 @@ for (const name of ['Crypto', 'SubtleCrypto', 'CryptoKey']) {
 {
   const loadPerformance = () => internalRequire('perf_hooks');
   for (const name of ['performance', 'Performance', 'PerformanceEntry', 'PerformanceMark', 'PerformanceMeasure', 'PerformanceObserver', 'PerformanceObserverEntryList', 'PerformanceResourceTiming'])
-    webGlobals.defineLazy(globalThis, name, loadPerformance);
+    webGlobals.defineLazy(globalThis, name, loadPerformance, name === 'performance');
 }
 host.path = internalRequire('path');
 const publicBuiltinNames = [...factories.keys()].filter(name => !name.startsWith('internal/'));
@@ -1218,8 +1268,9 @@ Environment:
 }
 function referencedWork() {
   if (native.hasPendingIO()) return true;
-  for (const timer of timers.values()) if (timer._refed && !timer._destroyed) return true;
-  for (const timer of immediates.values()) if (timer._refed && !timer._destroyed) return true;
+  // Most I/O-bound turns have no timers: skip creating the iterators.
+  if (timers.size !== 0) for (const timer of timers.values()) if (timer._refed && !timer._destroyed) return true;
+  if (immediates.size !== 0) for (const timer of immediates.values()) if (timer._refed && !timer._destroyed) return true;
   return false;
 }
 function fireTimer(timer, collection) {
@@ -1256,7 +1307,7 @@ function pollTimeout(pendingPromise) {
   const referenced = referencedWork();
   if (!referenced && pendingPromise === undefined) return 0;
   let due = Infinity;
-  for (const timer of timers.values()) if (!timer._destroyed && timer._due < due) due = timer._due;
+  if (timers.size !== 0) for (const timer of timers.values()) if (!timer._destroyed && timer._due < due) due = timer._due;
   // A hook may await an unreferenced timer or an externally settled promise.
   // Keep nested waits interruptible without emitting main-loop lifecycle events.
   if (!referenced && due === Infinity) return 1;
@@ -1268,7 +1319,7 @@ function loopTurn(pendingPromise) {
   const now = native.now();
   // Only the due timers are ordered; most turns have none.
   let due;
-  for (const timer of timers.values()) if (!timer._destroyed && timer._due <= now) (due ||= []).push(timer);
+  if (timers.size !== 0) for (const timer of timers.values()) if (!timer._destroyed && timer._due <= now) (due ||= []).push(timer);
   if (due !== undefined) {
     if (due.length > 1) due.sort((a, b) => a._due - b._due || a._id - b._id);
     for (const timer of due) if (!timer._destroyed && timer._due <= now) fireTimer(timer, timers);
@@ -1276,7 +1327,7 @@ function loopTurn(pendingPromise) {
   native.pollIO(pollTimeout(pendingPromise));
   pollWorkers();
   checkpoint();
-  for (const listener of loopListeners) listener();
+  if (loopListeners.size !== 0) for (const listener of loopListeners) listener();
   if (immediates.size !== 0) {
     for (const timer of [...immediates.values()]) {
       if (!timer._destroyed) fireTimer(timer, immediates);
