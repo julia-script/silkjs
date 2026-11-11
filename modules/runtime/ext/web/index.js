@@ -27,6 +27,11 @@ const groups = [
 // such as URL or TextEncoder are non-enumerable, as WebIDL defines them.
 const enumerableGlobals = new Set(['fetch', 'structuredClone', 'navigator']);
 
+// Node exposes these interfaces as plain data properties from the start, and
+// its tests read their descriptors. A native lazy data property keeps that
+// shape and still loads the module on first use.
+const dataGlobals = new Set(['URL', 'URLSearchParams']);
+
 // The accessors carry Node's names (`get fetch`), which tests and
 // util.inspect show.
 function defineLazy(target, name, load, enumerable) {
@@ -53,7 +58,10 @@ function install(target) {
     }
     let exports;
     const load = () => exports || (exports = require(id));
-    for (const name of names) defineLazy(target, name, load, enumerableGlobals.has(name));
+    for (const name of names) {
+      if (dataGlobals.has(name)) require('internal/host').defineLazyDataProperty(target, name, () => load()[name]);
+      else defineLazy(target, name, load, enumerableGlobals.has(name));
+    }
   }
 }
 

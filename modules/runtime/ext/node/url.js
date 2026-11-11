@@ -43,7 +43,7 @@ const {
   decodeURIComponent: globalThis.decodeURIComponent,
 };
 
-const toASCII = (domain) => require('internal/web/vendor/tr46/index').toASCII(domain) || '';
+const toASCII = (domain) => require('internal/host').urlIdnaToASCII(`${domain}`);
 const encodeStr = (value) => encodeURIComponent(value).replace(/%3A/gi, ':');
 const querystring = require('querystring');
 
