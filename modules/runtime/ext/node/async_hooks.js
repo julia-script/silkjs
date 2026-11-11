@@ -4,7 +4,10 @@ const host = require('internal/host');
 const apply = Reflect.apply;
 const hookNames = ['init', 'before', 'after', 'destroy', 'promiseResolve'];
 const hooks = new Set();
-const promiseHooks = new Set();
+// internalBinding('async_wrap').setPromiseHooks: one function per event, set by
+// internal/promise_hooks (which runs several hooks for one event itself).
+let promiseHookFunctions = [undefined, undefined, undefined, undefined];
+const promiseEventIndex = { init: 0, before: 1, after: 2, settled: 3 };
 const nativeResources = new Map();
 const rootResource = {};
 const resourceOwnerToken = Symbol('resourceOwner');
@@ -33,8 +36,12 @@ function executionAsyncResource() {
   const resource = captureContext()?.resource;
   return resource instanceof WeakRef ? resource.deref() : resource ?? rootResource;
 }
+// The inspector's view of promise reactions (V8's async task instrumentation),
+// kept apart from promise hooks so it never shows up as one.
+let promiseObserver;
+function setPromiseObserver(observer) { promiseObserver = observer; syncNativeHooks(); }
 function syncNativeHooks() {
-  let enabled = !emitting && promiseHooks.size !== 0;
+  let enabled = !emitting && (promiseHookFunctions.some(Boolean) || promiseObserver !== undefined);
   if (!emitting) for (const hook of hooks) {
     if (hook.trackPromises && hookNames.some(name => hook.callbacks[name] !== undefined)) { enabled = true; break; }
   }
@@ -59,41 +66,27 @@ function emit(name, args, promise = false) {
     syncNativeHooks();
   }
 }
-function createPromiseHook(callbacks = {}) {
-  if (callbacks === null || typeof callbacks !== 'object')
-    throw error('ERR_INVALID_ARG_TYPE', 'The "callbacks" argument must be an object');
-  const listener = Object.create(null);
-  for (const name of ['init', 'before', 'after', 'settled']) {
-    const callback = callbacks[name];
-    if (callback === undefined) continue;
-    checkFunction(callback, name);
-    if (require('util/types').isAsyncFunction(callback))
-      throw error('ERR_INVALID_ARG_TYPE', `The "${name}" hook must not be an async function`);
-    listener[name] = callback;
-  }
-  if (Object.keys(listener).length) promiseHooks.add(listener);
+function setPromiseHooks(init, before, after, settled) {
+  promiseHookFunctions = [init, before, after, settled];
   syncNativeHooks();
-  return () => { promiseHooks.delete(listener); syncNativeHooks(); };
 }
+// An exception from a promise hook is uncaught, as Node's hook functions report it.
 function emitPromise(name, promise, parent) {
-  if (emitting || promiseHooks.size === 0) return;
-  const listeners = Array.from(promiseHooks);
+  const callback = promiseHookFunctions[promiseEventIndex[name]];
+  if (emitting || callback === undefined) return;
   emitting = true;
   syncNativeHooks();
+  let thrown;
   try {
-    for (const listener of listeners) {
-      const callback = listener[name];
-      if (callback !== undefined) {
-        if (name === 'init') callback(promise, parent);
-        else callback(promise);
-      }
-    }
+    if (name === 'init') callback(promise, parent);
+    else callback(promise);
   } catch (exception) {
-    host.asyncHookFatal(exception);
+    thrown = { exception };
   } finally {
     emitting = false;
     syncNativeHooks();
   }
+  if (thrown !== undefined) host.triggerUncaughtException(thrown.exception);
 }
 function enqueueDestroy(state) {
   if (state.destroyed) return;
@@ -339,6 +332,7 @@ class AsyncLocalStorage {
 // Engine tokens are monotonic and distinct from public async IDs. Metadata must
 // never strongly retain a Promise, otherwise its destroy event cannot occur.
 function nativeEvent(event, token, parent, resource, parentResource) {
+  if (promiseObserver !== undefined) promiseObserver(event, token, parentResource !== undefined);
   if (event === 0) {
     const state = { id: nextId++, trigger: nativeResources.get(parent)?.id ?? executionAsyncId(),
       resource: new WeakRef(resource), destroyed: false, promise: true };
@@ -371,6 +365,7 @@ function nativeEvent(event, token, parent, resource, parentResource) {
   }
 }
 function nativeDestroy(token) {
+  if (promiseObserver !== undefined) promiseObserver(4, token, false);
   const state = nativeResources.get(token);
   if (state === undefined) return;
   nativeResources.delete(token);
@@ -398,7 +393,7 @@ const asyncWrapProviders = Object.freeze({
 });
 module.exports = { AsyncLocalStorage, AsyncResource, createHook, executionAsyncId, triggerAsyncId, executionAsyncResource, asyncWrapProviders };
 Object.defineProperties(module.exports, {
-  _createPromiseHook: { value: createPromiseHook },
+  _setPromiseHooks: { value: setPromiseHooks },
   _createResource: { value: (type, owner, id) => new InternalResource(type, owner, id) },
   _enterResource: { value: (resource, omitFrame = false) => enterResource(resource, omitFrame) },
   _leaveResource: { value: resource => leaveResource(resource) },
@@ -409,5 +404,6 @@ Object.defineProperties(module.exports, {
   _runWithContext: { value: runWithContext },
   _nativeEvent: { value: nativeEvent },
   _nativeDestroy: { value: nativeDestroy },
+  _setPromiseObserver: { value: setPromiseObserver },
   _drainDestroy: { value: drainDestroy },
 });

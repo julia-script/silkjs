@@ -94,6 +94,43 @@ function getDeprecationWarningEmitter(
   };
 }
 
+function isPendingDeprecation() {
+  const { getOptionValue } = require('internal/options');
+  return getOptionValue('--pending-deprecation') &&
+    !getOptionValue('--no-deprecation');
+}
+
+function deprecateProperty(key, msg, code, isPendingDeprecation) {
+  const emitDeprecationWarning = getDeprecationWarningEmitter(
+    code, msg, undefined, false, isPendingDeprecation,
+  );
+  return (options) => {
+    if (key in options) {
+      emitDeprecationWarning();
+    }
+  };
+}
+
+// Internal deprecator for pending --pending-deprecation. This can be invoked
+// at snapshot building time as the warning permission is only queried at
+// run time.
+function pendingDeprecate(fn, msg, code) {
+  const emitDeprecationWarning = getDeprecationWarningEmitter(
+    code, msg, deprecated, false, isPendingDeprecation,
+  );
+  function deprecated(...args) {
+    emitDeprecationWarning();
+    return ReflectApply(fn, this, args);
+  }
+
+  ObjectDefineProperty(deprecated, 'length', {
+    __proto__: null,
+    ...ObjectGetOwnPropertyDescriptor(fn, 'length'),
+  });
+
+  return deprecated;
+}
+
 // Mark that a method should not be used.
 // Returns a modified function which warns once by default.
 // If --no-deprecation is set, then it is a no-op.
@@ -414,6 +451,21 @@ function filterDuplicateStrings(items, low) {
   return ArrayPrototypeSort(ArrayFrom(map.values()));
 }
 
+function getConstructorOf(obj) {
+  while (obj) {
+    const descriptor = ObjectGetOwnPropertyDescriptor(obj, 'constructor');
+    if (descriptor !== undefined &&
+        typeof descriptor.value === 'function' &&
+        descriptor.value.name !== '') {
+      return descriptor.value;
+    }
+
+    obj = ObjectGetPrototypeOf(obj);
+  }
+
+  return null;
+}
+
 let validateUint32;
 function sleep(msec) {
   // Lazy-load to avoid a circular dependency.
@@ -447,6 +499,7 @@ module.exports = {
   customPromisifyArgs: kCustomPromisifyArgsSymbol,
   deprecate,
   deprecateInstantiation,
+  deprecateProperty,
   emitExperimentalWarning,
   filterDuplicateStrings,
   encodingsMap,
@@ -455,6 +508,7 @@ module.exports = {
   getLazy,
   getSystemErrorName,
   isError,
+  isPendingDeprecation,
   join,
   kEmptyObject,
   kEnumerableProperty,
@@ -462,6 +516,7 @@ module.exports = {
   lazyDOMExceptionClass,
   normalizeEncoding,
   once,
+  pendingDeprecate,
   promisify,
   removeColors,
   setOwnProperty,

@@ -49,11 +49,10 @@ const {
 } = require('internal/util_public/support');
 const { addAbortListener } = require('internal/path_events/abort_listener');
 const { kEmptyObject } = require('internal/util_public/support');
-const TIMEOUT_MAX = 2147483647;
+const { TIMEOUT_MAX } = require('internal/timers');
 const { clearTimeout, setTimeout } = require('timers');
 
-const host = require('internal/host');
-const timersBinding = { getLibuvNow: () => Math.floor(host.now()) };
+const timersBinding = require('internal/timers_binding');
 const { markPromiseAsHandled } = require('internal/host');
 
 /**
