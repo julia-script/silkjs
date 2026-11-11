@@ -99,7 +99,7 @@ function inspect(value, options, depth, color) {
         }
         if (holes) entries.push(style('<' + holes + ' empty item' + (holes === 1 ? '' : 's') + '>', 'undefined'));
         if (v.length > count) entries.push('... ' + (v.length - count) + ' more item' + (v.length - count === 1 ? '' : 's'));
-        for (const k of Object.keys(v)) if (/^(0|[1-9]\d*)$/.test(k) && Number(k) < v.length) skip.add(k);
+        for (let i = 0, own = Object.keys(v); i < own.length; i++) { const k = own[i]; if (/^(0|[1-9]\d*)$/.test(k) && Number(k) < v.length) skip.add(k); }
         if (!opts.showHidden) skip.add('length');
       } else if (map || set) {
         prefix = (map ? 'Map' : 'Set') + '(' + v.size + ') ';
@@ -120,13 +120,13 @@ function inspect(value, options, depth, color) {
         // Like Node, an error whose stack has no frames prints in brackets.
         if (typeof v.stack === 'string' && !v.stack.includes('\n    at')) prefix = '[' + v.stack + ']';
         skip.add('name'); skip.add('message'); skip.add('stack');
-        for (const key of ['cause', 'errors']) if (Object.prototype.hasOwnProperty.call(v, key)) entries.push(property(v, key, next, level, false));
+        for (let key$i = 0, key$a = ['cause', 'errors']; key$i < key$a.length; key$i++) { const key = key$a[key$i]; if (Object.prototype.hasOwnProperty.call(v, key)) entries.push(property(v, key, next, level, false)); }
         skip.add('cause'); skip.add('errors');
       } else if (typeof v === 'function') {
         prefix = style('[' + (types.isAsyncFunction(v) ? 'AsyncFunction' : types.isGeneratorFunction(v) ? 'GeneratorFunction' : 'Function') + (v.name ? ': ' + v.name : ' (anonymous)') + ']', 'special');
       } else if (types.isBoxedPrimitive(v)) {
         let inner;
-        for (const proto of [Number.prototype, String.prototype, Boolean.prototype, BigInt.prototype, Symbol.prototype]) {
+        for (let proto$i = 0, proto$a = [Number.prototype, String.prototype, Boolean.prototype, BigInt.prototype, Symbol.prototype]; proto$i < proto$a.length; proto$i++) { const proto = proto$a[proto$i]; 
           try { inner = proto.valueOf.call(v); break; } catch {}
         }
         prefix = '[' + (typeof inner === 'bigint' ? 'BigInt' : typeof inner === 'symbol' ? 'Symbol' : ctor) + ': ' + primitive(inner) + ']';
@@ -135,7 +135,7 @@ function inspect(value, options, depth, color) {
         prefix = ctor + ' ';
         let bytes;
         try { bytes = new Uint8Array(v); } catch { bytes = null; }
-        entries.push('[Uint8Contents]: ' + (bytes ? '<' + Array.from(bytes.subarray(0, max), n => n.toString(16).padStart(2, '0')).join(' ') + (bytes.length > max ? ' ... ' + (bytes.length - max) + ' more bytes' : '') + '>' : '<detached>'));
+        entries.push('[Uint8Contents]: ' + (bytes ? '<' + Array.prototype.map.call(bytes.subarray(0, max), n => n.toString(16).padStart(2, '0')).join(' ') + (bytes.length > max ? ' ... ' + (bytes.length - max) + ' more bytes' : '') + '>' : '<detached>'));
         entries.push('byteLength: ' + (bytes ? bytes.length : 0));
       } else if (types.isDataView(v)) {
         prefix = 'DataView ';
@@ -146,15 +146,27 @@ function inspect(value, options, depth, color) {
         const details = host.getPromiseDetails(v);
         prefix = 'Promise ';
         entries.push(details[0] === 0 ? style('<pending>', 'special') : (details[0] === 2 ? style('<rejected>', 'special') + ' ' : '') + format(details[1], next, level + 1));
+      } else if (types.isModuleNamespaceObject(v)) {
+        prefix = '[Module: null prototype] ';
+        // Exports still in their temporal dead zone read as <uninitialized>, as in Node.
+        const exported = Reflect.ownKeys(v).filter(k => typeof k === 'string' || opts.showHidden);
+        for (let key$i = 0, key$a = exported; key$i < key$a.length; key$i++) { const key = key$a[key$i]; 
+          let rendered;
+          try { rendered = format(v[key], next, level + 1); }
+          catch (error) { if (!(error instanceof ReferenceError)) throw error; rendered = style('<uninitialized>', 'special'); }
+          const name = typeof key === 'symbol' ? '[' + style(String(key), 'symbol') + ']' : /^[A-Za-z_$][\w$]*$/.test(key) ? key : style(quote(key), 'string');
+          entries.push(name + ': ' + rendered);
+        }
+        for (let key$i = 0, key$a = exported; key$i < key$a.length; key$i++) { const key = key$a[key$i]; skip.add(key); }
       } else if (Object.getPrototypeOf(v) === null) {
         prefix = '[Object: null prototype] ';
       } else if (ctor && ctor !== 'Object') {
         prefix = ctor + ' ';
       }
-      let keys = opts.showHidden ? Reflect.ownKeys(v) : Reflect.ownKeys(v).filter(k => Object.prototype.propertyIsEnumerable.call(v, k));
+      let keys = types.isModuleNamespaceObject(v) ? [] : opts.showHidden ? Reflect.ownKeys(v) : Reflect.ownKeys(v).filter(k => Object.prototype.propertyIsEnumerable.call(v, k));
       keys = keys.filter(k => !skip.has(k));
       if (opts.sorted) keys.sort(typeof opts.sorted === 'function' ? opts.sorted : (a, b) => String(a).localeCompare(String(b)));
-      for (const key of keys) entries.push(property(v, key, next, level, false));
+      for (let key$i = 0, key$a = keys; key$i < key$a.length; key$i++) { const key = key$a[key$i]; entries.push(property(v, key, next, level, false)); }
       if (opts.sorted && (map || set)) entries.sort(typeof opts.sorted === 'function' ? opts.sorted : undefined);
       let result;
       if (prefix && !prefix.endsWith(' ')) result = entries.length ? join(prefix + ' ', open, entries, close, level) : prefix;

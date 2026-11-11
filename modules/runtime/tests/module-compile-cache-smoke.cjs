@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { createHash } = require('node:crypto');
+const zlib = require('node:zlib');
 const { spawnSync, spawn } = require('node:child_process');
 const executable = path.resolve(process.argv[2] || process.execPath);
 const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'silk-module-cache-')));
@@ -20,22 +20,27 @@ function run(args, extra = {}) {
 function entries(directory) {
   return fs.readdirSync(directory, { withFileTypes: true }).filter(entry => entry.isFile()).map(entry => path.join(directory, entry.name));
 }
+// Cache files use Node's layout: five little-endian words (magic, code size,
+// cache size, code hash, cache hash; crc32) and then the cache bytes.
+const kHeader = 20;
+const isCacheFile = bytes => bytes.length >= kHeader && bytes.readUInt32LE(0) === 0x8adfdbb2;
+const rehash = bytes => bytes.writeUInt32LE(zlib.crc32(bytes.subarray(kHeader)), 16);
 // A semantic witness, not timing or telemetry: change one valid serialized string
 // constant, leaving source and identity intact. Warm execution MUST use that value.
-// Only Silk's envelope is changed; Node still exercises the public contract below.
+// Only Silk's bytecode is changed; Node still exercises the public contract below.
 function witness(directory, from, to) {
   assert.equal(from.length, to.length);
   let count = 0;
   for (const filename of entries(directory)) {
     const bytes = fs.readFileSync(filename);
-    if (bytes.subarray(0, 8).toString() !== 'SILKMC01') continue;
-    const payload = bytes.subarray(104);
+    if (!isCacheFile(bytes)) continue;
+    const payload = bytes.subarray(kHeader);
     const wireLength = Number(payload.readBigUInt64LE(payload.length - 24));
     const wire = payload.subarray(0, wireLength);
     const at = wire.indexOf(from);
     if (at < 0) continue;
     Buffer.from(to).copy(wire, at);
-    createHash('sha256').update(payload).digest().copy(bytes, 72);
+    rehash(bytes);
     fs.writeFileSync(filename, bytes); count++;
   }
   return count;
@@ -68,27 +73,27 @@ async function main() {
   assert.ok(entries(directory).length >= 4);
   const cjsWitness = witness(directory, 'CJS_COLD_MARKER', 'CJS_WARM_MARKER');
   const esmWitness = witness(directory, 'ESM_COLD_MARKER', 'ESM_WARM_MARKER');
-  const silk = path.basename(directory).startsWith('silk-');
+  const silk = run(['-p', "'silkjsruntime' in process.versions"]) === 'true';
   if (silk) {
     assert.ok(cjsWitness && esmWitness, 'both bytecode kinds must be persisted');
     const warm = JSON.parse(run(['main.cjs']));
     assert.deepEqual(warm, ['CJS_WARM_MARKER', 'ESM_WARM_MARKER', ...cold.slice(2)], 'must execute deserialized code, not recompile source');
-    // Changed effective compiler options cannot reuse the old serialized witness.
-    assert.deepEqual(JSON.parse(run(['--no-warnings', 'main.cjs'])), cold);
+    // Like Node, the key is the file name and code type, not the CLI options.
+    assert.deepEqual(JSON.parse(run(['--no-warnings', 'main.cjs'])).slice(0, 2), ['CJS_WARM_MARKER', 'ESM_WARM_MARKER']);
     // Recompute outer integrity after damaging native metadata: this reaches
     // decoder/restore rollback, including the ESM context-list ownership edge.
     for (const filename of entries(directory)) {
       const bytes = fs.readFileSync(filename);
-      if (bytes.subarray(0, 8).toString() !== 'SILKMC01') continue;
-      const payload = bytes.subarray(104);
+      if (!isCacheFile(bytes)) continue;
+      const payload = bytes.subarray(kHeader);
       payload[Number(payload.readBigUInt64LE(payload.length - 24))] = 255;
-      createHash('sha256').update(payload).digest().copy(bytes, 72);
+      rehash(bytes);
       fs.writeFileSync(filename, bytes);
     }
     assert.deepEqual(JSON.parse(run(['main.cjs'])), cold);
-    // Rejected envelope bytes fall back to the real source compiler.
+    // A header that no longer matches falls back to the real source compiler.
     for (const filename of entries(directory)) {
-      const bytes = fs.readFileSync(filename); if (bytes[0] === 83) { bytes[8] ^= 1; fs.writeFileSync(filename, bytes); }
+      const bytes = fs.readFileSync(filename); if (isCacheFile(bytes)) { bytes[16] ^= 1; fs.writeFileSync(filename, bytes); }
     }
     assert.deepEqual(JSON.parse(run(['main.cjs'])), cold);
     for (const filename of entries(directory)) fs.writeFileSync(filename, Buffer.from('truncated'));
@@ -117,7 +122,7 @@ async function main() {
     child.on('error', reject); child.on('exit', code => code === 0 ? resolve() : reject(new Error(stderr)));
   })));
   assert.equal(JSON.parse(run(['main.cjs']))[0], 'CJS_EDIT_MARKER');
-  assert.equal(fs.readdirSync(directory).some(name => name.startsWith('.tmp-')), false);
+  assert.equal(fs.readdirSync(directory).some(name => /\.[A-Za-z0-9]{6}$/.test(name)), false);
   // Portable keys and debug/module identities must relocate together.
   const portable = { ...env, NODE_COMPILE_CACHE_PORTABLE: '1' };
   run(['main.cjs'], { env: portable });
