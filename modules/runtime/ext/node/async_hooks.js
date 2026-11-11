@@ -33,8 +33,12 @@ function executionAsyncResource() {
   const resource = captureContext()?.resource;
   return resource instanceof WeakRef ? resource.deref() : resource ?? rootResource;
 }
+// The inspector's view of promise reactions (V8's async task instrumentation),
+// kept apart from promise hooks so it never shows up as one.
+let promiseObserver;
+function setPromiseObserver(observer) { promiseObserver = observer; syncNativeHooks(); }
 function syncNativeHooks() {
-  let enabled = !emitting && promiseHooks.size !== 0;
+  let enabled = !emitting && (promiseHooks.size !== 0 || promiseObserver !== undefined);
   if (!emitting) for (const hook of hooks) {
     if (hook.trackPromises && hookNames.some(name => hook.callbacks[name] !== undefined)) { enabled = true; break; }
   }
@@ -339,6 +343,7 @@ class AsyncLocalStorage {
 // Engine tokens are monotonic and distinct from public async IDs. Metadata must
 // never strongly retain a Promise, otherwise its destroy event cannot occur.
 function nativeEvent(event, token, parent, resource, parentResource) {
+  if (promiseObserver !== undefined) promiseObserver(event, token, parentResource !== undefined);
   if (event === 0) {
     const state = { id: nextId++, trigger: nativeResources.get(parent)?.id ?? executionAsyncId(),
       resource: new WeakRef(resource), destroyed: false, promise: true };
@@ -371,6 +376,7 @@ function nativeEvent(event, token, parent, resource, parentResource) {
   }
 }
 function nativeDestroy(token) {
+  if (promiseObserver !== undefined) promiseObserver(4, token, false);
   const state = nativeResources.get(token);
   if (state === undefined) return;
   nativeResources.delete(token);
@@ -409,5 +415,6 @@ Object.defineProperties(module.exports, {
   _runWithContext: { value: runWithContext },
   _nativeEvent: { value: nativeEvent },
   _nativeDestroy: { value: nativeDestroy },
+  _setPromiseObserver: { value: setPromiseObserver },
   _drainDestroy: { value: drainDestroy },
 });
