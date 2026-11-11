@@ -11,11 +11,12 @@ function install(global) {
   const WeakMap = global.WeakMap;
   const state = host.errorStackState || (host.errorStackState = {
     records: new WeakMap(), captured: new WeakMap(), rootError: Error, formatting: false,
-    // internal/errors: NodeErrors answer true to kIsNodeError, and an error in
-    // overrideStackTrace is formatted once by its callback (Node's hooks of the same names).
-    kIsNodeError: Symbol('kIsNodeError'), overrideStackTrace: new WeakMap(),
+    // Node's overrideStackTrace: a one-shot formatter for one error, ahead of Error.prepareStackTrace.
+    overrides: new WeakMap(),
+    // internal/errors: NodeErrors answer true to kIsNodeError (Node's symbol of the same name).
+    kIsNodeError: Symbol('kIsNodeError'),
   });
-  const { records, captured, rootError, kIsNodeError, overrideStackTrace } = state;
+  const { records, captured, rootError, kIsNodeError } = state;
   const define = Object.defineProperty;
   function record(site) {
     const value = records.get(site);
@@ -54,6 +55,26 @@ function install(global) {
     }
     return line === sourceLine ? offset + sourceColumn - 1 : null;
   }
+  // Node's internalBinding('errors').getErrorSourcePositions: where the top
+  // frame of a capture whose stack is not formatted yet sits in its script's
+  // source, as { sourceLine, scriptResourceName, lineNumber, startColumn }
+  // with a 0-based column. Undefined when there is no such frame or source.
+  function isLineBreak(code) { return code === 10 || code === 13 || code === 0x2028 || code === 0x2029; }
+  if (!state.getErrorSourcePositions) state.getErrorSourcePositions = (error) => {
+    const entry = captured.get(error);
+    if (!entry || entry.ready || !entry.raw || entry.raw.length === 0) return undefined;
+    const frame = fromNative(entry.raw[0]);
+    if (frame.scriptId === '0') return undefined;
+    const offset = position(frame);
+    if (offset === null || offset < 0) return undefined;
+    const source = scriptMetadata(frame).source;
+    let start = offset;
+    while (start > 0 && !isLineBreak(source.charCodeAt(start - 1))) start--;
+    let end = offset;
+    while (end < source.length && !isLineBreak(source.charCodeAt(end))) end++;
+    return { sourceLine: source.slice(start, end), scriptResourceName: frame.scriptName,
+      lineNumber: frame.lineNumber, startColumn: offset - start };
+  };
   function location(frame) {
     if (frame.isNative) return 'native';
     let filename = frame.scriptName || '<anonymous>';
@@ -175,19 +196,16 @@ function install(global) {
     if (state.formatting) return defaultFormat(error, frames);
     state.formatting = true;
     try {
-      const override = overrideStackTrace.get(error);
-      if (override !== undefined) {
-        overrideStackTrace.delete(error);
-        return override(error, callSites(frames));
-      }
+      const override = state.overrides.get(error);
+      if (override !== undefined) state.overrides.delete(error);
       let owner = Error;
-      let prepare = owner.prepareStackTrace;
-      if (typeof prepare !== 'function' && rootError !== Error) {
+      let prepare = override ?? owner.prepareStackTrace;
+      if (override === undefined && typeof prepare !== 'function' && rootError !== Error) {
         owner = rootError;
         prepare = owner.prepareStackTrace;
       }
-      if (typeof prepare !== 'function' || prepare === state.defaultPrepare) return defaultFormat(error, frames);
-      return Reflect.apply(prepare, owner, [error, callSites(frames)]);
+      if (override === undefined && (typeof prepare !== 'function' || prepare === state.defaultPrepare)) return defaultFormat(error, frames);
+      return Reflect.apply(prepare, override === undefined ? owner : undefined, [error, callSites(frames)]);
     } finally { state.formatting = false; }
   }
   function getStack() {
@@ -230,4 +248,8 @@ function install(global) {
   host.captureCallSites(0, Error, format);
 }
 
-module.exports = { install };
+module.exports = {
+  install,
+  get overrideStackTrace() { return host.errorStackState.overrides; },
+  get ErrorPrepareStackTrace() { return host.errorStackState.defaultPrepare; },
+};

@@ -1,155 +1,35 @@
-// Helpers the Node.js v24.22.1 web streams modules take from internal/util,
-// internal/util/types, internal/validators, internal/assert,
-// internal/worker/js_transferable and the messaging/buffer/util bindings.
-// The validators and assert are ported from Node.js v24.22.1.
+// What the Node.js v24.22.1 web streams modules take from internal/util,
+// internal/util/types, internal/validators, internal/assert, internal/webidl,
+// internal/worker/js_transferable and the messaging/buffer/util bindings, in
+// one place. The webidl enumeration converter is ported from Node.js v24.22.1.
 // Copyright Node.js contributors. All rights reserved. MIT license (see
 // vendor/node-api/LICENSE).
 
 'use strict';
 
 const {
-  ArrayIsArray,
-  ArrayPrototypeIncludes,
-  ArrayPrototypeJoin,
-  ArrayPrototypeMap,
-  NumberIsNaN,
-  ObjectDefineProperty,
-  ObjectFreeze,
   RegExpPrototypeSymbolReplace,
   SafeSet,
   String,
-  SymbolFor,
   Uint8Array,
 } = require('internal/per_context/primordials');
-
-const {
-  codes: {
-    ERR_INTERNAL_ASSERTION,
-    ERR_INVALID_ARG_TYPE,
-    ERR_INVALID_ARG_VALUE,
-    ERR_OUT_OF_RANGE,
-  },
-} = require('internal/errors');
 
 const host = require('internal/host');
 const types = require('util/types');
 const { DOMException } = require('internal/path_events/event_target');
-const { normalizeEncoding } = require('internal/streams/support');
 
-// internal/util
-const customInspectSymbol = SymbolFor('nodejs.util.inspect.custom');
-const kEmptyObject = ObjectFreeze({ __proto__: null });
-const kEnumerableProperty = ObjectFreeze({ __proto__: null, enumerable: true });
-
-function setOwnProperty(obj, key, value) {
-  ObjectDefineProperty(obj, key, {
-    __proto__: null,
-    configurable: true,
-    enumerable: true,
-    value,
-    writable: true,
-  });
-  return value;
-}
+const { customInspectSymbol, kEmptyObject, kEnumerableProperty, normalizeEncoding, setOwnProperty } = require('internal/util');
+const {
+  kValidateObjectAllowObjects, kValidateObjectAllowObjectsAndNull, validateAbortSignal, validateBoolean,
+  validateBuffer, validateFunction, validateNumber, validateObject, validateOneOf,
+} = require('internal/validators');
+const assert = require('internal/assert');
 
 // Node runs the replacement through a RegExp from a separate realm so that
 // user changes to RegExp.prototype are not observed; the primordial is the
 // original RegExp.prototype[Symbol.replace], which gives the same guarantee.
 function SideEffectFreeRegExpPrototypeSymbolReplace(regex, string, replacement) {
   return RegExpPrototypeSymbolReplace(regex, string, replacement);
-}
-
-// internal/validators
-const kValidateObjectNone = 0;
-const kValidateObjectAllowNullable = 1 << 0;
-const kValidateObjectAllowArray = 1 << 1;
-const kValidateObjectAllowFunction = 1 << 2;
-const kValidateObjectAllowObjects = kValidateObjectAllowArray |
-  kValidateObjectAllowFunction;
-const kValidateObjectAllowObjectsAndNull = kValidateObjectAllowNullable |
-  kValidateObjectAllowArray |
-  kValidateObjectAllowFunction;
-
-function validateObject(value, name, options = kValidateObjectNone) {
-  if (options === kValidateObjectNone) {
-    if (value === null || ArrayIsArray(value)) {
-      throw new ERR_INVALID_ARG_TYPE(name, 'Object', value);
-    }
-
-    if (typeof value !== 'object') {
-      throw new ERR_INVALID_ARG_TYPE(name, 'Object', value);
-    }
-  } else {
-    const throwOnNullable = (kValidateObjectAllowNullable & options) === 0;
-
-    if (throwOnNullable && value === null) {
-      throw new ERR_INVALID_ARG_TYPE(name, 'Object', value);
-    }
-
-    const throwOnArray = (kValidateObjectAllowArray & options) === 0;
-
-    if (throwOnArray && ArrayIsArray(value)) {
-      throw new ERR_INVALID_ARG_TYPE(name, 'Object', value);
-    }
-
-    const throwOnFunction = (kValidateObjectAllowFunction & options) === 0;
-    const typeofValue = typeof value;
-
-    if (typeofValue !== 'object' && (throwOnFunction || typeofValue !== 'function')) {
-      throw new ERR_INVALID_ARG_TYPE(name, 'Object', value);
-    }
-  }
-}
-
-function validateNumber(value, name, min = undefined, max) {
-  if (typeof value !== 'number')
-    throw new ERR_INVALID_ARG_TYPE(name, 'number', value);
-
-  if ((min != null && value < min) || (max != null && value > max) ||
-    ((min != null || max != null) && NumberIsNaN(value))) {
-    throw new ERR_OUT_OF_RANGE(
-      name,
-      `${min != null ? `>= ${min}` : ''}${min != null && max != null ? ' && ' : ''}${max != null ? `<= ${max}` : ''}`,
-      value);
-  }
-}
-
-function validateOneOf(value, name, oneOf) {
-  if (!ArrayPrototypeIncludes(oneOf, value)) {
-    const allowed = ArrayPrototypeJoin(
-      ArrayPrototypeMap(oneOf, (v) =>
-        (typeof v === 'string' ? `'${v}'` : String(v))),
-      ', ');
-    const reason = 'must be one of: ' + allowed;
-    throw new ERR_INVALID_ARG_VALUE(name, value, reason);
-  }
-}
-
-function validateBoolean(value, name) {
-  if (typeof value !== 'boolean')
-    throw new ERR_INVALID_ARG_TYPE(name, 'boolean', value);
-}
-
-function validateBuffer(buffer, name = 'buffer') {
-  if (!types.isArrayBufferView(buffer)) {
-    throw new ERR_INVALID_ARG_TYPE(name,
-                                   ['Buffer', 'TypedArray', 'DataView'],
-                                   buffer);
-  }
-}
-
-function validateAbortSignal(signal, name) {
-  if (signal !== undefined &&
-      (signal === null ||
-       typeof signal !== 'object' ||
-       !('aborted' in signal))) {
-    throw new ERR_INVALID_ARG_TYPE(name, 'AbortSignal', signal);
-  }
-}
-
-function validateFunction(value, name) {
-  if (typeof value !== 'function')
-    throw new ERR_INVALID_ARG_TYPE(name, 'Function', value);
 }
 
 // internal/webidl: the enumeration converter.
@@ -196,17 +76,6 @@ function createEnumConverter(name, values) {
     return S;
   };
 }
-
-// internal/assert
-function assert(value, message) {
-  if (!value) {
-    throw new ERR_INTERNAL_ASSERTION(message);
-  }
-}
-function fail(message) {
-  throw new ERR_INTERNAL_ASSERTION(message);
-}
-assert.fail = fail;
 
 // internal/worker/js_transferable
 const {

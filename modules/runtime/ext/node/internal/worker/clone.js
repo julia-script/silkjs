@@ -32,11 +32,23 @@ function isJSTransferable(value) {
     typeof value[jsTransferable.kTransfer] === 'function';
 }
 function installPortHooks(hooks) { portHooks = hooks; }
+// postMessage(value, transferList) takes an iterable, or an options object whose transfer
+// member is one, with Node's messages for each.
+function iterable(value, name) {
+  const invalid = () => codedError('ERR_INVALID_ARG_TYPE', `Optional ${name} argument must be an iterable`);
+  if (value === null || (typeof value !== 'object' && typeof value !== 'function') || typeof value[Symbol.iterator] !== 'function') throw invalid();
+  const iterator = value[Symbol.iterator]();
+  if (iterator === null || typeof iterator !== 'object' || typeof iterator.next !== 'function') throw invalid();
+  const result = [];
+  for (let step = iterator.next(); !step.done; step = iterator.next()) result.push(step.value);
+  return result;
+}
 function transferList(value) {
-  if (value === undefined) return [];
-  if (value === null || typeof value[Symbol.iterator] !== 'function')
-    throw codedError('ERR_INVALID_ARG_TYPE', 'The transferList argument must be an iterable');
-  return Array.from(value);
+  if (value == null) return [];
+  if ((typeof value === 'object' || typeof value === 'function') && typeof value[Symbol.iterator] !== 'function') {
+    return value.transfer === undefined ? [] : iterable(value.transfer, 'options.transfer');
+  }
+  return iterable(value, 'transferList');
 }
 
 class CloneSerializer extends Serializer {
@@ -155,7 +167,7 @@ class CloneSerializer extends Serializer {
     }
     if (portHooks?.isPort(value)) {
       const id = this.ports.indexOf(value);
-      if (id < 0) throw codedError('ERR_MISSING_TRANSFERABLE_IN_TRANSFER_LIST', 'Object that needs transfer was found in message but not listed in transferList', Error);
+      if (id < 0) throw cloneError('Object that needs transfer was found in message but not listed in transferList');
       this.writeUint32(0);
       this.writeUint32(id);
       return;
@@ -267,7 +279,7 @@ function prepare(value, list, source) {
   const signals = new Map();
   const transferred = new Map();
   for (const item of transferList(list)) {
-    if (seen.has(item)) throw cloneError('Transfer list contains a duplicate object.');
+    if (seen.has(item)) throw cloneError(`Transfer list contains duplicate ${portHooks?.isPort(item) ? 'MessagePort' : 'ArrayBuffer'}`);
     seen.add(item);
     if (isMarkedAsUntransferable(item)) throw cloneError('Object is marked as untransferable.');
     if (types.isArrayBuffer(item)) {
@@ -275,9 +287,9 @@ function prepare(value, list, source) {
       try { new Uint8Array(item); } catch { throw cloneError('An ArrayBuffer is detached.'); }
       buffers.push(item);
     } else if (portHooks?.isPort(item)) {
-      const id = portHooks.id(item);
-      if (id === source) throw cloneError('Transfer list contains the source port.');
-      if (ids.includes(id)) throw cloneError('Transfer list contains a duplicate port.');
+      const id = portHooks.transferId(item);
+      if (id === source) throw cloneError('Transfer list contains source port');
+      if (ids.includes(id)) throw cloneError('Transfer list contains duplicate MessagePort');
       ports.push(item);
       ids.push(id);
     } else if (abort.isTransferable(item)) {
@@ -375,7 +387,7 @@ function decode(envelope, realm) {
   catch (error) { for (const port of deserializer.ports) portHooks.close(port); throw error; }
 }
 function structuredClone(value, options) {
-  if (arguments.length === 0) throw codedError('ERR_MISSING_ARGS', 'The value argument must be specified');
+  if (arguments.length === 0) throw codedError('ERR_MISSING_ARGS', 'The "value" argument must be specified');
   // Web IDL StructuredSerializeOptions, as in Node's js_transferable.
   const prefix = "Failed to execute 'structuredClone'";
   if (options != null && !object(options))
@@ -401,7 +413,7 @@ function structuredClone(value, options) {
   let prepared;
   try { prepared = prepare(value, list); }
   catch (error) {
-    if (error?.code === 'ERR_INVALID_TRANSFER_OBJECT' || error?.code === 'ERR_MISSING_TRANSFERABLE_IN_TRANSFER_LIST')
+    if (error?.code === 'ERR_INVALID_TRANSFER_OBJECT')
       throw cloneError(error.message);
     throw error;
   }

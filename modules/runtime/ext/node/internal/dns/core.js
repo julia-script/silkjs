@@ -20,6 +20,12 @@ function native(op, args) {
   try { return host.net(op, args); }
   catch (e) { resource.emitDestroy(); throw e; }
 }
+const { codedError, codes: { ERR_INVALID_ARG_VALUE }, validateArray, validateFunction, validateInt32, validateNumber, validatePort, validateString, validateUint32 } = require('internal/validators');
+const { codes: { ERR_DNS_SET_SERVERS_FAILED, ERR_INVALID_IP_ADDRESS } } = require('internal/errors');
+function validateStringWithoutNullBytes(value, name) {
+  validateString(value, name);
+  if (value.includes('\0')) throw new ERR_INVALID_ARG_VALUE(name, value, 'must be a string without null bytes');
+}
 function invalid(name, type) { const e = new TypeError(`The "${name}" argument must be ${type}`); e.code = 'ERR_INVALID_ARG_TYPE'; return e; }
 function valueError(name, value) { const e = new TypeError(`The argument '${name}' is invalid. Received ${String(value)}`); e.code = 'ERR_INVALID_ARG_VALUE'; return e; }
 function range(name, value) { const e = new RangeError(`The value of "${name}" is out of range. Received ${value}`); e.code = 'ERR_OUT_OF_RANGE'; return e; }
@@ -50,8 +56,12 @@ function lookup(hostname, options, cb) {
   let family = options.family === undefined ? 0 : options.family;
   if (family === 'IPv4') family = 4; if (family === 'IPv6') family = 6;
   if (![0, 4, 6].includes(family)) throw valueError('options.family', family);
-  const hints = options.hints === undefined ? 0 : integer(options.hints, 'options.hints', 0, 0xffffffff);
-  if (hints & ~(constants.ADDRCONFIG | constants.ALL | constants.V4MAPPED)) throw valueError('options.hints', hints);
+  let hints = 0;
+  if (options.hints != null) {
+    validateNumber(options.hints, 'options.hints');
+    hints = options.hints >>> 0;
+    if (hints & ~(constants.ADDRCONFIG | constants.ALL | constants.V4MAPPED)) throw new ERR_INVALID_ARG_VALUE('hints', hints);
+  }
   if (options.all !== undefined && typeof options.all !== 'boolean') throw invalid('options.all', 'a boolean');
   if (options.verbatim !== undefined && typeof options.verbatim !== 'boolean') throw invalid('options.verbatim', 'a boolean');
   const resultOrder = options.order !== undefined ? order(options.order) : options.verbatim !== undefined ? options.verbatim ? 'verbatim' : 'ipv4first' : defaultOrder;
@@ -78,65 +88,124 @@ function lookupService(address, port, cb) {
     const at = data.indexOf('\n'); cb(null, data.slice(0, at), data.slice(at + 1));
   }]);
 }
-function invalidServer(value) { const e = new TypeError(`Invalid IP address: ${value}`); e.code = 'ERR_INVALID_IP_ADDRESS'; return e; }
-function parseServer(value) {
-  string(value, 'servers');
-  let address = value, port;
-  if (value.startsWith('[')) {
-    const match = /^\[([^\]]+)\](?::([0-9]+))?$/.exec(value); if (!match) throw invalidServer(value);
-    address = match[1]; port = match[2]; if (isIP(address) !== 6) throw invalidServer(value);
-  } else if (!isIP(value)) {
-    const match = /^([^:]+):([0-9]+)$/.exec(value); if (!match || isIP(match[1]) !== 4) throw invalidServer(value);
-    address = match[1]; port = match[2];
-  }
-  const family = isIP(address); if (!family) throw invalidServer(value);
-  if (port !== undefined) integer(Number(port), 'port', 0, 65535);
-  return (family === 6 ? '[' + address + ']' : address) + (port === undefined ? '' : ':' + Number(port));
-}
-const state = new WeakMap();
-const finalizers = new FinalizationRegistry(id => native('dnsDestroy', [id]));
-class Resolver {
-  constructor(options = {}) {
-    object(options, 'options');
-    const timeout = options.timeout === undefined ? -1 : integer(options.timeout, 'options.timeout', -1, 0x7fffffff);
-    const tries = options.tries === undefined ? 4 : integer(options.tries, 'options.tries', 1, 0x7fffffff);
+// The c-ares ChannelWrap contract of Node's ResolverBase over the native resolver.
+const DNS_ESETSRVPENDING = -1000;
+const IANA_DNS_PORT = 53;
+const IPv6RE = /^\[([^[\]]*)\]/;
+const addrSplitRE = /(^.+?)(?::(\d+))?$/;
+class ChannelWrap {
+  constructor(timeout, tries) {
     const id = native('dnsCreate', [timeout, tries]); if (id < 0) throw error(codes[-id] || 'UNKNOWN', 'ares_init_options');
-    state.set(this, { id, pending: 0 });
+    this.id = id;
+    this.pending = 0;
     finalizers.register(this, id);
   }
-  cancel() { native('dnsCancel', [resolverState(this).id]); }
+  cancel() { native('dnsCancel', [this.id]); }
   getServers() {
-    const csv = native('dnsServers', [resolverState(this).id]);
+    const csv = native('dnsServers', [this.id]);
     return csv ? csv.split(',').map(server => {
-      const v6 = /^\[([^\]]+)\](?::53)?$/.exec(server); if (v6) return v6[1];
-      return server.replace(/:53$/, '');
+      const v6 = /^\[([^\]]+)\](?::([0-9]+))?$/.exec(server);
+      if (v6) return [v6[1], Number(v6[2] || IANA_DNS_PORT)];
+      const at = server.lastIndexOf(':');
+      return at === -1 ? [server, IANA_DNS_PORT] : [server.slice(0, at), Number(server.slice(at + 1))];
     }) : [];
   }
   setServers(servers) {
-    if (!Array.isArray(servers)) throw invalid('servers', 'an Array');
-    const csv = servers.map(parseServer).join(','); const entry = resolverState(this);
-    if (entry.pending) { const e = new Error('c-ares failed to set servers: There are pending queries'); e.code = 'ERR_DNS_SET_SERVERS_FAILED'; throw e; }
-    const status = native('dnsSetServers', [entry.id, csv]);
-    if (status) { const e = new Error(`c-ares failed to set servers: ${codes[status] || status} [${servers.join(', ')}]`); e.code = 'ERR_DNS_SET_SERVERS_FAILED'; throw e; }
+    if (this.pending) return DNS_ESETSRVPENDING;
+    return native('dnsSetServers', [this.id, servers.map(([family, address, port]) => `${family === 6 ? `[${address}]` : address}:${port}`).join(',')]);
   }
-  setLocalAddress(ipv4 = '0.0.0.0', ipv6 = '::') {
-    string(ipv4, 'ipv4'); string(ipv6, 'ipv6'); if (isIP(ipv4) !== 4) throw valueError('ipv4', ipv4); if (isIP(ipv6) !== 6) throw valueError('ipv6', ipv6);
-    const status = native('dnsLocal', [resolverState(this).id, ipv4, ipv6]); if (status) throw error('EINVAL', 'setLocalAddress', undefined, status);
+  setLocalAddress(first, second) {
+    const firstFamily = isIP(first);
+    if (!firstFamily) throw codedError(TypeError, 'ERR_INVALID_ARG_VALUE', 'Invalid IP address.');
+    let ipv4 = firstFamily === 4 ? first : '0.0.0.0';
+    let ipv6 = firstFamily === 6 ? first : '::';
+    if (second !== undefined) {
+      const secondFamily = isIP(second);
+      if (!secondFamily) throw codedError(TypeError, 'ERR_INVALID_ARG_VALUE', 'Invalid IP address.');
+      if (secondFamily === firstFamily) throw codedError(TypeError, 'ERR_INVALID_ARG_VALUE', `Cannot specify two IPv${firstFamily} addresses.`);
+      if (secondFamily === 4) ipv4 = second; else ipv6 = second;
+    }
+    const status = native('dnsLocal', [this.id, ipv4, ipv6]); if (status) throw error('EINVAL', 'setLocalAddress', undefined, status);
+  }
+}
+function strerror(status) {
+  return status === DNS_ESETSRVPENDING ? 'There are pending queries.' : codes[status] || String(status);
+}
+const finalizers = new FinalizationRegistry(id => native('dnsDestroy', [id]));
+class Resolver {
+  constructor(options = undefined) {
+    let { timeout = -1, tries = 4, maxTimeout = 0 } = { ...options };
+    validateInt32(timeout, 'options.timeout', -1);
+    validateInt32(tries, 'options.tries', 1);
+    validateUint32(maxTimeout, 'options.maxTimeout');
+    this._handle = new ChannelWrap(timeout + 0, tries);
+  }
+  cancel() { this._handle.cancel(); }
+  getServers() {
+    return (this._handle.getServers() || []).map(val => {
+      if (!val[1] || val[1] === IANA_DNS_PORT) return val[0];
+      return `${isIP(val[0]) === 6 ? `[${val[0]}]` : val[0]}:${val[1]}`;
+    });
+  }
+  setServers(servers) {
+    validateArray(servers, 'servers');
+    const newSet = [];
+    servers.forEach((serv, index) => {
+      validateString(serv, `servers[${index}]`);
+      let ipVersion = isIP(serv);
+      if (ipVersion !== 0) return newSet.push([ipVersion, serv, IANA_DNS_PORT]);
+      const match = IPv6RE.exec(serv);
+      // Check for an IPv6 in brackets.
+      if (match) {
+        ipVersion = isIP(match[1]);
+        if (ipVersion !== 0) {
+          const port = Number.parseInt(serv.replace(addrSplitRE, '$2')) || IANA_DNS_PORT;
+          validatePort(port);
+          return newSet.push([ipVersion, match[1], port]);
+        }
+      }
+      // addr::port
+      const addrSplitMatch = addrSplitRE.exec(serv);
+      if (addrSplitMatch) {
+        const hostIP = addrSplitMatch[1];
+        const port = Number.parseInt(addrSplitMatch[2]) || IANA_DNS_PORT;
+        ipVersion = isIP(hostIP);
+        if (ipVersion !== 0) {
+          validatePort(port);
+          return newSet.push([ipVersion, hostIP, port]);
+        }
+      }
+      throw new ERR_INVALID_IP_ADDRESS(serv);
+    });
+    const orig = (this._handle.getServers() || []).map(val => [isIP(val[0]), ...val]);
+    const errorNumber = this._handle.setServers(newSet);
+    if (errorNumber !== 0) {
+      // Reset the servers to the old servers, because the resolver probably unset them.
+      this._handle.setServers(orig);
+      throw new ERR_DNS_SET_SERVERS_FAILED(strerror(errorNumber), servers);
+    }
+  }
+  setLocalAddress(ipv4, ipv6) {
+    validateStringWithoutNullBytes(ipv4, 'ipv4');
+    if (ipv6 !== undefined) validateStringWithoutNullBytes(ipv6, 'ipv6');
+    this._handle.setLocalAddress(ipv4, ipv6);
   }
   resolve(hostname, rrtype, cb) {
     if (typeof rrtype === 'function') { cb = rrtype; rrtype = 'A'; }
     if (rrtype === undefined) rrtype = 'A';
-    string(rrtype, 'rrtype'); if (!Object.prototype.hasOwnProperty.call(packet.types, rrtype)) throw valueError('rrtype', rrtype);
+    validateString(rrtype, 'rrtype');
+    if (!Object.prototype.hasOwnProperty.call(packet.types, rrtype)) throw new ERR_INVALID_ARG_VALUE('rrtype', rrtype);
     return query(this, hostname, rrtype, {}, cb);
   }
   reverse(ip, cb) {
-    string(ip, 'ip'); callback(cb); const family = isIP(ip); if (!family) throw valueError('ip', ip);
+    validateStringWithoutNullBytes(ip, 'name'); validateFunction(cb, 'callback');
+    const family = isIP(ip); if (!family) throw new ERR_INVALID_ARG_VALUE('ip', ip);
     return query(this, packet.reverseName(ip, family), 'PTR', {}, cb, ip, 'getHostByAddr');
   }
 }
-function resolverState(resolver) { const entry = state.get(resolver); if (!entry) { const e = new TypeError('Value of this must be of type Resolver'); e.code = 'ERR_INVALID_THIS'; throw e; } return entry; }
+function resolverState(resolver) { const entry = resolver instanceof Resolver ? resolver._handle : undefined; if (!(entry instanceof ChannelWrap)) { const e = new TypeError('Value of this must be of type Resolver'); e.code = 'ERR_INVALID_THIS'; throw e; } return entry; }
 function query(resolver, hostname, rrtype, options, cb, display = hostname, syscall = 'query' + rrtype[0] + rrtype.slice(1).toLowerCase()) {
-  string(hostname, 'hostname'); callback(cb); object(options, 'options');
+  validateStringWithoutNullBytes(hostname, 'name'); validateFunction(cb, 'callback'); object(options, 'options');
   if (options.ttl !== undefined && typeof options.ttl !== 'boolean') throw invalid('options.ttl', 'a boolean');
   const ttl = options.ttl === true;
   const entry = resolverState(resolver); entry.pending++;
@@ -162,17 +231,31 @@ for (const [method, rrtype] of Object.entries(methods)) {
 function defaultInstance() { if (!defaultResolver) defaultResolver = new Resolver(); return defaultResolver; }
 const publicMethods = ['resolve', 'reverse', ...Object.keys(methods)];
 const api = Object.assign({ Resolver, lookup, lookupService, setDefaultResultOrder, getDefaultResultOrder }, constants, errors);
-for (const name of [...publicMethods, 'getServers', 'setServers']) api[name] = (...args) => defaultInstance()[name](...args);
-function promisifyCall(fn, receiver, args, shape) { return new Promise((resolve, reject) => { fn.apply(receiver, args.concat([(err, ...values) => { if (err) reject(err); else resolve(shape ? shape(values) : values[0]); }])); }); }
+for (const name of [...publicMethods, 'getServers']) api[name] = (...args) => defaultInstance()[name](...args);
+// Like Node, dns.setServers replaces the default resolver, so queries already sent keep theirs.
+api.setServers = function setServers(servers) {
+  const resolver = new Resolver();
+  resolver.setServers(servers);
+  defaultResolver = resolver;
+};
+// Like Node's dns.promises, invalid arguments throw at the call; only the query rejects.
+function promisifyCall(fn, receiver, args, shape) {
+  let resolve, reject;
+  const promise = new Promise((done, failed) => { resolve = done; reject = failed; });
+  fn.apply(receiver, args.concat([(err, ...values) => { if (err) reject(err); else resolve(shape ? shape(values) : values[0]); }]));
+  return promise;
+}
 function lookupPromise(hostname, options) { return promisifyCall(lookup, undefined, [hostname, options], values => Array.isArray(values[0]) ? values[0] : { address: values[0], family: values[1] }); }
 function lookupServicePromise(address, port) { return promisifyCall(lookupService, undefined, [address, port], values => ({ hostname: values[0], service: values[1] })); }
 class PromiseResolver extends Resolver {}
 for (const method of publicMethods) {
   Object.defineProperty(PromiseResolver.prototype, method, { configurable: true, writable: true, value: function(...args) { return promisifyCall(Resolver.prototype[method], this, args); } });
 }
-const promises = Object.assign({ Resolver: PromiseResolver, lookup: lookupPromise, lookupService: lookupServicePromise, setDefaultResultOrder, getDefaultResultOrder, getServers: api.getServers, setServers: api.setServers }, constants);
+const promises = Object.assign({ Resolver: PromiseResolver, lookup: lookupPromise, lookupService: lookupServicePromise, setDefaultResultOrder, getDefaultResultOrder, getServers: api.getServers, setServers: api.setServers }, constants, errors);
 for (const method of publicMethods) promises[method] = (...args) => promisifyCall(Resolver.prototype[method], defaultInstance(), args);
-const custom = Symbol.for('nodejs.util.promisify.custom');
-lookup[custom] = lookupPromise; lookupService[custom] = lookupServicePromise;
+// Like Node, util.promisify resolves these with an object of their named callback values.
+const { customPromisifyArgs } = require('internal/util');
+Object.defineProperty(lookup, customPromisifyArgs, { value: ['address', 'family'], enumerable: false });
+Object.defineProperty(lookupService, customPromisifyArgs, { value: ['hostname', 'service'], enumerable: false });
 api.promises = promises;
 module.exports = api;

@@ -22,22 +22,20 @@
 'use strict';
 const host = require('internal/host');
 const native = (operation, args = []) => host.osNative(operation, args);
-function invalid(name, expected) {
-  return Object.assign(new TypeError(`The "${name}" argument must be of type ${expected}`), { code: 'ERR_INVALID_ARG_TYPE' });
-}
+const { codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_UNKNOWN_CREDENTIAL } } = require('internal/errors');
+const { validateUint32 } = require('internal/validators');
+const invalid = (name, expected, value) => new ERR_INVALID_ARG_TYPE(name, expected, value);
 function uint32(value, name) {
-  if (typeof value !== 'number') throw invalid(name, 'number');
-  if (!Number.isInteger(value) || value < 0 || value > 0xffffffff)
-    throw Object.assign(new RangeError(`The value of "${name}" is out of range. It must be >= 0 and <= 4294967295. Received ${value}`), { code: 'ERR_OUT_OF_RANGE' });
+  validateUint32(value, name);
   return value;
 }
 function validateId(value, name) {
   if (typeof value === 'number') return uint32(value, name);
-  if (typeof value !== 'string') throw invalid(name, 'number or string');
+  if (typeof value !== 'string') throw invalid(name, ['number', 'string'], value);
   return value;
 }
 function unknown(value, group) {
-  return Object.assign(new Error(`${group ? 'Group' : 'User'} identifier does not exist: ${value}`), { code: 'ERR_UNKNOWN_CREDENTIAL' });
+  return new ERR_UNKNOWN_CREDENTIAL(group ? 'Group' : 'User', value);
 }
 function resolve(value, group) {
   if (typeof value === 'number') return value;
@@ -50,15 +48,17 @@ function usage(operation, previous) {
     for (const key of ['user', 'system']) {
       const value = previous[key];
       if (typeof value !== 'number' || !(value >= 0 && value <= Number.MAX_SAFE_INTEGER)) {
-        if (key === 'user' && (typeof previous !== 'object' || Array.isArray(previous))) throw invalid('prevValue', 'Object');
-        if (typeof value !== 'number') throw invalid(`prevValue.${key}`, 'number');
-        throw Object.assign(new RangeError(`The property 'prevValue.${key}' must be a non-negative number not exceeding Number.MAX_SAFE_INTEGER. Received ${value}`), { code: 'ERR_INVALID_ARG_VALUE' });
+        if (key === 'user' && (typeof previous !== 'object' || Array.isArray(previous))) throw invalid('prevValue', 'object', previous);
+        if (typeof value !== 'number') throw invalid(`prevValue.${key}`, 'number', value);
+        throw new ERR_INVALID_ARG_VALUE.RangeError(`prevValue.${key}`, value);
       }
     }
   }
   const result = native(operation);
   return { user: result[0] - (previous ? previous.user : 0), system: result[1] - (previous ? previous.system : 0) };
 }
+const requestKinds = { FSReqCallback: class FSReqCallback {}, FSReqPromise: class FSReqPromise {} };
+
 function install(process) {
   // Do not replace bootstrap's EventEmitter, scheduling, hrtime, stdio, argv,
   // environment, exit machinery or runtime version metadata.
@@ -82,7 +82,7 @@ function install(process) {
     } }[operation];
   }
   process.setgroups = function setgroups(groups) {
-    if (!Array.isArray(groups)) throw invalid('groups', 'Array');
+    if (!Array.isArray(groups)) throw invalid('groups', 'Array', groups);
     for (let i = 0; i < groups.length; i++) validateId(groups[i], `groups[${i}]`);
     const ids = [];
     for (let i = 0; i < groups.length; i++) ids.push(resolve(groups[i], true));
@@ -93,8 +93,9 @@ function install(process) {
     validateId(extraGroup, 'extraGroup');
     // Looking up a name first also detects a nonexistent user on systems where
     // initgroups itself would otherwise succeed with only the extra group.
-    const uid = resolve(user, false);
+    // Node looks the group up before passing a user name to initgroups.
     const gid = resolve(extraGroup, true);
+    const uid = resolve(user, false);
     try { native('initgroups', [uid, gid]); }
     catch (error) {
       if (error.syscall === 'uv_os_get_passwd2' && (error.code === 'ENOENT' || error.code === 'ESRCH')) throw unknown(user, false);
@@ -104,7 +105,7 @@ function install(process) {
   process.umask = function umask(mask) {
     if (mask !== undefined) {
       if (typeof mask === 'string') {
-        if (!/^[0-7]+$/.test(mask)) throw Object.assign(new TypeError(`The argument 'mask' must be a 32-bit unsigned integer or an octal string. Received '${mask}'`), { code: 'ERR_INVALID_ARG_VALUE' });
+        if (!/^[0-7]+$/.test(mask)) throw new ERR_INVALID_ARG_VALUE('mask', mask, 'must be a 32-bit unsigned integer or an octal string');
         mask = parseInt(mask, 8);
       }
       uint32(mask, 'mask');
@@ -145,6 +146,16 @@ function install(process) {
     if (typeof fn === 'function') call(fn, value);
   };
   process.getActiveResourcesInfo = function getActiveResourcesInfo() { return host.activeResources(); };
+  process._getActiveHandles = function _getActiveHandles() {
+    return require('internal/net/transport').activeOwners();
+  };
+  process._getActiveRequests = function _getActiveRequests() {
+    // The native requests stay native; each pending one is listed by its kind.
+    const requests = [];
+    for (const name of host.activeResources())
+      if (name === 'FSReqCallback' || name === 'FSReqPromise') requests.push(new requestKinds[name]());
+    return requests;
+  };
   Object.defineProperty(process, 'finalization', {
     configurable: true, enumerable: true,
     get() {

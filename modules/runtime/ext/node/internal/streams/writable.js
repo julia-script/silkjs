@@ -85,7 +85,7 @@ const {
   kOnConstructed,
 } = require('internal/streams/utils');
 
-const { assignFunctionName } = require('internal/streams/support');
+const { assignFunctionName } = require('internal/util');
 
 const { errorOrDestroy } = destroyImpl;
 

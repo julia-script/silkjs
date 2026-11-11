@@ -64,7 +64,7 @@ const {
 
 // internal/error_stack owns these two: its stack header names the code of a
 // NodeError, and it formats an error found in overrideStackTrace with that callback.
-const { kIsNodeError, overrideStackTrace } = require('internal/host').errorStackState;
+const { kIsNodeError, overrides: overrideStackTrace } = require('internal/host').errorStackState;
 
 const isWindows = require('internal/host').platform === 'win32';
 
@@ -146,13 +146,13 @@ let util;
 
 let internalUtil = null;
 function lazyInternalUtil() {
-  internalUtil ??= require('util');
+  internalUtil ??= require('internal/util');
   return internalUtil;
 }
 
 let internalUtilInspect = null;
 function lazyInternalUtilInspect() {
-  internalUtilInspect ??= { inspect: require('internal/util_inspect').inspect, format: require('util').format };
+  internalUtilInspect ??= require('internal/util/inspect');
   return internalUtilInspect;
 }
 

@@ -8,7 +8,6 @@ const encoder = { encode: text => (encoderInstance ||= new (require('internal/we
 const blobs = new WeakMap();
 const files = new WeakMap();
 const objectURLs = new Map();
-let objectURLSequence = 0;
 
 function string(value) {
   if (typeof value === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
@@ -226,8 +225,11 @@ for (const Constructor of [Blob, File]) {
   }
 }
 function createObjectURL(blob) {
-  state(blob);
-  const id = 'blob:nodedata:' + Date.now().toString(16) + '-' + (++objectURLSequence).toString(16) + '-' + Math.random().toString(16).slice(2);
+  if (!blobs.has(blob)) {
+    const { ERR_INVALID_ARG_TYPE } = require('internal/errors').codes;
+    throw new ERR_INVALID_ARG_TYPE('obj', 'Blob', blob);
+  }
+  const id = 'blob:nodedata:' + require('crypto').randomUUID();
   objectURLs.set(id, blob);
   return id;
 }
