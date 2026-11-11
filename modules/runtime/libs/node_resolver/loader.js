@@ -19,14 +19,26 @@ function createLoader(host, builtins) {
   const path = host.path;
   // Node's internalModuleStat probes metadata without public fs permissions.
   // Keep this capability private; source and package JSON reads remain checked.
-  // It answers null for a path that is not there.
-  const stat = host.moduleStat;
+  // It answers a path's file type bits (mode & S_IFMT), 0 for a path that is not there.
+  const typeOf = host.moduleType;
   // Package files already read, by directory. As in Node, one is read once.
   const packages = new Map();
   // The package scope of a directory, and the node_modules lookup paths of one (callers
   // get a copy). Permissions are fixed once a program runs, so the walks give the same
   // answer every time.
   const scopes = new Map(), lookupPaths = new Map();
+  // Real paths already found. As with Node's realpathCache, a symlink changed while the
+  // program runs is not seen again.
+  const realPaths = new Map();
+  // The last file tryFile found to be a regular file and not a symlink, for the realPath
+  // of the same resolution, which then needs no lstat of its own.
+  let regularFile = null;
+  // Parent filenames as given to resolve, resolved.
+  const parentNames = new Map();
+  // What a require of a relative or bare specifier found, by the specifier and its
+  // directory or lookup paths, as with Node's Module._pathCache: a module found once is
+  // not looked for again. Callers get a copy.
+  const foundPaths = new Map();
   // The source format() read to tell a module from a script, for the load that follows.
   let probed = null;
   const cache = Object.create(null);
@@ -72,13 +84,11 @@ function createLoader(host, builtins) {
   }
 
   function isFile(filename) {
-    const info = stat(filename);
-    return info !== null && info.isFile();
+    return typeOf(filename, true) === 0o100000;
   }
 
   function isDirectory(filename) {
-    const info = stat(filename);
-    return info !== null && info.isDirectory();
+    return typeOf(filename, true) === 0o040000;
   }
 
   function fileURL(filename) {
@@ -110,7 +120,14 @@ function createLoader(host, builtins) {
   function parentName(parent) {
     if (parent && typeof parent === 'object') parent = parent.filename;
     if (!parent) return path.join(host.cwd(), '__silk_entry__.js');
-    return path.resolve(filesystemName(String(parent)));
+    parent = String(parent);
+    let name = parentNames.get(parent);
+    if (name !== undefined) return name;
+    const filename = filesystemName(parent);
+    name = path.resolve(filename);
+    // A relative one depends on the working directory.
+    if (path.isAbsolute(filename)) parentNames.set(parent, name);
+    return name;
   }
 
   function readPackage(directory) {
@@ -129,6 +146,24 @@ function createLoader(host, builtins) {
     const pkg = { directory, filename, data };
     packages.set(directory, pkg);
     return pkg;
+  }
+
+  // The real path of an absolute filename: its directory's, found once, joined to its own
+  // name unless it is itself a symlink. One lstat for a file whose directory is known.
+  function realPath(filename) {
+    let real = realPaths.get(filename);
+    if (real !== undefined) return real;
+    const directory = path.dirname(filename);
+    if (directory === filename || !path.isAbsolute(filename)) real = host.realpath(filename);
+    else if (filename !== regularFile && typeOf(filename, false) === 0o120000) real = host.realpath(filename);
+    else {
+      // A real directory is normalized and the base name has no separator.
+      const base = realPath(directory);
+      real = (base.endsWith(path.sep) ? base : base + path.sep) + path.basename(filename);
+    }
+    regularFile = null;
+    realPaths.set(filename, real);
+    return real;
   }
 
   function packageScope(filename) {
@@ -151,8 +186,8 @@ function createLoader(host, builtins) {
   }
 
   function modulePaths(directory) {
-    directory = path.resolve(directory);
     let result = lookupPaths.get(directory);
+    if (result === undefined) directory = path.resolve(directory), result = lookupPaths.get(directory);
     if (result === undefined) {
       result = [];
       for (let current = directory; ;) {
@@ -221,7 +256,7 @@ function createLoader(host, builtins) {
 
   function descriptor(filename, mode, suffix, isMain) {
     const preserve = isMain ? host.preserveSymlinksMain : host.preserveSymlinks;
-    const canonical = preserve ? path.resolve(filename) : host.realpath(filename);
+    const canonical = preserve ? path.resolve(filename) : realPath(filename);
     const identity = suffix && mode === 'import' ? fileURL(canonical) + suffix : canonical;
     let kind;
     try { kind = format(identity, mode, mode === 'require' && !isMain && !hooks.active()); }
@@ -247,7 +282,10 @@ function createLoader(host, builtins) {
   }
 
   function tryFile(filename) {
-    return isFile(filename) ? filename : null;
+    // An lstat answers for a regular file, and its realPath needs no other.
+    const type = typeOf(filename, false);
+    if (type === 0o100000) { regularFile = filename; return filename; }
+    return type === 0o120000 && isFile(filename) ? filename : null;
   }
 
   function tryExtensions(filename) {
@@ -415,8 +453,9 @@ function createLoader(host, builtins) {
     if (options && own(options, 'paths') && options.paths !== undefined && !Array.isArray(options.paths)) {
       throw error('ERR_INVALID_ARG_VALUE', 'The property "options.paths" must be an array');
     }
-    const parentModule = parent && typeof parent === 'object' ? parent : cache[parentName(parent)];
+    const parentObject = parent && typeof parent === 'object' ? parent : null;
     parent = parentName(parent);
+    const parentModule = parentObject || cache[parent];
     const recursion = mode + '\0' + parent + '\0' + specifier;
     if (seen.has(recursion)) throw error('ERR_INVALID_PACKAGE_TARGET', `Circular package mapping for '${specifier}' in ${parent}`);
     seen.add(recursion);
@@ -443,11 +482,16 @@ function createLoader(host, builtins) {
           catch (_) { throw error('ERR_INVALID_MODULE_SPECIFIER', `Invalid percent encoding in '${specifier}'`); }
         }
         const bases = options && Array.isArray(options.paths) ? options.paths : [path.dirname(parent)];
+        const key = cacheable(mode, options, isMain) ? specifier + '\0' + bases[0] : null;
+        if (key !== null) {
+          const known = foundPaths.get(key);
+          if (known !== undefined) return { ...known };
+        }
         for (const base of bases) {
           const candidate = path.resolve(base, requested);
           if (mode === 'import') return strictFile(candidate, specifier, parent, mode, suffix, isMain);
           const found = legacyFile(candidate, true, /[\\/]$/.test(specifier) || specifier === '.' || specifier === '..');
-          if (found) return descriptor(found, mode, undefined, isMain);
+          if (found) return remember(key, descriptor(found, mode, undefined, isMain));
         }
         throw missing(specifier, parent, mode);
       }
@@ -469,26 +513,47 @@ function createLoader(host, builtins) {
         search = mode === 'require' && parentModule && Array.isArray(parentModule.paths) ? parentModule.paths : modulePaths(path.dirname(parent));
         if (mode === 'require') search = search.concat(globalPaths);
       }
-      for (const directory of search) {
-        if (!isDirectory(directory)) continue;
-        const root = path.join(directory, parsed.name);
-        const pkg = readPackage(root);
-        if (pkg && pkg.data.exports !== undefined && pkg.data.exports !== null) return packageMap(pkg, pkg.data.exports, parsed.subpath, false, parent, mode, seen, isMain);
-        const candidate = parsed.subpath === '.' ? root : path.join(root, parsed.subpath.slice(2));
-        if (mode === 'import' && parsed.subpath !== '.') {
-          if (isDirectory(root)) return strictFile(candidate, specifier, parent, mode, undefined, isMain);
-          continue;
-        }
-        if (mode === 'import' && pkg && typeof pkg.data.main === 'string') {
-          const exact = path.resolve(root, pkg.data.main);
-          if (isFile(exact)) return descriptor(exact, mode, undefined, isMain);
-        }
-        const found = legacyFile(candidate, true, /[\\/]$/.test(specifier));
-        if (found) return descriptor(found, mode, undefined, isMain);
-        if (mode === 'import' && isDirectory(root)) throw missing(specifier, parent, mode);
+      const key = cacheable(mode, options, isMain) ? specifier + '\0' + search.join('\0') : null;
+      if (key !== null) {
+        const known = foundPaths.get(key);
+        if (known !== undefined) return { ...known };
       }
-      throw missing(specifier, parent, mode);
+      return remember(key, findPackage(search, parsed, specifier, parent, mode, seen, isMain));
     } finally { seen.delete(recursion); }
+  }
+
+  // Whether resolveInternal may keep what it finds in foundPaths: a plain require, as
+  // hooks can answer differently each time and a main module's symlinks may be kept.
+  function cacheable(mode, options, isMain) {
+    return mode === 'require' && !isMain && !(options && options.paths !== undefined) && !hooks.active();
+  }
+
+  function remember(key, result) {
+    if (key === null) return result;
+    foundPaths.set(key, result);
+    return { ...result };
+  }
+
+  function findPackage(search, parsed, specifier, parent, mode, seen, isMain) {
+    for (const directory of search) {
+      if (!isDirectory(directory)) continue;
+      const root = path.join(directory, parsed.name);
+      const pkg = readPackage(root);
+      if (pkg && pkg.data.exports !== undefined && pkg.data.exports !== null) return packageMap(pkg, pkg.data.exports, parsed.subpath, false, parent, mode, seen, isMain);
+      const candidate = parsed.subpath === '.' ? root : path.join(root, parsed.subpath.slice(2));
+      if (mode === 'import' && parsed.subpath !== '.') {
+        if (isDirectory(root)) return strictFile(candidate, specifier, parent, mode, undefined, isMain);
+        continue;
+      }
+      if (mode === 'import' && pkg && typeof pkg.data.main === 'string') {
+        const exact = path.resolve(root, pkg.data.main);
+        if (isFile(exact)) return descriptor(exact, mode, undefined, isMain);
+      }
+      const found = legacyFile(candidate, true, /[\\/]$/.test(specifier));
+      if (found) return descriptor(found, mode, undefined, isMain);
+      if (mode === 'import' && isDirectory(root)) throw missing(specifier, parent, mode);
+    }
+    throw missing(specifier, parent, mode);
   }
 
   function conditions(mode) {
@@ -535,6 +600,7 @@ function createLoader(host, builtins) {
   }
 
   function resolve(specifier, parent, mode, attributes, options, isMain, allowAsync) {
+    regularFile = null;
     mode = mode === 'import' || mode === 'esm' ? 'import' : 'require';
     if (allowAsync === undefined) allowAsync = mode === 'import';
     if (!hooks.active(allowAsync) && !String(specifier).startsWith('data:')) {
@@ -744,7 +810,7 @@ function createLoader(host, builtins) {
     let filename = fileURLToPath(target);
     if (!isDirectory(filename)) {
       if (!isFile(filename)) throw missing(specifier, parentURL.href, 'import');
-      if (!host.preserveSymlinks) filename = host.realpath(filename);
+      if (!host.preserveSymlinks) filename = realPath(filename);
     }
     // An unsupported directory import retains its original URL and trailing
     // slash. A slash makes the directory itself the first package scope.
@@ -879,9 +945,28 @@ function createLoader(host, builtins) {
     host.loadAddon(filename, module);
   };
 
+  // As in Bun, the entry points of an installed `ws` package give the runtime's own
+  // implementation (internal/ws), whose frames are read and written natively.
+  const substituteEntry = /[\\/]node_modules[\\/]ws[\\/](?:index\.js|wrapper\.mjs)$/;
+  function substituteExports(filename) {
+    return substituteEntry.test(filesystemName(filename)) ? builtins.get('internal/ws') : undefined;
+  }
+
   function loadResolved(resolved, parent, isMain, allowAsync = false) {
     const mock = moduleMocks.size === 0 ? undefined : moduleMocks.get(asURL(resolved.filename));
     if (mock) return mockCommonJS(mock, filesystemName(resolved.filename), parent);
+    const substitute = substituteExports(resolved.filename);
+    if (substitute !== undefined) {
+      const filename = filesystemName(resolved.filename);
+      if (!own(cache, filename)) {
+        const module = makeModule(filename, parent);
+        module.exports = substitute;
+        module.loaded = true;
+        cache[filename] = module;
+      }
+      addChild(parent, cache[filename]);
+      return cache[filename].exports;
+    }
     if (resolved.format === 'builtin' && !hooks.active(allowAsync)) return loadBuiltin(resolved.filename);
     const filename = filesystemName(resolved.filename);
     if (host.reportDependency && path.isAbsolute(filename)) host.reportDependency(filename);
@@ -1013,16 +1098,21 @@ function createLoader(host, builtins) {
   function warmMain(filename) {
     const modules = new Set(Object.keys(cache)), directories = new Set(packages.keys());
     const resolved = new Set(resolutions.keys()), previous = main;
-    const scoped = new Set(scopes.keys()), looked = new Set(lookupPaths.keys());
+    const scoped = new Set(scopes.keys()), looked = new Set(lookupPaths.keys()), reals = new Set(realPaths.keys());
+    const parents = new Set(parentNames.keys()), founds = new Set(foundPaths.keys());
     try { runMain(filename); }
     finally {
       for (const key of Object.keys(cache)) if (!modules.has(key)) delete cache[key];
       for (const key of [...packages.keys()]) if (!directories.has(key)) packages.delete(key);
       for (const key of [...scopes.keys()]) if (!scoped.has(key)) scopes.delete(key);
       for (const key of [...lookupPaths.keys()]) if (!looked.has(key)) lookupPaths.delete(key);
+      for (const key of [...realPaths.keys()]) if (!reals.has(key)) realPaths.delete(key);
+      for (const key of [...parentNames.keys()]) if (!parents.has(key)) parentNames.delete(key);
+      for (const key of [...foundPaths.keys()]) if (!founds.has(key)) foundPaths.delete(key);
       for (const key of [...resolutions.keys()]) if (!resolved.has(key)) resolutions.delete(key);
       main = previous;
       probed = null;
+      regularFile = null;
     }
   }
 
@@ -1111,7 +1201,12 @@ function createLoader(host, builtins) {
 
   function finishESM(resolved, loaded, attributes) {
     let source;
-    if (resolved.format === 'module') source = cleanSource(loaded.source);
+    const substitute = substituteExports(resolved.filename);
+    if (substitute !== undefined) {
+      resolutions.set(resolved.filename, { filename: resolved.filename, format: 'commonjs' });
+      source = bridgeSource(resolved.filename, Object.keys(substitute), true);
+    }
+    else if (resolved.format === 'module') source = cleanSource(loaded.source);
     else if (resolved.format === 'builtin') {
       pendingLoads.set(resolved.filename, loaded);
       source = bridgeSource(resolved.filename, Object.keys(loadBuiltin(resolved.filename)), false);

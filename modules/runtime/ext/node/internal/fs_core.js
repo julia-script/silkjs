@@ -143,17 +143,39 @@ function encoding(value, fallback = 'utf8', bufferAllowed = false) {
 }
 function encoded(value, enc) { return enc === 'buffer' ? Buffer.from(value) : enc === 'utf8' || enc === 'utf-8' ? value : Buffer.from(value).toString(enc); }
 function aborted(signal) { if (signal && signal.aborted) { const e = new Error('The operation was aborted', { cause: signal.reason }); e.name = 'AbortError'; e.code = 'ABORT_ERR'; throw e; } }
+// A time field of a native stat result, or of an object given to the constructor.
+function timeMs(ms, date) {
+  return ms !== undefined ? Number(ms) : date instanceof Date ? date.getTime() : date === undefined ? 0 : Number(date);
+}
+function bigTimeMs(ms, ns, date) {
+  if (ns !== undefined) return BigInt(ns) / 1000000n;
+  if (typeof ms === 'bigint') return ms;
+  return BigInt(Math.trunc(timeMs(ms, date)));
+}
+const big = x => BigInt(x === undefined ? 0 : x);
+const small = x => x === undefined ? 0 : Number(x);
+// Fields in Node's order. As in Node, atime, mtime, ctime and birthtime are Dates made
+// when first read, from the *Ms fields.
 class Stats {
   constructor(value = {}, bigint = false) {
-    const number = x => bigint ? BigInt(x === undefined ? 0 : x) : Number(x === undefined ? 0 : x);
-    for (const name of ['dev', 'ino', 'mode', 'nlink', 'uid', 'gid', 'rdev', 'size', 'blksize', 'blocks']) this[name] = number(value[name]);
-    for (const name of ['atime', 'mtime', 'ctime', 'birthtime']) {
-      const ms = value[`${name}Ms`] === undefined ? value[name] instanceof Date ? value[name].getTime() : value[name] === undefined ? 0 : value[name] : value[`${name}Ms`];
-      const ns = value[`${name}Ns`];
-      this[`${name}Ms`] = bigint ? ns === undefined ? typeof ms === 'bigint' ? ms : BigInt(Math.trunc(ms)) : BigInt(ns) / 1000000n : Number(ms);
-      this[name] = new Date(Number(this[`${name}Ms`]));
-      if (bigint) this[`${name}Ns`] = ns === undefined ? this[`${name}Ms`] * 1000000n : BigInt(ns);
+    const number = bigint ? big : small;
+    this.dev = number(value.dev); this.mode = number(value.mode); this.nlink = number(value.nlink);
+    this.uid = number(value.uid); this.gid = number(value.gid); this.rdev = number(value.rdev);
+    this.blksize = number(value.blksize); this.ino = number(value.ino); this.size = number(value.size);
+    this.blocks = number(value.blocks);
+    if (!bigint) {
+      this.atimeMs = timeMs(value.atimeMs, value.atime); this.mtimeMs = timeMs(value.mtimeMs, value.mtime);
+      this.ctimeMs = timeMs(value.ctimeMs, value.ctime); this.birthtimeMs = timeMs(value.birthtimeMs, value.birthtime);
+      return;
     }
+    this.atimeMs = bigTimeMs(value.atimeMs, value.atimeNs, value.atime);
+    this.mtimeMs = bigTimeMs(value.mtimeMs, value.mtimeNs, value.mtime);
+    this.ctimeMs = bigTimeMs(value.ctimeMs, value.ctimeNs, value.ctime);
+    this.birthtimeMs = bigTimeMs(value.birthtimeMs, value.birthtimeNs, value.birthtime);
+    this.atimeNs = value.atimeNs === undefined ? this.atimeMs * 1000000n : BigInt(value.atimeNs);
+    this.mtimeNs = value.mtimeNs === undefined ? this.mtimeMs * 1000000n : BigInt(value.mtimeNs);
+    this.ctimeNs = value.ctimeNs === undefined ? this.ctimeMs * 1000000n : BigInt(value.ctimeNs);
+    this.birthtimeNs = value.birthtimeNs === undefined ? this.birthtimeMs * 1000000n : BigInt(value.birthtimeNs);
   }
   _is(type) { return (Number(this.mode) & 0o170000) === type; }
   isFile() { return this._is(0o100000); }
@@ -163,6 +185,15 @@ class Stats {
   isSymbolicLink() { return this._is(0o120000); }
   isFIFO() { return this._is(0o010000); }
   isSocket() { return this._is(0o140000); }
+}
+for (const name of ['atime', 'mtime', 'ctime', 'birthtime']) {
+  const ms = name + 'Ms';
+  const own = (target, value) => Object.defineProperty(target, name, { value, writable: true, enumerable: true, configurable: true });
+  Object.defineProperty(Stats.prototype, name, {
+    enumerable: true, configurable: true,
+    get() { const value = new Date(Number(this[ms])); own(this, value); return value; },
+    set(value) { own(this, value); },
+  });
 }
 class Dirent {
   constructor(name, mode, parentPath) { this.name = name; this.parentPath = parentPath; this.path = parentPath; Object.defineProperty(this, '_mode', { value: Number(mode) }); }

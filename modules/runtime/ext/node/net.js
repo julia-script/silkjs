@@ -136,6 +136,12 @@ Socket.prototype._onNative = function(type, status, payload) {
     return;
   }
   if (this.destroyed) return;
+  // A WebSocket peer (internal/ws) owns the frames of this socket after its upgrade.
+  if (type === 7 || type === 8) { this._wsPeer?._frame(type, status, payload); return; }
+  if (type === 1 && status >= 0 && this._wsPeer) {
+    if (payload?.byteLength) { this._bytesRead += payload.byteLength; native('wsFeed', [this._transport.id, payload, 0, payload.byteLength]); }
+    return;
+  }
   if (type === 3) {
     if (status < 0) { this._connectionFailed(nativeError(status, 'connect', this._connectAddress, this._connectPort)); return; }
     this.connecting = false;

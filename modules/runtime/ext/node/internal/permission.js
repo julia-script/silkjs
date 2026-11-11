@@ -203,6 +203,8 @@ function dropScope(scope, reference) {
   } else if (own(names, scope)) state[scope] = false;
 }
 function checkFile(op, args) {
+  // Every case below checks only with the Permission Model or its audit on.
+  if (!initialized || (!state.enforce && !state.audit)) return;
   const path = args[0];
   switch (op) {
     case 'close': case 'read': case 'pread': case 'readv': case 'write': case 'pwrite': case 'writev': case 'fstat': case 'futimes': case 'ftruncate': return;
@@ -330,8 +332,12 @@ function initialize(options = {}) {
     }
     define(process, 'permission', { value: { has, drop }, enumerable: true, writable: false, configurable: false });
   }
-  wrapHostIO();
-  host.installPermissionGuard(checkNative);
+  // Without --permission or --permission-audit every check passes, so host IO and native
+  // calls skip the guard entirely instead of calling into JavaScript for each one.
+  if (state.enforce || state.audit) {
+    wrapHostIO();
+    host.installPermissionGuard(checkNative);
+  }
   initialized = true;
 }
 module.exports = { optionEntries, isValueOption, applyOption, initialize, check, canRead, checkFile, checkNative,

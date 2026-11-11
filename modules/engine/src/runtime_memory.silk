@@ -242,11 +242,38 @@ struct Ledger {
   // Only the allocation owner reads/writes this flag; reclaims use the gate.
   profiling: bool,
   // Pooled blocks carry PoolRecords (ids for snapshots and lookups, samples for
-  // profiles). Set once by keepRecords or startProfile and never cleared; the
-  // owner writes it under the gate, and reclaims read it under the gate.
+  // profiles). Set once by keepRecords or startProfile and never cleared, except
+  // by finishImage; the owner writes it under the gate, and reclaims read it under
+  // the gate.
   records: bool,
   profile: Option<Recording>,
-  pool: Pool
+  pool: Pool,
+  // While a heap image is built with placeForImage: where its blocks go.
+  placing: bool,
+  layout: ImageLayout
+}
+
+// How a heap image being built places its small blocks (placeForImage). A start
+// from the image writes some of its blocks (counts, caches, lazily set fields),
+// and each page it writes costs it a copy: the blocks it writes go to arenas of
+// their own, so that they fill as few pages as their bytes need. Blocks are named
+// by allocation id, which a build that runs the same bootstrap hands out the same.
+struct ImageLayout {
+  // The ids of the blocks to keep apart, in increasing order, and the first one
+  // not yet passed.
+  hot: ?*mut u64,
+  count: usize,
+  next: usize,
+  // Each such block alone on its pages, so that the pages a start writes name
+  // the blocks it writes one by one.
+  probe: bool,
+  // Each class's arena for them, carved one block at a time, as Pool.fresh.
+  fresh: [?*mut u8; 64],
+  freshBytes: [usize; 64],
+  // The arenas taken for them. Other blocks reuse reclaimed blocks of other arenas
+  // only, and only while these all fit here.
+  hotArenas: [usize; 256],
+  hotArenaCount: usize
 }
 
 // Field addresses are obtained from a fresh typed borrow, never from assumed offsets.
@@ -378,6 +405,60 @@ impl AllocationObserver {
     unsafe startRecords(ledger)
     unsafe unlockLedger(ledger)
   }
+  /// Gives each live pooled block at addresses that has no record (it was
+  /// allocated before records were kept) a fresh allocation id, as if it were
+  /// allocated now, and keeps records from now on: a heap snapshot then names
+  /// every object by allocation id without records costing every allocation
+  /// before the first snapshot. Blocks that have a record, and addresses outside
+  /// this ledger's pooled arenas, are left alone. Owner thread only; each address
+  /// must be the start of a live block or outside the pool.
+  pub effect fn recordLive(self: &Self, addresses: &[usize]) -> () ! OutOfMemoryError ? &mut Allocator {
+    let ledger = self.ledger
+    let anchor = ()
+    // Pooled arena starts, hashed: only the owner adds or drops arenas.
+    let mut count: usize = 0
+    let mut next = (unsafe Pointer.borrow(&anchor, ledger.allocation)).firstPooledArena
+    while !Pointer.isNull(next) { count = count + 1 next = (unsafe Pointer.borrow(&anchor, unsafe Intrinsic.pointerRequalify<?*mut ArenaHeader, *mut ArenaHeader>(next))).nextLive }
+    let size = count * 2 + 1
+    let mut arenas = List<?*mut ArenaHeader>.make()
+    run arenas.reserveExact(size)
+    let mut i: usize = 0
+    while i < size { run arenas.append(Pointer.null<ArenaHeader>()) i = i + 1 }
+    next = (unsafe Pointer.borrow(&anchor, ledger.allocation)).firstPooledArena
+    while !Pointer.isNull(next) {
+      let base = Pointer.address(unsafe Intrinsic.pointerRequalify<?*mut ArenaHeader, *mut ArenaHeader>(next))
+      let mut slot = (base / ARENA_BYTES) % size
+      while !Pointer.isNull(arenas.get(slot)) { slot = (slot + 1) % size }
+      arenas.set(slot, next)
+      next = (unsafe Pointer.borrow(&anchor, unsafe Intrinsic.pointerRequalify<?*mut ArenaHeader, *mut ArenaHeader>(next))).nextLive
+    }
+    unsafe lockLedger(ledger)
+    unsafe startRecords(ledger)
+    i = 0
+    while i < addresses.length {
+      let address = addresses[i]
+      let base = address - usize.bitAnd(address, ARENA_BYTES - 1)
+      let mut slot = (base / ARENA_BYTES) % size
+      while !Pointer.isNull(arenas.get(slot)) && Pointer.address(unsafe Intrinsic.pointerRequalify<?*mut ArenaHeader, *mut ArenaHeader>(arenas.get(slot))) != base { slot = (slot + 1) % size }
+      if !Pointer.isNull(arenas.get(slot)) && address >= base + firstPoolOffset() {
+        let arena = unsafe Pointer.borrow(&anchor, unsafe Intrinsic.pointerRequalify<?*mut ArenaHeader, *mut ArenaHeader>(arenas.get(slot)))
+        let index = (address - base - firstPoolOffset()) / classBytes(arena.class)
+        if index < arena.carved {
+          let record = unsafe Pointer.atMut<PoolRecord>(unsafe Pointer.assumeManyMut<PoolRecord>(arena.records), index)
+          if (unsafe Pointer.read<PoolRecord>(record)).id == 0 {
+            let mut stateAnchor = ()
+            let state = unsafe Pointer.borrowMut(&mut stateAnchor, ledger.allocation)
+            let id = state.nextAllocationId
+            state.nextAllocationId = u64.wrappingAdd(id, 1)
+            drop state
+            unsafe Pointer.write<PoolRecord>(record, PoolRecord { id: id, requestedBytes: classBytes(arena.class), sampledEpoch: 0 })
+          }
+        }
+      }
+      i = i + 1
+    }
+    unsafe unlockLedger(ledger)
+  }
   pub fn stopProfile(self: &Self) -> Option<Recording> {
     let ledger = self.ledger
     unsafe lockLedger(ledger)
@@ -420,6 +501,39 @@ impl AllocationObserver {
   }
   /// Owner-thread only, with no concurrent allocation or owner-cache release.
   /// Finds an interior address without allocating or borrowing a JS payload.
+  /// For a heap mapped back from an image built with placeForImage: the allocation
+  /// ids of the image's small blocks that overlap [start, end), written to ids (at
+  /// most capacity of them). Returns how many there are. Blocks freed while the
+  /// image was built have none.
+  pub unsafe fn imageIds(self: &Self, start: usize, end: usize, ids: *mut u64, capacity: usize) -> usize {
+    let ledger = self.ledger
+    unsafe lockLedger(ledger)
+    let anchor = ()
+    let state = unsafe Pointer.borrow(&anchor, ledger.allocation)
+    let out = unsafe Pointer.assumeManyMut<u64>(ids)
+    let mut found: usize = 0
+    let mut nextArena = state.firstPooledArena
+    while !Pointer.isNull(nextArena) {
+      let pointer = unsafe Intrinsic.pointerRequalify<?*mut ArenaHeader, *mut ArenaHeader>(nextArena)
+      let arena = unsafe Pointer.borrow(&anchor, pointer)
+      let base = Pointer.address(pointer)
+      if base < end && start < base + ARENA_BYTES {
+        let blockBytes = classBytes(arena.class)
+        let mut index: usize = 0
+        while index < arena.carved {
+          let record = unsafe pooledAllocation(arena, base, index)
+          if record.address < end && start < record.address + blockBytes && record.id != 0 && found < capacity {
+            unsafe Pointer.write<u64>(unsafe Pointer.atMut<u64>(out, found), record.id)
+            found = found + 1
+          }
+          index = index + 1
+        }
+      }
+      nextArena = arena.nextLive
+    }
+    drop state unsafe unlockLedger(ledger)
+    return found
+  }
   pub fn lookupAllocation(self: &Self, address: usize) -> Option<AllocationRecord> {
     let ledger = self.ledger
     unsafe lockLedger(ledger)
@@ -562,6 +676,7 @@ impl<A> RuntimeAllocator<A> {
       stats: RuntimeMemoryStats { usedBytes: 0, peakBytes: 0, allocationCount: 0, limit: usize.MAX },
       firstAllocation: Pointer.null<AllocationHeader>(), firstPooledArena: Pointer.null<ArenaHeader>(), nextAllocationId: 1, nextSortId: FIRST_SORT_ID,
       nextProfileEpoch: 1, profiling: false, records: false, profile: Option<Recording>.none(),
+      placing: false, layout: ImageLayout { hot: Pointer.null<u64>(), count: 0, next: 0, probe: false, fresh: [Pointer.null<u8>(); 64], freshBytes: [0; 64], hotArenas: [0; 256], hotArenaCount: 0 },
       pool: Pool { enabled: false, heads: [Pointer.null<u8>(); 64], counts: [0; 64], arenas: Pointer.null<ArenaHeader>(), spare: Pointer.null<u8>(), spareCount: 0, spareRecords: Pointer.null<PoolRecord>(),
         fresh: [Pointer.null<u8>(); 64], freshBytes: [0; 64],
         ownerActive: false, ownerThread: 0, ownerHeads: [Pointer.null<u8>(); 64], ownerCounts: [0; 64], ownerUsed: 0, ownerAllocations: 0, ownerPeak: 0,
@@ -635,6 +750,54 @@ impl<A> RuntimeAllocator<A> {
       pool.ownerActive = true
       pool.ownerThread = unsafe threadPointer()
       drop pool
+      unlockLedger(ledger)
+    }
+  }
+
+  /// Lays out the small blocks of a heap image being built (see ImageLayout): the
+  /// blocks that get the count ids at hot, in increasing order, go to arenas of their
+  /// own, each alone on its pages when probe. Call before the first allocation that
+  /// pooling serves, with pooling enabled; hot stays readable until finishImage.
+  /// Blocks carry records, so that a start from the image can name them (imageIds).
+  pub unsafe fn placeForImage(self: &mut Self, hot: ?*mut u64, count: usize, probe: bool) -> () {
+    let ledger = self.ledger
+    unsafe {
+      lockLedger(ledger)
+      startRecords(ledger)
+      let mut anchor = ()
+      let state = Pointer.borrowMut(&mut anchor, ledger.allocation)
+      state.placing = true
+      state.layout.hot = hot
+      state.layout.count = count
+      state.layout.next = 0
+      state.layout.probe = probe
+      // Reclaimed blocks take the gated path to the shared lists, where refillPlaced leaves them.
+      state.pool.ownerActive = false
+      drop state
+      unlockLedger(ledger)
+    }
+  }
+
+  /// Ends placeForImage before the heap is saved: the saved heap allocates as any
+  /// pooled one, without records, and never hands out a block the build reclaimed,
+  /// which would write pages a start otherwise leaves alone. The records the build
+  /// wrote stay in place for imageIds.
+  pub fn finishImage(self: &mut Self) -> () {
+    let ledger = self.ledger
+    unsafe {
+      lockLedger(ledger)
+      let mut anchor = ()
+      let state = Pointer.borrowMut(&mut anchor, ledger.allocation)
+      if state.placing {
+        state.placing = false
+        state.records = false
+        state.layout = ImageLayout { hot: Pointer.null<u64>(), count: 0, next: 0, probe: false, fresh: [Pointer.null<u8>(); 64], freshBytes: [0; 64], hotArenas: [0; 256], hotArenaCount: 0 }
+        // Idle blocks on the shared lists are uncharged and hold no reference.
+        state.pool.heads = [Pointer.null<u8>(); 64]
+        state.pool.counts = [0; 64]
+        state.pool.ownerActive = true
+      }
+      drop state
       unlockLedger(ledger)
     }
   }
@@ -724,6 +887,7 @@ pub unsafe fn zeroBytes(at: *mut u8, count: usize) -> () {
 effect fn allocatePooledSlow<A>(self: &mut RuntimeAllocator<A>, layout: Layout, class: usize, zeroed: bool) -> Intrinsic.Allocation
   ! OutOfMemoryError where &mut A provides &Allocator from &mut Allocator {
   let ledger = self.ledger
+  if unsafe placing(ledger) { return run refillPlaced<A>(&mut self, move layout, class, zeroed) }
   if unsafe refillSpilled(ledger, class) {
     match Pointer.nonNullMut<u8>(unsafe takeOwned(ledger, class)) {
       Option<*mut u8>.Some { value: block } => { return unsafe adoptPooled(ledger, block, move layout, zeroed) }
@@ -930,6 +1094,118 @@ unsafe fn carveCount(start: ?*mut u8, left: usize, blockBytes: usize) -> usize {
   if count * blockBytes > left { return left / blockBytes }
   return count
 }
+@inlineAlways
+unsafe fn placing(ledger: LedgerPointers) -> bool {
+  let anchor = ()
+  let state = unsafe Pointer.borrow(&anchor, ledger.allocation)
+  return state.placing
+}
+// Whether the block allocation id gets is one placeForImage keeps apart. Ids only grow.
+unsafe fn imageHot(layout: &mut ImageLayout, id: u64) -> bool {
+  if layout.count == 0 { return false }
+  let hot = unsafe Pointer.assumeManyMut<u64>(unsafe Intrinsic.pointerRequalify<?*mut u64, *mut u64>(layout.hot))
+  while layout.next < layout.count && unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(hot, layout.next)) < id { layout.next = layout.next + 1 }
+  return layout.next < layout.count && unsafe Pointer.read<u64>(unsafe Pointer.atMut<u64>(hot, layout.next)) == id
+}
+// A reclaimed block of class from the shared lists that lies outside the arenas of
+// the blocks a start writes, taken off them, or null. Blocks of those arenas found
+// on the way are dropped: those arenas stay for the blocks they were taken for.
+unsafe fn reusablePlaced(ledger: LedgerPointers, class: usize) -> ?*mut u8 {
+  let mut anchor = ()
+  let state = unsafe Pointer.borrowMut(&mut anchor, ledger.allocation)
+  if state.layout.hotArenaCount > 256 { return Pointer.null<u8>() }
+  while !Pointer.isNull<u8>(state.pool.heads[class]) {
+    let block = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(state.pool.heads[class])
+    state.pool.heads[class] = unsafe Pointer.read<?*mut u8>(unsafe poolLink(block))
+    state.pool.counts[class] = state.pool.counts[class] - 1
+    let arena = usize.bitAnd(Pointer.address<u8>(block), usize.bitNot(ARENA_BYTES - 1))
+    let mut index: usize = 0
+    while index < state.layout.hotArenaCount && state.layout.hotArenas[index] != arena { index = index + 1 }
+    if index == state.layout.hotArenaCount { return unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(block) }
+  }
+  return Pointer.null<u8>()
+}
+// The allocation path while an image is built (placeForImage): a block a start
+// writes is carved from its class's arena for such blocks, any other comes from
+// the reclaimed blocks of other arenas or is carved from the class's usual arena,
+// and either is handed out at once. Ids go by allocation, so which reclaimed block
+// an allocation gets does not change which allocations are kept apart.
+@inlineNever
+effect fn refillPlaced<A>(self: &mut RuntimeAllocator<A>, layout: Layout, class: usize, zeroed: bool) -> Intrinsic.Allocation
+  ! OutOfMemoryError where &mut A provides &Allocator from &mut Allocator {
+  let ledger = self.ledger
+  let before = self.stats()
+  let blockBytes = classBytes(class)
+  if before.usedBytes > before.limit || blockBytes > before.limit - before.usedBytes { return run Allocator.outOfMemory() }
+  let mut anchor = ()
+  let state = unsafe Pointer.borrowMut(&mut anchor, ledger.allocation)
+  let hot = unsafe imageHot(&mut state.layout, state.nextAllocationId)
+  let probe = hot && state.layout.probe
+  let mut start = if hot { state.layout.fresh[class] } else { state.pool.fresh[class] }
+  let mut left = if hot { state.layout.freshBytes[class] } else { state.pool.freshBytes[class] }
+  drop state
+  if !hot {
+    unsafe lockLedger(ledger)
+    let reused = unsafe reusablePlaced(ledger, class)
+    unsafe unlockLedger(ledger)
+    if let Option<*mut u8>.Some { value: block } = Pointer.nonNullMut<u8>(reused) { return unsafe chargePlaced(ledger, block, blockBytes, move layout, zeroed) }
+  }
+  let first = firstPoolOffset()
+  if left < blockBytes {
+    let arenaBase = run takeArena<A>(&mut self, class, layout.bytes)
+    start = unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(arenaBase), first))
+    left = ARENA_BYTES - first
+    if hot {
+      let control = unsafe Pointer.borrowMut(&mut anchor, ledger.allocation)
+      if control.layout.hotArenaCount < 256 { control.layout.hotArenas[control.layout.hotArenaCount] = Pointer.address<u8>(arenaBase) }
+      control.layout.hotArenaCount = control.layout.hotArenaCount + 1
+      drop control
+    }
+  }
+  let block = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(start)
+  let address = Pointer.address<u8>(block)
+  let offset = usize.bitAnd(address, ARENA_BYTES - 1)
+  // The next block of the arena; under probe, the first whose pages this one does not touch.
+  let mut nextOffset = offset + blockBytes
+  if probe {
+    let pageEnd = usize.bitAnd(nextOffset + CARVE_BYTES - 1, usize.bitNot(CARVE_BYTES - 1))
+    nextOffset = first + (pageEnd - first + blockBytes - 1) / blockBytes * blockBytes
+  }
+  let mut nextLeft: usize = 0
+  if nextOffset < ARENA_BYTES { nextLeft = ARENA_BYTES - nextOffset }
+  let next = unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(block), nextOffset - offset))
+  unsafe {
+    lockLedger(ledger)
+    let control = Pointer.borrowMut(&mut anchor, ledger.allocation)
+    if hot { control.layout.fresh[class] = next control.layout.freshBytes[class] = nextLeft }
+    else { control.pool.fresh[class] = next control.pool.freshBytes[class] = nextLeft }
+    drop control
+    let mut arenaAnchor = ()
+    let arena = Pointer.borrowMut<(), ArenaHeader>(&mut arenaAnchor, arenaOf(block))
+    let slot = (offset - first) / blockBytes
+    if arena.carved <= slot { arena.carved = slot + 1 }
+    drop arena
+    unlockLedger(ledger)
+  }
+  return unsafe chargePlaced(ledger, block, blockBytes, move layout, zeroed)
+}
+// Charges a block refillPlaced hands out, as claimShared and takeOwned together would.
+unsafe fn chargePlaced(ledger: LedgerPointers, block: *mut u8, blockBytes: usize, layout: Layout, zeroed: bool) -> Intrinsic.Allocation {
+  unsafe {
+    lockLedger(ledger)
+    let references = Atomic.load<usize>(ledger.references, MemoryOrder.Relaxed)
+    if references == usize.MAX { Intrinsic.trap("allocation ledger reference count overflow") }
+    Atomic.store<usize>(ledger.references, references + 1, MemoryOrder.Relaxed)
+    let mut stats = Pointer.read<RuntimeMemoryStats>(ledger.stats)
+    stats.usedBytes = stats.usedBytes + blockBytes
+    stats.allocationCount = stats.allocationCount + 1
+    if stats.peakBytes < stats.usedBytes { stats.peakBytes = stats.usedBytes }
+    Pointer.write<RuntimeMemoryStats>(ledger.stats, stats)
+    unlockLedger(ledger)
+    return adoptPooled(ledger, block, move layout, zeroed)
+  }
+}
+
 // Carves the next page of an empty class's arena into blocks (taking a new arena
 // when the current one is used up), then takes the first of them.
 @inlineNever

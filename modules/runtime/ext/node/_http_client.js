@@ -119,11 +119,12 @@ class ClientRequest extends OutgoingMessage {
       };
       const onTimeout = () => this.emit('timeout');
       const onConnect = () => { socket.setNoDelay(true); this._flushOutput(); };
+      const onDrain = () => this._onSocketDrain();
       const detach = () => {
-        socket.removeListener('data', onData); socket.removeListener('end', onEnd); socket.removeListener('error', onError); socket.removeListener('close', onClose); socket.removeListener('timeout', onTimeout); socket.removeListener('connect', onConnect);
+        socket.removeListener('drain', onDrain); socket.removeListener('data', onData); socket.removeListener('end', onEnd); socket.removeListener('error', onError); socket.removeListener('close', onClose); socket.removeListener('timeout', onTimeout); socket.removeListener('connect', onConnect);
       };
       this._detachSocket = detach; this._parser = parser;
-      socket.on('data', onData); socket.on('end', onEnd); socket.on('error', onError); socket.on('close', onClose); socket.on('timeout', onTimeout);
+      socket.on('data', onData); socket.on('end', onEnd); socket.on('error', onError); socket.on('close', onClose); socket.on('timeout', onTimeout); socket.on('drain', onDrain);
       socket.once('connect', onConnect);
       if (this._options.timeout !== undefined) socket.setTimeout(this._options.timeout);
       this.emit('socket', socket);

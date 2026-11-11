@@ -20,7 +20,13 @@ import silk.num.u64
 import silk.num.usize
 import silk.num.f64
 import silkjs.js_engine { Engine }
-import silkjs.js_heap { HeapHeader }
+import silkjs.js_heap { HeapCell, HeapHeader }
+import silkjs.js_owned_value { immediateRef }
+import silkjs.js_core_types { ObjectData, ShapeData, SlotBits }
+import silkjs.js_object_allocate as objects
+import silkjs.js_array_storage as arrays
+import silkjs.js_shapes as shapes
+import silkjs.js_gc as gc
 import silkjs.js_value { ValueBits }
 import silkjs.js_core_types { FrameSlots, NativeErrorKind, NativeFunctionId }
 import silkjs.js_exceptions { JsException }
@@ -46,9 +52,10 @@ import sqlite.sys as c
 unsafe extern "C" fn memcpy(dest: *mut u8, source: *const u8, length: usize) -> *mut u8
 unsafe extern "C" fn calloc(count: usize, size: usize) -> ?*mut u8
 unsafe extern "C" fn free(pointer: ?*mut u8) -> ()
+unsafe extern "C" fn strlen(text: *const u8) -> usize
 
 pub struct State { first: ?*mut Handle, callbacks: ?*mut Callback, next: i32, engine: ?*mut u8, context: ?*mut HeapHeader, depth: i32, allocator: *mut RuntimeHeap }
-struct Handle { next: ?*mut Handle, id: i32, kind: i32, owner: i32, ptr: ?*mut u8, extra: ?*mut u8, texts: ?*mut Text, busy: bool }
+struct Handle { next: ?*mut Handle, id: i32, kind: i32, owner: i32, ptr: ?*mut u8, extra: ?*mut u8, texts: ?*mut Text, busy: bool, rowsHint: usize }
 struct Text { next: ?*mut Text, bytes: List<u8> }
 struct Callback { next: ?*mut Callback, state: *mut State, owner: i32, function: ValueBits, dead: bool, big: bool }
 fn nil() -> ?*mut u8 { return Pointer.null<u8>() }
@@ -67,7 +74,7 @@ effect fn alloc<T>() -> *mut T ! OutOfMemoryError { let p = unsafe calloc(1, Lay
 // while the outer dispatch is suspended inside SQLite, never from another thread.
 pub effect fn open(allocator: *mut RuntimeHeap) -> *mut State ! OutOfMemoryError { let p = run alloc<State>() unsafe Pointer.put<State>(p, State { first: Pointer.null<Handle>(), callbacks: Pointer.null<Callback>(), next: 1, engine: nil(), context: Pointer.null<HeapHeader>(), depth: 0, allocator: allocator }) return p }
 unsafe fn lookup(state: *mut State, id: i32) -> ?*mut Handle { let a = () let s = unsafe Pointer.borrow<(), State>(&a, state) let mut p = s.first drop s while !Pointer.isNull<Handle>(p) { let h = unsafe Pointer.borrow<(), Handle>(&a, unsafe nn(p)) if h.id == id { return p } p = h.next } return Pointer.null<Handle>() }
-unsafe effect fn add(state: *mut State, kind: i32, owner: i32, ptr: ?*mut u8, extra: ?*mut u8) -> i32 ! OutOfMemoryError { let h = run alloc<Handle>() let mut a = () let s = unsafe Pointer.borrowMut<(), State>(&mut a, state) let id = s.next s.next = s.next + 1 unsafe Pointer.put<Handle>(h, Handle { next: s.first, id: id, kind: kind, owner: owner, ptr: ptr, extra: extra, texts: Pointer.null<Text>(), busy: false }) s.first = h return id }
+unsafe effect fn add(state: *mut State, kind: i32, owner: i32, ptr: ?*mut u8, extra: ?*mut u8) -> i32 ! OutOfMemoryError { let h = run alloc<Handle>() let mut a = () let s = unsafe Pointer.borrowMut<(), State>(&mut a, state) let id = s.next s.next = s.next + 1 unsafe Pointer.put<Handle>(h, Handle { next: s.first, id: id, kind: kind, owner: owner, ptr: ptr, extra: extra, texts: Pointer.null<Text>(), busy: false, rowsHint: 0 }) s.first = h return id }
 unsafe fn clearTexts(h: &mut Handle) -> () { let mut p = h.texts h.texts = Pointer.null<Text>() while !Pointer.isNull<Text>(p) { let address = unsafe nn(p) let entry = unsafe Pointer.take<Text>(address) p = entry.next drop entry unsafe free(unsafe raw(address)) } }
 unsafe fn dispose(state: *mut State, id: i32) -> () {
   let mut a = () let s = unsafe Pointer.borrowMut<(), State>(&mut a, state) let mut link = Pointer.fromMutRef<?*mut Handle>(&mut s.first) drop s
@@ -232,12 +239,7 @@ unsafe effect fn info<'m>(engine: &mut Engine<'m, host.Services>, context: *mut 
     if mode == 0 {
       let value = run unsafe string(&mut engine, context, one(unsafe c.sqlite3_bind_parameter_name(stmt, i + 1)))
       run unsafe common.defineIndex(&mut engine, context, out, i32.toU32(i), value)
-    } else if mode == 1 {
-      let value = run unsafe string(&mut engine, context, one(unsafe c.sqlite3_column_name(stmt, i)))
-      run unsafe common.defineIndex(&mut engine, context, out, i32.toU32(i), value)
-    }
-    else if mode == 2 { let value = run unsafe sqlValue(&mut engine, context, unsafe c.sqlite3_column_value(stmt, i), num(scope.values[1]) != 0) run unsafe common.defineIndex(&mut engine, context, out, i32.toU32(i), value) }
-    else {
+    } else {
       scope.values[9] = run unsafe array(&mut engine, context) let row = scope.values[9]
       let names = [one(unsafe c.sqlite3_column_name(stmt, i)), one(unsafe c.sqlite3_column_origin_name(stmt, i)), one(unsafe c.sqlite3_column_table_name(stmt, i)), one(unsafe c.sqlite3_column_database_name(stmt, i)), one(unsafe c.sqlite3_column_decltype(stmt, i))]
       let mut n: u32 = 0
@@ -251,6 +253,160 @@ unsafe effect fn info<'m>(engine: &mut Engine<'m, host.Services>, context: *mut 
   } return scope.take(8)
 }
 
+// A connection is only used from the thread of the runtime that opened it (a
+// worker opens its own), so SQLite's per-call connection mutex only costs time:
+// every sqlite3_column_* call took and released it.
+const OPEN_NOMUTEX: i32 = 0x8000
+// Row materialization for all(), get() and iteration. The first row of a call
+// is defined property by property on a null-prototype object (so duplicate,
+// numeric and __proto__ column names behave like ordinary assignment), and its
+// final shape is then shared by every later row of the call: each later row is
+// born with that shape and gets its slots stored in order, with no per-column
+// property lookup. FIX_BLOB and FIX_BIG tell the JS side to finish values that
+// need it (blobs become Uint8Array views, out-of-range integers throw).
+const FIX_BLOB: i32 = 1
+const FIX_BIG: i32 = 2
+// One sqlite3_column_value per column, then sqlite3_value_* on it: each
+// sqlite3_column_* call validates the statement and column again. The value is
+// unprotected, which is safe on a connection opened without a mutex.
+unsafe effect fn columnValue<'m>(engine: &mut Engine<'m, host.Services>, context: *mut HeapHeader, stmt: ?*mut u8, i: i32, big: bool, fix: &mut i32) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let value = unsafe c.sqlite3_column_value(stmt, i)
+  let kind = unsafe c.sqlite3_value_type(value)
+  if kind == 1 {
+    let n = unsafe c.sqlite3_value_int64(value)
+    if !big && n >= -9007199254740991 && n <= 9007199254740991 { return ValueBits.number(i64.toF64(n)) }
+    if !big { fix.* = i32.bitOr(fix.*, FIX_BIG) }
+    return run bigint.newBigInt64(n)
+  }
+  if kind == 2 { return ValueBits.number(unsafe c.sqlite3_value_double(value)) }
+  if kind == 4 { fix.* = i32.bitOr(fix.*, FIX_BLOB) }
+  return run unsafe sqlValue(&mut engine, context, value, big)
+}
+unsafe fn releaseAll<'m>(engine: &mut Engine<'m, host.Services>, context: *mut HeapHeader, values: &mut List<ValueBits>) -> () {
+  let mut i: usize = 0 while i < values.length() { unsafe owners.release(&mut engine, context, values.get(i)) values.set(i, ValueBits.Undefined) i = i + 1 }
+}
+// The current row's values, one per slot of the shared shape (a later duplicate
+// column replaces an earlier one, as assignment would). On failure every value
+// made so far is released.
+unsafe effect fn fillSlots<'m>(engine: &mut Engine<'m, host.Services>, context: *mut HeapHeader, stmt: ?*mut u8, count: i32, big: bool, slotOf: &List<usize>, values: &mut List<ValueBits>, fix: &mut i32) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut i: i32 = 0
+  while i < count {
+    let made = run Effect.result(unsafe columnValue(&mut engine, context, stmt, i, big, &mut fix))
+    match move made {
+      Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => {
+        let slot = slotOf.get(i32.toUsize(i)) let old = values.get(slot) values.set(slot, value) unsafe owners.release(&mut engine, context, old)
+      }
+      Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => { unsafe releaseAll(&mut engine, context, &mut values) fail move error }
+    }
+    i = i + 1
+  }
+}
+unsafe effect fn columnName(stmt: ?*mut u8, i: i32) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<u8>.make()
+  match Pointer.nonNullMany<u8>(unsafe c.sqlite3_column_name(stmt, i)) {
+    Option<[*]const u8>.Some { value } => {
+      let n = unsafe strlen(unsafe Pointer.at<u8>(value, 0))
+      let anchor = () run out.appendBytes(unsafe Pointer.borrowMany<(), u8>(&anchor, value, n))
+    }
+    Option<[*]const u8>.None => ()
+  }
+  return move out
+}
+unsafe fn slotCount(object: ValueBits) -> usize {
+  let node = match object { ValueBits.Object { reference } => reference _ => { return 0 } }
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node) let shape = data.shape drop data
+  return (unsafe HeapCell.payload<ShapeData, ()>(&anchor, shape)).properties.length()
+}
+unsafe fn shapeOf(object: ValueBits) -> *mut HeapHeader {
+  let node = match object { ValueBits.Object { reference } => reference _ => { return Intrinsic.trap("SQLite row is not an object") } }
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node) return data.shape
+}
+// Steps up to max rows (0: until done) and returns them as an array of row
+// objects (or arrays). args: id, readBigInts, returnArrays, max, fixups out-array.
+unsafe effect fn rowsBody<'m>(engine: &mut Engine<'m, host.Services>, context: *mut HeapHeader, db: ?*mut u8, stmt: ?*mut u8, args: &mut Scope, hint: &mut usize) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let big = num(args.values[1]) != 0 let asArrays = num(args.values[2]) != 0 let max = num(args.values[3])
+  let memory = engine.memory
+  let realm = unsafe lendRealm(&context, context)
+  // A full read reserves as many rows as the statement's last full read
+  // returned, so rereading a table does not regrow (and copy) the result.
+  let mut capacity: usize = 0
+  if max == 0 { capacity = hint.* }
+  args.values[8] = run objects.arrayWithCapacity(&mut engine, memory, realm, capacity)
+  let count = unsafe c.sqlite3_column_count(stmt)
+  let mut slotOf = List<usize>.make() let mut values = List<ValueBits>.make()
+  let mut shaped = false let mut produced: i32 = 0 let mut fix: i32 = 0 let mut status: i32 = 100
+  while true {
+    status = unsafe c.sqlite3_step(stmt)
+    if status != 100 { break }
+    if asArrays {
+      args.values[10] = run objects.arrayWithCapacity(&mut engine, memory, realm, i32.toUsize(count))
+      let mut i: i32 = 0
+      while i < count {
+        let value = run unsafe columnValue(&mut engine, context, stmt, i, big, &mut fix)
+        let row = match args.values[10] { ValueBits.Object { reference } => reference _ => Intrinsic.trap("SQLite row is not an array") }
+        let _stored = run unsafe arrays.appendFastElement(&mut engine, realm, row, value)
+        i = i + 1
+      }
+    } else if !shaped {
+      args.values[10] = (run objects.newWithPrototype(&mut engine, memory, realm, immediateRef(ValueBits.Null))).intoBits()
+      let mut i: i32 = 0
+      while i < count {
+        let before = unsafe slotCount(args.values[10])
+        let value = run unsafe columnValue(&mut engine, context, stmt, i, big, &mut fix)
+        let name = run unsafe columnName(stmt, i)
+        run unsafe common.define(&mut engine, context, args.values[10], name.asSlice(), value, 7)
+        let after = unsafe slotCount(args.values[10])
+        let mut slot = after - 1
+        if after == before {
+          let mut j: i32 = 0 while j < i { let other = run unsafe columnName(stmt, j) if eq(other.asSlice(), name.asSlice()) { slot = slotOf.get(i32.toUsize(j)) } j = j + 1 }
+        }
+        run slotOf.append(slot)
+        i = i + 1
+      }
+      // The first row keeps the shared shape alive for the rest of the call.
+      args.values[9] = unsafe args.values[10].retained()
+      let slots = unsafe slotCount(args.values[10])
+      while values.length() < slots { run values.append(ValueBits.Undefined) }
+      shaped = true
+    } else {
+      run unsafe fillSlots(&mut engine, context, stmt, count, big, &slotOf, &mut values, &mut fix)
+      let shape = unsafe shapeOf(args.values[9])
+      unsafe shapes.take(unsafe runtime.contextRuntime(context), shape)
+      let created = run Effect.result(unsafe objects.recordFromShapeWritten(&mut engine, memory, realm, shape, values.length()))
+      let node = match move created {
+        Result<ValueBits, OutOfMemoryError>.Success { value } => match value { ValueBits.Object { reference } => reference _ => Intrinsic.trap("SQLite row is not an object") }
+        Result<ValueBits, OutOfMemoryError>.Failure { error } => { unsafe releaseAll(&mut engine, context, &mut values) fail move error }
+      }
+      let mut anchor = ()
+      let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+      data.slotListMut().clear()
+      let mut k: usize = 0 while k < values.length() { data.pushSlot(SlotBits.value(values.get(k))) values.set(k, ValueBits.Undefined) k = k + 1 }
+      drop data
+      args.values[10] = ValueBits.Object { reference: node }
+    }
+    let rows = match args.values[8] { ValueBits.Object { reference } => reference _ => Intrinsic.trap("SQLite rows is not an array") }
+    let _appended = run unsafe arrays.appendFastElement(&mut engine, realm, rows, args.take(10))
+    produced = produced + 1
+    if i32.bitAnd(fix, FIX_BIG) != 0 { break }
+    if max != 0 && produced >= max { break }
+  }
+  if status != 100 && status != 101 { run unsafe checked(&mut engine, context, db, status) }
+  if fix != 0 { run unsafe common.defineIndex(&mut engine, context, args.values[4], 0, ValueBits.Int { value: fix }) }
+  if max == 0 && status == 101 { hint.* = i32.toUsize(produced) }
+  return args.take(8)
+}
+unsafe effect fn rows<'m>(engine: &mut Engine<'m, host.Services>, context: *mut HeapHeader, db: ?*mut u8, hp: *mut Handle, stmt: ?*mut u8, args: &mut Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut anchor = ()
+  let entry = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, hp) entry.busy = true let mut hint = entry.rowsHint drop entry
+  // Every row stays reachable from the result until it is returned.
+  let rt = unsafe runtime.contextRuntime(context)
+  let threshold = unsafe runtime.deferCollections(rt)
+  let outcome = run Effect.result(unsafe rowsBody(&mut engine, context, db, stmt, &mut args, &mut hint))
+  let memory = engine.memory
+  unsafe runtime.resumeCollections(memory, rt, threshold)
+  let finished = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, hp) finished.busy = false finished.rowsHint = hint drop finished
+  return match move outcome { Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
+}
 unsafe effect fn executeSQL<'m>(engine: &mut Engine<'m, host.Services>, context: *mut HeapHeader, db: ?*mut u8, sql: ValueBits) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
   let bytes = run text.ctext(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(sql)) let mut offset: usize = 0
   while offset + 1 < bytes.length() {
@@ -265,7 +421,7 @@ unsafe effect fn executeSQL<'m>(engine: &mut Engine<'m, host.Services>, context:
 unsafe effect fn operation<'m>(engine: &mut Engine<'m, host.Services>, context: *mut HeapHeader, state: *mut State, op: &[u8], args: &mut Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
   if eq(op, b"open") {
     let filename = run text.ctext(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(args.values[0])) let mut db = nil()
-    let status = unsafe c.sqlite3_open_v2(cs(&filename), Pointer.fromMutRef<?*mut u8>(&mut db), num(args.values[1]), none())
+    let status = unsafe c.sqlite3_open_v2(cs(&filename), Pointer.fromMutRef<?*mut u8>(&mut db), i32.bitOr(num(args.values[1]), OPEN_NOMUTEX), none())
     if status != 0 { let result = run Effect.result(unsafe checked(&mut engine, context, db, status)) let _ignored = unsafe c.sqlite3_close_v2(db) match move result { Result<(), OutOfMemoryError | JsException>.Success { .. } => () Result<(), OutOfMemoryError | JsException>.Failure { error } => { fail move error } } }
     let added = run Effect.result(unsafe add(state, 1, 0, db, nil()))
     return match move added { Result<i32, OutOfMemoryError>.Success { value } => ValueBits.Int { value: value } Result<i32, OutOfMemoryError>.Failure { error } => { let _ignored = unsafe c.sqlite3_close_v2(db) fail move error } }
@@ -284,14 +440,13 @@ unsafe effect fn operation<'m>(engine: &mut Engine<'m, host.Services>, context: 
   }
   if kind == 2 {
     if eq(op, b"parameters") { return run unsafe info(&mut engine, context, ptr, 0, &mut args) }
-    if eq(op, b"names") { return run unsafe info(&mut engine, context, ptr, 1, &mut args) }
-    if eq(op, b"row") { return run unsafe info(&mut engine, context, ptr, 2, &mut args) }
-    if eq(op, b"columns") { return run unsafe info(&mut engine, context, ptr, 3, &mut args) }
+    if eq(op, b"columns") { return run unsafe info(&mut engine, context, ptr, 1, &mut args) }
     if eq(op, b"source") { return run unsafe string(&mut engine, context, one(unsafe c.sqlite3_sql(ptr))) }
     if eq(op, b"expanded") { let p = unsafe c.sqlite3_expanded_sql(ptr) if Pointer.isNull<u8>(p) { fail OutOfMemoryError {} } let result = run Effect.result(unsafe string(&mut engine, context, p)) unsafe c.sqlite3_free(p) return match move result { Result<ValueBits, JsException>.Success { value } => value Result<ValueBits, JsException>.Failure { error } => { fail move error } } }
     if busy { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"SQLite statement is executing") }
     if eq(op, b"bind") { let status = run unsafe bind(&mut engine, context, hp, &args.*) run unsafe checked(&mut engine, context, db, status) return ValueBits.Undefined }
     if eq(op, b"clear") { let status = unsafe c.sqlite3_clear_bindings(ptr) let entry = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, hp) unsafe clearTexts(&mut entry) drop entry run unsafe checked(&mut engine, context, db, status) return ValueBits.Undefined }
+    if eq(op, b"rows") { return run unsafe rows(&mut engine, context, db, hp, ptr, &mut args) }
     if eq(op, b"step") || eq(op, b"reset") {
       let entry = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, hp) entry.busy = true drop entry
       let mut status: i32 = 0 if eq(op, b"step") { status = unsafe c.sqlite3_step(ptr) } else { status = unsafe c.sqlite3_reset(ptr) }
@@ -412,7 +567,7 @@ unsafe effect fn attachSession<'m>(engine: &mut Engine<'m, host.Services>, conte
 }
 unsafe effect fn backupStart<'m>(engine: &mut Engine<'m, host.Services>, context: *mut HeapHeader, state: *mut State, source: ?*mut u8, id: i32, args: &Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
   let path = run text.ctext(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(args.values[1])) let sourceName = run text.ctext(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(args.values[2])) let destName = run text.ctext(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(args.values[3])) let mut dest = nil()
-  let status = unsafe c.sqlite3_open_v2(cs(&path), Pointer.fromMutRef<?*mut u8>(&mut dest), 6, none())
+  let status = unsafe c.sqlite3_open_v2(cs(&path), Pointer.fromMutRef<?*mut u8>(&mut dest), i32.bitOr(6, OPEN_NOMUTEX), none())
   let mut backup = nil() if status == 0 { backup = unsafe c.sqlite3_backup_init(dest, cs(&destName), source, cs(&sourceName)) }
   if status != 0 || Pointer.isNull<u8>(backup) { let mut code = status if code == 0 { code = unsafe c.sqlite3_extended_errcode(dest) } let outcome = run Effect.result(unsafe checked(&mut engine, context, dest, code)) let _ignored = unsafe c.sqlite3_close_v2(dest) match move outcome { Result<(), OutOfMemoryError | JsException>.Success { .. } => () Result<(), OutOfMemoryError | JsException>.Failure { error } => { fail move error } } }
   let added = run Effect.result(unsafe add(state, 4, id, backup, dest))

@@ -9,8 +9,25 @@ const { FormData, encodeForm, parseForm, parseMIME } = require('internal/web/fet
 const { scalar } = require('internal/web/fetch/headers');
 const states = new WeakMap();
 const disturbedSymbol = Symbol.for('nodejs.stream.disturbed');
-function used(body) { return !!body && (body.used || !!body.stream[disturbedSymbol]); }
-function unusable(body) { return !!body && (used(body) || body.stream.locked); }
+// A body made from bytes or a Blob gets its stream only when something reads it.
+class BodyRecord {
+  constructor(stream, source, bytes, length, type) {
+    this.current = stream; this.source = source; this.bytes = bytes; this.length = length; this.type = type; this.used = false;
+  }
+  get stream() {
+    if (this.current === null) {
+      const bytes = this.bytes;
+      this.current = bytes !== null ? new ReadableStream({ type: 'bytes', start(controller) { if (bytes.length) controller.enqueue(new Uint8Array(bytes)); controller.close(); } })
+        : this.source.stream();
+    }
+    return this.current;
+  }
+  set stream(value) { this.current = value; }
+  // No source to read again: the body is a stream.
+  get streaming() { return this.source === null && this.bytes === null; }
+}
+function used(body) { return !!body && (body.used || (body.current !== null && !!body.current[disturbedSymbol])); }
+function unusable(body) { return !!body && (used(body) || (body.current !== null && body.current.locked)); }
 function state(object) {
   const value = states.get(object);
   if (!value) throw new TypeError('Illegal body invocation');
@@ -18,12 +35,17 @@ function state(object) {
 }
 function extract(value, keepalive = false) {
   if (value == null) return null;
-  let stream, source = null, type = null, length = null;
+  let stream = null, source = null, type = null, length = null;
+  if (typeof value === 'string') { const bytes = Buffer.from(value, 'utf8'); return new BodyRecord(null, null, bytes, bytes.length, 'text/plain;charset=UTF-8'); }
   if (value instanceof ReadableStream) stream = value;
   else if (value instanceof Blob) { source = value; type = value.type || null; }
   else if (value instanceof FormData) { source = encodeForm(value); type = source.type; }
   else if (value instanceof URLSearchParams) { source = new Blob([value.toString()]); type = 'application/x-www-form-urlencoded;charset=UTF-8'; }
-  else if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) source = new Blob([value]);
+  else if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
+    const view = value instanceof ArrayBuffer ? new Uint8Array(value) : new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    const bytes = Buffer.from(view);
+    return new BodyRecord(null, null, bytes, bytes.length, null);
+  }
   else if (value && typeof value[Symbol.asyncIterator] === 'function') {
     const iterator = value[Symbol.asyncIterator]();
     stream = new ReadableStream({
@@ -40,15 +62,16 @@ function extract(value, keepalive = false) {
   if (stream) {
     if (keepalive) throw new TypeError('keepalive cannot be used with a streaming body');
     if (stream.locked || stream[disturbedSymbol]) throw new TypeError('Response body object should not be disturbed or locked');
-  } else { stream = source.stream(); length = source.size; }
-  return { stream, source, length, type, used: false };
+  } else length = source.size;
+  return new BodyRecord(stream, source, null, length, type);
 }
 function clone(body) {
   if (!body) return null;
   if (unusable(body)) throw new TypeError('Body has already been consumed');
+  if (body.current === null) return new BodyRecord(null, body.source, body.bytes, body.length, body.type);
   const branches = body.stream.tee();
   body.stream = branches[0];
-  return { ...body, stream: branches[1], used: false };
+  return new BodyRecord(branches[1], body.source, body.bytes, body.length, body.type);
 }
 function transfer(body) {
   if (!body) return null;
@@ -63,13 +86,14 @@ function transfer(body) {
     },
     async cancel(reason) { try { await reader.cancel(reason); } finally { reader.releaseLock(); } },
   }, { highWaterMark: 0 });
-  return { ...body, stream, used: false };
+  return new BodyRecord(stream, body.source, body.bytes, body.length, body.type);
 }
 async function consume(object) {
   const record = state(object), body = record.body;
   if (unusable(body)) throw new TypeError('Body is unusable: Body has already been read');
   if (!body) return new Uint8Array(0);
   body.used = true;
+  if (body.current === null && body.bytes !== null) return new Uint8Array(body.bytes);
   const reader = body.stream.getReader();
   const chunks = []; let length = 0;
   try {
@@ -102,4 +126,7 @@ function installBody(prototype) {
     } },
   });
 }
-module.exports = { states, state, extract, clone, transfer, consume, used, unusable, installBody };
+// A fresh unread body from the same bytes or Blob, for a redirect that sends it again.
+function replay(body) { return new BodyRecord(null, body.source, body.bytes, body.length, body.type); }
+function streamBody(stream) { return new BodyRecord(stream, null, null, null, null); }
+module.exports = { replay, streamBody, states, state, extract, clone, transfer, consume, used, unusable, installBody };

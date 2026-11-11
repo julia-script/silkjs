@@ -2,7 +2,7 @@
 
 const host = require('internal/host');
 const EventEmitter = require('events');
-const { AsyncResource } = require('async_hooks');
+const { _createResource: createResource } = require('async_hooks');
 const { Buffer } = require('buffer');
 // A main thread that never starts a worker needs none of these; each loads on first use.
 const lazy = name => { let loaded; return () => loaded ??= require(name); };
@@ -13,6 +13,12 @@ const messaging = lazy('internal/worker/messaging');
 const lockManager = lazy('internal/worker/locks');
 const runtimeOptions = lazy('internal/options');
 const path = lazy('path');
+const validators = lazy('internal/validators');
+function workerPathError(filename) {
+  return clone().codedError('ERR_WORKER_PATH', "The worker script or module filename must be an absolute path or a relative path starting with './' or '../'." +
+    (filename.startsWith('file://') ? ' Wrap file:// URLs with `new URL`.' : '') +
+    (filename.startsWith('data:text/javascript') ? ' Wrap data: URLs with `new URL`.' : '') + ` Received "${filename}"`);
+}
 let profilesModule;
 const profiles = () => profilesModule ??= require('internal/worker/profiles');
 const SHARE_ENV = Symbol.for('nodejs.worker_threads.SHARE_ENV');
@@ -44,6 +50,12 @@ function writableTo(port, fd, callbacks) {
   const pendingIds = new Set();
   return new (require('stream').Writable)({
     write(chunk, encoding, callback) {
+      // Like Node's worker stdio: once the thread is exiting, no acknowledgement can
+      // arrive, so each chunk completes as soon as it is posted.
+      if (process._exiting) {
+        try { controlSend(port, { type: 'stdio', fd, chunk, id: 0 }); callback(); } catch (error) { callback(error); }
+        return;
+      }
       const id = ++stdioSequence;
       pendingIds.add(id);
       controlRef(port, 1);
@@ -91,7 +103,7 @@ function handleControl(worker, message) {
   const state = workerState(worker);
   switch (message.type) {
     case 'watch:dependency': require('internal/watch_mode/dependencies').report(message.filename); break;
-    case 'error': state.errorReceived = true; state.resource.runInAsyncScope(worker.emit, worker, 'error', message.error); break;
+    case 'error': state.errorReceived = true; state.resource.runInAsyncScope(worker.emit, worker, 'error', 'symbol' in message ? Symbol.for(message.symbol) : message.error); break;
     case 'stdio': {
       const stream = message.fd === 1 ? state.stdout : message.fd === 2 ? state.stderr : null;
       receiveStdio(stream, state.control, message);
@@ -106,13 +118,16 @@ function handleControl(worker, message) {
     }
   }
 }
+function unsupported(api) {
+  return clone().codedError('ERR_NOT_SUPPORTED', `${api} is not supported by SilkJS: the engine has no V8 heap generations or code range`, Error);
+}
 function resourceLimits(options) {
   const limits = { stackSizeMb: 4 };
   if (options === null || typeof options !== 'object') return limits;
   // SilkJS has neither generations nor a JIT code range. A whole-runtime
   // allocator budget is not a faithful implementation of any of these options.
   for (const key of ['maxOldGenerationSizeMb', 'maxYoungGenerationSizeMb', 'codeRangeSizeMb']) {
-    if (typeof options[key] === 'number') throw unsupported(`Worker resourceLimits.${key} (V8-only control)`);
+    if (typeof options[key] === 'number') throw unsupported(`Worker resourceLimits.${key}`);
   }
   const stack = options.stackSizeMb;
   if (typeof stack === 'number' && stack > 0) {
@@ -131,17 +146,15 @@ function workerOptions(filename, options) {
   const result = {};
   // Node validates the array containers before resolving the entry, but defers
   // execArgv string conversion until after environment/name/resource parsing.
-  if (options.execArgv && !Array.isArray(options.execArgv))
-    throw clone().codedError('ERR_INVALID_ARG_TYPE', 'The options.execArgv property must be an Array');
+  if (options.execArgv) validators().validateArray(options.execArgv, 'options.execArgv');
   result.argv = [];
   if (options.argv) {
-    if (!Array.isArray(options.argv))
-      throw clone().codedError('ERR_INVALID_ARG_TYPE', 'The options.argv property must be an Array');
+    validators().validateArray(options.argv, 'options.argv');
     result.argv = Array.prototype.map.call(options.argv, String);
   }
   result.eval = !!options.eval;
   if (result.eval) {
-    if (typeof filename !== 'string') throw clone().codedError('ERR_INVALID_ARG_VALUE', 'The filename must be a string when options.eval is true');
+    if (typeof filename !== 'string') throw new (validators().codes.ERR_INVALID_ARG_VALUE)('options.eval', options.eval, "must be false when 'filename' is not a string");
     result.filename = filename;
   } else {
     if (filename instanceof require('url').URL) {
@@ -149,8 +162,8 @@ function workerOptions(filename, options) {
       else filename = require('url').fileURLToPath(filename);
     }
     if (!result.filename) {
-      if (typeof filename !== 'string') throw clone().codedError('ERR_INVALID_ARG_TYPE', 'The filename argument must be a string or URL');
-      if (!path().isAbsolute(filename) && !filename.startsWith('./') && !filename.startsWith('../')) throw clone().codedError('ERR_WORKER_PATH', 'Worker filename must be an absolute path or a relative path starting with ./ or ../');
+      if (typeof filename !== 'string') throw new (validators().codes.ERR_INVALID_ARG_TYPE)('filename', ['string', 'URL'], filename);
+      if (!path().isAbsolute(filename) && !/^\.\.?[\\/]/.test(filename)) throw workerPathError(filename);
       result.filename = path().resolve(filename);
     }
   }
@@ -162,13 +175,13 @@ function workerOptions(filename, options) {
     for (const [key, value] of Object.entries(options.env)) Object.defineProperty(result.env, key, { value: optionString(value), enumerable: true, configurable: true, writable: true });
   } else if (options.env != null) {
     if (options.env !== SHARE_ENV)
-      throw clone().codedError('ERR_INVALID_ARG_TYPE', 'The options.env property must be an object or SHARE_ENV');
+      throw new (validators().codes.ERR_INVALID_ARG_TYPE)('options.env', ['object', 'undefined', 'null', 'worker_threads.SHARE_ENV'], options.env);
     result.shareEnv = true;
   }
   result.name = 'WorkerThread';
   result.watchReportDependencies = require('internal/watch_mode/dependencies').enabled();
   if (options.name) {
-    if (typeof options.name !== 'string') throw clone().codedError('ERR_INVALID_ARG_TYPE', 'The options.name property must be a string');
+    validators().validateString(options.name, 'options.name');
     result.name = options.name.trim();
   }
   const execArgv = options.execArgv;
@@ -220,6 +233,11 @@ function workerOptions(filename, options) {
   result.processExposeGC = !!host.exposeGC;
   return { metadata: result, options };
 }
+class WorkerHandle {
+  #state;
+  constructor(state) { this.#state = state; }
+  hasRef() { return this.#state.handleGone ? undefined : this.#state.refed; }
+}
 class Worker extends EventEmitter {
   constructor(filename, options) {
     super();
@@ -228,10 +246,13 @@ class Worker extends EventEmitter {
     const userChannel = new (ports().MessageChannel)();
     const controlChannel = new (ports().MessageChannel)();
     const state = { id: null, online: false, exited: false, exitCode: undefined, user: userChannel.port1,
-      control: controlChannel.port1, resource: new AsyncResource('WORKER'),
+      control: controlChannel.port1, resource: null, refed: true, handleGone: false,
       stdout: readableFrom(), stderr: readableFrom(), stdin: null,
       callbacks: new Map(), termination: null, resolveTermination: null, metadata: config.metadata };
     workerStates.set(this, state);
+    // Like Node's, the async resource of a worker is its native handle: hasRef() reports
+    // the ref state while the thread runs and undefined once the handle is gone.
+    state.resource = createResource('WORKER', new WorkerHandle(state));
     state.stdin = config.metadata.stdin ? writableTo(state.control, 0, state.callbacks) : null;
     this.on('newListener', type => { if (type === 'message') state.user.ref(); });
     this.on('removeListener', type => { if (type === 'message' && this.listenerCount('message') === 0) state.user.unref(); });
@@ -255,6 +276,7 @@ class Worker extends EventEmitter {
     }
     if (!config.metadata.stdout) state.stdout.pipe(process.stdout, { end: false });
     if (!config.metadata.stderr) state.stderr.pipe(process.stderr, { end: false });
+    process.nextTick(() => process.emit('worker', this));
   }
   get threadId() { const state = workerState(this); return state.exited ? -1 : state.id; }
   get threadName() { const state = workerState(this); return state.exited ? null : state.metadata.name; }
@@ -266,16 +288,22 @@ class Worker extends EventEmitter {
     if (arguments.length === 0) throw clone().codedError('ERR_MISSING_ARGS', 'The value argument must be specified');
     workerState(this).user.postMessage(value, transferList);
   }
-  ref() { const state = workerState(this); if (!state.exited) { host.workerNative('workerRef', [state.id, true]); state.user.ref(); } return this; }
-  unref() { const state = workerState(this); if (!state.exited) { host.workerNative('workerRef', [state.id, false]); state.user.unref(); } return this; }
+  ref() { const state = workerState(this); if (!state.exited) { host.workerNative('workerRef', [state.id, true]); state.user.ref(); state.refed = true; } return this; }
+  unref() { const state = workerState(this); if (!state.exited) { host.workerNative('workerRef', [state.id, false]); state.user.unref(); state.refed = false; } return this; }
   terminate(callback) {
     const state = workerState(this);
-    if (callback !== undefined && typeof callback !== 'function') throw clone().codedError('ERR_INVALID_ARG_TYPE', 'The callback argument must be a function');
-    if (!state.termination) state.termination = state.exited ? Promise.resolve(state.exitCode) : new Promise(resolve => {
+    this.ref();
+    if (typeof callback === 'function') {
+      process.emitWarning('Passing a callback to worker.terminate() is deprecated. It returns a Promise instead.', 'DeprecationWarning', 'DEP0132');
+      if (state.exited) return Promise.resolve();
+      this.once('exit', exitCode => callback(null, exitCode));
+    }
+    // Like Node, a worker that has exited resolves with undefined.
+    if (state.exited) return Promise.resolve();
+    if (!state.termination) state.termination = new Promise(resolve => {
       state.resolveTermination = resolve;
       host.workerNative('terminate', [state.id]);
     });
-    if (callback) state.termination.then(code => callback(null, code));
     return state.termination;
   }
   getHeapSnapshot(options) { return profiles().getHeapSnapshot(workerStates.get(this), options, controlRef); }
@@ -285,13 +313,9 @@ class Worker extends EventEmitter {
   cpuUsage(prev) {
     // Node validates synchronously, even when the worker is already dead.
     if (prev) {
-      if (typeof prev !== 'object' || Array.isArray(prev)) throw clone().codedError('ERR_INVALID_ARG_TYPE', 'The prev argument must be an object');
-      for (const key of ['user', 'system']) {
-        const value = prev[key];
-        if (typeof value !== 'number') throw clone().codedError('ERR_INVALID_ARG_TYPE', `The prev.${key} property must be a number`);
-        if (!(value >= 0 && value <= Number.MAX_SAFE_INTEGER))
-          throw clone().codedError('ERR_OUT_OF_RANGE', `The prev.${key} property must be >= 0 && <= ${Number.MAX_SAFE_INTEGER}`, RangeError);
-      }
+      validators().validateObject(prev, 'prev');
+      validators().validateNumber(prev.user, 'prev.user', 0, Number.MAX_SAFE_INTEGER);
+      validators().validateNumber(prev.system, 'prev.system', 0, Number.MAX_SAFE_INTEGER);
     }
     const state = workerStates.get(this);
     if (!state || state.exited) return Promise.reject(clone().codedError('ERR_WORKER_NOT_RUNNING', 'Worker instance not running', Error));
@@ -312,6 +336,7 @@ function receiveMessageOnPort(port) { return ports().receiveMessageOnPort(broadc
 function poll() {
   const profileActivity = profilesModule ? profilesModule.poll() : false;
   const events = host.workerNative('poll', []);
+  if (events.length === 0) return profileActivity;
   for (const event of events) {
     if (event.type === 'threadMessage') { messaging().dispatch(event); continue; }
     if (event.type === 'lock') { lockManager().dispatch(event); continue; }
@@ -346,7 +371,10 @@ function poll() {
           clone().codedError('ERR_WORKER_INIT_FAILED', 'Worker initialization failed before becoming online', Error));
         state.resource.runInAsyncScope(worker.emit, worker, 'exit', event.code);
       }
-      finally { state.resource.emitDestroy(); }
+      finally {
+        state.resource.emitDestroy();
+        process.nextTick(() => { state.handleGone = true; });
+      }
     }
   }
   return profileActivity || events.length > 0;
@@ -432,7 +460,7 @@ function install(proc = process, metadata = bootstrap()) {
     if (typeof code === 'string' && code.trim()) code = Number(code);
     if (!Number.isInteger(code)) throw clone().codedError('ERR_INVALID_ARG_TYPE', 'The code argument must be an integer');
     proc.exitCode = code;
-    if (!exitRequested) { exitRequested = true; proc.emit('exit', code); }
+    if (!exitRequested) { exitRequested = true; proc._exiting = true; proc.emit('exit', code); }
     if (host.builtinLoaded('internal/compile_cache')) require('internal/compile_cache').flushCompileCache();
     host.workerNative('requestExit', [code]);
   };
@@ -440,6 +468,10 @@ function install(proc = process, metadata = bootstrap()) {
 }
 function reportError(error) {
   if (!control) return false;
+  if (typeof error === 'symbol') {
+    controlSend(control, { type: 'error', symbol: error.description ?? '' });
+    return true;
+  }
   try { controlSend(control, { type: 'error', error }); }
   catch (serializationError) {
     const fallback = new Error('Worker error could not be serialized: ' + String(serializationError?.message || serializationError));
