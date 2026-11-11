@@ -13,18 +13,25 @@ const { bufferCodec } = require('internal/host');
 const decoders = new WeakMap();
 const encoders = new WeakSet();
 
+const { ERR_INVALID_ARG_TYPE } = require('internal/path_events/support').codes;
+function codedError(Base, code, message) {
+  const error = new Base(message);
+  error.code = code;
+  return error;
+}
 function domString(value) {
   if (typeof value === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
   return String(value);
 }
-function dictionary(value) {
-  if (value == null) return {};
-  if (typeof value !== 'object' && typeof value !== 'function') throw new TypeError('Options must be an object');
+// Node's validateObject(value, name, kValidateObjectAllowObjectsAndNull).
+function dictionary(value, name) {
+  if (value === null) return {};
+  if (typeof value !== 'object' && typeof value !== 'function') throw new ERR_INVALID_ARG_TYPE(name, 'object', value);
   return value;
 }
 function decoderFor(value) {
   const decoder = decoders.get(value);
-  if (!decoder) throw new TypeError('Value of this must be of type TextDecoder');
+  if (!decoder) throw codedError(TypeError, 'ERR_INVALID_THIS', 'Value of "this" must be of type TextDecoder');
   return decoder;
 }
 
@@ -73,11 +80,20 @@ class TextEncoder {
 }
 
 class TextDecoder {
-  constructor(label = 'utf-8', options = {}) {
-    label = domString(label).replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, '');
-    if (/[^\x21-\x7e]/.test(label)) throw new RangeError('Unsupported encoding: ' + label);
-    options = dictionary(options);
-    decoders.set(this, new Decoder(label, { fatal: Boolean(options.fatal), ignoreBOM: Boolean(options.ignoreBOM) }));
+  constructor(encoding = 'utf-8', options = {}) {
+    encoding = domString(encoding);
+    options = dictionary(options, 'options');
+    const label = encoding.replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, '');
+    const notSupported = () => codedError(RangeError, 'ERR_ENCODING_NOT_SUPPORTED', `The "${encoding}" encoding is not supported`);
+    if (/[^\x21-\x7e]/.test(label)) throw notSupported();
+    let decoder;
+    try {
+      decoder = new Decoder(label, { fatal: Boolean(options.fatal), ignoreBOM: Boolean(options.ignoreBOM) });
+    } catch (error) {
+      if (error instanceof RangeError) throw notSupported();
+      throw error;
+    }
+    decoders.set(this, decoder);
   }
   get encoding() { return decoderFor(this).encoding; }
   get fatal() { return decoderFor(this).fatal; }
@@ -86,9 +102,9 @@ class TextDecoder {
     const decoder = decoderFor(this);
     if (input !== undefined && !(input instanceof ArrayBuffer) && !ArrayBuffer.isView(input) &&
         !(typeof SharedArrayBuffer === 'function' && input instanceof SharedArrayBuffer)) {
-      throw new TypeError('input must be an ArrayBuffer or ArrayBufferView');
+      throw new ERR_INVALID_ARG_TYPE('input', ['ArrayBuffer', 'ArrayBufferView'], input);
     }
-    const stream = Boolean(dictionary(options).stream);
+    const stream = Boolean(dictionary(options, 'options').stream);
     // A whole UTF-8 input with no stream pending: the native codec, BOM dropped unless kept.
     if (!stream && decoder.decoder == null && !decoder.fatal && decoder.encoding === 'utf-8') {
       if (input === undefined) return '';
@@ -97,7 +113,16 @@ class TextDecoder {
       const start = !decoder.ignoreBOM && bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf ? 3 : 0;
       return bufferCodec(3, bytes, start, bytes.length);
     }
-    return decoder.decode(input, { stream });
+    try {
+      return decoder.decode(input, { stream });
+    } catch (error) {
+      // The decoder's fatal error mode reports malformed input as a TypeError.
+      if (decoder.fatal && error instanceof TypeError) {
+        throw codedError(TypeError, 'ERR_ENCODING_INVALID_ENCODED_DATA',
+          `The encoded data was not valid for encoding ${decoder.encoding}`);
+      }
+      throw error;
+    }
   }
 }
 for (const Constructor of [TextEncoder, TextDecoder]) {

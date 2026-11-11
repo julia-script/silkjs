@@ -23,30 +23,24 @@
 'use strict';
 
 const { Buffer } = require('buffer');
+const {
+  codes: { ERR_INVALID_ARG_TYPE, ERR_UNKNOWN_ENCODING },
+  normalizeEncoding,
+} = require('internal/buffer_binding');
 const state = new WeakMap();
-function decoderError(code, message) {
-  const error = new TypeError(message);
-  error.code = code;
+function invalidThis() {
+  const error = new TypeError('Value of "this" must be of type StringDecoder');
+  error.code = 'ERR_INVALID_THIS';
   return error;
-}
-function normalizeEncoding(value) {
-  if (value === undefined || value === null || value === '') return 'utf8';
-  if (typeof value !== 'string') return undefined;
-  switch (value.toLowerCase()) {
-    case 'utf8': case 'utf-8': return 'utf8';
-    case 'utf16le': case 'utf-16le': case 'ucs2': case 'ucs-2': return 'utf16le';
-    case 'binary': case 'latin1': return 'latin1';
-    case 'ascii': case 'hex': case 'base64': case 'base64url': return value.toLowerCase();
-  }
 }
 function StringDecoder(encoding) {
   this.encoding = normalizeEncoding(encoding);
-  if (this.encoding === undefined) throw decoderError('ERR_UNKNOWN_ENCODING', `Unknown encoding: ${String(encoding)}`);
+  if (this.encoding === undefined) throw new ERR_UNKNOWN_ENCODING(encoding);
   state.set(this, { encoding: this.encoding, bytes: Buffer.alloc(4), count: 0, total: 0 });
 }
 function getState(self) {
   const s = state.get(self);
-  if (!s) throw decoderError('ERR_INVALID_THIS', 'Value of "this" must be of type StringDecoder');
+  if (!s) throw invalidThis();
   return s;
 }
 function utf8Tail(bytes) {
@@ -68,7 +62,7 @@ function utf8Tail(bytes) {
 }
 StringDecoder.prototype.write = function write(input) {
   if (typeof input === 'string') return input;
-  if (!ArrayBuffer.isView(input)) throw decoderError('ERR_INVALID_ARG_TYPE', 'The "buf" argument must be an instance of Buffer, TypedArray, or DataView');
+  if (!ArrayBuffer.isView(input)) throw new ERR_INVALID_ARG_TYPE('buf', ['Buffer', 'TypedArray', 'DataView'], input);
   const s = getState(this);
   let bytes = Buffer.from(input.buffer, input.byteOffset, input.byteLength);
   if (bytes.length === 0) return '';

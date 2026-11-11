@@ -5,6 +5,9 @@ const booleanOptions = new Map([
   ['--warnings', 'warnings'], ['--deprecation', 'deprecation'],
   ['--trace-warnings', 'traceProcessWarnings'], ['--trace-deprecation', 'traceDeprecation'],
   ['--throw-deprecation', 'throwDeprecation'], ['--pending-deprecation', 'pendingDeprecation'],
+  // Every ArrayBuffer the engine allocates is zero-filled, so Buffer's unsafe
+  // allocations already meet --zero-fill-buffers.
+  ['--zero-fill-buffers', 'zeroFillBuffers'],
 ]);
 const valueOptions = new Set(['--disable-warning', '--redirect-warnings', '--unhandled-rejections']);
 const rejectionModes = new Set(['throw', 'strict', 'warn', 'warn-with-error-code', 'none']);

@@ -7,7 +7,6 @@ const isKeyObject = types.isKeyObject;
 const { Serializer, Deserializer } = require('internal/serialization/v8');
 const { DOMException, isDOMException } = require('internal/path_events/event_target');
 const abort = require('internal/abort_controller');
-const untransferable = new WeakSet();
 const uncloneable = new WeakSet();
 const arrayBufferLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get;
 const arrayBufferResizable = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'resizable')?.get;
@@ -21,8 +20,7 @@ function codedError(code, message, Kind = TypeError) {
   return Object.assign(new Kind(message), { code });
 }
 function object(value) { return value !== null && (typeof value === 'object' || typeof value === 'function'); }
-function markAsUntransferable(value) { if (object(value)) untransferable.add(value); }
-function isMarkedAsUntransferable(value) { return object(value) && untransferable.has(value); }
+const { markAsUntransferable, isMarkedAsUntransferable } = require('internal/buffer');
 function markAsUncloneable(value) {
   if (object(value) && !types.isArrayBuffer(value) && !types.isSharedArrayBuffer(value) && !ArrayBuffer.isView(value)) uncloneable.add(value);
 }
