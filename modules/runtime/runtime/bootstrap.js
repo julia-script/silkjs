@@ -54,7 +54,9 @@ function internalRequire(request, parent = '') {
       factory = native.compileBuiltin(factory, 'node:' + request);
       factorySet(request, factory);
     }
-    factory(module, module.exports, name => internalRequire(name, request));
+    // Like Node's builtin wrapper, process is a parameter, so user code that
+    // shadows or replaces the global process cannot change what built-ins see.
+    factory(module, module.exports, name => internalRequire(name, request), process);
   }
   catch (error) { moduleDelete(request); throw error; }
   return module.exports;
@@ -98,6 +100,11 @@ host.processFeatures = {
 // Node's kFirstModuleParent: the module that first required a module, for require stacks.
 host.kFirstModuleParent = Symbol('kFirstModuleParent');
 define('internal/host', module => { module.exports = host; });
+// Like Node's, process is an instance of a constructor named process whose
+// prototype inherits from EventEmitter.prototype once events has loaded below.
+// It exists before any built-in runs, since every one of them takes it.
+const ProcessConstructor = { process: function () {} }.process;
+const process = Object.create(ProcessConstructor.prototype);
 internalRequire('internal/error_stack').install(globalThis);
 let warnedTransformTypes = false;
 host.stripTypeScriptModuleTypes = (source, filename, sourceURL = filename) => {
@@ -162,7 +169,7 @@ host.initializeRealmBuiltins = (handle, global, wasmCodeGeneration) => {
     cache.set(name, module);
     const script = native.vmCompile('(' + source + ')', 'node:' + name, handle);
     const factory = native.vmRun(script, 0, false);
-    factory(module, module.exports, load);
+    factory(module, module.exports, load, process);
     return module.exports;
   }
   load('internal/error_stack').install(global);
@@ -383,6 +390,7 @@ const kTimerId = Symbol('timerId'), kDue = Symbol('due'), kRefed = Symbol('refed
 const TIMEOUT_MAX = 2147483647;
 let warnedNegativeNumber = false, warnedNotNumber = false;
 function timeoutDuration(after) {
+  if (after === undefined) return 1;
   after *= 1;
   if (!(after >= 1 && after <= TIMEOUT_MAX)) {
     if (after > TIMEOUT_MAX) {
@@ -552,13 +560,10 @@ host.writeText = (fd, text) => {
   return true;
 };
 host.writeStartupDiagnostic = host.stderr.write;
-globalThis.process = { platform: host.platform, env: host.env, nextTick: host.nextTick, emitWarning: value => host.stderr.write(String(value) + '\n') };
+Object.assign(process, { platform: host.platform, env: host.env, nextTick: host.nextTick, emitWarning: value => host.stderr.write(String(value) + '\n') });
+globalThis.process = process;
 const EventEmitter = internalRequire('events');
-// Like Node's, process is an instance of a constructor named process whose
-// prototype inherits from EventEmitter.prototype.
-const ProcessConstructor = { process: function () {} }.process;
 Object.setPrototypeOf(ProcessConstructor.prototype, EventEmitter.prototype);
-const process = Object.create(ProcessConstructor.prototype);
 EventEmitter.call(process);
 Object.defineProperty(process, Symbol.toStringTag, { enumerable: false, writable: true, configurable: false, value: 'process' });
 defineGlobalAccessor('process', process);
@@ -912,6 +917,7 @@ function runtimeFlag(arg) {
   try {
     if (internalRequire('internal/permission').applyOption(arg) ||
         internalRequire('internal/startup_controls').applyOption(arg) ||
+        internalRequire('internal/tls/options').applyOption(arg) ||
         internalRequire('internal/heap_prof').applyOption(arg) ||
         internalRequire('internal/options').applyInspectorOption(arg)) return true;
   }
@@ -1189,11 +1195,11 @@ function run() {
   // the option tables load only for flags or NODE_OPTIONS.
   const flags = native.argv.length < 2 || native.argv[1].charCodeAt(0) === 45;
   if (flags) loadRuntimeEnvironment(native.argv.slice(1), () => { startupEnvironment = { ...process.env }; });
-  const options = internalRequire('internal/options');
   let environment = [], environmentEntries = [];
   if (process.env.NODE_OPTIONS) {
     let parsed;
     try {
+      const options = internalRequire('internal/options');
       environment = options.parseEnvironment(process.env.NODE_OPTIONS);
       parsed = options.parseArguments(environment, true);
     } catch (error) {
@@ -1204,7 +1210,8 @@ function run() {
     environmentEntries = parsed.entries;
   }
   const args = native.argv.slice(1);
-  const parsed = options.parseArguments(args, false);
+  // Without flags the parser and its option table stay unloaded.
+  const parsed = flags ? internalRequire('internal/options').parseArguments(args, false) : { entries: [], execArgv: [], index: 0 };
   if (parsed.error !== undefined) return cliError(parsed.error);
   const index = parsed.index;
   process.execArgv.push(...parsed.execArgv);
@@ -1277,6 +1284,9 @@ function run() {
     const separator = native.argv.indexOf('--', 1);
     return internalRequire('internal/main/run').runPackageScript(runName, separator < 0 ? [] : native.argv.slice(separator + 1));
   }
+  // Only a TLS flag loads internal/tls/options, so a plain start skips the check.
+  const tlsConflict = moduleHas('internal/tls/options') && internalRequire('internal/tls/options').validate();
+  if (tlsConflict) return cliError(tlsConflict);
   if (watchMode && expression !== undefined) return cliError('either --watch or --eval can be used, not both');
   if (watchMode && check) return cliError('either --watch or --check can be used, not both');
   if (watchMode && interactive) return cliError('either --watch or --interactive can be used, not both');
