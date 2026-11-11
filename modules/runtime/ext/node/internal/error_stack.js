@@ -1,7 +1,6 @@
 'use strict';
 
 const host = require('internal/host');
-const sources = require('internal/source_maps');
 
 // Each realm owns its CallSite prototype. Shared ephemeron brands allow borrowed
 // CallSite methods and recaptured targets without retaining abandoned realms.
@@ -135,7 +134,8 @@ function install(global) {
     const rawMessage = error.message;
     const message = rawMessage === undefined ? '' : `${rawMessage}`;
     let result = name ? message ? name + ': ' + message : name : message;
-    const mapped = sources.getSourceMapsSupport().enabled;
+    const sources = host.builtinLoaded('internal/source_maps') ? require('internal/source_maps') : null;
+    const mapped = sources !== null && sources.getSourceMapsSupport().enabled;
     for (let index = 0; index < frames.length; index++) {
       if (!frames[index] && sites) {
         result += '\n    at ' + sites[index];

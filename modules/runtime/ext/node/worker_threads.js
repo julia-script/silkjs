@@ -3,17 +3,18 @@
 const host = require('internal/host');
 const EventEmitter = require('events');
 const { AsyncResource } = require('async_hooks');
-const { Readable, Writable } = require('stream');
 const { Buffer } = require('buffer');
-const path = require('path');
-const { URL, fileURLToPath } = require('url');
-const clone = require('internal/worker/clone');
-const ports = require('internal/worker/ports');
-const broadcast = require('internal/worker/broadcast');
-const messaging = require('internal/worker/messaging');
-const lockManager = require('internal/worker/locks');
-const profiles = require('internal/worker/profiles');
-const runtimeOptions = require('internal/options');
+// A main thread that never starts a worker needs none of these; each loads on first use.
+const lazy = name => { let loaded; return () => loaded ??= require(name); };
+const clone = lazy('internal/worker/clone');
+const ports = lazy('internal/worker/ports');
+const broadcast = lazy('internal/worker/broadcast');
+const messaging = lazy('internal/worker/messaging');
+const lockManager = lazy('internal/worker/locks');
+const runtimeOptions = lazy('internal/options');
+const path = lazy('path');
+let profilesModule;
+const profiles = () => profilesModule ??= require('internal/worker/profiles');
 const SHARE_ENV = Symbol.for('nodejs.worker_threads.SHARE_ENV');
 const workers = new Map();
 const workerStates = new WeakMap();
@@ -30,7 +31,7 @@ const info = host.workerNative('info', []);
 
 function workerState(worker) {
   const state = workerStates.get(worker);
-  if (!state) throw clone.codedError('ERR_INVALID_THIS', 'Value of this must be a Worker');
+  if (!state) throw clone().codedError('ERR_INVALID_THIS', 'Value of this must be a Worker');
   return state;
 }
 function controlSend(port, message) { if (port) port.postMessage(message); }
@@ -41,7 +42,7 @@ function controlRef(port, delta) {
 }
 function writableTo(port, fd, callbacks) {
   const pendingIds = new Set();
-  return new Writable({
+  return new (require('stream').Writable)({
     write(chunk, encoding, callback) {
       const id = ++stdioSequence;
       pendingIds.add(id);
@@ -59,7 +60,7 @@ function writableTo(port, fd, callbacks) {
       for (const id of pendingIds) {
         const pending = callbacks.get(id);
         callbacks.delete(id);
-        pending?.(error || clone.codedError('ERR_STREAM_DESTROYED', 'Worker stream was destroyed', Error));
+        pending?.(error || clone().codedError('ERR_STREAM_DESTROYED', 'Worker stream was destroyed', Error));
       }
       pendingIds.clear();
       callback(error);
@@ -68,7 +69,7 @@ function writableTo(port, fd, callbacks) {
 }
 function readableFrom(onRead) {
   const acks = [];
-  const stream = new Readable({
+  const stream = new (require('stream').Readable)({
     read() {
       onRead?.();
       while (acks.length) acks.shift()();
@@ -116,7 +117,7 @@ function resourceLimits(options) {
   const stack = options.stackSizeMb;
   if (typeof stack === 'number' && stack > 0) {
     if (!Number.isFinite(stack) || stack * 1048576 > Number.MAX_SAFE_INTEGER - 8388608 - 65535)
-      throw clone.codedError('ERR_OUT_OF_RANGE', 'The options.resourceLimits.stackSizeMb property exceeds the supported native stack size', RangeError);
+      throw clone().codedError('ERR_OUT_OF_RANGE', 'The options.resourceLimits.stackSizeMb property exceeds the supported native stack size', RangeError);
     limits.stackSizeMb = Math.max(0.1875, stack);
   }
   return limits;
@@ -131,26 +132,26 @@ function workerOptions(filename, options) {
   // Node validates the array containers before resolving the entry, but defers
   // execArgv string conversion until after environment/name/resource parsing.
   if (options.execArgv && !Array.isArray(options.execArgv))
-    throw clone.codedError('ERR_INVALID_ARG_TYPE', 'The options.execArgv property must be an Array');
+    throw clone().codedError('ERR_INVALID_ARG_TYPE', 'The options.execArgv property must be an Array');
   result.argv = [];
   if (options.argv) {
     if (!Array.isArray(options.argv))
-      throw clone.codedError('ERR_INVALID_ARG_TYPE', 'The options.argv property must be an Array');
+      throw clone().codedError('ERR_INVALID_ARG_TYPE', 'The options.argv property must be an Array');
     result.argv = Array.prototype.map.call(options.argv, String);
   }
   result.eval = !!options.eval;
   if (result.eval) {
-    if (typeof filename !== 'string') throw clone.codedError('ERR_INVALID_ARG_VALUE', 'The filename must be a string when options.eval is true');
+    if (typeof filename !== 'string') throw clone().codedError('ERR_INVALID_ARG_VALUE', 'The filename must be a string when options.eval is true');
     result.filename = filename;
   } else {
-    if (filename instanceof URL) {
+    if (filename instanceof require('url').URL) {
       if (filename.protocol === 'data:') result.filename = String(filename);
-      else filename = fileURLToPath(filename);
+      else filename = require('url').fileURLToPath(filename);
     }
     if (!result.filename) {
-      if (typeof filename !== 'string') throw clone.codedError('ERR_INVALID_ARG_TYPE', 'The filename argument must be a string or URL');
-      if (!path.isAbsolute(filename) && !filename.startsWith('./') && !filename.startsWith('../')) throw clone.codedError('ERR_WORKER_PATH', 'Worker filename must be an absolute path or a relative path starting with ./ or ../');
-      result.filename = path.resolve(filename);
+      if (typeof filename !== 'string') throw clone().codedError('ERR_INVALID_ARG_TYPE', 'The filename argument must be a string or URL');
+      if (!path().isAbsolute(filename) && !filename.startsWith('./') && !filename.startsWith('../')) throw clone().codedError('ERR_WORKER_PATH', 'Worker filename must be an absolute path or a relative path starting with ./ or ../');
+      result.filename = path().resolve(filename);
     }
   }
   result.shareEnv = false;
@@ -161,13 +162,13 @@ function workerOptions(filename, options) {
     for (const [key, value] of Object.entries(options.env)) Object.defineProperty(result.env, key, { value: optionString(value), enumerable: true, configurable: true, writable: true });
   } else if (options.env != null) {
     if (options.env !== SHARE_ENV)
-      throw clone.codedError('ERR_INVALID_ARG_TYPE', 'The options.env property must be an object or SHARE_ENV');
+      throw clone().codedError('ERR_INVALID_ARG_TYPE', 'The options.env property must be an object or SHARE_ENV');
     result.shareEnv = true;
   }
   result.name = 'WorkerThread';
   result.watchReportDependencies = require('internal/watch_mode/dependencies').enabled();
   if (options.name) {
-    if (typeof options.name !== 'string') throw clone.codedError('ERR_INVALID_ARG_TYPE', 'The options.name property must be a string');
+    if (typeof options.name !== 'string') throw clone().codedError('ERR_INVALID_ARG_TYPE', 'The options.name property must be a string');
     result.name = options.name.trim();
   }
   const execArgv = options.execArgv;
@@ -184,17 +185,17 @@ function workerOptions(filename, options) {
   if (explicitEnv || explicitExecArgv) {
     const value = (result.shareEnv ? process.env : result.env).NODE_OPTIONS || '';
     const errors = [];
-    environment = runtimeOptions.parseEnvironment(value, errors);
-    accepted = runtimeOptions.validateEnvironment(environment, errors);
+    environment = runtimeOptions().parseEnvironment(value, errors);
+    accepted = runtimeOptions().validateEnvironment(environment, errors);
     if (explicitEnv && value !== process.env.NODE_OPTIONS) {
       for (const arg of environment) {
         const name = arg.split('=', 1)[0];
-        if (runtimeOptions.processOption(name) && !/^--(?:no-)?expose-gc$/.test(name))
+        if (runtimeOptions().processOption(name) && !/^--(?:no-)?expose-gc$/.test(name))
           errors.push(new Error(name + ' is not allowed in NODE_OPTIONS'));
       }
     }
     if (explicitEnv && errors.length)
-      throw clone.codedError('ERR_WORKER_INVALID_EXEC_ARGV', errors.map(error => error.message).join(', '), Error);
+      throw clone().codedError('ERR_WORKER_INVALID_EXEC_ARGV', errors.map(error => error.message).join(', '), Error);
   }
   if (explicitExecArgv) {
     result.execArgv = new Array(execArgv.length);
@@ -202,8 +203,8 @@ function workerOptions(filename, options) {
   } else {
     result.execArgv = host.initialExecArgv.slice();
   }
-  try { runtimeOptions.validateWorker(result.execArgv, explicitExecArgv); }
-  catch (error) { throw clone.codedError('ERR_WORKER_INVALID_EXEC_ARGV', error.message, Error); }
+  try { runtimeOptions().validateWorker(result.execArgv, explicitExecArgv); }
+  catch (error) { throw clone().codedError('ERR_WORKER_INVALID_EXEC_ARGV', error.message, Error); }
   if (explicitEnv || explicitExecArgv) {
     result.runtimeArgs = environment.slice(0, accepted).concat(result.execArgv);
   } else {
@@ -223,9 +224,9 @@ class Worker extends EventEmitter {
   constructor(filename, options) {
     super();
     const config = workerOptions(filename, options);
-    const list = clone.transferList(config.options.transferList);
-    const userChannel = new ports.MessageChannel();
-    const controlChannel = new ports.MessageChannel();
+    const list = clone().transferList(config.options.transferList);
+    const userChannel = new (ports().MessageChannel)();
+    const controlChannel = new (ports().MessageChannel)();
     const state = { id: null, online: false, exited: false, exitCode: undefined, user: userChannel.port1,
       control: controlChannel.port1, resource: new AsyncResource('WORKER'),
       stdout: readableFrom(), stderr: readableFrom(), stdin: null,
@@ -243,9 +244,9 @@ class Worker extends EventEmitter {
       controlChannel.port1.postMessage({ workerData: config.options.workerData,
         environmentData: Array.from(environmentData), parentPort: userChannel.port2,
         options: config.metadata }, [userChannel.port2, ...list]);
-      state.id = host.workerNative('startWorker', [JSON.stringify(config.metadata), ports.id(controlChannel.port2), Math.floor(config.metadata.resourceLimits.stackSizeMb * 1048576), config.metadata.name]);
+      state.id = host.workerNative('startWorker', [JSON.stringify(config.metadata), ports().id(controlChannel.port2), Math.floor(config.metadata.resourceLimits.stackSizeMb * 1048576), config.metadata.name]);
       // Native ownership of this endpoint moved into the new isolate.
-      clone.commit({ moved: [controlChannel.port2] });
+      clone().commit({ moved: [controlChannel.port2] });
       workers.set(state.id, this);
     } catch (error) {
       for (const port of [userChannel.port1, userChannel.port2, controlChannel.port1, controlChannel.port2]) port.close();
@@ -262,14 +263,14 @@ class Worker extends EventEmitter {
   get stderr() { return workerState(this).stderr; }
   get resourceLimits() { const state = workerState(this); return state.exited ? {} : { ...state.metadata.resourceLimits }; }
   postMessage(value, transferList) {
-    if (arguments.length === 0) throw clone.codedError('ERR_MISSING_ARGS', 'The value argument must be specified');
+    if (arguments.length === 0) throw clone().codedError('ERR_MISSING_ARGS', 'The value argument must be specified');
     workerState(this).user.postMessage(value, transferList);
   }
   ref() { const state = workerState(this); if (!state.exited) { host.workerNative('workerRef', [state.id, true]); state.user.ref(); } return this; }
   unref() { const state = workerState(this); if (!state.exited) { host.workerNative('workerRef', [state.id, false]); state.user.unref(); } return this; }
   terminate(callback) {
     const state = workerState(this);
-    if (callback !== undefined && typeof callback !== 'function') throw clone.codedError('ERR_INVALID_ARG_TYPE', 'The callback argument must be a function');
+    if (callback !== undefined && typeof callback !== 'function') throw clone().codedError('ERR_INVALID_ARG_TYPE', 'The callback argument must be a function');
     if (!state.termination) state.termination = state.exited ? Promise.resolve(state.exitCode) : new Promise(resolve => {
       state.resolveTermination = resolve;
       host.workerNative('terminate', [state.id]);
@@ -277,27 +278,27 @@ class Worker extends EventEmitter {
     if (callback) state.termination.then(code => callback(null, code));
     return state.termination;
   }
-  getHeapSnapshot(options) { return profiles.getHeapSnapshot(workerStates.get(this), options, controlRef); }
-  getHeapStatistics() { return profiles.getHeapStatistics(workerStates.get(this), controlRef); }
-  startCpuProfile() { return profiles.startCpuProfile(workerStates.get(this), controlRef); }
-  startHeapProfile() { return profiles.startHeapProfile(workerStates.get(this), controlRef); }
+  getHeapSnapshot(options) { return profiles().getHeapSnapshot(workerStates.get(this), options, controlRef); }
+  getHeapStatistics() { return profiles().getHeapStatistics(workerStates.get(this), controlRef); }
+  startCpuProfile() { return profiles().startCpuProfile(workerStates.get(this), controlRef); }
+  startHeapProfile() { return profiles().startHeapProfile(workerStates.get(this), controlRef); }
   cpuUsage(prev) {
     // Node validates synchronously, even when the worker is already dead.
     if (prev) {
-      if (typeof prev !== 'object' || Array.isArray(prev)) throw clone.codedError('ERR_INVALID_ARG_TYPE', 'The prev argument must be an object');
+      if (typeof prev !== 'object' || Array.isArray(prev)) throw clone().codedError('ERR_INVALID_ARG_TYPE', 'The prev argument must be an object');
       for (const key of ['user', 'system']) {
         const value = prev[key];
-        if (typeof value !== 'number') throw clone.codedError('ERR_INVALID_ARG_TYPE', `The prev.${key} property must be a number`);
+        if (typeof value !== 'number') throw clone().codedError('ERR_INVALID_ARG_TYPE', `The prev.${key} property must be a number`);
         if (!(value >= 0 && value <= Number.MAX_SAFE_INTEGER))
-          throw clone.codedError('ERR_OUT_OF_RANGE', `The prev.${key} property must be >= 0 && <= ${Number.MAX_SAFE_INTEGER}`, RangeError);
+          throw clone().codedError('ERR_OUT_OF_RANGE', `The prev.${key} property must be >= 0 && <= ${Number.MAX_SAFE_INTEGER}`, RangeError);
       }
     }
     const state = workerStates.get(this);
-    if (!state || state.exited) return Promise.reject(clone.codedError('ERR_WORKER_NOT_RUNNING', 'Worker instance not running', Error));
+    if (!state || state.exited) return Promise.reject(clone().codedError('ERR_WORKER_NOT_RUNNING', 'Worker instance not running', Error));
     let usage;
     try { usage = host.workerNative('cpuUsage', [state.id]); }
-    catch (cause) { return Promise.reject(clone.codedError('ERR_OPERATION_FAILED', 'Unable to read worker CPU usage: ' + cause.message, Error)); }
-    if (usage === null) return Promise.reject(clone.codedError('ERR_WORKER_NOT_RUNNING', 'Worker instance not running', Error));
+    catch (cause) { return Promise.reject(clone().codedError('ERR_OPERATION_FAILED', 'Unable to read worker CPU usage: ' + cause.message, Error)); }
+    if (usage === null) return Promise.reject(clone().codedError('ERR_WORKER_NOT_RUNNING', 'Worker instance not running', Error));
     return Promise.resolve(usage).then(current => ({
       user: current.user - (prev ? prev.user : 0),
       system: current.system - (prev ? prev.system : 0),
@@ -307,32 +308,32 @@ class Worker extends EventEmitter {
 if (Symbol.asyncDispose) Worker.prototype[Symbol.asyncDispose] = async function() { await this.terminate(); };
 function setEnvironmentData(key, value) { if (value === undefined) environmentData.delete(key); else environmentData.set(key, value); }
 function getEnvironmentData(key) { return environmentData.get(key); }
-function receiveMessageOnPort(port) { return ports.receiveMessageOnPort(broadcast.portOf(port) || port); }
+function receiveMessageOnPort(port) { return ports().receiveMessageOnPort(broadcast().portOf(port) || port); }
 function poll() {
-  const profileActivity = profiles.poll();
+  const profileActivity = profilesModule ? profilesModule.poll() : false;
   const events = host.workerNative('poll', []);
   for (const event of events) {
-    if (event.type === 'threadMessage') { messaging.dispatch(event); continue; }
-    if (event.type === 'lock') { lockManager.dispatch(event); continue; }
-    if (event.type === 'message' || event.type === 'close') { ports.dispatch(event); continue; }
+    if (event.type === 'threadMessage') { messaging().dispatch(event); continue; }
+    if (event.type === 'lock') { lockManager().dispatch(event); continue; }
+    if (event.type === 'message' || event.type === 'close') { ports().dispatch(event); continue; }
     const worker = workers.get(event.worker);
     if (!worker) continue;
     const state = workerState(worker);
     if (event.type === 'online') {
-      profiles.online(state);
+      profiles().online(state);
       state.resource.runInAsyncScope(worker.emit, worker, 'online');
     }
     else if (event.type === 'exit' && !state.exited) {
       // Final control messages precede exit even if both wakeups coalesce.
       let message;
-      while ((message = ports.receiveMessageOnPort(state.control)) !== undefined) handleControl(worker, message.message);
-      while ((message = ports.receiveMessageOnPort(state.user)) !== undefined) state.resource.runInAsyncScope(worker.emit, worker, 'message', message.message);
+      while ((message = ports().receiveMessageOnPort(state.control)) !== undefined) handleControl(worker, message.message);
+      while ((message = ports().receiveMessageOnPort(state.user)) !== undefined) state.resource.runInAsyncScope(worker.emit, worker, 'message', message.message);
       // Native replies are enqueued before native exit; drain once more after
       // observing exit so a concurrent final reply wins over the dead-worker error.
-      profiles.poll();
+      profiles().poll();
       state.exited = true;
       state.exitCode = event.code;
-      profiles.exited(state);
+      profiles().exited(state);
       workers.delete(state.id);
       state.control.close();
       state.user.close();
@@ -342,7 +343,7 @@ function poll() {
       state.resolveTermination?.(event.code);
       try {
         if (event.initFailed && !state.errorReceived) state.resource.runInAsyncScope(worker.emit, worker, 'error',
-          clone.codedError('ERR_WORKER_INIT_FAILED', 'Worker initialization failed before becoming online', Error));
+          clone().codedError('ERR_WORKER_INIT_FAILED', 'Worker initialization failed before becoming online', Error));
         state.resource.runInAsyncScope(worker.emit, worker, 'exit', event.code);
       }
       finally { state.resource.emitDestroy(); }
@@ -353,8 +354,8 @@ function poll() {
 function bootstrap() {
   if (bootstrapResult !== undefined) return bootstrapResult;
   if (info.isMainThread) return bootstrapResult = null;
-  control = ports.wrap(info.controlPort);
-  const initial = ports.receiveMessageOnPort(control);
+  control = ports().wrap(info.controlPort);
+  const initial = ports().receiveMessageOnPort(control);
   if (!initial) throw new Error('Worker bootstrap envelope is missing');
   const data = initial.message;
   environmentData = new Map(data.environmentData);
@@ -390,7 +391,7 @@ function workerEnvironment() {
     },
     defineProperty(target, key, descriptor) {
       if (!('value' in descriptor) || !descriptor.configurable || !descriptor.enumerable || !descriptor.writable)
-        throw clone.codedError('ERR_INVALID_OBJECT_DEFINE_PROPERTY', 'process.env only accepts configurable, writable, enumerable data descriptors');
+        throw clone().codedError('ERR_INVALID_OBJECT_DEFINE_PROPERTY', 'process.env only accepts configurable, writable, enumerable data descriptors');
       host.workerNative('envSet', [String(key), String(descriptor.value)]); return true;
     },
   });
@@ -420,19 +421,19 @@ function install(proc = process, metadata = bootstrap()) {
   proc.openStdin = () => { proc.stdin.resume(); return proc.stdin; };
   proc.execArgv = metadata.execArgv;
   for (const method of ['chdir', 'abort', 'setuid', 'setgid', 'seteuid', 'setegid', 'setgroups', 'initgroups']) {
-    if (typeof proc[method] === 'function') proc[method] = () => { throw clone.codedError('ERR_WORKER_UNSUPPORTED_OPERATION', `process.${method}() is not supported in workers`, Error); };
+    if (typeof proc[method] === 'function') proc[method] = () => { throw clone().codedError('ERR_WORKER_UNSUPPORTED_OPERATION', `process.${method}() is not supported in workers`, Error); };
   }
   const umask = proc.umask;
   if (typeof umask === 'function') proc.umask = function(value) {
-    if (arguments.length) throw clone.codedError('ERR_WORKER_UNSUPPORTED_OPERATION', 'Setting process.umask() is not supported in workers', Error);
+    if (arguments.length) throw clone().codedError('ERR_WORKER_UNSUPPORTED_OPERATION', 'Setting process.umask() is not supported in workers', Error);
     return umask();
   };
   proc.exit = function(code = proc.exitCode || 0) {
     if (typeof code === 'string' && code.trim()) code = Number(code);
-    if (!Number.isInteger(code)) throw clone.codedError('ERR_INVALID_ARG_TYPE', 'The code argument must be an integer');
+    if (!Number.isInteger(code)) throw clone().codedError('ERR_INVALID_ARG_TYPE', 'The code argument must be an integer');
     proc.exitCode = code;
     if (!exitRequested) { exitRequested = true; proc.emit('exit', code); }
-    require('internal/compile_cache').flushCompileCache();
+    if (host.builtinLoaded('internal/compile_cache')) require('internal/compile_cache').flushCompileCache();
     host.workerNative('requestExit', [code]);
   };
   host.workerNative('online', []);
@@ -448,14 +449,29 @@ function reportError(error) {
 }
 module.exports = { isMainThread: !!info.isMainThread, isInternalThread: false,
   parentPort: null, workerData: null, threadId: info.threadId, threadName: null,
-  Worker, MessagePort: ports.MessagePort, MessageChannel: ports.MessageChannel,
-  BroadcastChannel: broadcast.BroadcastChannel, SHARE_ENV,
-  postMessageToThread: messaging.postMessageToThread, locks: lockManager.locks,
-  receiveMessageOnPort, moveMessagePortToContext: ports.moveMessagePortToContext,
-  markAsUntransferable: clone.markAsUntransferable,
-  isMarkedAsUntransferable: clone.isMarkedAsUntransferable,
-  markAsUncloneable: clone.markAsUncloneable, getEnvironmentData, setEnvironmentData,
+  Worker, MessagePort: undefined, MessageChannel: undefined,
+  BroadcastChannel: undefined, SHARE_ENV,
+  postMessageToThread: undefined, locks: undefined,
+  receiveMessageOnPort, moveMessagePortToContext: undefined,
+  markAsUntransferable: undefined,
+  isMarkedAsUntransferable: undefined,
+  markAsUncloneable: undefined, getEnvironmentData, setEnvironmentData,
   resourceLimits: {} };
+for (const [name, load] of [
+  ['MessagePort', () => ports().MessagePort], ['MessageChannel', () => ports().MessageChannel],
+  ['BroadcastChannel', () => broadcast().BroadcastChannel],
+  ['postMessageToThread', () => messaging().postMessageToThread], ['locks', () => lockManager().locks],
+  ['moveMessagePortToContext', () => ports().moveMessagePortToContext],
+  ['markAsUntransferable', () => clone().markAsUntransferable],
+  ['isMarkedAsUntransferable', () => clone().isMarkedAsUntransferable],
+  ['markAsUncloneable', () => clone().markAsUncloneable],
+]) {
+  Object.defineProperty(module.exports, name, {
+    enumerable: true, configurable: true,
+    get() { const value = load(); Object.defineProperty(module.exports, name, { value, writable: true, enumerable: true, configurable: true }); return value; },
+    set(value) { Object.defineProperty(module.exports, name, { value, writable: true, enumerable: true, configurable: true }); },
+  });
+}
 Object.defineProperties(module.exports, {
   _bootstrap: { value: bootstrap }, _install: { value: install }, _poll: { value: poll },
   _reportError: { value: reportError }, _exitRequested: { get: () => exitRequested },

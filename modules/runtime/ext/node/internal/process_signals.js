@@ -1,17 +1,22 @@
 'use strict';
 const host = require('internal/host');
 const { AsyncResource } = require('async_hooks');
-const signals = require('os').constants.signals;
+let signalTable;
+const signalNumbers = () => signalTable ??= require('os').constants.signals;
 function signalNumber(signal = 'SIGTERM') {
+  const signals = signalNumbers();
   if (typeof signal === 'string' && signals[signal.toUpperCase()] !== undefined) return signals[signal.toUpperCase()];
   if (Number.isInteger(signal) && signal >= 0 && signal <= 0x7fffffff) return signal;
   throw Object.assign(new TypeError(`Unknown signal: ${signal}`), { code: 'ERR_UNKNOWN_SIGNAL' });
 }
-function signalName(number) { return Object.keys(signals).find(name => signals[name] === number) || null; }
+function signalName(number) { const signals = signalNumbers(); return Object.keys(signals).find(name => signals[name] === number) || null; }
 function install(process) {
   const watchers = new Map();
   const add = name => {
-    if (typeof name !== 'string' || signals[name] === undefined || watchers.has(name)) return;
+    // Every signal name starts with SIG, so other events never load the table.
+    if (typeof name !== 'string' || !name.startsWith('SIG')) return;
+    const signals = signalNumbers();
+    if (signals[name] === undefined || watchers.has(name)) return;
     const resource = new AsyncResource('SIGNALWRAP');
     const id = host.processNative('signalStart', [signals[name], () => {
       host.invokeResource(resource, process.emit, process, [name, name], false);

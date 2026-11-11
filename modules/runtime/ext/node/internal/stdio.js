@@ -1,17 +1,14 @@
 'use strict';
 
 const host = require('internal/host');
-const { Writable } = require('stream');
 const { native, error: nativeError } = require('internal/net/transport');
-const { writeAll } = require('internal/tty/write');
-const fs = require('fs');
 
 function socket(fd, reading) {
   const owned = native('duplicateFd', [fd]);
   if (owned < 0) throw nativeError(owned, 'dup');
   let stream;
   try { stream = new (require('net').Socket)({ fd: owned, readable: reading, writable: !reading, manualStart: true }); }
-  catch (error) { fs.closeSync(owned); throw error; }
+  catch (error) { require('fs').closeSync(owned); throw error; }
   stream.fd = fd;
   stream._type = 'pipe';
   return stream;
@@ -32,7 +29,8 @@ function output(fd) {
   } else {
     // Regular files (and character devices such as /dev/null) use synchronous
     // writes on all platforms. Invalid descriptors report their real write error.
-    stream = new Writable({
+    const { writeAll } = require('internal/tty/write');
+    stream = new (require('internal/streams/writable'))({
       autoDestroy: false,
       emitClose: false,
       write(chunk, encoding, callback) {
@@ -65,7 +63,7 @@ function input() {
   } else if (kind === 1 || kind === 2) {
     stream = socket(0, true);
   } else {
-    stream = fs.createReadStream(undefined, { fd: 0, autoClose: false });
+    stream = require('fs').createReadStream(undefined, { fd: 0, autoClose: false });
     stream._type = 'fs';
     // Even an explicit close() must not transfer ownership of process fd 0.
     const destroy = stream._destroy;
@@ -114,8 +112,6 @@ function install(process) {
   // Explicit process.exit bypasses native state teardown. Restore terminal mode
   // here too; the shared net state handles normal completion and fatal teardown.
   process.on('exit', () => native('ttyResetMode', []));
-  host.stdout = process.stdout;
-  host.stderr = process.stderr;
 }
 
 module.exports = { install };

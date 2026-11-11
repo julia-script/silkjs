@@ -742,7 +742,7 @@ function createLoader(host, builtins) {
         ? host.compileFunction(Module.wrap(compiledSource), filename, undefined, undefined, true)
         : host.compileFunction(wrapperPrefix + compiledSource + wrapperSuffix, filename, compiledSource, wrapperPrefix.length);
       const metadata = host.getScriptMetadata(wrapper);
-      builtins.get('internal/source_maps').registerSource(filename, compiledSource, {
+      host.registerSource(filename, compiledSource, {
         owner: this, scriptId: metadata?.scriptId, sourceURL: metadata?.sourceURL ?? null, sourceMapURL: metadata?.sourceMapURL ?? null,
       });
       if (this === main && host.inspectorEntry) host.inspectorEntry(wrapper);
@@ -804,7 +804,10 @@ function createLoader(host, builtins) {
   };
   Module._initPaths();
   Module.findPackageJSON = findPackageJSON;
-  Module.stripTypeScriptTypes = builtins.get('internal/typescript').stripTypeScriptTypes;
+  Module.stripTypeScriptTypes = function stripTypeScriptTypes(code, options) {
+    return arguments.length < 2 ? builtins.get('internal/typescript').stripTypeScriptTypes(code)
+      : builtins.get('internal/typescript').stripTypeScriptTypes(code, options);
+  };
   Module.registerHooks = hooks.registerHooks;
   Module.register = hooks.register;
   Module.createRequire = filename => {
