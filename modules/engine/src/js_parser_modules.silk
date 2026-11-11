@@ -12,7 +12,8 @@ import silk.num.usize
 import js_heap { HeapCell, CellRef }
 import js_value { ValueBits }
 import js_core_types { RuntimeState, ModuleDef, linkedModule, ObjectData, SlotBits, ExportBinding,
-  ImportEntry, ClosureKind, VariableKind, FunctionKind, NativeFunctionId, JS_PROP_C_W_E, OwnedAtom }
+  ImportEntry, ClosureKind, VariableKind, FunctionKind, NativeFunctionId, JS_PROP_C_W_E, OwnedAtom,
+  RequestedModule, ShapeData }
 import js_compiler_types { ParseFunctionKind, ParseExportKind, CompilerError }
 import js_compiler_state as state
 import js_parser_core { Parser, ParserStackOverflow, PF_IN_ACCEPTED }
@@ -36,6 +37,7 @@ import js_bigint { BigIntError }
 import js_gc { HeapHooks }
 import js_gc as gc
 import js_shapes as shapes
+import js_strings { Strings }
 import js_object_allocate as objects
 import runtime_memory { AllocationObserver }
 import js_invariant { invariant }
@@ -186,8 +188,61 @@ effect fn parseWith<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'_>,
   // Empty `with {}` leaves attributes Undefined and never dispatches the host.
   run s.expect(125)
 }
+/// Whether two import attribute records hold the same keys and values. Each is
+/// Undefined (no attributes) or the parser's private null-prototype object of
+/// string data properties, which never has deleted records.
+unsafe fn sameAttributes(first: ValueBits, second: ValueBits) -> bool {
+  let a = match first { ValueBits.Object { reference } => reference _ => { return second.tag() == first.tag() } }
+  let b = match second { ValueBits.Object { reference } => reference _ => { return false } }
+  let anchor = ()
+  let x = unsafe HeapCell.payload<ObjectData, ()>(&anchor, a)
+  let y = unsafe HeapCell.payload<ObjectData, ()>(&anchor, b)
+  let count = unsafe shapes.recordCount(x.shape)
+  if count != unsafe shapes.recordCount(y.shape) { return false }
+  let records = unsafe HeapCell.payload<ShapeData, ()>(&anchor, x.shape)
+  let mut i: usize = 0
+  while i < count {
+    let found = unsafe shapes.lookup(y.shape, records.properties.get(i).atom)
+    let same = match found {
+      Option<usize>.Some { value } => Strings.equal(x.slot(i).valueBits(), y.slot(value).valueBits())
+      Option<usize>.None => false
+    }
+    if !same { return false }
+    i = i + 1
+  }
+  return true
+}
+/// A module's requests hold each (specifier, attributes, phase) once, like the
+/// spec's ModuleRequest records: when the request just parsed at index (always the
+/// last) equals an earlier one, it is dropped and the earlier index is returned.
+fn uniqueRequest<H: HeapHooks>(s: &Parser<'_>, hooks: &mut H, index: i32) -> i32 {
+  let module = modulePointer(s)
+  let mut anchor = ()
+  let m = module.getMut(&mut anchor)
+  let last = i32.toUsize(index)
+  let requests = m.requestedModules.asSlice()
+  let name = requests[last].name
+  let sourcePhase = requests[last].sourcePhase
+  let attributes = requests[last].attributes.view()
+  let mut i: usize = 0
+  while i < last {
+    if requests[i].name == name && requests[i].sourcePhase == sourcePhase && unsafe sameAttributes(requests[i].attributes.view(), attributes) { break }
+    i = i + 1
+  }
+  drop requests
+  if i == last { return index }
+  let mut removed = match m.requestedModules.pop() { Option<RequestedModule>.Some { value } => move value _ => invariant() }
+  drop m
+  let bits = Intrinsic.replace(removed.attributes, Value.immediate(ValueBits.Undefined)).intoBits()
+  drop removed
+  let mut ra = ()
+  let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut ra, s.runtimeCell())
+  rt.atoms.release(name) drop rt
+  unsafe gc.release(&mut hooks, s.runtimeCell(), bits)
+  return usize.toI32(i)
+}
 effect fn parseFrom<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'_>,
-  hooks: &mut H, memory: &AllocationObserver) -> i32
+  hooks: &mut H, memory: &AllocationObserver, sourcePhase: bool) -> i32
   ! OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException ? &mut Allocator {
   if !support.pseudoKeyword(&s.*, atoms.JS_ATOM_from) { return run s.syntax<i32>(b"from clause expected") }
   run s.advance()
@@ -196,8 +251,14 @@ effect fn parseFrom<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'_>,
   run s.advance()
   let index = run addRequested(&s.*, name.get())
   drop name
+  if sourcePhase {
+    let mut anchor = ()
+    let m = modulePointer(&s.*).getMut(&mut anchor)
+    let requests = m.requestedModules.asMutSlice()
+    requests[i32.toUsize(index)].sourcePhase = true
+  }
   if s.token.kind == tok.TOK_WITH { run parseWith(&mut s, &mut hooks, memory, index) }
-  return index
+  return uniqueRequest(&s.*, &mut hooks, index)
 }
 effect fn parseExport<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'_>,
   hooks: &mut H, memory: &AllocationObserver) -> ()
@@ -242,7 +303,7 @@ effect fn parseExport<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'_>,
     }
     run s.expect(125)
     if support.pseudoKeyword(&s.*, atoms.JS_ATOM_from) {
-      let requested = run parseFrom(&mut s, &mut hooks, memory)
+      let requested = run parseFrom(&mut s, &mut hooks, memory, false)
       let countAnchor = ()
       let current = modulePointer(&s.*).get(&countAnchor)
       let count = current.exports.length()
@@ -256,11 +317,11 @@ effect fn parseExport<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'_>,
       if !support.tokenIsIdent(s.token.kind) { return run s.syntax<()>(b"identifier expected") }
       let exportName = support.ownedToken(&mut s)
       run s.advance()
-      let requested = run parseFrom(&mut s, &mut hooks, memory)
+      let requested = run parseFrom(&mut s, &mut hooks, memory, false)
       let added = run addExport(&mut s, atoms.JS_ATOM__star_, exportName.get(), ExportKind.Indirect)
       setIndirect(&s.*, added, requested)
     } else {
-      let requested = run parseFrom(&mut s, &mut hooks, memory)
+      let requested = run parseFrom(&mut s, &mut hooks, memory, false)
       let mut anchor = ()
       let m = modulePointer(&s.*).getMut(&mut anchor)
       let _added = run metadata.addStarExport(&mut m, requested)
@@ -322,6 +383,7 @@ effect fn parseImport<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'_>,
     requested = run addRequested(&s.*, name.get())
     drop name
     if s.token.kind == tok.TOK_WITH { run parseWith(&mut s, &mut hooks, memory, requested) }
+    requested = uniqueRequest(&s.*, &mut hooks, requested)
   } else {
     let mut ended = false
     if s.token.kind == tok.TOK_IDENT {
@@ -386,14 +448,10 @@ effect fn parseImport<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'_>,
         run s.expect(125)
       }
     }
-    requested = run parseFrom(&mut s, &mut hooks, memory)
+    requested = run parseFrom(&mut s, &mut hooks, memory, sourcePhase)
   }
   let mut updateAnchor = ()
   let updated = module.getMut(&mut updateAnchor)
-  if sourcePhase {
-    let requests = updated.requestedModules.asMutSlice()
-    requests[i32.toUsize(requested)].sourcePhase = true drop requests
-  }
   let mut index = first
   while index < updated.imports.length() {
     let mut entry = updated.imports.get(index)

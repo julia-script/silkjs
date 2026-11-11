@@ -424,6 +424,21 @@ function sleep(msec) {
   require('internal/util/binding').sleep(msec);
 }
 
+function getConstructorOf(obj) {
+  while (obj) {
+    const descriptor = ObjectGetOwnPropertyDescriptor(obj, 'constructor');
+    if (descriptor !== undefined &&
+        typeof descriptor.value === 'function' &&
+        descriptor.value.name !== '') {
+      return descriptor.value;
+    }
+
+    obj = ObjectGetPrototypeOf(obj);
+  }
+
+  return null;
+}
+
 module.exports = {
   assertCrypto,
   sleep,
@@ -435,6 +450,7 @@ module.exports = {
   emitExperimentalWarning,
   filterDuplicateStrings,
   encodingsMap,
+  getConstructorOf,
   getDeprecationWarningEmitter,
   getLazy,
   getSystemErrorName,

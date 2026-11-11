@@ -25,7 +25,7 @@
 'use strict';
 
 const {
-  codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_MISSING_ARGS, ERR_OUT_OF_RANGE, ERR_SOCKET_BAD_PORT, ERR_UNKNOWN_SIGNAL },
+  codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_INVALID_THIS, ERR_MISSING_ARGS, ERR_OUT_OF_RANGE, ERR_SOCKET_BAD_PORT, ERR_UNKNOWN_SIGNAL },
 } = require('internal/errors');
 
 function isInt32(value) {
@@ -197,10 +197,15 @@ function checkRangesOrGetDefault(number, name, lower, upper, def) {
   }
   return number;
 }
+function validateThisInternalField(object, fieldKey, className) {
+  if (typeof object !== 'object' || object === null || !Object.prototype.hasOwnProperty.call(object, fieldKey)) {
+    throw new ERR_INVALID_THIS(className);
+  }
+}
 // Node wraps its validators in hideStackFrames(), whose callers inside other
 // hidden frames use fn.withoutStackTrace.
 for (const fn of [validateString, validateBoolean, validateFunction, validateNumber, validateInteger, validateInt32,
-  validateUint32, validateObject, validateArray, validateOneOf, validateAbortSignal, validateBuffer]) {
+  validateUint32, validateObject, validateArray, validateOneOf, validateAbortSignal, validateBuffer, validateThisInternalField]) {
   fn.withoutStackTrace = fn;
 }
 
@@ -210,7 +215,7 @@ module.exports = {
   kValidateObjectAllowNullable, kValidateObjectAllowArray, kValidateObjectAllowFunction,
   kValidateObjectAllowObjects, kValidateObjectAllowObjectsAndNull,
   validateString, validateBoolean, validateFunction, validateNumber, validateInteger, validateInt32,
-  validateUint32, validateObject, validateArray, validateOneOf, validateAbortSignal,
+  validateUint32, validateObject, validateArray, validateOneOf, validateAbortSignal, validateThisInternalField,
   isUint32, parseFileMode, validateBuffer, validateLinkHeaderValue,
   convertToValidSignal, signalName, toPathIfFileURL, validatePath, getValidatedPath, validatePort,
   validateFiniteNumber, checkRangesOrGetDefault,
