@@ -18,6 +18,8 @@ function op(...args) {
 // (onhandshakedone) and _onTLSError (onerror).
 class TLSTransport {
   constructor(socket, carrier, context, options, owned) {
+    // As TLSWrap's constructor, a handle made without a socket wraps no session.
+    if (socket === undefined) { this.id = 0; this.closed = true; this.closing = true; return; }
     this.socket = socket; this.carrier = carrier; this.options = options;
     this.kind = carrier._transport?.kind || 1; this.closed = false; this.closing = false;
     this.reading = true; this.ready = false; this.selecting = false; this.pumping = false;

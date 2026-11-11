@@ -22,7 +22,10 @@ const kBindings = {
   // node_http_parser.cc: HTTPParser, ConnectionsList, methods, allMethods.
   http_parser: () => require('internal/http/native-parser'),
   util: () => require('internal/util/binding'),
+  // inspector_agent.cc: registerAsyncHook and the asyncTask* calls.
+  inspector: () => require('internal/inspector_async'),
   timers: () => require('internal/timers_binding'),
+  tls_wrap: () => require('internal/tls/binding'),
   uv: () => require('internal/uv_binding'),
   tcp_wrap: () => net().tcp_wrap,
   pipe_wrap: () => net().pipe_wrap,

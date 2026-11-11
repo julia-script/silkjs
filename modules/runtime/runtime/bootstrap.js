@@ -6,6 +6,10 @@ const rawOS = { ...osNamespace };
 
 const native = globalThis.__silkNative;
 delete globalThis.__silkNative;
+// Every exit path ends here. Node's exit handler stops and joins every worker
+// before exit(): libc exit handlers (OpenSSL's cleanup among them) must not tear
+// down shared native state while a worker thread still runs.
+rawStd.exit = code => { native.workerNative('stopThreads', []); stdNamespace.exit(code); };
 const factories = new Map();
 const modules = new Map();
 const realmSources = new Map();
@@ -1426,9 +1430,7 @@ function run() {
     installCommonJSInputGlobals(name, '[eval]');
     armInspectorEntry();
     // As in Node, the script is named [eval] while module.filename is under the cwd.
-    const result = native.compileFunction(code, '[eval]', undefined, undefined, undefined, true);
-    if (print) console.log(result);
-    return afterMain(result);
+    return afterMain(internalRequire('internal/process/execution').evalScript('[eval]', code, print));
   }
   if (filename === undefined || filename === '-') {
     let source = rawStd.in.readAsString();
@@ -1441,9 +1443,7 @@ function run() {
     }
     installCommonJSInputGlobals(name, '[stdin]');
     armInspectorEntry();
-    const result = native.compileFunction(source, '[stdin]', undefined, undefined, undefined, true);
-    if (print) console.log(result);
-    return afterMain(result);
+    return afterMain(internalRequire('internal/process/execution').evalScript('[stdin]', source, print));
   }
   const path = host.path.resolve(filename);
   process.argv[1] = path;
@@ -1570,7 +1570,8 @@ function loop() {
 }
 const imageModules = ['fs', 'fs/promises', 'internal/fs_streams', 'internal/fs_utf8_stream', 'path', 'os',
   'events', 'stream', 'stream/promises', 'string_decoder', 'util', 'assert', 'console', 'net', 'tty',
-  'internal/tty/write', 'url', 'internal/web/url', 'internal/web/encoding', 'internal/abort_controller'];
+  'internal/tty/write', 'url', 'internal/web/url', 'internal/web/encoding', 'internal/abort_controller',
+  'internal/process/execution'];
 globalThis.__silkRuntime = {
   normalize(name, parent, attributes) { return loader.importKey(name, parent, attributes); },
   load(name, attributes) { return loader.loadESM(name, attributes).source; },

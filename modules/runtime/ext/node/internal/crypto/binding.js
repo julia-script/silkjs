@@ -864,6 +864,8 @@ module.exports = {
   secureHeapUsed: () => call('secureHeapUsed', []),
   setEngine: (id, flags) => call('setEngine', [id, flags]),
   timingSafeEqual: (a, b) => timingSafe(a, b),
+  addBlockedSPKIForTesting: hash => require('internal/tls/context').addBlockedSPKIForTesting(hash),
+  clearBlockedSPKIsForTesting: () => require('internal/tls/context').clearBlockedSPKIsForTesting(),
 
   // Runtime internals for internal/crypto/keys and crypto.js.
   createHandle,
