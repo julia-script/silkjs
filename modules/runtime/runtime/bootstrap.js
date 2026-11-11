@@ -897,6 +897,7 @@ const requirePreloads = [], importPreloads = [], loaderPreloads = [];
 function runPreloads(entry, loadImports = true) {
   // Before any preload: Node applies it when the context is made.
   if (host.disableProto !== undefined) disableProto(globalThis);
+  if (host.disallowCodeGeneration) native.vmSetCodeGeneration(undefined, false);
   // --experimental-loader: each one is module.register(specifier, cwd) before any preload.
   if (loadImports && loaderPreloads.length) {
     const base = internalRequire('url').pathToFileURL(host.cwd() + host.path.sep).href;
@@ -974,6 +975,22 @@ function runtimeFlag(arg) {
     }
     host.disableProto = mode; return true;
   }
+  // Read before the bootstrap runs (worker.silk snapshotWanted): without a snapshot the
+  // start skips the heap image and runs the bootstrap itself.
+  if (arg === '--node-snapshot' || arg === '--no-node-snapshot') return true;
+  // Node maps its code to large pages on request; this binary does not, which Node
+  // reports as its ENOTSUP result (src/large_pages/node_large_page.cc).
+  if (arg.startsWith('--use-largepages=')) {
+    const mode = arg.slice(17);
+    if (mode !== 'off' && mode !== 'on' && mode !== 'silent') { cliError('invalid value for --use-largepages'); return true; }
+    if (mode === 'on') host.writeStartupDiagnostic(process.execPath + ': Mapping to large pages is not supported.\n');
+    return true;
+  }
+  // V8's flag: eval and new Function throw EvalError in the main realm.
+  if (arg === '--disallow-code-generation-from-strings') { host.disallowCodeGeneration = true; return true; }
+  // V8 frees ArrayBuffer backing stores on a concurrent thread unless told not to; this
+  // engine frees them when they are collected, so the flag already holds.
+  if (arg === '--no-concurrent-array-buffer-sweeping') return true;
   // V8's flag to run without a JIT: this engine is an interpreter, so it always holds.
   if (arg === '--jitless') return true;
   // Buffer.allocUnsafe memory is always zeroed here, which is what this flag asks for.
@@ -990,6 +1007,7 @@ function runtimeFlag(arg) {
   }
   if (arg === '--experimental-import-meta-resolve') { host.importMetaResolveParent = true; return true; }
   if (arg === '--experimental-print-required-tla') { host.printRequiredTLA = true; return true; }
+  if (arg === '--experimental-import-text') { host.importText = true; return true; }
   if (arg.startsWith('--experimental-loader=') || arg.startsWith('--loader=')) {
     loaderPreloads.push(arg.slice(arg.indexOf('=') + 1)); return true;
   }
@@ -1099,7 +1117,7 @@ function runWorker() {
       const name = host.path.join(host.cwd(), '[worker eval]');
       installCommonJSInputGlobals(name, '[worker eval]');
       armInspectorEntry();
-      return native.compileFunction(workerSource, name, undefined, undefined, undefined, true);
+      return native.compileFunction(workerSource, '[worker eval]', undefined, undefined, undefined, true);
     }
     if (filename.startsWith('data:')) {
       const loaded = loader.loadESM(filename);
@@ -1380,7 +1398,7 @@ function run() {
     }
     installCommonJSInputGlobals(name, '[eval]');
     armInspectorEntry();
-    // As in Node, the script itself is named [eval]; module.filename keeps the cwd path.
+    // As in Node, the script is named [eval] while module.filename is under the cwd.
     const result = native.compileFunction(code, '[eval]', undefined, undefined, undefined, true);
     if (print) console.log(result);
     return afterMain(result);
@@ -1546,7 +1564,13 @@ globalThis.__silkRuntime = {
     meta.main = mainModuleName !== undefined && url === asURL(mainModuleName);
     meta.resolve = function resolve(specifier, parent) {
       // Only --experimental-import-meta-resolve gives the second argument meaning.
-      const from = host.importMetaResolveParent && parent !== undefined ? String(parent) : name;
+      let from = name;
+      if (host.importMetaResolveParent && parent !== undefined) {
+        // Node's throwIfInvalidParentURL.
+        if (typeof parent !== 'string' && !(parent instanceof internalRequire('url').URL))
+          throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('parentURL', ['string', 'URL'], parent);
+        from = String(parent);
+      }
       // As in Node, a file that is missing (or a directory) still resolves to its URL.
       try { return asURL(loader.resolve(specifier, from, 'import').filename); }
       catch (error) {
