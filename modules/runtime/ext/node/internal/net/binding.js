@@ -459,8 +459,6 @@ class Pipe extends NativeStreamHandle {
     return this._call('chmod', (mode & PipeConstants.UV_READABLE) !== 0, (mode & PipeConstants.UV_WRITABLE) !== 0);
   }
   setPendingInstances() {}
-  getsockname(out) { const r = this._address(out, false); return r; }
-  getpeername(out) { const r = this._address(out, true); return r; }
 }
 Pipe.SOCKET = 0;
 Pipe.SERVER = 1;
