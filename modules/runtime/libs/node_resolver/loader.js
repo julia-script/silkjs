@@ -1282,6 +1282,13 @@ function createLoader(host, builtins) {
     get(filename) {
       const resolved = resolutions.get(filename) || (filename.startsWith('node:')
         ? { filename, format: 'builtin' } : { filename, format: format(filename, 'require') });
+      // As in Node, an imported JSON file shares require.cache only when its URL has no
+      // query or hash: each of those is a module of its own.
+      if (resolved.format === 'json' && /^file:[^?#]*[?#]/.test(resolved.filename)) {
+        const loaded = pendingLoads.get(filename) || loadSource(resolved, undefined, hooks.hasAsync(), 'import');
+        pendingLoads.delete(filename);
+        return JSON.parse(String(loaded.source).replace(/^\uFEFF/, ''));
+      }
       return loadResolved(resolved, null, false, hooks.hasAsync());
     },
   });
@@ -1377,7 +1384,8 @@ function createLoader(host, builtins) {
       resolutions.set(resolved.filename, resolved);
       source = bridgeSource(resolved.filename, resolved.format === 'commonjs' ? commonJSNames(resolved.filename, new Set(), loaded.source) : [], resolved.format === 'commonjs');
     }
-    else throw error('ERR_UNKNOWN_FILE_EXTENSION', `Native addons cannot be imported directly: ${resolved.filename}`);
+    else if (resolved.format === 'addon') throw error('ERR_UNKNOWN_FILE_EXTENSION', `Native addons cannot be imported directly: ${resolved.filename}`);
+    else throw unknownFormat(resolved.format, path.isAbsolute(resolved.filename) ? fileURL(resolved.filename) : resolved.filename);
     return { source, format: resolved.format, filename: resolved.filename };
   }
 
