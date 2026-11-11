@@ -4,7 +4,7 @@ const host = require('internal/host');
 const { EventTarget, Event, DOMException } = require('internal/path_events/event_target');
 const { createHistogram, createSlidingWindowHistogram, importHistogram, monitorEventLoopDelay, isRecordableHistogram } = require('internal/performance_histogram');
 const trace = require('internal/trace_events');
-const { codes: { ERR_INVALID_ARG_TYPE } } = require('internal/errors');
+const { codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_MISSING_ARGS } } = require('internal/errors');
 const { validateFunction, validateObject } = require('internal/validators');
 const token = Symbol('Performance');
 const entries = new WeakMap();
@@ -201,19 +201,22 @@ class PerformanceObserver {
   #mode;
   #records = [];
   constructor(callback) {
-    if (typeof callback !== 'function') throw error('ERR_INVALID_ARG_TYPE', 'callback must be a function');
+    validateFunction(callback, 'callback');
     this.#callback = callback;
   }
+  // Validation and messages as Node's lib/internal/perf/observe.js.
   observe(options = {}) {
-    object(options, 'options');
-    const { entryTypes, type, buffered } = options;
-    if (entryTypes === undefined && type === undefined) throw error('ERR_MISSING_ARGS', 'options.entryTypes or options.type is required');
-    if (entryTypes != null && type != null) throw error('ERR_INVALID_ARG_VALUE', 'entryTypes and type cannot both be set');
+    validateObject(options, 'options');
+    const { entryTypes, type, buffered } = { ...options };
+    if (entryTypes === undefined && type === undefined) throw new ERR_MISSING_ARGS('options.entryTypes', 'options.type');
+    if (entryTypes != null && type != null)
+      throw new ERR_INVALID_ARG_VALUE('options.entryTypes', entryTypes, 'options.entryTypes can not set with options.type together');
     const mode = entryTypes !== undefined ? 'multiple' : 'single';
-    if (this.#mode !== undefined && this.#mode !== mode) throw new DOMException('PerformanceObserver cannot change observation mode', 'InvalidModificationError');
+    if (this.#mode !== undefined && this.#mode !== mode)
+      throw new DOMException(`PerformanceObserver can not change to ${mode} observation${mode === 'multiple' ? 's' : ''}`, 'InvalidModificationError');
     this.#mode = mode;
     if (mode === 'multiple') {
-      if (!Array.isArray(entryTypes)) throw error('ERR_INVALID_ARG_TYPE', 'options.entryTypes must be an array');
+      if (!Array.isArray(entryTypes)) throw new ERR_INVALID_ARG_TYPE('options.entryTypes', 'string[]', entryTypes);
       this.#types = new Set(entryTypes.filter(value => supportedTypes.includes(value)));
     } else {
       if (!supportedTypes.includes(type)) return;
@@ -223,9 +226,9 @@ class PerformanceObserver {
         pending.add(this); scheduleDelivery();
       }
     }
-    if (this.#types.size) observers.add(this); else this.disconnect();
+    if (this.#types.size) { observers.add(this); countObservers(); } else this.disconnect();
   }
-  disconnect() { observers.delete(this); pending.delete(this); this.#records = []; this.#types.clear(); this.#mode = undefined; }
+  disconnect() { observers.delete(this); pending.delete(this); this.#records = []; this.#types.clear(); this.#mode = undefined; countObservers(); }
   takeRecords() { const records = this.#records; this.#records = []; return records; }
   [observesType](type) { return this.#types.has(type); }
   static get supportedEntryTypes() { return supportedTypes; }
@@ -378,12 +381,26 @@ internalEntries.observing = (type) => {
   return false;
 };
 internalEntries.emit = (name, type, start, duration, detail) => emitNodeEntry(name, type, start - startTime, duration, detail);
-const constants = Object.freeze({
-  NODE_PERFORMANCE_GC_MAJOR: 4, NODE_PERFORMANCE_GC_MINOR: 1, NODE_PERFORMANCE_GC_INCREMENTAL: 8, NODE_PERFORMANCE_GC_WEAKCB: 16,
+// As Node's binding: per Node entry type, how many observers watch it (observerCounts).
+const nodeEntryTypes = ['gc', 'http', 'http2', 'net', 'dns'];
+function countObservers() {
+  const counts = internalEntries.observerCounts;
+  for (let index = 0; index < nodeEntryTypes.length; index++) {
+    let count = 0;
+    for (const observer of observers) if (observer[observesType](nodeEntryTypes[index])) count++;
+    counts[index] = count;
+  }
+}
+const constants = {
+  NODE_PERFORMANCE_GC_MAJOR: 4, NODE_PERFORMANCE_GC_MINOR: 1, NODE_PERFORMANCE_GC_MINOR_MARK_SWEEP: 2, NODE_PERFORMANCE_GC_INCREMENTAL: 8, NODE_PERFORMANCE_GC_WEAKCB: 16,
   NODE_PERFORMANCE_GC_FLAGS_NO: 0, NODE_PERFORMANCE_GC_FLAGS_CONSTRUCT_RETAINED: 2, NODE_PERFORMANCE_GC_FLAGS_FORCED: 4,
   NODE_PERFORMANCE_GC_FLAGS_SYNCHRONOUS_PHANTOM_PROCESSING: 8, NODE_PERFORMANCE_GC_FLAGS_ALL_AVAILABLE_GARBAGE: 16,
   NODE_PERFORMANCE_GC_FLAGS_ALL_EXTERNAL_MEMORY: 32, NODE_PERFORMANCE_GC_FLAGS_SCHEDULE_IDLE: 64
-});
+};
+// Node defines the entry type indexes as hidden (non-enumerable) constants.
+for (let index = 0; index < nodeEntryTypes.length; index++)
+  Object.defineProperty(constants, `NODE_PERFORMANCE_ENTRY_TYPE_${nodeEntryTypes[index].toUpperCase()}`, { value: index, enumerable: false });
+Object.freeze(constants);
 module.exports = { Performance, PerformanceEntry, PerformanceMark, PerformanceMeasure, PerformanceObserver, PerformanceObserverEntryList,
   PerformanceResourceTiming, monitorEventLoopDelay, createHistogram, createSlidingWindowHistogram, importHistogram,
   eventLoopUtilization, timerify, performance, constants };
