@@ -38,8 +38,19 @@ function defineLazy(target, name, load, enumerable) {
   Object.defineProperty(target, name, { get, set, enumerable, configurable: true });
 }
 
+// Modules every process has loaded anyway (the heap image holds them): their
+// interfaces are plain data properties from the start, as Node's are.
+const eagerGroups = new Set(['internal/web/encoding', 'internal/web/url']);
+
 function install(target) {
   for (const [id, names] of groups) {
+    if (eagerGroups.has(id)) {
+      const exports = require(id);
+      for (const name of names) {
+        Object.defineProperty(target, name, { value: exports[name], writable: true, enumerable: enumerableGlobals.has(name), configurable: true });
+      }
+      continue;
+    }
     let exports;
     const load = () => exports || (exports = require(id));
     for (const name of names) defineLazy(target, name, load, enumerableGlobals.has(name));
