@@ -1525,7 +1525,13 @@ globalThis.__silkRuntime = {
     meta.main = mainModuleName !== undefined && url === asURL(mainModuleName);
     meta.resolve = function resolve(specifier, parent) {
       // Only --experimental-import-meta-resolve gives the second argument meaning.
-      const from = host.importMetaResolveParent && parent !== undefined ? String(parent) : name;
+      let from = name;
+      if (host.importMetaResolveParent && parent !== undefined) {
+        // Node's throwIfInvalidParentURL.
+        if (typeof parent !== 'string' && !(parent instanceof internalRequire('url').URL))
+          throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('parentURL', ['string', 'URL'], parent);
+        from = String(parent);
+      }
       // As in Node, a file that is missing (or a directory) still resolves to its URL.
       try { return asURL(loader.resolve(specifier, from, 'import').filename); }
       catch (error) {

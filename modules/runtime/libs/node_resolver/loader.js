@@ -336,7 +336,9 @@ function createLoader(host, builtins) {
     return null;
   }
 
-  function strictFile(filename, specifier, parent, mode, suffix, isMain) {
+  // pkg: the package whose "exports" or "imports" mapped the request. A require of a
+  // missing target then fails like Node's createEsmNotFoundErr: the file, no stack.
+  function strictFile(filename, specifier, parent, mode, suffix, isMain, pkg) {
     if (isDirectory(filename)) {
       if (mode === 'import') {
         // Node names the directory as resolved, keeping the specifier's trailing slash.
@@ -345,7 +347,10 @@ function createLoader(host, builtins) {
       }
       throw missing(specifier, parent, mode);
     }
-    if (!isFile(filename)) throw missing(specifier, parent, mode, filename);
+    if (!isFile(filename)) {
+      if (pkg && mode !== 'import') throw notFound(`Cannot find module '${filename}'`, { path: pkg.filename });
+      throw missing(specifier, parent, mode, filename);
+    }
     return descriptor(filename, mode, suffix, isMain);
   }
 
@@ -472,7 +477,7 @@ function createLoader(host, builtins) {
       const targetResult = packageTarget(pkg, target, replacement, match, pattern, internal, parent, mode, seen);
       if (targetResult !== null && targetResult !== undefined) {
         if (targetResult.external) return resolveInternal(targetResult.external, targetResult.parent, mode, undefined, seen, isMain);
-        return strictFile(targetResult.filename, request, parent, mode, targetResult.suffix, isMain);
+        return strictFile(targetResult.filename, request, parent, mode, targetResult.suffix, isMain, pkg);
       }
     }
     if (internal) throw error('ERR_PACKAGE_IMPORT_NOT_DEFINED', request, packagePath(pkg), parent);
