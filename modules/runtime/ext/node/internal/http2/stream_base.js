@@ -10,7 +10,7 @@
 const { Buffer } = require('buffer');
 const { clearTimeout, setTimeout } = require('timers');
 const { UV_EOF } = require('internal/http2/binding');
-const { ErrnoException, codes: { ERR_OUT_OF_RANGE } } = require('internal/http2/errors');
+const { ErrnoException, codes: { ERR_OUT_OF_RANGE } } = require('internal/errors');
 const { validateFunction, validateNumber } = require('internal/validators');
 
 const kMaybeDestroy = Symbol('kMaybeDestroy');

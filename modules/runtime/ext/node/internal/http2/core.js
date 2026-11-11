@@ -25,7 +25,7 @@ const {
   SymbolDispose,
   Uint32Array,
   Uint8Array,
-} = require('internal/http2/primordials');
+} = require('internal/per_context/primordials');
 
 // silkjs: Node's internal/util helpers the module uses.
 const kInspect = Symbol.for('nodejs.util.inspect.custom');
@@ -116,7 +116,7 @@ const {
     ERR_SOCKET_CLOSED,
   },
   hideStackFrames,
-} = require('internal/http2/errors');
+} = require('internal/errors');
 const {
   isUint32,
   validateAbortSignal,

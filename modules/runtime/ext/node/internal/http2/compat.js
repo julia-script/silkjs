@@ -12,7 +12,7 @@ const {
   Proxy,
   ReflectGetPrototypeOf,
   Symbol,
-} = require('internal/http2/primordials');
+} = require('internal/per_context/primordials');
 
 const assert = require('assert');
 const Stream = require('stream');
@@ -47,7 +47,7 @@ const {
     ERR_STREAM_WRITE_AFTER_END,
   },
   hideStackFrames,
-} = require('internal/http2/errors');
+} = require('internal/errors');
 const {
   validateFunction,
   validateString,

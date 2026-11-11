@@ -15,7 +15,7 @@ const {
   String,
   StringFromCharCode,
   Symbol,
-} = require('internal/http2/primordials');
+} = require('internal/per_context/primordials');
 
 const {
   _checkIsHttpToken: checkIsHttpToken,
@@ -38,7 +38,7 @@ const {
   getMessage,
   hideStackFrames,
   kIsNodeError,
-} = require('internal/http2/errors');
+} = require('internal/errors');
 
 const kAuthority = Symbol('authority');
 const kSensitiveHeaders = Symbol('sensitiveHeaders');
