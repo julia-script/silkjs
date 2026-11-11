@@ -101,14 +101,61 @@ impl Copy for ImageRoots {}
 unsafe fn rootsAt(image: ?*mut u8) -> *mut ImageRoots {
   return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ImageRoots>(unsafe heap_image.roots(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(image)))
 }
-unsafe effect fn heap(workers: *mut worker_native.State, region: ?*mut u8, image: ?*mut u8) -> RuntimeHeap ! OutOfMemoryError ? &mut Allocator {
+/// How an image build lays out its heap (RuntimeAllocator.placeForImage), from the
+/// arguments `--silk-write-heap-image PATH LAYOUT probe|pack`: LAYOUT holds the
+/// allocation ids, as little-endian words in increasing order, of the blocks a start
+/// writes. tools/build.py finds them with SILKJS_HEAP_IMAGE_PROFILE (profileImage).
+struct ImageLayout { placed: bool, hot: ?*mut u64, count: usize, probe: bool }
+impl Copy for ImageLayout {}
+fn imageLayout(arguments: &List<Bytes>) -> ImageLayout {
+  let mut layout = ImageLayout { placed: false, hot: Pointer.null<u64>(), count: 0, probe: false }
+  if arguments.length() != 5 { return layout }
+  let mode = arguments.asSlice()[4].asSlice()
+  if !same(mode, b"probe") && !same(mode, b"pack") {
+    let _reported = platform.writeAll(2, b"silkjsruntime: the heap image layout mode is probe or pack\n")
+    unsafe leave(1)
+  }
+  if !unsafe heap_image.mapWords(arguments.asSlice()[3].asSlice(), Pointer.fromMutRef<?*mut u64>(&mut layout.hot), Pointer.fromMutRef<usize>(&mut layout.count)) {
+    let _reported = platform.writeAll(2, b"silkjsruntime: unable to read the heap image layout\n")
+    unsafe leave(1)
+  }
+  layout.placed = true
+  layout.probe = same(mode, b"probe")
+  return layout
+}
+unsafe effect fn heap(workers: *mut worker_native.State, region: ?*mut u8, image: ?*mut u8, layout: ImageLayout) -> RuntimeHeap ! OutOfMemoryError ? &mut Allocator {
   let mut child = unsafe worker_native.reportingAllocator(workers)
   if !Pointer.isNull<u8>(image) { return unsafe RuntimeAllocator.adopt(move child, (unsafe Pointer.read<ImageRoots>(unsafe rootsAt(image))).ledger) }
   if !Pointer.isNull<u8>(region) { child.buildImage(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(region)) }
   let mut allocator = run RuntimeAllocator.make(move child)
   // The reporting child only watches for failure, so small blocks can be pooled.
   allocator.enablePooling()
+  if layout.placed { unsafe allocator.placeForImage(layout.hot, layout.count, layout.probe) }
   return move allocator
+}
+@foreign(noCapture: .("name"))
+unsafe extern "C" fn getenv(name: *const u8) -> ?*mut u8
+/// With SILKJS_HEAP_IMAGE_PROFILE set, a start from the image writes to the file it
+/// names the allocation ids of the image blocks on the pages the start wrote, as
+/// little-endian words, for tools/build.py to lay out the next image by.
+unsafe fn profileImage(memory: &AllocationObserver, image: ?*mut u8) -> () {
+  let path = unsafe getenv(Pointer.fromRef<u8>(&b"SILKJS_HEAP_IMAGE_PROFILE\0"[0]))
+  if Pointer.isNull<u8>(path) { return () }
+  let base = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(image)
+  let pagemap = unsafe heap_image.openPageMap()
+  let out = unsafe heap_image.create(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(path))
+  if pagemap < 0 || out < 0 { let _reported = platform.writeAll(2, b"silkjsruntime: unable to profile the heap image\n") return () }
+  let length = unsafe heap_image.length(base)
+  let mut ids: [u64; 256] = [0; 256]
+  let mut offset: usize = 0
+  while offset < length {
+    if unsafe heap_image.written(pagemap, offset) {
+      let start = Pointer.address<u8>(base) + offset
+      let count = unsafe memory.imageIds(start, start + 4096, Pointer.fromMutRef<u64>(&mut ids[0]), 256)
+      if !unsafe heap_image.writeWords(out, Pointer.fromMutRef<u64>(&mut ids[0]), count) { let _reported = platform.writeAll(2, b"silkjsruntime: unable to write the heap image profile\n") return () }
+    }
+    offset = offset + 4096
+  }
 }
 unsafe effect fn observer(allocator: &RuntimeHeap, image: ?*mut u8) -> AllocationObserver ! OutOfMemoryError {
   if !Pointer.isNull<u8>(image) { return unsafe allocator.adoptedObserver() }
@@ -132,7 +179,8 @@ unsafe effect fn writeImage<'m>(engine: &mut Engine<'m, Services>, rt: *mut Heap
   let sealed = run promise.call(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(seal), unsafe lendFor(ValueBits.Undefined), &[])
   unsafe gc.release(&mut engine, rt, sealed.intoBits())
   unsafe gc.release(&mut engine, rt, seal)
-  let anchor = () let heap = unsafe Pointer.borrow<(), RuntimeHeap>(&anchor, allocator)
+  let mut anchor = () let heap = unsafe Pointer.borrowMut<(), RuntimeHeap>(&mut anchor, allocator)
+  heap.finishImage()
   let ledger = heap.ledgerPointer() drop heap
   let wasm = unsafe Intrinsic.pointerRequalify<?*mut wasm_native.State, *mut wasm_native.State>(engine.services.wasm)
   unsafe Pointer.write<ImageRoots>(unsafe rootsAt(region), ImageRoots {
@@ -542,11 +590,12 @@ unsafe effect fn runtimeBody(workers: *mut worker_native.State, arguments: &List
   // Only the main thread's runtime starts from a heap image, or builds one.
   let mut region = Pointer.null<u8>() let mut image = Pointer.null<u8>()
   if exiting {
-    if arguments.length() == 3 && same(arguments.asSlice()[1].asSlice(), b"--silk-write-heap-image") { region = unsafe heap_image.begin() }
+    if (arguments.length() == 3 || arguments.length() == 5) && same(arguments.asSlice()[1].asSlice(), b"--silk-write-heap-image") { region = unsafe heap_image.begin() }
     else if usable(arguments) { image = unsafe heap_image.load() }
   }
   let restored = !Pointer.isNull<u8>(image)
-  let mut allocator = run unsafe heap(workers, region, image)
+  let layout = if Pointer.isNull<u8>(region) { ImageLayout { placed: false, hot: Pointer.null<u64>(), count: 0, probe: false } } else { imageLayout(arguments) }
+  let mut allocator = run unsafe heap(workers, region, image, layout)
   let memory = run unsafe observer(&allocator, image)
   let allocatorPointer = Pointer.fromMutRef<RuntimeHeap>(&mut allocator)
   let rt = run unsafe runtimeFor(image, process) |> Effect.provideMut<Allocator>(&mut allocator)
@@ -562,6 +611,7 @@ unsafe effect fn runtimeBody(workers: *mut worker_native.State, arguments: &List
     unsafe runtime.setInterruptHandler(rt, HostHook { callback: Option<NativeFunctionId>.some(NativeFunctionId.Host { id: 6098 }), opaque: Pointer.null<u8>() })
   }
   let executed = run Effect.result(unsafe realm(&mut engine, rt, arguments, process, allocatorPointer, region, image)) |> Effect.provideMut<Allocator>(&mut allocator)
+  if restored { unsafe profileImage(engine.memory, image) }
   let allocationProfile = engine.memory.stopProfile()
   drop allocationProfile
   // Addon finalizers are observable and run when the heap is destroyed; every other
@@ -601,9 +651,10 @@ unsafe effect fn executeRuntime(workers: *mut worker_native.State, arguments: &L
   }
 }
 pub effect fn executeProgram(arguments: &List<Bytes>) -> i32 ! OutOfMemoryError | SynchronizationError ? &mut Allocator {
-  // As Node does: a write to a closed pipe fails with EPIPE, which the stream reports,
-  // instead of ending the process. Children start with every signal at its default.
-  static if Intrinsic.targetOperatingSystem() != "windows" { let _ignored = unsafe signal(13, 1) }
+  // As Node does: a write to a closed pipe fails with EPIPE, which the stream reports, and a
+  // write past RLIMIT_FSIZE fails with EFBIG (SIGXFSZ is 25 on Linux and macOS), instead of
+  // ending the process. Children start with every signal at its default.
+  static if Intrinsic.targetOperatingSystem() != "windows" { let _ignored = unsafe signal(13, 1) let _ignoredFileSize = unsafe signal(25, 1) }
   let namespace = run ClassIdAllocator.make()
   let process = run Process.make(&namespace)
   let domain = run WaiterDomain.make()

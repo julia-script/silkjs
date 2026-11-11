@@ -8,21 +8,25 @@ function fail(code, message, Type = TypeError) {
 function contextObject(value, name) {
   if (value === null || typeof value !== 'object') throw fail('ERR_INVALID_ARG_TYPE', `The "${name}" argument must be an object`);
 }
-function validate(kind, result, advanced, asynchronous) {
+// Node's ERR_INVALID_RETURN_PROPERTY_VALUE: "<loader url> '<hook>'" names a module.register() hook.
+function badProperty(expected, hook, property, value) {
+  const { ERR_INVALID_RETURN_PROPERTY_VALUE } = require('internal/errors').codes;
+  return new ERR_INVALID_RETURN_PROPERTY_VALUE(expected, hook, property, value);
+}
+function validate(kind, result, advanced, asynchronous, url) {
   if (!asynchronous && result == null) throw new TypeError(`The "${kind}" hook must return an object`);
   if (result === null || typeof result !== 'object' || typeof result.then === 'function') {
     throw fail(asynchronous ? 'ERR_INVALID_RETURN_VALUE' : 'ERR_INVALID_RETURN_PROPERTY_VALUE', `Expected an object to be returned from the "${kind}" hook`);
   }
   if (!advanced && result.shortCircuit !== true) throw fail(asynchronous ? 'ERR_LOADER_CHAIN_INCOMPLETE' : 'ERR_INVALID_RETURN_PROPERTY_VALUE', `"${kind}" did not call the next hook in its chain and did not explicitly signal a short circuit`, asynchronous ? Error : TypeError);
-  if (kind === 'resolve' && typeof result.url !== 'string') throw fail('ERR_INVALID_RETURN_PROPERTY_VALUE', 'Expected a URL string for "url" from the resolve hook');
+  const hook = url === undefined ? kind : `${url} '${kind}'`;
+  if (kind === 'resolve' && (typeof result.url !== 'string' || !URL.canParse(result.url))) throw badProperty('a URL string', hook, 'url', result.url);
   if (kind === 'resolve') {
-    try { new URL(result.url); }
-    catch (_) { throw fail('ERR_INVALID_RETURN_PROPERTY_VALUE', 'Expected an absolute URL for "url" from the resolve hook'); }
     if (result.importAttributes !== undefined) contextObject(result.importAttributes, 'importAttributes');
   }
-  if (result.format !== undefined && result.format !== null && typeof result.format !== 'string') throw fail('ERR_INVALID_RETURN_PROPERTY_VALUE', 'Expected a string for "format" from the hook');
+  if (result.format !== undefined && result.format !== null && typeof result.format !== 'string') throw badProperty('a string', hook, 'format', result.format);
   if (kind === 'load') {
-    if (typeof result.format !== 'string') throw fail('ERR_INVALID_RETURN_PROPERTY_VALUE', 'Expected a string for "format" from the load hook');
+    if (typeof result.format !== 'string') throw badProperty('a string', hook, 'format', result.format);
     const source = result.source;
     if (source != null && typeof source !== 'string' && !(source instanceof ArrayBuffer) && !(typeof SharedArrayBuffer !== 'undefined' && source instanceof SharedArrayBuffer) && !ArrayBuffer.isView(source)) {
       throw fail('ERR_INVALID_RETURN_PROPERTY_VALUE', 'Expected a string, ArrayBuffer or typed array for "source" from the load hook');
@@ -42,7 +46,7 @@ function chain(records, kind, input, context, terminal, asynchronous) {
       return dispatch(index - 1, nextValue, { ...current, ...nextContext });
     };
     const result = hooks[index][kind](value, current, next);
-    return asynchronous ? Promise.resolve(result).then(value => validate(kind, value, advanced, true)) : validate(kind, result, advanced, false);
+    return asynchronous ? Promise.resolve(result).then(value => validate(kind, value, advanced, true, hooks[index].url)) : validate(kind, result, advanced, false);
   }
   return dispatch(hooks.length - 1, input, context);
 }
@@ -102,10 +106,10 @@ function createHooks(defaultResolve, defaultLoad, getThreads, awaitHook, workerS
     hasAsync: () => remote !== undefined || (local && asynchronous.length !== 0),
     inWorker: () => local,
     enterWorker() { local = true; },
-    async addAsync(namespace, data) {
+    async addAsync(namespace, data, url) {
       for (const name of ['resolve', 'load', 'initialize']) if (namespace[name] !== undefined && typeof namespace[name] !== 'function') throw fail('ERR_INVALID_ARG_TYPE', `The hook export "${name}" must be a function`);
       if (namespace.initialize) await namespace.initialize(data);
-      asynchronous.push({ resolve: namespace.resolve, load: namespace.load });
+      asynchronous.push({ resolve: namespace.resolve, load: namespace.load, url });
     },
   };
 }

@@ -5,6 +5,7 @@ const { Readable } = require('stream');
 const assert = require('assert');
 const { MockTracker } = require('internal/test_runner/mock');
 const host = require('internal/host');
+const { codes: { ERR_INVALID_ARG_TYPE }, validateObject, validateString, validateFunction, validateNumber, validateInteger, validateAbortSignal } = require('internal/validators');
 const context = new AsyncLocalStorage();
 const nativeSetTimeout = globalThis.setTimeout;
 const nativeClearTimeout = globalThis.clearTimeout;
@@ -19,24 +20,114 @@ function failure(message, failureType = 'testCodeFailure', cause) {
 function invalid(message) { return Object.assign(new TypeError(message), { code: 'ERR_INVALID_ARG_VALUE' }); }
 function unsupported(name) { throw Object.assign(new Error(`${name} is not supported by the Silk test runner`), { code: 'ERR_NOT_SUPPORTED' }); }
 function deferred() { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; }
+const TIMEOUT_MAX = 2 ** 31 - 1;
+function invalidValue(name, value, reason) {
+  const kind = name.includes('.') || name.includes('[') ? 'property' : 'argument';
+  return Object.assign(new TypeError(`The ${kind} '${name}' ${reason}. Received ${require('util').inspect(value)}`), { code: 'ERR_INVALID_ARG_VALUE' });
+}
+const kEmptyTags = Object.freeze([]);
+let warnedTags = false;
+function tagFilter(value, name) {
+  validateString(value, name);
+  if (value.length === 0) throw invalidValue(name, value, 'must not be empty');
+  return value.toLowerCase();
+}
+// Tags are lowercased and deduplicated in declaration order.
+function canonicalTags(tags, name) {
+  if (!Array.isArray(tags)) throw new ERR_INVALID_ARG_TYPE(name, 'Array', tags);
+  if (tags.length === 0) return kEmptyTags;
+  if (!warnedTags) { warnedTags = true; process.emitWarning('Test tags is an experimental feature and might change at any time', 'ExperimentalWarning'); }
+  const result = [];
+  for (let i = 0; i < tags.length; i++) {
+    const tag = tagFilter(tags[i], `${name}[${i}]`);
+    if (!result.includes(tag)) result.push(tag);
+  }
+  return Object.freeze(result);
+}
+function validateConcurrency(value, name) {
+  if (value == null || typeof value === 'boolean') return;
+  if (typeof value !== 'number') throw new ERR_INVALID_ARG_TYPE(name, ['boolean', 'number'], value);
+  validateInteger(value, name, 1, 4294967295);
+}
+function validateTimeout(value, name) {
+  if (value != null && value !== Infinity) validateNumber(value, name, 0, TIMEOUT_MAX);
+}
 function parse(args) {
   let [name, options, fn] = args;
-  if (typeof name === 'function') { fn = name; name = fn.name; options = {}; }
-  else if (name && typeof name === 'object') { fn = options; options = name; name = fn?.name; }
-  else if (typeof options === 'function') { fn = options; options = {}; }
-  options ??= {};
-  if (name === undefined) name = fn?.name || '<anonymous>';
-  if (typeof name !== 'string') throw invalid('name must be a string');
-  if (!options || typeof options !== 'object') throw invalid('options must be an object');
-  if (fn !== undefined && typeof fn !== 'function') throw invalid('fn must be a function');
-  if (options.timeout !== undefined && (typeof options.timeout !== 'number' || options.timeout < 0 || Number.isNaN(options.timeout))) throw invalid('timeout must be a non-negative number');
-  if (options.concurrency !== undefined && typeof options.concurrency !== 'boolean' && (!Number.isInteger(options.concurrency) || options.concurrency < 1)) throw invalid('concurrency must be a positive integer or boolean');
-  if (options.signal !== undefined && typeof options.signal?.addEventListener !== 'function') throw invalid('signal must be an AbortSignal');
+  if (typeof name === 'function') { fn = name; name = undefined; options = undefined; }
+  else if (name !== null && typeof name === 'object') { fn = options; options = name; name = undefined; }
+  else if (typeof options === 'function') { fn = options; options = undefined; }
+  if (options == null) options = {};
+  validateObject(options, 'options');
+  if (typeof name !== 'string' || name === '') name = fn?.name || '<anonymous>';
+  if (fn !== undefined && typeof fn !== 'function') throw new ERR_INVALID_ARG_TYPE('fn', 'function', fn);
+  validateTimeout(options.timeout, 'options.timeout');
+  validateConcurrency(options.concurrency, 'options.concurrency');
+  validateAbortSignal(options.signal, 'options.signal');
   for (const key of ['only', 'skip', 'todo']) if (options[key] !== undefined && typeof options[key] !== 'boolean' && (key === 'only' || typeof options[key] !== 'string')) throw invalid(`${key} has an invalid type`);
-  for (const key of ['tags', 'expectFailure']) if (options[key] !== undefined) unsupported(`test option ${key}`);
-  return { name, options, fn: fn || function() {} };
+  const tags = options.tags === undefined ? kEmptyTags : canonicalTags(options.tags, 'options.tags');
+  return { name, options, fn: fn || function() {}, tags };
 }
-function pattern(value) { return value === undefined ? [] : (Array.isArray(value) ? value : [value]).map(item => item instanceof RegExp ? item : new RegExp(item)); }
+function parseExpectFailure(value) {
+  if (value === undefined || value === false) return false;
+  if (typeof value === 'string') return { label: value, match: undefined };
+  if (typeof value === 'function' || value instanceof RegExp) return { label: undefined, match: value };
+  if (value === null || typeof value !== 'object') return { label: undefined, match: undefined };
+  const keys = Object.keys(value);
+  if (keys.length === 0) throw invalidValue('options.expectFailure', value, 'must not be an empty object');
+  if (keys.every(key => key === 'match' || key === 'label')) return { label: value.label, match: value.match };
+  return { label: undefined, match: value };
+}
+// An expected failure passes when the test fails (with a matching error, when given)
+// and fails when the test passes.
+function settleExpectedFailure(node) {
+  const expectation = node.expectFailure;
+  if (!node.error) {
+    node.error = failure('test was expected to fail but passed', 'expectedFailure');
+    return;
+  }
+  if (expectation.match !== undefined) {
+    const error = node.error;
+    const actual = error?.code === 'ERR_TEST_FAILURE' && error.failureType === 'testCodeFailure' && error.cause ? error.cause : error;
+    try { assert.throws(() => { throw actual; }, expectation.match); }
+    catch (mismatch) {
+      node.error = failure('The test failed, but the error did not match the expected validation', 'testCodeFailure', mismatch);
+      return;
+    }
+  }
+  node.error = undefined;
+}
+// --test-global-setup / options.globalSetupPath: a module exporting globalSetup and
+// globalTeardown, run once around the whole run.
+async function loadGlobalHooks(globalSetupPath, cwd) {
+  validateString(globalSetupPath, 'options.globalSetupPath');
+  const { pathToFileURL } = require('url');
+  const loaded = await import(pathToFileURL(require('path').resolve(cwd, globalSetupPath)).href);
+  const hooks = {};
+  if (loaded.globalSetup) { validateFunction(loaded.globalSetup, 'globalSetupModule.globalSetup'); hooks.setup = loaded.globalSetup; }
+  if (loaded.globalTeardown) { validateFunction(loaded.globalTeardown, 'globalSetupModule.globalTeardown'); hooks.teardown = loaded.globalTeardown; }
+  return hooks;
+}
+function reportSetupFailure(error) {
+  process.exitCode = 1;
+  process.stderr.write(`${error?.stack ?? error}\n`);
+}
+function createRandomSeed() { return Math.floor(Math.random() * 0x1_0000_0000); }
+// Mulberry32, as Node's test runner uses for --test-randomize.
+function seededGenerator(seed) {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6D2B79F5) | 0;
+    let value = Math.imul(state ^ state >>> 15, 1 | state);
+    value ^= value + Math.imul(value ^ value >>> 7, 61 | value);
+    return ((value ^ value >>> 14) >>> 0) / 4_294_967_296;
+  };
+}
+function stringPattern(text) {
+  const match = /^\/(.*)\/([a-z]*)$/s.exec(text);
+  return match ? new RegExp(match[1], match[2]) : new RegExp(text);
+}
+function pattern(value) { return value == null ? [] : (Array.isArray(value) ? value : [value]).map(item => item instanceof RegExp ? item : stringPattern(item)); }
 function matches(patterns, name) { return patterns.some(re => { re.lastIndex = 0; return re.test(name); }); }
 function testMatches(patterns, node) {
   for (let current = node; current?.parent; current = current.parent) {
@@ -44,7 +135,13 @@ function testMatches(patterns, node) {
   }
   return false;
 }
+function settledCount(node) {
+  let count = 0;
+  for (const child of node.children) count += (child.state === 'done') + settledCount(child);
+  return count;
+}
 function visibleChildren(node) { return node.children.filter(child => !child.filtered && (!child.nameFiltered || child.error)); }
+const taggedEvents = new Set(['test:enqueue', 'test:dequeue', 'test:start', 'test:pass', 'test:fail', 'test:complete']);
 class TestsStream extends Readable {
   constructor() { super({ objectMode: true, read() {} }); }
   publish(type, data) { this.emit(type, data); this.push({ type, data }); }
@@ -91,6 +188,11 @@ class TestContext {
   get filePath() { return this._node.file; }
   get signal() { return this._node.controller.signal; }
   get mock() { return this._node.mock ||= new MockTracker(); }
+  get error() { return this._node.error ?? null; }
+  get passed() { return this._node.passed === true; }
+  get attempt() { return 0; }
+  get tags() { return this._node.tags; }
+  get workerId() { return Number(process.env.NODE_TEST_WORKER_ID) || undefined; }
   get assert() {
     if (!this._assert) {
       const plan = this._node.plan;
@@ -109,7 +211,9 @@ class TestContext {
   _count() { this._node.plan?.count(); }
   test(...args) {
     this._count();
-    const node = this._node.harness.add('test', parse(args), this._node);
+    const spec = parse(args);
+    spec.loc = callerLocation();
+    const node = this._node.harness.add('test', spec, this._node);
     return this._node.type === 'suite' ? Promise.resolve() : node.done.promise;
   }
   before(fn, options) { this._hook('before', fn, options); }
@@ -122,7 +226,7 @@ class TestContext {
     if (type === 'before' && this._node.state === 'running') this._node.harness.hooks(this._node, type).catch(error => this._node.cancel(error));
   }
   diagnostic(message) { (this._node.diagnostics ||= []).push(String(message)); }
-  skip(message) { this._node.skip = message === undefined ? true : String(message) || true; }
+  skip(message) { if (this._node.state === 'running') this._node.runtimeSkip = true; this._node.skip = message === undefined ? true : String(message) || true; }
   todo(message) { this._node.todo = message === undefined ? true : String(message) || true; }
   runOnly(value) { if (typeof value !== 'boolean') throw invalid('runOnly requires a boolean'); this._node.runOnly = value; }
   plan(count, options = {}) {
@@ -130,10 +234,11 @@ class TestContext {
     this._node.plan = new AssertionPlan(count, options);
   }
   waitFor(condition, options = {}) {
-    if (typeof condition !== 'function') throw invalid('condition must be a function');
-    const interval = options.interval ?? 50;
-    const timeout = options.timeout ?? 1000;
-    if (!Number.isFinite(interval) || interval < 0 || !Number.isFinite(timeout) || timeout < 0) throw invalid('Invalid waitFor timing');
+    validateFunction(condition, 'condition');
+    validateObject(options, 'options');
+    const { interval = 50, timeout = 1000 } = options;
+    validateNumber(interval, 'options.interval', 0, TIMEOUT_MAX);
+    validateNumber(timeout, 'options.timeout', 0, TIMEOUT_MAX);
     return new Promise((resolve, reject) => {
       let poller;
       let cause;
@@ -159,11 +264,15 @@ class TestNode {
     this.controller = new AbortController(); this.done = deferred(); this.cancelled = deferred(); this.state = 'pending';
     this.skip = spec.options.skip === '' ? true : spec.options.skip;
     this.todo = spec.options.todo === '' ? true : spec.options.todo; this.only = !!spec.options.only;
+    this.expectFailure = parseExpectFailure(spec.options.expectFailure) || parent?.expectFailure || false;
     this.runOnly = parent?.runOnly ?? !!harness.options.only;
     this.nesting = parent ? parent.nesting + 1 : -1;
     this.fullName = parent?.parent ? `${parent.fullName} > ${this.name}` : this.name;
     this.filterName = parent?.parent ? `${parent.filterName} ${this.name}` : this.name;
-    this.file = parent && parent.type !== 'root' ? parent.file : harness.file; this.ctx = new TestContext(this); this.active = 0;
+    const own = spec.tags || kEmptyTags;
+    const inherited = parent?.tags || kEmptyTags;
+    this.tags = inherited.length === 0 ? own : own.length === 0 ? inherited : Object.freeze([...new Set([...inherited, ...own])]);
+    this.file = parent && parent.type !== 'root' ? parent.file : harness.file; this.loc = spec.loc; this.ctx = new TestContext(this); this.active = 0;
   }
   cancel(error) {
     if (this.state === 'done') return;
@@ -176,7 +285,9 @@ class Harness {
   constructor(options = {}) {
     this.options = options; this.stream = new TestsStream(); this.file = options.file;
     this.names = pattern(options.testNamePatterns); this.skips = pattern(options.testSkipPatterns);
-    this.root = new TestNode(this, 'root', { name: '', options, fn() {} }, null);
+    this.randomSeed = options.randomSeed ?? (options.randomize ? createRandomSeed() : undefined);
+    this.tagFilters = options.testTagFilters == null ? [] : [options.testTagFilters].flat().map((value, i) => tagFilter(value, `options.testTagFilters[${i}]`));
+    this.root = new TestNode(this, 'root', { name: '<root>', options, fn() {} }, null);
     this.root.state = 'collecting'; this.started = false; this.finished = false;
     this.counts = { tests: 0, suites: 0, passed: 0, failed: 0, cancelled: 0, skipped: 0, todo: 0, topLevel: 0 };
     this.success = true;
@@ -193,8 +304,12 @@ class Harness {
   }
   emit(type, node, extra = {}) {
     if (this.finished) return;
-    this.stream.publish(type, { name: node.name, nesting: node.nesting, file: node.file,
-      testId: node.id, parentId: node.parent?.id, ...extra });
+    const data = { name: node.name, nesting: node.nesting, file: node.file, testId: node.id, parentId: node.parent?.id, ...extra };
+    if (taggedEvents.has(type)) {
+      if (node.loc) { data.line = node.loc.line; data.column = node.loc.column; data.file = node.loc.file; }
+      data.tags = [...node.tags];
+    }
+    this.stream.publish(type, data);
   }
   enqueue(node) {
     if (!node.parent || node.enqueued || node.nameFiltered) return;
@@ -205,7 +320,8 @@ class Harness {
   add(type, spec, parent = this.root) {
     const node = new TestNode(this, type, spec, parent);
     parent.children.push(node);
-    node.nameFiltered = (this.names.length > 0 && !testMatches(this.names, node)) || testMatches(this.skips, node);
+    node.nameFiltered = (this.names.length > 0 && !testMatches(this.names, node)) || testMatches(this.skips, node) ||
+      (this.tagFilters.length > 0 && !this.tagFilters.every(tag => node.tags.includes(tag)));
     if (!node.nameFiltered) {
       for (let ancestor = parent; ancestor.parent; ancestor = ancestor.parent) ancestor.nameFiltered = false;
       this.enqueue(node);
@@ -223,28 +339,49 @@ class Harness {
         node.build = Promise.resolve(result).catch(error => { node.error = failure(String(error?.message ?? error), 'testCodeFailure', error); });
       } catch (error) { node.error = failure(String(error?.message ?? error), 'testCodeFailure', error); node.build = Promise.resolve(); }
     }
-    if (parent.state === 'running') this.pump(parent);
+    // Under randomize, siblings declared in the same turn all take part in the first draw.
+    if (parent.state === 'running') {
+      if (this.randomSeed === undefined) this.pump(parent);
+      else queueMicrotask(() => { if (parent.state === 'running') this.pump(parent); });
+    }
     return node;
   }
   pump(parent) {
     let owner = parent;
-    while (owner.parent && owner.options.concurrency === undefined) owner = owner.parent;
+    while (owner.parent && owner.options.concurrency == null) owner = owner.parent;
     const configured = owner.options.concurrency ?? this.options.concurrency ?? 1;
     const limit = configured === true ? Infinity : configured === false ? 1 : configured;
-    for (const child of parent.children) {
+    for (;;) {
       if (parent.active >= limit) break;
-      if (child.scheduled) continue;
+      const child = this.nextChild(parent);
+      if (!child) break;
       child.scheduled = true; parent.active++;
       this.execute(child).catch(error => { child.error ||= failure(String(error?.message ?? error), 'testCodeFailure', error); if (child.state !== 'done') this.finish(child, now()); }).finally(() => { parent.active--; if (parent.state === 'running') this.pump(parent); });
       this.flush(this.root);
     }
+  }
+  // Children start in declaration order or, with randomize, in seeded random order. A
+  // started child moves up to the end of the started prefix, so reports follow start order.
+  nextChild(parent) {
+    const started = parent.startedCount ??= 0;
+    const pending = parent.children.length - started;
+    if (pending <= 0) return undefined;
+    let index = started;
+    if (this.randomSeed !== undefined && pending > 1) {
+      parent.random ??= seededGenerator(this.randomSeed);
+      index = started + Math.floor(parent.random() * pending);
+    }
+    const [child] = parent.children.splice(index, 1);
+    parent.children.splice(started, 0, child);
+    parent.startedCount = started + 1;
+    return child;
   }
   async invoke(fn, node, options = {}) {
     let timer;
     const timeout = options.timeout;
     let result;
     try {
-      const task = context.run(node, () => {
+      const task = context.run(options.owner ?? node, () => {
         if (fn.length < 2) return Promise.resolve(Reflect.apply(fn, node.ctx, [node.ctx]));
         return new Promise((resolve, reject) => {
           let calls = 0;
@@ -277,9 +414,9 @@ class Harness {
               const scope = Object.create(target); scope.cancelled = deferred(); scope.error = undefined;
               const onIdle = () => { scope.error = failure('cleanup is pending after the event loop resolved', 'testUnfinished'); scope.cancelled.resolve(); };
               process.on('beforeExit', onIdle);
-              try { await this.invoke(hook.fn, scope, { timeout: target.options.timeout ?? this.options.timeout, ...hook.options }); }
+              try { await this.invoke(hook.fn, scope, { timeout: target.options.timeout ?? this.options.timeout, ...hook.options, owner: node }); }
               finally { process.removeListener('beforeExit', onIdle); }
-            } else await this.invoke(hook.fn, target, hook.options);
+            } else await this.invoke(hook.fn, target, { ...hook.options, owner: node });
           };
           if (once) hook.promise = run();
           else { await run(); continue; }
@@ -335,7 +472,16 @@ class Harness {
         } else {
           await this.invoke(node.fn, node);
           await this.hooks(node, 'before');
-          // Unawaited subtests cannot outlive their parent test.
+          // Unawaited subtests cannot outlive their parent test. Node starts a subtest
+          // synchronously, so one that needs no I/O or timer has finished by now there:
+          // let pending promise work settle before cancelling the rest.
+          for (let settled = -1; ;) {
+            if (node.children.every(child => child.state === 'done')) break;
+            const done = settledCount(node);
+            if (done === settled) break;
+            settled = done;
+            await new Promise(resolve => nativeSetImmediate(resolve));
+          }
           for (const child of node.children) if (child.state !== 'done') child.cancel(failure('test did not finish before its parent', 'cancelledByParent'));
           this.pump(node);
           await Promise.all(node.children.map(child => child.done.promise));
@@ -347,7 +493,7 @@ class Harness {
     finally {
       if (timeout !== undefined) nativeClearTimeout(timeout);
       signal?.removeEventListener('abort', onAbort);
-      if (!node.skip && !node.filtered) {
+      if ((!node.skip || node.runtimeSkip) && !node.filtered) {
         await this.hooks(node, 'after', node, true);
         if (node.type !== 'suite') for (let i = ancestors.length - 1; i >= 0; i--) await this.hooks(ancestors[i], 'afterEach', node, true);
       }
@@ -366,6 +512,8 @@ class Harness {
   }
   finish(node, start) {
     node.state = 'done';
+    if (node.expectFailure && node.type !== 'suite' && !node.skip && !node.todo && !node.filtered) settleExpectedFailure(node);
+    node.passed = !node.error;
     node.controller.abort();
     if (node.filtered) { this.flush(this.root); node.done.resolve(); return; }
     const counts = this.counts;
@@ -379,9 +527,15 @@ class Harness {
     }
     if (node.error && !node.todo && !node.skip) this.success = false;
     if (node.error && !node.todo && !node.skip && this.options.setExitCode !== false) process.exitCode = 1;
+    // The suite path the JUnit reporter uses as the test's classname.
+    const classParts = [];
+    for (let parent = node.parent; parent && parent !== this.root; parent = parent.parent) classParts.unshift(parent.name);
     node.reportData = { testNumber: visibleChildren(node.parent).indexOf(node) + 1,
-      details: { duration_ms: now() - start, type: node.type, ...(node.error ? { error: node.error } : {}) },
-      ...(node.skip ? { skip: node.skip } : {}), ...(node.todo ? { todo: node.todo } : {}) };
+      details: { duration_ms: now() - start, type: node.type, ...(node.error ? { error: node.error } : {}),
+        ...(classParts.length ? { classname: classParts.join('.') } : {}) },
+      ...(classParts.length ? { classname: classParts.join('.') } : {}),
+      ...(node.skip ? { skip: node.skip } : node.todo ? { todo: node.todo } :
+        node.expectFailure ? { expectFailure: node.expectFailure.label ?? true } : {}) };
     this.emit('test:complete', node, { ...node.reportData, details: { ...node.reportData.details, passed: !node.error || !!node.skip } });
     this.flush(this.root);
     node.done.resolve();
@@ -434,6 +588,12 @@ class Harness {
     const onAbort = () => this.root.cancel(failure('test run aborted', 'testAborted', signal.reason));
     if (signal?.aborted) onAbort(); else signal?.addEventListener('abort', onAbort, { once: true });
     try {
+      if (this.options.globalSetupPath) {
+        const hooks = await loadGlobalHooks(this.options.globalSetupPath, process.cwd());
+        try { await hooks.setup?.(); }
+        catch (error) { reportSetupFailure(error); throw error; }
+        this.globalTeardown = hooks.teardown;
+      }
       await this.hooks(this.root, 'before');
       this.pump(this.root);
       // Definitions may append root tests while asynchronous suites are collecting.
@@ -452,6 +612,11 @@ class Harness {
       await Promise.all(this.root.children.map(child => child.done.promise));
     } finally {
       await this.hooks(this.root, 'after', this.root, true);
+      if (this.globalTeardown) {
+        const teardown = this.globalTeardown; this.globalTeardown = undefined;
+        try { await teardown(); }
+        catch (error) { reportSetupFailure(error); }
+      }
       try { this.snapshots?.writeFiles(); }
       catch (error) {
         this.root.error ||= failure(String(error?.message ?? error), 'testCodeFailure', error);
@@ -459,6 +624,8 @@ class Harness {
       }
       this.stream.publish('test:plan', { nesting: 0, count: visibleChildren(this.root).length });
       for (const message of this.root.diagnostics || []) this.emit('test:diagnostic', this.root, { nesting: 0, message, level: 'info' });
+      const duration = now() - start;
+      publishCounts((type, data) => this.emit(type, this.root, data), this.counts, duration);
       if (this.options.collectCoverage) {
         try {
           const coverage = require('internal/test_runner/coverage');
@@ -473,12 +640,24 @@ class Harness {
       signal?.removeEventListener('abort', onAbort);
       const success = !this.root.error && this.success;
       if (!success && this.options.setExitCode !== false) process.exitCode = 1;
-      const summary = { nesting: 0, file: this.file, success, counts: { ...this.counts }, duration_ms: now() - start };
+      const summary = { nesting: 0, file: this.file, success, counts: { ...this.counts }, duration_ms: duration };
       this.stream.publish('test:summary', summary);
       this.stream.push(null); this.completion.resolve(summary);
     }
     return this.completion.promise;
   }
+}
+// The run totals Node's root test reports as diagnostics before its summary.
+const kCountDiagnostics = [['tests', 'tests'], ['suites', 'suites'], ['pass', 'passed'], ['fail', 'failed'],
+  ['cancelled', 'cancelled'], ['skipped', 'skipped'], ['todo', 'todo']];
+function publishCounts(publish, counts, duration) {
+  for (const [label, key] of kCountDiagnostics) publish('test:diagnostic', { nesting: 0, message: `${label} ${counts[key]}`, level: 'info' });
+  publish('test:diagnostic', { nesting: 0, message: `duration_ms ${duration}`, level: 'info' });
+}
+// A child's own totals, which the parent replaces with the totals of the whole run.
+function isCountDiagnostic(message) {
+  const parts = String(message).split(' ');
+  return parts.length === 2 && (parts[0] === 'duration_ms' || kCountDiagnostics.some(([label]) => label === parts[0]));
 }
 function createHarness(options) { return new Harness(options); }
 function getHarness() {
@@ -489,22 +668,52 @@ function getHarness() {
     if (collectCoverage && !host.testCoveragePrestarted) {
       host.testCoverageStart(); host.testCoveragePrestarted = true;
     }
-    defaultHarness = createHarness({ waitForIdle: true, file: process.argv[1], collectCoverage });
-    const { tap } = require('test/reporters');
-    Readable.from(tap(defaultHarness.stream)).pipe(process.stdout, { end: false });
+    const cli = host.testCoverageOptions || {};
+    defaultHarness = createHarness({ waitForIdle: true, file: process.argv[1], collectCoverage, only: cli.only,
+      timeout: cli.timeout, testNamePatterns: cli.testNamePatterns, testSkipPatterns: cli.testSkipPatterns, testTagFilters: cli.testTagFilters,
+      randomize: cli.randomize, randomSeed: cli.randomSeed, globalSetupPath: cli.globalSetupPath });
+    if (process.env.NODE_TEST_CONTEXT === 'child-v8' && typeof process.send === 'function') reportToParent(defaultHarness.stream);
+    else {
+      const reporters = host.testReporters || { names: [], destinations: [] };
+      const fail = error => { console.error(error); process.exitCode = 1; };
+      const written = require('internal/main/test_runner').attachReporters(defaultHarness.stream, reporters.names,
+        reporters.destinations, 'spec', fail);
+      if (cli.forceExit) written.then(() => process.exit());
+    }
     nativeSetImmediate(() => { defaultHarness.start(); });
   }
   return defaultHarness;
+}
+// A file that run() started in its own process sends its events to the parent over an
+// advanced-serialization channel, errors through error_serdes like Node's v8-serializer reporter.
+function reportToParent(stream) {
+  const { serializeError } = require('internal/error_serdes');
+  stream.on('data', event => {
+    const error = event.data?.details?.error;
+    if (error === undefined) { process.send(event); return; }
+    process.send({ ...event, data: { ...event.data, details: { ...event.data.details, error: serializeError(error) } } });
+  });
+  stream.on('end', () => process.disconnect());
 }
 function configure(options = {}) {
   if (defaultHarness) throw Object.assign(new Error('The default test harness is already initialized'), { code: 'ERR_INVALID_STATE' });
   defaultHarness = createHarness(options);
   return defaultHarness;
 }
+// Where user code declared a test: the first frame outside the built-ins.
+function callerLocation() {
+  for (const site of require('util').getCallSites(16)) {
+    const file = site.scriptName;
+    if (file && !file.startsWith('node:')) return { line: site.lineNumber, column: site.column, file: file.startsWith('file://') ? require('url').fileURLToPath(file) : file };
+  }
+  return undefined;
+}
 function define(type, args) {
   const harness = getHarness();
   const parent = context.getStore() || harness.root;
-  const node = harness.add(type, parse(args), parent);
+  const spec = parse(args);
+  spec.loc = callerLocation();
+  const node = harness.add(type, spec, parent);
   return parent.type === 'suite' ? Promise.resolve() : node.done.promise;
 }
 function test(...args) { return define('test', args); }
@@ -513,9 +722,9 @@ for (const fn of [test, suite]) for (const modifier of ['skip', 'todo', 'only'])
   const spec = parse(args); spec.options = { ...spec.options, [modifier]: true };
   return define(fn === test ? 'test' : 'suite', [spec.name, spec.options, spec.fn]);
 };
-const exportsObject = { test, suite, createHarness, configure, getTestContext: () => context.getStore()?.ctx,
+const exportsObject = { publishCounts, isCountDiagnostic, loadGlobalHooks, reportSetupFailure, tagFilter, seededGenerator, createRandomSeed, test, suite, createHarness, configure, getTestContext: () => context.getStore()?.ctx,
   withHarness: (harness, fn) => context.run(harness.root, fn), failure, unsupported, TestsStream,
-  registerAssertion(name, fn) { if (typeof name !== 'string' || typeof fn !== 'function') throw invalid('assert.register requires a name and function'); assertions.set(name, fn); } };
+  registerAssertion(name, fn) { validateString(name, 'name'); validateFunction(fn, 'fn'); assertions.set(name, fn); } };
 for (const type of ['before', 'after', 'beforeEach', 'afterEach']) exportsObject[type] = (fn, options) => {
   const harness = getHarness(); (context.getStore() || harness.root).ctx._hook(type, fn, options);
 };

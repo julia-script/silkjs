@@ -5,6 +5,7 @@ const types = require('util/types');
 const { inspect } = require('internal/util_inspect');
 const { isDeepStrictEqual } = require('internal/util_comparisons');
 const customPromisify = Symbol.for('nodejs.util.promisify.custom');
+const { customPromisifyArgs } = require('internal/util_promisify');
 function invalid(name, expected, value) {
   const error = new TypeError('The "' + name + '" argument must be of type ' + expected + '. Received ' + inspect(value));
   error.code = 'ERR_INVALID_ARG_TYPE';
@@ -41,24 +42,33 @@ function formatWithOptions(options, ...args) {
   return result;
 }
 function format(...args) { return formatWithOptions({}, ...args); }
+// Node's lib/internal/util.js promisify.
 function promisify(original) {
   validateFunction(original, 'original');
-  if (original[customPromisify] !== undefined) {
-    const custom = original[customPromisify];
-    validateFunction(custom, 'util.promisify.custom');
-    Object.defineProperty(custom, customPromisify, { value: custom, configurable: true });
-    return custom;
+  if (original[customPromisify]) {
+    const fn = original[customPromisify];
+    validateFunction(fn, 'util.promisify.custom');
+    return Object.defineProperty(fn, customPromisify, { value: fn, enumerable: false, writable: false, configurable: true });
   }
+  const argumentNames = original[customPromisifyArgs];
   function fn(...args) {
     return new Promise((resolve, reject) => {
-      args.push((error, value) => error ? reject(error) : resolve(value));
-      Reflect.apply(original, this, args);
+      args.push((err, ...values) => {
+        if (err) return reject(err);
+        if (argumentNames !== undefined && values.length > 1) {
+          const obj = {};
+          for (let i = 0; i < argumentNames.length; i++) obj[argumentNames[i]] = values[i];
+          resolve(obj);
+        } else resolve(values[0]);
+      });
+      if (types.isPromise(Reflect.apply(original, this, args))) process.emitWarning('Calling promisify on a function that returns a Promise is likely a mistake.', 'DeprecationWarning', 'DEP0174');
     });
   }
   Object.setPrototypeOf(fn, Object.getPrototypeOf(original));
-  Object.defineProperties(fn, Object.getOwnPropertyDescriptors(original));
-  Object.defineProperty(fn, customPromisify, { value: fn, configurable: true });
-  return fn;
+  Object.defineProperty(fn, customPromisify, { value: fn, enumerable: false, writable: false, configurable: true });
+  const descriptors = Object.getOwnPropertyDescriptors(original);
+  for (const descriptor of Object.values(descriptors)) Object.setPrototypeOf(descriptor, null);
+  return Object.defineProperties(fn, descriptors);
 }
 promisify.custom = customPromisify;
 function callbackify(original) {

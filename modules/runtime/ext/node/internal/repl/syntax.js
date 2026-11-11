@@ -57,4 +57,6 @@ function rememberBindings(code, names) {
     }
   }
 }
-module.exports = { Recoverable, isRecoverableError, isValidSyntax, rememberBindings };
+// Marks the REPL that `node` starts with no script (Node's internal/repl/utils kStandaloneREPL).
+const kStandaloneREPL = Symbol('kStandaloneREPL');
+module.exports = { kStandaloneREPL, Recoverable, isRecoverableError, isValidSyntax, rememberBindings };

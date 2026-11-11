@@ -142,7 +142,7 @@ const kGenericUserError = 1;
 const kInvalidFatalExceptionMonkeyPatching = 6;
 const kExceptionInFatalExceptionHandler = 7;
 function terminate(code) {
-  if (host.builtinLoaded('internal/compile_cache')) require('internal/compile_cache').flushCompileCache();
+  if (host.builtinLoaded('internal/compile_cache')) require('internal/compile_cache').flushAtExit();
   host.rawStd.exit(code);
 }
 // TriggerUncaughtException: an error nothing caught reaches process._fatalException;

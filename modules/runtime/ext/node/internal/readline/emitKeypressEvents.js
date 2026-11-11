@@ -64,19 +64,6 @@ function emitKeypressEvents(stream, iface = {}) {
   const triggerEscape = () => stream[ESCAPE_DECODER].next('');
   const { escapeCodeTimeout = ESCAPE_CODE_TIMEOUT } = iface;
   let timeoutId;
-  let closed = false;
-
-  function cleanup() {
-    if (closed) return;
-    closed = true;
-    clearTimeout(timeoutId);
-    stream.removeListener('data', onData);
-    stream.removeListener('newListener', onNewListener);
-    stream.removeListener('end', cleanup);
-    stream.removeListener('close', cleanup);
-    delete stream[KEYPRESS_DECODER];
-    delete stream[ESCAPE_DECODER];
-  }
 
   function onData(input) {
     if (stream.listenerCount('keypress') > 0) {
@@ -97,7 +84,6 @@ function emitKeypressEvents(stream, iface = {}) {
 
           try {
             stream[ESCAPE_DECODER].next(character);
-            if (closed) break;
             // Escape letter at the tail position
             if (length === string.length && character === kEscape) {
               timeoutId = setTimeout(triggerEscape, escapeCodeTimeout);
@@ -105,10 +91,8 @@ function emitKeypressEvents(stream, iface = {}) {
           } catch (err) {
             // If the generator throws (it could happen in the `keypress`
             // event), we need to restart it.
-            if (!closed) {
-              stream[ESCAPE_DECODER] = emitKeys(stream);
-              stream[ESCAPE_DECODER].next();
-            }
+            stream[ESCAPE_DECODER] = emitKeys(stream);
+            stream[ESCAPE_DECODER].next();
             throw err;
           }
         }
@@ -127,16 +111,11 @@ function emitKeypressEvents(stream, iface = {}) {
     }
   }
 
-  stream.once('end', cleanup);
-  stream.once('close', cleanup);
   if (stream.listenerCount('keypress') > 0) {
     stream.on('data', onData);
   } else {
     stream.on('newListener', onNewListener);
   }
-  return () => {
-    if (stream.listenerCount('keypress') === 0) cleanup();
-  };
 }
 
 module.exports = emitKeypressEvents;

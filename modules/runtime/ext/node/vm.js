@@ -23,36 +23,36 @@ const constants = Object.freeze(Object.assign(Object.create(null), { USE_MAIN_CO
 function error(code, message, Type = TypeError) {
   return Object.assign(new Type(message), { code });
 }
-function invalid(name, type) {
-  return error('ERR_INVALID_ARG_TYPE', `The "${name}" argument must be of type ${type}`);
-}
+const { ERR_INVALID_ARG_TYPE } = require('internal/path_events/support').codes;
+// Node's ERR_INVALID_ARG_TYPE wording, with what was received.
+function invalid(name, expected, value) { return new ERR_INVALID_ARG_TYPE(name, expected, value); }
 function unsupported(surface) {
   throw error('ERR_NOT_IMPLEMENTED', `${surface} is not supported by this runtime`, Error);
 }
 function options(value, string = false) {
   if (value === undefined) return {};
   if (string && typeof value === 'string') return { filename: value };
-  if (value === null || typeof value !== 'object') throw invalid('options', 'object');
+  if (value === null || typeof value !== 'object') throw invalid('options', 'object', value);
   return value;
 }
 function integer(value, name, min, max) {
-  if (typeof value !== 'number') throw invalid(name, 'number');
+  if (typeof value !== 'number') throw invalid(name, 'number', value);
   if (!Number.isInteger(value) || value < min || value > max)
     throw error('ERR_OUT_OF_RANGE', `The value of "${name}" is out of range`, RangeError);
   return value;
 }
 function boolean(value, name) {
-  if (typeof value !== 'boolean') throw invalid(name, 'boolean');
+  if (typeof value !== 'boolean') throw invalid(name, 'boolean', value);
   return value;
 }
 function contextData(value) {
   const data = contexts.get(value);
-  if (!data) throw error('ERR_INVALID_ARG_TYPE', 'The "contextifiedObject" argument must be a vm.Context');
+  if (!data) throw value === null || typeof value !== 'object' ? invalid('object', 'object', value) : invalid('contextifiedObject', 'vm.Context', value);
   return data;
 }
 function contextOptions(value) {
   const opts = options(value);
-  for (const key of ['name', 'origin']) if (opts[key] !== undefined && typeof opts[key] !== 'string') throw invalid(`options.${key}`, 'string');
+  for (const key of ['name', 'origin']) if (opts[key] !== undefined && typeof opts[key] !== 'string') throw invalid(`options.${key}`, 'string', opts[key]);
   if (opts.microtaskMode !== undefined && opts.microtaskMode !== 'afterEvaluate')
     throw error('ERR_INVALID_ARG_VALUE', 'options.microtaskMode must be "afterEvaluate"');
   let strings = true, wasm = true;
@@ -64,7 +64,7 @@ function contextOptions(value) {
   return { strings, wasm, afterEvaluate: opts.microtaskMode === 'afterEvaluate', name: opts.name, origin: opts.origin };
 }
 function createContext(sandbox = {}, value) {
-  if (sandbox !== DONT_CONTEXTIFY && (sandbox === null || typeof sandbox !== 'object')) throw invalid('object', 'object');
+  if (sandbox !== DONT_CONTEXTIFY && (sandbox === null || typeof sandbox !== 'object')) throw invalid('contextObject', 'object', sandbox);
   const config = contextOptions(value);
   if (sandbox !== DONT_CONTEXTIFY && contexts.has(sandbox)) return sandbox;
   const handle = host.vmCreateContext(config.afterEvaluate);
@@ -124,17 +124,17 @@ function createContext(sandbox = {}, value) {
   return result;
 }
 function isContext(value) {
-  if (value === null || typeof value !== 'object') throw invalid('object', 'object');
+  if (value === null || typeof value !== 'object') throw invalid('object', 'object', value);
   return contexts.has(value);
 }
 function compileOptions(value, defaultFilename = 'evalmachine.<anonymous>') {
   const opts = options(value, true);
   const filename = opts.filename === undefined ? defaultFilename : opts.filename;
-  if (typeof filename !== 'string') throw invalid('options.filename', 'string');
+  if (typeof filename !== 'string') throw invalid('options.filename', 'string', filename);
   const line = opts.lineOffset === undefined ? 0 : integer(opts.lineOffset, 'options.lineOffset', -2147483648, 2147483647);
   const column = opts.columnOffset === undefined ? 0 : integer(opts.columnOffset, 'options.columnOffset', -2147483648, 2147483647);
   validateImportCallback(opts.importModuleDynamically);
-  if (opts.cachedData !== undefined && !ArrayBufferIsView(opts.cachedData)) throw invalid('options.cachedData', 'Buffer, TypedArray, or DataView');
+  if (opts.cachedData !== undefined && !ArrayBufferIsView(opts.cachedData)) throw invalid('options.cachedData', ['Buffer', 'TypedArray', 'DataView'], opts.cachedData);
   if (opts.produceCachedData !== undefined) boolean(opts.produceCachedData, 'options.produceCachedData');
   return { opts, filename, line, column };
 }
@@ -160,7 +160,7 @@ function compile(source, filename, line, column, prefix = 0, body = source) {
   catch (cause) { syntaxDiagnostic(cause, body, filename, line, column, prefix); }
 }
 function runOptions(value) {
-  const opts = options(value, true);
+  const opts = options(value);
   const { timeout: duration, displayErrors, breakOnSigint = false } = opts;
   const timeout = duration === undefined ? 0 : integer(duration, 'options.timeout', 1, 4294967295);
   if (displayErrors !== undefined) boolean(displayErrors, 'options.displayErrors');
@@ -243,7 +243,7 @@ function run(handle, { timeout, breakOnSigint }, afterEvaluate, wrapSignals = tr
 function validateImportCallback(callback, module = false) {
   if (callback !== undefined && typeof callback !== 'function' &&
       (module || callback !== USE_MAIN_CONTEXT_DEFAULT_LOADER)) {
-    throw invalid('options.importModuleDynamically', 'function');
+    throw invalid('options.importModuleDynamically', 'function', callback);
   }
 }
 function importCallback(callback, referrer, filename, functionRef = false) {
@@ -271,6 +271,10 @@ class Script {
     const dynamicImport = importCallback(opts.importModuleDynamically, this, filename);
     host.vmSetImportModuleDynamically(handle, dynamicImport);
     scripts.set(this, { source, handle, dynamicImport, realms: new WeakMap() });
+    // The last "//# sourceMappingURL=" magic comment, as V8 reports it.
+    let mapURL;
+    for (const match of source.matchAll(/\/\/[#@][ \t]+sourceMappingURL=[ \t]*([^\s'"]+)[ \t]*$/gm)) mapURL = match[1];
+    this.sourceMapURL = mapURL;
     if (opts.produceCachedData) {
       this.cachedData = this.createCachedData();
       this.cachedDataProduced = true;
@@ -293,8 +297,12 @@ class Script {
     return run(handle, execution, context.afterEvaluate);
   }
   runInNewContext(sandbox, value) {
-    const opts = options(value, true);
-    return this.runInContext(createContext(sandbox, opts), opts);
+    // As in Node, the context takes its options under context-prefixed names.
+    const contextOptions = value === null || typeof value !== 'object' ? undefined : {
+      name: value.contextName, origin: value.contextOrigin,
+      codeGeneration: value.contextCodeGeneration, microtaskMode: value.microtaskMode,
+    };
+    return this.runInContext(createContext(sandbox, contextOptions), value);
   }
   createCachedData() {
     const data = scriptData(this);
@@ -307,24 +315,30 @@ function scriptData(value) {
   return data;
 }
 function createScript(code, value) { return new Script(code, value); }
+// The functions take a filename string in place of options, as Node's do.
+const scriptOptions = value => typeof value === 'string' ? { filename: value } : value;
 function runInContext(code, contextifiedObject, value) {
   contextData(contextifiedObject);
+  value = scriptOptions(value);
   return new Script(code, value).runInContext(contextifiedObject, value);
 }
-function runInNewContext(code, sandbox, value) { return new Script(code, value).runInNewContext(sandbox, value); }
-function runInThisContext(code, value) { return new Script(code, value).runInThisContext(value); }
+function runInNewContext(code, sandbox, value) { value = scriptOptions(value); return new Script(code, value).runInNewContext(sandbox, value); }
+function runInThisContext(code, value) { value = scriptOptions(value); return new Script(code, value).runInThisContext(value); }
 function compileFunction(code, params = [], value) {
-  if (typeof code !== 'string') throw invalid('code', 'string');
-  if (!Array.isArray(params)) throw invalid('params', 'Array');
-  for (const name of params) {
-    if (typeof name !== 'string') throw invalid('params', 'Array of strings');
+  if (typeof code !== 'string') throw invalid('code', 'string', code);
+  if (!Array.isArray(params)) throw invalid('params', 'Array', params);
+  for (let i = 0; i < params.length; i++) {
+    const name = params[i];
+    if (typeof name !== 'string') throw invalid(`params[${i}]`, 'string', name);
     if (!/^[$_\p{ID_Start}][$\u200c\u200d_\p{ID_Continue}]*$/u.test(name)) throw new SyntaxError('Invalid function parameter name');
   }
   const { opts, filename, line, column } = compileOptions(value, '');
   const context = opts.parsingContext === undefined ? undefined : contextData(opts.parsingContext);
   const extensions = opts.contextExtensions === undefined ? [] : opts.contextExtensions;
-  if (!Array.isArray(extensions)) throw invalid('options.contextExtensions', 'Array');
-  for (const extension of extensions) if (extension === null || typeof extension !== 'object') throw invalid('options.contextExtensions', 'Array of objects');
+  if (!Array.isArray(extensions)) throw invalid('options.contextExtensions', 'Array', extensions);
+  for (let i = 0; i < extensions.length; i++) {
+    if (extensions[i] === null || typeof extensions[i] !== 'object') throw invalid(`options.contextExtensions[${i}]`, 'object', extensions[i]);
+  }
   // This factory is compiled in the actual parsing realm. with-environments hold
   // live extension objects, not copied bindings. The function has its own this
   // and arguments; no hidden identifier is injected into its lexical scope.
@@ -368,7 +382,7 @@ function moduleStatus(data) {
 }
 function moduleOptions(value) {
   const opts = options(value);
-  if (opts.identifier !== undefined && typeof opts.identifier !== 'string') throw invalid('options.identifier', 'string');
+  if (opts.identifier !== undefined && typeof opts.identifier !== 'string') throw invalid('options.identifier', 'string', opts.identifier);
   const context = opts.context === undefined ? undefined : contextData(opts.context);
   return { opts, context, identifier: opts.identifier === undefined ? `vm:module(${nextModuleId++})` : opts.identifier };
 }
@@ -380,7 +394,7 @@ function requireDependency(value, owner) {
   return data;
 }
 function bindRequests(data, dependencies) {
-  if (!Array.isArray(dependencies)) throw invalid('modules', 'Array');
+  if (!Array.isArray(dependencies)) throw invalid('modules', 'Array', dependencies);
   if (dependencies.length !== data.requests.length) throw error('ERR_MODULE_LINK_MISMATCH', 'Expected one module for each module request', Error);
   for (const dependency of dependencies) requireDependency(dependency, data);
   for (let i = 0; i < dependencies.length; i++) host.vmModule(5, data.handle, i, moduleData(dependencies[i]).handle);
@@ -425,6 +439,18 @@ class Module {
   }
   get identifier() { return moduleData(this).identifier; }
   get context() { return moduleData(this).context; }
+  [Symbol.for('nodejs.util.inspect.custom')](depth, options) {
+    moduleData(this);
+    if (typeof depth === 'number' && depth < 0) return this;
+    const constructor = Object.getPrototypeOf(this)?.constructor || Module;
+    const view = { __proto__: { constructor } };
+    view.status = this.status;
+    view.identifier = this.identifier;
+    view.context = this.context;
+    Object.setPrototypeOf(view, Object.getPrototypeOf(this));
+    Object.defineProperty(view, Symbol.toStringTag, { value: constructor.name, configurable: true });
+    return require('util').inspect(view, { ...options, customInspect: false });
+  }
   get status() { return moduleStatus(moduleData(this)); }
   get namespace() {
     const data = moduleData(this);
@@ -438,42 +464,49 @@ class Module {
   }
   async link(linker) {
     const data = moduleData(this);
-    if (typeof linker !== 'function') throw invalid('linker', 'function');
+    if (typeof linker !== 'function') throw invalid('linker', 'function', linker);
     // Node 24 synthetic modules are already instantiated at construction.
     if (data.synthetic) return;
     if (moduleStatus(data) !== 'unlinked') throw error('ERR_VM_MODULE_STATUS', 'Module status must be unlinked', Error);
     await stageLink(this, linker, new Set());
     instantiateModule(this);
   }
-  async evaluate(value) {
-    const data = moduleData(this);
-    const execution = runOptions(value);
-    const status = moduleStatus(data);
-    if (status === 'unlinked' || status === 'linking') throw error('ERR_VM_MODULE_STATUS', 'Module status must be linked, evaluated, or errored', Error);
-    if (data.terminated) throw null;
-    try { await run(data.handle, execution, data.realm ? data.realm.afterEvaluate : false, false); }
-    catch (cause) {
-      if (terminationErrors.has(cause)) {
-        const visited = new Set();
-        const terminate = current => {
-          if (visited.has(current)) return;
-          visited.add(current);
-          const state = moduleData(current);
-          if (moduleStatus(state) === 'errored') state.terminated = true;
-          for (const dependency of state.dependencies || []) terminate(dependency);
-        };
-        terminate(this);
+  // As in Node, the engine's own evaluation promise: already settled when the module
+  // (or a synthetic one's evaluation step) finished synchronously.
+  evaluate(value) {
+    try {
+      const data = moduleData(this);
+      const execution = runOptions(value);
+      const status = moduleStatus(data);
+      if (status === 'unlinked' || status === 'linking') throw error('ERR_VM_MODULE_STATUS', 'Module status must be one of linked, evaluated, or errored', Error);
+      if (data.terminated) throw null;
+      let result;
+      try { result = run(data.handle, execution, data.realm ? data.realm.afterEvaluate : false, false); }
+      catch (cause) {
+        if (terminationErrors.has(cause)) {
+          const visited = new Set();
+          const terminate = current => {
+            if (visited.has(current)) return;
+            visited.add(current);
+            const state = moduleData(current);
+            if (moduleStatus(state) === 'errored') state.terminated = true;
+            const dependencies = state.dependencies || [];
+            for (let i = 0; i < dependencies.length; i++) terminate(dependencies[i]);
+          };
+          terminate(this);
+        }
+        throw cause;
       }
-      throw cause;
-    }
+      return result instanceof Promise ? result : Promise.resolve(result);
+    } catch (cause) { return Promise.reject(cause); }
   }
 }
 class SourceTextModule extends Module {
   constructor(code, value) {
-    if (typeof code !== 'string') throw invalid('code', 'string');
+    if (typeof code !== 'string') throw invalid('code', 'string', code);
     const { opts, context, identifier } = moduleOptions(value);
     validateImportCallback(opts.importModuleDynamically, true);
-    if (opts.initializeImportMeta !== undefined && typeof opts.initializeImportMeta !== 'function') throw invalid('options.initializeImportMeta', 'function');
+    if (opts.initializeImportMeta !== undefined && typeof opts.initializeImportMeta !== 'function') throw invalid('options.initializeImportMeta', 'function', opts.initializeImportMeta);
     const line = opts.lineOffset === undefined ? 0 : integer(opts.lineOffset, 'options.lineOffset', -2147483648, 2147483647);
     const column = opts.columnOffset === undefined ? 0 : integer(opts.columnOffset, 'options.columnOffset', -2147483648, 2147483647);
     let handle;
@@ -520,14 +553,15 @@ class SourceTextModule extends Module {
 }
 class SyntheticModule extends Module {
   constructor(exportNames, evaluateCallback, value) {
-    if (!Array.isArray(exportNames)) throw invalid('exportNames', 'Array');
+    if (!Array.isArray(exportNames)) throw invalid('exportNames', 'Array', exportNames);
     const names = new Set();
-    for (const name of exportNames) {
-      if (typeof name !== 'string') throw invalid('exportNames', 'Array of strings');
+    for (let i = 0; i < exportNames.length; i++) {
+      const name = exportNames[i];
+      if (typeof name !== 'string') throw invalid(`exportNames[${i}]`, 'string', name);
       if (names.has(name)) throw error('ERR_INVALID_ARG_VALUE', `The property 'exportNames' contains duplicate export '${name}'`);
       names.add(name);
     }
-    if (typeof evaluateCallback !== 'function') throw invalid('evaluateCallback', 'function');
+    if (typeof evaluateCallback !== 'function') throw invalid('evaluateCallback', 'function', evaluateCallback);
     const { opts, context, identifier } = moduleOptions(value);
     let module;
     const handle = host.vmModule(1, identifier, context && context.handle, () => Reflect.apply(evaluateCallback, module, []));
@@ -538,7 +572,7 @@ class SyntheticModule extends Module {
   }
   setExport(name, value) {
     const data = moduleData(this);
-    if (typeof name !== 'string') throw invalid('name', 'string');
+    if (typeof name !== 'string') throw invalid('name', 'string', name);
     if (!data.synthetic) throw error('ERR_INVALID_THIS', 'Value of "this" must be a SyntheticModule');
     if (!data.names.has(name)) throw new ReferenceError(`Export '${name}' is not defined in module`);
     host.vmModule(10, data.handle, name, value);
