@@ -113,9 +113,9 @@ function deprecate(fn, message, code) {
 }
 function debuglog(section, callback) {
   section = String(section).toUpperCase();
-  const patterns = String(host.env.NODE_DEBUG || '').split(/[\s,]+/).filter(Boolean);
   let enabled;
-  const initialize = () => { enabled = patterns.some(pattern => new RegExp('^' + pattern.replace(/[|\\{}()[\]^$+?.]/g, '\\$&').replace(/\*/g, '.*') + '$', 'i').test(section)); };
+  // NODE_DEBUG is read on first use, not when a module asks for its logger.
+  const initialize = () => { enabled = String(host.env.NODE_DEBUG || '').split(/[\s,]+/).filter(Boolean).some(pattern => new RegExp('^' + pattern.replace(/[|\\{}()[\]^$+?.]/g, '\\$&').replace(/\*/g, '.*') + '$', 'i').test(section)); };
   const write = (...args) => { if (enabled) host.stderr.write(section + ' ' + (globalThis.process ? process.pid : 0) + ': ' + format(...args) + '\n'); };
   Object.defineProperty(write, 'enabled', { enumerable: true, configurable: true, get: () => enabled });
   let initialized = false;

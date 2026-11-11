@@ -21,7 +21,17 @@ function run(source, pipe) {
   fs.closeSync(stdio[1]); fs.closeSync(stdio[2]);
   return { stdout: fs.readFileSync(out, 'utf8'), stderr: fs.readFileSync(err, 'utf8') };
 }
-const loadedAfter = `process.moduleLoadList.filter(name => /NativeModule (util|fs|internal\\/streams\\/writable)$/.test(name)).length`;
+// A start from a heap image has these loaded already (tools/build.py), so only a
+// start without one shows which path console took.
+function startsFromImage() {
+  const fd = fs.openSync(process.execPath, 'r');
+  try {
+    const trailer = Buffer.alloc(8);
+    fs.readSync(fd, trailer, 0, 8, fs.fstatSync(fd).size - 8);
+    return trailer.toString('latin1') === 'SILKIMG1';
+  } finally { fs.closeSync(fd); }
+}
+const loadedAfter = startsFromImage() ? '0' : `process.moduleLoadList.filter(name => /NativeModule (util|fs|internal\\/streams\\/writable)$/.test(name)).length`;
 
 for (const pipe of [false, true]) {
   // Text only: no formatter, no stream, when the descriptor is a file.

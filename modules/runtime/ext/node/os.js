@@ -43,7 +43,9 @@ function native(op, args = []) {
     throw error;
   }
 }
-const uname = native('uname');
+// Read on first use: a heap image may hold this module, loaded on another machine.
+let unameFields;
+const uname = () => unameFields ||= native('uname');
 function arch() { return host.arch; }
 function platform() { return host.platform; }
 function availableParallelism() { return native('availableParallelism'); }
@@ -57,10 +59,10 @@ function tmpdir() {
   if (path.length > 1 && path.endsWith('/')) path = path.slice(0, -1);
   return path;
 }
-function type() { return uname[0]; }
-function release() { return uname[1]; }
-function version() { return uname[2]; }
-function machine() { return uname[3]; }
+function type() { return uname()[0]; }
+function release() { return uname()[1]; }
+function version() { return uname()[2]; }
+function machine() { return uname()[3]; }
 function uptime() { return native('uptime'); }
 const byteOrder = new Uint8Array(new Uint16Array([0x0102]).buffer)[0] === 1 ? 'BE' : 'LE';
 function endianness() { return byteOrder; }
