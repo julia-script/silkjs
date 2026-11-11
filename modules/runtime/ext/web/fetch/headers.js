@@ -1,6 +1,6 @@
 'use strict';
 
-const { TextEncoder, TextDecoder } = require('internal/web/encoding');
+const { TextEncoder, TextDecoder } = require('internal/encoding');
 
 const states = new WeakMap();
 const token = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;

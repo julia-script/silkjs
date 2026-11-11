@@ -1,6 +1,6 @@
 'use strict';
 const sea = require('internal/sea');
-const { TextDecoder } = require('internal/web/encoding');
+const { TextDecoder } = require('internal/encoding');
 const { Blob } = require('buffer');
 const slice = Function.call.bind(ArrayBuffer.prototype.slice);
 function string(value, name) {
