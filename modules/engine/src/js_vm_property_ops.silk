@@ -38,6 +38,7 @@ import js_bigint { BigIntError }
 import js_exceptions { JsException }
 import js_opcode_data as op
 import js_vm_factories as factories
+import js_vm_operators as operators
 import js_atom_data as atoms
 import js_atoms { AtomTable, ATOM_INTEGER_TAG, UNKNOWN_STRING_ATOM }
 import js_strings { Strings }
@@ -744,17 +745,41 @@ unsafe fn fieldAtom(machine: &Machine) -> u32 {
 /// the field without pushing (so retaining and releasing) the object, which the
 /// slot keeps alive. false consumes nothing; cellFieldStep then runs the pair.
 @inlineAlways
-pub unsafe fn pushCellField(machine: &mut Machine, cell: *mut ValueBits) -> bool {
+pub unsafe fn pushCellField(machine: &mut Machine, cell: *mut ValueBits, chain: bool) -> bool {
   let object = match unsafe Pointer.read<ValueBits>(cell) { ValueBits.Object { reference } => reference _ => { return false } }
   let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
   let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
   let key = unsafe fieldKeyAt(machine.ip)
   if u64.shiftRight(key, 16) != shape.version { return false }
-  let found = (unsafe data.slotUnchecked(u64.toUsize(key & 0xffff))).valueBits()
+  let mut found = (unsafe data.slotUnchecked(u64.toUsize(key & 0xffff))).valueBits()
   drop shape drop data
-  unsafe machine.push(unsafe found.retained())
   unsafe machine.skip(FIELD_OPERAND_BYTES + 1)
+  if chain {
+    found = unsafe chainFields(&mut machine, found)
+    if unsafe operators.fusedOperand(&mut machine, found) { return true }
+  }
+  unsafe machine.push(unsafe found.retained())
   return true
+}
+/// `a.b.c`: while the next instruction is a get_field whose inline key holds
+/// the field as an own slot of found's object, reads it here and skips that
+/// instruction. found is borrowed from the slot it was read from, and so is
+/// the result: no value in between is pushed, retained or released, and no
+/// dispatch runs. Stops (with ip at the get_field) at anything else.
+@inlineAlways
+unsafe fn chainFields(machine: &mut Machine, first: ValueBits) -> ValueBits {
+  let mut found = first
+  while unsafe machine.peekU8(0) == op.OP_get_field {
+    let object = match found { ValueBits.Object { reference } => reference _ => { break } }
+    let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+    let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+    let key = unsafe fieldKeyAt(unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(machine.ip), 1))
+    if u64.shiftRight(key, 16) != shape.version { break }
+    found = (unsafe data.slotUnchecked(u64.toUsize(key & 0xffff))).valueBits()
+    drop shape drop data
+    unsafe machine.skip(FIELD_OPERAND_BYTES + 1)
+  }
+  return found
 }
 /// get_loc_length8 and get_arg_length8 (ip at the slot index): a string's or an
 /// Array's length, pushed without pushing (so retaining and releasing) the
@@ -858,7 +883,7 @@ pub unsafe effect fn cellFieldStep<H: HeapHooks + OwnPropertyHooks + GetProperty
   ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
   // Uncached own fields, still without retaining the object.
   unsafe machine.pushCopy(cell)
-  match Pointer.nonNullMut<HeapHeader>(unsafe readFieldOperand(&mut machine)) {
+  match Pointer.nonNullMut<HeapHeader>(unsafe readFieldOperand(&mut machine, false)) {
     Option<*mut HeapHeader>.Some { value } => { unsafe gc.releaseObjectHeader(&mut hooks, machine.runtime, value) }
     Option<*mut HeapHeader>.None => {
       match Pointer.nonNullMut<HeapHeader>(unsafe readStringFieldOperand(&mut machine)) {
@@ -875,10 +900,26 @@ pub unsafe effect fn cellFieldStep<H: HeapHooks + OwnPropertyHooks + GetProperty
 /// Object operands only, so execute can run it on its register machine: nothing
 /// here takes the machine's address. Strings go to readStringFieldOperand.
 @inlineAlways
-pub unsafe fn readFieldOperand(machine: &mut Machine) -> ?*mut HeapHeader {
+pub unsafe fn readFieldOperand(machine: &mut Machine, chain: bool) -> ?*mut HeapHeader {
   let object = match unsafe machine.top(1) {
     ValueBits.Object { reference } => reference
     _ => { return Pointer.null<HeapHeader>() }
+  }
+  if chain {
+    // The inline key's own-slot hit, with any get_field chain after it read
+    // borrowed (chainFields); object keeps every value on the way alive until
+    // the caller releases it.
+    let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+    let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, data.shape)
+    let key = unsafe fieldKeyAt(machine.ip)
+    if u64.shiftRight(key, 16) == shape.version {
+      let first = (unsafe data.slotUnchecked(u64.toUsize(key & 0xffff))).valueBits()
+      drop shape drop data
+      unsafe machine.skip(FIELD_OPERAND_BYTES)
+      let found = unsafe chainFields(&mut machine, first)
+      unsafe machine.set(1, unsafe found.retained())
+      return object
+    }
   }
   if !unsafe readFieldKeyed(&machine.*, object, unsafe machine.topCell(1), true) { return Pointer.null<HeapHeader>() }
   unsafe machine.skip(FIELD_OPERAND_BYTES)
@@ -1298,7 +1339,7 @@ unsafe effect fn writeField<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeade
   drop shape
   let old = (unsafe data.slotUnchecked(index)).valueBits()
   // An object has a slot for each record of its shape.
-  unsafe data.setSlotUnchecked(index, SlotBits.value(unsafe Pointer.read<ValueBits>(source))) drop data
+  unsafe data.setSlotUnchecked(index, unsafe SlotBits.valueAt(unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(source))) drop data
   // The last reference goes out of line by header, so this function keeps no
   // ValueBits in memory and needs no stack frame.
   if old.tag() >= 0 { return true }
@@ -1362,7 +1403,7 @@ unsafe fn storeOwnSlot(data: &mut ObjectData, index: usize, source: *mut ValueBi
       Option<*mut HeapHeader>.None => ()
     }
   }
-  unsafe data.setSlotUnchecked(index, SlotBits.value(unsafe Pointer.read<ValueBits>(source)))
+  unsafe data.setSlotUnchecked(index, unsafe SlotBits.valueAt(unsafe Intrinsic.pointerRequalify<*mut ValueBits, *const ValueBits>(source)))
   return true
 }
 /// addField's verified-memo case in a frame of its own: a leaf with no spills
