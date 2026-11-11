@@ -352,6 +352,19 @@ function output(fd) {
   } };
 }
 host.stdout = output(1); host.stderr = output(2);
+// Text written to a descriptor synchronously, with no stream (internal/stdio
+// direct). False when nothing could be written; a failure after a partial
+// write drops the rest, as a stream write that console ignores would.
+host.writeText = (fd, text) => {
+  const bytes = Buffer.from(text);
+  let offset = 0;
+  while (offset < bytes.length) {
+    const count = rawOS.write(fd, bytes.buffer, bytes.byteOffset + offset, bytes.length - offset);
+    if (count <= 0) return offset !== 0;
+    offset += count;
+  }
+  return true;
+};
 host.writeStartupDiagnostic = host.stderr.write;
 globalThis.process = { platform: host.platform, env: host.env, nextTick: host.nextTick, emitWarning: value => host.stderr.write(String(value) + '\n') };
 const EventEmitter = internalRequire('events');
@@ -786,9 +799,10 @@ function cliError(message) {
   host.writeStartupDiagnostic(process.execPath + ': ' + message + '\n');
   return process.exit(9);
 }
-function loadRuntimeEnvironment(args) {
+function loadRuntimeEnvironment(args, beforeLoading) {
   const files = internalRequire('internal/options').environmentFiles(args);
   if (!files.length) return;
+  if (beforeLoading) beforeLoading();
   const { loaded, errors } = internalRequire('internal/dotenv').loadEnvironmentFiles(files);
   if (errors.length) return cliError(errors.join('\n' + process.execPath + ': '));
   if (loaded) loader.Module._initPaths();
@@ -796,8 +810,10 @@ function loadRuntimeEnvironment(args) {
 function run() {
   if (workerBootstrap) return runWorker();
   if (native.seaNative(0)) return internalRequire('internal/sea').runMain(native.argv.slice(1), runtimeFlag, installRuntimeOptions, runPreloads, loadRuntimeEnvironment);
-  const startupEnvironment = { ...process.env };
-  loadRuntimeEnvironment(native.argv.slice(1));
+  // The environment as the process got it, before any environment file: only a
+  // watch supervisor needs it, so it is copied only when a file is about to load.
+  let startupEnvironment;
+  loadRuntimeEnvironment(native.argv.slice(1), () => { startupEnvironment = { ...process.env }; });
   const options = internalRequire('internal/options');
   let environment;
   try {
@@ -1033,7 +1049,7 @@ Environment:
     return supervisor.start({
       args: supervisor.withoutWatchOptions(process.execArgv).concat(process.argv.length > 1 ? ['--', ...process.argv.slice(1)] : []),
       paths: watchPaths, preserveOutput: watchPreserveOutput, killSignal: watchKillSignal,
-      envFiles: options.environmentFiles(native.argv.slice(1)), env: startupEnvironment,
+      envFiles: options.environmentFiles(native.argv.slice(1)), env: startupEnvironment ?? { ...process.env },
     });
   }
   host.testCoverageOptions = testOptions;
