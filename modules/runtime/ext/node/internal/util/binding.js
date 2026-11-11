@@ -74,7 +74,15 @@ function getExternalValue(value) {
   throw error;
 }
 
+// uv_sleep: blocks the thread for msec milliseconds without running the loop.
+let sleepCell;
+function sleep(msec) {
+  sleepCell ??= new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(sleepCell, 0, 0, msec);
+}
+
 module.exports = {
+  sleep,
   ALL_PROPERTIES,
   ONLY_ENUMERABLE,
   SKIP_SYMBOLS,
