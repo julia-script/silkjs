@@ -124,6 +124,7 @@ host.initializeRealmBuiltins = (handle, global, wasmCodeGeneration) => {
   const bridge = {
     captureCallSites: native.captureCallSites,
     errorStackState: host.errorStackState,
+    builtinLoaded: moduleHas,
     wasmNative: native.vmWasmNative(handle),
     wasmRealmState: host.wasmRealmState,
     wasmCodeGeneration,
