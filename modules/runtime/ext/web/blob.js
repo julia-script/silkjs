@@ -1,10 +1,10 @@
 'use strict';
 
 // Encoding and streams load on first use; URL (and so startup) requires this module.
-const TextDecoder = function(...args) { return new (require('internal/web/encoding').TextDecoder)(...args); };
+const TextDecoder = function(...args) { return new (require('internal/encoding').TextDecoder)(...args); };
 const ReadableStream = function(...args) { return new (require('internal/web/streams').ReadableStream)(...args); };
 let encoderInstance;
-const encoder = { encode: text => (encoderInstance ||= new (require('internal/web/encoding').TextEncoder)()).encode(text) };
+const encoder = { encode: text => (encoderInstance ||= new (require('internal/encoding').TextEncoder)()).encode(text) };
 const blobs = new WeakMap();
 const files = new WeakMap();
 const objectURLs = new Map();
@@ -40,6 +40,9 @@ function integer(value) {
 const fileReaders = new FinalizationRegistry(fd => {
   try { require('fs').closeSync(fd); } catch (_) {}
 });
+const kInspect = Symbol.for('nodejs.util.inspect.custom');
+const inspectValue = (value, options) => require('internal/util/inspect').inspect(value, options);
+
 class BlobReader {
   constructor(record) { this.parts = record.parts; this.index = 0; this.offset = 0; this.fd = -1; }
   close() {
@@ -96,20 +99,22 @@ function copyBytes(record) {
   return result;
 }
 
+// Node's sourcesConverter: sequence<(BlobPart)>, each part kept as bytes, a blob or text.
+function blobPart(part) {
+  if (blobs.has(part)) return { blob: state(part) };
+  if (part instanceof ArrayBuffer || (typeof SharedArrayBuffer === 'function' && part instanceof SharedArrayBuffer)) {
+    return { bytes: new Uint8Array(new Uint8Array(part)) };
+  }
+  if (ArrayBuffer.isView(part)) return { bytes: new Uint8Array(new Uint8Array(part.buffer, part.byteOffset, part.byteLength)) };
+  return { text: scalarString(part) };
+}
+let blobPartsConverter;
+
 class Blob {
   constructor(blobParts = [], options = {}) {
-    if (blobParts == null || typeof blobParts === 'string' || typeof blobParts[Symbol.iterator] !== 'function') {
-      throw new TypeError('blobParts must be an iterable sequence');
-    }
     // Web IDL converts the sequence before the options dictionary.
-    const values = Array.from(blobParts, part => {
-      if (blobs.has(part)) return { blob: state(part) };
-      if (part instanceof ArrayBuffer || (typeof SharedArrayBuffer === 'function' && part instanceof SharedArrayBuffer)) {
-        return { bytes: new Uint8Array(new Uint8Array(part)) };
-      }
-      if (ArrayBuffer.isView(part)) return { bytes: new Uint8Array(new Uint8Array(part.buffer, part.byteOffset, part.byteLength)) };
-      return { text: scalarString(part) };
-    });
+    blobPartsConverter ??= require('internal/webidl').createSequenceConverter(blobPart);
+    const values = blobPartsConverter(blobParts);
     options = optionsObject(options);
     const endings = options.endings === undefined ? 'transparent' : string(options.endings);
     if (endings !== 'transparent' && endings !== 'native') throw new TypeError('Invalid endings value');
@@ -138,10 +143,27 @@ class Blob {
   }
   get size() { return state(this).size; }
   get type() { return state(this).type; }
+  // Node's lib/internal/blob.js [kInspect].
+  [kInspect](depth, options) {
+    if (depth < 0)
+      return this;
+
+    const opts = {
+      ...options,
+      depth: options.depth == null ? null : options.depth - 1,
+    };
+
+    return `Blob ${inspectValue({
+      size: this.size,
+      type: this.type,
+    }, opts)}`;
+  }
   slice(start = 0, end = undefined, contentType = '') {
     const source = state(this);
-    start = integer(start);
-    end = end === undefined ? source.size : integer(end);
+    // Node's slice: Web IDL long long conversions, clamped.
+    const { converters } = require('internal/webidl');
+    start = converters['long long'](start, { __proto__: null, context: 'start', clamp: true });
+    end = end === undefined ? source.size : converters['long long'](end, { __proto__: null, context: 'end', clamp: true });
     const first = start < 0 ? Math.max(source.size + start, 0) : Math.min(start, source.size);
     const last = end < 0 ? Math.max(source.size + end, 0) : Math.min(end, source.size);
     const size = Math.max(last - first, 0);
@@ -216,6 +238,24 @@ class File extends Blob {
     const file = files.get(this);
     if (!file) throw new TypeError('Invalid File receiver');
     return file.lastModified;
+  }
+  // Node's lib/internal/file.js [kInspect].
+  [kInspect](depth, options) {
+    if (depth < 0) {
+      return this;
+    }
+
+    const opts = {
+      ...options,
+      depth: options.depth == null ? null : options.depth - 1,
+    };
+
+    return `File ${inspectValue({
+      size: this.size,
+      type: this.type,
+      name: this.name,
+      lastModified: this.lastModified,
+    }, opts)}`;
   }
 }
 for (const Constructor of [Blob, File]) {

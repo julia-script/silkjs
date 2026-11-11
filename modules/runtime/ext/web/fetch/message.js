@@ -137,8 +137,8 @@ class Request {
 // A Response made with no headers gets its Headers object only when something asks for it: until
 // then `fields` is null and `contentType` holds the one field the body gave it.
 class ResponseRecord {
-  constructor(status, statusText, fields, payload) {
-    this.status = status; this.statusText = statusText; this.fields = fields; this.body = payload;
+  constructor(status, statusText, fields, payload, contentType = null) {
+    this.status = status; this.statusText = statusText; this.fields = fields; this.body = payload; this.contentType = contentType;
   }
   get headers() {
     let headers = this.fields;
@@ -151,7 +151,7 @@ class ResponseRecord {
   set headers(value) { this.fields = value; }
 }
 // What most responses share; a response that differs gets its own field.
-Object.assign(ResponseRecord.prototype, { contentType: null, type: 'default', url: '', redirected: false, immutable: false });
+Object.assign(ResponseRecord.prototype, { type: 'default', url: '', redirected: false, immutable: false });
 
 class Response {
   #state;
@@ -173,13 +173,10 @@ class Response {
       if (init.headers !== undefined) headers = new Headers(init.headers);
     }
     const payload = typeof value === 'string' ? textBody(value) : body.extract(value);
-    if (payload && nullBodyStatus.has(status)) throw new TypeError('Invalid response status code for a body: ' + status);
-    const record = new ResponseRecord(status, statusText, headers, payload);
-    if (payload?.type) {
-      if (headers === null) record.contentType = payload.type;
-      else if (!headers.has('content-type')) headers.set('content-type', payload.type);
-    }
-    this.#state = record;
+    if (payload !== null && status !== 200 && nullBodyStatus.has(status)) throw new TypeError('Invalid response status code for a body: ' + status);
+    const type = payload === null ? null : payload.type;
+    if (type && headers !== null && !headers.has('content-type')) headers.set('content-type', type);
+    this.#state = new ResponseRecord(status, statusText, headers, payload, headers === null && type ? type : null);
   }
   clone() {
     const record = responseState(this), headers = new Headers(record.headers);
@@ -251,4 +248,4 @@ function serverRequest(fields, authority, bytes) {
 }
 body.readStates(value => readRequest(value) ?? readResponse(value));
 body.installBody(Request.prototype); body.installBody(Response.prototype);
-module.exports = { Request, Response, copyRequestRecord, requestState, responseState, makeResponse, serverRequest, nullBodyStatus, redirectStatus };
+module.exports = { Request, Response, copyRequestRecord, readResponse, requestState, responseState, makeResponse, serverRequest, nullBodyStatus, redirectStatus };
