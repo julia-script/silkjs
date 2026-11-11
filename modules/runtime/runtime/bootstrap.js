@@ -1031,6 +1031,7 @@ function runtimeFlag(arg) {
   if (arg === '--experimental-import-meta-resolve') { host.importMetaResolveParent = true; return true; }
   if (arg === '--experimental-print-required-tla') { host.printRequiredTLA = true; return true; }
   if (arg === '--experimental-import-text') { host.importText = true; return true; }
+  if (arg.startsWith('--experimental-package-map=')) { host.packageMap = arg.slice(27); return true; }
   if (arg.startsWith('--experimental-loader=') || arg.startsWith('--loader=')) {
     loaderPreloads.push(arg.slice(arg.indexOf('=') + 1)); return true;
   }
@@ -1425,9 +1426,7 @@ function run() {
     installCommonJSInputGlobals(name, '[eval]');
     armInspectorEntry();
     // As in Node, the script is named [eval] while module.filename is under the cwd.
-    const result = native.compileFunction(code, '[eval]', undefined, undefined, undefined, true);
-    if (print) console.log(result);
-    return afterMain(result);
+    return afterMain(internalRequire('internal/process/execution').evalScript('[eval]', code, print));
   }
   if (filename === undefined || filename === '-') {
     let source = rawStd.in.readAsString();
@@ -1440,9 +1439,7 @@ function run() {
     }
     installCommonJSInputGlobals(name, '[stdin]');
     armInspectorEntry();
-    const result = native.compileFunction(source, '[stdin]', undefined, undefined, undefined, true);
-    if (print) console.log(result);
-    return afterMain(result);
+    return afterMain(internalRequire('internal/process/execution').evalScript('[stdin]', source, print));
   }
   const path = host.path.resolve(filename);
   process.argv[1] = path;
@@ -1569,11 +1566,13 @@ function loop() {
 }
 const imageModules = ['fs', 'fs/promises', 'internal/fs_streams', 'internal/fs_utf8_stream', 'path', 'os',
   'events', 'stream', 'stream/promises', 'string_decoder', 'util', 'assert', 'console', 'net', 'tty',
-  'internal/tty/write', 'url', 'internal/web/url', 'internal/web/encoding', 'internal/abort_controller'];
+  'internal/tty/write', 'url', 'internal/web/url', 'internal/encoding', 'internal/abort_controller',
+  'internal/process/execution'];
 globalThis.__silkRuntime = {
   normalize(name, parent, attributes) { return loader.importKey(name, parent, attributes); },
   load(name, attributes) { return loader.loadESM(name, attributes).source; },
   moduleSource(name, parent, attributes) { return loader.moduleSource(name, parent, attributes); },
+  moduleError(name, error) { loader.moduleEvaluationError(name, error); },
   registerSource(filename, source, metadata) {
     host.registerSource(filename, source, { ...metadata, owner: metadata });
     if (!metadata.generated && typeof filename === 'string') {

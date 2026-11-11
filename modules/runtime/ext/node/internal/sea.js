@@ -1,7 +1,7 @@
 'use strict';
 const host = require('internal/host');
 const { Buffer } = require('buffer');
-const { TextDecoder } = require('internal/web/encoding');
+const { TextDecoder } = require('internal/encoding');
 const utf8 = new TextDecoder();
 const align = value => Math.ceil(value / 8) * 8;
 function error(code, message, Type = Error) { return Object.assign(new Type(message), { code }); }
