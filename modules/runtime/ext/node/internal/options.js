@@ -75,7 +75,7 @@ const environmentOptions = new Map([
     '--preserve-symlinks-main', '--no-preserve-symlinks-main',
     '--experimental-vm-modules', '--no-experimental-vm-modules',
     '--experimental-require-module', '--no-experimental-require-module',
-    '--experimental-import-meta-resolve', '--experimental-print-required-tla',
+    '--experimental-import-meta-resolve', '--experimental-print-required-tla', '--experimental-import-text',
     '--enable-source-maps', '--no-enable-source-maps',
     '--trace-sigint', '--no-trace-sigint',
     '--strip-types', '--no-strip-types', '--experimental-strip-types', '--no-experimental-strip-types',
@@ -272,6 +272,7 @@ function getOptionValue(name) {
     case '--inspect-port': return { host: host.inspectorOptions?.host ?? '127.0.0.1', port: host.inspectorOptions?.port ?? 9229 };
     case '--localstorage-file': return host.localStorageFile;
     case '--experimental-print-required-tla': return !!host.printRequiredTLA;
+    case '--experimental-import-text': return !!host.importText;
     default: return startupControls.getOptionValue(name);
   }
 }
