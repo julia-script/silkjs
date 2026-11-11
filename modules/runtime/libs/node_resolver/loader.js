@@ -1140,7 +1140,7 @@ function createLoader(host, builtins) {
   }
 
   function asyncModuleError(filename, parent) {
-    return error('ERR_REQUIRE_ASYNC_MODULE', filesystemName(filename), parent);
+    return error('ERR_REQUIRE_ASYNC_MODULE', filesystemName(filename), parent, undefined);
   }
 
   // Node's hint for a CommonJS global used in an ES module.

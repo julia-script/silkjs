@@ -150,6 +150,11 @@ function lazyInternalUtil() {
   return internalUtil;
 }
 
+// internal/util's setOwnProperty, until the runtime ports internal/util.
+function setOwnProperty(object, key, value) {
+  return ObjectDefineProperty(object, key, { __proto__: null, configurable: true, enumerable: true, value, writable: true });
+}
+
 let internalUtilInspect = null;
 function lazyInternalUtilInspect() {
   internalUtilInspect ??= { inspect: require('internal/util_inspect').inspect, format: require('util').format };
@@ -1485,7 +1490,7 @@ E('ERR_MISSING_OPTION', '%s is required', TypeError);
 E('ERR_MODULE_LINK_MISMATCH', '%s', TypeError);
 E('ERR_MODULE_NOT_FOUND', function(path, base, exactUrl) {
   if (exactUrl) {
-    lazyInternalUtil().setOwnProperty(this, 'url', `${exactUrl}`);
+    setOwnProperty(this, 'url', `${exactUrl}`);
   }
   return `Cannot find ${
     exactUrl ? 'module' : 'package'} '${path}' imported from ${base}`;
@@ -1790,7 +1795,7 @@ E('ERR_UNKNOWN_MODULE_FORMAT', 'Unknown module format: %s for URL %s',
   RangeError);
 E('ERR_UNKNOWN_SIGNAL', 'Unknown signal: %s', TypeError, HideStackFramesError);
 E('ERR_UNSUPPORTED_DIR_IMPORT', function(path, base, exactUrl) {
-  lazyInternalUtil().setOwnProperty(this, 'url', exactUrl);
+  setOwnProperty(this, 'url', exactUrl);
   return `Directory import '${path}' is not supported ` +
     `resolving ES modules imported from ${base}`;
 }, Error);
