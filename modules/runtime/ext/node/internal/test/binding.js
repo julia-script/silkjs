@@ -22,17 +22,8 @@ const kBindings = {
   // node_http_parser.cc: HTTPParser, ConnectionsList, methods, allMethods.
   http_parser: () => require('internal/http/native-parser'),
   util: () => require('internal/util/binding'),
-  uv: () => {
-    // Node's uv binding: every UV_ code from the system error map, errname and the map.
-    const map = require('util').getSystemErrorMap();
-    const uv = { __proto__: null };
-    for (const { 0: errno, 1: { 0: name } } of map) uv[`UV_${name}`] = errno;
-    return {
-      ...uv, ...net().uv,
-      getErrorMap: () => new Map(map),
-      getErrorMessage: (err) => map.get(err)?.[1] ?? `Unknown system error ${err}`,
-    };
-  },
+  timers: () => require('internal/timers_binding'),
+  uv: () => require('internal/uv_binding'),
   tcp_wrap: () => net().tcp_wrap,
   pipe_wrap: () => net().pipe_wrap,
   tty_wrap: () => net().tty_wrap,

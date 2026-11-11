@@ -484,6 +484,9 @@ const PipeConstants = { SOCKET: Pipe.SOCKET, SERVER: Pipe.SERVER, IPC: Pipe.IPC,
 class TTY extends StreamHandle {
   constructor(fd, ctx) {
     super();
+    // As uv_tty_init: a regular file, or a descriptor it cannot tell, is EINVAL.
+    const kind = host.net('guessHandleType', [fd]);
+    if (kind < 0 || kind === 6) { fillContext(ctx, uv.UV_EINVAL, 'uv_tty_init'); return; }
     const owned = host.net('duplicateFd', [fd]);
     if (owned < 0) { fillContext(ctx, owned, 'uv_tty_init'); return; }
     let transport;
