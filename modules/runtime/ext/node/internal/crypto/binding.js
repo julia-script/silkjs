@@ -410,6 +410,8 @@ function defineJob(name, prepare) {
 function bytesOf(value) {
   if (value === undefined || value === null) return Buffer.alloc(0);
   if (value instanceof KeyObjectHandle) return own(stateOf(value).secret);
+  // ArrayBufferOrViewContents reads a detached backing store as empty.
+  if ((ArrayBuffer.isView(value) ? value.buffer : value)?.detached === true) return Buffer.alloc(0);
   return Buffer.from(c.bytes(value, undefined, 'data'));
 }
 function keyId(handle) { return c.handle(handle); }

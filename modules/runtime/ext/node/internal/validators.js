@@ -31,9 +31,6 @@ const {
 function isInt32(value) {
   return value === (value | 0);
 }
-function isUint32(value) {
-  return value === (value >>> 0);
-}
 
 function codedError(Base, code, message) {
   const error = new Base(message);
@@ -207,7 +204,7 @@ for (const fn of [validateString, validateBoolean, validateFunction, validateNum
 
 module.exports = {
   codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_MISSING_ARGS, ERR_OUT_OF_RANGE },
-  codedError, unknownSignal, isInt32, isUint32,
+  codedError, unknownSignal, isInt32,
   kValidateObjectAllowNullable, kValidateObjectAllowArray, kValidateObjectAllowFunction,
   validateString, validateBoolean, validateFunction, validateNumber, validateInteger, validateInt32,
   validateUint32, validateObject, validateArray, validateOneOf, validateAbortSignal,
