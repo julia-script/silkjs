@@ -33,7 +33,8 @@ function integer(value, name, min, max) {
   return value;
 }
 function normalizeEncoding(enc) {
-  if (enc === undefined || enc === null || enc === '') return 'utf8';
+  if (enc === undefined || enc === null || enc === '' || enc === 'utf8' || enc === 'utf-8') return 'utf8';
+  if (enc === 'latin1') return 'latin1';
   if (typeof enc !== 'string') return undefined;
   switch (enc.toLowerCase()) {
     case 'utf8': case 'utf-8': return 'utf8';
@@ -56,6 +57,9 @@ function size(value) {
   return Math.trunc(value);
 }
 function isArrayBuffer(value) {
+  if (value instanceof ArrayBuffer) return true;
+  // Views and primitives are never buffers; skip building their tag strings.
+  if (value === null || typeof value !== 'object' || ArrayBuffer.isView(value)) return false;
   return Object.prototype.toString.call(value) === '[object ArrayBuffer]' ||
     Object.prototype.toString.call(value) === '[object SharedArrayBuffer]';
 }
@@ -178,6 +182,7 @@ Buffer.copyBytesFrom = function copyBytesFrom(view, offset, length) {
 Buffer.isBuffer = function isBuffer(value) { return value instanceof Buffer; };
 Buffer.isEncoding = function isEncoding(enc) { return typeof enc === 'string' && enc.length > 0 && normalizeEncoding(enc) !== undefined; };
 Buffer.byteLength = function byteLength(value, enc) {
+  if (typeof value === 'string' && enc === undefined) return host.bufferCodec(0, value);
   if (isArrayBuffer(value) || ArrayBuffer.isView(value)) return value.byteLength;
   if (typeof value !== 'string') throw type('string', 'string or an instance of Buffer or ArrayBuffer', value);
   switch (normalizeEncoding(enc) || 'utf8') {
@@ -293,6 +298,11 @@ Buffer.prototype.write = function write(string, offset, length, enc) {
     if (normalized === 'utf16le') length = Math.min(length, remaining);
     else if (length > remaining) throw error(RangeError, 'ERR_BUFFER_OUT_OF_BOUNDS', '"length" is outside of buffer bounds');
     return host.bufferCodec(normalized === 'utf8' ? 1 : 2, string, this, offset, length);
+  }
+  if (normalized === 'latin1' || normalized === 'ascii') {
+    const remaining = this.length - offset;
+    if (remaining < 0) throw error(RangeError, 'ERR_BUFFER_OUT_OF_BOUNDS', '"offset" is outside of buffer bounds');
+    return host.bufferCodec(5, string, this, offset, Math.min(length, remaining, string.length));
   }
   const bytes = encode(string, normalized, length);
   this.set(bytes, offset);

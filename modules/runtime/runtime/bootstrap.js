@@ -228,14 +228,20 @@ function invokeResource(scope, callback, receiver, args, destroy = true) {
   finally { if (destroy) scope.emitDestroy(); }
 }
 host.invokeResource = invokeResource;
+// Queues drain from a head index: Array.prototype.shift moves every element.
+// ticks holds flat (callback, args, scope) triples.
 const ticks = [];
+let tickHead = 0;
 const completions = [];
+let completionHead = 0;
+const ticksPending = () => ticks.length !== tickHead;
+const completionsPending = () => completions.length !== completionHead;
 // Compound native operations finish through promises, but their public
 // callbacks are I/O completions, not microtasks. Dispatch them outside drainJobs.
 host.enqueueIOCompletion = callback => completions.push(callback);
 host.nextTick = (callback, ...args) => {
   if (typeof callback !== 'function') throw Object.assign(new TypeError('The callback argument must be a function'), { code: 'ERR_INVALID_ARG_TYPE' });
-  ticks.push([callback, args, resource('TickObject')]);
+  ticks.push(callback, args, resource('TickObject'));
 };
 host.queueMicrotask = callback => {
   checkCallback(callback);
@@ -277,14 +283,20 @@ function onRejection(promise, reason, handled) {
 function checkpoint() {
   do {
     while (true) {
-      while (ticks.length) {
-        const [callback, args, scope] = ticks.shift();
+      while (tickHead !== ticks.length) {
+        const at = tickHead;
+        const callback = ticks[at], args = ticks[at + 1], scope = ticks[at + 2];
+        ticks[at] = ticks[at + 1] = ticks[at + 2] = undefined;
+        tickHead = at + 3;
         invokeResource(scope, callback, undefined, args);
       }
+      ticks.length = tickHead = 0;
       native.drainJobs();
-      if (ticks.length) continue;
-      if (!completions.length) break;
-      completions.shift()();
+      if (ticksPending()) continue;
+      if (!completionsPending()) { completions.length = completionHead = 0; break; }
+      const completion = completions[completionHead];
+      completions[completionHead++] = undefined;
+      completion();
     }
     while (rejections.size) {
       const pending = [...rejections];
@@ -303,8 +315,8 @@ function checkpoint() {
     asyncHooks._drainDestroy();
     // Listeners and destroy hooks may themselves queue promises or next ticks.
     // These must settle before testing loop liveness or emitting beforeExit.
-    if (!ticks.length) native.drainJobs();
-  } while (ticks.length || rejections.size || completions.length);
+    if (!ticksPending()) native.drainJobs();
+  } while (ticksPending() || rejections.size || completionsPending());
 }
 host.checkpoint = checkpoint;
 class Timeout {
@@ -1216,7 +1228,7 @@ function pollWorkers() {
 // Milliseconds the native poll may wait: 0 when JavaScript work is ready, the
 // delay to the next timer, or -1 to wait for native completions alone.
 function pollTimeout(pendingPromise) {
-  if (ticks.length || immediates.size) return 0;
+  if (ticksPending() || immediates.size) return 0;
   if (pendingPromise !== undefined && native.promiseState(pendingPromise) !== 0) return 0;
   const referenced = referencedWork();
   if (!referenced && pendingPromise === undefined) return 0;

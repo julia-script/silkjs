@@ -206,6 +206,8 @@ function cachedHandle(value, source, filename, line, column, prefix = 0, kind = 
   } catch (cause) {
     // Checksums do not make externally supplied bytecode safe. The native reader
     // independently validates operands, control flow, metadata and ownership.
+    // null: the cache is valid, but a debugger needs code compiled with metadata.
+    if (cause instanceof SyntaxError && cause.message === 'Silk script cache has no debugger metadata') return null;
     if (cause instanceof SyntaxError || cause instanceof TypeError || cause instanceof RangeError) return undefined;
     throw cause;
   }
@@ -265,7 +267,7 @@ class Script {
       handle = cachedHandle(opts.cachedData, source, filename, line, column);
       this.cachedDataRejected = handle === undefined;
     }
-    if (handle === undefined) handle = compile(source, filename, line, column);
+    if (handle == null) handle = compile(source, filename, line, column);
     const dynamicImport = importCallback(opts.importModuleDynamically, this, filename);
     host.vmSetImportModuleDynamically(handle, dynamicImport);
     scripts.set(this, { source, handle, dynamicImport, realms: new WeakMap() });
@@ -334,7 +336,7 @@ function compileFunction(code, params = [], value) {
   source += '}'.repeat(extensions.length) + '})';
   let handle = opts.cachedData === undefined ? undefined : cachedHandle(opts.cachedData, source, filename, line, column, prefix, 1);
   const rejected = opts.cachedData !== undefined && handle === undefined;
-  if (handle === undefined) {
+  if (handle == null) {
     try { host.vmValidateFunctionBody(code, filename, context && context.handle); }
     catch (cause) { syntaxDiagnostic(cause, code, filename, line, column); }
     handle = compile(source, filename, line, column, prefix, code);

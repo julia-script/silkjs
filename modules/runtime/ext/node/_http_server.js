@@ -122,6 +122,7 @@ class Server extends net.Server {
         if (info.upgrade) return { upgrade: true };
         const res = new this._ServerResponse(req, this._responseOptions);
         req.res = res; res._active = state.responses.length === 0;
+        res._keepAliveTimeout = this.keepAliveTimeout; res._maxRequestsPerSocket = this.maxRequestsPerSocket;
         state.responses.push(res); res.assignSocket(socket);
         if (this.maxRequestsPerSocket > 0 && state.count >= this.maxRequestsPerSocket) res.shouldKeepAlive = false;
         res.on('error', err => socket.destroy(err));
@@ -182,8 +183,9 @@ class Server extends net.Server {
       for (const req of state.requests) req._abort();
       for (const res of state.responses) if (!res._closed) res.destroy();
     };
-    const detach = () => { socket.removeListener('data', onData); socket.removeListener('end', onEnd); socket.removeListener('error', onError); socket.removeListener('timeout', onTimeout); socket.removeListener('close', onClose); };
-    socket.on('data', onData); socket.on('end', onEnd); socket.on('error', onError); socket.on('timeout', onTimeout); socket.on('close', onClose);
+    const onDrain = () => { if (state.responses.length) state.responses[0]._onSocketDrain(); };
+    const detach = () => { socket.removeListener('drain', onDrain); socket.removeListener('data', onData); socket.removeListener('end', onEnd); socket.removeListener('error', onError); socket.removeListener('timeout', onTimeout); socket.removeListener('close', onClose); };
+    socket.on('data', onData); socket.on('end', onEnd); socket.on('error', onError); socket.on('timeout', onTimeout); socket.on('close', onClose); socket.on('drain', onDrain);
     armHeaders();
   }
 }
