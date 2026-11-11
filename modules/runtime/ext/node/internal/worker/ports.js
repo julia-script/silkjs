@@ -2,10 +2,13 @@
 
 const host = require('internal/host');
 const EventEmitter = require('events');
-const { AsyncResource } = require('async_hooks');
 const { Event, EventTarget, kEvents } = require('internal/path_events/event_target');
 const { MessageEvent } = require('internal/web/websocket/events');
 const clone = require('internal/worker/clone');
+const { _createResource: createResource } = require('async_hooks');
+const { codes: { ERR_MISSING_ARGS } } = require('internal/validators');
+const inspectCustom = Symbol.for('nodejs.util.inspect.custom');
+const constructCallInvalid = () => clone.codedError('ERR_CONSTRUCT_CALL_INVALID', 'Constructor cannot be called');
 const states = new WeakMap();
 const endpoints = new Map();
 const retained = new Map();
@@ -22,6 +25,11 @@ function state(port) {
 function id(port) {
   const value = state(port);
   if (value.id === null) throw clone.cloneError('MessagePort is already detached or closed.');
+  return value.id;
+}
+function transferId(port) {
+  const value = state(port);
+  if (value.id === null) throw clone.cloneError('MessagePort in transfer list is already detached');
   return value.id;
 }
 function retain(port) {
@@ -55,7 +63,10 @@ function dispose(port, notify) {
   retained.delete(value.id);
   finalizer.unregister(port);
   value.id = null;
-  if (notify) host.nextTick(() => { emit(port, 'close'); value.resource.emitDestroy(); });
+  if (notify) {
+    value.closing = true;
+    host.nextTick(() => { value.closing = false; emit(port, 'close'); value.resource.emitDestroy(); });
+  }
   else value.resource.emitDestroy();
 }
 function start(port) {
@@ -73,6 +84,7 @@ function close(port, callback) {
     else value.emitter.once('close', callback);
   }
   if (value.id === null) return;
+  value.refedAtClose = host.workerNative('hasRef', [value.id]);
   host.workerNative('close', [value.id]);
   dispose(port, true);
 }
@@ -86,32 +98,39 @@ function ref(port, enabled) {
   return port;
 }
 function initialize(port, endpoint, realm) {
-  states.set(port, { id: endpoint, started: false, refed: false, emitter: new EventEmitter(),
-    resource: new AsyncResource('MESSAGEPORT'), realm, handlers: Object.create(null) });
+  const value = { id: endpoint, started: false, refed: false, emitter: new EventEmitter(),
+    resource: null, realm, handlers: Object.create(null), closing: false, refedAtClose: false };
+  states.set(port, value);
   endpoints.set(endpoint, new WeakRef(port));
   finalizer.register(port, endpoint, port);
   host.workerNative('start', [endpoint, false]);
   host.workerNative('ref', [endpoint, false]);
+  // Like Node's, the async resource of a port is the port itself.
+  value.resource = createResource('MESSAGEPORT', port);
   return port;
 }
-class MessagePort extends EventTarget {
+function hasRef(port) {
+  const value = state(port);
+  if (value.id === null) return value.closing ? value.refedAtClose : false;
+  return host.workerNative('hasRef', [value.id]);
+}
+class InternalMessagePort extends EventTarget {
   constructor(key, endpoint) {
     super();
-    if (key !== token) throw clone.codedError('ERR_CONSTRUCT_CALL_INVALID', 'MessagePort cannot be constructed directly');
+    if (key !== token) throw constructCallInvalid();
     initialize(this, endpoint);
   }
   postMessage(value, transferList) {
-    if (arguments.length === 0) throw clone.codedError('ERR_MISSING_ARGS', 'The value argument must be specified');
+    if (arguments.length === 0) throw new ERR_MISSING_ARGS('value');
     const data = state(this);
     if (data.id === null) return;
-    const list = transferList && typeof transferList === 'object' && !transferList[Symbol.iterator] ? transferList.transfer : transferList;
-    clone.post(data.id, value, list);
+    clone.post(data.id, value, transferList);
   }
   start() { start(this); }
   close(callback) { close(this, callback); }
   ref() { return ref(this, true); }
   unref() { return ref(this, false); }
-  hasRef() { const value = state(this); return value.id !== null && host.workerNative('hasRef', [value.id]); }
+  hasRef() { return hasRef(this); }
   addEventListener(type, listener, options) {
     super.addEventListener(type, listener, options);
     if (type === 'message' && this[kEvents].get(type)?.size) ref(this, true);
@@ -172,7 +191,7 @@ class MessagePort extends EventTarget {
   getMaxListeners() { return state(this).emitter.getMaxListeners(); }
 }
 for (const type of ['message', 'messageerror', 'close']) {
-  Object.defineProperty(MessagePort.prototype, 'on' + type, {
+  Object.defineProperty(InternalMessagePort.prototype, 'on' + type, {
     enumerable: true, configurable: true,
     get() { return state(this).handlers[type] || null; },
     set(callback) {
@@ -187,24 +206,39 @@ for (const type of ['message', 'messageerror', 'close']) {
     },
   });
 }
-Object.defineProperty(MessagePort.prototype, Symbol.toStringTag, { value: 'MessagePort', configurable: true });
+// MessagePort cannot be constructed by user code, with or without new; ports come from
+// MessageChannel and transfers. Its prototype is the internal class's.
+function MessagePort() { throw constructCallInvalid(); }
+MessagePort.prototype = InternalMessagePort.prototype;
+Object.defineProperty(MessagePort.prototype, 'constructor', { value: MessagePort, writable: true, configurable: true });
+Object.setPrototypeOf(MessagePort, EventTarget);
+Object.defineProperty(MessagePort.prototype, inspectCustom, {
+  enumerable: false, writable: false, configurable: true,
+  value: function inspect() {
+    let ref;
+    try { ref = state(this).id === null ? undefined : hasRef(this); } catch { return this; }
+    return Object.assign({ __proto__: MessagePort.prototype }, ref === undefined ? { active: false } : { active: true, refed: ref }, this);
+  },
+});
 if (Symbol.dispose) MessagePort.prototype[Symbol.dispose] = MessagePort.prototype.close;
 function wrap(endpoint, realm) {
-  if (!realm) return new MessagePort(token, endpoint);
+  if (!realm) return new InternalMessagePort(token, endpoint);
   return initialize(realm.makePort({
     post(port, value, list) { const data = state(port); if (data.id !== null) clone.post(data.id, value, list); },
     start, close, ref, retain,
-    hasRef(port) { const data = state(port); return data.id !== null && host.workerNative('hasRef', [data.id]); },
+    hasRef,
   }), endpoint, realm);
 }
-class MessageChannel {
-  constructor() {
-    const pair = host.workerNative('channel', []);
-    this.port1 = wrap(pair[0]);
-    this.port2 = wrap(pair[1]);
+function MessageChannel() {
+  if (new.target === undefined) {
+    throw clone.codedError('ERR_CONSTRUCT_CALL_REQUIRED', 'Class constructor MessageChannel cannot be invoked without `new`');
   }
+  const pair = host.workerNative('channel', []);
+  this.port1 = wrap(pair[0]);
+  this.port2 = wrap(pair[1]);
 }
 function receiveMessageOnPort(port) {
+  if (!states.has(port)) throw clone.codedError('ERR_INVALID_ARG_TYPE', 'The "port" argument must be a MessagePort instance');
   const endpoint = state(port).id;
   if (endpoint === null) return undefined;
   const envelope = host.workerNative('receive', [endpoint]);
@@ -222,6 +256,7 @@ function dispatch(event) {
   return true;
 }
 function moveMessagePortToContext(port, context) {
+  if (states.get(port)?.id === null) throw clone.codedError('ERR_CLOSED_MESSAGE_PORT', 'Cannot send data on closed MessagePort');
   const endpoint = id(port);
   const vm = require('vm');
   if (!vm.isContext(context)) throw clone.codedError('ERR_INVALID_ARG_TYPE', 'The contextifiedSandbox argument must be a vm.Context');
@@ -270,6 +305,6 @@ function moveMessagePortToContext(port, context) {
   endpoints.set(endpoint, new WeakRef(moved));
   return moved;
 }
-clone.installPortHooks({ isPort: port => states.has(port), id, wrap, detach: port => dispose(port, true), close });
+clone.installPortHooks({ isPort: port => states.has(port), id, transferId, wrap, detach: port => dispose(port, true), close });
 module.exports = { MessagePort, MessageChannel, receiveMessageOnPort, moveMessagePortToContext,
   wrap, id, dispatch, close, start, ref };
