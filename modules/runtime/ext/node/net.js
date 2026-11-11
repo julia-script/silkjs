@@ -221,24 +221,35 @@ Socket.prototype._onNative = function(type, status, payload) {
       this._bytesRead += payload.byteLength;
       this._refreshTimeout();
     }
-    const consumer = this._streamConsumers?.[this._streamConsumers.length - 1];
-    if (consumer && consumer.read(status, payload) !== false) return;
-    if (status === -4095) {
-      this._readEOF = true;
-      // Match Node's onStreamRead: read(0) schedules end for an empty,
-      // unconsumed socket without consuming any buffered application data.
-      if (!this._onreadPending) this._pushEOF();
-      return;
-    }
-    if (status < 0) { this.destroy(nativeError(status, 'read')); return; }
-    if (!payload || !payload.byteLength) return;
-    const chunk = Buffer.from(payload);
-    if (this._onread && typeof this._onread.callback === 'function') {
-      if (this._onreadPending) (this._onreadQueue ||= []).push(chunk);
-      else this._onreadPending = chunk;
-      this._deliverOnread();
-    } else if (!this.push(chunk) && this._transport) this._transport.readStop();
+    this._onRead(status, payload);
   }
+};
+Socket.prototype._onRead = function(status, payload) {
+  const consumer = this._streamConsumers?.[this._streamConsumers.length - 1];
+  // Reads the native side queued before a readStop are held while the socket is
+  // paused, so a consumer (an HTTP parser) sees no data after pause, as with libuv.
+  // The payload is only lent for the event, so a held read keeps a copy. _read
+  // replays them in order.
+  if (this._consumerQueue || (consumer && this._readPaused)) {
+    (this._consumerQueue ||= []).push(status, payload ? payload.slice(0) : payload);
+    return;
+  }
+  if (consumer && consumer.read(status, payload) !== false) return;
+  if (status === -4095) {
+    this._readEOF = true;
+    // Match Node's onStreamRead: read(0) schedules end for an empty,
+    // unconsumed socket without consuming any buffered application data.
+    if (!this._onreadPending) this._pushEOF();
+    return;
+  }
+  if (status < 0) { this.destroy(nativeError(status, 'read')); return; }
+  if (!payload || !payload.byteLength) return;
+  const chunk = Buffer.from(payload);
+  if (this._onread && typeof this._onread.callback === 'function') {
+    if (this._onreadPending) (this._onreadQueue ||= []).push(chunk);
+    else this._onreadPending = chunk;
+    this._deliverOnread();
+  } else if (!this.push(chunk) && this._transport) this._transport.readStop();
 };
 Socket.prototype._deliverOnread = function() {
   while (this._onreadPending?.length && !this._readPaused && !this.destroyed) {
@@ -266,6 +277,18 @@ Socket.prototype._read = function() {
   if (this._onreadPending) {
     this._deliverOnread();
     if (this._readPaused || this.destroyed) return;
+  }
+  const queue = this._consumerQueue;
+  if (queue) {
+    this._consumerQueue = null;
+    for (let i = 0; i < queue.length; i += 2) {
+      this._onRead(queue[i], queue[i + 1]);
+      if (this._readPaused || this.destroyed || this._consumerQueue) {
+        if (!this.destroyed) this._consumerQueue = queue.slice(i + 2).concat(this._consumerQueue || []);
+        if (!this._consumerQueue?.length) this._consumerQueue = null;
+        return;
+      }
+    }
   }
   if (this._readEOF) return;
   const status = this._transport.readStart();
@@ -327,6 +350,11 @@ Socket.prototype._destroy = function(err, cb) {
   if (pending?.callback) process.nextTick(pending.callback, fail('ERR_SOCKET_CLOSED_BEFORE_CONNECTION', 'Socket closed before the connection was established'));
   else if (pending) pending();
   const done = () => {
+    // Like Node's _destroy, the server counts the connection closed without a listener.
+    if (this._server) {
+      this._server._connections--;
+      this._server._emitCloseIfDrained?.();
+    }
     cb(err);
     process.nextTick(() => this.emit('close', this._hadError));
   };
@@ -627,7 +655,6 @@ Server.prototype._acceptSocket = function(socket) {
   ++this._connections;
   socket.server = this;
   socket._server = this;
-  socket.once('close', () => { --this._connections; this._emitCloseIfDrained(); });
   if (this._options.noDelay !== undefined) socket.setNoDelay(this._options.noDelay);
   if (this._options.keepAlive !== undefined) socket.setKeepAlive(this._options.keepAlive, this._options.keepAliveInitialDelay || 0);
   if (this.pauseOnConnect) socket.pause();
