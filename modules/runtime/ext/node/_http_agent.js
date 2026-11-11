@@ -149,7 +149,6 @@ function removeFreeSocketDataGuard(socket) {
     if (at !== -1) consumers.splice(at, 1);
   }
 }
-}
 
 function Agent(options) {
   if (!(this instanceof Agent))
