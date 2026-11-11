@@ -14,6 +14,14 @@ function site(error, fromPromise) {
     if (thrown !== undefined) return { name: thrown[0], line: thrown[1], column: thrown[2], text: thrown[3] };
   }
   if (error === null || typeof error !== 'object') return undefined;
+  // A script that did not compile: V8's message points at the bad token.
+  const own = Object.prototype.hasOwnProperty;
+  if (!fromPromise && error instanceof SyntaxError && own.call(error, 'fileName') && own.call(error, 'lineNumber')) {
+    const { fileName, lineNumber, columnNumber } = error;
+    if (typeof fileName === 'string' && Number.isInteger(lineNumber)) {
+      return { name: fileName, line: lineNumber, column: columnNumber, text: undefined };
+    }
+  }
   try { void error.stack; } catch { return undefined; }
   const frame = require('internal/error_stack').origin(error);
   if (frame === undefined) return undefined;
