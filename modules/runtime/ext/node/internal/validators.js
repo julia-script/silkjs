@@ -234,7 +234,7 @@ function validateBuffer(buffer, name = 'buffer') {
 }
 function validateArray(value, name, minLength = 0) {
   if (!Array.isArray(value)) throw ERR_INVALID_ARG_TYPE(name, 'Array', value);
-  if (value.length < minLength) throw ERR_INVALID_ARG_VALUE(name, value, `must be longer than ${minLength}`);
+  if (value.length < minLength) throw ERR_INVALID_ARG_VALUE(name, value, `must have a length of at least ${minLength}`);
 }
 function validateAbortSignal(signal, name) {
   if (signal !== undefined && (signal === null || typeof signal !== 'object' || !('aborted' in signal))) throw ERR_INVALID_ARG_TYPE(name, 'AbortSignal', signal);
