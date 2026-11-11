@@ -23,20 +23,26 @@ const groups = [
   ['worker_threads', ['MessageChannel', 'MessagePort', 'BroadcastChannel']],
 ];
 
-function defineLazy(target, name, load) {
-  const settle = value => Object.defineProperty(target, name, { value, writable: true, enumerable: true, configurable: true });
-  Object.defineProperty(target, name, {
-    get() { const value = load()[name]; settle(value); return value; },
-    set(value) { settle(value); },
-    enumerable: true, configurable: true,
-  });
+// Node lists only these web globals in Object.keys(globalThis); interfaces
+// such as URL or TextEncoder are non-enumerable, as WebIDL defines them.
+const enumerableGlobals = new Set(['fetch', 'structuredClone', 'navigator']);
+
+// The accessors carry Node's names (`get fetch`), which tests and
+// util.inspect show.
+function defineLazy(target, name, load, enumerable) {
+  const settle = value => Object.defineProperty(target, name, { value, writable: true, enumerable, configurable: true });
+  const get = function () { const value = load()[name]; settle(value); return value; };
+  const set = function (value) { settle(value); };
+  Object.defineProperty(get, 'name', { value: 'get ' + name });
+  Object.defineProperty(set, 'name', { value: 'set ' + name });
+  Object.defineProperty(target, name, { get, set, enumerable, configurable: true });
 }
 
 function install(target) {
   for (const [id, names] of groups) {
     let exports;
     const load = () => exports || (exports = require(id));
-    for (const name of names) defineLazy(target, name, load);
+    for (const name of names) defineLazy(target, name, load, enumerableGlobals.has(name));
   }
 }
 
