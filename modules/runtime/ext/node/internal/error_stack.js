@@ -11,12 +11,13 @@ function install(global) {
   const WeakMap = global.WeakMap;
   const state = host.errorStackState || (host.errorStackState = {
     records: new WeakMap(), captured: new WeakMap(), rootError: Error, formatting: false,
+    origins: new WeakMap(),
     // Node's overrideStackTrace: a one-shot formatter for one error, ahead of Error.prepareStackTrace.
     overrides: new WeakMap(),
     // internal/errors: NodeErrors answer true to kIsNodeError (Node's symbol of the same name).
     kIsNodeError: Symbol('kIsNodeError'),
   });
-  const { records, captured, rootError, kIsNodeError } = state;
+  const { records, captured, rootError, kIsNodeError, origins } = state;
   const define = Object.defineProperty;
   function record(site) {
     const value = records.get(site);
@@ -199,6 +200,11 @@ function install(global) {
     if (raw === undefined) return undefined;
     const frames = [];
     for (let index = 0; index < raw.length; index++) frames[index] = fromNative(raw[index]);
+    for (const frame of frames) {
+      if (frame.isNative || !(frame.lineNumber > 0) || !frame.scriptName) continue;
+      if (typeof error === 'object' && error !== null) origins.set(error, frame);
+      break;
+    }
     if (state.formatting) return defaultFormat(error, frames);
     state.formatting = true;
     try {
@@ -254,8 +260,15 @@ function install(global) {
   host.captureCallSites(0, Error, format);
 }
 
+// The first frame with a source location of error's formatted stack, where V8
+// places the message of an error no throw statement threw.
+function origin(error) {
+  return host.errorStackState?.origins.get(error);
+}
+
 module.exports = {
   install,
+  origin,
   get overrideStackTrace() { return host.errorStackState.overrides; },
   get ErrorPrepareStackTrace() { return host.errorStackState.defaultPrepare; },
 };
