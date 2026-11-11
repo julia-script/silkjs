@@ -322,6 +322,7 @@ function reportUncaught(error) {
     exceptionInFatalHandler(next);
   }
 }
+host.triggerUncaughtException = reportUncaught;
 // Runs a timer or immediate callback; true when it threw (and was reported).
 function invokeReporting(callback, receiver, args) {
   try { Reflect.apply(callback, receiver, args); return false; }
@@ -801,7 +802,12 @@ process.getBuiltinModule = function getBuiltinModule(id) {
   return builtinRequire(id);
 };
 process.loadEnvFile = function loadEnvFile(path = undefined) { return internalRequire('internal/dotenv').loadEnvFile(path); };
-if (workerThreads.isMainThread && process.env.NODE_UNIQUE_ID !== undefined) internalRequire('cluster');
+// Like Node's initializeClusterWorker: a cluster worker joins its primary, then the variable is gone.
+function setupClusterWorker() {
+  internalRequire('cluster')._setupWorker();
+  delete process.env.NODE_UNIQUE_ID;
+}
+if (workerThreads.isMainThread && process.env.NODE_UNIQUE_ID !== undefined) setupClusterWorker();
 Object.defineProperty(globalThis, '__silkModuleBridge', { value: loader.bridge });
 let mainModuleName;
 let inspectorStartupArmed = false;
@@ -1524,7 +1530,7 @@ globalThis.__silkRuntime = {
     loader.Module._initPaths();
     internalRequire('internal/child_process/ipc').installChild(process);
     internalRequire('internal/watch_mode/dependencies').initialize();
-    if (process.env.NODE_UNIQUE_ID !== undefined) internalRequire('cluster');
+    if (process.env.NODE_UNIQUE_ID !== undefined) setupClusterWorker();
     for (const refresh of hydrations) refresh();
     performanceMilestones.bootstrapComplete = native.now() - startTime;
   }

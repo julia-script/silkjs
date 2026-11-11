@@ -4,7 +4,10 @@ const host = require('internal/host');
 const apply = Reflect.apply;
 const hookNames = ['init', 'before', 'after', 'destroy', 'promiseResolve'];
 const hooks = new Set();
-const promiseHooks = new Set();
+// internalBinding('async_wrap').setPromiseHooks: one function per event, set by
+// internal/promise_hooks (which runs several hooks for one event itself).
+let promiseHookFunctions = [undefined, undefined, undefined, undefined];
+const promiseEventIndex = { init: 0, before: 1, after: 2, settled: 3 };
 const nativeResources = new Map();
 const rootResource = {};
 const resourceOwnerToken = Symbol('resourceOwner');
@@ -38,7 +41,7 @@ function executionAsyncResource() {
 let promiseObserver;
 function setPromiseObserver(observer) { promiseObserver = observer; syncNativeHooks(); }
 function syncNativeHooks() {
-  let enabled = !emitting && (promiseHooks.size !== 0 || promiseObserver !== undefined);
+  let enabled = !emitting && (promiseHookFunctions.some(Boolean) || promiseObserver !== undefined);
   if (!emitting) for (const hook of hooks) {
     if (hook.trackPromises && hookNames.some(name => hook.callbacks[name] !== undefined)) { enabled = true; break; }
   }
@@ -63,41 +66,27 @@ function emit(name, args, promise = false) {
     syncNativeHooks();
   }
 }
-function createPromiseHook(callbacks = {}) {
-  if (callbacks === null || typeof callbacks !== 'object')
-    throw error('ERR_INVALID_ARG_TYPE', 'The "callbacks" argument must be an object');
-  const listener = Object.create(null);
-  for (const name of ['init', 'before', 'after', 'settled']) {
-    const callback = callbacks[name];
-    if (callback === undefined) continue;
-    checkFunction(callback, name);
-    if (require('util/types').isAsyncFunction(callback))
-      throw error('ERR_INVALID_ARG_TYPE', `The "${name}" hook must not be an async function`);
-    listener[name] = callback;
-  }
-  if (Object.keys(listener).length) promiseHooks.add(listener);
+function setPromiseHooks(init, before, after, settled) {
+  promiseHookFunctions = [init, before, after, settled];
   syncNativeHooks();
-  return () => { promiseHooks.delete(listener); syncNativeHooks(); };
 }
+// An exception from a promise hook is uncaught, as Node's hook functions report it.
 function emitPromise(name, promise, parent) {
-  if (emitting || promiseHooks.size === 0) return;
-  const listeners = Array.from(promiseHooks);
+  const callback = promiseHookFunctions[promiseEventIndex[name]];
+  if (emitting || callback === undefined) return;
   emitting = true;
   syncNativeHooks();
+  let thrown;
   try {
-    for (const listener of listeners) {
-      const callback = listener[name];
-      if (callback !== undefined) {
-        if (name === 'init') callback(promise, parent);
-        else callback(promise);
-      }
-    }
+    if (name === 'init') callback(promise, parent);
+    else callback(promise);
   } catch (exception) {
-    host.asyncHookFatal(exception);
+    thrown = { exception };
   } finally {
     emitting = false;
     syncNativeHooks();
   }
+  if (thrown !== undefined) host.triggerUncaughtException(thrown.exception);
 }
 function enqueueDestroy(state) {
   if (state.destroyed) return;
@@ -137,7 +126,8 @@ const kId = Symbol('asyncId'), kScope = Symbol('asyncScope'), kStack = Symbol('a
 function frameScope(id, trigger, resource) { return { stores: undefined, id, trigger, resource }; }
 
 class AsyncResource {
-  #context;
+  // Only the stores: the whole context would keep the resource that was current alive.
+  #stores;
   #id;
   #trigger;
   #destroy;
@@ -182,14 +172,14 @@ class AsyncResource {
   [kStack]() { return this.#previousContexts ??= []; }
   [kScope](omitFrame) {
     if (omitFrame && usesContextFrames()) return frameScope(this.#id, this.#trigger, this.#owner ?? this);
-    return this.#scope ??= { stores: this.#context?.stores, id: this.#id, trigger: this.#trigger, resource: this.#owner ?? this };
+    return this.#scope ??= { stores: this.#stores, id: this.#id, trigger: this.#trigger, resource: this.#owner ?? this };
   }
   constructor(type, options = {}, token, owner, explicitId) {
     if (typeof type !== 'string') throw error('ERR_INVALID_ARG_TYPE', 'The "type" argument must be a string');
     if (type.length === 0 && Array.from(hooks).some(hook => hook.callbacks.init !== undefined)) throw error('ERR_ASYNC_TYPE', 'Invalid name for async "type"');
     const trigger = typeof options === 'number' ? options : options.triggerAsyncId ?? executionAsyncId();
     if (!Number.isSafeInteger(trigger) || trigger < -1) throw error('ERR_INVALID_ASYNC_ID', `Invalid triggerAsyncId value: ${trigger}`, RangeError);
-    this.#context = captureContext();
+    this.#stores = captureContext()?.stores;
     this.#id = token === resourceOwnerToken && typeof explicitId === 'number' && explicitId !== -1 ? explicitId : nextId++;
     this.#trigger = trigger;
     this.#destroy = { id: this.#id, destroyed: false, promise: false };
@@ -235,7 +225,8 @@ class InternalResource {
     if (typeof type !== 'string') throw error('ERR_INVALID_ARG_TYPE', 'The "type" argument must be a string');
     if (hooks.size !== 0 && type.length === 0 && Array.from(hooks).some(hook => hook.callbacks.init !== undefined)) throw error('ERR_ASYNC_TYPE', 'Invalid name for async "type"');
     const context = captureContext();
-    this.context = context;
+    // Only the stores: the whole context would keep the resource that was current alive.
+    this.stores = context?.stores;
     this.id = typeof explicitId === 'number' && explicitId !== -1 ? explicitId : nextId++;
     this.trigger = context?.id ?? 1;
     this.owner = owner;
@@ -249,7 +240,7 @@ class InternalResource {
   [kStack]() { return this.stack ??= []; }
   [kScope](omitFrame) {
     if (omitFrame && usesContextFrames()) return frameScope(this.id, this.trigger, this.owner ?? this);
-    return this.scope ??= { stores: this.context?.stores, id: this.id, trigger: this.trigger, resource: this.owner ?? this };
+    return this.scope ??= { stores: this.stores, id: this.id, trigger: this.trigger, resource: this.owner ?? this };
   }
   asyncId() { return this.id; }
   triggerAsyncId() { return this.trigger; }
@@ -404,7 +395,7 @@ const asyncWrapProviders = Object.freeze({
 });
 module.exports = { AsyncLocalStorage, AsyncResource, createHook, executionAsyncId, triggerAsyncId, executionAsyncResource, asyncWrapProviders };
 Object.defineProperties(module.exports, {
-  _createPromiseHook: { value: createPromiseHook },
+  _setPromiseHooks: { value: setPromiseHooks },
   _createResource: { value: (type, owner, id) => new InternalResource(type, owner, id) },
   _enterResource: { value: (resource, omitFrame = false) => enterResource(resource, omitFrame) },
   _leaveResource: { value: resource => leaveResource(resource) },
@@ -417,4 +408,5 @@ Object.defineProperties(module.exports, {
   _nativeDestroy: { value: nativeDestroy },
   _setPromiseObserver: { value: setPromiseObserver },
   _drainDestroy: { value: drainDestroy },
+  _newAsyncId: { value: () => nextId++ },
 });

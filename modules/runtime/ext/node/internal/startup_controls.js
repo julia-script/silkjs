@@ -9,10 +9,13 @@ const booleanOptions = new Map([
   // allocations already meet --zero-fill-buffers.
   ['--zero-fill-buffers', 'zeroFillBuffers'],
   ['--abort-on-uncaught-exception', 'abortOnUncaughtException'], ['--trace-exit', 'traceExit'],
+  ['--network-family-autoselection', 'networkFamilyAutoselection'],
 ]);
-const valueOptions = new Set(['--disable-warning', '--redirect-warnings', '--unhandled-rejections', '--stack-trace-limit']);
+const valueOptions = new Set(['--disable-warning', '--redirect-warnings', '--unhandled-rejections', '--stack-trace-limit',
+  '--network-family-autoselection-attempt-timeout']);
 const rejectionModes = new Set(['throw', 'strict', 'warn', 'warn-with-error-code', 'none']);
-const state = { warnings: true, deprecation: true, unhandledRejections: 'throw' };
+const state = { warnings: true, deprecation: true, unhandledRejections: 'throw',
+  networkFamilyAutoselection: true, networkFamilyAutoselectionAttemptTimeout: 250 };
 const disabledWarnings = new Set();
 let traceHelperShown = false;
 let warningFd;
@@ -38,6 +41,7 @@ function applyOption(arg) {
   if (error) throw new Error(error);
   if (name === '--disable-warning') disabledWarnings.add(value);
   else if (name === '--redirect-warnings') state.redirectWarnings = value;
+  else if (name === '--network-family-autoselection-attempt-timeout') state.networkFamilyAutoselectionAttemptTimeout = Number(value);
   // A V8 flag: it sets the initial Error.stackTraceLimit and the depth of --trace-exit stacks.
   else if (name === '--stack-trace-limit') Error.stackTraceLimit = state.stackTraceLimit = Number(value);
   else state.unhandledRejections = value;
@@ -228,6 +232,7 @@ module.exports = {
     if (name === '--pending-deprecation') return !!host.pendingDeprecation;
     if (name === '--disable-warning') return [...disabledWarnings];
     if (name === '--redirect-warnings') return state.redirectWarnings || '';
+    if (name === '--network-family-autoselection-attempt-timeout') return state.networkFamilyAutoselectionAttemptTimeout;
     const key = booleanOptions.get(name);
     return key ? state[key] : undefined;
   },

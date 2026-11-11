@@ -274,8 +274,6 @@ class Worker extends EventEmitter {
       controlChannel.port1.postMessage({ workerData: config.options.workerData,
         environmentData: Array.from(environmentData), parentPort: userChannel.port2,
         options: config.metadata }, [userChannel.port2, ...list]);
-      // OpenSSL providers are configured once, on this thread, before any worker starts.
-      host.crypto('prepareThreads', []);
       state.id = host.workerNative('startWorker', [JSON.stringify(config.metadata), ports().id(controlChannel.port2), Math.floor(config.metadata.resourceLimits.stackSizeMb * 1048576), config.metadata.name]);
       // Native ownership of this endpoint moved into the new isolate.
       clone().commit({ moved: [controlChannel.port2] });

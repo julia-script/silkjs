@@ -689,17 +689,21 @@ def normalize(records):
     """Normalize the structured native compiler-error ABI, not syntax failures.
 
     CompilerError intentionally has no C parser stacktrace/coordinates. The
-    enclosing tokenStart/cursor is still compared exactly. SyntaxError retains
-    complete message and line/column, including absent locations encoded as zero.
+    enclosing tokenStart/cursor is still compared exactly. SyntaxError keeps
+    line/column, including absent locations encoded as zero, but not its text,
+    which Silk words like V8.
     """
     import re
     templates = [
         (r'too many local variables', 0), (r'too many arguments', 1),
-        (r'too many closure variables', 2), (r'invalid redefinition of lexical identifier', 3),
-        (r'invalid redefinition of parameter name', 4), (r'invalid redefinition of a variable', 5),
-        (r'invalid redefinition of global identifier', 6),
-        (r"undefined private field '(.*)'", 7),
-        (r"exported variable '(.*)' does not exist", 8),
+        (r'too many closure variables', 2),
+        # Silk words redefinitions like V8 with one message for every kind,
+        # so all four collapse to one kind on both sides.
+        (r'invalid redefinition of lexical identifier', 3), (r'invalid redefinition of parameter name', 3),
+        (r'invalid redefinition of a variable', 3), (r'invalid redefinition of global identifier', 3),
+        (r"Identifier '.*' has already been declared", 3),
+        (r"undefined private field '(.*)'", 7), (r"Private field '(.*)' must be declared in an enclosing class", 7),
+        (r"exported variable '(.*)' does not exist", 8), (r"Export '(.*)' is not defined in module", 8),
     ]
     result = []
     for label, payload in records:
@@ -716,6 +720,10 @@ def normalize(records):
                             if match.groups():
                                 payload.append(('compilerName', tuple(ord(c) for c in match[1])))
                             break
+                    else:
+                        # Silk's SyntaxError text follows V8, not QuickJS; the
+                        # location still has to match exactly.
+                        payload = [(name, () if name == 'message' else value) for name, value in payload]
         result.append((label, payload))
     return result
 

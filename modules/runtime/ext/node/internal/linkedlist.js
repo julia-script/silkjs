@@ -1,4 +1,4 @@
-// linkedlist copied from Node.js v24.22.1 lib/internal/linkedlist.js.
+// Adapted from Node.js v24.22.1 lib/internal/linkedlist.js by tools/port_node_net.py.
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a

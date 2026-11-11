@@ -65,6 +65,12 @@ function validateBoolean(value, name) {
 function validateFunction(value, name) {
   if (typeof value !== 'function') throw new ERR_INVALID_ARG_TYPE(name, 'Function', value);
 }
+// A function that is neither async nor a generator.
+function validatePlainFunction(value, name) {
+  validateFunction(value, name);
+  const types = require('util/types');
+  if (types.isAsyncFunction(value) || types.isGeneratorFunction(value)) throw new ERR_INVALID_ARG_TYPE(name, 'function', value);
+}
 function validateNumber(value, name, min, max) {
   if (typeof value !== 'number') throw new ERR_INVALID_ARG_TYPE(name, 'number', value);
   if ((min != null && value < min) || (max != null && value > max) || ((min != null || max != null) && Number.isNaN(value))) {
@@ -202,10 +208,18 @@ function checkRangesOrGetDefault(number, name, lower, upper, def) {
   }
   return number;
 }
+function validateStringWithoutNullBytes(value, name) {
+  validateString(value, name);
+  if (value.includes('\u0000')) {
+    throw new ERR_INVALID_ARG_VALUE(name, value, 'must be a string without null bytes');
+  }
+}
+
 // Node wraps its validators in hideStackFrames(), whose callers inside other
 // hidden frames use fn.withoutStackTrace.
-for (const fn of [validateString, validateBoolean, validateFunction, validateNumber, validateInteger, validateInt32,
-  validateUint32, validateObject, validateArray, validateOneOf, validateAbortSignal, validateBuffer]) {
+for (const fn of [validateString, validateBoolean, validateFunction, validatePlainFunction, validateNumber, validateInteger, validateInt32,
+  validateUint32, validateObject, validateArray, validateOneOf, validateAbortSignal, validateBuffer,
+  validateStringWithoutNullBytes]) {
   fn.withoutStackTrace = fn;
 }
 
@@ -214,9 +228,10 @@ module.exports = {
   codedError, unknownSignal, isInt32,
   kValidateObjectAllowNullable, kValidateObjectAllowArray, kValidateObjectAllowFunction,
   kValidateObjectAllowObjects, kValidateObjectAllowObjectsAndNull,
-  validateString, validateBoolean, validateFunction, validateNumber, validateInteger, validateInt32,
+  validateString, validateBoolean, validateFunction, validatePlainFunction, validateNumber, validateInteger, validateInt32,
   validateUint32, validateObject, validateArray, validateOneOf, validateAbortSignal,
   isUint32, parseFileMode, validateBuffer, validateLinkHeaderValue,
   convertToValidSignal, signalName, toPathIfFileURL, validatePath, getValidatedPath, validatePort,
   validateFiniteNumber, checkRangesOrGetDefault, validateThisInternalField,
+  validateStringWithoutNullBytes,
 };
