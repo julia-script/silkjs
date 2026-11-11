@@ -64,10 +64,16 @@ function stringValue(part) {
   if (part.tag === 28) { let out = ''; for (let i = 0; i < part.data.length; i += 4) out += String.fromCodePoint(part.data.readUInt32BE(i)); return out; }
   return part.data.toString(part.tag === 20 ? 'latin1' : 'utf8');
 }
+// The universal tags with a tag2nbyte width in OpenSSL's a_strex.c.
+const kUtf8Convertible = new Set([12, 18, 19, 20, 22, 23, 24, 26, 28, 30]);
 function nameObject(part) {
   const result = Object.create(null);
   for (const rdn of children(part.data)) for (const attr of children(rdn.data)) {
-    const pair = children(attr.data), key = oidName(oid(pair[0].data), true), value = stringValue(pair[1]);
+    const pair = children(attr.data);
+    // ASN1_STRING_to_UTF8 only converts the string and time types; Node
+    // leaves out the entries it cannot convert.
+    if (!kUtf8Convertible.has(pair[1].tag)) continue;
+    const key = oidName(oid(pair[0].data), true), value = stringValue(pair[1]);
     if (result[key] === undefined) result[key] = value;
     else if (Array.isArray(result[key])) result[key].push(value);
     else result[key] = [result[key], value];
@@ -172,8 +178,8 @@ class X509Certificate {
   get raw() { return cached(this, 'raw', () => Buffer.from(call(this, 'x509Raw'))); }
   get publicKey() { return cached(this, 'publicKey', () => c.keyFromHandle('public', call(this, 'x509PublicKey'))); }
   get ca() { return cached(this, 'ca', () => !!call(this, 'x509CA')); }
-  toString() { return cached(this, 'pem', () => call(this, 'x509PEM')); }
-  toJSON() { return this.toString(); }
+  toString() { return pem(this); }
+  toJSON() { return pem(this); }
   checkHost(name, options) { return check(this, 'x509Host', name, 'name', options); }
   checkEmail(email, options) { return check(this, 'x509Email', email, 'email', options); }
   checkIP(ip, options) { return check(this, 'x509IP', ip, 'ip', options); }
@@ -183,10 +189,14 @@ class X509Certificate {
   toLegacyObject() { state(this); return legacy(this, new Map()); }
   [Symbol.for('nodejs.util.inspect.custom')](depth, options) {
     if (depth < 0) return this;
-    const value = {}; for (const name of ['subject', 'subjectAltName', 'issuer', 'infoAccess', 'validFrom', 'validTo', 'validFromDate', 'validToDate', 'fingerprint', 'fingerprint256', 'fingerprint512', 'keyUsage', 'serialNumber', 'signatureAlgorithm', 'signatureAlgorithmOid']) value[name] = this[name];
+    // Node reads the native slots, never the patchable prototype getters.
+    const value = {}; for (const [name, get] of kInspectGetters) value[name] = get.call(this);
     return 'X509Certificate ' + require('util').inspect(value, { ...options, depth: options.depth == null ? null : options.depth - 1 });
   }
 }
+const kInspectGetters = ['subject', 'subjectAltName', 'issuer', 'infoAccess', 'validFrom', 'validTo', 'validFromDate', 'validToDate', 'fingerprint', 'fingerprint256', 'fingerprint512', 'keyUsage', 'serialNumber', 'signatureAlgorithm', 'signatureAlgorithmOid']
+  .map(name => [name, Object.getOwnPropertyDescriptor(X509Certificate.prototype, name).get]);
+function pem(cert) { return cached(cert, 'pem', () => call(cert, 'x509PEM')); }
 function fingerprint(cert, digest) { return cached(cert, digest, () => { const value = Buffer.from(call(cert, 'x509Fingerprint', digest)); return Array.from(value, byte => byte.toString(16).padStart(2, '0').toUpperCase()).join(':'); }); }
 function Certificate() { if (!(this instanceof Certificate)) return new Certificate(); }
 function verifySpkac(spkac, encoding) { return !!c.call('spkacVerify', [c.packed(c.bytes(spkac, encoding, 'spkac'))]); }

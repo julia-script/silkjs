@@ -590,27 +590,38 @@ function hkdf(hash, key, salt, info, length, cb) { const args = hkdfCheck(hash, 
 // properties. A KeyObjectHandle is internal: like Node, user code cannot construct a KeyObject.
 const keySlots = new WeakMap();
 const kCreatePrivate = 0, kCreatePublic = 1, kConsumePrivate = 2, kConsumePublic = 3;
-class KeyObjectHandle { constructor(value) { this.value = value; } }
+const binding = require('internal/crypto/binding');
+const { KeyObjectHandle } = binding;
 let dep0203Warned = false, dep0204Warned = false;
 function emitDEP0203() { if (dep0203Warned) return; dep0203Warned = true; process.emitWarning('Passing a CryptoKey to node:crypto functions is deprecated.', 'DeprecationWarning', 'DEP0203'); }
 function isKeyObject(key) { return key !== null && typeof key === 'object' && keySlots.has(key); }
 require('internal/host').types.isKeyObject = isKeyObject;
 function keySlotsOf(key, expected = 'KeyObject') { const slots = key !== null && typeof key === 'object' ? keySlots.get(key) : undefined; if (slots === undefined) throw codes.ERR_INVALID_THIS(expected); return slots; }
 function isCryptoKey(value) { return require('internal/host').types.isCryptoKey(value); }
-function cryptoKeyObject(value) { return require('internal/crypto_webcrypto').unwrap(value); }
+function cryptoKeyObject(value) { const keys = require('internal/crypto/keys'); return keyObjectFromHandle(keys.getCryptoKeyType(value), keys.getCryptoKeyHandle(value)); }
+function keyObjectFromHandle(type, handle) { return type === 'secret' ? new SecretKeyObject(handle) : type === 'public' ? new PublicKeyObject(handle) : new PrivateKeyObject(handle); }
 class KeyObject {
   constructor(type, handle) {
     if (type !== 'secret' && type !== 'public' && type !== 'private') throw codes.ERR_INVALID_ARG_VALUE('type', type);
-    if (typeof handle !== 'object' || !(handle instanceof KeyObjectHandle)) throw codes.ERR_INVALID_ARG_TYPE('handle', 'object', handle);
-    const slots = { type, secret: undefined, asymmetricKeyType: undefined, details: undefined };
-    if (type === 'secret') slots.secret = Buffer.from(handle.value); else attach(this, handle.value);
+    if (typeof handle !== 'object' || !binding.isKeyObjectHandle(handle)) throw codes.ERR_INVALID_ARG_TYPE('handle', 'object', handle);
+    const slots = { type, handle, secret: undefined, asymmetricKeyType: undefined, details: undefined };
+    if (type === 'secret') slots.secret = binding.handleSecret(handle); else c.share(this, handle);
     keySlots.set(this, slots);
   }
   get type() { return keySlotsOf(this).type; }
-  toCryptoKey(algorithm, extractable, keyUsages) { keySlotsOf(this); return require('internal/crypto_webcrypto').toCryptoKey(this, algorithm, extractable, keyUsages); }
+  toCryptoKey(algorithm, extractable, keyUsages) {
+    const slots = keySlotsOf(this);
+    const webidl = require('internal/crypto/webidl'), keys = require('internal/crypto/keys');
+    algorithm = require('internal/crypto/util').normalizeAlgorithm(webidl.converters.AlgorithmIdentifier(algorithm), 'importKey');
+    extractable = webidl.converters.boolean(extractable);
+    keyUsages = webidl.converters['sequence<KeyUsage>'](keyUsages);
+    return slots.type === 'secret' ? keys.toCryptoKeySecret(slots.handle, algorithm, extractable, keyUsages) : keys.toCryptoKey(slots.handle, algorithm, extractable, keyUsages);
+  }
   static from(key) {
     if (!isCryptoKey(key)) throw codes.ERR_INVALID_ARG_TYPE('key', 'CryptoKey', key);
-    if (!key.extractable && !dep0204Warned) { dep0204Warned = true; process.emitWarning('Passing a non-extractable CryptoKey to KeyObject.from() is deprecated.', 'DeprecationWarning', 'DEP0204'); }
+    const keys = require('internal/crypto/keys');
+    if (!keys.getCryptoKeyExtractable(key) && !dep0204Warned) { dep0204Warned = true; process.emitWarning('Passing a non-extractable CryptoKey to KeyObject.from() is deprecated.', 'DeprecationWarning', 'DEP0204'); }
+    if (keys.getCryptoKeySecondaryHandle(key) !== undefined) throw codes.ERR_INVALID_ARG_VALUE('key', key, 'cannot be represented by a single KeyObject');
     return cryptoKeyObject(key);
   }
   equals(otherKeyObject) {
@@ -655,9 +666,10 @@ function asymmetricKeyDetailsOf(key) {
       details = { modulusLength: call('keyBits', [handle(key)]), publicExponent: unsignedBig(Buffer.from(keyParam(key, 'e', 0) ?? [])) };
       if (type === 'rsa-pss') {
         // OpenSSL leaves out restriction fields that hold the RFC 8017 defaults
-        // (SHA-1, MGF1 with SHA-1, salt 20); an unrestricted key has none.
+        // (SHA-1, MGF1 with SHA-1, salt 20); an unrestricted key has none. A
+        // negative salt length makes ncrypto treat the parameters as absent.
         const digest = keyParam(key, 'digest', 1), mgf1 = keyParam(key, 'mgf1-digest', 1), saltLength = keyParam(key, 'saltlen', 2);
-        if (digest !== undefined || mgf1 !== undefined || saltLength !== undefined) {
+        if ((digest !== undefined || mgf1 !== undefined || saltLength !== undefined) && !(saltLength < 0)) {
           details.hashAlgorithm = digest === undefined ? 'sha1' : digestLongName(Buffer.from(digest).toString());
           details.mgf1HashAlgorithm = mgf1 === undefined ? 'sha1' : digestLongName(Buffer.from(mgf1).toString());
           details.saltLength = saltLength ?? 20;
@@ -811,10 +823,7 @@ function prepareAsymmetricKeyOptions(key, ctx, name, isPrivateKeyInput) {
   const parsed = parseKeyEncoding(key, undefined, isPrivateKeyInput ? false : undefined, name);
   return { data: keyData, format: parsed.format, type: parsed.type, passphrase: parsed.passphrase };
 }
-function newKeyObject(type, value) {
-  const handle = new KeyObjectHandle(value);
-  return type === 'secret' ? new SecretKeyObject(handle) : type === 'public' ? new PublicKeyObject(handle) : new PrivateKeyObject(handle);
-}
+function newKeyObject(type, value) { return keyObjectFromHandle(type, binding.createHandle(type, value)); }
 // Turns prepared key input into a KeyObject of the given type.
 function keyFromPrepared(prepared, type) {
   if (prepared.keyObject !== undefined) {
@@ -824,7 +833,11 @@ function keyFromPrepared(prepared, type) {
   }
   if (prepared.format === 'jwk') return require('internal/crypto_keys').importJwk(prepared.data, type);
   if (prepared.raw !== undefined) return c.providerRawImport(prepared.raw, type);
-  const { format, passphrase } = prepared, data = bytes(prepared.data);
+  const { format, passphrase } = prepared;
+  let data = bytes(prepared.data);
+  // PEM_read_bio_PrivateKey and friends skip blocks that hold no key, such
+  // as the EC PARAMETERS block `openssl ecparam -genkey` writes first.
+  if (format === 'pem') data = skipPemParameters(data);
   const [structure, keyType] = keyStructure(format, prepared.type, data);
   let id;
   try { id = call('keyImport', [packed(data), format.toUpperCase(), type === 'private' ? 1 : 0, packed(passphrase === undefined ? Buffer.alloc(0) : passphrase), passphrase === undefined ? 0 : 1, structure, keyType]); }
@@ -839,6 +852,11 @@ function keyStructure(format, type, data) {
   if (format === 'der') return kDerStructures[type] ?? ['', ''];
   const label = /-----BEGIN ([A-Z0-9 ]+)-----/.exec(data.toString('latin1'));
   return (label && kPemStructures[label[1]]) ?? ['', ''];
+}
+function skipPemParameters(data) {
+  const text = data.toString('latin1');
+  const block = /^\s*-----BEGIN ([A-Z0-9 ]*PARAMETERS)-----[\s\S]*?-----END \1-----/.exec(text);
+  return block && text.slice(block[0].length).includes('-----BEGIN ') ? skipPemParameters(data.subarray(block[0].length)) : data;
 }
 function importDer(data, type) { return newKeyObject(type, call('keyImport', [packed(data), 'DER', type === 'private' ? 1 : 0, packed(Buffer.alloc(0)), 0])); }
 // lib/internal/crypto/keys.js prepareSecretKey: the secret's bytes.
@@ -1024,6 +1042,11 @@ function signatureOptions(key) {
 }
 function signatureArgs(algorithm, data, key, options, signature) {
   if (options.context !== undefined && options.context.byteLength > 255) throw codes.ERR_OUT_OF_RANGE_MESSAGE('context string must be at most 255 bytes');
+  // EVPKeyPointer::supportsContextString: only the one-shot EdDSA, ML-DSA and
+  // SLH-DSA signatures take a context string.
+  if (options.context?.byteLength && !/^(?:ed25519|ed448|ml-dsa-|slh-dsa-)/.test(asymmetricKeyTypeOf(key))) {
+    throw codes.ERR_CRYPTO_OPERATION_FAILED('Context parameter is unsupported');
+  }
   // Streams follow Node_SignFinal: RSA options apply only to RSA keys.
   const rsa = !options.stream || /^rsa/.test(asymmetricKeyTypeOf(key));
   return [handle(key), algorithm ?? '', packed(data), signature === undefined ? undefined : packed(signature), rsa ? options.padding ?? 0 : 0, rsa ? options.saltLength ?? -2147483648 : -2147483648, options.context === undefined ? undefined : packed(options.context), options.stream ? 1 : 0];
@@ -1081,7 +1104,7 @@ function verify(algorithm, data, key, signature, cb) {
     const der = signatureFromP1363(signature, info.key, options);
     if (der === undefined) { if (cb !== undefined) { process.nextTick(cb, null, false); return; } return false; }
     const args = signatureArgs(algorithm, data, info.key, options, der);
-    if (cb !== undefined) { submit('verify', args, (e, result) => { if (info.owned) release(info.key); cb(e ? signFailure(e) : null, e ? undefined : !!result); }); submitted = true; return; }
+    if (cb !== undefined) { submit('verify', args, (e, result) => { if (info.owned) release(info.key); if (e) cb(signFailure(e)); else cb(null, !!result); }); submitted = true; return; }
     try { return !!call('verify', args); } catch (e) { throw signFailure(e); }
   } finally { if (!submitted && info.owned) release(info.key); }
 }
@@ -1348,7 +1371,7 @@ function createECDH(curve) { return new ECDH(curve); }
 function createDiffieHellman(sizeOrKey, keyEncoding, generator, genEncoding) { return new DiffieHellman(sizeOrKey, keyEncoding, generator, genEncoding); }
 function getDiffieHellman(group) { return new DiffieHellmanGroup(group); }
 module.exports = { constants, randomBytes, randomFill, randomFillSync, randomInt, randomUUID, timingSafeEqual, Hash: require('util').deprecate(Hash, 'crypto.Hash constructor is deprecated.', 'DEP0179'), Hmac: require('util').deprecate(Hmac, 'crypto.Hmac constructor is deprecated.', 'DEP0181'), createHash, createHmac, hash, Cipheriv, Decipheriv, createCipheriv, createDecipheriv, pbkdf2, pbkdf2Sync, scrypt, scryptSync, hkdf, hkdfSync, KeyObject, createSecretKey, createPrivateKey, createPublicKey, generateKey, generateKeySync, generateKeyPair, generateKeyPairSync, sign, verify, Sign, Verify, createSign, createVerify, diffieHellman, publicEncrypt, privateDecrypt, ECDH, createECDH, DiffieHellman, DiffieHellmanGroup, createDiffieHellman, getDiffieHellman, createDiffieHellmanGroup: getDiffieHellman };
-Object.defineProperty(module.exports, 'webcrypto', { enumerable: true, get() { return require('internal/crypto_webcrypto').webcrypto; } });
+Object.defineProperty(module.exports, 'webcrypto', { enumerable: true, get() { return require('internal/crypto/webcrypto').crypto; } });
 Object.defineProperty(module.exports, 'subtle', { enumerable: true, get() { return module.exports.webcrypto.subtle; } });
 module.exports.getRandomValues = value => module.exports.webcrypto.getRandomValues(value);
 // Node's filterDuplicateStrings: one entry per lowercased name, the last spelling seen wins.
@@ -1357,8 +1380,12 @@ module.exports.getHashes = () => names('hashes');
 module.exports.getCiphers = () => names('ciphers');
 module.exports.getCurves = () => names('curves');
 module.exports.getFips = () => call('getFips', []);
-module.exports.setFips = enabled => call('setFips', [enabled ? 1 : 0]);
+module.exports.setFips = enabled => { call('setFips', [enabled ? 1 : 0]); binding.noteFipsChange(); };
 c.keyFromHandle = (type, id) => newKeyObject(type, id);
+c.keyObjectFromHandle = keyObjectFromHandle;
+c.keyObjectHandle = key => keySlotsOf(key).handle;
+c.importKeyObject = keyFromPrepared;
+c.prepareSecretKey = prepareSecretKey;
 // Internal reads that bypass the public, user-replaceable KeyObject accessors.
 c.keyObjectType = key => keySlotsOf(key).type;
 c.keyObjectEquals = keyObjectEquals;

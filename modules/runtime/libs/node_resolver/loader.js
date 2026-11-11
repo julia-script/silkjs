@@ -217,9 +217,14 @@ function createLoader(host, builtins) {
   }
 
   function builtinName(specifier) {
+    // The runtime's own modules, such as silk:serve, have only their silk: names.
+    if (builtinPrefix(specifier, 'silk:')) {
+      if (!builtins.runtime(specifier)) throw error('ERR_UNKNOWN_BUILTIN_MODULE', `No such built-in module: ${specifier}`);
+      return specifier;
+    }
     if (builtinPrefix(specifier, 'node:')) {
       const name = builtinSlice(specifier, 5);
-      if (!builtins.listed(name) && !builtins.listed(specifier)) {
+      if (builtins.runtime(name) || (!builtins.listed(name) && !builtins.listed(specifier))) {
         throw error('ERR_UNKNOWN_BUILTIN_MODULE', specifier);
       }
       return name;
@@ -227,8 +232,17 @@ function createLoader(host, builtins) {
     return builtins.listed(specifier) && builtins.has(specifier) ? specifier : null;
   }
 
+  // Where a builtin lives: node:fs for Node's modules, the specifier itself for silk: ones.
+  function builtinFile(name) {
+    return builtinPrefix(name, 'silk:') ? name : 'node:' + name;
+  }
+
+  function isBuiltinFile(filename) {
+    return filename.startsWith('node:') || filename.startsWith('silk:');
+  }
+
   function loadBuiltin(filename) {
-    const name = builtinPrefix(filename, 'node:') ? builtinName(filename) : null;
+    const name = isBuiltinFile(filename) ? builtinName(filename) : null;
     if (name === null) throw error('ERR_UNKNOWN_BUILTIN_MODULE', filename);
     return builtins.get(name);
   }
@@ -241,7 +255,7 @@ function createLoader(host, builtins) {
   const detectedModules = new WeakSet();
 
   function format(filename, mode, deferDetection = false) {
-    if (filename.startsWith('node:')) return 'builtin';
+    if (isBuiltinFile(filename)) return 'builtin';
     const disk = filesystemName(filename);
     const ext = path.extname(disk);
     if (ext === '.json') return 'json';
@@ -276,7 +290,9 @@ function createLoader(host, builtins) {
     let kind;
     try { kind = format(identity, mode, mode === 'require' && !isMain && !hooks.active()); }
     catch (cause) {
-      if (!hooks.active() || cause.code !== 'ERR_UNKNOWN_FILE_EXTENSION') throw cause;
+      // As in Node, an unknown extension is a load error: resolution (and
+      // import.meta.resolve) still succeeds and leaves the format to the load step.
+      if (cause.code !== 'ERR_UNKNOWN_FILE_EXTENSION') throw cause;
     }
     if (kind === ambiguous) return { filename: identity, format: 'commonjs', ambiguous: true };
     return { filename: identity, format: kind };
@@ -334,12 +350,21 @@ function createLoader(host, builtins) {
     return null;
   }
 
-  function strictFile(filename, specifier, parent, mode, suffix, isMain) {
+  // pkg: the package whose "exports" or "imports" mapped the request. A require of a
+  // missing target then fails like Node's createEsmNotFoundErr: the file, no stack.
+  function strictFile(filename, specifier, parent, mode, suffix, isMain, pkg) {
     if (isDirectory(filename)) {
-      if (mode === 'import') throw error('ERR_UNSUPPORTED_DIR_IMPORT', filename, parent, fileURL(filename));
+      if (mode === 'import') {
+        // Node names the directory as resolved, keeping the specifier's trailing slash.
+        const named = typeof specifier === 'string' && /\/$/.test(specifier.replace(/[?#].*$/, '')) && !filename.endsWith(path.sep) ? filename + path.sep : filename;
+        throw error('ERR_UNSUPPORTED_DIR_IMPORT', named, parent, fileURL(named));
+      }
       throw missing(specifier, parent, mode);
     }
-    if (!isFile(filename)) throw missing(specifier, parent, mode, filename);
+    if (!isFile(filename)) {
+      if (pkg && mode !== 'import') throw notFound(`Cannot find module '${filename}'`, { path: pkg.filename });
+      throw missing(specifier, parent, mode, filename);
+    }
     return descriptor(filename, mode, suffix, isMain);
   }
 
@@ -466,21 +491,26 @@ function createLoader(host, builtins) {
       const targetResult = packageTarget(pkg, target, replacement, match, pattern, internal, parent, mode, seen);
       if (targetResult !== null && targetResult !== undefined) {
         if (targetResult.external) return resolveInternal(targetResult.external, targetResult.parent, mode, undefined, seen, isMain);
-        return strictFile(targetResult.filename, request, parent, mode, targetResult.suffix, isMain);
+        return strictFile(targetResult.filename, request, parent, mode, targetResult.suffix, isMain, pkg);
       }
     }
     if (internal) throw error('ERR_PACKAGE_IMPORT_NOT_DEFINED', request, packagePath(pkg), parent);
     throw error('ERR_PACKAGE_PATH_NOT_EXPORTED', packagePath(pkg), request, mode === 'import' && parent ? parent : undefined);
   }
 
+  // Node's parsePackageName: only the name part (before the first '/', or the second
+  // for a scope) must not start with '.' or hold '%' or '\\'.
   function packageName(specifier, parent) {
-    const parts = specifier.split('/');
-    const scoped = specifier.startsWith('@');
-    if (!parts[0] || (scoped && (!parts[1] || parts[0].length === 1)) || specifier.includes('\\') || specifier.includes('%') || specifier.startsWith('.')) {
-      throw error('ERR_INVALID_MODULE_SPECIFIER', specifier, 'is not a valid package name', parent || undefined);
+    let separator = specifier.indexOf('/');
+    let valid = true;
+    if (specifier[0] === '@') {
+      if (separator === -1) valid = false;
+      else separator = specifier.indexOf('/', separator + 1);
     }
-    const count = scoped ? 2 : 1;
-    return { name: parts.slice(0, count).join('/'), subpath: parts.length === count ? '.' : './' + parts.slice(count).join('/') };
+    const name = separator === -1 ? specifier : specifier.slice(0, separator);
+    if (/^\.|%|\\/.test(name)) valid = false;
+    if (!valid) throw error('ERR_INVALID_MODULE_SPECIFIER', specifier, 'is not a valid package name', parent || undefined);
+    return { name, subpath: separator === -1 ? '.' : '.' + specifier.slice(separator) };
   }
 
   function resolveInternal(specifier, parent, mode, options, seen, isMain) {
@@ -488,9 +518,9 @@ function createLoader(host, builtins) {
     if (specifier.length === 0) throw invalidArgValue('id', specifier, 'must be a non-empty string');
     if (mode === 'import' && specifier.includes('\0')) throw invalidArgValue('specifier', specifier, 'must not contain null bytes');
     const builtin = builtinName(specifier);
-    if (builtin !== null) return { filename: 'node:' + builtin, format: 'builtin' };
+    if (builtin !== null) return { filename: builtinFile(builtin), format: 'builtin' };
     if (options && own(options, 'paths') && options.paths !== undefined && !Array.isArray(options.paths)) {
-      throw invalidArgType('options.paths', 'Array', options.paths);
+      throw invalidArgValue('options.paths', options.paths);
     }
     const parentObject = parent && typeof parent === 'object' ? parent : null;
     parent = parentName(parent);
@@ -614,11 +644,12 @@ function createLoader(host, builtins) {
   }
 
   function defaultResolve(specifier, context) {
-    if (context.conditions !== undefined && !Array.isArray(context.conditions)) throw invalidArgType('context.conditions', 'Array', context.conditions);
+    if (context.conditions !== undefined && !Array.isArray(context.conditions)) throw invalidArgValue('context.conditions', context.conditions, 'expected an array');
     const mode = context.conditions && context.conditions.includes('require') ? 'require' : 'import';
-    if (specifier.startsWith('data:')) return { url: specifier, format: dataFormat(specifier) };
+    const textImport = host.importText && context.importAttributes && context.importAttributes.type === 'text';
+    if (specifier.startsWith('data:')) return { url: specifier, format: textImport ? 'text' : dataFormat(specifier) };
     const builtin = builtinName(specifier);
-    if (builtin !== null) return { url: 'node:' + builtin, format: 'builtin' };
+    if (builtin !== null) return { url: builtinFile(builtin), format: 'builtin' };
     if (context.parentURL && !context.parentURL.startsWith('file:') && !/^[A-Za-z][A-Za-z\d+.-]*:/.test(specifier) && !path.isAbsolute(specifier)) {
       throw error('ERR_UNSUPPORTED_RESOLVE_REQUEST', specifier, context.parentURL);
     }
@@ -627,7 +658,7 @@ function createLoader(host, builtins) {
     activeConditions = context.conditions;
     try {
       const result = resolveInternal(specifier, context.parentURL, mode, context.resolveOptions, new Set(), context.isMain);
-      return { url: asURL(result.filename), format: result.format };
+      return { url: asURL(result.filename), format: textImport ? 'text' : result.format };
     } finally { activeConditions = previous; }
   }
 
@@ -744,13 +775,15 @@ function createLoader(host, builtins) {
     if (!match) return null;
     const mime = match[1];
     return mime === 'text/javascript' || mime === 'application/javascript' ? 'module'
-      : mime === 'application/json' ? 'json' : null;
+      : mime === 'application/json' ? 'json' : mime === 'text/plain' && host.importText ? 'text' : null;
   }
   function dataSource(url) {
     const match = /^data:([^/]+\/[^;,]+)(?:[^,]*?)(;base64)?,([\s\S]*)$/.exec(url);
     if (!match) throw error('ERR_INVALID_URL', url);
-    return { format: dataFormat(url), source: match[2]
-      ? host.Buffer.from(match[3], 'base64').toString('utf8') : decodeURIComponent(match[3]) };
+    // Percent escapes are bytes, decoded as UTF-8 with replacement characters, as Node does.
+    const bytes = match[2] ? host.Buffer.from(match[3], 'base64') : host.Buffer.concat(match[3].split(/(%[0-9A-Fa-f]{2})/)
+      .map(part => /^%[0-9A-Fa-f]{2}$/.test(part) ? host.Buffer.from([parseInt(part.slice(1), 16)]) : host.Buffer.from(part, 'utf8')));
+    return { format: dataFormat(url), source: bytes.toString('utf8') };
   }
   function unknownFormat(format, url) {
     return error('ERR_UNKNOWN_MODULE_FORMAT', format, url);
@@ -758,7 +791,8 @@ function createLoader(host, builtins) {
 
   function defaultLoad(url, context) {
     const data = url.startsWith('data:') ? dataSource(url) : undefined;
-    let kind = context.format || (data ? data.format : format(url, context.conditions && context.conditions.includes('require') ? 'require' : 'import'));
+    const textImport = host.importText && context.importAttributes && context.importAttributes.type === 'text';
+    let kind = context.format || (textImport ? 'text' : data ? data.format : format(url, context.conditions && context.conditions.includes('require') ? 'require' : 'import'));
     if (!context.conditions || !context.conditions.includes('require')) validateAttributes(kind, url, context.importAttributes || {});
     if (data) {
       if (!kind) throw unknownFormat(dataMime(url), url);
@@ -962,7 +996,7 @@ function createLoader(host, builtins) {
   };
   Module._resolveFilename = (request, parent, isMain, options) => {
     const result = resolve(request, parent, 'require', undefined, options, !!isMain, !!parent && moduleAsyncModes.get(parent) === true);
-    return result.format === 'builtin' && !request.startsWith('node:') ? result.filename.slice(5) : result.filename;
+    return result.format === 'builtin' && !request.startsWith('node:') && result.filename.startsWith('node:') ? result.filename.slice(5) : result.filename;
   };
   Module._load = (request, parent, isMain) => {
     probed = null;
@@ -1210,7 +1244,7 @@ function createLoader(host, builtins) {
     require.resolve = (specifier, options) => {
       if (typeof specifier !== 'string') throw invalidArgType('request', 'string', specifier);
       const result = resolve(specifier, parent || filename, 'require', undefined, options, false, allowAsync);
-      return result.format === 'builtin' && !specifier.startsWith('node:') ? result.filename.slice(5) : result.filename;
+      return result.format === 'builtin' && !specifier.startsWith('node:') && result.filename.startsWith('node:') ? result.filename.slice(5) : result.filename;
     };
     require.resolve.paths = (specifier) => {
       if (typeof specifier !== 'string') throw invalidArgType('request', 'string', specifier);
@@ -1291,7 +1325,7 @@ function createLoader(host, builtins) {
     loadHookAsync: (url, context) => hooks.asyncRun('load', url, context),
     register(filename, update) { builtinUpdates.set(filename, update); },
     get(filename) {
-      const resolved = resolutions.get(filename) || (filename.startsWith('node:')
+      const resolved = resolutions.get(filename) || (isBuiltinFile(filename)
         ? { filename, format: 'builtin' } : { filename, format: format(filename, 'require') });
       // As in Node, an imported JSON file shares require.cache only when its URL has no
       // query or hash: each of those is a module of its own.
@@ -1341,9 +1375,19 @@ function createLoader(host, builtins) {
     if (host.reportDependency && (filename.startsWith('file:') || path.isAbsolute(filename))) host.reportDependency(filename);
     const mock = mockInstances.get(filename);
     if (mock) return mockESM(filename, mock);
-    const resolved = resolutions.get(filename) || { filename,
-      format: filename.startsWith('data:') ? dataFormat(filename) : format(filename, 'import') };
+    let resolved = resolutions.get(filename);
+    if (!resolved) {
+      let detected;
+      if (filename.startsWith('data:')) detected = dataFormat(filename);
+      else {
+        // An unknown extension is reported by the default load step, after the hooks ran.
+        try { detected = format(filename, 'import'); }
+        catch (cause) { if (cause.code !== 'ERR_UNKNOWN_FILE_EXTENSION') throw cause; }
+      }
+      resolved = { filename, format: detected };
+    }
     attributes = resolved.importAttributes || attributes || {};
+    if (host.importText && attributes.type === 'text') resolved = { ...resolved, format: 'text' };
     const loaded = pendingLoads.get(filename) || loadSource(resolved, attributes);
     pendingLoads.delete(filename);
     resolved.format = loaded.format;
@@ -1353,16 +1397,18 @@ function createLoader(host, builtins) {
   // Node's validateAttributes: the "type" each format needs, none for code formats, and
   // nothing checked for a format Node does not know.
   const implicitType = { builtin: true, commonjs: true, module: true, wasm: true, 'commonjs-typescript': true, 'module-typescript': true };
+  // (Node's esm/assert.js) Formats Node does not map, such as text without
+  // --experimental-import-text, take any attributes.
   function validateAttributes(kind, url, attributes) {
     for (let i12 = 0, a12 = Object.keys(attributes); i12 < a12.length; i12++) { const key = a12[i12];
       if (key !== 'type') throw error('ERR_IMPORT_ATTRIBUTE_UNSUPPORTED', key, attributes[key], url);
     }
-    const expected = kind === 'json' ? 'json' : kind === 'text' ? 'text' : own(implicitType, kind) ? null : undefined;
+    const expected = kind === 'json' ? 'json' : kind === 'text' && host.importText ? 'text' : own(implicitType, kind) ? null : undefined;
     if (expected === undefined) return;
-    if (expected === null ? attributes.type === undefined : attributes.type === expected) return;
+    if (expected === null ? !own(attributes, 'type') : attributes.type === expected) return;
     if (expected !== null && !own(attributes, 'type')) throw error('ERR_IMPORT_ATTRIBUTE_MISSING', url, 'type', expected);
     const type = attributes.type;
-    if (typeof type !== 'string') throw invalidArgType('importAttributes.type', 'string', type);
+    validateString(type, 'type');
     if (type === 'json' || (type === 'text' && host.importText)) throw error('ERR_IMPORT_ATTRIBUTE_TYPE_INCOMPATIBLE', url, type);
     throw error('ERR_IMPORT_ATTRIBUTE_UNSUPPORTED', 'type', type, url);
   }
@@ -1407,6 +1453,9 @@ function createLoader(host, builtins) {
       }
       throw error;
     }
+    // --experimental-import-text: `with { type: 'text' }` asks for the text format
+    // whatever the file is (Node's isExperimentalTextImport).
+    if (host.importText && attributes && attributes.type === 'text') resolved = { ...resolved, format: 'text' };
     if (resolved.format && !hooks.active()) validateAttributes(resolved.format, asURL(resolved.filename), attributes || {});
     return resolved;
   }
@@ -1429,6 +1478,8 @@ function createLoader(host, builtins) {
       source = bridgeSource(resolved.filename, resolved.format === 'commonjs' ? commonJSNames(resolved.filename, new Set(), loaded.source) : [], resolved.format === 'commonjs');
     }
     else if (resolved.format === 'addon') throw error('ERR_UNKNOWN_FILE_EXTENSION', path.extname(resolved.filename), resolved.filename);
+    // Node's text translator: the source, without a byte order mark, as the default export.
+    else if (resolved.format === 'text') source = `export default ${JSON.stringify(sourceText(loaded.source).replace(/^\uFEFF/, ''))};`;
     else throw unknownFormat(resolved.format, path.isAbsolute(resolved.filename) ? fileURL(resolved.filename) : resolved.filename);
     return { source, format: resolved.format, filename: resolved.filename };
   }

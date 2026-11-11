@@ -1,5 +1,5 @@
 // Adapted from Node.js v24.22.1 lib/internal/util.js: the helpers that
-// util.inspect, assert and util use. Bindings are replaced by the runtime's
+// util.inspect, assert, util and http use. Bindings are replaced by the runtime's
 // util/types predicates.
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -25,7 +25,9 @@
 'use strict';
 
 const {
+  ArrayFrom,
   ArrayPrototypePush,
+  ArrayPrototypeSort,
   Error,
   ErrorCaptureStackTrace,
   FunctionPrototypeSymbolHasInstance,
@@ -40,6 +42,7 @@ const {
   Promise,
   ReflectApply,
   ReflectConstruct,
+  SafeMap,
   SafeSet,
   SymbolPrototypeGetDescription,
   StringPrototypeReplace,
@@ -344,18 +347,85 @@ function deprecateInstantiation(target, code, ...args) {
   return ReflectConstruct(target, args);
 }
 
+// Node builds this from internalBinding('string_decoder').encodings.
+const encodingsMap = { __proto__: null, ascii: 0, utf8: 1, base64: 2, utf16le: 3, latin1: 4, hex: 5, buffer: 6, base64url: 7 };
+
 // The system error tables live in internal/util_public/system here.
 function getSystemErrorName(err) {
   return require('internal/util_public/system').getSystemErrorName(err);
 }
 
+// Node's assertCrypto. This module loads during bootstrap, before process.versions
+// exists, so the check reads it when called.
+function assertCrypto() {
+  if (!process.versions.openssl) {
+    const { ERR_NO_CRYPTO } = require('internal/errors').codes;
+    throw new ERR_NO_CRYPTO();
+  }
+}
+
+const experimentalWarnings = new SafeSet();
+function emitExperimentalWarning(feature, messagePrefix, code, ctor) {
+  if (experimentalWarnings.has(feature)) return;
+  experimentalWarnings.add(feature);
+  let msg = `${feature} is an experimental feature and might change at any time`;
+  if (messagePrefix) {
+    msg = messagePrefix + msg;
+  }
+  process.emitWarning(msg, 'ExperimentalWarning', code, ctor);
+}
+
+function getLazy(initializer) {
+  let value;
+  let initialized = false;
+  return function() {
+    if (initialized === false) {
+      value = initializer();
+      initialized = true;
+    }
+    return value;
+  };
+}
+
+function once(callback, { preserveReturnValue = false } = kEmptyObject) {
+  let called = false;
+  let returnValue;
+  return function(...args) {
+    if (called) return returnValue;
+    called = true;
+    const result = ReflectApply(callback, this, args);
+    returnValue = preserveReturnValue ? result : undefined;
+    return result;
+  };
+}
+
+
+function filterDuplicateStrings(items, low) {
+  const map = new SafeMap();
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    const key = StringPrototypeToLowerCase(item);
+    if (low) {
+      map.set(key, key);
+    } else {
+      map.set(key, item);
+    }
+  }
+  return ArrayPrototypeSort(ArrayFrom(map.values()));
+}
+
 module.exports = {
+  assertCrypto,
   assignFunctionName,
   customInspectSymbol: SymbolFor('nodejs.util.inspect.custom'),
   customPromisifyArgs: kCustomPromisifyArgsSymbol,
   deprecate,
   deprecateInstantiation,
+  emitExperimentalWarning,
+  filterDuplicateStrings,
+  encodingsMap,
   getDeprecationWarningEmitter,
+  getLazy,
   getSystemErrorName,
   isError,
   join,
@@ -364,6 +434,7 @@ module.exports = {
   lazyDOMException,
   lazyDOMExceptionClass,
   normalizeEncoding,
+  once,
   promisify,
   removeColors,
   setOwnProperty,

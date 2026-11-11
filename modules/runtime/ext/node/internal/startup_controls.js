@@ -5,13 +5,13 @@ const booleanOptions = new Map([
   ['--warnings', 'warnings'], ['--deprecation', 'deprecation'],
   ['--trace-warnings', 'traceProcessWarnings'], ['--trace-deprecation', 'traceDeprecation'],
   ['--throw-deprecation', 'throwDeprecation'], ['--pending-deprecation', 'pendingDeprecation'],
+  // Every ArrayBuffer the engine allocates is zero-filled, so Buffer's unsafe
+  // allocations already meet --zero-fill-buffers.
+  ['--zero-fill-buffers', 'zeroFillBuffers'],
   ['--abort-on-uncaught-exception', 'abortOnUncaughtException'], ['--trace-exit', 'traceExit'],
 ]);
 const valueOptions = new Set(['--disable-warning', '--redirect-warnings', '--unhandled-rejections', '--stack-trace-limit']);
 const rejectionModes = new Set(['throw', 'strict', 'warn', 'warn-with-error-code', 'none']);
-const optionEntries = [];
-for (const name of booleanOptions.keys()) optionEntries.push([name, false], ['--no-' + name.slice(2), false]);
-for (const name of valueOptions) optionEntries.push([name, true]);
 const state = { warnings: true, deprecation: true, unhandledRejections: 'throw' };
 const disabledWarnings = new Set();
 let traceHelperShown = false;
@@ -221,8 +221,7 @@ function safeString(value) {
 }
 
 module.exports = {
-  optionEntries, valueError, applyOption, initialize, emitWarning, handleUncaught, fatalException, reportFatal, traceExit,
-  isValueOption: name => valueOptions.has(name),
+  valueError, applyOption, initialize, emitWarning, handleUncaught, fatalException, reportFatal, traceExit,
   setUncaughtExceptionCaptureCallback, hasUncaughtExceptionCaptureCallback: () => captureCallback !== null,
   getOptionValue(name) {
     if (name === '--unhandled-rejections') return state.unhandledRejections;
