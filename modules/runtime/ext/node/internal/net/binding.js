@@ -27,6 +27,7 @@ const uv = {
   UV_EOF: -4095,
   UV_EADDRINUSE: -errno.EADDRINUSE,
   UV_EBADF: -errno.EBADF,
+  UV_EPROTO: -errno.EPROTO,
   UV_ECANCELED: -errno.ECANCELED,
   UV_EINVAL: -errno.EINVAL,
   UV_ENOTCONN: -errno.ENOTCONN,
@@ -621,7 +622,15 @@ class JSStream extends StreamHandle {
     this._resource.emitDestroy();
     this._resource = require('async_hooks')._createResource('JSSTREAM', resource);
   }
-  _callback(fn, args) { return host.invokeResource(this._resource, fn, this, args, false); }
+  // A MakeCallback: an exception is reported as uncaught, and the call fails with
+  // UV_EPROTO (JSStream's DoWrite, DoShutdown, ReadStart and ReadStop).
+  _callback(fn, args, receiver = this) {
+    let result;
+    const threw = host.invokeTimer(this._resource, function callback() {
+      result = Reflect.apply(fn, receiver, args);
+    }, undefined, []);
+    return threw ? uv.UV_EPROTO : result;
+  }
   ref() {}
   unref() {}
   hasRef() { return false; }
@@ -646,11 +655,11 @@ class JSStream extends StreamHandle {
     return req ? status : wrap;
   }
   finishWrite(req, status) {
-    if (typeof req.oncomplete === 'function') this._callback(req.oncomplete, [status]);
+    if (typeof req.oncomplete === 'function') this._callback(req.oncomplete, [status], req);
     else req.writeStatus = status;
   }
   finishShutdown(req, status) {
-    if (typeof req.oncomplete === 'function') this._callback(req.oncomplete, [status]);
+    if (typeof req.oncomplete === 'function') this._callback(req.oncomplete, [status], req);
   }
   readBuffer(chunk) { this._callback(this._deliver, [chunk, 0]); }
   emitEOF() { this._callback(this._deliver, [null, uv.UV_EOF]); }
