@@ -1,13 +1,12 @@
 'use strict';
 
 // Node's DOMStorage and Storage domains (--experimental-storage-inspection).
-// As DOMStorageAgent in Node, the items a session reads are the ones the
-// storage events reported (and registerStorage, a pseudo-event, replaced).
+// As DOMStorageAgent in Node, each session has its own copy of the items, made
+// of the storage events it saw (and registerStorage, a pseudo-event, replaced).
 const host = require('internal/host');
 const { protocolError, unsupported } = require('internal/inspector_values');
 
 const DEFAULT_KEY = 'node-inspector://default-dom-storage';
-const registered = { local: new Map(), session: new Map() };
 
 function enabled() { return !!host.experimentalStorageInspection; }
 // lib/internal/inspector/webstorage.js getStorageKey.
@@ -17,31 +16,32 @@ function storageKey() {
 }
 function storageId(isLocalStorage) { return { securityOrigin: '', isLocalStorage, storageKey: storageKey() }; }
 
-function mapFor(params) {
+function storages(session) { return session.domStorage ??= { local: new Map(), session: new Map() }; }
+function mapFor(session, params) {
   const id = params.storageId;
   const local = id !== null && typeof id === 'object' ? id.isLocalStorage : params.isLocalStorage;
-  return local ? registered.local : registered.session;
+  return local ? storages(session).local : storages(session).session;
 }
-// Every DOMStorage event updates the agent's copy, enabled or not.
-function observe(method, params, items) {
+// Every DOMStorage event updates the session's copy, enabled or not.
+function observe(session, method, params, items) {
   switch (method) {
     case 'DOMStorage.registerStorage': {
-      const map = mapFor(params);
+      const map = mapFor(session, params);
       map.clear();
       for (const [key, value] of items) map.set(key, value);
       break;
     }
     case 'DOMStorage.domStorageItemAdded':
-    case 'DOMStorage.domStorageItemUpdated': mapFor(params).set(`${params.key}`, `${params.newValue}`); break;
-    case 'DOMStorage.domStorageItemRemoved': mapFor(params).delete(`${params.key}`); break;
-    case 'DOMStorage.domStorageItemsCleared': mapFor(params).clear(); break;
+    case 'DOMStorage.domStorageItemUpdated': mapFor(session, params).set(`${params.key}`, `${params.newValue}`); break;
+    case 'DOMStorage.domStorageItemRemoved': mapFor(session, params).delete(`${params.key}`); break;
+    case 'DOMStorage.domStorageItemsCleared': mapFor(session, params).clear(); break;
   }
 }
 
-function items(params) {
+function items(session, params) {
   const id = params && params.storageId;
   if (id === null || typeof id !== 'object' || typeof id.isLocalStorage !== 'boolean') throw protocolError(-32602, 'Invalid parameters');
-  return { entries: [...(id.isLocalStorage ? registered.local : registered.session)] };
+  return { entries: [...(id.isLocalStorage ? storages(session).local : storages(session).session)] };
 }
 
 function dispatch(session, method, params) {
@@ -49,7 +49,7 @@ function dispatch(session, method, params) {
   switch (method) {
     case 'DOMStorage.enable': session.domStorageEnabled = true; return {};
     case 'DOMStorage.disable': session.domStorageEnabled = false; return {};
-    case 'DOMStorage.getDOMStorageItems': return items(params);
+    case 'DOMStorage.getDOMStorageItems': return items(session, params);
     case 'Storage.getStorageKey': return { storageKey: storageKey() };
     default: unsupported(method);
   }

@@ -348,9 +348,13 @@ function broadcast(method, params) {
   if (sessions.size === 0) return;
   const items = require('internal/inspector_events').validate(method, params);
   if (method.startsWith('DOMStorage.')) {
-    require('internal/inspector_dom_storage').observe(method, params, items);
-    // Not a protocol event: DOMStorageAgent::registerStorage in Node.
-    if (method === 'DOMStorage.registerStorage') return;
+    const domStorage = require('internal/inspector_dom_storage');
+    for (const session of sessions.values()) {
+      domStorage.observe(session, method, params, items);
+      // Not a protocol event: DOMStorageAgent::registerStorage in Node.
+      if (session.domStorageEnabled && method !== 'DOMStorage.registerStorage') session.emit(method, params);
+    }
+    return;
   }
   if (method.startsWith('Network.')) {
     // As NetworkAgent: a request names the user code that started it.
@@ -361,10 +365,7 @@ function broadcast(method, params) {
     }
     return;
   }
-  for (const session of sessions.values()) {
-    if (method.startsWith('DOMStorage.') && !session.domStorageEnabled) continue;
-    session.emit(method, params);
-  }
+  for (const session of sessions.values()) session.emit(method, params);
 }
 // A V8 StackTrace (Runtime.StackTrace) of call sites. Unlike scriptParsed, V8
 // names a frame's script by its resource name as given, not as a URL.
