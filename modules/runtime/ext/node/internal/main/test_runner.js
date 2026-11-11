@@ -7,36 +7,61 @@ const util = require('util');
 
 let debug = util.debuglog('test_runner', fn => { debug = fn; });
 
-function reporterOutputs(reporterNames, destinations, defaultReporter) {
-  const names = reporterNames.length ? [...reporterNames] : [defaultReporter];
+const kBuiltinReporters = new Map([
+  ['spec', 'internal/test_runner/reporter/spec'],
+  ['dot', 'internal/test_runner/reporter/dot'],
+  ['tap', 'internal/test_runner/reporter/tap'],
+  ['junit', 'internal/test_runner/reporter/junit'],
+  ['lcov', 'internal/test_runner/reporter/lcov'],
+]);
+
+// Node's parseCommandLine reporter and destination pairing.
+function reporterPairs(reporterNames, destinations, defaultReporter) {
+  const reporters = [...reporterNames];
   const targets = [...destinations];
-  if (!targets.length && names.length === 1) targets.push('stdout');
-  if (names.length !== targets.length) {
-    throw Object.assign(new Error('The argument \'--test-reporter\' must match the number of specified \'--test-reporter-destination\'. Received ' + names.length), { code: 'ERR_INVALID_ARG_VALUE' });
+  if (!reporters.length && !targets.length) reporters.push(defaultReporter);
+  if (reporters.length === 1 && !targets.length) targets.push('stdout');
+  if (targets.length !== reporters.length) {
+    throw Object.assign(new TypeError('The argument \'--test-reporter\' must match the number of specified ' +
+      `'--test-reporter-destination'. Received ${util.inspect(reporters)}`), { code: 'ERR_INVALID_ARG_VALUE' });
   }
-  const reporters = require('test/reporters');
-  return names.map((name, index) => {
-    let reporter = reporters[name];
-    if (!reporter) {
-      reporter = host.loader.requireFor(require('path').join(process.cwd(), '[test-reporter]'))(name);
-      reporter = reporter.default || reporter;
-    } else if (name === 'spec' || name === 'lcov') reporter = reporter();
+  return { reporters, targets };
+}
+
+// Node's getReportersMap: built-in reporters by name, anything else through the ESM loader.
+async function reporterOutputs(reporters, targets) {
+  return Promise.all(reporters.map(async (name, index) => {
     const destination = targets[index];
     const output = destination === 'stdout' ? process.stdout : destination === 'stderr' ? process.stderr :
-      require('fs').createWriteStream(destination);
+      require('fs').createWriteStream(destination, { flush: true });
+    const builtin = kBuiltinReporters.get(name);
+    let reporter;
+    if (builtin !== undefined) reporter = require(builtin);
+    else {
+      const { filename } = host.loader.resolve(name, require('path').join(process.cwd(), '[test-reporter]'), 'import');
+      reporter = await import(/^[A-Za-z][A-Za-z\d+.-]*:/.test(filename) ? filename : require('url').pathToFileURL(filename).href);
+    }
+    if (reporter?.default) reporter = reporter.default;
+    if (reporter?.prototype && Object.getOwnPropertyDescriptor(reporter.prototype, 'constructor')) reporter = new reporter();
+    if (!reporter) {
+      throw Object.assign(new TypeError(`The argument 'reporter' must be one of: stream.Transform, async generator function, or async function. Received ${util.inspect(reporter)}`),
+        { code: 'ERR_INVALID_ARG_TYPE' });
+    }
     return { reporter, output };
-  });
+  }));
 }
 
 // Pipes a test event stream through each reporter. Resolves once every destination
 // has taken all of its output.
-function attachReporters(stream, reporterNames, destinations, defaultReporter, onError) {
+async function attachReporters(stream, reporterNames, destinations, defaultReporter, onError) {
+  const { reporters, targets } = reporterPairs(reporterNames, destinations, defaultReporter);
   const { PassThrough, finished } = require('stream');
+  const branches = reporters.map(() => { const branch = new PassThrough({ objectMode: true }); stream.pipe(branch); return branch; });
+  let outputs;
+  try { outputs = await reporterOutputs(reporters, targets); } catch (error) { onError(error); return; }
   const pending = [];
-  for (const { reporter, output } of reporterOutputs(reporterNames, destinations, defaultReporter)) {
-    const branch = new PassThrough({ objectMode: true });
-    stream.pipe(branch);
-    const formatted = branch.compose(reporter);
+  outputs.forEach(({ reporter, output }, index) => {
+    const formatted = branches[index].compose(reporter);
     formatted.on('error', onError);
     output.on('error', onError);
     const standard = output === process.stdout || output === process.stderr;
@@ -46,8 +71,8 @@ function attachReporters(stream, reporterNames, destinations, defaultReporter, o
       else finished(output, () => resolve());
       formatted.once('error', resolve);
     }));
-  }
-  return Promise.all(pending);
+  });
+  await Promise.all(pending);
 }
 
 function configuration(options, files) {

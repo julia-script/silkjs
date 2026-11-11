@@ -882,7 +882,7 @@ function runWorker() {
   }, !evaluate || moduleEval);
 }
 function startRepl() {
-  if (process.stdout.isTTY) console.log('Welcome to SilkJS Runtime.\nType ".help" for more information.');
+  console.log('Welcome to SilkJS Runtime.\nType ".help" for more information.');
   return internalRequire('internal/repl').createInternalRepl(process.env, {
     input: process.stdin, output: process.stdout, terminal: !!process.stdout.isTTY, preview: !!process.stdout.isTTY,
   }, error => { if (error) console.error('REPL history:', error.message); });
@@ -1187,7 +1187,14 @@ Environment:
   if (testMode) {
     return internalRequire('internal/main/test_runner').runTestRunner(testOptions, args.slice(index), reporterNames, destinations);
   }
-  if (expression === undefined && filename === undefined && (interactive || process.stdin.isTTY)) return startRepl();
+  if (expression === undefined && filename === undefined && (interactive || process.stdin.isTTY)) {
+    if (inputTypeSet) {
+      console.error('Cannot specify --input-type for REPL');
+      process.exitCode = 9;
+      return;
+    }
+    return startRepl();
+  }
   if (expression !== undefined) {
     const name = host.path.join(host.cwd(), '[eval]');
     expression = prepareInput(expression, name, inputType, inputTypeSet);

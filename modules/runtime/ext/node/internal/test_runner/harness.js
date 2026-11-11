@@ -527,8 +527,13 @@ class Harness {
     }
     if (node.error && !node.todo && !node.skip) this.success = false;
     if (node.error && !node.todo && !node.skip && this.options.setExitCode !== false) process.exitCode = 1;
+    // The suite path the JUnit reporter uses as the test's classname.
+    const classParts = [];
+    for (let parent = node.parent; parent && parent !== this.root; parent = parent.parent) classParts.unshift(parent.name);
     node.reportData = { testNumber: visibleChildren(node.parent).indexOf(node) + 1,
-      details: { duration_ms: now() - start, type: node.type, ...(node.error ? { error: node.error } : {}) },
+      details: { duration_ms: now() - start, type: node.type, ...(node.error ? { error: node.error } : {}),
+        ...(classParts.length ? { classname: classParts.join('.') } : {}) },
+      ...(classParts.length ? { classname: classParts.join('.') } : {}),
       ...(node.skip ? { skip: node.skip } : node.todo ? { todo: node.todo } :
         node.expectFailure ? { expectFailure: node.expectFailure.label ?? true } : {}) };
     this.emit('test:complete', node, { ...node.reportData, details: { ...node.reportData.details, passed: !node.error || !!node.skip } });
@@ -619,6 +624,8 @@ class Harness {
       }
       this.stream.publish('test:plan', { nesting: 0, count: visibleChildren(this.root).length });
       for (const message of this.root.diagnostics || []) this.emit('test:diagnostic', this.root, { nesting: 0, message, level: 'info' });
+      const duration = now() - start;
+      publishCounts((type, data) => this.emit(type, this.root, data), this.counts, duration);
       if (this.options.collectCoverage) {
         try {
           const coverage = require('internal/test_runner/coverage');
@@ -633,12 +640,24 @@ class Harness {
       signal?.removeEventListener('abort', onAbort);
       const success = !this.root.error && this.success;
       if (!success && this.options.setExitCode !== false) process.exitCode = 1;
-      const summary = { nesting: 0, file: this.file, success, counts: { ...this.counts }, duration_ms: now() - start };
+      const summary = { nesting: 0, file: this.file, success, counts: { ...this.counts }, duration_ms: duration };
       this.stream.publish('test:summary', summary);
       this.stream.push(null); this.completion.resolve(summary);
     }
     return this.completion.promise;
   }
+}
+// The run totals Node's root test reports as diagnostics before its summary.
+const kCountDiagnostics = [['tests', 'tests'], ['suites', 'suites'], ['pass', 'passed'], ['fail', 'failed'],
+  ['cancelled', 'cancelled'], ['skipped', 'skipped'], ['todo', 'todo']];
+function publishCounts(publish, counts, duration) {
+  for (const [label, key] of kCountDiagnostics) publish('test:diagnostic', { nesting: 0, message: `${label} ${counts[key]}`, level: 'info' });
+  publish('test:diagnostic', { nesting: 0, message: `duration_ms ${duration}`, level: 'info' });
+}
+// A child's own totals, which the parent replaces with the totals of the whole run.
+function isCountDiagnostic(message) {
+  const parts = String(message).split(' ');
+  return parts.length === 2 && (parts[0] === 'duration_ms' || kCountDiagnostics.some(([label]) => label === parts[0]));
 }
 function createHarness(options) { return new Harness(options); }
 function getHarness() {
@@ -658,20 +677,22 @@ function getHarness() {
       const reporters = host.testReporters || { names: [], destinations: [] };
       const fail = error => { console.error(error); process.exitCode = 1; };
       const written = require('internal/main/test_runner').attachReporters(defaultHarness.stream, reporters.names,
-        reporters.destinations, process.stdout.isTTY ? 'spec' : 'tap', fail);
+        reporters.destinations, 'spec', fail);
       if (cli.forceExit) written.then(() => process.exit());
     }
     nativeSetImmediate(() => { defaultHarness.start(); });
   }
   return defaultHarness;
 }
-// A file that run() started in its own process sends its events to the parent.
-function serializable(_key, value) {
-  if (value instanceof Error) return { name: value.name, message: value.message, stack: value.stack, code: value.code, failureType: value.failureType, cause: value.cause };
-  return typeof value === 'bigint' ? String(value) : value;
-}
+// A file that run() started in its own process sends its events to the parent over an
+// advanced-serialization channel, errors through error_serdes like Node's v8-serializer reporter.
 function reportToParent(stream) {
-  stream.on('data', event => process.send(JSON.parse(JSON.stringify(event, serializable))));
+  const { serializeError } = require('internal/error_serdes');
+  stream.on('data', event => {
+    const error = event.data?.details?.error;
+    if (error === undefined) { process.send(event); return; }
+    process.send({ ...event, data: { ...event.data, details: { ...event.data.details, error: serializeError(error) } } });
+  });
   stream.on('end', () => process.disconnect());
 }
 function configure(options = {}) {
@@ -701,7 +722,7 @@ for (const fn of [test, suite]) for (const modifier of ['skip', 'todo', 'only'])
   const spec = parse(args); spec.options = { ...spec.options, [modifier]: true };
   return define(fn === test ? 'test' : 'suite', [spec.name, spec.options, spec.fn]);
 };
-const exportsObject = { loadGlobalHooks, reportSetupFailure, tagFilter, seededGenerator, createRandomSeed, test, suite, createHarness, configure, getTestContext: () => context.getStore()?.ctx,
+const exportsObject = { publishCounts, isCountDiagnostic, loadGlobalHooks, reportSetupFailure, tagFilter, seededGenerator, createRandomSeed, test, suite, createHarness, configure, getTestContext: () => context.getStore()?.ctx,
   withHarness: (harness, fn) => context.run(harness.root, fn), failure, unsupported, TestsStream,
   registerAssertion(name, fn) { validateString(name, 'name'); validateFunction(fn, 'fn'); assertions.set(name, fn); } };
 for (const type of ['before', 'after', 'beforeEach', 'afterEach']) exportsObject[type] = (fn, options) => {

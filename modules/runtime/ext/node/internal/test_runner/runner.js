@@ -1,6 +1,6 @@
 'use strict';
 
-const { createHarness, withHarness, TestsStream, failure, unsupported, seededGenerator, createRandomSeed, loadGlobalHooks, reportSetupFailure } = require('internal/test_runner/harness');
+const { createHarness, withHarness, TestsStream, failure, unsupported, seededGenerator, createRandomSeed, loadGlobalHooks, reportSetupFailure, publishCounts, isCountDiagnostic } = require('internal/test_runner/harness');
 const { validateBoolean } = require('internal/path_events/support');
 const path = require('path');
 const fs = require('fs');
@@ -183,7 +183,12 @@ async function runProcesses(files, options, stream, cwd, names) {
   let sequence = 0;
   let eventId = 1;
   const completed = new Map();
+  const durations = new Map();
+  const exitStatus = new Map();
   const coverages = [];
+  // Each file is a test of its own, like Node's FileTest: queued, dequeued and completed
+  // around the events of the process that ran it.
+  const fileData = index => ({ nesting: 0, name: names.get(files[index]) ?? files[index], type: 'test', line: 1, column: 1, file: files[index] });
   function flush() {
     while (completed.has(flushed)) {
       const { events, summary, error, ids = new Map() } = completed.get(flushed);
@@ -199,14 +204,20 @@ async function runProcesses(files, options, stream, cwd, names) {
         stream.publish(event.type, data);
       }
       if (summary) {
+        stream.publish('test:summary', { ...summary, file: files[flushed] });
         for (const key of Object.keys(counts)) counts[key] += summary.counts[key] || 0;
         successful &&= summary.success;
       }
+      const { type: _type, ...fileReport } = fileData(flushed);
+      const fileFailed = !!error || (summary && !summary.success) || exitStatus.get(flushed);
+      const fileError = error ?? (fileFailed ? Object.assign(failure('test failed', summary && !summary.success ? 'subtestsFailed' : 'testCodeFailure'), exitStatus.get(flushed) ?? {}) : undefined);
+      stream.publish('test:complete', { ...fileReport, testNumber: 1,
+        details: { duration_ms: durations.get(flushed) ?? 0, type: 'test', ...(fileError ? { error: fileError } : {}), passed: !fileFailed } });
       if (error || (!summary && events.length === 0)) {
         const failed = !!error;
         const data = { name: names.get(files[flushed]) ?? files[flushed], nesting: 0, line: 1, column: 1, file: files[flushed], testId: eventId++, testNumber: ++sequence,
           details: { type: 'test', duration_ms: now() - start, ...(error ? { error } : {}) } };
-        stream.publish('test:start', data); stream.publish('test:complete', data); stream.publish(failed ? 'test:fail' : 'test:pass', data);
+        stream.publish('test:start', data); stream.publish(failed ? 'test:fail' : 'test:pass', data);
         counts.tests++; counts.topLevel++;
         counts[failed ? (['testAborted', 'testTimeoutFailure', 'cancelledByParent'].includes(error.failureType) ? 'cancelled' : 'failed') : 'passed']++;
         if (failed) successful = false;
@@ -216,6 +227,8 @@ async function runProcesses(files, options, stream, cwd, names) {
   }
   async function execute(index) {
     const file = files[index];
+    stream.publish('test:dequeue', fileData(index));
+    const fileStart = now();
     if (options.signal?.aborted) {
       completed.set(index, { events: [], error: failure('test run aborted', 'testAborted', options.signal.reason) });
       flush(); return;
@@ -236,7 +249,7 @@ async function runProcesses(files, options, stream, cwd, names) {
         const snapshotFlags = host.testUpdateSnapshots === undefined ? [] :
           [host.testUpdateSnapshots ? '--test-update-snapshots' : '--no-test-update-snapshots'];
         child = spawn(process.execPath, [...inheritedExecArgv(), ...snapshotFlags, ...flags, ...(options.execArgv || []), file, ...(options.argv || [])], {
-          cwd, env: { NODE_TEST_CONTEXT: 'child-v8', ...(options.env || process.env) }, stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+          cwd, env: { NODE_TEST_CONTEXT: 'child-v8', ...(options.env || process.env) }, stdio: ['ignore', 'pipe', 'pipe', 'ipc'], serialization: 'advanced',
         });
       } catch (cause) { error = failure('test process failed to start', 'testCodeFailure', cause); finish(); return; }
       child.stdout?.on('data', chunk => events.push({ type: 'test:stdout', data: { file, message: String(chunk) } }));
@@ -249,6 +262,7 @@ async function runProcesses(files, options, stream, cwd, names) {
           }
         }
         if (!event || typeof event.type !== 'string') return;
+        if (event.data?.details?.error !== undefined) event.data.details.error = require('internal/error_serdes').deserializeError(event.data.details.error);
         if (event.type === 'test:summary') summary = event.data;
         else if (event.type === 'test:coverage') coverages.push(event.data.summary);
         else if (['test:enqueue', 'test:dequeue', 'test:complete'].includes(event.type)) {
@@ -256,10 +270,12 @@ async function runProcesses(files, options, stream, cwd, names) {
           if (data.testId !== undefined) data.testId = id(data.testId);
           if (data.parentId !== undefined) data.parentId = id(data.parentId);
           stream.publish(event.type, data);
-        } else if (!(event.type === 'test:plan' && event.data.nesting === 0)) events.push(event);
+        } else if (event.type === 'test:diagnostic' && event.data.nesting === 0 && isCountDiagnostic(event.data.message)) return;
+        else if (!(event.type === 'test:plan' && event.data.nesting === 0)) events.push(event);
       });
       child.on('error', cause => { error ||= failure('test process failed', 'testCodeFailure', cause); if (!child.pid) finish(); });
       child.on('close', (code, signal) => {
+        if (code !== 0 || signal) exitStatus.set(index, { exitCode: code, signal: signal ?? null });
         if ((code !== 0 || signal) && (!summary || summary.success)) error ||= failure(`test process exited with ${signal || code}`, 'testCodeFailure');
         if (!summary && !error && events.length) error = failure('test process exited without completing its test run', 'testUnfinished');
         finish();
@@ -270,6 +286,7 @@ async function runProcesses(files, options, stream, cwd, names) {
     });
     if (timer !== undefined) nativeClearTimeout(timer);
     if (onAbort) options.signal?.removeEventListener('abort', onAbort);
+    durations.set(index, now() - fileStart);
     completed.set(index, { events, summary, error, ids }); flush();
   }
   if (options.randomSeed !== undefined) {
@@ -277,17 +294,20 @@ async function runProcesses(files, options, stream, cwd, names) {
     files = [];
     while (pending.length) files.push(pending.splice(pending.length > 1 ? Math.floor(random() * pending.length) : 0, 1)[0]);
   }
+  for (let index = 0; index < files.length; index++) stream.publish('test:enqueue', fileData(index));
   const concurrency = options.concurrency === false ? 1 : options.concurrency === true || options.concurrency === undefined ? Math.max(1, (require('os').availableParallelism?.() || 2) - 1) : options.concurrency;
   await Promise.all(Array.from({ length: Math.min(files.length, concurrency) }, async () => {
     while (next < files.length) { const index = next++; await execute(index); }
   }));
   stream.publish('test:plan', { nesting: 0, count: sequence });
   if (options.randomSeed !== undefined) stream.publish('test:diagnostic', { nesting: 0, message: `Randomized test order seed: ${options.randomSeed}`, level: 'info' });
+  const duration = now() - start;
+  publishCounts((type, data) => stream.publish(type, data), counts, duration);
   if (options.coverage) {
     const coverage = require('internal/test_runner/coverage');
     if (!coverage.publish(stream, coverage.merge(coverages, options, cwd))) successful = false;
   }
-  stream.publish('test:summary', { nesting: 0, success: successful, counts, duration_ms: now() - start });
+  stream.publish('test:summary', { nesting: 0, success: successful, counts, duration_ms: duration });
   stream.push(null);
 }
 module.exports = { run };
