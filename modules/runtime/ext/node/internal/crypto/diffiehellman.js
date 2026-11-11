@@ -32,7 +32,7 @@ const {
 
 const {
   lazyDOMException,
-} = require('internal/crypto/node_util');
+} = require('internal/util');
 
 function ecdhDeriveBits(algorithm, baseKey, length) {
   const { 'public': key } = algorithm;

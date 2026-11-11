@@ -54,7 +54,9 @@ function internalRequire(request, parent = '') {
       factory = native.compileBuiltin(factory, 'node:' + request);
       factorySet(request, factory);
     }
-    factory(module, module.exports, name => internalRequire(name, request));
+    // Like Node's builtin wrapper, process is a parameter, so user code that
+    // shadows or replaces the global process cannot change what built-ins see.
+    factory(module, module.exports, name => internalRequire(name, request), process);
   }
   catch (error) { moduleDelete(request); throw error; }
   return module.exports;
@@ -69,6 +71,8 @@ for (const name of ['dispose', 'asyncDispose']) {
 }
 const host = { ...native, rawOS, rawStd };
 host.builtinLoaded = moduleHas;
+// Whether a built-in id (public or internal) exists, loaded or not: Node's BuiltinModule.exists.
+host.builtinExists = Map.prototype.has.bind(factories);
 // Source maps are off until something loads the module to switch them on, so
 // registering a source before that only matters when coverage wants every map.
 host.registerSource = (filename, source, metadata) => {
@@ -98,6 +102,11 @@ host.processFeatures = {
 // Node's kFirstModuleParent: the module that first required a module, for require stacks.
 host.kFirstModuleParent = Symbol('kFirstModuleParent');
 define('internal/host', module => { module.exports = host; });
+// Like Node's, process is an instance of a constructor named process whose
+// prototype inherits from EventEmitter.prototype once events has loaded below.
+// It exists before any built-in runs, since every one of them takes it.
+const ProcessConstructor = { process: function () {} }.process;
+const process = Object.create(ProcessConstructor.prototype);
 internalRequire('internal/error_stack').install(globalThis);
 let warnedTransformTypes = false;
 host.stripTypeScriptModuleTypes = (source, filename, sourceURL = filename) => {
@@ -150,7 +159,7 @@ host.initializeRealmBuiltins = (handle, global, wasmCodeGeneration) => {
     cache.set(name, module);
     const script = native.vmCompile('(' + source + ')', 'node:' + name, handle);
     const factory = native.vmRun(script, 0, false);
-    factory(module, module.exports, load);
+    factory(module, module.exports, load, process);
     return module.exports;
   }
   load('internal/error_stack').install(global);
@@ -371,6 +380,7 @@ const kTimerId = Symbol('timerId'), kDue = Symbol('due'), kRefed = Symbol('refed
 const TIMEOUT_MAX = 2147483647;
 let warnedNegativeNumber = false, warnedNotNumber = false;
 function timeoutDuration(after) {
+  if (after === undefined) return 1;
   after *= 1;
   if (!(after >= 1 && after <= TIMEOUT_MAX)) {
     if (after > TIMEOUT_MAX) {
@@ -540,13 +550,10 @@ host.writeText = (fd, text) => {
   return true;
 };
 host.writeStartupDiagnostic = host.stderr.write;
-globalThis.process = { platform: host.platform, env: host.env, nextTick: host.nextTick, emitWarning: value => host.stderr.write(String(value) + '\n') };
+Object.assign(process, { platform: host.platform, env: host.env, nextTick: host.nextTick, emitWarning: value => host.stderr.write(String(value) + '\n') });
+globalThis.process = process;
 const EventEmitter = internalRequire('events');
-// Like Node's, process is an instance of a constructor named process whose
-// prototype inherits from EventEmitter.prototype.
-const ProcessConstructor = { process: function () {} }.process;
 Object.setPrototypeOf(ProcessConstructor.prototype, EventEmitter.prototype);
-const process = Object.create(ProcessConstructor.prototype);
 EventEmitter.call(process);
 Object.defineProperty(process, Symbol.toStringTag, { enumerable: false, writable: true, configurable: false, value: 'process' });
 defineGlobalAccessor('process', process);
@@ -637,6 +644,7 @@ Object.assign(process, {
   exit(code) {
     if (code !== undefined) process.exitCode = code;
     if (!process._exiting) { process._exiting = true; process.emit('exit', Number(process.exitCode) || 0); }
+    inspectorBackend._atExit();
     process.reallyExit(Number(process.exitCode) || 0);
   },
   // What process.exit ends with; replaceable, as in Node.
@@ -897,6 +905,7 @@ function runtimeFlag(arg) {
   try {
     if (internalRequire('internal/permission').applyOption(arg) ||
         internalRequire('internal/startup_controls').applyOption(arg) ||
+        internalRequire('internal/tls/options').applyOption(arg) ||
         internalRequire('internal/heap_prof').applyOption(arg) ||
         internalRequire('internal/options').applyInspectorOption(arg)) return true;
   }
@@ -924,6 +933,11 @@ function runtimeFlag(arg) {
   if (arg === '--expose-gc' || arg === '--no-expose-gc') {
     host.exposeGC = arg === '--expose-gc'; return true;
   }
+  // Node's flag exposes Node's own lib/internal modules and bindings. This
+  // runtime has none of those, so the flag is accepted and exposes nothing:
+  // require('internal/...') stays MODULE_NOT_FOUND.
+  if (arg === '--expose-internals' || arg === '--expose_internals') return true;
+  if (arg === '--disable-sigusr1') { host.disableSigusr1 = true; return true; }
   if (arg === '--test-update-snapshots' || arg === '--no-test-update-snapshots') {
     host.testUpdateSnapshots = arg === '--test-update-snapshots'; return true;
   }
@@ -1013,6 +1027,7 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
     process.debugPort = options?.port ?? 9229;
     process._breakFirstLine = !!options?.breakFirst;
     if (options?.enabled) inspectorBackend._start(options.port, options.host, options.wait, options.breakFirst);
+    if (workerThreads.isMainThread) inspectorBackend._installProcess(process, options?.host, !host.disableSigusr1);
     if (!workerThreads.isMainThread) inspectorBackend._waitForWorker();
   }
 }
@@ -1177,7 +1192,8 @@ function run() {
         (arg.endsWith('=') && (internalRequire('internal/process_report').isValueOption(arg.slice(0, -1)) ||
           internalRequire('internal/startup_controls').isValueOption(arg.slice(0, -1)) ||
           internalRequire('internal/heap_prof').isValueOption(arg.slice(0, -1)) ||
-          internalRequire('internal/permission').isValueOption(arg.slice(0, -1))))) return cliError(arg + ' requires an argument');
+          internalRequire('internal/permission').isValueOption(arg.slice(0, -1)) ||
+          internalRequire('internal/tls/options').isValueOption(arg.slice(0, -1))))) return cliError(arg + ' requires an argument');
     if (runtimeFlag(arg)) { record(arg); continue; }
     if (arg === '--trace-event-categories' || arg === '--trace-event-file-pattern' || arg === '--localstorage-file' ||
         arg === '-r' || arg === '--require' || arg === '--import' || arg === '-C' || arg === '--conditions' ||
@@ -1186,6 +1202,7 @@ function run() {
         internalRequire('internal/startup_controls').isValueOption(arg) ||
         internalRequire('internal/heap_prof').isValueOption(arg) ||
         internalRequire('internal/permission').isValueOption(arg) ||
+        internalRequire('internal/tls/options').isValueOption(arg) ||
         internalRequire('internal/options').isInspectorValueOption(arg) ||
         arg === '--experimental-sea-config' || arg.startsWith('--experimental-sea-config=')) {
       const separator = arg.indexOf('=');
@@ -1330,6 +1347,8 @@ Environment:
 `);
       return;
     }
+    if (/^--debug(?:-brk)?(?:=|$)/.test(arg))
+      return cliError('`node --debug` and `node --debug-brk` are invalid. Please use `node --inspect` and `node --inspect-brk` instead.');
     if (arg !== '-' && arg.startsWith('-')) return cliError('bad option: ' + arg);
     break;
   }
@@ -1337,6 +1356,8 @@ Environment:
     const separator = native.argv.indexOf('--', 1);
     return internalRequire('internal/main/run').runPackageScript(runName, separator < 0 ? [] : native.argv.slice(separator + 1));
   }
+  const tlsConflict = internalRequire('internal/tls/options').validate();
+  if (tlsConflict) return cliError(tlsConflict);
   if (watchMode && expression !== undefined) return cliError('either --watch or --eval can be used, not both');
   if (watchMode && check) return cliError('either --watch or --check can be used, not both');
   if (watchMode && interactive) return cliError('either --watch or --interactive can be used, not both');
@@ -1344,6 +1365,11 @@ Environment:
   process._print_eval = print;
   filename = args[index];
   process.argv = [process.execPath, ...args.slice(index)];
+  // `node inspect ...`: the debugger client (lib/internal/main/inspect.js).
+  if (filename === 'inspect' && expression === undefined && !testMode && !check && !watchMode && !interactive) {
+    installRuntimeOptions(environment.concat(process.execArgv));
+    return runPreloads(() => internalRequire('internal/debugger/inspect').start());
+  }
   if (check && expression !== undefined) return cliError('either --check or --eval can be used, not both');
   if (check && testMode) return cliError('either --test or --check can be used, not both');
   if (testMode && (expression !== undefined || interactive || inputTypeSet))
@@ -1541,6 +1567,7 @@ function loop() {
   performanceMilestones.loopExit = native.now() - startTime;
   process._exiting = true; const status = Number(process.exitCode) || 0;
   process.emit('exit', status);
+  inspectorBackend._atExit();
   if (moduleHas('internal/heap_prof')) internalRequire('internal/heap_prof').finish();
   if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushAtExit();
   return Number(process.exitCode) || 0;
@@ -1615,6 +1642,9 @@ globalThis.__silkRuntime = {
     // Whoever kept a noting proxy reaches the environment through it unnoted.
     for (const trap of Object.keys(notes)) delete notes[trap];
     host.env = startupEnvironmentValues; process.env = liveEnvironment;
+    // The warm main script and its dependency are cycles the loader no longer holds;
+    // left in the image, every start would find them (the inspector lists their scripts).
+    rawStd.gc();
   },
   // Starts a process from a heap image: everything the bootstrap took from the
   // process that built the image is taken again from this one.

@@ -29,7 +29,7 @@ const {
 
 const {
   lazyDOMException,
-} = require('internal/crypto/node_util');
+} = require('internal/util');
 
 // Implementation for WebCrypto subtle.digest()
 

@@ -321,7 +321,7 @@ host.types.isCryptoKey = isCryptoKey;
 // --- Jobs -------------------------------------------------------------------
 
 function operationError(cause) {
-  const { lazyDOMException } = require('internal/crypto/node_util');
+  const { lazyDOMException } = require('internal/util');
   return lazyDOMException('The operation failed for an operation-specific reason', { name: 'OperationError', cause });
 }
 
@@ -767,7 +767,21 @@ function getPqcKeyTypes() {
   return result;
 }
 
+// internalBinding('encoding_binding') decodeUTF8(buffer, ignoreBOM, fatal)
+// and encodeUtf8String(string).
+const encodingBinding = {
+  decodeUTF8(data, ignoreBOM, fatal) {
+    const { TextDecoder } = require('util');
+    return new TextDecoder('utf-8', { ignoreBOM, fatal }).decode(data);
+  },
+  encodeUtf8String(string) {
+    const { TextEncoder } = require('util');
+    return new TextEncoder().encode(string);
+  },
+};
+
 module.exports = {
+  encodingBinding,
   // Constants.
   kCryptoJobAsync,
   kCryptoJobSync,

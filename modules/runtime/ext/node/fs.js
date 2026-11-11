@@ -11,7 +11,7 @@ const { bufferCodec } = c.host;
 const fs = module.exports;
 const kMaxUserId = 2 ** 32 - 1;
 const kIoMaxLength = 2 ** 31 - 1;
-const { customPromisifyArgs } = require('internal/util_promisify');
+const { customPromisifyArgs } = require('internal/util');
 const customPromisified = Symbol.for('nodejs.util.promisify.custom');
 const isFd = value => value === (value | 0);
 const stats = (value, bigint) => value === undefined ? undefined : makeStats(value, !!bigint);

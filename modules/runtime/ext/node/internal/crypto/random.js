@@ -8,7 +8,7 @@
 
 const {
   lazyDOMException,
-} = require('internal/crypto/node_util');
+} = require('internal/util');
 
 const {
   isTypedArray,

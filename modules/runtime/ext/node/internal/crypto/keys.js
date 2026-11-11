@@ -47,7 +47,7 @@ const {
   customInspectSymbol: kInspect,
   kEnumerableProperty,
   lazyDOMException,
-} = require('internal/crypto/node_util');
+} = require('internal/util');
 
 const { inspect } = require('util');
 

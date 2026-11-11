@@ -1,6 +1,6 @@
 'use strict';
 
-// Node.js main (ce7aaf1c) lib/internal/crypto/webcrypto.js. Changes: primordials, internalBinding and the internal/util helpers come from the runtime's modules (internal/crypto/binding, internal/crypto/node_util).
+// Node.js main (ce7aaf1c) lib/internal/crypto/webcrypto.js. Changes: primordials, internalBinding and the internal/util helpers come from the runtime's modules (internal/crypto/binding, internal/util).
 // Copyright Node.js contributors. All rights reserved. MIT license (see
 // vendor/node-api/LICENSE).
 
@@ -39,7 +39,7 @@ const {
 const {
   decodeUTF8,
   encodeUtf8String,
-} = require('internal/crypto/node_util').encodingBinding;
+} = require('internal/crypto/binding').encodingBinding;
 
 const {
   codes: {
@@ -82,7 +82,7 @@ const {
   kEnumerableProperty,
   lazyDOMException,
   setOwnProperty,
-} = require('internal/crypto/node_util');
+} = require('internal/util');
 
 const {
   getRandomValues: _getRandomValues,

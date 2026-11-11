@@ -1,6 +1,6 @@
 'use strict';
 
-// Node.js main (ce7aaf1c) lib/internal/crypto/util.js. Changes: primordials, internalBinding and the internal/util helpers come from the runtime's modules (internal/crypto/binding, internal/crypto/node_util). There is no startup snapshot, so the snapshot cache resets are gone.
+// Node.js main (ce7aaf1c) lib/internal/crypto/util.js. Changes: primordials, internalBinding and the internal/util helpers come from the runtime's modules (internal/crypto/binding, internal/util). There is no startup snapshot, so the snapshot cache resets are gone.
 // Copyright Node.js contributors. All rights reserved. MIT license (see
 // vendor/node-api/LICENSE).
 
@@ -88,7 +88,7 @@ const {
   filterDuplicateStrings,
   lazyDOMException,
   setOwnProperty,
-} = require('internal/crypto/node_util');
+} = require('internal/util');
 
 
 const {

@@ -35,7 +35,7 @@ const {
   TypedArrayPrototypeGetSymbolToStringTag,
 } = require('internal/per_context/primordials');
 
-const { kEmptyObject, setOwnProperty } = require('internal/crypto/node_util');
+const { kEmptyObject, setOwnProperty } = require('internal/util');
 const {
   isSharedArrayBuffer,
   isTypedArray,

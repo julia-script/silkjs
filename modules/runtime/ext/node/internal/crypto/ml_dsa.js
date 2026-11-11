@@ -1,6 +1,6 @@
 'use strict';
 
-// Node.js main (ce7aaf1c) lib/internal/crypto/ml_dsa.js. Changes: primordials, internalBinding and the internal/util helpers come from the runtime's modules (internal/crypto/binding, internal/crypto/node_util).
+// Node.js main (ce7aaf1c) lib/internal/crypto/ml_dsa.js. Changes: primordials, internalBinding and the internal/util helpers come from the runtime's modules (internal/crypto/binding, internal/util).
 // Copyright Node.js contributors. All rights reserved. MIT license (see
 // vendor/node-api/LICENSE).
 
@@ -37,7 +37,7 @@ const {
 
 const {
   lazyDOMException,
-} = require('internal/crypto/node_util');
+} = require('internal/util');
 
 const {
   getCryptoKeyAlgorithm,
