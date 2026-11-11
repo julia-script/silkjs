@@ -118,6 +118,8 @@ class StreamHandle {
     this._consumers = null;
     if (transport !== undefined) this._adopt(transport);
   }
+  // Node's StreamBase: an HTTP parser can consume the handle directly (parser.consume).
+  get isStreamBase() { return true; }
   _adopt(transport) {
     this._transport = transport;
     transport.onEvent = (type, status, payload) => this._dispatch(type, status, payload);
@@ -271,7 +273,8 @@ class StreamHandle {
         }
         // An http parser that consumed this stream (parser.consume) reads its bytes instead.
         const consumer = this._consumers?.[this._consumers.length - 1];
-        if (consumer) { consumer.read(status, payload); return; }
+        // A consumer hands read errors and the end of the stream back (returns false).
+        if (consumer && consumer.read(status, payload) !== false) return;
         if (status < 0) {
           this.reading = false;
           this._deliver(null, status);

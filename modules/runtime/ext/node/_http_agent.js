@@ -45,6 +45,11 @@ const {
   once,
 } = require('internal/util');
 const {
+  kReadBytesOrError,
+  streamBaseState,
+  onStreamRead,
+} = require('internal/stream_base_commons');
+const {
   validateNumber,
   validateOneOf,
   validateString,
@@ -88,17 +93,12 @@ function freeSocketErrorListener(err) {
 // in the TCP buffer and be silently consumed as the response for the
 // *next* request that reuses the socket (response-queue poisoning).
 // See: https://hackerone.com/reports/3582376
-// The runtime's sockets read through stream consumers instead of handle.onread, so the
-// guard is a consumer that sits on top while the socket is free, as Node swaps onread.
-const kFreeSocketReadGuard = Symbol('kFreeSocketReadGuard');
-function freeSocketReadGuard(socket) {
-  return {
-    read(status, payload) {
-      if (status >= 0 && !payload?.byteLength) return;
-      debug('READ on FREE socket - destroying poisoned socket');
-      socket.destroy();
-    },
-  };
+function freeSocketOnReadGuard() {
+  const nread = streamBaseState[kReadBytesOrError];
+  if (nread === 0) return;
+
+  debug('READ on FREE socket - destroying poisoned socket');
+  this[owner_symbol].destroy();
 }
 
 function installFreeSocketDataGuard(socket) {
@@ -117,11 +117,14 @@ function installFreeSocketDataGuard(socket) {
     return;
   }
 
-  const transport = socket._transport;
-  if (transport && !socket[kFreeSocketReadGuard]) {
-    const guard = socket[kFreeSocketReadGuard] = freeSocketReadGuard(socket);
-    (socket._streamConsumers ||= []).push(guard);
-    if (transport.readStart() < 0) socket.destroy();
+  const handle = socket._handle;
+  if (handle) {
+    handle.onread = freeSocketOnReadGuard;
+    if (!handle.reading) {
+      handle.reading = true;
+      const err = handle.readStart();
+      if (err) socket.destroy();
+    }
   }
 }
 
@@ -132,7 +135,9 @@ function hasPendingRead(socket) {
   // A socket that is still connecting has nothing to read yet, and a pending
   // connect error must be reported to the request rather than swallowed here.
   if (socket.connecting) return false;
-  return socket.readableLength > 0;
+  const handle = socket._handle;
+  return typeof handle?.hasPendingRead === 'function' &&
+    handle.hasPendingRead() === true;
 }
 
 function removeFreeSocketDataGuard(socket) {
@@ -141,12 +146,9 @@ function removeFreeSocketDataGuard(socket) {
     socket[kFreeSocketDataGuard] = null;
   }
 
-  const guard = socket[kFreeSocketReadGuard];
-  if (guard) {
-    socket[kFreeSocketReadGuard] = null;
-    const consumers = socket._streamConsumers;
-    const at = consumers.indexOf(guard);
-    if (at !== -1) consumers.splice(at, 1);
+  const handle = socket._handle;
+  if (handle?.onread === freeSocketOnReadGuard) {
+    handle.onread = onStreamRead;
   }
 }
 
