@@ -306,24 +306,26 @@ host.queueMicrotask = callback => {
   catch (error) { scope.emitDestroy(); throw error; }
 };
 globalThis.queueMicrotask = host.queueMicrotask;
-let nextTimer = 1;
-const timers = new Map();
-const immediates = new Map();
-const executingTimers = [];
 function checkCallback(callback) {
   if (typeof callback !== 'function') throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('callback', 'function', callback);
 }
 function invoke(callback, receiver, args) {
   try { return Reflect.apply(callback, receiver, args); }
-  catch (error) {
-    try {
-      if (process.domain && internalRequire('domain')._handleException(error)) return;
-      internalRequire('internal/startup_controls').handleUncaught(error, 'uncaughtException');
-    } catch (next) {
-      if (next === error || !workerThreads.isMainThread) throw next;
-      exceptionInFatalHandler(next);
-    }
+  catch (error) { reportUncaught(error); }
+}
+function reportUncaught(error) {
+  try {
+    if (process.domain && internalRequire('domain')._handleException(error)) return;
+    internalRequire('internal/startup_controls').handleUncaught(error, 'uncaughtException');
+  } catch (next) {
+    if (next === error || !workerThreads.isMainThread) throw next;
+    exceptionInFatalHandler(next);
   }
+}
+// Runs a timer or immediate callback; true when it threw (and was reported).
+function invokeReporting(callback, receiver, args) {
+  try { Reflect.apply(callback, receiver, args); return false; }
+  catch (error) { reportUncaught(error); return true; }
 }
 // A domain error handler or uncaughtException listener that throws ends the process
 // with Node's kExceptionInFatalExceptionHandler status, without 'exit' listeners.
@@ -391,109 +393,16 @@ function checkpoint() {
   } while (ticksPending() || rejections.size || completionsPending());
 }
 host.checkpoint = checkpoint;
-// Timeout and Immediate keep Node's public fields (_idleTimeout, _onTimeout,
-// _timerArgs, _repeat, _destroyed; _onImmediate, _argv), which code reads and
-// writes: a callback that sets _repeat turns a timeout into an interval, and
-// _onTimeout = null or _idleTimeout = -1 stops one. The schedule itself is in
-// symbol-keyed fields and the timers / immediates maps.
-const kTimerId = Symbol('timerId'), kDue = Symbol('due'), kRefed = Symbol('refed'), kTimerResource = Symbol('resource');
-const TIMEOUT_MAX = 2147483647;
-let warnedNegativeNumber = false, warnedNotNumber = false;
-function timeoutDuration(after) {
-  if (after === undefined) return 1;
-  after *= 1;
-  if (!(after >= 1 && after <= TIMEOUT_MAX)) {
-    if (after > TIMEOUT_MAX) {
-      process.emitWarning(`${after} does not fit into a 32-bit signed integer.\nTimeout duration was set to 1.`, 'TimeoutOverflowWarning');
-    } else if (after < 0 && !warnedNegativeNumber) {
-      warnedNegativeNumber = true;
-      process.emitWarning(`${after} is a negative number.\nTimeout duration was set to 1.`, 'TimeoutNegativeWarning');
-    } else if (Number.isNaN(after) && !warnedNotNumber) {
-      warnedNotNumber = true;
-      process.emitWarning(`${after} is not a number.\nTimeout duration was set to 1.`, 'TimeoutNaNWarning');
-    }
-    after = 1;
-  }
-  return after;
+// Node's lib/timers.js and lib/internal/timers.js run the timers; the loop
+// drives them through internal/timers_binding as Node's Environment does.
+host.invokeTimer = (scope, callback, receiver, args) => invokeScoped(scope, invokeReporting, callback, receiver, args);
+const timerAPI = internalRequire('timers');
+{
+  const { processImmediate, processTimers } = internalRequire('internal/timers').getTimerCallbacks(checkpoint);
+  internalRequire('internal/timers_binding').setupTimers(processImmediate, processTimers);
 }
-function schedule(timer, start) {
-  timer._idleStart = start;
-  timer[kDue] = start + Math.trunc(timer._idleTimeout);
-  timers.set(timer[kTimerId], timer);
-}
-class Timeout {
-  constructor(callback, after, args, isRepeat) {
-    after = timeoutDuration(after);
-    this._idleTimeout = after; this._idlePrev = null; this._idleNext = null; this._idleStart = null;
-    this._onTimeout = callback; this._timerArgs = args; this._repeat = isRepeat ? after : null; this._destroyed = false;
-    this[kRefed] = true; this[kTimerId] = nextTimer++;
-    this[kTimerResource] = resource('Timeout', this);
-    schedule(this, native.now());
-  }
-  ref() { this[kRefed] = true; return this; }
-  unref() { this[kRefed] = false; return this; }
-  hasRef() { return this[kRefed]; }
-  refresh() {
-    if (this._destroyed) { this[kTimerResource] = resource('Timeout', this); this._destroyed = false; }
-    schedule(this, native.now());
-    return this;
-  }
-  close() { clearTimeout(this); return this; }
-  [Symbol.toPrimitive]() { return this[kTimerId]; }
-  [Symbol.dispose]() { clearTimeout(this); }
-}
-class Immediate {
-  constructor(callback, args) {
-    this._idleNext = null; this._idlePrev = null; this._onImmediate = callback; this._argv = args; this._destroyed = false;
-    this[kRefed] = true; this[kTimerId] = nextTimer++;
-    this[kTimerResource] = resource('Immediate', this);
-    immediates.set(this[kTimerId], this);
-  }
-  ref() { this[kRefed] = true; return this; }
-  unref() { this[kRefed] = false; return this; }
-  hasRef() { return !!this[kRefed]; }
-  [Symbol.dispose]() { clearImmediate(this); }
-}
-function unenroll(timer) {
-  timers.delete(timer[kTimerId]);
-  if (!timer._destroyed) { timer._destroyed = true; timer[kTimerResource].emitDestroy(); }
-  timer._idleTimeout = -1;
-}
-function clearTimeout(timer) {
-  if (timer?._onTimeout) { timer._onTimeout = null; unenroll(timer); return; }
-  if (typeof timer === 'number' || typeof timer === 'string') {
-    const instance = timers.get(Number(timer));
-    if (instance !== undefined) { instance._onTimeout = null; unenroll(instance); }
-  }
-}
-function clearImmediate(immediate) {
-  if (!(immediate instanceof Immediate) || immediate._destroyed) return;
-  immediate._destroyed = true; immediate._onImmediate = null;
-  immediates.delete(immediate[kTimerId]);
-  immediate[kTimerResource].emitDestroy();
-}
-function validateCallback(callback) {
-  if (typeof callback !== 'function') throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('callback', 'function', callback);
-}
-const timerAPI = {
-  setTimeout(callback, after, ...args) { validateCallback(callback); return new Timeout(callback, after, args.length ? args : undefined, false); },
-  clearTimeout,
-  setImmediate(callback, ...args) { validateCallback(callback); return new Immediate(callback, args.length ? args : undefined); },
-  clearImmediate,
-  setInterval(callback, repeat, ...args) { validateCallback(callback); return new Timeout(callback, repeat, args.length ? args : undefined, true); },
-  // Intervals are Timeouts: either clear function clears either.
-  clearInterval(timer) { clearTimeout(timer); },
-};
-Object.defineProperty(timerAPI, 'promises', {
-  get() { return internalRequire('timers/promises'); }, enumerable: true, configurable: true,
-});
+const timerLoop = host.timerLoop;
 for (const name of ['setTimeout', 'clearTimeout', 'setImmediate', 'clearImmediate', 'setInterval', 'clearInterval']) globalThis[name] = timerAPI[name];
-define('timers', module => { module.exports = timerAPI; });
-for (const name of ['setTimeout', 'setImmediate']) {
-  Object.defineProperty(timerAPI[name], Symbol.for('nodejs.util.promisify.custom'), {
-    enumerable: true, get() { return internalRequire('timers/promises')[name]; }
-  });
-}
 const Buffer = internalRequire('buffer').Buffer;
 host.Buffer = Buffer;
 // process and Buffer are accessors on Node's global object (the hook for an
@@ -724,15 +633,9 @@ host.activeResources = () => {
   const names = [];
   for (const row of native.resourceSnapshot())
     if ((row[7] ?? row[2]) && row[6] !== null) names.push(row[6]);
-  const seen = new Set();
-  for (const collection of [timers.values(), immediates.values(), executingTimers]) {
-    for (const timer of collection) {
-      if (!timer._destroyed && timer[kRefed] && !seen.has(timer)) {
-        seen.add(timer);
-        names.push(timer instanceof Immediate ? 'Immediate' : 'Timeout');
-      }
-    }
-  }
+  // As node_process_methods.cc does: the referenced Timeouts, then the referenced Immediates.
+  for (let count = timerLoop.timeoutInfo[0]; count > 0; count--) names.push('Timeout');
+  for (let count = timerLoop.immediateInfo[1]; count > 0; count--) names.push('Immediate');
   names.push(...native.workerNative('activeResources', []));
   return names;
 };
@@ -1458,43 +1361,7 @@ function run() {
   });
 }
 function referencedWork() {
-  if (native.hasPendingIO()) return true;
-  // Most I/O-bound turns have no timers: skip creating the iterators.
-  if (timers.size !== 0) for (const timer of timers.values()) if (timer[kRefed] && !timer._destroyed) return true;
-  if (immediates.size !== 0) for (const timer of immediates.values()) if (timer[kRefed] && !timer._destroyed) return true;
-  return false;
-}
-function fireTimeout(timer, start) {
-  const id = timer[kTimerId];
-  timers.delete(id);
-  if (!timer._onTimeout) { unenroll(timer); return; }
-  executingTimers.push(timer);
-  try { invokeResource(timer[kTimerResource], timer._onTimeout, timer, timer._timerArgs || [], false); }
-  finally {
-    executingTimers.pop();
-    if (timer._repeat && timer._idleTimeout !== -1 && !timer._destroyed) {
-      timer._idleTimeout = timer._repeat;
-      schedule(timer, start);
-    } else if (!timers.has(id) && !timer._destroyed) {
-      // Not refreshed by its callback: done.
-      timer._destroyed = true;
-      timer[kTimerResource].emitDestroy();
-    }
-  }
-  checkpoint();
-}
-function fireImmediate(immediate) {
-  immediates.delete(immediate[kTimerId]);
-  immediate._destroyed = true;
-  const callback = immediate._onImmediate;
-  executingTimers.push(immediate);
-  try { invokeResource(immediate[kTimerResource], callback, immediate, immediate._argv || [], false); }
-  finally {
-    executingTimers.pop();
-    immediate._onImmediate = null;
-    immediate[kTimerResource].emitDestroy();
-  }
-  checkpoint();
+  return native.hasPendingIO() || timerLoop.hasRef();
 }
 function pollWorkers() {
   // Replenished queues must yield to timers and native I/O. Rearm the wake
@@ -1508,37 +1375,26 @@ function pollWorkers() {
 // Milliseconds the native poll may wait: 0 when JavaScript work is ready, the
 // delay to the next timer, or -1 to wait for native completions alone.
 function pollTimeout(pendingPromise) {
-  if (ticksPending() || immediates.size) return 0;
+  if (ticksPending()) return 0;
   if (pendingPromise !== undefined && native.promiseState(pendingPromise) !== 0) return 0;
   const referenced = referencedWork();
   if (!referenced && pendingPromise === undefined) return 0;
-  let due = Infinity;
-  if (timers.size !== 0) for (const timer of timers.values()) if (!timer._destroyed && timer[kDue] < due) due = timer[kDue];
+  const delay = timerLoop.pollDelay();
   // A hook may await an unreferenced timer or an externally settled promise.
   // Keep nested waits interruptible without emitting main-loop lifecycle events.
-  if (!referenced && due === Infinity) return 1;
-  if (due === Infinity) return native.hasPendingIO() ? -1 : 0;
+  if (!referenced && delay === -1) return 1;
+  if (delay === -1) return native.hasPendingIO() ? -1 : 0;
   // To the fraction of a millisecond: rounding up would wait up to one more.
-  return Math.max(0, due - native.now());
+  return delay;
 }
+// One turn in libuv's order: timers, poll for I/O, then the check phase (immediates).
 function loopTurn(pendingPromise) {
-  const now = native.now();
-  // Only the due timers are ordered; most turns have none.
-  let due;
-  if (timers.size !== 0) for (const timer of timers.values()) if (!timer._destroyed && timer[kDue] <= now) (due ||= []).push(timer);
-  if (due !== undefined) {
-    if (due.length > 1) due.sort((a, b) => a[kDue] - b[kDue] || a[kTimerId] - b[kTimerId]);
-    for (const timer of due) if (!timer._destroyed && timer[kDue] <= now && timers.has(timer[kTimerId])) fireTimeout(timer, now);
-  }
+  if (timerLoop.runTimers()) checkpoint();
   native.pollIO(pollTimeout(pendingPromise));
   pollWorkers();
   checkpoint();
   if (loopListeners.size !== 0) for (const listener of loopListeners) listener();
-  if (immediates.size !== 0) {
-    for (const immediate of [...immediates.values()]) {
-      if (!immediate._destroyed) fireImmediate(immediate);
-    }
-  }
+  if (timerLoop.checkImmediate()) checkpoint();
 }
 // An exception in a 'beforeExit' or 'exit' listener is uncaught like any other.
 function emitProcessEvent(name) { process.emit(name, Number(process.exitCode) || 0); }
