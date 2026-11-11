@@ -12,6 +12,8 @@ let asyncEnabled = false;
 let initialized = false;
 let nextId = 1;
 const stringify = JSON.stringify;
+// Modules that switch a fast path on and off with a category group: [group, callback, state].
+const watchers = [];
 function native(operation, value, timestamp) {
   const errno = host.traceNative(operation, value, timestamp);
   if (errno) throw Object.assign(new Error(`Trace file ${operation} failed (errno ${errno})`), { code: 'ERR_TRACE_EVENTS_WRITE', errno: -errno });
@@ -26,7 +28,25 @@ function ensureOpen() {
   const path = filePattern.replace(/\$\{(pid|rotation)\}/g, (_, key) => key === 'pid' ? String(process.pid) : '1');
   native('open', path);
   opened = true;
+  writeMetadata();
 }
+// As Node's agent: every trace file starts with the process and thread names and versions.
+function metadata(name, args) {
+  const json = stringify({ cat: '__metadata', name, ph: 'M', args });
+  native('record', json.slice(0, -1), 0);
+}
+function writeMetadata() {
+  metadata('process_name', { name: processName() });
+  metadata('thread_name', { name: 'JavaScriptMainThread' });
+  metadata('version', { node: process.versions.node });
+  const { versions, arch, platform, release } = process;
+  metadata('node', { process: { versions, arch, platform, release } });
+}
+function processName() {
+  return typeof process.title === 'string' ? process.title : require('path').basename(process.argv0 || 'node');
+}
+// process.title setters call this so the trace names the process again, as Node does.
+function processTitleChanged() { if (opened && !writing) metadata('process_name', { name: processName() }); }
 function emit(category, name, phase, args = {}, id, timestamp, duration) {
   if (writing || !enabled(category)) return;
   writing = true;
@@ -45,13 +65,17 @@ function sync() {
   if (enabled('node.diagnostics_channel')) require('diagnostics_channel');
   const track = enabled('node,node.async_hooks');
   native('gc', enabled('v8,gc'));
+  for (const watcher of watchers) {
+    const on = enabled(watcher[0]);
+    if (on !== watcher[2]) { watcher[2] = on; watcher[1](on); }
+  }
   if (track && !asyncEnabled) {
     if (!hook) {
       const async = require('async_hooks');
       hook = async.createHook({
         init(id, type, triggerAsyncId) {
           resources.set(id, type);
-          emit('node,node.async_hooks', type, 'b', { triggerAsyncId, executionAsyncId: async.executionAsyncId() }, id);
+          emit('node,node.async_hooks', type, 'b', { data: { triggerAsyncId, executionAsyncId: async.executionAsyncId() } }, id);
         },
         before(id) { const type = resources.get(id); if (type !== undefined) emit('node,node.async_hooks', `${type}_CALLBACK`, 'b', {}, id); },
         after(id) { const type = resources.get(id); if (type !== undefined) emit('node,node.async_hooks', `${type}_CALLBACK`, 'e', {}, id); },
@@ -111,5 +135,17 @@ function performanceEntry(entry, origin) {
 function diagnostic(name) {
   if (enabled('node.diagnostics_channel')) emit('node.diagnostics_channel', String(name), 'i');
 }
+// Calls callback(true) when a category of group turns on and callback(false) when all are off.
+function watch(group, callback) {
+  const on = enabled(group);
+  watchers.push([group, callback, on]);
+  if (on) callback(true);
+}
+// internalBinding('trace_events').trace: the phase is a character code, and data, when
+// given, is the event's args.data.
+function trace(phase, category, name, id, data) {
+  if (!enabled(category)) return;
+  emit(category, `${name}`, String.fromCharCode(phase), data === undefined ? {} : { data }, id);
+}
 function flush() { if (opened) native('flush'); }
-module.exports = { available, enabled, add, remove, getEnabledCategories, initialize, emit, begin, end, performanceEntry, diagnostic, flush };
+module.exports = { available, enabled, isTraceCategoryEnabled: enabled, watch, trace, processTitleChanged, add, remove, getEnabledCategories, initialize, emit, begin, end, performanceEntry, diagnostic, flush };

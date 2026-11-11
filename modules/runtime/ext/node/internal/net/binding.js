@@ -10,6 +10,10 @@
 // onEvent(type, status, payload) callback), such as the TLS transport.
 
 const { Buffer } = require('buffer');
+const kNetTraceCategory = 'node,node.net,node.net.native';
+let traceEventsModule;
+// Loaded on first connect: this module is in the heap image.
+const traceEvents = () => (traceEventsModule ??= require('internal/trace_events'));
 const host = require('internal/host');
 const { Transport } = require('internal/net/transport');
 const {
@@ -277,6 +281,7 @@ class StreamHandle {
         return;
       }
       case CONNECT: {
+        this._endConnectTrace?.();
         const req = this._connectRequest;
         this._connectRequest = null;
         if (req && typeof req.oncomplete === 'function') req.oncomplete(status, this, req, true, true);
@@ -294,6 +299,7 @@ class StreamHandle {
     }
   }
   _closed() {
+    this._endConnectTrace?.();
     const callback = this._closeCallback;
     this._closeCallback = null;
     const owner = this.#owner;
@@ -376,6 +382,21 @@ class NativeStreamHandle extends StreamHandle {
     return 0;
   }
   _accept(id) { return new this.constructor(this.constructor.SOCKET, id); }
+  // ConnectWrap: a node.net.native "connect" span lasts from the native connect to its result.
+  _connect(req, address, port) {
+    const traceId = traceEvents().begin(kNetTraceCategory, 'connect');
+    const status = this._call('connect', address, port);
+    if (status < 0) { traceEvents().end(kNetTraceCategory, 'connect', traceId); return status; }
+    this._connectRequest = req;
+    this._connectTraceId = traceId;
+    return 0;
+  }
+  _endConnectTrace() {
+    const id = this._connectTraceId;
+    if (id === undefined) return;
+    this._connectTraceId = undefined;
+    traceEvents().end(kNetTraceCategory, 'connect', id);
+  }
 }
 
 // src/tcp_wrap.cc
@@ -395,11 +416,7 @@ class TCP extends NativeStreamHandle {
     return this._call('listen', 511, 1);
   }
   bind6(address, port, flags = 0) { return this.bind(address, port, flags); }
-  connect(req, address, port) {
-    const status = this._call('connect', address, port);
-    if (status === 0) this._connectRequest = req;
-    return status < 0 ? status : 0;
-  }
+  connect(req, address, port) { return this._connect(req, address, port); }
   connect6(req, address, port) { return this.connect(req, address, port); }
   getsockname(out) { const r = this._address(out, false); return typeof r === 'string' ? uv.UV_EINVAL : r; }
   getpeername(out) { const r = this._address(out, true); return typeof r === 'string' ? uv.UV_EINVAL : r; }
@@ -433,11 +450,7 @@ class Pipe extends NativeStreamHandle {
     this._mode = 0;
   }
   bind(path) { return this._call('bind', path, 0, 0); }
-  connect(req, path) {
-    const status = this._call('connect', path, 0);
-    if (status === 0) this._connectRequest = req;
-    return status < 0 ? status : 0;
-  }
+  connect(req, path) { return this._connect(req, path, 0); }
   fchmod(mode) {
     return this._call('chmod', (mode & PipeConstants.UV_READABLE) !== 0, (mode & PipeConstants.UV_WRITABLE) !== 0);
   }
