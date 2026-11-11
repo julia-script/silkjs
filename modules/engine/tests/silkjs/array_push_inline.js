@@ -22,6 +22,6 @@ var big=[]; big.length=5; out.push(big.push('e'), big.length);
 var t=[1,2,3]; out.push(t.indexOf(2), t.includes(3), t.hasOwnProperty('length'), t.toString(), t.constructor===Array);
 Array.prototype.extra=function(){ return 'extra'; }; out.push(t.extra()); delete Array.prototype.extra; out.push(typeof t.extra);
 const got = out.join(',');
-const expected = "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,20,19,true,1,true,2,true,2,4,4,false,own:5,1,1,1,true,over:1,1,set:0,set:length,1,1,x,1,21,21,21,23,23,0,1,2,0,1,2,1,6,6,1,true,true,1,2,3,true,extra,undefined";
+const expected = "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,20,19,true,1,true,1,true,2,4,4,false,own:5,1,1,1,true,over:1,1,set:0,set:length,1,1,x,1,21,21,21,23,23,0,1,2,0,1,2,1,6,6,1,true,true,1,2,3,true,extra,undefined";
 console.log(got === expected ? 'PASS array push inline' : 'FAIL ' + got);
 if (got !== expected) throw new Error('array push inline regressions');

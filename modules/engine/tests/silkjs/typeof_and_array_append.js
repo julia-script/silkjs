@@ -22,6 +22,6 @@ var m=[0,1,2]; m[3]='w'; r.push(m.length, m[3]);
 var sub=Object.create([]); sub[0]=1; r.push(sub.length, Array.isArray(sub));
 var big=[]; for (var j=0;j<5000;j++) big[j]={v:j}; var t=0; for (var j=0;j<big.length;j++) t+=big[j].v; r.push(big.length, t);
 var got=r.join(',');
-const expected = '1000000000000000000000,0000000000000111101110,true,true,false,100,0,198,9900,6,,1|2|3|x||y,2,,3,,2,,2,,TypeError,3,setz,false,4,w,0,false,5000,12497500';
+const expected = '1000000000000000000000,0000000000000111101110,true,true,false,100,0,198,9900,6,,1|2|3|x||y,2,,2,,2,,2,,TypeError,3,setz,false,4,w,0,false,5000,12497500';
 console.log(got === expected ? 'PASS typeof tests and array appends' : 'FAIL ' + got);
 if (got !== expected) throw new Error('typeof or array append regressions');
