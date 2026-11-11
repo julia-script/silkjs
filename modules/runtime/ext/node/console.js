@@ -37,25 +37,7 @@ let width;
 const getStringWidth = text => (width ||= require('internal/readline/width')).getStringWidth(text);
 const inspectorConsole = require('internal/inspector_console');
 
-class ERR_CONSOLE_WRITABLE_STREAM extends TypeError {
-  constructor(name) {
-    super(`Console expects a writable stream instance for ${name}`);
-    this.code = 'ERR_CONSOLE_WRITABLE_STREAM';
-  }
-  get name() { return 'TypeError'; }
-  toString() { return `TypeError [${this.code}]: ${this.message}`; }
-}
-class ERR_INCOMPATIBLE_OPTION_PAIR extends TypeError {
-  constructor(first, second) {
-    super(`Option "${first}" cannot be used in combination with option "${second}"`);
-    this.code = 'ERR_INCOMPATIBLE_OPTION_PAIR';
-  }
-  get name() { return 'TypeError'; }
-  toString() { return `TypeError [${this.code}]: ${this.message}`; }
-}
-function isStackOverflowError(error) {
-  return error instanceof RangeError && /call stack|recursion/i.test(error.message);
-}
+const { codes: { ERR_CONSOLE_WRITABLE_STREAM, ERR_INCOMPATIBLE_OPTION_PAIR }, isStackOverflowError } = require('internal/errors');
 
 const onLog = channel('console.log');
 const onWarn = channel('console.warn');

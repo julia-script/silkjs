@@ -22,12 +22,11 @@
 'use strict';
 const host = require('internal/host');
 const native = (operation, args = []) => host.osNative(operation, args);
-const { codes: { ERR_INVALID_ARG_TYPE } } = require('internal/path_events/support');
+const { codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_UNKNOWN_CREDENTIAL } } = require('internal/errors');
+const { validateUint32 } = require('internal/validators');
 const invalid = (name, expected, value) => new ERR_INVALID_ARG_TYPE(name, expected, value);
 function uint32(value, name) {
-  if (typeof value !== 'number') throw invalid(name, 'number', value);
-  if (!Number.isInteger(value) || value < 0 || value > 0xffffffff)
-    throw Object.assign(new RangeError(`The value of "${name}" is out of range. It must be >= 0 and <= 4294967295. Received ${value}`), { code: 'ERR_OUT_OF_RANGE' });
+  validateUint32(value, name);
   return value;
 }
 function validateId(value, name) {
@@ -36,7 +35,7 @@ function validateId(value, name) {
   return value;
 }
 function unknown(value, group) {
-  return Object.assign(new Error(`${group ? 'Group' : 'User'} identifier does not exist: ${value}`), { code: 'ERR_UNKNOWN_CREDENTIAL' });
+  return new ERR_UNKNOWN_CREDENTIAL(group ? 'Group' : 'User', value);
 }
 function resolve(value, group) {
   if (typeof value === 'number') return value;
@@ -51,7 +50,7 @@ function usage(operation, previous) {
       if (typeof value !== 'number' || !(value >= 0 && value <= Number.MAX_SAFE_INTEGER)) {
         if (key === 'user' && (typeof previous !== 'object' || Array.isArray(previous))) throw invalid('prevValue', 'object', previous);
         if (typeof value !== 'number') throw invalid(`prevValue.${key}`, 'number', value);
-        throw Object.assign(new RangeError(`The property 'prevValue.${key}' is invalid. Received ${value}`), { code: 'ERR_INVALID_ARG_VALUE' });
+        throw new ERR_INVALID_ARG_VALUE.RangeError(`prevValue.${key}`, value);
       }
     }
   }
@@ -106,7 +105,7 @@ function install(process) {
   process.umask = function umask(mask) {
     if (mask !== undefined) {
       if (typeof mask === 'string') {
-        if (!/^[0-7]+$/.test(mask)) throw Object.assign(new TypeError(`The argument 'mask' must be a 32-bit unsigned integer or an octal string. Received '${mask}'`), { code: 'ERR_INVALID_ARG_VALUE' });
+        if (!/^[0-7]+$/.test(mask)) throw new ERR_INVALID_ARG_VALUE('mask', mask, 'must be a 32-bit unsigned integer or an octal string');
         mask = parseInt(mask, 8);
       }
       uint32(mask, 'mask');

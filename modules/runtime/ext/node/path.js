@@ -220,7 +220,7 @@ const win32 = {
           continue;
         }
       } else if (resolvedDevice.length === 0) {
-        path = host.cwd();
+        path = cwd();
         // Fast path for current directory
         if (args.length === 0 || ((args.length === 1 && (args[0] === '' || args[0] === '.')) &&
             isPathSeparator(StringPrototypeCharCodeAt(path, 0)))) {
@@ -235,7 +235,7 @@ const win32 = {
         // absolute path, get cwd for that drive, or the process cwd if
         // the drive cwd is not available. We're sure the device is not
         // a UNC path at this points, because UNC paths are always absolute.
-        path = host.env[`=${resolvedDevice}`] || host.cwd();
+        path = host.env[`=${resolvedDevice}`] || cwd();
 
         // Verify that a cwd was found and that it actually points
         // to our drive. If not, default to the drive's root.
@@ -1238,19 +1238,22 @@ const win32 = {
   posix: null,
 };
 
+// Node calls process.cwd(), which programs may replace. The bootstrap resolves paths
+// before the real process object exists; until then the host's cwd is the answer.
+const cwd = () => (typeof globalThis.process?.cwd === 'function' ? globalThis.process.cwd() : host.cwd());
 const posixCwd = (() => {
   if (isWindows) {
     // Converts Windows' backslash path separators to POSIX forward slashes
     // and truncates any drive indicator
     const regexp = /\\/g;
     return () => {
-      const cwd = StringPrototypeReplace(host.cwd(), regexp, '/');
-      return StringPrototypeSlice(cwd, StringPrototypeIndexOf(cwd, '/'));
+      const path = StringPrototypeReplace(cwd(), regexp, '/');
+      return StringPrototypeSlice(path, StringPrototypeIndexOf(path, '/'));
     };
   }
 
   // We're already on POSIX, no need for any transformations
-  return () => host.cwd();
+  return cwd;
 })();
 
 const posix = {

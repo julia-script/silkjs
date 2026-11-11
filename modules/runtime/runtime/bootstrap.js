@@ -245,7 +245,7 @@ const completionsPending = () => completions.length !== completionHead;
 // callbacks are I/O completions, not microtasks. Dispatch them outside drainJobs.
 host.enqueueIOCompletion = callback => completions.push(callback);
 host.nextTick = (callback, ...args) => {
-  if (typeof callback !== 'function') throw Object.assign(new TypeError('The callback argument must be a function'), { code: 'ERR_INVALID_ARG_TYPE' });
+  if (typeof callback !== 'function') throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('callback', 'function', callback);
   ticks.push(callback, args, resource('TickObject'));
 };
 host.queueMicrotask = callback => {
@@ -259,7 +259,9 @@ let nextTimer = 1;
 const timers = new Map();
 const immediates = new Map();
 const executingTimers = [];
-function checkCallback(callback) { if (typeof callback !== 'function') throw Object.assign(new TypeError('The callback argument must be a function'), { code: 'ERR_INVALID_ARG_TYPE' }); }
+function checkCallback(callback) {
+  if (typeof callback !== 'function') throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('callback', 'function', callback);
+}
 function invoke(callback, receiver, args) {
   try { return Reflect.apply(callback, receiver, args); }
   catch (error) {
@@ -405,7 +407,7 @@ function clearImmediate(immediate) {
   immediate[kTimerResource].emitDestroy();
 }
 function validateCallback(callback) {
-  if (typeof callback !== 'function') throw new (internalRequire('internal/path_events/support').codes.ERR_INVALID_ARG_TYPE)('callback', 'function', callback);
+  if (typeof callback !== 'function') throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('callback', 'function', callback);
 }
 const timerAPI = {
   setTimeout(callback, after, ...args) { validateCallback(callback); return new Timeout(callback, after, args.length ? args : undefined, false); },
@@ -583,7 +585,7 @@ Object.assign(process, {
     if (code < 0) throw systemError(code, 'chdir', host.cwd(), directory);
   },
   nextTick: host.nextTick, uptime: () => (native.now() - startTime) / 1000,
-  hrtime(previous) { const nanoseconds = native.nowNanoseconds(); const value = [Number(nanoseconds / 1000000000n), Number(nanoseconds % 1000000000n)]; if (previous !== undefined) { if (!Array.isArray(previous)) throw Object.assign(new TypeError('The time argument must be an Array'), { code: 'ERR_INVALID_ARG_TYPE' }); if (previous.length !== 2) throw Object.assign(new RangeError('The time argument must contain two entries'), { code: 'ERR_OUT_OF_RANGE' }); value[0] -= previous[0]; value[1] -= previous[1]; if (value[1] < 0) { value[0]--; value[1] += 1000000000; } } return value; },
+  hrtime(previous) { const nanoseconds = native.nowNanoseconds(); const value = [Number(nanoseconds / 1000000000n), Number(nanoseconds % 1000000000n)]; if (previous !== undefined) { if (!Array.isArray(previous)) throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('time', 'Array', previous); if (previous.length !== 2) throw new (internalRequire('internal/errors').codes.ERR_OUT_OF_RANGE)('time', 2, previous.length); value[0] -= previous[0]; value[1] -= previous[1]; if (value[1] < 0) { value[0]--; value[1] += 1000000000; } } return value; },
   emitWarning: internalRequire('internal/startup_controls').emitWarning,
   setUncaughtExceptionCaptureCallback: internalRequire('internal/startup_controls').setUncaughtExceptionCaptureCallback,
   hasUncaughtExceptionCaptureCallback: internalRequire('internal/startup_controls').hasUncaughtExceptionCaptureCallback,
@@ -595,18 +597,15 @@ Object.assign(process, {
   // What process.exit ends with; replaceable, as in Node.
   reallyExit(code) { internalRequire('internal/compile_cache').flushCompileCache(); rawStd.exit(code); },
   kill(pid, signal) {
-    if (pid != (pid | 0)) throw new (internalRequire('internal/path_events/support').codes.ERR_INVALID_ARG_TYPE)('pid', 'number', pid);
+    if (pid != (pid | 0)) throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('pid', 'number', pid);
     let number = signal;
     if (signal !== (signal | 0)) {
       signal ||= 'SIGTERM';
       number = internalRequire('os').constants.signals[signal];
-      if (number === undefined) throw Object.assign(new TypeError('Unknown signal: ' + signal), { code: 'ERR_UNKNOWN_SIGNAL' });
+      if (number === undefined) throw new (internalRequire('internal/errors').codes.ERR_UNKNOWN_SIGNAL)(signal);
     }
     const code = rawOS.kill(pid, number);
-    if (code < 0) {
-      const name = errnoNames.get(Math.abs(code)) || 'UNKNOWN';
-      throw Object.assign(new Error('kill ' + name), { errno: -Math.abs(code), code: name, syscall: 'kill' });
-    }
+    if (code < 0) throw new (internalRequire('internal/errors').ErrnoException)(-Math.abs(code), 'kill');
     return true;
   },
   // Formats like console.log and writes to fd 2 at once: no streams, ticks or console.
@@ -621,7 +620,7 @@ Object.assign(process, {
       if (code !== null && code !== undefined) {
         let value = code;
         if (typeof code === 'string' && code !== '' && Number.isInteger(+code)) value = +code;
-        internalRequire('internal/path_events/support').validateInteger(value, 'code');
+        internalRequire('internal/validators').validateInteger(value, 'code');
       }
       exitCode = code;
     },
@@ -832,6 +831,10 @@ function evaluateMain(source, name) {
 const requirePreloads = [], importPreloads = [];
 function runPreloads(entry, loadImports = true) {
   loader.Module._preloadModules(requirePreloads);
+  if (host.frozenIntrinsics) {
+    process.emitWarning('Frozen intristics is an experimental feature and might change at any time', 'ExperimentalWarning');
+    internalRequire('internal/freeze_intrinsics')();
+  }
   if (!loadImports || !importPreloads.length) return entry();
   const name = host.path.join(host.cwd(), '[preload]');
   let pending = Promise.resolve();
@@ -879,6 +882,14 @@ function runtimeFlag(arg) {
   if (arg === '--experimental-eventsource' || arg === '--no-experimental-eventsource') {
     host.experimentalEventSource = arg === '--experimental-eventsource'; return true;
   }
+  if (arg === '--experimental-websocket' || arg === '--no-experimental-websocket') {
+    host.experimentalWebSocket = arg === '--experimental-websocket'; return true;
+  }
+  if (arg === '--frozen-intrinsics') { host.frozenIntrinsics = true; return true; }
+  // V8's flag to run without a JIT: this engine is an interpreter, so it always holds.
+  if (arg === '--jitless') return true;
+  // Buffer.allocUnsafe memory is always zeroed here, which is what this flag asks for.
+  if (arg === '--zero-fill-buffers') { host.zeroFillBuffers = true; return true; }
   if (arg === '--experimental-webstorage' || arg === '--no-experimental-webstorage') {
     host.experimentalWebStorage = arg === '--experimental-webstorage'; return true;
   }
@@ -925,6 +936,10 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
   if (host.experimentalEventSource) Object.defineProperty(globalThis, 'EventSource', {
     value: internalRequire('internal/web/eventsource').EventSource, writable: true, configurable: true,
   });
+  if (host.experimentalWebSocket === false) {
+    delete globalThis.WebSocket;
+    delete globalThis.CloseEvent;
+  }
   if (host.experimentalWebStorage) internalRequire('internal/web/storage').install(globalThis, { localStorageFile: host.localStorageFile });
   if (workerThreads.isMainThread) internalRequire('internal/trace_events').initialize(host.traceOptions);
   if (workerThreads.isMainThread && host.traceSigint) internalRequire('util').setTraceSigInt(true);
@@ -1000,37 +1015,10 @@ function runWorker() {
   }, !evaluate || moduleEval);
 }
 function startRepl() {
-  if (process.stdout.isTTY) console.log('Welcome to SilkJS Runtime.\nType ".help" for more information.');
+  console.log('Welcome to SilkJS Runtime.\nType ".help" for more information.');
   return internalRequire('internal/repl').createInternalRepl(process.env, {
     input: process.stdin, output: process.stdout, terminal: !!process.stdout.isTTY, preview: !!process.stdout.isTTY,
   }, error => { if (error) console.error('REPL history:', error.message); });
-}
-function runTests(options, files, reporterNames, destinations) {
-  const reporters = internalRequire('test/reporters');
-  if (!reporterNames.length) reporterNames.push('spec');
-  if (!destinations.length && reporterNames.length === 1) destinations.push('stdout');
-  if (reporterNames.length !== destinations.length) throw new Error('Each test reporter requires a destination');
-  const outputs = reporterNames.map((name, index) => {
-    let reporter = reporters[name];
-    if (!reporter) {
-      reporter = loader.requireFor(host.path.join(host.cwd(), '[test-reporter]'))(name);
-      reporter = reporter.default || reporter;
-    } else if (name === 'spec' || name === 'lcov') reporter = reporter();
-    const destination = destinations[index];
-    return { reporter, output: destination === 'stdout' ? process.stdout : destination === 'stderr' ? process.stderr : internalRequire('fs').createWriteStream(destination) };
-  });
-  const stream = internalRequire('test').run({ ...options, ...(files.length ? { files } : {}) });
-  stream.on('test:summary', summary => { if (!summary.success) process.exitCode = 1; });
-  const fail = error => { console.error(error); process.exitCode = 1; };
-  stream.on('error', fail);
-  for (const { reporter, output } of outputs) {
-    const branch = new (internalRequire('stream').PassThrough)({ objectMode: true });
-    stream.pipe(branch);
-    const formatted = branch.compose(reporter);
-    formatted.on('error', fail);
-    output.on('error', fail);
-    formatted.pipe(output, { end: output !== process.stdout && output !== process.stderr });
-  }
 }
 function installCommonJSInputGlobals(filename, id) {
   const module = new loader.Module(id);
@@ -1173,11 +1161,16 @@ function run() {
     if (arg === '-c' || arg === '--check') { check = true; record(arg); continue; }
     if (arg === '--test') { testMode = true; record(arg); continue; }
     if (arg === '--test-only') { testOptions.only = true; record(arg); continue; }
-    if (arg.startsWith('--test-')) {
+    if (arg === '--test-force-exit') { testOptions.forceExit = true; record(arg); continue; }
+    if (arg === '--test-randomize') { testOptions.randomize = true; record(arg); continue; }
+    if (arg.startsWith('--test-') || arg.startsWith('--experimental-test-tag-filter') || arg.startsWith('--experimental-test-isolation')) {
       const separator = arg.indexOf('=');
       const name = separator < 0 ? arg : arg.slice(0, separator);
       const option = {
         '--test-concurrency': 'concurrency', '--test-timeout': 'timeout', '--test-isolation': 'isolation',
+        '--experimental-test-isolation': 'isolation', '--test-random-seed': 'randomSeed',
+        '--test-rerun-failures': 'rerunFailuresFilePath', '--test-global-setup': 'globalSetupPath',
+        '--experimental-test-tag-filter': 'testTagFilters',
         '--test-name-pattern': 'testNamePatterns', '--test-skip-pattern': 'testSkipPatterns',
         '--test-shard': 'shard', '--test-reporter': 'reporter', '--test-reporter-destination': 'destination',
         '--test-coverage-include': 'coverageIncludeGlobs', '--test-coverage-exclude': 'coverageExcludeGlobs',
@@ -1185,11 +1178,11 @@ function run() {
       }[name];
       if (!option) return cliError('bad option: ' + arg);
       const value = separator < 0 ? args[++index] : arg.slice(separator + 1);
-      if (value === undefined) return cliError(name + ' requires an argument');
+      if (value === undefined || value === '') return cliError((value === '' && separator >= 0 ? arg : name) + ' requires an argument');
       record(arg, ...(separator < 0 ? [value] : []));
       if (option === 'reporter') reporterNames.push(value);
       else if (option === 'destination') destinations.push(value);
-      else if (option === 'testNamePatterns' || option === 'testSkipPatterns') (testOptions[option] ||= []).push(value);
+      else if (option === 'testNamePatterns' || option === 'testSkipPatterns' || option === 'testTagFilters') (testOptions[option] ||= []).push(value);
       else if (option === 'coverageIncludeGlobs' || option === 'coverageExcludeGlobs') (testOptions[option] ||= []).push(value);
       else if (option === 'lineCoverage' || option === 'branchCoverage' || option === 'functionCoverage') {
         const threshold = Number(value);
@@ -1199,7 +1192,7 @@ function run() {
       }
       else if (option === 'shard') {
         const [index, total] = value.split('/').map(Number); testOptions.shard = { index, total };
-      } else testOptions[option] = option === 'concurrency' || option === 'timeout' ? Number(value) : value;
+      } else testOptions[option] = option === 'concurrency' || option === 'timeout' || option === 'randomSeed' ? Number(value) : value;
       continue;
     }
     if (arg === '-v' || arg === '--version') { host.stdout.write('silkjsruntime 0.1.0 (QuickJS; Node 24 target)\n'); return; }
@@ -1308,6 +1301,7 @@ Environment:
     });
   }
   host.testCoverageOptions = testOptions;
+  host.testReporters = { names: reporterNames, destinations };
   if (testOptions.coverage && !testMode && !check) {
     host.testCoverageStart();
     host.testCoveragePrestarted = true;
@@ -1324,9 +1318,16 @@ Environment:
     return;
   }
   if (testMode) {
-    return runTests(testOptions, args.slice(index), reporterNames, destinations);
+    return internalRequire('internal/main/test_runner').runTestRunner(testOptions, args.slice(index), reporterNames, destinations);
   }
-  if (expression === undefined && filename === undefined && (interactive || process.stdin.isTTY)) return startRepl();
+  if (expression === undefined && filename === undefined && (interactive || process.stdin.isTTY)) {
+    if (inputTypeSet) {
+      console.error('Cannot specify --input-type for REPL');
+      process.exitCode = 9;
+      return;
+    }
+    return startRepl();
+  }
   if (expression !== undefined) {
     const name = host.path.join(host.cwd(), '[eval]');
     expression = prepareInput(expression, name, inputType, inputTypeSet);
