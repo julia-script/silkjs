@@ -593,7 +593,10 @@ Object.assign(process, {
       if (number === undefined) throw Object.assign(new TypeError('Unknown signal: ' + signal), { code: 'ERR_UNKNOWN_SIGNAL' });
     }
     const code = rawOS.kill(pid, number);
-    if (code < 0) throw systemError(code, 'kill');
+    if (code < 0) {
+      const name = errnoNames.get(Math.abs(code)) || 'UNKNOWN';
+      throw Object.assign(new Error('kill ' + name), { errno: -Math.abs(code), code: name, syscall: 'kill' });
+    }
     return true;
   },
   // Formats like console.log and writes to fd 2 at once: no streams, ticks or console.
