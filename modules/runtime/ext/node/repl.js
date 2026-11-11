@@ -176,12 +176,14 @@ function REPLServer(prompt, stream, eval_, useGlobal, ignoreUndefined, replMode)
       set: pending ? require('util').deprecate(set, message, 'DEP0141') : set,
     });
   }
-  this.on('line', line => {
+  // Named: the error writer drops the frames below the last unnamed one.
+  const onLine = line => {
     if (this._closeScheduled) return;
     this._sawSIGINT = false;
     this._queue.push([line ?? '', this.terminal]);
     this._drain();
-  });
+  };
+  this.on('line', onLine);
   this.on('close', () => { this._inputClosed = true; this._maybeExit(); });
   this.on('SIGINT', () => this._interrupt());
   this.on('SIGCONT', () => this.displayPrompt(true));
