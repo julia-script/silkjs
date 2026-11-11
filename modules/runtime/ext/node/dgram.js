@@ -261,7 +261,7 @@ Socket.prototype.bind = function(port_, address_ /* , callback */) {
     if (cluster.isWorker && !exclusive) {
       bindServerHandle(this, { address: null, port: null, addressType: this.type, fd, flags: null }, (err) => {
         state.bindState = BIND_STATE_UNBOUND;
-        this.emit('error', err);
+        this.emit('error', new ErrnoException(err, 'open'));
       });
       return this;
     }
@@ -308,7 +308,7 @@ Socket.prototype.bind = function(port_, address_ /* , callback */) {
     if (cluster.isWorker && !exclusive) {
       bindServerHandle(this, { address: ip, port, addressType: this.type, fd: undefined, flags }, (err) => {
         state.bindState = BIND_STATE_UNBOUND;
-        this.emit('error', err);
+        this.emit('error', new ExceptionWithHostPort(err, 'bind', ip, port));
       });
     } else {
       const err = state.handle.bind(ip, port || 0, flags);
