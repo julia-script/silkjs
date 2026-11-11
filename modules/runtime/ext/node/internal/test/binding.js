@@ -18,6 +18,7 @@ const kBindings = {
   buffer: 'internal/buffer_binding',
   crypto: 'internal/crypto/binding',
   http2: 'internal/http2/binding',
+  tls_wrap: 'internal/tls/binding',
   util: 'internal/util/binding',
 };
 
