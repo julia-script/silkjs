@@ -13,11 +13,11 @@ const arrayBufferLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype,
 const arrayBufferResizable = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'resizable')?.get;
 const arrayBufferMaximum = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'maxByteLength')?.get;
 let portHooks;
-// fs/promises installs FileHandle transfer hooks on internal/fs_core when it loads; no
+// internal/fs/promises installs FileHandle transfer hooks on internal/fs/utils when it loads; no
 // FileHandle can exist before that, so senders only look when it is loaded.
 function fileHandles(load) {
-  if (load) require('fs/promises');
-  return host.builtinLoaded('fs/promises') ? require('internal/fs_core').fileHandles : null;
+  if (load) require('internal/fs/promises');
+  return host.builtinLoaded('internal/fs/promises') ? require('internal/fs/utils').fileHandles : null;
 }
 
 function cloneError(message = 'The object could not be cloned.') {

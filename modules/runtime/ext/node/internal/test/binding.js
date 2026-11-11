@@ -16,9 +16,11 @@ process.emitWarning(
 const kBindings = {
   __proto__: null,
   buffer: 'internal/buffer_binding',
+  constants: 'internal/constants_binding',
   crypto: 'internal/crypto/binding',
   http2: 'internal/http2/binding',
   util: 'internal/util/binding',
+  uv: 'internal/uv_binding',
 };
 
 function internalBinding(module) {

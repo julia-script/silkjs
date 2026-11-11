@@ -5,7 +5,7 @@
 const { Readable, Writable, finished } = require('stream');
 const { errorOrDestroy } = require('internal/streams/destroy');
 const fs = require('fs');
-const c = require('internal/fs_core');
+const c = require('internal/fs/utils');
 const v = require('internal/validators');
 const { Buffer } = require('buffer');
 const { validateBoolean, validateFunction, validateInteger } = v;

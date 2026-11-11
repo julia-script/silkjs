@@ -1074,7 +1074,7 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
     delete globalThis.CloseEvent;
   }
   if (host.experimentalWebStorage) internalRequire('internal/web/storage').install(globalThis, { localStorageFile: host.localStorageFile });
-  if (host.experimentalStreamIter) { internalRequire('fs/promises'); internalRequire('internal/fs_iter').install(); }
+  if (host.experimentalStreamIter) { internalRequire('fs/promises'); internalRequire('internal/fs/iter').install(); }
   if (workerThreads.isMainThread) internalRequire('internal/trace_events').initialize(host.traceOptions);
   if (workerThreads.isMainThread && host.traceSigint) internalRequire('util').setTraceSigInt(true);
   if (process.env.NODE_COMPILE_CACHE) internalRequire('internal/compile_cache').initialize();
@@ -1549,7 +1549,7 @@ function loop() {
   if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushAtExit();
   return Number(process.exitCode) || 0;
 }
-const imageModules = ['fs', 'fs/promises', 'internal/fs_streams', 'internal/fs_utf8_stream', 'path', 'os',
+const imageModules = ['fs', 'fs/promises', 'internal/fs/streams', 'internal/streams/fast-utf8-stream', 'path', 'os',
   'events', 'stream', 'stream/promises', 'string_decoder', 'util', 'assert', 'console', 'net', 'tty',
   'internal/tty/write', 'url', 'internal/web/url', 'internal/web/encoding', 'internal/abort_controller'];
 globalThis.__silkRuntime = {

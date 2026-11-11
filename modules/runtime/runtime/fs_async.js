@@ -4,12 +4,14 @@
 module.exports = function createAsyncFS(native) {
   const host = require('internal/host');
   let core;
-  const c = () => core || (core = require('internal/fs_core'));
+  const c = () => core || (core = require('internal/fs/utils'));
   const path = () => require('path');
+  // Errors name libuv's request, as Node's do.
+  const uvSyscalls = { __proto__: null, copyFile: 'copyfile', utimes: 'utime', lutimes: 'lutime', futimes: 'futime' };
   function primitive(requestKind, operation, args) {
     return new Promise((resolve, reject) => {
       native.submit(operation, args, (status, value, code) => {
-        if (status < 0) reject(c().error(code || 'UNKNOWN', operation === 'copyFile' ? 'copyfile' : operation,
+        if (status < 0) reject(c().error(code || 'UNKNOWN', uvSyscalls[operation] ?? operation,
           typeof args[0] === 'string' ? args[0] : undefined,
           ['rename', 'link', 'symlink', 'copyFile'].includes(operation) ? args[1] : undefined, status));
         else resolve(value);
@@ -196,7 +198,7 @@ module.exports = function createAsyncFS(native) {
       case 'cp': return copy(requestKind, ...args);
       case 'truncate':
         if (typeof args[0] === 'number') { await primitive(requestKind, 'ftruncate', args); return; }
-        return withFD(requestKind, args[0], c().flags('r+'), 0o666, async fd => { await primitive(requestKind, 'ftruncate', [fd, args[1]]); });
+        return withFD(requestKind, args[0], c().stringToFlags('r+'), 0o666, async fd => { await primitive(requestKind, 'ftruncate', [fd, args[1]]); });
       case 'readFile': {
         const [filename, o] = args; c().aborted(o.signal);
         return withFD(requestKind, filename, o.flag, 0o666, async fd => {
