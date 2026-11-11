@@ -69,6 +69,20 @@ REPLACEMENTS = {
     'push_5': ('add_top_loc8', 2, 1, 1, 'loc8'),
     'push_6': ('sub_top_loc8', 2, 1, 1, 'loc8'),
     'push_7': ('mul_top_loc8', 2, 1, 1, 'loc8'),
+    # set_loc0-3 are emitted as set_loc8 and put_arg0-3 as put_arg. Their
+    # numbers hold: `x++`, `++x`, `x--` and `--x` with the value used, on a
+    # local or an argument (the slot, then a mode byte: 1 pushes the new value,
+    # 2 steps down); shl with an Int right operand; a[i] with a a local or an
+    # argument and i an argument, both read in place; add, sub and mul with
+    # the right operand an argument read in place.
+    'set_loc0': ('step_loc8', 3, 0, 1, 'u16'),
+    'set_loc1': ('step_arg8', 3, 0, 1, 'u16'),
+    'set_loc2': ('shl_imm', 3, 1, 1, 'i16'),
+    'set_loc3': ('get_loc_el_arg8', 3, 0, 1, 'u16'),
+    'put_arg0': ('add_top_arg8', 2, 1, 1, 'u8'),
+    'put_arg1': ('sub_top_arg8', 2, 1, 1, 'u8'),
+    'put_arg2': ('mul_top_arg8', 2, 1, 1, 'u8'),
+    'put_arg3': ('get_arg_el_arg8', 3, 0, 1, 'u16'),
 }
 
 
