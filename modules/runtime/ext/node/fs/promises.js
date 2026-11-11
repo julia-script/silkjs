@@ -128,7 +128,7 @@ class FileHandle extends EventEmitter {
     }
   }
 }
-if (require('internal/options').getOptionValue('--experimental-stream-iter')) require('internal/fs_iter').install(FileHandle, { kFd, kLocked, kRef, kUnref, kClosePromise, kCloseSync, invalidState });
+require('internal/fs_iter').register(FileHandle, { kFd, kLocked, kRef, kUnref, kClosePromise, kCloseSync, invalidState });
 
 async function fsCall(fn, handle, ...args) {
   if (!FileHandle.isFileHandle(handle)) throw v.ERR_INVALID_ARG_TYPE('handle', 'FileHandle', handle);
@@ -484,29 +484,4 @@ Object.assign(promises, {
   constants,
 });
 for (const name of ['access', 'copyFile', 'cp', 'open', 'rename', 'truncate', 'rm', 'rmdir', 'mkdir', 'readdir', 'readlink', 'symlink', 'lstat', 'stat', 'statfs', 'link', 'unlink', 'chmod', 'lchmod', 'lchown', 'chown', 'utimes', 'lutimes', 'realpath', 'mkdtemp', 'mkdtempDisposable', 'writeFile', 'appendFile', 'readFile']) Object.defineProperty(promises[name], 'name', { value: name });
-promises.watch = function watch(filename, options) {
-  options = c.options(options, { maxQueue: 2048, overflow: 'ignore' }); c.integer(options.maxQueue, 'maxQueue', 1);
-  if (options.overflow !== 'ignore' && options.overflow !== 'throw') throw c.invalid('overflow', 'ignore or throw');
-  const queue = []; const waiting = []; let done = false; let failure; let watcher;
-  function finish(error) { if (done) return; done = true; failure = error; if (watcher) watcher.close(); if (options.signal) options.signal.removeEventListener('abort', abort); while (waiting.length) { const next = waiting.shift(); if (error) next.reject(error); else next.resolve({ done: true, value: undefined }); } }
-  function abort() { finish(v.abortError(options.signal)); }
-  if (options.signal && options.signal.aborted) abort();
-  else {
-    watcher = fs.watch(filename, options, (eventType, filename) => {
-      if (done) return;
-      const value = { eventType, filename };
-      if (waiting.length) waiting.shift().resolve({ done: false, value });
-      else if (queue.length < options.maxQueue) queue.push(value);
-      else if (options.overflow === 'throw') { const e = new Error('Filesystem watch event queue overflow'); e.code = 'ERR_FS_WATCH_QUEUE_OVERFLOW'; finish(e); }
-      else if (typeof process !== 'undefined' && process.emitWarning) process.emitWarning('Filesystem watch event queue overflow; events dropped');
-    });
-    watcher.on('error', finish); watcher.on('close', () => finish());
-    if (options.signal) options.signal.addEventListener('abort', abort, { once: true });
-  }
-  return {
-    [Symbol.asyncIterator]() { return this; },
-    next() { if (failure) return Promise.reject(failure); if (done) return Promise.resolve({ done: true, value: undefined }); if (queue.length) return Promise.resolve({ done: false, value: queue.shift() }); return new Promise((resolve, reject) => waiting.push({ resolve, reject })); },
-    return() { finish(); queue.length = 0; return Promise.resolve({ done: true, value: undefined }); },
-    throw(error) { finish(error); return Promise.reject(error); }
-  };
-};
+promises.watch = require('internal/fs_watch').promisesWatch;

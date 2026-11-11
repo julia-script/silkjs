@@ -10,7 +10,7 @@ const { bufferCodec } = c.host;
 const fs = module.exports;
 const kMaxUserId = 2 ** 32 - 1;
 const kIoMaxLength = 2 ** 31 - 1;
-const customPromisifyArgs = Symbol.for('nodejs.util.promisify.customArgs');
+const { kCustomPromisifyArgsSymbol: customPromisifyArgs } = require('internal/promisify_args');
 const customPromisified = Symbol.for('nodejs.util.promisify.custom');
 const isFd = value => value === (value | 0);
 const stats = (value, bigint) => value === undefined ? undefined : makeStats(value, !!bigint);
@@ -78,7 +78,8 @@ function defaultCloseCallback(err) { if (err != null) throw err; }
 fs.close = function close(fd, callback = defaultCloseCallback) {
   fd = c.fd(fd);
   if (callback !== defaultCloseCallback) callback = makeCallback(callback);
-  c.submit('close', [fd], callback);
+  // Node calls back with only the error when the request has no result.
+  c.submit('close', [fd], error => callback(error), callback);
 };
 fs.closeSync = function closeSync(fd) { c.native('close', [c.fd(fd)]); };
 fs.open = function open(path, flags, mode, callback) {
@@ -409,7 +410,7 @@ fs.mkdirSync = function mkdirSync(path, options) {
       else { const info = fs.statSync(current, { throwIfNoEntry: false }); if (!info || !info.isDirectory()) throw c.error(info ? 'ENOTDIR' : 'EEXIST', 'mkdir', path, undefined, info ? -20 : -17); }
     }
   }
-  create(p.resolve(path)); return first;
+  create(path); return first;
 };
 
 function readdirEntries(dir, o, recursive) {
@@ -572,8 +573,12 @@ fs.readFileSync = function readFileSync(path, options) {
   const o = c.options(options, { flag: 'r' }); c.aborted(o.signal);
   const isUserFd = isFd(path);
   const fd = isUserFd ? path : fs.openSync(path, o.flag, 0o666);
-  try { return readAll(fd, o.signal, o.encoding || null); }
-  finally { if (!isUserFd) fs.closeSync(fd); }
+  try {
+    // As Node: a regular file over 2 GiB fails before any read.
+    const stats = c.native('fstat', [fd, { bigint: false }]);
+    if ((stats.mode & 0o170000) === 0o100000 && stats.size > kIoMaxLength) throw fileTooLarge(stats.size);
+    return readAll(fd, o.signal, o.encoding || null);
+  } finally { if (!isUserFd) fs.closeSync(fd); }
 };
 fs.readFile = function readFile(path, options, callback) {
   callback ||= options; validateFunction(callback, 'cb');
@@ -600,10 +605,30 @@ fs.writeFile = function writeFile(path, data, options, callback) {
   callback ||= options; validateFunction(callback, 'cb');
   const o = writeFileOptions(options, 'w');
   data = writeFileData(data, o);
-  if (isFd(path)) { c.submit('writeFile', [path, data, { signal: o.signal, flush: o.flush }], callback); return; }
+  // With flush, Node's own steps so the fsync goes through fs.fsync; otherwise one native request.
+  if (isFd(path)) {
+    if (o.flush) writeAll(path, true, data, 0, data.byteLength, o.signal, true, callback);
+    else c.submit('writeFile', [path, data, { signal: o.signal, flush: false }], callback);
+    return;
+  }
   if (checkAborted(o.signal, callback)) return;
-  c.submit('writeFile', [c.path(path), data, { signal: o.signal, flush: o.flush, flag: c.flags(o.flag), mode: c.mode(o.mode, 0o666) }], callback);
+  if (o.flush) {
+    fs.open(path, o.flag, o.mode, (openErr, fd) => { if (openErr) callback(openErr); else writeAll(fd, false, data, 0, data.byteLength, o.signal, true, callback); });
+    return;
+  }
+  c.submit('writeFile', [c.path(path), data, { signal: o.signal, flush: false, flag: c.flags(o.flag), mode: c.mode(o.mode, 0o666) }], callback);
 };
+function writeAll(fd, isUserFd, buffer, offset, length, signal, flush, callback) {
+  const finish = error => { if (isUserFd) callback(error); else fs.close(fd, err => callback(aggregateTwoErrors(err, error))); };
+  if (signal?.aborted) { finish(v.abortError(signal)); return; }
+  fs.write(fd, buffer, offset, length, null, (writeErr, written) => {
+    if (writeErr) finish(writeErr);
+    else if (written === length) {
+      if (!flush) { if (isUserFd) callback(null); else fs.close(fd, callback); }
+      else fs.fsync(fd, syncErr => { if (syncErr) finish(syncErr); else if (isUserFd) callback(null); else fs.close(fd, callback); });
+    } else writeAll(fd, isUserFd, buffer, offset + written, length - written, signal, flush, callback);
+  });
+}
 fs.writeFileSync = function writeFileSync(path, data, options) {
   const o = writeFileOptions(options, 'w');
   data = writeFileData(data, o);
@@ -740,7 +765,8 @@ fs.mkdtempSync = function mkdtempSync(prefix, options) {
 fs.mkdtempDisposableSync = function mkdtempDisposableSync(prefix, options) {
   const path = fs.mkdtempSync(prefix, options);
   const fullPath = p.resolve(process.cwd(), typeof path === 'string' ? path : path.toString());
-  const remove = () => { removeSync(fullPath, { recursive: true, force: false, maxRetries: 0, retryDelay: 100 }); };
+  // Node's binding.rmSync removes with std::filesystem::remove_all, which ignores a missing path.
+  const remove = () => { removeSync(fullPath, { recursive: true, force: true, maxRetries: 0, retryDelay: 100 }); };
   return { path, remove, [Symbol.dispose]() { remove(); } };
 };
 fs.copyFile = function copyFile(src, dest, mode, callback) {
@@ -767,18 +793,19 @@ fs.cpSync = function cpSync(src, dest, options) {
   cp().cpSyncFn(src, dest, options);
 };
 
-const { Dir, FSWatcher, StatWatcher, watch, watchFile, unwatchFile } = require('internal/fs_handles');
+const { Dir, DirHandle, openDirHandle, FSWatcher, StatWatcher, watch, watchFile, unwatchFile } = require('internal/fs_handles');
 Object.assign(fs, { Dir, FSWatcher, StatWatcher, watch, watchFile, unwatchFile });
 fs.opendirSync = function opendirSync(path, options) {
-  path = c.path(path); const o = c.options(options, { encoding: 'utf8' });
-  if (o.bufferSize !== undefined) v.validateUint32(o.bufferSize, 'options.bufferSize', true);
-  return new Dir(path, fs.readdirSync(path, Object.assign(o, { withFileTypes: true })));
+  path = c.path(path); options = c.options(options, { encoding: 'utf8' });
+  return new Dir(openDirHandle(path, options.encoding), path, options);
 };
 fs.opendir = function opendir(path, options, callback) {
   callback = typeof options === 'function' ? options : callback; validateFunction(callback, 'callback');
-  path = c.path(path); const o = c.options(typeof options === 'function' ? undefined : options, { encoding: 'utf8' });
-  if (o.bufferSize !== undefined) v.validateUint32(o.bufferSize, 'options.bufferSize', true);
-  c.submit('opendir', [path, o], (err, entries) => callback(err || null, err ? undefined : new Dir(path, entries.map(e => e instanceof Dirent ? e : new Dirent(e.name, e.mode, e.parentPath === undefined ? path : e.parentPath)))), callback);
+  path = c.path(path); options = c.options(options, { encoding: 'utf8' });
+  c.submit('opendir', [path, { encoding: options.encoding }], (err, entries) => {
+    if (err) { callback(err); return; }
+    callback(null, new Dir(new DirHandle(entries.map(e => e instanceof Dirent ? e : new Dirent(e.name, e.mode, e.parentPath === undefined ? path : e.parentPath))), path, options));
+  }, callback);
 };
 const streamConstructors = {};
 for (const name of ['ReadStream', 'WriteStream', 'FileReadStream', 'FileWriteStream']) {

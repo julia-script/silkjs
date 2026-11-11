@@ -39,6 +39,8 @@ function output(fd) {
         callback(failure);
       }
     });
+    // As Node's SyncWriteStream, which marks itself not readable.
+    stream.readable = false;
     stream._type = 'fs';
   }
   stream.fd = fd;

@@ -78,9 +78,13 @@ function validatePath(path) {
   c.path(path);
 }
 
+// Node's getOptions keeps an options object as given and copyObject copies it with for...in,
+// so inherited options apply.
+function streamOptions(options) { const checked = c.options(options); return options !== null && typeof options === 'object' ? options : checked; }
+function copyObject(source) { const target = {}; for (const key in source) target[key] = source[key]; return target; }
 function ReadStream(path, options) {
   if (!(this instanceof ReadStream)) return new ReadStream(path, options);
-  options = { ...c.options(options) };
+  options = copyObject(streamOptions(options));
   if (options.highWaterMark === undefined) options.highWaterMark = 64 * 1024;
   if (options.autoDestroy === undefined) options.autoDestroy = false;
   if (options.fd != null && options.windowsHandle != null) throw incompatible('windowsHandle', 'fd');
@@ -155,7 +159,7 @@ Object.defineProperty(ReadStream.prototype, 'pending', { get() { return this.fd 
 
 function WriteStream(path, options) {
   if (!(this instanceof WriteStream)) return new WriteStream(path, options);
-  options = { ...c.options(options) };
+  options = copyObject(streamOptions(options));
   options.decodeStrings = true;
   if (options.fd != null && options.windowsHandle != null) throw incompatible('windowsHandle', 'fd');
   else if (options.windowsHandle != null) importWindowsHandle(options);

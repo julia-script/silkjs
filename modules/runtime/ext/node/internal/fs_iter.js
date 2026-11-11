@@ -13,7 +13,7 @@ function binding(operation, args) {
   return new Promise((resolve, reject) => { c.submit(operation, args, c.promiseCallback((err, value) => err ? reject(err) : resolve(value), 1)); });
 }
 const position = pos => pos >= 0 ? pos : null;
-function install(FileHandle, { kFd, kLocked, kRef, kUnref, kClosePromise, kCloseSync, invalidState }) {
+function installOn(FileHandle, { kFd, kLocked, kRef, kUnref, kClosePromise, kCloseSync, invalidState }) {
   const { pull: newStreamsPull, pullSync: newStreamsPullSync } = require('internal/streams/iter/pull');
   const { parsePullArgs, toUint8Array, convertChunks } = require('internal/streams/iter/utils');
   const operationFailed = message => v.makeError(Error, 'ERR_OPERATION_FAILED', `Operation failed: ${message}`);
@@ -263,4 +263,9 @@ function install(FileHandle, { kFd, kLocked, kRef, kUnref, kClosePromise, kClose
     };
   };
 }
-module.exports = { install };
+// fs/promises registers FileHandle here when it loads, which can be while the startup heap
+// image is built, before any flag is parsed; bootstrap installs once --experimental-stream-iter is seen.
+let registered = null;
+function register(FileHandle, internals) { registered = { FileHandle, internals }; }
+function install() { if (registered !== null) { installOn(registered.FileHandle, registered.internals); registered = null; } }
+module.exports = { register, install };

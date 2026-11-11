@@ -4,12 +4,20 @@ const { Buffer } = require('buffer');
 const trace = require('internal/trace_events');
 const os = host.rawOS;
 const std = host.rawStd;
-const constants = Object.assign({ F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1, COPYFILE_EXCL: 1, COPYFILE_FICLONE: 2, COPYFILE_FICLONE_FORCE: 4, S_IRUSR: 256, S_IWUSR: 128, S_IXUSR: 64, S_IRGRP: 32, S_IWGRP: 16, S_IXGRP: 8, S_IROTH: 4, S_IWOTH: 2, S_IXOTH: 1 }, host.fsConstants);
-for (const key of Object.keys(os)) if (/^(O_|S_)/.test(key)) constants[key] = os[key];
+// fs.constants as Node builds it (src/node_constants.cc): the names Node exports, in its order,
+// with values from the platform and libuv's own UV_* definitions.
+const constants = (() => {
+  const uv = { UV_FS_SYMLINK_DIR: 1, UV_FS_SYMLINK_JUNCTION: 2, UV_DIRENT_UNKNOWN: 0, UV_DIRENT_FILE: 1, UV_DIRENT_DIR: 2, UV_DIRENT_LINK: 3, UV_DIRENT_FIFO: 4, UV_DIRENT_SOCKET: 5, UV_DIRENT_CHAR: 6, UV_DIRENT_BLOCK: 7, UV_FS_O_FILEMAP: 0, UV_FS_O_TEMPORARY: 0, UV_FS_O_SHORT_LIVED: 0, UV_FS_O_SEQUENTIAL: 0, UV_FS_O_RANDOM: 0 };
+  const source = Object.assign({}, os, host.fsConstants, uv);
+  const names = ['UV_FS_SYMLINK_DIR', 'UV_FS_SYMLINK_JUNCTION', 'O_RDONLY', 'O_WRONLY', 'O_RDWR', 'UV_DIRENT_UNKNOWN', 'UV_DIRENT_FILE', 'UV_DIRENT_DIR', 'UV_DIRENT_LINK', 'UV_DIRENT_FIFO', 'UV_DIRENT_SOCKET', 'UV_DIRENT_CHAR', 'UV_DIRENT_BLOCK', 'S_IFMT', 'S_IFREG', 'S_IFDIR', 'S_IFCHR', 'S_IFBLK', 'S_IFIFO', 'S_IFLNK', 'S_IFSOCK', 'O_CREAT', 'O_EXCL', 'UV_FS_O_FILEMAP', 'UV_FS_O_TEMPORARY', 'UV_FS_O_SHORT_LIVED', 'UV_FS_O_SEQUENTIAL', 'UV_FS_O_RANDOM', 'O_NOCTTY', 'O_TRUNC', 'O_APPEND', 'O_DIRECTORY', 'O_NOATIME', 'O_NOFOLLOW', 'O_SYNC', 'O_DSYNC', 'O_SYMLINK', 'O_DIRECT', 'O_NONBLOCK', 'S_IRWXU', 'S_IRUSR', 'S_IWUSR', 'S_IXUSR', 'S_IRWXG', 'S_IRGRP', 'S_IWGRP', 'S_IXGRP', 'S_IRWXO', 'S_IROTH', 'S_IWOTH', 'S_IXOTH', 'F_OK', 'R_OK', 'W_OK', 'X_OK', 'UV_FS_COPYFILE_EXCL', 'COPYFILE_EXCL', 'UV_FS_COPYFILE_FICLONE', 'COPYFILE_FICLONE', 'UV_FS_COPYFILE_FICLONE_FORCE', 'COPYFILE_FICLONE_FORCE'];
+  const result = Object.create(null);
+  for (const name of names) if (typeof source[name] === 'number') result[name] = source[name];
+  return result;
+})();
 const errnoNames = { 1: 'EPERM', 2: 'ENOENT', 3: 'ESRCH', 4: 'EINTR', 5: 'EIO', 6: 'ENXIO', 7: 'E2BIG', 8: 'ENOEXEC', 9: 'EBADF', 10: 'ECHILD', 12: 'ENOMEM', 13: 'EACCES', 14: 'EFAULT', 16: 'EBUSY', 17: 'EEXIST', 18: 'EXDEV', 19: 'ENODEV', 20: 'ENOTDIR', 21: 'EISDIR', 22: 'EINVAL', 23: 'ENFILE', 24: 'EMFILE', 27: 'EFBIG', 28: 'ENOSPC', 29: 'ESPIPE', 30: 'EROFS', 31: 'EMLINK', 32: 'EPIPE' };
 Object.assign(errnoNames, os.platform === 'darwin' ? { 11: 'EDEADLK', 35: 'EAGAIN', 45: 'ENOTSUP', 62: 'ELOOP', 63: 'ENAMETOOLONG', 66: 'ENOTEMPTY', 78: 'ENOSYS' } : { 11: 'EAGAIN', 36: 'ENAMETOOLONG', 38: 'ENOSYS', 39: 'ENOTEMPTY', 40: 'ELOOP', 95: 'ENOTSUP' });
 function error(code, syscall, path, dest, errno) {
-  const message = errno !== undefined && std && std.strerror ? std.strerror(Math.abs(errno)) : code;
+  const message = errno === undefined ? code : host.utilErrorMessage(-Math.abs(errno));
   const e = new Error(`${code}: ${message}, ${syscall}${path === undefined ? '' : ` '${path}'`}${dest === undefined ? '' : ` -> '${dest}'`}`);
   e.code = code; e.syscall = syscall;
   if (errno !== undefined) e.errno = -Math.abs(errno);
@@ -58,7 +66,7 @@ function fd(value, name = 'fd') { if (Object.is(value, -0)) return 0; v.validate
 // Node's getOptions.
 function options(value, defaults) {
   if (value === undefined || value === null || typeof value === 'function') return Object.assign({}, defaults);
-  if (typeof value === 'string') return Object.assign({}, defaults, { encoding: value });
+  if (typeof value === 'string') { if (value !== 'buffer') assertEncoding(value); return Object.assign({}, defaults, { encoding: value }); }
   if (typeof value !== 'object') throw ERR_INVALID_ARG_TYPE('options', ['string', 'Object'], value);
   const result = Object.assign({}, defaults, value);
   if (result.encoding !== 'buffer') assertEncoding(result.encoding);
@@ -66,7 +74,7 @@ function options(value, defaults) {
   return result;
 }
 function assertEncoding(value) { if (value && !Buffer.isEncoding(value)) throw ERR_INVALID_ARG_VALUE('encoding', value, 'is invalid encoding'); }
-function mode(value, fallback = 0o666, name = 'mode') { return v.parseFileMode(value, name, fallback); }
+function mode(value, fallback, name = 'mode') { return v.parseFileMode(value, name, fallback); }
 function flags(value, name = 'flags') {
   if (typeof value === 'number') { v.validateInt32(value, name); return value + 0; }
   if (value == null) return constants.O_RDONLY;
