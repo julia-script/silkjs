@@ -240,8 +240,11 @@ function indexError() {
   error.code = 'ERR_OUT_OF_RANGE';
   return error;
 }
+// SLICE_START_END. An empty view (also a detached or out of bounds one)
+// decodes to '' before its range is checked.
 function sliceRange(view, start, end) {
   const length = view.byteLength;
+  if (length === 0) return [0, 0];
   let s, e;
   try {
     s = arrayIndex(start, 0);
@@ -384,6 +387,10 @@ function staticWrite(operation) {
       error.code = 'ERR_INVALID_ARG_TYPE';
       throw error;
     }
+    // The binding reads both as integers (a pool offset can be fractional
+    // after a fractional allocation size).
+    offset = Math.trunc(offset);
+    length = Math.trunc(length);
     // Encoding coercion may detach or shrink a view after the JS checks.
     const available = target.byteLength - offset;
     if (available < 0) throw new ERR_BUFFER_OUT_OF_BOUNDS('offset');
