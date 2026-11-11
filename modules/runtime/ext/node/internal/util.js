@@ -352,10 +352,10 @@ function getSystemErrorName(err) {
   return require('internal/util_public/system').getSystemErrorName(err);
 }
 
-// Node's assertCrypto: this runtime always has crypto.
-const noCrypto = !process.versions.openssl;
+// Node's assertCrypto. This module loads during bootstrap, before process.versions
+// exists, so the check reads it when called.
 function assertCrypto() {
-  if (noCrypto) {
+  if (!process.versions.openssl) {
     const { ERR_NO_CRYPTO } = require('internal/errors').codes;
     throw new ERR_NO_CRYPTO();
   }
