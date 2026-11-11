@@ -23,7 +23,7 @@
 const host = require('internal/host');
 const { Buffer } = require('buffer');
 const darwin = host.platform === 'darwin';
-const { validateInteger } = require('internal/path_events/support');
+const { validateInteger } = require('internal/validators');
 function integer(value, name, min = -2147483648, max = 2147483647) {
   validateInteger(value, name, min, max);
   return value;
