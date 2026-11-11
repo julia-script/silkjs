@@ -114,14 +114,6 @@ function dateValue(text) {
   date.setUTCHours(Number(fields[3]), Number(fields[4]), Number(fields[5]), 0);
   return date;
 }
-function rsaPublic(bitString) {
-  // i2d_RSA_PUBKEY uses rsaEncryption even for an RSA-PSS certificate key.
-  const algorithm = Buffer.from('300d06092a864886f70d0101010500', 'hex');
-  let size = algorithm.length + bitString.length; const length = [];
-  if (size < 128) length.push(size);
-  else { while (size) { length.unshift(size & 255); size = Math.floor(size / 256); } length.unshift(128 | length.length); }
-  return Buffer.concat([Buffer.from([48, ...length]), algorithm, bitString]);
-}
 function legacy(cert, seen) {
   if (seen.has(cert)) return seen.get(cert);
   const parts = parsed(cert), key = cert.publicKey;
@@ -144,7 +136,7 @@ function legacy(cert, seen) {
     result.modulus = modulus.toString('hex').toUpperCase();
     let exponent = 0n; for (const byte of integers[1].data) exponent = exponent * 256n + BigInt(byte);
     result.exponent = '0x' + (exponent > 0xffffffffffffffffn ? 0xffffffffffffffffn : exponent).toString(16);
-    result.pubkey = rsaPublic(spki[1].raw); result.bits = c.call('keyBits', [c.handle(key)]);
+    result.pubkey = Buffer.from(c.call('rsaPubkey', [c.handle(key)])); result.bits = c.call('keyBits', [c.handle(key)]);
   } else if (algorithmId === '1.2.840.10045.2.1') {
     result.pubkey = Buffer.from(call(cert, 'x509ECPublic')); result.bits = c.call('keyBits', [c.handle(key)]);
     result.asn1Curve = call(cert, 'x509ECCurve', 0);
@@ -208,7 +200,19 @@ function parsePKCS12(bundle, options = {}) {
   const data = c.binary(bundle, 'bundle'); object(options, 'options');
   const pass = options.passphrase === undefined ? undefined : c.bytes(options.passphrase, 'utf8', 'options.passphrase');
   if (pass && pass.includes(0)) throw c.error('ERR_INVALID_ARG_VALUE', 'options.passphrase must not contain null bytes', TypeError);
-  const frame = Buffer.from(c.call('pkcs12Parse', [c.packed(data), pass === undefined ? undefined : c.packed(pass)]));
+  let raw;
+  try {
+    raw = c.call('pkcs12Parse', [c.packed(data), pass === undefined ? undefined : c.packed(pass)]);
+  } catch (error) {
+    // Node maps OpenSSL 3's missing legacy algorithms (RC2-40, RC4) to an
+    // actionable error, as the TLS pfx path does.
+    if (error.code === 'ERR_OSSL_EVP_UNSUPPORTED') {
+      throw c.error('ERR_CRYPTO_UNSUPPORTED_OPERATION', 'Unsupported PKCS#12 algorithm. The bundle may use legacy algorithms, which OpenSSL 3 only offers through its legacy provider');
+    }
+    throw error;
+  }
+  if (raw === undefined || raw.byteLength === 0) throw c.codes.ERR_CRYPTO_OPERATION_FAILED('The input is not a valid PKCS#12 structure');
+  const frame = Buffer.from(raw);
   let offset = 0, privateKey = null, certificate = null; const additionalCertificates = [];
   function field() { const length = frame.readUInt32BE(offset); offset += 4; const value = frame.subarray(offset, offset + length); offset += length; return value; }
   try {
@@ -231,4 +235,5 @@ function _x509FromChain(chain) {
 }
 function _cloneData(value) { return states.has(value) ? call(value, 'x509Raw') : undefined; }
 function _fromCloneData(value) { return new X509Certificate(new Uint8Array(value)); }
-module.exports = { Certificate, X509Certificate, parsePKCS12, _x509FromChain, _cloneData, _fromCloneData };
+function isX509Certificate(value) { return states.has(value); }
+module.exports = { Certificate, X509Certificate, isX509Certificate, parsePKCS12, _x509FromChain, _cloneData, _fromCloneData };

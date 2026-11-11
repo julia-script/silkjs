@@ -101,4 +101,18 @@ function rawHeaders(headers) {
   for (const [name, values] of state(headers).list) result[name] = name === 'set-cookie' ? values.slice() : values.join(name === 'cookie' ? '; ' : ', ');
   return result;
 }
-module.exports = { Headers, immutable, rawHeaders, string, scalar, token, byteString };
+// Headers of a request that the native server parsed: fields[start..] holds lower-case names and
+// their values, which the parser already checked.
+function parsedHeaders(fields, start) {
+  const headers = Object.create(Headers.prototype);
+  const list = new Map();
+  for (let index = start; index < fields.length; index += 2) {
+    const name = fields[index], values = list.get(name);
+    if (values === undefined) list.set(name, [fields[index + 1]]); else values.push(fields[index + 1]);
+  }
+  states.set(headers, { list, immutable: false });
+  return headers;
+}
+// The name -> values map of `headers`, for serializing a response.
+function headerList(headers) { return state(headers).list; }
+module.exports = { Headers, immutable, rawHeaders, parsedHeaders, headerList, string, scalar, token, byteString };

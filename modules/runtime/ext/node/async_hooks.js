@@ -405,6 +405,8 @@ Object.defineProperties(module.exports, {
   _enterResource: { value: (resource, omitFrame = false) => enterResource(resource, omitFrame) },
   _leaveResource: { value: resource => leaveResource(resource) },
   _invoke: { value: invokeIn },
+  // Whether any enabled hook observes resource callbacks; a hot runtime path may skip a resource's scope when none does.
+  _hooksActive: { value: () => hooks.size !== 0 },
   _captureContext: { value: captureContext },
   _runWithContext: { value: runWithContext },
   _nativeEvent: { value: nativeEvent },

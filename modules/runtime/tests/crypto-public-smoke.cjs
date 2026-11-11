@@ -15,8 +15,9 @@ async function main() {
   const heap = crypto.secureHeapUsed();
   assert.equal(heap.total, 0);
   assert.equal(heap.used, 0);
-  assert.ok(Number.isNaN(heap.utilization));
-  assert.equal(heap.min, 2);
+  // Node's secureHeapUsed without --secure-heap: all zero.
+  assert.equal(heap.utilization, 0);
+  assert.equal(heap.min, 0);
   assert.throws(() => crypto.setEngine('silk-nonexistent-engine'), { code: 'ERR_CRYPTO_ENGINE_UNKNOWN' });
   assert.throws(() => crypto.setEngine(1), { code: 'ERR_INVALID_ARG_TYPE' });
 
