@@ -39,13 +39,7 @@ class TLSTransport {
     // A peer that closes without close_notify still ends the stream, as in Node.
     carrier.on('end', () => { if (!this.closing) this.end(); });
     if (owned) carrier.on('error', err => { if (!this.closing) this.socket.destroy(err); });
-    carrier.once('close', () => {
-      this.closed = true; this.closing = true;
-      if (this.id) { native('release', this.id); this.id = 0; }
-      for (const item of this.writes.splice(0)) item.callback(canceled());
-      const done = this.pendingShutdown; this.pendingShutdown = null; if (done) done(null);
-      this.onEvent?.(6, 0);
-    });
+    carrier.once('close', () => this.finish());
     const start = () => {
       if (this.closing || this.started) return;
       // tls.connect() connects an owned carrier after the transport exists.
@@ -225,12 +219,25 @@ class TLSTransport {
   shutdown(callback) { this.pendingShutdown = callback; this.pump(); }
   readStart() { this.reading = true; this.carrier.resume(); this.pump(); return 0; }
   readStop() { this.reading = false; if (this.ready) this.carrier.pause(); return 0; }
+  // The TLS handle is closed: release the session and report the close once.
+  finish() {
+    if (this.closed) return;
+    this.closed = true; this.closing = true;
+    if (this.id) { native('release', this.id); this.id = 0; }
+    for (const item of this.writes.splice(0)) item.callback(canceled());
+    const done = this.pendingShutdown; this.pendingShutdown = null; if (done) done(null);
+    this.onEvent?.(6, 0);
+  }
   close(reset = false) {
     if (this.closing) return 0;
     this.closing = true;
     const alert = this.alert; this.alert = null;
-    if (alert && !reset && !this.carrier.destroyed) this.carrier.end(alert, () => this.carrier.destroy());
-    else if (reset && this.carrier.resetAndDestroy) this.carrier.resetAndDestroy();
+    if (alert && !reset && !this.carrier.destroyed) {
+      // As TLSWrap does, the handle closes without waiting for the alert to be
+      // written: a peer that never reads must not hold back 'error' and 'close'.
+      this.carrier.end(alert, () => this.carrier.destroy());
+      process.nextTick(() => this.finish());
+    } else if (reset && this.carrier.resetAndDestroy) this.carrier.resetAndDestroy();
     else this.carrier.destroy();
     return 0;
   }
@@ -240,6 +247,7 @@ class TLSTransport {
     return this.carrier.remoteAddress ? { address: this.carrier.remoteAddress, port: this.carrier.remotePort, family: this.carrier.remoteFamily } : undefined;
   }
   call(op, ...args) { return this.carrier._transport?.call(op, ...args) ?? 0; }
+  getAsyncId() { return this.carrier._handle?.getAsyncId?.() ?? -1; }
   ref() { this.carrier.ref?.(); }
   unref() { this.carrier.unref?.(); }
   hasRef() { return this.carrier._transport?.hasRef() ?? true; }

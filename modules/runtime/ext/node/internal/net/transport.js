@@ -54,6 +54,9 @@ class Transport {
     live.add(this);
   }
   call(operation, ...args) { return host.net(operation, [this.id, ...args]); }
+  // A stream handle that an HTTP parser can consume directly (Node's StreamBase).
+  get isStreamBase() { return true; }
+  getAsyncId() { return this.resource.asyncId(); }
   dispatch(type, status, payload, extra) {
     if (type === 4 || type === 5) {
       const request = this.requests.get(payload);

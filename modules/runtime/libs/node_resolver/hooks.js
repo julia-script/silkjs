@@ -22,6 +22,10 @@ function validate(kind, result, advanced, asynchronous, url) {
   const hook = url === undefined ? kind : `${url} '${kind}'`;
   if (kind === 'resolve' && (typeof result.url !== 'string' || !URL.canParse(result.url))) throw badProperty('a URL string', hook, 'url', result.url);
   if (kind === 'resolve') {
+    if (asynchronous && !('importAttributes' in result) && 'importAssertions' in result) {
+      importAssertionWarning();
+      result.importAttributes = result.importAssertions;
+    }
     if (result.importAttributes !== undefined) contextObject(result.importAttributes, 'importAttributes');
   }
   if (result.format !== undefined && result.format !== null && typeof result.format !== 'string') throw badProperty('a string', hook, 'format', result.format);
@@ -34,8 +38,26 @@ function validate(kind, result, advanced, asynchronous, url) {
   }
   return result;
 }
+// module.register() hooks still accept the old importAssertions name, with one warning
+// (Node's defineImportAssertionAlias).
+let importAssertionWarned = false;
+function importAssertionWarning() {
+  if (importAssertionWarned) return;
+  importAssertionWarned = true;
+  process.emitWarning('Use `importAttributes` instead of `importAssertions`', 'ExperimentalWarning');
+}
+function importAssertionAlias(context) {
+  return Object.defineProperty(context, 'importAssertions', {
+    configurable: true,
+    get() { importAssertionWarning(); return this.importAttributes; },
+    set(value) { importAssertionWarning(); return Reflect.set(this, 'importAttributes', value); },
+  });
+}
 function chain(records, kind, input, context, terminal, asynchronous) {
   const hooks = records.filter(record => typeof record[kind] === 'function');
+  // Like Node's async chain, the module.register() hooks share one context object
+  // that each next() call assigns into.
+  const shared = asynchronous ? importAssertionAlias({ ...context }) : null;
   function dispatch(index, value, current) {
     if (typeof value !== 'string') throw fail('ERR_INVALID_ARG_TYPE', `The "${kind === 'resolve' ? 'specifier' : 'url'}" argument must be a string`);
     contextObject(current, 'context');
@@ -43,12 +65,14 @@ function chain(records, kind, input, context, terminal, asynchronous) {
     let advanced = false;
     const next = (nextValue, nextContext) => {
       advanced = true;
-      return dispatch(index - 1, nextValue, { ...current, ...nextContext });
+      if (shared === null) return dispatch(index - 1, nextValue, { ...current, ...nextContext });
+      if (nextContext) Object.assign(shared, nextContext);
+      return dispatch(index - 1, nextValue, shared);
     };
     const result = hooks[index][kind](value, current, next);
     return asynchronous ? Promise.resolve(result).then(value => validate(kind, value, advanced, true, hooks[index].url)) : validate(kind, result, advanced, false);
   }
-  return dispatch(hooks.length - 1, input, context);
+  return dispatch(hooks.length - 1, input, shared === null ? context : shared);
 }
 function createHooks(defaultResolve, defaultLoad, getThreads, awaitHook, workerStatus, getWorkerExecArgv) {
   const synchronous = [];
