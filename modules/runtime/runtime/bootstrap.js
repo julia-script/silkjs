@@ -322,6 +322,7 @@ function reportUncaught(error) {
     exceptionInFatalHandler(next);
   }
 }
+host.triggerUncaughtException = reportUncaught;
 // Runs a timer or immediate callback; true when it threw (and was reported).
 function invokeReporting(callback, receiver, args) {
   try { Reflect.apply(callback, receiver, args); return false; }
