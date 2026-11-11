@@ -54,7 +54,17 @@ r.push([...counting(3)].join(","));
 // Zero products and the Int range's edges.
 function products(a, b) { var x = a; return [x * b, x + b, x - b].map(function (v) { return Object.is(v, -0) ? "-0" : String(v); }).join(","); }
 r.push(products(-1, 0), products(65536, 65536), products(-2147483648, 1), products(2147483647, 1));
+// Constructors that default their arguments or keep a store's value (the
+// frameless construct path reads the long put_arg and set_loc forms).
+function Color(red, green, blue) { if (!red) red = 0.5; if (!green) green = 0.25; if (!blue) blue = 0; this.red = red; this.green = green; this.blue = blue; }
+function Kept(a) { var t; this.a = (t = a); this.b = t; }
+var built = [];
+for (var round = 0; round < 40; round++) {
+  var c = new Color(round & 1, round & 2), k = new Kept(round);
+  if (round > 36) built.push(c.red + "/" + c.green + "/" + c.blue + "/" + k.a + "/" + k.b);
+}
+r.push(built.join(","));
 const got = r.join(";");
-const expected = '42,6,5,7,7,41,42,1,0,2147483647,2147483648,-2147483649,-2147483649,1.5,1.5,1.5,10,12,12,NaN,NaN,-1,4;20,41,17,60,x1,1x,20,2,30,2,-2147483648,17,12,2,0;7,6,7,7;12,3,10;0,2,7,5|2:5;bad:object|object;42,p2,2,8;6.5,p2.5,1.5,10;4294967294,p2147483647,0,4611686014132420600;0,p0,0,0;b;;g;8;1;16;2;0:2,1:1,2:0;-0,-1,-1;4294967296,131072,0;-2147483648,-2147483647,-2147483649;2147483647,2147483648,2147483646';
+const expected = '42,6,5,7,7,41,42,1,0,2147483647,2147483648,-2147483649,-2147483649,1.5,1.5,1.5,10,12,12,NaN,NaN,-1,4;20,41,17,60,x1,1x,20,2,30,2,-2147483648,17,12,2,0;7,6,7,7;12,3,10;0,2,7,5|2:5;bad:object|object;42,p2,2,8;6.5,p2.5,1.5,10;4294967294,p2147483647,0,4611686014132420600;0,p0,0,0;b;;g;8;1;16;2;0:2,1:1,2:0;-0,-1,-1;4294967296,131072,0;-2147483648,-2147483647,-2147483649;2147483647,2147483648,2147483646;1/0.25/0/37/37,0.5/2/0/38/38,1/2/0/39/39';
 console.log(got === expected ? 'PASS step and argument operands' : 'FAIL ' + got);
 if (got !== expected) throw new Error('step and argument operand regressions');
