@@ -2,6 +2,7 @@
 const c = require('internal/fs_core');
 const p = require('path');
 const { Buffer, os, constants, Stats, Dirent, StatFs } = c;
+const { bufferCodec } = c.host;
 const fs = module.exports;
 Object.assign(fs, { constants, Stats, Dirent, StatFs });
 for (const name of ['F_OK', 'R_OK', 'W_OK', 'X_OK']) {
@@ -32,7 +33,21 @@ function transfer(operation, fd, buffer, offset, length, position) {
   return c.fail(os[operation](fd, buffer.buffer, buffer.byteOffset + offset, length), operation);
 }
 fs.readSync = function readSync(fd, buffer, offset, length, position) { return transfer('read', fd, ...readArgs(buffer, offset, length, position)); };
-fs.writeSync = function writeSync(fd, buffer, offset, length, position) { return transfer('write', fd, ...writeArgs(buffer, offset, length, position).slice(0, 4)); };
+fs.writeSync = function writeSync(fd, buffer, offset, length, position) {
+  // The whole of a view, or a string as UTF-8, at the current position: the common calls.
+  if (offset === undefined && length === undefined && position === undefined) {
+    if (ArrayBuffer.isView(buffer)) return c.fail(os.write(c.fd(fd), buffer.buffer, buffer.byteOffset, buffer.byteLength), 'write');
+    if (typeof buffer === 'string' && buffer.length <= 21845) {
+      // Three bytes at most for each UTF-16 unit, so the string fits in the read buffer.
+      const scratch = readBuffer || Buffer.allocUnsafeSlow(65536); readBuffer = null;
+      try {
+        const count = buffer.length === 0 ? 0 : bufferCodec(1, buffer, scratch, 0, scratch.length);
+        return c.fail(os.write(c.fd(fd), scratch.buffer, scratch.byteOffset, count), 'write');
+      } finally { readBuffer = scratch; }
+    }
+  }
+  return transfer('write', fd, ...writeArgs(buffer, offset, length, position).slice(0, 4));
+};
 function vector(operation, fd, buffers, position) {
   c.fd(fd); if (!Array.isArray(buffers)) throw c.invalid('buffers', 'an array');
   buffers.forEach(c.bytes); position = c.position(position); let total = 0;
@@ -55,7 +70,9 @@ fs.statSync = (path, options) => stat('stat', path, options);
 fs.lstatSync = (path, options) => stat('lstat', path, options);
 fs.fstatSync = (fd, options) => stat('fstat', fd, options);
 fs.statfsSync = (path, options) => { path = c.path(path); options = opts(options); return new StatFs(c.native('statfs', [path, options]), !!options.bigint); };
-fs.existsSync = function existsSync(path) { try { fs.statSync(path); return true; } catch (_) { return false; } };
+fs.existsSync = function existsSync(path) {
+  try { c.native('access', [c.path(path), constants.F_OK]); return true; } catch (_) { return false; }
+};
 fs.accessSync = function accessSync(path, mode = constants.F_OK) { c.native('access', [c.path(path), c.integer(mode, 'mode', 0, 7)]); };
 fs.renameSync = function renameSync(oldPath, newPath) { oldPath = c.path(oldPath); newPath = c.path(newPath); c.fail(os.rename(oldPath, newPath), 'rename', oldPath, newPath); };
 fs.unlinkSync = function unlinkSync(path) { c.native('unlink', [c.path(path)]); };
