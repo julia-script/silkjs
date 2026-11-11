@@ -25,6 +25,16 @@ function setDepth(depth) {
   if (!on) { tasks.clear(); running.length = 0; }
   hooks ??= require('internal/inspector_async_hook');
   if (on) hooks.enable(); else hooks.disable();
+  require('async_hooks')._setPromiseObserver(on ? promiseEvent : undefined);
+}
+// V8 schedules a "Promise.then" task where then() derives a promise, and runs
+// it around the reaction job; promises keyed apart from async_hooks ids.
+function promiseEvent(event, token, derived) {
+  const id = `promise:${token}`;
+  if (event === 0) { if (derived) tasks.set(id, { description: 'Promise.then', callFrames: stack(promiseEvent), parent: running.at(-1) ?? null, recurring: false }); }
+  else if (event === 1) asyncTaskStarted(id);
+  else if (event === 2) asyncTaskFinished(id);
+  else if (event === 4) tasks.delete(id);
 }
 function stack(skip) {
   return host.captureCallSites(200, skip).map(frame => ({

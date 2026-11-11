@@ -3,7 +3,7 @@
 const { Buffer } = require('buffer');
 const { URL } = require('internal/web/url');
 const { Blob, resolveObjectURL } = require('internal/web/blob');
-const { TextEncoder } = require('internal/web/encoding');
+const { TextEncoder } = require('internal/encoding');
 const { Headers, immutable } = require('internal/web/fetch/headers');
 const { FormData } = require('internal/web/fetch/formdata');
 const { Request, Response, copyRequestRecord, requestState, responseState, redirectStatus } = require('internal/web/fetch/message');

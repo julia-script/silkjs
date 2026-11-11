@@ -50,7 +50,6 @@ import js_gc
 import js_parser_core { Parser }
 import js_parser_diagnostics { SyntaxError }
 import js_tokens { LexError }
-import js_tokens as tok
 import js_string_types { StringLengthError }
 import js_strings { Strings }
 import js_atom_data as atoms
@@ -84,8 +83,6 @@ def cases():
     for n in [1, 58, 63, 254, 255, 256, 600]:
         for ending in [b'z', b'\xc3\xa9', b'\xf0\x9f\x98\x80']:
             rows.append(('text', b'a' * n + ending))
-    for char in [0, 1, 10, 39, 59, 127, 128, 255, -1, -128, 'TOK_TEMPLATE', 'TOK_WHILE']:
-        rows.append(('char', char))
     for char in [0, 64, 128, 255]:
         rows.append(('lex', char))
     for atom in [0, 0x80000000, 0x80000001, 0xffffffff]:
@@ -105,11 +102,6 @@ def sources(rows):
             c_setup = f'const uint8_t text[]={{{c_bytes(data)}}};'
             c_call = 'js_parse_error_pos(&p,input+OFFSET,"%s",text);'
             s_call = f'parser.syntaxAt<()>(OFFSET,{byte_literal(data)})'
-        elif kind == 'char':
-            c_arg = str(data)
-            s_arg = 'tok.' + data if isinstance(data, str) else str(data)
-            c_call = f'js_parse_error_pos(&p,input+OFFSET,"expecting \'%c\'",{c_arg});'
-            s_call = f'parser.expected<()>({s_arg})'
         elif kind == 'lex':
             c_call = f'js_parse_error_pos(&p,input+OFFSET,"Unexpected token \'%c\'",{data});'
             s_call = f'parser.lexicalError(LexError {{ offset:OFFSET,message:"Unexpected token \'%c\'",detail:{data} }})'

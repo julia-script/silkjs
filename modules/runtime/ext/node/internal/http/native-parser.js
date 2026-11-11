@@ -28,15 +28,19 @@ const call1 = (fn, self, a) => fn.call(self, a);
 const call2 = (fn, self, a) => fn.call(self, a[0], a[1]);
 const callHead = (fn, self, a) => fn.call(self, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);
 // Parser callbacks run in the parser's async scope, with fixed arguments.
-// When the parser consumes its socket, each callback is a top-level call (Node's
-// MakeCallback), so the nextTick and microtask queues drain after it.
+// When the parser consumes its socket, Node calls kOnHeaders, kOnBody and kOnExecute
+// with MakeCallback, so the nextTick and microtask queues drain after them. Message
+// begin, headers complete and message complete run with kSkipTaskQueues: the rest of
+// the input (a pipelined request, a parse error) is parsed before any tick runs.
 function callback(parser, state, index, call, value) {
   const fn = parser[index];
   if (typeof fn !== 'function') return undefined;
   const result = state.resource ? invoke(state.resource, call, fn, parser, value) : call(fn, parser, value);
-  if (state.topLevel) host.checkpoint();
+  if (state.topLevel && drainsTicks[index]) host.checkpoint();
   return result;
 }
+// Indexed by callback slot (kOnHeaders 1, kOnBody 3, kOnExecute 5).
+const drainsTicks = [false, true, false, true, false, true, false];
 function resetMessage(state) {
   state.headersComplete = false;
   state.upgrade = false;
