@@ -282,6 +282,7 @@ function getOptionValue(name) {
     case '--insecure-http-parser': return !!host.insecureHTTPParser;
     case '--max-http-header-size': return host.maxHTTPHeaderSize ?? 16 * 1024;
     case '--experimental-import-text': return !!host.importText;
+    case '--experimental-package-map': return host.packageMap ?? '';
     default: return startupControls.getOptionValue(name) ?? require('internal/tls/options').getOptionValue(name);
   }
 }

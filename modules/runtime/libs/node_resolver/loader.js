@@ -568,6 +568,15 @@ function createLoader(host, builtins) {
       }
       if (mode === 'import' && /^[A-Za-z][A-Za-z\d+.-]*:/.test(specifier)) throw error('ERR_UNSUPPORTED_ESM_URL_SCHEME', { protocol: /^[^:]*:/.exec(specifier)[0] }, ['file', 'data', 'node']);
       const parsed = packageName(specifier, parent);
+      // --experimental-package-map: the map alone decides where a bare specifier's
+      // package is (Node's packageResolve and tryPackageMapResolveCJS).
+      if (host.packageMap && path.isAbsolute(parent)) {
+        const mapped = require('internal/modules/package_map').packageMapResolve(specifier, parent);
+        if (mapped === undefined) throw missing(specifier, parent, mode, undefined, parsed.name);
+        const found = packageAt(mapped.packagePath, { name: parsed.name, subpath: mapped.subpath }, specifier, parent, mode, seen, isMain);
+        if (found === undefined) throw missing(specifier, parent, mode, undefined, parsed.name);
+        return found;
+      }
       const scope = packageScope(parent);
       if (scope && scope.data.name === parsed.name && scope.data.exports !== undefined && scope.data.exports !== null) {
         return packageMap(scope, scope.data.exports, parsed.subpath, false, parent, mode, seen, isMain);
@@ -608,23 +617,30 @@ function createLoader(host, builtins) {
   function findPackage(search, parsed, specifier, parent, mode, seen, isMain) {
     for (let i8 = 0, a8 = search; i8 < a8.length; i8++) { const directory = a8[i8];
       if (!isDirectory(directory)) continue;
-      const root = path.join(directory, parsed.name);
-      const pkg = readPackage(root);
-      if (pkg && pkg.data.exports !== undefined && pkg.data.exports !== null) return packageMap(pkg, pkg.data.exports, parsed.subpath, false, parent, mode, seen, isMain);
-      const candidate = parsed.subpath === '.' ? root : path.join(root, parsed.subpath.slice(2));
-      if (mode === 'import' && parsed.subpath !== '.') {
-        if (isDirectory(root)) return strictFile(candidate, specifier, parent, mode, undefined, isMain);
-        continue;
-      }
-      if (mode === 'import' && pkg && typeof pkg.data.main === 'string') {
-        const exact = path.resolve(root, pkg.data.main);
-        if (isFile(exact)) return descriptor(exact, mode, undefined, isMain);
-      }
-      const found = legacyFile(candidate, true, /[\\/]$/.test(specifier));
-      if (found) return descriptor(found, mode, undefined, isMain);
-      if (mode === 'import' && isDirectory(root)) throw missing(specifier, parent, mode, undefined, root + path.sep);
+      const found = packageAt(path.join(directory, parsed.name), parsed, specifier, parent, mode, seen, isMain);
+      if (found !== undefined) return found;
     }
     throw missing(specifier, parent, mode, undefined, parsed.name);
+  }
+
+  // The module that parsed.subpath names in the package at root, or undefined when
+  // root holds no such package.
+  function packageAt(root, parsed, specifier, parent, mode, seen, isMain) {
+    const pkg = readPackage(root);
+    if (pkg && pkg.data.exports !== undefined && pkg.data.exports !== null) return packageMap(pkg, pkg.data.exports, parsed.subpath, false, parent, mode, seen, isMain);
+    const candidate = parsed.subpath === '.' ? root : path.join(root, parsed.subpath.slice(2));
+    if (mode === 'import' && parsed.subpath !== '.') {
+      if (isDirectory(root)) return strictFile(candidate, specifier, parent, mode, undefined, isMain);
+      return undefined;
+    }
+    if (mode === 'import' && pkg && typeof pkg.data.main === 'string') {
+      const exact = path.resolve(root, pkg.data.main);
+      if (isFile(exact)) return descriptor(exact, mode, undefined, isMain);
+    }
+    const found = legacyFile(candidate, true, /[\\/]$/.test(specifier));
+    if (found) return descriptor(found, mode, undefined, isMain);
+    if (mode === 'import' && isDirectory(root)) throw missing(specifier, parent, mode, undefined, root + path.sep);
+    return undefined;
   }
 
   function conditions(mode) {
