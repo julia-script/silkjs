@@ -48,7 +48,7 @@ function internalRequire(request, parent = '') {
   const module = { exports: {} }; moduleSet(request, module);
   try {
     if (typeof factory === 'number') {
-      factory = native.compileFunction(native.builtinSource(factory), 'node:' + request);
+      factory = native.compileBuiltin(factory, 'node:' + request);
       factorySet(request, factory);
     }
     factory(module, module.exports, name => internalRequire(name, request));
@@ -57,6 +57,9 @@ function internalRequire(request, parent = '') {
   return module.exports;
 }
 for (let index = 0, count = native.builtinCount(); index < count; index++) define(native.builtinName(index), index);
+// tools/build.py runs the freshly linked executable once this way to get the
+// built-ins' bytecode, which it then links in. Nothing else of the runtime is up yet.
+if (native.argv.length === 2 && native.argv[1] === '--silk-write-builtin-cache') rawStd.exit(native.writeBuiltinCache() ? 0 : 1);
 
 for (const name of ['dispose', 'asyncDispose']) {
   if (Symbol[name] === undefined) Object.defineProperty(Symbol, name, { value: Symbol.for('nodejs.' + name) });

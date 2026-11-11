@@ -71,6 +71,8 @@ import ext.trace_native
 import ext.sea_native
 import runtime.embedded
 
+const STARTUP_GC_THRESHOLD: usize = 67108864
+
 unsafe fn global(context: *mut HeapHeader) -> ValueBits {
   let anchor = () let state = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
   return state.globalObject.view()
@@ -101,6 +103,8 @@ unsafe effect fn configure<'m>(engine: &mut Engine<'m, Services>, context: *mut 
   run unsafe function(&mut engine, context, native, b"builtinCount", 29)
   run unsafe function(&mut engine, context, native, b"builtinName", 30)
   run unsafe function(&mut engine, context, native, b"builtinSource", 31)
+  run unsafe function(&mut engine, context, native, b"compileBuiltin", 32)
+  run unsafe function(&mut engine, context, native, b"writeBuiltinCache", 33)
   let started = engine.services.started
   run unsafe common.define(&mut engine, context, native, b"runtimeStartTime", ValueBits.number(i64.toF64(started) / 1000000.0), 7)
   run unsafe common.define(&mut engine, context, native, b"environmentTime", ValueBits.number(i64.toF64(clock.nowNanoseconds()) / 1000000.0), 7)
@@ -184,7 +188,7 @@ unsafe effect fn configure<'m>(engine: &mut Engine<'m, Services>, context: *mut 
   let mut architecture = b"x64" static if Intrinsic.targetArchitecture() == "aarch64" { architecture = b"arm64" }
   let architectureValue = run unsafe host.string(&mut engine, context, architecture)
   run unsafe common.define(&mut engine, context, native, b"arch", architectureValue, 7)
-  let result = (run evaluation.evaluate(&mut engine, memory, unsafe lendRealm(&context, context), embedded.source(), b"silk:bootstrap", flags.TYPE_MODULE)).intoBits()
+  let result = (run evaluation.evaluate(&mut engine, memory, unsafe lendRealm(&context, context), embedded.source(), b"silk:bootstrap", flags.TYPE_MODULE | flags.FLAG_HOST_LIBRARY)).intoBits()
   let drained = run Effect.result(unsafe host.drain(&mut engine, context))
   match move drained {
     Result<bool, OutOfMemoryError | JsException>.Failure { error } => { unsafe gc.release(&mut engine, rt, result) fail move error }
@@ -402,13 +406,18 @@ unsafe effect fn realm<'m>(engine: &mut Engine<'m, Services>, rt: *mut HeapHeade
   unsafe gc.releaseHeader(&mut engine, rt, context)
   return status
 }
-unsafe effect fn runtimeBody(workers: *mut worker_native.State, arguments: &List<Bytes>, process: &Process) -> i32 ! OutOfMemoryError ? &mut Allocator {
+/// exiting: the process ends when this runtime does (the main thread's), so its heap
+/// is left for the operating system to reclaim, as process.exit() already leaves it.
+unsafe effect fn runtimeBody(workers: *mut worker_native.State, arguments: &List<Bytes>, process: &Process, exiting: bool) -> i32 ! OutOfMemoryError ? &mut Allocator {
   let mut services = Services.make(process.namespace.clone()) services.workers = workers
   let mut allocator = run RuntimeAllocator.make(unsafe worker_native.reportingAllocator(workers))
   let memory = run allocator.observe()
   let allocatorPointer = Pointer.fromMutRef<RuntimeHeap>(&mut allocator)
   let rt = run runtime.allocateRuntimeStorage(stack.currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut allocator)
   unsafe debugger.configureCompilation(rt, true)
+  // The built-ins a start loads stay live for the whole run: collecting while they
+  // load only rescans them. The first collection waits for the heap to pass this.
+  unsafe runtime.setGCThreshold(rt, STARTUP_GC_THRESHOLD)
   unsafe worker_native.configureRuntime(workers, rt)
   let domain = unsafe worker_native.domain(workers)
   let mut engine = Engine { memory: &memory, domain: domain, services: move services }
@@ -419,8 +428,16 @@ unsafe effect fn runtimeBody(workers: *mut worker_native.State, arguments: &List
   let executed = run Effect.result(unsafe realm(&mut engine, rt, arguments, process, allocatorPointer)) |> Effect.provideMut<Allocator>(&mut allocator)
   let allocationProfile = engine.memory.stopProfile()
   drop allocationProfile
-  unsafe events.freeHandlers(&mut engine, rt)
-  run unsafe gc.destroyRuntime(&mut engine, rt) |> Effect.provideMut<Allocator>(&mut allocator)
+  // Addon finalizers are observable and run when the heap is destroyed; every other
+  // native resource was closed with its service above.
+  let addons = match Pointer.nonNullMut<napi_native.State>(engine.services.napi) {
+    Option<*mut napi_native.State>.Some { value: napi } => unsafe napi_native.loaded(napi)
+    _ => false
+  }
+  if !exiting || addons {
+    unsafe events.freeHandlers(&mut engine, rt)
+    run unsafe gc.destroyRuntime(&mut engine, rt) |> Effect.provideMut<Allocator>(&mut allocator)
+  }
   match Pointer.nonNullMut<napi_native.State>(engine.services.napi) {
     Option<*mut napi_native.State>.Some { value: napi } => { unsafe napi_native.dispose(napi) }
     _ => ()
@@ -438,8 +455,8 @@ unsafe effect fn runtimeBody(workers: *mut worker_native.State, arguments: &List
   engine.services.sea = Pointer.null<sea_native.State>()
   return match move executed { Result<i32, OutOfMemoryError | JsException>.Success { value } => value Result<i32, OutOfMemoryError | JsException>.Failure { .. } => 1 }
 }
-unsafe effect fn executeRuntime(workers: *mut worker_native.State, arguments: &List<Bytes>, process: &Process) -> i32 ! OutOfMemoryError ? &mut Allocator {
-  let outcome = run Effect.result(unsafe runtimeBody(workers, arguments, process))
+unsafe effect fn executeRuntime(workers: *mut worker_native.State, arguments: &List<Bytes>, process: &Process, exiting: bool) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  let outcome = run Effect.result(unsafe runtimeBody(workers, arguments, process, exiting))
   if let Result<i32, OutOfMemoryError>.Failure { .. } = &outcome { unsafe worker_native.fatal(workers, b"runtime initialization", b"Native allocator exhausted") }
   unsafe worker_native.close(workers)
   return match move outcome {
@@ -452,11 +469,11 @@ pub effect fn executeProgram(arguments: &List<Bytes>) -> i32 ! OutOfMemoryError 
   let process = run Process.make(&namespace)
   let domain = run WaiterDomain.make()
   let workers = run worker_native.mainState(&process, domain.handle())
-  return run unsafe executeRuntime(workers, arguments, &process)
+  return run unsafe executeRuntime(workers, arguments, &process, true)
 }
 pub effect fn executeThread(start: worker_native.Start) -> i32 ! OutOfMemoryError ? &mut Allocator {
   let process = start.group.process.clone()
   let workers = run worker_native.makeState(move start.group, start.id, start.control, move start.metadata)
   let arguments = List<Bytes>.make()
-  return run unsafe executeRuntime(workers, &arguments, &process)
+  return run unsafe executeRuntime(workers, &arguments, &process, false)
 }
