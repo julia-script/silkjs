@@ -1388,7 +1388,9 @@ function run() {
   if (testMode) {
     return internalRequire('internal/main/test_runner').runTestRunner(testOptions, args.slice(index), reporterNames, destinations);
   }
-  if (expression === undefined && filename === undefined && (interactive || process.stdin.isTTY)) {
+  // As node.cc, ask whether descriptor 0 is a terminal without making process.stdin:
+  // that stream would make the descriptor nonblocking before a piped script is read.
+  if (expression === undefined && filename === undefined && (interactive || internalRequire('tty').isatty(0))) {
     if (inputTypeSet) {
       console.error('Cannot specify --input-type for REPL');
       process.exitCode = 9;
