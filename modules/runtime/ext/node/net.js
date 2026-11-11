@@ -251,6 +251,22 @@ Socket.prototype._onRead = function(status, payload) {
     this._deliverOnread();
   } else if (!this.push(chunk) && this._transport) this._transport.readStop();
 };
+function replayConsumerReads(socket) {
+  socket._consumerReplay = null;
+  const queue = socket._consumerQueue;
+  if (!queue || socket._readPaused || socket.destroyed) return;
+  socket._consumerQueue = null;
+  for (let i = 0; i < queue.length; i += 2) {
+    socket._onRead(queue[i], queue[i + 1]);
+    if (socket.destroyed) return;
+    if (socket._readPaused || socket._consumerQueue) {
+      const rest = queue.slice(i + 2);
+      if (socket._consumerQueue) rest.push(...socket._consumerQueue);
+      socket._consumerQueue = rest.length ? rest : null;
+      return;
+    }
+  }
+}
 Socket.prototype._deliverOnread = function() {
   while (this._onreadPending?.length && !this._readPaused && !this.destroyed) {
     const destination = typeof this._onread.buffer === 'function' ? this._onread.buffer() : this._onread.buffer;
@@ -278,18 +294,9 @@ Socket.prototype._read = function() {
     this._deliverOnread();
     if (this._readPaused || this.destroyed) return;
   }
-  const queue = this._consumerQueue;
-  if (queue) {
-    this._consumerQueue = null;
-    for (let i = 0; i < queue.length; i += 2) {
-      this._onRead(queue[i], queue[i + 1]);
-      if (this._readPaused || this.destroyed || this._consumerQueue) {
-        if (!this.destroyed) this._consumerQueue = queue.slice(i + 2).concat(this._consumerQueue || []);
-        if (!this._consumerQueue?.length) this._consumerQueue = null;
-        return;
-      }
-    }
-  }
+  // Held reads come back on a later turn of the loop, as libuv delivers reads after
+  // readStart, never inside resume().
+  if (this._consumerQueue && !this._consumerReplay) this._consumerReplay = setImmediate(replayConsumerReads, this);
   if (this._readEOF) return;
   const status = this._transport.readStart();
   if (status < 0) this.destroy(nativeError(status, 'read'));
