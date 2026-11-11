@@ -9,6 +9,8 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'silk-inspector-websocket-')));
 const entry = path.join(root, 'debug-target.cjs');
+// As in Node, a script named by an absolute path is reported as a file URL.
+const entryURL = require('node:url').pathToFileURL(entry).href;
 const source = [
   "'use strict';",
   'function inspectorInner(value) {',
@@ -125,13 +127,13 @@ async function main() {
   enter('startup release and initial pause');
   await post('Runtime.runIfWaitingForDebugger');
   const startup = await notification('Debugger.paused');
-  assert.equal(scripts.get(startup.callFrames[0].location.scriptId)?.url, entry, 'inspect-brk must stop in the guest entry, not inspector internals');
+  assert.equal(scripts.get(startup.callFrames[0].location.scriptId)?.url, entryURL, 'inspect-brk must stop in the guest entry, not inspector internals');
   assert.ok(startup.callFrames[0].location.lineNumber >= 0, 'startup must pause inside the original CJS source');
   assert.ok(startup.callFrames[0].location.columnNumber >= 0, 'startup must skip the generated CJS wrapper prefix');
   enter('startup resume and guest ready');
   await post('Debugger.resume');
   await untilOutput(text => text.includes('INSPECTOR_GUEST_READY'));
-  const script = [...scripts.values()].find(item => item.url === entry);
+  const script = [...scripts.values()].find(item => item.url === entryURL);
   assert.ok(script);
   enter('script source and executable locations');
   assert.equal((await post('Debugger.getScriptSource', { scriptId: script.scriptId })).scriptSource, source);
@@ -146,7 +148,7 @@ async function main() {
   assert.equal(exactBreakpoint.actualLocation.columnNumber, exactColumn, 'an exact executable column must take precedence over earlier PCs');
   await post('Debugger.removeBreakpoint', { breakpointId: exactBreakpoint.breakpointId });
   enter('install URL breakpoint');
-  const breakpoint = await post('Debugger.setBreakpointByUrl', { url: entry, lineNumber: 7, columnNumber: 0 });
+  const breakpoint = await post('Debugger.setBreakpointByUrl', { url: entryURL, lineNumber: 7, columnNumber: 0 });
   assert.equal(breakpoint.locations[0].lineNumber, 7);
   assert.equal(breakpoint.locations[0].columnNumber, callLine.indexOf('inspectorInner'), 'a line breakpoint must precede the call, not select its later assignment store');
   enter('evaluate target and await URL breakpoint pause');
@@ -190,7 +192,7 @@ async function main() {
   await post('Debugger.resume');
   assert.equal((await execution).result.value, 19);
   enter('callFunctionOn target and await URL breakpoint pause');
-  const callBreakpoint = await post('Debugger.setBreakpointByUrl', { url: entry, lineNumber: 7, columnNumber: 0 });
+  const callBreakpoint = await post('Debugger.setBreakpointByUrl', { url: entryURL, lineNumber: 7, columnNumber: 0 });
   evaluation = { status: 'pending', command: 'Runtime.callFunctionOn' };
   const called = post('Runtime.callFunctionOn', { functionDeclaration: 'function() { return inspectorTransportTarget(2); }', executionContextId: mainContext.context.id, returnByValue: true });
   called.then(

@@ -54,8 +54,6 @@ COMMON = [
     ("require('internal/events/abort_listener')", "require('events')"),
     ("require('internal/util/types')", "require('util').types"),
     ("const assert = require('internal/assert');", "const assert = require('assert').ok;"),
-    ("const { kEmptyObject } = require('internal/util');",
-     "const kEmptyObject = Object.freeze({ __proto__: null });"),
     ("const { exitCodes: { kNoFailure } } = internalBinding('errors');", "const kNoFailure = 0;"),
 ]
 
@@ -162,11 +160,10 @@ function markTransferMode() {}"""),
   kEmptyObject,
   promisify,
 } = require('internal/util');""",
-         """// silkjs: Node's internal/util helpers the module uses.
+         """const { kEmptyObject, promisify } = require('internal/util');
+// silkjs: guessHandleType is the handle binding's; internal/util has no isWindows.
 const { guessHandleType } = require('internal/net/binding');
-const isWindows = process.platform === 'win32';
-const kEmptyObject = Object.freeze({ __proto__: null });
-const { promisify } = require('util');"""),
+const isWindows = process.platform === 'win32';"""),
         ("""const {
   hasObserver,
   startPerf,

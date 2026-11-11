@@ -30,7 +30,7 @@ const {
 
 const EventEmitter = require('events');
 
-const kEmptyObject = Object.freeze({ __proto__: null });
+const { kEmptyObject } = require('internal/util');
 
 module.exports = Worker;
 
