@@ -1,17 +1,18 @@
 'use strict';
 
 // The parts of Node.js lib/internal/perf/observe.js that the ported modules use.
-let hooks;
-const perf = () => hooks ??= require('perf_hooks');
+// Entries go through internal/perf_observers, which perf_hooks fills in once loaded.
+const host = require('internal/host');
+const entries = require('internal/perf_observers');
 
 function hasObserver(type) {
-  return perf()._hasObserver(type);
+  return entries.observing(type);
 }
 
 function startPerf(target, key, context = {}) {
   target[key] = {
     ...context,
-    startTime: perf()._now(),
+    startTime: host.now(),
   };
 }
 
@@ -21,8 +22,8 @@ function stopPerf(target, key, context = {}) {
     return;
   }
   const startTime = ctx.startTime;
-  perf()._enqueueNodeEntry(ctx.name, ctx.type, startTime, perf()._now() - startTime,
-                           { ...ctx.detail, ...context.detail });
+  entries.emit(ctx.name, ctx.type, startTime, host.now() - startTime,
+               { ...ctx.detail, ...context.detail });
 }
 
 module.exports = { hasObserver, startPerf, stopPerf };

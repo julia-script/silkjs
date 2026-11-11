@@ -4,6 +4,8 @@ const host = require('internal/host');
 const { EventTarget, Event, DOMException } = require('internal/path_events/event_target');
 const { createHistogram, createSlidingWindowHistogram, importHistogram, monitorEventLoopDelay, isRecordableHistogram } = require('internal/performance_histogram');
 const trace = require('internal/trace_events');
+const { codes: { ERR_INVALID_ARG_TYPE } } = require('internal/errors');
+const { validateFunction, validateObject } = require('internal/validators');
 const token = Symbol('Performance');
 const entries = new WeakMap();
 const markTimings = new Map();
@@ -14,8 +16,7 @@ const enqueueObserver = Symbol('enqueue');
 const deliverObserver = Symbol('deliver');
 const observesType = Symbol('observesType');
 const reservedMarks = new Set(['nodeStart', 'v8Start', 'environment', 'loopStart', 'loopExit', 'bootstrapComplete']);
-// 'http' entries come from node:http (internal/perf/observe).
-const supportedTypes = Object.freeze([...new Set(['function', 'http', 'mark', 'measure', 'resource', ...(host.performanceObserverTypes || [])])].sort());
+const supportedTypes = Object.freeze([...new Set(['function', 'http', 'http2', 'mark', 'measure', 'resource', ...(host.performanceObserverTypes || [])])].sort());
 // Only an installed instance counts: reading the lazy global would load this module
 // again while it loads, and settle globalThis.performance to undefined.
 const previousDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'performance');
@@ -29,6 +30,14 @@ let deliveryScheduled = false;
 let resourceLimit = 250;
 let resourcePending = false;
 let resourceOverflow = [];
+// WebIDL unsigned long, with Node's messages for the values ToNumber rejects.
+function unsignedLong(value, context) {
+  if (typeof value === 'bigint') throw error('ERR_INVALID_ARG_TYPE', `${context} is a BigInt and cannot be converted to a number.`);
+  if (typeof value === 'symbol') throw error('ERR_INVALID_ARG_TYPE', `${context} is a Symbol and cannot be converted to a number.`);
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 0;
+  return Math.trunc(number) >>> 0;
+}
 function error(code, message, Type = TypeError) { return Object.assign(new Type(message), { code }); }
 function object(value, name) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) throw error('ERR_INVALID_ARG_TYPE', `${name} must be an object`);
@@ -101,6 +110,11 @@ class PerformanceEntry {
   get startTime() { return data(this).start; }
   get duration() { return data(this).duration; }
   toJSON() { return { name: this.name, entryType: this.entryType, startTime: this.startTime, duration: this.duration }; }
+  [Symbol.for('nodejs.util.inspect.custom')](depth, options) {
+    if (depth < 0) return this;
+    const opts = { ...options, depth: options.depth == null ? null : options.depth - 1 };
+    return `${this.constructor.name} ${require('util').inspect(this.toJSON(), opts)}`;
+  }
 }
 class PerformanceMark extends PerformanceEntry {
   constructor(name, options) {
@@ -148,18 +162,32 @@ class PerformanceResourceTiming extends PerformanceEntry {
   get contentType() { return data(this).bodyInfo?.contentType ?? ''; }
   get contentEncoding() { return data(this).bodyInfo?.contentEncoding ?? ''; }
   toJSON() {
-    const result = super.toJSON();
-    for (const key of ['initiatorType', 'nextHopProtocol', ...Object.keys(resourceFields), ...Object.keys(connectionFields),
-      'firstInterimResponseStart', 'responseStart', 'transferSize', 'deliveryType', 'responseStatus', 'renderBlockingStatus', 'contentType', 'contentEncoding']) result[key] = this[key];
+    data(this);
+    const result = {};
+    for (const key of resourceJSONKeys) result[key] = this[key];
     return result;
   }
 }
+// Node's order, which inspect output follows.
+const resourceJSONKeys = ['name', 'entryType', 'startTime', 'duration', 'initiatorType', 'nextHopProtocol', 'workerStart',
+  'redirectStart', 'redirectEnd', 'fetchStart', 'domainLookupStart', 'domainLookupEnd', 'connectStart', 'connectEnd',
+  'secureConnectionStart', 'requestStart', 'finalResponseHeadersStart', 'firstInterimResponseStart', 'responseStart',
+  'responseEnd', 'transferSize', 'encodedBodySize', 'decodedBodySize', 'deliveryType', 'responseStatus',
+  'renderBlockingStatus', 'contentType', 'contentEncoding'];
 for (const [name, field] of Object.entries(resourceFields)) Object.defineProperty(PerformanceResourceTiming.prototype, name, {
   enumerable: true, configurable: true, get() { return data(this).timing[field]; }
 });
 for (const [name, field] of Object.entries(connectionFields)) Object.defineProperty(PerformanceResourceTiming.prototype, name, {
   enumerable: true, configurable: true, get() { return data(this).timing.finalConnectionTimingInfo?.[field]; }
 });
+// The attributes of a resource entry are enumerable accessors on the prototype, as in Node.
+for (const name of [...Object.getOwnPropertyNames(PerformanceResourceTiming.prototype), 'toJSON']) {
+  const descriptor = Object.getOwnPropertyDescriptor(PerformanceResourceTiming.prototype, name);
+  if (name !== 'constructor' && descriptor && !descriptor.enumerable) {
+    descriptor.enumerable = true;
+    Object.defineProperty(PerformanceResourceTiming.prototype, name, descriptor);
+  }
+}
 class PerformanceObserverEntryList {
   #entries;
   constructor(key, list) { if (key !== token) throw illegal(); this.#entries = sort(list); }
@@ -199,13 +227,13 @@ class PerformanceObserver {
   }
   disconnect() { observers.delete(this); pending.delete(this); this.#records = []; this.#types.clear(); this.#mode = undefined; }
   takeRecords() { const records = this.#records; this.#records = []; return records; }
+  [observesType](type) { return this.#types.has(type); }
   static get supportedEntryTypes() { return supportedTypes; }
   [enqueueObserver](entry) {
     if (!this.#types.has(entry.entryType)) return;
     this.#records.push(entry); pending.add(this); scheduleDelivery();
   }
   [deliverObserver]() { this.#callback(new PerformanceObserverEntryList(token, this.takeRecords()), this); }
-  static [observesType](observer, type) { return observer.#types.has(type); }
 }
 function getMark(value) {
   if (value === undefined) return undefined;
@@ -226,10 +254,10 @@ function eventLoopUtilization(util1, util2) {
   return { idle, active, utilization: !util1 && idle === 0 && active === 0 ? 0 : active / (idle + active) };
 }
 function timerify(fn, options = {}) {
-  if (typeof fn !== 'function') throw error('ERR_INVALID_ARG_TYPE', 'fn must be a function');
-  object(options, 'options');
+  validateFunction(fn, 'fn');
+  validateObject(options, 'options');
   const histogram = options.histogram;
-  if (histogram !== undefined && !isRecordableHistogram(histogram)) throw error('ERR_INVALID_ARG_TYPE', 'options.histogram must be a RecordableHistogram');
+  if (histogram !== undefined && !isRecordableHistogram(histogram)) throw new ERR_INVALID_ARG_TYPE('options.histogram', 'RecordableHistogram', histogram);
   function timerified(...args) {
     const start = now();
     const complete = () => {
@@ -260,7 +288,6 @@ class PerformanceNodeTiming extends PerformanceEntry {
 }
 for (const name of [...reservedMarks, 'idleTime']) Object.defineProperty(PerformanceNodeTiming.prototype, name, {
   configurable: true, enumerable: true, get() {
-    if (name === 'v8Start') return -1;
     if (name === 'nodeStart') return 0;
     const value = host.performanceNodeTiming?.()[name];
     if (value !== undefined) return value;
@@ -310,15 +337,13 @@ class Performance extends EventTarget {
   getEntries() { brand(this); return sort(allEntries()); }
   getEntriesByType(type) { brand(this); required(arguments.length, 'type'); return filter(allEntries(), undefined, `${type}`); }
   getEntriesByName(name, type) { brand(this); required(arguments.length, 'name'); return filter(allEntries(), `${name}`, type === undefined ? undefined : `${type}`); }
-  setResourceTimingBufferSize(size) { brand(this); required(arguments.length, 'maxSize'); resourceLimit = +size >>> 0; }
+  setResourceTimingBufferSize(maxSize) { brand(this); required(arguments.length, 'maxSize'); resourceLimit = unsignedLong(maxSize, 'maxSize'); }
   markResourceTiming(timingInfo, requestedUrl, initiatorType, global, cacheMode, bodyInfo, responseStatus, deliveryType = '') {
     if (cacheMode !== '' && cacheMode !== 'local') throw error('ERR_INTERNAL_ASSERTION', "cache must be an empty string or 'local'", Error);
     const entry = new PerformanceResourceTiming(token, requestedUrl, 'resource');
     Object.assign(data(entry), { timing: timingInfo, initiatorType, cacheMode, bodyInfo, responseStatus, deliveryType });
     enqueue(entry); bufferResource(entry); return entry;
   }
-  timerify(fn, options) { return timerify(fn, options); }
-  eventLoopUtilization(util1, util2) { return eventLoopUtilization(util1, util2); }
   get onresourcetimingbufferfull() { return this.#handler; }
   set onresourcetimingbufferfull(value) {
     if (this.#handler) this.removeEventListener('resourcetimingbufferfull', this.#handler);
@@ -327,14 +352,18 @@ class Performance extends EventTarget {
   }
   toJSON() { brand(this); return { nodeTiming: this.nodeTiming, timeOrigin: this.timeOrigin, eventLoopUtilization: this.eventLoopUtilization() }; }
 }
+// As in Node, the methods are the module's own functions, not wrappers.
+Object.defineProperties(Performance.prototype, {
+  timerify: { value: timerify, writable: true, enumerable: true, configurable: true },
+  eventLoopUtilization: { value: eventLoopUtilization, writable: true, enumerable: true, configurable: true },
+});
 const performance = new Performance(token);
 function brand(value) { if (value !== performance) throw error('ERR_INVALID_THIS', 'Value must be a Performance'); }
 for (const Constructor of [Performance, PerformanceEntry, PerformanceMark, PerformanceMeasure, PerformanceResourceTiming,
   PerformanceObserver, PerformanceObserverEntryList, PerformanceNodeTiming]) {
   Object.defineProperty(Constructor.prototype, Symbol.toStringTag, { value: Constructor.name, configurable: true });
 }
-// A Node entry (http, dns, net, ...) made by a builtin module or by the host.
-function enqueueNodeEntry(name, type, start, duration, detail) {
+function emitNodeEntry(name, type, start, duration, detail) {
   if (!supportedTypes.includes(type)) return;
   const entry = new PerformanceNodeEntry(token, name, type, start, duration, detail);
   if (detail && typeof detail === 'object') for (const key of Object.keys(detail)) {
@@ -342,11 +371,13 @@ function enqueueNodeEntry(name, type, start, duration, detail) {
   }
   enqueue(entry);
 }
-if (typeof host.performanceSetObserverCallback === 'function') host.performanceSetObserverCallback(enqueueNodeEntry);
-function hasObserver(type) {
-  for (const observer of observers) if (PerformanceObserver[observesType](observer, type)) return true;
+if (typeof host.performanceSetObserverCallback === 'function') host.performanceSetObserverCallback(emitNodeEntry);
+const internalEntries = require('internal/perf_observers');
+internalEntries.observing = (type) => {
+  for (const observer of observers) if (observer[observesType](type)) return true;
   return false;
-}
+};
+internalEntries.emit = (name, type, start, duration, detail) => emitNodeEntry(name, type, start - startTime, duration, detail);
 const constants = Object.freeze({
   NODE_PERFORMANCE_GC_MAJOR: 4, NODE_PERFORMANCE_GC_MINOR: 1, NODE_PERFORMANCE_GC_INCREMENTAL: 8, NODE_PERFORMANCE_GC_WEAKCB: 16,
   NODE_PERFORMANCE_GC_FLAGS_NO: 0, NODE_PERFORMANCE_GC_FLAGS_CONSTRUCT_RETAINED: 2, NODE_PERFORMANCE_GC_FLAGS_FORCED: 4,
@@ -356,9 +387,3 @@ const constants = Object.freeze({
 module.exports = { Performance, PerformanceEntry, PerformanceMark, PerformanceMeasure, PerformanceObserver, PerformanceObserverEntryList,
   PerformanceResourceTiming, monitorEventLoopDelay, createHistogram, createSlidingWindowHistogram, importHistogram,
   eventLoopUtilization, timerify, performance, constants };
-// Hooks for internal/perf/observe (builtin modules that report Node entries).
-Object.defineProperties(module.exports, {
-  _hasObserver: { value: hasObserver },
-  _enqueueNodeEntry: { value: enqueueNodeEntry },
-  _now: { value: now },
-});

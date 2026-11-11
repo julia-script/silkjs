@@ -3,9 +3,8 @@
 const { WritableStream } = require('internal/web/streams');
 const { Duplex } = require('stream');
 const { Buffer } = require('buffer');
-const { isArrayBuffer } = require('util/types');
-const compressionStreams = new WeakMap();
-const decompressionStreams = new WeakMap();
+const { isAnyArrayBuffer, isSharedArrayBuffer } = require('util/types');
+const { codes: { ERR_INVALID_ARG_TYPE, ERR_STREAM_NULL_VALUES } } = require('internal/streams/support');
 const formats = {
   deflate: ['createDeflate', 'createInflate'],
   'deflate-raw': ['createDeflateRaw', 'createInflateRaw'],
@@ -13,18 +12,21 @@ const formats = {
   brotli: ['createBrotliCompress', 'createBrotliDecompress'],
 };
 
+// Chunks are BufferSource values not backed by a SharedArrayBuffer (Compression
+// Streams spec). The rest is the codec's own Writable chunk validation, done
+// here so that a rejected chunk also errors the readable side.
 function bufferSource(chunk) {
-  if (typeof chunk === 'string') return Buffer.from(chunk);
   const view = ArrayBuffer.isView(chunk);
-  const buffer = view ? chunk.buffer : chunk;
-  if (!isArrayBuffer(buffer)) {
-    const error = new TypeError('The "chunk" argument must be a string, ArrayBuffer, Buffer, TypedArray, or DataView not backed by SharedArrayBuffer');
-    error.code = 'ERR_INVALID_ARG_TYPE';
-    throw error;
+  if (isSharedArrayBuffer(view ? chunk.buffer : chunk)) {
+    throw new ERR_INVALID_ARG_TYPE('chunk', ['ArrayBuffer', 'Buffer', 'TypedArray', 'DataView'], chunk);
   }
+  if (chunk === null) throw new ERR_STREAM_NULL_VALUES();
+  if (typeof chunk === 'string') return Buffer.from(chunk);
   // Constructing the view also rejects detached buffers. Preserve the byte
   // range of non-byte views instead of converting their numeric elements.
-  return Buffer.from(buffer, view ? chunk.byteOffset : 0, view ? chunk.byteLength : buffer.byteLength);
+  if (view) return Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+  if (isAnyArrayBuffer(chunk)) return Buffer.from(chunk);
+  throw new ERR_INVALID_ARG_TYPE('chunk', ['string', 'Buffer', 'TypedArray', 'DataView'], chunk);
 }
 
 function create(format, decompress) {
@@ -62,20 +64,17 @@ function create(format, decompress) {
   return { readable: pair.readable, writable };
 }
 
-function state(map, receiver) {
-  const value = map.get(receiver);
-  if (!value) throw new TypeError('Invalid compression stream receiver');
-  return value;
-}
 class CompressionStream {
-  constructor(format) { compressionStreams.set(this, create(format, false)); }
-  get readable() { return state(compressionStreams, this).readable; }
-  get writable() { return state(compressionStreams, this).writable; }
+  #transform;
+  constructor(format) { this.#transform = create(format, false); }
+  get readable() { return this.#transform.readable; }
+  get writable() { return this.#transform.writable; }
 }
 class DecompressionStream {
-  constructor(format) { decompressionStreams.set(this, create(format, true)); }
-  get readable() { return state(decompressionStreams, this).readable; }
-  get writable() { return state(decompressionStreams, this).writable; }
+  #transform;
+  constructor(format) { this.#transform = create(format, true); }
+  get readable() { return this.#transform.readable; }
+  get writable() { return this.#transform.writable; }
 }
 for (const Constructor of [CompressionStream, DecompressionStream]) {
   Object.defineProperties(Constructor.prototype, {
