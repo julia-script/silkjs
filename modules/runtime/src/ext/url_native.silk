@@ -1,0 +1,354 @@
+//! WHATWG URL natives (host 2800 to 2807), on silk.url. ext/web/url.js keeps each URL as the
+//! record these functions return, its ASCII href and the positions of its parts, and slices its
+//! getters from it. Arguments are strings: the JS side converts them first. Each input is read as
+//! UTF-8 with lone surrogates as U+FFFD, the USVString conversion.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.text.string { String }
+import silk.text.idna { Idna, IdnaOptions }
+import silk.url.url { Url, UrlComponents }
+import silk.url.host { UrlHost, UrlHostKind }
+import silk.url.percent { UrlPercent, UrlEncodeSet }
+import silk.url.form { UrlForm, UrlFormPair }
+import silk.num.u16
+import silk.num.u32
+import silk.num.usize
+import silkjs.js_realm { lendRealm }
+import silkjs.js_owned_value { Value, lendFor }
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_heap { HeapHeader }
+import silkjs.js_core_types { FrameSlots, NativeErrorKind }
+import silkjs.js_value { ValueBits }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_coercion_host { CoercionHooks }
+import silkjs.js_string_types { StringLengthError }
+import silkjs.js_strings { Strings }
+import silkjs.js_proxy_core as core
+import silkjs.js_std_support as common
+import silkjs.js_object_allocate as objects
+import silkjs.js_array_intrinsics_support as arrays
+import libs.core.owners as owners
+
+pub const BASE: u32 = 2800
+pub const PARSE: u32 = 2800
+pub const CAN_PARSE: u32 = 2801
+pub const UPDATE: u32 = 2802
+pub const FORM_PARSE: u32 = 2803
+pub const FORM_SERIALIZE: u32 = 2804
+pub const DOMAIN_TO_ASCII: u32 = 2805
+pub const DOMAIN_TO_UNICODE: u32 = 2806
+pub const IDNA_TO_ASCII: u32 = 2807
+pub const END: u32 = 2808
+
+
+pub fn handles(id: u32) -> bool {
+  return id >= BASE && id < END
+}
+
+// The UTF-8 of `value`, a string. WTF-8 surrogates (ED A0..BF xx) become U+FFFD, which has the same
+// length, so the bytes are valid UTF-8 for silk.url.
+unsafe effect fn utf8<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, value: ValueBits) -> List<u8>
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  if !value.isString() {
+    return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"URL native requires a string")
+  }
+  let mut bytes = run Strings.toUtf8(value, false)
+  let mut i: usize = 0
+  while i + 2 < bytes.length() {
+    if bytes.get(i) == 0xed && bytes.get(i + 1) >= 0xa0 {
+      bytes.set(i, 0xef)
+      bytes.set(i + 1, 0xbf)
+      bytes.set(i + 2, 0xbd)
+      i = i + 3
+    } else {
+      i = i + 1
+    }
+  }
+  return move bytes
+}
+
+unsafe effect fn latin1<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, bytes: &[u8]) -> ValueBits
+  ! JsException ? &mut Allocator {
+  let result = run Effect.result(Strings.fromLatin1(bytes))
+  return match move result {
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error } => run core.materialize(&mut engine, unsafe lendRealm(&context, context), move error)
+  }
+}
+
+unsafe effect fn unicode<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, bytes: &[u8]) -> ValueBits
+  ! JsException ? &mut Allocator {
+  let result = run Effect.result(Strings.fromUtf8(bytes))
+  return match move result {
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error } => run core.materialize(&mut engine, unsafe lendRealm(&context, context), move error)
+  }
+}
+
+fn position(value: Option<usize>) -> i32 {
+  return match value {
+    Option<usize>.Some { value: found } => usize.toI32(found)
+    Option<usize>.None => -1
+  }
+}
+
+fn hostCode(kind: UrlHostKind) -> i32 {
+  if kind == UrlHostKind.Absent { return 0 }
+  if kind == UrlHostKind.Domain { return 1 }
+  if kind == UrlHostKind.Ipv4 { return 2 }
+  if kind == UrlHostKind.Ipv6 { return 3 }
+  if kind == UrlHostKind.Opaque { return 4 }
+  return 5
+}
+
+// The record ext/web/url.js keeps for `url`: [href, schemeEnd, userStart, usernameEnd,
+// passwordEnd, hostStart, hostEnd, port, pathStart, queryStart, fragmentStart, hostKind], with -1
+// for an absent port, query or fragment.
+unsafe effect fn record<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, url: &Url) -> ValueBits
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let href = run unsafe latin1(&mut engine, context, String.utf8Bytes(url.href()))
+  let parts: UrlComponents = url.components()
+  if String.byteLength(url.href()) > 0x7fffffff {
+    unsafe owners.release(&mut engine, context, href)
+    return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Range, b"URL is too long")
+  }
+  let mut port: i32 = -1
+  match parts.port {
+    Option<u16>.Some { value } => { port = u16.toI32(value) }
+    Option<u16>.None => {}
+  }
+  let values: [i32; 11] = [
+    usize.toI32(parts.schemeEnd), usize.toI32(parts.userStart), usize.toI32(parts.usernameEnd),
+    usize.toI32(parts.passwordEnd), usize.toI32(parts.hostStart), usize.toI32(parts.hostEnd), port,
+    usize.toI32(parts.pathStart), position(parts.queryStart), position(parts.fragmentStart),
+    hostCode(parts.hostKind),
+  ]
+  let memory = engine.memory
+  let made = run Effect.result(objects.arrayWithCapacity(&mut engine, memory, unsafe lendRealm(&context, context), 12))
+  let array = match move made {
+    Result<ValueBits, OutOfMemoryError>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError>.Failure { error } => {
+      unsafe owners.release(&mut engine, context, href)
+      fail move error
+    }
+  }
+  let reserved = run Effect.result(arrays.reserve(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(array), 12))
+  match move reserved {
+    Result<(), OutOfMemoryError>.Success { .. } => ()
+    Result<(), OutOfMemoryError>.Failure { error } => {
+      unsafe owners.release(&mut engine, context, array)
+      unsafe owners.release(&mut engine, context, href)
+      fail move error
+    }
+  }
+  run arrays.appendReserved(unsafe lendFor(array), unsafe Value.adoptBits(href))
+  let mut i: usize = 0
+  while i < values.length {
+    run arrays.appendReserved(unsafe lendFor(array), Value.immediate(ValueBits.Int { value: values[i] }))
+    i = i + 1
+  }
+  arrays.publishLength(unsafe lendFor(array), 12)
+  return array
+}
+
+// Parses `href`, a serialization this binding returned. Returns None only if it was not one.
+effect fn reparse(href: &[u8]) -> Option<Url> ! OutOfMemoryError ? &mut Allocator {
+  return run Url.parse(unsafe String.fromUtf8Unchecked(href), Option<&Url>.none())
+}
+
+// Parses input against the base href, or with no base when `base` is undefined.
+unsafe effect fn parseWith<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, input: ValueBits, base: ValueBits) -> Option<Url>
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let text = run unsafe utf8(&mut engine, context, input)
+  let source = unsafe String.fromUtf8Unchecked(text.asSlice())
+  let noBase = match base { ValueBits.Undefined => true _ => false }
+  if noBase {
+    return run Url.parse(source, Option<&Url>.none())
+  }
+  let baseText = run unsafe utf8(&mut engine, context, base)
+  let parsedBase = run Url.parse(unsafe String.fromUtf8Unchecked(baseText.asSlice()), Option<&Url>.none())
+  return match move parsedBase {
+    Option<Url>.Some { value: found } => run Url.parse(source, Option<&Url>.some(&found))
+    Option<Url>.None => Option<Url>.none()
+  }
+}
+
+// The host parser's input for a hostname setter: up to the first `:` outside brackets, `/`, `?`,
+// `#`, or `\`, as the hostname state with a state override reads it for a special URL.
+fn hostnamePrefix(bytes: &[u8]) -> usize {
+  let mut brackets = false
+  let mut i: usize = 0
+  while i < bytes.length {
+    let value = bytes[i]
+    if value == 58 && !brackets { return i }
+    if value == 47 || value == 63 || value == 35 || value == 92 { return i }
+    if value == 91 { brackets = true }
+    if value == 93 { brackets = false }
+    i = i + 1
+  }
+  return bytes.length
+}
+
+// Node's url.domainToASCII: the host the hostname setter of `ws://x` gives, or nothing when it
+// fails.
+effect fn domainAscii(bytes: &[u8], output: &mut Bytes) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut cleaned = Bytes.make()
+  let end = hostnamePrefix(bytes)
+  let mut i: usize = 0
+  while i < end {
+    let value = bytes[i]
+    if value != 9 && value != 10 && value != 13 {
+      run Bytes.append(&mut cleaned, Slice.view<u8>(bytes, i, 1))
+    }
+    i = i + 1
+  }
+  if Bytes.length(&cleaned) == 0 { return false }
+  return match run UrlHost.parse(Bytes.asSlice(&cleaned), false, &mut output.*) {
+    Option<UrlHostKind>.Some { .. } => true
+    Option<UrlHostKind>.None => false
+  }
+}
+
+// The names and values of form text as one flat Array [name0, value0, name1, value1, ...].
+unsafe effect fn formArray<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, pairs: &[UrlFormPair]) -> ValueBits
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let memory = engine.memory
+  let array = run objects.arrayWithCapacity(&mut engine, memory, unsafe lendRealm(&context, context), pairs.length * 2)
+  let reserved = run Effect.result(arrays.reserve(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(array), usize.toI64(pairs.length * 2)))
+  match move reserved {
+    Result<(), OutOfMemoryError>.Success { .. } => ()
+    Result<(), OutOfMemoryError>.Failure { error } => {
+      unsafe owners.release(&mut engine, context, array)
+      fail move error
+    }
+  }
+  let mut i: usize = 0
+  while i < pairs.length * 2 {
+    let pair = &pairs[i / 2]
+    let text = if i % 2 == 0 { String.ownedUtf8Bytes(&pair.name) } else { String.ownedUtf8Bytes(&pair.value) }
+    let made = run Effect.result(Strings.fromUtf8(text))
+    match move made {
+      Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => {
+        run arrays.appendReserved(unsafe lendFor(array), unsafe Value.adoptBits(value))
+      }
+      Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error } => {
+        arrays.publishLength(unsafe lendFor(array), usize.toI64(i))
+        unsafe owners.release(&mut engine, context, array)
+        return run core.materialize(&mut engine, unsafe lendRealm(&context, context), move error)
+      }
+    }
+    i = i + 1
+  }
+  arrays.publishLength(unsafe lendFor(array), usize.toI64(i))
+  return array
+}
+
+pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, id: u32, argc: i32, argv: &FrameSlots) -> ValueBits
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let first = unsafe common.argument(argv, argc, 0)
+  if id == PARSE {
+    // (input, base | undefined) -> record | undefined
+    let parsed = run unsafe parseWith(&mut engine, context, first, unsafe common.argument(argv, argc, 1))
+    return match move parsed {
+      Option<Url>.Some { value: url } => run unsafe record(&mut engine, context, &url)
+      Option<Url>.None => ValueBits.Undefined
+    }
+  }
+  if id == CAN_PARSE {
+    let parsed = run unsafe parseWith(&mut engine, context, first, unsafe common.argument(argv, argc, 1))
+    return match move parsed {
+      Option<Url>.Some { .. } => ValueBits.Bool { value: true }
+      Option<Url>.None => ValueBits.Bool { value: false }
+    }
+  }
+  if id == UPDATE {
+    // (href, setter, value) -> the new record
+    let href = run unsafe utf8(&mut engine, context, first)
+    let setter = unsafe common.argument(argv, argc, 1)
+    let operation = match setter { ValueBits.Int { value } => value _ => 0 }
+    let input = run unsafe utf8(&mut engine, context, unsafe common.argument(argv, argc, 2))
+    let value = unsafe String.fromUtf8Unchecked(input.asSlice())
+    let parsed = run reparse(href.asSlice())
+    let mut url = match move parsed {
+      Option<Url>.Some { value: found } => move found
+      Option<Url>.None => { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Invalid URL") }
+    }
+    if operation == 1 { run url.setProtocol(value) }
+    else if operation == 2 { run url.setUsername(value) }
+    else if operation == 3 { run url.setPassword(value) }
+    else if operation == 4 { run url.setHost(value) }
+    else if operation == 5 { run url.setHostname(value) }
+    else if operation == 6 { run url.setPort(value) }
+    else if operation == 7 { run url.setPathname(value) }
+    else if operation == 8 { run url.setSearch(value) }
+    else if operation == 9 { run url.setHash(value) }
+    else { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Unknown URL setter") }
+    return run unsafe record(&mut engine, context, &url)
+  }
+  if id == DOMAIN_TO_ASCII || id == DOMAIN_TO_UNICODE {
+    let input = run unsafe utf8(&mut engine, context, first)
+    let mut ascii = Bytes.make()
+    if !(run domainAscii(input.asSlice(), &mut ascii)) {
+      return run unsafe latin1(&mut engine, context, b"")
+    }
+    if id == DOMAIN_TO_ASCII {
+      return run unsafe latin1(&mut engine, context, Bytes.asSlice(&ascii))
+    }
+    let mut output = String.make()
+    let _valid = run Idna.toUnicode(unsafe String.fromUtf8Unchecked(Bytes.asSlice(&ascii)), IdnaOptions.lenient(), &mut output)
+    return run unsafe unicode(&mut engine, context, String.ownedUtf8Bytes(&output))
+  }
+  if id == FORM_PARSE {
+    // (text) -> [name0, value0, ...]
+    let input = run unsafe utf8(&mut engine, context, first)
+    let pairs = run UrlForm.parseBytes(input.asSlice())
+    return run unsafe formArray(&mut engine, context, List<UrlFormPair>.asSlice(&pairs))
+  }
+  if id == FORM_SERIALIZE {
+    // (names and values joined by U+D800) -> form text. The entries are USVStrings, so each
+    // WTF-8 surrogate (ED A0 80) is a separator; they alternate between "=" and "&".
+    if !first.isString() {
+      return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"URL native requires a string")
+    }
+    let input = run Strings.toUtf8(first, false)
+    let bytes = input.asSlice()
+    let mut output = Bytes.make()
+    if bytes.length == 0 { return run unsafe latin1(&mut engine, context, Bytes.asSlice(&output)) }
+    let mut start: usize = 0
+    let mut index: usize = 0
+    let mut i: usize = 0
+    while i <= bytes.length {
+      let separator = i + 2 < bytes.length && bytes[i] == 0xed && bytes[i + 1] == 0xa0 && bytes[i + 2] == 0x80
+      if i == bytes.length || separator {
+        if index > 0 {
+          if index % 2 == 1 { run Bytes.append(&mut output, b"=") } else { run Bytes.append(&mut output, b"&") }
+        }
+        run UrlPercent.appendFormEncoded(&mut output, Slice.view<u8>(bytes, start, i - start), UrlEncodeSet.FormUrlencoded)
+        index = index + 1
+        if i == bytes.length { break }
+        i = i + 3
+        start = i
+      } else {
+        i = i + 1
+      }
+    }
+    return run unsafe latin1(&mut engine, context, Bytes.asSlice(&output))
+  }
+  if id == IDNA_TO_ASCII {
+    // UTS #46 ToASCII with every optional check off, for the legacy url.parse; '' on failure.
+    let input = run unsafe utf8(&mut engine, context, first)
+    let mut output = String.make()
+    let options = IdnaOptions { checkHyphens: false, checkBidi: false, checkJoiners: false, useStd3AsciiRules: false, verifyDnsLength: false }
+    if !(run Idna.toAscii(unsafe String.fromUtf8Unchecked(input.asSlice()), options, &mut output)) {
+      return run unsafe latin1(&mut engine, context, b"")
+    }
+    return run unsafe latin1(&mut engine, context, String.ownedUtf8Bytes(&output))
+  }
+  return ValueBits.Undefined
+}

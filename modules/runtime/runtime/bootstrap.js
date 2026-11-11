@@ -1002,7 +1002,8 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
   }
   internalRequire('internal/permission').initialize({ entrypoints });
   internalRequire('internal/startup_controls').initialize();
-  const heapProfileProblem = internalRequire('internal/heap_prof').start();
+  // Only a heap-prof option loads internal/heap_prof, and without one there is nothing to start.
+  const heapProfileProblem = moduleHas('internal/heap_prof') ? internalRequire('internal/heap_prof').start() : undefined;
   if (heapProfileProblem) return cliError(heapProfileProblem);
   if (host.enableSourceMaps || moduleHas('internal/source_maps')) process.setSourceMapsEnabled(!!host.enableSourceMaps);
   host.typeScriptMode = host.transformTypes ? 'transform' : host.stripTypes === false ? false : 'strip';

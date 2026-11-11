@@ -37,6 +37,8 @@ class IncomingMessage extends Readable {
     this.url = ''; this.method = null; this.statusCode = null; this.statusMessage = null;
     this.rawHeaders = []; this.rawTrailers = []; this.joinDuplicateHeaders = false;
     this._parser = null; this._headers = null; this._trailers = null;
+    // Node's flags; stream.destroy() uses them to recognise a server request.
+    this._consuming = false; this._dumped = false;
   }
   get connection() { return this.socket; }
   set connection(value) { this.socket = value; }
@@ -52,7 +54,7 @@ class IncomingMessage extends Readable {
     for (let i = 0; i < length; i++) raw.push(headers[i]);
     if (cached) collect(headers, false, this.joinDuplicateHeaders, cached, length);
   }
-  _read() { if (this._parser) this._parser.resume(); if (this.socket && !this.destroyed) { if (this._parser?.paused) this.socket.pause(); else this.socket.resume(); } }
+  _read() { if (!this._consuming) { this._readableState.readingMore = false; this._consuming = true; } if (this._parser) this._parser.resume(); if (this.socket && !this.destroyed) { if (this._parser?.paused) this.socket.pause(); else this.socket.resume(); } }
   _destroy(err, callback) {
     if (!this.complete || !this.readableEnded) {
       if (!this.aborted) { this.aborted = true; this.emit('aborted'); }
