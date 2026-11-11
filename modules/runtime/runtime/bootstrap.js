@@ -994,6 +994,11 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
   }
   if (host.experimentalWebStorage) internalRequire('internal/web/storage').install(globalThis, { localStorageFile: host.localStorageFile, inspect: !!host.experimentalStorageInspection });
   if (host.experimentalStreamIter) { internalRequire('fs/promises'); internalRequire('internal/fs_iter').install(); }
+  // http is in the heap image, whose global agent was made without this process's options.
+  if (internalRequire('internal/options').getOptionValue('--use-env-proxy')) {
+    const agent = internalRequire('_http_agent');
+    agent.globalAgent = internalRequire('internal/http').getGlobalAgent(process.env, agent.Agent);
+  }
   if (workerThreads.isMainThread) internalRequire('internal/trace_events').initialize(host.traceOptions);
   if (workerThreads.isMainThread && host.traceSigint) internalRequire('util').setTraceSigInt(true);
   if (process.env.NODE_COMPILE_CACHE) internalRequire('internal/compile_cache').initialize();
@@ -1422,7 +1427,7 @@ function loop() {
   return Number(process.exitCode) || 0;
 }
 const imageModules = ['fs', 'fs/promises', 'internal/fs_streams', 'internal/fs_utf8_stream', 'path', 'os',
-  'events', 'stream', 'stream/promises', 'string_decoder', 'util', 'assert', 'console', 'net', 'tty',
+  'events', 'stream', 'stream/promises', 'string_decoder', 'util', 'assert', 'console', 'net', 'tty', 'http',
   'internal/tty/write', 'url', 'internal/web/url', 'internal/encoding', 'internal/abort_controller',
   'internal/process/execution'];
 globalThis.__silkRuntime = {
