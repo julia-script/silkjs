@@ -99,8 +99,7 @@ function prepare(configPath) {
   const header = Buffer.alloc(16); header.write('SILKSEA1'); header.writeUInt32LE(manifest.length, 8);
   fs.writeFileSync(output, Buffer.concat([header, manifest, Buffer.alloc(align(16 + manifest.length) - 16 - manifest.length), ...chunks]));
 }
-const { parseEnvironment: environmentArgs, validateEnvironment } = require('internal/options');
-const reportOptions = require('internal/process_report');
+const { parseEnvironment: environmentArgs, validateEnvironment, parseArguments, optionFlag } = require('internal/options');
 function runMain(args, runtimeFlag, installRuntimeOptions, runPreloads, loadRuntimeEnvironment) {
   const { data, source, cache } = metadata();
   const flags = data.execArgv.slice();
@@ -111,31 +110,22 @@ function runMain(args, runtimeFlag, installRuntimeOptions, runPreloads, loadRunt
     environment.length = validateEnvironment(environment);
     flags.push(...environment);
   }
+  let entries;
   if (data.execArgvExtension === 'cli') {
-    let index = 0;
-    while (index < args.length && args[index].startsWith('-') && args[index] !== '-') {
-      if (args[index] === '--') { index++; break; }
-      const flag = args[index++];
-      flags.push(flag);
-      if ((['-r', '--require', '--import', '-C', '--conditions', '--localstorage-file', '--trace-event-categories',
-        '--trace-event-file-pattern', '--env-file', '--env-file-if-exists'].includes(flag) || reportOptions.isValueOption(flag)) && index < args.length) flags.push(args[index++]);
-    }
-    appArgs = args.slice(index);
+    const parsed = parseArguments(flags.concat(args), false);
+    if (parsed.error !== undefined) throw error('ERR_INVALID_ARG_VALUE', parsed.error);
+    appArgs = args.slice(Math.max(0, parsed.index - flags.length));
+    flags.push(...parsed.execArgv.slice(flags.length));
+    entries = parsed.entries;
+  } else {
+    const parsed = parseArguments(flags, false);
+    if (parsed.error !== undefined) throw error('ERR_INVALID_ARG_VALUE', parsed.error);
+    entries = parsed.entries;
   }
-  for (let index = 0; index < flags.length; index++) {
-    let flag = flags[index];
-    if (['-r', '--require', '--import', '-C', '--conditions', '--localstorage-file', '--trace-event-categories',
-      '--trace-event-file-pattern', '--env-file', '--env-file-if-exists'].includes(flag) || reportOptions.isValueOption(flag)) {
-      const value = flags[++index];
-      if (value === undefined || value === '' || value.startsWith('-'))
-        throw error('ERR_INVALID_ARG_VALUE', flag + ' requires an argument');
-      flag = (flag === '-r' ? '--require' : flag === '-C' ? '--conditions' : flag) + '=' + value;
-    }
-    if (['--require=', '--import=', '--conditions=', '--localstorage-file=', '--env-file=', '--env-file-if-exists='].includes(flag) ||
-        (flag.endsWith('=') && reportOptions.isValueOption(flag.slice(0, -1))))
-      throw error('ERR_INVALID_ARG_VALUE', flag + ' requires an argument');
-    if (flag.startsWith('--env-file=') || flag.startsWith('--env-file-if-exists=')) continue;
-    if (!runtimeFlag(flag)) throw error('ERR_NOT_SUPPORTED', `Unsupported SEA runtime option: ${flag}`);
+  for (const entry of entries) {
+    if (entry.name === '--env-file' || entry.name === '--env-file-if-exists') continue;
+    const flag = optionFlag(entry);
+    if (!runtimeFlag(flag) && !entry.implied) throw error('ERR_NOT_SUPPORTED', `Unsupported SEA runtime option: ${flag}`);
   }
   process.execArgv = flags;
   installRuntimeOptions(flags);

@@ -15,6 +15,7 @@ const lockManager = lazy('internal/worker/locks');
 const runtimeOptions = lazy('internal/options');
 const path = lazy('path');
 const validators = lazy('internal/validators');
+const nodeErrors = lazy('internal/errors');
 function workerPathError(filename) {
   return clone().codedError('ERR_WORKER_PATH', "The worker script or module filename must be an absolute path or a relative path starting with './' or '../'." +
     (filename.startsWith('file://') ? ' Wrap file:// URLs with `new URL`.' : '') +
@@ -217,8 +218,12 @@ function workerOptions(filename, options) {
   } else {
     result.execArgv = host.initialExecArgv.slice();
   }
-  try { runtimeOptions().validateWorker(result.execArgv, explicitExecArgv); }
-  catch (error) { throw clone().codedError('ERR_WORKER_INVALID_EXEC_ARGV', error.message, Error); }
+  if (explicitExecArgv) {
+    let invalid;
+    try { invalid = runtimeOptions().invalidWorkerArguments(result.execArgv); }
+    catch (error) { throw new (nodeErrors().codes.ERR_WORKER_INVALID_EXEC_ARGV)([error.message]); }
+    if (invalid.length) throw new (nodeErrors().codes.ERR_WORKER_INVALID_EXEC_ARGV)(invalid);
+  }
   if (explicitEnv || explicitExecArgv) {
     result.runtimeArgs = environment.slice(0, accepted).concat(result.execArgv);
   } else {

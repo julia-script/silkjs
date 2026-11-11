@@ -80,6 +80,9 @@ class Mac extends Transform {
     try { id = call('macCreate', args); }
     catch (e) {
       if (e.code === 'ERR_INVALID_ARG_VALUE' || e.code === 'ERR_CRYPTO_INVALID_MAC') throw Object.assign(new TypeError(e.message), { code: e.code });
+      // EVP_MAC_init failed without an OpenSSL error (Node's ThrowCryptoError
+      // with its own message).
+      if (e.code === 'ERR_OSSL_CRYPTO_OPERATION_FAILED') throw error('ERR_CRYPTO_OPERATION_FAILED', 'Failed to initialize MAC');
       throw e;
     }
     try { super(options); } catch (e) { call('release', [id]); throw e; }
@@ -113,7 +116,8 @@ function getMacs() {
 
 function kemKey(value, privateOnly) {
   const crypto = require('crypto');
-  const { unwrap } = require('internal/crypto_webcrypto');
+  const keys = require('internal/crypto/keys');
+  const unwrap = item => keys.isCryptoKey(item) ? c.keyObjectFromHandle(keys.getCryptoKeyType(item), keys.getCryptoKeyHandle(item)) : undefined;
   let key = unwrap(value) || value, owned = false;
   if (!(key instanceof crypto.KeyObject)) {
     if (key && key.key instanceof crypto.KeyObject) key = key.key;
@@ -136,17 +140,32 @@ function encapsulate(key, callback) {
   const prepared = kemKey(key, false);
   try {
     const args = [handle(prepared.key)];
-    if (callback !== undefined) { submit('encapsulate', args, callback, encapsulated); return; }
-    return encapsulated(call('encapsulate', args));
+    if (callback !== undefined) {
+      submit('encapsulate', args, (err, value) => callback(err ? error('ERR_CRYPTO_OPERATION_FAILED', 'Deriving bits failed') : null, value), encapsulated);
+      return;
+    }
+    let result;
+    try { result = call('encapsulate', args); }
+    catch { throw error('ERR_CRYPTO_OPERATION_FAILED', 'Failed to perform encapsulation'); }
+    return encapsulated(result);
   } finally { if (prepared.owned) release(prepared.key); }
 }
 function decapsulate(key, ciphertext, callback) {
   if (callback !== undefined) c.callback(callback);
   const prepared = kemKey(key, true);
   try {
+    ciphertext = require('internal/crypto/util').getArrayBufferOrView(ciphertext, 'ciphertext');
     const args = [handle(prepared.key), packed(bytes(ciphertext, undefined, 'ciphertext'))];
-    if (callback !== undefined) { submit('decapsulate', args, callback, Buffer.from); return; }
-    return Buffer.from(call('decapsulate', args));
+    // KEMDecapsulateJob: a sync failure names the step, an async one is
+    // the job's generic DeriveBits failure.
+    if (callback !== undefined) {
+      submit('decapsulate', args, (err, value) => callback(err ? error('ERR_CRYPTO_OPERATION_FAILED', 'Deriving bits failed') : null, value), Buffer.from);
+      return;
+    }
+    let result;
+    try { result = call('decapsulate', args); }
+    catch { throw error('ERR_CRYPTO_OPERATION_FAILED', 'Failed to perform decapsulation'); }
+    return Buffer.from(result);
   } finally { if (prepared.owned) release(prepared.key); }
 }
 const rawAlgorithms = {
@@ -170,6 +189,11 @@ c.providerRawImport = function providerRawImport(options, type) {
   const format = rawFormat(options.format);
   if (type === 'private' && format === 0) throw error('ERR_INVALID_ARG_VALUE', 'A private key cannot use raw-public format', TypeError);
   const data = binary(options.key, 'key.key');
+  // Node's binding reads the name as a C string, so an embedded NUL ends it
+  // and the name is never valid.
+  if (typeof options.asymmetricKeyType === 'string' && options.asymmetricKeyType.includes('\0')) {
+    throw error('ERR_INVALID_ARG_VALUE', `Invalid asymmetricKeyType: ${options.asymmetricKeyType.split('\0')[0]}`, TypeError);
+  }
   const algorithm = c.name(options.asymmetricKeyType, 'key.asymmetricKeyType');
   let curve = '';
   if (algorithm === 'ec') curve = c.name(options.namedCurve, 'key.namedCurve');
@@ -178,7 +202,8 @@ c.providerRawImport = function providerRawImport(options, type) {
   try { id = call('providerRawImport', [rawAlgorithms[algorithm], packed(data), format, curve, type === 'public' ? 1 : 0]); }
   catch (e) {
     if (e.code === 'ERR_INVALID_ARG_VALUE' || e.code === 'ERR_CRYPTO_INVALID_CURVE') throw Object.assign(new TypeError(e.message), { code: e.code });
-    throw e;
+    // ImportRawKey: any other failure is Node's throw_invalid.
+    throw error('ERR_INVALID_ARG_VALUE', 'Invalid key data', TypeError);
   }
   return c.keyFromHandle(type, id);
 };

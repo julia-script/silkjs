@@ -28,7 +28,6 @@ const {
   Array,
   ArrayBuffer,
   ArrayIsArray,
-  ArrayPrototypeIncludes,
   ArrayPrototypePush,
   BigInt,
   BigInt64Array,
@@ -173,23 +172,32 @@ function isURL(value) {
 // runtime's crypto modules own the key records, so equality compares those
 // records directly, never the user-replaceable KeyObject.prototype.equals.
 let cryptoCore;
-let cryptoWebcrypto;
+let cryptoKeys;
 function keyObjectEquals(a, b) {
   cryptoCore ??= require('internal/crypto_core');
   return cryptoCore.keyObjectEquals(a, b);
 }
-// The KeyObject record behind a CryptoKey.
-function cryptoKeyObject(key) {
-  cryptoWebcrypto ??= require('internal/crypto_webcrypto');
-  return cryptoWebcrypto.unwrap(key);
-}
-// CryptoKey usages are a set (Node compares the usages bit mask).
-function sameUsages(a, b) {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    if (!ArrayPrototypeIncludes(b, a[i])) return false;
-  }
-  return true;
+// Node's comparisons.js: CryptoKeys compare by their internal slots
+// (type, extractable, algorithm, usages mask, key handles and seed).
+function cryptoKeyEquals(a, b, mode, memos) {
+  cryptoKeys ??= require('internal/crypto/keys');
+  const {
+    getCryptoKeyType, getCryptoKeyExtractable, getCryptoKeyAlgorithm,
+    getCryptoKeyUsagesMask, getCryptoKeyHandle, getCryptoKeySecondaryHandle,
+    getCryptoKeySeedData,
+  } = cryptoKeys;
+  const secondaryA = getCryptoKeySecondaryHandle(a);
+  const secondaryB = getCryptoKeySecondaryHandle(b);
+  const seedA = getCryptoKeySeedData(a), seedB = getCryptoKeySeedData(b);
+  return getCryptoKeyType(a) === getCryptoKeyType(b) &&
+    getCryptoKeyExtractable(a) === getCryptoKeyExtractable(b) &&
+    innerDeepEqual(getCryptoKeyAlgorithm(a), getCryptoKeyAlgorithm(b), mode, memos) &&
+    getCryptoKeyUsagesMask(a) === getCryptoKeyUsagesMask(b) &&
+    getCryptoKeyHandle(a).equals(getCryptoKeyHandle(b)) &&
+    (secondaryA === undefined) === (secondaryB === undefined) &&
+    (secondaryA === undefined || secondaryA.equals(secondaryB)) &&
+    (seedA === undefined) === (seedB === undefined) &&
+    (seedA === undefined || innerDeepEqual(seedA, seedB, mode, memos));
 }
 
 const kStrict = 2;
@@ -474,13 +482,7 @@ function objectComparisonStart(val1, val2, mode, memos) {
       return false;
     }
   } else if (isCryptoKey(val1)) {
-    if (!isCryptoKey(val2) ||
-      val1.type !== val2.type ||
-      val1.extractable !== val2.extractable ||
-      !innerDeepEqual(val1.algorithm, val2.algorithm, mode, memos) ||
-      !sameUsages(val1.usages, val2.usages) ||
-      !keyObjectEquals(cryptoKeyObject(val1), cryptoKeyObject(val2))
-    ) {
+    if (!isCryptoKey(val2) || !cryptoKeyEquals(val1, val2, mode, memos)) {
       return false;
     }
   } else if (isBoxedPrimitive(val2) ||

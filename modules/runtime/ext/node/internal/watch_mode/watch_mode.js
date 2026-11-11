@@ -121,7 +121,4 @@ function start({ args, paths = [], preserveOutput = false, killSignal = 'SIGTERM
   return watcher;
 }
 
-module.exports = { start, withoutWatchOptions, optionEntries: [
-  ...Array.from(booleanOptions, name => [name, false]),
-  ...Array.from(valueOptions, name => [name, true]),
-] };
+module.exports = { start, withoutWatchOptions };
