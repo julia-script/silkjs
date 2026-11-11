@@ -158,6 +158,8 @@ class KeyObject {
   toCryptoKey(algorithm, extractable, keyUsages) { if (!keyObjects.has(this)) throw error('ERR_INVALID_THIS', 'Value of "this" must be of type KeyObject', TypeError); return require('internal/crypto_webcrypto').toCryptoKey(this, algorithm, extractable, keyUsages); }
   static from(key) { const obj = require('internal/crypto_webcrypto').unwrap(key); if (!obj) throw invalid('key', 'a CryptoKey'); return obj; }
 }
+// As Node's internal/crypto/keys.js.
+Object.defineProperty(KeyObject.prototype, Symbol.toStringTag, { value: 'KeyObject', configurable: true });
 function createSecretKey(key, encoding) { return new KeyObject(keyToken, 'secret', bytes(key, encoding)); }
 function importKey(key, type) {
   if (key instanceof KeyObject) { if (type === 'public' && key.type === 'private') return importKey({ key: key.export({ format: 'der', type: 'pkcs8' }), format: 'der' }, 'public'); if (key.type !== type) throw error('ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE', `Expected ${type} key`); return key; }

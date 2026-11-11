@@ -445,6 +445,8 @@ host.writeStartupDiagnostic = host.stderr.write;
 globalThis.process = { platform: host.platform, env: host.env, nextTick: host.nextTick, emitWarning: value => host.stderr.write(String(value) + '\n') };
 const EventEmitter = internalRequire('events');
 const process = new EventEmitter();
+// As Node's bootstrap/node.js: Object.prototype.toString reports [object process].
+Object.defineProperty(process, Symbol.toStringTag, { value: 'process', writable: true, enumerable: false, configurable: false });
 defineGlobalAccessor('process', process);
 let startTime = native.runtimeStartTime;
 const performanceMilestones = {
