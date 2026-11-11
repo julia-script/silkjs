@@ -237,7 +237,9 @@ function loaderWorkerArguments(args) {
     const { name } = entry;
     if (entry.implied || entry.type === undefined) continue;
     const flag = optionFlag(entry);
-    if ((!table.options.get(name)[1] && name !== '--experimental-test-module-mocks') || processOption(flag.split('=', 1)[0]) ||
+    // Process-wide options already hold for every thread, and a Worker may not be given them.
+    const [, allowedInEnvironment, , perProcess] = table.options.get(name);
+    if ((!allowedInEnvironment && name !== '--experimental-test-module-mocks') || perProcess || processOption(flag.split('=', 1)[0]) ||
         loaderWorkerExcluded.has(name) || name.startsWith('--test-coverage-')) continue;
     result.push(flag);
   }
