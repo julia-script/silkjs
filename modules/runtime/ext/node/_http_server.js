@@ -5,7 +5,7 @@ const { OutgoingMessage, validateHeaderName, validateHeaderValue } = require('_h
 const { IncomingMessage } = require('_http_incoming');
 const { Parser, error, invalidValue, hasToken, setParserOptions } = require('internal/http/parser');
 const { STATUS_CODES } = require('internal/http/constants');
-const diagnostics = require('internal/dc');
+const diagnostics = require('internal/host').diagnostics;
 
 class ServerResponse extends OutgoingMessage {
   constructor(req, options = {}) {

@@ -271,5 +271,5 @@ class TracingChannel {
 function tracingChannel(nameOrChannels) { return new TracingChannel(nameOrChannels); }
 
 module.exports = { channel, hasSubscribers, subscribe, tracingChannel, unsubscribe, Channel };
-// Built-in publishers find the channels through internal/dc once this module is loaded.
+// Built-in publishers find the channels through host.diagnostics once this module is loaded.
 require('internal/host').diagnosticsChannel = module.exports;

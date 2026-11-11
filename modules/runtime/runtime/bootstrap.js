@@ -240,6 +240,23 @@ const completionsPending = () => completions.length !== completionHead;
 // Compound native operations finish through promises, but their public
 // callbacks are I/O completions, not microtasks. Dispatch them outside drainJobs.
 host.enqueueIOCompletion = callback => completions.push(callback);
+// Built-in modules publish to diagnostics channels through these, so a process that never
+// loads diagnostics_channel pays one property read per publish site. No channel can have a
+// subscriber before diagnostics_channel loads (it sets host.diagnosticsChannel): subscribing
+// needs its exports, and the node.diagnostics_channel trace category loads it when enabled.
+host.diagnostics = {
+  publish(name, message) {
+    const dc = host.diagnosticsChannel;
+    if (dc !== undefined && dc.hasSubscribers(name)) dc.channel(name).publish(message);
+  },
+  // The tracing channel for name, or undefined when nothing observes any of its events.
+  tracing(name) {
+    const dc = host.diagnosticsChannel;
+    if (dc === undefined) return undefined;
+    const channels = dc.tracingChannel(name);
+    return channels.hasSubscribers ? channels : undefined;
+  },
+};
 host.nextTick = (callback, ...args) => {
   if (typeof callback !== 'function') throw Object.assign(new TypeError('The callback argument must be a function'), { code: 'ERR_INVALID_ARG_TYPE' });
   ticks.push(callback, args, resource('TickObject'));

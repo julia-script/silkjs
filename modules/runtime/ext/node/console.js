@@ -1,7 +1,7 @@
 'use strict';
 
 const host = require('internal/host');
-const diagnostics = require('internal/dc');
+const diagnostics = require('internal/host').diagnostics;
 const types = require('util/types');
 // The formatter loads with the first value that needs it: text alone does not.
 let util;

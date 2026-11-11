@@ -6,7 +6,7 @@ const { OutgoingMessage } = require('_http_outgoing');
 const { IncomingMessage } = require('_http_incoming');
 const { Agent } = require('_http_agent');
 const { Parser, token, error, setParserOptions } = require('internal/http/parser');
-const diagnostics = require('internal/dc');
+const diagnostics = require('internal/host').diagnostics;
 
 class ClientRequest extends OutgoingMessage {
   constructor(input, options, callback) {

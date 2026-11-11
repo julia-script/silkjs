@@ -7,7 +7,7 @@ const host = require('internal/host');
 const { EventEmitter } = require('events');
 const { Buffer } = require('buffer');
 const { AsyncResource } = require('async_hooks');
-const diagnostics = require('internal/dc');
+const diagnostics = require('internal/host').diagnostics;
 const dns = require('dns');
 
 function error(code, message, Type = Error) {

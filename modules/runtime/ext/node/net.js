@@ -3,7 +3,7 @@
 const { Duplex } = require('stream');
 const { EventEmitter } = require('events');
 const { Buffer } = require('buffer');
-const diagnostics = require('internal/dc');
+const diagnostics = require('internal/host').diagnostics;
 const { Transport, error: nativeError, native } = require('internal/net/transport');
 
 let defaultAutoSelectFamily = true;

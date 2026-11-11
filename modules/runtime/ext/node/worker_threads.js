@@ -4,7 +4,7 @@ const host = require('internal/host');
 const EventEmitter = require('events');
 const { AsyncResource } = require('async_hooks');
 const { Buffer } = require('buffer');
-const diagnostics = require('internal/dc');
+const diagnostics = require('internal/host').diagnostics;
 // A main thread that never starts a worker needs none of these; each loads on first use.
 const lazy = name => { let loaded; return () => loaded ??= require(name); };
 const clone = lazy('internal/worker/clone');
