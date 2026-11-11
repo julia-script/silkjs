@@ -85,6 +85,7 @@ const {
     ERR_INVALID_ARG_TYPE,
     ERR_METHOD_NOT_IMPLEMENTED,
     ERR_OUT_OF_RANGE,
+    ERR_STREAM_ITER_MISSING_FLAG,
     ERR_STREAM_PUSH_AFTER_EOF,
     ERR_STREAM_UNSHIFT_AFTER_END_EVENT,
     ERR_UNKNOWN_ENCODING,
@@ -1819,7 +1820,7 @@ let webStreamsAdapters;
 // Lazy to avoid circular references
 function lazyWebStreams() {
   if (webStreamsAdapters === undefined)
-    webStreamsAdapters = require('internal/streams/web-adapters');
+    webStreamsAdapters = require('internal/webstreams/adapters');
   return webStreamsAdapters;
 }
 
@@ -1867,11 +1868,7 @@ Readable.wrap = function(src, options) {
   Readable.prototype[toAsyncStreamable] = function() {
     if (createBatchedAsyncIterator === undefined) {
       if (!getOptionValue('--experimental-stream-iter')) {
-        // ERR_STREAM_ITER_MISSING_FLAG: built here until internal/errors
-        // provides every Node error code to the stream modules.
-        const error = new TypeError('The stream/iter API requires the --experimental-stream-iter flag');
-        error.code = 'ERR_STREAM_ITER_MISSING_FLAG';
-        throw error;
+        throw new ERR_STREAM_ITER_MISSING_FLAG();
       }
       ({
         createBatchedAsyncIterator,

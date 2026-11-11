@@ -182,7 +182,7 @@ let webStreamsAdapters;
 // Lazy to avoid circular references
 function lazyWebStreams() {
   if (webStreamsAdapters === undefined)
-    webStreamsAdapters = require('internal/streams/web-adapters');
+    webStreamsAdapters = require('internal/webstreams/adapters');
   return webStreamsAdapters;
 }
 
