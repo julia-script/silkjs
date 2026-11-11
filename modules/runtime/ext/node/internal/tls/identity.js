@@ -26,9 +26,40 @@ const { domainToASCII, URL } = require('url');
 const { isArray: ArrayIsArray } = Array;
 const { parse: JSONParse } = JSON;
 const { fromCharCode: StringFromCharCode } = String;
+// cares_wrap canonicalizeIP: inet_pton then uv_inet_ntop; undefined when not an address.
 function canonicalizeIP(ip) {
-  if (net.isIP(ip) === 6) return new URL('http://[' + ip + ']/').hostname.slice(1, -1);
-  return ip;
+  const family = net.isIP(ip);
+  if (family === 4) return ip;
+  if (family !== 6) return undefined;
+  let text = ip;
+  const dotted = /(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(text);
+  if (dotted) {
+    const [a, b, c, d] = dotted.slice(1).map(Number);
+    text = text.slice(0, dotted.index) + ((a << 8) | b).toString(16) + ':' + ((c << 8) | d).toString(16);
+  }
+  const [head, tail] = text.includes('::') ? text.split('::') : [text, null];
+  const left = head ? head.split(':') : [], right = tail ? tail.split(':') : [];
+  const words = [...left, ...Array(tail === null ? 0 : 8 - left.length - right.length).fill('0'), ...right].map(w => parseInt(w, 16));
+  // The longest run of two or more zero words becomes '::' (uv's inet_ntop6).
+  let best = { base: -1, len: 0 }, cur = { base: -1, len: 0 };
+  for (let i = 0; i < 8; i++) {
+    if (words[i] === 0) { if (cur.base === -1) cur = { base: i, len: 1 }; else cur.len++; }
+    else if (cur.base !== -1) { if (best.base === -1 || cur.len > best.len) best = cur; cur = { base: -1, len: 0 }; }
+  }
+  if (cur.base !== -1 && (best.base === -1 || cur.len > best.len)) best = cur;
+  if (best.base !== -1 && best.len < 2) best = { base: -1, len: 0 };
+  let out = '';
+  for (let i = 0; i < 8; i++) {
+    if (best.base !== -1 && i >= best.base && i < best.base + best.len) { if (i === best.base) out += ':'; continue; }
+    if (i !== 0) out += ':';
+    if (i === 6 && best.base === 0 && (best.len === 6 || (best.len === 7 && words[7] !== 1) || (best.len === 5 && words[5] === 0xffff))) {
+      out += `${words[6] >> 8}.${words[6] & 255}.${words[7] >> 8}.${words[7] & 255}`;
+      break;
+    }
+    out += words[i].toString(16);
+  }
+  if (best.base !== -1 && best.base + best.len === 8) out += ':';
+  return out;
 }
 class ERR_TLS_CERT_ALTNAME_FORMAT extends SyntaxError {
   constructor() { super('Invalid subject alternative name string'); this.code = 'ERR_TLS_CERT_ALTNAME_FORMAT'; }

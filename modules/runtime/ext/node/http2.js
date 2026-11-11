@@ -56,8 +56,8 @@ class Http2SecureServer extends Http2Server {
     super(options, listener); this.removeAllListeners('connection');
     require('internal/tls/server').initialize(this, options);
     this.on('secureConnection', socket => {
-      if (socket.alpnProtocol === 'h2') { accept(this, socket); return; }
-      if (options.allowHTTP1 && (!socket.alpnProtocol || socket.alpnProtocol === 'http/1.1')) { this._connection(socket); return; }
+      if (socket.alpnProtocol === 'h2') { accept(this, socket); socket.resume(); return; }
+      if (options.allowHTTP1 && (!socket.alpnProtocol || socket.alpnProtocol === 'http/1.1')) { this._connection(socket); socket.resume(); return; }
       if (!this.emit('unknownProtocol', socket)) {
         const timer = setTimeout(() => socket.destroy(), unknownProtocolTimeout);
         timer.unref(); socket.once('close', () => clearTimeout(timer));

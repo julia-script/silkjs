@@ -53,7 +53,8 @@ class Transport {
       const request = this.requests.get(payload);
       if (!request) return;
       this.requests.delete(payload);
-      request.callback(status < 0 ? error(status, type === 4 ? 'write' : 'shutdown') : null);
+      // Node's afterShutdown ignores the status: a peer that already left is not an error.
+      request.callback(type === 4 && status < 0 ? error(status, 'write') : null);
       return;
     }
     if (type === 1 && status < 0) this.reading = false;

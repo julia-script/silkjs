@@ -4,6 +4,7 @@ const host = require('internal/host');
 const reportOptions = require('internal/process_report');
 const startupControls = require('internal/startup_controls');
 const permission = require('internal/permission');
+const tlsOptions = require('internal/tls/options');
 
 // Inspector enable flags accept an optional address only with "="; unlike
 // ordinary booleans that suffix must survive normalization.
@@ -58,6 +59,7 @@ const environmentOptions = new Map([
   ...reportOptions.optionEntries,
   ...startupControls.optionEntries,
   ...permission.optionEntries,
+  ...tlsOptions.optionEntries,
   ...[...inspectorEnableOptions, '--no-inspect', '--no-inspect-brk', '--no-inspect-wait',
     '--experimental-inspector-network-resource', '--no-experimental-inspector-network-resource'].map(name => [name, false]),
   ['--inspect-port', true], ['--debug-port', true],
@@ -266,7 +268,7 @@ function getOptionValue(name) {
     case '--inspect-wait': return !!host.inspectorOptions?.wait;
     case '--inspect-port': return { host: host.inspectorOptions?.host ?? '127.0.0.1', port: host.inspectorOptions?.port ?? 9229 };
     case '--localstorage-file': return host.localStorageFile;
-    default: return startupControls.getOptionValue(name);
+    default: return startupControls.getOptionValue(name) ?? tlsOptions.getOptionValue(name);
   }
 }
 
