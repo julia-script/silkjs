@@ -25,7 +25,9 @@
 'use strict';
 
 const {
+  ArrayFrom,
   ArrayPrototypePush,
+  ArrayPrototypeSort,
   Error,
   ErrorCaptureStackTrace,
   FunctionPrototypeSymbolHasInstance,
@@ -40,6 +42,7 @@ const {
   Promise,
   ReflectApply,
   ReflectConstruct,
+  SafeMap,
   SafeSet,
   SymbolPrototypeGetDescription,
   StringPrototypeReplace,
@@ -352,12 +355,39 @@ function getSystemErrorName(err) {
   return require('internal/util_public/system').getSystemErrorName(err);
 }
 
+const experimentalWarnings = new SafeSet();
+function emitExperimentalWarning(feature, messagePrefix, code, ctor) {
+  if (experimentalWarnings.has(feature)) return;
+  experimentalWarnings.add(feature);
+  let msg = `${feature} is an experimental feature and might change at any time`;
+  if (messagePrefix) {
+    msg = messagePrefix + msg;
+  }
+  process.emitWarning(msg, 'ExperimentalWarning', code, ctor);
+}
+
+function filterDuplicateStrings(items, low) {
+  const map = new SafeMap();
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    const key = StringPrototypeToLowerCase(item);
+    if (low) {
+      map.set(key, key);
+    } else {
+      map.set(key, item);
+    }
+  }
+  return ArrayPrototypeSort(ArrayFrom(map.values()));
+}
+
 module.exports = {
   assignFunctionName,
   customInspectSymbol: SymbolFor('nodejs.util.inspect.custom'),
   customPromisifyArgs: kCustomPromisifyArgsSymbol,
   deprecate,
   deprecateInstantiation,
+  emitExperimentalWarning,
+  filterDuplicateStrings,
   encodingsMap,
   getDeprecationWarningEmitter,
   getSystemErrorName,
