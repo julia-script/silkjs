@@ -26,6 +26,8 @@ const define = (name, factory) => {
       name === 'internal/web/wasm' || name.startsWith('internal/web/wasm/'))
     realmSources.set(name, factory);
 };
+// process.moduleLoadList: every built-in module this realm has run, in load order.
+const moduleLoadList = [];
 function internalRequire(request, parent = '') {
   if (stringStartsWith(request, 'node:')) request = stringSlice(request, 5);
   if (stringStartsWith(request, '.')) {
@@ -46,6 +48,7 @@ function internalRequire(request, parent = '') {
   let factory = factoryGet(request);
   if (factory === undefined) throw Object.assign(new Error('Unknown builtin: ' + request), { code: 'ERR_UNKNOWN_BUILTIN_MODULE' });
   const module = { exports: {} }; moduleSet(request, module);
+  moduleLoadList.push('NativeModule ' + request);
   try {
     if (typeof factory === 'number') {
       factory = native.compileBuiltin(factory, 'node:' + request);
@@ -65,6 +68,18 @@ for (const name of ['dispose', 'asyncDispose']) {
   if (Symbol[name] === undefined) Object.defineProperty(Symbol, name, { value: Symbol.for('nodejs.' + name) });
 }
 const host = { ...native, rawOS, rawStd };
+host.builtinLoaded = moduleHas;
+// Source maps are off until something loads the module to switch them on, so
+// registering a source before that only matters when coverage wants every map.
+host.registerSource = (filename, source, metadata) => {
+  if (!moduleHas('internal/source_maps') && !host.env.NODE_V8_COVERAGE) return undefined;
+  return internalRequire('internal/source_maps').registerSource(filename, source, metadata);
+};
+// pathToFileURL(path).href for the plain absolute paths that need no escaping.
+const plainPath = /^\/[A-Za-z0-9\/._~+@=,-]*$/;
+const dotSegment = /\/\.\.?(?:\/|$)/;
+const fileHref = path => host.platform !== 'win32' && plainPath.test(path) && !dotSegment.test(path)
+  ? 'file://' + path : internalRequire('url').pathToFileURL(path).href;
 const inspectorNativeOperations = Array.from({ length: 32 }, (_, index) => native['inspectorNative' + index]);
 host.inspectorNative = (operation, ...args) => inspectorNativeOperations[operation](...args);
 host.inspectorEntry = wrapper => host.inspectorNative(15, wrapper);
@@ -423,6 +438,7 @@ process.setSourceMapsEnabled = function setSourceMapsEnabled(enabled) {
     nodeModules: enabled, generatedCode: enabled,
   });
 };
+process.moduleLoadList = moduleLoadList;
 define('process', module => { module.exports = process; });
 internalRequire('internal/napi').install(host, process);
 const eventGlobals = internalRequire('internal/path_events/event_target');
@@ -463,11 +479,16 @@ if (workerThreads.isMainThread) {
 }
 workerThreads._install(process, workerBootstrap);
 if (workerThreads.isMainThread) internalRequire('internal/watch_mode/dependencies').initialize();
-host.stdout = process.stdout;
-host.stderr = process.stderr;
+// The standard streams and console are built on first use: a script that
+// prints nothing loads neither the stream stack nor the formatter.
+for (const name of ['stdout', 'stderr']) Object.defineProperty(host, name, {
+  enumerable: true, configurable: true,
+  get: () => process[name],
+  set(value) { Object.defineProperty(host, name, { value, writable: true, enumerable: true, configurable: true }); },
+});
 const webGlobals = internalRequire('internal/web/index');
 webGlobals.install(globalThis);
-globalThis.console = internalRequire('console');
+webGlobals.defineLazy(globalThis, 'console', () => ({ console: internalRequire('console') }));
 // Register the trusted dispatcher before preloads or any other guest code can
 // connect to this isolate (including through a parent Worker inspector).
 const inspectorBackend = internalRequire('internal/inspector');
@@ -535,8 +556,7 @@ const loader = internalRequire('internal/loader/loader').createLoader(host, publ
 host.loader = loader;
 host.vmCreateDefaultImporter = filename =>
   native.compileFunction('(specifier, attributes) => import(specifier, { with: attributes })', filename);
-const dotenv = internalRequire('internal/dotenv');
-process.loadEnvFile = dotenv.loadEnvFile;
+process.loadEnvFile = function loadEnvFile(path = undefined) { return internalRequire('internal/dotenv').loadEnvFile(path); };
 if (workerThreads.isMainThread && process.env.NODE_UNIQUE_ID !== undefined) internalRequire('cluster');
 Object.defineProperty(globalThis, '__silkModuleBridge', { value: loader.bridge });
 let mainModuleName;
@@ -639,7 +659,7 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
   }
   internalRequire('internal/permission').initialize({ entrypoints });
   internalRequire('internal/startup_controls').initialize();
-  process.setSourceMapsEnabled(!!host.enableSourceMaps);
+  if (host.enableSourceMaps || moduleHas('internal/source_maps')) process.setSourceMapsEnabled(!!host.enableSourceMaps);
   host.typeScriptMode = host.transformTypes ? 'transform' : host.stripTypes === false ? false : 'strip';
   host.initialExecArgv = process.execArgv.slice();
   host.workerRuntimeArgs = args.slice();
@@ -650,7 +670,7 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
   if (host.experimentalWebStorage) internalRequire('internal/web/storage').install(globalThis, { localStorageFile: host.localStorageFile });
   if (workerThreads.isMainThread) internalRequire('internal/trace_events').initialize(host.traceOptions);
   if (workerThreads.isMainThread && host.traceSigint) internalRequire('util').setTraceSigInt(true);
-  internalRequire('internal/compile_cache').initialize();
+  if (process.env.NODE_COMPILE_CACHE) internalRequire('internal/compile_cache').initialize();
   // Watch supervisors forward these options to their child, which owns the
   // inspector endpoint; opening here would steal that child's port.
   if (preloadEntrypoints) {
@@ -768,14 +788,13 @@ function cliError(message) {
 function loadRuntimeEnvironment(args) {
   const files = internalRequire('internal/options').environmentFiles(args);
   if (!files.length) return;
-  const { loaded, errors } = dotenv.loadEnvironmentFiles(files);
+  const { loaded, errors } = internalRequire('internal/dotenv').loadEnvironmentFiles(files);
   if (errors.length) return cliError(errors.join('\n' + process.execPath + ': '));
   if (loaded) loader.Module._initPaths();
 }
 function run() {
   if (workerBootstrap) return runWorker();
-  const sea = internalRequire('internal/sea');
-  if (sea.isSea()) return sea.runMain(native.argv.slice(1), runtimeFlag, installRuntimeOptions, runPreloads, loadRuntimeEnvironment);
+  if (native.seaNative(0)) return internalRequire('internal/sea').runMain(native.argv.slice(1), runtimeFlag, installRuntimeOptions, runPreloads, loadRuntimeEnvironment);
   const startupEnvironment = { ...process.env };
   loadRuntimeEnvironment(native.argv.slice(1));
   const options = internalRequire('internal/options');
@@ -1152,21 +1171,20 @@ function loop() {
   performanceMilestones.loopExit = native.now() - startTime;
   process._exiting = true; const status = Number(process.exitCode) || 0;
   process.emit('exit', status);
-  internalRequire('internal/compile_cache').flushCompileCache();
+  if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushCompileCache();
   return Number(process.exitCode) || 0;
 }
 globalThis.__silkRuntime = {
   normalize(name, parent, attributes) { return loader.resolve(name, parent, 'import', attributes).filename; },
   load(name, attributes) { return loader.loadESM(name, attributes).source; },
   registerSource(filename, source, metadata) {
-    internalRequire('internal/source_maps').registerSource(filename, source, { ...metadata, owner: metadata });
+    host.registerSource(filename, source, { ...metadata, owner: metadata });
     if (!metadata.generated && typeof filename === 'string') {
-      return /^[A-Za-z][A-Za-z\d+.-]*:/.test(filename) ? filename : internalRequire('url').pathToFileURL(filename).href;
+      return /^[A-Za-z][A-Za-z\d+.-]*:/.test(filename) ? filename : fileHref(filename);
     }
   },
   importMeta(name) {
-    const { pathToFileURL, fileURLToPath } = internalRequire('url');
-    const asURL = value => /^[A-Za-z][A-Za-z\d+.-]*:/.test(value) ? value : pathToFileURL(value).href;
+    const asURL = value => /^[A-Za-z][A-Za-z\d+.-]*:/.test(value) ? value : fileHref(value);
     const url = asURL(name);
     const meta = {
       url,
@@ -1174,7 +1192,7 @@ globalThis.__silkRuntime = {
       resolve(specifier) { return asURL(loader.resolve(specifier, name, 'import').filename); }
     };
     if (url.startsWith('file:')) {
-      meta.filename = fileURLToPath(url);
+      meta.filename = url === 'file://' + name ? name : internalRequire('url').fileURLToPath(url);
       meta.dirname = host.path.dirname(meta.filename);
     }
     return meta;
