@@ -975,6 +975,9 @@ function runtimeFlag(arg) {
   if (arg === '--experimental-test-module-mocks' || arg === '--no-experimental-test-module-mocks') {
     host.experimentalTestModuleMocks = arg === '--experimental-test-module-mocks'; return true;
   }
+  if (arg === '--experimental-network-inspection' || arg === '--no-experimental-network-inspection') {
+    host.experimentalNetworkInspection = arg === '--experimental-network-inspection'; return true;
+  }
   if (arg === '--experimental-inspector-network-resource' || arg === '--no-experimental-inspector-network-resource') {
     host.experimentalInspectorNetworkResource = arg === '--experimental-inspector-network-resource'; return true;
   }

@@ -17,10 +17,21 @@ function put(url, data) {
   }
   resources.set(url, Buffer.from(data));
 }
+// With --experimental-network-inspection, http, http2 and fetch report to the Network domain
+// while a session has it enabled (Node's inspector_network_tracking).
+const tracking = new Set();
+function track(session, enabled) {
+  session.networkEnabled = enabled;
+  if (!host.experimentalNetworkInspection) return;
+  const before = tracking.size;
+  if (enabled) tracking.add(session); else tracking.delete(session);
+  if (before === 0 && tracking.size === 1) require('internal/inspector_network_tracking').enable();
+  else if (before === 1 && tracking.size === 0) require('internal/inspector_network_tracking').disable();
+}
 function dispatch(session, method, params) {
   switch (method) {
-    case 'Network.enable': session.networkEnabled = true; return {};
-    case 'Network.disable': session.networkEnabled = false; return {};
+    case 'Network.enable': track(session, true); return {};
+    case 'Network.disable': track(session, false); return {};
     case 'Network.loadNetworkResource': {
       if (!host.experimentalInspectorNetworkResource) throw protocolError(-32000, 'Network resource loading is not enabled. This feature is experimental and requires --experimental-inspector-network-resource flag to be set.');
       if (typeof params.url !== 'string') throw protocolError(-32602, 'Invalid parameters: url');
@@ -48,5 +59,5 @@ function dispatch(session, method, params) {
     default: unsupported(method);
   }
 }
-function close(session) { if (session.resourceStreams) session.resourceStreams.clear(); }
+function close(session) { track(session, false); if (session.resourceStreams) session.resourceStreams.clear(); }
 module.exports = { put, dispatch, close };

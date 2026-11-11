@@ -325,10 +325,22 @@ function broadcast(method, params) {
     session.emit(method, params);
   }
 }
+// V8's stack of a console call: from the caller of the console method down, at most 200 frames.
+function consoleStack() {
+  const frames = host.captureCallSites(200, consoleStack);
+  let first = 0;
+  while (first < frames.length && /^(?:node|silk):/.test(frames[first].scriptName)) first++;
+  return { callFrames: frames.slice(first).map(frame => ({
+    functionName: frame.functionName, scriptId: frame.scriptId, url: debuggerAgent.resourceURL(frame.scriptName),
+    lineNumber: frame.lineNumber - 1, columnNumber: frame.columnNumber - 1,
+  })) };
+}
 const consoleBridge = require('internal/inspector_console').create((type, args) => {
+  let stackTrace;
   for (const session of sessions.values()) if (session.runtime) {
     if (type === 'clear') session.values.releaseGroup('console');
-    session.emit('Runtime.consoleAPICalled', { type, args: args.map(value => session.values.remote(value, 'console', false, true)), executionContextId: 1, timestamp: Date.now() });
+    stackTrace ??= consoleStack();
+    session.emit('Runtime.consoleAPICalled', { type, args: args.map(value => session.values.remote(value, 'console', false, true)), executionContextId: 1, timestamp: Date.now(), stackTrace });
   }
 });
 consoleBridge.console.profile = function profile(title) {

@@ -62,7 +62,8 @@ const environmentOptions = new Map([
   ...permission.optionEntries,
   ...tlsOptions.optionEntries,
   ...[...inspectorEnableOptions, '--no-inspect', '--no-inspect-brk', '--no-inspect-wait',
-    '--experimental-inspector-network-resource', '--no-experimental-inspector-network-resource'].map(name => [name, false]),
+    '--experimental-inspector-network-resource', '--no-experimental-inspector-network-resource',
+    '--experimental-network-inspection', '--no-experimental-network-inspection'].map(name => [name, false]),
   ['--inspect-port', true], ['--debug-port', true],
   ...['--watch', '--no-watch', '--watch-preserve-output', '--no-watch-preserve-output'].map(name => [name, false]),
   ...['--watch-path', '--watch-kill-signal'].map(name => [name, true]),
@@ -284,6 +285,7 @@ function getOptionValue(name) {
     case '--frozen-intrinsics': return !!host.frozenIntrinsics;
     case '--zero-fill-buffers': return !!host.zeroFillBuffers;
     case '--experimental-inspector-network-resource': return !!host.experimentalInspectorNetworkResource;
+    case '--experimental-network-inspection': return !!host.experimentalNetworkInspection;
     case '--inspect': return !!host.inspectorOptions?.enabled;
     case '--inspect-brk': return !!host.inspectorOptions?.breakFirst;
     case '--inspect-wait': return !!host.inspectorOptions?.wait;
