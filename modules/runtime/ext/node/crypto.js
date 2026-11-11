@@ -825,27 +825,124 @@ function preparedKeyObject(key, ctx, name, before) {
   if (type === 'private') return { key: keyFromPrepared(prepared, 'private'), owned: true };
   try { return { key: keyFromPrepared(prepared, 'public'), owned: true }; } catch (e) { try { return { key: keyFromPrepared(prepared, 'private'), owned: true }; } catch { throw e; } }
 }
-function keygenArgs(type, options = {}) {
-  name(type, 'type');
-  const native = ({ rsa: 'RSA', 'rsa-pss': 'RSA-PSS', dsa: 'DSA', ec: 'EC', ed25519: 'ED25519', ed448: 'ED448', x25519: 'X25519', x448: 'X448', dh: 'DH', 'ml-kem-512': 'ML-KEM-512', 'ml-kem-768': 'ML-KEM-768', 'ml-kem-1024': 'ML-KEM-1024', 'ml-dsa-44': 'ML-DSA-44', 'ml-dsa-65': 'ML-DSA-65', 'ml-dsa-87': 'ML-DSA-87' })[type];
-  if (!native) throw error('ERR_INVALID_ARG_VALUE', `Unsupported key type ${type}`);
-  const bits = /^rsa/.test(type) ? integer(options.modulusLength, 'modulusLength', 512) : 0;
-  let group = '';
-  if (type === 'ec') group = name(options.namedCurve, 'namedCurve');
-  if (type === 'dsa') return [native, integer(options.modulusLength, 'modulusLength', 512), '', packed(Buffer.alloc(0)), '', '', integer(options.divisorLength ?? 160, 'divisorLength', 160, 256), 1];
-  if (type === 'dh') {
-    if (options.group !== undefined) { if (options.prime !== undefined || options.primeLength !== undefined || options.generator !== undefined) throw error('ERR_INCOMPATIBLE_OPTION_PAIR', 'group cannot be combined with prime, primeLength, or generator'); group = name(options.group, 'group'); }
-    else { if (options.prime !== undefined && options.primeLength !== undefined) throw error('ERR_INCOMPATIBLE_OPTION_PAIR', 'prime and primeLength are mutually exclusive'); const generator = integer(options.generator ?? 2, 'generator', 2, 0x7fffffff), g = Buffer.alloc(4); g.writeUInt32BE(generator); return [native, options.prime === undefined ? integer(options.primeLength, 'primeLength', 2) : 0, '', packed(g), options.prime === undefined ? undefined : packed(options.prime), '', generator, 2]; }
+// lib/internal/crypto/keygen.js createJob, with the checks of the C++ key
+// generation configs (crypto_rsa.cc, crypto_dsa.cc, crypto_ec.cc, crypto_dh.cc).
+const kNamedKeyPairs = { __proto__: null, ed25519: 'ED25519', ed448: 'ED448', x25519: 'X25519', x448: 'X448', 'ml-kem-512': 'ML-KEM-512', 'ml-kem-768': 'ML-KEM-768', 'ml-kem-1024': 'ML-KEM-1024', 'ml-dsa-44': 'ML-DSA-44', 'ml-dsa-65': 'ML-DSA-65', 'ml-dsa-87': 'ML-DSA-87' };
+const kNistCurves = ['B-163', 'B-233', 'B-283', 'B-409', 'B-571', 'K-163', 'K-233', 'K-283', 'K-409', 'K-571', 'P-192', 'P-224', 'P-256', 'P-384', 'P-521'];
+function keygenEncoding(type, options) {
+  const { publicKeyEncoding, privateKeyEncoding } = options ?? {};
+  const result = {};
+  if (publicKeyEncoding != null) {
+    if (typeof publicKeyEncoding !== 'object') throw codes.ERR_INVALID_ARG_VALUE('options.publicKeyEncoding', publicKeyEncoding);
+    parsePublicKeyEncoding(publicKeyEncoding, type, 'options.publicKeyEncoding'); result.publicKeyEncoding = publicKeyEncoding;
   }
-  let exponent = Buffer.alloc(0);
-  if (/^rsa/.test(type)) { const e = integer(options.publicExponent ?? 65537, 'publicExponent', 3, 0xffffffff); if (!(e & 1)) throw error('ERR_OUT_OF_RANGE', 'publicExponent must be odd'); exponent = Buffer.alloc(4); exponent.writeUInt32BE(e); }
-  return [native, bits, group, packed(exponent), options.hashAlgorithm === undefined ? '' : name(options.hashAlgorithm), options.mgf1HashAlgorithm === undefined ? '' : name(options.mgf1HashAlgorithm), options.saltLength === undefined ? -1 : integer(options.saltLength, 'saltLength')];
+  if (privateKeyEncoding != null) {
+    if (typeof privateKeyEncoding !== 'object') throw codes.ERR_INVALID_ARG_VALUE('options.privateKeyEncoding', privateKeyEncoding);
+    parsePrivateKeyEncoding(privateKeyEncoding, type, 'options.privateKeyEncoding'); result.privateKeyEncoding = privateKeyEncoding;
+  }
+  return result;
 }
-function keypair(id, options) { const privateKey = newKeyObject('private', id); let publicKey; try { publicKey = createPublicKey(privateKey); const result = { publicKey: options.publicKeyEncoding ? publicKey.export(options.publicKeyEncoding) : publicKey, privateKey: options.privateKeyEncoding ? privateKey.export(options.privateKeyEncoding) : privateKey }; if (options.publicKeyEncoding) release(publicKey); if (options.privateKeyEncoding) release(privateKey); return result; } catch (e) { release(privateKey); if (publicKey) release(publicKey); throw e; } }
-function generateKeyPairSync(type, options = {}) { return keypair(call('keyGenerate', keygenArgs(type, options)), options); }
-function generateKeyPair(type, options, cb) { if (typeof options === 'function') { cb = options; options = {}; } options = options || {}; callback(cb); submit('keyGenerate', keygenArgs(type, options), (e, pair) => e ? cb(e) : cb(null, pair.publicKey, pair.privateKey), id => keypair(id, options)); }
-function generateKeySync(type, options) { if (type !== 'hmac' && type !== 'aes') throw error('ERR_INVALID_ARG_VALUE', 'type must be hmac or aes'); const length = integer(options && options.length, 'length', 8); if (type === 'aes' && ![128, 192, 256].includes(length)) throw error('ERR_INVALID_ARG_VALUE', 'AES length must be 128, 192, or 256'); return createSecretKey(randomBytes(Math.floor(length / 8))); }
-function generateKey(type, options, cb) { callback(cb); if (type !== 'hmac' && type !== 'aes') throw error('ERR_INVALID_ARG_VALUE', 'type must be hmac or aes'); const length = integer(options && options.length, 'length', 8); if (type === 'aes' && ![128, 192, 256].includes(length)) throw error('ERR_INVALID_ARG_VALUE', 'AES length must be 128, 192, or 256'); randomBytes(Math.floor(length / 8), (e, b) => e ? cb(e) : cb(null, createSecretKey(b))); }
+function keygenDigest(value, message) { if (value === undefined) return ''; if (digestSize(value) === undefined) throw error('ERR_CRYPTO_INVALID_DIGEST', `${message}: ${value}`, TypeError); return value; }
+function keygenArgs(type, options) {
+  validate.string(type, 'type');
+  if (options !== undefined) validate.object(options, 'options');
+  switch (type) {
+    case 'rsa': case 'rsa-pss': {
+      validate.object(options, 'options');
+      let { modulusLength, publicExponent } = options;
+      validate.uint32(modulusLength, 'options.modulusLength'); modulusLength += 0;
+      if (publicExponent == null) publicExponent = 0x10001; else { validate.uint32(publicExponent, 'options.publicExponent'); publicExponent += 0; }
+      const exponent = Buffer.alloc(4); exponent.writeUInt32BE(publicExponent);
+      if (type === 'rsa') return ['RSA', modulusLength, '', packed(exponent), '', '', -1];
+      const { hash, mgf1Hash, hashAlgorithm, mgf1HashAlgorithm } = options;
+      let { saltLength } = options;
+      if (saltLength !== undefined) { validate.int32(saltLength, 'options.saltLength', 0); saltLength += 0; }
+      if (hashAlgorithm !== undefined) validate.string(hashAlgorithm, 'options.hashAlgorithm');
+      if (mgf1HashAlgorithm !== undefined) validate.string(mgf1HashAlgorithm, 'options.mgf1HashAlgorithm');
+      if (hash !== undefined) {
+        process.emitWarning('"options.hash" is deprecated, use "options.hashAlgorithm" instead.', 'DeprecationWarning', 'DEP0154');
+        validate.string(hash, 'options.hash');
+        if (hashAlgorithm && hash !== hashAlgorithm) throw codes.ERR_INVALID_ARG_VALUE('options.hash', hash);
+      }
+      if (mgf1Hash !== undefined) {
+        process.emitWarning('"options.mgf1Hash" is deprecated, use "options.mgf1HashAlgorithm" instead.', 'DeprecationWarning', 'DEP0154');
+        validate.string(mgf1Hash, 'options.mgf1Hash');
+        if (mgf1HashAlgorithm && mgf1Hash !== mgf1HashAlgorithm) throw codes.ERR_INVALID_ARG_VALUE('options.mgf1Hash', mgf1Hash);
+      }
+      return ['RSA-PSS', modulusLength, '', packed(exponent), keygenDigest(hashAlgorithm || hash, 'Invalid digest'), keygenDigest(mgf1HashAlgorithm || mgf1Hash, 'Invalid MGF1 digest'), saltLength ?? -1];
+    }
+    case 'dsa': {
+      validate.object(options, 'options');
+      let { modulusLength, divisorLength } = options;
+      validate.uint32(modulusLength, 'options.modulusLength'); modulusLength += 0;
+      if (divisorLength == null) divisorLength = -1; else { validate.int32(divisorLength, 'options.divisorLength', 0); divisorLength += 0; }
+      return ['DSA', modulusLength, '', packed(Buffer.alloc(0)), '', '', divisorLength, 1];
+    }
+    case 'ec': {
+      validate.object(options, 'options');
+      const { namedCurve } = options; let { paramEncoding } = options;
+      validate.string(namedCurve, 'options.namedCurve');
+      if (paramEncoding == null || paramEncoding === 'named') paramEncoding = '';
+      else if (paramEncoding !== 'explicit') throw codes.ERR_INVALID_ARG_VALUE('options.paramEncoding', paramEncoding);
+      if (!kNistCurves.includes(namedCurve) && !names('curves').includes(namedCurve)) throw codes.ERR_CRYPTO_INVALID_CURVE();
+      return ['EC', 0, namedCurve, packed(Buffer.alloc(0)), '', '', -1, 0, paramEncoding];
+    }
+    case 'dh': {
+      validate.object(options, 'options');
+      const { group } = options; let { prime, primeLength, generator } = options;
+      if (group != null) {
+        if (prime != null) throw codes.ERR_INCOMPATIBLE_OPTION_PAIR('group', 'prime');
+        if (primeLength != null) throw codes.ERR_INCOMPATIBLE_OPTION_PAIR('group', 'primeLength');
+        if (generator != null) throw codes.ERR_INCOMPATIBLE_OPTION_PAIR('group', 'generator');
+        validate.string(group, 'options.group');
+        // DHPointer::FindGroup matches names without regard to case.
+        const known = DiffieHellmanGroup(group.toLowerCase());
+        try { prime = known.getPrime(); } finally { release(known); }
+        primeLength = undefined; generator = 2;
+      } else if (prime != null) {
+        if (primeLength != null) throw codes.ERR_INCOMPATIBLE_OPTION_PAIR('prime', 'primeLength');
+        validate.buffer(prime, 'options.prime');
+      } else if (primeLength != null) {
+        validate.int32(primeLength, 'options.primeLength', 0); primeLength += 0;
+      } else throw codes.ERR_MISSING_OPTION('At least one of the group, prime, or primeLength options');
+      if (generator != null) { validate.int32(generator, 'options.generator', 0); generator += 0; } else generator = 2;
+      const g = Buffer.alloc(4); g.writeUInt32BE(generator);
+      return ['DH', prime == null ? primeLength : 0, '', packed(g), prime == null ? undefined : packed(prime), '', generator, 2];
+    }
+    default:
+      if (kNamedKeyPairs[type] === undefined) throw codes.ERR_INVALID_ARG_VALUE('type', type, 'must be a supported key type');
+      return [kNamedKeyPairs[type], 0, '', packed(Buffer.alloc(0)), '', '', -1];
+  }
+}
+function keypair(id, encoding) { const privateKey = newKeyObject('private', id); let publicKey; try { publicKey = createPublicKey(privateKey); const result = { publicKey: encoding.publicKeyEncoding ? publicKey.export(encoding.publicKeyEncoding) : publicKey, privateKey: encoding.privateKeyEncoding ? privateKey.export(encoding.privateKeyEncoding) : privateKey }; if (encoding.publicKeyEncoding) release(publicKey); if (encoding.privateKeyEncoding) release(privateKey); return result; } catch (e) { release(privateKey); if (publicKey) release(publicKey); throw e; } }
+function keygenJob(type, options) {
+  validate.string(type, 'type');
+  if (options !== undefined) validate.object(options, 'options');
+  const encoding = keygenEncoding(type, options);
+  return { args: keygenArgs(type, options), encoding };
+}
+function generateKeyPairSync(type, options) { const job = keygenJob(type, options); return keypair(call('keyGenerate', job.args), job.encoding); }
+function generateKeyPair(type, options, cb) {
+  if (typeof options === 'function') { cb = options; options = undefined; }
+  validate.function(cb, 'callback');
+  const job = keygenJob(type, options);
+  submit('keyGenerate', job.args, (e, pair) => e ? cb(e) : cb(null, pair.publicKey, pair.privateKey), id => keypair(id, job.encoding));
+}
+function secretKeygenLength(type, options) {
+  validate.string(type, 'type'); validate.object(options, 'options');
+  const { length } = options;
+  if (type === 'hmac') validate.integer(length, 'options.length', 8, 2 ** 31 - 1);
+  else if (type === 'aes') validate.oneOf(length, 'options.length', [128, 192, 256]);
+  else throw codes.ERR_INVALID_ARG_VALUE('type', type, 'must be a supported key type');
+  return Math.floor(length / 8);
+}
+function generateKeySync(type, options) { return createSecretKey(randomBytes(secretKeygenLength(type, options))); }
+function generateKey(type, options, cb) {
+  if (typeof options === 'function') { cb = options; options = undefined; }
+  validate.function(cb, 'callback');
+  const length = secretKeygenLength(type, options);
+  randomBytes(length, (e, b) => e ? cb(e) : cb(null, createSecretKey(b)));
+}
 // lib/internal/crypto/sig.js, with the checks of src/crypto/crypto_sig.cc.
 const kSigOptionsDefault = {};
 function signatureKeyOptions(value) { return value !== null && typeof value === 'object' && !isKeyObject(value) && !isCryptoKey(value) && !ArrayBuffer.isView(value) && !isAnyArrayBuffer(value) ? value : kSigOptionsDefault; }
