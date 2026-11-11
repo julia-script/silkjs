@@ -5,13 +5,13 @@
 //! their canonical u32 LEB representation. Cache admission validates the whole
 //! graph before committing module roots, using the runtime's final opcode table.
 import thin_list { BoxList, ThinBox, PairList }
-import js_compiler_types { PendingFunction, LazyStub, LazyName, LazyBody, FunctionTree, FunctionId }
-import js_compiler_finish { STUB_CODE }
+import js_compiler_types { PendingFunction, DeferredBody, LazyStub, LazyName, LazyBody, FunctionTree, FunctionId }
+import js_compiler_finish { STUB_CODE, STUB_STACK }
 import silk.collections.slice { Slice }
 import js_strings { Strings }
 import js_string_types { StringOwner }
 import js_scopes as scopes
-import js_realm { Realm }
+import js_realm { Realm, lendRealm }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
@@ -37,7 +37,7 @@ import js_exceptions { JsException }
 import js_coercion_host { CoercionHooks }
 import js_debug_positions { PendingLines, SourceLocation }
 import js_core_types { HostEdges }
-import js_core_types { LineTables }
+import js_core_types { LineTables, DeferredSource }
 import js_core_types { SourceText, RuntimeState, ObjectData, ObjectPayload, NativeErrorKind, NativeFunctionId,
   FunctionBytecode, FunctionKind, FunctionDebugInfo, ByteStorage, VarDef, ClosureVar, CLOSURE_NO_DEPTH,
   VariableKind, ClosureKind, ModuleDef, RequestedModule, ExportEntry, ExportBinding,
@@ -70,6 +70,11 @@ const CACHE_MODULE: u32 = 32
 /// The code-cache wire (js_binary_object_writer.JS_WRITE_OBJ_LAZY): lazy stubs
 /// and shared source strings. Accepted only from trusted callers.
 pub const LAZY: u32 = 64
+/// With LAZY, the js_binary_object_writer.JS_WRITE_OBJ_DEFER layout: a function's
+/// variables, code and constants stay in the bytes until its first call
+/// (finishDeferred), so the bytes must stay readable and unchanged for as long
+/// as the runtime lives.
+pub const DEFER: u32 = 128
 /// Borrowed relocation entry. The decoder clones the buffer's backing owner;
 /// address is the serialized identifier, not necessarily this buffer's address.
 pub struct SharedBacking { pub address: u64, pub buffer: ValueBits }
@@ -81,7 +86,27 @@ struct Reader<'a> {
   trusted: bool, shared: &'a [SharedBacking], leases: &'a [SharedLease], firstAtom: u32,
   atoms: List<u32>, references: List<ValueBits>, roots: ValueList, modules: List<CellRef<ModuleDef>>,
   /// LAZY: the shared source strings read so far (owned through roots).
-  sources: List<ValueBits>
+  sources: List<ValueBits>,
+  /// DEFER: this read's RuntimeState.deferredSources index plus one, once a body
+  /// was left behind; 0 before.
+  deferSource: u32,
+  /// Whether atoms and sources are a deferred source's, which finishDeferred
+  /// borrows, rather than this read's own.
+  resumed: bool,
+  /// resumed: the source's ranges of RuntimeState.deferredAtoms and
+  /// deferredTexts, which no resumed read grows.
+  lentAtoms: *const u32, lentAtomCount: usize, lentTexts: *const ValueBits, lentTextCount: usize
+}
+/// Where a read that lends no table points.
+const NO_TABLE: [u32; 1] = [0]
+fn noAtoms()->*const u32 { return Pointer.fromRef<u32>(&NO_TABLE[0]) }
+fn noTexts()->*const ValueBits { return unsafe Intrinsic.pointerReinterpret<*const u32,*const ValueBits>(noAtoms()) }
+@inlineAlways
+fn atomCount<'a>(r:&Reader<'a>)->usize { if r.resumed { return r.lentAtomCount } return r.atoms.length() }
+@inlineAlways
+fn atomAt<'a>(r:&Reader<'a>,index:usize)->u32 {
+  if r.resumed { return unsafe Pointer.read<u32>(unsafe Pointer.at<u32>(unsafe Pointer.assumeMany<u32>(r.lentAtoms),index)) }
+  return r.atoms.get(index)
 }
 fn reference(value: ValueBits) -> *mut HeapHeader {
   return match value { ValueBits.Object { reference } => reference
@@ -156,8 +181,8 @@ effect fn mapAtom<'a,'r,'m,S:EngineServices>(r:&Reader<'a>,engine:&mut Engine<'m
   ->u32 !JsException ?&mut Allocator {
   if (index&0x80000000)!=0 || index<r.firstAtom { return index }
   let offset=u32.toUsize(index-r.firstAtom)
-  if offset>=r.atoms.length() { return run error(&mut engine,realm,b"invalid atom index") }
-  return r.atoms.get(offset)
+  if offset>=atomCount(&r.*) { return run error(&mut engine,realm,b"invalid atom index") }
+  return atomAt(&r.*,offset)
 }
 effect fn atom<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>)
   ->u32 !JsException ?&mut Allocator {
@@ -393,6 +418,14 @@ fn wordAt<'a>(r:&Reader<'a>,position:usize)->u32 {
   while i<4 { value=value|u32.shiftLeft(u8.toU32(r.data[position+i]),usize.toU32(i*8)) i=i+1 }
   return value
 }
+/// Whether the instruction at position, with available bytes left, is the
+/// fusion prefix of a `switch` case on a string (js_compiler_labels): the
+/// prefix, dup, then the push_atom_value whose atom the prefix repeats. That
+/// copy is this runtime's atom number too, so such code is never borrowed.
+fn casePrefix<'a>(r:&Reader<'a>,position:usize,available:usize)->bool {
+  return available>=11 && r.data[position]==op.OP_fuse_prefix && r.data[position+5]==op.OP_dup
+    && r.data[position+6]==op.OP_push_atom_value
+}
 effect fn readCode<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>,
   function:CellRef<FunctionBytecode>,length:usize)->() !OutOfMemoryError|JsException ?&mut Allocator {
   run need(&r.*,&mut engine,realm,length)
@@ -406,7 +439,7 @@ effect fn readCode<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engi
     if atomFormat(info.format) {
       let _mapped=run mapAtom(&r.*,&mut engine,realm,wordAt(&r.*,start+offset+1))
     }
-    if fieldKeyed(opcode) { keyed=true }
+    if fieldKeyed(opcode) || casePrefix(&r.*,start+offset,length-offset) { keyed=true }
     offset=offset+size
   }
   let mut code=ByteStorage.empty()
@@ -415,17 +448,24 @@ effect fn readCode<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engi
     code=ByteStorage.Borrowed { data:at(&r.*,start),length:length } r.position=r.position+length
   } else { let copied=run copiedBytes(&mut r,&mut engine,realm,length) code=run ByteStorage.copy(copied.asSlice()) }
   offset=0
+  // The fusion prefix of a string case just walked, if any: its operand is a
+  // copy of the atom in the push_atom_value it covers, which owns the reference.
+  let mut prefix=usize.MAX
   while offset<length {
     let opcode=unsafe code.byte(offset) let info=op.opcodeInfo(opcode,true)
+    if casePrefix(&r.*,start+offset,length-offset) { prefix=offset }
     if atomFormat(info.format) {
       let index=wordAt(&r.*,start+offset+1)
       // The validation pass proved every map lookup; no failure after retain.
       let mut mapped=index
-      if (index&0x80000000)==0 && index>=r.firstAtom { mapped=r.atoms.get(u32.toUsize(index-r.firstAtom)) }
+      if (index&0x80000000)==0 && index>=r.firstAtom { mapped=atomAt(&r.*,u32.toUsize(index-r.firstAtom)) }
       let retained=duplicateAtom(&mut engine,realm,mapped)
       match &mut code {
         ByteStorage.Owned { bytes }=>{
           let mut j:usize=0 while j<4 { bytes.set(offset+1+j,u32.toU8(u32.shiftRight(retained,usize.toU32(j*8))&255)) j=j+1 }
+          if prefix!=usize.MAX && offset==prefix+6 {
+            j=0 while j<4 { bytes.set(prefix+1+j,u32.toU8(u32.shiftRight(retained,usize.toU32(j*8))&255)) j=j+1 }
+          }
         }
         _=>()
       }
@@ -476,13 +516,16 @@ effect fn sourceText<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut En
     return Option<SourceText>.some(SourceText.Owned { bytes:move bytes })
   }
   let index=kind-2
-  if index>r.sources.length() { return run error(&mut engine,realm,b"invalid source text index") }
-  if index==r.sources.length() {
+  if r.resumed {
+    if index>=r.lentTextCount { return run error(&mut engine,realm,b"invalid source text index") }
+  } else if index>r.sources.length() { return run error(&mut engine,realm,b"invalid source text index") }
+  else if index==r.sources.length() {
     let length=run count(&mut r,&mut engine,realm) let bytes=run sliceBytes(&mut r,&mut engine,realm,length)
     let text=run own(&mut r,&mut engine,realm,run Strings.adoptLatin1(move bytes))
     run r.sources.append(text)
   }
-  let whole=r.sources.get(index)
+  let whole=if r.resumed { unsafe Pointer.read<ValueBits>(unsafe Pointer.at<ValueBits>(unsafe Pointer.assumeMany<ValueBits>(r.lentTexts),index)) }
+    else { r.sources.get(index) }
   let start=run count(&mut r,&mut engine,realm) let length=run count(&mut r,&mut engine,realm)
   let plain=(run byte(&mut r,&mut engine,realm))!=0
   if start>Strings.length(whole) || length>Strings.length(whole)-start { return run error(&mut engine,realm,b"invalid source text span") }
@@ -560,6 +603,131 @@ effect fn stubDefinition<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mu
     ecmaLine:ecmaLine,ecmaColumn:ecmaColumn,slots:slots,varSlots:varSlots,parameters:move parameters,variables:move variables,
     lazy:Option<LazyStub>.some(move stub) }
 }
+/// A function's variable definitions.
+effect fn readVarDefs<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>,
+  code:CellRef<FunctionBytecode>,locals:usize)->() !OutOfMemoryError|JsException ?&mut Allocator {
+  let mut anchor=()
+  let reserved=code.getMut(&mut anchor) run reserved.varDefs.reserveExact(locals) drop reserved
+  let mut i:usize=0
+  while i<locals {
+    let varName=run atom(&mut r,&mut engine,realm) let next=run leb(&mut r,&mut engine,realm)
+    let refIndex=run lebU16(&mut r,&mut engine,realm)
+    let bits=run byte(&mut r,&mut engine,realm) let varKind=run variableKind(&mut engine,realm,bits&15)
+    let b=code.getMut(&mut anchor)
+    run b.varDefs.append(VarDef { name:duplicateAtom(&mut engine,realm,varName),scopeNext:signed(u32.wrappingSubtract(next,1)),
+      varRefIndex:refIndex,kind:varKind,isConst:(bits&16)!=0,isLexical:(bits&32)!=0,isCaptured:(bits&64)!=0,hasScope:(bits&128)!=0 })
+    i=i+1
+  }
+}
+/// A function's closure variables.
+effect fn readClosures<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>,
+  code:CellRef<FunctionBytecode>,closures:usize)->() !OutOfMemoryError|JsException ?&mut Allocator {
+  let mut anchor=()
+  let reserved=code.getMut(&mut anchor) run reserved.closureVars.reserveExact(closures) drop reserved
+  let mut i:usize=0
+  while i<closures {
+    let varName=run atom(&mut r,&mut engine,realm) let index=run lebU16(&mut r,&mut engine,realm)
+    let bits=u64.toU16(run fixed(&mut r,&mut engine,realm,2))
+    if (bits&0xfc00)!=0 { return run error(&mut engine,realm,b"invalid closure flags") }
+    let varKind=run variableKind(&mut engine,realm,u16.toU8(u16.shiftRight(bits,5)&15))
+    let b=code.getMut(&mut anchor)
+    run b.closureVars.append(ClosureVar { name:duplicateAtom(&mut engine,realm,varName),variableIndex:index,
+      kind:closureKind(bits),isConst:(bits&8)!=0,isLexical:(bits&16)!=0,variableKind:varKind,depth:CLOSURE_NO_DEPTH })
+    i=i+1
+  }
+  // Scope captures sit behind the ones with cells (js_compiler_scopes.compact).
+  let compacted=code.getMut(&mut anchor)
+  let mut scoped:usize=0
+  while scoped<closures && compacted.closureVars.get(closures-1-scoped).kind==ClosureKind.Scope { scoped=scoped+1 }
+  compacted.scopeCaptures=usize.toU16(scoped)
+}
+/// A function's debug data: file name, line table and source text.
+effect fn readDebug<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>,
+  code:CellRef<FunctionBytecode>)->() !OutOfMemoryError|JsException ?&mut Allocator {
+  let mut anchor=()
+  let filename=run atom(&mut r,&mut engine,realm)
+  let b=code.getMut(&mut anchor)
+  b.debug=Option<FunctionDebugInfo>.some(FunctionDebugInfo { filename:duplicateAtom(&mut engine,realm,filename),
+    nodeVm:false,nodeSourceURL:false,lineOffset:0,columnOffset:0,sourceColumnOffset:0,
+    source:Option<SourceText>.none(),lines:ThinBox<LineTables>.none(),pendingLines:ThinBox<PendingLines>.none(), definition: SourceLocation { line: 0, column: 0 } }) drop b
+  let lines=run count(&mut r,&mut engine,realm)
+  run need(&r.*,&mut engine,realm,lines)
+  // DEFER bytes outlive the runtime, so the line table is read where it lies.
+  let borrow=(r.flags&DEFER)!=0 && lines!=0
+  let start=r.position
+  let lineBytes=if borrow { List<u8>.make() } else { run copiedBytes(&mut r,&mut engine,realm,lines) }
+  if borrow { r.position=r.position+lines }
+  let tables=if borrow { run LineTables.boxed(ByteStorage.Borrowed { data:Pointer.fromRef<u8>(&r.data[start]),length:lines },Option<ByteStorage>.none()) }
+    else { run LineTables.boxed(run ByteStorage.copy(lineBytes.asSlice()),Option<ByteStorage>.none()) }
+  let linesDebug=code.getMut(&mut anchor)
+  match &mut linesDebug.debug { Option<FunctionDebugInfo>.Some { value:debug }=>{ debug.lines=move tables } _=>() } drop linesDebug
+  if (r.flags&LAZY)!=0 {
+    let text=run sourceText(&mut r,&mut engine,realm)
+    let b=code.getMut(&mut anchor)
+    match &mut b.debug { Option<FunctionDebugInfo>.Some { value:debug }=>{ debug.source=move text } _=>() }
+  } else {
+    let source=run count(&mut r,&mut engine,realm)
+    if source!=0 {
+      let sourceBytes=run copiedBytes(&mut r,&mut engine,realm,source)
+      let b=code.getMut(&mut anchor)
+      match &mut b.debug { Option<FunctionDebugInfo>.Some { value:debug }=>{ debug.source=Option<SourceText>.some(SourceText.Owned { bytes:move sourceBytes }) } _=>() }
+    }
+  }
+}
+/// A function's constants.
+effect fn readConstants<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>,
+  code:CellRef<FunctionBytecode>,constants:usize)->() !OutOfMemoryError|JsException|StringLengthError|BigIntError ?&mut Allocator {
+  let mut anchor=()
+  let reserved=code.getMut(&mut anchor) run reserved.constants.reserveExact(constants) drop reserved
+  let mut i:usize=0
+  while i<constants {
+    let child=run readValue(&mut r,&mut engine,realm)
+    let b=code.getMut(&mut anchor)
+    run b.constants.append(unsafe child.retained()) i=i+1
+  }
+}
+/// This read's deferred source, registered on first use, with the source
+/// strings read since: its range of deferredTexts grows only while it is the
+/// newest source, which holds for a whole first read, and a resumed read finds
+/// no new strings (the writer keeps a body that introduces one in place).
+effect fn deferSource<'a,'r>(r:&mut Reader<'a>,realm: Realm<'r>)->u32 !OutOfMemoryError ?&mut Allocator {
+  let mut anchor=() let state=unsafe HeapCell.payloadMut<RuntimeState,()>(&mut anchor,realm.runtime())
+  if r.deferSource==0 {
+    let atomStart=state.deferredAtoms.length()
+    run state.deferredAtoms.reserve(r.atoms.length())
+    let mut i:usize=0
+    while i<r.atoms.length() { run state.deferredAtoms.append(state.atoms.duplicate(r.atoms.get(i))) i=i+1 }
+    run state.deferredSources.append(DeferredSource { data:Pointer.fromRef<u8>(&r.data[0]),length:r.length,flags:r.flags,firstAtom:r.firstAtom,
+      atomStart:usize.toU32(atomStart),atomCount:usize.toU32(r.atoms.length()),textStart:usize.toU32(state.deferredTexts.length()),textCount:0 })
+    r.deferSource=usize.toU32(state.deferredSources.length())
+  }
+  let index=u32.toUsize(r.deferSource-1)
+  let mut entry=state.deferredSources.get(index)
+  if u32.toUsize(entry.textCount)<r.sources.length() {
+    if index+1!=state.deferredSources.length() { Intrinsic.trap("deferred body introduces a source string") }
+    while u32.toUsize(entry.textCount)<r.sources.length() {
+      let text=r.sources.get(u32.toUsize(entry.textCount))
+      run state.deferredTexts.append(unsafe text.retained())
+      entry.textCount=entry.textCount+1
+    }
+    state.deferredSources.set(index,entry)
+  }
+  return usize.toU32(index)
+}
+/// Leaves the body at r.position in the bytes: code becomes a stub, as
+/// js_compiler_finish.defer makes one, until finishDeferred reads it.
+effect fn deferBody<'a,'r>(r:&mut Reader<'a>,realm: Realm<'r>,code:CellRef<FunctionBytecode>,body:DeferredBody)
+  ->() !OutOfMemoryError ?&mut Allocator {
+  let mut kept=body kept.source=run deferSource(&mut r,realm)
+  let pending=run ThinBox<PendingFunction>.make(PendingFunction { tree:ThinBox<FunctionTree>.none(),cell:FunctionId.placeholder(),start:0,line:0,column:0,
+    ecmaLine:0,ecmaColumn:0,slots:0,varSlots:0,parameters:BoxList<u32>.make(),variables:BoxList<u16>.make(),
+    lazy:Option<LazyStub>.none(),deferred:Option<DeferredBody>.some(kept) })
+  let mut anchor=() let b=code.getMut(&mut anchor)
+  b.code=ByteStorage.Borrowed { data:Pointer.fromRef<u8>(&STUB_CODE[0]),length:1 }
+  b.stackSize=STUB_STACK
+  b.frameCells=scopes.inlineFrameCells(b.variableCount,STUB_STACK,b.varRefCount,0)
+  b.pending=move pending
+}
 effect fn readFunction<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>)
   ->ValueBits !OutOfMemoryError|JsException|StringLengthError|BigIntError ?&mut Allocator { let context=realm.context()
   // Recursive constants share a fresh compilation identity, never a filename identity.
@@ -613,70 +781,40 @@ effect fn readFunction<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut 
   let mut anchor=()
   let b=code.getMut(&mut anchor)
   b.name=duplicateAtom(&mut engine,realm,name)
-  run b.varDefs.reserveExact(locals) run b.closureVars.reserveExact(closures) run b.constants.reserveExact(constants) drop b
-  let mut i:usize=0
-  while i<locals {
-    let varName=run atom(&mut r,&mut engine,realm) let next=run leb(&mut r,&mut engine,realm)
-    let refIndex=run lebU16(&mut r,&mut engine,realm)
-    let bits=run byte(&mut r,&mut engine,realm) let varKind=run variableKind(&mut engine,realm,bits&15)
-    let b=code.getMut(&mut anchor)
-    run b.varDefs.append(VarDef { name:duplicateAtom(&mut engine,realm,varName),scopeNext:signed(u32.wrappingSubtract(next,1)),
-      varRefIndex:refIndex,kind:varKind,isConst:(bits&16)!=0,isLexical:(bits&32)!=0,isCaptured:(bits&64)!=0,hasScope:(bits&128)!=0 })
-    i=i+1
+  drop b
+  if (r.flags&DEFER)!=0 {
+    run readClosures(&mut r,&mut engine,realm,code,closures)
+    if (flags&1024)!=0 { run readDebug(&mut r,&mut engine,realm,code) }
+    let bodyLength=u64.toUsize(run fixed(&mut r,&mut engine,realm,4))
+    // Only a call of a plain function finishes a stub (js_vm.callInternal):
+    // generators and async functions start from their own classes' calls, as
+    // js_compiler_finish.deferrable has it. The root function runs at once.
+    if bodyLength!=0 && !stub && previousScriptId!=0 && kind==FunctionKind.Normal && (flags&4)==0 {
+      run need(&r.*,&mut engine,realm,bodyLength)
+      let kept=DeferredBody { scriptId:r.activeScriptId,source:0,position:usize.toU32(r.position),
+        codeLength:usize.toU32(codeLength),locals:usize.toU32(locals),constants:usize.toU32(constants),stack:stack,
+        scriptIsEval:r.activeScriptIsEval }
+      run deferBody(&mut r,realm,code,kept)
+      r.position=r.position+bodyLength
+      r.activeScriptId = previousScriptId
+      r.activeScriptIsEval = previousScriptIsEval
+      return value
+    }
+    run readVarDefs(&mut r,&mut engine,realm,code,locals)
+    run readCode(&mut r,&mut engine,realm,code,codeLength)
+  } else {
+    run readVarDefs(&mut r,&mut engine,realm,code,locals)
+    run readClosures(&mut r,&mut engine,realm,code,closures)
+    run readCode(&mut r,&mut engine,realm,code,codeLength)
   }
-  i=0
-  while i<closures {
-    let varName=run atom(&mut r,&mut engine,realm) let index=run lebU16(&mut r,&mut engine,realm)
-    let bits=u64.toU16(run fixed(&mut r,&mut engine,realm,2))
-    if (bits&0xfc00)!=0 { return run error(&mut engine,realm,b"invalid closure flags") }
-    let varKind=run variableKind(&mut engine,realm,u16.toU8(u16.shiftRight(bits,5)&15))
-    let b=code.getMut(&mut anchor)
-    run b.closureVars.append(ClosureVar { name:duplicateAtom(&mut engine,realm,varName),variableIndex:index,
-      kind:closureKind(bits),isConst:(bits&8)!=0,isLexical:(bits&16)!=0,variableKind:varKind,depth:CLOSURE_NO_DEPTH })
-    i=i+1
-  }
-  // Scope captures sit behind the ones with cells (js_compiler_scopes.compact).
-  let compacted=code.getMut(&mut anchor)
-  let mut scoped:usize=0
-  while scoped<closures && compacted.closureVars.get(closures-1-scoped).kind==ClosureKind.Scope { scoped=scoped+1 }
-  compacted.scopeCaptures=usize.toU16(scoped) drop compacted
-  run readCode(&mut r,&mut engine,realm,code,codeLength)
   if stub {
     // The stub's placeholder: one shared static invalid opcode, as js_compiler_finish.defer makes it.
     let placeholder=code.getMut(&mut anchor)
     placeholder.code=ByteStorage.Borrowed { data:Pointer.fromRef<u8>(&STUB_CODE[0]),length:1 }
     placeholder.frameCells=scopes.inlineFrameCells(varc,stack,refs,0)
   } else if r.trusted { run deriveCallFacts(code) }
-  if (flags&1024)!=0 {
-    let filename=run atom(&mut r,&mut engine,realm)
-    let b=code.getMut(&mut anchor)
-    b.debug=Option<FunctionDebugInfo>.some(FunctionDebugInfo { filename:duplicateAtom(&mut engine,realm,filename),
-      nodeVm:false,nodeSourceURL:false,lineOffset:0,columnOffset:0,sourceColumnOffset:0,
-      source:Option<SourceText>.none(),lines:ThinBox<LineTables>.none(),pendingLines:ThinBox<PendingLines>.none(), definition: SourceLocation { line: 0, column: 0 } }) drop b
-    let lines=run count(&mut r,&mut engine,realm)
-    let lineBytes=run copiedBytes(&mut r,&mut engine,realm,lines)
-    let tables=run LineTables.boxed(run ByteStorage.copy(lineBytes.asSlice()),Option<ByteStorage>.none())
-    let linesDebug=code.getMut(&mut anchor)
-    match &mut linesDebug.debug { Option<FunctionDebugInfo>.Some { value:debug }=>{ debug.lines=move tables } _=>() } drop linesDebug
-    if (r.flags&LAZY)!=0 {
-      let text=run sourceText(&mut r,&mut engine,realm)
-      let b=code.getMut(&mut anchor)
-      match &mut b.debug { Option<FunctionDebugInfo>.Some { value:debug }=>{ debug.source=move text } _=>() }
-    } else {
-      let source=run count(&mut r,&mut engine,realm)
-      if source!=0 {
-        let sourceBytes=run copiedBytes(&mut r,&mut engine,realm,source)
-        let b=code.getMut(&mut anchor)
-        match &mut b.debug { Option<FunctionDebugInfo>.Some { value:debug }=>{ debug.source=Option<SourceText>.some(SourceText.Owned { bytes:move sourceBytes }) } _=>() }
-      }
-    }
-  }
-  i=0
-  while i<constants {
-    let child=run readValue(&mut r,&mut engine,realm)
-    let b=code.getMut(&mut anchor)
-    run b.constants.append(unsafe child.retained()) i=i+1
-  }
+  if (r.flags&DEFER)==0 && (flags&1024)!=0 { run readDebug(&mut r,&mut engine,realm,code) }
+  run readConstants(&mut r,&mut engine,realm,code,constants)
   if stub {
     let pending=run stubDefinition(&mut r,&mut engine,realm,code)
     let b=code.getMut(&mut anchor)
@@ -788,8 +926,10 @@ effect fn decodeBytes<'a,'b,'m,S:EngineServices>(engine:&mut Engine<'m,S>,realm:
   let mut r=Reader { data:bytes,length:length,position:0,flags:flags,rom:(flags&ROM_DATA)!=0,
     activeScriptId:0,activeScriptIsEval:false,
     trusted:trusted,shared:shared,leases:leases,firstAtom:first,atoms:List<u32>.make(),references:List<ValueBits>.make(),
-    roots:ValueList.make(),modules:List<CellRef<ModuleDef>>.make(),sources:List<ValueBits>.make() }
+    roots:ValueList.make(),modules:List<CellRef<ModuleDef>>.make(),sources:List<ValueBits>.make(),deferSource:0,resumed:false,
+    lentAtoms:noAtoms(),lentAtomCount:0,lentTexts:noTexts(),lentTextCount:0 }
   if (flags&LAZY)!=0 && !trusted { return run error(&mut engine,realm,b"lazy bytecode requires a trusted read") }
+  if (flags&DEFER)!=0 && (flags&LAZY)==0 { return run error(&mut engine,realm,b"deferred bytecode requires the lazy wire") }
   let decoded=run Effect.result(body(&mut r,&mut engine,realm))
   let failed=match &decoded { Result<ValueBits,OutOfMemoryError|JsException|StringLengthError|BigIntError>.Failure {..}=>true _=>false }
   let rt=realm.runtime()
@@ -814,6 +954,52 @@ effect fn decodeBytes<'a,'b,'m,S:EngineServices>(engine:&mut Engine<'m,S>,realm:
       BigIntError _bigintError=>run engine.throwError(realm,NativeErrorKind.Range,b"BigInt is too large to allocate")
     }
   }
+}
+/// Reads the body a DEFER read left in its bytes into function bytecode node,
+/// in place, so every closure of the function keeps working. A node that is not
+/// such a stub is left alone. The bytes are trusted and were read once already,
+/// so nothing here fails short of running out of memory, which traps: the stub
+/// is half filled by then and no caller could retry it.
+pub unsafe effect fn finishDeferred<'m,S:EngineServices>(engine:&mut Engine<'m,S>,node:*mut HeapHeader)->() ?&mut Allocator {
+  let code=unsafe CellRef<FunctionBytecode>.of(node)
+  let mut anchor=()
+  let b=code.getMut(&mut anchor)
+  if b.pending.isNone() { return () }
+  let body=match &b.pending.get().deferred { Option<DeferredBody>.Some { value }=>value _=>{ return () } }
+  let context=b.realm
+  let taken=b.pending.take() drop taken
+  b.stackSize=body.stack
+  b.frameCells=scopes.inlineFrameCells(b.variableCount,body.stack,b.varRefCount,b.scopeSlots)
+  drop b
+  let realm=unsafe lendRealm(&context,context)
+  let rt=realm.runtime()
+  let stateAnchor=() let state=unsafe HeapCell.payload<RuntimeState,()>(&stateAnchor,rt)
+  let source=state.deferredSources.get(u32.toUsize(body.source))
+  let mut lentAtoms=noAtoms() let mut lentTexts=noTexts()
+  if source.atomCount!=0 { lentAtoms=Pointer.fromRef<u32>(&state.deferredAtoms.asSlice()[u32.toUsize(source.atomStart)]) }
+  if source.textCount!=0 { lentTexts=Pointer.fromRef<ValueBits>(&state.deferredTexts.asSlice()[u32.toUsize(source.textStart)]) }
+  drop state
+  let held=()
+  let mut r=Reader { data:unsafe Pointer.borrowMany<(),u8>(&held,unsafe Pointer.assumeMany<u8>(source.data),source.length),length:source.length,
+    position:u32.toUsize(body.position),flags:source.flags,rom:false,
+    activeScriptId:body.scriptId,activeScriptIsEval:body.scriptIsEval,
+    trusted:true,shared:&[],leases:&[],firstAtom:source.firstAtom,atoms:List<u32>.make(),references:List<ValueBits>.make(),
+    roots:ValueList.make(),modules:List<CellRef<ModuleDef>>.make(),sources:List<ValueBits>.make(),deferSource:body.source+1,resumed:true,
+    lentAtoms:lentAtoms,lentAtomCount:u32.toUsize(source.atomCount),lentTexts:lentTexts,lentTextCount:u32.toUsize(source.textCount) }
+  let outcome=run Effect.result(deferredBody(&mut r,&mut engine,realm,code,body))
+  let mut i:usize=0
+  while i<r.roots.length() { unsafe r.roots.take(i).release(&mut engine,rt) i=i+1 }
+  match move outcome {
+    Result<(),OutOfMemoryError|JsException|StringLengthError|BigIntError>.Success { .. }=>()
+    Result<(),OutOfMemoryError|JsException|StringLengthError|BigIntError>.Failure { .. }=>Intrinsic.trap("deferred function body did not read back")
+  }
+}
+effect fn deferredBody<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>,
+  code:CellRef<FunctionBytecode>,body:DeferredBody)->() !OutOfMemoryError|JsException|StringLengthError|BigIntError ?&mut Allocator {
+  run readVarDefs(&mut r,&mut engine,realm,code,u32.toUsize(body.locals))
+  run readCode(&mut r,&mut engine,realm,code,u32.toUsize(body.codeLength))
+  run deriveCallFacts(code)
+  run readConstants(&mut r,&mut engine,realm,code,u32.toUsize(body.constants))
 }
 /// Copies bytecode; never retains pointers into bytes. ROM_DATA is rejected.
 /// SAB addresses require explicit readObjectShared relocation entries.

@@ -87,26 +87,48 @@ function input() {
   return stream;
 }
 
+// Set by install: writes console text to fd 1 or 2 with no stream, or declines.
+let direct;
+
 function install(process) {
   let stdin, stdout, stderr;
-  // In particular, do not inspect/open fd 0 here: the CLI may still need to
-  // synchronously consume piped program source before application execution.
-  Object.defineProperties(process, {
-    stdin: { configurable: true, enumerable: true, get() { return stdin ||= input(); } },
-    stdout: { configurable: true, enumerable: true, get() {
+  const kinds = [];
+  // console prints through this while a standard stream is untouched: nobody
+  // has read process.stdout (or stderr) or redefined it, so there is no stream
+  // whose write, listeners or pending data the text could bypass. Files and
+  // POSIX terminals take synchronous writes, as their streams do; pipes and
+  // sockets go through their transport, and so through the stream.
+  direct = (fd, text) => {
+    const name = fd === 1 ? 'stdout' : 'stderr';
+    if (fd === 1 ? stdout : stderr) return false;
+    const descriptor = Object.getOwnPropertyDescriptor(process, name);
+    if (!descriptor || descriptor.get !== getters[name]) return false;
+    kinds[fd] ??= native('guessHandleType', [fd]);
+    if (kinds[fd] !== 5 && kinds[fd] !== 6 || process.platform === 'win32') return false;
+    return host.writeText(fd, text);
+  };
+  const getters = {
+    stdout() {
       if (!stdout) {
         stdout = output(1);
         if (stdout.isTTY) process.on('SIGWINCH', () => stdout._refreshSize());
       }
       return stdout;
-    } },
-    stderr: { configurable: true, enumerable: true, get() {
+    },
+    stderr() {
       if (!stderr) {
         stderr = output(2);
         if (stderr.isTTY) process.on('SIGWINCH', () => stderr._refreshSize());
       }
       return stderr;
-    } }
+    },
+  };
+  // In particular, do not inspect/open fd 0 here: the CLI may still need to
+  // synchronously consume piped program source before application execution.
+  Object.defineProperties(process, {
+    stdin: { configurable: true, enumerable: true, get() { return stdin ||= input(); } },
+    stdout: { configurable: true, enumerable: true, get: getters.stdout },
+    stderr: { configurable: true, enumerable: true, get: getters.stderr }
   });
   process.openStdin = () => { const stream = process.stdin; stream.resume(); return stream; };
   // Explicit process.exit bypasses native state teardown. Restore terminal mode
@@ -114,4 +136,4 @@ function install(process) {
   process.on('exit', () => native('ttyResetMode', []));
 }
 
-module.exports = { install };
+module.exports = { install, direct: (fd, text) => direct !== undefined && direct(fd, text) };
