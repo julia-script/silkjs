@@ -57,6 +57,7 @@ function applyInspectorOption(arg) {
 const environmentOptions = new Map([
   ...reportOptions.optionEntries,
   ...startupControls.optionEntries,
+  ...require('internal/heap_prof').optionEntries,
   ...permission.optionEntries,
   ...[...inspectorEnableOptions, '--no-inspect', '--no-inspect-brk', '--no-inspect-wait',
     '--experimental-inspector-network-resource', '--no-experimental-inspector-network-resource'].map(name => [name, false]),

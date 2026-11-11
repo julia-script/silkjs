@@ -259,9 +259,23 @@ function checkCallback(callback) { if (typeof callback !== 'function') throw Obj
 function invoke(callback, receiver, args) {
   try { return Reflect.apply(callback, receiver, args); }
   catch (error) {
-    if (process.domain && internalRequire('domain')._handleException(error)) return;
-    internalRequire('internal/startup_controls').handleUncaught(error, 'uncaughtException');
+    try {
+      if (process.domain && internalRequire('domain')._handleException(error)) return;
+      internalRequire('internal/startup_controls').handleUncaught(error, 'uncaughtException');
+    } catch (next) {
+      if (next === error || !workerThreads.isMainThread) throw next;
+      exceptionInFatalHandler(next);
+    }
   }
+}
+// A domain error handler or uncaughtException listener that throws ends the process
+// with Node's kExceptionInFatalExceptionHandler status, without 'exit' listeners.
+function exceptionInFatalHandler(error) {
+  host.abortOnUncaughtException?.(error);
+  let text;
+  try { text = internalRequire('util').inspect(error); } catch { text = String(error); }
+  try { internalRequire('fs').writeSync(2, text + '\n'); } catch {}
+  rawStd.exit(7);
 }
 const rejections = new Map();
 const reportedRejections = new WeakMap();
@@ -514,7 +528,7 @@ Object.assign(process, {
   emitWarning: internalRequire('internal/startup_controls').emitWarning,
   setUncaughtExceptionCaptureCallback: internalRequire('internal/startup_controls').setUncaughtExceptionCaptureCallback,
   hasUncaughtExceptionCaptureCallback: internalRequire('internal/startup_controls').hasUncaughtExceptionCaptureCallback,
-  exit(code) { if (code !== undefined) process.exitCode = code; if (!process._exiting) { process._exiting = true; process.emit('exit', Number(process.exitCode) || 0); } internalRequire('internal/compile_cache').flushCompileCache(); rawStd.exit(Number(process.exitCode) || 0); },
+  exit(code) { if (code !== undefined) process.exitCode = code; if (!process._exiting) { process._exiting = true; process.emit('exit', Number(process.exitCode) || 0); } internalRequire('internal/compile_cache').flushCompileCache(); internalRequire('internal/startup_controls').traceExit(Number(process.exitCode) || 0); if (moduleHas('internal/heap_prof')) internalRequire('internal/heap_prof').finish(); rawStd.exit(Number(process.exitCode) || 0); },
   kill(pid, signal = 'SIGTERM') { const number = typeof signal === 'string' ? rawOS[signal] : signal; if (number === undefined) throw Object.assign(new TypeError('Unknown signal: ' + signal), { code: 'ERR_UNKNOWN_SIGNAL' }); const code = rawOS.kill(pid, number); if (code < 0) throw systemError(code, 'kill'); return true; }
 });
 Object.defineProperty(process, 'config', { writable: false });
@@ -726,6 +740,7 @@ function runtimeFlag(arg) {
   try {
     if (internalRequire('internal/permission').applyOption(arg) ||
         internalRequire('internal/startup_controls').applyOption(arg) ||
+        internalRequire('internal/heap_prof').applyOption(arg) ||
         internalRequire('internal/options').applyInspectorOption(arg)) return true;
   }
   catch (error) { cliError(error.message); return true; }
@@ -799,6 +814,8 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
   }
   internalRequire('internal/permission').initialize({ entrypoints });
   internalRequire('internal/startup_controls').initialize();
+  const heapProfileProblem = internalRequire('internal/heap_prof').start();
+  if (heapProfileProblem) return cliError(heapProfileProblem);
   if (host.enableSourceMaps || moduleHas('internal/source_maps')) process.setSourceMapsEnabled(!!host.enableSourceMaps);
   host.typeScriptMode = host.transformTypes ? 'transform' : host.stripTypes === false ? false : 'strip';
   host.initialExecArgv = process.execArgv.slice();
@@ -850,7 +867,7 @@ function runWorker() {
     if (arg === '--input-type') { inputType = runtimeArgs[++index]; continue; }
     if (arg.startsWith('--input-type=')) { inputType = arg.slice(13); continue; }
     if (arg === '--env-file' || arg === '--env-file-if-exists') { index++; continue; }
-    if (['--localstorage-file', '-r', '--require', '--import', '-C', '--conditions'].includes(arg) || internalRequire('internal/process_report').isValueOption(arg) || internalRequire('internal/startup_controls').isValueOption(arg) || internalRequire('internal/permission').isValueOption(arg) || internalRequire('internal/options').isInspectorValueOption(arg)) {
+    if (['--localstorage-file', '-r', '--require', '--import', '-C', '--conditions'].includes(arg) || internalRequire('internal/process_report').isValueOption(arg) || internalRequire('internal/startup_controls').isValueOption(arg) || internalRequire('internal/heap_prof').isValueOption(arg) || internalRequire('internal/permission').isValueOption(arg) || internalRequire('internal/options').isInspectorValueOption(arg)) {
       runtimeFlag((arg === '-r' ? '--require' : arg === '-C' ? '--conditions' : arg) + '=' + runtimeArgs[++index]); continue;
     }
     runtimeFlag(arg);
@@ -1007,12 +1024,15 @@ function run() {
     }
     if (['--localstorage-file=', '--require=', '--import=', '--conditions='].includes(arg) ||
         (arg.endsWith('=') && (internalRequire('internal/process_report').isValueOption(arg.slice(0, -1)) ||
+          internalRequire('internal/startup_controls').isValueOption(arg.slice(0, -1)) ||
+          internalRequire('internal/heap_prof').isValueOption(arg.slice(0, -1)) ||
           internalRequire('internal/permission').isValueOption(arg.slice(0, -1))))) return cliError(arg + ' requires an argument');
     if (runtimeFlag(arg)) { record(arg); continue; }
     if (arg === '--trace-event-categories' || arg === '--trace-event-file-pattern' || arg === '--localstorage-file' ||
         arg === '-r' || arg === '--require' || arg === '--import' || arg === '-C' || arg === '--conditions' ||
         internalRequire('internal/process_report').isValueOption(arg) ||
         internalRequire('internal/startup_controls').isValueOption(arg) ||
+        internalRequire('internal/heap_prof').isValueOption(arg) ||
         internalRequire('internal/permission').isValueOption(arg) ||
         internalRequire('internal/options').isInspectorValueOption(arg) ||
         arg === '--experimental-sea-config' || arg.startsWith('--experimental-sea-config=')) {
@@ -1020,7 +1040,7 @@ function run() {
       const name = arg === '-r' ? '--require' : arg === '-C' ? '--conditions' : separator < 0 ? arg : arg.slice(0, separator);
       const value = separator < 0 ? args[++index] : arg.slice(separator + 1);
       if (value === undefined || (separator < 0 && internalRequire('internal/options').isInspectorValueOption(name) && value.startsWith('-')) ||
-          ((['--localstorage-file', '--require', '--import', '--conditions'].includes(name) || internalRequire('internal/process_report').isValueOption(name) || internalRequire('internal/startup_controls').isValueOption(name) || internalRequire('internal/permission').isValueOption(name)) &&
+          ((['--localstorage-file', '--require', '--import', '--conditions'].includes(name) || internalRequire('internal/process_report').isValueOption(name) || internalRequire('internal/startup_controls').isValueOption(name) || internalRequire('internal/heap_prof').isValueOption(name) || internalRequire('internal/permission').isValueOption(name)) &&
           (value === '' || (separator < 0 && value.startsWith('-'))))) return cliError(name + ' requires an argument');
       record(arg, ...(separator < 0 ? [value] : []));
       if (name === '--experimental-sea-config') { sea.prepare(value); return; }
@@ -1334,6 +1354,7 @@ function loop() {
   performanceMilestones.loopExit = native.now() - startTime;
   process._exiting = true; const status = Number(process.exitCode) || 0;
   process.emit('exit', status);
+  if (moduleHas('internal/heap_prof')) internalRequire('internal/heap_prof').finish();
   if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushCompileCache();
   return Number(process.exitCode) || 0;
 }

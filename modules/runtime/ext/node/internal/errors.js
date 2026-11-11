@@ -118,9 +118,26 @@ function missingArgsMessage(...args) {
   return `${msg} must be specified`;
 }
 
+// Like Node's NodeError: the constructor reads as the base class, and both toString() and
+// the stack header carry the code, as in "TypeError [ERR_INVALID_ARG_TYPE]: ...".
+const nodeErrors = new Map();
+function nodeErrorClass(Base, code) {
+  const key = `${Base.name} ${code}`;
+  let NodeError = nodeErrors.get(key);
+  if (NodeError === undefined) {
+    NodeError = class NodeError extends Base {
+      get ['constructor']() { return Base; }
+      toString() { return `${this.name} [${code}]: ${this.message}`; }
+    };
+    nodeErrors.set(key, NodeError);
+  }
+  return NodeError;
+}
 function make(Base, code, message) {
-  const error = new Base(message);
+  const error = new (nodeErrorClass(Base, code))(message);
   Object.defineProperty(error, 'code', { value: code, enumerable: true, writable: true, configurable: true });
+  const stack = error.stack, prefix = `${error.name}: `;
+  if (typeof stack === 'string' && stack.startsWith(prefix)) error.stack = `${error.name} [${code}]: ${stack.slice(prefix.length)}`;
   return error;
 }
 

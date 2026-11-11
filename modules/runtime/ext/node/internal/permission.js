@@ -61,7 +61,9 @@ function applyOption(arg) {
   const separator = indexOf(arg, '=');
   const name = separator < 0 ? arg : slice(arg, 0, separator);
   if (isValueOption(name)) {
-    if (separator < 0 || separator === arg.length - 1) throw new ErrorClass(name + ' requires an argument');
+    // The bare spelling takes its value from the next argument, which the caller joins on.
+    if (separator < 0) return false;
+    if (separator === arg.length - 1) throw new ErrorClass(name + ' requires an argument');
     push(name === '--allow-fs-read' ? readGrants : writeGrants, slice(arg, separator + 1));
     return true;
   }

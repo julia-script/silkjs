@@ -1,6 +1,12 @@
 'use strict';
 
 const EventEmitter = require('events');
+const host = require('internal/host');
+if (process.hasUncaughtExceptionCaptureCallback()) {
+  throw Object.assign(new Error('A callback was registered through process.setUncaughtExceptionCaptureCallback(), which is mutually exclusive with using the `domain` module'), { code: 'ERR_DOMAIN_CALLBACK_NOT_AVAILABLE' });
+}
+// The stack where `domain` was required, appended to the capture-callback error below.
+const domainRequireStack = new Error('require(`domain`) at this point').stack;
 const { createHook } = require('async_hooks');
 let stack = [];
 let active = null;
@@ -95,11 +101,16 @@ class Domain extends EventEmitter {
     while (exports.active === this) this.exit();
     let caught = false;
     if (!stack.length) {
-      if (this.listenerCount('error')) caught = this.emit('error', error);
+      // With the top-level domain gone nothing captures a throw from its handler, so
+      // --abort-on-uncaught-exception aborts there, as V8 does when Node clears the capture.
+      if (this.listenerCount('error')) {
+        if (!host.abortOnUncaughtException) caught = this.emit('error', error);
+        else try { caught = this.emit('error', error); } catch (next) { host.abortOnUncaughtException(next); }
+      }
     } else {
       try { caught = this.emit('error', error); }
       catch (next) {
-        if (!stack.length) throw next;
+        if (!stack.length) { host.abortOnUncaughtException?.(next); throw next; }
         setActive(stack[stack.length - 1]);
         caught = process.domain._errorHandler(next);
       }
@@ -120,14 +131,13 @@ exports._associateResource = function(resource, domain) {
   else pairing.delete(resource.asyncId());
 };
 
-if (process.hasUncaughtExceptionCaptureCallback?.()) {
-  throw Object.assign(new Error('A domain cannot be loaded while an uncaught exception capture callback is set'), { code: 'ERR_DOMAIN_CALLBACK_NOT_AVAILABLE' });
-}
 process.hasUncaughtExceptionCaptureCallback = function() {
   return stack.some(domain => domain.listenerCount('error') > 0);
 };
 process.setUncaughtExceptionCaptureCallback = function() {
-  throw Object.assign(new Error('The domain module is in use; cannot set an uncaught exception capture callback'), { code: 'ERR_DOMAIN_CANNOT_SET_UNCAUGHT_EXCEPTION_CAPTURE' });
+  const error = Object.assign(new Error('The `domain` module is in use, which is mutually exclusive with calling process.setUncaughtExceptionCaptureCallback()'), { code: 'ERR_DOMAIN_CANNOT_SET_UNCAUGHT_EXCEPTION_CAPTURE' });
+  error.stack += `\n${'-'.repeat(40)}\n${domainRequireStack}`;
+  throw error;
 };
 
 // Install only when domain is loaded, as Node does; ordinary emitters retain
