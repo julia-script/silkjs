@@ -25,7 +25,9 @@
 'use strict';
 
 const {
+  ArrayFrom,
   ArrayPrototypePush,
+  ArrayPrototypeSort,
   Error,
   ErrorCaptureStackTrace,
   FunctionPrototypeSymbolHasInstance,
@@ -40,6 +42,7 @@ const {
   Promise,
   ReflectApply,
   ReflectConstruct,
+  SafeMap,
   SafeSet,
   SymbolPrototypeGetDescription,
   StringPrototypeReplace,
@@ -344,9 +347,37 @@ function deprecateInstantiation(target, code, ...args) {
   return ReflectConstruct(target, args);
 }
 
+// Node builds this from internalBinding('string_decoder').encodings.
+const encodingsMap = { __proto__: null, ascii: 0, utf8: 1, base64: 2, utf16le: 3, latin1: 4, hex: 5, buffer: 6, base64url: 7 };
+
 // The system error tables live in internal/util_public/system here.
 function getSystemErrorName(err) {
   return require('internal/util_public/system').getSystemErrorName(err);
+}
+
+const experimentalWarnings = new SafeSet();
+function emitExperimentalWarning(feature, messagePrefix, code, ctor) {
+  if (experimentalWarnings.has(feature)) return;
+  experimentalWarnings.add(feature);
+  let msg = `${feature} is an experimental feature and might change at any time`;
+  if (messagePrefix) {
+    msg = messagePrefix + msg;
+  }
+  process.emitWarning(msg, 'ExperimentalWarning', code, ctor);
+}
+
+function filterDuplicateStrings(items, low) {
+  const map = new SafeMap();
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    const key = StringPrototypeToLowerCase(item);
+    if (low) {
+      map.set(key, key);
+    } else {
+      map.set(key, item);
+    }
+  }
+  return ArrayPrototypeSort(ArrayFrom(map.values()));
 }
 
 module.exports = {
@@ -355,6 +386,9 @@ module.exports = {
   customPromisifyArgs: kCustomPromisifyArgsSymbol,
   deprecate,
   deprecateInstantiation,
+  emitExperimentalWarning,
+  filterDuplicateStrings,
+  encodingsMap,
   getDeprecationWarningEmitter,
   getSystemErrorName,
   isError,

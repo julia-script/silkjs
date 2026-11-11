@@ -1,4 +1,4 @@
-// Adapted from Node.js v24.11.0 for Silk QuickJS.
+// Adapted from Node.js v24.22.1 for Silk QuickJS.
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -24,6 +24,7 @@
 
 const {
   JSONParse,
+  Uint8Array,
 } = require('internal/streams/primordials');
 
 const {
@@ -74,6 +75,14 @@ async function buffer(stream) {
 
 /**
  * @param {AsyncIterable|ReadableStream|Readable} stream
+ * @returns {Promise<Uint8Array>}
+ */
+async function bytes(stream) {
+  return new Uint8Array(await arrayBuffer(stream));
+}
+
+/**
+ * @param {AsyncIterable|ReadableStream|Readable} stream
  * @returns {Promise<string>}
  */
 async function text(stream) {
@@ -104,6 +113,7 @@ module.exports = {
   arrayBuffer,
   blob,
   buffer,
+  bytes,
   text,
   json,
 };
