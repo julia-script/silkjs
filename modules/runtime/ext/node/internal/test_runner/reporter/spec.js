@@ -1,0 +1,165 @@
+// Adapted from Node.js v24.22.1 lib/internal/test_runner/reporter/spec.js.
+// Copyright Joyent, Inc. and other Node contributors.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the
+// following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+// USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+'use strict';
+const {
+  ArrayPrototypeJoin,
+  ArrayPrototypePop,
+  ArrayPrototypePush,
+  ArrayPrototypeShift,
+  ArrayPrototypeUnshift,
+  Date,
+  DatePrototypeToLocaleString,
+} = require('internal/per_context/primordials');
+const assert = require('assert');
+const Transform = require('stream').Transform;
+const colors = require('internal/util/colors');
+const { kSubtestsFailed } = require('internal/test_runner/support');
+const { getCoverageReport } = require('internal/test_runner/coverage_report');
+const { relative } = require('path');
+const {
+  formatTestReport,
+  indent,
+  reporterColorMap,
+  reporterUnicodeSymbolMap,
+} = require('internal/test_runner/reporter/utils');
+
+class SpecReporter extends Transform {
+  #stack = [];
+  #reported = [];
+  #failedTests = [];
+  #cwd = process.cwd();
+
+  constructor() {
+    super({ __proto__: null, writableObjectMode: true });
+    colors.refresh();
+  }
+
+  #formatFailedTestResults() {
+    if (this.#failedTests.length === 0) {
+      return '';
+    }
+
+    const results = [
+      `\n${reporterColorMap['test:fail']}${reporterUnicodeSymbolMap['test:fail']}failing tests:${colors.white}\n`,
+    ];
+
+    for (let i = 0; i < this.#failedTests.length; i++) {
+      const test = this.#failedTests[i];
+      const formattedErr = formatTestReport('test:fail', test);
+
+      if (test.file) {
+        const relPath = relative(this.#cwd, test.file);
+        const location = `test at ${relPath}:${test.line}:${test.column}`;
+        ArrayPrototypePush(results, location);
+      }
+
+      ArrayPrototypePush(results, formattedErr);
+    }
+
+    this.#failedTests = []; // Clean up the failed tests
+    return ArrayPrototypeJoin(results, '\n');
+  }
+  #handleTestReportEvent(type, data) {
+    const subtest = ArrayPrototypeShift(this.#stack); // This is the matching `test:start` event
+    if (subtest) {
+      assert(subtest.type === 'test:start');
+      assert(subtest.data.nesting === data.nesting);
+      assert(subtest.data.name === data.name);
+    }
+    let prefix = '';
+    while (this.#stack.length) {
+      // Report all the parent `test:start` events
+      const parent = ArrayPrototypePop(this.#stack);
+      assert(parent.type === 'test:start');
+      const msg = parent.data;
+      ArrayPrototypeUnshift(this.#reported, msg);
+      prefix += `${indent(msg.nesting)}${reporterUnicodeSymbolMap['arrow:right']}${msg.name}\n`;
+    }
+    const indentation = indent(data.nesting);
+    return `${formatTestReport(type, data, false, prefix, indentation)}\n`;
+  }
+  #handleEvent({ type, data }) {
+    switch (type) {
+      case 'test:fail':
+        if (data.details?.error?.failureType !== kSubtestsFailed) {
+          ArrayPrototypePush(this.#failedTests, data);
+        }
+        return this.#handleTestReportEvent(type, data);
+      case 'test:pass':
+        return this.#handleTestReportEvent(type, data);
+      case 'test:start':
+        ArrayPrototypeUnshift(this.#stack, { __proto__: null, data, type });
+        break;
+      case 'test:stderr':
+      case 'test:stdout':
+        return data.message;
+      case 'test:diagnostic':
+      case 'test:log': {
+        const diagnosticColor = reporterColorMap[data.level] || reporterColorMap[type];
+        return `${diagnosticColor}${indent(data.nesting)}${reporterUnicodeSymbolMap[type]}${data.message}${colors.white}\n`;
+      }
+      case 'test:coverage':
+        return getCoverageReport(indent(data.nesting), data.summary,
+                                 reporterUnicodeSymbolMap['test:coverage'], colors.blue, true);
+      case 'test:summary':
+        // We report only the root test summary
+        if (data.file === undefined) {
+          return this.#formatFailedTestResults();
+        }
+        break;
+      case 'test:watch:restarted':
+        return `\nRestarted at ${DatePrototypeToLocaleString(new Date())}\n`;
+      case 'test:interrupted':
+        return this.#formatInterruptedTests(data.tests);
+    }
+  }
+  #formatInterruptedTests(tests) {
+    if (tests.length === 0) {
+      return '';
+    }
+
+    const results = [
+      `\n${colors.yellow}Interrupted while running:${colors.white}\n`,
+    ];
+
+    for (let i = 0; i < tests.length; i++) {
+      const test = tests[i];
+      let msg = `${indent(test.nesting)}${reporterUnicodeSymbolMap['warning:alert']}${test.name}`;
+      if (test.file) {
+        const relPath = relative(this.#cwd, test.file);
+        msg += ` ${colors.gray}(${relPath}:${test.line}:${test.column})${colors.white}`;
+      }
+      ArrayPrototypePush(results, msg);
+    }
+
+    return ArrayPrototypeJoin(results, '\n') + '\n';
+  }
+  _transform({ type, data }, encoding, callback) {
+    callback(null, this.#handleEvent({ __proto__: null, type, data }));
+  }
+  _flush(callback) {
+    callback(null, this.#formatFailedTestResults());
+  }
+}
+
+module.exports = SpecReporter;

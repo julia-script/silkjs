@@ -76,129 +76,130 @@ function httpServerPreClose(server) {
   if (server._checkTimer) { clearInterval(server._checkTimer); server._checkTimer = null; }
 }
 
-class Server extends net.Server {
-  constructor(options, requestListener) {
-    if (typeof options === 'function') { requestListener = options; options = {}; }
-    options = options || {};
-    super({ ...options, allowHalfOpen: true });
-    storeHTTPOptions.call(this, options);
-    if (requestListener) this.on('request', requestListener);
-    this.on('connection', socket => this._connection(socket));
-  }
-  setTimeout(msecs, callback) { this.timeout = msecs; if (callback) this.on('timeout', callback); return this; }
-  close(callback) {
-    httpServerPreClose(this);
-    return super.close(callback);
-  }
-  _checkConnections() {
-    const now = Date.now();
-    for (const state of this._httpSockets.values()) {
-      if ((state.headerStart && this.headersTimeout > 0 && now - state.headerStart >= this.headersTimeout) ||
-          (state.requestStart && this.requestTimeout > 0 && now - state.requestStart >= this.requestTimeout)) state.expire();
-    }
-  }
-  closeAllConnections() { for (const [socket] of this._httpSockets) socket.destroy(); }
-  closeIdleConnections() { for (const [socket, state] of this._httpSockets) if (!state.responses.length && !state.current) socket.destroy(); }
-  _connection(socket) {
-    const state = { responses: [], requests: new Set(), current: null, count: 0, upgraded: false, ended: false, failed: false, headerStart: 0, requestStart: 0, expire: null };
-    this._httpSockets.set(socket, state);
-    setupConnectionsTracking.call(this);
-    socket.setNoDelay(true); socket.setTimeout(this.timeout);
-    const clearTimers = () => { state.headerStart = state.requestStart = 0; };
-    const clientError = err => {
-      if (state.failed || state.upgraded) return;
-      state.failed = true; clearTimers(); parser.stopped = true;
-      err.rawPacket = state.lastPacket;
-      if (!this.emit('clientError', err, socket)) {
-        if (socket.writable && !socket.destroyed && (!state.responses.length || !state.responses[0].headersSent)) {
-          const code = err.code === 'HPE_HEADER_OVERFLOW' ? 431 : err.code === 'ERR_HTTP_REQUEST_TIMEOUT' ? 408 : 400;
-          socket.end('HTTP/1.1 ' + code + ' ' + STATUS_CODES[code] + '\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
-        } else socket.destroy();
-      }
-    };
-    state.expire = () => clientError(error('ERR_HTTP_REQUEST_TIMEOUT', 'Request timeout'));
-    const armHeaders = () => { if (this.headersTimeout > 0 && !state.headerStart) state.headerStart = Date.now(); };
-    const armRequest = () => { if (this.requestTimeout > 0 && !state.requestStart) state.requestStart = Date.now(); };
-    const parser = new Parser('request', {
-      canResume: () => !state.outputPaused,
-      headers: info => {
-        state.headerStart = 0;
-        armRequest();
-        socket.setTimeout(this.timeout);
-        const req = new this._IncomingMessage(socket); Object.assign(req, info);
-        req.joinDuplicateHeaders = this.joinDuplicateHeaders; req._keepAlive = info.keepAlive; req._parser = parser;
-        state.current = req; state.requests.add(req); state.count++;
-        if (info.upgrade && info.method !== 'CONNECT' && !this.shouldUpgradeCallback(req)) { info.upgrade = false; req.upgrade = false; }
-        req.on('close', () => state.requests.delete(req));
-        if (info.upgrade) return { upgrade: true };
-        const res = new this._ServerResponse(req, this._responseOptions);
-        req.res = res; res._active = state.responses.length === 0;
-        res._keepAliveTimeout = this.keepAliveTimeout; res._maxRequestsPerSocket = this.maxRequestsPerSocket;
-        state.responses.push(res); res.assignSocket(socket);
-        if (this.maxRequestsPerSocket > 0 && state.count >= this.maxRequestsPerSocket) res.shouldKeepAlive = false;
-        res.on('error', err => socket.destroy(err));
-        res.on('finish', () => {
-          if (!req.complete || !req.readableEnded) req._dump();
-          if (state.responses[0] === res) state.responses.shift();
-          res.detachSocket(socket);
-          process.nextTick(() => res._emitClose());
-          if (!res.shouldKeepAlive || ((state.ended || this._httpClosing) && !state.responses.length)) { parser.stopped = true; socket.end(); }
-          else if (state.responses.length) { const next = state.responses[0]; next._active = true; next._flushOutput(); }
-          else if (state.deliverUpgrade) state.deliverUpgrade();
-          else if (req.complete) socket.setTimeout(this.keepAliveTimeout ? this.keepAliveTimeout + this.keepAliveTimeoutBuffer : 0);
-          if (state.outputPaused && state.responses.length < 2 && !parser.stopped) { state.outputPaused = false; parser.resume(); socket.resume(); }
-        });
-        if (this.requireHostHeader && req.httpVersionMinor === 1 && !req.headers.host) { res.statusCode = 400; res.shouldKeepAlive = false; res.end(); }
-        else if (this.maxRequestsPerSocket > 0 && state.count > this.maxRequestsPerSocket) { this.emit('dropRequest', req, socket); res.statusCode = 503; res.end(); }
-        else if (req.headers.expect !== undefined) {
-          if (/^100-continue$/i.test(req.headers.expect)) { if (this.listenerCount('checkContinue')) this.emit('checkContinue', req, res); else { res.writeContinue(); this.emit('request', req, res); } }
-          else if (this.listenerCount('checkExpectation')) this.emit('checkExpectation', req, res);
-          else { res.statusCode = 417; res.end(); }
-        } else this.emit('request', req, res);
-        return {};
-      },
-      body: chunk => { if (state.current._dumped) return true; const ok = state.current.push(chunk); if (!ok) socket.pause(); return ok; },
-      trailers: raw => { state.current.complete = true; state.current._addHeaderLines(raw, raw.length); },
-      complete: () => {
-        const req = state.current; state.current = null; clearTimers();
-        if (req) { req.complete = true; req.push(null); }
-        if (state.responses.length >= 2) { state.outputPaused = true; parser.paused = true; socket.pause(); }
-      },
-      upgrade: (info, head) => {
-        const req = state.current; state.current = null; req.complete = true; req._parser = null;
-        state.upgraded = true; clearTimers(); socket.pause();
-        socket.removeListener('data', onData);
-        state.deliverUpgrade = () => {
-          state.deliverUpgrade = null; detach(); this._httpSockets.delete(socket); socket.setTimeout(0);
-          const event = req.method === 'CONNECT' ? 'connect' : 'upgrade';
-          socket.resume();
-          if (!this.emit(event, req, socket, head)) socket.destroy();
-        };
-        if (!state.responses.length) state.deliverUpgrade();
-      },
-      error: clientError,
-    }, { maxHeaderSize: this.maxHeaderSize, maxHeadersCount: this.maxHeadersCount,
-      httpValidation: this.httpValidation, insecureHTTPParser: this.insecureHTTPParser });
-    const onData = data => {
-      state.lastPacket = data;
-      if (parser.state === 'headers') armHeaders();
-      armRequest();
-      parser.feed(data);
-      if (parser.state === 'headers' && parser.messageStarted) armHeaders();
-    };
-    const onEnd = () => { state.ended = true; parser.end(); if (!state.responses.length) socket.end(); };
-    const onError = err => clientError(err);
-    const onTimeout = () => { let handled = state.current?.emit('timeout') || false; if (state.responses[0]?.emit('timeout')) handled = true; if (this.emit('timeout', socket)) handled = true; if (!handled) socket.destroy(); };
-    const onClose = () => {
-      clearTimers(); parser.stopped = true; this._httpSockets.delete(socket);
-      for (const req of state.requests) req._abort();
-      for (const res of state.responses) if (!res._closed) res.destroy();
-    };
-    const onDrain = () => { if (state.responses.length) state.responses[0]._onSocketDrain(); };
-    const detach = () => { socket.removeListener('drain', onDrain); socket.removeListener('data', onData); socket.removeListener('end', onEnd); socket.removeListener('error', onError); socket.removeListener('timeout', onTimeout); socket.removeListener('close', onClose); };
-    socket.on('data', onData); socket.on('end', onEnd); socket.on('error', onError); socket.on('timeout', onTimeout); socket.on('close', onClose); socket.on('drain', onDrain);
-    armHeaders();
-  }
+function Server(options, requestListener) {
+  if (!(this instanceof Server)) return new Server(options, requestListener);
+  if (typeof options === 'function') { requestListener = options; options = {}; }
+  options = options || {};
+  net.Server.call(this, { ...options, allowHalfOpen: true });
+  storeHTTPOptions.call(this, options);
+  if (requestListener) this.on('request', requestListener);
+  this.on('connection', socket => this._connection(socket));
 }
+Object.setPrototypeOf(Server.prototype, net.Server.prototype);
+Object.setPrototypeOf(Server, net.Server);
+Server.prototype.setTimeout = function setTimeout(msecs, callback) { this.timeout = msecs; if (callback) this.on('timeout', callback); return this; };
+Server.prototype.close = function close(callback) {
+  httpServerPreClose(this);
+  return net.Server.prototype.close.call(this, callback);
+};
+Server.prototype._checkConnections = function _checkConnections() {
+  const now = Date.now();
+  for (const state of this._httpSockets.values()) {
+    if ((state.headerStart && this.headersTimeout > 0 && now - state.headerStart >= this.headersTimeout) ||
+        (state.requestStart && this.requestTimeout > 0 && now - state.requestStart >= this.requestTimeout)) state.expire();
+  }
+};
+Server.prototype.closeAllConnections = function closeAllConnections() { for (const [socket] of this._httpSockets) socket.destroy(); };
+Server.prototype.closeIdleConnections = function closeIdleConnections() { for (const [socket, state] of this._httpSockets) if (!state.responses.length && !state.current) socket.destroy(); };
+Server.prototype._connection = function _connection(socket) {
+  const state = { responses: [], requests: new Set(), current: null, count: 0, upgraded: false, ended: false, failed: false, headerStart: 0, requestStart: 0, expire: null };
+  this._httpSockets.set(socket, state);
+  setupConnectionsTracking.call(this);
+  socket.setNoDelay(true); socket.setTimeout(this.timeout);
+  const clearTimers = () => { state.headerStart = state.requestStart = 0; };
+  const clientError = err => {
+    if (state.failed || state.upgraded) return;
+    state.failed = true; clearTimers(); parser.stopped = true;
+    err.rawPacket = state.lastPacket;
+    if (!this.emit('clientError', err, socket)) {
+      if (socket.writable && !socket.destroyed && (!state.responses.length || !state.responses[0].headersSent)) {
+        const code = err.code === 'HPE_HEADER_OVERFLOW' ? 431 : err.code === 'ERR_HTTP_REQUEST_TIMEOUT' ? 408 : 400;
+        socket.end('HTTP/1.1 ' + code + ' ' + STATUS_CODES[code] + '\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+      } else socket.destroy();
+    }
+  };
+  state.expire = () => clientError(error('ERR_HTTP_REQUEST_TIMEOUT', 'Request timeout'));
+  const armHeaders = () => { if (this.headersTimeout > 0 && !state.headerStart) state.headerStart = Date.now(); };
+  const armRequest = () => { if (this.requestTimeout > 0 && !state.requestStart) state.requestStart = Date.now(); };
+  const parser = new Parser('request', {
+    canResume: () => !state.outputPaused,
+    headers: info => {
+      state.headerStart = 0;
+      armRequest();
+      socket.setTimeout(this.timeout);
+      const req = new this._IncomingMessage(socket); Object.assign(req, info);
+      req.joinDuplicateHeaders = this.joinDuplicateHeaders; req._keepAlive = info.keepAlive; req._parser = parser;
+      state.current = req; state.requests.add(req); state.count++;
+      if (info.upgrade && info.method !== 'CONNECT' && !this.shouldUpgradeCallback(req)) { info.upgrade = false; req.upgrade = false; }
+      req.on('close', () => state.requests.delete(req));
+      if (info.upgrade) return { upgrade: true };
+      const res = new this._ServerResponse(req, this._responseOptions);
+      req.res = res; res._active = state.responses.length === 0;
+      res._keepAliveTimeout = this.keepAliveTimeout; res._maxRequestsPerSocket = this.maxRequestsPerSocket;
+      state.responses.push(res); res.assignSocket(socket);
+      if (this.maxRequestsPerSocket > 0 && state.count >= this.maxRequestsPerSocket) res.shouldKeepAlive = false;
+      res.on('error', err => socket.destroy(err));
+      res.on('finish', () => {
+        if (!req.complete || !req.readableEnded) req._dump();
+        if (state.responses[0] === res) state.responses.shift();
+        res.detachSocket(socket);
+        process.nextTick(() => res._emitClose());
+        if (!res.shouldKeepAlive || ((state.ended || this._httpClosing) && !state.responses.length)) { parser.stopped = true; socket.end(); }
+        else if (state.responses.length) { const next = state.responses[0]; next._active = true; next._flushOutput(); }
+        else if (state.deliverUpgrade) state.deliverUpgrade();
+        else if (req.complete) socket.setTimeout(this.keepAliveTimeout ? this.keepAliveTimeout + this.keepAliveTimeoutBuffer : 0);
+        if (state.outputPaused && state.responses.length < 2 && !parser.stopped) { state.outputPaused = false; parser.resume(); socket.resume(); }
+      });
+      if (this.requireHostHeader && req.httpVersionMinor === 1 && !req.headers.host) { res.statusCode = 400; res.shouldKeepAlive = false; res.end(); }
+      else if (this.maxRequestsPerSocket > 0 && state.count > this.maxRequestsPerSocket) { this.emit('dropRequest', req, socket); res.statusCode = 503; res.end(); }
+      else if (req.headers.expect !== undefined) {
+        if (/^100-continue$/i.test(req.headers.expect)) { if (this.listenerCount('checkContinue')) this.emit('checkContinue', req, res); else { res.writeContinue(); this.emit('request', req, res); } }
+        else if (this.listenerCount('checkExpectation')) this.emit('checkExpectation', req, res);
+        else { res.statusCode = 417; res.end(); }
+      } else this.emit('request', req, res);
+      return {};
+    },
+    body: chunk => { if (state.current._dumped) return true; const ok = state.current.push(chunk); if (!ok) socket.pause(); return ok; },
+    trailers: raw => { state.current.complete = true; state.current._addHeaderLines(raw, raw.length); },
+    complete: () => {
+      const req = state.current; state.current = null; clearTimers();
+      if (req) { req.complete = true; req.push(null); }
+      if (state.responses.length >= 2) { state.outputPaused = true; parser.paused = true; socket.pause(); }
+    },
+    upgrade: (info, head) => {
+      const req = state.current; state.current = null; req.complete = true; req._parser = null;
+      state.upgraded = true; clearTimers(); socket.pause();
+      socket.removeListener('data', onData);
+      state.deliverUpgrade = () => {
+        state.deliverUpgrade = null; detach(); this._httpSockets.delete(socket); socket.setTimeout(0);
+        const event = req.method === 'CONNECT' ? 'connect' : 'upgrade';
+        socket.resume();
+        if (!this.emit(event, req, socket, head)) socket.destroy();
+      };
+      if (!state.responses.length) state.deliverUpgrade();
+    },
+    error: clientError,
+  }, { maxHeaderSize: this.maxHeaderSize, maxHeadersCount: this.maxHeadersCount,
+    httpValidation: this.httpValidation, insecureHTTPParser: this.insecureHTTPParser });
+  const onData = data => {
+    state.lastPacket = data;
+    if (parser.state === 'headers') armHeaders();
+    armRequest();
+    parser.feed(data);
+    if (parser.state === 'headers' && parser.messageStarted) armHeaders();
+  };
+  const onEnd = () => { state.ended = true; parser.end(); if (!state.responses.length) socket.end(); };
+  const onError = err => clientError(err);
+  const onTimeout = () => { let handled = state.current?.emit('timeout') || false; if (state.responses[0]?.emit('timeout')) handled = true; if (this.emit('timeout', socket)) handled = true; if (!handled) socket.destroy(); };
+  const onClose = () => {
+    clearTimers(); parser.stopped = true; this._httpSockets.delete(socket);
+    for (const req of state.requests) req._abort();
+    for (const res of state.responses) if (!res._closed) res.destroy();
+  };
+  const onDrain = () => { if (state.responses.length) state.responses[0]._onSocketDrain(); };
+  const detach = () => { socket.removeListener('drain', onDrain); socket.removeListener('data', onData); socket.removeListener('end', onEnd); socket.removeListener('error', onError); socket.removeListener('timeout', onTimeout); socket.removeListener('close', onClose); };
+  socket.on('data', onData); socket.on('end', onEnd); socket.on('error', onError); socket.on('timeout', onTimeout); socket.on('close', onClose); socket.on('drain', onDrain);
+  armHeaders();
+};
 function createServer(options, requestListener) { return new Server(options, requestListener); }
 module.exports = { Server, ServerResponse, STATUS_CODES, createServer, httpServerPreClose, setupConnectionsTracking, storeHTTPOptions };
