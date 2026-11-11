@@ -229,6 +229,10 @@ Object.defineProperties(URLSearchParamsIterator.prototype, {
 const loaded = {};
 const specialOrigin = new Set(['http', 'https', 'ws', 'wss', 'ftp']);
 
+// The serialization in a URL's private state, or undefined for anything that
+// is not a URL: Node's isURLInstance and getURLHref, which public accessors
+// cannot redirect.
+let urlHref;
 class URL {
   // [href, schemeEnd, userStart, usernameEnd, passwordEnd, hostStart, hostEnd, port, pathStart,
   // queryStart, fragmentStart, hostKind], NONE for an absent port, query or fragment: one field,
@@ -281,6 +285,9 @@ class URL {
     if (this.#query !== null) reset(this.#query, this.#queryText());
   }
   toString() { return this.#c[0]; }
+  static {
+    urlHref = (value) => (value !== null && typeof value === 'object' && #c in value ? value.#c[0] : undefined);
+  }
   toJSON() { return this.#c[0]; }
   get origin() {
     const scheme = this.#c[0].slice(0, this.#c[1]);
@@ -486,6 +493,7 @@ function formatURL(href, fragment, unicode, search, auth) {
 module.exports = {
   URL, URLSearchParams, domainToASCII, domainToUnicode,
   fileURLToPath, fileURLToPathBuffer, pathToFileURL, urlToHttpOptions, formatURL,
+  isURLInstance: (value) => urlHref(value) !== undefined, getURLHref: (value) => urlHref(value),
   unsafeProtocol: new Set(['javascript', 'javascript:']),
   hostlessProtocol: new Set(['javascript', 'javascript:']),
   slashedProtocol: new Set(['http', 'http:', 'https', 'https:', 'ftp', 'ftp:', 'gopher', 'gopher:', 'file', 'file:', 'ws', 'ws:', 'wss', 'wss:']),

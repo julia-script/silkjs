@@ -630,8 +630,9 @@ function convertALPNProtocols(protocols, out) {
   }
 }
 let ciphers;
+// Like Node's cachedResult: callers get a copy of the cached list.
 function getCiphers() {
-  if (ciphers) return ciphers;
+  if (ciphers) return ciphers.slice();
   const context = native('context');
   // Node's GetCiphers also lists the TLSv1.3 suites a default context leaves
   // disabled (the CCM ones); lib/tls.js lowercases, dedupes and sorts.
@@ -640,7 +641,7 @@ function getCiphers() {
     ciphers = require('internal/util').filterDuplicateStrings(names, true);
   }
   finally { native('release', context); }
-  return ciphers;
+  return ciphers.slice();
 }
 
 const tlsExports = module.exports = {
