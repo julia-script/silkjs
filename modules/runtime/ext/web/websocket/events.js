@@ -17,6 +17,26 @@ function unsigned(value, modulus) {
   const number = +value;
   return Number.isFinite(number) ? ((Math.trunc(number) % modulus) + modulus) % modulus : 0;
 }
+// WebIDL checks of Node's MessageEvent: source and every port must be MessagePorts.
+function notPort(value, name) {
+  return new TypeError(`MessageEvent constructor: Expected ${name} ("${require('util').inspect(value)}") to be an instance of MessagePort.`);
+}
+function messagePort(value, name) {
+  if (value !== null && !(value instanceof require('internal/worker/ports').MessagePort)) throw notPort(value, name);
+  return value;
+}
+function messagePorts(value) {
+  if (value === undefined) return [];
+  if (value === null || typeof value[Symbol.iterator] !== 'function') {
+    throw new TypeError(`MessageEvent constructor: eventInitDict.ports (${require('util').inspect(value)}) is not iterable.`);
+  }
+  const ports = Array.from(value);
+  for (let i = 0; i < ports.length; i++) {
+    if (ports[i] === null) throw notPort(null, `eventInitDict.ports[${i}]`);
+    messagePort(ports[i], `eventInitDict.ports[${i}]`);
+  }
+  return ports;
+}
 class MessageEvent extends Event {
   constructor(type, options = {}) {
     if (!arguments.length) throw new TypeError('MessageEvent requires a type');
@@ -26,8 +46,8 @@ class MessageEvent extends Event {
       data: options.data === undefined ? null : options.data,
       origin: options.origin === undefined ? '' : string(options.origin),
       lastEventId: options.lastEventId === undefined ? '' : string(options.lastEventId),
-      source: options.source ?? null,
-      ports: Object.freeze(Array.from(options.ports ?? [])),
+      source: messagePort(options.source ?? null, 'eventInitDict.source'),
+      ports: Object.freeze(messagePorts(options.ports)),
     });
   }
   get data() { return state(messageState, this).data; }

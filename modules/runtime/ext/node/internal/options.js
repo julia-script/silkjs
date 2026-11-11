@@ -4,6 +4,7 @@ const host = require('internal/host');
 const reportOptions = require('internal/process_report');
 const startupControls = require('internal/startup_controls');
 const permission = require('internal/permission');
+const tlsOptions = require('internal/tls/options');
 
 // Inspector enable flags accept an optional address only with "="; unlike
 // ordinary booleans that suffix must survive normalization.
@@ -59,6 +60,7 @@ const environmentOptions = new Map([
   ...startupControls.optionEntries,
   ...require('internal/heap_prof').optionEntries,
   ...permission.optionEntries,
+  ...tlsOptions.optionEntries,
   ...[...inspectorEnableOptions, '--no-inspect', '--no-inspect-brk', '--no-inspect-wait',
     '--experimental-inspector-network-resource', '--no-experimental-inspector-network-resource'].map(name => [name, false]),
   ['--inspect-port', true], ['--debug-port', true], ['--max-http-header-size', true],
@@ -275,7 +277,7 @@ function getOptionValue(name) {
     case '--insecure-http-parser': return !!host.insecureHTTPParser;
     case '--max-http-header-size': return host.maxHTTPHeaderSize ?? 16 * 1024;
     case '--experimental-print-required-tla': return !!host.printRequiredTLA;
-    default: return startupControls.getOptionValue(name);
+    default: return startupControls.getOptionValue(name) ?? tlsOptions.getOptionValue(name);
   }
 }
 
