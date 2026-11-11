@@ -16,11 +16,13 @@ function mainName() {
   return isMainThread ? `${process.argv0}[${process.pid}]` : `Worker[${threadId}]`;
 }
 const main = { id: 1, name: 'main', origin: '', uniqueId: `silk:${owner}:main`, handle: undefined, token: String(native(14)) };
+let nextDefaultName = 1;
 function register(sandbox, handle, options = {}) {
   const existing = bySandbox.get(sandbox);
   if (existing) return existing.id;
   const id = nextId++;
-  const entry = { id, name: options.name === undefined ? `VM Context ${id}` : options.name, origin: options.origin || '', uniqueId: `silk:${owner}:context:${id}`, handle, token: String(native(14, handle)) };
+  // As lib/vm.js: unnamed contexts are numbered on their own, from 1.
+  const entry = { id, name: options.name === undefined ? `VM Context ${nextDefaultName++}` : options.name, origin: options.origin || '', uniqueId: `silk:${owner}:context:${id}`, handle, token: String(native(14, handle)) };
   bySandbox.set(sandbox, entry);
   contexts.set(id, new WeakRef(sandbox));
   tokens.set(entry.token, new WeakRef(sandbox));

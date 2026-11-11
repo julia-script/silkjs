@@ -344,8 +344,11 @@ function evaluatePreview(expression, sandbox, timeout = 333) {
 }
 function releasePreview(token) { previews.delete(token); }
 function broadcast(method, params) {
+  // Node's agents check an event only where a session can receive it.
+  if (sessions.size === 0) return;
+  const items = require('internal/inspector_events').validate(method, params);
   if (method.startsWith('DOMStorage.')) {
-    require('internal/inspector_dom_storage').observe(method, params);
+    require('internal/inspector_dom_storage').observe(method, params, items);
     // Not a protocol event: DOMStorageAgent::registerStorage in Node.
     if (method === 'DOMStorage.registerStorage') return;
   }

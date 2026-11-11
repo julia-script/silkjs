@@ -23,14 +23,12 @@ function mapFor(params) {
   return local ? registered.local : registered.session;
 }
 // Every DOMStorage event updates the agent's copy, enabled or not.
-function observe(method, params) {
-  if (params === null || typeof params !== 'object') return;
+function observe(method, params, items) {
   switch (method) {
     case 'DOMStorage.registerStorage': {
       const map = mapFor(params);
       map.clear();
-      const items = params.storageMap;
-      if (items !== null && typeof items === 'object') for (const key of Object.keys(items)) map.set(`${key}`, `${items[key]}`);
+      for (const [key, value] of items) map.set(key, value);
       break;
     }
     case 'DOMStorage.domStorageItemAdded':
