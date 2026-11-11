@@ -11,7 +11,8 @@ const host = require('internal/host');
 const fs = require('fs');
 const path = require('path');
 const { Buffer } = require('buffer');
-const { codedError } = require('internal/loader/errors');
+// Node throws these two from C++: a TypeError with a code and its own message.
+const argumentError = message => Object.assign(new TypeError(message), { code: 'ERR_INVALID_ARG_TYPE' });
 
 const compileCacheStatus = Object.freeze(Object.assign(Object.create(null), {
   FAILED: 0, ENABLED: 1, ALREADY_ENABLED: 2, DISABLED: 3,
@@ -178,7 +179,7 @@ function enableCompileCache(options) {
   else directory = options;
   if (directory === undefined) directory = process.env.NODE_COMPILE_CACHE || path.join(require('os').tmpdir(), 'node-compile-cache');
   if (requestedPortable === undefined) requestedPortable = process.env.NODE_COMPILE_CACHE_PORTABLE === '1';
-  if (typeof directory !== 'string') throw codedError(TypeError, 'ERR_INVALID_ARG_TYPE', 'cacheDir should be a string');
+  if (typeof directory !== 'string') throw argumentError('cacheDir should be a string');
   return enable(directory, requestedPortable === true);
 }
 function enable(directory, requestedPortable) {
@@ -267,7 +268,7 @@ function persist() {
 }
 function flushCompileCache(keepDeserializedCache) {
   if (keepDeserializedCache !== undefined && typeof keepDeserializedCache !== 'boolean')
-    throw codedError(TypeError, 'ERR_INVALID_ARG_TYPE', 'keepDeserializedCache should be a boolean');
+    throw argumentError('keepDeserializedCache should be a boolean');
   debug('[compile cache] module.flushCompileCache() requested.\n');
   if (cacheDir) persist();
   debug('[compile cache] module.flushCompileCache() finished.\n');

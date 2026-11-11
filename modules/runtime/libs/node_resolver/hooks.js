@@ -10,8 +10,8 @@ function contextObject(value, name) {
 }
 // Node's ERR_INVALID_RETURN_PROPERTY_VALUE: "<loader url> '<hook>'" names a module.register() hook.
 function badProperty(expected, hook, property, value) {
-  const { specificType } = require('internal/path_events/support');
-  return fail('ERR_INVALID_RETURN_PROPERTY_VALUE', `Expected ${expected} to be returned for the "${property}" from the "${hook}" hook but got ${specificType(value)}.`);
+  const { ERR_INVALID_RETURN_PROPERTY_VALUE } = require('internal/errors').codes;
+  return new ERR_INVALID_RETURN_PROPERTY_VALUE(expected, hook, property, value);
 }
 function validate(kind, result, advanced, asynchronous, url) {
   if (!asynchronous && result == null) throw new TypeError(`The "${kind}" hook must return an object`);

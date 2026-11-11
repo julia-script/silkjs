@@ -95,8 +95,8 @@ host.processFeatures = {
   get require_module() { return !host.requireModuleDisabled; },
   get typescript() { return host.typeScriptMode; }
 };
-// Marks the errors Node itself throws, whose stack and toString carry their code.
-host.kIsNodeError = Symbol('kIsNodeError');
+// Node's kFirstModuleParent: the module that first required a module, for require stacks.
+host.kFirstModuleParent = Symbol('kFirstModuleParent');
 define('internal/host', module => { module.exports = host; });
 internalRequire('internal/error_stack').install(globalThis);
 let warnedTransformTypes = false;
@@ -826,6 +826,10 @@ function runPreloads(entry, loadImports = true) {
     for (const specifier of loaderPreloads) loader.Module.register(specifier, base);
   }
   loader.Module._preloadModules(requirePreloads);
+  if (host.frozenIntrinsics) {
+    process.emitWarning('Frozen intristics is an experimental feature and might change at any time', 'ExperimentalWarning');
+    internalRequire('internal/freeze_intrinsics')();
+  }
   if (!loadImports || !importPreloads.length) return entry();
   const name = host.path.join(host.cwd(), '[preload]');
   let pending = Promise.resolve();
@@ -873,6 +877,14 @@ function runtimeFlag(arg) {
   if (arg === '--experimental-eventsource' || arg === '--no-experimental-eventsource') {
     host.experimentalEventSource = arg === '--experimental-eventsource'; return true;
   }
+  if (arg === '--experimental-websocket' || arg === '--no-experimental-websocket') {
+    host.experimentalWebSocket = arg === '--experimental-websocket'; return true;
+  }
+  if (arg === '--frozen-intrinsics') { host.frozenIntrinsics = true; return true; }
+  // V8's flag to run without a JIT: this engine is an interpreter, so it always holds.
+  if (arg === '--jitless') return true;
+  // Buffer.allocUnsafe memory is always zeroed here, which is what this flag asks for.
+  if (arg === '--zero-fill-buffers') { host.zeroFillBuffers = true; return true; }
   if (arg === '--experimental-webstorage' || arg === '--no-experimental-webstorage') {
     host.experimentalWebStorage = arg === '--experimental-webstorage'; return true;
   }
@@ -927,6 +939,10 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
   if (host.experimentalEventSource) Object.defineProperty(globalThis, 'EventSource', {
     value: internalRequire('internal/web/eventsource').EventSource, writable: true, configurable: true,
   });
+  if (host.experimentalWebSocket === false) {
+    delete globalThis.WebSocket;
+    delete globalThis.CloseEvent;
+  }
   if (host.experimentalWebStorage) internalRequire('internal/web/storage').install(globalThis, { localStorageFile: host.localStorageFile });
   if (workerThreads.isMainThread) internalRequire('internal/trace_events').initialize(host.traceOptions);
   if (workerThreads.isMainThread && host.traceSigint) internalRequire('util').setTraceSigInt(true);

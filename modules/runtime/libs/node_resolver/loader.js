@@ -5,7 +5,8 @@ const { createHooks } = require('./hooks');
 const own = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
 const builtinPrefix = Function.prototype.call.bind(String.prototype.startsWith);
 const builtinSlice = Function.prototype.call.bind(String.prototype.slice);
-const kModuleParent = Symbol('kModuleParent');
+// Node's kFirstModuleParent: internal/errors reads it for require stacks.
+const kModuleParent = require('internal/host').kFirstModuleParent;
 
 // Embedding contract: compileFunction evaluates the complete wrapper expression;
 // evaluateModule(source, filename, isEntry) runs a real native ESM graph; the
@@ -59,18 +60,15 @@ function createLoader(host, builtins) {
     host.awaitModuleHook, host.loaderWorkerStatus,
     () => builtins.get('internal/options').loaderWorkerArguments(host.workerRuntimeArgs || []));
 
-  // Node's own errors: their stack and toString read "Name [CODE]: message". A missing
-  // CommonJS module is a plain Error with a code, as in Node.
-  const { codedError } = require('./errors');
-  const { codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE } } = require('internal/validators');
-  const invalidArgType = (name, expected, value) => new ERR_INVALID_ARG_TYPE(name, expected, value);
-  const invalidArgValue = (name, value, reason) => new ERR_INVALID_ARG_VALUE(name, value, reason);
-  function error(code, message, properties) {
-    if (code === 'MODULE_NOT_FOUND') return Object.assign(new Error(message), { code }, properties);
-    const type = code === 'ERR_INVALID_ARG_TYPE' || code === 'ERR_INVALID_ARG_VALUE' || code === 'ERR_MISSING_ARGS' ||
-      code === 'ERR_INVALID_MODULE_SPECIFIER';
-    return codedError(type ? TypeError : Error, code, message, properties);
-  }
+  // Node's own errors come from internal/errors, built with the arguments Node's loader
+  // passes. A missing CommonJS module is a plain Error with a code, as in Node.
+  const { codes } = require('internal/errors');
+  const { validateString } = require('internal/validators');
+  const invalidArgType = (name, expected, value) => new codes.ERR_INVALID_ARG_TYPE(name, expected, value);
+  const invalidArgValue = (name, value, reason) => new codes.ERR_INVALID_ARG_VALUE(name, value, reason);
+  const error = (code, ...args) => new codes[code](...args);
+  const notFound = (message, properties) => Object.assign(new Error(message), { code: 'MODULE_NOT_FOUND' }, properties);
+  const filenameOf = url => { try { return filesystemName(url); } catch (_) { return url; } };
   // A package's directory as Node's package errors name it.
   const packagePath = pkg => pkg.directory.endsWith(path.sep) ? pkg.directory : pkg.directory + path.sep;
 
@@ -108,15 +106,15 @@ function createLoader(host, builtins) {
 
   function fromFileURL(value) {
     const match = /^file:(?:\/\/([^/?#]*))?([^?#]*)([?#].*)?$/i.exec(value);
-    if (!match) throw error('ERR_INVALID_URL', `Invalid URL: ${value}`, { input: value });
+    if (!match) throw error('ERR_INVALID_URL', value);
     if (match[1] && match[1].toLowerCase() !== 'localhost') {
-      throw error('ERR_INVALID_FILE_URL_HOST', `File URL host must be "localhost" or empty: ${value}`);
+      throw error('ERR_INVALID_FILE_URL_HOST', process.platform);
     }
-    if (/%2f|%5c/i.test(match[2])) throw error('ERR_INVALID_MODULE_SPECIFIER', `Invalid encoded separator in ${value}`);
+    if (/%2f|%5c/i.test(match[2])) throw error('ERR_INVALID_MODULE_SPECIFIER', match[2], 'must not include encoded "/" or "\\" characters');
     let filename;
     try { filename = decodeURIComponent(match[2]); }
-    catch (_) { throw error('ERR_INVALID_URL', `Invalid URL: ${value}`, { input: value }); }
-    if (filename.includes('\0')) throw error('ERR_INVALID_ARG_VALUE', 'File URL must not contain null bytes');
+    catch (_) { throw error('ERR_INVALID_URL', value); }
+    if (filename.includes('\0')) throw invalidArgValue('path', value, 'must be a string or Uint8Array without null bytes');
     if (path.sep !== '\\' && !filename.startsWith('/')) filename = '/' + filename;
     if (path.sep === '\\' && /^\/[A-Za-z]:/.test(filename)) filename = filename.slice(1);
     return { filename: path.resolve(filename), suffix: match[3] || '' };
@@ -150,7 +148,7 @@ function createLoader(host, builtins) {
     try { data = JSON.parse(text(filename).replace(/^\uFEFF/, '')); }
     catch (cause) {
       if (!(cause instanceof SyntaxError)) throw cause;
-      throw error('ERR_INVALID_PACKAGE_CONFIG', `Invalid package config ${filename}: ${cause.message}`, { path: filename, cause });
+      throw Object.assign(error('ERR_INVALID_PACKAGE_CONFIG', filename, undefined, cause.message), { cause });
     }
     // Like Node, keep only the fields resolution reads, on a null-prototype object, so
     // a getter on Object.prototype never stands in for a missing field.
@@ -222,7 +220,7 @@ function createLoader(host, builtins) {
     if (builtinPrefix(specifier, 'node:')) {
       const name = builtinSlice(specifier, 5);
       if (!builtins.listed(name) && !builtins.listed(specifier)) {
-        throw error('ERR_UNKNOWN_BUILTIN_MODULE', `No such built-in module: ${specifier}`);
+        throw error('ERR_UNKNOWN_BUILTIN_MODULE', specifier);
       }
       return name;
     }
@@ -231,7 +229,7 @@ function createLoader(host, builtins) {
 
   function loadBuiltin(filename) {
     const name = builtinPrefix(filename, 'node:') ? builtinName(filename) : null;
-    if (name === null) throw error('ERR_UNKNOWN_BUILTIN_MODULE', `No such built-in module: ${filename}`);
+    if (name === null) throw error('ERR_UNKNOWN_BUILTIN_MODULE', filename);
     return builtins.get(name);
   }
 
@@ -257,7 +255,7 @@ function createLoader(host, builtins) {
       return pkg && (pkg.data.type === 'module' || pkg.data.type === 'commonjs') ? pkg.data.type + '-typescript' : undefined;
     }
     if (mode === 'import' && ext !== '.js' && ext !== '') {
-      throw error('ERR_UNKNOWN_FILE_EXTENSION', `Unknown file extension "${ext}" for ${disk}`);
+      throw error('ERR_UNKNOWN_FILE_EXTENSION', ext, disk);
     }
     const pkg = ext === '.js' || mode === 'import' ? packageScope(disk) : null;
     if (pkg && pkg.data.type === 'module') return 'module';
@@ -288,8 +286,8 @@ function createLoader(host, builtins) {
   // which import.meta.resolve returns) or the package.
   function missing(specifier, parent, mode, filename, packageName) {
     if (mode === 'import') {
-      if (filename !== undefined) return error('ERR_MODULE_NOT_FOUND', `Cannot find module '${filename}' imported from ${parent}`, { url: fileURL(filename) });
-      return error('ERR_MODULE_NOT_FOUND', `Cannot find package '${packageName ?? specifier}' imported from ${parent}`);
+      if (filename !== undefined) return error('ERR_MODULE_NOT_FOUND', filename, parent, fileURL(filename));
+      return error('ERR_MODULE_NOT_FOUND', packageName ?? specifier, parent, null);
     }
     const stack = [];
     let current = cache[parent];
@@ -300,7 +298,7 @@ function createLoader(host, builtins) {
       current = current[kModuleParent];
     }
     if (!stack.length && parent) stack.push(parent);
-    return error('MODULE_NOT_FOUND', `Cannot find module '${specifier}'` + (stack.length ? '\nRequire stack:\n- ' + stack.join('\n- ') : ''), { requireStack: stack });
+    return notFound(`Cannot find module '${specifier}'` + (stack.length ? '\nRequire stack:\n- ' + stack.join('\n- ') : ''), { requireStack: stack });
   }
 
   function tryFile(filename) {
@@ -331,14 +329,14 @@ function createLoader(host, builtins) {
     const index = tryExtensions(path.join(filename, 'index'));
     if (index) return index;
     if (pkg && typeof pkg.data.main === 'string' && pkg.data.main) {
-      throw error('MODULE_NOT_FOUND', `Cannot find module '${path.resolve(filename, pkg.data.main)}'. Please verify that the package.json has a valid "main" entry`, { path: pkg.filename, requestPath: filename });
+      throw notFound(`Cannot find module '${path.resolve(filename, pkg.data.main)}'. Please verify that the package.json has a valid "main" entry`, { path: pkg.filename, requestPath: filename });
     }
     return null;
   }
 
   function strictFile(filename, specifier, parent, mode, suffix, isMain) {
     if (isDirectory(filename)) {
-      if (mode === 'import') throw error('ERR_UNSUPPORTED_DIR_IMPORT', `Directory import '${filename}' is not supported resolving ES modules imported from ${parent}`, { url: fileURL(filename) });
+      if (mode === 'import') throw error('ERR_UNSUPPORTED_DIR_IMPORT', filename, parent, fileURL(filename));
       throw missing(specifier, parent, mode);
     }
     if (!isFile(filename)) throw missing(specifier, parent, mode, filename);
@@ -346,11 +344,7 @@ function createLoader(host, builtins) {
   }
 
   function invalidTarget(pkg, key, target, internal, parent) {
-    const related = typeof target === 'string' && !internal && target.length && !target.startsWith('./');
-    const base = parent ? ` imported from ${parent}` : '';
-    const where = `in the package config ${packagePath(pkg)}package.json${base}${related ? '; targets must start with "./"' : ''}`;
-    if (key === '.' && !internal) return error('ERR_INVALID_PACKAGE_TARGET', `Invalid "exports" main target ${JSON.stringify(target)} defined ${where}`);
-    return error('ERR_INVALID_PACKAGE_TARGET', `Invalid "${internal ? 'imports' : 'exports'}" target ${JSON.stringify(target)} defined for '${key}' ${where}`);
+    return error('ERR_INVALID_PACKAGE_TARGET', packagePath(pkg), key, target, internal, parent || undefined);
   }
 
   // Node's segment rules: ".", "..", "node_modules" (and their percent forms) are
@@ -385,8 +379,8 @@ function createLoader(host, builtins) {
       }
       if (subpath !== '' && invalidSegmentRegEx.test(subpath)) {
         if (deprecatedInvalidSegmentRegEx.test(subpath)) {
-          throw error('ERR_INVALID_MODULE_SPECIFIER', `Invalid module "${request}" request is not a valid match in pattern "${key}" for the ` +
-            `"${internal ? 'imports' : 'exports'}" resolution of ${packagePath(pkg)}package.json${parent ? ` imported from ${parent}` : ''}`);
+          throw error('ERR_INVALID_MODULE_SPECIFIER', request, `request is not a valid match in pattern "${key}" for the ` +
+            `"${internal ? 'imports' : 'exports'}" resolution of ${packagePath(pkg)}package.json`, parent || undefined);
         }
         segmentDeprecation(expandedTarget, request, key, pkg, internal, parent, false);
       }
@@ -418,7 +412,7 @@ function createLoader(host, builtins) {
       const keys = Object.keys(target);
       for (let i2 = 0, a2 = keys; i2 < a2.length; i2++) { const condition = a2[i2];
         if (/^(0|[1-9]\d*)$/.test(condition) && Number(condition) < 4294967295) {
-          throw error('ERR_INVALID_PACKAGE_CONFIG', `Numeric condition key '${condition}' in ${pkg.filename}`);
+          throw error('ERR_INVALID_PACKAGE_CONFIG', pkg.filename, parent || undefined, '"exports" cannot contain numeric property keys.');
         }
       }
       for (let i3 = 0, a3 = keys; i3 < a3.length; i3++) { const condition = a3[i3];
@@ -439,7 +433,8 @@ function createLoader(host, builtins) {
       else if (mapping && typeof mapping === 'object') {
         const keys = Object.keys(mapping);
         const subpaths = keys.filter((key) => key.startsWith('.')).length;
-        if (subpaths && subpaths !== keys.length) throw error('ERR_INVALID_PACKAGE_CONFIG', `Mixed condition and subpath keys in ${pkg.filename}`);
+        if (subpaths && subpaths !== keys.length) throw error('ERR_INVALID_PACKAGE_CONFIG', pkg.filename, parent || undefined, '"exports" cannot contain some keys starting with \'.\' and some not.' +
+          ' The exports object must either be an object of package subpath keys or an object of main entry condition name keys only.');
         if (!subpaths) mapping = { '.': mapping };
       } else throw invalidTarget(pkg, request, mapping, internal, parent);
     }
@@ -474,16 +469,15 @@ function createLoader(host, builtins) {
         return strictFile(targetResult.filename, request, parent, mode, targetResult.suffix, isMain);
       }
     }
-    if (internal) throw error('ERR_PACKAGE_IMPORT_NOT_DEFINED', `Package import specifier "${request}" is not defined in package ${packagePath(pkg)}package.json imported from ${parent}`);
-    const base = mode === 'import' && parent ? ` imported from ${parent}` : '';
-    throw error('ERR_PACKAGE_PATH_NOT_EXPORTED', request === '.' ? `No "exports" main defined in ${packagePath(pkg)}package.json${base}` : `Package subpath '${request}' is not defined by "exports" in ${packagePath(pkg)}package.json${base}`);
+    if (internal) throw error('ERR_PACKAGE_IMPORT_NOT_DEFINED', request, packagePath(pkg), parent);
+    throw error('ERR_PACKAGE_PATH_NOT_EXPORTED', packagePath(pkg), request, mode === 'import' && parent ? parent : undefined);
   }
 
   function packageName(specifier, parent) {
     const parts = specifier.split('/');
     const scoped = specifier.startsWith('@');
     if (!parts[0] || (scoped && (!parts[1] || parts[0].length === 1)) || specifier.includes('\\') || specifier.includes('%') || specifier.startsWith('.')) {
-      throw error('ERR_INVALID_MODULE_SPECIFIER', `Invalid module "${specifier}" is not a valid package name${parent ? ` imported from ${parent}` : ''}`);
+      throw error('ERR_INVALID_MODULE_SPECIFIER', specifier, 'is not a valid package name', parent || undefined);
     }
     const count = scoped ? 2 : 1;
     return { name: parts.slice(0, count).join('/'), subpath: parts.length === count ? '.' : './' + parts.slice(count).join('/') };
@@ -492,24 +486,24 @@ function createLoader(host, builtins) {
   function resolveInternal(specifier, parent, mode, options, seen, isMain) {
     if (typeof specifier !== 'string') throw invalidArgType('id', 'string', specifier);
     if (specifier.length === 0) throw invalidArgValue('id', specifier, 'must be a non-empty string');
-    if (mode === 'import' && specifier.includes('\0')) throw error('ERR_INVALID_ARG_VALUE', 'Module specifiers must not contain null bytes');
+    if (mode === 'import' && specifier.includes('\0')) throw invalidArgValue('specifier', specifier, 'must not contain null bytes');
     const builtin = builtinName(specifier);
     if (builtin !== null) return { filename: 'node:' + builtin, format: 'builtin' };
     if (options && own(options, 'paths') && options.paths !== undefined && !Array.isArray(options.paths)) {
-      throw error('ERR_INVALID_ARG_VALUE', 'The property "options.paths" must be an array');
+      throw invalidArgType('options.paths', 'Array', options.paths);
     }
     const parentObject = parent && typeof parent === 'object' ? parent : null;
     parent = parentName(parent);
     const parentModule = parentObject || cache[parent];
     const recursion = mode + '\0' + parent + '\0' + specifier;
-    if (seen.has(recursion)) throw error('ERR_INVALID_PACKAGE_TARGET', `Circular package mapping for '${specifier}' in ${parent}`);
+    if (seen.has(recursion)) throw error('ERR_INVALID_MODULE_SPECIFIER', specifier, 'maps back to itself through package "exports" or "imports"', parent || undefined);
     seen.add(recursion);
     try {
       // As in Node, a require of '#name' whose package has no "imports" looks in node_modules.
       if (specifier.startsWith('#') && (mode === 'import' || (packageScope(parent)?.data.imports ?? null) !== null)) {
-        if (specifier === '#' || specifier.endsWith('/')) throw error('ERR_INVALID_MODULE_SPECIFIER', `Invalid module "${specifier}" is not a valid internal imports specifier name${parent ? ` imported from ${parent}` : ''}`);
+        if (specifier === '#' || specifier.endsWith('/')) throw error('ERR_INVALID_MODULE_SPECIFIER', specifier, 'is not a valid internal imports specifier name', parent || undefined);
         const pkg = packageScope(parent);
-        if (!pkg) throw error('ERR_PACKAGE_IMPORT_NOT_DEFINED', `Package import specifier "${specifier}" is not defined imported from ${parent}`);
+        if (!pkg) throw error('ERR_PACKAGE_IMPORT_NOT_DEFINED', specifier, undefined, parent);
         return packageMap(pkg, pkg.data.imports, specifier, true, parent, mode, seen, isMain);
       }
       if (mode === 'import' && specifier.startsWith('file:')) {
@@ -523,9 +517,9 @@ function createLoader(host, builtins) {
         if (mode === 'import') {
           const position = requested.search(/[?#]/);
           if (position !== -1) { suffix = requested.slice(position); requested = requested.slice(0, position); }
-          if (/%2f|%5c/i.test(requested)) throw error('ERR_INVALID_MODULE_SPECIFIER', `Invalid encoded separator in '${specifier}'`);
+          if (/%2f|%5c/i.test(requested)) throw error('ERR_INVALID_MODULE_SPECIFIER', requested, 'must not include encoded "/" or "\\" characters', parent || undefined);
           try { requested = decodeURIComponent(requested); }
-          catch (_) { throw error('ERR_INVALID_MODULE_SPECIFIER', `Invalid percent encoding in '${specifier}'`); }
+          catch (_) { throw error('ERR_INVALID_URL', specifier); }
         }
         const bases = options && Array.isArray(options.paths) ? options.paths : [path.dirname(parent)];
         const key = cacheable(mode, options, isMain) ? specifier + '\0' + bases[0] : null;
@@ -541,7 +535,7 @@ function createLoader(host, builtins) {
         }
         throw missing(specifier, parent, mode);
       }
-      if (mode === 'import' && /^[A-Za-z][A-Za-z\d+.-]*:/.test(specifier)) throw error('ERR_UNSUPPORTED_ESM_URL_SCHEME', `Only file: and node: URLs are supported; received '${specifier}'`);
+      if (mode === 'import' && /^[A-Za-z][A-Za-z\d+.-]*:/.test(specifier)) throw error('ERR_UNSUPPORTED_ESM_URL_SCHEME', { protocol: /^[^:]*:/.exec(specifier)[0] }, ['file', 'data', 'node']);
       const parsed = packageName(specifier, parent);
       const scope = packageScope(parent);
       if (scope && scope.data.name === parsed.name && scope.data.exports !== undefined && scope.data.exports !== null) {
@@ -620,13 +614,13 @@ function createLoader(host, builtins) {
   }
 
   function defaultResolve(specifier, context) {
-    if (context.conditions !== undefined && !Array.isArray(context.conditions)) throw error('ERR_INVALID_ARG_VALUE', 'The property "context.conditions" must be an array');
+    if (context.conditions !== undefined && !Array.isArray(context.conditions)) throw invalidArgType('context.conditions', 'Array', context.conditions);
     const mode = context.conditions && context.conditions.includes('require') ? 'require' : 'import';
     if (specifier.startsWith('data:')) return { url: specifier, format: dataFormat(specifier) };
     const builtin = builtinName(specifier);
     if (builtin !== null) return { url: 'node:' + builtin, format: 'builtin' };
     if (context.parentURL && !context.parentURL.startsWith('file:') && !/^[A-Za-z][A-Za-z\d+.-]*:/.test(specifier) && !path.isAbsolute(specifier)) {
-      throw error('ERR_UNSUPPORTED_RESOLVE_REQUEST', `Cannot resolve "${specifier}" from "${context.parentURL}": the parent URL is not a file URL`);
+      throw error('ERR_UNSUPPORTED_RESOLVE_REQUEST', specifier, context.parentURL);
     }
     if (specifier.startsWith('file:') && mode === 'require') specifier = fromFileURL(specifier).filename;
     const previous = activeConditions;
@@ -697,7 +691,7 @@ function createLoader(host, builtins) {
     if (mockInstances.has(resolved.filename) || moduleMocks.has(asURL(resolved.filename)))
       throw error('ERR_INVALID_STATE', `Cannot mock '${specifier}'. The module is already mocked.`);
     if (resolved.format && !['builtin', 'commonjs', 'module', 'json', 'commonjs-typescript', 'module-typescript'].includes(resolved.format))
-      throw error('ERR_INVALID_ARG_VALUE', `Cannot mock module format '${resolved.format}'`);
+      throw invalidArgValue('specifier', specifier, `has an unsupported module format '${resolved.format}'`);
     const keys = new Set([asURL(resolved.filename)]);
     try { keys.add(asURL(resolve(specifier, caller, 'require').filename)); } catch (_) {}
     for (const key of keys) if (moduleMocks.has(key))
@@ -754,12 +748,12 @@ function createLoader(host, builtins) {
   }
   function dataSource(url) {
     const match = /^data:([^/]+\/[^;,]+)(?:[^,]*?)(;base64)?,([\s\S]*)$/.exec(url);
-    if (!match) throw error('ERR_INVALID_URL', `Invalid URL: ${url}`, { input: url });
+    if (!match) throw error('ERR_INVALID_URL', url);
     return { format: dataFormat(url), source: match[2]
       ? host.Buffer.from(match[3], 'base64').toString('utf8') : decodeURIComponent(match[3]) };
   }
   function unknownFormat(format, url) {
-    return error('ERR_UNKNOWN_MODULE_FORMAT', `Unknown module format: ${format} for URL ${url}`);
+    return error('ERR_UNKNOWN_MODULE_FORMAT', format, url);
   }
 
   function defaultLoad(url, context) {
@@ -774,7 +768,7 @@ function createLoader(host, builtins) {
     // Node's async default loader leaves CJS execution to the legacy loader.
     // A hook that supplies source opts hook-thread CJS into hook-aware requires.
     if (kind === 'commonjs' && hooks.inWorker()) return { format: kind, source: null };
-    if (!url.startsWith('file:')) throw error('ERR_UNSUPPORTED_ESM_URL_SCHEME', `Only file:, data:, and node: URLs are supported; received '${url}'`);
+    if (!url.startsWith('file:')) throw error('ERR_UNSUPPORTED_ESM_URL_SCHEME', { protocol: /^[^:]*:/.exec(url)?.[0] ?? '' }, ['file', 'data', 'node']);
     const source = text(filesystemName(url));
     if (kind === undefined && host.typeScriptMode && path.extname(filesystemName(url)) === '.ts') {
       const prepared = prepareSource(source, url, 'typescript');
@@ -814,7 +808,7 @@ function createLoader(host, builtins) {
       const legacyCommonJS = source == null && loaded.format === 'commonjs';
       if (source == null && loaded.format !== 'builtin' && loaded.format !== 'addon') {
         if (loaded.format === 'commonjs' && url.startsWith('file:')) source = text(filesystemName(url));
-        else throw error('ERR_INVALID_RETURN_PROPERTY_VALUE', `Expected source from load hook for ${url}`);
+        else throw error('ERR_INVALID_RETURN_PROPERTY_VALUE', 'a string, an ArrayBuffer, or a TypedArray', 'load', 'source', source);
       }
       const prepared = prepareSource(source, url, loaded.format);
       return { ...loaded, ...prepared, filename: resolved.filename, url, legacyCommonJS };
@@ -825,13 +819,13 @@ function createLoader(host, builtins) {
   }
 
   function findPackageJSON(specifier, base = 'data:') {
-    if (arguments.length === 0) throw error('ERR_MISSING_ARGS', 'The "specifier" argument must be specified');
+    if (arguments.length === 0) throw error('ERR_MISSING_ARGS', 'specifier');
     try { specifier = `${specifier}`; }
-    catch (_) { throw error('ERR_INVALID_ARG_TYPE', 'The "specifier" argument must be of type string'); }
+    catch (_) { validateString(specifier, 'specifier'); }
     const { URL, fileURLToPath, pathToFileURL } = builtins.get('url');
     let parentURL = base;
     if (!(base instanceof URL)) {
-      if (typeof base !== 'string') throw error('ERR_INVALID_ARG_TYPE', 'The "base" argument must be of type string');
+      validateString(base, 'base');
       parentURL = path.isAbsolute(base) ? pathToFileURL(base) : new URL(base);
     }
     let absolute;
@@ -857,11 +851,11 @@ function createLoader(host, builtins) {
       if (!specifier) throw missing(specifier, parentURL.href, 'import');
       try { target = new URL(specifier, parentURL); }
       catch (_) {
-        throw error('ERR_UNSUPPORTED_RESOLVE_REQUEST', `Failed to resolve module specifier "${specifier}" from "${parentURL.href}": Invalid relative URL or base scheme is not hierarchical.`);
+        throw error('ERR_UNSUPPORTED_RESOLVE_REQUEST', specifier, parentURL.href);
       }
     }
     if (/%2f|%5c/i.test(target.pathname) && target.protocol === 'file:') {
-      throw error('ERR_INVALID_MODULE_SPECIFIER', `Invalid encoded separator in ${target.href}`);
+      throw error('ERR_INVALID_MODULE_SPECIFIER', target.pathname, 'must not include encoded "/" or "\\" characters', filenameOf(parentURL.href));
     }
     let filename = fileURLToPath(target);
     if (!isDirectory(filename)) {
@@ -904,7 +898,7 @@ function createLoader(host, builtins) {
       return wrapper.call(this.exports, this.exports, makeRequire(filename, this, moduleAsyncModes.get(this) === true), this, filename, path.dirname(filename));
     }
     load(filename) {
-      if (this.loaded) throw error('ERR_ASSERTION', 'Module is already loaded');
+      if (this.loaded) throw error('ERR_INTERNAL_ASSERTION', 'Module is already loaded');
       this.filename = filename;
       this.path = path.dirname(filename);
       this.paths = modulePaths(this.path);
@@ -1041,7 +1035,7 @@ function createLoader(host, builtins) {
     }
   };
   extensions['.node'] = (module, filename) => {
-    if (typeof host.loadAddon !== 'function') throw error('ERR_DLOPEN_FAILED', `Native addon loading is not available for '${filename}'`);
+    if (typeof host.loadAddon !== 'function') throw Object.assign(new Error(`Native addon loading is not available for '${filename}'`), { code: 'ERR_DLOPEN_FAILED' });
     host.loadAddon(filename, module);
   };
 
@@ -1097,7 +1091,7 @@ function createLoader(host, builtins) {
       } else if (loaded && resolved.format !== 'addon') {
         if (resolved.format === 'json') module.exports = JSON.parse(loaded.source.replace(/^\uFEFF/, ''));
         else if (resolved.format === 'commonjs') module._compile(loaded.source, filename);
-        else throw error('ERR_UNKNOWN_MODULE_FORMAT', `Unknown module format: ${resolved.format}`);
+        else throw error('ERR_UNKNOWN_MODULE_FORMAT', resolved.format, asURL(resolved.filename));
       } else {
         const basename = path.basename(filename);
         let ext = '.js';
@@ -1146,14 +1140,7 @@ function createLoader(host, builtins) {
   }
 
   function asyncModuleError(filename, parent) {
-    const stack = requireStack(parent);
-    let message = 'require() cannot be used on an ESM graph with top-level await. Use import() instead.';
-    if (!host.printRequiredTLA) message += ' To see where the top-level await comes from, use --experimental-print-required-tla.';
-    message += `\nRequired module: ${filesystemName(filename)}`;
-    if (stack.length) message += '\nRequire stack:\n- ' + stack.join('\n- ');
-    const result = error('ERR_REQUIRE_ASYNC_MODULE', message);
-    Object.defineProperty(result, 'requireStack', { value: stack, writable: true, configurable: true });
-    return result;
+    return error('ERR_REQUIRE_ASYNC_MODULE', filesystemName(filename), parent);
   }
 
   // Node's hint for a CommonJS global used in an ES module.
@@ -1178,17 +1165,8 @@ function createLoader(host, builtins) {
 
   // Node's ERR_REQUIRE_ESM, for require() of an ES module under --no-experimental-require-module.
   function requireESMError(filename, parent) {
-    const parentPath = parent && parent.filename;
-    let message = `require() of ES Module ${filename}${parentPath ? ` from ${parentPath}` : ''} not supported.`;
-    if (parentPath) {
-      if (filename.endsWith('.mjs')) message += `\nInstead change the require of ${filename} to a dynamic import() which is available in all CommonJS modules.`;
-      else {
-        const basename = path.basename(parentPath) === path.basename(filename) ? filename : path.basename(filename);
-        const pkg = packageScope(filename);
-        message += `\nInstead either rename ${basename} to end in .cjs, change the requiring code to use dynamic import() which is available in all CommonJS modules, or change "type": "module" to "type": "commonjs" in ${pkg ? pkg.filename : 'package.json'} to treat all .js files as CommonJS (using .mjs for all ES modules instead).\n`;
-      }
-    }
-    return error('ERR_REQUIRE_ESM', message);
+    const pkg = filename.endsWith('.mjs') ? null : packageScope(filename);
+    return error('ERR_REQUIRE_ESM', filename, false, (parent && parent.filename) || null, pkg ? pkg.filename : null);
   }
 
   function requireNamespace(module, filename) {
@@ -1252,9 +1230,9 @@ function createLoader(host, builtins) {
     if (resolved.format === 'module') {
       if (inputTypeSet) {
         pendingLoads.delete(resolved.filename);
-        throw error('ERR_INPUT_TYPE_NOT_ALLOWED', '--input-type can only be used with string input via --eval, --print, or STDIN');
+        throw error('ERR_INPUT_TYPE_NOT_ALLOWED');
       }
-      if (typeof host.evaluateModule !== 'function') throw error('ERR_REQUIRE_ESM', 'Native ES module evaluation is not available');
+      if (typeof host.evaluateModule !== 'function') throw error('ERR_METHOD_NOT_IMPLEMENTED', 'evaluateModule');
       const loaded = loadESM(resolved.filename);
       return host.evaluateModule(loaded.source, loaded.filename, true);
     }
@@ -1367,16 +1345,16 @@ function createLoader(host, builtins) {
   const implicitType = { builtin: true, commonjs: true, module: true, wasm: true, 'commonjs-typescript': true, 'module-typescript': true };
   function validateAttributes(kind, url, attributes) {
     for (let i12 = 0, a12 = Object.keys(attributes); i12 < a12.length; i12++) { const key = a12[i12];
-      if (key !== 'type') throw error('ERR_IMPORT_ATTRIBUTE_UNSUPPORTED', `Import attribute "${key}" with value "${attributes[key]}" is not supported in ${url}`);
+      if (key !== 'type') throw error('ERR_IMPORT_ATTRIBUTE_UNSUPPORTED', key, attributes[key], url);
     }
     const expected = kind === 'json' ? 'json' : kind === 'text' ? 'text' : own(implicitType, kind) ? null : undefined;
     if (expected === undefined) return;
     if (expected === null ? attributes.type === undefined : attributes.type === expected) return;
-    if (expected !== null && !own(attributes, 'type')) throw error('ERR_IMPORT_ATTRIBUTE_MISSING', `Module "${url}" needs an import attribute of "type: ${expected}"`);
+    if (expected !== null && !own(attributes, 'type')) throw error('ERR_IMPORT_ATTRIBUTE_MISSING', url, 'type', expected);
     const type = attributes.type;
     if (typeof type !== 'string') throw invalidArgType('importAttributes.type', 'string', type);
-    if (type === 'json' || (type === 'text' && host.importText)) throw error('ERR_IMPORT_ATTRIBUTE_TYPE_INCOMPATIBLE', `Module "${url}" is not of type "${type}"`);
-    throw error('ERR_IMPORT_ATTRIBUTE_UNSUPPORTED', `Import attribute "type" with value "${type}" is not supported in ${url}`);
+    if (type === 'json' || (type === 'text' && host.importText)) throw error('ERR_IMPORT_ATTRIBUTE_TYPE_INCOMPATIBLE', url, type);
+    throw error('ERR_IMPORT_ATTRIBUTE_UNSUPPORTED', 'type', type, url);
   }
   function dataMime(url) {
     const match = /^data:([^/]+\/[^;,]+)/.exec(url);
@@ -1440,7 +1418,7 @@ function createLoader(host, builtins) {
       resolutions.set(resolved.filename, resolved);
       source = bridgeSource(resolved.filename, resolved.format === 'commonjs' ? commonJSNames(resolved.filename, new Set(), loaded.source) : [], resolved.format === 'commonjs');
     }
-    else if (resolved.format === 'addon') throw error('ERR_UNKNOWN_FILE_EXTENSION', `Native addons cannot be imported directly: ${resolved.filename}`);
+    else if (resolved.format === 'addon') throw error('ERR_UNKNOWN_FILE_EXTENSION', path.extname(resolved.filename), resolved.filename);
     else throw unknownFormat(resolved.format, path.isAbsolute(resolved.filename) ? fileURL(resolved.filename) : resolved.filename);
     return { source, format: resolved.format, filename: resolved.filename };
   }

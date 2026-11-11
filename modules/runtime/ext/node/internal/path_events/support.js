@@ -22,77 +22,14 @@
 
 'use strict';
 
-const kIsNodeError = require('internal/host').kIsNodeError;
-function specificType(value) {
-  if (value === null) return 'null';
-  if (value === undefined) return 'undefined';
-  switch (typeof value) {
-    case 'bigint': return `type bigint (${value}n)`;
-    case 'number': return `type number (${Object.is(value, -0) ? '-0' : value})`;
-    case 'boolean': return `type boolean (${value})`;
-    case 'symbol': return `type symbol (${String(value)})`;
-    case 'function': return `function ${value.name}`;
-    case 'object': {
-      const name = value.constructor?.name;
-      return typeof name === 'string' && name !== ''
-        ? `an instance of ${name}` : require('util').inspect(value, { depth: -1 });
-    }
-    case 'string':
-      if (value.length > 28) value = `${value.slice(0, 25)}...`;
-      return `type string (${value.includes("'") ? JSON.stringify(value) : `'${value}'`})`;
-  }
-}
-function formatList(values) {
-  return values.length < 3 ? values.join(' or ')
-    : `${values.slice(0, -1).join(', ')}, or ${values[values.length - 1]}`;
-}
-class ERR_INVALID_ARG_TYPE extends TypeError {
-  constructor(name, expected, value) {
-    const types = [];
-    const instances = [];
-    const other = [];
-    for (const entry of Array.isArray(expected) ? expected : [expected]) {
-      if (['string', 'function', 'number', 'object', 'Function', 'Object', 'boolean', 'bigint', 'symbol'].includes(entry)) {
-        types.push(entry.toLowerCase());
-      } else if (/^[A-Z][a-zA-Z0-9]*$/.test(entry)) instances.push(entry);
-      else other.push(entry);
-    }
-    const objectIndex = types.indexOf('object');
-    if (instances.length && objectIndex !== -1) {
-      types.splice(objectIndex, 1);
-      instances.push('Object');
-    }
-    const descriptions = [];
-    if (types.length) descriptions.push(`${types.length > 1 ? 'one of type' : 'of type'} ${formatList(types)}`);
-    if (instances.length) descriptions.push(`an instance of ${formatList(instances)}`);
-    if (other.length) descriptions.push(other.length > 1 ? `one of ${formatList(other)}` :
-      `${other[0].toLowerCase() !== other[0] ? 'an ' : ''}${other[0]}`);
-    const argument = name.endsWith(' argument') ? name : `"${name}" ${name.includes('.') ? 'property' : 'argument'}`;
-    super(`The ${argument} must be ${descriptions.join(' or ')}. Received ${specificType(value)}`);
-    Object.defineProperty(this, kIsNodeError, { value: true });
-    this.code = 'ERR_INVALID_ARG_TYPE';
-  }
-  toString() { return `${this.name} [${this.code}]: ${this.message}`; }
-}
-class ERR_UNHANDLED_ERROR extends Error {
-  constructor(value) {
-    super(value === undefined ? 'Unhandled error.' : `Unhandled error. (${value})`);
-    Object.defineProperty(this, kIsNodeError, { value: true });
-    this.code = 'ERR_UNHANDLED_ERROR';
-  }
-  toString() { return `${this.name} [${this.code}]: ${this.message}`; }
-}
-class AbortError extends Error {
-  constructor(message = 'The operation was aborted', options) {
-    super(message, options);
-    this.name = 'AbortError';
-    this.code = 'ABORT_ERR';
-  }
-}
+const {
+  AbortError,
+  codes: { ERR_INVALID_ARG_TYPE, ERR_OUT_OF_RANGE, ERR_UNHANDLED_ERROR },
+  genericNodeError,
+} = require('internal/errors');
+
 function outOfRange(name, range, value) {
-  const error = new RangeError(`The value of "${name}" is out of range. It must be ${range}. Received ${value}`);
-  error.code = 'ERR_OUT_OF_RANGE';
-  throw error;
+  throw new ERR_OUT_OF_RANGE(name, range, value);
 }
 function validateString(value, name) {
   if (typeof value !== 'string') throw new ERR_INVALID_ARG_TYPE(name, 'string', value);
@@ -136,10 +73,10 @@ function spliceOne(array, index) {
 module.exports = {
   AbortError,
   codes: { ERR_INVALID_ARG_TYPE, ERR_UNHANDLED_ERROR },
-  genericNodeError: (message, properties) => Object.assign(new Error(message), properties),
+  genericNodeError,
   validateString, validateObject, validateBoolean, validateFunction,
   validateNumber, validateInteger, validateAbortSignal,
   kEmptyObject: Object.freeze(Object.create(null)),
   isWindows: require('internal/host').platform === 'win32',
-  getLazy, spliceOne, specificType,
+  getLazy, spliceOne,
 };

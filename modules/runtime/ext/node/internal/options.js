@@ -262,12 +262,16 @@ function getOptionValue(name) {
     case '--experimental-vm-modules': return !!host.experimentalVmModules;
     case '--experimental-eventsource': return !!host.experimentalEventSource;
     case '--experimental-webstorage': return !!host.experimentalWebStorage;
+    case '--experimental-websocket': return host.experimentalWebSocket !== false;
+    case '--frozen-intrinsics': return !!host.frozenIntrinsics;
+    case '--zero-fill-buffers': return !!host.zeroFillBuffers;
     case '--experimental-inspector-network-resource': return !!host.experimentalInspectorNetworkResource;
     case '--inspect': return !!host.inspectorOptions?.enabled;
     case '--inspect-brk': return !!host.inspectorOptions?.breakFirst;
     case '--inspect-wait': return !!host.inspectorOptions?.wait;
     case '--inspect-port': return { host: host.inspectorOptions?.host ?? '127.0.0.1', port: host.inspectorOptions?.port ?? 9229 };
     case '--localstorage-file': return host.localStorageFile;
+    case '--experimental-print-required-tla': return !!host.printRequiredTLA;
     default: return startupControls.getOptionValue(name);
   }
 }
