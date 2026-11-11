@@ -58,12 +58,46 @@ function createLoader(host, builtins) {
     host.awaitModuleHook, host.loaderWorkerStatus,
     () => builtins.get('internal/options').loaderWorkerArguments(host.workerRuntimeArgs || []));
 
+  // Node's own errors: their stack and toString read "Name [CODE]: message". A missing
+  // CommonJS module is a plain Error with a code, as in Node.
   function error(code, message, properties) {
     const result = code === 'ERR_INVALID_ARG_TYPE' || code === 'ERR_INVALID_ARG_VALUE' || code === 'ERR_MISSING_ARGS' ? new TypeError(message) : new Error(message);
+    if (code !== 'MODULE_NOT_FOUND') {
+      Object.defineProperty(result, host.kIsNodeError, { value: true });
+      Object.defineProperty(result, 'toString', { value: nodeErrorString, writable: true, configurable: true });
+    }
     result.code = code;
     if (properties) Object.assign(result, properties);
     return result;
   }
+  function nodeErrorString() { return `${this.name} [${this.code}]: ${this.message}`; }
+
+  // How Node's ERR_INVALID_ARG_TYPE and ERR_INVALID_ARG_VALUE show the value they got.
+  function received(value) {
+    if (value == null) return String(value);
+    if (typeof value === 'function') return `function ${value.name}`;
+    if (typeof value === 'object') {
+      if (value.constructor && value.constructor.name) return `an instance of ${value.constructor.name}`;
+      return builtins.get('util').inspect(value, { depth: -1 });
+    }
+    let shown = typeof value === 'bigint' ? `${value}n` : typeof value === 'symbol' ? String(value) : value;
+    if (typeof value === 'number' && value === 0 && 1 / value < 0) shown = '-0';
+    if (typeof value === 'string') {
+      if (value.length > 28) value = value.slice(0, 25) + '...';
+      shown = value.includes("'") ? JSON.stringify(value) : `'${value}'`;
+    }
+    return `type ${typeof value} (${shown})`;
+  }
+  function invalidArgType(name, expected, value) {
+    return error('ERR_INVALID_ARG_TYPE', `The "${name}" ${name.includes('.') ? 'property' : 'argument'} must be of type ${expected}. Received ${received(value)}`);
+  }
+  function invalidArgValue(name, value, reason = 'is invalid') {
+    let inspected = builtins.get('util').inspect(value);
+    if (inspected.length > 128) inspected = inspected.slice(0, 128) + '...';
+    return error('ERR_INVALID_ARG_VALUE', `The ${name.includes('.') ? 'property' : 'argument'} '${name}' ${reason}. Received ${inspected}`);
+  }
+  // A package's directory as Node's package errors name it.
+  const packagePath = pkg => pkg.directory.endsWith(path.sep) ? pkg.directory : pkg.directory + path.sep;
 
   const text = host.readText;
 
@@ -124,7 +158,8 @@ function createLoader(host, builtins) {
     let name = parentNames.get(parent);
     if (name !== undefined) return name;
     const filename = filesystemName(parent);
-    name = path.resolve(filename);
+    // A file URL ending in a slash names a directory (module.register(specifier, cwd URL)).
+    name = parent.startsWith('file:') && /\/(?:[?#].*)?$/.test(parent) ? path.join(path.resolve(filename), '[directory]') : path.resolve(filename);
     // A relative one depends on the working directory.
     if (path.isAbsolute(filename)) parentNames.set(parent, name);
     return name;
@@ -289,7 +324,7 @@ function createLoader(host, builtins) {
   }
 
   function tryExtensions(filename) {
-    for (const ext of Object.keys(extensions)) {
+    for (let i0 = 0, a0 = Object.keys(extensions); i0 < a0.length; i0++) { const ext = a0[i0];
       if (ext === '.ts' || ext === '.mts' || ext === '.cts') continue;
       const result = tryFile(filename + ext);
       if (result) return result;
@@ -316,14 +351,19 @@ function createLoader(host, builtins) {
 
   function strictFile(filename, specifier, parent, mode, suffix, isMain) {
     if (isDirectory(filename)) {
-      throw error(mode === 'import' ? 'ERR_UNSUPPORTED_DIR_IMPORT' : 'MODULE_NOT_FOUND', `Directory import '${filename}' is not supported resolving ${specifier} from ${parent}`, { url: fileURL(filename) });
+      if (mode === 'import') throw error('ERR_UNSUPPORTED_DIR_IMPORT', `Directory import '${filename}' is not supported resolving ES modules imported from ${parent}`, { url: fileURL(filename) });
+      throw missing(specifier, parent, mode);
     }
     if (!isFile(filename)) throw missing(specifier, parent, mode);
     return descriptor(filename, mode, suffix, isMain);
   }
 
-  function invalidTarget(pkg, key, target) {
-    return error('ERR_INVALID_PACKAGE_TARGET', `Invalid package target ${JSON.stringify(target)} defined for '${key}' in ${pkg.filename}`);
+  function invalidTarget(pkg, key, target, internal, parent) {
+    const related = typeof target === 'string' && !internal && target.length && !target.startsWith('./');
+    const base = parent ? ` imported from ${parent}` : '';
+    const where = `in the package config ${packagePath(pkg)}package.json${base}${related ? '; targets must start with "./"' : ''}`;
+    if (key === '.' && !internal) return error('ERR_INVALID_PACKAGE_TARGET', `Invalid "exports" main target ${JSON.stringify(target)} defined ${where}`);
+    return error('ERR_INVALID_PACKAGE_TARGET', `Invalid "${internal ? 'imports' : 'exports'}" target ${JSON.stringify(target)} defined for '${key}' ${where}`);
   }
 
   function invalidSegment(value) {
@@ -340,22 +380,22 @@ function createLoader(host, builtins) {
           const request = pattern ? target.split('*').join(replacement) : target;
           return { external: request, parent: pkg.filename };
         }
-        throw invalidTarget(pkg, key, target);
+        throw invalidTarget(pkg, key, target, internal, parent);
       }
-      if (invalidSegment(target.slice(2))) throw invalidTarget(pkg, key, target);
+      if (invalidSegment(target.slice(2))) throw invalidTarget(pkg, key, target, internal, parent);
       if (pattern && invalidSegment(replacement)) {
         throw error('ERR_INVALID_MODULE_SPECIFIER', `Invalid subpath '${replacement}' for '${key}' in ${pkg.filename}`);
       }
       const expanded = pattern ? target.split('*').join(replacement) : target;
       const url = fromFileURL(fileURL(pkg.directory) + '/' + expanded.slice(2));
       const relative = path.relative(pkg.directory, url.filename);
-      if (relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) throw invalidTarget(pkg, key, target);
+      if (relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) throw invalidTarget(pkg, key, target, internal, parent);
       return { filename: url.filename, suffix: url.suffix };
     }
     if (Array.isArray(target)) {
       if (target.length === 0) return null;
       let last;
-      for (const item of target) {
+      for (let i1 = 0, a1 = target; i1 < a1.length; i1++) { const item = a1[i1];
         let result;
         try { result = packageTarget(pkg, item, replacement, key, pattern, internal, parent, mode, seen); }
         catch (cause) {
@@ -372,13 +412,13 @@ function createLoader(host, builtins) {
     }
     if (target && typeof target === 'object') {
       const keys = Object.keys(target);
-      for (const condition of keys) {
+      for (let i2 = 0, a2 = keys; i2 < a2.length; i2++) { const condition = a2[i2];
         if (/^(0|[1-9]\d*)$/.test(condition) && Number(condition) < 4294967295) {
           throw error('ERR_INVALID_PACKAGE_CONFIG', `Numeric condition key '${condition}' in ${pkg.filename}`);
         }
       }
-      for (const condition of keys) {
-        if (condition === 'default' || (activeConditions ? activeConditions.includes(condition) : condition === 'node' || condition === 'node-addons' || condition === mode || (condition === 'module-sync' && typeof host.requireModule === 'function') || (host.moduleConditions && host.moduleConditions.includes(condition)))) {
+      for (let i3 = 0, a3 = keys; i3 < a3.length; i3++) { const condition = a3[i3];
+        if (condition === 'default' || (activeConditions ? activeConditions.includes(condition) : condition === 'node' || condition === 'node-addons' || condition === mode || (condition === 'module-sync' && requireModuleEnabled()) || (host.moduleConditions && host.moduleConditions.includes(condition)))) {
           const result = packageTarget(pkg, target[condition], replacement, key, pattern, internal, parent, mode, seen);
           if (result !== undefined) return result;
         }
@@ -386,7 +426,7 @@ function createLoader(host, builtins) {
       return undefined;
     }
     if (target === null) return null;
-    throw invalidTarget(pkg, key, target);
+    throw invalidTarget(pkg, key, target, internal, parent);
   }
 
   function packageMap(pkg, mapping, request, internal, parent, mode, seen, isMain) {
@@ -397,7 +437,7 @@ function createLoader(host, builtins) {
         const subpaths = keys.filter((key) => key.startsWith('.')).length;
         if (subpaths && subpaths !== keys.length) throw error('ERR_INVALID_PACKAGE_CONFIG', `Mixed condition and subpath keys in ${pkg.filename}`);
         if (!subpaths) mapping = { '.': mapping };
-      } else throw invalidTarget(pkg, request, mapping);
+      } else throw invalidTarget(pkg, request, mapping, internal, parent);
     }
     let target;
     let match;
@@ -408,7 +448,7 @@ function createLoader(host, builtins) {
         match = request;
         target = mapping[request];
       } else {
-        for (const key of Object.keys(mapping)) {
+        for (let i4 = 0, a4 = Object.keys(mapping); i4 < a4.length; i4++) { const key = a4[i4];
           const star = key.indexOf('*');
           if (star === -1 || key.indexOf('*', star + 1) !== -1) continue;
           const prefix = key.slice(0, star);
@@ -430,8 +470,9 @@ function createLoader(host, builtins) {
         return strictFile(targetResult.filename, request, parent, mode, targetResult.suffix, isMain);
       }
     }
-    if (internal) throw error('ERR_PACKAGE_IMPORT_NOT_DEFINED', `Package import specifier "${request}" is not defined in ${pkg.filename} imported from ${parent}`);
-    throw error('ERR_PACKAGE_PATH_NOT_EXPORTED', request === '.' ? `No "exports" main defined in ${pkg.filename}` : `Package subpath '${request}' is not defined by "exports" in ${pkg.filename}`);
+    if (internal) throw error('ERR_PACKAGE_IMPORT_NOT_DEFINED', `Package import specifier "${request}" is not defined in package ${packagePath(pkg)}package.json imported from ${parent}`);
+    const base = mode === 'import' && parent ? ` imported from ${parent}` : '';
+    throw error('ERR_PACKAGE_PATH_NOT_EXPORTED', request === '.' ? `No "exports" main defined in ${packagePath(pkg)}package.json${base}` : `Package subpath '${request}' is not defined by "exports" in ${packagePath(pkg)}package.json${base}`);
   }
 
   function packageName(specifier, parent) {
@@ -445,9 +486,9 @@ function createLoader(host, builtins) {
   }
 
   function resolveInternal(specifier, parent, mode, options, seen, isMain) {
-    if (typeof specifier !== 'string') throw error('ERR_INVALID_ARG_TYPE', 'The "id" argument must be of type string');
-    if (specifier.length === 0) throw error('ERR_INVALID_ARG_VALUE', 'The argument "id" must be a non-empty string');
-    if (specifier.includes('\0')) throw error('ERR_INVALID_ARG_VALUE', 'Module specifiers must not contain null bytes');
+    if (typeof specifier !== 'string') throw invalidArgType('id', 'string', specifier);
+    if (specifier.length === 0) throw invalidArgValue('id', specifier, 'must be a non-empty string');
+    if (mode === 'import' && specifier.includes('\0')) throw error('ERR_INVALID_ARG_VALUE', 'Module specifiers must not contain null bytes');
     const builtin = builtinName(specifier);
     if (builtin !== null) return { filename: 'node:' + builtin, format: 'builtin' };
     if (options && own(options, 'paths') && options.paths !== undefined && !Array.isArray(options.paths)) {
@@ -460,8 +501,9 @@ function createLoader(host, builtins) {
     if (seen.has(recursion)) throw error('ERR_INVALID_PACKAGE_TARGET', `Circular package mapping for '${specifier}' in ${parent}`);
     seen.add(recursion);
     try {
-      if (specifier.startsWith('#')) {
-        if (specifier === '#' || specifier.startsWith('#/') || specifier.endsWith('/')) throw error('ERR_INVALID_MODULE_SPECIFIER', `Invalid package imports specifier '${specifier}'`);
+      // As in Node, a require of '#name' whose package has no "imports" looks in node_modules.
+      if (specifier.startsWith('#') && (mode === 'import' || (packageScope(parent)?.data.imports ?? null) !== null)) {
+        if (specifier === '#' || specifier.endsWith('/')) throw error('ERR_INVALID_MODULE_SPECIFIER', `Invalid package imports specifier '${specifier}'`);
         const pkg = packageScope(parent);
         if (!pkg) throw error('ERR_PACKAGE_IMPORT_NOT_DEFINED', `Package import specifier "${specifier}" is not defined imported from ${parent}`);
         return packageMap(pkg, pkg.data.imports, specifier, true, parent, mode, seen, isMain);
@@ -487,7 +529,7 @@ function createLoader(host, builtins) {
           const known = foundPaths.get(key);
           if (known !== undefined) return { ...known };
         }
-        for (const base of bases) {
+        for (let i5 = 0, a5 = bases; i5 < a5.length; i5++) { const base = a5[i5];
           const candidate = path.resolve(base, requested);
           if (mode === 'import') return strictFile(candidate, specifier, parent, mode, suffix, isMain);
           const found = legacyFile(candidate, true, /[\\/]$/.test(specifier) || specifier === '.' || specifier === '..');
@@ -504,10 +546,10 @@ function createLoader(host, builtins) {
       let search;
       if (options && options.paths !== undefined) {
         search = [];
-        for (const base of options.paths) {
+        for (let i6 = 0, a6 = options.paths; i6 < a6.length; i6++) { const base = a6[i6];
           const paths = modulePaths(base);
-          if (mode === 'require') paths.push(...globalPaths);
-          for (const entry of paths) if (!search.includes(entry)) search.push(entry);
+          if (mode === 'require') for (let index = 0; index < globalPaths.length; index++) paths.push(globalPaths[index]);
+          for (let i7 = 0, a7 = paths; i7 < a7.length; i7++) { const entry = a7[i7]; if (!search.includes(entry)) search.push(entry); }
         }
       } else {
         search = mode === 'require' && parentModule && Array.isArray(parentModule.paths) ? parentModule.paths : modulePaths(path.dirname(parent));
@@ -535,7 +577,7 @@ function createLoader(host, builtins) {
   }
 
   function findPackage(search, parsed, specifier, parent, mode, seen, isMain) {
-    for (const directory of search) {
+    for (let i8 = 0, a8 = search; i8 < a8.length; i8++) { const directory = a8[i8];
       if (!isDirectory(directory)) continue;
       const root = path.join(directory, parsed.name);
       const pkg = readPackage(root);
@@ -558,8 +600,8 @@ function createLoader(host, builtins) {
 
   function conditions(mode) {
     const values = mode === 'require' ? ['require', 'node', 'node-addons'] : ['node', 'import', 'node-addons'];
-    if (typeof host.requireModule === 'function') values.push('module-sync');
-    if (host.moduleConditions) values.push(...host.moduleConditions);
+    if (requireModuleEnabled()) values.push('module-sync');
+    if (host.moduleConditions) for (let index = 0; index < host.moduleConditions.length; index++) values.push(host.moduleConditions[index]);
     return values;
   }
 
@@ -883,6 +925,33 @@ function createLoader(host, builtins) {
   Module._cache = cache;
   Module._extensions = extensions;
   Module._nodeModulePaths = directory => modulePaths(path.resolve(directory));
+  // Node's internalModuleStat: 0 for a file, 1 for a directory, negative otherwise.
+  Module._stat = filename => {
+    const type = typeOf(path.toNamespacedPath(String(filename)), true);
+    return type === 0o100000 ? 0 : type === 0o040000 ? 1 : -2;
+  };
+  Module._resolveLookupPaths = (request, parent) => {
+    if (builtinName(request) !== null) return null;
+    if (request[0] !== '.' || (request.length > 1 && request[1] !== '.' && request[1] !== '/' && (path.sep !== '\\' || request[1] !== '\\'))) {
+      const paths = parent && Array.isArray(parent.paths) && parent.paths.length ? parent.paths.concat(globalPaths) : globalPaths.slice();
+      return paths.length > 0 ? paths : null;
+    }
+    if (!parent || !parent.id || !parent.filename) return ['.'];
+    return [path.dirname(parent.filename)];
+  };
+  Module._findPath = (request, paths, isMain) => {
+    const absolute = path.isAbsolute(request);
+    if (absolute) paths = [''];
+    else if (!Array.isArray(paths) || paths.length === 0) return false;
+    const trailingSlash = /[\\/]$/.test(request) || /(?:^|[\\/])\.?\.$/.test(request);
+    for (let index = 0; index < paths.length; index++) {
+      const base = paths[index];
+      if (!absolute && typeOf(base, true) !== 0o040000) continue;
+      const found = legacyFile(path.resolve(base, request), true, trailingSlash);
+      if (found) return isMain ? (host.preserveSymlinksMain ? path.resolve(found) : realPath(found)) : (host.preserveSymlinks ? path.resolve(found) : realPath(found));
+    }
+    return false;
+  };
   Module._resolveFilename = (request, parent, isMain, options) => {
     const result = resolve(request, parent, 'require', undefined, options, !!isMain, !!parent && moduleAsyncModes.get(parent) === true);
     return result.format === 'builtin' && !request.startsWith('node:') ? result.filename.slice(5) : result.filename;
@@ -912,7 +981,7 @@ function createLoader(host, builtins) {
   Module.register = hooks.register;
   Module.createRequire = filename => {
     if (filename && typeof filename === 'object' && filename.href) filename = filename.href;
-    if (typeof filename !== 'string' || (!filename.startsWith('file:') && !path.isAbsolute(filename))) throw error('ERR_INVALID_ARG_VALUE', 'The argument must be a file URL or absolute path');
+    if (typeof filename !== 'string' || (!filename.startsWith('file:') && !path.isAbsolute(filename))) throw invalidArgValue('filename', filename, 'must be a file URL object, file URL string, or absolute path string');
     return requireFor(filename, undefined, false);
   };
   Module.isBuiltin = name => typeof name === 'string' && (builtins.listed(name) ||
@@ -1029,16 +1098,53 @@ function createLoader(host, builtins) {
     }
   }
 
+  // Node's hint for a CommonJS global used in an ES module.
+  function decorateModuleError(cause, filename) {
+    if (cause === null || typeof cause !== 'object' || cause.name !== 'ReferenceError') return cause;
+    const match = /^'?(require|module|exports|__filename|__dirname)'? is not defined$/.exec(cause.message);
+    if (!match) return cause;
+    let message = `${match[1]} is not defined in ES module scope`;
+    if (match[1] === 'require') message += ', you can use import instead';
+    const url = asURL(filename);
+    if (url.startsWith('file:') && /\.js(\?[^#]*)?(#.*)?$/.test(url)) {
+      const pkg = packageScope(filesystemName(url));
+      if (pkg && pkg.data.type === 'module') message += `\nThis file is being treated as an ES module because it has a '.js' file extension and '${pkg.filename}' contains "type": "module". To treat it as a CommonJS script, rename it to use the '.cjs' file extension.`;
+    }
+    cause.message = message;
+    return cause;
+  }
+
+  function requireModuleEnabled() {
+    return typeof host.requireModule === 'function' && !host.requireModuleDisabled;
+  }
+
+  // Node's ERR_REQUIRE_ESM, for require() of an ES module under --no-experimental-require-module.
+  function requireESMError(filename, parent) {
+    const parentPath = parent && parent.filename;
+    let message = `require() of ES Module ${filename}${parentPath ? ` from ${parentPath}` : ''} not supported.`;
+    if (parentPath) {
+      if (filename.endsWith('.mjs')) message += `\nInstead change the require of ${filename} to a dynamic import() which is available in all CommonJS modules.`;
+      else {
+        const basename = path.basename(parentPath) === path.basename(filename) ? filename : path.basename(filename);
+        const pkg = packageScope(filename);
+        message += `\nInstead either rename ${basename} to end in .cjs, change the requiring code to use dynamic import() which is available in all CommonJS modules, or change "type": "module" to "type": "commonjs" in ${pkg ? pkg.filename : 'package.json'} to treat all .js files as CommonJS (using .mjs for all ES modules instead).\n`;
+      }
+    }
+    return error('ERR_REQUIRE_ESM', message);
+  }
+
   function requireNamespace(module, filename) {
-    if (typeof host.requireModule !== 'function') throw error('ERR_REQUIRE_ESM', `require() of ES Module ${filename} needs the native synchronous module evaluation hook`);
-    const namespace = host.requireModule(filename);
+    if (!requireModuleEnabled()) throw requireESMError(filename, module.parent);
+    let namespace;
+    try { namespace = host.requireModule(filename); }
+    catch (cause) { throw decorateModuleError(cause, filename); }
     if (own(namespace, 'module.exports')) module.exports = namespace['module.exports'];
     else if (own(namespace, 'default') && !own(namespace, '__esModule')) {
-      const facade = Object.create(null);
-      for (const key of Object.keys(namespace)) Object.defineProperty(facade, key, { enumerable: true, get: () => namespace[key] });
-      Object.defineProperty(facade, '__esModule', { enumerable: true, value: true });
-      Object.defineProperty(facade, Symbol.toStringTag, { value: 'Module' });
-      module.exports = Object.preventExtensions(facade);
+      // As in Node, a facade module re-exports the namespace with __esModule added, so
+      // that what require gives is still a module namespace with live bindings.
+      const target = JSON.stringify(asURL(filename));
+      module.exports = host.requireModule('data:text/javascript,' + encodeURIComponent(
+        `export * from ${target}; export { default } from ${target}; export const __esModule = true;`));
     } else module.exports = namespace;
   }
 
@@ -1056,7 +1162,7 @@ function createLoader(host, builtins) {
       return result.format === 'builtin' && !specifier.startsWith('node:') ? result.filename.slice(5) : result.filename;
     };
     require.resolve.paths = (specifier) => {
-      if (typeof specifier !== 'string') throw error('ERR_INVALID_ARG_TYPE', 'The "request" argument must be of type string');
+      if (typeof specifier !== 'string') throw invalidArgType('request', 'string', specifier);
       if (builtinName(specifier) !== null) return null;
       if (specifier === '.' || specifier === '..' || specifier.startsWith('./') || specifier.startsWith('../')) return [path.dirname(filename)];
       const current = parent || cache[filename];
@@ -1145,7 +1251,7 @@ function createLoader(host, builtins) {
     if (cjs) source += 'export { value as "module.exports" };\n';
     let index = 0;
     const updates = [];
-    for (const name of names) {
+    for (let i9 = 0, a9 = names; i9 < a9.length; i9++) { const name = a9[i9];
       if (name === 'default' || (cjs && name === 'module.exports')) continue;
       const local = 'export_' + index++;
       source += (cjs ? 'const ' : 'let ') + local + ' = value[' + JSON.stringify(name) + '];\nexport { ' + local + ' as ' + JSON.stringify(name) + ' };\n';
@@ -1161,14 +1267,14 @@ function createLoader(host, builtins) {
     visited.add(disk);
     const scanned = analyzeExports(cleanSource(source === undefined ? text(disk) : source));
     const names = new Set(scanned.names);
-    for (const specifier of scanned.reexports) {
+    for (let i10 = 0, a10 = scanned.reexports; i10 < a10.length; i10++) { const specifier = a10[i10];
       let resolved;
       try { resolved = resolve(specifier, disk, 'require'); }
       catch (_) { continue; } // Resolution errors still surface during evaluation.
       let inherited = [];
       if (resolved.format === 'builtin') inherited = Object.keys(loadBuiltin(resolved.filename));
       else if (resolved.format === 'commonjs') inherited = commonJSNames(resolved.filename, visited);
-      for (const name of inherited) if (name !== 'default' && name !== 'module.exports') names.add(name);
+      for (let i11 = 0, a11 = inherited; i11 < a11.length; i11++) { const name = a11[i11]; if (name !== 'default' && name !== 'module.exports') names.add(name); }
     }
     return Array.from(names);
   }
@@ -1187,7 +1293,7 @@ function createLoader(host, builtins) {
   }
 
   function validateAttributes(kind, url, attributes) {
-    for (const key of Object.keys(attributes)) {
+    for (let i12 = 0, a12 = Object.keys(attributes); i12 < a12.length; i12++) { const key = a12[i12];
       if (key !== 'type') throw error('ERR_IMPORT_ATTRIBUTE_UNSUPPORTED', `Import attribute "${key}" with value "${attributes[key]}" is not supported`);
     }
     if (kind === 'json') {
@@ -1220,7 +1326,7 @@ function createLoader(host, builtins) {
     return { source, format: resolved.format, filename: resolved.filename };
   }
 
-  return { requireFor, runMain, warmMain, resolve, resolveMain, loadESM, cleanSource, prepareSource, bridge, Module, mockModule };
+  return { decorateModuleError, requireFor, runMain, warmMain, resolve, resolveMain, loadESM, cleanSource, prepareSource, bridge, Module, mockModule };
 }
 
 module.exports = { createLoader };

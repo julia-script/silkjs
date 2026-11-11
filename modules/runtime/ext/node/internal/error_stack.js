@@ -14,6 +14,7 @@ function install(global) {
   });
   const { records, captured, rootError } = state;
   const define = Object.defineProperty;
+  const kIsNodeError = host.kIsNodeError;
   function record(site) {
     const value = records.get(site);
     if (!value) throw new TypeError('CallSite method called on incompatible receiver');
@@ -134,6 +135,9 @@ function install(global) {
     const rawMessage = error.message;
     const message = rawMessage === undefined ? '' : `${rawMessage}`;
     let result = name ? message ? name + ': ' + message : name : message;
+    // Node's own errors read "Name [CODE]: message" (kIsNodeError in Node's prepareStackTrace).
+    if (kIsNodeError !== undefined && error !== null && typeof error === 'object' && error[kIsNodeError] === true)
+      result = `${name} [${error.code}]: ${message}`;
     const sources = host.builtinLoaded('internal/source_maps') ? require('internal/source_maps') : null;
     const mapped = sources !== null && sources.getSourceMapsSupport().enabled;
     for (let index = 0; index < frames.length; index++) {

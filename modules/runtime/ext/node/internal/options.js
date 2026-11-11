@@ -74,6 +74,8 @@ const environmentOptions = new Map([
     '--no-experimental-stream-iter', '--preserve-symlinks', '--no-preserve-symlinks',
     '--preserve-symlinks-main', '--no-preserve-symlinks-main',
     '--experimental-vm-modules', '--no-experimental-vm-modules',
+    '--experimental-require-module', '--no-experimental-require-module',
+    '--experimental-import-meta-resolve', '--experimental-print-required-tla',
     '--enable-source-maps', '--no-enable-source-maps',
     '--trace-sigint', '--no-trace-sigint',
     '--strip-types', '--no-strip-types', '--experimental-strip-types', '--no-experimental-strip-types',
@@ -81,7 +83,7 @@ const environmentOptions = new Map([
   ...['--trace-event-categories', '--trace-event-file-pattern', '--input-type',
     '--test-isolation', '--test-name-pattern', '--test-skip-pattern', '--test-shard',
     '--test-reporter', '--test-reporter-destination', '--localstorage-file',
-    '-r', '--require', '--import', '-C', '--conditions'].map(name => [name, true]),
+    '-r', '--require', '--import', '-C', '--conditions', '--experimental-loader', '--loader'].map(name => [name, true]),
 ]);
 
 function normalizeOption(arg) {

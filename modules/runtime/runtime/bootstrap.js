@@ -90,9 +90,12 @@ host.testCoverageStop = () => native.testCoverageNative(2);
 host.processFeatures = {
   debug: native.debugBuild, uv: true, ipv6: true, inspector: true,
   tls: true, tls_alpn: true, tls_sni: true, tls_ocsp: false,
-  cached_builtins: false, require_module: true,
+  cached_builtins: false,
+  get require_module() { return !host.requireModuleDisabled; },
   get typescript() { return host.typeScriptMode; }
 };
+// Marks the errors Node itself throws, whose stack and toString carry their code.
+host.kIsNodeError = Symbol('kIsNodeError');
 define('internal/host', module => { module.exports = host; });
 internalRequire('internal/error_stack').install(globalThis);
 let warnedTransformTypes = false;
@@ -661,8 +664,13 @@ function evaluateMain(source, name) {
   armInspectorEntry();
   return native.evaluateModule(source, name, true);
 }
-const requirePreloads = [], importPreloads = [];
+const requirePreloads = [], importPreloads = [], loaderPreloads = [];
 function runPreloads(entry, loadImports = true) {
+  // --experimental-loader: each one is module.register(specifier, cwd) before any preload.
+  if (loadImports && loaderPreloads.length) {
+    const base = internalRequire('url').pathToFileURL(host.cwd() + host.path.sep).href;
+    for (const specifier of loaderPreloads) loader.Module.register(specifier, base);
+  }
   loader.Module._preloadModules(requirePreloads);
   if (!loadImports || !importPreloads.length) return entry();
   const name = host.path.join(host.cwd(), '[preload]');
@@ -716,6 +724,14 @@ function runtimeFlag(arg) {
   }
   if (arg === '--experimental-stream-iter' || arg === '--no-experimental-stream-iter') {
     host.experimentalStreamIter = arg === '--experimental-stream-iter'; return true;
+  }
+  if (arg === '--experimental-require-module' || arg === '--no-experimental-require-module') {
+    host.requireModuleDisabled = arg === '--no-experimental-require-module'; return true;
+  }
+  if (arg === '--experimental-import-meta-resolve') { host.importMetaResolveParent = true; return true; }
+  if (arg === '--experimental-print-required-tla') { host.printRequiredTLA = true; return true; }
+  if (arg.startsWith('--experimental-loader=') || arg.startsWith('--loader=')) {
+    loaderPreloads.push(arg.slice(arg.indexOf('=') + 1)); return true;
   }
   if (arg === '--experimental-vm-modules' || arg === '--no-experimental-vm-modules') {
     host.experimentalVmModules = arg === '--experimental-vm-modules'; return true;
@@ -955,12 +971,13 @@ function run() {
       record(arg, ...(separator < 0 ? [value] : []));
       continue;
     }
-    if (['--localstorage-file=', '--require=', '--import=', '--conditions='].includes(arg) ||
+    if (['--localstorage-file=', '--require=', '--import=', '--conditions=', '--experimental-loader=', '--loader='].includes(arg) ||
         (arg.endsWith('=') && (internalRequire('internal/process_report').isValueOption(arg.slice(0, -1)) ||
           internalRequire('internal/permission').isValueOption(arg.slice(0, -1))))) return cliError(arg + ' requires an argument');
     if (runtimeFlag(arg)) { record(arg); continue; }
     if (arg === '--trace-event-categories' || arg === '--trace-event-file-pattern' || arg === '--localstorage-file' ||
         arg === '-r' || arg === '--require' || arg === '--import' || arg === '-C' || arg === '--conditions' ||
+        arg === '--experimental-loader' || arg === '--loader' ||
         internalRequire('internal/process_report').isValueOption(arg) ||
         internalRequire('internal/startup_controls').isValueOption(arg) ||
         internalRequire('internal/permission').isValueOption(arg) ||
@@ -970,7 +987,7 @@ function run() {
       const name = arg === '-r' ? '--require' : arg === '-C' ? '--conditions' : separator < 0 ? arg : arg.slice(0, separator);
       const value = separator < 0 ? args[++index] : arg.slice(separator + 1);
       if (value === undefined || (separator < 0 && internalRequire('internal/options').isInspectorValueOption(name) && value.startsWith('-')) ||
-          ((['--localstorage-file', '--require', '--import', '--conditions'].includes(name) || internalRequire('internal/process_report').isValueOption(name) || internalRequire('internal/startup_controls').isValueOption(name) || internalRequire('internal/permission').isValueOption(name)) &&
+          ((['--localstorage-file', '--require', '--import', '--conditions', '--experimental-loader', '--loader'].includes(name) || internalRequire('internal/process_report').isValueOption(name) || internalRequire('internal/startup_controls').isValueOption(name) || internalRequire('internal/permission').isValueOption(name)) &&
           (value === '' || (separator < 0 && value.startsWith('-'))))) return cliError(name + ' requires an argument');
       record(arg, ...(separator < 0 ? [value] : []));
       if (name === '--experimental-sea-config') { sea.prepare(value); return; }
@@ -1301,15 +1318,20 @@ globalThis.__silkRuntime = {
   importMeta(name) {
     const asURL = value => /^[A-Za-z][A-Za-z\d+.-]*:/.test(value) ? value : fileHref(value);
     const url = asURL(name);
-    const meta = {
-      url,
-      main: mainModuleName !== undefined && url === asURL(mainModuleName),
-      resolve(specifier) { return asURL(loader.resolve(specifier, name, 'import').filename); }
-    };
+    // As in Node: a null prototype, keys in this order, filename and dirname for file: only.
+    const meta = { __proto__: null };
     if (url.startsWith('file:')) {
-      meta.filename = url === 'file://' + name ? name : internalRequire('url').fileURLToPath(url);
-      meta.dirname = host.path.dirname(meta.filename);
+      const filename = url === 'file://' + name ? name : internalRequire('url').fileURLToPath(url);
+      meta.dirname = host.path.dirname(filename);
+      meta.filename = filename;
     }
+    meta.main = mainModuleName !== undefined && url === asURL(mainModuleName);
+    meta.resolve = function resolve(specifier, parent) {
+      // Only --experimental-import-meta-resolve gives the second argument meaning.
+      const from = host.importMetaResolveParent && parent !== undefined ? String(parent) : name;
+      return asURL(loader.resolve(specifier, from, 'import').filename);
+    };
+    meta.url = url;
     return meta;
   },
   asyncEvent: asyncHooks._nativeEvent,

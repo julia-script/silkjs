@@ -124,7 +124,6 @@ function analyzeExports(source) {
     }
   }
   names.delete('default');
-  names.delete('__esModule');
   names.delete('module.exports');
   return { names: Array.from(names), reexports: Array.from(reexports) };
 }
