@@ -5,9 +5,6 @@ const booleans = [
   '--use-openssl-ca', '--use-bundled-ca', '--use-system-ca', '--openssl-legacy-provider', '--openssl-shared-config', '--trace-tls',
 ];
 const values = ['--tls-cipher-list', '--tls-keylog', '--openssl-config', '--secure-heap', '--secure-heap-min'];
-const optionEntries = [];
-for (const name of booleans) optionEntries.push([name, false], ['--no-' + name.slice(2), false]);
-for (const name of values) optionEntries.push([name, true]);
 const state = new Map();
 
 function applyOption(arg) {
@@ -51,4 +48,4 @@ function getOptionValue(name) {
   if (booleans.includes(name)) return !!state.get(name);
   return undefined;
 }
-module.exports = { optionEntries, applyOption, validate, getOptionValue, isValueOption: name => values.includes(name), DEFAULT_CIPHER_LIST };
+module.exports = { applyOption, validate, getOptionValue, DEFAULT_CIPHER_LIST };

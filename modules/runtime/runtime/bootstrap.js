@@ -135,7 +135,19 @@ host.rebindRealmBuiltins = (previous, global) => {
 };
 const wasmResolver = global => wasmCallbacks.get(global);
 native.wasmNative('register', wasmResolver);
+// --disable-proto=delete|throw, for the main realm and each new one.
+function disableProto(global) {
+  const prototype = global.Object.prototype;
+  if (host.disableProto === 'delete') delete prototype.__proto__;
+  else if (host.disableProto === 'throw') {
+    const thrower = function () {
+      throw Object.assign(new Error('Accessing Object.prototype.__proto__ has been disallowed with --disable-proto=throw'), { code: 'ERR_PROTO_ACCESS' });
+    };
+    Object.defineProperty(prototype, '__proto__', { get: thrower, set: thrower, enumerable: false, configurable: true });
+  }
+}
 host.initializeRealmBuiltins = (handle, global, wasmCodeGeneration) => {
+  if (host.disableProto !== undefined) disableProto(global);
   const cache = new Map();
   const bridge = {
     captureCallSites: native.captureCallSites,
@@ -883,6 +895,8 @@ function evaluateMain(source, name) {
 }
 const requirePreloads = [], importPreloads = [], loaderPreloads = [];
 function runPreloads(entry, loadImports = true) {
+  // Before any preload: Node applies it when the context is made.
+  if (host.disableProto !== undefined) disableProto(globalThis);
   // --experimental-loader: each one is module.register(specifier, cwd) before any preload.
   if (loadImports && loaderPreloads.length) {
     const base = internalRequire('url').pathToFileURL(host.cwd() + host.path.sep).href;
@@ -901,6 +915,7 @@ function runPreloads(entry, loadImports = true) {
   }
   return pending.then(entry);
 }
+const optionFlag = entry => internalRequire('internal/options').optionFlag(entry);
 function runtimeFlag(arg) {
   try {
     if (internalRequire('internal/permission').applyOption(arg) ||
@@ -936,7 +951,7 @@ function runtimeFlag(arg) {
   // Node's flag exposes Node's own lib/internal modules and bindings. This
   // runtime has none of those, so the flag is accepted and exposes nothing:
   // require('internal/...') stays MODULE_NOT_FOUND.
-  if (arg === '--expose-internals' || arg === '--expose_internals') return true;
+  if (arg === '--expose-internals') return true;
   if (arg === '--disable-sigusr1') { host.disableSigusr1 = true; return true; }
   if (arg === '--test-update-snapshots' || arg === '--no-test-update-snapshots') {
     host.testUpdateSnapshots = arg === '--test-update-snapshots'; return true;
@@ -951,6 +966,14 @@ function runtimeFlag(arg) {
     host.experimentalWebSocket = arg === '--experimental-websocket'; return true;
   }
   if (arg === '--frozen-intrinsics') { host.frozenIntrinsics = true; return true; }
+  if (arg.startsWith('--disable-proto=')) {
+    const mode = arg.slice(16);
+    if (mode !== 'delete' && mode !== 'throw') {
+      host.writeStartupDiagnostic(process.execPath + ': invalid mode passed to --disable-proto\n');
+      return process.exit(12);
+    }
+    host.disableProto = mode; return true;
+  }
   // V8's flag to run without a JIT: this engine is an interpreter, so it always holds.
   if (arg === '--jitless') return true;
   // Buffer.allocUnsafe memory is always zeroed here, which is what this flag asks for.
@@ -961,8 +984,9 @@ function runtimeFlag(arg) {
   if (arg === '--experimental-stream-iter' || arg === '--no-experimental-stream-iter') {
     host.experimentalStreamIter = arg === '--experimental-stream-iter'; return true;
   }
-  if (arg === '--experimental-require-module' || arg === '--no-experimental-require-module') {
-    host.requireModuleDisabled = arg === '--no-experimental-require-module'; return true;
+  if (arg === '--experimental-require-module' || arg === '--no-experimental-require-module' ||
+      arg === '--require-module' || arg === '--no-require-module') {
+    host.requireModuleDisabled = arg.startsWith('--no-'); return true;
   }
   if (arg === '--experimental-import-meta-resolve') { host.importMetaResolveParent = true; return true; }
   if (arg === '--experimental-print-required-tla') { host.printRequiredTLA = true; return true; }
@@ -1051,20 +1075,9 @@ function prepareInput(source, filename, inputType, explicit) {
 function runWorker() {
   const { filename, eval: evaluate, argv, runtimeArgs } = workerBootstrap;
   let inputType;
-  for (let index = 0; index < runtimeArgs.length; index++) {
-    const arg = internalRequire('internal/options').normalizeOption(runtimeArgs[index]);
-    if (arg === '-e' || arg === '--eval') { index++; continue; }
-    if (arg === '-p' || arg === '--print') {
-      if (runtimeArgs[index + 1] !== undefined && !runtimeArgs[index + 1].startsWith('-')) index++;
-      continue;
-    }
-    if (arg === '--input-type') { inputType = runtimeArgs[++index]; continue; }
-    if (arg.startsWith('--input-type=')) { inputType = arg.slice(13); continue; }
-    if (arg === '--env-file' || arg === '--env-file-if-exists') { index++; continue; }
-    if (['--localstorage-file', '-r', '--require', '--import', '-C', '--conditions'].includes(arg) || internalRequire('internal/process_report').isValueOption(arg) || internalRequire('internal/startup_controls').isValueOption(arg) || internalRequire('internal/heap_prof').isValueOption(arg) || internalRequire('internal/permission').isValueOption(arg) || internalRequire('internal/options').isInspectorValueOption(arg)) {
-      runtimeFlag((arg === '-r' ? '--require' : arg === '-C' ? '--conditions' : arg) + '=' + runtimeArgs[++index]); continue;
-    }
-    runtimeFlag(arg);
+  for (const entry of internalRequire('internal/options').parseArguments(runtimeArgs, false).entries) {
+    if (entry.name === '--input-type') inputType = entry.value;
+    else if (!['--eval', '--print', '--env-file', '--env-file-if-exists'].includes(entry.name)) runtimeFlag(optionFlag(entry));
   }
   if (workerBootstrap.reportOptions) internalRequire('internal/process_report').inherit(workerBootstrap.reportOptions);
   // Engine flags affect the process, not an individual Worker option parser.
@@ -1105,183 +1118,7 @@ function installCommonJSInputGlobals(filename, id) {
   globalThis.module = module; globalThis.exports = module.exports;
   globalThis.__filename = id; globalThis.__dirname = '.';
 }
-function cliError(message) {
-  host.writeStartupDiagnostic(process.execPath + ': ' + message + '\n');
-  return process.exit(9);
-}
-function loadRuntimeEnvironment(args, beforeLoading) {
-  const files = internalRequire('internal/options').environmentFiles(args);
-  if (!files.length) return;
-  if (beforeLoading) beforeLoading();
-  const { loaded, errors } = internalRequire('internal/dotenv').loadEnvironmentFiles(files);
-  if (errors.length) return cliError(errors.join('\n' + process.execPath + ': '));
-  if (loaded) loader.Module._initPaths();
-}
-function run() {
-  if (workerBootstrap) return runWorker();
-  if (native.seaNative(0)) return internalRequire('internal/sea').runMain(native.argv.slice(1), runtimeFlag, installRuntimeOptions, runPreloads, loadRuntimeEnvironment);
-  // The environment as the process got it, before any environment file: only a
-  // watch supervisor needs it, so it is copied only when a file is about to load.
-  let startupEnvironment;
-  // A script path first means no flags, so no environment file to look for:
-  // the option tables load only for flags or NODE_OPTIONS.
-  const flags = native.argv.length < 2 || native.argv[1].charCodeAt(0) === 45;
-  if (flags) loadRuntimeEnvironment(native.argv.slice(1), () => { startupEnvironment = { ...process.env }; });
-  let environment = [];
-  if (process.env.NODE_OPTIONS) {
-    const options = internalRequire('internal/options');
-    try {
-      environment = options.parseEnvironment(process.env.NODE_OPTIONS);
-      environment.length = options.validateEnvironment(environment);
-    } catch (error) {
-      return cliError(error.message);
-    }
-  }
-  const args = environment.concat(native.argv.slice(1)); let expression, print = false, inputType = 'commonjs';
-  let filename, index = 0, interactive = false, testMode = false, inputTypeSet = false, check = false;
-  let watchMode = false, watchPreserveOutput = false, watchKillSignal = 'SIGTERM', runName;
-  const watchPaths = [];
-  const record = (...values) => {
-    if (index >= environment.length) {
-      values[0] = args[index - values.length + 1];
-      process.execArgv.push(...values);
-    }
-  };
-  const testOptions = {}, reporterNames = [], destinations = [];
-  const afterMain = result => interactive ? result && typeof result.then === 'function' ? result.then(startRepl) : startRepl() : result;
-  for (; index < args.length; index++) {
-    // Every option starts with a dash: anything else is the script.
-    if (args[index].charCodeAt(0) !== 45) break;
-    const arg = internalRequire('internal/options').normalizeOption(args[index]);
-    if (arg === '--') { index++; break; }
-    if (arg === '--watch' || arg === '--no-watch') { watchMode = arg === '--watch'; record(arg); continue; }
-    if (arg === '--watch-preserve-output' || arg === '--no-watch-preserve-output') {
-      watchPreserveOutput = arg === '--watch-preserve-output'; record(arg); continue;
-    }
-    if (arg === '--watch-path' || arg.startsWith('--watch-path=') ||
-        arg === '--watch-kill-signal' || arg.startsWith('--watch-kill-signal=')) {
-      const separator = arg.indexOf('='), name = separator < 0 ? arg : arg.slice(0, separator);
-      const value = separator < 0 ? args[++index] : arg.slice(separator + 1);
-      if (value === undefined || value === '' || (separator < 0 && value.startsWith('-')))
-        return cliError(name + ' requires an argument');
-      record(arg, ...(separator < 0 ? [value] : []));
-      if (name === '--watch-path') { watchPaths.push(value); watchMode = true; }
-      else watchKillSignal = value;
-      continue;
-    }
-    if (arg === '--run' || arg.startsWith('--run=')) {
-      const separator = arg.indexOf('=');
-      const value = separator < 0 && args[index + 1] !== undefined && !args[index + 1].startsWith('-') ? args[++index] :
-        separator < 0 ? '' : arg.slice(separator + 1);
-      runName = value;
-      record(arg, ...(separator < 0 && value !== '' ? [value] : []));
-      continue;
-    }
-    if (arg === '--experimental-test-coverage' || arg === '--no-experimental-test-coverage') {
-      testOptions.coverage = arg === '--experimental-test-coverage'; record(arg); continue;
-    }
-    if (arg === '--env-file' || arg === '--env-file-if-exists' ||
-        arg.startsWith('--env-file=') || arg.startsWith('--env-file-if-exists=')) {
-      const separator = arg.indexOf('=');
-      const value = separator < 0 ? args[++index] : arg.slice(separator + 1);
-      if (value === undefined || value === '' || (separator < 0 && value.startsWith('-')))
-        return cliError(arg + ' requires an argument');
-      record(arg, ...(separator < 0 ? [value] : []));
-      continue;
-    }
-    if (['--localstorage-file=', '--require=', '--import=', '--conditions=', '--experimental-loader=', '--loader='].includes(arg) ||
-        (arg.endsWith('=') && (internalRequire('internal/process_report').isValueOption(arg.slice(0, -1)) ||
-          internalRequire('internal/startup_controls').isValueOption(arg.slice(0, -1)) ||
-          internalRequire('internal/heap_prof').isValueOption(arg.slice(0, -1)) ||
-          internalRequire('internal/permission').isValueOption(arg.slice(0, -1)) ||
-          internalRequire('internal/tls/options').isValueOption(arg.slice(0, -1))))) return cliError(arg + ' requires an argument');
-    if (runtimeFlag(arg)) { record(arg); continue; }
-    if (arg === '--trace-event-categories' || arg === '--trace-event-file-pattern' || arg === '--localstorage-file' ||
-        arg === '-r' || arg === '--require' || arg === '--import' || arg === '-C' || arg === '--conditions' ||
-        arg === '--experimental-loader' || arg === '--loader' ||
-        internalRequire('internal/process_report').isValueOption(arg) ||
-        internalRequire('internal/startup_controls').isValueOption(arg) ||
-        internalRequire('internal/heap_prof').isValueOption(arg) ||
-        internalRequire('internal/permission').isValueOption(arg) ||
-        internalRequire('internal/tls/options').isValueOption(arg) ||
-        internalRequire('internal/options').isInspectorValueOption(arg) ||
-        arg === '--experimental-sea-config' || arg.startsWith('--experimental-sea-config=')) {
-      const separator = arg.indexOf('=');
-      const name = arg === '-r' ? '--require' : arg === '-C' ? '--conditions' : separator < 0 ? arg : arg.slice(0, separator);
-      const value = separator < 0 ? args[++index] : arg.slice(separator + 1);
-      if (value === undefined || (separator < 0 && internalRequire('internal/options').isInspectorValueOption(name) && value.startsWith('-')) ||
-          ((['--localstorage-file', '--require', '--import', '--conditions', '--experimental-loader', '--loader'].includes(name) || internalRequire('internal/process_report').isValueOption(name) || internalRequire('internal/startup_controls').isValueOption(name) || internalRequire('internal/heap_prof').isValueOption(name) || internalRequire('internal/permission').isValueOption(name)) &&
-          (value === '' || (separator < 0 && value.startsWith('-'))))) return cliError(name + ' requires an argument');
-      record(arg, ...(separator < 0 ? [value] : []));
-      if (name === '--experimental-sea-config') { sea.prepare(value); return; }
-      runtimeFlag(name + '=' + value);
-      continue;
-    }
-    if (arg === '--no-print') { print = false; record(arg); continue; }
-    if (arg.startsWith('--print=')) { print = true; record(arg); continue; }
-    if (arg === '-p' || arg === '--print') {
-      print = true;
-      if (args[index + 1] !== undefined && !args[index + 1].startsWith('-')) {
-        expression = args[++index]; record(arg, expression);
-      } else record(arg);
-      continue;
-    }
-    if (arg === '-e' || arg === '--eval' || arg === '-pe' || arg.startsWith('--eval=')) {
-      const separator = arg.indexOf('=');
-      if (arg === '-pe') print = true;
-      if (separator < 0 && (++index >= args.length || args[index].startsWith('-'))) return cliError((arg === '-pe' ? '--eval' : arg) + ' requires an argument');
-      expression = separator < 0 ? args[index] : arg.slice(separator + 1);
-      record(arg, ...(separator < 0 ? [expression] : [])); continue;
-    }
-    if (arg === '--input-type' || arg.startsWith('--input-type=')) {
-      const separator = arg.indexOf('=');
-      inputType = separator < 0 ? args[++index] : arg.slice(separator + 1);
-      if (inputType === undefined || (separator < 0 && inputType.startsWith('-'))) return cliError('--input-type requires an argument');
-      if (!['module', 'commonjs', 'module-typescript', 'commonjs-typescript'].includes(inputType))
-        return cliError('--input-type must be "module", "commonjs", "module-typescript" or "commonjs-typescript"');
-      inputTypeSet = true; record(arg, ...(separator < 0 ? [inputType] : [])); continue;
-    }
-    if (arg === '-i' || arg === '--interactive') { interactive = true; record(arg); continue; }
-    if (arg === '-c' || arg === '--check') { check = true; record(arg); continue; }
-    if (arg === '--test') { testMode = true; record(arg); continue; }
-    if (arg === '--test-only') { testOptions.only = true; record(arg); continue; }
-    if (arg === '--test-force-exit') { testOptions.forceExit = true; record(arg); continue; }
-    if (arg === '--test-randomize') { testOptions.randomize = true; record(arg); continue; }
-    if (arg.startsWith('--test-') || arg.startsWith('--experimental-test-tag-filter') || arg.startsWith('--experimental-test-isolation')) {
-      const separator = arg.indexOf('=');
-      const name = separator < 0 ? arg : arg.slice(0, separator);
-      const option = {
-        '--test-concurrency': 'concurrency', '--test-timeout': 'timeout', '--test-isolation': 'isolation',
-        '--experimental-test-isolation': 'isolation', '--test-random-seed': 'randomSeed',
-        '--test-rerun-failures': 'rerunFailuresFilePath', '--test-global-setup': 'globalSetupPath',
-        '--experimental-test-tag-filter': 'testTagFilters',
-        '--test-name-pattern': 'testNamePatterns', '--test-skip-pattern': 'testSkipPatterns',
-        '--test-shard': 'shard', '--test-reporter': 'reporter', '--test-reporter-destination': 'destination',
-        '--test-coverage-include': 'coverageIncludeGlobs', '--test-coverage-exclude': 'coverageExcludeGlobs',
-        '--test-coverage-lines': 'lineCoverage', '--test-coverage-branches': 'branchCoverage', '--test-coverage-functions': 'functionCoverage',
-      }[name];
-      if (!option) return cliError('bad option: ' + arg);
-      const value = separator < 0 ? args[++index] : arg.slice(separator + 1);
-      if (value === undefined || value === '') return cliError((value === '' && separator >= 0 ? arg : name) + ' requires an argument');
-      record(arg, ...(separator < 0 ? [value] : []));
-      if (option === 'reporter') reporterNames.push(value);
-      else if (option === 'destination') destinations.push(value);
-      else if (option === 'testNamePatterns' || option === 'testSkipPatterns' || option === 'testTagFilters') (testOptions[option] ||= []).push(value);
-      else if (option === 'coverageIncludeGlobs' || option === 'coverageExcludeGlobs') (testOptions[option] ||= []).push(value);
-      else if (option === 'lineCoverage' || option === 'branchCoverage' || option === 'functionCoverage') {
-        const threshold = Number(value);
-        if (value === '' || !Number.isInteger(threshold) || threshold < 0 || threshold > 100)
-          return cliError(name + ' must be an integer between 0 and 100');
-        testOptions[option] = threshold;
-      }
-      else if (option === 'shard') {
-        const [index, total] = value.split('/').map(Number); testOptions.shard = { index, total };
-      } else testOptions[option] = option === 'concurrency' || option === 'timeout' || option === 'randomSeed' ? Number(value) : value;
-      continue;
-    }
-    if (arg === '-v' || arg === '--version') { host.stdout.write('silkjsruntime 0.1.0 (QuickJS; Node 24 target)\n'); return; }
-    if (arg === '-h' || arg === '--help') {
-      host.stdout.write(`Usage: silkjsruntime [options] [script.js] [arguments]
+const HELP_TEXT = `Usage: silkjsruntime [options] [script.js] [arguments]
   -e, --eval CODE    Evaluate JavaScript (also --eval=CODE)
   -p, --print [CODE] Evaluate and print; read stdin when CODE is omitted
   -c, --check        Check syntax without executing
@@ -1345,19 +1182,123 @@ Environment:
   NODE_OPTIONS      Supported runtime flags, applied before CLI flags
   NODE_PATH         Additional CommonJS package lookup directories
   NODE_NO_WARNINGS, NODE_REDIRECT_WARNINGS, NODE_PENDING_DEPRECATION
-`);
-      return;
+`;
+function cliError(message) {
+  host.writeStartupDiagnostic(process.execPath + ': ' + message + '\n');
+  return process.exit(9);
+}
+function loadRuntimeEnvironment(args, beforeLoading) {
+  const files = internalRequire('internal/options').environmentFiles(args);
+  if (!files.length) return;
+  if (beforeLoading) beforeLoading();
+  const { loaded, errors } = internalRequire('internal/dotenv').loadEnvironmentFiles(files);
+  if (errors.length) return cliError(errors.join('\n' + process.execPath + ': '));
+  if (loaded) loader.Module._initPaths();
+}
+function run() {
+  if (workerBootstrap) return runWorker();
+  if (native.seaNative(0)) return internalRequire('internal/sea').runMain(native.argv.slice(1), runtimeFlag, installRuntimeOptions, runPreloads, loadRuntimeEnvironment);
+  // The environment as the process got it, before any environment file: only a
+  // watch supervisor needs it, so it is copied only when a file is about to load.
+  let startupEnvironment;
+  // A script path first means no flags, so no environment file to look for:
+  // the option tables load only for flags or NODE_OPTIONS.
+  const flags = native.argv.length < 2 || native.argv[1].charCodeAt(0) === 45;
+  if (flags) loadRuntimeEnvironment(native.argv.slice(1), () => { startupEnvironment = { ...process.env }; });
+  let environment = [], environmentEntries = [];
+  if (process.env.NODE_OPTIONS) {
+    let parsed;
+    try {
+      const options = internalRequire('internal/options');
+      environment = options.parseEnvironment(process.env.NODE_OPTIONS);
+      parsed = options.parseArguments(environment, true);
+    } catch (error) {
+      return cliError(error.message);
     }
-    if (/^--debug(?:-brk)?(?:=|$)/.test(arg))
+    if (parsed.error !== undefined) return cliError(parsed.error);
+    environment.length = parsed.index;
+    environmentEntries = parsed.entries;
+  }
+  const args = native.argv.slice(1);
+  // Without flags the parser and its option table stay unloaded.
+  const parsed = flags ? internalRequire('internal/options').parseArguments(args, false) : { entries: [], execArgv: [], index: 0 };
+  if (parsed.error !== undefined) return cliError(parsed.error);
+  const index = parsed.index;
+  process.execArgv.push(...parsed.execArgv);
+  let expression, print = false, inputType = 'commonjs';
+  let filename, interactive = false, testMode = false, inputTypeSet = false, check = false;
+  let watchMode = false, watchPreserveOutput = false, watchKillSignal = 'SIGTERM', runName;
+  const watchPaths = [];
+  const testOptions = {}, reporterNames = [], destinations = [];
+  const afterMain = result => interactive ? result && typeof result.then === 'function' ? result.then(startRepl) : startRepl() : result;
+  const testOptionNames = {
+    '--test-concurrency': 'concurrency', '--test-timeout': 'timeout', '--test-isolation': 'isolation',
+    '--experimental-test-isolation': 'isolation', '--test-random-seed': 'randomSeed',
+    '--test-rerun-failures': 'rerunFailuresFilePath', '--test-global-setup': 'globalSetupPath',
+    '--experimental-test-tag-filter': 'testTagFilters',
+    '--test-name-pattern': 'testNamePatterns', '--test-skip-pattern': 'testSkipPatterns',
+    '--test-shard': 'shard', '--test-reporter': 'reporter', '--test-reporter-destination': 'destination',
+    '--test-coverage-include': 'coverageIncludeGlobs', '--test-coverage-exclude': 'coverageExcludeGlobs',
+    '--test-coverage-lines': 'lineCoverage', '--test-coverage-branches': 'branchCoverage', '--test-coverage-functions': 'functionCoverage',
+  };
+  // Options apply in order, NODE_OPTIONS first. Names are canonical: the
+  // option table has expanded aliases and short forms.
+  for (const entry of environmentEntries.concat(parsed.entries)) {
+    const { name, value } = entry;
+    switch (name) {
+      case '--watch': watchMode = value; continue;
+      case '--watch-preserve-output': watchPreserveOutput = value; continue;
+      case '--watch-path': watchPaths.push(value); continue;
+      case '--watch-kill-signal': watchKillSignal = value; continue;
+      case '--run': runName = value; continue;
+      case '--experimental-test-coverage': testOptions.coverage = value; continue;
+      // Loaded before parsing, by loadRuntimeEnvironment.
+      case '--env-file': case '--env-file-if-exists': continue;
+      case '--experimental-sea-config': sea.prepare(value); return;
+      case '--print': print = value; continue;
+      case '--eval': expression = value; continue;
+      case '--input-type':
+        if (!['module', 'commonjs', 'module-typescript', 'commonjs-typescript'].includes(value))
+          return cliError('--input-type must be "module", "commonjs", "module-typescript" or "commonjs-typescript"');
+        inputType = value; inputTypeSet = true; continue;
+      case '--interactive': interactive = value; continue;
+      case '--check': check = value; continue;
+      case '--test': testMode = value; continue;
+      case '--test-only': testOptions.only = value; continue;
+      case '--test-force-exit': testOptions.forceExit = value; continue;
+      case '--test-randomize': testOptions.randomize = value; continue;
+      case '--version': host.stdout.write('silkjsruntime 0.1.0 (QuickJS; Node 24 target)\n'); return;
+      case '--help': host.stdout.write(HELP_TEXT); return;
+    }
+    const option = testOptionNames[name];
+    if (option !== undefined) {
+      if (option === 'reporter') reporterNames.push(value);
+      else if (option === 'destination') destinations.push(value);
+      else if (option === 'testNamePatterns' || option === 'testSkipPatterns' || option === 'testTagFilters') (testOptions[option] ||= []).push(value);
+      else if (option === 'coverageIncludeGlobs' || option === 'coverageExcludeGlobs') (testOptions[option] ||= []).push(value);
+      else if (option === 'lineCoverage' || option === 'branchCoverage' || option === 'functionCoverage') {
+        const threshold = Number(value);
+        if (value === '' || !Number.isInteger(threshold) || threshold < 0 || threshold > 100)
+          return cliError(name + ' must be an integer between 0 and 100');
+        testOptions[option] = threshold;
+      }
+      else if (option === 'shard') {
+        const [index, total] = value.split('/').map(Number); testOptions.shard = { index, total };
+      } else testOptions[option] = option === 'concurrency' || option === 'timeout' || option === 'randomSeed' ? Number(value) : value;
+      continue;
+    }
+    // Node keeps both in its table only to reject them.
+    if (entry.name === '--debug' || entry.name === '--debug-brk')
       return cliError('`node --debug` and `node --debug-brk` are invalid. Please use `node --inspect` and `node --inspect-brk` instead.');
-    if (arg !== '-' && arg.startsWith('-')) return cliError('bad option: ' + arg);
-    break;
+    if (runtimeFlag(optionFlag(entry)) || entry.implied) continue;
+    return cliError('bad option: ' + entry.raw);
   }
   if (runName !== undefined) {
     const separator = native.argv.indexOf('--', 1);
     return internalRequire('internal/main/run').runPackageScript(runName, separator < 0 ? [] : native.argv.slice(separator + 1));
   }
-  const tlsConflict = internalRequire('internal/tls/options').validate();
+  // Only a TLS flag loads internal/tls/options, so a plain start skips the check.
+  const tlsConflict = moduleHas('internal/tls/options') && internalRequire('internal/tls/options').validate();
   if (tlsConflict) return cliError(tlsConflict);
   if (watchMode && expression !== undefined) return cliError('either --watch or --eval can be used, not both');
   if (watchMode && check) return cliError('either --watch or --check can be used, not both');

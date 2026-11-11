@@ -12,9 +12,6 @@ const stringFlags = new Map([
   ['--report-directory', 'directory'], ['--report-dir', 'directory'],
   ['--report-filename', 'filename'], ['--report-signal', 'signal'],
 ]);
-const optionEntries = [['--experimental-report', false]];
-for (const name of booleanFlags.keys()) optionEntries.push([name, false], ['--no-' + name.slice(2), false]);
-for (const name of stringFlags.keys()) optionEntries.push([name, true]);
 function processWideOption(name) {
   if (name.startsWith('--no-')) name = '--' + name.slice(5);
   return sharedSettings.has(booleanFlags.get(name) || stringFlags.get(name));
@@ -246,8 +243,7 @@ function createReport(process) {
 }
 module.exports = {
   createReport,
-  optionEntries, processWideOption,
-  isValueOption(name) { return stringFlags.has(name); },
+  processWideOption,
   applyOption(arg) { return hooks.applyOption(arg); },
   inherit(options) { hooks.inherit(options); },
   onUncaughtException(error) { hooks?.onUncaughtException(error); },
