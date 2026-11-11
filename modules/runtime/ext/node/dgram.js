@@ -20,8 +20,7 @@
 // USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 // Adapted from Node.js v24.22.1 lib/dgram.js for the Silk runtime: the UDP handle is
-// internal/dgram's UDP over the native network bridge, and cluster workers share bound
-// sockets through cluster._getDatagram.
+// internal/dgram's UDP over the native network bridge.
 
 'use strict';
 
@@ -104,7 +103,6 @@ function Socket(type, listener) {
     sendBufferSize,
     receiveBlockList,
     sendBlockList,
-    clusterRelease: null,
   };
 
   if (options?.signal !== undefined) {
@@ -188,13 +186,43 @@ function bufferSize(self, size, buffer) {
   return result;
 }
 
-// Ask the cluster primary for a shared socket; it arrives through _adoptClusterHandle.
-function bindServerHandle(self, options, errCb) {
+function replaceHandle(self, newHandle) {
   const state = self[kStateSymbol];
-  require('cluster')._getDatagram(self, options, (err) => {
-    if (!state.handle) return;
-    if (err) errCb(err);
-    else self.emit('listening');
+  const oldHandle = state.handle;
+  // Sync the old handle state to new handle
+  if (!oldHandle.hasRef() && typeof newHandle.unref === 'function') {
+    newHandle.unref();
+  }
+
+  // Set up the handle that we got from primary.
+  newHandle.lookupFunction = oldHandle.lookupFunction;
+  newHandle.owner = self;
+
+  // Replace the existing handle by the handle we got from primary.
+  oldHandle.close();
+  state.handle = newHandle;
+}
+
+function bindServerHandle(self, options, errCb) {
+  const cluster = require('cluster');
+
+  const state = self[kStateSymbol];
+  cluster._getServer(self, options, (err, handle) => {
+    if (err) {
+      // Do not call callback if socket is closed
+      if (state.handle) {
+        errCb(err);
+      }
+      return;
+    }
+
+    if (!state.handle) {
+      // Handle has been closed in the mean time.
+      return handle.close();
+    }
+
+    replaceHandle(self, handle);
+    startListening(self);
   });
 }
 
@@ -231,9 +259,9 @@ Socket.prototype.bind = function(port_, address_ /* , callback */) {
     const cluster = require('cluster');
 
     if (cluster.isWorker && !exclusive) {
-      bindServerHandle(this, { host: null, port: null, addressType: this.type, fd, flags: null }, (err) => {
+      bindServerHandle(this, { address: null, port: null, addressType: this.type, fd, flags: null }, (err) => {
         state.bindState = BIND_STATE_UNBOUND;
-        this.emit('error', err);
+        this.emit('error', new ErrnoException(err, 'open'));
       });
       return this;
     }
@@ -278,9 +306,9 @@ Socket.prototype.bind = function(port_, address_ /* , callback */) {
     if (state.reusePort) exclusive = true;
 
     if (cluster.isWorker && !exclusive) {
-      bindServerHandle(this, { host: ip, port, addressType: this.type, fd: undefined, flags }, (err) => {
+      bindServerHandle(this, { address: ip, port, addressType: this.type, fd: undefined, flags }, (err) => {
         state.bindState = BIND_STATE_UNBOUND;
-        this.emit('error', err);
+        this.emit('error', new ExceptionWithHostPort(err, 'bind', ip, port));
       });
     } else {
       const err = state.handle.bind(ip, port || 0, flags);
@@ -656,9 +684,6 @@ Socket.prototype.close = function(callback) {
   stopReceiving(this);
   state.handle.close();
   state.handle = null;
-  const release = state.clusterRelease;
-  state.clusterRelease = null;
-  if (release) release();
   process.nextTick(socketCloseNT, this);
 
   return this;
@@ -837,47 +862,6 @@ Socket.prototype.getSendQueueSize = function() {
 Socket.prototype.getSendQueueCount = function() {
   return this[kStateSymbol].handle.getSendQueueCount();
 };
-
-// Cluster and IPC handle sharing (internal/cluster, internal/child_process/ipc).
-
-// Binds or opens a descriptor; a primary or an IPC recipient that only passes the socket
-// on does not start receiving. Returns the error instead of throwing.
-Socket.prototype._bindNative = function(options, receive = true) {
-  const state = this[kStateSymbol];
-  const err = options.fd === undefined ?
-    state.handle.bind(options.host, options.port || 0, options.flags ?? bindFlags(state)) :
-    state.handle.open(options.fd);
-  if (err < 0) {
-    return options.fd === undefined ?
-      new ExceptionWithHostPort(err, 'bind', options.host, options.port) : new ErrnoException(err, 'open');
-  }
-  if (receive) return startReceiving(this);
-  state.bindState = BIND_STATE_BOUND;
-  return null;
-};
-
-// Takes over the bound handle of a socket received from the cluster primary.
-Socket.prototype._adoptClusterHandle = function(other) {
-  const state = this[kStateSymbol];
-  const theirs = other[kStateSymbol];
-  const unused = state.handle;
-  if (!unused.hasRef()) theirs.handle.unref();
-  state.handle = theirs.handle;
-  state.handle.owner = this;
-  theirs.handle = unused;
-  unused.owner = other;
-  other.close();
-  return startReceiving(this);
-};
-
-Object.defineProperties(Socket.prototype, {
-  _id: { get() { return this[kStateSymbol].handle?.id ?? 0; } },
-  _closed: { get() { return !this[kStateSymbol].handle; } },
-  _clusterRelease: {
-    get() { return this[kStateSymbol].clusterRelease; },
-    set(release) { this[kStateSymbol].clusterRelease = release; },
-  },
-});
 
 // Deprecated private APIs.
 for (const [name, key] of [['_handle', 'handle'], ['_receiving', 'receiving'], ['_bindState', 'bindState'],

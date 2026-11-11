@@ -21,7 +21,7 @@ for (const text of ["({a = 1})", "[{a = 1}]", "f({a = 1}.x)", "({__proto__: 1, _
 }
 const got = r.join() + "|" + errors.join();
 const expected = "1,2,3,5,object,object,7,8,9,10,11,12,true,27,2|" +
-  "SyntaxError:expecting '}',SyntaxError:expecting '}',SyntaxError:expecting '}'," +
-  "SyntaxError:duplicate __proto__ property name,SyntaxError:expecting '}',SyntaxError:expecting '}',SyntaxError:expecting '}'";
+  "SyntaxError:Invalid shorthand property initializer,SyntaxError:Invalid shorthand property initializer,SyntaxError:Invalid shorthand property initializer," +
+  "SyntaxError:Duplicate __proto__ fields are not allowed in object literals,SyntaxError:Invalid shorthand property initializer,SyntaxError:Invalid shorthand property initializer,SyntaxError:Invalid shorthand property initializer";
 console.log(got === expected ? "PASS speculative literal patterns" : "FAIL " + got);
 if (got !== expected) throw new Error("speculative literal pattern regressions");

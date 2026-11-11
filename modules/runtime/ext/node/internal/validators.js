@@ -208,10 +208,18 @@ function checkRangesOrGetDefault(number, name, lower, upper, def) {
   }
   return number;
 }
+function validateStringWithoutNullBytes(value, name) {
+  validateString(value, name);
+  if (value.includes('\u0000')) {
+    throw new ERR_INVALID_ARG_VALUE(name, value, 'must be a string without null bytes');
+  }
+}
+
 // Node wraps its validators in hideStackFrames(), whose callers inside other
 // hidden frames use fn.withoutStackTrace.
 for (const fn of [validateString, validateBoolean, validateFunction, validatePlainFunction, validateNumber, validateInteger, validateInt32,
-  validateUint32, validateObject, validateArray, validateOneOf, validateAbortSignal, validateBuffer]) {
+  validateUint32, validateObject, validateArray, validateOneOf, validateAbortSignal, validateBuffer,
+  validateStringWithoutNullBytes]) {
   fn.withoutStackTrace = fn;
 }
 
@@ -225,4 +233,5 @@ module.exports = {
   isUint32, parseFileMode, validateBuffer, validateLinkHeaderValue,
   convertToValidSignal, signalName, toPathIfFileURL, validatePath, getValidatedPath, validatePort,
   validateFiniteNumber, checkRangesOrGetDefault, validateThisInternalField,
+  validateStringWithoutNullBytes,
 };
