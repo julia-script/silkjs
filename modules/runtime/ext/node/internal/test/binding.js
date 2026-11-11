@@ -20,6 +20,8 @@ const kBindings = {
   constants: 'internal/constants_binding',
   crypto: 'internal/crypto/binding',
   http2: 'internal/http2/binding',
+  // node_http_parser.cc: HTTPParser, ConnectionsList, methods, allMethods.
+  http_parser: 'internal/http/native-parser',
   performance: 'internal/performance_binding',
   trace_events: 'internal/trace_events_binding',
   util: 'internal/util/binding',

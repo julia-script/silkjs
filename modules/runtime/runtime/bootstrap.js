@@ -71,6 +71,9 @@ for (const name of ['dispose', 'asyncDispose']) {
   if (Symbol[name] === undefined) Object.defineProperty(Symbol, name, { value: Symbol.for('nodejs.' + name) });
 }
 const host = { ...native, rawOS, rawStd };
+// Throws value again and keeps the throw site its first throw recorded, as
+// V8's TryCatch::ReThrow does for Node's own catch and rethrow paths.
+host.rethrow = value => { native.captureCallSites(-5, value); };
 host.builtinLoaded = moduleHas;
 // Whether a built-in id (public or internal) exists, loaded or not: Node's BuiltinModule.exists.
 host.builtinExists = Map.prototype.has.bind(factories);
@@ -674,6 +677,7 @@ Object.assign(process, {
     if (code < 0) throw new (internalRequire('internal/errors').ErrnoException)(-Math.abs(code), 'kill');
     return true;
   },
+  _fatalException: internalRequire('internal/startup_controls').fatalException,
   // Formats like console.log and writes to fd 2 at once: no streams, ticks or console.
   _rawDebug(...args) { host.writeText(2, internalRequire('util').format(...args) + '\n'); },
 });
@@ -1527,6 +1531,8 @@ function loopTurn(pendingPromise) {
     }
   }
 }
+// An exception in a 'beforeExit' or 'exit' listener is uncaught like any other.
+function emitProcessEvent(name) { process.emit(name, Number(process.exitCode) || 0); }
 function loop() {
   performanceMilestones.loopStart = native.now() - startTime;
   initialNativeIdleTime = native.loopIdleTime();
@@ -1535,15 +1541,15 @@ function loop() {
     pollWorkers();
     if (workerThreads._exitRequested) break;
     if (!referencedWork()) {
-      process.emit('beforeExit', Number(process.exitCode) || 0);
+      invoke(emitProcessEvent, undefined, ['beforeExit']);
       checkpoint();
       if (!referencedWork()) break;
     }
     loopTurn();
   }
   performanceMilestones.loopExit = native.now() - startTime;
-  process._exiting = true; const status = Number(process.exitCode) || 0;
-  process.emit('exit', status);
+  process._exiting = true;
+  invoke(emitProcessEvent, undefined, ['exit']);
   inspectorBackend._atExit();
   if (moduleHas('internal/heap_prof')) internalRequire('internal/heap_prof').finish();
   if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushAtExit();
@@ -1553,8 +1559,9 @@ const imageModules = ['fs', 'fs/promises', 'internal/fs_streams', 'internal/fs_u
   'events', 'stream', 'stream/promises', 'string_decoder', 'util', 'assert', 'console', 'net', 'tty',
   'internal/tty/write', 'url', 'internal/web/url', 'internal/web/encoding', 'internal/abort_controller'];
 globalThis.__silkRuntime = {
-  normalize(name, parent, attributes) { return loader.resolveImport(name, parent, attributes).filename; },
+  normalize(name, parent, attributes) { return loader.importKey(name, parent, attributes); },
   load(name, attributes) { return loader.loadESM(name, attributes).source; },
+  moduleSource(name, parent, attributes) { return loader.moduleSource(name, parent, attributes); },
   registerSource(filename, source, metadata) {
     host.registerSource(filename, source, { ...metadata, owner: metadata });
     if (!metadata.generated && typeof filename === 'string') {
