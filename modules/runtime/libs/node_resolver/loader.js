@@ -183,7 +183,14 @@ function createLoader(host, builtins) {
     return builtins.get(name);
   }
 
-  function format(filename, mode) {
+  // A .js file outside any typed package, required by another module with no hooks
+  // on: as in Node, it is compiled as CommonJS and its syntax is checked for ESM only
+  // when that fails, so the file is not parsed twice.
+  const ambiguous = 'commonjs (ambiguous)';
+  // Modules of such files that turned out to be ES modules.
+  const detectedModules = new WeakSet();
+
+  function format(filename, mode, deferDetection = false) {
     if (filename.startsWith('node:')) return 'builtin';
     const disk = filesystemName(filename);
     const ext = path.extname(disk);
@@ -204,6 +211,7 @@ function createLoader(host, builtins) {
     if (pkg && pkg.data.type === 'module') return 'module';
     // Embedders may provide Node's syntax detection for ambiguous .js files.
     if ((!pkg || pkg.data.type !== 'commonjs') && typeof host.detectModuleSyntax === 'function') {
+      if (deferDetection) return ambiguous;
       const source = text(disk);
       if (host.detectModuleSyntax(cleanSource(source), disk)) return 'module';
       probed = { filename: disk, source };
@@ -216,10 +224,11 @@ function createLoader(host, builtins) {
     const canonical = preserve ? path.resolve(filename) : host.realpath(filename);
     const identity = suffix && mode === 'import' ? fileURL(canonical) + suffix : canonical;
     let kind;
-    try { kind = format(identity, mode); }
+    try { kind = format(identity, mode, mode === 'require' && !isMain && !hooks.active()); }
     catch (cause) {
       if (!hooks.active() || cause.code !== 'ERR_UNKNOWN_FILE_EXTENSION') throw cause;
     }
+    if (kind === ambiguous) return { filename: identity, format: 'commonjs', ambiguous: true };
     return { filename: identity, format: kind };
   }
 
@@ -540,8 +549,9 @@ function createLoader(host, builtins) {
   }
 
   function mockResolution(resolved, mode) {
+    if (mode !== 'import' || moduleMocks.size === 0) return resolved;
     const mock = moduleMocks.get(asURL(resolved.filename));
-    if (!mock || mode !== 'import') return resolved;
+    if (!mock) return resolved;
     let filename = mock.identity;
     if (!mock.cache || !filename) {
       const url = new (builtins.get('url').URL)(asURL(resolved.filename));
@@ -870,13 +880,13 @@ function createLoader(host, builtins) {
   };
 
   function loadResolved(resolved, parent, isMain, allowAsync = false) {
-    const mock = moduleMocks.get(asURL(resolved.filename));
+    const mock = moduleMocks.size === 0 ? undefined : moduleMocks.get(asURL(resolved.filename));
     if (mock) return mockCommonJS(mock, filesystemName(resolved.filename), parent);
     if (resolved.format === 'builtin' && !hooks.active(allowAsync)) return loadBuiltin(resolved.filename);
     const filename = filesystemName(resolved.filename);
     if (host.reportDependency && path.isAbsolute(filename)) host.reportDependency(filename);
     if (own(cache, filename)) {
-      if (resolved.format === 'module' && !cache[filename].loaded) {
+      if ((resolved.format === 'module' || detectedModules.has(cache[filename])) && !cache[filename].loaded) {
         throw error('ERR_REQUIRE_CYCLE_MODULE', `Cannot require() ES Module ${filename} in a cycle`);
       }
       addChild(parent, cache[filename]);
@@ -897,17 +907,8 @@ function createLoader(host, builtins) {
     addChild(parent, module);
     try {
       if (resolved.format === 'module') {
-        if (typeof host.requireModule !== 'function') throw error('ERR_REQUIRE_ESM', `require() of ES Module ${filename} needs the native synchronous module evaluation hook`);
         if (loaded) pendingLoads.set(resolved.filename, loaded);
-        const namespace = host.requireModule(filename);
-        if (own(namespace, 'module.exports')) module.exports = namespace['module.exports'];
-        else if (own(namespace, 'default') && !own(namespace, '__esModule')) {
-          const facade = Object.create(null);
-          for (const key of Object.keys(namespace)) Object.defineProperty(facade, key, { enumerable: true, get: () => namespace[key] });
-          Object.defineProperty(facade, '__esModule', { enumerable: true, value: true });
-          Object.defineProperty(facade, Symbol.toStringTag, { value: 'Module' });
-          module.exports = Object.preventExtensions(facade);
-        } else module.exports = namespace;
+        requireNamespace(module, filename);
       } else if (loaded && resolved.format !== 'addon') {
         if (resolved.format === 'json') module.exports = JSON.parse(loaded.source.replace(/^\uFEFF/, ''));
         else if (resolved.format === 'commonjs') module._compile(loaded.source, filename);
@@ -919,7 +920,15 @@ function createLoader(host, builtins) {
           const candidate = basename.slice(index);
           if (own(extensions, candidate)) { ext = candidate; break; }
         }
-        extensions[ext](module, filename);
+        if (resolved.ambiguous && ext === '.js') {
+          try { extensions[ext](module, filename); }
+          catch (cause) {
+            // Only a file that does not compile as CommonJS can be a module.
+            if (!(cause instanceof SyntaxError) || !host.detectModuleSyntax(cleanSource(text(filename)), filename)) throw cause;
+            detectedModules.add(module);
+            requireNamespace(module, filename);
+          }
+        } else extensions[ext](module, filename);
       }
       module.loaded = true;
       return module.exports;
@@ -933,6 +942,19 @@ function createLoader(host, builtins) {
       }
       throw cause;
     }
+  }
+
+  function requireNamespace(module, filename) {
+    if (typeof host.requireModule !== 'function') throw error('ERR_REQUIRE_ESM', `require() of ES Module ${filename} needs the native synchronous module evaluation hook`);
+    const namespace = host.requireModule(filename);
+    if (own(namespace, 'module.exports')) module.exports = namespace['module.exports'];
+    else if (own(namespace, 'default') && !own(namespace, '__esModule')) {
+      const facade = Object.create(null);
+      for (const key of Object.keys(namespace)) Object.defineProperty(facade, key, { enumerable: true, get: () => namespace[key] });
+      Object.defineProperty(facade, '__esModule', { enumerable: true, value: true });
+      Object.defineProperty(facade, Symbol.toStringTag, { value: 'Module' });
+      module.exports = Object.preventExtensions(facade);
+    } else module.exports = namespace;
   }
 
   function makeRequire(filename, parent, allowAsync = false) {
