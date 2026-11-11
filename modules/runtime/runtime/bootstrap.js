@@ -824,12 +824,16 @@ function publicBuiltin(name) {
   return publicBuiltinHas(name) &&
     ((name !== 'stream/iter' && name !== 'zlib/iter') || host.experimentalStreamIter === true);
 }
+// Modules of this runtime, which only their silk: names load.
+const runtimeModules = { __proto__: null, 'silk:serve': 'internal/web/serve' };
 const publicBuiltins = {
-  has: publicBuiltin,
-  get: name => internalRequire(name),
+  has: name => runtimeModules[name] !== undefined || publicBuiltin(name),
+  get: name => internalRequire(runtimeModules[name] ?? name),
+  runtime: name => typeof name === 'string' && runtimeModules[name] !== undefined,
   // Whether names() lists name, without building the list.
   listed(name) {
     if (typeof name !== 'string') return false;
+    if (runtimeModules[name] !== undefined) return true;
     if (stringStartsWith(name, 'node:')) {
       const bare = stringSlice(name, 5);
       return prefixOnlyBuiltinHas(bare) && publicBuiltin(bare);
@@ -947,6 +951,11 @@ function runtimeFlag(arg) {
   }
   if (arg === '--insecure-http-parser' || arg === '--no-insecure-http-parser') {
     host.insecureHTTPParser = arg === '--insecure-http-parser'; return true;
+  }
+  if (arg.startsWith('--max-http-header-size=')) {
+    const value = arg.slice(23);
+    if (!/^\d+$/.test(value)) { cliError('--max-http-header-size requires a nonnegative integer'); return true; }
+    host.maxHTTPHeaderSize = Number(value); return true;
   }
   if (arg === '--async-context-frame' || arg === '--no-async-context-frame') {
     host.asyncContextFrame = arg === '--async-context-frame'; return true;
@@ -1174,7 +1183,7 @@ const HELP_TEXT = `Usage: silkjsruntime [options] [script.js] [arguments]
   --pending-deprecation, --no-pending-deprecation
   --disable-warning=CODE|NAME, --redirect-warnings=PATH
   --unhandled-rejections=throw|strict|warn|warn-with-error-code|none
-  --insecure-http-parser, --no-insecure-http-parser
+  --insecure-http-parser, --no-insecure-http-parser, --max-http-header-size=SIZE
   --async-context-frame, --no-async-context-frame
   --expose-gc, --no-expose-gc
   --experimental-eventsource

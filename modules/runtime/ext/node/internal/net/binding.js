@@ -161,7 +161,8 @@ class StreamHandle {
     const status = this._transport.readStart();
     if (status === 0 && this._pendingReads.length && !this._flushScheduled) {
       this._flushScheduled = true;
-      process.nextTick(() => this._flushPending());
+      // libuv delivers reads after uv_read_start on a later loop turn, never inside it.
+      setImmediate(() => this._flushPending());
     }
     return status;
   }

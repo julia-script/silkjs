@@ -132,7 +132,7 @@ const {
 // silkjs: fs/promises registers its FileHandle class on internal/fs_core.
 require('fs/promises');
 const fsPromisesInternal = require('internal/fs_core');
-const { utcDate } = require('_http_outgoing');
+const { utcDate } = require('internal/http');
 const {
   Http2ServerRequest,
   Http2ServerResponse,
