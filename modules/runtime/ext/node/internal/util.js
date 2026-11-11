@@ -41,6 +41,7 @@ const {
   ReflectApply,
   ReflectConstruct,
   SafeSet,
+  SymbolPrototypeGetDescription,
   StringPrototypeReplace,
   StringPrototypeToLowerCase,
   Symbol,
@@ -323,15 +324,37 @@ const kEnumerableProperty = ObjectFreeze({
 
 const kEmptyObject = ObjectFreeze({ __proto__: null });
 
+function assignFunctionName(name, fn) {
+  if (typeof name === 'symbol') {
+    const description = SymbolPrototypeGetDescription(name);
+    name = description === undefined ? '' : `[${description}]`;
+  }
+  return ObjectDefineProperty(fn, 'name', {
+    __proto__: null,
+    configurable: true,
+    value: name,
+  });
+}
+
+function deprecateInstantiation(target, code, ...args) {
+  require('internal/assert')(typeof code === 'string');
+
+  getDeprecationWarningEmitter(code, `Instantiating ${target.name} without the 'new' keyword has been deprecated.`, target)();
+
+  return ReflectConstruct(target, args);
+}
+
 // The system error tables live in internal/util_public/system here.
 function getSystemErrorName(err) {
   return require('internal/util_public/system').getSystemErrorName(err);
 }
 
 module.exports = {
+  assignFunctionName,
   customInspectSymbol: SymbolFor('nodejs.util.inspect.custom'),
   customPromisifyArgs: kCustomPromisifyArgsSymbol,
   deprecate,
+  deprecateInstantiation,
   getDeprecationWarningEmitter,
   getSystemErrorName,
   isError,
