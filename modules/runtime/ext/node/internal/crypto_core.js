@@ -156,4 +156,6 @@ const validate = {
     return value;
   },
 };
-module.exports = { Buffer, error, invalid, integer, callback, bytes, binary, packed, normalize, call, submit, output, attach, share, handle, release, name, codes, validate, isAnyArrayBuffer, byteLength };
+// internal/crypto/util's kHandle: the native handle slot of Hash and friends.
+const kHandle = Symbol('kHandle');
+module.exports = { kHandle, Buffer, error, invalid, integer, callback, bytes, binary, packed, normalize, call, submit, output, attach, share, handle, release, name, codes, validate, isAnyArrayBuffer, byteLength };

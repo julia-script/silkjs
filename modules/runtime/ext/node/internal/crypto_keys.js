@@ -106,6 +106,8 @@ function importJwk(jwk, type) {
 function exportJwk(key, encoded, publicEncoded) {
   const real = require('internal/host').types.isKeyObject(key), c = require('internal/crypto_core');
   if (real && pqcNames.some(name => name.toLowerCase() === c.keyObjectAsymmetricType(key))) return exportAkp(key);
+  // Like Node's ExportJWKEcKey, the curve is checked before anything is encoded.
+  if (real && c.keyObjectAsymmetricType(key) === 'ec') { const namedCurve = c.keyObjectDetails(key).namedCurve; if (!curves[jwkCurveAliases[namedCurve] ?? namedCurve]) throw error('ERR_CRYPTO_JWK_UNSUPPORTED_CURVE', `Unsupported JWK EC curve: ${namedCurve}.`); }
   const privateKey = (real ? c.keyObjectType(key) : key.type) === 'private'; const nodes = root(encoded || c.keyObjectDer(key)); const algorithm = children(nodes[privateKey ? 1 : 0].data); if (!algorithm[0] || algorithm[0].tag !== 6) fail(); const id = algorithm[0].data.toString('hex'); let payload = nodes[privateKey ? 2 : 1].data; if (!privateKey) { if (payload[0] !== 0) fail(); payload = payload.subarray(1); }
   if (id === rsaOid) { const parts = root(payload); const names = privateKey ? ['n', 'e', 'd', 'p', 'q', 'dp', 'dq', 'qi'] : ['n', 'e']; const result = { kty: 'RSA' }; names.forEach((name, i) => { dataProperty(result, name, b64(unsigned(parts[i + (privateKey ? 1 : 0)]))); }); if (privateKey && parts[9]) dataProperty(result, 'oth', children(parts[9].data).map(prime => { const fields = children(prime.data), r = fields[0], d = fields[1], t = fields[2]; return { r: b64(unsigned(r)), d: b64(unsigned(d)), t: b64(unsigned(t)) }; })); return result; }
   if (id === ecOid) {

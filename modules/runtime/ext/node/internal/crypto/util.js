@@ -1,6 +1,6 @@
 'use strict';
 
-// Node.js main (ce7aaf1c) lib/internal/crypto/util.js. Changes: primordials, internalBinding and the internal/util helpers come from the runtime's modules (internal/crypto/binding, internal/util). There is no startup snapshot, so the snapshot cache resets are gone.
+// Node.js main (ce7aaf1c) lib/internal/crypto/util.js. Changes: primordials, internalBinding and the internal/util helpers come from the runtime's modules (internal/crypto/binding, internal/util). There is no startup snapshot, so the snapshot cache resets are gone. kHandle comes from internal/crypto_core.
 // Copyright Node.js contributors. All rights reserved. MIT license (see
 // vendor/node-api/LICENSE).
 
@@ -98,7 +98,8 @@ const {
   isPromise,
 } = require('util/types');
 
-const kHandle = Symbol('kHandle');
+// Shared with the runtime's crypto.js port, whose Hash keeps its handle there.
+const { kHandle } = require('internal/crypto_core');
 
 // This is here because many functions accepted binary strings without
 // any explicit encoding in older versions of node, and we don't want
