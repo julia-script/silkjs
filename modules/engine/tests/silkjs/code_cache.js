@@ -25,11 +25,22 @@ var lib = (function () {
     return add(0)();
   }
   function unused(a, b) { return [a, b].map((v) => v + 1).join(","); }
+  // Each case on a string carries its atom twice: in the fusion prefix and in
+  // the push it covers. A decoding runtime has other atom numbers for both.
+  function kind(word) {
+    switch (word) {
+      case "cache-alpha": return 1;
+      case "cache-beta": return 2;
+      case "cache-gamma": return 3;
+      default: return 0;
+    }
+  }
   function where() { try { null.f(); } catch (e) { return e.stack.split("\\n")[1].trim(); } }
   return {
     bump() { return ++counter; },
     area: Shape.of(7).area,
     scoped: scoped(),
+    kinds: ["cache-gamma", "cache-alpha", "other", "cache-beta"].map(kind).join(""),
     text: unused.toString(),
     tag: String.raw\`a\${1 + 1}b\`,
     re: /(\\d+)-(\\d+)/.exec("x 12-34")[2],
@@ -42,7 +53,7 @@ lib;
 
 function load(source) {
   const lib = std.evalScript(source);
-  return [lib.bump(), lib.bump(), lib.area, lib.scoped, lib.text, lib.tag, lib.re, lib.where()].join("|");
+  return [lib.bump(), lib.bump(), lib.area, lib.scoped, lib.text, lib.tag, lib.re, lib.where(), lib.kinds].join("|");
 }
 
 let failed = 0;
@@ -64,6 +75,7 @@ if (os.Worker.parent) {
   check("fresh state per load", expected.split("|").slice(0, 2).join(), "1,2");
   check("results", expected.split("|").slice(2, 7).join("|"),
     "49|6|function unused(a, b) { return [a, b].map((v) => v + 1).join(\",\"); }|a2b|34");
+  check("string switch", expected.split("|")[8], "3102");
   for (let i = 2; i <= 4; i++) check(`load ${i}`, load(library), expected);
   check("edited script misses", load(library.replace("7).area", "8).area")).split("|")[2], "64");
   std.evalScript(library).later(21).then((v) => check("async function", v, 42));
