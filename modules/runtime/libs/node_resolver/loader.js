@@ -970,6 +970,22 @@ function createLoader(host, builtins) {
     return loadResolved(resolved, null, true, hooks.hasAsync());
   }
 
+  // A heap image build runs a main script that requires a second file, then forgets
+  // both, so that a start finds the code that loads a main script warm: its inline
+  // caches filled and its shapes made. Nothing of either file stays in the loader.
+  function warmMain(filename) {
+    const modules = new Set(Object.keys(cache)), directories = new Set(packages.keys());
+    const resolved = new Set(resolutions.keys()), previous = main;
+    try { runMain(filename); }
+    finally {
+      for (const key of Object.keys(cache)) if (!modules.has(key)) delete cache[key];
+      for (const key of [...packages.keys()]) if (!directories.has(key)) packages.delete(key);
+      for (const key of [...resolutions.keys()]) if (!resolved.has(key)) resolutions.delete(key);
+      main = previous;
+      probed = null;
+    }
+  }
+
   const builtinUpdates = new Map();
   Module.syncBuiltinESMExports = () => { for (const update of builtinUpdates.values()) update(); };
 
@@ -1069,7 +1085,7 @@ function createLoader(host, builtins) {
     return { source, format: resolved.format, filename: resolved.filename };
   }
 
-  return { requireFor, runMain, resolve, resolveMain, loadESM, cleanSource, prepareSource, bridge, Module, mockModule };
+  return { requireFor, runMain, warmMain, resolve, resolveMain, loadESM, cleanSource, prepareSource, bridge, Module, mockModule };
 }
 
 module.exports = { createLoader };
