@@ -1,10 +1,9 @@
-/* C host layer for silkjs on wasm64-unknown-unknown.
+/* C host layer for silkjs on wasm32-unknown-unknown.
  *
  * The engine's command line calls a C library for files, clocks, processes and terminals. The
- * freestanding WebAssembly target has none, and wasi-libc is 32-bit only, so this file is that
+ * freestanding WebAssembly target has none, so this file is that
  * library: the calls a script run needs are implemented on WASI Preview 1 imports, and the rest
- * fail with ENOSYS. WASI takes 32-bit addresses; the module's memory stays below 4 GiB, so
- * narrowing a pointer is exact. Compile it freestanding: there are no headers to include.
+ * fail with ENOSYS. Compile it freestanding: there are no headers to include.
  *
  * Supported: reading a script and other files (fopen, fread, fseeko, ftello, fgetc, fgets, open,
  * read, lseek), writing to any open descriptor, clocks, exit and command arguments.
@@ -368,7 +367,7 @@ void _start(void) { wasi_proc_exit((u32)main()); }
 int getpid(void) { return 1; }
 int isatty(int fd) { return 0; }
 /* One processor, and one of anything else a caller sizes itself by. */
-isize sysconf(int name) { return 1; }
+i64 sysconf(int name) { return 1; }
 int __cxa_atexit(void (*callback)(void *), void *argument, void *dso) { return 0; }
 
 static char *no_environment[1];
@@ -435,7 +434,7 @@ int dup2(int from, int to) { return fail(ENOSYS); }
 int execv(const char *path, char *const *arguments) { return fail(ENOSYS); }
 int execve(const char *path, char *const *arguments, char *const *environment) { return fail(ENOSYS); }
 int fork(void) { return fail(ENOSYS); }
-int ioctl(int fd, unsigned long request, ...) { return fail(ENOSYS); }
+int ioctl(int fd, u64 request, ...) { return fail(ENOSYS); }
 int kill(int pid, int signal) { return fail(ENOSYS); }
 int lstat(const char *path, void *out) { return fail(ENOSYS); }
 int mkdir(const char *path, u32 mode) { return fail(ENOSYS); }
