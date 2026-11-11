@@ -131,7 +131,8 @@ TLSSocket.prototype._init = function(socket) {
   if (options.handshakeTimeout > 0) this.setTimeout(options.handshakeTimeout, this._handleTimeout);
   if (socket instanceof net.Socket) {
     this.connecting = socket.connecting || socket._connected === false;
-    socket.once('connect', () => { this.connecting = false; });
+    // Like Node's _tls_wrap: the TLS socket connects when the socket it wraps does.
+    socket.once('connect', () => { this.connecting = false; this.emit('connect'); });
   }
   if (socket) socket.on('error', err => this._emitTLSError(err));
   else this.connecting = true;

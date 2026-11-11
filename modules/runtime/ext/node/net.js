@@ -3001,10 +3001,14 @@ Server.prototype.unref = function() {
 const { JSTransportHandle } = require('internal/net/binding');
 Socket.prototype._attachTransport = function(transport) {
   this._handle = new JSTransportHandle(transport);
-  // A transport reports its secure or upgraded connect as a connect event. An accepted
-  // socket is already connected, so its transport's connect event has nothing to finish.
+  // A transport reports its secure or upgraded connect as a connect event. A socket over
+  // an accepted or connected carrier is not connecting: like a net.Socket given a handle,
+  // it only starts reading.
   this._handle._connectRequest = {
-    oncomplete: (...args) => { if (this.connecting) afterConnect(...args); },
+    oncomplete: (...args) => {
+      if (this.connecting) afterConnect(...args);
+      else if (!this.destroyed && this.readable && !this.isPaused()) this.read(0);
+    },
   };
   initSocketHandle(this);
 };

@@ -105,8 +105,11 @@ class StreamHandle {
     this.bytesRead = 0;
     this.bytesWritten = 0;
     this._closeCallback = null;
+    this._closeReported = false;
     this._userBuffer = null;
-    this._pendingRead = null;
+    // Reads a stopped user-buffer stream holds, in order, until it reads again.
+    this._pendingReads = [];
+    this._flushScheduled = false;
     this._connectRequest = null;
     this._consumers = null;
     if (transport !== undefined) this._adopt(transport);
@@ -130,7 +133,16 @@ class StreamHandle {
   getProviderType() { return 0; }
   // HandleWrap
   close(callback) {
-    if (this._closeCallback !== null || !this._transport) return;
+    if (this._closeCallback !== null) return;
+    // The transport closed first (its peer or carrier went away) and destroyed the
+    // owner, whose _destroy closes the handle: it is closed, so the callback runs.
+    if (!this._transport) {
+      if (!this._closeReported && typeof callback === 'function') {
+        this._closeReported = true;
+        process.nextTick(() => callback.call(this));
+      }
+      return;
+    }
     this._closeCallback = typeof callback === 'function' ? callback : () => {};
     this.reading = false;
     if (this._transport.closed) { process.nextTick(() => this._closed()); return; }
@@ -143,10 +155,9 @@ class StreamHandle {
   readStart() {
     if (!this._transport || this._transport.closing || this._transport.closed) return uv.UV_EINVAL;
     const status = this._transport.readStart();
-    if (status === 0 && this._pendingRead) {
-      const pending = this._pendingRead;
-      this._pendingRead = null;
-      process.nextTick(() => this._deliver(pending, 0));
+    if (status === 0 && this._pendingReads.length && !this._flushScheduled) {
+      this._flushScheduled = true;
+      process.nextTick(() => this._flushPending());
     }
     return status;
   }
@@ -287,12 +298,24 @@ class StreamHandle {
     this._closeCallback = null;
     const owner = this.#owner;
     this._transport = null;
-    if (callback) callback.call(this);
+    if (callback) { this._closeReported = true; callback.call(this); }
     else if (owner && !owner.destroyed && typeof owner.destroy === 'function') owner.destroy();
   }
   // Hands nread and the bytes to onread like LibuvStreamWrap::OnUvRead.
+  _flushPending() {
+    this._flushScheduled = false;
+    const pending = this._pendingReads;
+    this._pendingReads = [];
+    for (let i = 0; i < pending.length; i++) {
+      // A read stopped again: the rest waits, after anything it held back.
+      if (this._pendingReads.length) { this._pendingReads.push(...pending.slice(i)); return; }
+      const [payload, nread] = pending[i];
+      this._deliver(payload, nread);
+    }
+  }
   _deliver(payload, nread) {
     if (typeof this.onread !== 'function') return;
+    if (this._pendingReads.length) { this._pendingReads.push([payload, nread]); return; }
     if (payload === null) {
       streamBaseState[kReadBytesOrError] = nread;
       streamBaseState[kArrayBufferOffset] = 0;
@@ -306,7 +329,7 @@ class StreamHandle {
       while (offset < bytes.byteLength) {
         if (!this._transport || this._transport.closed) return;
         if (!this._transport.reading && offset > 0) {
-          this._pendingRead = bytes.subarray(offset);
+          this._pendingReads.push([bytes.subarray(offset), 0]);
           return;
         }
         const target = this._userBuffer;
