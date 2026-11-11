@@ -2,7 +2,7 @@
 
 const host = require('internal/host');
 const EventEmitter = require('events');
-const { Event, EventTarget, kEvents } = require('internal/path_events/event_target');
+const { CustomEvent, EventTarget, kEvents } = require('internal/path_events/event_target');
 const { MessageEvent } = require('internal/web/websocket/events');
 const clone = require('internal/worker/clone');
 const { _createResource: createResource } = require('async_hooks');
@@ -40,7 +40,7 @@ function retain(port) {
   if (value.refed || value.started && listening) retained.set(value.id, port);
   else retained.delete(value.id);
 }
-function emit(port, type, data) {
+function emit(port, type, data, ports) {
   const value = state(port);
   value.resource.runInAsyncScope(() => {
     if (value.realm) {
@@ -49,7 +49,8 @@ function emit(port, type, data) {
       return;
     }
     value.emitter.emit(type, data);
-    const event = type === 'message' || type === 'messageerror' ? new MessageEvent(type, { data }) : new Event(type);
+    // Other types go out as Node's NodeEventTarget does: an event whose detail is the argument.
+    const event = type === 'message' || type === 'messageerror' ? new MessageEvent(type, { data, ports }) : new CustomEvent(type, { detail: data });
     if (type === 'message' && data === undefined) Object.defineProperty(event, 'data', { value: undefined, enumerable: true });
     port.dispatchEvent(event);
     if (type === 'message' && !value.emitter.listenerCount(type) && !port[kEvents].get(type)?.size) ref(port, false);
@@ -114,26 +115,13 @@ function hasRef(port) {
   if (value.id === null) return value.closing ? value.refedAtClose : false;
   return host.workerNative('hasRef', [value.id]);
 }
-class InternalMessagePort extends EventTarget {
-  constructor(key, endpoint) {
-    super();
-    if (key !== token) throw constructCallInvalid();
-    initialize(this, endpoint);
-  }
-  postMessage(value, transferList) {
-    if (arguments.length === 0) throw new ERR_MISSING_ARGS('value');
-    const data = state(this);
-    if (data.id === null) return;
-    clone.post(data.id, value, transferList);
-  }
-  start() { start(this); }
-  close(callback) { close(this, callback); }
-  ref() { return ref(this, true); }
-  unref() { return ref(this, false); }
-  hasRef() { return hasRef(this); }
+// Node puts the EventEmitter-style methods on NodeEventTarget, between MessagePort and
+// EventTarget, so MessagePort.prototype itself holds only the port's own members.
+class PortEventTarget extends EventTarget {
   addEventListener(type, listener, options) {
     super.addEventListener(type, listener, options);
-    if (type === 'message' && this[kEvents].get(type)?.size) ref(this, true);
+    // Node's kNewListener: a message listener, of either kind, starts and refs the port.
+    if (type === 'message' && this[kEvents].get(type)?.size) { start(this); ref(this, true); }
     retain(this);
   }
   removeEventListener(type, listener, options) {
@@ -190,7 +178,26 @@ class InternalMessagePort extends EventTarget {
   setMaxListeners(count) { state(this).emitter.setMaxListeners(count); return this; }
   getMaxListeners() { return state(this).emitter.getMaxListeners(); }
 }
-for (const type of ['message', 'messageerror', 'close']) {
+class InternalMessagePort extends PortEventTarget {
+  constructor(key, endpoint) {
+    super();
+    if (key !== token) throw constructCallInvalid();
+    initialize(this, endpoint);
+  }
+  postMessage(value, transferList) {
+    if (arguments.length === 0) throw new ERR_MISSING_ARGS('value');
+    const data = state(this);
+    // A closed port still checks the message and transfer list, as Node's does, then drops it.
+    if (data.id === null) { clone.rollback(clone.prepare(value, transferList, null)); return; }
+    clone.post(data.id, value, transferList);
+  }
+  start() { start(this); }
+  close(callback) { close(this, callback); }
+  ref() { return ref(this, true); }
+  unref() { return ref(this, false); }
+  hasRef() { return hasRef(this); }
+}
+for (const type of ['message', 'messageerror']) {
   Object.defineProperty(InternalMessagePort.prototype, 'on' + type, {
     enumerable: true, configurable: true,
     get() { return state(this).handlers[type] || null; },
@@ -250,9 +257,10 @@ function dispatch(event) {
   if (!port) return false;
   if (event.type === 'close') { dispose(port, true); return true; }
   let value;
-  try { value = clone.decode(event.envelope, state(port).realm); }
+  const ports = [];
+  try { value = clone.decode(event.envelope, state(port).realm, ports); }
   catch (error) { emit(port, 'messageerror', error); return true; }
-  emit(port, 'message', value);
+  emit(port, 'message', value, ports);
   return true;
 }
 function moveMessagePortToContext(port, context) {
@@ -264,6 +272,7 @@ function moveMessagePortToContext(port, context) {
   // realm. The underlying ArrayBuffer/SAB backing stores are never copied.
   const realm = vm.runInContext(`(() => {
     const handlers = new WeakMap();
+    const errorHandlers = new WeakMap();
     const tag = Function.call.bind(Object.prototype.toString);
     const prototypes = { Object: Object.prototype, Array: Array.prototype,
       Map: Map.prototype, Set: Set.prototype, Date: Date.prototype, RegExp: RegExp.prototype,
@@ -287,16 +296,21 @@ function moveMessagePortToContext(port, context) {
           start() { bridge.start(this); }, close() { bridge.close(this); },
           ref() { return bridge.ref(this, true); }, unref() { return bridge.ref(this, false); },
           hasRef() { return bridge.hasRef(this); },
-          get onmessage() { return handlers.get(this) || null; },
+          get onmessage() { return handlers.get(this); },
           set onmessage(fn) {
             handlers.set(this, typeof fn === 'function' ? fn : null);
             bridge.retain(this);
-          }
+          },
+          get onmessageerror() { return errorHandlers.get(this); },
+          set onmessageerror(fn) { errorHandlers.set(this, typeof fn === 'function' ? fn : null); },
         };
         Object.defineProperty(port, Symbol.toStringTag, { value: 'MessagePort' });
         return port;
       },
-      deliver(port, type, data) { if (type === 'message') handlers.get(port)?.call(port, { data }); }
+      deliver(port, type, data) {
+        if (type === 'message') handlers.get(port)?.call(port, { data });
+        else if (type === 'messageerror') errorHandlers.get(port)?.call(port, { data });
+      }
     };
   })()`, context);
   // Creating a wrapper can throw; retain the old endpoint until it succeeds.

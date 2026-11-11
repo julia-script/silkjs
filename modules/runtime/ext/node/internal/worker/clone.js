@@ -13,6 +13,12 @@ const arrayBufferLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype,
 const arrayBufferResizable = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'resizable')?.get;
 const arrayBufferMaximum = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'maxByteLength')?.get;
 let portHooks;
+// fs/promises installs FileHandle transfer hooks on internal/fs_core when it loads; no
+// FileHandle can exist before that, so senders only look when it is loaded.
+function fileHandles(load) {
+  if (load) require('fs/promises');
+  return host.builtinLoaded('fs/promises') ? require('internal/fs_core').fileHandles : null;
+}
 
 function cloneError(message = 'The object could not be cloned.') {
   return new DOMException(message, 'DataCloneError');
@@ -55,6 +61,8 @@ class CloneSerializer extends Serializer {
     this.buffers = buffers;
     this.signals = signals;
     this.pendingSignals = [];
+    this.handles = null;
+    this.handleFds = [];
     this.modules = new WeakMap();
     this.memories = new WeakMap();
   }
@@ -87,6 +95,7 @@ class CloneSerializer extends Serializer {
     if (isCryptoKey(value) || isKeyObject(value) || host.types.isX509Certificate?.(value)) return true;
     if (host.types.isStorage?.(value) || host.types.isEventSource?.(value)) return true;
     if (portHooks?.isPort(value)) return true;
+    if (this.handles && fileHandles(false)?.is(value)) return true;
     const memory = host.wasmNative('cloneMemory', value);
     if (memory === false) throw cloneError('A nonshared WebAssembly.Memory cannot be cloned.');
     if (memory !== undefined) { this.memories.set(value, memory); return true; }
@@ -147,6 +156,13 @@ class CloneSerializer extends Serializer {
       this.writeRawBytes(bytes);
       return;
     }
+    if (this.handles && fileHandles(false)?.is(value)) {
+      const index = this.handles.indexOf(value);
+      if (index < 0) throw cloneError('Object that needs transfer was found in message but not listed in transferList');
+      this.writeUint32(11);
+      this.writeUint32(this.handleFds[index]);
+      return;
+    }
     if (portHooks?.isPort(value)) {
       const id = this.ports.indexOf(value);
       if (id < 0) throw cloneError('Object that needs transfer was found in message but not listed in transferList');
@@ -201,6 +217,14 @@ class CloneDeserializer extends Deserializer {
       if (this.realm) throw codedError('ERR_MESSAGE_TARGET_CONTEXT_UNAVAILABLE', 'A native object cannot be received in the target context', Error);
       return abort.createTransferredSignal();
     }
+    if (tag === 11) {
+      const fd = this.readUint32();
+      if (this.realm) {
+        host.processNative('closeFd', [fd]);
+        throw codedError('ERR_MESSAGE_TARGET_CONTEXT_UNAVAILABLE', 'A native object cannot be received in the target context', Error);
+      }
+      return fileHandles(true).create(fd);
+    }
     if (tag === 10) {
       const name = this.readValue();
       const exception = new DOMException(this.readValue(), name);
@@ -213,7 +237,9 @@ class CloneDeserializer extends Deserializer {
     if (tag === 0) {
       const id = this.readUint32();
       if (id >= this.ports.length) throw cloneError('Invalid MessagePort reference.');
-      return this.ports[id];
+      const port = this.ports[id];
+      if (this.messagePorts && !this.messagePorts.includes(port)) this.messagePorts.push(port);
+      return port;
     }
     if (tag === 3) {
       const length = this.readDouble();
@@ -254,6 +280,8 @@ function prepare(value, list, source) {
   const shared = [];
   const seen = new Set();
   const signals = new Map();
+  const handles = [];
+  const handleFds = [];
   for (const item of transferList(list)) {
     if (seen.has(item)) throw cloneError(`Transfer list contains duplicate ${portHooks?.isPort(item) ? 'MessagePort' : 'ArrayBuffer'}`);
     seen.add(item);
@@ -270,6 +298,9 @@ function prepare(value, list, source) {
       ids.push(id);
     } else if (abort.isTransferable(item)) {
       signals.set(item, undefined);
+    } else if (fileHandles(false)?.is(item)) {
+      handleFds.push(fileHandles(false).check(item));
+      handles.push(item);
     } else throw codedError('ERR_INVALID_TRANSFER_OBJECT', 'Found invalid object in transferList');
   }
   try {
@@ -279,6 +310,8 @@ function prepare(value, list, source) {
       if (record.port) { ports.push(record.port); ids.push(portHooks.id(record.port)); }
     }
     const serializer = new CloneSerializer(ports, shared, buffers, signals);
+    serializer.handles = fileHandles(false) ? handles : null;
+    serializer.handleFds = handleFds;
     buffers.forEach((buffer, index) => serializer.transferArrayBuffer(index, buffer));
     serializer.writeHeader();
     serializer.writeValue(value);
@@ -307,7 +340,8 @@ function prepare(value, list, source) {
       if (host.wasmNative('isMemoryBuffer', buffer)) throw cloneError('WebAssembly memory buffers cannot be transferred.');
       try { new Uint8Array(buffer); } catch { throw cloneError('An ArrayBuffer was detached during serialization.'); }
     }
-    return { bytes: serializer.releaseBuffer(), buffers, shared, ports: ids, moved: ports, signals };
+    for (const handle of handles) fileHandles(false).check(handle);
+    return { bytes: serializer.releaseBuffer(), buffers, shared, ports: ids, moved: ports, signals, handles };
   } catch (error) {
     for (const record of signals.values()) if (record) abort.rollbackTransfer(record);
     throw error;
@@ -318,6 +352,7 @@ function rollback(prepared) {
 }
 function commit(prepared) {
   for (const port of prepared.moved) portHooks.detach(port);
+  for (const handle of prepared.handles || []) fileHandles(false).detach(handle);
   for (const record of prepared.signals?.values() || []) abort.commitTransfer(record);
 }
 function post(id, value, list) {
@@ -326,11 +361,15 @@ function post(id, value, list) {
   catch (error) { rollback(prepared); throw error; }
   commit(prepared);
 }
-function decode(envelope, realm) {
+// With a ports array, it receives the MessagePorts the message itself carries (Node's
+// MessageEvent#ports), not the internal ports of transferred AbortSignals.
+function decode(envelope, realm, ports) {
   const deserializer = new CloneDeserializer(envelope, realm);
   try {
     deserializer.readHeader();
+    deserializer.messagePorts = ports ?? null;
     const value = deserializer.readValue();
+    deserializer.messagePorts = null;
     while (deserializer.readUint32()) {
       const signal = deserializer.readValue();
       const aborted = deserializer.readUint32() === 1;
@@ -366,5 +405,5 @@ function structuredClone(value, options) {
     if (receive !== undefined) host.workerNative('close', [receive]);
   }
 }
-module.exports = { cloneError, codedError, installPortHooks, transferList, prepare, commit, post, decode, structuredClone,
+module.exports = { cloneError, codedError, installPortHooks, transferList, prepare, rollback, commit, post, decode, structuredClone,
   markAsUntransferable, isMarkedAsUntransferable, markAsUncloneable };

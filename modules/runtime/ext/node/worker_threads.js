@@ -243,16 +243,19 @@ class Worker extends EventEmitter {
     super();
     const config = workerOptions(filename, options);
     const list = clone().transferList(config.options.transferList);
-    const userChannel = new (ports().MessageChannel)();
-    const controlChannel = new (ports().MessageChannel)();
-    const state = { id: null, online: false, exited: false, exitCode: undefined, user: userChannel.port1,
-      control: controlChannel.port1, resource: null, refed: true, handleGone: false,
+    const state = { id: null, online: false, exited: false, exitCode: undefined, user: null,
+      control: null, resource: null, refed: true, handleGone: false,
       stdout: readableFrom(), stderr: readableFrom(), stdin: null,
       callbacks: new Map(), termination: null, resolveTermination: null, metadata: config.metadata };
     workerStates.set(this, state);
     // Like Node's, the async resource of a worker is its native handle: hasRef() reports
-    // the ref state while the thread runs and undefined once the handle is gone.
+    // the ref state while the thread runs and undefined once the handle is gone. Node
+    // creates it before the worker's ports, so async hooks see WORKER first.
     state.resource = createResource('WORKER', new WorkerHandle(state));
+    const userChannel = new (ports().MessageChannel)();
+    const controlChannel = new (ports().MessageChannel)();
+    state.user = userChannel.port1;
+    state.control = controlChannel.port1;
     state.stdin = config.metadata.stdin ? writableTo(state.control, 0, state.callbacks) : null;
     this.on('newListener', type => { if (type === 'message') state.user.ref(); });
     this.on('removeListener', type => { if (type === 'message' && this.listenerCount('message') === 0) state.user.unref(); });

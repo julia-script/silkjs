@@ -10,10 +10,20 @@ promises.opendir = (...args) => invoke('opendir', args, 0);
 promises.constants = fs.constants;
 promises.glob = async function* glob(pattern, options) { yield* new (require('internal/fs_glob').Glob)(pattern, options).glob(); };
 function badFd(operation) { return c.error('EBADF', operation); }
+// Node's error for a handle whose descriptor is gone: closed, or transferred to a port.
+function goneFd(handle, operation) {
+  const e = new Error(handle._closeReason ?? 'file closed');
+  e.code = 'EBADF'; e.syscall = operation;
+  return e;
+}
 class FileHandle extends EventEmitter {
-  constructor(fd) { super(); this._fd = fd; this._active = 0; this._closing = false; this._closePromise = null; this._finishClose = null; this._webStream = false; }
+  constructor(fd) { super(); this._fd = fd; this._active = 0; this._closing = false; this._closePromise = null; this._finishClose = null; this._webStream = false; this._webStreamOpen = false; this._closeReason = undefined; }
   get fd() { return this._fd; }
-  _retain(operation) { if (this._fd < 0 || this._closing) throw badFd(operation); this._active++; return this._fd; }
+  _retain(operation) {
+    if (this._fd < 0) throw goneFd(this, operation);
+    if (this._closing) throw badFd(operation);
+    this._active++; return this._fd;
+  }
   _release() { this._active--; if (this._active === 0 && this._finishClose) { const finish = this._finishClose; this._finishClose = null; finish(); } }
   _call(name, args, map) {
     return new Promise((resolve, reject) => {
@@ -71,23 +81,41 @@ class FileHandle extends EventEmitter {
   readableWebStream(options) {
     options = c.options(options);
     if (this._webStream) { const e = new Error('A readable stream has already been created for this FileHandle'); e.code = 'ERR_INVALID_STATE'; throw e; }
-    if (this._fd < 0 || this._closing) throw badFd('read');
+    if (this._fd < 0 || this._closing) {
+      const e = new Error(this._fd < 0 ? 'The FileHandle is closed' : 'The FileHandle is closing'); e.code = 'ERR_INVALID_STATE'; throw e;
+    }
     const { ReadableStream } = require('stream/web'); this._webStream = true;
     const handle = this;
+    // Like Node's kRef for the stream's life: the handle is in use (not transferable) until it ends.
+    this._webStreamOpen = true;
+    const done = () => { handle._webStreamOpen = false; };
     return new ReadableStream({
       type: 'bytes',
       async pull(controller) {
         try {
           const buffer = c.Buffer.alloc(65536); const result = await handle.read(buffer, 0, buffer.length, null);
-          if (result.bytesRead === 0) { controller.close(); if (controller.byobRequest) controller.byobRequest.respond(0); if (options.autoClose) await handle.close(); }
+          if (result.bytesRead === 0) { done(); controller.close(); if (controller.byobRequest) controller.byobRequest.respond(0); if (options.autoClose) await handle.close(); }
           else controller.enqueue(new Uint8Array(buffer.buffer, buffer.byteOffset, result.bytesRead));
-        } catch (e) { controller.error(e); if (options.autoClose) await handle.close(); }
+        } catch (e) { done(); controller.error(e); if (options.autoClose) await handle.close(); }
       },
-      async cancel() { if (options.autoClose) await handle.close(); }
+      async cancel() { done(); if (options.autoClose) await handle.close(); }
     });
   }
 }
 if (Symbol.asyncDispose) FileHandle.prototype[Symbol.asyncDispose] = FileHandle.prototype.close;
+// Transfer over MessagePort (internal/worker/clone). Workers share the process's
+// descriptor table, so the descriptor itself moves and the sender's handle lets go of it.
+c.fileHandles = {
+  is: value => value instanceof FileHandle,
+  check(handle) {
+    if (handle._closePromise || handle._active || handle._webStreamOpen || handle._fd < 0) {
+      throw new (require('internal/path_events/event_target').DOMException)('Cannot transfer FileHandle while in use', 'DataCloneError');
+    }
+    return handle._fd;
+  },
+  detach(handle) { handle._fd = -1; handle._closeReason = 'The FileHandle has been transferred'; },
+  create: fd => new FileHandle(fd),
+};
 promises.open = async function open(path, flags = 'r', mode) { return new FileHandle(await invoke('open', [path, flags, mode])); };
 // FileHandle overloads remain owned by the handle; a borrowed numeric descriptor
 // is not accepted by fs/promises readFile/writeFile in place of a path.
