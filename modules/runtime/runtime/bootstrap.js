@@ -1296,7 +1296,15 @@ globalThis.__silkRuntime = {
     // Built-ins most programs load run here, so that a start from the image finds
     // them loaded. None of them keeps anything of the process when it loads.
     for (const name of imageModules) internalRequire(name);
-    const hydrated = new Set(['HOME', 'NODE_PATH', 'NODE_CHANNEL_FD', 'NODE_UNIQUE_ID', 'WATCH_REPORT_DEPENDENCIES']);
+    // And they find the way to a main script warm (loader.warmMain).
+    const fs = internalRequire('fs'), directory = fs.mkdtempSync('/tmp/silkjs-image-');
+    try {
+      fs.writeFileSync(directory + '/main.js', "require('./dependency.js');\n");
+      fs.writeFileSync(directory + '/dependency.js', 'module.exports = 1;\n');
+      loader.warmMain(directory + '/main.js');
+    } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+    // Read again by hydrate, or (NODE_V8_COVERAGE) read again on every use.
+    const hydrated = new Set(['HOME', 'NODE_PATH', 'NODE_CHANNEL_FD', 'NODE_UNIQUE_ID', 'WATCH_REPORT_DEPENDENCIES', 'NODE_V8_COVERAGE']);
     const missed = [...environmentRead].filter(key => typeof key === 'string' && !hydrated.has(key));
     if (missed.length) throw new Error('The bootstrap read environment variables that a start from a heap image does not read again: ' + missed.join(' '));
     // Whoever kept a noting proxy reaches the environment through it unnoted.
