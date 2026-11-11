@@ -650,6 +650,11 @@ class Http2Session {
     this.stats.bytesRead += buffer.length;
     this.scope(() => this.consumeData(buffer));
     this.maybeStopReading();
+    // Node notifies only after a write. Data from a socket the user paused (for
+    // example one passed through createConnection after a 'readable' listener)
+    // can arrive after the last write, so a read that leaves nothing to do
+    // completes a graceful close too.
+    if (!this.writeInProgress) this.maybeNotifyGracefulCloseComplete();
   }
   consumeData(buffer) {
     const limits = this.limits;

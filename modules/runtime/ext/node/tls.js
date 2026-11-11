@@ -141,7 +141,8 @@ TLSSocket.prototype.connect = function(...args) {
   const [options, cb] = net._normalizeArgs(args);
   if (cb) this.once('connect', cb);
   this.connecting = true;
-  try { this._parent.connect({ ...options, allowHalfOpen: true }); } catch (err) { this.destroy(); throw err; }
+  // The TLS socket listens to options.signal itself; aborting it destroys the parent too.
+  try { this._parent.connect({ ...options, allowHalfOpen: true, signal: undefined }); } catch (err) { this.destroy(); throw err; }
   return this;
 };
 // A client sends its ClientHello only when told to (tls.connect does).
