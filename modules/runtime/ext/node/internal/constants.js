@@ -1,3 +1,5 @@
+// Copyright Joyent, Inc. and other Node contributors. MIT license (see vendor/node-api/LICENSE).
+// Adapted from Node.js v24.22.1 lib/internal/constants.js.
 'use strict';
 
 const isWindows = process.platform === 'win32';

@@ -1,4 +1,5 @@
 // Copyright Joyent, Inc. and other Node contributors.
+// Adapted from Node.js v24.22.1 lib/_http_incoming.js (primordials replaced by plain calls).
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
 // copy of this software and associated documentation files (the
