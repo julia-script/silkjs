@@ -1,8 +1,8 @@
 'use strict';
 // console prints plain text straight to the descriptor while the process
 // streams are untouched. Each case runs in a child with stdout and stderr
-// redirected to files, where that path applies, and must print what the stream
-// path prints, in the same order, and load neither the formatter nor a stream.
+// redirected to files, then to pipes, and must print what the stream path
+// prints, in the same order, and load neither the formatter nor a stream.
 const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
@@ -36,7 +36,7 @@ const loadedAfter = startsFromImage() ? '0' : `process.moduleLoadList.filter(nam
 for (const pipe of [false, true]) {
   // Text only: no formatter, no stream, when the descriptor is a file.
   let result = run(`console.log('one'); console.log('two', 'three'); console.error('oops'); console.info('i'); console.warn('w', 'x');
-    process.exitCode = ${loadedAfter} === 0 || ${pipe} ? 0 : 3;`, pipe);
+    process.exitCode = ${loadedAfter} === 0 ? 0 : 3;`, pipe);
   assert.strictEqual(result.stdout, 'one\ntwo three\ni\n');
   assert.strictEqual(result.stderr, 'oops\nw x\n');
 
@@ -60,6 +60,22 @@ for (const pipe of [false, true]) {
   result = run(`const { Worker } = require('worker_threads');
     new Worker("console.log('from worker')", { eval: true }).on('exit', () => console.log('h\\u00e9llo \\u{1f600}'));`, pipe);
   assert.strictEqual(result.stdout, 'from worker\nhéllo \u{1f600}\n');
+
+  // A line longer than a pipe holds: what the pipe takes goes at once, the rest
+  // through the stream, before anything printed after it.
+  result = run(`const line = 'x'.repeat(1 << 18); console.log(line); console.log('next'); process.stdout.write('end\\n');`, pipe);
+  assert.strictEqual(result.stdout, 'x'.repeat(1 << 18) + '\nnext\nend\n');
+}
+
+// Output to a pipe whose reader has gone fails with EPIPE, which console ignores
+// as Node's does; the process is not killed by SIGPIPE.
+{
+  const script = path.join(directory, 'case.cjs');
+  fs.writeFileSync(script, `for (let i = 0; i < 100000; i++) console.log(i);
+    process.on('exit', code => require('fs').writeSync(2, 'exit ' + code));`);
+  const child = spawnSync('/bin/sh', ['-c', '"$0" "$1" | head -c 1 > /dev/null', process.execPath, script], { encoding: 'utf8' });
+  assert.strictEqual(child.status, 0, child.stderr);
+  assert.strictEqual(child.stderr, 'exit 0');
 }
 fs.rmSync(directory, { recursive: true });
 console.log('console-direct-smoke ok');

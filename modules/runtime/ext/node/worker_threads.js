@@ -312,6 +312,7 @@ function receiveMessageOnPort(port) { return ports().receiveMessageOnPort(broadc
 function poll() {
   const profileActivity = profilesModule ? profilesModule.poll() : false;
   const events = host.workerNative('poll', []);
+  if (events.length === 0) return profileActivity;
   for (const event of events) {
     if (event.type === 'threadMessage') { messaging().dispatch(event); continue; }
     if (event.type === 'lock') { lockManager().dispatch(event); continue; }

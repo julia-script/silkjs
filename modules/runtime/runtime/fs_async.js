@@ -231,7 +231,21 @@ module.exports = function createAsyncFS(native) {
       default: await primitive(requestKind, operation, args); return;
     }
   }
+  // read and write of one view finish straight from the native callback: no promise
+  // hops, which cost more than the system call for a 64 KiB chunk.
+  function transferIO(operation, args, callback, requestKind) {
+    const fd = args[0], view = args[1], position = args[4];
+    const done = (status, value, code) => {
+      // The native request holds view.buffer until it ends.
+      const error = status < 0 ? c().error(code || 'UNKNOWN', operation, undefined, undefined, status) : null;
+      host.enqueueIOCompletion(error === null ? () => callback(null, value) : () => callback(error));
+      host.checkpoint();
+    };
+    try { native.submit(operation, [fd, view.buffer, view.byteOffset + args[2], args[3], position == null ? -1 : position], done, requestKind); }
+    catch (error) { Promise.resolve().then(() => host.enqueueIOCompletion(() => callback(error))); }
+  }
   function submitIO(operation, args, callback, requestKind) {
+    if (operation === 'read' || operation === 'write') { transferIO(operation, args, callback, requestKind); return; }
     // execute is async: preparation starts now, failures reject asynchronously.
     // Dispatch outside the Promise queue: callback exceptions are uncaught
     // exceptions, and each completion gets its own nextTick/microtask boundary.

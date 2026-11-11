@@ -93,20 +93,28 @@ let direct;
 function install(process) {
   let stdin, stdout, stderr;
   const kinds = [];
+  const nonblocking = [];
   // console prints through this while a standard stream is untouched: nobody
   // has read process.stdout (or stderr) or redefined it, so there is no stream
   // whose write, listeners or pending data the text could bypass. Files and
-  // POSIX terminals take synchronous writes, as their streams do; pipes and
-  // sockets go through their transport, and so through the stream.
+  // POSIX terminals take synchronous writes, as their streams do. A pipe or a
+  // local socket takes what it has room for at once, as its stream's transport
+  // would write it (and like that transport, this makes the descriptor
+  // nonblocking); what it has no room for is returned, for the stream to write.
   // What a descriptor is belongs to the process: a start from a heap image asks again.
-  host.onHydrate(() => { kinds.length = 0; });
+  host.onHydrate(() => { kinds.length = 0; nonblocking.length = 0; });
   direct = (fd, text) => {
     const name = fd === 1 ? 'stdout' : 'stderr';
     if (fd === 1 ? stdout : stderr) return false;
     const descriptor = Object.getOwnPropertyDescriptor(process, name);
-    if (!descriptor || descriptor.get !== getters[name]) return false;
-    kinds[fd] ??= native('guessHandleType', [fd]);
-    if (kinds[fd] !== 5 && kinds[fd] !== 6 || process.platform === 'win32') return false;
+    if (!descriptor || descriptor.get !== getters[name] || process.platform === 'win32') return false;
+    const kind = kinds[fd] ??= native('guessHandleType', [fd]);
+    if (kind === 5 || kind === 6) return host.writeText(fd, text) !== false;
+    if (kind !== 2) return false;
+    if (!nonblocking[fd]) {
+      if (native('setDescriptorBlocking', [fd, 0]) < 0) return false;
+      nonblocking[fd] = true;
+    }
     return host.writeText(fd, text);
   };
   const getters = {
