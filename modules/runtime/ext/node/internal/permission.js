@@ -74,7 +74,7 @@ function applyOption(arg) {
 }
 // Node words these as for a string only, although a reference may also be a Buffer.
 function invalid(name, value) {
-  const error = new TypeErrorClass('The "' + name + '" argument must be of type string. Received ' + require('internal/diagnostics_errors').determineSpecificType(value));
+  const error = new TypeErrorClass('The "' + name + '" argument must be of type string. Received ' + require('internal/errors').determineSpecificType(value));
   error.code = 'ERR_INVALID_ARG_TYPE';
   return error;
 }

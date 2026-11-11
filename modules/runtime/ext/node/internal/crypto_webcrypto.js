@@ -50,7 +50,7 @@ function count(value, name, min = 0, max = 0x7fffffff) { if (!Number.isInteger(v
 function work(op, args) { return new Promise((resolve, reject) => { submit(op, args, (e, result) => e ? reject(exception('OperationError', e.message)) : resolve(result)); }); }
 function allowed(a, type) { if (a === 'HMAC' || a.startsWith('KMAC')) return ['sign', 'verify']; if (a === 'AES-KW') return ['wrapKey', 'unwrapKey']; if (a.startsWith('AES-') || a === 'ChaCha20-Poly1305') return ['encrypt', 'decrypt', 'wrapKey', 'unwrapKey']; if (isDerivation(a)) return ['deriveKey', 'deriveBits']; if (a.startsWith('ML-KEM-')) return type === 'private' ? ['decapsulateBits', 'decapsulateKey'] : ['encapsulateBits', 'encapsulateKey']; if (a === 'ECDH' || a === 'X25519' || a === 'X448') return type === 'private' ? ['deriveKey', 'deriveBits'] : []; if (a === 'RSA-OAEP') return type === 'private' ? ['decrypt', 'unwrapKey'] : ['encrypt', 'wrapKey']; return type === 'private' ? ['sign'] : ['verify']; }
 function checkUsages(name, type, usages, requireNonempty = true) { if (!Array.isArray(usages)) throw new TypeError('keyUsages must be an array'); const permit = allowed(name, type); for (const u of usages) if (!permit.includes(u)) fail('SyntaxError', `Unsupported key usage: ${u}`); if (requireNonempty && type !== 'public' && !usages.length) fail('SyntaxError', 'Key usages must not be empty'); return [...new Set(usages)]; }
-function use(key, a, usage, type) { const r = record(key); if (r.algorithm.name !== a.name || !r.usages.includes(usage) || type && r.key.type !== type) fail('InvalidAccessError', 'Key does not support this operation'); return r; }
+function use(key, a, usage, type) { const r = record(key); if (r.algorithm.name !== a.name) fail('InvalidAccessError', 'Key algorithm mismatch'); if (!r.usages.includes(usage)) fail('InvalidAccessError', `Unable to use this key to ${usage}`); if (type && r.key.type !== type) fail('InvalidAccessError', 'Key does not support this operation'); return r; }
 const curves = { 'P-256': { name: 'prime256v1', size: 32 }, 'P-384': { name: 'secp384r1', size: 48 }, 'P-521': { name: 'secp521r1', size: 66 } };
 async function exportNative(key, privateKey) { return Buffer.from(await work('keyExport', [handle(key), 'DER', privateKey ? 'PrivateKeyInfo' : 'SubjectPublicKeyInfo', privateKey ? 1 : 0, '', packed(Buffer.alloc(0))])); }
 async function jwkOf(key) { const privateKey = key.type === 'private'; const encoded = await exportNative(key, privateKey); const publicEncoded = privateKey ? await exportNative(key, false) : undefined; return codecs.exportJwk(key, encoded, publicEncoded); }
@@ -149,16 +149,16 @@ async function kem(alg, key, usage, ciphertext) {
 }
 function snapshotAlgorithm(value) { const a = algorithm(value); for (const name of ['iv', 'counter', 'additionalData', 'label', 'salt', 'info', 'context', 'nonce', 'secretValue', 'associatedData', 'customization', 'functionName', 'publicExponent']) if (a[name] !== undefined) a[name] = optionalBytes(a[name]); if (a.hash !== undefined) a.hash = algorithm(a.hash); return a; }
 function toCryptoKey(key, alg, extractable, keyUsages) {
-  const a = algorithm(alg), usages = checkUsages(a.name, key.type, keyUsages);
+  const keyType = c.keyObjectType(key), a = algorithm(alg), usages = checkUsages(a.name, keyType, keyUsages);
   let descriptor = { name: a.name };
-  if (key.type === 'secret') {
+  if (keyType === 'secret') {
     if (!isSecret(a.name)) fail('DataError', 'Expected an asymmetric key');
     if (isDerivation(a.name) && extractable) fail('SyntaxError', 'Derivation keys must not be extractable');
-    const data = key.export(); descriptor = secretDescriptor(a, data);
+    const data = c.keyObjectSecret(key); descriptor = secretDescriptor(a, data);
     if (descriptor.length % 8) key = crypto.createSecretKey(truncateBits(data, descriptor.length));
   } else {
     if (isSecret(a.name)) fail('DataError', 'Expected a secret key');
-    const type = key.asymmetricKeyType;
+    const type = c.keyObjectAsymmetricType(key);
     if (a.name.startsWith('RSA') || a.name === 'RSASSA-PKCS1-v1_5') {
       if (type !== 'rsa') fail('DataError', 'Expected an RSA key');
       const jwk = codecs.exportJwk(key), n = Buffer.from(jwk.n, 'base64url'); let top = n[0], bits = (n.length - 1) * 8; while (top) { bits++; top >>= 1; }

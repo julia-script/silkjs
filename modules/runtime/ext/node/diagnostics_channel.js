@@ -5,7 +5,7 @@
 // object to ActiveChannel, so publishing to an unobserved channel is one empty call.
 
 const trace = require('internal/trace_events');
-const { codes: { ERR_INVALID_ARG_TYPE } } = require('internal/diagnostics_errors');
+const { codes: { ERR_INVALID_ARG_TYPE } } = require('internal/errors');
 const { validateFunction } = require('internal/validators');
 
 function triggerUncaught(error) { process.nextTick(() => { throw error; }); }
@@ -136,7 +136,7 @@ const channels = new WeakRefMap();
 function channel(name) {
   const existing = channels.get(name);
   if (existing) return existing;
-  if (typeof name !== 'string' && typeof name !== 'symbol') throw ERR_INVALID_ARG_TYPE('channel', ['string', 'symbol'], name);
+  if (typeof name !== 'string' && typeof name !== 'symbol') throw new ERR_INVALID_ARG_TYPE('channel', ['string', 'symbol'], name);
   return new Channel(name);
 }
 function subscribe(name, subscription) { return channel(name).subscribe(subscription); }
@@ -150,7 +150,7 @@ function hasSubscribers(name) {
 const traceEvents = ['start', 'end', 'asyncStart', 'asyncEnd', 'error'];
 
 function assertChannel(value, name) {
-  if (!(value instanceof Channel)) throw ERR_INVALID_ARG_TYPE(name, ['Channel'], value);
+  if (!(value instanceof Channel)) throw new ERR_INVALID_ARG_TYPE(name, ['Channel'], value);
 }
 function tracingChannelFrom(nameOrChannels, name) {
   if (typeof nameOrChannels === 'string') return channel(`tracing:${nameOrChannels}:${name}`);
@@ -159,7 +159,7 @@ function tracingChannelFrom(nameOrChannels, name) {
     assertChannel(value, `nameOrChannels.${name}`);
     return value;
   }
-  throw ERR_INVALID_ARG_TYPE('nameOrChannels', ['string', 'object', 'TracingChannel'], nameOrChannels);
+  throw new ERR_INVALID_ARG_TYPE('nameOrChannels', ['string', 'object', 'TracingChannel'], nameOrChannels);
 }
 
 class TracingChannel {

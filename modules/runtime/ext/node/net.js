@@ -9,35 +9,53 @@ const { Transport, error: nativeError, native } = require('internal/net/transpor
 let defaultAutoSelectFamily = true;
 let defaultAutoSelectFamilyAttemptTimeout = 250;
 
-function fail(code, message, Type = Error) { return Object.assign(new Type(message), { code }); }
+const { codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_OUT_OF_RANGE }, validateBoolean, validateFunction, validateInt32, validateNumber, validateString } = require('internal/validators');
+const { codes: { ERR_INVALID_ADDRESS_FAMILY, ERR_INVALID_IP_ADDRESS, ERR_IP_BLOCKED, ERR_MISSING_ARGS }, makeError, ExceptionWithHostPort, validatePort } = require('internal/net/errors');
+
+function fail(code, message, Type = Error) { return makeError(Type, code, message); }
 function integer(value, name, min, max) {
   if (!Number.isInteger(value) || value < min || value > max)
     throw fail('ERR_OUT_OF_RANGE', `The value of "${name}" is out of range. It must be >= ${min} and <= ${max}. Received ${value}`, RangeError);
   return value;
 }
-function portNumber(value, name = 'port') {
-  if ((typeof value !== 'number' && typeof value !== 'string') || (typeof value === 'string' && value.trim() === ''))
-    throw fail('ERR_SOCKET_BAD_PORT', `${name} should be >= 0 and < 65536. Received ${value}`, RangeError);
-  return integer(Number(value), name, 0, 65535);
-}
 function callback(value) {
   if (value !== undefined && typeof value !== 'function') throw fail('ERR_INVALID_ARG_TYPE', 'Callback must be a function', TypeError);
 }
-function isIP(input) { return typeof input === 'string' ? native('isIP', [input]) : 0; }
+// Like Node's regular expressions: the input is converted to a string, and an IPv6 address may
+// carry a zone ID such as `%eth0`.
+function isIP(input) {
+  const text = `${input}`;
+  const zone = text.indexOf('%');
+  if (zone === -1) return native('isIP', [text]);
+  return /^%[0-9a-zA-Z\-.:]+$/.test(text.slice(zone)) && native('isIP', [text.slice(0, zone)]) === 6 ? 6 : 0;
+}
 function isIPv4(input) { return isIP(input) === 4; }
 function isIPv6(input) { return isIP(input) === 6; }
+function socketToDnsFamily(family) { return family === 'IPv4' ? 4 : family === 'IPv6' ? 6 : family; }
+function toNumber(value) { return (value = Number(value)) >= 0 ? value : false; }
+function isPipeName(value) { return typeof value === 'string' && toNumber(value) === false; }
+const normalizedArgs = Symbol('normalizedArgs');
+// Node's normalizeArgs: (options[, cb]), (path[, cb]) or ([port][, host][, cb]).
 function normalizeArgs(args) {
-  if (Array.isArray(args[0])) return args[0];
-  let options;
-  const first = args[0];
-  if (first !== null && typeof first === 'object') options = { ...first };
-  else if (typeof first === 'string' && (first.trim() === '' || !Number.isFinite(Number(first)))) options = { path: first };
-  else {
-    options = { port: first };
-    if (typeof args[1] === 'string') options.host = args[1];
+  let options = {};
+  if (args.length > 0) {
+    const first = args[0];
+    if (typeof first === 'object' && first !== null) options = first;
+    else if (isPipeName(first)) options.path = first;
+    else {
+      options.port = first;
+      if (args.length > 1 && typeof args[1] === 'string') options.host = args[1];
+    }
   }
-  const cb = typeof args[args.length - 1] === 'function' ? args[args.length - 1] : undefined;
-  return [options, cb];
+  const cb = args[args.length - 1];
+  const normalized = [options, typeof cb === 'function' ? cb : null];
+  normalized[normalizedArgs] = true;
+  return normalized;
+}
+function blockList(options) {
+  if (!options.blockList) return undefined;
+  if (!require('internal/blocklist').isBlockList(options.blockList)) throw new ERR_INVALID_ARG_TYPE('options.blockList', 'net.BlockList', options.blockList);
+  return options.blockList;
 }
 function abortError(signal) {
   const err = fail('ABORT_ERR', 'The operation was aborted');
@@ -58,9 +76,14 @@ function attachAbort(target, signal, abort) {
 
 function Socket(options) {
   if (!(this instanceof Socket)) return new Socket(options);
-  if (typeof options === 'number') options = { fd: options };
-  options ||= {};
-  if (typeof options !== 'object') throw fail('ERR_INVALID_ARG_TYPE', 'Socket options must be an object', TypeError);
+  if (options?.objectMode) throw new ERR_INVALID_ARG_VALUE('options.objectMode', options.objectMode, 'is not supported');
+  if (options?.readableObjectMode || options?.writableObjectMode) {
+    throw new ERR_INVALID_ARG_VALUE(`options.${options.readableObjectMode ? 'readableObjectMode' : 'writableObjectMode'}`,
+      options.readableObjectMode || options.writableObjectMode, 'is not supported');
+  }
+  if (options?.keepAliveInitialDelay !== undefined) validateNumber(options.keepAliveInitialDelay, 'options.keepAliveInitialDelay');
+  options = typeof options === 'number' ? { fd: options } : { ...options };
+  this.blockList = blockList(options);
   Duplex.call(this, { ...options, signal: undefined, objectMode: false, readableObjectMode: false, writableObjectMode: false,
     allowHalfOpen: !!options.allowHalfOpen, autoDestroy: true, emitClose: false, decodeStrings: true });
   this.connecting = false;
@@ -84,13 +107,17 @@ function Socket(options) {
   this._attemptNext = null;
   this._noDelay = options.noDelay;
   this._keepAlive = options.keepAlive;
-  this._keepAliveDelay = options.keepAliveInitialDelay || 0;
+  this._keepAliveDelay = Math.max(0, options.keepAliveInitialDelay || 0);
   this._onread = options.onread;
   this._localAddress = undefined;
   this._remoteAddress = undefined;
   this.server = null;
-  if (options.fd !== undefined) {
-    integer(options.fd, 'fd', 0, 0x7fffffff);
+  if (options.handle) {
+    this._attachTransport(options.handle);
+    this._connected = true;
+    this._cacheAddresses();
+  } else if (options.fd !== undefined) {
+    validateInt32(options.fd, 'fd', 0);
     const kind = native('guessHandleType', [options.fd]);
     if (kind !== 1 && kind !== 2) throw nativeError(kind < 0 ? kind : -22, 'open');
     const transport = new Transport(kind, (...args) => this._onNative(...args));
@@ -99,11 +126,25 @@ function Socket(options) {
     this._attachTransport(transport);
     this._connected = true;
     this._cacheAddresses();
-    if (!options.manualStart) process.nextTick(() => { if (!this.destroyed && options.readable !== false) this._read(); });
   }
+  if (this._transport && !options.manualStart) process.nextTick(() => { if (!this.destroyed && options.readable !== false) this._read(); });
   attachAbort(this, options.signal, err => this.destroy(err));
+  this.on('end', onReadableStreamEnd);
 }
 Object.setPrototypeOf(Socket.prototype, Duplex.prototype);
+// Like Node: without allowHalfOpen, a write after the peer's FIN and our own end fails with EPIPE.
+function onReadableStreamEnd() {
+  if (!this.allowHalfOpen) this.write = writeAfterFIN;
+}
+function writeAfterFIN(chunk, encoding, cb) {
+  if (!this.writableEnded) return Duplex.prototype.write.call(this, chunk, encoding, cb);
+  if (typeof encoding === 'function') { cb = encoding; encoding = null; }
+  const err = new Error('This socket has been ended by the other party');
+  err.code = 'EPIPE';
+  if (typeof cb === 'function') process.nextTick(cb, err);
+  this.destroy(err);
+  return false;
+}
 Object.setPrototypeOf(Socket, Duplex);
 
 Socket.prototype._attachTransport = function(transport) {
@@ -144,7 +185,14 @@ Socket.prototype._onNative = function(type, status, payload) {
     return;
   }
   if (type === 3) {
-    if (status < 0) { this._connectionFailed(nativeError(status, 'connect', this._connectAddress, this._connectPort)); return; }
+    if (status < 0) {
+      // Like Node's createConnectionError: a given local address and port are in the message.
+      const local = this._connectLocal;
+      const err = ExceptionWithHostPort(status, 'connect', this._connectAddress, this._connectPort, local && `${local.address}:${local.port}`);
+      if (local) { err.localAddress = local.address; err.localPort = local.port; }
+      this._connectionFailed(err);
+      return;
+    }
     this.connecting = false;
     this._connected = true;
     this._cacheAddresses();
@@ -174,7 +222,7 @@ Socket.prototype._onNative = function(type, status, payload) {
       this._readEOF = true;
       // Match Node's onStreamRead: read(0) schedules end for an empty,
       // unconsumed socket without consuming any buffered application data.
-      if (!this._onreadPending) { this.push(null); this.read(0); }
+      if (!this._onreadPending) this._pushEOF();
       return;
     }
     if (status < 0) { this.destroy(nativeError(status, 'read')); return; }
@@ -199,7 +247,14 @@ Socket.prototype._deliverOnread = function() {
     this._onreadPending = count < chunk.length ? chunk.subarray(count) : this._onreadQueue?.shift() || null;
     if (this._onread.callback.call(this, count, destination) === false) this.pause();
   }
-  if (this._readEOF && !this._onreadPending && !this.destroyed) { this.push(null); this.read(0); }
+  if (this._readEOF && !this._onreadPending && !this.destroyed) this._pushEOF();
+};
+Socket.prototype._pushEOF = function() {
+  // Like libuv under Node, an onread socket is asked for a buffer for the read that sees EOF too.
+  if (!this._eofPushed && typeof this._onread?.callback === 'function' && typeof this._onread.buffer === 'function') this._onread.buffer();
+  this._eofPushed = true;
+  this.push(null);
+  this.read(0);
 };
 Socket.prototype._read = function() {
   if (!this._connected || this.destroyed || this._readPaused || this.readableEnded) return;
@@ -223,7 +278,12 @@ Socket.prototype.resume = function() {
   return result;
 };
 Socket.prototype._send = function(chunks, cb, vector) {
-  if (this.connecting) { this._pendingWrite = () => this._send(chunks, cb, vector); return; }
+  if (this.connecting) {
+    this._pendingWrite = () => this._send(chunks, cb, vector);
+    this._pendingWrite.callback = cb;
+    this._pendingWrite.chunks = chunks;
+    return;
+  }
   if (!this._connected || !this._transport) { cb(fail('ERR_SOCKET_CLOSED', 'Socket is closed')); return; }
   if (vector) for (const entry of chunks) this._bytesWritten += entry.chunk.length;
   else this._bytesWritten += chunks.length;
@@ -237,7 +297,11 @@ Socket.prototype._writev = function(chunks, cb) { this._send(chunks, cb, true); 
 Socket.prototype._final = function(cb) {
   if (this.connecting) { this._pendingWrite = () => this._final(cb); return; }
   if (!this._transport || !this._connected) { cb(); return; }
-  this._transport.shutdown(cb);
+  // Like Node: a shutdown that fails at submission reports it, but the status of a submitted
+  // shutdown is not reported (afterShutdown); a peer that reset the connection fails the reads.
+  let submitted = false;
+  this._transport.shutdown(err => { if (submitted) cb(); else cb(err); });
+  submitted = true;
 };
 Socket.prototype._destroy = function(err, cb) {
   ++this._generation;
@@ -254,7 +318,9 @@ Socket.prototype._destroy = function(err, cb) {
   this._removeAbort?.();
   const pending = this._pendingWrite;
   this._pendingWrite = null;
-  if (pending) pending();
+  // Like Node, a write waiting for the connect fails once the socket closes.
+  if (pending?.callback) process.nextTick(pending.callback, fail('ERR_SOCKET_CLOSED_BEFORE_CONNECTION', 'Socket closed before the connection was established'));
+  else if (pending) pending();
   const done = () => {
     cb(err);
     process.nextTick(() => this.emit('close', this._hadError));
@@ -275,23 +341,35 @@ Socket.prototype._connectionFailed = function(err) {
   else this.destroy(err);
 };
 Socket.prototype.connect = function(...args) {
-  const [options, cb] = normalizeArgs(args);
+  const [options, cb] = Array.isArray(args[0]) && args[0][normalizedArgs] ? args[0] : normalizeArgs(args);
   diagnostics.publish('net.client.socket', { socket: this });
+  if (cb !== null) this.once('connect', cb);
+  if (options.port === undefined && options.path == null) throw new ERR_MISSING_ARGS(['options', 'port', 'path']);
   if (this.connecting || this._connected) throw fail('ERR_SOCKET_IS_CONNECTED', 'Socket is already connected');
   if (this._transport?.closing) throw fail('ERR_SOCKET_CLOSED', 'Socket is still closing');
-  if (options.path === undefined && options.port === undefined) throw fail('ERR_MISSING_ARGS', 'The "options" or "port" or "path" argument must be specified');
-  if (options.path !== undefined && typeof options.path !== 'string') throw fail('ERR_INVALID_ARG_TYPE', 'The "path" argument must be a string', TypeError);
-  const port = options.path === undefined ? portNumber(options.port) : undefined;
-  if (options.localPort !== undefined) portNumber(options.localPort, 'localPort');
-  if (options.localAddress !== undefined && !isIP(options.localAddress)) throw fail('ERR_INVALID_IP_ADDRESS', `Invalid IP address: ${options.localAddress}`, TypeError);
-  if (options.lookup !== undefined && typeof options.lookup !== 'function') throw fail('ERR_INVALID_ARG_TYPE', 'The "lookup" option must be a function', TypeError);
-  if (options.host !== undefined && typeof options.host !== 'string') throw fail('ERR_INVALID_ARG_TYPE', 'The "host" argument must be a string', TypeError);
-  if (options.family !== undefined && options.family !== 0 && options.family !== 4 && options.family !== 6) throw fail('ERR_INVALID_ARG_VALUE', 'The "family" option must be 0, 4, or 6', TypeError);
-  if (options.autoSelectFamily !== undefined && typeof options.autoSelectFamily !== 'boolean') throw fail('ERR_INVALID_ARG_TYPE', 'The "autoSelectFamily" option must be a boolean', TypeError);
-  const attemptTimeout = options.autoSelectFamilyAttemptTimeout === undefined ? defaultAutoSelectFamilyAttemptTimeout :
-    Math.max(10, integer(options.autoSelectFamilyAttemptTimeout, 'autoSelectFamilyAttemptTimeout', 1, 0x7fffffff));
+  let port;
+  let attemptTimeout = defaultAutoSelectFamilyAttemptTimeout;
+  if (options.path) validateString(options.path, 'options.path');
+  else {
+    // Node's lookupAndConnect checks, in its order.
+    const host = options.host || 'localhost';
+    validateString(host, 'options.host');
+    if (host.includes('\0')) throw new ERR_INVALID_ARG_VALUE('options.host', host, 'must be a string without null bytes');
+    if (options.localAddress && !isIP(options.localAddress)) throw new ERR_INVALID_IP_ADDRESS(options.localAddress);
+    if (options.localPort) validateNumber(options.localPort, 'options.localPort');
+    if (options.port !== undefined) {
+      if (typeof options.port !== 'number' && typeof options.port !== 'string') throw new ERR_INVALID_ARG_TYPE('options.port', ['number', 'string'], options.port);
+      validatePort(options.port);
+    }
+    port = options.port | 0;
+    if (options.autoSelectFamily != null) validateBoolean(options.autoSelectFamily, 'options.autoSelectFamily');
+    if (options.autoSelectFamilyAttemptTimeout != null) {
+      validateInt32(options.autoSelectFamilyAttemptTimeout, 'options.autoSelectFamilyAttemptTimeout', 1);
+      attemptTimeout = Math.max(10, options.autoSelectFamilyAttemptTimeout);
+    }
+    if (!isIP(host) && options.lookup != null) validateFunction(options.lookup, 'options.lookup');
+  }
   if (this.destroyed) { this._undestroy(); this._hadError = false; this._reset = false; }
-  if (cb) this.once('connect', cb);
   this._bytesRead = 0;
   this._readEOF = false;
   this._bytesWritten = 0;
@@ -309,38 +387,56 @@ Socket.prototype.connect = function(...args) {
   const start = (address, family) => {
     if (this.destroyed || generation !== this._generation) return;
     this._connectAddress = address;
+    this._connectLocal = options.localAddress && options.localPort ? { address: options.localAddress, port: options.localPort } : undefined;
     try {
-      this._attachTransport(new Transport(options.path === undefined ? 1 : 2, (...event) => this._onNative(...event)));
+      this._attachTransport(new Transport(options.path ? 2 : 1, (...event) => this._onNative(...event)));
       if (options.localAddress !== undefined || options.localPort !== undefined) {
         const local = options.localAddress || (family === 6 ? '::' : '0.0.0.0');
         const status = this._transport.call('bind', local, Number(options.localPort || 0), 0);
         if (status < 0) { this.destroy(nativeError(status, 'bind', local, options.localPort)); return; }
       }
-      if (options.path === undefined) this.emit('connectionAttempt', address, port, family);
+      if (!options.path) this.emit('connectionAttempt', address, port, family);
       if (this.destroyed) return;
+      if (!options.path && this.blockList?.check(address, `ipv${family}`)) { this._connectionFailed(new ERR_IP_BLOCKED(address)); return; }
       const status = this._transport.call('connect', address, port || 0);
-      if (status < 0) this._connectionFailed(nativeError(status, 'connect', address, port));
+      if (status < 0) {
+        // Like Node's internalConnect, a TCP connect that fails at once names the local address,
+        // which is empty when the socket has none.
+        const local = options.path ? undefined : this.address();
+        this._connectionFailed(ExceptionWithHostPort(status, 'connect', address, port, local && `${local.address}:${local.port}`));
+      }
     } catch (err) { this.destroy(err); }
   };
-  if (options.path !== undefined) process.nextTick(start, options.path, 0);
+  if (options.path) process.nextTick(start, options.path, 0);
   else {
     const host = options.host || 'localhost';
-    if (typeof host !== 'string') throw fail('ERR_INVALID_ARG_TYPE', 'The "host" argument must be a string', TypeError);
     this._host = host;
     const family = isIP(host);
     if (family) process.nextTick(start, host, family);
     else {
       const lookup = options.lookup || require('dns').lookup;
-      const auto = (options.autoSelectFamily ?? defaultAutoSelectFamily) && !options.family && !options.localAddress;
-      lookup(host, { family: options.family || 0, hints: options.hints || 0, all: auto }, (err, address, resolvedFamily) => {
+      const family = socketToDnsFamily(options.family);
+      const auto = (options.autoSelectFamily ?? defaultAutoSelectFamily) && family !== 4 && family !== 6 && !options.localAddress;
+      // Like Node, without a family or hints the lookup asks only for configured address families.
+      const hints = options.hints || (family !== 4 && family !== 6 ? require('dns').ADDRCONFIG : 0);
+      lookup(host, { family, hints, all: auto }, (err, address, resolvedFamily) => {
         if (this.destroyed || generation !== this._generation) return;
         if (err) { this.emit('lookup', err, undefined, undefined, host); this.destroy(err); return; }
-        const records = auto ? address : [{ address, family: resolvedFamily }];
-        if (!Array.isArray(records) || records.length === 0 || records.some(record => !record || !isIP(record.address))) {
-          this.destroy(fail('ERR_INVALID_IP_ADDRESS', 'Lookup did not return a valid IP address', TypeError)); return;
+        const answers = auto ? address : [{ address, family: resolvedFamily }];
+        if (!Array.isArray(answers) || answers.length === 0 || !answers[0]) {
+          this.destroy(new ERR_INVALID_IP_ADDRESS(auto ? undefined : address)); return;
         }
-        for (const record of records) this.emit('lookup', null, record.address, record.family, host);
+        for (const record of answers) this.emit('lookup', null, record?.address, record?.family, host);
         if (this.destroyed) return;
+        // Node keeps the IPv4 and IPv6 answers, and fails on the first answer when none is valid.
+        const valid = address => typeof address === 'string' && isIP(address) !== 0;
+        const records = answers.filter(record => record && valid(record.address) && (record.family === 4 || record.family === 6));
+        if (records.length === 0) {
+          const first = answers[0];
+          this.destroy(!valid(first.address) ? new ERR_INVALID_IP_ADDRESS(first.address)
+            : new ERR_INVALID_ADDRESS_FAMILY(first.family, options.host, options.port));
+          return;
+        }
         if (!auto || records.length === 1) { start(records[0].address, records[0].family); return; }
         const firstFamily = records[0].family;
         const primary = records.filter(record => record.family === firstFamily);
@@ -400,9 +496,10 @@ Socket.prototype.connect = function(...args) {
   return this;
 };
 Socket.prototype.setTimeout = function(milliseconds, cb) {
-  if (typeof milliseconds !== 'number' || !Number.isFinite(milliseconds) || milliseconds < 0)
-    throw fail('ERR_OUT_OF_RANGE', 'Timeout must be a non-negative finite number', RangeError);
-  callback(cb);
+  if (this.destroyed) return this;
+  validateNumber(milliseconds, 'msecs');
+  if (milliseconds < 0 || !Number.isFinite(milliseconds)) throw new ERR_OUT_OF_RANGE('msecs', 'a non-negative finite number', milliseconds);
+  if (cb !== undefined) validateFunction(cb, 'callback');
   clearTimeout(this._timeout);
   this._timeout = null;
   this.timeout = milliseconds;
@@ -445,12 +542,25 @@ Socket.prototype.resetAndDestroy = function() {
   return this.destroy();
 };
 Object.defineProperties(Socket.prototype, {
-  _handle: { get() { return this._transport; }, configurable: true },
+  _handle: { get() { return this._transport; }, set(value) { this._transport = value; }, configurable: true },
+  _connecting: { get() { return this.connecting; } },
   pending: { get() { return !this._transport || this.connecting; } },
   readyState: { get() { return this.connecting ? 'opening' : this.readable && this.writable ? 'open' : this.readable ? 'readOnly' : this.writable ? 'writeOnly' : 'closed'; } },
-  bufferSize: { get() { return this._transport ? this.writableLength : undefined; } },
+  // Node creates the handle in connect(), so a connecting socket has a buffer size too.
+  bufferSize: { get() { return this._transport || this.connecting ? this.writableLength : undefined; } },
   bytesRead: { get() { return this._bytesRead; } },
-  bytesWritten: { get() { return this._bytesWritten + this.writableLength - (this._writableState.writing && !this.connecting ? this._writableState.writelen : 0); } },
+  // Like Node: the bytes sent, plus the buffered writes and the write that waits for the connect.
+  bytesWritten: { get() {
+    const buffered = this.writableBuffer;
+    if (!buffered) return undefined;
+    const length = entry => typeof entry.chunk === 'string' ? Buffer.byteLength(entry.chunk, entry.encoding) : entry.chunk.length;
+    let bytes = this._bytesWritten;
+    for (const entry of buffered) bytes += length(entry);
+    const pending = this._pendingWrite?.chunks;
+    if (Array.isArray(pending)) for (const entry of pending) bytes += length(entry);
+    else if (pending) bytes += pending.length;
+    return bytes;
+  } },
   localAddress: { get() { return this._localAddress?.address; } },
   localPort: { get() { return this._localAddress?.port; } },
   localFamily: { get() { return this._localAddress?.family; } },
@@ -462,9 +572,14 @@ Object.defineProperties(Socket.prototype, {
 function Server(options, listener) {
   if (!(this instanceof Server)) return new Server(options, listener);
   if (typeof options === 'function') { listener = options; options = {}; }
-  options ||= {};
-  if (typeof options !== 'object') throw fail('ERR_INVALID_ARG_TYPE', 'Server options must be an object', TypeError);
-  callback(listener);
+  else if (options == null || typeof options === 'object') options = { ...options };
+  else throw new ERR_INVALID_ARG_TYPE('options', 'Object', options);
+  if (typeof listener !== 'function') listener = undefined;
+  if (options.keepAliveInitialDelay !== undefined) {
+    validateNumber(options.keepAliveInitialDelay, 'options.keepAliveInitialDelay');
+    if (options.keepAliveInitialDelay < 0) options.keepAliveInitialDelay = 0;
+  }
+  this.blockList = blockList(options);
   EventEmitter.call(this);
   this.allowHalfOpen = !!options.allowHalfOpen;
   this.pauseOnConnect = !!options.pauseOnConnect;
@@ -491,6 +606,8 @@ Server.prototype._onNative = function(type, status, id) {
   catch (err) { this.emit('error', err); return; }
   socket._connected = true;
   socket._cacheAddresses();
+  const remote = socket._remoteAddress?.address;
+  if (this.blockList && isIP(remote) && this.blockList.check(remote, `ipv${isIP(remote)}`)) { socket.destroy(); return; }
   this._acceptSocket(socket);
 };
 Server.prototype._acceptSocket = function(socket) {
@@ -515,56 +632,60 @@ Server.prototype._acceptSocket = function(socket) {
   if (!this.pauseOnConnect && !socket.destroyed) socket._read();
 };
 Server.prototype.listen = function(...args) {
-  if (this._transport || this._starting || this._closing) throw fail('ERR_SERVER_ALREADY_LISTEN', 'Listen method has been called more than once without closing');
-  const [options, cb] = normalizeArgs(args);
-  if (options.port === undefined && options.path === undefined && options.fd === undefined) {
-    if (args.length === 0 || typeof args[0] === 'function') options.port = 0;
-    else throw fail('ERR_INVALID_ARG_VALUE', 'Listen options must specify a port, path, or fd', TypeError);
-  }
-  let backlog = options.backlog;
-  if (backlog === undefined && typeof args[0] !== 'object') {
-    if (typeof args[1] === 'number') backlog = args[1];
-    else if (typeof args[2] === 'number') backlog = args[2];
-  }
-  backlog = backlog === undefined ? 511 : integer(backlog, 'backlog', 0, 0x7fffffff);
-  const port = options.path === undefined && options.fd === undefined ? portNumber(options.port) : 0;
-  if (options.path !== undefined && typeof options.path !== 'string') throw fail('ERR_INVALID_ARG_TYPE', 'The "path" argument must be a string', TypeError);
-  if (options.fd !== undefined) integer(options.fd, 'fd', 0, 0x7fffffff);
-  const listenTracing = diagnostics.tracing('net.server.listen');
-  listenTracing?.asyncStart.publish({ server: this, options });
-  if (cb) this.once('listening', cb);
-  this._starting = true;
+  const [normalized, cb] = normalizeArgs(args);
+  if (this._transport) throw fail('ERR_SERVER_ALREADY_LISTEN', 'Listen method has been called more than once without closing');
+  if (cb !== null) this.once('listening', cb);
+  const backlogFromArgs = toNumber(args.length > 1 && args[1]) || toNumber(args.length > 2 && args[2]);
+  const options = normalized._handle || normalized.handle || normalized;
   const generation = ++this._generation;
   attachAbort(this, options.signal, () => this.close());
+  // Node's listen overloads, in its order: fd, port (listen(), listen(cb), listen(null) and an
+  // explicit port: undefined mean port 0), then path.
+  let port = 0;
+  let backlog = options.backlog || backlogFromArgs || 511;
+  if (!(typeof options.fd === 'number' && options.fd >= 0)) {
+    if (args.length === 0 || typeof args[0] === 'function' || (options.port === undefined && 'port' in options) || options.port === null) options.port = 0;
+    if (typeof options.port === 'number' || typeof options.port === 'string') port = validatePort(options.port, 'options.port');
+    else if (options.path && isPipeName(options.path)) {
+      if (options.path[0] === '\0' && (options.readableAll || options.writableAll))
+        throw new ERR_INVALID_ARG_VALUE('options', options, 'can not set readableAll or writableAllt to true when path is abstract unix socket');
+    } else if (!('port' in options || 'path' in options)) {
+      throw new ERR_INVALID_ARG_VALUE('options', options, 'must have the property "port" or "path"');
+    } else throw new ERR_INVALID_ARG_VALUE('options', options);
+  }
+  const fd = typeof options.fd === 'number' && options.fd >= 0 ? options.fd : undefined;
+  const path = fd === undefined && options.port === undefined ? options.path : undefined;
+  const listenTracing = diagnostics.tracing('net.server.listen');
+  listenTracing?.asyncStart.publish({ server: this, options });
+  this._starting = true;
   const failed = err => {
     listenTracing?.error.publish({ server: this, error: err });
     this._starting = false;
     this._removeAbort?.();
-    const transport = this._transport;
-    if (transport) transport.close();
+    this._detachTransport();
     process.nextTick(() => this.emit('error', err));
   };
   const cluster = require('cluster');
   if (cluster.isWorker && !options.exclusive && !options.reusePort) {
-    cluster._getServer(this, { ...options, port: options.path === undefined && options.fd === undefined ? port : undefined, backlog }, generation, failed);
+    cluster._getServer(this, { ...options, fd, path, port: path === undefined && fd === undefined ? port : undefined, backlog }, generation, failed);
     return this;
   }
   const start = address => {
     if (generation !== this._generation || !this._starting) return;
     try {
-      let kind = options.path === undefined ? 1 : 2;
-      if (options.fd !== undefined) {
-        kind = native('guessHandleType', [options.fd]);
+      let kind = path === undefined ? 1 : 2;
+      if (fd !== undefined) {
+        kind = native('guessHandleType', [fd]);
         if (kind !== 1 && kind !== 2) { failed(nativeError(kind < 0 ? kind : -22, 'open')); return; }
       }
       this._transport = new Transport(kind, (...event) => this._onNative(...event));
       if (this._unrefed) this._transport.unref();
       let status;
-      if (options.fd !== undefined) status = this._transport.call('open', options.fd);
+      if (fd !== undefined) status = this._transport.call('open', fd);
       else {
         const flags = (options.ipv6Only ? 1 : 0) | (options.reusePort ? 2 : 0);
         status = this._transport.call('bind', address, port, flags);
-        if (status < 0 && options.host === undefined && options.path === undefined && address === '::') {
+        if (status < 0 && !options.host && address === '::') {
           this._transport.onEvent = () => {};
           this._transport.close();
           this._transport = new Transport(1, (...event) => this._onNative(...event));
@@ -580,7 +701,7 @@ Server.prototype.listen = function(...args) {
       }
       status = this._transport.call('listen', backlog);
       // The bind of a TCP server takes effect at listen, so a host without IPv6 fails here.
-      if (status < 0 && kind === 1 && options.fd === undefined && options.host === undefined && address === '::') {
+      if (status < 0 && kind === 1 && fd === undefined && !options.host && address === '::') {
         this._transport.onEvent = () => {};
         this._transport.close();
         this._transport = new Transport(1, (...event) => this._onNative(...event));
@@ -590,14 +711,17 @@ Server.prototype.listen = function(...args) {
         if (status >= 0) status = this._transport.call('listen', backlog);
       }
       if (status < 0) { failed(nativeError(status, 'listen', address, port)); return; }
+      // Node's key for the listening address: type, address and the requested port.
+      this._connectionKey = kind === 1 && fd === undefined ? `${isIP(address)}:${address}:${port}`
+        : `-1:${fd === undefined ? address : null}:-1`;
       this._starting = false;
       this._listening = true;
       listenTracing?.asyncEnd.publish({ server: this });
       process.nextTick(() => { if (this._listening && generation === this._generation) this.emit('listening'); });
     } catch (err) { failed(err); }
   };
-  if (options.path !== undefined) start(options.path);
-  else if (options.fd !== undefined) start(undefined);
+  if (path !== undefined) start(path);
+  else if (fd !== undefined) start(undefined);
   else if (!options.host) start('::');
   else if (isIP(options.host)) start(options.host);
   else require('dns').lookup(options.host, { family: 0 }, (err, address) => {
@@ -606,28 +730,39 @@ Server.prototype.listen = function(...args) {
   });
   return this;
 };
+// Like Node dropping server._handle: the closing handle no longer belongs to the server.
+Server.prototype._detachTransport = function() {
+  const transport = this._transport;
+  this._transport = null;
+  if (transport) { transport.onEvent = () => {}; transport.close(); }
+};
 Server.prototype._emitCloseIfDrained = function() {
-  if (!this._closing || this._transport || this._connections) return;
+  if (!this._closing || this._connections) return;
   this._closing = false;
   process.nextTick(() => this.emit('close'));
 };
+// Like Node: a callback that is not a function is ignored, and 'close' is emitted even when the
+// server was not listening, with ERR_SERVER_NOT_RUNNING for the callback.
 Server.prototype.close = function(cb) {
-  callback(cb);
-  if (!this._listening && !this._starting && !this._closing) {
-    if (cb) process.nextTick(cb, fail('ERR_SERVER_NOT_RUNNING', 'Server is not running'));
-    return this;
+  if (typeof cb === 'function') {
+    if (!this._transport) this.once('close', function close() { cb(fail('ERR_SERVER_NOT_RUNNING', 'Server is not running')); });
+    else this.once('close', cb);
   }
-  if (cb) this.once('close', cb);
   ++this._generation;
   this._starting = false;
   this._listening = false;
   this._closing = true;
   this._removeAbort?.();
-  if (this._transport) this._transport.close();
+  this._detachTransport();
   this._emitCloseIfDrained();
   return this;
 };
 Server.prototype.address = function() { return this._listening ? this._transport.address() : null; };
+// Like Node: with captureRejections, a rejected 'connection' listener destroys that socket.
+Server.prototype[EventEmitter.captureRejectionSymbol] = function(err, event, sock) {
+  if (event === 'connection') sock.destroy(err);
+  else this.emit('error', err);
+};
 Server.prototype.getConnections = function(cb) { callback(cb); if (!cb) throw fail('ERR_INVALID_ARG_TYPE', 'Callback must be a function', TypeError); process.nextTick(cb, null, this._connections); return this; };
 Server.prototype.ref = function() { this._unrefed = false; this._transport?.ref(); return this; };
 Server.prototype.unref = function() { this._unrefed = true; this._transport?.unref(); return this; };
@@ -648,6 +783,8 @@ function setDefaultAutoSelectFamilyAttemptTimeout(value) {
 }
 
 module.exports = {
+  get BlockList() { return require('internal/blocklist').BlockList; },
+  get SocketAddress() { return require('internal/socketaddress').SocketAddress; },
   Socket, Stream: Socket, Server, createConnection, connect: createConnection, createServer,
   isIP, isIPv4, isIPv6, _normalizeArgs: normalizeArgs,
   getDefaultAutoSelectFamily, setDefaultAutoSelectFamily,

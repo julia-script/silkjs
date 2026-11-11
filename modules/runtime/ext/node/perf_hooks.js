@@ -4,7 +4,7 @@ const host = require('internal/host');
 const { EventTarget, Event, DOMException } = require('internal/path_events/event_target');
 const { createHistogram, createSlidingWindowHistogram, importHistogram, monitorEventLoopDelay, isRecordableHistogram } = require('internal/performance_histogram');
 const trace = require('internal/trace_events');
-const { codes: { ERR_INVALID_ARG_TYPE } } = require('internal/diagnostics_errors');
+const { codes: { ERR_INVALID_ARG_TYPE } } = require('internal/errors');
 const { validateFunction, validateObject } = require('internal/validators');
 const token = Symbol('Performance');
 const entries = new WeakMap();
@@ -16,10 +16,12 @@ const enqueueObserver = Symbol('enqueue');
 const deliverObserver = Symbol('deliver');
 const reservedMarks = new Set(['nodeStart', 'v8Start', 'environment', 'loopStart', 'loopExit', 'bootstrapComplete']);
 const supportedTypes = Object.freeze([...new Set(['function', 'mark', 'measure', 'resource', ...(host.performanceObserverTypes || [])])].sort());
-// The bootstrap sets both before any module loads. Reading globalThis.performance here
-// would run its lazy getter, which loads this module again while it is still loading.
-let startTime = host.performanceStartTime;
-let timeOrigin = host.performanceTimeOrigin;
+// Only an installed instance counts: reading the lazy global would load this module
+// again while it loads, and settle globalThis.performance to undefined.
+const previousDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'performance');
+const previousPerformance = previousDescriptor && 'value' in previousDescriptor ? previousDescriptor.value : undefined;
+let startTime = host.performanceStartTime ?? (host.now() - (previousPerformance?.now() ?? process.uptime() * 1000));
+let timeOrigin = host.performanceTimeOrigin ?? previousPerformance?.timeOrigin ?? (Date.now() - (host.now() - startTime));
 // A process started from a heap image has its own start.
 host.onHydrate(() => { startTime = host.performanceStartTime; timeOrigin = host.performanceTimeOrigin; });
 const now = () => host.now() - startTime;
@@ -253,7 +255,7 @@ function timerify(fn, options = {}) {
   validateFunction(fn, 'fn');
   validateObject(options, 'options');
   const histogram = options.histogram;
-  if (histogram !== undefined && !isRecordableHistogram(histogram)) throw ERR_INVALID_ARG_TYPE('options.histogram', 'RecordableHistogram', histogram);
+  if (histogram !== undefined && !isRecordableHistogram(histogram)) throw new ERR_INVALID_ARG_TYPE('options.histogram', 'RecordableHistogram', histogram);
   function timerified(...args) {
     const start = now();
     const complete = () => {

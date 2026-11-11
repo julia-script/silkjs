@@ -10,7 +10,7 @@ const Module = require('module');
 const addBuiltinGlobals = require('internal/loader/builtin_globals');
 const path = require('path');
 const fs = require('fs');
-const { Recoverable, isRecoverableError, isValidSyntax, rememberBindings } = require('internal/repl/syntax');
+const { kStandaloneREPL, Recoverable, isRecoverableError, isValidSyntax, rememberBindings } = require('internal/repl/syntax');
 const { complete } = require('internal/repl/completion');
 const { setupPreview } = require('internal/repl/preview');
 const host = require('internal/host');
@@ -95,16 +95,17 @@ function REPLServer(prompt, stream, eval_, useGlobal, ignoreUndefined, replMode)
   stream = options.stream || options.socket || process;
   const input = options.input || stream.stdin || stream;
   const output = options.output || stream.stdout || stream;
-  for (const name of ['eval', 'writer', 'completer']) if (options[name] !== undefined && typeof options[name] !== 'function') throw invalid(`options.${name}`, 'function');
   if (options.breakEvalOnSigint && options.eval) {
     throw Object.assign(new TypeError('Cannot specify both "breakEvalOnSigint" and "eval" for REPL'), { code: 'ERR_INVALID_REPL_EVAL_CONFIG' });
   }
+  for (const name of ['eval', 'writer', 'completer']) if (options[name] !== undefined && typeof options[name] !== 'function') throw invalid(`options.${name}`, 'function');
+  this[kStandaloneREPL] = !!options[kStandaloneREPL];
   this.useGlobal = !!options.useGlobal;
   this.ignoreUndefined = !!options.ignoreUndefined;
   this.replMode = options.replMode || REPL_MODE_SLOPPY;
   this.allowBlockingCompletions = !!options.allowBlockingCompletions;
   const terminal = options.terminal === undefined ? !!output.isTTY : !!options.terminal;
-  this.useColors = options.useColors === undefined ? terminal && process.env.TERM !== 'dumb' && !process.env.NODE_DISABLE_COLORS && !process.env.NO_COLOR : !!options.useColors;
+  this.useColors = options.useColors === undefined ? terminal && !!require('internal/util/colors').shouldColorize(output) : !!options.useColors;
   this.breakEvalOnSigint = !!options.breakEvalOnSigint;
   this.editorMode = false;
   this.last = undefined;
@@ -119,7 +120,22 @@ function REPLServer(prompt, stream, eval_, useGlobal, ignoreUndefined, replMode)
   this._sawSIGINT = false;
   this.commands = Object.create(null);
   this.writer = options.writer || module.exports.writer;
-  if (this.writer === writer) writer.options.colors = this.useColors;
+  // The REPL `node` starts is reachable from inside itself as repl.repl, and owns
+  // util.inspect.replDefaults.
+  if (options[kStandaloneREPL]) module.exports.repl = this;
+  if (this.writer === writer) {
+    writer.options.colors = this.useColors;
+    if (options[kStandaloneREPL]) {
+      Object.defineProperty(inspect, 'replDefaults', {
+        get() { return writer.options; },
+        set(value) {
+          if (value === null || typeof value !== 'object') throw invalid('options', 'object');
+          return Object.assign(writer.options, value);
+        },
+        enumerable: true, configurable: true,
+      });
+    }
+  }
   this._domain = options.domain || domain.create();
   replDomains.add(this._domain);
   this.eval = this._domain.bind(options.eval || defaultEval.bind(this));
@@ -128,7 +144,7 @@ function REPLServer(prompt, stream, eval_, useGlobal, ignoreUndefined, replMode)
     prompt: options.prompt === undefined ? '> ' : options.prompt,
     completer: options.completer || complete.bind(this),
     history: options.history,
-    historySize: options.historySize === undefined ? 1000 : options.historySize,
+    historySize: options.historySize,
     removeHistoryDuplicates: options.removeHistoryDuplicates,
     crlfDelay: Infinity,
   });
@@ -145,8 +161,7 @@ function REPLServer(prompt, stream, eval_, useGlobal, ignoreUndefined, replMode)
     if (this._activeFinish) this._activeFinish(error, undefined, kDomainError);
     else {
       this.clearBufferedCommand();
-      this._writeError(error);
-      this.displayPrompt();
+      if (this._writeError(error)) this.displayPrompt();
       this._drain();
     }
   });
@@ -164,7 +179,7 @@ function REPLServer(prompt, stream, eval_, useGlobal, ignoreUndefined, replMode)
   this.on('line', line => {
     if (this._closeScheduled) return;
     this._sawSIGINT = false;
-    this._queue.push([line, this.terminal]);
+    this._queue.push([line ?? '', this.terminal]);
     this._drain();
   });
   this.on('close', () => { this._inputClosed = true; this._maybeExit(); });
@@ -259,11 +274,19 @@ REPLServer.prototype.defineCommand = function defineCommand(keyword, command) {
   if (!command || typeof command.action !== 'function') throw invalid('cmd.action', 'function');
   this.commands[keyword] = command;
 };
-REPLServer.prototype.setupHistory = function setupHistory(config, callback) {
-  return require('internal/repl/history').setupHistory(this, config, callback);
+REPLServer.prototype.setupHistory = function setupHistory(historyConfig = {}, cb) {
+  // historyConfig can be a string for backwards compatibility.
+  const options = typeof historyConfig === 'string' ? { filePath: historyConfig } : historyConfig;
+  if (typeof cb === 'function') options.onHistoryFileLoaded = cb;
+  this.setupHistoryManager(options);
 };
 REPLServer.prototype.close = function close() {
   if (this._closeScheduled || this.closed) return;
+  if (this.terminal && this.historyManager.isFlushing && !this._closingOnFlush) {
+    this._closingOnFlush = true;
+    this.once('flushHistory', () => Interface.prototype.close.call(this));
+    return;
+  }
   if (this._preview) this._preview.cancel();
   this._closeScheduled = true;
   process.nextTick(() => Interface.prototype.close.call(this));
@@ -273,11 +296,60 @@ REPLServer.prototype._maybeExit = function maybeExit() {
   this._exitEmitted = true;
   this.emit('exit');
 };
-REPLServer.prototype._writeError = function writeError(error) {
-  if (!this.underscoreErrAssigned) this.lastError = error;
-  let text = '' + this.writer(error);
-  if (types.isNativeError(error) && text.startsWith('[') && text.endsWith(']')) text = text.slice(1, -1);
-  this.output.write(`Uncaught ${text}${text.endsWith('\n') ? '' : '\n'}`);
+// Node's debugDomainError: cut the stack below the REPL's own code, then print it as
+// "Uncaught <error>", or hand it to the process's listeners in the standalone REPL.
+REPLServer.prototype._writeError = function writeError(e) {
+  let errStack = '';
+  if (typeof e === 'object' && e !== null) {
+    const { overrideStackTrace, ErrorPrepareStackTrace } = require('internal/error_stack');
+    overrideStackTrace.set(e, (error, stackFrames) => {
+      let frames;
+      if (typeof stackFrames === 'object') {
+        // Everything from the last frame without a function name down is the REPL's machinery.
+        const idx = stackFrames.findLastIndex(frame => frame.getFunctionName() === null);
+        frames = stackFrames.slice(0, idx);
+      } else frames = stackFrames;
+      if (typeof Error.prepareStackTrace === 'function') return Error.prepareStackTrace(error, frames);
+      return ErrorPrepareStackTrace(error, frames);
+    });
+    if (e.domainThrown) { delete e.domain; delete e.domainThrown; }
+    if (types.isNativeError(e) || e instanceof Error) {
+      if (e.stack) {
+        if (e.name === 'SyntaxError') {
+          e.stack = e.stack.replace(/^REPL\d+:\d+\r?\n/, '').replace(/^\s+at\s.*\n?/gm, '');
+        } else if (this.replMode === REPL_MODE_STRICT) {
+          e.stack = e.stack.replace(/(\s+at\s+REPL\d+:)(\d+)/, (_, pre, line) => pre + (line - 1));
+        }
+      }
+      errStack = this.writer(e);
+      // Remove one line error braces to keep the old style in place.
+      if (errStack[0] === '[' && errStack[errStack.length - 1] === ']') errStack = errStack.slice(1, -1);
+    }
+  }
+  if (!this.underscoreErrAssigned) this.lastError = e;
+  if (this[kStandaloneREPL] && process.listenerCount('uncaughtException') !== 0) {
+    process.nextTick(() => {
+      process.emit('uncaughtException', e);
+      this.clearBufferedCommand();
+      this.lines.level = [];
+      if (!this.closed) this.displayPrompt();
+    });
+    return false;
+  }
+  if (errStack === '') errStack = this.writer(e);
+  const lines = String(errStack).split(/(?<=\n)/);
+  let matched = false;
+  errStack = '';
+  for (const line of lines) {
+    if (!matched && /^\[?([A-Z][a-z0-9_]*)*Error/.exec(line) !== null) {
+      errStack += writer.options.breakLength >= line.length ? `Uncaught ${line}` : `Uncaught:\n${line}`;
+      matched = true;
+    } else errStack += line;
+  }
+  if (!matched) errStack = `Uncaught${lines.length === 1 ? ' ' : ':\n'}${errStack}`;
+  errStack += errStack.endsWith('\n') ? '' : '\n';
+  this.output.write(errStack);
+  return true;
 };
 REPLServer.prototype._interrupt = function interrupt() {
   if (this._preview) this._preview.cancel();
@@ -418,8 +490,16 @@ function defineCommands(server) {
 }
 function start(...args) { return new REPLServer(...args); }
 module.exports = { start, writer, REPLServer, REPL_MODE_SLOPPY, REPL_MODE_STRICT, Recoverable, isValidSyntax };
-for (const name of ['builtinModules', '_builtinLibs']) Object.defineProperty(module.exports, name, {
-  configurable: true,
-  get: () => builtinModules,
-  set: value => { builtinModules = value; },
-});
+{
+  const pendingDeprecation = require('internal/options').getOptionValue('--pending-deprecation');
+  for (const [name, code] of [['builtinModules', 'DEP0191'], ['_builtinLibs', 'DEP0142']]) {
+    const message = `repl.${name} is deprecated. Check module.builtinModules instead`;
+    const get = () => builtinModules;
+    const set = value => { builtinModules = value; };
+    Object.defineProperty(module.exports, name, {
+      configurable: true, enumerable: false,
+      get: pendingDeprecation ? require('util').deprecate(get, message, code) : get,
+      set: pendingDeprecation ? require('util').deprecate(set, message, code) : set,
+    });
+  }
+}
