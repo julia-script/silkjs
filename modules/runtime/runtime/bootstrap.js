@@ -89,6 +89,7 @@ host.testCoverageTake = () => native.testCoverageNative(1);
 host.testCoverageStop = () => native.testCoverageNative(2);
 host.processFeatures = {
   debug: native.debugBuild, uv: true, ipv6: true, inspector: true,
+  openssl_is_boringssl: false, quic: false,
   tls: true, tls_alpn: true, tls_sni: true, tls_ocsp: false,
   cached_builtins: false, require_module: true,
   get typescript() { return host.typeScriptMode; }
@@ -319,44 +320,102 @@ function checkpoint() {
   } while (ticksPending() || rejections.size || completionsPending());
 }
 host.checkpoint = checkpoint;
-class Timeout {
-  constructor(callback, delay, args, repeat, immediate = false) {
-    this._id = nextTimer++; this._callback = callback; this._args = args; this._delay = delay;
-    this._repeat = repeat; this._refed = true; this._destroyed = false; this._immediate = immediate;
-    this._resource = resource(immediate ? 'Immediate' : 'Timeout', this);
-    this._due = native.now() + delay;
-    (immediate ? immediates : timers).set(this._id, this);
+// Timeout and Immediate keep Node's public fields (_idleTimeout, _onTimeout,
+// _timerArgs, _repeat, _destroyed; _onImmediate, _argv), which code reads and
+// writes: a callback that sets _repeat turns a timeout into an interval, and
+// _onTimeout = null or _idleTimeout = -1 stops one. The schedule itself is in
+// symbol-keyed fields and the timers / immediates maps.
+const kTimerId = Symbol('timerId'), kDue = Symbol('due'), kRefed = Symbol('refed'), kTimerResource = Symbol('resource');
+const TIMEOUT_MAX = 2147483647;
+let warnedNegativeNumber = false, warnedNotNumber = false;
+function timeoutDuration(after) {
+  after *= 1;
+  if (!(after >= 1 && after <= TIMEOUT_MAX)) {
+    if (after > TIMEOUT_MAX) {
+      process.emitWarning(`${after} does not fit into a 32-bit signed integer.\nTimeout duration was set to 1.`, 'TimeoutOverflowWarning');
+    } else if (after < 0 && !warnedNegativeNumber) {
+      warnedNegativeNumber = true;
+      process.emitWarning(`${after} is a negative number.\nTimeout duration was set to 1.`, 'TimeoutNegativeWarning');
+    } else if (Number.isNaN(after) && !warnedNotNumber) {
+      warnedNotNumber = true;
+      process.emitWarning(`${after} is not a number.\nTimeout duration was set to 1.`, 'TimeoutNaNWarning');
+    }
+    after = 1;
   }
-  ref() { this._refed = true; return this; }
-  unref() { this._refed = false; return this; }
-  hasRef() { return this._refed; }
+  return after;
+}
+function schedule(timer, start) {
+  timer._idleStart = start;
+  timer[kDue] = start + Math.trunc(timer._idleTimeout);
+  timers.set(timer[kTimerId], timer);
+}
+class Timeout {
+  constructor(callback, after, args, isRepeat) {
+    after = timeoutDuration(after);
+    this._idleTimeout = after; this._idlePrev = null; this._idleNext = null; this._idleStart = null;
+    this._onTimeout = callback; this._timerArgs = args; this._repeat = isRepeat ? after : null; this._destroyed = false;
+    this[kRefed] = true; this[kTimerId] = nextTimer++;
+    this[kTimerResource] = resource('Timeout', this);
+    schedule(this, native.now());
+  }
+  ref() { this[kRefed] = true; return this; }
+  unref() { this[kRefed] = false; return this; }
+  hasRef() { return this[kRefed]; }
   refresh() {
-    if (this._destroyed) this._resource = resource(this._immediate ? 'Immediate' : 'Timeout', this);
-    this._due = native.now() + this._delay; this._destroyed = false;
-    (this._immediate ? immediates : timers).set(this._id, this);
+    if (this._destroyed) { this[kTimerResource] = resource('Timeout', this); this._destroyed = false; }
+    schedule(this, native.now());
     return this;
   }
-  close() { clearTimer(this); return this; }
-  [Symbol.toPrimitive]() { return this._id; }
-  [Symbol.dispose]() { clearTimer(this); }
+  close() { clearTimeout(this); return this; }
+  [Symbol.toPrimitive]() { return this[kTimerId]; }
+  [Symbol.dispose]() { clearTimeout(this); }
 }
-function delayValue(delay) { delay = Number(delay); return !Number.isFinite(delay) || delay < 1 || delay > 2147483647 ? 1 : Math.trunc(delay); }
-function setTimer(callback, delay, args, repeat) { checkCallback(callback); return new Timeout(callback, delayValue(delay), args, repeat); }
-function clearTimer(timer) {
-  const id = timer instanceof Timeout ? timer._id : typeof timer === 'number' || typeof timer === 'string' ? Number(timer) : NaN;
-  const value = timers.get(id) || immediates.get(id) || (timer instanceof Timeout ? timer : undefined);
-  if (value && !value._destroyed) {
-    value._destroyed = true; timers.delete(id); immediates.delete(id);
-    value._resource.emitDestroy();
+class Immediate {
+  constructor(callback, args) {
+    this._idleNext = null; this._idlePrev = null; this._onImmediate = callback; this._argv = args; this._destroyed = false;
+    this[kRefed] = true; this[kTimerId] = nextTimer++;
+    this[kTimerResource] = resource('Immediate', this);
+    immediates.set(this[kTimerId], this);
+  }
+  ref() { this[kRefed] = true; return this; }
+  unref() { this[kRefed] = false; return this; }
+  hasRef() { return !!this[kRefed]; }
+  [Symbol.dispose]() { clearImmediate(this); }
+}
+function unenroll(timer) {
+  timers.delete(timer[kTimerId]);
+  if (!timer._destroyed) { timer._destroyed = true; timer[kTimerResource].emitDestroy(); }
+  timer._idleTimeout = -1;
+}
+function clearTimeout(timer) {
+  if (timer?._onTimeout) { timer._onTimeout = null; unenroll(timer); return; }
+  if (typeof timer === 'number' || typeof timer === 'string') {
+    const instance = timers.get(Number(timer));
+    if (instance !== undefined) { instance._onTimeout = null; unenroll(instance); }
   }
 }
+function clearImmediate(immediate) {
+  if (!(immediate instanceof Immediate) || immediate._destroyed) return;
+  immediate._destroyed = true; immediate._onImmediate = null;
+  immediates.delete(immediate[kTimerId]);
+  immediate[kTimerResource].emitDestroy();
+}
+function validateCallback(callback) {
+  if (typeof callback !== 'function') throw new (internalRequire('internal/path_events/support').codes.ERR_INVALID_ARG_TYPE)('callback', 'function', callback);
+}
 const timerAPI = {
-  setTimeout: (fn, delay, ...args) => setTimer(fn, delay, args, false),
-  setInterval: (fn, delay, ...args) => setTimer(fn, delay, args, true),
-  setImmediate: (fn, ...args) => { checkCallback(fn); return new Timeout(fn, 0, args, false, true); },
-  clearTimeout: clearTimer, clearInterval: clearTimer, clearImmediate: clearTimer,
+  setTimeout(callback, after, ...args) { validateCallback(callback); return new Timeout(callback, after, args.length ? args : undefined, false); },
+  clearTimeout,
+  setImmediate(callback, ...args) { validateCallback(callback); return new Immediate(callback, args.length ? args : undefined); },
+  clearImmediate,
+  setInterval(callback, repeat, ...args) { validateCallback(callback); return new Timeout(callback, repeat, args.length ? args : undefined, true); },
+  // Intervals are Timeouts: either clear function clears either.
+  clearInterval(timer) { clearTimeout(timer); },
 };
-Object.assign(globalThis, timerAPI);
+Object.defineProperty(timerAPI, 'promises', {
+  get() { return internalRequire('timers/promises'); }, enumerable: true, configurable: true,
+});
+for (const name of ['setTimeout', 'clearTimeout', 'setImmediate', 'clearImmediate', 'setInterval', 'clearInterval']) globalThis[name] = timerAPI[name];
 define('timers', module => { module.exports = timerAPI; });
 for (const name of ['setTimeout', 'setImmediate']) {
   Object.defineProperty(timerAPI[name], Symbol.for('nodejs.util.promisify.custom'), {
@@ -365,7 +424,15 @@ for (const name of ['setTimeout', 'setImmediate']) {
 }
 const Buffer = internalRequire('buffer').Buffer;
 host.Buffer = Buffer;
-globalThis.Buffer = Buffer;
+// process and Buffer are accessors on Node's global object (the hook for an
+// ESM deprecation path); assigning replaces the value the getter returns.
+function defineGlobalAccessor(name, initial) {
+  let current = initial;
+  Object.defineProperty(globalThis, name, {
+    get() { return current; }, set(value) { current = value; }, enumerable: false, configurable: true,
+  });
+}
+defineGlobalAccessor('Buffer', Buffer);
 globalThis.global = globalThis;
 globalThis.atob = internalRequire('buffer').atob;
 globalThis.btoa = internalRequire('buffer').btoa;
@@ -417,15 +484,15 @@ function output(fd) {
   } };
 }
 host.stdout = output(1); host.stderr = output(2);
-// Text written to a descriptor synchronously, with no stream (internal/stdio
-// direct). False when nothing could be written; a failure after a partial
-// write drops the rest, as a stream write that console ignores would.
+// Text written to a descriptor now, with no stream (internal/stdio direct):
+// true when all of it was written, false when none of it was, and the bytes
+// left over when a write stopped part way (a full nonblocking pipe, or an error).
 host.writeText = (fd, text) => {
   const bytes = Buffer.from(text);
   let offset = 0;
   while (offset < bytes.length) {
     const count = rawOS.write(fd, bytes.buffer, bytes.byteOffset + offset, bytes.length - offset);
-    if (count <= 0) return offset !== 0;
+    if (count <= 0) return offset === 0 ? false : bytes.subarray(offset);
     offset += count;
   }
   return true;
@@ -433,8 +500,13 @@ host.writeText = (fd, text) => {
 host.writeStartupDiagnostic = host.stderr.write;
 globalThis.process = { platform: host.platform, env: host.env, nextTick: host.nextTick, emitWarning: value => host.stderr.write(String(value) + '\n') };
 const EventEmitter = internalRequire('events');
-const process = new EventEmitter();
-globalThis.process = process;
+// Like Node's, process is an instance of a constructor named process whose
+// prototype inherits from EventEmitter.prototype.
+const ProcessConstructor = { process: function () {} }.process;
+Object.setPrototypeOf(ProcessConstructor.prototype, EventEmitter.prototype);
+const process = Object.create(ProcessConstructor.prototype);
+EventEmitter.call(process);
+defineGlobalAccessor('process', process);
 let startTime = native.runtimeStartTime;
 const performanceMilestones = {
   nodeStart: 0, environment: native.environmentTime - startTime,
@@ -455,20 +527,98 @@ host.performanceAddLoopListener = callback => {
   loopListeners.add(callback);
   return () => loopListeners.delete(callback);
 };
+// The Node release whose API this runtime implements.
+const nodeVersion = '24.22.1';
+// Versions of what this binary runs and links, as Node reports its own: node
+// first, the rest by name. The libraries answer for themselves; the bundled
+// JavaScript and vendored C sources carry the version of their pinned copy.
+function componentVersions() {
+  const [uv, openssl, zlib, brotli, zstd, nghttp2, sqlite] = native.osNative('componentVersions', []);
+  const versions = {
+    node: nodeVersion, acorn: '8.18.0', amaro: '1.1.11',
+    brotli: `${brotli >>> 24}.${(brotli >>> 12) & 0xfff}.${brotli & 0xfff}`,
+    llhttp: '9.4.3', napi: '10', nghttp2, openssl, quickjs: '2026-06-04', silkjsruntime: '0.1.0', sqlite,
+    uv, uvwasi: '0.0.23', zlib, zstd,
+  };
+  if (zlib === undefined) delete versions.zlib;
+  return versions;
+}
+// process.config describes the build the way Node's config.gypi does, for the
+// variables code inspects to learn what the binary supports. Frozen like Node's.
+function buildConfig() {
+  const freeze = value => {
+    if (value !== null && typeof value === 'object') { for (const key of Object.keys(value)) freeze(value[key]); Object.freeze(value); }
+    return value;
+  };
+  return freeze({
+    target_defaults: {
+      cflags: [], default_configuration: native.debugBuild ? 'Debug' : 'Release', defines: [], include_dirs: [], libraries: [],
+    },
+    variables: {
+      asan: 0, ubsan: 0, napi_build_version: '10', node_builtin_shareable_builtins: [], node_shared: false,
+      node_shared_openssl: false, node_shared_sqlite: false, node_shared_zstd: false, node_use_amaro: true,
+      node_use_openssl: true, node_without_node_options: false, node_quic: false, shlib_suffix: host.platform === 'darwin' ? 'dylib' : 'so',
+      single_executable_application: true, icu_small: false, v8_enable_i18n_support: 1, v8_enable_inspector: 1,
+    },
+  });
+}
 Object.assign(process, {
   argv: native.argv.slice(), argv0: native.argv[0], execArgv: [], execPath: native.osNative('execPath', []),
-  version: 'v24.0.0', versions: { node: '24.0.0', silkjsruntime: '0.1.0', quickjs: '2026-06-04', amaro: '1.1.11' },
+  version: 'v' + nodeVersion, versions: componentVersions(), config: buildConfig(),
   platform: host.platform, arch: host.arch, env: host.env, pid: rawOS.getpid(),
-  release: { name: 'silkjsruntime' }, stdout: host.stdout, stderr: host.stderr,
+  release: {
+    name: 'node', lts: 'Krypton',
+    sourceUrl: `https://nodejs.org/download/release/v${nodeVersion}/node-v${nodeVersion}.tar.gz`,
+    headersUrl: `https://nodejs.org/download/release/v${nodeVersion}/node-v${nodeVersion}-headers.tar.gz`,
+  }, stdout: host.stdout, stderr: host.stderr,
   cwd: host.cwd, chdir(path) { const code = rawOS.chdir(path); if (code < 0) throw systemError(code, 'chdir', path); },
   nextTick: host.nextTick, uptime: () => (native.now() - startTime) / 1000,
   hrtime(previous) { const nanoseconds = native.nowNanoseconds(); const value = [Number(nanoseconds / 1000000000n), Number(nanoseconds % 1000000000n)]; if (previous !== undefined) { if (!Array.isArray(previous)) throw Object.assign(new TypeError('The time argument must be an Array'), { code: 'ERR_INVALID_ARG_TYPE' }); if (previous.length !== 2) throw Object.assign(new RangeError('The time argument must contain two entries'), { code: 'ERR_OUT_OF_RANGE' }); value[0] -= previous[0]; value[1] -= previous[1]; if (value[1] < 0) { value[0]--; value[1] += 1000000000; } } return value; },
   emitWarning: internalRequire('internal/startup_controls').emitWarning,
   setUncaughtExceptionCaptureCallback: internalRequire('internal/startup_controls').setUncaughtExceptionCaptureCallback,
   hasUncaughtExceptionCaptureCallback: internalRequire('internal/startup_controls').hasUncaughtExceptionCaptureCallback,
-  exit(code) { if (code !== undefined) process.exitCode = code; if (!process._exiting) { process._exiting = true; process.emit('exit', Number(process.exitCode) || 0); } internalRequire('internal/compile_cache').flushCompileCache(); rawStd.exit(Number(process.exitCode) || 0); },
-  kill(pid, signal = 'SIGTERM') { const number = typeof signal === 'string' ? rawOS[signal] : signal; if (number === undefined) throw Object.assign(new TypeError('Unknown signal: ' + signal), { code: 'ERR_UNKNOWN_SIGNAL' }); const code = rawOS.kill(pid, number); if (code < 0) throw systemError(code, 'kill'); return true; }
+  exit(code) {
+    if (code !== undefined) process.exitCode = code;
+    if (!process._exiting) { process._exiting = true; process.emit('exit', Number(process.exitCode) || 0); }
+    process.reallyExit(Number(process.exitCode) || 0);
+  },
+  // What process.exit ends with; replaceable, as in Node.
+  reallyExit(code) { internalRequire('internal/compile_cache').flushCompileCache(); rawStd.exit(code); },
+  kill(pid, signal) {
+    if (pid != (pid | 0)) throw new (internalRequire('internal/path_events/support').codes.ERR_INVALID_ARG_TYPE)('pid', 'number', pid);
+    let number = signal;
+    if (signal !== (signal | 0)) {
+      signal ||= 'SIGTERM';
+      number = internalRequire('os').constants.signals[signal];
+      if (number === undefined) throw Object.assign(new TypeError('Unknown signal: ' + signal), { code: 'ERR_UNKNOWN_SIGNAL' });
+    }
+    const code = rawOS.kill(pid, number);
+    if (code < 0) {
+      const name = errnoNames.get(Math.abs(code)) || 'UNKNOWN';
+      throw Object.assign(new Error('kill ' + name), { errno: -Math.abs(code), code: name, syscall: 'kill' });
+    }
+    return true;
+  },
+  // Formats like console.log and writes to fd 2 at once: no streams, ticks or console.
+  _rawDebug(...args) { host.writeText(2, internalRequire('util').format(...args) + '\n'); },
 });
+// exitCode accepts an integer, a string holding one, undefined or null (Node's validation).
+{
+  let exitCode;
+  Object.defineProperty(process, 'exitCode', {
+    get() { return exitCode; },
+    set(code) {
+      if (code !== null && code !== undefined) {
+        let value = code;
+        if (typeof code === 'string' && code !== '' && Number.isInteger(+code)) value = +code;
+        internalRequire('internal/path_events/support').validateInteger(value, 'code');
+      }
+      exitCode = code;
+    },
+    enumerable: true, configurable: false,
+  });
+}
+Object.defineProperty(process, 'config', { writable: false });
 Object.defineProperty(process, 'allowedNodeEnvironmentFlags', {
   configurable: true, enumerable: true,
   get() {
@@ -494,9 +644,9 @@ host.activeResources = () => {
   const seen = new Set();
   for (const collection of [timers.values(), immediates.values(), executingTimers]) {
     for (const timer of collection) {
-      if (!timer._destroyed && timer._refed && !seen.has(timer)) {
+      if (!timer._destroyed && timer[kRefed] && !seen.has(timer)) {
         seen.add(timer);
-        names.push(timer._immediate ? 'Immediate' : 'Timeout');
+        names.push(timer instanceof Immediate ? 'Immediate' : 'Timeout');
       }
     }
   }
@@ -521,7 +671,8 @@ process.moduleLoadList = moduleLoadList;
 define('process', module => { module.exports = process; });
 internalRequire('internal/napi').install(host, process);
 const eventGlobals = internalRequire('internal/path_events/event_target');
-for (const name of ['Event', 'CustomEvent', 'EventTarget', 'AbortController', 'AbortSignal', 'DOMException']) globalThis[name] = eventGlobals[name];
+for (const name of ['Event', 'CustomEvent', 'EventTarget', 'AbortController', 'AbortSignal', 'DOMException'])
+  Object.defineProperty(globalThis, name, { value: eventGlobals[name], writable: true, enumerable: false, configurable: true });
 const asyncFS = internalRequire('internal/fs_async')(native);
 host.submitIO = (operation, args, callback, requestKind) => {
   const scope = resource(requestKind === 1 ? 'FSREQPROMISE' : requestKind === 2 ? 'FILEHANDLECLOSEREQ' : 'FSREQCALLBACK');
@@ -569,11 +720,11 @@ for (const name of ['stdout', 'stderr']) Object.defineProperty(host, name, {
 });
 const webGlobals = internalRequire('internal/web/index');
 webGlobals.install(globalThis);
-webGlobals.defineLazy(globalThis, 'console', () => ({ console: internalRequire('console') }));
+webGlobals.defineLazy(globalThis, 'console', () => ({ console: internalRequire('console') }), false);
 // Register the trusted dispatcher before preloads or any other guest code can
 // connect to this isolate (including through a parent Worker inspector).
 const inspectorBackend = internalRequire('internal/inspector');
-webGlobals.defineLazy(globalThis, 'crypto', () => ({ crypto: internalRequire('crypto').webcrypto }));
+webGlobals.defineLazy(globalThis, 'crypto', () => ({ crypto: internalRequire('crypto').webcrypto }), true);
 for (const name of ['Crypto', 'SubtleCrypto', 'CryptoKey']) {
   Object.defineProperty(globalThis, name, {
     get() {
@@ -588,7 +739,7 @@ for (const name of ['Crypto', 'SubtleCrypto', 'CryptoKey']) {
 {
   const loadPerformance = () => internalRequire('perf_hooks');
   for (const name of ['performance', 'Performance', 'PerformanceEntry', 'PerformanceMark', 'PerformanceMeasure', 'PerformanceObserver', 'PerformanceObserverEntryList', 'PerformanceResourceTiming'])
-    webGlobals.defineLazy(globalThis, name, loadPerformance);
+    webGlobals.defineLazy(globalThis, name, loadPerformance, name === 'performance');
 }
 host.path = internalRequire('path');
 const publicBuiltinNames = [...factories.keys()].filter(name => !name.startsWith('internal/'));
@@ -832,37 +983,10 @@ function runWorker() {
   }, !evaluate || moduleEval);
 }
 function startRepl() {
-  if (process.stdout.isTTY) console.log('Welcome to SilkJS Runtime.\nType ".help" for more information.');
+  console.log('Welcome to SilkJS Runtime.\nType ".help" for more information.');
   return internalRequire('internal/repl').createInternalRepl(process.env, {
     input: process.stdin, output: process.stdout, terminal: !!process.stdout.isTTY, preview: !!process.stdout.isTTY,
   }, error => { if (error) console.error('REPL history:', error.message); });
-}
-function runTests(options, files, reporterNames, destinations) {
-  const reporters = internalRequire('test/reporters');
-  if (!reporterNames.length) reporterNames.push('spec');
-  if (!destinations.length && reporterNames.length === 1) destinations.push('stdout');
-  if (reporterNames.length !== destinations.length) throw new Error('Each test reporter requires a destination');
-  const outputs = reporterNames.map((name, index) => {
-    let reporter = reporters[name];
-    if (!reporter) {
-      reporter = loader.requireFor(host.path.join(host.cwd(), '[test-reporter]'))(name);
-      reporter = reporter.default || reporter;
-    } else if (name === 'spec' || name === 'lcov') reporter = reporter();
-    const destination = destinations[index];
-    return { reporter, output: destination === 'stdout' ? process.stdout : destination === 'stderr' ? process.stderr : internalRequire('fs').createWriteStream(destination) };
-  });
-  const stream = internalRequire('test').run({ ...options, ...(files.length ? { files } : {}) });
-  stream.on('test:summary', summary => { if (!summary.success) process.exitCode = 1; });
-  const fail = error => { console.error(error); process.exitCode = 1; };
-  stream.on('error', fail);
-  for (const { reporter, output } of outputs) {
-    const branch = new (internalRequire('stream').PassThrough)({ objectMode: true });
-    stream.pipe(branch);
-    const formatted = branch.compose(reporter);
-    formatted.on('error', fail);
-    output.on('error', fail);
-    formatted.pipe(output, { end: output !== process.stdout && output !== process.stderr });
-  }
 }
 function installCommonJSInputGlobals(filename, id) {
   const module = new loader.Module(id);
@@ -1005,11 +1129,16 @@ function run() {
     if (arg === '-c' || arg === '--check') { check = true; record(arg); continue; }
     if (arg === '--test') { testMode = true; record(arg); continue; }
     if (arg === '--test-only') { testOptions.only = true; record(arg); continue; }
-    if (arg.startsWith('--test-')) {
+    if (arg === '--test-force-exit') { testOptions.forceExit = true; record(arg); continue; }
+    if (arg === '--test-randomize') { testOptions.randomize = true; record(arg); continue; }
+    if (arg.startsWith('--test-') || arg.startsWith('--experimental-test-tag-filter') || arg.startsWith('--experimental-test-isolation')) {
       const separator = arg.indexOf('=');
       const name = separator < 0 ? arg : arg.slice(0, separator);
       const option = {
         '--test-concurrency': 'concurrency', '--test-timeout': 'timeout', '--test-isolation': 'isolation',
+        '--experimental-test-isolation': 'isolation', '--test-random-seed': 'randomSeed',
+        '--test-rerun-failures': 'rerunFailuresFilePath', '--test-global-setup': 'globalSetupPath',
+        '--experimental-test-tag-filter': 'testTagFilters',
         '--test-name-pattern': 'testNamePatterns', '--test-skip-pattern': 'testSkipPatterns',
         '--test-shard': 'shard', '--test-reporter': 'reporter', '--test-reporter-destination': 'destination',
         '--test-coverage-include': 'coverageIncludeGlobs', '--test-coverage-exclude': 'coverageExcludeGlobs',
@@ -1017,11 +1146,11 @@ function run() {
       }[name];
       if (!option) return cliError('bad option: ' + arg);
       const value = separator < 0 ? args[++index] : arg.slice(separator + 1);
-      if (value === undefined) return cliError(name + ' requires an argument');
+      if (value === undefined || value === '') return cliError((value === '' && separator >= 0 ? arg : name) + ' requires an argument');
       record(arg, ...(separator < 0 ? [value] : []));
       if (option === 'reporter') reporterNames.push(value);
       else if (option === 'destination') destinations.push(value);
-      else if (option === 'testNamePatterns' || option === 'testSkipPatterns') (testOptions[option] ||= []).push(value);
+      else if (option === 'testNamePatterns' || option === 'testSkipPatterns' || option === 'testTagFilters') (testOptions[option] ||= []).push(value);
       else if (option === 'coverageIncludeGlobs' || option === 'coverageExcludeGlobs') (testOptions[option] ||= []).push(value);
       else if (option === 'lineCoverage' || option === 'branchCoverage' || option === 'functionCoverage') {
         const threshold = Number(value);
@@ -1031,7 +1160,7 @@ function run() {
       }
       else if (option === 'shard') {
         const [index, total] = value.split('/').map(Number); testOptions.shard = { index, total };
-      } else testOptions[option] = option === 'concurrency' || option === 'timeout' ? Number(value) : value;
+      } else testOptions[option] = option === 'concurrency' || option === 'timeout' || option === 'randomSeed' ? Number(value) : value;
       continue;
     }
     if (arg === '-v' || arg === '--version') { host.stdout.write('silkjsruntime 0.1.0 (QuickJS; Node 24 target)\n'); return; }
@@ -1140,6 +1269,7 @@ Environment:
     });
   }
   host.testCoverageOptions = testOptions;
+  host.testReporters = { names: reporterNames, destinations };
   if (testOptions.coverage && !testMode && !check) {
     host.testCoverageStart();
     host.testCoveragePrestarted = true;
@@ -1156,9 +1286,16 @@ Environment:
     return;
   }
   if (testMode) {
-    return runTests(testOptions, args.slice(index), reporterNames, destinations);
+    return internalRequire('internal/main/test_runner').runTestRunner(testOptions, args.slice(index), reporterNames, destinations);
   }
-  if (expression === undefined && filename === undefined && (interactive || process.stdin.isTTY)) return startRepl();
+  if (expression === undefined && filename === undefined && (interactive || process.stdin.isTTY)) {
+    if (inputTypeSet) {
+      console.error('Cannot specify --input-type for REPL');
+      process.exitCode = 9;
+      return;
+    }
+    return startRepl();
+  }
   if (expression !== undefined) {
     const name = host.path.join(host.cwd(), '[eval]');
     expression = prepareInput(expression, name, inputType, inputTypeSet);
@@ -1201,24 +1338,40 @@ Environment:
 }
 function referencedWork() {
   if (native.hasPendingIO()) return true;
-  for (const timer of timers.values()) if (timer._refed && !timer._destroyed) return true;
-  for (const timer of immediates.values()) if (timer._refed && !timer._destroyed) return true;
+  // Most I/O-bound turns have no timers: skip creating the iterators.
+  if (timers.size !== 0) for (const timer of timers.values()) if (timer[kRefed] && !timer._destroyed) return true;
+  if (immediates.size !== 0) for (const timer of immediates.values()) if (timer[kRefed] && !timer._destroyed) return true;
   return false;
 }
-function fireTimer(timer, collection) {
-  collection.delete(timer._id);
-  if (timer._repeat) {
-    timer._due = native.now() + timer._delay;
-    collection.set(timer._id, timer);
-  }
+function fireTimeout(timer, start) {
+  const id = timer[kTimerId];
+  timers.delete(id);
+  if (!timer._onTimeout) { unenroll(timer); return; }
   executingTimers.push(timer);
-  try { invokeResource(timer._resource, timer._callback, timer, timer._args, false); }
+  try { invokeResource(timer[kTimerResource], timer._onTimeout, timer, timer._timerArgs || [], false); }
   finally {
     executingTimers.pop();
-    if (!collection.has(timer._id)) {
+    if (timer._repeat && timer._idleTimeout !== -1 && !timer._destroyed) {
+      timer._idleTimeout = timer._repeat;
+      schedule(timer, start);
+    } else if (!timers.has(id) && !timer._destroyed) {
+      // Not refreshed by its callback: done.
       timer._destroyed = true;
-      timer._resource.emitDestroy();
+      timer[kTimerResource].emitDestroy();
     }
+  }
+  checkpoint();
+}
+function fireImmediate(immediate) {
+  immediates.delete(immediate[kTimerId]);
+  immediate._destroyed = true;
+  const callback = immediate._onImmediate;
+  executingTimers.push(immediate);
+  try { invokeResource(immediate[kTimerResource], callback, immediate, immediate._argv || [], false); }
+  finally {
+    executingTimers.pop();
+    immediate._onImmediate = null;
+    immediate[kTimerResource].emitDestroy();
   }
   checkpoint();
 }
@@ -1239,7 +1392,7 @@ function pollTimeout(pendingPromise) {
   const referenced = referencedWork();
   if (!referenced && pendingPromise === undefined) return 0;
   let due = Infinity;
-  for (const timer of timers.values()) if (!timer._destroyed && timer._due < due) due = timer._due;
+  if (timers.size !== 0) for (const timer of timers.values()) if (!timer._destroyed && timer[kDue] < due) due = timer[kDue];
   // A hook may await an unreferenced timer or an externally settled promise.
   // Keep nested waits interruptible without emitting main-loop lifecycle events.
   if (!referenced && due === Infinity) return 1;
@@ -1251,18 +1404,18 @@ function loopTurn(pendingPromise) {
   const now = native.now();
   // Only the due timers are ordered; most turns have none.
   let due;
-  for (const timer of timers.values()) if (!timer._destroyed && timer._due <= now) (due ||= []).push(timer);
+  if (timers.size !== 0) for (const timer of timers.values()) if (!timer._destroyed && timer[kDue] <= now) (due ||= []).push(timer);
   if (due !== undefined) {
-    if (due.length > 1) due.sort((a, b) => a._due - b._due || a._id - b._id);
-    for (const timer of due) if (!timer._destroyed && timer._due <= now) fireTimer(timer, timers);
+    if (due.length > 1) due.sort((a, b) => a[kDue] - b[kDue] || a[kTimerId] - b[kTimerId]);
+    for (const timer of due) if (!timer._destroyed && timer[kDue] <= now && timers.has(timer[kTimerId])) fireTimeout(timer, now);
   }
   native.pollIO(pollTimeout(pendingPromise));
   pollWorkers();
   checkpoint();
-  for (const listener of loopListeners) listener();
+  if (loopListeners.size !== 0) for (const listener of loopListeners) listener();
   if (immediates.size !== 0) {
-    for (const timer of [...immediates.values()]) {
-      if (!timer._destroyed) fireTimer(timer, immediates);
+    for (const immediate of [...immediates.values()]) {
+      if (!immediate._destroyed) fireImmediate(immediate);
     }
   }
 }
