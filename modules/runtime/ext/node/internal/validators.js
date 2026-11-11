@@ -144,6 +144,13 @@ function getValidatedPath(value, name = 'path') {
   return path;
 }
 
+// Node wraps its validators in hideStackFrames(), whose callers inside other
+// hidden frames use fn.withoutStackTrace.
+for (const fn of [validateString, validateBoolean, validateFunction, validateNumber, validateInteger, validateInt32,
+  validateUint32, validateObject, validateArray, validateOneOf, validateAbortSignal, validateBuffer]) {
+  fn.withoutStackTrace = fn;
+}
+
 module.exports = {
   codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_MISSING_ARGS, ERR_OUT_OF_RANGE },
   codedError, unknownSignal,
