@@ -28,15 +28,18 @@ function applyOption(arg) {
   return true;
 }
 function isPowerOfTwo(value) { return value > 0 && (value & (value - 1)) === 0; }
-// The checks Node's PerProcessOptions and EnvironmentOptions run after parsing.
+// The checks Node's PerProcessOptions and EnvironmentOptions run after
+// parsing. Like Node, every failed check is reported, one per line.
 function validate() {
-  if (state.get('--use-openssl-ca') && state.get('--use-bundled-ca')) return 'either --use-openssl-ca or --use-bundled-ca can be used, not both';
+  const errors = [];
+  if (state.get('--use-openssl-ca') && state.get('--use-bundled-ca')) errors.push('either --use-openssl-ca or --use-bundled-ca can be used, not both');
   const heap = state.has('--secure-heap') ? Number(state.get('--secure-heap')) : 0;
-  if (heap && !isPowerOfTwo(heap)) return '--secure-heap must be a power of 2';
+  if (heap && !isPowerOfTwo(heap)) errors.push('--secure-heap must be a power of 2');
   const heapMin = state.has('--secure-heap-min') ? Number(state.get('--secure-heap-min')) : 2;
-  if (heap && !isPowerOfTwo(heapMin)) return '--secure-heap-min must be a power of 2';
-  if (state.get('--tls-min-v1.3') && state.get('--tls-max-v1.2')) return 'either --tls-min-v1.3 or --tls-max-v1.2 can be used, not both';
-  if (state.get('--use-system-ca') && state.get('--use-openssl-ca')) return 'either --use-openssl-ca or --use-system-ca can be used, not both';
+  if (heap && !isPowerOfTwo(heapMin)) errors.push('--secure-heap-min must be a power of 2');
+  if (state.get('--tls-min-v1.3') && state.get('--tls-max-v1.2')) errors.push('either --tls-min-v1.3 or --tls-max-v1.2 can be used, not both');
+  if (state.get('--use-system-ca') && state.get('--use-openssl-ca')) errors.push('either --use-openssl-ca or --use-system-ca can be used, not both');
+  return errors;
 }
 const DEFAULT_CIPHER_LIST = 'TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-SHA256:DHE-RSA-AES128-SHA256:ECDHE-RSA-AES256-SHA384:DHE-RSA-AES256-SHA384:ECDHE-RSA-AES256-SHA256:DHE-RSA-AES256-SHA256:HIGH:!aNULL:!eNULL:!EXPORT:!DES:!RC4:!MD5:!PSK:!SRP:!CAMELLIA';
 function getOptionValue(name) {

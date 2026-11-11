@@ -634,7 +634,12 @@ let ciphers;
 function getCiphers() {
   if (ciphers) return ciphers;
   const context = native('context');
-  try { ciphers = [...new Set(native('cipherNames', context).trim().split('\n').map(name => name.toLowerCase()))]; }
+  // Node's GetCiphers also lists the TLSv1.3 suites a default context leaves
+  // disabled (the CCM ones); lib/tls.js lowercases, dedupes and sorts.
+  try {
+    const names = [...native('cipherNames', context).trim().split('\n'), 'TLS_AES_128_CCM_8_SHA256', 'TLS_AES_128_CCM_SHA256'];
+    ciphers = require('internal/util').filterDuplicateStrings(names, true);
+  }
   finally { native('release', context); }
   return ciphers;
 }

@@ -202,7 +202,16 @@ function cipherDetails(nameOrNid, keyLength, ivLength) {
 }
 // No secure heap is configured by this runtime. These are Node's disabled-heap
 // configuration values; used is queried from OpenSSL rather than estimated.
-function secureHeapUsed() { const total = 0, used = call('secureHeapUsed', []); return { total, used, utilization: used / total, min: 2 }; }
+// lib/internal/crypto/util.js secureHeapUsed over the heap that
+// --secure-heap sets up (InitCryptoOnce's CRYPTO_secure_malloc_init).
+function secureHeapUsed() {
+  const total = secureHeapOption('--secure-heap');
+  if (total === 0) return { total: 0, used: 0, utilization: 0, min: 0 };
+  const min = secureHeapOption('--secure-heap-min'), used = call('secureHeapUsed', []);
+  return { total, used, utilization: used / total, min };
+}
+function secureHeapOption(name) { return require('internal/options').getOptionValue(name); }
+if (secureHeapOption('--secure-heap')) call('secureHeapInit', [secureHeapOption('--secure-heap'), secureHeapOption('--secure-heap-min')]);
 function setEngine(id, flags) { name(id, 'id'); if (flags && typeof flags !== 'number') throw invalid('flags', 'a number'); flags = flags >>> 0; if (!call('setEngine', [id, flags || 65535])) throw error('ERR_CRYPTO_ENGINE_UNKNOWN', `Engine "${id}" was not found`); }
 function timingSafeEqual(a, b) { a = binary(a); b = binary(b); if (a.length !== b.length) throw error('ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH', 'Input buffers must have the same byte length', RangeError); return !!call('equal', [packed(a), packed(b)]); }
 // lib/internal/crypto/hash.js
@@ -839,8 +848,15 @@ function keyFromPrepared(prepared, type) {
   // as the EC PARAMETERS block `openssl ecparam -genkey` writes first.
   if (format === 'pem') data = skipPemParameters(data);
   const [structure, keyType] = keyStructure(format, prepared.type, data);
+  let importFormat = format.toUpperCase(), rsaPublicKey = 0;
+  if (type === 'public' && keyType === 'RSA') {
+    // Node reads a public PKCS#1 key with d2i_RSAPublicKey (PEM: the first
+    // RSA PUBLIC KEY block, PEM_read_bio_RSAPublicKey).
+    rsaPublicKey = 1;
+    if (format === 'pem') { data = pemBlock(data, 'RSA PUBLIC KEY'); importFormat = 'DER'; }
+  }
   let id;
-  try { id = call('keyImport', [packed(data), format.toUpperCase(), type === 'private' ? 1 : 0, packed(passphrase === undefined ? Buffer.alloc(0) : passphrase), passphrase === undefined ? 0 : 1, structure, keyType]); }
+  try { id = call('keyImport', [packed(data), importFormat, type === 'private' ? 1 : 0, packed(passphrase === undefined ? Buffer.alloc(0) : passphrase), passphrase === undefined ? 0 : 1, structure, keyType, rsaPublicKey]); }
   catch (e) { if (e.code === 'ERR_MISSING_PASSPHRASE') throw codes.ERR_MISSING_PASSPHRASE(); throw e; }
   return newKeyObject(type, id);
 }
@@ -852,6 +868,10 @@ function keyStructure(format, type, data) {
   if (format === 'der') return kDerStructures[type] ?? ['', ''];
   const label = /-----BEGIN ([A-Z0-9 ]+)-----/.exec(data.toString('latin1'));
   return (label && kPemStructures[label[1]]) ?? ['', ''];
+}
+function pemBlock(data, label) {
+  const block = new RegExp(`-----BEGIN ${label}-----([\\s\\S]*?)-----END ${label}-----`).exec(data.toString('latin1'));
+  return block ? Buffer.from(block[1].replace(/\s+/g, ''), 'base64') : Buffer.alloc(0);
 }
 function skipPemParameters(data) {
   const text = data.toString('latin1');
