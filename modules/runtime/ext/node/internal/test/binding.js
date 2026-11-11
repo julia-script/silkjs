@@ -16,11 +16,15 @@ process.emitWarning(
 const net = () => require('internal/net/binding');
 const kBindings = {
   __proto__: null,
+  async_wrap: () => require('internal/async_wrap_binding'),
   buffer: () => require('internal/buffer_binding'),
+  constants: () => require('internal/constants_binding'),
   crypto: () => require('internal/crypto/binding'),
   http2: () => require('internal/http2/binding'),
   // node_http_parser.cc: HTTPParser, ConnectionsList, methods, allMethods.
   http_parser: () => require('internal/http/native-parser'),
+  performance: () => require('internal/performance_binding'),
+  trace_events: () => require('internal/trace_events_binding'),
   util: () => require('internal/util/binding'),
   // inspector_agent.cc: registerAsyncHook and the asyncTask* calls.
   inspector: () => require('internal/inspector_async'),
