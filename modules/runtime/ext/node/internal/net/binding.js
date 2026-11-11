@@ -383,8 +383,8 @@ class NativeStreamHandle extends StreamHandle {
   }
   _accept(id) { return new this.constructor(this.constructor.SOCKET, id); }
   // ConnectWrap: a node.net.native "connect" span lasts from the native connect to its result.
-  _connect(req, address, port) {
-    const traceId = traceEvents().begin(kNetTraceCategory, 'connect');
+  _connect(req, address, port, traceArgs) {
+    const traceId = traceEvents().begin(kNetTraceCategory, 'connect', traceArgs);
     const status = this._call('connect', address, port);
     if (status < 0) { traceEvents().end(kNetTraceCategory, 'connect', traceId); return status; }
     this._connectRequest = req;
@@ -450,7 +450,11 @@ class Pipe extends NativeStreamHandle {
     this._mode = 0;
   }
   bind(path) { return this._call('bind', path, 0, 0); }
-  connect(req, path) { return this._connect(req, path, 0); }
+  connect(req, path) {
+    // pipe_wrap's span names the path and whether it is a Linux abstract socket.
+    const abstract = path[0] === '\0';
+    return this._connect(req, path, 0, { path_type: abstract ? 'abstract socket' : 'file', pipe_path: abstract ? path.slice(1) : path });
+  }
   fchmod(mode) {
     return this._call('chmod', (mode & PipeConstants.UV_READABLE) !== 0, (mode & PipeConstants.UV_WRITABLE) !== 0);
   }
