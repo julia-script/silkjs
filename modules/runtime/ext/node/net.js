@@ -628,6 +628,8 @@ function Server(options, listener) {
   this._options = options;
   this._transport = null;
   this._connections = 0;
+  this._usingWorkers = false;
+  this._workers = [];
   this._listening = false;
   this._starting = false;
   this._closing = false;
@@ -795,16 +797,63 @@ Server.prototype.close = function(cb) {
   this._closing = true;
   this._removeAbort?.();
   this._detachTransport();
-  this._emitCloseIfDrained();
+  // Like Node: sockets sent to child processes count until every child reports them closed.
+  if (this._usingWorkers) {
+    let left = this._workers.length;
+    const onWorkerClose = () => {
+      if (--left !== 0) return;
+      this._connections = 0;
+      this._emitCloseIfDrained();
+    };
+    this._connections++;
+    for (let n = 0; n < this._workers.length; n++) this._workers[n].close(onWorkerClose);
+  } else this._emitCloseIfDrained();
   return this;
 };
+// Node's child_process send of a server socket without keepOpen: the socket stops counting
+// as one of this server's connections (its child's list counts it now).
+const detachedSockets = new WeakSet();
+Server.prototype._detachSocket = function(socket) {
+  if (detachedSockets.has(socket)) return;
+  detachedSockets.add(socket);
+  this._connections--;
+  // _destroy counts a socket closed only for the server it still belongs to.
+  socket._server = null;
+};
+// Node's hook for child_process: a list of the sockets this server sent to one child.
+Server.prototype._setupWorker = function(socketList) {
+  this._usingWorkers = true;
+  this._workers.push(socketList);
+  socketList.once('exit', socketList => {
+    const index = this._workers.indexOf(socketList);
+    this._workers.splice(index, 1);
+  });
+};
+// Node's server._handle: the listening handle while the server has one, null otherwise.
+Object.defineProperty(Server.prototype, '_handle', {
+  get() { return this._transport; }, set(value) { this._transport = value; }, configurable: true,
+});
 Server.prototype.address = function() { return this._listening ? this._transport.address() : null; };
 // Like Node: with captureRejections, a rejected 'connection' listener destroys that socket.
 Server.prototype[EventEmitter.captureRejectionSymbol] = function(err, event, sock) {
   if (event === 'connection') sock.destroy(err);
   else this.emit('error', err);
 };
-Server.prototype.getConnections = function(cb) { validateFunction(cb, 'cb'); process.nextTick(cb, null, this._connections); return this; };
+Server.prototype.getConnections = function(cb) {
+  validateFunction(cb, 'cb');
+  const end = (err, connections) => process.nextTick(cb, err, connections);
+  if (!this._usingWorkers) { end(null, this._connections); return this; }
+  // Like Node: the server's own connections plus each child's count.
+  let left = this._workers.length;
+  let total = this._connections;
+  const oncount = (err, count) => {
+    if (err) { left = -1; return end(err); }
+    total += count;
+    if (--left === 0) return end(null, total);
+  };
+  for (let n = 0; n < this._workers.length; n++) this._workers[n].getConnections(oncount);
+  return this;
+};
 Server.prototype.ref = function() { this._unrefed = false; this._transport?.ref(); return this; };
 Server.prototype.unref = function() { this._unrefed = true; this._transport?.unref(); return this; };
 Object.defineProperty(Server.prototype, 'listening', { get() { return this._listening; } });
