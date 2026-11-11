@@ -354,6 +354,8 @@ function createLoader(host, builtins) {
 
   // Node's segment rules: ".", "..", "node_modules" (and their percent forms) are
   // invalid; an empty segment ("//", a leading or trailing "/") is only deprecated.
+  // Both expressions are Node.js v24's (lib/internal/modules/esm/resolve.js, MIT license,
+  // Copyright Node.js contributors).
   const invalidSegmentRegEx = /(^|\\|\/)((\.|%2e)(\.|%2e)?|(n|%6e|%4e)(o|%6f|%4f)(d|%64|%44)(e|%65|%45)(_|%5f)(m|%6d|%4d)(o|%6f|%4f)(d|%64|%44)(u|%75|%55)(l|%6c|%4c)(e|%65|%45)(s|%73|%53))?(\\|\/|$)/i;
   const deprecatedInvalidSegmentRegEx = /(^|\\|\/)((\.|%2e)(\.|%2e)?|(n|%6e|%4e)(o|%6f|%4f)(d|%64|%44)(e|%65|%45)(_|%5f)(m|%6d|%4d)(o|%6f|%4f)(d|%64|%44)(u|%75|%55)(l|%6c|%4c)(e|%65|%45)(s|%73|%53))(\\|\/|$)/i;
   function segmentDeprecation(target, request, key, pkg, internal, parent, isTarget) {
@@ -1364,8 +1366,41 @@ function createLoader(host, builtins) {
   }
   // An import request's attributes against what its module turned out to be: each request
   // is checked, also for a module an earlier request loaded.
+  // Node's hint when import fails where require would have found a file.
+  function commonJSHint(error, specifier, parent) {
+    let found;
+    try {
+      if (specifier.startsWith('file://')) specifier = builtins.get('url').fileURLToPath(specifier);
+      const from = parent.startsWith('file:') ? builtins.get('url').fileURLToPath(parent) : parent;
+      if (!path.isAbsolute(from)) return;
+      found = resolve(specifier, from, 'require').filename;
+      if (!path.isAbsolute(found)) return;
+      if (/^\.\.?(?:\/|$)/.test(specifier)) {
+        // Relative between URL paths, so the hint is itself a valid specifier.
+        const { pathToFileURL } = builtins.get('url');
+        const parentURL = parent.startsWith('file:') ? parent : pathToFileURL(parent).href;
+        found = path.posix.relative(parentURL.slice('file://'.length, parentURL.lastIndexOf('/')), pathToFileURL(found).pathname);
+        if (!found.startsWith('../')) found = `./${found}`;
+      } else if (!path.isAbsolute(specifier)) {
+        const slash = specifier.indexOf('/');
+        const pkg = slash === -1 ? specifier : specifier.slice(0, slash);
+        const needle = `${path.sep}node_modules${path.sep}${pkg}${path.sep}`;
+        const index = found.lastIndexOf(needle);
+        found = index === -1 ? fileURL(found) : pkg + '/' + found.slice(index + needle.length).split(path.sep).map(encodeURIComponent).join('/');
+      }
+    } catch { return; }
+    if (found && found !== specifier) error.message += `\nDid you mean to import ${JSON.stringify(found)}?`;
+  }
+
   function resolveImport(specifier, parent, attributes) {
-    const resolved = resolve(specifier, parent, 'import', attributes);
+    let resolved;
+    try { resolved = resolve(specifier, parent, 'import', attributes); }
+    catch (error) {
+      if ((error?.code === 'ERR_MODULE_NOT_FOUND' || error?.code === 'ERR_UNSUPPORTED_DIR_IMPORT') && typeof specifier === 'string' && typeof parent === 'string') {
+        commonJSHint(error, specifier, parent);
+      }
+      throw error;
+    }
     if (resolved.format && !hooks.active()) validateAttributes(resolved.format, asURL(resolved.filename), attributes || {});
     return resolved;
   }
