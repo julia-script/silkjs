@@ -32,6 +32,7 @@ const kBindings = {
   tty_wrap: () => net().tty_wrap,
   stream_wrap: () => net().stream_wrap,
   js_stream: () => net().js_stream,
+  cares_wrap: () => require('internal/dns/cares_wrap'),
   udp_wrap: () => {
     const { UDP, UV_UDP_IPV6ONLY, UV_UDP_REUSEADDR, UV_UDP_REUSEPORT } = require('internal/dgram');
     return { UDP, constants: { UV_UDP_IPV6ONLY, UV_UDP_REUSEADDR, UV_UDP_REUSEPORT } };
