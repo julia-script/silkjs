@@ -59,7 +59,6 @@ import js_class_data as classes
 import native_stack { currentFrameAddress }
 import js_bytecode_validate as validation
 import js_bytecode as bytecodeFacts
-import js_bytecode { CodeFacts, BytecodeError }
 
 pub const BYTECODE: u32 = 1
 pub const ROM_DATA: u32 = 2
@@ -90,24 +89,23 @@ struct Reader<'a> {
   /// DEFER: this read's RuntimeState.deferredSources index plus one, once a body
   /// was left behind; 0 before.
   deferSource: u32,
-  /// Whether atoms and sources are a deferred source's, which finishDeferred
-  /// borrows, rather than this read's own.
+  /// Whether this is finishDeferred's read, whose source strings are its
+  /// deferred source's rather than its own.
   resumed: bool,
-  /// resumed: the source's ranges of RuntimeState.deferredAtoms and
-  /// deferredTexts, which no resumed read grows.
-  lentAtoms: *const u32, lentAtomCount: usize, lentTexts: *const ValueBits, lentTextCount: usize
+  /// DEFER: the atoms are the deferred source's range of
+  /// RuntimeState.deferredAtoms, atomCount entries from atomStart, each interned
+  /// on first use from the string that starts, among those at atomStrings, where
+  /// the table at atomTable says.
+  lazyAtoms: bool, atomStart: usize, atomCount: usize, atomTable: usize, atomStrings: usize,
+  /// resumed: the source's range of RuntimeState.deferredTexts, which no
+  /// resumed read grows.
+  lentTexts: *const ValueBits, lentTextCount: usize
 }
 /// Where a read that lends no table points.
 const NO_TABLE: [u32; 1] = [0]
-fn noAtoms()->*const u32 { return Pointer.fromRef<u32>(&NO_TABLE[0]) }
-fn noTexts()->*const ValueBits { return unsafe Intrinsic.pointerReinterpret<*const u32,*const ValueBits>(noAtoms()) }
+fn noTexts()->*const ValueBits { return unsafe Intrinsic.pointerReinterpret<*const u32,*const ValueBits>(Pointer.fromRef<u32>(&NO_TABLE[0])) }
 @inlineAlways
-fn atomCount<'a>(r:&Reader<'a>)->usize { if r.resumed { return r.lentAtomCount } return r.atoms.length() }
-@inlineAlways
-fn atomAt<'a>(r:&Reader<'a>,index:usize)->u32 {
-  if r.resumed { return unsafe Pointer.read<u32>(unsafe Pointer.at<u32>(unsafe Pointer.assumeMany<u32>(r.lentAtoms),index)) }
-  return r.atoms.get(index)
-}
+fn atomCount<'a>(r:&Reader<'a>)->usize { if r.lazyAtoms { return r.atomCount } return r.atoms.length() }
 fn reference(value: ValueBits) -> *mut HeapHeader {
   return match value { ValueBits.Object { reference } => reference
     ValueBits.FunctionBytecode { reference } => reference ValueBits.Module { reference } => reference
@@ -128,9 +126,10 @@ effect fn need<'a,'r,'m,S:EngineServices>(r:&Reader<'a>,engine:&mut Engine<'m,S>
 fn at<'a>(r:&Reader<'a>,index:usize) -> *const u8 {
   return Pointer.fromRef<u8>(&r.data[index])
 }
+@inlineAlways
 effect fn byte<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>)
   -> u8 !JsException ?&mut Allocator {
-  run need(&r.*,&mut engine,realm,1)
+  if r.position>=r.length { return run error(&mut engine,realm,b"read after the end of the buffer") }
   let value=r.data[r.position] r.position=r.position+1 return value
 }
 effect fn fixed<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>,count:usize)
@@ -139,7 +138,17 @@ effect fn fixed<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<
   while i<count { value=value|u64.shiftLeft(u8.toU64(r.data[r.position+i]),usize.toU64(i*8)) i=i+1 }
   r.position=r.position+count return value
 }
+@inlineAlways
 effect fn leb<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>)
+  -> u32 !JsException ?&mut Allocator {
+  // Most integers take one byte.
+  if r.position<r.length {
+    let b=r.data[r.position]
+    if b<128 { r.position=r.position+1 return u8.toU32(b) }
+  }
+  return run longLeb(&mut r,&mut engine,realm)
+}
+effect fn longLeb<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>)
   -> u32 !JsException ?&mut Allocator {
   let mut value:u32=0 let mut shift:u32=0
   while shift<35 {
@@ -177,18 +186,36 @@ fn duplicateAtom<'a, 'm,S:EngineServices>(engine:&mut Engine<'m,S>,realm: Realm<
   let anchor=() let rt=unsafe HeapCell.payload<RuntimeState,()>(&anchor,realm.runtime())
   return rt.atoms.duplicate(atom)
 }
-effect fn mapAtom<'a,'r,'m,S:EngineServices>(r:&Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>,index:u32)
-  ->u32 !JsException ?&mut Allocator {
+effect fn mapAtom<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>,index:u32)
+  ->u32 !OutOfMemoryError|JsException ?&mut Allocator {
   if (index&0x80000000)!=0 || index<r.firstAtom { return index }
   let offset=u32.toUsize(index-r.firstAtom)
   if offset>=atomCount(&r.*) { return run error(&mut engine,realm,b"invalid atom index") }
-  return atomAt(&r.*,offset)
+  if !r.lazyAtoms { return r.atoms.get(offset) }
+  let slot=r.atomStart+offset
+  let anchor=() let rt=unsafe HeapCell.payload<RuntimeState,()>(&anchor,realm.runtime())
+  let known=rt.deferredAtoms.get(slot) drop rt
+  if known!=0 { return known }
+  return run internAtom(&mut r,&mut engine,realm,offset)
 }
+/// DEFER: the first use of the atom at offset in the table.
+effect fn internAtom<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>,offset:usize)
+  ->u32 !OutOfMemoryError|JsException ?&mut Allocator {
+  let resume=r.position
+  r.position=r.atomStrings+u32.toUsize(wordAt(&r.*,r.atomTable+offset*4))
+  let text=run string(&mut r,&mut engine,realm)
+  r.position=resume
+  let mut anchor=() let rt=unsafe HeapCell.payloadMut<RuntimeState,()>(&mut anchor,realm.runtime())
+  let interned=run rt.atoms.internOwned(text)
+  rt.deferredAtoms.set(r.atomStart+offset,interned)
+  return interned
+}
+@inlineAlways
 effect fn atom<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>)
-  ->u32 !JsException ?&mut Allocator {
+  ->u32 !OutOfMemoryError|JsException ?&mut Allocator {
   let encoded=run leb(&mut r,&mut engine,realm)
   if (encoded&1)!=0 { return u32.shiftRight(encoded,1)|0x80000000 }
-  return run mapAtom(&r.*,&mut engine,realm,u32.shiftRight(encoded,1))
+  return run mapAtom(&mut r,&mut engine,realm,u32.shiftRight(encoded,1))
 }
 effect fn string<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>)
   ->ValueBits !OutOfMemoryError|JsException ?&mut Allocator {
@@ -216,6 +243,24 @@ effect fn header<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine
   let version=run byte(&mut r,&mut engine,realm)
   if version!=7 { return run error(&mut engine,realm,b"invalid binary object version (expected 7)") }
   let n=run count(&mut r,&mut engine,realm) run need(&r.*,&mut engine,realm,n)
+  if (r.flags&DEFER)!=0 {
+    // The strings stay in the bytes (internAtom): this read's deferred source
+    // holds its atoms from the start, none interned yet.
+    let stringBytes=u64.toUsize(run fixed(&mut r,&mut engine,realm,4))
+    run need(&r.*,&mut engine,realm,n*4+stringBytes)
+    r.lazyAtoms=true r.atomCount=n r.atomTable=r.position r.atomStrings=r.position+n*4
+    r.position=r.atomStrings+stringBytes
+    let mut anchor=() let state=unsafe HeapCell.payloadMut<RuntimeState,()>(&mut anchor,realm.runtime())
+    r.atomStart=state.deferredAtoms.length()
+    run state.deferredAtoms.reserve(n)
+    let mut filled:usize=0
+    while filled<n { run state.deferredAtoms.append(0) filled=filled+1 }
+    run state.deferredSources.append(DeferredSource { data:Pointer.fromRef<u8>(&r.data[0]),length:r.length,flags:r.flags,firstAtom:r.firstAtom,
+      atomStart:usize.toU32(r.atomStart),atomCount:usize.toU32(n),textStart:usize.toU32(state.deferredTexts.length()),textCount:0,
+      atomTable:usize.toU32(r.atomTable) })
+    r.deferSource=usize.toU32(state.deferredSources.length())
+    return ()
+  }
   run r.atoms.reserveExact(n) let mut i:usize=0
   while i<n {
     let text=run string(&mut r,&mut engine,realm)
@@ -428,6 +473,7 @@ fn casePrefix<'a>(r:&Reader<'a>,position:usize,available:usize)->bool {
 }
 effect fn readCode<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>,
   function:CellRef<FunctionBytecode>,length:usize)->() !OutOfMemoryError|JsException ?&mut Allocator {
+  if (r.flags&DEFER)!=0 { return run patchedCode(&mut r,&mut engine,realm,function,length) }
   run need(&r.*,&mut engine,realm,length)
   let start=r.position let mut offset:usize=0 let mut keyed=false
   // Validate before installing any atom ownership or exposing code to VM/GC.
@@ -437,7 +483,7 @@ effect fn readCode<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engi
     let info=op.opcodeInfo(opcode,true) let size=u8.toUsize(info.size)
     if size==0 || size>length-offset { return run error(&mut engine,realm,b"truncated bytecode instruction") }
     if atomFormat(info.format) {
-      let _mapped=run mapAtom(&r.*,&mut engine,realm,wordAt(&r.*,start+offset+1))
+      let operand=wordAt(&r.*,start+offset+1) let _mapped=run mapAtom(&mut r,&mut engine,realm,operand)
     }
     if fieldKeyed(opcode) || casePrefix(&r.*,start+offset,length-offset) { keyed=true }
     offset=offset+size
@@ -458,7 +504,7 @@ effect fn readCode<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engi
       let index=wordAt(&r.*,start+offset+1)
       // The validation pass proved every map lookup; no failure after retain.
       let mut mapped=index
-      if (index&0x80000000)==0 && index>=r.firstAtom { mapped=atomAt(&r.*,u32.toUsize(index-r.firstAtom)) }
+      if (index&0x80000000)==0 && index>=r.firstAtom { mapped=r.atoms.get(u32.toUsize(index-r.firstAtom)) }
       let retained=duplicateAtom(&mut engine,realm,mapped)
       match &mut code {
         ByteStorage.Owned { bytes }=>{
@@ -482,29 +528,44 @@ effect fn readCode<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engi
   let mut anchor=() let b=function.getMut(&mut anchor)
   b.code=move code
 }
+/// DEFER code (js_binary_object_writer.writeCode with patches), from trusted
+/// bytes: the call facts, the code, copied whole, and the atom operands to
+/// replace in it. Field-cache keys arrive blank.
+effect fn patchedCode<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>,
+  function:CellRef<FunctionBytecode>,length:usize)->() !OutOfMemoryError|JsException ?&mut Allocator {
+  run need(&r.*,&mut engine,realm,length+3)
+  let borrows=r.data[r.position]!=0 let form=r.data[r.position+1] let leaf=r.data[r.position+2]
+  let start=r.position+3
+  let mut code=run ByteStorage.copy(Slice.view<u8>(r.data,start,length))
+  r.position=start+length
+  let operands=run count(&mut r,&mut engine,realm)
+  let mut at:usize=0 let mut i:usize=0
+  while i<operands {
+    let entry=run leb(&mut r,&mut engine,realm)
+    at=at+u32.toUsize(u32.shiftRight(entry,1))
+    if at+4>length { return run error(&mut engine,realm,b"invalid bytecode atom operand") }
+    let operand=wordAt(&r.*,start+at) let mut mapped=run mapAtom(&mut r,&mut engine,realm,operand)
+    if (entry&1)==0 { mapped=duplicateAtom(&mut engine,realm,mapped) }
+    match &mut code {
+      ByteStorage.Owned { bytes }=>{ let mut j:usize=0 while j<4 { bytes.set(at+j,u32.toU8(u32.shiftRight(mapped,usize.toU32(j*8))&255)) j=j+1 } }
+      _=>()
+    }
+    i=i+1
+  }
+  let mut anchor=() let b=function.getMut(&mut anchor)
+  b.code=move code
+  b.borrowsArguments=borrows b.constructForm=form b.leaf=leaf
+}
 /// The call fast-path facts js_compiler_finish.finalHeader derives from the
 /// code (frame-free leaf runs, lent arguments, constructor form), which the
-/// wire does not carry. Only for trusted bytes our own writer produced; code
-/// the analysis rejects keeps the slow paths.
+/// wire does not carry outside the DEFER layout. Only for trusted bytes our own
+/// writer produced; code the analysis rejects keeps the slow paths.
 effect fn deriveCallFacts(function:CellRef<FunctionBytecode>)->() !OutOfMemoryError ?&mut Allocator {
   let mut anchor=() let b=function.getMut(&mut anchor)
   let code=match &b.code { ByteStorage.Owned { bytes }=>bytes.asSlice() _=>{ return () } }
-  let analyzed=run Effect.result(bytecodeFacts.analyze(code))
-  let facts=match move analyzed {
-    Result<CodeFacts,BytecodeError|OutOfMemoryError>.Success { value }=>move value
-    Result<CodeFacts,BytecodeError|OutOfMemoryError>.Failure { .. }=>{ return () }
-  }
-  let normal=b.kind==FunctionKind.Normal
-  b.borrowsArguments=normal && b.varRefCount==0 && !facts.writesArguments
-  b.constructForm=bytecodeFacts.constructForm(code)
-  let locals=u16.toUsize(b.variableCount)
-  if normal && !b.isDerivedClassConstructor && b.varRefCount==0 && b.scopeSlots==0
-    && locals+u16.toUsize(b.stackSize)<=bytecodeFacts.LEAF_CELLS && bytecodeFacts.leafCode(code) {
-    let mut leaf=bytecodeFacts.LEAF_CREDITS
-    if locals!=0 && bytecodeFacts.leafPrefill(code,locals) { leaf=leaf|bytecodeFacts.LEAF_PREFILL }
-    if bytecodeFacts.leafAccessor(code) { leaf=leaf|bytecodeFacts.LEAF_ACCESSOR }
-    b.leaf=leaf
-  }
+  let facts=run bytecodeFacts.callFacts(code,b.kind==FunctionKind.Normal,b.isDerivedClassConstructor,b.varRefCount,b.scopeSlots,
+    b.variableCount,b.stackSize)
+  b.borrowsArguments=facts.borrowsArguments b.constructForm=facts.constructForm b.leaf=facts.leaf
 }
 /// LAZY source text (js_binary_object_writer Writer.sourceText).
 effect fn sourceText<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut Engine<'m,S>,realm: Realm<'r>)
@@ -686,21 +747,12 @@ effect fn readConstants<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut
     run b.constants.append(unsafe child.retained()) i=i+1
   }
 }
-/// This read's deferred source, registered on first use, with the source
+/// This read's deferred source (header registered it) with the source
 /// strings read since: its range of deferredTexts grows only while it is the
 /// newest source, which holds for a whole first read, and a resumed read finds
 /// no new strings (the writer keeps a body that introduces one in place).
 effect fn deferSource<'a,'r>(r:&mut Reader<'a>,realm: Realm<'r>)->u32 !OutOfMemoryError ?&mut Allocator {
   let mut anchor=() let state=unsafe HeapCell.payloadMut<RuntimeState,()>(&mut anchor,realm.runtime())
-  if r.deferSource==0 {
-    let atomStart=state.deferredAtoms.length()
-    run state.deferredAtoms.reserve(r.atoms.length())
-    let mut i:usize=0
-    while i<r.atoms.length() { run state.deferredAtoms.append(state.atoms.duplicate(r.atoms.get(i))) i=i+1 }
-    run state.deferredSources.append(DeferredSource { data:Pointer.fromRef<u8>(&r.data[0]),length:r.length,flags:r.flags,firstAtom:r.firstAtom,
-      atomStart:usize.toU32(atomStart),atomCount:usize.toU32(r.atoms.length()),textStart:usize.toU32(state.deferredTexts.length()),textCount:0 })
-    r.deferSource=usize.toU32(state.deferredSources.length())
-  }
   let index=u32.toUsize(r.deferSource-1)
   let mut entry=state.deferredSources.get(index)
   if u32.toUsize(entry.textCount)<r.sources.length() {
@@ -812,7 +864,7 @@ effect fn readFunction<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut 
     let placeholder=code.getMut(&mut anchor)
     placeholder.code=ByteStorage.Borrowed { data:Pointer.fromRef<u8>(&STUB_CODE[0]),length:1 }
     placeholder.frameCells=scopes.inlineFrameCells(varc,stack,refs,0)
-  } else if r.trusted { run deriveCallFacts(code) }
+  } else if r.trusted && (r.flags&DEFER)==0 { run deriveCallFacts(code) }
   if (r.flags&DEFER)==0 && (flags&1024)!=0 { run readDebug(&mut r,&mut engine,realm,code) }
   run readConstants(&mut r,&mut engine,realm,code,constants)
   if stub {
@@ -927,7 +979,7 @@ effect fn decodeBytes<'a,'b,'m,S:EngineServices>(engine:&mut Engine<'m,S>,realm:
     activeScriptId:0,activeScriptIsEval:false,
     trusted:trusted,shared:shared,leases:leases,firstAtom:first,atoms:List<u32>.make(),references:List<ValueBits>.make(),
     roots:ValueList.make(),modules:List<CellRef<ModuleDef>>.make(),sources:List<ValueBits>.make(),deferSource:0,resumed:false,
-    lentAtoms:noAtoms(),lentAtomCount:0,lentTexts:noTexts(),lentTextCount:0 }
+    lazyAtoms:false,atomStart:0,atomCount:0,atomTable:0,atomStrings:0,lentTexts:noTexts(),lentTextCount:0 }
   if (flags&LAZY)!=0 && !trusted { return run error(&mut engine,realm,b"lazy bytecode requires a trusted read") }
   if (flags&DEFER)!=0 && (flags&LAZY)==0 { return run error(&mut engine,realm,b"deferred bytecode requires the lazy wire") }
   let decoded=run Effect.result(body(&mut r,&mut engine,realm))
@@ -975,8 +1027,7 @@ pub unsafe effect fn finishDeferred<'m,S:EngineServices>(engine:&mut Engine<'m,S
   let rt=realm.runtime()
   let stateAnchor=() let state=unsafe HeapCell.payload<RuntimeState,()>(&stateAnchor,rt)
   let source=state.deferredSources.get(u32.toUsize(body.source))
-  let mut lentAtoms=noAtoms() let mut lentTexts=noTexts()
-  if source.atomCount!=0 { lentAtoms=Pointer.fromRef<u32>(&state.deferredAtoms.asSlice()[u32.toUsize(source.atomStart)]) }
+  let mut lentTexts=noTexts()
   if source.textCount!=0 { lentTexts=Pointer.fromRef<ValueBits>(&state.deferredTexts.asSlice()[u32.toUsize(source.textStart)]) }
   drop state
   let held=()
@@ -985,7 +1036,8 @@ pub unsafe effect fn finishDeferred<'m,S:EngineServices>(engine:&mut Engine<'m,S
     activeScriptId:body.scriptId,activeScriptIsEval:body.scriptIsEval,
     trusted:true,shared:&[],leases:&[],firstAtom:source.firstAtom,atoms:List<u32>.make(),references:List<ValueBits>.make(),
     roots:ValueList.make(),modules:List<CellRef<ModuleDef>>.make(),sources:List<ValueBits>.make(),deferSource:body.source+1,resumed:true,
-    lentAtoms:lentAtoms,lentAtomCount:u32.toUsize(source.atomCount),lentTexts:lentTexts,lentTextCount:u32.toUsize(source.textCount) }
+    lazyAtoms:true,atomStart:u32.toUsize(source.atomStart),atomCount:u32.toUsize(source.atomCount),atomTable:u32.toUsize(source.atomTable),
+    atomStrings:u32.toUsize(source.atomTable)+u32.toUsize(source.atomCount)*4,lentTexts:lentTexts,lentTextCount:u32.toUsize(source.textCount) }
   let outcome=run Effect.result(deferredBody(&mut r,&mut engine,realm,code,body))
   let mut i:usize=0
   while i<r.roots.length() { unsafe r.roots.take(i).release(&mut engine,rt) i=i+1 }
@@ -998,7 +1050,6 @@ effect fn deferredBody<'a,'r,'m,S:EngineServices>(r:&mut Reader<'a>,engine:&mut 
   code:CellRef<FunctionBytecode>,body:DeferredBody)->() !OutOfMemoryError|JsException|StringLengthError|BigIntError ?&mut Allocator {
   run readVarDefs(&mut r,&mut engine,realm,code,u32.toUsize(body.locals))
   run readCode(&mut r,&mut engine,realm,code,u32.toUsize(body.codeLength))
-  run deriveCallFacts(code)
   run readConstants(&mut r,&mut engine,realm,code,u32.toUsize(body.constants))
 }
 /// Copies bytecode; never retains pointers into bytes. ROM_DATA is rejected.
