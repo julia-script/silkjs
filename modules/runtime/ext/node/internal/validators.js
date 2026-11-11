@@ -25,7 +25,7 @@
 'use strict';
 
 const {
-  codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_MISSING_ARGS, ERR_OUT_OF_RANGE, ERR_UNKNOWN_SIGNAL },
+  codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_MISSING_ARGS, ERR_OUT_OF_RANGE, ERR_SOCKET_BAD_PORT, ERR_UNKNOWN_SIGNAL },
 } = require('internal/errors');
 
 function codedError(Base, code, message) {
@@ -38,6 +38,22 @@ function unknownSignal(signal) { return new ERR_UNKNOWN_SIGNAL(signal); }
 const isUint32 = (value) => value === (value >>> 0);
 function validateString(value, name) {
   if (typeof value !== 'string') throw new ERR_INVALID_ARG_TYPE(name, 'string', value);
+}
+/**
+ * @param {number|string} port
+ * @param {string} [name]
+ * @param {boolean} [allowZero]
+ * @returns {number}
+ */
+function validatePort(port, name = 'Port', allowZero = true) {
+  if ((typeof port !== 'number' && typeof port !== 'string') ||
+      (typeof port === 'string' && port.trim().length === 0) ||
+      +port !== (+port >>> 0) ||
+      port > 0xFFFF ||
+      (port === 0 && !allowZero)) {
+    throw new ERR_SOCKET_BAD_PORT(name, port, allowZero);
+  }
+  return port | 0;
 }
 function validateBoolean(value, name) {
   if (typeof value !== 'boolean') throw new ERR_INVALID_ARG_TYPE(name, 'boolean', value);
@@ -159,5 +175,5 @@ module.exports = {
   validateString, validateBoolean, validateFunction, validateNumber, validateInteger, validateInt32,
   validateUint32, validateObject, validateArray, validateOneOf, validateAbortSignal,
   isUint32, validateBuffer, validateLinkHeaderValue,
-  convertToValidSignal, signalName, toPathIfFileURL, validatePath, getValidatedPath,
+  convertToValidSignal, signalName, toPathIfFileURL, validatePath, getValidatedPath, validatePort,
 };
