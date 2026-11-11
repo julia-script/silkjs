@@ -257,9 +257,6 @@ function getOptionValue(name) {
     case '--experimental-websocket': return host.experimentalWebSocket !== false;
     case '--frozen-intrinsics': return !!host.frozenIntrinsics;
     case '--zero-fill-buffers': return !!host.zeroFillBuffers;
-    case '--use-openssl-ca': return host.caStore === 'openssl';
-    case '--use-bundled-ca': return host.caStore === 'bundled';
-    case '--use-system-ca': return !!host.useSystemCA;
     case '--experimental-inspector-network-resource': return !!host.experimentalInspectorNetworkResource;
     case '--inspect': return !!host.inspectorOptions?.enabled;
     case '--inspect-brk': return !!host.inspectorOptions?.breakFirst;
