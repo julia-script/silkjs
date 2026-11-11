@@ -1142,7 +1142,7 @@ function createLoader(host, builtins) {
           try { extensions[ext](module, filename); }
           catch (cause) {
             // Only a file that does not compile as CommonJS can be a module.
-            if (!(cause instanceof SyntaxError) || !host.detectModuleSyntax(cleanSource(text(filename)), filename)) throw cause;
+            if (!(cause instanceof SyntaxError) || !host.detectModuleSyntax(cleanSource(text(filename)), filename)) host.rethrow(cause);
             detectedModules.add(module);
             requireNamespace(module, filename);
           }
@@ -1158,7 +1158,7 @@ function createLoader(host, builtins) {
         const index = parent.children.indexOf(module);
         if (index !== -1) parent.children.splice(index, 1);
       }
-      throw cause;
+      host.rethrow(cause);
     }
   }
 
