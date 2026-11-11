@@ -1,6 +1,7 @@
 'use strict';
 const net = require('net');
 const diagnostics = require('internal/host').diagnostics;
+const traceEvents = require('internal/trace_events');
 const { setInterval, clearInterval } = require('timers');
 const { OutgoingMessage, validateHeaderName, validateHeaderValue } = require('_http_outgoing');
 const { IncomingMessage } = require('_http_incoming');
@@ -15,6 +16,8 @@ class ServerResponse extends OutgoingMessage {
     this.shouldKeepAlive = req._keepAlive !== false;
     this.useChunkedEncodingByDefault = req.httpVersionMinor !== 0;
     diagnostics.publish('http.server.response.created', { request: req, response: this });
+    // node.http trace events, as Node's: begin with the response, end when it finishes.
+    this._traceEventId = traceEvents.begin('node,node.http', 'http.server.request');
   }
   assignSocket(socket) { this.socket = socket; this.emit('socket', socket); this._flushOutput(); }
   detachSocket(socket) { if (this.socket === socket) this.socket = null; }
@@ -142,6 +145,7 @@ Server.prototype._connection = function _connection(socket) {
       if (this.maxRequestsPerSocket > 0 && state.count >= this.maxRequestsPerSocket) res.shouldKeepAlive = false;
       res.on('error', err => socket.destroy(err));
       res.on('finish', () => {
+        if (res._traceEventId !== undefined) traceEvents.trace(101, 'node,node.http', 'http.server.request', res._traceEventId, { url: req.url, statusCode: res.statusCode });
         diagnostics.publish('http.server.response.finish', { request: req, response: res, socket, server: this });
         if (!req.complete || !req.readableEnded) req._dump();
         if (state.responses[0] === res) state.responses.shift();
