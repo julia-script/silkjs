@@ -1,6 +1,8 @@
 'use strict';
 const host = require('internal/host');
 const { Buffer } = require('buffer');
+// Captured at load: crypto inputs never reach a user-replaced Buffer.from.
+const bufferFrom = Buffer.from.bind(Buffer);
 const ids = new WeakMap();
 const finalizers = new FinalizationRegistry(id => host.crypto('release', [id]));
 function error(code, message, Type = Error) { const e = new Type(message); e.code = code; return e; }
@@ -8,9 +10,9 @@ function invalid(name, type) { return error('ERR_INVALID_ARG_TYPE', `The "${name
 function integer(n, name, min = 0, max = 0x7fffffff) { require('internal/validators').validateInteger(n, name, min, max); return n; }
 function callback(cb) { if (typeof cb !== 'function') throw invalid('callback', 'a function'); return cb; }
 function bytes(value, encoding, name = 'data') {
-  if (typeof value === 'string') return Buffer.from(value, encoding);
-  if (ArrayBuffer.isView(value)) return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
-  if (value instanceof ArrayBuffer || typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer) return Buffer.from(value);
+  if (typeof value === 'string') return bufferFrom(value, encoding);
+  if (ArrayBuffer.isView(value)) return bufferFrom(value.buffer, value.byteOffset, value.byteLength);
+  if (value instanceof ArrayBuffer || typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer) return bufferFrom(value);
   throw invalid(name, 'a string, ArrayBuffer, Buffer, TypedArray, or DataView');
 }
 function binary(value, name = 'buffer') { if (typeof value === 'string') throw invalid(name, 'an ArrayBuffer or ArrayBufferView'); return bytes(value, undefined, name); }
@@ -47,7 +49,7 @@ function submit(op, args, cb, convert = x => x) {
     });
   } catch (e) { resource.emitDestroy(); throw normalize(e); }
 }
-function output(value, encoding) { const b = Buffer.from(value); return encoding && encoding !== 'buffer' ? b.toString(encoding) : b; }
+function output(value, encoding) { const b = bufferFrom(value); return encoding && encoding !== 'buffer' ? b.toString(encoding) : b; }
 function attach(object, id) { try { ids.set(object, id); finalizers.register(object, id, object); } catch (e) { call('release', [id]); throw e; } return object; }
 function handle(object) { const id = ids.get(object); if (id === undefined) throw error('ERR_CRYPTO_INVALID_STATE', 'Crypto object has been finalized'); return id; }
 // `object` uses the native object of `owner`, which stays alive while it does.
@@ -149,7 +151,7 @@ const validate = {
   // lib/internal/crypto/util.js getArrayBufferOrView
   bufferSource(value, name, encoding) {
     if (isAnyArrayBuffer(value)) return value;
-    if (typeof value === 'string') { if (encoding === 'buffer') encoding = 'utf8'; return Buffer.from(value, encoding); }
+    if (typeof value === 'string') { if (encoding === 'buffer') encoding = 'utf8'; return bufferFrom(value, encoding); }
     if (!isView(value)) throw codes.ERR_INVALID_ARG_TYPE(name, ['string', 'ArrayBuffer', 'Buffer', 'TypedArray', 'DataView'], value);
     return value;
   },

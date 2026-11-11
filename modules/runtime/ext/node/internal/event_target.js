@@ -865,9 +865,9 @@ class EventTarget {
         handler = next;
         continue;
       }
-      // Read before remove(), which drops the strong reference a weak listener's
-      // retainer holds: V8 keeps a WeakRef target alive to the end of the job
-      // (KeepDuringJob), the engine does not yet.
+      // Read before remove(), which drops the last strong reference to a weak
+      // listener. V8 frees it only at a later GC; the engine frees it at once
+      // unless this job created the WeakRef or already called deref() on it.
       const callback = handler.weak ?
         handler.callback.deref() : handler.callback;
       if (handler.once) {

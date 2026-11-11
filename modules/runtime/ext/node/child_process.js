@@ -215,7 +215,15 @@ class ChildProcess extends EventEmitter {
     for (let i = 0; i < stdio.length; i++) {
       const entry = stdio[i];
       const fd = err ? -1 : result[i + 2];
-      if (entry.type === 'wrap' && !err) { entry.source.pause(); entry.source[kIsUsedAsStdio] = true; }
+      if (entry.type === 'wrap' && !err) {
+        // Like Node: the parent stops reading a stream the child now reads.
+        const handle = entry.source._handle;
+        if (handle) { handle.reading = false; handle.readStop?.(); }
+        entry.source.pause();
+        entry.source.readableFlowing = false;
+        if (entry.source._readableState) entry.source._readableState.reading = false;
+        entry.source[kIsUsedAsStdio] = true;
+      }
       if (entry.type !== 'pipe') { this.stdio.push(null); continue; }
       if (entry.ipc) {
         this.stdio.push(null);

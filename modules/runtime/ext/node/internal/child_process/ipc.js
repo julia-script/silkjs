@@ -96,6 +96,20 @@ function setupChannel(target, fd, mode = 'json', onClose) {
   function deliver(value, handle) {
     target.emit(value && typeof value.cmd === 'string' && value.cmd.startsWith('NODE_') ? 'internalMessage' : 'message', value, handle);
   }
+  // A TCP or pipe handle over a received descriptor, or null after reporting the failure.
+  function openHandle(passed, server) {
+    const { tcp_wrap: { TCP }, pipe_wrap: { Pipe }, guessHandleType } = require('internal/net/binding');
+    const kind = guessHandleType(passed);
+    let handle;
+    if (kind === 'TCP') handle = new TCP(server ? TCP.SERVER : TCP.SOCKET);
+    else if (kind === 'PIPE') handle = new Pipe(server ? Pipe.SERVER : Pipe.SOCKET);
+    const status = handle ? handle.open(passed) : -22;
+    if (status >= 0) return handle;
+    handle?.close();
+    native('closeFd', [passed]);
+    target.emit('error', failure('ERR_INVALID_HANDLE_TYPE', `Unsupported IPC handle ${kind}`));
+    return null;
+  }
   function message(value) {
     if (value && typeof value.cmd === 'string' && value.cmd.startsWith('NODE_')) {
       if (value.cmd === 'NODE_HANDLE_ACK' || value.cmd === 'NODE_HANDLE_NACK') {
@@ -137,28 +151,29 @@ function setupChannel(target, fd, mode = 'json', onClose) {
             if (value.msg?.cmd === 'NODE_CLUSTER') deliver({ ...value.msg, error: { code: error.code, message: error.message, errno: error.errno, syscall: error.syscall } });
             else target.emit('error', error);
           });
-          server.listen({ fd: passed, exclusive: true, backlog: value.msg?.cmd === 'NODE_CLUSTER' ? value.msg.backlog : undefined }, () => deliver(value.msg, server));
+          // As in Node, the server listens on the received handle itself: listen({ fd }) in a
+          // cluster worker would ask the primary for a server on that descriptor number.
+          const handle = openHandle(passed, true);
+          if (!handle) return;
+          server.listen(handle, () => deliver(value.msg, server));
         } else if (value.type === 'dgram.Socket') {
           const socket = require('dgram').createSocket(value.dgramType || 'udp4');
-          if (value.msg?.cmd === 'NODE_CLUSTER') {
-            const error = socket._bindNative({ fd: passed }, false);
-            if (error) {
-              native('closeFd', [passed]); socket.close();
-              deliver({ ...value.msg, error: { code: error.code, message: error.message, errno: error.errno, syscall: error.syscall } });
-            } else deliver(value.msg, socket);
-          } else {
-            socket.once('error', error => target.emit('error', error));
-            socket.bind({ fd: passed, exclusive: true }, () => deliver(value.msg, socket));
-          }
+          socket.once('error', error => target.emit('error', error));
+          socket.bind({ fd: passed, exclusive: true }, () => deliver(value.msg, socket));
         } else if (value.type === 'net.Native') {
-          // Node hands over the raw handle; here, a transport opened on the descriptor.
-          const { Transport, native: netNative } = require('internal/net/transport');
-          const kind = netNative('guessHandleType', [passed]);
-          if (kind !== 1 && kind !== 2) { native('closeFd', [passed]); target.emit('error', failure('ERR_INVALID_HANDLE_TYPE', 'Unsupported IPC handle net.Native')); return; }
-          const transport = new Transport(kind, null, () => {});
-          const status = transport.call('open', passed);
-          if (status < 0) { transport.close(); native('closeFd', [passed]); target.emit('error', failure('ERR_INVALID_HANDLE_TYPE', 'Cannot open IPC handle')); return; }
-          deliver(value.msg, transport);
+          // Like Node's handleConversion: a raw TCP or pipe handle (cluster) arrives as a handle.
+          const handle = openHandle(passed, false);
+          if (handle) deliver(value.msg, handle);
+        } else if (value.type === 'dgram.Native') {
+          const handle = require('internal/dgram').newHandle(value.dgramType || 'udp4');
+          const status = handle.open(passed);
+          if (status < 0) {
+            handle.close();
+            native('closeFd', [passed]);
+            target.emit('error', failure('ERR_INVALID_HANDLE_TYPE', `Unsupported IPC handle ${value.type}`));
+            return;
+          }
+          deliver(value.msg, handle);
         } else { native('closeFd', [passed]); target.emit('error', failure('ERR_INVALID_HANDLE_TYPE', `Unsupported IPC handle ${value.type}`)); }
         return;
       }
@@ -231,12 +246,11 @@ function setupChannel(target, fd, mode = 'json', onClose) {
     }
     if (!handle) return submit(value, -1, callback);
     const net = require('net'); let type, handleFD;
-    const { Transport } = require('internal/net/transport');
     if (handle instanceof net.Socket) { type = 'net.Socket'; handleFD = handle._transport?.call('fileno'); }
     else if (handle instanceof net.Server) { type = 'net.Server'; handleFD = handle._transport?.call('fileno'); }
-    // A raw TCP or pipe handle (such as server._handle), Node's 'net.Native'.
-    else if (handle instanceof Transport && (handle.kind === 1 || handle.kind === 2)) { type = 'net.Native'; handleFD = handle.closed ? -1 : handle.call('fileno'); }
-    else if (handle instanceof require('dgram').Socket) { type = 'dgram.Socket'; handleFD = host.net('fileno', [handle._id]); }
+    else if (handle instanceof require('dgram').Socket) { type = 'dgram.Socket'; handleFD = handle[require('internal/dgram').kStateSymbol].handle?.fd; }
+    else if (require('internal/net/binding').isStreamHandle(handle)) { type = 'net.Native'; handleFD = handle.fd; }
+    else if (handle instanceof require('internal/dgram').UDP) { type = 'dgram.Native'; handleFD = handle.fd; }
     else throw codedError(TypeError, 'ERR_INVALID_HANDLE_TYPE', 'This handle type cannot be sent');
     if (!Number.isInteger(handleFD) || handleFD < 0) throw failure('ERR_INVALID_HANDLE_TYPE', 'Handle is closed');
     const envelope = { cmd: 'NODE_HANDLE', type, msg: value };
@@ -250,9 +264,12 @@ function setupChannel(target, fd, mode = 'json', onClose) {
         sentSocketLists.set(key, list);
         handle.server._setupWorker(list);
       }
-      if (!options.keepOpen) handle.server._detachSocket(handle);
+      // Node: "Act like socket is detached". The socket no longer counts toward its server,
+      // and its later destroy (after the ACK below) must not count it off again.
+      if (!options.keepOpen) { handle.server._connections--; handle._server = null; }
     }
     if (type === 'dgram.Socket') envelope.dgramType = handle.type || (handle._family === 6 ? 'udp6' : 'udp4');
+    if (type === 'dgram.Native') envelope.dgramType = handle.family === 6 ? 'udp6' : 'udp4';
     const buffer = encode(envelope);
     // Hold an independent descriptor until ACK, including time spent behind backpressure.
     handleFD = host.net('duplicateFd', [handleFD]);
