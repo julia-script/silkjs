@@ -14,7 +14,8 @@ const enqueueObserver = Symbol('enqueue');
 const deliverObserver = Symbol('deliver');
 const observesType = Symbol('observesType');
 const reservedMarks = new Set(['nodeStart', 'v8Start', 'environment', 'loopStart', 'loopExit', 'bootstrapComplete']);
-const supportedTypes = Object.freeze([...new Set(['function', 'mark', 'measure', 'resource', ...(host.performanceObserverTypes || [])])].sort());
+// 'http' entries come from node:http (internal/perf/observe).
+const supportedTypes = Object.freeze([...new Set(['function', 'http', 'mark', 'measure', 'resource', ...(host.performanceObserverTypes || [])])].sort());
 const previousPerformance = globalThis.performance;
 let startTime = host.performanceStartTime ?? (host.now() - (previousPerformance?.now() ?? process.uptime() * 1000));
 let timeOrigin = host.performanceTimeOrigin ?? previousPerformance?.timeOrigin ?? (Date.now() - (host.now() - startTime));

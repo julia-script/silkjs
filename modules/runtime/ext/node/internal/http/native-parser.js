@@ -28,10 +28,14 @@ const call1 = (fn, self, a) => fn.call(self, a);
 const call2 = (fn, self, a) => fn.call(self, a[0], a[1]);
 const callHead = (fn, self, a) => fn.call(self, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);
 // Parser callbacks run in the parser's async scope, with fixed arguments.
+// When the parser consumes its socket, each callback is a top-level call (Node's
+// MakeCallback), so the nextTick and microtask queues drain after it.
 function callback(parser, state, index, call, value) {
   const fn = parser[index];
   if (typeof fn !== 'function') return undefined;
-  return state.resource ? invoke(state.resource, call, fn, parser, value) : call(fn, parser, value);
+  const result = state.resource ? invoke(state.resource, call, fn, parser, value) : call(fn, parser, value);
+  if (state.topLevel) host.checkpoint();
+  return result;
 }
 function resetMessage(state) {
   state.headersComplete = false;
@@ -78,6 +82,9 @@ function normalize(state, result) {
     state.remainder = Buffer.from(result[1]);
     result = result[0];
   }
+  // Like the errors Node's parser binding makes, the message is not enumerable.
+  if (result instanceof Error && Object.getOwnPropertyDescriptor(result, 'message')?.enumerable)
+    Object.defineProperty(result, 'message', { enumerable: false });
   if (result && typeof result === 'object' && result.code === 'HPE_USER' && typeof result.reason === 'string') {
     const colon = result.reason.indexOf(':');
     if (colon !== -1) {
@@ -96,7 +103,7 @@ function resetAsync(state, owner, id) {
 }
 class HTTPParser {
   constructor() {
-    const state = { id: 0, type: HTTPParser.REQUEST, resource: null, connections: null, messageStart: 0, beingFreed: false, provider: 0, frame: undefined, consuming: null,
+    const state = { id: 0, type: HTTPParser.REQUEST, resource: null, connections: null, messageStart: 0, beingFreed: false, topLevel: false, provider: 0, frame: undefined, consuming: null,
       currentRead: null, executing: false, pauseRequested: false, remaining: 0, remainder: null, maxHeaderPairs: undefined };
     resetMessage(state);
     state.callback = (kind, value, remaining) => event(this, state, kind, value, remaining);
@@ -111,8 +118,8 @@ class HTTPParser {
       throw error('ERR_INVALID_ARG_VALUE', 'Invalid HTTP parser type');
     if (!Number.isSafeInteger(maxHeaderSize) || maxHeaderSize < 0)
       throw error('ERR_OUT_OF_RANGE', 'maxHeaderSize must be a nonnegative safe integer');
-    this.remove();
-    this.free();
+    HTTPParser.prototype.remove.call(this);
+    HTTPParser.prototype.free.call(this);
     state.beingFreed = false;
     state.type = type;
     state.remaining = 0;
@@ -182,7 +189,7 @@ class HTTPParser {
     const socket = handle?.owner;
     if (!socket || socket._transport !== handle || typeof handle.readStop !== 'function')
       throw error('ERR_INVALID_ARG_TYPE', 'stream must be a native socket handle');
-    this.unconsume();
+    HTTPParser.prototype.unconsume.call(this);
     const consumer = { parser: this, read: (status, payload) => {
       // Like Node's parser stream listener, read errors and the end of the stream go on to
       // the socket's own read path.
@@ -190,8 +197,9 @@ class HTTPParser {
       if (!payload?.byteLength) return true;
       const buffer = Buffer.from(payload);
       state.currentRead = buffer;
-      try { callback(this, state, HTTPParser.kOnExecute, call1, this.execute(buffer)); }
-      finally { state.currentRead = null; }
+      state.topLevel = true;
+      try { callback(this, state, HTTPParser.kOnExecute, call1, HTTPParser.prototype.execute.call(this, buffer)); }
+      finally { state.currentRead = null; state.topLevel = false; }
       return true;
     } };
     (socket._streamConsumers ||= []).push(consumer);
@@ -209,7 +217,7 @@ class HTTPParser {
     this._consumed = false;
   }
   remove() {
-    this.unconsume();
+    HTTPParser.prototype.unconsume.call(this);
     const state = stateOf(this);
     state.beingFreed = true;
     if (state.connections) { state.connections._remove(this); state.connections = null; }
@@ -222,8 +230,8 @@ class HTTPParser {
   close() {
     const state = stateOf(this);
     if (!state.id) return;
-    this.remove();
-    this.free();
+    HTTPParser.prototype.remove.call(this);
+    HTTPParser.prototype.free.call(this);
     native(1, state.id);
     finalizers.unregister(this);
     state.id = 0;
