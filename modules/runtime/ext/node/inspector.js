@@ -3,6 +3,7 @@
 const { EventEmitter } = require('events');
 const backend = require('internal/inspector');
 const { error, invalid } = backend;
+const { validateObject } = require('internal/validators');
 class Session extends EventEmitter {
   #connection = null;
   #nextId = 1;
@@ -58,7 +59,7 @@ class Session extends EventEmitter {
 }
 function event(method) {
   return (params = {}) => {
-    if (params === null || typeof params !== 'object' || Array.isArray(params)) throw invalid('params', 'object');
+    validateObject(params, 'params');
     backend.broadcast(method, params);
   };
 }

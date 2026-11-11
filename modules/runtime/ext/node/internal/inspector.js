@@ -138,6 +138,7 @@ function dispatch(session, method, params) {
   if (method.startsWith('Network.') || method.startsWith('IO.')) return network.dispatch(session, method, params);
   if (method.startsWith('NodeWorker.')) return workers.dispatch(session, method, params);
   if (method.startsWith('NodeRuntime.')) return nodeRuntime(session, method, params);
+  if (method.startsWith('DOMStorage.') || method.startsWith('Storage.')) return require('internal/inspector_dom_storage').dispatch(session, method, params);
   if (method.startsWith('NodeTracing.')) return (tracing ??= require('internal/inspector_tracing')).dispatch(session, method, params);
   if (method === 'Schema.getDomains') return { domains: ['Runtime', 'Debugger', 'Profiler', 'HeapProfiler', 'Network', 'IO', 'NodeWorker', 'NodeRuntime', 'NodeTracing', 'Schema'].map(name => ({ name, version: '1.3' })) };
   unsupported(method);
@@ -340,8 +341,11 @@ function evaluatePreview(expression, sandbox, timeout = 333) {
 }
 function releasePreview(token) { previews.delete(token); }
 function broadcast(method, params) {
+  // Not a protocol event: DOMStorageAgent::registerStorage in Node.
+  if (method === 'DOMStorage.registerStorage') return require('internal/inspector_dom_storage').register(params);
   for (const session of sessions.values()) {
     if (method.startsWith('Network.') && !session.networkEnabled) continue;
+    if (method.startsWith('DOMStorage.') && !session.domStorageEnabled) continue;
     session.emit(method, params);
   }
 }

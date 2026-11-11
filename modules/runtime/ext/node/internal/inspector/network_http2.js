@@ -29,7 +29,7 @@ const {
   HTTP2_HEADER_SET_COOKIE,
   HTTP2_HEADER_STATUS,
   NGHTTP2_NO_ERROR,
-} = internalBinding('http2').constants;
+} = require('internal/http2/constants');
 const EventEmitter = require('events');
 const { Buffer } = require('buffer');
 
