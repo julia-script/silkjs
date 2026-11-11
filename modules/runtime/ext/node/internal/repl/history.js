@@ -37,10 +37,7 @@ const {
   Symbol,
 } = require('internal/per_context/primordials');
 
-const { validateNumber, codes: { ERR_INVALID_ARG_TYPE } } = require('internal/path_events/support');
-function validateArray(value, name) {
-  if (!Array.isArray(value)) throw new ERR_INVALID_ARG_TYPE(name, 'Array', value);
-}
+const { validateNumber, validateArray } = require('internal/validators');
 
 const path = require('path');
 const fs = require('fs');
