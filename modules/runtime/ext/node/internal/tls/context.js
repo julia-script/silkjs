@@ -1,13 +1,24 @@
 'use strict';
+// SecureContext after Node.js v24 lib/internal/tls/common.js and
+// lib/internal/tls/secure-context.js. NativeSecureContext stands where Node's
+// internalBinding('crypto').SecureContext is, over the memory-BIO TLS handles
+// of src/ext/tls_native.silk.
 const host = require('internal/host');
 const { Buffer } = require('buffer');
-const roots = require('internal/tls/roots');
-function error(code, message, Type = Error) { return Object.assign(new Type(message), { code }); }
+const bundled = require('internal/tls/roots');
+const tlsOptions = require('internal/tls/options');
+const errors = require('internal/tls/errors');
+const {
+  codes, coded, invalidArgType, invalidArgValue, decorate,
+  validateString, validateObject, validateArray, validateBuffer, validateInt32, validateInteger,
+} = errors;
+
+function error(code, message, Type = Error) { return coded(Type, code, message); }
 function bytes(value, name = 'value') {
   if (typeof value === 'string') return Buffer.from(value);
   if (ArrayBuffer.isView(value)) return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
   if (value instanceof ArrayBuffer) return Buffer.from(value);
-  throw error('ERR_INVALID_ARG_TYPE', name + ' must be a string, Buffer, or ArrayBuffer view', TypeError);
+  throw invalidArgType(name, ['string', 'Buffer', 'TypedArray', 'DataView'], value);
 }
 function native(op, ...args) {
   args = args.map(value => {
@@ -16,134 +27,346 @@ function native(op, ...args) {
     return value.byteOffset === 0 && value.byteLength === value.buffer.byteLength ? value.buffer : value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
   });
   try { return host.tls(op, args); }
-  catch (err) { if (!err.code) err.code = /^([A-Z][A-Z0-9_]+):/.exec(err.message)?.[1] || 'ERR_SSL_TLS_OPERATION_FAILED'; throw err; }
+  catch (err) { throw decorate(err); }
 }
-const extra = [];
-if (process.env.NODE_EXTRA_CA_CERTS) {
-  try {
-    const pem = require('fs').readFileSync(process.env.NODE_EXTRA_CA_CERTS, 'utf8');
-    const candidates = pem.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g) || [];
-    if (!candidates.length) throw new Error('No certificates found');
-    const context = native('context');
-    try { for (const cert of candidates) native('ca', context, cert); } finally { native('release', context); }
-    extra.push(...candidates);
-  } catch (err) { process.emitWarning('Ignoring extra certs from ' + process.env.NODE_EXTRA_CA_CERTS + ': ' + err.message); }
-}
-Object.freeze(extra);
-let defaults = Object.freeze([...roots, ...extra]);
-function getCACertificates(type = 'default') {
-  if (type === 'default') return defaults;
-  if (type === 'bundled') return roots;
-  if (type === 'extra') return extra;
-  throw error('ERR_INVALID_ARG_VALUE', 'Unknown or unavailable CA certificate source: ' + type);
-}
-function list(value) { return Array.isArray(value) ? value : [value]; }
-function alpn(value) {
-  if (value === undefined) return Buffer.alloc(0);
-  let result;
-  if (Array.isArray(value)) {
-    const parts = value.map(item => {
-      if (typeof item !== 'string') throw error('ERR_INVALID_ARG_TYPE', 'ALPNProtocols entries must be strings', TypeError);
-      const data = Buffer.from(item); if (!data.length || data.length > 255) throw error('ERR_OUT_OF_RANGE', 'ALPN protocol must contain 1 to 255 bytes', RangeError);
-      return Buffer.concat([Buffer.from([data.length]), data]);
-    });
-    result = Buffer.concat(parts);
-  } else result = Buffer.from(bytes(value, 'ALPNProtocols'));
-  for (let i = 0; i < result.length;) { const n = result[i++]; if (!n || i + n > result.length) throw error('ERR_INVALID_ARG_VALUE', 'Malformed ALPN protocol list'); i += n; }
+
+const TLS1_VERSION = 0x301, TLS1_1_VERSION = 0x302, TLS1_2_VERSION = 0x303, TLS1_3_VERSION = 0x304;
+const SSL_OP_CIPHER_SERVER_PREFERENCE = 0x400000;
+// SecureContext::Init sets SSL_OP_ALLOW_CLIENT_RENEGOTIATION; OpenSSL's defaults add
+// SSL_OP_NO_COMPRESSION. The transport enforces Node's renegotiation limits.
+const SSL_OP_DEFAULTS = 0x100 | 0x20000;
+
+// PEM blocks re-encoded the way X509ToPEM prints them: 64 base64 characters a line.
+function pemBlocks(text) {
+  const result = [];
+  const pattern = /-----BEGIN (?:TRUSTED |X509 )?CERTIFICATE-----([\s\S]*?)-----END (?:TRUSTED |X509 )?CERTIFICATE-----/g;
+  for (let match; (match = pattern.exec(text)) !== null;) {
+    const body = match[1].replace(/[^A-Za-z0-9+/=]/g, '');
+    result.push('-----BEGIN CERTIFICATE-----\n' + body.replace(/.{1,64}/g, '$&\n') + '-----END CERTIFICATE-----\n');
+  }
   return result;
 }
-const versions = { TLSv1: 0x301, 'TLSv1.1': 0x302, 'TLSv1.2': 0x303, 'TLSv1.3': 0x304 };
-const DEFAULT_CIPHERS = 'TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-SHA256:DHE-RSA-AES128-SHA256:ECDHE-RSA-AES256-SHA384:DHE-RSA-AES256-SHA384:ECDHE-RSA-AES256-SHA256:DHE-RSA-AES256-SHA256:HIGH:!aNULL:!eNULL:!EXPORT:!DES:!RC4:!MD5:!PSK:!SRP:!CAMELLIA';
-const finalizer = typeof FinalizationRegistry === 'function' ? new FinalizationRegistry(id => native('release', id)) : null;
-function SecureContext(secureProtocol, secureOptions, minVersion, maxVersion) {
-  if (!(this instanceof SecureContext)) return new SecureContext(secureProtocol, secureOptions, minVersion, maxVersion);
-  this._id = native('context'); this.context = this;
-  try { this._configure({ secureProtocol, secureOptions, minVersion, maxVersion }); }
-  catch (err) { native('release', this._id); throw err; }
-  finalizer?.register(this, this._id);
+function readCertificates(file) {
+  const fs = require('fs');
+  return pemBlocks(fs.readFileSync(file, 'latin1'));
 }
-SecureContext.prototype._configure = function(options) {
-  let min = options.minVersion || 'TLSv1.2', max = options.maxVersion || 'TLSv1.3';
-  if (options.secureProtocol) {
-    if (options.minVersion || options.maxVersion) throw error('ERR_TLS_PROTOCOL_VERSION_CONFLICT', 'secureProtocol conflicts with minVersion/maxVersion');
-    const method = options.secureProtocol.replace(/_(?:client|server)_method$/, '_method');
-    const fixed = { TLSv1_method: 'TLSv1', TLSv1_1_method: 'TLSv1.1', TLSv1_2_method: 'TLSv1.2' }[method];
-    if (fixed) min = max = fixed;
-    else if (!['TLS_method', 'SSLv23_method'].includes(method)) throw error('ERR_TLS_INVALID_PROTOCOL_METHOD', 'Unknown secureProtocol: ' + options.secureProtocol);
-  }
-  if (!versions[min] || !versions[max] || versions[min] > versions[max]) throw error('ERR_TLS_INVALID_PROTOCOL_VERSION', 'Invalid TLS version range');
-  native('versions', this._id, versions[min], versions[max]);
-  // OpenSSL 3 requires explicit client renegotiation opt-in. The transport
-  // accounts for every native handshake and enforces Node's abuse limits.
-  if (options.secureOptions !== undefined && typeof options.secureOptions !== 'number') throw error('ERR_INVALID_ARG_TYPE', 'secureOptions must be a number', TypeError);
-  native('options', this._id, ((options.secureOptions || 0) | 0x100 | 0x20000 | (options.honorCipherOrder ? 0x400000 : 0)) >>> 0);
-  const ciphers = options.ciphers === undefined ? DEFAULT_CIPHERS : options.ciphers;
-  if (typeof ciphers !== 'string') throw error('ERR_INVALID_ARG_TYPE', 'ciphers must be a string', TypeError);
-  const parts = ciphers.split(':'); const suites = parts.filter(item => item.startsWith('TLS_'));
-  const legacy = parts.filter(item => !item.startsWith('TLS_'));
-  native('suites', this._id, suites.join(':'));
-  if (legacy.length) native('ciphers', this._id, legacy.join(':'));
-  else if (versions[min] < 0x304) native('versions', this._id, 0x304, versions[max]);
-  if (options.ecdhCurve !== undefined && typeof options.ecdhCurve !== 'string') throw error('ERR_INVALID_ARG_TYPE', 'ecdhCurve must be a string', TypeError);
-  if (options.ecdhCurve && options.ecdhCurve !== 'auto') native('groups', this._id, options.ecdhCurve);
-  if (options.sigalgs != null) {
-    if (typeof options.sigalgs !== 'string') throw error('ERR_INVALID_ARG_TYPE', 'sigalgs must be a string', TypeError);
-    if (!options.sigalgs) throw error('ERR_INVALID_ARG_VALUE', 'sigalgs must not be empty', TypeError);
-    native('sigalgs', this._id, options.sigalgs);
-  }
-  if (options.dhparam != null) {
-    if (options.dhparam === 'auto') native('dhAuto', this._id);
-    else {
-      const size = native('dhparam', this._id, bytes(options.dhparam, 'dhparam'));
-      if (size && size < 1024) throw error('ERR_INVALID_ARG_VALUE', 'DH parameter is less than 1024 bits', TypeError);
-      if (size && size < 2048) process.emitWarning('DH parameter is less than 2048 bits', 'SecurityWarning');
+// OpenSSL's default store: SSL_CERT_FILE / SSL_CERT_DIR or the build's defaults.
+function systemCertificates() {
+  const fs = require('fs');
+  const [fileEnv, defaultFile, dirEnv, defaultDir] = native('defaultCertPaths').split('\n');
+  const file = process.env[fileEnv] ?? defaultFile, dir = process.env[dirEnv] ?? defaultDir;
+  const result = [];
+  if (file) { try { result.push(...readCertificates(file)); } catch {} }
+  if (dir) {
+    for (const part of dir.split(':')) {
+      let names = [];
+      try { names = fs.readdirSync(part).sort(); } catch { continue; }
+      for (const name of names) {
+        const path = part + '/' + name;
+        try { if (fs.statSync(path).isFile()) result.push(...readCertificates(path)); } catch {}
+      }
     }
   }
-  const cas = options.ca === undefined ? defaults : list(options.ca);
-  for (const ca of cas) native('ca', this._id, bytes(ca, 'ca'));
-  if (options.allowPartialTrustChain) native('trustFlags', this._id, 0x80000);
-  if (options.crl != null) for (const crl of list(options.crl)) {
-    const data = bytes(crl, 'crl');
-    try { native('crl', this._id, data); }
-    catch (cause) { throw Object.assign(error('ERR_CRYPTO_OPERATION_FAILED', 'Failed to parse CRL'), { cause }); }
+  return result;
+}
+let extraCertificates, systemCache, defaultCache, userRoots;
+function extraCACertificates() {
+  if (extraCertificates) return extraCertificates;
+  const file = process.env.NODE_EXTRA_CA_CERTS, result = [];
+  if (file) {
+    try {
+      const text = require('fs').readFileSync(file, 'latin1');
+      result.push(...pemBlocks(text));
+    } catch (err) {
+      const reason = err.code === 'ENOENT' ? 'No such file or directory' : err.message;
+      process.emitWarning(`Ignoring extra certs from \`${file}\`, load failed: ${reason}\n`);
+    }
   }
-  if (options.cert !== undefined) for (const cert of list(options.cert)) native('cert', this._id, bytes(cert, 'cert'));
-  if (options.key !== undefined) for (const item of list(options.key)) {
-    const keyed = item && typeof item === 'object' && !ArrayBuffer.isView(item) && !(item instanceof ArrayBuffer) && 'pem' in item;
-    const passphrase = keyed ? item.passphrase ?? options.passphrase ?? '' : options.passphrase ?? '';
-    if (typeof passphrase !== 'string') throw error('ERR_INVALID_ARG_TYPE', 'passphrase must be a string', TypeError);
-    native('key', this._id, bytes(keyed ? item.pem : item, 'key'), passphrase);
+  return extraCertificates = Object.freeze(result);
+}
+function systemCACertificates() { return systemCache ||= Object.freeze(systemCertificates()); }
+function defaultCACertificates() {
+  if (defaultCache) return defaultCache;
+  if (userRoots) return defaultCache = Object.freeze([...userRoots]);
+  const result = [];
+  if (!tlsOptions.getOptionValue('--use-openssl-ca')) {
+    result.push(...bundled);
+    if (tlsOptions.getOptionValue('--use-system-ca')) result.push(...systemCACertificates());
   }
-  if (options.pfx !== undefined) for (const item of list(options.pfx)) {
-    const keyed = item && typeof item === 'object' && !ArrayBuffer.isView(item) && !(item instanceof ArrayBuffer) && 'buf' in item;
-    native('pfx', this._id, bytes(keyed ? item.buf : item, 'pfx'), keyed ? item.passphrase ?? options.passphrase ?? '' : options.passphrase ?? '');
+  if (process.env.NODE_EXTRA_CA_CERTS) result.push(...extraCACertificates());
+  return defaultCache = Object.freeze(result);
+}
+// The certificates addRootCerts installs: the store Node builds for the process.
+function rootStore() {
+  if (userRoots) return userRoots;
+  const result = tlsOptions.getOptionValue('--use-openssl-ca') ? [...systemCACertificates()] : [...bundled];
+  if (!tlsOptions.getOptionValue('--use-openssl-ca') && tlsOptions.getOptionValue('--use-system-ca')) result.push(...systemCACertificates());
+  if (process.env.NODE_EXTRA_CA_CERTS) result.push(...extraCACertificates());
+  return result;
+}
+function getCACertificates(type = 'default') {
+  validateString(type, 'type');
+  switch (type) {
+    case 'default': return defaultCACertificates();
+    case 'bundled': return bundled;
+    case 'system': return systemCACertificates();
+    case 'extra': return extraCACertificates();
+    default: throw invalidArgValue('type', type);
   }
-  if (options.key !== undefined || options.pfx !== undefined) native('checkKey', this._id);
-  if (options.sessionIdContext != null) {
-    if (typeof options.sessionIdContext !== 'string') throw error('ERR_INVALID_ARG_TYPE', 'sessionIdContext must be a string', TypeError);
-    native('sessionId', this._id, options.sessionIdContext);
-  } else native('sessionId', this._id, Buffer.from('silk-node-tls'));
-  if (options.sessionTimeout != null) {
-    if (typeof options.sessionTimeout !== 'number') throw error('ERR_INVALID_ARG_TYPE', 'sessionTimeout must be a number', TypeError);
-    if (!Number.isInteger(options.sessionTimeout) || options.sessionTimeout < 0 || options.sessionTimeout > 0x7fffffff) throw error('ERR_OUT_OF_RANGE', 'sessionTimeout must be a nonnegative int32', RangeError);
-    native('sessionTimeout', this._id, options.sessionTimeout);
-  }
-  if (options.ticketKeys != null) {
-    if (!ArrayBuffer.isView(options.ticketKeys)) throw error('ERR_INVALID_ARG_TYPE', 'ticketKeys must be an ArrayBuffer view', TypeError);
-    if (options.ticketKeys.byteLength !== 48) throw error('ERR_INVALID_ARG_VALUE', 'ticketKeys must be exactly 48 bytes', TypeError);
-    native('ticketKeys', this._id, options.ticketKeys);
-  }
-  this._alpn = alpn(options.ALPNProtocols); native('contextALPN', this._id, this._alpn);
-};
-function createSecureContext(options = {}) {
-  const context = Object.create(SecureContext.prototype); context._id = native('context'); context.context = context;
-  try { context._configure(options); } catch (err) { native('release', context._id); throw err; }
-  finalizer?.register(context, context._id); return context;
 }
 function setDefaultCACertificates(certs) {
-  if (!Array.isArray(certs)) throw error('ERR_INVALID_ARG_TYPE', 'certs must be an array', TypeError);
-  const next = certs.map(cert => bytes(cert, 'cert').toString());
-  const context = native('context'); try { for (const cert of next) native('ca', context, cert); } finally { native('release', context); }
-  defaults = Object.freeze(next);
+  validateArray(certs, 'certs');
+  for (let i = 0; i < certs.length; i++) {
+    if (typeof certs[i] !== 'string' && !ArrayBuffer.isView(certs[i]))
+      throw invalidArgType(`certs[${i}]`, ['string', 'ArrayBufferView'], certs[i]);
+  }
+  const next = [];
+  for (const cert of certs) next.push(...pemBlocks(bytes(cert).toString('latin1')));
+  if (next.length !== certs.length) {
+    const context = native('context');
+    try { for (const cert of certs) native('ca', context, bytes(cert)); } finally { native('release', context); }
+  }
+  userRoots = Object.freeze(next);
+  defaultCache = undefined;
 }
-module.exports = { SecureContext, createSecureContext, native, bytes, alpn, error, DEFAULT_CIPHERS, rootCertificates: roots, getCACertificates, setDefaultCACertificates };
+
+const finalizer = typeof FinalizationRegistry === 'function' ? new FinalizationRegistry(id => { try { native('release', id); } catch {} }) : null;
+function ticketKeysBuffer(keys) {
+  if (!ArrayBuffer.isView(keys)) throw invalidArgType('keys', ['Buffer', 'TypedArray', 'DataView'], keys);
+  if (keys.byteLength !== 48) throw error('ERR_INVALID_ARG_VALUE', 'Session ticket keys must be a 48-byte buffer', TypeError);
+  return Buffer.from(Buffer.from(keys.buffer, keys.byteOffset, keys.byteLength));
+}
+class NativeSecureContext {
+  #id = 0;
+  constructor() {
+    this.#id = native('context');
+    this._minProto = 0; this._maxProto = 0; this._ticketKeys = null; this._alpn = Buffer.alloc(0);
+    finalizer?.register(this, this.#id, this);
+  }
+  get _id() { return this.#id; }
+  get _external() { return this.#id; }
+  init(secureProtocol, min, max) {
+    if (max === 0) max = TLS1_3_VERSION;
+    if (secureProtocol) {
+      const method = String(secureProtocol);
+      if (/^SSLv2_(?:server_|client_)?method$/.test(method)) throw error('ERR_TLS_INVALID_PROTOCOL_METHOD', 'SSLv2 methods disabled', TypeError);
+      if (/^SSLv3_(?:server_|client_)?method$/.test(method)) throw error('ERR_TLS_INVALID_PROTOCOL_METHOD', 'SSLv3 methods disabled', TypeError);
+      const fixed = /^(SSLv23|TLS|TLSv1|TLSv1_1|TLSv1_2)_(?:server_|client_)?method$/.exec(method);
+      if (!fixed) throw error('ERR_TLS_INVALID_PROTOCOL_METHOD', `Unknown method: ${method}`, TypeError);
+      switch (fixed[1]) {
+        case 'SSLv23': max = TLS1_2_VERSION; break;
+        case 'TLS': min = 0; max = TLS1_3_VERSION; break;
+        case 'TLSv1': min = max = TLS1_VERSION; break;
+        case 'TLSv1_1': min = max = TLS1_1_VERSION; break;
+        case 'TLSv1_2': min = max = TLS1_2_VERSION; break;
+      }
+    }
+    native('options', this.#id, SSL_OP_DEFAULTS);
+    this.setMinProto(min); this.setMaxProto(max);
+    this.setTicketKeys(require('crypto').randomBytes(48));
+  }
+  setMinProto(version) { native('versions', this.#id, version, this._maxProto || TLS1_3_VERSION); this._minProto = version; }
+  setMaxProto(version) { native('versions', this.#id, this._minProto, version); this._maxProto = version; }
+  getMinProto() { return this._minProto; }
+  // The linked OpenSSL is built without zlib, brotli and zstd (OPENSSL_NO_COMP_ALG),
+  // which Node reports the same way.
+  setCertificateCompression(packed) {
+    if (this._maxProto !== 0 && this._maxProto < TLS1_3_VERSION)
+      throw error('ERR_INVALID_ARG_VALUE', 'certificateCompression requires a TLS protocol range that includes TLSv1.3', TypeError);
+    throw error('ERR_CRYPTO_UNSUPPORTED_OPERATION', 'Certificate compression is not supported by this OpenSSL build');
+  }
+  getMaxProto() { return this._maxProto || TLS1_3_VERSION; }
+  setOptions(options) { native('options', this.#id, options >>> 0); }
+  setCipherSuites(suites) { native('suites', this.#id, suites); }
+  setCiphers(ciphers) {
+    try { native('ciphers', this.#id, ciphers); }
+    catch (err) {
+      // An empty TLSv1.2 list is valid when TLSv1.3 suites remain (Node's SetCiphers).
+      if (ciphers !== '' || !/no cipher match/.test(err.message)) throw err;
+    }
+  }
+  setSigalgs(sigalgs) { native('sigalgs', this.#id, sigalgs); }
+  setECDHCurve(curve) {
+    if (curve === 'auto') return;
+    try { native('groups', this.#id, curve); }
+    catch { throw error('ERR_CRYPTO_OPERATION_FAILED', 'Failed to set ECDH curve', TypeError); }
+  }
+  setDHParam(value) {
+    if (value === true) { native('dhAuto', this.#id); return; }
+    const size = native('dhparam', this.#id, bytes(value));
+    if (size === 0) return;
+    if (size < 1024) throw error('ERR_INVALID_ARG_VALUE', 'DH parameter is less than 1024 bits', TypeError);
+    if (size < 2048) return 'DH parameter is less than 2048 bits';
+  }
+  setKey(key, passphrase) { native('key', this.#id, bytes(key), passphrase == null ? '' : String(passphrase)); }
+  setCert(cert) { native('cert', this.#id, bytes(cert)); }
+  addCACert(cert) { native('ca', this.#id, bytes(cert)); }
+  addRootCerts() { for (const cert of rootStore()) native('ca', this.#id, cert); }
+  setAllowPartialTrustChain() { native('trustFlags', this.#id, 0x80000); }
+  addCRL(crl) {
+    try { native('crl', this.#id, bytes(crl)); }
+    catch { throw error('ERR_CRYPTO_OPERATION_FAILED', 'Failed to parse CRL'); }
+  }
+  setSessionIdContext(id) { native('sessionId', this.#id, id); }
+  setSessionTimeout(seconds) { native('sessionTimeout', this.#id, seconds); }
+  setTicketKeys(keys) {
+    const copy = ticketKeysBuffer(keys);
+    native('ticketKeys', this.#id, copy); this._ticketKeys = copy;
+  }
+  getTicketKeys() { return Buffer.from(this._ticketKeys); }
+  loadPKCS12(pfx, passphrase) {
+    let status;
+    try { status = native('pfx', this.#id, bytes(pfx), passphrase === undefined ? '' : bytes(passphrase)); }
+    catch (err) {
+      if (err.reason === 'unsupported') throw error('ERR_CRYPTO_UNSUPPORTED_OPERATION', 'Unsupported PKCS12 PFX data');
+      throw new Error(err.reason || 'Unknown error');
+    }
+    if (status === 1) throw error('ERR_CRYPTO_OPERATION_FAILED', 'Unable to load private key from PFX data');
+    if (status === 2) throw error('ERR_CRYPTO_OPERATION_FAILED', 'Unable to load certificate from PFX data');
+  }
+  setALPN(protocols) { this._alpn = protocols; native('contextALPN', this.#id, protocols); }
+  close() {}
+}
+
+function toV(which, v, def) {
+  v ??= def;
+  if (v === 'TLSv1') return TLS1_VERSION;
+  if (v === 'TLSv1.1') return TLS1_1_VERSION;
+  if (v === 'TLSv1.2') return TLS1_2_VERSION;
+  if (v === 'TLSv1.3') return TLS1_3_VERSION;
+  throw new codes.ERR_TLS_INVALID_PROTOCOL_VERSION(v, which);
+}
+function SecureContext(secureProtocol, secureOptions, minVersion, maxVersion) {
+  if (!(this instanceof SecureContext)) return new SecureContext(secureProtocol, secureOptions, minVersion, maxVersion);
+  if (secureProtocol) {
+    if (minVersion != null) throw new codes.ERR_TLS_PROTOCOL_VERSION_CONFLICT(minVersion, secureProtocol);
+    if (maxVersion != null) throw new codes.ERR_TLS_PROTOCOL_VERSION_CONFLICT(maxVersion, secureProtocol);
+  }
+  const tls = require('tls');
+  this.context = new NativeSecureContext();
+  this.context.init(secureProtocol, toV('minimum', minVersion, tls.DEFAULT_MIN_VERSION), toV('maximum', maxVersion, tls.DEFAULT_MAX_VERSION));
+  if (secureOptions) {
+    validateInteger(secureOptions, 'secureOptions');
+    this.context.setOptions(secureOptions);
+  }
+}
+
+function validateKeyOrCertOption(name, value) {
+  if (typeof value !== 'string' && !ArrayBuffer.isView(value)) throw invalidArgType(name, ['string', 'Buffer', 'TypedArray', 'DataView'], value);
+}
+function setKey(context, key, passphrase, name) {
+  validateKeyOrCertOption(`${name}.key`, key);
+  if (passphrase !== undefined && passphrase !== null) validateString(passphrase, `${name}.passphrase`);
+  context.setKey(key, passphrase);
+}
+function processCiphers(ciphers, name) {
+  ciphers = (ciphers || require('tls').DEFAULT_CIPHERS).split(':');
+  const cipherList = ciphers.filter(c => c.length && !c.startsWith('TLS_') && !c.startsWith('!TLS_')).join(':');
+  const cipherSuites = ciphers.filter(c => c.length && (c.startsWith('TLS_') || c.startsWith('!TLS_'))).join(':');
+  if (cipherSuites === '' && cipherList === '') throw invalidArgValue(name, ciphers);
+  return { cipherList, cipherSuites };
+}
+function configSecureContext(context, options = {}, name = 'options') {
+  validateObject(options, name);
+  const tls = require('tls');
+  const {
+    allowPartialTrustChain, ca, cert, certificateCompression, ciphers = tls.DEFAULT_CIPHERS, clientCertEngine, crl, dhparam,
+    ecdhCurve = tls.DEFAULT_ECDH_CURVE || 'auto', key, passphrase, pfx, privateKeyIdentifier, privateKeyEngine,
+    sessionIdContext, sessionTimeout, sigalgs, ticketKeys,
+  } = options;
+  if (ciphers !== undefined && ciphers !== null) validateString(ciphers, `${name}.ciphers`);
+  const { cipherList, cipherSuites } = processCiphers(ciphers, `${name}.ciphers`);
+  if (cipherSuites !== '') context.setCipherSuites(cipherSuites);
+  context.setCiphers(cipherList);
+  if (cipherList === '' && context.getMinProto() < TLS1_3_VERSION && context.getMaxProto() > TLS1_2_VERSION) context.setMinProto(TLS1_3_VERSION);
+  if (ca) { for (const value of Array.isArray(ca) ? ca : [ca]) { validateKeyOrCertOption(`${name}.ca`, value); context.addCACert(value); } }
+  else context.addRootCerts();
+  if (allowPartialTrustChain) context.setAllowPartialTrustChain();
+  if (cert) { for (const value of Array.isArray(cert) ? cert : [cert]) { validateKeyOrCertOption(`${name}.cert`, value); context.setCert(value); } }
+  if (key) {
+    if (Array.isArray(key)) {
+      for (const value of key) setKey(context, value?.pem !== undefined ? value.pem : value, value?.passphrase !== undefined ? value.passphrase : passphrase, name);
+    } else setKey(context, key, passphrase, name);
+  }
+  if (certificateCompression != null) {
+    validateArray(certificateCompression, `${name}.certificateCompression`);
+    if (certificateCompression.length > 3) throw invalidArgValue(`${name}.certificateCompression`, certificateCompression, 'can specify at most 3 algorithms');
+    if (certificateCompression.length > 0) {
+      let packed = certificateCompression.length;
+      certificateCompression.forEach((algorithm, i) => {
+        const id = { zlib: 1, brotli: 2, zstd: 3 }[algorithm];
+        if (typeof algorithm !== 'string' || id === undefined)
+          throw invalidArgValue(`${name}.certificateCompression[${i}]`, algorithm, "must be 'zlib', 'brotli', or 'zstd'");
+        packed |= id << (8 * (i + 1));
+      });
+      context.setCertificateCompression(packed);
+    }
+  }
+  if (sigalgs !== undefined && sigalgs !== null) {
+    validateString(sigalgs, `${name}.sigalgs`);
+    if (sigalgs === '') throw invalidArgValue(`${name}.sigalgs`, sigalgs);
+    context.setSigalgs(sigalgs);
+  }
+  if (privateKeyIdentifier !== undefined && privateKeyIdentifier !== null) {
+    if (privateKeyEngine === undefined || privateKeyEngine === null) throw invalidArgValue(`${name}.privateKeyEngine`, privateKeyEngine);
+    if (key) throw invalidArgValue(`${name}.privateKeyIdentifier`, privateKeyIdentifier);
+    if (typeof privateKeyIdentifier === 'string' && typeof privateKeyEngine === 'string')
+      throw new codes.ERR_CRYPTO_CUSTOM_ENGINE_NOT_SUPPORTED();
+    if (typeof privateKeyIdentifier !== 'string') throw invalidArgType(`${name}.privateKeyIdentifier`, ['string', 'null', 'undefined'], privateKeyIdentifier);
+    throw invalidArgType(`${name}.privateKeyEngine`, ['string', 'null', 'undefined'], privateKeyEngine);
+  }
+  validateString(ecdhCurve, `${name}.ecdhCurve`);
+  context.setECDHCurve(ecdhCurve);
+  if (dhparam !== undefined && dhparam !== null) {
+    validateKeyOrCertOption(`${name}.dhparam`, dhparam);
+    const warning = context.setDHParam(dhparam === 'auto' || dhparam);
+    if (warning) process.emitWarning(warning, 'SecurityWarning');
+  }
+  if (crl !== undefined && crl !== null) {
+    for (const value of Array.isArray(crl) ? crl : [crl]) { validateKeyOrCertOption(`${name}.crl`, value); context.addCRL(value); }
+  }
+  if (sessionIdContext !== undefined && sessionIdContext !== null) {
+    validateString(sessionIdContext, `${name}.sessionIdContext`);
+    context.setSessionIdContext(sessionIdContext);
+  }
+  if (pfx !== undefined && pfx !== null) {
+    for (const value of Array.isArray(pfx) ? pfx : [pfx]) {
+      const raw = value.buf || value, pass = value.passphrase || passphrase;
+      context.loadPKCS12(raw, pass !== undefined && pass !== null ? pass : undefined);
+    }
+  }
+  if (typeof clientCertEngine === 'string') throw new codes.ERR_CRYPTO_CUSTOM_ENGINE_NOT_SUPPORTED();
+  if (clientCertEngine !== undefined && clientCertEngine !== null)
+    throw invalidArgType(`${name}.clientCertEngine`, ['string', 'null', 'undefined'], clientCertEngine);
+  if (ticketKeys !== undefined && ticketKeys !== null) {
+    validateBuffer(ticketKeys, `${name}.ticketKeys`);
+    if (ticketKeys.byteLength !== 48) throw invalidArgValue(`${name}.ticketKeys`, ticketKeys.byteLength, 'must be exactly 48 bytes');
+    context.setTicketKeys(ticketKeys);
+  }
+  if (sessionTimeout !== undefined && sessionTimeout !== null) {
+    validateInt32(sessionTimeout, `${name}.sessionTimeout`, 0);
+    context.setSessionTimeout(sessionTimeout);
+  }
+}
+function createSecureContext(options) {
+  options ||= {};
+  const { honorCipherOrder, minVersion, maxVersion, secureProtocol, singleUse } = options;
+  let { secureOptions } = options;
+  if (honorCipherOrder) secureOptions |= SSL_OP_CIPHER_SERVER_PREFERENCE;
+  const c = new SecureContext(secureProtocol, secureOptions, minVersion, maxVersion);
+  configSecureContext(c.context, options);
+  if (singleUse) c.singleUse = true;
+  return c;
+}
+
+function alpn(value) {
+  if (value === undefined) return Buffer.alloc(0);
+  const out = {};
+  require('tls').convertALPNProtocols(value, out);
+  if (out.ALPNProtocols === undefined) throw invalidArgType('ALPNProtocols', ['Array', 'Buffer', 'TypedArray', 'DataView'], value);
+  return out.ALPNProtocols;
+}
+module.exports = {
+  SecureContext, createSecureContext, configSecureContext, NativeSecureContext, ticketKeysBuffer, native, bytes, alpn, error,
+  bundledRootCertificates: bundled, getCACertificates, setDefaultCACertificates,
+};

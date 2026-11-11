@@ -39,6 +39,7 @@ const { native } = require('internal/net/transport');
 const { Buffer } = require('buffer');
 const EventEmitter = require('events');
 const { deprecate } = require('util');
+const diagnostics = require('internal/host').diagnostics;
 
 const BIND_STATE_UNBOUND = 0;
 const BIND_STATE_BINDING = 1;
@@ -119,6 +120,7 @@ function Socket(type, listener) {
       this.once('close', () => signal.removeEventListener('abort', onAborted));
     }
   }
+  diagnostics.publish('udp.socket', { socket: this });
 }
 Object.setPrototypeOf(Socket.prototype, EventEmitter.prototype);
 Object.setPrototypeOf(Socket, EventEmitter);

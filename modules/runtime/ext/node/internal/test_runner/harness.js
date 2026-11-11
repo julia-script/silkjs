@@ -5,7 +5,8 @@ const { Readable } = require('stream');
 const assert = require('assert');
 const { MockTracker } = require('internal/test_runner/mock');
 const host = require('internal/host');
-const { codes: { ERR_INVALID_ARG_TYPE }, validateObject, validateString, validateFunction, validateNumber, validateInteger, validateAbortSignal } = require('internal/validators');
+const { codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_INVALID_STATE } } = require('internal/errors');
+const { validateUint32, validateObject, validateString, validateFunction, validateNumber, validateInteger, validateAbortSignal } = require('internal/validators');
 const context = new AsyncLocalStorage();
 const nativeSetTimeout = globalThis.setTimeout;
 const nativeClearTimeout = globalThis.clearTimeout;
@@ -19,12 +20,10 @@ function failure(message, failureType = 'testCodeFailure', cause) {
 }
 function invalid(message) { return Object.assign(new TypeError(message), { code: 'ERR_INVALID_ARG_VALUE' }); }
 function unsupported(name) { throw Object.assign(new Error(`${name} is not supported by the Silk test runner`), { code: 'ERR_NOT_SUPPORTED' }); }
+const kCancelledByParentFailure = () => failure('test did not finish before its parent and was cancelled', 'cancelledByParent');
 function deferred() { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; }
 const TIMEOUT_MAX = 2 ** 31 - 1;
-function invalidValue(name, value, reason) {
-  const kind = name.includes('.') || name.includes('[') ? 'property' : 'argument';
-  return Object.assign(new TypeError(`The ${kind} '${name}' ${reason}. Received ${require('util').inspect(value)}`), { code: 'ERR_INVALID_ARG_VALUE' });
-}
+function invalidValue(name, value, reason) { return new ERR_INVALID_ARG_VALUE(name, value, reason); }
 const kEmptyTags = Object.freeze([]);
 let warnedTags = false;
 function tagFilter(value, name) {
@@ -57,8 +56,11 @@ function parse(args) {
   if (typeof name === 'function') { fn = name; name = undefined; options = undefined; }
   else if (name !== null && typeof name === 'object') { fn = options; options = name; name = undefined; }
   else if (typeof options === 'function') { fn = options; options = undefined; }
-  if (options == null) options = {};
+  if (options == null) options = { __proto__: null };
   validateObject(options, 'options');
+  // Node spreads the options over name and fn, so options.name and options.fn win.
+  if (options.name !== undefined) name = options.name;
+  if (options.fn !== undefined) fn = options.fn;
   if (typeof name !== 'string' || name === '') name = fn?.name || '<anonymous>';
   if (fn !== undefined && typeof fn !== 'function') throw new ERR_INVALID_ARG_TYPE('fn', 'function', fn);
   validateTimeout(options.timeout, 'options.timeout');
@@ -135,11 +137,6 @@ function testMatches(patterns, node) {
   }
   return false;
 }
-function settledCount(node) {
-  let count = 0;
-  for (const child of node.children) count += (child.state === 'done') + settledCount(child);
-  return count;
-}
 function visibleChildren(node) { return node.children.filter(child => !child.filtered && (!child.nameFiltered || child.error)); }
 const taggedEvents = new Set(['test:enqueue', 'test:dequeue', 'test:start', 'test:pass', 'test:fail', 'test:complete']);
 class TestsStream extends Readable {
@@ -147,17 +144,13 @@ class TestsStream extends Readable {
   publish(type, data) { this.emit(type, data); this.push({ type, data }); }
 }
 class AssertionPlan {
-  constructor(count, options) {
-    if (typeof count !== 'number') throw Object.assign(new TypeError('count must be a number'), { code: 'ERR_INVALID_ARG_TYPE' });
-    if (!Number.isInteger(count) || count < 0 || count > 4294967295)
-      throw Object.assign(new RangeError('count must be an unsigned 32-bit integer'), { code: 'ERR_OUT_OF_RANGE' });
-    if (options === null || typeof options !== 'object' || Array.isArray(options))
-      throw Object.assign(new TypeError('options must be an object'), { code: 'ERR_INVALID_ARG_TYPE' });
-    const wait = options.wait;
-    if (wait !== undefined && typeof wait !== 'boolean' && typeof wait !== 'number')
-      throw Object.assign(new TypeError('options.wait must be a boolean or number'), { code: 'ERR_INVALID_ARG_TYPE' });
-    if (typeof wait === 'number' && (!Number.isFinite(wait) || wait < 0 || wait > 2147483647))
-      throw Object.assign(new RangeError('options.wait must be between 0 and 2147483647'), { code: 'ERR_OUT_OF_RANGE' });
+  // Node's TestPlan validation.
+  constructor(count, options = { __proto__: null }) {
+    validateUint32(count, 'count');
+    validateObject(options, 'options');
+    const { wait } = options;
+    if (typeof wait === 'number') validateNumber(wait, 'options.wait', 0, TIMEOUT_MAX);
+    else if (wait !== undefined && typeof wait !== 'boolean') throw new ERR_INVALID_ARG_TYPE('options.wait', ['boolean', 'number'], wait);
     this.expected = count; this.actual = 0; this.wait = wait;
   }
   count() {
@@ -228,7 +221,7 @@ class TestContext {
   diagnostic(message) { (this._node.diagnostics ||= []).push(String(message)); }
   skip(message) { if (this._node.state === 'running') this._node.runtimeSkip = true; this._node.skip = message === undefined ? true : String(message) || true; }
   todo(message) { this._node.todo = message === undefined ? true : String(message) || true; }
-  runOnly(value) { if (typeof value !== 'boolean') throw invalid('runOnly requires a boolean'); this._node.runOnly = value; }
+  runOnly(value) { this._node.runOnlySubtests = !!value; }
   plan(count, options = {}) {
     if (this._node.plan !== undefined) throw failure('cannot set plan more than once');
     this._node.plan = new AssertionPlan(count, options);
@@ -265,7 +258,8 @@ class TestNode {
     this.skip = spec.options.skip === '' ? true : spec.options.skip;
     this.todo = spec.options.todo === '' ? true : spec.options.todo; this.only = !!spec.options.only;
     this.expectFailure = parseExpectFailure(spec.options.expectFailure) || parent?.expectFailure || false;
-    this.runOnly = parent?.runOnly ?? !!harness.options.only;
+    this.onlyOption = spec.options.only; this.hasOnlyTests = false;
+    this.runOnlySubtests = parent ? false : !!harness.options.only;
     this.nesting = parent ? parent.nesting + 1 : -1;
     this.fullName = parent?.parent ? `${parent.fullName} > ${this.name}` : this.name;
     this.filterName = parent?.parent ? `${parent.filterName} ${this.name}` : this.name;
@@ -278,16 +272,20 @@ class TestNode {
     if (this.state === 'done') return;
     this.error ||= error;
     this.controller.abort(error); this.cancelled.resolve();
-    for (const child of this.children) child.cancel(error);
+    // Node's postRun cancels outstanding subtests with its own cancelledByParent failure.
+    const pending = error?.failureType === 'testAborted' ? error : kCancelledByParentFailure();
+    for (const child of this.children) child.cancel(pending);
   }
 }
 class Harness {
   constructor(options = {}) {
     this.options = options; this.stream = new TestsStream(); this.file = options.file;
+    // Node's isFilteringByOnly: --test-only, or always for an isolation=none run.
+    this.filterByOnly = options.filterByOnly ?? !!options.only;
     this.names = pattern(options.testNamePatterns); this.skips = pattern(options.testSkipPatterns);
     this.randomSeed = options.randomSeed ?? (options.randomize ? createRandomSeed() : undefined);
     this.tagFilters = options.testTagFilters == null ? [] : [options.testTagFilters].flat().map((value, i) => tagFilter(value, `options.testTagFilters[${i}]`));
-    this.root = new TestNode(this, 'root', { name: '<root>', options, fn() {} }, null);
+    this.root = new TestNode(this, 'root', { name: '<root>', options: { __proto__: null, ...options }, fn() {} }, null);
     this.root.state = 'collecting'; this.started = false; this.finished = false;
     this.counts = { tests: 0, suites: 0, passed: 0, failed: 0, cancelled: 0, skipped: 0, todo: 0, topLevel: 0 };
     this.success = true;
@@ -317,12 +315,27 @@ class Harness {
     node.enqueued = true;
     this.emit('test:enqueue', node, { type: node.type });
   }
+  mayFilterByOnly(node) {
+    return this.filterByOnly && !node.only && !node.hasOnlyTests &&
+      (node.parent.runOnlySubtests || node.parent.hasOnlyTests || node.onlyOption === false);
+  }
   add(type, spec, parent = this.root) {
     const node = new TestNode(this, type, spec, parent);
     parent.children.push(node);
     node.nameFiltered = (this.names.length > 0 && !testMatches(this.names, node)) || testMatches(this.skips, node) ||
       (this.tagFilters.length > 0 && !this.tagFilters.every(tag => node.tags.includes(tag)));
-    if (!node.nameFiltered) {
+    // Node 24's --test-only filtering: an only test makes its parent run only such tests.
+    if (this.filterByOnly) {
+      if (node.only) {
+        parent.runOnlySubtests = true;
+        if (parent === this.root || parent.state === 'pending' || parent.state === 'collecting') {
+          for (let ancestor = parent; ancestor && !ancestor.hasOnlyTests; ancestor = ancestor.parent) ancestor.hasOnlyTests = true;
+        }
+      } else if (node.onlyOption === false) node.fn = function() {};
+    } else if (node.only || parent.runOnlySubtests) {
+      (node.diagnostics ||= []).push("'only' and 'runOnly' require the --test-only command-line option.");
+    }
+    if (!node.nameFiltered && !this.mayFilterByOnly(node)) {
       for (let ancestor = parent; ancestor.parent; ancestor = ancestor.parent) ancestor.nameFiltered = false;
       this.enqueue(node);
     }
@@ -434,11 +447,9 @@ class Harness {
     node.state = 'building';
     const ancestors = [];
     for (let p = node.parent; p; p = p.parent) ancestors.unshift(p);
-    if (node.parent?.controller.signal.aborted) node.cancel(node.parent.error || failure('cancelled by parent', 'cancelledByParent'));
+    if (node.parent?.controller.signal.aborted) node.cancel(node.parent.error?.failureType === 'testAborted' ? node.parent.error : kCancelledByParentFailure());
     if (node.parent?.skip) node.skip ||= node.parent.skip;
     if (node.parent?.todo) node.todo ||= node.parent.todo;
-    const selectedAncestor = ancestors.some(p => p.only);
-    if (node.runOnly && !node.only && !selectedAncestor && node.type !== 'suite') node.skip ||= "'only' option not set";
     let timeout;
     const timeoutMs = node.options.timeout ?? this.options.timeout;
     const signal = node.options.signal;
@@ -447,14 +458,7 @@ class Harness {
     if (Number.isFinite(timeoutMs) && !node.skip) timeout = nativeSetTimeout(() => node.cancel(failure(`test timed out after ${timeoutMs}ms`, 'testTimeoutFailure')), timeoutMs);
     try {
       if (node.build && !node.skip && !node.error) await Promise.race([this.collect(node), node.cancelled.promise]);
-      if (node.type === 'suite' && !node.skip && !node.error) {
-        const descendantsMatch = predicate => {
-          const visit = parent => parent.children.some(child => predicate(child) || visit(child));
-          return visit(node);
-        };
-        if (node.runOnly && !node.only && !selectedAncestor && !descendantsMatch(child => child.only)) node.skip = "'only' option not set";
-      }
-      node.filtered = !!node.nameFiltered && !node.error;
+      node.filtered = (!!node.nameFiltered || this.mayFilterByOnly(node)) && !node.error;
       if (!node.filtered) {
         node.nameFiltered = false;
         this.enqueue(node);
@@ -472,19 +476,10 @@ class Harness {
         } else {
           await this.invoke(node.fn, node);
           await this.hooks(node, 'before');
-          // Unawaited subtests cannot outlive their parent test. Node starts a subtest
-          // synchronously, so one that needs no I/O or timer has finished by now there:
-          // let pending promise work settle before cancelling the rest.
-          for (let settled = -1; ;) {
-            if (node.children.every(child => child.state === 'done')) break;
-            const done = settledCount(node);
-            if (done === settled) break;
-            settled = done;
-            await new Promise(resolve => nativeSetImmediate(resolve));
-          }
-          for (const child of node.children) if (child.state !== 'done') child.cancel(failure('test did not finish before its parent', 'cancelledByParent'));
+          // Like Node 24's subtestsPromise, a test waits for the subtests it started without
+          // awaiting them, unless it is cancelled first.
           this.pump(node);
-          await Promise.all(node.children.map(child => child.done.promise));
+          await Promise.race([Promise.all(node.children.map(child => child.done.promise)), node.cancelled.promise]);
         }
         const planWait = node.plan?.check(node);
         if (planWait) await planWait;
@@ -500,7 +495,7 @@ class Harness {
       for (const child of node.children) if (child.state !== 'done') {
         if (node.filtered) { child.nameFiltered = true; child.filtered = true; }
         else if (node.skip) child.skip ||= node.skip;
-        else child.cancel(node.error || failure('cancelled by parent', 'cancelledByParent'));
+        else child.cancel(kCancelledByParentFailure());
       }
       this.pump(node);
       await Promise.all(node.children.map(child => child.done.promise));
@@ -601,7 +596,9 @@ class Harness {
       do {
         length = this.root.children.length;
         await Promise.all(this.root.children.map(child => child.done.promise));
-        if (this.collection) {
+        // Like Node, once every top-level test has finished the root runs its after() hooks
+        // without waiting for ref'ed handles to go idle; an empty root still waits for them.
+        if (this.collection && this.root.children.length === 0) {
           this.waitingForIdle = true;
           await Promise.race([this.collection.promise, this.root.cancelled.promise]);
           this.waitingForIdle = false;
@@ -696,7 +693,7 @@ function reportToParent(stream) {
   stream.on('end', () => process.disconnect());
 }
 function configure(options = {}) {
-  if (defaultHarness) throw Object.assign(new Error('The default test harness is already initialized'), { code: 'ERR_INVALID_STATE' });
+  if (defaultHarness) throw new ERR_INVALID_STATE('The default test harness is already initialized');
   defaultHarness = createHarness(options);
   return defaultHarness;
 }
