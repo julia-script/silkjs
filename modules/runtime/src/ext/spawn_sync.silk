@@ -1,0 +1,624 @@
+//! child_process.spawnSync without an event loop.
+//!
+//! The child starts with posix_spawn, which glibc and Darwin run as a vfork-style clone, so a large
+//! parent costs nothing to copy. Only a user or group change forks. The parent then waits in one
+//! poll over the stdio socket pairs and the child's exit descriptor (a pidfd on Linux, a kqueue on
+//! Darwin), so the wait ends as soon as both the output and the exit are in.
+//!
+//! The program is searched like libuv does: a name without a slash is looked up in the child's
+//! PATH, relative entries against the child's working directory.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.core.ownership { Drop }
+import silk.system.subprocess { ExitStatus, ExitWatch, Subprocess, SubprocessError }
+import silk.num.i32
+import silk.num.isize
+import silk.num.u8
+import silk.num.u64
+import silk.num.usize
+import silk.num.f64
+import silkjs.js_libc_platform as platform
+import ext.process_abi as abi
+import ext.dns_abi as posix
+
+/// What a spawnSync call asks for, as process_native decodes it from JavaScript.
+pub struct Request {
+  /// The program as given, without NUL.
+  pub file: List<u8>,
+  /// argv entries, each NUL-terminated, then one more NUL.
+  pub arguments: List<u8>,
+  /// Environment entries like `arguments`.
+  pub environment: List<u8>,
+  /// The working directory without NUL, or empty for the parent's.
+  pub directory: List<u8>,
+  /// One entry per slot: -1 pipe, -2 ignore, or a parent descriptor the child gets.
+  pub slots: List<i32>,
+  pub detached: bool,
+  pub hasUser: bool,
+  pub user: u32,
+  pub hasGroup: bool,
+  pub group: u32,
+  /// Bytes for the child's standard input, written while it runs.
+  pub input: List<u8>,
+  /// Milliseconds, 0 for none.
+  pub timeout: f64,
+  /// Total output bytes allowed, Infinity for no limit.
+  pub maximum: f64,
+  pub killSignal: i32,
+}
+
+/// The end of a child: `error` is 0 or a negative errno (timeout, output limit), and `outputs`
+/// holds what each piped slot wrote.
+pub struct Outcome {
+  pub error: i32,
+  pub pid: i32,
+  pub status: ExitStatus,
+  pub outputs: List<List<u8>>,
+}
+
+struct Descriptors { fds: List<i32> }
+impl Drop for Descriptors {
+  fn drop(self: &mut Self) -> () {
+    let fds = self.fds.asMutSlice()
+    let mut i: usize = 0
+    while i < fds.length {
+      let fd = Intrinsic.replace(fds[i], -1)
+      if fd >= 0 { let _closed = unsafe abi.close(fd) }
+      i = i + 1
+    }
+  }
+}
+impl Descriptors {
+  effect fn make(count: usize) -> Descriptors ! OutOfMemoryError ? &mut Allocator {
+    let mut fds = run List<i32>.makeWithCapacity(count)
+    let mut i: usize = 0
+    while i < count { run fds.append(-1) i = i + 1 }
+    return Descriptors { fds: move fds }
+  }
+  fn get(self: &Self, slot: usize) -> i32 { return self.fds.asSlice()[slot] }
+  fn set(self: &mut Self, slot: usize, fd: i32) -> () { let fds = self.fds.asMutSlice() fds[slot] = fd }
+  fn close(self: &mut Self, slot: usize) -> () {
+    let fds = self.fds.asMutSlice()
+    let fd = Intrinsic.replace(fds[slot], -1)
+    if fd >= 0 { let _closed = unsafe abi.close(fd) }
+  }
+}
+
+@foreign(noCapture: .("path"))
+unsafe extern "C" fn access(path: ?[*]const u8, mode: i32) -> i32
+unsafe extern "C" fn strlen(text: [*]const u8) -> usize
+unsafe extern "C" fn malloc(size: usize) -> ?*mut u8
+unsafe extern "C" fn free(data: ?*mut u8) -> ()
+@foreign(noCapture: .("path"))
+unsafe extern "C" fn open(path: ?[*]const u8, flags: i32, ...) -> i32
+unsafe extern "C" fn fcntl(fd: i32, command: i32, ...) -> i32
+@foreign(noCapture: .("fds"))
+unsafe extern "C" fn pipe(fds: [*]mut i32) -> i32
+@foreign(noCapture: .("status"))
+unsafe extern "C" fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32
+unsafe extern "C" fn fork() -> i32
+unsafe extern "C" fn dup2(from: i32, to: i32) -> i32
+@foreign(noCapture: .("path"))
+unsafe extern "C" fn chdir(path: ?[*]const u8) -> i32
+unsafe extern "C" fn execve(path: ?[*]const u8, arguments: ?[*]const ?[*]const u8, environment: ?[*]const ?[*]const u8) -> i32
+unsafe extern "C" fn _exit(status: i32) -> ()
+unsafe extern "C" fn setsid() -> i32
+unsafe extern "C" fn setuid(user: u32) -> i32
+unsafe extern "C" fn setgid(group: u32) -> i32
+@foreign(noCapture: .("groups"))
+unsafe extern "C" fn setgroups(count: usize, groups: ?[*]const u32) -> i32
+unsafe extern "C" fn signal(number: i32, handler: usize) -> usize
+@foreign(noCapture: .("buffer"))
+unsafe extern "C" fn write(fd: i32, buffer: ?[*]const u8, count: usize) -> isize
+
+const X_OK: i32 = 1
+const F_SETFD: i32 = 2
+const FD_CLOEXEC: i32 = 1
+const SPAWN_SETSIGDEF: i16 = 4
+const SPAWN_SETSIGMASK: i16 = 8
+
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  const CLOEXEC: i32 = 16777216
+  const READ_WRITE: i32 = 2
+  const DUP_CLOEXEC: i32 = 67
+  const SIGNAL_STOP: i32 = 17
+  const SIGNAL_SETMASK: i32 = 3
+  const SPAWN_SETSID: i16 = 1024
+  // Darwin closes every descriptor the file actions do not name, as libuv asks there too.
+  const SPAWN_CLOEXEC_DEFAULT: i16 = 16384
+  const TIMED_OUT: i32 = -60
+  const NO_BUFFERS: i32 = -55
+  extern "C" struct SignalSet { bits: u32 }
+  fn signalSet(full: bool) -> SignalSet {
+    if !full { return SignalSet { bits: 0 } }
+    return SignalSet { bits: 2147483647 & ~(256 | 65536) }
+  }
+  extern "C" struct Actions { value: ?*mut u8 }
+  extern "C" struct Attributes { value: ?*mut u8 }
+  fn emptyActions() -> Actions { return Actions { value: Pointer.null<u8>() } }
+  fn emptyAttributes() -> Attributes { return Attributes { value: Pointer.null<u8>() } }
+} else {
+  const CLOEXEC: i32 = 524288
+  const READ_WRITE: i32 = 2
+  const DUP_CLOEXEC: i32 = 1030
+  const SIGNAL_STOP: i32 = 19
+  const SIGNAL_SETMASK: i32 = 2
+  const SPAWN_SETSID: i16 = 128
+  const TIMED_OUT: i32 = -110
+  const NO_BUFFERS: i32 = -105
+  extern "C" struct SignalSet { words: [u64; 16] }
+  fn signalSet(full: bool) -> SignalSet {
+    let mut set = SignalSet { words: [0; 16] }
+    if full { set.words[0] = 2147483647 & ~(256 | 262144) }
+    return move set
+  }
+  extern "C" struct Actions { words: [u64; 10] }
+  extern "C" struct Attributes { words: [u64; 42] }
+  fn emptyActions() -> Actions { return Actions { words: [0; 10] } }
+  fn emptyAttributes() -> Attributes { return Attributes { words: [0; 42] } }
+}
+
+@foreign(noCapture: .("set", "previous"))
+unsafe extern "C" fn sigprocmask(how: i32, set: ?*const SignalSet, previous: ?*mut SignalSet) -> i32
+@foreign(noCapture: .("value"))
+unsafe extern "C" fn posix_spawn_file_actions_init(value: *mut Actions) -> i32
+@foreign(noCapture: .("value"))
+unsafe extern "C" fn posix_spawn_file_actions_destroy(value: *mut Actions) -> i32
+@foreign(noCapture: .("value"))
+unsafe extern "C" fn posix_spawn_file_actions_adddup2(value: *mut Actions, from: i32, to: i32) -> i32
+@foreign(noCapture: ("value", "path"))
+unsafe extern "C" fn posix_spawn_file_actions_addchdir_np(value: *mut Actions, path: ?[*]const u8) -> i32
+@foreign(noCapture: .("value"))
+unsafe extern "C" fn posix_spawnattr_init(value: *mut Attributes) -> i32
+@foreign(noCapture: .("value"))
+unsafe extern "C" fn posix_spawnattr_destroy(value: *mut Attributes) -> i32
+@foreign(noCapture: .("value"))
+unsafe extern "C" fn posix_spawnattr_setflags(value: *mut Attributes, flags: i16) -> i32
+@foreign(noCapture: ("value", "set"))
+unsafe extern "C" fn posix_spawnattr_setsigmask(value: *mut Attributes, set: *const SignalSet) -> i32
+@foreign(noCapture: ("value", "set"))
+unsafe extern "C" fn posix_spawnattr_setsigdefault(value: *mut Attributes, set: *const SignalSet) -> i32
+@foreign(noCapture: ("pid", "path", "actions", "attributes", "arguments", "environment"))
+unsafe extern "C" fn posix_spawn(
+  pid: *mut i32,
+  path: ?[*]const u8,
+  actions: *const Actions,
+  attributes: *const Attributes,
+  arguments: ?[*]const ?[*]const u8,
+  environment: ?[*]const ?[*]const u8,
+) -> i32
+
+struct OwnedActions { handle: Actions }
+impl Drop for OwnedActions {
+  fn drop(self: &mut Self) -> () { let _ignored = unsafe posix_spawn_file_actions_destroy(Pointer.fromMutRef<Actions>(&mut self.handle)) }
+}
+struct OwnedAttributes { handle: Attributes }
+impl Drop for OwnedAttributes {
+  fn drop(self: &mut Self) -> () { let _ignored = unsafe posix_spawnattr_destroy(Pointer.fromMutRef<Attributes>(&mut self.handle)) }
+}
+
+fn nullText() -> ?[*]const u8 {
+  unsafe { return Intrinsic.pointerRequalify<?*mut u8, ?[*]const u8>(Pointer.null<u8>()) }
+}
+
+fn textPointer(text: &List<u8>) -> ?[*]const u8 { return Pointer.fromSlice<u8>(text.asSlice()) }
+
+/// Pointers to each NUL-terminated entry of `text`, then a null pointer. Entries may be empty
+/// (an argument of ''), so only the final extra NUL, when present, ends the list.
+effect fn vector(text: &List<u8>) -> List<?[*]const u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut result = List<?[*]const u8>.make()
+  let data = text.asSlice()
+  let mut i: usize = 0
+  while i + 1 < data.length {
+    let entry = unsafe entryAt(data, i)
+    run result.append(entry)
+    i = i + unsafe strlen(unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(entry)) + 1
+  }
+  run result.append(nullText())
+  return move result
+}
+
+/// The entry of NUL-terminated `data` that starts at `offset`.
+unsafe fn entryAt(data: &[u8], offset: usize) -> ?[*]const u8 {
+  unsafe {
+    let base = Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(Pointer.fromSlice<u8>(data))
+    return Pointer.assumeMany<u8>(Pointer.at<u8>(base, offset))
+  }
+}
+
+fn hasSlash(text: &[u8]) -> bool {
+  let mut i: usize = 0
+  while i < text.length { if text[i] == 47 { return true } i = i + 1 }
+  return false
+}
+
+/// The PATH the child sees, from its own environment.
+effect fn searchPath(request: &Request) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut result = List<u8>.make()
+  let data = request.environment.asSlice()
+  let mut i: usize = 0
+  while i + 1 < data.length {
+    let start = i
+    i = i + unsafe strlen(unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(unsafe entryAt(data, i)))
+    if i - start >= 5 && data[start] == 80 && data[start + 1] == 65 && data[start + 2] == 84 && data[start + 3] == 72 && data[start + 4] == 61 {
+      run result.appendSlice(Slice.view<u8>(data, start + 5, i - start - 5))
+      return move result
+    }
+    i = i + 1
+  }
+  // libuv's _PATH_DEFPATH.
+  run result.appendSlice(b"/usr/bin:/bin")
+  return move result
+}
+
+/// Appends `path`, prefixed with the child's working directory when both are relative to it.
+effect fn appendRelative(out: &mut List<u8>, directory: &[u8], path: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  if directory.length > 0 && (path.length == 0 || path[0] != 47) {
+    run out.appendSlice(directory)
+    run out.append(47)
+  }
+  run out.appendSlice(path)
+}
+
+/// The NUL-terminated program to run in `found`, or the errno for none.
+effect fn locate(request: &Request, found: &mut List<u8>) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  let file = request.file.asSlice()
+  let directory = request.directory.asSlice()
+  if hasSlash(file) {
+    run appendRelative(&mut found.*, directory, file)
+    run found.append(0)
+    return 0
+  }
+  let search = run searchPath(request)
+  let entries = search.asSlice()
+  let mut denied = false
+  let mut start: usize = 0
+  while start <= entries.length {
+    let mut end = start
+    while end < entries.length && entries[end] != 58 { end = end + 1 }
+    found.clear()
+    if end == start { run found.append(46) } else { run appendRelative(&mut found.*, directory, Slice.view<u8>(entries, start, end - start)) }
+    run found.append(47)
+    run found.appendSlice(file)
+    run found.append(0)
+    if unsafe access(textPointer(&found.*), X_OK) == 0 { return 0 }
+    if unsafe platform.errno() == 13 { denied = true }
+    start = end + 1
+  }
+  found.clear()
+  if denied { return 13 }
+  return 2
+}
+
+/// The working directory to change to, NUL-terminated, or an empty list for the parent's.
+effect fn changedDirectory(request: &Request) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut result = List<u8>.make()
+  if request.directory.length() == 0 { return move result }
+  run result.appendSlice(request.directory.asSlice())
+  run result.append(0)
+  return move result
+}
+
+/// A copy of `fd` at `lowest` or above, close-on-exec, so that no dup2 into a lower slot can
+/// overwrite a source that a later slot still needs.
+unsafe fn moveAbove(fd: i32, lowest: i32) -> i32 {
+  let copy = unsafe fcntl(fd, DUP_CLOEXEC, lowest)
+  if copy < 0 { return -(unsafe platform.errno()) }
+  return copy
+}
+
+/// Opens the child ends: `sources[slot]` is what the child gets in `slot`, `parents[slot]` the
+/// parent end of a pipe. Returns 0 or an errno.
+unsafe effect fn prepare(request: &Request, sources: &mut Descriptors, parents: &mut Descriptors) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  let slots = request.slots.asSlice()
+  let lowest = usize.toI32(slots.length)
+  let mut slot: usize = 0
+  while slot < slots.length {
+    let kind = slots[slot]
+    if kind == -1 {
+      let mut pair: [i32; 2] = [-1, -1]
+      let mut socketKind: i32 = 1
+      static if Intrinsic.targetOperatingSystem() == "linux" { socketKind = 1 | CLOEXEC }
+      if unsafe abi.socketpair(1, socketKind, 0, Pointer.fromMutRef<i32>(&mut pair[0])) < 0 { return unsafe platform.errno() }
+      static if Intrinsic.targetOperatingSystem() == "darwin" {
+        let _a = unsafe fcntl(pair[0], F_SETFD, FD_CLOEXEC)
+        let _b = unsafe fcntl(pair[1], F_SETFD, FD_CLOEXEC)
+      }
+      parents.set(slot, pair[0])
+      if pair[1] < lowest {
+        let moved = unsafe moveAbove(pair[1], lowest)
+        let _closed = unsafe abi.close(pair[1])
+        if moved < 0 { return -moved }
+        sources.set(slot, moved)
+      } else {
+        sources.set(slot, pair[1])
+      }
+    } else if kind == -2 {
+      if slot < 3 {
+        let opened = unsafe open(Pointer.fromSlice<u8>(b"/dev/null\0"), READ_WRITE | CLOEXEC)
+        if opened < 0 { return unsafe platform.errno() }
+        if opened < lowest {
+          let moved = unsafe moveAbove(opened, lowest)
+          let _closed = unsafe abi.close(opened)
+          if moved < 0 { return -moved }
+          sources.set(slot, moved)
+        } else {
+          sources.set(slot, opened)
+        }
+      }
+    } else {
+      let moved = unsafe moveAbove(kind, lowest)
+      if moved < 0 { return -moved }
+      sources.set(slot, moved)
+    }
+    slot = slot + 1
+  }
+  return 0
+}
+
+unsafe fn launchSpawned(program: ?[*]const u8, arguments: ?[*]const ?[*]const u8, environment: ?[*]const ?[*]const u8, directory: &List<u8>, detached: bool, sources: &Descriptors, pid: &mut i32) -> i32 {
+  let mut actionsValue = emptyActions()
+  let initialized = unsafe posix_spawn_file_actions_init(Pointer.fromMutRef<Actions>(&mut actionsValue))
+  if initialized != 0 { return initialized }
+  let mut actions = OwnedActions { handle: move actionsValue }
+  let mut attributesValue = emptyAttributes()
+  let prepared = unsafe posix_spawnattr_init(Pointer.fromMutRef<Attributes>(&mut attributesValue))
+  if prepared != 0 { return prepared }
+  let mut attributes = OwnedAttributes { handle: move attributesValue }
+  let attributePointer = Pointer.fromMutRef<Attributes>(&mut attributes.handle)
+  let mut flags = SPAWN_SETSIGDEF | SPAWN_SETSIGMASK
+  if detached { flags = flags | SPAWN_SETSID }
+  static if Intrinsic.targetOperatingSystem() == "darwin" { flags = flags | SPAWN_CLOEXEC_DEFAULT }
+  let flagged = unsafe posix_spawnattr_setflags(attributePointer, flags)
+  if flagged != 0 { return flagged }
+  let empty = signalSet(false)
+  let masked = unsafe posix_spawnattr_setsigmask(attributePointer, Pointer.fromRef<SignalSet>(&empty))
+  if masked != 0 { return masked }
+  let full = signalSet(true)
+  let defaulted = unsafe posix_spawnattr_setsigdefault(attributePointer, Pointer.fromRef<SignalSet>(&full))
+  if defaulted != 0 { return defaulted }
+  let actionPointer = Pointer.fromMutRef<Actions>(&mut actions.handle)
+  let count = sources.fds.length()
+  let mut slot: usize = 0
+  while slot < count {
+    let source = sources.get(slot)
+    if source >= 0 {
+      let duplicated = unsafe posix_spawn_file_actions_adddup2(actionPointer, source, usize.toI32(slot))
+      if duplicated != 0 { return duplicated }
+    }
+    slot = slot + 1
+  }
+  if directory.length() > 0 {
+    let changed = unsafe posix_spawn_file_actions_addchdir_np(actionPointer, textPointer(directory))
+    if changed != 0 { return changed }
+  }
+  return unsafe posix_spawn(Pointer.fromMutRef<i32>(&mut pid.*), program, Pointer.fromRef<Actions>(&actions.handle), Pointer.fromRef<Attributes>(&attributes.handle), arguments, environment)
+}
+
+/// fork and exec for a user or group change, which posix_spawn cannot make.
+unsafe fn launchForked(request: &Request, program: ?[*]const u8, arguments: ?[*]const ?[*]const u8, environment: ?[*]const ?[*]const u8, directory: &List<u8>, sources: &Descriptors, pid: &mut i32) -> i32 {
+  let mut report: [i32; 2] = [-1, -1]
+  if unsafe pipe(unsafe Intrinsic.pointerRequalify<?[*]mut i32, [*]mut i32>(Pointer.fromMutSlice<i32>(&mut report))) != 0 { return unsafe platform.errno() }
+  let _a = unsafe fcntl(report[0], F_SETFD, FD_CLOEXEC)
+  let _b = unsafe fcntl(report[1], F_SETFD, FD_CLOEXEC)
+  let full = signalSet(true)
+  let mut previous = signalSet(false)
+  let _blocked = unsafe sigprocmask(SIGNAL_SETMASK, Pointer.fromRef<SignalSet>(&full), Pointer.fromMutRef<SignalSet>(&mut previous))
+  let child = unsafe fork()
+  if child == 0 {
+    // Only async-signal-safe calls between fork and exec.
+    let mut number: i32 = 1
+    while number < 32 {
+      if number != 9 && number != SIGNAL_STOP { let _reset = unsafe signal(number, 0) }
+      number = number + 1
+    }
+    let empty = signalSet(false)
+    let _unmasked = unsafe sigprocmask(SIGNAL_SETMASK, Pointer.fromRef<SignalSet>(&empty), Pointer.null<SignalSet>())
+    let mut failed = false
+    if request.detached { failed = unsafe setsid() < 0 }
+    if !failed && request.hasGroup {
+      let none: [u32; 0] = []
+      let _cleared = unsafe setgroups(0, Pointer.fromSlice<u32>(&none))
+      failed = unsafe setgid(request.group) != 0
+    }
+    if !failed && request.hasUser { failed = unsafe setuid(request.user) != 0 }
+    let count = sources.fds.length()
+    let mut slot: usize = 0
+    while !failed && slot < count {
+      let source = sources.get(slot)
+      if source >= 0 { failed = unsafe dup2(source, usize.toI32(slot)) < 0 }
+      slot = slot + 1
+    }
+    if !failed && directory.length() > 0 { failed = unsafe chdir(textPointer(directory)) != 0 }
+    if !failed { let _ignored = unsafe execve(program, arguments, environment) }
+    let code: [i32; 1] = [unsafe platform.errno()]
+    let _written = unsafe write(report[1], unsafe Intrinsic.pointerReinterpret<?[*]const i32, ?[*]const u8>(Pointer.fromSlice<i32>(&code)), 4)
+    unsafe _exit(127)
+  }
+  let forkError = if child < 0 { unsafe platform.errno() } else { 0 }
+  let _restored = unsafe sigprocmask(SIGNAL_SETMASK, Pointer.fromRef<SignalSet>(&previous), Pointer.null<SignalSet>())
+  let _closedWriter = unsafe abi.close(report[1])
+  if child < 0 { let _closedReader = unsafe abi.close(report[0]) return forkError }
+  let mut code: [i32; 1] = [0]
+  let mut received: isize = -1
+  while received < 0 {
+    received = unsafe abi.read(report[0], unsafe Intrinsic.pointerReinterpret<*mut i32, *mut u8>(Pointer.fromMutRef<i32>(&mut code[0])), 4)
+    if received < 0 && unsafe platform.errno() != 4 { break }
+  }
+  let _closedReader = unsafe abi.close(report[0])
+  if received <= 0 { pid.* = child return 0 }
+  let mut status: i32 = 0
+  while unsafe waitpid(child, Pointer.fromMutRef<i32>(&mut status), 0) < 0 && unsafe platform.errno() == 4 {}
+  return code[0]
+}
+
+/// Starts the child. Returns its pid, or the negated errno of the failure to start it.
+unsafe effect fn start(request: &Request, parents: &mut Descriptors) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  let mut program = List<u8>.make()
+  let located = run locate(request, &mut program)
+  if located != 0 { return -located }
+  let directory = run changedDirectory(request)
+  let argv = run vector(&request.arguments)
+  let envp = run vector(&request.environment)
+  let environment = Pointer.fromSlice<?[*]const u8>(envp.asSlice())
+  let mut sources = run Descriptors.make(request.slots.length())
+  let opened = run unsafe prepare(request, &mut sources, &mut parents.*)
+  if opened != 0 { return -opened }
+  let mut pid: i32 = -1
+  let arguments = Pointer.fromSlice<?[*]const u8>(argv.asSlice())
+  let code = if request.hasUser || request.hasGroup {
+    unsafe launchForked(request, textPointer(&program), arguments, environment, &directory, &sources, &mut pid)
+  } else {
+    unsafe launchSpawned(textPointer(&program), arguments, environment, &directory, request.detached, &sources, &mut pid)
+  }
+  if code != 0 { return -code }
+  return pid
+}
+
+const SLAB: usize = 65536
+
+/// The read buffer: malloc, since a zeroed array would cost a 64 KiB memset on every call.
+struct Slab { data: *mut u8 }
+impl Drop for Slab { fn drop(self: &mut Self) -> () { unsafe free(unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(self.data)) } }
+impl Slab {
+  effect fn make() -> Slab ! OutOfMemoryError {
+    let raw = unsafe malloc(SLAB)
+    if Pointer.isNull<u8>(raw) { fail OutOfMemoryError {} }
+    return Slab { data: unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(raw) }
+  }
+}
+
+fn elapsed(started: u64) -> f64 { return u64.toF64(unsafe abi.uv_hrtime() - started) / 1000000.0 }
+
+/// Runs `request` to its end. A failure to start the child is a negative errno in `pid`.
+pub unsafe effect fn execute(request: &Request) -> Outcome ! OutOfMemoryError ? &mut Allocator {
+  let count = request.slots.length()
+  let mut parents = run Descriptors.make(count)
+  let mut outputs = List<List<u8>>.make()
+  let mut i: usize = 0
+  while i < count { run outputs.append(List<u8>.make()) i = i + 1 }
+  let pid = run unsafe start(request, &mut parents)
+  let mut status = ExitStatus { signaled: false, code: 0, signal: 0 }
+  if pid < 0 { return Outcome { error: 0, pid: pid, status: status, outputs: move outputs } }
+
+  // The parent ends are nonblocking; the exit descriptor joins them in the poll set.
+  i = 0
+  while i < count {
+    let fd = parents.get(i)
+    if fd >= 0 { let flags = unsafe fcntl(fd, 3, 0) let _set = unsafe fcntl(fd, 4, flags | abi.nonblockFlag()) }
+    i = i + 1
+  }
+  let watched = run Effect.result(ExitWatch.open(pid))
+  let mut watch = Option<ExitWatch>.none()
+  match move watched {
+    Result<ExitWatch, SubprocessError>.Success { value } => { watch = Option<ExitWatch>.some(move value) }
+    Result<ExitWatch, SubprocessError>.Failure { .. } => {}
+  }
+  let watchFd = match &watch { Option<ExitWatch>.Some { value } => value.descriptor() Option<ExitWatch>.None => -1 }
+  let input = request.input.asSlice()
+  let started = unsafe abi.uv_hrtime()
+  let mut offset: usize = 0
+  let mut error: i32 = 0
+  let mut total: usize = 0
+  let mut exited = false
+  let slab = run Slab.make()
+  let mut fds = List<posix.PollFd>.make()
+  i = 0
+  while i <= count { run fds.append(posix.PollFd { fd: -1, events: 0, revents: 0 }) i = i + 1 }
+  while true {
+    if parents.get(0) >= 0 && (offset >= input.length || exited || error != 0) { parents.close(0) }
+    let mut open = false
+    i = 0
+    while i < count { if parents.get(i) >= 0 { open = true } i = i + 1 }
+    if exited && !open { break }
+    let mut wait: i32 = -1
+    if watchFd < 0 && !exited { wait = 5 }
+    if error == 0 && request.timeout > 0.0 {
+      let left = request.timeout - elapsed(started)
+      let ms = if left <= 0.0 { 0 } else { f64.toI32(left) + 1 }
+      if wait < 0 || ms < wait { wait = ms }
+    }
+    let entries = fds.asMutSlice()
+    i = 0
+    while i < count {
+      entries[i].fd = parents.get(i)
+      entries[i].events = if i == 0 { 4 } else { 1 }
+      entries[i].revents = 0
+      i = i + 1
+    }
+    entries[count].fd = if exited { -1 } else { watchFd }
+    entries[count].events = 1
+    entries[count].revents = 0
+    drop entries
+    let mut ready: i32 = 0
+    static if Intrinsic.targetOperatingSystem() == "darwin" { ready = unsafe posix.systemPoll(Pointer.fromMutRef<posix.PollFd>(&mut fds.asMutSlice()[0]), usize.toU32(count + 1), wait) }
+    else { ready = unsafe posix.systemPoll(Pointer.fromMutRef<posix.PollFd>(&mut fds.asMutSlice()[0]), count + 1, wait) }
+    if !exited {
+      let mut collect = false
+      if watchFd >= 0 { collect = fds.asSlice()[count].revents != 0 }
+      if collect {
+        match &watch {
+          Option<ExitWatch>.Some { value } => {
+            match run Effect.result(value.collect()) {
+              Result<ExitStatus, SubprocessError>.Success { value: ended } => { status = ended }
+              Result<ExitStatus, SubprocessError>.Failure { .. } => {}
+            }
+          }
+          Option<ExitWatch>.None => {}
+        }
+        exited = true
+      } else if watchFd < 0 {
+        match run Effect.result(Subprocess.tryWait(pid)) {
+          Result<Option<ExitStatus>, SubprocessError>.Success { value: Option<ExitStatus>.Some { value: ended } } => { status = ended exited = true }
+          Result<Option<ExitStatus>, SubprocessError>.Success { value: Option<ExitStatus>.None } => {}
+          Result<Option<ExitStatus>, SubprocessError>.Failure { .. } => { exited = true }
+        }
+      }
+    }
+    if error == 0 && request.timeout > 0.0 && !exited && elapsed(started) >= request.timeout {
+      error = TIMED_OUT
+      let _killed = run Effect.result(Subprocess.kill(pid, request.killSignal))
+    }
+    if error != 0 {
+      i = 0
+      while i < count { parents.close(i) i = i + 1 }
+      continue
+    }
+    if ready <= 0 { continue }
+    i = 0
+    while i < count {
+      let fd = parents.get(i)
+      let events = fds.asSlice()[i].revents
+      if fd >= 0 && events != 0 {
+        let mut n: isize = 0
+        if i == 0 {
+          if offset < input.length {
+            n = unsafe abi.send(fd, Pointer.fromRef<u8>(&input[offset]), input.length - offset, abi.noSignal())
+            if n > 0 { offset = offset + isize.toUsize(n) }
+          }
+        } else {
+          n = unsafe abi.read(fd, slab.data, SLAB)
+          if n > 0 {
+            let length = isize.toUsize(n)
+            total = total + length
+            let anchor = length
+            run outputs.asMutSlice()[i].appendSlice(unsafe Pointer.borrowMany<usize, u8>(&anchor, unsafe Pointer.assumeManyMut<u8>(slab.data), length))
+            if usize.toF64(total) > request.maximum {
+              error = NO_BUFFERS
+              let _killed = run Effect.result(Subprocess.kill(pid, request.killSignal))
+            }
+          }
+        }
+        let code = if n < 0 { unsafe platform.errno() } else { 0 }
+        if n == 0 || (n < 0 && code != 4 && code != 11 && code != 35) { parents.close(i) }
+      }
+      i = i + 1
+    }
+  }
+  return Outcome { error: error, pid: pid, status: status, outputs: move outputs }
+}

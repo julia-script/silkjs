@@ -28,10 +28,11 @@ function normalize(file, args, options) {
   if (typeof options !== 'object' || Array.isArray(options)) throw invalid('options', 'object');
   options = { ...options };
   args = args.map((arg, i) => string(String(arg), `args[${i}]`));
-  let cwd = options.cwd === undefined ? process.cwd() : options.cwd;
+  // null: the child starts in this process's working directory.
+  let cwd = options.cwd === undefined ? null : options.cwd;
   if (cwd && typeof cwd === 'object' && cwd.href) cwd = require('url').fileURLToPath(cwd);
   if (Buffer.isBuffer(cwd)) cwd = cwd.toString();
-  string(cwd, 'options.cwd');
+  if (cwd !== null) string(cwd, 'options.cwd');
   let flags = options.detached ? 8 : 0;
   for (const key of ['uid', 'gid']) if (options[key] !== undefined) {
     if (!Number.isInteger(options[key]) || options[key] < 0 || options[key] > 0xffffffff) throw Object.assign(new RangeError(`${key} must be an unsigned 32-bit integer`), { code: 'ERR_OUT_OF_RANGE' });
@@ -48,8 +49,8 @@ function normalize(file, args, options) {
   const argv = [options.argv0 === undefined ? file : string(options.argv0, 'options.argv0'), ...args];
   const environment = options.env === undefined ? process.env : options.env;
   if (environment === null || typeof environment !== 'object') throw invalid('options.env', 'object');
-  const env = [];
-  for (const key of Object.keys(environment)) if (environment[key] !== undefined) env.push(`${string(key, 'env key')}=${string(String(environment[key]), `env.${key}`)}`);
+  // null hands this thread's own process.env to the child natively, without a copy key by key.
+  let env = environment === process.env ? null : [];
   let stdio = options.stdio;
   if (stdio === undefined || stdio === null) stdio = ['pipe', 'pipe', 'pipe'];
   else if (typeof stdio === 'string') {
@@ -74,13 +75,15 @@ function normalize(file, args, options) {
   });
   const serialization = options.serialization || 'json';
   if (serialization !== 'json' && serialization !== 'advanced') throw Object.assign(new TypeError('Unknown serialization mode'), { code: 'ERR_INVALID_ARG_VALUE' });
+  if (ipc >= 0 && env === null) env = [];
+  if (env !== null) for (const key of Object.keys(environment)) if (environment[key] !== undefined) env.push(`${string(key, 'env key')}=${string(String(environment[key]), `env.${key}`)}`);
   if (ipc >= 0) {
     for (let i = env.length - 1; i >= 0; i--) if (env[i].startsWith('NODE_CHANNEL_FD=') || env[i].startsWith('NODE_CHANNEL_SERIALIZATION_MODE=')) env.splice(i, 1);
     env.push(`NODE_CHANNEL_FD=${ipc}`, `NODE_CHANNEL_SERIALIZATION_MODE=${serialization}`);
   }
   if (options.signal !== undefined && (!options.signal || typeof options.signal.addEventListener !== 'function')) throw invalid('options.signal', 'AbortSignal');
   return { file, args, argv, options, timeout, killSignal, ipc, serialization, fds,
-    nativeArgs: [file, argv.join('\0') + '\0', env.join('\0') + (env.length ? '\0' : ''), cwd, fds, flags, options.uid || 0, options.gid || 0] };
+    nativeArgs: [file, argv.join('\0') + '\0', env === null ? null : env.join('\0') + (env.length ? '\0' : ''), cwd, fds, flags, options.uid || 0, options.gid || 0] };
 }
 function spawnError(status, normalized, sync = false) {
   const code = native('errorName', [status]);
@@ -241,17 +244,22 @@ function fork(modulePath, args, options) {
 function spawnSync(file, args, options) {
   const normalized = normalize(file, args, options); options = normalized.options;
   if (normalized.ipc >= 0) throw Object.assign(new Error('IPC cannot be used with synchronous forks'), { code: 'ERR_IPC_SYNC_FORK' });
-  let input = options.input === undefined ? Buffer.alloc(0) : options.input;
-  if (typeof input === 'string') input = Buffer.from(input, options.encoding && options.encoding !== 'buffer' ? options.encoding : 'utf8');
-  else if (ArrayBuffer.isView(input)) input = Buffer.from(input.buffer, input.byteOffset, input.byteLength);
-  else throw invalid('options.input', 'string, Buffer, TypedArray, or DataView');
-  const exactInput = input.buffer.slice(input.byteOffset, input.byteOffset + input.byteLength);
+  let exactInput;
+  if (options.input === undefined) exactInput = new ArrayBuffer(0);
+  else {
+    let input = options.input;
+    if (typeof input === 'string') input = Buffer.from(input, options.encoding && options.encoding !== 'buffer' ? options.encoding : 'utf8');
+    else if (ArrayBuffer.isView(input)) input = Buffer.from(input.buffer, input.byteOffset, input.byteLength);
+    else throw invalid('options.input', 'string, Buffer, TypedArray, or DataView');
+    exactInput = input.buffer.slice(input.byteOffset, input.byteOffset + input.byteLength);
+  }
   const maximum = options.maxBuffer === Infinity ? Infinity : nonnegative(options.maxBuffer, 'options.maxBuffer', 1024 * 1024);
   const raw = native('spawnSync', [...normalized.nativeArgs, exactInput, normalized.timeout, maximum, normalized.killSignal]);
   if (typeof raw === 'number') return { error: spawnError(raw, normalized, true), pid: 0, output: null, stdout: null, stderr: null, status: null, signal: null };
   const output = normalized.fds.map((fd, i) => {
     if (fd !== -1 || i === 0) return null;
-    const value = Buffer.from(raw[i + 4]); return options.encoding && options.encoding !== 'buffer' ? value.toString(options.encoding) : value;
+    // Buffer.from(arrayBuffer) without its type checks: raw[i + 4] is a fresh ArrayBuffer.
+    const value = Object.setPrototypeOf(new Uint8Array(raw[i + 4]), Buffer.prototype); return options.encoding && options.encoding !== 'buffer' ? value.toString(options.encoding) : value;
   });
   const result = { pid: raw[1], output, stdout: output[1], stderr: output[2], status: raw[3] ? null : raw[2], signal: signalName(raw[3]) };
   if (raw[0]) result.error = spawnError(raw[0], normalized, true);

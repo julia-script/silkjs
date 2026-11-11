@@ -9,7 +9,16 @@ function signalNumber(signal = 'SIGTERM') {
   if (Number.isInteger(signal) && signal >= 0 && signal <= 0x7fffffff) return signal;
   throw Object.assign(new TypeError(`Unknown signal: ${signal}`), { code: 'ERR_UNKNOWN_SIGNAL' });
 }
-function signalName(number) { const signals = signalNumbers(); return Object.keys(signals).find(name => signals[name] === number) || null; }
+let signalNames;
+// The first name of each number, as a search of the table in order finds it.
+function signalName(number) {
+  if (!number) return null;
+  if (!signalNames) {
+    const signals = signalNumbers(); signalNames = new Map();
+    for (const name of Object.keys(signals)) if (!signalNames.has(signals[name])) signalNames.set(signals[name], name);
+  }
+  return signalNames.get(number) ?? null;
+}
 function install(process) {
   const watchers = new Map();
   const add = name => {
