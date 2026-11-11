@@ -222,8 +222,9 @@ const hydrations = [];
 host.onHydrate = refresh => { hydrations.push(refresh); };
 const asyncHooks = internalRequire('async_hooks');
 function resource(type, owner) { return asyncHooks._createResource(type, owner); }
+const invokeScoped = asyncHooks._invoke;
 function invokeResource(scope, callback, receiver, args, destroy = true) {
-  try { return scope.runInAsyncScope(invoke, undefined, callback, receiver, args); }
+  try { return invokeScoped(scope, invoke, callback, receiver, args); }
   finally { if (destroy) scope.emitDestroy(); }
 }
 host.invokeResource = invokeResource;
@@ -1230,15 +1231,21 @@ function pollTimeout(pendingPromise) {
 }
 function loopTurn(pendingPromise) {
   const now = native.now();
-  for (const timer of [...timers.values()].sort((a, b) => a._due - b._due || a._id - b._id)) {
-    if (!timer._destroyed && timer._due <= now) fireTimer(timer, timers);
+  // Only the due timers are ordered; most turns have none.
+  let due;
+  for (const timer of timers.values()) if (!timer._destroyed && timer._due <= now) (due ||= []).push(timer);
+  if (due !== undefined) {
+    if (due.length > 1) due.sort((a, b) => a._due - b._due || a._id - b._id);
+    for (const timer of due) if (!timer._destroyed && timer._due <= now) fireTimer(timer, timers);
   }
   native.pollIO(pollTimeout(pendingPromise));
   pollWorkers();
   checkpoint();
   for (const listener of loopListeners) listener();
-  for (const timer of [...immediates.values()]) {
-    if (!timer._destroyed) fireTimer(timer, immediates);
+  if (immediates.size !== 0) {
+    for (const timer of [...immediates.values()]) {
+      if (!timer._destroyed) fireTimer(timer, immediates);
+    }
   }
 }
 function loop() {

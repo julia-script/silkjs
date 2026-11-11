@@ -85,7 +85,11 @@ class Transport {
     const token = ++this.sequence;
     this.requests.set(token, { callback, chunk });
     const status = this.call('write', chunk.buffer, chunk.byteOffset, chunk.byteLength, token);
-    if (status < 0) {
+    // 1: the kernel took every byte now. Node completes such a write synchronously too.
+    if (status === 1) {
+      this.requests.delete(token);
+      callback(null);
+    } else if (status < 0) {
       this.requests.delete(token);
       callback(error(status, 'write'));
     }

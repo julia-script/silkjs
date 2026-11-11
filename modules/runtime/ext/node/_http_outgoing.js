@@ -9,6 +9,20 @@ function validateHeaderValue(name, value, relaxed = false) {
   if (value === undefined) throw error('ERR_HTTP_INVALID_HEADER_VALUE', 'Invalid value "undefined" for header "' + name + '"');
   if (checkInvalidHeaderChar(String(value), relaxed)) throw error('ERR_INVALID_CHAR', 'Invalid character in header content ["' + name + '"]');
 }
+// The Date header changes once a second; format it once a second.
+let dateSecond = -1, dateText = '';
+function utcDate() {
+  const now = Date.now(), second = Math.floor(now / 1000);
+  if (second !== dateSecond) { dateSecond = second; dateText = new Date(now).toUTCString(); }
+  return dateText;
+}
+// The head and the first body chunk go out in one write.
+function joinHead(head, chunk) {
+  const output = Buffer.allocUnsafe(head.length + chunk.length);
+  output.write(head, 0, 'latin1');
+  output.set(chunk, head.length);
+  return output;
+}
 class OutgoingMessage extends Writable {
   constructor(options = {}) {
     super({ decodeStrings: true, autoDestroy: false, emitClose: false, highWaterMark: options.highWaterMark });
@@ -63,7 +77,7 @@ class OutgoingMessage extends Writable {
     let length = this.getHeader('content-length'), transfer = this.getHeader('transfer-encoding');
     if (length !== undefined && transfer !== undefined) throw error('ERR_HTTP_INVALID_HEADER_VALUE', 'Content-Length and Transfer-Encoding cannot coexist');
     if (length !== undefined && (Array.isArray(length) || !/^[0-9]+$/.test(String(length)) || !Number.isSafeInteger(Number(length)))) throw error('ERR_HTTP_INVALID_HEADER_VALUE', 'Invalid Content-Length');
-    if (this.sendDate && !this.hasHeader('date') && !this._removed.has('date')) this.setHeader('Date', new Date().toUTCString());
+    if (this.sendDate && !this.hasHeader('date') && !this._removed.has('date')) this.setHeader('Date', utcDate());
     if (this._hasBody && length === undefined && transfer === undefined) {
       if (this.useChunkedEncodingByDefault && !this._removed.has('transfer-encoding')) this.setHeader('Transfer-Encoding', transfer = 'chunked');
       else if (!this._bodyOptional) this.shouldKeepAlive = false;
@@ -104,15 +118,22 @@ class OutgoingMessage extends Writable {
   _write(chunk, encoding, callback) {
     try {
       if (this._bodyOptional && chunk.length && !this.headersSent) { this._bodyOptional = false; this.useChunkedEncodingByDefault = true; }
-      this._sendHeader();
-      if (!this._hasBody) { if (this._rejectBody) callback(error('ERR_HTTP_BODY_NOT_ALLOWED', 'Adding content for this response is not allowed')); else callback(); return; }
-      if (this._bodyOptional && chunk.length && !this._chunked && this._contentLength === null) { callback(error('ERR_HTTP_CONTENT_LENGTH_MISMATCH', 'Cannot send an unframed request body after headers')); return; }
+      let head = null;
+      if (!this._headerSent) {
+        if (!this._header) this._implicitHeader();
+        this._headerSent = true;
+        head = this._header;
+      }
+      const flushHead = () => { if (head !== null) { this._send(head); head = null; } };
+      if (!this._hasBody) { flushHead(); if (this._rejectBody) callback(error('ERR_HTTP_BODY_NOT_ALLOWED', 'Adding content for this response is not allowed')); else callback(); return; }
+      if (this._bodyOptional && chunk.length && !this._chunked && this._contentLength === null) { flushHead(); callback(error('ERR_HTTP_CONTENT_LENGTH_MISMATCH', 'Cannot send an unframed request body after headers')); return; }
       this._bytesWritten += chunk.length;
-      if (this.strictContentLength && this._contentLength !== null && this._bytesWritten > this._contentLength) { callback(error('ERR_HTTP_CONTENT_LENGTH_MISMATCH', 'Body exceeds Content-Length')); return; }
-      if (!chunk.length) { callback(); return; }
+      if (this.strictContentLength && this._contentLength !== null && this._bytesWritten > this._contentLength) { flushHead(); callback(error('ERR_HTTP_CONTENT_LENGTH_MISMATCH', 'Body exceeds Content-Length')); return; }
+      if (!chunk.length) { flushHead(); callback(); return; }
       if (this._chunked) {
-        this._send(chunk.length.toString(16) + '\r\n'); this._send(chunk); this._send('\r\n', callback);
-      } else this._send(chunk, callback);
+        this._send((head ?? '') + chunk.length.toString(16) + '\r\n'); this._send(chunk); this._send('\r\n', callback);
+      } else if (head !== null) this._send(joinHead(head, chunk), callback);
+      else this._send(chunk, callback);
     } catch (err) { callback(err); }
   }
   end(chunk, encoding, callback) {
@@ -129,7 +150,10 @@ class OutgoingMessage extends Writable {
       this._sendHeader();
       if (this.strictContentLength && this._hasBody && this._contentLength !== null && this._bytesWritten !== this._contentLength) { callback(error('ERR_HTTP_CONTENT_LENGTH_MISMATCH', 'Body does not match Content-Length')); return; }
       if (this._trailers && !this._chunked) { callback(error('ERR_HTTP_TRAILER_INVALID', 'Trailers require chunked encoding')); return; }
-      this._send(this._chunked ? '0\r\n' + this._trailers + '\r\n' : Buffer.alloc(0), callback);
+      // An unchunked body has nothing left to send: complete without an empty write.
+      if (this._chunked) this._send('0\r\n' + this._trailers + '\r\n', callback);
+      else if (this._pendingOutput.length) this._send(Buffer.alloc(0), callback);
+      else callback();
     } catch (err) { callback(err); }
   }
   _destroy(err, callback) {

@@ -102,6 +102,7 @@ function enqueueDestroy(state) {
 }
 const finalizer = new FinalizationRegistry(enqueueDestroy);
 function drainDestroy() {
+  if (pendingDestroy.length === 0) return;
   const pending = pendingDestroy;
   pendingDestroy = [];
   for (const state of pending) emit('destroy', [state.id], state.promise);
@@ -124,7 +125,12 @@ class AsyncHook {
   disable() { hooks.delete(this); syncNativeHooks(); return this; }
 }
 function createHook(callbacks) { return new AsyncHook(callbacks); }
-let enterResource, leaveResource;
+let enterResource, leaveResource, invokeIn;
+// What enter/leave/invoke need from a resource: its id, its callback context and a stack
+// of the contexts it interrupted. AsyncResource keeps them private; InternalResource
+// (the runtime's own ticks, timers and requests) keeps them as plain fields.
+const kId = Symbol('asyncId'), kScope = Symbol('asyncScope'), kStack = Symbol('asyncStack');
+function frameScope(id, trigger, resource) { return { stores: undefined, id, trigger, resource }; }
 
 class AsyncResource {
   #context;
@@ -132,21 +138,47 @@ class AsyncResource {
   #trigger;
   #destroy;
   #owner;
-  #previousContexts = [];
+  #previousContexts;
+  // The context a callback runs in. It never changes, so it is built once.
+  #scope;
+  #registered = false;
   static {
     enterResource = (resource, omitFrame) => {
       const previous = captureContext();
-      resource.#previousContexts.push(previous);
-      host.setAsyncContext({ stores: omitFrame && usesContextFrames() ? undefined : resource.#context?.stores, id: resource.#id,
-        trigger: resource.#trigger, resource: resource.#owner ?? resource });
-      try { emit('before', [resource.#id]); }
-      catch (error) { host.setAsyncContext(resource.#previousContexts.pop()); throw error; }
+      const stack = resource[kStack]();
+      stack.push(previous);
+      host.setAsyncContext(resource[kScope](omitFrame));
+      if (hooks.size === 0) return;
+      try { emit('before', [resource[kId]()]); }
+      catch (error) { host.setAsyncContext(stack.pop()); throw error; }
     };
     leaveResource = resource => {
-      if (resource.#previousContexts.length === 0) throw error('ERR_ASYNC_CALLBACK', 'No active async resource scope');
-      try { emit('after', [resource.#id]); }
-      finally { host.setAsyncContext(resource.#previousContexts.pop()); }
+      const stack = resource[kStack]();
+      if (!stack.length) throw error('ERR_ASYNC_CALLBACK', 'No active async resource scope');
+      try { if (hooks.size !== 0) emit('after', [resource[kId]()]); }
+      finally { host.setAsyncContext(stack.pop()); }
     };
+    // The runtime's own callbacks: fn(a, b, c) in the resource's scope, with no
+    // rest arguments and no scope stack.
+    invokeIn = (resource, fn, a, b, c) => {
+      const previous = captureContext();
+      host.setAsyncContext(resource[kScope](false));
+      if (hooks.size !== 0) {
+        try { emit('before', [resource[kId]()]); }
+        catch (error) { host.setAsyncContext(previous); throw error; }
+      }
+      try { return fn(a, b, c); }
+      finally {
+        try { if (hooks.size !== 0) emit('after', [resource[kId]()]); }
+        finally { host.setAsyncContext(previous); }
+      }
+    };
+  }
+  [kId]() { return this.#id; }
+  [kStack]() { return this.#previousContexts ??= []; }
+  [kScope](omitFrame) {
+    if (omitFrame && usesContextFrames()) return frameScope(this.#id, this.#trigger, this.#owner ?? this);
+    return this.#scope ??= { stores: this.#context?.stores, id: this.#id, trigger: this.#trigger, resource: this.#owner ?? this };
   }
   constructor(type, options = {}, token, owner, explicitId) {
     if (typeof type !== 'string') throw error('ERR_INVALID_ARG_TYPE', 'The "type" argument must be a string');
@@ -158,8 +190,11 @@ class AsyncResource {
     this.#trigger = trigger;
     this.#destroy = { id: this.#id, destroyed: false, promise: false };
     this.#owner = token === resourceOwnerToken ? owner : undefined;
-    if (!(typeof options === 'object' && options.requireManualDestroy)) finalizer.register(this, this.#destroy, this.#destroy);
-    emit('init', [this.#id, type, trigger, this.#owner ?? this]);
+    if (!(typeof options === 'object' && options.requireManualDestroy)) {
+      finalizer.register(this, this.#destroy, this.#destroy);
+      this.#registered = true;
+    }
+    if (hooks.size !== 0) emit('init', [this.#id, type, trigger, this.#owner ?? this]);
   }
   asyncId() { return this.#id; }
   triggerAsyncId() { return this.#trigger; }
@@ -169,7 +204,11 @@ class AsyncResource {
     try { return apply(fn, thisArg, args); }
     finally { leaveResource(this); }
   }
-  emitDestroy() { finalizer.unregister(this.#destroy); enqueueDestroy(this.#destroy); return this; }
+  emitDestroy() {
+    if (this.#registered) { this.#registered = false; finalizer.unregister(this.#destroy); }
+    enqueueDestroy(this.#destroy);
+    return this;
+  }
   bind(fn, thisArg) {
     checkFunction(fn);
     const resource = this;
@@ -182,6 +221,41 @@ class AsyncResource {
     checkFunction(fn);
     return new AsyncResource(type ?? (fn.name || 'bound-anonymous-fn')).bind(fn, thisArg);
   }
+}
+
+// The runtime's own resources (ticks, timers, native requests) behave like an
+// AsyncResource created with requireManualDestroy, without its validation and private
+// state. It is its own destroy record for enqueueDestroy.
+class InternalResource {
+  constructor(type, owner, explicitId) {
+    if (typeof type !== 'string') throw error('ERR_INVALID_ARG_TYPE', 'The "type" argument must be a string');
+    if (hooks.size !== 0 && type.length === 0 && Array.from(hooks).some(hook => hook.callbacks.init !== undefined)) throw error('ERR_ASYNC_TYPE', 'Invalid name for async "type"');
+    const context = captureContext();
+    this.context = context;
+    this.id = typeof explicitId === 'number' && explicitId !== -1 ? explicitId : nextId++;
+    this.trigger = context?.id ?? 1;
+    this.owner = owner;
+    this.destroyed = false;
+    this.promise = false;
+    this.scope = undefined;
+    this.stack = undefined;
+    if (hooks.size !== 0) emit('init', [this.id, type, this.trigger, owner ?? this]);
+  }
+  [kId]() { return this.id; }
+  [kStack]() { return this.stack ??= []; }
+  [kScope](omitFrame) {
+    if (omitFrame && usesContextFrames()) return frameScope(this.id, this.trigger, this.owner ?? this);
+    return this.scope ??= { stores: this.context?.stores, id: this.id, trigger: this.trigger, resource: this.owner ?? this };
+  }
+  asyncId() { return this.id; }
+  triggerAsyncId() { return this.trigger; }
+  runInAsyncScope(fn, thisArg, ...args) {
+    checkFunction(fn);
+    enterResource(this);
+    try { return apply(fn, thisArg, args); }
+    finally { leaveResource(this); }
+  }
+  emitDestroy() { enqueueDestroy(this); return this; }
 }
 
 class AsyncContextFrame extends Map {}
@@ -325,9 +399,10 @@ const asyncWrapProviders = Object.freeze({
 module.exports = { AsyncLocalStorage, AsyncResource, createHook, executionAsyncId, triggerAsyncId, executionAsyncResource, asyncWrapProviders };
 Object.defineProperties(module.exports, {
   _createPromiseHook: { value: createPromiseHook },
-  _createResource: { value: (type, owner, id) => new AsyncResource(type, { requireManualDestroy: true }, resourceOwnerToken, owner, id) },
+  _createResource: { value: (type, owner, id) => new InternalResource(type, owner, id) },
   _enterResource: { value: (resource, omitFrame = false) => enterResource(resource, omitFrame) },
   _leaveResource: { value: resource => leaveResource(resource) },
+  _invoke: { value: invokeIn },
   _captureContext: { value: captureContext },
   _runWithContext: { value: runWithContext },
   _nativeEvent: { value: nativeEvent },

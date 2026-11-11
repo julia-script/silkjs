@@ -330,8 +330,12 @@ function initialize(options = {}) {
     }
     define(process, 'permission', { value: { has, drop }, enumerable: true, writable: false, configurable: false });
   }
-  wrapHostIO();
-  host.installPermissionGuard(checkNative);
+  // Without --permission or --permission-audit every check passes, so host IO and native
+  // calls skip the guard entirely instead of calling into JavaScript for each one.
+  if (state.enforce || state.audit) {
+    wrapHostIO();
+    host.installPermissionGuard(checkNative);
+  }
   initialized = true;
 }
 module.exports = { optionEntries, isValueOption, applyOption, initialize, check, canRead, checkFile, checkNative,

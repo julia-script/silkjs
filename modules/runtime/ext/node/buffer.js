@@ -120,6 +120,11 @@ Buffer.from = function from(value, enc, length) {
       host.bufferCodec(normalized === 'utf8' ? 1 : 2, value, result, 0, capacity);
       return result;
     }
+    if ((normalized === 'latin1' || normalized === 'ascii') && value.length !== 0) {
+      const result = unsafe(size(value.length));
+      host.bufferCodec(5, value, result, 0, value.length);
+      return result;
+    }
     const bytes = encode(value, normalized);
     if (bytes.length > 0 && bytes.length < (Buffer.poolSize >>> 1)) {
       const result = unsafe(bytes.length);
@@ -230,8 +235,8 @@ function encode(string, enc, limit = Infinity) {
     }
   } else if (enc === 'utf8' || enc === 'utf16le') {
     out = host.bufferCodec(enc === 'utf8' ? 1 : 2, string, result, 0, result.length);
-  } else {
-    for (let i = 0; i < string.length && out < result.length; i++) result[out++] = string.charCodeAt(i);
+  } else if (result.length !== 0) {
+    out = host.bufferCodec(5, string, result, 0, result.length);
   }
   return out === result.length ? result : result.subarray(0, out);
 }
@@ -254,7 +259,7 @@ function decode(bytes, enc, start, end) {
     const digits = '0123456789abcdef';
     for (let i = start; i < end; i++) result += digits[bytes[i] >>> 4] + digits[bytes[i] & 15];
   } else {
-    for (let i = start; i < end; i++) result += String.fromCharCode(enc === 'ascii' ? bytes[i] & 127 : bytes[i]);
+    return host.bufferCodec(enc === 'ascii' ? 7 : 6, bytes, start, end);
   }
   return result;
 }
