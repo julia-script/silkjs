@@ -440,7 +440,7 @@ async function mkdtempDisposable(prefix, options) {
   const cwd = process.cwd();
   const path = await mkdtemp(prefix, options);
   const fullPath = p.resolve(cwd, typeof path === 'string' ? path : path.toString());
-  const remove = async () => { await binding('rm', [fullPath, { maxRetries: 0, recursive: true, retryDelay: 0 }]); };
+  const remove = async () => { await binding('rm', [fullPath, { maxRetries: 0, recursive: true, retryDelay: 0, force: true }]); };
   return { __proto__: null, path, remove, async [Symbol.asyncDispose]() { await remove(); } };
 }
 async function writeFile(path, data, options) {

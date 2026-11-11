@@ -340,7 +340,7 @@ class AbortSignal extends EventTarget {
       aborted: false, reason: undefined, onabort: null, handler: null,
       dependents: new Set(), sources: new Set(), composite: false, timeout: false,
       reference: new WeakRef(this),
-    } });
+    }, writable: true });
   }
   get aborted() { return signalData(this).aborted; }
   get reason() { return signalData(this).reason; }

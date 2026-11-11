@@ -407,7 +407,7 @@ fs.mkdirSync = function mkdirSync(path, options) {
     try { c.fail(result, 'mkdir', current); } catch (e) {
       if (e.code === 'ENOENT') { const parent = p.dirname(current); if (parent === current) throw e; create(parent); const again = os.mkdir(current, mode); if (again >= 0) { if (first === undefined) first = current; return; } try { c.fail(again, 'mkdir', current); } catch (race) { if (race.code !== 'EEXIST' || !fs.statSync(current).isDirectory()) throw race; } }
       else if (e.code !== 'EEXIST') throw e;
-      else { const info = fs.statSync(current, { throwIfNoEntry: false }); if (!info || !info.isDirectory()) throw c.error(info ? 'ENOTDIR' : 'EEXIST', 'mkdir', path, undefined, info ? -20 : -17); }
+      else { const info = fs.statSync(current, { throwIfNoEntry: false }); if (!info || !info.isDirectory()) { if (current === path) throw e; throw c.error('ENOTDIR', 'mkdir', path, undefined, -20); } }
     }
   }
   create(path); return first;
