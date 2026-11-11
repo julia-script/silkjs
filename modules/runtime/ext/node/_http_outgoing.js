@@ -14,6 +14,8 @@ function validateHeaderValue(name, value, relaxed = false) {
 let streamCodes = null;
 function codes() { return streamCodes ??= require('internal/streams/support').codes; }
 function nop() {}
+let streamState = null;
+function defaultHighWaterMark() { return (streamState ??= require('internal/streams/state')).getDefaultHighWaterMark(false); }
 function uncorkSocket(socket) { socket.uncork(); }
 // The Date header changes once a second; format it once a second.
 let dateSecond = -1, dateText = '';
@@ -61,7 +63,7 @@ class OutgoingMessage extends Stream {
     this.writable = true; this.destroyed = false; this.errored = null; this.finished = false;
     this._finishEmitted = false; this._finishQueued = false; this._prefinished = false; this._needDrain = false; this._corked = 0;
     this._closed = false; this._last = false;
-    this._highWaterMark = options.highWaterMark ?? require('internal/streams/state').getDefaultHighWaterMark(false);
+    this._highWaterMark = options.highWaterMark ?? defaultHighWaterMark();
     this._uniqueHeaders = options.uniqueHeaders ? new Set(options.uniqueHeaders.map(name => name.toLowerCase())) : noHeaders;
   }
   get connection() { return this.socket; }

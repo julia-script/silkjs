@@ -124,8 +124,8 @@ async function performFetch(original) {
       record.method = 'GET'; record.body = null;
       for (const name of ['content-encoding', 'content-language', 'content-location', 'content-type', 'content-length']) record.headers.delete(name);
     } else if (record.body) {
-      if (!record.body.source) throw networkError('Cannot replay a streaming request body across a redirect');
-      record.body = body.extract(record.body.source);
+      if (record.body.streaming) throw networkError('Cannot replay a streaming request body across a redirect');
+      record.body = body.replay(record.body);
     }
     if (target.origin !== url.origin) {
       for (const name of ['authorization', 'proxy-authorization', 'cookie', 'cookie2', 'host']) record.headers.delete(name);

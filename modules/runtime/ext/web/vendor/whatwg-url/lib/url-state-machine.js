@@ -425,7 +425,11 @@ function serializeHost(host) {
   return host;
 }
 
+// UTS 46 maps an ASCII letter to its lower case and keeps digits, hyphens and dots; with
+// CheckHyphens and VerifyDnsLength off only an xn-- label needs the full processing.
+const plainDomain = /^[A-Za-z0-9.-]+$/, punycodeLabel = /(?:^|\.)xn--/i;
 function domainToASCII(domain, beStrict = false) {
+  if (!beStrict && plainDomain.test(domain) && !punycodeLabel.test(domain)) return domain.toLowerCase();
   const result = tr46.toASCII(domain, {
     checkHyphens: beStrict,
     checkBidi: true,
