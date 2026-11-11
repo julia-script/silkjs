@@ -1258,6 +1258,12 @@ function run() {
   // Only a TLS flag loads internal/tls/options, so a plain start skips the check.
   const tlsErrors = moduleHas('internal/tls/options') ? internalRequire('internal/tls/options').validate() : [];
   if (tlsErrors.length) return cliError(tlsErrors);
+  // Only an OpenSSL option or OPENSSL_CONF initializes OpenSSL at startup.
+  const opensslError = moduleHas('internal/tls/options') || process.env.OPENSSL_CONF ? internalRequire('internal/tls/options').processOpenSSLOptions() : undefined;
+  if (opensslError !== undefined) {
+    host.writeStartupDiagnostic(process.execPath + ': ' + opensslError + '\n');
+    return process.exit(1);
+  }
   if (watchMode && expression !== undefined) return cliError('either --watch or --eval can be used, not both');
   if (watchMode && check) return cliError('either --watch or --check can be used, not both');
   if (watchMode && interactive) return cliError('either --watch or --interactive can be used, not both');
