@@ -6,6 +6,10 @@ const rawOS = { ...osNamespace };
 
 const native = globalThis.__silkNative;
 delete globalThis.__silkNative;
+// Every exit path ends here. Node's exit handler stops and joins every worker
+// before exit(): libc exit handlers (OpenSSL's cleanup among them) must not tear
+// down shared native state while a worker thread still runs.
+rawStd.exit = code => { native.workerNative('stopThreads', []); stdNamespace.exit(code); };
 const factories = new Map();
 const modules = new Map();
 const realmSources = new Map();
