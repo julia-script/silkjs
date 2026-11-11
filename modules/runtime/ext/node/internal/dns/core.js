@@ -254,7 +254,7 @@ for (const method of publicMethods) {
 const promises = Object.assign({ Resolver: PromiseResolver, lookup: lookupPromise, lookupService: lookupServicePromise, setDefaultResultOrder, getDefaultResultOrder, getServers: api.getServers, setServers: api.setServers }, constants, errors);
 for (const method of publicMethods) promises[method] = (...args) => promisifyCall(Resolver.prototype[method], defaultInstance(), args);
 // Like Node, util.promisify resolves these with an object of their named callback values.
-const { customPromisifyArgs } = require('internal/util_promisify');
+const { customPromisifyArgs } = require('internal/util');
 Object.defineProperty(lookup, customPromisifyArgs, { value: ['address', 'family'], enumerable: false });
 Object.defineProperty(lookupService, customPromisifyArgs, { value: ['hostname', 'service'], enumerable: false });
 api.promises = promises;
