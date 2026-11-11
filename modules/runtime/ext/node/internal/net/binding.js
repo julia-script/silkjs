@@ -27,6 +27,7 @@ const uv = {
   UV_EOF: -4095,
   UV_EADDRINUSE: -errno.EADDRINUSE,
   UV_EBADF: -errno.EBADF,
+  UV_EPROTO: -errno.EPROTO,
   UV_ECANCELED: -errno.ECANCELED,
   UV_EINVAL: -errno.EINVAL,
   UV_ENOTCONN: -errno.ENOTCONN,
@@ -136,7 +137,15 @@ class StreamHandle {
   }
   get _externalStream() { return this._transport; }
   getAsyncId() { return this._transport?.resource?.asyncId() ?? -1; }
-  getProviderType() { return 0; }
+  getProviderType() { return this._transport?.getProviderType?.() ?? 0; }
+  // AsyncWrap::AsyncReset: the handle's callbacks run in a new async resource, reported to
+  // async_hooks with `resource` as its resource object (the http agent's ReusedHandle).
+  asyncReset(resource) {
+    const transport = this._transport;
+    if (!transport?.resource) return;
+    transport.resource.emitDestroy();
+    transport.resource = require('async_hooks')._createResource(transport.provider ?? 'TCPWRAP', resource);
+  }
   // HandleWrap
   close(callback) {
     if (this._closeCallback !== null) return;
@@ -595,6 +604,67 @@ class JSTransportHandle extends StreamHandle {
   setKeepAlive(enable, delay) { return this._transport?.call?.('keepAlive', enable ? 1 : 0, delay >>> 0) ?? 0; }
 }
 
+// src/js_stream.cc: a StreamBase whose reads, writes and shutdowns are calls into JS
+// (internal/js_stream_socket sets onreadstart, onreadstop, onshutdown, onwrite and close).
+// Its callbacks run in its own async resource, as JSStream's MakeCallback calls do.
+class JSStream extends StreamHandle {
+  constructor() {
+    super();
+    this.onreadstart = null;
+    this.onreadstop = null;
+    this.onshutdown = null;
+    this.onwrite = null;
+    this._resource = require('async_hooks')._createResource('JSSTREAM', this);
+  }
+  getAsyncId() { return this._resource.asyncId(); }
+  getProviderType() { return require('async_hooks').asyncWrapProviders.JSSTREAM; }
+  asyncReset(resource) {
+    this._resource.emitDestroy();
+    this._resource = require('async_hooks')._createResource('JSSTREAM', resource);
+  }
+  // A MakeCallback: an exception is reported as uncaught, and the call fails with
+  // UV_EPROTO (JSStream's DoWrite, DoShutdown, ReadStart and ReadStop).
+  _callback(fn, args, receiver = this) {
+    let result;
+    const threw = host.invokeTimer(this._resource, function callback() {
+      result = Reflect.apply(fn, receiver, args);
+    }, undefined, []);
+    return threw ? uv.UV_EPROTO : result;
+  }
+  ref() {}
+  unref() {}
+  hasRef() { return false; }
+  readStart() { return this._callback(this.onreadstart, []) ?? 0; }
+  readStop() { return this._callback(this.onreadstop, []) ?? 0; }
+  shutdown(req) {
+    req.handle = this;
+    return this._callback(this.onshutdown, [req]) ?? 0;
+  }
+  // JSStream has no synchronous write: every write completes through finishWrite.
+  _write(req, buffers) {
+    let bytes = 0;
+    for (let i = 0; i < buffers.length; i++) bytes += buffers[i].byteLength;
+    const wrap = req ?? new WriteWrap();
+    wrap.handle = this;
+    wrap.async = true;
+    streamBaseState[kBytesWritten] = bytes;
+    streamBaseState[kLastWriteWasAsync] = 1;
+    streamBaseState[kLastWriteErr] = 0;
+    this.bytesWritten += bytes;
+    const status = this._callback(this.onwrite, [wrap, buffers]) ?? 0;
+    return req ? status : wrap;
+  }
+  finishWrite(req, status) {
+    if (typeof req.oncomplete === 'function') this._callback(req.oncomplete, [status], req);
+    else req.writeStatus = status;
+  }
+  finishShutdown(req, status) {
+    if (typeof req.oncomplete === 'function') this._callback(req.oncomplete, [status], req);
+  }
+  readBuffer(chunk) { this._callback(this._deliver, [chunk, 0]); }
+  emitEOF() { this._callback(this._deliver, [null, uv.UV_EOF]); }
+}
+
 function isStreamHandle(value) { return value instanceof StreamHandle; }
 
 // src/node_util.cc GuessHandleType over the native type numbers.
@@ -623,6 +693,7 @@ module.exports = {
     kReadBytesOrError, kArrayBufferOffset, kBytesWritten, kLastWriteWasAsync, kLastWriteErr,
   },
   JSTransportHandle,
+  js_stream: { JSStream },
   isStreamHandle,
   guessHandleType,
 };
