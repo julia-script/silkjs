@@ -131,7 +131,8 @@ TLSSocket.prototype._init = function(socket) {
   if (options.handshakeTimeout > 0) this.setTimeout(options.handshakeTimeout, this._handleTimeout);
   if (socket instanceof net.Socket) {
     this.connecting = socket.connecting || socket._connected === false;
-    socket.once('connect', () => { this.connecting = false; });
+    // Like Node's _tls_wrap: the TLS socket connects when the socket it wraps does.
+    socket.once('connect', () => { this.connecting = false; this.emit('connect'); });
   }
   if (socket) socket.on('error', err => this._emitTLSError(err));
   else this.connecting = true;
@@ -140,7 +141,8 @@ TLSSocket.prototype.connect = function(...args) {
   const [options, cb] = net._normalizeArgs(args);
   if (cb) this.once('connect', cb);
   this.connecting = true;
-  try { this._parent.connect({ ...options, allowHalfOpen: true }); } catch (err) { this.destroy(); throw err; }
+  // The TLS socket listens to options.signal itself; aborting it destroys the parent too.
+  try { this._parent.connect({ ...options, allowHalfOpen: true, signal: undefined }); } catch (err) { this.destroy(); throw err; }
   return this;
 };
 // A client sends its ClientHello only when told to (tls.connect does).

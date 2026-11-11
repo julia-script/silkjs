@@ -18,6 +18,8 @@ function op(...args) {
 // (onhandshakedone) and _onTLSError (onerror).
 class TLSTransport {
   constructor(socket, carrier, context, options, owned) {
+    // As TLSWrap's constructor, a handle made without a socket wraps no session.
+    if (socket === undefined) { this.id = 0; this.closed = true; this.closing = true; return; }
     this.socket = socket; this.carrier = carrier; this.options = options;
     this.kind = carrier._transport?.kind || 1; this.closed = false; this.closing = false;
     this.reading = true; this.ready = false; this.selecting = false; this.pumping = false;
@@ -38,7 +40,9 @@ class TLSTransport {
     });
     // A peer that closes without close_notify still ends the stream, as in Node.
     carrier.on('end', () => { if (!this.closing) this.end(); });
-    if (owned) carrier.on('error', err => { if (!this.closing) this.socket.destroy(err); });
+    // An owned carrier is TLSWrap's stream: its write errors once the TLS socket is destroyed
+    // or shutting down (EPIPE on the close_notify) reach nothing, as in afterShutdown.
+    if (owned) carrier.on('error', err => { if (!this.closing && !this.socket.destroyed && !this.shutdownInFlight) this.socket.destroy(err); });
     carrier.once('close', () => this.finish());
     const start = () => {
       if (this.closing || this.started) return;

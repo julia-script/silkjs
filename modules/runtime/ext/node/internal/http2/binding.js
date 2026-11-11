@@ -21,6 +21,9 @@ const perfEntries = require('internal/perf_observers');
 const { Buffer } = require('buffer');
 const { AsyncResource } = require('async_hooks');
 const constants = require('internal/http2/constants');
+const {
+  WriteWrap, streamBaseState, kReadBytesOrError, kArrayBufferOffset, kBytesWritten, kLastWriteWasAsync, kLastWriteErr,
+} = require('internal/net/binding').stream_wrap;
 
 const {
   NGHTTP2_SESSION_SERVER,
@@ -363,6 +366,37 @@ class Http2Stream {
     });
     return 1;
   }
+  // StreamBase writes (src/stream_base.cc): a WriteWrap completes through oncomplete.
+  _submit(req, buffers) {
+    let bytes = 0;
+    for (let i = 0; i < buffers.length; i++) bytes += buffers[i].length;
+    streamBaseState[kBytesWritten] = bytes;
+    streamBaseState[kLastWriteErr] = 0;
+    streamBaseState[kLastWriteWasAsync] = 1;
+    const wrap = req ?? new WriteWrap();
+    const ret = this.write(wrap, buffers);
+    if (ret !== 0) {
+      streamBaseState[kLastWriteWasAsync] = 0;
+      return ret;
+    }
+    return req ? 0 : wrap;
+  }
+  writeBuffer(req, buffer) { return this._submit(req, [buffer]); }
+  writev(req, chunks, allBuffers) {
+    let buffers = chunks;
+    if (!allBuffers) {
+      buffers = new Array(chunks.length >> 1);
+      for (let i = 0; i < chunks.length; i += 2) {
+        const chunk = chunks[i];
+        buffers[i >> 1] = typeof chunk === 'string' ? Buffer.from(chunk, chunks[i + 1]) : chunk;
+      }
+    }
+    return this._submit(req, buffers);
+  }
+  writeUtf8String(req, string) { return this._submit(req, [Buffer.from(string, 'utf8')]); }
+  writeAsciiString(req, string) { return this._submit(req, [Buffer.from(string, 'latin1')]); }
+  writeLatin1String(req, string) { return this._submit(req, [Buffer.from(string, 'latin1')]); }
+  writeUcs2String(req, string) { return this._submit(req, [Buffer.from(string, 'utf16le')]); }
   write(req, buffers) {
     const session = this.session;
     if (!this.writable || this.destroyed) return UV_EOF;
@@ -616,6 +650,11 @@ class Http2Session {
     this.stats.bytesRead += buffer.length;
     this.scope(() => this.consumeData(buffer));
     this.maybeStopReading();
+    // Node notifies only after a write. Data from a socket the user paused (for
+    // example one passed through createConnection after a 'readable' listener)
+    // can arrive after the last write, so a read that leaves nothing to do
+    // completes a graceful close too.
+    if (!this.writeInProgress) this.maybeNotifyGracefulCloseComplete();
   }
   consumeData(buffer) {
     const limits = this.limits;
@@ -741,7 +780,8 @@ class Http2Session {
       case FRAME_DATA: {
         const stream = this.streams.get(id);
         if (stream !== undefined && !stream.destroyed && (flags & FLAG_END_STREAM)) {
-          makeCallback(stream.resource, stream.onread, stream, [UV_EOF, undefined]);
+          streamBaseState[kReadBytesOrError] = UV_EOF;
+          makeCallback(stream.resource, stream.onread, stream, [undefined]);
         }
         return;
       }
@@ -834,7 +874,10 @@ class Http2Session {
     // Each chunk is its own buffer, so later reads cannot overwrite it.
     stream.stats.receivedBytes += payload.length;
     if (stream.stats.firstByte === 0n) stream.stats.firstByte = hrtimeNs();
-    makeCallback(stream.resource, stream.onread, stream, [payload.length, Buffer.from(payload)]);
+    const buffer = Buffer.from(payload);
+    streamBaseState[kReadBytesOrError] = buffer.length;
+    streamBaseState[kArrayBufferOffset] = buffer.byteOffset;
+    makeCallback(stream.resource, stream.onread, stream, [buffer.buffer]);
     if (stream.destroyed || !this.alive()) return;
     if (stream.reading) call('consume', this.id, id, payload.length);
     else stream.consumedWhilePaused += payload.length;

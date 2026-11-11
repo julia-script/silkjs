@@ -101,6 +101,46 @@ function tokens(source) {
   return result;
 }
 
+// What compilers emit for `export * from 'x'`, which Node also counts as re-exports:
+// TypeScript's `__exportStar(require('x'), exports)` and `__export(require('x'))`, and
+// the Babel/TypeScript loop over `var _x = require('x')`:
+//   Object.keys(_x).forEach(function (key) { ...; exports[key] = _x[key]; })
+// (or the same loop defining exports[key] with Object.defineProperty).
+function starReexports(list, text, name, reexports) {
+  const literal = i => (text(i) === '<string>' ? list[i].value : undefined);
+  const required = new Map();
+  for (let i = 0; i < list.length; i++) {
+    if ((text(i) === 'var' || text(i) === 'let' || text(i) === 'const') && name(i + 1) !== undefined &&
+        text(i + 2) === '=' && text(i + 3) === 'require' && text(i + 4) === '(' && literal(i + 5) !== undefined &&
+        text(i + 6) === ')') required.set(text(i + 1), literal(i + 5));
+  }
+  for (let i = 0; i < list.length; i++) {
+    if ((text(i) === '__exportStar' || text(i) === '__export') && text(i + 1) === '(' && text(i + 2) === 'require' &&
+        text(i + 3) === '(' && literal(i + 4) !== undefined && text(i + 5) === ')') {
+      reexports.add(literal(i + 4));
+      continue;
+    }
+    if (text(i) !== 'Object' || text(i + 1) !== '.' || text(i + 2) !== 'keys' || text(i + 3) !== '(' ||
+        !required.has(text(i + 4)) || text(i + 5) !== ')' || text(i + 6) !== '.' || text(i + 7) !== 'forEach' ||
+        text(i + 8) !== '(' || text(i + 9) !== 'function' || text(i + 10) !== '(' || name(i + 11) === undefined ||
+        text(i + 12) !== ')' || text(i + 13) !== '{') continue;
+    const binding = text(i + 4);
+    const key = text(i + 11);
+    let depth = 0;
+    let copies = false;
+    for (let j = i + 13; j < list.length; j++) {
+      const t = text(j);
+      if (t === '{') depth++;
+      else if (t === '}' && --depth === 0) break;
+      if (t === 'exports' && text(j - 1) !== '.' && text(j + 1) === '[' && text(j + 2) === key && text(j + 3) === ']' &&
+          text(j + 4) === '=' && text(j + 5) === binding && text(j + 6) === '[' && text(j + 7) === key) copies = true;
+      if (t === 'Object' && text(j + 1) === '.' && text(j + 2) === 'defineProperty' && text(j + 3) === '(' &&
+          text(j + 4) === 'exports' && text(j + 5) === ',' && text(j + 6) === key) copies = true;
+    }
+    if (copies) reexports.add(required.get(binding));
+  }
+}
+
 function analyzeExports(source) {
   const list = tokens(source);
   const names = new Set();
@@ -140,6 +180,7 @@ function analyzeExports(source) {
       if (end !== -1 && text(end) === ',' && text(end + 1) === '<string>' && name(end + 1) !== undefined) names.add(name(end + 1));
     }
   }
+  starReexports(list, text, name, reexports);
   names.delete('default');
   names.delete('module.exports');
   return { names: Array.from(names), reexports: Array.from(reexports) };

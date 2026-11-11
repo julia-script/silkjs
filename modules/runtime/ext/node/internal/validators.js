@@ -25,7 +25,7 @@
 'use strict';
 
 const {
-  codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_MISSING_ARGS, ERR_OUT_OF_RANGE, ERR_SOCKET_BAD_PORT, ERR_UNKNOWN_SIGNAL },
+  codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_MISSING_ARGS, ERR_OUT_OF_RANGE, ERR_SOCKET_BAD_PORT, ERR_UNKNOWN_SIGNAL, ERR_INVALID_THIS },
 } = require('internal/errors');
 
 function isInt32(value) {
@@ -64,6 +64,12 @@ function validateBoolean(value, name) {
 }
 function validateFunction(value, name) {
   if (typeof value !== 'function') throw new ERR_INVALID_ARG_TYPE(name, 'Function', value);
+}
+// A function that is neither async nor a generator.
+function validatePlainFunction(value, name) {
+  validateFunction(value, name);
+  const types = require('util/types');
+  if (types.isAsyncFunction(value) || types.isGeneratorFunction(value)) throw new ERR_INVALID_ARG_TYPE(name, 'function', value);
 }
 function validateNumber(value, name, min, max) {
   if (typeof value !== 'number') throw new ERR_INVALID_ARG_TYPE(name, 'number', value);
@@ -104,6 +110,11 @@ function validateOneOf(value, name, oneOf) {
 function validateAbortSignal(signal, name) {
   if (signal !== undefined && (signal === null || typeof signal !== 'object' || !('aborted' in signal))) {
     throw new ERR_INVALID_ARG_TYPE(name, 'AbortSignal', signal);
+  }
+}
+function validateThisInternalField(object, fieldKey, className) {
+  if (typeof object !== 'object' || object === null || !Object.prototype.hasOwnProperty.call(object, fieldKey)) {
+    throw new ERR_INVALID_THIS(className);
   }
 }
 function validateBuffer(buffer, name = 'buffer') {
@@ -197,10 +208,18 @@ function checkRangesOrGetDefault(number, name, lower, upper, def) {
   }
   return number;
 }
+function validateStringWithoutNullBytes(value, name) {
+  validateString(value, name);
+  if (value.includes('\u0000')) {
+    throw new ERR_INVALID_ARG_VALUE(name, value, 'must be a string without null bytes');
+  }
+}
+
 // Node wraps its validators in hideStackFrames(), whose callers inside other
 // hidden frames use fn.withoutStackTrace.
-for (const fn of [validateString, validateBoolean, validateFunction, validateNumber, validateInteger, validateInt32,
-  validateUint32, validateObject, validateArray, validateOneOf, validateAbortSignal, validateBuffer]) {
+for (const fn of [validateString, validateBoolean, validateFunction, validatePlainFunction, validateNumber, validateInteger, validateInt32,
+  validateUint32, validateObject, validateArray, validateOneOf, validateAbortSignal, validateBuffer,
+  validateStringWithoutNullBytes]) {
   fn.withoutStackTrace = fn;
 }
 
@@ -209,9 +228,10 @@ module.exports = {
   codedError, unknownSignal, isInt32,
   kValidateObjectAllowNullable, kValidateObjectAllowArray, kValidateObjectAllowFunction,
   kValidateObjectAllowObjects, kValidateObjectAllowObjectsAndNull,
-  validateString, validateBoolean, validateFunction, validateNumber, validateInteger, validateInt32,
+  validateString, validateBoolean, validateFunction, validatePlainFunction, validateNumber, validateInteger, validateInt32,
   validateUint32, validateObject, validateArray, validateOneOf, validateAbortSignal,
   isUint32, parseFileMode, validateBuffer, validateLinkHeaderValue,
   convertToValidSignal, signalName, toPathIfFileURL, validatePath, getValidatedPath, validatePort,
-  validateFiniteNumber, checkRangesOrGetDefault,
+  validateFiniteNumber, checkRangesOrGetDefault, validateThisInternalField,
+  validateStringWithoutNullBytes,
 };

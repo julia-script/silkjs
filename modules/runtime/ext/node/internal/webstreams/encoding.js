@@ -15,7 +15,7 @@ const {
 const {
   TextDecoder,
   TextEncoder,
-} = require('internal/web/encoding');
+} = require('internal/encoding');
 
 const {
   TransformStream,

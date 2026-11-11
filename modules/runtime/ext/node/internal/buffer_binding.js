@@ -76,7 +76,7 @@ function viewBytes(view) {
 function arrayIndex(value, fallback) {
   if (value === undefined) return fallback;
   const n = Math.trunc(+value) || 0;
-  if (n < 0) throw new RangeError('Index out of range');
+  if (n < 0) throw indexError();
   return n;
 }
 function indexError() {

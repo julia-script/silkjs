@@ -1,198 +1,420 @@
+// Adapted from Node.js v24.22.1 lib/internal/cluster/primary.js by tools/port_node_net.py.
+// Copyright Joyent, Inc. and other Node contributors.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the
+// following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+// USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 'use strict';
-const { EventEmitter } = require('events');
+
+const {
+  ArrayPrototypePush,
+  ArrayPrototypeSlice,
+  ArrayPrototypeSome,
+  ObjectKeys,
+  ObjectValues,
+  SafeMap,
+  StringPrototypeStartsWith,
+} = require('internal/per_context/primordials');
+const {
+  codes: {
+    ERR_SOCKET_BAD_PORT,
+  },
+} = require('internal/errors');
+
+const assert = require('assert').ok;
+const { fork } = require('child_process');
+const path = require('path');
+const EventEmitter = require('events');
+const RoundRobinHandle = require('internal/cluster/round_robin_handle');
+const SharedHandle = require('internal/cluster/shared_handle');
 const Worker = require('internal/cluster/worker');
-const cluster = module.exports = new EventEmitter();
-const handles = new Map();
-let ids = 0, sequence = 0, policy;
-Object.assign(cluster, {
-  isWorker: false, isPrimary: true, isMaster: true, Worker, workers: {}, settings: {},
-  SCHED_NONE: 1, SCHED_RR: 2,
-  schedulingPolicy: process.env.NODE_CLUSTER_SCHED_POLICY === 'none' ? 1 : 2
-});
-const send = (worker, message, handle, callback) => {
-  if (!worker.isConnected()) { if (callback) process.nextTick(callback, new Error('Worker disconnected')); return false; }
-  return worker.process.send({ cmd: 'NODE_CLUSTER', ...message }, handle, { keepOpen: true }, callback);
-};
+// silkjs: getInspectPort and isUsingInspector of Node's internal/util/inspector.
+const { validatePort } = require('internal/validators');
+const kMinPort = 1024;
+const kMaxPort = 65535;
+const kInspectArgRegex = /--inspect(?:-brk|-port)?|--debug-port/;
+const _isUsingInspector = new WeakMap();
+function isUsingInspector(execArgv = process.execArgv) {
+  if (!_isUsingInspector.has(execArgv)) {
+    _isUsingInspector.set(execArgv,
+                          execArgv.some((arg) => kInspectArgRegex.exec(arg) !== null) ||
+      kInspectArgRegex.exec(process.env.NODE_OPTIONS) !== null);
+  }
+  return _isUsingInspector.get(execArgv);
+}
+let debugPortOffset = 1;
+function getInspectPort(inspectPort) {
+  if (typeof inspectPort === 'function') {
+    inspectPort = inspectPort();
+  } else if (inspectPort == null) {
+    inspectPort = process.debugPort + debugPortOffset;
+    if (inspectPort > kMaxPort)
+      inspectPort = inspectPort - kMaxPort + kMinPort - 1;
+    debugPortOffset++;
+  }
+  validatePort(inspectPort);
+
+  return inspectPort;
+}
+const { internal, sendHelper } = require('internal/cluster/utils');
+const cluster = new EventEmitter();
+const intercom = new EventEmitter();
+const SCHED_NONE = 1;
+const SCHED_RR = 2;
+
+module.exports = cluster;
+
+const handles = new SafeMap();
+cluster.isWorker = false;
+cluster.isMaster = true; // Deprecated alias. Must be same as isPrimary.
+cluster.isPrimary = true;
+cluster.Worker = Worker;
+cluster.workers = {};
+cluster.settings = {};
+cluster.SCHED_NONE = SCHED_NONE;  // Leave it to the operating system.
+cluster.SCHED_RR = SCHED_RR;      // Primary distributes connections.
+
+let ids = 0;
+let initialized = false;
+
+// XXX(bnoordhuis) Fold cluster.schedulingPolicy into cluster.settings?
+let schedulingPolicy = process.env.NODE_CLUSTER_SCHED_POLICY;
+if (schedulingPolicy === 'rr')
+  schedulingPolicy = SCHED_RR;
+else if (schedulingPolicy === 'none')
+  schedulingPolicy = SCHED_NONE;
+else if (process.platform === 'win32') {
+  // Round-robin doesn't perform well on
+  // Windows due to the way IOCP is wired up.
+  schedulingPolicy = SCHED_NONE;
+} else
+  schedulingPolicy = SCHED_RR;
+
+cluster.schedulingPolicy = schedulingPolicy;
+
 cluster.setupPrimary = function(options) {
-  cluster.settings = { args: process.argv.slice(2), exec: process.argv[1], execArgv: process.execArgv,
-    silent: false, ...cluster.settings, ...options };
-  if (policy === undefined) {
-    policy = cluster.schedulingPolicy;
-    if (policy !== 1 && policy !== 2) throw Object.assign(new Error(`Bad cluster.schedulingPolicy: ${policy}`), { code: 'ERR_ASSERTION' });
+  const settings = {
+    args: ArrayPrototypeSlice(process.argv, 2),
+    exec: process.argv[1],
+    execArgv: process.execArgv,
+    silent: false,
+    ...cluster.settings,
+    ...options,
+  };
+
+  // Tell V8 to write profile data for each process to a separate file.
+  // Without --logfile=v8-%p.log, everything ends up in a single, unusable
+  // file. (Unusable because what V8 logs are memory addresses and each
+  // process has its own memory mappings.)
+  if (ArrayPrototypeSome(settings.execArgv,
+                         (s) => StringPrototypeStartsWith(s, '--prof')) &&
+      !ArrayPrototypeSome(settings.execArgv,
+                          (s) => StringPrototypeStartsWith(s, '--logfile='))) {
+    settings.execArgv = [...settings.execArgv, '--logfile=v8-%p.log'];
   }
-  const settings = cluster.settings;
-  process.nextTick(() => cluster.emit('setup', settings));
+
+  cluster.settings = settings;
+
+  if (initialized === true)
+    return process.nextTick(setupSettingsNT, settings);
+
+  initialized = true;
+  schedulingPolicy = cluster.schedulingPolicy;  // Freeze policy.
+  assert(schedulingPolicy === SCHED_NONE || schedulingPolicy === SCHED_RR,
+         `Bad cluster.schedulingPolicy: ${schedulingPolicy}`);
+
+  process.nextTick(setupSettingsNT, settings);
+
+  process.on('internalMessage', (message) => {
+    if (message.cmd !== 'NODE_DEBUG_ENABLED')
+      return;
+
+    for (const worker of ObjectValues(cluster.workers)) {
+      if (worker.state === 'online' || worker.state === 'listening') {
+        process._debugProcess(worker.process.pid);
+      } else {
+        worker.once('online', function() {
+          process._debugProcess(this.process.pid);
+        });
+      }
+    }
+  });
 };
+
+// Deprecated alias must be same as setupPrimary
 cluster.setupMaster = cluster.setupPrimary;
-function closeServer(entry) {
-  const server = entry.server;
-  if (entry.datagram) {
-    if (!server._closing && !server._closed) server.close();
-  } else if (server._listening || server._starting) server.close();
-  else server._transport?.close();
+
+function setupSettingsNT(settings) {
+  cluster.emit('setup', settings);
 }
-function remove(entry, worker) {
-  entry.workers.delete(worker.id);
-  for (const [id, pending] of entry.pending) if (pending.worker === worker) {
-    entry.pending.delete(id); entry.queue.push(pending.socket);
+
+function createWorkerProcess(id, env) {
+  const workerEnv = { ...process.env, ...env, NODE_UNIQUE_ID: `${id}` };
+  const execArgv = [...cluster.settings.execArgv];
+
+  if (cluster.settings.inspectPort === null) {
+    throw new ERR_SOCKET_BAD_PORT('Port', null, true);
   }
-  if (entry.workers.size) { distribute(entry); return; }
-  handles.delete(entry.key);
-  for (const socket of entry.queue) socket.destroy();
-  entry.queue.length = 0;
-  closeServer(entry);
-}
-function removeHandles(worker) { for (const entry of handles.values()) remove(entry, worker); }
-function distribute(entry) {
-  if (!entry.ready || entry.shared) return;
-  const workers = [...entry.workers.values()].filter(worker => worker.isConnected() && !worker.exitedAfterDisconnect);
-  if (!workers.length) return;
-  while (entry.queue.length) {
-    const worker = workers[entry.cursor++ % workers.length], socket = entry.queue.shift();
-    const seq = ++sequence;
-    entry.pending.set(seq, { worker, socket });
-    send(worker, { act: 'newconn', key: entry.key, seq }, socket, error => {
-      if (!error || !entry.pending.has(seq)) return;
-      entry.pending.delete(seq);
-      entry.queue.push(socket); remove(entry, worker);
-    });
+  if (isUsingInspector(cluster.settings.execArgv)) {
+    ArrayPrototypePush(execArgv, `--inspect-port=${getInspectPort(cluster.settings.inspectPort)}`);
   }
+
+  return fork(cluster.settings.exec, cluster.settings.args, {
+    cwd: cluster.settings.cwd,
+    env: workerEnv,
+    serialization: cluster.settings.serialization,
+    silent: cluster.settings.silent,
+    windowsHide: cluster.settings.windowsHide,
+    execArgv: execArgv,
+    stdio: cluster.settings.stdio,
+    gid: cluster.settings.gid,
+    uid: cluster.settings.uid,
+  });
 }
-function reply(entry, worker, request) {
-  send(worker, { act: 'queryServer', request, key: entry.key, address: entry.address, shared: entry.shared, backlog: entry.backlog },
-    entry.shared ? entry.server : undefined);
-}
-function query(worker, message) {
-  if (worker.exitedAfterDisconnect) return;
-  const options = message.options;
-  const datagram = options.addressType === 'udp4' || options.addressType === 'udp6';
-  const key = JSON.stringify([options.host || '', options.port, options.path, options.fd, options.addressType,
-    datagram || options.port === 0 ? message.index : 0]);
-  let entry = handles.get(key);
-  if (entry) {
-    entry.workers.set(worker.id, worker);
-    if (entry.ready) reply(entry, worker, message.request);
-    else entry.waiting.push([worker, message.request]);
-    return;
-  }
-  const server = datagram ? require('dgram').createSocket(options.addressType) :
-    new (require('net').Server)({ pauseOnConnect: true });
-  entry = { key, server, datagram, workers: new Map([[worker.id, worker]]), waiting: [[worker, message.request]],
-    shared: datagram || policy === 1, backlog: options.backlog, ready: false, queue: [], pending: new Map(), cursor: 0 };
-  handles.set(key, entry);
-  const failed = error => {
-    if (handles.get(key) !== entry) return;
-    handles.delete(key);
-    closeServer(entry);
-    for (const [target, request] of entry.waiting) send(target, { act: 'queryServer', request,
-      error: { message: error.message, code: error.code, errno: error.errno, syscall: error.syscall } });
-    entry.waiting.length = 0;
-  };
-  const ready = () => {
-    if (handles.get(key) !== entry) { closeServer(entry); return; }
-    entry.ready = true;
-    entry.address = entry.shared && !datagram ? server._transport.address() : server.address();
-    for (const [target, request] of entry.waiting) if (entry.workers.has(target.id)) reply(entry, target, request);
-    entry.waiting.length = 0; distribute(entry);
-  };
-  server.on('error', failed);
-  if (datagram) {
-    // SCM_RIGHTS duplicates one bound UDP socket, under either scheduling
-    // policy. The primary never starts receiving from that socket.
-    const error = server._bindNative(options, false);
-    if (error) failed(error);
-    else ready();
-    return;
-  }
-  server.on('connection', socket => { entry.queue.push(socket); distribute(entry); });
-  if (!entry.shared) { server.listen({ ...options, exclusive: true }, ready); return; }
-  // A passive primary descriptor cannot steal accepts from workers.
-  // SCM_RIGHTS duplicates this same socket; each child registers its own watcher.
-  const { Transport, native, error: nativeError } = require('internal/net/transport');
-  const bind = address => {
-    if (handles.get(key) !== entry) return;
-    try {
-      const kind = options.fd === undefined ? (options.path === undefined ? 1 : 2) : native('guessHandleType', [options.fd]);
-      server._transport = new Transport(kind, server, () => {});
-      let status = options.fd === undefined ? server._transport.call('bind', address, options.port || 0, options.ipv6Only ? 1 : 0) :
-        server._transport.call('open', options.fd);
-      if (status < 0) { failed(nativeError(status, 'bind', address, options.port)); return; }
-      if (kind === 2 && (options.readableAll || options.writableAll)) {
-        status = server._transport.call('chmod', !!options.readableAll, !!options.writableAll);
-        if (status < 0) { failed(nativeError(status, 'chmod', address)); return; }
-      }
-      // A passive listen makes the bound socket that workers share, and never accepts here.
-      if (options.fd === undefined) {
-        status = server._transport.call('listen', options.backlog || 511, true);
-        if (status < 0 && address === '::' && !options.host) { server._transport.close(); bind('0.0.0.0'); return; }
-        if (status < 0) { failed(nativeError(status, 'listen', address, options.port)); return; }
-      }
-      ready();
-    } catch (error) { failed(error); }
-  };
-  if (options.path !== undefined) bind(options.path);
-  else if (options.fd !== undefined) bind(undefined);
-  else if (!options.host || require('net').isIP(options.host)) bind(options.host || '::');
-  else require('dns').lookup(options.host, (error, address) => error ? failed(error) : bind(address));
-}
-function onmessage(worker, message) {
-  if (message.cmd !== 'NODE_CLUSTER') return;
-  if (message.act === 'online') {
-    worker.state = 'online'; worker.emit('online'); cluster.emit('online', worker);
-  } else if (message.act === 'listening') {
-    worker.state = 'listening'; worker.emit('listening', message.address); cluster.emit('listening', worker, message.address);
-  } else if (message.act === 'queryServer') query(worker, message);
-  else if (message.act === 'close') { const entry = handles.get(message.key); if (entry) remove(entry, worker); }
-  else if (message.act === 'exitedAfterDisconnect') {
-    worker.exitedAfterDisconnect = true; send(worker, { act: 'disconnectAck' });
-  } else if (message.act === 'accepted') {
-    const entry = handles.get(message.key), pending = entry?.pending.get(message.seq);
-    if (!pending || pending.worker !== worker) return;
-    entry.pending.delete(message.seq);
-    if (message.accepted) pending.socket.destroy();
-    else { entry.queue.push(pending.socket); distribute(entry); }
+
+function removeWorker(worker) {
+  assert(worker);
+  delete cluster.workers[worker.id];
+
+  if (ObjectKeys(cluster.workers).length === 0) {
+    assert(handles.size === 0, 'Resource leak detected.');
+    intercom.emit('disconnect');
   }
 }
+
+function removeHandlesForWorker(worker) {
+  assert(worker);
+
+  for (const { 0: key, 1: handle } of handles) {
+    if (handle.remove(worker))
+      handles.delete(key);
+  }
+}
+
 cluster.fork = function(env) {
   cluster.setupPrimary();
-  const id = ++ids, settings = cluster.settings;
-  const child = require('child_process').fork(settings.exec, settings.args, {
-    cwd: settings.cwd, env: { ...process.env, ...env, NODE_UNIQUE_ID: String(id) },
-    execArgv: settings.execArgv, silent: settings.silent, stdio: settings.stdio,
-    serialization: settings.serialization, uid: settings.uid, gid: settings.gid, windowsHide: settings.windowsHide
+  const id = ++ids;
+  const workerProcess = createWorkerProcess(id, env);
+  const worker = new Worker({
+    id: id,
+    process: workerProcess,
   });
-  const worker = new Worker({ id, process: child });
-  cluster.workers[id] = worker;
-  worker.on('message', (message, handle) => cluster.emit('message', worker, message, handle));
-  child.on('internalMessage', message => onmessage(worker, message));
-  child.once('disconnect', () => {
-    removeHandles(worker);
-    if (worker.isDead()) delete cluster.workers[id];
+
+  worker.on('message', function(message, handle) {
+    cluster.emit('message', this, message, handle);
+  });
+
+  worker.process.once('exit', (exitCode, signalCode) => {
+    /*
+     * Remove the worker from the workers list only
+     * if it has disconnected, otherwise we might
+     * still want to access it.
+     */
+    if (!worker.isConnected()) {
+      removeHandlesForWorker(worker);
+      removeWorker(worker);
+    }
+
     worker.exitedAfterDisconnect = !!worker.exitedAfterDisconnect;
-    worker.state = 'disconnected'; worker.emit('disconnect'); cluster.emit('disconnect', worker);
+    worker.state = 'dead';
+    worker.emit('exit', exitCode, signalCode);
+    cluster.emit('exit', worker, exitCode, signalCode);
   });
-  child.once('exit', (code, signal) => {
-    if (!worker.isConnected()) { removeHandles(worker); delete cluster.workers[id]; }
+
+  worker.process.once('disconnect', () => {
+    /*
+     * Now is a good time to remove the handles
+     * associated with this worker because it is
+     * not connected to the primary anymore.
+     */
+    removeHandlesForWorker(worker);
+
+    /*
+     * Remove the worker from the workers list only
+     * if its process has exited. Otherwise, we might
+     * still want to access it.
+     */
+    if (worker.isDead())
+      removeWorker(worker);
+
     worker.exitedAfterDisconnect = !!worker.exitedAfterDisconnect;
-    worker.state = 'dead'; worker.emit('exit', code, signal); cluster.emit('exit', worker, code, signal);
+    worker.state = 'disconnected';
+    worker.emit('disconnect');
+    cluster.emit('disconnect', worker);
   });
-  process.nextTick(() => cluster.emit('fork', worker));
+
+  worker.process.on('internalMessage', internal(worker, onmessage));
+  process.nextTick(emitForkNT, worker);
+  cluster.workers[worker.id] = worker;
   return worker;
 };
+
+function emitForkNT(worker) {
+  cluster.emit('fork', worker);
+}
+
+cluster.disconnect = function(cb) {
+  const workers = ObjectValues(cluster.workers);
+
+  if (workers.length === 0) {
+    process.nextTick(() => intercom.emit('disconnect'));
+  } else {
+    for (const worker of workers) {
+      if (worker.isConnected()) {
+        worker.disconnect();
+      }
+    }
+  }
+
+  if (typeof cb === 'function')
+    intercom.once('disconnect', cb);
+};
+
+const methodMessageMapping = {
+  close,
+  exitedAfterDisconnect,
+  listening,
+  online,
+  queryServer,
+};
+
+function onmessage(message, handle) {
+  const worker = this;
+
+  const fn = methodMessageMapping[message.act];
+
+  if (typeof fn === 'function')
+    fn(worker, message);
+}
+
+function online(worker) {
+  worker.state = 'online';
+  worker.emit('online');
+  cluster.emit('online', worker);
+}
+
+function exitedAfterDisconnect(worker, message) {
+  worker.exitedAfterDisconnect = true;
+  send(worker, { ack: message.seq });
+}
+
+function queryServer(worker, message) {
+  // Stop processing if worker already disconnecting
+  if (worker.exitedAfterDisconnect)
+    return;
+
+  const key = `${message.address}:${message.port}:${message.addressType}:` +
+              `${message.fd}` + (message.port === 0 ? `:${message.index}` : '');
+  const cachedHandle = handles.get(key);
+  let handle;
+  if (cachedHandle && !cachedHandle.has(worker)) {
+    handle = cachedHandle;
+  }
+
+  if (handle === undefined) {
+    let address = message.address;
+
+    // Find shortest path for unix sockets because of the ~100 byte limit
+    if (message.port < 0 && typeof address === 'string' &&
+        process.platform !== 'win32') {
+
+      address = path.relative(process.cwd(), address);
+
+      if (message.address.length < address.length)
+        address = message.address;
+    }
+
+    // UDP is exempt from round-robin connection balancing for what should
+    // be obvious reasons: it's connectionless. There is nothing to send to
+    // the workers except raw datagrams and that's pointless.
+    if (schedulingPolicy !== SCHED_RR ||
+        message.addressType === 'udp4' ||
+        message.addressType === 'udp6') {
+      handle = new SharedHandle(key, address, message);
+    } else {
+      handle = new RoundRobinHandle(key, address, message);
+    }
+
+    if (!cachedHandle) {
+      handles.set(key, handle);
+    }
+  }
+
+  handle.data ||= message.data;
+
+  // Set custom server data
+  handle.add(worker, (errno, reply, serverHandle) => {
+    if (!errno) {
+      handles.set(key, handle);  // Update in case it was replaced.
+    }
+    const { data } = handles.get(key);
+    if (!cachedHandle && errno) {
+      handles.delete(key);
+    }
+
+    send(worker, {
+      errno,
+      key,
+      ack: message.seq,
+      data,
+      ...reply,
+    }, serverHandle);
+  });
+}
+
+function listening(worker, message) {
+  const info = {
+    addressType: message.addressType,
+    address: message.address,
+    port: message.port,
+    fd: message.fd,
+  };
+
+  worker.state = 'listening';
+  worker.emit('listening', info);
+  cluster.emit('listening', worker, info);
+}
+
+// Server in worker is closing, remove from list. The handle may have been
+// removed by a prior call to removeHandlesForWorker() so guard against that.
+function close(worker, message) {
+  const key = message.key;
+  const handle = handles.get(key);
+
+  if (handle && handle.remove(worker))
+    handles.delete(key);
+}
+
+function send(worker, message, handle, cb) {
+  return sendHelper(worker.process, message, handle, cb);
+}
+
+// Extend generic Worker with methods specific to the primary process.
 Worker.prototype.disconnect = function() {
-  if (this.exitedAfterDisconnect) return this;
   this.exitedAfterDisconnect = true;
-  send(this, { act: 'disconnect' }); removeHandles(this);
-  delete cluster.workers[this.id];
+  send(this, { act: 'disconnect' });
+  removeHandlesForWorker(this);
+  removeWorker(this);
   return this;
 };
-Worker.prototype.destroy = function(signal) { this.process.kill(signal); };
-cluster.disconnect = function(callback) {
-  const workers = Object.values(cluster.workers).filter(worker => worker.isConnected());
-  let remaining = workers.length;
-  if (!remaining) { if (typeof callback === 'function') process.nextTick(callback); return; }
-  for (const worker of workers) {
-    worker.once('disconnect', () => { if (--remaining === 0 && typeof callback === 'function') callback(); });
-    worker.disconnect();
-  }
+
+Worker.prototype.destroy = function(signo) {
+  const signal = signo || 'SIGTERM';
+  this.process.kill(signal);
 };

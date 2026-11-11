@@ -281,31 +281,7 @@ function emitWarning(message) {
   else host.stderr.write('Warning: ' + message + '\n');
 }
 
-// internal/util/debuglog formatTime
-function pad(value) { return `${value}`.padStart(2, '0'); }
-function formatTime(ms) {
-  let hours = 0;
-  let minutes = 0;
-  let seconds = 0;
-  if (ms >= 1000) {
-    if (ms >= 60000) {
-      if (ms >= 3600000) {
-        hours = Math.floor(ms / 3600000);
-        ms = ms % 3600000;
-      }
-      minutes = Math.floor(ms / 60000);
-      ms = ms % 60000;
-    }
-    seconds = ms / 1000;
-  }
-  if (hours !== 0 || minutes !== 0) {
-    ({ 0: seconds, 1: ms } = seconds.toFixed(3).split('.', 2));
-    const res = hours !== 0 ? `${hours}:${pad(minutes)}` : minutes;
-    return `${res}:${pad(seconds)}.${ms} (${hours !== 0 ? 'h:m' : ''}m:ss.mmm)`;
-  }
-  if (seconds !== 0) return `${seconds.toFixed(3)}s`;
-  return `${Number(ms.toFixed(3))}ms`;
-}
+const { formatTime } = require('internal/util/debuglog');
 function timeLogImpl(consoleRef, timesStore, implementation, label, args) {
   const start = timesStore.get(label);
   if (start === undefined) {
