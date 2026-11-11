@@ -278,12 +278,12 @@ static void http_reply(client *c, unsigned status, const char *reason, const cha
     if (n < 0 || (size_t)n >= sizeof(header) || append_output(c, (const unsigned char *)header, (size_t)n, (const unsigned char *)body, strlen(body))) c->dead = 1;
     c->closing = 1; c->deadline = milliseconds() + 1000;
 }
+/* Like Node's inspector_socket.cc, any non-empty key is answered: the accept
+ * value is derived from the key text without decoding it. */
+#define KEY_LIMIT 128
 static int valid_key(const char *key) {
-    if (strlen(key) != 24 || key[22] != '=' || key[23] != '=') return 0;
-    unsigned char decoded[18], encoded[25];
-    int n = EVP_DecodeBlock(decoded, (const unsigned char *)key, 24);
-    if (n != 18 || EVP_EncodeBlock(encoded, decoded, 16) != 24) return 0;
-    return !memcmp(encoded, key, 24);
+    size_t length = strlen(key);
+    return length > 0 && length <= KEY_LIMIT;
 }
 static void http_input(silk_inspector *s, client *c) {
     size_t end = 0;
@@ -332,8 +332,9 @@ static void http_input(silk_inspector *s, client *c) {
     if (path[0] != '/' || strcmp(path + 1, s->uuid)) { http_reply(c, 404, "Not Found", "{}"); return; }
     if (!upgrade || strcasecmp(upgrade, "websocket") || !connection || !token(connection, "upgrade") || !key || !valid_key(key) || !ws_version || strcmp(ws_version, "13")) { http_reply(c, 400, "Bad Request", "{}"); return; }
     unsigned char digest[EVP_MAX_MD_SIZE], accept[64]; unsigned digest_length = 0;
-    char challenge[61]; memcpy(challenge, key, 24); memcpy(challenge + 24, "258EAFA5-E914-47DA-95CA-C5AB0DC85B11", 36);
-    if (!EVP_Digest(challenge, 60, digest, &digest_length, EVP_sha1(), NULL) || digest_length != 20) { http_reply(c, 500, "Internal Server Error", "{}"); return; }
+    size_t key_length = strlen(key);
+    char challenge[KEY_LIMIT + 36]; memcpy(challenge, key, key_length); memcpy(challenge + key_length, "258EAFA5-E914-47DA-95CA-C5AB0DC85B11", 36);
+    if (!EVP_Digest(challenge, key_length + 36, digest, &digest_length, EVP_sha1(), NULL) || digest_length != 20) { http_reply(c, 500, "Internal Server Error", "{}"); return; }
     EVP_EncodeBlock(accept, digest, 20);
     silk_inspector_packet *opened = packet(SILK_INSPECTOR_OPEN, c->id, NULL, 0);
     silk_inspector_packet *closed = packet(SILK_INSPECTOR_CLOSE, c->id, NULL, 0);
