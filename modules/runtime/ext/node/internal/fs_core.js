@@ -2,7 +2,9 @@
 const host = require('internal/host');
 const { Buffer } = require('buffer');
 const trace = require('internal/trace_events');
-const os = host.rawOS;
+// fs's own copy of the os functions, so that sync tracing can wrap the ones it calls.
+const rawOS = host.rawOS;
+const os = { ...rawOS };
 const std = host.rawStd;
 // fs.constants as Node builds it (src/node_constants.cc): the names Node exports, in its order,
 // with values from the platform and libuv's own UV_* definitions.
@@ -104,13 +106,30 @@ function syncFlag() { if (constants.O_SYNC === undefined) throw error('ENOSYS', 
 // pread/pwrite receive [fd, ArrayBuffer, absoluteByteOffset, length, position]
 // and preserve the descriptor's current offset. Metadata includes blksize,
 // birthtimeMs and, for bigint requests, exact integer fields and *timeNs.
+const kSyncCategory = 'node,node.fs,node.fs.sync';
+// Node names a sync trace event after its binding call: copyFile is copyfile, scandir readdir.
+const syncNames = { __proto__: null, copyFile: 'copyfile', scandir: 'readdir' };
+function traced(operation, call, self, args) {
+  const name = `fs.sync.${syncNames[operation] ?? operation}`;
+  trace.emit(kSyncCategory, name, 'B');
+  try { return Reflect.apply(call, self, args); }
+  finally { trace.emit(kSyncCategory, name, 'E'); }
+}
 function native(operation, args) {
   if (typeof host.fsSync !== 'function') throw error('ENOSYS', operation, typeof args[0] === 'string' ? args[0] : undefined);
-  if (!trace.enabled('node,node.fs,node.fs.sync')) return host.fsSync(operation, args);
-  trace.emit('node,node.fs,node.fs.sync', `fs.sync.${operation}`, 'B');
-  try { return host.fsSync(operation, args); }
-  finally { trace.emit('node,node.fs,node.fs.sync', `fs.sync.${operation}`, 'E'); }
+  if (!syncTracing) return host.fsSync(operation, args);
+  return traced(operation, host.fsSync, host, [operation, args]);
 }
+// The sync calls fs makes on os directly, traced only while the category is on.
+const tracedOS = ['mkdir', 'read', 'readlink', 'realpath', 'rename', 'symlink', 'utimes', 'write'];
+let syncTracing = false;
+trace.watch(kSyncCategory, on => {
+  syncTracing = on;
+  for (const name of tracedOS) {
+    const call = rawOS[name];
+    os[name] = on ? function (...args) { return traced(name, call, rawOS, args); } : call;
+  }
+});
 function callback(value) { v.validateFunction(value, 'cb'); return value; }
 // Native ownership kinds: callback, Promise, and FileHandle-close respectively.
 const promiseCallbacks = new WeakMap();

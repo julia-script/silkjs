@@ -104,7 +104,7 @@ function handleControl(worker, message) {
   const state = workerState(worker);
   switch (message.type) {
     case 'watch:dependency': require('internal/watch_mode/dependencies').report(message.filename); break;
-    case 'error': state.errorReceived = true; state.resource.runInAsyncScope(worker.emit, worker, 'error', 'symbol' in message ? Symbol.for(message.symbol) : message.error); break;
+    case 'error': state.errorReceived = true; state.resource.runInAsyncScope(worker.emit, worker, 'error', 'symbol' in message ? Symbol.for(message.symbol) : 'serialized' in message ? require('internal/error_serdes').deserializeError(message.serialized) : message.error); break;
     case 'stdio': {
       const stream = message.fd === 1 ? state.stdout : message.fd === 2 ? state.stderr : null;
       receiveStdio(stream, state.control, message);
@@ -496,7 +496,9 @@ function reportError(error) {
     controlSend(control, { type: 'error', symbol: error.description ?? '' });
     return true;
   }
-  try { controlSend(control, { type: 'error', error }); }
+  // As Node: error_serdes keeps the error's own properties (code, errno, ...) and constructor,
+  // which a structured clone of an Error drops.
+  try { controlSend(control, { type: 'error', serialized: require('internal/error_serdes').serializeError(error) }); }
   catch (serializationError) {
     const fallback = new Error('Worker error could not be serialized: ' + String(serializationError?.message || serializationError));
     controlSend(control, { type: 'error', error: fallback });

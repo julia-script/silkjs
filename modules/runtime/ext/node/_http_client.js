@@ -7,6 +7,7 @@ const { IncomingMessage } = require('_http_incoming');
 const { Agent } = require('_http_agent');
 const { Parser, token, error, setParserOptions } = require('internal/http/parser');
 const diagnostics = require('internal/host').diagnostics;
+const traceEvents = require('internal/trace_events');
 
 class ClientRequest extends OutgoingMessage {
   constructor(input, options, callback) {
@@ -70,7 +71,10 @@ class ClientRequest extends OutgoingMessage {
   end(chunk, encoding, callback) {
     const first = !this.finished;
     super.end(chunk, encoding, callback);
-    if (first && this.finished) diagnostics.publish('http.client.request.start', { request: this });
+    if (first && this.finished) {
+      diagnostics.publish('http.client.request.start', { request: this });
+      this._traceEventId = traceEvents.begin('node,node.http', 'http.client.request');
+    }
     return this;
   }
   _implicitHeader() { this._storeHeader(this.method + ' ' + this.path + ' HTTP/1.1\r\n'); }
@@ -96,6 +100,7 @@ class ClientRequest extends OutgoingMessage {
           socket._httpKeepAliveTimeout = keepAlive ? Math.max(0, Number(keepAlive[1]) * 1000 - (this.agent?.agentKeepAliveTimeoutBuffer || 0)) : undefined;
           current.once('end', () => { this._responseEnded = true; this._maybeRelease(); });
           diagnostics.publish('http.client.response.finish', { request: this, response: current });
+          if (this._traceEventId !== undefined) traceEvents.trace(101, 'node,node.http', 'http.client.request', this._traceEventId, { path: this.path, statusCode: current.statusCode });
           if (!this.emit('response', current)) current._dump();
           return { skipBody: this.method === 'HEAD' };
         },
