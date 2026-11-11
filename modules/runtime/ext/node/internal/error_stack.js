@@ -13,8 +13,10 @@ function install(global) {
     records: new WeakMap(), captured: new WeakMap(), rootError: Error, formatting: false,
     // Node's overrideStackTrace: a one-shot formatter for one error, ahead of Error.prepareStackTrace.
     overrides: new WeakMap(),
+    // internal/errors: NodeErrors answer true to kIsNodeError (Node's symbol of the same name).
+    kIsNodeError: Symbol('kIsNodeError'),
   });
-  const { records, captured, rootError } = state;
+  const { records, captured, rootError, kIsNodeError } = state;
   const define = Object.defineProperty;
   function record(site) {
     const value = records.get(site);
@@ -131,11 +133,16 @@ function install(global) {
     };
   }
   function defaultFormat(error, frames, sites) {
-    const rawName = error.name;
-    const name = rawName === undefined ? 'Error' : `${rawName}`;
-    const rawMessage = error.message;
-    const message = rawMessage === undefined ? '' : `${rawMessage}`;
-    let result = name ? message ? name + ': ' + message : name : message;
+    let result;
+    if (kIsNodeError in error) {
+      result = `${error.name} [${error.code}]: ${error.message}`;
+    } else {
+      const rawName = error.name;
+      const name = rawName === undefined ? 'Error' : `${rawName}`;
+      const rawMessage = error.message;
+      const message = rawMessage === undefined ? '' : `${rawMessage}`;
+      result = name ? message ? name + ': ' + message : name : message;
+    }
     const sources = host.builtinLoaded('internal/source_maps') ? require('internal/source_maps') : null;
     const mapped = sources !== null && sources.getSourceMapsSupport().enabled;
     for (let index = 0; index < frames.length; index++) {
@@ -153,6 +160,15 @@ function install(global) {
     for (let index = 0; index < sites.length; index++) frames[index] = records.get(sites[index]);
     return defaultFormat(error, frames, sites);
   }
+  function callSites(frames) {
+    const sites = [];
+    for (let index = 0; index < frames.length; index++) {
+      const site = Object.create(CallSite.prototype);
+      records.set(site, frames[index]);
+      sites[index] = site;
+    }
+    return sites;
+  }
   function format(error, raw) {
     if (raw === undefined) return undefined;
     const frames = [];
@@ -169,13 +185,7 @@ function install(global) {
         prepare = owner.prepareStackTrace;
       }
       if (override === undefined && (typeof prepare !== 'function' || prepare === state.defaultPrepare)) return defaultFormat(error, frames);
-      const sites = [];
-      for (let index = 0; index < frames.length; index++) {
-        const site = Object.create(CallSite.prototype);
-        records.set(site, frames[index]);
-        sites[index] = site;
-      }
-      return Reflect.apply(prepare, override === undefined ? owner : undefined, [error, sites]);
+      return Reflect.apply(prepare, override === undefined ? owner : undefined, [error, callSites(frames)]);
     } finally { state.formatting = false; }
   }
   function getStack() {

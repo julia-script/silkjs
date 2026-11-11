@@ -5,6 +5,7 @@ const types = require('util/types');
 const { inspect } = require('internal/util_inspect');
 const { isDeepStrictEqual } = require('internal/util_comparisons');
 const customPromisify = Symbol.for('nodejs.util.promisify.custom');
+const { customPromisifyArgs } = require('internal/util_promisify');
 function invalid(name, expected, value) {
   const error = new TypeError('The "' + name + '" argument must be of type ' + expected + '. Received ' + inspect(value));
   error.code = 'ERR_INVALID_ARG_TYPE';
@@ -49,9 +50,17 @@ function promisify(original) {
     Object.defineProperty(custom, customPromisify, { value: custom, configurable: true });
     return custom;
   }
+  const argumentNames = original[customPromisifyArgs];
   function fn(...args) {
     return new Promise((resolve, reject) => {
-      args.push((error, value) => error ? reject(error) : resolve(value));
+      args.push((error, ...values) => {
+        if (error) return reject(error);
+        if (argumentNames !== undefined && values.length > 1) {
+          const result = {};
+          for (let i = 0; i < argumentNames.length; i++) result[argumentNames[i]] = values[i];
+          resolve(result);
+        } else resolve(values[0]);
+      });
       Reflect.apply(original, this, args);
     });
   }
