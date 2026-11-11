@@ -23,7 +23,8 @@ function initialize(server, options, listener) {
       };
       socket = new (require('tls').TLSSocket)(carrier, configuration);
     } catch (err) { carrier.destroy(); server.emit('tlsClientError', err, carrier); return; }
-    socket.server = server; socket._server = server;
+    // Like Node, only the accepted carrier counts as the server's connection (_server).
+    socket.server = server;
     let secure = false, reported = false;
     socket.on('error', err => { if (!secure && !reported) { reported = true; server.emit('tlsClientError', err, socket); } });
     socket.once('close', () => {
