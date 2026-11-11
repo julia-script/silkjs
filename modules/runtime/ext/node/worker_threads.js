@@ -377,23 +377,43 @@ function bootstrap() {
   control.unref();
   return bootstrapResult;
 }
+// process.env, shared by every thread of the process. Like Node's: names that
+// are not variables resolve on Object.prototype, values become strings (a
+// Symbol throws), and only plain enumerable, writable, configurable data
+// properties can be defined.
 function workerEnvironment() {
+  const lookup = key => host.workerNative('envGet', [key]);
+  const store = (key, value) => {
+    if (typeof key === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
+    host.workerNative('envSet', [key, `${value}`]);
+  };
+  const invalidDescriptor = message => clone().codedError('ERR_INVALID_OBJECT_DEFINE_PROPERTY', message);
   return new Proxy(Object.create(null), {
-    get(target, key) { if (typeof key === 'symbol') return undefined; return host.workerNative('envGet', [String(key)]); },
-    set(target, key, value) { if (typeof key !== 'symbol') host.workerNative('envSet', [String(key), String(value)]); return true; },
-    deleteProperty(target, key) { if (typeof key !== 'symbol') host.workerNative('envDelete', [String(key)]); return true; },
+    get(target, key) {
+      if (typeof key === 'symbol') return undefined;
+      const value = lookup(key);
+      return value !== undefined ? value : Object.prototype[key];
+    },
+    set(target, key, value) { store(key, value); return true; },
+    deleteProperty(target, key) { if (typeof key !== 'symbol') host.workerNative('envDelete', [key]); return true; },
     ownKeys() { return host.workerNative('envKeys', []); },
-    has(target, key) { return typeof key !== 'symbol' && host.workerNative('envGet', [String(key)]) !== undefined; },
+    has(target, key) { return typeof key !== 'symbol' && (lookup(key) !== undefined || key in Object.prototype); },
     getOwnPropertyDescriptor(target, key) {
       if (typeof key === 'symbol') return undefined;
-      const value = host.workerNative('envGet', [String(key)]);
+      const value = lookup(key);
       if (value !== undefined) return { value, enumerable: true, configurable: true, writable: true };
     },
     defineProperty(target, key, descriptor) {
-      if (!('value' in descriptor) || !descriptor.configurable || !descriptor.enumerable || !descriptor.writable)
-        throw clone().codedError('ERR_INVALID_OBJECT_DEFINE_PROPERTY', 'process.env only accepts configurable, writable, enumerable data descriptors');
-      host.workerNative('envSet', [String(key), String(descriptor.value)]); return true;
+      if ('value' in descriptor) {
+        if (!descriptor.configurable || !descriptor.writable || !descriptor.enumerable)
+          throw invalidDescriptor("'process.env' only accepts a configurable, writable, and enumerable data descriptor");
+        store(key, descriptor.value); return true;
+      }
+      if ('get' in descriptor || 'set' in descriptor)
+        throw invalidDescriptor("'process.env' does not accept an accessor(getter/setter) descriptor");
+      throw invalidDescriptor("'process.env' only accepts a configurable, writable, and enumerable data descriptor");
     },
+    getPrototypeOf() { return Object.prototype; },
   });
 }
 function install(proc = process, metadata = bootstrap()) {
