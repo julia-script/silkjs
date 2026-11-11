@@ -53,7 +53,7 @@ const {
   validateString,
   validateLinkHeaderValue,
   validateObject,
-} = require('internal/http2/validators');
+} = require('internal/validators');
 const {
   kSocket,
   kRequest,

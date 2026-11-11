@@ -34,6 +34,7 @@ function codedError(Base, code, message) {
 }
 function unknownSignal(signal) { return codedError(TypeError, 'ERR_UNKNOWN_SIGNAL', `Unknown signal: ${signal}`); }
 
+const isUint32 = (value) => value === (value >>> 0);
 function validateString(value, name) {
   if (typeof value !== 'string') throw new ERR_INVALID_ARG_TYPE(name, 'string', value);
 }
@@ -82,6 +83,30 @@ function validateAbortSignal(signal, name) {
     throw new ERR_INVALID_ARG_TYPE(name, 'AbortSignal', signal);
   }
 }
+function validateBuffer(buffer, name = 'buffer') {
+  if (!ArrayBuffer.isView(buffer)) throw new ERR_INVALID_ARG_TYPE(name, ['Buffer', 'TypedArray', 'DataView'], buffer);
+}
+const linkValueRegExp = /^(?:<[^>]*>)(?:\s*;\s*[^;"\s]+(?:=(")?[^;"\s]*\1)?)*$/;
+function validateLinkHeaderFormat(value, name) {
+  if (typeof value === 'undefined' || !linkValueRegExp.exec(value)) {
+    throw new ERR_INVALID_ARG_VALUE(name, value, 'must be an array or string of format "</styles.css>; rel=preload; as=style"');
+  }
+}
+function validateLinkHeaderValue(hints) {
+  if (typeof hints === 'string') {
+    validateLinkHeaderFormat(hints, 'hints');
+    return hints;
+  } else if (Array.isArray(hints)) {
+    let result = '';
+    for (let i = 0; i < hints.length; i++) {
+      validateLinkHeaderFormat(hints[i], 'hints');
+      result += hints[i];
+      if (i !== hints.length - 1) result += ', ';
+    }
+    return result;
+  }
+  throw new ERR_INVALID_ARG_VALUE('hints', hints, 'must be an array or string of format "</styles.css>; rel=preload; as=style"');
+}
 let signals;
 const signalTable = () => signals ??= require('os').constants.signals;
 let signalNames;
@@ -125,5 +150,6 @@ module.exports = {
   kValidateObjectAllowNullable, kValidateObjectAllowArray, kValidateObjectAllowFunction,
   validateString, validateBoolean, validateFunction, validateNumber, validateInteger, validateInt32,
   validateUint32, validateObject, validateArray, validateOneOf, validateAbortSignal,
+  isUint32, validateBuffer, validateLinkHeaderValue,
   convertToValidSignal, signalName, toPathIfFileURL, validatePath, getValidatedPath,
 };
