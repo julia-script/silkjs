@@ -231,8 +231,20 @@ for (const [method, rrtype] of Object.entries(methods)) {
 function defaultInstance() { if (!defaultResolver) defaultResolver = new Resolver(); return defaultResolver; }
 const publicMethods = ['resolve', 'reverse', ...Object.keys(methods)];
 const api = Object.assign({ Resolver, lookup, lookupService, setDefaultResultOrder, getDefaultResultOrder }, constants, errors);
-for (const name of [...publicMethods, 'getServers', 'setServers']) api[name] = (...args) => defaultInstance()[name](...args);
-function promisifyCall(fn, receiver, args, shape) { return new Promise((resolve, reject) => { fn.apply(receiver, args.concat([(err, ...values) => { if (err) reject(err); else resolve(shape ? shape(values) : values[0]); }])); }); }
+for (const name of [...publicMethods, 'getServers']) api[name] = (...args) => defaultInstance()[name](...args);
+// Like Node, dns.setServers replaces the default resolver, so queries already sent keep theirs.
+api.setServers = function setServers(servers) {
+  const resolver = new Resolver();
+  resolver.setServers(servers);
+  defaultResolver = resolver;
+};
+// Like Node's dns.promises, invalid arguments throw at the call; only the query rejects.
+function promisifyCall(fn, receiver, args, shape) {
+  let resolve, reject;
+  const promise = new Promise((done, failed) => { resolve = done; reject = failed; });
+  fn.apply(receiver, args.concat([(err, ...values) => { if (err) reject(err); else resolve(shape ? shape(values) : values[0]); }]));
+  return promise;
+}
 function lookupPromise(hostname, options) { return promisifyCall(lookup, undefined, [hostname, options], values => Array.isArray(values[0]) ? values[0] : { address: values[0], family: values[1] }); }
 function lookupServicePromise(address, port) { return promisifyCall(lookupService, undefined, [address, port], values => ({ hostname: values[0], service: values[1] })); }
 class PromiseResolver extends Resolver {}

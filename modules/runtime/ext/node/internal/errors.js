@@ -153,9 +153,10 @@ function ErrnoException(status, syscall, original) {
   err.syscall = syscall;
   return err;
 }
-function ExceptionWithHostPort(status, syscall, address, port) {
+function ExceptionWithHostPort(status, syscall, address, port, additional) {
   const code = errorName(status);
-  const details = port && port > 0 ? ` ${address}:${port}` : address ? ` ${address}` : '';
+  let details = port && port > 0 ? ` ${address}:${port}` : address ? ` ${address}` : '';
+  if (additional) details += ` - Local (${additional})`;
   const err = new Error(`${syscall} ${code}${details}`);
   err.errno = status;
   err.code = code;

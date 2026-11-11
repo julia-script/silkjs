@@ -9,7 +9,7 @@ let defaultAutoSelectFamily = true;
 let defaultAutoSelectFamilyAttemptTimeout = 250;
 
 const { codes: { ERR_INVALID_ADDRESS_FAMILY, ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_INVALID_IP_ADDRESS, ERR_IP_BLOCKED, ERR_MISSING_ARGS, ERR_OUT_OF_RANGE }, makeError,
-  validateBoolean, validateFunction, validateInt32, validateNumber, validatePort, validateString } = require('internal/errors');
+  ExceptionWithHostPort, validateBoolean, validateFunction, validateInt32, validateNumber, validatePort, validateString } = require('internal/errors');
 
 function fail(code, message, Type = Error) { return makeError(Type, code, message); }
 function integer(value, name, min, max) {
@@ -20,7 +20,14 @@ function integer(value, name, min, max) {
 function callback(value) {
   if (value !== undefined && typeof value !== 'function') throw fail('ERR_INVALID_ARG_TYPE', 'Callback must be a function', TypeError);
 }
-function isIP(input) { return typeof input === 'string' ? native('isIP', [input]) : 0; }
+// Like Node's regular expressions: the input is converted to a string, and an IPv6 address may
+// carry a zone ID such as `%eth0`.
+function isIP(input) {
+  const text = `${input}`;
+  const zone = text.indexOf('%');
+  if (zone === -1) return native('isIP', [text]);
+  return /^%[0-9a-zA-Z\-.:]+$/.test(text.slice(zone)) && native('isIP', [text.slice(0, zone)]) === 6 ? 6 : 0;
+}
 function isIPv4(input) { return isIP(input) === 4; }
 function isIPv6(input) { return isIP(input) === 6; }
 function socketToDnsFamily(family) { return family === 'IPv4' ? 4 : family === 'IPv6' ? 6 : family; }
@@ -177,7 +184,14 @@ Socket.prototype._onNative = function(type, status, payload) {
     return;
   }
   if (type === 3) {
-    if (status < 0) { this._connectionFailed(nativeError(status, 'connect', this._connectAddress, this._connectPort)); return; }
+    if (status < 0) {
+      // Like Node's createConnectionError: a given local address and port are in the message.
+      const local = this._connectLocal;
+      const err = ExceptionWithHostPort(status, 'connect', this._connectAddress, this._connectPort, local && `${local.address}:${local.port}`);
+      if (local) { err.localAddress = local.address; err.localPort = local.port; }
+      this._connectionFailed(err);
+      return;
+    }
     this.connecting = false;
     this._connected = true;
     this._cacheAddresses();
@@ -259,6 +273,7 @@ Socket.prototype._send = function(chunks, cb, vector) {
   if (this.connecting) {
     this._pendingWrite = () => this._send(chunks, cb, vector);
     this._pendingWrite.callback = cb;
+    this._pendingWrite.chunks = chunks;
     return;
   }
   if (!this._connected || !this._transport) { cb(fail('ERR_SOCKET_CLOSED', 'Socket is closed')); return; }
@@ -359,6 +374,7 @@ Socket.prototype.connect = function(...args) {
   const start = (address, family) => {
     if (this.destroyed || generation !== this._generation) return;
     this._connectAddress = address;
+    this._connectLocal = options.localAddress && options.localPort ? { address: options.localAddress, port: options.localPort } : undefined;
     try {
       this._attachTransport(new Transport(options.path ? 2 : 1, (...event) => this._onNative(...event)));
       if (options.localAddress !== undefined || options.localPort !== undefined) {
@@ -370,7 +386,12 @@ Socket.prototype.connect = function(...args) {
       if (this.destroyed) return;
       if (!options.path && this.blockList?.check(address, `ipv${family}`)) { this._connectionFailed(new ERR_IP_BLOCKED(address)); return; }
       const status = this._transport.call('connect', address, port || 0);
-      if (status < 0) this._connectionFailed(nativeError(status, 'connect', address, port));
+      if (status < 0) {
+        // Like Node's internalConnect, a TCP connect that fails at once names the local address,
+        // which is empty when the socket has none.
+        const local = options.path ? undefined : this.address();
+        this._connectionFailed(ExceptionWithHostPort(status, 'connect', address, port, local && `${local.address}:${local.port}`));
+      }
     } catch (err) { this.destroy(err); }
   };
   if (options.path) process.nextTick(start, options.path, 0);
@@ -507,12 +528,25 @@ Socket.prototype.resetAndDestroy = function() {
   return this.destroy();
 };
 Object.defineProperties(Socket.prototype, {
-  _handle: { get() { return this._transport; }, configurable: true },
+  _handle: { get() { return this._transport; }, set(value) { this._transport = value; }, configurable: true },
+  _connecting: { get() { return this.connecting; } },
   pending: { get() { return !this._transport || this.connecting; } },
   readyState: { get() { return this.connecting ? 'opening' : this.readable && this.writable ? 'open' : this.readable ? 'readOnly' : this.writable ? 'writeOnly' : 'closed'; } },
-  bufferSize: { get() { return this._transport ? this.writableLength : undefined; } },
+  // Node creates the handle in connect(), so a connecting socket has a buffer size too.
+  bufferSize: { get() { return this._transport || this.connecting ? this.writableLength : undefined; } },
   bytesRead: { get() { return this._bytesRead; } },
-  bytesWritten: { get() { return this._bytesWritten + this.writableLength - (this._writableState.writing && !this.connecting ? this._writableState.writelen : 0); } },
+  // Like Node: the bytes sent, plus the buffered writes and the write that waits for the connect.
+  bytesWritten: { get() {
+    const buffered = this.writableBuffer;
+    if (!buffered) return undefined;
+    const length = entry => typeof entry.chunk === 'string' ? Buffer.byteLength(entry.chunk, entry.encoding) : entry.chunk.length;
+    let bytes = this._bytesWritten;
+    for (const entry of buffered) bytes += length(entry);
+    const pending = this._pendingWrite?.chunks;
+    if (Array.isArray(pending)) for (const entry of pending) bytes += length(entry);
+    else if (pending) bytes += pending.length;
+    return bytes;
+  } },
   localAddress: { get() { return this._localAddress?.address; } },
   localPort: { get() { return this._localAddress?.port; } },
   localFamily: { get() { return this._localAddress?.family; } },
@@ -659,6 +693,9 @@ Server.prototype.listen = function(...args) {
         if (status >= 0) status = this._transport.call('listen', backlog);
       }
       if (status < 0) { failed(nativeError(status, 'listen', address, port)); return; }
+      // Node's key for the listening address: type, address and the requested port.
+      this._connectionKey = kind === 1 && fd === undefined ? `${isIP(address)}:${address}:${port}`
+        : `-1:${fd === undefined ? address : null}:-1`;
       this._starting = false;
       this._listening = true;
       process.nextTick(() => { if (this._listening && generation === this._generation) this.emit('listening'); });
