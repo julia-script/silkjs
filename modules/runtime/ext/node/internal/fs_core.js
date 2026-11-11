@@ -25,54 +25,69 @@ function pair(result, syscall, path) {
   if (result[1]) fail(-Math.abs(result[1]), syscall, path);
   return result[0];
 }
+const v = require('internal/validators');
+const { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_OUT_OF_RANGE } = v;
+// Legacy helpers for callers that state the expectation in words.
 function invalid(name, expected) { const e = new TypeError(`The "${name}" argument must be ${expected}`); e.code = 'ERR_INVALID_ARG_TYPE'; return e; }
 function range(name) { const e = new RangeError(`The value of "${name}" is out of range`); e.code = 'ERR_OUT_OF_RANGE'; return e; }
-function integer(value, name, min = 0, max = Number.MAX_SAFE_INTEGER) {
-  if (typeof value !== 'number') throw invalid(name, 'a number');
-  if (!Number.isInteger(value) || value < min || value > max) throw range(name);
-  return value;
-}
-function path(value) {
-  if (Buffer.isBuffer(value)) value = value.toString();
-  else if (value && typeof value === 'object' && value.protocol === 'file:') {
-    if (value.hostname && value.hostname !== 'localhost') { const e = new TypeError('File URL host must be empty or localhost'); e.code = 'ERR_INVALID_FILE_URL_HOST'; throw e; }
-    if (/%2f|%5c/i.test(value.pathname)) { const e = new TypeError('File URL path must not include encoded separators'); e.code = 'ERR_INVALID_FILE_URL_PATH'; throw e; }
-    value = decodeURIComponent(value.pathname);
+function integer(value, name, min = 0, max = Number.MAX_SAFE_INTEGER) { v.validateInteger(value, name, min, max); return value; }
+// Node's getValidatedPath: a string, a Uint8Array or a file: URL, without null bytes.
+function toPathIfFileURL(value) {
+  if (value == null || typeof value !== 'object' || value.href === undefined || value.protocol === undefined) return value;
+  if (value.protocol !== 'file:') { const e = v.makeError(TypeError, 'ERR_INVALID_URL_SCHEME', 'The URL must be of scheme file'); throw e; }
+  if (value.hostname !== '' && value.hostname !== 'localhost') throw v.makeError(TypeError, 'ERR_INVALID_FILE_URL_HOST', `File URL host must be "localhost" or empty on ${process.platform}`);
+  const pathname = value.pathname;
+  for (let n = 0; n < pathname.length; n++) {
+    if (pathname[n] === '%') { const third = pathname.codePointAt(n + 2) | 0x20; if (pathname[n + 1] === '2' && third === 102) throw v.makeError(TypeError, 'ERR_INVALID_FILE_URL_PATH', 'File URL path must not include encoded / characters'); }
   }
-  if (typeof value !== 'string') throw invalid('path', 'a string, Buffer, or file URL');
-  if (value.includes('\0')) { const e = new TypeError('Path must not contain null bytes'); e.code = 'ERR_INVALID_ARG_VALUE'; throw e; }
-  return value;
+  return decodeURIComponent(pathname);
 }
-function fd(value) { return integer(value, 'fd', 0, 0x7fffffff); }
+function path(value, name = 'path') {
+  value = toPathIfFileURL(value);
+  if (typeof value === 'string') {
+    if (value.includes('\0')) throw ERR_INVALID_ARG_VALUE(name, value, 'must be a string, Uint8Array, or URL without null bytes');
+    return value;
+  }
+  if (value instanceof Uint8Array) {
+    if (value.includes(0)) throw ERR_INVALID_ARG_VALUE(name, value, 'must be a string, Uint8Array, or URL without null bytes');
+    return Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString();
+  }
+  throw ERR_INVALID_ARG_TYPE(name, ['string', 'Buffer', 'URL'], value);
+}
+function fd(value, name = 'fd') { if (Object.is(value, -0)) return 0; v.validateInt32(value, name, 0); return value; }
+// Node's getOptions.
 function options(value, defaults) {
-  if (value === undefined || value === null) return Object.assign({}, defaults);
+  if (value === undefined || value === null || typeof value === 'function') return Object.assign({}, defaults);
   if (typeof value === 'string') return Object.assign({}, defaults, { encoding: value });
-  if (typeof value !== 'object') throw invalid('options', 'an object or string');
-  return Object.assign({}, defaults, value);
+  if (typeof value !== 'object') throw ERR_INVALID_ARG_TYPE('options', ['string', 'Object'], value);
+  const result = Object.assign({}, defaults, value);
+  if (result.encoding !== 'buffer') assertEncoding(result.encoding);
+  if (result.signal !== undefined) v.validateAbortSignal(result.signal, 'options.signal');
+  return result;
 }
-function mode(value, fallback = 0o666) { return value === undefined ? fallback : typeof value === 'string' && /^[0-7]+$/.test(value) ? parseInt(value, 8) : integer(value, 'mode', 0, 0xffffffff); }
-function flags(value = 'r') {
-  if (typeof value === 'number') return integer(value, 'flags', 0, 0x7fffffff);
-  let result;
+function assertEncoding(value) { if (value && !Buffer.isEncoding(value)) throw ERR_INVALID_ARG_VALUE('encoding', value, 'is invalid encoding'); }
+function mode(value, fallback = 0o666, name = 'mode') { return v.parseFileMode(value, name, fallback); }
+function flags(value, name = 'flags') {
+  if (typeof value === 'number') { v.validateInt32(value, name); return value + 0; }
+  if (value == null) return constants.O_RDONLY;
   const c = constants;
   switch (value) {
-    case 'r': result = c.O_RDONLY; break;
-    case 'r+': result = c.O_RDWR; break;
-    case 'rs': case 'sr': result = c.O_RDONLY | syncFlag(); break;
-    case 'rs+': case 'sr+': result = c.O_RDWR | syncFlag(); break;
-    case 'w': result = c.O_WRONLY | c.O_CREAT | c.O_TRUNC; break;
-    case 'wx': case 'xw': result = c.O_WRONLY | c.O_CREAT | c.O_TRUNC | c.O_EXCL; break;
-    case 'w+': result = c.O_RDWR | c.O_CREAT | c.O_TRUNC; break;
-    case 'wx+': case 'xw+': result = c.O_RDWR | c.O_CREAT | c.O_TRUNC | c.O_EXCL; break;
-    case 'a': result = c.O_WRONLY | c.O_CREAT | c.O_APPEND; break;
-    case 'ax': case 'xa': result = c.O_WRONLY | c.O_CREAT | c.O_APPEND | c.O_EXCL; break;
-    case 'a+': result = c.O_RDWR | c.O_CREAT | c.O_APPEND; break;
-    case 'ax+': case 'xa+': result = c.O_RDWR | c.O_CREAT | c.O_APPEND | c.O_EXCL; break;
-    case 'as': case 'sa': result = c.O_WRONLY | c.O_CREAT | c.O_APPEND | syncFlag(); break;
-    case 'as+': case 'sa+': result = c.O_RDWR | c.O_CREAT | c.O_APPEND | syncFlag(); break;
-    default: { const e = new TypeError(`Unknown file open flag: ${value}`); e.code = 'ERR_INVALID_ARG_VALUE'; throw e; }
+    case 'r': return c.O_RDONLY;
+    case 'rs': case 'sr': return c.O_RDONLY | syncFlag();
+    case 'r+': return c.O_RDWR;
+    case 'rs+': case 'sr+': return c.O_RDWR | syncFlag();
+    case 'w': return c.O_TRUNC | c.O_CREAT | c.O_WRONLY;
+    case 'wx': case 'xw': return c.O_TRUNC | c.O_CREAT | c.O_WRONLY | c.O_EXCL;
+    case 'w+': return c.O_TRUNC | c.O_CREAT | c.O_RDWR;
+    case 'wx+': case 'xw+': return c.O_TRUNC | c.O_CREAT | c.O_RDWR | c.O_EXCL;
+    case 'a': return c.O_APPEND | c.O_CREAT | c.O_WRONLY;
+    case 'ax': case 'xa': return c.O_APPEND | c.O_CREAT | c.O_WRONLY | c.O_EXCL;
+    case 'as': case 'sa': return c.O_APPEND | c.O_CREAT | c.O_WRONLY | syncFlag();
+    case 'a+': return c.O_APPEND | c.O_CREAT | c.O_RDWR;
+    case 'ax+': case 'xa+': return c.O_APPEND | c.O_CREAT | c.O_RDWR | c.O_EXCL;
+    case 'as+': case 'sa+': return c.O_APPEND | c.O_CREAT | c.O_RDWR | syncFlag();
   }
-  return result;
+  throw ERR_INVALID_ARG_VALUE('flags', value);
 }
 function syncFlag() { if (constants.O_SYNC === undefined) throw error('ENOSYS', 'open'); return constants.O_SYNC; }
 // Private native extension: fsSync(name, positionalArgs) returns a Node result
@@ -88,7 +103,7 @@ function native(operation, args) {
   try { return host.fsSync(operation, args); }
   finally { trace.emit('node,node.fs,node.fs.sync', `fs.sync.${operation}`, 'E'); }
 }
-function callback(value) { if (typeof value !== 'function') throw invalid('callback', 'a function'); return value; }
+function callback(value) { v.validateFunction(value, 'cb'); return value; }
 // Native ownership kinds: callback, Promise, and FileHandle-close respectively.
 const promiseCallbacks = new WeakMap();
 function promiseCallback(cb, kind = 1) {
@@ -116,84 +131,103 @@ function submit(operation, args, cb, owner = cb) {
     throw error;
   }
 }
-function time(value) {
-  if (value instanceof Date) value = value.getTime() / 1000;
-  else if (typeof value === 'string' && value.trim() !== '') value = Number(value);
-  if (typeof value !== 'number' || !Number.isFinite(value)) throw invalid('time', 'a finite number, numeric string, or Date');
-  return value < 0 ? Date.now() / 1000 : value;
+// Node's toUnixTimestamp: a Date, a finite number or a numeric string, in seconds.
+function time(value, name = 'time') {
+  if (typeof value === 'string' && +value == value) return +value;
+  if (Number.isFinite(value)) return value < 0 ? Date.now() / 1000 : value;
+  if (value instanceof Date) return value.getTime() / 1000;
+  throw ERR_INVALID_ARG_TYPE(name, ['Date', 'Time in seconds'], value);
 }
-function bytes(value) {
-  if (!ArrayBuffer.isView(value)) throw invalid('buffer', 'a Buffer, TypedArray, or DataView');
-  return value;
+function bytes(value, name = 'buffer') { v.validateBuffer(value, name); return value; }
+// Node's validatePosition; null, undefined and -1 mean the current position.
+function position(value, name = 'position', length = 0) {
+  if (value === undefined || value === null) return null;
+  if (typeof value === 'number') { v.validateInteger(value, name, -1); return value === -1 ? null : value; }
+  if (typeof value === 'bigint') {
+    const max = 2n ** 63n - 1n - BigInt(length);
+    if (!(value >= -1n && value <= max)) throw ERR_OUT_OF_RANGE(name, `>= -1 && <= ${max}`, value);
+    return value === -1n ? null : value;
+  }
+  throw ERR_INVALID_ARG_TYPE(name, ['integer', 'bigint'], value);
 }
-function position(value) {
-  if (value === undefined || value === null || value === -1 || value === -1n) return null;
-  if (typeof value === 'bigint') { if (value < 0n || value > 0x7fffffffffffffffn) throw range('position'); return value; }
-  return integer(value, 'position');
+function validateOffsetLengthRead(offset, length, bufferLength) {
+  if (offset < 0) throw ERR_OUT_OF_RANGE('offset', '>= 0', offset);
+  if (length < 0) throw ERR_OUT_OF_RANGE('length', '>= 0', length);
+  if (offset + length > bufferLength) throw ERR_OUT_OF_RANGE('length', `<= ${bufferLength - offset}`, length);
 }
-function slice(buffer, offset = 0, length = buffer.byteLength - offset) {
-  bytes(buffer); integer(offset, 'offset', 0, buffer.byteLength); integer(length, 'length', 0, buffer.byteLength - offset);
-  return [buffer, offset, length];
+function validateOffsetLengthWrite(offset, length, byteLength) {
+  if (offset > byteLength) throw ERR_OUT_OF_RANGE('offset', `<= ${byteLength}`, offset);
+  if (length > byteLength - offset) throw ERR_OUT_OF_RANGE('length', `<= ${byteLength - offset}`, length);
+  if (length < 0) throw ERR_OUT_OF_RANGE('length', '>= 0', length);
+  v.validateInt32(length, 'length', 0);
+}
+function validateStringAfterArrayBufferView(value, name) {
+  if (typeof value !== 'string') throw ERR_INVALID_ARG_TYPE(name, ['string', 'Buffer', 'TypedArray', 'DataView'], value);
+}
+function bufferArray(buffers, name = 'buffers') {
+  if (!Array.isArray(buffers)) throw ERR_INVALID_ARG_TYPE(name, 'ArrayBufferView[]', buffers);
+  for (let i = 0; i < buffers.length; i++) if (!ArrayBuffer.isView(buffers[i])) throw ERR_INVALID_ARG_TYPE(name, 'ArrayBufferView[]', buffers);
+  return buffers;
 }
 function encoding(value, fallback = 'utf8', bufferAllowed = false) {
   if (value === undefined || value === null) return fallback;
   if (bufferAllowed && value === 'buffer') return value;
-  if (!Buffer.isEncoding(value)) { const e = new TypeError(`Unknown encoding: ${value}`); e.code = 'ERR_INVALID_ARG_VALUE'; throw e; }
+  assertEncoding(value);
   return value;
 }
 function encoded(value, enc) { return enc === 'buffer' ? Buffer.from(value) : enc === 'utf8' || enc === 'utf-8' ? value : Buffer.from(value).toString(enc); }
-function aborted(signal) { if (signal && signal.aborted) { const e = new Error('The operation was aborted', { cause: signal.reason }); e.name = 'AbortError'; e.code = 'ABORT_ERR'; throw e; } }
-// A time field of a native stat result, or of an object given to the constructor.
-function timeMs(ms, date) {
-  return ms !== undefined ? Number(ms) : date instanceof Date ? date.getTime() : date === undefined ? 0 : Number(date);
+function aborted(signal) { if (signal && signal.aborted) throw v.abortError(signal); }
+// Node's Stats and BigIntStats (lib/internal/fs/utils.js): function constructors taking the
+// fields in order, with atime, mtime, ctime and birthtime as Dates made when first read.
+const S_IFMT = 0o170000;
+function StatsBase(dev, mode, nlink, uid, gid, rdev, blksize, ino, size, blocks) {
+  this.dev = dev; this.mode = mode; this.nlink = nlink; this.uid = uid; this.gid = gid; this.rdev = rdev;
+  this.blksize = blksize; this.ino = ino; this.size = size; this.blocks = blocks;
 }
-function bigTimeMs(ms, ns, date) {
-  if (ns !== undefined) return BigInt(ns) / 1000000n;
-  if (typeof ms === 'bigint') return ms;
-  return BigInt(Math.trunc(timeMs(ms, date)));
-}
-const big = x => BigInt(x === undefined ? 0 : x);
-const small = x => x === undefined ? 0 : Number(x);
-// Fields in Node's order. As in Node, atime, mtime, ctime and birthtime are Dates made
-// when first read, from the *Ms fields.
-class Stats {
-  constructor(value = {}, bigint = false) {
-    const number = bigint ? big : small;
-    this.dev = number(value.dev); this.mode = number(value.mode); this.nlink = number(value.nlink);
-    this.uid = number(value.uid); this.gid = number(value.gid); this.rdev = number(value.rdev);
-    this.blksize = number(value.blksize); this.ino = number(value.ino); this.size = number(value.size);
-    this.blocks = number(value.blocks);
-    if (!bigint) {
-      this.atimeMs = timeMs(value.atimeMs, value.atime); this.mtimeMs = timeMs(value.mtimeMs, value.mtime);
-      this.ctimeMs = timeMs(value.ctimeMs, value.ctime); this.birthtimeMs = timeMs(value.birthtimeMs, value.birthtime);
-      return;
-    }
-    this.atimeMs = bigTimeMs(value.atimeMs, value.atimeNs, value.atime);
-    this.mtimeMs = bigTimeMs(value.mtimeMs, value.mtimeNs, value.mtime);
-    this.ctimeMs = bigTimeMs(value.ctimeMs, value.ctimeNs, value.ctime);
-    this.birthtimeMs = bigTimeMs(value.birthtimeMs, value.birthtimeNs, value.birthtime);
-    this.atimeNs = value.atimeNs === undefined ? this.atimeMs * 1000000n : BigInt(value.atimeNs);
-    this.mtimeNs = value.mtimeNs === undefined ? this.mtimeMs * 1000000n : BigInt(value.mtimeNs);
-    this.ctimeNs = value.ctimeNs === undefined ? this.ctimeMs * 1000000n : BigInt(value.ctimeNs);
-    this.birthtimeNs = value.birthtimeNs === undefined ? this.birthtimeMs * 1000000n : BigInt(value.birthtimeNs);
-  }
-  _is(type) { return (Number(this.mode) & 0o170000) === type; }
-  isFile() { return this._is(0o100000); }
-  isDirectory() { return this._is(0o040000); }
-  isBlockDevice() { return this._is(0o060000); }
-  isCharacterDevice() { return this._is(0o020000); }
-  isSymbolicLink() { return this._is(0o120000); }
-  isFIFO() { return this._is(0o010000); }
-  isSocket() { return this._is(0o140000); }
-}
+StatsBase.prototype.isDirectory = function() { return this._checkModeProperty(0o040000); };
+StatsBase.prototype.isFile = function() { return this._checkModeProperty(0o100000); };
+StatsBase.prototype.isBlockDevice = function() { return this._checkModeProperty(0o060000); };
+StatsBase.prototype.isCharacterDevice = function() { return this._checkModeProperty(0o020000); };
+StatsBase.prototype.isSymbolicLink = function() { return this._checkModeProperty(0o120000); };
+StatsBase.prototype.isFIFO = function() { return this._checkModeProperty(0o010000); };
+StatsBase.prototype.isSocket = function() { return this._checkModeProperty(0o140000); };
+function dateFromMs(ms) { return new Date(Math.round(Number(ms))); }
+const lazyDateFields = {};
 for (const name of ['atime', 'mtime', 'ctime', 'birthtime']) {
   const ms = name + 'Ms';
-  const own = (target, value) => Object.defineProperty(target, name, { value, writable: true, enumerable: true, configurable: true });
-  Object.defineProperty(Stats.prototype, name, {
-    enumerable: true, configurable: true,
-    get() { const value = new Date(Number(this[ms])); own(this, value); return value; },
-    set(value) { own(this, value); },
-  });
+  const own = (target, value) => { Object.defineProperty(target, name, { value, writable: true, enumerable: true, configurable: true }); return value; };
+  lazyDateFields[name] = { enumerable: true, configurable: true, get() { return own(this, dateFromMs(this[ms])); }, set(value) { own(this, value); } };
+}
+function BigIntStats(dev, mode, nlink, uid, gid, rdev, blksize, ino, size, blocks, atimeNs, mtimeNs, ctimeNs, birthtimeNs) {
+  StatsBase.call(this, dev, mode, nlink, uid, gid, rdev, blksize, ino, size, blocks);
+  this.atimeMs = atimeNs / 1000000n; this.mtimeMs = mtimeNs / 1000000n; this.ctimeMs = ctimeNs / 1000000n; this.birthtimeMs = birthtimeNs / 1000000n;
+  this.atimeNs = atimeNs; this.mtimeNs = mtimeNs; this.ctimeNs = ctimeNs; this.birthtimeNs = birthtimeNs;
+}
+Object.setPrototypeOf(BigIntStats.prototype, StatsBase.prototype);
+Object.setPrototypeOf(BigIntStats, StatsBase);
+Object.defineProperties(BigIntStats.prototype, lazyDateFields);
+BigIntStats.prototype._checkModeProperty = function(property) { return (this.mode & BigInt(S_IFMT)) === BigInt(property); };
+function Stats(dev, mode, nlink, uid, gid, rdev, blksize, ino, size, blocks, atimeMs, mtimeMs, ctimeMs, birthtimeMs) {
+  StatsBase.call(this, dev, mode, nlink, uid, gid, rdev, blksize, ino, size, blocks);
+  this.atimeMs = atimeMs; this.mtimeMs = mtimeMs; this.ctimeMs = ctimeMs; this.birthtimeMs = birthtimeMs;
+}
+Object.setPrototypeOf(Stats.prototype, StatsBase.prototype);
+Object.setPrototypeOf(Stats, StatsBase);
+Object.defineProperties(Stats.prototype, lazyDateFields);
+Stats.prototype._checkModeProperty = function(property) { return (this.mode & S_IFMT) === property; };
+// A Stats from a native stat result: an object with the fields by name, *timeMs for
+// numbers and *timeNs for bigint requests. A missing field is 0, as for a file a
+// watcher saw vanish.
+function makeStats(value = {}, bigint = false) {
+  if (bigint) {
+    const big = x => x === undefined ? 0n : BigInt(x);
+    const ns = (n, m) => n !== undefined ? BigInt(n) : m !== undefined ? BigInt(Math.trunc(Number(m))) * 1000000n : 0n;
+    return new BigIntStats(big(value.dev), big(value.mode), big(value.nlink), big(value.uid), big(value.gid), big(value.rdev), big(value.blksize), big(value.ino), big(value.size), big(value.blocks),
+      ns(value.atimeNs, value.atimeMs), ns(value.mtimeNs, value.mtimeMs), ns(value.ctimeNs, value.ctimeMs), ns(value.birthtimeNs, value.birthtimeMs));
+  }
+  const small = x => x === undefined ? 0 : Number(x);
+  return new Stats(small(value.dev), small(value.mode), small(value.nlink), small(value.uid), small(value.gid), small(value.rdev), small(value.blksize), small(value.ino), small(value.size), small(value.blocks),
+    small(value.atimeMs), small(value.mtimeMs), small(value.ctimeMs), small(value.birthtimeMs));
 }
 class Dirent {
   constructor(name, mode, parentPath) { this.name = name; this.parentPath = parentPath; this.path = parentPath; Object.defineProperty(this, '_mode', { value: Number(mode) }); }
@@ -207,6 +241,16 @@ class Dirent {
   isSocket() { return this._is(0o140000); }
 }
 class StatFs {
-  constructor(value, bigint = false) { for (const name of ['type', 'bsize', 'blocks', 'bfree', 'bavail', 'files', 'ffree']) this[name] = bigint ? BigInt(value[name]) : Number(value[name]); }
+  constructor(type, bsize, frsize, blocks, bfree, bavail, files, ffree) {
+    this.type = type; this.bsize = bsize; this.frsize = frsize; this.blocks = blocks;
+    this.bfree = bfree; this.bavail = bavail; this.files = files; this.ffree = ffree;
+  }
 }
-module.exports = { host, os, std, Buffer, constants, error, fail, pair, invalid, range, integer, path, fd, options, mode, flags, native, callback, promiseCallback, submit, time, bytes, position, slice, encoding, encoded, aborted, Stats, Dirent, StatFs };
+function makeStatFs(value, bigint = false) {
+  const get = name => bigint ? BigInt(value[name]) : Number(value[name]);
+  return new StatFs(get('type'), get('bsize'), get('frsize'), get('blocks'), get('bfree'), get('bavail'), get('files'), get('ffree'));
+}
+// A FileHandle's hold on its descriptor, taken by streams reading or writing through it.
+const kRef = Symbol('kRef');
+const kUnref = Symbol('kUnref');
+module.exports = { kRef, kUnref, host, os, std, Buffer, constants, error, fail, pair, invalid, range, integer, path, toPathIfFileURL, fd, options, assertEncoding, mode, flags, native, callback, promiseCallback, submit, time, bytes, position, validateOffsetLengthRead, validateOffsetLengthWrite, validateStringAfterArrayBufferView, bufferArray, encoding, encoded, aborted, Stats, BigIntStats, makeStats, Dirent, StatFs, makeStatFs, v };

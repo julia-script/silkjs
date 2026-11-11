@@ -53,17 +53,20 @@ class StatWatcher extends FSWatcher {
 }
 const statWatchers = new Map();
 function watchFile(filename, options, listener) {
-  if (typeof options === 'function') { listener = options; options = undefined; }
-  c.callback(listener); filename = require('path').resolve(c.path(filename)); options = c.options(options, { persistent: true, interval: 5007, bigint: false }); c.integer(options.interval, 'interval', 1);
+  filename = require('path').resolve(c.path(filename));
+  if (options === null || typeof options !== 'object') { listener = options; options = null; }
+  options = { interval: 5007, persistent: true, ...options };
+  c.v.validateFunction(listener, 'listener');
   let watcher = statWatchers.get(filename);
   if (!watcher) {
     if (typeof c.host.watch !== 'function') throw c.error('ENOSYS', 'watchFile', filename);
+    c.v.validateUint32(options.interval, 'interval');
     watcher = new StatWatcher(); statWatchers.set(filename, watcher);
     try {
       watcher._handle = c.host.watch(filename, Object.assign({}, options, { stat: true }), (err, current, previous) => {
         if (watcher._closed) return;
         if (err) { watcher.emit('error', err); return; }
-        watcher.emit('change', new c.Stats(current, !!options.bigint), new c.Stats(previous, !!options.bigint));
+        watcher.emit('change', c.makeStats(current, !!options.bigint), c.makeStats(previous, !!options.bigint));
       });
     } catch (e) { statWatchers.delete(filename); throw e; }
     watcher.once('close', () => { if (statWatchers.get(filename) === watcher) statWatchers.delete(filename); });
