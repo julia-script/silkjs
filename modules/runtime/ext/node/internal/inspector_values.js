@@ -46,13 +46,23 @@ function byValue(value, seen = new Set(), depth = 0) {
   seen.delete(value);
   return result;
 }
+// V8's descriptions for arrays and errors. Only own data properties are read, so
+// no getter or proxy trap runs (proxies have their own subtype).
+function describe(value, info) {
+  if (info.subtype === 'array') return `Array(${value.length})`;
+  if (info.subtype === 'error') {
+    const stack = Object.getOwnPropertyDescriptor(value, 'stack');
+    if (stack && typeof stack.value === 'string') return stack.value;
+  }
+  return info.description;
+}
 class RemoteValues {
   constructor(prefix) { this.prefix = prefix; this.next = 1; this.entries = new Map(); }
   remote(value, group = '', returnByValue = false, generatePreview = false, context) {
     const info = inspect(value, generatePreview ? 64 : 0);
     const simple = primitive(value, info.description);
     if (simple && typeof value !== 'symbol') return simple;
-    const result = simple || { type: info.type || typeof value, description: info.description || (typeof value === 'function' ? 'function' : 'Object') };
+    const result = simple || { type: info.type || typeof value, description: describe(value, info) || (typeof value === 'function' ? 'function' : 'Object') };
     if (info.subtype) result.subtype = info.subtype;
     if (info.className) result.className = info.className;
     if (returnByValue) result.value = byValue(value);
