@@ -35,7 +35,23 @@ function evaluation(session, result, params) {
   }
   const exception = result.status === 'sideEffect' ? new EvalError('Possible side-effect in debug-evaluate') : result.status === 'terminated' || result.status === 'timeout' ? new Error('Execution was terminated') : result.value;
   const remote = session.values.remote(exception, params.objectGroup);
-  return { result: remote, exceptionDetails: { exceptionId: nextException++, text: 'Uncaught', lineNumber: 0, columnNumber: 0, exception: remote } };
+  return { result: remote, exceptionDetails: exceptionDetails(exception, remote) };
+}
+// V8's exceptionDetails: the throw site and stack come from the frames the error captured.
+function exceptionDetails(exception, remote) {
+  const details = { exceptionId: nextException++, text: 'Uncaught', lineNumber: 0, columnNumber: 0 };
+  const frames = require('internal/error_stack').framesOf(exception);
+  if (frames && frames.length) {
+    const callFrames = frames.map(frame => ({ functionName: frame.functionName || '', scriptId: String(frame.scriptId ?? 0), url: debuggerAgent.resourceURL(frame.scriptName || ''), lineNumber: Math.max(0, (frame.lineNumber ?? 1) - 1), columnNumber: Math.max(0, (frame.columnNumber ?? 1) - 1) }));
+    const top = callFrames[0];
+    details.lineNumber = top.lineNumber;
+    details.columnNumber = top.columnNumber;
+    details.scriptId = top.scriptId;
+    if (top.url) details.url = top.url;
+    details.stackTrace = { callFrames };
+  }
+  details.exception = remote;
+  return details;
 }
 function validateEvaluation(params, method) {
   if (params.serializationOptions || params.replMode || params.allowUnsafeEvalBlockedByCSP === false || params.includeCommandLineAPI) unsupported(method);
@@ -113,6 +129,8 @@ function nodeRuntime(session, method, params) {
 function announceWaiting() {
   for (const session of sessions.values()) if (session.nodeRuntime) session.emit('NodeRuntime.waitingForDebugger', {});
 }
+// NodeTracing loads on its first command.
+let tracing;
 function dispatch(session, method, params) {
   if (method.startsWith('Runtime.')) return runtime(session, method, params);
   if (method.startsWith('Debugger.')) return debuggerAgent.dispatch(session, method, params);
@@ -120,7 +138,8 @@ function dispatch(session, method, params) {
   if (method.startsWith('Network.') || method.startsWith('IO.')) return network.dispatch(session, method, params);
   if (method.startsWith('NodeWorker.')) return workers.dispatch(session, method, params);
   if (method.startsWith('NodeRuntime.')) return nodeRuntime(session, method, params);
-  if (method === 'Schema.getDomains') return { domains: ['Runtime', 'Debugger', 'Profiler', 'HeapProfiler', 'Network', 'IO', 'NodeWorker', 'NodeRuntime', 'Schema'].map(name => ({ name, version: '1.3' })) };
+  if (method.startsWith('NodeTracing.')) return (tracing ??= require('internal/inspector_tracing')).dispatch(session, method, params);
+  if (method === 'Schema.getDomains') return { domains: ['Runtime', 'Debugger', 'Profiler', 'HeapProfiler', 'Network', 'IO', 'NodeWorker', 'NodeRuntime', 'NodeTracing', 'Schema'].map(name => ({ name, version: '1.3' })) };
   unsupported(method);
 }
 function createSession(key, send) {
@@ -141,6 +160,7 @@ function closeSession(key) {
   profiles.close(session);
   network.close(session);
   workers.close(session);
+  if (tracing) tracing.close(session);
   session.contexts.clear();
   session.values.clear();
   if (sessions.size === 0) native(7, false);

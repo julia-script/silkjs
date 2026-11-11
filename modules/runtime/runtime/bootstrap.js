@@ -1436,7 +1436,8 @@ Environment:
     }
     installCommonJSInputGlobals(name, '[eval]');
     armInspectorEntry();
-    const result = native.compileFunction(code, name, undefined, undefined, undefined, true);
+    // As in Node, the script itself is named [eval]; module.filename keeps the cwd path.
+    const result = native.compileFunction(code, '[eval]', undefined, undefined, undefined, true);
     if (print) console.log(result);
     return afterMain(result);
   }
@@ -1451,7 +1452,7 @@ Environment:
     }
     installCommonJSInputGlobals(name, '[stdin]');
     armInspectorEntry();
-    const result = native.compileFunction(source, name, undefined, undefined, undefined, true);
+    const result = native.compileFunction(source, '[stdin]', undefined, undefined, undefined, true);
     if (print) console.log(result);
     return afterMain(result);
   }

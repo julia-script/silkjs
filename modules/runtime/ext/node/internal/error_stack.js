@@ -15,6 +15,8 @@ function install(global) {
     overrides: new WeakMap(),
     // internal/errors: NodeErrors answer true to kIsNodeError (Node's symbol of the same name).
     kIsNodeError: Symbol('kIsNodeError'),
+    // The structured frames of each formatted error, for the inspector's exceptionDetails.
+    frames: new WeakMap(),
   });
   const { records, captured, rootError, kIsNodeError } = state;
   const define = Object.defineProperty;
@@ -199,6 +201,7 @@ function install(global) {
     if (raw === undefined) return undefined;
     const frames = [];
     for (let index = 0; index < raw.length; index++) frames[index] = fromNative(raw[index]);
+    if ((typeof error === 'object' && error !== null) || typeof error === 'function') state.frames.set(error, frames);
     if (state.formatting) return defaultFormat(error, frames);
     state.formatting = true;
     try {
@@ -254,8 +257,20 @@ function install(global) {
   host.captureCallSites(0, Error, format);
 }
 
+// The frames an error captured, once its stack has been formatted.
+function framesOf(error) {
+  if ((typeof error !== 'object' || error === null) && typeof error !== 'function') return undefined;
+  const state = host.errorStackState;
+  if (!state) return undefined;
+  if (!state.frames.has(error)) {
+    try { void error.stack; } catch { return undefined; }
+  }
+  return state.frames.get(error);
+}
+
 module.exports = {
   install,
+  framesOf,
   get overrideStackTrace() { return host.errorStackState.overrides; },
   get ErrorPrepareStackTrace() { return host.errorStackState.defaultPrepare; },
 };
