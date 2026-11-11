@@ -408,4 +408,5 @@ Object.defineProperties(module.exports, {
   _nativeEvent: { value: nativeEvent },
   _nativeDestroy: { value: nativeDestroy },
   _drainDestroy: { value: drainDestroy },
+  _newAsyncId: { value: () => nextId++ },
 });

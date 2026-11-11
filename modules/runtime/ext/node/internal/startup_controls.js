@@ -5,13 +5,16 @@ const booleanOptions = new Map([
   ['--warnings', 'warnings'], ['--deprecation', 'deprecation'],
   ['--trace-warnings', 'traceProcessWarnings'], ['--trace-deprecation', 'traceDeprecation'],
   ['--throw-deprecation', 'throwDeprecation'], ['--pending-deprecation', 'pendingDeprecation'],
+  ['--network-family-autoselection', 'networkFamilyAutoselection'],
 ]);
-const valueOptions = new Set(['--disable-warning', '--redirect-warnings', '--unhandled-rejections']);
+const valueOptions = new Set(['--disable-warning', '--redirect-warnings', '--unhandled-rejections',
+  '--network-family-autoselection-attempt-timeout']);
 const rejectionModes = new Set(['throw', 'strict', 'warn', 'warn-with-error-code', 'none']);
 const optionEntries = [];
 for (const name of booleanOptions.keys()) optionEntries.push([name, false], ['--no-' + name.slice(2), false]);
 for (const name of valueOptions) optionEntries.push([name, true]);
-const state = { warnings: true, deprecation: true, unhandledRejections: 'throw' };
+const state = { warnings: true, deprecation: true, unhandledRejections: 'throw',
+  networkFamilyAutoselection: true, networkFamilyAutoselectionAttemptTimeout: 250 };
 const disabledWarnings = new Set();
 let traceHelperShown = false;
 let warningFd;
@@ -36,6 +39,7 @@ function applyOption(arg) {
   if (error) throw new Error(error);
   if (name === '--disable-warning') disabledWarnings.add(value);
   else if (name === '--redirect-warnings') state.redirectWarnings = value;
+  else if (name === '--network-family-autoselection-attempt-timeout') state.networkFamilyAutoselectionAttemptTimeout = Number(value);
   else state.unhandledRejections = value;
   return true;
 }
@@ -134,6 +138,7 @@ module.exports = {
     if (name === '--pending-deprecation') return !!host.pendingDeprecation;
     if (name === '--disable-warning') return [...disabledWarnings];
     if (name === '--redirect-warnings') return state.redirectWarnings || '';
+    if (name === '--network-family-autoselection-attempt-timeout') return state.networkFamilyAutoselectionAttemptTimeout;
     const key = booleanOptions.get(name);
     return key ? state[key] : undefined;
   },

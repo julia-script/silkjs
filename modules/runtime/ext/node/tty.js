@@ -1,100 +1,192 @@
+// Adapted from Node.js v24.22.1 lib/tty.js by tools/port_node_net.py.
+// Copyright Joyent, Inc. and other Node contributors.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the
+// following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+// USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 'use strict';
 
-const { Socket } = require('net');
-const { Transport, native, error: nativeError } = require('internal/net/transport');
-const { getColorDepth, hasColors } = require('internal/tty/colors');
-const { writeAll } = require('internal/tty/write');
-const fs = require('fs');
+const {
+  NumberIsInteger,
+  ObjectSetPrototypeOf,
+} = require('internal/per_context/primordials');
+
+const net = require('net');
+const {
+  TTY,
+  UV_TTY_MODE_IO,
+  UV_TTY_MODE_NORMAL,
+  UV_TTY_MODE_RAW_VT,
+  isTTY,
+} = require('internal/net/binding').tty_wrap;
+const {
+  ErrnoException,
+  codes: {
+    ERR_INVALID_ARG_VALUE,
+    ERR_INVALID_FD,
+    ERR_TTY_INIT_FAILED,
+  },
+} = require('internal/errors');
+const {
+  getColorDepth,
+  hasColors,
+} = require('internal/tty/colors');
+
+// Lazy loaded for startup performance.
+let readline;
 
 function isatty(fd) {
-  return Number.isInteger(fd) && fd >= 0 && fd <= 0x7fffffff && native('guessHandleType', [fd]) === 5;
-}
-function initialize(stream, fd, options) {
-  if (!Number.isInteger(fd) || fd < 0 || fd > 0x7fffffff)
-    throw Object.assign(new RangeError(`"fd" must be a non-negative integer: ${fd}`), { code: 'ERR_INVALID_FD' });
-  Socket.call(stream, { readableHighWaterMark: 0, ...options, fd: undefined });
-  const owned = native('duplicateFd', [fd]);
-  if (owned < 0) throw Object.assign(nativeError(owned, 'uv_tty_init'), { code: 'ERR_TTY_INIT_FAILED' });
-  let transport;
-  try { transport = new Transport(5, stream, (...args) => stream._onNative(...args), undefined, owned); }
-  catch (cause) {
-    fs.closeSync(owned);
-    throw Object.assign(new Error(`TTY initialization failed: ${cause.message}`), { code: 'ERR_TTY_INIT_FAILED', cause });
-  }
-  // libuv reopens a slave terminal to isolate O_NONBLOCK from the caller's
-  // descriptor. On its fallback path it instead adopts the supplied duplicate.
-  if (transport.call('fileno') !== owned) fs.closeSync(owned);
-  stream._attachTransport(transport);
-  stream._connected = true;
-  stream.fd = fd;
-  stream.isTTY = true;
+  return NumberIsInteger(fd) && fd >= 0 && fd <= 2147483647 &&
+         isTTY(fd);
 }
 
 function ReadStream(fd, options) {
-  if (!(this instanceof ReadStream)) return new ReadStream(fd, options);
-  initialize(this, fd, options);
+  if (!(this instanceof ReadStream))
+    return new ReadStream(fd, options);
+  if (fd >> 0 !== fd || fd < 0)
+    throw new ERR_INVALID_FD(fd);
+
+  const ctx = {};
+  const tty = new TTY(fd, ctx);
+  if (ctx.code !== undefined) {
+    throw new ERR_TTY_INIT_FAILED(ctx);
+  }
+
+  net.Socket.call(this, {
+    readableHighWaterMark: 0,
+    handle: tty,
+    manualStart: true,
+    ...options,
+  });
+
   this.isRaw = false;
   this.rawMode = false;
+  this.isTTY = true;
 }
-Object.setPrototypeOf(ReadStream.prototype, Socket.prototype);
-Object.setPrototypeOf(ReadStream, Socket);
+
+ObjectSetPrototypeOf(ReadStream.prototype, net.Socket.prototype);
+ObjectSetPrototypeOf(ReadStream, net.Socket);
+
 ReadStream.prototype.setRawMode = function(mode) {
   let rawMode;
-  if (mode === 'io' || mode === 'raw') rawMode = mode;
-  else if (typeof mode === 'string')
-    throw Object.assign(new TypeError(`The argument 'mode' must be true, false, 'raw', or 'io'. Received '${mode}'`), { code: 'ERR_INVALID_ARG_VALUE' });
-  else rawMode = mode ? 'raw' : false;
-  const status = this._transport?.call('ttyMode', rawMode === 'io' ? 2 : rawMode === 'raw' ? 3 : 0);
-  if (status < 0) { this.emit('error', nativeError(status, 'setRawMode')); return this; }
+  if (mode === 'io' || mode === 'raw') {
+    rawMode = mode;
+  } else if (typeof mode === 'string') {
+    throw new ERR_INVALID_ARG_VALUE(
+      'mode', mode, "must be true, false, 'raw', or 'io'");
+  } else {
+    rawMode = mode ? 'raw' : false;
+  }
+  let ttyMode = UV_TTY_MODE_NORMAL;
+  if (rawMode === 'io') {
+    ttyMode = UV_TTY_MODE_IO;
+  } else if (rawMode === 'raw') {
+    ttyMode = UV_TTY_MODE_RAW_VT;
+  }
+  const err = this._handle?.setRawMode(ttyMode);
+  if (err) {
+    this.emit('error', new ErrnoException(err, 'setRawMode'));
+    return this;
+  }
   this.isRaw = rawMode !== false;
   this.rawMode = rawMode;
   return this;
 };
 
 function WriteStream(fd) {
-  if (!(this instanceof WriteStream)) return new WriteStream(fd);
-  initialize(this, fd);
-  if (process.platform !== 'win32') {
-    const status = this._transport.call('setBlocking', true);
-    if (status < 0) { this._transport.close(); throw nativeError(status, 'setBlocking'); }
+  if (!(this instanceof WriteStream))
+    return new WriteStream(fd);
+  if (fd >> 0 !== fd || fd < 0)
+    throw new ERR_INVALID_FD(fd);
+
+  const ctx = {};
+  const tty = new TTY(fd, ctx);
+  if (ctx.code !== undefined) {
+    throw new ERR_TTY_INIT_FAILED(ctx);
   }
-  const size = this._transport.call('ttyWindowSize');
-  if (typeof size === 'object') { this.columns = size.columns; this.rows = size.rows; }
+
+  net.Socket.call(this, {
+    readableHighWaterMark: 0,
+    handle: tty,
+    manualStart: true,
+  });
+
+  // Prevents interleaved or dropped stdout/stderr output for terminals.
+  // As noted in the following reference, local TTYs tend to be quite fast and
+  // this behavior has become expected due historical functionality on OS X,
+  // even though it was originally intended to change in v1.0.2 (Libuv 1.2.1).
+  // Ref: https://github.com/nodejs/node/pull/1771#issuecomment-119351671
+  this._handle.setBlocking(true);
+
+  const winSize = [0, 0];
+  const err = this._handle.getWindowSize(winSize);
+  if (!err) {
+    this.columns = winSize[0];
+    this.rows = winSize[1];
+  }
 }
-Object.setPrototypeOf(WriteStream.prototype, Socket.prototype);
-Object.setPrototypeOf(WriteStream, Socket);
+
+ObjectSetPrototypeOf(WriteStream.prototype, net.Socket.prototype);
+ObjectSetPrototypeOf(WriteStream, net.Socket);
+
 WriteStream.prototype.isTTY = true;
+
 WriteStream.prototype.getColorDepth = getColorDepth;
+
 WriteStream.prototype.hasColors = hasColors;
-WriteStream.prototype._write = function(chunk, encoding, callback) {
-  if (process.platform === 'win32') return Socket.prototype._write.call(this, chunk, encoding, callback);
-  let failure;
-  try { writeAll(this._transport.call('fileno'), chunk); this._bytesWritten += chunk.length; }
-  catch (error) { failure = error; }
-  callback(failure);
-};
-WriteStream.prototype._writev = function(chunks, callback) {
-  if (process.platform === 'win32') return Socket.prototype._writev.call(this, chunks, callback);
-  let failure;
-  try { const fd = this._transport.call('fileno'); for (const { chunk } of chunks) { writeAll(fd, chunk); this._bytesWritten += chunk.length; } }
-  catch (error) { failure = error; }
-  callback(failure);
-};
-// A terminal has no socket write-half to shut down.
-ReadStream.prototype._final = WriteStream.prototype._final = function(callback) { callback(); };
+
 WriteStream.prototype._refreshSize = function() {
-  if (!this._transport || this._transport.closing) return;
-  const size = this._transport.call('ttyWindowSize');
-  if (typeof size === 'number') { this.emit('error', nativeError(size, 'getWindowSize')); return; }
-  if (this.columns !== size.columns || this.rows !== size.rows) {
-    this.columns = size.columns;
-    this.rows = size.rows;
+  const oldCols = this.columns;
+  const oldRows = this.rows;
+  const winSize = [0, 0];
+  const err = this._handle.getWindowSize(winSize);
+  if (err) {
+    this.emit('error', new ErrnoException(err, 'getWindowSize'));
+    return;
+  }
+  const { 0: newCols, 1: newRows } = winSize;
+  if (oldCols !== newCols || oldRows !== newRows) {
+    this.columns = newCols;
+    this.rows = newRows;
     this.emit('resize');
   }
 };
-WriteStream.prototype.getWindowSize = function() { return [this.columns, this.rows]; };
-for (const name of ['cursorTo', 'moveCursor', 'clearLine', 'clearScreenDown']) {
-  WriteStream.prototype[name] = function(...args) { return require('readline')[name](this, ...args); };
-}
+
+// Backwards-compat
+WriteStream.prototype.cursorTo = function(x, y, callback) {
+  if (readline === undefined) readline = require('readline');
+  return readline.cursorTo(this, x, y, callback);
+};
+WriteStream.prototype.moveCursor = function(dx, dy, callback) {
+  if (readline === undefined) readline = require('readline');
+  return readline.moveCursor(this, dx, dy, callback);
+};
+WriteStream.prototype.clearLine = function(dir, callback) {
+  if (readline === undefined) readline = require('readline');
+  return readline.clearLine(this, dir, callback);
+};
+WriteStream.prototype.clearScreenDown = function(callback) {
+  if (readline === undefined) readline = require('readline');
+  return readline.clearScreenDown(this, callback);
+};
+WriteStream.prototype.getWindowSize = function() {
+  return [this.columns, this.rows];
+};
 
 module.exports = { isatty, ReadStream, WriteStream };

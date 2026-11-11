@@ -167,8 +167,8 @@ class HTTPParser {
   }
   consume(handle) {
     const state = live(this);
-    const socket = handle?.owner;
-    if (!socket || socket._transport !== handle || typeof handle.readStop !== 'function')
+    const binding = require('internal/net/binding');
+    if (!binding.isStreamHandle(handle))
       throw error('ERR_INVALID_ARG_TYPE', 'stream must be a native socket handle');
     this.unconsume();
     const consumer = { parser: this, read: (status, payload) => {
@@ -179,16 +179,16 @@ class HTTPParser {
       try { callback(this, state, HTTPParser.kOnExecute, call1, this.execute(buffer)); }
       finally { state.currentRead = null; }
     } };
-    (socket._streamConsumers ||= []).push(consumer);
-    state.consuming = { socket, consumer };
+    (handle._consumers ||= []).push(consumer);
+    state.consuming = { handle, consumer };
     this._consumed = true;
   }
   unconsume() {
     const state = stateOf(this);
     if (state.consuming) {
-      const { socket, consumer } = state.consuming;
-      const at = socket._streamConsumers.indexOf(consumer);
-      if (at !== -1) socket._streamConsumers.splice(at, 1);
+      const { handle, consumer } = state.consuming;
+      const at = handle._consumers.indexOf(consumer);
+      if (at !== -1) handle._consumers.splice(at, 1);
       state.consuming = null;
     }
     this._consumed = false;
