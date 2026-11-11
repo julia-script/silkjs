@@ -11,6 +11,7 @@ const modules = new Map();
 const realmSources = new Map();
 const factoryGet = Map.prototype.get.bind(factories);
 const factorySet = Map.prototype.set.bind(factories);
+const factoryHas = Map.prototype.has.bind(factories);
 const moduleGet = Map.prototype.get.bind(modules);
 const moduleHas = Map.prototype.has.bind(modules);
 const moduleSet = Map.prototype.set.bind(modules);
@@ -821,15 +822,25 @@ const publicBuiltinHas = Set.prototype.has.bind(new Set(publicBuiltinNames));
 const prefixOnlyBuiltinHas = Set.prototype.has.bind(new Set(['test', 'test/reporters', 'sqlite', 'sea']));
 const defineBuiltinName = Object.defineProperty;
 function publicBuiltin(name) {
-  return publicBuiltinHas(name) &&
-    ((name !== 'stream/iter' && name !== 'zlib/iter') || host.experimentalStreamIter === true);
+  if (!publicBuiltinHas(name)) return host.exposeInternals === true && exposedInternal(name);
+  return (name !== 'stream/iter' && name !== 'zlib/iter') || host.experimentalStreamIter === true;
 }
+// With --expose-internals, Node's internal/* modules load like public ones
+// (still left out of builtinModules). internal/host is the runtime's own
+// privileged bridge, not a Node module, so it never is.
+function exposedInternal(name) {
+  return typeof name === 'string' && stringStartsWith(name, 'internal/') && name !== 'internal/host' && factoryHas(name);
+}
+// Modules of this runtime, which only their silk: names load.
+const runtimeModules = { __proto__: null, 'silk:serve': 'internal/web/serve' };
 const publicBuiltins = {
-  has: publicBuiltin,
-  get: name => internalRequire(name),
+  has: name => runtimeModules[name] !== undefined || publicBuiltin(name),
+  get: name => internalRequire(runtimeModules[name] ?? name),
+  runtime: name => typeof name === 'string' && runtimeModules[name] !== undefined,
   // Whether names() lists name, without building the list.
   listed(name) {
     if (typeof name !== 'string') return false;
+    if (runtimeModules[name] !== undefined) return true;
     if (stringStartsWith(name, 'node:')) {
       const bare = stringSlice(name, 5);
       return prefixOnlyBuiltinHas(bare) && publicBuiltin(bare);
@@ -943,16 +954,20 @@ function runtimeFlag(arg) {
   if (arg === '--insecure-http-parser' || arg === '--no-insecure-http-parser') {
     host.insecureHTTPParser = arg === '--insecure-http-parser'; return true;
   }
+  if (arg.startsWith('--max-http-header-size=')) {
+    const value = arg.slice(23);
+    if (!/^\d+$/.test(value)) { cliError('--max-http-header-size requires a nonnegative integer'); return true; }
+    host.maxHTTPHeaderSize = Number(value); return true;
+  }
   if (arg === '--async-context-frame' || arg === '--no-async-context-frame') {
     host.asyncContextFrame = arg === '--async-context-frame'; return true;
   }
   if (arg === '--expose-gc' || arg === '--no-expose-gc') {
     host.exposeGC = arg === '--expose-gc'; return true;
   }
-  // Node's flag exposes Node's own lib/internal modules and bindings. This
-  // runtime has none of those, so the flag is accepted and exposes nothing:
-  // require('internal/...') stays MODULE_NOT_FOUND.
-  if (arg === '--expose-internals') return true;
+  // Node's BuiltinModule.exposeInternals: user code may load the internal/*
+  // built-ins (see publicBuiltins.listed).
+  if (arg === '--expose-internals') { host.exposeInternals = true; return true; }
   if (arg === '--disable-sigusr1') { host.disableSigusr1 = true; return true; }
   if (arg === '--test-update-snapshots' || arg === '--no-test-update-snapshots') {
     host.testUpdateSnapshots = arg === '--test-update-snapshots'; return true;
@@ -1169,7 +1184,7 @@ const HELP_TEXT = `Usage: silkjsruntime [options] [script.js] [arguments]
   --pending-deprecation, --no-pending-deprecation
   --disable-warning=CODE|NAME, --redirect-warnings=PATH
   --unhandled-rejections=throw|strict|warn|warn-with-error-code|none
-  --insecure-http-parser, --no-insecure-http-parser
+  --insecure-http-parser, --no-insecure-http-parser, --max-http-header-size=SIZE
   --async-context-frame, --no-async-context-frame
   --expose-gc, --no-expose-gc
   --experimental-eventsource
@@ -1201,8 +1216,9 @@ Environment:
   NODE_PATH         Additional CommonJS package lookup directories
   NODE_NO_WARNINGS, NODE_REDIRECT_WARNINGS, NODE_PENDING_DEPRECATION
 `;
-function cliError(message) {
-  host.writeStartupDiagnostic(process.execPath + ': ' + message + '\n');
+function cliError(messages) {
+  if (typeof messages === 'string') messages = [messages];
+  host.writeStartupDiagnostic(messages.map((message) => process.execPath + ': ' + message + '\n').join(''));
   return process.exit(9);
 }
 function loadRuntimeEnvironment(args, beforeLoading) {
@@ -1316,8 +1332,8 @@ function run() {
     return internalRequire('internal/main/run').runPackageScript(runName, separator < 0 ? [] : native.argv.slice(separator + 1));
   }
   // Only a TLS flag loads internal/tls/options, so a plain start skips the check.
-  const tlsConflict = moduleHas('internal/tls/options') && internalRequire('internal/tls/options').validate();
-  if (tlsConflict) return cliError(tlsConflict);
+  const tlsErrors = moduleHas('internal/tls/options') ? internalRequire('internal/tls/options').validate() : [];
+  if (tlsErrors.length) return cliError(tlsErrors);
   if (watchMode && expression !== undefined) return cliError('either --watch or --eval can be used, not both');
   if (watchMode && check) return cliError('either --watch or --check can be used, not both');
   if (watchMode && interactive) return cliError('either --watch or --interactive can be used, not both');

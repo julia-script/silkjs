@@ -50,8 +50,14 @@ import silk.platform.native.host_input { NativeHostInput }
 import silk.system.host_input { HostInputError }
 import silk.collections.slice { Slice }
 import silk.text.string { String }
+import silk.http.head { Limits as HeadLimits, ProgressState as HeadState, RequestParser }
+import silk.http.headers { Limits as ValueLimits }
+import silk.http.body { Decoder, Framing, Limits as BodyLimits, ProgressState as BodyState, TrailerPolicy, selectRequest }
+import silk.http.message { Version }
 import silk.http.websocket { CloseData, Event as WsEvent, Limits as WsLimits, MessageKind, PeerCloseData, Role as WsRole, Session, WebSocketError, closeCodeOf }
 import silkjs.js_string_rope { RopeIterator }
+import silkjs.js_string_types { StringLengthError }
+import silkjs.js_proxy_core as core
 import silkjs.js_strings { Strings }
 import silkjs.utf8 { Utf8 }
 
@@ -70,6 +76,7 @@ unsafe extern "C" fn dup2(from: i32, to: i32) -> i32
 unsafe extern "C" fn openPath(path: *const u8, flags: i32, ...) -> i32 as "open"
 @foreign(noCapture: .("buffer"))
 unsafe extern "C" fn ttyname_r(fd: i32, buffer: *mut u8, size: usize) -> i32
+unsafe extern "C" fn currentTime(t: ?*mut i64) -> i64 as "time"
 unsafe extern "C" fn lseek(fd: i32, offset: i64, whence: i32) -> i64
 unsafe extern "C" fn shutdown(fd: i32, how: i32) -> i32
 @foreign(noCapture: .("address", "length"))
@@ -209,7 +216,7 @@ struct Handle {
   firstWrite: ?*mut Write, lastWrite: ?*mut Write, shutdownToken: i32, shutdownPending: bool, writeShut: bool,
   local: Option<Endpoint>, flags: i32, noDelay: bool, keepAlive: bool, keepAliveDelay: u32,
   path: List<u8>, pathIsLocal: bool, chmodFlags: i32, terminal: Option<TerminalMode>, closeEvent: *mut Event,
-  peer: ?*mut Peer
+  peer: ?*mut Peer, exchange: ?*mut Exchange
 }
 // A WebSocket connection whose frames this module reads and writes (see the WebSocket section).
 // `output` holds frames not yet given to the socket. A handle with output is `dirty`, on the
@@ -301,7 +308,7 @@ unsafe effect fn create(state: *mut State, kind: i32, callback: ValueBits, socke
     firstWrite: Pointer.null<Write>(), lastWrite: Pointer.null<Write>(), shutdownToken: 0, shutdownPending: false, writeShut: false,
     local: Option<Endpoint>.none(), flags: 0, noDelay: false, keepAlive: false, keepAliveDelay: 0,
     path: List<u8>.make(), pathIsLocal: false, chmodFlags: 0, terminal: Option<TerminalMode>.none(), closeEvent: closeEvent,
-    peer: Pointer.null<Peer>()
+    peer: Pointer.null<Peer>(), exchange: Pointer.null<Exchange>()
   })
   unsafe Pointer.put<Event>(closeEvent, event(handle, CLOSED, 0, 0))
   let s2 = unsafe Pointer.borrowMut<(), State>(&mut anchor, state) s2.handles = handle s2.slots.set(slot, handle)
@@ -366,7 +373,7 @@ unsafe fn releaseHandle<'m, S: EngineServices>(engine: &mut Engine<'m, S>, conte
   let s = unsafe Pointer.borrowMut<(), State>(&mut anchor, state) let io = s.io s.slots.set(slot, Pointer.null<Handle>()) let mut link = Pointer.fromMutRef<?*mut Handle>(&mut s.handles) drop s
   if holding { unsafe fs_async.unhold(io) }
   while !Pointer.isNull<Handle>(unsafe Pointer.read<?*mut Handle>(link)) { let p = unsafe nn(unsafe Pointer.read<?*mut Handle>(link)) let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, p) if h.id == id { unsafe Pointer.put<?*mut Handle>(link, h.next) drop h break } link = Pointer.fromMutRef<?*mut Handle>(&mut h.next) drop h }
-  unsafe forgetPeer(state, handle)
+  unsafe forgetPeer(state, handle) unsafe forgetExchange(handle)
   let h = unsafe Pointer.take<Handle>(handle) unsafe owners.release(&mut engine, context, h.callback) let writes = h.firstWrite drop h
   unsafe freeWrites(writes) unsafe free(unsafe bytes(handle))
   return slot
@@ -621,6 +628,7 @@ unsafe effect fn collect(state: *mut State) -> () ! OutOfMemoryError ? &mut Allo
       if listening { let accepted = run Effect.result(unsafe acceptReady(handle)) if let Result<(), OutOfMemoryError>.Failure { .. } = move accepted { failed = true } }
       else if udp { unsafe receiveReady(handle) }
       else if !Pointer.isNull<Peer>(unsafe peerOf(handle)) { let read = run Effect.result(unsafe wsReadReady(handle)) if let Result<(), OutOfMemoryError>.Failure { .. } = move read { failed = true } }
+      else if !Pointer.isNull<Exchange>(unsafe exchangeOf(handle)) { let read = run Effect.result(unsafe httpReadReady(handle)) if let Result<(), OutOfMemoryError>.Failure { .. } = move read { failed = true } }
       else { unsafe readReady(handle) }
     }
     unsafe refresh(handle)
@@ -871,6 +879,447 @@ pub unsafe effect fn wsSend<'m, S: EngineServices>(engine: &mut Engine<'m, S>, c
   if token != 0 { return ValueBits.Int { value: run unsafe flushPeer(handle, token) } }
   run unsafe sendSoon(handle)
   return ValueBits.Int { value: 0 }
+}
+
+// ---- HTTP servers ----
+// serve() hands each accepted connection to this module (httpAdopt). Its reads are HTTP/1 requests,
+// parsed by silk.http's head parser and body framing. Each complete request is one HTTP_REQUEST
+// event: the status holds the HTTP_* flags, the payload is [method, target, host, name, value, ...]
+// with lower-case names, and the extra is the body as an ArrayBuffer (undefined without one).
+// httpRespond writes a whole response head and body with one system call when the socket has room;
+// httpChunk writes one chunk of a streamed response. A malformed request gets a bare 400 (413 for a
+// body over the limit), and the connection reads no more: a READ event with END follows.
+const HTTP_REQUEST: i32 = 9
+// Request flags.
+const HTTP_KEEP_ALIVE: i32 = 1
+const HTTP_HAS_BODY: i32 = 2
+// Response flags.
+const HTTP_CLOSE: i32 = 1
+const HTTP_NO_BODY: i32 = 2
+const HTTP_STREAM: i32 = 4
+const HTTP_HAS_LENGTH: i32 = 8
+const HTTP_HAS_DATE: i32 = 16
+// Exchange phases.
+const PHASE_HEAD: i32 = 0
+const PHASE_FIXED: i32 = 1
+const PHASE_CHUNKED: i32 = 2
+const PHASE_STOPPED: i32 = 3
+// The largest request body, as Bun's default maxRequestBodySize.
+const MAX_BODY: u64 = 134217728
+// `record` holds the strings of the request being read, each as a 4-byte little-endian length and
+// its bytes; `body` its payload so far.
+struct Exchange { parser: RequestParser, phase: i32, remaining: u64, decoder: Option<Decoder>, record: Bytes, body: Bytes, flags: i32, out: Bytes, scratch: Bytes }
+
+fn httpValueLimits() -> ValueLimits {
+  return ValueLimits { maxMethodBytes: 64, maxTargetBytes: 16384, maxNameBytes: 256, maxValueBytes: 16384, maxFields: 256, maxFieldBytes: 65536, maxOwnedBytes: 81920 }
+}
+fn httpHeadLimits() -> HeadLimits {
+  return HeadLimits { maxHeadBytes: 65536, maxStartLineBytes: 16384, maxFieldLineBytes: 16384, maxOwnedBytes: 65536 + 32 * 256, values: httpValueLimits() }
+}
+fn httpBodyLimits() -> BodyLimits {
+  return BodyLimits { maxWireBytes: 2 * MAX_BODY, maxPayloadBytes: MAX_BODY, maxChunkBytes: u64.toUsize(MAX_BODY), maxChunks: 1048576, maxChunkLineBytes: 4096, maxExtensionBytes: 65536, maxTrailerBytes: 16384, maxTrailerFields: 64, maxOwnedBytes: 32768, trailerValues: httpValueLimits() }
+}
+unsafe fn exchangeOf(handle: *mut Handle) -> ?*mut Exchange { let a = () let h = unsafe Pointer.borrow<(), Handle>(&a, handle) return h.exchange }
+unsafe fn forgetExchange(handle: *mut Handle) -> () {
+  let found = unsafe exchangeOf(handle) if Pointer.isNull<Exchange>(found) { return () }
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle) h.exchange = Pointer.null<Exchange>() drop h
+  let owned = unsafe Pointer.take<Exchange>(unsafe nn(found)) drop owned
+  unsafe free(unsafe bytes(unsafe nn(found)))
+}
+effect fn pushText(record: &mut Bytes, text: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let n = usize.toU32(text.length)
+  let size: [u8; 4] = [u32.toU8(n & 255), u32.toU8((n / 256) & 255), u32.toU8((n / 65536) & 255), u32.toU8(n / 16777216)]
+  run record.append(&size) run record.append(text)
+}
+// Appends `text` with ASCII letters in lower case.
+effect fn pushLower(record: &mut Bytes, text: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let n = usize.toU32(text.length)
+  let size: [u8; 4] = [u32.toU8(n & 255), u32.toU8((n / 256) & 255), u32.toU8((n / 65536) & 255), u32.toU8(n / 16777216)]
+  run record.append(&size)
+  let mut i: usize = 0
+  while i < text.length {
+    let mut one: [u8; 1] = [text[i]] if one[0] >= 65 && one[0] <= 90 { one[0] = one[0] + 32 }
+    run record.append(&one) i = i + 1
+  }
+}
+fn asciiEqualFold(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length { return false }
+  let mut i: usize = 0
+  while i < a.length { let mut x = a[i] if x >= 65 && x <= 90 { x = x + 32 } if x != b[i] { return false } i = i + 1 }
+  return true
+}
+// Writes `data` now if nothing waits before it, and queues the rest. A status on a failed write.
+unsafe effect fn writeNow(handle: *mut Handle, data: &[u8]) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  if data.length == 0 { return 1 }
+  let mut anchor = () let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+  if h.closing || h.writeShut || h.shutdownPending { return EPIPE() }
+  let mut sent: usize = 0
+  if Pointer.isNull<Write>(h.firstWrite) {
+    let result = writeOnce(&mut h.socket, data, Option<Endpoint>.none())
+    if result >= 0 { sent = i64.toUsize(result) }
+    else if result != WOULD { return i64.toI32(result) }
+  }
+  drop h
+  if sent == data.length { return 1 }
+  run unsafe queueWrite(handle, Slice.view<u8>(data, sent, data.length - sent), 0)
+  return 0
+}
+// Answers a request that cannot be read, and reads no more from the connection.
+unsafe effect fn httpReject(handle: *mut Handle, exchange: *mut Exchange, code: i32) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = () let ex = unsafe Pointer.borrowMut<(), Exchange>(&mut anchor, exchange) ex.phase = PHASE_STOPPED drop ex
+  let text: &[u8] = if code == 413 { b"HTTP/1.1 413 Payload Too Large\r\nconnection: close\r\ncontent-length: 0\r\n\r\n" } else if code == 431 { b"HTTP/1.1 431 Request Header Fields Too Large\r\nconnection: close\r\ncontent-length: 0\r\n\r\n" } else { b"HTTP/1.1 400 Bad Request\r\nconnection: close\r\ncontent-length: 0\r\n\r\n" }
+  let _written = run unsafe writeNow(handle, text)
+  let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle) h.reading = false drop h
+  unsafe notify(handle, READ, END, 0)
+}
+// Queues the request whose head and body the exchange holds.
+unsafe fn httpPost(handle: *mut Handle, exchange: *mut Exchange) -> () {
+  let mut anchor = () let ex = unsafe Pointer.borrowMut<(), Exchange>(&mut anchor, exchange)
+  let recordLength = ex.record.length() let bodyLength = ex.body.length()
+  let total = 4 + recordLength + bodyLength
+  let memory = unsafe calloc(1, total)
+  if Pointer.isNull<u8>(memory) { drop ex let mut b = () let s = unsafe Pointer.borrowMut<(), State>(&mut b, unsafe stateOf(handle)) s.oom = true return () }
+  let base = unsafe Pointer.assumeManyMut<u8>(unsafe nn(memory))
+  let n = usize.toU32(recordLength)
+  unsafe Pointer.put<u8>(unsafe Pointer.atMut<u8>(base, 0), u32.toU8(n & 255))
+  unsafe Pointer.put<u8>(unsafe Pointer.atMut<u8>(base, 1), u32.toU8((n / 256) & 255))
+  unsafe Pointer.put<u8>(unsafe Pointer.atMut<u8>(base, 2), u32.toU8((n / 65536) & 255))
+  unsafe Pointer.put<u8>(unsafe Pointer.atMut<u8>(base, 3), u32.toU8(n / 16777216))
+  if recordLength != 0 { let _a = unsafe memcpy(unsafe Pointer.atMut<u8>(base, 4), unsafe sliceAt(ex.record.asSlice(), 0), recordLength) }
+  if bodyLength != 0 { let _b = unsafe memcpy(unsafe Pointer.atMut<u8>(base, 4 + recordLength), unsafe sliceAt(ex.body.asSlice(), 0), bodyLength) }
+  let flags = ex.flags
+  ex.record.clear() ex.body.clear() ex.decoder = Option<Decoder>.none()
+  ex.phase = if (flags & HTTP_KEEP_ALIVE) == 0 { PHASE_STOPPED } else { PHASE_HEAD }
+  drop ex
+  let mut value = event(handle, HTTP_REQUEST, flags, 0) value.data = memory value.length = total
+  unsafe post(move value)
+}
+// What a complete head asks for. `code` is 0, or the status of a response that rejects it.
+struct HeadFacts { code: i32, flags: i32, expectContinue: bool, framingKind: i32, fixed: u64, decoder: Option<Decoder> }
+fn rejected(code: i32) -> HeadFacts { return HeadFacts { code: code, flags: 0, expectContinue: false, framingKind: 0, fixed: 0, decoder: Option<Decoder>.none() } }
+// Records the strings of the parsed head and picks its body framing.
+effect fn httpScan(ex: &mut Exchange) -> HeadFacts ! OutOfMemoryError ? &mut Allocator {
+  let head = match move ex.parser.head() { Result.Success { value } => value Result.Failure { .. } => { return rejected(400) } }
+  ex.record.clear() ex.body.clear()
+  run pushText(&mut ex.record, String.utf8Bytes(head.method().format()))
+  run pushText(&mut ex.record, String.utf8Bytes(head.target().format()))
+  let mut host = Slice.view<u8>(head.headBytes(), 0, 0) let mut expectContinue = false
+  let mut fields = head.fields()
+  while true {
+    match fields.next() {
+      Option.None => { break }
+      Option.Some { value: field } => {
+        let name = String.utf8Bytes(field.name())
+        if host.length == 0 && asciiEqualFold(name, b"host") { host = field.value() }
+        if asciiEqualFold(name, b"expect") && asciiEqualFold(field.value(), b"100-continue") { expectContinue = true }
+      }
+    }
+  }
+  run pushText(&mut ex.record, host)
+  let mut again = head.fields()
+  while true {
+    match again.next() {
+      Option.None => { break }
+      Option.Some { value: field } => { run pushLower(&mut ex.record, String.utf8Bytes(field.name())) run pushText(&mut ex.record, field.value()) }
+    }
+  }
+  let version = head.version()
+  let selection = match move selectRequest(head, TrailerPolicy.defaultPolicy()) { Result.Success { value } => move value Result.Failure { .. } => { return rejected(400) } }
+  let tokens = selection.connection()
+  let keepAlive = if version == Version.Http11 { !tokens.close } else { tokens.keepAlive && !tokens.close }
+  let mut facts = rejected(0)
+  facts.expectContinue = expectContinue
+  if keepAlive { facts.flags = HTTP_KEEP_ALIVE }
+  match selection.framing() {
+    Framing.Empty => {}
+    Framing.Fixed { length } => { facts.framingKind = 1 facts.fixed = length }
+    Framing.Chunked => {
+      facts.framingKind = 2
+      let made = run Decoder.make(move selection, httpBodyLimits(), TrailerPolicy.defaultPolicy())
+      match move made {
+        Result.Success { value } => { facts.decoder = Option<Decoder>.some(move value) }
+        Result.Failure { .. } => { return rejected(400) }
+      }
+    }
+    _ => { return rejected(400) }
+  }
+  return move facts
+}
+// After a complete head: records it, picks its body framing, and resets the parser.
+// Returns 0, or the status of a response that rejects the request.
+unsafe effect fn httpBegin(handle: *mut Handle, exchange: *mut Exchange) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = () let ex = unsafe Pointer.borrowMut<(), Exchange>(&mut anchor, exchange)
+  let mut facts = run httpScan(&mut ex)
+  let _reset = ex.parser.reset()
+  if facts.code != 0 { return facts.code }
+  if facts.framingKind == 1 && facts.fixed > MAX_BODY { return 413 }
+  let mut flags = facts.flags
+  if facts.framingKind != 0 { flags = flags | HTTP_HAS_BODY }
+  ex.flags = flags
+  if facts.framingKind == 0 || (facts.framingKind == 1 && facts.fixed == 0) { drop ex unsafe httpPost(handle, exchange) return 0 }
+  if facts.framingKind == 1 { ex.phase = PHASE_FIXED ex.remaining = facts.fixed run ex.body.reserve(u64.toUsize(facts.fixed)) }
+  else { ex.phase = PHASE_CHUNKED ex.decoder = Intrinsic.replace(facts.decoder, Option<Decoder>.none()) }
+  drop ex
+  if facts.expectContinue { let _continued = run unsafe writeNow(handle, b"HTTP/1.1 100 Continue\r\n\r\n") }
+  return 0
+}
+// Reads the requests in `input` and queues their events.
+unsafe effect fn httpReceive(handle: *mut Handle, input: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let found = unsafe exchangeOf(handle) if Pointer.isNull<Exchange>(found) { return () }
+  let exchange = unsafe nn(found)
+  let mut anchor = ()
+  let mut offset: usize = 0
+  while offset < input.length {
+    let ex = unsafe Pointer.borrowMut<(), Exchange>(&mut anchor, exchange)
+    let rest = Slice.view<u8>(input, offset, input.length - offset)
+    if ex.phase == PHASE_STOPPED { return () }
+    if ex.phase == PHASE_HEAD {
+      let fed = ex.parser.feed(rest, false)
+      match move fed {
+        Result.Failure { .. } => { drop ex run unsafe httpReject(handle, exchange, 400) return () }
+        Result.Success { value } => {
+          offset = offset + value.consumed
+          if value.state == HeadState.NeedInput { return () }
+        }
+      }
+      drop ex
+      let code = run unsafe httpBegin(handle, exchange)
+      if code != 0 { run unsafe httpReject(handle, exchange, code) return () }
+    } else if ex.phase == PHASE_FIXED {
+      let mut take = rest.length if u64.toUsize(ex.remaining) < take { take = u64.toUsize(ex.remaining) }
+      run ex.body.append(Slice.view<u8>(rest, 0, take))
+      ex.remaining = ex.remaining - usize.toU64(take) offset = offset + take
+      let done = ex.remaining == 0 drop ex
+      if done { unsafe httpPost(handle, exchange) }
+    } else {
+      let mut output: [u8; 16384] = [0; 16384]
+      let stepped = match &mut ex.decoder {
+        Option.Some { value: decoder } => decoder.step(rest, &mut output, false)
+        Option.None => { drop ex run unsafe httpReject(handle, exchange, 400) return () }
+      }
+      match move stepped {
+        Result.Failure { .. } => { drop ex run unsafe httpReject(handle, exchange, 400) return () }
+        Result.Success { value } => {
+          offset = offset + value.consumed
+          if value.written != 0 { run ex.body.append(Slice.view<u8>(&output, 0, value.written)) }
+          if usize.toU64(ex.body.length()) > MAX_BODY { drop ex run unsafe httpReject(handle, exchange, 413) return () }
+          let complete = value.state == BodyState.Complete
+          if !complete && value.consumed == 0 && value.written == 0 { return () }
+          drop ex
+          if complete { unsafe httpPost(handle, exchange) }
+        }
+      }
+    }
+  }
+}
+unsafe effect fn httpReadReady(handle: *mut Handle) -> () ! OutOfMemoryError ? &mut Allocator {
+  let scratch = unsafe scratchOf(handle) let mut anchor = () let mut round: usize = 0
+  while round < BATCH {
+    round = round + 1
+    let h = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle)
+    if !h.reading || h.closing { return () }
+    let mut bufferAnchor = () let output = unsafe Pointer.borrowManyMut<(), u8>(&mut bufferAnchor, unsafe Pointer.assumeManyMut<u8>(scratch), CHUNK)
+    let count = readOnce(&mut h.socket, move output)
+    if count == 0 { return () }
+    if count < 0 { h.reading = false drop h unsafe notify(handle, READ, i64.toI32(count), 0) return () }
+    drop h
+    let viewAnchor = ()
+    let view = unsafe Pointer.borrowMany<(), u8>(&viewAnchor, unsafe Pointer.assumeMany<u8>(scratch), i64.toUsize(count))
+    run unsafe httpReceive(handle, view)
+    if i64.toUsize(count) < CHUNK { return () }
+  }
+}
+// Reads the string at `offset` of a request record: its bytes, and the offset after it.
+unsafe fn recordText(data: *mut u8, offset: usize) -> usize {
+  let base = unsafe Pointer.assumeManyMut<u8>(data)
+  let b0 = u8.toUsize(unsafe Pointer.read<u8>(unsafe Pointer.atMut<u8>(base, offset)))
+  let b1 = u8.toUsize(unsafe Pointer.read<u8>(unsafe Pointer.atMut<u8>(base, offset + 1)))
+  let b2 = u8.toUsize(unsafe Pointer.read<u8>(unsafe Pointer.atMut<u8>(base, offset + 2)))
+  let b3 = u8.toUsize(unsafe Pointer.read<u8>(unsafe Pointer.atMut<u8>(base, offset + 3)))
+  return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+}
+// The payload and extra of an HTTP_REQUEST event (see the section above).
+unsafe effect fn httpRequestValues<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, data: *mut u8, length: usize, flags: i32, scope: &mut Scope) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  let recordLength = unsafe recordText(data, 0)
+  let memory = engine.memory
+  scope.values[1] = run unsafe common.array(&mut engine, memory, context)
+  let base = unsafe Pointer.assumeManyMut<u8>(data)
+  let mut offset: usize = 4 let end = 4 + recordLength let mut index: u32 = 0
+  while offset < end {
+    let size = unsafe recordText(data, offset)
+    let anchor = ()
+    let view = if size != 0 { unsafe Pointer.borrowMany<(), u8>(&anchor, unsafe Pointer.assumeMany<u8>(unsafe Pointer.atMut<u8>(base, offset + 4)), size) } else { b"" }
+    let made = run Effect.result(Strings.fromLatin1(view))
+    let value = match move made {
+      Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => value
+      Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error } => run core.materialize(&mut engine, unsafe lendRealm(&context, context), move error)
+    }
+    run unsafe common.defineIndex(&mut engine, context, scope.values[1], index, value)
+    index = index + 1 offset = offset + 4 + size
+  }
+  if (flags & HTTP_HAS_BODY) != 0 {
+    let memory2 = engine.memory
+    scope.values[2] = run unsafe buffers.newArrayBufferCopy(&mut engine, memory2, unsafe lendRealm(&context, context), unsafe Pointer.atMut<u8>(base, end), usize.toU64(length - end))
+  }
+}
+// Appends the string `value`, one byte per code unit: header names and values are byte strings.
+effect fn appendLatin1(output: &mut Bytes, value: ValueBits) -> () ! OutOfMemoryError ? &mut Allocator {
+  if Strings.isFlatAscii(value) {
+    let anchor = ()
+    return run output.append(unsafe Strings.flatLatin1(&anchor, value))
+  }
+  let mut iterator = RopeIterator.make(&value)
+  while true {
+    match iterator.next() {
+      Option<u16>.Some { value: unit } => { let one: [u8; 1] = [u16.toU8(unit & 255)] run output.append(&one) }
+      Option<u16>.None => { return () }
+    }
+  }
+}
+effect fn appendDecimal(output: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut digits: [u8; 20] = [0; 20] let mut n = value let mut count: usize = 0
+  while true { digits[19 - count] = u64.toU8(48 + n % 10) n = n / 10 count = count + 1 if n == 0 { break } }
+  run output.append(Slice.view<u8>(&digits, 20 - count, count))
+}
+effect fn appendHex(output: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let table = b"0123456789abcdef"
+  let mut digits: [u8; 16] = [0; 16] let mut n = value let mut count: usize = 0
+  while true { digits[15 - count] = table[u64.toUsize(n % 16)] n = n / 16 count = count + 1 if n == 0 { break } }
+  run output.append(Slice.view<u8>(&digits, 16 - count, count))
+}
+fn reasonPhrase(code: i32) -> &'static [u8] {
+  if code == 200 { return b"OK" } if code == 201 { return b"Created" } if code == 202 { return b"Accepted" } if code == 204 { return b"No Content" }
+  if code == 206 { return b"Partial Content" } if code == 301 { return b"Moved Permanently" } if code == 302 { return b"Found" } if code == 303 { return b"See Other" }
+  if code == 304 { return b"Not Modified" } if code == 307 { return b"Temporary Redirect" } if code == 308 { return b"Permanent Redirect" }
+  if code == 400 { return b"Bad Request" } if code == 401 { return b"Unauthorized" } if code == 403 { return b"Forbidden" } if code == 404 { return b"Not Found" }
+  if code == 405 { return b"Method Not Allowed" } if code == 409 { return b"Conflict" } if code == 410 { return b"Gone" } if code == 413 { return b"Payload Too Large" }
+  if code == 415 { return b"Unsupported Media Type" } if code == 422 { return b"Unprocessable Entity" } if code == 429 { return b"Too Many Requests" }
+  if code == 500 { return b"Internal Server Error" } if code == 501 { return b"Not Implemented" } if code == 502 { return b"Bad Gateway" } if code == 503 { return b"Service Unavailable" } if code == 504 { return b"Gateway Timeout" }
+  if code == 100 { return b"Continue" } if code == 101 { return b"Switching Protocols" } if code == 203 { return b"Non-Authoritative Information" } if code == 205 { return b"Reset Content" }
+  if code == 402 { return b"Payment Required" } if code == 406 { return b"Not Acceptable" } if code == 408 { return b"Request Timeout" } if code == 411 { return b"Length Required" }
+  if code == 412 { return b"Precondition Failed" } if code == 414 { return b"URI Too Long" } if code == 416 { return b"Range Not Satisfiable" } if code == 417 { return b"Expectation Failed" }
+  if code == 418 { return b"I'm a Teapot" } if code == 426 { return b"Upgrade Required" } if code == 428 { return b"Precondition Required" } if code == 431 { return b"Request Header Fields Too Large" }
+  if code == 505 { return b"HTTP Version Not Supported" }
+  return b""
+}
+// The IMF-fixdate of the current second, as the Date field takes it.
+effect fn appendDate(output: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  let seconds = unsafe currentTime(Pointer.null<i64>())
+  let days = seconds / 86400 let rest = seconds % 86400
+  let weekdays = b"ThuFriSatSunMonTueWed" let months = b"JanFebMarAprMayJunJulAugSepOctNovDec"
+  let w = i64.toUsize((days % 7 + 7) % 7)
+  // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+  let z = days + 719468 let era = (if z >= 0 { z } else { z - 146096 }) / 146097
+  let doe = z - era * 146097 let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+  let doy = doe - (365 * yoe + yoe / 4 - yoe / 100) let mp = (5 * doy + 2) / 153
+  let day = doy - (153 * mp + 2) / 5 + 1 let month = if mp < 10 { mp + 3 } else { mp - 9 }
+  let carry: i64 = if month <= 2 { 1 } else { 0 }
+  let year = yoe + era * 400 + carry
+  let mut text: [u8; 29] = [0; 29]
+  let mut i: usize = 0 while i < 3 { text[i] = weekdays[w * 3 + i] i = i + 1 }
+  text[3] = 44 text[4] = 32 text[5] = i64.toU8(48 + day / 10) text[6] = i64.toU8(48 + day % 10) text[7] = 32
+  let m = i64.toUsize(month - 1) let mut j: usize = 0 while j < 3 { text[8 + j] = months[m * 3 + j] j = j + 1 }
+  text[11] = 32 text[12] = i64.toU8(48 + year / 1000 % 10) text[13] = i64.toU8(48 + year / 100 % 10) text[14] = i64.toU8(48 + year / 10 % 10) text[15] = i64.toU8(48 + year % 10)
+  text[16] = 32 let hour = rest / 3600 let minute = rest / 60 % 60 let second = rest % 60
+  text[17] = i64.toU8(48 + hour / 10) text[18] = i64.toU8(48 + hour % 10) text[19] = 58 text[20] = i64.toU8(48 + minute / 10) text[21] = i64.toU8(48 + minute % 10)
+  text[22] = 58 text[23] = i64.toU8(48 + second / 10) text[24] = i64.toU8(48 + second % 10) text[25] = 32 text[26] = 71 text[27] = 77 text[28] = 84
+  run output.append(&text)
+}
+// Appends the bytes of `data`: a string as UTF-8, or the range [start, start + length) of an
+// ArrayBuffer. Returns false for a range out of bounds.
+unsafe effect fn appendBody<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, output: &mut Bytes, data: ValueBits, startValue: ValueBits, lengthValue: ValueBits) -> bool ! OutOfMemoryError | JsException ? &mut Allocator {
+  if data.isString() { run appendUtf8(&mut output, data) return true }
+  if !data.isObject() { return true }
+  let backing = run buffers.getArrayBuffer(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(data))
+  let start = startValue.numericValue() let length = lengthValue.numericValue()
+  if !f64.isFinite(start) || !f64.isFinite(length) || f64.floor(start) != start || f64.floor(length) != length || start < 0.0 || length < 0.0 || start > u64.toF64(backing.byteLength) || length > u64.toF64(backing.byteLength) - start { return false }
+  let first = f64.toU64(start) let total = f64.toU64(length)
+  if total == 0 { return true }
+  run output.reserve(u64.toUsize(total))
+  if backing.physicalCapacity != 0 {
+    // Leased or shared memory is read with atomics, one byte at a time, as transfer does.
+    let mut i: u64 = 0
+    while i < total { let one: [u8; 1] = [u64.toU8(unsafe buffers.loadScalar(backing, first + i, 0))] run output.append(&one) i = i + 1 }
+  } else {
+    let viewAnchor = ()
+    run output.append(unsafe Pointer.borrowMany<(), u8>(&viewAnchor, unsafe Pointer.assumeMany<u8>(unsafe buffers.dataAt(backing.data, first)), u64.toUsize(total)))
+  }
+  return true
+}
+// httpRespond(id, status, statusText, fields, count, body, start, length, flags): writes a response.
+// `fields` holds `count` strings, [name, value, ...]; `body` is a string, an ArrayBuffer with the
+// range of the payload, or undefined; `flags` holds the HTTP_* response flags. HTTP_STREAM writes
+// the head of a chunked response, whose chunks httpChunk writes. Returns 1 when the socket took
+// it all, 0 when some waits for room, or a status.
+pub unsafe effect fn httpRespond<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, argc: i32, argv: &FrameSlots) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let found = unsafe lookup(state, number(unsafe common.argument(argv, 0)))
+  if Pointer.isNull<Handle>(found) { return ValueBits.Int { value: EBADF() } }
+  let handle = unsafe nn(found)
+  let exchangeFound = unsafe exchangeOf(handle)
+  if Pointer.isNull<Exchange>(exchangeFound) { return ValueBits.Int { value: EBADF() } }
+  let exchange = unsafe nn(exchangeFound)
+  let code = number(unsafe common.argument(argv, 1))
+  let flags = number(unsafe common.argument(argv, 8))
+  let mut anchor = () let ex = unsafe Pointer.borrowMut<(), Exchange>(&mut anchor, exchange)
+  ex.out.clear() ex.scratch.clear()
+  run ex.out.append(b"HTTP/1.1 ")
+  run appendDecimal(&mut ex.out, i32.toU64(code))
+  run ex.out.append(b" ")
+  let reason = unsafe common.argument(argv, 2)
+  if reason.isString() && Strings.length(reason) != 0 { run appendLatin1(&mut ex.out, reason) } else { run ex.out.append(reasonPhrase(code)) }
+  run ex.out.append(b"\r\n")
+  drop ex
+  let fields = unsafe common.argument(argv, 3) let count = number(unsafe common.argument(argv, 4))
+  let mut i: i32 = 0
+  while i < count {
+    let name = run unsafe owners.getIndex(&mut engine, context, fields, i32.toU32(i))
+    let value = run unsafe owners.getIndex(&mut engine, context, fields, i32.toU32(i + 1))
+    let entry = unsafe Pointer.borrowMut<(), Exchange>(&mut anchor, exchange)
+    let mut ok = name.isString() && value.isString()
+    if ok { run appendLatin1(&mut entry.out, name) run entry.out.append(b": ") run appendLatin1(&mut entry.out, value) run entry.out.append(b"\r\n") }
+    drop entry
+    unsafe owners.release(&mut engine, context, name) unsafe owners.release(&mut engine, context, value)
+    if !ok { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"response fields must be strings") }
+    i = i + 2
+  }
+  let body = unsafe Pointer.borrowMut<(), Exchange>(&mut anchor, exchange)
+  let inRange = run unsafe appendBody(&mut engine, context, &mut body.scratch, unsafe common.argument(argv, 5), unsafe common.argument(argv, 6), unsafe common.argument(argv, 7))
+  if !inRange { drop body return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Range, b"network buffer range is out of bounds") }
+  let bodyless = code < 200 || code == 204 || code == 304
+  if (flags & HTTP_STREAM) != 0 { run body.out.append(b"transfer-encoding: chunked\r\n") }
+  else if (flags & HTTP_HAS_LENGTH) == 0 && !bodyless { run body.out.append(b"content-length: ") run appendDecimal(&mut body.out, usize.toU64(body.scratch.length())) run body.out.append(b"\r\n") }
+  if (flags & HTTP_HAS_DATE) == 0 { run body.out.append(b"date: ") run appendDate(&mut body.out) run body.out.append(b"\r\n") }
+  if (flags & HTTP_CLOSE) != 0 { run body.out.append(b"connection: close\r\n") }
+  run body.out.append(b"\r\n")
+  if (flags & HTTP_NO_BODY) == 0 && !bodyless && body.scratch.length() != 0 { run body.out.append(body.scratch.asSlice()) }
+  let status = run unsafe writeNow(handle, body.out.asSlice()) drop body
+  return ValueBits.Int { value: status }
+}
+// httpChunk(id, body, start, length): writes one chunk of a streamed response, or with an empty
+// body the last chunk. Returns as httpRespond does.
+pub unsafe effect fn httpChunk<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, state: *mut State, argc: i32, argv: &FrameSlots) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let found = unsafe lookup(state, number(unsafe common.argument(argv, 0)))
+  if Pointer.isNull<Handle>(found) { return ValueBits.Int { value: EBADF() } }
+  let handle = unsafe nn(found)
+  let exchangeFound = unsafe exchangeOf(handle)
+  if Pointer.isNull<Exchange>(exchangeFound) { return ValueBits.Int { value: EBADF() } }
+  let exchange = unsafe nn(exchangeFound)
+  let mut anchor = () let ex = unsafe Pointer.borrowMut<(), Exchange>(&mut anchor, exchange)
+  ex.out.clear() ex.scratch.clear()
+  let inRange = run unsafe appendBody(&mut engine, context, &mut ex.scratch, unsafe common.argument(argv, 1), unsafe common.argument(argv, 2), unsafe common.argument(argv, 3))
+  if !inRange { drop ex return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Range, b"network buffer range is out of bounds") }
+  let size = ex.scratch.length()
+  if size == 0 { run ex.out.append(b"0\r\n\r\n") }
+  else { run appendHex(&mut ex.out, usize.toU64(size)) run ex.out.append(b"\r\n") run ex.out.append(ex.scratch.asSlice()) run ex.out.append(b"\r\n") }
+  let status = run unsafe writeNow(handle, ex.out.asSlice()) drop ex
+  return ValueBits.Int { value: status }
+}
+// Bytes that wait for room in the socket, for a streamed response's backpressure.
+unsafe fn pendingBytes(handle: *mut Handle) -> f64 {
+  let anchor = () let h = unsafe Pointer.borrow<(), Handle>(&anchor, handle)
+  let mut total: usize = 0 let mut p = h.firstWrite drop h
+  while !Pointer.isNull<Write>(p) { let w = unsafe Pointer.borrow<(), Write>(&anchor, unsafe nn(p)) total = total + w.length - w.offset p = w.next }
+  return usize.toF64(total)
 }
 
 // ---- Addresses ----
@@ -1309,6 +1758,19 @@ unsafe effect fn operation<'m, S: EngineServices>(engine: &mut Engine<'m, S>, co
     }
     return ValueBits.Int { value: 0 }
   }
+  if eq(op, b"httpAdopt") {
+    if kind != TCP && kind != PIPE { return ValueBits.Int { value: EINVAL() } }
+    if !Pointer.isNull<Peer>(unsafe peerOf(handle)) || !Pointer.isNull<Exchange>(unsafe exchangeOf(handle)) { return ValueBits.Int { value: EINVAL() } }
+    let made = run RequestParser.make(httpHeadLimits())
+    let parser = match move made { Result.Success { value } => move value Result.Failure { .. } => { return ValueBits.Int { value: EINVAL() } } }
+    let raw = run allocate(Layout.of<Exchange>().bytes)
+    let exchange = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Exchange>(raw)
+    unsafe Pointer.put<Exchange>(exchange, Exchange { parser: move parser, phase: PHASE_HEAD, remaining: 0, decoder: Option<Decoder>.none(), record: Bytes.make(), body: Bytes.make(), flags: 0, out: Bytes.make(), scratch: Bytes.make() })
+    let entry = unsafe Pointer.borrowMut<(), Handle>(&mut anchor, handle) entry.exchange = exchange entry.reading = true drop entry
+    unsafe refresh(handle)
+    return ValueBits.Int { value: 0 }
+  }
+  if eq(op, b"httpPending") { return ValueBits.number(unsafe pendingBytes(handle)) }
   if eq(op, b"wsFeed") {
     if Pointer.isNull<Peer>(unsafe peerOf(handle)) { return ValueBits.Int { value: EBADF() } }
     let backing = run buffers.getArrayBuffer(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(args.values[1]))
@@ -1521,6 +1983,7 @@ unsafe effect fn deliver<'m, S: EngineServices>(engine: &mut Engine<'m, S>, cont
   if kind == WS_FRAME {
     let memory = engine.memory scope.values[1] = run unsafe buffers.newArrayBufferCopy(&mut engine, memory, unsafe lendRealm(&context, context), data, usize.toU64(length))
   }
+  if kind == HTTP_REQUEST { scope.values[1] = ValueBits.Undefined run unsafe httpRequestValues(&mut engine, context, unsafe nn(data), length, code, &mut scope) }
   if kind == READ && code >= 0 {
     let memory = engine.memory scope.values[1] = run unsafe buffers.newArrayBufferCopy(&mut engine, memory, unsafe lendRealm(&context, context), data, usize.toU64(length))
     match from { Option<Endpoint>.Some { value } => { scope.values[2] = run unsafe endpointValue(&mut engine, context, value) } Option<Endpoint>.None => {} }

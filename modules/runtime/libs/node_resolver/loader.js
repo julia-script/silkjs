@@ -217,9 +217,14 @@ function createLoader(host, builtins) {
   }
 
   function builtinName(specifier) {
+    // The runtime's own modules, such as silk:serve, have only their silk: names.
+    if (builtinPrefix(specifier, 'silk:')) {
+      if (!builtins.runtime(specifier)) throw error('ERR_UNKNOWN_BUILTIN_MODULE', `No such built-in module: ${specifier}`);
+      return specifier;
+    }
     if (builtinPrefix(specifier, 'node:')) {
       const name = builtinSlice(specifier, 5);
-      if (!builtins.listed(name) && !builtins.listed(specifier)) {
+      if (builtins.runtime(name) || (!builtins.listed(name) && !builtins.listed(specifier))) {
         throw error('ERR_UNKNOWN_BUILTIN_MODULE', specifier);
       }
       return name;
@@ -227,8 +232,17 @@ function createLoader(host, builtins) {
     return builtins.listed(specifier) && builtins.has(specifier) ? specifier : null;
   }
 
+  // Where a builtin lives: node:fs for Node's modules, the specifier itself for silk: ones.
+  function builtinFile(name) {
+    return builtinPrefix(name, 'silk:') ? name : 'node:' + name;
+  }
+
+  function isBuiltinFile(filename) {
+    return filename.startsWith('node:') || filename.startsWith('silk:');
+  }
+
   function loadBuiltin(filename) {
-    const name = builtinPrefix(filename, 'node:') ? builtinName(filename) : null;
+    const name = isBuiltinFile(filename) ? builtinName(filename) : null;
     if (name === null) throw error('ERR_UNKNOWN_BUILTIN_MODULE', filename);
     return builtins.get(name);
   }
@@ -241,7 +255,7 @@ function createLoader(host, builtins) {
   const detectedModules = new WeakSet();
 
   function format(filename, mode, deferDetection = false) {
-    if (filename.startsWith('node:')) return 'builtin';
+    if (isBuiltinFile(filename)) return 'builtin';
     const disk = filesystemName(filename);
     const ext = path.extname(disk);
     if (ext === '.json') return 'json';
@@ -505,7 +519,7 @@ function createLoader(host, builtins) {
     if (specifier.length === 0) throw invalidArgValue('id', specifier, 'must be a non-empty string');
     if (mode === 'import' && specifier.includes('\0')) throw invalidArgValue('specifier', specifier, 'must not contain null bytes');
     const builtin = builtinName(specifier);
-    if (builtin !== null) return { filename: 'node:' + builtin, format: 'builtin' };
+    if (builtin !== null) return { filename: builtinFile(builtin), format: 'builtin' };
     if (options && own(options, 'paths') && options.paths !== undefined && !Array.isArray(options.paths)) {
       throw invalidArgValue('options.paths', options.paths);
     }
@@ -636,7 +650,7 @@ function createLoader(host, builtins) {
     const textImport = host.importText && context.importAttributes && context.importAttributes.type === 'text';
     if (specifier.startsWith('data:')) return { url: specifier, format: textImport ? 'text' : dataFormat(specifier) };
     const builtin = builtinName(specifier);
-    if (builtin !== null) return { url: 'node:' + builtin, format: 'builtin' };
+    if (builtin !== null) return { url: builtinFile(builtin), format: 'builtin' };
     if (context.parentURL && !context.parentURL.startsWith('file:') && !/^[A-Za-z][A-Za-z\d+.-]*:/.test(specifier) && !path.isAbsolute(specifier)) {
       throw error('ERR_UNSUPPORTED_RESOLVE_REQUEST', specifier, context.parentURL);
     }
@@ -998,7 +1012,7 @@ function createLoader(host, builtins) {
   };
   Module._resolveFilename = (request, parent, isMain, options) => {
     const result = resolve(request, parent, 'require', undefined, options, !!isMain, !!parent && moduleAsyncModes.get(parent) === true);
-    return result.format === 'builtin' && !request.startsWith('node:') ? result.filename.slice(5) : result.filename;
+    return result.format === 'builtin' && !request.startsWith('node:') && result.filename.startsWith('node:') ? result.filename.slice(5) : result.filename;
   };
   Module._load = (request, parent, isMain) => {
     probed = null;
@@ -1246,7 +1260,7 @@ function createLoader(host, builtins) {
     require.resolve = (specifier, options) => {
       if (typeof specifier !== 'string') throw invalidArgType('request', 'string', specifier);
       const result = resolve(specifier, parent || filename, 'require', undefined, options, false, allowAsync);
-      return result.format === 'builtin' && !specifier.startsWith('node:') ? result.filename.slice(5) : result.filename;
+      return result.format === 'builtin' && !specifier.startsWith('node:') && result.filename.startsWith('node:') ? result.filename.slice(5) : result.filename;
     };
     require.resolve.paths = (specifier) => {
       if (typeof specifier !== 'string') throw invalidArgType('request', 'string', specifier);
@@ -1329,7 +1343,7 @@ function createLoader(host, builtins) {
     register(filename, update) { builtinUpdates.set(filename, update); },
     get(key) {
       const filename = keyName(key);
-      const resolved = resolutions.get(key) || (filename.startsWith('node:')
+      const resolved = resolutions.get(key) || (isBuiltinFile(filename)
         ? { filename, format: 'builtin' } : { filename, format: format(filename, 'require') });
       if (key !== resolved.filename && pendingLoads.has(key)) {
         pendingLoads.set(resolved.filename, pendingLoads.get(key));

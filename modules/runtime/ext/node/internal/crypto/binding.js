@@ -750,7 +750,7 @@ const NamedKeyPairGenJob = keyPairJob('NamedKeyPairGenJob', (name, algorithm, pu
 
 function names(op) { return StringPrototypeSplit(call(op, []), '\n').filter((name) => name); }
 
-let fipsGeneration = 0;
+let fipsGeneration = 0n;
 function noteFipsChange() { fipsGeneration++; }
 
 function aliases(list) {
@@ -857,8 +857,9 @@ module.exports = {
   getCachedAliases: () => aliases(names('hashes')),
   getCachedMacAliases: () => aliases(names('macs')),
   getFipsCrypto: () => call('getFips', []),
+  testFipsCrypto: () => call('fipsAvailable', []) === 1,
   getFipsCryptoGeneration: () => fipsGeneration,
-  getOpenSSLSecLevelCrypto: () => crypto().getOpenSSLSecLevel?.(),
+  getOpenSSLSecLevelCrypto: () => call('secLevel', []),
   getPqcKeyTypes,
   secureHeapUsed: () => call('secureHeapUsed', []),
   setEngine: (id, flags) => call('setEngine', [id, flags]),
