@@ -14,6 +14,20 @@ const resourceOwnerToken = Symbol('resourceOwner');
 let nextId = 2;
 let emitting = false;
 let pendingDestroy = [];
+// Node's async_hook_fields counters: enabled hooks per callback kind (kInit..kPromiseResolve)
+// and their total (kTotals), kept current by enable() and disable().
+const hookFields = new Uint32Array(6);
+function countHookFields() {
+  hookFields.fill(0);
+  for (const hook of hooks) {
+    for (let index = 0; index < hookNames.length; index++) {
+      if (hook.callbacks[hookNames[index]] !== undefined) { hookFields[index]++; hookFields[5]++; }
+    }
+  }
+}
+// Node's getPromiseHooks: the init, before, after and settled functions that
+// setPromiseHooks installed (internal/promise_hooks), undefined where none is.
+function getPromiseHooks() { return promiseHookFunctions.slice(); }
 
 function error(code, message, Kind = TypeError) {
   const value = new Kind(message);
@@ -114,8 +128,8 @@ class AsyncHook {
     this.trackPromises = callbacks.trackPromises !== false;
     if (!this.trackPromises && this.callbacks.promiseResolve !== undefined) throw error('ERR_INVALID_ARG_VALUE', 'trackPromises must not be false when promiseResolve is enabled');
   }
-  enable() { hooks.add(this); syncNativeHooks(); return this; }
-  disable() { hooks.delete(this); syncNativeHooks(); return this; }
+  enable() { hooks.add(this); countHookFields(); syncNativeHooks(); return this; }
+  disable() { hooks.delete(this); countHookFields(); syncNativeHooks(); return this; }
 }
 function createHook(callbacks) { return new AsyncHook(callbacks); }
 let enterResource, leaveResource, invokeIn;
@@ -126,7 +140,8 @@ const kId = Symbol('asyncId'), kScope = Symbol('asyncScope'), kStack = Symbol('a
 function frameScope(id, trigger, resource) { return { stores: undefined, id, trigger, resource }; }
 
 class AsyncResource {
-  #context;
+  // Only the stores: the whole context would keep the resource that was current alive.
+  #stores;
   #id;
   #trigger;
   #destroy;
@@ -171,14 +186,14 @@ class AsyncResource {
   [kStack]() { return this.#previousContexts ??= []; }
   [kScope](omitFrame) {
     if (omitFrame && usesContextFrames()) return frameScope(this.#id, this.#trigger, this.#owner ?? this);
-    return this.#scope ??= { stores: this.#context?.stores, id: this.#id, trigger: this.#trigger, resource: this.#owner ?? this };
+    return this.#scope ??= { stores: this.#stores, id: this.#id, trigger: this.#trigger, resource: this.#owner ?? this };
   }
   constructor(type, options = {}, token, owner, explicitId) {
     if (typeof type !== 'string') throw error('ERR_INVALID_ARG_TYPE', 'The "type" argument must be a string');
     if (type.length === 0 && Array.from(hooks).some(hook => hook.callbacks.init !== undefined)) throw error('ERR_ASYNC_TYPE', 'Invalid name for async "type"');
     const trigger = typeof options === 'number' ? options : options.triggerAsyncId ?? executionAsyncId();
     if (!Number.isSafeInteger(trigger) || trigger < -1) throw error('ERR_INVALID_ASYNC_ID', `Invalid triggerAsyncId value: ${trigger}`, RangeError);
-    this.#context = captureContext();
+    this.#stores = captureContext()?.stores;
     this.#id = token === resourceOwnerToken && typeof explicitId === 'number' && explicitId !== -1 ? explicitId : nextId++;
     this.#trigger = trigger;
     this.#destroy = { id: this.#id, destroyed: false, promise: false };
@@ -224,7 +239,8 @@ class InternalResource {
     if (typeof type !== 'string') throw error('ERR_INVALID_ARG_TYPE', 'The "type" argument must be a string');
     if (hooks.size !== 0 && type.length === 0 && Array.from(hooks).some(hook => hook.callbacks.init !== undefined)) throw error('ERR_ASYNC_TYPE', 'Invalid name for async "type"');
     const context = captureContext();
-    this.context = context;
+    // Only the stores: the whole context would keep the resource that was current alive.
+    this.stores = context?.stores;
     this.id = typeof explicitId === 'number' && explicitId !== -1 ? explicitId : nextId++;
     this.trigger = context?.id ?? 1;
     this.owner = owner;
@@ -238,7 +254,7 @@ class InternalResource {
   [kStack]() { return this.stack ??= []; }
   [kScope](omitFrame) {
     if (omitFrame && usesContextFrames()) return frameScope(this.id, this.trigger, this.owner ?? this);
-    return this.scope ??= { stores: this.context?.stores, id: this.id, trigger: this.trigger, resource: this.owner ?? this };
+    return this.scope ??= { stores: this.stores, id: this.id, trigger: this.trigger, resource: this.owner ?? this };
   }
   asyncId() { return this.id; }
   triggerAsyncId() { return this.trigger; }
@@ -406,4 +422,10 @@ Object.defineProperties(module.exports, {
   _nativeDestroy: { value: nativeDestroy },
   _setPromiseObserver: { value: setPromiseObserver },
   _drainDestroy: { value: drainDestroy },
+  // Node's newAsyncId: the next id from the same counter every resource takes its id from.
+  _newAsyncId: { value: () => nextId++ },
+  _hookFields: { value: hookFields },
+  _getPromiseHooks: { value: getPromiseHooks },
+  // Node's async_wrap.queueDestroyAsyncId: a destroy event for an id with no resource.
+  _queueDestroyId: { value: id => { if (hooks.size !== 0) pendingDestroy.push({ id, destroyed: true }); } },
 });

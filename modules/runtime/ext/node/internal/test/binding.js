@@ -13,25 +13,38 @@ process.emitWarning(
   'These APIs are for internal testing only. Do not use them.',
   'internal/test/binding');
 
+const net = () => require('internal/net/binding');
 const kBindings = {
   __proto__: null,
-  buffer: 'internal/buffer_binding',
-  crypto: 'internal/crypto/binding',
-  http2: 'internal/http2/binding',
+  async_wrap: () => require('internal/async_wrap_binding'),
+  buffer: () => require('internal/buffer_binding'),
+  constants: () => require('internal/constants_binding'),
+  crypto: () => require('internal/crypto/binding'),
+  http2: () => require('internal/http2/binding'),
   // node_http_parser.cc: HTTPParser, ConnectionsList, methods, allMethods.
-  http_parser: 'internal/http/native-parser',
+  http_parser: () => require('internal/http/native-parser'),
+  performance: () => require('internal/performance_binding'),
+  trace_events: () => require('internal/trace_events_binding'),
+  util: () => require('internal/util/binding'),
   // inspector_agent.cc: registerAsyncHook and the asyncTask* calls.
-  inspector: 'internal/inspector_async',
-  timers: 'internal/timers_binding',
-  tls_wrap: 'internal/tls/binding',
-  util: 'internal/util/binding',
-  uv: 'internal/uv_binding',
+  inspector: () => require('internal/inspector_async'),
+  timers: () => require('internal/timers_binding'),
+  tls_wrap: () => require('internal/tls/binding'),
+  uv: () => require('internal/uv_binding'),
+  tcp_wrap: () => net().tcp_wrap,
+  pipe_wrap: () => net().pipe_wrap,
+  tty_wrap: () => net().tty_wrap,
+  stream_wrap: () => net().stream_wrap,
+  udp_wrap: () => {
+    const { UDP, UV_UDP_IPV6ONLY, UV_UDP_REUSEADDR, UV_UDP_REUSEPORT } = require('internal/dgram');
+    return { UDP, constants: { UV_UDP_IPV6ONLY, UV_UDP_REUSEADDR, UV_UDP_REUSEPORT } };
+  },
 };
 
 function internalBinding(module) {
-  const id = kBindings[module];
-  if (id === undefined) throw new Error(`No such binding: ${module}`);
-  return require(id);
+  const binding = kBindings[module];
+  if (binding === undefined) throw new Error(`No such binding: ${module}`);
+  return binding();
 }
 
 module.exports = { internalBinding, primordials };
