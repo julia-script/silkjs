@@ -7,6 +7,10 @@ const builtinPrefix = Function.prototype.call.bind(String.prototype.startsWith);
 const builtinSlice = Function.prototype.call.bind(String.prototype.slice);
 // Node's kFirstModuleParent: internal/errors reads it for require stacks.
 const kModuleParent = require('internal/host').kFirstModuleParent;
+// Captured before user code runs: the main module's evaluation promise is
+// observed without a user-replaced Promise.prototype.then.
+const ReflectApply = Reflect.apply;
+const PromisePrototypeThen = Promise.prototype.then;
 
 // Embedding contract: compileFunction evaluates the complete wrapper expression;
 // evaluateModule(source, filename, isEntry) runs a real native ESM graph; the
@@ -1320,7 +1324,7 @@ function createLoader(host, builtins) {
       try { result = host.evaluateModule(loaded.source, loaded.filename, true); }
       catch (cause) { throw decorateModuleError(cause, resolved.filename); }
       if (result !== null && typeof result === 'object' && typeof result.then === 'function') {
-        return result.then(undefined, (cause) => { throw decorateModuleError(cause, resolved.filename); });
+        return ReflectApply(PromisePrototypeThen, result, [undefined, (cause) => { throw decorateModuleError(cause, resolved.filename); }]);
       }
       return result;
     }
