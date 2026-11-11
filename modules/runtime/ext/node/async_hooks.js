@@ -334,9 +334,15 @@ class AsyncLocalStorage {
     checkFunction(callback, 'callback');
     if (usesContextFrames()) return this.run(undefined, callback, ...args);
     if (!this.enabled) return apply(callback, null, args);
-    this.enabled = false;
+    // Node disables the storage while callback runs, so resources made there do not
+    // take the store; here they take the context, so it goes without the store.
+    const previous = captureContext();
+    if (previous?.stores === undefined || !(this.kResourceStore in previous.stores)) return apply(callback, null, args);
+    const stores = legacyStores(previous.stores);
+    delete stores[this.kResourceStore];
+    host.setAsyncContext({ stores, id: previous.id, trigger: previous.trigger, resource: previous.resource });
     try { return apply(callback, null, args); }
-    finally { this.enabled = true; }
+    finally { host.setAsyncContext(previous); }
   }
   withScope(store) {
     return new RunScope(this, store);
