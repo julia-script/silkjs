@@ -1,72 +1,153 @@
 'use strict';
 const c = require('internal/fs_core');
 const { EventEmitter } = require('events');
-function later(callback) { Promise.resolve().then(callback); }
-function closedDir() { const e = new Error('Directory handle was closed'); e.code = 'ERR_DIR_CLOSED'; return e; }
+const { join } = require('path');
+const v = require('internal/validators');
+const { codes: { ERR_DIR_CLOSED, ERR_DIR_CONCURRENT_OPERATION, ERR_INVALID_THIS, ERR_MISSING_ARGS } } = require('internal/errors');
+const { promisify } = require('util');
+// A directory handle over entries already listed: read() hands out up to bufferSize Dirents,
+// then null; with a request it completes on a later tick, as a libuv read does.
+class DirHandle {
+  constructor(entries) { this.entries = entries; this.index = 0; }
+  read(encoding, bufferSize, req) {
+    const result = this.index < this.entries.length ? this.entries.slice(this.index, this.index += bufferSize) : null;
+    if (req === undefined) return result;
+    process.nextTick(() => req.oncomplete(null, result));
+  }
+  close(req) { this.entries = []; if (req !== undefined) process.nextTick(() => req.oncomplete(null)); }
+}
+function openDirHandle(path, encoding) { return new DirHandle(require('fs').readdirSync(path, { encoding, withFileTypes: true })); }
+// Node's lib/internal/fs/dir.js.
 class Dir {
-  constructor(path, entries) { this.path = path; this._entries = entries; this._index = 0; this._closed = false; this._pending = false; }
-  _check() { if (this._closed) throw closedDir(); }
-  readSync() { this._check(); if (this._pending) { const e = new Error('Cannot perform synchronous operation while asynchronous operation is pending'); e.code = 'ERR_DIR_CONCURRENT_OPERATION'; throw e; } return this._index < this._entries.length ? this._entries[this._index++] : null; }
-  read(callback) {
-    if (callback !== undefined) c.callback(callback);
-    const operation = Promise.resolve().then(() => { this._check(); return this._index < this._entries.length ? this._entries[this._index++] : null; });
-    this._pending = true;
-    operation.then(() => { this._pending = false; }, () => { this._pending = false; });
-    if (callback) { operation.then(value => callback(null, value), callback); return; }
-    return operation;
+  #handle;
+  #path;
+  #bufferedEntries = [];
+  #closed = false;
+  #options;
+  #readPromisified;
+  #closePromisified;
+  #operationQueue = null;
+  #handlerQueue = [];
+  constructor(handle, path, options) {
+    if (handle == null) throw new ERR_MISSING_ARGS('handle');
+    this.#handle = handle;
+    this.#path = path;
+    this.#options = { bufferSize: 32, ...c.options(options, { encoding: 'utf8' }) };
+    try { v.validateUint32(this.#options.bufferSize, 'options.bufferSize', true); } catch (validationError) { this.#handle.close(); throw validationError; }
+    this.#readPromisified = promisify(this.#readImpl).bind(this, false);
+    this.#closePromisified = promisify(this.close).bind(this);
   }
-  closeSync() { this._check(); if (this._pending) { const e = new Error('Directory operation is pending'); e.code = 'ERR_DIR_CONCURRENT_OPERATION'; throw e; } this._closed = true; this._entries = []; }
+  get path() {
+    if (!(#path in this)) throw new ERR_INVALID_THIS('Dir');
+    return this.#path;
+  }
+  #processHandlerQueue() {
+    while (this.#handlerQueue.length > 0) {
+      const handler = this.#handlerQueue.shift();
+      const result = handler.handle.read(this.#options.encoding, this.#options.bufferSize);
+      if (result !== null) { this.#bufferedEntries.push(...result); if (result.length > 0) this.#handlerQueue.push(handler); } else handler.handle.close();
+      if (this.#bufferedEntries.length > 0) break;
+    }
+    return this.#bufferedEntries.length > 0;
+  }
+  read(callback) { return arguments.length === 0 ? this.#readPromisified() : this.#readImpl(true, callback); }
+  #readImpl(maybeSync, callback) {
+    if (this.#closed === true) throw new ERR_DIR_CLOSED();
+    if (callback === undefined) return this.#readPromisified();
+    v.validateFunction(callback, 'callback');
+    if (this.#operationQueue !== null) { this.#operationQueue.push(() => { this.#readImpl(maybeSync, callback); }); return; }
+    if (this.#processHandlerQueue()) {
+      try {
+        const dirent = this.#bufferedEntries.shift();
+        if (this.#options.recursive && dirent.isDirectory()) this.#readSyncRecursive(dirent);
+        if (maybeSync) process.nextTick(callback, null, dirent); else callback(null, dirent);
+        return;
+      } catch (error) { return callback(error); }
+    }
+    const req = { oncomplete: (err, result) => {
+      process.nextTick(() => { const queue = this.#operationQueue; this.#operationQueue = null; for (const op of queue) op(); });
+      if (err || result === null) return callback(err, result);
+      try {
+        this.#bufferedEntries.push(...result);
+        const dirent = this.#bufferedEntries.shift();
+        if (this.#options.recursive && dirent.isDirectory()) this.#readSyncRecursive(dirent);
+        callback(null, dirent);
+      } catch (error) { callback(error); }
+    } };
+    this.#operationQueue = [];
+    this.#handle.read(this.#options.encoding, this.#options.bufferSize, req);
+  }
+  #readSyncRecursive(dirent) {
+    const path = join(dirent.parentPath, dirent.name);
+    this.#handlerQueue.push({ handle: openDirHandle(path, this.#options.encoding), path });
+  }
+  readSync() {
+    if (this.#closed === true) throw new ERR_DIR_CLOSED();
+    if (this.#operationQueue !== null) throw new ERR_DIR_CONCURRENT_OPERATION();
+    if (!this.#processHandlerQueue()) {
+      const result = this.#handle.read(this.#options.encoding, this.#options.bufferSize);
+      if (result === null) return result;
+      this.#bufferedEntries.push(...result);
+    }
+    const dirent = this.#bufferedEntries.shift();
+    if (this.#options.recursive && dirent.isDirectory()) this.#readSyncRecursive(dirent);
+    return dirent;
+  }
   close(callback) {
-    if (callback !== undefined) c.callback(callback);
-    const operation = Promise.resolve().then(() => { this._check(); this._closed = true; this._entries = []; });
-    if (callback) { operation.then(() => callback(null), callback); return; }
-    return operation;
+    if (callback === undefined) {
+      if (this.#closed === true) return Promise.reject(new ERR_DIR_CLOSED());
+      return this.#closePromisified();
+    }
+    v.validateFunction(callback, 'callback');
+    if (this.#closed === true) { process.nextTick(callback, new ERR_DIR_CLOSED()); return; }
+    if (this.#operationQueue !== null) { this.#operationQueue.push(() => { this.close(callback); }); return; }
+    while (this.#handlerQueue.length > 0) this.#handlerQueue.shift().handle.close();
+    this.#closed = true;
+    this.#handle.close({ oncomplete: callback });
   }
-  async *[Symbol.asyncIterator]() { try { for (;;) { const entry = await this.read(); if (entry === null) return; yield entry; } } finally { if (!this._closed) await this.close(); } }
+  closeSync() {
+    if (this.#closed === true) throw new ERR_DIR_CLOSED();
+    if (this.#operationQueue !== null) throw new ERR_DIR_CONCURRENT_OPERATION();
+    while (this.#handlerQueue.length > 0) this.#handlerQueue.shift().handle.close();
+    this.#closed = true;
+    this.#handle.close();
+  }
+  async *entries() {
+    try {
+      while (true) { const result = await this.#readPromisified(); if (result === null) break; yield result; }
+    } finally { await this.#closePromisified(); }
+  }
+  [Symbol.dispose]() { if (this.#closed) return; this.closeSync(); }
+  async [Symbol.asyncDispose]() { if (this.#closed) return; await this.#closePromisified(); }
 }
-if (Symbol.asyncDispose) Dir.prototype[Symbol.asyncDispose] = async function() { if (!this._closed) await this.close(); };
-class FSWatcher extends EventEmitter {
-  constructor() { super(); this._handle = null; this._closed = false; this._abort = null; }
-  close() { if (this._closed) return; this._closed = true; if (this._abort) this._abort(); if (this._handle) this._handle.close(); later(() => this.emit('close')); }
-  ref() { if (!this._closed && this._handle) this._handle.ref(); return this; }
-  unref() { if (!this._closed && this._handle) this._handle.unref(); return this; }
-  hasRef() { return !this._closed && !!this._handle && this._handle.hasRef(); }
-}
-function watch(filename, options, listener) {
-  if (typeof options === 'function') { listener = options; options = undefined; }
-  filename = c.path(filename); options = c.options(options, { persistent: true, recursive: false, encoding: 'utf8' }); c.encoding(options.encoding, 'utf8', true);
-  if (listener !== undefined) c.callback(listener);
-  const watcher = new FSWatcher(); if (listener) watcher.on('change', listener);
-  if (options.signal && options.signal.aborted) { later(() => watcher.close()); return watcher; }
-  if (typeof c.host.watch !== 'function') throw c.error('ENOSYS', 'watch', filename);
-  watcher._handle = c.host.watch(filename, options, (err, eventType, name) => {
-    if (watcher._closed) return;
-    if (err) { watcher.close(); watcher.emit('error', err); return; }
-    watcher.emit('change', eventType, name === null || name === undefined ? null : typeof name === 'string' ? c.encoded(name, options.encoding) : options.encoding === 'buffer' ? c.Buffer.from(name) : c.Buffer.from(name).toString(options.encoding));
-  });
-  if (!options.persistent) watcher.unref();
-  if (options.signal) { const abort = () => watcher.close(); options.signal.addEventListener('abort', abort, { once: true }); watcher._abort = () => options.signal.removeEventListener('abort', abort); }
-  return watcher;
-}
-class StatWatcher extends FSWatcher {
-  stop() { this.close(); }
+Object.defineProperty(Dir.prototype, Symbol.asyncIterator, { enumerable: false, writable: true, configurable: true, value: Dir.prototype.entries });
+const { FSWatcher, watch } = require('internal/fs_watch');
+class StatWatcher extends EventEmitter {
+  constructor() { super(); this._handle = null; this._closed = false; }
+  stop() { if (this._closed) return; this._closed = true; if (this._handle) { this._handle.close(); this._handle = null; } process.nextTick(() => this.emit('stop')); }
+  close() { this.stop(); }
+  ref() { if (this._handle) this._handle.ref(); return this; }
+  unref() { if (this._handle) this._handle.unref(); return this; }
 }
 const statWatchers = new Map();
 function watchFile(filename, options, listener) {
-  if (typeof options === 'function') { listener = options; options = undefined; }
-  c.callback(listener); filename = require('path').resolve(c.path(filename)); options = c.options(options, { persistent: true, interval: 5007, bigint: false }); c.integer(options.interval, 'interval', 1);
+  filename = require('path').resolve(c.path(filename));
+  if (options === null || typeof options !== 'object') { listener = options; options = null; }
+  options = { interval: 5007, persistent: true, ...options };
+  c.v.validateFunction(listener, 'listener');
   let watcher = statWatchers.get(filename);
   if (!watcher) {
     if (typeof c.host.watch !== 'function') throw c.error('ENOSYS', 'watchFile', filename);
+    c.v.validateUint32(options.interval, 'interval');
     watcher = new StatWatcher(); statWatchers.set(filename, watcher);
     try {
       watcher._handle = c.host.watch(filename, Object.assign({}, options, { stat: true }), (err, current, previous) => {
         if (watcher._closed) return;
         if (err) { watcher.emit('error', err); return; }
-        watcher.emit('change', new c.Stats(current, !!options.bigint), new c.Stats(previous, !!options.bigint));
+        watcher.emit('change', c.makeStats(current, !!options.bigint), c.makeStats(previous, !!options.bigint));
       });
     } catch (e) { statWatchers.delete(filename); throw e; }
-    watcher.once('close', () => { if (statWatchers.get(filename) === watcher) statWatchers.delete(filename); });
+    watcher.once('stop', () => { if (statWatchers.get(filename) === watcher) statWatchers.delete(filename); });
     if (!options.persistent) watcher.unref();
   }
   watcher.on('change', listener); return watcher;
@@ -76,4 +157,4 @@ function unwatchFile(filename, listener) {
   if (listener) watcher.removeListener('change', listener); else watcher.removeAllListeners('change');
   if (watcher.listenerCount('change') === 0) { statWatchers.delete(filename); watcher.stop(); }
 }
-module.exports = { Dir, FSWatcher, StatWatcher, watch, watchFile, unwatchFile };
+module.exports = { Dir, DirHandle, openDirHandle, FSWatcher, StatWatcher, watch, watchFile, unwatchFile };

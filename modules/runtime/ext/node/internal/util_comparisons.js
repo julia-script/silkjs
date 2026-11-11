@@ -23,7 +23,10 @@ function compare(actual, expected, strict = true, skipPrototype = false, partial
       for (const predicate of ['isDate', 'isRegExp', 'isMap', 'isSet', 'isArrayBuffer', 'isAnyArrayBuffer', 'isArrayBufferView', 'isBoxedPrimitive', 'isNativeError', 'isArgumentsObject']) {
         if (types[predicate](a) !== types[predicate](b)) return false;
       }
-      if (types.isDate(a)) {
+      if (types.isKeyObject(a) || types.isKeyObject(b)) {
+        // Like Node: compare the hidden key material, never the patchable equals().
+        if (!types.isKeyObject(a) || !types.isKeyObject(b) || !require('internal/crypto_core').keyObjectEquals(a, b)) return false;
+      } else if (types.isDate(a)) {
         const av = Date.prototype.getTime.call(a), bv = Date.prototype.getTime.call(b);
         if (!(av === bv || Number.isNaN(av) && Number.isNaN(bv))) return false;
       } else if (types.isRegExp(a)) {
@@ -70,7 +73,7 @@ function compare(actual, expected, strict = true, skipPrototype = false, partial
         }
         if (!match(0)) return false;
       } else {
-        for (const predicate of ['isPromise', 'isWeakMap', 'isWeakSet', 'isModuleNamespaceObject']) if (types[predicate](a) || types[predicate](b)) return false;
+        for (const predicate of ['isPromise', 'isWeakMap', 'isWeakSet']) if (types[predicate](a) || types[predicate](b)) return false;
       }
       const ak = enumerable(a, strict), bk = enumerable(b, strict);
       if (!partial && ak.length !== bk.length) return false;

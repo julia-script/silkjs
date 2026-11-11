@@ -23,21 +23,25 @@
 
 'use strict';
 
-const ArrayIsArray = Array.isArray;
-const MathAbs = Math.abs;
-const NumberIsFinite = Number.isFinite;
-const ObjectKeys = Object.keys;
-const StringPrototypeCharCodeAt = Function.call.bind(String.prototype.charCodeAt);
-const StringPrototypeSlice = Function.call.bind(String.prototype.slice);
+const {
+  Array,
+  ArrayIsArray,
+  Int8Array,
+  MathAbs,
+  NumberIsFinite,
+  ObjectKeys,
+  String,
+  StringPrototypeCharCodeAt,
+  StringPrototypeSlice,
+  decodeURIComponent,
+} = require('internal/per_context/primordials');
 
 const { Buffer } = require('buffer');
-const hexTable = Array.from({ length: 256 }, (_, i) => '%' + i.toString(16).toUpperCase().padStart(2, '0'));
-const isHexTable = new Uint8Array(256);
-for (const c of '0123456789abcdefABCDEF') isHexTable[c.charCodeAt(0)] = 1;
-function encodeStr(value) {
-  try { return encodeURIComponent(value); }
-  catch (error) { error.code = 'ERR_INVALID_URI'; throw error; }
-}
+const {
+  encodeStr,
+  hexTable,
+  isHexTable,
+} = require('internal/querystring');
 const QueryString = module.exports = {
   unescapeBuffer,
   // `unescape()` is a JS global, so we need to use a different local name

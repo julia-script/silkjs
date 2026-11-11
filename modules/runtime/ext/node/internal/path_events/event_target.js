@@ -6,7 +6,13 @@ const kEvents = Symbol('events');
 const kResistStopPropagation = Symbol('resistStopPropagation');
 const eventState = new WeakMap();
 const targets = new WeakSet();
-const signalState = new WeakMap();
+// AbortSignal state lives under a symbol on the signal, as Node keeps kAborted and kReason, so
+// the brand check also passes for a Proxy of a signal.
+const kSignalState = Symbol('kSignalState');
+const signalState = {
+  get(value) { return (typeof value === 'object' && value !== null) || typeof value === 'function' ? value[kSignalState] : undefined; },
+  has(value) { return signalState.get(value) !== undefined; },
+};
 const controllerState = new WeakMap();
 const signalToken = {};
 
@@ -75,11 +81,19 @@ const exceptionConstants = [
 ];
 const exceptionState = new WeakMap();
 class DOMException extends Error {
-  constructor(message = '', name = 'Error') {
-    message = String(message);
+  constructor(message = '', options = 'Error') {
+    message = `${message}`;
     super(message);
     delete this.message;
-    exceptionState.set(this, { message, name: String(name) });
+    if (options && typeof options === 'object') {
+      const { name } = options;
+      exceptionState.set(this, { message, name: `${name}` });
+      if ('cause' in options) {
+        Object.defineProperty(this, 'cause', { value: options.cause, configurable: true, writable: true, enumerable: false });
+      }
+    } else {
+      exceptionState.set(this, { message, name: `${options}` });
+    }
   }
   get name() { return exceptionData(this).name; }
   get message() { return exceptionData(this).message; }
@@ -200,22 +214,26 @@ class EventTarget {
     if (options !== null && typeof options !== 'object' && typeof options !== 'boolean') {
       throw new ERR_INVALID_ARG_TYPE('options', ['Object', 'boolean'], options);
     }
+    // Node reads every option, in this order, before it looks at the listener.
+    const flags = typeof options === 'object' && options !== null;
+    const once = flags && !!options.once;
+    const capture = captureOption(options);
+    const passive = flags && !!options.passive;
+    const signal = flags ? options.signal : undefined;
+    const resistant = flags && !!options[kResistStopPropagation];
+    if (signal !== undefined && !signalState.has(signal)) throw new ERR_INVALID_ARG_TYPE('options.signal', 'AbortSignal', signal);
     if (listener === undefined || listener === null) return;
     if (typeof listener !== 'function' && typeof listener !== 'object') {
       throw new ERR_INVALID_ARG_TYPE('listener', ['EventListener', 'function'], listener);
     }
-    const signal = typeof options === 'object' ? options?.signal : undefined;
-    if (signal !== undefined && !signalState.has(signal)) throw new ERR_INVALID_ARG_TYPE('options.signal', 'AbortSignal', signal);
     if (signal?.aborted) return;
-    const capture = captureOption(options);
     let root = this[kEvents].get(type);
     for (let node = root?.next; node; node = node.next) {
       if (node.listener === listener && node.capture === capture) return;
     }
     if (!root) this[kEvents].set(type, root = { next: undefined, last: undefined, size: 0 });
     const node = {
-      listener, capture, once: !!options?.once, passive: !!options?.passive,
-      resistant: !!options?.[kResistStopPropagation], previous: root.last,
+      listener, capture, once, passive, resistant, previous: root.last,
       next: undefined, removed: false, abortDispose: undefined,
     };
     if (root.last) root.last.next = node;
@@ -330,11 +348,13 @@ class AbortSignal extends EventTarget {
       throw error;
     }
     super();
-    signalState.set(this, {
+    // Signals warn about no listener count (Node: kMaxEventTargetListeners = 0).
+    this[require('events').kMaxEventTargetListeners] = 0;
+    Object.defineProperty(this, kSignalState, { value: {
       aborted: false, reason: undefined, onabort: null, handler: null,
       dependents: new Set(), sources: new Set(), composite: false, timeout: false,
       reference: new WeakRef(this),
-    });
+    }, writable: true });
   }
   get aborted() { return signalData(this).aborted; }
   get reason() { return signalData(this).reason; }

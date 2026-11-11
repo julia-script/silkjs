@@ -283,4 +283,4 @@ class OutgoingMessage extends Stream {
   _emitClose() { if (!this._closed) { this._closed = true; this.emit('close'); } }
   setTimeout(msecs, callback) { if (callback) this.once('timeout', callback); if (this.socket) this.socket.setTimeout(msecs); else this.once('socket', socket => socket.setTimeout(msecs)); return this; }
 }
-module.exports = { OutgoingMessage, validateHeaderName, validateHeaderValue };
+module.exports = { OutgoingMessage, utcDate, validateHeaderName, validateHeaderValue };

@@ -25,8 +25,15 @@
 
 'use strict';
 
-const { codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE }, validateAbortSignal, validateObject, validateString, validateNumber, validateUint32 } = require('internal/validators');
-const { codes: { ERR_BUFFER_OUT_OF_BOUNDS, ERR_INVALID_FD_TYPE, ERR_IP_BLOCKED, ERR_MISSING_ARGS, ERR_SOCKET_ALREADY_BOUND, ERR_SOCKET_BAD_BUFFER_SIZE, ERR_SOCKET_DGRAM_IS_CONNECTED, ERR_SOCKET_DGRAM_NOT_CONNECTED, ERR_SOCKET_DGRAM_NOT_RUNNING }, ErrnoException, ExceptionWithHostPort, makeError, validatePort } = require('internal/net/errors');
+const { validateAbortSignal, validateObject, validatePort, validateString, validateNumber, validateUint32 } = require('internal/validators');
+const {
+  ErrnoException, ExceptionWithHostPort, uvErrmapGet,
+  codes: {
+    ERR_BUFFER_OUT_OF_BOUNDS, ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_INVALID_FD_TYPE, ERR_IP_BLOCKED, ERR_MISSING_ARGS,
+    ERR_SOCKET_ALREADY_BOUND, ERR_SOCKET_BAD_BUFFER_SIZE, ERR_SOCKET_BUFFER_SIZE, ERR_SOCKET_DGRAM_IS_CONNECTED,
+    ERR_SOCKET_DGRAM_NOT_CONNECTED, ERR_SOCKET_DGRAM_NOT_RUNNING,
+  },
+} = require('internal/errors');
 const { kStateSymbol, newHandle, UV_UDP_IPV6ONLY, UV_UDP_REUSEADDR, UV_UDP_REUSEPORT } = require('internal/dgram');
 const { native } = require('internal/net/transport');
 const { Buffer } = require('buffer');
@@ -170,12 +177,11 @@ function bufferSize(self, size, buffer) {
   const name = buffer === RECV_BUFFER ? 'recvBufferSize' : 'sendBufferSize';
   const result = self[kStateSymbol].handle.option(name, size);
   if (result < 0) {
-    const cause = new ErrnoException(result, buffer === RECV_BUFFER ? 'uv_recv_buffer_size' : 'uv_send_buffer_size');
-    const err = makeError(Error, 'ERR_SOCKET_BUFFER_SIZE', `Could not get or set buffer size: ${cause.syscall} returned ${cause.code}`);
-    err.info = { errno: cause.errno, code: cause.code, message: cause.message, syscall: cause.syscall };
-    err.errno = cause.errno;
-    err.syscall = cause.syscall;
-    throw err;
+    // The context node_udp's BufferSize fills in for the SystemError.
+    const [code, message] = uvErrmapGet(result) ?? ['UNKNOWN', 'unknown error'];
+    throw new ERR_SOCKET_BUFFER_SIZE({
+      errno: result, code, message, syscall: buffer === RECV_BUFFER ? 'uv_recv_buffer_size' : 'uv_send_buffer_size',
+    });
   }
   return result;
 }
