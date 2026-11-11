@@ -1225,7 +1225,8 @@ function pollTimeout(pendingPromise) {
   // Keep nested waits interruptible without emitting main-loop lifecycle events.
   if (!referenced && due === Infinity) return 1;
   if (due === Infinity) return native.hasPendingIO() ? -1 : 0;
-  return Math.max(0, Math.ceil(due - native.now()));
+  // To the fraction of a millisecond: rounding up would wait up to one more.
+  return Math.max(0, due - native.now());
 }
 function loopTurn(pendingPromise) {
   const now = native.now();
@@ -1303,6 +1304,16 @@ globalThis.__silkRuntime = {
       fs.writeFileSync(directory + '/dependency.js', 'module.exports = 1;\n');
       loader.warmMain(directory + '/main.js');
     } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+    // And a first console.log of text, here written to /dev/null.
+    const saved = rawOS.dup(1), sink = rawOS.open('/dev/null', rawOS.O_WRONLY);
+    try {
+      if (saved < 0 || sink < 0) throw new Error('No /dev/null to warm console.log against');
+      rawOS.dup2(sink, 1);
+      globalThis.console.log('silkjs heap image');
+    } finally {
+      if (saved >= 0) { rawOS.dup2(saved, 1); rawOS.close(saved); }
+      if (sink >= 0) rawOS.close(sink);
+    }
     // Read again by hydrate, or (NODE_V8_COVERAGE) read again on every use.
     const hydrated = new Set(['HOME', 'NODE_PATH', 'NODE_CHANNEL_FD', 'NODE_UNIQUE_ID', 'WATCH_REPORT_DEPENDENCIES', 'NODE_V8_COVERAGE']);
     const missed = [...environmentRead].filter(key => typeof key === 'string' && !hydrated.has(key));
