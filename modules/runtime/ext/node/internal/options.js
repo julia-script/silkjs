@@ -183,6 +183,21 @@ function validateEnvironment(args, errors) {
   return 0;
 }
 
+// Node's options parser types (src/node_options.h OptionType) and its option table,
+// as internal/options getCLIOptionsInfo gives them (node inspect walks it).
+const optionTypes = { kNoOp: 0, kV8Option: 1, kBoolean: 2, kInteger: 3, kUInteger: 4, kString: 5, kHostPort: 6, kStringList: 7 };
+const envVarSettings = { kAllowedInEnvvar: 0, kDisallowedInEnvvar: 1 };
+function getCLIOptionsInfo() {
+  const options = new Map();
+  for (const [name, [type, allowedInEnvironment, defaultIsTrue]] of table.options) {
+    options.set(name, {
+      type: optionTypes['k' + type],
+      envVarSettings: allowedInEnvironment ? envVarSettings.kAllowedInEnvvar : envVarSettings.kDisallowedInEnvvar,
+      defaultIsTrue,
+    });
+  }
+  return { options, aliases: new Map(table.aliases) };
+}
 function processOption(name) {
   return /^--(?:no-)?(?:expose-gc|trace-sigint)$/.test(name) || /^--trace-event(?:s-enabled|-categories|-file-pattern)$/.test(name) || reportOptions.processWideOption(name);
 }
@@ -318,4 +333,4 @@ function buildAllowedFlags() {
   return Object.freeze(new NodeEnvironmentFlagsSet());
 }
 
-module.exports = { parseArguments, optionFlag, parseEnvironment, validateEnvironment, invalidWorkerArguments, processOption, getOptionValue, environmentFiles, loaderWorkerArguments, buildAllowedFlags, applyInspectorOption, isInspectorValueOption };
+module.exports = { optionTypes, envVarSettings, getCLIOptionsInfo, parseArguments, optionFlag, parseEnvironment, validateEnvironment, invalidWorkerArguments, processOption, getOptionValue, environmentFiles, loaderWorkerArguments, buildAllowedFlags, applyInspectorOption, isInspectorValueOption };
