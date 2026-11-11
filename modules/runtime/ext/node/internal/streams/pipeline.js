@@ -1,4 +1,4 @@
-// Adapted from Node.js v24.11.0 for Silk QuickJS.
+// Adapted from Node.js v24.22.1 for Silk QuickJS.
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -32,7 +32,7 @@ const {
   SymbolDispose,
 } = require('internal/streams/primordials');
 
-const eos = require('internal/streams/end-of-stream');
+const { eos } = require('internal/streams/end-of-stream');
 const { once } = require('internal/streams/support');
 const destroyImpl = require('internal/streams/destroy');
 const Duplex = require('internal/streams/duplex');
@@ -249,7 +249,7 @@ function pipelineImpl(streams, callback, opts) {
   }
 
   function finishImpl(err, final) {
-    if (err && (!error || error.code === 'ERR_STREAM_PREMATURE_CLOSE')) {
+    if (err && (!error || error.code === 'ERR_STREAM_PREMATURE_CLOSE' || error.name === 'AbortError')) {
       error = err;
     }
 
