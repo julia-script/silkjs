@@ -118,7 +118,8 @@ host.rebindRealmBuiltins = (previous, global) => {
   wasmCallbacks.delete(previous);
   wasmCallbacks.set(global, callbacks);
 };
-native.wasmNative('register', global => wasmCallbacks.get(global));
+const wasmResolver = global => wasmCallbacks.get(global);
+native.wasmNative('register', wasmResolver);
 host.initializeRealmBuiltins = (handle, global, wasmCodeGeneration) => {
   const cache = new Map();
   const bridge = {
@@ -181,10 +182,29 @@ host.stat = (path, follow = true) =>
 // Node's resolver may probe existence without granting access to file contents.
 const moduleStat = osNamespace.stat;
 host.moduleStat = path => statResult(moduleStat(path), 'stat', path);
-host.env = new Proxy(Object.assign(Object.create(null), rawStd.getenviron()), {
+const environmentValues = Object.assign(Object.create(null), rawStd.getenviron());
+const environmentHandler = {
   set(target, key, value) { if (typeof key === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string'); value = String(value); rawStd.setenv(key, value); target[key] = value; return true; },
   deleteProperty(target, key) { rawStd.unsetenv(key); return delete target[key]; }
-});
+};
+// A heap image is this bootstrap's result, saved at build time and started from
+// by later processes (src/ext/heap_image.silk). Whatever the bootstrap takes from
+// its process must be taken again by hydrate, below. While an image is built, the
+// environment variables the bootstrap reads are noted, and seal refuses an image
+// whose bootstrap read one that hydrate does not know.
+const environmentRead = native.heapImage ? new Set() : undefined;
+const notes = {
+  get(target, key) { environmentRead.add(key); return target[key]; },
+  has(target, key) { environmentRead.add(key); return key in target; },
+  getOwnPropertyDescriptor(target, key) { environmentRead.add(key); return Reflect.getOwnPropertyDescriptor(target, key); },
+  ownKeys(target) { environmentRead.add('*'); return Reflect.ownKeys(target); },
+};
+const noted = environment => new Proxy(environment, notes);
+const startupEnvironmentValues = new Proxy(environmentValues, environmentHandler);
+host.env = environmentRead ? noted(startupEnvironmentValues) : startupEnvironmentValues;
+// Built-ins that keep something of the process at load time refresh it here.
+const hydrations = [];
+host.onHydrate = refresh => { hydrations.push(refresh); };
 const asyncHooks = internalRequire('async_hooks');
 function resource(type, owner) { return asyncHooks._createResource(type, owner); }
 function invokeResource(scope, callback, receiver, args, destroy = true) {
@@ -370,7 +390,7 @@ globalThis.process = { platform: host.platform, env: host.env, nextTick: host.ne
 const EventEmitter = internalRequire('events');
 const process = new EventEmitter();
 globalThis.process = process;
-const startTime = native.runtimeStartTime;
+let startTime = native.runtimeStartTime;
 const performanceMilestones = {
   nodeStart: 0, environment: native.environmentTime - startTime,
   bootstrapComplete: -1, loopStart: -1, loopExit: -1,
@@ -492,6 +512,8 @@ if (workerThreads.isMainThread) {
   internalRequire('internal/stdio').install(process);
 }
 workerThreads._install(process, workerBootstrap);
+const liveEnvironment = process.env;
+if (environmentRead) process.env = noted(liveEnvironment);
 if (workerThreads.isMainThread) internalRequire('internal/watch_mode/dependencies').initialize();
 // The standard streams and console are built on first use: a script that
 // prints nothing loads neither the stream stack nor the formatter.
@@ -1230,6 +1252,35 @@ globalThis.__silkRuntime = {
   asyncDestroy: asyncHooks._nativeDestroy,
   drainDestroy: asyncHooks._drainDestroy,
   workerError: workerThreads._reportError,
-  run: () => invoke(run, undefined, []), loop, onRejection
+  run: () => invoke(run, undefined, []), loop, onRejection,
+  // Ends the build of a heap image. Each variable listed here is read again by hydrate.
+  seal() {
+    const hydrated = new Set(['HOME', 'NODE_PATH', 'NODE_CHANNEL_FD', 'NODE_UNIQUE_ID', 'WATCH_REPORT_DEPENDENCIES']);
+    const missed = [...environmentRead].filter(key => typeof key === 'string' && !hydrated.has(key));
+    if (missed.length) throw new Error('The bootstrap read environment variables that a start from a heap image does not read again: ' + missed.join(' '));
+    // Whoever kept a noting proxy reaches the environment through it unnoted.
+    for (const trap of Object.keys(notes)) delete notes[trap];
+    host.env = startupEnvironmentValues; process.env = liveEnvironment;
+  },
+  // Starts a process from a heap image: everything the bootstrap took from the
+  // process that built the image is taken again from this one.
+  hydrate(argv, runtimeStartTime, environmentTime) {
+    for (const key of Object.keys(environmentValues)) delete environmentValues[key];
+    Object.assign(environmentValues, rawStd.getenviron());
+    native.argv = argv;
+    startTime = runtimeStartTime;
+    performanceMilestones.environment = environmentTime - startTime;
+    host.performanceStartTime = startTime;
+    host.performanceTimeOrigin = Date.now() - (native.now() - startTime);
+    process.argv = argv.slice(); process.argv0 = argv[0];
+    process.execPath = native.osNative('execPath', []); process.pid = rawOS.getpid();
+    native.wasmNative('register', wasmResolver);
+    loader.Module._initPaths();
+    internalRequire('internal/child_process/ipc').installChild(process);
+    internalRequire('internal/watch_mode/dependencies').initialize();
+    if (process.env.NODE_UNIQUE_ID !== undefined) internalRequire('cluster');
+    for (const refresh of hydrations) refresh();
+    performanceMilestones.bootstrapComplete = native.now() - startTime;
+  }
 };
 performanceMilestones.bootstrapComplete = native.now() - startTime;

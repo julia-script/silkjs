@@ -11,7 +11,7 @@ import silk.mem.pointer { Pointer }
 import silk.num.u32
 import silk.num.usize
 import silk.num.i64
-import silkjs.runtime_memory { RuntimeAllocator }
+import silkjs.runtime_memory { RuntimeAllocator, AllocationObserver }
 import ext.diagnostics_hub { Mailbox }
 import silkjs.js_atomics_native { WaiterDomain, SynchronizationError }
 import silkjs.js_runtime_registry { ClassIdAllocator }
@@ -70,9 +70,89 @@ import ext.http_parser_native
 import ext.trace_native
 import ext.sea_native
 import runtime.embedded
+import ext.heap_image
+import silk.core.ownership { Copy }
 
 const STARTUP_GC_THRESHOLD: usize = 67108864
 
+unsafe extern "C" fn leave(status: i32) -> () as "_exit"
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at: usize = 0
+  while at < left.length { if left[at] != right[at] { return false } at = at + 1 }
+  return true
+}
+/// Whether a process with these arguments may start from the heap image. The
+/// build's own modes run the bootstrap themselves.
+fn usable(arguments: &List<Bytes>) -> bool {
+  return !(arguments.length() == 2 && same(arguments.asSlice()[1].asSlice(), b"--silk-write-builtin-cache"))
+}
+
+/// What a process that maps a heap image needs to find in it. Kept in the image.
+struct ImageRoots {
+  rt: *mut HeapHeader, context: *mut HeapHeader, ledger: *mut u8, wasmClasses: [u32; 2],
+  bootstrap: ValueBits, normalize: ValueBits, load: ValueBits, registerSource: ValueBits, rejection: ValueBits,
+  workerError: ValueBits, meta: ValueBits, asyncEvent: ValueBits, asyncDestroyEvent: ValueBits,
+  storageClass: u32, classes: [u32; 23]
+}
+impl Copy for ImageRoots {}
+unsafe fn rootsAt(image: ?*mut u8) -> *mut ImageRoots {
+  return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut ImageRoots>(unsafe heap_image.roots(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(image)))
+}
+unsafe effect fn heap(workers: *mut worker_native.State, region: ?*mut u8, image: ?*mut u8) -> RuntimeHeap ! OutOfMemoryError ? &mut Allocator {
+  let mut child = unsafe worker_native.reportingAllocator(workers)
+  if !Pointer.isNull<u8>(image) { return unsafe RuntimeAllocator.adopt(move child, (unsafe Pointer.read<ImageRoots>(unsafe rootsAt(image))).ledger) }
+  if !Pointer.isNull<u8>(region) { child.buildImage(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(region)) }
+  let mut allocator = run RuntimeAllocator.make(move child)
+  // The reporting child only watches for failure, so small blocks can be pooled.
+  allocator.enablePooling()
+  return move allocator
+}
+unsafe effect fn observer(allocator: &RuntimeHeap, image: ?*mut u8) -> AllocationObserver ! OutOfMemoryError {
+  if !Pointer.isNull<u8>(image) { return unsafe allocator.adoptedObserver() }
+  // Each block keeps its allocation record: heap snapshots and heap tracking
+  // name objects by allocation id from the first allocation on.
+  let memory = run allocator.observe()
+  memory.keepRecords()
+  return move memory
+}
+unsafe effect fn contextFor<'m>(engine: &mut Engine<'m, Services>, rt: *mut HeapHeader, image: ?*mut u8) -> *mut HeapHeader ! OutOfMemoryError | JsException ? &mut Allocator {
+  if !Pointer.isNull<u8>(image) { return (unsafe Pointer.read<ImageRoots>(unsafe rootsAt(image))).context }
+  let memory = engine.memory
+  return run unsafe intrinsics.create(&mut engine, memory, rt)
+}
+/// Ends the build of a heap image: saves the heap as it is now to path and leaves.
+unsafe effect fn writeImage<'m>(engine: &mut Engine<'m, Services>, rt: *mut HeapHeader, context: *mut HeapHeader, allocator: *mut RuntimeHeap, region: ?*mut u8, bootstrap: ValueBits, process: &Process, path: &[u8]) -> ()
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let seal = run unsafe common.get(&mut engine, context, bootstrap, b"seal")
+  // Throws when the bootstrap took from this process something a start does not take again.
+  let sealed = run promise.call(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(seal), unsafe lendFor(ValueBits.Undefined), &[])
+  unsafe gc.release(&mut engine, rt, sealed.intoBits())
+  unsafe gc.release(&mut engine, rt, seal)
+  let anchor = () let heap = unsafe Pointer.borrow<(), RuntimeHeap>(&anchor, allocator)
+  let ledger = heap.ledgerPointer() drop heap
+  let wasm = unsafe Intrinsic.pointerRequalify<?*mut wasm_native.State, *mut wasm_native.State>(engine.services.wasm)
+  unsafe Pointer.write<ImageRoots>(unsafe rootsAt(region), ImageRoots {
+    rt: rt, context: context, ledger: ledger, wasmClasses: unsafe wasm_native.classIds(wasm),
+    bootstrap: bootstrap, normalize: engine.services.normalize, load: engine.services.load, registerSource: engine.services.registerSource,
+    rejection: engine.services.rejection, workerError: engine.services.workerError, meta: engine.services.meta,
+    asyncEvent: engine.services.asyncEvent, asyncDestroyEvent: engine.services.asyncDestroyEvent,
+    storageClass: engine.services.storageClass, classes: process.namespace.saved()
+  })
+  // What the bootstrap handed to native services stays behind with this process: closing
+  // them gives up their hold on the heap, and hydrate hands the same things to the next ones.
+  if let Option<*mut napi_native.State>.Some { value: napi } = Pointer.nonNullMut<napi_native.State>(engine.services.napi) { unsafe napi_native.close(&mut engine, context, napi) }
+  if let Option<*mut inspector_native.State>.Some { value: inspector } = Pointer.nonNullMut<inspector_native.State>(engine.services.inspector) {
+    engine.services.inspector = Pointer.null<inspector_native.State>()
+    unsafe inspector_native.dispose(&mut engine, context, inspector)
+  }
+  unsafe wasm_native.close(&mut engine, context, wasm)
+  engine.services.wasm = Pointer.null<wasm_native.State>()
+  let written = unsafe heap_image.save(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(region), path)
+  if !written { let _reported = platform.writeAll(2, b"silkjsruntime: unable to write the heap image\n") }
+  unsafe leave(if written { 0 } else { 1 })
+}
 unsafe fn global(context: *mut HeapHeader) -> ValueBits {
   let anchor = () let state = unsafe HeapCell.payload<ContextState, ()>(&anchor, context)
   return state.globalObject.view()
@@ -82,7 +162,7 @@ unsafe effect fn function<'m>(engine: &mut Engine<'m, Services>, context: *mut H
   let value = run functions.newFunction(&mut engine, memory, unsafe lendRealm(&context, context), NativeFunctionId.Host { id: id }, name, 2, NativeCallProtocol.Generic, 0)
   run unsafe common.define(&mut engine, context, object, name, value, 7)
 }
-unsafe effect fn configure<'m>(engine: &mut Engine<'m, Services>, context: *mut HeapHeader, arguments: &List<Bytes>, process: &Process) -> ValueBits
+unsafe effect fn configure<'m>(engine: &mut Engine<'m, Services>, context: *mut HeapHeader, arguments: &List<Bytes>, process: &Process, image: bool) -> ValueBits
   ! OutOfMemoryError | JsException | StringLengthError | ModuleMetadataError ? &mut Allocator {
   let memory = engine.memory let rt = unsafe runtime.contextRuntime(context)
   unsafe runtime.setCanBlock(rt, true)
@@ -176,8 +256,10 @@ unsafe effect fn configure<'m>(engine: &mut Engine<'m, Services>, context: *mut 
   }
   let argv = run unsafe common.array(&mut engine, memory, context)
   run unsafe common.define(&mut engine, context, native, b"argv", argv, 7)
+  // An image is built as if by the executable alone: hydrate gives each process its arguments.
+  let mut count = arguments.length() if image { count = 1 run unsafe common.define(&mut engine, context, native, b"heapImage", ValueBits.Bool { value: true }, 7) }
   at = 0
-  while at < arguments.length() {
+  while at < count {
     let value = run unsafe host.string(&mut engine, context, arguments.asSlice()[at].asSlice())
     run unsafe common.defineIndex(&mut engine, context, argv, usize.toU32(at), value)
     at = at + 1
@@ -203,11 +285,14 @@ unsafe effect fn configure<'m>(engine: &mut Engine<'m, Services>, context: *mut 
   let bootstrap = run unsafe common.get(&mut engine, context, unsafe global(context), b"__silkRuntime")
   return bootstrap
 }
-unsafe effect fn execute<'m>(engine: &mut Engine<'m, Services>, context: *mut HeapHeader, arguments: &List<Bytes>, process: &Process, allocator: *mut RuntimeHeap) -> i32
+unsafe effect fn execute<'m>(engine: &mut Engine<'m, Services>, context: *mut HeapHeader, arguments: &List<Bytes>, process: &Process, allocator: *mut RuntimeHeap, region: ?*mut u8, image: ?*mut u8) -> i32
   ! OutOfMemoryError | JsException | StringLengthError | ModuleMetadataError ? &mut Allocator {
   let intrinsicMemory = engine.memory
-  run errorIntrinsics.enableNodeStackFormatting(&mut engine, intrinsicMemory, unsafe lendRealm(&context, context))
-  run unsafe intl.install(&mut engine, context, &process.namespace)
+  let restored = !Pointer.isNull<u8>(image)
+  if !restored {
+    run errorIntrinsics.enableNodeStackFormatting(&mut engine, intrinsicMemory, unsafe lendRealm(&context, context))
+    run unsafe intl.install(&mut engine, context, &process.namespace)
+  }
   engine.services.io = run fs_async.make()
   engine.services.crypto = run crypto_native.open()
   let io = unsafe Intrinsic.pointerRequalify<?*mut fs_async.State, *mut fs_async.State>(engine.services.io)
@@ -224,30 +309,58 @@ unsafe effect fn execute<'m>(engine: &mut Engine<'m, Services>, context: *mut He
   engine.services.napi = run napi_native.open(allocator, unsafe Intrinsic.pointerReinterpret<*mut worker_native.State, *mut u8>(workers), worker_native.silkNodeFatalReport, io)
   let wasm = run wasm_native.open(allocator)
   engine.services.wasm = wasm
-  run unsafe wasm_native.install(wasm, unsafe runtime.contextRuntime(context), &process.namespace)
+  if restored { unsafe wasm_native.adoptClasses(wasm, unsafe runtime.contextRuntime(context), (unsafe Pointer.read<ImageRoots>(unsafe rootsAt(image))).wasmClasses) }
+  else { run unsafe wasm_native.install(wasm, unsafe runtime.contextRuntime(context), &process.namespace) }
   engine.services.wasi = run wasi_native.open(allocator)
   engine.services.httpParser = run http_parser_native.open(allocator)
   engine.services.tracing = run trace_native.open(allocator)
   engine.services.sea = run sea_native.open(&unsafe worker_native.groupResources(workers))
-  let bootstrap = run unsafe configure(&mut engine, context, arguments, process)
   let rt = unsafe runtime.contextRuntime(context)
-  engine.services.normalize = run unsafe common.get(&mut engine, context, bootstrap, b"normalize")
-  engine.services.load = run unsafe common.get(&mut engine, context, bootstrap, b"load")
-  engine.services.registerSource = run unsafe common.get(&mut engine, context, bootstrap, b"registerSource")
-  engine.services.rejection = run unsafe common.get(&mut engine, context, bootstrap, b"onRejection")
-  engine.services.workerError = run unsafe common.get(&mut engine, context, bootstrap, b"workerError")
-  engine.services.meta = run unsafe common.get(&mut engine, context, bootstrap, b"importMeta")
-  engine.services.asyncEvent = run unsafe common.get(&mut engine, context, bootstrap, b"asyncEvent")
-  engine.services.asyncDestroyEvent = run unsafe common.get(&mut engine, context, bootstrap, b"asyncDestroy")
-  unsafe runtime.setPromiseRejectionTracker(rt, HostHook { callback: Option<NativeFunctionId>.some(NativeFunctionId.Host { id: 22 }), opaque: Pointer.null<u8>() })
   let memory = engine.memory
-  let removed = run evaluation.evaluate(&mut engine, memory, unsafe lendRealm(&context, context), b"delete globalThis.__silkRuntime", b"silk:bootstrap-cleanup", flags.TYPE_GLOBAL)
-  unsafe gc.release(&mut engine, rt, removed.intoBits())
-  unsafe runtime.setModuleLoader(rt, ModuleLoaderHooks {
-    normalize: Option<NativeFunctionId>.some(NativeFunctionId.Host { id: 20 }),
-    load: Option<NativeFunctionId>.some(NativeFunctionId.Host { id: 21 }),
-    checkSupportedImportAttributes: Option<NativeFunctionId>.none(), loaderHasAttributes: true, opaque: Pointer.null<u8>()
-  })
+  let mut bootstrap = ValueBits.Undefined
+  if restored {
+    let roots = unsafe Pointer.read<ImageRoots>(unsafe rootsAt(image))
+    bootstrap = roots.bootstrap
+    engine.services.normalize = roots.normalize engine.services.load = roots.load engine.services.registerSource = roots.registerSource
+    engine.services.rejection = roots.rejection engine.services.workerError = roots.workerError engine.services.meta = roots.meta
+    engine.services.asyncEvent = roots.asyncEvent engine.services.asyncDestroyEvent = roots.asyncDestroyEvent
+    engine.services.storageClass = roots.storageClass
+    let argv = run unsafe common.array(&mut engine, memory, context)
+    let mut at: usize = 0
+    while at < arguments.length() {
+      let value = run unsafe host.string(&mut engine, context, arguments.asSlice()[at].asSlice())
+      run unsafe common.defineIndex(&mut engine, context, argv, usize.toU32(at), value)
+      at = at + 1
+    }
+    let hydrate = run unsafe common.get(&mut engine, context, bootstrap, b"hydrate")
+    let started = ValueBits.number(i64.toF64(engine.services.started) / 1000000.0)
+    let now = clock.nowNanoseconds()
+    // The image holds the random stream of the process that built it.
+    unsafe runtime.seedRandom(context, i64.toU64(now / 1000))
+    let hydrated = run promise.call(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(hydrate), unsafe lendFor(ValueBits.Undefined), &[argv, started, ValueBits.number(i64.toF64(now) / 1000000.0)])
+    unsafe gc.release(&mut engine, rt, hydrated.intoBits())
+    unsafe gc.release(&mut engine, rt, hydrate)
+    unsafe gc.release(&mut engine, rt, argv)
+  } else {
+    bootstrap = run unsafe configure(&mut engine, context, arguments, process, !Pointer.isNull<u8>(region))
+    engine.services.normalize = run unsafe common.get(&mut engine, context, bootstrap, b"normalize")
+    engine.services.load = run unsafe common.get(&mut engine, context, bootstrap, b"load")
+    engine.services.registerSource = run unsafe common.get(&mut engine, context, bootstrap, b"registerSource")
+    engine.services.rejection = run unsafe common.get(&mut engine, context, bootstrap, b"onRejection")
+    engine.services.workerError = run unsafe common.get(&mut engine, context, bootstrap, b"workerError")
+    engine.services.meta = run unsafe common.get(&mut engine, context, bootstrap, b"importMeta")
+    engine.services.asyncEvent = run unsafe common.get(&mut engine, context, bootstrap, b"asyncEvent")
+    engine.services.asyncDestroyEvent = run unsafe common.get(&mut engine, context, bootstrap, b"asyncDestroy")
+    unsafe runtime.setPromiseRejectionTracker(rt, HostHook { callback: Option<NativeFunctionId>.some(NativeFunctionId.Host { id: 22 }), opaque: Pointer.null<u8>() })
+    let removed = run evaluation.evaluate(&mut engine, memory, unsafe lendRealm(&context, context), b"delete globalThis.__silkRuntime", b"silk:bootstrap-cleanup", flags.TYPE_GLOBAL)
+    unsafe gc.release(&mut engine, rt, removed.intoBits())
+    unsafe runtime.setModuleLoader(rt, ModuleLoaderHooks {
+      normalize: Option<NativeFunctionId>.some(NativeFunctionId.Host { id: 20 }),
+      load: Option<NativeFunctionId>.some(NativeFunctionId.Host { id: 21 }),
+      checkSupportedImportAttributes: Option<NativeFunctionId>.none(), loaderHasAttributes: true, opaque: Pointer.null<u8>()
+    })
+    if !Pointer.isNull<u8>(region) { run unsafe writeImage(&mut engine, rt, context, allocator, region, bootstrap, process, arguments.asSlice()[2].asSlice()) }
+  }
   let start = run unsafe common.get(&mut engine, context, bootstrap, b"run")
   let launched = run Effect.result(promise.call(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(start), unsafe lendFor(ValueBits.Undefined), &[]))
   unsafe gc.release(&mut engine, rt, start)
@@ -261,11 +374,11 @@ unsafe effect fn execute<'m>(engine: &mut Engine<'m, Services>, context: *mut He
   unsafe gc.release(&mut engine, rt, value)
   return code
 }
-unsafe effect fn realm<'m>(engine: &mut Engine<'m, Services>, rt: *mut HeapHeader, arguments: &List<Bytes>, process: &Process, allocator: *mut RuntimeHeap) -> i32
+unsafe effect fn realm<'m>(engine: &mut Engine<'m, Services>, rt: *mut HeapHeader, arguments: &List<Bytes>, process: &Process, allocator: *mut RuntimeHeap, region: ?*mut u8, image: ?*mut u8) -> i32
   ! OutOfMemoryError | JsException ? &mut Allocator {
   let memory = engine.memory
-  let context = run unsafe intrinsics.create(&mut engine, memory, rt)
-  let executed = run Effect.result(unsafe execute(&mut engine, context, arguments, process, allocator))
+  let context = run unsafe contextFor(&mut engine, rt, image)
+  let executed = run Effect.result(unsafe execute(&mut engine, context, arguments, process, allocator, region, image))
   let mut status: i32 = 1
   match move executed {
     Result<i32, OutOfMemoryError | JsException | StringLengthError | ModuleMetadataError>.Success { value } => { status = value }
@@ -406,31 +519,47 @@ unsafe effect fn realm<'m>(engine: &mut Engine<'m, Services>, rt: *mut HeapHeade
   unsafe gc.releaseHeader(&mut engine, rt, context)
   return status
 }
-/// exiting: the process ends when this runtime does (the main thread's), so its heap
-/// is left for the operating system to reclaim, as process.exit() already leaves it.
-unsafe effect fn runtimeBody(workers: *mut worker_native.State, arguments: &List<Bytes>, process: &Process, exiting: bool) -> i32 ! OutOfMemoryError ? &mut Allocator {
-  let mut services = Services.make(process.namespace.clone()) services.workers = workers
-  let mut allocator = run RuntimeAllocator.make(unsafe worker_native.reportingAllocator(workers))
-  // The reporting child only watches for failure, so small blocks can be pooled.
-  // Each block keeps its allocation record: heap snapshots and heap tracking
-  // name objects by allocation id from the first allocation on.
-  allocator.enablePooling()
-  let memory = run allocator.observe()
-  memory.keepRecords()
-  let allocatorPointer = Pointer.fromMutRef<RuntimeHeap>(&mut allocator)
-  let rt = run runtime.allocateRuntimeStorage(stack.currentFrameAddress()) |> Effect.provideMut<Allocator>(&mut allocator)
+unsafe effect fn runtimeFor(image: ?*mut u8, process: &Process) -> *mut HeapHeader ! OutOfMemoryError ? &mut Allocator {
+  if !Pointer.isNull<u8>(image) {
+    let roots = unsafe Pointer.read<ImageRoots>(unsafe rootsAt(image))
+    unsafe runtime.updateStackTop(roots.rt, stack.currentFrameAddress())
+    process.namespace.adopt(roots.classes)
+    return roots.rt
+  }
+  let rt = run runtime.allocateRuntimeStorage(stack.currentFrameAddress())
   unsafe debugger.configureCompilation(rt, true)
   // The built-ins a start loads stay live for the whole run: collecting while they
   // load only rescans them. The first collection waits for the heap to pass this.
   unsafe runtime.setGCThreshold(rt, STARTUP_GC_THRESHOLD)
+  return rt
+}
+/// exiting: the process ends when this runtime does (the main thread's), so its heap
+/// is left for the operating system to reclaim, as process.exit() already leaves it.
+unsafe effect fn runtimeBody(workers: *mut worker_native.State, arguments: &List<Bytes>, process: &Process, exiting: bool) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  let mut services = Services.make(process.namespace.clone()) services.workers = workers
+  // Only the main thread's runtime starts from a heap image, or builds one.
+  let mut region = Pointer.null<u8>() let mut image = Pointer.null<u8>()
+  if exiting {
+    if arguments.length() == 3 && same(arguments.asSlice()[1].asSlice(), b"--silk-write-heap-image") { region = unsafe heap_image.begin() }
+    else if usable(arguments) { image = unsafe heap_image.load() }
+  }
+  let restored = !Pointer.isNull<u8>(image)
+  let mut allocator = run unsafe heap(workers, region, image)
+  let memory = run unsafe observer(&allocator, image)
+  let allocatorPointer = Pointer.fromMutRef<RuntimeHeap>(&mut allocator)
+  let rt = run unsafe runtimeFor(image, process) |> Effect.provideMut<Allocator>(&mut allocator)
   unsafe worker_native.configureRuntime(workers, rt)
   let domain = unsafe worker_native.domain(workers)
   let mut engine = Engine { memory: &memory, domain: domain, services: move services }
-  let initialized = run Effect.result(unsafe events.initHandlers(rt, process, false, domain)) |> Effect.provideMut<Allocator>(&mut allocator)
-  match move initialized { Result<(), OutOfMemoryError>.Failure { error } => { run unsafe gc.destroyRuntime(&mut engine, rt) |> Effect.provideMut<Allocator>(&mut allocator) fail move error } _ => () }
-  unsafe osWorkers.installShared(rt)
-  unsafe runtime.setInterruptHandler(rt, HostHook { callback: Option<NativeFunctionId>.some(NativeFunctionId.Host { id: 6098 }), opaque: Pointer.null<u8>() })
-  let executed = run Effect.result(unsafe realm(&mut engine, rt, arguments, process, allocatorPointer)) |> Effect.provideMut<Allocator>(&mut allocator)
+  if restored {
+    run unsafe events.rebindHandlers(rt, process, domain) |> Effect.provideMut<Allocator>(&mut allocator)
+  } else {
+    let initialized = run Effect.result(unsafe events.initHandlers(rt, process, false, domain)) |> Effect.provideMut<Allocator>(&mut allocator)
+    match move initialized { Result<(), OutOfMemoryError>.Failure { error } => { run unsafe gc.destroyRuntime(&mut engine, rt) |> Effect.provideMut<Allocator>(&mut allocator) fail move error } _ => () }
+    unsafe osWorkers.installShared(rt)
+    unsafe runtime.setInterruptHandler(rt, HostHook { callback: Option<NativeFunctionId>.some(NativeFunctionId.Host { id: 6098 }), opaque: Pointer.null<u8>() })
+  }
+  let executed = run Effect.result(unsafe realm(&mut engine, rt, arguments, process, allocatorPointer, region, image)) |> Effect.provideMut<Allocator>(&mut allocator)
   let allocationProfile = engine.memory.stopProfile()
   drop allocationProfile
   // Addon finalizers are observable and run when the heap is destroyed; every other

@@ -30,7 +30,9 @@ if arguments and not non_final.intersection(arguments):
             compile_only = [argument for argument in compile_only
                             if not argument.startswith(('-Wl,', '-l', '--ld-path=')) and argument != '-no-pie'
                             and not argument.endswith(('.a', '.o'))]
-            subprocess.run([compiler, *compile_only, '-c', '-o', program], check=True)
+            # One section per function, so that the link can order them (build.py, startup_order).
+            sections = [] if sys.platform == 'darwin' else ['-ffunction-sections']
+            subprocess.run([compiler, *compile_only, *sections, '-c', '-o', program], check=True)
             arguments[at:at + 5] = [program]
             # Code generation options have nothing left to apply to.
             while '-mllvm' in arguments:

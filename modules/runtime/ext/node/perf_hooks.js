@@ -15,8 +15,10 @@ const deliverObserver = Symbol('deliver');
 const reservedMarks = new Set(['nodeStart', 'v8Start', 'environment', 'loopStart', 'loopExit', 'bootstrapComplete']);
 const supportedTypes = Object.freeze([...new Set(['function', 'mark', 'measure', 'resource', ...(host.performanceObserverTypes || [])])].sort());
 const previousPerformance = globalThis.performance;
-const startTime = host.performanceStartTime ?? (host.now() - (previousPerformance?.now() ?? process.uptime() * 1000));
-const timeOrigin = host.performanceTimeOrigin ?? previousPerformance?.timeOrigin ?? (Date.now() - (host.now() - startTime));
+let startTime = host.performanceStartTime ?? (host.now() - (previousPerformance?.now() ?? process.uptime() * 1000));
+let timeOrigin = host.performanceTimeOrigin ?? previousPerformance?.timeOrigin ?? (Date.now() - (host.now() - startTime));
+// A process started from a heap image has its own start.
+host.onHydrate(() => { startTime = host.performanceStartTime; timeOrigin = host.performanceTimeOrigin; });
 const now = () => host.now() - startTime;
 let deliveryScheduled = false;
 let resourceLimit = 250;

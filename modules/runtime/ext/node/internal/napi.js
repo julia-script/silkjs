@@ -182,7 +182,10 @@ function createNapiAdapter(host) {
 }
 
 function install(host, process) {
-  host.napiNative(0, [createNapiAdapter(host)]);
+  const adapter = createNapiAdapter(host);
+  host.napiNative(0, [adapter]);
+  // Native state does not come with a heap image: a start from one hands the adapter over again.
+  host.onHydrate(() => { host.napiNative(0, [adapter]); });
   process.dlopen = function dlopen(module, filename, flags = 1) {
     if (module === null || typeof module !== 'object') throw Object.assign(new TypeError('The "module" argument must be an object'), { code: 'ERR_INVALID_ARG_TYPE' });
     if (typeof filename !== 'string') throw Object.assign(new TypeError('The "filename" argument must be a string'), { code: 'ERR_INVALID_ARG_TYPE' });
