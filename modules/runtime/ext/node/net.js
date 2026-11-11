@@ -514,9 +514,10 @@ Server.prototype._acceptSocket = function(socket) {
 Server.prototype.listen = function(...args) {
   if (this._transport || this._starting || this._closing) throw fail('ERR_SERVER_ALREADY_LISTEN', 'Listen method has been called more than once without closing');
   const [options, cb] = normalizeArgs(args);
-  if (options.port === undefined && options.path === undefined && options.fd === undefined) {
-    if (args.length === 0 || typeof args[0] === 'function') options.port = 0;
-    else throw fail('ERR_INVALID_ARG_VALUE', 'Listen options must specify a port, path, or fd', TypeError);
+  // As in Node, listen() and listen(callback) bind a random port.
+  if (args.length === 0 || typeof args[0] === 'function') options.port = 0;
+  else if (options.port === undefined && options.path === undefined && options.fd === undefined) {
+    throw fail('ERR_INVALID_ARG_VALUE', 'Listen options must specify a port, path, or fd', TypeError);
   }
   let backlog = options.backlog;
   if (backlog === undefined && typeof args[0] !== 'object') {

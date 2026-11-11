@@ -61,7 +61,7 @@ class Console {
       _stdout: { value: stdout, writable: true, configurable: true }, _stderr: { value: stderr, writable: true, configurable: true },
       _ignoreErrors: { value: options.ignoreErrors === undefined ? true : !!options.ignoreErrors, writable: true },
       _colorMode: { value: mode }, _inspectOptions: { value: options.inspectOptions || {} },
-      _counts: { value: new Map() }, _times: { value: new Map() }, _groupIndent: { value: '', writable: true }, _groupIndentation: { value: indentation },
+      _counts: { value: new Map() }, _writeErrorHandlers: { value: new WeakMap() }, _times: { value: new Map() }, _groupIndent: { value: '', writable: true }, _groupIndentation: { value: indentation },
     });
     for (const key of Object.getOwnPropertyNames(Console.prototype)) if (key !== 'constructor' && !key.startsWith('_')) {
       const method = this[key];
@@ -81,9 +81,16 @@ class Console {
       stream.once('error', onError);
     }
     try {
-      stream.write(text, error => {
-        if (error && typeof stream.once === 'function' && (!stream.listenerCount || stream.listenerCount('error') === 0)) stream.once('error', () => {});
-      });
+      // One handler per stream, as Node's createWriteErrorHandler: Writable
+      // batches synchronous completions that share a callback into one tick.
+      let handler = this._writeErrorHandlers.get(stream);
+      if (handler === undefined) {
+        handler = error => {
+          if (error && typeof stream.once === 'function' && (!stream.listenerCount || stream.listenerCount('error') === 0)) stream.once('error', () => {});
+        };
+        this._writeErrorHandlers.set(stream, handler);
+      }
+      stream.write(text, handler);
     } catch (error) {
       if (error instanceof RangeError && /call stack|recursion/i.test(error.message)) throw error;
     } finally {

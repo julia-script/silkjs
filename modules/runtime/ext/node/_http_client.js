@@ -15,6 +15,9 @@ class ClientRequest extends OutgoingMessage {
     else base = input || {};
     options = { ...base, ...options };
     super(options);
+    // As in Node: stream.destroy() tells a client response (req set, false)
+    // from a server request (no req) by this field.
+    this.upgradeOrConnect = false;
     const protocol = options.protocol || 'http:';
     this.agent = options.agent === undefined ? (options.createConnection ? null : options._defaultAgent || require('_http_agent').globalAgent) : options.agent;
     if (this.agent === false) this.agent = new Agent({ keepAlive: false });
@@ -77,7 +80,7 @@ class ClientRequest extends OutgoingMessage {
           current = new IncomingMessage(socket); Object.assign(current, info); current.req = this; current._parser = parser;
           current.joinDuplicateHeaders = !!this._options.joinDuplicateHeaders;
           const tunnel = this.method === 'CONNECT' && info.statusCode >= 200 && info.statusCode < 300;
-          if (info.statusCode === 101 || tunnel) { this.res = current; return { upgrade: true }; }
+          if (info.statusCode === 101 || tunnel) { this.upgradeOrConnect = true; this.res = current; return { upgrade: true }; }
           if (info.statusCode < 200) {
             if (info.statusCode === 100) this.emit('continue');
             this.emit('information', { statusCode: info.statusCode, statusMessage: info.statusMessage, httpVersion: info.httpVersion, httpVersionMajor: info.httpVersionMajor, httpVersionMinor: info.httpVersionMinor, headers: current.headers, rawHeaders: current.rawHeaders });
