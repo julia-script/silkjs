@@ -3,22 +3,20 @@
 Two WebAssembly builds for the benchmark tables, both run by the same runtime
 ([wasmtime](https://github.com/bytecodealliance/wasmtime)):
 
-- **silkjs**, compiled by the Silk LLVM backend to `wasm64-unknown-unknown` and linked with
+- **silkjs**, compiled by the Silk LLVM backend to `wasm32-unknown-unknown` and linked with
   `host.c`, a small C library on WASI Preview 1 imports.
 - **QuickJS** from github.com/bellard/quickjs (the tables used master e585640, version
   2026-06-04), compiled by wasi-sdk to `wasm32-wasip1` with `quickjs/host.c` in place of
   `quickjs-libc.c`.
 
-They are comparison columns, not goals: nothing in the engine is tuned for WebAssembly.
+Both are 32-bit modules, so the comparison is like for like.
 
-## Why silkjs is a 64-bit module
+## Why silkjs is a 32-bit module
 
-The engine's heap layout assumes 64-bit words (a four-word `RawBuffer` prefix, 16-byte values
-and slot pairs, 64-bit sentinels), so it does not run on `wasm32`. It type-checks there after
-small fixes, then traps on its first layout assertion. `wasm64` needs no layout change. The
-cost is that a 64-bit memory cannot use guard pages, so the runtime checks the bounds of every
-load and store; QuickJS on `wasm32` pays none of that. On Richards, turning off wasmtime's
-Spectre masking of those checks alone took silkjs from 337 to 516.
+A 64-bit WebAssembly memory cannot use guard pages, so the runtime checks the bounds of every
+load and store. The same engine built for `wasm64-unknown-unknown` scored 445 on Richards
+against 839 for this build. On a 32-bit target the engine keeps its 16-byte values and slot
+pairs; pointers, lengths and the `RawBuffer` prefix are the parts that shrink.
 
 ## Build
 
