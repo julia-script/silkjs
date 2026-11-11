@@ -941,6 +941,7 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
     delete globalThis.CloseEvent;
   }
   if (host.experimentalWebStorage) internalRequire('internal/web/storage').install(globalThis, { localStorageFile: host.localStorageFile });
+  if (host.experimentalStreamIter) { internalRequire('fs/promises'); internalRequire('internal/fs_iter').install(); }
   if (workerThreads.isMainThread) internalRequire('internal/trace_events').initialize(host.traceOptions);
   if (workerThreads.isMainThread && host.traceSigint) internalRequire('util').setTraceSigInt(true);
   if (process.env.NODE_COMPILE_CACHE) internalRequire('internal/compile_cache').initialize();

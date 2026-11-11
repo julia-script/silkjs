@@ -1,131 +1,490 @@
 'use strict';
+// fs/promises after Node's lib/internal/fs/promises.js (v24): the same validation, the
+// FileHandle with its reference count, close promise and lock, and readFile/writeFile on
+// a handle. The work goes to the native submitIO operations as Promise requests.
 const fs = require('fs');
 const c = require('internal/fs_core');
+const p = require('path');
 const { EventEmitter } = require('events');
+const { Buffer } = require('buffer');
+const v = c.v;
+const { AbortError, codes: { ERR_FS_EISDIR, ERR_FS_FILE_TOO_LARGE, ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_INVALID_STATE, ERR_METHOD_NOT_IMPLEMENTED, ERR_OUT_OF_RANGE } } = require('internal/errors');
+const { validateAbortSignal, validateBoolean, validateInteger, validateObject, validateOneOf, kValidateObjectAllowNullable } = v;
+const { constants, kRef, kUnref, makeStats, makeStatFs, Dirent } = c;
 const promises = module.exports;
-function invoke(name, args, requestKind = 1) { return new Promise((resolve, reject) => { fs[name](...args, c.promiseCallback((err, value) => err ? reject(err) : resolve(value), requestKind)); }); }
-for (const name of ['access', 'appendFile', 'chmod', 'chown', 'copyFile', 'cp', 'lchmod', 'lchown', 'link', 'lstat', 'lutimes', 'mkdir', 'mkdtemp', 'readdir', 'readFile', 'readlink', 'realpath', 'rename', 'rm', 'rmdir', 'stat', 'statfs', 'symlink', 'truncate', 'unlink', 'utimes', 'writeFile']) promises[name] = (...args) => invoke(name, args);
-// Node's directory API adapts the callback request rather than FSReqPromise.
-promises.opendir = (...args) => invoke('opendir', args, 0);
-promises.constants = fs.constants;
-promises.glob = async function* glob(pattern, options) { yield* new (require('internal/fs_glob').Glob)(pattern, options).glob(); };
-function badFd(operation) { return c.error('EBADF', operation); }
+const kMaxUserId = 2 ** 32 - 1;
+const kIoMaxLength = 2 ** 31 - 1;
+const kReadFileBufferLength = 512 * 1024;
+const kReadFileUnknownBufferLength = 64 * 1024;
+const kWriteFileMaxChunkSize = 512 * 1024;
+const kRefs = Symbol('kRefs');
+const kFd = Symbol('kFd');
+const kClosePromise = Symbol('kClosePromise');
+const kCloseResolve = Symbol('kCloseResolve');
+const kCloseReject = Symbol('kCloseReject');
+const kCloseReason = Symbol('kCloseReason');
+const kCloseSync = Symbol('kCloseSync');
+const kLocked = Symbol('kLocked');
+const invalidState = (message, Base = Error) => new (Base === Error ? ERR_INVALID_STATE : ERR_INVALID_STATE[Base.name])(message);
+
+// One native request with Promise ownership (requestKind 1), or 2 for a FileHandle close.
+function binding(operation, args, requestKind = 1) {
+  return new Promise((resolve, reject) => { c.submit(operation, args, c.promiseCallback((err, value) => err ? reject(err) : resolve(value), requestKind)); });
+}
+function aggregateTwoErrors(inner, outer) {
+  if (inner && outer && inner !== outer) {
+    if (Array.isArray(outer.errors)) { outer.errors.push(inner); return outer; }
+    const error = new AggregateError([outer, inner], outer.message);
+    error.code = outer.code; return error;
+  }
+  return inner || outer;
+}
+function checkAborted(signal) { if (signal?.aborted) throw new AbortError(undefined, { cause: signal?.reason }); }
+
 class FileHandle extends EventEmitter {
-  constructor(fd) { super(); this._fd = fd; this._active = 0; this._closing = false; this._closePromise = null; this._finishClose = null; this._webStream = false; }
-  get fd() { return this._fd; }
-  _retain(operation) { if (this._fd < 0 || this._closing) throw badFd(operation); this._active++; return this._fd; }
-  _release() { this._active--; if (this._active === 0 && this._finishClose) { const finish = this._finishClose; this._finishClose = null; finish(); } }
-  _call(name, args, map) {
-    return new Promise((resolve, reject) => {
-      let fd; try { fd = this._retain(name); } catch (e) { reject(e); return; }
-      try { fs[name](fd, ...args, c.promiseCallback((err, ...values) => { this._release(); if (err) reject(err); else { try { resolve(map ? map(values) : values[0]); } catch (e) { reject(e); } } })); }
-      catch (e) { this._release(); reject(e); }
-    });
+  #brandCheck = undefined;
+  static isFileHandle(value) { return value != null && typeof value === 'object' && #brandCheck in value; }
+  constructor(fd) {
+    super();
+    this[kFd] = fd === undefined ? -1 : fd;
+    this[kRefs] = 1;
+    this[kClosePromise] = null;
   }
-  close() {
-    if (this._closePromise) return this._closePromise;
-    if (this._fd < 0) return Promise.resolve();
-    this._closing = true;
-    this._closePromise = new Promise((resolve, reject) => {
-      const finish = () => {
-        const fd = this._fd; this._fd = -1;
-        try { fs.close(fd, c.promiseCallback(err => { this.emit('close'); if (err) reject(err); else resolve(); }, 2)); }
-        catch (e) { this.emit('close'); reject(e); }
-      };
-      if (this._active) this._finishClose = finish; else finish();
-    });
-    return this._closePromise;
+  getAsyncId() { return -1; }
+  get fd() { return this[kFd]; }
+  appendFile(data, options) { return fsCall(writeFile, this, data, options); }
+  chmod(mode) { return fsCall(fchmod, this, mode); }
+  chown(uid, gid) { return fsCall(fchown, this, uid, gid); }
+  datasync() { return fsCall(fdatasync, this); }
+  sync() { return fsCall(fsync, this); }
+  read(buffer, offset, length, position) { return fsCall(read, this, buffer, offset, length, position); }
+  readv(buffers, position) { return fsCall(readv, this, buffers, position); }
+  readFile(options) { return fsCall(readFile, this, options); }
+  readLines(options = undefined) {
+    return new (require('readline').Interface)({ input: this.createReadStream(options), crlfDelay: Infinity });
   }
-  appendFile(data, options) { return this._call('appendFile', [data, options]); }
-  chmod(mode) { return this._call('fchmod', [mode]); }
-  chown(uid, gid) { return this._call('fchown', [uid, gid]); }
-  datasync() { return this._call('fdatasync', []); }
-  read(...args) { return this._call('read', args, values => ({ bytesRead: values[0], buffer: values[1] })); }
-  readv(buffers, position) { return this._call('readv', [buffers, position], values => ({ bytesRead: values[0], buffers: values[1] })); }
-  readFile(options) { return this._call('readFile', [options]); }
-  stat(options) { return this._call('fstat', [options]); }
-  sync() { return this._call('fsync', []); }
-  truncate(length = 0) { return this._call('ftruncate', [length]); }
-  utimes(atime, mtime) { return this._call('futimes', [atime, mtime]); }
-  write(...args) { return this._call('write', args, values => ({ bytesWritten: values[0], buffer: values[1] })); }
-  writev(buffers, position) { return this._call('writev', [buffers, position], values => ({ bytesWritten: values[0], buffers: values[1] })); }
-  writeFile(data, options) { return this._call('writeFile', [data, options]); }
-  _stream(reading, options) {
-    const fd = this._retain(reading ? 'read' : 'write');
-    const o = c.options(options); const autoClose = o.autoClose !== false; let released = false;
-    const release = () => { if (!released) { released = true; this._release(); } };
-    const adapter = Object.create(fs);
-    adapter.close = (_fd, callback) => { release(); this.close().then(() => callback(null), callback); };
-    try {
-      const stream = reading ? fs.createReadStream(undefined, Object.assign(o, { fd, fs: adapter })) : fs.createWriteStream(undefined, Object.assign(o, { fd, fs: adapter }));
-      if (!autoClose) { stream.once(reading ? 'end' : 'finish', release); stream.once('error', release); stream.once('close', release); }
-      return stream;
-    } catch (e) { release(); throw e; }
+  stat(options) { return fsCall(fstat, this, options); }
+  truncate(len = 0) { return fsCall(ftruncate, this, len); }
+  utimes(atime, mtime) { return fsCall(futimes, this, atime, mtime); }
+  write(buffer, offset, length, position) { return fsCall(write, this, buffer, offset, length, position); }
+  writev(buffers, position) { return fsCall(writev, this, buffers, position); }
+  writeFile(data, options) { return fsCall(writeFile, this, data, options); }
+  close = () => {
+    if (this[kFd] === -1) return Promise.resolve();
+    if (this[kClosePromise]) return this[kClosePromise];
+    this[kRefs]--;
+    if (this[kRefs] === 0) {
+      const fd = this[kFd]; this[kFd] = -1;
+      this[kClosePromise] = binding('close', [fd], 2).finally(() => { this[kClosePromise] = undefined; });
+    } else {
+      this[kClosePromise] = new Promise((resolve, reject) => { this[kCloseResolve] = resolve; this[kCloseReject] = reject; })
+        .finally(() => { this[kClosePromise] = undefined; this[kCloseReject] = undefined; this[kCloseResolve] = undefined; });
+    }
+    this.emit('close');
+    return this[kClosePromise];
+  };
+  [kCloseSync]() {
+    if (this[kFd] === -1) return;
+    if (this[kClosePromise]) throw invalidState('The FileHandle is closing');
+    const fd = this[kFd]; this[kFd] = -1;
+    fs.closeSync(fd);
+    this.emit('close');
   }
-  createReadStream(options) { return this._stream(true, options); }
-  createWriteStream(options) { return this._stream(false, options); }
-  readLines(options) {
-    options = c.options(options);
-    return require('readline').createInterface({ input: this.createReadStream(options), crlfDelay: options.crlfDelay === undefined ? Infinity : options.crlfDelay, terminal: false });
-  }
-  readableWebStream(options) {
-    options = c.options(options);
-    if (this._webStream) { const e = new Error('A readable stream has already been created for this FileHandle'); e.code = 'ERR_INVALID_STATE'; throw e; }
-    if (this._fd < 0 || this._closing) throw badFd('read');
-    const { ReadableStream } = require('stream/web'); this._webStream = true;
-    const handle = this;
-    return new ReadableStream({
+  async [Symbol.asyncDispose]() { await this.close(); }
+  readableWebStream(options = {}) {
+    if (this[kFd] === -1) throw invalidState('The FileHandle is closed');
+    if (this[kClosePromise]) throw invalidState('The FileHandle is closing');
+    if (this[kLocked]) throw invalidState('The FileHandle is locked');
+    this[kLocked] = true;
+    validateObject(options, 'options');
+    const { type = 'bytes', autoClose = false } = options;
+    validateBoolean(autoClose, 'options.autoClose');
+    if (type !== 'bytes') process.emitWarning('A non-"bytes" options.type has no effect. A byte-oriented steam is always created.', 'ExperimentalWarning');
+    const readFn = this.read.bind(this);
+    const ondone = async () => { this[kUnref](); if (autoClose) await this.close(); };
+    const { ReadableStream } = require('stream/web');
+    const readable = new ReadableStream({
       type: 'bytes',
+      autoAllocateChunkSize: 16384,
       async pull(controller) {
-        try {
-          const buffer = c.Buffer.alloc(65536); const result = await handle.read(buffer, 0, buffer.length, null);
-          if (result.bytesRead === 0) { controller.close(); if (controller.byobRequest) controller.byobRequest.respond(0); if (options.autoClose) await handle.close(); }
-          else controller.enqueue(new Uint8Array(buffer.buffer, buffer.byteOffset, result.bytesRead));
-        } catch (e) { controller.error(e); if (options.autoClose) await handle.close(); }
+        const view = controller.byobRequest.view;
+        const { bytesRead } = await readFn(view, 0, view.byteLength);
+        if (bytesRead === 0) { controller.close(); await ondone(); }
+        controller.byobRequest.respond(bytesRead);
       },
-      async cancel() { if (options.autoClose) await handle.close(); }
+      async cancel() { await ondone(); },
     });
+    this[kRef]();
+    this.once('close', () => { readable.cancel().catch(() => {}); });
+    return readable;
+  }
+  createReadStream(options = undefined) { return new (require('internal/fs_streams').ReadStream)(undefined, { ...options, fd: this }); }
+  createWriteStream(options = undefined) { return new (require('internal/fs_streams').WriteStream)(undefined, { ...options, fd: this }); }
+  [kRef]() { this[kRefs]++; }
+  [kUnref]() {
+    this[kRefs]--;
+    if (this[kRefs] === 0) {
+      const fd = this[kFd]; this[kFd] = -1;
+      binding('close', [fd], 2).then(this[kCloseResolve], this[kCloseReject]);
+    }
   }
 }
-if (Symbol.asyncDispose) FileHandle.prototype[Symbol.asyncDispose] = FileHandle.prototype.close;
 // http2 respondWithFD() accepts a FileHandle as well as a descriptor.
 c.FileHandle = FileHandle;
-promises.open = async function open(path, flags = 'r', mode) { return new FileHandle(await invoke('open', [path, flags, mode])); };
-// FileHandle overloads remain owned by the handle; a borrowed numeric descriptor
-// is not accepted by fs/promises readFile/writeFile in place of a path.
-for (const name of ['readFile', 'writeFile', 'appendFile']) promises[name] = async function(path, ...args) {
-  if (path instanceof FileHandle) return path[name](...args);
-  return invoke(name, [c.path(path), ...args]);
-};
-promises.mkdtempDisposable = async function mkdtempDisposable(prefix, options) {
-  const path = await promises.mkdtemp(prefix, options); let removal;
-  const result = { path, remove() { if (!removal) removal = promises.rm(path, { recursive: true, force: true }); return removal; } };
-  if (Symbol.asyncDispose) result[Symbol.asyncDispose] = result.remove;
-  return result;
-};
-promises.watch = function watch(filename, options) {
-  options = c.options(options, { maxQueue: 2048, overflow: 'ignore' }); c.integer(options.maxQueue, 'maxQueue', 1);
-  if (options.overflow !== 'ignore' && options.overflow !== 'throw') throw c.invalid('overflow', 'ignore or throw');
-  const queue = []; const waiting = []; let done = false; let failure; let watcher;
-  function finish(error) { if (done) return; done = true; failure = error; if (watcher) watcher.close(); if (options.signal) options.signal.removeEventListener('abort', abort); while (waiting.length) { const next = waiting.shift(); if (error) next.reject(error); else next.resolve({ done: true, value: undefined }); } }
-  function abort() { const e = new Error('The operation was aborted', { cause: options.signal.reason }); e.name = 'AbortError'; e.code = 'ABORT_ERR'; finish(e); }
-  if (options.signal && options.signal.aborted) abort();
-  else {
-    watcher = fs.watch(filename, options, (eventType, filename) => {
-      if (done) return;
-      const value = { eventType, filename };
-      if (waiting.length) waiting.shift().resolve({ done: false, value });
-      else if (queue.length < options.maxQueue) queue.push(value);
-      else if (options.overflow === 'throw') { const e = new Error('Filesystem watch event queue overflow'); e.code = 'ERR_FS_WATCH_QUEUE_OVERFLOW'; finish(e); }
-      else if (typeof process !== 'undefined' && process.emitWarning) process.emitWarning('Filesystem watch event queue overflow; events dropped');
-    });
-    watcher.on('error', finish); watcher.on('close', () => finish());
-    if (options.signal) options.signal.addEventListener('abort', abort, { once: true });
+require('internal/fs_iter').register(FileHandle, { kFd, kLocked, kRef, kUnref, kClosePromise, kCloseSync, invalidState });
+
+async function fsCall(fn, handle, ...args) {
+  if (!FileHandle.isFileHandle(handle)) throw new ERR_INVALID_ARG_TYPE('handle', 'FileHandle', handle);
+  if (handle.fd === -1) {
+    const err = new Error(handle[kCloseReason] ?? 'file closed');
+    err.code = 'EBADF'; err.syscall = fn.name;
+    throw err;
   }
-  return {
-    [Symbol.asyncIterator]() { return this; },
-    next() { if (failure) return Promise.reject(failure); if (done) return Promise.resolve({ done: true, value: undefined }); if (queue.length) return Promise.resolve({ done: false, value: queue.shift() }); return new Promise((resolve, reject) => waiting.push({ resolve, reject })); },
-    return() { finish(); queue.length = 0; return Promise.resolve({ done: true, value: undefined }); },
-    throw(error) { finish(error); return Promise.reject(error); }
-  };
-};
+  try { handle[kRef](); return await fn(handle, ...args); }
+  finally { handle[kUnref](); }
+}
+async function handleFdClose(fileOpPromise, closeFunc) {
+  return fileOpPromise.then(result => closeFunc().then(() => result), opError => closeFunc().then(() => Promise.reject(opError), closeError => Promise.reject(aggregateTwoErrors(closeError, opError))));
+}
+async function handleFdSync(fileOpPromise, handle) {
+  return fileOpPromise.then(result => handle.sync().then(() => result, syncError => Promise.reject(syncError)), opError => Promise.reject(opError));
+}
+function isIterable(obj) { return obj != null && (typeof obj[Symbol.iterator] === 'function' || typeof obj[Symbol.asyncIterator] === 'function'); }
+function isCustomIterable(obj) { return isIterable(obj) && !ArrayBuffer.isView(obj) && typeof obj !== 'string'; }
+async function writeFileHandle(filehandle, data, signal, encoding) {
+  checkAborted(signal);
+  if (isCustomIterable(data)) {
+    for await (const buf of data) {
+      checkAborted(signal);
+      const toWrite = ArrayBuffer.isView(buf) ? buf : Buffer.from(buf, encoding || 'utf8');
+      let remaining = toWrite.byteLength;
+      while (remaining > 0) {
+        const writeSize = Math.min(kWriteFileMaxChunkSize, remaining);
+        const { bytesWritten } = await write(filehandle, toWrite, toWrite.byteLength - remaining, writeSize);
+        remaining -= bytesWritten;
+        checkAborted(signal);
+      }
+    }
+    return;
+  }
+  data = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  let remaining = data.byteLength;
+  if (remaining === 0) return;
+  do {
+    checkAborted(signal);
+    const { bytesWritten } = await write(filehandle, data, 0, Math.min(kWriteFileMaxChunkSize, data.byteLength));
+    remaining -= bytesWritten;
+    data = new Uint8Array(data.buffer, data.byteOffset + bytesWritten, data.byteLength - bytesWritten);
+  } while (remaining > 0);
+}
+function validateReadFileBufferOptions(options) {
+  const { buffer } = options;
+  if (buffer !== undefined && typeof buffer !== 'function' && !ArrayBuffer.isView(buffer)) throw new ERR_INVALID_ARG_TYPE('options.buffer', ['Buffer', 'TypedArray', 'DataView', 'Function'], buffer);
+}
+function getReadFileBuffer(options, size) {
+  let { buffer } = options;
+  if (typeof buffer === 'function') { buffer = options.buffer(size); v.validateBuffer(buffer, 'options.buffer()'); }
+  if (buffer === undefined) return undefined;
+  if (!Buffer.isBuffer(buffer)) buffer = Buffer.from(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+  if (size > buffer.byteLength) throw new ERR_INVALID_ARG_VALUE(typeof options.buffer === 'function' ? 'options.buffer().byteLength' : 'options.buffer.byteLength', buffer.byteLength, `is smaller than the file size of ${size} bytes`);
+  return buffer;
+}
+async function readFileHandleWithUserBuffer(filehandle, options, size) {
+  const signal = options?.signal; const encoding = options?.encoding;
+  const buffer = getReadFileBuffer(options, size);
+  const byteLengthName = typeof options.buffer === 'function' ? 'options.buffer().byteLength' : 'options.buffer.byteLength';
+  let totalRead = 0;
+  while (totalRead < buffer.byteLength) {
+    checkAborted(signal);
+    const length = size === 0 ? buffer.byteLength - totalRead : Math.min(size - totalRead, kReadFileBufferLength);
+    const bytesRead = (await binding('read', [filehandle.fd, buffer, totalRead, length, null])) ?? 0;
+    totalRead += bytesRead;
+    if (bytesRead === 0 || totalRead === size) { const result = buffer.subarray(0, totalRead); return encoding ? result.toString(encoding) : result; }
+  }
+  if (size === 0) {
+    checkAborted(signal);
+    const extraBuffer = Buffer.allocUnsafeSlow(1);
+    const bytesRead = (await binding('read', [filehandle.fd, extraBuffer, 0, 1, null])) ?? 0;
+    if (bytesRead !== 0) throw new ERR_INVALID_ARG_VALUE(byteLengthName, buffer.byteLength, 'is too small to contain the entire file');
+  }
+  return encoding ? buffer.toString(encoding) : buffer.subarray(0, totalRead);
+}
+async function readFileHandle(filehandle, options) {
+  const signal = options?.signal; const encoding = options?.encoding;
+  const decoder = encoding && new (require('string_decoder').StringDecoder)(encoding);
+  checkAborted(signal);
+  const statFields = await binding('fstat', [filehandle.fd, { bigint: false }]);
+  checkAborted(signal);
+  let size = 0; let length = 0;
+  if ((statFields.mode & 0o170000) === 0o100000) { size = statFields.size; length = encoding ? Math.min(size, kReadFileBufferLength) : size; }
+  if (length === 0) length = kReadFileUnknownBufferLength;
+  if (size > kIoMaxLength) throw new ERR_FS_FILE_TOO_LARGE(size);
+  if (options.buffer !== undefined) return readFileHandleWithUserBuffer(filehandle, options, size);
+  let totalRead = 0; const noSize = size === 0;
+  let buffer = Buffer.allocUnsafeSlow(length);
+  let result = ''; let offset = 0; let buffers;
+  const chunkedRead = length > kReadFileBufferLength;
+  for (;;) {
+    checkAborted(signal);
+    if (chunkedRead) length = Math.min(size - totalRead, kReadFileBufferLength);
+    const bytesRead = (await binding('read', [filehandle.fd, buffer, offset, length, null])) ?? 0;
+    totalRead += bytesRead;
+    if (bytesRead === 0 || totalRead === size || (bytesRead !== buffer.length && !chunkedRead && !noSize)) {
+      const singleRead = bytesRead === totalRead;
+      const bytesToCheck = chunkedRead ? totalRead : bytesRead;
+      if (bytesToCheck !== buffer.length) buffer = buffer.subarray(0, bytesToCheck);
+      if (!encoding) {
+        if (noSize && !singleRead) { buffers.push(buffer); return Buffer.concat(buffers, totalRead); }
+        return buffer;
+      }
+      if (singleRead) return buffer.toString(encoding);
+      result += decoder.end(buffer);
+      return result;
+    }
+    const readBuffer = bytesRead !== buffer.length ? buffer.subarray(0, bytesRead) : buffer;
+    if (encoding) result += decoder.write(readBuffer);
+    else if (size !== 0) offset = totalRead;
+    else { buffers ??= []; buffers.push(readBuffer); buffer = Buffer.allocUnsafeSlow(kReadFileUnknownBufferLength); }
+  }
+}
+
+async function access(path, mode = constants.F_OK) {
+  path = c.path(path);
+  if (mode == null) mode = constants.F_OK; else validateInteger(mode, 'mode', 0, 7);
+  return binding('access', [path, mode]);
+}
+async function cp(src, dest, options) {
+  const { validateCpOptions, cpFn } = require('internal/fs_cp');
+  options = validateCpOptions(options);
+  src = c.path(src, 'src'); dest = c.path(dest, 'dest');
+  return cpFn(src, dest, options);
+}
+async function copyFile(src, dest, mode) {
+  src = c.path(src, 'src'); dest = c.path(dest, 'dest');
+  if (mode == null) mode = 0; else validateInteger(mode, 'mode', 0, 7);
+  return binding('copyFile', [src, dest, mode]);
+}
+async function open(path, flags, mode) {
+  path = c.path(path);
+  const flagsNumber = c.flags(flags);
+  mode = c.mode(mode, 0o666);
+  return new FileHandle(await binding('open', [path, flagsNumber, mode]));
+}
+async function read(handle, bufferOrParams, offset, length, position) {
+  let buffer = bufferOrParams;
+  if (!ArrayBuffer.isView(buffer)) {
+    if (bufferOrParams !== undefined) validateObject(bufferOrParams, 'options', kValidateObjectAllowNullable);
+    ({ buffer = Buffer.alloc(16384), offset = 0, length = buffer.byteLength - offset, position = null } = bufferOrParams ?? {});
+    v.validateBuffer(buffer);
+  }
+  if (offset !== null && typeof offset === 'object') ({ offset = 0, length = buffer.byteLength - offset, position = null } = offset);
+  if (offset == null) offset = 0; else validateInteger(offset, 'offset', 0);
+  length ??= buffer.byteLength - offset;
+  length |= 0;
+  position = c.position(position, 'position', length);
+  if (length === 0) return { __proto__: null, bytesRead: length, buffer };
+  if (buffer.byteLength === 0) throw new ERR_INVALID_ARG_VALUE('buffer', buffer, 'is empty and cannot be written');
+  c.validateOffsetLengthRead(offset, length, buffer.byteLength);
+  const bytesRead = (await binding('read', [handle.fd, buffer, offset, length, position])) || 0;
+  return { __proto__: null, bytesRead, buffer };
+}
+async function readv(handle, buffers, position) {
+  c.bufferArray(buffers);
+  if (typeof position !== 'number') position = null;
+  const bytesRead = (await binding('readv', [handle.fd, buffers, position])) || 0;
+  return { __proto__: null, bytesRead, buffers };
+}
+function validateEncoding(data, encoding) {
+  const normalized = Buffer.isEncoding(encoding) ? String(encoding).toLowerCase() : encoding;
+  if (normalized === 'hex' && data.length % 2 !== 0) throw new ERR_INVALID_ARG_VALUE('encoding', encoding, `is invalid for data of length ${data.length}`);
+}
+async function write(handle, buffer, offsetOrOptions, length, position) {
+  if (buffer?.byteLength === 0) return { __proto__: null, bytesWritten: 0, buffer };
+  let offset = offsetOrOptions;
+  if (ArrayBuffer.isView(buffer)) {
+    if (typeof offset === 'object') ({ offset = 0, length = buffer.byteLength - offset, position = null } = offsetOrOptions ?? {});
+    if (offset == null) offset = 0; else validateInteger(offset, 'offset', 0);
+    if (typeof length !== 'number') length = buffer.byteLength - offset;
+    if (typeof position !== 'number') position = null;
+    c.validateOffsetLengthWrite(offset, length, buffer.byteLength);
+    const bytesWritten = (await binding('write', [handle.fd, buffer, offset, length, position])) || 0;
+    return { __proto__: null, bytesWritten, buffer };
+  }
+  c.validateStringAfterArrayBufferView(buffer, 'buffer');
+  validateEncoding(buffer, length);
+  // A string: offset is the position, length the encoding.
+  const bytes = Buffer.from(buffer, typeof length === 'string' ? length : 'utf8');
+  const bytesWritten = (await binding('write', [handle.fd, bytes, 0, bytes.byteLength, typeof offset === 'number' ? offset : null])) || 0;
+  return { __proto__: null, bytesWritten, buffer };
+}
+async function writev(handle, buffers, position) {
+  c.bufferArray(buffers);
+  if (typeof position !== 'number') position = null;
+  if (buffers.length === 0) return { __proto__: null, bytesWritten: 0, buffers };
+  const bytesWritten = (await binding('writev', [handle.fd, buffers, position])) || 0;
+  return { __proto__: null, bytesWritten, buffers };
+}
+async function rename(oldPath, newPath) { return binding('rename', [c.path(oldPath, 'oldPath'), c.path(newPath, 'newPath')]); }
+async function truncate(path, len = 0) {
+  const fd = await open(path, 'r+');
+  return handleFdClose(ftruncate(fd, len), fd.close);
+}
+async function ftruncate(handle, len = 0) {
+  validateInteger(len, 'len'); len = Math.max(0, len);
+  return binding('ftruncate', [handle.fd, len]);
+}
+const defaultRmOptions = { recursive: false, force: false, retryDelay: 100, maxRetries: 0 };
+const defaultRmdirOptions = { retryDelay: 100, maxRetries: 0, recursive: false };
+function validateRmdirOptions(options, defaults = defaultRmdirOptions) {
+  if (options === undefined) return defaults;
+  validateObject(options, 'options');
+  options = { ...defaults, ...options };
+  validateBoolean(options.recursive, 'options.recursive');
+  v.validateInt32(options.retryDelay, 'options.retryDelay', 0);
+  v.validateUint32(options.maxRetries, 'options.maxRetries');
+  return options;
+}
+async function rm(path, options) {
+  path = c.path(path);
+  options = validateRmdirOptions(options, defaultRmOptions);
+  validateBoolean(options.force, 'options.force');
+  let info;
+  try { info = await lstat(path); } catch (err) { if (options.force && err.code === 'ENOENT') return; throw err; }
+  if (info.isDirectory() && !options.recursive) throw new ERR_FS_EISDIR({ code: 'EISDIR', message: 'is a directory', path, syscall: 'rm', errno: 21 });
+  return binding('rm', [path, options]);
+}
+let recursiveRmdirWarned;
+async function rmdir(path, options) {
+  path = c.path(path);
+  options = validateRmdirOptions(options);
+  if (options.recursive) {
+    if (recursiveRmdirWarned === undefined) recursiveRmdirWarned = process.noDeprecation;
+    if (!recursiveRmdirWarned) { process.emitWarning('In future versions of Node.js, fs.rmdir(path, { recursive: true }) will be removed. Use fs.rm(path, { recursive: true }) instead', 'DeprecationWarning', 'DEP0147'); recursiveRmdirWarned = true; }
+    const info = await stat(path);
+    if (info.isDirectory()) return binding('rm', [path, { ...options, force: false }]);
+  }
+  return binding('rmdir', [path, {}]);
+}
+async function fdatasync(handle) { return binding('fdatasync', [handle.fd]); }
+async function fsync(handle) { return binding('fsync', [handle.fd]); }
+async function mkdir(path, options) {
+  if (typeof options === 'number' || typeof options === 'string') options = { mode: options };
+  const { recursive = false, mode = 0o777 } = options || {};
+  path = c.path(path);
+  validateBoolean(recursive, 'options.recursive');
+  return binding('mkdir', [path, { mode: c.mode(mode, 0o777), recursive }]);
+}
+async function readdir(path, options) {
+  options = { ...c.options(options) };
+  path = c.path(path);
+  const encoding = c.encoding(options.encoding, 'utf8', true);
+  const value = await binding('readdir', [path, { ...options, encoding }]);
+  return value.map(entry => options.withFileTypes ? entry instanceof Dirent ? entry : new Dirent(c.encoded(entry.name, encoding), entry.mode, entry.parentPath === undefined ? path : entry.parentPath) : typeof entry === 'string' ? c.encoded(entry, encoding) : Buffer.from(entry));
+}
+async function readlink(path, options) {
+  options = c.options(options);
+  path = c.path(path, 'oldPath');
+  return c.encoded(await binding('readlink', [path, options]), c.encoding(options.encoding, 'utf8', true));
+}
+async function symlink(target, path, type) {
+  validateOneOf(type, 'type', ['dir', 'file', 'junction', null, undefined]);
+  target = c.path(target, 'target'); path = c.path(path);
+  return binding('symlink', [target, path, type]);
+}
+async function fstat(handle, options = { bigint: false }) {
+  return makeStats(await binding('fstat', [handle.fd, { bigint: !!options.bigint }]), !!options.bigint);
+}
+async function lstat(path, options = { bigint: false }) {
+  path = c.path(path);
+  return makeStats(await binding('lstat', [path, { bigint: !!options.bigint }]), !!options.bigint);
+}
+async function stat(path, options = { bigint: false, throwIfNoEntry: true }) {
+  const result = await binding('stat', [c.path(path), { bigint: !!options.bigint, throwIfNoEntry: options.throwIfNoEntry }]);
+  if (!options.throwIfNoEntry && result === undefined) return undefined;
+  return makeStats(result, !!options.bigint);
+}
+async function statfs(path, options = { bigint: false }) {
+  return makeStatFs(await binding('statfs', [c.path(path), { bigint: !!options.bigint }]), !!options.bigint);
+}
+async function link(existingPath, newPath) { return binding('link', [c.path(existingPath, 'existingPath'), c.path(newPath, 'newPath')]); }
+async function unlink(path) { return binding('unlink', [c.path(path)]); }
+async function fchmod(handle, mode) { mode = c.mode(mode, undefined); return binding('fchmod', [handle.fd, mode]); }
+async function chmod(path, mode) { path = c.path(path); mode = c.mode(mode, undefined); return binding('chmod', [path, mode]); }
+async function lchmod(path, mode) {
+  if (constants.O_SYMLINK === undefined) throw new ERR_METHOD_NOT_IMPLEMENTED('lchmod()');
+  const fd = await open(path, constants.O_WRONLY | constants.O_SYMLINK);
+  return handleFdClose(fchmod(fd, mode), fd.close);
+}
+function ids(uid, gid) { validateInteger(uid, 'uid', -1, kMaxUserId); validateInteger(gid, 'gid', -1, kMaxUserId); }
+async function lchown(path, uid, gid) { path = c.path(path); ids(uid, gid); return binding('lchown', [path, uid, gid]); }
+async function fchown(handle, uid, gid) { ids(uid, gid); return binding('fchown', [handle.fd, uid, gid]); }
+async function chown(path, uid, gid) { path = c.path(path); ids(uid, gid); return binding('chown', [path, uid, gid]); }
+async function utimes(path, atime, mtime) { path = c.path(path); return binding('utimes', [path, c.time(atime), c.time(mtime)]); }
+async function futimes(handle, atime, mtime) { atime = c.time(atime, 'atime'); mtime = c.time(mtime, 'mtime'); return binding('futimes', [handle.fd, atime, mtime]); }
+async function lutimes(path, atime, mtime) { return binding('lutimes', [c.path(path), c.time(atime), c.time(mtime)]); }
+async function realpath(path, options) {
+  options = c.options(options);
+  return c.encoded(await binding('realpath', [c.path(path), options]), c.encoding(options.encoding, 'utf8', true));
+}
+let warnedNonPortableTemplate = false;
+function warnOnNonPortableTemplate(template) {
+  if (!warnedNonPortableTemplate && template.endsWith('X')) {
+    process.emitWarning('mkdtemp() templates ending with X are not portable. For details see: https://nodejs.org/api/fs.html');
+    warnedNonPortableTemplate = true;
+  }
+}
+async function mkdtemp(prefix, options) {
+  options = c.options(options);
+  prefix = c.path(prefix, 'prefix');
+  warnOnNonPortableTemplate(prefix);
+  return c.encoded(await binding('mkdtemp', [prefix, options]), c.encoding(options.encoding, 'utf8', true));
+}
+async function mkdtempDisposable(prefix, options) {
+  const cwd = process.cwd();
+  const path = await mkdtemp(prefix, options);
+  const fullPath = p.resolve(cwd, typeof path === 'string' ? path : path.toString());
+  const remove = async () => { await binding('rm', [fullPath, { maxRetries: 0, recursive: true, retryDelay: 0, force: true }]); };
+  return { __proto__: null, path, remove, async [Symbol.asyncDispose]() { await remove(); } };
+}
+async function writeFile(path, data, options) {
+  options = c.options(options, { encoding: 'utf8', mode: 0o666, flag: 'w', flush: false });
+  const flag = options.flag || 'w';
+  const flush = options.flush ?? false;
+  validateBoolean(flush, 'options.flush');
+  if (!ArrayBuffer.isView(data) && !isCustomIterable(data)) {
+    c.validateStringAfterArrayBufferView(data, 'data');
+    data = Buffer.from(data, options.encoding || 'utf8');
+  }
+  validateAbortSignal(options.signal);
+  if (FileHandle.isFileHandle(path)) return writeFileHandle(path, data, options.signal, options.encoding);
+  checkAborted(options.signal);
+  const fd = await open(path, flag, options.mode);
+  let writeOp = writeFileHandle(fd, data, options.signal, options.encoding);
+  if (flush) writeOp = handleFdSync(writeOp, fd);
+  return handleFdClose(writeOp, fd.close);
+}
+async function appendFile(path, data, options) {
+  options = { ...c.options(options, { encoding: 'utf8', mode: 0o666, flag: 'a' }) };
+  options.flag ||= 'a';
+  return writeFile(path, data, options);
+}
+async function readFile(path, options) {
+  options = c.options(options, { flag: 'r' });
+  validateReadFileBufferOptions(options);
+  const flag = options.flag || 'r';
+  if (FileHandle.isFileHandle(path)) return readFileHandle(path, options);
+  checkAborted(options.signal);
+  const fd = await open(path, flag, 0o666);
+  return handleFdClose(readFileHandle(fd, options), fd.close);
+}
+function opendir(path, options) {
+  return new Promise((resolve, reject) => { fs.opendir(path, options, (err, dir) => err ? reject(err) : resolve(dir)); });
+}
+async function* glob(pattern, options) { yield* new (require('internal/fs_glob').Glob)(pattern, options).glob(); }
+Object.assign(promises, {
+  access, copyFile, cp, glob, open, opendir, rename, truncate, rm, rmdir, mkdir, readdir, readlink, symlink, lstat, stat, statfs,
+  link, unlink, chmod, lchmod, lchown, chown, utimes, lutimes, realpath, mkdtemp, mkdtempDisposable, writeFile, appendFile, readFile,
+  constants,
+});
+for (const name of ['access', 'copyFile', 'cp', 'open', 'rename', 'truncate', 'rm', 'rmdir', 'mkdir', 'readdir', 'readlink', 'symlink', 'lstat', 'stat', 'statfs', 'link', 'unlink', 'chmod', 'lchmod', 'lchown', 'chown', 'utimes', 'lutimes', 'realpath', 'mkdtemp', 'mkdtempDisposable', 'writeFile', 'appendFile', 'readFile']) Object.defineProperty(promises[name], 'name', { value: name });
+promises.watch = require('internal/fs_watch').promisesWatch;
