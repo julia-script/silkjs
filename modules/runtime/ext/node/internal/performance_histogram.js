@@ -178,10 +178,16 @@ class Histogram {
       ewmaErrorRate: this.ewmaErrorRate, percentiles: Object.fromEntries(this.percentiles) };
   }
 }
+// A bigint value must fit the int64 recorder and be at least 1, as in Node's native histogram.
+function bigintValue(value) {
+  if (value < 1n || value > maxInt64) throw error('ERR_OUT_OF_RANGE', `The value of "val" is out of range. It must be >= 1 && <= ${maxInt64}. Received ${value}n`);
+  return value;
+}
 class RecordableHistogram extends Histogram {
   record(value) {
     const s = state(this);
     if (typeof value !== 'bigint') integer(value, 'val');
+    else bigintValue(value);
     record(s, BigInt(value));
   }
   recordDelta() {
@@ -334,6 +340,10 @@ function importHistogram(bytes) {
   }
   return histogram;
 }
+const slidingWindows = new WeakSet();
+function checkSlidingWindow(value) {
+  if (!slidingWindows.has(value)) throw error('ERR_INVALID_THIS', 'Value of "this" must be of type SlidingWindowHistogram', TypeError);
+}
 class SlidingWindowHistogram {
   #options;
   #chunks;
@@ -343,7 +353,9 @@ class SlidingWindowHistogram {
   #epoch;
   #index = 0;
   #ring = new Map();
-  constructor(options) {
+  constructor(key, options) {
+    if (key !== token) throw error('ERR_ILLEGAL_CONSTRUCTOR', 'Illegal constructor', TypeError);
+    slidingWindows.add(this);
     this.#options = { lowest: options.lowest, highest: options.highest, figures: options.figures };
     this.#chunks = options.chunks;
     this.#duration = options.chunkDuration === undefined ? undefined : BigInt(options.chunkDuration) * 1000000n;
@@ -361,13 +373,16 @@ class SlidingWindowHistogram {
     }
   }
   record(value) {
+    checkSlidingWindow(this);
     if (typeof value !== 'bigint') integer(value, 'val');
+    else bigintValue(value);
     this.#rotate(true);
     let current = this.#ring.get(this.#index);
     if (!current) { current = createHistogram(this.#options); this.#ring.set(this.#index, current); }
     current.record(value); this.#attempts++;
   }
   snapshot() {
+    checkSlidingWindow(this);
     this.#rotate(false);
     const result = new Histogram(token, this.#options), target = state(result);
     for (const histogram of this.#ring.values()) {
@@ -376,7 +391,7 @@ class SlidingWindowHistogram {
     }
     return result;
   }
-  reset() { this.#ring.clear(); this.#epoch = host.nowNanoseconds(); this.#index = 0; this.#attempts = 0; }
+  reset() { checkSlidingWindow(this); this.#ring.clear(); this.#epoch = host.nowNanoseconds(); this.#index = 0; this.#attempts = 0; }
 }
 function createSlidingWindowHistogram(options) {
   if (options === null || typeof options !== 'object' || Array.isArray(options)) throw error('ERR_INVALID_ARG_TYPE', 'options must be an object', TypeError);
@@ -384,9 +399,21 @@ function createSlidingWindowHistogram(options) {
   if ((options.chunkDuration === undefined) === (options.recordsPerChunk === undefined)) throw error('ERR_INVALID_ARG_VALUE', 'Specify exactly one of chunkDuration or recordsPerChunk', TypeError);
   if (options.chunkDuration !== undefined) integer(options.chunkDuration, 'options.chunkDuration', 1, 18446744073709);
   else integer(options.recordsPerChunk, 'options.recordsPerChunk');
-  return new SlidingWindowHistogram(options);
+  return new SlidingWindowHistogram(token, options);
 }
+// A sliding window keeps its chunks private to the thread that records into it.
+host.types.isSlidingWindowHistogram = value => slidingWindows.has(value);
 Object.defineProperty(Histogram.prototype, Symbol.toStringTag, { value: 'Histogram', configurable: true });
+Object.defineProperty(Histogram.prototype, Symbol.for('nodejs.util.inspect.custom'), {
+  configurable: true, writable: true,
+  value: function inspect(depth, options) {
+    const { inspect } = require('util');
+    if (depth < 0) return this;
+    const opts = { ...options, depth: options.depth == null ? null : options.depth - 1 };
+    return `Histogram ${inspect({ min: this.min, max: this.max, mean: this.mean, exceeds: this.exceeds, stddev: this.stddev,
+      skewness: this.skewness, kurtosis: this.kurtosis, count: this.count, percentiles: this.percentiles }, opts)}`;
+  },
+});
 Object.defineProperty(RecordableHistogram.prototype, Symbol.toStringTag, { value: 'RecordableHistogram', configurable: true });
 module.exports = { createHistogram, createSlidingWindowHistogram, importHistogram, monitorEventLoopDelay,
   isRecordableHistogram: value => value instanceof RecordableHistogram };
