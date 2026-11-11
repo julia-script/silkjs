@@ -125,12 +125,12 @@ const {
   },
   genericNodeError,
 } = require('internal/errors');
-// silkjs: the runtime's postMessage does not move handles yet, so a socket or
-// server in a transferList is refused (ERR_INVALID_TRANSFER_OBJECT).
-const kDeserialize = Symbol('kDeserialize');
-const kTransfer = Symbol('kTransfer');
-const kTransferList = Symbol('kTransferList');
-function markTransferMode() {}
+const {
+  markTransferMode,
+  kDeserialize,
+  kTransfer,
+  kTransferList,
+} = require('internal/worker/js_transferable');
 const { isUint8Array } = require('util').types;
 const { kEmptyObject, promisify } = require('internal/util');
 // silkjs: guessHandleType is the handle binding's; internal/util has no isWindows.

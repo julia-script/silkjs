@@ -1,4 +1,4 @@
-// Adapted from Node.js v24.11.0 for Silk QuickJS.
+// Adapted from Node.js v24.22.1 for Silk QuickJS.
 // Copyright Joyent, Inc. and other Node contributors.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
@@ -40,7 +40,6 @@ const { AbortController, AbortSignal } = require('internal/streams/web');
 const {
   AbortError,
   codes: {
-    ERR_INVALID_ARG_VALUE,
     ERR_MISSING_ARGS,
     ERR_OUT_OF_RANGE,
   },
@@ -53,39 +52,9 @@ const {
 } = require('internal/streams/support');
 const { kResistStopPropagation } = require('internal/path_events/event_target');
 const { finished } = require('internal/streams/end-of-stream');
-const staticCompose = require('internal/streams/compose');
-const {
-  addAbortSignalNoValidate,
-} = require('internal/streams/add-abort-signal');
-const { isWritable, isNodeStream } = require('internal/streams/utils');
 
 const kEmpty = Symbol('kEmpty');
 const kEof = Symbol('kEof');
-
-function compose(stream, options) {
-  if (options != null) {
-    validateObject(options, 'options');
-  }
-  if (options?.signal != null) {
-    validateAbortSignal(options.signal, 'options.signal');
-  }
-
-  if (isNodeStream(stream) && !isWritable(stream)) {
-    throw new ERR_INVALID_ARG_VALUE('stream', stream, 'must be writable');
-  }
-
-  const composedStream = staticCompose(this, stream);
-
-  if (options?.signal) {
-    // Not validating as we already validated before
-    addAbortSignalNoValidate(
-      options.signal,
-      composedStream,
-    );
-  }
-
-  return composedStream;
-}
 
 function map(fn, options) {
   validateFunction(fn, 'fn');
@@ -304,6 +273,8 @@ async function reduce(reducer, initialValue, options) {
   }
   const ac = new AbortController();
   const signal = ac.signal;
+  // The runtime's EventTarget has no weak-handler option, so the listener is
+  // removed explicitly once the reduction settles.
   const onAbort = () => ac.abort();
   if (options?.signal) {
     const opts = { once: true, [kResistStopPropagation]: true };
@@ -327,8 +298,8 @@ async function reduce(reducer, initialValue, options) {
       throw new ReduceAwareErrMissingArgs();
     }
   } finally {
-    options?.signal?.removeEventListener('abort', onAbort);
     ac.abort();
+    options?.signal?.removeEventListener('abort', onAbort);
   }
   return initialValue;
 }
@@ -432,7 +403,6 @@ module.exports.streamReturningOperators = {
   flatMap,
   map,
   take,
-  compose,
 };
 
 module.exports.promiseReturningOperators = {

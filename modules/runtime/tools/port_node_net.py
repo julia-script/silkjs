@@ -92,11 +92,6 @@ function getInspectPort(inspectPort) {
     'lib/tty.js': [
         ("} = require('internal/tty');", "} = require('internal/tty/colors');"),
     ],
-    'lib/internal/stream_base_commons.js': [
-        ("const { FastBuffer } = require('internal/buffer');\n", ""),
-        ("      const buf = new FastBuffer(arrayBuffer, offset, nread);",
-         "      const buf = Buffer.from(arrayBuffer, offset, nread);"),
-    ],
     'lib/internal/net.js': [
         ("const { writeBuffer } = internalBinding('fs');\n",
          "const { writeSync } = require('fs');\n"),
@@ -141,18 +136,6 @@ let autoSelectFamilyAttemptTimeoutDefault;"""),
         ("const { convertIpv6StringToBuffer } = internalBinding('cares_wrap');\n",
          "// silkjs: cares_wrap's convertIpv6StringToBuffer, over the BlockList parser.\n"
          "const convertIpv6StringToBuffer = (ip) => require('internal/socketaddress').parseAddress(ip, 6);\n"),
-        ("""const {
-  markTransferMode,
-  kDeserialize,
-  kTransfer,
-  kTransferList,
-} = require('internal/worker/js_transferable');""",
-         """// silkjs: the runtime's postMessage does not move handles yet, so a socket or
-// server in a transferList is refused (ERR_INVALID_TRANSFER_OBJECT).
-const kDeserialize = Symbol('kDeserialize');
-const kTransfer = Symbol('kTransfer');
-const kTransferList = Symbol('kTransferList');
-function markTransferMode() {}"""),
         ("const { queueMicrotask } = require('internal/process/task_queues');\n", ""),
         ("""const {
   guessHandleType,

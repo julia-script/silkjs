@@ -28,6 +28,7 @@ const {
 } = require('internal/per_context/primordials');
 
 const { Buffer } = require('buffer');
+const { FastBuffer } = require('internal/buffer');
 const {
   kReadBytesOrError,
   kArrayBufferOffset,
@@ -211,7 +212,7 @@ function onStreamRead(arrayBuffer) {
       }
     } else {
       const offset = streamBaseState[kArrayBufferOffset];
-      const buf = Buffer.from(arrayBuffer, offset, nread);
+      const buf = new FastBuffer(arrayBuffer, offset, nread);
       result = stream.push(buf);
     }
     if (!result) {

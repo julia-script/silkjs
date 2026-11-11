@@ -5,6 +5,9 @@ const booleanOptions = new Map([
   ['--warnings', 'warnings'], ['--deprecation', 'deprecation'],
   ['--trace-warnings', 'traceProcessWarnings'], ['--trace-deprecation', 'traceDeprecation'],
   ['--throw-deprecation', 'throwDeprecation'], ['--pending-deprecation', 'pendingDeprecation'],
+  // Every ArrayBuffer the engine allocates is zero-filled, so Buffer's unsafe
+  // allocations already meet --zero-fill-buffers.
+  ['--zero-fill-buffers', 'zeroFillBuffers'],
   ['--abort-on-uncaught-exception', 'abortOnUncaughtException'], ['--trace-exit', 'traceExit'],
   ['--network-family-autoselection', 'networkFamilyAutoselection'],
 ]);
