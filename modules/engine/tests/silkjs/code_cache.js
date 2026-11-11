@@ -35,12 +35,23 @@ var lib = (function () {
       default: return 0;
     }
   }
+  // The prefixes of a comparison before a branch and of a loop's last test
+  // name their operands again; a decoded copy is checked against them.
+  function loops(n, m) {
+    var c = 0, i, j = n;
+    for (i = 0; i < n; i++) c += i;
+    while (j-- > 0) c++;
+    for (i = 0; i < 300; i++) if (i < m) c++;
+    do { c += 2; } while (--m >= 0);
+    return c + "/" + i + "/" + j + "/" + m;
+  }
   function where() { try { null.f(); } catch (e) { return e.stack.split("\\n")[1].trim(); } }
   return {
     bump() { return ++counter; },
     area: Shape.of(7).area,
     scoped: scoped(),
     kinds: ["cache-gamma", "cache-alpha", "other", "cache-beta"].map(kind).join(""),
+    loops: loops(5, 20),
     text: unused.toString(),
     tag: String.raw\`a\${1 + 1}b\`,
     re: /(\\d+)-(\\d+)/.exec("x 12-34")[2],
@@ -53,7 +64,7 @@ lib;
 
 function load(source) {
   const lib = std.evalScript(source);
-  return [lib.bump(), lib.bump(), lib.area, lib.scoped, lib.text, lib.tag, lib.re, lib.where(), lib.kinds].join("|");
+  return [lib.bump(), lib.bump(), lib.area, lib.scoped, lib.text, lib.tag, lib.re, lib.where(), lib.kinds, lib.loops].join("|");
 }
 
 let failed = 0;
@@ -76,6 +87,7 @@ if (os.Worker.parent) {
   check("results", expected.split("|").slice(2, 7).join("|"),
     "49|6|function unused(a, b) { return [a, b].map((v) => v + 1).join(\",\"); }|a2b|34");
   check("string switch", expected.split("|")[8], "3102");
+  check("loop tests", expected.split("|")[9], "77/300/-1/-1");
   for (let i = 2; i <= 4; i++) check(`load ${i}`, load(library), expected);
   check("edited script misses", load(library.replace("7).area", "8).area")).split("|")[2], "64");
   std.evalScript(library).later(21).then((v) => check("async function", v, 42));
