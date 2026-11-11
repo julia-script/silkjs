@@ -33,6 +33,7 @@ import js_call_host { CallHooks }
 import js_interrupt_host { InterruptHooks }
 import js_exceptions { JsException }
 import js_string_types { FlatString, StringLengthError, STRING_LENGTH_MAX, stringReference, latin1Bytes }
+import byte_buffer { readU16 }
 import js_strings { StringBuilder, Strings }
 import js_atom_data as atoms
 import js_class_data as classes
@@ -572,6 +573,56 @@ unsafe fn standardReplace<'a>(realm: Realm<'a>, receiver: ValueBits) -> bool {
     Option<*mut HeapHeader>.None => false
   }
 }
+/// standard and standardReplace for a RegExp literal the VM never materialized:
+/// whether a fresh object of shape (the realm's regexpShape) would pass both,
+/// by the layout standard() last proved. False until a materialized RegExp has
+/// filled that cache.
+unsafe fn literalStandard<'a>(realm: Realm<'a>, shape: *mut HeapHeader) -> bool {
+  let anchor = ()
+  let cache = realm.runtimeState(&anchor).regexpStandard
+  if cache.replace == u32.MAX { return false }
+  let data = unsafe HeapCell.payload<ShapeData, ()>(&anchor, shape)
+  let version = data.version let prototype = data.prototype
+  drop data
+  if version != cache.receiverVersion { return false }
+  return match Pointer.nonNullMut<HeapHeader>(prototype) {
+    Option<*mut HeapHeader>.Some { value: proto } => unsafe versionOf(proto) == cache.protoVersion &&
+      unsafe native((unsafe rawSlot(proto, u32.toUsize(cache.exec))).valueBits(), 7, 0) &&
+      unsafe nativeGetter((unsafe rawSlot(proto, u32.toUsize(cache.flags))).getter(), 3, 0) &&
+      unsafe nativeGetter((unsafe rawSlot(proto, u32.toUsize(cache.global))).getter(), 4, u32.toI32(FLAG_GLOBAL)) &&
+      unsafe nativeGetter((unsafe rawSlot(proto, u32.toUsize(cache.unicode))).getter(), 4, u32.toI32(FLAG_UNICODE)) &&
+      unsafe native((unsafe rawSlot(proto, u32.toUsize(cache.replace))).valueBits(), 11, 0)
+    Option<*mut HeapHeader>.None => false
+  }
+}
+/// `s.replace(/re/, text)` for the VM when the literal was never materialized:
+/// String.prototype.replace and every RegExp builtin it reaches are the
+/// intrinsics, so the answer is latinReplace's from lastIndex 0, which no script
+/// can observe. code is the literal's bytecode, kept alive by the caller; shape
+/// the realm's regexpShape. None declines before any effect.
+pub effect fn literalReplace<'a, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks + InterruptHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, shape: *mut HeapHeader, code: ValueBits, receiver: ValueBits,
+  replacement: ValueBits) -> Option<ValueBits> ! JsException ? &mut Allocator {
+  if receiver.tag() != -7 || replacement.tag() != -7 || code.tag() != -7 { return Option<ValueBits>.none() }
+  if !unsafe literalStandard(realm, shape) { return Option<ValueBits>.none() }
+  let anchor = ()
+  let program = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(code))
+  let flags = u16.toU32(readU16(program.latin1.asSlice(), 0))
+  drop program
+  if (flags & FLAG_NAMED_GROUPS) != 0 || contains(replacement, 36) || unsafe wideFlat(receiver) || unsafe wideFlat(replacement) {
+    return Option<ValueBits>.none()
+  }
+  let attempted = run Effect.result(latinReplace(&mut hooks, memory, realm, immediateRef(ValueBits.Undefined), code,
+    unsafe lendBits(&receiver, receiver), unsafe lendBits(&replacement, replacement), (flags & FLAG_GLOBAL) != 0,
+    (flags & FLAG_STICKY) != 0, (flags & (FLAG_UNICODE | FLAG_UNICODE_SETS)) != 0, 0))
+  return match move attempted {
+    Result<ValueBits, OutOfMemoryError | StringLengthError | JsException>.Success { value } => Option<ValueBits>.some(value)
+    Result<ValueBits, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => {
+      let _pending = run Effect.catch<JsException>(support.materialize(&mut hooks, realm, move error), core.exceptionValue)
+      fail JsException {}
+    }
+  }
+}
 /// String.prototype.replace(search, replacement) for the VM's quick call path,
 /// without the native call layers or the Symbol.replace lookup: a flat string
 /// receiver and replacement and a standard RegExp search whose Symbol.replace is
@@ -611,7 +662,7 @@ effect fn optimizedReplace<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHoo
   // A replacement without `$` is inserted as is.
   let plain = !contains(replacement.view(), 36)
   if plain && !unsafe wideFlat(string.view()) && !unsafe wideFlat(replacement.view()) {
-    return run latinReplace(&mut hooks, memory, realm, receiver, string, replacement, global, sticky, fullUnicode, lastIndex)
+    return run latinReplace(&mut hooks, memory, realm, receiver, fields.bytecode(), string, replacement, global, sticky, fullUnicode, lastIndex)
   }
   let mut nextSource: i64 = 0
   let mut builder = ReplacementBuffer.make()
@@ -671,17 +722,20 @@ unsafe fn copyAt(raw: [*]mut u8, at: usize, source: &[u8]) -> () {
 /// lastIndex: the result is gathered on the stack and becomes one compact
 /// string; a result longer than REPLACE_SCRATCH moves to a builder.
 effect fn latinReplace<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + InterruptHooks>(hooks: &mut H,
-  memory: &AllocationObserver, realm: Realm<'a>, receiver: ValueRef<'b>, string: ValueRef<'b>, replacement: ValueRef<'b>,
-  global: bool, sticky: bool, fullUnicode: bool, start: i64) -> ValueBits
+  memory: &AllocationObserver, realm: Realm<'a>, receiver: ValueRef<'b>, bytecode: ValueBits, string: ValueRef<'b>,
+  replacement: ValueRef<'b>, global: bool, sticky: bool, fullUnicode: bool, start: i64) -> ValueBits
   ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
-  let fields = support.fields(receiver)
+  // A literal the VM never materialized (literalReplace) has no receiver: its
+  // lastIndex is unobservable and is not written.
+  let indexed = receiver.view().isObject()
   let anchor = ()
   let size = Strings.length(string.view())
   let length = usize.toI64(size)
   let text = Slice.view(unsafe latin1Bytes(&anchor, stringReference(string.view())), 0, size)
   let insert = Slice.view(unsafe latin1Bytes(&anchor, stringReference(replacement.view())), 0, Strings.length(replacement.view()))
-  // The receiver keeps its bytecode alive, and nothing in the loop replaces it.
-  let program = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(fields.bytecode()))
+  // The receiver (or the literal's constant) keeps its bytecode alive, and
+  // nothing in the loop replaces it.
+  let program = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(bytecode))
   let code = program.latin1.asSlice()
   let raw = unsafe Intrinsic.stackAllocate<u8>(REPLACE_SCRATCH)
   let view = unsafe Pointer.borrowMany<(), u8>(&anchor, unsafe Intrinsic.pointerRequalify<[*]mut u8, [*]const u8>(raw), REPLACE_SCRATCH)
@@ -705,12 +759,12 @@ effect fn latinReplace<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks +
     run RegExpExecutor.literalMatches8(code, text, &mut hits)
     let count = hits.length()
     if count == 0 {
-      run execution.setLastIndex(&mut hooks, realm, receiver, 0)
+      if indexed { run execution.setLastIndex(&mut hooks, realm, receiver, 0) }
       return string.dup().intoBits()
     }
     let removed = count * literal
     if insert.length == 0 || count <= (STRING_LENGTH_MAX - (size - removed)) / insert.length {
-      run execution.setLastIndex(&mut hooks, realm, receiver, 0)
+      if indexed { run execution.setLastIndex(&mut hooks, realm, receiver, 0) }
       let total = size - removed + count * insert.length
       let mut out = List<u8>.make()
       run out.reserveExact(total + 1)
@@ -729,7 +783,7 @@ effect fn latinReplace<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks +
   }
   while true {
     if lastIndex > length {
-      if global || sticky { run execution.setLastIndex(&mut hooks, realm, receiver, 0) }
+      if indexed && (global || sticky) { run execution.setLastIndex(&mut hooks, realm, receiver, 0) }
       break
     }
     let mut first: usize = 0
@@ -737,7 +791,7 @@ effect fn latinReplace<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks +
     if literal != 0 {
       let at = RegExpExecutor.findLiteral8(code, text, i64.toUsize(lastIndex))
       if at < 0 {
-        if global || sticky { run execution.setLastIndex(&mut hooks, realm, receiver, 0) }
+        if indexed && (global || sticky) { run execution.setLastIndex(&mut hooks, realm, receiver, 0) }
         break
       }
       first = i64.toUsize(at)
@@ -745,7 +799,7 @@ effect fn latinReplace<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks +
     } else {
       let matched = run execution.matchLatin1(&mut hooks, memory, realm, code, text, i64.toUsize(lastIndex), &mut captures)
       if !matched {
-        if global || sticky { run execution.setLastIndex(&mut hooks, realm, receiver, 0) }
+        if indexed && (global || sticky) { run execution.setLastIndex(&mut hooks, realm, receiver, 0) }
         break
       }
       first = i32.toUsize(captures.get(0))
@@ -770,7 +824,7 @@ effect fn latinReplace<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks +
     }
     nextSource = end
     if !global {
-      if sticky { run execution.setLastIndex(&mut hooks, realm, receiver, usize.toI32(end)) }
+      if indexed && sticky { run execution.setLastIndex(&mut hooks, realm, receiver, usize.toI32(end)) }
       break
     }
     lastIndex = usize.toI64(end)
