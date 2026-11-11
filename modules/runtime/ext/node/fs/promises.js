@@ -131,6 +131,23 @@ class FileHandle extends EventEmitter {
 }
 // http2 respondWithFD() accepts a FileHandle as well as a descriptor.
 c.FileHandle = FileHandle;
+// Node's kTransfer/kDeserialize, used by internal/worker/clone. Workers share the
+// process's descriptor table, so the descriptor itself moves to the receiver.
+c.fileHandles = {
+  is: value => FileHandle.isFileHandle(value),
+  check(handle) {
+    if (handle[kClosePromise] || handle[kRefs] > 1 || handle[kFd] === -1) {
+      throw new (require('internal/path_events/event_target').DOMException)('Cannot transfer FileHandle while in use', 'DataCloneError');
+    }
+    return handle[kFd];
+  },
+  detach(handle) {
+    handle[kFd] = -1;
+    handle[kCloseReason] = 'The FileHandle has been transferred';
+    handle[kRefs] = 0;
+  },
+  create: fd => new FileHandle(fd),
+};
 require('internal/fs_iter').register(FileHandle, { kFd, kLocked, kRef, kUnref, kClosePromise, kCloseSync, invalidState });
 
 async function fsCall(fn, handle, ...args) {

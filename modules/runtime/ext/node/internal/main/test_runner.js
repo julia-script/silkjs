@@ -114,8 +114,10 @@ function runTestRunner(options, files, reporterNames, destinations) {
   debug('test runner configuration:', config);
   const runOptions = { ...options, concurrency: config.concurrency, timeout: config.timeout };
   delete runOptions.forceExit;
-  if (files.length) runOptions.files = files;
-  const stream = require('test').run(runOptions);
+  runOptions.globPatterns = files;
+  const { run, kIsTestRunner } = require('internal/test_runner/runner');
+  runOptions[kIsTestRunner] = true;
+  const stream = run(runOptions);
   stream.on('test:summary', summary => { if (!summary.success) process.exitCode = 1; });
   const fail = error => { console.error(error); process.exitCode = 1; };
   stream.on('error', fail);

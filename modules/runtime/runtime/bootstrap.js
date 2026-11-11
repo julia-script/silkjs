@@ -54,7 +54,9 @@ function internalRequire(request, parent = '') {
       factory = native.compileBuiltin(factory, 'node:' + request);
       factorySet(request, factory);
     }
-    factory(module, module.exports, name => internalRequire(name, request));
+    // Like Node's builtin wrapper, process is a parameter, so user code that
+    // shadows or replaces the global process cannot change what built-ins see.
+    factory(module, module.exports, name => internalRequire(name, request), process);
   }
   catch (error) { moduleDelete(request); throw error; }
   return module.exports;
@@ -98,6 +100,11 @@ host.processFeatures = {
 // Node's kFirstModuleParent: the module that first required a module, for require stacks.
 host.kFirstModuleParent = Symbol('kFirstModuleParent');
 define('internal/host', module => { module.exports = host; });
+// Like Node's, process is an instance of a constructor named process whose
+// prototype inherits from EventEmitter.prototype once events has loaded below.
+// It exists before any built-in runs, since every one of them takes it.
+const ProcessConstructor = { process: function () {} }.process;
+const process = Object.create(ProcessConstructor.prototype);
 internalRequire('internal/error_stack').install(globalThis);
 let warnedTransformTypes = false;
 host.stripTypeScriptModuleTypes = (source, filename, sourceURL = filename) => {
@@ -150,7 +157,7 @@ host.initializeRealmBuiltins = (handle, global, wasmCodeGeneration) => {
     cache.set(name, module);
     const script = native.vmCompile('(' + source + ')', 'node:' + name, handle);
     const factory = native.vmRun(script, 0, false);
-    factory(module, module.exports, load);
+    factory(module, module.exports, load, process);
     return module.exports;
   }
   load('internal/error_stack').install(global);
@@ -249,6 +256,23 @@ const completionsPending = () => completions.length !== completionHead;
 // Compound native operations finish through promises, but their public
 // callbacks are I/O completions, not microtasks. Dispatch them outside drainJobs.
 host.enqueueIOCompletion = callback => completions.push(callback);
+// Built-in modules publish to diagnostics channels through these, so a process that never
+// loads diagnostics_channel pays one property read per publish site. No channel can have a
+// subscriber before diagnostics_channel loads (it sets host.diagnosticsChannel): subscribing
+// needs its exports, and the node.diagnostics_channel trace category loads it when enabled.
+host.diagnostics = {
+  publish(name, message) {
+    const dc = host.diagnosticsChannel;
+    if (dc !== undefined && dc.hasSubscribers(name)) dc.channel(name).publish(message);
+  },
+  // The tracing channel for name, or undefined when nothing observes any of its events.
+  tracing(name) {
+    const dc = host.diagnosticsChannel;
+    if (dc === undefined) return undefined;
+    const channels = dc.tracingChannel(name);
+    return channels.hasSubscribers ? channels : undefined;
+  },
+};
 host.nextTick = (callback, ...args) => {
   if (typeof callback !== 'function') throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('callback', 'function', callback);
   ticks.push(callback, args, resource('TickObject'));
@@ -270,9 +294,23 @@ function checkCallback(callback) {
 function invoke(callback, receiver, args) {
   try { return Reflect.apply(callback, receiver, args); }
   catch (error) {
-    if (process.domain && internalRequire('domain')._handleException(error)) return;
-    internalRequire('internal/startup_controls').handleUncaught(error, 'uncaughtException');
+    try {
+      if (process.domain && internalRequire('domain')._handleException(error)) return;
+      internalRequire('internal/startup_controls').handleUncaught(error, 'uncaughtException');
+    } catch (next) {
+      if (next === error || !workerThreads.isMainThread) throw next;
+      exceptionInFatalHandler(next);
+    }
   }
+}
+// A domain error handler or uncaughtException listener that throws ends the process
+// with Node's kExceptionInFatalExceptionHandler status, without 'exit' listeners.
+function exceptionInFatalHandler(error) {
+  host.abortOnUncaughtException?.(error);
+  let text;
+  try { text = internalRequire('util').inspect(error); } catch { text = String(error); }
+  try { internalRequire('fs').writeSync(2, text + '\n'); } catch {}
+  rawStd.exit(7);
 }
 const rejections = new Map();
 const reportedRejections = new WeakMap();
@@ -340,6 +378,7 @@ const kTimerId = Symbol('timerId'), kDue = Symbol('due'), kRefed = Symbol('refed
 const TIMEOUT_MAX = 2147483647;
 let warnedNegativeNumber = false, warnedNotNumber = false;
 function timeoutDuration(after) {
+  if (after === undefined) return 1;
   after *= 1;
   if (!(after >= 1 && after <= TIMEOUT_MAX)) {
     if (after > TIMEOUT_MAX) {
@@ -509,19 +548,16 @@ host.writeText = (fd, text) => {
   return true;
 };
 host.writeStartupDiagnostic = host.stderr.write;
-globalThis.process = { platform: host.platform, env: host.env, nextTick: host.nextTick, emitWarning: value => host.stderr.write(String(value) + '\n') };
+Object.assign(process, { platform: host.platform, env: host.env, nextTick: host.nextTick, emitWarning: value => host.stderr.write(String(value) + '\n') });
+globalThis.process = process;
 const EventEmitter = internalRequire('events');
-// Like Node's, process is an instance of a constructor named process whose
-// prototype inherits from EventEmitter.prototype.
-const ProcessConstructor = { process: function () {} }.process;
 Object.setPrototypeOf(ProcessConstructor.prototype, EventEmitter.prototype);
-const process = Object.create(ProcessConstructor.prototype);
 EventEmitter.call(process);
 Object.defineProperty(process, Symbol.toStringTag, { enumerable: false, writable: true, configurable: false, value: 'process' });
 defineGlobalAccessor('process', process);
 let startTime = native.runtimeStartTime;
 const performanceMilestones = {
-  nodeStart: 0, environment: native.environmentTime - startTime,
+  nodeStart: 0, v8Start: native.engineStartTime - startTime, environment: native.environmentTime - startTime,
   bootstrapComplete: -1, loopStart: -1, loopExit: -1,
 };
 let initialNativeIdleTime = 0;
@@ -574,6 +610,14 @@ function buildConfig() {
     },
   });
 }
+// What process.exit ends with; replaceable, as in Node. --trace-exit reports the stack
+// above it and --heap-prof writes its profile here, as Node's reallyExit binding does.
+function reallyExit(code) {
+  if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushAtExit();
+  internalRequire('internal/startup_controls').traceExit(code, 0, reallyExit);
+  if (moduleHas('internal/heap_prof')) internalRequire('internal/heap_prof').finish();
+  rawStd.exit(code);
+}
 Object.assign(process, {
   argv: native.argv.slice(), argv0: native.argv[0], execArgv: [], execPath: native.osNative('execPath', []),
   version: 'v' + nodeVersion, versions: componentVersions(), config: buildConfig(),
@@ -601,7 +645,7 @@ Object.assign(process, {
     process.reallyExit(Number(process.exitCode) || 0);
   },
   // What process.exit ends with; replaceable, as in Node.
-  reallyExit(code) { if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushAtExit(); rawStd.exit(code); },
+  reallyExit,
   kill(pid, signal) {
     if (pid != (pid | 0)) throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('pid', 'number', pid);
     let number = signal;
@@ -858,6 +902,7 @@ function runtimeFlag(arg) {
   try {
     if (internalRequire('internal/permission').applyOption(arg) ||
         internalRequire('internal/startup_controls').applyOption(arg) ||
+        internalRequire('internal/heap_prof').applyOption(arg) ||
         internalRequire('internal/options').applyInspectorOption(arg)) return true;
   }
   catch (error) { cliError(error.message); return true; }
@@ -947,6 +992,8 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
   }
   internalRequire('internal/permission').initialize({ entrypoints });
   internalRequire('internal/startup_controls').initialize();
+  const heapProfileProblem = internalRequire('internal/heap_prof').start();
+  if (heapProfileProblem) return cliError(heapProfileProblem);
   if (host.enableSourceMaps || moduleHas('internal/source_maps')) process.setSourceMapsEnabled(!!host.enableSourceMaps);
   host.typeScriptMode = host.transformTypes ? 'transform' : host.stripTypes === false ? false : 'strip';
   host.initialExecArgv = process.execArgv.slice();
@@ -1003,7 +1050,7 @@ function runWorker() {
     if (arg === '--input-type') { inputType = runtimeArgs[++index]; continue; }
     if (arg.startsWith('--input-type=')) { inputType = arg.slice(13); continue; }
     if (arg === '--env-file' || arg === '--env-file-if-exists') { index++; continue; }
-    if (['--localstorage-file', '-r', '--require', '--import', '-C', '--conditions'].includes(arg) || internalRequire('internal/process_report').isValueOption(arg) || internalRequire('internal/startup_controls').isValueOption(arg) || internalRequire('internal/permission').isValueOption(arg) || internalRequire('internal/options').isInspectorValueOption(arg)) {
+    if (['--localstorage-file', '-r', '--require', '--import', '-C', '--conditions'].includes(arg) || internalRequire('internal/process_report').isValueOption(arg) || internalRequire('internal/startup_controls').isValueOption(arg) || internalRequire('internal/heap_prof').isValueOption(arg) || internalRequire('internal/permission').isValueOption(arg) || internalRequire('internal/options').isInspectorValueOption(arg)) {
       runtimeFlag((arg === '-r' ? '--require' : arg === '-C' ? '--conditions' : arg) + '=' + runtimeArgs[++index]); continue;
     }
     runtimeFlag(arg);
@@ -1133,6 +1180,8 @@ function run() {
     }
     if (['--localstorage-file=', '--require=', '--import=', '--conditions=', '--experimental-loader=', '--loader='].includes(arg) ||
         (arg.endsWith('=') && (internalRequire('internal/process_report').isValueOption(arg.slice(0, -1)) ||
+          internalRequire('internal/startup_controls').isValueOption(arg.slice(0, -1)) ||
+          internalRequire('internal/heap_prof').isValueOption(arg.slice(0, -1)) ||
           internalRequire('internal/permission').isValueOption(arg.slice(0, -1))))) return cliError(arg + ' requires an argument');
     if (runtimeFlag(arg)) { record(arg); continue; }
     if (arg === '--trace-event-categories' || arg === '--trace-event-file-pattern' || arg === '--localstorage-file' ||
@@ -1140,6 +1189,7 @@ function run() {
         arg === '--experimental-loader' || arg === '--loader' ||
         internalRequire('internal/process_report').isValueOption(arg) ||
         internalRequire('internal/startup_controls').isValueOption(arg) ||
+        internalRequire('internal/heap_prof').isValueOption(arg) ||
         internalRequire('internal/permission').isValueOption(arg) ||
         internalRequire('internal/options').isInspectorValueOption(arg) ||
         arg === '--experimental-sea-config' || arg.startsWith('--experimental-sea-config=')) {
@@ -1147,7 +1197,7 @@ function run() {
       const name = arg === '-r' ? '--require' : arg === '-C' ? '--conditions' : separator < 0 ? arg : arg.slice(0, separator);
       const value = separator < 0 ? args[++index] : arg.slice(separator + 1);
       if (value === undefined || (separator < 0 && internalRequire('internal/options').isInspectorValueOption(name) && value.startsWith('-')) ||
-          ((['--localstorage-file', '--require', '--import', '--conditions', '--experimental-loader', '--loader'].includes(name) || internalRequire('internal/process_report').isValueOption(name) || internalRequire('internal/startup_controls').isValueOption(name) || internalRequire('internal/permission').isValueOption(name)) &&
+          ((['--localstorage-file', '--require', '--import', '--conditions', '--experimental-loader', '--loader'].includes(name) || internalRequire('internal/process_report').isValueOption(name) || internalRequire('internal/startup_controls').isValueOption(name) || internalRequire('internal/heap_prof').isValueOption(name) || internalRequire('internal/permission').isValueOption(name)) &&
           (value === '' || (separator < 0 && value.startsWith('-'))))) return cliError(name + ' requires an argument');
       record(arg, ...(separator < 0 ? [value] : []));
       if (name === '--experimental-sea-config') { sea.prepare(value); return; }
@@ -1496,6 +1546,7 @@ function loop() {
   performanceMilestones.loopExit = native.now() - startTime;
   process._exiting = true; const status = Number(process.exitCode) || 0;
   process.emit('exit', status);
+  if (moduleHas('internal/heap_prof')) internalRequire('internal/heap_prof').finish();
   if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushAtExit();
   return Number(process.exitCode) || 0;
 }
@@ -1572,9 +1623,10 @@ globalThis.__silkRuntime = {
   },
   // Starts a process from a heap image: everything the bootstrap took from the
   // process that built the image is taken again from this one.
-  hydrate(argv, runtimeStartTime, environmentTime) {
+  hydrate(argv, runtimeStartTime, environmentTime, engineStartTime) {
     native.argv = argv;
     startTime = runtimeStartTime;
+    performanceMilestones.v8Start = engineStartTime - startTime;
     performanceMilestones.environment = environmentTime - startTime;
     host.performanceStartTime = startTime;
     host.performanceTimeOrigin = Date.now() - (native.now() - startTime);
