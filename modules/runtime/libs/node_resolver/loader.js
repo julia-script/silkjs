@@ -338,7 +338,11 @@ function createLoader(host, builtins) {
 
   function strictFile(filename, specifier, parent, mode, suffix, isMain) {
     if (isDirectory(filename)) {
-      if (mode === 'import') throw error('ERR_UNSUPPORTED_DIR_IMPORT', filename, parent, fileURL(filename));
+      if (mode === 'import') {
+        // Node names the directory as resolved, keeping the specifier's trailing slash.
+        const named = typeof specifier === 'string' && /\/$/.test(specifier.replace(/[?#].*$/, '')) && !filename.endsWith(path.sep) ? filename + path.sep : filename;
+        throw error('ERR_UNSUPPORTED_DIR_IMPORT', named, parent, fileURL(named));
+      }
       throw missing(specifier, parent, mode);
     }
     if (!isFile(filename)) throw missing(specifier, parent, mode, filename);
@@ -623,7 +627,8 @@ function createLoader(host, builtins) {
   function defaultResolve(specifier, context) {
     if (context.conditions !== undefined && !Array.isArray(context.conditions)) throw invalidArgValue('context.conditions', context.conditions, 'expected an array');
     const mode = context.conditions && context.conditions.includes('require') ? 'require' : 'import';
-    if (specifier.startsWith('data:')) return { url: specifier, format: dataFormat(specifier) };
+    const textImport = host.importText && context.importAttributes && context.importAttributes.type === 'text';
+    if (specifier.startsWith('data:')) return { url: specifier, format: textImport ? 'text' : dataFormat(specifier) };
     const builtin = builtinName(specifier);
     if (builtin !== null) return { url: 'node:' + builtin, format: 'builtin' };
     if (context.parentURL && !context.parentURL.startsWith('file:') && !/^[A-Za-z][A-Za-z\d+.-]*:/.test(specifier) && !path.isAbsolute(specifier)) {
@@ -634,7 +639,7 @@ function createLoader(host, builtins) {
     activeConditions = context.conditions;
     try {
       const result = resolveInternal(specifier, context.parentURL, mode, context.resolveOptions, new Set(), context.isMain);
-      return { url: asURL(result.filename), format: result.format };
+      return { url: asURL(result.filename), format: textImport ? 'text' : result.format };
     } finally { activeConditions = previous; }
   }
 
@@ -1341,15 +1346,19 @@ function createLoader(host, builtins) {
     if (host.reportDependency && (filename.startsWith('file:') || path.isAbsolute(filename))) host.reportDependency(filename);
     const mock = mockInstances.get(filename);
     if (mock) return mockESM(filename, mock);
-    let detected;
-    if (filename.startsWith('data:')) detected = dataFormat(filename);
-    else {
-      // An unknown extension is reported by the default load step, after the hooks ran.
-      try { detected = format(filename, 'import'); }
-      catch (cause) { if (cause.code !== 'ERR_UNKNOWN_FILE_EXTENSION') throw cause; }
+    let resolved = resolutions.get(filename);
+    if (!resolved) {
+      let detected;
+      if (filename.startsWith('data:')) detected = dataFormat(filename);
+      else {
+        // An unknown extension is reported by the default load step, after the hooks ran.
+        try { detected = format(filename, 'import'); }
+        catch (cause) { if (cause.code !== 'ERR_UNKNOWN_FILE_EXTENSION') throw cause; }
+      }
+      resolved = { filename, format: detected };
     }
-    const resolved = resolutions.get(filename) || { filename, format: detected };
     attributes = resolved.importAttributes || attributes || {};
+    if (host.importText && attributes.type === 'text') resolved = { ...resolved, format: 'text' };
     const loaded = pendingLoads.get(filename) || loadSource(resolved, attributes);
     pendingLoads.delete(filename);
     resolved.format = loaded.format;
