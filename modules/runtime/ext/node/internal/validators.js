@@ -78,6 +78,8 @@ function validateUint32(value, name, positive = false) { validateInteger(value, 
 const kValidateObjectAllowNullable = 1;
 const kValidateObjectAllowArray = 2;
 const kValidateObjectAllowFunction = 4;
+const kValidateObjectAllowObjects = kValidateObjectAllowArray | kValidateObjectAllowFunction;
+const kValidateObjectAllowObjectsAndNull = kValidateObjectAllowNullable | kValidateObjectAllowArray | kValidateObjectAllowFunction;
 function validateObject(value, name, options = 0) {
   if ((value === null && !(options & kValidateObjectAllowNullable)) ||
       (Array.isArray(value) && !(options & kValidateObjectAllowArray)) ||
@@ -202,6 +204,7 @@ module.exports = {
   codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_MISSING_ARGS, ERR_OUT_OF_RANGE },
   codedError, unknownSignal,
   kValidateObjectAllowNullable, kValidateObjectAllowArray, kValidateObjectAllowFunction,
+  kValidateObjectAllowObjects, kValidateObjectAllowObjectsAndNull,
   validateString, validateBoolean, validateFunction, validateNumber, validateInteger, validateInt32,
   validateUint32, validateObject, validateArray, validateOneOf, validateAbortSignal,
   isUint32, parseFileMode, validateBuffer, validateLinkHeaderValue,

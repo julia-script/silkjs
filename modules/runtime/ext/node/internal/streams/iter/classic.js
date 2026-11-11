@@ -68,7 +68,7 @@ const {
   validateObject,
 } = require('internal/streams/iter/support');
 
-const eos = require('internal/streams/end-of-stream');
+const { eos } = require('internal/streams/end-of-stream');
 const {
   addAbortSignal: addAbortSignalNoValidate,
 } = require('internal/streams/add-abort-signal');
