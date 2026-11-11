@@ -20,8 +20,10 @@ const kBindings = {
   http2: 'internal/http2/binding',
   // node_http_parser.cc: HTTPParser, ConnectionsList, methods, allMethods.
   http_parser: 'internal/http/native-parser',
+  timers: 'internal/timers_binding',
   tls_wrap: 'internal/tls/binding',
   util: 'internal/util/binding',
+  uv: 'internal/uv_binding',
 };
 
 function internalBinding(module) {
