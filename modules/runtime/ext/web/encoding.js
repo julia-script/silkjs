@@ -14,7 +14,7 @@ const decoders = new WeakMap();
 const encoders = new WeakSet();
 
 const {
-  codes: { ERR_ENCODING_INVALID_ENCODED_DATA, ERR_ENCODING_NOT_SUPPORTED, ERR_INVALID_ARG_TYPE, ERR_INVALID_THIS },
+  codes: { ERR_ENCODING_NOT_SUPPORTED, ERR_INVALID_ARG_TYPE, ERR_INVALID_THIS },
 } = require('internal/errors');
 function domString(value) {
   if (typeof value === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
@@ -115,7 +115,10 @@ class TextDecoder {
     } catch (error) {
       // The decoder's fatal error mode reports malformed input as a TypeError.
       if (decoder.fatal && error instanceof TypeError) {
-        throw new ERR_ENCODING_INVALID_ENCODED_DATA(decoder.encoding);
+        // Node's ICU decoder raises this from C++ (no errno), not through internal/errors.
+        const invalid = new TypeError(`The encoded data was not valid for encoding ${decoder.encoding}`);
+        invalid.code = 'ERR_ENCODING_INVALID_ENCODED_DATA';
+        throw invalid;
       }
       throw error;
     }
