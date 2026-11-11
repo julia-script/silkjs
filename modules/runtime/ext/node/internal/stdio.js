@@ -98,6 +98,8 @@ function install(process) {
   // whose write, listeners or pending data the text could bypass. Files and
   // POSIX terminals take synchronous writes, as their streams do; pipes and
   // sockets go through their transport, and so through the stream.
+  // What a descriptor is belongs to the process: a start from a heap image asks again.
+  host.onHydrate(() => { kinds.length = 0; });
   direct = (fd, text) => {
     const name = fd === 1 ? 'stdout' : 'stderr';
     if (fd === 1 ? stdout : stderr) return false;
