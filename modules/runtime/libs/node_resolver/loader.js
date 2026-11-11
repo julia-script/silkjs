@@ -19,8 +19,8 @@ function createLoader(host, builtins) {
   const path = host.path;
   // Node's internalModuleStat probes metadata without public fs permissions.
   // Keep this capability private; source and package JSON reads remain checked.
-  // It answers null for a path that is not there.
-  const stat = host.moduleStat;
+  // It answers a path's file type bits (mode & S_IFMT), 0 for a path that is not there.
+  const typeOf = host.moduleType;
   // Package files already read, by directory. As in Node, one is read once.
   const packages = new Map();
   // The package scope of a directory, and the node_modules lookup paths of one (callers
@@ -30,6 +30,11 @@ function createLoader(host, builtins) {
   // Real paths already found. As with Node's realpathCache, a symlink changed while the
   // program runs is not seen again.
   const realPaths = new Map();
+  // The last file tryFile found to be a regular file and not a symlink, for the realPath
+  // of the same resolution, which then needs no lstat of its own.
+  let regularFile = null;
+  // Parent filenames as given to resolve, resolved.
+  const parentNames = new Map();
   // The source format() read to tell a module from a script, for the load that follows.
   let probed = null;
   const cache = Object.create(null);
@@ -75,13 +80,11 @@ function createLoader(host, builtins) {
   }
 
   function isFile(filename) {
-    const info = stat(filename);
-    return info !== null && info.isFile();
+    return typeOf(filename, true) === 0o100000;
   }
 
   function isDirectory(filename) {
-    const info = stat(filename);
-    return info !== null && info.isDirectory();
+    return typeOf(filename, true) === 0o040000;
   }
 
   function fileURL(filename) {
@@ -113,7 +116,14 @@ function createLoader(host, builtins) {
   function parentName(parent) {
     if (parent && typeof parent === 'object') parent = parent.filename;
     if (!parent) return path.join(host.cwd(), '__silk_entry__.js');
-    return path.resolve(filesystemName(String(parent)));
+    parent = String(parent);
+    let name = parentNames.get(parent);
+    if (name !== undefined) return name;
+    const filename = filesystemName(parent);
+    name = path.resolve(filename);
+    // A relative one depends on the working directory.
+    if (path.isAbsolute(filename)) parentNames.set(parent, name);
+    return name;
   }
 
   function readPackage(directory) {
@@ -141,8 +151,13 @@ function createLoader(host, builtins) {
     if (real !== undefined) return real;
     const directory = path.dirname(filename);
     if (directory === filename || !path.isAbsolute(filename)) real = host.realpath(filename);
-    else if ((host.stat(filename, false).mode & 0o170000) === 0o120000) real = host.realpath(filename);
-    else real = path.join(realPath(directory), path.basename(filename));
+    else if (filename !== regularFile && typeOf(filename, false) === 0o120000) real = host.realpath(filename);
+    else {
+      // A real directory is normalized and the base name has no separator.
+      const base = realPath(directory);
+      real = (base.endsWith(path.sep) ? base : base + path.sep) + path.basename(filename);
+    }
+    regularFile = null;
     realPaths.set(filename, real);
     return real;
   }
@@ -167,8 +182,8 @@ function createLoader(host, builtins) {
   }
 
   function modulePaths(directory) {
-    directory = path.resolve(directory);
     let result = lookupPaths.get(directory);
+    if (result === undefined) directory = path.resolve(directory), result = lookupPaths.get(directory);
     if (result === undefined) {
       result = [];
       for (let current = directory; ;) {
@@ -263,7 +278,10 @@ function createLoader(host, builtins) {
   }
 
   function tryFile(filename) {
-    return isFile(filename) ? filename : null;
+    // An lstat answers for a regular file, and its realPath needs no other.
+    const type = typeOf(filename, false);
+    if (type === 0o100000) { regularFile = filename; return filename; }
+    return type === 0o120000 && isFile(filename) ? filename : null;
   }
 
   function tryExtensions(filename) {
@@ -431,8 +449,9 @@ function createLoader(host, builtins) {
     if (options && own(options, 'paths') && options.paths !== undefined && !Array.isArray(options.paths)) {
       throw error('ERR_INVALID_ARG_VALUE', 'The property "options.paths" must be an array');
     }
-    const parentModule = parent && typeof parent === 'object' ? parent : cache[parentName(parent)];
+    const parentObject = parent && typeof parent === 'object' ? parent : null;
     parent = parentName(parent);
+    const parentModule = parentObject || cache[parent];
     const recursion = mode + '\0' + parent + '\0' + specifier;
     if (seen.has(recursion)) throw error('ERR_INVALID_PACKAGE_TARGET', `Circular package mapping for '${specifier}' in ${parent}`);
     seen.add(recursion);
@@ -551,6 +570,7 @@ function createLoader(host, builtins) {
   }
 
   function resolve(specifier, parent, mode, attributes, options, isMain, allowAsync) {
+    regularFile = null;
     mode = mode === 'import' || mode === 'esm' ? 'import' : 'require';
     if (allowAsync === undefined) allowAsync = mode === 'import';
     if (!hooks.active(allowAsync) && !String(specifier).startsWith('data:')) {
@@ -1030,6 +1050,7 @@ function createLoader(host, builtins) {
     const modules = new Set(Object.keys(cache)), directories = new Set(packages.keys());
     const resolved = new Set(resolutions.keys()), previous = main;
     const scoped = new Set(scopes.keys()), looked = new Set(lookupPaths.keys()), reals = new Set(realPaths.keys());
+    const parents = new Set(parentNames.keys());
     try { runMain(filename); }
     finally {
       for (const key of Object.keys(cache)) if (!modules.has(key)) delete cache[key];
@@ -1037,9 +1058,11 @@ function createLoader(host, builtins) {
       for (const key of [...scopes.keys()]) if (!scoped.has(key)) scopes.delete(key);
       for (const key of [...lookupPaths.keys()]) if (!looked.has(key)) lookupPaths.delete(key);
       for (const key of [...realPaths.keys()]) if (!reals.has(key)) realPaths.delete(key);
+      for (const key of [...parentNames.keys()]) if (!parents.has(key)) parentNames.delete(key);
       for (const key of [...resolutions.keys()]) if (!resolved.has(key)) resolutions.delete(key);
       main = previous;
       probed = null;
+      regularFile = null;
     }
   }
 

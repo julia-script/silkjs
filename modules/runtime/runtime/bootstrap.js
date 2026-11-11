@@ -180,15 +180,15 @@ function statResult(result, syscall, path) {
 host.stat = (path, follow = true) =>
   statResult((follow ? rawOS.stat : rawOS.lstat)(path), follow ? 'stat' : 'lstat', path);
 // Node's resolver may probe existence without granting access to file contents.
-const moduleStat = osNamespace.stat;
-// null for a path that is not there: the resolver asks about many of those.
-host.moduleStat = path => {
-  const result = moduleStat(path);
-  if (result[1] !== 0) {
-    const code = errnoNames.get(Math.abs(result[1]));
-    if (code === 'ENOENT' || code === 'ENOTDIR') return null;
-  }
-  return statResult(result, 'stat', path);
+const moduleStat = osNamespace.stat, moduleLstat = osNamespace.lstat;
+// A path's file type bits, or 0 for a path that is not there: the resolver asks
+// about many of those.
+host.moduleType = (path, follow) => {
+  const result = (follow ? moduleStat : moduleLstat)(path);
+  if (result[1] === 0) return result[0].mode & 0o170000;
+  const code = errnoNames.get(Math.abs(result[1]));
+  if (code === 'ENOENT' || code === 'ENOTDIR') return 0;
+  throw systemError(result[1], follow ? 'stat' : 'lstat', path);
 };
 // Built-ins read the environment where it lives: nothing of it is kept here.
 const environmentHandler = {
