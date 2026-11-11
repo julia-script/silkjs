@@ -63,7 +63,8 @@ function createLoader(host, builtins) {
   const { codedError, invalidArgType, invalidArgValue } = require('internal/errors');
   function error(code, message, properties) {
     if (code === 'MODULE_NOT_FOUND') return Object.assign(new Error(message), { code }, properties);
-    const type = code === 'ERR_INVALID_ARG_TYPE' || code === 'ERR_INVALID_ARG_VALUE' || code === 'ERR_MISSING_ARGS';
+    const type = code === 'ERR_INVALID_ARG_TYPE' || code === 'ERR_INVALID_ARG_VALUE' || code === 'ERR_MISSING_ARGS' ||
+      code === 'ERR_INVALID_MODULE_SPECIFIER';
     return codedError(type ? TypeError : Error, code, message, properties);
   }
   // A package's directory as Node's package errors name it.
@@ -147,8 +148,15 @@ function createLoader(host, builtins) {
       if (!(cause instanceof SyntaxError)) throw cause;
       throw error('ERR_INVALID_PACKAGE_CONFIG', `Invalid package config ${filename}: ${cause.message}`, { path: filename, cause });
     }
-    if (data === null || typeof data !== 'object' || Array.isArray(data)) data = {};
-    const pkg = { directory, filename, data };
+    // Like Node, keep only the fields resolution reads, on a null-prototype object, so
+    // a getter on Object.prototype never stands in for a missing field.
+    const fields = Object.create(null);
+    if (data !== null && typeof data === 'object' && !Array.isArray(data)) {
+      for (let i = 0, names = ['name', 'main', 'type', 'exports', 'imports']; i < names.length; i++) {
+        if (Object.prototype.hasOwnProperty.call(data, names[i])) fields[names[i]] = data[names[i]];
+      }
+    }
+    const pkg = { directory, filename, data: fields };
     packages.set(directory, pkg);
     return pkg;
   }
@@ -272,8 +280,13 @@ function createLoader(host, builtins) {
     return { filename: identity, format: kind };
   }
 
-  function missing(specifier, parent, mode) {
-    if (mode === 'import') return error('ERR_MODULE_NOT_FOUND', `Cannot find module '${specifier}' imported from ${parent}`);
+  // In import mode Node names what it looked for: the resolved file (with its URL,
+  // which import.meta.resolve returns) or the package.
+  function missing(specifier, parent, mode, filename, packageName) {
+    if (mode === 'import') {
+      if (filename !== undefined) return error('ERR_MODULE_NOT_FOUND', `Cannot find module '${filename}' imported from ${parent}`, { url: fileURL(filename) });
+      return error('ERR_MODULE_NOT_FOUND', `Cannot find package '${packageName ?? specifier}' imported from ${parent}`);
+    }
     const stack = [];
     let current = cache[parent];
     const visited = new Set();
@@ -324,7 +337,7 @@ function createLoader(host, builtins) {
       if (mode === 'import') throw error('ERR_UNSUPPORTED_DIR_IMPORT', `Directory import '${filename}' is not supported resolving ES modules imported from ${parent}`, { url: fileURL(filename) });
       throw missing(specifier, parent, mode);
     }
-    if (!isFile(filename)) throw missing(specifier, parent, mode);
+    if (!isFile(filename)) throw missing(specifier, parent, mode, filename);
     return descriptor(filename, mode, suffix, isMain);
   }
 
@@ -336,11 +349,16 @@ function createLoader(host, builtins) {
     return error('ERR_INVALID_PACKAGE_TARGET', `Invalid "${internal ? 'imports' : 'exports'}" target ${JSON.stringify(target)} defined for '${key}' ${where}`);
   }
 
-  function invalidSegment(value) {
-    let decoded;
-    try { decoded = decodeURIComponent(value); }
-    catch (_) { return true; }
-    return /%2f|%5c/i.test(value) || decoded.split(/[\\/]/).some((part) => part === '.' || part === '..' || part.toLowerCase() === 'node_modules');
+  // Node's segment rules: ".", "..", "node_modules" (and their percent forms) are
+  // invalid; an empty segment ("//", a leading or trailing "/") is only deprecated.
+  const invalidSegmentRegEx = /(^|\\|\/)((\.|%2e)(\.|%2e)?|(n|%6e|%4e)(o|%6f|%4f)(d|%64|%44)(e|%65|%45)(_|%5f)(m|%6d|%4d)(o|%6f|%4f)(d|%64|%44)(u|%75|%55)(l|%6c|%4c)(e|%65|%45)(s|%73|%53))?(\\|\/|$)/i;
+  const deprecatedInvalidSegmentRegEx = /(^|\\|\/)((\.|%2e)(\.|%2e)?|(n|%6e|%4e)(o|%6f|%4f)(d|%64|%44)(e|%65|%45)(_|%5f)(m|%6d|%4d)(o|%6f|%4f)(d|%64|%44)(u|%75|%55)(l|%6c|%4c)(e|%65|%45)(s|%73|%53))(\\|\/|$)/i;
+  function segmentDeprecation(target, request, key, pkg, internal, parent, isTarget) {
+    if (process.noDeprecation) return;
+    const double = /[/\\][/\\]/.test(isTarget ? target : request);
+    process.emitWarning(`Use of deprecated ${double ? 'double slash' : 'leading or trailing slash matching'} resolving "${target}" for module ` +
+      `request "${request}" ${request !== key ? `matched to "${key}" ` : ''}in the "${internal ? 'imports' : 'exports'}" field module resolution of the package at ` +
+      `${packagePath(pkg)}package.json${parent ? ` imported from ${parent}` : ''}.`, 'DeprecationWarning', 'DEP0166');
   }
 
   function packageTarget(pkg, target, replacement, key, pattern, internal, parent, mode, seen) {
@@ -352,9 +370,19 @@ function createLoader(host, builtins) {
         }
         throw invalidTarget(pkg, key, target, internal, parent);
       }
-      if (invalidSegment(target.slice(2))) throw invalidTarget(pkg, key, target, internal, parent);
-      if (pattern && invalidSegment(replacement)) {
-        throw error('ERR_INVALID_MODULE_SPECIFIER', `Invalid subpath '${replacement}' for '${key}' in ${pkg.filename}`);
+      const subpath = replacement || '';
+      const request = pattern ? key.replace('*', () => subpath) : key + subpath;
+      const expandedTarget = pattern ? target.split('*').join(subpath) : target;
+      if (invalidSegmentRegEx.test(target.slice(2))) {
+        if (deprecatedInvalidSegmentRegEx.test(target.slice(2))) throw invalidTarget(pkg, key, target, internal, parent);
+        segmentDeprecation(expandedTarget, request, key, pkg, internal, parent, true);
+      }
+      if (subpath !== '' && invalidSegmentRegEx.test(subpath)) {
+        if (deprecatedInvalidSegmentRegEx.test(subpath)) {
+          throw error('ERR_INVALID_MODULE_SPECIFIER', `Invalid module "${request}" request is not a valid match in pattern "${key}" for the ` +
+            `"${internal ? 'imports' : 'exports'}" resolution of ${packagePath(pkg)}package.json${parent ? ` imported from ${parent}` : ''}`);
+        }
+        segmentDeprecation(expandedTarget, request, key, pkg, internal, parent, false);
       }
       const expanded = pattern ? target.split('*').join(replacement) : target;
       const url = fromFileURL(fileURL(pkg.directory) + '/' + expanded.slice(2));
@@ -449,7 +477,7 @@ function createLoader(host, builtins) {
     const parts = specifier.split('/');
     const scoped = specifier.startsWith('@');
     if (!parts[0] || (scoped && (!parts[1] || parts[0].length === 1)) || specifier.includes('\\') || specifier.includes('%') || specifier.startsWith('.')) {
-      throw error('ERR_INVALID_MODULE_SPECIFIER', `Invalid package name '${specifier}' imported from ${parent}`);
+      throw error('ERR_INVALID_MODULE_SPECIFIER', `Invalid module "${specifier}" is not a valid package name${parent ? ` imported from ${parent}` : ''}`);
     }
     const count = scoped ? 2 : 1;
     return { name: parts.slice(0, count).join('/'), subpath: parts.length === count ? '.' : './' + parts.slice(count).join('/') };
@@ -473,7 +501,7 @@ function createLoader(host, builtins) {
     try {
       // As in Node, a require of '#name' whose package has no "imports" looks in node_modules.
       if (specifier.startsWith('#') && (mode === 'import' || (packageScope(parent)?.data.imports ?? null) !== null)) {
-        if (specifier === '#' || specifier.endsWith('/')) throw error('ERR_INVALID_MODULE_SPECIFIER', `Invalid package imports specifier '${specifier}'`);
+        if (specifier === '#' || specifier.endsWith('/')) throw error('ERR_INVALID_MODULE_SPECIFIER', `Invalid module "${specifier}" is not a valid internal imports specifier name${parent ? ` imported from ${parent}` : ''}`);
         const pkg = packageScope(parent);
         if (!pkg) throw error('ERR_PACKAGE_IMPORT_NOT_DEFINED', `Package import specifier "${specifier}" is not defined imported from ${parent}`);
         return packageMap(pkg, pkg.data.imports, specifier, true, parent, mode, seen, isMain);
@@ -563,9 +591,9 @@ function createLoader(host, builtins) {
       }
       const found = legacyFile(candidate, true, /[\\/]$/.test(specifier));
       if (found) return descriptor(found, mode, undefined, isMain);
-      if (mode === 'import' && isDirectory(root)) throw missing(specifier, parent, mode);
+      if (mode === 'import' && isDirectory(root)) throw missing(specifier, parent, mode, undefined, root + path.sep);
     }
-    throw missing(specifier, parent, mode);
+    throw missing(specifier, parent, mode, undefined, parsed.name);
   }
 
   function conditions(mode) {
@@ -831,7 +859,7 @@ function createLoader(host, builtins) {
     }
     let filename = fileURLToPath(target);
     if (!isDirectory(filename)) {
-      if (!isFile(filename)) throw missing(specifier, parentURL.href, 'import');
+      if (!isFile(filename)) throw missing(specifier, parentURL.href, 'import', filename);
       if (!host.preserveSymlinks) filename = realPath(filename);
     }
     // An unsupported directory import retains its original URL and trailing
@@ -1169,6 +1197,7 @@ function createLoader(host, builtins) {
       return loadResolved(resolved, parent || cache[filename], false, allowAsync);
     }
     require.resolve = (specifier, options) => {
+      if (typeof specifier !== 'string') throw invalidArgType('request', 'string', specifier);
       const result = resolve(specifier, parent || filename, 'require', undefined, options, false, allowAsync);
       return result.format === 'builtin' && !specifier.startsWith('node:') ? result.filename.slice(5) : result.filename;
     };

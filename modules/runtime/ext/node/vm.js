@@ -425,6 +425,18 @@ class Module {
   }
   get identifier() { return moduleData(this).identifier; }
   get context() { return moduleData(this).context; }
+  [Symbol.for('nodejs.util.inspect.custom')](depth, options) {
+    moduleData(this);
+    if (typeof depth === 'number' && depth < 0) return this;
+    const constructor = Object.getPrototypeOf(this)?.constructor || Module;
+    const view = { __proto__: { constructor } };
+    view.status = this.status;
+    view.identifier = this.identifier;
+    view.context = this.context;
+    Object.setPrototypeOf(view, Object.getPrototypeOf(this));
+    Object.defineProperty(view, Symbol.toStringTag, { value: constructor.name, configurable: true });
+    return require('util').inspect(view, { ...options, customInspect: false });
+  }
   get status() { return moduleStatus(moduleData(this)); }
   get namespace() {
     const data = moduleData(this);

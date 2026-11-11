@@ -106,8 +106,10 @@ host.stripTypeScriptModuleTypes = (source, filename, sourceURL = filename) => {
     warnedTransformTypes = true;
     process.emitWarning('Transform Types is an experimental feature and might change at any time', 'ExperimentalWarning');
   }
-  return internalRequire('internal/typescript').stripTypeScriptModuleTypes(
-    source, filename, transform ? 'transform' : 'strip-only', transform, sourceURL);
+  // --experimental-transform-types implies --enable-source-maps unless it is turned off.
+  const mode = transform ? 'transform' : 'strip-only', sourceMap = transform && host.enableSourceMaps !== false;
+  const strip = () => internalRequire('internal/typescript').stripTypeScriptModuleTypes(source, filename, mode, sourceMap, sourceURL);
+  return moduleHas('internal/compile_cache') ? internalRequire('internal/compile_cache').transpile(source, filename, mode, sourceMap, strip) : strip();
 };
 // These ephemeron registries share brands without rooting other realms. Only
 // internal factories receive the bridge; no registry is a VM global.
@@ -518,7 +520,7 @@ Object.assign(process, {
   emitWarning: internalRequire('internal/startup_controls').emitWarning,
   setUncaughtExceptionCaptureCallback: internalRequire('internal/startup_controls').setUncaughtExceptionCaptureCallback,
   hasUncaughtExceptionCaptureCallback: internalRequire('internal/startup_controls').hasUncaughtExceptionCaptureCallback,
-  exit(code) { if (code !== undefined) process.exitCode = code; if (!process._exiting) { process._exiting = true; process.emit('exit', Number(process.exitCode) || 0); } internalRequire('internal/compile_cache').flushCompileCache(); rawStd.exit(Number(process.exitCode) || 0); },
+  exit(code) { if (code !== undefined) process.exitCode = code; if (!process._exiting) { process._exiting = true; process.emit('exit', Number(process.exitCode) || 0); } if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushAtExit(); rawStd.exit(Number(process.exitCode) || 0); },
   kill(pid, signal = 'SIGTERM') { const number = typeof signal === 'string' ? rawOS[signal] : signal; if (number === undefined) throw Object.assign(new TypeError('Unknown signal: ' + signal), { code: 'ERR_UNKNOWN_SIGNAL' }); const code = rawOS.kill(pid, number); if (code < 0) throw systemError(code, 'kill'); return true; }
 });
 Object.defineProperty(process, 'config', { writable: false });
@@ -1352,7 +1354,7 @@ function loop() {
   performanceMilestones.loopExit = native.now() - startTime;
   process._exiting = true; const status = Number(process.exitCode) || 0;
   process.emit('exit', status);
-  if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushCompileCache();
+  if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushAtExit();
   return Number(process.exitCode) || 0;
 }
 const imageModules = ['fs', 'fs/promises', 'internal/fs_streams', 'internal/fs_utf8_stream', 'path', 'os',
@@ -1381,7 +1383,12 @@ globalThis.__silkRuntime = {
     meta.resolve = function resolve(specifier, parent) {
       // Only --experimental-import-meta-resolve gives the second argument meaning.
       const from = host.importMetaResolveParent && parent !== undefined ? String(parent) : name;
-      return asURL(loader.resolve(specifier, from, 'import').filename);
+      // As in Node, a file that is missing (or a directory) still resolves to its URL.
+      try { return asURL(loader.resolve(specifier, from, 'import').filename); }
+      catch (error) {
+        if ((error?.code === 'ERR_MODULE_NOT_FOUND' || error?.code === 'ERR_UNSUPPORTED_DIR_IMPORT') && error.url) return error.url;
+        throw error;
+      }
     };
     meta.url = url;
     return meta;

@@ -434,7 +434,7 @@ function install(proc = process, metadata = bootstrap()) {
     if (!Number.isInteger(code)) throw clone().codedError('ERR_INVALID_ARG_TYPE', 'The code argument must be an integer');
     proc.exitCode = code;
     if (!exitRequested) { exitRequested = true; proc.emit('exit', code); }
-    if (host.builtinLoaded('internal/compile_cache')) require('internal/compile_cache').flushCompileCache();
+    if (host.builtinLoaded('internal/compile_cache')) require('internal/compile_cache').flushAtExit();
     host.workerNative('requestExit', [code]);
   };
   host.workerNative('online', []);
