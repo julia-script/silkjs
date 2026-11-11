@@ -26,6 +26,8 @@ function install(process) {
     if (typeof name !== 'string' || !name.startsWith('SIG')) return;
     const signals = signalNumbers();
     if (signals[name] === undefined || watchers.has(name)) return;
+    // A SIGUSR1 listener takes the signal from the inspector's activation, as in Node.
+    if (name === 'SIGUSR1') host.processNative('debugSignalPause', [true]);
     const resource = new AsyncResource('SIGNALWRAP');
     const id = host.processNative('signalStart', [signals[name], () => {
       host.invokeResource(resource, process.emit, process, [name, name], false);
@@ -45,6 +47,7 @@ function install(process) {
       watchers.delete(name);
       host.processNative('signalStop', [watcher.id]);
       watcher.resource.emitDestroy();
+      if (name === 'SIGUSR1') host.processNative('debugSignalPause', [false]);
     }
   });
   for (const name of process.eventNames()) if (process.listenerCount(name)) add(name);

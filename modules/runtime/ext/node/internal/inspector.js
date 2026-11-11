@@ -294,7 +294,8 @@ function installProcess(process, hostname, activateOnSignal) {
   process._debugEnd = () => close();
   process._debugProcess = pid => { process.kill(pid, 'SIGUSR1'); };
   if (!activateOnSignal) return;
-  host.processNative('signalStart', [host.platform === 'darwin' ? 30 : 10, () => {
+  // A descriptor in the loop's reactor, not a libuv signal handle: a start pays no signal setup.
+  host.processNative('debugSignalStart', [() => {
     if (!url()) start(process.debugPort, hostname, false, false);
   }]);
 }
