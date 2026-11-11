@@ -11,6 +11,7 @@ const modules = new Map();
 const realmSources = new Map();
 const factoryGet = Map.prototype.get.bind(factories);
 const factorySet = Map.prototype.set.bind(factories);
+const factoryHas = Map.prototype.has.bind(factories);
 const moduleGet = Map.prototype.get.bind(modules);
 const moduleHas = Map.prototype.has.bind(modules);
 const moduleSet = Map.prototype.set.bind(modules);
@@ -70,6 +71,9 @@ for (const name of ['dispose', 'asyncDispose']) {
   if (Symbol[name] === undefined) Object.defineProperty(Symbol, name, { value: Symbol.for('nodejs.' + name) });
 }
 const host = { ...native, rawOS, rawStd };
+// Throws value again and keeps the throw site its first throw recorded, as
+// V8's TryCatch::ReThrow does for Node's own catch and rethrow paths.
+host.rethrow = value => { native.captureCallSites(-5, value); };
 host.builtinLoaded = moduleHas;
 // Whether a built-in id (public or internal) exists, loaded or not: Node's BuiltinModule.exists.
 host.builtinExists = Map.prototype.has.bind(factories);
@@ -673,6 +677,7 @@ Object.assign(process, {
     if (code < 0) throw new (internalRequire('internal/errors').ErrnoException)(-Math.abs(code), 'kill');
     return true;
   },
+  _fatalException: internalRequire('internal/startup_controls').fatalException,
   // Formats like console.log and writes to fd 2 at once: no streams, ticks or console.
   _rawDebug(...args) { host.writeText(2, internalRequire('util').format(...args) + '\n'); },
 });
@@ -821,15 +826,25 @@ const publicBuiltinHas = Set.prototype.has.bind(new Set(publicBuiltinNames));
 const prefixOnlyBuiltinHas = Set.prototype.has.bind(new Set(['test', 'test/reporters', 'sqlite', 'sea']));
 const defineBuiltinName = Object.defineProperty;
 function publicBuiltin(name) {
-  return publicBuiltinHas(name) &&
-    ((name !== 'stream/iter' && name !== 'zlib/iter') || host.experimentalStreamIter === true);
+  if (!publicBuiltinHas(name)) return host.exposeInternals === true && exposedInternal(name);
+  return (name !== 'stream/iter' && name !== 'zlib/iter') || host.experimentalStreamIter === true;
 }
+// With --expose-internals, Node's internal/* modules load like public ones
+// (still left out of builtinModules). internal/host is the runtime's own
+// privileged bridge, not a Node module, so it never is.
+function exposedInternal(name) {
+  return typeof name === 'string' && stringStartsWith(name, 'internal/') && name !== 'internal/host' && factoryHas(name);
+}
+// Modules of this runtime, which only their silk: names load.
+const runtimeModules = { __proto__: null, 'silk:serve': 'internal/web/serve' };
 const publicBuiltins = {
-  has: publicBuiltin,
-  get: name => internalRequire(name),
+  has: name => runtimeModules[name] !== undefined || publicBuiltin(name),
+  get: name => internalRequire(runtimeModules[name] ?? name),
+  runtime: name => typeof name === 'string' && runtimeModules[name] !== undefined,
   // Whether names() lists name, without building the list.
   listed(name) {
     if (typeof name !== 'string') return false;
+    if (runtimeModules[name] !== undefined) return true;
     if (stringStartsWith(name, 'node:')) {
       const bare = stringSlice(name, 5);
       return prefixOnlyBuiltinHas(bare) && publicBuiltin(bare);
@@ -954,10 +969,9 @@ function runtimeFlag(arg) {
   if (arg === '--expose-gc' || arg === '--no-expose-gc') {
     host.exposeGC = arg === '--expose-gc'; return true;
   }
-  // Node's flag exposes Node's own lib/internal modules and bindings. This
-  // runtime has none of those, so the flag is accepted and exposes nothing:
-  // require('internal/...') stays MODULE_NOT_FOUND.
-  if (arg === '--expose-internals') return true;
+  // Node's BuiltinModule.exposeInternals: user code may load the internal/*
+  // built-ins (see publicBuiltins.listed).
+  if (arg === '--expose-internals') { host.exposeInternals = true; return true; }
   if (arg === '--disable-sigusr1') { host.disableSigusr1 = true; return true; }
   if (arg === '--test-update-snapshots' || arg === '--no-test-update-snapshots') {
     host.testUpdateSnapshots = arg === '--test-update-snapshots'; return true;
@@ -1212,8 +1226,9 @@ Environment:
   NODE_PATH         Additional CommonJS package lookup directories
   NODE_NO_WARNINGS, NODE_REDIRECT_WARNINGS, NODE_PENDING_DEPRECATION
 `;
-function cliError(message) {
-  host.writeStartupDiagnostic(process.execPath + ': ' + message + '\n');
+function cliError(messages) {
+  if (typeof messages === 'string') messages = [messages];
+  host.writeStartupDiagnostic(messages.map((message) => process.execPath + ': ' + message + '\n').join(''));
   return process.exit(9);
 }
 function loadRuntimeEnvironment(args, beforeLoading) {
@@ -1327,8 +1342,8 @@ function run() {
     return internalRequire('internal/main/run').runPackageScript(runName, separator < 0 ? [] : native.argv.slice(separator + 1));
   }
   // Only a TLS flag loads internal/tls/options, so a plain start skips the check.
-  const tlsConflict = moduleHas('internal/tls/options') && internalRequire('internal/tls/options').validate();
-  if (tlsConflict) return cliError(tlsConflict);
+  const tlsErrors = moduleHas('internal/tls/options') ? internalRequire('internal/tls/options').validate() : [];
+  if (tlsErrors.length) return cliError(tlsErrors);
   if (watchMode && expression !== undefined) return cliError('either --watch or --eval can be used, not both');
   if (watchMode && check) return cliError('either --watch or --check can be used, not both');
   if (watchMode && interactive) return cliError('either --watch or --interactive can be used, not both');
@@ -1522,6 +1537,8 @@ function loopTurn(pendingPromise) {
     }
   }
 }
+// An exception in a 'beforeExit' or 'exit' listener is uncaught like any other.
+function emitProcessEvent(name) { process.emit(name, Number(process.exitCode) || 0); }
 function loop() {
   performanceMilestones.loopStart = native.now() - startTime;
   initialNativeIdleTime = native.loopIdleTime();
@@ -1530,15 +1547,15 @@ function loop() {
     pollWorkers();
     if (workerThreads._exitRequested) break;
     if (!referencedWork()) {
-      process.emit('beforeExit', Number(process.exitCode) || 0);
+      invoke(emitProcessEvent, undefined, ['beforeExit']);
       checkpoint();
       if (!referencedWork()) break;
     }
     loopTurn();
   }
   performanceMilestones.loopExit = native.now() - startTime;
-  process._exiting = true; const status = Number(process.exitCode) || 0;
-  process.emit('exit', status);
+  process._exiting = true;
+  invoke(emitProcessEvent, undefined, ['exit']);
   inspectorBackend._atExit();
   if (moduleHas('internal/heap_prof')) internalRequire('internal/heap_prof').finish();
   if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushAtExit();

@@ -15,7 +15,8 @@ function install(global) {
     overrides: new WeakMap(),
     // internal/errors: NodeErrors answer true to kIsNodeError (Node's symbol of the same name).
     kIsNodeError: Symbol('kIsNodeError'),
-    // The structured frames of each formatted error, for the inspector's exceptionDetails.
+    // The structured frames of each formatted error: the inspector's exceptionDetails
+    // and the fatal report's origin.
     frames: new WeakMap(),
   });
   const { records, captured, rootError, kIsNodeError } = state;
@@ -267,10 +268,19 @@ function framesOf(error) {
   }
   return state.frames.get(error);
 }
+// The first frame with a source location of error's formatted stack, where V8
+// places the message of an error no throw statement threw.
+function origin(error) {
+  const frames = (typeof error === 'object' && error !== null) ? host.errorStackState?.frames.get(error) : undefined;
+  if (!frames) return undefined;
+  for (const frame of frames) if (!frame.isNative && frame.lineNumber > 0 && frame.scriptName) return frame;
+  return undefined;
+}
 
 module.exports = {
   install,
   framesOf,
+  origin,
   get overrideStackTrace() { return host.errorStackState.overrides; },
   get ErrorPrepareStackTrace() { return host.errorStackState.defaultPrepare; },
 };

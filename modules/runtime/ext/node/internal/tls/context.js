@@ -136,15 +136,24 @@ function ticketKeysBuffer(keys) {
   if (keys.byteLength !== 48) throw error('ERR_INVALID_ARG_VALUE', 'Session ticket keys must be a 48-byte buffer', TypeError);
   return Buffer.from(Buffer.from(keys.buffer, keys.byteOffset, keys.byteLength));
 }
+let idOf;
 class NativeSecureContext {
   #id = 0;
+  // Like a V8 binding's receiver check: a method moved to another object
+  // throws instead of reaching the native context.
+  static {
+    idOf = (self) => {
+      if (self === null || typeof self !== 'object' || !(#id in self)) throw new TypeError('Illegal invocation');
+      return self.#id;
+    };
+  }
   constructor() {
     this.#id = native('context');
     this._minProto = 0; this._maxProto = 0; this._ticketKeys = null; this._alpn = Buffer.alloc(0);
     finalizer?.register(this, this.#id, this);
   }
-  get _id() { return this.#id; }
-  get _external() { return this.#id; }
+  get _id() { return idOf(this); }
+  get _external() { return idOf(this); }
   init(secureProtocol, min, max) {
     if (max === 0) max = TLS1_3_VERSION;
     if (secureProtocol) {
@@ -161,12 +170,12 @@ class NativeSecureContext {
         case 'TLSv1_2': min = max = TLS1_2_VERSION; break;
       }
     }
-    native('options', this.#id, SSL_OP_DEFAULTS);
+    native('options', idOf(this), SSL_OP_DEFAULTS);
     this.setMinProto(min); this.setMaxProto(max);
     this.setTicketKeys(require('crypto').randomBytes(48));
   }
-  setMinProto(version) { native('versions', this.#id, version, this._maxProto || TLS1_3_VERSION); this._minProto = version; }
-  setMaxProto(version) { native('versions', this.#id, this._minProto, version); this._maxProto = version; }
+  setMinProto(version) { native('versions', idOf(this), version, this._maxProto || TLS1_3_VERSION); this._minProto = version; }
+  setMaxProto(version) { native('versions', idOf(this), this._minProto, version); this._maxProto = version; }
   getMinProto() { return this._minProto; }
   // The linked OpenSSL is built without zlib, brotli and zstd (OPENSSL_NO_COMP_ALG),
   // which Node reports the same way.
@@ -176,47 +185,47 @@ class NativeSecureContext {
     throw error('ERR_CRYPTO_UNSUPPORTED_OPERATION', 'Certificate compression is not supported by this OpenSSL build');
   }
   getMaxProto() { return this._maxProto || TLS1_3_VERSION; }
-  setOptions(options) { native('options', this.#id, options >>> 0); }
-  setCipherSuites(suites) { native('suites', this.#id, suites); }
+  setOptions(options) { native('options', idOf(this), options >>> 0); }
+  setCipherSuites(suites) { native('suites', idOf(this), suites); }
   setCiphers(ciphers) {
-    try { native('ciphers', this.#id, ciphers); }
+    try { native('ciphers', idOf(this), ciphers); }
     catch (err) {
       // An empty TLSv1.2 list is valid when TLSv1.3 suites remain (Node's SetCiphers).
       if (ciphers !== '' || !/no cipher match/.test(err.message)) throw err;
     }
   }
-  setSigalgs(sigalgs) { native('sigalgs', this.#id, sigalgs); }
+  setSigalgs(sigalgs) { native('sigalgs', idOf(this), sigalgs); }
   setECDHCurve(curve) {
     if (curve === 'auto') return;
-    try { native('groups', this.#id, curve); }
+    try { native('groups', idOf(this), curve); }
     catch { throw error('ERR_CRYPTO_OPERATION_FAILED', 'Failed to set ECDH curve', TypeError); }
   }
   setDHParam(value) {
-    if (value === true) { native('dhAuto', this.#id); return; }
-    const size = native('dhparam', this.#id, bytes(value));
+    if (value === true) { native('dhAuto', idOf(this)); return; }
+    const size = native('dhparam', idOf(this), bytes(value));
     if (size === 0) return;
     if (size < 1024) throw error('ERR_INVALID_ARG_VALUE', 'DH parameter is less than 1024 bits', TypeError);
     if (size < 2048) return 'DH parameter is less than 2048 bits';
   }
-  setKey(key, passphrase) { native('key', this.#id, bytes(key), passphrase == null ? '' : String(passphrase)); }
-  setCert(cert) { native('cert', this.#id, bytes(cert)); }
-  addCACert(cert) { native('ca', this.#id, bytes(cert)); }
-  addRootCerts() { for (const cert of rootStore()) native('ca', this.#id, cert); }
-  setAllowPartialTrustChain() { native('trustFlags', this.#id, 0x80000); }
+  setKey(key, passphrase) { native('key', idOf(this), bytes(key), passphrase == null ? '' : String(passphrase)); }
+  setCert(cert) { native('cert', idOf(this), bytes(cert)); }
+  addCACert(cert) { native('ca', idOf(this), bytes(cert)); }
+  addRootCerts() { for (const cert of rootStore()) native('ca', idOf(this), cert); }
+  setAllowPartialTrustChain() { native('trustFlags', idOf(this), 0x80000); }
   addCRL(crl) {
-    try { native('crl', this.#id, bytes(crl)); }
+    try { native('crl', idOf(this), bytes(crl)); }
     catch { throw error('ERR_CRYPTO_OPERATION_FAILED', 'Failed to parse CRL'); }
   }
-  setSessionIdContext(id) { native('sessionId', this.#id, id); }
-  setSessionTimeout(seconds) { native('sessionTimeout', this.#id, seconds); }
+  setSessionIdContext(id) { native('sessionId', idOf(this), id); }
+  setSessionTimeout(seconds) { native('sessionTimeout', idOf(this), seconds); }
   setTicketKeys(keys) {
     const copy = ticketKeysBuffer(keys);
-    native('ticketKeys', this.#id, copy); this._ticketKeys = copy;
+    native('ticketKeys', idOf(this), copy); this._ticketKeys = copy;
   }
   getTicketKeys() { return Buffer.from(this._ticketKeys); }
   loadPKCS12(pfx, passphrase) {
     let status;
-    try { status = native('pfx', this.#id, bytes(pfx), passphrase === undefined ? '' : bytes(passphrase)); }
+    try { status = native('pfx', idOf(this), bytes(pfx), passphrase === undefined ? '' : bytes(passphrase)); }
     catch (err) {
       if (err.reason === 'unsupported') throw error('ERR_CRYPTO_UNSUPPORTED_OPERATION', 'Unsupported PKCS12 PFX data');
       throw new Error(err.reason || 'Unknown error');
@@ -224,7 +233,7 @@ class NativeSecureContext {
     if (status === 1) throw error('ERR_CRYPTO_OPERATION_FAILED', 'Unable to load private key from PFX data');
     if (status === 2) throw error('ERR_CRYPTO_OPERATION_FAILED', 'Unable to load certificate from PFX data');
   }
-  setALPN(protocols) { this._alpn = protocols; native('contextALPN', this.#id, protocols); }
+  setALPN(protocols) { this._alpn = protocols; native('contextALPN', idOf(this), protocols); }
   close() {}
 }
 

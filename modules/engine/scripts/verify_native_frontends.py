@@ -127,14 +127,14 @@ def stack_scenarios(qjs, env):
     js(["-e", nested + "print('executed')" + "})()" * 32],
        stdout=b"executed\n", stderr=b"")
     limited = js(["--stack-size", "64K", "-e", nested + "})" * 32], expected=1)
-    assert b"InternalError: stack overflow" in limited.stderr
+    assert b"RangeError: Maximum call stack size exceeded" in limited.stderr
     deep = js(["-e", "(function(){" * 256 + "})" * 256], expected=1)
-    assert b"InternalError: stack overflow" in deep.stderr
+    assert b"RangeError: Maximum call stack size exceeded" in deep.stderr
 
     recursion = (
         "var depth=0;function f(){++depth;f()}"
         "try{f()}catch(e){"
-        "if(!(e instanceof InternalError)||e.message!=='stack overflow')throw e;"
+        "if(!(e instanceof RangeError)||e.message!=='Maximum call stack size exceeded')throw e;"
         "print(depth)}"
     )
     normal = js(["-e", recursion], stderr=b"")
@@ -347,7 +347,7 @@ def suite(qjs, qjsc, reference, compiler, stdlib, env, output, bjson_plugin=None
                                  env=env, timeout=1800)
                 assert b"--optimization speed" in verbose.stdout
                 limited = invoke([executable], expected=1, stdout=b"", env=env)
-                assert b"stack overflow" in limited.stderr
+                assert b"Maximum call stack size exceeded" in limited.stderr
                 count += 1
             if "native-module" in stages:
                 (work / "plugin.mjs").write_text(
