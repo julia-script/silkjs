@@ -4,6 +4,7 @@ const host = require('internal/host');
 const EventEmitter = require('events');
 const { _createResource: createResource } = require('async_hooks');
 const { Buffer } = require('buffer');
+const diagnostics = require('internal/host').diagnostics;
 // A main thread that never starts a worker needs none of these; each loads on first use.
 const lazy = name => { let loaded; return () => loaded ??= require(name); };
 const clone = lazy('internal/worker/clone');
@@ -277,6 +278,7 @@ class Worker extends EventEmitter {
     if (!config.metadata.stdout) state.stdout.pipe(process.stdout, { end: false });
     if (!config.metadata.stderr) state.stderr.pipe(process.stderr, { end: false });
     process.nextTick(() => process.emit('worker', this));
+    diagnostics.publish('worker_threads', { worker: this });
   }
   get threadId() { const state = workerState(this); return state.exited ? -1 : state.id; }
   get threadName() { const state = workerState(this); return state.exited ? null : state.metadata.name; }
@@ -482,6 +484,8 @@ function install(proc = process, metadata = bootstrap()) {
     proc.exitCode = code;
     if (!exitRequested) { exitRequested = true; proc._exiting = true; proc.emit('exit', code); }
     if (host.builtinLoaded('internal/compile_cache')) require('internal/compile_cache').flushAtExit();
+    require('internal/startup_controls').traceExit(code, info.threadId);
+    if (host.builtinLoaded('internal/heap_prof')) require('internal/heap_prof').finish();
     host.workerNative('requestExit', [code]);
   };
   host.workerNative('online', []);
