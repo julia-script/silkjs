@@ -1,0 +1,213 @@
+//! Runtime-owned DevTools projection of the native observational graph. Encoding
+//! touches only native graph storage: no guest objects, getters, or JS execution.
+//! Standard fields carry nodes and grouped edges; silk.heap.snapshot v2 retains
+//! exact strengths, ephemeron conditions and native-byte decomposition without
+//! duplicating the graph. Edge labels end in [decimal index]; split at the last [.
+import silk.collections.list { List }
+import silk.collections.hash { Hash, HashKey, HashSeed }
+import silk.collections.hash_map { HashMap }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.slice { Slice }
+import silk.num.usize
+import silk.num.u8
+import silkjs.js_heap { HeapKind }
+import silkjs.js_heap_snapshot_graph { Graph, Strength }
+
+pub struct SnapshotFormatError {}
+
+// Names are interned as borrowed (label, index) keys, never formatted per edge.
+struct Name { label: &'static [u8], index: usize }
+impl Copy for Name {}
+impl HashKey for Name {
+  fn equals(left: &Self, right: &Self) -> bool {
+    if left.index != right.index || left.label.length != right.label.length { return false }
+    let mut i: usize = 0
+    while i < left.label.length { if left.label[i] != right.label[i] { return false } i = i + 1 }
+    return true
+  }
+  fn hash(value: &Self, seed: &HashSeed) -> u64 {
+    let mut hash = Hash.mix(seed, usize.toU64(value.index))
+    let mut i: usize = 0
+    while i < value.label.length { hash = Hash.combine(hash, u8.toU64(value.label[i])) i = i + 1 }
+    return hash
+  }
+}
+struct Group { first: usize, last: usize, count: usize }
+impl Copy for Group {}
+
+// A stable adjacency index: one link per edge, one group per node, O(N + E).
+struct Adjacency { groups: List<Group>, next: List<usize> }
+effect fn adjacency(graph: &Graph) -> Adjacency ! OutOfMemoryError ? &mut Allocator {
+  let mut groups = List<Group>.make()
+  run groups.appendRepeated(Group { first: usize.MAX, last: usize.MAX, count: 0 }, graph.nodes.length())
+  let mut next = List<usize>.make()
+  run next.appendRepeated(usize.MAX, graph.edges.length())
+  let mut i: usize = 0
+  while i < graph.edges.length() {
+    let edge = graph.edges.get(i) let mut group = groups.get(edge.from)
+    if group.last == usize.MAX { group.first = i } else { next.set(group.last, i) }
+    group.last = i group.count = group.count + 1 groups.set(edge.from, group)
+    i = i + 1
+  }
+  return Adjacency { groups: move groups, next: move next }
+}
+effect fn number(output: &mut List<u8>, value: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut digits: [u8; 32] = [0; 32] let mut at: usize = 32 let mut rest = value
+  while true { at = at - 1 digits[at] = 48 + usize.toU8(rest % 10) rest = rest / 10 if rest == 0 { break } }
+  run output.appendBytes(Slice.view<u8>(&digits, at, 32 - at))
+}
+// Escapes content only, allowing a name to be emitted without a temporary string.
+effect fn escaped(output: &mut List<u8>, value: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut i: usize = 0 let mut start: usize = 0
+  while i < value.length {
+    let ch = value[i]
+    if ch == 34 || ch == 92 || ch < 32 {
+      run output.appendBytes(Slice.view<u8>(value, start, i - start))
+      if ch == 34 || ch == 92 { run output.append(92) run output.append(ch) }
+      else {
+        run output.appendBytes(b"\\u00") let digits = b"0123456789abcdef"
+        run output.append(digits[u8.toUsize(ch) / 16]) run output.append(digits[u8.toUsize(ch) % 16])
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  run output.appendBytes(Slice.view<u8>(value, start, value.length - start))
+}
+effect fn quoted(output: &mut List<u8>, value: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  run output.append(34) run escaped(&mut output, value) run output.append(34)
+}
+fn nodeType(kind: HeapKind) -> usize {
+  return match kind {
+    HeapKind.Object => 3 HeapKind.FunctionBytecode => 4 HeapKind.String => 2
+    HeapKind.Rope => 10 HeapKind.BigInt => 13 HeapKind.Auxiliary => 8
+    HeapKind.Shape => 0 HeapKind.VarRef => 0 HeapKind.AsyncFunction => 0
+    HeapKind.Context => 0 HeapKind.Module => 0 HeapKind.Scope => 0
+  }
+}
+// These IDs index the fixed, unique node-name prefix of strings below.
+fn nodeName(kind: HeapKind) -> usize {
+  return match kind {
+    HeapKind.Object => 1 HeapKind.FunctionBytecode => 2 HeapKind.Shape => 3
+    HeapKind.VarRef => 4 HeapKind.AsyncFunction => 5 HeapKind.Context => 6
+    HeapKind.Module => 7 HeapKind.String => 8 HeapKind.Rope => 9
+    HeapKind.BigInt => 10 HeapKind.Auxiliary => 11 HeapKind.Scope => 12
+  }
+}
+fn strength(value: Strength) -> usize {
+  return match value { Strength.Strong => 0 Strength.Weak => 1 Strength.Ephemeron => 2 Strength.Borrowed => 3 }
+}
+
+pub effect fn encode(graph: &Graph) -> List<u8> ! OutOfMemoryError | SnapshotFormatError ? &mut Allocator {
+  let mut i: usize = 0
+  while i < graph.nodes.length() {
+    if graph.nodes.get(i).id > 9007199254740991 { fail SnapshotFormatError {} }
+    i = i + 1
+  }
+  let adjacency = run adjacency(&graph)
+  let mut output = List<u8>.make()
+  run output.appendBytes(b"{\"snapshot\":{\"meta\":{\"node_fields\":[\"type\",\"name\",\"id\",\"self_size\",\"edge_count\",\"trace_node_id\",\"detachedness\"],\"node_types\":[[\"hidden\",\"array\",\"string\",\"object\",\"code\",\"closure\",\"regexp\",\"number\",\"native\",\"synthetic\",\"concatenated string\",\"sliced string\",\"symbol\",\"bigint\"],\"string\",\"number\",\"number\",\"number\",\"number\",\"number\"],\"edge_fields\":[\"type\",\"name_or_index\",\"to_node\"],\"edge_types\":[[\"context\",\"element\",\"property\",\"internal\",\"hidden\",\"shortcut\",\"weak\"],\"string_or_number\",\"node\"],\"trace_function_info_fields\":[\"function_id\",\"name\",\"script_name\",\"script_id\",\"line\",\"column\"],\"trace_node_fields\":[\"id\",\"function_info_index\",\"count\",\"size\",\"children\"],\"sample_fields\":[\"timestamp_us\",\"last_assigned_id\"],\"location_fields\":[\"object_index\",\"script_id\",\"line\",\"column\"]},\"node_count\":")
+  run number(&mut output, graph.nodes.length())
+  run output.appendBytes(b",\"edge_count\":") run number(&mut output, graph.edges.length())
+  run output.appendBytes(b",\"trace_function_count\":0},\"nodes\":[") i = 0
+  while i < graph.nodes.length() {
+    if i != 0 { run output.append(44) }
+    let node = graph.nodes.get(i)
+    run number(&mut output, if i == 0 { 9 } else { nodeType(node.kind) }) run output.append(44)
+    run number(&mut output, if i == 0 { 0 } else { nodeName(node.kind) }) run output.append(44)
+    run number(&mut output, node.id) run output.append(44)
+    run number(&mut output, node.selfBytes + node.nativeBytes) run output.append(44)
+    run number(&mut output, adjacency.groups.get(i).count) run output.appendBytes(b",0,0")
+    i = i + 1
+  }
+  run output.appendBytes(b"],\"edges\":[")
+  let mut names = List<Name>.make()
+  let mut ids = HashMap<Name, usize>.make(Hash.seed(18011))
+  let mut first = true i = 0
+  while i < graph.nodes.length() {
+    let mut at = adjacency.groups.get(i).first
+    while at != usize.MAX {
+      let edge = graph.edges.get(at)
+      let key = Name { label: edge.label, index: edge.index }
+      let name = match ids.get(key) {
+        Option<usize>.Some { value } => value
+        Option<usize>.None => {
+          let value = 13 + names.length()
+          let _ignored = run ids.insert(key, value)
+          run names.append(key)
+          value
+        }
+      }
+      if !first { run output.append(44) } first = false
+      run number(&mut output, if edge.strength == Strength.Strong { 3 } else { 6 }) run output.append(44)
+      run number(&mut output, name) run output.append(44) run number(&mut output, edge.to * 7)
+      at = adjacency.next.get(at)
+    }
+    i = i + 1
+  }
+  run output.appendBytes(b"],\"trace_function_infos\":[],\"trace_tree\":[],\"samples\":[],\"locations\":[],\"strings\":[\"(Silk roots)\",\"Silk object\",\"Silk bytecode\",\"Silk shape\",\"Silk binding\",\"Silk asyncFrame\",\"Silk context\",\"Silk module\",\"Silk string\",\"Silk rope\",\"Silk bigint\",\"Silk native\",\"Silk scope\"")
+  i = 0
+  while i < names.length() {
+    let name = names.get(i)
+    run output.appendBytes(b",\"") run escaped(&mut output, name.label)
+    run output.append(91) run number(&mut output, name.index) run output.appendBytes(b"]\"")
+    i = i + 1
+  }
+  run output.appendBytes(b"],\"silk\":{\"format\":\"silk.heap.snapshot\",\"version\":2,\"graphVersion\":1,\"identity\":")
+  if graph.allocationIdentity { run quoted(&mut output, b"runtime-allocation-id") }
+  else { run quoted(&mut output, b"address-stable-while-live") }
+  run output.appendBytes(b",\"root\":0,\"rootKind\":\"native\",\"edgeStrengths\":[")
+  first = true i = 0
+  while i < graph.nodes.length() {
+    let mut at = adjacency.groups.get(i).first
+    while at != usize.MAX {
+      if !first { run output.append(44) } first = false
+      run number(&mut output, strength(graph.edges.get(at).strength)) at = adjacency.next.get(at)
+    }
+    i = i + 1
+  }
+  run output.appendBytes(b"],\"ephemerons\":[")
+  let mut emitted: usize = 0 first = true i = 0
+  while i < graph.nodes.length() {
+    let mut at = adjacency.groups.get(i).first
+    while at != usize.MAX {
+      let edge = graph.edges.get(at)
+      if edge.strength == Strength.Ephemeron {
+        if !first { run output.append(44) } first = false
+        run number(&mut output, emitted) run output.append(44) run number(&mut output, edge.condition)
+      }
+      emitted = emitted + 1 at = adjacency.next.get(at)
+    }
+    i = i + 1
+  }
+  run output.appendBytes(b"],\"nodeNativeBytes\":[") first = true i = 0
+  while i < graph.nodes.length() {
+    let bytes = graph.nodes.get(i).nativeBytes
+    if bytes != 0 {
+      if !first { run output.append(44) } first = false
+      run number(&mut output, i) run output.append(44) run number(&mut output, bytes)
+    }
+    i = i + 1
+  }
+  run output.appendBytes(b"],\"allocations\":[") i = 0
+  while i < graph.allocations.length() {
+    if i != 0 { run output.append(44) }
+    let allocation = graph.allocations.get(i)
+    run output.appendBytes(b"{\"owner\":") run number(&mut output, allocation.owner)
+    run output.appendBytes(b",\"address\":\"") run number(&mut output, allocation.address)
+    run output.appendBytes(b"\",\"chargedBytes\":") run number(&mut output, allocation.bytes)
+    run output.append(125) i = i + 1
+  }
+  run output.appendBytes(b"],\"limitations\":[") i = 0
+  while i < graph.limitations.length() {
+    if i != 0 { run output.append(44) }
+    let limitation = graph.limitations.get(i)
+    run output.appendBytes(b"{\"node\":") run number(&mut output, limitation.node)
+    run output.appendBytes(b",\"message\":") run quoted(&mut output, limitation.message)
+    run output.append(125) i = i + 1
+  }
+  run output.appendBytes(b"],\"projection\":\"strong edges retain; weak, borrowed and ephemeron edges are weak in DevTools; ephemeron retained sizes are conservative, exact retention requires the owner and condition key\"}}")
+  return move output
+}

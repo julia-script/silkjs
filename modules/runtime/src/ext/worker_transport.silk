@@ -1,0 +1,182 @@
+//! Process-scoped worker registry. Every queue and backing owner is independent
+//! of JavaScript heaps; the registry lock also serializes wake-handle retirement.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Drop }
+import silk.collections.list { List }
+import silk.concurrency.sync { Arc, Mutex, Condition }
+import silk.concurrency.thread { Transferable }
+import silk.mem.pointer { Pointer }
+import silk.mem.layout { Layout }
+import silkjs.js_atomics_native { Domain, WaiterDomain, CancellableDomain }
+import silkjs.js_libc_process { Process }
+import silkjs.js_os_workers_resources { Resources }
+import silkjs.js_os_workers_resources as resources
+import silkjs.js_os_workers_transport as shared
+import silkjs.js_buffer_storage { BufferTransfer, BufferLease }
+import ext.worker_resource_controls { Cpu }
+import ext.vm_interrupt
+import ext.diagnostics_hub { Hub }
+import ext.diagnostics_fatal { Settings }
+
+import silk.io.reactor { ReactorError, Waker }
+import silk.core.result { Result }
+pub union Shared {
+  Host { pub data: ?*mut u8, pub length: u64, pub capacity: u64 },
+  Native { pub lease: BufferLease }
+}
+impl Shared {
+  pub fn clone(self: &Self) -> Self {
+    return match &self.* {
+      Shared.Host { data, length, capacity } => {
+        unsafe shared.duplicateShared(data)
+        Shared.Host { data: data, length: length, capacity: capacity }
+      }
+      Shared.Native { lease } => Shared.Native { lease: lease.clone() }
+    }
+  }
+}
+impl Drop for Shared {
+  fn drop(self: &mut Self) -> () {
+    match &self.* { Shared.Host { data, .. } => { unsafe shared.freeShared(data) } _ => () }
+  }
+}
+pub struct Message { pub next: ?*mut Message, pub bytes: List<u8>, pub buffers: List<BufferTransfer>, pub shared: List<Shared>, pub ports: List<u32> }
+pub struct Endpoint { pub next: ?*mut Endpoint, pub id: u32, pub owner: u32, pub peer: u32, pub started: bool, pub referenced: bool, pub closed: bool, pub closePending: bool, pub name: List<u8>, pub broadcast: bool, pub routed: bool, pub first: ?*mut Message, pub last: ?*mut Message }
+pub struct Variable { pub name: List<u8>, pub value: List<u8>, pub active: bool }
+pub struct Environment { pub next: ?*mut Environment, pub variables: List<Variable> }
+pub struct Thread { pub next: ?*mut Thread, pub id: u32, pub parent: u32, pub wake: Option<Waker>, pub cancellation: CancellableDomain, pub stopped: bool, pub exitCode: i32, pub exited: bool, pub online: bool, pub onlinePending: bool, pub exitPending: bool, pub referenced: bool, pub environment: ?*mut Environment, pub cpu: Cpu, pub stackSize: usize }
+// Status: queued=0, held=1, stolen=2, unavailable=3. Only native data crosses isolates.
+pub struct LockRequest { pub next: ?*mut LockRequest, pub id: u32, pub owner: u32, pub name: List<u8>, pub shared: bool, pub status: u32, pub notify: bool }
+pub struct Registry { pub nextId: u32, pub endpoints: ?*mut Endpoint, pub threads: ?*mut Thread, pub environments: ?*mut Environment, pub locks: ?*mut LockRequest, pub vmWatchdog: Option<Arc<vm_interrupt.Service>>, pub diagnostics: Hub }
+impl Transferable for Registry {}
+// changed: notified whenever the diagnostics mailbox or a report changes, under the registry lock.
+pub struct Group { pub registry: Arc<Mutex<Registry>>, pub changed: Arc<Condition>, pub reports: Settings, pub resources: Resources, pub process: Process, pub waiters: WaiterDomain }
+impl Group {
+  pub effect fn make(process: &Process, domain: Domain) -> Self ! OutOfMemoryError {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let mutex = run Mutex<Registry>.make(Registry { nextId: 1, endpoints: Pointer.null<Endpoint>(), threads: Pointer.null<Thread>(), environments: Pointer.null<Environment>(), locks: Pointer.null<LockRequest>(), vmWatchdog: Option<Arc<vm_interrupt.Service>>.none(), diagnostics: Hub.make() }) |> Effect.provideMut<Allocator>(&mut allocator)
+    let condition = run Condition.make() |> Effect.provideMut<Allocator>(&mut allocator)
+    return Self { registry: run Arc<Mutex<Registry>>.make(move mutex) |> Effect.provideMut<Allocator>(&mut allocator), changed: run Arc<Condition>.make(move condition) |> Effect.provideMut<Allocator>(&mut allocator), reports: run Settings.make() |> Effect.provideMut<Allocator>(&mut allocator), resources: run Resources.make(), process: process.clone(), waiters: unsafe WaiterDomain.retain(domain) }
+  }
+  pub fn clone(self: &Self) -> Self { return Self { registry: self.registry.clone(), changed: self.changed.clone(), reports: self.reports.clone(), resources: self.resources.clone(), process: self.process.clone(), waiters: unsafe WaiterDomain.retain(self.waiters.handle()) } }
+}
+pub unsafe fn nonnull<T>(pointer: ?*mut T) -> *mut T { return unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(pointer) }
+pub unsafe fn raw<T>(pointer: *mut T) -> *mut u8 { return unsafe Intrinsic.pointerReinterpret<*mut T, *mut u8>(pointer) }
+pub effect fn allocate<T>(owner: &Resources) -> *mut T ! OutOfMemoryError {
+  let memory = resources.allocate(owner, Layout.of<T>().bytes, 0)
+  if Pointer.isNull<u8>(memory) { fail OutOfMemoryError {} }
+  return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut T>(unsafe nonnull(memory))
+}
+pub unsafe fn endpoint(registry: &Registry, id: u32) -> ?*mut Endpoint {
+  let anchor = () let mut cursor = registry.endpoints
+  while !Pointer.isNull<Endpoint>(cursor) { let item = unsafe Pointer.borrow<(), Endpoint>(&anchor, unsafe nonnull(cursor)) if item.id == id { return cursor } cursor = item.next }
+  return Pointer.null<Endpoint>()
+}
+pub unsafe fn thread(registry: &Registry, id: u32) -> ?*mut Thread {
+  let anchor = () let mut cursor = registry.threads
+  while !Pointer.isNull<Thread>(cursor) { let item = unsafe Pointer.borrow<(), Thread>(&anchor, unsafe nonnull(cursor)) if item.id == id { return cursor } cursor = item.next }
+  return Pointer.null<Thread>()
+}
+pub unsafe fn wake(registry: &Registry, id: u32) -> () {
+  let pointer = unsafe thread(registry, id) if Pointer.isNull<Thread>(pointer) { return () }
+  let anchor = () let item = unsafe Pointer.borrow<(), Thread>(&anchor, unsafe nonnull(pointer))
+  if let Option<Waker>.Some { value } = &item.wake {
+    let woke = run Effect.result(value.wake())
+    if let Result<(), ReactorError>.Failure { .. } = move woke { Intrinsic.trap("a worker cannot wake its runtime loop") }
+  }
+}
+pub unsafe fn enqueue(registry: &Registry, pointer: *mut Endpoint, message: *mut Message) -> () {
+  let mut anchor = () let entry = unsafe Pointer.borrowMut<(), Endpoint>(&mut anchor, pointer)
+  if Pointer.isNull<Message>(entry.last) { entry.first = message }
+  else { let mut messageAnchor = () let last = unsafe Pointer.borrowMut<(), Message>(&mut messageAnchor, unsafe nonnull(entry.last)) last.next = message }
+  entry.last = message let owner = entry.owner drop entry unsafe wake(registry, owner)
+}
+pub unsafe fn dequeue(pointer: *mut Endpoint) -> ?*mut Message {
+  let mut anchor = () let entry = unsafe Pointer.borrowMut<(), Endpoint>(&mut anchor, pointer) let first = entry.first
+  if !Pointer.isNull<Message>(first) { let messageAnchor = () let message = unsafe Pointer.borrow<(), Message>(&messageAnchor, unsafe nonnull(first)) entry.first = message.next if Pointer.isNull<Message>(entry.first) { entry.last = Pointer.null<Message>() } }
+  return first
+}
+pub unsafe fn freeMessage(pointer: *mut Message) -> () { let value = unsafe Pointer.take<Message>(pointer) drop value unsafe resources.release(unsafe raw(pointer)) }
+pub unsafe fn closeEndpoint(registry: &Registry, pointer: *mut Endpoint) -> () {
+  let mut anchor = () let entry = unsafe Pointer.borrowMut<(), Endpoint>(&mut anchor, pointer)
+  if entry.closed { return () } entry.closed = true entry.started = false
+  let peer = entry.peer let owner = entry.owner let routed = entry.routed entry.closePending = true drop entry
+  let other = unsafe endpoint(registry, peer)
+  if !Pointer.isNull<Endpoint>(other) { let target = unsafe Pointer.borrowMut<(), Endpoint>(&mut anchor, unsafe nonnull(other)) target.closePending = true let targetOwner = target.owner drop target unsafe wake(registry, targetOwner) }
+  if routed && !Pointer.isNull<Endpoint>(other) { unsafe closeEndpoint(registry, unsafe nonnull(other)) }
+  unsafe wake(registry, owner)
+  let mut cursor = unsafe dequeue(pointer)
+  while !Pointer.isNull<Message>(cursor) {
+    let message = unsafe Pointer.borrow<(), Message>(&anchor, unsafe nonnull(cursor))
+    let mut index: usize = 0 while index < message.ports.length() { let transferred = unsafe endpoint(registry, message.ports.get(index)) if !Pointer.isNull<Endpoint>(transferred) { unsafe closeEndpoint(registry, unsafe nonnull(transferred)) } index = index + 1 }
+    drop message unsafe freeMessage(unsafe nonnull(cursor)) cursor = unsafe dequeue(pointer)
+  }
+}
+pub unsafe fn newEndpoint(registry: &mut Registry, pointer: *mut Endpoint, owner: u32, peer: u32, name: List<u8>, broadcast: bool) -> u32 {
+  let id = registry.nextId registry.nextId = id + 1
+  unsafe Pointer.put<Endpoint>(pointer, Endpoint { next: registry.endpoints, id: id, owner: owner, peer: peer, started: false, referenced: true, closed: false, closePending: false, name: move name, broadcast: broadcast, routed: false, first: Pointer.null<Message>(), last: Pointer.null<Message>() })
+  registry.endpoints = pointer return id
+}
+impl Drop for Registry {
+  fn drop(self: &mut Self) -> () {
+    let mut cursor = self.endpoints
+    while !Pointer.isNull<Endpoint>(cursor) { let pointer = unsafe nonnull(cursor) let mut entry = unsafe Pointer.take<Endpoint>(pointer) cursor = entry.next
+      while !Pointer.isNull<Message>(entry.first) { let item = unsafe nonnull(entry.first) let anchor = () let message = unsafe Pointer.borrow<(), Message>(&anchor, item) entry.first = message.next drop message unsafe freeMessage(item) }
+      drop entry unsafe resources.release(unsafe raw(pointer)) }
+    let mut threads = self.threads
+    while !Pointer.isNull<Thread>(threads) { let pointer = unsafe nonnull(threads) let entry = unsafe Pointer.take<Thread>(pointer) threads = entry.next drop entry unsafe resources.release(unsafe raw(pointer)) }
+    let mut environments = self.environments
+    while !Pointer.isNull<Environment>(environments) { let pointer = unsafe nonnull(environments) let entry = unsafe Pointer.take<Environment>(pointer) environments = entry.next drop entry unsafe resources.release(unsafe raw(pointer)) }
+    let mut locks = self.locks
+    while !Pointer.isNull<LockRequest>(locks) { let pointer = unsafe nonnull(locks) let entry = unsafe Pointer.take<LockRequest>(pointer) locks = entry.next drop entry unsafe resources.release(unsafe raw(pointer)) }
+  }
+}
+
+pub unsafe fn retireEndpoint(registry: &mut Registry, id: u32) -> () {
+  let mut link = Pointer.fromMutRef<?*mut Endpoint>(&mut registry.endpoints) let mut anchor = ()
+  while !Pointer.isNull<Endpoint>(unsafe Pointer.read<?*mut Endpoint>(link)) {
+    let pointer = unsafe nonnull(unsafe Pointer.read<?*mut Endpoint>(link))
+    let endpoint = unsafe Pointer.borrowMut<(), Endpoint>(&mut anchor, pointer)
+    if endpoint.id == id {
+      if !endpoint.closed || !Pointer.isNull<Message>(endpoint.first) { return () }
+      unsafe Pointer.put<?*mut Endpoint>(link, endpoint.next) drop endpoint
+      let owned = unsafe Pointer.take<Endpoint>(pointer) drop owned unsafe resources.release(unsafe raw(pointer)) return ()
+    }
+    link = Pointer.fromMutRef<?*mut Endpoint>(&mut endpoint.next) drop endpoint
+  }
+}
+pub unsafe fn retireThread(registry: &mut Registry, id: u32) -> () {
+  let mut link = Pointer.fromMutRef<?*mut Thread>(&mut registry.threads) let mut anchor = ()
+  while !Pointer.isNull<Thread>(unsafe Pointer.read<?*mut Thread>(link)) {
+    let pointer = unsafe nonnull(unsafe Pointer.read<?*mut Thread>(link))
+    let thread = unsafe Pointer.borrowMut<(), Thread>(&mut anchor, pointer)
+    if thread.id == id {
+      if !thread.exited { return () }
+      unsafe Pointer.put<?*mut Thread>(link, thread.next) drop thread
+      let owned = unsafe Pointer.take<Thread>(pointer) drop owned unsafe resources.release(unsafe raw(pointer)) break
+    }
+    link = Pointer.fromMutRef<?*mut Thread>(&mut thread.next) drop thread
+  }
+  let mut environments = Pointer.fromMutRef<?*mut Environment>(&mut registry.environments)
+  while !Pointer.isNull<Environment>(unsafe Pointer.read<?*mut Environment>(environments)) {
+    let pointer = unsafe nonnull(unsafe Pointer.read<?*mut Environment>(environments)) let mut used = false let mut cursor = registry.threads
+    while !Pointer.isNull<Thread>(cursor) { let thread = unsafe Pointer.borrow<(), Thread>(&anchor, unsafe nonnull(cursor)) if Pointer.address(thread.environment) == Pointer.address(pointer) { used = true break } cursor = thread.next }
+    let environment = unsafe Pointer.borrowMut<(), Environment>(&mut anchor, pointer)
+    if used { environments = Pointer.fromMutRef<?*mut Environment>(&mut environment.next) drop environment }
+    else { unsafe Pointer.put<?*mut Environment>(environments, environment.next) drop environment let owned = unsafe Pointer.take<Environment>(pointer) drop owned unsafe resources.release(unsafe raw(pointer)) }
+  }
+}
+
+// Dropped packets may own transferred endpoints that no isolate can poll.
+pub unsafe fn reapAbandoned(registry: &mut Registry) -> () {
+  let mut cursor = registry.endpoints let anchor = ()
+  while !Pointer.isNull<Endpoint>(cursor) {
+    let entry = unsafe Pointer.borrow<(), Endpoint>(&anchor, unsafe nonnull(cursor))
+    let next = entry.next let id = entry.id let abandoned = entry.owner == 4294967295 && entry.closed
+    drop entry
+    if abandoned { unsafe retireEndpoint(&mut registry, id) }
+    cursor = next
+  }
+}

@@ -1,0 +1,329 @@
+//! Process-group SIGINT broker. The private loop never enters a JavaScript heap.
+//! Store one lazily-created Arc<Service> in the process Group, not in an isolate.
+//! Each execution retains that Arc until its stack-owned Slot is unregistered.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.box { Box }
+import silk.mem.pointer { Pointer }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Drop }
+import silk.concurrency.atomic { Atomic, MemoryOrder }
+import silk.concurrency.sync { Mutex }
+import silk.concurrency.thread { Concurrent, Transferable }
+import ext.process_abi as process
+import ext.uv_net as net
+import ext.uv_fs as uv
+
+@deferredCallbacks("callback")
+unsafe extern "C" fn uv_async_init(loop: *mut u8, handle: *mut u8, callback: extern "C" fn(*mut u8) -> ()) -> i32
+unsafe extern "C" fn uv_async_send(handle: *mut u8) -> i32
+@foreign(noCapture: .("loop"))
+unsafe extern "C" fn uv_stop(loop: *mut u8) -> ()
+@threadCallbacks("start")
+unsafe extern "C" fn pthread_create(thread: *mut usize, attributes: ?*const u8, start: extern "C" fn(?*mut u8) -> ?*mut u8, argument: ?*mut u8) -> i32
+unsafe extern "C" fn pthread_join(thread: usize, result: ?*mut ?*mut u8) -> i32
+
+// libuv handle kinds are part of its public ABI (UV_ASYNC=1, UV_SIGNAL=16).
+const asyncKind: i32 = 1
+const signalKind: i32 = 16
+const sigint: i32 = 2
+
+/// Native initialization failure: negative libuv status or positive pthread errno.
+pub struct StartError { pub code: i32 }
+
+/// Intrusive execution registration. Do not move or drop a registered slot.
+/// Only `interrupted` may inspect it concurrently with the watchdog thread.
+pub struct Slot { next: ?*mut Slot, flag: u32 }
+impl Slot {
+  pub fn make() -> Self { return Self { next: Pointer.null<Slot>(), flag: 0 } }
+}
+pub fn interrupted(slot: &Slot) -> bool {
+  return unsafe Atomic.load<u32>(Pointer.fromRef<u32>(&slot.flag), MemoryOrder.Acquire) != 0
+}
+
+/// Intrusive JS signal subscription. Its async handle belongs to the subscriber's
+/// loop; detach before closing that handle or moving/freeing this record.
+pub struct Observer { next: ?*mut Observer, pending: u32, wake: *mut u8, linked: bool }
+impl Observer {
+  pub fn make(wake: *mut u8) -> Self {
+    return Self { next: Pointer.null<Observer>(), pending: 0, wake: wake, linked: false }
+  }
+}
+pub fn takePending(observer: &mut Observer) -> u32 {
+  return unsafe Atomic.swap<u32>(Pointer.fromMutRef<u32>(&mut observer.pending), 0, MemoryOrder.Acquire)
+}
+
+struct Control { first: ?*mut Slot, observers: ?*mut Observer, desired: bool, active: bool, stopping: bool, status: i32 }
+impl Transferable for Control {}
+
+// Initialization flags allow every partial construction to use the same cleanup.
+// After startup these fields are immutable. The loop is owned exclusively by its
+// native thread until Service.drop joins it; only then can this destructor run.
+struct Handles {
+  loop: ?*mut u8, wake: ?*mut u8, signal: ?*mut u8,
+  loopReady: bool, wakeReady: bool, signalReady: bool
+}
+impl Handles {
+  fn empty() -> Self {
+    return Self { loop: Pointer.null<u8>(), wake: Pointer.null<u8>(), signal: Pointer.null<u8>(), loopReady: false, wakeReady: false, signalReady: false }
+  }
+}
+export "C" fn silkVMInterruptClosed(handle: *mut u8) -> () {}
+impl Drop for Handles {
+  fn drop(self: &mut Self) -> () {
+    if self.signalReady { unsafe net.uv_close(unsafe nonnull(self.signal), silkVMInterruptClosed) }
+    if self.wakeReady { unsafe net.uv_close(unsafe nonnull(self.wake), silkVMInterruptClosed) }
+    if self.loopReady {
+      // Both handles are closing, so UV_RUN_DEFAULT drains their close callbacks
+      // and returns without waiting for another external event.
+      let _drained = unsafe uv.uv_run(unsafe nonnull(self.loop), 0)
+      let closed = unsafe process.uv_loop_close(unsafe nonnull(self.loop))
+      if closed != 0 { Intrinsic.trap("VM interrupt loop retained a foreign handle") }
+    }
+    unsafe net.free(self.signal) unsafe net.free(self.wake) unsafe net.free(self.loop)
+  }
+}
+
+// The acknowledgement address is computed before publication and never changes.
+// Its Box is owned by Owner, not by the background thread.
+struct Acknowledgement { storage: Box<u32>, pointer: *mut u32 }
+struct Owner { handles: Handles, gate: Mutex<()>, control: Mutex<Control>, ack: Acknowledgement }
+
+/// Share through Arc<Service>. The native thread holds only Owner's stable raw
+/// address, never an Arc; the last external lease therefore stops and joins it.
+pub struct Service { owner: Box<Owner>, thread: usize, started: bool }
+impl Transferable for Service {}
+impl Concurrent for Service {}
+
+unsafe fn nonnull<T>(pointer: ?*mut T) -> *mut T {
+  return unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(pointer)
+}
+unsafe fn ownerFor(handle: *mut u8) -> *mut Owner {
+  return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Owner>(unsafe nonnull(unsafe net.uv_handle_get_data(handle)))
+}
+effect fn allocate(bytes: usize) -> *mut u8 ! OutOfMemoryError {
+  let memory = unsafe net.calloc(1, bytes)
+  if Pointer.isNull<u8>(memory) { fail OutOfMemoryError {} }
+  return unsafe nonnull(memory)
+}
+
+/// Creates an idle watchdog; SIGINT is not watched until the first registration.
+/// All allocation, loop/handle initialization and thread-start failures unwind
+/// their native owners. No native thread retains the service itself.
+pub effect fn make() -> Service ! OutOfMemoryError | StartError {
+  let mut handles = Handles.empty()
+  handles.loop = run allocate(unsafe process.uv_loop_size())
+  let loop = unsafe nonnull(handles.loop)
+  let initialized = unsafe process.uv_loop_init(loop)
+  if initialized != 0 { fail StartError { code: initialized } }
+  handles.loopReady = true
+  handles.wake = run allocate(unsafe net.uv_handle_size(asyncKind))
+  let wake = unsafe nonnull(handles.wake)
+  let asynchronous = unsafe uv_async_init(loop, wake, silkVMInterruptControl)
+  if asynchronous != 0 { fail StartError { code: asynchronous } }
+  handles.wakeReady = true
+  handles.signal = run allocate(unsafe net.uv_handle_size(signalKind))
+  let signal = unsafe nonnull(handles.signal)
+  let initializedSignal = unsafe process.uv_signal_init(loop, signal)
+  if initializedSignal != 0 { fail StartError { code: initializedSignal } }
+  handles.signalReady = true
+
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let gate = run Mutex<()>.make(()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let control = run Mutex<Control>.make(Control { first: Pointer.null<Slot>(), observers: Pointer.null<Observer>(), desired: false, active: false, stopping: false, status: 0 }) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut storage = run Box<u32>.make(0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let acknowledgement = Pointer.fromMutRef<u32>(&mut storage.getMut()[0])
+  let mut owner = run Box<Owner>.make(Owner { handles: move handles, gate: move gate, control: move control, ack: Acknowledgement { storage: move storage, pointer: acknowledgement } }) |> Effect.provideMut<Allocator>(&mut allocator)
+  let pointer = Pointer.fromMutRef<Owner>(&mut owner.getMut()[0])
+  let raw = unsafe Intrinsic.pointerReinterpret<*mut Owner, *mut u8>(pointer)
+  unsafe net.uv_handle_set_data(wake, raw) unsafe net.uv_handle_set_data(signal, raw)
+  let mut watcher = Service { owner: move owner, thread: 0, started: false }
+  let status = unsafe pthread_create(Pointer.fromMutRef<usize>(&mut watcher.thread), Pointer.null<u8>(), silkVMInterruptThread, raw)
+  if status != 0 { fail StartError { code: status } }
+  watcher.started = true
+  return move watcher
+}
+
+export "C" fn silkVMInterruptThread(raw: ?*mut u8) -> ?*mut u8 {
+  let pointer = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Owner>(unsafe nonnull(raw))
+  let anchor = () let owner = unsafe Pointer.borrow<(), Owner>(&anchor, pointer)
+  let _ignored = unsafe uv.uv_run(unsafe nonnull(owner.handles.loop), 0)
+  return Pointer.null<u8>()
+}
+
+// Called only by the private loop, never by the POSIX signal handler. The native
+// registry lock pins the newest slot. Node stops propagation at that watchdog;
+// older nested or concurrent executions are not marked by the same signal.
+export "C" fn silkVMInterruptSignal(handle: *mut u8, signal: i32) -> () {
+  let ownerAnchor = () let mut anchor = ()
+  let owner = unsafe Pointer.borrow<(), Owner>(&ownerAnchor, unsafe ownerFor(handle))
+  let guard = owner.control.lock() let pointer = guard.get().first
+  if !Pointer.isNull<Slot>(pointer) {
+    let slot = unsafe Pointer.borrowMut<(), Slot>(&mut anchor, unsafe nonnull(pointer))
+    unsafe Atomic.store<u32>(Pointer.fromMutRef<u32>(&mut slot.flag), 1, MemoryOrder.Release)
+  } else {
+    let mut current = guard.get().observers
+    while !Pointer.isNull<Observer>(current) {
+      let observer = unsafe Pointer.borrowMut<(), Observer>(&mut anchor, unsafe nonnull(current))
+      let _previous = unsafe Atomic.fetchAdd<u32>(Pointer.fromMutRef<u32>(&mut observer.pending), 1, MemoryOrder.Release)
+      let _notified = unsafe uv_async_send(observer.wake)
+      current = observer.next
+    }
+  }
+}
+
+// Commands are serialized by gate. Only this callback starts/stops the watcher.
+// Its acknowledgement is published after libuv has installed/restored SIGINT.
+export "C" fn silkVMInterruptControl(handle: *mut u8) -> () {
+  let anchor = () let owner = unsafe Pointer.borrow<(), Owner>(&anchor, unsafe ownerFor(handle))
+  let mut guard = owner.control.lock() let control = guard.getMut()
+  control.status = 0
+  if control.desired && !control.active {
+    control.status = unsafe process.uv_signal_start(unsafe nonnull(owner.handles.signal), silkVMInterruptSignal, sigint)
+    control.active = control.status == 0
+  } else {
+    if !control.desired && control.active {
+      // On Unix uv_signal_stop returns 0 for every initialized live handle.
+      let _ignored = unsafe process.uv_signal_stop(unsafe nonnull(owner.handles.signal))
+      control.active = false
+    }
+  }
+  let stopping = control.stopping drop control drop guard
+  if stopping { unsafe uv_stop(unsafe nonnull(owner.handles.loop)) }
+  unsafe Atomic.store<u32>(owner.ack.pointer, 1, MemoryOrder.Release)
+  unsafe Atomic.notifyOne(owner.ack.pointer)
+}
+
+// Caller holds gate but not control. On the supported Unix targets async_send
+// returns 0 for a live async handle; it neither allocates nor loses early wakes.
+fn synchronize(owner: &Owner) -> () {
+  unsafe Atomic.store<u32>(owner.ack.pointer, 0, MemoryOrder.Release)
+  let _ignored = unsafe uv_async_send(unsafe nonnull(owner.handles.wake))
+  while unsafe Atomic.load<u32>(owner.ack.pointer, MemoryOrder.Acquire) == 0 {
+    let _notified = unsafe Atomic.wait(owner.ack.pointer, 0, Option<u64>.none())
+  }
+}
+
+/// Registers a fresh or previously unregistered stable slot without allocation.
+/// Returns 0 only after SIGINT watching is active. A negative libuv start failure
+/// leaves the slot unregistered. The caller must retain Service and the slot's
+/// address until unregister returns, and must not register a slot twice.
+pub unsafe fn register(watcher: &Service, pointer: *mut Slot) -> i32 {
+  let owner = &watcher.owner.get()[0] let _gate = owner.gate.lock()
+  let mut guard = owner.control.lock() let control = guard.getMut()
+  let first = !control.desired
+  let mut anchor = () let slot = unsafe Pointer.borrowMut<(), Slot>(&mut anchor, pointer)
+  unsafe Atomic.store<u32>(Pointer.fromMutRef<u32>(&mut slot.flag), 0, MemoryOrder.Release)
+  slot.next = control.first control.first = pointer control.desired = true
+  drop slot drop control drop guard
+  if !first { return 0 }
+  synchronize(owner)
+  let mut result = owner.control.lock() let status = result.get().status
+  if status != 0 {
+    let failed = result.getMut()
+    failed.first = Pointer.null<Slot>() failed.desired = false drop failed
+    let slot = unsafe Pointer.borrowMut<(), Slot>(&mut anchor, pointer)
+    slot.next = Pointer.null<Slot>()
+  }
+  return status
+}
+
+/// Removes exactly one successful registration. The last slot remains alive in
+/// the registry until the loop acknowledges stop, so a signal arriving during
+/// shutdown still marks a live execution. Read its final flag after unregister.
+/// After return no callback can touch the slot and normal libuv signal behavior
+/// is restored when no other execution remains. There is no per-execution free.
+pub unsafe fn unregister(watcher: &Service, pointer: *mut Slot) -> () {
+  let owner = &watcher.owner.get()[0] let _gate = owner.gate.lock()
+  let mut guard = owner.control.lock() let control = guard.getMut()
+  let mut anchor = () let slot = unsafe Pointer.borrow<(), Slot>(&anchor, pointer)
+  let last = Pointer.address<Slot>(control.first) == Pointer.address<Slot>(pointer) && Pointer.isNull<Slot>(slot.next)
+  drop slot
+  if last && Pointer.isNull<Observer>(control.observers) {
+    control.desired = false drop control drop guard
+    synchronize(owner)
+    let mut finalGuard = owner.control.lock() let finished = finalGuard.getMut()
+    finished.first = Pointer.null<Slot>() drop finished
+    let slot = unsafe Pointer.borrowMut<(), Slot>(&mut anchor, pointer) slot.next = Pointer.null<Slot>()
+    return ()
+  }
+  let mut link = Pointer.fromMutRef<?*mut Slot>(&mut control.first)
+  while !Pointer.isNull<Slot>(unsafe Pointer.read<?*mut Slot>(link)) {
+    let current = unsafe nonnull(unsafe Pointer.read<?*mut Slot>(link))
+    let slot = unsafe Pointer.borrowMut<(), Slot>(&mut anchor, current)
+    if Pointer.address<Slot>(current) == Pointer.address<Slot>(pointer) {
+      unsafe Pointer.put<?*mut Slot>(link, slot.next) slot.next = Pointer.null<Slot>() return ()
+    }
+    link = Pointer.fromMutRef<?*mut Slot>(&mut slot.next) drop slot
+  }
+  Intrinsic.trap("VM interrupt slot was not registered with this service")
+}
+
+/// Registers an observer only once. The caller owns the service and observer.
+pub unsafe fn observe(watcher: &Service, pointer: *mut Observer) -> i32 {
+  let owner = &watcher.owner.get()[0] let _gate = owner.gate.lock()
+  let mut guard = owner.control.lock() let control = guard.getMut()
+  let mut anchor = () let observer = unsafe Pointer.borrowMut<(), Observer>(&mut anchor, pointer)
+  if observer.linked { return 0 }
+  let first = !control.desired
+  unsafe Atomic.store<u32>(Pointer.fromMutRef<u32>(&mut observer.pending), 0, MemoryOrder.Release)
+  observer.next = control.observers observer.linked = true
+  control.observers = pointer control.desired = true
+  drop observer drop control drop guard
+  if !first { return 0 }
+  synchronize(owner)
+  let mut result = owner.control.lock() let status = result.get().status
+  if status != 0 {
+    let failed = result.getMut()
+    failed.observers = Pointer.null<Observer>() failed.desired = false drop failed
+    let observer = unsafe Pointer.borrowMut<(), Observer>(&mut anchor, pointer)
+    observer.next = Pointer.null<Observer>() observer.linked = false
+  }
+  return status
+}
+
+/// Idempotent detach. No private-loop callback can touch the observer afterward.
+pub unsafe fn unobserve(watcher: &Service, pointer: *mut Observer) -> () {
+  let owner = &watcher.owner.get()[0] let _gate = owner.gate.lock()
+  let mut guard = owner.control.lock() let control = guard.getMut()
+  let mut anchor = () let observer = unsafe Pointer.borrow<(), Observer>(&anchor, pointer)
+  if !observer.linked { return () }
+  drop observer
+  let mut link = Pointer.fromMutRef<?*mut Observer>(&mut control.observers)
+  while !Pointer.isNull<Observer>(unsafe Pointer.read<?*mut Observer>(link)) {
+    let current = unsafe nonnull(unsafe Pointer.read<?*mut Observer>(link))
+    let observer = unsafe Pointer.borrowMut<(), Observer>(&mut anchor, current)
+    if Pointer.address<Observer>(current) == Pointer.address<Observer>(pointer) {
+      unsafe Pointer.put<?*mut Observer>(link, observer.next)
+      observer.next = Pointer.null<Observer>() observer.linked = false
+      unsafe Atomic.store<u32>(Pointer.fromMutRef<u32>(&mut observer.pending), 0, MemoryOrder.Release)
+      drop observer
+      let last = Pointer.isNull<Observer>(control.observers) && Pointer.isNull<Slot>(control.first)
+      if last {
+        control.desired = false drop control drop guard
+        synchronize(owner)
+      }
+      return ()
+    }
+    link = Pointer.fromMutRef<?*mut Observer>(&mut observer.next) drop observer
+  }
+  Intrinsic.trap("SIGINT observer was not registered with this service")
+}
+
+impl Drop for Service {
+  fn drop(self: &mut Self) -> () {
+    if !self.started { return () }
+    let owner = &self.owner.get()[0]
+    let mut guard = owner.control.lock() let control = guard.getMut()
+    // A live registered execution must own an external Arc lease.
+    if !Pointer.isNull<Slot>(control.first) || !Pointer.isNull<Observer>(control.observers) {
+      Intrinsic.trap("SIGINT service dropped with registered clients")
+    }
+    control.desired = false control.stopping = true drop control drop guard
+    synchronize(owner)
+    let joined = unsafe pthread_join(self.thread, Pointer.null<?*mut u8>())
+    if joined != 0 { Intrinsic.trap("VM interrupt thread could not be joined") }
+    self.started = false
+    // Implicit field destruction now closes/drains the loop and frees all owners.
+  }
+}

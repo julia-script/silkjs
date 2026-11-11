@@ -1,0 +1,602 @@
+//! Real QuickJS realms and compiled scripts. Handles are native functions so the
+//! existing engine GC traces their realm and captured bytecode, including cycles.
+//! RUN installs a stack-owned, nested interrupt deadline through host hook 3098.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silkjs.js_owned_value { Value, lendFor }
+import silkjs.js_realm { lendRealm }
+import silk.mem.pointer { Pointer }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.num.usize
+import silk.num.f64
+import silk.num.u64
+import silkjs.js_os_events_platform as clock
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_heap { CellRef, HeapCell, HeapHeader }
+import silkjs.js_core_types { ContextState, RuntimeState, ObjectData, ObjectPayload, FunctionBytecode, FunctionDebugInfo, FrameSlots, NativeFunctionId, NativeCallProtocol, NativeErrorKind, JobEntry, HostHook, StackFrame }
+import silkjs.js_value { ValueBits }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_coercion_host { CoercionHooks }
+import silkjs.js_intrinsic_install as intrinsics
+import silkjs.js_native_functions as functions
+import silkjs.js_runtime as runtime
+import silkjs.js_runtime_jobs as jobs
+import silkjs.js_gc as gc
+import silkjs.js_eval_compile as compiler
+import silkjs.js_eval as evaluation
+import ext.script_cache
+import silkjs.js_buffer_storage as buffers
+import libs.core.common as common
+import libs.core.host as host
+import silkjs.js_object_allocate as objects
+import ext.vm_global
+import silkjs.js_module_native as modules
+import silkjs.js_module_metadata { ModuleMetadataError }
+import silkjs.js_module_linker as linker
+import silkjs.js_module_namespace as namespaces
+import silkjs.js_core_types { ModuleDef, ModuleStatus }
+import silkjs.js_string_types { StringLengthError }
+import silkjs.js_eval_errors as errors
+import silkjs.js_promise as promises
+import silkjs.js_error_intrinsics as errorIntrinsics
+import ext.vm_interrupt
+import libs.core.intl as intl
+import silkjs.js_runtime_registry { ClassIdAllocator }
+import ext.vm_interrupt { Slot }
+import silkjs.js_atomics_native as atomics
+import ext.inspector_debugger as inspectorDebugger
+
+pub const OPERATION_COUNT: u32 = 14
+/// Handled by [`createContext`], which needs the runtime's class namespace.
+pub const CREATE_CONTEXT: u32 = 0
+pub const RUN: u32 = 4
+pub const HANDLE_CALLBACK_ID: u32 = 3099
+pub const INTERRUPT_CALLBACK_ID: u32 = 3098
+pub struct Deadline { pub end: i64, pub previous: ?*mut Deadline, pub expired: bool, pub watchSignal: bool, pub signal: vm_interrupt.Slot }
+impl Deadline {
+  pub fn make(timeout: f64) -> Self {
+    let mut end: i64 = 0
+    if timeout > 0.0 { end = clock.nowNanoseconds() + f64.toI64(timeout) * 1000000 }
+    return Self { end: end, previous: Pointer.null<Deadline>(), expired: false, watchSignal: false, signal: Slot.make() }
+  }
+}
+// Caller keeps the stack-owned deadline at a stable address until restoring the
+// returned hook. This shares the VM chain rather than replacing outer deadlines.
+pub unsafe fn beginDeadline(rt: *mut HeapHeader, deadline: *mut Deadline) -> HostHook {
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+  let mut deadlineAnchor = () let current = unsafe Pointer.borrowMut<(), Deadline>(&mut deadlineAnchor, deadline)
+  if let Option<NativeFunctionId>.Some { value: callback } = state.interrupt.callback {
+    if hostId(callback, INTERRUPT_CALLBACK_ID) {
+      current.previous = unsafe Intrinsic.pointerReinterpret<?*mut u8, ?*mut Deadline>(state.interrupt.opaque)
+    }
+  }
+  drop current
+  return Intrinsic.replace(state.interrupt, HostHook {
+    callback: Option<NativeFunctionId>.some(NativeFunctionId.Host { id: INTERRUPT_CALLBACK_ID }),
+    opaque: unsafe Intrinsic.pointerReinterpret<*mut Deadline, *mut u8>(deadline)
+  })
+}
+pub unsafe fn interrupt(opaque: ?*mut u8) -> bool {
+  let now = clock.nowNanoseconds()
+  let mut cursor = unsafe Intrinsic.pointerReinterpret<?*mut u8, ?*mut Deadline>(opaque)
+  while let Option<*mut Deadline>.Some { value: pointer } = Pointer.nonNullMut<Deadline>(cursor) {
+    let mut anchor = () let deadline = unsafe Pointer.borrowMut<(), Deadline>(&mut anchor, pointer)
+    if deadline.watchSignal && vm_interrupt.interrupted(&deadline.signal) { return true }
+    if deadline.expired || (deadline.end != 0 && now >= deadline.end) { deadline.expired = true return true }
+    cursor = deadline.previous
+  }
+  return false
+}
+export "C" fn silkVMWaitInterrupt(opaque: ?*mut u8) -> u8 {
+  if unsafe interrupt(opaque) { return 1 } return 0
+}
+// A blocking host operation must not sleep past the earliest nested VM
+// deadline. -1 means no deadline; cancellation is materialized by interrupt().
+pub unsafe fn remainingNanoseconds(rt: *mut HeapHeader) -> i64 {
+  let anchor = ()
+  let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+  let mut cursor = Pointer.null<Deadline>()
+  if let Option<NativeFunctionId>.Some { value: callback } = state.interrupt.callback {
+    if hostId(callback, INTERRUPT_CALLBACK_ID) {
+      cursor = unsafe Intrinsic.pointerReinterpret<?*mut u8, ?*mut Deadline>(state.interrupt.opaque)
+    }
+  }
+  drop state
+  let now = clock.nowNanoseconds()
+  let mut remaining: i64 = -1
+  while let Option<*mut Deadline>.Some { value: pointer } = Pointer.nonNullMut<Deadline>(cursor) {
+    let deadline = unsafe Pointer.borrow<(), Deadline>(&anchor, pointer)
+    if deadline.expired || (deadline.watchSignal && vm_interrupt.interrupted(&deadline.signal)) { return 0 }
+    if deadline.end != 0 {
+      let interval = deadline.end - now
+      if interval <= 0 { return 0 }
+      if remaining < 0 || interval < remaining { remaining = interval }
+    }
+    cursor = deadline.previous
+  }
+  return remaining
+}
+pub fn name(operation: u32) -> &'static [u8] {
+  return match operation {
+    0 => b"vmCreateContext" 1 => b"vmGlobal" 2 => b"vmSetGlobal"
+    3 => b"vmCompile" 4 => b"vmRun" 5 => b"vmCloneScript"
+    6 => b"vmWriteCache" 7 => b"vmSetCodeGeneration"
+    8 => b"vmValidateFunctionBody" 9 => b"vmContextGlobal"
+    10 => b"vmSetImportModuleDynamically" 11 => b"vmWasmNative"
+    12 => b"vmReadCache"
+    13 => b"vmModule"
+    _ => Intrinsic.trap("unknown VM operation")
+  }
+}
+unsafe fn object(value: ValueBits) -> *mut HeapHeader {
+  return match value { ValueBits.Object { reference } => reference _ => Intrinsic.trap("VM handle invariant") }
+}
+fn hostId(callback: NativeFunctionId, expected: u32) -> bool {
+  return match callback { NativeFunctionId.Host { id } => id == expected _ => false }
+}
+pub unsafe effect fn rejectHandleCall<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader) -> ValueBits ! JsException ? &mut Allocator {
+  return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"VM handles are not callable")
+}
+unsafe effect fn realm<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, value: ValueBits, handleId: u32) -> *mut HeapHeader ! JsException ? &mut Allocator {
+  if let ValueBits.Undefined = value { return context }
+  if value.isObject() {
+    let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, unsafe object(value))
+    if let ObjectPayload.NativeFunction { function } = &data.payload {
+      if hostId(function.function, handleId) && !function.isDataFunction() {
+        if let Option<*mut HeapHeader>.Some { value: target } = Pointer.nonNullMut<HeapHeader>(function.realm()) { return target }
+      }
+    }
+  }
+  return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Invalid VM context handle")
+}
+unsafe effect fn bytecode<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, value: ValueBits, handleId: u32) -> ValueBits ! JsException ? &mut Allocator {
+  if value.isObject() {
+    let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, unsafe object(value))
+    if let ObjectPayload.NativeFunction { function } = &data.payload {
+      if hostId(function.function, handleId) && function.isDataFunction() && unsafe function.capturedCount() == 2 {
+        return unsafe function.capturedGet(0)
+      }
+    }
+  }
+  return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Invalid VM script handle")
+}
+// Consumes compiled on both success and failure. Data functions carry no realm,
+// so the handle also captures a context handle whose realm is the target.
+unsafe effect fn scriptHandle<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, compiled: ValueBits, handleId: u32) -> ValueBits ! JsException ? &mut Allocator {
+  let memory = engine.memory let rt = unsafe runtime.contextRuntime(context)
+  let carried = run Effect.result(functions.newFunction(&mut engine, memory, unsafe lendRealm(&context, context), NativeFunctionId.Host { id: handleId }, b"", 0, NativeCallProtocol.Generic, 0))
+  let carrier = match move carried {
+    Result<ValueBits, JsException>.Success { value } => value
+    Result<ValueBits, JsException>.Failure { error } => { unsafe gc.release(&mut engine, rt, compiled) fail move error }
+  }
+  let captures = [compiled, carrier]
+  let made = run Effect.result(functions.newDataFunction(&mut engine, memory, unsafe lendRealm(&context, context), NativeFunctionId.Host { id: handleId }, 0, 0, &captures))
+  unsafe gc.release(&mut engine, rt, compiled) unsafe gc.release(&mut engine, rt, carrier)
+  return match move made { Result<ValueBits, JsException>.Success { value } => value Result<ValueBits, JsException>.Failure { error } => { fail move error } }
+}
+// VM Script construction does not bind its source to an execution context.
+// Synthetic compileFunction factories remain deferred until the returned body
+// is annotated by setFunctionSource; modules retain compilation publication.
+unsafe effect fn publishedHandle<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  compiled: ValueBits, handleId: u32) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  if let ValueBits.FunctionBytecode { .. } = compiled {
+    run unsafe inspectorDebugger.deferSource(compiled, true)
+    return run unsafe scriptHandle(&mut engine, context, compiled, handleId)
+  }
+  let published = run Effect.result(EngineServices.configuredBytecode(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(compiled)))
+  if let Result<(), OutOfMemoryError | JsException>.Failure { error } = move published {
+    unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), compiled) fail move error
+  }
+  return run unsafe scriptHandle(&mut engine, context, compiled, handleId)
+}
+// Consumes the unpublished bytecode even if recursive metadata setup fails.
+unsafe effect fn configuredHandle<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader,
+  compiled: ValueBits, handleId: u32, argv: &FrameSlots, start: usize, filename: ValueBits) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let line = offsetArgument(argv, start)
+  let column = offsetArgument(argv, start + 1)
+  let prefix = offsetArgument(argv, start + 2)
+  let configured = run Effect.result(unsafe script_cache.configureVm(&mut engine, context, compiled, line, column, prefix, filename))
+  match move configured {
+    Result<(), JsException>.Success { .. } => ()
+    Result<(), JsException>.Failure { error } => {
+      unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), compiled) fail move error
+    }
+  }
+  return run unsafe publishedHandle(&mut engine, context, compiled, handleId)
+}
+fn offsetArgument(argv: &FrameSlots, index: usize) -> i32 {
+  let value = unsafe common.argument(argv, index)
+  if let ValueBits.Undefined = value { return 0 }
+  return f64.toI32(value.numericValue())
+}
+// Select one realm's FIFO without running jobs belonging to another realm.
+// Jobs retain their contexts; removing/pushing a node never changes ownership.
+unsafe fn selectJob(context: *mut HeapHeader) -> bool {
+  let rt = unsafe runtime.contextRuntime(context) let mut anchor = ()
+  let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+  let mut cursor = state.jobs.first
+  while let Option<*mut HeapHeader>.Some { value: node } = Pointer.nonNullMut<HeapHeader>(cursor) {
+    let readAnchor = () let entry = unsafe HeapCell.payload<JobEntry, ()>(&readAnchor, node)
+    let selected = Pointer.address<HeapHeader>(entry.realm) == Pointer.address<HeapHeader>(context) drop entry
+    if selected { unsafe state.jobs.remove(node) unsafe state.jobs.pushFront(node) return true }
+    cursor = unsafe HeapCell.nextLinked(node)
+  }
+  return false
+}
+/// Select the next ordinary host job without consuming private realm queues.
+/// Call immediately before executePendingJob, with exclusive runtime access.
+pub unsafe fn sharedJobPending(rt: *mut HeapHeader) -> bool {
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+  let mut cursor = state.jobs.first
+  while let Option<*mut HeapHeader>.Some { value: node } = Pointer.nonNullMut<HeapHeader>(cursor) {
+    let readAnchor = () let entry = unsafe HeapCell.payload<JobEntry, ()>(&readAnchor, node)
+    let context = entry.realm drop entry
+    if let Option<*mut HeapHeader>.Some { value: realm } = Pointer.nonNullMut<HeapHeader>(context) {
+      let data = unsafe HeapCell.payload<ContextState, ()>(&readAnchor, realm)
+      let selected = !data.privateJobQueue drop data
+      if selected { unsafe state.jobs.remove(node) unsafe state.jobs.pushFront(node) return true }
+    }
+    cursor = unsafe HeapCell.nextLinked(node)
+  }
+  return false
+}
+/// Realm setup shared by every `vm` context: Node stack formatting and Intl.
+unsafe effect fn configureRealm<'m, S: EngineServices>(engine: &mut Engine<'m, S>, created: *mut HeapHeader, classes: &ClassIdAllocator) -> () ! JsException ? &mut Allocator {
+  let memory = engine.memory
+  run errorIntrinsics.enableNodeStackFormatting(&mut engine, memory, unsafe lendRealm(&created, created))
+  run unsafe intl.install(&mut engine, created, classes)
+}
+/// Operation CREATE_CONTEXT: a new realm, returned as its handle function.
+pub unsafe effect fn createContext<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, argv: &FrameSlots, classes: &ClassIdAllocator) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let handleId = HANDLE_CALLBACK_ID
+  let memory = engine.memory let rt = unsafe runtime.contextRuntime(context)
+  let created = run unsafe intrinsics.create(&mut engine, memory, rt)
+  let configured = run Effect.result(unsafe configureRealm(&mut engine, created, classes))
+  if let Result<(), JsException>.Failure { error } = move configured {
+    unsafe gc.releaseHeader(&mut engine, rt, created) fail move error
+  }
+  let mut anchor = () let state = unsafe HeapCell.payloadMut<ContextState, ()>(&mut anchor, created)
+  state.privateJobQueue = match unsafe common.argument(argv, 0) { ValueBits.Bool { value } => value _ => false } drop state
+  let made = run Effect.result(functions.newFunction(&mut engine, memory, unsafe lendRealm(&created, created), NativeFunctionId.Host { id: handleId }, b"", 0, NativeCallProtocol.Generic, 0))
+  unsafe gc.releaseHeader(&mut engine, rt, created)
+  return match move made { Result<ValueBits, JsException>.Success { value } => value Result<ValueBits, JsException>.Failure { error } => { fail move error } }
+}
+pub unsafe effect fn dispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, operation: u32, argc: i32, argv: &FrameSlots, watchdog: ?*const vm_interrupt.Service) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let handleId = HANDLE_CALLBACK_ID
+  let memory = engine.memory let rt = unsafe runtime.contextRuntime(context)
+  let first = unsafe common.argument(argv, 0)
+  if operation == 13 { return run unsafe moduleDispatch(&mut engine, context, argv) }
+  if operation == 10 {
+    let compiled = run unsafe bytecode(&mut engine, context, first, handleId)
+    let mut code = compiled let mut owner = ValueBits.Undefined
+    if let ValueBits.Module { reference } = compiled {
+      let anchor = () let data = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, reference)
+      code = data.functionObject.view() owner = compiled
+    }
+    run modules.configureHostCallbacks(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(code), unsafe lendFor(unsafe common.argument(argv, 1)), unsafe lendFor(owner))
+    return ValueBits.Undefined
+  }
+  if operation == 11 {
+    let target = run unsafe realm(&mut engine, context, first, handleId)
+    return run functions.newFunction(&mut engine, memory, unsafe lendRealm(&target, target), NativeFunctionId.Host { id: 9000 }, b"wasmNative", 2, NativeCallProtocol.Generic, 0)
+  }
+  if operation == 9 {
+    let target = run unsafe realm(&mut engine, context, first, handleId)
+    let handlers = unsafe common.argument(argv, 1)
+    let classId = f64.toU32((unsafe common.argument(argv, 2)).numericValue())
+    let sandbox = unsafe common.argument(argv, 3)
+    let backingGlobal = unsafe common.argument(argv, 4)
+    return run unsafe vm_global.make(&mut engine, target, handlers, sandbox, backingGlobal, classId)
+  }
+  if operation == 1 || operation == 2 || operation == 7 {
+    let target = run unsafe realm(&mut engine, context, first, handleId)
+    let mut anchor = () let state = unsafe HeapCell.payloadMut<ContextState, ()>(&mut anchor, target)
+    if operation == 1 { return state.globalObject.dup().intoBits() }
+    if operation == 7 {
+      state.codeGenerationAllowed = match unsafe common.argument(argv, 1) { ValueBits.Bool { value } => value _ => true }
+      return ValueBits.Undefined
+    }
+    let incoming = unsafe common.argument(argv, 1)
+    if !incoming.isObject() { drop state return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"VM global must be an object") }
+    let needsBindings = !state.globalProxyBindings.view().isObject() drop state
+    let mut bindings = ValueBits.Undefined
+    if needsBindings { bindings = run objects.withPrototype(&mut engine, memory, unsafe lendRealm(&target, target), unsafe lendFor(ValueBits.Null)) }
+    let updated = unsafe HeapCell.payloadMut<ContextState, ()>(&mut anchor, target)
+    if needsBindings { updated.globalProxyBindings = unsafe Value.adoptBits(bindings) }
+    let previous = Intrinsic.replace(updated.globalObject, unsafe Value.retain(incoming))
+    if updated.globalObjectStorage.view().isObject() { drop updated unsafe gc.release(&mut engine, rt, previous.intoBits()) }
+    else { updated.globalObjectStorage = move previous drop updated }
+    return ValueBits.Undefined
+  }
+  if operation == 3 || operation == 8 {
+    let source = run unsafe host.text(&mut engine, context, first)
+    let filename = run unsafe host.text(&mut engine, context, unsafe common.argument(argv, 1))
+    let target = run unsafe realm(&mut engine, context, unsafe common.argument(argv, 2), handleId)
+    // Explicit host compilation is independent of the realm's eval policy.
+    let mut flags = compiler.FLAG_COMPILE_ONLY | compiler.FLAG_NODE_VM_DIAGNOSTICS
+    if operation == 8 { flags = flags | compiler.FLAG_VALIDATE_FUNCTION_BODY }
+    let compiled = run unsafe compiler.compile(&mut engine, memory, unsafe lendRealm(&target, target), source.asSlice(), ValueBits.Undefined, filename.asSlice(), flags, -1, Pointer.null<StackFrame>())
+    if operation == 8 { unsafe gc.release(&mut engine, rt, compiled) return ValueBits.Undefined }
+    return run unsafe configuredHandle(&mut engine, target, compiled, handleId, argv, 3, ValueBits.Undefined)
+  }
+  if operation == 12 {
+    let input = (run buffers.requireBuffer(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(first), 0)).header()
+    if !unsafe buffers.canLeaseReadBacking(input) {
+      return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Syntax, b"VM cache requires stable owned bytes")
+    }
+    let offsetValue = unsafe common.argument(argv, 1)
+    let lengthValue = unsafe common.argument(argv, 2)
+    if !offsetValue.isNumber() || !lengthValue.isNumber() {
+      return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Syntax, b"Invalid VM cache extent")
+    }
+    let offsetNumber = offsetValue.numericValue() let lengthNumber = lengthValue.numericValue()
+    if !(offsetNumber >= 0.0 && offsetNumber <= 9007199254740991.0 && lengthNumber >= 32.0 && lengthNumber <= 9007199254740991.0) {
+      return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Syntax, b"Invalid VM cache extent")
+    }
+    let offset = f64.toU64(offsetNumber) let length = f64.toU64(lengthNumber)
+    let backing = unsafe buffers.snapshot(input)
+    if u64.toF64(offset) != offsetNumber || u64.toF64(length) != lengthNumber
+      || offset > backing.byteLength || length > backing.byteLength - offset {
+      return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Syntax, b"Invalid VM cache extent")
+    }
+    // No JavaScript callbacks occur between this snapshot and owned decoding.
+    // The JS envelope layer has already copied shared/external caller input.
+    let compiled = run unsafe script_cache.read(&mut engine, context, unsafe buffers.dataAt(backing.data, offset), u64.toUsize(length))
+    return run unsafe configuredHandle(&mut engine, context, compiled, handleId, argv, 4, unsafe common.argument(argv, 3))
+  }
+  let compiled = run unsafe bytecode(&mut engine, context, first, handleId)
+  if operation == 6 {
+    let bytes = run unsafe script_cache.write(&mut engine, context, compiled)
+    let pointer = Pointer.fromRef<u8>(&bytes.asSlice()[0])
+    return run unsafe buffers.newArrayBufferCopy(&mut engine, memory, unsafe lendRealm(&context, context), pointer, usize.toU64(bytes.length()))
+  }
+  if operation == 5 {
+    let target = run unsafe realm(&mut engine, context, unsafe common.argument(argv, 1), handleId)
+    let clone = run unsafe script_cache.clone(&mut engine, context, target, compiled)
+    if argc >= 5 { return run unsafe configuredHandle(&mut engine, target, clone, handleId, argv, 2, ValueBits.Undefined) }
+    return run unsafe publishedHandle(&mut engine, target, clone, handleId)
+  }
+  if operation == RUN {
+    let mut target = unsafe handleRealm(first)
+    if let ValueBits.FunctionBytecode { reference } = compiled {
+      let anchor = () let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference)
+      target = code.realm
+    }
+    let mut factory = false
+    if let ValueBits.FunctionBytecode { reference } = compiled {
+      let anchor = () let code = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference)
+      if let Option<FunctionDebugInfo>.Some { value: debug } = &code.debug { factory = debug.sourceColumnOffset > 0 }
+    }
+    // Node publishes every Script execution, including repeated runs in one realm.
+    // Invoke before installing the deadline and without any live Services borrow.
+    if !factory {
+      // Eligibility must survive execution before any inspector state exists.
+      run unsafe inspectorDebugger.deferSource(compiled, false)
+      run EngineServices.configuredBytecode(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(compiled))
+    }
+    let timeout = (unsafe common.argument(argv, 1)).numericValue()
+    let mut deadline = Deadline { end: 0, previous: Pointer.null<Deadline>(), expired: false, watchSignal: !Pointer.isNull<vm_interrupt.Service>(watchdog), signal: Slot.make() }
+    if timeout > 0.0 { deadline.end = clock.nowNanoseconds() + f64.toI64(timeout) * 1000000 }
+    if deadline.watchSignal {
+      let anchor = ()
+      let watcher = unsafe Pointer.borrow<(), vm_interrupt.Service>(&anchor, unsafe Intrinsic.pointerRequalify<?*const vm_interrupt.Service, *const vm_interrupt.Service>(watchdog))
+      if unsafe vm_interrupt.register(&watcher, Pointer.fromMutRef<vm_interrupt.Slot>(&mut deadline.signal)) != 0 {
+        return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Internal, b"ERR_CANNOT_WATCH_SIGINT: Cannot watch for SIGINT signals")
+      }
+    }
+    let mut anchor = () let state = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, rt)
+    if let Option<NativeFunctionId>.Some { value: callback } = state.interrupt.callback {
+      if hostId(callback, INTERRUPT_CALLBACK_ID) {
+        deadline.previous = unsafe Intrinsic.pointerReinterpret<?*mut u8, ?*mut Deadline>(state.interrupt.opaque)
+      }
+    }
+    let saved = Intrinsic.replace(state.interrupt, HostHook {
+      callback: Option<NativeFunctionId>.some(NativeFunctionId.Host { id: INTERRUPT_CALLBACK_ID }),
+      opaque: unsafe Intrinsic.pointerReinterpret<*mut Deadline, *mut u8>(Pointer.fromMutRef<Deadline>(&mut deadline))
+    }) drop state
+    let afterEvaluate = match unsafe common.argument(argv, 2) { ValueBits.Bool { value } => value _ => false }
+    let previousDomain = engine.domain
+    if deadline.watchSignal || deadline.end != 0 {
+      engine.domain = unsafe atomics.withInterrupt(previousDomain, silkVMWaitInterrupt,
+        unsafe Intrinsic.pointerReinterpret<*mut Deadline, *mut u8>(Pointer.fromMutRef<Deadline>(&mut deadline)))
+    }
+    let outcome = run Effect.result(unsafe execute(&mut engine, target, compiled, afterEvaluate))
+    engine.domain = previousDomain
+    unsafe runtime.setInterruptHandler(rt, move saved)
+    if deadline.watchSignal {
+      let serviceAnchor = ()
+      let watcher = unsafe Pointer.borrow<(), vm_interrupt.Service>(&serviceAnchor, unsafe Intrinsic.pointerRequalify<?*const vm_interrupt.Service, *const vm_interrupt.Service>(watchdog))
+      unsafe vm_interrupt.unregister(&watcher, Pointer.fromMutRef<vm_interrupt.Slot>(&mut deadline.signal))
+    }
+    let interrupted = vm_interrupt.interrupted(&deadline.signal)
+    if interrupted || deadline.expired {
+      if let Result<ValueBits, OutOfMemoryError | JsException>.Success { value } = &outcome {
+        // The host replaces this evaluation's rejection with its termination
+        // error. Its private Promise must not escape as an unhandled rejection.
+        if promises.stateOf(unsafe lendFor(value)) >= 0 { run promises.markHandled(&mut engine, unsafe lendRealm(&target, target), unsafe lendFor(value)) }
+        unsafe gc.release(&mut engine, rt, value)
+      }
+      if interrupted {
+        return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Internal, b"ERR_SCRIPT_EXECUTION_INTERRUPTED: Script execution was interrupted by SIGINT")
+      }
+      return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Internal, b"ERR_SCRIPT_EXECUTION_TIMEOUT: Script execution timed out")
+    }
+    return match move outcome {
+      Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value
+      Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => { fail move error }
+    }
+  }
+  return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Unknown VM operation")
+}
+unsafe effect fn drain<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  while unsafe selectJob(context) {
+    let result = run unsafe jobs.executePendingJob(&mut engine, unsafe runtime.contextRuntime(context))
+    if result.status < 0 { fail JsException {} }
+  }
+}
+unsafe effect fn execute<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, compiled: ValueBits, afterEvaluate: bool) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let memory = engine.memory
+  let result = (run evaluation.evaluateFunction(&mut engine, memory, unsafe lendRealm(&context, context), unsafe Value.retain(compiled))).intoBits()
+  if afterEvaluate {
+    let drained = run Effect.result(unsafe drain(&mut engine, context))
+    match move drained {
+      Result<(), OutOfMemoryError | JsException>.Success { .. } => ()
+      Result<(), OutOfMemoryError | JsException>.Failure { error } => {
+        unsafe gc.release(&mut engine, unsafe runtime.contextRuntime(context), result)
+        fail move error
+      }
+    }
+  }
+  return result
+}
+
+unsafe fn handleRealm(handle: ValueBits) -> *mut HeapHeader {
+  let anchor = () let data = unsafe HeapCell.payload<ObjectData, ()>(&anchor, unsafe object(handle))
+  let carrier = match &data.payload {
+    ObjectPayload.NativeFunction { function } => { if !function.isDataFunction() || unsafe function.capturedCount() != 2 { Intrinsic.trap("VM handle realm invariant") } unsafe function.capturedGet(1) }
+    _ => Intrinsic.trap("VM handle realm invariant")
+  } drop data
+  let carried = unsafe HeapCell.payload<ObjectData, ()>(&anchor, unsafe object(carrier))
+  if let ObjectPayload.NativeFunction { function } = &carried.payload {
+    if let Option<*mut HeapHeader>.Some { value } = Pointer.nonNullMut<HeapHeader>(function.realm()) { return value }
+  }
+  return Intrinsic.trap("VM handle realm invariant")
+}
+pub unsafe effect fn initializeSynthetic<'m, S: EngineServices>(engine: &mut Engine<'m, S>,
+  context: *mut HeapHeader, module: *mut HeapHeader) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  let callback = modules.getPrivateValue(unsafe CellRef<ModuleDef>.of(module)).intoBits()
+  let called = run Effect.result(promises.call(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(callback), unsafe lendFor(ValueBits.Undefined), &[]))
+  let rt = unsafe runtime.contextRuntime(context) unsafe gc.release(&mut engine, rt, callback)
+  match move called {
+    Result<Value, JsException>.Success { value } => { unsafe gc.release(&mut engine, rt, value.intoBits()) }
+    Result<Value, JsException>.Failure { error } => { fail move error }
+  }
+}
+unsafe effect fn moduleDispatch<'m, S: EngineServices>(engine: &mut Engine<'m, S>,
+  context: *mut HeapHeader, argv: &FrameSlots) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let outcome = run Effect.result(unsafe moduleOperation(&mut engine, context, argv))
+  return match move outcome {
+    Result<ValueBits, OutOfMemoryError | StringLengthError | ModuleMetadataError | JsException>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError | StringLengthError | ModuleMetadataError | JsException>.Failure { error } => {
+      match move error {
+        ModuleMetadataError _duplicate => { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Syntax, b"Duplicate synthetic module export") }
+        OutOfMemoryError allocation => { return run errors.materialize<ValueBits, Engine<'m, S>>(&mut engine, unsafe lendRealm(&context, context), move allocation) }
+        StringLengthError length => { return run errors.materialize<ValueBits, Engine<'m, S>>(&mut engine, unsafe lendRealm(&context, context), move length) }
+        JsException signal => { fail move signal }
+      }
+    }
+  }
+}
+unsafe effect fn moduleOperation<'m, S: EngineServices>(engine: &mut Engine<'m, S>,
+  context: *mut HeapHeader, argv: &FrameSlots) -> ValueBits ! OutOfMemoryError | StringLengthError | ModuleMetadataError | JsException ? &mut Allocator {
+  let operation = f64.toU32((unsafe common.argument(argv, 0)).numericValue())
+  let first = unsafe common.argument(argv, 1)
+  let memory = engine.memory let rt = unsafe runtime.contextRuntime(context)
+  if operation == 0 {
+    let source = run unsafe host.text(&mut engine, context, first)
+    let filename = run unsafe host.text(&mut engine, context, unsafe common.argument(argv, 2))
+    let target = run unsafe realm(&mut engine, context, unsafe common.argument(argv, 3), HANDLE_CALLBACK_ID)
+    let flags = compiler.TYPE_MODULE | compiler.FLAG_COMPILE_ONLY | compiler.FLAG_UNLINKED_MODULE | compiler.FLAG_NODE_VM_DIAGNOSTICS
+    let compiled = run unsafe compiler.compile(&mut engine, memory, unsafe lendRealm(&target, target), source.asSlice(), ValueBits.Undefined, filename.asSlice(), flags, -1, Pointer.null<StackFrame>())
+    let reference = match compiled { ValueBits.Module { reference } => reference _ => Intrinsic.trap("compiled module invariant") }
+    let mut anchor = () let data = unsafe HeapCell.payloadMut<ModuleDef, ()>(&mut anchor, reference)
+    // Explicit VM linking owns resolution; ordinary loader-error cleanup must
+    // never discard these independently constructed module records.
+    data.resolved = true data.hostOwnedGraph = true
+    let code = data.functionObject.view() drop data
+    unsafe gc.detachModule(&mut engine, rt, reference)
+    let configured = run Effect.result(unsafe script_cache.configureVm(&mut engine, target, code, offsetArgument(argv, 4), offsetArgument(argv, 5), 0, ValueBits.Undefined))
+    if let Result<(), JsException>.Failure { error } = move configured {
+      unsafe gc.release(&mut engine, rt, compiled) fail move error
+    }
+    return run unsafe publishedHandle(&mut engine, target, compiled, HANDLE_CALLBACK_ID)
+  }
+  if operation == 1 {
+    let filename = run unsafe host.text(&mut engine, context, first)
+    let target = run unsafe realm(&mut engine, context, unsafe common.argument(argv, 2), HANDLE_CALLBACK_ID)
+    let module = run modules.newNativeModule(unsafe lendRealm(&target, target), filename.asSlice(), NativeFunctionId.Host { id: 3097 })
+    let mut anchor = () let data = module.getMut(&mut anchor)
+    data.resolved = true data.hostOwnedGraph = true drop data
+    modules.setPrivateValue(&mut engine, unsafe lendRealm(&target, target), module, unsafe Value.retain(unsafe common.argument(argv, 3)))
+    unsafe HeapCell.retain(module.header())
+    unsafe gc.detachModule(&mut engine, rt, module.header())
+    return run unsafe scriptHandle(&mut engine, target, ValueBits.Module { reference: module.header() }, HANDLE_CALLBACK_ID)
+  }
+  let compiled = run unsafe bytecode(&mut engine, context, first, HANDLE_CALLBACK_ID)
+  let module = match compiled { ValueBits.Module { reference } => reference _ => { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Invalid VM module handle") } }
+  let moduleRef = unsafe CellRef<ModuleDef>.of(module)
+  let target = unsafe handleRealm(first)
+  let second = unsafe common.argument(argv, 2)
+  if operation == 2 {
+    let name = run unsafe host.text(&mut engine, context, second)
+    run modules.addModuleExport(unsafe lendRealm(&target, target), moduleRef, name.asSlice())
+    return ValueBits.Undefined
+  }
+  if operation == 3 {
+    let anchor = () let data = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, module)
+    return ValueBits.Int { value: usize.toI32(data.requestedModules.length()) }
+  }
+  if operation == 4 || operation == 5 {
+    let index = f64.toUsize(second.numericValue())
+    let mut anchor = () let data = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, module)
+    if index >= data.requestedModules.length() { drop data return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Range, b"Invalid module request index") }
+    let name = data.requestedModules.asSlice()[index].name
+    let attributes = data.requestedModules.asSlice()[index].attributes.view() drop data
+    if operation == 4 {
+      if (unsafe common.argument(argv, 3)).numericValue() == 1.0 { return unsafe attributes.retained() }
+      let state = unsafe HeapCell.payload<RuntimeState, ()>(&anchor, rt)
+      return run state.atoms.toValue(name, true)
+    }
+    let handle = unsafe common.argument(argv, 3)
+    let dependency = run unsafe bytecode(&mut engine, context, handle, HANDLE_CALLBACK_ID)
+    if Pointer.address<HeapHeader>(unsafe handleRealm(handle)) != Pointer.address<HeapHeader>(target) {
+      return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Linked modules must use the same context")
+    }
+    let reference = match dependency { ValueBits.Module { reference } => reference _ => { return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Expected a VM module") } }
+    let changed = unsafe HeapCell.payloadMut<ModuleDef, ()>(&mut anchor, module)
+    let previous = changed.requestedModules.asSlice()[index].module
+    unsafe HeapCell.retain(reference)
+    let requests = changed.requestedModules.asMutSlice()
+    requests[index].module = Option<CellRef<ModuleDef>>.some(unsafe CellRef<ModuleDef>.of(reference))
+    drop requests drop changed
+    if let Option<CellRef<ModuleDef>>.Some { value: replaced } = previous { unsafe gc.releaseHeader(&mut engine, rt, replaced.header()) }
+    return ValueBits.Undefined
+  }
+  if operation == 6 {
+    let mut anchor = () let data = unsafe HeapCell.payloadMut<ModuleDef, ()>(&mut anchor, module)
+    data.resolved = true drop data
+    run linker.createFunctions(&mut engine, memory, unsafe lendRealm(&target, target), moduleRef)
+    run linker.link(&mut engine, memory, unsafe lendRealm(&target, target), moduleRef)
+    return ValueBits.Undefined
+  }
+  if operation == 7 { return (run namespaces.getNamespace(&mut engine, memory, unsafe lendRealm(&target, target), moduleRef)).intoBits() }
+  if operation == 8 {
+    let anchor = () let data = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, module)
+    if data.evaluationHasException { return ValueBits.Int { value: 5 } }
+    let status = match data.status {
+      ModuleStatus.Unlinked => 0 ModuleStatus.Linking => 1 ModuleStatus.Linked => 2
+      ModuleStatus.Evaluating => 3 ModuleStatus.EvaluatingAsync => 4 ModuleStatus.Evaluated => 4
+    }
+    return ValueBits.Int { value: status }
+  }
+  if operation == 9 {
+    let anchor = () let data = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, module)
+    return data.evaluationException.dup().intoBits()
+  }
+  if operation == 10 {
+    let name = run unsafe host.text(&mut engine, context, second)
+    let set = run unsafe modules.setModuleExport(&mut engine, unsafe lendRealm(&target, target), moduleRef, name.asSlice(), unsafe Value.retain(unsafe common.argument(argv, 3)))
+    return ValueBits.Bool { value: set }
+  }
+  if operation == 11 {
+    modules.setPrivateValue(&mut engine, unsafe lendRealm(&target, target), moduleRef, unsafe Value.retain(second))
+    return ValueBits.Undefined
+  }
+  if operation == 12 {
+    let anchor = () let data = unsafe HeapCell.payload<ModuleDef, ()>(&anchor, module)
+    return ValueBits.Bool { value: data.hasTopLevelAwait }
+  }
+  return run engine.throwError(unsafe lendRealm(&context, context), NativeErrorKind.Type, b"Unknown VM module operation")
+}

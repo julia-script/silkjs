@@ -1,0 +1,887 @@
+//! Node-API asynchronous operations on the runtime loop: async contexts and callback scopes, async
+//! work on the loop's blocking threads, thread-safe functions and environment cleanup hooks.
+//!
+//! Async work runs its `execute` callback on the blocking pool of `fs_async`. The pool hands the job
+//! back on the owner thread, which only moves it to this environment's finished list: the complete
+//! callback enters JavaScript, so it runs in [`poll`], while the Node-API bridge is bound.
+//!
+//! A thread-safe function is a queue that any thread fills. A producer wakes the runtime reactor;
+//! [`poll`] drains the queue on the owner thread. A referenced function holds the loop open.
+//!
+//! `napi_get_uv_event_loop` returns the runtime's libuv loop, which runs as a guest of the reactor,
+//! so addon libuv handles share the one runtime loop as they do in Node.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.mem.pointer { Pointer }
+import silk.mem.layout { Layout }
+import silk.concurrency.sync { Condition, Mutex }
+import silk.concurrency.thread { Transferable }
+import silk.io.reactor { ReactorError, Waker }
+import silk.num.usize
+import ext.blocking_pool as pool
+import ext.fs_async as loops
+import ext.uv_fs as uv
+import ext.napi_core as napi
+import ext.napi_values as values
+
+const OK: i32 = 0
+const INVALID_ARG: i32 = 1
+const FUNCTION_EXPECTED: i32 = 5
+const GENERIC_FAILURE: i32 = 9
+const CANCELLED: i32 = 11
+const CALLBACK_SCOPE_MISMATCH: i32 = 14
+const QUEUE_FULL: i32 = 15
+const CLOSING: i32 = 16
+const WOULD_DEADLOCK: i32 = 21
+const TYPE_FUNCTION: i32 = 7
+const TSFN_NONBLOCKING: i32 = 0
+const TSFN_BLOCKING: i32 = 1
+const TSFN_RELEASE: i32 = 0
+const TSFN_ABORT: i32 = 1
+const RUN_NOWAIT: i32 = 2
+// How many queued calls one thread-safe function delivers per turn, so that an active producer
+// cannot starve the rest of the loop.
+const DELIVERY_LIMIT: usize = 1024
+
+unsafe extern "C" fn calloc(count: usize, size: usize) -> ?*mut u8
+unsafe extern "C" fn free(data: ?*mut u8) -> ()
+
+type Execute = extern "C" fn(?*mut u8, ?*mut u8) -> ()
+type Complete = ?extern "C" fn(?*mut u8, i32, ?*mut u8) -> ()
+type Finalize = ?extern "C" fn(?*mut u8, ?*mut u8, ?*mut u8) -> ()
+type CallJs = ?extern "C" fn(?*mut u8, ?*mut u8, ?*mut u8, ?*mut u8) -> ()
+type CleanupHook = ?extern "C" fn(?*mut u8) -> ()
+type AsyncCleanupHook = ?extern "C" fn(?*mut u8, ?*mut u8) -> ()
+
+/// An async context: a JavaScript async resource that callback scopes enter.
+struct Context { env: *mut u8, resource: ?*mut u8, next: ?*mut Context, scopes: usize, destroyed: bool }
+struct CallbackScope { context: *mut Context, previous: ?*mut CallbackScope }
+
+const WORK_CREATED: i32 = 0
+const WORK_QUEUED: i32 = 1
+const WORK_FINISHED: i32 = 2
+const WORK_COMPLETING: i32 = 3
+const WORK_COMPLETE: i32 = 4
+/// What a blocking thread reads while the work runs. The owner never writes it while it is queued.
+struct Task { job: pool.Job, execute: Execute, env: *mut u8, data: ?*mut u8, work: *mut Work }
+/// Async work. Only the owner thread reads or writes it.
+struct Work {
+  env: *mut u8, state: *mut Async, task: *mut Task, context: *mut Context, complete: Complete, data: ?*mut u8,
+  next: ?*mut Work, finished: ?*mut Work, phase: i32, status: i32, deleteRequested: bool
+}
+
+struct Item { data: ?*mut u8, next: ?*mut Item }
+struct Queue { head: ?*mut Item, tail: ?*mut Item, count: usize, threads: usize, closing: bool, closed: bool }
+// Items are only linked or unlinked under the function's mutex.
+impl Transferable for Queue {}
+/// A thread-safe function. Producers on any thread use `queue`, `space` and `waker`; every other
+/// field belongs to the owner thread.
+struct Function {
+  env: *mut u8, state: *mut Async, queue: Mutex<Queue>, space: Condition, waker: Waker, maximum: usize,
+  callback: ?*mut u8, resource: *mut Context, context: ?*mut u8, finalizeData: ?*mut u8, finalize: Finalize, call: CallJs,
+  next: ?*mut Function, referenced: bool
+}
+
+/// A cleanup hook. Removed hooks stay allocated until dispose, since an async hook may be removed
+/// from a native thread while its owner callback runs.
+struct Hook { sync: CleanupHook, asynchronous: AsyncCleanupHook, data: ?*mut u8, removed: bool, started: bool, next: ?*mut Hook, state: *mut Async }
+struct Hooks { first: ?*mut Hook, pending: usize }
+impl Transferable for Hooks {}
+
+/// The asynchronous half of one environment.
+struct Async {
+  env: *mut u8, io: *mut loops.State, waker: Waker, hooks: Mutex<Hooks>,
+  contexts: ?*mut Context, scope: ?*mut CallbackScope, works: ?*mut Work, finishedFirst: ?*mut Work, finishedLast: ?*mut Work,
+  functions: ?*mut Function, activity: u64, draining: bool, polling: bool
+}
+
+fn nil() -> ?*mut u8 { return Pointer.null<u8>() }
+unsafe fn nn<T>(p: ?*mut T) -> *mut T { return unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(p) }
+unsafe fn raw<T>(p: *mut T) -> *mut u8 { return unsafe Intrinsic.pointerReinterpret<*mut T, *mut u8>(p) }
+unsafe fn cast<T>(p: ?*mut u8) -> *mut T { return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut T>(unsafe nn(p)) }
+unsafe fn same<T>(a: ?*mut T, b: *mut T) -> bool { return !Pointer.isNull<T>(a) && Pointer.address(unsafe nn(a)) == Pointer.address(b) }
+fn text(name: &'static [u8]) -> *const u8 { return Pointer.fromRef<u8>(&name[0]) }
+/// Native memory that addons and other threads can reach, so it is not on a Silk allocator.
+unsafe fn allocate<T>() -> ?*mut T {
+  let p = unsafe calloc(1, Layout.of<T>().bytes)
+  if Pointer.isNull<u8>(p) { return Pointer.null<T>() }
+  return unsafe cast<T>(p)
+}
+unsafe fn release<T>(p: *mut T) -> () { let value = unsafe Pointer.take<T>(p) drop value unsafe free(unsafe raw(p)) }
+unsafe fn status(env: ?*mut u8, code: i32) -> i32 { return unsafe napi.status(env, code) }
+unsafe fn owner(env: ?*mut u8) -> bool { return unsafe napi.onOwner(env) }
+unsafe fn closing(env: ?*mut u8) -> bool { return unsafe napi.closing(env) }
+unsafe fn stateOf(env: ?*mut u8) -> ?*mut Async {
+  let p = unsafe napi.asyncState(env)
+  if Pointer.isNull<u8>(p) { return Pointer.null<Async>() }
+  return unsafe cast<Async>(p)
+}
+unsafe fn bump(state: *mut Async) -> () { let mut a = () let s = unsafe Pointer.borrowMut<(), Async>(&mut a, state) s.activity = s.activity + 1 }
+fn wake(waker: &Waker) -> () {
+  let woke = run Effect.result(waker.wake())
+  if let Result<(), ReactorError>.Failure { .. } = move woke { Intrinsic.trap("a Node-API producer cannot wake the runtime loop") }
+}
+// Function addresses are compared through their stored bits; a code address is not a data pointer.
+unsafe fn sameHook(a: CleanupHook, b: CleanupHook) -> bool {
+  let left = unsafe Pointer.read<usize>(unsafe Intrinsic.pointerReinterpret<*const CleanupHook, *const usize>(Pointer.fromRef<CleanupHook>(&a)))
+  let right = unsafe Pointer.read<usize>(unsafe Intrinsic.pointerReinterpret<*const CleanupHook, *const usize>(Pointer.fromRef<CleanupHook>(&b)))
+  return left == right
+}
+unsafe fn store<T>(out: ?*mut T, value: T) -> () { unsafe Pointer.put<T>(unsafe nn(out), move value) }
+unsafe fn enter(env: *mut u8) -> *mut u8 { return unsafe napi.enterCallback(env) }
+
+/// Attaches the asynchronous half to a fresh environment on the loop `io`.
+pub effect fn attach(env: *mut u8, io: *mut loops.State) -> () ! OutOfMemoryError {
+  let mut system = Allocator.systemAllocatorProvider()
+  let hooks = run Mutex<Hooks>.make(Hooks { first: Pointer.null<Hook>(), pending: 0 }) |> Effect.provideMut<Allocator>(&mut system)
+  let p = unsafe allocate<Async>()
+  if Pointer.isNull<Async>(p) { fail OutOfMemoryError {} }
+  unsafe Pointer.put<Async>(unsafe nn(p), Async {
+    env: env, io: io, waker: unsafe loops.waker(io), hooks: move hooks,
+    contexts: Pointer.null<Context>(), scope: Pointer.null<CallbackScope>(), works: Pointer.null<Work>(),
+    finishedFirst: Pointer.null<Work>(), finishedLast: Pointer.null<Work>(), functions: Pointer.null<Function>(),
+    activity: 0, draining: false, polling: false
+  })
+  unsafe napi.setAsyncState(env, unsafe raw(unsafe nn(p)))
+}
+
+// Async contexts and callback scopes.
+
+/// Runs the dispatcher operation on the context's resource, keeping any pending exception.
+unsafe fn contextOperation(context: *mut Context, operation: *const u8) -> i32 {
+  let a = () let c = unsafe Pointer.borrow<(), Context>(&a, context) let env = c.env let resource = c.resource drop c
+  let mut pending = false
+  let mut exception = nil()
+  let mut code = unsafe napi.napi_is_exception_pending(env, Pointer.fromMutRef<bool>(&mut pending))
+  if code != OK { return code }
+  if pending { code = unsafe napi.napi_get_and_clear_last_exception(env, Pointer.fromMutRef<?*mut u8>(&mut exception)) if code != OK { return code } }
+  let argument = resource
+  code = unsafe napi.js(env, operation, 1, Pointer.fromRef<?*mut u8>(&argument), Pointer.null<?*mut u8>())
+  if !Pointer.isNull<u8>(exception) {
+    let mut secondary = false
+    let _ignored = unsafe napi.napi_is_exception_pending(env, Pointer.fromMutRef<bool>(&mut secondary))
+    if secondary { let mut dropped = nil() let _cleared = unsafe napi.napi_get_and_clear_last_exception(env, Pointer.fromMutRef<?*mut u8>(&mut dropped)) }
+    let _thrown = unsafe napi.napi_throw(env, exception)
+  }
+  return code
+}
+unsafe fn contextFree(context: *mut Context) -> () {
+  let a = () let c = unsafe Pointer.borrow<(), Context>(&a, context) let env = c.env let resource = c.resource let next = c.next drop c
+  match Pointer.nonNullMut<Async>(unsafe stateOf(env)) {
+    Option<*mut Async>.Some { value: state } => {
+      let mut b = () let s = unsafe Pointer.borrowMut<(), Async>(&mut b, state)
+      if unsafe same<Context>(s.contexts, context) { s.contexts = next drop s } else {
+        let mut p = s.contexts drop s
+        while !Pointer.isNull<Context>(p) {
+          let entry = unsafe Pointer.borrowMut<(), Context>(&mut b, unsafe nn(p))
+          if unsafe same<Context>(entry.next, context) { entry.next = next break }
+          p = entry.next
+        }
+      }
+    }
+    Option<*mut Async>.None => ()
+  }
+  if !Pointer.isNull<u8>(resource) { unsafe napi.releaseRoot(env, unsafe nn(resource)) }
+  unsafe release<Context>(context)
+}
+export "C" fn napi_async_init(env: ?*mut u8, resource: ?*mut u8, name: ?*mut u8, result: ?*mut ?*mut Context) -> i32 {
+  let code = unsafe napi.check(env)
+  if code != OK { return code }
+  if Pointer.isNull<u8>(name) || Pointer.isNull<?*mut Context>(result) { return unsafe status(env, INVALID_ARG) }
+  if unsafe closing(env) { return unsafe status(env, CLOSING) }
+  let state = unsafe stateOf(env)
+  if Pointer.isNull<Async>(state) { return unsafe status(env, GENERIC_FAILURE) }
+  let mut target = resource
+  if Pointer.isNull<u8>(target) { let made = unsafe values.napi_get_undefined(env, Pointer.fromMutRef<?*mut u8>(&mut target)) if made != OK { return made } }
+  let mut arguments = [target, name]
+  let mut value = nil()
+  let called = unsafe napi.js(env, text(b"asyncInit\0"), 2, Pointer.fromRef<?*mut u8>(&arguments[0]), Pointer.fromMutRef<?*mut u8>(&mut value))
+  if called != OK { return called }
+  let rooted = unsafe napi.root(env, value)
+  if Pointer.isNull<u8>(rooted) { return unsafe status(env, GENERIC_FAILURE) }
+  let context = unsafe allocate<Context>()
+  if Pointer.isNull<Context>(context) { unsafe napi.releaseRoot(unsafe nn(env), unsafe nn(rooted)) return unsafe status(env, GENERIC_FAILURE) }
+  let mut a = () let s = unsafe Pointer.borrowMut<(), Async>(&mut a, unsafe nn(state))
+  unsafe Pointer.put<Context>(unsafe nn(context), Context { env: unsafe nn(env), resource: rooted, next: s.contexts, scopes: 0, destroyed: false })
+  s.contexts = context drop s
+  unsafe store<?*mut Context>(result, context)
+  return unsafe status(env, OK)
+}
+unsafe fn contextEnv(context: ?*mut Context) -> ?*mut u8 {
+  if Pointer.isNull<Context>(context) { return nil() }
+  let a = () let c = unsafe Pointer.borrow<(), Context>(&a, unsafe nn(context)) return c.env
+}
+export "C" fn napi_async_destroy(env: ?*mut u8, context: ?*mut Context) -> i32 {
+  if !unsafe owner(env) { return INVALID_ARG }
+  if Pointer.isNull<Context>(context) || Pointer.address(unsafe nn(unsafe contextEnv(context))) != Pointer.address(unsafe nn(env)) { return unsafe status(env, INVALID_ARG) }
+  let mut a = () let c = unsafe Pointer.borrowMut<(), Context>(&mut a, unsafe nn(context))
+  if c.destroyed { return unsafe status(env, INVALID_ARG) }
+  c.destroyed = true drop c
+  let code = unsafe contextOperation(unsafe nn(context), text(b"asyncDestroy\0"))
+  let c2 = unsafe Pointer.borrow<(), Context>(&a, unsafe nn(context)) let scopes = c2.scopes drop c2
+  if scopes == 0 { unsafe contextFree(unsafe nn(context)) }
+  return unsafe status(env, code)
+}
+unsafe fn openScope(env: ?*mut u8, resource: ?*mut u8, context: ?*mut Context, result: ?*mut ?*mut CallbackScope, operation: *const u8) -> i32 {
+  let code = unsafe napi.check(env)
+  if code != OK { return code }
+  if Pointer.isNull<u8>(resource) || Pointer.isNull<Context>(context) || Pointer.isNull<?*mut CallbackScope>(result) { return unsafe status(env, INVALID_ARG) }
+  let a = () let c = unsafe Pointer.borrow<(), Context>(&a, unsafe nn(context))
+  let valid = Pointer.address(c.env) == Pointer.address(unsafe nn(env)) && !c.destroyed drop c
+  if !valid { return unsafe status(env, INVALID_ARG) }
+  let state = unsafe stateOf(env)
+  if Pointer.isNull<Async>(state) { return unsafe status(env, GENERIC_FAILURE) }
+  let scope = unsafe allocate<CallbackScope>()
+  if Pointer.isNull<CallbackScope>(scope) { return unsafe status(env, GENERIC_FAILURE) }
+  let entered = unsafe contextOperation(unsafe nn(context), operation)
+  if entered != OK { unsafe free(unsafe raw(unsafe nn(scope))) return entered }
+  let mut b = () let s = unsafe Pointer.borrowMut<(), Async>(&mut b, unsafe nn(state))
+  unsafe Pointer.put<CallbackScope>(unsafe nn(scope), CallbackScope { context: unsafe nn(context), previous: s.scope })
+  s.scope = scope drop s
+  let c2 = unsafe Pointer.borrowMut<(), Context>(&mut b, unsafe nn(context)) c2.scopes = c2.scopes + 1 drop c2
+  unsafe store<?*mut CallbackScope>(result, scope)
+  return unsafe status(env, OK)
+}
+export "C" fn napi_open_callback_scope(env: ?*mut u8, resource: ?*mut u8, context: ?*mut Context, result: ?*mut ?*mut CallbackScope) -> i32 {
+  return unsafe openScope(env, resource, context, result, text(b"asyncBefore\0"))
+}
+export "C" fn napi_close_callback_scope(env: ?*mut u8, scope: ?*mut CallbackScope) -> i32 {
+  if !unsafe owner(env) { return INVALID_ARG }
+  let state = unsafe stateOf(env)
+  if Pointer.isNull<Async>(state) || Pointer.isNull<CallbackScope>(scope) { return unsafe status(env, CALLBACK_SCOPE_MISMATCH) }
+  let mut a = () let s = unsafe Pointer.borrowMut<(), Async>(&mut a, unsafe nn(state))
+  if !unsafe same<CallbackScope>(s.scope, unsafe nn(scope)) { return unsafe status(env, CALLBACK_SCOPE_MISMATCH) }
+  drop s
+  let entry = unsafe Pointer.take<CallbackScope>(unsafe nn(scope))
+  unsafe free(unsafe raw(unsafe nn(scope)))
+  let code = unsafe contextOperation(entry.context, text(b"asyncAfter\0"))
+  let s2 = unsafe Pointer.borrowMut<(), Async>(&mut a, unsafe nn(state)) s2.scope = entry.previous drop s2
+  let c = unsafe Pointer.borrowMut<(), Context>(&mut a, entry.context) c.scopes = c.scopes - 1
+  let done = c.destroyed && c.scopes == 0 drop c
+  if done { unsafe contextFree(entry.context) }
+  return unsafe status(env, code)
+}
+export "C" fn napi_make_callback(env: ?*mut u8, context: ?*mut Context, receiver: ?*mut u8, function: ?*mut u8, argc: usize, argv: ?*const ?*mut u8, result: ?*mut ?*mut u8) -> i32 {
+  let mut code = unsafe napi.check(env)
+  if code != OK { return code }
+  if Pointer.isNull<u8>(receiver) || Pointer.isNull<u8>(function) || (argc != 0 && Intrinsic.pointerIsNull<?*const ?*mut u8>(argv)) { return unsafe status(env, INVALID_ARG) }
+  let mut scope = Pointer.null<CallbackScope>()
+  if !Pointer.isNull<Context>(context) {
+    code = unsafe openScope(env, receiver, context, Pointer.fromMutRef<?*mut CallbackScope>(&mut scope), text(b"asyncBeforeCallback\0"))
+    if code != OK { return code }
+  }
+  code = unsafe values.napi_call_function(env, receiver, function, argc, argv, result)
+  if !Pointer.isNull<CallbackScope>(scope) {
+    let after = unsafe napi_close_callback_scope(env, scope)
+    if code == OK { code = after }
+  }
+  return unsafe status(env, code)
+}
+
+// Async work.
+
+unsafe fn workFree(work: *mut Work) -> () {
+  let entry = unsafe Pointer.take<Work>(work)
+  let mut a = () let s = unsafe Pointer.borrowMut<(), Async>(&mut a, entry.state)
+  if unsafe same<Work>(s.works, work) { s.works = entry.next drop s } else {
+    let mut p = s.works drop s
+    while !Pointer.isNull<Work>(p) {
+      let other = unsafe Pointer.borrowMut<(), Work>(&mut a, unsafe nn(p))
+      if unsafe same<Work>(other.next, work) { other.next = entry.next break }
+      p = other.next
+    }
+  }
+  let _destroyed = unsafe napi_async_destroy(entry.env, entry.context)
+  unsafe release<Task>(entry.task)
+  unsafe free(unsafe raw(work))
+}
+/// Runs on a blocking thread.
+export "C" fn silkNapiWorkExecute(data: ?*mut u8) -> () {
+  let a = () let task = unsafe Pointer.borrow<(), Task>(&a, unsafe cast<Task>(data))
+  let execute = task.execute let env = task.env let input = task.data drop task
+  unsafe execute(env, input)
+}
+unsafe fn finish(work: *mut Work, code: i32) -> () {
+  let mut a = () let entry = unsafe Pointer.borrowMut<(), Work>(&mut a, work)
+  entry.phase = WORK_FINISHED entry.status = code entry.finished = Pointer.null<Work>()
+  let state = entry.state drop entry
+  let s = unsafe Pointer.borrowMut<(), Async>(&mut a, state)
+  if Pointer.isNull<Work>(s.finishedLast) { s.finishedFirst = work } else {
+    let last = s.finishedLast drop s
+    let previous = unsafe Pointer.borrowMut<(), Work>(&mut a, unsafe nn(last)) previous.finished = work drop previous
+  }
+  let s2 = unsafe Pointer.borrowMut<(), Async>(&mut a, state) s2.finishedLast = work
+}
+/// Runs on the owner thread when the pool hands the work back, maybe outside the bridge binding,
+/// so it only records the completion for [`poll`].
+export "C" fn silkNapiWorkFinish(data: ?*mut u8) -> () {
+  let a = () let task = unsafe Pointer.borrow<(), Task>(&a, unsafe cast<Task>(data)) let work = task.work drop task
+  unsafe finish(work, OK)
+}
+unsafe fn complete(work: *mut Work) -> () {
+  let mut a = () let entry = unsafe Pointer.borrowMut<(), Work>(&mut a, work)
+  let env = entry.env let state = entry.state let context = entry.context let callback = entry.complete let data = entry.data let code = entry.status
+  entry.phase = WORK_COMPLETING drop entry
+  unsafe bump(state)
+  let handles = unsafe enter(env)
+  let mut scope = Pointer.null<CallbackScope>()
+  let c = unsafe Pointer.borrow<(), Context>(&a, context) let resource = c.resource drop c
+  let opened = unsafe napi_open_callback_scope(env, resource, context, Pointer.fromMutRef<?*mut CallbackScope>(&mut scope))
+  if opened == OK && !Intrinsic.pointerIsNull<Complete>(callback) {
+    let present = unsafe Intrinsic.pointerRequalify<Complete, extern "C" fn(?*mut u8, i32, ?*mut u8) -> ()>(callback)
+    unsafe present(env, code, data)
+  }
+  if !Pointer.isNull<CallbackScope>(scope) { let _closed = unsafe napi_close_callback_scope(env, scope) }
+  unsafe napi.fatalPending(env)
+  let after = unsafe Pointer.borrowMut<(), Work>(&mut a, work)
+  after.phase = WORK_COMPLETE let delete = after.deleteRequested drop after
+  if delete { unsafe workFree(work) }
+  unsafe napi.leaveCallback(env, handles)
+}
+unsafe fn completeFinished(state: *mut Async) -> () {
+  while true {
+    let mut a = () let s = unsafe Pointer.borrowMut<(), Async>(&mut a, state)
+    let work = s.finishedFirst
+    if Pointer.isNull<Work>(work) { return () }
+    let b = () let entry = unsafe Pointer.borrow<(), Work>(&b, unsafe nn(work)) let next = entry.finished drop entry
+    s.finishedFirst = next
+    if Pointer.isNull<Work>(next) { s.finishedLast = Pointer.null<Work>() }
+    drop s
+    unsafe complete(unsafe nn(work))
+  }
+}
+unsafe fn workOf(env: ?*mut u8, work: ?*mut Work) -> bool {
+  if Pointer.isNull<Work>(work) { return false }
+  let a = () let entry = unsafe Pointer.borrow<(), Work>(&a, unsafe nn(work)) return Pointer.address(entry.env) == Pointer.address(unsafe nn(env))
+}
+@threadCallbacks("execute")
+@deferredCallbacks("callback")
+unsafe export "C" fn napi_create_async_work(env: ?*mut u8, resource: ?*mut u8, name: ?*mut u8, execute: ?extern "C" fn(?*mut u8, ?*mut u8) -> (), callback: Complete, data: ?*mut u8, result: ?*mut ?*mut Work) -> i32 {
+  let code = unsafe napi.check(env)
+  if code != OK { return code }
+  if Intrinsic.pointerIsNull<?extern "C" fn(?*mut u8, ?*mut u8) -> ()>(execute) || Pointer.isNull<?*mut Work>(result) || Pointer.isNull<u8>(name) { return unsafe status(env, INVALID_ARG) }
+  if unsafe closing(env) { return unsafe status(env, CLOSING) }
+  let state = unsafe stateOf(env)
+  if Pointer.isNull<Async>(state) { return unsafe status(env, GENERIC_FAILURE) }
+  let work = unsafe allocate<Work>()
+  let task = unsafe allocate<Task>()
+  if Pointer.isNull<Work>(work) || Pointer.isNull<Task>(task) { unsafe free(unsafe Intrinsic.pointerReinterpret<?*mut Work, ?*mut u8>(work)) unsafe free(unsafe Intrinsic.pointerReinterpret<?*mut Task, ?*mut u8>(task)) return unsafe status(env, GENERIC_FAILURE) }
+  let mut context = Pointer.null<Context>()
+  let initialized = unsafe napi_async_init(env, resource, name, Pointer.fromMutRef<?*mut Context>(&mut context))
+  if initialized != OK { unsafe free(unsafe raw(unsafe nn(work))) unsafe free(unsafe raw(unsafe nn(task))) return initialized }
+  let body = unsafe Intrinsic.pointerRequalify<?extern "C" fn(?*mut u8, ?*mut u8) -> (), Execute>(execute)
+  unsafe Pointer.put<Task>(unsafe nn(task), Task { job: pool.job(silkNapiWorkExecute, silkNapiWorkFinish, unsafe raw(unsafe nn(task))), execute: body, env: unsafe nn(env), data: data, work: unsafe nn(work) })
+  let mut a = () let s = unsafe Pointer.borrowMut<(), Async>(&mut a, unsafe nn(state))
+  unsafe Pointer.put<Work>(unsafe nn(work), Work {
+    env: unsafe nn(env), state: unsafe nn(state), task: unsafe nn(task), context: unsafe nn(context), complete: callback, data: data,
+    next: s.works, finished: Pointer.null<Work>(), phase: WORK_CREATED, status: OK, deleteRequested: false
+  })
+  s.works = work drop s
+  unsafe store<?*mut Work>(result, work)
+  return unsafe status(env, OK)
+}
+export "C" fn napi_delete_async_work(env: ?*mut u8, work: ?*mut Work) -> i32 {
+  if !unsafe owner(env) { return INVALID_ARG }
+  if !unsafe workOf(env, work) { return unsafe status(env, INVALID_ARG) }
+  let mut a = () let entry = unsafe Pointer.borrowMut<(), Work>(&mut a, unsafe nn(work))
+  if entry.deleteRequested { return unsafe status(env, INVALID_ARG) }
+  if entry.phase == WORK_QUEUED || entry.phase == WORK_FINISHED || entry.phase == WORK_COMPLETING { entry.deleteRequested = true drop entry }
+  else { drop entry unsafe workFree(unsafe nn(work)) }
+  return unsafe status(env, OK)
+}
+export "C" fn napi_queue_async_work(env: ?*mut u8, work: ?*mut Work) -> i32 {
+  if !unsafe owner(env) { return INVALID_ARG }
+  if !unsafe workOf(env, work) { return unsafe status(env, INVALID_ARG) }
+  let mut a = () let entry = unsafe Pointer.borrowMut<(), Work>(&mut a, unsafe nn(work))
+  if entry.phase != WORK_CREATED || entry.deleteRequested { return unsafe status(env, INVALID_ARG) }
+  if unsafe closing(env) { return unsafe status(env, CLOSING) }
+  let task = entry.task let state = entry.state drop entry
+  let s = unsafe Pointer.borrow<(), Async>(&a, state) let io = s.io drop s
+  let job = unsafe jobOf(task)
+  let code = run unsafe loops.queueWork(io, job)
+  if code != 0 { return unsafe status(env, GENERIC_FAILURE) }
+  let after = unsafe Pointer.borrowMut<(), Work>(&mut a, unsafe nn(work)) after.phase = WORK_QUEUED
+  return unsafe status(env, OK)
+}
+unsafe fn jobOf(task: *mut Task) -> *mut pool.Job {
+  let mut anchor = () let entry = unsafe Pointer.borrowMut<(), Task>(&mut anchor, task)
+  return Pointer.fromMutRef<pool.Job>(&mut entry.job)
+}
+unsafe fn cancel(work: *mut Work) -> bool {
+  let mut a = () let entry = unsafe Pointer.borrowMut<(), Work>(&mut a, work)
+  let task = entry.task let state = entry.state drop entry
+  let s = unsafe Pointer.borrow<(), Async>(&a, state) let io = s.io drop s
+  let job = unsafe jobOf(task)
+  if !unsafe loops.cancelWork(io, job) { return false }
+  unsafe finish(work, CANCELLED)
+  return true
+}
+export "C" fn napi_cancel_async_work(env: ?*mut u8, work: ?*mut Work) -> i32 {
+  if !unsafe owner(env) { return INVALID_ARG }
+  if !unsafe workOf(env, work) { return unsafe status(env, INVALID_ARG) }
+  let a = () let entry = unsafe Pointer.borrow<(), Work>(&a, unsafe nn(work)) let phase = entry.phase drop entry
+  if phase != WORK_QUEUED { return unsafe status(env, INVALID_ARG) }
+  if unsafe cancel(unsafe nn(work)) { return unsafe status(env, OK) }
+  return unsafe status(env, GENERIC_FAILURE)
+}
+
+// Thread-safe functions.
+
+unsafe fn functionOf(env: ?*mut u8, function: ?*mut Function) -> bool {
+  if Pointer.isNull<Function>(function) { return false }
+  let a = () let entry = unsafe Pointer.borrow<(), Function>(&a, unsafe nn(function)) return Pointer.address(entry.env) == Pointer.address(unsafe nn(env))
+}
+unsafe fn holdLoop(state: *mut Async, held: bool) -> () {
+  let a = () let s = unsafe Pointer.borrow<(), Async>(&a, state) let io = s.io drop s if held { unsafe loops.hold(io) } else { unsafe loops.unhold(io) }
+}
+@deferredCallbacks("finalize", "call")
+unsafe export "C" fn napi_create_threadsafe_function(env: ?*mut u8, callback: ?*mut u8, resource: ?*mut u8, name: ?*mut u8, maximum: usize, threads: usize, finalizeData: ?*mut u8, finalize: Finalize, context: ?*mut u8, call: CallJs, result: ?*mut ?*mut Function) -> i32 {
+  let mut code = unsafe napi.check(env)
+  if code != OK { return code }
+  if (Pointer.isNull<u8>(callback) && Intrinsic.pointerIsNull<CallJs>(call)) || threads == 0 || Pointer.isNull<u8>(name) || Pointer.isNull<?*mut Function>(result) { return unsafe status(env, INVALID_ARG) }
+  if unsafe closing(env) { return unsafe status(env, CLOSING) }
+  let state = unsafe stateOf(env)
+  if Pointer.isNull<Async>(state) { return unsafe status(env, GENERIC_FAILURE) }
+  if !Pointer.isNull<u8>(callback) {
+    let mut kind: i32 = 0
+    code = unsafe values.napi_typeof(env, callback, Pointer.fromMutRef<i32>(&mut kind))
+    if code != OK { return code }
+    if kind != TYPE_FUNCTION { return unsafe status(env, FUNCTION_EXPECTED) }
+  }
+  let mut system = Allocator.systemAllocatorProvider()
+  let queueMade = run Effect.result(Mutex<Queue>.make(Queue { head: Pointer.null<Item>(), tail: Pointer.null<Item>(), count: 0, threads: threads, closing: false, closed: false })) |> Effect.provideMut<Allocator>(&mut system)
+  let queue = match move queueMade { Result<Mutex<Queue>, OutOfMemoryError>.Success { value } => move value Result<Mutex<Queue>, OutOfMemoryError>.Failure { .. } => { return unsafe status(env, GENERIC_FAILURE) } }
+  let spaceMade = run Effect.result(Condition.make()) |> Effect.provideMut<Allocator>(&mut system)
+  let space = match move spaceMade { Result<Condition, OutOfMemoryError>.Success { value } => move value Result<Condition, OutOfMemoryError>.Failure { .. } => { return unsafe status(env, GENERIC_FAILURE) } }
+  let function = unsafe allocate<Function>()
+  if Pointer.isNull<Function>(function) { return unsafe status(env, GENERIC_FAILURE) }
+  let mut async = Pointer.null<Context>()
+  code = unsafe napi_async_init(env, resource, name, Pointer.fromMutRef<?*mut Context>(&mut async))
+  if code != OK { unsafe free(unsafe raw(unsafe nn(function))) return code }
+  let mut rooted = nil()
+  if !Pointer.isNull<u8>(callback) {
+    rooted = unsafe napi.root(env, callback)
+    if Pointer.isNull<u8>(rooted) { let _destroyed = unsafe napi_async_destroy(env, async) unsafe free(unsafe raw(unsafe nn(function))) return unsafe status(env, GENERIC_FAILURE) }
+  }
+  let mut a = () let s = unsafe Pointer.borrowMut<(), Async>(&mut a, unsafe nn(state))
+  unsafe Pointer.put<Function>(unsafe nn(function), Function {
+    env: unsafe nn(env), state: unsafe nn(state), queue: move queue, space: move space, waker: s.waker.clone(), maximum: maximum,
+    callback: rooted, resource: unsafe nn(async), context: context, finalizeData: finalizeData, finalize: finalize, call: call,
+    next: s.functions, referenced: true
+  })
+  s.functions = function drop s
+  unsafe holdLoop(unsafe nn(state), true)
+  unsafe store<?*mut Function>(result, function)
+  return unsafe status(env, OK)
+}
+export "C" fn napi_get_threadsafe_function_context(function: ?*mut Function, result: ?*mut ?*mut u8) -> i32 {
+  if Pointer.isNull<Function>(function) || Pointer.isNull<?*mut u8>(result) { return INVALID_ARG }
+  let a = () let entry = unsafe Pointer.borrow<(), Function>(&a, unsafe nn(function))
+  unsafe store<?*mut u8>(result, entry.context)
+  return OK
+}
+export "C" fn napi_call_threadsafe_function(function: ?*mut Function, data: ?*mut u8, mode: i32) -> i32 {
+  if Pointer.isNull<Function>(function) || (mode != TSFN_BLOCKING && mode != TSFN_NONBLOCKING) { return INVALID_ARG }
+  let a = () let entry = unsafe Pointer.borrow<(), Function>(&a, unsafe nn(function))
+  let mut guard = entry.queue.lock()
+  while !guard.get().closing && entry.maximum != 0 && guard.get().count >= entry.maximum {
+    if mode == TSFN_NONBLOCKING { return QUEUE_FULL }
+    if unsafe owner(unsafe raw(entry.env)) { return WOULD_DEADLOCK }
+    entry.space.wait(&mut guard)
+  }
+  let queue = guard.getMut()
+  if queue.closing {
+    // napi_closing relinquishes the caller's participation, as in Node.
+    if queue.threads != 0 { queue.threads = queue.threads - 1 }
+    drop queue drop guard
+    wake(&entry.waker)
+    return CLOSING
+  }
+  if queue.threads == 0 || queue.closed { return CLOSING }
+  let item = unsafe allocate<Item>()
+  if Pointer.isNull<Item>(item) { return GENERIC_FAILURE }
+  unsafe Pointer.put<Item>(unsafe nn(item), Item { data: data, next: Pointer.null<Item>() })
+  let mut b = ()
+  if Pointer.isNull<Item>(queue.tail) { queue.head = item } else {
+    let last = unsafe Pointer.borrowMut<(), Item>(&mut b, unsafe nn(queue.tail)) last.next = item drop last
+  }
+  queue.tail = item
+  queue.count = queue.count + 1
+  drop queue drop guard
+  wake(&entry.waker)
+  return OK
+}
+export "C" fn napi_acquire_threadsafe_function(function: ?*mut Function) -> i32 {
+  if Pointer.isNull<Function>(function) { return INVALID_ARG }
+  let a = () let entry = unsafe Pointer.borrow<(), Function>(&a, unsafe nn(function))
+  let mut guard = entry.queue.lock()
+  let queue = guard.getMut()
+  if queue.closing || queue.threads == 0 || queue.closed { return CLOSING }
+  if queue.threads == usize.MAX { return GENERIC_FAILURE }
+  queue.threads = queue.threads + 1
+  return OK
+}
+export "C" fn napi_release_threadsafe_function(function: ?*mut Function, mode: i32) -> i32 {
+  if Pointer.isNull<Function>(function) || (mode != TSFN_ABORT && mode != TSFN_RELEASE) { return INVALID_ARG }
+  let a = () let entry = unsafe Pointer.borrow<(), Function>(&a, unsafe nn(function))
+  let mut guard = entry.queue.lock()
+  let queue = guard.getMut()
+  if queue.threads == 0 || queue.closed { return INVALID_ARG }
+  queue.threads = queue.threads - 1
+  if mode == TSFN_ABORT { queue.closing = true }
+  let signal = queue.threads == 0 || queue.closing
+  drop queue drop guard
+  if signal { entry.space.notifyAll() wake(&entry.waker) }
+  return OK
+}
+unsafe fn setReferenced(env: ?*mut u8, function: ?*mut Function, referenced: bool) -> i32 {
+  if !unsafe owner(env) { return INVALID_ARG }
+  if !unsafe functionOf(env, function) { return unsafe status(env, INVALID_ARG) }
+  let mut a = () let entry = unsafe Pointer.borrowMut<(), Function>(&mut a, unsafe nn(function))
+  let changed = entry.referenced != referenced
+  entry.referenced = referenced let state = entry.state drop entry
+  if changed { unsafe holdLoop(state, referenced) }
+  return unsafe status(env, OK)
+}
+export "C" fn napi_unref_threadsafe_function(env: ?*mut u8, function: ?*mut Function) -> i32 { return unsafe setReferenced(env, function, false) }
+export "C" fn napi_ref_threadsafe_function(env: ?*mut u8, function: ?*mut Function) -> i32 { return unsafe setReferenced(env, function, true) }
+
+/// Finalizes a function that no thread holds any more.
+unsafe fn functionClose(function: *mut Function) -> () {
+  let entry = unsafe Pointer.take<Function>(function)
+  let env = entry.env let state = entry.state
+  let mut a = () let s = unsafe Pointer.borrowMut<(), Async>(&mut a, state)
+  if unsafe same<Function>(s.functions, function) { s.functions = entry.next drop s } else {
+    let mut p = s.functions drop s
+    while !Pointer.isNull<Function>(p) {
+      let other = unsafe Pointer.borrowMut<(), Function>(&mut a, unsafe nn(p))
+      if unsafe same<Function>(other.next, function) { other.next = entry.next break }
+      p = other.next
+    }
+  }
+  if entry.referenced { unsafe holdLoop(state, false) }
+  unsafe bump(state)
+  let handles = unsafe enter(env)
+  if !Intrinsic.pointerIsNull<Finalize>(entry.finalize) {
+    let present = unsafe Intrinsic.pointerRequalify<Finalize, extern "C" fn(?*mut u8, ?*mut u8, ?*mut u8) -> ()>(entry.finalize)
+    unsafe present(env, entry.finalizeData, entry.context)
+  }
+  let _destroyed = unsafe napi_async_destroy(env, entry.resource)
+  if !Pointer.isNull<u8>(entry.callback) { unsafe napi.releaseRoot(env, unsafe nn(entry.callback)) }
+  drop entry
+  unsafe free(unsafe raw(function))
+  unsafe napi.fatalPending(env)
+  unsafe napi.leaveCallback(env, handles)
+}
+unsafe fn deliver(function: *mut Function, data: ?*mut u8) -> () {
+  let a = () let entry = unsafe Pointer.borrow<(), Function>(&a, function)
+  let env = entry.env let call = entry.call let context = entry.context let callback = entry.callback let resource = entry.resource drop entry
+  let present = unsafe Intrinsic.pointerRequalify<CallJs, extern "C" fn(?*mut u8, ?*mut u8, ?*mut u8, ?*mut u8) -> ()>(call)
+  let handles = unsafe enter(env)
+  let mut scope = Pointer.null<CallbackScope>()
+  let c = unsafe Pointer.borrow<(), Context>(&a, resource) let target = c.resource drop c
+  let opened = unsafe napi_open_callback_scope(env, target, resource, Pointer.fromMutRef<?*mut CallbackScope>(&mut scope))
+  if opened == OK {
+    if !Intrinsic.pointerIsNull<CallJs>(call) { unsafe present(env, callback, context, data) }
+    else {
+      let mut receiver = nil()
+      if unsafe values.napi_get_undefined(env, Pointer.fromMutRef<?*mut u8>(&mut receiver)) == OK {
+        let _called = unsafe values.napi_call_function(env, receiver, callback, 0, Pointer.null<?*mut u8>(), Pointer.null<?*mut u8>())
+      }
+    }
+  } else if !Intrinsic.pointerIsNull<CallJs>(call) { unsafe present(nil(), nil(), context, data) }
+  if !Pointer.isNull<CallbackScope>(scope) { let _closed = unsafe napi_close_callback_scope(env, scope) }
+  unsafe napi.fatalPending(env)
+  unsafe napi.leaveCallback(env, handles)
+}
+/// Delivers queued calls, and finalizes the function once no thread holds it. Returns whether
+/// calls remain for another turn.
+unsafe fn dispatch(function: *mut Function) -> bool {
+  let mut delivered: usize = 0
+  while delivered < DELIVERY_LIMIT {
+    let a = () let entry = unsafe Pointer.borrow<(), Function>(&a, function)
+    let mut guard = entry.queue.lock()
+    let queue = guard.getMut()
+    let item = queue.head
+    let closing = queue.closing
+    let mut close = false
+    if !Pointer.isNull<Item>(item) {
+      let b = () let first = unsafe Pointer.borrow<(), Item>(&b, unsafe nn(item)) queue.head = first.next drop first
+      if Pointer.isNull<Item>(queue.head) { queue.tail = Pointer.null<Item>() }
+      queue.count = queue.count - 1
+    } else if queue.threads == 0 && !queue.closed { queue.closed = true close = true }
+    drop queue drop guard
+    if !Pointer.isNull<Item>(item) { entry.space.notifyOne() }
+    let call = entry.call let context = entry.context drop entry
+    if close { unsafe functionClose(function) return false }
+    if Pointer.isNull<Item>(item) { return false }
+    let taken = unsafe Pointer.take<Item>(unsafe nn(item)) unsafe free(unsafe raw(unsafe nn(item)))
+    if closing {
+      if !Intrinsic.pointerIsNull<CallJs>(call) {
+        let present = unsafe Intrinsic.pointerRequalify<CallJs, extern "C" fn(?*mut u8, ?*mut u8, ?*mut u8, ?*mut u8) -> ()>(call)
+        unsafe present(nil(), nil(), context, taken.data)
+      }
+    } else { unsafe deliver(function, taken.data) }
+    delivered = delivered + 1
+  }
+  return true
+}
+/// Dispatches every function once. Returns whether one has calls left for another turn.
+unsafe fn dispatchAll(state: *mut Async) -> bool {
+  let a = () let s = unsafe Pointer.borrow<(), Async>(&a, state) let mut p = s.functions drop s
+  let mut more = false
+  while !Pointer.isNull<Function>(p) {
+    // A delivered callback may close the function, so read the next one first.
+    let entry = unsafe Pointer.borrow<(), Function>(&a, unsafe nn(p)) let next = entry.next drop entry
+    if unsafe dispatch(unsafe nn(p)) { more = true }
+    p = next
+  }
+  return more
+}
+
+// Cleanup hooks.
+
+@deferredCallbacks("callback")
+unsafe export "C" fn napi_add_env_cleanup_hook(env: ?*mut u8, callback: CleanupHook, data: ?*mut u8) -> i32 {
+  if !unsafe owner(env) { return INVALID_ARG }
+  if Intrinsic.pointerIsNull<CleanupHook>(callback) { return unsafe status(env, INVALID_ARG) }
+  if unsafe closing(env) { return unsafe status(env, CLOSING) }
+  let state = unsafe stateOf(env)
+  if Pointer.isNull<Async>(state) { return unsafe status(env, GENERIC_FAILURE) }
+  let a = () let s = unsafe Pointer.borrow<(), Async>(&a, unsafe nn(state))
+  let mut guard = s.hooks.lock()
+  let hooks = guard.getMut()
+  let mut p = hooks.first
+  while !Pointer.isNull<Hook>(p) {
+    let hook = unsafe Pointer.borrow<(), Hook>(&a, unsafe nn(p))
+    if !hook.removed && !Intrinsic.pointerIsNull<CleanupHook>(hook.sync) && unsafe sameHook(hook.sync, callback) && Pointer.address(hook.data) == Pointer.address(data) { return unsafe status(env, INVALID_ARG) }
+    p = hook.next
+  }
+  let hook = unsafe allocate<Hook>()
+  if Pointer.isNull<Hook>(hook) { return unsafe status(env, GENERIC_FAILURE) }
+  unsafe Pointer.put<Hook>(unsafe nn(hook), Hook { sync: callback, asynchronous: Intrinsic.pointerNullFunction<AsyncCleanupHook>(), data: data, removed: false, started: false, next: hooks.first, state: unsafe nn(state) })
+  hooks.first = hook
+  return unsafe status(env, OK)
+}
+@callbacks("callback")
+unsafe export "C" fn napi_remove_env_cleanup_hook(env: ?*mut u8, callback: CleanupHook, data: ?*mut u8) -> i32 {
+  if !unsafe owner(env) { return INVALID_ARG }
+  if Intrinsic.pointerIsNull<CleanupHook>(callback) { return unsafe status(env, INVALID_ARG) }
+  let state = unsafe stateOf(env)
+  if Pointer.isNull<Async>(state) { return unsafe status(env, INVALID_ARG) }
+  let mut a = () let s = unsafe Pointer.borrow<(), Async>(&a, unsafe nn(state))
+  let mut guard = s.hooks.lock()
+  let mut p = guard.get().first
+  let mut b = ()
+  while !Pointer.isNull<Hook>(p) {
+    let hook = unsafe Pointer.borrowMut<(), Hook>(&mut b, unsafe nn(p))
+    if !hook.removed && !Intrinsic.pointerIsNull<CleanupHook>(hook.sync) && unsafe sameHook(hook.sync, callback) && Pointer.address(hook.data) == Pointer.address(data) { hook.removed = true return unsafe status(env, OK) }
+    p = hook.next
+  }
+  return unsafe status(env, INVALID_ARG)
+}
+@deferredCallbacks("callback")
+unsafe export "C" fn napi_add_async_cleanup_hook(env: ?*mut u8, callback: AsyncCleanupHook, data: ?*mut u8, result: ?*mut ?*mut Hook) -> i32 {
+  if !unsafe owner(env) { return INVALID_ARG }
+  if Intrinsic.pointerIsNull<AsyncCleanupHook>(callback) { return unsafe status(env, INVALID_ARG) }
+  if unsafe closing(env) { return unsafe status(env, CLOSING) }
+  let state = unsafe stateOf(env)
+  if Pointer.isNull<Async>(state) { return unsafe status(env, GENERIC_FAILURE) }
+  let hook = unsafe allocate<Hook>()
+  if Pointer.isNull<Hook>(hook) { return unsafe status(env, GENERIC_FAILURE) }
+  let a = () let s = unsafe Pointer.borrow<(), Async>(&a, unsafe nn(state))
+  let mut guard = s.hooks.lock()
+  let hooks = guard.getMut()
+  unsafe Pointer.put<Hook>(unsafe nn(hook), Hook { sync: Intrinsic.pointerNullFunction<CleanupHook>(), asynchronous: callback, data: data, removed: false, started: false, next: hooks.first, state: unsafe nn(state) })
+  hooks.first = hook
+  drop hooks drop guard
+  if !Pointer.isNull<?*mut Hook>(result) { unsafe store<?*mut Hook>(result, hook) }
+  return unsafe status(env, OK)
+}
+/// May run on any thread, also while the hook's owner callback runs.
+export "C" fn napi_remove_async_cleanup_hook(handle: ?*mut Hook) -> i32 {
+  if Pointer.isNull<Hook>(handle) { return INVALID_ARG }
+  let a = () let hook = unsafe Pointer.borrow<(), Hook>(&a, unsafe nn(handle))
+  if Intrinsic.pointerIsNull<AsyncCleanupHook>(hook.asynchronous) { return INVALID_ARG }
+  let state = hook.state drop hook
+  let s = unsafe Pointer.borrow<(), Async>(&a, state)
+  let mut guard = s.hooks.lock()
+  let mut b = () let entry = unsafe Pointer.borrowMut<(), Hook>(&mut b, unsafe nn(handle))
+  if entry.removed { return INVALID_ARG }
+  entry.removed = true
+  let started = entry.started drop entry
+  if started { let hooks = guard.getMut() hooks.pending = hooks.pending - 1 }
+  drop guard
+  wake(&s.waker)
+  return OK
+}
+/// Runs each hook that has not started, newest first. Returns whether an async hook is pending.
+unsafe fn runCleanupHooks(state: *mut Async) -> bool {
+  let a = () let s = unsafe Pointer.borrow<(), Async>(&a, state) let env = s.env drop s
+  while true {
+    let s1 = unsafe Pointer.borrow<(), Async>(&a, state)
+    let mut guard = s1.hooks.lock()
+    let hooks = guard.getMut()
+    let mut p = hooks.first
+    let mut b = ()
+    while !Pointer.isNull<Hook>(p) {
+      let hook = unsafe Pointer.borrow<(), Hook>(&b, unsafe nn(p))
+      if !hook.removed && !hook.started { break }
+      p = hook.next
+    }
+    if Pointer.isNull<Hook>(p) { return hooks.pending != 0 }
+    let hook = unsafe Pointer.borrowMut<(), Hook>(&mut b, unsafe nn(p))
+    hook.started = true
+    let sync = hook.sync let asynchronous = hook.asynchronous let data = hook.data
+    if !Intrinsic.pointerIsNull<AsyncCleanupHook>(asynchronous) { hooks.pending = hooks.pending + 1 } else { hook.removed = true }
+    drop hook drop hooks drop guard drop s1
+    unsafe bump(state)
+    let handles = unsafe enter(env)
+    if !Intrinsic.pointerIsNull<AsyncCleanupHook>(asynchronous) {
+      let present = unsafe Intrinsic.pointerRequalify<AsyncCleanupHook, extern "C" fn(?*mut u8, ?*mut u8) -> ()>(asynchronous)
+      unsafe present(unsafe raw(unsafe nn(p)), data)
+    } else {
+      let present = unsafe Intrinsic.pointerRequalify<CleanupHook, extern "C" fn(?*mut u8) -> ()>(sync)
+      unsafe present(data)
+    }
+    unsafe napi.fatalPending(env)
+    unsafe napi.leaveCallback(env, handles)
+  }
+  return false
+}
+
+export "C" fn napi_get_uv_event_loop(env: ?*mut u8, result: ?*mut ?*mut u8) -> i32 {
+  if !unsafe owner(env) { return INVALID_ARG }
+  if Pointer.isNull<?*mut u8>(result) { return unsafe status(env, INVALID_ARG) }
+  let state = unsafe stateOf(env)
+  if Pointer.isNull<Async>(state) { return unsafe status(env, GENERIC_FAILURE) }
+  let a = () let s = unsafe Pointer.borrow<(), Async>(&a, unsafe nn(state)) let io = s.io drop s
+  unsafe store<?*mut u8>(result, unsafe loops.loopPointer(io))
+  return unsafe status(env, OK)
+}
+export "C" fn napi_fatal_exception(env: ?*mut u8, error: ?*mut u8) -> i32 {
+  if !unsafe owner(env) { return INVALID_ARG }
+  if Pointer.isNull<u8>(error) { return unsafe status(env, INVALID_ARG) }
+  let code = unsafe napi.napi_throw(env, error)
+  if code == OK { unsafe napi.fatalPending(unsafe nn(env)) }
+  return unsafe status(env, code)
+}
+
+// The runtime side.
+
+unsafe fn workPending(state: *mut Async) -> bool {
+  let a = () let s = unsafe Pointer.borrow<(), Async>(&a, state) let mut p = s.works drop s
+  while !Pointer.isNull<Work>(p) {
+    let entry = unsafe Pointer.borrow<(), Work>(&a, unsafe nn(p))
+    if entry.phase == WORK_QUEUED || entry.phase == WORK_FINISHED || entry.phase == WORK_COMPLETING { return true }
+    p = entry.next
+  }
+  return false
+}
+/// Completes finished work and delivers thread-safe calls, with the bridge bound. Returns whether
+/// a native callback ran or calls remain for another turn.
+pub unsafe fn poll(env: *mut u8) -> bool {
+  if !unsafe owner(unsafe raw(env)) { return false }
+  let state = unsafe stateOf(unsafe raw(env))
+  if Pointer.isNull<Async>(state) { return false }
+  let mut a = () let s = unsafe Pointer.borrowMut<(), Async>(&mut a, unsafe nn(state))
+  if s.draining || s.polling { return false }
+  s.polling = true let before = s.activity drop s
+  unsafe completeFinished(unsafe nn(state))
+  let more = unsafe dispatchAll(unsafe nn(state))
+  let s2 = unsafe Pointer.borrowMut<(), Async>(&mut a, unsafe nn(state))
+  s2.polling = false
+  return more || s2.activity != before
+}
+/// Whether the environment has queued work or a referenced thread-safe function.
+pub unsafe fn alive(env: *mut u8) -> bool {
+  let state = unsafe stateOf(unsafe raw(env))
+  if Pointer.isNull<Async>(state) { return false }
+  if unsafe workPending(unsafe nn(state)) { return true }
+  let a = () let s = unsafe Pointer.borrow<(), Async>(&a, unsafe nn(state)) let mut p = s.functions drop s
+  while !Pointer.isNull<Function>(p) {
+    let entry = unsafe Pointer.borrow<(), Function>(&a, unsafe nn(p))
+    if entry.referenced { return true }
+    p = entry.next
+  }
+  return false
+}
+/// Closes every function, cancels queued work and runs the cleanup hooks, then waits until async
+/// hooks, running work and the producers of every function finish.
+pub export "C" fn silk_napi_async_close(env: *mut u8) -> () {
+  if !unsafe owner(unsafe raw(env)) { return () }
+  let state = unsafe stateOf(unsafe raw(env))
+  if Pointer.isNull<Async>(state) { return () }
+  let mut a = () let s = unsafe Pointer.borrowMut<(), Async>(&mut a, unsafe nn(state))
+  if s.draining { return () }
+  s.draining = true let io = s.io let mut f = s.functions let mut w = s.works drop s
+  while !Pointer.isNull<Function>(f) {
+    let entry = unsafe Pointer.borrow<(), Function>(&a, unsafe nn(f))
+    let mut guard = entry.queue.lock() let queue = guard.getMut() queue.closing = true drop queue drop guard
+    entry.space.notifyAll()
+    f = entry.next
+  }
+  while !Pointer.isNull<Work>(w) {
+    let entry = unsafe Pointer.borrow<(), Work>(&a, unsafe nn(w)) let next = entry.next let phase = entry.phase drop entry
+    if phase == WORK_QUEUED { let _cancelled = unsafe cancel(unsafe nn(w)) }
+    w = next
+  }
+  while true {
+    let cleanup = unsafe runCleanupHooks(unsafe nn(state))
+    unsafe completeFinished(unsafe nn(state))
+    let more = unsafe dispatchAll(unsafe nn(state))
+    let s2 = unsafe Pointer.borrow<(), Async>(&a, unsafe nn(state)) let functions = s2.functions drop s2
+    if !cleanup && !more && !unsafe workPending(unsafe nn(state)) && Pointer.isNull<Function>(functions) { break }
+    // Addon libuv handles, such as an async cleanup hook's timer, run on the runtime's guest loop.
+    let _ignored = unsafe uv.uv_run(unsafe loops.loopPointer(io), RUN_NOWAIT)
+    if !more { run unsafe loops.waitWork(io) }
+  }
+  while true {
+    let s3 = unsafe Pointer.borrow<(), Async>(&a, unsafe nn(state)) let scope = s3.scope drop s3
+    if Pointer.isNull<CallbackScope>(scope) { break }
+    let closed = unsafe napi_close_callback_scope(unsafe raw(env), scope)
+    if closed != OK { break }
+  }
+}
+/// Runs after object and instance finalizers, which may destroy contexts and delete work.
+pub export "C" fn silk_napi_async_dispose(env: *mut u8) -> () {
+  if !unsafe owner(unsafe raw(env)) { return () }
+  let state = unsafe stateOf(unsafe raw(env))
+  if Pointer.isNull<Async>(state) { return () }
+  unsafe silk_napi_async_close(env)
+  let a = ()
+  while true {
+    let s = unsafe Pointer.borrow<(), Async>(&a, unsafe nn(state)) let scope = s.scope drop s
+    if Pointer.isNull<CallbackScope>(scope) { break }
+    let closed = unsafe napi_close_callback_scope(unsafe raw(env), scope)
+    if closed != OK { break }
+  }
+  while true {
+    let s = unsafe Pointer.borrow<(), Async>(&a, unsafe nn(state)) let work = s.works drop s
+    if Pointer.isNull<Work>(work) { break }
+    unsafe workFree(unsafe nn(work))
+  }
+  while true {
+    let s = unsafe Pointer.borrow<(), Async>(&a, unsafe nn(state)) let context = s.contexts drop s
+    if Pointer.isNull<Context>(context) { break }
+    let _destroyed = unsafe napi_async_destroy(unsafe raw(env), context)
+    // A context still entered by a scope stays listed; free it here.
+    let s2 = unsafe Pointer.borrow<(), Async>(&a, unsafe nn(state))
+    let still = unsafe same<Context>(s2.contexts, unsafe nn(context)) drop s2
+    if still { unsafe contextFree(unsafe nn(context)) }
+  }
+  let owned = unsafe Pointer.take<Async>(unsafe nn(state))
+  let mut guard = owned.hooks.lock()
+  let mut p = guard.get().first
+  drop guard
+  while !Pointer.isNull<Hook>(p) {
+    let hook = unsafe Pointer.take<Hook>(unsafe nn(p))
+    unsafe free(unsafe raw(unsafe nn(p)))
+    p = hook.next
+  }
+  drop owned
+  unsafe free(unsafe raw(unsafe nn(state)))
+  unsafe napi.setAsyncState(env, nil())
+}

@@ -1,0 +1,362 @@
+//! Native Set algebra/predicates (quickjs.c:55059-55610) and Map/Set.groupBy
+//! (54760-54875). Inputs borrow roots; successful returned Values own references.
+import js_shapes
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.num.f64
+import silk.num.i32
+import silk.num.i64
+import silk.num.u32
+import silk.num.u8
+import silk.num.usize
+import runtime_memory { AllocationObserver }
+import js_heap { HeapCell }
+import js_value { ValueBits }
+import js_intl_realm as ops
+import js_realm { Realm, Arguments }
+import js_core_types { NativeErrorKind, ObjectData, ObjectPayload,
+  PropertySlot, ShapeData, JS_PROP_WRITABLE }
+import js_gc { HeapHooks }
+import js_coercion_host { CoercionHooks }
+import js_property_host { OwnPropertyHooks, GetPropertyHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_call_host { CallHooks }
+import js_native_function_host { NativeFunctionHooks }
+import js_atom_data as atoms
+import js_proxy_core as core
+import js_primitives as primitives
+import js_property_mutations as properties
+import js_object_allocate as objects
+import js_array_storage { StorageOutcome }
+import js_array_storage as arrayStorage
+import js_map_storage as storage
+import js_map_storage { Collection }
+import js_map_iterators as iterators
+import js_owned_value { Value, immediateRef, ValueRef }
+import js_collection_support as support
+import js_string_types { StringLengthError }
+import js_bigint { BigIntError }
+import js_exceptions { JsException }
+import js_invariant { invariant }
+
+pub const IS_DISJOINT_FROM: u32 = 16
+pub const IS_SUBSET_OF: u32 = 17
+pub const IS_SUPERSET_OF: u32 = 18
+pub const INTERSECTION: u32 = 19
+pub const DIFFERENCE: u32 = 20
+pub const SYMMETRIC_DIFFERENCE: u32 = 21
+pub const UNION: u32 = 22
+
+
+// The other argument's Set record, plus its keys() iterator once one is taken.
+struct SetRecord { has: Value, keys: Value, iterator: Value, next: Value }
+impl SetRecord {
+  fn make() -> Self {
+    return SetRecord { has: Value.immediate(ValueBits.Undefined), keys: Value.immediate(ValueBits.Undefined),
+      iterator: Value.immediate(ValueBits.Undefined), next: Value.immediate(ValueBits.Undefined) }
+  }
+}
+// An actual native Set bypasses its .size property, but NEVER its has/keys getters.
+effect fn setRecord<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(hooks: &mut H,realm: Realm<'a>, other: ValueRef<'b>, record: &mut SetRecord) -> i64 ! JsException ? &mut Allocator {
+  let mut size: i64 = 0
+  match Collection.find(other, 1) {
+    Option<Collection<'b>>.Some { value: state } => { size = u32.toI64(state.count()) }
+    _ => {
+      let sizeValue = run support.get(&mut hooks, realm, other, atoms.JS_ATOM_size)
+      let number = run support.number(&mut hooks, realm, sizeValue.borrow())
+      drop sizeValue
+      if f64.isNaN(number) { return run ops.error(&mut hooks,realm, b".size is not a number") }
+      size = primitives.numberToInt64Saturated(number).value
+      if size < 0 { return run ops.throwError(&mut hooks,realm, NativeErrorKind.Range, b".size must be positive") }
+    }
+  }
+  record.has = run support.get(&mut hooks, realm, other, atoms.JS_ATOM_has)
+  if core.undefined(record.has.view()) { return run ops.error(&mut hooks,realm, b".has is undefined") }
+  if !hooks.isCallable(realm, record.has.borrow()) { return run ops.error(&mut hooks,realm, b".has is not a function") }
+  record.keys = run support.get(&mut hooks, realm, other, atoms.JS_ATOM_keys)
+  if core.undefined(record.keys.view()) { return run ops.error(&mut hooks,realm, b".keys is undefined") }
+  if !hooks.isCallable(realm, record.keys.borrow()) { return run ops.error(&mut hooks,realm, b".keys is not a function") }
+  return size
+}
+effect fn otherIterator<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(hooks: &mut H,realm: Realm<'a>, other: ValueRef<'b>, record: &mut SetRecord) -> () ! JsException ? &mut Allocator {
+  record.iterator = run support.callWith(&mut hooks, realm, record.keys.borrow(), other, &[])
+  record.next = run support.get(&mut hooks, realm, record.iterator.borrow(), atoms.JS_ATOM_next)
+}
+effect fn hasItem<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(hooks: &mut H,realm: Realm<'a>, other: ValueRef<'b>, record: &SetRecord, item: ValueRef<'b>) -> bool ! JsException ? &mut Allocator {
+  return core.truthy(run support.callWith(&mut hooks, realm, record.has.borrow(), other, &[item.view()]))
+}
+effect fn copySet<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, source: Collection<'b>) -> Value ! JsException ? &mut Allocator {
+  let copy = run storage.make(&mut hooks, memory, realm, 1)
+  // This source copy does not invoke .add, @@iterator, or any JavaScript callback.
+  // It walks ordered records directly, not a separately allocated key snapshot.
+  run source.copyKeysInto(&mut hooks, realm, Collection.of(copy.borrow(), 1))
+  return move copy
+}
+effect fn predicates<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, method: u32, receiver: ValueRef<'b>,
+  other: ValueRef<'b>, source: Collection<'b>, size: i64, record: &mut SetRecord) -> ValueBits ! JsException ? &mut Allocator {
+  let count = u32.toI64(source.count())
+  if (method == IS_SUBSET_OF && count > size) || (method == IS_SUPERSET_OF && count < size) {
+    return ValueBits.Bool { value: false }
+  }
+  if method == IS_SUBSET_OF || (method == IS_DISJOINT_FROM && count <= size) {
+    let iterator = run iterators.create(&mut hooks, memory, realm, receiver, 1, 0)
+    while true {
+      let mut done = false
+      let item = run iterators.step(&mut hooks, memory, realm, iterator.borrow(), 1, &mut done)
+      if done { break }
+      let present = run hasItem(&mut hooks, realm, other, &record, item.borrow())
+      if (method == IS_DISJOINT_FROM && present) || (method == IS_SUBSET_OF && !present) {
+        return ValueBits.Bool { value: false }
+      }
+    }
+  } else {
+    run otherIterator(&mut hooks, realm, other, &mut record)
+    while true {
+      let mut done = false
+      let item = run support.next(&mut hooks, realm, record.iterator.borrow(), record.next.borrow(), &mut done)
+      if done { break }
+      let present = source.has(item.borrow())
+      drop item
+      if (method == IS_DISJOINT_FROM && present) || (method == IS_SUPERSET_OF && !present) {
+        // The pinned source deliberately ignores IteratorClose's return code:
+        // a throwing return leaves its pending exception, but this result is false.
+        let closed = run Effect.result(support.close(&mut hooks, realm, record.iterator.borrow(), false))
+        drop closed
+        return ValueBits.Bool { value: false }
+      }
+    }
+  }
+  return ValueBits.Bool { value: true }
+}
+effect fn intersection<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, receiver: ValueRef<'b>, other: ValueRef<'b>,
+  source: Collection<'b>, size: i64, record: &mut SetRecord) -> ValueBits ! JsException ? &mut Allocator {
+  let native = u32.toI64(source.count()) <= size
+  if native {
+    record.iterator = run iterators.create(&mut hooks, memory, realm, receiver, 1, 0)
+  } else {
+    run otherIterator(&mut hooks, realm, other, &mut record)
+  }
+  // The keys call and next getter precede allocation of the result Set.
+  let created = run storage.make(&mut hooks, memory, realm, 1)
+  let target = Collection.of(created.borrow(), 1)
+  while true {
+    let mut done = false
+    let mut item = Value.immediate(ValueBits.Undefined)
+    if native {
+      item = run iterators.step(&mut hooks, memory, realm, record.iterator.borrow(), 1, &mut done)
+    } else {
+      item = run support.next(&mut hooks, realm, record.iterator.borrow(), record.next.borrow(), &mut done)
+    }
+    if done { break }
+    let mut present = false
+    if native { present = run hasItem(&mut hooks, realm, other, &record, item.borrow()) }
+    else { present = source.has(item.borrow()) }
+    if present && !target.has(item.borrow()) {
+      run target.put(&mut hooks, realm, item.borrow(), immediateRef(ValueBits.Undefined))
+    }
+  }
+  return created.intoBits()
+}
+effect fn difference<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, other: ValueRef<'b>, source: Collection<'b>,
+  size: i64, record: &mut SetRecord) -> ValueBits ! JsException ? &mut Allocator {
+  let copy = run copySet(&mut hooks, memory, realm, source)
+  let target = Collection.of(copy.borrow(), 1)
+  let native = u32.toI64(source.count()) <= size
+  if native {
+    // Difference visits the COPY, unlike intersection/subset/disjointness.
+    record.iterator = run iterators.create(&mut hooks, memory, realm, copy.borrow(), 1, 0)
+  } else {
+    run otherIterator(&mut hooks, realm, other, &mut record)
+  }
+  while true {
+    let mut done = false
+    let mut item = Value.immediate(ValueBits.Undefined)
+    if native {
+      item = run iterators.step(&mut hooks, memory, realm, record.iterator.borrow(), 1, &mut done)
+    } else {
+      item = run support.next(&mut hooks, realm, record.iterator.borrow(), record.next.borrow(), &mut done)
+    }
+    if done { break }
+    let mut remove = true
+    if native { remove = run hasItem(&mut hooks, realm, other, &record, item.borrow()) }
+    if remove {
+      let _erased = target.erase(&mut hooks, realm, item.borrow())
+    }
+  }
+  return copy.intoBits()
+}
+effect fn combine<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, method: u32, other: ValueRef<'b>,
+  source: Collection<'b>, record: &mut SetRecord) -> ValueBits ! JsException ? &mut Allocator {
+  record.has = Value.immediate(ValueBits.Undefined)
+  run otherIterator(&mut hooks, realm, other, &mut record)
+  // Both iterator acquisition side effects run BEFORE this copy.
+  let copy = run copySet(&mut hooks, memory, realm, source)
+  let target = Collection.of(copy.borrow(), 1)
+  while true {
+    let mut done = false
+    let item = run support.next(&mut hooks, realm, record.iterator.borrow(), record.next.borrow(), &mut done)
+    if done { break }
+    if method == UNION {
+      run target.put(&mut hooks, realm, item.borrow(), immediateRef(ValueBits.Undefined))
+    } else if source.has(item.borrow()) {
+      // Membership is tested against the LIVE receiver on every iteration.
+      let _erased = target.erase(&mut hooks, realm, item.borrow())
+    } else if !target.has(item.borrow()) {
+      // A duplicate, or a key erased from the receiver by the iterator, must not
+      // be removed/reinserted in the result: its original position survives.
+      run target.put(&mut hooks, realm, item.borrow(), immediateRef(ValueBits.Undefined))
+    }
+  }
+  return copy.intoBits()
+}
+effect fn body<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, method: u32, receiver: ValueRef<'b>,
+  args: Arguments<'a>) -> ValueBits ! JsException ? &mut Allocator {
+  let source = run Collection.require(&mut hooks, realm, receiver, 1)
+  let other = args.get(0)
+  let mut record = SetRecord.make()
+  let size = run setRecord(&mut hooks, realm, other, &mut record)
+  if method >= IS_DISJOINT_FROM && method <= IS_SUPERSET_OF {
+    return run predicates(&mut hooks, memory, realm, method, receiver, other, source, size, &mut record)
+  }
+  if method == INTERSECTION { return run intersection(&mut hooks, memory, realm, receiver, other, source, size, &mut record) }
+  if method == DIFFERENCE { return run difference(&mut hooks, memory, realm, other, source, size, &mut record) }
+  if method == SYMMETRIC_DIFFERENCE || method == UNION {
+    return run combine(&mut hooks, memory, realm, method, other, source, &mut record)
+  }
+  return run ops.error(&mut hooks,realm, b"invalid Set algebra method")
+}
+pub effect fn call<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, method: u32, thisValue: ValueRef<'b>,
+  args: Arguments<'a>) -> ValueBits ! JsException ? &mut Allocator {
+  // Callback/storage adapters have already installed the pending exception.
+  let result = run Effect.result(body(&mut hooks, memory, realm, method, thisValue, args))
+  return match move result {
+    Result<ValueBits, JsException>.Success { value } => value
+    Result<ValueBits, JsException>.Failure { error } => { fail move error }
+  }
+}
+
+effect fn fastPush<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
+  array: ValueRef<'b>, item: ValueRef<'b>) -> bool ! JsException ? &mut Allocator {
+  let node = core.reference(array.view())
+  let anchor = ()
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  if !object.fastArray() { return false }
+  let mut count: usize = 0
+  let mut capacity: usize = 0
+  match &object.payload {
+    ObjectPayload.FastArray { array: values } => {
+      count = values.values().length()
+      capacity = values.values().capacity()
+    }
+    _ => invariant()
+  }
+  let denseLength = match object.slot(0).view(unsafe js_shapes.slotFlags(object.shape, 0)) {
+    PropertySlot.Value { value: ValueBits.Int { value } } => value >= 0 && i32.toUsize(value) == count
+    _ => false
+  }
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, object.shape)
+  let writable = (u8.toU32(shape.properties.get(0).flags) & JS_PROP_WRITABLE) != 0
+  drop shape
+  drop object
+  if !denseLength || !writable || count >= 2147483647 || !unsafe properties.canExtendFast(node) { return false }
+  // js_array_push expands BEFORE changing length. Generic indexed Set instead
+  // extends length before its allocation; a leaked group array can expose that
+  // difference on OOM, so reserve through the existing array storage API first.
+  if count == capacity {
+    let expanded = run Effect.result(unsafe arrayStorage.expandFastValues(&mut hooks, realm, node, usize.toU32(count + 1)))
+    match move expanded {
+      Result<(), OutOfMemoryError>.Success { .. } => ()
+      Result<(), OutOfMemoryError>.Failure { error } => { return run ops.materialize(&mut hooks,realm, move error) }
+    }
+  }
+  let appended = run Effect.result(unsafe arrayStorage.appendFastElement(&mut hooks, realm, node, item.dup().intoBits()))
+  match move appended {
+    Result<StorageOutcome, OutOfMemoryError>.Success { value } => {
+      if value != StorageOutcome.Accepted { invariant() }
+    }
+    Result<StorageOutcome, OutOfMemoryError>.Failure { error } => { return run ops.materialize(&mut hooks,realm, move error) }
+  }
+  return true
+}
+effect fn pushGroup<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(hooks: &mut H,realm: Realm<'a>, array: ValueRef<'b>, item: ValueRef<'b>) -> () ! JsException ? &mut Allocator {
+  if run fastPush(&mut hooks, realm, array, item) { return () }
+  // Group arrays always have an own numeric length in the uint32 range. The
+  // general push path observes inherited indexed setters before setting length.
+  let lengthValue = run support.get(&mut hooks, realm, array, atoms.JS_ATOM_length)
+  let length = lengthValue.view().numericValue()
+  drop lengthValue
+  let inserted = run Effect.result(properties.setPropertyInt64(&mut hooks, realm, array,
+    f64.toI64(length), item.dup()))
+  match move inserted {
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { .. } => ()
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => {
+      return run ops.materialize(&mut hooks,realm, move error)
+    }
+  }
+  let resized = run Effect.result(properties.setProperty(&mut hooks, realm, array,
+    atoms.JS_ATOM_length, Value.immediate(ValueBits.number(length + 1.0))))
+  match move resized {
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { .. } => ()
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => {
+      return run ops.materialize(&mut hooks,realm, move error)
+    }
+  }
+}
+effect fn groupByBody<'a, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, args: Arguments<'a>,
+  iterator: &mut Value, close: &mut bool) -> ValueBits ! JsException ? &mut Allocator {
+  let callback = args.get(1)
+  if !hooks.isCallable(realm, callback) { return run ops.error(&mut hooks,realm, b"not a function") }
+  iterator.* = run support.iterator(&mut hooks, memory, realm, args.get(0))
+  let next = run support.get(&mut hooks, realm, iterator.borrow(), atoms.JS_ATOM_next)
+  // Source installs this very same Map-producing function on Set as well.
+  let map = run storage.make(&mut hooks, memory, realm, 0)
+  let groups = Collection.of(map.borrow(), 0)
+  let mut index: i64 = 0
+  while true {
+    close.* = true
+    if index >= primitives.MAX_SAFE_INTEGER { return run ops.error(&mut hooks,realm, b"too many elements") }
+    close.* = false
+    let mut done = false
+    let item = run support.next(&mut hooks, realm, iterator.borrow(), next.borrow(), &mut done)
+    if done { break }
+    close.* = true
+    let key = run support.callWith(&mut hooks, realm, callback, realm.globalObject(), &[item.view(), ValueBits.number(i64.toF64(index))])
+    close.* = false
+    let mut group = groups.get(key.borrow())
+    if core.undefined(group.view()) {
+      let made = run Effect.result(objects.newArray(&mut hooks, memory, realm))
+      group = match move made { Result<Value, OutOfMemoryError>.Success { value } => move value
+        Result<Value, OutOfMemoryError>.Failure { error } => run ops.materialize(&mut hooks,realm, move error) }
+      run groups.put(&mut hooks, realm, key.borrow(), group.borrow())
+    }
+    run pushGroup(&mut hooks, realm, group.borrow(), item.borrow())
+    index = index + 1
+  }
+  return map.intoBits()
+}
+pub effect fn groupBy<'a, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + CallHooks + NativeFunctionHooks>(hooks: &mut H,
+  memory: &AllocationObserver, realm: Realm<'a>, args: Arguments<'a>) -> ValueBits ! JsException ? &mut Allocator {
+  let mut iterator = Value.immediate(ValueBits.Undefined)
+  let mut close = false
+  let result = run Effect.result(groupByBody(&mut hooks, memory, realm, args, &mut iterator, &mut close))
+  if close {
+    // Only callback and safe-index failures close the iterator. next/get/allocation
+    // and push failures intentionally do not; pending=true preserves the original.
+    let closed = run Effect.result(support.close(&mut hooks, realm, iterator.borrow(), true))
+    drop closed
+  }
+  return match move result {
+    Result<ValueBits, JsException>.Success { value } => value
+    Result<ValueBits, JsException>.Failure { error } => { fail move error }
+  }
+}

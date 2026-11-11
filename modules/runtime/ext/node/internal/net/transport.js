@@ -1,0 +1,131 @@
+'use strict';
+
+const host = require('internal/host');
+const { AsyncResource } = require('async_hooks');
+
+function error(status, syscall, address, port) {
+  const info = host.net('error', [status]);
+  const target = address === undefined ? '' : ` ${address}${port === undefined ? '' : `:${port}`}`;
+  const err = new Error(`${syscall} ${info.code}${target}`);
+  err.code = info.code;
+  err.errno = status;
+  err.syscall = syscall;
+  if (address !== undefined) err.address = address;
+  if (port !== undefined) err.port = port;
+  return err;
+}
+
+// Socket owns stream state; this adapter owns a native handle and request lifetime.
+// An adopted handle (accepted TCP/pipe, or a future TLS/stdio adapter) has the
+// same read/write/shutdown/close contract as a newly allocated connection.
+class Transport {
+  constructor(kind, onEvent, id, fd) {
+    this.kind = kind;
+    this.onEvent = onEvent;
+    this.closed = false;
+    this.closing = false;
+    this.reading = false;
+    this.requests = new Map();
+    this.sequence = 0;
+    this.resource = new AsyncResource(kind === 5 ? 'TTYWRAP' : kind === 2 ? 'PIPEWRAP' : 'TCPWRAP');
+    const callback = (type, status, payload, extra) => {
+      host.invokeResource(this.resource, this.dispatch, this, [type, status, payload, extra], false);
+      host.checkpoint();
+    };
+    this.id = id === undefined ? host.net('create', [kind, callback, fd]) : id;
+    if (this.id < 0) {
+      this.resource.emitDestroy();
+      throw error(this.id, 'socket');
+    }
+    if (id !== undefined) {
+      const status = host.net('callback', [id, callback]);
+      if (status < 0) {
+        host.net('close', [id]);
+        this.resource.emitDestroy();
+        throw error(status, 'socket');
+      }
+    }
+  }
+  call(operation, ...args) { return host.net(operation, [this.id, ...args]); }
+  dispatch(type, status, payload, extra) {
+    if (type === 4 || type === 5) {
+      const request = this.requests.get(payload);
+      if (!request) return;
+      this.requests.delete(payload);
+      request.callback(status < 0 ? error(status, type === 4 ? 'write' : 'shutdown') : null);
+      return;
+    }
+    if (type === 1 && status < 0) this.reading = false;
+    if (type === 6) {
+      this.closed = true;
+      this.reading = false;
+      try {
+        const cancelled = Object.assign(new Error('Cannot call write after a stream was destroyed'), { code: 'ERR_STREAM_DESTROYED' });
+        for (const request of this.requests.values()) request.callback(cancelled);
+        this.requests.clear();
+        this.onEvent(type, status, payload, extra);
+      } finally { this.resource.emitDestroy(); }
+      return;
+    }
+    this.onEvent(type, status, payload, extra);
+  }
+  readStart() {
+    if (this.reading || this.closing) return 0;
+    const status = this.call('readStart');
+    if (status >= 0) this.reading = true;
+    return status;
+  }
+  readStop() {
+    if (!this.reading || this.closing) return 0;
+    const status = this.call('readStop');
+    if (status >= 0) this.reading = false;
+    return status;
+  }
+  write(chunk, callback) {
+    const token = ++this.sequence;
+    this.requests.set(token, { callback, chunk });
+    const status = this.call('write', chunk.buffer, chunk.byteOffset, chunk.byteLength, token);
+    if (status < 0) {
+      this.requests.delete(token);
+      callback(error(status, 'write'));
+    }
+  }
+  writev(chunks, callback) {
+    let pending = chunks.length;
+    let failure = null;
+    if (pending === 0) return callback(null);
+    const done = err => {
+      failure ||= err;
+      if (--pending === 0) callback(failure);
+    };
+    // Each buffer is submitted separately, avoiding concatenation and retaining
+    // corked write order. The stream callback waits for every native completion.
+    for (const entry of chunks) this.write(entry.chunk, done);
+  }
+  shutdown(callback) {
+    const token = ++this.sequence;
+    this.requests.set(token, { callback });
+    const status = this.call('shutdown', token);
+    if (status < 0) {
+      this.requests.delete(token);
+      const failure = error(status, 'shutdown');
+      // libuv refuses submission when its write side is already shut,
+      // shutting, closing, or non-writable. This is not a shutdown(2) error.
+      // Match Node's synchronous completion contract; queued shutdown and
+      // read errors (including a reset that cleared WRITABLE) still dispatch.
+      callback(failure.code === 'ENOTCONN' ? null : failure);
+    }
+  }
+  close(reset = false) {
+    if (this.closed || this.closing) return 0;
+    const status = this.call(reset ? 'reset' : 'close');
+    if (status >= 0) this.closing = true;
+    return status;
+  }
+  address(peer = false) { return this.closed ? undefined : this.call('address', peer); }
+  ref() { if (!this.closed) this.call('ref'); }
+  unref() { if (!this.closed) this.call('unref'); }
+  hasRef() { return !this.closed && !!this.call('hasRef'); }
+}
+
+module.exports = { Transport, error, native: (operation, args) => host.net(operation, args) };

@@ -1,0 +1,114 @@
+//! Group-wide Web Lock arbitration. All functions manipulating nodes require the
+//! registry mutex; names and nodes use the group allocator, never an isolate heap.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.mem.pointer { Pointer }
+import silk.num.u32
+import silk.num.usize
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_heap { HeapHeader }
+import silkjs.js_value { ValueBits }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_os_workers_resources as resources
+import libs.core.owners as owners
+import libs.core.common as common
+import libs.core.host as host
+import ext.worker_transport { Group, Registry, LockRequest }
+import ext.worker_transport as transport
+
+fn equal(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length { return false }
+  let mut i: usize = 0 while i < a.length { if a[i] != b[i] { return false } i = i + 1 } return true
+}
+pub unsafe fn lookup(registry: &Registry, owner: u32, id: u32) -> ?*mut LockRequest {
+  let anchor = () let mut cursor = registry.locks
+  while !Pointer.isNull<LockRequest>(cursor) { let item = unsafe Pointer.borrow<(), LockRequest>(&anchor, unsafe transport.nonnull(cursor)) if item.owner == owner && item.id == id { return cursor } cursor = item.next }
+  return Pointer.null<LockRequest>()
+}
+unsafe fn available(registry: &Registry, request: &LockRequest) -> bool {
+  let anchor = () let mut cursor = registry.locks
+  while !Pointer.isNull<LockRequest>(cursor) {
+    let item = unsafe Pointer.borrow<(), LockRequest>(&anchor, unsafe transport.nonnull(cursor)) cursor = item.next
+    if item.id == request.id || !equal(item.name.asSlice(), request.name.asSlice()) { continue }
+    if item.status == 1 && (!request.shared || !item.shared) { return false }
+    if item.status == 0 && item.id < request.id { return false }
+  }
+  return true
+}
+unsafe fn grant(registry: &Registry) -> () {
+  let mut anchor = () let mut cursor = registry.locks
+  while !Pointer.isNull<LockRequest>(cursor) {
+    let request = unsafe Pointer.borrowMut<(), LockRequest>(&mut anchor, unsafe transport.nonnull(cursor)) cursor = request.next
+    if request.status == 0 && unsafe available(registry, &request.*) {
+      request.status = 1 request.notify = true let owner = request.owner drop request unsafe transport.wake(registry, owner)
+    }
+  }
+}
+pub unsafe effect fn request(group: &Group, owner: u32, name: List<u8>, shared: bool, steal: bool, ifAvailable: bool) -> u32 ! OutOfMemoryError {
+  let pointer = run transport.allocate<LockRequest>(&group.resources)
+  let mut guard = group.registry.get().lock() let registry = guard.getMut()
+  let id = registry.nextId registry.nextId = id + 1
+  unsafe Pointer.put<LockRequest>(pointer, LockRequest { next: Pointer.null<LockRequest>(), id: id, owner: owner, name: move name, shared: shared, status: 0, notify: false })
+  let mut anchor = () let request = unsafe Pointer.borrowMut<(), LockRequest>(&mut anchor, pointer)
+  if steal {
+    let mut cursor = registry.locks let mut otherAnchor = ()
+    while !Pointer.isNull<LockRequest>(cursor) {
+      let item = unsafe Pointer.borrowMut<(), LockRequest>(&mut otherAnchor, unsafe transport.nonnull(cursor)) cursor = item.next
+      if item.status == 1 && equal(item.name.asSlice(), request.name.asSlice()) {
+        item.status = 2 item.notify = true let target = item.owner drop item unsafe transport.wake(&registry.*, target)
+      }
+    }
+    request.status = 1
+  } else if unsafe available(&registry.*, &request.*) { request.status = 1 }
+  else if ifAvailable { request.status = 3 }
+  drop request
+  // Append rather than prepend: a release grants the oldest compatible cohort.
+  let mut link = Pointer.fromMutRef<?*mut LockRequest>(&mut registry.locks)
+  while !Pointer.isNull<LockRequest>(unsafe Pointer.read<?*mut LockRequest>(link)) {
+    let item = unsafe Pointer.borrowMut<(), LockRequest>(&mut anchor, unsafe transport.nonnull(unsafe Pointer.read<?*mut LockRequest>(link)))
+    link = Pointer.fromMutRef<?*mut LockRequest>(&mut item.next) drop item
+  }
+  unsafe Pointer.put<?*mut LockRequest>(link, pointer)
+  return id
+}
+pub unsafe fn release(registry: &mut Registry, owner: u32, id: u32, all: bool) -> () {
+  let mut anchor = () let mut link = Pointer.fromMutRef<?*mut LockRequest>(&mut registry.locks)
+  while !Pointer.isNull<LockRequest>(unsafe Pointer.read<?*mut LockRequest>(link)) {
+    let pointer = unsafe transport.nonnull(unsafe Pointer.read<?*mut LockRequest>(link))
+    let item = unsafe Pointer.borrowMut<(), LockRequest>(&mut anchor, pointer)
+    if item.owner == owner && (all || item.id == id) {
+      unsafe Pointer.put<?*mut LockRequest>(link, item.next) drop item
+      let owned = unsafe Pointer.take<LockRequest>(pointer) drop owned unsafe resources.release(unsafe transport.raw(pointer))
+    } else { link = Pointer.fromMutRef<?*mut LockRequest>(&mut item.next) drop item }
+  }
+  unsafe grant(&registry.*)
+}
+struct Snapshot { name: List<u8>, shared: bool, owner: u32, status: u32 }
+pub unsafe effect fn query<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, group: &Group, owner: u32, scope: &mut owners.Scope) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut snapshots = List<Snapshot>.make()
+  let guard = group.registry.get().lock() let mut cursor = guard.get().locks let anchor = ()
+  while !Pointer.isNull<LockRequest>(cursor) {
+    let item = unsafe Pointer.borrow<(), LockRequest>(&anchor, unsafe transport.nonnull(cursor)) cursor = item.next
+    if item.owner != owner || item.status > 1 { continue }
+    let mut name = List<u8>.make() run name.reserveExact(item.name.length())
+    let mut at: usize = 0
+    while at < item.name.length() { run name.append(item.name.asSlice()[at]) at = at + 1 }
+    run snapshots.append(Snapshot { name: move name, shared: item.shared, owner: item.owner, status: item.status })
+  }
+  // Query is environment-local in Node. No engine allocation holds the registry.
+  drop guard
+  let memory = engine.memory scope.values[0] = run unsafe common.array(&mut engine, memory, context)
+  let mut index: usize = 0
+  while index < snapshots.length() {
+    let item = &snapshots.asSlice()[index]
+    scope.values[1] = run unsafe common.array(&mut engine, memory, context)
+    let name = run unsafe host.string(&mut engine, context, item.name.asSlice())
+    run unsafe common.defineIndex(&mut engine, context, scope.values[1], 0, name)
+    run unsafe common.defineIndex(&mut engine, context, scope.values[1], 1, ValueBits.Bool { value: item.shared })
+    run unsafe common.defineIndex(&mut engine, context, scope.values[1], 2, ValueBits.number(u32.toF64(item.owner)))
+    run unsafe common.defineIndex(&mut engine, context, scope.values[1], 3, ValueBits.number(u32.toF64(item.status)))
+    run unsafe common.defineIndex(&mut engine, context, scope.values[0], usize.toU32(index), scope.take(1)) index = index + 1
+  }
+  return scope.take(0)
+}

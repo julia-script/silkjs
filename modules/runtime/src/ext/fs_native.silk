@@ -1,0 +1,344 @@
+//! Node filesystem host boundary. ext.fs_ops runs each call with silk.platform.native.file.
+//! Request owners clean native allocations on every exceptional exit; JS scopes
+//! retain argument values until IO completes and release partially built results.
+import ext.system_errors as systemErrors
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silkjs.js_owned_value { lendFor }
+import silkjs.js_realm { lendRealm }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.collections.list { List }
+import silk.mem.pointer { Pointer }
+import silk.num.i32
+import silk.num.i64
+import silk.num.isize
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.num.f64
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_heap { HeapHeader }
+import silkjs.js_value { ValueBits }
+import silkjs.js_core_types { FrameSlots, NativeErrorKind }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_string_types { StringLengthError }
+import silkjs.js_exceptions as exceptions
+import silkjs.js_runtime as runtime
+import silkjs.js_coercion_host { CoercionHooks }
+import libs.core.owners { Scope }
+import libs.core.owners as owners
+import libs.core.common as common
+import silkjs.js_proxy_core as core
+import silkjs.js_object_allocate as objects
+import silkjs.js_errors as errors
+import silkjs.js_std_support as text
+import silkjs.js_buffer_storage as buffers
+import silkjs.js_bigint { BigInt, BigIntError }
+import silkjs.js_bigint_coercions as bigints
+import ext.uv_fs { UvStat, UvStatfs, UvTimespec }
+import ext.fs_descriptors as descriptors
+import ext.fs_ops as ops
+
+pub fn equal(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length { return false }
+  let mut at: usize = 0 while at < a.length { if a[at] != b[at] { return false } at = at + 1 } return true
+}
+unsafe effect fn defineText<'m, S: EngineServices>(engine: &mut Engine<'m,S>, context: *mut HeapHeader,
+  object: ValueBits, key: &[u8], bytes: &[u8]) -> () ! JsException ? &mut Allocator {
+  let value = run text.string(&mut engine, unsafe lendRealm(&context, context), bytes)
+  run unsafe common.define(&mut engine, context, object, key, value.intoBits(), 7)
+}
+unsafe effect fn errorBody<'m, S: EngineServices>(engine: &mut Engine<'m,S>, context: *mut HeapHeader,
+  object: ValueBits, code: i32, syscall: &[u8], path: ValueBits, dest: ValueBits) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  let name = run systemErrors.nameValue(&mut engine, unsafe lendRealm(&context, context), code)
+  run unsafe common.define(&mut engine, context, object, b"code", name.intoBits(), 7)
+  let mut message = List<u8>.make()
+  run systemErrors.appendName(&mut message, code)
+  run text.append(&mut message, b": ")
+  run systemErrors.appendMessage(&mut message, code)
+  run text.append(&mut message, b", ") run text.append(&mut message, syscall)
+  if !core.undefined(path) {
+    let bytes = run text.text(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(path))
+    run text.append(&mut message, b" '") run text.append(&mut message, bytes.asSlice()) run message.append(39)
+    run unsafe common.define(&mut engine, context, object, b"path", unsafe path.retained(), 7)
+  }
+  if !core.undefined(dest) {
+    let bytes = run text.text(&mut engine, unsafe lendRealm(&context, context), unsafe lendFor(dest))
+    run text.append(&mut message, b" -> '") run text.append(&mut message, bytes.asSlice()) run message.append(39)
+    run unsafe common.define(&mut engine, context, object, b"dest", unsafe dest.retained(), 7)
+  }
+  run unsafe defineText(&mut engine, context, object, b"message", message.asSlice())
+  run unsafe defineText(&mut engine, context, object, b"syscall", syscall)
+  run unsafe common.define(&mut engine, context, object, b"errno", ValueBits.Int { value: code }, 7)
+}
+// Returns an owned native Error; the caller chooses callback delivery or throwing.
+pub unsafe effect fn error<'m, S: EngineServices>(engine: &mut Engine<'m,S>, context: *mut HeapHeader,
+  code: i32, syscall: &[u8], path: ValueBits, dest: ValueBits) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let memory = engine.memory let object = run errors.newError(&mut engine, memory, unsafe lendRealm(&context, context))
+  let outcome = run Effect.result(unsafe errorBody(&mut engine, context, object, code, syscall, path, dest))
+  match move outcome { Result<(), OutOfMemoryError | JsException>.Success { .. } => { return object } Result<(), OutOfMemoryError | JsException>.Failure { error } => { unsafe owners.release(&mut engine, context, object) fail move error } }
+}
+unsafe effect fn raise<'m, S: EngineServices>(engine: &mut Engine<'m,S>, context: *mut HeapHeader,
+  code: i32, syscall: &[u8], path: ValueBits, dest: ValueBits) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  let value = run unsafe error(&mut engine, context, code, syscall, path, dest)
+  return run unsafe exceptions.throwValue<ValueBits, Engine<'m,S>>(&mut engine, unsafe runtime.contextRuntime(context), value)
+}
+unsafe effect fn field<'m,S:EngineServices>(engine:&mut Engine<'m,S>, context:*mut HeapHeader,
+  object:ValueBits, key:&[u8], number:u64, bigint:bool)->() ! OutOfMemoryError|JsException ?&mut Allocator {
+  let mut value = ValueBits.Float64 { value: u64.toF64(number) }
+  if bigint { value = run bigints.newBigUint64(number) }
+  run unsafe common.define(&mut engine,context,object,key,value,7)
+}
+effect fn timestamp(time:&UvTimespec, milliseconds:bool)->ValueBits ! OutOfMemoryError|BigIntError ?&mut Allocator {
+  let sec = isize.toI64(time.tv_sec) let ns = isize.toI64(time.tv_nsec)
+  if sec >= -9223372035 && sec <= 9223372035 {
+    let total = sec * 1000000000 + ns
+    if milliseconds { return run bigints.newBigInt64(total / 1000000) }
+    return run bigints.newBigInt64(total)
+  }
+  let seconds = run BigInt.fromI64(sec)
+  let billion = run BigInt.fromI32(1000000000)
+  let scaled = run seconds.view().multiply(&billion.view())
+  let fraction = run BigInt.fromI64(isize.toI64(time.tv_nsec))
+  let nanos = run scaled.view().add(&fraction.view())
+  if !milliseconds { return run bigints.compact(move nanos) }
+  let million = run BigInt.fromI32(1000000)
+  return run bigints.compact(run nanos.view().divide(&million.view()))
+}
+unsafe effect fn timeFields<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,
+  object:ValueBits, msKey:&[u8], nsKey:&[u8], time:&UvTimespec,bigint:bool)->() ! OutOfMemoryError|JsException ?&mut Allocator {
+  if !bigint {
+    let value = ValueBits.Float64 { value: isize.toF64(time.tv_sec)*1000.0+isize.toF64(time.tv_nsec)/1000000.0 }
+    run unsafe common.define(&mut engine,context,object,msKey,value,7) return ()
+  }
+  let ms = run Effect.result(timestamp(time,true))
+  let msValue = match move ms { Result<ValueBits,OutOfMemoryError|BigIntError>.Success { value }=>value Result<ValueBits,OutOfMemoryError|BigIntError>.Failure { error }=>run core.materialize(&mut engine,unsafe lendRealm(&context, context),move error) }
+  run unsafe common.define(&mut engine,context,object,msKey,msValue,7)
+  let ns = run Effect.result(timestamp(time,false))
+  let nsValue = match move ns { Result<ValueBits,OutOfMemoryError|BigIntError>.Success { value }=>value Result<ValueBits,OutOfMemoryError|BigIntError>.Failure { error }=>run core.materialize(&mut engine,unsafe lendRealm(&context, context),move error) }
+  run unsafe common.define(&mut engine,context,object,nsKey,nsValue,7)
+}
+unsafe effect fn statBody<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,object:ValueBits,stat:&UvStat,bigint:bool)->() ! OutOfMemoryError|JsException ?&mut Allocator {
+  run unsafe field(&mut engine,context,object,b"dev",stat.st_dev,bigint)
+  run unsafe field(&mut engine,context,object,b"ino",stat.st_ino,bigint)
+  run unsafe field(&mut engine,context,object,b"mode",stat.st_mode,bigint)
+  run unsafe field(&mut engine,context,object,b"nlink",stat.st_nlink,bigint)
+  run unsafe field(&mut engine,context,object,b"uid",stat.st_uid,bigint)
+  run unsafe field(&mut engine,context,object,b"gid",stat.st_gid,bigint)
+  run unsafe field(&mut engine,context,object,b"rdev",stat.st_rdev,bigint)
+  run unsafe field(&mut engine,context,object,b"size",stat.st_size,bigint)
+  run unsafe field(&mut engine,context,object,b"blksize",stat.st_blksize,bigint)
+  run unsafe field(&mut engine,context,object,b"blocks",stat.st_blocks,bigint)
+  run unsafe field(&mut engine,context,object,b"flags",stat.st_flags,bigint)
+  run unsafe field(&mut engine,context,object,b"gen",stat.st_gen,bigint)
+  run unsafe timeFields(&mut engine,context,object,b"atimeMs",b"atimeNs",&stat.st_atim,bigint)
+  run unsafe timeFields(&mut engine,context,object,b"mtimeMs",b"mtimeNs",&stat.st_mtim,bigint)
+  run unsafe timeFields(&mut engine,context,object,b"ctimeMs",b"ctimeNs",&stat.st_ctim,bigint)
+  run unsafe timeFields(&mut engine,context,object,b"birthtimeMs",b"birthtimeNs",&stat.st_birthtim,bigint)
+}
+pub unsafe effect fn statValue<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,stat:&UvStat,bigint:bool)->ValueBits ! OutOfMemoryError|JsException ?&mut Allocator {
+  let memory=engine.memory let object=run objects.withPrototype(&mut engine,memory,unsafe lendRealm(&context, context),unsafe lendFor(ValueBits.Null))
+  let outcome=run Effect.result(unsafe statBody(&mut engine,context,object,stat,bigint))
+  match move outcome { Result<(),OutOfMemoryError|JsException>.Success { .. }=>{ return object } Result<(),OutOfMemoryError|JsException>.Failure { error }=>{ unsafe owners.release(&mut engine,context,object) fail move error } }
+}
+unsafe effect fn statfsBody<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,object:ValueBits,stat:&UvStatfs,bigint:bool)->() ! OutOfMemoryError|JsException ?&mut Allocator {
+  run unsafe field(&mut engine,context,object,b"type",stat.f_type,bigint)
+  run unsafe field(&mut engine,context,object,b"bsize",stat.f_bsize,bigint)
+  run unsafe field(&mut engine,context,object,b"blocks",stat.f_blocks,bigint)
+  run unsafe field(&mut engine,context,object,b"bfree",stat.f_bfree,bigint)
+  run unsafe field(&mut engine,context,object,b"bavail",stat.f_bavail,bigint)
+  run unsafe field(&mut engine,context,object,b"files",stat.f_files,bigint)
+  run unsafe field(&mut engine,context,object,b"ffree",stat.f_ffree,bigint)
+  run unsafe field(&mut engine,context,object,b"frsize",stat.f_frsize,bigint)
+}
+pub unsafe effect fn statfsValue<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,stat:&UvStatfs,bigint:bool)->ValueBits ! OutOfMemoryError|JsException ?&mut Allocator {
+  let memory=engine.memory let object=run objects.withPrototype(&mut engine,memory,unsafe lendRealm(&context, context),unsafe lendFor(ValueBits.Null))
+  let outcome=run Effect.result(unsafe statfsBody(&mut engine,context,object,stat,bigint))
+  match move outcome { Result<(),OutOfMemoryError|JsException>.Success { .. }=>{ return object } Result<(),OutOfMemoryError|JsException>.Failure { error }=>{ unsafe owners.release(&mut engine,context,object) fail move error } }
+}
+unsafe effect fn integer<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,value:ValueBits,minimum:f64,maximum:f64)->i64 ! JsException ?&mut Allocator {
+  if !value.isNumber() { return run engine.throwError(unsafe lendRealm(&context, context),NativeErrorKind.Type,b"filesystem argument must be a number") }
+  let number=value.numericValue()
+  if !f64.isFinite(number) || f64.floor(number)!=number || number<minimum || number>maximum { return run engine.throwError(unsafe lendRealm(&context, context),NativeErrorKind.Range,b"filesystem integer argument out of range") }
+  return f64.toI64(number)
+}
+unsafe effect fn position<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,value:ValueBits)->i64 ! JsException ?&mut Allocator {
+  if !value.isBigInt() { return run unsafe integer(&mut engine,context,value,0.0,9007199254740991.0) }
+  let mut low:u64=0 let mut high:u64=0
+  let converted=run Effect.result(bigints.toBigInt128(&mut engine,unsafe lendRealm(&context, context),&mut low,&mut high,unsafe lendFor(value)))
+  match move converted { Result<(),OutOfMemoryError|StringLengthError|JsException>.Success { .. }=>() Result<(),OutOfMemoryError|StringLengthError|JsException>.Failure { error }=>{ return run core.materialize(&mut engine,unsafe lendRealm(&context, context),move error) } }
+  if high!=0 || low>9223372036854775807 { return run engine.throwError(unsafe lendRealm(&context, context),NativeErrorKind.Range,b"filesystem position out of range") }
+  return u64.toI64(low)
+}
+unsafe effect fn pathname<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,value:ValueBits)->List<u8> ! OutOfMemoryError|JsException ?&mut Allocator {
+  if !value.isString() { return run engine.throwError(unsafe lendRealm(&context, context),NativeErrorKind.Type,b"filesystem path must be a string") }
+  let mut bytes=run text.text(&mut engine,unsafe lendRealm(&context, context),unsafe lendFor(value))
+  let mut at:usize=0 while at<bytes.length() { if bytes.asSlice()[at]==0 { return run engine.throwError(unsafe lendRealm(&context, context),NativeErrorKind.Type,b"filesystem path contains a null byte") } at=at+1 }
+  run bytes.append(0) return move bytes
+}
+unsafe effect fn seconds<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,value:ValueBits)->f64 ! JsException ?&mut Allocator {
+  if !value.isNumber() || !f64.isFinite(value.numericValue()) { return run engine.throwError(unsafe lendRealm(&context, context),NativeErrorKind.Type,b"filesystem time must be finite") }
+  return value.numericValue()
+}
+unsafe effect fn transfer<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,operation:&[u8],args:&Scope)->ValueBits ! OutOfMemoryError|JsException ?&mut Allocator {
+  let fd=i64.toI32(run unsafe integer(&mut engine,context,args.values[0],0.0,2147483647.0))
+  let offset=i64.toU64(run unsafe integer(&mut engine,context,args.values[2],0.0,17179869184.0))
+  let length=i64.toU64(run unsafe integer(&mut engine,context,args.values[3],0.0,17179869184.0))
+  let pos=run unsafe position(&mut engine,context,args.values[4])
+  // All conversions finish before borrowing the backing pointer.
+  let buffer=run buffers.getArrayBuffer(&mut engine,unsafe lendRealm(&context, context),unsafe lendFor(args.values[1]))
+  if offset>buffer.byteLength || length>buffer.byteLength-offset { return run engine.throwError(unsafe lendRealm(&context, context),NativeErrorKind.Range,b"filesystem buffer range exceeds ArrayBuffer") }
+  if length==0 { return ValueBits.Int { value:0 } }
+  let writing=equal(operation,b"pwrite")
+  let mut staging=List<u8>.make()
+  let mut data: ?*mut u8 = unsafe buffers.dataAt(buffer.data,offset)
+  if buffer.physicalCapacity!=0 {
+    run staging.reserveExact(u64.toUsize(length))
+    let mut at:u64=0
+    while at<length { let mut byte:u8=0 if writing { byte=u64.toU8(unsafe buffers.loadScalar(buffer,offset+at,0)) } run staging.append(byte) at=at+1 }
+    data=Pointer.fromMutRef<u8>(&mut staging.asMutSlice()[0])
+  }
+  let mut call=ops.call(if writing { ops.WRITE } else { ops.READ })
+  call.fd=fd call.buffer=data call.length=u64.toUsize(length) call.position=pos
+  let mut out=ops.outcome()
+  unsafe ops.execute(&call,&mut out)
+  let mut syscall:&[u8]=b"read" if writing { syscall=b"write" }
+  if out.code<0 { return run unsafe raise(&mut engine,context,out.code,syscall,ValueBits.Undefined,ValueBits.Undefined) }
+  let count=out.count
+  if buffer.physicalCapacity!=0 && !writing {
+    let mut at:u64=0 while at<i64.toU64(count) { unsafe buffers.storeScalar(buffer,offset+at,0,u8.toU64(staging.asSlice()[u64.toUsize(at)])) at=at+1 }
+  }
+  return ValueBits.number(i64.toF64(count))
+}
+unsafe effect fn dispatchBody<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,tracking:*mut descriptors.State,operation:&[u8],argv:&FrameSlots,scope:&mut Scope)->ValueBits ! OutOfMemoryError|JsException ?&mut Allocator {
+  let input=unsafe common.argument(argv,1)
+  let mut at:u32=0 while at<5 { scope.values[u32.toUsize(at)]=run unsafe owners.getIndex(&mut engine,context,input,at) at=at+1 }
+  if equal(operation,b"pread") || equal(operation,b"pwrite") { return run unsafe transfer(&mut engine,context,operation,&scope.*) }
+  let descriptor=equal(operation,b"close") || equal(operation,b"fstat") || equal(operation,b"fchmod") || equal(operation,b"fchown") || equal(operation,b"ftruncate") || equal(operation,b"fsync") || equal(operation,b"fdatasync") || equal(operation,b"futimes")
+  let twoPaths=equal(operation,b"link") || equal(operation,b"copyFile")
+  let mut path=List<u8>.make() let mut dest=List<u8>.make() let mut fd:i32=0
+  let mut pathValue=ValueBits.Undefined let mut destValue=ValueBits.Undefined
+  if descriptor { fd=i64.toI32(run unsafe integer(&mut engine,context,scope.values[0],0.0,2147483647.0)) run path.append(0) }
+  else { path=run unsafe pathname(&mut engine,context,scope.values[0]) pathValue=scope.values[0] }
+  if twoPaths { dest=run unsafe pathname(&mut engine,context,scope.values[1]) destValue=scope.values[1] } else { run dest.append(0) }
+  let mut bigint=false
+  if equal(operation,b"stat") || equal(operation,b"lstat") || equal(operation,b"fstat") || equal(operation,b"statfs") {
+    if !core.undefined(scope.values[1]) { bigint=run text.option(&mut engine,unsafe lendRealm(&context, context),unsafe lendFor(scope.values[1]),b"bigint") }
+  }
+  let mut mode:i32=0 let mut uid:u32=0 let mut gid:u32=0 let mut length:i64=0 let mut atime:f64=0.0 let mut mtime:f64=0.0
+  let mut openFlags:i32=0
+  if equal(operation,b"open") {
+    openFlags=i64.toI32(run unsafe integer(&mut engine,context,scope.values[1],-2147483648.0,2147483647.0))
+    mode=i64.toI32((run unsafe integer(&mut engine,context,scope.values[2],0.0,4294967295.0)) & 65535)
+  }
+  if equal(operation,b"chmod") || equal(operation,b"fchmod") || equal(operation,b"lchmod") { mode=i64.toI32((run unsafe integer(&mut engine,context,scope.values[1],0.0,4294967295.0)) & 65535) }
+  if equal(operation,b"access") { mode=i64.toI32(run unsafe integer(&mut engine,context,scope.values[1],0.0,7.0)) }
+  if equal(operation,b"copyFile") { mode=i64.toI32(run unsafe integer(&mut engine,context,scope.values[2],0.0,7.0)) }
+  if equal(operation,b"chown") || equal(operation,b"fchown") || equal(operation,b"lchown") {
+    let user=run unsafe integer(&mut engine,context,scope.values[1],-1.0,4294967295.0)
+    let group=run unsafe integer(&mut engine,context,scope.values[2],-1.0,4294967295.0)
+    if user<0 { uid=4294967295 } else { uid=i64.toU32(user) }
+    if group<0 { gid=4294967295 } else { gid=i64.toU32(group) }
+  }
+  if equal(operation,b"truncate") || equal(operation,b"ftruncate") { length=run unsafe integer(&mut engine,context,scope.values[1],0.0,9007199254740991.0) }
+  if equal(operation,b"futimes") || equal(operation,b"lutimes") {
+    atime=run unsafe seconds(&mut engine,context,scope.values[1]) mtime=run unsafe seconds(&mut engine,context,scope.values[2])
+  }
+  let op=ops.code(operation)
+  if op==0 || op==ops.READ || op==ops.WRITE { return run engine.throwError(unsafe lendRealm(&context, context),NativeErrorKind.Type,b"unknown filesystem operation") }
+  let mut call=ops.call(op)
+  // Paths arrive with a final zero byte, which NativeFile adds itself.
+  if !descriptor { let _zero=path.pop() } if twoPaths { let _zero=dest.pop() }
+  if equal(operation,b"mkdtemp") { run text.append(&mut path,b"XXXXXX") }
+  call.path=move path call.dest=move dest call.fd=fd
+  if op==ops.OPEN { call.a=i32.toI64(openFlags) call.b=i32.toI64(mode) }
+  else if op==ops.CHOWN || op==ops.FCHOWN || op==ops.LCHOWN { call.a=u32.toI64(uid) call.b=u32.toI64(gid) if uid==4294967295 { call.a=-1 } if gid==4294967295 { call.b=-1 } }
+  else if op==ops.COPYFILE { call.b=i32.toI64(mode) }
+  else if op==ops.TRUNCATE || op==ops.FTRUNCATE { call.a=length }
+  else { call.a=i32.toI64(mode) }
+  call.atime=atime call.mtime=mtime
+  let mut out=ops.outcome()
+  unsafe ops.execute(&call,&mut out)
+  if out.code<0 {
+    if equal(operation,b"copyFile") { return run unsafe raise(&mut engine,context,out.code,b"copyfile",pathValue,destValue) }
+    return run unsafe raise(&mut engine,context,out.code,operation,pathValue,destValue)
+  }
+  if op==ops.OPEN {
+    let opened=i64.toI32(out.count)
+    let registered=run Effect.result(unsafe descriptors.acquire(tracking,opened))
+    match move registered {
+      Result<(),OutOfMemoryError>.Success { .. }=>()
+      Result<(),OutOfMemoryError>.Failure { error }=>{ unsafe descriptors.close(opened) fail move error }
+    }
+  } else if op==ops.CLOSE { unsafe descriptors.forget(tracking,fd) }
+  return run unsafe ops.value(&mut engine,context,op,&out,bigint)
+}
+pub unsafe effect fn dispatch<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,tracking:*mut descriptors.State,argc:i32,argv:&FrameSlots)->ValueBits ! OutOfMemoryError|JsException ?&mut Allocator {
+  if argc<2 { return run engine.throwError(unsafe lendRealm(&context, context),NativeErrorKind.Type,b"fsSync requires operation and argument array") }
+  let operation=run text.text(&mut engine,unsafe lendRealm(&context, context),unsafe lendFor(unsafe common.argument(argv,0)))
+  let mut scope=Scope.make()
+  let outcome=run Effect.result(unsafe dispatchBody(&mut engine,context,tracking,operation.asSlice(),argv,&mut scope))
+  unsafe owners.cleanup(&mut engine,context,move scope)
+  return match move outcome { Result<ValueBits,OutOfMemoryError|JsException>.Success { value }=>value Result<ValueBits,OutOfMemoryError|JsException>.Failure { error }=>{ fail move error } }
+}
+
+unsafe effect fn constantsBody<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader,object:ValueBits)->() ! JsException ?&mut Allocator {
+  run unsafe common.define(&mut engine,context,object,b"F_OK",ValueBits.Int { value:0 },7)
+  run unsafe common.define(&mut engine,context,object,b"R_OK",ValueBits.Int { value:4 },7)
+  run unsafe common.define(&mut engine,context,object,b"W_OK",ValueBits.Int { value:2 },7)
+  run unsafe common.define(&mut engine,context,object,b"X_OK",ValueBits.Int { value:1 },7)
+  run unsafe common.define(&mut engine,context,object,b"COPYFILE_EXCL",ValueBits.Int { value:1 },7)
+  run unsafe common.define(&mut engine,context,object,b"COPYFILE_FICLONE",ValueBits.Int { value:2 },7)
+  run unsafe common.define(&mut engine,context,object,b"COPYFILE_FICLONE_FORCE",ValueBits.Int { value:4 },7)
+  run unsafe common.define(&mut engine,context,object,b"UV_FS_COPYFILE_EXCL",ValueBits.Int { value:1 },7)
+  run unsafe common.define(&mut engine,context,object,b"UV_FS_COPYFILE_FICLONE",ValueBits.Int { value:2 },7)
+  run unsafe common.define(&mut engine,context,object,b"UV_FS_COPYFILE_FICLONE_FORCE",ValueBits.Int { value:4 },7)
+  run unsafe common.define(&mut engine,context,object,b"S_ISVTX",ValueBits.Int { value:512 },7)
+  run unsafe common.define(&mut engine,context,object,b"S_IRUSR",ValueBits.Int { value:256 },7)
+  run unsafe common.define(&mut engine,context,object,b"S_IWUSR",ValueBits.Int { value:128 },7)
+  run unsafe common.define(&mut engine,context,object,b"S_IXUSR",ValueBits.Int { value:64 },7)
+  run unsafe common.define(&mut engine,context,object,b"S_IRGRP",ValueBits.Int { value:32 },7)
+  run unsafe common.define(&mut engine,context,object,b"S_IWGRP",ValueBits.Int { value:16 },7)
+  run unsafe common.define(&mut engine,context,object,b"S_IXGRP",ValueBits.Int { value:8 },7)
+  run unsafe common.define(&mut engine,context,object,b"S_IROTH",ValueBits.Int { value:4 },7)
+  run unsafe common.define(&mut engine,context,object,b"S_IWOTH",ValueBits.Int { value:2 },7)
+  run unsafe common.define(&mut engine,context,object,b"S_IXOTH",ValueBits.Int { value:1 },7)
+  run unsafe common.define(&mut engine,context,object,b"S_IRWXU",ValueBits.Int { value:448 },7)
+  run unsafe common.define(&mut engine,context,object,b"S_IRWXG",ValueBits.Int { value:56 },7)
+  run unsafe common.define(&mut engine,context,object,b"S_IRWXO",ValueBits.Int { value:7 },7)
+  run unsafe common.define(&mut engine,context,object,b"O_ACCMODE",ValueBits.Int { value:3 },7)
+  // Darwin SDK sys/fcntl.h; Linux uapi asm-generic/fcntl.h and arm64 overrides.
+  static if Intrinsic.targetOperatingSystem()=="darwin" {
+    run unsafe common.define(&mut engine,context,object,b"O_SYNC",ValueBits.Int { value:128 },7)
+    run unsafe common.define(&mut engine,context,object,b"O_DSYNC",ValueBits.Int { value:4194304 },7)
+    run unsafe common.define(&mut engine,context,object,b"O_NONBLOCK",ValueBits.Int { value:4 },7)
+    run unsafe common.define(&mut engine,context,object,b"O_NOCTTY",ValueBits.Int { value:131072 },7)
+    run unsafe common.define(&mut engine,context,object,b"O_NOFOLLOW",ValueBits.Int { value:256 },7)
+    run unsafe common.define(&mut engine,context,object,b"O_DIRECTORY",ValueBits.Int { value:1048576 },7)
+    run unsafe common.define(&mut engine,context,object,b"O_CLOEXEC",ValueBits.Int { value:16777216 },7)
+    run unsafe common.define(&mut engine,context,object,b"O_SYMLINK",ValueBits.Int { value:2097152 },7)
+  } else {
+    run unsafe common.define(&mut engine,context,object,b"O_SYNC",ValueBits.Int { value:1052672 },7)
+    run unsafe common.define(&mut engine,context,object,b"O_DSYNC",ValueBits.Int { value:4096 },7)
+    run unsafe common.define(&mut engine,context,object,b"O_NONBLOCK",ValueBits.Int { value:2048 },7)
+    run unsafe common.define(&mut engine,context,object,b"O_NOCTTY",ValueBits.Int { value:256 },7)
+    run unsafe common.define(&mut engine,context,object,b"O_NOATIME",ValueBits.Int { value:262144 },7)
+    run unsafe common.define(&mut engine,context,object,b"O_CLOEXEC",ValueBits.Int { value:524288 },7)
+    static if Intrinsic.targetArchitecture()=="aarch64" {
+      run unsafe common.define(&mut engine,context,object,b"O_DIRECTORY",ValueBits.Int { value:16384 },7)
+      run unsafe common.define(&mut engine,context,object,b"O_NOFOLLOW",ValueBits.Int { value:32768 },7)
+      run unsafe common.define(&mut engine,context,object,b"O_DIRECT",ValueBits.Int { value:65536 },7)
+    } else {
+      run unsafe common.define(&mut engine,context,object,b"O_DIRECTORY",ValueBits.Int { value:65536 },7)
+      run unsafe common.define(&mut engine,context,object,b"O_NOFOLLOW",ValueBits.Int { value:131072 },7)
+      run unsafe common.define(&mut engine,context,object,b"O_DIRECT",ValueBits.Int { value:16384 },7)
+    }
+  }
+}
+pub unsafe effect fn constants<'m,S:EngineServices>(engine:&mut Engine<'m,S>,context:*mut HeapHeader)->ValueBits ! OutOfMemoryError|JsException ?&mut Allocator {
+  let memory=engine.memory let object=run objects.withPrototype(&mut engine,memory,unsafe lendRealm(&context, context),unsafe lendFor(ValueBits.Null))
+  let outcome=run Effect.result(unsafe constantsBody(&mut engine,context,object))
+  match move outcome { Result<(),JsException>.Success { .. }=>{ return object } Result<(),JsException>.Failure { error }=>{ unsafe owners.release(&mut engine,context,object) fail move error } }
+}

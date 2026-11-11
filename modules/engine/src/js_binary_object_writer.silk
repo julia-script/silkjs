@@ -1,0 +1,873 @@
+//! Native QuickJS binary writer, pinned quickjs.c:38216-39189 (version 5).
+//! Inputs are borrowed JS roots and must remain live throughout the call. The
+//! shared side table borrows source buffers: keep those buffers/backings alive
+//! until the consumer has duplicated their backing ownership. No JS edge is
+//! acquired by the table. All native tables unwind on errors. Circular values are
+//! found through the writer's own object table, so objects carry no marks.
+import js_eval_host { EvalHooks }
+import js_compiler_finish as compilerFinish
+import js_compiler_lazy as compilerLazy
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.mem.pointer { Pointer }
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.u64
+import silk.num.i32
+import silk.num.i64
+import silk.num.usize
+import silk.num.f64
+import js_heap { HeapCell, HeapHeader, CellRef }
+import js_value { ValueBits }
+import js_owned_value { ValueRef, lendBits, lendFor, immediateRef }
+import js_realm { Realm }
+import js_engine { Engine }
+import js_engine_host { EngineServices }
+import js_debug_positions { encodePending }
+import js_core_types { SourceText, ObjectData, ObjectPayload, PropertySlot, ShapeData,
+  ByteStorage, FunctionBytecode, FunctionKind, VariableKind, ClosureKind, ModuleDef,
+  ExportBinding, NativeErrorKind, FunctionDebugInfo }
+import js_coercion_host { CoercionHooks }
+import js_exceptions { JsException }
+import js_atoms { AtomTable }
+import js_bytecode { callFacts }
+import js_string_types { StringOwner, StringLengthError, AtomKind }
+import js_strings { Strings }
+import js_string_types { latin1Bytes, stringReference }
+import js_compiler_types { PendingFunction, LazyStub, LazyName }
+import silk.collections.slice { Slice }
+import js_bigint { BigInt, ShortLimbs }
+import js_runtime as runtime
+import js_errors as errors
+import js_proxy_core as core
+import js_shapes as shapes
+import js_buffer_storage as buffers
+import js_class_data as classes
+import js_atom_data as atoms
+import js_opcode_data as op
+import native_stack { currentFrameAddress }
+
+pub const JS_WRITE_OBJ_BYTECODE: u32 = 1
+/// Present in quickjs.h but ignored by the pinned implementation: wire is LE.
+pub const JS_WRITE_OBJ_BSWAP: u32 = 2
+pub const JS_WRITE_OBJ_SAB: u32 = 4
+pub const JS_WRITE_OBJ_REFERENCE: u32 = 8
+/// SilkJS code-cache wire (js_code_cache), never written for bjson or qjsc:
+/// lazy functions are written unfinished, as their stubs, and every function's
+/// source text names one copy of its script's text instead of carrying its own.
+pub const JS_WRITE_OBJ_LAZY: u32 = 64
+/// With JS_WRITE_OBJ_LAZY: each function's closure vars and debug data come
+/// first, then a four-byte length and the body it measures (variables, code,
+/// constants), so a reader may leave the body in the bytes until the function
+/// is first called (js_binary_object_reader.DEFER). The length is 0 for a body
+/// that must be read in place: a lazy stub's, or one that introduces a shared
+/// source string.
+pub const JS_WRITE_OBJ_DEFER: u32 = 128
+pub struct SharedEntry { pub address: *mut u8, pub buffer: ValueBits }
+impl Copy for SharedEntry {}
+pub struct SharedLease { pub address: u64, pub lease: buffers.BufferLease }
+pub struct WriteResult { pub bytes: List<u8>, pub shared: List<SharedEntry> }
+/// Releases only native side-table storage, never its borrowed source buffers.
+pub fn releaseShared(entries: List<SharedEntry>) -> () { drop entries }
+
+struct ObjectEntry { object: *mut HeapHeader, next: u32 }
+impl Copy for ObjectEntry {}
+struct Writer {
+  bytes: List<u8>, shared: List<SharedEntry>, atomMap: List<u32>, atomList: List<u32>,
+  objects: List<ObjectEntry>, buckets: List<u32>, firstAtom: u32, flags: u32,
+  /// JS_WRITE_OBJ_LAZY: the shared source strings written so far, by address.
+  sources: List<usize>
+}
+fn boolean(value: bool) -> u32 { if value { return 1 } return 0 }
+fn hash(object: *mut HeapHeader, size: usize) -> usize {
+  return usize.wrappingMultiply(Pointer.address<HeapHeader>(object), 3163) & (size - 1)
+}
+impl Writer {
+  fn make(flags: u32) -> Self {
+    let mut first: u32 = 1
+    if (flags & JS_WRITE_OBJ_BYTECODE) != 0 { first = atoms.JS_ATOM_END }
+    return Self { bytes: List<u8>.make(), shared: List<SharedEntry>.make(),
+      atomMap: List<u32>.make(), atomList: List<u32>.make(), objects: List<ObjectEntry>.make(),
+      buckets: List<u32>.make(), firstAtom: first, flags: flags, sources: List<usize>.make() }
+  }
+  effect fn byte(self: &mut Self, value: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.bytes.append(value)
+  }
+  effect fn leb(self: &mut Self, mut value: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    while value >= 128 {
+      run self.byte(u32.toU8(value & 127) | 128)
+      value = u32.shiftRight(value, 7)
+    }
+    run self.byte(u32.toU8(value))
+  }
+  effect fn word(self: &mut Self, value: u32, count: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut i: u32 = 0
+    while i < count { run self.byte(u32.toU8(u32.shiftRight(value, i * 8) & 255)) i = i + 1 }
+  }
+  effect fn quad(self: &mut Self, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut i: u64 = 0
+    while i < 8 { run self.byte(u64.toU8(u64.shiftRight(value, i * 8) & 255)) i = i + 1 }
+  }
+  effect fn storage(self: &mut Self, bytes: &ByteStorage) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.bytes.appendSlice(unsafe bytes.asSlice())
+  }
+  effect fn atomIndex(self: &mut Self, atom: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    if atom < self.firstAtom || AtomTable.isInteger(atom) { return atom }
+    let index = u32.toUsize(atom - self.firstAtom)
+    if index < self.atomMap.length() && self.atomMap.get(index) != 0 { return self.atomMap.get(index) }
+    if index >= self.atomMap.length() {
+      let additional = index + 1 - self.atomMap.length()
+      run self.atomMap.reserve(additional)
+      while self.atomMap.length() <= index { run self.atomMap.append(0) }
+    }
+    if self.atomList.length() >= u32.toUsize(u32.MAX - self.firstAtom) { return run Allocator.outOfMemory() }
+    let mapped = usize.toU32(self.atomList.length()) + self.firstAtom
+    run self.atomList.append(atom)
+    self.atomMap.set(index, mapped)
+    return mapped
+  }
+  effect fn atom(self: &mut Self, atom: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    if AtomTable.isInteger(atom) { run self.leb(u32.shiftLeft(AtomTable.integer(atom), 1) | 1) }
+    else {
+      let mapped = run self.atomIndex(atom)
+      run self.leb(u32.shiftLeft(mapped, 1))
+    }
+  }
+  /// JS_WRITE_OBJ_LAZY source text: 0 for none; 1 then the bytes of an owned
+  /// text; 2 + n for a span of shared string n, whose text follows its first use.
+  effect fn sourceText(self: &mut Self, text: &Option<SourceText>) -> () ! OutOfMemoryError ? &mut Allocator {
+    match &text.* {
+      Option<SourceText>.Some { value } => match &value {
+        SourceText.Shared { text: whole, start, length, plain } => {
+          let string = whole.get()
+          let address = Pointer.address<HeapHeader>(stringReference(string))
+          let mut index: usize = 0
+          while index < self.sources.length() && self.sources.get(index) != address { index = index + 1 }
+          run self.leb(usize.toU32(index + 2))
+          if index == self.sources.length() {
+            run self.sources.append(address)
+            let anchor = ()
+            let bytes = Slice.view<u8>(unsafe latin1Bytes(&anchor, stringReference(string)), 0, Strings.length(string))
+            run self.leb(usize.toU32(bytes.length))
+            run self.bytes.appendSlice(bytes)
+          }
+          run self.leb(usize.toU32(start)) run self.leb(usize.toU32(length)) run self.byte(u32.toU8(boolean(plain)))
+        }
+        SourceText.Owned { bytes } => {
+          run self.leb(1) run self.leb(usize.toU32(bytes.length())) run self.bytes.appendSlice(bytes.asSlice())
+        }
+      }
+      Option<SourceText>.None => { run self.leb(0) }
+    }
+  }
+  fn findObject(self: &Self, object: *mut HeapHeader) -> u32 {
+    if self.objects.length() == 0 { return u32.MAX }
+    let mut cursor = self.buckets.get(hash(object, self.buckets.length()))
+    while cursor != u32.MAX {
+      let entry = self.objects.get(u32.toUsize(cursor))
+      if Pointer.address<HeapHeader>(entry.object) == Pointer.address<HeapHeader>(object) { return cursor }
+      cursor = entry.next
+    }
+    return u32.MAX
+  }
+  // Removes the most recently added object, which heads its bucket's chain.
+  fn popObject(self: &mut Self) -> () {
+    match self.objects.pop() {
+      Option<ObjectEntry>.Some { value: entry } => {
+        let bucket = hash(entry.object, self.buckets.length())
+        self.buckets.set(bucket, entry.next)
+      }
+      Option<ObjectEntry>.None => ()
+    }
+  }
+  effect fn addObject(self: &mut Self, object: *mut HeapHeader) -> () ! OutOfMemoryError ? &mut Allocator {
+    let count = self.objects.length()
+    if count >= u32.toUsize(u32.MAX) { return run Allocator.outOfMemory() }
+    if count + 1 >= self.buckets.length() {
+      let mut size = self.buckets.length()
+      if size < 4 { size = 4 }
+      while size <= count { size = size * 2 }
+      let mut replacement = List<u32>.make()
+      run replacement.reserve(size)
+      while replacement.length() < size { run replacement.append(u32.MAX) }
+      let mut i: usize = 0
+      while i < count {
+        let mut entry = self.objects.get(i)
+        let bucket = hash(entry.object, size)
+        entry.next = replacement.get(bucket)
+        replacement.set(bucket, usize.toU32(i))
+        self.objects.set(i, entry)
+        i = i + 1
+      }
+      self.buckets = move replacement
+    }
+    let bucket = hash(object, self.buckets.length())
+    run self.objects.append(ObjectEntry { object: object, next: self.buckets.get(bucket) })
+    self.buckets.set(bucket, usize.toU32(count))
+  }
+  effect fn string(self: &mut Self, value: ValueBits) -> () ! OutOfMemoryError ? &mut Allocator {
+    let length = Strings.length(value)
+    let wide = Strings.isWide(value)
+    run self.leb(u32.shiftLeft(usize.toU32(length), 1) | boolean(wide))
+    let mut i: usize = 0
+    while i < length {
+      let unit = u16.toU32(Strings.codeUnit(value, i))
+      let mut width: u32 = 1 if wide { width = 2 }
+      run self.word(unit, width)
+      i = i + 1
+    }
+  }
+  effect fn bigint(self: &mut Self, limbs: &[u32]) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.byte(10)
+    let mut length = limbs.length * 4
+    if limbs.length == 1 && limbs[0] == 0 { length = 0 }
+    else {
+      let high = limbs[limbs.length - 1]
+      let mut shift: u32 = 24
+      while shift > 0 {
+        let byte = u32.shiftRight(high, shift) & 255
+        if (byte != 0 && byte != 255) || (byte & 1) != (u32.shiftRight(high, shift - 1) & 1) { break }
+        shift = shift - 8 length = length - 1
+      }
+    }
+    run self.leb(usize.toU32(length))
+    let mut i: usize = 0
+    while i < length {
+      run self.byte(u32.toU8(u32.shiftRight(limbs[i / 4], usize.toU32(i % 4) * 8) & 255))
+      i = i + 1
+    }
+  }
+}
+
+effect fn reject<'a, 'm, S: EngineServices>(engine: &mut Engine<'m, S>, realm: Realm<'a>,
+  message: &[u8]) -> never ! JsException ? &mut Allocator {
+  return run engine.throwError(realm, NativeErrorKind.Type, message)
+}
+effect fn unsupported<'a, 'm, S: EngineServices>(engine: &mut Engine<'m, S>, realm: Realm<'a>) -> never ! JsException ? &mut Allocator {
+  return run engine.throwError(realm, NativeErrorKind.Internal, b"unsupported tag")
+}
+/// The stored value lent for as long as the object payload is borrowed.
+effect fn propertyValue<'a, 'm, 'o, S: EngineServices>(engine: &mut Engine<'m, S>, realm: Realm<'a>,
+  object: &'o ObjectData, index: usize) -> ValueRef<'o> ! JsException ? &mut Allocator {
+  let anchor = () let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, object.shape)
+  if (shape.properties.get(index).flags & 48) != 0 {
+    return run reject(&mut engine, realm, b"only value properties are supported")
+  }
+  return match object.slot(index).view(unsafe shapes.slotFlags(object.shape, index)) {
+    PropertySlot.Value { value } => unsafe lendFor<'o>(value)
+    _ => run reject(&mut engine, realm, b"only value properties are supported")
+  }
+}
+effect fn ownValue<'a, 'm, 'o, S: EngineServices>(engine: &mut Engine<'m, S>, realm: Realm<'a>,
+  object: &'o ObjectData, atom: u32, enumerable: bool) -> ValueRef<'o> ! JsException ? &mut Allocator {
+  match unsafe shapes.lookup(object.shape, atom) {
+    Option<usize>.None => { return immediateRef(ValueBits.Undefined) }
+    Option<usize>.Some { value: index } => {
+      let anchor = () let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, object.shape)
+      if enumerable && (shape.properties.get(index).flags & 4) == 0 { return immediateRef(ValueBits.Undefined) }
+      return run propertyValue(&mut engine, realm, object, index)
+    }
+  }
+}
+
+effect fn writeArray<'a, 'm, S: EngineServices>(state: &mut Writer, engine: &mut Engine<'m, S>,realm: Realm<'a>, object: &ObjectData) -> () ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let template = (state.flags & JS_WRITE_OBJ_BYTECODE) != 0 && !object.extensible()
+  if template { run state.byte(11) } else { run state.byte(9) }
+  let lengthValue = (run ownValue(&mut engine, realm, object, atoms.JS_ATOM_length, false)).view()
+  if !lengthValue.isNumber() || lengthValue.numericValue() < 0.0 || lengthValue.numericValue() > 4294967295.0 {
+    return run reject(&mut engine, realm, b"invalid array length")
+  }
+  let length = f64.toU32(lengthValue.numericValue())
+  run state.leb(length)
+  let mut i: u32 = 0
+  if object.fastArray() {
+    if let ObjectPayload.FastArray { array } = &object.payload {
+      while u32.toUsize(i) < array.values().length() && i < length {
+        run writeValue(&mut state, &mut engine, realm, unsafe lendBits(&array, array.values().get(u32.toUsize(i))))
+        i = i + 1
+      }
+    }
+    while i < length { run state.byte(2) i = i + 1 }
+  } else {
+    while i < length {
+      let _rt = realm.runtime()
+      let mut anchor = () let runtimeData = realm.runtimeStateMut(&mut anchor)
+      let atom = run runtimeData.atoms.internUInt32(i)
+      drop runtimeData
+      let result = run Effect.result(ownValue(&mut engine, realm, object, atom, true))
+      let releaseRuntime = realm.runtimeStateMut(&mut anchor)
+      releaseRuntime.atoms.release(atom)
+      drop releaseRuntime
+      let item = match move result {
+        Result<ValueRef, JsException>.Success { value } => value
+        Result<ValueRef, JsException>.Failure { error } => { fail move error }
+      }
+      run writeValue(&mut state, &mut engine, realm, item)
+      i = i + 1
+    }
+  }
+  if template {
+    let raw = run ownValue(&mut engine, realm, object, atoms.JS_ATOM_raw, false)
+    run writeValue(&mut state, &mut engine, realm, raw)
+  }
+}
+effect fn writePlain<'a, 'm, S: EngineServices>(state: &mut Writer, engine: &mut Engine<'m, S>,realm: Realm<'a>, object: &ObjectData) -> () ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  run state.byte(8)
+  let anchor = () let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, object.shape)
+  let rt = realm.runtimeState(&anchor)
+  let mut count: u32 = 0 let mut pass: u32 = 0
+  while pass < 2 {
+    if pass == 1 { run state.leb(count) }
+    let mut i: usize = 0
+    while i < shape.properties.length() {
+      let property = shape.properties.get(i)
+      if property.atom != 0 && rt.atoms.kind(property.atom) == AtomKind.String && (property.flags & 4) != 0 {
+        let value = run propertyValue(&mut engine, realm, object, i)
+        if pass == 0 { count = count + 1 }
+        else {
+          run state.atom(property.atom)
+          run writeValue(&mut state, &mut engine, realm, value)
+        }
+      }
+      i = i + 1
+    }
+    pass = pass + 1
+  }
+}
+unsafe effect fn writeObjectTag<'a, 'm, S: EngineServices>(state: &mut Writer, engine: &mut Engine<'m, S>,realm: Realm<'a>, reference: *mut HeapHeader) -> () ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+  let id = object.classId()
+  if id == classes.JS_CLASS_ARRAY { return run writeArray(&mut state, &mut engine, realm, &object.*) }
+  if id == classes.JS_CLASS_OBJECT { return run writePlain(&mut state, &mut engine, realm, &object.*) }
+  if id == classes.JS_CLASS_ARRAY_BUFFER || id == classes.JS_CLASS_SHARED_ARRAY_BUFFER {
+    let shared = id == classes.JS_CLASS_SHARED_ARRAY_BUFFER
+    if shared && (state.flags & JS_WRITE_OBJ_SAB) == 0 { return run unsupported(&mut engine, realm) }
+    let buffer = unsafe buffers.snapshot(reference)
+    if buffer.detached { return run reject(&mut engine, realm, b"ArrayBuffer is detached") }
+    // Keep the pinned version-5 representation byte-for-byte for its range.
+    // Extension tags use fixed u64 fields; all-ones remains the absent maximum.
+    let wide = buffer.byteLength > 4294967295 || buffer.maxByteLength >= 4294967295
+    if wide {
+      if shared { run state.byte(21) } else { run state.byte(20) }
+      run state.quad(buffer.byteLength)
+      let mut maximum: u64 = 18446744073709551615
+      if buffer.maxByteLength >= 0 { maximum = i64.toU64(buffer.maxByteLength) }
+      run state.quad(maximum)
+    } else {
+      if shared { run state.byte(16) } else { run state.byte(15) }
+      run state.leb(u64.toU32(buffer.byteLength))
+      run state.leb(i64.toU32(buffer.maxByteLength & 4294967295))
+    }
+    if shared {
+      let address = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(buffer.data)
+      run state.quad(usize.toU64(Pointer.address<u8>(address)))
+      run state.shared.append(SharedEntry { address: address, buffer: ValueBits.Object { reference: reference } })
+    } else {
+      run state.bytes.reserve(u64.toUsize(buffer.byteLength))
+      let mut i: u64 = 0
+      while i < buffer.byteLength {
+        run state.byte(unsafe Pointer.read<u8>(unsafe buffers.dataAt(buffer.data, i)))
+        i = i + 1
+      }
+    }
+    return ()
+  }
+  if id == classes.JS_CLASS_DATE || id == classes.JS_CLASS_NUMBER || id == classes.JS_CLASS_STRING ||
+    id == classes.JS_CLASS_BOOLEAN || id == classes.JS_CLASS_BIG_INT {
+    if id == classes.JS_CLASS_DATE { run state.byte(17) } else { run state.byte(18) }
+    if let ObjectPayload.Boxed { value } = &object.payload { return run writeValue(&mut state, &mut engine, realm, unsafe lendBits(&value, value)) }
+    return run reject(&mut engine, realm, b"invalid boxed object")
+  }
+  if id >= classes.JS_CLASS_UINT8C_ARRAY && id <= classes.JS_CLASS_FLOAT64_ARRAY {
+    let view = unsafe buffers.view(reference)
+    if let ObjectPayload.TypedArray { array } = &object.payload {
+      let wide = array.count > 4294967295 || view.offset > 4294967295
+      if wide { run state.byte(22) } else { run state.byte(14) }
+      run state.byte(u32.toU8(id - classes.JS_CLASS_UINT8C_ARRAY))
+      if wide { run state.quad(array.count) run state.quad(view.offset) }
+      else { run state.leb(u64.toU32(array.count)) run state.leb(u64.toU32(view.offset)) }
+      return run writeValue(&mut state, &mut engine, realm, unsafe lendBits(&view, ValueBits.Object { reference: view.buffer }))
+    }
+    return run reject(&mut engine, realm, b"invalid typed array")
+  }
+  return run reject(&mut engine, realm, b"unsupported object class")
+}
+
+fn variableKind(kind: VariableKind) -> u32 {
+  return match kind {
+    VariableKind.Normal => 0
+    VariableKind.FunctionDeclaration => 1
+    VariableKind.NewFunctionDeclaration => 2
+    VariableKind.Catch => 3
+    VariableKind.FunctionName => 4
+    VariableKind.PrivateField => 5
+    VariableKind.PrivateMethod => 6
+    VariableKind.PrivateGetter => 7
+    VariableKind.PrivateSetter => 8
+    VariableKind.PrivateGetterSetter => 9
+    VariableKind.GlobalFunctionDeclaration => 10
+    VariableKind.Using => 11
+    VariableKind.UsingMethod => 12
+  }
+}
+fn closureKind(kind: ClosureKind) -> u32 {
+  return match kind {
+    ClosureKind.Local => 0
+    ClosureKind.Argument => 1
+    ClosureKind.Reference => 2
+    ClosureKind.GlobalReference => 3
+    ClosureKind.GlobalDeclaration => 4
+    ClosureKind.Global => 5
+    ClosureKind.ModuleDeclaration => 6
+    ClosureKind.ModuleImport => 7
+    ClosureKind.Scope => 512
+  }
+}
+/// Writes code with its atom operands as wire indices. With patches (the
+/// JS_WRITE_OBJ_DEFER layout) the list of operands a reader must replace
+/// follows the code, so it copies the code and visits only those: a count,
+/// then for each the distance from the one before, doubled, plus one when the
+/// operand owns no reference (the fusion prefix of a string `switch` case,
+/// which repeats the atom of the push_atom_value it covers). Atoms every
+/// runtime numbers alike need no entry.
+effect fn writeCode<'a, 'm, S: EngineServices>(state: &mut Writer, engine: &mut Engine<'m, S>,realm: Realm<'a>, code: &ByteStorage, patches: bool) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  // Native final bytecode is already LE. Stream it once, replacing atom operands
+  // without making the pinned implementation's avoidable temporary code copy.
+  let bytes = unsafe code.asSlice()
+  let mut position: usize = 0
+  run state.bytes.reserve(bytes.length)
+  let mut operands = List<u32>.make()
+  let mut last: usize = 0
+  while position < bytes.length {
+    let opcode = bytes[position]
+    if opcode == 0 || u8.toUsize(opcode) >= op.OP_COUNT {
+      return run reject(&mut engine, realm, b"invalid bytecode opcode")
+    }
+    let info = op.opcodeInfo(opcode, true)
+    let size = u8.toUsize(info.size)
+    if size == 0 || size > bytes.length - position {
+      return run reject(&mut engine, realm, b"truncated bytecode")
+    }
+    run state.byte(opcode)
+    let mut offset: usize = 1
+    if patches && opcode == op.OP_fuse_prefix && bytes.length - position >= 11 && bytes[position + 5] == op.OP_dup
+      && bytes[position + 6] == op.OP_push_atom_value {
+      let mut atom: u32 = 0 let mut j: u32 = 0
+      while j < 4 {
+        atom = atom | u32.shiftLeft(u8.toU32(bytes[position + 1 + u32.toUsize(j)]), j * 8)
+        j = j + 1
+      }
+      let mapped = run state.atomIndex(atom)
+      run state.word(mapped, 4)
+      if !AtomTable.isConstant(atom) {
+        run operands.append(usize.toU32(position + 1 - last) * 2 + 1)
+        last = position + 1
+      }
+      offset = 5
+    }
+    if info.format == op.OP_FMT_atom || info.format == op.OP_FMT_atom_u8 ||
+      info.format == op.OP_FMT_atom_u16 || info.format == op.OP_FMT_atom_label_u8 ||
+      info.format == op.OP_FMT_atom_label_u16 {
+      if size < 5 { return run reject(&mut engine, realm, b"truncated bytecode atom") }
+      let mut atom: u32 = 0 let mut j: u32 = 0
+      while j < 4 {
+        atom = atom | u32.shiftLeft(u8.toU32(bytes[position + 1 + u32.toUsize(j)]), j * 8)
+        j = j + 1
+      }
+      let mapped = run state.atomIndex(atom)
+      run state.word(mapped, 4)
+      if patches && !AtomTable.isConstant(atom) {
+        run operands.append(usize.toU32(position + 1 - last) * 2)
+        last = position + 1
+      }
+      offset = 5
+      // The inline field-cache key names this runtime's shapes: write none.
+      if op.fieldKeyed(opcode) {
+        let end = offset + u8.toUsize(op.FIELD_KEY_BYTES)
+        while offset < end { run state.byte(255) offset = offset + 1 }
+      }
+    }
+    while offset < size { run state.byte(bytes[position + offset]) offset = offset + 1 }
+    position = position + size
+  }
+  if patches {
+    run state.leb(usize.toU32(operands.length()))
+    let mut i: usize = 0
+    while i < operands.length() { run state.leb(operands.get(i)) i = i + 1 }
+  }
+}
+unsafe effect fn writeFunction<'a, 'm, S: EngineServices>(state: &mut Writer, engine: &mut Engine<'m, S>,realm: Realm<'a>, reference: *mut HeapHeader) -> () ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let lazy = (state.flags & JS_WRITE_OBJ_LAZY) != 0
+  // A function whose compile waits for its first call is written finished,
+  // except on the code-cache wire, which keeps it a stub.
+  if unsafe compilerFinish.deferredStub(reference) { run unsafe EvalHooks.finishDeferred(&mut engine, reference) }
+  let stub = unsafe compilerFinish.lazyStub(reference)
+  let keepStub = stub && lazy
+  if stub && !keepStub {
+    let memory = engine.memory
+    run unsafe compilerLazy.finishLazy(&mut engine, memory, reference)
+  }
+  if !keepStub { run unsafe compilerFinish.finish(&mut engine, reference) }
+  let anchor = () let function = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, reference)
+  run state.byte(12)
+  let kind: u32 = match function.kind {
+    FunctionKind.Normal => 0
+    FunctionKind.Generator => 1
+    FunctionKind.Async => 2
+    FunctionKind.AsyncGenerator => 3
+  }
+  let debug = match &function.debug { Option<FunctionDebugInfo>.Some { .. } => true _ => false }
+  let flags = boolean(function.hasPrototype) | u32.shiftLeft(boolean(function.hasSimpleParameterList), 1) |
+    u32.shiftLeft(boolean(function.isDerivedClassConstructor), 2) | u32.shiftLeft(boolean(function.needsHomeObject), 3) |
+    u32.shiftLeft(kind, 4) | u32.shiftLeft(boolean(function.newTargetAllowed), 6) |
+    u32.shiftLeft(boolean(function.superCallAllowed), 7) | u32.shiftLeft(boolean(function.superAllowed), 8) |
+    u32.shiftLeft(boolean(function.argumentsAllowed), 9) | u32.shiftLeft(boolean(debug), 10) |
+    u32.shiftLeft(boolean(function.isDirectOrIndirectEval), 11) | u32.shiftLeft(boolean(function.scopeSlots != 0), 12) |
+    u32.shiftLeft(boolean(keepStub), 13)
+  run state.word(flags, 2) run state.byte(function.mode) run state.atom(function.name)
+  run state.leb(u16.toU32(function.argumentCount))
+  run state.leb(u16.toU32(function.variableCount))
+  run state.leb(u16.toU32(function.definedArgumentCount))
+  run state.leb(u16.toU32(function.stackSize))
+  run state.leb(u16.toU32(function.varRefCount))
+  if function.scopeSlots != 0 {
+    run state.leb(u16.toU32(function.scopeSlots)) run state.leb(u16.toU32(function.scopeVarSlots))
+    run state.leb(usize.toU32(function.scopeParameters.length()))
+    let mut p: usize = 0
+    while p < function.scopeParameters.length() { run state.leb(function.scopeParameters.get(p)) p = p + 1 }
+    run state.leb(usize.toU32(function.scopeVariables.length()))
+    p = 0
+    while p < function.scopeVariables.length() { run state.leb(u16.toU32(function.scopeVariables.get(p))) p = p + 1 }
+  }
+  run state.leb(usize.toU32(function.closureVars.length()))
+  run state.leb(usize.toU32(function.constants.length()))
+  // A stub's placeholder code is not written: the reader supplies its own.
+  if keepStub { run state.leb(0) } else { run state.leb(usize.toU32(function.code.length())) }
+  run state.leb(usize.toU32(function.varDefs.length()))
+  let mut i: usize = 0
+  let defer = (state.flags & JS_WRITE_OBJ_DEFER) != 0
+  if defer {
+    i = 0
+    while i < function.closureVars.length() {
+      let closure = function.closureVars.get(i)
+      run state.atom(closure.name) run state.leb(u16.toU32(closure.variableIndex))
+      run state.word(closureKind(closure.kind) | u32.shiftLeft(boolean(closure.isConst), 3) |
+        u32.shiftLeft(boolean(closure.isLexical), 4) | u32.shiftLeft(variableKind(closure.variableKind), 5), 2)
+      i = i + 1
+    }
+    if let Option<FunctionDebugInfo>.Some { value: info } = &function.debug {
+      run state.atom(info.filename)
+      if info.pendingLines.isSome() {
+        let text = match &info.source { Option<SourceText>.Some { value: source } => source.bytes() _ => Intrinsic.trap("pending line table without source") }
+        let encoded = run encodePending(info.pendingLines.get(), text, false)
+        let lines = run ByteStorage.copy(encoded.asSlice())
+        run state.leb(usize.toU32(lines.length()))
+        run state.storage(&lines)
+      } else if info.lines.isSome() {
+        run state.leb(usize.toU32(info.lines.get().pcToLine.length()))
+        run state.storage(&info.lines.get().pcToLine)
+      } else { run state.leb(0) }
+      if lazy { run state.sourceText(&info.source) }
+      else {
+        match &info.source {
+          Option<SourceText>.Some { value: source } => {
+            let bytes = source.bytes()
+            run state.leb(usize.toU32(bytes.length))
+            run state.bytes.appendSlice(bytes)
+          }
+          Option<SourceText>.None => { run state.leb(0) }
+        }
+      }
+    }
+    // The body's length, patched in below once it is known.
+    let lengthAt = state.bytes.length()
+    run state.word(0, 4)
+    let sourcesBefore = state.sources.length()
+    i = 0
+    while i < function.varDefs.length() {
+      let variable = function.varDefs.get(i)
+      run state.atom(variable.name)
+      run state.leb(i64.toU32((i32.toI64(variable.scopeNext) + 1) & 4294967295))
+      run state.leb(u16.toU32(variable.varRefIndex))
+      run state.byte(u32.toU8(variableKind(variable.kind) | u32.shiftLeft(boolean(variable.isConst), 4) |
+        u32.shiftLeft(boolean(variable.isLexical), 5) | u32.shiftLeft(boolean(variable.isCaptured), 6) |
+        u32.shiftLeft(boolean(variable.hasScope), 7)))
+      i = i + 1
+    }
+    if !keepStub {
+      // The call facts a reader would otherwise derive from the code.
+      let facts = run callFacts(unsafe function.code.asSlice(), function.kind == FunctionKind.Normal, function.isDerivedClassConstructor,
+        function.varRefCount, function.scopeSlots, function.variableCount, function.stackSize)
+      run state.byte(u32.toU8(boolean(facts.borrowsArguments))) run state.byte(facts.constructForm) run state.byte(facts.leaf)
+      run writeCode(&mut state, &mut engine, realm, &function.code, true)
+    }
+    i = 0
+    while i < function.constants.length() {
+      run writeValue(&mut state, &mut engine, realm, unsafe lendBits(&function, function.constants.get(i)))
+      i = i + 1
+    }
+    let length = state.bytes.length() - lengthAt - 4
+    if !keepStub && state.sources.length() == sourcesBefore && length != 0 && usize.toU64(length) < 4294967296 {
+      let mut shift: usize = 0
+      while shift < 4 { state.bytes.set(lengthAt + shift, usize.toU8(usize.shiftRight(length, shift * 8) & 255)) shift = shift + 1 }
+    }
+  } else {
+    while i < function.varDefs.length() {
+      let variable = function.varDefs.get(i)
+      run state.atom(variable.name)
+      run state.leb(i64.toU32((i32.toI64(variable.scopeNext) + 1) & 4294967295))
+      run state.leb(u16.toU32(variable.varRefIndex))
+      run state.byte(u32.toU8(variableKind(variable.kind) | u32.shiftLeft(boolean(variable.isConst), 4) |
+        u32.shiftLeft(boolean(variable.isLexical), 5) | u32.shiftLeft(boolean(variable.isCaptured), 6) |
+        u32.shiftLeft(boolean(variable.hasScope), 7)))
+      i = i + 1
+    }
+    i = 0
+    while i < function.closureVars.length() {
+      let closure = function.closureVars.get(i)
+      run state.atom(closure.name) run state.leb(u16.toU32(closure.variableIndex))
+      run state.word(closureKind(closure.kind) | u32.shiftLeft(boolean(closure.isConst), 3) |
+        u32.shiftLeft(boolean(closure.isLexical), 4) | u32.shiftLeft(variableKind(closure.variableKind), 5), 2)
+      i = i + 1
+    }
+    if !keepStub { run writeCode(&mut state, &mut engine, realm, &function.code, false) }
+    if let Option<FunctionDebugInfo>.Some { value: info } = &function.debug {
+      run state.atom(info.filename)
+      if info.pendingLines.isSome() {
+        let text = match &info.source { Option<SourceText>.Some { value: source } => source.bytes() _ => Intrinsic.trap("pending line table without source") }
+        let encoded = run encodePending(info.pendingLines.get(), text, false)
+        let lines = run ByteStorage.copy(encoded.asSlice())
+        run state.leb(usize.toU32(lines.length()))
+        run state.storage(&lines)
+      } else if info.lines.isSome() {
+        run state.leb(usize.toU32(info.lines.get().pcToLine.length()))
+        run state.storage(&info.lines.get().pcToLine)
+      } else { run state.leb(0) }
+      if lazy { run state.sourceText(&info.source) }
+      else {
+        match &info.source {
+          Option<SourceText>.Some { value: source } => {
+            let bytes = source.bytes()
+            run state.leb(usize.toU32(bytes.length))
+            run state.bytes.appendSlice(bytes)
+          }
+          Option<SourceText>.None => { run state.leb(0) }
+        }
+      }
+    }
+    i = 0
+    while i < function.constants.length() {
+      run writeValue(&mut state, &mut engine, realm, unsafe lendBits(&function, function.constants.get(i)))
+      i = i + 1
+    }
+  }
+  if keepStub {
+    if function.pending.isSome() { run writeStubDefinition(&mut state, function.pending.get(), &function) }
+  }
+}
+/// What finishLazy reads of a stub (PendingFunction and its LazyStub), after
+/// the stub's constants; js_binary_object_reader.readStubDefinition mirrors it.
+effect fn writeStubDefinition(state: &mut Writer, pending: &PendingFunction, record: &FunctionBytecode) -> () ! OutOfMemoryError ? &mut Allocator {
+  run state.leb(pending.start)
+  run state.leb(i32.wrappingToU32(pending.line)) run state.leb(i32.wrappingToU32(pending.column))
+  run state.leb(i32.wrappingToU32(pending.ecmaLine)) run state.leb(i32.wrappingToU32(pending.ecmaColumn))
+  run state.leb(u16.toU32(pending.slots)) run state.leb(u16.toU32(pending.varSlots))
+  run state.leb(usize.toU32(pending.parameters.length()))
+  let mut i: usize = 0
+  while i < pending.parameters.length() { run state.leb(pending.parameters.get(i)) i = i + 1 }
+  run state.leb(usize.toU32(pending.variables.length()))
+  i = 0
+  while i < pending.variables.length() { run state.leb(u16.toU32(pending.variables.get(i))) i = i + 1 }
+  match &pending.lazy {
+    Option<LazyStub>.Some { value: stub } => {
+      run state.atom(stub.filename)
+      run state.byte(u32.toU8(boolean(stub.scriptIsEval) | u32.shiftLeft(boolean(stub.nodeVmDiagnostics), 1) | u32.shiftLeft(boolean(stub.entryLineFeed), 2)))
+      run state.leb(stub.sourcePosition) run state.leb(stub.entry)
+      run state.sourceText(stub.sourceOf(&record))
+      // Each closure var's free-name nesting (ClosureVar.depth).
+      run state.leb(usize.toU32(record.closureVars.length()))
+      i = 0
+      while i < record.closureVars.length() { run state.byte(record.closureVars.get(i).depth) i = i + 1 }
+      let bodies = stub.skips.first()
+      run state.leb(usize.toU32(bodies.length))
+      i = 0
+      while i < bodies.length {
+        let body = bodies[i]
+        run state.leb(usize.toU32(body.bodyStart)) run state.leb(usize.toU32(body.end))
+        run state.byte(u32.toU8(boolean(body.endLineFeed))) run state.leb(body.freeStart) run state.leb(body.freeCount)
+        i = i + 1
+      }
+      run writeNames(&mut state, stub.skips.second())
+    }
+    _ => Intrinsic.trap("lazy stub without definition")
+  }
+}
+effect fn writeNames(state: &mut Writer, names: &[LazyName]) -> () ! OutOfMemoryError ? &mut Allocator {
+  run state.leb(usize.toU32(names.length))
+  let mut i: usize = 0
+  while i < names.length { let name = names[i] run state.atom(name.name) run state.byte(name.depth) i = i + 1 }
+}
+unsafe effect fn writeModule<'a, 'm, S: EngineServices>(state: &mut Writer, engine: &mut Engine<'m, S>,realm: Realm<'a>, reference: *mut HeapHeader) -> () ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let anchor = () let module = (unsafe CellRef<ModuleDef>.of(reference)).get(&anchor)
+  run state.byte(13) run state.atom(module.name)
+  run state.leb(usize.toU32(module.requestedModules.length()))
+  let mut i: usize = 0
+  while i < module.requestedModules.length() {
+    let requested = &module.requestedModules.asSlice()[i]
+    run state.atom(requested.name)
+    run writeValue(&mut state, &mut engine, realm, requested.attributes.borrow())
+    i = i + 1
+  }
+  run state.leb(usize.toU32(module.exports.length()))
+  i = 0
+  while i < module.exports.length() {
+    let entry = module.exports.get(i)
+    match entry.binding {
+      ExportBinding.Local { variableIndex, .. } => {
+        run state.byte(0) run state.leb(i64.toU32(i32.toI64(variableIndex) & 4294967295))
+      }
+      ExportBinding.Indirect { requestedModuleIndex } => {
+        run state.byte(1) run state.leb(i64.toU32(i32.toI64(requestedModuleIndex) & 4294967295))
+        run state.atom(entry.localName)
+      }
+    }
+    run state.atom(entry.exportName)
+    i = i + 1
+  }
+  run state.leb(usize.toU32(module.starExports.length()))
+  i = 0
+  while i < module.starExports.length() {
+    run state.leb(i64.toU32(i32.toI64(module.starExports.get(i).requestedModuleIndex) & 4294967295))
+    i = i + 1
+  }
+  run state.leb(usize.toU32(module.imports.length()))
+  i = 0
+  while i < module.imports.length() {
+    let entry = module.imports.get(i)
+    run state.leb(i64.toU32(i32.toI64(entry.variableIndex) & 4294967295))
+    run state.byte(u32.toU8(boolean(entry.isStar))) run state.atom(entry.importName)
+    run state.leb(i64.toU32(i32.toI64(entry.requestedModuleIndex) & 4294967295))
+    i = i + 1
+  }
+  run state.byte(u32.toU8(boolean(module.hasTopLevelAwait)))
+  run writeValue(&mut state, &mut engine, realm, module.functionObject.borrow())
+}
+effect fn writeValue<'a, 'b, 'm, S: EngineServices>(state: &mut Writer, engine: &mut Engine<'m, S>,realm: Realm<'a>, value: ValueRef<'b>) -> () ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  if realm.stackOverflows(currentFrameAddress(), 0) {
+    let memory = engine.memory
+    return run errors.throwStackOverflow(&mut engine, memory, realm)
+  }
+  match value.view() {
+    ValueBits.Null => { run state.byte(1) }
+    ValueBits.Undefined => { run state.byte(2) }
+    ValueBits.Bool { value: flag } => { run state.byte(3 + u32.toU8(boolean(flag))) }
+    ValueBits.Int { value: number } => {
+      run state.byte(5)
+      let bits = i64.toU32(i32.toI64(number) & 4294967295)
+      let mut sign: u32 = 0 if number < 0 { sign = u32.MAX }
+      run state.leb(u32.shiftLeft(bits, 1) ^ sign)
+    }
+    ValueBits.Float64 { value: number } => { run state.byte(6) run state.quad(f64.toBits(number)) }
+    ValueBits.String { .. } => { run state.byte(7) run state.string(value.view()) }
+    ValueBits.Rope { .. } => {
+      let anchor = () let runtimeData = realm.runtimeState(&anchor)
+      let flat = StringOwner.adopt(run runtimeData.atoms.flatten(value.view()))
+      drop runtimeData
+      run writeValue(&mut state, &mut engine, realm, unsafe lendBits(&flat, flat.get()))
+    }
+    ValueBits.ShortBigInt { value: number } => {
+      let words = ShortLimbs.of(number)
+      run state.bigint(words.limbs())
+    }
+    ValueBits.BigInt { reference } => {
+      let anchor = () let number = unsafe HeapCell.shortPayload<BigInt, ()>(&anchor, reference)
+      run state.bigint(number.limbs())
+    }
+    ValueBits.FunctionBytecode { reference } => {
+      if (state.flags & JS_WRITE_OBJ_BYTECODE) == 0 { return run unsupported(&mut engine, realm) }
+      run unsafe writeFunction(&mut state, &mut engine, realm, reference)
+    }
+    ValueBits.Module { reference } => {
+      if (state.flags & JS_WRITE_OBJ_BYTECODE) == 0 { return run unsupported(&mut engine, realm) }
+      run unsafe writeModule(&mut state, &mut engine, realm, reference)
+    }
+    ValueBits.Object { reference } => {
+      let references = (state.flags & JS_WRITE_OBJ_REFERENCE) != 0
+      let index = state.findObject(reference)
+      if references {
+        if index != u32.MAX { run state.byte(19) run state.leb(index) return () }
+      } else if index != u32.MAX { return run reject(&mut engine, realm, b"circular reference") }
+      run state.addObject(reference)
+      run unsafe writeObjectTag(&mut state, &mut engine, realm, reference)
+      // Without references the table holds only the objects being written, the
+      // ancestors of the current value. A failed write discards the whole table.
+      if !references { state.popObject() }
+    }
+    _ => { return run unsupported(&mut engine, realm) }
+  }
+}
+effect fn finish<'a>(state: &mut Writer, realm: Realm<'a>) -> () ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let mut prefix = Writer.make(0)
+  run prefix.byte(7) run prefix.leb(usize.toU32(state.atomList.length()))
+  let anchor = () let rt = realm.runtimeState(&anchor)
+  let mut i: usize = 0
+  if (state.flags & JS_WRITE_OBJ_DEFER) != 0 {
+    // A reader interns an atom on its first use: the length of the strings,
+    // then where each one starts among them, then the strings.
+    let mut strings = Writer.make(0)
+    let mut starts = List<u32>.make()
+    while i < state.atomList.length() {
+      let string = StringOwner.adopt(run rt.atoms.toValue(state.atomList.get(i), true))
+      run starts.append(usize.toU32(strings.bytes.length()))
+      run strings.string(string.get())
+      i = i + 1
+    }
+    if usize.toU64(strings.bytes.length()) >= 4294967296 { return run Allocator.outOfMemory() }
+    run prefix.word(usize.toU32(strings.bytes.length()), 4)
+    i = 0
+    while i < starts.length() { run prefix.word(starts.get(i), 4) i = i + 1 }
+    run prefix.bytes.appendSlice(strings.bytes.asSlice())
+  } else {
+    while i < state.atomList.length() {
+      let string = StringOwner.adopt(run rt.atoms.toValue(state.atomList.get(i), true))
+      run prefix.string(string.get())
+      i = i + 1
+    }
+  }
+  run state.bytes.insertSlice(0, prefix.bytes.asSlice())
+}
+effect fn perform<'a, 'b, 'm, S: EngineServices>(engine: &mut Engine<'m, S>, realm: Realm<'a>,
+  value: ValueRef<'b>, flags: u32) -> WriteResult ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let mut state = Writer.make(flags)
+  run writeValue(&mut state, &mut engine, realm, value)
+  run finish(&mut state, realm)
+  return match move state { Writer { bytes, shared, .. } => WriteResult { bytes: move bytes, shared: move shared } }
+}
+/// Serializes borrowed live engine Values. BSWAP and unknown bits are ignored.
+/// SharedEntry borrows both source object and backing; dropping the result frees
+/// only native output storage, so the caller explicitly owns the source lifetime.
+/// Requires a live context owned by this engine and a live, valid borrowed ValueBits
+/// graph from its runtime, with exclusive runtime execution throughout the call.
+pub effect fn writeObject2<'a, 'b, 'm, S: EngineServices>(engine: &mut Engine<'m, S>, realm: Realm<'a>,
+  value: ValueRef<'b>, flags: u32) -> WriteResult ! JsException ? &mut Allocator {
+  let result = run Effect.result(perform(&mut engine, realm, value, flags))
+  return match move result {
+    Result<WriteResult, OutOfMemoryError | StringLengthError | JsException>.Success { value: output } => move output
+    Result<WriteResult, OutOfMemoryError | StringLengthError | JsException>.Failure { error } =>
+      run core.materialize(&mut engine, realm, move error)
+  }
+}
+/// Same wire output, discarding (and freeing) the native non-owning SAB table.
+/// Requires the same live context, borrowed graph, and exclusivity as writeObject2.
+pub effect fn writeObject<'a, 'b, 'm, S: EngineServices>(engine: &mut Engine<'m, S>, realm: Realm<'a>,
+  value: ValueRef<'b>, flags: u32) -> List<u8> ! JsException ? &mut Allocator {
+  let result = run writeObject2(&mut engine, realm, value, flags)
+  return match move result {
+    WriteResult { bytes, shared } => { releaseShared(move shared) return move bytes }
+  }
+}

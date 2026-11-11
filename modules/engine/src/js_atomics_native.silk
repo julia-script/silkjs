@@ -1,0 +1,488 @@
+//! Native CONFIG_ATOMICS kernels, pinned quickjs.c 64105-64172,64250-64267,
+//! 64282-64474. No JavaScript, allocations, or callbacks occur while locked.
+//! One shared waiter queue covers every runtime sharing backing addresses.
+//! Owning leases keep it alive independently of the original embedding. Different
+//! views (including Int32/BigInt64) match by byte address, not wrapper or width.
+//! CancellableDomain owns a queue lease and an independent stop scope. Borrowed
+//! Domain handles remain valid only while their queue and scope owners are live.
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.concurrency.atomic { Atomic, MemoryOrder }
+import silk.concurrency.sync { Mutex, MutexGuard }
+import silk.mem.box { Box }
+import silk.mem.layout { Layout }
+import silk.core.ownership { Copy, Drop }
+import silk.mem.pointer { Pointer }
+import silk.mem.raw_buffer { RawBuffer }
+import silk.mem.slot { Slot }
+import silk.concurrency.thread { Transferable, Concurrent }
+import silk.core.effect { Effect }
+import silk.concurrency.thread_native { NativeThread, SpawnError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.num.i64
+import silk.num.usize
+import silk.num.i32
+import silk.num.u32
+import runtime_memory { RuntimeAllocator }
+import js_shared_memory as shared
+import js_shared_memory { Span }
+import silk.text.format { Debug, Format, Formatter }
+import silk.io.writer { Writer, WriterError }
+import js_invariant { invariant, present }
+
+struct Waiter {
+  previous: ?*mut Waiter,
+  next: ?*mut Waiter,
+  linked: bool,
+  address: *mut u8,
+  cancellation: ?*mut Cancellation,
+  /// Set under the queue lock when a notify or cancellation removes the waiter; the waiter
+  /// sleeps on it with `Atomic.wait`.
+  woken: u32,
+}
+/// The shared waiter list. Its links point at `Waiter`s on the waiting threads'
+/// stacks; each waiter unlinks itself under the lock before its frame ends.
+struct QueueState {
+  first: ?*mut Waiter,
+  last: ?*mut Waiter,
+  active: usize,
+  scopes: usize,
+}
+impl Transferable for QueueState {}
+struct Queue {
+  references: usize,
+  lock: Mutex<QueueState>,
+  // Fields drop in declaration order: release the mutex before its enclosing allocation.
+  storage: Intrinsic.RawBuffer<Queue>,
+}
+struct Cancellation { cancelled: bool, active: usize }
+/// Copyable native capability, not an owning handle. Using it after its domain
+/// is destroyed is invalid. JS runtime/heap values never cross native threads.
+pub type WaitInterrupt = extern "C" fn(?*mut u8) -> u8
+pub struct Domain {
+  queue: *mut Queue,
+  lock: *const Mutex<QueueState>,
+  cancellation: ?*mut Cancellation,
+  interrupt: Option<WaitInterrupt>,
+  interruptOpaque: ?*mut u8,
+}
+impl Copy for Domain {}
+impl Transferable for Domain {}
+impl Concurrent for Domain {}
+/// Borrows a thread-local, non-JS interrupt predicate for this capability only.
+/// Keep its opaque owner alive until all waits using the returned handle finish.
+/// Owning domain constructors deliberately do not inherit this borrowed hook.
+pub unsafe fn withInterrupt(domain: Domain, callback: WaitInterrupt, opaque: ?*mut u8) -> Domain {
+  let mut configured = domain
+  configured.interrupt = Option<WaitInterrupt>.some(callback)
+  configured.interruptOpaque = opaque
+  return configured
+}
+/// One-allocation shared waiter-list owner. Per-wait storage lives on the waiting
+/// thread's stack; every borrowed handle must retain an enclosing owner.
+pub struct WaiterDomain { domain: Domain }
+impl Transferable for WaiterDomain {}
+impl Concurrent for WaiterDomain {}
+pub struct SynchronizationError { pub code: i32 }
+impl Debug for SynchronizationError {
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    let mut record = run Format.debugRecord("SynchronizationError", &mut formatter)
+    run Format.debugField(&mut record, "code", &self.code, &mut formatter)
+    return run Format.debugFinish(record, &mut formatter)
+  }
+}
+fn plainDomain(queue: *mut Queue, lock: *const Mutex<QueueState>) -> Domain {
+  return Domain { queue: queue, lock: lock, cancellation: Pointer.null<Cancellation>(),
+    interrupt: Option<WaitInterrupt>.none(), interruptOpaque: Pointer.null<u8>() }
+}
+impl WaiterDomain {
+  pub effect fn make() -> WaiterDomain ! OutOfMemoryError | SynchronizationError ? &mut Allocator {
+    let lock = run Mutex<QueueState>.make(QueueState { first: Pointer.null<Waiter>(), last: Pointer.null<Waiter>(), active: 0, scopes: 0 })
+    let allocation = run Allocator.allocate(Layout.of<Queue>())
+    let mut storage = unsafe RawBuffer.from<Queue>(move allocation, 1)
+    let queue = Slot.address(RawBuffer.slot<Queue>(&mut storage, 0))
+    unsafe Pointer.put<Queue>(queue, Queue { references: 1, lock: move lock, storage: move storage })
+    let anchor = () let state = unsafe Pointer.borrow(&anchor, queue)
+    let lockPointer = Pointer.fromRef(&state.lock) drop state
+    return WaiterDomain { domain: plainDomain(queue, lockPointer) }
+  }
+  pub fn handle(self: &Self) -> Domain { return self.domain }
+  /// Retains the live parent queue without allocation or inheriting its stop scope.
+  /// The caller must keep the borrowed parent's owner alive during this operation.
+  pub unsafe fn retain(parent: Domain) -> WaiterDomain {
+    let mut anchor = () let state = unsafe Pointer.borrowMut(&mut anchor, parent.queue)
+    let references = Pointer.fromMutRef(&mut state.references) drop state
+    let previous = unsafe Atomic.fetchAdd<usize>(references, 1, MemoryOrder.Relaxed)
+    if previous == 0 || previous > usize.MAX / 2 { invariant() }
+    return WaiterDomain { domain: plainDomain(parent.queue, parent.lock) }
+  }
+}
+impl Drop for WaiterDomain {
+  fn drop(self: &mut Self) -> () {
+    let mut anchor = () let state = unsafe Pointer.borrowMut(&mut anchor, self.domain.queue)
+    let references = Pointer.fromMutRef(&mut state.references) drop state
+    let previous = unsafe Atomic.fetchSubtract<usize>(references, 1, MemoryOrder.Release)
+    if previous == 0 { invariant() }
+    if previous != 1 { return () }
+    Atomic.fence(MemoryOrder.Acquire)
+    let lockAnchor = () let guard = unsafe locked(&lockAnchor, self.domain)
+    let last = guard.get()
+    if last.active != 0 || last.scopes != 0 || !Pointer.isNull<Waiter>(last.first) { invariant() }
+    drop guard
+    unsafe Pointer.dropInPlace<Queue>(self.domain.queue)
+  }
+}
+/// Independently owned stop scope sharing the parent queue. Its queue lease may
+/// outlive the original parent owner; all users must retire before this scope drops.
+pub struct CancellableDomain { storage: Box<Cancellation>, owner: WaiterDomain, domain: Domain }
+impl CancellableDomain {
+  pub effect fn make(parent: Domain) -> CancellableDomain ! OutOfMemoryError ? &mut Allocator {
+    let mut storage = run Box<Cancellation>.make(Cancellation { cancelled: false, active: 0 })
+    let owner = unsafe WaiterDomain.retain(parent)
+    let cancellation = Pointer.fromMutRef(&mut storage.getMut()[0])
+    let lockAnchor = () let mut guard = unsafe locked(&lockAnchor, parent)
+    let queue = guard.getMut()
+    queue.scopes = queue.scopes + 1
+    drop guard
+    let mut domain = owner.domain
+    domain.cancellation = cancellation
+    return CancellableDomain { storage: move storage, owner: move owner, domain: domain }
+  }
+  pub fn handle(self: &Self) -> Domain { return self.domain }
+  pub fn cancel(self: &Self) -> () {
+    let domain = self.domain
+    let lockAnchor = () let mut guard = unsafe locked(&lockAnchor, domain)
+    let mut anchor = ()
+    let cancellation = present(domain.cancellation)
+    let state = unsafe Pointer.borrowMut(&mut anchor, cancellation)
+    state.cancelled = true
+    drop state
+    let queue = guard.getMut()
+    let mut cursor = queue.first
+    while !Pointer.isNull<Waiter>(cursor) {
+      let pointer = nonnull(cursor)
+      let node = unsafe Pointer.borrowMut(&mut anchor, pointer)
+      cursor = node.next
+      let matches = Pointer.address<Cancellation>(node.cancellation) == Pointer.address<Cancellation>(cancellation)
+      drop node
+      if matches { unsafe wake(&mut queue, pointer) }
+    }
+    drop guard
+  }
+}
+impl Drop for CancellableDomain {
+  fn drop(self: &mut Self) -> () {
+    // Cancellation removes queue links, but a waking activation still owns a
+    // reference to this state until it reacquires the mutex and retires.
+    let lockAnchor = () let mut guard = unsafe locked(&lockAnchor, self.domain)
+    if self.storage.get()[0].active != 0 { invariant() }
+    let queue = guard.getMut()
+    queue.scopes = queue.scopes - 1
+  }
+}
+unsafe fn cancelled(domain: Domain) -> bool {
+  if Pointer.isNull<Cancellation>(domain.cancellation) { return false }
+  let anchor = ()
+  return (unsafe Pointer.borrow(&anchor, present(domain.cancellation))).cancelled
+}
+// The queue lives while any owner does, and the caller holds one.
+unsafe fn locked<'a>(anchor: &'a (), domain: Domain) -> MutexGuard<'a, QueueState> {
+  return (unsafe Pointer.borrow(&anchor.*, domain.lock)).lock()
+}
+// Under the queue lock: removes `waiter` and wakes its thread. The waiter reacquires the lock
+// before its stack frame ends, so its word stays live through the notify.
+unsafe fn wake(queue: &mut QueueState, waiter: *mut Waiter) -> () {
+  unsafe unlink(&mut queue, waiter)
+  let mut anchor = ()
+  let node = unsafe Pointer.borrowMut(&mut anchor, waiter)
+  let word = Pointer.fromMutRef(&mut node.woken) drop node
+  unsafe Atomic.store<u32>(word, 1, MemoryOrder.Release)
+  unsafe Atomic.notifyOne(word)
+}
+fn requireSuccess(status: i32) -> () { if status != 0 { invariant() } }
+/// The non-null pointer; traps on null.
+fn nonnull(value: ?*mut Waiter) -> *mut Waiter {
+  return match Pointer.nonNullMut<Waiter>(value) { Option<*mut Waiter>.Some { value: found } => found _ => Intrinsic.trap("unexpected null pointer") }
+}
+unsafe fn append(queue: &mut QueueState, waiter: *mut Waiter) -> () {
+  let mut anchor = ()
+  let last = queue.last
+  queue.last = waiter
+  if Pointer.isNull<Waiter>(last) { queue.first = waiter }
+  if !Pointer.isNull<Waiter>(last) {
+    let previous = unsafe Pointer.borrowMut(&mut anchor, nonnull(last))
+    previous.next = waiter
+  }
+  let node = unsafe Pointer.borrowMut(&mut anchor, waiter)
+  node.previous = last
+  node.next = Pointer.null<Waiter>()
+  node.linked = true
+}
+unsafe fn unlink(queue: &mut QueueState, waiter: *mut Waiter) -> () {
+  let mut anchor = ()
+  let node = unsafe Pointer.borrowMut(&mut anchor, waiter)
+  let previous = node.previous
+  let next = node.next
+  node.linked = false
+  drop node
+  if !Pointer.isNull<Waiter>(previous) {
+    let before = unsafe Pointer.borrowMut(&mut anchor, nonnull(previous))
+    before.next = next
+  } else { queue.first = next }
+  if !Pointer.isNull<Waiter>(next) {
+    let after = unsafe Pointer.borrowMut(&mut anchor, nonnull(next))
+    after.previous = previous
+  } else { queue.last = previous }
+}
+pub fn pause(static operatingSystem: string) -> () {
+  static if operatingSystem == "linux" || operatingSystem == "darwin" {
+    static if Intrinsic.targetArchitecture() == "aarch64" {
+      unsafe Intrinsic.assembly<()>("yield", "", "", "write", true, false, ())
+    } else {
+      static if operatingSystem == "linux" && Intrinsic.targetArchitecture() == "x86_64" {
+        unsafe Intrinsic.assembly<()>("pause", "", "", "write", true, false, ())
+      } else { compileError("Atomics.pause requires a native CPU-hint primitive on this architecture") }
+    }
+  } else {
+    // WebAssembly has no CPU-hint instruction.
+    static if Intrinsic.targetObjectFormat() != "wasm" { compileError("Atomics.pause requires a native CPU-hint primitive on this operating system") }
+  }
+}
+pub enum WaitResult { NotEqual, TimedOut, Ok, Cancelled }
+/// timeout is whole milliseconds; i64.MAX denotes infinite. No retry loop:
+/// spurious wakeups return "ok", as in the source. The comparison is a real
+/// atomic load, avoiding source C's plain-load data race with atomic writers.
+pub unsafe fn wait(domain: Domain, span: Span, offset: u64, sizeLog2: u32,
+  expected: u64, timeout: i64) -> WaitResult {
+  return unsafe waitDuration(domain, span, offset, sizeLog2, expected,
+    timeout == 9223372036854775807, timeout / 1000, (timeout % 1000) * 1000000)
+}
+/// WebAssembly timeout is signed nanoseconds; every negative value is infinite.
+/// This uses the same address-keyed queue and canonical comparison as Atomics.wait.
+pub unsafe fn waitNanoseconds(domain: Domain, span: Span, offset: u64, sizeLog2: u32,
+  expected: u64, timeout: i64) -> WaitResult {
+  return unsafe waitDuration(domain, span, offset, sizeLog2, expected,
+    timeout < 0, timeout / 1000000000, timeout % 1000000000)
+}
+extern "C" struct Timespec { seconds: i64, nanoseconds: i64 }
+@foreign(noCapture: .("time"))
+unsafe extern "C" fn darwinClockGetTime(clock: u32, time: *mut Timespec) -> i32 as "clock_gettime"
+@foreign(noCapture: .("time"))
+unsafe extern "C" fn gnuClockGetTime(clock: i32, time: *mut Timespec) -> i32 as "clock_gettime"
+fn realtime() -> Timespec {
+  let mut now = Timespec { seconds: 0, nanoseconds: 0 }
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    requireSuccess(unsafe darwinClockGetTime(0, Pointer.fromMutRef(&mut now)))
+  } else {
+    requireSuccess(unsafe gnuClockGetTime(0, Pointer.fromMutRef(&mut now)))
+  }
+  return move now
+}
+unsafe fn waitDuration(domain: Domain, span: Span, offset: u64, sizeLog2: u32,
+  expected: u64, infinite: bool, seconds: i64, nanoseconds: i64) -> WaitResult {
+  let address = unsafe shared.address(span, offset)
+  let lockAnchor = () let mut guard = unsafe locked(&lockAnchor, domain)
+  // The flag and enqueue are protected by the same lock. Cancellation sets the
+  // waiter's word, so it cannot slip between this check and the sleep below.
+  if unsafe cancelled(domain) { return WaitResult.Cancelled }
+  let current = unsafe shared.load(span, offset, sizeLog2, MemoryOrder.SequentiallyConsistent)
+  let mut target = expected
+  if sizeLog2 == 2 { target = target & 0xffffffff }
+  if current != target { return WaitResult.NotEqual }
+  let mut waiter = Waiter { previous: Pointer.null<Waiter>(), next: Pointer.null<Waiter>(),
+    linked: false, address: address, cancellation: domain.cancellation, woken: 0 }
+  let node = Pointer.fromMutRef(&mut waiter)
+  let queue = guard.getMut()
+  unsafe append(&mut queue, node)
+  queue.active = queue.active + 1
+  let mut anchor = ()
+  if !Pointer.isNull<Cancellation>(domain.cancellation) {
+    let state = unsafe Pointer.borrowMut(&mut anchor, present(domain.cancellation))
+    state.active = state.active + 1
+  }
+  let sleeper = unsafe Pointer.borrowMut(&mut anchor, node)
+  let word = Pointer.fromMutRef(&mut sleeper.woken) drop sleeper
+  drop guard
+  let mut interrupted = false
+  let mut woke = false
+  if let Option<WaitInterrupt>.Some { value: callback } = domain.interrupt {
+    let mut deadline = realtime()
+    deadline.seconds = deadline.seconds + seconds
+    deadline.nanoseconds = deadline.nanoseconds + nanoseconds
+    if deadline.nanoseconds >= 1000000000 {
+      deadline.nanoseconds = deadline.nanoseconds - 1000000000
+      deadline.seconds = deadline.seconds + 1
+    }
+    while true {
+      // Remain linked across polling slices; notify/cancel publish the word
+      // under the queue lock, so neither a wake nor FIFO position can be lost.
+      interrupted = unsafe callback(domain.interruptOpaque) != 0
+      if interrupted { break }
+      if unsafe Atomic.load<u32>(word, MemoryOrder.Acquire) != 0 { woke = true break }
+      let now = realtime()
+      let mut slice: u64 = 10000000
+      if !infinite {
+        if now.seconds > deadline.seconds || (now.seconds == deadline.seconds && now.nanoseconds >= deadline.nanoseconds) { break }
+        let remainingSeconds = deadline.seconds - now.seconds
+        if remainingSeconds <= 1 {
+          let remaining = remainingSeconds * 1000000000 + deadline.nanoseconds - now.nanoseconds
+          if remaining < 10000000 { slice = i64.toU64(remaining) }
+        }
+      }
+      woke = unsafe Atomic.wait(word, 0, Option<u64>.some(slice))
+      if woke { break }
+    }
+  } else {
+    // A wake after unlock has set the word. As in the source, a spurious
+    // wake returns "ok" without retrying.
+    let mut bound = Option<u64>.none()
+    if !infinite {
+      if seconds < 0 || (seconds == 0 && nanoseconds <= 0) { bound = Option<u64>.some(0) }
+      else if seconds <= 9223372036 {
+        bound = Option<u64>.some(i64.toU64(seconds) * 1000000000 + i64.toU64(nanoseconds))
+      }
+    }
+    woke = unsafe Atomic.wait(word, 0, move bound)
+  }
+  let mut relocked = unsafe locked(&lockAnchor, domain)
+  let finishing = relocked.getMut()
+  let linked = (unsafe Pointer.borrow(&anchor, node)).linked
+  if linked { unsafe unlink(&mut finishing, node) }
+  finishing.active = finishing.active - 1
+  let wasCancelled = unsafe cancelled(domain)
+  if !Pointer.isNull<Cancellation>(domain.cancellation) {
+    let state = unsafe Pointer.borrowMut(&mut anchor, present(domain.cancellation))
+    state.active = state.active - 1
+  }
+  drop relocked
+  if wasCancelled || interrupted { return WaitResult.Cancelled }
+  if !woke && linked { return WaitResult.TimedOut }
+  return WaitResult.Ok
+}
+/// FIFO notify by byte address. Wakes occur under the same lock as removal,
+/// so a waiter cannot end its stack frame while notify still uses its word.
+pub unsafe fn notify(domain: Domain, address: *mut u8, count: i32) -> i32 {
+  if count <= 0 { return 0 }
+  // notifyCount returns at most this positive i32 input.
+  return u32.toI32(unsafe notifyCount(domain, address, i32.toU32(count)))
+}
+pub unsafe fn notifyCount(domain: Domain, address: *mut u8, count: u32) -> u32 {
+  if count == 0 { return 0 }
+  let lockAnchor = () let mut guard = unsafe locked(&lockAnchor, domain)
+  let mut anchor = ()
+  let queue = guard.getMut()
+  let mut cursor = queue.first
+  let mut notified: u32 = 0
+  while !Pointer.isNull<Waiter>(cursor) && notified < count {
+    let pointer = nonnull(cursor)
+    let node = unsafe Pointer.borrowMut(&mut anchor, pointer)
+    cursor = node.next
+    let matches = Pointer.address<u8>(node.address) == Pointer.address<u8>(address)
+    drop node
+    if matches {
+      unsafe wake(&mut queue, pointer)
+      notified = notified + 1
+    }
+  }
+  drop guard
+  return notified
+}
+
+// Module-local regression coordination observes the real queue under its mutex;
+// no production enqueue callback or public test-only waiter-count API is needed.
+fn regressionWait(domain: Domain, span: Span, offset: u64, shift: u32) -> i32 {
+  return match unsafe wait(domain, span, offset, shift, 0, 10000) {
+    WaitResult.Ok => 0
+    WaitResult.Cancelled => 1
+    WaitResult.NotEqual => 2
+    WaitResult.TimedOut => 3
+  }
+}
+fn regressionAwaitActive(domain: Domain, expected: usize) -> () {
+  let idle: u32 = 0
+  let mut attempts: u32 = 0
+  while true {
+    let lockAnchor = () let guard = unsafe locked(&lockAnchor, domain)
+    let active = guard.get().active
+    drop guard
+    if active == expected { return () }
+    attempts = attempts + 1
+    if attempts >= 5000 { invariant() }
+    // Nothing changes `idle`, so this sleeps the full millisecond.
+    let _slept = unsafe Atomic.wait(Pointer.fromRef(&idle), 0, Option<u64>.some(1000000))
+  }
+}
+test effect fn scopedCancellationUnlinksBlockedWaitersWithoutPoisoningSharedQueue() -> ()
+  ! OutOfMemoryError | SynchronizationError | SpawnError | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let owner = run WaiterDomain.make() |> Effect.provideMut<Allocator>(&mut memory)
+  let main = owner.handle()
+  let cancelledScope = run CancellableDomain.make(main) |> Effect.provideMut<Allocator>(&mut memory)
+  let otherScope = run CancellableDomain.make(main) |> Effect.provideMut<Allocator>(&mut memory)
+  let mut backing = run Box<[u64; 2]>.make([0; 2]) |> Effect.provideMut<Allocator>(&mut memory)
+  let first = Pointer.fromMutRef(&mut backing.getMut()[0][0])
+  let span = Span { data: unsafe Intrinsic.pointerReinterpret<*mut u64, *mut u8>(first), capacity: 16 }
+  let a32Domain = cancelledScope.handle() let a32Span = span
+  let a64Domain = cancelledScope.handle() let a64Span = span
+  let mainDomain = main let mainSpan = span
+  let otherDomain = otherScope.handle() let otherSpan = span
+  let a32 = run NativeThread.spawn(fn() -> i32 { return regressionWait(a32Domain, a32Span, 0, 2) }) |> Effect.provideMut<Allocator>(&mut memory)
+  let a64 = run NativeThread.spawn(fn() -> i32 { return regressionWait(a64Domain, a64Span, 8, 3) }) |> Effect.provideMut<Allocator>(&mut memory)
+  let ordinary = run NativeThread.spawn(fn() -> i32 { return regressionWait(mainDomain, mainSpan, 0, 3) }) |> Effect.provideMut<Allocator>(&mut memory)
+  let unrelated = run NativeThread.spawn(fn() -> i32 { return regressionWait(otherDomain, otherSpan, 0, 2) }) |> Effect.provideMut<Allocator>(&mut memory)
+  // Seeing all four active while holding the queue mutex proves each has
+  // linked its waiter under the lock, not merely signalled an about-to-wait startup flag.
+  regressionAwaitActive(main, 4)
+  cancelledScope.cancel()
+  cancelledScope.cancel()
+  let a32Result = a32.join() let a64Result = a64.join()
+  regressionAwaitActive(main, 2)
+  let empty = unsafe notify(main, unsafe shared.address(span, 8), 2147483647)
+  let firstNotified = unsafe notify(cancelledScope.handle(), unsafe shared.address(span, 0), 1)
+  let secondNotified = unsafe notify(otherScope.handle(), unsafe shared.address(span, 0), 1)
+  let ordinaryResult = ordinary.join() let unrelatedResult = unrelated.join()
+  run Testing.expect(a32Result == 1 && a64Result == 1 && empty == 0,
+    "cancellation unlinks and interrupts all blocked 32/64-bit group waits at distinct addresses")
+  run Testing.expect(firstNotified == 1 && secondNotified == 1 && ordinaryResult == 0 && unrelatedResult == 0,
+    "uncancellable and independent scopes remain blocked until ordinary cross-scope byte-address notify")
+  drop backing
+  drop cancelledScope
+  drop otherScope
+  drop owner
+  run Testing.expect(observer.stats().allocationCount == 0 && observer.stats().usedBytes == 0,
+    "all threads join before either domain owner drops, leaving no native allocation residue")
+}
+
+test effect fn retainedWaiterQueuesOutliveTheirOriginalOwnerAndAllocator() -> ()
+  ! OutOfMemoryError | SynchronizationError | SpawnError | AssertionError<'static> {
+  let mut memory = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let observer = run memory.observe()
+  let original = run WaiterDomain.make() |> Effect.provideMut<Allocator>(&mut memory)
+  let scope = run CancellableDomain.make(original.handle()) |> Effect.provideMut<Allocator>(&mut memory)
+  let retained = unsafe WaiterDomain.retain(scope.handle())
+  let mut backing = run Box<[u64; 2]>.make([0; 2]) |> Effect.provideMut<Allocator>(&mut memory)
+  let first = Pointer.fromMutRef(&mut backing.getMut()[0][0])
+  let span = Span { data: unsafe Intrinsic.pointerReinterpret<*mut u64, *mut u8>(first), capacity: 16 }
+  let ordinaryDomain = retained.handle() let ordinarySpan = span
+  let scopedDomain = scope.handle() let scopedSpan = span
+  let ordinary = run NativeThread.spawn(fn() -> i32 { return regressionWait(ordinaryDomain, ordinarySpan, 0, 2) })
+    |> Effect.provideMut<Allocator>(&mut memory)
+  let scoped = run NativeThread.spawn(fn() -> i32 { return regressionWait(scopedDomain, scopedSpan, 8, 3) })
+    |> Effect.provideMut<Allocator>(&mut memory)
+  regressionAwaitActive(original.handle(), 2)
+  drop original
+  drop memory
+  scope.cancel()
+  let cancelled = scoped.join()
+  regressionAwaitActive(retained.handle(), 1)
+  let count = unsafe notify(retained.handle(), unsafe shared.address(span, 0), 1)
+  let notified = ordinary.join()
+  run Testing.expect(cancelled == 1 && count == 1 && notified == 0,
+    "retained queues survive parent destruction without inheriting cancellation or losing cross-owner notification")
+  drop scope
+  drop backing
+  drop retained
+  run Testing.expect(observer.stats().allocationCount == 0 && observer.stats().usedBytes == 0,
+    "the last queue lease reclaims its allocation after the original allocator has dropped")
+}

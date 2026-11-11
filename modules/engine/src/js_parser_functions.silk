@@ -1,0 +1,1092 @@
+// Native function grammar, pinned quickjs.c:37148-37891.
+// Child definitions are linked at allocation. Failure restores the parser cursor's
+// function, but leaves all linked children for the compile entry's tree teardown.
+import thin_list { BoxList, PairList }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.num.i32
+import silk.num.u32
+import silk.num.u16
+import silk.num.usize
+import js_heap { HeapCell }
+import js_core_types { FunctionKind, RuntimeState, JS_MODE_STRICT, SourceText, OwnedAtom }
+import js_compiler_types { LazyBody, LazyName, FunctionId, ParseFunctionKind, ParseExportKind, VariableDefinition, CompilerError, ARGUMENT_VAR_OFFSET }
+import js_compiler_state as state
+import js_parser_core { Parser, ParserStackOverflow, PF_IN_ACCEPTED }
+import js_parser_diagnostics { SyntaxError }
+import js_parser_host { ModuleAttributeHooks }
+import js_exceptions { JsException }
+import js_string_types { StringLengthError }
+import js_bigint { BigIntError }
+import js_tokens { LexError }
+import js_tokens as tok
+import js_atom_data as atoms
+import js_opcode_data as op
+import byte_buffer { ByteBuffer, readU16 }
+import js_lexer { SKIP_HAS_ASSIGNMENT, LexerPosition }
+import js_gc { HeapHooks }
+import js_value { ValueBits }
+import runtime_memory { AllocationObserver }
+import js_parser_support as support
+import js_parser_expressions as expressions
+import js_parser_literals as literals
+import js_parser_statements as statements
+import js_parser_modules as modules
+import js_parser_lvalues { setObjectName }
+import js_preparse as preparse
+import js_preparse { Preparse }
+import silk.mem.box { Box }
+import js_preparse_tables { PreparseTables }
+import js_preparse_pool as pool
+import js_preparse_pool { PoolJob, SpanName, Deferred }
+import silk.num.i64
+import silk.mem.pointer { Pointer }
+import silk.collections.list { List }
+import js_module_metadata { ExportKind }
+
+fn directiveCanEnd(kind: i32) -> bool {
+  return kind == tok.TOK_NUMBER || kind == tok.TOK_STRING || kind == tok.TOK_TEMPLATE
+    || kind == tok.TOK_IDENT || kind == tok.TOK_REGEXP || kind == tok.TOK_DEC
+    || kind == tok.TOK_INC || kind == tok.TOK_NULL || kind == tok.TOK_FALSE
+    || kind == tok.TOK_TRUE || kind == tok.TOK_IF || kind == tok.TOK_RETURN
+    || kind == tok.TOK_VAR || kind == tok.TOK_THIS || kind == tok.TOK_DELETE
+    || kind == tok.TOK_TYPEOF || kind == tok.TOK_NEW || kind == tok.TOK_DO
+    || kind == tok.TOK_WHILE || kind == tok.TOK_FOR || kind == tok.TOK_SWITCH
+    || kind == tok.TOK_THROW || kind == tok.TOK_TRY || kind == tok.TOK_FUNCTION
+    || kind == tok.TOK_DEBUGGER || kind == tok.TOK_WITH || kind == tok.TOK_CLASS
+    || kind == tok.TOK_CONST || kind == tok.TOK_ENUM || kind == tok.TOK_EXPORT
+    || kind == tok.TOK_IMPORT || kind == tok.TOK_SUPER || kind == tok.TOK_INTERFACE
+    || kind == tok.TOK_LET || kind == tok.TOK_PACKAGE || kind == tok.TOK_PRIVATE
+    || kind == tok.TOK_PROTECTED || kind == tok.TOK_PUBLIC || kind == tok.TOK_STATIC
+}
+
+pub effect fn parseDirectives(s: &mut Parser<'_>) -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError ? &mut Allocator {
+  if s.token.kind != tok.TOK_STRING { return () }
+  let saved = s.save()
+  while s.token.kind == tok.TOK_STRING {
+    // Compare the original spelling, not the cooked string: escapes do not
+    // enable strict mode. The source snprintf truncation cannot match this text.
+    let bytes = s.sourceBytes()
+    let start = s.token.start + 1
+    let end = s.lexer.offset - 1
+    let expected = b"use strict"
+    let mut useStrict = end - start == expected.length
+    let mut i: usize = 0
+    while useStrict && i < expected.length {
+      useStrict = bytes[start + i] == expected[i]
+      i = i + 1
+    }
+    run s.advance()
+    let mut hasSemicolon = false
+    if s.token.kind == 59 {
+      run s.advance()
+      hasSemicolon = true
+    } else if s.token.kind == 125 || s.token.kind == tok.TOK_EOF {
+      hasSemicolon = true
+    } else if directiveCanEnd(s.token.kind) && s.lexer.gotLineFeed {
+      hasSemicolon = true
+    }
+    if !hasSemicolon { break }
+    if useStrict {
+      let fd = s.function()
+      fd.hasUseStrict = true
+      fd.jsMode = fd.jsMode | JS_MODE_STRICT
+      drop fd
+      s.contextChanged()
+    }
+  }
+  run s.seek(saved)
+}
+
+fn strictFutureKeyword(name: u32) -> bool {
+  return name > atoms.JS_ATOM_LAST_KEYWORD && name <= atoms.JS_ATOM_LAST_STRICT_KEYWORD
+}
+fn invalidStrictName(name: u32) -> bool {
+  return name == atoms.JS_ATOM_eval || name == atoms.JS_ATOM_arguments || strictFutureKeyword(name)
+}
+effect fn checkNames(s: &mut Parser<'_>, name: u32) -> ()
+  ! OutOfMemoryError | StringLengthError | SyntaxError ? &mut Allocator {
+  let fd = s.functionView()
+  if (fd.jsMode & JS_MODE_STRICT) != 0 {
+    if !fd.hasSimpleParameterList && fd.hasUseStrict {
+      drop fd
+      return run s.syntax<()>(b"\"use strict\" not allowed in function with default or destructuring parameter")
+    }
+    if invalidStrictName(name) {
+      drop fd
+      return run s.syntax<()>(b"invalid function name in strict code")
+    }
+    let mut index: usize = 0
+    while index < fd.args.length() {
+      if invalidStrictName(fd.args.get(index).name) {
+        drop fd
+        return run s.syntax<()>(b"invalid argument name in strict code")
+      }
+      index = index + 1
+    }
+  }
+  if (fd.jsMode & JS_MODE_STRICT) != 0 || !fd.hasSimpleParameterList
+    || fd.functionType == ParseFunctionKind.Arrow || fd.functionType == ParseFunctionKind.Method {
+    let mut index: usize = 0
+    while index < fd.args.length() {
+      let argument = fd.args.get(index).name
+      if argument != 0 {
+        let mut previous: usize = 0
+        while previous < index {
+          if fd.args.get(previous).name == argument {
+            drop fd
+            return run s.syntax<()>(b"duplicate argument names not allowed in this context")
+          }
+          previous = previous + 1
+        }
+        previous = 0
+        while previous < fd.vars.length() {
+          let variable = fd.vars.get(previous)
+          if variable.name == argument && variable.scopeLevel == 0 {
+            drop fd
+            return run s.syntax<()>(b"duplicate argument names not allowed in this context")
+          }
+          previous = previous + 1
+        }
+      }
+      index = index + 1
+    }
+  }
+}
+
+pub effect fn newClassFieldsInitializer(s: &mut Parser<'_>) -> FunctionId
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut _anchor = ()
+  let parent = s.functionView()
+  let filename = parent.filename
+  let cache = parent.sourceCache
+  drop parent
+  let current = s.functionCell() let child = run s.newFunction(Option<FunctionId>.some(current), false, false, filename, 0, cache)
+  let fd = s.functionAtMut(child)
+  fd.functionName = 0 fd.hasPrototype = false fd.hasHomeObject = true
+  fd.hasArgumentsBinding = false fd.hasThisBinding = true
+  fd.isDerivedClassConstructor = false fd.newTargetAllowed = true
+  fd.superCallAllowed = false fd.superAllowed = true fd.argumentsAllowed = false
+  fd.functionKind = FunctionKind.Normal fd.functionType = ParseFunctionKind.Method
+  drop fd
+  s.contextChanged()
+  return child
+}
+
+fn scope(s: &Parser<'_>) -> u16 {
+  let fd = s.functionView()
+  return i32.toU16(fd.scopeLevel)
+}
+fn parameterExpressions(s: &Parser<'_>) -> bool {
+  let fd = s.functionView()
+  return fd.hasParameterExpressions
+}
+fn nonSimple(s: &mut Parser<'_>) -> () {
+  let fd = s.function()
+  fd.hasSimpleParameterList = false
+}
+fn incrementLength(s: &mut Parser<'_>) -> () {
+  let fd = s.function()
+  fd.definedArgCount = fd.definedArgCount + 1
+}
+effect fn addArgument(s: &mut Parser<'_>, name: u32) -> i32
+  ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  let cells = s.cells() let fd = move cells.function
+  let rt = move cells.runtime
+  return run state.addArg(&mut fd, &mut rt.atoms, name)
+}
+effect fn defineBinding(s: &mut Parser<'_>, name: u32, kind: VariableDefinition) -> i32
+  ! OutOfMemoryError | StringLengthError | CompilerError ? &mut Allocator {
+  let cells = s.cells() let fd = move cells.function
+  let rt = move cells.runtime
+  return run state.defineVar(&mut fd, &mut rt.atoms, name, kind)
+}
+/// Hands a skipped body's free name, seen from scope `level`, to the compiler.
+/// A stub whose only code is its body scope's enter_scope gives the buffer to
+/// the next definition (Parser.spareBytecode); full resolution re-emits it.
+fn recycleStubCode(s: &mut Parser<'_>, child: FunctionId) -> () {
+  let fd = s.functionAtMut(child)
+  if fd.bytecode.length() != 3 || fd.bytecode.get(0) != op.OP_enter_scope || fd.bodyScope < 0
+    || u16.toI32(readU16(fd.bytecode.asSlice(), 1)) != fd.bodyScope { return () }
+  let mut code = Intrinsic.replace(fd.bytecode, ByteBuffer.make())
+  fd.lazyScopeElided = true fd.lastOpcodePosition = -1
+  drop fd
+  code.clear()
+  s.spareBytecode = move code
+}
+/// A skipped body's free names each take a reference for variable resolution
+/// (js_compiler_variables.resolveStub reads them at the stub's scope level).
+fn holdFree(s: &mut Parser<'_>, free: &BoxList<LazyName>) -> () {
+  let rt = s.runtimeState()
+  let mut i: usize = 0
+  while i < free.length() { drop rt.atoms.duplicate(free.get(i).name) i = i + 1 }
+}
+effect fn emitScopedName(s: &mut Parser<'_>, opcode: u8, name: u32, level: u16) -> () ? &mut Allocator {
+  run support.emitOpAtomU16(&mut s, opcode, name, level)
+}
+effect fn copySource(s: &mut Parser<'_>, start: &Option<usize>, end: usize) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  if s.function().stripSource { return () }
+  match &start.* {
+    Option<usize>.Some { value } => {
+      let text = run s.sourceSpan(value, end)
+      let fd = s.function()
+      fd.source = Option<SourceText>.some(move text)
+    }
+    Option<usize>.None => {}
+  }
+}
+
+effect fn parseParameters<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'_>, hooks: &mut H,
+    memory: &AllocationObserver, functionType: ParseFunctionKind) -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException ? &mut Allocator {
+  let mut _anchor = ()
+  let initial = s.function()
+  initial.hasSimpleParameterList = true initial.hasParameterExpressions = false
+  drop initial
+  let mut optional = false
+  if functionType == ParseFunctionKind.Arrow { s.reparseIdentifier(-1) }
+  if functionType == ParseFunctionKind.Arrow && s.token.kind == tok.TOK_IDENT {
+    if support.tokenReserved(&s.*) { return run s.reserved<()>() }
+    let name = support.tokenAtom(&s.*)
+    let _index = run addArgument(&mut s, name)
+    incrementLength(&mut s)
+  } else if functionType != ParseFunctionKind.ClassStaticInit {
+    if s.token.kind == 40 {
+      if !run s.plainParameters() {
+        let skipped = run s.skipParens(false)
+        if (skipped.bits & SKIP_HAS_ASSIGNMENT) != 0 {
+          let fd = s.function()
+          fd.hasParameterExpressions = true
+        }
+      }
+      run s.advance()
+    } else { run s.expect(40) }
+    if parameterExpressions(&s.*) {
+      let fd = s.function()
+      fd.scopeLevel = -1
+      drop fd
+      let _parameterScope = run support.pushScope(&mut s)
+    }
+    while s.token.kind != 41 {
+      let mut rest = false
+      if s.token.kind == tok.TOK_ELLIPSIS {
+        if functionType == ParseFunctionKind.Setter {
+          return run s.syntax<()>(b"invalid number of arguments for getter or setter")
+        }
+        nonSimple(&mut s)
+        rest = true
+        run s.advance()
+      }
+      if s.token.kind == 91 || s.token.kind == 123 {
+        nonSimple(&mut s)
+        if rest {
+          let fd = s.functionView()
+          let count = usize.toU16(fd.args.length())
+          drop fd
+          run support.emitOpU16(&mut s, op.OP_rest, count)
+        } else {
+          let index = run addArgument(&mut s, 0)
+          run support.emitOpU16(&mut s, op.OP_get_arg, i32.toU16(index))
+        }
+        let mut token = tok.TOK_VAR
+        if parameterExpressions(&s.*) { token = tok.TOK_LET }
+        let initialized = run expressions.parseDestructuring(&mut s, &mut hooks, memory, token, true, true, -1, true, false)
+        if initialized { optional = true }
+        if !optional { incrementLength(&mut s) }
+      } else if s.token.kind == tok.TOK_IDENT {
+        if support.tokenReserved(&s.*) { return run s.reserved<()>() }
+        let borrowed = support.tokenAtom(&s.*)
+        let name = unsafe OwnedAtom.duplicate(s.runtimeCell(), borrowed)
+        if parameterExpressions(&s.*) {
+          run support.checkDuplicateParameter(&mut s, name.get())
+          let _binding = run defineBinding(&mut s, name.get(), VariableDefinition.Let)
+        }
+        let index = run addArgument(&mut s, name.get())
+        run s.advance()
+        if rest {
+          run support.emitOpU16(&mut s, op.OP_rest, i32.toU16(index))
+          if parameterExpressions(&s.*) {
+            run support.emitOp(&mut s, op.OP_dup)
+            let level = scope(&s.*)
+            run emitScopedName(&mut s, op.OP_scope_put_var_init, name.get(), level)
+          }
+          run support.emitOpU16(&mut s, op.OP_put_arg, i32.toU16(index))
+          nonSimple(&mut s)
+          optional = true
+        } else if s.token.kind == 61 {
+          nonSimple(&mut s)
+          optional = true
+          run s.advance()
+          let label = run support.newLabel(&mut s)
+          run support.emitOpU16(&mut s, op.OP_get_arg, i32.toU16(index))
+          run support.emitOp(&mut s, op.OP_dup)
+          run support.emitOp(&mut s, op.OP_undefined)
+          run support.emitOp(&mut s, op.OP_strict_eq)
+          let _branch = run support.emitGoto(&mut s, op.OP_if_false, label)
+          run support.emitOp(&mut s, op.OP_drop)
+          run expressions.parseAssignment(&mut s, &mut hooks, memory, PF_IN_ACCEPTED)
+          run setObjectName(&mut s, name.get())
+          run support.emitOp(&mut s, op.OP_dup)
+          run support.emitOpU16(&mut s, op.OP_put_arg, i32.toU16(index))
+          let _emitted = run support.emitLabel(&mut s, label)
+          let level = scope(&s.*)
+          run emitScopedName(&mut s, op.OP_scope_put_var_init, name.get(), level)
+        } else {
+          if !optional { incrementLength(&mut s) }
+          if parameterExpressions(&s.*) {
+            run support.emitOpU16(&mut s, op.OP_get_arg, i32.toU16(index))
+            let level = scope(&s.*)
+            run emitScopedName(&mut s, op.OP_scope_put_var_init, name.get(), level)
+          }
+        }
+      } else { return run s.syntax<()>(b"missing formal parameter") }
+      if rest && s.token.kind != 41 { return run s.expected<()>(41) }
+      if s.token.kind == 41 { break }
+      run s.expect(44)
+    }
+    let fd = s.functionView()
+    let count = fd.args.length()
+    drop fd
+    if (functionType == ParseFunctionKind.Getter && count != 0)
+      || (functionType == ParseFunctionKind.Setter && count != 1) {
+      return run s.syntax<()>(b"invalid number of arguments for getter or setter")
+    }
+  }
+  if parameterExpressions(&s.*) {
+    let fd = s.functionView()
+    let level = fd.scopeLevel
+    let mut index = fd.scopes.get(i32.toUsize(level)).first
+    drop fd
+    while index >= 0 {
+      let current = s.functionView()
+      let variable = current.vars.get(i32.toUsize(index))
+      if variable.scopeLevel != level { break }
+      let missing = state.findVar(&current.*, variable.name) < 0
+      drop current
+      if missing {
+        let mut runtimeAnchor = ()
+        let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut runtimeAnchor, s.runtimeCell())
+        let target = s.function()
+        let _added = run state.addVar(&mut target, &mut rt.atoms, variable.name)
+        drop target drop rt
+        run emitScopedName(&mut s, op.OP_scope_get_var, variable.name, i32.toU16(level))
+        run emitScopedName(&mut s, op.OP_scope_put_var, variable.name, 0)
+      }
+      index = variable.scopeNext
+    }
+    run support.emitOpU16(&mut s, op.OP_leave_scope, i32.toU16(level))
+    let updated = s.function()
+    updated.scopeLevel = 0 updated.scopeFirst = updated.scopes.get(0).first
+  }
+  // Consumes ')' (or the single arrow parameter, or the static block's '{').
+  run s.advance()
+}
+
+effect fn parseFunctionInner<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'_>, hooks: &mut H,
+    memory: &AllocationObserver, functionType: ParseFunctionKind, initialKind: FunctionKind,
+    borrowedName: u32, sourceStart: Option<usize>, exportKind: ParseExportKind, mayEager: bool) -> FunctionId
+  ! OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException ? &mut Allocator {
+  let parentCell = s.functionCell()
+  // finishLazy's own function: parsed in full, and its children may go lazy.
+  let finishing = s.lazyFinish s.lazyFinish = false
+  let mut entry = s.save()
+  // Where a retry of an eagerly parsed IIFE starts over.
+  let start = s.save()
+  let mut kind = initialKind
+  let expression = functionType != ParseFunctionKind.Statement && functionType != ParseFunctionKind.Var
+  let mut name = support.ownedAtom(&mut s, borrowedName)
+  let ordinary = functionType == ParseFunctionKind.Statement || functionType == ParseFunctionKind.Var
+    || functionType == ParseFunctionKind.Expression
+  if ordinary {
+    if kind == FunctionKind.Normal && support.pseudoKeyword(&s.*, atoms.JS_ATOM_async) && s.peek(true) != 10 {
+      run s.advance()
+      kind = FunctionKind.Async
+    }
+    run s.advance()
+    if s.token.kind == 42 {
+      run s.advance()
+      if kind == FunctionKind.Async || kind == FunctionKind.AsyncGenerator { kind = FunctionKind.AsyncGenerator }
+      else { kind = FunctionKind.Generator }
+    }
+    if functionType == ParseFunctionKind.Expression {
+      let mut forced: i32 = 0
+      if kind == FunctionKind.Generator { forced = 1 }
+      else if kind == FunctionKind.Async { forced = 2 }
+      else if kind == FunctionKind.AsyncGenerator { forced = 3 }
+      s.reparseIdentifier(forced)
+    }
+    if s.token.kind == tok.TOK_IDENT {
+      if support.tokenReserved(&s.*) { return run s.reserved<FunctionId>() }
+      let atom = support.tokenAtom(&s.*)
+      name = support.ownedAtom(&mut s, atom)
+      // finishLazy reparses a declaration as an anonymous expression from its
+      // name, so the name resolves outside like every other free name.
+      if functionType != ParseFunctionKind.Expression { entry = s.save() }
+      run s.advance()
+    } else if functionType != ParseFunctionKind.Expression && exportKind != ParseExportKind.Default {
+      return run s.syntax<FunctionId>(b"function name expected")
+    }
+  }
+  let mut _anchor = ()
+  let mut createFunctionVar = false
+  let mut lexicalFunctionIndex: i32 = -1
+  let parent = s.functionAt(parentCell)
+  if parent.isEval && parent.evalType == 1
+    && (functionType == ParseFunctionKind.Statement || functionType == ParseFunctionKind.Var) {
+    let previous = state.findGlobalVar(&parent.*, name.get())
+    if previous >= 0 && parent.globalVars.get(i32.toUsize(previous)).scopeLevel == parent.scopeLevel {
+      drop parent
+      return run s.syntax<FunctionId>(b"invalid redefinition of global identifier in module code")
+    }
+  }
+  let mut defineLexical = false
+  if functionType == ParseFunctionKind.Var {
+    let existing = state.findVar(&parent.*, name.get())
+    createFunctionVar = (parent.jsMode & JS_MODE_STRICT) == 0 && kind == FunctionKind.Normal
+      && state.findLexicalDeclaration(&parent.*, name.get(), parent.scopeFirst, false) < 0
+      && !(existing >= 0 && (existing & ARGUMENT_VAR_OFFSET) != 0)
+      && !(name.get() == atoms.JS_ATOM_arguments && parent.hasArgumentsBinding)
+    let globalScope = parent.isEval && (parent.evalType == 0 || parent.evalType == 1)
+      && parent.scopeLevel == parent.bodyScope
+    if globalScope {
+      let previous = state.findGlobalVar(&parent.*, name.get())
+      if previous >= 0 && parent.globalVars.get(i32.toUsize(previous)).scopeLevel == parent.scopeLevel {
+        drop parent
+        return run s.syntax<FunctionId>(b"invalid redefinition of global identifier")
+      }
+    } else { defineLexical = true }
+  }
+  drop parent
+  if defineLexical {
+    let mut definition = VariableDefinition.FunctionDeclaration
+    if kind != FunctionKind.Normal { definition = VariableDefinition.NewFunctionDeclaration }
+    lexicalFunctionIndex = run defineBinding(&mut s, name.get(), definition)
+  }
+  let outer = s.functionAt(parentCell)
+  let filename = outer.filename let cache = outer.sourceCache
+  let inheritedNewTarget = outer.newTargetAllowed let inheritedSuperCall = outer.superCallAllowed
+  let inheritedSuper = outer.superAllowed let inheritedArguments = outer.argumentsAllowed
+  let parentVerified = outer.lazyVerified
+  drop outer
+  let mut position: u32 = 0
+  match &sourceStart {
+    Option<usize>.Some { value } => { position = usize.toU32(value) }
+    Option<usize>.None => {}
+  }
+  let child = run s.newFunction(Option<FunctionId>.some(parentCell), false, expression, filename, position, cache)
+  s.enterFunction(child)
+  let functionName = name.get()
+  let fd = s.functionAtMut(child)
+  fd.functionName = name.take()
+  fd.hasPrototype = ordinary && kind == FunctionKind.Normal
+  fd.hasHomeObject = functionType == ParseFunctionKind.Method || functionType == ParseFunctionKind.Getter
+    || functionType == ParseFunctionKind.Setter || functionType == ParseFunctionKind.ClassConstructor
+    || functionType == ParseFunctionKind.DerivedClassConstructor
+  fd.hasArgumentsBinding = functionType != ParseFunctionKind.Arrow && functionType != ParseFunctionKind.ClassStaticInit
+  fd.hasThisBinding = fd.hasArgumentsBinding
+  fd.isDerivedClassConstructor = functionType == ParseFunctionKind.DerivedClassConstructor
+  if functionType == ParseFunctionKind.Arrow {
+    fd.newTargetAllowed = inheritedNewTarget fd.superCallAllowed = inheritedSuperCall
+    fd.superAllowed = inheritedSuper fd.argumentsAllowed = inheritedArguments
+  } else if functionType == ParseFunctionKind.ClassStaticInit {
+    fd.newTargetAllowed = true fd.superCallAllowed = false fd.superAllowed = true fd.argumentsAllowed = false
+  } else {
+    fd.newTargetAllowed = true fd.superCallAllowed = fd.isDerivedClassConstructor
+    fd.superAllowed = fd.hasHomeObject fd.argumentsAllowed = true
+  }
+  fd.functionKind = kind fd.functionType = functionType
+  fd.lazyVerified = finishing || parentVerified
+  drop fd
+  s.contextChanged()
+  if functionType == ParseFunctionKind.ClassConstructor || functionType == ParseFunctionKind.DerivedClassConstructor {
+    run support.emitOp(&mut s, op.OP_check_ctor)
+  }
+  if functionType == ParseFunctionKind.ClassConstructor { run literals.emitClassFieldInit(&mut s) }
+  let paramStart = s.token.start
+  run parseParameters(&mut s, &mut hooks, memory, functionType)
+  if kind == FunctionKind.Generator || kind == FunctionKind.AsyncGenerator {
+    run support.emitOp(&mut s, op.OP_initial_yield)
+  }
+  let bodyFunction = s.functionAtMut(child)
+  bodyFunction.inFunctionBody = true
+  drop bodyFunction
+  s.contextChanged()
+  let _bodyScope = run support.pushScope(&mut s)
+  let scopedFunction = s.functionAtMut(child)
+  scopedFunction.bodyScope = scopedFunction.scopeLevel
+  drop scopedFunction
+  let mut expressionBody = false
+  if s.token.kind == tok.TOK_ARROW && functionType == ParseFunctionKind.Arrow {
+    run s.advance()
+    if s.token.kind != 123 {
+      run checkNames(&mut s, functionName)
+      let arrowBodyPosition = usize.toU32(s.token.start)
+      run statements.startStatement(&mut s, arrowBodyPosition)
+      run expressions.parseAssignment(&mut s, &mut hooks, memory, PF_IN_ACCEPTED)
+      if kind != FunctionKind.Normal { run support.emitOp(&mut s, op.OP_return_async) }
+      else { run support.emitOp(&mut s, op.OP_return) }
+      let end = s.lexer.lastOffset
+      run copySource(&mut s, &sourceStart, end)
+      expressionBody = true
+    }
+  }
+  if !expressionBody {
+    let mut skipped = false
+    let mut eager = false
+    if !finishing && kind == FunctionKind.Normal && ordinary && s.token.kind == 123 && sourceStart.isSome()
+      && !(functionType != ParseFunctionKind.Expression && functionName == atoms.JS_ATOM_async)
+      && lazyCandidate(&s.*, parentCell, child) {
+      // An immediately invoked function: parenthesized, or (under a parent
+      // parsed in full) a parameterless expression after `=` or `,`. That shape
+      // is not always called at once, but most such functions run during the
+      // load anyway, and parsing them in full costs less than a scan of the
+      // body to tell.
+      let mut invoked = false
+      if mayEager && functionType == ParseFunctionKind.Expression {
+        invoked = parenthesizedCall(&s.*, &sourceStart)
+        if !invoked && parentVerified && invokedShape(&s.*, &sourceStart) { invoked = true }
+      }
+      // Under a verified parent the child is verified too: it parses in full
+      // with nothing to check afterwards.
+      eager = invoked && !parentVerified
+      if !invoked { skipped = run skipBody(&mut s, child, entry, paramStart, functionName) }
+    }
+    if skipped {
+      run checkNames(&mut s, functionName)
+    } else {
+      // An IIFE runs at once: parse it in full now instead of preparsing it and
+      // parsing it again on the call. Its children may go lazy as finishLazy's
+      // would, unless the body turns out to hold a direct eval or a with.
+      let outerDynamic = s.dynamicScopeSeen
+      let deferredMark = pool.deferredCount(&s.*)
+      if eager {
+        s.dynamicScopeSeen = false
+        let verified = s.functionAtMut(child) verified.lazyVerified = true drop verified
+      }
+      if functionType != ParseFunctionKind.ClassStaticInit { run s.expect(123) }
+      run parseDirectives(&mut s)
+      run checkNames(&mut s, functionName)
+      let _block = run statements.pushBreakEntry(&mut s, 0, -1, -1, 0)
+      while s.token.kind != 125 {
+        run modules.parseSourceElement(&mut s, &mut hooks, memory)
+      }
+      run statements.popBreakEntry(&mut s)
+      if eager {
+        let dynamic = s.dynamicScopeSeen
+        s.dynamicScopeSeen = outerDynamic || dynamic
+        if dynamic {
+          // Its lazy children assumed static scopes: start over the usual way.
+          pool.truncateDeferred(&mut s, deferredMark)
+          s.destroyFunction(&mut hooks, child)
+          s.enterFunction(parentCell)
+          run s.seek(start)
+          return run parseFunctionInner(&mut s, &mut hooks, memory, functionType, initialKind, borrowedName, move sourceStart, exportKind, false)
+        }
+      }
+    }
+    let end = s.lexer.offset
+    let closingSource = usize.toU32(s.token.start)
+    run copySource(&mut s, &sourceStart, end)
+    run s.advance()
+    if !skipped && support.isLiveCode(&s.*) {
+      // Only debug compilation attributes the implicit return to the closing
+      // delimiter. Keep ordinary QuickJS bytecode/pc2line output unchanged.
+      let function = s.functionView()
+      let debug = function.debuggerMetadata.enabled drop function
+      if debug { run statements.startStatement(&mut s, closingSource) }
+      run statements.emitReturn(&mut s, false)
+    }
+  }
+  s.enterFunction(parentCell)
+  s.reparseIdentifier(-1)
+  let poolIndex = run unsafe support.addConstant(&mut s, &mut hooks, ValueBits.Null)
+  let pooledFunction = s.functionAtMut(child)
+  pooledFunction.parentConstantPoolIndex = poolIndex
+  drop pooledFunction
+  if expression {
+    if functionType != ParseFunctionKind.ClassConstructor && functionType != ParseFunctionKind.DerivedClassConstructor {
+      run support.emitOp(&mut s, op.OP_fclosure)
+      run support.emitU32(&mut s, i32.toU32(poolIndex))
+      if functionName == 0 {
+        run support.emitOp(&mut s, op.OP_set_name)
+        run support.emitU32(&mut s, 0)
+      }
+    }
+  } else if functionType == ParseFunctionKind.Var {
+    run support.emitOp(&mut s, op.OP_fclosure)
+    run support.emitU32(&mut s, i32.toU32(poolIndex))
+    if createFunctionVar {
+      let mut _runtimeAnchor = ()
+      let cells = s.cellsAt(parentCell) let parent = move cells.function
+      let rt = move cells.runtime
+      if parent.isGlobalVar {
+        let index = run state.addGlobalVar(&mut parent, &mut rt.atoms, functionName)
+        let mut global = parent.globalVars.get(i32.toUsize(index))
+        global.scopeLevel = 0 global.forceInit = (parent.jsMode & JS_MODE_STRICT) != 0
+        parent.globalVars.set(i32.toUsize(index), global)
+      } else if state.findVar(&parent.*, functionName) < 0 {
+        let _index = run state.addVar(&mut parent, &mut rt.atoms, functionName)
+      }
+      drop parent drop rt
+      run support.emitOp(&mut s, op.OP_dup)
+      run emitScopedName(&mut s, op.OP_scope_put_var, functionName, 0)
+    }
+    if lexicalFunctionIndex >= 0 {
+      let parent = s.functionAtMut(parentCell)
+      let mut variable = parent.vars.get(i32.toUsize(lexicalFunctionIndex))
+      variable.functionPoolIndex = poolIndex
+      parent.vars.set(i32.toUsize(lexicalFunctionIndex), variable)
+      drop parent
+      run support.emitOp(&mut s, op.OP_drop)
+    } else {
+      let level = scope(&s.*)
+      run emitScopedName(&mut s, op.OP_scope_put_var_init, functionName, level)
+    }
+  } else {
+    let parent = s.functionAt(parentCell)
+    let global = parent.isGlobalVar
+    drop parent
+    if !global {
+      let index = run defineBinding(&mut s, functionName, VariableDefinition.Var)
+      let target = s.functionAtMut(parentCell)
+      if (index & ARGUMENT_VAR_OFFSET) != 0 {
+        let argumentIndex = i32.toUsize(index - ARGUMENT_VAR_OFFSET)
+        let mut argument = target.args.get(argumentIndex)
+        argument.functionPoolIndex = poolIndex target.args.set(argumentIndex, argument)
+      } else {
+        let mut variable = target.vars.get(i32.toUsize(index))
+        variable.functionPoolIndex = poolIndex target.vars.set(i32.toUsize(index), variable)
+      }
+    } else {
+      let mut variableName = functionName
+      if variableName == 0 { variableName = atoms.JS_ATOM__default_ }
+      let mut _runtimeAnchor = ()
+      let cells = s.cellsAt(parentCell) let target = move cells.function
+      let rt = move cells.runtime
+      let index = run state.addGlobalVar(&mut target, &mut rt.atoms, variableName)
+      let mut variable = target.globalVars.get(i32.toUsize(index))
+      variable.constantPoolIndex = poolIndex target.globalVars.set(i32.toUsize(index), variable)
+      drop target drop rt
+      if exportKind != ParseExportKind.None {
+        let mut exportName = atoms.JS_ATOM_default
+        if exportKind == ParseExportKind.Named { exportName = variableName }
+        let _exported = run modules.addExport(&mut s, variableName, exportName, ExportKind.Local)
+      }
+    }
+  }
+  return child
+}
+
+/// Whether child, whose parameters are parsed, may skip its body for a lazy
+/// compile: what js_compiler_finish.deferrable needs, plus an environment no
+/// later eval or with can change. That holds for children of an indirect eval
+/// root (names there resolve the same either way) and of a function finishLazy
+/// is parsing (its preparse saw no eval or with in it), and for the root of a
+/// script compiled with FLAG_LAZY_BODIES, which asks for it. A global script parses
+/// eagerly: it runs right after loading, so a lazy body only moves its compile
+/// to the first call (Octane's MandreelLatency lost ~10% that way) while the
+/// preparse adds ~0.5%. Code built and evaluated at run time is where skipping
+/// never-called bodies pays (Octane CodeLoad -13% instructions).
+fn lazyCandidate(s: &Parser<'_>, parentCell: FunctionId, child: FunctionId) -> bool {
+  let fd = s.functionAt(child)
+  if fd.stripSource || fd.debuggerMetadata.enabled || !fd.hasSimpleParameterList || fd.hasParameterExpressions
+    || fd.module.isSome() { return false }
+  drop fd
+  let parent = s.functionAt(parentCell)
+  let root = parent.parent.isNone() && parent.isEval && (parent.evalType == 3 || parent.lazyRoot) && parent.module.isNone()
+  if !root && !parent.lazyVerified { return false }
+  // A with block before the function may enclose it.
+  if parent.hasWithVar { return false }
+  drop parent
+  return s.sharedSourceFits()
+}
+
+/// Whether the function expression starting at sourceStart is parenthesized
+/// right after an opening paren that is not a call's, as in `(function () {...})()`:
+/// the shape of an immediately invoked function.
+fn parenthesizedCall(s: &Parser<'_>, sourceStart: &Option<usize>) -> bool {
+  let start = match &sourceStart.* { Option<usize>.Some { value } => value _ => { return false } }
+  let bytes = s.sourceBytes()
+  let mut at = start
+  while at > 0 && whitespace(bytes[at - 1]) { at = at - 1 }
+  if at == 0 || bytes[at - 1] != 40 { return false }
+  at = at - 1
+  while at > 0 && whitespace(bytes[at - 1]) { at = at - 1 }
+  if at == 0 { return true }
+  // After a name, a closing bracket or a quote, the paren opens a call's arguments.
+  let c = bytes[at - 1]
+  return !((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c == 36
+    || c == 41 || c == 93 || c == 34 || c == 39 || c == 96 || c >= 128)
+}
+fn whitespace(c: u8) -> bool { return c == 32 || c == 9 || c == 10 || c == 13 }
+
+/// Whether the function expression starting at sourceStart, now at its body's
+/// `{`, has the shape of an unparenthesized IIFE: no parameters, right after an
+/// assignment's `=` or a `,`, as in `f = function () {...}()`.
+fn invokedShape(s: &Parser<'_>, sourceStart: &Option<usize>) -> bool {
+  let start = match &sourceStart.* { Option<usize>.Some { value } => value _ => { return false } }
+  let bytes = s.sourceBytes()
+  let mut at = s.token.start
+  while at > 0 && whitespace(bytes[at - 1]) { at = at - 1 }
+  if at == 0 || bytes[at - 1] != 41 { return false }
+  at = at - 1
+  while at > 0 && whitespace(bytes[at - 1]) { at = at - 1 }
+  if at == 0 || bytes[at - 1] != 40 { return false }
+  at = start
+  while at > 0 && whitespace(bytes[at - 1]) { at = at - 1 }
+  if at == 0 { return false }
+  let c = bytes[at - 1]
+  if c == 44 { return true }
+  if c != 61 || at < 2 { return false }
+  // Not ==, !=, <=, >= or =>.
+  let b = bytes[at - 2]
+  return b != 61 && b != 33 && b != 60 && b != 62
+}
+
+/// Preparses the body at `{`. On acceptance, leaves the parser at the closing
+/// `}` with child holding only synthetic reads of the body's free names, from
+/// which variable resolution makes the closure vars the full body would; on a
+/// bail, rewinds to the `{`.
+/// Sources shorter than this (in bytes) parse every body eagerly.
+const LAZY_MIN_SOURCE: usize = 2048
+
+effect fn skipBody(s: &mut Parser<'_>, child: FunctionId, entry: LexerPosition, paramStart: usize, name: u32) -> bool
+  ! ParserStackOverflow | LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+  // Inside a function finishLazy parses, its preparse already went through
+  // this body: take its record instead of preparsing again.
+  let known = recordAt(&s.*, s.token.start)
+  if known >= 0 { run skipKnown(&mut s, child, entry, i32.toUsize(known)) return true }
+  // A small script compiles little: preparsing then reparsing the bodies it
+  // calls costs more than it saves.
+  if s.sourceBytes().length < LAZY_MIN_SOURCE { return false }
+  // The scanner found this body (js_preparse_pool): take a helper's records
+  // when they are ready, else skip to the scanned `}` and complete the stub
+  // after the parse (joinDeferred).
+  if !Pointer.isNull<u8>(s.pool) && (s.functionAt(child).jsMode & JS_MODE_STRICT) == 0 {
+    // No helpers: find the `}` here, and preparse at the join.
+    if pool.local(&s.*) {
+      let bodyStart = s.token.start
+      let end = pool.bodyEnd(s.sourceBytes(), bodyStart)
+      if end == 0 { let level = scope(&s.*) return run preparseFill(&mut s, child, entry, level) }
+      let level = scope(&s.*)
+      let lineFeed = lineFeedBefore(s.sourceBytes(), end)
+      s.seekBrace(LexerPosition { offset: end, gotLineFeed: lineFeed })
+      run pool.defer(&mut s, Deferred { child: child, job: 0, bodyStart: bodyStart, end: end, level: level, entry: entry, name: name })
+      recycleStubCode(&mut s, child)
+      return true
+    }
+    let found = pool.lookup(&s.*, paramStart)
+    if found >= 0 {
+      let index = i64.toUsize(found)
+      let current = pool.jobState(&s.*, index)
+      if current == pool.DONE {
+        pool.countHit(&s.*)
+        let level = scope(&s.*) let job = pool.job(&s.*, index)
+        drop run skipPooled(&mut s, child, entry, level, job, true)
+        return true
+      }
+      // A helper's preparse bailed: so would this one.
+      if current == pool.FAILED { return false }
+      let job = pool.job(&s.*, index)
+      let saved = s.save()
+      let level = scope(&s.*)
+      let lineFeed = lineFeedBefore(s.sourceBytes(), job.end)
+      run s.seek(LexerPosition { offset: job.end, gotLineFeed: lineFeed })
+      if s.token.kind == 125 && s.token.start == job.end {
+        run pool.defer(&mut s, Deferred { child: child, job: index, bodyStart: job.bodyStart, end: job.end, level: level, entry: entry, name: name })
+        recycleStubCode(&mut s, child)
+        return true
+      }
+      run s.seek(saved)
+    }
+  }
+  let level = scope(&s.*)
+  return run preparseFill(&mut s, child, entry, level)
+}
+
+/// Whether a line feed sits among the spaces before offset.
+fn lineFeedBefore(bytes: &[u8], offset: usize) -> bool {
+  let mut at = offset
+  while at > 0 && whitespace(bytes[at - 1]) {
+    if bytes[at - 1] == 10 || bytes[at - 1] == 13 { return true }
+    at = at - 1
+  }
+  return false
+}
+
+/// skipBody's own preparse of the body at `{`, for child (the function being
+/// parsed): on acceptance child becomes the stub at level and the parser is at
+/// the closing `}`; on a bail the parser is back at the `{`.
+effect fn preparseFill(s: &mut Parser<'_>, child: FunctionId, entry: LexerPosition, level: u16) -> bool
+  ! ParserStackOverflow | LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let saved = s.save()
+  // One preparse serves every body of the parse: only its tables' contents
+  // change between bodies.
+  let mut boxed = match Intrinsic.replace(s.preparser, Option<Box<Preparse>>.none()) {
+    Option<Box<Preparse>>.Some { value } => move value
+    _ => run Box<Preparse>.make(Preparse.withTables(Intrinsic.replace(s.preparseTables, PreparseTables.make())))
+  }
+  let pre = &mut boxed.getMut()[0]
+  pre.restart()
+  s.synchronize()
+  s.lexer.skipValues = true
+  run s.lexer.holdEmpty()
+  let outcome = run Effect.result(preparse.body(&mut s, &mut pre))
+  s.lexer.skipValues = false
+  let accepted = match move outcome {
+    Result<bool, ParserStackOverflow | LexError | BigIntError | OutOfMemoryError | StringLengthError>.Success { value } => value
+    Result<bool, ParserStackOverflow | LexError | BigIntError | OutOfMemoryError | StringLengthError>.Failure { error } => { drop error false }
+  }
+  if !accepted {
+    pre.release(&mut s)
+    pre.clearTables()
+    drop pre
+    s.preparser = Option<Box<Preparse>>.some(move boxed)
+    run s.seek(saved)
+    return false
+  }
+  let mut free = BoxList<LazyName>.make()
+  run free.reserveExact(pre.free.length())
+  let mut i: usize = 0
+  while i < pre.free.length() {
+    let name = pre.free.get(i)
+    let mut depth = name.depth if depth > 255 { depth = 255 }
+    run free.append(LazyName { name: name.name, depth: i32.toU8(depth) })
+    i = i + 1
+  }
+  let skips = run PairList<LazyBody, LazyName>.copied(pre.bodies.asSlice(), pre.bodyFree.asSlice())
+  // The stub owns its own references to these names.
+  let rt = s.runtimeState()
+  let held = skips.second()
+  i = 0
+  while i < held.length { drop rt.atoms.duplicate(held[i].name) i = i + 1 }
+  drop rt
+  pre.release(&mut s)
+  pre.clearTables()
+  drop pre
+  s.preparser = Option<Box<Preparse>>.some(move boxed)
+  holdFree(&mut s, &free)
+  let fd = s.functionAtMut(child)
+  fd.lazy = true fd.lazyFree = move free fd.lazySkips = move skips
+  fd.lazyLevel = level fd.lazyFreeHeld = true
+  fd.lazyEntry = entry.offset fd.lazyEntryLineFeed = entry.gotLineFeed
+  drop fd
+  recycleStubCode(&mut s, child)
+  return true
+}
+
+/// The index in s.skips of the body whose `{` is at offset, or -1.
+fn recordAt(s: &Parser<'_>, offset: usize) -> i32 {
+  let mut low: usize = 0 let mut high = s.skips.length()
+  while low < high {
+    let middle = (low + high) / 2
+    let at = s.skips.get(middle).bodyStart
+    if at == offset { return usize.toI32(middle) }
+    if at < offset { low = middle + 1 } else { high = middle }
+  }
+  return -1
+}
+
+/// skipBody from a record: the free names it lists, then the closing `}`;
+/// child keeps the records of the bodies inside it.
+effect fn skipKnown(s: &mut Parser<'_>, child: FunctionId, entry: LexerPosition, index: usize) -> ()
+  ! ParserStackOverflow | LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let record = s.skips.get(index)
+  let level = scope(&s.*)
+  let mut free = BoxList<LazyName>.make()
+  run free.reserveExact(u32.toUsize(record.freeCount))
+  let mut i = u32.toUsize(record.freeStart)
+  while i < u32.toUsize(record.freeStart + record.freeCount) {
+    let name = s.skipFree.get(i)
+    run free.append(name)
+    i = i + 1
+  }
+  // Records are in source order: the ones inside follow it.
+  let mut last = index + 1 let mut nameCount: usize = 0
+  while last < s.skips.length() && s.skips.get(last).bodyStart < record.end { nameCount = nameCount + u32.toUsize(s.skips.get(last).freeCount) last = last + 1 }
+  let mut skips = run PairList<LazyBody, LazyName>.filled(last - index - 1, nameCount, record, LazyName { name: 0, depth: 0 })
+  let mut at: usize = 0
+  let mut next = index + 1
+  while next < last {
+    let mut inner = s.skips.get(next)
+    let from = u32.toUsize(inner.freeStart)
+    inner.freeStart = usize.toU32(at)
+    let mut j = from
+    while j < from + u32.toUsize(inner.freeCount) { skips.setSecond(at, s.skipFree.get(j)) at = at + 1 j = j + 1 }
+    skips.setFirst(next - index - 1, inner)
+    next = next + 1
+  }
+  // The stub owns its own references to these names.
+  let rt = s.runtimeState()
+  let held = skips.second()
+  i = 0
+  while i < held.length { drop rt.atoms.duplicate(held[i].name) i = i + 1 }
+  drop rt
+  holdFree(&mut s, &free)
+  let fd = s.functionAtMut(child)
+  fd.lazy = true fd.lazyFree = move free fd.lazySkips = move skips
+  fd.lazyLevel = level fd.lazyFreeHeld = true
+  fd.lazyEntry = entry.offset fd.lazyEntryLineFeed = entry.gotLineFeed
+  drop fd
+  recycleStubCode(&mut s, child)
+  run s.seek(LexerPosition { offset: record.end, gotLineFeed: record.endLineFeed })
+}
+
+/// skipBody from a helper's job: skipKnown over its records, whose names are
+/// source spans to intern here.
+/// Without seek (at the join) the records must end where the parser skipped
+/// to (job.end): false when they do not.
+effect fn skipPooled(s: &mut Parser<'_>, child: FunctionId, entry: LexerPosition, level: u16, job: PoolJob, seek: bool) -> bool
+  ! ParserStackOverflow | LexError | BigIntError | OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let anchor = ()
+  let bodies = unsafe Pointer.borrowMany<(), LazyBody>(&anchor, unsafe Intrinsic.pointerRequalify<?[*]const LazyBody, [*]const LazyBody>(job.bodies), job.bodyCount)
+  let names = unsafe Pointer.borrowMany<(), SpanName>(&anchor, unsafe Intrinsic.pointerRequalify<?[*]const SpanName, [*]const SpanName>(job.names), job.nameCount)
+  let record = bodies[0]
+  if !seek && record.end != job.end { return false }
+  let mut free = BoxList<LazyName>.make()
+  run free.reserveExact(u32.toUsize(record.freeCount))
+  let mut i = u32.toUsize(record.freeStart)
+  while i < u32.toUsize(record.freeStart + record.freeCount) {
+    let name = names[i]
+    let atom = run s.spanAtom(u32.toUsize(name.start), u32.toUsize(name.length))
+    run free.append(LazyName { name: atom, depth: name.depth })
+    i = i + 1
+  }
+  let mut nameCount: usize = 0
+  let mut next: usize = 1
+  while next < bodies.length { nameCount = nameCount + u32.toUsize(bodies[next].freeCount) next = next + 1 }
+  let mut skips = run PairList<LazyBody, LazyName>.filled(bodies.length - 1, nameCount, record, LazyName { name: 0, depth: 0 })
+  let mut at: usize = 0
+  next = 1
+  while next < bodies.length {
+    let mut body = bodies[next]
+    let from = u32.toUsize(body.freeStart)
+    body.freeStart = usize.toU32(at)
+    let mut j = from
+    while j < from + u32.toUsize(body.freeCount) {
+      let name = names[j]
+      let atom = run s.spanAtom(u32.toUsize(name.start), u32.toUsize(name.length))
+      // The stub owns its own references to these names.
+      let rt = s.runtimeState()
+      skips.setSecond(at, LazyName { name: rt.atoms.duplicate(atom), depth: name.depth })
+      at = at + 1 j = j + 1
+    }
+    skips.setFirst(next - 1, body)
+    next = next + 1
+  }
+  holdFree(&mut s, &free)
+  let fd = s.functionAtMut(child)
+  fd.lazy = true fd.lazyFree = move free fd.lazySkips = move skips
+  fd.lazyLevel = level fd.lazyFreeHeld = true
+  fd.lazyEntry = entry.offset fd.lazyEntryLineFeed = entry.gotLineFeed
+  drop fd
+  recycleStubCode(&mut s, child)
+  if seek { run s.seek(LexerPosition { offset: record.end, gotLineFeed: record.endLineFeed }) }
+  return true
+}
+
+/// Completes the stubs skipBody left for after the parse (js_preparse_pool's
+/// Deferred): helpers' records when they finished, else this thread's own
+/// preparse, or (when that bails) the body parsed in full. Returns true when a
+/// scanned end turns out wrong: the parse then went past the wrong bytes and
+/// must start over without the scanner.
+pub effect fn joinDeferred<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'_>, hooks: &mut H, memory: &AllocationObserver) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException ? &mut Allocator {
+  let count = pool.deferredCount(&s.*)
+  if count == 0 { return false }
+  let root = s.functionCell()
+  if pool.local(&s.*) {
+    // From the last: a body's stub is complete before its parent's.
+    let mut k = count
+    while k > 0 {
+      k = k - 1
+      let deferred = pool.deferredAt(&s.*, k)
+      if !run completeHere(&mut s, &mut hooks, memory, deferred) { s.enterFunction(root) return true }
+    }
+    s.enterFunction(root)
+    return false
+  }
+  // Helpers start no job the parse did not leave.
+  let jobs = pool.jobCount(&s.*)
+  let mut wanted = List<bool>.make()
+  run wanted.appendRepeated(false, jobs)
+  let mut i: usize = 0
+  while i < count { wanted.set(pool.deferredAt(&s.*, i).job, true) i = i + 1 }
+  i = 0
+  while i < jobs { if !wanted.get(i) { pool.cancelJob(&s.*, i) } i = i + 1 }
+  // The ones nobody started, here and from the last (helpers go from the
+  // first); then the ones a helper had started.
+  let mut started = List<usize>.make()
+  i = count
+  while i > 0 {
+    i = i - 1
+    let deferred = pool.deferredAt(&s.*, i)
+    if pool.claim(&s.*, deferred.job) {
+      let complete = run completeHere(&mut s, &mut hooks, memory, deferred)
+      pool.release(&s.*, deferred.job)
+      if !complete { s.enterFunction(root) return true }
+    } else { run started.append(i) }
+  }
+  i = 0
+  while i < started.length() {
+    let deferred = pool.deferredAt(&s.*, started.get(i))
+    let mut complete = false
+    if pool.settled(&s.*, deferred.job) == pool.DONE {
+      pool.countHit(&s.*)
+      let job = pool.job(&s.*, deferred.job)
+      complete = run skipPooled(&mut s, deferred.child, deferred.entry, deferred.level, job, false)
+    } else {
+      complete = run completeHere(&mut s, &mut hooks, memory, deferred)
+    }
+    if !complete { s.enterFunction(root) return true }
+    i = i + 1
+  }
+  s.enterFunction(root)
+  return false
+}
+
+/// joinDeferred on this thread: preparse the body, or parse it in full. False
+/// when its `}` is not the scanned one.
+effect fn completeHere<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'_>, hooks: &mut H, memory: &AllocationObserver, deferred: Deferred) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException ? &mut Allocator {
+  s.enterFunction(deferred.child)
+  s.seekBrace(LexerPosition { offset: deferred.bodyStart, gotLineFeed: false })
+  if run preparseFill(&mut s, deferred.child, deferred.entry, deferred.level) { return s.token.start == deferred.end }
+  // Its children parse in full too: skipping them now would leave stubs after the join.
+  let fd = s.functionAtMut(deferred.child) fd.lazyVerified = false
+  let elided = fd.lazyScopeElided let bodyScope = fd.bodyScope
+  fd.lazyScopeElided = false drop fd
+  // skipBody gave its code (the body scope's enter_scope) to the next function.
+  if elided {
+    run support.emitOpU16(&mut s, op.OP_enter_scope, i32.toU16(bodyScope))
+  }
+  run s.expect(123)
+  run parseDirectives(&mut s)
+  run checkNames(&mut s, deferred.name)
+  let _block = run statements.pushBreakEntry(&mut s, 0, -1, -1, 0)
+  while s.token.kind != 125 {
+    run modules.parseSourceElement(&mut s, &mut hooks, memory)
+  }
+  run statements.popBreakEntry(&mut s)
+  if s.token.start != deferred.end { return false }
+  if support.isLiveCode(&s.*) { run statements.emitReturn(&mut s, false) }
+  return true
+}
+
+pub effect fn parseFunction<H: HeapHooks + ModuleAttributeHooks>(s: &mut Parser<'_>, hooks: &mut H,
+    memory: &AllocationObserver, functionType: ParseFunctionKind, functionKind: FunctionKind,
+    borrowedName: u32, sourceStart: Option<usize>, exportKind: ParseExportKind) -> FunctionId
+  ! OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException ? &mut Allocator {
+  let parent = s.functionCell()
+  let outcome = run Effect.result(parseFunctionInner(&mut s, &mut hooks, memory,
+    functionType, functionKind, borrowedName, move sourceStart, exportKind, true))
+  s.enterFunction(parent)
+  return match move outcome {
+    Result<FunctionId, OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException>.Success { value } => value
+    Result<FunctionId, OutOfMemoryError | StringLengthError | BigIntError | LexError | SyntaxError | ParserStackOverflow | CompilerError | JsException>.Failure { error } => { fail move error }
+  }
+}

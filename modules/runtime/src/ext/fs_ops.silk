@@ -1,0 +1,284 @@
+//! The file system operations of `fs` and `fs/promises`, as plain data and one blocking call each.
+//!
+//! [`execute`] runs a [`Call`] with `silk.platform.native.file` and writes an [`Outcome`]. It
+//! touches no JS state and allocates only from the system allocator, so a blocking worker thread
+//! can run it. The loop thread turns the outcome into JS values with [`value`].
+//!
+//! Codes follow libuv on Unix: 0 for success and the negated `errno` for a failure.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.core.order { Order, Ordering }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.mem.pointer { Pointer }
+import silk.num.f64
+import silk.num.i32
+import silk.num.i64
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.platform.native.file {
+  CopyMethod, DirectoryEntry, FileStatus, NativeFile, NativeFileError, Timestamp, VolumeStatus,
+  OPEN_CLOSE_ON_EXEC, OPEN_WRITE_ONLY,
+}
+import silkjs.js_owned_value { Value }
+import silkjs.js_realm { lendRealm }
+import silkjs.js_engine { Engine }
+import silkjs.js_engine_host { EngineServices }
+import silkjs.js_heap { HeapHeader }
+import silkjs.js_value { ValueBits }
+import silkjs.js_exceptions { JsException }
+import silkjs.js_std_support as text
+import libs.core.owners as owners
+import libs.core.common as common
+import ext.uv_fs { UvStat, UvStatfs, UvTimespec }
+import ext.fs_native as fs
+
+pub const STAT: i32 = 1
+pub const LSTAT: i32 = 2
+pub const FSTAT: i32 = 3
+pub const STATFS: i32 = 4
+pub const OPEN: i32 = 5
+pub const CLOSE: i32 = 6
+pub const FSYNC: i32 = 7
+pub const FDATASYNC: i32 = 8
+pub const ACCESS: i32 = 9
+pub const MKDIR: i32 = 10
+pub const CHMOD: i32 = 11
+pub const FCHMOD: i32 = 12
+pub const LCHMOD: i32 = 13
+pub const CHOWN: i32 = 14
+pub const LCHOWN: i32 = 15
+pub const FCHOWN: i32 = 16
+pub const UNLINK: i32 = 17
+pub const RMDIR: i32 = 18
+pub const RENAME: i32 = 19
+pub const LINK: i32 = 20
+pub const SYMLINK: i32 = 21
+pub const COPYFILE: i32 = 22
+pub const READLINK: i32 = 23
+pub const REALPATH: i32 = 24
+pub const MKDTEMP: i32 = 25
+pub const SCANDIR: i32 = 26
+pub const FTRUNCATE: i32 = 27
+pub const READ: i32 = 28
+pub const WRITE: i32 = 29
+pub const UTIMES: i32 = 30
+pub const LUTIMES: i32 = 31
+pub const FUTIMES: i32 = 32
+pub const TRUNCATE: i32 = 33
+
+fn equal(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length { return false }
+  let mut i: usize = 0 while i < a.length { if a[i] != b[i] { return false } i = i + 1 } return true
+}
+
+/// The operation code of a Node binding name, or 0 for a name this module does not run.
+pub fn code(name: &[u8]) -> i32 {
+  let names: [&[u8]; 33] = [b"stat", b"lstat", b"fstat", b"statfs", b"open", b"close", b"fsync", b"fdatasync", b"access", b"mkdir", b"chmod", b"fchmod", b"lchmod", b"chown", b"lchown", b"fchown", b"unlink", b"rmdir", b"rename", b"link", b"symlink", b"copyFile", b"readlink", b"realpath", b"mkdtemp", b"scandir", b"ftruncate", b"read", b"write", b"utimes", b"lutimes", b"futimes", b"truncate"]
+  let mut index: usize = 0
+  while index < 33 { if equal(names[index], name) { return usize.toI32(index) + 1 } index = index + 1 }
+  return 0
+}
+
+/// Whether `op` takes a descriptor in place of a path.
+pub fn takesDescriptor(op: i32) -> bool {
+  return op == FSTAT || op == CLOSE || op == FSYNC || op == FDATASYNC || op == FCHMOD || op == FCHOWN || op == FTRUNCATE || op == READ || op == WRITE || op == FUTIMES
+}
+
+/// Whether `op` takes a second path.
+pub fn takesDestination(op: i32) -> bool { return op == RENAME || op == LINK || op == SYMLINK || op == COPYFILE }
+
+/// One operation and its arguments. Paths hold no final zero byte. `a` and `b` are the integer
+/// arguments: flags and mode for open, the mode, user and group, a length, or copy flags.
+pub struct Call {
+  pub op: i32, pub path: List<u8>, pub dest: List<u8>, pub fd: i32, pub a: i64, pub b: i64,
+  pub atime: f64, pub mtime: f64, pub buffer: ?*mut u8, pub length: usize, pub position: i64,
+}
+
+pub fn call(op: i32) -> Call {
+  return Call { op: op, path: List<u8>.make(), dest: List<u8>.make(), fd: -1, a: 0, b: 0, atime: 0.0, mtime: 0.0, buffer: Pointer.null<u8>(), length: 0, position: -1 }
+}
+
+struct Name { bytes: List<u8> }
+fn compareNames(left: &Name, right: &Name) -> Ordering {
+  let a = left.bytes.asSlice() let b = right.bytes.asSlice()
+  let mut index: usize = 0
+  while index < a.length && index < b.length {
+    if a[index] < b[index] { return Ordering.Less }
+    if a[index] > b[index] { return Ordering.Greater }
+    index = index + 1
+  }
+  if a.length < b.length { return Ordering.Less }
+  if a.length > b.length { return Ordering.Greater }
+  return Ordering.Equal
+}
+impl Order for Name { compare: compareNames }
+
+/// The result of one call. `count` is the descriptor of an open or the bytes of a read or write.
+/// `text` is a path result. `names` are the entries of a scan, in byte order without `.` and `..`.
+pub struct Outcome { pub code: i32, pub count: i64, pub status: FileStatus, pub volume: VolumeStatus, pub text: List<u8>, names: List<Name> }
+
+pub fn outcome() -> Outcome {
+  let zero = Timestamp { seconds: 0, nanoseconds: 0 }
+  return Outcome {
+    code: 0, count: 0,
+    status: FileStatus { device: 0, inode: 0, mode: 0, links: 0, user: 0, group: 0, specialDevice: 0, size: 0, blockSize: 0, blocks: 0, flags: 0, generation: 0, accessed: zero, modified: zero, changed: zero, born: zero },
+    volume: VolumeStatus { kind: 0, blockSize: 0, blocks: 0, freeBlocks: 0, availableBlocks: 0, files: 0, freeFiles: 0 },
+    text: List<u8>.make(), names: List<Name>.make(),
+  }
+}
+
+fn timestamp(seconds: f64) -> Timestamp {
+  let whole = f64.floor(seconds)
+  let mut nanoseconds = f64.toI64((seconds - whole) * 1000000000.0)
+  if nanoseconds < 0 { nanoseconds = 0 } if nanoseconds > 999999999 { nanoseconds = 999999999 }
+  return Timestamp { seconds: f64.toI64(whole), nanoseconds: i64.toU32(nanoseconds) }
+}
+
+// The uid_t and gid_t that leave an owner unchanged.
+fn owner(value: i64) -> u32 { if value < 0 { return 4294967295 } return i64.toU32(value) }
+
+effect fn scan(path: &[u8], out: &mut Outcome) -> () ! NativeFileError | OutOfMemoryError ? &mut Allocator {
+  let mut directory = run NativeFile.openDirectory(path)
+  let mut name: [u8; 1024] = [0; 1024]
+  while true {
+    let next = run Effect.result(directory.next(&mut name))
+    let entry = match move next {
+      Result<Option<DirectoryEntry>, NativeFileError>.Success { value } => move value
+      Result<Option<DirectoryEntry>, NativeFileError>.Failure { error } => { let _closed = run Effect.result(directory.close()) fail move error }
+    }
+    let found = match move entry { Option<DirectoryEntry>.Some { value } => move value Option<DirectoryEntry>.None => { break } }
+    let bytes = Slice.view<u8>(&name, 0, found.length)
+    if equal(bytes, b".") || equal(bytes, b"..") { continue }
+    let mut copy = List<u8>.make()
+    run copy.reserveExact(found.length)
+    let mut index: usize = 0 while index < found.length { run copy.append(bytes[index]) index = index + 1 }
+    run out.names.append(Name { bytes: move copy })
+  }
+  run directory.close()
+  // libuv's scandir sorts with strcmp, and Node's readdir order depends on it.
+  run out.names.sort()
+}
+
+effect fn copyText(out: &mut Outcome, bytes: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  run out.text.reserveExact(bytes.length)
+  let mut index: usize = 0 while index < bytes.length { run out.text.append(bytes[index]) index = index + 1 }
+}
+
+unsafe effect fn perform(call: &Call, out: &mut Outcome) -> () ! NativeFileError | OutOfMemoryError ? &mut Allocator {
+  let op = call.op let path = call.path.asSlice() let dest = call.dest.asSlice()
+  if op == STAT || op == LSTAT { out.status = run NativeFile.status(path, op == STAT) return () }
+  if op == FSTAT { out.status = run NativeFile.statusOf(call.fd) return () }
+  if op == STATFS { out.volume = run NativeFile.volumeStatus(path) return () }
+  if op == OPEN { out.count = i32.toI64(run NativeFile.open(path, i64.toI32(call.a) | OPEN_CLOSE_ON_EXEC, i64.toU32(call.b & 65535))) return () }
+  if op == CLOSE { return run NativeFile.close(call.fd) }
+  if op == FSYNC || op == FDATASYNC { return run NativeFile.synchronize(call.fd, op == FDATASYNC) }
+  if op == ACCESS { return run NativeFile.access(path, i64.toI32(call.a)) }
+  if op == MKDIR { return run NativeFile.makeDirectory(path, i64.toU32(call.a & 65535)) }
+  if op == CHMOD || op == LCHMOD { return run NativeFile.changeMode(path, i64.toU32(call.a & 65535), op == CHMOD) }
+  if op == FCHMOD { return run NativeFile.changeModeOf(call.fd, i64.toU32(call.a & 65535)) }
+  if op == CHOWN || op == LCHOWN { return run NativeFile.changeOwner(path, owner(call.a), owner(call.b), op == CHOWN) }
+  if op == FCHOWN { return run NativeFile.changeOwnerOf(call.fd, owner(call.a), owner(call.b)) }
+  if op == UNLINK { return run NativeFile.remove(path) }
+  if op == RMDIR { return run NativeFile.removeDirectory(path) }
+  if op == RENAME { return run NativeFile.rename(path, dest) }
+  if op == LINK { return run NativeFile.link(path, dest) }
+  if op == SYMLINK { return run NativeFile.symbolicLink(path, dest) }
+  if op == COPYFILE {
+    // UV_FS_COPYFILE_EXCL is 1, FICLONE is 2 and FICLONE_FORCE is 4.
+    let flags = call.b
+    let method = if (flags & 4) != 0 { CopyMethod.Clone } else if (flags & 2) != 0 { CopyMethod.CloneOrBytes } else { CopyMethod.Bytes }
+    return run NativeFile.copy(path, dest, (flags & 1) != 0, method)
+  }
+  if op == READLINK || op == REALPATH || op == MKDTEMP {
+    let mut output: [u8; 4096] = [0; 4096]
+    let mut length: usize = 0
+    if op == READLINK { length = run NativeFile.readLink(path, &mut output) }
+    else if op == REALPATH { length = run NativeFile.realPath(path, &mut output) }
+    else { length = run NativeFile.makeTemporaryDirectory(path, &mut output) }
+    return run copyText(&mut out, Slice.view<u8>(&output, 0, length))
+  }
+  if op == SCANDIR { return run scan(path, &mut out) }
+  if op == FTRUNCATE { return run NativeFile.truncateOf(call.fd, i64.toU64(call.a)) }
+  if op == TRUNCATE {
+    let fd = run NativeFile.open(path, OPEN_WRITE_ONLY | OPEN_CLOSE_ON_EXEC, 0)
+    let truncated = run Effect.result(NativeFile.truncateOf(fd, i64.toU64(call.a)))
+    let closed = run Effect.result(NativeFile.close(fd))
+    match move truncated { Result<(), NativeFileError>.Success { .. } => () Result<(), NativeFileError>.Failure { error } => { fail move error } }
+    match move closed { Result<(), NativeFileError>.Success { .. } => () Result<(), NativeFileError>.Failure { error } => { fail move error } }
+    return ()
+  }
+  if op == READ || op == WRITE {
+    let position = if call.position < 0 { Option<u64>.none() } else { Option<u64>.some(i64.toU64(call.position)) }
+    if call.length == 0 { out.count = 0 return () }
+    let base = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(call.buffer)
+    let mut anchor = ()
+    if op == READ {
+      let bytes = unsafe Pointer.borrowManyMut<(), u8>(&mut anchor, unsafe Pointer.assumeManyMut<u8>(base), call.length)
+      out.count = usize.toI64(run NativeFile.read(call.fd, move bytes, position))
+    } else {
+      let bytes = unsafe Pointer.borrowMany<(), u8>(&anchor, unsafe Pointer.assumeMany<u8>(base), call.length)
+      out.count = usize.toI64(run NativeFile.write(call.fd, bytes, position))
+    }
+    return ()
+  }
+  if op == UTIMES || op == LUTIMES { return run NativeFile.setTimes(path, timestamp(call.atime), timestamp(call.mtime), op == UTIMES) }
+  if op == FUTIMES { return run NativeFile.setTimesOf(call.fd, timestamp(call.atime), timestamp(call.mtime)) }
+  // ENOSYS for an operation this module does not run.
+  static if Intrinsic.targetOperatingSystem() == "darwin" { out.code = -78 } else { out.code = -38 }
+}
+
+/// Runs `call` and writes its result to `out`. It blocks, and it is safe on any thread.
+pub unsafe fn execute(call: &Call, out: &mut Outcome) -> () {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let result = run Effect.result(unsafe perform(&call, &mut out)) |> Effect.provideMut<Allocator>(&mut allocator)
+  match move result {
+    Result<(), NativeFileError | OutOfMemoryError>.Success { .. } => ()
+    Result<(), NativeFileError | OutOfMemoryError>.Failure { error } => {
+      out.code = match move error {
+        NativeFileError failure => -failure.code
+        OutOfMemoryError _ => -12
+      }
+    }
+  }
+}
+
+fn timespec(time: Timestamp) -> UvTimespec { return UvTimespec { tv_sec: i64.toIsize(time.seconds), tv_nsec: u32.toIsize(time.nanoseconds) } }
+
+/// The JS value of a successful `out`: a stats record, a path, a list of names, a count, or
+/// undefined. The value is owned by the caller.
+pub unsafe effect fn value<'m, S: EngineServices>(engine: &mut Engine<'m, S>, context: *mut HeapHeader, op: i32, out: &Outcome, bigint: bool) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  if op == STAT || op == LSTAT || op == FSTAT {
+    let s = out.status
+    let stat = UvStat {
+      st_dev: s.device, st_mode: u32.toU64(s.mode), st_nlink: s.links, st_uid: u32.toU64(s.user), st_gid: u32.toU64(s.group), st_rdev: s.specialDevice,
+      st_ino: s.inode, st_size: s.size, st_blksize: s.blockSize, st_blocks: s.blocks, st_flags: u32.toU64(s.flags), st_gen: u32.toU64(s.generation),
+      st_atim: timespec(s.accessed), st_mtim: timespec(s.modified), st_ctim: timespec(s.changed), st_birthtim: timespec(s.born),
+    }
+    return run unsafe fs.statValue(&mut engine, context, &stat, bigint)
+  }
+  if op == STATFS {
+    let v = out.volume
+    let stat = UvStatfs { f_type: v.kind, f_bsize: v.blockSize, f_blocks: v.blocks, f_bfree: v.freeBlocks, f_bavail: v.availableBlocks, f_files: v.files, f_ffree: v.freeFiles, f_frsize: v.blockSize, f_spare: [0; 3] }
+    return run unsafe fs.statfsValue(&mut engine, context, &stat, bigint)
+  }
+  if op == READLINK || op == REALPATH || op == MKDTEMP { return (run text.string(&mut engine, unsafe lendRealm(&context, context), out.text.asSlice())).intoBits() }
+  if op == SCANDIR {
+    let memory = engine.memory let array = run unsafe common.array(&mut engine, memory, context)
+    let names = out.names.asSlice()
+    let mut index: usize = 0
+    while index < names.length {
+      let made = run Effect.result(text.string(&mut engine, unsafe lendRealm(&context, context), names[index].bytes.asSlice()))
+      let name = match move made { Result<Value, JsException>.Success { value } => move value Result<Value, JsException>.Failure { error } => { unsafe owners.release(&mut engine, context, array) fail move error } }
+      let defined = run Effect.result(unsafe common.defineIndex(&mut engine, context, array, usize.toU32(index), name.intoBits()))
+      match move defined { Result<(), JsException>.Success { .. } => () Result<(), JsException>.Failure { error } => { unsafe owners.release(&mut engine, context, array) fail move error } }
+      index = index + 1
+    }
+    return array
+  }
+  if op == OPEN || op == READ || op == WRITE { return ValueBits.number(i64.toF64(out.count)) }
+  return ValueBits.Undefined
+}

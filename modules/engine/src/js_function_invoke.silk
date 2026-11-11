@@ -1,0 +1,252 @@
+//! Native quickjs.c:41989-42100. Inputs are borrowed roots through every getter,
+//! coercion and call. Extracted arguments own references until synchronous dispatch
+//! returns; native scratch always allocates at least one slot, even for length 0.
+import js_realm { lendArguments, Realm }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.core.option { Option }
+import silk.mem.pointer { Pointer }
+import silk.num.i32
+import silk.num.i64
+import silk.num.usize
+import silk.num.u32
+import js_heap { HeapCell }
+import js_value { ValueBits }
+import js_owned_value { lendBits, ValueRef, Value }
+import js_core_types { ObjectData, ObjectPayload, ValueSlots, FrameSlots, NativeErrorKind, NativeFunctionId, BuiltinFamily, JS_MAX_LOCAL_VARS, emptyFrameSlots }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_call_host { CallHooks }
+import js_coercion_host { CoercionHooks }
+import js_integer_coercions as integers
+import js_var_refs as varRefs
+import js_vm_property_ops as property_ops
+import js_class_data as classes
+import js_atom_data as atoms
+import js_exceptions { JsException, exceptionValue }
+import js_string_types { StringLengthError }
+
+pub struct ArgumentList {
+  storage: ValueSlots,
+  count: usize
+}
+impl ArgumentList {
+  pub fn length(self: &Self) -> usize { return self.count }
+  // The returned view borrows this owner; never retain it beyond freeArgList.
+  pub fn view(self: &mut Self) -> FrameSlots {
+    return FrameSlots { data: self.storage.address(0), count: self.count }
+  }
+}
+effect fn materialize<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
+  error: OutOfMemoryError | StringLengthError | JsException) -> ValueBits ! JsException ? &mut Allocator {
+  match move error {
+    OutOfMemoryError _allocation => { return run hooks.throwOutOfMemory(realm) }
+    StringLengthError _length => { return run hooks.throwError(realm, NativeErrorKind.Internal, b"string too long") }
+    JsException signal => { fail move signal }
+  }
+}
+pub fn freeArgList<'a, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>, arguments: ArgumentList) -> () {
+  let rt = realm.runtime()
+  let mut i: usize = 0
+  while i < arguments.count { unsafe gc.release(&mut hooks, rt, arguments.storage.get(i)) i = i + 1 }
+}
+pub effect fn getLength64<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, output: &mut i64, object: ValueRef<'b>) -> ()
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  // An ordinary data length (arrays, arguments, plain objects) reads straight
+  // from the shape; getters, proxies and other exotic lookups take the full get.
+  match object.view() {
+    ValueBits.Object { reference } => {
+      let mut found = ValueBits.Undefined
+      if unsafe property_ops.readField(reference, atoms.JS_ATOM_length, Pointer.fromMutRef<ValueBits>(&mut found)) {
+        match found {
+          ValueBits.Int { value } => {
+            if value < 0 { output.* = 0 } else { output.* = i32.toI64(value) }
+            return ()
+          }
+          _ => { return run integers.toLengthFree(&mut hooks, realm, &mut output, unsafe Value.adoptBits(found)) }
+        }
+      }
+    }
+    _ => ()
+  }
+  let fetched = run Effect.result(hooks.getProperty(realm, object, atoms.JS_ATOM_length))
+  let value = match move fetched {
+    Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => { output.* = 0 fail move error }
+  }
+  run integers.toLengthFree(&mut hooks, realm, &mut output, unsafe Value.adoptBits(value))
+}
+pub effect fn buildArgList<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, array: ValueRef<'b>) -> ArgumentList ! JsException ? &mut Allocator {
+  // Preserve the logical length separately from capacity (the zero-length case
+  // still allocates). Read length exactly once, before touching dense storage.
+  let allocated = run Effect.result(prepare(&mut hooks, realm, array))
+  let mut arguments = match move allocated {
+    Result<ArgumentList, OutOfMemoryError | StringLengthError | JsException>.Success { value } => move value
+    Result<ArgumentList, OutOfMemoryError | StringLengthError | JsException>.Failure { error } => {
+      let _pending = run materialize(&mut hooks, realm, move error)
+      fail JsException {}
+    }
+  }
+  let length = arguments.count arguments.count = 0
+  let filled = run Effect.result(fill(&mut hooks, realm, array, &mut arguments, length))
+  match move filled {
+    Result<(), OutOfMemoryError | JsException>.Success { .. } => { return move arguments }
+    Result<(), OutOfMemoryError | JsException>.Failure { error } => {
+      let _pending = run Effect.catch<JsException>(materialize(&mut hooks, realm, move error), exceptionValue)
+      freeArgList(&mut hooks, realm, move arguments)
+      fail JsException {}
+    }
+  }
+}
+effect fn prepare<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, array: ValueRef<'b>) -> ArgumentList
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  if !array.view().isObject() { return run hooks.throwError(realm, NativeErrorKind.Type, b"not a object") }
+  let mut length: i64 = 0
+  run getLength64(&mut hooks, realm, &mut length, array)
+  if length > usize.toI64(JS_MAX_LOCAL_VARS) {
+    return run hooks.throwError(realm, NativeErrorKind.Range, b"too many arguments in function call (only 65534 allowed)")
+  }
+  let count = i64.toUsize(length)
+  let mut capacity = count if capacity == 0 { capacity = 1 }
+  return ArgumentList { storage: run ValueSlots.make(capacity), count: count }
+}
+effect fn fill<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
+  array: ValueRef<'b>, arguments: &mut ArgumentList, length: usize) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  let reference = match array.view() { ValueBits.Object { reference } => reference _ => Intrinsic.trap("QuickJS invariant violated") }
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+  if object.fastArray() && (object.classId() == classes.JS_CLASS_ARRAY || object.classId() == classes.JS_CLASS_ARGUMENTS || object.classId() == classes.JS_CLASS_MAPPED_ARGUMENTS) {
+    match &object.payload {
+      ObjectPayload.FastArray { array: dense } => {
+        if length == dense.values().length() {
+          while arguments.count < length {
+            let _previous = arguments.storage.replace(arguments.count, unsafe dense.values().get(arguments.count).retained())
+            arguments.count = arguments.count + 1
+          }
+          return ()
+        }
+      }
+      ObjectPayload.MappedArguments { arguments: mapped } => {
+        if length == mapped.varRefs.length() {
+          while arguments.count < length {
+            let value = unsafe varRefs.read(mapped.varRefs.get(arguments.count))
+            let _previous = arguments.storage.replace(arguments.count, unsafe value.retained())
+            arguments.count = arguments.count + 1
+          }
+          return ()
+        }
+      }
+      _ => ()
+    }
+  }
+  drop object
+  while arguments.count < length {
+    // All indices are below JS_MAX_LOCAL_VARS, hence immediate uint32 atoms:
+    // this is exactly GetPropertyUint32 without temporary key allocation.
+    let value = run hooks.getProperty(realm, array, 0x80000000 | usize.toU32(arguments.count))
+    let _previous = arguments.storage.replace(arguments.count, value)
+    arguments.count = arguments.count + 1
+  }
+}
+/// Function.prototype.call's and apply's method numbers in the Function builtin family.
+pub const CALL_METHOD: u32 = 2
+pub const APPLY_METHOD: u32 = 3
+/// Whether function is the intrinsic Function.prototype.apply.
+@inlineAlways
+pub unsafe fn isApply(function: ValueBits) -> bool { return unsafe functionMethod(function) == APPLY_METHOD }
+/// Whether function is the intrinsic Function.prototype.call.
+@inlineAlways
+pub unsafe fn isCall(function: ValueBits) -> bool { return unsafe functionMethod(function) == CALL_METHOD }
+/// function's method number when it is one of the intrinsic Function.prototype
+/// methods (call, apply, ...), else u32.MAX.
+@inlineAlways
+pub unsafe fn functionMethod(function: ValueBits) -> u32 {
+  let reference = match function { ValueBits.Object { reference } => reference _ => { return u32.MAX } }
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+  if object.classId() != classes.JS_CLASS_C_FUNCTION { return u32.MAX }
+  return match &object.payload {
+    ObjectPayload.NativeFunction { function: native } => if native.magicBits != 0 { u32.MAX } else { match native.function {
+      NativeFunctionId.Builtin { family, method } => if family == BuiltinFamily.Function { method } else { u32.MAX }
+      _ => u32.MAX
+    } }
+    _ => u32.MAX
+  }
+}
+/// The arguments apply passes for array when collecting them runs no JS: a dense
+/// array or arguments object whose length property counts its storage, as in
+/// fill. Writes them unretained to buffer, which has room for capacity values,
+/// and returns their count; None when array is anything else or too long.
+pub unsafe fn denseArguments(array: ValueBits, buffer: *mut ValueBits, capacity: usize) -> Option<usize> {
+  let reference = match array { ValueBits.Object { reference } => reference _ => { return Option<usize>.none() } }
+  let mut found = ValueBits.Undefined
+  if !unsafe property_ops.readField(reference, atoms.JS_ATOM_length, Pointer.fromMutRef<ValueBits>(&mut found)) { return Option<usize>.none() }
+  let length = match found { ValueBits.Int { value } => value _ => -1 }
+  if length < 0 || i32.toUsize(length) > capacity { return Option<usize>.none() }
+  let count = i32.toUsize(length)
+  let anchor = () let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+  if !object.fastArray() { return Option<usize>.none() }
+  let class = object.classId()
+  if class != classes.JS_CLASS_ARRAY && class != classes.JS_CLASS_ARGUMENTS && class != classes.JS_CLASS_MAPPED_ARGUMENTS { return Option<usize>.none() }
+  let many = unsafe Pointer.assumeManyMut<ValueBits>(buffer)
+  let mut index: usize = 0
+  match &object.payload {
+    ObjectPayload.FastArray { array: dense } => {
+      if count != dense.values().length() { return Option<usize>.none() }
+      while index < count { unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(many, index), dense.values().get(index)) index = index + 1 }
+      return Option<usize>.some(count)
+    }
+    ObjectPayload.MappedArguments { arguments: mapped } => {
+      if count != mapped.varRefs.length() { return Option<usize>.none() }
+      while index < count { unsafe Pointer.write<ValueBits>(unsafe Pointer.atMut<ValueBits>(many, index), unsafe varRefs.read(mapped.varRefs.get(index))) index = index + 1 }
+      return Option<usize>.some(count)
+    }
+    _ => ()
+  }
+  return Option<usize>.none()
+}
+pub unsafe effect fn apply<'a, 'b, H: HeapHooks + CoercionHooks + CallHooks>(hooks: &mut H,realm: Realm<'a>, function: ValueRef<'b>, arguments: &FrameSlots, magic: i32) -> ValueBits ! JsException ? &mut Allocator {
+  if !hooks.isCallable(realm, function) { return run hooks.throwError(realm, NativeErrorKind.Type, b"not a function") }
+  let mut receiver = ValueBits.Undefined let mut array = ValueBits.Undefined
+  if arguments.length() > 0 { receiver = unsafe arguments.get(0) }
+  if arguments.length() > 1 { array = unsafe arguments.get(1) }
+  if (array.tag() == 2 || array.tag() == 3) && magic != 2 {
+    let empty = emptyFrameSlots()
+    let called = run Effect.result(hooks.callArguments(realm, function, unsafe lendBits(&receiver, receiver), unsafe lendArguments(&empty)))
+    return match move called {
+      Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value
+      Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => run materialize(&mut hooks, realm, move error)
+    }
+  }
+  let mut list = run buildArgList(&mut hooks, realm, unsafe lendBits(&array, array))
+  let slots = list.view()
+  let called = run Effect.result(unsafe dispatch(&mut hooks, realm, function, unsafe lendBits(&receiver, receiver), &slots, (magic & 1) != 0))
+  drop slots
+  // Materialize a native allocation error before releasing arguments, just as a
+  // failing JS_Call has already installed its pending exception in QuickJS.
+  match move called {
+    Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => {
+      freeArgList(&mut hooks, realm, move list) return value
+    }
+    Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => {
+      let _pending = run Effect.catch<JsException>(materialize(&mut hooks, realm, move error), exceptionValue)
+      freeArgList(&mut hooks, realm, move list) fail JsException {}
+    }
+  }
+}
+unsafe effect fn dispatch<'a, 'b, H: CallHooks>(hooks: &mut H, realm: Realm<'a>,
+  function: ValueRef<'b>, receiver: ValueRef<'b>, arguments: &FrameSlots, constructor: bool) -> ValueBits ! OutOfMemoryError | JsException ? &mut Allocator {
+  if constructor { return run hooks.construct(realm, function, receiver, unsafe lendArguments(arguments)) }
+  return run hooks.callArguments(realm, function, receiver, unsafe lendArguments(arguments))
+}
+pub unsafe effect fn call<'a, 'b, H: CoercionHooks + CallHooks>(hooks: &mut H, realm: Realm<'a>,
+  function: ValueRef<'b>, arguments: &FrameSlots) -> ValueBits ! JsException ? &mut Allocator {
+  let mut receiver = ValueBits.Undefined
+  if arguments.length() != 0 { receiver = unsafe arguments.get(0) }
+  let rest = arguments.after(1)
+  let called = run Effect.result(hooks.callArguments(realm, function, unsafe lendBits(&receiver, receiver), unsafe lendArguments(&rest)))
+  return match move called {
+    Result<ValueBits, OutOfMemoryError | JsException>.Success { value } => value
+    Result<ValueBits, OutOfMemoryError | JsException>.Failure { error } => run materialize(&mut hooks, realm, move error)
+  }
+}

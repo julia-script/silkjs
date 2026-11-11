@@ -1,0 +1,1424 @@
+//! Native property mutation, quickjs.c:9397-9538,9772-11028.
+//! Borrowed Define inputs are rooted across arbitrary callbacks. Set and the
+//! explicitly named consuming wrappers release owned inputs on EVERY outcome.
+//! false is the source 0 result; JsException is -1 with pending state preserved.
+import js_object_ref { ObjectRef }
+import js_realm { Realm, RuntimeRef, lendRuntime }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.pointer { Pointer }
+import silk.collections.slice { Slice }
+import silk.core.result { Result }
+import silk.num.f64
+import silk.num.i32
+import silk.num.i64
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+import js_core_types { ObjectData, ObjectPayload, ShapeData,
+  PropertySlot, SlotBits, PropertyDescriptor, VarRef, StackFrame, NativeFunctionId, ExoticCallbacks,
+  AutoInitKind, AutoInitOpaque, NativeErrorKind, JS_MODE_STRICT,
+  JS_PROP_CONFIGURABLE, JS_PROP_WRITABLE, JS_PROP_ENUMERABLE, JS_PROP_C_W_E,
+  JS_PROP_LENGTH, JS_PROP_TMASK, JS_PROP_GETSET, JS_PROP_VARREF, JS_PROP_AUTOINIT,
+  JS_PROP_HAS_SHIFT, JS_PROP_HAS_CONFIGURABLE, JS_PROP_HAS_WRITABLE,
+  JS_PROP_HAS_ENUMERABLE, JS_PROP_HAS_GET, JS_PROP_HAS_SET, JS_PROP_HAS_VALUE,
+  JS_PROP_THROW, JS_PROP_THROW_STRICT, JS_PROP_NO_EXOTIC,
+  EXOTIC_SET_PROPERTY, EXOTIC_GET_OWN_PROPERTY, EXOTIC_DEFINE_OWN_PROPERTY,
+  EXOTIC_DELETE_PROPERTY, EXOTIC_IS_EXTENSIBLE }
+import js_heap { HeapCell, HeapHeader }
+import js_owned_value { Value, lendBits, immediateRef, lendFor, ValueRef }
+import js_value { ValueBits }
+import js_atoms { AtomTable, ATOM_INTEGER_TAG }
+import js_atom_data as atoms
+import js_class_data as classes
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_shapes as shapes
+import js_shapes { FoundProperty }
+import js_array_storage as arrays
+import js_array_storage { StorageOutcome }
+import js_var_refs as varRefs
+import js_coercion_host { CoercionHooks }
+import js_property_host { OwnPropertyHooks, OwnPropertyResult }
+import js_property_write_host { PropertyWriteHooks }
+import js_property_descriptors as descriptors
+import js_coercions as coercions
+import js_integer_coercions as integers
+import js_debugger_restricted as restricted
+import js_typed_array_write as typed
+import js_prototypes as prototypes
+import js_primitives { EqualityMode }
+import js_primitives as primitives
+import js_parser_diagnostics { DiagnosticMessage }
+import js_strings { Strings, StringBuilder }
+import js_string_types { StringLengthError }
+import js_string_rope { stringWide }
+import js_bigint { BigIntError }
+import js_exceptions { JsException, exceptionValue }
+import js_invariant { invariant }
+import js_caught { FailedOom, failedOom, FailedJs, failedJs, FailedOomJs, failedOomJs, FailedOomLength, failedOomLength, Failed, failed }
+
+effect fn materialize<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
+  error: OutOfMemoryError | StringLengthError | BigIntError | JsException) -> ValueBits ! JsException ? &mut Allocator {
+  match move error {
+    OutOfMemoryError _allocation => { return run hooks.throwOutOfMemory(realm) }
+    StringLengthError _length => { return run hooks.throwError(realm, NativeErrorKind.Internal, b"string too long") }
+    BigIntError _impossible => invariant()
+    JsException signal => { fail move signal }
+  }
+}
+// Native allocation/coercion failures must become pending JavaScript exceptions
+// before consuming an operand whose last-owner finalizer can observe the runtime.
+effect fn settleMutation<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
+  result: Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>) -> Result<bool, JsException>
+  ? &mut Allocator {
+  return match move result {
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { value } => Result<bool, JsException>.Success { value: value }
+    Result<bool, OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => {
+      let _pending = run Effect.catch<JsException>(materialize(&mut hooks, realm, move error), exceptionValue)
+      return Result<bool, JsException>.Failure { error: JsException {} }
+    }
+  }
+}
+fn reference(value: ValueBits) -> *mut HeapHeader {
+  return match value { ValueBits.Object { reference } => reference _ => invariant() }
+}
+fn sameObject(a: ValueBits, b: ValueBits) -> bool {
+  return a.isObject() && b.isObject() && Pointer.address<HeapHeader>(reference(a)) == Pointer.address<HeapHeader>(reference(b))
+}
+fn duplicateAtom<'r>(rt: RuntimeRef<'r>, atom: u32) -> () {
+  let anchor = () let state = rt.state(&anchor)
+  let _owned = state.atoms.duplicate(atom)
+}
+pub unsafe fn releaseAtom(rt: *mut HeapHeader, atom: u32) -> () {
+  let anchor = () releaseHeldAtom(unsafe lendRuntime(&anchor, rt), atom)
+}
+fn releaseHeldAtom<'r>(rt: RuntimeRef<'r>, atom: u32) -> () {
+  let mut anchor = () let state = rt.stateMut(&mut anchor)
+  state.atoms.release(atom)
+}
+pub fn shouldThrow<'a>(realm: Realm<'a>, flags: u32) -> bool {
+  if (flags & JS_PROP_THROW) != 0 { return true }
+  if (flags & JS_PROP_THROW_STRICT) == 0 { return false }
+  let anchor = ()
+  let state = realm.runtimeState(&anchor)
+  return match Pointer.nonNullMut<StackFrame>(state.currentStackFrame) {
+    Option<*mut StackFrame>.Some { value } => {
+      let frame = unsafe Pointer.borrow<(), StackFrame>(&anchor, value)
+      return (frame.mode & u8.toU32(JS_MODE_STRICT)) != 0
+    }
+    Option<*mut StackFrame>.None => false
+  }
+}
+pub effect fn reject<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
+  flags: u32, message: &[u8]) -> bool ! JsException ? &mut Allocator {
+  if shouldThrow(realm, flags) { return run hooks.throwError(realm, NativeErrorKind.Type, message) }
+  return false
+}
+effect fn throwAtom<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
+  atom: u32, kind: NativeErrorKind, prefix: &[u8], suffix: &[u8]) -> never ! JsException ? &mut Allocator {
+  let mut message = DiagnosticMessage.make() message.append(prefix)
+  let anchor = () let state = realm.runtimeState(&anchor)
+  message.appendAtom(&state.atoms, atom) drop state message.append(suffix)
+  return run hooks.throwError(realm, kind, message.bytes())
+}
+effect fn readOnly<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
+  atom: u32, flags: u32) -> bool ! JsException ? &mut Allocator {
+  if shouldThrow(realm, flags) { return run throwAtom(&mut hooks, realm, atom, NativeErrorKind.Type, b"'", b"' is read-only") }
+  return false
+}
+fn classId<'o>(object: ObjectRef<'o>) -> u32 {
+  let anchor = () let object = object.data(&anchor)
+  return object.classId()
+}
+fn isTyped(id: u32) -> bool { return id >= classes.JS_CLASS_UINT8C_ARRAY && id <= classes.JS_CLASS_FLOAT64_ARRAY }
+fn method<'r, 'o>(rt: RuntimeRef<'r>, object: ObjectRef<'o>, mask: u16) -> Option<NativeFunctionId> {
+  let anchor = () let p = object.data(&anchor)
+  if !p.isExotic() { return Option<NativeFunctionId>.none() }
+  let id = p.classId() drop p
+  let state = rt.state(&anchor)
+  return match &state.classes.asSlice()[u32.toUsize(id)].exotic {
+    Option<ExoticCallbacks>.Some { value } => {
+      if (value.methodMask & mask) != 0 { return Option<NativeFunctionId>.some(value.descriptor) }
+      return Option<NativeFunctionId>.none()
+    }
+    Option<ExoticCallbacks>.None => Option<NativeFunctionId>.none()
+  }
+}
+fn numericIndex<'r>(rt: RuntimeRef<'r>, atom: u32) -> ValueBits {
+  let anchor = () let state = rt.state(&anchor)
+  return state.atoms.numericIndex(atom)
+}
+fn arrayIndex<'r>(rt: RuntimeRef<'r>, atom: u32) -> Option<u32> {
+  let anchor = () let state = rt.state(&anchor)
+  return state.atoms.arrayIndex(atom)
+}
+fn typedIndex<'r>(rt: RuntimeRef<'r>, atom: u32) -> Option<u64> {
+  let anchor = () let state = rt.state(&anchor)
+  return state.atoms.typedIndex(atom)
+}
+fn count<'o>(object: ObjectRef<'o>) -> u64 {
+  let anchor = () let p = object.data(&anchor)
+  return match &p.payload {
+    ObjectPayload.FastArray { array } => usize.toU64(array.values().length())
+    ObjectPayload.MappedArguments { arguments } => usize.toU64(arguments.varRefs.length())
+    ObjectPayload.TypedArray { array } => array.count
+    _ => 0
+  }
+}
+fn own<'o>(object: ObjectRef<'o>, atom: u32) -> Option<usize> {
+  let anchor = () let p = object.data(&anchor)
+  return unsafe shapes.lookup(p.shape, atom)
+}
+fn find<'o>(object: ObjectRef<'o>, atom: u32) -> Option<FoundProperty> {
+  let anchor = () let p = object.data(&anchor)
+  return unsafe shapes.find(p.shape, atom)
+}
+/// The slot at index, whose kind flags name.
+fn slotAs<'o>(object: ObjectRef<'o>, index: usize, flags: u8) -> PropertySlot {
+  let anchor = () let object = object.data(&anchor)
+  return object.slot(index).view(flags)
+}
+fn slot<'o>(object: ObjectRef<'o>, index: usize) -> PropertySlot {
+  let anchor = () let object = object.data(&anchor)
+  return object.slot(index).view(unsafe shapes.slotFlags(object.shape, index))
+}
+fn storedFlags<'o>(object: ObjectRef<'o>, index: usize) -> u32 {
+  let anchor = () let p = object.data(&anchor)
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, p.shape)
+  return u8.toU32(shape.properties.get(index).flags)
+}
+effect fn flags<'r, 'o>(rt: RuntimeRef<'r>, object: ObjectRef<'o>, index: usize, value: u32) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = () let p = object.dataMut(&mut anchor)
+  run unsafe shapes.updateFlags(rt.raw(), &mut p, index, u32.toU8(value))
+}
+/// Stores value at index and returns the slot it replaced, whose kind previousFlags
+/// names: callers may already have moved the shape flags to value's kind.
+/// An accessor's box is made beforehand (SlotBits.from), so the store cannot fail.
+fn put<'o>(object: ObjectRef<'o>, index: usize, stored: SlotBits, previousFlags: u32) -> PropertySlot {
+  let mut anchor = () let p = object.dataMut(&mut anchor)
+  let previous = unsafe p.slot(index).retire(u32.toU8(previousFlags & JS_PROP_TMASK)) p.setSlot(index, stored) return previous
+}
+fn invalidate<'r, 'o>(rt: RuntimeRef<'r>, held: ObjectRef<'o>, atom: u32) -> () {
+  let anchor = () let object = held.data(&anchor)
+  let standard = object.isStandardArrayPrototype() drop object
+  if !standard { return () }
+  if AtomTable.isInteger(atom) || match arrayIndex(rt, atom) { Option<u32>.Some { .. } => true Option<u32>.None => false } {
+    let mut anchor = () let p = held.dataMut(&mut anchor)
+    p.setIsStandardArrayPrototype(false)
+  }
+}
+// Incoming ownership transfers only on success. All finalizer-capable releases
+// happen after the replacement is published and all payload loans are dropped.
+effect fn add<'r, 'o, H: HeapHooks>(hooks: &mut H, rt: RuntimeRef<'r>, object: ObjectRef<'o>,
+  atom: u32, propertyFlags: u32, incoming: PropertySlot) -> () ! OutOfMemoryError ? &mut Allocator {
+  invalidate(rt, object, atom)
+  let stored = run SlotBits.from(incoming)
+  let mut anchor = () let p = object.dataMut(&mut anchor)
+  let made = run Effect.result(unsafe shapes.addProperty(rt.raw(), &mut p, atom, u32.toU8(propertyFlags)))
+  let added = match move made {
+    Result<shapes.AddResult, OutOfMemoryError>.Success { value } => move value
+    Result<shapes.AddResult, OutOfMemoryError>.Failure { error } => {
+      if (propertyFlags & JS_PROP_TMASK) == JS_PROP_GETSET { unsafe stored.discardBox() }
+      fail move error
+    }
+  }
+  p.setSlot(added.index, stored) drop p
+  match Pointer.nonNullMut<HeapHeader>(added.retiredShape) {
+    Option<*mut HeapHeader>.Some { value } => { unsafe gc.releaseHeader(&mut hooks, rt.raw(), value) }
+    Option<*mut HeapHeader>.None => ()
+  }
+}
+fn globalPending<'o>(object: ObjectRef<'o>) -> *mut HeapHeader {
+  let anchor = () let p = object.data(&anchor)
+  return match &p.payload { ObjectPayload.GlobalObject { global } => reference(global.uninitializedVariables) _ => invariant() }
+}
+/// define's change of the data, VarRef or lazy property at index into an accessor,
+/// made once the accessor's box exists: flags (and a global's binding) switch to
+/// the accessor. false when the property moved away meanwhile (define retries);
+/// an accessor previous needs nothing.
+effect fn toAccessor<'r, 'o, H: HeapHooks>(hooks: &mut H, rt: RuntimeRef<'r>, held: ObjectRef<'o>, node: *mut HeapHeader,
+  atom: u32, previous: PropertySlot, index: &mut usize, current: &mut u32) -> bool ! OutOfMemoryError ? &mut Allocator {
+  match previous { PropertySlot.GetterSetter { .. } => { return true } _ => () }
+  let mut anchor = () let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+  run unsafe shapes.prepareUpdate(rt.raw(), &mut p) drop p
+  if classId(held) == classes.JS_CLASS_GLOBAL_OBJECT {
+    match previous { PropertySlot.VarRef { reference } => { run unsafe retireGlobal(&mut hooks, rt, node, atom, reference) } _ => () }
+    index.* = match own(held, atom) { Option<usize>.Some { value: foundIndex } => foundIndex Option<usize>.None => { return false } }
+    match previous {
+      PropertySlot.VarRef { reference: oldCell } => {
+        if !sameBinding(slot(held, index.*), oldCell) { return false }
+      }
+      _ => ()
+    }
+    current.* = storedFlags(held, index.*)
+  }
+  current.* = (current.* & (JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE)) | JS_PROP_GETSET
+  run flags(rt, held, index.*, current.*)
+  return true
+}
+unsafe effect fn retireGlobal<'r, H: HeapHooks>(hooks: &mut H, rt: RuntimeRef<'r>,
+  node: *mut HeapHeader, atom: u32, cell: *mut HeapHeader) -> () ! OutOfMemoryError ? &mut Allocator {
+  let lent = ()
+  let anchor = () let header = unsafe Pointer.borrow<(), HeapHeader>(&anchor, cell)
+  let shared = header.referenceCount != 1 drop header
+  if !shared { return () }
+  let pending = globalPending(unsafe ObjectRef.lend(&lent, node))
+  // Allocate before altering the live binding. The pending table owns this retain.
+  unsafe HeapCell.retain(cell)
+  let added = run Effect.result(add(&mut hooks, rt, unsafe ObjectRef.lend(&lent, pending), atom, JS_PROP_C_W_E | JS_PROP_VARREF, PropertySlot.VarRef { reference: cell }))
+  match move added {
+    Result<(), OutOfMemoryError>.Failure { error } => { unsafe gc.releaseHeader(&mut hooks, rt.raw(), cell) fail move error }
+    Result<(), OutOfMemoryError>.Success { .. } => ()
+  }
+  let mut changedAnchor = () let binding = unsafe HeapCell.payloadMut<VarRef, ()>(&mut changedAnchor, cell)
+  binding.isLexical = false binding.isConst = false drop binding
+  let old = unsafe varRefs.replace(cell, ValueBits.Uninitialized)
+  unsafe gc.release(&mut hooks, rt.raw(), old)
+}
+effect fn deleteStored<'r, 'o, H: HeapHooks>(hooks: &mut H, rt: RuntimeRef<'r>,
+  object: ObjectRef<'o>, atom: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = () let p = object.dataMut(&mut anchor)
+  let removed = run unsafe shapes.deleteProperty(rt.raw(), &mut p, atom) drop p
+  match move removed {
+    Option<shapes.RetiredProperty>.Some { value } => { unsafe gc.releaseProperty(&mut hooks, rt.raw(), value.slot) }
+    Option<shapes.RetiredProperty>.None => ()
+  }
+}
+unsafe effect fn globalBinding<'r, H: HeapHooks>(hooks: &mut H, rt: RuntimeRef<'r>,
+  node: *mut HeapHeader, atom: u32, remove: bool) -> *mut HeapHeader ! OutOfMemoryError ? &mut Allocator {
+  let lent = ()
+  let pending = unsafe ObjectRef.lend(&lent, globalPending(unsafe ObjectRef.lend(&lent, node)))
+  match own(pending, atom) {
+    Option<usize>.Some { value: index } => {
+      let cell = match slot(pending, index) { PropertySlot.VarRef { reference } => reference _ => invariant() }
+      unsafe HeapCell.retain(cell)
+      if remove {
+        let deleted = run Effect.result(deleteStored(&mut hooks, rt, pending, atom))
+        match move deleted {
+          Result<(), OutOfMemoryError>.Failure { error } => { unsafe gc.releaseHeader(&mut hooks, rt.raw(), cell) fail move error }
+          Result<(), OutOfMemoryError>.Success { .. } => ()
+        }
+        let old = unsafe varRefs.replace(cell, ValueBits.Undefined) unsafe gc.release(&mut hooks, rt.raw(), old)
+      }
+      return cell
+    }
+    Option<usize>.None => { return run unsafe varRefs.createDetached(rt.raw(), false) }
+  }
+}
+fn getPropertyFlags(value: u32, defaults: u32) -> u32 {
+  let mask = u32.shiftRight(value, JS_PROP_HAS_SHIFT) & JS_PROP_C_W_E
+  return (value & mask) | (defaults & ~mask)
+}
+pub fn checkDefinePropertyFlags(current: u32, incoming: u32) -> bool {
+  if (current & JS_PROP_CONFIGURABLE) != 0 { return true }
+  if (incoming & (JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE)) == (JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE) { return false }
+  if (incoming & JS_PROP_HAS_ENUMERABLE) != 0 && (incoming & JS_PROP_ENUMERABLE) != (current & JS_PROP_ENUMERABLE) { return false }
+  if (incoming & (JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE | JS_PROP_HAS_GET | JS_PROP_HAS_SET)) != 0 {
+    let accessor = (incoming & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) != 0
+    if accessor != ((current & JS_PROP_TMASK) == JS_PROP_GETSET) { return false }
+    if !accessor && (current & JS_PROP_WRITABLE) == 0 && (incoming & (JS_PROP_HAS_WRITABLE | JS_PROP_WRITABLE)) == (JS_PROP_HAS_WRITABLE | JS_PROP_WRITABLE) { return false }
+  }
+  return true
+}
+fn functionPointer<'a, 'b, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>, value: ValueRef<'b>) -> ?*mut HeapHeader {
+  if hooks.isCallable(realm, value) { return reference(value.view()) }
+  return Pointer.null<HeapHeader>()
+}
+unsafe fn retainPointer(value: ?*mut HeapHeader) -> () {
+  match Pointer.nonNullMut<HeapHeader>(value) { Option<*mut HeapHeader>.Some { value: pointer } => { unsafe HeapCell.retain(pointer) } Option<*mut HeapHeader>.None => () }
+}
+effect fn storageResult<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
+  outcome: StorageOutcome, propertyFlags: u32) -> bool ! JsException ? &mut Allocator {
+  if outcome == StorageOutcome.ReadOnlyLength { return run readOnly(&mut hooks, realm, atoms.JS_ATOM_length, propertyFlags) }
+  if outcome == StorageOutcome.NonConfigurable { return run reject(&mut hooks, realm, propertyFlags, b"not configurable") }
+  return true
+}
+unsafe effect fn create<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, rt: RuntimeRef<'a>, node: *mut HeapHeader, atom: u32,
+  value: ValueRef<'b>, getter: ValueRef<'b>, setter: ValueRef<'b>, propertyFlags: u32) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  let lent = () let held = unsafe ObjectRef.lend(&lent, node)
+  let anchor = () let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  let id = p.classId() let exotic = p.isExotic() let fast = p.fastArray() let extensible = p.extensible() drop p
+  let mut fill = false
+  if exotic {
+    if id == classes.JS_CLASS_ARRAY {
+      match arrayIndex(rt, atom) {
+        Option<u32>.Some { value: index } => {
+          if fast {
+            if AtomTable.isInteger(atom) && u32.toU64(index) == count(held) {
+              if !extensible { return run reject(&mut hooks, realm, propertyFlags, b"object is not extensible") }
+              if (propertyFlags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) == 0 && getPropertyFlags(propertyFlags, 0) == JS_PROP_C_W_E {
+                let outcome = run unsafe arrays.appendFastElement(&mut hooks, realm, node, value.dup().intoBits())
+                return run storageResult(&mut hooks, realm, outcome, propertyFlags)
+              }
+            }
+            run unsafe arrays.convertFastToSlow(&mut hooks, realm, node)
+          }
+          let oldLength = match slot(held, 0) { PropertySlot.Value { value: lengthValue } => f64.toU32(lengthValue.numericValue()) _ => invariant() }
+          // Filling a hole may leave exactly the indices below length: densify
+          // checks after the add below.
+          fill = !fast && index < oldLength && (propertyFlags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) == 0
+          if index + 1 > oldLength {
+            if (storedFlags(held, 0) & JS_PROP_WRITABLE) == 0 { return run readOnly(&mut hooks, realm, atoms.JS_ATOM_length, propertyFlags) }
+            // The add below would be refused: length must not move first.
+            if !extensible { return run reject(&mut hooks, realm, propertyFlags, b"object is not extensible") }
+            let _previous = put(held, 0, SlotBits.plain(PropertySlot.Value { value: ValueBits.number(u32.toF64(index + 1)) }), storedFlags(held, 0))
+          }
+        }
+        Option<u32>.None => ()
+      }
+    } else if isTyped(id) {
+      if !match numericIndex(rt, atom) { ValueBits.Undefined => true _ => false } {
+        return run reject(&mut hooks, realm, propertyFlags, b"cannot create numeric index in typed array")
+      }
+    } else if (propertyFlags & JS_PROP_NO_EXOTIC) == 0 {
+      match method(rt, held, EXOTIC_DEFINE_OWN_PROPERTY) {
+        Option<NativeFunctionId>.Some { value: table } => { return run hooks.defineExoticProperty(realm, table, unsafe lendFor(ValueBits.Object { reference: node }), atom, value, getter, setter, propertyFlags) }
+        Option<NativeFunctionId>.None => ()
+      }
+      match method(rt, held, EXOTIC_IS_EXTENSIBLE) {
+        Option<NativeFunctionId>.Some { value: table } => {
+          if !run hooks.isExoticExtensible(realm, table, unsafe lendFor(ValueBits.Object { reference: node })) { return run reject(&mut hooks, realm, propertyFlags, b"object is not extensible") }
+        }
+        Option<NativeFunctionId>.None => ()
+      }
+    }
+  }
+  let current = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  let canAdd = current.extensible() drop current
+  if !canAdd { return run reject(&mut hooks, realm, propertyFlags, b"object is not extensible") }
+  let mut stored = propertyFlags & JS_PROP_C_W_E
+  let mut incoming = PropertySlot.Value { value: ValueBits.Undefined }
+  if (propertyFlags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) != 0 {
+    stored = (propertyFlags & (JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE)) | JS_PROP_GETSET
+    let mut get = Pointer.null<HeapHeader>() let mut set = Pointer.null<HeapHeader>()
+    if (propertyFlags & JS_PROP_HAS_GET) != 0 { get = functionPointer(&mut hooks, realm, getter) }
+    if (propertyFlags & JS_PROP_HAS_SET) != 0 { set = functionPointer(&mut hooks, realm, setter) }
+    unsafe retainPointer(get) unsafe retainPointer(set)
+    incoming = PropertySlot.GetterSetter { getter: get, setter: set }
+  } else if id == classes.JS_CLASS_GLOBAL_OBJECT {
+    let cell = run unsafe globalBinding(&mut hooks, rt, node, atom, false)
+    let mut bindingAnchor = () let binding = unsafe HeapCell.payloadMut<VarRef, ()>(&mut bindingAnchor, cell)
+    binding.isConst = (stored & JS_PROP_WRITABLE) == 0 drop binding
+    stored = stored | JS_PROP_VARREF incoming = PropertySlot.VarRef { reference: cell }
+  } else if (propertyFlags & JS_PROP_HAS_VALUE) != 0 { incoming = PropertySlot.Value { value: value.dup().intoBits() } }
+  let added = run Effect.result(add(&mut hooks, rt, held, atom, stored, incoming))
+  match move added {
+    Result<(), OutOfMemoryError>.Failure { error } => { unsafe gc.releaseProperty(&mut hooks, rt.raw(), incoming) fail move error }
+    Result<(), OutOfMemoryError>.Success { .. } => ()
+  }
+  if fill && stored == JS_PROP_C_W_E {
+    drop run Effect.result(unsafe arrays.densify(&mut hooks, realm, node))
+  }
+  if id == classes.JS_CLASS_GLOBAL_OBJECT && (stored & JS_PROP_TMASK) == JS_PROP_VARREF {
+    let cell = match incoming { PropertySlot.VarRef { reference } => reference _ => invariant() }
+    run deleteStored(&mut hooks, rt, unsafe ObjectRef.lend(&lent, globalPending(held)), atom)
+    let mut initial = ValueBits.Undefined if (propertyFlags & JS_PROP_HAS_VALUE) != 0 { initial = value.dup().intoBits() }
+    let previous = unsafe varRefs.replace(cell, initial) unsafe gc.release(&mut hooks, rt.raw(), previous)
+  }
+  return true
+}
+unsafe effect fn define<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, rt: RuntimeRef<'a>, object: ValueRef<'b>, atom: u32,
+  mut value: ValueBits, getter: ValueRef<'b>, setter: ValueRef<'b>, propertyFlags: u32) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  if !object.view().isObject() { return run OwnPropertyHooks.throwNotObject(&mut hooks, realm) }
+  let held = ObjectRef.of(object) let node = held.header()
+  while true {
+    match own(held, atom) {
+      Option<usize>.Some { value: found } => {
+        let mut index = found let mut current = storedFlags(held, index)
+        if (current & JS_PROP_LENGTH) != 0 && (propertyFlags & JS_PROP_HAS_VALUE) != 0 {
+          let mut length: u32 = 0
+          run integers.toArrayLengthFree(&mut hooks, realm, &mut length, unsafe Value.retain(value), false)
+          value = ValueBits.number(u32.toF64(length))
+          index = match own(held, atom) { Option<usize>.Some { value: foundIndex } => foundIndex Option<usize>.None => invariant() }
+          current = storedFlags(held, index)
+        }
+        if !checkDefinePropertyFlags(current, propertyFlags) { return run reject(&mut hooks, realm, propertyFlags, b"property is not configurable") }
+        let previous = slot(held, index)
+        if previous.isLazy() {
+          run OwnPropertyHooks.instantiateAutoInit(&mut hooks, realm, object, atom) continue
+        }
+        if (propertyFlags & (JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE | JS_PROP_HAS_GET | JS_PROP_HAS_SET)) != 0 {
+          if (propertyFlags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) != 0 {
+            let newGet = functionPointer(&mut hooks, realm, getter)
+            let newSet = functionPointer(&mut hooks, realm, setter)
+            let mut oldGet = Pointer.null<HeapHeader>() let mut oldSet = Pointer.null<HeapHeader>()
+            match previous {
+              PropertySlot.GetterSetter { getter: previousGetter, setter: previousSetter } => {
+                oldGet = previousGetter oldSet = previousSetter
+                if (current & JS_PROP_CONFIGURABLE) == 0 {
+                  if ((propertyFlags & JS_PROP_HAS_GET) != 0 && Pointer.address<HeapHeader>(newGet) != Pointer.address<HeapHeader>(oldGet)) || ((propertyFlags & JS_PROP_HAS_SET) != 0 && Pointer.address<HeapHeader>(newSet) != Pointer.address<HeapHeader>(oldSet)) {
+                    return run reject(&mut hooks, realm, propertyFlags, b"property is not configurable")
+                  }
+                }
+              }
+              _ => ()
+            }
+            let mut get = oldGet let mut set = oldSet
+            if (propertyFlags & JS_PROP_HAS_GET) != 0 { get = newGet }
+            if (propertyFlags & JS_PROP_HAS_SET) != 0 { set = newSet }
+            // The new box comes first: from here on nothing may fail undone.
+            let stored = run SlotBits.from(PropertySlot.GetterSetter { getter: get, setter: set })
+            let reshaped = run Effect.result(toAccessor(&mut hooks, rt, held, node, atom, previous, &mut index, &mut current))
+            let proceed = match move reshaped {
+              Result<bool, OutOfMemoryError>.Success { value: go } => go
+              Result<bool, OutOfMemoryError>.Failure { error } => { unsafe stored.discardBox() fail move error }
+            }
+            if !proceed { unsafe stored.discardBox() continue }
+            unsafe retainPointer(get) unsafe retainPointer(set)
+            let retired = put(held, index, stored, previous.kind())
+            unsafe gc.releaseProperty(&mut hooks, rt.raw(), retired)
+          } else {
+            let mut active = previous
+            match previous {
+              PropertySlot.GetterSetter { .. } => {
+                let mut incoming = PropertySlot.Value { value: ValueBits.Undefined }
+                let mut nextFlags = current & ~(JS_PROP_TMASK | JS_PROP_WRITABLE)
+                if classId(held) == classes.JS_CLASS_GLOBAL_OBJECT {
+                  incoming = PropertySlot.VarRef { reference: run unsafe globalBinding(&mut hooks, rt, node, atom, true) }
+                  nextFlags = (current & ~JS_PROP_TMASK) | JS_PROP_VARREF | JS_PROP_WRITABLE
+                }
+                let changed = run Effect.result(flags(rt, held, index, nextFlags))
+                match move changed {
+                  Result<(), OutOfMemoryError>.Failure { error } => { unsafe gc.releaseProperty(&mut hooks, rt.raw(), incoming) fail move error }
+                  Result<(), OutOfMemoryError>.Success { .. } => ()
+                }
+                let retired = put(held, index, SlotBits.plain(incoming), JS_PROP_GETSET) active = incoming current = nextFlags
+                unsafe gc.releaseProperty(&mut hooks, rt.raw(), retired)
+                index = match own(held, atom) { Option<usize>.Some { value: foundIndex } => foundIndex Option<usize>.None => { continue } }
+                active = slot(held, index) current = storedFlags(held, index)
+                if match active { PropertySlot.GetterSetter { .. } => true _ => active.isLazy() } { continue }
+              }
+              PropertySlot.Value { value: old } => {
+                if (current & (JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)) == 0 && (propertyFlags & JS_PROP_HAS_VALUE) != 0 {
+                  if !unsafe primitives.equal(value, old, EqualityMode.SameValue) { return run reject(&mut hooks, realm, propertyFlags, b"property is not configurable") }
+                  return true
+                }
+              }
+              _ => ()
+            }
+            match active {
+              PropertySlot.VarRef { reference: cell } => {
+                let id = classId(held)
+                if (propertyFlags & JS_PROP_HAS_VALUE) != 0 {
+                  if id == classes.JS_CLASS_MODULE_NS {
+                    if !unsafe primitives.equal(value, unsafe varRefs.read(cell), EqualityMode.SameValue) { return run reject(&mut hooks, realm, propertyFlags, b"property is not configurable") }
+                  } else {
+                    let retired = unsafe varRefs.replace(cell, unsafe value.retained()) unsafe gc.release(&mut hooks, rt.raw(), retired)
+                    index = match own(held, atom) { Option<usize>.Some { value: foundIndex } => foundIndex Option<usize>.None => { continue } }
+                    if !sameBinding(slot(held, index), cell) { continue }
+                    current = storedFlags(held, index)
+                  }
+                }
+                if (propertyFlags & (JS_PROP_HAS_WRITABLE | JS_PROP_WRITABLE)) == JS_PROP_HAS_WRITABLE {
+                  if id == classes.JS_CLASS_MODULE_NS { return run reject(&mut hooks, realm, propertyFlags, b"module namespace properties have writable = false") }
+                  if id == classes.JS_CLASS_GLOBAL_OBJECT {
+                    current = current & ~JS_PROP_WRITABLE run flags(rt, held, index, current)
+                    let mut anchor = () let binding = unsafe HeapCell.payloadMut<VarRef, ()>(&mut anchor, cell) binding.isConst = true
+                  } else {
+                    current = current & ~(JS_PROP_TMASK | JS_PROP_WRITABLE) run flags(rt, held, index, current)
+                    let bindingValue = unsafe varRefs.read(cell)
+                    let incoming = unsafe bindingValue.retained()
+                    let retired = put(held, index, SlotBits.plain(PropertySlot.Value { value: incoming }), JS_PROP_VARREF) unsafe gc.releaseProperty(&mut hooks, rt.raw(), retired)
+                  }
+                }
+              }
+              _ => {
+                if (current & JS_PROP_LENGTH) != 0 {
+                  let mut outcome = StorageOutcome.Accepted
+                  if (propertyFlags & JS_PROP_HAS_VALUE) != 0 { outcome = run unsafe arrays.setArrayLength(&mut hooks, realm, node, f64.toU32(value.numericValue())) }
+                  // Source returns -1 rather than unwinding: writable is cleared
+                  // even after a throwing nonconfigurable-element rejection.
+                  let accepted = run Intrinsic.catchFailure<JsException>(storageResult(&mut hooks, realm, outcome, propertyFlags), failedJs)
+                  if (propertyFlags & (JS_PROP_HAS_WRITABLE | JS_PROP_WRITABLE)) == JS_PROP_HAS_WRITABLE {
+                    run flags(rt, held, 0, storedFlags(held, 0) & ~JS_PROP_WRITABLE)
+                  }
+                  return match move accepted {
+                    bool acceptedValue => acceptedValue
+                    FailedJs { error } => { fail move error }
+                  }
+                }
+                if (propertyFlags & JS_PROP_HAS_VALUE) != 0 {
+                  let retired = put(held, index, SlotBits.plain(PropertySlot.Value { value: unsafe value.retained() }), storedFlags(held, index)) unsafe gc.releaseProperty(&mut hooks, rt.raw(), retired)
+                  index = match own(held, atom) { Option<usize>.Some { value: foundIndex } => foundIndex Option<usize>.None => { continue } }
+                  if !match slot(held, index) { PropertySlot.Value { .. } => true _ => false } { continue }
+                  current = storedFlags(held, index)
+                }
+                if (propertyFlags & JS_PROP_HAS_WRITABLE) != 0 { current = (current & ~JS_PROP_WRITABLE) | (propertyFlags & JS_PROP_WRITABLE) run flags(rt, held, index, current) }
+              }
+            }
+          }
+        }
+        index = match own(held, atom) { Option<usize>.Some { value: foundIndex } => foundIndex Option<usize>.None => { continue } }
+        let mut mask: u32 = 0
+        if (propertyFlags & JS_PROP_HAS_CONFIGURABLE) != 0 { mask = mask | JS_PROP_CONFIGURABLE }
+        if (propertyFlags & JS_PROP_HAS_ENUMERABLE) != 0 { mask = mask | JS_PROP_ENUMERABLE }
+        run flags(rt, held, index, (storedFlags(held, index) & ~mask) | (propertyFlags & mask))
+        return true
+      }
+      Option<usize>.None => ()
+    }
+    let anchor = () let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+    let fast = p.fastArray() let id = p.classId() drop p
+    if fast {
+      if id == classes.JS_CLASS_ARRAY && AtomTable.isInteger(atom) && u32.toU64(atom & ~ATOM_INTEGER_TAG) < count(held) {
+        if getPropertyFlags(propertyFlags, JS_PROP_C_W_E) != JS_PROP_C_W_E || (propertyFlags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) != 0 {
+          run unsafe arrays.convertFastToSlow(&mut hooks, realm, node) continue
+        }
+        if (propertyFlags & JS_PROP_HAS_VALUE) != 0 { unsafe replaceDense(&mut hooks, rt, node, atom & ~ATOM_INTEGER_TAG, value) }
+        return true
+      }
+      if isTyped(id) {
+        let number = numericIndex(rt, atom)
+        if !match number { ValueBits.Undefined => true _ => false } {
+          if !AtomTable.isInteger(atom) {
+            let n = number.numericValue()
+            if !f64.isFinite(n) || f64.trunc(n) != n { return run reject(&mut hooks, realm, propertyFlags, b"non integer index in typed array") }
+            if n < 0.0 || (n == 0.0 && (f64.toBits(n) & 0x8000000000000000) != 0) { return run reject(&mut hooks, realm, propertyFlags, b"negative index in typed array") }
+          }
+          let index = match typedIndex(rt, atom) {
+            Option<u64>.Some { value: found } => found
+            Option<u64>.None => { return run reject(&mut hooks, realm, propertyFlags, b"out-of-bound index in typed array") }
+          }
+          if index >= count(held) { return run reject(&mut hooks, realm, propertyFlags, b"out-of-bound index in typed array") }
+          if getPropertyFlags(propertyFlags, JS_PROP_C_W_E) != JS_PROP_C_W_E || (propertyFlags & (JS_PROP_HAS_GET | JS_PROP_HAS_SET)) != 0 { return run reject(&mut hooks, realm, propertyFlags, b"invalid descriptor flags") }
+          if (propertyFlags & JS_PROP_HAS_VALUE) != 0 { run unsafe typed.writeIndex(&mut hooks, realm, node, index, value) }
+          return true
+        }
+      }
+    }
+    return run unsafe create(&mut hooks, realm, rt, node, atom, unsafe lendBits(&value, value), getter, setter, propertyFlags)
+  }
+}
+
+/// JS_DefineProperty: all arguments are borrowed, including the atom.
+pub effect fn defineProperty<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, atom: u32, value: ValueRef<'b>, getter: ValueRef<'b>,
+  setter: ValueRef<'b>, propertyFlags: u32) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  run unsafe restricted.write(realm, object.view())
+  let rt = realm.runtimeRef()
+  let hold = realm.hold() duplicateAtom(rt, atom)
+  let objectRoot = object.dup() let valueRoot = value.dup()
+  let getterRoot = getter.dup() let setterRoot = setter.dup()
+  let result = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError | BigIntError | JsException>(unsafe define(&mut hooks, realm, rt, object, atom, value.view(), getter, setter, propertyFlags), failed)
+  drop setterRoot drop getterRoot drop valueRoot drop objectRoot
+  releaseHeldAtom(rt, atom) hold.release(&mut hooks)
+  return match move result {
+    bool accepted => accepted
+    Failed { error } => { fail move error }
+  }
+}
+unsafe fn replaceDense<'r, H: HeapHooks>(hooks: &mut H, rt: RuntimeRef<'r>,
+  node: *mut HeapHeader, index: u32, value: ValueBits) -> () {
+  unsafe replaceDenseOwned(&mut hooks, rt, node, index, unsafe value.retained())
+}
+unsafe fn replaceDenseOwned<'r, H: HeapHooks>(hooks: &mut H, rt: RuntimeRef<'r>,
+  node: *mut HeapHeader, index: u32, incoming: ValueBits) -> () {
+  let mut anchor = () let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+  let mut old = ValueBits.Undefined
+  match &mut p.payload {
+    ObjectPayload.FastArray { array } => {
+      old = array.values().get(u32.toUsize(index)) array.valuesMut().set(u32.toUsize(index), incoming)
+    }
+    ObjectPayload.MappedArguments { arguments } => {
+      let cell = arguments.varRefs.get(u32.toUsize(index))
+      old = unsafe varRefs.replace(cell, incoming)
+    }
+    _ => invariant()
+  }
+  drop p unsafe gc.release(&mut hooks, rt.raw(), old)
+}
+unsafe effect fn callSetter<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, rt: RuntimeRef<'a>, setter: ValueRef<'b>,
+  receiver: ValueRef<'b>, incoming: &mut Value, propertyFlags: u32) -> bool
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  if match setter.view() { ValueBits.Undefined => true _ => false } {
+    releaseIncoming(&mut hooks, realm, &mut incoming)
+    return run reject(&mut hooks, realm, propertyFlags, b"no setter for property")
+  }
+  let function = setter.dup()
+  let result = run Intrinsic.catchFailure<OutOfMemoryError | JsException>(unsafe hooks.call(realm, function.borrow(), receiver, &[incoming.view()]), failedOomJs)
+  realm.release(&mut hooks, move function)
+  releaseIncoming(&mut hooks, realm, &mut incoming)
+  return match move result {
+    ValueBits value => { unsafe gc.release(&mut hooks, rt.raw(), value) return true }
+    FailedOomJs { error } => { fail move error }
+  }
+}
+fn pointerValue(pointer: ?*mut HeapHeader) -> ValueBits {
+  return match Pointer.nonNullMut<HeapHeader>(pointer) {
+    Option<*mut HeapHeader>.Some { value } => ValueBits.Object { reference: value }
+    Option<*mut HeapHeader>.None => ValueBits.Undefined
+  }
+}
+union SetStep { Done { accepted: bool }, Writable, Next { node: *mut HeapHeader } }
+unsafe effect fn setStep<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, rt: RuntimeRef<'a>, node: *mut HeapHeader, atom: u32,
+  incoming: &mut Value, receiver: ValueRef<'b>, direct: bool, propertyFlags: u32) -> SetStep
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  let lent = () let held = unsafe ObjectRef.lend(&lent, node)
+  let object = ValueBits.Object { reference: node }
+  let value = incoming.view()
+  while true {
+    match find(held, atom) {
+      Option<FoundProperty>.Some { value: found } => {
+        let index = found.index
+        let current = u8.toU32(found.flags) let previous = slotAs(held, index, found.flags)
+        if direct && (current & (JS_PROP_TMASK | JS_PROP_WRITABLE | JS_PROP_LENGTH)) == JS_PROP_WRITABLE {
+          let retired = put(held, index, SlotBits.plain(PropertySlot.Value { value: takeIncoming(&mut incoming) }), current)
+          unsafe gc.releaseProperty(&mut hooks, rt.raw(), retired)
+          return SetStep.Done { accepted: true }
+        }
+        if direct && (current & JS_PROP_LENGTH) != 0 {
+          let mut length: u32 = 0
+          run integers.toArrayLengthFree(&mut hooks, realm, &mut length, incoming.take(), false)
+          let outcome = run unsafe arrays.setArrayLength(&mut hooks, realm, node, length)
+          return SetStep.Done { accepted: run storageResult(&mut hooks, realm, outcome, propertyFlags) }
+        }
+        match previous {
+          PropertySlot.GetterSetter { setter, .. } => {
+            return SetStep.Done { accepted: run unsafe callSetter(&mut hooks, realm, rt, unsafe lendFor(pointerValue(setter)), receiver, &mut incoming, propertyFlags) }
+          }
+          PropertySlot.LazyPrototype { .. } => {
+            run OwnPropertyHooks.instantiateAutoInit(&mut hooks, realm, unsafe lendBits(&object, object), atom) continue
+          }
+          PropertySlot.LazyNamespace { .. } => {
+            run OwnPropertyHooks.instantiateAutoInit(&mut hooks, realm, unsafe lendBits(&object, object), atom) continue
+          }
+          PropertySlot.LazyBuiltin { .. } => {
+            run OwnPropertyHooks.instantiateAutoInit(&mut hooks, realm, unsafe lendBits(&object, object), atom) continue
+          }
+          PropertySlot.LazyStack { .. } => {
+            // Assigning a new stack never needs the captured one formatted.
+            if direct && (current & JS_PROP_WRITABLE) != 0 {
+              run flags(rt, held, index, current & ~JS_PROP_TMASK)
+              let retired = put(held, index, SlotBits.plain(PropertySlot.Value { value: takeIncoming(&mut incoming) }), current)
+              unsafe gc.releaseProperty(&mut hooks, rt.raw(), retired)
+              return SetStep.Done { accepted: true }
+            }
+            run OwnPropertyHooks.instantiateAutoInit(&mut hooks, realm, unsafe lendBits(&object, object), atom) continue
+          }
+          PropertySlot.LazyInitializer { .. } => {
+            if direct && (current & JS_PROP_WRITABLE) != 0 {
+              run flags(rt, held, index, current & ~JS_PROP_TMASK)
+              let retired = put(held, index, SlotBits.plain(PropertySlot.Value { value: takeIncoming(&mut incoming) }), current)
+              unsafe gc.releaseProperty(&mut hooks, rt.raw(), retired)
+              return SetStep.Done { accepted: true }
+            }
+            run OwnPropertyHooks.instantiateAutoInit(&mut hooks, realm, unsafe lendBits(&object, object), atom) continue
+          }
+          PropertySlot.LazyHost { .. } => {
+            run OwnPropertyHooks.instantiateAutoInit(&mut hooks, realm, unsafe lendBits(&object, object), atom) continue
+          }
+          PropertySlot.VarRef { reference: cell } => {
+            if direct {
+              let anchor = () let binding = unsafe HeapCell.payload<VarRef, ()>(&anchor, cell)
+              let constant = binding.isConst drop binding
+              if classId(held) == classes.JS_CLASS_MODULE_NS || constant {
+                releaseIncoming(&mut hooks, realm, &mut incoming)
+                return SetStep.Done { accepted: run readOnly(&mut hooks, realm, atom, propertyFlags) }
+              }
+              let retired = unsafe varRefs.replace(cell, takeIncoming(&mut incoming))
+              unsafe gc.release(&mut hooks, rt.raw(), retired)
+              return SetStep.Done { accepted: true }
+            }
+          }
+          _ => ()
+        }
+        if (current & JS_PROP_WRITABLE) == 0 {
+          releaseIncoming(&mut hooks, realm, &mut incoming)
+          return SetStep.Done { accepted: run readOnly(&mut hooks, realm, atom, propertyFlags) }
+        }
+        return SetStep.Writable
+      }
+      Option<FoundProperty>.None => ()
+    }
+    let anchor = () let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+    let exotic = p.isExotic() let fast = p.fastArray() let id = p.classId() drop p
+    if exotic {
+      if fast {
+        if AtomTable.isInteger(atom) && u32.toU64(atom & ~ATOM_INTEGER_TAG) < count(held) {
+          if sameObject(object, receiver.view()) {
+            if isTyped(id) { run unsafe typed.writeIndexFree(&mut hooks, realm, node, u32.toU64(atom & ~ATOM_INTEGER_TAG), takeIncoming(&mut incoming)) }
+            else { unsafe replaceDenseOwned(&mut hooks, rt, node, atom & ~ATOM_INTEGER_TAG, takeIncoming(&mut incoming)) }
+            return SetStep.Done { accepted: true }
+          }
+          return SetStep.Writable
+        }
+        if isTyped(id) && !match numericIndex(rt, atom) { ValueBits.Undefined => true _ => false } {
+          match typedIndex(rt, atom) {
+            Option<u64>.Some { value: index } => {
+              if index < count(held) {
+                if !sameObject(object, receiver.view()) { return SetStep.Writable }
+                run unsafe typed.writeIndexFree(&mut hooks, realm, node, index, takeIncoming(&mut incoming))
+                return SetStep.Done { accepted: true }
+              }
+            }
+            Option<u64>.None => ()
+          }
+          if sameObject(object, receiver.view()) { run unsafe typed.convertOutOfBoundsFree(&mut hooks, realm, node, takeIncoming(&mut incoming)) }
+          return SetStep.Done { accepted: true }
+        }
+      } else {
+        match method(rt, held, EXOTIC_SET_PROPERTY) {
+          Option<NativeFunctionId>.Some { value: table } => {
+            return SetStep.Done { accepted: run hooks.setExoticProperty(realm, table, unsafe lendBits(&object, object), atom, unsafe lendBits(&value, value), receiver, propertyFlags) }
+          }
+          Option<NativeFunctionId>.None => ()
+        }
+        match method(rt, held, EXOTIC_GET_OWN_PROPERTY) {
+          Option<NativeFunctionId>.Some { value: table } => {
+            let ownResult = run OwnPropertyHooks.getExoticOwnProperty(&mut hooks, realm, table, unsafe lendBits(&object, object), atom, true)
+            match move ownResult {
+              OwnPropertyResult.Absent => ()
+              OwnPropertyResult.Exists => invariant()
+              OwnPropertyResult.Descriptor { descriptor } => {
+                if (descriptor.flags & JS_PROP_GETSET) != 0 {
+                  let called = run Intrinsic.catchFailure<OutOfMemoryError | JsException>(unsafe callSetter(&mut hooks, realm, rt, descriptor.setter.borrow(), receiver, &mut incoming, propertyFlags), failedOomJs)
+                  drop descriptor
+                  return match move called {
+                    bool accepted => SetStep.Done { accepted: accepted }
+                    FailedOomJs { error } => { fail move error }
+                  }
+                }
+                let writable = (descriptor.flags & JS_PROP_WRITABLE) != 0
+                drop descriptor
+                if !writable {
+                  releaseIncoming(&mut hooks, realm, &mut incoming)
+                  return SetStep.Done { accepted: run readOnly(&mut hooks, realm, atom, propertyFlags) }
+                }
+                if sameObject(object, receiver.view()) {
+                  return SetStep.Done { accepted: run defineProperty(&mut hooks, realm, receiver, atom, unsafe lendBits(&value, value), immediateRef(ValueBits.Undefined), immediateRef(ValueBits.Undefined), JS_PROP_HAS_VALUE) }
+                }
+                return SetStep.Writable
+              }
+            }
+          }
+          Option<NativeFunctionId>.None => ()
+        }
+      }
+    }
+    // Fresh payload/shape after arbitrary get-own callback.
+    let current = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+    let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, current.shape)
+    match Pointer.nonNullMut<HeapHeader>(shape.prototype) {
+      Option<*mut HeapHeader>.Some { value: next } => { unsafe HeapCell.retain(next) return SetStep.Next { node: next } }
+      Option<*mut HeapHeader>.None => { return SetStep.Writable }
+    }
+  }
+}
+unsafe effect fn set<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, rt: RuntimeRef<'a>, object: ValueRef<'b>, atom: u32,
+  incoming: &mut Value, receiver: ValueRef<'b>, propertyFlags: u32) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  run unsafe restricted.set(realm, object.view(), atom, receiver.view())
+  let lent = ()
+  let mut start = object.view()
+  if !object.view().isObject() {
+    match receiver.view() {
+      ValueBits.Null => {
+        releaseIncoming(&mut hooks, realm, &mut incoming)
+        return run throwAtom(&mut hooks, realm, atom, NativeErrorKind.Type, b"cannot set property '", b"' of null")
+      }
+      ValueBits.Undefined => {
+        releaseIncoming(&mut hooks, realm, &mut incoming)
+        return run throwAtom(&mut hooks, realm, atom, NativeErrorKind.Type, b"cannot set property '", b"' of undefined")
+      }
+      _ => ()
+    }
+    start = prototypes.getPrototypePrimitive(realm, object)
+  }
+  if start.isObject() {
+    let mut node = reference(start) unsafe HeapCell.retain(node)
+    let mut direct = sameObject(object.view(), receiver.view())
+    while true {
+      let result = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError | BigIntError | JsException>(unsafe setStep(&mut hooks, realm, rt, node, atom, &mut incoming, receiver, direct, propertyFlags), failed)
+      unsafe gc.releaseHeader(&mut hooks, rt.raw(), node)
+      match move result {
+        Failed { error } => { fail move error }
+        SetStep value => match move value {
+          SetStep.Done { accepted } => { return accepted }
+          SetStep.Next { node: next } => { node = next direct = false }
+          SetStep.Writable => { break }
+        }
+      }
+    }
+  }
+  if !receiver.view().isObject() {
+    releaseIncoming(&mut hooks, realm, &mut incoming)
+    return run reject(&mut hooks, realm, propertyFlags, b"not an object")
+  }
+  if !sameObject(object.view(), receiver.view()) {
+    let ownProperty = run descriptors.getOwnProperty(&mut hooks, realm, receiver, atom)
+    match move ownProperty {
+      Option<PropertyDescriptor>.Some { value: descriptor } => {
+        let accessor = (descriptor.flags & JS_PROP_GETSET) != 0
+        let writable = (descriptor.flags & JS_PROP_WRITABLE) != 0
+        drop descriptor
+        if accessor {
+          releaseIncoming(&mut hooks, realm, &mut incoming)
+          return run reject(&mut hooks, realm, propertyFlags, b"setter is forbidden")
+        }
+        if !writable || classId(ObjectRef.of(receiver)) == classes.JS_CLASS_MODULE_NS {
+          releaseIncoming(&mut hooks, realm, &mut incoming)
+          return run readOnly(&mut hooks, realm, atom, propertyFlags)
+        }
+        return run defineProperty(&mut hooks, realm, receiver, atom, incoming.borrow(), immediateRef(ValueBits.Undefined), immediateRef(ValueBits.Undefined), JS_PROP_HAS_VALUE)
+      }
+      Option<PropertyDescriptor>.None => ()
+    }
+  }
+  if sameObject(object.view(), receiver.view()) {
+    let node = reference(receiver.view())
+    let anchor = () let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+    let exotic = p.isExotic() let fast = p.fastArray() let id = p.classId() let extensible = p.extensible() drop p
+    if exotic && id == classes.JS_CLASS_ARRAY && fast && AtomTable.isInteger(atom) && u32.toU64(atom & ~ATOM_INTEGER_TAG) == count(unsafe ObjectRef.lend(&lent, node)) {
+      if !extensible {
+        releaseIncoming(&mut hooks, realm, &mut incoming)
+        return run reject(&mut hooks, realm, propertyFlags, b"object is not extensible")
+      }
+      let outcome = run unsafe arrays.appendFastElement(&mut hooks, realm, node, takeIncoming(&mut incoming))
+      return run storageResult(&mut hooks, realm, outcome, propertyFlags)
+    }
+    if !exotic && id != classes.JS_CLASS_GLOBAL_OBJECT {
+      if !extensible {
+        releaseIncoming(&mut hooks, realm, &mut incoming)
+        return run reject(&mut hooks, realm, propertyFlags, b"object is not extensible")
+      }
+      let owned = PropertySlot.Value { value: takeIncoming(&mut incoming) }
+      let added = run Effect.result(add(&mut hooks, rt, unsafe ObjectRef.lend(&lent, node), atom, JS_PROP_C_W_E, owned))
+      return match move added {
+        Result<(), OutOfMemoryError>.Success { .. } => true
+        Result<(), OutOfMemoryError>.Failure { error } => {
+          let _pending = run Effect.catch<JsException>(materialize(&mut hooks, realm, move error), exceptionValue)
+          unsafe gc.releaseProperty(&mut hooks, rt.raw(), owned) fail JsException {}
+        }
+      }
+    }
+  }
+  return run unsafe create(&mut hooks, realm, rt, reference(receiver.view()), atom, incoming.borrow(), immediateRef(ValueBits.Undefined), immediateRef(ValueBits.Undefined),
+    propertyFlags | JS_PROP_HAS_VALUE | JS_PROP_HAS_ENUMERABLE | JS_PROP_HAS_WRITABLE | JS_PROP_HAS_CONFIGURABLE | JS_PROP_C_W_E)
+}
+/// JS_SetPropertyInternal: consumes value, borrows object/receiver/atom.
+pub unsafe effect fn setPropertyInternal<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, atom: u32, value: ValueBits,
+  receiver: ValueRef<'b>, propertyFlags: u32) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  let rt = realm.runtimeRef()
+  let hold = realm.hold() duplicateAtom(rt, atom)
+  let objectRoot = object.dup() let receiverRoot = receiver.dup()
+  let mut incoming = unsafe Value.adoptBits(value)
+  let result = run Effect.result(unsafe set(&mut hooks, realm, rt, object, atom, &mut incoming, receiver, propertyFlags))
+  let settled = run settleMutation(&mut hooks, realm, move result)
+  realm.release(&mut hooks, move incoming) drop receiverRoot drop objectRoot
+  releaseHeldAtom(rt, atom)
+  hold.release(&mut hooks)
+  return match move settled {
+    Result<bool, JsException>.Success { value: accepted } => accepted
+    Result<bool, JsException>.Failure { error } => { fail move error }
+  }
+}
+/// Sets `atom` on `object` with an explicit receiver. Consumes the owned value on every path.
+@inlineAlways
+pub effect fn setPropertyWithReceiver<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, atom: u32, value: Value,
+  receiver: ValueRef<'b>, propertyFlags: u32) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  return run unsafe setPropertyInternal(&mut hooks, realm, object, atom, value.intoBits(), receiver, propertyFlags)
+}
+effect fn setPropertyOwned<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, atom: u32, value: Value) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  return run unsafe setPropertyInternal(&mut hooks, realm, object, atom, value.intoBits(), object, JS_PROP_THROW)
+}
+unsafe effect fn deleteOwn<'a, H: HeapHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, rt: RuntimeRef<'a>, node: *mut HeapHeader, atom: u32) -> bool
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let lent = () let held = unsafe ObjectRef.lend(&lent, node)
+  match own(held, atom) {
+    Option<usize>.Some { value: index } => {
+      if (storedFlags(held, index) & JS_PROP_CONFIGURABLE) == 0 { return false }
+      if classId(held) == classes.JS_CLASS_GLOBAL_OBJECT {
+        let mut anchor = () let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+        run unsafe shapes.prepareUpdate(rt.raw(), &mut p) drop p
+        match slot(held, index) {
+          PropertySlot.VarRef { reference } => { run unsafe retireGlobal(&mut hooks, rt, node, atom, reference) }
+          _ => ()
+        }
+      }
+      let mut anchor = () let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+      let removed = run unsafe shapes.deleteAt(rt.raw(), &mut p, atom, index) drop p
+      unsafe gc.releaseProperty(&mut hooks, rt.raw(), removed.slot) return true
+    }
+    Option<usize>.None => ()
+  }
+  let anchor = () let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  let exotic = p.isExotic() let fast = p.fastArray() let id = p.classId() drop p
+  if exotic {
+    if fast {
+      if isTyped(id) {
+        match typedIndex(rt, atom) {
+          Option<u64>.Some { value: index } => { return index >= count(held) }
+          Option<u64>.None => { return true }
+        }
+      }
+      match arrayIndex(rt, atom) {
+        Option<u32>.Some { value: index } => {
+          if u32.toU64(index) < count(held) {
+            if id == classes.JS_CLASS_ARRAY || id == classes.JS_CLASS_ARGUMENTS || id == classes.JS_CLASS_MAPPED_ARGUMENTS {
+              let outcome = run unsafe arrays.deleteOwnIndex(&mut hooks, realm, node, index)
+              return outcome == StorageOutcome.Accepted
+            }
+            return false
+          }
+        }
+        Option<u32>.None => ()
+      }
+    } else {
+      match method(rt, held, EXOTIC_DELETE_PROPERTY) {
+        Option<NativeFunctionId>.Some { value: table } => { return run hooks.deleteExoticProperty(realm, table, unsafe lendFor(ValueBits.Object { reference: node }), atom) }
+        Option<NativeFunctionId>.None => ()
+      }
+    }
+  }
+  return true
+}
+/// deleteOwnProperty for a caller that keeps the object, the atom and the realm
+/// alive across the call (the VM's operand stack and frame), so nothing is
+/// retained or caught here.
+pub unsafe effect fn deleteOwnRooted<'a, H: HeapHooks + PropertyWriteHooks>(hooks: &mut H, realm: Realm<'a>, node: *mut HeapHeader, atom: u32) -> bool
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  run unsafe restricted.write(realm, ValueBits.Object { reference: node })
+  return run unsafe deleteOwn(&mut hooks, realm, realm.runtimeRef(), node, atom)
+}
+/// Internal delete_property. Requires an object; no boxing or throw-flag mapping.
+pub effect fn deleteOwnProperty<'a, 'b, H: HeapHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, atom: u32) -> bool
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  run unsafe restricted.write(realm, object.view())
+  let rt = realm.runtimeRef()
+  let hold = realm.hold() duplicateAtom(rt, atom)
+  let root = object.dup()
+  let result = run Intrinsic.catchFailure<OutOfMemoryError | JsException>(unsafe deleteOwn(&mut hooks, realm, rt, reference(object.view()), atom), failedOomJs)
+  drop root releaseHeldAtom(rt, atom)
+  hold.release(&mut hooks)
+  return match move result {
+    bool value => value
+    FailedOomJs { error } => { fail move error }
+  }
+}
+
+/// Consumes value, and marks all three data attributes as explicitly supplied.
+effect fn definePropertyValueOwned<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, atom: u32, value: Value, propertyFlags: u32) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  let hold = realm.hold()
+  let result = run Effect.result(defineProperty(&mut hooks, realm, object, atom, value.borrow(),
+    immediateRef(ValueBits.Undefined), immediateRef(ValueBits.Undefined), propertyFlags | JS_PROP_HAS_VALUE |
+    JS_PROP_HAS_CONFIGURABLE | JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE))
+  let settled = run settleMutation(&mut hooks, realm, move result)
+  realm.release(&mut hooks, move value) hold.release(&mut hooks)
+  return match move settled {
+    Result<bool, JsException>.Success { value: accepted } => accepted
+    Result<bool, JsException>.Failure { error } => { fail move error }
+  }
+}
+/// Defines an accessor property; `getter` and `setter` are lent.
+pub effect fn definePropertyGetSet<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, atom: u32, getter: ValueRef<'b>, setter: ValueRef<'b>, propertyFlags: u32) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  return run defineProperty(&mut hooks, realm, object, atom, immediateRef(ValueBits.Undefined), getter, setter,
+    propertyFlags | JS_PROP_HAS_GET | JS_PROP_HAS_SET | JS_PROP_HAS_CONFIGURABLE | JS_PROP_HAS_ENUMERABLE)
+}
+unsafe effect fn defineAuto<'a, 'b, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>,
+  rt: RuntimeRef<'a>, object: ValueRef<'b>, atom: u32, kind: AutoInitKind,
+  opaque: AutoInitOpaque, propertyFlags: u32) -> bool ! OutOfMemoryError ? &mut Allocator { let context = realm.context()
+  if !object.view().isObject() { return false }
+  match own(ObjectRef.of(object), atom) { Option<usize>.Some { .. } => invariant() Option<usize>.None => () }
+  unsafe HeapCell.retain(context)
+  if let AutoInitOpaque.Initializer { reference } = opaque { unsafe HeapCell.retain(reference) }
+  if let AutoInitOpaque.Stack { reference } = opaque { unsafe HeapCell.retain(reference) }
+  let incoming = PropertySlot.lazy(context, kind, opaque)
+  let result = run Effect.result(add(&mut hooks, rt, ObjectRef.of(object), atom, (propertyFlags & JS_PROP_C_W_E) | JS_PROP_AUTOINIT, incoming))
+  return match move result {
+    Result<(), OutOfMemoryError>.Success { .. } => true
+    Result<(), OutOfMemoryError>.Failure { error } => { unsafe gc.releaseProperty(&mut hooks, rt.raw(), incoming) fail move error }
+  }
+}
+/// defineAutoInitProperty for an object the caller owns and that has no property
+/// atom, with a predefined atom: nothing needs rooting across the definition.
+pub unsafe effect fn defineFreshAutoInit<'a, 'b, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>,
+  object: ValueRef<'b>, atom: u32, kind: AutoInitKind, opaque: AutoInitOpaque,
+  propertyFlags: u32) -> bool ! OutOfMemoryError ? &mut Allocator {
+  return run unsafe defineAuto(&mut hooks, realm, realm.runtimeRef(), object, atom, kind, opaque, propertyFlags)
+}
+pub effect fn defineAutoInitProperty<'a, 'b, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>,
+  object: ValueRef<'b>, atom: u32, kind: AutoInitKind, opaque: AutoInitOpaque,
+  propertyFlags: u32) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let rt = realm.runtimeRef() let hold = realm.hold()
+  let root = object.dup() duplicateAtom(rt, atom)
+  let result = run Intrinsic.catchFailure<OutOfMemoryError>(unsafe defineAuto(&mut hooks, realm, rt, object, atom, kind, opaque, propertyFlags), failedOom)
+  realm.release(&mut hooks, move root) releaseHeldAtom(rt, atom)
+  hold.release(&mut hooks)
+  return match move result {
+    bool value => value
+    FailedOom { error } => { fail move error }
+  }
+}
+unsafe effect fn keyOperation<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, rt: RuntimeRef<'a>, object: ValueRef<'b>, key: Value,
+  incoming: &mut Value, propertyFlags: u32, defining: bool) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  if !defining && object.view().isObject() {
+    match key.view() {
+      ValueBits.Int { value: index } => {
+        let held = ObjectRef.of(object) let node = held.header() let id = classId(held)
+        if isTyped(id) {
+          realm.release(&mut hooks, move key)
+          // A negative Int is a canonical numeric string that is never a valid index.
+          if index < 0 { run unsafe typed.convertOutOfBoundsFree(&mut hooks, realm, node, takeIncoming(&mut incoming)) return true }
+          run unsafe typed.writeIndexFree(&mut hooks, realm, node, i32.toU64(index), takeIncoming(&mut incoming)) return true
+        }
+        let anchor = () let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+        let fast = p.fastArray() drop p
+        if fast && index >= 0 && i32.toU64(index) < count(held) &&
+          (id == classes.JS_CLASS_ARRAY || id == classes.JS_CLASS_ARGUMENTS || id == classes.JS_CLASS_MAPPED_ARGUMENTS) {
+          realm.release(&mut hooks, move key)
+          unsafe replaceDenseOwned(&mut hooks, rt, node, i32.toU32(index), takeIncoming(&mut incoming)) return true
+        }
+        if id == classes.JS_CLASS_ARRAY && fast && index >= 0 && i32.toU64(index) == count(held) && unsafe canExtendFast(node) {
+          realm.release(&mut hooks, move key)
+          let outcome = run unsafe arrays.appendFastElement(&mut hooks, realm, node, takeIncoming(&mut incoming))
+          return run storageResult(&mut hooks, realm, outcome, propertyFlags)
+        }
+      }
+      _ => ()
+    }
+  }
+  let converted = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError | BigIntError | JsException>(coercions.valueToAtom(&mut hooks, realm, key.borrow()), failed)
+  let atom = match move converted {
+    u32 value => value
+    Failed { error } => {
+      let _pending = run Effect.catch<JsException>(materialize(&mut hooks, realm, move error), exceptionValue)
+      realm.release(&mut hooks, move key) fail JsException {}
+    }
+  }
+  realm.release(&mut hooks, move key)
+  let mut effectiveFlags = propertyFlags
+  if defining { effectiveFlags = effectiveFlags | JS_PROP_HAS_VALUE | JS_PROP_HAS_CONFIGURABLE | JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE }
+  let result = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError | BigIntError | JsException>(unsafe atomOperation(&mut hooks, realm, rt, object, atom, &mut incoming, effectiveFlags, defining), failed)
+  releaseHeldAtom(rt, atom)
+  return match move result {
+    bool value => value
+    Failed { error } => { fail move error }
+  }
+}
+unsafe effect fn atomOperation<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, rt: RuntimeRef<'a>, object: ValueRef<'b>, atom: u32,
+  incoming: &mut Value, propertyFlags: u32, defining: bool) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  if defining { return run unsafe define(&mut hooks, realm, rt, object, atom, incoming.view(), immediateRef(ValueBits.Undefined), immediateRef(ValueBits.Undefined), propertyFlags) }
+  return run unsafe set(&mut hooks, realm, rt, object, atom, &mut incoming, object, propertyFlags)
+}
+effect fn ownedKeyOperation<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, key: Value, mut value: Value,
+  propertyFlags: u32, defining: bool) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  let rt = realm.runtimeRef() let hold = realm.hold()
+  let root = object.dup()
+  let result = run Effect.result(unsafe keyOperation(&mut hooks, realm, rt, object, move key, &mut value, propertyFlags, defining))
+  let settled = run settleMutation(&mut hooks, realm, move result)
+  realm.release(&mut hooks, move value) realm.release(&mut hooks, move root)
+  hold.release(&mut hooks)
+  return match move settled {
+    Result<bool, JsException>.Success { value: accepted } => accepted
+    Result<bool, JsException>.Failure { error } => { fail move error }
+  }
+}
+/// Both key and value are consumed, including conversion failure.
+effect fn setPropertyValueOwned<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, key: Value, value: Value, propertyFlags: u32) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  return run ownedKeyOperation(&mut hooks, realm, object, move key, move value, propertyFlags, false)
+}
+effect fn definePropertyValueValueOwned<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, key: Value, value: Value, propertyFlags: u32) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  return run ownedKeyOperation(&mut hooks, realm, object, move key, move value, propertyFlags, true)
+}
+effect fn setPropertyUint32Owned<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, index: u32, value: Value) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  return run setPropertyValueOwned(&mut hooks, realm, object, Value.immediate(ValueBits.number(u32.toF64(index))), move value, JS_PROP_THROW)
+}
+effect fn definePropertyValueUint32Owned<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, index: u32, value: Value, propertyFlags: u32) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  return run definePropertyValueValueOwned(&mut hooks, realm, object, Value.immediate(ValueBits.number(u32.toF64(index))), move value, propertyFlags)
+}
+effect fn definePropertyValueInt64Owned<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, index: i64, value: Value, propertyFlags: u32) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  // Appending a plain data element to a fast, extensible Array (map, Array.from,
+  // spreads) needs no key conversion: the same path keyOperation takes for a set.
+  let plain = JS_PROP_C_W_E | JS_PROP_THROW | JS_PROP_THROW_STRICT
+  if (propertyFlags & JS_PROP_C_W_E) == JS_PROP_C_W_E && (propertyFlags | plain) == plain && index >= 0 && object.view().isObject() {
+    let held = ObjectRef.of(object) let node = held.header()
+    if classId(held) == classes.JS_CLASS_ARRAY {
+      let anchor = () let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+      let fast = p.fastArray() drop p
+      if fast && i64.toU64(index) == count(held) && unsafe canExtendFast(node) {
+        let outcome = run unsafe arrays.appendFastElement(&mut hooks, realm, node, value.intoBits())
+        return run storageResult(&mut hooks, realm, outcome, propertyFlags)
+      }
+    }
+  }
+  // JS_NewInt64 rounds through Number, unlike JS_SetPropertyInt64's atom path.
+  return run definePropertyValueValueOwned(&mut hooks, realm, object, Value.immediate(ValueBits.number(i64.toF64(index))), move value, propertyFlags)
+}
+effect fn createDataPropertyUint32Owned<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, index: i64, value: Value, propertyFlags: u32) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  return run definePropertyValueInt64Owned(&mut hooks, realm, object, index, move value, propertyFlags | JS_PROP_C_W_E)
+}
+effect fn internIndex<'r>(rt: RuntimeRef<'r>, index: i64) -> u32
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let mut anchor = () let state = rt.stateMut(&mut anchor)
+  return run state.atoms.internInt64(index)
+}
+effect fn internString<'r>(rt: RuntimeRef<'r>, name: &[u8]) -> u32
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let mut anchor = () let state = rt.stateMut(&mut anchor)
+  let mut length: usize = 0
+  while length < name.length && name[length] != 0 { length = length + 1 }
+  return run state.atoms.internUtf8(Slice.view(name, 0, length))
+}
+effect fn stringOperation<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, name: &[u8], mut value: Value,
+  propertyFlags: u32, defining: bool) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  let rt = realm.runtimeRef() let hold = realm.hold()
+  let root = object.dup()
+  let atomResult = run Effect.result(internString(rt, name))
+  let operation = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError | BigIntError | JsException>(unsafe convertedAtomOperation(&mut hooks, realm, rt, object, move atomResult, &mut value, propertyFlags, defining), failed)
+  realm.release(&mut hooks, move value) realm.release(&mut hooks, move root)
+  hold.release(&mut hooks)
+  return match move operation {
+    bool accepted => accepted
+    Failed { error } => { fail move error }
+  }
+}
+unsafe effect fn convertedAtomOperation<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, rt: RuntimeRef<'a>, object: ValueRef<'b>,
+  converted: Result<u32, OutOfMemoryError | StringLengthError>, incoming: &mut Value,
+  propertyFlags: u32, defining: bool) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  let atom = match move converted {
+    Result<u32, OutOfMemoryError | StringLengthError>.Success { value } => value
+    Result<u32, OutOfMemoryError | StringLengthError>.Failure { error } => { fail move error }
+  }
+  let mut effectiveFlags = propertyFlags
+  if defining { effectiveFlags = effectiveFlags | JS_PROP_HAS_VALUE | JS_PROP_HAS_CONFIGURABLE | JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE }
+  let result = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError | BigIntError | JsException>(unsafe atomOperation(&mut hooks, realm, rt, object, atom, &mut incoming, effectiveFlags, defining), failed)
+  releaseHeldAtom(rt, atom)
+  return match move result {
+    bool value => value
+    Failed { error } => { fail move error }
+  }
+}
+effect fn setPropertyStrOwned<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, name: &[u8], value: Value) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  return run stringOperation(&mut hooks, realm, object, name, move value, JS_PROP_THROW, false)
+}
+effect fn definePropertyValueStrOwned<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, name: &[u8], value: Value, propertyFlags: u32) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  return run stringOperation(&mut hooks, realm, object, name, move value, propertyFlags, true)
+}
+effect fn setPropertyInt64Owned<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, index: i64, mut value: Value) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  if index >= 0 && index <= 2147483647 { return run setPropertyValueOwned(&mut hooks, realm, object, Value.immediate(ValueBits.Int { value: i64.toI32(index) }), move value, JS_PROP_THROW) }
+  let rt = realm.runtimeRef() let hold = realm.hold()
+  let root = object.dup()
+  let atomResult = run Effect.result(internIndex(rt, index))
+  let result = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError | BigIntError | JsException>(unsafe convertedAtomOperation(&mut hooks, realm, rt, object, move atomResult, &mut value, JS_PROP_THROW, false), failed)
+  realm.release(&mut hooks, move value) realm.release(&mut hooks, move root)
+  hold.release(&mut hooks)
+  return match move result {
+    bool accepted => accepted
+    Failed { error } => { fail move error }
+  }
+}
+
+/// Source's own-slot check deliberately does not invoke getters or auto-init.
+fn objectHasName<'a>(object: ValueRef<'a>) -> bool {
+  let held = ObjectRef.of(object)
+  return match own(held, atoms.JS_ATOM_name) {
+    Option<usize>.None => false
+    Option<usize>.Some { value: index } => {
+      return match slot(held, index) {
+        PropertySlot.Value { value } => !value.isString() || Strings.length(value) != 0
+        _ => true
+      }
+    }
+  }
+}
+effect fn bracketName(name: ValueBits) -> ValueBits ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let mut builder = StringBuilder.make()
+  let length = Strings.length(name)
+  run builder.reserve(length + 2, stringWide(name))
+  run builder.appendUnit(91)
+  let mut index: usize = 0
+  while index < length { run builder.appendUnit(Strings.codeUnit(name, index)) index = index + 1 }
+  run builder.appendUnit(93)
+  return run builder.finish()
+}
+pub effect fn functionName<'r>(rt: RuntimeRef<'r>, atom: u32) -> Value
+  ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  let anchor = () let state = rt.state(&anchor)
+  let name = run state.atoms.toValue(atom, true)
+  let brackets = state.atoms.hasDescription(atom) drop state
+  if !brackets { return unsafe Value.adoptBits(name) }
+  let result = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError>(bracketName(name), failedOomLength) Strings.release(name)
+  return match move result {
+    ValueBits value => unsafe Value.adoptBits(value)
+    FailedOomLength { error } => { fail move error }
+  }
+}
+effect fn nameExceptionValue(error: JsException) -> ValueBits { drop error return ValueBits.Exception }
+effect fn nameStringFailure<'a, H: CoercionHooks>(hooks: &mut H, realm: Realm<'a>,
+  error: OutOfMemoryError | StringLengthError) -> ValueBits ! JsException ? &mut Allocator {
+  match move error {
+    OutOfMemoryError _allocation => { return run hooks.throwOutOfMemory(realm) }
+    StringLengthError _length => { return run hooks.throwError(realm, NativeErrorKind.Internal, b"string too long") }
+  }
+}
+/// JS_DefineObjectName returns success even when Define returns false.
+pub effect fn defineObjectName<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, name: u32, propertyFlags: u32) -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  if name == 0 || !object.view().isObject() || objectHasName(object) { return () }
+  let rt = realm.runtimeRef()
+  let anchor = () let state = realm.runtimeState(&anchor)
+  let converted = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError>(state.atoms.toValue(name, true), failedOomLength) drop state
+  // Source does not check AtomToString: it defines the Exception value while
+  // retaining pending OOM, and can still return success.
+  let string = match move converted {
+    ValueBits value => value
+    FailedOomLength { error } =>
+      run Effect.catch<JsException>(nameStringFailure(&mut hooks, realm, move error), nameExceptionValue)
+  }
+  if propertyFlags == JS_PROP_CONFIGURABLE && unsafe replaceOwnName(&mut hooks, rt, object.view(), string) { return () }
+  let _accepted = run definePropertyValueOwned(&mut hooks, realm, object, atoms.JS_ATOM_name, unsafe Value.adoptBits(string), propertyFlags)
+}
+/// defineObjectName's common case: an anonymous function's own configurable,
+/// read-only "name" data property, where the definition only replaces the value.
+unsafe fn replaceOwnName<'r, H: HeapHooks>(hooks: &mut H, rt: RuntimeRef<'r>, object: ValueBits, string: ValueBits) -> bool {
+  let node = reference(object)
+  let mut anchor = () let data = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
+  if data.isExotic() { return false }
+  let index = match unsafe shapes.lookup(data.shape, atoms.JS_ATOM_name) { Option<usize>.Some { value } => value Option<usize>.None => { return false } }
+  if u8.toU32(unsafe shapes.slotFlags(data.shape, index)) != JS_PROP_CONFIGURABLE { return false }
+  let old = data.slot(index).valueBits()
+  data.setSlot(index, SlotBits.value(string))
+  drop data
+  unsafe gc.release(&mut hooks, rt.raw(), old)
+  return true
+}
+effect fn computedName<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, rt: RuntimeRef<'a>, object: ValueRef<'b>, key: ValueRef<'b>, propertyFlags: u32) -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  let atom = run coercions.valueToAtom(&mut hooks, realm, key)
+  let named = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError>(functionName(rt, atom), failedOomLength) releaseHeldAtom(rt, atom)
+  let name = match move named {
+    Value value => move value
+    FailedOomLength { error } => { fail move error }
+  }
+  let _accepted = run definePropertyValueOwned(&mut hooks, realm, object, atoms.JS_ATOM_name, move name, propertyFlags)
+}
+pub effect fn defineObjectNameComputed<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, key: ValueRef<'b>, propertyFlags: u32) -> ()
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  if !object.view().isObject() || objectHasName(object) { return () }
+  let rt = realm.runtimeRef() let hold = realm.hold()
+  let root = object.dup() let keyRoot = key.dup()
+  let result = run Effect.result(computedName(&mut hooks, realm, rt, object, key, propertyFlags))
+  drop keyRoot drop root
+  hold.release(&mut hooks)
+  match move result {
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | JsException>.Success { .. } => ()
+    Result<(), OutOfMemoryError | StringLengthError | BigIntError | JsException>.Failure { error } => { fail move error }
+  }
+}
+
+pub unsafe fn canExtendFast(node: *mut HeapHeader) -> bool {
+  let anchor = () let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, node)
+  if !p.extensible() { return false }
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, p.shape)
+  return match Pointer.nonNullMut<HeapHeader>(shape.prototype) {
+    Option<*mut HeapHeader>.None => true
+    Option<*mut HeapHeader>.Some { value } => {
+      let prototype = unsafe HeapCell.payload<ObjectData, ()>(&anchor, value)
+      return prototype.isStandardArrayPrototype()
+    }
+  }
+}
+
+/// Hands the incoming value's count to a store that adopts raw bits.
+@inlineAlways fn takeIncoming(incoming: &mut Value) -> ValueBits { return incoming.take().intoBits() }
+/// Frees the incoming value now, on a path that rejects the store.
+fn releaseIncoming<'a, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>, incoming: &mut Value) -> () { realm.release(&mut hooks, incoming.take()) }
+
+fn sameBinding(slot: PropertySlot, cell: *mut HeapHeader) -> bool {
+  return match slot {
+    PropertySlot.VarRef { reference } => Pointer.address<HeapHeader>(reference) == Pointer.address<HeapHeader>(cell)
+    _ => false
+  }
+}
+
+// Owned-value entries over the bit-level operations above.
+/// Consumes the owned value on every path.
+@inlineAlways
+pub effect fn setProperty<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, atom: u32, value: Value) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  return run setPropertyOwned(&mut hooks, realm, object, atom, move value)
+}
+/// Consumes the owned value on every path.
+@inlineAlways
+pub effect fn setPropertyInt64<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, index: i64, value: Value) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  return run setPropertyInt64Owned(&mut hooks, realm, object, index, move value)
+}
+/// Consumes the owned value on every path.
+@inlineAlways
+pub effect fn setPropertyStr<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, name: &[u8], value: Value) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  return run setPropertyStrOwned(&mut hooks, realm, object, name, move value)
+}
+/// Consumes the owned value on every path.
+@inlineAlways
+pub effect fn setPropertyUint32<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, index: u32, value: Value) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  return run setPropertyUint32Owned(&mut hooks, realm, object, index, move value)
+}
+/// Consumes the owned value and key on every path.
+@inlineAlways
+pub effect fn setPropertyValue<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, key: Value, value: Value, propertyFlags: u32) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  return run setPropertyValueOwned(&mut hooks, realm, object, move key, move value, propertyFlags)
+}
+/// Consumes the owned value on every path.
+@inlineAlways
+pub effect fn definePropertyValue<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, atom: u32, value: Value, propertyFlags: u32) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  return run definePropertyValueOwned(&mut hooks, realm, object, atom, move value, propertyFlags)
+}
+/// Consumes the owned value on every path.
+@inlineAlways
+pub effect fn definePropertyValueUint32<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, index: u32, value: Value, propertyFlags: u32) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  return run definePropertyValueUint32Owned(&mut hooks, realm, object, index, move value, propertyFlags)
+}
+/// Consumes the owned value on every path.
+@inlineAlways
+pub effect fn definePropertyValueInt64<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, index: i64, value: Value, propertyFlags: u32) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  return run definePropertyValueInt64Owned(&mut hooks, realm, object, index, move value, propertyFlags)
+}
+/// Consumes the owned value on every path.
+@inlineAlways
+pub effect fn definePropertyValueStr<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, name: &[u8], value: Value, propertyFlags: u32) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  return run definePropertyValueStrOwned(&mut hooks, realm, object, name, move value, propertyFlags)
+}
+/// Consumes the owned value and key on every path.
+@inlineAlways
+pub effect fn definePropertyValueValue<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, key: Value, value: Value, propertyFlags: u32) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  return run definePropertyValueValueOwned(&mut hooks, realm, object, move key, move value, propertyFlags)
+}
+/// Consumes the owned value on every path.
+@inlineAlways
+pub effect fn createDataPropertyUint32<'a, 'b, H: HeapHooks + OwnPropertyHooks + CoercionHooks + PropertyWriteHooks>(hooks: &mut H,realm: Realm<'a>, object: ValueRef<'b>, index: i64, value: Value, propertyFlags: u32) -> bool
+  ! OutOfMemoryError | StringLengthError | BigIntError | JsException ? &mut Allocator {
+  return run createDataPropertyUint32Owned(&mut hooks, realm, object, index, move value, propertyFlags)
+}

@@ -1,0 +1,334 @@
+//! Native quickjs-libc.c synchronous os module. Callback IDs 0..199; table 0.
+//! Raw descriptors have source process-wide, caller-managed lifetime; releasing a
+//! detached Worker's runtime does not close them or interrupt native operations.
+import js_realm { Realm, Arguments }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.mem.pointer { Pointer }
+import silk.num.u8
+import silk.num.i32
+import silk.num.i64
+import silk.num.isize
+import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import runtime_memory { AllocationObserver }
+import js_heap { HeapCell, CellRef }
+import js_value { ValueBits }
+import js_intl_realm as ops
+import js_core_types { NativeFunctionId, BuiltinFamily, NativeErrorKind, PropertyEnum, RuntimeState, ModuleDef }
+import js_gc { HeapHooks }
+import js_coercion_host { CoercionHooks }
+import js_property_host { OwnPropertyHooks, GetPropertyHooks, OwnKeysHooks }
+import js_property_write_host { PropertyWriteHooks }
+import js_exceptions { JsException }
+import js_string_types { StringLengthError }
+import js_strings { Strings }
+import js_integer_coercions as integers
+import js_bigint_coercions as bigints
+import js_intl_common as common
+import js_collection_support as owners
+import js_owned_value { Value, ValueRef }
+import js_proxy_core as core
+import js_runtime as runtime
+import js_buffer_storage as buffers
+import js_property_names as names
+import js_property_names { OwnKeysError }
+import js_module_native as modules
+import js_module_metadata { ModuleMetadataError }
+import js_intrinsic_properties { Entry, Definition, IntrinsicDefinitions }
+import js_native_functions as functions
+import js_os_platform as os
+import js_os_platform { Directory }
+import js_os_platform_process as process
+import js_os_platform_process { Options }
+import js_os_platform_terminal as terminal
+import js_os_events as events
+import js_os_workers as workers
+import js_os_platform_exports as exports
+
+pub const INITIALIZE: u32 = 199
+pub const NOW: u32 = 30
+pub fn nativeId(method: u32) -> NativeFunctionId { return NativeFunctionId.Builtin { family: BuiltinFamily.Os, method: method } }
+fn number(value: i64) -> ValueBits { if value >= -2147483648 && value <= 2147483647 { return ValueBits.Int { value: i64.toI32(value) } } return ValueBits.Float64 { value: i64.toF64(value) } }
+effect fn int<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H, realm: Realm<'a>, value: ValueRef<'b>) -> i32 ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let mut result: i32 = 0 run integers.toInt32(&mut hooks,realm,&mut result,value.borrow()) return result
+}
+effect fn wide<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H, realm: Realm<'a>, value: ValueRef<'b>) -> i64 ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let mut result: i64 = 0 run integers.toInt64(&mut hooks,realm,&mut result,value.borrow()) return result
+}
+pub effect fn cstring<'a, 'b, H: HeapHooks + CoercionHooks>(hooks: &mut H, realm: Realm<'a>, value: ValueRef<'b>) -> List<u8> ! OutOfMemoryError | JsException ? &mut Allocator {
+  let text = run common.toString(&mut hooks,realm,value)
+  let encoded = run Effect.result(Strings.toUtf8(text.view(),false)) drop text
+  let mut bytes = match move encoded { Result<List<u8>,OutOfMemoryError>.Success { value:encodedBytes } => move encodedBytes Result<List<u8>,OutOfMemoryError>.Failure { error } => { fail move error } }
+  run bytes.append(0) return move bytes
+}
+fn ptr(bytes: &List<u8>) -> *const u8 { return Pointer.fromRef(&bytes.asSlice()[0]) }
+effect fn pairArray<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, first: Value, second: Value) -> ValueBits ! JsException ? &mut Allocator {
+  let array = run common.array(&mut hooks,memory,realm)
+  run common.defineIndex(&mut hooks,realm,array.borrow(),0,move first)
+  run common.defineIndex(&mut hooks,realm,array.borrow(),1,move second)
+  return array.intoBits()
+}
+unsafe effect fn bufferString(data: *const u8) -> Value ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+  return unsafe Value.adoptBits(run unsafe Strings.fromUtf8Pointer(data,unsafe os.length(data)))
+}
+effect fn environment<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + OwnKeysHooks>(hooks: &mut H, realm: Realm<'a>, object: ValueRef<'b>, options: &mut process.Options) -> () ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let listed = run Effect.result(names.getOwnPropertyNames(&mut hooks,realm,object,17))
+  let keys = match move listed {
+    Result<List<PropertyEnum>,OutOfMemoryError | OwnKeysError | JsException | StringLengthError>.Success { value } => move value
+    Result<List<PropertyEnum>,OutOfMemoryError | OwnKeysError | JsException | StringLengthError>.Failure { error } => {
+      match move error {
+        OwnKeysError own => { return run ownKeysError(&mut hooks,realm,move own) }
+        OutOfMemoryError allocation => { fail move allocation }
+        StringLengthError length => { fail move length }
+        JsException exception => { fail move exception }
+      }
+    }
+  }
+  let result = run Effect.result(environmentBody(&mut hooks,realm,object,&keys,&mut options))
+  realm.releaseNames(move keys)
+  match move result { Result<(),OutOfMemoryError | JsException>.Success { .. } => () Result<(),OutOfMemoryError | JsException>.Failure { error } => { fail move error } }
+}
+/// bytes up to its first NUL.
+fn untilNul(bytes: &[u8]) -> &[u8] {
+  let mut length: usize = 0
+  while length < bytes.length && bytes[length] != 0 { length = length + 1 }
+  return Slice.view(bytes, 0, length)
+}
+effect fn environmentBody<'a, 'b, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks>(hooks: &mut H, realm: Realm<'a>, object: ValueRef<'b>, keys: &List<PropertyEnum>, options: &mut process.Options) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+  let mut index: usize = 0 run options.environment.reserveExact(keys.length())
+  while index < keys.length() {
+    let property = run owners.get(&mut hooks,realm,object,keys.get(index).atom)
+    let value = run cstring(&mut hooks,realm,property.borrow())
+    let name = run core.atomKey(&mut hooks, realm, keys.get(index).atom)
+    let key = run cstring(&mut hooks,realm,name.borrow())
+    let keyBytes = untilNul(key.asSlice()) let valueBytes = untilNul(value.asSlice())
+    let mut pair = List<u8>.make() run pair.reserveExact(keyBytes.length + valueBytes.length + 2)
+    run pair.appendSlice(keyBytes) run pair.append(61) run pair.appendSlice(valueBytes)
+    run pair.append(0) run options.environment.append(move pair) index = index + 1
+  }
+}
+effect fn exec<'a, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + OwnKeysHooks>(hooks: &mut H, realm: Realm<'a>, args: Arguments<'a>) -> ValueBits ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let argList = args.get(0) let mut options = Options.make()
+  let length = run common.get(&mut hooks,realm,argList,b"length")
+  let mut count: u32 = 0 run integers.toUint32(&mut hooks,realm,&mut count,length.borrow()) drop length
+  if count < 1 || count > 65535 { return run ops.throwError(&mut hooks,realm,NativeErrorKind.Type,b"invalid number of arguments") }
+  run options.arguments.reserveExact(u32.toUsize(count)) let mut index: u32 = 0
+  while index < count {
+    let element = run owners.getIndex(&mut hooks,realm,argList,index)
+    let argument = run cstring(&mut hooks,realm,element.borrow())
+    run options.arguments.append(move argument) index = index + 1
+  }
+  if args.slots().length() >= 2 {
+    let _object = args.get(1).view()
+    // An undefined option owns nothing, so only a defined one is freed.
+    let block = run common.get(&mut hooks,realm,args.get(1),b"block")
+    if !core.undefined(block.view()) { options.block = core.toBoolFree(&mut hooks, realm, move block) }
+    let usePath = run common.get(&mut hooks,realm,args.get(1),b"usePath")
+    if !core.undefined(usePath.view()) { options.usePath = core.toBoolFree(&mut hooks, realm, move usePath) }
+    let file = run common.get(&mut hooks,realm,args.get(1),b"file")
+    if !core.undefined(file.view()) { options.file = run cstring(&mut hooks,realm,file.borrow()) }
+    let cwd = run common.get(&mut hooks,realm,args.get(1),b"cwd")
+    if !core.undefined(cwd.view()) { options.cwd = run cstring(&mut hooks,realm,cwd.borrow()) }
+    let mut fdIndex: usize = 0
+    while fdIndex < 3 {
+      let name = match fdIndex { 0 => b"stdin" 1 => b"stdout" _ => b"stderr" }
+      let fd = run common.get(&mut hooks,realm,args.get(1),name)
+      if !core.undefined(fd.view()) { options.fds[fdIndex] = run int(&mut hooks,realm,fd.borrow()) }
+      fdIndex = fdIndex + 1
+    }
+    let env = run common.get(&mut hooks,realm,args.get(1),b"env")
+    if !core.undefined(env.view()) { options.customEnvironment = true run environment(&mut hooks,realm,env.borrow(),&mut options) }
+    let uid = run common.get(&mut hooks,realm,args.get(1),b"uid")
+    if !core.undefined(uid.view()) { run integers.toUint32(&mut hooks,realm,&mut options.uid,uid.borrow()) }
+    let gid = run common.get(&mut hooks,realm,args.get(1),b"gid")
+    if !core.undefined(gid.view()) { run integers.toUint32(&mut hooks,realm,&mut options.gid,gid.borrow()) }
+  }
+  let result = run unsafe process.spawn(&options)
+  if result == process.FORK_ERROR { return run ops.throwError(&mut hooks,realm,NativeErrorKind.Type,b"fork error") }
+  return ValueBits.Int { value: result }
+}
+effect fn body<'a, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + OwnKeysHooks + PropertyWriteHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, method: u32, args: Arguments<'a>) -> ValueBits ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let _a = args.get(0).view() let b = args.get(1).view()
+  let c = args.get(2).view()
+  if method == NOW { return ValueBits.Float64 { value: os.now() } }
+  if method == 26 { return ValueBits.Int { value: unsafe os.getpid() } }
+  if method == 19 { return run exec(&mut hooks,realm,args) }
+  if method == 21 {
+    let mut fds: [i32;2] = [0;2]
+    let opened = os.result(unsafe os.pipe(Pointer.fromMutRef(&mut fds[0])))
+    if opened < 0 { return ValueBits.Null }
+    let result = run Effect.result(pairArray(&mut hooks,memory,realm,Value.immediate(ValueBits.Int { value:fds[0] }),Value.immediate(ValueBits.Int { value:fds[1] })))
+    match move result { Result<ValueBits,JsException>.Success { value } => { return value } Result<ValueBits,JsException>.Failure { error } => { let _x = unsafe os.close(fds[0]) let _y = unsafe os.close(fds[1]) fail move error } }
+  }
+  if method == 11 || method == 27 || method == 17 {
+    let mut path = List<u8>.make()
+    if method != 11 { path = run cstring(&mut hooks,realm,args.get(0)) }
+    let mut data: [u8;4096] = [0;4096] let output = Pointer.fromMutRef(&mut data[0]) let mut error: i32 = 0
+    if method == 11 { if Pointer.isNull<u8>(unsafe os.getcwd(output,os.pathMax())) { error = os.errno() data[0] = 0 } }
+    else { if method == 27 { if Pointer.isNull<u8>(unsafe os.realpath(ptr(&path),output)) { error = os.errno() data[0] = 0 } }
+      else { let size = isize.toI64(unsafe os.readlink(ptr(&path),output,os.pathMax() - 1)) if size < 0 { error = os.errno() data[0] = 0 } else { data[i64.toUsize(size)] = 0 } }
+    }
+    let text = unsafe Value.adoptBits(run Strings.fromUtf8(untilNul(&data)))
+    return run pairArray(&mut hooks,memory,realm,move text,Value.immediate(ValueBits.Int { value:error }))
+  }
+  if method == 0 {
+    let path = run cstring(&mut hooks,realm,args.get(0)) let flags = run int(&mut hooks,realm,args.get(1)) let mut mode: i32 = 438
+    if args.slots().length() >= 3 && !core.undefined(c) { mode = run int(&mut hooks,realm,args.get(2)) }
+    return ValueBits.Int { value:os.result(unsafe os.open(ptr(&path),flags,mode)) }
+  }
+  if method == 10 {
+    let mut mode: i32 = 511 if args.slots().length() >= 2 { mode = run int(&mut hooks,realm,args.get(1)) }
+    let path = run cstring(&mut hooks,realm,args.get(0))
+    return ValueBits.Int { value:os.result(unsafe os.mkdir(ptr(&path),os.unsigned32(mode))) }
+  }
+  if method == 15 {
+    let atime = run wide(&mut hooks,realm,args.get(1)) let mtime = run wide(&mut hooks,realm,args.get(2))
+    let path = run cstring(&mut hooks,realm,args.get(0))
+    return ValueBits.Int { value:unsafe os.utimes(ptr(&path),atime,mtime) }
+  }
+  if method == 8 || method == 9 || method == 12 || method == 16 || method == 13 || method == 14 || method == 18 {
+    let path = run cstring(&mut hooks,realm,args.get(0))
+    if method == 8 { return ValueBits.Int { value:os.result(unsafe os.remove(ptr(&path))) } }
+    if method == 12 { return ValueBits.Int { value:os.result(unsafe os.chdir(ptr(&path))) } }
+    if method == 9 || method == 16 {
+      let target = run cstring(&mut hooks,realm,args.get(1)) let mut result: i32 = 0
+      if method == 9 { result = os.result(unsafe os.rename(ptr(&path),ptr(&target))) } else { result = os.result(unsafe os.symlink(ptr(&path),ptr(&target))) }
+      return ValueBits.Int { value:result }
+    }
+    if method == 18 {
+      let listing = run common.array(&mut hooks,memory,realm)
+      let directory = unsafe Directory.open(ptr(&path)) let mut error: i32 = 0
+      if !directory.valid() { error = os.errno() } else {
+        let mut index: u32 = 0
+        while true {
+          os.setErrno(0) let entry = unsafe directory.next()
+          if Pointer.isNull<u8>(entry) { error = os.errno() break }
+          let text = run unsafe bufferString(unsafe Intrinsic.pointerRequalify<?*mut u8,*const u8>(entry))
+          run common.defineIndex(&mut hooks,realm,listing.borrow(),index,move text) index = index + 1
+        }
+      }
+      return run pairArray(&mut hooks,memory,realm,move listing,Value.immediate(ValueBits.Int { value:error }))
+    }
+    let mut stat = os.Stat { fields:[0;12] } let error = unsafe os.stat(ptr(&path),method == 14,&mut stat)
+    if error != 0 { return run pairArray(&mut hooks,memory,realm,Value.immediate(ValueBits.Null),Value.immediate(ValueBits.Int { value:-error })) }
+    let fields = run ops.object(&mut hooks,memory,realm)
+    let mut index: usize = 0
+    while index < 12 {
+      let name = match index { 0=>b"dev" 1=>b"ino" 2=>b"mode" 3=>b"nlink" 4=>b"uid" 5=>b"gid" 6=>b"rdev" 7=>b"size" 8=>b"blocks" 9=>b"atime" 10=>b"mtime" _=>b"ctime" }
+      run common.define(&mut hooks,realm,fields.borrow(),name,Value.immediate(number(stat.fields[index])),7) index = index + 1
+    }
+    return run pairArray(&mut hooks,memory,realm,move fields,Value.immediate(ValueBits.Int { value:0 }))
+  }
+  if method == 25 { return ValueBits.Int { value:events.sleep(realm,run wide(&mut hooks,realm,args.get(0))) } }
+  let fd = run int(&mut hooks,realm,args.get(0))
+  if method == 1 { return ValueBits.Int { value:os.result(unsafe os.close(fd)) } }
+  if method == 5 { return ValueBits.Bool { value:unsafe os.isatty(fd) != 0 } }
+  if method == 23 { return ValueBits.Int { value:os.result(unsafe os.dup(fd)) } }
+  if method == 7 { run terminal.setRaw(&mut hooks,realm,fd) return ValueBits.Undefined }
+  if method == 6 { let mut cols: i32 = 0 let mut rows: i32 = 0 if !os.window(fd,&mut cols,&mut rows) { return ValueBits.Null } return run pairArray(&mut hooks,memory,realm,Value.immediate(ValueBits.Int { value:cols }),Value.immediate(ValueBits.Int { value:rows })) }
+  if method == 2 {
+    let mut position: i64 = 0 run bigints.toInt64Ext(&mut hooks,realm,&mut position,args.get(1))
+    let whence = run int(&mut hooks,realm,args.get(2)) let result = os.wideResult(unsafe os.lseek(fd,position,whence))
+    if b.isBigInt() { return run bigints.newBigInt64(result) } return number(result)
+  }
+  if method == 3 || method == 4 {
+    let mut position: u64 = 0 let mut length: u64 = 0
+    run integers.toIndex(&mut hooks,realm,&mut position,args.get(2)) run integers.toIndex(&mut hooks,realm,&mut length,args.get(3))
+    let buffer = run buffers.requireBuffer(&mut hooks,realm,args.get(1),-1) let state = buffer.state()
+    if state.detached { return run ops.throwError(&mut hooks,realm,NativeErrorKind.Type,b"ArrayBuffer is detached") }
+    if position > state.byteLength || length > state.byteLength - position { return run ops.throwError(&mut hooks,realm,NativeErrorKind.Range,b"read/write array buffer overflow") }
+    let mut result: i64 = 0
+    if state.physicalCapacity != 0 {
+      // The kernel cannot issue atomic accesses to SharedArrayBuffer cells.
+      // Snapshot/scatter atomically around the single source-defined syscall.
+      let mut temporary = List<u8>.make()
+      let mut capacity = u64.toUsize(length) if capacity == 0 { capacity = 1 }
+      run temporary.appendRepeated(0,capacity)
+      let mut index: u64 = 0
+      if method == 4 {
+        while index < length { let _previous = Intrinsic.replace(temporary.asMutSlice()[u64.toUsize(index)],u64.toU8(unsafe buffers.loadScalar(state,position + index,0))) index = index + 1 }
+      }
+      let data = Pointer.fromMutRef(&mut temporary.asMutSlice()[0])
+      if method == 3 {
+        result = os.wideResult(isize.toI64(unsafe os.read(fd,data,u64.toUsize(length))))
+        while result > 0 && i64.toU64(result) > index { unsafe buffers.storeScalar(state,position + index,0,u8.toU64(temporary.asSlice()[u64.toUsize(index)])) index = index + 1 }
+      } else { result = os.wideResult(isize.toI64(unsafe os.write(fd,data,u64.toUsize(length)))) }
+    } else {
+      let data = unsafe buffers.dataAt(state.data,position)
+      if method == 3 { result = os.wideResult(isize.toI64(unsafe os.read(fd,data,u64.toUsize(length)))) }
+      else { result = os.wideResult(isize.toI64(unsafe os.write(fd,data,u64.toUsize(length)))) }
+    }
+    return number(result)
+  }
+  let other = run int(&mut hooks,realm,args.get(1))
+  if method == 22 { return ValueBits.Int { value:os.result(unsafe os.kill(fd,other)) } }
+  if method == 24 { return ValueBits.Int { value:os.result(unsafe os.dup2(fd,other)) } }
+  if method == 20 {
+    // WNOHANG's unchanged status is uninitialized in C: define it as zero.
+    let mut status: i32 = 0 let result = os.result(unsafe os.waitpid(fd,Pointer.fromMutRef(&mut status),other))
+    if result < 0 { status = 0 }
+    return run pairArray(&mut hooks,memory,realm,Value.immediate(ValueBits.Int { value:result }),Value.immediate(ValueBits.Int { value:status }))
+  }
+  return Intrinsic.trap("unknown synchronous os callback")
+}
+pub effect fn dispatch<'a, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + OwnKeysHooks + PropertyWriteHooks>(hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, method: u32, receiverRef: ValueRef<'a>, argvArgs: Arguments<'a>, magic: i32) -> ValueBits ! JsException ? &mut Allocator {
+  let _receiver = receiverRef.view() let _argc = usize.toI32(argvArgs.length())
+  let result = run Effect.result(body(&mut hooks,memory,realm,method,argvArgs))
+  return match move result { Result<ValueBits,OutOfMemoryError | StringLengthError | JsException>.Success { value } => value Result<ValueBits,OutOfMemoryError | StringLengthError | JsException>.Failure { error } => run core.materialize(&mut hooks,realm,move error) }
+}
+
+effect fn uninitialized<'a, H: OwnPropertyHooks>(hooks: &mut H,realm: Realm<'a>,atom: u32) -> ValueBits ! JsException ? &mut Allocator {
+  return run hooks.throwUninitialized(realm,atom)
+}
+effect fn ownKeysError<'a, H: CoercionHooks + OwnPropertyHooks>(hooks: &mut H,realm: Realm<'a>,error: OwnKeysError) -> never ! JsException ? &mut Allocator {
+  match move error {
+    OwnKeysError.NotObject => { return run ops.throwError(&mut hooks,realm,NativeErrorKind.Type,b"not an object") }
+    OwnKeysError.Uninitialized { name } => {
+      let rt = realm.runtime() let mut anchor = ()
+      let state = unsafe HeapCell.payloadMut<RuntimeState,()>(&mut anchor,rt)
+      let interned = run Effect.result(state.atoms.internOwned(unsafe name.get().retained())) drop state
+      let atom = match move interned { Result<u32,OutOfMemoryError>.Success { value } => value Result<u32,OutOfMemoryError>.Failure { .. } => { return run hooks.throwOutOfMemory(realm) } }
+      let thrown = run Effect.result(uninitialized(&mut hooks,realm,atom))
+      let release = unsafe HeapCell.payloadMut<RuntimeState,()>(&mut anchor,rt) release.atoms.release(atom) drop release
+      match move thrown { Result<ValueBits,JsException>.Success { .. } => Intrinsic.trap("throwUninitialized returned") Result<ValueBits,JsException>.Failure { error:signal } => { fail move signal } }
+    }
+  }
+}
+pub fn tableLength(table: u32) -> u32 { return exports.tableLength(table) }
+pub fn entry(table: u32,index: u32) -> Entry { return exports.entry(table,index) }
+pub effect fn addModule<'a>(realm: Realm<'a>,name: &[u8]) -> CellRef<ModuleDef> ! OutOfMemoryError | StringLengthError | ModuleMetadataError ? &mut Allocator {
+  let module = run modules.newNativeModule(realm,name,nativeId(INITIALIZE))
+  let mut index: u32 = 0
+  while index < tableLength(0) { let row = entry(0,index) run modules.addModuleExport(realm,module,row.name) index = index + 1 }
+  run modules.addModuleExport(realm,module,b"Worker")
+  return module
+}
+effect fn initializeBody<'a, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + IntrinsicDefinitions>(hooks: &mut H,memory: &AllocationObserver,realm: Realm<'a>,module: CellRef<ModuleDef>) -> () ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  events.enablePolling(realm)
+  let worker = run workers.createConstructor(&mut hooks,memory,realm)
+  let _installed = run unsafe modules.setModuleExport(&mut hooks,realm,module,b"Worker",unsafe Value.adoptBits(worker))
+  let mut index: u32 = 0
+  while index < tableLength(0) {
+    let row = entry(0,index)
+    let value = match move row.definition {
+      Definition.Function { function } => run functions.newFunction(&mut hooks,memory,realm,function.callback,function.name,function.length,function.protocol,function.magic)
+      Definition.Int32 { value:integer } => ValueBits.Int { value:integer }
+      Definition.String { value:text } => run Strings.fromUtf8(text)
+      _ => Intrinsic.trap("invalid os export definition")
+    }
+    let _exported = run unsafe modules.setModuleExport(&mut hooks,realm,module,row.name,unsafe Value.adoptBits(value))
+    index = index + 1
+  }
+}
+pub effect fn initializeModule<'a, H: HeapHooks + CoercionHooks + OwnPropertyHooks + GetPropertyHooks + PropertyWriteHooks + IntrinsicDefinitions>(hooks: &mut H,memory: &AllocationObserver,realm: Realm<'a>,module: CellRef<ModuleDef>) -> () ! JsException ? &mut Allocator {
+  let result = run Effect.result(initializeBody(&mut hooks,memory,realm,module))
+  match move result {
+    Result<(),OutOfMemoryError | StringLengthError | JsException>.Success { .. } => ()
+    Result<(),OutOfMemoryError | StringLengthError | JsException>.Failure { error } => { return run ops.materialize(&mut hooks,realm,move error) }
+  }
+}

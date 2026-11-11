@@ -1,0 +1,190 @@
+--- a/src/fd_table.h
++++ b/src/fd_table.h
+@@ -19,6 +19,8 @@
+   uvwasi_rights_t rights_base;
+   uvwasi_rights_t rights_inheriting;
+   int preopen;
++  /* Automatic destruction closes owned entries; explicit fd_close always closes. */
++  int owned;
+   uv_mutex_t mutex;
+ };
+ 
+--- a/src/fd_table.c
++++ b/src/fd_table.c
+@@ -46,6 +46,9 @@
+                                &wrap);
+   if (err != UVWASI_ESUCCESS)
+     return err;
++
++  /* Host stdio is borrowed until the guest explicitly closes or replaces it. */
++  wrap->owned = 0;
+ 
+   if (wrap->id != expected)
+     err = UVWASI_EBADF;
+@@ -110,7 +113,7 @@
+     err = uvwasi__normalize_path(mp_copy, mp_len, np_copy, mp_len);
+     if (err) {
+       uvwasi__free(uvwasi, entry);
+-      goto exit;
++      return err;
+     }
+   }
+ 
+@@ -151,10 +154,9 @@
+     }
+   }
+ 
+-  table->fds[index] = entry;
+-
+   r = uv_mutex_init(&entry->mutex);
+   if (r != 0) {
++    uvwasi__free(uvwasi, entry);
+     err = uvwasi__translate_uv_error(r);
+     goto exit;
+   }
+@@ -169,6 +171,9 @@
+   entry->rights_base = rights_base;
+   entry->rights_inheriting = rights_inheriting;
+   entry->preopen = preopen;
++  entry->owned = 1;
++  /* Publish only a fully initialized entry. Renumber moves this ownership bit. */
++  table->fds[index] = entry;
+ 
+   if (wrap != NULL) {
+     uv_mutex_lock(&entry->mutex);
+--- a/src/uvwasi.c
++++ b/src/uvwasi.c
+@@ -386,8 +386,13 @@
+     uv_fs_req_cleanup(&realpath_req);
+     uv_fs_req_cleanup(&open_req);
+ 
+-    if (err != UVWASI_ESUCCESS)
++    if (err != UVWASI_ESUCCESS) {
++      /* The fd table never took ownership of this newly opened descriptor. */
++      uv_fs_t close_req;
++      uv_fs_close(NULL, &close_req, r, NULL);
++      uv_fs_req_cleanup(&close_req);
+       goto exit;
++    }
+   }
+ 
+   if (options->preopen_socketc > 0) {
+@@ -432,9 +437,19 @@
+ }
+ 
+ void uvwasi_destroy(uvwasi_t* uvwasi) {
++  uint32_t i;
+   if (uvwasi == NULL)
+     return;
+ 
++  /* Entries retain ownership through fd_renumber and guest descriptor reuse.
++     Borrowed host stdio survives automatic disposal, but fd_close retains its
++     existing behavior of explicitly closing even a borrowed descriptor. */
++  if (uvwasi->fds != NULL) {
++    for (i = 0; i < uvwasi->fds->size; ++i) {
++      if (uvwasi->fds->fds[i] != NULL && uvwasi->fds->fds[i]->owned)
++        uvwasi_fd_close(uvwasi, i);
++    }
++  }
+   uvwasi_fd_table_free(uvwasi, uvwasi->fds);
+   uvwasi__free(uvwasi, uvwasi->argv_buf);
+   uvwasi__free(uvwasi, uvwasi->argv);
+--- /dev/null
++++ b/test/test-fd-ownership.c
+@@ -0,0 +1,96 @@
++/* Unix ownership regression coverage for Silk's uvwasi 0.0.23 patch.
++ * Original uvwasi and this extension are MIT-licensed. */
++#include <assert.h>
++#include <dirent.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include "uvwasi.h"
++#include "../src/fd_table.h"
++
++static int descriptor_count(void) {
++  DIR* directory = opendir("/dev/fd");
++  struct dirent* entry;
++  int count = 0;
++  assert(directory != NULL);
++  while ((entry = readdir(directory)) != NULL) {
++    if (entry->d_name[0] != '.')
++      count++;
++  }
++  closedir(directory);
++  return count;
++}
++
++static void closed(int fd) {
++  errno = 0;
++  assert(fcntl(fd, F_GETFD) == -1 && errno == EBADF);
++}
++
++int main(void) {
++  char directory[] = "/tmp/uvwasi-owned-XXXXXX";
++  char regular[] = "/tmp/uvwasi-file-XXXXXX";
++  uvwasi_t wasi;
++  uvwasi_options_t options;
++  uvwasi_preopen_t preopens[2];
++  int borrowed;
++  int owned;
++  int before;
++  int regular_fd;
++  assert(mkdtemp(directory) != NULL);
++  regular_fd = mkstemp(regular);
++  assert(regular_fd >= 0);
++  close(regular_fd);
++  preopens[0].mapped_path = "/sandbox";
++  preopens[0].real_path = directory;
++  preopens[1].mapped_path = "/bad";
++  preopens[1].real_path = regular;
++
++  /* Successful disposal closes preopens but preserves supplied host stdio. */
++  borrowed = open("/dev/null", O_RDWR);
++  assert(borrowed >= 0);
++  memset(&wasi, 0, sizeof(wasi));
++  uvwasi_options_init(&options);
++  options.out = borrowed;
++  options.preopenc = 1;
++  options.preopens = preopens;
++  assert(uvwasi_init(&wasi, &options) == UVWASI_ESUCCESS);
++  owned = wasi.fds->fds[3]->fd;
++  uvwasi_destroy(&wasi);
++  closed(owned);
++  assert(fcntl(borrowed, F_GETFD) != -1);
++  close(borrowed);
++
++  /* Explicit guest fd_close still closes the borrowed host descriptor. */
++  borrowed = open("/dev/null", O_RDWR);
++  assert(borrowed >= 0);
++  options.out = borrowed;
++  assert(uvwasi_init(&wasi, &options) == UVWASI_ESUCCESS);
++  assert(uvwasi_fd_close(&wasi, 1) == UVWASI_ESUCCESS);
++  closed(borrowed);
++  uvwasi_destroy(&wasi);
++
++  /* An owned preopen moved into stdout is still owned, not leaked as stdio. */
++  borrowed = open("/dev/null", O_RDWR);
++  assert(borrowed >= 0);
++  options.out = borrowed;
++  assert(uvwasi_init(&wasi, &options) == UVWASI_ESUCCESS);
++  owned = wasi.fds->fds[3]->fd;
++  assert(uvwasi_fd_renumber(&wasi, 3, 1) == UVWASI_ESUCCESS);
++  closed(borrowed);
++  uvwasi_destroy(&wasi);
++  closed(owned);
++
++  /* Failure after an earlier preopen, including a newly opened non-directory,
++     closes both the inserted fd and the fd rejected before table insertion. */
++  options.out = 1;
++  options.preopenc = 2;
++  before = descriptor_count();
++  assert(uvwasi_init(&wasi, &options) == UVWASI_ENOTDIR);
++  uvwasi_destroy(&wasi);
++  assert(descriptor_count() == before);
++  unlink(regular);
++  rmdir(directory);
++  return 0;
++}

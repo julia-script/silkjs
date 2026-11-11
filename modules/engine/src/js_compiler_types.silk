@@ -1,0 +1,466 @@
+//! Transient QuickJS compiler state, quickjs.c:22321-22542. Not executable bytecode.
+//! Function definitions live in one FunctionTree owned by the compile entry point, not
+//! on the JS heap. Parent/child/sibling links are FunctionIds into that tree; destruction
+//! unlinks and retires a definition; retiring the last one frees the tree's storage.
+//! List references may not escape mutation; scope/block/relocation links are indices.
+//! Every mutable operation requires exclusive access to the tree and its runtime;
+//! allocators must not reenter it. ValueBits copies are borrowed, never implicit retains.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.mem.pointer { Pointer }
+import silk.num.usize
+import silk.num.u32
+import byte_buffer { ByteBuffer }
+import thin_list { ThinList, BoxList, ThinBox, PairList }
+import js_heap { HeapHeader, HeapCell, CellRef }
+import js_value { ValueBits }
+import js_core_types { LineTables, ClosureVar, VariableKind, FunctionKind, ModuleDef, SourceText, RuntimeState, FunctionBytecode, FunctionDebugInfo }
+import js_debug_positions { SourcePositionCache, PcSourcePosition, PendingLines }
+import js_debugger_metadata { Metadata as DebuggerMetadata }
+import silk.core.option { Option }
+import silk.core.effect { Effect }
+import js_atoms { AtomTable }
+import js_string_types { StringOwner, StringLengthError }
+
+pub const MAX_LOCAL_VAR_COUNT: usize = 65534
+pub const ARGUMENT_VAR_OFFSET: i32 = 0x20000000
+pub const GLOBAL_VAR_OFFSET: i32 = 0x40000000
+pub const ARG_SCOPE_INDEX: i32 = 1
+pub const ARG_SCOPE_END: i32 = -2
+pub enum ParseFunctionKind { Statement, Var, Expression, Arrow, Getter, Setter, Method, ClassStaticInit, ClassConstructor, DerivedClassConstructor }
+pub enum ParseExportKind { None, Named, Default }
+pub enum VariableDefinition { With, Let, Const, FunctionDeclaration, NewFunctionDeclaration, Catch, Var, Using }
+pub enum CompilerErrorKind { TooManyLocals, TooManyArguments, TooManyClosures, LexicalRedefinition, ParameterRedefinition, VariableRedefinition, GlobalRedefinition, UndefinedPrivateField, MissingExport }
+// name owns its string/registry reference independently of the parse tree and
+// runtime AtomTable handle. Diagnostics remain readable after parser unwinding.
+pub struct CompilerError { pub kind: CompilerErrorKind, pub atom: u32, pub name: Option<StringOwner> }
+impl CompilerError {
+  pub effect fn make(table: &AtomTable, kind: CompilerErrorKind, atom: u32) -> Self
+    ! OutOfMemoryError | StringLengthError ? &mut Allocator {
+    let mut name = Option<StringOwner>.none()
+    if atom != 0 { name = Option<StringOwner>.some(StringOwner.adopt(run table.toValue(atom, true))) }
+    return Self { kind: kind, atom: atom, name: move name }
+  }
+}
+
+// Unlike final core VarDef this contains the parser scope and function-pool fields.
+pub struct CompilerVar {
+  pub name: u32, pub scopeLevel: i32, pub scopeNext: i32,
+  pub isConst: bool, pub isLexical: bool, pub isCaptured: bool,
+  pub isStaticPrivate: bool, pub kind: VariableKind, pub varRefIndex: u16,
+  pub functionPoolIndex: i32,
+  /// The var pass made a reference to it (make_loc_ref/make_arg_ref): a scope
+  /// slot cannot serve it (js_compiler_scopes.plan keeps its cell).
+  pub isReferenced: bool
+}
+impl Copy for CompilerVar {}
+impl CompilerVar {
+  pub fn make(name: u32) -> Self { return Self { name: name, scopeLevel: 0, scopeNext: 0,
+    isConst: false, isLexical: false, isCaptured: false, isStaticPrivate: false,
+    kind: VariableKind.Normal, varRefIndex: 0, functionPoolIndex: -1, isReferenced: false } }
+}
+pub struct GlobalVar { pub constantPoolIndex: i32, pub forceInit: bool, pub isLexical: bool,
+  pub isConst: bool, pub scopeLevel: i32, pub name: u32 }
+impl Copy for GlobalVar {}
+pub struct VarScope { pub parent: i32, pub first: i32 }
+impl Copy for VarScope {}
+pub struct ScopeTable { inline: [VarScope; 8], overflow: List<VarScope>, count: usize }
+impl ScopeTable {
+  pub fn make() -> Self { return Self { inline: [VarScope { parent: -1, first: -1 }; 8],
+    overflow: List<VarScope>.make(), count: 1 } }
+  pub fn length(self: &Self) -> usize { return self.count }
+  pub fn capacity(self: &Self) -> usize { if self.overflow.length() == 0 { return 8 } return self.overflow.capacity() }
+  pub fn get(self: &Self, index: usize) -> VarScope {
+    if index >= self.count { Intrinsic.trap("QuickJS invariant violated") }
+    if self.overflow.length() == 0 { return self.inline[index] }
+    return self.overflow.get(index)
+  }
+  @inlineAlways
+  pub fn set(self: &mut Self, index: usize, value: VarScope) -> () {
+    if index >= self.count { Intrinsic.trap("QuickJS invariant violated") }
+    if self.overflow.length() == 0 { self.inline[index] = value }
+    else { self.overflow.set(index, value) }
+  }
+  pub effect fn append(self: &mut Self, value: VarScope) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.count < 8 { self.inline[self.count] = value }
+    else {
+      if self.overflow.length() == 0 {
+        run self.overflow.reserveExact(12)
+        let mut i: usize = 0
+        while i < 8 { run self.overflow.append(self.inline[i]) i = i + 1 }
+      }
+      run reserveArray(&mut self.overflow)
+      run self.overflow.append(value)
+    }
+    self.count = self.count + 1
+  }
+}
+// js_resize_array uses max(required, old * 3 / 2). No allocator slack is promised
+// by Silk, so exact native capacity is the source capacity without optional slack.
+pub effect fn reserveArray<T>(values: &mut List<T>) -> () ! OutOfMemoryError ? &mut Allocator {
+  if values.length() < values.capacity() { return () }
+  let mut capacity = values.capacity() * 3 / 2
+  if capacity < values.length() + 1 { capacity = values.length() + 1 }
+  let additional = capacity - values.length()
+  run values.reserveExact(additional)
+}
+
+/// Like `reserveArray`, but the first growth makes room for four entries. Closure
+/// vars and constants come a few at a time, so this avoids reallocating at 1, 2, 3
+/// and 4 entries.
+pub effect fn reserveCompilerArray<T>(values: &mut List<T>) -> () ! OutOfMemoryError ? &mut Allocator {
+  if values.length() < values.capacity() { return () }
+  let mut capacity = values.capacity() * 3 / 2
+  if capacity < 4 { capacity = 4 }
+  if capacity < values.length() + 1 { capacity = values.length() + 1 }
+  let additional = capacity - values.length()
+  run values.reserveExact(additional)
+}
+/// reserveCompilerArray for a one-word BoxList.
+pub effect fn reserveCompilerBox<T>(values: &mut BoxList<T>) -> () ! OutOfMemoryError ? &mut Allocator {
+  if values.length() < values.capacity() { return () }
+  let mut capacity = values.capacity() * 3 / 2
+  if capacity < 4 { capacity = 4 }
+  if capacity < values.length() + 1 { capacity = values.length() + 1 }
+  let additional = capacity - values.length()
+  run values.reserveExact(additional)
+}
+@inlineAlways
+pub effect fn reserveThinArray<T>(values: &mut ThinList<T>) -> () ! OutOfMemoryError ? &mut Allocator {
+  if values.length() < values.capacity() { return () }
+  let mut capacity = values.capacity() * 3 / 2
+  let length = values.length()
+  if capacity < length + 1 { capacity = length + 1 }
+  // A function's labels, variables and blocks come in handfuls: start at 8
+  // rather than reallocating at 1, 2, 3, 4 and 6 entries.
+  if capacity < 8 { capacity = 8 }
+  run values.reserveExact(capacity - length)
+}
+pub struct BlockEnv {
+  pub previous: i32, pub labelName: u32, pub labelBreak: i32, pub labelContinue: i32,
+  pub dropCount: i32, pub labelFinally: i32, pub scopeLevel: i32,
+  pub usingLabelCatch: i32, pub usingLabelEnd: i32, pub hasIterator: bool,
+  pub isAsyncIterator: bool, pub isRegularStatement: bool, pub hasUsing: bool, pub isAwaitUsing: bool
+}
+impl Copy for BlockEnv {}
+impl BlockEnv {
+  pub fn make() -> Self { return Self { previous: -1, labelName: 0, labelBreak: -1,
+    labelContinue: -1, dropCount: 0, labelFinally: -1, scopeLevel: 0,
+    usingLabelCatch: -1, usingLabelEnd: -1, hasIterator: false,
+    isAsyncIterator: false, isRegularStatement: false, hasUsing: false, isAwaitUsing: false } }
+}
+pub struct RelocEntry { pub next: i32, pub address: u32, pub size: i32 }
+impl Copy for RelocEntry {}
+// nullish: the jump directly follows an is_undefined_or_null or is_null (fuseNullishBranches).
+// removed: shrinkJumps's running total of bytes removed through this jump.
+// compare: the bytes from a slot compare prefix's operands to this if_true right after it, else 0 (fuseBackEdges).
+pub struct JumpSlot { pub opcode: i32, pub size: i32, pub position: i32, pub label: i32, pub nullish: bool, pub compare: i32, pub removed: i32 }
+impl Copy for JumpSlot {}
+pub struct LabelSlot { pub referenceCount: i32, pub position: i32, pub position2: i32,
+  pub address: i32, pub firstRelocation: i32 }
+impl Copy for LabelSlot {}
+
+/// A function definition in a FunctionTree. Ids stay valid as the tree grows.
+pub struct FunctionId { index: u32 }
+impl Copy for FunctionId {}
+impl FunctionId {
+  /// The cell of a PendingFunction whose tree is empty (a lazy stub's).
+  pub fn placeholder() -> FunctionId { return FunctionId { index: 0 } }
+  pub fn is(self: FunctionId, other: FunctionId) -> bool { return self.index == other.index }
+  /// Whether `link` names this definition.
+  pub fn linkedBy(self: FunctionId, link: Option<FunctionId>) -> bool {
+    return match link { Option<FunctionId>.Some { value } => value.index == self.index _ => false }
+  }
+}
+
+/// The id a link holds. Traps on an empty link, which the tree's invariants rule out.
+pub fn linked(link: Option<FunctionId>) -> FunctionId {
+  return match link { Option<FunctionId>.Some { value } => value _ => Intrinsic.trap("QuickJS invariant violated") }
+}
+
+/// Every definition of one compilation. Definitions own native storage only; their JS
+/// edges (constants, atoms) are released by compiler_state.destroyFunction before the
+/// tree drops or its last definition is retired.
+effect fn reservedRoom(error: OutOfMemoryError) -> () { drop error Intrinsic.trap("FunctionTree.addReserved: no reserved room") }
+pub struct FunctionTree { defs: List<FunctionDef>, live: usize }
+impl FunctionTree {
+  pub fn make() -> FunctionTree { return FunctionTree { defs: List<FunctionDef>.make(), live: 0 } }
+  /// Reserves room for the definitions a source of `length` bytes is likely to hold,
+  /// about one per 192 bytes, so a large compile does not regrow and copy the tree.
+  /// Sources too small to hold a few functions keep ordinary growth.
+  pub effect fn reserveForSource(self: &mut Self, length: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    let expected = length / 128
+    if expected > 4 { run self.defs.reserveExact(expected) }
+  }
+  /// Room for exactly `count` definitions: a one-function tree holds no spare slots.
+  pub effect fn reserveExact(self: &mut Self, count: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.defs.reserveExact(count)
+  }
+  /// Adds `fd` to the tree. The caller proves that fd's context and runtime stay live for as
+  /// long as the tree holds it; that is what lets the compiler passes over a tree be safe.
+  pub unsafe effect fn add(self: &mut Self, fd: FunctionDef) -> FunctionId ! OutOfMemoryError ? &mut Allocator {
+    let index = usize.toU32(self.defs.length())
+    run self.defs.append(move fd)
+    self.live = self.live + 1
+    return FunctionId { index: index }
+  }
+  /// add into room reserveExact made, so it cannot fail.
+  pub unsafe effect fn addReserved(self: &mut Self, fd: FunctionDef) -> FunctionId ? &mut Allocator {
+    if self.defs.length() >= self.defs.capacity() { Intrinsic.trap("FunctionTree.addReserved: no reserved room") }
+    let index = usize.toU32(self.defs.length())
+    run Effect.catch<OutOfMemoryError>(self.defs.append(move fd), reservedRoom)
+    self.live = self.live + 1
+    return FunctionId { index: index }
+  }
+  /// Frees the native storage of `id`, whose JS edges are already released and which
+  /// is unlinked from the tree. Retiring the last live definition frees the whole tree.
+  pub fn retire(self: &mut Self, id: FunctionId) -> () {
+    // The last live definition: free the whole tree without resetting its slot first.
+    if self.live == 1 { self.live = 0 self.defs = List<FunctionDef>.make() return () }
+    let fd = self.getMut(id)
+    fd.* = FunctionDef.make(fd.context, fd.runtime, 0)
+    drop fd
+    self.live = self.live - 1
+    if self.live == 0 { self.defs = List<FunctionDef>.make() }
+  }
+  @inlineAlways
+  pub fn get(self: &Self, id: FunctionId) -> &FunctionDef {
+    return &self.defs.asSlice()[u32.toUsize(id.index)]
+  }
+  @inlineAlways
+  pub fn getMut(self: &mut Self, id: FunctionId) -> &mut FunctionDef {
+    return &mut self.defs.asMutSlice()[u32.toUsize(id.index)]
+  }
+}
+
+/// A nested function whose compile stopped after variable resolution
+/// (js_compiler_finish.defer): label resolution, the line table and the final
+/// code wait for its first call. tree holds just its definition, unlinked; the
+/// line table restarts from start (line, column), the function's own position.
+/// slots..variables keep the function's own scope plan (js_compiler_scopes.plan),
+/// made before deferral so its owner's planning sees its scope.
+/// A free name of a lazily compiled body, with its deepest nesting (0: the body itself).
+pub struct LazyName { pub name: u32, pub depth: u8 }
+impl Copy for LazyName {}
+/// A nested function body a preparse accepted: its `{` offset, its closing `}`
+/// token (offset and whether a line feed precedes it), and its free names, at
+/// freeStart..freeStart+freeCount of the name list kept beside it.
+pub struct LazyBody { pub bodyStart: usize, pub end: usize, pub endLineFeed: bool, pub freeStart: u32, pub freeCount: u32 }
+impl Copy for LazyBody {}
+
+/// What finishLazy reads of a lazy stub's definition (js_parser_functions.skipBody),
+/// kept instead of the whole FunctionDef. It owns filename and bodyFree's names;
+/// free's names are the stub's closure vars'. Its realm, script id and mode are
+/// the stub record's, and so is its source text unless the record's debug info
+/// was stripped: only then does source hold it.
+pub struct LazyStub {
+  pub source: ThinBox<Option<SourceText>>,
+  /// The records of the bodies inside it (first) and their free names (second), which it owns.
+  pub skips: PairList<LazyBody, LazyName>,
+  pub filename: u32, pub sourcePosition: u32, pub entry: u32,
+  pub scriptIsEval: bool, pub nodeVmDiagnostics: bool, pub entryLineFeed: bool }
+
+/// Gives each of a stub's closure vars its free name's preparse nesting (ClosureVar.depth).
+pub fn markFreeDepths(vars: &mut BoxList<ClosureVar>, free: &BoxList<LazyName>) -> () {
+  let mut i: usize = 0
+  while i < vars.length() {
+    let mut v = vars.get(i)
+    let mut j: usize = 0
+    while j < free.length() {
+      let name = free.get(j)
+      if name.name == v.name { v.depth = name.depth vars.set(i, v) break }
+      j = j + 1
+    }
+    i = i + 1
+  }
+}
+impl LazyStub {
+  /// The function's source text: its own when stripped, else its record's.
+  pub fn sourceOf<'a>(self: &'a Self, record: &'a FunctionBytecode) -> &'a Option<SourceText> {
+    if self.source.isSome() { return self.source.get() }
+    match &record.debug {
+      Option<FunctionDebugInfo>.Some { value } => { return &value.source }
+      _ => Intrinsic.trap("lazy stub without source")
+    }
+  }
+  /// Releases the names it owns, in runtime's atom table.
+  pub unsafe fn release(self: &mut Self, runtime: *mut HeapHeader) -> () {
+    let mut anchor = ()
+    let rt = unsafe HeapCell.payloadMut<RuntimeState, ()>(&mut anchor, runtime)
+    rt.atoms.release(self.filename) self.filename = 0
+    let mut i: usize = 0
+    let names = self.skips.second()
+    while i < names.length { rt.atoms.release(names[i].name) i = i + 1 }
+    self.skips.clear()
+  }
+}
+
+/// A deferred function's definition: an unlinked FunctionDef in tree at cell,
+/// or, for a lazy stub, only lazy (tree is then none).
+/// Fields ordered so the struct packs (Silk keeps declaration order); offsets fit u32.
+/// or, for a body left in code-cache bytes, only deferred (tree is none too).
+pub struct PendingFunction { pub tree: ThinBox<FunctionTree>, pub start: u32, pub cell: FunctionId, pub line: i32, pub column: i32,
+  pub ecmaLine: i32, pub ecmaColumn: i32,
+  pub slots: u16, pub varSlots: u16, pub parameters: BoxList<u32>, pub variables: BoxList<u16>, pub lazy: Option<LazyStub>,
+  pub deferred: Option<DeferredBody> }
+
+/// A function read from trusted code-cache bytes whose variables, code and
+/// constants stay in those bytes until its first call
+/// (js_binary_object_reader.finishDeferred). source indexes
+/// RuntimeState.deferredSources, position is the body's offset in its bytes, and
+/// the counts and stack size are the record's own, which the stub's header
+/// cannot hold while it stands in.
+pub struct DeferredBody { pub scriptId: u64, pub source: u32, pub position: u32, pub codeLength: u32, pub locals: u32, pub constants: u32,
+  pub stack: u16, pub scriptIsEval: bool }
+impl Copy for DeferredBody {}
+
+/// One free name a lazy child resolved from parentScopeLevel of its parent:
+/// the closure entry the child got for it.
+pub struct StubName { pub scope: i32, pub closure: ClosureVar }
+impl Copy for StubName {}
+pub struct FunctionDef {
+  pub context: *mut HeapHeader, pub runtime: *mut HeapHeader,
+  pub scriptId: u64,
+  pub scriptIsEval: bool,
+  pub nodeVmDiagnostics: bool,
+  pub debuggerMetadata: DebuggerMetadata,
+  // Parser-owned, consumed only by the first emitted operation of a statement.
+  pub pendingStatementStart: bool,
+  pub deferModuleAttributes: bool,
+  pub parent: Option<FunctionId>, pub parentConstantPoolIndex: i32, pub parentScopeLevel: i32,
+  pub firstChild: Option<FunctionId>, pub lastChild: Option<FunctionId>,
+  pub previousSibling: Option<FunctionId>, pub nextSibling: Option<FunctionId>,
+  pub isEval: bool, pub evalType: i32, pub isGlobalVar: bool, pub isFuncExpr: bool,
+  pub hasHomeObject: bool, pub hasPrototype: bool, pub hasSimpleParameterList: bool,
+  // Lazy compile: a body the preparser accepted and the parser skipped (lazy),
+  // its free names (owned only while lazyFreeHeld; after that closure vars hold them),
+  // the bodies nested in it with their free names (owned atoms), and where
+  // finishLazy reparses it from. A lazyVerified function is inside a function
+  // finishLazy parses, which its preparse showed has no eval or with, so its
+  // children may go lazy.
+  // Whether vars holds a `with` object (JS_ATOM__with_): set by compiler_state.addVar.
+  pub hasWithVar: bool,
+  // lazyFreeHeld: lazyFree's names each hold one reference, taken by the
+  // parser for variable resolution (each read at scope lazyLevel); resolution
+  // drops them once closure vars hold what they captured.
+  pub lazy: bool, pub lazyRoot: bool, pub lazyVerified: bool, pub lazyFree: BoxList<LazyName>, pub lazyLevel: u16, pub lazyFreeHeld: bool,
+  // lazyScopeElided: the stub's only code, enter_scope of bodyScope, went back to
+  // the parser (Parser.spareBytecode); a full resolution emits it again.
+  pub lazyScopeElided: bool,
+  pub lazySkips: PairList<LazyBody, LazyName>,
+  pub lazyEntry: usize, pub lazyEntryLineFeed: bool, pub noDefer: bool,
+  pub hasParameterExpressions: bool, pub hasUseStrict: bool, pub hasEvalCall: bool,
+  pub hasArgumentsBinding: bool, pub hasThisBinding: bool, pub newTargetAllowed: bool,
+  pub superCallAllowed: bool, pub superAllowed: bool, pub argumentsAllowed: bool,
+  pub isDerivedClassConstructor: bool, pub inFunctionBody: bool,
+  pub functionKind: FunctionKind, pub functionType: ParseFunctionKind, pub jsMode: u8,
+  pub functionName: u32, pub vars: ThinList<CompilerVar>, pub args: ThinList<CompilerVar>,
+  // Open-addressed index of vars by name (var index + 1, 0 empty), built once a
+  // function has VAR_INDEX_MIN vars so findVar stops scanning them all.
+  pub varIndex: ThinList<u32>,
+  // The same for closureVars, by name and by variable index, covering the
+  // first closureIndexed entries (see syncClosureIndex).
+  pub closureNames: ThinList<u32>, pub closureSlots: ThinList<u32>, pub closureIndexed: usize,
+  // Free names the lazy children of this function resolved, open addressed by
+  // name and parent scope (closure.name 0 empty), stubNameCount of them used:
+  // js_compiler_variables.resolveStub replays an entry for the next child.
+  pub stubNames: ThinList<StubName>, pub stubNameCount: usize,
+  pub definedArgCount: i32, pub varRefCount: i32,
+  pub varObjectIndex: i32, pub argVarObjectIndex: i32, pub argumentsVarIndex: i32,
+  pub argumentsArgIndex: i32, pub functionVarIndex: i32, pub evalReturnIndex: i32,
+  pub thisVarIndex: i32, pub newTargetVarIndex: i32, pub thisActiveFunctionVarIndex: i32,
+  pub homeObjectVarIndex: i32, pub needHomeObject: bool,
+  pub scopeLevel: i32, pub scopeFirst: i32, pub scopes: ScopeTable, pub bodyScope: i32,
+  pub globalVars: ThinList<GlobalVar>, pub bytecode: ByteBuffer, pub bytecodeError: bool,
+  pub lastOpcodePosition: i32, pub lastOpcodeSourcePosition: u32, pub useShortOpcodes: bool,
+  // Call-instruction PC -> callee source offset, relocated by each compiler pass.
+  pub callSiteSources: List<PcSourcePosition>, pub callSitePc2line: ByteBuffer,
+  pub labels: ThinList<LabelSlot>, pub blocks: ThinList<BlockEnv>, pub topBreak: i32,
+  pub constants: BoxList<ValueBits>, pub closureVars: BoxList<ClosureVar>,
+  pub relocations: ThinList<RelocEntry>, pub jumps: ThinList<JumpSlot>, pub jumpCapacity: usize,
+  // Bytecode length right after label resolution last emitted is_undefined_or_null.
+  pub nullishEnd: i32,
+  // Eight times the bytecode length right after label resolution last emitted
+  // a comparison under a fusion prefix (compareBranch), plus the bytes the
+  // prefix covers; the branch after it keeps the prefix or takes it back
+  // (keepComparePrefix).
+  pub compareEnd: i32,
+  // The bytecode length right after label resolution last emitted a loop's
+  // slot comparison under a fusion prefix (slotCompare), and the bytes from
+  // the prefix's operands to there (emitBranch, fuseBackEdges).
+  pub loopCompareEnd: i32, pub loopCompareSpan: i32,
+  // The pre-label position right after the last line number label resolution
+  // passed: its five bytes are room for a fusion prefix that starts there
+  // (prefixRoom), since final code must not outgrow the pre-label code.
+  pub lineEnd: i32,
+  // Where the straight run label resolution is in began (no label and no
+  // branch since): its pre-label position and the bytecode length there. What
+  // the run has shrunk by so far is room for a fusion prefix too (prefixRoom).
+  pub runStart: i32, pub runOut: i32,
+  pub lineNumbers: ThinList<PcSourcePosition>, pub lineNumberCapacity: usize,
+  pub lineNumberLast: u32, pub lineNumberLastPc: u32,
+  pub stripDebug: bool, pub stripSource: bool, pub filename: u32, pub sourcePosition: u32,
+  // Borrowed coordinate cache shared by the parse tree; each policy has its own cursor.
+  pub sourceCache: ?*mut SourcePositionCache, pub pc2line: ByteBuffer,
+  // finalHeader moves pc2line and callSitePc2line here before transfer publishes them.
+  pub lineTables: ThinBox<LineTables>,
+  // finalHeader boxes debuggerMetadata here when it holds anything.
+  pub debuggerBox: ThinBox<DebuggerMetadata>,
+  // computePc2Line's raw tables when it leaves them unencoded (pc2line and
+  // callSitePc2line stay empty then).
+  pub pendingLines: ThinBox<PendingLines>,
+  pub source: Option<SourceText>, pub module: Option<CellRef<ModuleDef>>, pub hasAwait: bool,
+  // A function inside this one has direct eval or with (js_compiler_scopes).
+  pub subtreeDynamic: bool,
+  // Per varDefs index (arguments, then vars), the scope slot js_compiler_scopes
+  // gave the variable, or -1; empty when the function has no scope.
+  pub scopeSlotOf: ThinList<i32>
+}
+impl FunctionDef {
+  /// The owning runtime's state, borrowed for as long as `owner` stays borrowed. FunctionTree.add's
+  /// caller proved the runtime outlives the definition.
+  @inlineAlways pub fn runtimeState<'b, A>(self: &Self, owner: &'b A) -> &'b RuntimeState {
+    return unsafe HeapCell.payload<RuntimeState, A>(owner, self.runtime)
+  }
+  /// The owning runtime's state, borrowed exclusively for as long as `owner` stays exclusively borrowed.
+  @inlineAlways pub fn runtimeStateMut<'b, A>(self: &Self, owner: &'b mut A) -> &'b mut RuntimeState {
+    return unsafe HeapCell.payloadMut<RuntimeState, A>(&mut owner.*, self.runtime)
+  }
+  // Detached native owner. filename/name/array JS edges must be released explicitly
+  // before dropping; production construction/destruction use compiler_state APIs.
+  pub fn make(context: *mut HeapHeader, runtime: *mut HeapHeader, sourcePosition: u32) -> Self {
+    return Self { context: context, runtime: runtime, parent: Option<FunctionId>.none(),
+      scriptId: 0,
+      scriptIsEval: false,
+      nodeVmDiagnostics: false,
+      debuggerMetadata: DebuggerMetadata.make(),
+      pendingStatementStart: false,
+      deferModuleAttributes: false,
+      parentConstantPoolIndex: -1, parentScopeLevel: 0, firstChild: Option<FunctionId>.none(),
+      lastChild: Option<FunctionId>.none(), previousSibling: Option<FunctionId>.none(), nextSibling: Option<FunctionId>.none(),
+      isEval: false, evalType: 0, isGlobalVar: false, isFuncExpr: false, hasHomeObject: false,
+      hasPrototype: false, hasSimpleParameterList: false, hasParameterExpressions: false,
+      hasWithVar: false, lazy: false, lazyRoot: false, lazyVerified: false, lazyFree: BoxList<LazyName>.make(), lazyLevel: 0, lazyFreeHeld: false, lazyScopeElided: false, lazySkips: PairList<LazyBody, LazyName>.none(), lazyEntry: 0, lazyEntryLineFeed: false, noDefer: false,
+      hasUseStrict: false, hasEvalCall: false, hasArgumentsBinding: false, hasThisBinding: false,
+      newTargetAllowed: false, superCallAllowed: false, superAllowed: false, argumentsAllowed: false,
+      isDerivedClassConstructor: false, inFunctionBody: false, functionKind: FunctionKind.Normal,
+      functionType: ParseFunctionKind.Statement, jsMode: 0, functionName: 0,
+      vars: ThinList<CompilerVar>.make(), args: ThinList<CompilerVar>.make(), varIndex: ThinList<u32>.make(), closureNames: ThinList<u32>.make(), closureSlots: ThinList<u32>.make(), closureIndexed: 0, stubNames: ThinList<StubName>.make(), stubNameCount: 0, definedArgCount: 0, varRefCount: 0,
+      varObjectIndex: -1, argVarObjectIndex: -1, argumentsVarIndex: -1, argumentsArgIndex: -1,
+      functionVarIndex: -1, evalReturnIndex: -1, thisVarIndex: -1, newTargetVarIndex: -1,
+      thisActiveFunctionVarIndex: -1, homeObjectVarIndex: -1, needHomeObject: false,
+      scopeLevel: 0, scopeFirst: -1, scopes: ScopeTable.make(), bodyScope: -1,
+      globalVars: ThinList<GlobalVar>.make(), bytecode: ByteBuffer.make(), bytecodeError: false,
+      lastOpcodePosition: -1, lastOpcodeSourcePosition: sourcePosition, useShortOpcodes: false,
+      callSiteSources: List<PcSourcePosition>.make(), callSitePc2line: ByteBuffer.make(),
+      labels: ThinList<LabelSlot>.make(), blocks: ThinList<BlockEnv>.make(), topBreak: -1,
+      constants: BoxList<ValueBits>.make(), closureVars: BoxList<ClosureVar>.make(),
+      relocations: ThinList<RelocEntry>.make(), jumps: ThinList<JumpSlot>.make(), jumpCapacity: 0, nullishEnd: -1, compareEnd: -1, loopCompareEnd: -1, loopCompareSpan: 0, lineEnd: -1, runStart: 0, runOut: 0,
+      lineNumbers: ThinList<PcSourcePosition>.make(), lineNumberCapacity: 0, lineNumberLast: 0,
+      lineNumberLastPc: 0, stripDebug: false, stripSource: false, filename: 0,
+      sourcePosition: sourcePosition, sourceCache: Pointer.null<SourcePositionCache>(),
+      pc2line: ByteBuffer.make(), lineTables: ThinBox<LineTables>.none(), debuggerBox: ThinBox<DebuggerMetadata>.none(), pendingLines: ThinBox<PendingLines>.none(), source: Option<SourceText>.none(), module: Option<CellRef<ModuleDef>>.none(), hasAwait: false,
+      subtreeDynamic: false, scopeSlotOf: ThinList<i32>.make() }
+  }
+}

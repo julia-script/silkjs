@@ -1,0 +1,735 @@
+//! A growable list of `Copy` elements whose header is two words: the element pointer,
+//! then the length and the capacity. A `List<T>` also keeps its allocation's RawBuffer
+//! (four words); this list keeps an owner tag instead. Storage from a RuntimeAllocator
+//! is a runtime_memory block, released from its address, as js_heap does for cells.
+//! Storage from any other allocator keeps its RawBuffer in a prefix before the elements.
+
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.layout { Layout }
+import silk.mem.pointer { Pointer }
+import silk.collections.slice { Slice }
+import silk.mem.raw_buffer { RawBuffer }
+import silk.mem.slot { Slot }
+import silk.core.ownership { Copy, Drop }
+import silk.core.option { Option }
+import silk.num.u32
+import silk.num.usize
+import runtime_memory as memory
+
+const OWNER_NONE: u32 = 0
+const OWNER_POOLED: u32 = 1
+const OWNER_UNPOOLED: u32 = 2
+const OWNER_PREFIX: u32 = 3
+const OWNER_SHIFT: u32 = 30
+const CAPACITY_MASK: u32 = 1073741823
+/// The bytes a prefixed block's RawBuffer takes before its elements.
+const PREFIX: usize = 32
+
+/// A RawBuffer read as its words, to recognise runtime_memory blocks by their reclaim
+/// callback and context.
+struct StorageWords { base: usize, count: usize, reclaim: usize, context: usize }
+impl Copy for StorageWords {}
+
+/// Element storage: its first element, its owner tag, and how many bytes it holds.
+struct Block { address: *mut u8, owner: u32, bytes: usize }
+impl Copy for Block {}
+
+const BLOCK_ALIGNMENT: usize = 16
+/// Allocates bytes (more than zero), aligned to 16.
+@inlineAlways
+effect fn obtainBlock(bytes: usize) -> Block ! OutOfMemoryError ? &mut Allocator {
+  // Four words: 32 bytes on a 64-bit target, 16 in the same prefix on a 32-bit one.
+  if Layout.of<Intrinsic.RawBuffer<u8>>().bytes != Layout.of<StorageWords>().bytes || Layout.of<StorageWords>().bytes > PREFIX {
+    Intrinsic.trap("RawBuffer is not four words")
+  }
+  // Always 16: the runtime allocator places a 16-aligned payload right after its
+  // unpooled header (what the owner check below expects), and 16-byte elements
+  // then never straddle a cache line.
+  let allocation = run Allocator.allocate(Layout { bytes: bytes, alignment: BLOCK_ALIGNMENT })
+  let mut storage = unsafe RawBuffer.from<u8>(move allocation, bytes)
+  let words = unsafe Pointer.read<StorageWords>(unsafe Intrinsic.pointerReinterpret<*const Intrinsic.RawBuffer<u8>, *const StorageWords>(
+    Pointer.fromRef<Intrinsic.RawBuffer<u8>>(&storage)))
+  let base = Slot.address(RawBuffer.slot<u8>(&mut storage, 0))
+  let address = Pointer.address<u8>(base)
+  let mut owner = OWNER_PREFIX
+  if words.base == address {
+    if words.context == address && words.reclaim == memory.pooledReclaimAddress() {
+      owner = OWNER_POOLED
+    } else if words.context == usize.wrappingSubtract(address, memory.unpooledOffset()) && words.reclaim == memory.unpooledReclaimAddress() {
+      owner = OWNER_UNPOOLED
+    }
+  }
+  if owner != OWNER_PREFIX {
+    // The block releases from its address. Parking its RawBuffer in plain words forgets it;
+    // the block itself can be smaller than the RawBuffer, so it must not hold it.
+    let mut parked = StorageWords { base: 0, count: 0, reclaim: 0, context: 0 }
+    unsafe Pointer.put<Intrinsic.RawBuffer<u8>>(unsafe Intrinsic.pointerReinterpret<*mut StorageWords, *mut Intrinsic.RawBuffer<u8>>(Pointer.fromMutRef<StorageWords>(&mut parked)), move storage)
+    return Block { address: base, owner: owner, bytes: bytes }
+  }
+  // Another allocator's block: allocate again with room for its RawBuffer before the elements.
+  drop storage
+  return run prefixedBlock(bytes, BLOCK_ALIGNMENT)
+}
+
+@inlineNever
+effect fn prefixedBlock(bytes: usize, alignment: usize) -> Block ! OutOfMemoryError ? &mut Allocator {
+  let total = bytes + PREFIX
+  let prefixed = run Allocator.allocate(Layout { bytes: total, alignment: alignment })
+  let mut kept = unsafe RawBuffer.from<u8>(move prefixed, total)
+  let start = Slot.address(RawBuffer.slot<u8>(&mut kept, 0))
+  unsafe Pointer.put<Intrinsic.RawBuffer<u8>>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Intrinsic.RawBuffer<u8>>(start), move kept)
+  return Block { address: unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(start), PREFIX), owner: OWNER_PREFIX, bytes: bytes }
+}
+
+/// Releases a block obtained by obtainBlock.
+@inlineAlways
+unsafe fn releaseBlock(address: *mut u8, owner: u32) -> () {
+  // Borrowed storage (ThinBox.borrowingIn) stays with its owner.
+  if owner == OWNER_NONE { return () }
+  if owner == OWNER_POOLED { return unsafe memory.releasePooled(address) }
+  if owner == OWNER_UNPOOLED { return unsafe memory.releaseUnpooled(address) }
+  let start = unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(address), usize.wrappingSubtract(0, PREFIX))
+  let storage = unsafe Pointer.take<Intrinsic.RawBuffer<u8>>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Intrinsic.RawBuffer<u8>>(start))
+  drop storage
+}
+
+/// A list of `Copy` elements in two words. See the module documentation.
+pub struct ThinList<T> {
+  data: ?*mut T,
+  count: u32,
+  /// The capacity in the low 30 bits and the storage's owner tag above them.
+  meta: u32
+}
+
+impl<T> ThinList<T> {
+  /// An empty list. Does not allocate.
+  @inlineAlways
+  pub fn make() -> ThinList<T> {
+    return ThinList<T> { data: Pointer.null<T>(), count: 0, meta: 0 }
+  }
+  /// An empty list over capacity elements of storage it does not own, such as a
+  /// heap cell's tail. Growing moves the elements into owned storage; dropping
+  /// releases nothing. The storage must outlive every use of the list.
+  @inlineAlways
+  pub unsafe fn borrowing(data: *mut T, capacity: usize) -> ThinList<T> {
+    if capacity > u32.toUsize(CAPACITY_MASK) { Intrinsic.trap("ThinList.borrowing: capacity too large") }
+    return ThinList<T> { data: unsafe Intrinsic.pointerRequalify<*mut T, ?*mut T>(data), count: 0, meta: usize.toU32(capacity) }
+  }
+  /// Whether dropping the list releases storage: false for an empty list and for
+  /// a borrowing one.
+  @inlineAlways
+  pub fn ownsStorage(self: &Self) -> bool { return u32.shiftRight(self.meta, OWNER_SHIFT) != OWNER_NONE }
+  /// Whether the list is over storage it does not own (made by borrowing).
+  @inlineAlways
+  pub fn borrowsStorage(self: &Self) -> bool { return !self.ownsStorage() && self.capacity() != 0 }
+  /// Adds value at the end of a list with room for it. Traps when it is full.
+  @inlineAlways
+  pub fn push(self: &mut Self, value: T) -> () {
+    let index = u32.toUsize(self.count)
+    if index >= self.capacity() { Intrinsic.trap("ThinList.push: the list is full") }
+    let slot = unsafe Pointer.atMut<T>(unsafe Pointer.assumeManyMut<T>(unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(self.data)), index)
+    unsafe Pointer.put<T>(slot, move value)
+    self.count = self.count + 1
+  }
+  /// push for a caller that has checked the list has room (length below
+  /// capacity): no capacity test and no checked length increment.
+  @inlineAlways
+  pub unsafe fn pushUnchecked(self: &mut Self, value: T) -> () {
+    let slot = unsafe Pointer.atMut<T>(unsafe Pointer.assumeManyMut<T>(unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(self.data)), u32.toUsize(self.count))
+    unsafe Pointer.put<T>(slot, move value)
+    self.count = u32.wrappingAdd(self.count, 1)
+  }
+  /// The first unused slot, for a caller that fills `count` of them and then
+  /// calls `extendFilled(count)`. Traps when the list lacks room for count.
+  @inlineAlways
+  pub unsafe fn spareFor(self: &mut Self, count: usize) -> [*]mut T {
+    let index = u32.toUsize(self.count)
+    if count > self.capacity() - index { Intrinsic.trap("ThinList.spareFor: the list is full") }
+    let base = unsafe Pointer.assumeManyMut<T>(unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(self.data))
+    return unsafe Pointer.assumeManyMut<T>(unsafe Pointer.atMut<T>(base, index))
+  }
+  /// Counts `count` slots after the length, filled through spareFor, as elements.
+  @inlineAlways
+  pub unsafe fn extendFilled(self: &mut Self, count: usize) -> () {
+    self.count = usize.toU32(u32.toUsize(self.count) + count)
+  }
+  /// An empty list with room for at least capacity elements.
+  pub effect fn makeWithCapacity(capacity: usize) -> ThinList<T> ! OutOfMemoryError ? &mut Allocator {
+    let mut list = ThinList<T>.make()
+    if capacity != 0 { run list.reserveExact(capacity) }
+    return move list
+  }
+  @inlineAlways
+  pub fn length(self: &Self) -> usize { return u32.toUsize(self.count) }
+  @inlineAlways
+  pub fn capacity(self: &Self) -> usize { return u32.toUsize(u32.bitAnd(self.meta, CAPACITY_MASK)) }
+
+  /// Replaces the element at index. Traps unless index is below the length.
+  @inlineAlways
+  pub fn set(self: &mut Self, index: usize, value: T) -> () {
+    if u32.toUsize(self.count) <= index { Intrinsic.trap("ThinList.set: the index is not less than the length") }
+    let slot = unsafe Pointer.atMut<T>(unsafe Pointer.assumeManyMut<T>(unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(self.data)), index)
+    // Elements are Copy in every use, so the old value needs no drop.
+    unsafe Pointer.put<T>(slot, move value)
+  }
+  /// set without the bounds check, for an index the caller's invariant keeps
+  /// below the length.
+  @inlineAlways
+  pub unsafe fn setUnchecked(self: &mut Self, index: usize, value: T) -> () {
+    let slot = unsafe Pointer.atMut<T>(unsafe Pointer.assumeManyMut<T>(unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(self.data)), index)
+    unsafe Pointer.put<T>(slot, move value)
+  }
+  /// All elements, in order.
+  pub fn asSlice(self: &Self) -> &[T] {
+    if self.count == 0 { return &[] }
+    let base = unsafe Pointer.assumeMany<T>(unsafe Intrinsic.pointerRequalify<?*mut T, *const T>(self.data))
+    return unsafe Pointer.borrowMany<Self, T>(self, base, u32.toUsize(self.count))
+  }
+  /// Shortens the list to length elements; a longer length changes nothing.
+  pub fn truncate(self: &mut Self, length: usize) -> () {
+    if length < u32.toUsize(self.count) { self.count = usize.toU32(length) }
+  }
+  /// Removes every element, keeping the storage.
+  pub fn clear(self: &mut Self) -> () { self.count = 0 }
+  /// Adds value at the end, growing like List: four elements first, then doubling.
+  @inlineAlways
+  pub effect fn append(self: &mut Self, value: T) -> () ! OutOfMemoryError ? &mut Allocator {
+    if u32.toUsize(self.count) == self.capacity() {
+      let current = self.capacity()
+      let mut next: usize = 4
+      if current != 0 { next = current * 2 }
+      run self.growTo(next)
+    }
+    let index = u32.toUsize(self.count)
+    let slot = unsafe Pointer.atMut<T>(unsafe Pointer.assumeManyMut<T>(unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(self.data)), index)
+    unsafe Pointer.put<T>(slot, move value)
+    self.count = self.count + 1
+  }
+  /// Makes room for at least additional more elements than the length.
+  pub effect fn reserveExact(self: &mut Self, additional: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    let wanted = u32.toUsize(self.count) + additional
+    if wanted > self.capacity() { run self.growTo(wanted) }
+  }
+
+  /// Moves the elements into new storage for at least capacity elements.
+  @inlineNever
+  effect fn growTo(self: &mut Self, capacity: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    let size = Layout.of<T>().bytes
+    let alignment = Layout.of<T>().alignment
+    if alignment > 16 || size == 0 { Intrinsic.trap("ThinList needs elements of 1 to 16 byte alignment and nonzero size") }
+    if capacity > u32.toUsize(CAPACITY_MASK) || capacity > usize.MAX / size { return run Allocator.outOfMemory() }
+    let block = run obtainBlock(capacity * size)
+    let fresh = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut T>(block.address)
+    let count = u32.toUsize(self.count)
+    if count != 0 {
+      let from = unsafe Pointer.assumeMany<T>(unsafe Intrinsic.pointerRequalify<?*mut T, *const T>(self.data))
+      let to = unsafe Pointer.assumeManyMut<T>(fresh)
+      let mut index = usize.ZERO
+      while index < count {
+        // A bitwise move: the old storage is released without dropping elements.
+        unsafe Pointer.put<T>(unsafe Pointer.atMut<T>(to, index), unsafe Pointer.take<T>(unsafe Intrinsic.pointerRequalify<*const T, *mut T>(unsafe Pointer.at<T>(from, index))))
+        index = index + usize.ONE
+      }
+    }
+    unsafe self.release()
+    self.data = unsafe Intrinsic.pointerRequalify<*mut T, ?*mut T>(fresh)
+    self.meta = u32.bitOr(usize.toU32(capacity), u32.shiftLeft(block.owner, OWNER_SHIFT))
+  }
+
+  /// Releases the storage, leaving the list without any. Elements are Copy.
+  /// A borrowed or empty list (most object slot lists) only pays the owner
+  /// test, inlined at each drop; owned storage is freed out of line.
+  @inlineAlways
+  unsafe fn release(self: &mut Self) -> () {
+    let owner = u32.shiftRight(self.meta, OWNER_SHIFT)
+    if owner == OWNER_NONE { return () }
+    unsafe self.releaseOwned(owner)
+  }
+  @inlineNever
+  unsafe fn releaseOwned(self: &mut Self, owner: u32) -> () {
+    let address = unsafe Intrinsic.pointerReinterpret<*mut T, *mut u8>(unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(self.data))
+    unsafe releaseBlock(address, owner)
+    self.data = Pointer.null<T>()
+    self.meta = 0
+  }
+}
+impl<T: Copy> ThinList<T> {
+  /// Adds count elements copied from source at the end of a list with room for
+  /// them, setting the length once. Traps when it lacks room.
+  @inlineAlways
+  pub unsafe fn pushCopies(self: &mut Self, source: *const T, count: usize) -> () {
+    let index = u32.toUsize(self.count)
+    if count > self.capacity() - index { Intrinsic.trap("ThinList.pushCopies: the list is full") }
+    if count == 0 { return () }
+    let base = unsafe Pointer.assumeManyMut<T>(unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(self.data))
+    let from = unsafe Pointer.assumeMany<T>(source)
+    // Disjoint slices let the copy lower to memcpy, which raw pointers do not.
+    let mut destinationAnchor = ()
+    let sourceAnchor = ()
+    let destination = unsafe Pointer.borrowManyMut<(), T>(&mut destinationAnchor, unsafe Pointer.assumeManyMut<T>(unsafe Pointer.atMut<T>(base, index)), count)
+    Slice.copyInto<T>(&mut destination, 0, unsafe Pointer.borrowMany<(), T>(&sourceAnchor, from, count))
+    self.count = usize.toU32(index + count)
+  }
+  /// pushCopies of every element of other.
+  @inlineAlways
+  pub fn pushAll(self: &mut Self, other: &ThinList<T>) -> () {
+    if other.count == 0 { return () }
+    unsafe self.pushCopies(unsafe Intrinsic.pointerRequalify<?*mut T, *const T>(other.data), u32.toUsize(other.count))
+  }
+  /// Adds count copies of value at the end of a list with room for them, setting
+  /// the length once. Traps when it lacks room.
+  @inlineAlways
+  pub fn pushRepeated(self: &mut Self, value: T, count: usize) -> () {
+    let index = u32.toUsize(self.count)
+    if count > self.capacity() - index { Intrinsic.trap("ThinList.pushRepeated: the list is full") }
+    if count == 0 { return () }
+    let base = unsafe Pointer.assumeManyMut<T>(unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(self.data))
+    let mut destinationAnchor = ()
+    let destination = unsafe Pointer.borrowManyMut<(), T>(&mut destinationAnchor, unsafe Pointer.assumeManyMut<T>(unsafe Pointer.atMut<T>(base, index)), count)
+    let mut i: usize = 0
+    while i < count { destination[i] = value i = i + 1 }
+    drop destination
+    self.count = usize.toU32(index + count)
+  }
+  /// A copy of the element at index. Traps unless index is below the length.
+  @inlineAlways
+  pub fn get(self: &Self, index: usize) -> T {
+    if u32.toUsize(self.count) <= index { Intrinsic.trap("ThinList.get: the index is not less than the length") }
+    return unsafe Pointer.read<T>(unsafe Pointer.at<T>(unsafe Pointer.assumeMany<T>(unsafe Intrinsic.pointerRequalify<?*mut T, *const T>(self.data)), index))
+  }
+  /// The element at index without the bounds check, for an index the caller's
+  /// invariant keeps below the length.
+  @inlineAlways
+  pub unsafe fn getUnchecked(self: &Self, index: usize) -> T {
+    return unsafe Pointer.read<T>(unsafe Pointer.at<T>(unsafe Pointer.assumeMany<T>(unsafe Intrinsic.pointerRequalify<?*mut T, *const T>(self.data)), index))
+  }
+  /// Copies the count elements at from to to, as memmove does: the ranges may
+  /// overlap. Traps unless both lie below the length. The elements left behind
+  /// keep their values.
+  @inlineAlways
+  pub fn moveWithin(self: &mut Self, from: usize, to: usize, count: usize) -> () {
+    let length = u32.toUsize(self.count)
+    if from > length || to > length || count > length - from || count > length - to {
+      Intrinsic.trap("ThinList.moveWithin: the range is not within the length")
+    }
+    if count == 0 || from == to { return () }
+    let base = unsafe Pointer.assumeManyMut<T>(unsafe Intrinsic.pointerRequalify<?*mut T, *mut T>(self.data))
+    if to < from {
+      let mut i: usize = 0
+      while i < count {
+        unsafe Pointer.put<T>(unsafe Pointer.atMut<T>(base, to + i), unsafe Pointer.read<T>(unsafe Pointer.atMut<T>(base, from + i)))
+        i = i + 1
+      }
+    } else {
+      let mut i = count
+      while i > 0 {
+        i = i - 1
+        unsafe Pointer.put<T>(unsafe Pointer.atMut<T>(base, to + i), unsafe Pointer.read<T>(unsafe Pointer.atMut<T>(base, from + i)))
+      }
+    }
+  }
+  /// Adds count copies of value at the end, with one reservation.
+  pub effect fn appendRepeated(self: &mut Self, value: T, count: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.reserveExact(count)
+    let mut i: usize = 0
+    while i < count { run self.append(value) i = i + 1 }
+  }
+  /// Removes and returns the element at index, shifting later ones down.
+  pub fn remove(self: &mut Self, index: usize) -> T {
+    let value = self.get(index)
+    let count = u32.toUsize(self.count)
+    let mut i = index + 1
+    while i < count { let next = self.get(i) self.set(i - 1, next) i = i + 1 }
+    self.count = self.count - 1
+    return value
+  }
+}
+
+impl<T> Drop for ThinList<T> {
+  @inlineAlways
+  fn drop(self: &mut ThinList<T>) -> () {
+    unsafe self.release()
+    self.count = 0
+  }
+}
+
+/// The header at the start of a BoxList block: the length, then the capacity and owner.
+struct BoxHeader { count: u32, meta: u32 }
+impl Copy for BoxHeader {}
+pub const BOX_HEADER: usize = 8
+
+/// A list of `Copy` elements in one word: a pointer to a block that starts with its
+/// length, capacity and owner tag, followed by the elements (alignment at most 8).
+/// An empty list without storage is a null pointer. See the module documentation for
+/// how its storage is owned.
+pub struct BoxList<T> { block: ?*mut BoxHeader }
+
+impl<T> BoxList<T> {
+  /// An empty list. Does not allocate.
+  @inlineAlways
+  pub fn make() -> BoxList<T> { return BoxList<T> { block: Pointer.null<BoxHeader>() } }
+  /// An empty list with room for at least capacity elements.
+  pub effect fn makeWithCapacity(capacity: usize) -> BoxList<T> ! OutOfMemoryError ? &mut Allocator {
+    let mut list = BoxList<T>.make()
+    if capacity != 0 { run list.growTo(capacity) }
+    return move list
+  }
+  @inlineAlways
+  fn header(self: &Self) -> BoxHeader {
+    if Pointer.isNull<BoxHeader>(self.block) { return BoxHeader { count: 0, meta: 0 } }
+    return unsafe Pointer.read<BoxHeader>(unsafe Intrinsic.pointerRequalify<?*mut BoxHeader, *const BoxHeader>(self.block))
+  }
+  @inlineAlways
+  fn elements(self: &Self) -> *mut T {
+    let start = unsafe Intrinsic.pointerReinterpret<*mut BoxHeader, *mut u8>(unsafe Intrinsic.pointerRequalify<?*mut BoxHeader, *mut BoxHeader>(self.block))
+    return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut T>(unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(start), BOX_HEADER))
+  }
+  @inlineAlways
+  pub fn length(self: &Self) -> usize { return u32.toUsize(self.header().count) }
+  @inlineAlways
+  pub fn capacity(self: &Self) -> usize { return u32.toUsize(u32.bitAnd(self.header().meta, CAPACITY_MASK)) }
+  /// Whether the elements live in storage the list borrows (borrowingFilled).
+  @inlineAlways
+  pub fn borrowsStorage(self: &Self) -> bool { return !Pointer.isNull<BoxHeader>(self.block) && u32.shiftRight(self.header().meta, OWNER_SHIFT) == OWNER_NONE }
+  /// Replaces the element at index. Traps unless index is below the length.
+  @inlineAlways
+  pub fn set(self: &mut Self, index: usize, value: T) -> () {
+    if self.length() <= index { Intrinsic.trap("BoxList.set: the index is not less than the length") }
+    // Elements are Copy in every use, so the old value needs no drop.
+    unsafe Pointer.put<T>(unsafe Pointer.atMut<T>(unsafe Pointer.assumeManyMut<T>(self.elements()), index), move value)
+  }
+  /// The first element's address, without the empty check: requires a nonempty list.
+  @inlineAlways
+  pub unsafe fn first(self: &Self) -> *const T {
+    return unsafe Intrinsic.pointerRequalify<*mut T, *const T>(self.elements())
+  }
+  /// All elements, in order.
+  pub fn asSlice(self: &Self) -> &[T] {
+    let count = self.length()
+    if count == 0 { return &[] }
+    let base = unsafe Pointer.assumeMany<T>(unsafe Intrinsic.pointerRequalify<*mut T, *const T>(self.elements()))
+    return unsafe Pointer.borrowMany<Self, T>(self, base, count)
+  }
+  /// Shortens the list to length elements; a longer length changes nothing.
+  pub fn truncate(self: &mut Self, length: usize) -> () {
+    if length < self.length() { unsafe self.setCount(length) }
+  }
+  /// Empties the list, keeping its storage.
+  pub fn clear(self: &mut Self) -> () { self.truncate(0) }
+  @inlineAlways
+  unsafe fn setCount(self: &mut Self, count: usize) -> () {
+    let header = unsafe Intrinsic.pointerRequalify<?*mut BoxHeader, *mut BoxHeader>(self.block)
+    let mut value = unsafe Pointer.read<BoxHeader>(header)
+    value.count = usize.toU32(count)
+    unsafe Pointer.write<BoxHeader>(header, value)
+  }
+  /// Adds value at the end, growing like List: four elements first, then doubling.
+  @inlineAlways
+  pub effect fn append(self: &mut Self, value: T) -> () ! OutOfMemoryError ? &mut Allocator {
+    let count = self.length()
+    if count == self.capacity() {
+      let mut next: usize = 4
+      if count != 0 { next = count * 2 }
+      run self.growTo(next)
+    }
+    unsafe Pointer.put<T>(unsafe Pointer.atMut<T>(unsafe Pointer.assumeManyMut<T>(self.elements()), count), move value)
+    unsafe self.setCount(count + 1)
+  }
+  /// The first element of a list with storage. Valid until the list grows or
+  /// releases its storage.
+  @inlineAlways
+  pub unsafe fn elementsMut(self: &mut Self) -> *mut T { return self.elements() }
+  /// Makes room for at least additional more elements than the length.
+  pub effect fn reserveExact(self: &mut Self, additional: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    let wanted = self.length() + additional
+    if wanted > self.capacity() { run self.growTo(wanted) }
+  }
+
+  /// Moves the elements into storage of exactly their length (none when empty).
+  pub effect fn shrinkToFit(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    let count = self.length()
+    if count == self.capacity() || self.borrowsStorage() { return () }
+    if count == 0 { unsafe self.release() return () }
+    run self.growTo(count)
+  }
+  /// Moves the elements into new storage for at least capacity elements.
+  @inlineNever
+  effect fn growTo(self: &mut Self, capacity: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    let size = Layout.of<T>().bytes
+    let alignment = Layout.of<T>().alignment
+    if alignment > BOX_HEADER || size == 0 { Intrinsic.trap("BoxList needs elements of 1 to 8 byte alignment and nonzero size") }
+    if capacity > u32.toUsize(CAPACITY_MASK) || capacity > (usize.MAX - BOX_HEADER) / size { return run Allocator.outOfMemory() }
+    let block = run obtainBlock(BOX_HEADER + capacity * size)
+    let fresh = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut BoxHeader>(block.address)
+    let count = self.length()
+    unsafe Pointer.put<BoxHeader>(fresh, BoxHeader { count: usize.toU32(count), meta: u32.bitOr(usize.toU32(capacity), u32.shiftLeft(block.owner, OWNER_SHIFT)) })
+    if count != 0 {
+      let from = unsafe Pointer.assumeMany<T>(unsafe Intrinsic.pointerRequalify<*mut T, *const T>(self.elements()))
+      let to = unsafe Pointer.assumeManyMut<T>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut T>(unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(block.address), BOX_HEADER)))
+      let mut index = usize.ZERO
+      while index < count {
+        // A bitwise move: the old storage is released without dropping elements.
+        unsafe Pointer.put<T>(unsafe Pointer.atMut<T>(to, index), unsafe Pointer.take<T>(unsafe Intrinsic.pointerRequalify<*const T, *mut T>(unsafe Pointer.at<T>(from, index))))
+        index = index + usize.ONE
+      }
+    }
+    unsafe self.release()
+    self.block = unsafe Intrinsic.pointerRequalify<*mut BoxHeader, ?*mut BoxHeader>(fresh)
+  }
+
+  /// Releases the storage, leaving the list without any. Elements are Copy.
+  @inlineAlways
+  unsafe fn release(self: &mut Self) -> () {
+    if Pointer.isNull<BoxHeader>(self.block) { return () }
+    let owner = u32.shiftRight(self.header().meta, OWNER_SHIFT)
+    // Borrowed storage (borrowingFilled) stays with its owner.
+    if owner == OWNER_NONE { self.block = Pointer.null<BoxHeader>() return () }
+    let address = unsafe Intrinsic.pointerReinterpret<*mut BoxHeader, *mut u8>(unsafe Intrinsic.pointerRequalify<?*mut BoxHeader, *mut BoxHeader>(self.block))
+    unsafe releaseBlock(address, owner)
+    self.block = Pointer.null<BoxHeader>()
+  }
+}
+impl<T: Copy> BoxList<T> {
+  /// Adds copies of values at the end.
+  pub effect fn appendSlice(self: &mut Self, values: &[T]) -> () ! OutOfMemoryError ? &mut Allocator {
+    if values.length == 0 { return () }
+    run self.reserveExact(values.length)
+    // One store loop into the reserved room and one count update.
+    let base = self.length()
+    let to = unsafe Pointer.assumeManyMut<T>(self.elements())
+    // Disjoint slices let the copy lower to memcpy, which raw pointers do not.
+    let mut destinationAnchor = ()
+    let destination = unsafe Pointer.borrowManyMut<(), T>(&mut destinationAnchor, unsafe Pointer.assumeManyMut<T>(unsafe Pointer.atMut<T>(to, base)), values.length)
+    Slice.copyInto<T>(&mut destination, 0, values)
+    drop destination
+    unsafe self.setCount(base + values.length)
+  }
+  /// A copy of the element at index. Traps unless index is below the length.
+  @inlineAlways
+  pub fn get(self: &Self, index: usize) -> T {
+    if self.length() <= index { Intrinsic.trap("BoxList.get: the index is not less than the length") }
+    return unsafe Pointer.read<T>(unsafe Pointer.at<T>(unsafe Pointer.assumeMany<T>(unsafe Intrinsic.pointerRequalify<*mut T, *const T>(self.elements())), index))
+  }
+  /// count copies of value in storage of exactly that capacity: one allocation and
+  /// no copy loop, for lists built at their final length.
+  pub effect fn makeFilled(count: usize, value: T) -> BoxList<T> ! OutOfMemoryError ? &mut Allocator {
+    if count == 0 { return BoxList<T>.make() }
+    let size = Layout.of<T>().bytes
+    if Layout.of<T>().alignment > BOX_HEADER || size == 0 { Intrinsic.trap("BoxList needs elements of 1 to 8 byte alignment and nonzero size") }
+    if count > u32.toUsize(CAPACITY_MASK) || count > (usize.MAX - BOX_HEADER) / size { return run Allocator.outOfMemory() }
+    let block = run obtainBlock(BOX_HEADER + count * size)
+    let fresh = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut BoxHeader>(block.address)
+    unsafe Pointer.put<BoxHeader>(fresh, BoxHeader { count: usize.toU32(count), meta: u32.bitOr(usize.toU32(count), u32.shiftLeft(block.owner, OWNER_SHIFT)) })
+    let list = BoxList<T> { block: unsafe Intrinsic.pointerRequalify<*mut BoxHeader, ?*mut BoxHeader>(fresh) }
+    let elements = unsafe Pointer.assumeManyMut<T>(list.elements())
+    let mut index: usize = 0
+    while index < count { unsafe Pointer.put<T>(unsafe Pointer.atMut<T>(elements, index), value) index = index + 1 }
+    return move list
+  }
+  /// count copies of value in storage the caller owns: block, aligned to 8, holds
+  /// BOX_HEADER bytes and then the elements, and outlives the list, which never
+  /// frees it (a function cell's own tail, for its closure references).
+  @inlineAlways
+  /// A full list of copies of values in storage it borrows: block holds BOX_HEADER
+  /// bytes and then room for values, aligned to 8, and outlives the list.
+  pub unsafe fn borrowingCopy(block: *mut u8, values: &[T]) -> BoxList<T> {
+    let fresh = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut BoxHeader>(block)
+    let count = usize.toU32(values.length)
+    unsafe Pointer.put<BoxHeader>(fresh, BoxHeader { count: count, meta: u32.bitOr(count, u32.shiftLeft(OWNER_NONE, OWNER_SHIFT)) })
+    let list = BoxList<T> { block: unsafe Intrinsic.pointerRequalify<*mut BoxHeader, ?*mut BoxHeader>(fresh) }
+    if values.length != 0 {
+      let mut anchor = ()
+      let mut destination = unsafe Pointer.borrowManyMut<(), T>(&mut anchor, unsafe Pointer.assumeManyMut<T>(list.elements()), values.length)
+      Slice.copyInto<T>(&mut destination, 0, values)
+    }
+    return move list
+  }
+  pub unsafe fn borrowingFilled(block: *mut u8, count: usize, value: T) -> BoxList<T> {
+    let fresh = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut BoxHeader>(block)
+    unsafe Pointer.put<BoxHeader>(fresh, BoxHeader { count: usize.toU32(count), meta: u32.bitOr(usize.toU32(count), u32.shiftLeft(OWNER_NONE, OWNER_SHIFT)) })
+    let list = BoxList<T> { block: unsafe Intrinsic.pointerRequalify<*mut BoxHeader, ?*mut BoxHeader>(fresh) }
+    let elements = unsafe Pointer.assumeManyMut<T>(list.elements())
+    let mut index: usize = 0
+    while index < count { unsafe Pointer.put<T>(unsafe Pointer.atMut<T>(elements, index), value) index = index + 1 }
+    return move list
+  }
+}
+
+impl<T> Drop for BoxList<T> {
+  fn drop(self: &mut BoxList<T>) -> () { unsafe self.release() }
+}
+
+/// Where a ThinBox block keeps its value: past an owner word, at 16 so values
+/// aligned up to 16 fit.
+const THIN_BOX_OFFSET: usize = 16
+
+/// An optional owning box in one word (silk.mem.box.Box<T> takes five, and its
+/// Option six): null, or a block holding its owner tag and then the value.
+pub struct ThinBox<T> { block: ?*mut u8 }
+
+impl<T> ThinBox<T> {
+  pub fn none() -> ThinBox<T> { return ThinBox<T> { block: Pointer.null<u8>() } }
+  pub fn isSome(self: &Self) -> bool { return !Pointer.isNull<u8>(self.block) }
+  pub fn isNone(self: &Self) -> bool { return Pointer.isNull<u8>(self.block) }
+  /// A box holding value.
+  pub effect fn make(value: T) -> ThinBox<T> ! OutOfMemoryError ? &mut Allocator {
+    if Layout.of<T>().alignment > THIN_BOX_OFFSET { Intrinsic.trap("ThinBox needs values aligned to at most 16") }
+    let block = run obtainBlock(THIN_BOX_OFFSET + Layout.of<T>().bytes)
+    unsafe Pointer.put<u32>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut u32>(block.address), block.owner)
+    unsafe Pointer.put<T>(valueIn<T>(block.address), move value)
+    return ThinBox<T> { block: unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(block.address) }
+  }
+  /// The bytes borrowingIn needs at its address.
+  pub fn borrowedBytes() -> usize { return THIN_BOX_OFFSET + Layout.of<T>().bytes }
+  /// A box holding value in storage it borrows: borrowedBytes at address, aligned
+  /// for T, which outlives the box. Taking or dropping the value frees nothing.
+  pub unsafe fn borrowingIn(address: *mut u8, value: T) -> ThinBox<T> {
+    if Layout.of<T>().alignment > THIN_BOX_OFFSET { Intrinsic.trap("ThinBox needs values aligned to at most 16") }
+    unsafe Pointer.put<u32>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut u32>(address), OWNER_NONE)
+    unsafe Pointer.put<T>(valueIn<T>(address), move value)
+    return ThinBox<T> { block: unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(address) }
+  }
+  fn address(self: &Self) -> *mut u8 {
+    if Pointer.isNull<u8>(self.block) { Intrinsic.trap("ThinBox: the box is empty") }
+    return unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(self.block)
+  }
+  /// The value. Traps when the box is empty.
+  pub fn get(self: &Self) -> &T {
+    return unsafe Pointer.borrow<Self, T>(&self.*, unsafe Intrinsic.pointerRequalify<*mut T, *const T>(valueIn<T>(self.address())))
+  }
+  /// The value, to change. Traps when the box is empty.
+  pub fn getMut(self: &mut Self) -> &mut T {
+    let at = valueIn<T>(self.address())
+    return unsafe Pointer.borrowMut<Self, T>(&mut self.*, at)
+  }
+  /// Takes the value out, leaving the box empty.
+  pub fn take(self: &mut Self) -> Option<T> {
+    if Pointer.isNull<u8>(self.block) { return Option<T>.none() }
+    let address = self.address()
+    let value = unsafe Pointer.take<T>(valueIn<T>(address))
+    unsafe releaseBlock(address, unsafe Pointer.read<u32>(unsafe Intrinsic.pointerRequalify<*mut u32, *const u32>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut u32>(address))))
+    self.block = Pointer.null<u8>()
+    return Option<T>.some(move value)
+  }
+}
+fn valueIn<T>(address: *mut u8) -> *mut T {
+  return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut T>(unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(address), THIN_BOX_OFFSET))
+}
+impl<T> Drop for ThinBox<T> {
+  fn drop(self: &mut ThinBox<T>) -> () {
+    if Pointer.isNull<u8>(self.block) { return () }
+    let value = self.take()
+    drop value
+  }
+}
+
+/// Where a PairList block's elements start: past its owner word and both lengths.
+const PAIR_OFFSET: usize = 16
+
+/// Two lists of `Copy` elements in one block, made at their final lengths: an
+/// owner word, both lengths, the first list's elements, then the second's (at
+/// the next multiple of 8). One word; null when both lists are empty.
+pub struct PairList<A, B> { block: ?*mut u8 }
+
+impl<A: Copy, B: Copy> PairList<A, B> {
+  /// Two empty lists. Does not allocate.
+  @inlineAlways
+  pub fn none() -> PairList<A, B> { return PairList<A, B> { block: Pointer.null<u8>() } }
+  fn secondOffset(firstCount: usize) -> usize {
+    let bytes = PAIR_OFFSET + firstCount * Layout.of<A>().bytes
+    return (bytes + 7) / 8 * 8
+  }
+  /// Lists of firstCount and secondCount elements, each set to its filler.
+  pub effect fn filled(firstCount: usize, secondCount: usize, first: A, second: B) -> PairList<A, B> ! OutOfMemoryError ? &mut Allocator {
+    if firstCount == 0 && secondCount == 0 { return PairList<A, B>.none() }
+    if Layout.of<A>().alignment > 8 || Layout.of<B>().alignment > 8 { Intrinsic.trap("PairList needs elements aligned to at most 8") }
+    let block = run obtainBlock(PairList<A, B>.secondOffset(firstCount) + secondCount * Layout.of<B>().bytes)
+    unsafe Pointer.put<u32>(pairWord(block.address, 0), block.owner)
+    unsafe Pointer.put<u32>(pairWord(block.address, 1), usize.toU32(firstCount))
+    unsafe Pointer.put<u32>(pairWord(block.address, 2), usize.toU32(secondCount))
+    let mut list = PairList<A, B> { block: unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(block.address) }
+    let mut i: usize = 0
+    while i < firstCount { list.setFirst(i, first) i = i + 1 }
+    i = 0
+    while i < secondCount { list.setSecond(i, second) i = i + 1 }
+    return move list
+  }
+  /// Copies of first and second.
+  pub effect fn copied(first: &[A], second: &[B]) -> PairList<A, B> ! OutOfMemoryError ? &mut Allocator {
+    if first.length == 0 && second.length == 0 { return PairList<A, B>.none() }
+    if Layout.of<A>().alignment > 8 || Layout.of<B>().alignment > 8 { Intrinsic.trap("PairList needs elements aligned to at most 8") }
+    let block = run obtainBlock(PairList<A, B>.secondOffset(first.length) + second.length * Layout.of<B>().bytes)
+    unsafe Pointer.put<u32>(pairWord(block.address, 0), block.owner)
+    unsafe Pointer.put<u32>(pairWord(block.address, 1), usize.toU32(first.length))
+    unsafe Pointer.put<u32>(pairWord(block.address, 2), usize.toU32(second.length))
+    let list = PairList<A, B> { block: unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(block.address) }
+    // Disjoint slices let the copies lower to memcpy.
+    if first.length != 0 {
+      let mut anchor = ()
+      let mut destination = unsafe Pointer.borrowManyMut<(), A>(&mut anchor, unsafe Pointer.assumeManyMut<A>(list.firstAddress()), first.length)
+      Slice.copyInto<A>(&mut destination, 0, first)
+    }
+    if second.length != 0 {
+      let mut anchor = ()
+      let mut destination = unsafe Pointer.borrowManyMut<(), B>(&mut anchor, unsafe Pointer.assumeManyMut<B>(list.secondAddress()), second.length)
+      Slice.copyInto<B>(&mut destination, 0, second)
+    }
+    return move list
+  }
+  @inlineAlways
+  fn count(self: &Self, word: usize) -> usize {
+    if Pointer.isNull<u8>(self.block) { return 0 }
+    return u32.toUsize(unsafe Pointer.read<u32>(unsafe Intrinsic.pointerRequalify<*mut u32, *const u32>(pairWord(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(self.block), word))))
+  }
+  @inlineAlways
+  pub fn firstLength(self: &Self) -> usize { return self.count(1) }
+  @inlineAlways
+  pub fn secondLength(self: &Self) -> usize { return self.count(2) }
+  fn firstAddress(self: &Self) -> *mut A {
+    let start = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(self.block)
+    return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut A>(unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(start), PAIR_OFFSET))
+  }
+  fn secondAddress(self: &Self) -> *mut B {
+    let start = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(self.block)
+    let offset = PairList<A, B>.secondOffset(self.firstLength())
+    return unsafe Intrinsic.pointerReinterpret<*mut u8, *mut B>(unsafe Pointer.atMut<u8>(unsafe Pointer.assumeManyMut<u8>(start), offset))
+  }
+  /// The first list.
+  pub fn first(self: &Self) -> &[A] {
+    let count = self.firstLength()
+    if count == 0 { return &[] }
+    return unsafe Pointer.borrowMany<Self, A>(self, unsafe Pointer.assumeMany<A>(unsafe Intrinsic.pointerRequalify<*mut A, *const A>(self.firstAddress())), count)
+  }
+  /// The second list.
+  pub fn second(self: &Self) -> &[B] {
+    let count = self.secondLength()
+    if count == 0 { return &[] }
+    return unsafe Pointer.borrowMany<Self, B>(self, unsafe Pointer.assumeMany<B>(unsafe Intrinsic.pointerRequalify<*mut B, *const B>(self.secondAddress())), count)
+  }
+  /// Replaces the first list's element at index. Traps unless index is below its length.
+  pub fn setFirst(self: &mut Self, index: usize, value: A) -> () {
+    if self.firstLength() <= index { Intrinsic.trap("PairList.setFirst: the index is not less than the length") }
+    unsafe Pointer.put<A>(unsafe Pointer.atMut<A>(unsafe Pointer.assumeManyMut<A>(self.firstAddress()), index), move value)
+  }
+  /// Replaces the second list's element at index. Traps unless index is below its length.
+  pub fn setSecond(self: &mut Self, index: usize, value: B) -> () {
+    if self.secondLength() <= index { Intrinsic.trap("PairList.setSecond: the index is not less than the length") }
+    unsafe Pointer.put<B>(unsafe Pointer.atMut<B>(unsafe Pointer.assumeManyMut<B>(self.secondAddress()), index), move value)
+  }
+}
+impl<A, B> PairList<A, B> {
+  /// Frees the block, leaving both lists empty.
+  pub fn clear(self: &mut Self) -> () {
+    if Pointer.isNull<u8>(self.block) { return () }
+    let address = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(self.block)
+    let owner = unsafe Pointer.read<u32>(unsafe Intrinsic.pointerRequalify<*mut u32, *const u32>(pairWord(address, 0)))
+    self.block = Pointer.null<u8>()
+    unsafe releaseBlock(address, owner)
+  }
+}
+fn pairWord(address: *mut u8, index: usize) -> *mut u32 {
+  return unsafe Pointer.atMut<u32>(unsafe Pointer.assumeManyMut<u32>(unsafe Intrinsic.pointerReinterpret<*mut u8, *mut u32>(address)), index)
+}
+impl<A, B> Drop for PairList<A, B> {
+  fn drop(self: &mut PairList<A, B>) -> () { self.clear() }
+}

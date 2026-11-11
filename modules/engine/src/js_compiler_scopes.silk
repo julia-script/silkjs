@@ -1,0 +1,746 @@
+//! Per-scope contexts at compile time (see js_scopes). Runs on a function after
+//! its variables are resolved and all its children are finished, before its
+//! labels pass: decides which captured variables live in the function's scope,
+//! rewrites its own accesses to them into scope-operand var-ref opcodes, and
+//! rewrites every finished descendant's captures of them the same way (the
+//! descendants' closure vars become ClosureKind.Scope). Captured variables that
+//! a scope cannot hold (block lexicals, mapped arguments, references through
+//! make_*_ref, too deep) keep their cells.
+import thin_list { BoxList }
+import silk.core.option { Option }
+import silk.mem.pointer { Pointer }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.num.i32
+import silk.num.u8
+import silk.num.u16
+import silk.num.u32
+import silk.num.usize
+import byte_buffer { readU16, readU32 }
+import js_heap { HeapHeader, CellRef }
+import js_value { ValueBits }
+import js_core_types { FunctionBytecode, FunctionKind, ByteStorage, ClosureKind, ClosureVar, CLOSURE_NO_DEPTH, JS_MODE_STRICT,
+  SCOPE_OPERAND, SCOPE_DEPTH_SHIFT, SCOPE_DEPTH_MAX, SCOPE_SLOTS_MAX, SCOPE_SLOT_MASK }
+import js_compiler_types { FunctionDef, FunctionId, FunctionTree, CompilerVar }
+import js_opcode_data as op
+
+/// What assemble stores into the FunctionBytecode.
+/// droppedLocals counts the locals dropScopedLocals moved behind the frame's.
+pub struct ScopePlan { pub slots: u16, pub varSlots: u16, pub parameters: BoxList<u32>, pub variables: BoxList<u16>, pub droppedLocals: usize }
+/// The plan of a function without a scope.
+pub fn emptyPlan() -> ScopePlan {
+  return ScopePlan { slots: 0, varSlots: 0, parameters: BoxList<u32>.make(), variables: BoxList<u16>.make(), droppedLocals: 0 }
+}
+
+/// Root ids: a variable v is v, an argument a is ARGUMENT_ROOT + a.
+const ARGUMENT_ROOT: i32 = 65536
+const NONE: i32 = -1
+/// candidate states per root
+const NOT_CANDIDATE: i32 = -2
+const DEMOTED: i32 = -3
+
+fn operand(depth: usize, slot: i32) -> u16 {
+  return SCOPE_OPERAND | u16.shiftLeft(usize.toU16(depth), SCOPE_DEPTH_SHIFT) | i32.toU16(slot)
+}
+
+/// Whether fd or a function inside it can resolve names at run time (direct
+/// eval or with), so its variables must stay reachable by name through cells.
+pub fn dynamicScope(fd: &FunctionDef) -> bool {
+  return fd.hasEvalCall || fd.subtreeDynamic || fd.hasWithVar
+}
+
+fn eligibleFunction(fd: &FunctionDef) -> bool {
+  // The debugger reads captured locals from frames and cells (js_debugger_scopes).
+  return fd.functionKind == FunctionKind.Normal && !fd.isEval && fd.module.isNone()
+    && !fd.hasParameterExpressions && !dynamicScope(&fd.*) && !fd.debuggerMetadata.enabled
+}
+
+fn rootIndex(fd: &FunctionDef, root: i32) -> usize {
+  if root >= ARGUMENT_ROOT { return i32.toUsize(root - ARGUMENT_ROOT) }
+  return fd.args.length() + i32.toUsize(root)
+}
+
+/// The state slot (index into states) for a local or argument operand of fd.
+fn localRoot(fd: &FunctionDef, index: usize, argument: bool) -> usize {
+  if argument { return index }
+  return fd.args.length() + index
+}
+
+/// Pre-labels opcodes that name a local (false) or argument (true) slot by u16.
+fn localOperand(code: u8) -> i32 {
+  if code == op.OP_get_loc || code == op.OP_put_loc || code == op.OP_set_loc || code == op.OP_get_loc_check
+    || code == op.OP_put_loc_check || code == op.OP_set_loc_check || code == op.OP_put_loc_check_init
+    || code == op.OP_get_loc_checkthis || code == op.OP_set_loc_uninitialized || code == op.OP_close_loc { return 0 }
+  if code == op.OP_get_arg || code == op.OP_put_arg || code == op.OP_set_arg { return 1 }
+  return -1
+}
+/// The var-ref opcode a scope-slot access of local opcode code becomes; 0 for a nop.
+fn scopeOpcode(code: u8) -> u8 {
+  if code == op.OP_get_loc || code == op.OP_get_arg { return op.OP_get_var_ref }
+  if code == op.OP_put_loc || code == op.OP_put_arg { return op.OP_put_var_ref }
+  if code == op.OP_set_loc || code == op.OP_set_arg { return op.OP_set_var_ref }
+  if code == op.OP_get_loc_check || code == op.OP_get_loc_checkthis { return op.OP_get_var_ref_check }
+  if code == op.OP_put_loc_check { return op.OP_put_var_ref_check }
+  if code == op.OP_put_loc_check_init { return op.OP_put_var_ref_check_init }
+  return 0
+}
+/// Final opcodes with a u16 closure-var operand right after the opcode byte.
+fn varRefOperand(code: u8) -> bool {
+  return code == op.OP_get_var_ref || code == op.OP_put_var_ref || code == op.OP_set_var_ref
+    || code == op.OP_get_var_ref_check || code == op.OP_put_var_ref_check || code == op.OP_put_var_ref_check_init
+}
+
+/// The depth-0 scope form of a var-ref opcode (get_scope0 etc.), which takes the
+/// bare slot as its operand.
+fn depthZeroOpcode(code: u8) -> u8 {
+  if code == op.OP_get_var_ref { return op.OP_get_scope0 }
+  if code == op.OP_put_var_ref { return op.OP_put_scope0 }
+  if code == op.OP_set_var_ref { return op.OP_set_scope0 }
+  if code == op.OP_get_var_ref_check { return op.OP_get_scope0_check }
+  if code == op.OP_put_var_ref_check { return op.OP_put_scope0_check }
+  if code == op.OP_put_var_ref_check_init { return op.OP_put_scope0_check_init }
+  return Intrinsic.trap("not a var-ref opcode")
+}
+
+/// After fd's labels pass: its own depth-0 scope operands take the depth-0 forms.
+pub fn specializeOwn(fd: &mut FunctionDef) -> () {
+  let mut position: usize = 0
+  while position < fd.bytecode.length() {
+    let code = fd.bytecode.get(position)
+    let size = u8.toUsize(op.opcodeInfo(code, true).size)
+    if varRefOperand(code) {
+      let value = readU16(fd.bytecode.asSlice(), position + 1)
+      if value >= SCOPE_OPERAND && (u16.shiftRight(value, SCOPE_DEPTH_SHIFT) & 7) == 0 {
+        fd.bytecode.set(position, depthZeroOpcode(code)) fd.bytecode.patchU16(position + 1, value & SCOPE_SLOT_MASK)
+      }
+    }
+    position = position + size
+  }
+}
+
+fn hasScope(code: CellRef<FunctionBytecode>) -> bool {
+  let anchor = () let b = code.get(&anchor) return b.scopeSlots != 0
+}
+/// Whether bytecode is a stub that js_compiler_finish.defer published.
+fn pendingStub(code: CellRef<FunctionBytecode>) -> bool {
+  let anchor = () let b = code.get(&anchor) return b.pending.isSome()
+}
+fn lazyPending(code: CellRef<FunctionBytecode>) -> bool {
+  let anchor = () let b = code.get(&anchor)
+  return b.pending.isSome() && b.pending.get().lazy.isSome()
+}
+/// The deepest nesting (0: the stub's own body) at which a lazy stub uses a closure var; -1 if unknown.
+fn lazyNesting(entry: ClosureVar) -> i32 {
+  if entry.depth == CLOSURE_NO_DEPTH { return -1 }
+  return u8.toI32(entry.depth)
+}
+/// Whether bytecode's code is final (short opcodes). A stub's code is its
+/// deferred definition's pre-label bytecode, which the rewrite patches the same
+/// way; finish's labels pass then reads the patched operands.
+fn finalCode(code: CellRef<FunctionBytecode>) -> bool { return !pendingStub(code) }
+fn codeLength(code: CellRef<FunctionBytecode>) -> usize {
+  let anchor = () let b = code.get(&anchor)
+  if b.pending.isSome() {
+    // A lazy stub has no code (js_compiler_variables.resolveStub).
+    let p = b.pending.get() if p.lazy.isSome() { return 0 } return p.tree.get().get(p.cell).bytecode.length()
+  }
+  return b.code.length()
+}
+/// The first byte of bytecode's code (pending or final), for a walk that reads
+/// it in place; patches never move it. Only for code that is not empty.
+unsafe fn codeStart(code: CellRef<FunctionBytecode>) -> *const u8 {
+  let anchor = () let b = code.get(&anchor)
+  if b.pending.isSome() { let p = b.pending.get() return Pointer.fromRef<u8>(&p.tree.get().get(p.cell).bytecode.asSlice()[0]) }
+  return unsafe b.code.start()
+}
+@inlineAlways
+unsafe fn byteAt(start: *const u8, at: usize) -> u8 { return unsafe Pointer.read<u8>(unsafe Pointer.at<u8>(unsafe Pointer.assumeMany<u8>(start), at)) }
+@inlineAlways
+unsafe fn u16At(start: *const u8, at: usize) -> i32 { return u8.toI32(unsafe byteAt(start, at)) + u8.toI32(unsafe byteAt(start, at + 1)) * 256 }
+fn patchByte(code: CellRef<FunctionBytecode>, at: usize, value: u8) -> () {
+  let mut anchor = () let b = code.getMut(&mut anchor)
+  if b.pending.isSome() {
+    let p = b.pending.getMut() let cell = p.cell p.tree.getMut().getMut(cell).bytecode.set(at, value) return ()
+  }
+  match &mut b.code {
+    ByteStorage.Owned { bytes: owned } => { owned.set(at, value) }
+    _ => Intrinsic.trap("scoped descendant with borrowed code")
+  }
+}
+fn patchU16(code: CellRef<FunctionBytecode>, at: usize, value: u16) -> () {
+  patchByte(code, at, u16.toU8(value & 255))
+  patchByte(code, at + 1, u16.toU8(u16.shiftRight(value, 8)))
+}
+fn closureCount(code: CellRef<FunctionBytecode>) -> usize {
+  let anchor = () let b = code.get(&anchor) return b.closureVars.length()
+}
+fn closureAt(code: CellRef<FunctionBytecode>, index: usize) -> ClosureVar {
+  let anchor = () let b = code.get(&anchor) return b.closureVars.get(index)
+}
+fn markScoped(code: CellRef<FunctionBytecode>, index: usize, value: u16) -> () {
+  let mut anchor = () let b = code.getMut(&mut anchor)
+  let mut v = b.closureVars.get(index)
+  v.kind = ClosureKind.Scope v.variableIndex = value
+  b.closureVars.set(index, v)
+}
+fn setClosure(code: CellRef<FunctionBytecode>, index: usize, value: ClosureVar) -> () {
+  let mut anchor = () let b = code.getMut(&mut anchor)
+  b.closureVars.set(index, value)
+}
+fn setScopeCaptures(code: CellRef<FunctionBytecode>, value: usize) -> () {
+  let mut anchor = () let b = code.getMut(&mut anchor)
+  b.scopeCaptures = usize.toU16(value)
+}
+fn constantCount(code: CellRef<FunctionBytecode>) -> usize {
+  let anchor = () let b = code.get(&anchor) return b.constants.length()
+}
+fn childAt(code: CellRef<FunctionBytecode>, index: usize) -> Option<CellRef<FunctionBytecode>> {
+  let anchor = () let b = code.get(&anchor)
+  return match b.constants.get(index) {
+    ValueBits.FunctionBytecode { reference } => Option<CellRef<FunctionBytecode>>.some(child(reference))
+    _ => Option<CellRef<FunctionBytecode>>.none()
+  }
+}
+/// The function bytecode a constant names. Its parent's constant list keeps it
+/// alive for as long as the parent, which outlives every scope pass over it.
+fn child(reference: *mut HeapHeader) -> CellRef<FunctionBytecode> { return unsafe CellRef<FunctionBytecode>.of(reference) }
+
+/// Walks a finished descendant. map gives, per closure var of the descendant, the
+/// root of the planning function it captures (or NONE). rewrite false demotes
+/// roots the descendant uses in ways a scope slot cannot serve; rewrite true
+/// patches its operands and closure vars for roots that got slots.
+effect fn visit(code: CellRef<FunctionBytecode>, map: &List<i32>, depth: usize, states: &mut List<i32>, rewrite: bool) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let short = finalCode(code)
+  let mut d = depth
+  if hasScope(code) { d = d + 1 }
+  // A lazy stub keeps no code (js_compiler_variables.resolveStub).
+  let length = codeLength(code)
+  let mut position: usize = 0
+  if length != 0 {
+    let start = unsafe codeStart(code)
+    while position < length {
+      let opcode = unsafe byteAt(start, position)
+      let size = u8.toUsize(op.opcodeInfo(opcode, short).size)
+      let mut index: i32 = -1 let mut reference = false
+      if varRefOperand(opcode) { index = unsafe u16At(start, position + 1) }
+      else if opcode == op.OP_make_var_ref_ref { index = unsafe u16At(start, position + 5) reference = true }
+      if index >= 0 && index < u16.toI32(SCOPE_OPERAND) && i32.toUsize(index) < map.length() {
+        let root = map.get(i32.toUsize(index))
+        if root != NONE {
+          let state = states.get(i32.toUsize(root))
+          if !rewrite {
+            if reference || d > SCOPE_DEPTH_MAX { states.set(i32.toUsize(root), DEMOTED) }
+          } else if state >= 0 {
+            // A stub's pre-label code numbers opcodes differently: it keeps the
+            // var-ref form, and finish specializes its depth-0 operands.
+            if d == 0 && short { patchByte(code, position, depthZeroOpcode(opcode)) patchU16(code, position + 1, i32.toU16(state)) }
+            else { patchU16(code, position + 1, operand(d, state)) }
+          }
+        }
+      }
+      position = position + size
+    }
+  }
+  let count = closureCount(code)
+  // A lazy stub's body is not compiled yet: its preparse gave each free name's
+  // deepest nesting. Assume every function on the way owns a scope.
+  if !rewrite && lazyPending(code) {
+    let mut i: usize = 0
+    while i < count && i < map.length() {
+      let root = map.get(i)
+      if root != NONE {
+        let entry = closureAt(code, i)
+        let nesting = lazyNesting(entry)
+        if nesting < 0 || d + 1 + i32.toUsize(nesting) > SCOPE_DEPTH_MAX { states.set(i32.toUsize(root), DEMOTED) }
+      }
+      i = i + 1
+    }
+  }
+  if rewrite {
+    let mut i: usize = 0
+    while i < count && i < map.length() {
+      let root = map.get(i)
+      if root != NONE && states.get(i32.toUsize(root)) >= 0 { markScoped(code, i, operand(d, states.get(i32.toUsize(root)))) }
+      i = i + 1
+    }
+  }
+  let constants = constantCount(code)
+  let mut c: usize = 0
+  while c < constants {
+    match childAt(code, c) {
+      Option<CellRef<FunctionBytecode>>.Some { value } => {
+        let n = closureCount(value)
+        let mut childMap = List<i32>.make()
+        run childMap.reserve(n)
+        let mut any = false
+        let mut j: usize = 0
+        while j < n {
+          let v = closureAt(value, j)
+          let mut root = NONE
+          if v.kind == ClosureKind.Reference && u16.toUsize(v.variableIndex) < map.length() { root = map.get(u16.toUsize(v.variableIndex)) }
+          if root != NONE { any = true }
+          run childMap.append(root)
+          j = j + 1
+        }
+        // A descendant reaches the planning function's roots only through its
+        // parent's captures: one that maps none of them has nothing below it.
+        if any { run visit(value, &childMap, d, &mut states, rewrite) }
+      }
+      _ => ()
+    }
+    c = c + 1
+  }
+  // After the children, whose references into this list are still the old indexes.
+  if rewrite { run compact(code) }
+}
+
+/// Moves a finished function's scope captures behind the captures that keep
+/// cells (stable on both sides) and records how many there are, so its closures
+/// hold and walk cells only for the rest. Renumbers its own closure-var operands and
+/// its children's Reference and GlobalReference captures, which index its list.
+effect fn compact(code: CellRef<FunctionBytecode>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let count = closureCount(code)
+  let mut live: usize = 0 let mut sorted = true
+  let mut i: usize = 0
+  while i < count {
+    let entry = closureAt(code, i)
+    if entry.kind != ClosureKind.Scope {
+      if live != i { sorted = false }
+      live = live + 1
+    }
+    i = i + 1
+  }
+  setScopeCaptures(code, count - live)
+  if sorted { return () }
+  // order: the new index of each old one.
+  let mut order = List<u16>.make() run order.reserve(count)
+  let mut original = List<ClosureVar>.make() run original.reserve(count)
+  let mut nextLive: usize = 0 let mut nextScoped = live
+  i = 0
+  while i < count {
+    let v = closureAt(code, i)
+    run original.append(v)
+    if v.kind == ClosureKind.Scope { run order.append(usize.toU16(nextScoped)) nextScoped = nextScoped + 1 }
+    else { run order.append(usize.toU16(nextLive)) nextLive = nextLive + 1 }
+    i = i + 1
+  }
+  i = 0
+  while i < count { setClosure(code, u16.toUsize(order.get(i)), original.get(i)) i = i + 1 }
+  let length = codeLength(code) let short = finalCode(code)
+  let mut position: usize = 0
+  if length != 0 {
+    let start = unsafe codeStart(code)
+    while position < length {
+      let opcode = unsafe byteAt(start, position)
+      let size = u8.toUsize(op.opcodeInfo(opcode, short).size)
+      let mut at: usize = 0
+      // Every closure-var operand: var refs and the global cells of get_var and friends.
+      if op.opcodeInfo(opcode, short).format == op.OP_FMT_var_ref { at = position + 1 }
+      else if opcode == op.OP_make_var_ref_ref { at = position + 5 }
+      if at != 0 {
+        let index = unsafe u16At(start, at)
+        if index < u16.toI32(SCOPE_OPERAND) { patchU16(code, at, order.get(i32.toUsize(index))) }
+      }
+      position = position + size
+    }
+  }
+  let constants = constantCount(code)
+  let mut c: usize = 0
+  while c < constants {
+    match childAt(code, c) {
+      Option<CellRef<FunctionBytecode>>.Some { value } => {
+        let n = closureCount(value)
+        let mut j: usize = 0
+        while j < n {
+          let mut v = closureAt(value, j)
+          if v.kind == ClosureKind.Reference || v.kind == ClosureKind.GlobalReference {
+            v.variableIndex = order.get(u16.toUsize(v.variableIndex)) setClosure(value, j, v)
+          }
+          j = j + 1
+        }
+      }
+      _ => ()
+    }
+    c = c + 1
+  }
+}
+
+/// Map for a direct child, into map: its Local/Argument closure vars name fd's
+/// own slots. Whether any entry names one.
+effect fn directMap(fd: &FunctionDef, code: CellRef<FunctionBytecode>, map: &mut List<i32>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  map.clear()
+  let n = closureCount(code)
+  run map.reserve(n)
+  let mut any = false
+  let mut j: usize = 0
+  while j < n {
+    let v = closureAt(code, j)
+    let mut root = NONE
+    if v.kind == ClosureKind.Local { root = usize.toI32(localRoot(&fd.*, u16.toUsize(v.variableIndex), false)) any = true }
+    else if v.kind == ClosureKind.Argument { root = usize.toI32(localRoot(&fd.*, u16.toUsize(v.variableIndex), true)) any = true }
+    run map.append(root)
+    j = j + 1
+  }
+  return any
+}
+
+effect fn visitChildren(fd: &FunctionDef, states: &mut List<i32>, rewrite: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  // One map for every child: most are small stubs.
+  let mut map = List<i32>.make()
+  let mut c: usize = 0
+  while c < fd.constants.length() {
+    match fd.constants.get(c) {
+      ValueBits.FunctionBytecode { reference } => {
+        // A child that captures none of fd's locals has nothing to demote or
+        // rewrite, and neither do its descendants, which reach fd's locals only
+        // through its captures.
+        let captures = run directMap(&fd.*, child(reference), &mut map)
+        if captures { run visit(child(reference), &map, 0, &mut states, rewrite) }
+      }
+      _ => ()
+    }
+    c = c + 1
+  }
+}
+
+/// Plans fd's scope and rewrites fd and its finished descendants to use it.
+/// Leaves fd.scopeSlotOf filled (per varDefs index, -1 when not in the scope) for
+/// the labels pass's prologue when the plan has slots.
+pub effect fn plan(tree: &mut FunctionTree, cell: FunctionId) -> ScopePlan ! OutOfMemoryError ? &mut Allocator {
+  let fd = tree.getMut(cell)
+  if !eligibleFunction(&fd.*) { return emptyPlan() }
+  let argCount = fd.args.length() let varCount = fd.vars.length()
+  let mapped = fd.argumentsVarIndex >= 0 && (fd.jsMode & JS_MODE_STRICT) == 0 && fd.hasSimpleParameterList
+  // Most functions have no candidate: find that out before allocating states.
+  let mut any = false
+  let mut i: usize = 0
+  if !mapped { while i < argCount && !any { if fd.args.get(i).isCaptured { any = true } i = i + 1 } }
+  i = 0
+  while i < varCount && !any {
+    let v = fd.vars.get(i)
+    if v.isCaptured && (v.scopeLevel == 0 || v.scopeLevel == fd.bodyScope) { any = true }
+    i = i + 1
+  }
+  if !any { return emptyPlan() }
+  let mut states = List<i32>.make()
+  run states.reserve(argCount + varCount)
+  i = 0
+  while i < argCount {
+    let v = fd.args.get(i)
+    let mut state = NOT_CANDIDATE
+    if v.isCaptured && !mapped { state = NONE }
+    run states.append(state) i = i + 1
+  }
+  i = 0
+  while i < varCount {
+    let v = fd.vars.get(i)
+    let mut state = NOT_CANDIDATE
+    if v.isCaptured && (v.scopeLevel == 0 || v.scopeLevel == fd.bodyScope) { state = NONE }
+    run states.append(state) i = i + 1
+  }
+  // Demotions from fd's own code: locals the var pass made references to keep cells.
+  i = 0
+  while i < argCount { if states.get(i) == NONE && fd.args.get(i).isReferenced { states.set(i, DEMOTED) } i = i + 1 }
+  i = 0
+  while i < varCount { if states.get(argCount + i) == NONE && fd.vars.get(i).isReferenced { states.set(argCount + i, DEMOTED) } i = i + 1 }
+  // Demotions from descendants.
+  run visitChildren(&fd.*, &mut states, false)
+  // Slots: arguments, then var-like locals (start Undefined), then lexicals.
+  let mut parameters = BoxList<u32>.make()
+  let mut variables = BoxList<u16>.make()
+  let mut next: i32 = 0
+  i = 0
+  while i < argCount {
+    if states.get(i) == NONE && i32.toUsize(next) < SCOPE_SLOTS_MAX {
+      states.set(i, next) run parameters.append(usize.toU32(i)) run parameters.append(i32.toU32(next))
+      run variables.append(usize.toU16(i)) next = next + 1
+    }
+    i = i + 1
+  }
+  let mut pass: usize = 0
+  let mut varSlots: i32 = 0
+  while pass < 2 {
+    i = 0
+    while i < varCount {
+      let root = argCount + i
+      let lexical = fd.vars.get(i).isLexical
+      if states.get(root) == NONE && lexical == (pass == 1) && i32.toUsize(next) < SCOPE_SLOTS_MAX {
+        states.set(root, next) run variables.append(usize.toU16(root)) next = next + 1
+      }
+      i = i + 1
+    }
+    if pass == 0 { varSlots = next }
+    pass = pass + 1
+  }
+  if next == 0 { return emptyPlan() }
+  // fd's own code: locals and arguments in the scope become depth-0 scope operands.
+  let mut position: usize = 0
+  while position < fd.bytecode.length() {
+    let code = fd.bytecode.get(position)
+    let size = u8.toUsize(op.opcodeInfo(code, false).size)
+    let kind = localOperand(code)
+    if kind >= 0 {
+      let root = localRoot(&fd.*, u16.toUsize(readU16(fd.bytecode.asSlice(), position + 1)), kind == 1)
+      if root < states.length() && states.get(root) >= 0 {
+        let replacement = scopeOpcode(code)
+        if replacement == 0 {
+          fd.bytecode.set(position, op.OP_nop) fd.bytecode.set(position + 1, op.OP_nop) fd.bytecode.set(position + 2, op.OP_nop)
+        } else {
+          fd.bytecode.set(position, replacement) fd.bytecode.patchU16(position + 1, operand(0, states.get(root)))
+        }
+      }
+    }
+    position = position + size
+  }
+  run visitChildren(&fd.*, &mut states, true)
+  // Variables in the scope have no frame cell: renumber the remaining captures.
+  let mut references: i32 = 0
+  i = 0
+  while i < argCount {
+    let mut v = fd.args.get(i)
+    if states.get(i) >= 0 { v.isCaptured = false v.varRefIndex = 0 }
+    else if v.isCaptured { v.varRefIndex = i32.toU16(references) references = references + 1 }
+    fd.args.set(i, v) i = i + 1
+  }
+  i = 0
+  while i < varCount {
+    let mut v = fd.vars.get(i)
+    if states.get(argCount + i) >= 0 { v.isCaptured = false v.varRefIndex = 0 }
+    else if v.isCaptured { v.varRefIndex = i32.toU16(references) references = references + 1 }
+    fd.vars.set(i, v) i = i + 1
+  }
+  fd.varRefCount = references
+  fd.scopeSlotOf.clear()
+  i = 0
+  while i < states.length() {
+    let mut slot = states.get(i) if slot < 0 { slot = -1 }
+    run fd.scopeSlotOf.append(slot) i = i + 1
+  }
+  return ScopePlan { slots: i32.toU16(next), varSlots: i32.toU16(varSlots), parameters: move parameters, variables: move variables, droppedLocals: 0 }
+}
+
+/// The scope slot of local index (argument false) of fd, or -1.
+pub fn localSlot(fd: &FunctionDef, index: i32, argument: bool) -> i32 {
+  let root = localRoot(&fd.*, i32.toUsize(index), argument)
+  if root >= fd.scopeSlotOf.length() { return -1 }
+  return fd.scopeSlotOf.get(root)
+}
+
+/// Final opcodes naming a local: where its index sits and how wide it is (1 or
+/// 2 bytes), or 0 for none; a second local of get_loc_el8 and get_arg_el8 is at
+/// second. Short forms (get_loc0 and friends) report width 0 with short true.
+struct LocalSites { first: usize, second: usize, width: usize, short: bool }
+fn localSites(code: u8) -> LocalSites {
+  let none = LocalSites { first: 0, second: 0, width: 0, short: false }
+  if code == op.OP_get_loc || code == op.OP_put_loc || code == op.OP_set_loc || code == op.OP_set_loc_uninitialized
+    || code == op.OP_get_loc_check || code == op.OP_put_loc_check || code == op.OP_set_loc_check || code == op.OP_put_loc_check_init
+    || code == op.OP_get_loc_checkthis || code == op.OP_close_loc || code == op.OP_using_dispose || code == op.OP_using_dispose_async {
+    return LocalSites { first: 1, second: 0, width: 2, short: false }
+  }
+  if code == op.OP_dec_loc || code == op.OP_inc_loc || code == op.OP_add_loc || code == op.OP_get_loc8 || code == op.OP_put_loc8
+    || code == op.OP_set_loc8 || code == op.OP_get_loc_length8 || (code >= op.OP_add_top_loc8 && code <= op.OP_mul_top_loc8)
+    || code == op.OP_step_loc8 || code == op.OP_get_loc_el_arg8 {
+    return LocalSites { first: 1, second: 0, width: 1, short: false }
+  }
+  if code == op.OP_get_loc_field8 { return LocalSites { first: 5 + u8.toUsize(op.FIELD_KEY_BYTES), second: 0, width: 1, short: false } }
+  if code == op.OP_put_loc_field_loc8 { return LocalSites { first: 5 + u8.toUsize(op.FIELD_KEY_BYTES), second: 6 + u8.toUsize(op.FIELD_KEY_BYTES), width: 1, short: false } }
+  if code == op.OP_put_loc_field_arg8 { return LocalSites { first: 5 + u8.toUsize(op.FIELD_KEY_BYTES), second: 0, width: 1, short: false } }
+  if code == op.OP_get_loc_el8 || (code >= op.OP_add_loc_loc8 && code <= op.OP_mul_loc_loc8) { return LocalSites { first: 1, second: 2, width: 1, short: false } }
+  if code == op.OP_get_arg_el8 { return LocalSites { first: 2, second: 0, width: 1, short: false } }
+  if code >= op.OP_get_loc0 && code <= op.OP_put_loc3 { return LocalSites { first: 0, second: 0, width: 0, short: true } }
+  return move none
+}
+fn localAt(fd: &FunctionDef, at: usize, width: usize) -> usize {
+  if width == 1 { return u8.toUsize(fd.bytecode.get(at)) }
+  return u16.toUsize(readU16(fd.bytecode.asSlice(), at))
+}
+fn setLocalAt(fd: &mut FunctionDef, at: usize, width: usize, value: usize) -> () {
+  if width == 1 { fd.bytecode.set(at, usize.toU8(value)) } else { fd.bytecode.patchU16(at, usize.toU16(value)) }
+}
+/// Whether fd's final code names local index (short forms included) anywhere
+/// in dead (dead[i] for local i), or, rewrite true, renumbers every local by order.
+fn walkLocals(fd: &mut FunctionDef, dead: &List<bool>, order: &List<usize>, rewrite: bool) -> bool {
+  let mut position: usize = 0
+  while position < fd.bytecode.length() {
+    let code = fd.bytecode.get(position)
+    let size = u8.toUsize(op.opcodeInfo(code, true).size)
+    let sites = localSites(code)
+    if sites.short {
+      let offset = code - op.OP_get_loc0
+      let base = op.OP_get_loc0 + (offset / 4) * 4
+      let index = u8.toUsize(offset & 3)
+      if rewrite { fd.bytecode.set(position, base + usize.toU8(order.get(index))) }
+      else if dead.get(index) { return true }
+    } else if code == op.OP_fuse_prefix && fd.bytecode.get(position + 4) >= 0x89 && fd.bytecode.get(position + 4) <= 0x8c {
+      // The prefix of `a[i] = v` (js_compiler_labels.slotStore): the array
+      // unless bit 7 says argument, the index when bit 7 says local, the
+      // value when bits 6-7 say local. Renumbering only lowers an index.
+      let first = fd.bytecode.get(position + 1) let second = fd.bytecode.get(position + 2) let third = fd.bytecode.get(position + 3)
+      if (first & 0x80) == 0 {
+        if rewrite { fd.bytecode.set(position + 1, usize.toU8(order.get(u8.toUsize(first)))) }
+        else if dead.get(u8.toUsize(first)) { return true }
+      }
+      if (second & 0x80) != 0 {
+        if rewrite { fd.bytecode.set(position + 2, 0x80 + usize.toU8(order.get(u8.toUsize(second & 0x7f)))) }
+        else if dead.get(u8.toUsize(second & 0x7f)) { return true }
+      }
+      if (third & 0xc0) == 0 {
+        if rewrite { fd.bytecode.set(position + 3, usize.toU8(order.get(u8.toUsize(third)))) }
+        else if dead.get(u8.toUsize(third)) { return true }
+      }
+    } else if code == op.OP_fuse_prefix && fd.bytecode.get(position + 4) >= 0x88 {
+      // The prefix of a loop's slot comparison (last operand byte 0x88 and
+      // up, see js_vm_operators.fusedSlotCompare) names its locals too: the left slot unless bit 6 of the
+      // mode says argument, the right one when bits 2-3 say local.
+      let mode = fd.bytecode.get(position + 1)
+      if (mode & 64) == 0 {
+        let index = u8.toUsize(fd.bytecode.get(position + 2))
+        if rewrite { fd.bytecode.set(position + 2, usize.toU8(order.get(index))) }
+        else if dead.get(index) { return true }
+      }
+      if (mode & 12) == 0 {
+        let other = u8.toUsize(fd.bytecode.get(position + 3))
+        if rewrite { fd.bytecode.set(position + 3, usize.toU8(order.get(other))) }
+        else if dead.get(other) { return true }
+      }
+    } else if code == op.OP_fuse_prefix && rewrite {
+      // The prefix of a comparison names its local operands too (bits 20 to
+      // 22 of its operand: a left argument, a right argument, a right i8).
+      let operand = readU32(fd.bytecode.asSlice(), position + 1)
+      if (operand & 0x80000000) != 0 {
+        if (operand & 0x100000) == 0 { let left = localAt(&fd.*, position + 1, 1) setLocalAt(&mut fd, position + 1, 1, order.get(left)) }
+        if (operand & 0x600000) == 0 { let right = localAt(&fd.*, position + 2, 1) setLocalAt(&mut fd, position + 2, 1, order.get(right)) }
+      }
+    } else if sites.width != 0 {
+      let index = localAt(&fd.*, position + sites.first, sites.width)
+      if rewrite { setLocalAt(&mut fd, position + sites.first, sites.width, order.get(index)) }
+      else if dead.get(index) { return true }
+      if sites.second != 0 {
+        let other = localAt(&fd.*, position + sites.second, 1)
+        if rewrite { setLocalAt(&mut fd, position + sites.second, 1, order.get(other)) }
+        else if dead.get(other) { return true }
+      }
+    }
+    position = position + size
+  }
+  return false
+}
+fn remapIndex(order: &List<usize>, index: i32) -> i32 {
+  if index < 0 { return index }
+  return usize.toI32(order.get(i32.toUsize(index)))
+}
+/// After specializeOwn: the locals whose variables moved into fd's scope have
+/// no use left in its code. Renumbers the others down so the frame neither
+/// fills nor walks them; the moved ones keep their definitions, behind the
+/// frame's, for names. Leaves fd as it was when any code still names one.
+pub effect fn dropScopedLocals(fd: &mut FunctionDef, plan: &mut ScopePlan) -> () ! OutOfMemoryError ? &mut Allocator {
+  let argCount = fd.args.length() let varCount = fd.vars.length()
+  if fd.scopeSlotOf.length() < argCount + varCount { return () }
+  let mut dead = List<bool>.make() run dead.reserve(varCount)
+  let mut live: usize = 0
+  let mut i: usize = 0
+  while i < varCount {
+    let moved = fd.scopeSlotOf.get(argCount + i) >= 0
+    run dead.append(moved)
+    if !moved { live = live + 1 }
+    i = i + 1
+  }
+  if live == varCount { return () }
+  let mut order = List<usize>.make() run order.reserve(varCount)
+  let mut nextLive: usize = 0 let mut nextDead = live
+  i = 0
+  while i < varCount {
+    if dead.get(i) { run order.append(nextDead) nextDead = nextDead + 1 } else { run order.append(nextLive) nextLive = nextLive + 1 }
+    i = i + 1
+  }
+  if walkLocals(&mut fd, &dead, &order, false) { return () }
+  let _ignored = walkLocals(&mut fd, &dead, &order, true)
+  // The definitions, in their new order.
+  let mut original = List<CompilerVar>.make() run original.reserve(varCount)
+  i = 0
+  while i < varCount { run original.append(fd.vars.get(i)) i = i + 1 }
+  let mut slots = List<i32>.make() run slots.reserve(varCount)
+  i = 0
+  while i < varCount { run slots.append(fd.scopeSlotOf.get(argCount + i)) i = i + 1 }
+  i = 0
+  while i < varCount {
+    let mut v = original.get(i)
+    v.scopeNext = remapIndex(&order, v.scopeNext)
+    fd.vars.set(order.get(i), v)
+    fd.scopeSlotOf.set(argCount + order.get(i), slots.get(i))
+    i = i + 1
+  }
+  fd.varObjectIndex = remapIndex(&order, fd.varObjectIndex)
+  fd.argumentsVarIndex = remapIndex(&order, fd.argumentsVarIndex)
+  fd.functionVarIndex = remapIndex(&order, fd.functionVarIndex)
+  fd.evalReturnIndex = remapIndex(&order, fd.evalReturnIndex)
+  fd.thisVarIndex = remapIndex(&order, fd.thisVarIndex)
+  fd.newTargetVarIndex = remapIndex(&order, fd.newTargetVarIndex)
+  fd.thisActiveFunctionVarIndex = remapIndex(&order, fd.thisActiveFunctionVarIndex)
+  fd.homeObjectVarIndex = remapIndex(&order, fd.homeObjectVarIndex)
+  // Scope slots name their variables by varDefs index (arguments first).
+  i = 0
+  while i < plan.variables.length() {
+    let root = u16.toUsize(plan.variables.get(i))
+    if root >= argCount { plan.variables.set(i, usize.toU16(argCount + order.get(root - argCount))) }
+    i = i + 1
+  }
+  // Direct children capture fd's locals by index.
+  let mut c: usize = 0
+  while c < fd.constants.length() {
+    match fd.constants.get(c) {
+      ValueBits.FunctionBytecode { reference } => {
+        let code = child(reference)
+        let n = closureCount(code)
+        let mut j: usize = 0
+        while j < n {
+          let mut v = closureAt(code, j)
+          if v.kind == ClosureKind.Local { v.variableIndex = usize.toU16(order.get(u16.toUsize(v.variableIndex))) setClosure(code, j, v) }
+          j = j + 1
+        }
+      }
+      _ => ()
+    }
+    c = c + 1
+  }
+  plan.droppedLocals = varCount - live
+}
+
+/// After finishLazy compiled a lazy stub's function in place: the captures its
+/// owners' plans moved into scopes (Scope kind in stub, the stub's closure list,
+/// whose order bytecode's list repeats) get the rewrite visit gave the stub,
+/// now through the real code and descendants. The stub had no scope, so its
+/// operands leave out the function's own scope; visit adds it.
+pub effect fn rewriteLazy(code: CellRef<FunctionBytecode>, stub: &List<ClosureVar>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let count = stub.length()
+  let mut any = false
+  let mut i: usize = 0
+  // Mark them all first: each visit compacts, and the stub's scope captures
+  // already sit after the rest.
+  while i < count {
+    let v = stub.get(i)
+    if v.kind == ClosureKind.Scope { markScoped(code, i, v.variableIndex) any = true }
+    i = i + 1
+  }
+  if !any { return () }
+  let mut depth: usize = 0
+  while depth <= SCOPE_DEPTH_MAX {
+    let mut map = List<i32>.make() let mut states = List<i32>.make()
+    run map.reserve(count) run states.reserve(count)
+    let mut used = false
+    i = 0
+    while i < count {
+      let v = stub.get(i)
+      let mut root = NONE let mut slot: i32 = NONE
+      if v.kind == ClosureKind.Scope {
+        slot = u16.toI32(v.variableIndex & SCOPE_SLOT_MASK)
+        if u16.toUsize(u16.shiftRight(v.variableIndex, SCOPE_DEPTH_SHIFT) & 7) == depth { root = usize.toI32(i) used = true }
+      }
+      run map.append(root) run states.append(slot)
+      i = i + 1
+    }
+    if used { run visit(code, &map, depth, &mut states, true) }
+    depth = depth + 1
+  }
+}

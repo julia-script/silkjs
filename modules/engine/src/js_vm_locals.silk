@@ -1,0 +1,268 @@
+//! Final local, argument and captured-cell operations, quickjs.c:18841-19085.
+import js_realm { lendRealm }
+import silk.mem.allocator { Allocator }
+import silk.mem.pointer { Pointer }
+import silk.num.u8
+import silk.num.u16
+import silk.num.usize
+import js_heap { HeapCell, HeapHeader }
+import js_core_types { FunctionBytecode, NativeErrorKind, SCOPE_OPERAND, scopeSlot }
+import js_value { ValueBits }
+import js_vm_state { Machine }
+import js_vm_activation as activation
+import js_vm_property_ops as properties
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_var_refs as cells
+import js_scopes as scopes
+import js_coercion_host { CoercionHooks }
+import js_property_host { OwnPropertyHooks }
+import js_exceptions { JsException }
+import js_opcode_data as op
+
+fn invariant() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+@inlineAlways
+unsafe fn reference(machine: &Machine, index: usize) -> *mut HeapHeader {
+  let value = unsafe machine.closureReference(index)
+  if Pointer.isNull<HeapHeader>(value) { invariant() }
+  return unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(value)
+}
+/// The value of captured operand index: a scope slot (SCOPE_OPERAND set) or a closure cell.
+@inlineAlways
+unsafe fn readCaptured(machine: &Machine, scope: ?*mut HeapHeader, index: usize) -> ValueBits {
+  if index >= u16.toUsize(SCOPE_OPERAND) {
+    return unsafe Pointer.read<ValueBits>(unsafe scopes.operandSlot(scope, usize.toU16(index)))
+  }
+  return unsafe cells.read(unsafe reference(&machine.*, index))
+}
+/// Stores an owned value into captured operand index and returns the previous owned value.
+@inlineAlways
+unsafe fn replaceCaptured(machine: &Machine, scope: ?*mut HeapHeader, index: usize, value: ValueBits) -> ValueBits {
+  if index >= u16.toUsize(SCOPE_OPERAND) {
+    let slot = unsafe scopes.operandSlot(scope, usize.toU16(index))
+    let previous = unsafe Pointer.read<ValueBits>(slot)
+    unsafe Pointer.write<ValueBits>(slot, value)
+    return previous
+  }
+  return unsafe cells.replace(unsafe reference(&machine.*, index), value)
+}
+unsafe fn name(machine: &Machine, index: usize, captured: bool) -> u32 {
+  let anchor = () let bytecode = unsafe HeapCell.payload<FunctionBytecode, ()>(&anchor, machine.bytecode)
+  if captured && index >= u16.toUsize(SCOPE_OPERAND) { return scopes.operandName(&bytecode.*, usize.toU16(index)) }
+  if captured { return bytecode.closureVars.get(index).name }
+  if bytecode.varDefs.length() == 0 { return 0 }
+  return bytecode.varDefs.get(u16.toUsize(bytecode.argumentCount) + index).name
+}
+fn uninitialized(value: ValueBits) -> bool { return match value { ValueBits.Uninitialized => true _ => false } }
+
+/// The var_ref opcode a depth-0 scope opcode stands for; any other opcode unchanged.
+fn genericScopeOpcode(opcode: u8) -> u8 {
+  if opcode == op.OP_get_scope0 { return op.OP_get_var_ref }
+  if opcode == op.OP_put_scope0 { return op.OP_put_var_ref }
+  if opcode == op.OP_set_scope0 { return op.OP_set_var_ref }
+  if opcode == op.OP_get_scope0_check { return op.OP_get_var_ref_check }
+  if opcode == op.OP_put_scope0_check { return op.OP_put_var_ref_check }
+  if opcode == op.OP_put_scope0_check_init { return op.OP_put_var_ref_check_init }
+  return opcode
+}
+// The family fallback: rare on hot paths, so its call sites are laid out cold.
+@cold
+pub unsafe effect fn step<H: HeapHooks + CoercionHooks + OwnPropertyHooks>(hooks: &mut H,
+  machine: &mut Machine, opcode: u8) -> bool ! JsException ? &mut Allocator {
+  // The depth-0 scope forms decode as their var_ref forms with a scope operand.
+  let code = genericScopeOpcode(opcode)
+  // kind: local/argument/cell. action: get/put/set. Decode only final opcodes.
+  let mut kind: u8 = 0 let mut action: u8 = 0 let mut index: usize = 0
+  let mut shortPut = false
+  if code >= op.OP_get_loc && code <= op.OP_close_loc {
+    index = u16.toUsize(unsafe machine.readU16())
+    if code != opcode { index = index + u16.toUsize(SCOPE_OPERAND) }
+    if code <= op.OP_set_var_ref {
+      let offset = code - op.OP_get_loc kind = offset / 3 action = offset % 3
+    } else if code == op.OP_close_loc {
+      unsafe cells.closeLexical(&mut hooks, machine.runtime, machine.bytecode, machine.frame, index) return true
+    } else if code == op.OP_set_loc_uninitialized {
+      let old = unsafe machine.setLocal(index, ValueBits.Uninitialized)
+      unsafe gc.releaseCompact(&mut hooks, machine.runtime, old) return true
+    } else {
+      if code >= op.OP_get_var_ref_check { kind = 2 }
+      let mut previous = ValueBits.Undefined
+      if kind == 2 { previous = unsafe readCaptured(&machine.*, machine.scope, index) }
+      else { previous = unsafe machine.local(index) }
+      let isUninitialized = uninitialized(previous)
+      if code == op.OP_put_loc_check_init {
+        if !isUninitialized {
+          return run hooks.throwError(unsafe lendRealm(&machine.context, machine.context), NativeErrorKind.Reference, b"'this' can be initialized only once")
+        }
+      } else if (code == op.OP_put_var_ref_check_init && !isUninitialized)
+        || (code != op.OP_put_var_ref_check_init && isUninitialized) {
+        let atom = unsafe name(&machine.*, index, kind == 2)
+        let mut context = machine.context
+        if code == op.OP_get_loc_checkthis { context = unsafe activation.callerContextOf(&machine) }
+        return run hooks.throwUninitialized(unsafe lendRealm(&context, context), atom)
+      }
+      if code == op.OP_get_loc_check || code == op.OP_get_loc_checkthis || code == op.OP_get_var_ref_check { action = 0 }
+      else if code == op.OP_set_loc_check { action = 2 }
+      else { action = 1 }
+    }
+  } else if opcode >= op.OP_get_loc8 && opcode <= op.OP_set_loc8 {
+    index = u8.toUsize(unsafe machine.readU8()) action = opcode - op.OP_get_loc8 shortPut = action == 1
+  // Short local, argument and closure forms, twelve per kind (the closure ones
+  // whose numbers now hold other opcodes never reach step).
+  } else if opcode >= op.OP_get_loc0 && opcode <= op.OP_get_loc0 + 35 {
+    let offset = opcode - op.OP_get_loc0
+    kind = offset / 12 action = (offset % 12) / 4 index = u8.toUsize(offset % 4) shortPut = action == 1
+  } else { return false }
+  if action == 0 {
+    let mut value = ValueBits.Undefined
+    if kind == 0 { value = unsafe machine.local(index) }
+    else if kind == 1 { value = unsafe machine.argument(index) }
+    else { value = unsafe readCaptured(&machine.*, machine.scope, index) }
+    unsafe machine.push(unsafe value.retained()) return true
+  }
+  let mut value = unsafe machine.top(1)
+  if action == 2 { value = unsafe value.retained() }
+  if shortPut { unsafe machine.discard(1) }
+  let mut old = ValueBits.Undefined
+  if kind == 0 { old = unsafe machine.setLocal(index, value) }
+  else if kind == 1 { old = unsafe machine.setArgument(index, value) }
+  else { old = unsafe replaceCaptured(&machine.*, machine.scope, index, value) }
+  unsafe gc.releaseCompact(&mut hooks, machine.runtime, old)
+  if action == 1 && !shortPut { unsafe machine.discard(1) }
+  return true
+}
+
+// Fast paths for the short local/argument forms, called inline from the
+// interpreter's dispatch match. They match step's semantics for those opcodes.
+@inlineAlways
+pub unsafe fn pushLocal(machine: &mut Machine, index: usize) -> () {
+  let cell = unsafe machine.localCell(index) unsafe machine.pushCopy(cell)
+}
+/// get_loc_check and get_loc_checkthis on an initialized slot. false consumes
+/// nothing, leaving the opcode to step (which throws).
+@inlineAlways
+pub unsafe fn pushCheckedLocal(machine: &mut Machine) -> bool {
+  let index = u16.toUsize(unsafe machine.peekU16())
+  let value = unsafe machine.local(index)
+  if uninitialized(value) { return false }
+  unsafe machine.skip(2)
+  let cell = unsafe machine.localCell(index) unsafe machine.pushCopy(cell) return true
+}
+/// put_loc_check (keep false) and set_loc_check (keep true) on an initialized slot.
+@inlineAlways
+pub unsafe fn storeCheckedLocal<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, shared: &Machine, keep: bool) -> bool {
+  let index = u16.toUsize(unsafe machine.peekU16())
+  if uninitialized(unsafe machine.local(index)) { return false }
+  unsafe machine.skip(2)
+  unsafe storeLocal(&mut hooks, &mut machine, shared, index, keep) return true
+}
+/// put_loc_check_init on a slot that is still uninitialized.
+@inlineAlways
+pub unsafe fn initializeLocal<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, shared: &Machine) -> bool {
+  let index = u16.toUsize(unsafe machine.peekU16())
+  if !uninitialized(unsafe machine.local(index)) { return false }
+  unsafe machine.skip(2)
+  unsafe storeLocal(&mut hooks, &mut machine, shared, index, false) return true
+}
+@inlineAlways
+pub unsafe fn pushArgument(machine: &mut Machine, index: usize) -> () {
+  let cell = unsafe machine.argumentCell(index) unsafe machine.pushCopy(cell)
+}
+/// Releases a value with the runtime read from shared, and only on the slow path.
+/// Arms share one out-of-line release block, so a runtime argument would be
+/// loaded in every arm before the jump; shared already sits in a register.
+@inlineAlways
+pub unsafe fn releaseIn<H: HeapHooks>(hooks: &mut H, shared: &Machine, value: ValueBits) -> () {
+  if value.tag() >= 0 { return () }
+  // A shared reference (the usual case for a pushed local or field) just
+  // drops its count here; only a last reference calls out.
+  if unsafe gc.releaseIfShared(value) { return () }
+  unsafe releaseInSlow(&mut hooks, shared, value)
+}
+@cold
+unsafe fn releaseInSlow<H: HeapHooks>(hooks: &mut H, shared: &Machine, value: ValueBits) -> () {
+  unsafe gc.releaseHeap(&mut hooks, shared.runtime, value)
+}
+/// put (keep false) moves the top operand into the slot; set (keep true) copies it.
+@inlineAlways
+pub unsafe fn storeLocal<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, shared: &Machine, index: usize, keep: bool) -> () {
+  let mut value = unsafe machine.top(1)
+  if keep { value = unsafe value.retained() } else { unsafe machine.discard(1) }
+  unsafe releaseIn(&mut hooks, shared, unsafe machine.setLocal(index, value))
+}
+@inlineAlways
+pub unsafe fn storeArgument<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, shared: &Machine, index: usize, keep: bool) -> () {
+  let mut value = unsafe machine.top(1)
+  if keep { value = unsafe value.retained() } else { unsafe machine.discard(1) }
+  unsafe releaseIn(&mut hooks, shared, unsafe machine.setArgument(index, value))
+}
+@inlineAlways
+pub unsafe fn pushCell(machine: &mut Machine, scope: ?*mut HeapHeader, index: usize, chain: bool) -> () {
+  let value = unsafe readCaptured(&machine.*, scope, index)
+  if chain { unsafe properties.pushChained(&mut machine, value) } else { unsafe machine.push(unsafe value.retained()) }
+}
+/// get_var_ref_check on an initialized cell. false consumes nothing.
+@inlineAlways
+pub unsafe fn pushCheckedCell(machine: &mut Machine, scope: ?*mut HeapHeader) -> bool {
+  let index = u16.toUsize(unsafe machine.peekU16())
+  let value = unsafe readCaptured(&machine.*, scope, index)
+  if uninitialized(value) { return false }
+  unsafe machine.skip(2)
+  unsafe machine.push(unsafe value.retained()) return true
+}
+/// put_var_ref_check on an initialized cell.
+@inlineAlways
+pub unsafe fn storeCheckedCell<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, scope: ?*mut HeapHeader) -> bool {
+  let index = u16.toUsize(unsafe machine.peekU16())
+  if uninitialized(unsafe readCaptured(&machine.*, scope, index)) { return false }
+  unsafe machine.skip(2)
+  unsafe storeCell(&mut hooks, &mut machine, scope, index, false) return true
+}
+/// The depth-0 scope forms: slot of the running scope, which the compiler
+/// guarantees exists wherever it emits them.
+@inlineAlways
+unsafe fn ownSlot(scope: ?*mut HeapHeader, slot: usize) -> *mut ValueBits {
+  return unsafe scopeSlot(unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(scope), slot)
+}
+@inlineAlways
+pub unsafe fn pushScoped(machine: &mut Machine, scope: ?*mut HeapHeader, slot: usize, chain: bool) -> () {
+  let value = unsafe Pointer.read<ValueBits>(unsafe ownSlot(scope, slot))
+  if chain { unsafe properties.pushChained(&mut machine, value) } else { unsafe machine.push(unsafe value.retained()) }
+}
+/// get_scope0_check on an initialized slot. false consumes nothing.
+@inlineAlways
+pub unsafe fn pushCheckedScoped(machine: &mut Machine, scope: ?*mut HeapHeader) -> bool {
+  let value = unsafe Pointer.read<ValueBits>(unsafe ownSlot(scope, u16.toUsize(unsafe machine.peekU16())))
+  if uninitialized(value) { return false }
+  unsafe machine.skip(2)
+  unsafe machine.push(unsafe value.retained()) return true
+}
+@inlineAlways
+pub unsafe fn storeScoped<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, scope: ?*mut HeapHeader, slot: usize, keep: bool) -> () {
+  let mut value = unsafe machine.top(1)
+  if keep { value = unsafe value.retained() } else { unsafe machine.discard(1) }
+  let at = unsafe ownSlot(scope, slot)
+  let previous = unsafe Pointer.read<ValueBits>(at)
+  unsafe Pointer.write<ValueBits>(at, value)
+  unsafe gc.releaseCompact(&mut hooks, machine.runtime, previous)
+}
+/// put_scope0_check on an initialized slot. false consumes nothing.
+@inlineAlways
+pub unsafe fn storeCheckedScoped<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, scope: ?*mut HeapHeader) -> bool {
+  let slot = u16.toUsize(unsafe machine.peekU16())
+  if uninitialized(unsafe Pointer.read<ValueBits>(unsafe ownSlot(scope, slot))) { return false }
+  unsafe machine.skip(2)
+  unsafe storeScoped(&mut hooks, &mut machine, scope, slot, false) return true
+}
+/// close_loc: detaches this lexical generation's captured cell.
+@inlineAlways
+pub unsafe fn closeLocal<H: HeapHooks>(hooks: &mut H, machine: &mut Machine) -> () {
+  let index = u16.toUsize(unsafe machine.readU16())
+  unsafe cells.closeLexical(&mut hooks, machine.runtime, machine.bytecode, machine.frame, index)
+}
+@inlineAlways
+pub unsafe fn storeCell<H: HeapHooks>(hooks: &mut H, machine: &mut Machine, scope: ?*mut HeapHeader, index: usize, keep: bool) -> () {
+  let mut value = unsafe machine.top(1)
+  if keep { value = unsafe value.retained() } else { unsafe machine.discard(1) }
+  unsafe gc.releaseCompact(&mut hooks, machine.runtime, unsafe replaceCaptured(&machine.*, scope, index, value))
+}

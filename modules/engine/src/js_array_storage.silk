@@ -1,0 +1,624 @@
+//! Native array-family storage from quickjs.c:9353-9395,9420-9514,9542-9708.
+//! No coercion, VM, builtins, or arbitrary exotic dispatch. Raw objects/context
+//! belong to one live runtime; hooks may collect but must not mutate the active
+//! object. Length operations require Array's canonical slot-zero length layout.
+//! Every public mutator roots the context and object across collector callbacks.
+//! Values are borrowed except appendFastElement's explicitly consumed argument.
+import thin_list { ThinList }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.num.f64
+import silk.num.i32
+import silk.num.i64
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+import runtime_memory { AllocationObserver }
+import js_atoms { ATOM_INTEGER_TAG, ATOM_MAX_INTEGER }
+import silk.mem.pointer { Pointer }
+import js_core_types { RuntimeState, ObjectData, ObjectPayload, ShapeData, PropertySlot, SlotBits,
+  JS_PROP_WRITABLE, JS_PROP_CONFIGURABLE, JS_PROP_C_W_E, JS_PROP_VARREF }
+import js_heap { HeapCell, HeapHeader }
+import js_value { ValueBits }
+import js_object_ref { ObjectRef }
+import js_realm { Realm, RuntimeRef }
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_shapes as shapes
+import js_object_allocate as objects
+import js_string_types { StringLengthError }
+import js_caught { FailedOom, failedOom }
+
+pub enum StorageOutcome { Accepted, ReadOnlyLength, NonConfigurable }
+pub struct ArrayLengthError {}
+
+fn invalidStorage() -> never { return Intrinsic.trap("QuickJS invariant violated") }
+fn objectReference(value: ValueBits) -> *mut HeapHeader {
+  return match value { ValueBits.Object { reference } => reference _ => invalidStorage() }
+}
+unsafe fn retainRoots<'a>(realm: Realm<'a>, object: *mut HeapHeader) -> () { let context = realm.context()
+  unsafe HeapCell.retain(context)
+  unsafe HeapCell.retain(object)
+}
+unsafe fn releaseRoots<'r, 'a, H: HeapHooks>(hooks: &mut H, rt: RuntimeRef<'r>,realm: Realm<'a>, object: *mut HeapHeader) -> () { let context = realm.context()
+  unsafe gc.releaseHeader(&mut hooks, rt.raw(), object)
+  unsafe gc.releaseHeader(&mut hooks, rt.raw(), context)
+}
+fn count<'o>(object: ObjectRef<'o>) -> usize {
+  let anchor = ()
+  let p = object.data(&anchor)
+  return match &p.payload {
+    ObjectPayload.FastArray { array } => array.values().length()
+    ObjectPayload.MappedArguments { arguments } => arguments.varRefs.length()
+    _ => invalidStorage()
+  }
+}
+fn writable<'o>(object: ObjectRef<'o>) -> bool {
+  let anchor = ()
+  let p = object.data(&anchor)
+  let sh = unsafe HeapCell.payload<ShapeData, ()>(&anchor, p.shape)
+  return (u8.toU32(sh.properties.get(0).flags) & JS_PROP_WRITABLE) != 0
+}
+fn lengthValue<'o>(object: ObjectRef<'o>) -> ValueBits {
+  let anchor = ()
+  let p = object.data(&anchor)
+  return p.slot(0).valueBits()
+}
+fn length<'o>(object: ObjectRef<'o>) -> u32 {
+  return match lengthValue(object) {
+    ValueBits.Int { value } => i32.toU32(value)
+    ValueBits.Float64 { value } => f64.toU32(value)
+    _ => invalidStorage()
+  }
+}
+fn storeLength<'o>(object: ObjectRef<'o>, value: u32) -> () {
+  let mut anchor = ()
+  let p = object.dataMut(&mut anchor)
+  p.setSlot(0, SlotBits.value(ValueBits.number(u32.toF64(value))))
+}
+
+unsafe effect fn convertStorage<'r>(rt: RuntimeRef<'r>, object: *mut HeapHeader) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = ()
+  let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, object)
+  run unsafe shapes.prepareUpdate(rt.raw(), &mut p)
+  let size = match &p.payload {
+    ObjectPayload.FastArray { array } => array.values().length()
+    ObjectPayload.MappedArguments { arguments } => arguments.varRefs.length()
+    _ => invalidStorage()
+  }
+  // Shape storage has the source's 30-bit property-count bound; reserve rejects
+  // impossible counts before any index/value is transferred. Every accepted
+  // index is consequently an allocation-free tagged integer atom.
+  let required = p.slotCount() + size
+  run unsafe shapes.reserveProperties(&mut p, required)
+  let flags = match &p.payload {
+    ObjectPayload.MappedArguments { .. } => JS_PROP_C_W_E | JS_PROP_VARREF
+    _ => JS_PROP_C_W_E
+  }
+  let mut i: usize = 0
+  while i < size {
+    let slot = match &p.payload {
+      ObjectPayload.FastArray { array } => PropertySlot.Value { value: array.values().get(i) }
+      ObjectPayload.MappedArguments { arguments } => PropertySlot.VarRef { reference: arguments.varRefs.get(i) }
+      _ => invalidStorage()
+    }
+    let _index = run unsafe shapes.appendReservedProperty(rt.raw(), &mut p,
+      usize.toU32(i) | ATOM_INTEGER_TAG, u32.toU8(flags), slot)
+    i = i + 1
+  }
+  // Native List destruction frees only backing storage: these Copy edges have
+  // moved into slots, and MUST NOT be retained or released during this cutover.
+  match &mut p.payload {
+    ObjectPayload.FastArray { array } => { drop array.take() }
+    ObjectPayload.MappedArguments { arguments } => { arguments.varRefs = ThinList<*mut HeapHeader>.make() }
+    _ => invalidStorage()
+  }
+  p.setFastArray(false)
+  p.setIsStandardArrayPrototype(false)
+}
+
+/// Requires a fast Array, Arguments, or MappedArguments. COW and a single reserve
+/// precede all edge transfers; OOM can leave a cloned shape/spare slot capacity,
+/// but never partial index metadata, moved edges, or changed fast-array flags.
+pub unsafe effect fn convertFastToSlow<'a, H: HeapHooks>(hooks: &mut H,realm: Realm<'a>, object: *mut HeapHeader) -> () ! OutOfMemoryError ? &mut Allocator {
+  let rt = realm.runtimeRef()
+  unsafe retainRoots(realm, object)
+  let result = run Effect.result(unsafe convertStorage(rt, object))
+  unsafe releaseRoots(&mut hooks, rt, realm, object)
+  match move result {
+    Result<(), OutOfMemoryError>.Success { .. } => ()
+    Result<(), OutOfMemoryError>.Failure { error } => { fail move error }
+  }
+}
+
+const MIN_FAST_CAPACITY: usize = 4
+/// Gives a fast Array with no storage yet a parked value list of the capacity
+/// expandStorage would allocate, when one is spare.
+unsafe fn adoptSpare(runtime: *mut HeapHeader, object: *mut HeapHeader, newLength: u32, exact: bool) -> () {
+  let mut capacity = u32.toUsize(newLength)
+  if !exact && capacity < MIN_FAST_CAPACITY { capacity = MIN_FAST_CAPACITY }
+  if capacity > shapes.SPARE_VALUE_CAPACITY { return () }
+  let mut anchor = ()
+  let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, object)
+  match &mut p.payload {
+    ObjectPayload.FastArray { array } => {
+      if array.values().capacity() != 0 { return () }
+      if let Option<ThinList<ValueBits>>.Some { value: spare } = unsafe shapes.takeSpareValues(runtime, capacity) {
+        let empty = array.replace(move spare) drop empty
+      }
+    }
+    _ => ()
+  }
+}
+unsafe effect fn expandStorage(object: *mut HeapHeader, newLength: u32, exact: bool) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = ()
+  let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, object)
+  match &mut p.payload {
+    ObjectPayload.FastArray { array } => {
+      let current = array.values().capacity()
+      let mut capacity = current * 3 / 2
+      if capacity < u32.toUsize(newLength) { capacity = u32.toUsize(newLength) }
+      // Small arrays start at MIN_FAST_CAPACITY so JSON arrays grow once; an exact
+      // request (an array literal of known length) gets only what it asked for.
+      if exact { capacity = u32.toUsize(newLength) }
+      else if capacity < MIN_FAST_CAPACITY { capacity = MIN_FAST_CAPACITY }
+      // No allocator slack is observable in native List capacity. Do not reproduce
+      // C's documented overflowing uint32 multiplication for enormous buffers.
+      if capacity > 0xffffffff { return run Allocator.outOfMemory() }
+      let additional = capacity - array.values().length()
+      if capacity > current { run (unsafe array.plainMut()).reserveExact(additional) }
+    }
+    _ => invalidStorage()
+  }
+}
+/// Requires FastArray value storage and newLength greater than its capacity.
+/// Capacity grows by max(newLength, floor(oldCapacity * 3 / 2), 4), with no slack.
+pub unsafe effect fn expandFastValues<'a, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>,
+  object: *mut HeapHeader, newLength: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+  run unsafe expandFastValuesWith(&mut hooks, realm, object, newLength, false)
+}
+/// expandFastValues to exactly newLength, for storage whose final length is known.
+pub unsafe effect fn expandFastValuesExact<'a, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>,
+  object: *mut HeapHeader, newLength: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+  run unsafe expandFastValuesWith(&mut hooks, realm, object, newLength, true)
+}
+unsafe effect fn expandFastValuesWith<'a, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>,
+  object: *mut HeapHeader, newLength: u32, exact: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  let rt = realm.runtimeRef()
+  unsafe adoptSpare(rt.raw(), object, newLength, exact)
+  unsafe retainRoots(realm, object)
+  let result = run Effect.result(unsafe expandStorage(object, newLength, exact))
+  unsafe releaseRoots(&mut hooks, rt, realm, object)
+  match move result {
+    Result<(), OutOfMemoryError>.Success { .. } => ()
+    Result<(), OutOfMemoryError>.Failure { error } => { fail move error }
+  }
+}
+unsafe effect fn appendStorage(object: *mut HeapHeader, incoming: ValueBits) -> StorageOutcome
+  ! OutOfMemoryError ? &mut Allocator {
+  let lent = () let held = unsafe ObjectRef.lend(&lent, object)
+  let initialized = count(held)
+  if initialized == 0xffffffff { return run Allocator.outOfMemory() }
+  let newLength = usize.toU32(initialized + 1)
+  match lengthValue(held) {
+    ValueBits.Int { value } => {
+      if newLength > i32.toU32(value) {
+        if !writable(held) { return StorageOutcome.ReadOnlyLength }
+        // Source ordering is observable: failure growing storage leaves this
+        // length extended, although no element ownership has transferred yet.
+        storeLength(held, newLength)
+      }
+    }
+    _ => ()
+  }
+  let anchor = ()
+  let before = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  let capacity = match &before.payload {
+    ObjectPayload.FastArray { array } => array.values().capacity() _ => invalidStorage()
+  }
+  drop before
+  if u32.toUsize(newLength) > capacity { run unsafe expandStorage(object, newLength, false) }
+  let mut changedAnchor = ()
+  let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut changedAnchor, object)
+  match &mut p.payload {
+    ObjectPayload.FastArray { array } => { array.noteStored(&incoming) run (unsafe array.plainMut()).append(incoming) }
+    _ => invalidStorage()
+  }
+  return StorageOutcome.Accepted
+}
+/// Requires a fast, extensible Array. Consumes incoming on success, read-only
+/// rejection, AND OOM. Read-only length permits filling existing holes below it.
+pub unsafe effect fn appendFastElement<'a, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>,
+  object: *mut HeapHeader, incoming: ValueBits) -> StorageOutcome ! OutOfMemoryError ? &mut Allocator {
+  let rt = realm.runtimeRef()
+  unsafe retainRoots(realm, object)
+  let result = run Intrinsic.catchFailure<OutOfMemoryError>(unsafe appendStorage(object, incoming), failedOom)
+  match move result {
+    StorageOutcome value => {
+      if value != StorageOutcome.Accepted { unsafe gc.release(&mut hooks, rt.raw(), incoming) }
+      unsafe releaseRoots(&mut hooks, rt, realm, object)
+      return value
+    }
+    FailedOom { error } => {
+      unsafe gc.release(&mut hooks, rt.raw(), incoming)
+      unsafe releaseRoots(&mut hooks, rt, realm, object)
+      fail move error
+    }
+  }
+}
+
+unsafe effect fn initializeValues(object: *mut HeapHeader, len: u32) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  if len == 0 { return () }
+  run unsafe expandStorage(object, len, false)
+  let mut anchor = ()
+  let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, object)
+  match &mut p.payload {
+    ObjectPayload.FastArray { array } => {
+      while array.values().length() < u32.toUsize(len) { run (unsafe array.plainMut()).append(ValueBits.Undefined) }
+    }
+    _ => invalidStorage()
+  }
+  p.setSlot(0, SlotBits.value(ValueBits.number(u32.toF64(len))))
+}
+/// Source js_allocate_fast_array: len > INT32_MAX is a typed range failure;
+/// nonpositive len produces an empty Array. Requires the real cached Array shape
+/// already installed on context; never invents intrinsics or a fallback shape.
+pub effect fn allocateFastArray<'a, H: HeapHooks>(hooks: &mut H, memory: &AllocationObserver,realm: Realm<'a>, len: i64) -> ValueBits ! OutOfMemoryError | ArrayLengthError ? &mut Allocator {
+  if len > 2147483647 { fail ArrayLengthError {} }
+  let rt = realm.runtimeRef()
+  let hold = realm.hold()
+  let allocated = run Intrinsic.catchFailure<OutOfMemoryError>(objects.array(&mut hooks, memory, realm), failedOom)
+  let value = match move allocated {
+    ValueBits value => value
+    FailedOom { error } => {
+      hold.release(&mut hooks)
+      fail move error
+    }
+  }
+  let mut count: u32 = 0
+  if len > 0 { count = i64.toU32(len) }
+  let initialized = run Effect.result(unsafe initializeValues(objectReference(value), count))
+  match move initialized {
+    Result<(), OutOfMemoryError>.Success { .. } => {
+      hold.release(&mut hooks)
+      return value
+    }
+    Result<(), OutOfMemoryError>.Failure { error } => {
+      unsafe gc.release(&mut hooks, rt.raw(), value)
+      hold.release(&mut hooks)
+      fail move error
+    }
+  }
+}
+
+// UInt32 decimal atoms contain at most ten characters, below STRING_LENGTH_MAX.
+// This discharges only the impossible length error, never an allocation failure.
+effect fn impossibleIndexLength(error: StringLengthError) -> u32 { drop error return invalidStorage() }
+effect fn indexAtom<'r>(rt: RuntimeRef<'r>, index: u32) -> u32
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut anchor = ()
+  let state = rt.stateMut(&mut anchor)
+  return run Effect.catch<StringLengthError>(state.atoms.internUInt32(index), impossibleIndexLength)
+}
+fn releaseAtom<'r>(rt: RuntimeRef<'r>, atom: u32) -> () {
+  let mut anchor = ()
+  let state = rt.stateMut(&mut anchor)
+  state.atoms.release(atom)
+}
+unsafe effect fn deleteAtom<'r, H: HeapHooks>(hooks: &mut H, rt: RuntimeRef<'r>,
+  object: *mut HeapHeader, atom: u32) -> StorageOutcome ! OutOfMemoryError ? &mut Allocator {
+  let lent = () let held = unsafe ObjectRef.lend(&lent, object)
+  let mut anchor = ()
+  let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, object)
+  match unsafe shapes.lookup(p.shape, atom) {
+    Option<usize>.Some { value: index } => {
+      let shapeAnchor = ()
+      let shape = unsafe HeapCell.payload<ShapeData, ()>(&shapeAnchor, p.shape)
+      let configurable = (u8.toU32(shape.properties.get(index).flags) & JS_PROP_CONFIGURABLE) != 0
+      drop shape
+      if !configurable { return StorageOutcome.NonConfigurable }
+      let retired = run unsafe shapes.deleteProperty(rt.raw(), &mut p, atom)
+      drop p
+      match move retired {
+        Option<shapes.RetiredProperty>.Some { value } => { unsafe gc.releaseProperty(&mut hooks, rt.raw(), value.slot) }
+        Option<shapes.RetiredProperty>.None => invalidStorage()
+      }
+      return StorageOutcome.Accepted
+    }
+    Option<usize>.None => ()
+  }
+  let fast = p.fastArray()
+  drop p
+  if fast {
+    let runtimeAnchor = ()
+    let state = unsafe HeapCell.payload<RuntimeState, ()>(&runtimeAnchor, rt.raw())
+    let index = state.atoms.arrayIndex(atom)
+    drop state
+    match move index {
+      Option<u32>.Some { value } => {
+        let size = count(held)
+        if u32.toUsize(value) < size {
+          if u32.toUsize(value) == size - 1 {
+            let mut lastAnchor = ()
+            let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut lastAnchor, object)
+            let mut retired = PropertySlot.Value { value: ValueBits.Undefined }
+            match &mut p.payload {
+              ObjectPayload.FastArray { array } => {
+                retired = PropertySlot.Value { value: array.values().get(size - 1) }
+                array.truncate(size - 1)
+              }
+              ObjectPayload.MappedArguments { arguments } => {
+                retired = PropertySlot.VarRef { reference: arguments.varRefs.get(size - 1) }
+                arguments.varRefs.truncate(size - 1)
+              }
+              _ => invalidStorage()
+            }
+            drop p
+            unsafe gc.releaseProperty(&mut hooks, rt.raw(), retired)
+            return StorageOutcome.Accepted
+          }
+          run unsafe convertStorage(rt, object)
+          return run unsafe deleteAtom(&mut hooks, rt, object, atom)
+        }
+      }
+      Option<u32>.None => ()
+    }
+  }
+  return StorageOutcome.Accepted
+}
+unsafe effect fn deleteIndex<'r, H: HeapHooks>(hooks: &mut H, rt: RuntimeRef<'r>,
+  object: *mut HeapHeader, index: u32) -> StorageOutcome ! OutOfMemoryError ? &mut Allocator {
+  // An index up to ATOM_MAX_INTEGER is its own constant atom: nothing to intern or release.
+  if index <= ATOM_MAX_INTEGER { return run unsafe deleteAtom(&mut hooks, rt, object, index | ATOM_INTEGER_TAG) }
+  let atom = run indexAtom(rt, index)
+  let result = run Intrinsic.catchFailure<OutOfMemoryError>(unsafe deleteAtom(&mut hooks, rt, object, atom), failedOom)
+  releaseAtom(rt, atom)
+  return match move result {
+    StorageOutcome value => value
+    FailedOom { error } => { fail move error }
+  }
+}
+/// Own index deletion ONLY for Array/Arguments/MappedArguments, index <= UINT32_MAX-1.
+/// Includes the fast last-element shortcut and interior-element slow conversion.
+/// Array length is unchanged. No arbitrary exotic callback is dispatched.
+pub unsafe effect fn deleteOwnIndex<'a, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>,
+  object: *mut HeapHeader, index: u32) -> StorageOutcome ! OutOfMemoryError ? &mut Allocator {
+  let rt = realm.runtimeRef()
+  unsafe retainRoots(realm, object)
+  let result = run Intrinsic.catchFailure<OutOfMemoryError>(unsafe deleteIndex(&mut hooks, rt, object, index), failedOom)
+  unsafe releaseRoots(&mut hooks, rt, realm, object)
+  return match move result {
+    StorageOutcome value => value
+    FailedOom { error } => { fail move error }
+  }
+}
+unsafe fn propertyCount(object: *mut HeapHeader) -> usize {
+  let anchor = ()
+  let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, p.shape)
+  return shape.properties.length()
+}
+unsafe effect fn setLengthStorage<'r, H: HeapHooks>(hooks: &mut H, rt: RuntimeRef<'r>,
+  object: *mut HeapHeader, requested: u32) -> StorageOutcome ! OutOfMemoryError ? &mut Allocator {
+  let lent = () let held = unsafe ObjectRef.lend(&lent, object)
+  // Caller MUST have completed coercion before this check, including equal lengths.
+  if !writable(held) { return StorageOutcome.ReadOnlyLength }
+  let anchor = ()
+  let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  let fast = p.fastArray()
+  drop p
+  if fast {
+    let oldCount = count(held)
+    let mut i = u32.toUsize(requested)
+    while i < oldCount {
+      let mut elementAnchor = ()
+      let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut elementAnchor, object)
+      let mut retired = ValueBits.Undefined
+      match &mut p.payload {
+        ObjectPayload.FastArray { array } => {
+          retired = array.values().get(i)
+          // Clear the owned edge before hooks can collect, retaining source's
+          // ascending release order and final count/length publication order.
+          array.clear(i)
+        }
+        _ => invalidStorage()
+      }
+      drop p
+      unsafe gc.release(&mut hooks, rt.raw(), retired)
+      i = i + 1
+    }
+    let mut changedAnchor = ()
+    let changed = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut changedAnchor, object)
+    match &mut changed.payload {
+      ObjectPayload.FastArray { array } => { array.truncate(u32.toUsize(requested)) }
+      _ => invalidStorage()
+    }
+    drop changed
+    storeLength(held, requested)
+    return StorageOutcome.Accepted
+  }
+  let mut current = length(held)
+  if requested < current {
+    if u32.toUsize(current - requested) <= unsafe propertyCount(object) {
+      while current > requested {
+        let deleted = run unsafe deleteIndex(&mut hooks, rt, object, current - 1)
+        if deleted == StorageOutcome.NonConfigurable { break }
+        current = current - 1
+      }
+    } else {
+      current = requested
+      let mut i: usize = 0
+      while i < unsafe propertyCount(object) {
+        let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+        let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, p.shape)
+        let property = shape.properties.get(i)
+        if property.atom != 0 {
+          let state = rt.state(&anchor)
+          match state.atoms.arrayIndex(property.atom) {
+            Option<u32>.Some { value: index } => {
+              if index >= current && (u8.toU32(property.flags) & JS_PROP_CONFIGURABLE) == 0 { current = index + 1 }
+            }
+            Option<u32>.None => ()
+          }
+        }
+        i = i + 1
+      }
+      i = 0
+      while i < unsafe propertyCount(object) {
+        let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+        let shape = unsafe HeapCell.payload<ShapeData, ()>(&anchor, p.shape)
+        let atom = shape.properties.get(i).atom
+        let state = rt.state(&anchor)
+        let mut remove = false
+        if atom != 0 {
+          match state.atoms.arrayIndex(atom) {
+            Option<u32>.Some { value: index } => { remove = index >= current }
+            Option<u32>.None => ()
+          }
+        }
+        drop state
+        drop shape
+        drop p
+        if remove { let _deleted = run unsafe deleteAtom(&mut hooks, rt, object, atom) }
+        // Deliberately retain source's scan index even when deletion compacts the
+        // shape. Re-read shape/count on the next iteration, never a stale pointer.
+        i = i + 1
+      }
+    }
+  } else { current = requested }
+  storeLength(held, current)
+  if current > requested { return StorageOutcome.NonConfigurable }
+  return StorageOutcome.Accepted
+}
+/// `array.length = requested` on a sparse Array with a writable length that
+/// only drops its last, absent index (a countdown over holes): the length
+/// alone moves. false leaves every other case to setArrayLength.
+pub unsafe fn dropAbsentLast(object: *mut HeapHeader, requested: u32) -> bool {
+  if requested > ATOM_MAX_INTEGER { return false }
+  let mut anchor = ()
+  let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, object)
+  if p.fastArray() { return false }
+  let current = match p.slot(0).valueBits() { ValueBits.Int { value } => value _ => { return false } }
+  if current <= 0 || i32.toU32(current) - 1 != requested { return false }
+  match unsafe shapes.lookup(p.shape, requested | ATOM_INTEGER_TAG) {
+    Option<usize>.Some { .. } => { return false }
+    Option<usize>.None => ()
+  }
+  p.setSlot(0, SlotBits.value(ValueBits.Int { value: u32.toI32(requested) }))
+  return true
+}
+/// Already-coerced u32 kernel. Rejections are precise storage outcomes for the
+/// caller's flags/strictness mapping. Slow deletion OOM propagates immediately:
+/// unlike source's unchecked -1, it cannot silently report success and lower
+/// length across an undeleted index. Earlier completed deletions remain committed.
+/// Shrinks a fast array with a writable length when every dropped element is a
+/// plain value (no release can run anything): setLengthStorage's result with no
+/// root bookkeeping. False declines to setArrayLength.
+pub unsafe fn truncatePlain(object: *mut HeapHeader, requested: u32) -> bool {
+  let lent = () let held = unsafe ObjectRef.lend(&lent, object)
+  if !writable(held) { return false }
+  let mut anchor = ()
+  let p = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, object)
+  // A converted (sparse) Array keeps its FastArray payload, emptied, while its
+  // elements live in the shape: only setArrayLength may truncate that one.
+  if !p.fastArray() { return false }
+  match &mut p.payload {
+    ObjectPayload.FastArray { array } => {
+      let count = array.values().length()
+      let keep = u32.toUsize(requested)
+      if keep > count { return false }
+      let mut i = keep
+      while i < count {
+        let element = array.values().get(i)
+        match ValueBits.heapReference(&element) { Option<*mut HeapHeader>.Some { .. } => { return false } Option<*mut HeapHeader>.None => () }
+        i = i + 1
+      }
+      array.truncate(keep)
+    }
+    _ => { return false }
+  }
+  p.setSlot(0, SlotBits.value(ValueBits.number(u32.toF64(requested))))
+  return true
+}
+pub unsafe effect fn setArrayLength<'a, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>,
+  object: *mut HeapHeader, requested: u32) -> StorageOutcome ! OutOfMemoryError ? &mut Allocator {
+  let rt = realm.runtimeRef()
+  unsafe retainRoots(realm, object)
+  let result = run Intrinsic.catchFailure<OutOfMemoryError>(unsafe setLengthStorage(&mut hooks, rt, object, requested), failedOom)
+  unsafe releaseRoots(&mut hooks, rt, realm, object)
+  return match move result {
+    StorageOutcome value => value
+    FailedOom { error } => { fail move error }
+  }
+}
+
+/// Largest slow Array densify turns back into a fast one.
+const DENSIFY_MAX: usize = 16777216
+/// Turns a slow Array back into a fast one once its own properties are exactly
+/// length and the plain indices 0..length-1, as a fill from the top down leaves
+/// it (crypto's `while (--i >= 0) a[i] = 0` on a fresh array). Its shape becomes
+/// the context's array shape again, so reads and writes take the dense paths.
+/// Leaves the object untouched when it does not qualify, or on OOM.
+pub unsafe effect fn densify<'a, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>, object: *mut HeapHeader) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let rt = realm.runtimeRef()
+  let anchor = ()
+  let ctx = realm.state(&anchor)
+  let cached = ctx.arrayShape
+  drop ctx
+  let arrayShape = match Pointer.nonNullMut<HeapHeader>(cached) { Option<*mut HeapHeader>.Some { value } => value Option<*mut HeapHeader>.None => { return () } }
+  let p = unsafe HeapCell.payload<ObjectData, ()>(&anchor, object)
+  if p.fastArray() || !p.extensible() { return () }
+  let shape = p.shape
+  let len = match p.slot(0).valueBits() {
+    ValueBits.Int { value } => i32.toUsize(value)
+    _ => { return () }
+  }
+  drop p
+  if len == 0 || len > DENSIFY_MAX { return () }
+  let sh = unsafe HeapCell.payload<ShapeData, ()>(&anchor, shape)
+  let target = unsafe HeapCell.payload<ShapeData, ()>(&anchor, arrayShape)
+  if sh.deletedPropertyCount != 0 || sh.properties.length() != len + 1 { return () }
+  if Pointer.address<HeapHeader>(sh.prototype) != Pointer.address<HeapHeader>(target.prototype) { return () }
+  if sh.properties.get(0).flags != target.properties.get(0).flags || sh.properties.get(0).atom != target.properties.get(0).atom { return () }
+  // Distinct atoms, len of them, each an integer below len: exactly 0..len-1.
+  let mut i: usize = 1
+  while i <= len {
+    let record = sh.properties.get(i)
+    if u8.toU32(record.flags) != JS_PROP_C_W_E || (record.atom & ATOM_INTEGER_TAG) == 0 { return () }
+    if u32.toUsize(record.atom & ~ATOM_INTEGER_TAG) >= len { return () }
+    i = i + 1
+  }
+  drop target
+  let mut values = run ThinList<ValueBits>.makeWithCapacity(len)
+  values.pushRepeated(ValueBits.Undefined, len)
+  let mut changed = ()
+  let q = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut changed, object)
+  i = 1
+  while i <= len {
+    let at = u32.toUsize(sh.properties.get(i).atom & ~ATOM_INTEGER_TAG)
+    // Plain value slots: the edges move into the dense list unchanged.
+    values.set(at, q.slot(i).valueBits())
+    i = i + 1
+  }
+  drop sh
+  q.truncateSlots(1)
+  match &mut q.payload {
+    ObjectPayload.FastArray { array } => {
+      let old = array.replace(move values)
+      drop old
+    }
+    _ => invalidStorage()
+  }
+  unsafe HeapCell.retain(arrayShape)
+  q.shape = arrayShape
+  unsafe shapes.noteShapeChange(rt.raw(), &q)
+  q.setFastArray(true)
+  drop q
+  unsafe gc.releaseHeader(&mut hooks, rt.raw(), shape)
+}

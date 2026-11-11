@@ -1,0 +1,581 @@
+//! Native quickjs.c:15153-15620,15982-16018 consuming binary operations.
+//! Both input slots own values. Success leaves only the left result active;
+//! failure clears both slots. Source's inactive right stack garbage is not an owner.
+import js_realm { Realm }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.option { Option }
+import silk.collections.slice { Slice }
+import silk.mem.pointer { Pointer }
+import silk.num.f64
+import silk.num.i32
+import silk.num.i64
+import silk.num.u32
+import silk.num.u64
+import js_heap { HeapCell, HeapHeader }
+import js_value { ValueBits, fitsShortBigInt }
+import js_owned_value { Value }
+import js_bigint { BigInt, BigIntView, BigIntError, Bitwise, ShortLimbs, Int128 }
+import js_bigint_coercions as bigint
+import js_bigint as BigIntOps
+import js_gc { HeapHooks }
+import js_gc as gc
+import js_runtime as runtime
+import js_core_types { NativeErrorKind }
+import js_exceptions { JsException }
+import js_string_types { StringLengthError }
+import js_strings { Strings }
+import js_coercion_host { CoercionHooks }
+import js_coercions as coercion
+import js_integer_coercions as integer
+import js_number_power as power
+import js_invariant { invariant }
+/// Failures caught without wrapping the success in a Result (see js_caught).
+struct FailedOomBigInt { error: OutOfMemoryError | BigIntError }
+effect fn failedOomBigInt(error: OutOfMemoryError | BigIntError) -> FailedOomBigInt { return FailedOomBigInt { error: move error } }
+struct FailedOomLengthJsBigInt { error: OutOfMemoryError | StringLengthError | JsException | BigIntError }
+effect fn failedOomLengthJsBigInt(error: OutOfMemoryError | StringLengthError | JsException | BigIntError) -> FailedOomLengthJsBigInt { return FailedOomLengthJsBigInt { error: move error } }
+
+/// A failure caught without wrapping the success in a Result (see js_caught).
+struct TextFailed { error: OutOfMemoryError | StringLengthError | JsException }
+effect fn textFailed(error: OutOfMemoryError | StringLengthError | JsException) -> TextFailed { return TextFailed { error: move error } }
+
+
+pub enum Arithmetic { Subtract, Multiply, Divide, Remainder, Power }
+pub enum Logic { And, Or, Xor, ShiftLeft, ShiftRight }
+enum Operation { Add, Subtract, Multiply, Divide, Remainder, Power, And, Or, Xor, ShiftLeft, ShiftRight, UnsignedShiftRight }
+enum Conversion { Numeric, Primitive, String }
+fn bits(value: i32) -> u32 {
+  if value < 0 { return i32.toU32(-(value + 1)) ^ 0xffffffff }
+  return i32.toU32(value)
+}
+// The high limb pair of a 128-bit sign extension of value.
+fn extension(value: i64) -> u64 { if value < 0 { return 0xffffffffffffffff } return 0 }
+// A BigInt that fits 128 bits as two's complement words; false when it is wider.
+@inlineAlways
+unsafe fn wide128(value: ValueBits, out: &mut Int128) -> bool {
+  match value {
+    ValueBits.ShortBigInt { value: x } => { out.* = Int128 { low: i64.wrappingToU64(x), high: extension(x) } return true }
+    ValueBits.BigInt { reference } => {
+      let anchor = () let big = unsafe HeapCell.shortPayload<BigInt, ()>(&anchor, reference)
+      return big.small128(&mut out)
+    }
+    _ => { return false }
+  }
+}
+// A BigInt that fits 64 bits as two's complement; false when it is wider.
+@inlineAlways
+unsafe fn wide64(value: ValueBits, out: &mut i64) -> bool {
+  let mut wide = Int128 { low: 0, high: 0 }
+  if !unsafe wide128(value, &mut wide) { return false }
+  let low = u64.wrappingToI64(wide.low)
+  if wide.high != extension(low) { return false }
+  out.* = low
+  return true
+}
+// x * y in 128-bit two's complement (always exact).
+@inlineAlways
+fn product128(x: i64, y: i64) -> Int128 {
+  return Int128 { low: i64.wrappingToU64(i64.wrappingMultiply(x, y)), high: i64.wrappingToU64(i64.multiplyHigh(x, y)) }
+}
+// -value in 128-bit two's complement (wraps only for -2^127).
+@inlineAlways
+fn negate128(value: Int128) -> Int128 {
+  let low = u64.wrappingAdd(value.low ^ 0xffffffffffffffff, 1)
+  let mut high = value.high ^ 0xffffffffffffffff
+  if low == 0 { high = u64.wrappingAdd(high, 1) }
+  return Int128 { low: low, high: high }
+}
+// Whether value is in the ShortBigInt range (so it must not live in a heap cell).
+@inlineAlways
+fn short128(value: Int128) -> bool {
+  let low = u64.wrappingToI64(value.low)
+  return value.high == extension(low) && fitsShortBigInt(low)
+}
+// left + right, left - right or left * right on machine words when the
+// operands and the result fit 128 bits (products: operands of 64 bits); false
+// leaves out unspecified and the limb kernels take over.
+@inlineAlways
+unsafe fn wordArithmetic(left: ValueBits, right: ValueBits, subtract: bool, multiply: bool, out: &mut Int128) -> bool {
+  if multiply {
+    let mut x: i64 = 0 let mut y: i64 = 0
+    if !unsafe wide64(left, &mut x) || !unsafe wide64(right, &mut y) { return false }
+    out.* = product128(x, y)
+    return true
+  }
+  let mut a = Int128 { low: 0, high: 0 } let mut b = Int128 { low: 0, high: 0 }
+  if !unsafe wide128(left, &mut a) || !unsafe wide128(right, &mut b) { return false }
+  return sum128(a, b, subtract, &mut out)
+}
+// a + b (or a - b) in 128-bit two's complement; false when the result needs more bits.
+@inlineAlways
+fn sum128(a: Int128, b: Int128, subtract: bool, out: &mut Int128) -> bool {
+  let mut low: u64 = 0 let mut high: u64 = 0
+  if subtract {
+    low = u64.wrappingSubtract(a.low, b.low)
+    let mut borrow: u64 = 0 if a.low < b.low { borrow = 1 }
+    high = u64.wrappingSubtract(u64.wrappingSubtract(a.high, b.high), borrow)
+  } else {
+    low = u64.wrappingAdd(a.low, b.low)
+    let mut carry: u64 = 0 if low < a.low { carry = 1 }
+    high = u64.wrappingAdd(u64.wrappingAdd(a.high, b.high), carry)
+  }
+  let sign: u64 = 0x8000000000000000
+  let signA = a.high & sign let signB = b.high & sign let signResult = high & sign
+  // Overflow: same-sign addends (opposite-sign for subtraction) whose result flips sign.
+  let operandsAgree = (signA == signB) != subtract
+  if operandsAgree && signResult != signA { return false }
+  out.* = Int128 { low: low, high: high }
+  return true
+}
+fn signed(value: u32) -> i32 {
+  if value > 0x7fffffff { return -1 - u32.toI32(value ^ 0xffffffff) }
+  return u32.toI32(value)
+}
+fn shortLimbs(value: ValueBits) -> ShortLimbs {
+  match value { ValueBits.ShortBigInt { value: number } => { return ShortLimbs.of(number) } _ => { return ShortLimbs.of(0) } }
+}
+unsafe effect fn view<'a>(anchor: &'a (), storage: &'a ShortLimbs, value: ValueBits) -> BigIntView<'a> ! BigIntError {
+  match value {
+    ValueBits.ShortBigInt { .. } => { return run BigIntView.fromLimbs(storage.limbs()) }
+    ValueBits.BigInt { reference } => {
+      let payload = unsafe HeapCell.shortPayload<BigInt, ()>(anchor, reference)
+      return payload.view()
+    }
+    _ => invariant()
+  }
+}
+/// a + b, a - b or a * b for two borrowed BigInts of at most SMALL_LIMBS limbs
+/// each (no conversion, no callback); Undefined declines.
+pub unsafe effect fn smallBigArithmetic(left: ValueBits, right: ValueBits, subtract: bool, multiply: bool) -> ValueBits
+  ! OutOfMemoryError ? &mut Allocator {
+  if !left.isBigInt() || !right.isBigInt() { return ValueBits.Undefined }
+  let mut wide = Int128 { low: 0, high: 0 }
+  if unsafe wordArithmetic(left, right, subtract, multiply, &mut wide) { return run bigint.compact128(wide) }
+  return run unsafe limbArithmetic(left, right, subtract, multiply)
+}
+// smallBigArithmetic past the machine-word results: the limb kernels in stack scratch.
+@inlineNever
+unsafe effect fn limbArithmetic(left: ValueBits, right: ValueBits, subtract: bool, multiply: bool) -> ValueBits
+  ! OutOfMemoryError ? &mut Allocator {
+  let anchor = ()
+  let leftStorage = shortLimbs(left)
+  let rightStorage = shortLimbs(right)
+  let a = unsafe smallLimbs(&anchor, &leftStorage, left)
+  let b = unsafe smallLimbs(&anchor, &rightStorage, right)
+  if a.length > BigIntOps.SMALL_LIMBS || b.length > BigIntOps.SMALL_LIMBS { return ValueBits.Undefined }
+  return run smallScratch(a, b, subtract, multiply)
+}
+/// smallBigArithmetic into left's own cell, for a heap BigInt that exactly
+/// holders references hold, all of which the caller replaces with the result
+/// (x += y on a local holds it once; x = x + y holds it in the local and on
+/// the stack): no allocation and no free. Returns left, or Undefined to
+/// decline (shared, spilled, or a short result).
+pub unsafe fn smallBigInPlace(left: ValueBits, right: ValueBits, subtract: bool, multiply: bool, holders: i32) -> ValueBits {
+  let reference = match left { ValueBits.BigInt { reference } => reference _ => { return ValueBits.Undefined } }
+  if !right.isBigInt() { return ValueBits.Undefined }
+  let anchor = ()
+  let header = unsafe Pointer.borrow<(), HeapHeader>(&anchor, reference)
+  let unique = header.referenceCount == holders
+  drop header
+  if !unique { return ValueBits.Undefined }
+  // Operands and a result of machine words: no limb loop and no scratch.
+  let mut wide = Int128 { low: 0, high: 0 }
+  if unsafe wordArithmetic(left, right, subtract, multiply, &mut wide) {
+    if short128(wide) { return ValueBits.Undefined }
+    let mut token = ()
+    let target = unsafe HeapCell.shortPayloadMut<BigInt, ()>(&mut token, reference)
+    if target.store128(wide) { return left }
+    return ValueBits.Undefined
+  }
+  return unsafe limbsInPlace(reference, left, right, subtract, multiply)
+}
+// smallBigInPlace past the machine-word results, for a uniquely held left.
+@inlineNever
+unsafe fn limbsInPlace(reference: *mut HeapHeader, left: ValueBits, right: ValueBits, subtract: bool, multiply: bool) -> ValueBits {
+  let anchor = ()
+  // x += y with a short y: the carry rarely runs past y's limbs.
+  if !multiply {
+    if let ValueBits.ShortBigInt { value } = right {
+      if !subtract || value != -9223372036854775807 - 1 {
+        let mut y = value
+        if subtract { y = i64.wrappingNegate(value) }
+        let mut token = ()
+        let target = unsafe HeapCell.shortPayloadMut<BigInt, ()>(&mut token, reference)
+        if target.addShortInPlace(y) { return left }
+      }
+    }
+  }
+  let rightStorage = shortLimbs(right)
+  let leftStorage = shortLimbs(left)
+  let a = unsafe smallLimbs(&anchor, &leftStorage, left)
+  let b = unsafe smallLimbs(&anchor, &rightStorage, right)
+  if a.length > BigIntOps.SMALL_LIMBS || b.length > BigIntOps.SMALL_LIMBS { return ValueBits.Undefined }
+  let mut scratch: [u32; 33] = [0; 33]
+  let mut n: usize = 0
+  if multiply { n = BigIntOps.productScratch(&mut scratch, a, b) } else { n = BigIntOps.sumScratch(&mut scratch, a, b, subtract) }
+  let words = Slice.view<u32>(&scratch, 0, BigIntOps.scratchLength(Slice.view<u32>(&scratch, 0, n)))
+  if words.length <= 2 { return ValueBits.Undefined }
+  let mut token = ()
+  let target = unsafe HeapCell.shortPayloadMut<BigInt, ()>(&mut token, reference)
+  if !target.overwriteInline(words) { return ValueBits.Undefined }
+  return left
+}
+/// sum + a * b (or sum - a * b) into sum's own cell, for a heap BigInt that
+/// exactly holders references hold, all of which the caller replaces with the
+/// result: the product stays in stack scratch. Returns sum, or Undefined to
+/// decline (shared, spilled, too long, or a short result).
+pub unsafe fn multiplyAccumulateInPlace(sum: ValueBits, left: ValueBits, right: ValueBits, subtract: bool, holders: i32) -> ValueBits {
+  let reference = match sum { ValueBits.BigInt { reference } => reference _ => { return ValueBits.Undefined } }
+  if !left.isBigInt() || !right.isBigInt() { return ValueBits.Undefined }
+  let anchor = ()
+  let header = unsafe Pointer.borrow<(), HeapHeader>(&anchor, reference)
+  let unique = header.referenceCount == holders
+  drop header
+  if !unique { return ValueBits.Undefined }
+  // Factors of one machine word each and a 128-bit sum: no limb loop and no scratch.
+  let mut x: i64 = 0 let mut y: i64 = 0
+  if unsafe wide64(left, &mut x) && unsafe wide64(right, &mut y) {
+    let mut total = Int128 { low: 0, high: 0 }
+    let mut product = product128(x, y)
+    // |x * y| <= 2^126, so the negation is exact.
+    if subtract { product = negate128(product) }
+    let mut token = ()
+    let target = unsafe HeapCell.shortPayloadMut<BigInt, ()>(&mut token, reference)
+    let mut held = Int128 { low: 0, high: 0 }
+    if target.small128(&mut held) && sum128(held, product, false, &mut total) {
+      if short128(total) { return ValueBits.Undefined }
+      if target.store128(total) { return sum }
+      return ValueBits.Undefined
+    }
+  }
+  return unsafe limbsAccumulateInPlace(reference, sum, left, right, subtract)
+}
+// multiplyAccumulateInPlace past the machine-word results, for a uniquely held sum.
+@inlineNever
+unsafe fn limbsAccumulateInPlace(reference: *mut HeapHeader, sum: ValueBits, left: ValueBits, right: ValueBits, subtract: bool) -> ValueBits {
+  let anchor = ()
+  let leftStorage = shortLimbs(left)
+  let rightStorage = shortLimbs(right)
+  let a = unsafe smallLimbs(&anchor, &leftStorage, left)
+  let b = unsafe smallLimbs(&anchor, &rightStorage, right)
+  if a.length > BigIntOps.SMALL_LIMBS || b.length > BigIntOps.SMALL_LIMBS { return ValueBits.Undefined }
+  let mut token = ()
+  let target = unsafe HeapCell.shortPayloadMut<BigInt, ()>(&mut token, reference)
+  if !target.multiplyAccumulateInPlace(a, b, subtract) { return ValueBits.Undefined }
+  return sum
+}
+/// a + b, a - b or a * b of at most SMALL_LIMBS limbs each, normalized straight
+/// from stack scratch into a ShortBigInt or one heap cell.
+effect fn smallScratch(a: &[u32], b: &[u32], subtract: bool, multiply: bool) -> ValueBits ! OutOfMemoryError ? &mut Allocator {
+  let mut scratch: [u32; 33] = [0; 33]
+  let mut n: usize = 0
+  if multiply { n = BigIntOps.productScratch(&mut scratch, a, b) } else { n = BigIntOps.sumScratch(&mut scratch, a, b, subtract) }
+  return run bigint.compactScratch(Slice.view<u32>(&scratch, 0, n))
+}
+// Limbs of a short or heap BigInt, borrowed for the anchor's scope.
+unsafe fn smallLimbs<'a>(anchor: &'a (), storage: &'a ShortLimbs, value: ValueBits) -> &'a [u32] {
+  match value {
+    ValueBits.BigInt { reference } => {
+      let payload = unsafe HeapCell.shortPayload<BigInt, ()>(anchor, reference)
+      return payload.limbs()
+    }
+    _ => { return storage.limbs() }
+  }
+}
+unsafe fn releaseSlot<H: HeapHooks>(hooks: &mut H, rt: *mut HeapHeader, slot: &mut ValueBits) -> () {
+  unsafe gc.release(&mut hooks, rt, Intrinsic.replace(slot.*, ValueBits.Undefined))
+}
+effect fn diagnostic<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, error: BigIntError) -> ValueBits ! JsException ? &mut Allocator {
+  match error {
+    BigIntError.TooLarge => { return run hooks.throwError(realm, NativeErrorKind.Range, b"BigInt is too large to allocate") }
+    BigIntError.DivisionByZero => { return run hooks.throwError(realm, NativeErrorKind.Range, b"BigInt division by zero") }
+    BigIntError.NegativeExponent => { return run hooks.throwError(realm, NativeErrorKind.Range, b"BigInt negative exponent") }
+    BigIntError.PowerTooLarge => { return run hooks.throwError(realm, NativeErrorKind.Range, b"BigInt is too large") }
+    _ => invariant()
+  }
+}
+// Replace before invoking a consuming conversion: an exception must never leave
+// the old owner in the cleanup slots. The other operand stays alive throughout.
+effect fn convert<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, slot: &mut ValueBits, conversion: Conversion) -> ()
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let input = Intrinsic.replace(slot.*, ValueBits.Undefined)
+  match conversion {
+    Conversion.Numeric => { slot.* = run coercion.toNumericFree(&mut hooks, realm, unsafe Value.adoptBits(input)) }
+    Conversion.Primitive => { slot.* = run coercion.toPrimitiveFree(&mut hooks, realm, unsafe Value.adoptBits(input), coercion.JS_HINT_NONE) }
+    Conversion.String => {
+      let result = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError | JsException | BigIntError>(coercion.toStringFree(&mut hooks, realm, unsafe Value.adoptBits(input)), failedOomLengthJsBigInt)
+      match move result {
+        Value value => { slot.* = value.intoBits() }
+        FailedOomLengthJsBigInt { error } => match move error {
+          BigIntError big => { slot.* = run diagnostic(&mut hooks, realm, big) }
+          OutOfMemoryError allocation => { fail move allocation }
+          StringLengthError length => { fail move length }
+          JsException exception => { fail move exception }
+        }
+      }
+    }
+  }
+  if slot.*.isException() { slot.* = ValueBits.Undefined fail JsException {} }
+}
+fn floating(left: f64, right: f64, operation: Operation) -> f64 {
+  return match operation {
+    Operation.Add => left + right
+    Operation.Subtract => left - right
+    Operation.Multiply => left * right
+    Operation.Divide => left / right
+    Operation.Remainder => f64.remainder(left, right)
+    Operation.Power => power.power(left, right)
+    _ => invariant()
+  }
+}
+fn isLogic(operation: Operation) -> bool {
+  return operation == Operation.And || operation == Operation.Or || operation == Operation.Xor || operation == Operation.ShiftLeft || operation == Operation.ShiftRight || operation == Operation.UnsignedShiftRight
+}
+effect fn kernel<'a, 'b>(left: &BigIntView<'a>, right: &BigIntView<'b>, operation: Operation) -> BigInt
+  ! OutOfMemoryError | BigIntError ? &mut Allocator {
+  return match operation {
+    Operation.Add => run left.add(right)
+    Operation.Subtract => run left.subtract(right)
+    Operation.Multiply => run left.multiply(right)
+    Operation.Divide => run left.divide(right)
+    Operation.Remainder => run left.remainder(right)
+    Operation.Power => run left.power(right)
+    Operation.And => run left.bitwise(right, Bitwise.And)
+    Operation.Or => run left.bitwise(right, Bitwise.Or)
+    Operation.Xor => run left.bitwise(right, Bitwise.Xor)
+    Operation.ShiftLeft => run left.shift(right, true)
+    Operation.ShiftRight => run left.shift(right, false)
+    Operation.UnsignedShiftRight => invariant()
+  }
+}
+unsafe effect fn borrowedKernel(left: ValueBits, right: ValueBits, operation: Operation) -> BigInt
+  ! OutOfMemoryError | BigIntError ? &mut Allocator {
+  let anchor = ()
+  let leftStorage = shortLimbs(left)
+  let rightStorage = shortLimbs(right)
+  let a = run unsafe view(&anchor, &leftStorage, left)
+  let b = run unsafe view(&anchor, &rightStorage, right)
+  return run kernel(&a, &b, operation)
+}
+effect fn bigResult<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, left: &mut ValueBits, right: &mut ValueBits, operation: Operation) -> ValueBits
+  ! OutOfMemoryError | JsException ? &mut Allocator {
+  let result = run Intrinsic.catchFailure<OutOfMemoryError | BigIntError>(unsafe borrowedKernel(left.*, right.*, operation), failedOomBigInt)
+  match move result {
+    BigInt value => {
+      let rt = realm.runtime()
+      unsafe releaseSlot(&mut hooks, rt, &mut left)
+      unsafe releaseSlot(&mut hooks, rt, &mut right)
+      return run bigint.compact(move value)
+    }
+    FailedOomBigInt { error } => match move error {
+      OutOfMemoryError allocation => { fail move allocation }
+      // Throw before cleanup, with neither borrowed limb view crossing callbacks.
+      BigIntError big => { return run diagnostic(&mut hooks, realm, big) }
+    }
+  }
+}
+effect fn numericResult<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, left: &mut ValueBits, right: &mut ValueBits, operation: Operation) -> ValueBits
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  if operation == Operation.UnsignedShiftRight && (left.*.isBigInt() || right.*.isBigInt()) {
+    return run hooks.throwError(realm, NativeErrorKind.Type, b"bigint operands are forbidden for >>>")
+  }
+  if left.*.isBigInt() && right.*.isBigInt() { return run bigResult(&mut hooks, realm, &mut left, &mut right, operation) }
+  if isLogic(operation) {
+    let mut a: i32 = 0 let mut b: i32 = 0
+    run integer.toInt32Free(&mut hooks, realm, &mut a, unsafe Value.adoptBits(Intrinsic.replace(left.*, ValueBits.Undefined)))
+    run integer.toInt32Free(&mut hooks, realm, &mut b, unsafe Value.adoptBits(Intrinsic.replace(right.*, ValueBits.Undefined)))
+    let shift = bits(b) & 31
+    let output = match operation {
+      Operation.And => bits(a) & bits(b)
+      Operation.Or => bits(a) | bits(b)
+      Operation.Xor => bits(a) ^ bits(b)
+      Operation.ShiftLeft => u32.shiftLeft(bits(a), shift)
+      Operation.ShiftRight => bits(i32.shiftRight(a, u32.toI32(shift)))
+      Operation.UnsignedShiftRight => u32.shiftRight(bits(a), shift)
+      _ => invariant()
+    }
+    if operation == Operation.UnsignedShiftRight { return ValueBits.number(u32.toF64(output)) }
+    return ValueBits.Int { value: signed(output) }
+  }
+  match left.* {
+    ValueBits.Int { value: a } => match right.* {
+      ValueBits.Int { value: b } => {
+        let x = i32.toI64(a) let y = i32.toI64(b)
+        match operation {
+          Operation.Add => { return ValueBits.number(i64.toF64(x + y)) }
+          Operation.Subtract => { return ValueBits.number(i64.toF64(x - y)) }
+          Operation.Multiply => {
+            if (a == 0 || b == 0) && (a < 0 || b < 0) { return ValueBits.Float64 { value: f64.fromBits(0x8000000000000000) } }
+            return ValueBits.number(i64.toF64(x * y))
+          }
+          Operation.Remainder => {
+            if a >= 0 && b > 0 { return ValueBits.Int { value: a % b } }
+          }
+          _ => ()
+        }
+        return ValueBits.number(floating(i32.toF64(a), i32.toF64(b), operation))
+      }
+      _ => ()
+    }
+    _ => ()
+  }
+  let mut a: f64 = 0.0 let mut b: f64 = 0.0
+  run integer.toFloat64Free(&mut hooks, realm, &mut a, unsafe Value.adoptBits(Intrinsic.replace(left.*, ValueBits.Undefined)))
+  run integer.toFloat64Free(&mut hooks, realm, &mut b, unsafe Value.adoptBits(Intrinsic.replace(right.*, ValueBits.Undefined)))
+  return ValueBits.Float64 { value: floating(a, b, operation) }
+}
+effect fn execute<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, left: &mut ValueBits, right: &mut ValueBits, operation: Operation) -> ValueBits
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  if !isLogic(operation) {
+    match left.* {
+      ValueBits.Float64 { value: a } => match right.* {
+        ValueBits.Float64 { value: b } => { return ValueBits.Float64 { value: floating(a, b, operation) } }
+        _ => ()
+      }
+      _ => ()
+    }
+  }
+  if operation != Operation.UnsignedShiftRight {
+    match left.* {
+      ValueBits.ShortBigInt { value: x } => match right.* {
+        ValueBits.ShortBigInt { value: y } => {
+          match operation {
+            Operation.Add => {
+              match i64.checkedAdd(x, y) {
+                Option<i64>.Some { value } => { return run bigint.newBigInt64(value) }
+                Option<i64>.None => { return run bigint.newBigInt128(i64.wrappingToU64(i64.wrappingAdd(x, y)), extension(x)) }
+              }
+            }
+            Operation.Subtract => {
+              match i64.checkedSubtract(x, y) {
+                Option<i64>.Some { value } => { return run bigint.newBigInt64(value) }
+                Option<i64>.None => { return run bigint.newBigInt128(i64.wrappingToU64(i64.wrappingSubtract(x, y)), extension(x)) }
+              }
+            }
+            Operation.Multiply => {
+              match i64.checkedMultiply(x, y) {
+                Option<i64>.Some { value } => { return run bigint.newBigInt64(value) }
+                Option<i64>.None => {
+                  return run bigint.newBigInt128(i64.wrappingToU64(i64.wrappingMultiply(x, y)), i64.wrappingToU64(i64.multiplyHigh(x, y)))
+                }
+              }
+            }
+            Operation.Divide => { if y != 0 && !(x == i64.MIN && y == -1) { return run bigint.newBigInt64(x / y) } }
+            Operation.Remainder => { if y != 0 && !(x == i64.MIN && y == -1) { return ValueBits.ShortBigInt { value: x % y } } }
+            Operation.And => { return ValueBits.ShortBigInt { value: x & y } }
+            Operation.Or => { return ValueBits.ShortBigInt { value: x | y } }
+            Operation.Xor => { return ValueBits.ShortBigInt { value: x ^ y } }
+            Operation.ShiftLeft => {
+              if y >= 0 && y <= 31 && x >= -2147483648 && x <= 2147483647 { return run bigint.newBigInt64(i64.shiftLeft(x, y)) }
+              if y < 0 && y >= -63 { return ValueBits.ShortBigInt { value: i64.shiftRight(x, -y) } }
+            }
+            Operation.ShiftRight => {
+              if y >= 0 && y <= 63 { return ValueBits.ShortBigInt { value: i64.shiftRight(x, y) } }
+              if y < 0 && y >= -31 && x >= -2147483648 && x <= 2147483647 { return run bigint.newBigInt64(i64.shiftLeft(x, -y)) }
+            }
+            _ => ()
+          }
+          return run bigResult(&mut hooks, realm, &mut left, &mut right, operation)
+        }
+        _ => ()
+      }
+      _ => ()
+    }
+    // Both operands are already BigInts: no conversion can run a callback.
+    if left.*.isBigInt() && right.*.isBigInt() {
+      if operation == Operation.Add || operation == Operation.Subtract || operation == Operation.Multiply {
+        let anchor = ()
+        let leftStorage = shortLimbs(left.*)
+        let rightStorage = shortLimbs(right.*)
+        let a = unsafe smallLimbs(&anchor, &leftStorage, left.*)
+        let b = unsafe smallLimbs(&anchor, &rightStorage, right.*)
+        if a.length <= BigIntOps.SMALL_LIMBS && b.length <= BigIntOps.SMALL_LIMBS {
+          return run smallScratch(a, b, operation == Operation.Subtract, operation == Operation.Multiply)
+        }
+      }
+      return run bigResult(&mut hooks, realm, &mut left, &mut right, operation)
+    }
+  }
+  if operation == Operation.Add {
+    if left.*.isObject() || right.*.isObject() {
+      run convert(&mut hooks, realm, &mut left, Conversion.Primitive)
+      run convert(&mut hooks, realm, &mut right, Conversion.Primitive)
+    }
+    if left.*.isString() || right.*.isString() {
+      match right.* {
+        ValueBits.Int { value: integer } => {
+          if left.*.isString() {
+            let text = Intrinsic.replace(left.*, ValueBits.Undefined)
+            match run Strings.concatIntegerOwned(text, integer, false) {
+              Option<ValueBits>.Some { value } => { return value }
+              Option<ValueBits>.None => { left.* = text }
+            }
+          }
+        }
+        _ => ()
+      }
+      match left.* {
+        ValueBits.Int { value: integer } => {
+          if right.*.isString() {
+            let text = Intrinsic.replace(right.*, ValueBits.Undefined)
+            match run Strings.concatIntegerOwned(text, integer, true) {
+              Option<ValueBits>.Some { value } => { return value }
+              Option<ValueBits>.None => { right.* = text }
+            }
+          }
+        }
+        _ => ()
+      }
+      if !left.*.isString() { run convert(&mut hooks, realm, &mut left, Conversion.String) }
+      if !right.*.isString() { run convert(&mut hooks, realm, &mut right, Conversion.String) }
+      let a = Intrinsic.replace(left.*, ValueBits.Undefined)
+      let b = Intrinsic.replace(right.*, ValueBits.Undefined)
+      return run Strings.concatOwned(a, b)
+    }
+  }
+  run convert(&mut hooks, realm, &mut left, Conversion.Numeric)
+  run convert(&mut hooks, realm, &mut right, Conversion.Numeric)
+  return run numericResult(&mut hooks, realm, &mut left, &mut right, operation)
+}
+effect fn consume<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, left: &mut ValueBits, right: &mut ValueBits, operation: Operation) -> ()
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let mut a = Intrinsic.replace(left.*, ValueBits.Undefined)
+  let mut b = Intrinsic.replace(right.*, ValueBits.Undefined)
+  let result = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError | JsException>(
+    execute(&mut hooks, realm, &mut a, &mut b, operation), textFailed)
+  let rt = realm.runtime()
+  unsafe releaseSlot(&mut hooks, rt, &mut a)
+  unsafe releaseSlot(&mut hooks, rt, &mut b)
+  match move result {
+    ValueBits value => {
+      if value.isException() { fail JsException {} }
+      left.* = value
+    }
+    TextFailed { error } => { fail move error }
+  }
+}
+
+pub effect fn arithmetic<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, left: &mut ValueBits, right: &mut ValueBits, operation: Arithmetic) -> ()
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let selected = match operation {
+    Arithmetic.Subtract => Operation.Subtract Arithmetic.Multiply => Operation.Multiply
+    Arithmetic.Divide => Operation.Divide Arithmetic.Remainder => Operation.Remainder Arithmetic.Power => Operation.Power
+  }
+  run consume(&mut hooks, realm, &mut left, &mut right, selected)
+}
+pub effect fn add<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, left: &mut ValueBits, right: &mut ValueBits) -> ()
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  run consume(&mut hooks, realm, &mut left, &mut right, Operation.Add)
+}
+pub effect fn logic<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, left: &mut ValueBits, right: &mut ValueBits, operation: Logic) -> ()
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  let selected = match operation {
+    Logic.And => Operation.And Logic.Or => Operation.Or Logic.Xor => Operation.Xor
+    Logic.ShiftLeft => Operation.ShiftLeft Logic.ShiftRight => Operation.ShiftRight
+  }
+  run consume(&mut hooks, realm, &mut left, &mut right, selected)
+}
+pub effect fn unsignedShiftRight<'a, H: HeapHooks + CoercionHooks>(hooks: &mut H,realm: Realm<'a>, left: &mut ValueBits, right: &mut ValueBits) -> ()
+  ! OutOfMemoryError | StringLengthError | JsException ? &mut Allocator {
+  run consume(&mut hooks, realm, &mut left, &mut right, Operation.UnsignedShiftRight)
+}
