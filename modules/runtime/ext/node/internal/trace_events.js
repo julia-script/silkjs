@@ -41,6 +41,8 @@ function emit(category, name, phase, args = {}, id, timestamp, duration) {
 }
 function sync() {
   patterns = [...counts.keys()].map(category => new RegExp(`^${category.split('*').map(part => part.replace(/[\\^$+?.()|[\]{}]/g, '\\$&')).join('.*')}$`));
+  // Every publish is traced under this category, built-in publishers included.
+  if (enabled('node.diagnostics_channel')) require('diagnostics_channel');
   const track = enabled('node,node.async_hooks');
   native('gc', enabled('v8,gc'));
   if (track && !asyncEnabled) {

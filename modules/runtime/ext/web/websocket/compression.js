@@ -1,7 +1,7 @@
 'use strict';
 
 const { Buffer } = require('buffer');
-const { createInflateRaw, constants } = require('zlib');
+const constants = require('internal/compression/constants');
 const { failure, MAX_MESSAGE } = require('internal/web/websocket/framing');
 const tail = Buffer.from([0, 0, 255, 255]);
 const offer = 'permessage-deflate; client_max_window_bits';
@@ -40,7 +40,7 @@ class Inflater {
     this.length = 0;
     try {
       if (!this.engine) {
-        const engine = this.engine = createInflateRaw({ windowBits: this.options.windowBits });
+        const engine = this.engine = require('zlib').createInflateRaw({ windowBits: this.options.windowBits });
         engine.on('data', part => {
           if (!this.callback) return;
           this.length += part.length;

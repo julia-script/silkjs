@@ -6,6 +6,7 @@ function tokens(source) {
   const result = [];
   let i = 0;
   let previous = '';
+  const simpleEscapes = { n: '\n', r: '\r', t: '\t', b: '\b', f: '\f', v: '\v' };
   const regexPrefix = new Set(['', '=', '(', '[', '{', ',', ':', ';', '!', '?', '&&', '||', 'return', 'throw', 'case', '=>']);
   while (i < source.length) {
     const c = source[i];
@@ -29,15 +30,31 @@ function tokens(source) {
         if (source[i] === '\\') {
           i++;
           const escaped = source[i++];
-          if (escaped === quote || escaped === '\\') value += escaped;
-          else if (escaped === 'n') value += '\n';
-          else if (escaped === 'r') value += '\r';
-          else if (escaped === 't') value += '\t';
-          else { valid = false; }
+          if (escaped === undefined) valid = false;
+          else if (Object.hasOwn(simpleEscapes, escaped)) value += simpleEscapes[escaped];
+          else if (escaped === 'x' || escaped === 'u') {
+            // \xHH, \uHHHH and \u{H...}, as the string literal itself means them.
+            let digits;
+            if (escaped === 'u' && source[i] === '{') {
+              const close = source.indexOf('}', i);
+              digits = close < 0 ? '' : source.slice(i + 1, close);
+              i = close < 0 ? source.length : close + 1;
+            } else {
+              digits = source.slice(i, i + (escaped === 'x' ? 2 : 4));
+              i += digits.length;
+              if (digits.length !== (escaped === 'x' ? 2 : 4)) digits = '';
+            }
+            const code = /^[0-9a-fA-F]+$/.test(digits) ? parseInt(digits, 16) : NaN;
+            if (code <= 0x10ffff) value += String.fromCodePoint(code); else valid = false;
+          } else if (escaped === '0' && !/[0-9]/.test(source[i] || '')) value += '\0';
+          else if (/[0-9]/.test(escaped)) valid = false;
+          else if (escaped === '\r') { if (source[i] === '\n') i++; }
+          else if (escaped !== '\n' && escaped !== '\u2028' && escaped !== '\u2029') value += escaped;
         } else value += source[i++];
       }
       i++;
-      result.push({ text: '<string>', value: valid ? value : undefined });
+      // Like cjs-module-lexer, a name that is not well-formed UTF-16 is no export.
+      result.push({ text: '<string>', value: valid && value.isWellFormed() ? value : undefined });
       previous = '<string>';
       continue;
     }
@@ -124,7 +141,6 @@ function analyzeExports(source) {
     }
   }
   names.delete('default');
-  names.delete('__esModule');
   names.delete('module.exports');
   return { names: Array.from(names), reexports: Array.from(reexports) };
 }

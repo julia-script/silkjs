@@ -1,81 +1,1009 @@
 'use strict';
-const { Readable, Writable } = require('stream');
-const { error, integer } = require('internal/http2/util');
-const { validateHeaderName, validateHeaderValue } = require('http');
+// Ported from Node.js v24 lib/internal/http2/compat.js. Copyright Joyent, Inc. and other Node
+// contributors. MIT license (see THIRD_PARTY_NOTICES). Changes from Node are
+// marked with "silkjs:" comments.
+
+const {
+  ArrayIsArray,
+  Boolean,
+  ObjectAssign,
+  ObjectHasOwn,
+  ObjectKeys,
+  Proxy,
+  ReflectGetPrototypeOf,
+  Symbol,
+} = require('internal/per_context/primordials');
+
+const assert = require('assert');
+const Stream = require('stream');
+const { Readable } = Stream;
+const {
+  constants: {
+    HTTP2_HEADER_AUTHORITY,
+    HTTP2_HEADER_CONNECTION,
+    HTTP2_HEADER_METHOD,
+    HTTP2_HEADER_PATH,
+    HTTP2_HEADER_SCHEME,
+    HTTP2_HEADER_STATUS,
+
+    HTTP_STATUS_CONTINUE,
+    HTTP_STATUS_EARLY_HINTS,
+    HTTP_STATUS_EXPECTATION_FAILED,
+    HTTP_STATUS_METHOD_NOT_ALLOWED,
+    HTTP_STATUS_OK,
+  },
+} = require('internal/http2/binding');
+const {
+  codes: {
+    ERR_HTTP2_HEADERS_SENT,
+    ERR_HTTP2_INFO_STATUS_NOT_ALLOWED,
+    ERR_HTTP2_INVALID_HEADER_VALUE,
+    ERR_HTTP2_INVALID_STREAM,
+    ERR_HTTP2_NO_SOCKET_MANIPULATION,
+    ERR_HTTP2_PSEUDOHEADER_NOT_ALLOWED,
+    ERR_HTTP2_STATUS_INVALID,
+    ERR_INVALID_ARG_VALUE,
+    ERR_INVALID_HTTP_TOKEN,
+    ERR_STREAM_WRITE_AFTER_END,
+  },
+  hideStackFrames,
+} = require('internal/errors');
+const {
+  validateFunction,
+  validateString,
+  validateLinkHeaderValue,
+  validateObject,
+} = require('internal/validators');
+const {
+  kSocket,
+  kRequest,
+  kProxySocket,
+  assertValidPseudoHeader,
+  getAuthority,
+} = require('internal/http2/util');
+const { _checkIsHttpToken: checkIsHttpToken } = require('_http_common');
+
+const kBeginSend = Symbol('begin-send');
+const kState = Symbol('state');
+const kStream = Symbol('stream');
+const kResponse = Symbol('response');
+const kHeaders = Symbol('headers');
+const kRawHeaders = Symbol('rawHeaders');
+const kTrailers = Symbol('trailers');
+const kRawTrailers = Symbol('rawTrailers');
+const kSetHeader = Symbol('setHeader');
+const kAppendHeader = Symbol('appendHeader');
+const kAborted = Symbol('aborted');
+
+let statusMessageWarned = false;
+let statusConnectionHeaderWarned = false;
+
+// Defines and implements an API compatibility layer on top of the core
+// HTTP/2 implementation, intended to provide an interface that is as
+// close as possible to the current require('http') API
+
+const assertValidHeader = hideStackFrames((name, value) => {
+  if (name === '' ||
+      typeof name !== 'string' ||
+      name.includes(' ')) {
+    throw new ERR_INVALID_HTTP_TOKEN.HideStackFramesError('Header name', name);
+  }
+  if (isPseudoHeader(name)) {
+    throw new ERR_HTTP2_PSEUDOHEADER_NOT_ALLOWED.HideStackFramesError();
+  }
+  if (value === undefined || value === null) {
+    throw new ERR_HTTP2_INVALID_HEADER_VALUE.HideStackFramesError(value, name);
+  }
+  if (!isConnectionHeaderAllowed(name, value)) {
+    connectionHeaderMessageWarn();
+  }
+});
+
+function isPseudoHeader(name) {
+  switch (name) {
+    case HTTP2_HEADER_STATUS:    // :status
+    case HTTP2_HEADER_METHOD:    // :method
+    case HTTP2_HEADER_PATH:      // :path
+    case HTTP2_HEADER_AUTHORITY: // :authority
+    case HTTP2_HEADER_SCHEME:    // :scheme
+      return true;
+    default:
+      return false;
+  }
+}
+
+function statusMessageWarn() {
+  if (statusMessageWarned === false) {
+    process.emitWarning(
+      'Status message is not supported by HTTP/2 (RFC7540 8.1.2.4)',
+      'UnsupportedWarning',
+    );
+    statusMessageWarned = true;
+  }
+}
+
+function isConnectionHeaderAllowed(name, value) {
+  return name !== HTTP2_HEADER_CONNECTION ||
+         value === 'trailers';
+}
+
+function connectionHeaderMessageWarn() {
+  if (statusConnectionHeaderWarned === false) {
+    process.emitWarning(
+      'The provided connection header is not valid, ' +
+      'the value will be dropped from the header and ' +
+      'will never be in use.',
+      'UnsupportedWarning',
+    );
+    statusConnectionHeaderWarned = true;
+  }
+}
+
+function onStreamData(chunk) {
+  const request = this[kRequest];
+  if (request !== undefined && !request.push(chunk))
+    this.pause();
+}
+
+function onStreamTrailers(trailers, flags, rawTrailers) {
+  const request = this[kRequest];
+  if (request !== undefined) {
+    ObjectAssign(request[kTrailers], trailers);
+    request[kRawTrailers].push(...rawTrailers);
+  }
+}
+
+function onStreamEnd() {
+  // Cause the request stream to end as well.
+  const request = this[kRequest];
+  if (request !== undefined)
+    this[kRequest].push(null);
+}
+
+function onStreamError(error) {
+  // This is purposefully left blank
+  //
+  // errors in compatibility mode are
+  // not forwarded to the request
+  // and response objects.
+}
+
+function onRequestPause() {
+  this[kStream].pause();
+}
+
+function onRequestResume() {
+  this[kStream].resume();
+}
+
+function onStreamDrain() {
+  const response = this[kResponse];
+  if (response !== undefined)
+    response.emit('drain');
+}
+
+function onStreamAbortedRequest() {
+  const request = this[kRequest];
+  if (request !== undefined && request[kState].closed === false) {
+    request[kAborted] = true;
+    request.emit('aborted');
+  }
+}
+
+function onStreamAbortedResponse() {
+  // non-op for now
+}
+
+function resumeStream(stream) {
+  stream.resume();
+}
+
+const proxySocketHandler = {
+  has(stream, prop) {
+    const ref = stream.session !== undefined ? stream.session[kSocket] : stream;
+    return (prop in stream) || (prop in ref);
+  },
+
+  get(stream, prop) {
+    switch (prop) {
+      case 'on':
+      case 'once':
+      case 'end':
+      case 'emit':
+      case 'destroy':
+        return stream[prop].bind(stream);
+      case 'writable':
+      case 'destroyed':
+        return stream[prop];
+      case 'readable': {
+        if (stream.destroyed)
+          return false;
+        const request = stream[kRequest];
+        return request ? request.readable : stream.readable;
+      }
+      case 'setTimeout': {
+        const session = stream.session;
+        if (session !== undefined)
+          return session.setTimeout.bind(session);
+        return stream.setTimeout.bind(stream);
+      }
+      case 'write':
+      case 'read':
+      case 'pause':
+      case 'resume':
+        throw new ERR_HTTP2_NO_SOCKET_MANIPULATION();
+      default: {
+        const ref = stream.session !== undefined ?
+          stream.session[kSocket] : stream;
+        const value = ref[prop];
+        return typeof value === 'function' ?
+          value.bind(ref) :
+          value;
+      }
+    }
+  },
+  getPrototypeOf(stream) {
+    if (stream.session !== undefined)
+      return ReflectGetPrototypeOf(stream.session[kSocket]);
+    return ReflectGetPrototypeOf(stream);
+  },
+  set(stream, prop, value) {
+    switch (prop) {
+      case 'writable':
+      case 'readable':
+      case 'destroyed':
+      case 'on':
+      case 'once':
+      case 'end':
+      case 'emit':
+      case 'destroy':
+        stream[prop] = value;
+        return true;
+      case 'setTimeout': {
+        const session = stream.session;
+        if (session !== undefined)
+          session.setTimeout = value;
+        else
+          stream.setTimeout = value;
+        return true;
+      }
+      case 'write':
+      case 'read':
+      case 'pause':
+      case 'resume':
+        throw new ERR_HTTP2_NO_SOCKET_MANIPULATION();
+      default: {
+        const ref = stream.session !== undefined ?
+          stream.session[kSocket] : stream;
+        ref[prop] = value;
+        return true;
+      }
+    }
+  },
+};
+
+function onStreamCloseRequest() {
+  const req = this[kRequest];
+
+  if (req === undefined)
+    return;
+
+  const state = req[kState];
+  state.closed = true;
+
+  req.push(null);
+  // If the user didn't interact with incoming data and didn't pipe it,
+  // dump it for compatibility with http1
+  if (!state.didRead && !req._readableState.resumeScheduled)
+    req.resume();
+
+  this[kProxySocket] = null;
+  this[kRequest] = undefined;
+
+  req.emit('close');
+}
+
+function onStreamTimeoutRequest() {
+  this[kRequest].emit('timeout');
+}
+
+function onStreamTimeoutResponse() {
+  this[kResponse].emit('timeout');
+}
+
 class Http2ServerRequest extends Readable {
-  constructor(stream, headers, options = {}, rawHeaders = []) {
-    super({ autoDestroy: true, highWaterMark: options.highWaterMark });
-    this.stream = stream; this.headers = headers; this.rawHeaders = rawHeaders;
-    this.trailers = {}; this.rawTrailers = []; this.httpVersion = '2.0'; this.httpVersionMajor = 2; this.httpVersionMinor = 0;
-    this.complete = false; this.aborted = false; this.url = headers[':path']; this.method = headers[':method']; this.authority = headers[':authority']; this.scheme = headers[':scheme'];
-    stream.on('data', chunk => { if (!this.push(chunk)) stream.pause(); });
-    stream.on('end', () => { this.complete = true; this.push(null); });
-    stream.on('trailers', (trailers, flags, raw) => { this.trailers = trailers; this.rawTrailers = raw; });
-    stream.on('aborted', () => { this.aborted = true; this.emit('aborted'); });
-    stream.on('error', err => this.destroy(err));
-    stream.on('close', () => { if (!this.complete) this.destroy(); });
-    stream.pause();
+  constructor(stream, headers, options, rawHeaders) {
+    super({ autoDestroy: false, ...options });
+    this[kState] = {
+      closed: false,
+      didRead: false,
+    };
+    // Headers in HTTP/1 are not initialized using Object.create(null) which,
+    // although preferable, would simply break too much code. Ergo header
+    // initialization using Object.create(null) in HTTP/2 is intentional.
+    this[kHeaders] = headers;
+    this[kRawHeaders] = rawHeaders;
+    this[kTrailers] = {};
+    this[kRawTrailers] = [];
+    this[kStream] = stream;
+    this[kAborted] = false;
+    stream[kProxySocket] = null;
+    stream[kRequest] = this;
+
+    // Pause the stream..
+    stream.on('trailers', onStreamTrailers);
+    stream.on('end', onStreamEnd);
+    stream.on('error', onStreamError);
+    stream.on('aborted', onStreamAbortedRequest);
+    stream.on('close', onStreamCloseRequest);
+    stream.on('timeout', onStreamTimeoutRequest);
+    this.on('pause', onRequestPause);
+    this.on('resume', onRequestResume);
   }
-  get socket() { return this.stream.session.socket; }
-  get connection() { return this.socket; }
-  get headersDistinct() { const out = {}; for (let i = 0; i < this.rawHeaders.length; i += 2) (out[this.rawHeaders[i]] ||= []).push(this.rawHeaders[i + 1]); return out; }
-  get trailersDistinct() { const out = {}; for (let i = 0; i < this.rawTrailers.length; i += 2) (out[this.rawTrailers[i]] ||= []).push(this.rawTrailers[i + 1]); return out; }
-  _read() { this.stream.resume(); }
-  _destroy(err, callback) { if (!this.complete && !this.stream.destroyed) this.stream.destroy(err); callback(err); }
-  setTimeout(msecs, callback) { this.stream.setTimeout(msecs, callback); return this; }
+
+  get aborted() {
+    return this[kAborted];
+  }
+
+  get complete() {
+    return this[kAborted] ||
+           this.readableEnded ||
+           this[kState].closed ||
+           this[kStream].destroyed;
+  }
+
+  get stream() {
+    return this[kStream];
+  }
+
+  get headers() {
+    return this[kHeaders];
+  }
+
+  get rawHeaders() {
+    return this[kRawHeaders];
+  }
+
+  get trailers() {
+    return this[kTrailers];
+  }
+
+  get rawTrailers() {
+    return this[kRawTrailers];
+  }
+
+  get httpVersionMajor() {
+    return 2;
+  }
+
+  get httpVersionMinor() {
+    return 0;
+  }
+
+  get httpVersion() {
+    return '2.0';
+  }
+
+  get socket() {
+    const stream = this[kStream];
+    const proxySocket = stream[kProxySocket];
+    if (proxySocket === null)
+      return stream[kProxySocket] = new Proxy(stream, proxySocketHandler);
+    return proxySocket;
+  }
+
+  get connection() {
+    return this.socket;
+  }
+
+  _read(nread) {
+    const state = this[kState];
+    assert(!state.closed);
+    if (!state.didRead) {
+      state.didRead = true;
+      this[kStream].on('data', onStreamData);
+    } else {
+      process.nextTick(resumeStream, this[kStream]);
+    }
+  }
+
+  get method() {
+    return this[kHeaders][HTTP2_HEADER_METHOD];
+  }
+
+  set method(method) {
+    validateString(method, 'method');
+    if (method.trim() === '')
+      throw new ERR_INVALID_ARG_VALUE('method', method);
+
+    this[kHeaders][HTTP2_HEADER_METHOD] = method;
+  }
+
+  get authority() {
+    return getAuthority(this[kHeaders]);
+  }
+
+  get scheme() {
+    return this[kHeaders][HTTP2_HEADER_SCHEME];
+  }
+
+  get url() {
+    return this[kHeaders][HTTP2_HEADER_PATH];
+  }
+
+  set url(url) {
+    this[kHeaders][HTTP2_HEADER_PATH] = url;
+  }
+
+  setTimeout(msecs, callback) {
+    if (!this[kState].closed)
+      this[kStream].setTimeout(msecs, callback);
+    return this;
+  }
 }
-class Http2ServerResponse extends Writable {
-  constructor(stream, options = {}) {
-    super({ autoDestroy: false, highWaterMark: options.highWaterMark });
-    this.stream = stream; this.statusCode = 200; this.statusMessage = ''; this.sendDate = true;
-    this._headers = Object.create(null); this._names = Object.create(null); this._trailers = null; this._sent = false;
-    this._closed = false; this.req = undefined;
-    stream.on('wantTrailers', () => stream.sendTrailers(this._trailers || {}));
-    stream.on('error', err => this.destroy(err));
-    stream.on('close', () => { if (!this._closed) { this._closed = true; this.emit('close'); } });
+
+function onStreamTrailersReady() {
+  this.sendTrailers(this[kResponse][kTrailers]);
+}
+
+function onStreamCloseResponse() {
+  const res = this[kResponse];
+
+  if (res === undefined)
+    return;
+
+  const state = res[kState];
+
+  if (this.headRequest !== state.headRequest)
+    return;
+
+  state.closed = true;
+
+  this[kProxySocket] = null;
+
+  this.removeListener('wantTrailers', onStreamTrailersReady);
+  this[kResponse] = undefined;
+
+  res.emit('finish');
+  res.emit('close');
+}
+
+class Http2ServerResponse extends Stream {
+  constructor(stream, options) {
+    super(options);
+    this[kState] = {
+      closed: false,
+      ending: false,
+      destroyed: false,
+      headRequest: false,
+      sendDate: true,
+      statusCode: HTTP_STATUS_OK,
+    };
+    this[kHeaders] = { __proto__: null };
+    this[kTrailers] = { __proto__: null };
+    this[kStream] = stream;
+    stream[kProxySocket] = null;
+    stream[kResponse] = this;
+    this.writable = true;
+    this.req = stream[kRequest];
+    stream.on('drain', onStreamDrain);
+    stream.on('aborted', onStreamAbortedResponse);
+    stream.on('close', onStreamCloseResponse);
+    stream.on('wantTrailers', onStreamTrailersReady);
+    stream.on('timeout', onStreamTimeoutResponse);
   }
-  get socket() { return this.stream.session.socket; }
-  get connection() { return this.socket; }
-  get headersSent() { return this._sent || this.stream.headersSent; }
-  get finished() { return this.writableEnded; }
-  get writableFinished() { return this._writableState.finished; }
-  _mutable() { if (this.headersSent) throw error('ERR_HTTP2_HEADERS_SENT', 'Response headers have already been sent'); }
-  setHeader(name, value) { this._mutable(); validateHeaderName(name); for (const v of Array.isArray(value) ? value : [value]) validateHeaderValue(name, v); const lower = name.toLowerCase(); this._headers[lower] = value; this._names[lower] = name; return this; }
-  appendHeader(name, value) { this._mutable(); const old = this.getHeader(name); return this.setHeader(name, old === undefined ? value : [].concat(old, value)); }
-  getHeader(name) { return this._headers[String(name).toLowerCase()]; }
-  getHeaders() { return Object.assign(Object.create(null), this._headers); }
-  getHeaderNames() { return Object.keys(this._headers); }
-  getRawHeaderNames() { return Object.values(this._names); }
-  hasHeader(name) { return Object.prototype.hasOwnProperty.call(this._headers, String(name).toLowerCase()); }
-  removeHeader(name) { this._mutable(); name = String(name).toLowerCase(); delete this._headers[name]; delete this._names[name]; if (name === 'date') this.sendDate = false; }
-  setHeaders(headers) { for (const [name, value] of headers) this.setHeader(name, value); return this; }
+
+  // User land modules such as finalhandler just check truthiness of this
+  // but if someone is actually trying to use this for more than that
+  // then we simply can't support such use cases
+  get _header() {
+    return this.headersSent;
+  }
+
+  get writableEnded() {
+    const state = this[kState];
+    return state.ending;
+  }
+
+  get finished() {
+    const state = this[kState];
+    return state.ending;
+  }
+
+  get socket() {
+    // This is compatible with http1 which removes socket reference
+    // only from ServerResponse but not IncomingMessage
+    if (this[kState].closed)
+      return undefined;
+
+    const stream = this[kStream];
+    const proxySocket = stream[kProxySocket];
+    if (proxySocket === null)
+      return stream[kProxySocket] = new Proxy(stream, proxySocketHandler);
+    return proxySocket;
+  }
+
+  get connection() {
+    return this.socket;
+  }
+
+  get stream() {
+    return this[kStream];
+  }
+
+  get headersSent() {
+    return this[kStream].headersSent;
+  }
+
+  get sendDate() {
+    return this[kState].sendDate;
+  }
+
+  set sendDate(bool) {
+    this[kState].sendDate = Boolean(bool);
+  }
+
+  get statusCode() {
+    return this[kState].statusCode;
+  }
+
+  get writableCorked() {
+    return this[kStream].writableCorked;
+  }
+
+  get writableHighWaterMark() {
+    return this[kStream].writableHighWaterMark;
+  }
+
+  get writableObjectMode() {
+    return this[kStream].writableObjectMode;
+  }
+
+  get writableFinished() {
+    return this[kStream].writableFinished;
+  }
+
+  get writableLength() {
+    return this[kStream].writableLength;
+  }
+
+  get writableNeedDrain() {
+    return this[kStream].writableNeedDrain;
+  }
+
+  set statusCode(code) {
+    code |= 0;
+    if (code >= 100 && code < 200)
+      throw new ERR_HTTP2_INFO_STATUS_NOT_ALLOWED();
+    if (code < 100 || code > 599)
+      throw new ERR_HTTP2_STATUS_INVALID(code);
+    this[kState].statusCode = code;
+  }
+
+  setTrailer(name, value) {
+    validateString(name, 'name');
+    name = name.trim().toLowerCase();
+    assertValidHeader(name, value);
+    this[kTrailers][name] = value;
+  }
+
+  addTrailers(headers) {
+    const keys = ObjectKeys(headers);
+    let key = '';
+    for (let i = 0; i < keys.length; i++) {
+      key = keys[i];
+      this.setTrailer(key, headers[key]);
+    }
+  }
+
+  getHeader(name) {
+    validateString(name, 'name');
+    name = name.trim().toLowerCase();
+    return this[kHeaders][name];
+  }
+
+  getHeaderNames() {
+    return ObjectKeys(this[kHeaders]);
+  }
+
+  getHeaders() {
+    const headers = { __proto__: null };
+    return ObjectAssign(headers, this[kHeaders]);
+  }
+
+  hasHeader(name) {
+    validateString(name, 'name');
+    name = name.trim().toLowerCase();
+    return ObjectHasOwn(this[kHeaders], name);
+  }
+
+  removeHeader(name) {
+    validateString(name, 'name');
+    if (this[kStream].headersSent)
+      throw new ERR_HTTP2_HEADERS_SENT();
+
+    name = name.trim().toLowerCase();
+
+    if (name === 'date') {
+      this[kState].sendDate = false;
+
+      return;
+    }
+
+    delete this[kHeaders][name];
+  }
+
+  setHeader(name, value) {
+    validateString(name, 'name');
+    if (this[kStream].headersSent)
+      throw new ERR_HTTP2_HEADERS_SENT();
+
+    this[kSetHeader](name, value);
+  }
+
+  [kSetHeader](name, value) {
+    name = name.trim().toLowerCase();
+    assertValidHeader(name, value);
+
+    if (!isConnectionHeaderAllowed(name, value)) {
+      return;
+    }
+
+    if (name[0] === ':')
+      assertValidPseudoHeader(name);
+    else if (!checkIsHttpToken(name))
+      this.destroy(new ERR_INVALID_HTTP_TOKEN('Header name', name));
+
+    this[kHeaders][name] = value;
+  }
+
+  appendHeader(name, value) {
+    validateString(name, 'name');
+    if (this[kStream].headersSent)
+      throw new ERR_HTTP2_HEADERS_SENT();
+
+    this[kAppendHeader](name, value);
+  }
+
+  [kAppendHeader](name, value) {
+    name = name.trim().toLowerCase();
+    assertValidHeader(name, value);
+
+    if (!isConnectionHeaderAllowed(name, value)) {
+      return;
+    }
+
+    if (name[0] === ':')
+      assertValidPseudoHeader(name);
+    else if (!checkIsHttpToken(name))
+      this.destroy(new ERR_INVALID_HTTP_TOKEN('Header name', name));
+
+    // Handle various possible cases the same as OutgoingMessage.appendHeader:
+    const headers = this[kHeaders];
+    if (headers === null || !headers[name]) {
+      return this.setHeader(name, value);
+    }
+
+    if (!ArrayIsArray(headers[name])) {
+      headers[name] = [headers[name]];
+    }
+
+    const existingValues = headers[name];
+    if (ArrayIsArray(value)) {
+      for (let i = 0, length = value.length; i < length; i++) {
+        existingValues.push(value[i]);
+      }
+    } else {
+      existingValues.push(value);
+    }
+  }
+
+  get statusMessage() {
+    statusMessageWarn();
+
+    return '';
+  }
+
+  set statusMessage(msg) {
+    statusMessageWarn();
+  }
+
+  flushHeaders() {
+    const state = this[kState];
+    if (!state.closed && !this[kStream].headersSent)
+      this.writeHead(state.statusCode);
+  }
+
   writeHead(statusCode, statusMessage, headers) {
-    this._mutable(); integer(statusCode, 'statusCode', 200, 599); this.statusCode = statusCode;
-    if (typeof statusMessage !== 'string') headers = statusMessage;
-    if (headers) { if (Array.isArray(headers)) for (let i = 0; i < headers.length; i += 2) this.appendHeader(headers[i], headers[i + 1]); else for (const name of Object.keys(headers)) this.setHeader(name, headers[name]); }
-    this.flushHeaders(); return this;
+    const state = this[kState];
+
+    if (state.closed || this.stream.destroyed || this.stream.closed)
+      return this;
+    if (this[kStream].headersSent)
+      throw new ERR_HTTP2_HEADERS_SENT();
+
+    if (typeof statusMessage === 'string')
+      statusMessageWarn();
+
+    if (headers === undefined && typeof statusMessage === 'object')
+      headers = statusMessage;
+
+    let i;
+    if (ArrayIsArray(headers)) {
+      if (this[kHeaders]) {
+        // Headers in obj should override previous headers but still
+        // allow explicit duplicates. To do so, we first remove any
+        // existing conflicts, then use appendHeader. This is the
+        // slow path, which only applies when you use setHeader and
+        // then pass headers in writeHead too.
+
+        // We need to handle both the tuple and flat array formats, just
+        // like the logic further below.
+        if (headers.length && ArrayIsArray(headers[0])) {
+          for (let n = 0; n < headers.length; n += 1) {
+            const key = headers[n + 0][0];
+            this.removeHeader(key);
+          }
+        } else {
+          for (let n = 0; n < headers.length; n += 2) {
+            const key = headers[n + 0];
+            this.removeHeader(key);
+          }
+        }
+      }
+
+      // Append all the headers provided in the array:
+      if (headers.length && ArrayIsArray(headers[0])) {
+        for (i = 0; i < headers.length; i++) {
+          const header = headers[i];
+          this[kAppendHeader](header[0], header[1]);
+        }
+      } else {
+        if (headers.length % 2 !== 0) {
+          throw new ERR_INVALID_ARG_VALUE('headers', headers);
+        }
+
+        for (i = 0; i < headers.length; i += 2) {
+          this[kAppendHeader](headers[i], headers[i + 1]);
+        }
+      }
+    } else if (typeof headers === 'object') {
+      const keys = ObjectKeys(headers);
+      let key = '';
+      for (i = 0; i < keys.length; i++) {
+        key = keys[i];
+        this[kSetHeader](key, headers[key]);
+      }
+    }
+
+    state.statusCode = statusCode;
+    this[kBeginSend]();
+
+    return this;
   }
-  flushHeaders() { if (this.headersSent) return; integer(this.statusCode, 'statusCode', 200, 599); if (this.sendDate && !this.hasHeader('date')) this._headers.date = new Date().toUTCString(); this.stream.respond({ ...this._headers, ':status': this.statusCode }, { waitForTrailers: true }); this._sent = true; }
-  _write(chunk, encoding, callback) { try { this.flushHeaders(); if (this.stream._localEnded) { callback(); return; } this.stream.write(chunk, encoding, callback); } catch (err) { callback(err); } }
-  _final(callback) { try { this.flushHeaders(); if (this.stream.writableFinished) { callback(); return; } this.stream.end(callback); } catch (err) { callback(err); } }
-  _destroy(err, callback) { this.stream.destroy(err); callback(err); }
-  addTrailers(headers) { if (Array.isArray(headers)) { const out = {}; for (let i = 0; i < headers.length; i += 2) out[headers[i]] = headers[i + 1]; headers = out; } require('internal/http2/util').headers(headers, 'trailers'); this._trailers = { ...this._trailers, ...headers }; }
-  writeContinue(callback) { this.stream.additionalHeaders({ ':status': 100 }); if (callback) process.nextTick(callback); }
-  writeProcessing() { this.stream.additionalHeaders({ ':status': 102 }); }
-  writeEarlyHints(hints, callback) { this.stream.additionalHeaders({ ...hints, ':status': 103 }); if (callback) process.nextTick(callback); }
-  createPushResponse(headers, callback) { this.stream.pushStream(headers, (err, stream) => callback(err, err ? undefined : new Http2ServerResponse(stream))); }
-  setTimeout(msecs, callback) { this.stream.setTimeout(msecs, callback); return this; }
-  cork() { this.stream.cork(); }
-  uncork() { this.stream.uncork(); }
-}
-function compatibility(server, stream, headers, flags, raw) {
-  if (!server.listenerCount('request') && !server.listenerCount('checkContinue') && !server.listenerCount('checkExpectation')) return;
-  const req = new (server._http2Options.Http2ServerRequest || Http2ServerRequest)(stream, headers, server._http2Options, raw);
-  const res = new (server._http2Options.Http2ServerResponse || Http2ServerResponse)(stream, server._http2Options); req.res = res; res.req = req;
-  if (headers.expect) {
-    if (headers.expect.toLowerCase() === '100-continue') { if (server.listenerCount('checkContinue')) { server.emit('checkContinue', req, res); return; } res.writeContinue(); }
-    else { if (server.listenerCount('checkExpectation')) server.emit('checkExpectation', req, res); else { res.writeHead(417); res.end(); } return; }
+
+  cork() {
+    this[kStream].cork();
   }
-  server.emit('request', req, res);
+
+  uncork() {
+    this[kStream].uncork();
+  }
+
+  write(chunk, encoding, cb) {
+    const state = this[kState];
+
+    if (typeof encoding === 'function') {
+      cb = encoding;
+      encoding = 'utf8';
+    }
+
+    let err;
+    if (state.ending) {
+      err = new ERR_STREAM_WRITE_AFTER_END();
+    } else if (state.closed) {
+      err = new ERR_HTTP2_INVALID_STREAM();
+    } else if (state.destroyed) {
+      return false;
+    }
+
+    if (err) {
+      if (typeof cb === 'function')
+        process.nextTick(cb, err);
+      this.destroy(err);
+      return false;
+    }
+
+    const stream = this[kStream];
+    if (!stream.headersSent)
+      this.writeHead(state.statusCode);
+    return stream.write(chunk, encoding, cb);
+  }
+
+  end(chunk, encoding, cb) {
+    const stream = this[kStream];
+    const state = this[kState];
+
+    if (typeof chunk === 'function') {
+      cb = chunk;
+      chunk = null;
+    } else if (typeof encoding === 'function') {
+      cb = encoding;
+      encoding = 'utf8';
+    }
+
+    if ((state.closed || state.ending) &&
+        state.headRequest === stream.headRequest) {
+      if (typeof cb === 'function') {
+        process.nextTick(cb);
+      }
+      return this;
+    }
+
+    if (chunk !== null && chunk !== undefined)
+      this.write(chunk, encoding);
+
+    state.headRequest = stream.headRequest;
+    state.ending = true;
+
+    if (typeof cb === 'function') {
+      if (stream.writableEnded)
+        this.once('finish', cb);
+      else
+        stream.once('finish', cb);
+    }
+
+    if (!stream.headersSent)
+      this.writeHead(this[kState].statusCode);
+
+    if (this[kState].closed || stream.destroyed)
+      onStreamCloseResponse.call(stream);
+    else
+      stream.end();
+
+    return this;
+  }
+
+  destroy(err) {
+    if (this[kState].destroyed)
+      return;
+
+    this[kState].destroyed = true;
+    this[kStream].destroy(err);
+  }
+
+  setTimeout(msecs, callback) {
+    if (this[kState].closed)
+      return;
+    this[kStream].setTimeout(msecs, callback);
+  }
+
+  createPushResponse(headers, callback) {
+    validateFunction(callback, 'callback');
+    if (this[kState].closed) {
+      process.nextTick(callback, new ERR_HTTP2_INVALID_STREAM());
+      return;
+    }
+    this[kStream].pushStream(headers, {}, (err, stream, headers, options) => {
+      if (err) {
+        callback(err);
+        return;
+      }
+      callback(null, new Http2ServerResponse(stream));
+    });
+  }
+
+  [kBeginSend]() {
+    const state = this[kState];
+    const headers = this[kHeaders];
+    headers[HTTP2_HEADER_STATUS] = state.statusCode;
+    const options = {
+      endStream: state.ending,
+      waitForTrailers: true,
+      sendDate: state.sendDate,
+    };
+    this[kStream].respond(headers, options);
+  }
+
+  writeInformation(statusCode, headers) {
+    if (typeof statusCode !== 'number' ||
+        statusCode < 100 || statusCode > 199) {
+      throw new ERR_HTTP2_STATUS_INVALID(statusCode);
+    }
+    if (statusCode === 101) {
+      throw new ERR_HTTP2_STATUS_INVALID(statusCode);
+    }
+
+    const stream = this[kStream];
+
+    if (stream.headersSent || this[kState].closed)
+      return false;
+
+    const outHeaders = { __proto__: null };
+    if (headers !== undefined && headers !== null) {
+      validateObject(headers, 'headers');
+      const keys = ObjectKeys(headers);
+      for (let i = 0; i < keys.length; i++) {
+        outHeaders[keys[i]] = headers[keys[i]];
+      }
+    }
+    outHeaders[HTTP2_HEADER_STATUS] = statusCode;
+
+    stream.additionalHeaders(outHeaders);
+    return true;
+  }
+
+  // TODO doesn't support callbacks
+  writeContinue() {
+    return this.writeInformation(HTTP_STATUS_CONTINUE);
+  }
+
+  writeEarlyHints(hints) {
+    validateObject(hints, 'hints');
+
+    const headers = { __proto__: null };
+
+    const linkHeaderValue = validateLinkHeaderValue(hints.link);
+
+    for (const key of ObjectKeys(hints)) {
+      if (key !== 'link') {
+        const name = key.trim().toLowerCase();
+        assertValidHeader(name, hints[key]);
+        if (!checkIsHttpToken(name))
+          throw new ERR_INVALID_HTTP_TOKEN('Header name', name);
+        headers[name] = hints[key];
+      }
+    }
+
+    if (linkHeaderValue.length === 0) {
+      return false;
+    }
+
+    headers.Link = linkHeaderValue;
+
+    return this.writeInformation(HTTP_STATUS_EARLY_HINTS, headers);
+  }
 }
-module.exports = { Http2ServerRequest, Http2ServerResponse, compatibility };
+
+function onServerStream(ServerRequest, ServerResponse,
+                        stream, headers, flags, rawHeaders) {
+  const server = this;
+  const request = new ServerRequest(stream, headers, undefined, rawHeaders);
+  const response = new ServerResponse(stream);
+
+  // Check for the CONNECT method
+  const method = headers[HTTP2_HEADER_METHOD];
+  if (method === 'CONNECT') {
+    if (!server.emit('connect', request, response)) {
+      response.statusCode = HTTP_STATUS_METHOD_NOT_ALLOWED;
+      response.end();
+    }
+    return;
+  }
+
+  // Check for Expectations
+  if (headers.expect !== undefined) {
+    if (headers.expect === '100-continue') {
+      if (server.listenerCount('checkContinue')) {
+        server.emit('checkContinue', request, response);
+      } else {
+        response.writeContinue();
+        server.emit('request', request, response);
+      }
+    } else if (server.listenerCount('checkExpectation')) {
+      server.emit('checkExpectation', request, response);
+    } else {
+      response.statusCode = HTTP_STATUS_EXPECTATION_FAILED;
+      response.end();
+    }
+    return;
+  }
+
+  server.emit('request', request, response);
+}
+
+module.exports = {
+  onServerStream,
+  Http2ServerRequest,
+  Http2ServerResponse,
+};

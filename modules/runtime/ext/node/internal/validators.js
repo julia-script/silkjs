@@ -25,7 +25,7 @@
 'use strict';
 
 const {
-  codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_MISSING_ARGS, ERR_OUT_OF_RANGE, ERR_UNKNOWN_SIGNAL },
+  codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_MISSING_ARGS, ERR_OUT_OF_RANGE, ERR_SOCKET_BAD_PORT, ERR_UNKNOWN_SIGNAL },
 } = require('internal/errors');
 
 function codedError(Base, code, message) {
@@ -35,8 +35,25 @@ function codedError(Base, code, message) {
 }
 function unknownSignal(signal) { return new ERR_UNKNOWN_SIGNAL(signal); }
 
+const isUint32 = (value) => value === (value >>> 0);
 function validateString(value, name) {
   if (typeof value !== 'string') throw new ERR_INVALID_ARG_TYPE(name, 'string', value);
+}
+/**
+ * @param {number|string} port
+ * @param {string} [name]
+ * @param {boolean} [allowZero]
+ * @returns {number}
+ */
+function validatePort(port, name = 'Port', allowZero = true) {
+  if ((typeof port !== 'number' && typeof port !== 'string') ||
+      (typeof port === 'string' && port.trim().length === 0) ||
+      +port !== (+port >>> 0) ||
+      port > 0xFFFF ||
+      (port === 0 && !allowZero)) {
+    throw new ERR_SOCKET_BAD_PORT(name, port, allowZero);
+  }
+  return port | 0;
 }
 function validateBoolean(value, name) {
   if (typeof value !== 'boolean') throw new ERR_INVALID_ARG_TYPE(name, 'boolean', value);
@@ -83,6 +100,30 @@ function validateAbortSignal(signal, name) {
     throw new ERR_INVALID_ARG_TYPE(name, 'AbortSignal', signal);
   }
 }
+function validateBuffer(buffer, name = 'buffer') {
+  if (!ArrayBuffer.isView(buffer)) throw new ERR_INVALID_ARG_TYPE(name, ['Buffer', 'TypedArray', 'DataView'], buffer);
+}
+const linkValueRegExp = /^(?:<[^>]*>)(?:\s*;\s*[^;"\s]+(?:=(")?[^;"\s]*\1)?)*$/;
+function validateLinkHeaderFormat(value, name) {
+  if (typeof value === 'undefined' || !linkValueRegExp.exec(value)) {
+    throw new ERR_INVALID_ARG_VALUE(name, value, 'must be an array or string of format "</styles.css>; rel=preload; as=style"');
+  }
+}
+function validateLinkHeaderValue(hints) {
+  if (typeof hints === 'string') {
+    validateLinkHeaderFormat(hints, 'hints');
+    return hints;
+  } else if (Array.isArray(hints)) {
+    let result = '';
+    for (let i = 0; i < hints.length; i++) {
+      validateLinkHeaderFormat(hints[i], 'hints');
+      result += hints[i];
+      if (i !== hints.length - 1) result += ', ';
+    }
+    return result;
+  }
+  throw new ERR_INVALID_ARG_VALUE('hints', hints, 'must be an array or string of format "</styles.css>; rel=preload; as=style"');
+}
 let signals;
 const signalTable = () => signals ??= require('os').constants.signals;
 let signalNames;
@@ -120,11 +161,50 @@ function getValidatedPath(value, name = 'path') {
   return path;
 }
 
+const octalReg = /^[0-7]+$/;
+const modeDesc = 'must be a 32-bit unsigned integer or an octal string';
+// Values that become a mode_t: valid numbers and octal strings.
+function parseFileMode(value, name, def) {
+  value ??= def;
+  if (typeof value === 'string') {
+    if (octalReg.exec(value) === null) throw new ERR_INVALID_ARG_VALUE(name, value, modeDesc);
+    value = Number.parseInt(value, 8);
+  }
+  validateUint32(value, name);
+  // Coerce -0 to +0.
+  return value + 0;
+}
+// Node's validateFiniteNumber and checkRangesOrGetDefault (used by zlib).
+function validateFiniteNumber(number, name) {
+  // Common case
+  if (number === undefined) return false;
+  if (Number.isFinite(number)) return true; // Is a valid number
+  if (Number.isNaN(number)) return false;
+  validateNumber(number, name);
+  // Infinite numbers
+  throw new ERR_OUT_OF_RANGE(name, 'a finite number', number);
+}
+function checkRangesOrGetDefault(number, name, lower, upper, def) {
+  if (!validateFiniteNumber(number, name)) return def;
+  if (number < lower || number > upper) {
+    throw new ERR_OUT_OF_RANGE(name, `>= ${lower} and <= ${upper}`, number);
+  }
+  return number;
+}
+// Node wraps its validators in hideStackFrames(), whose callers inside other
+// hidden frames use fn.withoutStackTrace.
+for (const fn of [validateString, validateBoolean, validateFunction, validateNumber, validateInteger, validateInt32,
+  validateUint32, validateObject, validateArray, validateOneOf, validateAbortSignal, validateBuffer]) {
+  fn.withoutStackTrace = fn;
+}
+
 module.exports = {
   codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_MISSING_ARGS, ERR_OUT_OF_RANGE },
   codedError, unknownSignal,
   kValidateObjectAllowNullable, kValidateObjectAllowArray, kValidateObjectAllowFunction,
   validateString, validateBoolean, validateFunction, validateNumber, validateInteger, validateInt32,
   validateUint32, validateObject, validateArray, validateOneOf, validateAbortSignal,
-  convertToValidSignal, signalName, toPathIfFileURL, validatePath, getValidatedPath,
+  isUint32, parseFileMode, validateBuffer, validateLinkHeaderValue,
+  convertToValidSignal, signalName, toPathIfFileURL, validatePath, getValidatedPath, validatePort,
+  validateFiniteNumber, checkRangesOrGetDefault,
 };
