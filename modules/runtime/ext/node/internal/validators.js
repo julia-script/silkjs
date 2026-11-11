@@ -124,7 +124,7 @@ function validateThisInternalField(object, fieldKey, className) {
 function validateBuffer(buffer, name = 'buffer') {
   if (!ArrayBuffer.isView(buffer)) throw new ERR_INVALID_ARG_TYPE(name, ['Buffer', 'TypedArray', 'DataView'], buffer);
 }
-const linkValueRegExp = /^(?:<[^>]*>)(?:\s*;\s*[^;"\s]+(?:=(")?[^;"\s]*\1)?)*$/;
+const linkValueRegExp = /^(?:<[^>\r\n]*>)(?:\s*;\s*[^;"\s]+(?:=(")?[^;"\s]*\1)?)*$/;
 function validateLinkHeaderFormat(value, name) {
   if (typeof value === 'undefined' || !linkValueRegExp.exec(value)) {
     throw new ERR_INVALID_ARG_VALUE(name, value, 'must be an array or string of format "</styles.css>; rel=preload; as=style"');

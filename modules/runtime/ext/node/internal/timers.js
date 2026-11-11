@@ -162,8 +162,8 @@ const knownTimersById = { __proto__: null };
 
 function initAsyncResource(resource, type) {
   const asyncResource = createResource(type, resource);
-  resource[async_id_symbol] = asyncResource.asyncId();
-  resource[trigger_async_id_symbol] = asyncResource.triggerAsyncId();
+  resource[async_id_symbol] = asyncResource.id;
+  resource[trigger_async_id_symbol] = asyncResource.trigger;
   resource[kAsyncResource] = asyncResource;
 }
 
@@ -234,10 +234,8 @@ class Timeout {
   }
 
   refresh() {
-    if (this[kRefed])
-      active(this);
-    else
-      unrefActive(this);
+    // active() or unrefActive(), by the timer's current state.
+    insertGuarded(this, this[kRefed]);
 
     return this;
   }
@@ -372,16 +370,18 @@ function insertGuarded(item, refed) {
     initAsyncResource(item, 'Timeout');
   }
 
+  const wasRefed = item[kRefed];
   if (isDestroyed) {
     if (refed)
       incRefCount();
-  } else if (refed === !item[kRefed]) {
+  } else if (refed === !wasRefed) {
     if (refed)
       incRefCount();
     else
       decRefCount();
   }
-  item[kRefed] = refed;
+  if (wasRefed !== refed)
+    item[kRefed] = refed;
 }
 
 function insert(item, msecs, start = binding.getLibuvNow()) {
@@ -403,7 +403,10 @@ function insert(item, msecs, start = binding.getLibuvNow()) {
     }
   }
 
-  L.append(list, item);
+  // Already the newest of this list (a refresh of the latest timer): appending
+  // again would unlink and relink it in the same place.
+  if (list._idleNext !== item)
+    L.append(list, item);
 }
 
 function setUnrefTimeout(callback, after) {
