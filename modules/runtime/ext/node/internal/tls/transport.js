@@ -38,7 +38,9 @@ class TLSTransport {
     });
     // A peer that closes without close_notify still ends the stream, as in Node.
     carrier.on('end', () => { if (!this.closing) this.end(); });
-    if (owned) carrier.on('error', err => { if (!this.closing) this.socket.destroy(err); });
+    // An owned carrier is TLSWrap's stream: its write errors once the TLS socket is destroyed
+    // or shutting down (EPIPE on the close_notify) reach nothing, as in afterShutdown.
+    if (owned) carrier.on('error', err => { if (!this.closing && !this.socket.destroyed && !this.shutdownInFlight) this.socket.destroy(err); });
     carrier.once('close', () => this.finish());
     const start = () => {
       if (this.closing || this.started) return;

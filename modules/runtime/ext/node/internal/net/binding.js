@@ -222,14 +222,21 @@ class StreamHandle {
     let failure = 0;
     let sync = true;
     const wrap = req ?? new WriteWrap();
+    let completed = false;
+    const complete = status => {
+      if (completed) return;
+      completed = true;
+      this._pendingWrites?.delete(complete);
+      this.writeQueueSize -= bytes;
+      if (typeof wrap.oncomplete === 'function') wrap.oncomplete(status);
+      else wrap.writeStatus = status;
+    };
     const done = error => {
       failure ||= statusOf(error);
       if (--pending !== 0) return;
-      if (sync) return;
-      this.writeQueueSize -= bytes;
-      if (!this._transport) return;
-      if (typeof wrap.oncomplete === 'function') wrap.oncomplete(failure);
-      else wrap.writeStatus = failure;
+      if (sync || completed) return;
+      if (!this._transport) { completed = true; this._pendingWrites?.delete(complete); return; }
+      complete(failure);
     };
     for (let i = 0; i < target.length; i++) {
       const chunk = target[i];
@@ -244,6 +251,7 @@ class StreamHandle {
     }
     streamBaseState[kLastWriteWasAsync] = 1;
     this.writeQueueSize += bytes;
+    this._pendingWrites?.add(complete);
     if (failure !== 0) streamBaseState[kLastWriteErr] = failure;
     wrap.async = true;
     return req ? 0 : wrap;
@@ -528,6 +536,18 @@ function fillContext(ctx, status, syscall) {
 // A handle for a transport that is not a native socket (the TLS transport): addresses and
 // socket options come from what the transport reports, such as its carrier socket.
 class JSTransportHandle extends StreamHandle {
+  constructor(transport) {
+    super(transport);
+    this._pendingWrites = new Set();
+  }
+  // TLSWrap cancels its queued writes as it closes (InvokeQueued(UV_ECANCELED)), before
+  // the close or any error of its owner surfaces.
+  close(callback) {
+    if (this._closeCallback === null && this._pendingWrites.size) {
+      for (const complete of [...this._pendingWrites]) complete(uv.UV_ECANCELED);
+    }
+    super.close(callback);
+  }
   _address(out, peer) {
     const result = this._transport?.address?.(peer);
     if (typeof result === 'number') return result;
