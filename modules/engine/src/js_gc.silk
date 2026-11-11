@@ -1267,12 +1267,26 @@ pub unsafe fn drainZero<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader) -
 unsafe fn drainZeroFrom<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, first: ?*mut HeapHeader) -> () {
   unsafe setPhase(runtime, GcPhase.Decrement)
   let mut stacked = first
+  // Dead objects destroyed so far. A drain that reaches RELEASE_DEFER_AFTER
+  // times its last RELEASE_PROBE objects: slow ones are stalling on cells that
+  // left the cache, and the rest of the drain defers its releases
+  // (drainDeferred); garbage still in cache (most of it) drains as it is.
+  let mut drained: usize = 0
+  let mut probeStart: usize = 0
   while true {
     match Pointer.nonNullMut<HeapHeader>(stacked) {
       Option<*mut HeapHeader>.Some { value } => {
         require(unsafe count(value) == 0)
         if unsafe kind(value) == HeapKind.Object {
-          if !unsafe closureClass(value) || !unsafe parkClosure(&mut hooks, runtime, value) { unsafe destroyObject(&mut hooks, runtime, value, true) }
+          if !unsafe closureClass(value) || !unsafe parkClosure(&mut hooks, runtime, value) {
+            unsafe destroyObject(&mut hooks, runtime, value, true, false, Pointer.null<ReleaseRing>())
+            drained = drained + 1
+            if drained == RELEASE_DEFER_AFTER - RELEASE_PROBE { probeStart = unsafe memory.ticks() }
+            else if drained == RELEASE_DEFER_AFTER {
+              let elapsed = usize.wrappingSubtract(unsafe memory.ticks(), probeStart)
+              if elapsed * 1000 > unsafe memory.ticksPerMicrosecond() * RELEASE_COLD_NANOSECONDS { unsafe drainDeferred(&mut hooks, runtime) }
+            }
+          }
         }
         else { unsafe destroyGc(&mut hooks, runtime, value) }
       }
@@ -1292,6 +1306,32 @@ unsafe fn drainZeroFrom<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, f
     stacked = unsafe popZeroStack(runtime)
   }
   unsafe setPhase(runtime, GcPhase.None)
+}
+/// drainZeroFrom's loop over the zero stack for a long drain, with the dying
+/// objects' releases deferred through a ReleaseRing. Out of line, so the short
+/// drains that are most of them (a temporary and its children) keep their lean
+/// loop. Returns with the ring empty: when the stack and the ring are both
+/// empty, or when the ring shows a chain (see RELEASE_WIDE), where deferring
+/// only costs; drainZeroFrom then goes on undeferred.
+@inlineNever
+unsafe fn drainDeferred<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader) -> () {
+  let mut ring = ReleaseRing { cells: [ValueBits.Undefined; RELEASE_RING], at: 0 }
+  while true {
+    match Pointer.nonNullMut<HeapHeader>(unsafe popZeroStack(runtime)) {
+      Option<*mut HeapHeader>.Some { value } => {
+        require(unsafe count(value) == 0)
+        if unsafe kind(value) == HeapKind.Object {
+          if !unsafe closureClass(value) || !unsafe parkClosure(&mut hooks, runtime, value) {
+            unsafe destroyObject(&mut hooks, runtime, value, true, true, Pointer.fromMutRef<ReleaseRing>(&mut ring))
+          }
+        }
+        else { unsafe destroyGc(&mut hooks, runtime, value) }
+      }
+      Option<*mut HeapHeader>.None => {
+        if unsafe flushRing(&mut hooks, runtime, &mut ring) < RELEASE_WIDE { return () }
+      }
+    }
+  }
 }
 
 /// RuntimeState.spareClosures entries: SPARE_CLOSURE_WAYS per set, so a few
@@ -2402,6 +2442,74 @@ unsafe fn finishFastArray<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader,
   }
   return true
 }
+/// Entries in a ReleaseRing: how many releases a deferred one waits.
+const RELEASE_RING: usize = 16
+/// The dead objects one drainZero frees before it may defer its releases: short
+/// drains (a temporary and its children, still in cache) stay undeferred.
+const RELEASE_DEFER_AFTER: usize = 16
+/// The last objects before RELEASE_DEFER_AFTER, which drainZero times.
+const RELEASE_PROBE: usize = 8
+/// The time RELEASE_PROBE objects take when their cells have left the cache
+/// (about 100 ns each on Splay's dead trees) is several times what they take
+/// in cache (about 15 ns each); slower than this defers.
+const RELEASE_COLD_NANOSECONDS: usize = 300
+/// The fewest waiting values, when the zero stack runs empty, of a drain wide
+/// enough to keep deferring.
+const RELEASE_WIDE: usize = 3
+/// drainZero's delayed releases. A long drain frees cells that left the cache
+/// long ago (a dropped tree), and each release's first read of its child's
+/// header would stall on that miss. Deferred, the child's lines are requested
+/// at once and its count is read RELEASE_RING releases later, so the misses of
+/// that many children overlap. Each heap value in cells owns the reference it
+/// will release; the other entries are Undefined. at is the oldest entry.
+struct ReleaseRing { cells: [ValueBits; RELEASE_RING], at: usize }
+/// releaseDraining through the ring: value's cell lines start loading now, and
+/// the oldest waiting value is released in its place.
+@inlineAlways
+unsafe fn deferRelease<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, waiting: ?*mut ReleaseRing, value: ValueBits) -> () {
+  if value.tag() >= 0 { return () }
+  match ValueBits.heapReference(&value) {
+    Option<*mut HeapHeader>.Some { value: reference } => {
+      unsafe prefetchCell(reference)
+      // An array literal's values follow its slots, in the cell's later lines.
+      if value.isObject() {
+        let address = Pointer.address<HeapHeader>(reference)
+        unsafe memory.prefetch(address + 128)
+        unsafe memory.prefetch(address + 192)
+        unsafe memory.prefetch(address + 256)
+      }
+    }
+    Option<*mut HeapHeader>.None => ()
+  }
+  let mut ringAnchor = ()
+  let ring = unsafe Pointer.borrowMut<(), ReleaseRing>(&mut ringAnchor, unsafe Intrinsic.pointerRequalify<?*mut ReleaseRing, *mut ReleaseRing>(waiting))
+  let at = ring.at
+  let due = ring.cells[at]
+  ring.cells[at] = value
+  ring.at = (at + 1) & (RELEASE_RING - 1)
+  drop ring
+  unsafe releaseDraining(&mut hooks, runtime, due)
+}
+/// Releases every waiting value of ring, oldest first, leaving it empty, and
+/// returns how many there were. The releases may stack more dead objects,
+/// whose children may use ring again.
+@inlineNever
+unsafe fn flushRing<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, ring: &mut ReleaseRing) -> usize {
+  let mut left = RELEASE_RING
+  let mut at = ring.at
+  let mut found: usize = 0
+  while left != 0 {
+    let due = ring.cells[at]
+    if due.tag() < 0 {
+      ring.cells[at] = ValueBits.Undefined
+      found = found + 1
+      unsafe releaseDraining(&mut hooks, runtime, due)
+    }
+    at = (at + 1) & (RELEASE_RING - 1)
+    left = left - 1
+  }
+  return found
+}
 /// release during drainZero (phase Decrement): an object's last reference,
 /// with the object still in gcObjects (mark 0), pushes it on the zero stack
 /// here, as enqueueZero would, without releaseHeap's out-of-line calls.
@@ -2441,14 +2549,17 @@ unsafe fn releaseRecordedRealm<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHe
 /// destroyObject for a node in a GC list (cycle removal), out of line.
 @inlineNever
 unsafe fn destroyUnlinked<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node: *mut HeapHeader) -> () {
-  unsafe destroyObject(&mut hooks, runtime, node, false)
+  unsafe destroyObject(&mut hooks, runtime, node, false, false, Pointer.null<ReleaseRing>())
 }
+/// deferred (drainDeferred only): the children wait in ring before they are
+/// released; ring is null otherwise.
 /// linked: node comes from drainZero's stack (phase Decrement), so its dying
 /// children go straight onto the zero stack; otherwise it is cycle garbage.
 // Inlined: drainZero's loop runs it for nearly every dying object, and the
 // call's frame setup and spills were ~15% of its instructions.
 @inlineAlways
-unsafe fn destroyObject<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node: *mut HeapHeader, linked: bool) -> () {
+unsafe fn destroyObject<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, node: *mut HeapHeader, linked: bool,
+  deferred: bool, ring: ?*mut ReleaseRing) -> () {
   let mut anchor = ()
   let object = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut anchor, node)
   require(!object.freeMark())
@@ -2483,7 +2594,8 @@ unsafe fn destroyObject<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, n
       Option<*mut HeapHeader>.Some { value } => { unsafe memory.prefetch(Pointer.address<HeapHeader>(value)) }
       Option<*mut HeapHeader>.None => ()
     }
-    if linked { unsafe releaseDraining(&mut hooks, runtime, car) unsafe releaseDraining(&mut hooks, runtime, cdr) }
+    if deferred { unsafe deferRelease(&mut hooks, runtime, ring, car) unsafe deferRelease(&mut hooks, runtime, ring, cdr) }
+    else if linked { unsafe releaseDraining(&mut hooks, runtime, car) unsafe releaseDraining(&mut hooks, runtime, cdr) }
     else { unsafe release(&mut hooks, runtime, car) unsafe release(&mut hooks, runtime, cdr) }
     index = 2
   } else if plain {
@@ -2501,7 +2613,8 @@ unsafe fn destroyObject<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, n
     drop values
     while index < slotCount {
       let slot = unsafe properties.getUnchecked(index)
-      if linked { unsafe releaseDraining(&mut hooks, runtime, slot.valueBits()) }
+      if deferred { unsafe deferRelease(&mut hooks, runtime, ring, slot.valueBits()) }
+      else if linked { unsafe releaseDraining(&mut hooks, runtime, slot.valueBits()) }
       else { unsafe release(&mut hooks, runtime, slot.valueBits()) }
       index = index + 1
     }
@@ -2515,7 +2628,8 @@ unsafe fn destroyObject<H: HeapHooks>(hooks: &mut H, runtime: *mut HeapHeader, n
     if kind == 0 {
       // From drainZero (phase Decrement), a child object's last reference
       // goes straight onto the zero stack.
-      if linked { unsafe releaseDraining(&mut hooks, runtime, slot.valueBits()) }
+      if deferred { unsafe deferRelease(&mut hooks, runtime, ring, slot.valueBits()) }
+      else if linked { unsafe releaseDraining(&mut hooks, runtime, slot.valueBits()) }
       else { unsafe release(&mut hooks, runtime, slot.valueBits()) }
     }
     // A lazy slot (a function's prototype, most often) owns only its realm,
