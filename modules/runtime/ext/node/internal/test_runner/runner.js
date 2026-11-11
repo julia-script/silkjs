@@ -1,6 +1,6 @@
 'use strict';
 
-const { createHarness, withHarness, TestsStream, failure, unsupported, seededGenerator, createRandomSeed } = require('internal/test_runner/harness');
+const { createHarness, withHarness, TestsStream, failure, unsupported, seededGenerator, createRandomSeed, loadGlobalHooks, reportSetupFailure } = require('internal/test_runner/harness');
 const { validateBoolean } = require('internal/path_events/support');
 const path = require('path');
 const fs = require('fs');
@@ -9,7 +9,7 @@ const nativeSetImmediate = globalThis.setImmediate;
 const nativeSetTimeout = globalThis.setTimeout;
 const nativeClearTimeout = globalThis.clearTimeout;
 const now = Date.now.bind(Date);
-const supported = new Set(['randomize', 'randomSeed', 'testTagFilters', 'files', 'cwd', 'concurrency', 'timeout', 'signal', 'isolation', 'setup', 'only', 'testNamePatterns', 'testSkipPatterns', 'shard', 'execArgv', 'argv', 'env', 'coverage', 'coverageIncludeGlobs', 'coverageExcludeGlobs', 'lineCoverage', 'branchCoverage', 'functionCoverage']);
+const supported = new Set(['globalSetupPath', 'randomize', 'randomSeed', 'testTagFilters', 'files', 'cwd', 'concurrency', 'timeout', 'signal', 'isolation', 'setup', 'only', 'testNamePatterns', 'testSkipPatterns', 'shard', 'execArgv', 'argv', 'env', 'coverage', 'coverageIncludeGlobs', 'coverageExcludeGlobs', 'lineCoverage', 'branchCoverage', 'functionCoverage']);
 function invalid(message) { return Object.assign(new TypeError(message), { code: 'ERR_INVALID_ARG_VALUE' }); }
 function discover(directory, files = [], inTest = false) {
   for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
@@ -25,6 +25,7 @@ function validate(options) {
   for (const key of Object.keys(options)) if (!supported.has(key) && options[key] !== undefined) unsupported(`run option ${key}`);
   if (options.files !== undefined && (!Array.isArray(options.files) || options.files.some(file => typeof file !== 'string'))) throw invalid('files must be an array of paths');
   if (options.isolation !== undefined && !['process', 'none'].includes(options.isolation)) throw invalid('isolation must be process or none');
+  if (options.globalSetupPath != null && typeof options.globalSetupPath !== 'string') throw new (require('internal/path_events/support').codes.ERR_INVALID_ARG_TYPE)('options.globalSetupPath', 'string', options.globalSetupPath);
   if (options.setup !== undefined && typeof options.setup !== 'function') throw invalid('setup must be a function');
   if (options.signal !== undefined && typeof options.signal?.addEventListener !== 'function') throw invalid('signal must be an AbortSignal');
   if (options.concurrency !== undefined && typeof options.concurrency !== 'boolean' && (!Number.isInteger(options.concurrency) || options.concurrency < 1)) throw invalid('Invalid concurrency');
@@ -77,8 +78,26 @@ function run(options = {}) {
       const names = new Map(files.map((file, index) => [file, options.files ? options.files[index] : path.relative(cwd, file)]));
       if (options.shard) files = files.filter((_, index) => index % options.shard.total === options.shard.index - 1);
       await options.setup?.(stream);
-      if (options.isolation === 'none') await runLocal(files, options, stream, cwd);
-      else await runProcesses(files, options, stream, cwd, names);
+      let teardown;
+      if (options.globalSetupPath) {
+        const hooks = await loadGlobalHooks(options.globalSetupPath, cwd);
+        try { await hooks.setup?.(); }
+        catch (error) {
+          reportSetupFailure(error);
+          stream.publish('test:plan', { nesting: 0, count: 0 });
+          stream.publish('test:summary', { nesting: 0, success: false, counts: { tests: 0, suites: 0, passed: 0, failed: 0, cancelled: 0, skipped: 0, todo: 0, topLevel: 0 }, duration_ms: 0 });
+          stream.push(null);
+          return;
+        }
+        teardown = hooks.teardown;
+      }
+      const local = { ...options, globalSetupPath: undefined };
+      try {
+        if (options.isolation === 'none') await runLocal(files, local, stream, cwd);
+        else await runProcesses(files, local, stream, cwd, names);
+      } finally {
+        if (teardown) { try { await teardown(); } catch (error) { reportSetupFailure(error); } }
+      }
     } catch (error) { stream.destroy(error); }
   });
   return stream;

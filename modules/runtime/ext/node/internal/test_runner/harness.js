@@ -97,6 +97,21 @@ function settleExpectedFailure(node) {
   }
   node.error = undefined;
 }
+// --test-global-setup / options.globalSetupPath: a module exporting globalSetup and
+// globalTeardown, run once around the whole run.
+async function loadGlobalHooks(globalSetupPath, cwd) {
+  validateString(globalSetupPath, 'options.globalSetupPath');
+  const { pathToFileURL } = require('url');
+  const loaded = await import(pathToFileURL(require('path').resolve(cwd, globalSetupPath)).href);
+  const hooks = {};
+  if (loaded.globalSetup) { validateFunction(loaded.globalSetup, 'globalSetupModule.globalSetup'); hooks.setup = loaded.globalSetup; }
+  if (loaded.globalTeardown) { validateFunction(loaded.globalTeardown, 'globalSetupModule.globalTeardown'); hooks.teardown = loaded.globalTeardown; }
+  return hooks;
+}
+function reportSetupFailure(error) {
+  process.exitCode = 1;
+  process.stderr.write(`${error?.stack ?? error}\n`);
+}
 function createRandomSeed() { return Math.floor(Math.random() * 0x1_0000_0000); }
 // Mulberry32, as Node's test runner uses for --test-randomize.
 function seededGenerator(seed) {
@@ -568,6 +583,12 @@ class Harness {
     const onAbort = () => this.root.cancel(failure('test run aborted', 'testAborted', signal.reason));
     if (signal?.aborted) onAbort(); else signal?.addEventListener('abort', onAbort, { once: true });
     try {
+      if (this.options.globalSetupPath) {
+        const hooks = await loadGlobalHooks(this.options.globalSetupPath, process.cwd());
+        try { await hooks.setup?.(); }
+        catch (error) { reportSetupFailure(error); throw error; }
+        this.globalTeardown = hooks.teardown;
+      }
       await this.hooks(this.root, 'before');
       this.pump(this.root);
       // Definitions may append root tests while asynchronous suites are collecting.
@@ -586,6 +607,11 @@ class Harness {
       await Promise.all(this.root.children.map(child => child.done.promise));
     } finally {
       await this.hooks(this.root, 'after', this.root, true);
+      if (this.globalTeardown) {
+        const teardown = this.globalTeardown; this.globalTeardown = undefined;
+        try { await teardown(); }
+        catch (error) { reportSetupFailure(error); }
+      }
       try { this.snapshots?.writeFiles(); }
       catch (error) {
         this.root.error ||= failure(String(error?.message ?? error), 'testCodeFailure', error);
@@ -626,11 +652,14 @@ function getHarness() {
     const cli = host.testCoverageOptions || {};
     defaultHarness = createHarness({ waitForIdle: true, file: process.argv[1], collectCoverage, only: cli.only,
       timeout: cli.timeout, testNamePatterns: cli.testNamePatterns, testSkipPatterns: cli.testSkipPatterns, testTagFilters: cli.testTagFilters,
-      randomize: cli.randomize, randomSeed: cli.randomSeed });
+      randomize: cli.randomize, randomSeed: cli.randomSeed, globalSetupPath: cli.globalSetupPath });
     if (process.env.NODE_TEST_CONTEXT === 'child-v8' && typeof process.send === 'function') reportToParent(defaultHarness.stream);
     else {
-      const { tap } = require('test/reporters');
-      Readable.from(tap(defaultHarness.stream)).pipe(process.stdout, { end: false });
+      const reporters = host.testReporters || { names: [], destinations: [] };
+      const fail = error => { console.error(error); process.exitCode = 1; };
+      const written = require('internal/main/test_runner').attachReporters(defaultHarness.stream, reporters.names,
+        reporters.destinations, process.stdout.isTTY ? 'spec' : 'tap', fail);
+      if (cli.forceExit) written.then(() => process.exit());
     }
     nativeSetImmediate(() => { defaultHarness.start(); });
   }
@@ -672,7 +701,7 @@ for (const fn of [test, suite]) for (const modifier of ['skip', 'todo', 'only'])
   const spec = parse(args); spec.options = { ...spec.options, [modifier]: true };
   return define(fn === test ? 'test' : 'suite', [spec.name, spec.options, spec.fn]);
 };
-const exportsObject = { tagFilter, seededGenerator, createRandomSeed, test, suite, createHarness, configure, getTestContext: () => context.getStore()?.ctx,
+const exportsObject = { loadGlobalHooks, reportSetupFailure, tagFilter, seededGenerator, createRandomSeed, test, suite, createHarness, configure, getTestContext: () => context.getStore()?.ctx,
   withHarness: (harness, fn) => context.run(harness.root, fn), failure, unsupported, TestsStream,
   registerAssertion(name, fn) { validateString(name, 'name'); validateFunction(fn, 'fn'); assertions.set(name, fn); } };
 for (const type of ['before', 'after', 'beforeEach', 'afterEach']) exportsObject[type] = (fn, options) => {
