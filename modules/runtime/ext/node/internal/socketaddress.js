@@ -9,9 +9,8 @@ const kHandle = Symbol('kHandle');
 const kClone = Symbol('kClone');
 const kDeserialize = Symbol('kDeserialize');
 
-const {
-  codes: { ERR_INVALID_ARG_VALUE }, makeError, validateObject, validateString, validatePort, validateInteger,
-} = require('internal/errors');
+const { codes: { ERR_INVALID_ARG_VALUE }, validateObject, validateString, validateInteger } = require('internal/validators');
+const { makeError, validatePort } = require('internal/net/errors');
 
 // --- inet_pton / inet_ntop ---------------------------------------------------
 

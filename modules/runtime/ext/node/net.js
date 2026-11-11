@@ -8,8 +8,8 @@ const { Transport, error: nativeError, native } = require('internal/net/transpor
 let defaultAutoSelectFamily = true;
 let defaultAutoSelectFamilyAttemptTimeout = 250;
 
-const { codes: { ERR_INVALID_ADDRESS_FAMILY, ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_INVALID_IP_ADDRESS, ERR_IP_BLOCKED, ERR_MISSING_ARGS, ERR_OUT_OF_RANGE }, makeError,
-  ExceptionWithHostPort, validateBoolean, validateFunction, validateInt32, validateNumber, validatePort, validateString } = require('internal/errors');
+const { codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE, ERR_OUT_OF_RANGE }, validateBoolean, validateFunction, validateInt32, validateNumber, validateString } = require('internal/validators');
+const { codes: { ERR_INVALID_ADDRESS_FAMILY, ERR_INVALID_IP_ADDRESS, ERR_IP_BLOCKED, ERR_MISSING_ARGS }, makeError, ExceptionWithHostPort, validatePort } = require('internal/net/errors');
 
 function fail(code, message, Type = Error) { return makeError(Type, code, message); }
 function integer(value, name, min, max) {
@@ -427,10 +427,11 @@ Socket.prototype.connect = function(...args) {
         for (const record of answers) this.emit('lookup', null, record?.address, record?.family, host);
         if (this.destroyed) return;
         // Node keeps the IPv4 and IPv6 answers, and fails on the first answer when none is valid.
-        const records = answers.filter(record => record && isIP(record.address) && (record.family === 4 || record.family === 6));
+        const valid = address => typeof address === 'string' && isIP(address) !== 0;
+        const records = answers.filter(record => record && valid(record.address) && (record.family === 4 || record.family === 6));
         if (records.length === 0) {
           const first = answers[0];
-          this.destroy(!isIP(first.address) ? new ERR_INVALID_IP_ADDRESS(first.address)
+          this.destroy(!valid(first.address) ? new ERR_INVALID_IP_ADDRESS(first.address)
             : new ERR_INVALID_ADDRESS_FAMILY(first.family, options.host, options.port));
           return;
         }

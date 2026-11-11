@@ -14,9 +14,7 @@ const {
   parseAddress,
   formatAddress,
 } = require('internal/socketaddress');
-const {
-  codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE }, validateArray, validateInteger, validateString,
-} = require('internal/errors');
+const { codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE }, validateArray, validateInteger, validateString } = require('internal/validators');
 
 const kHandle = Symbol('kHandle');
 

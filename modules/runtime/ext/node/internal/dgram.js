@@ -7,7 +7,8 @@
 const host = require('internal/host');
 const { AsyncResource } = require('async_hooks');
 const { Buffer } = require('buffer');
-const { codes: { ERR_SOCKET_BAD_TYPE }, validateFunction } = require('internal/errors');
+const { validateFunction } = require('internal/validators');
+const { codes: { ERR_SOCKET_BAD_TYPE } } = require('internal/net/errors');
 
 const kStateSymbol = Symbol('state symbol');
 const isIP = input => typeof input === 'string' ? host.net('isIP', [input]) : 0;
@@ -35,7 +36,7 @@ class UDP {
     this.id = host.net('create', [family === 4 ? 3 : 4, this.callback]);
     if (this.id < 0) {
       this.resource.emitDestroy();
-      throw require('internal/errors').ErrnoException(this.id, 'socket');
+      throw require('internal/net/errors').ErrnoException(this.id, 'socket');
     }
   }
   dispatch(event, status, payload, extra) {

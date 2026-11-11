@@ -20,8 +20,8 @@ function native(op, args) {
   try { return host.net(op, args); }
   catch (e) { resource.emitDestroy(); throw e; }
 }
-const { codes: { ERR_INVALID_ARG_VALUE, ERR_INVALID_IP_ADDRESS }, makeError, validateArray, validateFunction, validateInt32,
-  validateNumber, validatePort, validateString, validateUint32 } = require('internal/errors');
+const { codes: { ERR_INVALID_ARG_VALUE }, validateArray, validateFunction, validateInt32, validateNumber, validateString, validateUint32 } = require('internal/validators');
+const { codes: { ERR_INVALID_IP_ADDRESS }, makeError, validatePort } = require('internal/net/errors');
 function validateStringWithoutNullBytes(value, name) {
   validateString(value, name);
   if (value.includes('\0')) throw new ERR_INVALID_ARG_VALUE(name, value, 'must be a string without null bytes');

@@ -25,30 +25,8 @@
 
 'use strict';
 
-const {
-  ErrnoException,
-  ExceptionWithHostPort,
-  codes: {
-    ERR_BUFFER_OUT_OF_BOUNDS,
-    ERR_INVALID_ARG_TYPE,
-    ERR_INVALID_ARG_VALUE,
-    ERR_INVALID_FD_TYPE,
-    ERR_IP_BLOCKED,
-    ERR_MISSING_ARGS,
-    ERR_SOCKET_ALREADY_BOUND,
-    ERR_SOCKET_BAD_BUFFER_SIZE,
-    ERR_SOCKET_DGRAM_IS_CONNECTED,
-    ERR_SOCKET_DGRAM_NOT_CONNECTED,
-    ERR_SOCKET_DGRAM_NOT_RUNNING,
-  },
-  makeError,
-  validateAbortSignal,
-  validateObject,
-  validateString,
-  validateNumber,
-  validatePort,
-  validateUint32,
-} = require('internal/errors');
+const { codes: { ERR_INVALID_ARG_TYPE, ERR_INVALID_ARG_VALUE }, validateAbortSignal, validateObject, validateString, validateNumber, validateUint32 } = require('internal/validators');
+const { codes: { ERR_BUFFER_OUT_OF_BOUNDS, ERR_INVALID_FD_TYPE, ERR_IP_BLOCKED, ERR_MISSING_ARGS, ERR_SOCKET_ALREADY_BOUND, ERR_SOCKET_BAD_BUFFER_SIZE, ERR_SOCKET_DGRAM_IS_CONNECTED, ERR_SOCKET_DGRAM_NOT_CONNECTED, ERR_SOCKET_DGRAM_NOT_RUNNING }, ErrnoException, ExceptionWithHostPort, makeError, validatePort } = require('internal/net/errors');
 const { kStateSymbol, newHandle, UV_UDP_IPV6ONLY, UV_UDP_REUSEADDR, UV_UDP_REUSEPORT } = require('internal/dgram');
 const { native } = require('internal/net/transport');
 const { Buffer } = require('buffer');
