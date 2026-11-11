@@ -548,7 +548,7 @@ pub effect fn quickExec<'a, H: HeapHooks + CoercionHooks + OwnPropertyHooks + Pr
   }
   // The receiver keeps code alive: nothing below can replace its bytecode.
   let mut captures = Captures.empty()
-  let quick = run answer(&mut hooks, memory, realm, code, input, lastIndex, test, &mut captures)
+  let quick = run answer(&mut hooks, memory, realm, code, input, lastIndex, test, ValueBits.Undefined, &mut captures)
   if updatesIndex {
     if let Option<ValueBits>.Some { value } = quick {
       let matched = match value {
@@ -564,8 +564,11 @@ pub effect fn quickExec<'a, H: HeapHooks + CoercionHooks + OwnPropertyHooks + Pr
 /// quickExec for a RegExp literal the VM never materialized (`/re/.exec(s)` with
 /// the builtin exec or test): the same answer from lastIndex 0, which no script
 /// can observe or write. code is the literal's bytecode, kept alive by the caller.
+/// previous is the value the store right after the call overwrites (or
+/// Undefined): a dying result there takes this match (refillResult).
 pub effect fn literalExec<'a, H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + InterruptHooks>(
-  hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, code: ValueBits, input: ValueBits, test: bool) -> Option<ValueBits>
+  hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, code: ValueBits, input: ValueBits, test: bool,
+  previous: ValueBits) -> Option<ValueBits>
   ? &mut Allocator {
   if input.tag() != -7 { return Option<ValueBits>.none() }
   let anchor = ()
@@ -574,14 +577,14 @@ pub effect fn literalExec<'a, H: HeapHooks + CoercionHooks + OwnPropertyHooks + 
   drop flat
   if !test && (flags & (FLAG_NAMED_GROUPS | FLAG_INDICES)) != 0 { return Option<ValueBits>.none() }
   let mut captures = Captures.empty()
-  return run answer(&mut hooks, memory, realm, code, input, 0, test, &mut captures)
+  return run answer(&mut hooks, memory, realm, code, input, 0, test, previous, &mut captures)
 }
 /// The match and its answer for quickExec and literalExec: Null (false for test)
 /// without a match, else the result array (true); none on a failure.
 @inlineAlways
 effect fn answer<'a, H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyWriteHooks + InterruptHooks>(
   hooks: &mut H, memory: &AllocationObserver, realm: Realm<'a>, code: ValueBits, input: ValueBits, lastIndex: usize,
-  test: bool, captures: &mut Captures) -> Option<ValueBits> ? &mut Allocator {
+  test: bool, previous: ValueBits, captures: &mut Captures) -> Option<ValueBits> ? &mut Allocator {
   let anchor = ()
   let codeFlat = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(code))
   let text = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(input))
@@ -599,6 +602,9 @@ effect fn answer<'a, H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyW
   }
   // test (with exec the builtin, see the VM's caller) needs no result array.
   if test { return Option<ValueBits>.some(ValueBits.Bool { value: true }) }
+  if previous.isObject() && run unsafe refillResult(&mut hooks, realm, previous, input, code, &captures) {
+    return Option<ValueBits>.some(unsafe previous.retained())
+  }
   let mut state = ResultState { object: ValueBits.Undefined, groups: ValueBits.Undefined,
     indices: ValueBits.Undefined, indicesGroups: ValueBits.Undefined, temporary: ValueBits.Undefined, groupName: 0 }
   let built = run Effect.result(buildResult(&mut hooks, memory, realm, unsafe lendFor(input), unsafe lendFor(code), &captures, &mut state))
@@ -608,6 +614,137 @@ effect fn answer<'a, H: HeapHooks + CoercionHooks + OwnPropertyHooks + PropertyW
     Result<ValueBits, OutOfMemoryError | StringLengthError | JsException>.Success { value } => Option<ValueBits>.some(value)
     Result<ValueBits, OutOfMemoryError | StringLengthError | JsException>.Failure { .. } => Option<ValueBits>.none()
   }
+}
+/// The most captures of a result refillResult reuses.
+const REFILL_MAX: usize = 8
+/// `r = /re/.exec(s)` where r holds an exec result that only r references: the
+/// store after the call frees it, so it takes this match in place of a fresh
+/// array, which no script can tell apart. previous must be that: strong count
+/// 1, no weak references, an extensible fast array of exactly this pattern's
+/// capture count over the untouched result shape (so index, input and groups
+/// are still plain slots), from a pattern with neither named groups nor the d
+/// flag. A piece whose text is already there stays. Every new piece is made
+/// before anything is written, so false leaves previous as it was.
+unsafe effect fn refillResult<'a, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>, previous: ValueBits, input: ValueBits,
+  code: ValueBits, captures: &Captures) -> bool ? &mut Allocator {
+  let anchor = ()
+  let reference = core.reference(previous)
+  let header = unsafe Pointer.borrow<(), HeapHeader>(&anchor, reference)
+  if header.referenceCount != 1 { return false }
+  drop header
+  let flat = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(code))
+  let flags = u16.toU32(readU16(flat.latin1.asSlice(), 0))
+  let count = u8.toUsize(flat.latin1.asSlice()[2])
+  drop flat
+  if (flags & (FLAG_NAMED_GROUPS | FLAG_INDICES)) != 0 || count > REFILL_MAX { return false }
+  let ctx = realm.state(&anchor)
+  let resultShape = Pointer.address<HeapHeader>(unsafe Intrinsic.pointerRequalify<?*mut HeapHeader, *mut HeapHeader>(ctx.regexpResultShape))
+  drop ctx
+  let object = unsafe HeapCell.payload<ObjectData, ()>(&anchor, reference)
+  if object.weakRefCount != 0 || !object.extensible() || !object.fastArray()
+    || Pointer.address<HeapHeader>(object.shape) != resultShape || object.slotCount() != 4 { return false }
+  match object.slot(0).valueBits() {
+    ValueBits.Int { value } => { if value != usize.toI32(count) { return false } }
+    _ => { return false }
+  }
+  let length = match &object.payload { ObjectPayload.FastArray { array } => array.values.length() _ => { return false } }
+  if length != count { return false }
+  let inputFlat = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(input))
+  let narrow = !inputFlat.wide
+  drop inputFlat
+  let empty: [u8; 1] = [0]
+  let mut bytes = Slice.view(&empty, 0, 0)
+  if narrow { bytes = unsafe latin1Bytes(&anchor, stringReference(input)) }
+  let inputLength = Strings.length(input)
+  // Per capture: the new piece, or Uninitialized where the old one stays.
+  let mut pieces = [ValueBits.Uninitialized; 8]
+  let mut i: usize = 0
+  while i < count {
+    let start = captures.get(i * 2)
+    let end = captures.get(i * 2 + 1)
+    let old = match &object.payload { ObjectPayload.FastArray { array } => array.values.get(i) _ => ValueBits.Undefined }
+    if start < 0 || end < 0 {
+      match old { ValueBits.Undefined => () _ => { pieces[i] = ValueBits.Undefined } }
+    } else if !(narrow && sameLatin1(old, Slice.view(bytes, i32.toUsize(start), i32.toUsize(end - start))))
+      && !(!narrow && sameWide(old, input, i32.toUsize(start), i32.toUsize(end - start))) {
+      let made = run Intrinsic.catchFailure<OutOfMemoryError | StringLengthError>(
+        capturePiece(realm, unsafe lendFor(input), bytes, narrow, inputLength, start, end), failedCapture)
+      match move made {
+        ValueBits piece => { pieces[i] = piece }
+        FailedCapture { error } => {
+          drop error
+          let mut made: usize = 0
+          while made < i { unsafe releasePiece(&mut hooks, realm, pieces[made]) made = made + 1 }
+          return false
+        }
+      }
+    }
+    i = i + 1
+  }
+  drop object
+  // Commit: nothing allocates or fails from here on. The values written over
+  // trade places with their pieces and are released last, when the array is
+  // whole again.
+  let mut writeAnchor = ()
+  let target = unsafe HeapCell.payloadMut<ObjectData, ()>(&mut writeAnchor, reference)
+  match &mut target.payload {
+    ObjectPayload.FastArray { array } => {
+      i = 0
+      while i < count {
+        match pieces[i] {
+          ValueBits.Uninitialized => ()
+          _ => { let old = array.values.get(i) array.values.set(i, pieces[i]) pieces[i] = old }
+        }
+        i = i + 1
+      }
+    }
+    _ => { Intrinsic.trap("QuickJS invariant violated") }
+  }
+  let oldIndex = target.slot(1).valueBits()
+  target.setSlot(1, SlotBits.value(ValueBits.Int { value: captures.get(0) }))
+  let mut oldInput = target.slot(2).valueBits()
+  let sameInput = match oldInput {
+    ValueBits.String { reference: held } => Pointer.address<HeapHeader>(held) == Pointer.address<HeapHeader>(stringReference(input))
+    _ => false
+  }
+  if sameInput { oldInput = ValueBits.Undefined } else { target.setSlot(2, SlotBits.value(Strings.duplicate(input))) }
+  // groups: Undefined for this pattern; a value stored there since goes.
+  let oldGroups = target.slot(3).valueBits()
+  target.setSlot(3, SlotBits.value(ValueBits.Undefined))
+  drop target
+  i = 0
+  while i < count { unsafe releasePiece(&mut hooks, realm, pieces[i]) i = i + 1 }
+  unsafe releasePiece(&mut hooks, realm, oldIndex)
+  unsafe releasePiece(&mut hooks, realm, oldInput)
+  unsafe releasePiece(&mut hooks, realm, oldGroups)
+  return true
+}
+/// Releases value when it is a heap value: most of refillResult's are not.
+@inlineAlways
+unsafe fn releasePiece<'a, H: HeapHooks>(hooks: &mut H, realm: Realm<'a>, value: ValueBits) -> () {
+  if value.tag() < 0 { unsafe support.release(&mut hooks, realm, value) }
+}
+/// Whether old is a narrow flat string holding exactly text.
+fn sameLatin1(old: ValueBits, text: &[u8]) -> bool {
+  if old.tag() != -7 || Strings.length(old) != text.length { return false }
+  let anchor = ()
+  let flat = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(old))
+  if flat.wide { return false }
+  drop flat
+  let held = unsafe latin1Bytes(&anchor, stringReference(old))
+  if text.length < 2 { return text.length == 0 || held[0] == text[0] }
+  return unitStrings.sameBytes(held, text)
+}
+/// Whether old is a wide flat string holding input's count units from start;
+/// input is wide and flat.
+fn sameWide(old: ValueBits, input: ValueBits, start: usize, count: usize) -> bool {
+  if old.tag() != -7 || count == 0 || Strings.length(old) != count { return false }
+  let anchor = ()
+  let held = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(old))
+  if !held.wide { return false }
+  let text = unsafe HeapCell.shortPayload<FlatString, ()>(&anchor, stringReference(input))
+  return unitStrings.sameBytes(Slice.asBytes<u16>(Slice.view(held.wideUnits(), 0, count)),
+    Slice.asBytes<u16>(Slice.view(text.wideUnits(), start, count)))
 }
 /// Stores an Int lastIndex into a slot quickExec found Int and writable.
 unsafe fn quickLastIndex(receiver: ValueBits, index: i32) -> () {
