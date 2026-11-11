@@ -8,12 +8,12 @@ const pendingScripts = new Map();
 const hashes = new Map();
 const scriptURLs = new Map();
 const enabled = new Set();
-const methods = new Set(['Debugger.getScriptSource', 'Debugger.getPossibleBreakpoints', 'Debugger.setBreakpoint', 'Debugger.setBreakpointByUrl', 'Debugger.removeBreakpoint', 'Debugger.setBreakpointsActive', 'Debugger.setSkipAllPauses', 'Debugger.setPauseOnExceptions', 'Debugger.pause', 'Debugger.resume', 'Debugger.stepInto', 'Debugger.stepOver', 'Debugger.stepOut', 'Debugger.evaluateOnCallFrame']);
+const methods = new Set(['Debugger.getScriptSource', 'Debugger.getPossibleBreakpoints', 'Debugger.setBreakpoint', 'Debugger.setBreakpointByUrl', 'Debugger.removeBreakpoint', 'Debugger.setBreakpointsActive', 'Debugger.setSkipAllPauses', 'Debugger.setPauseOnExceptions', 'Debugger.pause', 'Debugger.resume', 'Debugger.stepInto', 'Debugger.stepOver', 'Debugger.stepOut', 'Debugger.evaluateOnCallFrame', 'Debugger.setAsyncCallStackDepth', 'Debugger.setBlackboxPatterns']);
 let nextBreakpoint = 1;
 let startupArmed = false;
 let activePause;
 function state(session) {
-  if (!session.debugger) session.debugger = { breakpoints: new Map(), active: true, skip: false, exceptions: 'none' };
+  if (!session.debugger) session.debugger = { breakpoints: new Map(), active: true, skip: false, exceptions: 'none', blackbox: [], asyncDepth: 0 };
   return session.debugger;
 }
 function rebuild() {
@@ -34,7 +34,12 @@ function locationsOnly(locations) {
   for (const location of locations) unique.set(`${location.scriptId}:${location.lineNumber}:${location.columnNumber}`, locationOnly(location));
   return [...unique.values()];
 }
+// Node's resourceNameToUrl: a script named by an absolute path is reported as a file URL.
+function resourceURL(name) {
+  return typeof name === 'string' && name.startsWith('/') ? require('url').pathToFileURL(name).href : name;
+}
 function metadata(script) {
+  script.url = resourceURL(script.url);
   scriptURLs.set(script.scriptId, script.url);
   const context = contexts.fromToken(script.contextToken);
   if (!context) {
@@ -53,7 +58,8 @@ function metadata(script) {
   return { ...properties, hash, executionContextId: context.id };
 }
 function matches(breakpoint, script) {
-  return breakpoint.scriptId !== undefined ? breakpoint.scriptId === script.scriptId : breakpoint.url !== undefined ? breakpoint.url === script.url : breakpoint.regex ? breakpoint.regex.test(script.url) : breakpoint.scriptHash === (script.hash || metadata(script)?.hash);
+  const url = resourceURL(script.url);
+  return breakpoint.scriptId !== undefined ? breakpoint.scriptId === script.scriptId : breakpoint.url !== undefined ? breakpoint.url === url : breakpoint.regex ? breakpoint.regex.test(url) : breakpoint.scriptHash === (script.hash || metadata(script)?.hash);
 }
 function resolve(breakpoint, script) {
   const locations = native(23, script.scriptId);
@@ -71,8 +77,15 @@ function resolve(breakpoint, script) {
     }
     if (location.lineNumber === best.lineNumber && location.columnNumber === best.columnNumber) resolved.push(location);
   }
-  // A source coordinate can have distinct native PCs in several realm clones.
-  return resolved.filter(location => !breakpoint.locations.some(old => old.scriptId === location.scriptId && old.pc === location.pc));
+  // A source coordinate can have distinct native PCs in several realm clones,
+  // and several executable points inside one function: like V8, break once per
+  // function, at its first point for the position.
+  const functions = new Set();
+  return resolved.filter(location => {
+    if (functions.has(location.function)) return false;
+    functions.add(location.function);
+    return !breakpoint.locations.some(old => old.scriptId === location.scriptId && old.pc === location.pc);
+  });
 }
 function scriptParsed(script) {
   if (enabled.size === 0) return;
@@ -111,8 +124,12 @@ function frames(session, source) {
     return { callFrameId: frame.callFrameId, functionName: frame.functionName, location: locationOnly(frame.location), url: scriptURLs.get(frame.location.scriptId) ?? '', scopeChain, this: session.values.remote(frame.this, 'backtrace', false, false, context) };
   });
 }
+// V8 reports a pause that ends a step (and hits no breakpoint) with reason 'step'.
+let stepping = false;
 function paused(payload) {
   const source = payload.frames || [];
+  const stepped = stepping;
+  stepping = false;
   activePause = payload;
   const startup = startupArmed;
   startupArmed = false;
@@ -132,8 +149,15 @@ function paused(payload) {
       hits.push(id);
     }
     if (conditional && hits.length === 0 && payload.reason !== 'exception') continue;
+    // Blackboxed scripts are stepped through and their debugger statements ignored;
+    // an explicit breakpoint there still stops.
+    if (hits.length === 0 && payload.reason !== 'exception' && source.length && data.blackbox.length) {
+      const url = scriptURLs.get(source[0].location.scriptId) ?? '';
+      if (data.blackbox.some(pattern => pattern.test(url))) continue;
+    }
     delivered = true;
-    session.emit('Debugger.paused', { callFrames: frames(session, source), reason: payload.reason || 'other', hitBreakpoints: hits });
+    const reason = stepped && hits.length === 0 && payload.reason !== 'exception' ? 'step' : payload.reason || 'other';
+    session.emit('Debugger.paused', { callFrames: frames(session, source), reason, hitBreakpoints: hits });
     if (!native(31)) break;
   }
   if (!delivered && !startup && native(31)) { native(27, 0); activePause = undefined; }
@@ -193,8 +217,23 @@ function dispatch(session, method, params) {
           try { breakpoint.regex = new RegExp(params.urlRegex); } catch { throw protocolError(-32602, 'Invalid regular expression'); }
         }
       }
+      // V8 names a URL breakpoint by its target and a script breakpoint by its
+      // resolved location; a second one with the same name is refused.
+      const exists = () => protocolError(-32000, 'Breakpoint at specified location already exists.');
+      if (method === 'Debugger.setBreakpointByUrl') {
+        for (const other of data.breakpoints.values()) {
+          if (other.scriptId === undefined && other.lineNumber === breakpoint.lineNumber && other.columnNumber === breakpoint.columnNumber &&
+            other.url === breakpoint.url && other.scriptHash === breakpoint.scriptHash && other.regex?.source === breakpoint.regex?.source) throw exists();
+        }
+      }
       for (const script of native(21)) if (matches(breakpoint, script)) breakpoint.locations.push(...resolve(breakpoint, script));
       if (method === 'Debugger.setBreakpoint' && !breakpoint.locations.length) throw protocolError(-32000, 'Could not resolve breakpoint');
+      if (method === 'Debugger.setBreakpoint') {
+        const [first] = breakpoint.locations;
+        for (const other of data.breakpoints.values()) {
+          if (other.scriptId !== undefined && other.locations.some(location => location.scriptId === first.scriptId && location.lineNumber === first.lineNumber && location.columnNumber === first.columnNumber)) throw exists();
+        }
+      }
       const id = `${session.id}:${nextBreakpoint++}`;
       data.breakpoints.set(id, breakpoint);
       if (data.active) for (const location of breakpoint.locations) native(24, location.scriptId, location.pc);
@@ -211,10 +250,21 @@ function dispatch(session, method, params) {
       if (!['none', 'all', 'uncaught'].includes(params.state)) throw protocolError(-32602, 'Invalid parameters');
       data.exceptions = params.state; exceptionMode(); return {};
     case 'Debugger.pause': native(26); return {};
+    case 'Debugger.setAsyncCallStackDepth':
+      if (!Number.isInteger(params.maxDepth)) throw protocolError(-32602, 'Invalid parameters: maxDepth');
+      // Recorded only: paused frames carry no asyncStackTrace yet.
+      data.asyncDepth = Math.max(0, params.maxDepth); return {};
+    case 'Debugger.setBlackboxPatterns': {
+      if (!Array.isArray(params.patterns) || params.patterns.some(pattern => typeof pattern !== 'string')) throw protocolError(-32602, 'Invalid parameters: patterns');
+      try { data.blackbox = params.patterns.map(pattern => new RegExp(pattern)); }
+      catch { throw protocolError(-32000, 'Invalid regular expression'); }
+      return {};
+    }
     case 'Debugger.resume': case 'Debugger.stepInto': case 'Debugger.stepOver': case 'Debugger.stepOut': {
       if (params.breakOnAsyncCall || params.skipList || params.terminateOnResume) unsupported(method);
       const mode = { 'Debugger.resume': 0, 'Debugger.stepInto': 1, 'Debugger.stepOver': 2, 'Debugger.stepOut': 3 }[method];
       if (!native(27, mode)) throw protocolError(-32000, 'Can only perform operation while paused.');
+      stepping = mode !== 0;
       resumed(); return {};
     }
     case 'Debugger.evaluateOnCallFrame':

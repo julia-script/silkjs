@@ -1,5 +1,5 @@
-// Copyright Joyent, Inc. and other Node contributors. MIT license (see vendor/node-api/LICENSE).
-// Adapted from Node.js v24.22.1 lib/internal/assert.js.
+// Node.js v24.22.1 lib/internal/assert.js (MIT, Copyright Node.js contributors).
+
 'use strict';
 
 let error;
