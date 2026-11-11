@@ -5,6 +5,7 @@ const { Readable } = require('stream');
 const assert = require('assert');
 const { MockTracker } = require('internal/test_runner/mock');
 const host = require('internal/host');
+const { codes: { ERR_INVALID_ARG_TYPE }, validateObject, validateString, validateFunction, validateNumber, validateInteger, validateAbortSignal } = require('internal/path_events/support');
 const context = new AsyncLocalStorage();
 const nativeSetTimeout = globalThis.setTimeout;
 const nativeClearTimeout = globalThis.clearTimeout;
@@ -19,30 +20,47 @@ function failure(message, failureType = 'testCodeFailure', cause) {
 function invalid(message) { return Object.assign(new TypeError(message), { code: 'ERR_INVALID_ARG_VALUE' }); }
 function unsupported(name) { throw Object.assign(new Error(`${name} is not supported by the Silk test runner`), { code: 'ERR_NOT_SUPPORTED' }); }
 function deferred() { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; }
+const TIMEOUT_MAX = 2 ** 31 - 1;
+function validateConcurrency(value, name) {
+  if (value == null || typeof value === 'boolean') return;
+  if (typeof value !== 'number') throw new ERR_INVALID_ARG_TYPE(name, ['boolean', 'number'], value);
+  validateInteger(value, name, 1, 4294967295);
+}
+function validateTimeout(value, name) {
+  if (value != null && value !== Infinity) validateNumber(value, name, 0, TIMEOUT_MAX);
+}
 function parse(args) {
   let [name, options, fn] = args;
-  if (typeof name === 'function') { fn = name; name = fn.name; options = {}; }
-  else if (name && typeof name === 'object') { fn = options; options = name; name = fn?.name; }
-  else if (typeof options === 'function') { fn = options; options = {}; }
-  options ??= {};
-  if (name === undefined) name = fn?.name || '<anonymous>';
-  if (typeof name !== 'string') throw invalid('name must be a string');
-  if (!options || typeof options !== 'object') throw invalid('options must be an object');
-  if (fn !== undefined && typeof fn !== 'function') throw invalid('fn must be a function');
-  if (options.timeout !== undefined && (typeof options.timeout !== 'number' || options.timeout < 0 || Number.isNaN(options.timeout))) throw invalid('timeout must be a non-negative number');
-  if (options.concurrency !== undefined && typeof options.concurrency !== 'boolean' && (!Number.isInteger(options.concurrency) || options.concurrency < 1)) throw invalid('concurrency must be a positive integer or boolean');
-  if (options.signal !== undefined && typeof options.signal?.addEventListener !== 'function') throw invalid('signal must be an AbortSignal');
+  if (typeof name === 'function') { fn = name; name = undefined; options = undefined; }
+  else if (name !== null && typeof name === 'object') { fn = options; options = name; name = undefined; }
+  else if (typeof options === 'function') { fn = options; options = undefined; }
+  if (options == null) options = {};
+  validateObject(options, 'options');
+  if (typeof name !== 'string' || name === '') name = fn?.name || '<anonymous>';
+  if (fn !== undefined && typeof fn !== 'function') throw new ERR_INVALID_ARG_TYPE('fn', 'function', fn);
+  validateTimeout(options.timeout, 'options.timeout');
+  validateConcurrency(options.concurrency, 'options.concurrency');
+  validateAbortSignal(options.signal, 'options.signal');
   for (const key of ['only', 'skip', 'todo']) if (options[key] !== undefined && typeof options[key] !== 'boolean' && (key === 'only' || typeof options[key] !== 'string')) throw invalid(`${key} has an invalid type`);
   for (const key of ['tags', 'expectFailure']) if (options[key] !== undefined) unsupported(`test option ${key}`);
   return { name, options, fn: fn || function() {} };
 }
-function pattern(value) { return value === undefined ? [] : (Array.isArray(value) ? value : [value]).map(item => item instanceof RegExp ? item : new RegExp(item)); }
+function stringPattern(text) {
+  const match = /^\/(.*)\/([a-z]*)$/s.exec(text);
+  return match ? new RegExp(match[1], match[2]) : new RegExp(text);
+}
+function pattern(value) { return value == null ? [] : (Array.isArray(value) ? value : [value]).map(item => item instanceof RegExp ? item : stringPattern(item)); }
 function matches(patterns, name) { return patterns.some(re => { re.lastIndex = 0; return re.test(name); }); }
 function testMatches(patterns, node) {
   for (let current = node; current?.parent; current = current.parent) {
     if (matches(patterns, current.name) || matches(patterns, current.filterName)) return true;
   }
   return false;
+}
+function settledCount(node) {
+  let count = 0;
+  for (const child of node.children) count += (child.state === 'done') + settledCount(child);
+  return count;
 }
 function visibleChildren(node) { return node.children.filter(child => !child.filtered && (!child.nameFiltered || child.error)); }
 class TestsStream extends Readable {
@@ -91,6 +109,10 @@ class TestContext {
   get filePath() { return this._node.file; }
   get signal() { return this._node.controller.signal; }
   get mock() { return this._node.mock ||= new MockTracker(); }
+  get error() { return this._node.error ?? null; }
+  get passed() { return this._node.passed === true; }
+  get attempt() { return 0; }
+  get workerId() { return Number(process.env.NODE_TEST_WORKER_ID) || undefined; }
   get assert() {
     if (!this._assert) {
       const plan = this._node.plan;
@@ -122,7 +144,7 @@ class TestContext {
     if (type === 'before' && this._node.state === 'running') this._node.harness.hooks(this._node, type).catch(error => this._node.cancel(error));
   }
   diagnostic(message) { (this._node.diagnostics ||= []).push(String(message)); }
-  skip(message) { this._node.skip = message === undefined ? true : String(message) || true; }
+  skip(message) { if (this._node.state === 'running') this._node.runtimeSkip = true; this._node.skip = message === undefined ? true : String(message) || true; }
   todo(message) { this._node.todo = message === undefined ? true : String(message) || true; }
   runOnly(value) { if (typeof value !== 'boolean') throw invalid('runOnly requires a boolean'); this._node.runOnly = value; }
   plan(count, options = {}) {
@@ -130,10 +152,11 @@ class TestContext {
     this._node.plan = new AssertionPlan(count, options);
   }
   waitFor(condition, options = {}) {
-    if (typeof condition !== 'function') throw invalid('condition must be a function');
-    const interval = options.interval ?? 50;
-    const timeout = options.timeout ?? 1000;
-    if (!Number.isFinite(interval) || interval < 0 || !Number.isFinite(timeout) || timeout < 0) throw invalid('Invalid waitFor timing');
+    validateFunction(condition, 'condition');
+    validateObject(options, 'options');
+    const { interval = 50, timeout = 1000 } = options;
+    validateNumber(interval, 'options.interval', 0, TIMEOUT_MAX);
+    validateNumber(timeout, 'options.timeout', 0, TIMEOUT_MAX);
     return new Promise((resolve, reject) => {
       let poller;
       let cause;
@@ -176,7 +199,7 @@ class Harness {
   constructor(options = {}) {
     this.options = options; this.stream = new TestsStream(); this.file = options.file;
     this.names = pattern(options.testNamePatterns); this.skips = pattern(options.testSkipPatterns);
-    this.root = new TestNode(this, 'root', { name: '', options, fn() {} }, null);
+    this.root = new TestNode(this, 'root', { name: '<root>', options, fn() {} }, null);
     this.root.state = 'collecting'; this.started = false; this.finished = false;
     this.counts = { tests: 0, suites: 0, passed: 0, failed: 0, cancelled: 0, skipped: 0, todo: 0, topLevel: 0 };
     this.success = true;
@@ -244,7 +267,7 @@ class Harness {
     const timeout = options.timeout;
     let result;
     try {
-      const task = context.run(node, () => {
+      const task = context.run(options.owner ?? node, () => {
         if (fn.length < 2) return Promise.resolve(Reflect.apply(fn, node.ctx, [node.ctx]));
         return new Promise((resolve, reject) => {
           let calls = 0;
@@ -277,9 +300,9 @@ class Harness {
               const scope = Object.create(target); scope.cancelled = deferred(); scope.error = undefined;
               const onIdle = () => { scope.error = failure('cleanup is pending after the event loop resolved', 'testUnfinished'); scope.cancelled.resolve(); };
               process.on('beforeExit', onIdle);
-              try { await this.invoke(hook.fn, scope, { timeout: target.options.timeout ?? this.options.timeout, ...hook.options }); }
+              try { await this.invoke(hook.fn, scope, { timeout: target.options.timeout ?? this.options.timeout, ...hook.options, owner: node }); }
               finally { process.removeListener('beforeExit', onIdle); }
-            } else await this.invoke(hook.fn, target, hook.options);
+            } else await this.invoke(hook.fn, target, { ...hook.options, owner: node });
           };
           if (once) hook.promise = run();
           else { await run(); continue; }
@@ -335,7 +358,16 @@ class Harness {
         } else {
           await this.invoke(node.fn, node);
           await this.hooks(node, 'before');
-          // Unawaited subtests cannot outlive their parent test.
+          // Unawaited subtests cannot outlive their parent test. Node starts a subtest
+          // synchronously, so one that needs no I/O or timer has finished by now there:
+          // let pending promise work settle before cancelling the rest.
+          for (let settled = -1; ;) {
+            if (node.children.every(child => child.state === 'done')) break;
+            const done = settledCount(node);
+            if (done === settled) break;
+            settled = done;
+            await new Promise(resolve => nativeSetImmediate(resolve));
+          }
           for (const child of node.children) if (child.state !== 'done') child.cancel(failure('test did not finish before its parent', 'cancelledByParent'));
           this.pump(node);
           await Promise.all(node.children.map(child => child.done.promise));
@@ -347,7 +379,7 @@ class Harness {
     finally {
       if (timeout !== undefined) nativeClearTimeout(timeout);
       signal?.removeEventListener('abort', onAbort);
-      if (!node.skip && !node.filtered) {
+      if ((!node.skip || node.runtimeSkip) && !node.filtered) {
         await this.hooks(node, 'after', node, true);
         if (node.type !== 'suite') for (let i = ancestors.length - 1; i >= 0; i--) await this.hooks(ancestors[i], 'afterEach', node, true);
       }
@@ -366,6 +398,7 @@ class Harness {
   }
   finish(node, start) {
     node.state = 'done';
+    node.passed = !node.error;
     node.controller.abort();
     if (node.filtered) { this.flush(this.root); node.done.resolve(); return; }
     const counts = this.counts;
@@ -381,7 +414,7 @@ class Harness {
     if (node.error && !node.todo && !node.skip && this.options.setExitCode !== false) process.exitCode = 1;
     node.reportData = { testNumber: visibleChildren(node.parent).indexOf(node) + 1,
       details: { duration_ms: now() - start, type: node.type, ...(node.error ? { error: node.error } : {}) },
-      ...(node.skip ? { skip: node.skip } : {}), ...(node.todo ? { todo: node.todo } : {}) };
+      ...(node.skip ? { skip: node.skip } : node.todo ? { todo: node.todo } : {}) };
     this.emit('test:complete', node, { ...node.reportData, details: { ...node.reportData.details, passed: !node.error || !!node.skip } });
     this.flush(this.root);
     node.done.resolve();
@@ -489,12 +522,26 @@ function getHarness() {
     if (collectCoverage && !host.testCoveragePrestarted) {
       host.testCoverageStart(); host.testCoveragePrestarted = true;
     }
-    defaultHarness = createHarness({ waitForIdle: true, file: process.argv[1], collectCoverage });
-    const { tap } = require('test/reporters');
-    Readable.from(tap(defaultHarness.stream)).pipe(process.stdout, { end: false });
+    const cli = host.testCoverageOptions || {};
+    defaultHarness = createHarness({ waitForIdle: true, file: process.argv[1], collectCoverage, only: cli.only,
+      timeout: cli.timeout, testNamePatterns: cli.testNamePatterns, testSkipPatterns: cli.testSkipPatterns });
+    if (process.env.NODE_TEST_CONTEXT === 'child-v8' && typeof process.send === 'function') reportToParent(defaultHarness.stream);
+    else {
+      const { tap } = require('test/reporters');
+      Readable.from(tap(defaultHarness.stream)).pipe(process.stdout, { end: false });
+    }
     nativeSetImmediate(() => { defaultHarness.start(); });
   }
   return defaultHarness;
+}
+// A file that run() started in its own process sends its events to the parent.
+function serializable(_key, value) {
+  if (value instanceof Error) return { name: value.name, message: value.message, stack: value.stack, code: value.code, failureType: value.failureType, cause: value.cause };
+  return typeof value === 'bigint' ? String(value) : value;
+}
+function reportToParent(stream) {
+  stream.on('data', event => process.send(JSON.parse(JSON.stringify(event, serializable))));
+  stream.on('end', () => process.disconnect());
 }
 function configure(options = {}) {
   if (defaultHarness) throw Object.assign(new Error('The default test harness is already initialized'), { code: 'ERR_INVALID_STATE' });
@@ -515,7 +562,7 @@ for (const fn of [test, suite]) for (const modifier of ['skip', 'todo', 'only'])
 };
 const exportsObject = { test, suite, createHarness, configure, getTestContext: () => context.getStore()?.ctx,
   withHarness: (harness, fn) => context.run(harness.root, fn), failure, unsupported, TestsStream,
-  registerAssertion(name, fn) { if (typeof name !== 'string' || typeof fn !== 'function') throw invalid('assert.register requires a name and function'); assertions.set(name, fn); } };
+  registerAssertion(name, fn) { validateString(name, 'name'); validateFunction(fn, 'fn'); assertions.set(name, fn); } };
 for (const type of ['before', 'after', 'beforeEach', 'afterEach']) exportsObject[type] = (fn, options) => {
   const harness = getHarness(); (context.getStore() || harness.root).ctx._hook(type, fn, options);
 };

@@ -101,6 +101,24 @@ function serializablePatterns(patterns) {
   if (patterns === undefined) return undefined;
   return (Array.isArray(patterns) ? patterns : [patterns]).map(value => value instanceof RegExp ? { source: value.source, flags: value.flags } : { source: String(value), flags: '' });
 }
+// The child's default harness reads these the way a test file run by hand does, and
+// reports its events over IPC because NODE_TEST_CONTEXT is child-v8.
+function childFlags(options) {
+  const flags = [];
+  if (options.only) flags.push('--test-only');
+  if (Number.isFinite(options.timeout)) flags.push(`--test-timeout=${options.timeout}`);
+  for (const key of ['testNamePatterns', 'testSkipPatterns']) {
+    const name = key === 'testNamePatterns' ? '--test-name-pattern' : '--test-skip-pattern';
+    for (const { source, flags: reFlags } of serializablePatterns(options[key]) || [])
+      flags.push(`${name}=${reFlags || source.startsWith('/') ? `/${source}/${reFlags}` : source}`);
+  }
+  if (options.coverage) {
+    flags.push('--experimental-test-coverage');
+    for (const glob of [options.coverageIncludeGlobs ?? []].flat()) flags.push(`--test-coverage-include=${glob}`);
+    for (const glob of [options.coverageExcludeGlobs ?? []].flat()) flags.push(`--test-coverage-exclude=${glob}`);
+  }
+  return flags;
+}
 function inheritedExecArgv() {
   const result = [];
   const takesValue = new Set(['--test-concurrency', '--test-timeout', '--test-isolation', '--test-name-pattern', '--test-skip-pattern', '--test-reporter', '--test-reporter-destination', '--test-shard', '--test-coverage-include', '--test-coverage-exclude', '--test-coverage-lines', '--test-coverage-branches', '--test-coverage-functions', '--watch-path', '--eval', '--print', '-e', '-p']);
@@ -160,11 +178,7 @@ async function runProcesses(files, options, stream, cwd) {
       completed.set(index, { events: [], error: failure('test run aborted', 'testAborted', options.signal.reason) });
       flush(); return;
     }
-    const childOptions = { files: [file], isolation: 'none', only: options.only, timeout: Number.isFinite(options.timeout) ? options.timeout : undefined,
-      testNamePatterns: serializablePatterns(options.testNamePatterns), testSkipPatterns: serializablePatterns(options.testSkipPatterns),
-      coverage: options.coverage, coverageIncludeGlobs: options.coverageIncludeGlobs, coverageExcludeGlobs: options.coverageExcludeGlobs };
-    // A normal public run() entry keeps process isolation independent of CLI --test parsing.
-    const script = `const o=${JSON.stringify(childOptions)};process.argv=[process.execPath,o.files[0],...process.argv.slice(1)];for(const k of ['testNamePatterns','testSkipPatterns'])if(o[k])o[k]=o[k].map(p=>new RegExp(p.source,p.flags));const s=require('node:test').run(o);s.on('data',e=>{if(e.type==='test:summary'&&!e.data.success)process.exitCode=1;process.send(JSON.parse(JSON.stringify(e,(_k,v)=>v instanceof Error?{name:v.name,message:v.message,stack:v.stack,code:v.code,failureType:v.failureType,cause:v.cause}:typeof v==='bigint'?String(v):v)));});s.on('error',e=>{console.error(e);process.exitCode=1;process.disconnect();});s.on('end',()=>process.disconnect());`;
+    const flags = childFlags(options);
     const events = [];
     let summary;
     let error;
@@ -179,7 +193,7 @@ async function runProcesses(files, options, stream, cwd) {
       try {
         const snapshotFlags = host.testUpdateSnapshots === undefined ? [] :
           [host.testUpdateSnapshots ? '--test-update-snapshots' : '--no-test-update-snapshots'];
-        child = spawn(process.execPath, [...inheritedExecArgv(), ...snapshotFlags, ...(options.execArgv || []), '-e', script, '--', ...(options.argv || [])], {
+        child = spawn(process.execPath, [...inheritedExecArgv(), ...snapshotFlags, ...flags, ...(options.execArgv || []), file, ...(options.argv || [])], {
           cwd, env: { NODE_TEST_CONTEXT: 'child-v8', ...(options.env || process.env) }, stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
         });
       } catch (cause) { error = failure('test process failed to start', 'testCodeFailure', cause); finish(); return; }
@@ -205,7 +219,7 @@ async function runProcesses(files, options, stream, cwd) {
       child.on('error', cause => { error ||= failure('test process failed', 'testCodeFailure', cause); if (!child.pid) finish(); });
       child.on('close', (code, signal) => {
         if ((code !== 0 || signal) && (!summary || summary.success)) error ||= failure(`test process exited with ${signal || code}`, 'testCodeFailure');
-        if (!summary && !error) error = failure('test process exited without completing its test run', 'testUnfinished');
+        if (!summary && !error && events.length) error = failure('test process exited without completing its test run', 'testUnfinished');
         finish();
       });
       onAbort = () => { error ||= failure('test run aborted', 'testAborted', options.signal.reason); child.kill(); };
