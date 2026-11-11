@@ -133,7 +133,8 @@ const kId = Symbol('asyncId'), kScope = Symbol('asyncScope'), kStack = Symbol('a
 function frameScope(id, trigger, resource) { return { stores: undefined, id, trigger, resource }; }
 
 class AsyncResource {
-  #context;
+  // Only the stores: the whole context would keep the resource that was current alive.
+  #stores;
   #id;
   #trigger;
   #destroy;
@@ -178,14 +179,14 @@ class AsyncResource {
   [kStack]() { return this.#previousContexts ??= []; }
   [kScope](omitFrame) {
     if (omitFrame && usesContextFrames()) return frameScope(this.#id, this.#trigger, this.#owner ?? this);
-    return this.#scope ??= { stores: this.#context?.stores, id: this.#id, trigger: this.#trigger, resource: this.#owner ?? this };
+    return this.#scope ??= { stores: this.#stores, id: this.#id, trigger: this.#trigger, resource: this.#owner ?? this };
   }
   constructor(type, options = {}, token, owner, explicitId) {
     if (typeof type !== 'string') throw error('ERR_INVALID_ARG_TYPE', 'The "type" argument must be a string');
     if (type.length === 0 && Array.from(hooks).some(hook => hook.callbacks.init !== undefined)) throw error('ERR_ASYNC_TYPE', 'Invalid name for async "type"');
     const trigger = typeof options === 'number' ? options : options.triggerAsyncId ?? executionAsyncId();
     if (!Number.isSafeInteger(trigger) || trigger < -1) throw error('ERR_INVALID_ASYNC_ID', `Invalid triggerAsyncId value: ${trigger}`, RangeError);
-    this.#context = captureContext();
+    this.#stores = captureContext()?.stores;
     this.#id = token === resourceOwnerToken && typeof explicitId === 'number' && explicitId !== -1 ? explicitId : nextId++;
     this.#trigger = trigger;
     this.#destroy = { id: this.#id, destroyed: false, promise: false };
@@ -231,7 +232,8 @@ class InternalResource {
     if (typeof type !== 'string') throw error('ERR_INVALID_ARG_TYPE', 'The "type" argument must be a string');
     if (hooks.size !== 0 && type.length === 0 && Array.from(hooks).some(hook => hook.callbacks.init !== undefined)) throw error('ERR_ASYNC_TYPE', 'Invalid name for async "type"');
     const context = captureContext();
-    this.context = context;
+    // Only the stores: the whole context would keep the resource that was current alive.
+    this.stores = context?.stores;
     this.id = typeof explicitId === 'number' && explicitId !== -1 ? explicitId : nextId++;
     this.trigger = context?.id ?? 1;
     this.owner = owner;
@@ -245,7 +247,7 @@ class InternalResource {
   [kStack]() { return this.stack ??= []; }
   [kScope](omitFrame) {
     if (omitFrame && usesContextFrames()) return frameScope(this.id, this.trigger, this.owner ?? this);
-    return this.scope ??= { stores: this.context?.stores, id: this.id, trigger: this.trigger, resource: this.owner ?? this };
+    return this.scope ??= { stores: this.stores, id: this.id, trigger: this.trigger, resource: this.owner ?? this };
   }
   asyncId() { return this.id; }
   triggerAsyncId() { return this.trigger; }

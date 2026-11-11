@@ -45,10 +45,12 @@ const {
   once,
 } = require('internal/util');
 const {
-  kReadBytesOrError,
-  streamBaseState,
   onStreamRead,
 } = require('internal/stream_base_commons');
+const {
+  kReadBytesOrError,
+  streamBaseState,
+} = require('internal/net/binding').stream_wrap;
 const {
   validateNumber,
   validateOneOf,
