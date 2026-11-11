@@ -174,6 +174,23 @@ function parseFileMode(value, name, def) {
   // Coerce -0 to +0.
   return value + 0;
 }
+// Node's validateFiniteNumber and checkRangesOrGetDefault (used by zlib).
+function validateFiniteNumber(number, name) {
+  // Common case
+  if (number === undefined) return false;
+  if (Number.isFinite(number)) return true; // Is a valid number
+  if (Number.isNaN(number)) return false;
+  validateNumber(number, name);
+  // Infinite numbers
+  throw new ERR_OUT_OF_RANGE(name, 'a finite number', number);
+}
+function checkRangesOrGetDefault(number, name, lower, upper, def) {
+  if (!validateFiniteNumber(number, name)) return def;
+  if (number < lower || number > upper) {
+    throw new ERR_OUT_OF_RANGE(name, `>= ${lower} and <= ${upper}`, number);
+  }
+  return number;
+}
 // Node wraps its validators in hideStackFrames(), whose callers inside other
 // hidden frames use fn.withoutStackTrace.
 for (const fn of [validateString, validateBoolean, validateFunction, validateNumber, validateInteger, validateInt32,
@@ -189,4 +206,5 @@ module.exports = {
   validateUint32, validateObject, validateArray, validateOneOf, validateAbortSignal,
   isUint32, parseFileMode, validateBuffer, validateLinkHeaderValue,
   convertToValidSignal, signalName, toPathIfFileURL, validatePath, getValidatedPath, validatePort,
+  validateFiniteNumber, checkRangesOrGetDefault,
 };
