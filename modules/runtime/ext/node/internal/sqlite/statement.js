@@ -34,15 +34,20 @@ function bind(s, args) {
     bindValue(s.id, index++, args[i]);
   }
 }
-function row(s) {
-  const values = native('row', [s.id, +s.options.readBigInts]);
-  for (let i = 0; i < values.length; i++) values[i] = readValue(values[i], s.options.readBigInts);
-  if (s.options.returnArrays) return values;
-  // Reprepared statements can acquire a different result schema after a DDL.
-  const names = native('names', [s.id]);
-  const result = Object.create(null);
-  for (let i = 0; i < names.length; i++) result[names[i]] = values[i];
-  return result;
+// Steps up to max rows (0 for all) natively. Rows are built in native code with a
+// shared shape per call; fix flags values that still need JS finishing: blobs
+// arrive as ArrayBuffers, and an out-of-range integer stops the call as a BigInt.
+function fetch(s, max) {
+  const fix = [0];
+  const big = s.options.readBigInts, arrays = s.options.returnArrays;
+  const rows = native('rows', [s.id, +big, +arrays, max, fix]);
+  if (fix[0]) {
+    for (const row of rows) {
+      if (arrays) { for (let i = 0; i < row.length; i++) row[i] = readValue(row[i], big); }
+      else { for (const key of Object.keys(row)) row[key] = readValue(row[key], big); }
+    }
+  }
+  return rows;
 }
 function execution(s, fn) {
   const db = databases.get(s.db);
@@ -56,9 +61,9 @@ function execute(self, args, mode) {
   return execution(s, () => {
     let resetDone = false;
     try {
-      if (mode === 'all') { const rows = []; while (native('step', [s.id]) === 100) rows.push(row(s)); return rows; }
+      if (mode === 'all') return fetch(s, 0);
+      if (mode === 'get') { const rows = fetch(s, 1); return rows.length ? rows[0] : undefined; }
       const code = native('step', [s.id]);
-      if (mode === 'get') return code === 100 ? row(s) : undefined;
       reset(s);
       resetDone = true;
       const [changes, lastInsertRowid] = native('changes', [databases.get(s.db).id, +s.options.readBigInts]);
@@ -77,8 +82,8 @@ class StatementSyncIterator {
     if (iterator.done) return Object.assign(Object.create(null), { done: true, value: null });
     if (s.resetGeneration !== iterator.generation) throw stateError('iterator was invalidated');
     return execution(s, () => {
-      const code = native('step', [s.id]);
-      if (code === 100) return Object.assign(Object.create(null), { done: false, value: row(s) });
+      const rows = fetch(s, 1);
+      if (rows.length) return Object.assign(Object.create(null), { done: false, value: rows[0] });
       reset(s, false); iterator.done = true;
       return Object.assign(Object.create(null), { done: true, value: null });
     });
