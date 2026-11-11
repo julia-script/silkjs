@@ -11,6 +11,8 @@ function install(global) {
   const WeakMap = global.WeakMap;
   const state = host.errorStackState || (host.errorStackState = {
     records: new WeakMap(), captured: new WeakMap(), rootError: Error, formatting: false,
+    // Node's overrideStackTrace: a one-shot formatter for one error, ahead of Error.prepareStackTrace.
+    overrides: new WeakMap(),
   });
   const { records, captured, rootError } = state;
   const define = Object.defineProperty;
@@ -158,20 +160,22 @@ function install(global) {
     if (state.formatting) return defaultFormat(error, frames);
     state.formatting = true;
     try {
+      const override = state.overrides.get(error);
+      if (override !== undefined) state.overrides.delete(error);
       let owner = Error;
-      let prepare = owner.prepareStackTrace;
-      if (typeof prepare !== 'function' && rootError !== Error) {
+      let prepare = override ?? owner.prepareStackTrace;
+      if (override === undefined && typeof prepare !== 'function' && rootError !== Error) {
         owner = rootError;
         prepare = owner.prepareStackTrace;
       }
-      if (typeof prepare !== 'function' || prepare === state.defaultPrepare) return defaultFormat(error, frames);
+      if (override === undefined && (typeof prepare !== 'function' || prepare === state.defaultPrepare)) return defaultFormat(error, frames);
       const sites = [];
       for (let index = 0; index < frames.length; index++) {
         const site = Object.create(CallSite.prototype);
         records.set(site, frames[index]);
         sites[index] = site;
       }
-      return Reflect.apply(prepare, owner, [error, sites]);
+      return Reflect.apply(prepare, override === undefined ? owner : undefined, [error, sites]);
     } finally { state.formatting = false; }
   }
   function getStack() {
@@ -214,4 +218,8 @@ function install(global) {
   host.captureCallSites(0, Error, format);
 }
 
-module.exports = { install };
+module.exports = {
+  install,
+  get overrideStackTrace() { return host.errorStackState.overrides; },
+  get ErrorPrepareStackTrace() { return host.errorStackState.defaultPrepare; },
+};
