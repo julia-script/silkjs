@@ -27,6 +27,7 @@ const host = require('internal/host');
 const { EventEmitter } = require('events');
 const { AsyncResource } = require('async_hooks');
 const { Buffer } = require('buffer');
+const diagnostics = require('internal/host').diagnostics;
 const { Socket } = require('net');
 const { setupChannel } = require('internal/child_process/ipc');
 const { AbortError } = require('internal/path_events/support');
@@ -142,6 +143,7 @@ class ChildProcess extends EventEmitter {
     this.spawnfile = null;
     this._handle = null;
     this._resource = new AsyncResource('PROCESSWRAP');
+    diagnostics.publish('child_process', { process: this });
   }
   _onexit(exitCode, signal) {
     if (signal) this.signalCode = signalName(signal) ?? null;
@@ -183,6 +185,8 @@ class ChildProcess extends EventEmitter {
     if (options.uid != null) flags |= 1;
     if (options.gid != null) flags |= 2;
     const argv = this.spawnargs.length ? this.spawnargs : [options.file];
+    const tracing = diagnostics.tracing('child_process.spawn');
+    tracing?.start.publish({ process: this, options });
     const result = native('spawn', [options.file, argv.map(String).join('\0') + '\0', nativeEnvironment(options),
       nativeCwd(options.cwd), stdio.map(entry => entry.fd), flags, options.uid >>> 0, options.gid >>> 0, (code, signal) => {
         host.invokeResource(this._resource, this._onexit, this, [code, signal], false);
@@ -194,14 +198,17 @@ class ChildProcess extends EventEmitter {
       const code = native('errorName', [err]);
       if (code !== 'EACCES' && code !== 'EAGAIN' && code !== 'EMFILE' && code !== 'ENFILE' && code !== 'ENOENT') {
         this._resource.emitDestroy();
+        tracing?.error.publish({ process: this, error: errnoException(err, 'spawn') });
         throw errnoException(err, 'spawn');
       }
+      tracing?.error.publish({ process: this, error: errnoException(err, 'spawn') });
       process.nextTick(() => this._onexit(err, 0));
       if (code === 'EMFILE' || code === 'ENFILE') return err;
       this.pid = undefined;
     } else {
       this._handle = result[0];
       this.pid = result[1];
+      tracing?.end.publish({ process: this });
       process.nextTick(() => this.emit('spawn'));
     }
     this.stdio = [];

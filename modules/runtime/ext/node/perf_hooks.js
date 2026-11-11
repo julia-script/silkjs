@@ -4,6 +4,8 @@ const host = require('internal/host');
 const { EventTarget, Event, DOMException } = require('internal/path_events/event_target');
 const { createHistogram, createSlidingWindowHistogram, importHistogram, monitorEventLoopDelay, isRecordableHistogram } = require('internal/performance_histogram');
 const trace = require('internal/trace_events');
+const { codes: { ERR_INVALID_ARG_TYPE } } = require('internal/errors');
+const { validateFunction, validateObject } = require('internal/validators');
 const token = Symbol('Performance');
 const entries = new WeakMap();
 const markTimings = new Map();
@@ -28,6 +30,14 @@ let deliveryScheduled = false;
 let resourceLimit = 250;
 let resourcePending = false;
 let resourceOverflow = [];
+// WebIDL unsigned long, with Node's messages for the values ToNumber rejects.
+function unsignedLong(value, context) {
+  if (typeof value === 'bigint') throw error('ERR_INVALID_ARG_TYPE', `${context} is a BigInt and cannot be converted to a number.`);
+  if (typeof value === 'symbol') throw error('ERR_INVALID_ARG_TYPE', `${context} is a Symbol and cannot be converted to a number.`);
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 0;
+  return Math.trunc(number) >>> 0;
+}
 function error(code, message, Type = TypeError) { return Object.assign(new Type(message), { code }); }
 function object(value, name) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) throw error('ERR_INVALID_ARG_TYPE', `${name} must be an object`);
@@ -100,6 +110,11 @@ class PerformanceEntry {
   get startTime() { return data(this).start; }
   get duration() { return data(this).duration; }
   toJSON() { return { name: this.name, entryType: this.entryType, startTime: this.startTime, duration: this.duration }; }
+  [Symbol.for('nodejs.util.inspect.custom')](depth, options) {
+    if (depth < 0) return this;
+    const opts = { ...options, depth: options.depth == null ? null : options.depth - 1 };
+    return `${this.constructor.name} ${require('util').inspect(this.toJSON(), opts)}`;
+  }
 }
 class PerformanceMark extends PerformanceEntry {
   constructor(name, options) {
@@ -147,18 +162,32 @@ class PerformanceResourceTiming extends PerformanceEntry {
   get contentType() { return data(this).bodyInfo?.contentType ?? ''; }
   get contentEncoding() { return data(this).bodyInfo?.contentEncoding ?? ''; }
   toJSON() {
-    const result = super.toJSON();
-    for (const key of ['initiatorType', 'nextHopProtocol', ...Object.keys(resourceFields), ...Object.keys(connectionFields),
-      'firstInterimResponseStart', 'responseStart', 'transferSize', 'deliveryType', 'responseStatus', 'renderBlockingStatus', 'contentType', 'contentEncoding']) result[key] = this[key];
+    data(this);
+    const result = {};
+    for (const key of resourceJSONKeys) result[key] = this[key];
     return result;
   }
 }
+// Node's order, which inspect output follows.
+const resourceJSONKeys = ['name', 'entryType', 'startTime', 'duration', 'initiatorType', 'nextHopProtocol', 'workerStart',
+  'redirectStart', 'redirectEnd', 'fetchStart', 'domainLookupStart', 'domainLookupEnd', 'connectStart', 'connectEnd',
+  'secureConnectionStart', 'requestStart', 'finalResponseHeadersStart', 'firstInterimResponseStart', 'responseStart',
+  'responseEnd', 'transferSize', 'encodedBodySize', 'decodedBodySize', 'deliveryType', 'responseStatus',
+  'renderBlockingStatus', 'contentType', 'contentEncoding'];
 for (const [name, field] of Object.entries(resourceFields)) Object.defineProperty(PerformanceResourceTiming.prototype, name, {
   enumerable: true, configurable: true, get() { return data(this).timing[field]; }
 });
 for (const [name, field] of Object.entries(connectionFields)) Object.defineProperty(PerformanceResourceTiming.prototype, name, {
   enumerable: true, configurable: true, get() { return data(this).timing.finalConnectionTimingInfo?.[field]; }
 });
+// The attributes of a resource entry are enumerable accessors on the prototype, as in Node.
+for (const name of [...Object.getOwnPropertyNames(PerformanceResourceTiming.prototype), 'toJSON']) {
+  const descriptor = Object.getOwnPropertyDescriptor(PerformanceResourceTiming.prototype, name);
+  if (name !== 'constructor' && descriptor && !descriptor.enumerable) {
+    descriptor.enumerable = true;
+    Object.defineProperty(PerformanceResourceTiming.prototype, name, descriptor);
+  }
+}
 class PerformanceObserverEntryList {
   #entries;
   constructor(key, list) { if (key !== token) throw illegal(); this.#entries = sort(list); }
@@ -225,10 +254,10 @@ function eventLoopUtilization(util1, util2) {
   return { idle, active, utilization: !util1 && idle === 0 && active === 0 ? 0 : active / (idle + active) };
 }
 function timerify(fn, options = {}) {
-  if (typeof fn !== 'function') throw error('ERR_INVALID_ARG_TYPE', 'fn must be a function');
-  object(options, 'options');
+  validateFunction(fn, 'fn');
+  validateObject(options, 'options');
   const histogram = options.histogram;
-  if (histogram !== undefined && !isRecordableHistogram(histogram)) throw error('ERR_INVALID_ARG_TYPE', 'options.histogram must be a RecordableHistogram');
+  if (histogram !== undefined && !isRecordableHistogram(histogram)) throw new ERR_INVALID_ARG_TYPE('options.histogram', 'RecordableHistogram', histogram);
   function timerified(...args) {
     const start = now();
     const complete = () => {
@@ -259,7 +288,6 @@ class PerformanceNodeTiming extends PerformanceEntry {
 }
 for (const name of [...reservedMarks, 'idleTime']) Object.defineProperty(PerformanceNodeTiming.prototype, name, {
   configurable: true, enumerable: true, get() {
-    if (name === 'v8Start') return -1;
     if (name === 'nodeStart') return 0;
     const value = host.performanceNodeTiming?.()[name];
     if (value !== undefined) return value;
@@ -309,15 +337,13 @@ class Performance extends EventTarget {
   getEntries() { brand(this); return sort(allEntries()); }
   getEntriesByType(type) { brand(this); required(arguments.length, 'type'); return filter(allEntries(), undefined, `${type}`); }
   getEntriesByName(name, type) { brand(this); required(arguments.length, 'name'); return filter(allEntries(), `${name}`, type === undefined ? undefined : `${type}`); }
-  setResourceTimingBufferSize(size) { brand(this); required(arguments.length, 'maxSize'); resourceLimit = +size >>> 0; }
+  setResourceTimingBufferSize(maxSize) { brand(this); required(arguments.length, 'maxSize'); resourceLimit = unsignedLong(maxSize, 'maxSize'); }
   markResourceTiming(timingInfo, requestedUrl, initiatorType, global, cacheMode, bodyInfo, responseStatus, deliveryType = '') {
     if (cacheMode !== '' && cacheMode !== 'local') throw error('ERR_INTERNAL_ASSERTION', "cache must be an empty string or 'local'", Error);
     const entry = new PerformanceResourceTiming(token, requestedUrl, 'resource');
     Object.assign(data(entry), { timing: timingInfo, initiatorType, cacheMode, bodyInfo, responseStatus, deliveryType });
     enqueue(entry); bufferResource(entry); return entry;
   }
-  timerify(fn, options) { return timerify(fn, options); }
-  eventLoopUtilization(util1, util2) { return eventLoopUtilization(util1, util2); }
   get onresourcetimingbufferfull() { return this.#handler; }
   set onresourcetimingbufferfull(value) {
     if (this.#handler) this.removeEventListener('resourcetimingbufferfull', this.#handler);
@@ -326,6 +352,11 @@ class Performance extends EventTarget {
   }
   toJSON() { brand(this); return { nodeTiming: this.nodeTiming, timeOrigin: this.timeOrigin, eventLoopUtilization: this.eventLoopUtilization() }; }
 }
+// As in Node, the methods are the module's own functions, not wrappers.
+Object.defineProperties(Performance.prototype, {
+  timerify: { value: timerify, writable: true, enumerable: true, configurable: true },
+  eventLoopUtilization: { value: eventLoopUtilization, writable: true, enumerable: true, configurable: true },
+});
 const performance = new Performance(token);
 function brand(value) { if (value !== performance) throw error('ERR_INVALID_THIS', 'Value must be a Performance'); }
 for (const Constructor of [Performance, PerformanceEntry, PerformanceMark, PerformanceMeasure, PerformanceResourceTiming,
