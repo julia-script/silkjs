@@ -6,7 +6,7 @@ const { Blob, resolveObjectURL } = require('internal/web/blob');
 const { TextEncoder } = require('internal/web/encoding');
 const { Headers, immutable } = require('internal/web/fetch/headers');
 const { FormData } = require('internal/web/fetch/formdata');
-const { Request, Response, requestState, responseState, redirectStatus } = require('internal/web/fetch/message');
+const { Request, Response, copyRequestRecord, requestState, responseState, redirectStatus } = require('internal/web/fetch/message');
 const body = require('internal/web/fetch/body');
 const { dispatch, networkError, performance } = require('internal/web/fetch/transport');
 
@@ -82,7 +82,8 @@ function fetch(input, init = undefined) {
 }
 async function performFetch(original) {
   const dispatcher = original.dispatcher;
-  const record = { ...original, headers: new Headers(original.headers) };
+  const record = copyRequestRecord(original);
+  record.headers = new Headers(original.headers);
   const timing = { startTime: performance.now() };
   let redirects = 0;
   for (;;) {
