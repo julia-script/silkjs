@@ -105,6 +105,21 @@ function generalName(part) {
     default: throw c.error('ERR_OSSL_ASN1_INVALID_ENCODING', 'Invalid general name');
   }
 }
+// Node's GetSubjectAltNameString: an absent SAN is undefined; a present one
+// that is not a nonempty GeneralNames SEQUENCE throws, and in the legacy TLS
+// object reads as an empty DNS name so hostname checks cannot fall back to
+// the common name.
+function subjectAltName(cert, legacy) {
+  const data = parsed(cert).extensions['2.5.29.17'];
+  if (data === undefined) return undefined;
+  let names = [];
+  try { const outer = node(data); if (outer.tag === 0x30 && outer.end === data.length) names = children(outer.data); } catch {}
+  if (names.length === 0) {
+    if (legacy) return 'DNS:';
+    throw c.error('ERR_CRYPTO_OPERATION_FAILED', 'Failed to format subject alternative name');
+  }
+  return names.map(generalName).join(', ');
+}
 function extension(cert, id, convert) { const data = parsed(cert).extensions[id]; return data === undefined ? undefined : convert(children(node(data).data)); }
 function dateValue(text) {
   const fields = /^([A-Z][a-z]{2}) +(\d+) (\d\d):(\d\d):(\d\d) (\d+) GMT$/.exec(text);
@@ -116,9 +131,12 @@ function dateValue(text) {
 }
 function legacy(cert, seen) {
   if (seen.has(cert)) return seen.get(cert);
-  const parts = parsed(cert), key = cert.publicKey;
+  const parts = parsed(cert);
+  // Like X509ToObject: a public key OpenSSL cannot decode leaves the key fields out.
+  let key;
+  try { key = cert.publicKey; } catch {}
   const result = {
-    subject: nameObject(parts.subject), issuer: nameObject(parts.issuer), subjectaltname: cert.subjectAltName,
+    subject: nameObject(parts.subject), issuer: nameObject(parts.issuer), subjectaltname: subjectAltName(cert, true),
     infoAccess: undefined, ca: cert.ca, modulus: undefined, exponent: undefined, pubkey: undefined, bits: undefined,
     valid_from: cert.validFrom, valid_to: cert.validTo, fingerprint: cert.fingerprint, fingerprint256: cert.fingerprint256,
     fingerprint512: cert.fingerprint512, ext_key_usage: extension(cert, '2.5.29.37', usages => usages.map(item => oid(item.data))), serialNumber: cert.serialNumber,
@@ -130,7 +148,9 @@ function legacy(cert, seen) {
     for (const line of cert.infoAccess.split('\n')) { const split = line.indexOf(':'); if (split < 0) continue; const name = line.slice(0, split); let value = line.slice(split + 1); if (value[0] === '"') value = JSON.parse(value); (result.infoAccess[name] || (result.infoAccess[name] = [])).push(value); }
   }
   const spki = children(parts.spki.data), algorithm = children(spki[0].data), algorithmId = oid(algorithm[0].data);
-  if (algorithmId === '1.2.840.113549.1.1.1' || algorithmId === '1.2.840.113549.1.1.10') {
+  if (key === undefined) {
+    // No key fields.
+  } else if (algorithmId === '1.2.840.113549.1.1.1' || algorithmId === '1.2.840.113549.1.1.10') {
     const integers = children(node(spki[1].data.subarray(1)).data);
     let modulus = integers[0].data; while (modulus.length > 1 && modulus[0] === 0) modulus = modulus.subarray(1);
     result.modulus = modulus.toString('hex').toUpperCase();
@@ -154,7 +174,7 @@ class X509Certificate {
   get subject() { return cached(this, 'subject', () => call(this, 'x509Name', 0)); }
   get issuer() { return cached(this, 'issuer', () => call(this, 'x509Name', 1)); }
   get issuerCertificate() { return state(this).issuerCertificate; }
-  get subjectAltName() { return cached(this, 'subjectAltName', () => extension(this, '2.5.29.17', names => names.map(generalName).join(', '))); }
+  get subjectAltName() { return cached(this, 'subjectAltName', () => subjectAltName(this, false)); }
   get infoAccess() { return cached(this, 'infoAccess', () => extension(this, '1.3.6.1.5.5.7.1.1', entries => entries.map(entry => { const fields = children(entry.data); return oidName(oid(fields[0].data)) + ' - ' + generalName(fields[1]); }).join('\n'))); }
   get validFrom() { return cached(this, 'validFrom', () => call(this, 'x509Time', 0)); }
   get validTo() { return cached(this, 'validTo', () => call(this, 'x509Time', 1)); }

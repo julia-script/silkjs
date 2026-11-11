@@ -920,8 +920,9 @@ class Http2Session {
       return 0;
     }
     // A socket whose writable side has ended drops the data, as a failed libuv
-    // write does in Node, without an error on the JS socket.
-    if (chunks.length === 0 || !socket.writable) {
+    // write does in Node, without an error on the JS socket. Node writes to the
+    // handle, so a user setting socket.writable = false does not stop the session.
+    if (chunks.length === 0 || socket.writableEnded || socket.destroyed) {
       this.clearOutgoing(0);
       return 0;
     }
