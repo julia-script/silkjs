@@ -5,8 +5,9 @@ const booleanOptions = new Map([
   ['--warnings', 'warnings'], ['--deprecation', 'deprecation'],
   ['--trace-warnings', 'traceProcessWarnings'], ['--trace-deprecation', 'traceDeprecation'],
   ['--throw-deprecation', 'throwDeprecation'], ['--pending-deprecation', 'pendingDeprecation'],
+  ['--abort-on-uncaught-exception', 'abortOnUncaughtException'], ['--trace-exit', 'traceExit'],
 ]);
-const valueOptions = new Set(['--disable-warning', '--redirect-warnings', '--unhandled-rejections']);
+const valueOptions = new Set(['--disable-warning', '--redirect-warnings', '--unhandled-rejections', '--stack-trace-limit']);
 const rejectionModes = new Set(['throw', 'strict', 'warn', 'warn-with-error-code', 'none']);
 const state = { warnings: true, deprecation: true, unhandledRejections: 'throw' };
 const disabledWarnings = new Set();
@@ -17,6 +18,7 @@ let captureCallback = null;
 function valueError(name, value) {
   if (valueOptions.has(name) && (value === undefined || value === '')) return name + ' requires an argument';
   if (name === '--unhandled-rejections' && !rejectionModes.has(value)) return 'invalid value for --unhandled-rejections';
+  if (name === '--stack-trace-limit' && !/^-?[0-9]+$/.test(value)) return 'invalid value for --stack-trace-limit';
 }
 function applyOption(arg) {
   const separator = arg.indexOf('=');
@@ -33,6 +35,8 @@ function applyOption(arg) {
   if (error) throw new Error(error);
   if (name === '--disable-warning') disabledWarnings.add(value);
   else if (name === '--redirect-warnings') state.redirectWarnings = value;
+  // A V8 flag: it sets the initial Error.stackTraceLimit and the depth of --trace-exit stacks.
+  else if (name === '--stack-trace-limit') Error.stackTraceLimit = state.stackTraceLimit = Number(value);
   else state.unhandledRejections = value;
   return true;
 }
@@ -44,6 +48,31 @@ function initialize() {
   host.pendingDeprecation = state.pendingDeprecation ?? process.env.NODE_PENDING_DEPRECATION === '1';
   state.redirectWarnings ||= process.env.NODE_REDIRECT_WARNINGS;
   if (state.warnings && process.env.NODE_NO_WARNINGS !== '1') process.on('warning', onWarning);
+  if (state.abortOnUncaughtException) host.abortOnUncaughtException = abortOnUncaughtException;
+}
+function writeStderr(text) { try { require('fs').writeSync(2, text); } catch {} }
+// V8 aborts when an exception reaches the top of the stack with no capture callback. Here the
+// runtime's exception boundary makes that decision, before uncaughtException listeners run.
+function abortOnUncaughtException(error) {
+  let text;
+  try { text = error instanceof Error && typeof error.stack === 'string' ? error.stack : require('util').inspect(error); }
+  catch { text = '<uncaught exception>'; }
+  writeStderr('Uncaught ' + text + '\n');
+  host.osNative('abort', []);
+}
+// process.exit with --trace-exit names the exit code and prints the current stack, as Node does.
+function traceExit(code, threadId, below = traceExit) {
+  if (!state.traceExit) return;
+  const holder = {};
+  const limit = Error.stackTraceLimit;
+  Error.stackTraceLimit = state.stackTraceLimit ?? 10;
+  Error.captureStackTrace(holder, below);
+  Error.stackTraceLimit = limit;
+  const frames = String(holder.stack);
+  const newline = frames.indexOf('\n');
+  const thread = threadId ? ', thread:' + threadId : '';
+  writeStderr('(' + process.release.name + ':' + process.pid + thread + ') WARNING: Exited the environment with code ' + code +
+    (newline < 0 ? '' : frames.slice(newline)) + '\n');
 }
 function invalidArgument(name, expected, value) {
   const { codes: { ERR_INVALID_ARG_TYPE } } = require('internal/path_events/support');
@@ -114,6 +143,7 @@ function setUncaughtExceptionCaptureCallback(callback) {
   captureCallback = callback;
 }
 function handleUncaught(error, origin) {
+  if (origin === 'uncaughtException' && state.abortOnUncaughtException && captureCallback === null) abortOnUncaughtException(error);
   process.emit('uncaughtExceptionMonitor', error, origin);
   if (captureCallback !== null) { captureCallback(error); return; }
   if (!process.emit('uncaughtException', error, origin)) {
@@ -123,7 +153,7 @@ function handleUncaught(error, origin) {
 }
 
 module.exports = {
-  valueError, applyOption, initialize, emitWarning, handleUncaught,
+  valueError, applyOption, initialize, emitWarning, handleUncaught, traceExit,
   setUncaughtExceptionCaptureCallback, hasUncaughtExceptionCaptureCallback: () => captureCallback !== null,
   getOptionValue(name) {
     if (name === '--unhandled-rejections') return state.unhandledRejections;

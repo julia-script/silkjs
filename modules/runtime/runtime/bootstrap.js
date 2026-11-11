@@ -261,6 +261,23 @@ const completionsPending = () => completions.length !== completionHead;
 // Compound native operations finish through promises, but their public
 // callbacks are I/O completions, not microtasks. Dispatch them outside drainJobs.
 host.enqueueIOCompletion = callback => completions.push(callback);
+// Built-in modules publish to diagnostics channels through these, so a process that never
+// loads diagnostics_channel pays one property read per publish site. No channel can have a
+// subscriber before diagnostics_channel loads (it sets host.diagnosticsChannel): subscribing
+// needs its exports, and the node.diagnostics_channel trace category loads it when enabled.
+host.diagnostics = {
+  publish(name, message) {
+    const dc = host.diagnosticsChannel;
+    if (dc !== undefined && dc.hasSubscribers(name)) dc.channel(name).publish(message);
+  },
+  // The tracing channel for name, or undefined when nothing observes any of its events.
+  tracing(name) {
+    const dc = host.diagnosticsChannel;
+    if (dc === undefined) return undefined;
+    const channels = dc.tracingChannel(name);
+    return channels.hasSubscribers ? channels : undefined;
+  },
+};
 host.nextTick = (callback, ...args) => {
   if (typeof callback !== 'function') throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('callback', 'function', callback);
   ticks.push(callback, args, resource('TickObject'));
@@ -282,9 +299,23 @@ function checkCallback(callback) {
 function invoke(callback, receiver, args) {
   try { return Reflect.apply(callback, receiver, args); }
   catch (error) {
-    if (process.domain && internalRequire('domain')._handleException(error)) return;
-    internalRequire('internal/startup_controls').handleUncaught(error, 'uncaughtException');
+    try {
+      if (process.domain && internalRequire('domain')._handleException(error)) return;
+      internalRequire('internal/startup_controls').handleUncaught(error, 'uncaughtException');
+    } catch (next) {
+      if (next === error || !workerThreads.isMainThread) throw next;
+      exceptionInFatalHandler(next);
+    }
   }
+}
+// A domain error handler or uncaughtException listener that throws ends the process
+// with Node's kExceptionInFatalExceptionHandler status, without 'exit' listeners.
+function exceptionInFatalHandler(error) {
+  host.abortOnUncaughtException?.(error);
+  let text;
+  try { text = internalRequire('util').inspect(error); } catch { text = String(error); }
+  try { internalRequire('fs').writeSync(2, text + '\n'); } catch {}
+  rawStd.exit(7);
 }
 const rejections = new Map();
 const reportedRejections = new WeakMap();
@@ -533,7 +564,7 @@ Object.defineProperty(process, Symbol.toStringTag, { enumerable: false, writable
 defineGlobalAccessor('process', process);
 let startTime = native.runtimeStartTime;
 const performanceMilestones = {
-  nodeStart: 0, environment: native.environmentTime - startTime,
+  nodeStart: 0, v8Start: native.engineStartTime - startTime, environment: native.environmentTime - startTime,
   bootstrapComplete: -1, loopStart: -1, loopExit: -1,
 };
 let initialNativeIdleTime = 0;
@@ -586,6 +617,14 @@ function buildConfig() {
     },
   });
 }
+// What process.exit ends with; replaceable, as in Node. --trace-exit reports the stack
+// above it and --heap-prof writes its profile here, as Node's reallyExit binding does.
+function reallyExit(code) {
+  if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushAtExit();
+  internalRequire('internal/startup_controls').traceExit(code, 0, reallyExit);
+  if (moduleHas('internal/heap_prof')) internalRequire('internal/heap_prof').finish();
+  rawStd.exit(code);
+}
 Object.assign(process, {
   argv: native.argv.slice(), argv0: native.argv[0], execArgv: [], execPath: native.osNative('execPath', []),
   version: 'v' + nodeVersion, versions: componentVersions(), config: buildConfig(),
@@ -613,7 +652,7 @@ Object.assign(process, {
     process.reallyExit(Number(process.exitCode) || 0);
   },
   // What process.exit ends with; replaceable, as in Node.
-  reallyExit(code) { if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushAtExit(); rawStd.exit(code); },
+  reallyExit,
   kill(pid, signal) {
     if (pid != (pid | 0)) throw new (internalRequire('internal/errors').codes.ERR_INVALID_ARG_TYPE)('pid', 'number', pid);
     let number = signal;
@@ -873,6 +912,7 @@ function runtimeFlag(arg) {
   try {
     if (internalRequire('internal/permission').applyOption(arg) ||
         internalRequire('internal/startup_controls').applyOption(arg) ||
+        internalRequire('internal/heap_prof').applyOption(arg) ||
         internalRequire('internal/options').applyInspectorOption(arg)) return true;
   }
   catch (error) { cliError(error.message); return true; }
@@ -983,6 +1023,8 @@ function installRuntimeOptions(args, entrypoints = [], preloadEntrypoints = true
   }
   internalRequire('internal/permission').initialize({ entrypoints });
   internalRequire('internal/startup_controls').initialize();
+  const heapProfileProblem = internalRequire('internal/heap_prof').start();
+  if (heapProfileProblem) return cliError(heapProfileProblem);
   if (host.enableSourceMaps || moduleHas('internal/source_maps')) process.setSourceMapsEnabled(!!host.enableSourceMaps);
   host.typeScriptMode = host.transformTypes ? 'transform' : host.stripTypes === false ? false : 'strip';
   host.initialExecArgv = process.execArgv.slice();
@@ -1451,6 +1493,7 @@ function loop() {
   performanceMilestones.loopExit = native.now() - startTime;
   process._exiting = true; const status = Number(process.exitCode) || 0;
   process.emit('exit', status);
+  if (moduleHas('internal/heap_prof')) internalRequire('internal/heap_prof').finish();
   if (moduleHas('internal/compile_cache')) internalRequire('internal/compile_cache').flushAtExit();
   return Number(process.exitCode) || 0;
 }
@@ -1527,9 +1570,10 @@ globalThis.__silkRuntime = {
   },
   // Starts a process from a heap image: everything the bootstrap took from the
   // process that built the image is taken again from this one.
-  hydrate(argv, runtimeStartTime, environmentTime) {
+  hydrate(argv, runtimeStartTime, environmentTime, engineStartTime) {
     native.argv = argv;
     startTime = runtimeStartTime;
+    performanceMilestones.v8Start = engineStartTime - startTime;
     performanceMilestones.environment = environmentTime - startTime;
     host.performanceStartTime = startTime;
     host.performanceTimeOrigin = Date.now() - (native.now() - startTime);
