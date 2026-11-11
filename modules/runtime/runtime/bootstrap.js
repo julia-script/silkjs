@@ -182,10 +182,17 @@ host.stat = (path, follow = true) =>
 // Node's resolver may probe existence without granting access to file contents.
 const moduleStat = osNamespace.stat;
 host.moduleStat = path => statResult(moduleStat(path), 'stat', path);
-const environmentValues = Object.assign(Object.create(null), rawStd.getenviron());
+// Built-ins read the environment where it lives: nothing of it is kept here.
 const environmentHandler = {
-  set(target, key, value) { if (typeof key === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string'); value = String(value); rawStd.setenv(key, value); target[key] = value; return true; },
-  deleteProperty(target, key) { rawStd.unsetenv(key); return delete target[key]; }
+  get(target, key) { return typeof key === 'string' ? rawStd.getenv(key) : undefined; },
+  has(target, key) { return typeof key === 'string' && rawStd.getenv(key) !== undefined; },
+  ownKeys() { return Object.keys(rawStd.getenviron()); },
+  getOwnPropertyDescriptor(target, key) {
+    const value = typeof key === 'string' ? rawStd.getenv(key) : undefined;
+    if (value !== undefined) return { value, writable: true, enumerable: true, configurable: true };
+  },
+  set(target, key, value) { if (typeof key === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string'); rawStd.setenv(key, String(value)); return true; },
+  deleteProperty(target, key) { if (typeof key === 'string') rawStd.unsetenv(key); return true; },
 };
 // A heap image is this bootstrap's result, saved at build time and started from
 // by later processes (src/ext/heap_image.silk). Whatever the bootstrap takes from
@@ -200,7 +207,7 @@ const notes = {
   ownKeys(target) { environmentRead.add('*'); return Reflect.ownKeys(target); },
 };
 const noted = environment => new Proxy(environment, notes);
-const startupEnvironmentValues = new Proxy(environmentValues, environmentHandler);
+const startupEnvironmentValues = new Proxy(Object.create(null), environmentHandler);
 host.env = environmentRead ? noted(startupEnvironmentValues) : startupEnvironmentValues;
 // Built-ins that keep something of the process at load time refresh it here.
 const hydrations = [];
@@ -1265,8 +1272,6 @@ globalThis.__silkRuntime = {
   // Starts a process from a heap image: everything the bootstrap took from the
   // process that built the image is taken again from this one.
   hydrate(argv, runtimeStartTime, environmentTime) {
-    for (const key of Object.keys(environmentValues)) delete environmentValues[key];
-    Object.assign(environmentValues, rawStd.getenviron());
     native.argv = argv;
     startTime = runtimeStartTime;
     performanceMilestones.environment = environmentTime - startTime;
